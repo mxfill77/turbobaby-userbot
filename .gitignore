@@ -1,0 +1,16 @@
+venv/
+.env
+*.session
+__pycache__/
+data/
+manager-bot/
+whatsapp-bot/
+data_export/
+exporttg27052026/
+recon_photos/
+*.zip
+*.jsonl
+structure.txt
+git status.txt
+client_chats.jsonl
+скрипты проекта/
