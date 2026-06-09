@@ -1,6 +1,7 @@
 venv/
 .env
 *.session
+*.log
 __pycache__/
 data/
 manager-bot/
