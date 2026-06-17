@@ -1,6 +1,9 @@
 venv/
 .env
 *.session
+*.session-journal
+*.session-wal
+*.session-shm
 *.log
 *.lock
 __pycache__/
