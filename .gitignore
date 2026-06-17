@@ -2,7 +2,7 @@ venv/
 .env
 *.session
 *.log
-userbot.lock
+*.lock
 __pycache__/
 data/
 manager-bot/

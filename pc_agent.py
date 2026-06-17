@@ -50,6 +50,7 @@ VENV_PY = REPO_DIR / "venv" / "Scripts" / "python.exe"
 LISTEN_SCRIPT = REPO_DIR / "userbot_listen.py"
 USERBOT_LOG = REPO_DIR / "userbot.log"
 AGENT_LOG = REPO_DIR / "pc_agent.log"
+AGENT_LOCK = REPO_DIR / "pc_agent.lock"  # singleton-гард: не запускать ДВА агента сразу
 
 # --- доступ (жёстко зашит) ---
 HQ_CHAT_ID = -1003853365891
@@ -135,6 +136,8 @@ class UserbotProcess:
             )
         if not VENV_PY.exists():
             return f"не нашёл python venv: {VENV_PY}"
+        # ВАЖНО: userbot_listen.py запускаем ТОЛЬКО через venv-python (VENV_PY),
+        # НИКОГДА не системным и НИКОГДА не сам себя (pc_agent.py).
         self.proc = subprocess.Popen([str(VENV_PY), str(LISTEN_SCRIPT)], cwd=str(REPO_DIR))
         alog.info(f"userbot запущен агентом, PID {self.proc.pid}")
 
@@ -352,16 +355,86 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send(context, chat_id, f"ошибка: {e}")
 
 
+# ============================ singleton-гард агента ============================
+# Чтобы НИКОГДА не было ДВУХ pc_agent одновременно (как бы второй ни запустился:
+# вручную системным python, дважды от Планировщика и т.п.). Два poller'а на одном
+# токене → Telegram отдаёт "Conflict: terminated by other getUpdates" + путаница
+# в управлении. Lock-файл pc_agent.lock с PID, атомарный O_CREAT|O_EXCL.
+
+def _agent_pid_alive(pid: int) -> bool:
+    """Жив ли процесс по PID (Windows, без psutil). НЕ os.kill (он бы убил процесс)."""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return f'"{pid}"' in out.stdout or f",{pid}," in out.stdout
+    except Exception:
+        return False
+
+
+def _read_agent_lock_pid() -> int:
+    try:
+        return int(AGENT_LOCK.read_text(encoding="utf-8").strip() or "0")
+    except Exception:
+        return 0
+
+
+def acquire_agent_lock() -> bool:
+    """True — лок наш, работаем; False — другой агент уже жив, выходим."""
+    for _ in range(3):
+        try:
+            fd = os.open(str(AGENT_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode("utf-8"))
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            old = _read_agent_lock_pid()
+            if old == 0:
+                time.sleep(0.3)
+                old = _read_agent_lock_pid()
+            if old and _agent_pid_alive(old):
+                alog.warning(f"pc_agent уже запущен (PID {old}) — выхожу, второй экземпляр не поднимаю.")
+                return False
+            alog.info(f"устаревший pc_agent.lock (PID {old or '?'} мёртв) — забираю лок.")
+            try:
+                AGENT_LOCK.unlink()
+            except FileNotFoundError:
+                pass
+    alog.warning("не смог получить pc_agent.lock — НЕ стартую (защита от двойного агента).")
+    return False
+
+
+def release_agent_lock() -> None:
+    try:
+        if _read_agent_lock_pid() == os.getpid():
+            AGENT_LOCK.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        alog.warning(f"не смог снять pc_agent.lock: {e}")
+
+
 def main():
     if not AGENT_BOT_TOKEN:
         raise SystemExit(
             "AGENT_BOT_TOKEN пуст. Впиши токен бота (из BotFather) в .env строкой "
             "AGENT_BOT_TOKEN=... и запусти снова."
         )
-    alog.info("pc_agent ЗАПУСК — слушаю HQ/тему 205, команды только от разрешённого id.")
-    app = ApplicationBuilder().token(AGENT_BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.UpdateType.EDITED, on_message))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Singleton-гард ДО polling: если другой pc_agent уже жив — выходим.
+    if not acquire_agent_lock():
+        return
+    try:
+        # При старте агент ТОЛЬКО слушает Telegram. Ничего сам не запускает.
+        # userbot_listen.py поднимается лишь по команде «старт userbot» (через VENV_PY).
+        alog.info("pc_agent ЗАПУСК — слушаю HQ/тему 205, команды только от разрешённого id.")
+        app = ApplicationBuilder().token(AGENT_BOT_TOKEN).build()
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.UpdateType.EDITED, on_message))
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        release_agent_lock()
 
 
 if __name__ == "__main__":
