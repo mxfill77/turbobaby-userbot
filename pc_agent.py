@@ -34,6 +34,7 @@ userbot_listen.py делается фиксированным CIM-запросо
 
 import os
 import io
+import time
 import asyncio
 import logging
 import subprocess
@@ -124,21 +125,48 @@ class UserbotProcess:
         return (len(pids) > 0), pids, self._agent_alive()
 
     def start(self):
-        if self._agent_alive():
-            return f"userbot уже работает (PID {self.proc.pid}, запущен агентом)."
+        # 1) ВСЕГДА живой CIM-поиск ПЕРЕД запуском (не полагаемся на self.proc).
+        #    Любой найденный userbot_listen.py (агента/ручной/автозапуск) → второй не поднимаем.
         pids = _find_userbot_pids()
         if pids:
             return (
-                "userbot уже работает (запущен вручную, PID "
-                + ", ".join(map(str, pids))
-                + "). Останови его прежде чем управлять через агента "
-                "(команда «стоп userbot» или закрой окно на ПК)."
+                "userbot уже работает (PID " + ", ".join(map(str, pids))
+                + "), второй не поднимаю."
             )
         if not VENV_PY.exists():
             return f"не нашёл python venv: {VENV_PY}"
         self.proc = subprocess.Popen([str(VENV_PY), str(LISTEN_SCRIPT)], cwd=str(REPO_DIR))
         alog.info(f"userbot запущен агентом, PID {self.proc.pid}")
-        return f"userbot запущен (PID {self.proc.pid})."
+
+        # 2) Подстраховка от гонки: подождём и перепроверим. Если экземпляров >1 —
+        #    оставляем один, лишние убиваем. (singleton-гард в userbot_listen.py
+        #    обычно сам отсеет дубль, это второй рубеж.)
+        time.sleep(2.5)
+        pids = _find_userbot_pids()
+        if len(pids) > 1:
+            keep = self.proc.pid if self.proc.pid in pids else pids[0]
+            killed = [pid for pid in pids if pid != keep and _taskkill(pid)]
+            alog.warning(f"обнаружен дубль userbot {pids}, оставил PID {keep}, убил {killed}")
+            return (
+                f"обнаружил дубль, оставил PID {keep}"
+                + (f" (убил лишние: {', '.join(map(str, killed))})" if killed else "")
+                + "."
+            )
+        if not pids:
+            return "запустил, но процесс не виден — проверь userbot.log (возможно, сразу вышел)."
+        return f"userbot запущен (PID {pids[0]})."
+
+    def _wait_until_clear(self, timeout=20):
+        """Дождаться, пока НИ ОДНОГО userbot_listen не останется (добивая по пути). True — чисто."""
+        start_t = time.monotonic()
+        while time.monotonic() - start_t < timeout:
+            pids = _find_userbot_pids()
+            if not pids:
+                return True
+            for pid in pids:
+                _taskkill(pid)
+            time.sleep(0.7)
+        return not _find_userbot_pids()
 
     def stop(self):
         stopped = []
@@ -167,6 +195,14 @@ class UserbotProcess:
 
     def update(self):
         stop_msg = self.stop()
+        # ДО git pull/start — дождаться, пока старые экземпляры реально умрут.
+        if not self._wait_until_clear(timeout=20):
+            remaining = _find_userbot_pids()
+            return (
+                f"стоп: {stop_msg}\n\n"
+                f"НЕ смог остановить старый userbot (PID {', '.join(map(str, remaining))}). "
+                "git pull/старт отменён — останови вручную на ПК и повтори «обнови userbot»."
+            )
         try:
             pull = subprocess.run(
                 ["git", "-C", str(REPO_DIR), "pull"],

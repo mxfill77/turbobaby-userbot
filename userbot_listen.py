@@ -24,8 +24,10 @@ respond. Userbot ничего не пишет. Доступ к мозгу/Drive 
 """
 
 import os
+import time
 import asyncio
 import logging
+import subprocess
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -43,6 +45,11 @@ OWN_USERNAMES = {"turbophuket", "turbophuket1"}
 
 LOG_FILE = "userbot.log"
 
+# Singleton-гард: lock-файл с PID живого экземпляра. Главная страховка от ДВУХ
+# клиентов на одной session turbobaby_session (двойной клиент = риск бана).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCK_FILE = os.path.join(BASE_DIR, "userbot.lock")
+
 # Логирование: файл (utf-8) + stdout. Каждая строка самодостаточна (своя ISO-дата).
 logging.basicConfig(
     level=logging.INFO,
@@ -58,6 +65,78 @@ log = logging.getLogger("userbot")
 def _now() -> str:
     """ISO-метка текущего момента (UTC) для служебных строк журнала."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _pid_alive(pid: int) -> bool:
+    """Жив ли процесс с данным PID (Windows, без psutil).
+
+    НЕ используем os.kill(pid, 0): на Windows это ВЫЗЫВАЕТ TerminateProcess —
+    то есть убило бы процесс. Спрашиваем tasklist (фиксированный запрос).
+    """
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return f'"{pid}"' in out.stdout or f",{pid}," in out.stdout
+    except Exception:
+        # Не смогли проверить — считаем мёртвым, чтобы не заклинить legit-старт.
+        return False
+
+
+def _read_lock_pid() -> int:
+    try:
+        with open(LOCK_FILE, encoding="utf-8") as f:
+            return int(f.read().strip() or "0")
+    except Exception:
+        return 0
+
+
+def acquire_lock() -> bool:
+    """Гарантия одного экземпляра. True — лок наш, работаем; False — уже кто-то живой.
+
+    Создаём lock атомарно (O_CREAT|O_EXCL). Если файл уже есть — проверяем, жив ли
+    владелец по PID: жив → выходим (второй экземпляр не поднимаем), мёртв → снимаем
+    устаревший лок и пробуем снова.
+    """
+    for _ in range(3):
+        try:
+            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode("utf-8"))
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            old = _read_lock_pid()
+            if old == 0:
+                # Владелец, возможно, ещё дописывает PID — подождём и перечитаем.
+                time.sleep(0.3)
+                old = _read_lock_pid()
+            if old and _pid_alive(old):
+                log.info(
+                    f"{_now()} | userbot уже запущен (PID {old}), выхожу — "
+                    f"второй экземпляр на session не поднимаю."
+                )
+                return False
+            log.info(f"{_now()} | устаревший userbot.lock (PID {old or '?'} мёртв) — забираю лок.")
+            try:
+                os.remove(LOCK_FILE)
+            except FileNotFoundError:
+                pass
+    log.warning(f"{_now()} | не смог получить lock — на всякий случай НЕ стартую (защита от дубля).")
+    return False
+
+
+def release_lock() -> None:
+    """Снять lock — только если он наш (наш PID внутри)."""
+    try:
+        if _read_lock_pid() == os.getpid():
+            os.remove(LOCK_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"{_now()} | не смог снять lock-файл: {e}")
 
 
 async def on_incoming(event):
@@ -85,25 +164,30 @@ async def on_incoming(event):
 
 
 async def main():
+    # Singleton-гард ДО подключения: если живой экземпляр уже есть — выходим,
+    # чтобы не было двух клиентов на одной session.
+    if not acquire_lock():
+        return
+
     # Клиент создаём внутри main (под asyncio.run) — как в fetch_client_chats.py,
     # чтобы Telethon корректно привязался к event loop.
     client = TelegramClient(SESSION, API_ID, API_HASH)
     client.add_event_handler(on_incoming, events.NewMessage(incoming=True))
 
     log.info(f"{_now()} | --- userbot_listen ЗАПУСК (ЭТАП C: слушаю, НЕ отвечаю) ---")
-    # start() поднимет существующую сессию turbobaby_session — код подтверждения не спросит.
-    await client.start()
-    me = await client.get_me()
-    log.info(
-        f"{_now()} | вошёл как @{me.username} (id={me.id}). "
-        f"Слушаю входящие ЛИЧНЫЕ сообщения. Исходящих — ноль."
-    )
-
     try:
+        # start() поднимет существующую сессию turbobaby_session — код подтверждения не спросит.
+        await client.start()
+        me = await client.get_me()
+        log.info(
+            f"{_now()} | вошёл как @{me.username} (id={me.id}). "
+            f"Слушаю входящие ЛИЧНЫЕ сообщения. Исходящих — ноль."
+        )
         # Процесс ЖИВЁТ постоянно — это и есть отличие от разведчиков.
         await client.run_until_disconnected()
     finally:
         await client.disconnect()
+        release_lock()  # снимаем lock при любом выходе
         log.info(f"{_now()} | --- userbot_listen ОСТАНОВЛЕН ---")
 
 
