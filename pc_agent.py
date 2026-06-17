@@ -418,15 +418,18 @@ def release_agent_lock() -> None:
 
 
 def main():
-    if not AGENT_BOT_TOKEN:
-        raise SystemExit(
-            "AGENT_BOT_TOKEN пуст. Впиши токен бота (из BotFather) в .env строкой "
-            "AGENT_BOT_TOKEN=... и запусти снова."
-        )
-    # Singleton-гард ДО polling: если другой pc_agent уже жив — выходим.
+    # Singleton-гард — ПЕРВЫМ действием в main, атомарно, ДО всего остального.
+    # (Примечание: «второй процесс» с системным python был НЕ от кода, а от venv-
+    #  лаунчера — см. fix_venv_launcher.ps1. Гард остаётся как страховка от реального
+    #  второго запуска агента.)
     if not acquire_agent_lock():
         return
     try:
+        if not AGENT_BOT_TOKEN:
+            raise SystemExit(
+                "AGENT_BOT_TOKEN пуст. Впиши токен бота (из BotFather) в .env строкой "
+                "AGENT_BOT_TOKEN=... и запусти снова."
+            )
         # При старте агент ТОЛЬКО слушает Telegram. Ничего сам не запускает.
         # userbot_listen.py поднимается лишь по команде «старт userbot» (через VENV_PY).
         alog.info("pc_agent ЗАПУСК — слушаю HQ/тему 205, команды только от разрешённого id.")
