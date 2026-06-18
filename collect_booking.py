@@ -4,8 +4,8 @@ collect_booking.py — сборщик карточки брони из ВЫБР�
 ЧТО ДЕЛАЕТ (этап 1 — собрать и ПОКАЗАТЬ, без отправки):
   1. находит личный диалог по @username или id (аргумент командной строки);
   2. читает последние 50 сообщений диалога, строит текст "[менеджер]/[клиент]: ...";
-  3. шлёт транскрипт в Anthropic с системным промптом из спеки → получает JSON;
-  4. собирает карточку и ВЫВОДИТ её в консоль. НИКУДА НЕ ОТПРАВЛЯЕТ.
+  3. шлёт транскрипт в Anthropic с системным промптом из спеки → получает ГОТОВУЮ карточку;
+  4. дописывает @username в «Контакт» и ВЫВОДИТ карточку в консоль. НИКУДА НЕ ОТПРАВЛЯЕТ.
 
 ГАРД (критично): клиенту НИЧЕГО не пишется. Файл только ЧИТАЕТ диалог
 (iter_messages / get_entity). Ни одного client.send_message. Ноль исходящих.
@@ -31,9 +31,7 @@ collect_booking_prompt.txt рядом с этим скриптом. Логику
 """
 
 import os
-import re
 import sys
-import json
 import asyncio
 
 from dotenv import load_dotenv
@@ -115,22 +113,7 @@ async def read_transcript(client, entity, me_id: int):
     return "\n".join(lines), len(msgs)
 
 
-# --------------------------------- LLM-парсер --------------------------------
-
-def extract_json(text: str):
-    """Достать JSON из ответа LLM (с код-фенсами или без). Бросает ValueError, если не JSON."""
-    t = text.strip()
-    if t.startswith("```"):
-        t = t.strip("`")
-        t = re.sub(r"^json\s*", "", t, flags=re.I).strip()
-    try:
-        return json.loads(t)
-    except Exception:
-        m = re.search(r"\{.*\}", t, re.S)  # первый {...} в тексте
-        if m:
-            return json.loads(m.group(0))
-        raise ValueError("ответ LLM не похож на JSON")
-
+# ----------------------------------- LLM -------------------------------------
 
 def call_llm(system_prompt: str, transcript: str) -> str:
     """Вызвать Anthropic, вернуть текст ответа."""
@@ -148,19 +131,20 @@ def call_llm(system_prompt: str, transcript: str) -> str:
 
 # --------------------------------- карточка ----------------------------------
 
-def render_card(data: dict) -> str:
-    """Показать карточку (ЭТАП 1 — предпросмотр, НЕ отправляется).
-
-    Если промпт из спеки уже выдаёт готовую карточку строкой (поле card/карточка/
-    card_text) — печатаем её как есть (формат из спеки, не трогаем). Иначе —
-    нейтральный дамп полей JSON для проверки.
+def add_username(card: str, handle: str) -> str:
+    """Добавить @username диалога в карточку. Промпт оставляет 'Контакт: <телефон>' —
+    дописываем ник туда (чтобы был и телефон, и ник). Если строки 'Контакт:' нет —
+    добавляем отдельной строкой 'Telegram: @username'.
     """
-    for key in ("card", "карточка", "card_text"):
-        if isinstance(data.get(key), str) and data[key].strip():
-            return data[key].strip()
-    lines = ["🆕 БРОНЬ — предпросмотр (ЭТАП 1, НЕ отправлено)"]
-    for k, v in data.items():
-        lines.append(f"{k}: {v}")
+    if not handle:
+        return card
+    lines = card.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("Контакт:"):
+            if handle not in line:  # не дублировать
+                lines[i] = (line.rstrip() + " " + handle).rstrip()
+            return "\n".join(lines)
+    lines.append(f"Telegram: {handle}")
     return "\n".join(lines)
 
 
@@ -194,15 +178,14 @@ async def main():
         peer = f"@{entity.username}" if entity.username else f"id{entity.id}"
         print(f"# диалог {peer}: прочитано сообщений — {n}\n")
 
-        raw = call_llm(system_prompt, transcript)
-        try:
-            data = extract_json(raw)
-        except Exception:
-            print("LLM вернул не-JSON. Сырой ответ:\n")
-            print(raw)
+        # Промпт возвращает ГОТОВУЮ карточку текстом — печатаем как есть.
+        card = call_llm(system_prompt, transcript)
+        if not card:
+            print("LLM вернул пустой ответ")
             return
 
-        print(render_card(data))
+        handle = f"@{entity.username}" if entity.username else None
+        print(add_username(card, handle))
     finally:
         await client.disconnect()  # только читали; ничего не отправляли
 
