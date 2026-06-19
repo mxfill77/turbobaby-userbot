@@ -1,21 +1,24 @@
 """
-collect_booking.py — сборщик карточки брони из ВЫБРАННОГО диалога. ЭТАП 1.
+collect_booking.py — сборщик карточки брони из ВЫБРАННОГО диалога. ЭТАП 2.
 
-ЧТО ДЕЛАЕТ (этап 1 — собрать и ПОКАЗАТЬ, без отправки):
+ЧТО ДЕЛАЕТ (этап 2 — собрать, ПОКАЗАТЬ и по флагу --send ОТПРАВИТЬ во Входящие):
   1. находит личный диалог по @username или id (аргумент командной строки);
   2. читает последние 50 сообщений диалога, строит текст "[менеджер]/[клиент]: ...";
   3. шлёт транскрипт в Anthropic с системным промптом из спеки → получает ГОТОВУЮ карточку;
-  4. дописывает @username в «Контакт» и ВЫВОДИТ карточку в консоль. НИКУДА НЕ ОТПРАВЛЯЕТ.
+  4. дописывает @username в «Клиент», ВЫВОДИТ карточку; с флагом --send — отправляет
+     её во внутреннюю группу Входящие (как USER, Telethon).
 
-ГАРД (критично): клиенту НИЧЕГО не пишется. Файл только ЧИТАЕТ диалог
-(iter_messages / get_entity). Ни одного client.send_message. Ноль исходящих.
-Отправка карточки во «Входящие» — это ЭТАП 2, здесь её НЕТ.
+ГАРД (критично): клиенту НИЧЕГО не пишется. Чтение диалога — read-only
+(iter_messages / get_entity). Единственная исходящая — карточка во ВНУТРЕННЮЮ
+группу Входящие (INBOX_GROUP_ID) и ТОЛЬКО по явному флагу --send. Адресат send —
+строго эта группа-константа, НИКОГДА не entity клиента. Без --send — только превью.
 
 Запуск (ТОЛЬКО на ПК):
     cd D:\\turbobaby-bot
     venv\\Scripts\\activate
-    python collect_booking.py @Egor_blg_28
-    python collect_booking.py 123456789
+    python collect_booking.py @Egor_blg_28            # превью (без отправки)
+    python collect_booking.py @Egor_blg_28 --send     # собрать и ОТПРАВИТЬ во Входящие
+    python collect_booking.py 123456789 --send
 
 Требуется в .env (вне git):
   API_ID, API_HASH        — как у fetch_*.py (session turbobaby_session)
@@ -61,6 +64,10 @@ PROMPT_PLACEHOLDER = "ВСТАВЬ СЮДА"
 
 MAX_MESSAGES = 50          # последние N сообщений диалога
 LLM_MAX_TOKENS = 2000
+
+# ЭТАП 2: внутренняя группа «Входящие» (Splinter принимает карточку отсюда).
+# ЕДИНСТВЕННЫЙ адресат отправки. Никогда не клиент.
+INBOX_GROUP_ID = -1003997419806
 
 
 # ----------------------------- системный промпт -----------------------------
@@ -132,17 +139,17 @@ def call_llm(system_prompt: str, transcript: str) -> str:
 # --------------------------------- карточка ----------------------------------
 
 def add_username(card: str, handle: str) -> str:
-    """Добавить @username диалога в карточку. Промпт оставляет 'Контакт: <телефон>' —
-    дописываем ник туда (чтобы был и телефон, и ник). Если строки 'Контакт:' нет —
-    добавляем отдельной строкой 'Telegram: @username'.
+    """Дописать @username диалога в строку 'Клиент:' (формат Splinter:
+    'Клиент: <имя> (@username)'). Если строки 'Клиент:' нет — добавляем отдельной
+    строкой 'Telegram: @username'. Источник ника — entity.username (авторитетный).
     """
     if not handle:
         return card
     lines = card.splitlines()
     for i, line in enumerate(lines):
-        if line.startswith("Контакт:"):
+        if line.startswith("Клиент:"):
             if handle not in line:  # не дублировать
-                lines[i] = (line.rstrip() + " " + handle).rstrip()
+                lines[i] = (line.rstrip() + f" ({handle})").rstrip()
             return "\n".join(lines)
     lines.append(f"Telegram: {handle}")
     return "\n".join(lines)
@@ -151,9 +158,12 @@ def add_username(card: str, handle: str) -> str:
 # ----------------------------------- main ------------------------------------
 
 async def main():
-    if len(sys.argv) < 2:
-        sys.exit("Использование: python collect_booking.py @username | id")
-    target = sys.argv[1].strip()
+    args = [a for a in sys.argv[1:] if a.strip()]
+    send = "--send" in args
+    positional = [a for a in args if not a.startswith("--")]
+    if not positional:
+        sys.exit("Использование: python collect_booking.py @username | id [--send]")
+    target = positional[0].strip()
 
     if not ANTHROPIC_API_KEY:
         sys.exit("Нет ANTHROPIC_API_KEY в .env. Впиши строкой ANTHROPIC_API_KEY=... и запусти снова.")
@@ -185,9 +195,25 @@ async def main():
             return
 
         handle = f"@{entity.username}" if entity.username else None
-        print(add_username(card, handle))
+        final_card = add_username(card, handle)
+        print(final_card)
+
+        # ЭТАП 2: отправка карточки во ВНУТРЕННЮЮ группу Входящие (как USER, Telethon).
+        # Адресат — СТРОГО INBOX_GROUP_ID; клиенту (entity) НЕ шлём ничего (zero-out).
+        if not send:
+            print("\n(превью — без флага --send не отправляю)")
+            return
+        if not final_card.lstrip().startswith("🆕 БРОНЬ"):
+            print("\n⛔ карточка не начинается с «🆕 БРОНЬ» — НЕ отправляю (Splinter не распознает).")
+            return
+        group = await resolve_entity(client, str(INBOX_GROUP_ID))
+        if group is None:
+            print(f"\n⛔ не нашёл группу Входящие {INBOX_GROUP_ID} — отправка отменена.")
+            return
+        sent = await client.send_message(group, final_card)
+        print(f"\n✅ карточка отправлена во Входящие (msg id {sent.id}). Splinter ответит резюме в группе.")
     finally:
-        await client.disconnect()  # только читали; ничего не отправляли
+        await client.disconnect()
 
 
 if __name__ == "__main__":
