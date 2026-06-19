@@ -42,6 +42,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
 # --- пути (всё относительно этого файла = D:\turbobaby-bot) ---
@@ -355,6 +356,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send(context, chat_id, f"ошибка: {e}")
 
 
+# ============================ обработчик ошибок (ФИКС 1) ============================
+# Сетевые сбои (NetworkError/TimedOut, в т.ч. httpx.ReadError/ReadTimeout, которые PTB
+# заворачивает в NetworkError) НЕ должны ронять процесс агента. Логируем и продолжаем —
+# PTB сам переподключит long-polling. Прочие необработанные ошибки — логируем с трейсом.
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        alog.warning(f"сетевая ошибка (не падаю, PTB переподключится): {type(err).__name__}: {err}")
+    else:
+        alog.error("необработанная ошибка в обработчике", exc_info=err)
+
+
 # ============================ singleton-гард агента ============================
 # Чтобы НИКОГДА не было ДВУХ pc_agent одновременно (как бы второй ни запустился:
 # вручную системным python, дважды от Планировщика и т.п.). Два poller'а на одном
@@ -433,8 +446,23 @@ def main():
         # При старте агент ТОЛЬКО слушает Telegram. Ничего сам не запускает.
         # userbot_listen.py поднимается лишь по команде «старт userbot» (через VENV_PY).
         alog.info("pc_agent ЗАПУСК — слушаю HQ/тему 205, команды только от разрешённого id.")
+
+        # ФИКС 2: авто-реадопшн userbot. Дефолт — userbot жив всегда.
+        # При старте агента (в т.ч. после краша и перезапуска Планировщиком) проверяем,
+        # живёт ли userbot (CIM-поиск процесса userbot_listen.py = источник правды).
+        # Не жив → поднимаем через VENV_PY (UB.start идемпотентен, дубль не создаст).
+        # Жив → не трогаем. Команды стоп/старт из темы 205 работают как прежде —
+        # это разовая проверка ТОЛЬКО на старте агента.
+        alive, pids, _ = UB.status()
+        if alive:
+            alog.info(f"userbot уже жив (PID {', '.join(map(str, pids))}) — не трогаю.")
+        else:
+            alog.info("userbot не запущен при старте агента — поднимаю (авто-реадопшн).")
+            alog.info(UB.start())
+
         app = ApplicationBuilder().token(AGENT_BOT_TOKEN).build()
         app.add_handler(MessageHandler(filters.TEXT & ~filters.UpdateType.EDITED, on_message))
+        app.add_error_handler(on_error)  # ФИКС 1: сетевые ошибки не роняют агента
         app.run_polling(allowed_updates=Update.ALL_TYPES)
     finally:
         release_agent_lock()
