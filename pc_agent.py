@@ -52,6 +52,7 @@ LISTEN_SCRIPT = REPO_DIR / "userbot_listen.py"
 USERBOT_LOG = REPO_DIR / "userbot.log"
 AGENT_LOG = REPO_DIR / "pc_agent.log"
 AGENT_LOCK = REPO_DIR / "pc_agent.lock"  # singleton-гард: не запускать ДВА агента сразу
+TASK_NAME = "pc_agent"  # ФИКС 3: имя задачи в Планировщике Windows — ДОЛЖНО совпадать с реальным
 
 # --- доступ (жёстко зашит) ---
 HQ_CHAT_ID = -1003853365891
@@ -297,10 +298,78 @@ async def _send_log_file(context, chat_id):
     await context.bot.send_document(chat_id, document=bio, message_thread_id=HQ_THREAD_ID)
 
 
+# ===================== само-рестарт агента (ФИКС 3) =====================
+# Цель: применять свежий код агента с телефона (команда «обновись» из темы 205), без
+# PowerShell на ПК. Самое тонкое — перезапустить СЕБЯ на Windows так, чтобы (1) НИКОГДА
+# не было двух агентов одновременно (конфликт getUpdates на одном токене), (2) новый
+# экземпляр ГАРАНТИРОВАННО поднялся (не «оба умерли»).
+# Механизм: после git pull текущий агент спавнит DETACHED-помощника (переживает наш
+# выход). Помощник ЖДЁТ смерти нашего PID и ТОЛЬКО ПОСЛЕ этого просит Планировщик поднять
+# задачу (schtasks /Run). Перекрытия нет: новый стартует строго после смерти старого.
+# Лок снимаем сами перед выходом; даже забудь мы — новый агент заберёт устаревший лок
+# (singleton-гард НЕ ослабляем). userbot не трогаем: если он отвалится со старым агентом,
+# его поднимет авто-реадопшн (ФИКС 2) при старте нового.
+
+def _git_pull():
+    """git pull --ff-only в REPO_DIR → (ok: bool, output: str).
+    --ff-only: без merge-коммитов; при расхождении/конфликте дерево НЕ ломаем, вернём ошибку."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(REPO_DIR), "pull", "--ff-only"],
+            capture_output=True, text=True, timeout=120,
+        )
+        out = (r.stdout + r.stderr).strip() or "(пустой вывод)"
+        return (r.returncode == 0), out
+    except Exception as e:
+        return False, f"git pull упал: {e}"
+
+
+def _spawn_restart_helper():
+    """DETACHED-помощник: ждёт смерти ТЕКУЩЕГО агента (наш PID), затем просит Планировщик
+    поднять задачу заново. creationflags → помощник переживает выход родителя."""
+    my_pid = os.getpid()
+    ps = (
+        f"$old={my_pid}; "
+        "while (Get-Process -Id $old -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 300 }; "
+        "Start-Sleep -Milliseconds 800; "
+        f"schtasks /Run /TN {TASK_NAME}"
+    )
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    CREATE_NO_WINDOW = 0x08000000
+    subprocess.Popen(
+        ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps],
+        cwd=str(REPO_DIR),
+        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+        close_fds=True,
+    )
+    alog.info(f"помощник рестарта запущен (ждёт смерти PID {my_pid} → schtasks /Run /TN {TASK_NAME}).")
+
+
+async def self_restart(context, chat_id):
+    """Команда «обновись»: git pull → (если ок) спавн помощника → снять лок → жёсткий выход.
+    git pull упал → НЕ перезапускаемся, остаёмся на текущем коде."""
+    await _send(context, chat_id, "🔄 принято: git pull, затем перезапуск себя.")
+    ok, out = await asyncio.to_thread(_git_pull)
+    if not ok:
+        await _send(context, chat_id, f"⛔ git pull не удался — НЕ перезапускаюсь, остаюсь на текущем коде:\n{out}")
+        alog.warning("self-restart отменён: git pull failed")
+        return
+    await _send(
+        context, chat_id,
+        f"✅ git pull:\n{out}\n\nПерезапускаюсь. Новый экземпляр поднимется через Планировщик "
+        "после моей смерти (без окна с двумя агентами). Вернусь через ~10–20с — проверь «статус»."
+    )
+    alog.info("self-restart: pull OK → спавню помощника, снимаю лок, выхожу.")
+    _spawn_restart_helper()
+    release_agent_lock()
+    os._exit(0)  # жёсткий выход: гарантирует смерть PID; помощник стартует новый ТОЛЬКО после
+
+
 # ================================ обработчик ================================
 
 HELP = (
-    "не понял. Доступно: обнови userbot / статус / стоп userbot / старт userbot / сводка"
+    "не понял. Доступно: обнови userbot / статус / стоп userbot / старт userbot / сводка / обновись"
 )
 
 
@@ -348,6 +417,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send(context, chat_id, digest)
             if len(full) > MAX_TG:  # лог большой — шлём полный файлом
                 await _send_log_file(context, chat_id)
+
+        elif text in ("обновись", "перезапустись", "обнови себя", "restart"):
+            alog.info("команда: self-restart")
+            await self_restart(context, chat_id)
 
         else:
             await _send(context, chat_id, HELP)
