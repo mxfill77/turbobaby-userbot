@@ -519,7 +519,7 @@ except Exception:
 DROP_FILE = REPO_DIR / "cowork_drop.log"        # сюда Cowork дописывает строки-отчёты
 DROP_OFFSET = REPO_DIR / "cowork_drop.offset"   # байтовый указатель уже отнесённого
 COWORK_DOC = "cowork_log"                        # имя дока в Brain (Bridge)
-SYNC_PERIOD_SEC = 420                            # ~7 минут между тиками
+SYNC_PERIOD_SEC = 30                             # 30 секунд между тиками
 BRIDGE_URL = os.getenv("BRIDGE_URL", "").strip()
 BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
 
