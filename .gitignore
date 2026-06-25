@@ -20,3 +20,7 @@ structure.txt
 git status.txt
 client_chats.jsonl
 скрипты проекта/
+
+# авто-синк cowork → мозг (runtime-артефакты, не исходники)
+cowork_drop.log
+cowork_drop.offset

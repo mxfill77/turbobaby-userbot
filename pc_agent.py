@@ -503,6 +503,112 @@ def release_agent_lock() -> None:
         alog.warning(f"не смог снять pc_agent.lock: {e}")
 
 
+# ===================== авто-синк cowork → общий мозг (Bridge) =====================
+# Слепые зоны 0.1/0.2: pc_agent фоном относит отчёты Cowork в cowork_log на Drive.
+# Cowork дописывает строки в DROP_FILE; синк раз в SYNC_PERIOD_SEC шлёт НОВЫЕ строки в
+# Bridge (read_doc → склейка «новое сверху» → write_doc) и двигает байтовый offset.
+# Идемпотентность: offset сдвигается ТОЛЬКО после успешного write_doc → дважды не отправим,
+# при ошибке Bridge строки не теряются (повтор на след. тике).
+# БЕЗОПАСНОСТЬ: это ТОЛЬКО HTTP к Bridge. НЕ трогает userbot, session, Telethon-клиент.
+# Отдельный лёгкий канал; забор вокруг личного номера эта задача не затрагивает.
+try:
+    import requests
+except Exception:
+    requests = None
+
+DROP_FILE = REPO_DIR / "cowork_drop.log"        # сюда Cowork дописывает строки-отчёты
+DROP_OFFSET = REPO_DIR / "cowork_drop.offset"   # байтовый указатель уже отнесённого
+COWORK_DOC = "cowork_log"                        # имя дока в Brain (Bridge)
+SYNC_PERIOD_SEC = 420                            # ~7 минут между тиками
+BRIDGE_URL = os.getenv("BRIDGE_URL", "").strip()
+BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
+
+
+def _drop_read_offset() -> int:
+    try:
+        return int(DROP_OFFSET.read_text(encoding="utf-8").strip() or "0")
+    except Exception:
+        return 0
+
+
+def _drop_write_offset(n: int) -> None:
+    try:
+        DROP_OFFSET.write_text(str(n), encoding="utf-8")
+    except Exception as e:
+        alog.warning(f"cowork-синк: не смог записать offset: {e}")
+
+
+def _bridge_read_doc() -> str:
+    r = requests.get(
+        BRIDGE_URL,
+        params={"action": "read_doc", "name": COWORK_DOC, "token": BRIDGE_TOKEN},
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok", False):
+        raise RuntimeError(f"read_doc не ok: {data}")
+    return data.get("text", "")
+
+
+def _bridge_write_doc(text: str) -> None:
+    r = requests.post(
+        BRIDGE_URL,
+        json={"token": BRIDGE_TOKEN, "action": "write_doc", "name": COWORK_DOC, "text": text},
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok", False):
+        raise RuntimeError(f"write_doc не ok: {data}")
+
+
+def _flush_cowork_drop() -> int:
+    """Отнести новые байты drop-файла в мозг (Bridge). Возвращает число отнесённых байт.
+    Идемпотентность: байтовый offset; сдвигаем ТОЛЬКО после успешного write_doc.
+    При ошибке Bridge offset НЕ двигаем → строки не теряются, повтор на след. тике."""
+    if not DROP_FILE.exists():
+        return 0
+    size = DROP_FILE.stat().st_size
+    off = _drop_read_offset()
+    if off > size:          # drop усечён/переписан — сбрасываем указатель
+        off = 0
+    if size <= off:
+        return 0            # новых байт нет
+    raw = DROP_FILE.read_bytes()[off:size]
+    chunk = raw.decode("utf-8", errors="replace").strip()
+    if not chunk:
+        _drop_write_offset(size)   # только пустые строки — просто двигаем offset
+        return 0
+    current = _bridge_read_doc()                  # R
+    _bridge_write_doc(chunk + "\n\n" + current)  # M+W: новое сверху; текст непуст
+    _drop_write_offset(size)                      # успех → фиксируем offset
+    return size - off
+
+
+async def _cowork_sync_loop():
+    if requests is None:
+        alog.warning("cowork-синк ОТКЛЮЧЁН: нет библиотеки requests.")
+        return
+    if not (BRIDGE_URL and BRIDGE_TOKEN):
+        alog.info("cowork-синк ОТКЛЮЧЁН: нет BRIDGE_URL/BRIDGE_TOKEN в .env (добавит Филипп).")
+        return
+    alog.info(f"cowork-синк включён: {DROP_FILE.name} → cowork_log каждые {SYNC_PERIOD_SEC}с.")
+    while True:
+        try:
+            await asyncio.sleep(SYNC_PERIOD_SEC)
+            n = await asyncio.to_thread(_flush_cowork_drop)
+            if n:
+                alog.info(f"cowork-синк: отнёс {n} новых байт в cowork_log.")
+        except Exception as e:
+            alog.warning(f"cowork-синк: ошибка тика (offset не сдвинут, повтор позже): {e}")
+
+
+async def _cowork_sync_post_init(app):
+    # Фоновая задача синка в петле приложения (после init, до/во время polling).
+    app.create_task(_cowork_sync_loop())
+
+
 def main():
     # Singleton-гард — ПЕРВЫМ действием в main, атомарно, ДО всего остального.
     # (Примечание: «второй процесс» с системным python был НЕ от кода, а от venv-
@@ -533,7 +639,7 @@ def main():
             alog.info("userbot не запущен при старте агента — поднимаю (авто-реадопшн).")
             alog.info(UB.start())
 
-        app = ApplicationBuilder().token(AGENT_BOT_TOKEN).build()
+        app = ApplicationBuilder().token(AGENT_BOT_TOKEN).post_init(_cowork_sync_post_init).build()
         app.add_handler(MessageHandler(filters.TEXT & ~filters.UpdateType.EDITED, on_message))
         app.add_error_handler(on_error)  # ФИКС 1: сетевые ошибки не роняют агента
         app.run_polling(allowed_updates=Update.ALL_TYPES)
