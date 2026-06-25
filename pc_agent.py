@@ -586,27 +586,15 @@ def _flush_cowork_drop() -> int:
     return size - off
 
 
-async def _cowork_sync_loop():
-    if requests is None:
-        alog.warning("cowork-синк ОТКЛЮЧЁН: нет библиотеки requests.")
-        return
-    if not (BRIDGE_URL and BRIDGE_TOKEN):
-        alog.info("cowork-синк ОТКЛЮЧЁН: нет BRIDGE_URL/BRIDGE_TOKEN в .env (добавит Филипп).")
-        return
-    alog.info(f"cowork-синк включён: {DROP_FILE.name} → cowork_log каждые {SYNC_PERIOD_SEC}с.")
-    while True:
-        try:
-            await asyncio.sleep(SYNC_PERIOD_SEC)
-            n = await asyncio.to_thread(_flush_cowork_drop)
-            if n:
-                alog.info(f"cowork-синк: отнёс {n} новых байт в cowork_log.")
-        except Exception as e:
-            alog.warning(f"cowork-синк: ошибка тика (offset не сдвинут, повтор позже): {e}")
-
-
-async def _cowork_sync_post_init(app):
-    # Фоновая задача синка в петле приложения (после init, до/во время polling).
-    app.create_task(_cowork_sync_loop())
+async def _cowork_sync_job(context):
+    # Один тик синка — JobQueue вызывает его каждые SYNC_PERIOD_SEC. Канонично для PTB,
+    # без Application.create_task (та «мина» создавала задачу, пока приложение не запущено).
+    try:
+        n = await asyncio.to_thread(_flush_cowork_drop)
+        if n:
+            alog.info(f"cowork-синк: отнёс {n} новых байт в cowork_log.")
+    except Exception as e:
+        alog.warning(f"cowork-синк: ошибка тика (offset не сдвинут, повтор позже): {e}")
 
 
 def main():
@@ -639,9 +627,16 @@ def main():
             alog.info("userbot не запущен при старте агента — поднимаю (авто-реадопшн).")
             alog.info(UB.start())
 
-        app = ApplicationBuilder().token(AGENT_BOT_TOKEN).post_init(_cowork_sync_post_init).build()
+        app = ApplicationBuilder().token(AGENT_BOT_TOKEN).build()
         app.add_handler(MessageHandler(filters.TEXT & ~filters.UpdateType.EDITED, on_message))
         app.add_error_handler(on_error)  # ФИКС 1: сетевые ошибки не роняют агента
+        # cowork-синк через JobQueue (канонично, без create_task-мины). Планируем ТОЛЬКО при кредах
+        # и наличии JobQueue (иначе просто отключаем — НЕ роняем агента).
+        if requests is not None and BRIDGE_URL and BRIDGE_TOKEN and app.job_queue is not None:
+            app.job_queue.run_repeating(_cowork_sync_job, interval=SYNC_PERIOD_SEC, first=20)
+            alog.info(f"cowork-синк включён (JobQueue): {DROP_FILE.name} каждые {SYNC_PERIOD_SEC}с, первый тик +20с.")
+        else:
+            alog.info("cowork-синк ОТКЛЮЧЁН: нет requests / BRIDGE-кред / JobQueue.")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
     finally:
         release_agent_lock()
