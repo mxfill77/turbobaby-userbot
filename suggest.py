@@ -23,6 +23,7 @@ import json
 import time
 import random
 import asyncio
+import re
 import logging
 import datetime
 
@@ -58,6 +59,19 @@ RATE_PER_HOUR = _int("SUGGEST_RATE_HOUR", 6)
 RATE_PER_DAY = _int("SUGGEST_RATE_DAY", 15)
 PAUSE_MIN = _int("SUGGEST_PAUSE_MIN", 30)
 PAUSE_MAX = _int("SUGGEST_PAUSE_MAX", 60)
+
+# Первый контакт: нет НАШИХ (менеджера) сообщений за последние N часов → черновик с приветствием.
+FIRST_CONTACT_HOURS = _int("SUGGEST_FIRST_CONTACT_HOURS", 18)
+
+
+def _csv_set(name: str):
+    """Разобрать список юзернеймов из env (разделитель — запятая/пробел), в lower без @."""
+    raw = os.getenv(name, "") or ""
+    return {p.strip().lstrip("@").lower() for p in re.split(r"[,\s]+", raw) if p.strip()}
+
+
+# Право approve/edit/reject. ПУСТОЙ список = любой участник группы может approve.
+APPROVER_USERNAMES = _csv_set("APPROVER_USERNAMES")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6").strip()
@@ -156,21 +170,51 @@ def parse_approval(reply_text: str):
 
 # ------------------------------- транскрипт ----------------------------------
 
-async def read_transcript(client, entity, me_id: int, limit: int = MAX_MESSAGES):
-    """Собрать текст диалога '[менеджер]/[клиент]: ...' в хронологическом порядке.
-    Ручные ответы менеджера видны (они отправлены с этого же аккаунта, sender_id==me).
-    """
+async def _fetch_messages(client, entity, limit: int = MAX_MESSAGES):
+    """Выбрать последние сообщения диалога (newest-first, как отдаёт iter_messages)."""
     msgs = []
     async for m in client.iter_messages(entity, limit=limit):
         msgs.append(m)
-    msgs.reverse()
+    return msgs
+
+
+def transcript_from(msgs, me_id: int) -> str:
+    """Текст диалога '[менеджер]/[клиент]: ...' в хронологическом порядке (old→new).
+    Ручные ответы менеджера видны (они отправлены с этого же аккаунта, sender_id==me)."""
     lines = []
-    for m in msgs:
+    for m in reversed(msgs):
         who = "менеджер" if (getattr(m, "sender_id", None) == me_id) else "клиент"
         body = (getattr(m, "message", None) or "").strip() or "[медиа/без текста]"
         body = body.replace("\n", " ⏎ ")
         lines.append(f"[{who}]: {body}")
     return "\n".join(lines)
+
+
+def first_contact_from(msgs, me_id: int, hours=None, now=None) -> bool:
+    """Первый контакт: НЕТ наших (менеджера) сообщений за последние `hours` часов.
+    msgs — newest-first. now — инъекция для тестов."""
+    hours = FIRST_CONTACT_HOURS if hours is None else hours
+    now_dt = now() if now else datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now_dt - datetime.timedelta(hours=hours)
+    for m in msgs:  # newest-first
+        d = getattr(m, "date", None)
+        if d is not None and d < cutoff:
+            break  # дальше только более старые — выходим из окна
+        if getattr(m, "sender_id", None) == me_id and d is not None:
+            return False  # мы писали в окне → это продолжение диалога
+    return True
+
+
+async def read_transcript(client, entity, me_id: int, limit: int = MAX_MESSAGES) -> str:
+    """Совместимость: выбрать сообщения и собрать транскрипт."""
+    return transcript_from(await _fetch_messages(client, entity, limit), me_id)
+
+
+def is_approver(username) -> bool:
+    """Есть ли право approve/edit/reject. Пустой whitelist = можно любому."""
+    if not APPROVER_USERNAMES:
+        return True
+    return (username or "").lstrip("@").lower() in APPROVER_USERNAMES
 
 
 # ------------------------------- FAQ / LLM -----------------------------------
@@ -213,14 +257,24 @@ def load_faq(getter=None) -> str:
         return ""
 
 
-def make_system_prompt(faq: str, lang: str) -> str:
+def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False) -> str:
     lang_name = "русском" if lang == "ru" else "английском"
+    if is_first_contact:
+        greet = (
+            "\n\nЭто ПЕРВЫЙ ответ в этом диалоге — НАЧНИ ответ с фирменного приветствия из "
+            "FAQ («Здравствуйте! …»), затем переходи к сути."
+        )
+    else:
+        greet = (
+            "\n\nЭто ПРОДОЛЖЕНИЕ диалога — НЕ здоровайся повторно, сразу отвечай по сути."
+        )
     return (
         "Ты — менеджер проката мотобайков TurboBaby (Пхукет). По переписке с клиентом "
         f"составь ОДИН короткий, вежливый ответ на {lang_name} языке (язык клиента). "
         "Отвечай только на то, что ещё НЕ отвечено менеджером в диалоге; не повторяй уже "
         "сказанное; держи контекст сделки. Не выдумывай данные и наличие. Верни ТОЛЬКО "
-        "текст ответа клиенту — без пояснений, без кавычек, без префиксов.\n\n"
+        "текст ответа клиенту — без пояснений, без кавычек, без префиксов."
+        + greet + "\n\n"
         + CRITICAL_FACTS
         + "\n\nFAQ и эталонные формулировки:\n" + (faq or "(FAQ недоступен — опирайся на критичные факты выше)")
     )
@@ -238,10 +292,11 @@ def _default_llm(system: str, user: str) -> str:
     return "".join(getattr(b, "text", "") for b in resp.content).strip()
 
 
-def generate_draft(transcript: str, lang: str, faq: str, call_llm=None) -> str:
+def generate_draft(transcript: str, lang: str, faq: str,
+                   is_first_contact: bool = False, call_llm=None) -> str:
     """Сгенерировать черновик. call_llm(system, user)->str инъектируется в тестах."""
     call_llm = call_llm or _default_llm
-    system = make_system_prompt(faq, lang)
+    system = make_system_prompt(faq, lang, is_first_contact)
     return call_llm(system, transcript).strip()
 
 
@@ -419,7 +474,9 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
         return None
     client_id = sender.id
     client_ref = f"@{sender.username}" if getattr(sender, "username", None) else f"id{sender.id}"
-    transcript = await read_transcript(client, sender, me_id)
+    msgs = await _fetch_messages(client, sender)
+    transcript = transcript_from(msgs, me_id)
+    first = first_contact_from(msgs, me_id)   # первый контакт → приветствие в черновике
     last_client_line = ""
     for ln in reversed(transcript.split("\n")):
         if ln.startswith("[клиент]:"):
@@ -427,21 +484,45 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
             break
     lang = detect_lang(last_client_line or transcript)
     faq = faq if faq is not None else load_faq()
-    draft = generate_draft(transcript, lang, faq, call_llm=call_llm)
+    draft = generate_draft(transcript, lang, faq, is_first_contact=first, call_llm=call_llm)
     if not draft:
         log.warning(f"SUGGEST: пустой черновик для {client_ref} — пропускаю.")
         return None
     mid = await post_draft(client, draft, client_ref)
     pending.add(mid, {
         "client_id": client_id, "client_ref": client_ref, "lang": lang,
-        "incoming": last_client_line, "draft": draft, "ts": _now_iso(),
+        "incoming": last_client_line, "draft": draft, "first_contact": first,
+        "ts": _now_iso(),
     })
     return mid
 
 
+async def _sender_username(event):
+    """Юзернейм автора reply (для проверки прав). Без падения."""
+    s = getattr(event, "sender", None)
+    if s is None and hasattr(event, "get_sender"):
+        try:
+            s = await event.get_sender()
+        except Exception:
+            s = None
+    return getattr(s, "username", None)
+
+
+async def _ack(event, draft_msg_id, text):
+    """Видимый ответ userbot'а на сообщение-черновик в ГРУППЕ МОДЕРАЦИИ (не клиенту)."""
+    try:
+        chat = getattr(event, "chat_id", None)
+        if chat is None:
+            chat = getattr(getattr(event, "message", None), "chat_id", None)
+        await event.client.send_message(chat, text, reply_to=draft_msg_id)
+    except Exception as e:
+        log.warning(f"SUGGEST: не смог отправить ack модерации: {e}")
+
+
 async def on_moderation_reply(event, sender=None, jitter=None, sleep=None):
     """Врезка во второй хендлер: reply менеджера в группе модерации → approve/edit/reject.
-    sender/jitter/sleep — инъекция для тестов."""
+    NO-SILENT-PATHS: каждый reply получает видимый ответ userbot'а (reply на черновик).
+    Права approve/edit/reject — по APPROVER-whitelist. sender/jitter/sleep — инъекция для тестов."""
     if not is_enabled():
         return None
     reply_to = None
@@ -453,27 +534,42 @@ async def on_moderation_reply(event, sender=None, jitter=None, sleep=None):
     if rec is None:
         return None  # reply не на наш черновик
 
+    # Права: не-approver → ⛔ и НЕ трогаем pending (пусть approver ещё сможет решить).
+    username = await _sender_username(event)
+    if not is_approver(username):
+        await _ack(event, reply_to, "⛔ Нет прав на approve")
+        return {"action": "denied", "sent": False, "reason": "not_approver", "final": None}
+
     action, payload = parse_approval(getattr(event, "raw_text", "") or getattr(event, "text", ""))
     final = None
     sent = False
     reason = None
     if action == "reject":
-        pass
+        ack = "❌ Отклонено"
     else:
         final = rec["draft"] if action == "approve" else payload
         if SUGGEST_TEST_MODE:
-            reason = "TEST_MODE: отправка клиенту отключена"
+            # SAFETY: в TEST_MODE send_to_client НЕ вызываем — клиенту ничего не уходит.
+            reason = "TEST_MODE"
             log.info(f"SUGGEST[TEST_MODE] одобрено, НЕ шлю клиенту {rec['client_ref']}: {final}")
+            ack = ("🧪 Принято (TEST_MODE — клиенту НЕ отправлено)" if action == "approve"
+                   else "✅ Правка принята 🧪 (TEST_MODE — клиенту НЕ отправлено)")
         else:
             _send = sender or send_to_client
             sent, reason = await _send(event.client, rec["client_id"], final, sleep=sleep, jitter=jitter)
+            if action == "approve":
+                ack = "✅ Отправлено клиенту" if sent else f"⚠️ Не отправлено: {reason}"
+            else:
+                ack = ("✅ Правка принята — отправлено клиенту" if sent
+                       else f"✅ Правка принята, ⚠️ не отправлено: {reason}")
 
+    await _ack(event, reply_to, ack)
     record_pair({
         "ts": _now_iso(), "client": rec["client_ref"], "lang": rec["lang"],
         "incoming": rec["incoming"], "draft": rec["draft"], "action": action,
         "final_sent": final if sent else ("" if action == "reject" else final),
         "edit": _edit_diff(rec["draft"], final or ""),
-        "sent": sent, "reason": reason,
+        "first_contact": rec.get("first_contact"), "sent": sent, "reason": reason, "ack": ack,
     })
     pending.pop(reply_to)
-    return {"action": action, "sent": sent, "reason": reason, "final": final}
+    return {"action": action, "sent": sent, "reason": reason, "final": final, "ack": ack}

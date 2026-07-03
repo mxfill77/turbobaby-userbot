@@ -8,6 +8,7 @@ Anthropic: оба замоканы. Реальной отправки клиен
 
 import os
 import asyncio
+import datetime
 import tempfile
 import unittest
 
@@ -30,9 +31,10 @@ class FakeAction:  # async context manager под `async with client.action(...)
 
 
 class FakeHistMsg:
-    def __init__(self, sender_id, message):
+    def __init__(self, sender_id, message, date=None):
         self.sender_id = sender_id
         self.message = message
+        self.date = date
 
 
 class FakeSender:
@@ -63,7 +65,7 @@ class FakeClient:
     def action(self, chat, kind):
         return FakeAction()
 
-    async def send_message(self, chat, text):
+    async def send_message(self, chat, text, reply_to=None):
         if self.flood_exc is not None:
             raise self.flood_exc
         self._next_id += 1
@@ -84,11 +86,13 @@ class FakeClient:
 
 
 class FakeEvent:
-    def __init__(self, client, reply_to, text, is_reply=True):
+    def __init__(self, client, reply_to, text, is_reply=True, sender=None, chat_id=-1002220000):
         self.client = client
         self.is_reply = is_reply
         self.reply_to_msg_id = reply_to
         self.raw_text = text
+        self.sender = sender          # None → _sender_username вернёт None
+        self.chat_id = chat_id        # куда идёт ack (группа модерации, не клиент)
 
 
 async def _nosleep(_):
@@ -276,8 +280,10 @@ class TestFullFlow(unittest.TestCase):
         res = asyncio.run(suggest.on_moderation_reply(ev, jitter=lambda: 0, sleep=_nosleep))
         self.assertEqual(res["action"], "approve")
         self.assertTrue(res["sent"])
-        # последняя отправка — КЛИЕНТУ (id 999) с текстом черновика
-        self.assertEqual(self.client.sent[-1], (999, "DRAFT ответа клиенту"))
+        # отправка КЛИЕНТУ (id 999) с текстом черновика (среди отправок; после неё — ack в группу)
+        client_sends = [t for t in self.client.sent if t[0] == 999]
+        self.assertIn((999, "DRAFT ответа клиенту"), client_sends)
+        self.assertEqual(res["ack"], "✅ Отправлено клиенту")
         pairs = self._pairs_lines()
         self.assertEqual(pairs[-1]["action"], "approve")
         self.assertEqual(pairs[-1]["client"], "@client1")
@@ -288,35 +294,48 @@ class TestFullFlow(unittest.TestCase):
         ev = FakeEvent(self.client, reply_to=mid, text=edited)
         res = asyncio.run(suggest.on_moderation_reply(ev, jitter=lambda: 0, sleep=_nosleep))
         self.assertEqual(res["action"], "edit")
-        self.assertEqual(self.client.sent[-1], (999, edited))
+        client_sends = [t for t in self.client.sent if t[0] == 999]
+        self.assertIn((999, edited), client_sends)
         pairs = self._pairs_lines()
         self.assertEqual(pairs[-1]["edit"], edited)      # правка зафиксирована
 
     def test_reject_does_not_send(self):
         mid = self._incoming()
-        before = len(self.client.sent)
         ev = FakeEvent(self.client, reply_to=mid, text="-")
         res = asyncio.run(suggest.on_moderation_reply(ev, jitter=lambda: 0, sleep=_nosleep))
         self.assertEqual(res["action"], "reject")
         self.assertFalse(res["sent"])
-        self.assertEqual(len(self.client.sent), before)  # клиенту ничего
+        self.assertEqual([t for t in self.client.sent if t[0] == 999], [])  # клиенту ничего
+        self.assertEqual(res["ack"], "❌ Отклонено")
         self.assertIsNone(suggest.pending.get(mid))      # pending снят
 
     def test_test_mode_does_not_send_to_client(self):
         suggest.SUGGEST_TEST_MODE = True
         mid = self._incoming()
-        before = len(self.client.sent)
         ev = FakeEvent(self.client, reply_to=mid, text="+")
         res = asyncio.run(suggest.on_moderation_reply(ev, jitter=lambda: 0, sleep=_nosleep))
         self.assertEqual(res["action"], "approve")
         self.assertFalse(res["sent"])                    # TEST_MODE: клиенту НЕ ушло
-        self.assertEqual(len(self.client.sent), before)
+        self.assertEqual([t for t in self.client.sent if t[0] == 999], [])
+        self.assertIn("TEST_MODE", res["ack"])
 
     def test_reply_not_on_our_draft_ignored(self):
         self._incoming()
         ev = FakeEvent(self.client, reply_to=123456789, text="+")  # чужой reply
         res = asyncio.run(suggest.on_moderation_reply(ev, jitter=lambda: 0, sleep=_nosleep))
         self.assertIsNone(res)
+
+    def test_greeting_reflected_on_first_contact(self):
+        # мок-LLM отражает, попросили ли в промпте приветствие; история без дат → первый контакт
+        def refllm(system, _user):
+            return "GREETED" if "ПЕРВЫЙ ответ" in system else "CONT"
+        mid = asyncio.run(
+            suggest.on_client_message(self.client, self.sender, self.me,
+                                      call_llm=refllm, faq="FAQ")
+        )
+        rec = suggest.pending.get(mid)
+        self.assertTrue(rec["first_contact"])
+        self.assertEqual(rec["draft"], "GREETED")
 
 
 class TestFaqOrder(unittest.TestCase):
@@ -378,6 +397,135 @@ class TestResolveGroup(unittest.TestCase):
         c = FakeClient(dialogs=[])  # iter_dialogs не нужен — ID уже есть
         gid = asyncio.run(suggest.resolve_mod_group(c))
         self.assertEqual(gid, -1009990000)
+
+
+class TestGreeting(unittest.TestCase):
+    """Приветствие на первом контакте; продолжение — без него."""
+
+    def test_prompt_greets_on_first_contact(self):
+        p = suggest.make_system_prompt("FAQ", "ru", is_first_contact=True)
+        self.assertIn("ПЕРВЫЙ ответ", p)
+        self.assertIn("приветств", p.lower())
+
+    def test_prompt_no_greet_on_continuation(self):
+        p = suggest.make_system_prompt("FAQ", "ru", is_first_contact=False)
+        self.assertIn("ПРОДОЛЖЕНИЕ", p)
+        self.assertIn("НЕ здоровайся", p)
+
+    def test_first_contact_detection(self):
+        now = datetime.datetime(2026, 7, 3, 12, 0, tzinfo=datetime.timezone.utc)
+        me = 42
+        # наш ответ 2ч назад (в окне 18ч) → продолжение (False)
+        cont = [FakeHistMsg(999, "вопрос", date=now - datetime.timedelta(hours=1)),
+                FakeHistMsg(42, "ответ", date=now - datetime.timedelta(hours=2))]
+        self.assertFalse(suggest.first_contact_from(cont, me, hours=18, now=lambda: now))
+        # наш ответ 2 дня назад (вне окна) → первый контакт (True)
+        old = [FakeHistMsg(999, "вопрос", date=now - datetime.timedelta(hours=1)),
+               FakeHistMsg(42, "ответ", date=now - datetime.timedelta(days=2))]
+        self.assertTrue(suggest.first_contact_from(old, me, hours=18, now=lambda: now))
+        # только клиентские сообщения → первый контакт
+        only = [FakeHistMsg(999, "привет", date=now - datetime.timedelta(hours=1))]
+        self.assertTrue(suggest.first_contact_from(only, me, hours=18, now=lambda: now))
+
+
+class _ModBase(unittest.TestCase):
+    """Общий каркас: SUGGEST включён, tmp-хранилища, восстановление глобалей."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._save = (suggest.SUGGEST_MODE, suggest.SUGGEST_TEST_MODE,
+                      suggest.APPROVER_USERNAMES, suggest.pending, suggest.PAIRS_FILE)
+        suggest.SUGGEST_MODE = True
+        suggest.SUGGEST_TEST_MODE = True         # безопасно по умолчанию: клиенту не уходит
+        suggest.APPROVER_USERNAMES = set()        # пустой whitelist
+        suggest.reset_disabled()
+        suggest.limiter = suggest.RateLimiter(6, 15)
+        suggest.pending = suggest.PendingStore(os.path.join(self._tmp.name, "p.jsonl"))
+        suggest.PAIRS_FILE = os.path.join(self._tmp.name, "pairs.jsonl")
+
+    def tearDown(self):
+        (suggest.SUGGEST_MODE, suggest.SUGGEST_TEST_MODE,
+         suggest.APPROVER_USERNAMES, suggest.pending, suggest.PAIRS_FILE) = self._save
+        suggest.reset_disabled()
+        self._tmp.cleanup()
+
+    def _add_pending(self, mid=555, draft="D"):
+        suggest.pending.add(mid, {
+            "client_id": 999, "client_ref": "@c", "lang": "ru",
+            "incoming": "x", "draft": draft, "first_contact": True, "ts": "t",
+        })
+        return mid
+
+
+class TestApproverWhitelist(_ModBase):
+
+    def test_in_whitelist_passes(self):
+        suggest.APPROVER_USERNAMES = {"danya"}
+        mid = self._add_pending()
+        c = FakeClient()
+        ev = FakeEvent(c, reply_to=mid, text="+", sender=FakeSender(1, username="Danya"), chat_id=-100)
+        res = asyncio.run(suggest.on_moderation_reply(ev, jitter=lambda: 0, sleep=_nosleep))
+        self.assertEqual(res["action"], "approve")
+        self.assertIsNone(suggest.pending.get(mid))       # решение принято, pending снят
+
+    def test_not_in_whitelist_denied(self):
+        suggest.APPROVER_USERNAMES = {"danya"}
+        mid = self._add_pending()
+        c = FakeClient()
+        ev = FakeEvent(c, reply_to=mid, text="+", sender=FakeSender(2, username="stranger"), chat_id=-100)
+        res = asyncio.run(suggest.on_moderation_reply(ev, jitter=lambda: 0, sleep=_nosleep))
+        self.assertEqual(res["action"], "denied")
+        self.assertEqual(res["reason"], "not_approver")
+        self.assertTrue(any("⛔" in t[1] for t in c.sent if t[0] == -100))  # видимый ⛔
+        self.assertEqual([t for t in c.sent if t[0] == 999], [])            # клиенту ничего
+        self.assertIsNotNone(suggest.pending.get(mid))     # pending НЕ снят — approver ещё решит
+
+    def test_empty_whitelist_allows_any(self):
+        suggest.APPROVER_USERNAMES = set()
+        mid = self._add_pending()
+        c = FakeClient()
+        ev = FakeEvent(c, reply_to=mid, text="+", sender=FakeSender(3, username="whoever"), chat_id=-100)
+        res = asyncio.run(suggest.on_moderation_reply(ev, jitter=lambda: 0, sleep=_nosleep))
+        self.assertEqual(res["action"], "approve")
+
+
+class TestModerationAcks(_ModBase):
+    """NO-SILENT-PATHS: каждая ветка reply даёт видимый ack в группу; safety цел."""
+
+    def _run(self, text, test_mode):
+        suggest.SUGGEST_TEST_MODE = test_mode
+        mid = self._add_pending(mid=556, draft="D")
+        c = FakeClient()
+        ev = FakeEvent(c, reply_to=mid, text=text, chat_id=-100)
+        res = asyncio.run(suggest.on_moderation_reply(ev, jitter=lambda: 0, sleep=_nosleep))
+        acks = [t[1] for t in c.sent if t[0] == -100]
+        client_sends = [t for t in c.sent if t[0] == 999]
+        return res, acks, client_sends
+
+    def test_reject_ack(self):
+        res, acks, cs = self._run("-", True)
+        self.assertTrue(any("❌ Отклонено" in a for a in acks))
+        self.assertEqual(cs, [])
+
+    def test_approve_testmode_ack_no_client_send(self):
+        res, acks, cs = self._run("+", True)                 # SAFETY
+        self.assertTrue(any("TEST_MODE" in a for a in acks))
+        self.assertEqual(cs, [])                             # клиенту НИЧЕГО в TEST_MODE
+
+    def test_edit_testmode_ack_no_client_send(self):
+        res, acks, cs = self._run("Здравствуйте, вот цена", True)
+        self.assertTrue(any("Правка принята" in a for a in acks))
+        self.assertEqual(cs, [])
+
+    def test_approve_live_ack_and_sends(self):
+        res, acks, cs = self._run("+", False)
+        self.assertTrue(any("Отправлено клиенту" in a for a in acks))
+        self.assertIn((999, "D"), cs)                        # live: клиенту ушло
+
+    def test_every_branch_gets_ack(self):
+        for text in ("+", "-", "правка текстом"):
+            _, acks, _ = self._run(text, True)
+            self.assertTrue(acks, f"reply «{text}» остался без ack")
 
 
 if __name__ == "__main__":
