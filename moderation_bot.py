@@ -39,6 +39,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("moderation_bot")
 
+# БЕЗОПАСНОСТЬ: httpx/telegram на INFO пишут URL вида .../bot<TOKEN>/getUpdates — это
+# утечка токена в лог. Глушим их (и шумный apscheduler) до WARNING.
+for _noisy in ("httpx", "telegram", "telegram.ext", "apscheduler"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 TOKEN = suggest.MODERBOT_TOKEN
 _env_mod = os.getenv("MOD_GROUP_ID", "").strip()
 MOD_GROUP_ID = int(_env_mod) if _env_mod.lstrip("-").isdigit() else None
