@@ -198,9 +198,8 @@ async def main():
     # чтобы Telethon корректно привязался к event loop.
     client = TelegramClient(SESSION, API_ID, API_HASH)
     client.add_event_handler(on_incoming, events.NewMessage(incoming=True))
-    # Второй хендлер — только когда SUGGEST включён и задана группа модерации.
-    if suggest.is_enabled() and suggest.MOD_GROUP_ID is not None:
-        client.add_event_handler(on_moderation, events.NewMessage(chats=suggest.MOD_GROUP_ID))
+    # Второй хендлер (модерация) вешаем ПОСЛЕ старта — когда известен id группы
+    # (может резолвиться по имени через iter_dialogs). См. блок после get_me ниже.
 
     log.info(f"{_now()} | --- userbot_listen ЗАПУСК (ЭТАП C: слушаю, НЕ отвечаю) ---")
     try:
@@ -214,9 +213,13 @@ async def main():
             f"Слушаю входящие ЛИЧНЫЕ сообщения."
         )
         if suggest.is_enabled():
+            # Резолвим группу модерации (по ID из env или по имени) и вешаем 2-й хендлер.
+            gid = await suggest.resolve_mod_group(client)
+            if gid is not None:
+                client.add_event_handler(on_moderation, events.NewMessage(chats=gid))
             log.info(
                 f"{_now()} | SUGGEST ВКЛЮЧЁН "
-                f"(TEST_MODE={suggest.SUGGEST_TEST_MODE}, mod_group={suggest.MOD_GROUP_ID}, "
+                f"(TEST_MODE={suggest.SUGGEST_TEST_MODE}, mod_group={gid}, "
                 f"лимиты {suggest.RATE_PER_HOUR}/ч {suggest.RATE_PER_DAY}/д)."
             )
         else:

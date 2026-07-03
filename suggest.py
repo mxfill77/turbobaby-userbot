@@ -51,7 +51,8 @@ SUGGEST_MODE = _flag("SUGGEST_MODE", False)          # главный рубил
 SUGGEST_TEST_MODE = _flag("SUGGEST_TEST_MODE", False)  # обкатка: черновики есть, отправки клиенту НЕТ
 
 _mg = os.getenv("MOD_GROUP_ID", "").strip()
-MOD_GROUP_ID = int(_mg) if _mg.lstrip("-").isdigit() else None  # нет ID → черновики в лог
+MOD_GROUP_ID = int(_mg) if _mg.lstrip("-").isdigit() else None  # нет ID → резолв по имени/лог
+MOD_GROUP_NAME = os.getenv("MOD_GROUP_NAME", "").strip()        # резолв группы по title, если ID пуст
 
 RATE_PER_HOUR = _int("SUGGEST_RATE_HOUR", 6)
 RATE_PER_DAY = _int("SUGGEST_RATE_DAY", 15)
@@ -62,7 +63,8 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6").strip()
 LLM_MAX_TOKENS = _int("SUGGEST_MAX_TOKENS", 1000)
 
-FAQ_DOC = os.getenv("FAQ_DOC", "turbobaby_faq").strip()   # имя дока в Brain (read_doc GET)
+# Порядок чтения живого FAQ из Brain: «faq» (живой ключ) → «turbobaby_faq» → локальный файл.
+FAQ_DOC_ORDER = [s.strip() for s in os.getenv("FAQ_DOCS", "faq,turbobaby_faq").split(",") if s.strip()]
 BRIDGE_URL = os.getenv("BRIDGE_URL", "").strip()
 BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
 LOCAL_FAQ = os.path.join(BASE_DIR, "manager-bot", "docs", "turbobaby_faq_v1.md")
@@ -173,33 +175,37 @@ async def read_transcript(client, entity, me_id: int, limit: int = MAX_MESSAGES)
 
 # ------------------------------- FAQ / LLM -----------------------------------
 
+def _bridge_read_doc(name: str):
+    """read_doc GET по имени дока; вернуть текст или None."""
+    if not (BRIDGE_URL and BRIDGE_TOKEN):
+        return None
+    import urllib.request
+    import urllib.parse
+    full = BRIDGE_URL + "?" + urllib.parse.urlencode(
+        {"action": "read_doc", "name": name, "token": BRIDGE_TOKEN}
+    )
+    req = urllib.request.Request(full, method="GET")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if isinstance(data, dict) and data.get("ok"):
+        for k in ("text", "content", "fileContent", "body"):
+            if isinstance(data.get(k), str) and data[k].strip():
+                return data[k]
+    return None
+
+
 def load_faq(getter=None) -> str:
-    """Живой FAQ: сначала Brain (read_doc GET), затем локальный файл-снапшот.
-    getter — инъекция для тестов (callable(name)->text|None)."""
-    if getter is not None:
+    """Живой FAQ. Порядок: read_doc name=faq → read_doc name=turbobaby_faq → локальный файл.
+    getter(name)->text|None — инъекция для тестов (заменяет чтение из Brain)."""
+    read = getter if getter is not None else _bridge_read_doc
+    for name in FAQ_DOC_ORDER:
         try:
-            t = getter(FAQ_DOC)
-            if t:
-                return t
+            t = read(name)
         except Exception as e:
-            log.warning(f"SUGGEST: FAQ getter упал: {e}")
-    # Brain read_doc через GET (как cowork_log_append.get)
-    if BRIDGE_URL and BRIDGE_TOKEN:
-        try:
-            import urllib.request
-            import urllib.parse
-            full = BRIDGE_URL + "?" + urllib.parse.urlencode(
-                {"action": "read_doc", "name": FAQ_DOC, "token": BRIDGE_TOKEN}
-            )
-            req = urllib.request.Request(full, method="GET")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            if isinstance(data, dict) and data.get("ok"):
-                for k in ("text", "content", "fileContent", "body"):
-                    if isinstance(data.get(k), str) and data[k].strip():
-                        return data[k]
-        except Exception as e:
-            log.warning(f"SUGGEST: read_doc FAQ упал ({e}) — падаю на локальный файл.")
+            log.warning(f"SUGGEST: read_doc FAQ '{name}' упал: {e}")
+            t = None
+        if t and t.strip():
+            return t
     try:
         with open(LOCAL_FAQ, encoding="utf-8") as f:
             return f.read()
@@ -340,7 +346,12 @@ def record_pair(rec: dict, path: str = None):
 # ------------------------------- отправка ------------------------------------
 
 async def send_to_client(client, client_id, text, sleep=None, jitter=None):
-    """Отправка клиенту с гардами. Возвращает (ok, reason). При флуде — авто-стоп."""
+    """Отправка клиенту с гардами. Возвращает (ok, reason). При флуде — авто-стоп.
+    Defense-in-depth: в TEST_MODE отправка клиенту заблокирована и ЗДЕСЬ (второй слой,
+    помимо гейта в on_moderation_reply) — чтобы никакой путь не смог написать клиенту."""
+    if SUGGEST_TEST_MODE:
+        log.info("SUGGEST[TEST_MODE] send_to_client заблокирован — клиенту ничего не уходит.")
+        return False, "TEST_MODE"
     sleep = sleep or asyncio.sleep
     jitter = jitter or (lambda: random.uniform(PAUSE_MIN, PAUSE_MAX))
 
@@ -375,6 +386,31 @@ async def post_draft(client, draft: str, client_ref: str):
     mid = int(time.time() * 1000) % 2147483647
     log.info(f"SUGGEST[draft→log mid={mid}] {client_ref}: {draft}")
     return mid
+
+
+async def resolve_mod_group(client):
+    """Если MOD_GROUP_ID пуст и задано MOD_GROUP_NAME — найти группу по title через
+    iter_dialogs и подставить её id. Возвращает id или None. Не падает: не нашли →
+    лог + None (черновики пойдут в лог, как при отсутствии ID)."""
+    global MOD_GROUP_ID
+    if MOD_GROUP_ID is not None:
+        return MOD_GROUP_ID
+    if not MOD_GROUP_NAME:
+        return None
+    try:
+        async for d in client.iter_dialogs():
+            title = getattr(d, "title", None) or getattr(d, "name", None)
+            if title == MOD_GROUP_NAME:
+                MOD_GROUP_ID = int(d.id)
+                log.info(f"SUGGEST: MOD_GROUP resolved: {MOD_GROUP_ID} (по имени «{MOD_GROUP_NAME}»).")
+                return MOD_GROUP_ID
+        log.warning(
+            f"SUGGEST: группа «{MOD_GROUP_NAME}» не найдена среди диалогов — "
+            f"черновики пойдут в ЛОГ (approve недоступен, отправки клиенту нет)."
+        )
+    except Exception as e:
+        log.warning(f"SUGGEST: resolve_mod_group упал: {e} — черновики в лог.")
+    return None
 
 
 async def on_client_message(client, sender, me_id, call_llm=None, faq=None):

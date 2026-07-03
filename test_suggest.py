@@ -44,12 +44,20 @@ class FakeSender:
         self.bot = bot
 
 
+class FakeDialog:
+    def __init__(self, title, did):
+        self.title = title
+        self.name = title
+        self.id = did
+
+
 class FakeClient:
-    """Замена Telethon-клиента: пишет отправки в self.sent, отдаёт историю диалога."""
-    def __init__(self, history=None, flood_exc=None):
+    """Замена Telethon-клиента: пишет отправки в self.sent, отдаёт историю/диалоги."""
+    def __init__(self, history=None, flood_exc=None, dialogs=None):
         self.history = history or []
         self.sent = []            # список (chat, text)
         self.flood_exc = flood_exc
+        self.dialogs = dialogs or []
         self._next_id = 5000
 
     def action(self, chat, kind):
@@ -66,6 +74,12 @@ class FakeClient:
         async def gen():
             for m in self.history:
                 yield m
+        return gen()
+
+    def iter_dialogs(self):
+        async def gen():
+            for d in self.dialogs:
+                yield d
         return gen()
 
 
@@ -167,6 +181,21 @@ class TestSendGuards(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("лимит", reason)
         self.assertEqual(len(c.sent), 1)          # второй не ушёл
+
+    def test_test_mode_blocks_send_to_client(self):
+        # Defense-in-depth: даже прямой вызов send_to_client в TEST_MODE ничего не шлёт.
+        old = suggest.SUGGEST_TEST_MODE
+        suggest.SUGGEST_TEST_MODE = True
+        try:
+            c = FakeClient()
+            ok, reason = asyncio.run(
+                suggest.send_to_client(c, 1, "x", sleep=_nosleep, jitter=lambda: 0)
+            )
+            self.assertFalse(ok)
+            self.assertEqual(reason, "TEST_MODE")
+            self.assertEqual(c.sent, [])          # клиенту ничего
+        finally:
+            suggest.SUGGEST_TEST_MODE = old
 
     def test_flood_disables_suggest(self):
         class MyFlood(Exception):
@@ -288,6 +317,67 @@ class TestFullFlow(unittest.TestCase):
         ev = FakeEvent(self.client, reply_to=123456789, text="+")  # чужой reply
         res = asyncio.run(suggest.on_moderation_reply(ev, jitter=lambda: 0, sleep=_nosleep))
         self.assertIsNone(res)
+
+
+class TestFaqOrder(unittest.TestCase):
+    """Порядок чтения FAQ: faq → turbobaby_faq → локальный файл."""
+
+    def test_primary_faq_used(self):
+        getter = lambda name: {"faq": "ЖИВОЙ-FAQ", "turbobaby_faq": "СТАРЫЙ"}.get(name)
+        self.assertEqual(suggest.load_faq(getter=getter), "ЖИВОЙ-FAQ")
+
+    def test_fallback_to_turbobaby(self):
+        getter = lambda name: {"faq": "", "turbobaby_faq": "СТАРЫЙ-FAQ"}.get(name)
+        self.assertEqual(suggest.load_faq(getter=getter), "СТАРЫЙ-FAQ")
+
+    def test_fallback_to_local_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "faq.md")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("ЛОКАЛЬНЫЙ-FAQ")
+            old = suggest.LOCAL_FAQ
+            suggest.LOCAL_FAQ = p
+            try:
+                self.assertEqual(suggest.load_faq(getter=lambda n: ""), "ЛОКАЛЬНЫЙ-FAQ")
+            finally:
+                suggest.LOCAL_FAQ = old
+
+
+class TestResolveGroup(unittest.TestCase):
+    """Резолв группы модерации по имени через iter_dialogs."""
+
+    def setUp(self):
+        self._id = suggest.MOD_GROUP_ID
+        self._name = suggest.MOD_GROUP_NAME
+
+    def tearDown(self):
+        suggest.MOD_GROUP_ID = self._id
+        suggest.MOD_GROUP_NAME = self._name
+
+    def test_resolve_by_name(self):
+        suggest.MOD_GROUP_ID = None
+        suggest.MOD_GROUP_NAME = "Модерация ответов"
+        c = FakeClient(dialogs=[
+            FakeDialog("Входящие", -1001110000),
+            FakeDialog("Модерация ответов", -1002220000),
+        ])
+        gid = asyncio.run(suggest.resolve_mod_group(c))
+        self.assertEqual(gid, -1002220000)
+        self.assertEqual(suggest.MOD_GROUP_ID, -1002220000)
+
+    def test_not_found_returns_none(self):
+        suggest.MOD_GROUP_ID = None
+        suggest.MOD_GROUP_NAME = "Нет такой группы"
+        c = FakeClient(dialogs=[FakeDialog("Входящие", -1001110000)])
+        gid = asyncio.run(suggest.resolve_mod_group(c))
+        self.assertIsNone(gid)
+
+    def test_explicit_id_skips_resolve(self):
+        suggest.MOD_GROUP_ID = -1009990000
+        suggest.MOD_GROUP_NAME = "Модерация ответов"
+        c = FakeClient(dialogs=[])  # iter_dialogs не нужен — ID уже есть
+        gid = asyncio.run(suggest.resolve_mod_group(c))
+        self.assertEqual(gid, -1009990000)
 
 
 if __name__ == "__main__":
