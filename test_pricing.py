@@ -139,7 +139,8 @@ class TestHintsAndNote(unittest.TestCase):
         self.assertIn("никак", p)
         self.assertIn("from", p)
 
-    _HINTS = {"has_dates": True, "model": "NMAX", "iso_start": "2026-07-10", "iso_end": "2026-07-17"}
+    _HINTS = {"has_dates": True, "model": "NMAX", "iso_start": "2026-07-10",
+              "iso_end": "2026-07-17", "hint_days": 7, "monthly": False}
 
     def _with_qfm(self, ret):
         saved = pricing.quote_for_model
@@ -148,7 +149,7 @@ class TestHintsAndNote(unittest.TestCase):
 
     def test_note_quote_ok_carries_figure(self):
         self._with_qfm({"status": "ok", "quote": {"day_price": 900, "total": 6300,
-                                                  "deposit": 7000, "available": True}})
+                                                  "deposit": 7000, "available": True, "days": 7}})
         note = suggest.build_pricing_note(dict(self._HINTS))
         self.assertIn("Календаря", note)
         self.assertIn("900", note)
@@ -209,7 +210,7 @@ class TestTwoPhaseDraft(unittest.TestCase):
         if "использовать ДОСЛОВНО" in system:
             return "HAS_PRICE"
         if ("сейчас недоступна" in system or "все подходящие байки заняты" in system
-                or "не удалось однозначно разобрать" in system):
+                or "не удалось однозначно разобрать" in system or "не сходится" in system):
             return "FALLBACK"
         return "OTHER"
 
@@ -225,8 +226,15 @@ class TestTwoPhaseDraft(unittest.TestCase):
 
     def test_phase_b_quote_ok_uses_figure(self):
         pricing.quote_for_model = lambda *a, **k: {"status": "ok", "quote": {
-            "day_price": 900, "total": 6300, "deposit": 7000, "available": True}}
+            "day_price": 900, "total": 6300, "deposit": 7000, "available": True, "days": 7}}
         self.assertEqual(self._run("NMAX 10.07-17.07 почём?"), "HAS_PRICE")
+
+    def test_phase_b_bad_days_sanity_fallback(self):
+        # SANITY: quote days=360 при hint 5 дней → фолбэк, цифры НЕ уходят
+        pricing.quote_for_model = lambda *a, **k: {"status": "ok", "quote": {
+            "day_price": 219, "total": 78858, "deposit": 3000, "available": True, "days": 360}}
+        draft = self._run("NMAX с 5 по 10 июля")   # hint ~5 дней
+        self.assertEqual(draft, "FALLBACK")
 
     def test_phase_b_quote_error_fallback(self):
         # quote_for_model → error (setUp) → фолбэк, без FAQ-числа
@@ -304,26 +312,71 @@ class TestFleetResolve(unittest.TestCase):
 class TestDateParse(unittest.TestCase):
     TODAY = datetime.date(2026, 7, 3)
 
-    def test_numeric_range(self):
-        self.assertEqual(suggest.parse_date_range("10.07-15.07", self.TODAY),
-                         ("2026-07-10", "2026-07-15"))
+    def _days(self, phrase):
+        s, e = suggest.parse_date_range(phrase, self.TODAY)
+        self.assertIsNotNone(s, phrase); self.assertIsNotNone(e, phrase)
+        ds = datetime.date.fromisoformat(s); de = datetime.date.fromisoformat(e)
+        return s, e, (de - ds).days
 
-    def test_s_po_shared_month(self):
-        self.assertEqual(suggest.parse_date_range("с 5 по 10.07", self.TODAY),
-                         ("2026-07-05", "2026-07-10"))
+    def test_battery_durations(self):
+        # каждый кейс → корректная длительность (days = разница дат, конвенция как у quote_price)
+        self.assertEqual(self._days("с 5 по 10 июля")[2], 5)
+        self.assertEqual(self._days("5–10 июля")[2], 5)
+        self.assertEqual(self._days("с 5 по 10.07")[2], 5)
+        self.assertEqual(self._days("10.07-15.07")[2], 5)
+        self.assertEqual(self._days("на неделю с 5 июля")[2], 7)
+        self.assertEqual(self._days("завтра на 3 дня")[2], 3)
+        self.assertEqual(self._days("на месяц с 5 июля")[2], 30)
 
-    def test_month_word_range(self):
-        self.assertEqual(suggest.parse_date_range("5–10 июля", self.TODAY),
-                         ("2026-07-05", "2026-07-10"))
+    def test_year_roll_dec_jan(self):
+        s, e, d = self._days("с 28 декабря по 3 января")
+        self.assertEqual((s, e, d), ("2026-12-28", "2027-01-03", 6))   # легитимный переход через год
 
-    def test_past_month_rolls_next_year(self):
-        self.assertEqual(suggest.parse_date_range("10.01-15.01", self.TODAY),
-                         ("2027-01-10", "2027-01-15"))
+    def test_swapped_order_not_360(self):
+        # КОРЕНЬ БАГА: перепутанный порядок НЕ должен давать ~360 дней
+        s, e, d = self._days("с 10 по 5 июля")
+        self.assertEqual(d, 5)
+        self.assertLess(d, 30)
+        self.assertEqual((s, e), ("2026-07-05", "2026-07-10"))
 
-    def test_hints_include_iso(self):
+    def test_hints_iso_and_hintdays(self):
         h = suggest.extract_booking_hints("[клиент]: NMAX 10.07-17.07", today=self.TODAY)
         self.assertEqual(h["iso_start"], "2026-07-10")
         self.assertEqual(h["iso_end"], "2026-07-17")
+        self.assertEqual(h["hint_days"], 7)
+
+
+class TestSanityGuard(unittest.TestCase):
+    def test_matching_days_ok(self):
+        self.assertTrue(pricing.sanity_days_ok(5, 5))
+        self.assertTrue(pricing.sanity_days_ok(6, 5))          # расхождение 1 — ок
+
+    def test_mismatch_blocked(self):
+        self.assertFalse(pricing.sanity_days_ok(7, 5))         # расхождение 2 — режем
+        self.assertFalse(pricing.sanity_days_ok(360, 5))       # дикое расхождение
+
+    def test_over_45_without_monthly_blocked(self):
+        self.assertFalse(pricing.sanity_days_ok(60, None))     # >45 без месячного → режем
+        self.assertTrue(pricing.sanity_days_ok(30, 30, monthly=True))
+
+    def test_invalid_days_blocked(self):
+        self.assertFalse(pricing.sanity_days_ok(None, 5))
+        self.assertFalse(pricing.sanity_days_ok(0, 5))
+
+    def test_note_wild_days_no_number(self):
+        # build_pricing_note: quote days=360 при hint 5 → фолбэк, ни одной цифры цены
+        saved = pricing.quote_for_model
+        pricing.quote_for_model = lambda *a, **k: {"status": "ok", "quote": {
+            "day_price": 219, "total": 78858, "deposit": 3000, "available": True, "days": 360}}
+        try:
+            note = suggest.build_pricing_note({"has_dates": True, "model": "NMAX",
+                                               "iso_start": "2026-07-05", "iso_end": "2026-07-10",
+                                               "hint_days": 5, "monthly": False})
+            for n in ("219", "78858", "78 858", "3000"):
+                self.assertNotIn(n, note)
+            self.assertIn("уточн", note.lower())
+        finally:
+            pricing.quote_for_model = saved
 
 
 class TestScenarioOrder(unittest.TestCase):

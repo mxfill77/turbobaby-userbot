@@ -279,61 +279,140 @@ def _client_text(transcript: str) -> str:
     return "\n".join(l for l in (transcript or "").split("\n") if l.startswith("[клиент]:")).lower()
 
 
-_RU_MONTH_NUM = [
-    ("январ", 1), ("феврал", 2), ("март", 3), ("апрел", 4), ("мая", 5), ("май", 5),
-    ("июн", 6), ("июл", 7), ("август", 8), ("сентябр", 9), ("октябр", 10),
-    ("ноябр", 11), ("декабр", 12),
-]
+_MONTH_RE = r"(январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)"
+_MON_MAP = {"январ": 1, "феврал": 2, "март": 3, "апрел": 4, "май": 5, "мая": 5,
+            "июн": 6, "июл": 7, "август": 8, "сентябр": 9, "октябр": 10,
+            "ноябр": 11, "декабр": 12}
 
 
-def _future_date(day, month, today, year=None):
-    y = int(year) if year else today.year
-    if year and y < 100:
-        y += 2000
+def _mon(stem):
+    return _MON_MAP.get(stem)
+
+
+def _safe_date(y, m, d):
     try:
-        d = datetime.date(y, int(month), int(day))
+        return datetime.date(int(y), int(m), int(d))
     except (ValueError, TypeError):
         return None
-    if not year and d < today:                 # прошло в этом году → ближайший будущий
-        try:
-            d = datetime.date(y + 1, int(month), int(day))
-        except ValueError:
-            return None
-    return d
+
+
+def _mk(day, month, today, year=None):
+    """Дата ближайшего будущего (если год не задан явно)."""
+    if year:
+        y = int(year)
+        if y < 100:
+            y += 2000
+        return _safe_date(y, month, day)
+    dt = _safe_date(today.year, month, day)
+    if dt is None:
+        return None
+    if dt < today:                       # прошло в этом году → следующий год (ТОЛЬКО для старта/якоря)
+        dt = _safe_date(today.year + 1, month, day)
+    return dt
+
+
+def _resolve_range(d_s, m_s, d_e, m_e, today, y_s=None, y_e=None):
+    """Собрать (start, end) из двух точек. Год-ролл end+1г ТОЛЬКО при реальном переходе через
+    год (месяц конца < месяца начала, напр. дек→янв). Перепутанный порядок в одном месяце → SWAP
+    (НИКОГДА не превращаем в ~360 дней)."""
+    start = _mk(d_s, m_s, today, y_s)
+    if start is None:
+        return None, None
+    if y_e:                                          # у конца явный год
+        end = _mk(d_e, m_e, today, y_e)
+        if end and end < start:
+            return end, start                        # явные годы, но реверс → swap
+        return start, end
+    end = _safe_date(start.year, m_e, d_e)
+    if end is None:
+        return start, None
+    if end >= start:
+        return start, end
+    if int(m_e) < int(m_s):                          # дек→янв: легитимный переход через год
+        return start, _safe_date(start.year + 1, m_e, d_e)
+    return end, start                                # тот же/поздний месяц, но end<start → перепутан → swap
+
+
+def _parse_term(t):
+    """Срок из слов → (days:int, monthly:bool) или None."""
+    if re.search(r"\bна\s+месяц\b", t) or re.search(r"\bмесяц\b", t):
+        return (30, True)
+    m = re.search(r"на\s+(\d{1,3})\s*(нед|недел)", t)
+    if m:
+        return (int(m.group(1)) * 7, False)
+    if re.search(r"\bна\s+недел|\bнеделю\b", t):
+        return (7, False)
+    m = re.search(r"на\s+(\d{1,3})\s*(дн|дня|дней|день|сут)", t)
+    if m:
+        return (int(m.group(1)), False)
+    m = re.search(r"на\s+(\d{1,3})\s*(day|days|week|weeks|month)", t)
+    if m:
+        n, u = int(m.group(1)), m.group(2)
+        if u.startswith("week"):
+            return (n * 7, False)
+        if u == "month":
+            return (n * 30, True)
+        return (n, False)
+    return None
+
+
+def _anchor_date(t, today):
+    """Дата начала для срочных фраз («завтра на 3 дня», «на неделю с 5 июля»)."""
+    if "послезавтра" in t:
+        return today + datetime.timedelta(days=2)
+    if "завтра" in t:
+        return today + datetime.timedelta(days=1)
+    if "сегодня" in t:
+        return today
+    m = re.search(r"с\s+(\d{1,2})\s+" + _MONTH_RE, t)
+    if m:
+        return _mk(int(m.group(1)), _mon(m.group(2)), today)
+    m = re.search(r"с\s+(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", t)
+    if m:
+        return _mk(int(m.group(1)), int(m.group(2)), today, m.group(3) or None)
+    m = re.search(r"(\d{1,2})\s+" + _MONTH_RE, t)
+    if m:
+        return _mk(int(m.group(1)), _mon(m.group(2)), today)
+    m = re.search(r"(\d{1,2})[./](\d{1,2})", t)
+    if m:
+        return _mk(int(m.group(1)), int(m.group(2)), today)
+    return None
 
 
 def parse_date_range(text, today=None):
-    """Разобрать диапазон дат из слов клиента → (iso_start, iso_end) или (None, None).
-    Поддержка: «10.07-15.07», «с 5 по 10.07», «5–10 июля». Год — ближайший будущий; если
-    из-за этого start в прошлом — берётся следующий год."""
+    """Диапазон дат из слов клиента → (iso_start, iso_end) или (None, None).
+    Поддержка: «10.07-15.07», «с 5 по 10.07», «5–10 июля», «с 5 по 10 июля», «с 28 декабря по
+    3 января» (год-ролл), «на неделю/месяц с 5 июля», «завтра на 3 дня», перепутанный порядок
+    (swap). Год-ролл end+1г — ТОЛЬКО при реальном переходе через год, НЕ как лечение."""
     today = today or datetime.date.today()
-    t = (text or "").lower().replace("–", "-").replace("—", "-")
-    dm = re.findall(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", t)
+    t = (text or "").lower().replace("–", "-").replace("—", "-").replace("ё", "е")
+    dmw = [(int(m.group(1)), _mon(m.group(2))) for m in re.finditer(r"(\d{1,2})\s+" + _MONTH_RE, t)]
+    dmy = re.findall(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", t)
+    mwm = re.search(_MONTH_RE, t)
+    mw = _mon(mwm.group(1)) if mwm else None
     rng = re.search(r"(?:с\s*)?(\d{1,2})\s*(?:-|по|до)\s*(\d{1,2})", t)
-    month_word = None
-    for stem, mon in _RU_MONTH_NUM:
-        if stem in t:
-            month_word = mon
-            break
+    term = _parse_term(t)
+
     s = e = None
-    if len(dm) >= 2:                                        # «10.07-15.07»
-        d1, m1, y1 = dm[0]; d2, m2, y2 = dm[1]
-        s = _future_date(d1, m1, today, y1 or None)
-        e = _future_date(d2, m2, today, y2 or None)
-    elif len(dm) == 1 and rng:                             # «с 5 по 10.07» (месяц из dd.mm)
-        _de, _me, _ye = dm[0]
-        s = _future_date(rng.group(1), _me, today, _ye or None)
-        e = _future_date(rng.group(2), _me, today, _ye or None)
-    elif rng and month_word:                               # «5-10 июля»
-        s = _future_date(rng.group(1), month_word, today)
-        e = _future_date(rng.group(2), month_word, today)
+    if len(dmw) >= 2:                                        # «28 декабря по 3 января»
+        s, e = _resolve_range(dmw[0][0], dmw[0][1], dmw[1][0], dmw[1][1], today)
+    elif len(dmy) >= 2:                                      # «10.07-15.07»
+        s, e = _resolve_range(int(dmy[0][0]), int(dmy[0][1]), int(dmy[1][0]), int(dmy[1][1]),
+                              today, dmy[0][2] or None, dmy[1][2] or None)
+    elif rng and (mw or len(dmy) == 1):                     # «с 5 по 10 июля» / «с 5 по 10.07» / «5-10 июля»
+        month = mw if mw else int(dmy[0][1])
+        yhint = (dmy[0][2] or None) if len(dmy) == 1 else None
+        s, e = _resolve_range(int(rng.group(1)), month, int(rng.group(2)), month, today, yhint, yhint)
+    elif term:                                              # «на неделю с 5 июля» / «завтра на 3 дня»
+        anchor = _anchor_date(t, today)
+        if anchor:
+            s = anchor
+            e = anchor + datetime.timedelta(days=term[0])
+
     if not (s and e):
         return None, None
-    if e < s:                                              # диапазон через границу года
-        try:
-            e = e.replace(year=e.year + 1)
-        except ValueError:
-            pass
+    if e < s:                                               # финальная страховка: swap, НЕ год-ролл
+        s, e = e, s
     return s.isoformat(), e.isoformat()
 
 
@@ -349,21 +428,28 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
     dates = re.findall(r"\b(\d{1,2}[.\-/]\d{1,2}(?:[./]\d{2,4})?)\b", text)
     date_start = dates[0] if dates else None
     date_end = dates[1] if len(dates) > 1 else None
-    m_term = (re.search(r"на\s+(\d{1,3})\s*(дн|дней|день|сут|недел|мес)", text)
-              or re.search(r"(\d{1,3})\s*(day|days|week|month)", text))
-    term_days = None
-    if m_term:
-        try:
-            term_days = int(m_term.group(1))
-        except Exception:
-            term_days = None
+    term = _parse_term(text)
+    term_days = term[0] if term else None
+    monthly = bool(term and term[1]) or bool(re.search(r"месяц", text))
     m_range = re.search(r"с\s+(\d{1,2})\s+(?:по|до)\s+(\d{1,2})", text)
     has_month = any(mo in text for mo in _MONTHS)
     has_dates = bool(dates or term_days or m_range or has_month)
     iso_start, iso_end = parse_date_range(text, today)     # полный формат для Bridge
+    # длительность из слов клиента (для sanity-гарда): разница разобранных дат, иначе срок
+    hint_days = None
+    if iso_start and iso_end:
+        try:
+            hint_days = (datetime.date.fromisoformat(iso_end)
+                         - datetime.date.fromisoformat(iso_start)).days
+        except Exception:
+            hint_days = None
+    if hint_days is None:
+        hint_days = term_days
+    if hint_days is not None and hint_days >= 28:
+        monthly = True
     return {"model": model, "date_start": date_start, "date_end": date_end,
-            "iso_start": iso_start, "iso_end": iso_end,
-            "term_days": term_days, "has_dates": has_dates}
+            "iso_start": iso_start, "iso_end": iso_end, "term_days": term_days,
+            "hint_days": hint_days, "monthly": monthly, "has_dates": has_dates}
 
 
 def build_pricing_note(hints: dict) -> str:
@@ -387,6 +473,11 @@ def build_pricing_note(hints: dict) -> str:
     q = res.get("quote") if isinstance(res, dict) else None
     status = res.get("status") if isinstance(res, dict) else "error"
     if status == "ok" and q:
+        # SANITY-ГАРД: сверяем days из quote с длительностью из слов клиента. Кривые даты
+        # (напр. 360 дней при 5) → НЕ вставляем цифры, честный фолбэк.
+        if not pricing.sanity_days_ok(q.get("days"), hints.get("hint_days"), hints.get("monthly")):
+            return ("ЦЕНА: расчёт по датам не сходится (длительность подозрительная) — НЕ называй "
+                    "никакого числа; ответь, что уточню цену по датам и вернусь.")
         parts = []
         if q.get("day_price") is not None:
             parts.append(f"{q['day_price']} ฿/день")

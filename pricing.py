@@ -127,6 +127,32 @@ def fleet(_get=None, _now=None):
     return bikes
 
 
+def sanity_days_ok(quote_days, hint_days, monthly=False):
+    """СТРАХОВОЧНЫЙ ГАРД (независим от парсера): согласуется ли days из quote с длительностью
+    из слов клиента. Кривые даты (напр. 360 дней при 5) НЕ должны доехать до клиента.
+    False → цену НЕ вставляем, честный фолбэк. Логируем WARNING в pricing.log."""
+    try:
+        qd = int(quote_days)
+    except (TypeError, ValueError):
+        log.warning(f"SANITY: quote без валидного days={quote_days!r} — режу цену, фолбэк")
+        return False
+    if qd < 1:
+        log.warning(f"SANITY: days={qd} < 1 — режу цену, фолбэк")
+        return False
+    if qd > 45 and not monthly:
+        log.warning(f"SANITY: days={qd} > 45 без месячного запроса — режу цену, фолбэк")
+        return False
+    if hint_days is not None:
+        try:
+            hd = int(hint_days)
+        except (TypeError, ValueError):
+            hd = None
+        if hd is not None and abs(qd - hd) > 1:
+            log.warning(f"SANITY: quote days={qd} vs слова клиента {hd} (расхождение >1) — режу цену, фолбэк")
+            return False
+    return True
+
+
 def _norm_alnum(s):
     return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
 
