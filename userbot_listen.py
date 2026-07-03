@@ -19,8 +19,10 @@ turbobaby_session.session — те же ключи и та же сессия, ч
 
 Зависимости: telethon, python-dotenv (уже стоят, как у fetch_*.py).
 
-ЭТАП C — гарантия: в этом файле НЕТ client.send_message / reply / forward /
-respond. Userbot ничего не пишет. Доступ к мозгу/Drive не используется.
+ЭТАП C (по умолчанию) — userbot только слушает и логирует, ноль исходящих.
+Ступень ① SUGGEST — ОПЦИОНАЛЬНА и по умолчанию ВЫКЛЮЧЕНА (SUGGEST_MODE=off в .env):
+при выключенной SUGGEST поведение идентично Stage C. При включении черновики ответов
+готовятся и уходят клиенту ТОЛЬКО после модерации reply-командой — логика в suggest.py.
 """
 
 import os
@@ -35,6 +37,10 @@ from telethon import TelegramClient, events
 from telethon.tl.types import User
 
 load_dotenv()
+
+# suggest импортируем ПОСЛЕ load_dotenv — модуль читает конфиг (SUGGEST_MODE и пр.)
+# из окружения на импорте; иначе флаги из .env не подхватятся.
+import suggest  # noqa: E402
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -60,6 +66,8 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("userbot")
+
+_ME_ID = None  # id аккаунта userbot; заполняется в main после get_me (нужно SUGGEST)
 
 
 def _now() -> str:
@@ -162,6 +170,23 @@ async def on_incoming(event):
 
     log.info(f"{date_iso} | {who} | {name} | {text}")
 
+    # --- ступень ① SUGGEST (opt-in; при SUGGEST_MODE=off блок не выполняется) ---
+    if suggest.is_enabled():
+        try:
+            await suggest.on_client_message(event.client, sender, _ME_ID)
+        except Exception as e:
+            log.warning(f"{_now()} | SUGGEST: сбой генерации черновика: {e}")
+
+
+async def on_moderation(event):
+    """Reply менеджера в группе «Модерация ответов» → approve/edit/reject (ступень ①)."""
+    if not suggest.is_enabled():
+        return
+    try:
+        await suggest.on_moderation_reply(event)
+    except Exception as e:
+        log.warning(f"{_now()} | SUGGEST: сбой обработки модерации: {e}")
+
 
 async def main():
     # Singleton-гард ДО подключения: если живой экземпляр уже есть — выходим,
@@ -173,16 +198,29 @@ async def main():
     # чтобы Telethon корректно привязался к event loop.
     client = TelegramClient(SESSION, API_ID, API_HASH)
     client.add_event_handler(on_incoming, events.NewMessage(incoming=True))
+    # Второй хендлер — только когда SUGGEST включён и задана группа модерации.
+    if suggest.is_enabled() and suggest.MOD_GROUP_ID is not None:
+        client.add_event_handler(on_moderation, events.NewMessage(chats=suggest.MOD_GROUP_ID))
 
     log.info(f"{_now()} | --- userbot_listen ЗАПУСК (ЭТАП C: слушаю, НЕ отвечаю) ---")
     try:
         # start() поднимет существующую сессию turbobaby_session — код подтверждения не спросит.
         await client.start()
         me = await client.get_me()
+        global _ME_ID
+        _ME_ID = me.id
         log.info(
             f"{_now()} | вошёл как @{me.username} (id={me.id}). "
-            f"Слушаю входящие ЛИЧНЫЕ сообщения. Исходящих — ноль."
+            f"Слушаю входящие ЛИЧНЫЕ сообщения."
         )
+        if suggest.is_enabled():
+            log.info(
+                f"{_now()} | SUGGEST ВКЛЮЧЁН "
+                f"(TEST_MODE={suggest.SUGGEST_TEST_MODE}, mod_group={suggest.MOD_GROUP_ID}, "
+                f"лимиты {suggest.RATE_PER_HOUR}/ч {suggest.RATE_PER_DAY}/д)."
+            )
+        else:
+            log.info(f"{_now()} | SUGGEST выключен — чистый Stage C, исходящих ноль.")
         # Процесс ЖИВЁТ постоянно — это и есть отличие от разведчиков.
         await client.run_until_disconnected()
     finally:
