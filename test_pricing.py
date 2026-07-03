@@ -124,6 +124,20 @@ class TestHintsAndNote(unittest.TestCase):
         self.assertIn("дат", note.lower())
         self.assertIn("не называй", note.lower())
 
+    def test_note_no_dates_forbids_any_price_form(self):
+        # уточнение владельца: запрещена ЛЮБАЯ цена, включая «от X»/диапазон/«from»
+        note = suggest.build_pricing_note({"has_dates": False}).lower()
+        self.assertIn("никак", note)
+        self.assertIn("от x", note)       # прямой запрет «от X»
+        self.assertIn("диапазон", note)   # запрет диапазона
+        self.assertIn("from", note)       # запрет англ. «from»
+
+    def test_policy_forbids_any_price_without_calendar(self):
+        p = suggest.make_system_prompt("FAQ", "ru").lower()
+        self.assertIn("от x", p)          # политика прямо запрещает «от X»
+        self.assertIn("никак", p)
+        self.assertIn("from", p)
+
     def test_note_quote_ok_carries_figure(self):
         saved = pricing.quote
         pricing.quote = lambda *a, **k: {"day_price": 900, "total": 6300, "deposit": 7000, "available": True}
