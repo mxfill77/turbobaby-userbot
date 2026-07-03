@@ -49,6 +49,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 REPO_DIR = Path(__file__).resolve().parent
 VENV_PY = REPO_DIR / "venv" / "Scripts" / "python.exe"
 LISTEN_SCRIPT = REPO_DIR / "userbot_listen.py"
+MODERBOT_SCRIPT = REPO_DIR / "moderation_bot.py"  # бот-модератор (задача-2)
 USERBOT_LOG = REPO_DIR / "userbot.log"
 AGENT_LOG = REPO_DIR / "pc_agent.log"
 AGENT_LOCK = REPO_DIR / "pc_agent.lock"  # singleton-гард: не запускать ДВА агента сразу
@@ -223,6 +224,81 @@ class UserbotProcess:
 UB = UserbotProcess()
 
 
+# ===================== управление процессом moderation_bot ====================
+
+def _find_moderbot_pids():
+    """PID'ы python-процессов, исполняющих moderation_bot.py. Фиксированный CIM-запрос."""
+    ps = (
+        "Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" "
+        "| Where-Object { $_.CommandLine -like '*moderation_bot.py*' } "
+        "| Select-Object -ExpandProperty ProcessId"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=20,
+        )
+        return [int(x) for x in out.stdout.split() if x.strip().isdigit()]
+    except Exception as e:
+        alog.warning(f"не смог проверить процессы moderation_bot: {e}")
+        return []
+
+
+class ModerbotProcess:
+    """Жизненный цикл moderation_bot.py (задача-2). По образцу UserbotProcess.
+    НЕ поднимается без MODERBOT_TOKEN — тогда работает деградация (reply-режим userbot)."""
+
+    def __init__(self):
+        self.proc = None
+
+    def _alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def status(self):
+        pids = _find_moderbot_pids()
+        token = bool(os.getenv("MODERBOT_TOKEN", "").strip())
+        state = "работает" if pids else ("не запущен" if token else "не запущен (нет MODERBOT_TOKEN → reply-режим)")
+        return f"moderation_bot: {state}" + (f" (PID {', '.join(map(str, pids))})" if pids else "")
+
+    def start(self):
+        if not os.getenv("MODERBOT_TOKEN", "").strip():
+            return "не запускаю: нет MODERBOT_TOKEN в .env (работает деградация — reply-режим userbot)."
+        pids = _find_moderbot_pids()
+        if pids:
+            return f"moderation_bot уже работает (PID {', '.join(map(str, pids))}), второй не поднимаю."
+        if not VENV_PY.exists():
+            return f"не нашёл python venv: {VENV_PY}"
+        self.proc = subprocess.Popen([str(VENV_PY), str(MODERBOT_SCRIPT)], cwd=str(REPO_DIR))
+        alog.info(f"moderation_bot запущен агентом, PID {self.proc.pid}")
+        time.sleep(2.0)
+        pids = _find_moderbot_pids()
+        if not pids:
+            return "запустил, но процесс не виден — проверь moderation_bot.log (возможно, сразу вышел)."
+        return f"moderation_bot запущен (PID {pids[0]})."
+
+    def stop(self):
+        stopped = []
+        if self._alive():
+            pid = self.proc.pid
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+            stopped.append(pid)
+            self.proc = None
+        for pid in _find_moderbot_pids():
+            if _taskkill(pid):
+                stopped.append(pid)
+        if stopped:
+            alog.info(f"moderation_bot остановлен, PID {stopped}")
+            return "moderation_bot остановлен (PID " + ", ".join(map(str, stopped)) + ")."
+        return "moderation_bot не запущен — останавливать нечего."
+
+
+MB = ModerbotProcess()
+
+
 # ============================ чтение userbot.log =============================
 
 def _read_log_lines():
@@ -370,6 +446,7 @@ async def self_restart(context, chat_id):
 
 HELP = (
     "не понял. Доступно: обнови userbot / статус / стоп userbot / старт userbot / сводка / обновись"
+    " / статус модербот / старт модербот / стоп модербот"
 )
 
 
@@ -410,6 +487,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif text in ("старт userbot", "start"):
             alog.info("команда: start")
             await _send(context, chat_id, await asyncio.to_thread(UB.start))
+
+        elif text in ("статус модербот", "moderbot status", "статус moderbot"):
+            alog.info("команда: moderbot status")
+            await _send(context, chat_id, await asyncio.to_thread(MB.status))
+
+        elif text in ("старт модербот", "moderbot start", "старт moderbot"):
+            alog.info("команда: moderbot start")
+            await _send(context, chat_id, await asyncio.to_thread(MB.start))
+
+        elif text in ("стоп модербот", "moderbot stop", "стоп moderbot"):
+            alog.info("команда: moderbot stop")
+            await _send(context, chat_id, await asyncio.to_thread(MB.stop))
 
         elif text in ("сводка", "summary"):
             alog.info("команда: summary")

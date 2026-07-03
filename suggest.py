@@ -73,6 +73,10 @@ def _csv_set(name: str):
 # Право approve/edit/reject. ПУСТОЙ список = любой участник группы может approve.
 APPROVER_USERNAMES = _csv_set("APPROVER_USERNAMES")
 
+# Токен бота-модератора (задача-2). Пусто → бот не поднимается, работает деградация
+# (reply-режим userbot). Токен НИКОГДА не логируем и не коммитим.
+MODERBOT_TOKEN = os.getenv("MODERBOT_TOKEN", "").strip()
+
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6").strip()
 LLM_MAX_TOKENS = _int("SUGGEST_MAX_TOKENS", 1000)
@@ -468,8 +472,55 @@ async def resolve_mod_group(client):
     return None
 
 
+def bot_mode_active():
+    """Активен ли бот-модератор (задача-2): есть токен И свежий heartbeat в IPC.
+    Нет → деградация в reply-режим userbot (текущее поведение). Без токена IPC не трогаем."""
+    if not MODERBOT_TOKEN:
+        return False
+    try:
+        import moderation_ipc
+        return moderation_ipc.is_bot_alive()
+    except Exception as e:
+        log.warning(f"SUGGEST: проверка bot-mode упала ({e}) — деградация в reply-режим.")
+        return False
+
+
+async def poll_and_send(client, sender=None, jitter=None, sleep=None):
+    """Исполнитель userbot: разобрать решения бота (status='ready') из IPC и отправить
+    клиенту. ЕДИНСТВЕННАЯ точка отправки клиенту в bot-режиме. Double-lock: в TEST_MODE
+    send_to_client откажет (сюда 'ready' в TEST_MODE и не должен попасть — бот ставит
+    'test_held'). Возвращает число обработанных."""
+    if not is_enabled():
+        return 0
+    try:
+        import moderation_ipc
+        rows = moderation_ipc.fetch_ready()
+    except Exception as e:
+        log.warning(f"SUGGEST: poll_and_send: IPC недоступен ({e}).")
+        return 0
+    n = 0
+    _send = sender or send_to_client
+    for r in rows:
+        final = r.get("final_text") or ""
+        if not final:
+            moderation_ipc.mark(r["id"], "failed", reason="пустой final_text")
+            continue
+        ok, reason = await _send(client, r["client_id"], final, sleep=sleep, jitter=jitter)
+        moderation_ipc.mark(r["id"], "sent" if ok else "failed", reason=reason)
+        record_pair({
+            "ts": _now_iso(), "client": r.get("client_ref"), "lang": r.get("lang"),
+            "incoming": r.get("incoming"), "draft": r.get("draft"),
+            "action": "bot_decision", "final_sent": final if ok else "",
+            "edit": _edit_diff(r.get("draft") or "", final), "first_contact": bool(r.get("first_contact")),
+            "sent": ok, "reason": reason, "via": "moderation_bot",
+        })
+        n += 1
+    return n
+
+
 async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
-    """Врезка в on_incoming: собрать диалог → черновик → на модерацию → pending."""
+    """Врезка в on_incoming: собрать диалог → черновик → на модерацию.
+    bot-режим → в IPC (бот запостит карточку с кнопками); иначе reply-режим (в группу)."""
     if not is_enabled():
         return None
     client_id = sender.id
@@ -488,12 +539,24 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
     if not draft:
         log.warning(f"SUGGEST: пустой черновик для {client_ref} — пропускаю.")
         return None
-    mid = await post_draft(client, draft, client_ref)
-    pending.add(mid, {
+
+    rec = {
         "client_id": client_id, "client_ref": client_ref, "lang": lang,
         "incoming": last_client_line, "draft": draft, "first_contact": first,
-        "ts": _now_iso(),
-    })
+    }
+    # bot-режим: кладём в IPC, карточку с кнопками запостит moderation_bot.
+    if bot_mode_active():
+        try:
+            import moderation_ipc
+            did = moderation_ipc.enqueue_draft(rec)
+            log.info(f"SUGGEST: черновик #{did} → IPC (bot-режим) для {client_ref}.")
+            return f"ipc:{did}"
+        except Exception as e:
+            log.warning(f"SUGGEST: IPC-enqueue упал ({e}) — деградация в reply-режим.")
+    # reply-режим (деградация / бот не поднят): постим в группу сами + pending.
+    mid = await post_draft(client, draft, client_ref)
+    rec["ts"] = _now_iso()
+    pending.add(mid, rec)
     return mid
 
 

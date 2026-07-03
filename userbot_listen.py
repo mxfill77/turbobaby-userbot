@@ -188,6 +188,24 @@ async def on_moderation(event):
         log.warning(f"{_now()} | SUGGEST: сбой обработки модерации: {e}")
 
 
+async def _suggest_ipc_poller(client):
+    """Исполнитель решений бота-модератора (задача-2, bot-режим): раз в ~3с относим
+    готовые (status='ready') ответы клиенту через userbot. Deprecation-safe: даже если
+    бот упал, добираем уже принятые решения. SAFETY: реальная отправка — в suggest.send,
+    в TEST_MODE заблокирована."""
+    try:
+        import moderation_ipc
+        moderation_ipc.init_db()
+    except Exception as e:
+        log.warning(f"{_now()} | SUGGEST: IPC init: {e}")
+    while True:
+        try:
+            await suggest.poll_and_send(client)
+        except Exception as e:
+            log.warning(f"{_now()} | SUGGEST: IPC-поллер: {e}")
+        await asyncio.sleep(3)
+
+
 async def main():
     # Singleton-гард ДО подключения: если живой экземпляр уже есть — выходим,
     # чтобы не было двух клиентов на одной session.
@@ -212,14 +230,22 @@ async def main():
             f"{_now()} | вошёл как @{me.username} (id={me.id}). "
             f"Слушаю входящие ЛИЧНЫЕ сообщения."
         )
+        # Premium статус (для голосовой расшифровки в задаче-2) — читаем БЕЗ второго
+        # клиента, из уже поднятого me. Появится в логе после рестарта.
+        log.info(f"{_now()} | Premium аккаунта: {getattr(me, 'premium', None)} "
+                 f"(нужно для транскрипции голосовых reply).")
         if suggest.is_enabled():
             # Резолвим группу модерации (по ID из env или по имени) и вешаем 2-й хендлер.
             gid = await suggest.resolve_mod_group(client)
             if gid is not None:
                 client.add_event_handler(on_moderation, events.NewMessage(chats=gid))
+            # Исполнитель решений бота-модератора (bot-режим) — только при наличии токена.
+            if suggest.MODERBOT_TOKEN:
+                asyncio.create_task(_suggest_ipc_poller(client))
             log.info(
                 f"{_now()} | SUGGEST ВКЛЮЧЁН "
                 f"(TEST_MODE={suggest.SUGGEST_TEST_MODE}, mod_group={gid}, "
+                f"bot-режим={'да' if suggest.MODERBOT_TOKEN else 'нет (reply-режим)'}, "
                 f"лимиты {suggest.RATE_PER_HOUR}/ч {suggest.RATE_PER_DAY}/д)."
             )
         else:
