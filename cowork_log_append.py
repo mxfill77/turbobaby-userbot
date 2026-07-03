@@ -50,7 +50,7 @@ def main():
     if not url or not token:
         sys.stderr.write("ОШИБКА: нет BRIDGE_URL/BRIDGE_TOKEN в .env\nНЕ ЗАПИСАНО: " + msg + "\n"); sys.exit(1)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    new_line = msg if msg.startswith(("DONE", "NOTE")) else "DONE " + stamp + ": " + msg
+    new_line = msg if msg.startswith(("DONE", "NOTE", "ASK")) else "DONE " + stamp + ": " + msg
     try:
         r = get(url, {"action": "read_doc", "token": token, "name": DOC_NAME})
         if not (isinstance(r, dict) and r.get("ok")):
