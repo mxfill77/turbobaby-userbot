@@ -13,7 +13,9 @@ None. Read-only GET, БЕЗ побочных эффектов (никаких cr
 """
 
 import os
+import re
 import json
+import time
 import logging
 import urllib.request
 import urllib.parse
@@ -34,6 +36,8 @@ PRICING_ACTION = os.getenv("PRICING_ACTION", "").strip()   # пусто → фа
 BRIDGE_URL = os.getenv("BRIDGE_URL", "").strip()
 BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
 HTTP_TIMEOUT = int(os.getenv("PRICING_TIMEOUT", "20") or "20")
+FLEET_TTL = int(os.getenv("FLEET_TTL_SEC", "300") or "300")   # кэш парка, чтобы не долбить Bridge
+_FLEET_CACHE = {"ts": 0.0, "data": None}
 
 
 def _default_get(params):
@@ -55,6 +59,10 @@ def _normalize(data):
         "deposit": src.get("deposit"),
         "available": src.get("available"),
         "season": src.get("season"),
+        "bike": src.get("bike"),
+        "model": src.get("model"),
+        "days": src.get("days"),
+        "text": src.get("text"),
     }
     # Нужна хотя бы одна осмысленная цифра цены, иначе это не котировка.
     if out["day_price"] is None and out["total"] is None:
@@ -88,3 +96,72 @@ def quote(bike, date_start, date_end, _get=None):
     else:
         log.info(f"quote ok bike={bike} {date_start}..{date_end}: day={q.get('day_price')} total={q.get('total')}")
     return q
+
+
+# ------------------------------- парк (fleet) --------------------------------
+
+def fleet(_get=None, _now=None):
+    """Список байков парка (read-only GET action=fleet), кэш на FLEET_TTL секунд.
+    Возвращает list[dict] (или [] при недоступности). _get/_now — инъекция для тестов."""
+    now = _now() if _now else time.time()
+    c = _FLEET_CACHE
+    if c["data"] is not None and (now - c["ts"]) < FLEET_TTL:
+        return c["data"]
+    if not (BRIDGE_URL and BRIDGE_TOKEN) and _get is None:
+        return c["data"] or []
+    getter = _get or _default_get
+    try:
+        data = getter({"action": "fleet", "token": BRIDGE_TOKEN})
+    except Exception as e:
+        log.info(f"fleet упал ({type(e).__name__}) — отдаю кэш/пусто")
+        return c["data"] or []
+    bikes = None
+    if isinstance(data, dict) and data.get("ok"):
+        src = data.get("data") if isinstance(data.get("data"), dict) else data
+        if isinstance(src, dict) and isinstance(src.get("bikes"), list):
+            bikes = src["bikes"]
+    if bikes is None:
+        return c["data"] or []
+    c["ts"] = now
+    c["data"] = bikes
+    return bikes
+
+
+def _norm_alnum(s):
+    return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+
+
+def _candidates(model, bikes):
+    """Байки, у кого нормализованная модель входит в нормализованное имя."""
+    m = _norm_alnum(model)
+    if not m:
+        return []
+    return [b for b in bikes if m in _norm_alnum(b.get("name"))]
+
+
+def quote_for_model(model, date_start, date_end, _get=None, _fleet=None):
+    """Резолв МОДЕЛЬ→конкретный байк и котировка. READ-ONLY (create_booking НЕ зовём).
+    Возвращает {'status': ok|none_available|no_candidates|error, 'quote': dict|None}:
+      ok            — нашли available байк, quote с ценой (использовать дословно);
+      none_available— котировки получены, но все подходящие байки заняты на даты;
+      no_candidates — нет модели/дат или в парке нет такой модели;
+      error         — парк/котировки недоступны (ошибка/таймаут/не-ok)."""
+    if not (model and date_start and date_end):
+        return {"status": "no_candidates", "quote": None}
+    bikes = _fleet if _fleet is not None else fleet(_get=_get)
+    if not bikes:
+        return {"status": "error", "quote": None}
+    cands = _candidates(model, bikes)
+    if not cands:
+        return {"status": "no_candidates", "quote": None}
+    saw_quote = False
+    for b in cands:
+        q = quote(b.get("name"), date_start, date_end, _get=_get)
+        if q is None:
+            continue
+        saw_quote = True
+        if q.get("available"):
+            return {"status": "ok", "quote": q}
+    if saw_quote:
+        return {"status": "none_available", "quote": None}
+    return {"status": "error", "quote": None}

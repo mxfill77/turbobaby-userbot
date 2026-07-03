@@ -279,10 +279,67 @@ def _client_text(transcript: str) -> str:
     return "\n".join(l for l in (transcript or "").split("\n") if l.startswith("[клиент]:")).lower()
 
 
-def extract_booking_hints(transcript: str) -> dict:
-    """Грубая эвристика: модель + признак наличия дат/срока в словах КЛИЕНТА.
-    Возвращает {model, date_start, date_end, term_days, has_dates}. Достаточно для выбора
-    фазы; точную цену всё равно даёт только Календарь."""
+_RU_MONTH_NUM = [
+    ("январ", 1), ("феврал", 2), ("март", 3), ("апрел", 4), ("мая", 5), ("май", 5),
+    ("июн", 6), ("июл", 7), ("август", 8), ("сентябр", 9), ("октябр", 10),
+    ("ноябр", 11), ("декабр", 12),
+]
+
+
+def _future_date(day, month, today, year=None):
+    y = int(year) if year else today.year
+    if year and y < 100:
+        y += 2000
+    try:
+        d = datetime.date(y, int(month), int(day))
+    except (ValueError, TypeError):
+        return None
+    if not year and d < today:                 # прошло в этом году → ближайший будущий
+        try:
+            d = datetime.date(y + 1, int(month), int(day))
+        except ValueError:
+            return None
+    return d
+
+
+def parse_date_range(text, today=None):
+    """Разобрать диапазон дат из слов клиента → (iso_start, iso_end) или (None, None).
+    Поддержка: «10.07-15.07», «с 5 по 10.07», «5–10 июля». Год — ближайший будущий; если
+    из-за этого start в прошлом — берётся следующий год."""
+    today = today or datetime.date.today()
+    t = (text or "").lower().replace("–", "-").replace("—", "-")
+    dm = re.findall(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", t)
+    rng = re.search(r"(?:с\s*)?(\d{1,2})\s*(?:-|по|до)\s*(\d{1,2})", t)
+    month_word = None
+    for stem, mon in _RU_MONTH_NUM:
+        if stem in t:
+            month_word = mon
+            break
+    s = e = None
+    if len(dm) >= 2:                                        # «10.07-15.07»
+        d1, m1, y1 = dm[0]; d2, m2, y2 = dm[1]
+        s = _future_date(d1, m1, today, y1 or None)
+        e = _future_date(d2, m2, today, y2 or None)
+    elif len(dm) == 1 and rng:                             # «с 5 по 10.07» (месяц из dd.mm)
+        _de, _me, _ye = dm[0]
+        s = _future_date(rng.group(1), _me, today, _ye or None)
+        e = _future_date(rng.group(2), _me, today, _ye or None)
+    elif rng and month_word:                               # «5-10 июля»
+        s = _future_date(rng.group(1), month_word, today)
+        e = _future_date(rng.group(2), month_word, today)
+    if not (s and e):
+        return None, None
+    if e < s:                                              # диапазон через границу года
+        try:
+            e = e.replace(year=e.year + 1)
+        except ValueError:
+            pass
+    return s.isoformat(), e.isoformat()
+
+
+def extract_booking_hints(transcript: str, today=None) -> dict:
+    """Грубая эвристика: модель + даты/срок в словах КЛИЕНТА + нормализованные ISO-даты.
+    Возвращает {model, date_start, date_end, iso_start, iso_end, term_days, has_dates}."""
     text = _client_text(transcript)
     model = None
     for tok in _MODEL_TOKENS:
@@ -303,7 +360,9 @@ def extract_booking_hints(transcript: str) -> dict:
     m_range = re.search(r"с\s+(\d{1,2})\s+(?:по|до)\s+(\d{1,2})", text)
     has_month = any(mo in text for mo in _MONTHS)
     has_dates = bool(dates or term_days or m_range or has_month)
+    iso_start, iso_end = parse_date_range(text, today)     # полный формат для Bridge
     return {"model": model, "date_start": date_start, "date_end": date_end,
+            "iso_start": iso_start, "iso_end": iso_end,
             "term_days": term_days, "has_dates": has_dates}
 
 
@@ -314,11 +373,20 @@ def build_pricing_note(hints: dict) -> str:
                 "НЕ называй НИКАКУЮ цену: ни точную, ни ориентир, ни «от X ฿», ни диапазон "
                 "(«X–Y ฿»), ни «from X» — вообще никаких чисел цены, в т.ч. из FAQ. "
                 "Цену назовём только после дат, из Календаря.")
+    model = hints.get("model")
+    ds, de = hints.get("iso_start"), hints.get("iso_end")
+    if not (model and ds and de):
+        # даты есть словами, но модель/полные даты не разобрались → фолбэк БЕЗ числа
+        return ("ЦЕНА: не удалось однозначно разобрать модель/даты для Календаря — НЕ называй "
+                "никакого числа (в т.ч. из FAQ); уточни модель и точные даты и скажи, что "
+                "назовёшь цену по датам.")
     try:
-        q = pricing.quote(hints.get("model"), hints.get("date_start"), hints.get("date_end"))
+        res = pricing.quote_for_model(model, ds, de)
     except Exception:
-        q = None
-    if q:
+        res = {"status": "error", "quote": None}
+    q = res.get("quote") if isinstance(res, dict) else None
+    status = res.get("status") if isinstance(res, dict) else "error"
+    if status == "ok" and q:
         parts = []
         if q.get("day_price") is not None:
             parts.append(f"{q['day_price']} ฿/день")
@@ -326,10 +394,12 @@ def build_pricing_note(hints: dict) -> str:
             parts.append(f"итого {q['total']} ฿")
         if q.get("deposit") is not None:
             parts.append(f"депозит {q['deposit']} ฿")
-        if q.get("available") is not None:
-            parts.append("свободен" if q["available"] else "занят на эти даты")
+        parts.append("свободен на эти даты")
         return ("ЦЕНА из Календаря бронирования (использовать ДОСЛОВНО, не пересчитывать и не "
                 "округлять): " + "; ".join(parts) + ".")
+    if status == "none_available":
+        return ("ЦЕНА: на эти даты все подходящие байки заняты — НЕ называй числа; ответь, что "
+                "уточню наличие и цену на эти даты и вернусь.")
     return ("ЦЕНА: точная цена из Календаря сейчас недоступна — НЕ называй никакого числа "
             "(в т.ч. из FAQ); ответь, что уточнишь цену и вернёшься.")
 
@@ -353,6 +423,16 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         "цену по датам и вернёшься, БЕЗ числа. Дневные ставки FAQ — ориентир ДЛЯ МЕНЕДЖЕРА, "
         "не для клиента."
     )
+    scenario = (
+        "\n\nПОРЯДОК ДИАЛОГА (СТРОГО по этапам, не забегай вперёд):\n"
+        "Этап 1 — ЦЕНА: назови цену по датам из Календаря (если она в блоке ЦЕНА выше). "
+        "На этом этапе НЕ проси паспорт, апартаменты и шлемы — только цена и наличие.\n"
+        "Этап 2 — ДОСТАВКА: когда клиент заинтересовался ценой — уточни район доставки и назови "
+        "её стоимость по прайсу районов; добавь, что забор байка в конце аренды БЕСПЛАТНЫЙ.\n"
+        "Этап 3 — БРОНЬ: только когда клиент готов бронировать — запроси качественное фото "
+        "паспорта, название апартаментов (или ссылку Google Maps), количество шлемов и "
+        "номер(а) телефона. Раньше этапа 3 документы/апартаменты/шлемы не запрашивай."
+    )
     price_block = ("\n\n" + pricing_note) if pricing_note else ""
     return (
         "Ты — менеджер проката мотобайков TurboBaby (Пхукет). По переписке с клиентом "
@@ -360,7 +440,7 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         "Отвечай только на то, что ещё НЕ отвечено менеджером в диалоге; не повторяй уже "
         "сказанное; держи контекст сделки. Не выдумывай данные и наличие. Верни ТОЛЬКО "
         "текст ответа клиенту — без пояснений, без кавычек, без префиксов."
-        + greet + policy + price_block + "\n\n"
+        + greet + policy + scenario + price_block + "\n\n"
         + CRITICAL_FACTS
         + "\n\nFAQ и эталонные формулировки:\n" + (faq or "(FAQ недоступен — опирайся на критичные факты выше)")
     )
