@@ -45,6 +45,8 @@ from telegram import Update
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
+import selfupdate_gate  # гейт самообновления (проверка нового кода перед рестартом)
+
 # --- пути (всё относительно этого файла = D:\turbobaby-bot) ---
 REPO_DIR = Path(__file__).resolve().parent
 VENV_PY = REPO_DIR / "venv" / "Scripts" / "python.exe"
@@ -431,12 +433,26 @@ async def self_restart(context, chat_id):
         await _send(context, chat_id, f"⛔ git pull не удался — НЕ перезапускаюсь, остаюсь на текущем коде:\n{out}")
         alog.warning("self-restart отменён: git pull failed")
         return
+    # ГЕЙТ КЛАССА: НИКОГДА не перезапускаться в непроверенный код — иначе рискуем убить
+    # канал управления (некому будет принять команду отката). py_compile + import-smoke.
+    ok_code, gate_msg = await asyncio.to_thread(
+        selfupdate_gate.code_gate, VENV_PY, REPO_DIR,
+        ["pc_agent.py", "moderation_bot.py", "userbot_listen.py", "suggest.py"], "pc_agent",
+    )
+    if not ok_code:
+        await _send(
+            context, chat_id,
+            "⛔ обновление отклонено: новый код НЕ прошёл проверку — остаюсь на текущем "
+            f"(рабочем) коде, канал управления жив.\n{gate_msg}",
+        )
+        alog.warning(f"self-restart отменён гейтом: {gate_msg[:300]}")
+        return
     await _send(
         context, chat_id,
-        f"✅ git pull:\n{out}\n\nПерезапускаюсь. Новый экземпляр поднимется через Планировщик "
-        "после моей смерти (без окна с двумя агентами). Вернусь через ~10–20с — проверь «статус»."
+        f"✅ git pull:\n{out}\n\n✅ гейт кода пройден (py_compile + import-smoke). Перезапускаюсь. "
+        "Новый экземпляр поднимется через Планировщик после моей смерти. Вернусь через ~10–20с — проверь «статус»."
     )
-    alog.info("self-restart: pull OK → спавню помощника, снимаю лок, выхожу.")
+    alog.info("self-restart: pull OK + гейт пройден → спавню помощника, снимаю лок, выхожу.")
     _spawn_restart_helper()
     release_agent_lock()
     os._exit(0)  # жёсткий выход: гарантирует смерть PID; помощник стартует новый ТОЛЬКО после
