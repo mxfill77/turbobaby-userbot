@@ -27,6 +27,8 @@ import re
 import logging
 import datetime
 
+import pricing  # каркас получения точной цены из Календаря (Bridge); пусто → фолбэк
+
 log = logging.getLogger("suggest")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -105,7 +107,8 @@ except Exception:  # pragma: no cover
 CRITICAL_FACTS = """КРИТИЧНЫЕ ФАКТЫ (не искажать, числа дословно):
 Депозит: либо деньги, либо паспорт (НЕ оба). Принимаем: наличные баты, перевод
 (в т.ч. USDT TRC20/BEP20, тайский счёт, Сбер/Тинькофф), либо паспорт вместо денег.
-Прайс (฿/день, депозит ฿):
+Прайс-ОРИЕНТИР (НЕ финальная цена; точная — по датам из Календаря бронирования;
+клиенту как финальную НЕ называть) (฿/день, депозит ฿):
 - Скутеры: PCX150 349/3000; ADV150 449/3000; NMAX155 449/3000; PCX160 498/5000;
   ADV160 498/5000; FORZA300 690/5000; XMAX300(2020-2022) 790/5000;
   XMAX300(NEW 2023+) 939/7000; ADV350 998/7000; XADV750 2788/25000.
@@ -261,7 +264,75 @@ def load_faq(getter=None) -> str:
         return ""
 
 
-def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False) -> str:
+# --- лёгкий парсер модель+даты из диалога (поля по образцу collect_booking) ---
+_MODEL_TOKENS = [
+    "nmax", "pcx", "adv350", "adv 350", "adv150", "adv 150", "adv160", "adv 160", "adv",
+    "xmax", "forza", "xadv", "xsr", "cb300", "cb 300", "cb650", "cb 650",
+    "cbr650", "cbr 650", "cbr", "rebel", "mt-03", "mt03", "mt 03", "ninja", "vulcan", "r7", "click",
+]
+_MONTHS = ("январ", "феврал", "март", "апрел", "мая", "июн", "июл", "август", "сентябр",
+           "октябр", "ноябр", "декабр",
+           "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def _client_text(transcript: str) -> str:
+    return "\n".join(l for l in (transcript or "").split("\n") if l.startswith("[клиент]:")).lower()
+
+
+def extract_booking_hints(transcript: str) -> dict:
+    """Грубая эвристика: модель + признак наличия дат/срока в словах КЛИЕНТА.
+    Возвращает {model, date_start, date_end, term_days, has_dates}. Достаточно для выбора
+    фазы; точную цену всё равно даёт только Календарь."""
+    text = _client_text(transcript)
+    model = None
+    for tok in _MODEL_TOKENS:
+        if tok in text:
+            model = tok.upper().replace(" ", "")
+            break
+    dates = re.findall(r"\b(\d{1,2}[.\-/]\d{1,2}(?:[./]\d{2,4})?)\b", text)
+    date_start = dates[0] if dates else None
+    date_end = dates[1] if len(dates) > 1 else None
+    m_term = (re.search(r"на\s+(\d{1,3})\s*(дн|дней|день|сут|недел|мес)", text)
+              or re.search(r"(\d{1,3})\s*(day|days|week|month)", text))
+    term_days = None
+    if m_term:
+        try:
+            term_days = int(m_term.group(1))
+        except Exception:
+            term_days = None
+    m_range = re.search(r"с\s+(\d{1,2})\s+(?:по|до)\s+(\d{1,2})", text)
+    has_month = any(mo in text for mo in _MONTHS)
+    has_dates = bool(dates or term_days or m_range or has_month)
+    return {"model": model, "date_start": date_start, "date_end": date_end,
+            "term_days": term_days, "has_dates": has_dates}
+
+
+def build_pricing_note(hints: dict) -> str:
+    """Инструкция по цене для промпта. ИНВАРИАНТ: без котировки из Календаря — без числа."""
+    if not hints.get("has_dates"):
+        return ("ЦЕНА: дат аренды в диалоге НЕТ — попроси у клиента даты (начало/конец) и срок. "
+                "Точную цену НЕ называй, никаких чисел цены (даже ориентировочных из FAQ).")
+    try:
+        q = pricing.quote(hints.get("model"), hints.get("date_start"), hints.get("date_end"))
+    except Exception:
+        q = None
+    if q:
+        parts = []
+        if q.get("day_price") is not None:
+            parts.append(f"{q['day_price']} ฿/день")
+        if q.get("total") is not None:
+            parts.append(f"итого {q['total']} ฿")
+        if q.get("deposit") is not None:
+            parts.append(f"депозит {q['deposit']} ฿")
+        if q.get("available") is not None:
+            parts.append("свободен" if q["available"] else "занят на эти даты")
+        return ("ЦЕНА из Календаря бронирования (использовать ДОСЛОВНО, не пересчитывать и не "
+                "округлять): " + "; ".join(parts) + ".")
+    return ("ЦЕНА: точная цена из Календаря сейчас недоступна — НЕ называй никакого числа "
+            "(в т.ч. из FAQ); ответь, что уточнишь цену и вернёшься.")
+
+
+def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pricing_note: str = "") -> str:
     lang_name = "русском" if lang == "ru" else "английском"
     if is_first_contact:
         greet = (
@@ -272,13 +343,20 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False) -> s
         greet = (
             "\n\nЭто ПРОДОЛЖЕНИЕ диалога — НЕ здоровайся повторно, сразу отвечай по сути."
         )
+    policy = (
+        "\n\nЦЕНОВАЯ ПОЛИТИКА (СТРОГО): финальную/точную цену клиенту называй ТОЛЬКО если она "
+        "передана ниже в блоке «ЦЕНА из Календаря». Дневные ставки из FAQ — ОРИЕНТИР, НЕ "
+        "финальная цена: клиенту как финальную НЕ называй. Дат нет — сперва спроси даты. Если "
+        "точная цена недоступна — скажи, что уточнишь цену и вернёшься, БЕЗ числа."
+    )
+    price_block = ("\n\n" + pricing_note) if pricing_note else ""
     return (
         "Ты — менеджер проката мотобайков TurboBaby (Пхукет). По переписке с клиентом "
         f"составь ОДИН короткий, вежливый ответ на {lang_name} языке (язык клиента). "
         "Отвечай только на то, что ещё НЕ отвечено менеджером в диалоге; не повторяй уже "
         "сказанное; держи контекст сделки. Не выдумывай данные и наличие. Верни ТОЛЬКО "
         "текст ответа клиенту — без пояснений, без кавычек, без префиксов."
-        + greet + "\n\n"
+        + greet + policy + price_block + "\n\n"
         + CRITICAL_FACTS
         + "\n\nFAQ и эталонные формулировки:\n" + (faq or "(FAQ недоступен — опирайся на критичные факты выше)")
     )
@@ -297,10 +375,10 @@ def _default_llm(system: str, user: str) -> str:
 
 
 def generate_draft(transcript: str, lang: str, faq: str,
-                   is_first_contact: bool = False, call_llm=None) -> str:
+                   is_first_contact: bool = False, pricing_note: str = "", call_llm=None) -> str:
     """Сгенерировать черновик. call_llm(system, user)->str инъектируется в тестах."""
     call_llm = call_llm or _default_llm
-    system = make_system_prompt(faq, lang, is_first_contact)
+    system = make_system_prompt(faq, lang, is_first_contact, pricing_note)
     return call_llm(system, transcript).strip()
 
 
@@ -535,7 +613,10 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
             break
     lang = detect_lang(last_client_line or transcript)
     faq = faq if faq is not None else load_faq()
-    draft = generate_draft(transcript, lang, faq, is_first_contact=first, call_llm=call_llm)
+    # Двухфазная цена: даты есть → пробуем Календарь (pricing.quote), иначе/None → фолбэк.
+    price_note = build_pricing_note(extract_booking_hints(transcript))
+    draft = generate_draft(transcript, lang, faq, is_first_contact=first,
+                           pricing_note=price_note, call_llm=call_llm)
     if not draft:
         log.warning(f"SUGGEST: пустой черновик для {client_ref} — пропускаю.")
         return None
