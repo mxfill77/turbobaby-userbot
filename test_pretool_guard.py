@@ -150,8 +150,12 @@ class TestEndToEndStdin(unittest.TestCase):
         p = self._run(bash("taskkill /PID 1 /F"))
         self.assertEqual(p.returncode, 0)
         out = json.loads(p.stdout)
-        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
-        self.assertIn("КРАСНОЕ", out["hookSpecificOutput"]["permissionDecisionReason"])
+        reason = out["hookSpecificOutput"]["permissionDecision"], out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(reason[0], "ask")
+        # человеческая карточка: ЧТО + «— разрешить?», не сырая команда первой строкой
+        self.assertIn("Хочу снять процесс", reason[1])
+        self.assertIn("разрешить?", reason[1])
+        self.assertTrue(reason[1].lstrip().startswith("🔴"))
 
     def test_unparseable_stdin_defers(self):
         env = dict(os.environ, PRETOOL_NOPUSH="1", PYTHONIOENCODING="utf-8")
@@ -160,6 +164,38 @@ class TestEndToEndStdin(unittest.TestCase):
                            encoding="utf-8", env=env, timeout=30)
         self.assertEqual(p.returncode, 0)
         self.assertEqual(p.stdout.strip(), "")
+
+
+class TestHumanCards(unittest.TestCase):
+    def test_card_is_human_not_raw(self):
+        card = g._card("delete", "old.log", "del /f old.log")
+        self.assertTrue(card.lstrip().startswith("🔴 Хочу удалить файл old.log"))
+        self.assertIn("разрешить?", card)
+        self.assertIn("Команда: del /f old.log", card)   # сырая команда — отдельной строкой, не первой
+        self.assertLess(card.index("Хочу"), card.index("Команда:"))
+
+    def test_human_phrases(self):
+        self.assertIn("снять процесс PID 42", g._human("kill", "PID 42"))
+        self.assertIn("секретный файл .env", g._human("edit_secret", ".env"))
+        self.assertIn(".env / секрет", g._human("env"))
+        self.assertIn("git-историю", g._human("git_force"))
+        self.assertIn("за пределами проекта", g._human("write_outside", r"C:\x.txt"))
+        self.assertIn("не распознана как безопасная", g._human("unknown"))
+
+    def test_extractors(self):
+        self.assertEqual(g._extract_delete_target("del /f old.log"), "old.log")
+        self.assertEqual(g._extract_kill_target("taskkill /PID 42 /F"), "PID 42")
+        self.assertEqual(g._extract_kill_target("Stop-Process -Id 7"), "PID 7")
+        self.assertEqual(g._extract_host("curl https://api.telegram.org/bot/x"), "api.telegram.org")
+        self.assertEqual(g._extract_host("ssh root@5.223.94.179 ls"), "root@5.223.94.179")
+
+    def test_env_edit_card_via_decide(self):
+        action, kind, obj = g.decide(edit(r"D:\turbobaby-bot\.env"))
+        self.assertEqual(action, "ask")
+        card = g._card(kind, obj)
+        self.assertIn("секретный файл", card)
+        self.assertIn(".env", card)
+        self.assertNotIn("D:\\turbobaby-bot", card)   # показываем имя файла, не команду
 
 
 if __name__ == "__main__":

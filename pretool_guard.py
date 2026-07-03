@@ -38,21 +38,72 @@ PROJ_N = os.path.normcase(os.path.normpath(PROJECT))
 VENV_PY = os.path.join(PROJECT, "venv", "Scripts", "python.exe")
 DNOTIFY = os.path.join(PROJECT, "dispatch_notify.py")
 
-# --- КРАСНЫЕ признаки Bash-команды ---
+# --- КРАСНЫЕ признаки Bash-команды → (regex, kind) ---
 _RED_CMD = [
-    (re.compile(r"(?i)(^|[\s;&|(])(del|erase|rmdir|rd|rm)([\s;&|)]|$)"), "удаление файлов (del/rm/rmdir)"),
-    (re.compile(r"(?i)remove-item\b"), "удаление (Remove-Item)"),
-    (re.compile(r"(?i)(^|[\s;&|(])(taskkill|kill|pkill)([\s;&|)]|$)"), "снятие процесса (taskkill/kill)"),
-    (re.compile(r"(?i)stop-process\b"), "снятие процесса (Stop-Process)"),
-    (re.compile(r"(?i)\bschtasks\b"), "Планировщик задач (schtasks)"),
-    (re.compile(r"(?i)git\s+push\b.*(--force|(?<![\w-])-f(?![\w]))"), "git push --force"),
-    (re.compile(r"(?i)git\s+reset\s+--hard"), "git reset --hard"),
-    (re.compile(r"(?i)git\s+clean(\s|$)"), "git clean"),
-    (re.compile(r"(?i)(^|[\s;&|(])sqlite3([\s;&|)]|$)"), "sqlite3 CLI (запись в БД)"),
-    (re.compile(r"(?i)(^|[\s;&|(])(curl|wget|iwr|irm)([\s;&|)]|$)|invoke-webrequest|invoke-restmethod"),
-     "сетевое действие (curl/wget/Invoke-WebRequest)"),
-    (re.compile(r"(?i)(^|[\s;&|(])(ssh|scp|sftp|nc|ncat|telnet)([\s;&|)]|$)"), "сетевой доступ (ssh/scp/nc)"),
+    (re.compile(r"(?i)(^|[\s;&|(])(del|erase|rmdir|rd|rm)([\s;&|)]|$)"), "delete"),
+    (re.compile(r"(?i)remove-item\b"), "delete"),
+    (re.compile(r"(?i)(^|[\s;&|(])(taskkill|kill|pkill)([\s;&|)]|$)"), "kill"),
+    (re.compile(r"(?i)stop-process\b"), "kill"),
+    (re.compile(r"(?i)\bschtasks\b"), "schtasks"),
+    (re.compile(r"(?i)git\s+push\b.*(--force|(?<![\w-])-f(?![\w]))"), "git_force"),
+    (re.compile(r"(?i)git\s+reset\s+--hard"), "git_force"),
+    (re.compile(r"(?i)git\s+clean(\s|$)"), "git_force"),
+    (re.compile(r"(?i)(^|[\s;&|(])sqlite3([\s;&|)]|$)"), "sqlite"),
+    (re.compile(r"(?i)(^|[\s;&|(])(curl|wget|iwr|irm)([\s;&|)]|$)|invoke-webrequest|invoke-restmethod"), "network"),
+    (re.compile(r"(?i)(^|[\s;&|(])(ssh|scp|sftp|nc|ncat|telnet)([\s;&|)]|$)"), "network"),
 ]
+
+
+def _extract_delete_target(cmd):
+    m = re.search(r"(?i)(?:del|erase|rmdir|rd|rm|remove-item)\s+(?:[-/][a-z]+\s+)*[\"']?([^\s\"';|&]+)", cmd)
+    return m.group(1) if m else None
+
+
+def _extract_kill_target(cmd):
+    m = (re.search(r"(?i)/pid\s+(\d+)", cmd) or re.search(r"(?i)-id\s+(\d+)", cmd)
+         or re.search(r"(?i)\b(?:kill|pkill)\s+(\d+)", cmd))
+    if m:
+        return "PID " + m.group(1)
+    m = re.search(r"(?i)/im\s+([^\s\"']+)", cmd) or re.search(r"(?i)-name\s+([^\s\"']+)", cmd)
+    return m.group(1) if m else None
+
+
+def _extract_host(cmd):
+    m = re.search(r"(?i)https?://([^/\s\"']+)", cmd)
+    if m:
+        return m.group(1)
+    m = re.search(r"([\w.\-]+@[\w.\-]+)", cmd)
+    if m:
+        return m.group(1)
+    m = re.search(r"(?i)(?:ssh|scp|sftp)\s+([^\s\"'-][^\s\"']*)", cmd)
+    return m.group(1) if m else None
+
+
+def _extract_db(cmd):
+    m = re.search(r"([\w.\-\\/]+\.db)\b", cmd)
+    return m.group(1) if m else None
+
+
+def _human(kind, obj=""):
+    """Человекочитаемая фраза для карточки: ЧТО (+ объект/причина). Без «— разрешить?» (добавит _card)."""
+    o = (obj or "").strip()
+    tpl = {
+        "delete": ("Хочу удалить файл " + o) if o else "Хочу удалить файл(ы)",
+        "kill": ("Хочу снять процесс " + o + " (taskkill/kill)") if o else "Хочу снять процесс (taskkill/kill)",
+        "schtasks": "Хочу выполнить операцию Планировщика задач (schtasks)",
+        "git_force": "Хочу перезаписать git-историю (push --force / reset --hard / clean)",
+        "sqlite": ("Хочу записать в базу данных " + o) if o else "Хочу записать в базу данных (sqlite)",
+        "network": ("Хочу выйти в сеть к " + o) if o else "Хочу выполнить сетевую команду (curl/wget/ssh)",
+        "env": "Хочу обратиться к .env / секретам",
+        "outside": ("Хочу записать за пределами проекта: " + o) if o else "Хочу выполнить операцию за пределами проекта",
+        "py_write": ("Хочу выполнить python с боевой записью (" + o + ")") if o else "Хочу выполнить python с боевой записью",
+        "edit_secret": "Хочу изменить секретный файл " + (o or ".env/сессия") + " (секреты/токен)",
+        "read_secret": "Хочу прочитать секретный файл " + (o or ".env/сессия") + " (секреты/токен)",
+        "edit_claude": "Хочу изменить конфиг Claude Code (.claude): " + (o or "*"),
+        "write_outside": "Хочу записать за пределами проекта: " + (o or "вне D:\\turbobaby-bot"),
+        "unknown": "Требуется подтверждение: команда не распознана как безопасная",
+    }
+    return tpl.get(kind, "Требуется подтверждение операции")
 _RE_ENV = re.compile(r"(?i)(\.env(\b|['\"\s]|$)|\.session\b)")            # .env / *.session в команде
 _RE_SQL_WRITE = re.compile(r"(?i)\b(UPDATE|DELETE\s+FROM|INSERT\s+INTO|DROP\s+TABLE)\b")
 _RE_OUTSIDE_WRITE = re.compile(r"(?i)(>>?|out-file|set-content|new-item|move-item|copy-item)\s+[\"']?([a-z]:[\\/][^\"'\s]+)")
@@ -109,11 +160,11 @@ def _read_file(path, cwd):
 
 
 def _scan_python(cmd, cwd):
-    """→ ('defer','') | ('ask', reason). Читаем инлайн -c и тела .py-целей, ищем боевую запись."""
+    """→ ('defer','','') | ('ask','py_write',detail). Инлайн -c и тела .py-целей, ищем боевую запись."""
     try:
         toks = shlex.split(cmd)
     except Exception:
-        return ("ask", "python: кривое квотирование — не разобрал команду")
+        return ("ask", "py_write", "кривое квотирование")
     content = ""
     saw_target = False
     i = 0
@@ -125,30 +176,30 @@ def _scan_python(cmd, cwd):
             i += 2
             continue
         if t == "-":
-            return ("ask", "python: код из stdin — читать нечего")
+            return ("ask", "py_write", "код из stdin")
         if t == "-m":
             mod = toks[i + 1] if i + 1 < len(toks) else ""
             if mod in _GREEN_MODULES:
-                return ("defer", "")
-            return ("ask", f"python -m {mod}: модуль не в списке безопасных")
+                return ("defer", "", "")
+            return ("ask", "py_write", f"-m {mod}")
         if t.endswith(".py"):
             body = _read_file(t, cwd)
             if body is None:
-                return ("ask", "python: цель-скрипт не прочитан")
+                return ("ask", "py_write", "скрипт не прочитан")
             content += body
             saw_target = True
         i += 1
     blob = cmd + "\n" + content
     if _RE_ENV.search(blob):
-        return ("ask", "python трогает .env/секрет")
+        return ("ask", "env", "")
     for tok in _RED_PY_TOKENS:
         if tok in blob:
-            return ("ask", f"python: боевая запись/удаление ({tok})")
+            return ("ask", "py_write", tok)
     if _RE_SQL_WRITE.search(blob) and ".db" in blob.lower() and "memory.db" not in blob.lower():
-        return ("ask", "python: SQL-запись в БД (не memory.db)")
+        return ("ask", "sqlite", _extract_db(blob) or "")
     if not saw_target:
-        return ("ask", "python без внятной цели (REPL/неясно)")
-    return ("defer", "")
+        return ("ask", "py_write", "без внятной цели")
+    return ("defer", "", "")
 
 
 # ------------------------------- классификаторы ------------------------------
@@ -156,48 +207,57 @@ def _scan_python(cmd, cwd):
 def _decide_write(ti, cwd):
     path = ti.get("file_path") or ti.get("notebook_path") or ""
     if _is_secret_path(path):
-        return ("ask", "правка секрета/.env — красное")
+        return ("ask", "edit_secret", os.path.basename(path))
     if _is_claude_path(path):
-        return ("ask", "правка .claude/* — красное")
+        return ("ask", "edit_claude", os.path.basename(path))
     if not _inside_project(path):
-        return ("ask", "запись вне D:\\turbobaby-bot — красное")
-    return ("defer", "")
+        return ("ask", "write_outside", path)
+    return ("defer", "", "")
 
 
 def _decide_read(ti, cwd):
     path = ti.get("file_path") or ""
     if _is_secret_path(path):
-        return ("ask", "чтение .env/секрета — красное")
-    return ("defer", "")
+        return ("ask", "read_secret", os.path.basename(path))
+    return ("defer", "", "")
 
 
 def _decide_bash(cmd, cwd):
     if not cmd:
-        return ("defer", "")
-    for rx, reason in _RED_CMD:
+        return ("defer", "", "")
+    for rx, kind in _RED_CMD:
         if rx.search(cmd):
-            return ("ask", reason + " — красное")
+            obj = ""
+            if kind == "delete":
+                obj = _extract_delete_target(cmd) or ""
+            elif kind == "kill":
+                obj = _extract_kill_target(cmd) or ""
+            elif kind == "network":
+                obj = _extract_host(cmd) or ""
+            elif kind == "sqlite":
+                obj = _extract_db(cmd) or ""
+            return ("ask", kind, obj)
     if _RE_ENV.search(cmd):
-        return ("ask", "доступ к .env/секрету — красное")
+        return ("ask", "env", "")
     m = _RE_OUTSIDE_WRITE.search(cmd)
     if m and not _inside_project(m.group(2)):
-        return ("ask", "запись по пути вне D:\\turbobaby-bot — красное")
+        return ("ask", "outside", m.group(2))
     # зелёное
     if _RE_SAFE_SCRIPTS.search(cmd):
-        return ("defer", "")
+        return ("defer", "", "")
     if _RE_GIT_SAFE.search(cmd):
-        return ("defer", "")
+        return ("defer", "", "")
     if _RE_TESTS.search(cmd):
-        return ("defer", "")
+        return ("defer", "", "")
     if _RE_PY.search(cmd):
         return _scan_python(cmd, cwd)
     if _RE_READONLY_SHELL.search(cmd):
-        return ("defer", "")
-    return ("ask", "команда не распознана как безопасная — подтверди (fail-safe)")
+        return ("defer", "", "")
+    return ("ask", "unknown", "")
 
 
 def decide(data):
-    """Чистая классификация: → ('defer','') или ('ask', reason). Без I/O."""
+    """Чистая классификация: → ('defer','','') или ('ask', kind, obj). Без I/O."""
     tool = data.get("tool_name") or ""
     ti = data.get("tool_input") or {}
     cwd = data.get("cwd") or PROJECT
@@ -207,15 +267,17 @@ def decide(data):
         return _decide_read(ti, cwd)
     if tool == "Bash":
         return _decide_bash(ti.get("command") or "", cwd)
-    return ("defer", "")  # Grep/Glob/прочие read-only инструменты
+    return ("defer", "", "")  # Grep/Glob/прочие read-only инструменты
 
 
 # ------------------------------- вывод/пуш -----------------------------------
 
-def _card(reason):
-    return ("🔴 КРАСНОЕ — нужно твоё «да»\n"
-            "Что: " + reason + "\n"
-            "Гард Dispatch форсит подтверждение (fail-safe). Проверь и подтверди в сессии.")
+def _card(kind, obj="", raw_cmd=""):
+    """Человеческая карточка: первая строка — ЧТО хочу + зачем, затем (для прозрачности) сырая команда."""
+    card = "🔴 " + _human(kind, obj) + " — разрешить?"
+    if raw_cmd:
+        card += "\nКоманда: " + raw_cmd.strip()
+    return card
 
 
 def _push(card):
@@ -231,8 +293,7 @@ def _push(card):
         pass  # пуш вторичен — не роняем решение
 
 
-def _emit_ask(reason):
-    card = _card(reason)
+def _emit_ask(card):
     _push(card)
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
@@ -248,11 +309,14 @@ def main():
     except Exception:
         sys.exit(0)  # вход не распарсили → штатный flow (defer)
     try:
-        action, reason = decide(data)
+        action, kind, obj = decide(data)
     except Exception:
-        action, reason = ("ask", "ошибка анализа — подтверди (fail-safe)")
+        action, kind, obj = ("ask", "unknown", "")
     if action == "ask":
-        _emit_ask(reason)
+        raw = ""
+        if (data.get("tool_name") or "") == "Bash":
+            raw = (data.get("tool_input") or {}).get("command", "") or ""
+        _emit_ask(_card(kind, obj, raw))
     sys.exit(0)  # defer
 
 
