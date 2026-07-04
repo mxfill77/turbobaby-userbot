@@ -294,6 +294,16 @@ def _push(card):
 
 
 def _emit_ask(card):
+    # Сигнал headless→демон (pc_orchestrator): в headless карточку не показать интерактивно,
+    # поэтому при заданном env пишем красную карточку в файл-маркер — демон детектит и ставит
+    # NEEDS_APPROVAL. В интерактивной сессии env не задан → поведение не меняется.
+    mk = os.environ.get("PRETOOL_ASK_MARKER")
+    if mk:
+        try:
+            with open(mk, "a", encoding="utf-8") as f:
+                f.write(card + "\n")
+        except Exception:
+            pass
     _push(card)
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
