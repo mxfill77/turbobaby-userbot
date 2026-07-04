@@ -35,6 +35,15 @@ import urllib.request
 import urllib.parse
 
 REPO = r"D:\turbobaby-bot"
+
+# .env грузим ДО чтения любых config-констант ниже (CLAUDE_BIN/LANE/POLL_SEC/…), иначе
+# os.getenv вернёт дефолты вместо значений из .env — прод-баг: демон не увидел бы CLAUDE_BIN.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(REPO, ".env"))
+except Exception:
+    pass
+
 VENV_PY = os.path.join(REPO, "venv", "Scripts", "python.exe")
 DNOTIFY = os.path.join(REPO, "dispatch_notify.py")
 TASK_NAME = "pc_orchestrator"          # имя задачи Планировщика (schtasks /Run /TN pc_orchestrator)
@@ -54,12 +63,6 @@ HEARTBEAT_FILE = os.path.join(REPO, "pc_orchestrator.heartbeat")
 LOG_PATH = os.path.join(REPO, "pc_orchestrator.log")
 NA_MARKER = "NEEDS_APPROVAL:"
 ASK_MARKER_ENV = "PRETOOL_ASK_MARKER"   # env для pretool_guard: писать красную карточку в этот файл
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv(os.path.join(REPO, ".env"))
-except Exception:
-    pass
 
 logging.basicConfig(filename=LOG_PATH, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
