@@ -187,9 +187,17 @@ def _age_sec(updated_iso, now=None):
 
 def _detect_needs_approval(out, marker_content=""):
     """Красная зона: файл-маркер гарда (headless-сигнал) ИЛИ маркер в stdout ИЛИ фолбэк-фразы."""
-    # 1) файл-маркер гарда (надёжный сигнал: гард форснул ask в headless)
+    # 1) файл-маркер гарда (надёжный сигнал: гард форснул ask в headless).
+    #    Дедуп строк: одно красное действие могло ретраиться → карточка набегала ×N (была ×5).
     if marker_content:
-        return ("NEEDS_APPROVAL (гард): " + marker_content)[:RESULT_MAX]
+        seen, uniq = set(), []
+        for ln in marker_content.splitlines():
+            key = ln.strip()
+            if key and key not in seen:
+                seen.add(key)
+                uniq.append(ln)
+        deduped = "\n".join(uniq) or marker_content
+        return ("NEEDS_APPROVAL (гард): " + deduped)[:RESULT_MAX]
     t = out or ""
     for line in t.splitlines():
         i = line.find(NA_MARKER)
@@ -218,9 +226,9 @@ def run_claude(prompt, timeout, cwd, env):
 def run_task(tid, text, note=""):
     """Исполнить задачу через headless claude -p. → (status, result). status ∈ done|failed|needs_approval."""
     marker_path = os.path.join(REPO, f"pc_ask_{tid}.marker")
-    try:
-        if os.path.exists(marker_path):
-            os.remove(marker_path)
+    try:  # ЧИСТИМ маркер ПЕРЕД каждым запуском headless (в т.ч. перед повтором approved-шага):
+        if os.path.exists(marker_path):   # иначе красная карточка прошлого прогона протекла бы
+            os.remove(marker_path)        # в результат нового (ложное needs_approval).
     except Exception:
         pass
     env = dict(os.environ)

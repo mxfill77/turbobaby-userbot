@@ -112,6 +112,38 @@ class TestProcessNew(Base):
         self.assertEqual(self.fb.tasks[tid]["status"], "needs_approval")
         self.assertIn("гард", self.fb.tasks[tid]["result"].lower())
 
+    def test_marker_lines_deduped_in_result(self):
+        # claude ретраил красное — гард дописал карточку ×5. Демон дедупит строки → карточка ×1.
+        tid = self.fb.add(status="new")
+        line = "🔴 Хочу удалить файл X — разрешить?"
+
+        def fake(prompt, timeout, cwd, env):
+            with open(env[o.ASK_MARKER_ENV], "a", encoding="utf-8") as f:
+                for _ in range(5):
+                    f.write(line + "\n")
+            return (0, "сделал", "")
+        o.run_claude = fake
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "needs_approval")
+        self.assertEqual(self.fb.tasks[tid]["result"].count("Хочу удалить файл X"), 1)
+
+    def test_stale_marker_cleared_before_run(self):
+        # маркер прошлого прогона не должен протечь в новый результат (чистим перед запуском).
+        tid = self.fb.add(status="new")
+        stale = os.path.join(o.REPO, f"pc_ask_{tid}.marker")
+        with open(stale, "w", encoding="utf-8") as f:
+            f.write("🔴 старая красная карточка — разрешить?\n")
+        try:
+            self._claude(0, "всё зелёное, готово")   # новый прогон без красного
+            o.process_new()
+            self.assertEqual(self.fb.tasks[tid]["status"], "done")   # не needs_approval
+            self.assertNotIn("старая красная", self.fb.tasks[tid]["result"])
+        finally:
+            try:
+                os.remove(stale)
+            except Exception:
+                pass
+
     def test_lane_isolation_other_lane_untouched(self):
         vps = self.fb.add(status="new", lane="vps", task_text="чужая VPS-задача")
         pc = self.fb.add(status="new", lane="pc")
@@ -213,6 +245,11 @@ class TestUnit(unittest.TestCase):
         self.assertIsNotNone(o._detect_needs_approval("NEEDS_APPROVAL: op=other | X", ""))
         self.assertIsNotNone(o._detect_needs_approval("это требует подтверждения", ""))
         self.assertIsNone(o._detect_needs_approval("всё зелёное, готово", ""))
+
+    def test_detect_needs_approval_dedups_marker_lines(self):
+        dup = "🔴 карточка — разрешить?\n" * 5
+        card = o._detect_needs_approval("сделал", dup)
+        self.assertEqual(card.count("🔴 карточка — разрешить?"), 1)   # была ×5 → ×1
 
     def test_lane_ok(self):
         self.assertTrue(o._lane_ok({"lane": "pc"}))

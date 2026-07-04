@@ -115,6 +115,9 @@ _RE_TESTS = re.compile(r"(?i)-m\s+(pytest|py_compile|unittest)(\s|$)|(^|[\s/\\])
 _RE_READONLY_SHELL = re.compile(r"(?i)^\s*(ls|dir|echo|type|cat|head|tail|findstr|grep|rg|get-content|get-childitem|select-string|get-item|get-ciminstance|test-path|measure-object|where|get-command|git|py|python\s+--version)\b")
 _RE_PY = re.compile(r"(?i)(^|[\s/\\])(python3?|python\.exe|venv[\\/]scripts[\\/]python(\.exe)?)(\s|$)")
 _GREEN_MODULES = {"py_compile", "pytest", "unittest", "json.tool"}
+# .py-цели в сырой команде (устойчиво к shlex, который на Windows-путях с «\» ломает токены)
+_RE_PY_FILE = re.compile(r"(?i)(?:^|[\s/\\\"'])([^\s/\\\"';|&]+\.py)(?:[\s\"';|&]|$)")
+_RE_PY_FLAG = re.compile(r"(?i)(^|\s)-(c|m)(\s|$)|(^|\s)-(\s|$)")   # -c/-m/stdin → полный скан, не шорткат
 
 # python-скрипт с боевой записью → красное
 _RED_PY_TOKENS = [
@@ -144,6 +147,24 @@ def _is_secret_path(path):
 def _is_claude_path(path):
     n = os.path.normcase(os.path.normpath(path or ""))
     return (os.sep + ".claude" + os.sep) in n or n.endswith(os.sep + ".claude")
+
+
+def _is_test_target(path):
+    """test_*.py как ЦЕЛЬ прямого запуска (в т.ч. tests/test_*.py). Содержимое тест-файлов —
+    фикстуры с красными токенами (.env/os.remove/add_transaction/…), а НЕ боевые вызовы; сами
+    тесты гейтуются в репо (review+git). Порт VPS-урока: арг-файлы тест-раннера не сканируем."""
+    b = os.path.basename(path or "").lower()
+    return b.startswith("test_") and b.endswith(".py")
+
+
+def _all_py_targets_are_tests(cmd):
+    """True ⇔ это прямой запуск python, где ВСЕ .py-цели — test_*.py (и нет -c/-m/stdin).
+    Тогда контент не сканируем (тесты гейтуются в репо). Смешанный запуск (есть не-тест .py)
+    или -c/-m/stdin → False, идём в полный _scan_python — красное для остального НЕ ослабляем."""
+    if _RE_PY_FLAG.search(cmd):
+        return False                          # -c/-m/stdin: .py-имя могло быть внутри кода → скан
+    files = _RE_PY_FILE.findall(cmd)
+    return bool(files) and all(_is_test_target(f) for f in files)
 
 
 # ------------------------------- python scan ---------------------------------
@@ -183,6 +204,13 @@ def _scan_python(cmd, cwd):
                 return ("defer", "", "")
             return ("ask", "py_write", f"-m {mod}")
         if t.endswith(".py"):
+            if _is_test_target(t):
+                # прямой запуск test_*.py: тело НЕ читаем/НЕ сканируем — красные токены внутри
+                # тестов это фикстуры, а не боевая запись (тесты гейтуются в репо). Красный
+                # список для остального НЕ ослабляем: не-тест .py по-прежнему сканируется ниже.
+                saw_target = True
+                i += 1
+                continue
             body = _read_file(t, cwd)
             if body is None:
                 return ("ask", "py_write", "скрипт не прочитан")
@@ -250,6 +278,8 @@ def _decide_bash(cmd, cwd):
     if _RE_TESTS.search(cmd):
         return ("defer", "", "")
     if _RE_PY.search(cmd):
+        if _all_py_targets_are_tests(cmd):        # прямой запуск только test_*.py → без контент-скана
+            return ("defer", "", "")
         return _scan_python(cmd, cwd)
     if _RE_READONLY_SHELL.search(cmd):
         return ("defer", "", "")
@@ -293,17 +323,33 @@ def _push(card):
         pass  # пуш вторичен — не роняем решение
 
 
+def _write_marker(mk, card):
+    """Дописать красную карточку в файл-маркер headless-сигнала С ДЕДУПОМ: claude может ретраить
+    одно и то же красное действие несколько раз — гард срабатывал бы на каждый вызов и карточка
+    набегала бы ×N (было ×5). Если такая карточка уже в маркере — не дублируем."""
+    c = (card or "").strip()
+    if not c:
+        return
+    try:
+        existing = ""
+        if os.path.isfile(mk):
+            with open(mk, "r", encoding="utf-8", errors="ignore") as f:
+                existing = f.read()
+        if c in existing:
+            return
+        with open(mk, "a", encoding="utf-8") as f:
+            f.write(card + "\n")
+    except Exception:
+        pass
+
+
 def _emit_ask(card):
     # Сигнал headless→демон (pc_orchestrator): в headless карточку не показать интерактивно,
     # поэтому при заданном env пишем красную карточку в файл-маркер — демон детектит и ставит
     # NEEDS_APPROVAL. В интерактивной сессии env не задан → поведение не меняется.
     mk = os.environ.get("PRETOOL_ASK_MARKER")
     if mk:
-        try:
-            with open(mk, "a", encoding="utf-8") as f:
-                f.write(card + "\n")
-        except Exception:
-            pass
+        _write_marker(mk, card)
     _push(card)
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",

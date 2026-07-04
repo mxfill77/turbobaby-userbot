@@ -45,6 +45,25 @@ class TestGreenDefer(unittest.TestCase):
                   'venv/Scripts/python.exe dispatch_notify.py --hook stop'):
             self._defer(bash(c))
 
+    def test_test_runner_modules_defer_without_scanning_args(self):
+        # -m unittest / -m pytest c тест-файлами-аргументами: green-модуль, арг-файлы НЕ сканируем
+        # (порт VPS-урока). Тест-файлы содержат красные токены-фикстуры — не должны триггерить ask.
+        for c in ("venv/Scripts/python.exe -m unittest test_pretool_guard",
+                  "venv/Scripts/python.exe -m unittest test_pretool_guard test_pc_orchestrator",
+                  "venv/Scripts/python.exe -m pytest test_pretool_guard.py",
+                  "python -m unittest -v test_pc_orchestrator"):
+            self._defer(bash(c))
+
+    def test_direct_test_file_run_defers(self):
+        # прямой запуск test_*.py (в т.ч. tests/test_*.py) — defer без контент-скана: тела этих
+        # файлов — фикстуры с .env/os.remove/add_transaction, а не боевая запись (гейтуются в репо).
+        for c in ("venv/Scripts/python.exe test_pretool_guard.py",
+                  "venv/Scripts/python.exe test_pc_orchestrator.py",
+                  "python test_pretool_guard.py",
+                  "venv/Scripts/python.exe tests/test_something.py",
+                  r"venv\Scripts\python.exe tests\test_something.py"):
+            self._defer(bash(c))
+
     def test_readonly_shell(self):
         for c in ("ls -la", "echo hi", "grep foo bar.py", "git status", "type suggest.py"):
             self._defer(bash(c))
@@ -102,6 +121,13 @@ class TestRedAsk(unittest.TestCase):
 
     def test_python_touches_env(self):
         self._ask(bash('venv/Scripts/python.exe -c "open(\'.env\').read()"'))
+
+    def test_nontest_script_still_scanned(self):
+        # красное НЕ ослаблено: не-тест .py по-прежнему сканируется на боевую запись.
+        # pretool_guard.py содержит токен os.remove (в списке _RED_PY_TOKENS) → ask.
+        self._ask(bash("venv/Scripts/python.exe pretool_guard.py"))
+        # тест-файл-аргумент рядом с не-тест целью НЕ обеляет её (не-тест всё равно сканируется):
+        self._ask(bash("venv/Scripts/python.exe pretool_guard.py test_pretool_guard.py"))
 
     def test_edit_secret_and_claude_and_outside(self):
         self._ask(edit(r"D:\turbobaby-bot\.env"))
@@ -196,6 +222,48 @@ class TestHumanCards(unittest.TestCase):
         self.assertIn("секретный файл", card)
         self.assertIn(".env", card)
         self.assertNotIn("D:\\turbobaby-bot", card)   # показываем имя файла, не команду
+
+
+class TestMarkerDedup(unittest.TestCase):
+    """PRETOOL_ASK_MARKER: дедуп карточек. claude мог ретраить красное → карточка набегала ×5."""
+
+    def _tmp_marker(self):
+        import tempfile
+        fd, mk = tempfile.mkstemp(suffix=".marker")
+        os.close(fd)
+        os.remove(mk)   # начинаем с чистого (несуществующего) пути
+        return mk
+
+    def test_write_marker_dedups_repeats(self):
+        mk = self._tmp_marker()
+        try:
+            card = "🔴 Хочу удалить файл X — разрешить?\nКоманда: del X"
+            for _ in range(5):
+                g._write_marker(mk, card)
+            with open(mk, encoding="utf-8") as f:
+                content = f.read()
+            self.assertEqual(content.count("Хочу удалить файл X"), 1)   # была ×5 → стала ×1
+        finally:
+            try:
+                os.remove(mk)
+            except Exception:
+                pass
+
+    def test_write_marker_keeps_distinct_cards(self):
+        mk = self._tmp_marker()
+        try:
+            g._write_marker(mk, "🔴 карточка A — разрешить?")
+            g._write_marker(mk, "🔴 карточка B — разрешить?")
+            g._write_marker(mk, "🔴 карточка A — разрешить?")   # повтор A не добавляется
+            with open(mk, encoding="utf-8") as f:
+                content = f.read()
+            self.assertEqual(content.count("карточка A"), 1)
+            self.assertEqual(content.count("карточка B"), 1)   # разные карточки сохраняются
+        finally:
+            try:
+                os.remove(mk)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
