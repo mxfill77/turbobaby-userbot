@@ -416,26 +416,79 @@ def parse_date_range(text, today=None):
     return s.isoformat(), e.isoformat()
 
 
-def extract_booking_hints(transcript: str, today=None) -> dict:
-    """Грубая эвристика: модель + даты/срок в словах КЛИЕНТА + нормализованные ISO-даты.
-    Возвращает {model, date_start, date_end, iso_start, iso_end, term_days, has_dates}."""
-    text = _client_text(transcript)
-    model = None
+def _client_messages(transcript: str):
+    """Реплики КЛИЕНТА (не менеджера) в хронологическом порядке, lowercased."""
+    return [ln[len("[клиент]:"):].strip().lower()
+            for ln in (transcript or "").split("\n") if ln.startswith("[клиент]:")]
+
+
+def _detect_model(text: str):
     for tok in _MODEL_TOKENS:
         if tok in text:
-            model = tok.upper().replace(" ", "")
+            return tok.upper().replace(" ", "")
+    return None
+
+
+def _explicit_monthly(text: str) -> bool:
+    """monthly ТОЛЬКО по явному слову клиента, НЕ по длительности диапазона."""
+    return bool(re.search(r"месяц|\bmonth\b|monthly", text or ""))
+
+
+def _has_date_signal(text: str) -> bool:
+    if re.search(r"\d{1,2}[.\-/]\d{1,2}", text or ""):
+        return True
+    if _parse_term(text):
+        return True
+    if re.search(r"с\s+\d{1,2}\s+(?:по|до)\s+\d{1,2}", text or ""):
+        return True
+    return any(mo in (text or "") for mo in _MONTHS)
+
+
+BOOKING_WINDOW = 3  # сколько последних реплик клиента смотрим, чтобы дособрать ОДНУ бронь
+
+
+def extract_booking_hints(transcript: str, today=None) -> dict:
+    """Модель + даты ТОЛЬКО из ПОСЛЕДНЕЙ релевантной брони клиента (не из всего диалога).
+    База — последняя реплика клиента; до 2 предыдущих его реплик смотрим лишь чтобы дособрать
+    НЕДОСТАЮЩЕЕ той же брони. Разные модели / разные даты = разные брони: приоритет у последней,
+    старую отбрасываем (не смешиваем). Возвращает {model, date_start, date_end, iso_start,
+    iso_end, term_days, hint_days, monthly, has_dates}."""
+    window = _client_messages(transcript)[-BOOKING_WINDOW:][::-1]  # новейшая первой
+    newest = window[0] if window else ""
+
+    model = iso_start = iso_end = term_days = None
+    monthly = False
+
+    for idx, msg in enumerate(window):
+        m_model = _detect_model(msg)
+        s, e = parse_date_range(msg, today)
+        t = _parse_term(msg)
+        if idx == 0:
+            model = m_model
+            if s and e:
+                iso_start, iso_end = s, e
+            if t:
+                term_days = t[0]
+            monthly = _explicit_monthly(msg)
+            if model and (iso_start or term_days):
+                break  # последняя реплика самодостаточна — назад не идём
+            continue
+        # предыдущая реплика окна: СТОП при признаках ДРУГОЙ брони (другая модель)
+        if m_model and model and m_model != model:
             break
-    dates = re.findall(r"\b(\d{1,2}[.\-/]\d{1,2}(?:[./]\d{2,4})?)\b", text)
-    date_start = dates[0] if dates else None
-    date_end = dates[1] if len(dates) > 1 else None
-    term = _parse_term(text)
-    term_days = term[0] if term else None
-    monthly = bool(term and term[1]) or bool(re.search(r"месяц", text))
-    m_range = re.search(r"с\s+(\d{1,2})\s+(?:по|до)\s+(\d{1,2})", text)
-    has_month = any(mo in text for mo in _MONTHS)
-    has_dates = bool(dates or term_days or m_range or has_month)
-    iso_start, iso_end = parse_date_range(text, today)     # полный формат для Bridge
-    # длительность из слов клиента (для sanity-гарда): разница разобранных дат, иначе срок
+        # дособираем ТОЛЬКО недостающее (даты/срок), если у нас их ещё нет
+        if iso_start is None and term_days is None:
+            if s and e:
+                iso_start, iso_end = s, e
+                monthly = monthly or _explicit_monthly(msg)
+            elif t:
+                term_days = t[0]
+                monthly = monthly or _explicit_monthly(msg)
+        if model is None and m_model:
+            model = m_model
+        if model and (iso_start or term_days):
+            break
+
     hint_days = None
     if iso_start and iso_end:
         try:
@@ -445,9 +498,8 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
             hint_days = None
     if hint_days is None:
         hint_days = term_days
-    if hint_days is not None and hint_days >= 28:
-        monthly = True
-    return {"model": model, "date_start": date_start, "date_end": date_end,
+    has_dates = bool(iso_start or term_days) or _has_date_signal(newest)
+    return {"model": model, "date_start": iso_start, "date_end": iso_end,
             "iso_start": iso_start, "iso_end": iso_end, "term_days": term_days,
             "hint_days": hint_days, "monthly": monthly, "has_dates": has_dates}
 

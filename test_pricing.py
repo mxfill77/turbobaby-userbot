@@ -106,9 +106,10 @@ class TestHintsAndNote(unittest.TestCase):
         self.assertEqual(h["model"], "NMAX")
 
     def test_extract_numeric_dates(self):
-        h = suggest.extract_booking_hints("[клиент]: хочу XMAX на 10.07-17.07")
+        h = suggest.extract_booking_hints("[клиент]: хочу XMAX на 10.07-17.07",
+                                          today=datetime.date(2026, 7, 3))
         self.assertTrue(h["has_dates"])
-        self.assertEqual(h["date_start"], "10.07")
+        self.assertEqual(h["iso_start"], "2026-07-10")   # date_start=iso_start после фикса
 
     def test_extract_term_days(self):
         h = suggest.extract_booking_hints("[клиент]: ADV на 7 дней")
@@ -398,6 +399,77 @@ class TestScenarioOrder(unittest.TestCase):
         p = suggest.make_system_prompt("FAQ", "ru").lower()
         for w in ("паспорт", "апартамент", "шлем", "телефон"):
             self.assertIn(w, p)
+
+
+class TestLastBookingWindow(unittest.TestCase):
+    """Корневой фикс: модель+даты из ПОСЛЕДНЕЙ релевантной брони, не из всего диалога."""
+    TODAY = datetime.date(2026, 7, 3)
+
+    def _tr(self, *client_msgs):
+        return "\n".join("[клиент]: " + m for m in client_msgs)
+
+    def _h(self, *msgs):
+        return suggest.extract_booking_hints(self._tr(*msgs), today=self.TODAY)
+
+    def test_two_bookings_last_nmax_wins(self):
+        h = self._h("ADV 350 с 28 декабря по 3 января", "NMAX с 5 по 10 июля")
+        self.assertEqual(h["model"], "NMAX")
+        self.assertEqual((h["iso_start"], h["iso_end"]), ("2026-07-05", "2026-07-10"))
+        self.assertEqual(h["hint_days"], 5)          # чужая бронь (дек-янв) НЕ подмешана
+
+    def test_two_bookings_last_adv_wins(self):
+        h = self._h("NMAX с 5 по 10 июля", "ADV 350 с 28 декабря по 3 января")
+        self.assertEqual(h["model"], "ADV350")
+        self.assertEqual((h["iso_start"], h["iso_end"]), ("2026-12-28", "2027-01-03"))
+        self.assertEqual(h["hint_days"], 6)
+
+    def test_changed_dates_new_wins(self):
+        h = self._h("NMAX с 5 по 10 июля", "давай с 12 по 18 июля")
+        self.assertEqual(h["model"], "NMAX")         # модель из той же брони
+        self.assertEqual((h["iso_start"], h["iso_end"]), ("2026-07-12", "2026-07-18"))
+        self.assertEqual(h["hint_days"], 6)          # новые даты, старые сброшены
+
+    def test_window_assembly_model_last_dates_prev(self):
+        h = self._h("с 5 по 10 июля", "NMAX")        # даты в предыдущей, модель в последней
+        self.assertEqual(h["model"], "NMAX")
+        self.assertEqual((h["iso_start"], h["iso_end"]), ("2026-07-05", "2026-07-10"))
+        self.assertEqual(h["hint_days"], 5)
+
+    def test_monthly_only_explicit(self):
+        h1 = self._h("на месяц с 5 июля")
+        self.assertTrue(h1["monthly"]); self.assertEqual(h1["term_days"], 30)
+        h2 = self._h("с 5 июля по 20 августа")       # 46 дней, но БЕЗ слова «месяц»
+        self.assertFalse(h2["monthly"]); self.assertGreater(h2["hint_days"], 45)
+
+    def test_real_samhold_transcript_last_booking(self):
+        # реальный мульти-темный диалог из розыска — должна взяться ПОСЛЕДНЯЯ бронь (NMAX июль)
+        h = self._h("Привет! Есть NMAX на 5 дней?", "С 5ого по 10 июля",
+                    "NMAX с 5 по 10 июля", "ADV 350 с 28 декабря по 3 января",
+                    "Хорошо", "NMAX с 5 по 10 июля")
+        self.assertEqual(h["model"], "NMAX")
+        self.assertEqual((h["iso_start"], h["iso_end"]), ("2026-07-05", "2026-07-10"))
+        self.assertEqual(h["hint_days"], 5)          # НЕ 0 и НЕ 47 (чужая дек-янв не подмешана)
+
+
+class TestSanityStrengthened(unittest.TestCase):
+    def test_long_range_no_month_word_blocked(self):
+        # ~47 дней БЕЗ явного «месяц» → sanity режет (auto-monthly убран)
+        self.assertFalse(pricing.sanity_days_ok(47, 47, monthly=False))
+        self.assertFalse(pricing.sanity_days_ok(47, None, monthly=False))
+
+    def test_note_garbage_range_no_number(self):
+        saved = pricing.quote_for_model
+        pricing.quote_for_model = lambda *a, **k: {"status": "ok", "quote": {
+            "day_price": 219, "total": 10293, "deposit": 3000, "available": True, "days": 47}}
+        try:
+            note = suggest.build_pricing_note({"has_dates": True, "model": "NMAX",
+                                               "iso_start": "2026-07-05", "iso_end": "2026-08-21",
+                                               "hint_days": 47, "monthly": False})
+            for n in ("219", "10293", "10 293", "3000"):
+                self.assertNotIn(n, note)
+            self.assertIn("уточн", note.lower())     # инвариант: мусорный диапазон → фолбэк
+        finally:
+            pricing.quote_for_model = saved
 
 
 if __name__ == "__main__":
