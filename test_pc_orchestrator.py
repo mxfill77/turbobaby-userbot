@@ -6,8 +6,11 @@ test_pc_orchestrator.py — мок-тесты ПК-оркестратора. Б�
 """
 
 import os
+import sys
+import tempfile
 import datetime
 import unittest
+from unittest import mock
 
 import pc_orchestrator as o
 
@@ -279,6 +282,77 @@ class TestNeedsApprovalTopic(unittest.TestCase):
         self.assertEqual(captured["action"], "set_needs_approval")
         self.assertEqual(captured["id"], 5)
         self.assertEqual(captured["topic"], 829)     # карточка → тема 829 (уточнение Филиппа)
+
+
+class TestResolveClaude(unittest.TestCase):
+    """Версионно-независимый резолв claude (класс-фикс WinError 2 при автообновлении)."""
+
+    def setUp(self):
+        self._save = (o._claude_cache, o.CLAUDE_BIN, o._CLAUDE_BASE)
+        o._claude_cache = None
+
+    def tearDown(self):
+        (o._claude_cache, o.CLAUDE_BIN, o._CLAUDE_BASE) = self._save
+
+    def test_prefers_path_shim(self):
+        o.CLAUDE_BIN = "claude"
+        with mock.patch.object(o.shutil, "which", return_value=sys.executable):
+            self.assertEqual(o.resolve_claude(), sys.executable)   # PATH-шим (.cmd/.exe) выигрывает
+
+    def test_env_bin_fallback_when_not_on_path(self):
+        o.CLAUDE_BIN = sys.executable                              # существующий абсолютный файл
+        with mock.patch.object(o.shutil, "which", return_value=None):
+            self.assertEqual(o.resolve_claude(), sys.executable)
+
+    def test_env_bin_ignored_when_missing(self):
+        o.CLAUDE_BIN = r"C:\nope\claude-2.1.197\claude.exe"        # протухший .env-путь
+        with tempfile.TemporaryDirectory() as base:
+            sub = os.path.join(base, "2.1.201"); os.makedirs(sub)
+            exe = os.path.join(sub, "claude.exe"); open(exe, "w").close()
+            o._CLAUDE_BASE = base
+            with mock.patch.object(o.shutil, "which", return_value=None):
+                self.assertEqual(o.resolve_claude(), exe)          # протухший .env → берём установленную версию
+
+    def test_newest_version_glob(self):
+        o.CLAUDE_BIN = r"C:\nope\claude.exe"
+        with tempfile.TemporaryDirectory() as base:
+            for v in ("2.1.99", "2.1.100", "2.1.7"):
+                sub = os.path.join(base, v); os.makedirs(sub)
+                open(os.path.join(sub, "claude.exe"), "w").close()
+            o._CLAUDE_BASE = base
+            with mock.patch.object(o.shutil, "which", return_value=None):
+                got = o.resolve_claude()
+            self.assertEqual(os.path.basename(os.path.dirname(got)), "2.1.100")  # 100>99 (версией, не строкой)
+
+    def test_none_when_absent(self):
+        o.CLAUDE_BIN = r"C:\nope\claude.exe"
+        with tempfile.TemporaryDirectory() as d:
+            o._CLAUDE_BASE = d
+            with mock.patch.object(o.shutil, "which", return_value=None):
+                self.assertIsNone(o.resolve_claude())
+
+    def test_cache_revalidates_after_removal(self):
+        with tempfile.TemporaryDirectory() as base:
+            sub = os.path.join(base, "2.1.5"); os.makedirs(sub)
+            exe = os.path.join(sub, "claude.exe"); open(exe, "w").close()
+            o._CLAUDE_BASE = base; o.CLAUDE_BIN = "claude"
+            with mock.patch.object(o.shutil, "which", return_value=None):
+                self.assertEqual(o.resolve_claude(), exe)
+                os.remove(exe)                                     # автообновление удалило версию
+                self.assertIsNone(o.resolve_claude())              # кэш перепроверен → не мёртвый путь
+
+
+class TestClaudeUnresolvable(Base):
+    def test_run_task_failed_loud_when_not_found(self):
+        tid = self.fb.add(status="new")
+        save = o.resolve_claude
+        o.resolve_claude = lambda: None                            # claude нигде не найден
+        try:
+            o.process_new()
+        finally:
+            o.resolve_claude = save
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertIn("не найден", self.fb.tasks[tid]["result"].lower())
 
 
 if __name__ == "__main__":

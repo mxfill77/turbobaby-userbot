@@ -26,8 +26,10 @@ cowork_log + пуш Филиппу на done/failed/needs_approval.
 import os
 import re
 import sys
+import glob
 import time
 import json
+import shutil
 import logging
 import datetime
 import subprocess
@@ -56,7 +58,11 @@ NEEDS_APPROVAL_TOPIC = int(os.getenv("PC_NA_TOPIC", "829") or "829")   # тем�
 HEARTBEAT_STALE = int(os.getenv("PC_HB_STALE", "180") or "180")        # watchdog: heartbeat протух
 WATCH_VERIFY_SLEEP = int(os.getenv("PC_WATCH_VERIFY", "20") or "20")
 RESULT_MAX = 4500
-CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")   # ПРОД: указать реальный путь к claude CLI
+CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")   # ФОЛБЭК: явный путь из .env (может протухнуть при автообновлении)
+# Базовая папка версионных установок claude-code (AppData\Roaming\Claude\claude-code\<версия>\claude.exe).
+# Резолвим НОВЕЙШУЮ установку сами → путь переживает автообновление, даже когда .env-путь протух (WinError 2).
+_CLAUDE_BASE = os.path.join(os.getenv("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming"),
+                            "Claude", "claude-code")
 
 STOP_FLAG = os.path.join(REPO, "pc_orchestrator.stop")
 HEARTBEAT_FILE = os.path.join(REPO, "pc_orchestrator.heartbeat")
@@ -212,11 +218,56 @@ def _detect_needs_approval(out, marker_content=""):
 
 # ------------------------------- запуск claude -------------------------------
 
+def _ver_key(name):
+    """Ключ сортировки версии '2.1.197' → (2,1,197); нечисловое → (0,)."""
+    nums = re.findall(r"\d+", name or "")
+    return tuple(int(n) for n in nums) if nums else (0,)
+
+
+_claude_cache = None
+
+
+def resolve_claude():
+    """Найти исполняемый claude БЕЗ привязки к версии (иначе .env-путь протухает при
+    автообновлении → [WinError 2]). Порядок:
+      1) PATH-шим: shutil.which('claude') — учитывает PATHEXT (claude.cmd/.exe/.bat);
+      2) CLAUDE_BIN из .env — только если файл реально существует;
+      3) НОВЕЙШАЯ версия в AppData\\...\\claude-code\\<версия>\\claude.exe.
+    → путь (str) или None. Кэшируем, но перепроверяем существование (переживаем автообновление)."""
+    global _claude_cache
+    if _claude_cache and os.path.isfile(_claude_cache):
+        return _claude_cache
+    _claude_cache = None
+    w = shutil.which("claude")                       # 1) PATH-шим (.cmd/.exe через PATHEXT)
+    if w and os.path.isfile(w):
+        _claude_cache = w
+        return w
+    if CLAUDE_BIN and os.path.isabs(CLAUDE_BIN) and os.path.isfile(CLAUDE_BIN):  # 2) .env, если жив
+        _claude_cache = CLAUDE_BIN
+        return CLAUDE_BIN
+    try:                                             # 3) новейшая версионная установка
+        cands = []
+        for d in glob.glob(os.path.join(_CLAUDE_BASE, "*")):
+            exe = os.path.join(d, "claude.exe")
+            if os.path.isfile(exe):
+                cands.append((_ver_key(os.path.basename(d)), exe))
+        if cands:
+            cands.sort()
+            _claude_cache = cands[-1][1]
+            return _claude_cache
+    except Exception:
+        pass
+    return None
+
+
 def run_claude(prompt, timeout, cwd, env):
     """Запуск headless claude -p. Возврат (returncode, stdout, stderr). Таймаут → TimeoutError.
-    Инъектируется в тестах (реальный claude не дёргаем)."""
+    Инъектируется в тестах (реальный claude не дёргаем). Путь резолвится версионно-независимо."""
+    cbin = resolve_claude()
+    if not cbin:
+        raise FileNotFoundError("claude CLI не найден (PATH/.env/AppData)")
     try:
-        p = subprocess.run([CLAUDE_BIN, "-p", prompt], cwd=cwd, capture_output=True, text=True,
+        p = subprocess.run([cbin, "-p", prompt], cwd=cwd, capture_output=True, text=True,
                            timeout=timeout, env=env)
         return p.returncode, (p.stdout or ""), (p.stderr or "")
     except subprocess.TimeoutExpired:
@@ -231,6 +282,13 @@ def run_task(tid, text, note=""):
             os.remove(marker_path)        # в результат нового (ложное needs_approval).
     except Exception:
         pass
+    cbin = resolve_claude()                       # версионно-независимый резолв (класс-фикс WinError 2)
+    if not cbin:
+        msg = ("claude CLI не найден: нет ни в PATH, ни в CLAUDE_BIN (.env), ни в "
+               + os.path.join(_CLAUDE_BASE, "<версия>", "claude.exe")
+               + ". Проверь установку/автообновление claude-code.")
+        log.error("id=%s НЕ НАЙДЕН claude: %s", tid, msg)
+        return "failed", msg
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)          # headless идёт по ~/.claude (подписка), не платный API
     env.pop("OPENAI_API_KEY", None)
