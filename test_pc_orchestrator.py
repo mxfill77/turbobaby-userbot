@@ -224,5 +224,25 @@ class TestUnit(unittest.TestCase):
         self.assertTrue(ok, msg)                     # актуальный pc_orchestrator.py проходит гейт
 
 
+class TestNeedsApprovalTopic(unittest.TestCase):
+    def test_topic_829_default(self):
+        self.assertEqual(o.NEEDS_APPROVAL_TOPIC, 829)
+
+    def test_set_needs_approval_passes_topic_829(self):
+        b = o.Bridge(url="https://x", token="t")
+        captured = {}
+
+        def fake_post(action, **fields):
+            captured["action"] = action
+            captured.update(fields)
+            return {"ok": True}
+
+        b._post = fake_post
+        b.set_needs_approval(5, "красная карточка")
+        self.assertEqual(captured["action"], "set_needs_approval")
+        self.assertEqual(captured["id"], 5)
+        self.assertEqual(captured["topic"], 829)     # карточка → тема 829 (уточнение Филиппа)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

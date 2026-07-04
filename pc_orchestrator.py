@@ -43,6 +43,7 @@ LANE = os.getenv("PC_LANE", "pc")
 POLL_SEC = int(os.getenv("PC_POLL_SEC", "60") or "60")
 TASK_TIMEOUT = int(os.getenv("PC_TASK_TIMEOUT", "2700") or "2700")     # 45 мин жёсткий таймаут
 APPROVAL_TTL = int(os.getenv("PC_APPROVAL_TTL", "1800") or "1800")     # 30 мин ожидание approve
+NEEDS_APPROVAL_TOPIC = int(os.getenv("PC_NA_TOPIC", "829") or "829")   # тема, куда Splinter постит карточку
 HEARTBEAT_STALE = int(os.getenv("PC_HB_STALE", "180") or "180")        # watchdog: heartbeat протух
 WATCH_VERIFY_SLEEP = int(os.getenv("PC_WATCH_VERIFY", "20") or "20")
 RESULT_MAX = 4500
@@ -118,8 +119,9 @@ class Bridge:
     def complete_task(self, tid, status, result):
         return self._post("complete_task", id=tid, status=status, result=(result or "")[:RESULT_MAX])
 
-    def set_needs_approval(self, tid, what):
-        return self._post("set_needs_approval", id=tid, what=(what or "")[:RESULT_MAX])
+    def set_needs_approval(self, tid, what, topic=NEEDS_APPROVAL_TOPIC):
+        # topic → Splinter постит красную карточку в эту тему (по уточнению Филиппа — 829).
+        return self._post("set_needs_approval", id=tid, what=(what or "")[:RESULT_MAX], topic=topic)
 
     def task_heartbeat(self, tid):
         return self._post("task_heartbeat", id=tid)
