@@ -248,6 +248,106 @@ class TestOutputContract(Base):
         self.assertIn("RESULT:", o.PREAMBLE)                  # преамбула обязывает контракт
 
 
+class TestEncoding(Base):
+    """Кодировка headless (фикс кракозябр в карточках 829): utf-8/replace на чтении вывода +
+    PYTHONIOENCODING=utf-8 ребёнку. Кириллица в мок-выводе должна доходить читаемой."""
+
+    def test_run_claude_reads_utf8_replace(self):
+        captured = {}
+
+        class _P:
+            returncode = 0
+            stdout = "готово\nRESULT: кириллица жива"
+            stderr = ""
+
+        def fake_run(cmd, **kw):
+            captured.update(kw)
+            return _P()
+
+        with mock.patch.object(o.subprocess, "run", fake_run), \
+                mock.patch.object(o, "resolve_claude", lambda: sys.executable):
+            rc, out, err = o.run_claude("p", 10, o.REPO, {"X": "1"})
+        self.assertEqual(captured.get("encoding"), "utf-8")     # не локаль Windows (cp1251)
+        self.assertEqual(captured.get("errors"), "replace")     # не падаем на неведомом байте
+        self.assertIn("кириллица жива", out)
+
+    def test_child_env_has_pythonioencoding_utf8(self):
+        captured = {}
+
+        def fake(prompt, timeout, cwd, env):
+            captured["env"] = dict(env)
+            return (0, "готово\nRESULT: ок", "")
+        o.run_claude = fake
+        self.fb.add(status="new")
+        o.process_new()
+        self.assertEqual(captured["env"].get("PYTHONIOENCODING"), "utf-8")
+
+    def test_cyrillic_result_readable_end_to_end(self):
+        tid = self.fb.add(status="new")
+        self._claude(0, "выполнил\nRESULT: настроил кодировку — кириллица читаема, кракозябр нет")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+        self.assertIn("кириллица читаема", self.fb.tasks[tid]["result"])
+
+    def test_schtasks_run_reads_utf8_replace(self):
+        captured = {}
+
+        class _P:
+            returncode = 0
+            stdout = "УСПЕХ: задача запущена"
+            stderr = ""
+
+        def fake_run(cmd, **kw):
+            captured.update(kw)
+            return _P()
+
+        with mock.patch.object(o.subprocess, "run", fake_run):
+            rc, out = o._schtasks_run("pc_orchestrator")
+        self.assertEqual(captured.get("encoding"), "utf-8")
+        self.assertEqual(captured.get("errors"), "replace")
+        self.assertIn("УСПЕХ", out)
+
+
+class TestCoworkFullResult(Base):
+    """Полный отчёт в мозг: при done/failed в cowork_log идёт не только статус, а полный текст
+    RESULT/причины failed (усечение до ~1500 символов с пометкой «…обрезано»)."""
+
+    def setUp(self):
+        super().setUp()
+        self.lines = []
+        o._cowork = lambda line: self.lines.append(line)
+
+    def test_done_writes_full_result_to_cowork(self):
+        self.fb.add(status="new")
+        self._claude(0, "сводка работ\nRESULT: закоммитил фикс кодировки и наблюдаемости pc_orchestrator")
+        o.process_new()
+        joined = "\n".join(self.lines)
+        self.assertIn("→ done", joined)
+        self.assertIn("закоммитил фикс кодировки", joined)     # полный RESULT, не только статус
+
+    def test_failed_writes_reason_to_cowork(self):
+        self.fb.add(status="new")
+        self._claude(0, "долго болтал, но итог не подтвердил")   # нет RESULT: → insufficient_output
+        o.process_new()
+        joined = "\n".join(self.lines)
+        self.assertIn("→ failed", joined)
+        self.assertIn("insufficient_output", joined)           # причина failed видна штабу
+
+    def test_long_result_truncated_with_marker(self):
+        self.fb.add(status="new")
+        big = "RESULT: " + ("хвост " * 600)                     # >1500 символов
+        self._claude(0, "работа\n" + big)
+        o.process_new()
+        done_line = next(l for l in self.lines if "→ done" in l)
+        self.assertIn("…обрезано", done_line)                  # усечение помечено
+        self.assertLessEqual(len(done_line), 1600)             # ~1500 + префикс/пометка
+
+    def test_clip_collapses_and_marks(self):
+        self.assertEqual(o._clip("а  б\nв"), "а б в")           # схлопывает пробелы/переносы
+        self.assertTrue(o._clip("x" * 5000).endswith("…обрезано"))
+        self.assertEqual(o._clip("коротко"), "коротко")        # короткое не трогаем
+
+
 class TestApproved(Base):
     def test_approved_rerun_done(self):
         tid = self.fb.add(status="approved", updated=iso_ago(10))

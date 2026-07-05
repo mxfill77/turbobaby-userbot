@@ -104,6 +104,16 @@ def _tail(s, n=500):
     return s[-n:] if s else ""
 
 
+COWORK_RESULT_MAX = 1500   # полный текст RESULT/причины failed в cowork_log штаб читает без скринов
+
+
+def _clip(s, n=COWORK_RESULT_MAX):
+    """Однострочный итог для cowork_log: схлопываем пробелы/переносы (лог — одна строка),
+    режем до n символов с явной пометкой «…обрезано», чтобы штаб видел усечение."""
+    s = " ".join(str(s or "").split())
+    return s if len(s) <= n else (s[:n] + " …обрезано")
+
+
 # ------------------------------- Bridge (очередь) ----------------------------
 
 class Bridge:
@@ -290,8 +300,11 @@ def run_claude(prompt, timeout, cwd, env):
     if not cbin:
         raise FileNotFoundError("claude CLI не найден (PATH/.env/AppData)")
     try:
-        p = subprocess.run([cbin, "-p", prompt], cwd=cwd, capture_output=True, text=True,
-                           timeout=timeout, env=env)
+        # encoding=utf-8 + errors=replace: без явной кодировки text=True берёт локаль Windows
+        # (cp1251) → кириллица в карточках 829 превращалась в кракозябры. replace → не падаем на
+        # неведомом байте, а подставляем �. PYTHONIOENCODING=utf-8 ребёнку выставлен в run_task().
+        p = subprocess.run([cbin, "-p", prompt], cwd=cwd, capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=timeout, env=env)
         return p.returncode, (p.stdout or ""), (p.stderr or "")
     except subprocess.TimeoutExpired:
         raise TimeoutError("claude -p timeout")
@@ -314,6 +327,7 @@ def run_task(tid, text, note=""):
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)          # headless идёт по ~/.claude (подписка), не платный API
     env.pop("OPENAI_API_KEY", None)
+    env["PYTHONIOENCODING"] = "utf-8"            # ребёнок пишет stdout/stderr в utf-8 → нет кракозябр (пара к encoding в run_claude)
     env[ASK_MARKER_ENV] = marker_path            # pretool_guard в headless пишет сюда красную карточку
     env[MARKER_TOKEN_ENV] = run_token            # …штампуя её нашим токеном — чужие карточки отсеем
     prompt = (note + PREAMBLE) if note else PREAMBLE
@@ -411,8 +425,8 @@ def process_new():
     else:
         bc.complete_task(tid, status, result)
         log.info("COMPLETE id=%s status=%s", tid, status)
-        brief = (" — " + " ".join(str(result or "").split())[:220]) if status == "failed" else ""
-        _cowork(f"задача #{tid} → {status}{brief}")   # на failed диагноз (stderr-хвост) виден в cowork_log
+        # полный текст RESULT (done) / причины failed → штаб читает итог из cowork_log без скринов
+        _cowork(f"задача #{tid} → {status} · {_clip(result)}")
         _notify(_human(status, tid, result))
 
 
@@ -428,17 +442,21 @@ def process_approved():
             return
         if (_age_sec(task.get("updated")) or 0) > APPROVAL_TTL:
             log.info("APPROVED id=%s истёк (>%ss) → failed", tid, APPROVAL_TTL)
-            bc.complete_task(tid, "failed", "approve истёк (>30 мин) — повтори задачу")
+            msg = "approve истёк (>30 мин) — повтори задачу"
+            bc.complete_task(tid, "failed", msg)
+            _cowork(f"задача #{tid} (approved) → failed · {_clip(msg)}")
             _notify(_human("failed", tid, "approve истёк"))
             continue
         status, result = run_task(tid, str(task.get("task_text") or ""),
                                   note="[ОДОБРЕНО ЧЕЛОВЕКОМ] предыдущий шаг подтверждён. ")
         if status == "needs_approval":
-            bc.complete_task(tid, "failed",
-                             "одобрено, но шаг снова упирается в красное — выполни вручную: " + result[:400])
+            msg = "одобрено, но шаг снова упирается в красное — выполни вручную: " + result[:400]
+            bc.complete_task(tid, "failed", msg)
+            _cowork(f"задача #{tid} (approved) → failed · {_clip(msg)}")
             _notify(_human("failed", tid, "снова красное после approve — вручную"))
         else:
             bc.complete_task(tid, status, result)
+            _cowork(f"задача #{tid} (approved) → {status} · {_clip(result)}")
             _notify(_human(status, tid, result))
         log.info("APPROVED id=%s → %s", tid, status)
 
@@ -453,7 +471,9 @@ def process_approval_timeouts():
         tid = task.get("id")
         if (_age_sec(task.get("updated")) or 0) > APPROVAL_TTL:
             log.info("NEEDS_APPROVAL id=%s таймаут (>%ss) → failed", tid, APPROVAL_TTL)
-            bc.complete_task(tid, "failed", "подтверждение не получено за 30 мин — задача провалена")
+            msg = "подтверждение не получено за 30 мин — задача провалена"
+            bc.complete_task(tid, "failed", msg)
+            _cowork(f"задача #{tid} → failed · {_clip(msg)}")
             _notify(_human("failed", tid, "подтверждение не получено за 30 мин"))
 
 
@@ -497,7 +517,8 @@ def _heartbeat_fresh(now=None, threshold=HEARTBEAT_STALE):
 def _schtasks_run(task_name=TASK_NAME):
     """Запустить задачу Планировщика. Возврат (rc, output). Инъектируется в тестах."""
     try:
-        p = subprocess.run(["schtasks", "/Run", "/TN", task_name], capture_output=True, text=True, timeout=30)
+        p = subprocess.run(["schtasks", "/Run", "/TN", task_name], capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=30)   # utf-8: русский вывод schtasks читаем в логе
         return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
     except Exception as e:
         return -1, f"schtasks не запустился: {e}"
