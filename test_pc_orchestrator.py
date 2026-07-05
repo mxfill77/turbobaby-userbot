@@ -468,9 +468,33 @@ class TestResolveClaude(unittest.TestCase):
     def setUp(self):
         self._save = (o._claude_cache, o.CLAUDE_BIN, o._CLAUDE_BASE)
         o._claude_cache = None
+        # ИЗОЛЯЦИЯ от реального MSIX-claude на машине (LOCALAPPDATA\Packages\Claude_*) —
+        # иначе _claude_base_dirs нашёл бы боевой бинарь и сломал тесты «None/конкретный путь».
+        self._latmp = tempfile.TemporaryDirectory()
+        self._save_la = os.environ.get("LOCALAPPDATA")
+        os.environ["LOCALAPPDATA"] = self._latmp.name
 
     def tearDown(self):
         (o._claude_cache, o.CLAUDE_BIN, o._CLAUDE_BASE) = self._save
+        if self._save_la is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = self._save_la
+        self._latmp.cleanup()
+
+    def test_msix_package_path_found(self):
+        # Store/MSIX: реальный бинарь в LOCALAPPDATA\Packages\Claude_*\LocalCache\...\claude-code
+        pkg = os.path.join(self._latmp.name, "Packages", "Claude_xyz", "LocalCache",
+                           "Roaming", "Claude", "claude-code", "2.1.197")
+        os.makedirs(pkg)
+        exe = os.path.join(pkg, "claude.exe"); open(exe, "w").close()
+        o.CLAUDE_BIN = "claude"
+        with tempfile.TemporaryDirectory() as empty:
+            o._CLAUDE_BASE = empty                            # обычная база пуста → берём MSIX
+            self.assertTrue(any("Claude_xyz" in b for b in o._claude_base_dirs()))
+            with mock.patch.object(o.shutil, "which", return_value=None), \
+                 mock.patch.object(o, "_claude_candidates", return_value=[]):
+                self.assertEqual(o.resolve_claude(retry_sleep=0), exe)
 
     def test_prefers_path_shim(self):
         o.CLAUDE_BIN = "claude"

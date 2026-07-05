@@ -275,23 +275,42 @@ def _claude_candidates():
     ]
 
 
+def _claude_base_dirs():
+    """Базы версий claude-code: обычная Roaming\\Claude\\claude-code + РЕАЛЬНАЯ MSIX-база
+    AppData\\Local\\Packages\\Claude_*\\LocalCache\\Roaming\\Claude\\claude-code. У Store/MSIX-установки
+    Roaming\\Claude — виртуальный редирект, видимый ТОЛЬКО в интерактивной сессии; демон запущен
+    Планировщиком и его не видит (FileNotFoundError). Реальный путь в Packages доступен всегда."""
+    out = [_CLAUDE_BASE]
+    home = os.path.expanduser("~")
+    local = os.getenv("LOCALAPPDATA") or os.path.join(os.getenv("USERPROFILE") or home, "AppData", "Local")
+    try:
+        for cc in glob.glob(os.path.join(local, "Packages", "Claude_*", "LocalCache",
+                                         "Roaming", "Claude", "claude-code")):
+            if cc not in out:
+                out.append(cc)
+    except Exception:
+        pass
+    return out
+
+
 def _resolve_claude_once():
     """Один проход по всем местам (без ретраев). → путь | None. Порядок:
       1) PATH-шим: shutil.which('claude') — учитывает PATHEXT (claude.cmd/.exe/.bat);
       2) CLAUDE_BIN из .env — только если файл реально существует;
-      3) НОВЕЙШАЯ версия в AppData\\...\\claude-code\\<версия>\\claude.exe;
+      3) НОВЕЙШАЯ версия claude-code по всем базам (вкл. реальную MSIX-Packages — фикс «не найден в бою»);
       4) явные кандидаты других схем установки (_claude_candidates)."""
     w = shutil.which("claude")                       # 1) PATH-шим (.cmd/.exe через PATHEXT)
     if w and os.path.isfile(w):
         return w
     if CLAUDE_BIN and os.path.isabs(CLAUDE_BIN) and os.path.isfile(CLAUDE_BIN):  # 2) .env, если жив
         return CLAUDE_BIN
-    try:                                             # 3) новейшая версионная установка
+    try:                                             # 3) новейшая версионная установка (все базы)
         cands = []
-        for d in glob.glob(os.path.join(_CLAUDE_BASE, "*")):
-            exe = os.path.join(d, "claude.exe")
-            if os.path.isfile(exe):
-                cands.append((_ver_key(os.path.basename(d)), exe))
+        for base in _claude_base_dirs():
+            for d in glob.glob(os.path.join(base, "*")):
+                exe = os.path.join(d, "claude.exe")
+                if os.path.isfile(exe):
+                    cands.append((_ver_key(os.path.basename(d)), exe))
         if cands:
             cands.sort()
             return cands[-1][1]

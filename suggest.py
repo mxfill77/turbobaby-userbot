@@ -792,16 +792,30 @@ def _env_file_claude_bin():
 
 
 def _claude_base_dirs():
-    """Базовые папки версионных установок claude-code по ВСЕМ профилям (в сервис-контексте %APPDATA%
-    может указывать на systemprofile — пробуем и APPDATA, и USERPROFILE, и ~)."""
-    roots, out = [], []
+    """Базовые папки версий claude-code. Включает:
+    (1) обычные Roaming\\Claude\\claude-code по всем профилям — НО у Store/MSIX-установки Claude это
+        ВИРТУАЛЬНЫЙ редирект (виден только в интерактивной сессии; процессы Планировщика/userbot
+        получают FileNotFoundError → «claude CLI не найден в бою»);
+    (2) РЕАЛЬНЫЙ путь MSIX-пакета AppData\\Local\\Packages\\Claude_*\\LocalCache\\Roaming\\Claude\\
+        claude-code — доступен из ЛЮБОГО контекста (это и есть фикс)."""
+    out = []
     up = os.getenv("USERPROFILE")
+    home = os.path.expanduser("~")
+    local = os.getenv("LOCALAPPDATA") or os.path.join(up or home, "AppData", "Local")
+    roots = []
     for r in (os.getenv("APPDATA"),
               (os.path.join(up, "AppData", "Roaming") if up else None),
-              os.path.join(os.path.expanduser("~"), "AppData", "Roaming")):
+              os.path.join(home, "AppData", "Roaming")):
         if r and r not in roots:
             roots.append(r)
             out.append(os.path.join(r, "Claude", "claude-code"))
+    try:  # реальные MSIX-базы (Claude_<хэш-издателя> — wildcard, чтобы пережить смену пакета)
+        for cc in glob.glob(os.path.join(local, "Packages", "Claude_*", "LocalCache",
+                                         "Roaming", "Claude", "claude-code")):
+            if cc not in out:
+                out.append(cc)
+    except Exception:
+        pass
     return out
 
 

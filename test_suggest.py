@@ -720,6 +720,26 @@ class TestCliLlm(unittest.TestCase):
             with mock.patch.object(suggest, "REPO_ENV", envf):
                 self.assertEqual(suggest._env_file_claude_bin(), exe)
 
+    def test_msix_package_path_found_when_roaming_virtual(self):
+        # Store/MSIX: Roaming\Claude невидим процессам Планировщика; реальный бинарь в
+        # AppData\Local\Packages\Claude_*\LocalCache\... — резолвер обязан его найти.
+        with tempfile.TemporaryDirectory() as d:
+            local = os.path.join(d, "Local")
+            cc = os.path.join(local, "Packages", "Claude_abc123", "LocalCache",
+                              "Roaming", "Claude", "claude-code")
+            pkg = os.path.join(cc, "2.1.197"); os.makedirs(pkg)
+            exe = os.path.join(pkg, "claude.exe"); open(exe, "w").close()
+            # (1) _claude_base_dirs включает MSIX-базу (по LOCALAPPDATA)
+            with mock.patch.dict(os.environ, {"LOCALAPPDATA": local}, clear=False):
+                self.assertTrue(any("Claude_abc123" in b and "Packages" in b
+                                    for b in suggest._claude_base_dirs()))
+            # (2) резолв находит реальный MSIX-бинарь (базы = только MSIX, .env/which пусты)
+            with mock.patch.object(suggest.shutil, "which", return_value=None), \
+                 mock.patch.object(suggest, "CLAUDE_BIN", "claude"), \
+                 mock.patch.object(suggest, "REPO_ENV", os.path.join(d, "no.env")), \
+                 mock.patch.object(suggest, "_claude_base_dirs", return_value=[cc]):
+                self.assertEqual(suggest._resolve_claude_once(), exe)
+
     def test_service_context_reproduction_fixed(self):
         # РЕПРО живого бага: %APPDATA%=systemprofile, env-var CLAUDE_BIN нет → раньше None. Теперь .env спасает.
         with tempfile.TemporaryDirectory() as d:
