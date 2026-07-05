@@ -766,25 +766,70 @@ def _default_llm(system: str, user: str) -> str:
     return "".join(getattr(b, "text", "") for b in resp.content).strip()
 
 
-_CLAUDE_BASE = os.path.join(os.getenv("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming"),
-                            "Claude", "claude-code")
+REPO_ENV = os.path.join(BASE_DIR, ".env")   # .env репо по __file__ (НЕ по cwd/окружению)
+
+
+def _env_file_claude_bin():
+    """CLAUDE_BIN, прочитанный ПРЯМО из .env-файла репо (путь по __file__, не из окружения процесса).
+    КОРЕНЬ БАГА: userbot запущен в СЕРВИС-контексте (services.exe→…→python) — %APPDATA% указывает на
+    systemprofile, load_dotenv не подхватил .env, поэтому ни glob по %APPDATA%, ни env-var CLAUDE_BIN
+    не срабатывали → «claude CLI не найден» ТОЛЬКО в бою. Чтение файла напрямую от окружения не зависит.
+    Берём ТОЛЬКО строку CLAUDE_BIN (секреты не читаем/не логируем). → путь если существует, иначе ''."""
+    try:
+        # utf-8-sig: снимает BOM (PowerShell 5.1 `Set-Content -Encoding utf8` пишет его на первой
+        # строке — иначе startswith мимо); errors=replace: одинокий не-utf8 байт на ЧУЖОЙ строке
+        # не должен уронить парс до строки CLAUDE_BIN. Иначе фикс сервис-контекста тихо ломается.
+        with open(REPO_ENV, encoding="utf-8-sig", errors="replace") as f:
+            for ln in f:
+                s = ln.strip()
+                if s.startswith("CLAUDE_BIN=") and not s.startswith("#"):
+                    val = s.split("=", 1)[1].strip().strip('"').strip("'")
+                    if val and os.path.isabs(val) and os.path.isfile(val):
+                        return val
+    except Exception:
+        pass
+    return ""
+
+
+def _claude_base_dirs():
+    """Базовые папки версионных установок claude-code по ВСЕМ профилям (в сервис-контексте %APPDATA%
+    может указывать на systemprofile — пробуем и APPDATA, и USERPROFILE, и ~)."""
+    roots, out = [], []
+    up = os.getenv("USERPROFILE")
+    for r in (os.getenv("APPDATA"),
+              (os.path.join(up, "AppData", "Roaming") if up else None),
+              os.path.join(os.path.expanduser("~"), "AppData", "Roaming")):
+        if r and r not in roots:
+            roots.append(r)
+            out.append(os.path.join(r, "Claude", "claude-code"))
+    return out
+
+
+# Совместимость: часть кода ссылается на _CLAUDE_BASE (первый корень).
+_CLAUDE_BASE = (_claude_base_dirs() or
+                [os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "Claude", "claude-code")])[0]
 
 
 def _resolve_claude_once():
-    """Один проход резолва (без ретраев). PATH-шим → CLAUDE_BIN если жив → новейшая версия в AppData
-    → кандидаты иных схем установки. → путь|None."""
+    """Один проход резолва (без ретраев). Порядок: PATH-шим → CLAUDE_BIN из окружения (если жив) →
+    CLAUDE_BIN ПРЯМО из .env-файла (спасает сервис-контекст) → новейшая версия claude-code по ВСЕМ
+    профилям → кандидаты иных схем установки. → путь|None."""
     w = shutil.which("claude")
     if w and os.path.isfile(w):
         return w
     if CLAUDE_BIN and os.path.isabs(CLAUDE_BIN) and os.path.isfile(CLAUDE_BIN):
         return CLAUDE_BIN
+    envbin = _env_file_claude_bin()             # ← КЛЮЧ: не зависит от %APPDATA%/load_dotenv/cwd
+    if envbin:
+        return envbin
     try:
         cands = []
-        for d in glob.glob(os.path.join(_CLAUDE_BASE, "*")):
-            exe = os.path.join(d, "claude.exe")
-            if os.path.isfile(exe):
-                nums = re.findall(r"\d+", os.path.basename(d))
-                cands.append((tuple(int(n) for n in nums) if nums else (0,), exe))
+        for base in _claude_base_dirs():
+            for d in glob.glob(os.path.join(base, "*")):
+                exe = os.path.join(d, "claude.exe")
+                if os.path.isfile(exe):
+                    nums = re.findall(r"\d+", os.path.basename(d))
+                    cands.append((tuple(int(n) for n in nums) if nums else (0,), exe))
         if cands:
             cands.sort()
             return cands[-1][1]

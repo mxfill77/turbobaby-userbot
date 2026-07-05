@@ -678,6 +678,62 @@ class TestCliLlm(unittest.TestCase):
              mock.patch.object(suggest.subprocess, "run", return_value=P()):
             self.assertEqual(suggest._cli_llm("S", "U"), "Здравствуйте! NMAX свободен.")
 
+    # --- резолв из .env-файла: спасает сервис-контекст (%APPDATA%=systemprofile) ---
+    def test_resolve_reads_claude_bin_from_env_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe = os.path.join(d, "claude.exe"); open(exe, "w").close()
+            envf = os.path.join(d, ".env")
+            with open(envf, "w", encoding="utf-8") as f:
+                f.write("BRIDGE_TOKEN=secret-не-читаем\nCLAUDE_BIN=" + exe + "\n")
+            with mock.patch.object(suggest, "REPO_ENV", envf), \
+                 mock.patch.object(suggest, "CLAUDE_BIN", "claude"), \
+                 mock.patch.object(suggest.shutil, "which", return_value=None), \
+                 mock.patch.object(suggest, "_claude_base_dirs", return_value=[os.path.join(d, "nope")]):
+                self.assertEqual(suggest._resolve_claude_once(), exe)          # взято ИЗ .env-файла
+                self.assertEqual(suggest._resolve_claude(retry_sleep=0), exe)  # и полный резолв тоже
+
+    def test_env_file_bin_ignores_missing_and_comments(self):
+        with tempfile.TemporaryDirectory() as d:
+            envf = os.path.join(d, ".env")
+            with open(envf, "w", encoding="utf-8") as f:
+                f.write("# CLAUDE_BIN=C:\\commented\\claude.exe\nCLAUDE_BIN=C:\\nope\\claude.exe\n")
+            with mock.patch.object(suggest, "REPO_ENV", envf):
+                self.assertEqual(suggest._env_file_claude_bin(), "")           # путь не существует → ''
+
+    def test_env_file_bin_handles_utf8_bom_first_line(self):
+        # PowerShell 5.1 `Set-Content -Encoding utf8` пишет BOM; CLAUDE_BIN первой строкой не должен теряться
+        with tempfile.TemporaryDirectory() as d:
+            exe = os.path.join(d, "claude.exe"); open(exe, "w").close()
+            envf = os.path.join(d, ".env")
+            with open(envf, "w", encoding="utf-8-sig") as f:                   # ← с BOM
+                f.write("CLAUDE_BIN=" + exe + "\nBRIDGE_TOKEN=x\n")
+            with mock.patch.object(suggest, "REPO_ENV", envf):
+                self.assertEqual(suggest._env_file_claude_bin(), exe)
+
+    def test_env_file_bin_survives_stray_nonutf8_on_other_line(self):
+        # одинокий не-utf8 байт на ЧУЖОЙ строке не должен уронить парс до валидной строки CLAUDE_BIN
+        with tempfile.TemporaryDirectory() as d:
+            exe = os.path.join(d, "claude.exe"); open(exe, "w").close()
+            envf = os.path.join(d, ".env")
+            with open(envf, "wb") as f:
+                f.write(b"SOMEKEY=\xff\xfe bad\r\nCLAUDE_BIN=" + exe.encode("utf-8") + b"\r\n")
+            with mock.patch.object(suggest, "REPO_ENV", envf):
+                self.assertEqual(suggest._env_file_claude_bin(), exe)
+
+    def test_service_context_reproduction_fixed(self):
+        # РЕПРО живого бага: %APPDATA%=systemprofile, env-var CLAUDE_BIN нет → раньше None. Теперь .env спасает.
+        with tempfile.TemporaryDirectory() as d:
+            exe = os.path.join(d, "claude.exe"); open(exe, "w").close()
+            envf = os.path.join(d, ".env")
+            with open(envf, "w", encoding="utf-8") as f:
+                f.write("CLAUDE_BIN=" + exe + "\n")
+            svc = r"C:\Windows\system32\config\systemprofile\AppData\Roaming\Claude\claude-code"
+            with mock.patch.object(suggest, "REPO_ENV", envf), \
+                 mock.patch.object(suggest, "CLAUDE_BIN", "claude"), \
+                 mock.patch.object(suggest.shutil, "which", return_value=None), \
+                 mock.patch.object(suggest, "_claude_base_dirs", return_value=[svc]):
+                self.assertEqual(suggest._resolve_claude(retry_sleep=0), exe)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
