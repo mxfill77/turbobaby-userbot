@@ -451,6 +451,54 @@ class TestLastBookingWindow(unittest.TestCase):
         self.assertEqual(h["hint_days"], 5)          # НЕ 0 и НЕ 47 (чужая дек-янв не подмешана)
 
 
+class TestQuizFourCases(unittest.TestCase):
+    """Доводка ценовой викторины: 4 боевые фразы (с моделью) через parse_date_range +
+    extract_booking_hints на today=2026-07-05. Замок против дрейфа год-ролла/swap/monthly."""
+    TODAY = datetime.date(2026, 7, 5)
+
+    def _pd(self, phrase):
+        s, e = suggest.parse_date_range(phrase, self.TODAY)
+        self.assertIsNotNone(s, phrase); self.assertIsNotNone(e, phrase)
+        ds = datetime.date.fromisoformat(s); de = datetime.date.fromisoformat(e)
+        return s, e, (de - ds).days
+
+    def _h(self, phrase):
+        return suggest.extract_booking_hints("[клиент]: " + phrase, today=self.TODAY)
+
+    def test_case1_adv350_year_roll_6_days(self):
+        s, e, d = self._pd("ADV 350 с 28 декабря по 3 января")
+        self.assertEqual((s, e, d), ("2026-12-28", "2027-01-03", 6))   # легитимный переход через год
+        h = self._h("ADV 350 с 28 декабря по 3 января")
+        self.assertEqual(h["model"], "ADV350")
+        self.assertEqual(h["hint_days"], 6)
+        self.assertFalse(h["monthly"])
+
+    def test_case2_nmax_tomorrow_3_days(self):
+        s, e, d = self._pd("NMAX завтра на 3 дня")
+        self.assertEqual((s, e, d), ("2026-07-06", "2026-07-09", 3))   # 3 дня от завтра
+        h = self._h("NMAX завтра на 3 дня")
+        self.assertEqual(h["model"], "NMAX")
+        self.assertEqual(h["hint_days"], 3)
+        self.assertFalse(h["monthly"])
+
+    def test_case3_nmax_swapped_5_days_not_360(self):
+        s, e, d = self._pd("NMAX с 10 по 5 июля")
+        self.assertEqual((s, e), ("2026-07-05", "2026-07-10"))         # swap, НЕ 360
+        self.assertEqual(d, 5)
+        self.assertLess(d, 30)
+        h = self._h("NMAX с 10 по 5 июля")
+        self.assertEqual(h["hint_days"], 5)
+        self.assertFalse(h["monthly"])
+
+    def test_case4_nmax_monthly_only_explicit_word(self):
+        s, e, d = self._pd("NMAX на месяц с 5 июля")
+        self.assertEqual((s, e, d), ("2026-07-05", "2026-08-04", 30))  # monthly по явному слову
+        h = self._h("NMAX на месяц с 5 июля")
+        self.assertEqual(h["model"], "NMAX")
+        self.assertEqual(h["term_days"], 30)
+        self.assertTrue(h["monthly"])                                   # «месяц» сказано явно
+
+
 class TestSanityStrengthened(unittest.TestCase):
     def test_long_range_no_month_word_blocked(self):
         # ~47 дней БЕЗ явного «месяц» → sanity режет (auto-monthly убран)
