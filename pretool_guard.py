@@ -323,22 +323,30 @@ def _push(card):
         pass  # пуш вторичен — не роняем решение
 
 
+MARKER_TOKEN_ENV = "PRETOOL_MARKER_TOKEN"   # токен запуска демона: штампуем им каждую строку карточки,
+MARKER_SEP = "\x1f"                          # чтобы демон принимал только карточки СВОЕГО запуска
+
+
 def _write_marker(mk, card):
-    """Дописать красную карточку в файл-маркер headless-сигнала С ДЕДУПОМ: claude может ретраить
-    одно и то же красное действие несколько раз — гард срабатывал бы на каждый вызов и карточка
-    набегала бы ×N (было ×5). Если такая карточка уже в маркере — не дублируем."""
+    """Дописать красную карточку в файл-маркер headless-сигнала С ДЕДУПОМ и ШТАМПОМ ТОКЕНА.
+    Формат строки: '<run_token>\\x1f<строка карточки>'. Токен из env PRETOOL_MARKER_TOKEN —
+    задаёт демон на КАЖДЫЙ запуск; так демон отсеивает чужие/старые карточки (напр. фикстуры
+    из subprocess-тестов гарда, унаследовавших боевой маркер). Дедуп: одно красное действие
+    могло ретраиться → карточка набегала ×N (было ×5)."""
     c = (card or "").strip()
     if not c:
         return
+    token = os.environ.get(MARKER_TOKEN_ENV, "")
+    block = "\n".join(token + MARKER_SEP + ln for ln in c.splitlines())
     try:
         existing = ""
         if os.path.isfile(mk):
             with open(mk, "r", encoding="utf-8", errors="ignore") as f:
                 existing = f.read()
-        if c in existing:
+        if block in existing:
             return
         with open(mk, "a", encoding="utf-8") as f:
-            f.write(card + "\n")
+            f.write(block + "\n")
     except Exception:
         pass
 

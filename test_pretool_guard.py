@@ -8,6 +8,7 @@ end-to-end через stdin с PRETOOL_NOPUSH=1 (без реального Teleg
 import os
 import sys
 import json
+import tempfile
 import subprocess
 import unittest
 
@@ -160,11 +161,22 @@ class TestUnknownAsk(unittest.TestCase):
 class TestEndToEndStdin(unittest.TestCase):
     """Гоняем гард как процесс: stdin JSON → exit 0; green без вывода, red c permissionDecision ask.
     PRETOOL_NOPUSH=1 → без реального Telegram."""
-    def _run(self, data):
-        env = dict(os.environ, PRETOOL_NOPUSH="1", PYTHONIOENCODING="utf-8")
-        p = subprocess.run([sys.executable, os.path.join(PROJ, "pretool_guard.py")],
-                           input=json.dumps(data), capture_output=True, text=True,
-                           encoding="utf-8", env=env, timeout=30)
+    def _run(self, data, raw=None):
+        # ИЗОЛЯЦИЯ МАРКЕРА: свой tempfile в PRETOOL_ASK_MARKER, чтобы тест НИКОГДА не писал в
+        # боевой маркер демона (иначе фикстурные красные карточки → «призрак» ложного ask).
+        fd, mk = tempfile.mkstemp(suffix=".marker")
+        os.close(fd)
+        os.remove(mk)   # начинаем с чистого (несуществующего) пути
+        env = dict(os.environ, PRETOOL_NOPUSH="1", PYTHONIOENCODING="utf-8", PRETOOL_ASK_MARKER=mk)
+        try:
+            p = subprocess.run([sys.executable, os.path.join(PROJ, "pretool_guard.py")],
+                               input=(raw if raw is not None else json.dumps(data)),
+                               capture_output=True, text=True, encoding="utf-8", env=env, timeout=30)
+        finally:
+            try:
+                os.remove(mk)
+            except Exception:
+                pass
         return p
 
     def test_green_no_output(self):
@@ -184,10 +196,7 @@ class TestEndToEndStdin(unittest.TestCase):
         self.assertTrue(reason[1].lstrip().startswith("🔴"))
 
     def test_unparseable_stdin_defers(self):
-        env = dict(os.environ, PRETOOL_NOPUSH="1", PYTHONIOENCODING="utf-8")
-        p = subprocess.run([sys.executable, os.path.join(PROJ, "pretool_guard.py")],
-                           input="not json", capture_output=True, text=True,
-                           encoding="utf-8", env=env, timeout=30)
+        p = self._run(None, raw="not json")   # тот же изолированный маркер
         self.assertEqual(p.returncode, 0)
         self.assertEqual(p.stdout.strip(), "")
 
@@ -259,6 +268,34 @@ class TestMarkerDedup(unittest.TestCase):
                 content = f.read()
             self.assertEqual(content.count("карточка A"), 1)
             self.assertEqual(content.count("карточка B"), 1)   # разные карточки сохраняются
+        finally:
+            try:
+                os.remove(mk)
+            except Exception:
+                pass
+
+
+class TestMarkerIsolation(unittest.TestCase):
+    """Регресс «призрака PID 1»: полный прогон тестов под выставленным БОЕВЫМ PRETOOL_ASK_MARKER
+    не должен записать в него ни байта (иначе демон принял бы тест-фикстуру за реальный ask)."""
+
+    @unittest.skipIf(os.environ.get("PRETOOL_ISOLATION_CHILD") == "1", "дочерний прогон — избегаем рекурсии")
+    def test_live_marker_stays_empty_after_full_suite(self):
+        fd, mk = tempfile.mkstemp(suffix=".livemarker")
+        os.close(fd)
+        with open(mk, "w", encoding="utf-8") as f:
+            f.write("")                                   # боевой маркер стартует пустым
+        env = dict(os.environ, PRETOOL_ASK_MARKER=mk, PRETOOL_MARKER_TOKEN="daemon-run-probe",
+                   PRETOOL_NOPUSH="1", PRETOOL_ISOLATION_CHILD="1", PYTHONIOENCODING="utf-8")
+        try:
+            r = subprocess.run([sys.executable, "-m", "unittest",
+                                "test_pretool_guard", "test_pc_orchestrator"],
+                               cwd=PROJ, capture_output=True, text=True, env=env, timeout=300)
+            with open(mk, encoding="utf-8", errors="ignore") as f:
+                leaked = f.read()
+            self.assertEqual(r.returncode, 0, (r.stdout or "") + "\n" + (r.stderr or ""))
+            self.assertEqual(leaked, "",                  # ← файл ПУСТ = ни один тест не тронул боевой маркер
+                             "боевой PRETOOL_ASK_MARKER наполнился тестами (призрак):\n" + leaked[:800])
         finally:
             try:
                 os.remove(mk)

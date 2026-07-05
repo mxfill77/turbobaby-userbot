@@ -74,9 +74,10 @@ class Base(unittest.TestCase):
         def fake(prompt, timeout, cwd, env):
             if raise_timeout:
                 raise TimeoutError("timeout")
-            if write_marker:
+            if write_marker:                      # имитируем гард: штампуем карточку токеном запуска
+                tok = env.get(o.MARKER_TOKEN_ENV, "")
                 with open(env[o.ASK_MARKER_ENV], "a", encoding="utf-8") as f:
-                    f.write("🔴 Хочу удалить файл X — разрешить?\n")
+                    f.write(tok + o.MARKER_SEP + "🔴 Хочу удалить файл X — разрешить?\n")
             return (rc, out, err)
         o.run_claude = fake
 
@@ -121,14 +122,28 @@ class TestProcessNew(Base):
         line = "🔴 Хочу удалить файл X — разрешить?"
 
         def fake(prompt, timeout, cwd, env):
+            tok = env.get(o.MARKER_TOKEN_ENV, "")
             with open(env[o.ASK_MARKER_ENV], "a", encoding="utf-8") as f:
                 for _ in range(5):
-                    f.write(line + "\n")
+                    f.write(tok + o.MARKER_SEP + line + "\n")
             return (0, "сделал", "")
         o.run_claude = fake
         o.process_new()
         self.assertEqual(self.fb.tasks[tid]["status"], "needs_approval")
         self.assertEqual(self.fb.tasks[tid]["result"].count("Хочу удалить файл X"), 1)
+
+    def test_foreign_token_card_ignored(self):
+        # карточка с ЧУЖИМ токеном (напр. утечка из другого запуска) → демон её игнорирует.
+        tid = self.fb.add(status="new")
+
+        def fake(prompt, timeout, cwd, env):
+            with open(env[o.ASK_MARKER_ENV], "a", encoding="utf-8") as f:
+                f.write("ЧУЖОЙ-РАН-999" + o.MARKER_SEP + "🔴 чужая карточка — разрешить?\n")
+            return (0, "готово", "")
+        o.run_claude = fake
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")          # не наш токен → не наш ask
+        self.assertNotIn("чужая карточка", str(self.fb.tasks[tid]["result"]))
 
     def test_stale_marker_cleared_before_run(self):
         # маркер прошлого прогона не должен протечь в новый результат (чистим перед запуском).

@@ -69,6 +69,9 @@ HEARTBEAT_FILE = os.path.join(REPO, "pc_orchestrator.heartbeat")
 LOG_PATH = os.path.join(REPO, "pc_orchestrator.log")
 NA_MARKER = "NEEDS_APPROVAL:"
 ASK_MARKER_ENV = "PRETOOL_ASK_MARKER"   # env для pretool_guard: писать красную карточку в этот файл
+MARKER_TOKEN_ENV = "PRETOOL_MARKER_TOKEN"   # env: токен нашего запуска — гард штампует им карточки;
+MARKER_SEP = "\x1f"                          # демон принимает ТОЛЬКО карточки со своим токеном (fix ghost:
+#   subprocess-тесты гарда наследовали боевой маркер и писали фикстурные карточки — «призрак PID 1»).
 
 logging.basicConfig(filename=LOG_PATH, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -191,19 +194,30 @@ def _age_sec(updated_iso, now=None):
         return None
 
 
-def _detect_needs_approval(out, marker_content=""):
-    """Красная зона: файл-маркер гарда (headless-сигнал) ИЛИ маркер в stdout ИЛИ фолбэк-фразы."""
+def _detect_needs_approval(out, marker_content="", run_token=None):
+    """Красная зона: файл-маркер гарда (headless-сигнал) ИЛИ маркер в stdout ИЛИ фолбэк-фразы.
+    run_token задан → принимаем ТОЛЬКО карточки нашего запуска (строки '<token>\\x1f<текст>');
+    чужие/старые (иной или пустой токен) — логируем и игнорируем (страховка от «призрака»)."""
     # 1) файл-маркер гарда (надёжный сигнал: гард форснул ask в headless).
     #    Дедуп строк: одно красное действие могло ретраиться → карточка набегала ×N (была ×5).
     if marker_content:
-        seen, uniq = set(), []
+        seen, uniq, foreign = set(), [], 0
         for ln in marker_content.splitlines():
-            key = ln.strip()
+            if not ln.strip():
+                continue
+            tok, text = ln.split(MARKER_SEP, 1) if MARKER_SEP in ln else ("", ln)
+            if run_token is not None and tok != run_token:
+                foreign += 1            # чужая/старая карточка (не наш run_token) — не наш ask
+                continue
+            key = text.strip()
             if key and key not in seen:
                 seen.add(key)
-                uniq.append(ln)
-        deduped = "\n".join(uniq) or marker_content
-        return ("NEEDS_APPROVAL (гард): " + deduped)[:RESULT_MAX]
+                uniq.append(text)
+        if foreign:
+            log.warning("маркер: игнорирую %d чужих/старых карточек (не наш run_token=%s)", foreign, run_token)
+        if uniq:
+            return ("NEEDS_APPROVAL (гард): " + "\n".join(uniq))[:RESULT_MAX]
+        # только чужие карточки → это НЕ наш красный сигнал; идём к stdout-маркеру/фолбэку ниже
     t = out or ""
     for line in t.splitlines():
         i = line.find(NA_MARKER)
@@ -289,10 +303,12 @@ def run_task(tid, text, note=""):
                + ". Проверь установку/автообновление claude-code.")
         log.error("id=%s НЕ НАЙДЕН claude: %s", tid, msg)
         return "failed", msg
+    run_token = f"{os.getpid()}-{int(time.time() * 1000)}-{tid}"   # контекст запуска: pid+ts+tid
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)          # headless идёт по ~/.claude (подписка), не платный API
     env.pop("OPENAI_API_KEY", None)
     env[ASK_MARKER_ENV] = marker_path            # pretool_guard в headless пишет сюда красную карточку
+    env[MARKER_TOKEN_ENV] = run_token            # …штампуя её нашим токеном — чужие карточки отсеем
     prompt = (note + PREAMBLE) if note else PREAMBLE
     prompt += text
     log.info("RUN id=%s (timeout=%ss)", tid, TASK_TIMEOUT)
@@ -308,14 +324,15 @@ def run_task(tid, text, note=""):
     marker_content = ""
     try:
         if os.path.isfile(marker_path):
-            marker_content = open(marker_path, encoding="utf-8", errors="ignore").read().strip()
+            with open(marker_path, encoding="utf-8", errors="ignore") as mf:
+                marker_content = mf.read().strip()
     except Exception:
         pass
     try:
         os.remove(marker_path)
     except Exception:
         pass
-    card = _detect_needs_approval(out, marker_content)
+    card = _detect_needs_approval(out, marker_content, run_token)
     if card is not None:
         log.info("id=%s NEEDS_APPROVAL", tid)
         return "needs_approval", card
