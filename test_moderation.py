@@ -6,6 +6,8 @@ test_moderation.py — мок-тесты задачи-2 (бот-модерато
 Запуск: D:\\turbobaby-bot\\venv\\Scripts\\python.exe -m unittest test_moderation -v
 """
 
+import test_isolation  # noqa: F401 — ПЕРВОЙ строкой: TESTING=1, боевой IPC/токен недоступны
+
 import os
 import json
 import asyncio

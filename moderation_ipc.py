@@ -28,7 +28,31 @@ import datetime
 from contextlib import contextmanager
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.getenv("MODERBOT_DB", os.path.join(BASE_DIR, "moderation_ipc.db"))
+_PROD_DB = os.path.join(BASE_DIR, "moderation_ipc.db")  # БОЕВАЯ очередь (её читает живой бот)
+
+
+def _env_flag(name, default=False):
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on", "да")
+
+
+# ИЗОЛЯЦИЯ ТЕСТОВ: TESTING=1 → боевой IPC недоступен ПО ПОСТРОЕНИЮ. Дефолт DB_PATH уводим в
+# одноразовый temp (игнорируя MODERBOT_DB, который в среде демона указывает на боевую БД), а
+# _conn() дополнительно ловит любую попытку открыть боевой moderation_ipc.db и БЛОКИРУЕТ её.
+# Инцидент 16:39: тесты в среде демона (bot_mode_active=True) enqueue'или фикстурные черновики
+# «@client1» в боевую очередь → живой модербот запостил их в реальную группу. Больше нельзя.
+TESTING = _env_flag("TESTING")
+if TESTING:
+    import tempfile
+    DB_PATH = os.path.join(tempfile.gettempdir(), "turbobaby_TESTING_ipc.db")
+else:
+    DB_PATH = os.getenv("MODERBOT_DB", _PROD_DB)
+
+# Мок-счётчик наружу: сколько раз под TESTING пытались открыть БОЕВОЙ IPC. Норма прогона = 0.
+prod_ipc_open_attempts = 0
+
 HEARTBEAT_STALE_SEC = int(os.getenv("MODERBOT_HEARTBEAT_STALE", "15") or "15")
 
 
@@ -40,7 +64,17 @@ def _now_iso():
 def _conn(path=None):
     """Соединение с sqlite: коммитит при успехе и ВСЕГДА закрывает (иначе файл БД
     остаётся занят — на Windows это блокирует удаление/тесты)."""
-    c = sqlite3.connect(path or DB_PATH, timeout=5.0)
+    real = path or DB_PATH
+    # ТРИПВАЙР ИЗОЛЯЦИИ: под TESTING любое обращение к боевому moderation_ipc.db — ошибка
+    # (тест обязан работать на своём tmp). Считаем попытку и валимся громко, а не молча в бой.
+    if TESTING and os.path.abspath(real) == os.path.abspath(_PROD_DB):
+        global prod_ipc_open_attempts
+        prod_ipc_open_attempts += 1
+        raise RuntimeError(
+            "TESTING: попытка открыть БОЕВОЙ moderation_ipc.db заблокирована (изоляция тестов). "
+            "Тест должен переопределить moderation_ipc.DB_PATH на временный файл."
+        )
+    c = sqlite3.connect(real, timeout=5.0)
     c.row_factory = sqlite3.Row
     try:
         c.execute("PRAGMA journal_mode=WAL")

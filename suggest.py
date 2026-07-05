@@ -53,6 +53,11 @@ def _int(name: str, default: int) -> int:
 SUGGEST_MODE = _flag("SUGGEST_MODE", False)          # главный рубильник, по умолч. OFF
 SUGGEST_TEST_MODE = _flag("SUGGEST_TEST_MODE", False)  # обкатка: черновики есть, отправки клиенту НЕТ
 
+# ИЗОЛЯЦИЯ ТЕСТОВ: TESTING=1 (ставит test_isolation) → боевой IPC/токен недоступны по построению.
+# moderation_ipc под TESTING уводит БД в temp и блокирует боевую очередь; здесь bot_mode_active
+# читает уже изолированный (пустой) IPC → нет heartbeat → reply-режим → ничего не уходит наружу.
+TESTING = _flag("TESTING", False)
+
 _mg = os.getenv("MOD_GROUP_ID", "").strip()
 MOD_GROUP_ID = int(_mg) if _mg.lstrip("-").isdigit() else None  # нет ID → резолв по имени/лог
 MOD_GROUP_NAME = os.getenv("MOD_GROUP_NAME", "").strip()        # резолв группы по title, если ID пуст

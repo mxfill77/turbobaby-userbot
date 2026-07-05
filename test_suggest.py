@@ -6,6 +6,8 @@ Anthropic: оба замоканы. Реальной отправки клиен
 Запуск: D:\\turbobaby-bot\\venv\\Scripts\\python.exe -m unittest test_suggest -v
 """
 
+import test_isolation  # noqa: F401 — ПЕРВОЙ строкой: TESTING=1, боевой IPC/токен недоступны
+
 import os
 import asyncio
 import datetime
