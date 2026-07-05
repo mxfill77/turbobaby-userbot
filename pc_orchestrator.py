@@ -91,8 +91,17 @@ PREAMBLE = (
     "выход за пределы проекта, сеть кроме git/Bridge/Telegram) — НЕ выполняй и НЕ ищи обход: "
     "выведи РОВНО одну строку «NEEDS_APPROVAL: <карточка: что · зачем · последствия>» и заверши "
     "работу (исполнит человек после «да»). userbot и moderation_bot НЕ трогай. Первая строка "
-    "ответа — краткая сводка (≤400 символов). ЗАДАЧА:\n"
+    "ответа — краткая сводка (≤400 символов). ПОСЛЕДНЯЯ строка вывода — ОБЯЗАТЕЛЬНО "
+    "«RESULT: <краткий итог сделанного>»; без этой строки задача считается НЕ выполненной. ЗАДАЧА:\n"
 )
+
+_RE_RESULT = re.compile(r"(?m)^\s*RESULT:\s*\S")   # признак результата в stdout headless
+
+
+def _tail(s, n=500):
+    """Хвост строки для диагноза (последние ~n символов, без пустышек)."""
+    s = (s or "").strip()
+    return s[-n:] if s else ""
 
 
 # ------------------------------- Bridge (очередь) ----------------------------
@@ -289,13 +298,11 @@ def run_claude(prompt, timeout, cwd, env):
 
 
 def run_task(tid, text, note=""):
-    """Исполнить задачу через headless claude -p. → (status, result). status ∈ done|failed|needs_approval."""
+    """Исполнить задачу через headless claude -p. → (status, result). status ∈ done|failed|needs_approval.
+    Контракт результата (фикс ложного done задачи #24): done ТОЛЬКО при непустом stdout со строкой
+    «RESULT: <итог>»; пустой stdout → один авто-повтор (транзиент), снова пустой → failed с хвостом
+    stderr; непустой без RESULT → failed insufficient_output. Диагноз (stderr) всегда в карточке+логе."""
     marker_path = os.path.join(REPO, f"pc_ask_{tid}.marker")
-    try:  # ЧИСТИМ маркер ПЕРЕД каждым запуском headless (в т.ч. перед повтором approved-шага):
-        if os.path.exists(marker_path):   # иначе красная карточка прошлого прогона протекла бы
-            os.remove(marker_path)        # в результат нового (ложное needs_approval).
-    except Exception:
-        pass
     cbin = resolve_claude()                       # версионно-независимый резолв (класс-фикс WinError 2)
     if not cbin:
         msg = ("claude CLI не найден: нет ни в PATH, ни в CLAUDE_BIN (.env), ни в "
@@ -311,35 +318,55 @@ def run_task(tid, text, note=""):
     env[MARKER_TOKEN_ENV] = run_token            # …штампуя её нашим токеном — чужие карточки отсеем
     prompt = (note + PREAMBLE) if note else PREAMBLE
     prompt += text
-    log.info("RUN id=%s (timeout=%ss)", tid, TASK_TIMEOUT)
-    try:
-        rc, out, err = run_claude(prompt, TASK_TIMEOUT, REPO, env)
-    except TimeoutError:
-        log.warning("id=%s ТАЙМАУТ %ss → failed", tid, TASK_TIMEOUT)
-        return "failed", f"таймаут {TASK_TIMEOUT}s — headless прерван, задача не завершилась"
-    except Exception as e:
-        log.error("id=%s ошибка запуска: %s", tid, e)
-        return "failed", f"ошибка запуска claude: {e}"
-    # прочитать маркер ДО удаления (гард пишет туда красную карточку в headless)
-    marker_content = ""
-    try:
-        if os.path.isfile(marker_path):
-            with open(marker_path, encoding="utf-8", errors="ignore") as mf:
-                marker_content = mf.read().strip()
-    except Exception:
-        pass
-    try:
-        os.remove(marker_path)
-    except Exception:
-        pass
-    card = _detect_needs_approval(out, marker_content, run_token)
-    if card is not None:
-        log.info("id=%s NEEDS_APPROVAL", tid)
-        return "needs_approval", card
-    out = (out or "").strip()
-    if rc != 0:
-        return "failed", (f"claude exit={rc}: " + (out or err or "нет вывода"))[:RESULT_MAX]
-    return "done", (out or "(claude вернул пустой вывод)")[:RESULT_MAX]
+    for attempt in (1, 2):
+        try:  # ЧИСТИМ маркер ПЕРЕД КАЖДОЙ попыткой headless (в т.ч. перед авто-повтором):
+            if os.path.exists(marker_path):   # иначе красная карточка прошлого прогона протекла бы
+                os.remove(marker_path)        # в результат нового (ложное needs_approval).
+        except Exception:
+            pass
+        log.info("RUN id=%s (timeout=%ss, попытка %s/2)", tid, TASK_TIMEOUT, attempt)
+        try:
+            rc, out, err = run_claude(prompt, TASK_TIMEOUT, REPO, env)
+        except TimeoutError:
+            log.warning("id=%s ТАЙМАУТ %ss → failed", tid, TASK_TIMEOUT)
+            return "failed", f"таймаут {TASK_TIMEOUT}s — headless прерван, задача не завершилась"
+        except Exception as e:
+            log.error("id=%s ошибка запуска: %s", tid, e)
+            return "failed", f"ошибка запуска claude: {e}"
+        # прочитать маркер ДО удаления (гард пишет туда красную карточку в headless)
+        marker_content = ""
+        try:
+            if os.path.isfile(marker_path):
+                with open(marker_path, encoding="utf-8", errors="ignore") as mf:
+                    marker_content = mf.read().strip()
+        except Exception:
+            pass
+        try:
+            os.remove(marker_path)
+        except Exception:
+            pass
+        card = _detect_needs_approval(out, marker_content, run_token)
+        if card is not None:
+            log.info("id=%s NEEDS_APPROVAL", tid)
+            return "needs_approval", card
+        out_s = (out or "").strip()
+        err_tail = _tail(err)
+        if rc != 0:
+            return "failed", (f"claude exit={rc}: " + (out_s or err_tail or "нет вывода"))[:RESULT_MAX]
+        if not out_s:
+            if attempt == 1:   # один авто-повтор: пустой stdout бывает транзиентом
+                log.warning("id=%s пустой stdout (rc=0) — авто-повтор; stderr: %s",
+                            tid, err_tail or "(пуст)")
+                continue
+            log.error("id=%s ПУСТОЙ ВЫВОД ×2 → failed; stderr: %s", tid, err_tail or "(пуст)")
+            return "failed", ("пустой вывод claude (2 попытки — работа не выполнялась) | stderr: "
+                              + (err_tail or "(пуст)"))[:RESULT_MAX]
+        if not _RE_RESULT.search(out_s):   # вывод есть, но итог не подтверждён строкой RESULT:
+            log.warning("id=%s insufficient_output (нет «RESULT:») → failed", tid)
+            return "failed", ("insufficient_output: нет строки «RESULT: <итог>» — выполнение не "
+                              "подтверждено. stdout(хвост): " + _tail(out_s)
+                              + (" | stderr(хвост): " + err_tail if err_tail else ""))[:RESULT_MAX]
+        return "done", out_s[:RESULT_MAX]
 
 
 # ------------------------------- обработчики цикла ---------------------------
@@ -384,7 +411,8 @@ def process_new():
     else:
         bc.complete_task(tid, status, result)
         log.info("COMPLETE id=%s status=%s", tid, status)
-        _cowork(f"задача #{tid} → {status}")
+        brief = (" — " + " ".join(str(result or "").split())[:220]) if status == "failed" else ""
+        _cowork(f"задача #{tid} → {status}{brief}")   # на failed диагноз (stderr-хвост) виден в cowork_log
         _notify(_human(status, tid, result))
 
 

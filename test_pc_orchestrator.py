@@ -70,7 +70,7 @@ class Base(unittest.TestCase):
     def tearDown(self):
         (o.bc, o.run_claude, o._notify, o._cowork, o._stopped) = self._save
 
-    def _claude(self, rc=0, out="готово", err="", raise_timeout=False, write_marker=False):
+    def _claude(self, rc=0, out="готово\nRESULT: готово", err="", raise_timeout=False, write_marker=False):
         def fake(prompt, timeout, cwd, env):
             if raise_timeout:
                 raise TimeoutError("timeout")
@@ -85,7 +85,7 @@ class Base(unittest.TestCase):
 class TestProcessNew(Base):
     def test_new_done(self):
         tid = self.fb.add(status="new")
-        self._claude(0, "выполнено")
+        self._claude(0, "выполнено\nRESULT: выполнено")
         o.process_new()
         self.assertEqual(self.fb.tasks[tid]["status"], "done")
         self.assertIn("выполнено", self.fb.tasks[tid]["result"])
@@ -139,7 +139,7 @@ class TestProcessNew(Base):
         def fake(prompt, timeout, cwd, env):
             with open(env[o.ASK_MARKER_ENV], "a", encoding="utf-8") as f:
                 f.write("ЧУЖОЙ-РАН-999" + o.MARKER_SEP + "🔴 чужая карточка — разрешить?\n")
-            return (0, "готово", "")
+            return (0, "готово\nRESULT: готово", "")
         o.run_claude = fake
         o.process_new()
         self.assertEqual(self.fb.tasks[tid]["status"], "done")          # не наш токен → не наш ask
@@ -152,7 +152,7 @@ class TestProcessNew(Base):
         with open(stale, "w", encoding="utf-8") as f:
             f.write("🔴 старая красная карточка — разрешить?\n")
         try:
-            self._claude(0, "всё зелёное, готово")   # новый прогон без красного
+            self._claude(0, "всё зелёное, готово\nRESULT: готово")   # новый прогон без красного
             o.process_new()
             self.assertEqual(self.fb.tasks[tid]["status"], "done")   # не needs_approval
             self.assertNotIn("старая красная", self.fb.tasks[tid]["result"])
@@ -165,7 +165,7 @@ class TestProcessNew(Base):
     def test_lane_isolation_other_lane_untouched(self):
         vps = self.fb.add(status="new", lane="vps", task_text="чужая VPS-задача")
         pc = self.fb.add(status="new", lane="pc")
-        self._claude(0, "ок")
+        self._claude(0, "ок\nRESULT: ок")
         o.process_new()
         self.assertEqual(self.fb.tasks[vps]["status"], "new")   # чужая полоса не тронута
         self.assertEqual(self.fb.tasks[pc]["status"], "done")
@@ -185,10 +185,73 @@ class TestProcessNew(Base):
         self.assertEqual(self.fb.tasks[tid]["status"], "new")   # рубильник → не берём
 
 
+class TestOutputContract(Base):
+    """Контракт результата (фикс ложного done #24): done только с «RESULT:»; пустой stdout →
+    авто-повтор, снова пустой → failed с хвостом stderr; без RESULT → failed insufficient_output."""
+
+    def test_empty_stdout_retried_then_failed_with_stderr(self):
+        tid = self.fb.add(status="new")
+        calls = {"n": 0}
+
+        def fake(prompt, timeout, cwd, env):
+            calls["n"] += 1
+            return (0, "   ", "rate limit reached — upgrade plan")
+        o.run_claude = fake
+        o.process_new()
+        self.assertEqual(calls["n"], 2)                       # ровно один авто-повтор
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        r = self.fb.tasks[tid]["result"]
+        self.assertIn("пустой вывод", r.lower())
+        self.assertIn("rate limit", r)                        # хвост stderr виден в карточке
+
+    def test_empty_then_ok_transient_done(self):
+        tid = self.fb.add(status="new")
+        seq = iter([(0, "", ""), (0, "сделал\nRESULT: сделал X", "")])
+        calls = {"n": 0}
+
+        def fake(prompt, timeout, cwd, env):
+            calls["n"] += 1
+            return next(seq)
+        o.run_claude = fake
+        o.process_new()
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")   # транзиент пережит повтором
+
+    def test_no_result_line_insufficient_output(self):
+        tid = self.fb.add(status="new")
+        self._claude(0, "долго болтал, но итог не подтвердил")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        r = self.fb.tasks[tid]["result"]
+        self.assertIn("insufficient_output", r)
+        self.assertIn("болтал", r)                            # хвост stdout виден в карточке
+
+    def test_with_result_line_done(self):
+        tid = self.fb.add(status="new")
+        self._claude(0, "сводка работ\nRESULT: закоммитил фикс abc123")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+
+    def test_nonzero_exit_not_retried(self):
+        tid = self.fb.add(status="new")
+        calls = {"n": 0}
+
+        def fake(prompt, timeout, cwd, env):
+            calls["n"] += 1
+            return (1, "", "boom")
+        o.run_claude = fake
+        o.process_new()
+        self.assertEqual(calls["n"], 1)                       # повтор только для пустого rc=0
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+
+    def test_preamble_requires_result_line(self):
+        self.assertIn("RESULT:", o.PREAMBLE)                  # преамбула обязывает контракт
+
+
 class TestApproved(Base):
     def test_approved_rerun_done(self):
         tid = self.fb.add(status="approved", updated=iso_ago(10))
-        self._claude(0, "доделал после одобрения")
+        self._claude(0, "доделал после одобрения\nRESULT: доделал")
         o.process_approved()
         self.assertEqual(self.fb.tasks[tid]["status"], "done")
 
