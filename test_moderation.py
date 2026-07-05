@@ -98,29 +98,46 @@ class TestInterpret(unittest.TestCase):
         self.assertEqual(moderation_core.interpret("D", "+", "FAQ")["intent"], "approve")
         self.assertEqual(moderation_core.interpret("D", "нет", "FAQ")["intent"], "reject")
 
-    def test_replacement_no_confirm(self):
-        r = moderation_core.interpret("D", "любой текст", "FAQ", call_llm=_llm("replacement", final="ГОТОВО"))
-        self.assertEqual(r["intent"], "replacement")
-        self.assertFalse(r["need_confirm"])
-        self.assertEqual(r["final_text"], "ГОТОВО")
-
-    def test_instruction_needs_confirm(self):
-        r = moderation_core.interpret("D", "сделай короче", "FAQ", call_llm=_llm("instruction", final="Кратко"))
-        self.assertEqual(r["intent"], "instruction")
+    def test_cosmetic_edits_and_confirms(self):
+        # КОСМЕТИКА: правит форму существующего черновика → need_confirm
+        r = moderation_core.interpret("D", "сделай короче", "FAQ", call_llm=_llm("cosmetic", final="Кратко"))
+        self.assertEqual(r["intent"], "cosmetic")
         self.assertTrue(r["need_confirm"])
+        self.assertEqual(r["final_text"], "Кратко")
 
-    def test_command_needs_confirm(self):
-        r = moderation_core.interpret("D", "напиши что есть скидка", "FAQ", call_llm=_llm("command", final="Есть скидка"))
+    def test_strategy_marks_regenerate(self):
+        # СТРАТЕГИЯ: final_text пуст (перегенерация с нуля отдельно), need_confirm
+        r = moderation_core.interpret("D", "дожимай на ADV", "FAQ", call_llm=_llm("strategy", final="неважно"))
+        self.assertEqual(r["intent"], "strategy")
         self.assertTrue(r["need_confirm"])
+        self.assertEqual(r["final_text"], "")     # НЕ патч старого текста
+
+    def test_dictation_confirms(self):
+        # ДИКТОВКА: текст менеджера почти как есть, НО повторное подтверждение обязательно
+        r = moderation_core.interpret("D", "ответь дословно: приедем в 5", "FAQ",
+                                      call_llm=_llm("dictation", final="Приедем в 5"))
+        self.assertEqual(r["intent"], "dictation")
+        self.assertTrue(r["need_confirm"])
+        self.assertEqual(r["final_text"], "Приедем в 5")
 
     def test_question_answers(self):
         r = moderation_core.interpret("D", "что по ценам XMAX?", "FAQ", call_llm=_llm("question", answer="939฿/день"))
         self.assertEqual(r["intent"], "question")
         self.assertEqual(r["answer"], "939฿/день")
 
-    def test_unknown_is_safe_confirm(self):
+    def test_ambiguous_is_strategy(self):
+        # двусмысленно/битый JSON → СТРАТЕГИЯ (глубже безопаснее), с подтверждением
         r = moderation_core.interpret("D", "мутный текст", "FAQ", call_llm=lambda s, u: "не json")
-        self.assertTrue(r["need_confirm"])       # неизвестное → безопасно, с подтверждением
+        self.assertEqual(r["intent"], "strategy")
+        self.assertTrue(r["need_confirm"])
+
+    def test_classifier_intent_not_length(self):
+        # длинная косметика остаётся косметикой; короткая стратегия — стратегией (решает интент, не длина)
+        long_cos = moderation_core.interpret("D", "пожалуйста " * 20 + "убери восклицательные знаки",
+                                             "FAQ", call_llm=_llm("cosmetic", final="без !"))
+        self.assertEqual(long_cos["intent"], "cosmetic")
+        short_str = moderation_core.interpret("D", "жёстче", "FAQ", call_llm=_llm("strategy"))
+        self.assertEqual(short_str["intent"], "strategy")
 
 
 class TestDecisions(unittest.TestCase):
@@ -160,28 +177,65 @@ class TestDecisions(unittest.TestCase):
         self.assertEqual(d["decision"], "denied")
         self.assertIn("⛔", d["card"])
 
-    def test_reply_replacement_ready(self):
-        d = moderation_core.process_reply(self.DRAFT, "текст", "d", "FAQ", test_mode=False,
-                                          call_llm=_llm("replacement", final="ГОТОВО"))
-        self.assertEqual(d["decision"], "ready")
-        self.assertEqual(d["final_text"], "ГОТОВО")
+    STRAT_DRAFT = {"id": 1, "draft": "черновик", "final_text": "кандидат",
+                   "transcript": "[клиент]: NMAX?", "lang": "ru",
+                   "first_contact": False, "pricing_note": "ЦЕНА из Календаря: 500฿/день"}
 
-    def test_reply_instruction_confirm(self):
+    def test_reply_cosmetic_confirm(self):
         d = moderation_core.process_reply(self.DRAFT, "короче", "d", "FAQ", test_mode=False,
-                                          call_llm=_llm("instruction", final="Кратко"))
+                                          call_llm=_llm("cosmetic", final="Кратко"))
         self.assertEqual(d["decision"], "confirm")       # обязательное подтверждение
         self.assertEqual(d["final_text"], "Кратко")
+        self.assertEqual(d["level"], "cosmetic")
+
+    def test_reply_dictation_confirm(self):
+        # ДИКТОВКА больше НЕ авто-шлёт (раньше replacement уходил без подтверждения) → confirm
+        d = moderation_core.process_reply(self.DRAFT, "ответь дословно: ок", "d", "FAQ", test_mode=False,
+                                          call_llm=_llm("dictation", final="Ок"))
+        self.assertEqual(d["decision"], "confirm")
+        self.assertEqual(d["final_text"], "Ок")
+
+    def test_reply_strategy_regenerates_with_directive(self):
+        # СТРАТЕГИЯ: перегенерация С НУЛЯ — regen получает ДИРЕКТИВУ и исходный контекст, НЕ патчит старое
+        seen = {}
+        def fake_regen(draft, faq, directive):
+            seen["directive"] = directive
+            seen["transcript"] = draft.get("transcript")
+            return "НОВЫЙ ЧЕРНОВИК по стратегии"
+        d = moderation_core.process_reply(self.STRAT_DRAFT, "дожимай на ADV", "d", "FAQ", test_mode=False,
+                                          call_llm=_llm("strategy"), regen=fake_regen)
+        self.assertEqual(d["decision"], "confirm")
+        self.assertEqual(d["final_text"], "НОВЫЙ ЧЕРНОВИК по стратегии")   # не старый черновик
+        self.assertEqual(seen["directive"], "дожимай на ADV")             # реплика = директива
+        self.assertEqual(seen["transcript"], "[клиент]: NMAX?")           # исходный контекст
+
+    def test_reconfirm_mandatory_all_levels(self):
+        for intent in ("cosmetic", "dictation"):
+            d = moderation_core.process_reply(self.DRAFT, "x", "d", "FAQ", test_mode=False,
+                                              call_llm=_llm(intent, final="T"))
+            self.assertEqual(d["decision"], "confirm", intent)   # ни один уровень не авто-шлёт
+        d = moderation_core.process_reply(self.STRAT_DRAFT, "жёстче", "d", "FAQ", test_mode=False,
+                                          call_llm=_llm("strategy"), regen=lambda *a: "R")
+        self.assertEqual(d["decision"], "confirm")
+
+    def test_reply_edit_never_autosends_in_testmode(self):
+        # даже в TEST_MODE правка не «test_held» на этапе reply — сперва повторное подтверждение
+        d = moderation_core.process_reply(self.DRAFT, "ответь дословно: ок", "d", "FAQ", test_mode=True,
+                                          call_llm=_llm("dictation", final="Ок"))
+        self.assertEqual(d["decision"], "confirm")
+        self.assertNotIn(d["decision"], ("ready", "test_held", "sent"))
+
+    def test_reply_approve_still_sends(self):
+        # быстрый путь «+» реплики → отправка как есть (без доп-подтверждения)
+        d = moderation_core.process_reply(self.DRAFT, "+", "d", "FAQ", test_mode=False)
+        self.assertEqual(d["decision"], "ready")
+        self.assertEqual(d["final_text"], "черновик")
 
     def test_reply_question_answer(self):
         d = moderation_core.process_reply(self.DRAFT, "что по ценам?", "d", "FAQ", test_mode=False,
                                           call_llm=_llm("question", answer="A"))
         self.assertEqual(d["decision"], "answer")
         self.assertEqual(d["answer"], "A")
-
-    def test_reply_testmode_replacement_held(self):
-        d = moderation_core.process_reply(self.DRAFT, "текст", "d", "FAQ", test_mode=True,
-                                          call_llm=_llm("replacement", final="ГОТОВО"))
-        self.assertEqual(d["decision"], "test_held")     # DOUBLE-LOCK слой 1
 
     def test_reply_whitelist_denies(self):
         suggest.APPROVER_USERNAMES = {"danya"}

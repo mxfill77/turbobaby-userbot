@@ -136,6 +136,32 @@ class TestPureLogic(unittest.TestCase):
         d = suggest.generate_draft("[клиент]: привет", "ru", "FAQ", call_llm=_fake_llm)
         self.assertEqual(d, "DRAFT ответа клиенту")
 
+    def test_directive_in_prompt_preserves_invariants(self):
+        # СТРАТЕГИЯ-директива входит в системный промпт ВЕРХНИМ приоритетом, но кап-цена и
+        # критфакты (ценовая политика + CRITICAL_FACTS) НЕ ослабляются.
+        sysp = suggest.make_system_prompt("FAQ", "ru", pricing_note="ЦЕНА из Календаря: 500฿/день",
+                                          directive="дожимай на ADV, скажи что NMAX разберут")
+        self.assertIn("ДИРЕКТИВА МЕНЕДЖЕРА", sysp)
+        self.assertIn("дожимай на ADV", sysp)                    # директива на месте
+        self.assertIn("ЦЕНА из Календаря: 500฿/день", sysp)      # кап-цена сохранена
+        self.assertIn("CLICK 125", sysp)                         # критфакт дословно
+        self.assertIn("ЦЕНОВАЯ ПОЛИТИКА", sysp)                  # ценовая политика (кап) на месте
+        self.assertNotIn("ДИРЕКТИВА МЕНЕДЖЕРА",                  # без директивы блока нет
+                         suggest.make_system_prompt("FAQ", "ru"))
+
+    def test_regenerate_draft_injects_directive(self):
+        seen = {}
+        def fake(system, user):
+            seen["system"] = system; seen["user"] = user
+            return "перегенерённый ответ"
+        out = suggest.regenerate_draft("[клиент]: NMAX на месяц?", "ru", "FAQ", False,
+                                       "ЦЕНА из Календаря: 500฿/день", "жёстче про депозит", call_llm=fake)
+        self.assertEqual(out, "перегенерённый ответ")
+        self.assertIn("жёстче про депозит", seen["system"])      # директива в system
+        self.assertIn("ЦЕНА из Календаря", seen["system"])       # кап сохранён
+        self.assertIn("CLICK 125", seen["system"])               # критфакты сохранены
+        self.assertEqual(seen["user"], "[клиент]: NMAX на месяц?")  # исходный транскрипт = user
+
     def test_rate_limiter_hour_and_day(self):
         t = [1000.0]
         rl = suggest.RateLimiter(per_hour=2, per_day=3, now=lambda: t[0])

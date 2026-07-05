@@ -93,9 +93,16 @@ def init_db(path=None):
                 client_id INTEGER, client_ref TEXT, lang TEXT, incoming TEXT,
                 draft TEXT, first_contact INTEGER,
                 status TEXT, card_msg_id INTEGER, final_text TEXT,
-                decided_by TEXT, reason TEXT, created_ts TEXT, updated_ts TEXT
+                decided_by TEXT, reason TEXT, created_ts TEXT, updated_ts TEXT,
+                transcript TEXT, pricing_note TEXT
             )"""
         )
+        # МИГРАЦИЯ для старых БД: transcript/pricing_note нужны для СТРАТЕГИЯ-перегенерации.
+        for col in ("transcript TEXT", "pricing_note TEXT"):
+            try:
+                c.execute("ALTER TABLE drafts ADD COLUMN " + col)
+            except Exception:
+                pass  # колонка уже есть
         c.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_status ON drafts(status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_card ON drafts(card_msg_id)")
@@ -107,17 +114,18 @@ def _row(r):
 
 def enqueue_draft(rec, path=None):
     """userbot кладёт черновик (status=new). rec: client_id, client_ref, lang, incoming,
-    draft, first_contact. Возвращает id."""
+    draft, first_contact, transcript, pricing_note. Возвращает id.
+    transcript+pricing_note хранятся для СТРАТЕГИЯ-перегенерации черновика с нуля."""
     ts = _now_iso()
     with _conn(path) as c:
         cur = c.execute(
             """INSERT INTO drafts
                (client_id, client_ref, lang, incoming, draft, first_contact,
-                status, created_ts, updated_ts)
-               VALUES (?,?,?,?,?,?, 'new', ?, ?)""",
+                status, created_ts, updated_ts, transcript, pricing_note)
+               VALUES (?,?,?,?,?,?, 'new', ?, ?, ?, ?)""",
             (rec.get("client_id"), rec.get("client_ref"), rec.get("lang"),
              rec.get("incoming"), rec.get("draft"), int(bool(rec.get("first_contact"))),
-             ts, ts),
+             ts, ts, rec.get("transcript"), rec.get("pricing_note")),
         )
         return cur.lastrowid
 

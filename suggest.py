@@ -711,7 +711,8 @@ def build_pricing_note(hints: dict) -> str:
     return header + "\n".join(bullets) + dep
 
 
-def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pricing_note: str = "") -> str:
+def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pricing_note: str = "",
+                       directive: str = "") -> str:
     lang_name = "русском" if lang == "ru" else "английском"
     if is_first_contact:
         greet = (
@@ -742,13 +743,23 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         "номер(а) телефона. Раньше этапа 3 документы/апартаменты/шлемы не запрашивай."
     )
     price_block = ("\n\n" + pricing_note) if pricing_note else ""
+    # СТРАТЕГИЯ-директива менеджера: высший приоритет по СОДЕРЖАНИЮ/логике/тону ответа, НО
+    # ценовую политику и критичные факты НЕ отменяет (они ниже — незыблемы).
+    directive_block = ""
+    if (directive or "").strip():
+        directive_block = (
+            "\n\n★ ДИРЕКТИВА МЕНЕДЖЕРА (ВЫСШИЙ приоритет по стратегии/логике/тону — строй ответ "
+            "именно так): " + directive.strip()
+            + "\nВАЖНО: эта директива задаёт ЧТО и КАК предлагать, но НЕ отменяет ценовую политику "
+            "и критичные факты ниже — цену клиенту только из блока ЦЕНА, критфакты дословно."
+        )
     return (
         "Ты — менеджер проката мотобайков TurboBaby (Пхукет). По переписке с клиентом "
         f"составь ОДИН короткий, вежливый ответ на {lang_name} языке (язык клиента). "
         "Отвечай только на то, что ещё НЕ отвечено менеджером в диалоге; не повторяй уже "
         "сказанное; держи контекст сделки. Не выдумывай данные и наличие. Верни ТОЛЬКО "
         "текст ответа клиенту — без пояснений, без кавычек, без префиксов."
-        + greet + policy + scenario + price_block + "\n\n"
+        + directive_block + greet + policy + scenario + price_block + "\n\n"
         + CRITICAL_FACTS
         + "\n\nFAQ и эталонные формулировки:\n" + (faq or "(FAQ недоступен — опирайся на критичные факты выше)")
     )
@@ -909,6 +920,16 @@ def generate_draft(transcript: str, lang: str, faq: str,
     SUGGEST_LLM_VIA_CLI — claude CLI (подписка Max) либо _default_llm (платный API-ключ)."""
     call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note)
+    return call_llm(system, transcript).strip()
+
+
+def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: bool,
+                     pricing_note: str, directive: str, call_llm=None) -> str:
+    """СТРАТЕГИЯ-перегенерация черновика С НУЛЯ: реплика модератора идёт как ДИРЕКТИВА ВЕРХНЕГО
+    УРОВНЯ поверх ИСХОДНОГО клиентского контекста (транскрипт+FAQ+кап-цена), а НЕ как патч к старому
+    тексту. Инварианты (ценовая политика/критфакты) сохраняются — они в make_system_prompt."""
+    call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
+    system = make_system_prompt(faq, lang, is_first_contact, pricing_note, directive=directive)
     return call_llm(system, transcript).strip()
 
 
@@ -1173,6 +1194,8 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
     rec = {
         "client_id": client_id, "client_ref": client_ref, "lang": lang,
         "incoming": last_client_line, "draft": draft, "first_contact": first,
+        # контекст для СТРАТЕГИЯ-перегенерации (реплика модератора → директива поверх этого):
+        "transcript": transcript, "pricing_note": price_note,
     }
     # bot-режим: кладём в IPC, карточку с кнопками запостит moderation_bot.
     if bot_mode_active():
