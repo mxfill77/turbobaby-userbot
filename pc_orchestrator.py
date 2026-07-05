@@ -485,15 +485,116 @@ def poll_once():
     _write_heartbeat()
 
 
+# ------------------------------- self-update ---------------------------------
+# Порт VPS-паттерна: задача изменила pc_orchestrator.py (блоб HEAD != запущенной версии) →
+# гейт (code_gate + unittest своих тестов) → управляемый рестарт: spawn нового процесса →
+# лог/cowork «self-update: <старый коммит>→<новый>» → старый выходит. Watchdog — страховка:
+# если новый упадёт на ходу, heartbeat протухнет и schtasks /Run поднимет демон.
+
+RUNNING_BLOB = None       # git-блоб pc_orchestrator.py на момент старта («запущенная версия»)
+RUNNING_COMMIT = "?"      # короткий коммит на момент старта (для строки self-update в логе)
+_SU_REJECTED_BLOB = None  # блоб, уже проваливший гейт — не гоняем гейт каждый цикл, ждём нового коммита
+
+
+def _git_out(args):
+    """git в REPO → stdout.strip() | None (тихо: git недоступен/ошибка — self-update просто молчит)."""
+    try:
+        p = subprocess.run(["git"] + args, cwd=REPO, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=15)
+        return p.stdout.strip() if p.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _blob_hash():
+    """Хеш содержимого pc_orchestrator.py в HEAD — «версия» кода демона (дифф против запущенной)."""
+    return _git_out(["rev-parse", "HEAD:pc_orchestrator.py"])
+
+
+def _head_commit():
+    return _git_out(["rev-parse", "--short", "HEAD"]) or "?"
+
+
+def _init_running_version():
+    global RUNNING_BLOB, RUNNING_COMMIT
+    RUNNING_BLOB = _blob_hash()
+    RUNNING_COMMIT = _head_commit()
+
+
+def _gate_unittests():
+    """Гейт self-update ступень 2: unittest собственных тестов демона (новым кодом). → (ok, msg)."""
+    try:
+        p = subprocess.run([VENV_PY, "-m", "unittest", "test_pc_orchestrator"], cwd=REPO,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=600)
+        return p.returncode == 0, _tail((p.stderr or "") + (p.stdout or ""), 400)
+    except Exception as e:
+        return False, f"unittest-гейт не запустился: {e}"
+
+
+def _spawn_daemon():
+    """Поднять НОВЫЙ detached-процесс демона (тот же venv+скрипт). → True/False. Мокается в тестах."""
+    try:
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.Popen([VENV_PY, os.path.join(REPO, "pc_orchestrator.py")], cwd=REPO,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, creationflags=flags)
+        return True
+    except Exception as e:
+        log.error("self-update: не смог запустить новый процесс: %s", e)
+        return False
+
+
+def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=None, head_fn=None):
+    """→ True = гейт пройден, новый процесс запущен, ТЕКУЩИЙ должен выйти (эстафета передана).
+    False = обновляться нечему/нельзя (нет диффа, рубильник, гейт провален, spawn не удался) —
+    продолжаем на старом коде. Провал гейта запоминается по блобу (без перегона каждый цикл)."""
+    global _SU_REJECTED_BLOB
+    if _stopped():
+        return False
+    new_blob = (blob_fn or _blob_hash)()
+    if not new_blob or RUNNING_BLOB is None or new_blob == RUNNING_BLOB:
+        return False                        # диффа нет (или git недоступен — не рискуем)
+    if new_blob == _SU_REJECTED_BLOB:
+        return False                        # этот код уже провалил гейт — ждём следующего коммита
+    new_commit = (head_fn or _head_commit)()
+    log.info("self-update: pc_orchestrator.py изменился (%s→%s) — гоняю гейт", RUNNING_COMMIT, new_commit)
+    ok, msg = (code_gate or self_update_ok)()
+    if not ok:
+        _SU_REJECTED_BLOB = new_blob
+        log.error("self-update: code_gate ПРОВАЛЕН (%s→%s): %s — остаюсь на старом коде",
+                  RUNNING_COMMIT, new_commit, msg)
+        _notify(f"⚠️ Оркестратор: self-update {RUNNING_COMMIT}→{new_commit} провалил гейт кода — работаю на старом")
+        return False
+    ok, msg = (tests_gate or _gate_unittests)()
+    if not ok:
+        _SU_REJECTED_BLOB = new_blob
+        log.error("self-update: unittest-гейт ПРОВАЛЕН (%s→%s): %s — остаюсь на старом коде",
+                  RUNNING_COMMIT, new_commit, msg)
+        _notify(f"⚠️ Оркестратор: self-update {RUNNING_COMMIT}→{new_commit} провалил unittest-гейт — работаю на старом")
+        return False
+    if not (spawner or _spawn_daemon)():
+        log.error("self-update: spawn нового демона НЕ УДАЛСЯ — продолжаю на старом коде "
+                  "(упаду — watchdog поднимет через schtasks)")
+        return False
+    log.info("self-update: %s→%s — гейт пройден, новый процесс запущен, передаю управление", RUNNING_COMMIT, new_commit)
+    _cowork(f"self-update: {RUNNING_COMMIT}→{new_commit} (гейт пройден, управляемый рестарт демона)")
+    return True
+
+
 def main():
-    log.info("=== ДЕМОН СТАРТ (lane=%s, poll=%ss, task_timeout=%ss, approval_ttl=%ss, claude=%s) ===",
-             LANE, POLL_SEC, TASK_TIMEOUT, APPROVAL_TTL, CLAUDE_BIN)
+    _init_running_version()
+    log.info("=== ДЕМОН СТАРТ (lane=%s, poll=%ss, task_timeout=%ss, approval_ttl=%ss, claude=%s, commit=%s) ===",
+             LANE, POLL_SEC, TASK_TIMEOUT, APPROVAL_TTL, CLAUDE_BIN, RUNNING_COMMIT)
     if _stopped():
         log.info("рубильник pc_orchestrator.stop активен — не стартую поллинг")
         return
     while not _stopped():
         try:
             poll_once()
+            if maybe_self_update():   # задача цикла обновила pc_orchestrator.py → эстафета новому
+                log.info("=== ДЕМОН ВЫШЕЛ ПО SELF-UPDATE (эстафета новому процессу) ===")
+                return
         except Exception as e:
             log.exception("ошибка цикла: %s", e)
         for _ in range(POLL_SEC):

@@ -533,5 +533,89 @@ class TestClaudeUnresolvable(Base):
         self.assertIn("не найден", self.fb.tasks[tid]["result"].lower())
 
 
+class TestSelfUpdate(Base):
+    """Механика самообновления (порт VPS): всё замокано — git/гейты/spawn НЕ дёргаем."""
+
+    def setUp(self):
+        super().setUp()
+        self._su = (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB)
+        o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB = "blob-old", "aaa1111", None
+
+    def tearDown(self):
+        (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB) = self._su
+        super().tearDown()
+
+    def test_no_diff_no_restart(self):
+        spawned = {"n": 0}
+        r = o.maybe_self_update(blob_fn=lambda: "blob-old",
+                                spawner=lambda: spawned.__setitem__("n", 1) or True)
+        self.assertFalse(r)
+        self.assertEqual(spawned["n"], 0)                     # без диффа не трогаем процесс
+
+    def test_git_unavailable_no_restart(self):
+        r = o.maybe_self_update(blob_fn=lambda: None, spawner=lambda: True)
+        self.assertFalse(r)                                   # git молчит → не рискуем
+
+    def test_diff_gates_pass_handover(self):
+        calls = []
+        r = o.maybe_self_update(
+            blob_fn=lambda: "blob-new", head_fn=lambda: "bbb2222",
+            code_gate=lambda: calls.append("code") or (True, "ok"),
+            tests_gate=lambda: calls.append("tests") or (True, "ok"),
+            spawner=lambda: calls.append("spawn") or True)
+        self.assertTrue(r)                                    # → старый процесс должен выйти
+        self.assertEqual(calls, ["code", "tests", "spawn"])   # гейты СТРОГО до spawn
+
+    def test_selfupdate_line_in_cowork(self):
+        lines = []
+        o._cowork = lambda s: lines.append(s)
+        o.maybe_self_update(blob_fn=lambda: "blob-new", head_fn=lambda: "bbb2222",
+                            code_gate=lambda: (True, "ok"), tests_gate=lambda: (True, "ok"),
+                            spawner=lambda: True)
+        self.assertTrue(any("self-update: aaa1111→bbb2222" in s for s in lines))   # строка старый→новый
+
+    def test_code_gate_fail_no_restart_memoized(self):
+        gates, spawned = {"n": 0}, {"n": 0}
+
+        def cg():
+            gates["n"] += 1
+            return (False, "битый импорт")
+        for _ in (1, 2):                                      # два цикла подряд
+            r = o.maybe_self_update(blob_fn=lambda: "blob-new", code_gate=cg,
+                                    spawner=lambda: spawned.__setitem__("n", 1) or True)
+            self.assertFalse(r)
+        self.assertEqual(spawned["n"], 0)
+        self.assertEqual(gates["n"], 1)                       # провал запомнен по блобу — гейт не перегоняем
+
+    def test_new_commit_after_reject_regates(self):
+        gates = {"n": 0}
+
+        def cg():
+            gates["n"] += 1
+            return (False, "всё ещё битый")
+        o.maybe_self_update(blob_fn=lambda: "blob-new", code_gate=cg, spawner=lambda: True)
+        o.maybe_self_update(blob_fn=lambda: "blob-new2", code_gate=cg, spawner=lambda: True)
+        self.assertEqual(gates["n"], 2)                       # НОВЫЙ блоб → гейт гоняем заново
+
+    def test_unittest_gate_fail_no_restart(self):
+        spawned = {"n": 0}
+        r = o.maybe_self_update(blob_fn=lambda: "blob-new", code_gate=lambda: (True, "ok"),
+                                tests_gate=lambda: (False, "FAILED (failures=1)"),
+                                spawner=lambda: spawned.__setitem__("n", 1) or True)
+        self.assertFalse(r)
+        self.assertEqual(spawned["n"], 0)                     # красные тесты → остаёмся на старом
+
+    def test_spawn_fail_old_keeps_running(self):
+        r = o.maybe_self_update(blob_fn=lambda: "blob-new", code_gate=lambda: (True, "ok"),
+                                tests_gate=lambda: (True, "ok"), spawner=lambda: False)
+        self.assertFalse(r)                                   # эстафета НЕ передана → старый живёт
+
+    def test_stopped_no_selfupdate(self):
+        o._stopped = lambda: True
+        r = o.maybe_self_update(blob_fn=lambda: "blob-new", code_gate=lambda: (True, "ok"),
+                                tests_gate=lambda: (True, "ok"), spawner=lambda: True)
+        self.assertFalse(r)                                   # рубильник → никакой эстафеты
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
