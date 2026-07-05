@@ -19,13 +19,17 @@ userbot_listen.py — тонкие (on_client_message / on_moderation_reply).
 """
 
 import os
+import re
+import glob
 import json
 import time
 import random
+import shutil
 import asyncio
-import re
 import logging
 import datetime
+import tempfile
+import subprocess
 
 import pricing  # каркас получения точной цены из Календаря (Bridge); пусто → фолбэк
 
@@ -87,6 +91,11 @@ MODERBOT_TOKEN = os.getenv("MODERBOT_TOKEN", "").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6").strip()
 LLM_MAX_TOKENS = _int("SUGGEST_MAX_TOKENS", 1000)
+# Генерация через claude CLI (подписка Max) вместо платного API-ключа. Флаг .env SUGGEST_LLM_VIA_CLI=1.
+SUGGEST_LLM_VIA_CLI = _flag("SUGGEST_LLM_VIA_CLI")
+CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude").strip()   # фолбэк-путь (может протухнуть при автообновлении)
+CLI_TIMEOUT = _int("SUGGEST_CLI_TIMEOUT", 60)
+CLI_MODEL = os.getenv("SUGGEST_CLI_MODEL", "sonnet").strip()   # алиас модели для CLI (--model)
 
 # Порядок чтения живого FAQ из Brain: «faq» (живой ключ) → «turbobaby_faq» → локальный файл.
 FAQ_DOC_ORDER = [s.strip() for s in os.getenv("FAQ_DOCS", "faq,turbobaby_faq").split(",") if s.strip()]
@@ -757,10 +766,73 @@ def _default_llm(system: str, user: str) -> str:
     return "".join(getattr(b, "text", "") for b in resp.content).strip()
 
 
+_CLAUDE_BASE = os.path.join(os.getenv("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming"),
+                            "Claude", "claude-code")
+
+
+def _resolve_claude():
+    """Компактный версионно-независимый резолв claude CLI (порт pc_orchestrator.resolve_claude — не
+    импортируем его, чтобы не тянуть в userbot-процесс его logging.basicConfig/Bridge-глобалы).
+    PATH-шим → CLAUDE_BIN если жив → новейшая версия в AppData → кандидаты иных схем. → путь|None."""
+    w = shutil.which("claude")
+    if w and os.path.isfile(w):
+        return w
+    if CLAUDE_BIN and os.path.isabs(CLAUDE_BIN) and os.path.isfile(CLAUDE_BIN):
+        return CLAUDE_BIN
+    try:
+        cands = []
+        for d in glob.glob(os.path.join(_CLAUDE_BASE, "*")):
+            exe = os.path.join(d, "claude.exe")
+            if os.path.isfile(exe):
+                nums = re.findall(r"\d+", os.path.basename(d))
+                cands.append((tuple(int(n) for n in nums) if nums else (0,), exe))
+        if cands:
+            cands.sort()
+            return cands[-1][1]
+    except Exception:
+        pass
+    home = os.path.expanduser("~")
+    local = os.getenv("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+    for c in (os.path.join(home, ".local", "bin", "claude.exe"),
+              os.path.join(home, ".local", "bin", "claude.cmd"),
+              os.path.join(local, "Programs", "claude", "claude.exe")):
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _cli_llm(system: str, user: str) -> str:
+    """Генерация через claude CLI по подписке Max (не платный API-ключ → нет 'credit balance too low').
+    ЧИСТЫЙ генератор текста, НЕ агент: --allowed-tools '' + нейтральный cwd (НЕ репо) → CLI не читает
+    .claude/settings.json+pretool_guard и не дёргает инструменты. ANTHROPIC_API_KEY вычищен из env,
+    иначе CLI пошёл бы по платному ключу. Таймаут/ошибка → '' (upstream: 'пустой черновик' → пропуск)."""
+    cbin = _resolve_claude()
+    if not cbin:
+        raise RuntimeError("claude CLI не найден (PATH/CLAUDE_BIN/AppData) — генерация через CLI невозможна")
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)          # ← ключ НЕ утекает: CLI идёт по подписке Max
+    env.pop("OPENAI_API_KEY", None)
+    try:
+        p = subprocess.run(
+            [cbin, "-p", user, "--system-prompt", system, "--model", CLI_MODEL, "--allowed-tools", ""],
+            cwd=tempfile.gettempdir(),          # нейтральный cwd: без settings.json/pretool_guard репо
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=env, timeout=CLI_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("SUGGEST: claude CLI таймаут %sс — пустой черновик", CLI_TIMEOUT)
+        return ""
+    if p.returncode != 0:
+        log.warning("SUGGEST: claude CLI rc=%s — %s", p.returncode, (p.stderr or "").strip()[-300:])
+        return ""
+    return (p.stdout or "").strip()
+
+
 def generate_draft(transcript: str, lang: str, faq: str,
                    is_first_contact: bool = False, pricing_note: str = "", call_llm=None) -> str:
-    """Сгенерировать черновик. call_llm(system, user)->str инъектируется в тестах."""
-    call_llm = call_llm or _default_llm
+    """Сгенерировать черновик. call_llm(system, user)->str инъектируется в тестах; иначе по флагу
+    SUGGEST_LLM_VIA_CLI — claude CLI (подписка Max) либо _default_llm (платный API-ключ)."""
+    call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note)
     return call_llm(system, transcript).strip()
 

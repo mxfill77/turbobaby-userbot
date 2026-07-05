@@ -13,6 +13,7 @@ import asyncio
 import datetime
 import tempfile
 import unittest
+from unittest import mock
 
 import suggest
 
@@ -528,6 +529,98 @@ class TestModerationAcks(_ModBase):
         for text in ("+", "-", "правка текстом"):
             _, acks, _ = self._run(text, True)
             self.assertTrue(acks, f"reply «{text}» остался без ack")
+
+
+class TestCliLlm(unittest.TestCase):
+    """Генерация через claude CLI (подписка Max). Всё замокано — реальный claude не дёргаем."""
+
+    def setUp(self):
+        self._api = os.environ.get("ANTHROPIC_API_KEY")
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-SECRET-must-not-leak"   # должен быть вычищен из env CLI
+
+    def tearDown(self):
+        if self._api is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = self._api
+
+    def test_cli_success_returns_stdout(self):
+        captured = {}
+
+        class P:
+            returncode = 0
+            stdout = "  Здравствуйте! NMAX свободен.\nRESULT: ок  "
+            stderr = ""
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            captured["cwd"] = kw.get("cwd")
+            captured["env"] = kw.get("env")
+            captured["timeout"] = kw.get("timeout")
+            return P()
+        with mock.patch.object(suggest, "_resolve_claude", return_value=r"C:\claude\claude.exe"), \
+             mock.patch.object(suggest.subprocess, "run", side_effect=fake_run):
+            out = suggest._cli_llm("SYS", "USER")
+        self.assertEqual(out, "Здравствуйте! NMAX свободен.\nRESULT: ок")   # stdout.strip()
+        # ЧИСТЫЙ генератор: --allowed-tools '' + нейтральный cwd (НЕ репо) + модель/промпты на месте
+        self.assertIn("--allowed-tools", captured["cmd"])
+        i = captured["cmd"].index("--allowed-tools")
+        self.assertEqual(captured["cmd"][i + 1], "")
+        self.assertIn("--system-prompt", captured["cmd"])
+        self.assertIn("SYS", captured["cmd"])
+        self.assertIn("USER", captured["cmd"])
+        self.assertNotEqual(os.path.normcase(captured["cwd"] or ""), os.path.normcase(suggest.BASE_DIR))
+
+    def test_cli_env_has_no_api_key(self):
+        def fake_run(cmd, **kw):
+            self.assertIsNotNone(kw.get("env"))
+            self.assertNotIn("ANTHROPIC_API_KEY", kw["env"])   # ключ НЕ утёк → CLI по подписке
+            self.assertNotIn("OPENAI_API_KEY", kw["env"])
+
+            class P:
+                returncode = 0
+                stdout = "ok"
+                stderr = ""
+            return P()
+        with mock.patch.object(suggest, "_resolve_claude", return_value=r"C:\claude\claude.exe"), \
+             mock.patch.object(suggest.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(suggest._cli_llm("S", "U"), "ok")
+
+    def test_cli_timeout_returns_empty(self):
+        def fake_run(cmd, **kw):
+            raise suggest.subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        with mock.patch.object(suggest, "_resolve_claude", return_value=r"C:\claude\claude.exe"), \
+             mock.patch.object(suggest.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(suggest._cli_llm("S", "U"), "")   # таймаут → пусто (upstream пропустит)
+
+    def test_cli_nonzero_returns_empty(self):
+        class P:
+            returncode = 1
+            stdout = ""
+            stderr = "boom"
+        with mock.patch.object(suggest, "_resolve_claude", return_value=r"C:\claude\claude.exe"), \
+             mock.patch.object(suggest.subprocess, "run", return_value=P()):
+            self.assertEqual(suggest._cli_llm("S", "U"), "")
+
+    def test_cli_not_found_raises(self):
+        with mock.patch.object(suggest, "_resolve_claude", return_value=None):
+            with self.assertRaises(RuntimeError):
+                suggest._cli_llm("S", "U")
+
+    def test_generate_draft_uses_cli_when_flag_on(self):
+        calls = {"cli": 0, "api": 0}
+        with mock.patch.object(suggest, "SUGGEST_LLM_VIA_CLI", True), \
+             mock.patch.object(suggest, "_cli_llm", lambda s, u: calls.__setitem__("cli", calls["cli"] + 1) or "черновик"), \
+             mock.patch.object(suggest, "_default_llm", lambda s, u: calls.__setitem__("api", 1) or "нет"):
+            d = suggest.generate_draft("[клиент]: привет", "ru", "FAQ")
+        self.assertEqual(d, "черновик")
+        self.assertEqual((calls["cli"], calls["api"]), (1, 0))   # флаг ON → CLI, платный API не тронут
+
+    def test_injected_call_llm_wins_over_flag(self):
+        # мок-call_llm инъектируется поверх флага — прежние тесты не ломаются
+        with mock.patch.object(suggest, "SUGGEST_LLM_VIA_CLI", True):
+            d = suggest.generate_draft("[клиент]: привет", "ru", "FAQ", call_llm=_fake_llm)
+        self.assertTrue(d)
 
 
 if __name__ == "__main__":
