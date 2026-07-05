@@ -260,23 +260,31 @@ def _ver_key(name):
 _claude_cache = None
 
 
-def resolve_claude():
-    """Найти исполняемый claude БЕЗ привязки к версии (иначе .env-путь протухает при
-    автообновлении → [WinError 2]). Порядок:
+def _claude_candidates():
+    """Явные кандидаты бинаря по ВСЕМ известным схемам установки claude-code (на случай, если
+    автообновление сменит место): native-инсталлер (~/.local/bin), LOCALAPPDATA\\Programs, npm-шим."""
+    home = os.path.expanduser("~")
+    local = os.getenv("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+    appdata = os.getenv("APPDATA") or os.path.join(home, "AppData", "Roaming")
+    return [
+        os.path.join(home, ".local", "bin", "claude.exe"),            # native-инсталлер (новая схема)
+        os.path.join(home, ".local", "bin", "claude.cmd"),
+        os.path.join(local, "Programs", "claude", "claude.exe"),      # LOCALAPPDATA\Programs
+        os.path.join(local, "Programs", "claude-code", "claude.exe"),
+        os.path.join(appdata, "npm", "claude.cmd"),                   # npm -g шим
+    ]
+
+
+def _resolve_claude_once():
+    """Один проход по всем местам (без ретраев). → путь | None. Порядок:
       1) PATH-шим: shutil.which('claude') — учитывает PATHEXT (claude.cmd/.exe/.bat);
       2) CLAUDE_BIN из .env — только если файл реально существует;
-      3) НОВЕЙШАЯ версия в AppData\\...\\claude-code\\<версия>\\claude.exe.
-    → путь (str) или None. Кэшируем, но перепроверяем существование (переживаем автообновление)."""
-    global _claude_cache
-    if _claude_cache and os.path.isfile(_claude_cache):
-        return _claude_cache
-    _claude_cache = None
+      3) НОВЕЙШАЯ версия в AppData\\...\\claude-code\\<версия>\\claude.exe;
+      4) явные кандидаты других схем установки (_claude_candidates)."""
     w = shutil.which("claude")                       # 1) PATH-шим (.cmd/.exe через PATHEXT)
     if w and os.path.isfile(w):
-        _claude_cache = w
         return w
     if CLAUDE_BIN and os.path.isabs(CLAUDE_BIN) and os.path.isfile(CLAUDE_BIN):  # 2) .env, если жив
-        _claude_cache = CLAUDE_BIN
         return CLAUDE_BIN
     try:                                             # 3) новейшая версионная установка
         cands = []
@@ -286,10 +294,33 @@ def resolve_claude():
                 cands.append((_ver_key(os.path.basename(d)), exe))
         if cands:
             cands.sort()
-            _claude_cache = cands[-1][1]
-            return _claude_cache
+            return cands[-1][1]
     except Exception:
         pass
+    for c in _claude_candidates():                   # 4) другие схемы установки
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def resolve_claude(retries=1, retry_sleep=2.0):
+    """Найти исполняемый claude БЕЗ привязки к версии/месту установки. Кэшируем, но перепроверяем
+    существование (переживаем автообновление). НЕ сдаёмся с первого прохода: transient-недоступность
+    диска (стейджинг автообновления/антивирус — кейс задачи #35: файл был на месте, а isfile мигнул
+    False) → короткий ретрай. → путь (str) | None (после ретраев — реально нигде нет)."""
+    global _claude_cache
+    if _claude_cache and os.path.isfile(_claude_cache):
+        return _claude_cache
+    _claude_cache = None
+    for i in range(retries + 1):
+        p = _resolve_claude_once()
+        if p:
+            _claude_cache = p
+            return p
+        if i < retries:
+            log.warning("resolve_claude: не найден (проход %s: PATH/CLAUDE_BIN/%s/кандидаты) — "
+                        "транзиент? повтор через %sс", i + 1, _CLAUDE_BASE, retry_sleep)
+            time.sleep(retry_sleep)
     return None
 
 
@@ -318,9 +349,10 @@ def run_task(tid, text, note=""):
     marker_path = os.path.join(REPO, f"pc_ask_{tid}.marker")
     cbin = resolve_claude()                       # версионно-независимый резолв (класс-фикс WinError 2)
     if not cbin:
-        msg = ("claude CLI не найден: нет ни в PATH, ни в CLAUDE_BIN (.env), ни в "
+        msg = ("claude CLI не найден (после ретрая): нет ни в PATH, ни в CLAUDE_BIN (.env), ни в "
                + os.path.join(_CLAUDE_BASE, "<версия>", "claude.exe")
-               + ". Проверь установку/автообновление claude-code.")
+               + ", ни в кандидатах (~/.local/bin, LOCALAPPDATA\\Programs, npm). "
+               "Проверь установку/автообновление claude-code.")
         log.error("id=%s НЕ НАЙДЕН claude: %s", tid, msg)
         return "failed", msg
     run_token = f"{os.getpid()}-{int(time.time() * 1000)}-{tid}"   # контекст запуска: pid+ts+tid

@@ -506,18 +506,52 @@ class TestResolveClaude(unittest.TestCase):
         o.CLAUDE_BIN = r"C:\nope\claude.exe"
         with tempfile.TemporaryDirectory() as d:
             o._CLAUDE_BASE = d
-            with mock.patch.object(o.shutil, "which", return_value=None):
-                self.assertIsNone(o.resolve_claude())
+            with mock.patch.object(o.shutil, "which", return_value=None), \
+                 mock.patch.object(o, "_claude_candidates", return_value=[]):
+                self.assertIsNone(o.resolve_claude(retry_sleep=0))
 
     def test_cache_revalidates_after_removal(self):
         with tempfile.TemporaryDirectory() as base:
             sub = os.path.join(base, "2.1.5"); os.makedirs(sub)
             exe = os.path.join(sub, "claude.exe"); open(exe, "w").close()
             o._CLAUDE_BASE = base; o.CLAUDE_BIN = "claude"
-            with mock.patch.object(o.shutil, "which", return_value=None):
+            with mock.patch.object(o.shutil, "which", return_value=None), \
+                 mock.patch.object(o, "_claude_candidates", return_value=[]):
                 self.assertEqual(o.resolve_claude(), exe)
                 os.remove(exe)                                     # автообновление удалило версию
-                self.assertIsNone(o.resolve_claude())              # кэш перепроверен → не мёртвый путь
+                self.assertIsNone(o.resolve_claude(retry_sleep=0))   # кэш перепроверен → не мёртвый путь
+
+    def test_new_scheme_candidate_found(self):
+        # автообновление сменило место установки → бинарь находится по явным кандидатам (п.4)
+        o.CLAUDE_BIN = r"C:\nope\claude.exe"
+        with tempfile.TemporaryDirectory() as d:
+            o._CLAUDE_BASE = os.path.join(d, "empty-base")         # старой схемы больше нет
+            exe = os.path.join(d, ".local", "bin", "claude.exe")   # native-инсталлер (новая схема)
+            os.makedirs(os.path.dirname(exe)); open(exe, "w").close()
+            with mock.patch.object(o.shutil, "which", return_value=None), \
+                 mock.patch.object(o, "_claude_candidates", return_value=[exe]):
+                self.assertEqual(o.resolve_claude(), exe)
+
+    def test_candidates_cover_known_schemes(self):
+        cands = "\n".join(o._claude_candidates()).lower()
+        self.assertIn(os.path.join(".local", "bin", "claude.exe"), cands)   # native-инсталлер
+        self.assertIn(os.path.join("programs", "claude"), cands)            # LOCALAPPDATA\Programs
+        self.assertIn(os.path.join("npm", "claude.cmd"), cands)             # npm-шим
+
+    def test_transient_miss_recovered_by_retry(self):
+        # кейс #35: файл «мигнул» (стейджинг автообновления/AV) — первый проход пуст, ретрай находит
+        o.CLAUDE_BIN = r"C:\nope\claude.exe"
+        with tempfile.TemporaryDirectory() as base:
+            o._CLAUDE_BASE = base
+            exe = os.path.join(base, "2.1.200", "claude.exe")
+
+            def appear(_):
+                os.makedirs(os.path.dirname(exe), exist_ok=True)
+                open(exe, "w").close()                             # файл «вернулся» перед ретраем
+            with mock.patch.object(o.shutil, "which", return_value=None), \
+                 mock.patch.object(o, "_claude_candidates", return_value=[]), \
+                 mock.patch.object(o.time, "sleep", side_effect=appear):
+                self.assertEqual(o.resolve_claude(retries=1), exe)   # второй проход нашёл
 
 
 class TestClaudeUnresolvable(Base):
