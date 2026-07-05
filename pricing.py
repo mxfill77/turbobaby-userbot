@@ -63,6 +63,8 @@ def _normalize(data):
         "model": src.get("model"),
         "days": src.get("days"),
         "text": src.get("text"),
+        "cap_active": src.get("cap_active"),   # низкий сезон: активен ценовой потолок
+        "cap_price": src.get("cap_price"),     # цена потолка (฿/мес) для «аренда от <cap>»
     }
     # Нужна хотя бы одна осмысленная цифра цены, иначе это не котировка.
     if out["day_price"] is None and out["total"] is None:

@@ -429,6 +429,56 @@ def _detect_model(text: str):
     return None
 
 
+def _detect_models(text: str):
+    """ВСЕ модели, упомянутые в тексте (для запроса нескольких байков сразу). Порядок
+    появления, без дублей; «ADV» отбрасываем, если есть более точная «ADV350» и т.п."""
+    found = []
+    for tok in _MODEL_TOKENS:
+        if tok in text:
+            canon = tok.upper().replace(" ", "")
+            if canon not in found:
+                found.append(canon)
+    # снять префиксы, поглощённые более длинной моделью (ADV ⊂ ADV350, CBR ⊂ CBR650)
+    return [c for c in found if not any(o != c and o.startswith(c) for o in found)]
+
+
+# --- класс байка → минимальный срок аренды (правила цен v2, п.2) ---------------
+# Скутеры сдаём от 5 дней (XSR155 тоже 5), мотоциклы — от 3.
+SCOOTER_MIN_DAYS = 5
+MOTO_MIN_DAYS = 3
+_MOTO_PREFIXES = ("CB300", "CB650", "CBR", "REBEL", "MT", "NINJA", "VULCAN", "R7")
+_SCOOTER_PREFIXES = ("PCX", "NMAX", "FORZA", "XMAX", "XADV", "ADV")
+
+
+def bike_class(model):
+    """(kind, min_days, label) для модели или None, если класс неизвестен.
+    kind: 'scooter'|'moto'. label — как называть тип в сообщении клиенту."""
+    m = re.sub(r"[^A-Z0-9]", "", (model or "").upper())
+    if not m:
+        return None
+    if m.startswith("XSR"):
+        if "900" in m:                       # XSR900 — большой мотоцикл (3)
+            return ("moto", MOTO_MIN_DAYS, "мотоциклы")
+        return ("scooter", SCOOTER_MIN_DAYS, "этот байк")   # XSR155 → минимум как у скутеров (5)
+    for t in _MOTO_PREFIXES:
+        if m.startswith(t):
+            return ("moto", MOTO_MIN_DAYS, "мотоциклы")
+    for t in _SCOOTER_PREFIXES:
+        if m.startswith(t):
+            return ("scooter", SCOOTER_MIN_DAYS, "скутеры")
+    return None
+
+
+def _asks_deposit_reduction_multi(newest: str, recent: str, models) -> bool:
+    """Явный вопрос клиента про уменьшение депозита при нескольких байках (правила цен v2, п.4).
+    newest — последняя реплика клиента, recent — склейка последних реплик, models — найденные модели."""
+    dep = re.search(r"депозит|залог|deposit", newest or "")
+    less = re.search(r"меньше|уменьш|сниз|скид|дешевл|пониз|lower|reduce|discount|less", newest or "")
+    multi = re.search(r"нескольк|два\b|две\b|\bоба\b|\bобе\b|байка|байков|мотик|two|both|several",
+                      recent or "")
+    return bool(dep and less and (multi or len(models or []) >= 2))
+
+
 def _explicit_monthly(text: str) -> bool:
     """monthly ТОЛЬКО по явному слову клиента, НЕ по длительности диапазона."""
     return bool(re.search(r"месяц|\bmonth\b|monthly", text or ""))
@@ -455,6 +505,7 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
     iso_end, term_days, hint_days, monthly, has_dates}."""
     window = _client_messages(transcript)[-BOOKING_WINDOW:][::-1]  # новейшая первой
     newest = window[0] if window else ""
+    recent = " ".join(window)
 
     model = iso_start = iso_end = term_days = None
     monthly = False
@@ -499,52 +550,151 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
     if hint_days is None:
         hint_days = term_days
     has_dates = bool(iso_start or term_days) or _has_date_signal(newest)
-    return {"model": model, "date_start": iso_start, "date_end": iso_end,
+
+    # Несколько моделей в ОДНОМ запросе (правила цен v2, п.3) — берём из последней реплики;
+    # одна/ноль → падаем на единственную разрешённую модель окна.
+    newest_models = _detect_models(newest)
+    if len(newest_models) >= 2:
+        models = newest_models
+    elif model:
+        models = [model]
+    else:
+        models = newest_models
+    deposit_multi_q = _asks_deposit_reduction_multi(newest, recent, models)
+
+    return {"model": model, "models": models, "date_start": iso_start, "date_end": iso_end,
             "iso_start": iso_start, "iso_end": iso_end, "term_days": term_days,
-            "hint_days": hint_days, "monthly": monthly, "has_dates": has_dates}
+            "hint_days": hint_days, "monthly": monthly, "has_dates": has_dates,
+            "deposit_multi_q": deposit_multi_q}
+
+
+# Инструкция про депозит при нескольких байках (правила цен v2, п.4).
+DEPOSIT_MULTI_NOTE = ("ДЕПОЗИТ: клиент спрашивает про уменьшение депозита при нескольких байках "
+                      "— сам скидку/снижение депозита НЕ предлагай и НЕ обещай; ответь ровно: "
+                      "«уточню у менеджера».")
+
+
+def _iso_plus(iso_date, n_days):
+    """iso-дата + n_days дней → iso-строка или None."""
+    try:
+        return (datetime.date.fromisoformat(iso_date) + datetime.timedelta(days=int(n_days))).isoformat()
+    except Exception:
+        return None
+
+
+def _safe_quote_for_model(model, ds, de):
+    """pricing.quote_for_model без падений → всегда dict {status, quote}."""
+    try:
+        res = pricing.quote_for_model(model, ds, de)
+    except Exception:
+        res = None
+    if not isinstance(res, dict):
+        return {"status": "error", "quote": None}
+    return res
+
+
+def _client_price(q: dict) -> str:
+    """Фраза ЦЕНЫ клиенту из quote. Правила цен v2, п.1 и п.5:
+    кап (низкий сезон, total>cap_price) → «аренда от <cap> ฿/мес …» вместо J-цены (+депозит/наличие);
+    иначе — поле text из quote ДОСЛОВНО (цена J); иначе — сборка из day_price/total/deposit."""
+    cap_active = q.get("cap_active")
+    cap_price = q.get("cap_price")
+    total = q.get("total")
+    if cap_active and cap_price is not None and total is not None and total > cap_price:
+        parts = [f"аренда от {cap_price} ฿/мес — предложение низкого сезона"]
+        if q.get("deposit") is not None:
+            parts.append(f"депозит {q['deposit']} ฿")
+        if q.get("available"):
+            parts.append("свободен на эти даты")
+        return "; ".join(parts)
+    if isinstance(q.get("text"), str) and q["text"].strip():
+        return q["text"].strip()               # J-цена дословно (п.5)
+    parts = []
+    if q.get("day_price") is not None:
+        parts.append(f"{q['day_price']} ฿/день")
+    if q.get("total") is not None:
+        parts.append(f"итого {q['total']} ฿")
+    if q.get("deposit") is not None:
+        parts.append(f"депозит {q['deposit']} ฿")
+    if q.get("available"):
+        parts.append("свободен на эти даты")
+    return "; ".join(parts)
+
+
+def _resolve_model_price(model, ds, de, hint_days, monthly):
+    """Цена для ОДНОЙ модели по датам ds..de. Возвращает (kind, phrase):
+      ok    — цену использовать дословно (кап/J-текст/сборка внутри _client_price);
+      min   — срок короче минимального: «<тип> сдаём от N дней» + цена на минимум;
+      sanity/none/error — фолбэк без числа."""
+    cls = bike_class(model)
+    # (п.2) минимальный срок аренды: короче → предлагаем минимум и цену на него
+    if cls and hint_days is not None and hint_days < cls[1]:
+        min_days, label = cls[1], cls[2]
+        de_min = _iso_plus(ds, min_days)
+        q = None
+        if de_min:
+            res = _safe_quote_for_model(model, ds, de_min)
+            if res.get("status") == "ok" and res.get("quote") and \
+                    pricing.sanity_days_ok(res["quote"].get("days"), min_days, monthly):
+                q = res["quote"]
+        base = f"{label} сдаём от {min_days} дней (короче срок не оформляем)"
+        if q:
+            return ("min", f"{base}; цена за {min_days} дн: {_client_price(q)}")
+        return ("min", f"{base}; точную цену за {min_days} дн уточню и вернусь")
+    res = _safe_quote_for_model(model, ds, de)
+    status, q = res.get("status"), res.get("quote")
+    if status == "ok" and q:
+        # SANITY-ГАРД: сверяем days из quote с длительностью из слов клиента.
+        if not pricing.sanity_days_ok(q.get("days"), hint_days, monthly):
+            return ("sanity", "расчёт по датам не сходится (длительность подозрительная) — НЕ "
+                              "называй никакого числа; ответь, что уточню цену по датам и вернусь")
+        return ("ok", _client_price(q))
+    if status == "none_available":
+        return ("none", "на эти даты все подходящие байки заняты — НЕ называй числа; ответь, что "
+                        "уточню наличие и цену на эти даты и вернусь")
+    return ("error", "точная цена из Календаря сейчас недоступна — НЕ называй никакого числа "
+                     "(в т.ч. из FAQ); ответь, что уточнишь цену и вернёшься")
+
+
+def _wrap_single(kind: str, phrase: str) -> str:
+    if kind == "ok":
+        return ("ЦЕНА из Календаря бронирования (использовать ДОСЛОВНО, не пересчитывать и не "
+                "округлять): " + phrase + ".")
+    return "ЦЕНА: " + phrase + "."
 
 
 def build_pricing_note(hints: dict) -> str:
-    """Инструкция по цене для промпта. ИНВАРИАНТ: без котировки из Календаря — без числа."""
+    """Инструкция по цене для промпта. ИНВАРИАНТ: без котировки из Календаря — без числа.
+    Правила цен v2: кап низкого сезона (п.1), минимальный срок (п.2), несколько моделей одной
+    строкой каждая (п.3), депозит при нескольких байках (п.4), J-текст дословно (п.5)."""
+    # (п.4) депозит при нескольких байках — инструкция дописывается к ЛЮБОМУ исходу цены.
+    dep = (" " + DEPOSIT_MULTI_NOTE) if hints.get("deposit_multi_q") else ""
     if not hints.get("has_dates"):
         return ("ЦЕНА: дат аренды в диалоге НЕТ — попроси у клиента даты (начало/конец) и срок. "
                 "НЕ называй НИКАКУЮ цену: ни точную, ни ориентир, ни «от X ฿», ни диапазон "
                 "(«X–Y ฿»), ни «from X» — вообще никаких чисел цены, в т.ч. из FAQ. "
-                "Цену назовём только после дат, из Календаря.")
-    model = hints.get("model")
+                "Цену назовём только после дат, из Календаря.") + dep
     ds, de = hints.get("iso_start"), hints.get("iso_end")
-    if not (model and ds and de):
+    models = hints.get("models") or ([hints["model"]] if hints.get("model") else [])
+    if not (models and ds and de):
         # даты есть словами, но модель/полные даты не разобрались → фолбэк БЕЗ числа
         return ("ЦЕНА: не удалось однозначно разобрать модель/даты для Календаря — НЕ называй "
                 "никакого числа (в т.ч. из FAQ); уточни модель и точные даты и скажи, что "
-                "назовёшь цену по датам.")
-    try:
-        res = pricing.quote_for_model(model, ds, de)
-    except Exception:
-        res = {"status": "error", "quote": None}
-    q = res.get("quote") if isinstance(res, dict) else None
-    status = res.get("status") if isinstance(res, dict) else "error"
-    if status == "ok" and q:
-        # SANITY-ГАРД: сверяем days из quote с длительностью из слов клиента. Кривые даты
-        # (напр. 360 дней при 5) → НЕ вставляем цифры, честный фолбэк.
-        if not pricing.sanity_days_ok(q.get("days"), hints.get("hint_days"), hints.get("monthly")):
-            return ("ЦЕНА: расчёт по датам не сходится (длительность подозрительная) — НЕ называй "
-                    "никакого числа; ответь, что уточню цену по датам и вернусь.")
-        parts = []
-        if q.get("day_price") is not None:
-            parts.append(f"{q['day_price']} ฿/день")
-        if q.get("total") is not None:
-            parts.append(f"итого {q['total']} ฿")
-        if q.get("deposit") is not None:
-            parts.append(f"депозит {q['deposit']} ฿")
-        parts.append("свободен на эти даты")
-        return ("ЦЕНА из Календаря бронирования (использовать ДОСЛОВНО, не пересчитывать и не "
-                "округлять): " + "; ".join(parts) + ".")
-    if status == "none_available":
-        return ("ЦЕНА: на эти даты все подходящие байки заняты — НЕ называй числа; ответь, что "
-                "уточню наличие и цену на эти даты и вернусь.")
-    return ("ЦЕНА: точная цена из Календаря сейчас недоступна — НЕ называй никакого числа "
-            "(в т.ч. из FAQ); ответь, что уточнишь цену и вернёшься.")
+                "назовёшь цену по датам.") + dep
+    hint_days, monthly = hints.get("hint_days"), hints.get("monthly")
+
+    if len(models) == 1:
+        kind, phrase = _resolve_model_price(models[0], ds, de, hint_days, monthly)
+        return _wrap_single(kind, phrase) + dep
+
+    # (п.3) несколько моделей — раздельная цена по каждой, отдельной строкой в одном сообщении
+    bullets = []
+    for m in models:
+        _, phrase = _resolve_model_price(m, ds, de, hint_days, monthly)
+        bullets.append(f"- {m}: {phrase}")
+    header = ("ЦЕНЫ ПО МОДЕЛЯМ (клиент запросил несколько) — назови КАЖДУЮ отдельной строкой в "
+              "ОДНОМ сообщении, цену использовать ДОСЛОВНО, модели НЕ смешивай и НЕ суммируй:\n")
+    return header + "\n".join(bullets) + dep
 
 
 def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pricing_note: str = "") -> str:
@@ -564,7 +714,8 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         "клиенту НИКАКУЮ цену: ни точную, ни ориентир, ни «от X», ни диапазон, ни «from», ни "
         "ставку из FAQ. Дат нет — сперва спроси даты. Цена недоступна — скажи, что уточнишь "
         "цену по датам и вернёшься, БЕЗ числа. Дневные ставки FAQ — ориентир ДЛЯ МЕНЕДЖЕРА, "
-        "не для клиента."
+        "не для клиента. Про уменьшение депозита при нескольких байках сам НЕ предлагай и НЕ "
+        "обещай; на прямой вопрос клиента ответь ровно «уточню у менеджера»."
     )
     scenario = (
         "\n\nПОРЯДОК ДИАЛОГА (СТРОГО по этапам, не забегай вперёд):\n"

@@ -520,5 +520,150 @@ class TestSanityStrengthened(unittest.TestCase):
             pricing.quote_for_model = saved
 
 
+class TestPriceRulesV2(unittest.TestCase):
+    """Правила цен v2: (1) кап низкого сезона, (2) минимальный срок, (3) несколько моделей,
+    (4) депозит при нескольких байках, (5) J-текст quote дословно."""
+    TODAY = datetime.date(2026, 7, 5)
+
+    def _with_qfm(self, fn):
+        saved = pricing.quote_for_model
+        pricing.quote_for_model = fn
+        self.addCleanup(lambda: setattr(pricing, "quote_for_model", saved))
+
+    def _h(self, phrase):
+        return suggest.extract_booking_hints("[клиент]: " + phrase, today=self.TODAY)
+
+    # --- (1) кап низкого сезона ---------------------------------------------
+    def test_cap_active_replaces_j_price_with_low_season(self):
+        # total (за месяц) > cap_price → «аренда от <cap> ฿/мес — предложение низкого сезона»
+        self._with_qfm(lambda *a, **k: {"status": "ok", "quote": {
+            "text": "30000 ฿ за месяц", "total": 30000, "cap_active": True, "cap_price": 15000,
+            "deposit": 7000, "available": True, "days": 30}})
+        note = suggest.build_pricing_note(self._h("NMAX на месяц с 5 июля"))
+        self.assertIn("аренда от 15000 ฿/мес", note)
+        self.assertIn("низкого сезона", note)
+        self.assertIn("депозит 7000", note)     # депозит/наличие как обычно
+        self.assertIn("свободен", note)
+        self.assertNotIn("30000", note)          # J-цена НЕ уходит клиенту
+
+    def test_cap_inactive_uses_j_text(self):
+        # cap_active=False → обычная J-цена (поле text) дословно, не кап-фраза
+        self._with_qfm(lambda *a, **k: {"status": "ok", "quote": {
+            "text": "6300 ฿ за 7 дней, депозит 7000 ฿", "total": 6300, "cap_active": False,
+            "cap_price": 15000, "available": True, "days": 7}})
+        note = suggest.build_pricing_note(self._h("NMAX 10.07-17.07"))
+        self.assertIn("6300 ฿ за 7 дней", note)
+        self.assertNotIn("низкого сезона", note)
+
+    def test_cap_active_but_total_below_cap_no_low_season(self):
+        # кап активен, но total < cap_price → берём J-цену, без кап-фразы
+        self._with_qfm(lambda *a, **k: {"status": "ok", "quote": {
+            "text": "6300 ฿", "total": 6300, "cap_active": True, "cap_price": 15000,
+            "available": True, "days": 7}})
+        note = suggest.build_pricing_note(self._h("NMAX 10.07-17.07"))
+        self.assertNotIn("низкого сезона", note)
+        self.assertIn("6300 ฿", note)
+
+    # --- (2) минимальный срок ------------------------------------------------
+    def test_bike_class_min_days(self):
+        self.assertEqual(suggest.bike_class("NMAX")[1], 5)        # скутер → 5
+        self.assertEqual(suggest.bike_class("PCX")[1], 5)
+        self.assertEqual(suggest.bike_class("ADV350")[1], 5)
+        self.assertEqual(suggest.bike_class("XSR")[1], 5)         # XSR155 → 5 (как скутер)
+        self.assertEqual(suggest.bike_class("CB300")[1], 3)      # мотоцикл → 3
+        self.assertEqual(suggest.bike_class("NINJA")[1], 3)
+        self.assertEqual(suggest.bike_class("XSR900")[1], 3)     # большой мотоцикл → 3
+        self.assertIsNone(suggest.bike_class("CLICK"))
+
+    def test_scooter_below_min_offers_5_days(self):
+        # скутер на 3 дня (min 5) → «скутеры сдаём от 5 дней» + цена на минимум
+        self._with_qfm(lambda m, ds, de, *a, **k: {"status": "ok", "quote": {
+            "text": "4500 ฿ за 5 дней", "total": 4500, "available": True, "days": 5}})
+        note = suggest.build_pricing_note(self._h("NMAX завтра на 3 дня"))
+        self.assertIn("скутеры сдаём от 5 дней", note)
+        self.assertIn("4500 ฿ за 5 дней", note)
+
+    def test_moto_below_min_offers_3_days(self):
+        self._with_qfm(lambda m, ds, de, *a, **k: {"status": "ok", "quote": {
+            "text": "3000 ฿ за 3 дня", "total": 3000, "available": True, "days": 3}})
+        note = suggest.build_pricing_note(self._h("CB300 завтра на 2 дня"))
+        self.assertIn("мотоциклы сдаём от 3 дней", note)
+        self.assertIn("3000 ฿ за 3 дня", note)
+
+    def test_xsr155_below_min_offers_5_days(self):
+        self._with_qfm(lambda m, ds, de, *a, **k: {"status": "ok", "quote": {
+            "text": "5000 ฿ за 5 дней", "total": 5000, "available": True, "days": 5}})
+        note = suggest.build_pricing_note(self._h("XSR завтра на 4 дня"))
+        self.assertIn("от 5 дней", note)
+
+    def test_at_min_days_no_min_message(self):
+        # ровно минимум (скутер 5 дней) → обычная цена, без «сдаём от»
+        self._with_qfm(lambda *a, **k: {"status": "ok", "quote": {
+            "text": "4500 ฿", "total": 4500, "available": True, "days": 5}})
+        note = suggest.build_pricing_note(self._h("NMAX с 5 по 10 июля"))
+        self.assertNotIn("сдаём от", note)
+        self.assertIn("4500 ฿", note)
+
+    # --- (3) несколько моделей ----------------------------------------------
+    def test_detect_multiple_models(self):
+        ms = suggest._detect_models("nmax и pcx на 10.07-17.07")
+        self.assertIn("NMAX", ms)
+        self.assertIn("PCX", ms)
+        self.assertEqual(len(ms), 2)
+
+    def test_detect_models_no_false_split_adv350(self):
+        # «ADV 350» не должно расщепляться на ADV + ADV350
+        self.assertEqual(suggest._detect_models("adv 350 на 10.07-17.07"), ["ADV350"])
+
+    def test_multi_model_separate_prices(self):
+        prices = {"NMAX": "6300 ฿ NMAX", "PCX": "5600 ฿ PCX"}
+        self._with_qfm(lambda m, ds, de, *a, **k: {"status": "ok", "quote": {
+            "text": prices.get(suggest.bike_class(m) and m, "?"), "total": 6300,
+            "available": True, "days": 7}})
+        h = self._h("NMAX и PCX на 10.07-17.07")
+        self.assertEqual(len(h["models"]), 2)
+        note = suggest.build_pricing_note(h)
+        self.assertIn("6300 ฿ NMAX", note)
+        self.assertIn("5600 ฿ PCX", note)
+        self.assertIn("- NMAX:", note)
+        self.assertIn("- PCX:", note)
+        self.assertIn("отдельной строкой", note)
+
+    # --- (4) депозит при нескольких байках -----------------------------------
+    def test_deposit_multi_question_detected(self):
+        h = self._h("Беру NMAX и PCX, можно депозит поменьше на два байка?")
+        self.assertTrue(h["deposit_multi_q"])
+        note = suggest.build_pricing_note(h)
+        self.assertIn("уточню у менеджера", note)
+
+    def test_deposit_single_bike_not_triggered(self):
+        h = self._h("NMAX 10.07-17.07, какой депозит?")
+        self.assertFalse(h["deposit_multi_q"])
+
+    def test_policy_forbids_self_deposit_reduction(self):
+        p = suggest.make_system_prompt("FAQ", "ru")
+        self.assertIn("уточню у менеджера", p)
+        self.assertIn("депозит", p.lower())
+
+    # --- (5) J-текст дословно ------------------------------------------------
+    def test_ok_uses_quote_text_verbatim(self):
+        # поле text из quote уходит клиенту дословно; day_price игнорируется
+        self._with_qfm(lambda *a, **k: {"status": "ok", "quote": {
+            "text": "Ровно так: 900 ฿/день, 6300 ฿ за неделю", "day_price": 111, "total": 6300,
+            "available": True, "days": 7}})
+        note = suggest.build_pricing_note(self._h("NMAX 10.07-17.07"))
+        self.assertIn("Ровно так: 900 ฿/день, 6300 ฿ за неделю", note)
+        self.assertIn("ДОСЛОВНО", note)
+        self.assertNotIn("111", note)            # day_price не подмешан
+
+    def test_ok_without_text_falls_back_to_assembly(self):
+        # обратная совместимость: нет поля text → сборка из чисел
+        self._with_qfm(lambda *a, **k: {"status": "ok", "quote": {
+            "day_price": 900, "total": 6300, "deposit": 7000, "available": True, "days": 7}})
+        note = suggest.build_pricing_note(self._h("NMAX 10.07-17.07"))
+        self.assertIn("900", note)
+        self.assertIn("6300", note)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
