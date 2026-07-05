@@ -277,6 +277,38 @@ class TestFullFlow(unittest.TestCase):
         self.assertIn("DRAFT ответа клиенту", self.client.sent[0][1])
         self.assertIsNotNone(suggest.pending.get(mid))
 
+    def test_generation_exception_posts_visible_note(self):
+        # сбой генератора (claude CLI не найден) → видимая заметка в группу, НЕ молчаливый пропуск
+        def boom(_s, _u):
+            raise RuntimeError("claude CLI не найден (PATH/CLAUDE_BIN/AppData)")
+        res = asyncio.run(suggest.on_client_message(self.client, self.sender, self.me,
+                                                    call_llm=boom, faq="FAQ"))
+        self.assertIsNone(res)
+        notes = [t for t in self.client.sent if t[0] == suggest.MOD_GROUP_ID and "НЕ сгенерирован" in t[1]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("claude CLI не найден", notes[0][1])
+        self.assertIn("@client1", notes[0][1])
+        self.assertTrue(notes[0][1].lstrip().startswith("⚠️"))
+        # карточки-черновика НЕ было, pending пуст
+        self.assertFalse(any("Черновик ответа клиенту" in t[1] for t in self.client.sent))
+
+    def test_empty_draft_posts_visible_note(self):
+        # пустой вывод LLM → тоже видимая заметка (раньше молчали)
+        res = asyncio.run(suggest.on_client_message(self.client, self.sender, self.me,
+                                                    call_llm=lambda s, u: "", faq="FAQ"))
+        self.assertIsNone(res)
+        notes = [t for t in self.client.sent if "НЕ сгенерирован" in t[1]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("пустой вывод LLM", notes[0][1])
+        self.assertIn("@client1", notes[0][1])
+
+    def test_success_still_posts_card_no_note(self):
+        # успех — карточка как раньше, никакой заметки о сбое
+        mid = self._incoming()
+        self.assertIsNotNone(mid)
+        self.assertTrue(any("Черновик ответа клиенту" in t[1] for t in self.client.sent))
+        self.assertFalse(any("НЕ сгенерирован" in t[1] for t in self.client.sent))
+
     def test_approve_sends_draft_to_client(self):
         mid = self._incoming()
         ev = FakeEvent(self.client, reply_to=mid, text="+")
@@ -621,6 +653,30 @@ class TestCliLlm(unittest.TestCase):
         with mock.patch.object(suggest, "SUGGEST_LLM_VIA_CLI", True):
             d = suggest.generate_draft("[клиент]: привет", "ru", "FAQ", call_llm=_fake_llm)
         self.assertTrue(d)
+
+    # --- ретрай резолва: транзиентный isfile==False не убивает черновик с первой осечки ---
+    def test_resolve_retries_then_succeeds(self):
+        seq = [None, r"C:\claude\claude.exe"]     # первый проход пусто, второй — нашли
+        with mock.patch.object(suggest, "_resolve_claude_once", side_effect=seq), \
+             mock.patch.object(suggest.time, "sleep") as slp:
+            self.assertEqual(suggest._resolve_claude(retries=1, retry_sleep=2.0), r"C:\claude\claude.exe")
+            slp.assert_called_once()               # была пауза перед второй попыткой
+
+    def test_resolve_exhausted_returns_none(self):
+        with mock.patch.object(suggest, "_resolve_claude_once", return_value=None), \
+             mock.patch.object(suggest.time, "sleep"):
+            self.assertIsNone(suggest._resolve_claude(retries=1, retry_sleep=0))
+
+    def test_cli_llm_recovers_via_retry(self):
+        # первая осечка isfile → вторая удача: _cli_llm НЕ падает, зовёт CLI (кейс теста 00:33)
+        class P:
+            returncode = 0
+            stdout = "Здравствуйте! NMAX свободен."
+            stderr = ""
+        with mock.patch.object(suggest, "_resolve_claude_once", side_effect=[None, r"C:\claude\claude.exe"]), \
+             mock.patch.object(suggest.time, "sleep"), \
+             mock.patch.object(suggest.subprocess, "run", return_value=P()):
+            self.assertEqual(suggest._cli_llm("S", "U"), "Здравствуйте! NMAX свободен.")
 
 
 if __name__ == "__main__":

@@ -770,10 +770,9 @@ _CLAUDE_BASE = os.path.join(os.getenv("APPDATA") or os.path.join(os.path.expandu
                             "Claude", "claude-code")
 
 
-def _resolve_claude():
-    """Компактный версионно-независимый резолв claude CLI (порт pc_orchestrator.resolve_claude — не
-    импортируем его, чтобы не тянуть в userbot-процесс его logging.basicConfig/Bridge-глобалы).
-    PATH-шим → CLAUDE_BIN если жив → новейшая версия в AppData → кандидаты иных схем. → путь|None."""
+def _resolve_claude_once():
+    """Один проход резолва (без ретраев). PATH-шим → CLAUDE_BIN если жив → новейшая версия в AppData
+    → кандидаты иных схем установки. → путь|None."""
     w = shutil.which("claude")
     if w and os.path.isfile(w):
         return w
@@ -798,6 +797,23 @@ def _resolve_claude():
               os.path.join(local, "Programs", "claude", "claude.exe")):
         if os.path.isfile(c):
             return c
+    return None
+
+
+def _resolve_claude(retries=1, retry_sleep=2.0):
+    """Версионно-независимый резолв claude CLI (порт pc_orchestrator.resolve_claude, коммит 45bdd75 —
+    не импортируем pc_orchestrator, чтобы не тянуть его logging.basicConfig/Bridge в userbot).
+    НЕ сдаёмся с первой осечки: транзиентный os.path.isfile()==False на 236-МБ claude.exe
+    (AV-скан/локация файла — кейс теста 00:33 и задачи #35) не должен убивать черновик — короткий
+    ретрай (2 попытки, пауза ~2с). → путь (str) | None (после ретраев — реально нигде нет)."""
+    for i in range(retries + 1):
+        p = _resolve_claude_once()
+        if p:
+            return p
+        if i < retries:
+            log.warning("SUGGEST: claude CLI не найден (проход %s/%s) — транзиент? повтор через %sс",
+                        i + 1, retries + 1, retry_sleep)
+            time.sleep(retry_sleep)
     return None
 
 
@@ -980,6 +996,18 @@ async def post_draft(client, draft: str, client_ref: str):
     return mid
 
 
+async def post_mod_note(client, text: str):
+    """Служебная заметка в группу «Модерация» (НЕ клиенту!). Конец слепоты: любой сбой генерации
+    виден сразу в группе, без раскопок лога. Есть MOD_GROUP_ID → в группу, иначе в лог. Не падает."""
+    try:
+        if MOD_GROUP_ID is not None:
+            await client.send_message(MOD_GROUP_ID, text)
+        else:
+            log.warning(f"SUGGEST[note→log] {text}")
+    except Exception as e:
+        log.warning(f"SUGGEST: post_mod_note упал: {e} | {text}")
+
+
 async def resolve_mod_group(client):
     """Если MOD_GROUP_ID пуст и задано MOD_GROUP_NAME — найти группу по title через
     iter_dialogs и подставить её id. Возвращает id или None. Не падает: не нашли →
@@ -1070,10 +1098,17 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
     faq = faq if faq is not None else load_faq()
     # Двухфазная цена: даты есть → пробуем Календарь (pricing.quote), иначе/None → фолбэк.
     price_note = build_pricing_note(extract_booking_hints(transcript))
-    draft = generate_draft(transcript, lang, faq, is_first_contact=first,
-                           pricing_note=price_note, call_llm=call_llm)
-    if not draft:
+    try:
+        draft = generate_draft(transcript, lang, faq, is_first_contact=first,
+                               pricing_note=price_note, call_llm=call_llm)
+    except Exception as e:   # сбой генератора (напр. claude CLI не найден / API-ошибка) — НЕ молчим
+        reason = " ".join(str(e).split())[:200] or type(e).__name__
+        log.warning(f"SUGGEST: сбой генерации для {client_ref}: {reason}")
+        await post_mod_note(client, f"⚠️ Черновик НЕ сгенерирован для {client_ref}: {reason}")
+        return None
+    if not draft:            # пустой вывод LLM — раньше молчали, теперь видно в группе (конец слепоты)
         log.warning(f"SUGGEST: пустой черновик для {client_ref} — пропускаю.")
+        await post_mod_note(client, f"⚠️ Черновик НЕ сгенерирован для {client_ref}: пустой вывод LLM")
         return None
 
     rec = {
