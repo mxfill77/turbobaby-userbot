@@ -617,5 +617,154 @@ class TestSelfUpdate(Base):
         self.assertFalse(r)                                   # рубильник → никакой эстафеты
 
 
+class TestAutoUpdateBots(Base):
+    """Авто-обновление userbot/moderbot после дев-задач (убираем ручное «обнови userbot»).
+    Всё внешнее (git-дифф/гейт/рестарт) инъектируется — реальные процессы НЕ трогаем."""
+
+    def _upd(self, text="тз: правка", head_before="old", changed=None, gate=(True, "ok"),
+             restart=(True, [4321], "PID поднят, лог свежий"), commit="abc1234"):
+        return o.maybe_update_bots(
+            5, text, head_before,
+            changed_fn=lambda hb: (changed if changed is not None else ["userbot_listen.py"]),
+            gate_fn=lambda mods: gate,
+            restart_fn=lambda kind: restart,
+            head_fn=lambda: commit)
+
+    def test_is_dev_task(self):
+        self.assertTrue(o._is_dev_task("тз: сделай X"))
+        self.assertTrue(o._is_dev_task("  ТЗ добавь фичу"))
+        self.assertFalse(o._is_dev_task("обнови userbot"))
+        self.assertFalse(o._is_dev_task(""))
+
+    def test_non_dev_task_no_update(self):
+        self.assertEqual(self._upd(text="просто вопрос"), "")
+
+    def test_no_new_commits_no_update(self):
+        self.assertEqual(self._upd(changed=[]), "")   # head не двигался / нет диффа
+
+    def test_non_runtime_change_no_update(self):
+        self.assertEqual(self._upd(changed=["README.md", "bot.py"]), "")
+
+    def test_userbot_change_restart_ok(self):
+        note = self._upd(changed=["userbot_listen.py"])
+        self.assertIn("userbot обновлён до abc1234", note)
+        self.assertIn("PID 4321", note)
+
+    def test_gate_red_no_restart(self):
+        called = {"n": 0}
+        note = o.maybe_update_bots(
+            5, "тз: правка", "old",
+            changed_fn=lambda hb: ["suggest.py"],
+            gate_fn=lambda mods: (False, "FAILED (failures=1)"),
+            restart_fn=lambda kind: called.__setitem__("n", called["n"] + 1) or (True, [1], "x"),
+            head_fn=lambda: "abc1234")
+        self.assertIn("рестарт отложен: тесты красные", note)
+        self.assertEqual(called["n"], 0)              # красный гейт → рестарт не звали
+
+    def test_shared_suggest_restarts_both(self):
+        kinds = []
+        note = o.maybe_update_bots(
+            5, "тз: правка suggest", "old",
+            changed_fn=lambda hb: ["suggest.py"],     # общий рантайм → и userbot, и модербот
+            gate_fn=lambda mods: (True, "ok"),
+            restart_fn=lambda kind: kinds.append(kind) or (True, [7], "ok"),
+            head_fn=lambda: "c0ffee1")
+        self.assertEqual(sorted(kinds), ["moderbot", "userbot"])
+        self.assertIn("userbot обновлён", note)
+        self.assertIn("модербот обновлён", note)
+
+    def test_moderbot_only_change(self):
+        kinds = []
+        o.maybe_update_bots(
+            5, "тз: модерация", "old",
+            changed_fn=lambda hb: ["moderation_core.py"],
+            gate_fn=lambda mods: (True, "ok"),
+            restart_fn=lambda kind: kinds.append(kind) or (True, [9], "ok"),
+            head_fn=lambda: "d00d")
+        self.assertEqual(kinds, ["moderbot"])         # userbot не трогаем — его рантайм не менялся
+
+    def test_moderbot_reply_mode_note(self):
+        note = o.maybe_update_bots(
+            5, "тз: модерация", "old",
+            changed_fn=lambda hb: ["moderation_bot.py"],
+            gate_fn=lambda mods: (True, "ok"),
+            restart_fn=lambda kind: (True, [], "модербот в reply-режиме (нет MODERBOT_TOKEN) — рестарт не требуется"),
+            head_fn=lambda: "e1e1")
+        self.assertIn("reply-режиме", note)
+        self.assertNotIn("PID", note)                 # PID нет — не выдумываем
+
+    def test_restart_failed_note(self):
+        note = self._upd(changed=["pricing.py"], restart=(False, [], "процесс не поднялся"))
+        self.assertIn("рестарт НЕ удался", note)
+
+    def test_stop_flag_respected(self):
+        o._stopped = lambda: True
+        self.assertEqual(self._upd(), "")             # рубильник → не обновляем
+
+    def test_classify_changed(self):
+        ub, mb = o._classify_changed(["userbot_listen.py", "suggest.py", "moderation_core.py",
+                                      "pricing.py", "README.md"])
+        self.assertIn("userbot_listen.py", ub)
+        self.assertIn("suggest.py", ub)               # suggest — общий, в обеих группах
+        self.assertIn("suggest.py", mb)
+        self.assertIn("moderation_core.py", mb)
+        self.assertNotIn("moderation_core.py", ub)
+        self.assertNotIn("README.md", ub + mb)
+
+    def test_affected_test_modules(self):
+        mods = o._affected_test_modules(["suggest.py", "pricing.py", "userbot_listen.py",
+                                         "test_moderation.py"])
+        self.assertIn("test_suggest", mods)           # есть на диске
+        self.assertIn("test_pricing", mods)
+        self.assertIn("test_moderation", mods)        # сам тест-файл
+        self.assertNotIn("test_userbot_listen", mods) # такого файла нет → не включаем
+
+    def test_gate_no_tests_passes(self):
+        ok, msg = o._gate_test_modules([])            # нет затронутых тестов → зелено (config-правка)
+        self.assertTrue(ok)
+
+
+class TestAutoUpdateInProcessNew(Base):
+    """Интеграция: done дев-задачи → суффикс авто-обновления попадает в результат/карточку."""
+
+    def setUp(self):
+        super().setUp()
+        self._patch = (o._git_out, o._changed_files_since, o._gate_test_modules,
+                       o._restart_via_pc_agent, o._head_commit)
+        o._git_out = lambda args: "headsha_before"
+        o._changed_files_since = lambda hb: ["userbot_listen.py"]
+        o._gate_test_modules = lambda mods: (True, "ok")
+        o._restart_via_pc_agent = lambda kind: (True, [5150], "PID поднят, лог свежий")
+        o._head_commit = lambda: "beef123"
+
+    def tearDown(self):
+        (o._git_out, o._changed_files_since, o._gate_test_modules,
+         o._restart_via_pc_agent, o._head_commit) = self._patch
+        super().tearDown()
+
+    def test_dev_task_done_appends_update_note(self):
+        tid = self.fb.add(status="new", task_text="тз: правка userbot")
+        self._claude(0, "сделал\nRESULT: закоммитил и запушил")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+        self.assertIn("userbot обновлён до beef123, PID 5150", self.fb.tasks[tid]["result"])
+
+    def test_non_dev_task_no_note(self):
+        tid = self.fb.add(status="new", task_text="почини баг в логах")
+        self._claude(0, "сделал\nRESULT: готово")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+        self.assertNotIn("обновлён до", self.fb.tasks[tid]["result"])   # не дев-задача → без рестарта
+
+    def test_failed_task_no_update(self):
+        called = {"n": 0}
+        o._restart_via_pc_agent = lambda kind: called.__setitem__("n", called["n"] + 1) or (True, [1], "x")
+        tid = self.fb.add(status="new", task_text="тз: правка")
+        self._claude(0, "болтал без итога")        # нет RESULT: → failed
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertEqual(called["n"], 0)           # провал задачи → бот не трогаем
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

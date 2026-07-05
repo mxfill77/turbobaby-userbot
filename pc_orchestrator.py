@@ -416,6 +416,9 @@ def process_new():
         return
     log.info("CLAIM id=%s in_progress", tid)
     _cowork(f"взял задачу #{tid} (in_progress)")
+    # HEAD до задачи (только для дев-задач): диффом head_before..HEAD увидим новые коммиты задачи,
+    # чтобы понять, надо ли перезапускать userbot/moderbot (авто-обновление вместо ручной команды).
+    head_before = _git_out(["rev-parse", "HEAD"]) if _is_dev_task(text) else None
     status, result = run_task(tid, text)
     if status == "needs_approval":
         bc.set_needs_approval(tid, result)
@@ -423,6 +426,8 @@ def process_new():
         _cowork(f"задача #{tid} → needs_approval (красное, жду «да»)")
         _notify(_human("needs_approval", tid, result))
     else:
+        if status == "done":   # задача успешна → применить свежий код к боту(ам), если рантайм менялся
+            result = (result + maybe_update_bots(tid, text, head_before))[:RESULT_MAX]
         bc.complete_task(tid, status, result)
         log.info("COMPLETE id=%s status=%s", tid, status)
         # полный текст RESULT (done) / причины failed → штаб читает итог из cowork_log без скринов
@@ -580,6 +585,162 @@ def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=Non
     log.info("self-update: %s→%s — гейт пройден, новый процесс запущен, передаю управление", RUNNING_COMMIT, new_commit)
     _cowork(f"self-update: {RUNNING_COMMIT}→{new_commit} (гейт пройден, управляемый рестарт демона)")
     return True
+
+
+# ------------------- авто-обновление userbot/moderbot после дев-задач ----------
+# Убираем ручное «обнови userbot» из темы 205: после done дев-задачи («тз:…»), если она
+# создала НОВЫЕ коммиты, затронувшие рантайм-файлы бота → гейт (unittest затронутых тестов)
+# → зелено → рестарт бота ТОЙ ЖЕ механикой pc_agent (CIM-поиск PID + taskkill + venv-spawn,
+# PID-контроль) → верификация (PID поднялся + лог свежий) → строка в карточку/cowork.
+# Гейт красный → НЕ рестартим (код запушен, применится позже). Стоп-флаг уважаем.
+# suggest.py/pricing.py импортят ОБА бота → их правка рестартит и userbot, и moderbot.
+
+_USERBOT_PREFIXES = ("userbot", "suggest", "pricing")            # userbot_listen → suggest → pricing
+_MODERBOT_PREFIXES = ("moderation", "moderbot", "suggest", "pricing")  # moderation_bot → suggest/pricing
+_RE_DEV_TASK = re.compile(r"^\s*тз\b", re.I)   # дев-задача: текст начинается с «тз:/тз …»
+
+
+def _is_dev_task(text):
+    """Дев-задача («тз:…») — только после таких обновляем боты (обычные задачи не трогают рантайм)."""
+    return bool(_RE_DEV_TASK.match(str(text or "")))
+
+
+def _changed_files_since(head_before):
+    """Файлы, изменённые НОВЫМИ коммитами задачи (head_before..HEAD). → список путей.
+    Нет head_before / git молчит / нет новых коммитов → [] (обновлять нечего)."""
+    if not head_before:
+        return []
+    head_now = _git_out(["rev-parse", "HEAD"])
+    if not head_now or head_now == head_before:
+        return []
+    out = _git_out(["diff", "--name-only", f"{head_before}..{head_now}"])
+    if not out:
+        return []
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+def _classify_changed(paths):
+    """Разложить изменённые файлы по цели рестарта. → (userbot_files, moderbot_files).
+    Файл может попасть в обе группы (suggest/pricing — общий рантайм)."""
+    ub, mb = [], []
+    for p in paths:
+        name = os.path.basename(p).lower()
+        if name.startswith(_USERBOT_PREFIXES):
+            ub.append(p)
+        if name.startswith(_MODERBOT_PREFIXES):
+            mb.append(p)
+    return ub, mb
+
+
+def _affected_test_modules(paths):
+    """Тест-модули для изменённых .py: сам test_*.py и test_<stem> при наличии на диске. → отсортированный список."""
+    mods = set()
+    for p in paths:
+        base = os.path.basename(p)
+        if not base.endswith(".py"):
+            continue
+        stem = base[:-3]
+        if stem.startswith("test_"):
+            mods.add(stem)
+            continue
+        cand = "test_" + stem
+        if os.path.isfile(os.path.join(REPO, cand + ".py")):
+            mods.add(cand)
+    return sorted(mods)
+
+
+def _gate_test_modules(mods):
+    """Гейт обновления бота: unittest затронутых тест-модулей новым кодом. → (ok, msg).
+    Нет затронутых тестов → (True, '…') — рестарт без гейта (config-правка; код уже прошёл тесты в задаче)."""
+    if not mods:
+        return True, "нет затронутых тестов — рестарт без гейта"
+    try:
+        p = subprocess.run([VENV_PY, "-m", "unittest", *mods], cwd=REPO,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=600)
+        return p.returncode == 0, _tail((p.stderr or "") + (p.stdout or ""), 400)
+    except Exception as e:
+        return False, f"unittest-гейт не запустился: {e}"
+
+
+def _log_size(path):
+    try:
+        return os.path.getsize(str(path))
+    except Exception:
+        return -1
+
+
+def _restart_via_pc_agent(kind, settle=0.5, wait_cycles=20):
+    """Рестарт бота ТОЙ ЖЕ механикой pc_agent: стоп (CIM-поиск PID + taskkill) → дождаться
+    чистоты → старт через venv-python → PID-контроль. kind ∈ 'userbot'|'moderbot'.
+    → (ok, pids, detail). Реальные процессы — в тестах функция мокается целиком."""
+    try:
+        import pc_agent   # lazy: не тянем telegram в импорт оркестратора
+    except Exception as e:
+        return False, [], f"не смог импортировать механику pc_agent: {e}"
+    if kind == "userbot":
+        proc, finder, logfile = pc_agent.UserbotProcess(), pc_agent._find_userbot_pids, pc_agent.USERBOT_LOG
+    else:
+        if not os.getenv("MODERBOT_TOKEN", "").strip():
+            # модербот без токена не поднимается (reply-режим userbot) — рестарт не требуется,
+            # новый код применится сам, когда/если модербот запустят с токеном.
+            return True, [], "модербот в reply-режиме (нет MODERBOT_TOKEN) — рестарт не требуется"
+        proc, finder, logfile = pc_agent.ModerbotProcess(), pc_agent._find_moderbot_pids, os.path.join(REPO, "moderation_bot.log")
+    try:
+        proc.stop()
+        for _ in range(wait_cycles):        # ждём смерти старых экземпляров (не поднимаем поверх живого)
+            if not finder():
+                break
+            time.sleep(settle)
+        size_before = _log_size(logfile)
+        start_msg = proc.start()
+        pids = finder()
+        if not pids:
+            return False, [], f"процесс не поднялся: {start_msg}"
+        fresh = _log_size(logfile) > size_before   # свежая строка лога = файл вырос после старта
+        return True, pids, ("PID поднят, лог свежий" if fresh else f"PID поднят, лог без новых строк ({start_msg})")
+    except Exception as e:
+        return False, [], f"ошибка рестарта: {e}"
+
+
+def maybe_update_bots(tid, text, head_before, changed_fn=None, gate_fn=None,
+                      restart_fn=None, is_dev_fn=None, head_fn=None):
+    """После done дев-задачи применить свежий код к боту(ам). → строка-суффикс для карточки/cowork
+    ('' если обновлять нечего). Уважает стоп-флаг. Всё внешнее инъектируется для тестов."""
+    if _stopped():
+        return ""
+    if not (is_dev_fn or _is_dev_task)(text):
+        return ""
+    changed = (changed_fn or _changed_files_since)(head_before)
+    if not changed:
+        return ""
+    ub_files, mb_files = _classify_changed(changed)
+    if not (ub_files or mb_files):
+        return ""
+    commit = (head_fn or _head_commit)()
+    notes = []
+    for kind, label, files in (("userbot", "userbot", ub_files), ("moderbot", "модербот", mb_files)):
+        if not files:
+            continue
+        mods = _affected_test_modules(files)
+        ok, gmsg = (gate_fn or _gate_test_modules)(mods)
+        if not ok:
+            log.error("авто-обновление %s: гейт КРАСНЫЙ (%s) — рестарт отложен", kind, gmsg)
+            notes.append(f"{label}: код запушен, рестарт отложен: тесты красные ({_tail(gmsg, 200)})")
+            _notify(f"⚠️ Оркестратор: {label} НЕ перезапущен — тесты красные (код запушен, применится после фикса)")
+            continue
+        rok, pids, detail = (restart_fn or _restart_via_pc_agent)(kind)
+        if rok and pids:
+            log.info("авто-обновление %s: обновлён до %s, PID %s", kind, commit, pids)
+            notes.append(f"{label} обновлён до {commit}, PID {', '.join(map(str, pids))}")
+        elif rok:                               # рестарт не требовался (напр. модербот без токена)
+            log.info("авто-обновление %s: %s", kind, detail)
+            notes.append(f"{label}: {detail}")
+        else:
+            log.error("авто-обновление %s: рестарт НЕ УДАЛСЯ — %s", kind, detail)
+            notes.append(f"{label}: код запушен, рестарт НЕ удался — {_tail(detail, 200)}")
+            _notify(f"⚠️ Оркестратор: {label} — рестарт не удался после обновления: {_tail(detail, 200)}")
+    return (" | авто-обновление: " + " ; ".join(notes)) if notes else ""
 
 
 def main():
