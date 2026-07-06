@@ -337,11 +337,34 @@ def _now_iso() -> str:
 
 
 def detect_lang(text: str) -> str:
-    """Язык клиента по тексту: есть кириллица → ru, иначе en."""
+    """Язык по одному тексту (примитив): есть кириллица → ru, иначе en.
+    ВНИМАНИЕ: не использовать для выбора языка ответа на диалог — латинское НАЗВАНИЕ модели
+    («Adv 350») ложно даёт en. Для диалога — detect_lang_from_client (по ВСЕМ репликам клиента)."""
     for ch in text or "":
         if "а" <= ch.lower() <= "я" or ch.lower() == "ё":
             return "ru"
     return "en"
+
+
+_LATIN_WORD_RE = re.compile(r"[a-z]{2,}")
+
+
+def detect_lang_from_client(transcript: str) -> str:
+    """Язык ответа = преобладающий язык ВСЕХ реплик КЛИЕНТА в диалоге (не одной последней).
+    Правила:
+      • хоть немного кириллицы у клиента где угодно → ru (стабильно, без прыжков RU↔EN);
+      • латинские НАЗВАНИЯ моделей (NMAX/ADV/CBR/XMAX/Forza/Vulcan/Ninja/XADV/MT/…), цифры и
+        даты за признак EN НЕ считаем — их вырезаем перед проверкой;
+      • осмысленные латинские слова (2+ буквы, не только модель+число) → en;
+      • содержательного текста нет (только модель+числа) → ru (RU-first магазин, дефолт).
+    Инвариант: «Adv 350» в русском диалоге → остаёмся RU (латиница модели EN не триггерит)."""
+    joined = " ".join(_client_messages(transcript))   # реплики клиента, уже lowercased
+    if re.search(r"[а-яё]", joined):
+        return "ru"
+    stripped = joined
+    for tok in _MODEL_TOKENS:                          # убрать латинские названия моделей
+        stripped = stripped.replace(tok, " ")
+    return "en" if _LATIN_WORD_RE.search(stripped) else "ru"
 
 
 def parse_approval(reply_text: str):
@@ -396,6 +419,25 @@ def first_contact_from(msgs, me_id: int, hours=None, now=None) -> bool:
         if getattr(m, "sender_id", None) == me_id and d is not None:
             return False  # мы писали в окне → это продолжение диалога
     return True
+
+
+_GREETING_RE = re.compile(
+    r"^(здравствуй\w*|привет\w*|добр(?:ый|ое|ой)\s+(?:день|утро|вечер|ночи)|"
+    r"hello|hi|hey|good\s+(?:morning|afternoon|evening|day)|welcome|greetings)\b",
+    re.IGNORECASE)
+
+
+def greeting_already_sent(transcript: str) -> bool:
+    """Уже уходило НАШЕ (менеджера) приветствие в этом диалоге? (автоприветствие ИЛИ прошлый
+    наш ответ). Сканируем строки [менеджер]: — если хоть одна НАЧИНАЕТСЯ с приветствия →
+    приветствие уже состоялось, генератор не должен здороваться повторно (один раз на диалог)."""
+    for ln in (transcript or "").split("\n"):
+        if not ln.startswith("[менеджер]:"):
+            continue
+        body = ln[len("[менеджер]:"):].strip().lstrip("!.,:;-—–()«\"' \t")
+        if _GREETING_RE.match(body):
+            return True
+    return False
 
 
 async def read_transcript(client, entity, me_id: int, limit: int = MAX_MESSAGES) -> str:
@@ -1390,13 +1432,17 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
     client_ref = f"@{sender.username}" if getattr(sender, "username", None) else f"id{sender.id}"
     msgs = await _fetch_messages(client, sender)
     transcript = transcript_from(msgs, me_id)
-    first = first_contact_from(msgs, me_id)   # первый контакт → приветствие в черновике
+    # Приветствие ОДИН РАЗ на диалог: первый контакт по окну И приветствие ещё не уходило
+    # (учитываем автоприветствие / прошлый наш ответ из транскрипта).
+    first = first_contact_from(msgs, me_id) and not greeting_already_sent(transcript)
     last_client_line = ""
     for ln in reversed(transcript.split("\n")):
         if ln.startswith("[клиент]:"):
             last_client_line = ln[len("[клиент]:"):].strip()
             break
-    lang = detect_lang(last_client_line or transcript)
+    # Язык — по ВСЕМУ клиенту, не по последней реплике: латинское название модели («Adv 350»)
+    # в русском диалоге НЕ должно переключать ответ на EN.
+    lang = detect_lang_from_client(transcript)
     faq = faq if faq is not None else load_faq()
     # Двухфазная цена: даты есть → пробуем Календарь (pricing.quote), иначе/None → фолбэк.
     price_note = build_pricing_note(extract_booking_hints(transcript))

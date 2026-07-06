@@ -115,6 +115,39 @@ class TestPureLogic(unittest.TestCase):
         self.assertEqual(suggest.detect_lang("Hello, how much?"), "en")
         self.assertEqual(suggest.detect_lang("650K per day"), "en")
 
+    def test_detect_lang_from_client_whole_dialog(self):
+        # язык по ВСЕМ репликам клиента, латинское имя модели EN не триггерит
+        ru = ("[менеджер]: Здравствуйте!\n[клиент]: Какие байки есть?\n"
+              "[клиент]: NMAX с 10 июля\n[клиент]: Adv 350")
+        self.assertEqual(suggest.detect_lang_from_client(ru), "ru")   # последняя латиница → всё равно RU
+        # латинские названия моделей, но текст кириллицей → RU
+        mix = "[клиент]: хочу adv 350 или nmax 155 на месяц"
+        self.assertEqual(suggest.detect_lang_from_client(mix), "ru")
+        # чистый английский → EN
+        en = "[клиент]: hello, what bikes do you have for rent?"
+        self.assertEqual(suggest.detect_lang_from_client(en), "en")
+        # только модель+число (без осмысленных слов) → дефолт RU (RU-first магазин)
+        self.assertEqual(suggest.detect_lang_from_client("[клиент]: Adv 350"), "ru")
+        self.assertEqual(suggest.detect_lang_from_client("[клиент]: NMAX 155"), "ru")
+
+    def test_detect_lang_stable_between_drafts(self):
+        # два черновика одного клиента (растущий транскрипт) — язык не прыгает RU↔EN
+        t1 = "[клиент]: Какие байки есть в аренду?"
+        t2 = t1 + "\n[менеджер]: ...\n[клиент]: Adv 350"
+        self.assertEqual(suggest.detect_lang_from_client(t1),
+                         suggest.detect_lang_from_client(t2))
+        self.assertEqual(suggest.detect_lang_from_client(t2), "ru")
+
+    def test_greeting_already_sent(self):
+        self.assertTrue(suggest.greeting_already_sent(
+            "[менеджер]: Здравствуйте! Что арендуете?\n[клиент]: NMAX"))
+        self.assertTrue(suggest.greeting_already_sent("[менеджер]: Hello! How can I help?"))
+        # наше сообщение без приветствия → приветствия ещё не было
+        self.assertFalse(suggest.greeting_already_sent(
+            "[менеджер]: NMAX стоит 449฿/день\n[клиент]: ок"))
+        # приветствие у КЛИЕНТА не считается нашим
+        self.assertFalse(suggest.greeting_already_sent("[клиент]: Здравствуйте!"))
+
     def test_parse_approval(self):
         self.assertEqual(suggest.parse_approval("+"), ("approve", None))
         self.assertEqual(suggest.parse_approval("да"), ("approve", None))
@@ -387,9 +420,11 @@ class TestFullFlow(unittest.TestCase):
         self.assertIsNone(res)
 
     def test_greeting_reflected_on_first_contact(self):
-        # мок-LLM отражает, попросили ли в промпте приветствие; история без дат → первый контакт
+        # мок-LLM отражает, попросили ли в промпте приветствие; ЧИСТЫЙ первый контакт:
+        # в истории ТОЛЬКО реплика клиента (нашего приветствия ещё не было).
         def refllm(system, _user):
             return "GREETED" if "ПЕРВЫЙ ответ" in system else "CONT"
+        self.client.history = [FakeHistMsg(999, "Привет, сколько стоит NMAX на неделю?")]
         mid = asyncio.run(
             suggest.on_client_message(self.client, self.sender, self.me,
                                       call_llm=refllm, faq="FAQ")
@@ -397,6 +432,42 @@ class TestFullFlow(unittest.TestCase):
         rec = suggest.pending.get(mid)
         self.assertTrue(rec["first_contact"])
         self.assertEqual(rec["draft"], "GREETED")
+
+    def test_no_regreet_when_greeting_in_history(self):
+        # приветствие уже уходило (наше «Здравствуйте» в истории) → повторно НЕ здороваемся.
+        def refllm(system, _user):
+            return "GREETED" if "ПЕРВЫЙ ответ" in system else "CONT"
+        self.client.history = [
+            FakeHistMsg(self.me, "Здравствуйте! Что хотите арендовать?"),
+            FakeHistMsg(999, "А сколько стоит NMAX на неделю?"),
+        ]
+        mid = asyncio.run(
+            suggest.on_client_message(self.client, self.sender, self.me,
+                                      call_llm=refllm, faq="FAQ")
+        )
+        rec = suggest.pending.get(mid)
+        self.assertFalse(rec["first_contact"])
+        self.assertEqual(rec["draft"], "CONT")
+
+    def test_lang_stable_latin_model_name_stays_ru(self):
+        # русский диалог + последняя реплика «Adv 350» (латиница) → черновик остаётся RU, НЕ EN.
+        seen = {}
+        def caplang(system, _user):
+            seen["ru"] = "русском" in system
+            return "ЧЕРНОВИК"
+        self.client.history = [
+            FakeHistMsg(self.me, "Здравствуйте! Что хотите арендовать?"),
+            FakeHistMsg(999, "Какие байки есть в аренду?"),
+            FakeHistMsg(999, "NMAX с 10 июля на месяц"),
+            FakeHistMsg(999, "Adv 350"),
+        ]
+        mid = asyncio.run(
+            suggest.on_client_message(self.client, self.sender, self.me,
+                                      call_llm=caplang, faq="FAQ")
+        )
+        rec = suggest.pending.get(mid)
+        self.assertEqual(rec["lang"], "ru")
+        self.assertTrue(seen["ru"])
 
 
 class TestFaqOrder(unittest.TestCase):
