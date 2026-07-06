@@ -147,10 +147,16 @@ def process_callback(draft, action, username, test_mode, candidate=None):
 
 def _default_regen(draft, faq, directive):
     """СТРАТЕГИЯ: перегенерация черновика С НУЛЯ по директиве поверх исходного контекста из IPC
-    (транскрипт+кап-цена сохранены в записи черновика). Инъектируется в тестах."""
+    (транскрипт+кап-цена сохранены в записи черновика). Модели — только реального парка (Лист1).
+    Инъектируется в тестах."""
+    try:
+        allow = suggest.park_allowlist()
+    except Exception:
+        allow = None
     return suggest.regenerate_draft(
         draft.get("transcript") or "", draft.get("lang") or "ru", faq,
-        bool(draft.get("first_contact")), draft.get("pricing_note") or "", directive)
+        bool(draft.get("first_contact")), draft.get("pricing_note") or "", directive,
+        park_models=allow)
 
 
 def process_reply(draft, reply_text, username, faq, test_mode, call_llm=None, regen=None):

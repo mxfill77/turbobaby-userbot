@@ -781,5 +781,82 @@ class TestCliLlm(unittest.TestCase):
                 self.assertEqual(suggest._resolve_claude(retry_sleep=0), exe)
 
 
+class TestParkModelsAllowlist(unittest.TestCase):
+    """Модели клиенту — ТОЛЬКО реальный парк (Лист1). allowlist из fleet()/park_list.md + fail-safe."""
+
+    def setUp(self):
+        self._pf = suggest.PARK_LIST_FILE
+        suggest.pricing._FLEET_CACHE["data"] = None      # сброс кэша fleet между тестами
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+
+    def tearDown(self):
+        suggest.PARK_LIST_FILE = self._pf
+        suggest.pricing._FLEET_CACHE["data"] = None
+
+    def _fleet(self, names):
+        return lambda params: {"ok": True, "data": {"bikes": [{"name": n} for n in names]}}
+
+    def test_allowlist_from_fleet_park_only(self):
+        # реальный парк (имена как в Байки.xlsx Лист1) → только эти модели; «нет в парке» отсеяны
+        names = ["NMAX 155CC BLACK PHUKET 4255", "XMAX 300CC GREY PHUKET 4246",
+                 "ADV 350CC BLACK PHUKET 5849", "CB 300CC R 9011", "CBR 650R PHUKET 4505",
+                 "MT-03 300СС BLUE PHUKET 5068", "CLICK 125CC PHUKET 5580"]
+        allow = suggest.park_allowlist(getter=self._fleet(names))
+        for m in ("NMAX 155", "XMAX 300", "ADV 350", "CB 300R", "CBR 650R", "MT-03"):
+            self.assertIn(m, allow)
+        for m in ("PCX 150", "PCX 160", "ADV 150", "ADV 160", "REBEL 300", "XSR 900", "R7", "CB 650R"):
+            self.assertNotIn(m, allow)          # ← «нет в парке» НЕ попадают
+
+    def test_prompt_hard_restricts_to_park(self):
+        sysp = suggest.make_system_prompt("FAQ", "ru", park_models=["NMAX 155", "XMAX 300", "ADV 350"])
+        self.assertIn("ПАРК (СТРОГО)", sysp)
+        self.assertIn("NMAX 155", sysp)
+        self.assertIn("ADV 350", sysp)
+        self.assertIn("НЕ предлагай", sysp)
+        self.assertIn("PCX150", sysp)           # названы как «нет в парке — не предлагать»
+        # без allowlist — блока НЕТ (fail-safe)
+        self.assertNotIn("ПАРК (СТРОГО)", suggest.make_system_prompt("FAQ", "ru"))
+
+    def test_failsafe_no_source_no_restriction(self):
+        # fleet пуст + park_list.md отсутствует → None → бот отвечает как раньше (не онемел)
+        suggest.PARK_LIST_FILE = os.path.join(tempfile.gettempdir(), "no_such_park_zzz.md")
+        empty = lambda params: {"ok": False}
+        self.assertIsNone(suggest.park_allowlist(getter=empty))
+        self.assertNotIn("ПАРК (СТРОГО)", suggest.make_system_prompt("FAQ", "ru", park_models=None))
+        d = suggest.generate_draft("[клиент]: NMAX?", "ru", "FAQ", call_llm=_fake_llm, park_models=None)
+        self.assertTrue(d)                       # ← отвечает, ограничения нет
+
+    def test_fallback_to_park_list_md_when_fleet_empty(self):
+        with tempfile.TemporaryDirectory() as dd:
+            pf = os.path.join(dd, "park_list.md")
+            with open(pf, "w", encoding="utf-8") as f:
+                f.write("| № | Название | Номер | Статус |\n|---|---|---|---|\n"
+                        "| 1 | NMAX 155CC BLACK 4255 | 4255 | ДОМА |\n"
+                        "| 2 | ADV 350CC GREY 798 | 798 | ДОМА |\n")
+            suggest.PARK_LIST_FILE = pf
+            allow = suggest.park_allowlist(getter=lambda p: {"ok": False})   # fleet пуст → файл
+            self.assertIn("NMAX 155", allow)
+            self.assertIn("ADV 350", allow)
+            self.assertNotIn("PCX 150", allow)
+
+    def test_price_cap_and_critfacts_intact_with_park(self):
+        sysp = suggest.make_system_prompt("FAQ", "ru", pricing_note="ЦЕНА из Календаря: 500฿/день",
+                                          park_models=["NMAX 155"])
+        self.assertIn("ЦЕНА из Календаря: 500฿/день", sysp)   # кап-цена цела
+        self.assertIn("CLICK 125", sysp)                       # критфакт цел
+        self.assertIn("ЦЕНОВАЯ ПОЛИТИКА", sysp)                # ценовая политика цела
+        self.assertIn("ПАРК (СТРОГО)", sysp)
+
+    def test_generate_draft_threads_park_into_prompt(self):
+        cap = {}
+        def capture(system, user):
+            cap["s"] = system
+            return "ok"
+        suggest.generate_draft("[клиент]: что есть?", "ru", "FAQ", call_llm=capture,
+                               park_models=["NMAX 155", "XMAX 300"])
+        self.assertIn("ПАРК (СТРОГО)", cap["s"])
+        self.assertIn("XMAX 300", cap["s"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -136,6 +136,68 @@ HONDA CLICK 125 — НЕ сдаём. На запрос Click предлагат�
 Наличие байка на даты НЕ подтверждать без проверки — уточнить даты и сказать, что проверим."""
 
 
+# ------------------------------- парк (Лист1) --------------------------------
+# Клиенту показываем ТОЛЬКО модели РЕАЛЬНОГО парка (Байки.xlsx Лист1). Источник правды:
+# живой pricing.fleet() (Bridge action=fleet, отражает Лист1), фолбэк — локальный park_list.md.
+PARK_LIST_FILE = os.path.join(BASE_DIR, "manager-bot", "docs", "park_list.md")
+
+# Универсум известных моделей: (как показывать клиенту, ключ для матчинга в имени байка парка).
+# В allowlist попадают ТОЛЬКО те, что реально в парке; вне парка (PCX/ADV150-160/Rebel/XSR900/R7/
+# CB650R) — отсеиваются автоматически (их нет среди имён байков).
+KNOWN_MODELS = [
+    ("NMAX 155", "nmax155"), ("XMAX 300", "xmax300"), ("ADV 350", "adv350"),
+    ("ADV 160", "adv160"), ("ADV 150", "adv150"), ("PCX 160", "pcx160"), ("PCX 150", "pcx150"),
+    ("FORZA 300", "forza300"), ("XADV 750", "xadv750"),
+    ("XSR 155", "xsr155"), ("XSR 900", "xsr900"),
+    ("CBR 650R", "cbr650r"), ("CB 650R", "cb650r"), ("CB 300R", "cb300r"),
+    ("REBEL 300", "rebel300"), ("MT-03", "mt03"), ("NINJA 400", "ninja400"),
+    ("VULCAN 650S", "vulcan650s"), ("R7", "r7"), ("CLICK 125", "click125"),
+]
+
+
+def _bike_key(name):
+    """Имя байка → alnum-ключ (снимаем CC/СС и не-alnum) для матчинга с моделью."""
+    s = re.sub(r"(?i)[сc][сc]", "", str(name or ""))   # убрать CC и кириллич. СС
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _park_bike_names(getter=None):
+    """Имена байков реального парка. Приоритет — живой Bridge pricing.fleet() (отражает Лист1),
+    фолбэк — локальный park_list.md (снимок Байки.xlsx Лист1). → list[str] (или [] если нет источника)."""
+    try:
+        bikes = pricing.fleet(_get=getter)
+        names = [b.get("name") for b in (bikes or []) if isinstance(b, dict) and b.get("name")]
+        if names:
+            return names
+    except Exception as e:
+        log.info(f"park: fleet упал ({type(e).__name__}) — пробую park_list.md")
+    try:
+        names = []
+        with open(PARK_LIST_FILE, encoding="utf-8") as f:
+            for ln in f:
+                if not ln.strip().startswith("|"):
+                    continue
+                cols = [c.strip() for c in ln.strip().strip("|").split("|")]
+                if len(cols) >= 2 and cols[1] and cols[1].lower() not in ("название", "name") \
+                        and not set(cols[1]) <= set("- "):   # пропускаем шапку и разделитель |---|
+                    names.append(cols[1])
+        return names
+    except Exception as e:
+        log.info(f"park: park_list.md не прочитан ({type(e).__name__})")
+    return []
+
+
+def park_allowlist(getter=None):
+    """Модели РЕАЛЬНОГО парка (Лист1) для показа клиенту. → list[str] отображаемых имён ИЛИ None.
+    None = источник недоступен/пуст → НЕ ограничивать (FAIL-SAFE: бот отвечает как раньше, не онемел)."""
+    names = _park_bike_names(getter=getter)
+    if not names:
+        return None
+    keys = [_bike_key(n) for n in names]
+    allow = [disp for disp, key in KNOWN_MODELS if any(key in k for k in keys)]
+    return allow or None   # пусто (ни одного совпадения) → тоже fail-safe, не ограничиваем на мусоре
+
+
 # ------------------------------- рантайм-стоп --------------------------------
 
 _disabled = False  # флип при флуде — авто-стоп до перезапуска/сброса
@@ -712,7 +774,7 @@ def build_pricing_note(hints: dict) -> str:
 
 
 def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pricing_note: str = "",
-                       directive: str = "") -> str:
+                       directive: str = "", park_models=None) -> str:
     lang_name = "русском" if lang == "ru" else "английском"
     if is_first_contact:
         greet = (
@@ -753,13 +815,24 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
             + "\nВАЖНО: эта директива задаёт ЧТО и КАК предлагать, но НЕ отменяет ценовую политику "
             "и критичные факты ниже — цену клиенту только из блока ЦЕНА, критфакты дословно."
         )
+    # ПАРК (Лист1): если allowlist реально получен — ЖЁСТКО ограничиваем модели, что бот называет
+    # клиенту. Пусто/None (источник недоступен) → блока нет (FAIL-SAFE, ограничения не применяем).
+    park_block = ""
+    if park_models:
+        park_block = (
+            "\n\n★ ПАРК (СТРОГО): предлагай, перечисляй и упоминай клиенту ТОЛЬКО модели реального "
+            "парка: " + ", ".join(park_models) + ". Любые ДРУГИЕ модели клиенту НЕ предлагай и НЕ "
+            "называй — даже если они есть в справочнике/FAQ ниже или как «замена» (напр. PCX150/160, "
+            "ADV150/160, Rebel300, XSR900, R7, CB650R — их НЕТ в парке). Этот список парка приоритетнее "
+            "любых списков моделей из справочника."
+        )
     return (
         "Ты — менеджер проката мотобайков TurboBaby (Пхукет). По переписке с клиентом "
         f"составь ОДИН короткий, вежливый ответ на {lang_name} языке (язык клиента). "
         "Отвечай только на то, что ещё НЕ отвечено менеджером в диалоге; не повторяй уже "
         "сказанное; держи контекст сделки. Не выдумывай данные и наличие. Верни ТОЛЬКО "
         "текст ответа клиенту — без пояснений, без кавычек, без префиксов."
-        + directive_block + greet + policy + scenario + price_block + "\n\n"
+        + directive_block + park_block + greet + policy + scenario + price_block + "\n\n"
         + CRITICAL_FACTS
         + "\n\nFAQ и эталонные формулировки:\n" + (faq or "(FAQ недоступен — опирайся на критичные факты выше)")
     )
@@ -915,21 +988,24 @@ def _cli_llm(system: str, user: str) -> str:
 
 
 def generate_draft(transcript: str, lang: str, faq: str,
-                   is_first_contact: bool = False, pricing_note: str = "", call_llm=None) -> str:
+                   is_first_contact: bool = False, pricing_note: str = "", call_llm=None,
+                   park_models=None) -> str:
     """Сгенерировать черновик. call_llm(system, user)->str инъектируется в тестах; иначе по флагу
-    SUGGEST_LLM_VIA_CLI — claude CLI (подписка Max) либо _default_llm (платный API-ключ)."""
+    SUGGEST_LLM_VIA_CLI — claude CLI (подписка Max) либо _default_llm (платный API-ключ).
+    park_models — allowlist моделей реального парка (Лист1); None → без ограничения (fail-safe)."""
     call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
-    system = make_system_prompt(faq, lang, is_first_contact, pricing_note)
+    system = make_system_prompt(faq, lang, is_first_contact, pricing_note, park_models=park_models)
     return call_llm(system, transcript).strip()
 
 
 def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: bool,
-                     pricing_note: str, directive: str, call_llm=None) -> str:
+                     pricing_note: str, directive: str, call_llm=None, park_models=None) -> str:
     """СТРАТЕГИЯ-перегенерация черновика С НУЛЯ: реплика модератора идёт как ДИРЕКТИВА ВЕРХНЕГО
     УРОВНЯ поверх ИСХОДНОГО клиентского контекста (транскрипт+FAQ+кап-цена), а НЕ как патч к старому
-    тексту. Инварианты (ценовая политика/критфакты) сохраняются — они в make_system_prompt."""
+    тексту. Инварианты (ценовая политика/критфакты/парк) сохраняются — они в make_system_prompt."""
     call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
-    system = make_system_prompt(faq, lang, is_first_contact, pricing_note, directive=directive)
+    system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
+                                directive=directive, park_models=park_models)
     return call_llm(system, transcript).strip()
 
 
@@ -1178,9 +1254,14 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
     faq = faq if faq is not None else load_faq()
     # Двухфазная цена: даты есть → пробуем Календарь (pricing.quote), иначе/None → фолбэк.
     price_note = build_pricing_note(extract_booking_hints(transcript))
+    try:                                   # allowlist парка (Лист1); недоступен → None (fail-safe)
+        allow = park_allowlist()
+    except Exception as e:
+        allow = None
+        log.info(f"SUGGEST: park_allowlist упал ({type(e).__name__}) — без ограничения моделей")
     try:
         draft = generate_draft(transcript, lang, faq, is_first_contact=first,
-                               pricing_note=price_note, call_llm=call_llm)
+                               pricing_note=price_note, call_llm=call_llm, park_models=allow)
     except Exception as e:   # сбой генератора (напр. claude CLI не найден / API-ошибка) — НЕ молчим
         reason = " ".join(str(e).split())[:200] or type(e).__name__
         log.warning(f"SUGGEST: сбой генерации для {client_ref}: {reason}")
