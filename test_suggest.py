@@ -911,5 +911,53 @@ class TestPlaybook(unittest.TestCase):
         self.assertIn("ПРАВИЛО-Z", cap["s"])
 
 
+class TestPlaybookAppend(unittest.TestCase):
+    """Фаза 2: дозапись выученного правила в playbook.md (append + дата + дедуп + fail-safe)."""
+
+    SEED = ("# Playbook\n\n## Стиль общения\n- коротко\n\n## Выученные правила\n"
+            "- Предлагать клиенту только модели реального парка; Honda Click 125 не предлагать.\n")
+
+    def setUp(self):
+        self._pf = suggest.PLAYBOOK_FILE
+        self._tmp = tempfile.TemporaryDirectory()
+        self._file = os.path.join(self._tmp.name, "playbook.md")
+        with open(self._file, "w", encoding="utf-8") as f:
+            f.write(self.SEED)
+        suggest.PLAYBOOK_FILE = self._file
+
+    def tearDown(self):
+        suggest.PLAYBOOK_FILE = self._pf
+        self._tmp.cleanup()
+
+    def _read(self):
+        with open(self._file, encoding="utf-8") as f:
+            return f.read()
+
+    def test_append_adds_rule_with_date_in_learned_section(self):
+        import datetime as _dt
+        st = suggest.append_playbook_rule("Всегда уточняй район доставки заранее", now=_dt.date(2026, 7, 6))
+        self.assertEqual(st, "added")
+        txt = self._read()
+        self.assertIn("- (2026-07-06) Всегда уточняй район доставки заранее", txt)   # с датой
+        self.assertIn("только модели реального парка", txt)                          # append, не перезапись
+        self.assertLess(txt.index("## Выученные правила"), txt.index("Всегда уточняй район"))
+
+    def test_append_dedup_near_identical(self):
+        st = suggest.append_playbook_rule(
+            "предлагать клиенту только модели реального парка honda click 125 не предлагать")
+        self.assertEqual(st, "duplicate")
+        self.assertEqual(self._read().count("реального парка"), 1)   # дубль НЕ дописан
+
+    def test_append_failsafe_on_missing_target(self):
+        suggest.PLAYBOOK_FILE = os.path.join(self._tmp.name, "nope", "playbook.md")  # каталога нет
+        self.assertEqual(suggest.append_playbook_rule("правило"), "error")
+
+    def test_learned_rule_then_shows_in_prompt(self):
+        suggest.append_playbook_rule("Всегда предлагай шлем в подарок на неделю аренды")
+        sysp = suggest.make_system_prompt("FAQ", "ru", playbook=suggest.load_playbook())
+        self.assertIn("шлем в подарок", sysp)
+        self.assertIn("КНИГА ПРАВИЛ", sysp)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

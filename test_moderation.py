@@ -242,6 +242,92 @@ class TestDecisions(unittest.TestCase):
         d = moderation_core.process_reply(self.DRAFT, "+", "stranger", "FAQ", test_mode=False)
         self.assertEqual(d["decision"], "denied")
 
+    def test_confirm_carries_directive(self):
+        # confirm-карточка несёт формулировку модератора → её сохранит IPC для «Запомнить»
+        d = moderation_core.process_reply(self.DRAFT, "будь мягче", "d", "FAQ", test_mode=False,
+                                          call_llm=_llm("cosmetic", final="Мягко"))
+        self.assertEqual(d["decision"], "confirm")
+        self.assertEqual(d["directive"], "будь мягче")
+
+
+class TestRememberRule(unittest.TestCase):
+    """Фаза 2: кнопка «📌 Запомнить как правило» — approver-гейт, дистилляция, append, дедуп, fail-safe."""
+
+    def setUp(self):
+        self._wl = suggest.APPROVER_USERNAMES
+        suggest.APPROVER_USERNAMES = set()
+
+    def tearDown(self):
+        suggest.APPROVER_USERNAMES = self._wl
+
+    def _distill(self, text):
+        return lambda directive, call_llm=None: text
+
+    def test_distill_rule_uses_llm(self):
+        r = moderation_core.distill_rule("дожимай на ADV", call_llm=lambda s, u: "  Дожимай на ADV350  ")
+        self.assertEqual(r, "Дожимай на ADV350")     # LLM-выход схлопнут/обрезан
+
+    def test_remember_approver_appends(self):
+        got = {}
+        def appender(rule, now=None):
+            got["rule"] = rule
+            return "added"
+        d = moderation_core.remember_rule({"directive": "жёстче про депозит"}, "danya",
+                                          distill=self._distill("Жёстче про депозит"), appender=appender)
+        self.assertEqual(d["decision"], "remembered")
+        self.assertEqual(got["rule"], "Жёстче про депозит")           # дистиллят дописан
+        self.assertIn("Записано в правила", d["card"])
+
+    def test_remember_nonapprover_denied(self):
+        suggest.APPROVER_USERNAMES = {"danya"}
+        d = moderation_core.remember_rule({"directive": "x"}, "stranger",
+                                          distill=self._distill("R"), appender=lambda *a, **k: "added")
+        self.assertEqual(d["decision"], "denied")
+        self.assertIn("⛔", d["card"])
+
+    def test_remember_duplicate_not_appended(self):
+        d = moderation_core.remember_rule({"directive": "x"}, "danya",
+                                          distill=self._distill("R"), appender=lambda *a, **k: "duplicate")
+        self.assertEqual(d["decision"], "duplicate")
+        self.assertIn("уже есть", d["card"].lower())
+
+    def test_remember_append_error_is_failsafe(self):
+        def boom(rule, now=None):
+            raise IOError("disk full")
+        d = moderation_core.remember_rule({"directive": "x"}, "danya",
+                                          distill=self._distill("R"), appender=boom)
+        self.assertEqual(d["decision"], "not_saved")                  # правка НЕ заблокирована
+        self.assertIn("разово", d["card"].lower())
+
+    def test_remember_no_directive(self):
+        d = moderation_core.remember_rule({"directive": ""}, "danya",
+                                          distill=self._distill("R"), appender=lambda *a, **k: "added")
+        self.assertEqual(d["decision"], "no_directive")
+
+    def test_remembered_rule_flows_into_next_prompt(self):
+        # end-to-end: реальный appender → playbook → подмешивание в НОВЫЙ черновик
+        with tempfile.TemporaryDirectory() as dd:
+            pf = os.path.join(dd, "playbook.md")
+            with open(pf, "w", encoding="utf-8") as f:
+                f.write("# PB\n\n## Выученные правила\n- старое правило\n")
+            save = suggest.PLAYBOOK_FILE
+            suggest.PLAYBOOK_FILE = pf
+            try:
+                d = moderation_core.remember_rule(
+                    {"directive": "всегда предлагай доставку сразу"}, "danya",
+                    distill=self._distill("Всегда предлагай доставку сразу"))    # реальный appender
+                self.assertEqual(d["decision"], "remembered")
+                sysp = suggest.make_system_prompt("FAQ", "ru", playbook=suggest.load_playbook())
+                self.assertIn("Всегда предлагай доставку сразу", sysp)           # выученное правило в промпте
+            finally:
+                suggest.PLAYBOOK_FILE = save
+
+    def test_confirm_card_has_remember_button(self):
+        import moderation_bot
+        kb = moderation_bot._kb(moderation_bot._kb_confirm, 7)
+        flat = [(b.text, b.callback_data) for row in kb.inline_keyboard for b in row]
+        self.assertTrue(any("Запомнить" in t and c == "m:7:remember" for t, c in flat))
+
 
 class TestDegradationAndExecutor(unittest.TestCase):
     def setUp(self):

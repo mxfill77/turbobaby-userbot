@@ -215,6 +215,76 @@ def load_playbook():
         return ""
 
 
+_LEARNED_HEADER = "## Выученные правила"
+
+
+def _norm_rule(s):
+    """Нормализация правила для дедупа: буквы/цифры/пробелы, нижний регистр, схлопнутые пробелы."""
+    return " ".join(re.sub(r"[^0-9a-zа-яё ]+", " ", str(s or "").lower()).split())
+
+
+def _rules_similar(a, b):
+    """Почти-идентичны? (для дедупа): Jaccard слов ≥ 0.6 ИЛИ одно содержится в другом."""
+    na, nb = _norm_rule(a), _norm_rule(b)
+    if not na or not nb:
+        return False
+    if na in nb or nb in na:
+        return True
+    ta, tb = set(na.split()), set(nb.split())
+    return (len(ta & tb) / len(ta | tb)) >= 0.6 if (ta and tb) else False
+
+
+def _playbook_learned_rules(text):
+    """Существующие правила из секции «Выученные правила» (без даты-префикса) — для дедупа."""
+    out, inside = [], False
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if s.startswith("## "):
+            inside = s.lower().startswith(_LEARNED_HEADER.lower())
+            continue
+        if inside and s.startswith("-"):
+            r = re.sub(r"^\(\d{4}-\d{2}-\d{2}\)\s*", "", s.lstrip("-").strip())
+            if r:
+                out.append(r)
+    return out
+
+
+def append_playbook_rule(rule, now=None):
+    """Дописать ВЫУЧЕННОЕ правило в playbook.md (секция «Выученные правила», APPEND с датой, не
+    перезапись). Дедуп почти-идентичных. → 'added' | 'duplicate' | 'error'.
+    FAIL-SAFE: файл недоступен/ошибка записи → 'error' (вызывающий не блокирует отправку черновика)."""
+    rule = " ".join(str(rule or "").split()).strip()
+    if not rule:
+        return "error"
+    try:
+        with open(PLAYBOOK_FILE, encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        return "error"
+    if any(_rules_similar(rule, e) for e in _playbook_learned_rules(text)):
+        return "duplicate"
+    date = (now or datetime.date.today()).isoformat()
+    bullet = f"- ({date}) {rule}"
+    lines = text.splitlines()
+    start = next((i for i, ln in enumerate(lines)
+                  if ln.strip().lower().startswith(_LEARNED_HEADER.lower())), None)
+    if start is None:                       # секции нет — создаём в конце
+        new_text = text.rstrip() + "\n\n" + _LEARNED_HEADER + "\n" + bullet + "\n"
+    else:
+        end = next((j for j in range(start + 1, len(lines)) if lines[j].strip().startswith("## ")),
+                   len(lines))
+        while end - 1 > start and not lines[end - 1].strip():   # вставляем после последнего правила
+            end -= 1
+        lines.insert(end, bullet)
+        new_text = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+    try:
+        with open(PLAYBOOK_FILE, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        return "added"
+    except Exception:
+        return "error"
+
+
 # ------------------------------- рантайм-стоп --------------------------------
 
 _disabled = False  # флип при флуде — авто-стоп до перезапуска/сброса

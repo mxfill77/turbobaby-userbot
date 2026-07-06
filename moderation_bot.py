@@ -71,6 +71,7 @@ def _kb_confirm():
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Отправить", callback_data="m:{id}:send")],
+        [InlineKeyboardButton("📌 Запомнить как правило", callback_data="m:{id}:remember")],
         [InlineKeyboardButton("✏️ Ещё правка", callback_data="m:{id}:more"),
          InlineKeyboardButton("❌", callback_data="m:{id}:no")],
     ])
@@ -135,8 +136,12 @@ async def _apply(context, chat_id, draft, dec, edit_msg_id=None):
         return
     if d == "confirm":
         m = await context.bot.send_message(chat_id, dec["card"], reply_markup=_kb(_kb_confirm, draft["id"]))
-        moderation_ipc.set_candidate(draft["id"], dec["final_text"])
+        # directive сохраняем в IPC — по нему кнопка «Запомнить как правило» соберёт правило
+        moderation_ipc.set_candidate(draft["id"], dec["final_text"], directive=dec.get("directive"))
         moderation_ipc.mark_posted(draft["id"], m.message_id)  # новая карточка = точка reply
+        return
+    if d in ("remembered", "duplicate", "no_directive", "not_saved"):
+        await context.bot.send_message(chat_id, dec["card"], reply_to_message_id=draft.get("card_msg_id"))
         return
     if d == "rejected":
         moderation_ipc.set_decision(draft["id"], "rejected", decided_by=by)
@@ -163,8 +168,11 @@ async def on_callback(update, context):
     if draft is None:
         return
     username = (q.from_user.username if q.from_user else None)
-    dec = moderation_core.process_callback(draft, action, username, suggest.SUGGEST_TEST_MODE,
-                                           candidate=draft.get("final_text"))
+    if action == "remember":     # 📌 захват правки в playbook (Фаза 2) — approver-гейт внутри
+        dec = moderation_core.remember_rule(draft, username)
+    else:
+        dec = moderation_core.process_callback(draft, action, username, suggest.SUGGEST_TEST_MODE,
+                                               candidate=draft.get("final_text"))
     dec["_by"] = f"@{username}" if username else "?"
     await _apply(context, q.message.chat_id, draft, dec)
 

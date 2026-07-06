@@ -190,5 +190,54 @@ def process_reply(draft, reply_text, username, faq, test_mode, call_llm=None, re
         final = res["final_text"]
 
     # ЛЮБОЙ уровень правки → повторное подтверждение (стратегия/диктовка/косметика = обязательный ✅).
+    # directive = формулировка модератора: сохранится в IPC для кнопки «Запомнить как правило».
     return {"decision": "confirm", "final_text": final, "answer": None, "level": intent,
+            "directive": reply_text,
             "card": f"[{_LEVEL_RU.get(intent, intent)}] Проверьте перед отправкой:\n\n{final}"}
+
+
+# ------------------------- захват правки в playbook (Фаза 2) ------------------
+
+def _distill_system():
+    return (
+        "Ты ведёшь КНИГУ ПРАВИЛ менеджера мотопроката TurboBaby. Дана РЕПЛИКА-ДИРЕКТИВА менеджера "
+        "(как отвечать клиентам). Сформулируй её как ОДНО короткое устойчивое ПРАВИЛО для бота: "
+        "1-2 строки, повелительно, по-русски, без воды и без кавычек. Верни ТОЛЬКО текст правила."
+    )
+
+
+def distill_rule(directive, call_llm=None):
+    """Дистилляция формулировки модератора в короткое правило (тот же LLM-маршрут, что классификатор
+    — claude CLI/Max). → строка правила (или '' при пустом/ошибке)."""
+    call_llm = call_llm or _default_llm
+    out = call_llm(_distill_system(), (directive or "").strip())
+    return " ".join((out or "").split()).strip()
+
+
+def remember_rule(draft, username, call_llm=None, distill=None, appender=None, now=None):
+    """Кнопка «📌 Запомнить как правило»: approver-гейт → дистилляция ДИРЕКТИВЫ модератора → APPEND
+    в playbook. Возвращает decision-dict (без I/O карточки — постит moderation_bot). distill/appender
+    инъектируются в тестах. FAIL-SAFE: сбой записи → 'not_saved' (правка уже применена к черновику)."""
+    if not suggest.is_approver(username):
+        return {"decision": "denied", "rule": None, "card": "⛔ Нет прав на запись правил"}
+    directive = (draft.get("directive") or "").strip()
+    if not directive:
+        return {"decision": "no_directive", "rule": None,
+                "card": "⚠️ Нет директивы для правила (нажмите после своей правки-реплики)"}
+    distill = distill or distill_rule
+    try:
+        rule = distill(directive, call_llm=call_llm)
+    except Exception:
+        rule = ""
+    rule = " ".join((rule or "").split()).strip() or directive   # фолбэк: сама формулировка модератора
+    appender = appender or suggest.append_playbook_rule
+    try:
+        status = appender(rule, now=now)
+    except Exception:
+        status = "error"
+    if status == "added":
+        return {"decision": "remembered", "rule": rule, "card": f"📌 Записано в правила: {rule}"}
+    if status == "duplicate":
+        return {"decision": "duplicate", "rule": rule, "card": "📌 Уже есть похожее правило"}
+    return {"decision": "not_saved", "rule": rule,
+            "card": "⚠️ Правило НЕ сохранилось — правка применена разово (к текущему черновику)"}

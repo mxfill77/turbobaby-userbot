@@ -94,11 +94,12 @@ def init_db(path=None):
                 draft TEXT, first_contact INTEGER,
                 status TEXT, card_msg_id INTEGER, final_text TEXT,
                 decided_by TEXT, reason TEXT, created_ts TEXT, updated_ts TEXT,
-                transcript TEXT, pricing_note TEXT
+                transcript TEXT, pricing_note TEXT, directive TEXT
             )"""
         )
-        # МИГРАЦИЯ для старых БД: transcript/pricing_note нужны для СТРАТЕГИЯ-перегенерации.
-        for col in ("transcript TEXT", "pricing_note TEXT"):
+        # МИГРАЦИЯ для старых БД: transcript/pricing_note — СТРАТЕГИЯ-перегенерация; directive —
+        # текст правки модератора (для кнопки «Запомнить как правило» → playbook).
+        for col in ("transcript TEXT", "pricing_note TEXT", "directive TEXT"):
             try:
                 c.execute("ALTER TABLE drafts ADD COLUMN " + col)
             except Exception:
@@ -156,11 +157,13 @@ def mark_posted(draft_id, card_msg_id, path=None):
                   (card_msg_id, _now_iso(), draft_id))
 
 
-def set_candidate(draft_id, final_text, path=None):
-    """Правка применена, ждём подтверждения (status=pending_confirm)."""
+def set_candidate(draft_id, final_text, directive=None, path=None):
+    """Правка применена, ждём подтверждения (status=pending_confirm). directive — текст правки
+    модератора (сохраняем для кнопки «Запомнить как правило»)."""
     with _conn(path) as c:
-        c.execute("UPDATE drafts SET status='pending_confirm', final_text=?, updated_ts=? WHERE id=?",
-                  (final_text, _now_iso(), draft_id))
+        c.execute("UPDATE drafts SET status='pending_confirm', final_text=?, directive=?, "
+                  "updated_ts=? WHERE id=?",
+                  (final_text, directive, _now_iso(), draft_id))
 
 
 def set_decision(draft_id, status, final_text=None, decided_by=None, reason=None, path=None):
