@@ -858,5 +858,58 @@ class TestParkModelsAllowlist(unittest.TestCase):
         self.assertIn("XMAX 300", cap["s"])
 
 
+class TestPlaybook(unittest.TestCase):
+    """Растущая книга правил (playbook): загрузка + подмешивание НИЖЕ кап-цены/критфактов + fail-safe."""
+
+    def setUp(self):
+        self._pf = suggest.PLAYBOOK_FILE
+
+    def tearDown(self):
+        suggest.PLAYBOOK_FILE = self._pf
+
+    def test_seeded_playbook_has_park_rule(self):
+        # боевой файл засеян первым правилом (модели только парка; Click не предлагать)
+        txt = suggest.load_playbook()
+        self.assertTrue(txt)
+        self.assertIn("реального парка", txt)
+        self.assertIn("Click 125", txt)
+
+    def test_load_playbook_missing_returns_empty(self):
+        suggest.PLAYBOOK_FILE = os.path.join(tempfile.gettempdir(), "no_such_playbook_zzz.md")
+        self.assertEqual(suggest.load_playbook(), "")     # нет файла → '' (fail-safe)
+
+    def test_playbook_block_below_critfacts_and_above_faq(self):
+        sysp = suggest.make_system_prompt("ТЕЛО-FAQ", "ru", playbook="ПРАВИЛО-X: говорить мягко")
+        self.assertIn("КНИГА ПРАВИЛ", sysp)
+        self.assertIn("ПРАВИЛО-X", sysp)
+        # СТРОГО НИЖЕ критфактов, ВЫШЕ общего FAQ:
+        self.assertLess(sysp.index("КРИТИЧНЫЕ ФАКТЫ"), sysp.index("КНИГА ПРАВИЛ"))
+        self.assertLess(sysp.index("КНИГА ПРАВИЛ"), sysp.index("FAQ и эталонные"))
+
+    def test_playbook_empty_skipped_generation_ok(self):
+        # пусто → блока нет, генерация цела (fail-safe)
+        self.assertNotIn("КНИГА ПРАВИЛ", suggest.make_system_prompt("FAQ", "ru", playbook=""))
+        d = suggest.generate_draft("[клиент]: NMAX?", "ru", "FAQ", call_llm=_fake_llm, playbook="")
+        self.assertTrue(d)
+
+    def test_playbook_does_not_override_price_and_critfacts(self):
+        sysp = suggest.make_system_prompt("FAQ", "ru", pricing_note="ЦЕНА из Календаря: 500฿/день",
+                                          playbook="ПРАВИЛО-Y")
+        self.assertIn("ЦЕНА из Календаря: 500฿/день", sysp)   # кап-цена цела
+        self.assertIn("CLICK 125", sysp)                       # критфакт цел
+        self.assertIn("ЦЕНОВАЯ ПОЛИТИКА", sysp)                # ценовая политика цела
+        self.assertIn("НЕ отменяет", sysp)                     # playbook прямо помечен как неприоритетный
+
+    def test_generate_draft_threads_playbook_into_prompt(self):
+        cap = {}
+        def capture(system, user):
+            cap["s"] = system
+            return "ok"
+        suggest.generate_draft("[клиент]: привет", "ru", "FAQ", call_llm=capture,
+                               playbook="ПРАВИЛО-Z: без давления")
+        self.assertIn("КНИГА ПРАВИЛ", cap["s"])
+        self.assertIn("ПРАВИЛО-Z", cap["s"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

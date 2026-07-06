@@ -153,10 +153,14 @@ def _default_regen(draft, faq, directive):
         allow = suggest.park_allowlist()
     except Exception:
         allow = None
+    try:
+        pb = suggest.load_playbook()
+    except Exception:
+        pb = ""
     return suggest.regenerate_draft(
         draft.get("transcript") or "", draft.get("lang") or "ru", faq,
         bool(draft.get("first_contact")), draft.get("pricing_note") or "", directive,
-        park_models=allow)
+        park_models=allow, playbook=pb)
 
 
 def process_reply(draft, reply_text, username, faq, test_mode, call_llm=None, regen=None):

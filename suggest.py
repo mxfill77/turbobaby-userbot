@@ -198,6 +198,23 @@ def park_allowlist(getter=None):
     return allow or None   # пусто (ни одного совпадения) → тоже fail-safe, не ограничиваем на мусоре
 
 
+# ------------------------------- playbook (книга правил) ---------------------
+# Растущая книга правил (стиль/факты/запреты/выученные правки) — локальный файл. Подмешивается в
+# промпт СТРОГО НИЖЕ кап-цены и CRITICAL_FACTS (playbook их НЕ отменяет). Пополняется из одобренных
+# правок модератора. Bridge не трогаем — источник локальный.
+PLAYBOOK_FILE = os.path.join(BASE_DIR, "manager-bot", "docs", "playbook.md")
+
+
+def load_playbook():
+    """Текст книги правил из PLAYBOOK_FILE. Нет файла/пусто/ошибка чтения → '' (FAIL-SAFE:
+    генерация не ломается, блок в промпте просто не появляется)."""
+    try:
+        with open(PLAYBOOK_FILE, encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
 # ------------------------------- рантайм-стоп --------------------------------
 
 _disabled = False  # флип при флуде — авто-стоп до перезапуска/сброса
@@ -774,7 +791,7 @@ def build_pricing_note(hints: dict) -> str:
 
 
 def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pricing_note: str = "",
-                       directive: str = "", park_models=None) -> str:
+                       directive: str = "", park_models=None, playbook: str = "") -> str:
     lang_name = "русском" if lang == "ru" else "английском"
     if is_first_contact:
         greet = (
@@ -826,6 +843,14 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
             "ADV150/160, Rebel300, XSR900, R7, CB650R — их НЕТ в парке). Этот список парка приоритетнее "
             "любых списков моделей из справочника."
         )
+    # КНИГА ПРАВИЛ (playbook): СТРОГО НИЖЕ кап-цены и CRITICAL_FACTS — соблюдать, но НЕ отменяет их.
+    # Пусто → блока нет (FAIL-SAFE, генерация цела).
+    playbook_block = ""
+    if (playbook or "").strip():
+        playbook_block = (
+            "\n\nКНИГА ПРАВИЛ (стиль/факты/запреты/выученные правки — СОБЛЮДАЙ; но она НЕ отменяет "
+            "ценовую политику и критичные факты ВЫШЕ — те приоритетнее):\n" + playbook.strip()
+        )
     return (
         "Ты — менеджер проката мотобайков TurboBaby (Пхукет). По переписке с клиентом "
         f"составь ОДИН короткий, вежливый ответ на {lang_name} языке (язык клиента). "
@@ -833,7 +858,7 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         "сказанное; держи контекст сделки. Не выдумывай данные и наличие. Верни ТОЛЬКО "
         "текст ответа клиенту — без пояснений, без кавычек, без префиксов."
         + directive_block + park_block + greet + policy + scenario + price_block + "\n\n"
-        + CRITICAL_FACTS
+        + CRITICAL_FACTS + playbook_block
         + "\n\nFAQ и эталонные формулировки:\n" + (faq or "(FAQ недоступен — опирайся на критичные факты выше)")
     )
 
@@ -989,23 +1014,26 @@ def _cli_llm(system: str, user: str) -> str:
 
 def generate_draft(transcript: str, lang: str, faq: str,
                    is_first_contact: bool = False, pricing_note: str = "", call_llm=None,
-                   park_models=None) -> str:
+                   park_models=None, playbook: str = "") -> str:
     """Сгенерировать черновик. call_llm(system, user)->str инъектируется в тестах; иначе по флагу
     SUGGEST_LLM_VIA_CLI — claude CLI (подписка Max) либо _default_llm (платный API-ключ).
-    park_models — allowlist моделей реального парка (Лист1); None → без ограничения (fail-safe)."""
+    park_models — allowlist моделей реального парка (Лист1); None → без ограничения (fail-safe).
+    playbook — книга правил (ниже кап-цены/критфактов); '' → без блока (fail-safe)."""
     call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
-    system = make_system_prompt(faq, lang, is_first_contact, pricing_note, park_models=park_models)
+    system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
+                                park_models=park_models, playbook=playbook)
     return call_llm(system, transcript).strip()
 
 
 def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: bool,
-                     pricing_note: str, directive: str, call_llm=None, park_models=None) -> str:
+                     pricing_note: str, directive: str, call_llm=None, park_models=None,
+                     playbook: str = "") -> str:
     """СТРАТЕГИЯ-перегенерация черновика С НУЛЯ: реплика модератора идёт как ДИРЕКТИВА ВЕРХНЕГО
     УРОВНЯ поверх ИСХОДНОГО клиентского контекста (транскрипт+FAQ+кап-цена), а НЕ как патч к старому
-    тексту. Инварианты (ценовая политика/критфакты/парк) сохраняются — они в make_system_prompt."""
+    тексту. Инварианты (ценовая политика/критфакты/парк/playbook) сохраняются — они в make_system_prompt."""
     call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
-                                directive=directive, park_models=park_models)
+                                directive=directive, park_models=park_models, playbook=playbook)
     return call_llm(system, transcript).strip()
 
 
@@ -1259,9 +1287,13 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
     except Exception as e:
         allow = None
         log.info(f"SUGGEST: park_allowlist упал ({type(e).__name__}) — без ограничения моделей")
+    try:                                   # книга правил; недоступна → '' (fail-safe)
+        pb = load_playbook()
+    except Exception:
+        pb = ""
     try:
         draft = generate_draft(transcript, lang, faq, is_first_contact=first,
-                               pricing_note=price_note, call_llm=call_llm, park_models=allow)
+                               pricing_note=price_note, call_llm=call_llm, park_models=allow, playbook=pb)
     except Exception as e:   # сбой генератора (напр. claude CLI не найден / API-ошибка) — НЕ молчим
         reason = " ".join(str(e).split())[:200] or type(e).__name__
         log.warning(f"SUGGEST: сбой генерации для {client_ref}: {reason}")
