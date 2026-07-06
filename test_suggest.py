@@ -169,6 +169,65 @@ class TestPureLogic(unittest.TestCase):
         d = suggest.generate_draft("[клиент]: привет", "ru", "FAQ", call_llm=_fake_llm)
         self.assertEqual(d, "DRAFT ответа клиенту")
 
+    def test_prompt_forbids_leaking_stage_context(self):
+        # Класс-фикс: промпт явно запрещает начинать ответ с описания ситуации/этапа и
+        # помечает блок этапов как ВНУТРЕННИЙ (клиенту не показывать).
+        sysp = suggest.make_system_prompt("FAQ", "ru")
+        self.assertIn("ВНУТРЕННИЙ КОНТЕКСТ", sysp)          # блок этапов помечен как внутренний
+        self.assertIn("НЕ начинай ответ с описания ситуации", sysp)
+        self.assertIn("сейчас Этап N", sysp)                # запрет пометки стадии в тексте
+        # инварианты целы
+        self.assertIn("CLICK 125", sysp)                    # критфакты
+        self.assertIn("ЦЕНОВАЯ ПОЛИТИКА", sysp)             # ценовая политика
+        self.assertIn("русском", sysp)                      # язык
+
+    def test_strip_service_prefix_removes_stage_note(self):
+        # Точный кейс бага: черновик начинается со служебной строки о стадии сделки.
+        leaked = ("Клиент готов бронировать по датам 7 июля на неделю, менеджер ещё не назвал "
+                  "цену — сейчас Этап 1.\nCBR 650R — 650฿/день, депозит 5000฿, свободен на эти даты.")
+        out = suggest._strip_service_prefix(leaked)
+        # служебные маркеры вычищены
+        self.assertNotIn("Этап", out)
+        self.assertNotIn("Клиент готов бронировать", out)
+        self.assertNotIn("менеджер ещё не назвал", out)
+        # реальный ответ (модель/цена/депозит) на месте
+        self.assertIn("CBR 650R", out)
+        self.assertIn("650฿/день", out)
+        self.assertIn("депозит 5000฿", out)
+
+    def test_strip_service_prefix_same_line(self):
+        # Служебная пометка и ответ в ОДНОЙ строке — режем по концу служебного предложения.
+        out = suggest._strip_service_prefix("Сейчас Этап 1. NMAX 449฿/день, свободен.")
+        self.assertNotIn("Этап", out)
+        self.assertTrue(out.startswith("NMAX 449"))
+
+    def test_strip_service_prefix_leaves_clean_answer(self):
+        # Нормальный ответ (приветствие/цена, без служебных маркеров) НЕ трогаем.
+        clean = "Здравствуйте! NMAX на 7 дней — 449฿/день, депозит 3000฿. Какой район доставки?"
+        self.assertEqual(suggest._strip_service_prefix(clean), clean)
+        # Слово «цену» без служебного контекста тоже не должно триггерить срез.
+        self.assertEqual(suggest._strip_service_prefix("Назову цену по датам."),
+                         "Назову цену по датам.")
+
+    def test_strip_service_prefix_never_empties(self):
+        # Если весь черновик — только служебная строка: пусто НЕ возвращаем (отдаём как есть).
+        only = "Клиент готов бронировать, менеджер ещё не назвал цену — сейчас Этап 1."
+        self.assertEqual(suggest._strip_service_prefix(only), only)
+        self.assertEqual(suggest._strip_service_prefix(""), "")
+
+    def test_generate_draft_scrubs_service_prefix(self):
+        # Сквозь generate_draft: LLM отдал служебный префикс → в черновике его нет, суть цела.
+        def leaky(_s, _u):
+            return ("Клиент готов бронировать — сейчас Этап 1.\n"
+                    "Здравствуйте! CBR 650R — 650฿/день, депозит 5000฿.")
+        d = suggest.generate_draft("[клиент]: CBR 650R на неделю с 7 июля", "ru", "FAQ",
+                                   is_first_contact=True, call_llm=leaky)
+        self.assertNotIn("Этап", d)
+        self.assertNotIn("Клиент готов", d)
+        self.assertTrue(d.startswith("Здравствуйте!"))     # приветствие сохранено
+        self.assertIn("650฿/день", d)                      # цена/депозит целы
+        self.assertIn("депозит 5000฿", d)
+
     def test_directive_in_prompt_preserves_invariants(self):
         # СТРАТЕГИЯ-директива входит в системный промпт ВЕРХНИМ приоритетом, но кап-цена и
         # критфакты (ценовая политика + CRITICAL_FACTS) НЕ ослабляются.
