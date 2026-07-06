@@ -959,5 +959,56 @@ class TestPlaybookAppend(unittest.TestCase):
         self.assertIn("КНИГА ПРАВИЛ", sysp)
 
 
+class TestSalesPressureAndSafety(unittest.TestCase):
+    """Хвост 2 — рычаг SALES_PRESSURE НАД базой; Хвост 1 — жёсткое правило опыт/безопасность."""
+
+    def setUp(self):
+        self._sp = suggest.SALES_PRESSURE
+
+    def tearDown(self):
+        suggest.SALES_PRESSURE = self._sp
+
+    def test_pressure_firm_block_and_cta(self):
+        sysp = suggest.make_system_prompt("FAQ", "ru", pressure="firm")
+        self.assertIn("НАСТОЙЧИВОСТИ", sysp)
+        self.assertIn("FIRM", sysp)
+        self.assertIn("предоплат", sysp.lower())          # явный CTA к предоплате
+
+    def test_pressure_normal_no_block_regression(self):
+        suggest.SALES_PRESSURE = "normal"
+        normal = suggest.make_system_prompt("FAQ", "ru", pressure="normal")
+        default = suggest.make_system_prompt("FAQ", "ru")  # дефолт из глобали (normal)
+        self.assertNotIn("НАСТОЙЧИВОСТИ", normal)          # normal НЕ добавляет блок
+        self.assertEqual(normal, default)                  # регресс: дефолт == явный normal
+
+    def test_pressure_soft_block(self):
+        self.assertIn("SOFT", suggest.make_system_prompt("FAQ", "ru", pressure="soft"))
+
+    def test_pressure_invalid_falls_to_normal(self):
+        self.assertEqual(suggest._pressure_block("garbage"), "")
+        self.assertNotIn("НАСТОЙЧИВОСТИ", suggest.make_system_prompt("FAQ", "ru", pressure="garbage"))
+
+    def test_pressure_default_reads_global(self):
+        suggest.SALES_PRESSURE = "firm"
+        self.assertIn("FIRM", suggest.make_system_prompt("FAQ", "ru"))   # без аргумента → глобаль
+
+    def test_firm_keeps_invariants(self):
+        sysp = suggest.make_system_prompt("FAQ", "ru", pricing_note="ЦЕНА из Календаря: 500฿/день",
+                                          park_models=["NMAX 155"], pressure="firm")
+        self.assertIn("ЦЕНА из Календаря: 500฿/день", sysp)   # кап-цена цела
+        self.assertIn("CLICK 125", sysp)                       # критфакт цел
+        self.assertIn("ЦЕНОВАЯ ПОЛИТИКА", sysp)                # политика цела
+        self.assertIn("★ ПАРК (СТРОГО)", sysp)                 # парк цел
+        self.assertIn("НЕ нарушай", sysp)                      # firm явно защищает инварианты
+
+    def test_experience_safety_rule_always_and_positioned(self):
+        sysp = suggest.make_system_prompt("FAQ", "ru", playbook="ПРАВИЛО-X")
+        self.assertIn("ОПЫТ И БЕЗОПАСНОСТЬ", sysp)             # жёсткое правило A.3 есть всегда
+        self.assertIn("ТОЛЬКО менеджер", sysp)
+        # рядом с критфактами: ПОСЛЕ CRITICAL_FACTS, ВЫШЕ playbook
+        self.assertLess(sysp.index("КРИТИЧНЫЕ ФАКТЫ"), sysp.index("ОПЫТ И БЕЗОПАСНОСТЬ"))
+        self.assertLess(sysp.index("ОПЫТ И БЕЗОПАСНОСТЬ"), sysp.index("КНИГА ПРАВИЛ"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
