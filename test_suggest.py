@@ -9,6 +9,7 @@ Anthropic: оба замоканы. Реальной отправки клиен
 import test_isolation  # noqa: F401 — ПЕРВОЙ строкой: TESTING=1, боевой IPC/токен недоступны
 
 import os
+import json
 import asyncio
 import datetime
 import tempfile
@@ -16,6 +17,18 @@ import unittest
 from unittest import mock
 
 import suggest
+
+
+def _cli_json(result="", main="claude-fable-5", main_in=2766, main_out=31, is_error=False):
+    """Собрать stdout как у claude --output-format json: поле result + modelUsage с реальной головой
+    (main, большой inputTokens) и служебным haiku (крошечный вход). Для тестов _cli_llm/_parse_cli_json."""
+    return json.dumps({
+        "type": "result", "is_error": is_error, "result": result,
+        "modelUsage": {
+            "claude-haiku-4-5-20251001": {"inputTokens": 505, "outputTokens": 13},
+            main: {"inputTokens": main_in, "outputTokens": main_out},
+        },
+    })
 
 
 # ------------------------------- моки Telegram -------------------------------
@@ -737,7 +750,7 @@ class TestCliLlm(unittest.TestCase):
 
         class P:
             returncode = 0
-            stdout = "  Здравствуйте! NMAX свободен.\nRESULT: ок  "
+            stdout = _cli_json(result="  Здравствуйте! NMAX свободен.\nRESULT: ок  ")
             stderr = ""
 
         def fake_run(cmd, **kw):
@@ -746,10 +759,12 @@ class TestCliLlm(unittest.TestCase):
             captured["env"] = kw.get("env")
             captured["timeout"] = kw.get("timeout")
             return P()
-        with mock.patch.object(suggest, "_resolve_claude", return_value=r"C:\claude\claude.exe"), \
+        with mock.patch.object(suggest, "SUGGEST_MODEL", "fable"), \
+             mock.patch.object(suggest, "SUGGEST_MODEL_FALLBACK", "sonnet"), \
+             mock.patch.object(suggest, "_resolve_claude", return_value=r"C:\claude\claude.exe"), \
              mock.patch.object(suggest.subprocess, "run", side_effect=fake_run):
             out = suggest._cli_llm("SYS", "USER")
-        self.assertEqual(out, "Здравствуйте! NMAX свободен.\nRESULT: ок")   # stdout.strip()
+        self.assertEqual(out, "Здравствуйте! NMAX свободен.\nRESULT: ок")   # поле result из JSON, .strip()
         # ЧИСТЫЙ генератор: --allowed-tools '' + нейтральный cwd (НЕ репо) + модель/промпты на месте
         self.assertIn("--allowed-tools", captured["cmd"])
         i = captured["cmd"].index("--allowed-tools")
@@ -757,7 +772,26 @@ class TestCliLlm(unittest.TestCase):
         self.assertIn("--system-prompt", captured["cmd"])
         self.assertIn("SYS", captured["cmd"])
         self.assertIn("USER", captured["cmd"])
+        # кондуктор: основная модель fable + фолбэк sonnet + JSON-выхлоп (одним вызовом CLI)
+        self.assertEqual(captured["cmd"][captured["cmd"].index("--model") + 1], "fable")
+        self.assertEqual(captured["cmd"][captured["cmd"].index("--fallback-model") + 1], "sonnet")
+        self.assertEqual(captured["cmd"][captured["cmd"].index("--output-format") + 1], "json")
         self.assertNotEqual(os.path.normcase(captured["cwd"] or ""), os.path.normcase(suggest.BASE_DIR))
+
+    def test_cli_reports_fallback_model_from_modelusage(self):
+        # кондуктор: основная модель недоступна → CLI сам добил фолбэком; реально отработавшую голову
+        # (sonnet, БОЛЬШОЙ inputTokens) достаём из modelUsage, а не служебный haiku (крошечный вход).
+        text, real = suggest._parse_cli_json(
+            _cli_json(result="OK", main="claude-sonnet-5", main_in=3077, main_out=4))
+        self.assertEqual(text, "OK")
+        self.assertEqual(real, "claude-sonnet-5")   # НЕ haiku, хотя у него output больше (12 > 4)
+
+    def test_cli_parse_is_error_returns_empty(self):
+        text, real = suggest._parse_cli_json(_cli_json(result="что-то", is_error=True))
+        self.assertEqual(text, "")                   # is_error → пустой текст (upstream пропустит)
+
+    def test_cli_parse_broken_json_returns_empty(self):
+        self.assertEqual(suggest._parse_cli_json("не json"), ("", ""))
 
     def test_cli_env_has_no_api_key(self):
         def fake_run(cmd, **kw):
@@ -767,7 +801,7 @@ class TestCliLlm(unittest.TestCase):
 
             class P:
                 returncode = 0
-                stdout = "ok"
+                stdout = _cli_json(result="ok")
                 stderr = ""
             return P()
         with mock.patch.object(suggest, "_resolve_claude", return_value=r"C:\claude\claude.exe"), \
@@ -827,7 +861,7 @@ class TestCliLlm(unittest.TestCase):
         # первая осечка isfile → вторая удача: _cli_llm НЕ падает, зовёт CLI (кейс теста 00:33)
         class P:
             returncode = 0
-            stdout = "Здравствуйте! NMAX свободен."
+            stdout = _cli_json(result="Здравствуйте! NMAX свободен.")
             stderr = ""
         with mock.patch.object(suggest, "_resolve_claude_once", side_effect=[None, r"C:\claude\claude.exe"]), \
              mock.patch.object(suggest.time, "sleep"), \

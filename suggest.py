@@ -95,7 +95,13 @@ LLM_MAX_TOKENS = _int("SUGGEST_MAX_TOKENS", 1000)
 SUGGEST_LLM_VIA_CLI = _flag("SUGGEST_LLM_VIA_CLI")
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude").strip()   # фолбэк-путь (может протухнуть при автообновлении)
 CLI_TIMEOUT = _int("SUGGEST_CLI_TIMEOUT", 60)
-CLI_MODEL = os.getenv("SUGGEST_CLI_MODEL", "sonnet").strip()   # алиас модели для CLI (--model)
+CLI_MODEL = os.getenv("SUGGEST_CLI_MODEL", "sonnet").strip()   # legacy-алиас (совместимость); вытеснен SUGGEST_MODEL
+# Голова suggest: основная модель + кондуктор-фолбэк. Фолбэк исполняет САМ CLI одним вызовом
+# (--fallback-model): если основная недоступна/ошиблась — тем же процессом добивает фолбэком, свой
+# ретрай не городим. Реально отработавшую голову достаём из modelUsage (--output-format json) и логируем.
+# Дефолты разумны и без .env: fable как основная, прежняя sonnet как фолбэк.
+SUGGEST_MODEL = os.getenv("SUGGEST_MODEL", "fable").strip() or "fable"
+SUGGEST_MODEL_FALLBACK = os.getenv("SUGGEST_MODEL_FALLBACK", "sonnet").strip()
 
 # Управляемый УРОВЕНЬ НАПОРА продаж — НАД базовой установкой (не ниже, как playbook). soft|normal|firm;
 # дефолт normal = текущее поведение. firm активнее ведёт к брони/предоплате, но инварианты
@@ -1154,20 +1160,58 @@ def _resolve_claude(retries=1, retry_sleep=2.0):
     return None
 
 
+def _real_model_from_json(data: dict) -> str:
+    """Реально отработавшая ГОЛОВА из modelUsage (--output-format json). CLI под капотом дёргает
+    служебный haiku-помощник (заголовок сессии и т.п.) — у него всегда крошечный фикс-вход (~505 ткн),
+    поэтому реальную голову опознаём по МАКСИМУ inputTokens, а НЕ по outputTokens: при фолбэке основная
+    модель может дать МЕНЬШЕ output, чем служебный haiku (замер: sonnet=4 vs haiku=12) — по output лог
+    соврал бы про модель. Нет modelUsage → ''."""
+    mu = data.get("modelUsage") if isinstance(data, dict) else None
+    if not isinstance(mu, dict) or not mu:
+        return ""
+    try:
+        return max(mu.items(), key=lambda kv: (kv[1] or {}).get("inputTokens", 0))[0]
+    except Exception:
+        return ""
+
+
+def _parse_cli_json(raw: str):
+    """Разобрать --output-format json от claude CLI. → (text, real_model). text — поле result (готовый
+    ответ клиенту), real_model — реально отработавшая голова (см. _real_model_from_json). Битый JSON или
+    is_error → ('', real_model): upstream трактует пустой текст как 'пустой черновик' → пропуск."""
+    try:
+        data = json.loads(raw or "")
+    except Exception:
+        return "", ""
+    if not isinstance(data, dict):
+        return "", ""
+    real = _real_model_from_json(data)
+    if data.get("is_error"):
+        return "", real
+    return (data.get("result") or "").strip(), real
+
+
 def _cli_llm(system: str, user: str) -> str:
     """Генерация через claude CLI по подписке Max (не платный API-ключ → нет 'credit balance too low').
     ЧИСТЫЙ генератор текста, НЕ агент: --allowed-tools '' + нейтральный cwd (НЕ репо) → CLI не читает
     .claude/settings.json+pretool_guard и не дёргает инструменты. ANTHROPIC_API_KEY вычищен из env,
-    иначе CLI пошёл бы по платному ключу. Таймаут/ошибка → '' (upstream: 'пустой черновик' → пропуск)."""
+    иначе CLI пошёл бы по платному ключу. Голова: SUGGEST_MODEL с кондуктором-фолбэком SUGGEST_MODEL_FALLBACK
+    (--fallback-model — САМ CLI одним вызовом добивает фолбэком, свой ретрай не нужен). --output-format json:
+    достаём поле result и реально отработавшую голову (modelUsage) в лог. Таймаут/ошибка → '' (upstream:
+    'пустой черновик' → пропуск)."""
     cbin = _resolve_claude()
     if not cbin:
         raise RuntimeError("claude CLI не найден (PATH/CLAUDE_BIN/AppData) — генерация через CLI невозможна")
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)          # ← ключ НЕ утекает: CLI идёт по подписке Max
     env.pop("OPENAI_API_KEY", None)
+    cmd = [cbin, "-p", user, "--system-prompt", system, "--model", SUGGEST_MODEL,
+           "--output-format", "json", "--allowed-tools", ""]
+    if SUGGEST_MODEL_FALLBACK:                   # кондуктор: фолбэк исполняет сам CLI в этом же вызове
+        cmd += ["--fallback-model", SUGGEST_MODEL_FALLBACK]
     try:
         p = subprocess.run(
-            [cbin, "-p", user, "--system-prompt", system, "--model", CLI_MODEL, "--allowed-tools", ""],
+            cmd,
             cwd=tempfile.gettempdir(),          # нейтральный cwd: без settings.json/pretool_guard репо
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             env=env, timeout=CLI_TIMEOUT,
@@ -1178,7 +1222,10 @@ def _cli_llm(system: str, user: str) -> str:
     if p.returncode != 0:
         log.warning("SUGGEST: claude CLI rc=%s — %s", p.returncode, (p.stderr or "").strip()[-300:])
         return ""
-    return (p.stdout or "").strip()
+    text, real = _parse_cli_json(p.stdout or "")
+    log.info("SUGGEST: голова=%s (просили %s, фолбэк %s)",
+             real or "?", SUGGEST_MODEL, SUGGEST_MODEL_FALLBACK or "—")
+    return text
 
 
 # --- защита от утечки служебного контекста в тело черновика -------------------
