@@ -23,6 +23,7 @@ userbot.send_to_client. Голос: пока не расшифровываем (
 import os
 import sys
 import logging
+import subprocess
 
 from dotenv import load_dotenv
 
@@ -202,6 +203,82 @@ async def on_group_message(update, context):
     await _apply(context, chat.id, draft, dec)
 
 
+# ---------------------------- обработчик ошибок (разбор #128) ----------------------------
+# Причина «мгновенной смерти» класса: у moderation_bot НЕ было error-handler'а. Любая
+# необработанная ошибка в polling-цикле PTB (сетевой сбой httpx.ConnectError/ReadError, а
+# главное — Conflict «terminated by other getUpdates», когда рядом на миг оказывалась ВТОРАЯ
+# копия бота) всплывала как unhandled → PTB писал «No error handlers are registered» и ронял
+# процесс. В логе бота при этом пусто (падение вне его логгера) — оттого смерть выглядела
+# «мгновенной без улик». Ставим handler по образцу pc_agent: сетевые/Conflict — пережить и
+# продолжить (PTB переподключит long-polling), прочее — залогировать с трейсом (в файл, не в /dev/null).
+async def on_error(update, context):
+    from telegram.error import NetworkError, TimedOut, Conflict
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        log.warning(f"сетевая ошибка (не падаю, PTB переподключится): {type(err).__name__}: {err}")
+    elif isinstance(err, Conflict):
+        # вторая копия дёргает getUpdates → НЕ падаем: singleton-гард (ниже) на старте отсекает
+        # второй экземпляр; если конфликт всё же мигнул — просто ждём, Telegram сам разведёт.
+        log.warning(f"Conflict getUpdates (вероятно вторая копия) — не падаю, жду: {err}")
+    else:
+        log.error("необработанная ошибка", exc_info=err)
+
+
+# ------------------------- singleton-гард (разбор #128) ----------------------
+# Двух moderation_bot на одном MODERBOT_TOKEN быть не должно: два поллера → Telegram отдаёт
+# Conflict, один из процессов умирает. Раньше защиты не было — pc_agent-старт и контур-вотчдог
+# оркестратора могли на миг поднять второй экземпляр. Атомарный lock-файл с PID (как в pc_agent).
+LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moderation_bot.lock")
+
+
+def _pid_alive(pid):
+    try:
+        r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                           capture_output=True, text=True, timeout=10)
+        return f'"{pid}"' in r.stdout or f",{pid}," in r.stdout
+    except Exception:
+        return False
+
+
+def acquire_lock():
+    """True — лок наш; False — другой живой moderation_bot уже держит его (выходим)."""
+    for _ in range(3):
+        try:
+            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode("utf-8"))
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                with open(LOCK_FILE, encoding="utf-8") as f:
+                    old = int(f.read().strip() or "0")
+            except Exception:
+                old = 0
+            if old and _pid_alive(old):
+                log.warning(f"moderation_bot уже запущен (PID {old}) — второй не поднимаю, выхожу.")
+                return False
+            log.info(f"устаревший moderation_bot.lock (PID {old or '?'} мёртв) — забираю.")
+            try:
+                os.remove(LOCK_FILE)
+            except FileNotFoundError:
+                pass
+    return False
+
+
+def release_lock():
+    try:
+        with open(LOCK_FILE, encoding="utf-8") as f:
+            mine = int(f.read().strip() or "0") == os.getpid()
+        if mine:
+            os.remove(LOCK_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
 def main():
     if not TOKEN:
         log.warning("MODERBOT_TOKEN отсутствует — бот-модератор НЕ запускается "
@@ -210,18 +287,25 @@ def main():
     if not suggest.is_enabled():
         log.warning("SUGGEST выключен (SUGGEST_MODE=off) — боту нечего модерировать, выхожу.")
         return
-    moderation_ipc.init_db()
+    # singleton-гард ДО init_db/polling: второй экземпляр не поднимаем (иначе Conflict getUpdates).
+    if not acquire_lock():
+        return
+    try:
+        moderation_ipc.init_db()
 
-    from telegram.ext import ApplicationBuilder, CallbackQueryHandler, MessageHandler, filters
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, on_group_message))
-    if app.job_queue is not None:
-        app.job_queue.run_repeating(job_heartbeat, interval=HEARTBEAT_SEC, first=1)
-        app.job_queue.run_repeating(job_poll_new, interval=POLL_SEC, first=2)
-    log.info(f"moderation_bot ЗАПУСК (TEST_MODE={suggest.SUGGEST_TEST_MODE}, "
-             f"mod_chat={_target_chat()}). Клиенту не пишу; решения — в IPC.")
-    app.run_polling()
+        from telegram.ext import ApplicationBuilder, CallbackQueryHandler, MessageHandler, filters
+        app = ApplicationBuilder().token(TOKEN).build()
+        app.add_handler(CallbackQueryHandler(on_callback))
+        app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, on_group_message))
+        app.add_error_handler(on_error)   # разбор #128: сетевые/Conflict не роняют процесс
+        if app.job_queue is not None:
+            app.job_queue.run_repeating(job_heartbeat, interval=HEARTBEAT_SEC, first=1)
+            app.job_queue.run_repeating(job_poll_new, interval=POLL_SEC, first=2)
+        log.info(f"moderation_bot ЗАПУСК (TEST_MODE={suggest.SUGGEST_TEST_MODE}, "
+                 f"mod_chat={_target_chat()}). Клиенту не пишу; решения — в IPC.")
+        app.run_polling()
+    finally:
+        release_lock()
 
 
 if __name__ == "__main__":

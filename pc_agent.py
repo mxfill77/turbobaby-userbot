@@ -37,6 +37,7 @@ import io
 import time
 import asyncio
 import logging
+import datetime
 import subprocess
 from pathlib import Path
 
@@ -54,6 +55,7 @@ LISTEN_SCRIPT = REPO_DIR / "userbot_listen.py"
 MODERBOT_SCRIPT = REPO_DIR / "moderation_bot.py"  # бот-модератор (задача-2)
 USERBOT_LOG = REPO_DIR / "userbot.log"
 AGENT_LOG = REPO_DIR / "pc_agent.log"
+LOGS_DIR = REPO_DIR / "logs"        # ФИКС 1 (#128): сюда пишем stdout/stderr детей (append)
 AGENT_LOCK = REPO_DIR / "pc_agent.lock"  # singleton-гард: не запускать ДВА агента сразу
 TASK_NAME = "pc_agent"  # ФИКС 3: имя задачи в Планировщике Windows — ДОЛЖНО совпадать с реальным
 
@@ -79,6 +81,28 @@ logging.basicConfig(
 # Глушим болтливый сетевой лог PTB, оставляем свои сообщения.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 alog = logging.getLogger("pc_agent")
+
+
+# ==================== ФИКС 1 (#128): stderr/stdout детей → файл ================
+# Раньше детей (userbot_listen.py, moderation_bot.py) спавнили без перенаправления
+# stdout/stderr. Под Планировщиком (без консоли) их stderr уходил в никуда → смерть
+# ребёнка ДО настройки его собственного logging (ошибка импорта, битый токен, падение
+# на старте PTB) не оставляла НИ traceback, НИ строки в *.log — «мгновенная смерть»
+# без улик (разбор #128). Теперь stdout+stderr каждого ребёнка идут в
+# logs/<имя>_stderr.log (APPEND, не перетираем историю падений). Собственный лог ребёнка
+# (userbot.log/moderation_bot.log) остаётся — это дополнительный, «сырой» канал для того,
+# что до логгера не дошло.
+
+def _child_log_handle(name):
+    """Открыть logs/<name>_stderr.log на APPEND (utf-8) для stdout+stderr ребёнка и вписать
+    строку-разделитель со временем старта. Возвращает файловый объект (передаём в Popen).
+    Файл переживает выход родителя: ребёнок наследует dup дескриптора."""
+    LOGS_DIR.mkdir(exist_ok=True)
+    fh = open(LOGS_DIR / f"{name}_stderr.log", "a", encoding="utf-8")
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fh.write(f"\n===== {name}: старт {ts} (pc_agent PID {os.getpid()}) =====\n")
+    fh.flush()
+    return fh
 
 
 # ======================== управление процессом userbot ========================
@@ -143,7 +167,10 @@ class UserbotProcess:
             return f"не нашёл python venv: {VENV_PY}"
         # ВАЖНО: userbot_listen.py запускаем ТОЛЬКО через venv-python (VENV_PY),
         # НИКОГДА не системным и НИКОГДА не сам себя (pc_agent.py).
-        self.proc = subprocess.Popen([str(VENV_PY), str(LISTEN_SCRIPT)], cwd=str(REPO_DIR))
+        # ФИКС 1 (#128): stdout+stderr ребёнка → logs/userbot_stderr.log (смерть оставит traceback).
+        logf = _child_log_handle("userbot")
+        self.proc = subprocess.Popen([str(VENV_PY), str(LISTEN_SCRIPT)], cwd=str(REPO_DIR),
+                                     stdout=logf, stderr=subprocess.STDOUT)
         alog.info(f"userbot запущен агентом, PID {self.proc.pid}")
 
         # 2) Подстраховка от гонки: подождём и перепроверим. Если экземпляров >1 —
@@ -270,7 +297,10 @@ class ModerbotProcess:
             return f"moderation_bot уже работает (PID {', '.join(map(str, pids))}), второй не поднимаю."
         if not VENV_PY.exists():
             return f"не нашёл python venv: {VENV_PY}"
-        self.proc = subprocess.Popen([str(VENV_PY), str(MODERBOT_SCRIPT)], cwd=str(REPO_DIR))
+        # ФИКС 1 (#128): stdout+stderr ребёнка → logs/moderbot_stderr.log (смерть оставит traceback).
+        logf = _child_log_handle("moderbot")
+        self.proc = subprocess.Popen([str(VENV_PY), str(MODERBOT_SCRIPT)], cwd=str(REPO_DIR),
+                                     stdout=logf, stderr=subprocess.STDOUT)
         alog.info(f"moderation_bot запущен агентом, PID {self.proc.pid}")
         time.sleep(2.0)
         pids = _find_moderbot_pids()

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import datetime
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import pc_orchestrator as o
@@ -991,6 +992,189 @@ class TestTaskSelfheal(Base):
         with mock.patch.object(o, "resolve_claude", lambda: sys.executable), \
                 mock.patch.object(o.subprocess, "run", side_effect=RuntimeError("boom")):
             self.assertIsNone(o._thinker_exec("p", 5, "t"))
+
+
+class TestClientWatchdog(unittest.TestCase):
+    """Контур-вотчдог (разбор #128, часть 3): finder/raiser/now/state инъектируются —
+    реальных процессов/schtasks НЕ трогаем. Проверяем: живой не поднимается; мёртвый →
+    подъём + NOTE; анти-флап (кулдаун); 3 смерти подряд → стоп + громкий NOTE; skip; рубильник."""
+
+    def setUp(self):
+        self._save = (o._cowork, o._notify, o._stopped)
+        self.notes, self.pushes = [], []
+        o._cowork = lambda line: self.notes.append(line)
+        o._notify = lambda text: self.pushes.append(text)
+        o._stopped = lambda: False
+
+    def tearDown(self):
+        (o._cowork, o._notify, o._stopped) = self._save
+
+    def _spec(self, name, alive_seq, raiser_ok=True, skip=False):
+        """Спека процесса: alive_seq — очередь ответов finder (True/False по тикам).
+        После исчерпания повторяем последнее значение (лишние тики не роняют finder)."""
+        it = iter(alive_seq)
+        last = {"v": alive_seq[-1] if alive_seq else False}
+        raises = []
+
+        def finder():
+            try:
+                last["v"] = next(it)
+            except StopIteration:
+                pass
+            return [123] if last["v"] else []
+        sp = {"name": name,
+              "finder": finder,
+              "raiser": lambda: (raises.append(1) or (raiser_ok, "detail")),
+              "logfile": os.path.join(o.REPO, "nope.log"),
+              "skip": lambda: skip}
+        sp["_raises"] = raises
+        return sp
+
+    def test_alive_not_raised(self):
+        st = {}
+        sp = self._spec("userbot", [True])
+        out = o.client_watchdog_tick(now=1000, specs=[sp], state=st, cooldown=900, max_deaths=3)
+        self.assertEqual(out["userbot"], "alive")
+        self.assertEqual(sp["_raises"], [])            # живого не поднимаем
+        self.assertEqual(st["userbot"]["deaths"], 0)
+
+    def test_dead_raised_with_note(self):
+        st = {}
+        sp = self._spec("userbot", [False])
+        out = o.client_watchdog_tick(now=1000, specs=[sp], state=st, cooldown=900, max_deaths=3)
+        self.assertEqual(out["userbot"], "raise")
+        self.assertEqual(len(sp["_raises"]), 1)        # мёртвого подняли
+        self.assertTrue(any("вотчдог поднял userbot" in n for n in self.notes))
+        self.assertEqual(st["userbot"]["deaths"], 1)
+
+    def test_anti_flap_cooldown(self):
+        st = {}
+        sp = self._spec("userbot", [False, False])
+        o.client_watchdog_tick(now=1000, specs=[sp], state=st, cooldown=900, max_deaths=3)   # подъём в t=1000
+        o.client_watchdog_tick(now=1100, specs=[sp], state=st, cooldown=900, max_deaths=3)   # t=1100 (<15мин)
+        self.assertEqual(len(sp["_raises"]), 1)        # второй раз НЕ поднимали (кулдаун)
+
+    def test_three_deaths_halt_loud(self):
+        st = {}
+        sp = self._spec("moderation_bot", [False, False, False])
+        # три тика вне кулдауна (cooldown=0) → death1 raise, death2 raise, death3 halt
+        o.client_watchdog_tick(now=1, specs=[sp], state=st, cooldown=0, max_deaths=3)
+        o.client_watchdog_tick(now=2, specs=[sp], state=st, cooldown=0, max_deaths=3)
+        out = o.client_watchdog_tick(now=3, specs=[sp], state=st, cooldown=0, max_deaths=3)
+        self.assertEqual(out["moderation_bot"], "halt_now")
+        self.assertEqual(len(sp["_raises"]), 2)        # подняли дважды, на 3-й — стоп
+        self.assertTrue(st["moderation_bot"]["halted"])
+        self.assertTrue(any("нужен разбор" in p for p in self.pushes))   # громкий пуш
+        # после halt дальше молчим
+        out2 = o.client_watchdog_tick(now=4, specs=[sp], state=st, cooldown=0, max_deaths=3)
+        self.assertEqual(out2["moderation_bot"], "halted")
+        self.assertEqual(len(sp["_raises"]), 2)
+
+    def test_recovery_resets_deaths(self):
+        st = {}
+        sp = self._spec("userbot", [False, True])
+        o.client_watchdog_tick(now=1, specs=[sp], state=st, cooldown=0, max_deaths=3)   # death1
+        o.client_watchdog_tick(now=2, specs=[sp], state=st, cooldown=0, max_deaths=3)   # ожил
+        self.assertEqual(st["userbot"]["deaths"], 0)   # ожил → счётчик обнулён
+
+    def test_skip_no_token_moderbot(self):
+        st = {}
+        sp = self._spec("moderation_bot", [False], skip=True)   # skip=True (нет MODERBOT_TOKEN)
+        out = o.client_watchdog_tick(now=1, specs=[sp], state=st, cooldown=0, max_deaths=3)
+        self.assertEqual(out["moderation_bot"], "skip")
+        self.assertEqual(len(sp["_raises"]), 0)        # штатный простой ≠ смерть
+        self.assertEqual(st["moderation_bot"]["deaths"], 0)
+
+    def test_stop_flag_skips_contour(self):
+        o._stopped = lambda: True
+        sp = self._spec("userbot", [False])
+        out = o.client_watchdog_tick(now=1, specs=[sp], state={}, cooldown=0, max_deaths=3)
+        self.assertEqual(out, {"_": "stopped"})
+        self.assertEqual(len(sp["_raises"]), 0)        # рубильник → контур не трогаем
+
+    def test_raiser_failure_pushes(self):
+        sp = self._spec("pc_agent", [False], raiser_ok=False)
+        o.client_watchdog_tick(now=1, specs=[sp], state={}, cooldown=0, max_deaths=3)
+        self.assertTrue(any("не смог поднять pc_agent" in p for p in self.pushes))
+
+    def test_throttle_maybe_client_watchdog(self):
+        o._client_watch_last_run = 0.0
+        calls = {"n": 0}
+        save = o.client_watchdog_tick
+        try:
+            o.client_watchdog_tick = lambda now=None: (calls.__setitem__("n", calls["n"] + 1), {"ok": True})[1]
+            self.assertIsNotNone(o.maybe_client_watchdog(now=1000))   # первый прогон
+            self.assertIsNone(o.maybe_client_watchdog(now=1100))      # <5мин → пропуск
+            self.assertIsNotNone(o.maybe_client_watchdog(now=1000 + o.CLIENT_WATCH_SEC + 1))
+            self.assertEqual(calls["n"], 2)
+        finally:
+            o.client_watchdog_tick = save
+            o._client_watch_last_run = 0.0
+
+
+class TestSingletonLock(unittest.TestCase):
+    """OS-синглтон демона (разбор #128, часть 4): lock_path/pid_alive инъектируются, tasklist
+    НЕ дёргаем. Проверяем: свободный лок берётся; живой чужой → отказ; мёртвый холдер → забор;
+    supersede-PID → ждём и забираем; release снимает только свой."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.lock = os.path.join(self.tmp, "orch.lock")
+        self._env = os.environ.pop(o.SUPERSEDE_ENV, None)
+
+    def tearDown(self):
+        if self._env is not None:
+            os.environ[o.SUPERSEDE_ENV] = self._env
+        else:
+            os.environ.pop(o.SUPERSEDE_ENV, None)
+
+    def test_acquire_free(self):
+        self.assertTrue(o.acquire_singleton(lock_path=self.lock, pid_alive=lambda p: False))
+        self.assertEqual(Path(self.lock).read_text().strip(), str(os.getpid()))
+
+    def test_live_other_refused(self):
+        with open(self.lock, "w") as f:
+            f.write("99999")                            # чужой PID
+        self.assertFalse(o.acquire_singleton(lock_path=self.lock, pid_alive=lambda p: True))
+
+    def test_stale_holder_stolen(self):
+        with open(self.lock, "w") as f:
+            f.write("99999")
+        self.assertTrue(o.acquire_singleton(lock_path=self.lock, pid_alive=lambda p: False))
+        self.assertEqual(Path(self.lock).read_text().strip(), str(os.getpid()))
+
+    def test_supersede_waits_then_takes(self):
+        os.environ[o.SUPERSEDE_ENV] = "77777"
+        with open(self.lock, "w") as f:
+            f.write("77777")                            # лок держит сменяемый старый
+        # старый «умирает» после первой проверки: pid_alive → False со 2-го вызова
+        seq = {"n": 0}
+        def alive(pid):
+            seq["n"] += 1
+            return seq["n"] < 2
+        ok = o.acquire_singleton(lock_path=self.lock, pid_alive=alive, supersede_wait=5, sleep=0)
+        self.assertTrue(ok)
+        self.assertEqual(Path(self.lock).read_text().strip(), str(os.getpid()))
+
+    def test_release_only_own(self):
+        with open(self.lock, "w") as f:
+            f.write("42")                               # не наш
+        o.release_singleton(lock_path=self.lock)
+        self.assertTrue(os.path.exists(self.lock))      # чужой лок не трогаем
+        with open(self.lock, "w") as f:
+            f.write(str(os.getpid()))
+        o.release_singleton(lock_path=self.lock)
+        self.assertFalse(os.path.exists(self.lock))     # свой — сняли
+
+    def test_spawn_daemon_sets_supersede_env(self):
+        captured = {}
+        def fake_popen(cmd, **kw):
+            captured.update(kw)
+            class P: pass
+            return P()
+        with mock.patch.object(o.subprocess, "Popen", fake_popen):
+            self.assertTrue(o._spawn_daemon())
+        self.assertEqual(captured["env"][o.SUPERSEDE_ENV], str(os.getpid()))
 
 
 if __name__ == "__main__":

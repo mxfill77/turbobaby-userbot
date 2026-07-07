@@ -58,6 +58,12 @@ APPROVAL_TTL = int(os.getenv("PC_APPROVAL_TTL", "1800") or "1800")     # 30 ми
 NEEDS_APPROVAL_TOPIC = int(os.getenv("PC_NA_TOPIC", "829") or "829")   # тема, куда Splinter постит карточку
 HEARTBEAT_STALE = int(os.getenv("PC_HB_STALE", "180") or "180")        # watchdog: heartbeat протух
 WATCH_VERIFY_SLEEP = int(os.getenv("PC_WATCH_VERIFY", "20") or "20")
+# Контур-вотчдог клиентского контура (разбор #128, часть 3): демон — единственный надёжно
+# выживающий процесс (его самого держит heartbeat+schtasks), поэтому он же следит за
+# pc_agent/userbot/moderation_bot и поднимает мёртвых.
+CLIENT_WATCH_SEC = int(os.getenv("PC_CLIENT_WATCH_SEC", "300") or "300")        # проверка контура каждые 5 мин
+CLIENT_COOLDOWN_SEC = int(os.getenv("PC_CLIENT_COOLDOWN_SEC", "900") or "900")  # анти-флап: ≤1 подъём/процесс за 15 мин
+CLIENT_MAX_DEATHS = int(os.getenv("PC_CLIENT_MAX_DEATHS", "3") or "3")          # 3 смерти подряд → стоп + громкий NOTE
 RESULT_MAX = 4500
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")   # ФОЛБЭК: явный путь из .env (может протухнуть при автообновлении)
 # Базовая папка версионных установок claude-code (AppData\Roaming\Claude\claude-code\<версия>\claude.exe).
@@ -67,6 +73,8 @@ _CLAUDE_BASE = os.path.join(os.getenv("APPDATA") or os.path.join(os.path.expandu
 
 STOP_FLAG = os.path.join(REPO, "pc_orchestrator.stop")
 HEARTBEAT_FILE = os.path.join(REPO, "pc_orchestrator.heartbeat")
+LOCK_FILE = os.path.join(REPO, "pc_orchestrator.lock")       # OS-синглтон демона (разбор #128, часть 4)
+SUPERSEDE_ENV = "PC_ORCH_SUPERSEDE_PID"                       # self-update: PID старого, которого сменяем
 LOG_PATH = os.path.join(REPO, "pc_orchestrator.log")
 NA_MARKER = "NEEDS_APPROVAL:"
 ASK_MARKER_ENV = "PRETOOL_ASK_MARKER"   # env для pretool_guard: писать красную карточку в этот файл
@@ -605,12 +613,16 @@ def _gate_unittests():
 
 
 def _spawn_daemon():
-    """Поднять НОВЫЙ detached-процесс демона (тот же venv+скрипт). → True/False. Мокается в тестах."""
+    """Поднять НОВЫЙ detached-процесс демона (тот же venv+скрипт). → True/False. Мокается в тестах.
+    Передаём PC_ORCH_SUPERSEDE_PID=<свой PID>: новый в acquire_singleton дождётся смерти старого
+    (нас) прежде чем забрать лок — эстафета без перекрытия (разбор #128, часть 4)."""
     try:
         flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        env = dict(os.environ)
+        env[SUPERSEDE_ENV] = str(os.getpid())
         subprocess.Popen([VENV_PY, os.path.join(REPO, "pc_orchestrator.py")], cwd=REPO,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         stdin=subprocess.DEVNULL, creationflags=flags)
+                         stdin=subprocess.DEVNULL, creationflags=flags, env=env)
         return True
     except Exception as e:
         log.error("self-update: не смог запустить новый процесс: %s", e)
@@ -1011,7 +1023,255 @@ def maybe_update_bots(tid, text, head_before, changed_fn=None, gate_fn=None,
     return (" | авто-обновление: " + " ; ".join(notes)) if notes else ""
 
 
+# ------------------- контур-вотчдог клиентского контура (часть 3) -------------
+# Демон каждые CLIENT_WATCH_SEC (5 мин) проверяет живость pc_agent/userbot/moderation_bot по
+# PID (CIM-поиск процесса = источник правды) + свежести их логов (диагностика). Мёртвого
+# поднимает ШТАТНО: pc_agent — через Планировщик (schtasks /Run), userbot/moderation_bot — той
+# же механикой pc_agent (venv-spawn, CIM-guard от дубля). На каждый подъём — NOTE в cowork_log.
+# Анти-флаппинг: не чаще 1 подъёма на процесс за CLIENT_COOLDOWN_SEC (15 мин); CLIENT_MAX_DEATHS
+# (3) смертей подряд → СТОП попыток по этому процессу + громкий NOTE «нужен разбор». Живой снова
+# → счётчик смертей сброшен. moderation_bot без MODERBOT_TOKEN — не «мёртв», а штатно не поднят
+# (reply-режим) → пропускаем. Состояние в памяти демона (переживает тики; рестарт демона его
+# сбрасывает — не страшно). Всё внешнее (finder/raiser/now/state) инъектируется для тестов.
+
+_client_watch_state = {}      # name -> {"last_raise": float, "deaths": int, "halted": bool}
+_client_watch_last_run = 0.0  # монотонная метка последнего прогона контура (троттлинг 5 мин)
+
+
+def _find_pids_by_script(script_name):
+    """PID python-процессов, исполняющих <script_name> (фиксированный CIM-запрос, read-only).
+    script_name — литерал из спецификации контура (не пользовательский ввод)."""
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" "
+          "| Where-Object { $_.CommandLine -like '*" + script_name + "*' } "
+          "| Select-Object -ExpandProperty ProcessId")
+    try:
+        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, text=True, timeout=20)
+        return [int(x) for x in p.stdout.split() if x.strip().isdigit()]
+    except Exception as e:
+        log.warning("контур-вотчдог: CIM-поиск %s не удался: %s", script_name, e)
+        return []
+
+
+def _raise_pc_agent():
+    """Поднять pc_agent через Планировщик (у него отдельная задача schtasks). → (ok, detail)."""
+    rc, out = _schtasks_run("pc_agent")
+    return rc == 0, f"schtasks /Run /TN pc_agent rc={rc}: {_tail(out, 160)}"
+
+
+def _raise_client_bot(kind):
+    """Поднять userbot/moderation_bot ТОЙ ЖЕ механикой pc_agent (venv-spawn + CIM-guard). → (ok, detail).
+    kind ∈ 'userbot'|'moderbot'. start() идемпотентен: если процесс уже есть — второй не создаст."""
+    try:
+        import pc_agent   # lazy: не тянем telegram в общий импорт демона
+    except Exception as e:
+        return False, f"импорт pc_agent не удался: {e}"
+    try:
+        proc = pc_agent.UserbotProcess() if kind == "userbot" else pc_agent.ModerbotProcess()
+        return True, proc.start()
+    except Exception as e:
+        return False, f"ошибка старта {kind}: {e}"
+
+
+def _client_watch_specs():
+    """Спецификации процессов клиентского контура. skip() → «не применимо» (не считаем мёртвым)."""
+    return [
+        {"name": "pc_agent",
+         "finder": lambda: _find_pids_by_script("pc_agent.py"),
+         "raiser": _raise_pc_agent,
+         "logfile": os.path.join(REPO, "pc_agent.log"),
+         "skip": lambda: False},
+        {"name": "userbot",
+         "finder": lambda: _find_pids_by_script("userbot_listen.py"),
+         "raiser": lambda: _raise_client_bot("userbot"),
+         "logfile": os.path.join(REPO, "userbot.log"),
+         "skip": lambda: False},
+        {"name": "moderation_bot",
+         "finder": lambda: _find_pids_by_script("moderation_bot.py"),
+         "raiser": lambda: _raise_client_bot("moderbot"),
+         "logfile": os.path.join(REPO, "moderation_bot.log"),
+         # без токена модербот НЕ должен работать (reply-режим) — это не смерть, а штатный простой
+         "skip": lambda: not os.getenv("MODERBOT_TOKEN", "").strip()},
+    ]
+
+
+def _log_age_sec(path, now):
+    """Возраст (сек) последней записи в лог. now — time.time(). None — файла нет/ошибка."""
+    try:
+        return max(0.0, now - os.path.getmtime(path))
+    except Exception:
+        return None
+
+
+def _client_watch_step(name, alive, now, state, cooldown, max_deaths):
+    """Чистое решение по ОДНОМУ процессу. → (action, new_state_entry). Побочек нет — подъём делает
+    вызывающий. action ∈ 'alive'|'raise'|'cooldown'|'halted'|'halt_now'."""
+    st = dict(state.get(name) or {"last_raise": 0.0, "deaths": 0, "halted": False})
+    if alive:
+        return "alive", {"last_raise": st["last_raise"], "deaths": 0, "halted": False}
+    if st["halted"]:
+        return "halted", st                        # уже сдались (громкий NOTE был при переходе)
+    if now - st["last_raise"] < cooldown:
+        return "cooldown", st                       # анти-флап: рано поднимать снова
+    st["deaths"] += 1
+    st["last_raise"] = now
+    if st["deaths"] >= max_deaths:
+        st["halted"] = True
+        return "halt_now", st                       # смерть №max_deaths подряд → стоп, не поднимаем
+    return "raise", st
+
+
+def client_watchdog_tick(now=None, specs=None, state=None, cooldown=None, max_deaths=None):
+    """Один прогон контур-вотчдога. → dict name->action (для тестов/лога). Побочки: raiser()+NOTE.
+    Уважает рубильник pc_orchestrator.stop (клиентский контур при намеренной остановке не трогаем)."""
+    now = time.time() if now is None else now
+    specs = _client_watch_specs() if specs is None else specs
+    state = _client_watch_state if state is None else state
+    cooldown = CLIENT_COOLDOWN_SEC if cooldown is None else cooldown
+    max_deaths = CLIENT_MAX_DEATHS if max_deaths is None else max_deaths
+    if _stopped():
+        return {"_": "stopped"}
+    out = {}
+    for sp in specs:
+        name = sp["name"]
+        try:
+            if sp.get("skip") and sp["skip"]():
+                out[name] = "skip"
+                state[name] = {"last_raise": 0.0, "deaths": 0, "halted": False}
+                continue
+            alive = bool(sp["finder"]())
+        except Exception as e:
+            log.warning("контур-вотчдог: проверка %s не удалась: %s", name, e)
+            out[name] = "check_failed"
+            continue
+        action, st = _client_watch_step(name, alive, now, state, cooldown, max_deaths)
+        state[name] = st
+        out[name] = action
+        if action == "raise":
+            try:
+                ok, detail = sp["raiser"]()
+            except Exception as e:
+                ok, detail = False, f"raiser упал: {e}"
+            log_age = _log_age_sec(sp.get("logfile"), now)
+            log.warning("контур-вотчдог: %s МЁРТВ (смерть %s/%s, лог %s) → подъём ok=%s: %s",
+                        name, st["deaths"], max_deaths,
+                        (f"{int(log_age)}с назад" if log_age is not None else "нет"), ok, _tail(str(detail), 200))
+            _cowork(f"вотчдог поднял {name} (смерть {st['deaths']}/{max_deaths}): {_tail(str(detail), 160)}")
+            if not ok:
+                _notify(f"⚠️ Оркестратор: контур-вотчдог не смог поднять {name}: {_tail(str(detail), 160)}")
+        elif action == "halt_now":
+            log.error("контур-вотчдог: %s умер %s раз подряд — СТОП попыток, нужен разбор", name, st["deaths"])
+            _cowork(f"вотчдог: {name} умер {st['deaths']} раза подряд — СТОП, нужен разбор")
+            _notify(f"⚠️ Оркестратор: {name} умер {max_deaths} раза подряд — контур-вотчдог остановлен, нужен разбор")
+    return out
+
+
+def maybe_client_watchdog(now=None):
+    """Троттлинг контур-вотчдога: тело прогоняем не чаще CLIENT_WATCH_SEC. → dict|None (None = ещё рано)."""
+    global _client_watch_last_run
+    now = time.time() if now is None else now
+    if now - _client_watch_last_run < CLIENT_WATCH_SEC:
+        return None
+    _client_watch_last_run = now
+    return client_watchdog_tick(now=now)
+
+
+# ------------------- OS-синглтон демона (разбор #128, часть 4) ----------------
+# Инцидент: ДВА pc_orchestrator одновременно (оба стартовали в одну секунду от Планировщика
+# поверх уже живого) → оба поллят очередь и наперегонки claim'ят задачи (двойное исполнение).
+# Класс-фикс: атомарный lock-файл с PID (O_CREAT|O_EXCL, как в pc_agent). Второй живой демон
+# при старте видит лок живого и выходит. Дубль, поднявшийся БЕЗ лока (старый код), схлопнется
+# сам: при первом же self-update оба старых спавнят новых, но лок эксклюзивен — выживает ОДИН.
+# Self-update-эстафета: старый спавнит нового с env PC_ORCH_SUPERSEDE_PID=<свой PID>; новый,
+# если лок держит именно этот PID, ЖДЁТ его смерти (старый снимает лок в finally main()) —
+# гарантированно «гасим старого перед стартом нового», перекрытия нет.
+
+def _lock_pid_alive(pid):
+    """Жив ли процесс по PID (Windows, без psutil). Инъектируется в тестах."""
+    try:
+        r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                           capture_output=True, text=True, timeout=10)
+        return f'"{pid}"' in r.stdout or f",{pid}," in r.stdout
+    except Exception:
+        return False
+
+
+def _read_lock_pid(path=None):
+    try:
+        with open(path or LOCK_FILE, encoding="utf-8") as f:   # закрываем сразу: на Windows
+            return int(f.read().strip() or "0")                # висящий хэндл блокирует os.remove
+    except Exception:
+        return 0
+
+
+def acquire_singleton(lock_path=None, pid_alive=None, supersede_wait=30.0, sleep=0.5):
+    """True — лок наш, стартуем; False — другой ЖИВОЙ демон уже держит лок, выходим (второй не поднимаем).
+    Мёртвый холдер → забираем лок. Холдер == наш supersede-PID (self-update) → ждём его смерти до
+    supersede_wait, затем забираем (эстафета). pid_alive/lock_path инъектируются в тестах."""
+    lock_path = lock_path or LOCK_FILE
+    pid_alive = pid_alive or _lock_pid_alive
+    sup = os.getenv(SUPERSEDE_ENV, "").strip()
+    sup = int(sup) if sup.lstrip("-").isdigit() else 0
+    deadline = time.time() + supersede_wait
+    for _ in range(200):                       # верхняя граница итераций (страховка от вечного цикла)
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode("utf-8"))
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            holder = _read_lock_pid(lock_path)
+            if holder == os.getpid():          # уже наш (перезабор) — считаем успехом
+                return True
+            if holder == 0 or not pid_alive(holder):
+                log.warning("singleton: устаревший лок (PID %s мёртв) — забираю", holder or "?")
+                try:
+                    os.remove(lock_path)
+                except FileNotFoundError:
+                    pass
+                continue                        # заберём на следующем витке
+            if holder == sup and time.time() < deadline:
+                time.sleep(sleep)               # self-update: ждём смерти сменяемого старого демона
+                continue
+            if holder == sup:                   # старый завис дольше окна — successor всё равно забирает
+                log.warning("singleton: сменяемый PID %s не умер за %sс — забираю лок (successor)", holder, supersede_wait)
+                try:
+                    os.remove(lock_path)
+                except FileNotFoundError:
+                    pass
+                continue
+            log.warning("singleton: pc_orchestrator уже запущен (живой PID %s) — второй НЕ стартую", holder)
+            return False
+    log.error("singleton: не смог получить лок за 200 итераций — НЕ стартую (страховка)")
+    return False
+
+
+def release_singleton(lock_path=None):
+    """Снять лок ТОЛЬКО если он наш (чужой/successor'ский лок не трогаем)."""
+    lock_path = lock_path or LOCK_FILE
+    try:
+        if _read_lock_pid(lock_path) == os.getpid():
+            os.remove(lock_path)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("singleton: не смог снять лок: %s", e)
+
+
 def main():
+    # OS-синглтон ПЕРВЫМ действием: два демона одновременно недопустимы (двойной claim задач).
+    if not acquire_singleton():
+        log.warning("=== ВТОРОЙ ЭКЗЕМПЛЯР ДЕМОНА — выхожу (singleton-лок держит живой процесс) ===")
+        return
+    try:
+        _main_loop()
+    finally:
+        release_singleton()
+
+
+def _main_loop():
     _init_running_version()
     log.info("=== ДЕМОН СТАРТ (lane=%s, poll=%ss, task_timeout=%ss, approval_ttl=%ss, claude=%s, commit=%s) ===",
              LANE, POLL_SEC, TASK_TIMEOUT, APPROVAL_TTL, CLAUDE_BIN, RUNNING_COMMIT)
@@ -1021,6 +1281,7 @@ def main():
     while not _stopped():
         try:
             poll_once()
+            maybe_client_watchdog()   # часть 3: следим за pc_agent/userbot/moderation_bot (троттлинг 5 мин)
             if maybe_self_update():   # задача цикла обновила pc_orchestrator.py → эстафета новому
                 log.info("=== ДЕМОН ВЫШЕЛ ПО SELF-UPDATE (эстафета новому процессу) ===")
                 return
