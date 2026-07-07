@@ -32,6 +32,7 @@ import json
 import shutil
 import logging
 import datetime
+import tempfile
 import subprocess
 import urllib.request
 import urllib.parse
@@ -417,6 +418,15 @@ def run_task(tid, text, note=""):
         out_s = (out or "").strip()
         err_tail = _tail(err)
         if rc != 0:
+            # класс «самомодификация → ложный failed» (порт 48d9c64): claude погашен ПЛАНОВЫМ
+            # self-update-рестартом демона (4 признака) — это НЕ сбой → done, думателя НЕ зовём.
+            # Под флагом STEP_SELFHEAL (=0 → байт-в-байт прежний failed ниже).
+            if _selfheal_on() and _killed_by_planned_restart(rc, text):
+                log.info("id=%s claude погашен ПЛАНОВЫМ рестартом демона (rc=%s) → done (плановый)", tid, rc)
+                return "done", ("🔁 Завершено плановым рестартом демона (самомодификация "
+                                "pc_orchestrator): claude-процесс задачи штатно погашен в окне "
+                                "управляемого self-update-рестарта — работа к этому моменту сделана "
+                                "(RESULT в логе, коммит в git). Это НЕ сбой.")[:RESULT_MAX]
             return "failed", (f"claude exit={rc}: " + (out_s or err_tail or "нет вывода"))[:RESULT_MAX]
         if not out_s:
             if attempt == 1:   # один авто-повтор: пустой stdout бывает транзиентом
@@ -477,6 +487,12 @@ def process_new():
         _cowork(f"задача #{tid} → needs_approval (красное, жду «да»)")
         _notify(_human("needs_approval", tid, result))
     else:
+        # САМОПОЧИНКА (STEP_SELFHEAL=1): провал ОДИНОЧНОЙ задачи lane=pc → думатель, РОВНО 1 попытка.
+        # True = финализировано внутри (перерождение / терминальный failed с диагнозом); False =
+        # прежний путь (fail-safe: флаг off / сбой думателя / очередь не приняла). Байт-в-байт
+        # прежнее поведение при STEP_SELFHEAL=0 (короткое замыкание в _maybe_selfheal).
+        if status == "failed" and _maybe_selfheal(tid, text, result, frm=str(task.get("from") or "")):
+            return
         if status == "done":   # задача успешна → применить свежий код к боту(ам), если рантайм менялся
             result = (result + maybe_update_bots(tid, text, head_before))[:RESULT_MAX]
         bc.complete_task(tid, status, result)
@@ -636,6 +652,207 @@ def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=Non
     log.info("self-update: %s→%s — гейт пройден, новый процесс запущен, передаю управление", RUNNING_COMMIT, new_commit)
     _cowork(f"self-update: {RUNNING_COMMIT}→{new_commit} (гейт пройден, управляемый рестарт демона)")
     return True
+
+
+# ------------------- САМОПОЧИНКА ОДИНОЧНЫХ задач (флаг STEP_SELFHEAL) -----------
+# Порт VPS-образцов: самопочинка одиночных (9b0a496) + «думатель» (784e453) + класс «плановый
+# рестарт ≠ падение» (48d9c64). Под флагом STEP_SELFHEAL: провал ОДИНОЧНОЙ задачи lane=pc,
+# которая НЕ красный NEEDS_APPROVAL (отсечён раньше в run_task→process_new) и НЕ плановый
+# self-update-рестарт (см. _killed_by_planned_restart ниже — стал done внутри run_task), →
+# локальный ДУМАТЕЛЬ (переиспользуем существующий кондуктор Fable5→fallback PC-контура: та же
+# голова/фолбэк SUGGEST_MODEL/SUGGEST_MODEL_FALLBACK, тот же механизм --fallback-model, но чистым
+# генератором --max-turns 1) → строгий JSON {verdict:retry|halt, fixed_task, reason} →
+#   retry: РОВНО одно перерождение «[самопочинка задачи N, попытка 1] …» в очередь lane=pc + карточка;
+#   повторный провал уже МАРКИРОВАННОЙ задачи = терминальный failed (маркер = стоп, петля невозможна);
+#   halt: сразу терминальный failed с причиной.
+# FAIL-SAFE: ЛЮБОЙ сбой думателя (не-JSON / таймаут / пусто / исключение / очередь не приняла) =
+# прежний ГОЛЫЙ failed (не хуже базового поведения). STEP_SELFHEAL=0/нет → ветка не зовётся вовсе
+# (поведение байт-в-байт прежнее). Красное НЕ ослаблено: думатель ничего не исполняет
+# (--allowed-tools '' + нейтральный cwd → без settings.json/pretool_guard), тема 829/инбокс 1160 нетронуты.
+STEP_SELFHEAL_TIMEOUT = int(os.getenv("PC_SELFHEAL_TIMEOUT", "180") or "180")   # думатель — короткий ответ
+THINKER_MODEL = os.getenv("SUGGEST_MODEL", "fable").strip() or "fable"          # кондуктор: та же голова, что у suggest
+THINKER_MODEL_FALLBACK = os.getenv("SUGGEST_MODEL_FALLBACK", "sonnet").strip()  # …и тот же фолбэк
+# Маркер перерождения одиночной задачи стоит ПЕРВЫМ в тексте → якорь ^ (страховка от ложного
+# срабатывания на ТЗ, где маркер лишь упомянут в теле). N = id исходной задачи.
+_HEAL_TASK_RE = re.compile(r"^\s*\[самопочинка задачи (\d+), попытка (\d+)\]")
+# Признак самомодификации демона для класса «плановый рестарт ≠ падение».
+_SELFMOD_RE = re.compile(r"pc[-_ ]?orchestrator|самомодифика", re.IGNORECASE)
+
+TASK_THINKER_PREAMBLE = (
+    "Ты — думательный слой самопочинки ПК-оркестратора TurboBaby (мета-дирижёр). Одиночная "
+    "headless-задача упала при исполнении. Твоя задача — ТОЛЬКО диагноз и вердикт; ты НИЧЕГО "
+    "не исполняешь, инструментов у тебя нет, файлы не читаешь — решай строго по данным ниже.\n"
+    "Ответь СТРОГО ОДНИМ JSON-объектом, без текста до/после, без markdown-обёртки:\n"
+    '{"verdict":"retry"|"halt","fixed_task":"<новая формулировка задачи>","reason":"<1 строка диагноза>"}\n'
+    "verdict=retry — ТОЛЬКО если провал починим переформулировкой задачи (неверный путь/имя файла, "
+    "недостающий контекст, кривая команда) и правка очевидна; fixed_task тогда — САМОДОСТАТОЧНОЕ "
+    "дев-ТЗ ≤400 символов (исполнитель увидит ТОЛЬКО его, впиши нужный контекст). Во всех прочих "
+    "случаях (причина неясна, нужен человек, красная зона, объём не влезает в таймаут) — "
+    "verdict=halt и fixed_task пустой. Система даёт РОВНО ОДНУ попытку починки — не предлагай "
+    "многошаговых планов.\n\n"
+)
+
+
+def _selfheal_on():
+    """Флаг STEP_SELFHEAL=1 в .env (демон load_dotenv'ит на старте). 0/нет → прежнее поведение."""
+    return (os.environ.get("STEP_SELFHEAL") or "").strip() == "1"
+
+
+def _killed_by_planned_restart(rc, task_text, blob_fn=None):
+    """Класс «самомодификация демона → ложный failed» (порт 48d9c64) на ПК. True → claude задачи
+    завершился НЕ из-за поломки, а потому что демон в окне управляемого self-update-рестарта
+    (задача правила pc_orchestrator.py). РОВНО 4 обязательных признака, нужны ВСЕ (любое сомнение
+    → False → прежний честный failed, fail-safe):
+      1) rc != 0 — claude оборвался ненормально (логический no-RESULT при rc==0 сюда НЕ попадает);
+      2) self-update РЕАЛЬНО назрел: HEAD-блоб pc_orchestrator.py != запущенной версии RUNNING_BLOB
+         (единственная причина планового рестарта — задача закоммитила правку самого демона);
+      3) текст задачи — про сам демон (pc_orchestrator / самомодификация);
+      4) взведён рубильник pc_orchestrator.stop — демон в окне намеренной остановки/рестарта.
+    Признаки взяты из реальных механизмов ПК (self-update-дифф + стоп-файл) — лишнего не выдумываем
+    (schtasks/heartbeat — забота watchdog, не признак гибели конкретной задачи)."""
+    if rc == 0:
+        return False
+    new_blob = (blob_fn or _blob_hash)()
+    if not new_blob or RUNNING_BLOB is None or new_blob == RUNNING_BLOB:
+        return False
+    if not _SELFMOD_RE.search(str(task_text or "")):
+        return False
+    return _stopped()
+
+
+def _parse_thinker_json(text, fix_key="fixed_task"):
+    """Строгий парс ответа думателя → {"verdict",<fix_key>,"reason"} или None (fail-safe).
+    Терпим обёртку-мусор вокруг JSON (берём от первой { до последней }), но verdict обязан быть
+    retry|halt — иначе None."""
+    t = (text or "").strip()
+    i, j = t.find("{"), t.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        d = json.loads(t[i:j + 1])
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    v = str(d.get("verdict") or "").strip().lower()
+    if v not in ("retry", "halt"):
+        return None
+    return {"verdict": v,
+            fix_key: str(d.get(fix_key) or "").strip(),
+            "reason": str(d.get("reason") or "").strip()}
+
+
+def _thinker_exec(prompt, timeout, tag):
+    """Думатель = ПЕРЕИСПОЛЬЗОВАННЫЙ кондуктор Fable5→fallback (--fallback-model одним вызовом CLI),
+    но ЧИСТЫЙ генератор: --max-turns 1 (один ответ, без инструментального цикла) + --allowed-tools ''
+    + нейтральный cwd (tempdir, НЕ репо) → CLI не читает .claude/settings.json+pretool_guard и НИЧЕГО
+    не исполняет (думатель красное не трогает). ANTHROPIC_API_KEY вычищен → подписка Max, не платный
+    API. Возврат: текст ответа (распакован из --output-format json) или None при ЛЮБОМ сбое
+    (запуск/таймаут/exit!=0/claude не найден) — fail-safe (upstream → прежний голый failed).
+    Инъектируется в тестах (реальный claude не дёргаем)."""
+    cbin = resolve_claude()
+    if not cbin:
+        log.warning("%s: claude не найден — думатель недоступен (fail-safe)", tag)
+        return None
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)          # идём по ~/.claude (подписка), не по платному ключу
+    env.pop("OPENAI_API_KEY", None)
+    env["PYTHONIOENCODING"] = "utf-8"
+    cmd = [cbin, "-p", prompt, "--model", THINKER_MODEL,
+           "--output-format", "json", "--max-turns", "1", "--allowed-tools", ""]
+    if THINKER_MODEL_FALLBACK:                   # кондуктор: фолбэк исполняет сам CLI в этом же вызове
+        cmd += ["--fallback-model", THINKER_MODEL_FALLBACK]
+    try:
+        p = subprocess.run(cmd, cwd=tempfile.gettempdir(), capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=timeout, env=env)
+    except Exception as e:
+        log.warning("%s: думатель не отработал (%s) — fail-safe", tag, e)
+        return None
+    if p.returncode != 0:
+        log.warning("%s: думатель exit=%s — fail-safe", tag, p.returncode)
+        return None
+    raw = (p.stdout or "").strip()
+    out = raw
+    try:
+        env_j = json.loads(raw)
+        if isinstance(env_j, dict) and "result" in env_j:   # CLI-конверт --output-format json
+            out = (env_j.get("result") or "").strip()
+    except Exception:
+        pass
+    return out
+
+
+def _task_selfheal_consult(task_text, fail_text):
+    """Думатель самопочинки ОДИНОЧНОЙ задачи: контекст — текст задачи ДОСЛОВНО + суть провала
+    (краткая). Возврат: dict {"verdict","fixed_task","reason"} или None (любой сбой думателя =
+    None = fail-safe прежний голый failed)."""
+    prompt = (TASK_THINKER_PREAMBLE +
+              f"УПАВШАЯ ЗАДАЧА (текст дословно):\n{str(task_text or '')[:2000]}\n\n"
+              f"СУТЬ ПРОВАЛА:\n{str(fail_text or '')[:1200]}\n")
+    out = _thinker_exec(prompt, STEP_SELFHEAL_TIMEOUT, "task-selfheal")
+    if out is None:
+        return None
+    verdict = _parse_thinker_json(out, fix_key="fixed_task")
+    if verdict is None:
+        log.warning("task-selfheal: ответ думателя не распарсился (fail-safe failed): %.200s", out)
+    return verdict
+
+
+def _maybe_task_selfheal(tid, text, fail_text, frm):
+    """Провал ОДИНОЧНОЙ задачи lane=pc → тот же думательный слой, РОВНО 1 попытка. Возврат True =
+    финализация сделана здесь (перерождение / терминальный failed с диагнозом); False = прежний
+    голый failed в вызывающем коде (fail-safe). Красное НЕ ослаблено: сюда доходит только
+    исполнительский failed — needs_approval отсечён раньше в run_task/process_new, а плановый рестарт
+    самомод-задачи (фикс 48d9c64) уже стал done внутри run_task и думателя не видит."""
+    hm = _HEAL_TASK_RE.match(str(text or ""))
+    if hm:
+        # перерождённая задача упала ПОВТОРНО → терминальный failed (без retry) — петля невозможна
+        oid = hm.group(1)
+        msg = (f"🛑 самопочинка не помогла (попытка 1 исчерпана): перерождение задачи {oid} упало "
+               f"повторно — нужен человек.\n{str(fail_text or '')}")[:RESULT_MAX]
+        bc.complete_task(tid, "failed", msg)
+        log.info("task-selfheal: id=%s (перерождение задачи %s) упал ПОВТОРНО → терминальный failed", tid, oid)
+        _cowork(f"задача #{tid} (перерождение {oid}) → failed повторно · {_clip(msg)}")
+        _notify(_human("failed", tid, "самопочинка не помогла — нужен человек"))
+        return True
+    verdict = _task_selfheal_consult(text, fail_text)
+    if verdict is None:
+        return False                              # fail-safe: сбой думателя = прежний голый failed
+    reason = verdict["reason"] or "(без причины)"
+    fixed = verdict["fixed_task"]
+    if verdict["verdict"] != "retry" or not fixed:
+        msg = (f"задача упала → думатель: halt, причина: {reason}\n"
+               f"Перерождение не поможет (диагноз думателя выше), нужен человек.\n"
+               f"{str(fail_text or '')}")[:RESULT_MAX]
+        bc.complete_task(tid, "failed", msg)
+        log.info("task-selfheal: id=%s → думатель halt (%s)", tid, reason[:120])
+        _cowork(f"задача #{tid} → failed (думатель: halt) · {_clip(reason)}")
+        _notify(_human("failed", tid, "думатель: halt — нужен человек"))
+        return True
+    reborn = f"[самопочинка задачи {tid}, попытка 1] {fixed}"[:RESULT_MAX]
+    r = bc.enqueue_task(frm or "Filipp", reborn)
+    if not r.get("ok"):
+        log.warning("task-selfheal: перерождение id=%s не встало в очередь (%s) — fail-safe failed",
+                    tid, r.get("error"))
+        return False                              # fail-safe: очередь не приняла → прежний голый failed
+    nid = r.get("id")
+    card = (f"🩹 задача упала → думатель: retry, правка: {fixed[:200]}, причина: {reason[:200]}\n"
+            f"Перерождена задачей id {nid} (попытка 1 из 1; повторный провал = терминальный failed).\n"
+            f"Исходный провал: {str(fail_text or '')[:400]}")[:RESULT_MAX]
+    bc.complete_task(tid, "done", card)           # карточка решения → cowork_log/пуш (тема 829-красное нетронуто)
+    log.info("task-selfheal: id=%s перерождён задачей %s (retry)", tid, nid)
+    _cowork(f"задача #{tid} → самопочинка retry, перерождена #{nid} · {_clip(card)}")
+    _notify(_human("done", tid, f"самопочинка: перерождена задачей #{nid}"))
+    return True
+
+
+def _maybe_selfheal(tid, text, fail_text, frm=""):
+    """Провал одиночной задачи (исполнительский failed) → думательный слой, РОВНО 1 попытка.
+    Возврат True = финализация сделана здесь; False = ничего не делал → прежний путь в вызывающем
+    коде (fail-safe). STEP_SELFHEAL=0/нет → False сразу (поведение байт-в-байт прежнее)."""
+    if not _selfheal_on():
+        return False
+    return _maybe_task_selfheal(tid, text, fail_text, frm)
 
 
 # ------------------- авто-обновление userbot/moderbot после дев-задач ----------

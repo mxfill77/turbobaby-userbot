@@ -57,18 +57,25 @@ class FakeBridge:
     def task_heartbeat(self, tid):
         return {"ok": True}
 
+    def enqueue_task(self, frm, text, lane="pc"):
+        self._id += 1
+        self.tasks[self._id] = {"id": self._id, "status": "new", "lane": lane,
+                                "task_text": text, "updated": None, "result": None, "from": frm}
+        return {"ok": True, "id": self._id}
+
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self._save = (o.bc, o.run_claude, o._notify, o._cowork, o._stopped)
+        self._save = (o.bc, o.run_claude, o._notify, o._cowork, o._stopped, o._selfheal_on)
         self.fb = FakeBridge()
         o.bc = self.fb
         o._notify = lambda *a, **k: None
         o._cowork = lambda *a, **k: None
         o._stopped = lambda: False
+        o._selfheal_on = lambda: False        # существующие тесты — прежнее поведение (флаг off)
 
     def tearDown(self):
-        (o.bc, o.run_claude, o._notify, o._cowork, o._stopped) = self._save
+        (o.bc, o.run_claude, o._notify, o._cowork, o._stopped, o._selfheal_on) = self._save
 
     def _claude(self, rc=0, out="готово\nRESULT: готово", err="", raise_timeout=False, write_marker=False):
         def fake(prompt, timeout, cwd, env):
@@ -822,6 +829,168 @@ class TestAutoUpdateInProcessNew(Base):
         o.process_new()
         self.assertEqual(self.fb.tasks[tid]["status"], "failed")
         self.assertEqual(called["n"], 0)           # провал задачи → бот не трогаем
+
+
+class TestTaskSelfheal(Base):
+    """САМОПОЧИНКА ОДИНОЧНЫХ (STEP_SELFHEAL): думатель/кондуктор и claude замоканы — сеть/боевое
+    не трогаем. Проверяем: (а) починимый → retry → 1 перерождение с маркером → перерождение done;
+    (б) непочинимый → 1 попытка (маркер) → повтор = терминальный failed, БЕЗ третьего перерождения;
+    (в) плановый рестарт (4 признака) → done, думатель НЕ зван; (г) флаг off → голый failed;
+    плюс fail-safe: думатель вернул мусор/таймаут/очередь отказала → голый failed."""
+
+    def setUp(self):
+        super().setUp()
+        o._selfheal_on = lambda: True                 # флаг ВКЛЮЧЁН для этого класса
+        self.thinker_calls = {"n": 0}
+        self._save_thinker = o._thinker_exec
+
+    def tearDown(self):
+        o._thinker_exec = self._save_thinker
+        super().tearDown()
+
+    def _thinker(self, reply):
+        """Замокать думателя (кондуктор): вернуть заданный сырой текст, считая вызовы."""
+        def fake(prompt, timeout, tag):
+            self.thinker_calls["n"] += 1
+            return reply
+        o._thinker_exec = fake
+
+    # ---- (а) починимый провал → retry → одно перерождение с маркером → перерождение done -------
+    def test_a_fixable_retry_reborn_then_done(self):
+        tid = self.fb.add(status="new", task_text="тз: почини путь к файлу")
+        self._thinker('{"verdict":"retry","fixed_task":"почини путь: файл лежит в src/, не в корне","reason":"неверный путь"}')
+
+        def fake(prompt, timeout, cwd, env):
+            if "[самопочинка задачи" in prompt:       # перерождённая задача — успех
+                return (0, "починил\nRESULT: путь исправлен, закоммитил", "")
+            return (0, "болтал без итога", "")         # исходная — нет RESULT → insufficient_output failed
+        o.run_claude = fake
+
+        o.process_new()                                # 1-й цикл: исходная падает → retry → перерождение
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")          # исходная закрыта как done (перерождена)
+        self.assertIn("перерожден", self.fb.tasks[tid]["result"].lower())
+        reborn = [t for t in self.fb.tasks.values() if t["id"] != tid]
+        self.assertEqual(len(reborn), 1)                                # РОВНО одно перерождение
+        self.assertTrue(reborn[0]["task_text"].startswith(f"[самопочинка задачи {tid}, попытка 1]"))
+        self.assertEqual(reborn[0]["status"], "new")
+
+        o.process_new()                                # 2-й цикл: перерождение исполняется → done
+        self.assertEqual(reborn[0]["status"], "done")
+        self.assertIn("путь исправлен", reborn[0]["result"])
+        self.assertEqual(self.thinker_calls["n"], 1)                    # думатель звался ровно раз (для исходной)
+
+    # ---- (б) непочинимый → 1 попытка (маркер) → повтор = терминальный failed, БЕЗ 3-го ---------
+    def test_b_unfixable_marker_stops_loop(self):
+        tid = self.fb.add(status="new", task_text="тз: невыполнимое")
+        self._thinker('{"verdict":"retry","fixed_task":"попробуй иначе","reason":"кривая команда"}')
+        o.run_claude = lambda p, t, c, e: (0, "снова болтал без итога", "")   # падает ВСЕГДА
+
+        o.process_new()                                # исходная → retry → перерождение
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+        reborn = next(t for t in self.fb.tasks.values() if t["id"] != tid)
+        self.assertEqual(len(self.fb.tasks), 2)
+
+        o.process_new()                                # перерождение падает ПОВТОРНО → терминальный failed
+        self.assertEqual(reborn["status"], "failed")
+        self.assertIn("самопочинка не помогла", reborn["result"])
+        self.assertEqual(len(self.fb.tasks), 2)                         # ТРЕТЬЕГО перерождения НЕТ
+        self.assertEqual(self.thinker_calls["n"], 1)                    # на маркированной думателя НЕ звали
+
+    def test_b_halt_terminal_failed_no_reborn(self):
+        tid = self.fb.add(status="new", task_text="тз: нужен человек")
+        self._thinker('{"verdict":"halt","fixed_task":"","reason":"нужен доступ к секрету"}')
+        o.run_claude = lambda p, t, c, e: (0, "болтал без итога", "")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")        # halt → сразу терминальный
+        self.assertIn("halt", self.fb.tasks[tid]["result"].lower())
+        self.assertEqual(len(self.fb.tasks), 1)                         # перерождения НЕТ
+
+    # ---- (в) плановый self-update-рестарт (4 признака) → done, думатель НЕ зван -----------------
+    def test_c_planned_restart_done_no_thinker(self):
+        self._thinker("НЕ ДОЛЖЕН ВЫЗЫВАТЬСЯ")
+        self._save_blob = (o.RUNNING_BLOB, o._blob_hash, o._stopped)
+        try:
+            o.RUNNING_BLOB = "blob-old"
+            o._blob_hash = lambda: "blob-new"          # HEAD демона изменился (self-update назрел)
+            o._stopped = lambda: True                  # рубильник взведён (окно рестарта)
+            with mock.patch.object(o, "resolve_claude", lambda: sys.executable):
+                o.run_claude = lambda p, t, c, e: (143, "", "SIGTERM")   # rc!=0, оборван
+                status, result = o.run_task(7, "тз: самомодификация pc_orchestrator.py")
+            self.assertEqual(status, "done")           # плановый рестарт ≠ падение
+            self.assertIn("плановым рестартом", result)
+            self.assertEqual(self.thinker_calls["n"], 0)                # думатель НЕ зван
+        finally:
+            (o.RUNNING_BLOB, o._blob_hash, o._stopped) = self._save_blob
+
+    def test_c_planned_restart_needs_all_4_signs(self):
+        # не хватает признака (текст НЕ про демон) → честный failed, не done
+        save = (o.RUNNING_BLOB, o._blob_hash)
+        try:
+            o.RUNNING_BLOB = "blob-old"
+            o._blob_hash = lambda: "blob-new"
+            o._stopped = lambda: True
+            with mock.patch.object(o, "resolve_claude", lambda: sys.executable):
+                o.run_claude = lambda p, t, c, e: (143, "", "boom")
+                status, _ = o.run_task(8, "обычная задача, демон не при чём")
+            self.assertEqual(status, "failed")         # 3 из 4 → честный failed (fail-safe)
+        finally:
+            (o.RUNNING_BLOB, o._blob_hash) = save
+
+    # ---- (г) STEP_SELFHEAL=0 → голый failed, думатель не зван (байт-в-байт прежнее) -------------
+    def test_g_flag_off_bare_failed(self):
+        o._selfheal_on = lambda: False
+        tid = self.fb.add(status="new", task_text="тз: упадёт")
+        self._thinker("НЕ ДОЛЖЕН ВЫЗЫВАТЬСЯ")
+        o.run_claude = lambda p, t, c, e: (0, "болтал без итога", "")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertIn("insufficient_output", self.fb.tasks[tid]["result"])   # прежняя причина
+        self.assertEqual(len(self.fb.tasks), 1)                              # без перерождения
+        self.assertEqual(self.thinker_calls["n"], 0)
+
+    # ---- fail-safe: любой сбой думателя = прежний ГОЛЫЙ failed (не хуже) ------------------------
+    def test_failsafe_garbage_reply_bare_failed(self):
+        tid = self.fb.add(status="new", task_text="тз: упадёт")
+        self._thinker("не json, просто болтовня без объекта")            # мусор → parse None
+        o.run_claude = lambda p, t, c, e: (0, "болтал без итога", "")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertIn("insufficient_output", self.fb.tasks[tid]["result"])
+        self.assertEqual(len(self.fb.tasks), 1)                              # голый failed, без перерождения
+
+    def test_failsafe_thinker_timeout_bare_failed(self):
+        tid = self.fb.add(status="new", task_text="тз: упадёт")
+        self._thinker(None)                                             # таймаут/сбой → None
+        o.run_claude = lambda p, t, c, e: (0, "болтал без итога", "")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertEqual(len(self.fb.tasks), 1)
+
+    def test_failsafe_enqueue_rejected_bare_failed(self):
+        tid = self.fb.add(status="new", task_text="тз: упадёт")
+        self._thinker('{"verdict":"retry","fixed_task":"почини","reason":"путь"}')
+        self.fb.enqueue_task = lambda frm, text, lane="pc": {"ok": False, "error": "queue_down"}
+        o.run_claude = lambda p, t, c, e: (0, "болтал без итога", "")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")             # очередь отказала → голый failed
+        self.assertIn("insufficient_output", self.fb.tasks[tid]["result"])
+        self.assertEqual(len(self.fb.tasks), 1)
+
+    # ---- парсер думателя (строгий JSON) --------------------------------------------------------
+    def test_parse_thinker_json_strict(self):
+        self.assertIsNone(o._parse_thinker_json("нет объекта"))
+        self.assertIsNone(o._parse_thinker_json('{"verdict":"maybe"}'))       # verdict не retry/halt
+        v = o._parse_thinker_json('шум {"verdict":"retry","fixed_task":"X","reason":"Y"} хвост')
+        self.assertEqual(v["verdict"], "retry")
+        self.assertEqual(v["fixed_task"], "X")
+
+    def test_thinker_exec_failsafe_on_exception(self):
+        # реальный _thinker_exec: любой сбой subprocess → None (fail-safe), claude не найден → None
+        with mock.patch.object(o, "resolve_claude", lambda: None):
+            self.assertIsNone(o._thinker_exec("p", 5, "t"))
+        with mock.patch.object(o, "resolve_claude", lambda: sys.executable), \
+                mock.patch.object(o.subprocess, "run", side_effect=RuntimeError("boom")):
+            self.assertIsNone(o._thinker_exec("p", 5, "t"))
 
 
 if __name__ == "__main__":
