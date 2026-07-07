@@ -993,6 +993,36 @@ class TestTaskSelfheal(Base):
                 mock.patch.object(o.subprocess, "run", side_effect=RuntimeError("boom")):
             self.assertIsNone(o._thinker_exec("p", 5, "t"))
 
+    def test_thinker_uses_own_thinker_models_not_suggest(self):
+        # думатель формирует CLI-вызов из СВОЕЙ пары THINKER_MODEL/THINKER_FALLBACK,
+        # НЕ из SUGGEST_MODEL клиентского suggest (=sonnet).
+        captured = {}
+
+        class _P:
+            returncode = 0
+            stdout = '{"result": "{\\"verdict\\":\\"halt\\",\\"fixed_task\\":\\"\\",\\"reason\\":\\"x\\"}"}'
+            stderr = ""
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = list(cmd)
+            return _P()
+
+        with mock.patch.object(o, "resolve_claude", lambda: sys.executable), \
+                mock.patch.object(o, "THINKER_MODEL", "fable-5"), \
+                mock.patch.object(o, "THINKER_FALLBACK", "opus-4.8"), \
+                mock.patch.object(o.subprocess, "run", fake_run):
+            o._thinker_exec("prompt", 5, "t")
+        cmd = captured["cmd"]
+        self.assertEqual(cmd[cmd.index("--model") + 1], "fable-5")            # своя голова
+        self.assertEqual(cmd[cmd.index("--fallback-model") + 1], "opus-4.8")  # свой фолбэк
+        self.assertNotIn("sonnet", cmd)                                       # НЕ SUGGEST_MODEL
+
+    def test_thinker_model_defaults_and_no_suggest_coupling(self):
+        # дефолты думателя — своя пара; старое имя переменной убрано; на SUGGEST_MODEL не завязан
+        self.assertEqual(o.THINKER_MODEL, "fable-5")
+        self.assertEqual(o.THINKER_FALLBACK, "opus-4.8")
+        self.assertFalse(hasattr(o, "THINKER_MODEL_FALLBACK"))               # переименовано → THINKER_FALLBACK
+
 
 class TestClientWatchdog(unittest.TestCase):
     """Контур-вотчдог (разбор #128, часть 3): finder/raiser/now/state инъектируются —

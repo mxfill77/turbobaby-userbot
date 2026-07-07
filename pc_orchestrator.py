@@ -671,9 +671,10 @@ def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=Non
 # рестарт ≠ падение» (48d9c64). Под флагом STEP_SELFHEAL: провал ОДИНОЧНОЙ задачи lane=pc,
 # которая НЕ красный NEEDS_APPROVAL (отсечён раньше в run_task→process_new) и НЕ плановый
 # self-update-рестарт (см. _killed_by_planned_restart ниже — стал done внутри run_task), →
-# локальный ДУМАТЕЛЬ (переиспользуем существующий кондуктор Fable5→fallback PC-контура: та же
-# голова/фолбэк SUGGEST_MODEL/SUGGEST_MODEL_FALLBACK, тот же механизм --fallback-model, но чистым
-# генератором --max-turns 1) → строгий JSON {verdict:retry|halt, fixed_task, reason} →
+# локальный ДУМАТЕЛЬ (тот же кондуктор-механизм --fallback-model, чистый генератор --max-turns 1),
+# но со СВОЕЙ парой моделей THINKER_MODEL/THINKER_FALLBACK — НЕ завязан на SUGGEST_MODEL клиентского
+# suggest (у думателя своя задача: строгий диагноз, не клиентский черновик) → строгий JSON
+# {verdict:retry|halt, fixed_task, reason} →
 #   retry: РОВНО одно перерождение «[самопочинка задачи N, попытка 1] …» в очередь lane=pc + карточка;
 #   повторный провал уже МАРКИРОВАННОЙ задачи = терминальный failed (маркер = стоп, петля невозможна);
 #   halt: сразу терминальный failed с причиной.
@@ -682,8 +683,8 @@ def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=Non
 # (поведение байт-в-байт прежнее). Красное НЕ ослаблено: думатель ничего не исполняет
 # (--allowed-tools '' + нейтральный cwd → без settings.json/pretool_guard), тема 829/инбокс 1160 нетронуты.
 STEP_SELFHEAL_TIMEOUT = int(os.getenv("PC_SELFHEAL_TIMEOUT", "180") or "180")   # думатель — короткий ответ
-THINKER_MODEL = os.getenv("SUGGEST_MODEL", "fable").strip() or "fable"          # кондуктор: та же голова, что у suggest
-THINKER_MODEL_FALLBACK = os.getenv("SUGGEST_MODEL_FALLBACK", "sonnet").strip()  # …и тот же фолбэк
+THINKER_MODEL = os.getenv("THINKER_MODEL", "fable-5").strip() or "fable-5"      # своя голова думателя (НЕ SUGGEST_MODEL)
+THINKER_FALLBACK = os.getenv("THINKER_FALLBACK", "opus-4.8").strip()            # свой фолбэк думателя
 # Маркер перерождения одиночной задачи стоит ПЕРВЫМ в тексте → якорь ^ (страховка от ложного
 # срабатывания на ТЗ, где маркер лишь упомянут в теле). N = id исходной задачи.
 _HEAL_TASK_RE = re.compile(r"^\s*\[самопочинка задачи (\d+), попытка (\d+)\]")
@@ -772,8 +773,8 @@ def _thinker_exec(prompt, timeout, tag):
     env["PYTHONIOENCODING"] = "utf-8"
     cmd = [cbin, "-p", prompt, "--model", THINKER_MODEL,
            "--output-format", "json", "--max-turns", "1", "--allowed-tools", ""]
-    if THINKER_MODEL_FALLBACK:                   # кондуктор: фолбэк исполняет сам CLI в этом же вызове
-        cmd += ["--fallback-model", THINKER_MODEL_FALLBACK]
+    if THINKER_FALLBACK:                         # кондуктор: фолбэк исполняет сам CLI в этом же вызове
+        cmd += ["--fallback-model", THINKER_FALLBACK]
     try:
         p = subprocess.run(cmd, cwd=tempfile.gettempdir(), capture_output=True,
                            encoding="utf-8", errors="replace", timeout=timeout, env=env)
