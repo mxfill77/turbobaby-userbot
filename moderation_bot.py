@@ -161,11 +161,21 @@ async def _apply(context, chat_id, draft, dec, edit_msg_id=None):
 
 # ---------------------- O3 кусок 1: карточка «Бронь» --------------------------
 
+INTAKE_ENQUEUE_TIMEOUT = 10   # с; ожидание подтверждения записи в очередь (IPC мёртв → честная ошибка)
+
+
+def _kb_intake(intake_id):
+    """Кнопка «✅ В CRM» на карточке ЗАЯВКА (по тапу — пост во «Входящие брони» userbot-аккаунтом)."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ В CRM", callback_data=f"crm:{intake_id}")]])
+
+
 async def _post_booking_card(context, chat_id, draft, username):
     """Собрать карточку-ЧЕРНОВИК заявки из транскрипта диалога (тот же, что хранит IPC для
     перегенерации) и запостить менеджеру reply на карточку черновика. Ни строчки в CRM/IPC —
     только чтение цены через Bridge. Экстракция (claude CLI) — в отдельном потоке, чтобы не
-    блокировать heartbeat/poll event-loop бота."""
+    блокировать heartbeat/poll event-loop бота. Если из заявки собрался валидный пост «🆕 БРОНЬ»,
+    вешаем кнопку «✅ В CRM» (кандидат сохраняем в очередь intake со статусом draft)."""
     if not suggest.is_approver(username):
         await context.bot.send_message(chat_id, "⛔ Нет прав",
                                        reply_to_message_id=draft.get("card_msg_id"))
@@ -179,13 +189,61 @@ async def _post_booking_card(context, chat_id, draft, username):
             "client_name": draft.get("client_name")}
     try:
         import asyncio
-        card = await asyncio.to_thread(booking_draft.make_booking_card, transcript, meta=meta)
+        card, intake_text = await asyncio.to_thread(
+            booking_draft.make_booking_and_intake, transcript, None, None, None, None, meta)
     except Exception as e:
         log.warning(f"booking card #{draft.get('id')}: {type(e).__name__}: {e}")
         await context.bot.send_message(chat_id, "⚠️ Не удалось собрать заявку (см. moderation_bot.log).",
                                        reply_to_message_id=draft.get("card_msg_id"))
         return
-    await context.bot.send_message(chat_id, card, reply_to_message_id=draft.get("card_msg_id"))
+    kb = None
+    if intake_text:                                   # есть валидный пост → сохраняем кандидат + кнопка
+        try:
+            intake_id = moderation_ipc.save_intake_candidate(intake_text)
+            kb = _kb_intake(intake_id)
+        except Exception as e:
+            log.warning(f"intake candidate #{draft.get('id')}: {type(e).__name__}: {e}")
+    await context.bot.send_message(chat_id, card, reply_markup=kb,
+                                   reply_to_message_id=draft.get("card_msg_id"))
+
+
+async def _confirm_intake(context, q, data):
+    """Тап «✅ В CRM»: подтверждаем запись в очередь (draft→pending) с таймаутом; userbot-аккаунт
+    заберёт и запостит во «Входящие брони». С ПК В CRM НЕ пишем — финальное «да» за авторизатором
+    в группе. Сбой/таймаут записи в очередь → честная ошибка на карточке, бот НЕ падает."""
+    import asyncio
+    username = (q.from_user.username if q.from_user else None)
+    if not suggest.is_approver(username):
+        await context.bot.send_message(q.message.chat_id, "⛔ Нет прав на отправку в CRM")
+        return
+    try:
+        intake_id = int(data.split(":", 1)[1])
+    except Exception:
+        return
+    try:
+        ok = await asyncio.wait_for(
+            asyncio.to_thread(moderation_ipc.confirm_intake, intake_id),
+            timeout=INTAKE_ENQUEUE_TIMEOUT)
+    except Exception as e:   # IPC мёртв / таймаут записи в очередь — честная ошибка, без падения
+        log.warning(f"intake confirm #{intake_id}: {type(e).__name__}: {e}")
+        try:
+            await q.edit_message_reply_markup(reply_markup=_kb_intake(intake_id))  # кнопку оставляем (ретрай)
+        except Exception:
+            pass
+        await context.bot.send_message(
+            q.message.chat_id,
+            "⚠️ Не удалось поставить заявку в очередь отправки (IPC недоступен) — НЕ отправлено, попробуй ещё раз.")
+        return
+    if not ok:   # нет draft-записи или уже ушла
+        await context.bot.send_message(q.message.chat_id, "⚠️ Заявка уже отправлена или устарела — пропускаю.")
+        return
+    base = (q.message.text or "").strip()
+    note = ("\n\n⏳ Отправляю во «Входящие брони» (userbot-аккаунтом) — подтверди там своим «да» "
+            "(ты авторизатор); шли по одной, дожидайся ✅/❌.")
+    try:
+        await q.edit_message_text(base + note)       # карточку редактируем, кнопку убираем (без дублей)
+    except Exception:
+        await context.bot.send_message(q.message.chat_id, note.strip())
 
 
 # ------------------------------- хендлеры ------------------------------------
@@ -193,8 +251,12 @@ async def _post_booking_card(context, chat_id, draft, username):
 async def on_callback(update, context):
     q = update.callback_query
     await q.answer()
+    data = q.data or ""
+    if data.startswith("crm:"):   # O3-2c: «✅ В CRM» — своя маршрутизация (не m:{id}:action)
+        await _confirm_intake(context, q, data)
+        return
     try:
-        _, sid, action = (q.data or "").split(":", 2)
+        _, sid, action = data.split(":", 2)
         draft = moderation_ipc.get(int(sid))
     except Exception:
         return

@@ -203,6 +203,12 @@ async def _suggest_ipc_poller(client):
             await suggest.poll_and_send(client)
         except Exception as e:
             log.warning(f"{_now()} | SUGGEST: IPC-поллер: {e}")
+        try:
+            # O3-2c: пост подтверждённых заявок «🆕 БРОНЬ» во «Входящие брони» ЭТИМ userbot-аккаунтом
+            # (бот-аккаунт INTAKE не видит). Отдельный try — сбой постинга не роняет client-send выше.
+            await suggest.poll_and_post_intake(client)
+        except Exception as e:
+            log.warning(f"{_now()} | SUGGEST: intake-поллер: {e}")
         await asyncio.sleep(3)
 
 

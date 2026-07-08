@@ -1516,6 +1516,48 @@ async def poll_and_send(client, sender=None, jitter=None, sleep=None):
     return n
 
 
+# ------------------- O3-2c: пост «🆕 БРОНЬ» во «Входящие брони» ----------------
+# bot-to-bot невидимость: карточку INTAKE не видит бот-аккаунт → постить должен USERBOT
+# (этот Telethon user-аккаунт). Адресат — СТРОГО INBOX_GROUP_ID (внутренняя группа), НИКОГДА
+# не клиент. С ПК только ПОСТ во «Входящие», НИКАКОЙ прямой записи в CRM. Финальное «да» —
+# живой авторизатор в группе. Триггер-префикс поста — «🆕 БРОНЬ».
+INBOX_GROUP_ID = int(os.getenv("INBOX_GROUP_ID", "-1003997419806") or "-1003997419806")
+INTAKE_POST_PREFIX = "🆕 БРОНЬ"
+
+
+async def poll_and_post_intake(client, poster=None, group_id=None):
+    """Исполнитель userbot: забрать подтверждённые заявки (intake status='pending') и ПОСТ во
+    «Входящие брони» этим userbot-аккаунтом. SAFETY: адресат строго INBOX_GROUP_ID (константа),
+    zero-out клиента сохранён; постим ТОЛЬКО текст, начинающийся с «🆕 БРОНЬ» (иначе INTAKE не
+    распознает). poster(client, group_id, text)->msg_id — инъекция для тестов. → число обработанных."""
+    try:
+        import moderation_ipc
+        rows = moderation_ipc.fetch_pending_intake()
+    except Exception as e:
+        log.warning(f"SUGGEST: poll_and_post_intake: IPC недоступен ({e}).")
+        return 0
+    gid = group_id if group_id is not None else INBOX_GROUP_ID
+    n = 0
+    for r in rows:
+        text = (r.get("text") or "").strip()
+        if not text.startswith(INTAKE_POST_PREFIX):   # защита: не тот формат — не постим наружу
+            moderation_ipc.mark_intake(r["id"], "failed", reason="текст не начинается с 🆕 БРОНЬ")
+            continue
+        try:
+            if poster is not None:
+                mid = await poster(client, gid, text)
+            else:
+                sent = await client.send_message(gid, text)   # userbot-аккаунт → внутренняя группа
+                mid = getattr(sent, "id", None)
+            moderation_ipc.mark_intake(r["id"], "posted", posted_msg_id=mid)
+            log.info(f"SUGGEST: заявка intake #{r['id']} → Входящие брони (msg {mid}).")
+            n += 1
+        except Exception as e:
+            moderation_ipc.mark_intake(r["id"], "failed", reason=" ".join(str(e).split())[:200])
+            log.warning(f"SUGGEST: пост заявки intake #{r['id']} упал: {type(e).__name__}: {e}")
+    return n
+
+
 async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
     """Врезка в on_incoming: собрать диалог → черновик → на модерацию.
     bot-режим → в IPC (бот запостит карточку с кнопками); иначе reply-режим (в группу)."""

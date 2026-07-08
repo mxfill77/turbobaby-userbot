@@ -108,6 +108,18 @@ def init_db(path=None):
         c.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_status ON drafts(status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_card ON drafts(card_msg_id)")
+        # O3-2c МОСТ «Заявка → INTAKE»: обратный канал модербот→userbot для ПОСТА карточки
+        # «🆕 БРОНЬ» во «Входящие брони». Статусы: draft (кандидат под кнопкой «✅ В CRM») →
+        # pending (менеджер подтвердил, ждёт постинга userbot-аккаунтом) → posted | failed.
+        # SAFETY: тут только ТЕКСТ поста во внутреннюю группу; НИКАКОЙ записи в CRM, ни адресата-клиента.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS intake (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT, status TEXT, created_ts TEXT, updated_ts TEXT,
+                posted_msg_id INTEGER, reason TEXT
+            )"""
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_intake_status ON intake(status)")
 
 
 def _row(r):
@@ -131,6 +143,52 @@ def enqueue_draft(rec, path=None):
              ts, ts, rec.get("transcript"), rec.get("pricing_note"), rec.get("client_name")),
         )
         return cur.lastrowid
+
+
+# ------------------- O3-2c: очередь поста «🆕 БРОНЬ» → Входящие -----------------
+
+def save_intake_candidate(text, path=None):
+    """Модербот сохраняет КАНДИДАТ поста (status='draft') под кнопкой «✅ В CRM». Возвращает id.
+    Ещё НЕ отправляется — ждёт подтверждения менеджера-авторизатора."""
+    ts = _now_iso()
+    with _conn(path) as c:
+        cur = c.execute(
+            "INSERT INTO intake (text, status, created_ts, updated_ts) VALUES (?, 'draft', ?, ?)",
+            (text, ts, ts),
+        )
+        return cur.lastrowid
+
+
+def confirm_intake(intake_id, path=None):
+    """Тап «✅ В CRM»: перевод draft→pending (запись в очередь на постинг userbot'ом). Это и есть
+    «подтверждение записи в очередь». → True (перевели) | False (нет такой draft-записи / уже ушла)."""
+    with _conn(path) as c:
+        cur = c.execute(
+            "UPDATE intake SET status='pending', updated_ts=? WHERE id=? AND status='draft'",
+            (_now_iso(), intake_id),
+        )
+        return cur.rowcount > 0
+
+
+def fetch_pending_intake(path=None):
+    """userbot забирает подтверждённые посты (status='pending') для отправки во «Входящие брони»."""
+    with _conn(path) as c:
+        return [_row(r) for r in c.execute("SELECT * FROM intake WHERE status='pending' ORDER BY id")]
+
+
+def mark_intake(intake_id, status, posted_msg_id=None, reason=None, path=None):
+    """Итог постинга userbot'ом: posted (ушло, posted_msg_id) | failed (reason)."""
+    assert status in ("posted", "failed")
+    with _conn(path) as c:
+        c.execute(
+            "UPDATE intake SET status=?, posted_msg_id=?, reason=?, updated_ts=? WHERE id=?",
+            (status, posted_msg_id, reason, _now_iso(), intake_id),
+        )
+
+
+def get_intake(intake_id, path=None):
+    with _conn(path) as c:
+        return _row(c.execute("SELECT * FROM intake WHERE id=?", (intake_id,)).fetchone())
 
 
 def fetch_new(path=None):

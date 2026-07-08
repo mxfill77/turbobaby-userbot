@@ -454,11 +454,83 @@ def build_card(ex, allowlist=None, quote_fn=None, today=None, meta=None):
     return "\n".join(lines)
 
 
-def make_booking_card(transcript, call_llm=None, allowlist=None, quote_fn=None, today=None, meta=None):
-    """ВЕРХНИЙ вход для кнопки «📋 Бронь»: транскрипт → экстракция → валидации → карточка.
-    meta — метаданные диалога из записи IPC {client_ref, client_name, transcript} (U/D/подхват
-    модели). В бою deps берутся сами (park_allowlist / quote_for_model / _extract_llm); в тестах —
-    инъекция. НЕ пишет в CRM/IPC — только читает цену Bridge и возвращает строку карточки."""
+# ------------------------- O3-2c: текст поста «🆕 БРОНЬ» ----------------------
+# Формат, который принимает живой INTAKE (Splinter): карточка collect_booking_prompt.txt.
+# Поля с ⚠️/«—» (невалидные/отсутствующие) НЕ включаем — пусть INTAKE честно спросит «не хватает».
+# Цену НЕ шлём (INTAKE берёт её сам). Даты — человеческие (как парсит Splinter) + строка ISO.
+
+def build_intake(ex, allowlist=None, meta=None):
+    """Собрать ТЕКСТ поста «🆕 БРОНЬ» из ВАЛИДНЫХ полей заявки (для «Входящие брони»).
+    → строка поста ИЛИ None (модель под жёстким блоком Click / валидных полей нет — постить нечего).
+    НЕ пишет никуда, цену не зовёт."""
+    meta = meta or {}
+    client_ref = _norm_field(meta.get("client_ref"))
+    transcript = meta.get("transcript") or ""
+
+    mv = classify_model(ex.get("model"), allowlist)
+    if mv["status"] == "click":
+        return None                                  # HONDA CLICK 125 — в CRM не отправляем
+
+    if mv["status"] in ("ok", "no_source"):
+        model_display = mv["display"]
+    else:                                            # не-парк/неизвестна → подхват из черновика треда
+        model_display = thread_model(transcript, allowlist)
+
+    df = _parse_date(ex.get("date_from"))
+    dt_end, _hhmm = _parse_datetime(ex.get("date_to_datetime"))
+    dep_kind, _ = classify_deposit(ex.get("deposit"))
+    note = _norm_field(ex.get("note"))
+    delivery_bad = delivery_outside_phuket(note)
+    handle_at = client_ref if (client_ref and client_ref.startswith("@")) else None
+
+    lines = ["🆕 БРОНЬ (черновик из диалога)"]
+
+    name = _norm_field(ex.get("name"))               # только имя ИЗ ТЕКСТА (профильное «уточни» не шлём)
+    if name and handle_at:
+        lines.append(f"Клиент: {name} ({handle_at})")
+    elif name:
+        lines.append(f"Клиент: {name}")
+    elif handle_at:
+        lines.append(f"Клиент: {handle_at}")
+
+    if model_display:
+        lines.append(f"Модель: {model_display}")
+
+    if df and dt_end:                                # только полный диапазон
+        term = (dt_end - df).days
+        human = f"{_fmt_date(df)} – {_fmt_date(dt_end)}"
+        if term > 0:
+            human += f" ({term} дн.)"
+        lines.append(f"Даты: {human}")
+        lines.append(f"Даты ISO: {df.isoformat()} – {dt_end.isoformat()}")
+
+    contact = _norm_field(ex.get("contact"))
+    if contact:
+        lines.append(f"Контакт: {contact}")
+    elif client_ref and not handle_at:               # idNNN как контакт (username уже в «Клиент»)
+        lines.append(f"Контакт: {client_ref}")
+
+    if note and not delivery_bad:                    # доставка вне Пхукета (⚠️) — не включаем
+        lines.append(f"Доставка: {note}")
+
+    helmets = _norm_field(ex.get("helmets"))
+    if helmets:
+        lines.append(f"Шлемы: {helmets}")
+
+    if dep_kind == "money":                          # ⚠️-конфликт/пусто — не включаем
+        lines.append("Депозит: деньги")
+    elif dep_kind == "passport":
+        lines.append("Депозит: паспорт")
+
+    if len(lines) <= 1:                              # только заголовок, валидных полей нет
+        return None
+    return "\n".join(lines)
+
+
+def make_booking_and_intake(transcript, call_llm=None, allowlist=None, quote_fn=None,
+                            today=None, meta=None):
+    """Одна экстракция → (карточка менеджеру, текст поста «🆕 БРОНЬ»|None). Карточка — для показа,
+    intake-текст — для кнопки «✅ В CRM» (кладётся кандидатом в очередь). НЕ пишет никуда."""
     if allowlist is None and call_llm is None:   # бой: тянем актуальный список парка
         try:
             allowlist = suggest.park_allowlist()
@@ -467,4 +539,15 @@ def make_booking_card(transcript, call_llm=None, allowlist=None, quote_fn=None, 
     meta = dict(meta or {})
     meta.setdefault("transcript", transcript)
     ex = extract_booking(transcript, call_llm=call_llm)
-    return build_card(ex, allowlist=allowlist, quote_fn=quote_fn, today=today, meta=meta)
+    card = build_card(ex, allowlist=allowlist, quote_fn=quote_fn, today=today, meta=meta)
+    intake = build_intake(ex, allowlist=allowlist, meta=meta)
+    return card, intake
+
+
+def make_booking_card(transcript, call_llm=None, allowlist=None, quote_fn=None, today=None, meta=None):
+    """ВЕРХНИЙ вход для кнопки «📋 Бронь»: транскрипт → экстракция → валидации → карточка.
+    meta — метаданные диалога из записи IPC {client_ref, client_name, transcript} (U/D/подхват
+    модели). В бою deps берутся сами (park_allowlist / quote_for_model / _extract_llm); в тестах —
+    инъекция. НЕ пишет в CRM/IPC — только читает цену Bridge и возвращает строку карточки."""
+    return make_booking_and_intake(transcript, call_llm=call_llm, allowlist=allowlist,
+                                   quote_fn=quote_fn, today=today, meta=meta)[0]
