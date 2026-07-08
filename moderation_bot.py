@@ -32,6 +32,7 @@ load_dotenv()
 import suggest            # noqa: E402  (после load_dotenv — читает конфиг из окружения)
 import moderation_core    # noqa: E402
 import moderation_ipc     # noqa: E402
+import booking_draft      # noqa: E402  (O3 кусок 1 «Кнопка Бронь»: экстракция заявки, read-only)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,10 +63,12 @@ def _target_chat():
 
 def _kb_initial():
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Да", callback_data="m:{id}:yes"),
-        InlineKeyboardButton("❌ Отклонить", callback_data="m:{id}:no"),
-    ]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да", callback_data="m:{id}:yes"),
+         InlineKeyboardButton("❌ Отклонить", callback_data="m:{id}:no")],
+        # O3 кусок 1: экстракция заявки из диалога в карточку-черновик (read-only, без записи в CRM).
+        [InlineKeyboardButton("📋 Бронь", callback_data="m:{id}:booking")],
+    ])
 
 
 def _kb_confirm():
@@ -156,6 +159,33 @@ async def _apply(context, chat_id, draft, dec, edit_msg_id=None):
         return
 
 
+# ---------------------- O3 кусок 1: карточка «Бронь» --------------------------
+
+async def _post_booking_card(context, chat_id, draft, username):
+    """Собрать карточку-ЧЕРНОВИК заявки из транскрипта диалога (тот же, что хранит IPC для
+    перегенерации) и запостить менеджеру reply на карточку черновика. Ни строчки в CRM/IPC —
+    только чтение цены через Bridge. Экстракция (claude CLI) — в отдельном потоке, чтобы не
+    блокировать heartbeat/poll event-loop бота."""
+    if not suggest.is_approver(username):
+        await context.bot.send_message(chat_id, "⛔ Нет прав",
+                                       reply_to_message_id=draft.get("card_msg_id"))
+        return
+    transcript = draft.get("transcript") or ""
+    if not transcript.strip():
+        await context.bot.send_message(chat_id, "⚠️ Нет транскрипта диалога — заявку не собрать.",
+                                       reply_to_message_id=draft.get("card_msg_id"))
+        return
+    try:
+        import asyncio
+        card = await asyncio.to_thread(booking_draft.make_booking_card, transcript)
+    except Exception as e:
+        log.warning(f"booking card #{draft.get('id')}: {type(e).__name__}: {e}")
+        await context.bot.send_message(chat_id, "⚠️ Не удалось собрать заявку (см. moderation_bot.log).",
+                                       reply_to_message_id=draft.get("card_msg_id"))
+        return
+    await context.bot.send_message(chat_id, card, reply_to_message_id=draft.get("card_msg_id"))
+
+
 # ------------------------------- хендлеры ------------------------------------
 
 async def on_callback(update, context):
@@ -169,6 +199,9 @@ async def on_callback(update, context):
     if draft is None:
         return
     username = (q.from_user.username if q.from_user else None)
+    if action == "booking":      # 📋 Бронь: экстракция заявки → карточка-черновик менеджеру (read-only)
+        await _post_booking_card(context, q.message.chat_id, draft, username)
+        return
     if action == "remember":     # 📌 захват правки в playbook (Фаза 2) — approver-гейт внутри
         dec = moderation_core.remember_rule(draft, username)
     else:
