@@ -113,6 +113,41 @@ class TestBookingCard(unittest.TestCase):
         kind, _ = booking_draft.classify_deposit("5000")
         self.assertEqual(kind, "money")
 
+    # (1.1) сценарий экзамена: модель распознана неточно, но в черновике треда — «NMAX 155»;
+    # контакт @cryptopeppa в метаданных; клиент не назвался, но есть профиль; Bridge даёт цену.
+    def test_exam_scenario_meta_and_thread_model(self):
+        transcript = "[клиент]: привет, хочу nmax на 10.07-15.07"
+        ex = {"model": "Yamaha Nmax", "name": None, "date_from": "2026-07-10",
+              "date_to_datetime": "2026-07-15", "price_day": None, "deposit": "паспорт",
+              "helmets": "1", "contact": None, "note": "Патонг"}
+        meta = {"client_ref": "@cryptopeppa", "client_name": "Пётр"}
+        qf = _quote_ok(337)
+        card = booking_draft.make_booking_card(transcript, call_llm=_llm(ex), allowlist=ALLOW,
+                                               quote_fn=qf, meta=meta)
+        self.assertIn("C=NMAX 155 (из черновика)", card)     # подхват нормализованной модели треда
+        self.assertIn("цена Bridge", card)                   # Bridge при валидной модели+датах
+        self.assertIn("337", card)
+        self.assertTrue(qf.called)
+        self.assertIn("U=@cryptopeppa", card)                # контакт из метаданных
+        self.assertIn("D=Пётр (из профиля — уточни)", card)  # имя из профиля с пометкой
+
+    def test_u_falls_back_to_client_ref_id(self):
+        ex = {"model": "NMAX 155", "name": "Лена", "date_from": "2026-07-10",
+              "date_to_datetime": "2026-07-15", "price_day": "449", "deposit": "паспорт",
+              "helmets": "1", "contact": None, "note": "Патонг"}
+        card = booking_draft.make_booking_card("dlg", call_llm=_llm(ex), allowlist=ALLOW,
+                                               quote_fn=_quote_ok(449), meta={"client_ref": "id777"})
+        self.assertIn("U=id777", card)
+
+    def test_d_missing_when_no_name_no_profile(self):
+        ex = {"model": "NMAX 155", "name": None, "date_from": "2026-07-10",
+              "date_to_datetime": "2026-07-15", "price_day": "449", "deposit": "паспорт",
+              "helmets": "1", "contact": "@x", "note": "Патонг"}
+        card = booking_draft.make_booking_card("dlg", call_llm=_llm(ex), allowlist=ALLOW,
+                                               quote_fn=_quote_ok(449), meta={"client_ref": "@x"})
+        self.assertIn("D=—", card)
+        self.assertIn("нет имени (D)", card)
+
 
 class TestButtonsIntact(unittest.TestCase):
     """(е-часть) существующие кнопки целы + новая «📋 Бронь» на исходной карточке."""

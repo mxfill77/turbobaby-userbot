@@ -1566,6 +1566,8 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
         "incoming": last_client_line, "draft": draft, "first_contact": first,
         # контекст для СТРАТЕГИЯ-перегенерации (реплика модератора → директива поверх этого):
         "transcript": transcript, "pricing_note": price_note,
+        # first_name профиля — для D-колонки карточки «Бронь», если клиент в тексте не назвался:
+        "client_name": getattr(sender, "first_name", None),
     }
     # bot-режим: кладём в IPC, карточку с кнопками запостит moderation_bot.
     if bot_mode_active():

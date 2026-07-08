@@ -94,12 +94,13 @@ def init_db(path=None):
                 draft TEXT, first_contact INTEGER,
                 status TEXT, card_msg_id INTEGER, final_text TEXT,
                 decided_by TEXT, reason TEXT, created_ts TEXT, updated_ts TEXT,
-                transcript TEXT, pricing_note TEXT, directive TEXT
+                transcript TEXT, pricing_note TEXT, directive TEXT, client_name TEXT
             )"""
         )
         # МИГРАЦИЯ для старых БД: transcript/pricing_note — СТРАТЕГИЯ-перегенерация; directive —
-        # текст правки модератора (для кнопки «Запомнить как правило» → playbook).
-        for col in ("transcript TEXT", "pricing_note TEXT", "directive TEXT"):
+        # текст правки модератора (для кнопки «Запомнить как правило» → playbook); client_name —
+        # first_name профиля клиента (O3 кусок 1.1: D-колонка карточки «Бронь», когда имя в тексте не названо).
+        for col in ("transcript TEXT", "pricing_note TEXT", "directive TEXT", "client_name TEXT"):
             try:
                 c.execute("ALTER TABLE drafts ADD COLUMN " + col)
             except Exception:
@@ -115,18 +116,19 @@ def _row(r):
 
 def enqueue_draft(rec, path=None):
     """userbot кладёт черновик (status=new). rec: client_id, client_ref, lang, incoming,
-    draft, first_contact, transcript, pricing_note. Возвращает id.
-    transcript+pricing_note хранятся для СТРАТЕГИЯ-перегенерации черновика с нуля."""
+    draft, first_contact, transcript, pricing_note, client_name. Возвращает id.
+    transcript+pricing_note хранятся для СТРАТЕГИЯ-перегенерации черновика с нуля;
+    client_name (first_name профиля) — для D-колонки карточки «Бронь»."""
     ts = _now_iso()
     with _conn(path) as c:
         cur = c.execute(
             """INSERT INTO drafts
                (client_id, client_ref, lang, incoming, draft, first_contact,
-                status, created_ts, updated_ts, transcript, pricing_note)
-               VALUES (?,?,?,?,?,?, 'new', ?, ?, ?, ?)""",
+                status, created_ts, updated_ts, transcript, pricing_note, client_name)
+               VALUES (?,?,?,?,?,?, 'new', ?, ?, ?, ?, ?)""",
             (rec.get("client_id"), rec.get("client_ref"), rec.get("lang"),
              rec.get("incoming"), rec.get("draft"), int(bool(rec.get("first_contact"))),
-             ts, ts, rec.get("transcript"), rec.get("pricing_note")),
+             ts, ts, rec.get("transcript"), rec.get("pricing_note"), rec.get("client_name")),
         )
         return cur.lastrowid
 

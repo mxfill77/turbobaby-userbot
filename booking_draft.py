@@ -182,6 +182,31 @@ def classify_model(model_text, allowlist):
     return {"status": status, "display": matched or model_text, "similar": similar}
 
 
+def thread_model(transcript, allowlist):
+    """Нормализованное имя модели ИЗ ПАРКА, выведенное из СОХРАНЁННОГО треда (тот же путь, что
+    у suggest: extract_booking_hints по транскрипту → токен модели → маппинг на отображаемое имя
+    парка). → display-имя из парка ИЛИ None. Используется как подхват, когда экстракция дала
+    неточное/не-парковое имя, а suggest этого треда уже нормализовал модель."""
+    if not (transcript or "").strip():
+        return None
+    try:
+        hints = suggest.extract_booking_hints(transcript)
+    except Exception:
+        return None
+    tokens = hints.get("models") or ([hints.get("model")] if hints.get("model") else [])
+    for tok in tokens:
+        n = _norm_alnum(tok)
+        if not n or n == _norm_alnum(CLICK_KEY):
+            continue
+        for disp, key in suggest.KNOWN_MODELS:
+            if key == CLICK_KEY:
+                continue
+            if key == n or n in key or key in n:      # «nmax»⊂«nmax155», «nmax155»==key и т.п.
+                if allowlist is None or disp in allowlist:
+                    return disp
+    return None
+
+
 def classify_deposit(deposit_text):
     """Правило владельца: залог — ЛИБО число бат, ЛИБО «паспорт», НЕ оба.
     → (kind, shown): money|passport|conflict|none."""
@@ -300,10 +325,15 @@ def delivery_outside_phuket(note):
 
 # ------------------------------- сборка карточки -----------------------------
 
-def build_card(ex, allowlist=None, quote_fn=None, today=None):
+def build_card(ex, allowlist=None, quote_fn=None, today=None, meta=None):
     """Собрать текст карточки-ЧЕРНОВИКА заявки менеджеру из полей экстракции ex + валидаций.
-    allowlist/quote_fn/today инъектируемы. НЕ пишет никуда — только возвращает строку."""
+    allowlist/quote_fn/today инъектируемы. meta — метаданные диалога из записи IPC
+    {client_ref, client_name, transcript} для U/D/подхвата модели. НЕ пишет никуда."""
     warn = []
+    meta = meta or {}
+    client_ref = _norm_field(meta.get("client_ref"))
+    client_name = _norm_field(meta.get("client_name"))
+    transcript = meta.get("transcript") or ""
 
     mv = classify_model(ex.get("model"), allowlist)
 
@@ -317,23 +347,34 @@ def build_card(ex, allowlist=None, quote_fn=None, today=None):
             "Заявку во вкладку «клиенты» НЕ вносить."
         )
 
-    # C — модель
-    if mv["status"] == "empty":
-        c = MISSING
-        warn.append("нет модели (C)")
-    elif mv["status"] == "ok":
-        c = mv["display"]
+    # C — модель. Валидная (ok/no_source) → как есть. Иначе (не-парк/неизвестна/пусто) —
+    # подхват нормализованного имени из СОХРАНЁННОГО черновика треда, если оно есть.
+    model_display = None       # каноничное имя для Bridge-котировки (None → quote не зовём)
+    if mv["status"] == "ok":
+        c = model_display = mv["display"]
     elif mv["status"] == "no_source":
-        c = mv["display"]
+        c = model_display = mv["display"]
         warn.append("список парка недоступен — сверь модель вручную (C)")
-    else:  # not_in_park | unknown
-        c = mv["display"]
-        sim = (" — ближайшие: " + ", ".join(mv["similar"])) if mv["similar"] else ""
-        warn.append(f"модель не из парка (C): {mv['display']}{sim}")
+    else:  # empty | not_in_park | unknown → пробуем модель из черновика треда
+        tm = thread_model(transcript, allowlist)
+        if tm:
+            model_display = tm
+            c = f"{tm} (из черновика)"
+        elif mv["status"] == "empty":
+            c = MISSING
+            warn.append("нет модели (C)")
+        else:  # not_in_park | unknown, черновик не помог
+            c = mv["display"]
+            sim = (" — ближайшие: " + ", ".join(mv["similar"])) if mv["similar"] else ""
+            warn.append(f"модель не из парка (C): {mv['display']}{sim}")
 
-    # D — имя
-    d = ex.get("name") or MISSING
-    if not ex.get("name"):
+    # D — имя: из текста → из профиля (first_name) с пометкой → «—»+⚠️
+    if ex.get("name"):
+        d = ex.get("name")
+    elif client_name:
+        d = f"{client_name} (из профиля — уточни)"
+    else:
+        d = MISSING
         warn.append("нет имени (D)")
 
     # E/F — даты
@@ -348,9 +389,9 @@ def build_card(ex, allowlist=None, quote_fn=None, today=None):
         f = MISSING
         warn.append("нет даты/времени конца (F)")
 
-    # H — цена: НЕ из экстракции, а из Bridge (когда есть model+даты)
-    model_for_quote = mv["display"] if mv["status"] in ("ok", "not_in_park", "no_source") else None
-    pr = resolve_price(model_for_quote, df, dt_end, ex.get("price_day"), quote_fn=quote_fn)
+    # H — цена: НЕ из экстракции, а из Bridge (когда есть ВАЛИДНАЯ модель — вкл. подхваченную
+    # из черновика — и обе даты). model_display выставлен выше только для валидных случаев.
+    pr = resolve_price(model_display, df, dt_end, ex.get("price_day"), quote_fn=quote_fn)
     if pr["status"] == "bridge_ok":
         h = f"{pr['bridge_day']} ฿/день (цена Bridge)"
     elif pr["status"] == "bridge_conflict":
@@ -387,9 +428,13 @@ def build_card(ex, allowlist=None, quote_fn=None, today=None):
     if not ex.get("helmets"):
         warn.append("нет числа шлемов (T)")
 
-    # U — контакт
-    u = ex.get("contact") or MISSING
-    if not ex.get("contact"):
+    # U — контакт: из текста → из метаданных диалога (@username / idNNN системе всегда известен)
+    if ex.get("contact"):
+        u = ex.get("contact")
+    elif client_ref:
+        u = client_ref
+    else:
+        u = MISSING
         warn.append("нет контакта (U)")
 
     # V — примечание + доставка
@@ -409,14 +454,17 @@ def build_card(ex, allowlist=None, quote_fn=None, today=None):
     return "\n".join(lines)
 
 
-def make_booking_card(transcript, call_llm=None, allowlist=None, quote_fn=None, today=None):
+def make_booking_card(transcript, call_llm=None, allowlist=None, quote_fn=None, today=None, meta=None):
     """ВЕРХНИЙ вход для кнопки «📋 Бронь»: транскрипт → экстракция → валидации → карточка.
-    В бою deps берутся сами (park_allowlist / quote_for_model / _extract_llm); в тестах — инъекция.
-    НЕ пишет в CRM/IPC — только читает цену Bridge и возвращает строку карточки."""
+    meta — метаданные диалога из записи IPC {client_ref, client_name, transcript} (U/D/подхват
+    модели). В бою deps берутся сами (park_allowlist / quote_for_model / _extract_llm); в тестах —
+    инъекция. НЕ пишет в CRM/IPC — только читает цену Bridge и возвращает строку карточки."""
     if allowlist is None and call_llm is None:   # бой: тянем актуальный список парка
         try:
             allowlist = suggest.park_allowlist()
         except Exception:
             allowlist = None
+    meta = dict(meta or {})
+    meta.setdefault("transcript", transcript)
     ex = extract_booking(transcript, call_llm=call_llm)
-    return build_card(ex, allowlist=allowlist, quote_fn=quote_fn, today=today)
+    return build_card(ex, allowlist=allowlist, quote_fn=quote_fn, today=today, meta=meta)

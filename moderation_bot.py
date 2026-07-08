@@ -175,9 +175,11 @@ async def _post_booking_card(context, chat_id, draft, username):
         await context.bot.send_message(chat_id, "⚠️ Нет транскрипта диалога — заявку не собрать.",
                                        reply_to_message_id=draft.get("card_msg_id"))
         return
+    meta = {"transcript": transcript, "client_ref": draft.get("client_ref"),
+            "client_name": draft.get("client_name")}
     try:
         import asyncio
-        card = await asyncio.to_thread(booking_draft.make_booking_card, transcript)
+        card = await asyncio.to_thread(booking_draft.make_booking_card, transcript, meta=meta)
     except Exception as e:
         log.warning(f"booking card #{draft.get('id')}: {type(e).__name__}: {e}")
         await context.bot.send_message(chat_id, "⚠️ Не удалось собрать заявку (см. moderation_bot.log).",
