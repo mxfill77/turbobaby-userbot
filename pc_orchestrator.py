@@ -465,6 +465,77 @@ def _human(kind, tid, text):
     return f"Оркестратор: задача #{tid}"
 
 
+# ------------------- команды-рычаги (прямое исполнение без headless) ----------
+# Одиночные lane=pc задачи-команды («рестартни userbot» / «рестартни модербот» / «статус контура»)
+# демон исполняет САМ (полномочия вотчдога), мгновенно, без headless claude. Распознавание — по
+# ЯКОРНЫМ паттернам (НЕ LLM, НЕ подстрока): совпадает, только когда ВЕСЬ текст задачи и есть команда,
+# поэтому дев-задачи («тз: … рестартни …») и путь темы 205 не перехватываются. pc_agent командой не
+# рестартим (агент себя чужими руками не трогает).
+_CMD_RESTART_UB = re.compile(r"^\s*(?:рестартни|рестарт|перезапусти|restart)\s+(?:userbot|юзербот)\s*[.!]*\s*$", re.I)
+_CMD_RESTART_MB = re.compile(r"^\s*(?:рестартни|рестарт|перезапусти|restart)\s+(?:модербот|moderbot|moderation[_ ]?bot|модербот)\s*[.!]*\s*$", re.I)
+_CMD_STATUS = re.compile(r"^\s*статус\s+контура\s*[.!?]*\s*$", re.I)
+
+
+def _match_command(text):
+    """Распознать команду-рычаг по якорным паттернам (весь текст = команда). →
+    'restart_userbot'|'restart_moderbot'|'status' | None (не команда → обычный headless-путь)."""
+    t = str(text or "")
+    if _CMD_STATUS.match(t):
+        return "status"
+    if _CMD_RESTART_UB.match(t):
+        return "restart_userbot"
+    if _CMD_RESTART_MB.match(t):
+        return "restart_moderbot"
+    return None
+
+
+def _proc_line(label, pids, extra=""):
+    base = (f"{label}: жив (PID {', '.join(map(str, pids))})" if pids else f"{label}: НЕ ЖИВ")
+    return base + (f" · {extra}" if extra else "")
+
+
+def _contour_status(finder=None):
+    """Статус клиентского контура: живость+PID userbot/moderation_bot/pc_agent/pc_orchestrator и
+    свежесть heartbeat демона. → многострочный текст (в результат задачи). finder — для тестов."""
+    find = finder or _find_pids_by_script
+    ub, mb = find("userbot_listen.py"), find("moderation_bot.py")
+    ag, orch = find("pc_agent.py"), find("pc_orchestrator.py")
+    mb_extra = "" if mb else ("нет MODERBOT_TOKEN → reply-режим (штатно)"
+                              if not os.getenv("MODERBOT_TOKEN", "").strip() else "")
+    try:
+        hb = open(HEARTBEAT_FILE, encoding="utf-8").read().strip()
+        age = _age_sec(hb)
+        hb_txt = ("нет" if age is None else
+                  f"свеж ({int(age)}с назад)" if age <= HEARTBEAT_STALE else f"ПРОТУХ ({int(age)}с назад)")
+    except Exception:
+        hb_txt = "нет"
+    return "\n".join(["📊 Статус контура:",
+                      _proc_line("userbot", ub),
+                      _proc_line("moderation_bot", mb, mb_extra),
+                      _proc_line("pc_agent", ag),
+                      _proc_line("pc_orchestrator", orch, f"heartbeat {hb_txt}")])
+
+
+def _exec_command(cmd, restart_fn=None, status_fn=None):
+    """Исполнить команду-рычаг НАПРЯМУЮ (полномочия вотчдога), без headless. → (status, result).
+    Рестарт уважает рубильник и штампует анти-флап-реестр (не воюет с авто-применением кода)."""
+    if cmd == "status":
+        return "done", (status_fn or _contour_status)()
+    kind = "userbot" if cmd == "restart_userbot" else "moderbot"
+    if _stopped():
+        return "failed", "рубильник pc_orchestrator.stop активен — рестарт не выполняю"
+    try:
+        ok, pids, detail = (restart_fn or _restart_via_pc_agent)(kind)
+    except Exception as e:
+        return "failed", f"{kind}: исключение рестарта: {e}"
+    _stamp_apply_restart(kind)
+    if ok and pids:
+        return "done", f"🔁 {kind} перезапущен напрямую (рычаг вотчдога): {detail}, PID {', '.join(map(str, pids))}"
+    if ok:
+        return "done", f"🔁 {kind} (рычаг): {detail}"
+    return "failed", f"{kind}: рестарт не удался — {detail}"
+
+
 def process_new():
     """Взять СТАРЕЙШУЮ new-задачу своей полосы, исполнить, записать результат/needs_approval."""
     if _stopped():
@@ -485,6 +556,14 @@ def process_new():
         return
     log.info("CLAIM id=%s in_progress", tid)
     _cowork(f"взял задачу #{tid} (in_progress)")
+    cmd = _match_command(text)                 # команда-рычаг? исполняем САМИ, без headless claude
+    if cmd:
+        status, result = _exec_command(cmd)
+        bc.complete_task(tid, status, result)
+        log.info("COMMAND id=%s cmd=%s → %s", tid, cmd, status)
+        _cowork(f"задача #{tid} (рычаг {cmd}) → {status} · {_clip(result)}")
+        _notify(_human(status, tid, result))
+        return
     # HEAD до задачи (только для дев-задач): диффом head_before..HEAD увидим новые коммиты задачи,
     # чтобы понять, надо ли перезапускать userbot/moderbot (авто-обновление вместо ручной команды).
     head_before = _git_out(["rev-parse", "HEAD"]) if _is_dev_task(text) else None
@@ -629,7 +708,8 @@ def _spawn_daemon():
         return False
 
 
-def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=None, head_fn=None):
+def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=None, head_fn=None,
+                      children_fn=None):
     """→ True = гейт пройден, новый процесс запущен, ТЕКУЩИЙ должен выйти (эстафета передана).
     False = обновляться нечему/нельзя (нет диффа, рубильник, гейт провален, spawn не удался) —
     продолжаем на старом коде. Провал гейта запоминается по блобу (без перегона каждый цикл)."""
@@ -657,6 +737,15 @@ def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=Non
                   RUNNING_COMMIT, new_commit, msg)
         _notify(f"⚠️ Оркестратор: self-update {RUNNING_COMMIT}→{new_commit} провалил unittest-гейт — работаю на старом")
         return False
+    # Дети self-update: применить свежий код к userbot/moderbot по диффу RUNNING_COMMIT..new_commit
+    # ДО передачи эстафеты (pc_agent — только пометка). Делаем это в СТАРОМ процессе (у него есть
+    # ссылка на прежний коммит и общий анти-флап-реестр с maybe_update_bots — не дёрнем повторно то,
+    # что дев-задача уже рестартнула). Best-effort: сбой рестарта детей НЕ блокирует хендовер демона
+    # (дети — отдельные процессы; если что — их подхватит контур-вотчдог нового демона).
+    try:
+        (children_fn or _selfupdate_restart_children)(RUNNING_COMMIT, new_commit)
+    except Exception as e:
+        log.warning("self-update: реконсиляция детей упала (не блокирует хендовер): %s", e)
     if not (spawner or _spawn_daemon)():
         log.error("self-update: spawn нового демона НЕ УДАЛСЯ — продолжаю на старом коде "
                   "(упаду — watchdog поднимет через schtasks)")
@@ -876,9 +965,36 @@ def _maybe_selfheal(tid, text, fail_text, frm=""):
 # Гейт красный → НЕ рестартим (код запушен, применится позже). Стоп-флаг уважаем.
 # suggest.py/pricing.py импортят ОБА бота → их правка рестартит и userbot, и moderbot.
 
-_USERBOT_PREFIXES = ("userbot", "suggest", "pricing")            # userbot_listen → suggest → pricing
-_MODERBOT_PREFIXES = ("moderation", "moderbot", "suggest", "pricing")  # moderation_bot → suggest/pricing
+# ЯВНАЯ карта «файл → какие процессы рестартить» (НЕ эвристика префиксов): единственный источник
+# правды и для авто-обновления после дев-задач (maybe_update_bots), и для реконсиляции детей после
+# self-update демона (_selfupdate_restart_children). Значения — подмножество
+# {"userbot","moderbot","pc_agent"}. pc_agent НИКОГДА не рестартим чужими руками (только пометка
+# «ждёт ручного рестарта»). Правила проверяются по имени файла (basename, lower); один файл может
+# задеть НЕСКОЛЬКО процессов (suggest/pricing импортят и userbot, и moderation_bot — общий рантайм).
+# moderation_ipc.py специально → userbot (IPC модерации исполняет userbot), а НЕ moderbot —
+# поэтому карта явная, без общего префикса «moderation».
+_FILE_PROCESS_RULES = (
+    (lambda n: n.startswith("userbot"),   ("userbot",)),              # userbot_listen.py и т.п.
+    (lambda n: n.startswith("suggest"),   ("userbot", "moderbot")),   # suggest*.py — общий рантайм
+    (lambda n: n.startswith("pricing"),   ("userbot", "moderbot")),   # pricing*.py — общий рантайм
+    (lambda n: n.startswith("booking"),   ("userbot",)),              # booking_draft.py и др. booking-модули
+    (lambda n: n == "moderation_ipc.py",  ("userbot",)),              # IPC модерации → рестарт userbot
+    (lambda n: n == "moderation_bot.py",  ("moderbot",)),             # сам модербот
+    (lambda n: n == "moderation_core.py", ("moderbot",)),             # ядро модерации
+    (lambda n: n == "pc_agent.py",        ("pc_agent",)),             # агент — ТОЛЬКО пометка (ручной рестарт)
+)
 _RE_DEV_TASK = re.compile(r"^\s*тз\b", re.I)   # дев-задача: текст начинается с «тз:/тз …»
+
+
+def _procs_for_file(path):
+    """Множество процессов, которые надо рестартить из-за правки данного файла (по ЯВНОЙ карте).
+    Пусто → файл рантайм ботов не задевает (README/*.md/тесты и т.п.)."""
+    name = os.path.basename(str(path or "")).lower()
+    procs = set()
+    for pred, targets in _FILE_PROCESS_RULES:
+        if pred(name):
+            procs.update(targets)
+    return procs
 
 
 def _is_dev_task(text):
@@ -901,14 +1017,15 @@ def _changed_files_since(head_before):
 
 
 def _classify_changed(paths):
-    """Разложить изменённые файлы по цели рестарта. → (userbot_files, moderbot_files).
-    Файл может попасть в обе группы (suggest/pricing — общий рантайм)."""
+    """Разложить изменённые файлы по цели рестарта бота по ЯВНОЙ карте _FILE_PROCESS_RULES. →
+    (userbot_files, moderbot_files). Файл может попасть в обе группы (suggest/pricing — общий
+    рантайм). pc_agent сюда НЕ попадает: maybe_update_bots рестартит только боты (агент — пометка)."""
     ub, mb = [], []
     for p in paths:
-        name = os.path.basename(p).lower()
-        if name.startswith(_USERBOT_PREFIXES):
+        procs = _procs_for_file(p)
+        if "userbot" in procs:
             ub.append(p)
-        if name.startswith(_MODERBOT_PREFIXES):
+        if "moderbot" in procs:
             mb.append(p)
     return ub, mb
 
@@ -1012,6 +1129,7 @@ def maybe_update_bots(tid, text, head_before, changed_fn=None, gate_fn=None,
             continue
         rok, pids, detail = (restart_fn or _restart_via_pc_agent)(kind)
         if rok and pids:
+            _stamp_apply_restart(kind)          # реестр анти-флапа: реконсиляция self-update не дёрнет повторно
             log.info("авто-обновление %s: обновлён до %s, PID %s", kind, commit, pids)
             notes.append(f"{label} обновлён до {commit}, PID {', '.join(map(str, pids))}")
         elif rok:                               # рестарт не требовался (напр. модербот без токена)
@@ -1022,6 +1140,96 @@ def maybe_update_bots(tid, text, head_before, changed_fn=None, gate_fn=None,
             notes.append(f"{label}: код запушен, рестарт НЕ удался — {_tail(detail, 200)}")
             _notify(f"⚠️ Оркестратор: {label} — рестарт не удался после обновления: {_tail(detail, 200)}")
     return (" | авто-обновление: " + " ; ".join(notes)) if notes else ""
+
+
+# ------------------- анти-флап авто-рестартов + реконсиляция детей self-update ----
+# Лёгкий реестр «когда последний раз авто-рестартили процесс» (в памяти демона). Его СТАМПИТ и
+# maybe_update_bots (рестарт после дев-задачи), и командой-рычагом _exec_command, и реконсиляция
+# детей после self-update; реконсиляция ЧИТАЕТ его и ПОДАВЛЯЕТ рестарт, если процесс дёргали недавно
+# (< APPLY_COOLDOWN_SEC). Так авто-применение кода не воюет с только что случившимся рестартом
+# (уважение анти-флапа — требование задачи). Контур-вотчдог держит СВОЙ отдельный анти-флап
+# (_client_watch_state) — его забор не трогаем.
+APPLY_COOLDOWN_SEC = int(os.getenv("PC_APPLY_COOLDOWN_SEC", "120") or "120")
+_apply_restart_at = {}     # name -> time.time() последнего авто-рестарта (userbot/moderbot)
+
+
+def _stamp_apply_restart(name, now=None, state=None):
+    (state if state is not None else _apply_restart_at)[name] = time.time() if now is None else now
+
+
+def _apply_antiflap(name, now, cooldown, state):
+    """True → рестарт подавить (этот процесс уже авто-рестартили меньше cooldown назад)."""
+    last = state.get(name)
+    return last is not None and (now - last) < cooldown
+
+
+def _diff_names(old_commit, new_commit):
+    """Файлы, изменённые между двумя коммитами (old..new). git молчит/ошибка/нет диффа → []."""
+    if not old_commit or not new_commit or old_commit == new_commit:
+        return []
+    out = _git_out(["diff", "--name-only", f"{old_commit}..{new_commit}"])
+    return [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+
+
+def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_fn=None,
+                                 now=None, cooldown=None, state=None):
+    """После УСПЕШНОГО self-update демона: рестарт затронутых детей по ЯВНОЙ карте на основе диффа
+    old..new. → строка-итог для лога/cowork ('' если никого не трогали). Правила:
+      • userbot/moderbot → штатный рестарт механикой вотчдога (_restart_via_pc_agent), с уважением
+        анти-флапа (недавно рестартили → пропуск);
+      • pc_agent → НЕ трогаем чужими руками, только пометка «ждёт ручного рестарта»;
+      • дифф пуст / тронуты только не-код-файлы (README/*.md/тесты) → никого не рестартим.
+    На каждое применение — NOTE в cowork «авто-применил <коммит>: рестарт <кто>». Всё внешнее
+    (дифф/рестарт/время/реестр) инъектируется — в тестах боевое не дёргаем."""
+    if _stopped():
+        return ""
+    now = time.time() if now is None else now
+    cooldown = APPLY_COOLDOWN_SEC if cooldown is None else cooldown
+    state = _apply_restart_at if state is None else state
+    changed = (diff_fn or _diff_names)(old_commit, new_commit)
+    if not changed:
+        return ""
+    procs = {}          # name -> [files]
+    for p in changed:
+        for name in _procs_for_file(p):
+            procs.setdefault(name, []).append(p)
+    if not procs:
+        return ""                                  # тронуты только не-код-файлы — никого не рестартим
+    notes = []
+    if "pc_agent" in procs:                        # агент себя чужими руками не рестартует — только пометка
+        procs.pop("pc_agent")
+        msg = ("pc_agent изменён — ЖДЁТ РУЧНОГО рестарта (Планировщик/сам подхватит), "
+               "чужими руками не трогаю")
+        log.info("self-update дети: %s", msg)
+        _cowork(f"авто-применил {new_commit}: {msg}")
+        _notify(f"ℹ️ Оркестратор: {msg} (self-update {new_commit})")
+        notes.append(msg)
+    for kind, label in (("userbot", "userbot"), ("moderbot", "модербот")):
+        if kind not in procs:
+            continue
+        if _apply_antiflap(kind, now, cooldown, state):
+            log.info("self-update дети: %s недавно рестартили — анти-флап, рестарт пропущен", kind)
+            notes.append(f"{label}: анти-флап (недавно рестартили) — рестарт пропущен")
+            continue
+        try:
+            ok, pids, detail = (restart_fn or _restart_via_pc_agent)(kind)
+        except Exception as e:
+            ok, pids, detail = False, [], f"исключение рестарта: {e}"
+        _stamp_apply_restart(kind, now, state)
+        if ok and pids:
+            log.info("self-update дети: %s рестартнут до %s, PID %s", kind, new_commit, pids)
+            _cowork(f"авто-применил {new_commit}: рестарт {kind} (PID {', '.join(map(str, pids))})")
+            notes.append(f"{label} рестартнут (PID {', '.join(map(str, pids))})")
+        elif ok:                                    # рестарт не требовался (напр. модербот без токена)
+            log.info("self-update дети: %s — %s", kind, detail)
+            _cowork(f"авто-применил {new_commit}: рестарт {kind} — {_tail(detail, 160)}")
+            notes.append(f"{label}: {detail}")
+        else:
+            log.error("self-update дети: рестарт %s НЕ УДАЛСЯ — %s", kind, detail)
+            _cowork(f"авто-применил {new_commit}: рестарт {kind} НЕ удался — {_tail(detail, 160)}")
+            _notify(f"⚠️ Оркестратор: {label} не рестартнут после self-update {new_commit}: {_tail(detail, 160)}")
+            notes.append(f"{label}: рестарт НЕ удался — {_tail(detail, 160)}")
+    return " ; ".join(notes)
 
 
 # ------------------- контур-вотчдог клиентского контура (часть 3) -------------

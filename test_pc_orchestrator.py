@@ -604,11 +604,13 @@ class TestSelfUpdate(Base):
 
     def setUp(self):
         super().setUp()
-        self._su = (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB)
+        self._su = (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB, o._selfupdate_restart_children)
         o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB = "blob-old", "aaa1111", None
+        # реконсиляция детей замокана в no-op: git-дифф/рестарт боевые НЕ трогаем (проверяем отдельно)
+        o._selfupdate_restart_children = lambda *a, **k: ""
 
     def tearDown(self):
-        (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB) = self._su
+        (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB, o._selfupdate_restart_children) = self._su
         super().tearDown()
 
     def test_no_diff_no_restart(self):
@@ -1205,6 +1207,220 @@ class TestSingletonLock(unittest.TestCase):
         with mock.patch.object(o.subprocess, "Popen", fake_popen):
             self.assertTrue(o._spawn_daemon())
         self.assertEqual(captured["env"][o.SUPERSEDE_ENV], str(os.getpid()))
+
+
+class TestFileProcessMap(unittest.TestCase):
+    """ЯВНАЯ карта файл→процесс (не эвристика) + распознавание команд-рычагов по якорям."""
+
+    def test_explicit_map(self):
+        self.assertEqual(o._procs_for_file("userbot_listen.py"), {"userbot"})
+        self.assertEqual(o._procs_for_file("booking_draft.py"), {"userbot"})
+        self.assertEqual(o._procs_for_file("moderation_ipc.py"), {"userbot"})    # → userbot, НЕ moderbot
+        self.assertEqual(o._procs_for_file("moderation_bot.py"), {"moderbot"})
+        self.assertEqual(o._procs_for_file("moderation_core.py"), {"moderbot"})
+        self.assertEqual(o._procs_for_file("suggest.py"), {"userbot", "moderbot"})
+        self.assertEqual(o._procs_for_file("pricing_rules.py"), {"userbot", "moderbot"})
+        self.assertEqual(o._procs_for_file("pc_agent.py"), {"pc_agent"})
+        self.assertEqual(o._procs_for_file("README.md"), set())
+        self.assertEqual(o._procs_for_file("CLAUDE.md"), set())
+        self.assertEqual(o._procs_for_file("test_suggest.py"), set())            # тест — не рантайм
+
+    def test_classify_moderation_ipc_to_userbot(self):
+        ub, mb = o._classify_changed(["moderation_ipc.py"])
+        self.assertIn("moderation_ipc.py", ub)
+        self.assertNotIn("moderation_ipc.py", mb)
+
+    def test_match_command_anchored(self):
+        self.assertEqual(o._match_command("рестартни userbot"), "restart_userbot")
+        self.assertEqual(o._match_command("Перезапусти userbot!"), "restart_userbot")
+        self.assertEqual(o._match_command("рестартни модербот"), "restart_moderbot")
+        self.assertEqual(o._match_command("рестарт moderation_bot"), "restart_moderbot")
+        self.assertEqual(o._match_command("статус контура"), "status")
+        self.assertIsNone(o._match_command("тз: рестартни userbot при сбое"))    # дев-задача НЕ перехвачена
+        self.assertIsNone(o._match_command("обнови userbot"))                    # не наша команда
+        self.assertIsNone(o._match_command("расскажи про статус контура войск"))
+        self.assertIsNone(o._match_command(""))
+
+
+class TestSelfUpdateChildren(Base):
+    """(1) авто-рестарт детей при self-update по диффу old..new (ЯВНАЯ карта): git-дифф/рестарт/
+    время/реестр инъектируются — боевое НЕ трогаем. Пункты (а),(б),(д),(е) + интеграция + анти-флап
+    против дев-рестарта."""
+
+    def test_a_userbot_change_restarts_userbot_with_note(self):
+        kinds, cows = [], []
+        o._cowork = lambda s: cows.append(s)
+        note = o._selfupdate_restart_children(
+            "old", "c0mmit1",
+            diff_fn=lambda a, b: ["userbot_listen.py"],
+            restart_fn=lambda kind: kinds.append(kind) or (True, [9999], "PID поднят, лог свежий"),
+            state={}, now=1000, cooldown=120)
+        self.assertEqual(kinds, ["userbot"])                                     # стоп+старт userbot
+        self.assertIn("userbot рестартнут", note)
+        self.assertTrue(any("авто-применил c0mmit1: рестарт userbot" in s for s in cows))
+
+    def test_b_only_md_nobody_restarted(self):
+        kinds = []
+        note = o._selfupdate_restart_children(
+            "old", "c2",
+            diff_fn=lambda a, b: ["README.md", "CLAUDE.md", "docs/guide.md"],
+            restart_fn=lambda kind: kinds.append(kind) or (True, [1], "x"),
+            state={}, now=1, cooldown=120)
+        self.assertEqual(kinds, [])                                              # никого не тронули
+        self.assertEqual(note, "")
+
+    def test_d_pc_agent_manual_note_not_restarted(self):
+        kinds, cows = [], []
+        o._cowork = lambda s: cows.append(s)
+        note = o._selfupdate_restart_children(
+            "old", "c3",
+            diff_fn=lambda a, b: ["pc_agent.py"],
+            restart_fn=lambda kind: kinds.append(kind) or (True, [1], "x"),
+            state={}, now=1, cooldown=120)
+        self.assertEqual(kinds, [])                                              # агент чужими руками НЕ рестартим
+        self.assertIn("РУЧНОГО рестарта", note)
+
+    def test_e_antiflap_recent_restart_suppressed(self):
+        kinds = []
+        note = o._selfupdate_restart_children(
+            "old", "c4",
+            diff_fn=lambda a, b: ["userbot_listen.py"],
+            restart_fn=lambda kind: kinds.append(kind) or (True, [1], "x"),
+            state={"userbot": 1000}, now=1050, cooldown=120)                     # рестартили 50с назад (<120)
+        self.assertEqual(kinds, [])                                              # анти-флап подавил
+        self.assertIn("анти-флап", note)
+
+    def test_devtask_restart_then_selfupdate_suppressed(self):
+        save = dict(o._apply_restart_at)
+        o._apply_restart_at.clear()
+        try:
+            o.maybe_update_bots(                                                 # дев-задача рестартит userbot → штамп
+                5, "тз: правка", "old",
+                changed_fn=lambda hb: ["userbot_listen.py"],
+                gate_fn=lambda mods: (True, "ok"),
+                restart_fn=lambda kind: (True, [111], "ok"),
+                head_fn=lambda: "cc")
+            self.assertIn("userbot", o._apply_restart_at)
+            kinds = []
+            note = o._selfupdate_restart_children(                               # self-update видит тот же файл
+                "old", "cc",
+                diff_fn=lambda a, b: ["userbot_listen.py", "pc_orchestrator.py"],
+                restart_fn=lambda kind: kinds.append(kind) or (True, [1], "x"),
+                cooldown=120, now=o._apply_restart_at["userbot"] + 1)
+            self.assertEqual(kinds, [])                                          # повторно НЕ дёрнули
+            self.assertIn("анти-флап", note)
+        finally:
+            o._apply_restart_at.clear()
+            o._apply_restart_at.update(save)
+
+    def test_selfupdate_invokes_children_reconcile(self):
+        save = (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB)
+        o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB = "blob-old", "old7", None
+        try:
+            seen = {}
+            r = o.maybe_self_update(
+                blob_fn=lambda: "blob-new", head_fn=lambda: "new7",
+                code_gate=lambda: (True, "ok"), tests_gate=lambda: (True, "ok"),
+                spawner=lambda: True,
+                children_fn=lambda old, new: seen.update(old=old, new=new) or "")
+            self.assertTrue(r)
+            self.assertEqual((seen.get("old"), seen.get("new")), ("old7", "new7"))
+        finally:
+            (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB) = save
+
+    def test_moderbot_reply_mode_ok_no_pids(self):
+        note = o._selfupdate_restart_children(
+            "old", "c5",
+            diff_fn=lambda a, b: ["moderation_bot.py"],
+            restart_fn=lambda kind: (True, [], "модербот в reply-режиме (нет MODERBOT_TOKEN) — рестарт не требуется"),
+            state={}, now=1, cooldown=120)
+        self.assertIn("reply-режиме", note)
+
+    def test_child_restart_failure_noted(self):
+        note = o._selfupdate_restart_children(
+            "old", "c6",
+            diff_fn=lambda a, b: ["userbot_listen.py"],
+            restart_fn=lambda kind: (False, [], "процесс не поднялся"),
+            state={}, now=1, cooldown=120)
+        self.assertIn("рестарт НЕ удался", note)
+
+    def test_stop_flag_no_children_restart(self):
+        o._stopped = lambda: True
+        kinds = []
+        note = o._selfupdate_restart_children(
+            "old", "c7",
+            diff_fn=lambda a, b: ["userbot_listen.py"],
+            restart_fn=lambda kind: kinds.append(kind) or (True, [1], "x"),
+            state={}, now=1, cooldown=120)
+        self.assertEqual(note, "")
+        self.assertEqual(kinds, [])
+
+
+class TestCommandLevers(Base):
+    """(2) команды-рычаги: одиночная lane=pc задача-команда исполняется НАПРЯМУЮ, без headless claude."""
+
+    def _no_headless(self):
+        def boom(*a, **k):
+            raise AssertionError("headless claude НЕ должен запускаться для команды-рычага")
+        o.run_claude = boom
+
+    def _patch_restart(self, fn):
+        save = o._restart_via_pc_agent
+        self.addCleanup(lambda: setattr(o, "_restart_via_pc_agent", save))
+        o._restart_via_pc_agent = fn
+
+    def test_v_restart_moderbot_direct_done_no_headless(self):
+        self._no_headless()
+        self._patch_restart(lambda kind: (True, [222], "PID поднят, лог свежий") if kind == "moderbot" else (False, [], "?"))
+        tid = self.fb.add(status="new", task_text="рестартни модербот")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")                   # помечена done
+        self.assertIn("moderbot перезапущен", self.fb.tasks[tid]["result"])      # стоп/старт напрямую
+        self.assertIn("222", self.fb.tasks[tid]["result"])                       # новый PID
+
+    def test_restart_userbot_direct(self):
+        self._no_headless()
+        self._patch_restart(lambda kind: (True, [333], "PID поднят, лог свежий"))
+        tid = self.fb.add(status="new", task_text="рестартни userbot")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+        self.assertIn("userbot перезапущен", self.fb.tasks[tid]["result"])
+
+    def test_status_command_direct(self):
+        self._no_headless()
+        save = o._find_pids_by_script
+        self.addCleanup(lambda: setattr(o, "_find_pids_by_script", save))
+        o._find_pids_by_script = lambda name: [42] if "userbot_listen" in name else []
+        tid = self.fb.add(status="new", task_text="статус контура")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+        self.assertIn("Статус контура", self.fb.tasks[tid]["result"])
+        self.assertIn("userbot: жив", self.fb.tasks[tid]["result"])
+
+    def test_restart_command_failure_failed(self):
+        self._patch_restart(lambda kind: (False, [], "процесс не поднялся"))
+        tid = self.fb.add(status="new", task_text="рестартни userbot")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertIn("не удался", self.fb.tasks[tid]["result"])
+
+    def test_exec_command_respects_stopflag(self):
+        o._stopped = lambda: True
+        status, res = o._exec_command("restart_userbot", restart_fn=lambda k: (True, [1], "x"))
+        self.assertEqual(status, "failed")
+        self.assertIn("рубильник", res)
+
+    def test_non_command_dev_task_uses_headless(self):
+        called = {"n": 0}
+
+        def fake(prompt, timeout, cwd, env):
+            called["n"] += 1
+            return (0, "сделал\nRESULT: готово", "")
+        o.run_claude = fake
+        tid = self.fb.add(status="new", task_text="тз: рестартни userbot при сбое")
+        o.process_new()
+        self.assertEqual(called["n"], 1)                                         # ушло в headless (не перехвачено)
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
 
 
 if __name__ == "__main__":
