@@ -1224,17 +1224,52 @@ class TestPriceSheet(unittest.TestCase):
                     "cap_price": cp, "text": f"{bike} {days}d {total}"}}
         return fake
 
+    # Реальное сообщение клиента (дословно, 21:11) — провалившийся живой тест 68cfc31.
+    # Правило-класс: фразы для тестов детекта = РЕАЛЬНЫЕ клиентские, не идеализированные.
+    LIVE_PHRASE = ("Какие марки и модели байков вы предлагаете? Какие у вас цены на аренду? "
+                   "(Стоимость за день, неделю и месяц для разных моделей.) Требуется ли депозит?")
+
     # ---- ЭТАП 2: детект намерения (позитив/негатив) ----
     def test_detect_positive(self):
-        for s in ["цены на все модели на 15.07-15.08", "пришлите прайс", "прайс-лист по всему парку",
+        for s in [# старые явные формы
+                  "цены на все модели на 15.07-15.08", "пришлите прайс", "прайс-лист по всему парку",
                   "сколько стоит аренда всех байков", "all models price for a month", "price list please",
-                  "дайте цены по всем моделям"]:
-            self.assertTrue(suggest._asks_price_sheet(s, s), s)
+                  "дайте цены по всем моделям",
+                  # ЖИВАЯ фраза клиента + парафразы RU/EN (перечень моделей / цены-в-целом)
+                  self.LIVE_PHRASE,
+                  "какие модели байков у вас есть?",
+                  "сколько стоит аренда байка в день и в неделю?",
+                  "что по ценам на прокат скутеров?",
+                  "подскажите стоимость аренды на месяц",
+                  "какие у вас расценки на прокат?",
+                  "what bikes do you have?",
+                  "what are your rental prices?",
+                  "how much is the rental per day, week and month?",
+                  "price per day, week or month for different models?"]:
+            self.assertTrue(suggest._asks_price_sheet(s.lower(), s.lower()), s)
 
     def test_detect_negative(self):
-        for s in ["сколько стоит NMAX", "цена на ADV350 на месяц", "всё включено в цену?",
-                  "у вас все байки новые?", "какой депозит", "можно два байка?"]:
-            self.assertFalse(suggest._asks_price_sheet(s, s), s)
+        for s in [# явная одна модель / нет цены-парка
+                  "сколько стоит NMAX", "цена на ADV350 на месяц", "всё включено в цену?",
+                  "у вас все байки новые?", "какой депозит", "можно два байка?",
+                  # одна названная модель → точечный quote, приветствие, ТОЛЬКО депозит
+                  "сколько стоит nmax на неделю", "какие цены на nmax?",
+                  "здравствуйте!", "добрый день, вы работаете?",
+                  "нужен ли депозит?", "какой залог?"]:
+            self.assertFalse(suggest._asks_price_sheet(s.lower(), s.lower()), s)
+
+    def test_live_phrase_end_to_end_yields_grid_no_date_question(self):
+        # ЖИВАЯ фраза клиента дословно → hints.price_sheet_q True → сетка СРАЗУ, без вопроса про даты/модель.
+        hints = suggest.extract_booking_hints(f"[клиент]: {self.LIVE_PHRASE}",
+                                              today=datetime.date(2026, 7, 11))
+        self.assertTrue(hints["price_sheet_q"])          # детект на реальной фразе сработал
+        self.assertIsNone(hints["model"])                # конкретной модели нет → не точечный quote
+        note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+        self.assertIn("ПРАЙС ПО ПАРКУ", note)            # сетка по парку
+        self.assertIn("1 дн — 450 ฿", note)              # реальные цифры сразу
+        self.assertNotIn("Попроси", note)                # НЕ просим даты
+        self.assertNotIn("НЕ называй НИКАКУЮ цену", note)  # НЕ ушли в гейт дат
 
     def test_hints_flag_set_on_episode(self):
         h = suggest.extract_booking_hints("[клиент]: нужны цены на все модели на 15.07-15.08")

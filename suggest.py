@@ -740,18 +740,49 @@ _PS_PRICE_LIST = re.compile(
     r"прайс[\s\-]?лист|прайс[- ]?лист|\bпрайс\b|price\s*-?\s*list|pricelist"
     r"|список\s+(?:модел|байк|цен|тариф)|list\s+of\s+(?:models|bikes|prices)", re.I)
 _PS_PRICE_WORD = re.compile(
-    r"цен[аыу]|цены|стоимост|стоит|сколько|тариф|price|cost|how\s+much|\brate", re.I)
+    r"цен[аыуэ]|цены|стоимост|стоит|сколько|тариф|расцен|price|cost|how\s+much|\brate", re.I)
+
+# --- смысловые признаки (классификация, а НЕ бесконечный список ключевиков) --------------------
+# Клиент реально просит либо ПЕРЕЧЕНЬ моделей, либо ЦЕНЫ-В-ЦЕЛОМ (не по одной названной модели).
+# Признак «перечень» = вопрос/предложение-цель + собирательное «модели/байки/марки».
+_PS_ENUM_CUE = re.compile(
+    r"как(?:ие|ой|их|ого)\b|что\s+(?:за|есть|у\s+вас|вы|предлаг)"
+    r"|какой\s+выбор|ассортимент|перечень|каталог|модельн\w*\s+ряд|линейк"
+    r"|предлаг\w*|сдаёте|сдаете|в\s+нали\w*"
+    r"|\bwhat\b|\bwhich\b|list\s+of\b|range\s+of\b|(?:do\s+you|you)\s+(?:have|offer|rent)"
+    r"|available|selection|catalog|line\s*-?up", re.I)
+_PS_FLEET_NOUN = re.compile(
+    r"марк\w*|модел\w*|байк\w*|скутер\w*|мотоцикл\w*|мопед\w*|мотик\w*|транспорт\w*|вариант\w*"
+    r"|bikes?|scooters?|models?|brands?|mopeds?|motos?|motorcycles?|options?", re.I)
+# Признак «цены-в-целом» = ценовое слово ВМЕСТЕ с арендой / сроком / вопросительным «сколько/какие».
+_PS_RENTAL = re.compile(r"аренд\w*|прокат\w*|снять|снима\w*|rent\w*|hire|rental", re.I)
+_PS_DURATION = re.compile(
+    r"\bдень\b|\bдня\b|\bдней\b|сут(?:к|очн)\w*|недел\w*|месяц\w*|мес\b"
+    r"|\bday\b|\bweek\b|\bmonth\b|daily|weekly|monthly", re.I)
+_PS_ASK_CUE = re.compile(
+    r"\bсколько\b|как(?:ие|ая|ов[аы])\b|\bпочём\b|\bпочем\b|\bчто\s+по\b"
+    r"|\bhow\s+much\b|\bwhat\b|\bwhich\b", re.I)
 
 
 def _asks_price_sheet(newest: str, recent: str) -> bool:
-    """Детект намерения «прайс по всему парку / все модели». Явный «прайс»/«price list» → True;
-    иначе — «все модели/весь парк» ВМЕСТЕ с ценовым словом. Одна модель / «всё включено» → False."""
+    """Детект СМЫСЛА «дай перечень моделей и/или цены по парку». Классификация, не список слов:
+      • явный «прайс»/«price list» ИЛИ «все модели/весь парк»+цена → True (как раньше);
+      • иначе — вопрос про ПЕРЕЧЕНЬ моделей (какие модели/байки предлагаете) ИЛИ про ЦЕНЫ-В-ЦЕЛОМ
+        (ценовое слово + аренда/срок/«сколько/какие») → True;
+      • НО назван конкретный байк (NMAX / ADV350 / …) → False: это точечный/мульти-quote.
+    Негативы: одна модель, приветствие, вопрос ТОЛЬКО про депозит, «всё включено в цену?»."""
     t = f"{newest or ''}\n{recent or ''}"
     if _PS_PRICE_LIST.search(t):
         return True
     if _PS_ALL_SCOPE.search(t) and _PS_PRICE_WORD.search(t):
         return True
-    return False
+    # Назван конкретный байк → не сетка по парку, а точечная/мульти-котировка.
+    if _detect_models(t.lower()):
+        return False
+    enum = bool(_PS_ENUM_CUE.search(t)) and bool(_PS_FLEET_NOUN.search(t))
+    price_q = bool(_PS_PRICE_WORD.search(t)) and bool(
+        _PS_RENTAL.search(t) or _PS_DURATION.search(t) or _PS_ASK_CUE.search(t))
+    return enum or price_q
 
 
 # Несдаваемые модели: физически в парке (Лист1), но правило KB/CRITICAL_FACTS «НЕ сдаём» —
