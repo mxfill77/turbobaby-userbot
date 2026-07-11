@@ -1271,6 +1271,42 @@ class TestPriceSheet(unittest.TestCase):
         self.assertNotIn("Попроси", note)                # НЕ просим даты
         self.assertNotIn("НЕ называй НИКАКУЮ цену", note)  # НЕ ушли в гейт дат
 
+    def test_live_2227_prior_model_mention_still_yields_grid(self):
+        # КОРЕНЬ живого провала 22:27 (код aae1ed2): та же прайс-фраза, но клиент РАНЬШЕ в окне
+        # упомянул модель («интересует nmax»). Старый модель-гард сканировал ВСЁ окно и глушил
+        # сетку → бот спрашивал даты. Теперь каталог-вопрос сетку сохраняет. Реальный путь боя
+        # (extract_booking_hints по многосообщенческому транскрипту), НЕ идеализированная одиночка.
+        tr = ("[клиент]: привет, интересует nmax\n"
+              "[менеджер]: Здравствуйте!\n"
+              f"[клиент]: {self.LIVE_PHRASE}")
+        h = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        self.assertTrue(h["price_sheet_q"])              # каталог-вопрос перебивает старую модель окна
+        note = suggest.build_pricing_note(h, lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+        self.assertIn("ПРАЙС ПО ПАРКУ", note)            # сетка, а не гейт дат
+        self.assertIn("• Сутки: 450 ฿", note)              # реальные цифры сразу
+        self.assertNotIn("Попроси", note)                # НЕ просим даты
+        self.assertNotIn("НЕ называй НИКАКУЮ цену", note)
+
+    def test_live_2227_two_message_first_contact_yields_grid(self):
+        # Первое обращение ДВУМЯ сообщениями: сперва «хочу adv», следом каталог+цены — тоже сетка.
+        tr = ("[клиент]: здравствуйте, хочу adv\n"
+              f"[клиент]: {self.LIVE_PHRASE}")
+        h = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        self.assertTrue(h["price_sheet_q"])
+
+    def test_catalog_question_with_model_example_yields_grid(self):
+        # Каталог-вопрос в ОДНОМ сообщении с моделью-примером → всё равно сетка (смещение к показу).
+        for s in ["какие модели предлагаете, например nmax, и какие цены?",
+                  "what models do you have, like adv, and prices?"]:
+            self.assertTrue(suggest._asks_price_sheet(s.lower(), s.lower()), s)
+
+    def test_pointed_single_model_in_window_stays_negative(self):
+        # Точечный диалог по ОДНОЙ модели без каталог-вопроса — сетку НЕ включаем (негатив цел),
+        # даже если ценовые слова размазаны по окну.
+        self.assertFalse(suggest._asks_price_sheet("а на неделю?", "сколько стоит nmax а на неделю?"))
+        self.assertFalse(suggest._asks_price_sheet("какие цены на nmax?", "какие цены на nmax?"))
+
     def test_hints_flag_set_on_episode(self):
         h = suggest.extract_booking_hints("[клиент]: нужны цены на все модели на 15.07-15.08")
         self.assertTrue(h["price_sheet_q"])
