@@ -1673,5 +1673,102 @@ class TestCommandLevers(Base):
         self.assertEqual(self.fb.tasks[tid]["status"], "done")
 
 
+class TestDirectChannel(Base):
+    """Этап 1 (развязка 328-pc): прямой канал ПК↔Bridge для одиночек pc — enqueue+claim минуя
+    девбот-в-splinter. Дополнительный путь, тема 328 остаётся рабочей (регресс)."""
+
+    def test_direct_enqueue_then_claim_without_devbot(self):
+        # никакого девбота/splinter в контуре — только Bridge. Прямой enqueue → демон claim'ит и исполняет.
+        ok, nid, err = o.enqueue_pc_task("пк: сделай Y")
+        self.assertTrue(ok)
+        self.assertIsNotNone(nid)
+        self.assertIsNone(err)
+        self.assertEqual(self.fb.tasks[nid]["status"], "new")
+        self.assertEqual(self.fb.tasks[nid]["lane"], "pc")
+        self._claude(0, "сделал\nRESULT: готово")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[nid]["status"], "done")     # принята и взята напрямую
+
+    def test_direct_enqueue_forces_lane_pc(self):
+        ok, nid, _ = o.enqueue_pc_task("пк: X")
+        self.assertTrue(ok)
+        self.assertEqual(self.fb.tasks[nid]["lane"], "pc")          # изоляция: строго своя полоса
+
+    def test_direct_enqueue_empty_rejected(self):
+        ok, nid, err = o.enqueue_pc_task("   ")
+        self.assertFalse(ok)
+        self.assertIsNone(nid)
+        self.assertIn("пуст", err.lower())
+
+    def test_direct_enqueue_bridge_error_reported(self):
+        class _Down:
+            def enqueue_task(self, frm, text, lane="pc"):
+                return {"ok": False, "error": "URLError"}
+        ok, nid, err = o.enqueue_pc_task("пк: X", bridge=_Down())
+        self.assertFalse(ok)
+        self.assertIsNone(nid)
+        self.assertTrue(err)
+
+    def test_splinter_down_direct_path_still_serves_single(self):
+        # «Splinter down» на ПК = девбота/splinter в контуре нет вовсе; путь опирается ТОЛЬКО на
+        # Bridge. Прямой enqueue принимает одиночку, демон её исполняет — инвариант развязки 328-pc.
+        ok, nid, _ = o.enqueue_pc_task("пк: важная одиночка")
+        self.assertTrue(ok)
+        self._claude(0, "ок\nRESULT: сделано")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[nid]["status"], "done")
+
+    def test_regress_devbot_path_intact(self):
+        # регресс: путь темы 328/девбота (задача положена «извне», как её кладёт девбот) цел
+        tid = self.fb.add(status="new", task_text="сделай Z")
+        self._claude(0, "готово\nRESULT: готово")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+
+
+class TestStuckSingles(Base):
+    """Этап 2 (развязка 328-pc): ПК-side таймаут застрявших одиночек lane=pc в in_progress."""
+
+    def test_stale_in_progress_reaped_failed(self):
+        tid = self.fb.add(status="in_progress", updated=iso_ago(o.PC_SINGLE_STALE + 120))
+        o.process_stuck_singles()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertIn("ПК-таймаут", self.fb.tasks[tid]["result"])
+
+    def test_fresh_in_progress_kept(self):
+        tid = self.fb.add(status="in_progress", updated=iso_ago(60))
+        o.process_stuck_singles()
+        self.assertEqual(self.fb.tasks[tid]["status"], "in_progress")   # живой прогон не трогаем
+
+    def test_threshold_strictly_above_task_timeout(self):
+        # порог реапа СТРОГО > жёсткого TASK_TIMEOUT (45 мин) → живой синхронный прогон не срубим
+        self.assertGreater(o.PC_SINGLE_STALE, o.TASK_TIMEOUT)
+
+    def test_other_lane_in_progress_untouched(self):
+        # изоляция контуров: чужая полоса in_progress не реапится ПК-стороной
+        tid = self.fb.add(status="in_progress", lane="vps", updated=iso_ago(o.PC_SINGLE_STALE + 600))
+        o.process_stuck_singles()
+        self.assertEqual(self.fb.tasks[tid]["status"], "in_progress")
+
+    def test_no_updated_not_reaped(self):
+        # updated=None → не реапим (fail-safe: не рубим задачу без метки времени наугад)
+        tid = self.fb.add(status="in_progress", updated=None)
+        o.process_stuck_singles()
+        self.assertEqual(self.fb.tasks[tid]["status"], "in_progress")
+
+    def test_stopflag_skips_reaper(self):
+        o._stopped = lambda: True
+        tid = self.fb.add(status="in_progress", updated=iso_ago(o.PC_SINGLE_STALE + 600))
+        o.process_stuck_singles()
+        self.assertEqual(self.fb.tasks[tid]["status"], "in_progress")   # рубильник → реапер молчит
+
+    def test_poll_once_includes_reaper(self):
+        # реапер встроен в обычный цикл: орфан-одиночка добивается прямо в poll_once
+        tid = self.fb.add(status="in_progress", updated=iso_ago(o.PC_SINGLE_STALE + 300))
+        with mock.patch.object(o, "_write_heartbeat", lambda: None):
+            o.poll_once()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

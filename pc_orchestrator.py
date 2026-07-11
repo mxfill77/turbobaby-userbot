@@ -55,6 +55,13 @@ LANE = os.getenv("PC_LANE", "pc")
 POLL_SEC = int(os.getenv("PC_POLL_SEC", "60") or "60")
 TASK_TIMEOUT = int(os.getenv("PC_TASK_TIMEOUT", "2700") or "2700")     # 45 мин жёсткий таймаут
 APPROVAL_TTL = int(os.getenv("PC_APPROVAL_TTL", "1800") or "1800")     # 30 мин ожидание approve
+# ПК-side ливнесс ОДИНОЧЕК lane=pc (развязка 328-pc, этап 2): одиночка, застрявшая в in_progress
+# дольше этого порога (ПК был выключен / процесс умер посреди прогона / self-update-гонка) →
+# честный failed вместо тихого вечного зависания. Порог СТРОГО > TASK_TIMEOUT (45 мин): демон
+# исполняет одну задачу за раз СИНХРОННО и в пределах TASK_TIMEOUT завершает статус ≠ in_progress,
+# поэтому живой прогон под нож не попадёт — реапится только орфан мёртвого процесса. vps-реапер НЕ
+# дублируем: он про VPS/цепочки, а тут ТОЛЬКО одиночки lane=pc, которых он не видит.
+PC_SINGLE_STALE = int(os.getenv("PC_SINGLE_STALE", "5400") or "5400")  # 90 мин: орфан-одиночка in_progress → failed
 NEEDS_APPROVAL_TOPIC = int(os.getenv("PC_NA_TOPIC", "829") or "829")   # тема, куда Splinter постит карточку
 HEARTBEAT_STALE = int(os.getenv("PC_HB_STALE", "180") or "180")        # watchdog: heartbeat протух
 WATCH_VERIFY_SLEEP = int(os.getenv("PC_WATCH_VERIFY", "20") or "20")
@@ -645,8 +652,65 @@ def process_approval_timeouts():
             _notify(_human("failed", tid, "подтверждение не получено за 30 мин"))
 
 
+# ---------------- ПРЯМОЙ КАНАЛ ПК↔Bridge для ОДИНОЧЕК pc (развязка 328-pc, этап 1) --------------
+# Поставить ОДИНОЧНУЮ lane=pc задачу прямо в очередь Bridge СУЩЕСТВУЮЩИМ экшеном enqueue_task,
+# МИНУЯ девбот-в-splinter (тема 328). Демон claim'ит её обычным поллингом (process_new). Это
+# ДОПОЛНИТЕЛЬНЫЙ путь, НЕ замена темы 328/девбота (тот остаётся рабочим). Инвариант: даже когда
+# Splinter/девбот лежат — и enqueue, и claim идут ПК→Bridge напрямую, поэтому одиночка pc всё равно
+# принимается и исполняется. lane ЖЁСТКО == LANE ('pc') — чужие полосы не трогаем. Эмпирически
+# проверено с ПК: enqueue_task → id, get_pending видит, claim берёт (RECON развязки 328-pc).
+
+def enqueue_pc_task(text, frm="Filipp", bridge=None):
+    """ПРЯМОЙ enqueue одиночки lane=pc в очередь Bridge (существующий экшен, без нового Bridge-кода).
+    Детерминированно, lane жёстко 'pc'. → (ok: bool, id|None, err|None). Демон подхватит её обычным
+    process_new — enqueue+claim идут напрямую ПК→Bridge, независимо от Splinter/девбота (инвариант)."""
+    t = str(text or "").strip()
+    if not t:
+        return False, None, "пустой текст задачи"
+    b = bridge if bridge is not None else bc
+    r = b.enqueue_task(frm or "Filipp", t, lane=LANE)   # LANE == 'pc' строго (чужие полосы не создаём)
+    if not r.get("ok"):
+        return False, None, str(r.get("error") or "enqueue отклонён Bridge")
+    nid = r.get("id")
+    log.info("direct-enqueue: одиночка lane=%s поставлена в очередь id=%s (минуя splinter)", LANE, nid)
+    return True, nid, None
+
+
+# ---------------- ПК-side таймаут ОДИНОЧЕК pc (развязка 328-pc, этап 2) --------------------------
+
+def process_stuck_singles(now=None):
+    """ПК-side ливнесс одиночек lane=pc: задача, застрявшая в in_progress дольше PC_SINGLE_STALE
+    (ПК был выключен / процесс умер посреди прогона / гонка self-update), → честный failed с видимой
+    пометкой вместо тихого вечного зависания. НЕ дублирует и НЕ ослабляет vps-реапер: тот про
+    VPS/цепочки, здесь ТОЛЬКО одиночки lane=pc, которых он не видит. Порог > TASK_TIMEOUT, поэтому
+    живой синхронный прогон демона (≤45 мин) под нож не попадёт — реапится лишь орфан мёртвого
+    процесса. lane СТРОГО (чужие полосы не трогаем: _lane_ok). updated=None → не реапим (fail-safe,
+    идиома `or 0` как в process_approval_timeouts)."""
+    if _stopped():
+        return
+    r = bc.get_pending("in_progress")
+    if not r.get("ok"):
+        log.warning("get_pending(in_progress) ошибка: %s", r.get("error"))
+        return
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    for task in [it for it in r.get("items", []) if _lane_ok(it)]:
+        tid = task.get("id")
+        age = _age_sec(task.get("updated"), now=now) or 0
+        if age <= PC_SINGLE_STALE:
+            continue
+        msg = (f"ПК-таймаут одиночки: задача провисела in_progress {int(age)}с (> {PC_SINGLE_STALE}с) — "
+               "ПК был выключен, либо прогон застрял/оборвался посреди исполнения. Помечена failed "
+               "ПК-ливнессом (не зависает вечно). Повтори при необходимости.")[:RESULT_MAX]
+        bc.complete_task(tid, "failed", msg)
+        log.warning("stuck-single: id=%s in_progress %sс > %sс → failed (ПК-ливнесс одиночки)",
+                    tid, int(age), PC_SINGLE_STALE)
+        _cowork(f"задача #{tid} (одиночка) → failed по ПК-таймауту ({int(age)}с) · {_clip(msg)}")
+        _notify(_human("failed", tid, "ПК-таймаут одиночки (застряла in_progress)"))
+
+
 def poll_once():
-    """Один цикл: довести одобренное → добить просроченные ожидания → взять новое → heartbeat."""
+    """Один цикл: добить орфанов-одиночек → довести одобренное → просроченные ожидания → новое → heartbeat."""
+    process_stuck_singles()       # этап 2: ПК-side ливнесс одиночек pc, застрявших в in_progress
     process_approved()
     process_approval_timeouts()
     process_new()
@@ -1768,5 +1832,15 @@ if __name__ == "__main__":
         except Exception:
             pass
         print("рубильник снят")
+    elif arg == "--enqueue":
+        # ПРЯМОЙ КАНАЛ (этап 1): инъекция одиночки lane=pc прямо в очередь Bridge, минуя splinter.
+        # Демон подхватит обычным поллингом. Работает даже при лежащем Splinter/девботе.
+        text = sys.argv[2] if len(sys.argv) > 2 else ""
+        ok, nid, err = enqueue_pc_task(text)
+        if ok:
+            print(f"OK: одиночка lane={LANE} поставлена в очередь id={nid} (прямой канал, минуя splinter)")
+        else:
+            print(f"FAIL enqueue: {err}")
+            sys.exit(1)
     else:
         main()
