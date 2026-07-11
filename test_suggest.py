@@ -1174,5 +1174,141 @@ class TestSalesPressureAndSafety(unittest.TestCase):
         self.assertLess(sysp.index("ОПЫТ И БЕЗОПАСНОСТЬ"), sysp.index("КНИГА ПРАВИЛ"))
 
 
+class TestPriceSheet(unittest.TestCase):
+    """Прайс по всему парку: детект намерения, детерминированный рендер день/7/месяц из ЖИВОГО
+    формата ячеек Bridge, капы в месячной колонке, allowlist-фильтр (CLICK/не-в-парке), анти-луп.
+    Bridge замокан getter'ом — боевой Календарь НЕ трогаем."""
+
+    # тариф по модели: (day_total, week_total, month_total, deposit, cap_active, cap_price)
+    TAR = {
+        "NMAX 155": (450, 2800, 9000, 5000, True, 8500),      # месяц 9000>cap8500 → «от 8500»
+        "ADV 350": (749, 4928, 14606, 7000, True, 10900),     # месяц капнут
+        "CB 300R": (757, 4716, 12491, 15000, True, 9900),     # мото, месяц капнут
+        "XMAX 300": (700, 4200, 13000, 7000, False, 20000),   # кап НЕ активен → сумма месяца
+    }
+    FLEET_NAMES = ["NMAX 155CC BLACK PHUKET 4255", "ADV 350CC BLACK PHUKET 5849",
+                   "CB 300CC R 9011", "XMAX 300CC GREY PHUKET 4246",
+                   "CLICK 125CC PHUKET 5580"]   # CLICK физически в парке, но НЕ сдаём
+
+    def setUp(self):
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+
+    def tearDown(self):
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+
+    def _getter(self):
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET_NAMES]}}
+            bike = params.get("bike", "")
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            bk = suggest._bike_key(bike)
+            key = next((k for k in self.TAR if suggest._bike_key(k) in bk), None)
+            if key is None:
+                return {"ok": False}
+            d1, d7, d30, dep, ca, cp = self.TAR[key]
+            total = {1: d1, 7: d7, 30: d30}.get(days, d1)
+            return {"ok": True, "data": {"day_price": round(total / max(days, 1)), "total": total,
+                    "deposit": dep, "available": True, "days": days, "cap_active": ca,
+                    "cap_price": cp, "text": f"{bike} {days}d {total}"}}
+        return fake
+
+    # ---- ЭТАП 2: детект намерения (позитив/негатив) ----
+    def test_detect_positive(self):
+        for s in ["цены на все модели на 15.07-15.08", "пришлите прайс", "прайс-лист по всему парку",
+                  "сколько стоит аренда всех байков", "all models price for a month", "price list please",
+                  "дайте цены по всем моделям"]:
+            self.assertTrue(suggest._asks_price_sheet(s, s), s)
+
+    def test_detect_negative(self):
+        for s in ["сколько стоит NMAX", "цена на ADV350 на месяц", "всё включено в цену?",
+                  "у вас все байки новые?", "какой депозит", "можно два байка?"]:
+            self.assertFalse(suggest._asks_price_sheet(s, s), s)
+
+    def test_hints_flag_set_on_episode(self):
+        h = suggest.extract_booking_hints("[клиент]: нужны цены на все модели на 15.07-15.08")
+        self.assertTrue(h["price_sheet_q"])
+        self.assertTrue(h["has_dates"])
+
+    # ---- ЭТАП 1+3: детерминированный рендер + allowlist-фильтр ----
+    def test_rows_exclude_click_and_out_of_park(self):
+        rows = suggest.price_sheet("2026-07-15", getter=self._getter())
+        models = [r["model"] for r in rows]
+        self.assertIn("NMAX 155", models)
+        self.assertIn("CB 300R", models)          # мото матчится (CC-стрип)
+        self.assertNotIn("CLICK 125", models)     # несдаваемая — исключена
+        for m in ("PCX 150", "REBEL 300", "XSR 900", "R7"):
+            self.assertNotIn(m, models)           # не-в-парке отсутствуют
+
+    def test_render_deterministic_numbers(self):
+        rows = suggest.price_sheet("2026-07-15", getter=self._getter())
+        block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
+        self.assertIn("- NMAX 155: 1 дн — 450 ฿ · 7 дн — 2800 ฿ · месяц — от 8500 ฿; депозит 5000 ฿", block)
+        self.assertIn("- ADV 350: 1 дн — 749 ฿ · 7 дн — 4928 ฿ · месяц — от 10900 ฿; депозит 7000 ฿", block)
+
+    def test_month_cap_applied_only_when_over_cap(self):
+        rows = suggest.price_sheet("2026-07-15", getter=self._getter())
+        block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
+        # XMAX кап НЕ активен → показываем СУММУ месяца (13000), не «от»
+        self.assertIn("- XMAX 300: 1 дн — 700 ฿ · 7 дн — 4200 ฿ · месяц — 13000 ฿", block)
+
+    def test_month_cap_en_prefix(self):
+        rows = suggest.price_sheet("2026-07-15", getter=self._getter())
+        block = suggest.render_price_sheet(rows, "2026-07-15", "en")
+        self.assertIn("month — from 8500 ฿", block)     # EN: «from», не «от»
+        self.assertNotIn("месяц", block)
+
+    # ---- ЭТАП 2: анти-луп в note ----
+    def test_note_has_numbers_no_promise_no_reask(self):
+        hints = {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True}
+        note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter())
+        self.assertIn("ПРАЙС ПО ПАРКУ", note)
+        self.assertIn("450 ฿", note)                    # реальные цифры в блоке
+        self.assertIn("НЕ обещай прислать прайс позже", note)
+        self.assertIn("ДОСЛОВНО", note)                 # инвариант: цифры не переформатировать
+
+    def test_note_ask_dates_once_when_no_dates(self):
+        note = suggest.build_pricing_note({"price_sheet_q": True, "has_dates": False}, lang="ru")
+        self.assertIn("Попроси ОДИН раз даты", note)
+        self.assertIn("НЕ переспрашивай", note)         # модель/опыт не переспрашивать
+        # ни одной цены-числа быть не должно
+        self.assertNotIn("฿", note)
+
+    def test_note_unavailable_no_numbers_no_reask(self):
+        empty = lambda p: {"ok": False}                 # Bridge не отдаёт цифр
+        note = suggest.build_pricing_note({"price_sheet_q": True, "iso_start": "2026-07-15",
+                                           "has_dates": True}, lang="ru", getter=empty)
+        self.assertIn("недоступны", note)
+        self.assertNotIn("450", note)
+        self.assertNotIn("฿", note)
+
+    # ---- база: ANTI_LOOP всегда в промпте, инварианты целы ----
+    def test_anti_loop_in_base_prompt(self):
+        sysp = suggest.make_system_prompt("FAQ", "ru")
+        self.assertIn("БЕЗ ПЕРЕСПРОСОВ", sysp)
+        self.assertIn("НЕ обещай", sysp)
+        # ценовая политика и критфакты целы (f0b9316 / инварианты)
+        self.assertIn("ЦЕНОВАЯ ПОЛИТИКА", sysp)
+        self.assertIn("CLICK 125", sysp)
+
+    def test_sheet_block_threads_into_prompt_verbatim(self):
+        hints = {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True}
+        note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter())
+        sysp = suggest.make_system_prompt("FAQ", "ru", pricing_note=note)
+        self.assertIn("1 дн — 450 ฿", sysp)             # цифры доехали до промпта дословно
+        self.assertIn("БЕЗ ПЕРЕСПРОСОВ", sysp)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -728,6 +728,37 @@ def _has_date_signal(text: str) -> bool:
     return any(mo in (text or "") for mo in _MONTHS)
 
 
+# --- намерение «прайс по всему парку / все модели / прайс-лист» (сценарий price_sheet) --------
+# Позитив: «цены на все модели», «прайс», «прайс-лист», «весь парк», «по всем байкам сколько».
+# Негатив: «сколько стоит NMAX» (одна модель), «всё включено?», «все новые байки?» (нет цены/парка).
+_PS_ALL_SCOPE = re.compile(
+    r"вс[еёх]\w*\s+(?:модел|байк|скутер|мотоцикл|вариант)"
+    r"|весь\s+парк|всего\s+парка|по\s+всему\s+парку|на\s+вс[её]\s+модел"
+    r"|all\s+(?:the\s+)?(?:models|bikes|scooters|motos)|whole\s+fleet|entire\s+fleet"
+    r"|full\s+(?:list|range|fleet)|every\s+(?:model|bike)", re.I)
+_PS_PRICE_LIST = re.compile(
+    r"прайс[\s\-]?лист|прайс[- ]?лист|\bпрайс\b|price\s*-?\s*list|pricelist"
+    r"|список\s+(?:модел|байк|цен|тариф)|list\s+of\s+(?:models|bikes|prices)", re.I)
+_PS_PRICE_WORD = re.compile(
+    r"цен[аыу]|цены|стоимост|стоит|сколько|тариф|price|cost|how\s+much|\brate", re.I)
+
+
+def _asks_price_sheet(newest: str, recent: str) -> bool:
+    """Детект намерения «прайс по всему парку / все модели». Явный «прайс»/«price list» → True;
+    иначе — «все модели/весь парк» ВМЕСТЕ с ценовым словом. Одна модель / «всё включено» → False."""
+    t = f"{newest or ''}\n{recent or ''}"
+    if _PS_PRICE_LIST.search(t):
+        return True
+    if _PS_ALL_SCOPE.search(t) and _PS_PRICE_WORD.search(t):
+        return True
+    return False
+
+
+# Несдаваемые модели: физически в парке (Лист1), но правило KB/CRITICAL_FACTS «НЕ сдаём» —
+# в прайс по парку НЕ включаем (Honda Click 125). Ключи нормализованы как _bike_key.
+_NON_RENTABLE_KEYS = {_bike_key("CLICK 125")}   # {'click125'}
+
+
 BOOKING_WINDOW = 3  # сколько последних реплик клиента смотрим, чтобы дособрать ОДНУ бронь
 
 
@@ -795,11 +826,12 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
     else:
         models = newest_models
     deposit_multi_q = _asks_deposit_reduction_multi(newest, recent, models)
+    price_sheet_q = _asks_price_sheet(newest, recent)
 
     return {"model": model, "models": models, "date_start": iso_start, "date_end": iso_end,
             "iso_start": iso_start, "iso_end": iso_end, "term_days": term_days,
             "hint_days": hint_days, "monthly": monthly, "has_dates": has_dates,
-            "deposit_multi_q": deposit_multi_q}
+            "deposit_multi_q": deposit_multi_q, "price_sheet_q": price_sheet_q}
 
 
 # Инструкция про депозит при нескольких байках (правила цен v2, п.4).
@@ -897,12 +929,193 @@ def _wrap_single(kind: str, phrase: str) -> str:
     return "ЦЕНА: " + phrase + "."
 
 
-def build_pricing_note(hints: dict) -> str:
+# ============================ ПРАЙС ПО ВСЕМУ ПАРКУ (price_sheet) ============================
+# Сценарий «клиент просит цены на ВСЕ модели / прайс-лист». Черновик обязан дать РЕАЛЬНЫЕ цифры
+# (день/7 дней/месяц по каждой сдаваемой модели), а не переспрашивать модель/опыт и не обещать
+# «пришлю позже». Источник — ТОЛЬКО живой Bridge (та же точка правды, что quote_price): по каждой
+# модели allowlist три quote() на 1/7/30 дней от даты-якоря. Цифры рендерит КОД детерминированно
+# (инвариант как у кап-подстановки) — LLM их не сочиняет и не переформатирует.
+_SHEET_TERMS = ((1, "day"), (7, "week"), (30, "month"))     # дни аренды от даты-якоря → ключ ячейки
+_SHEET_TTL = int(os.getenv("PRICE_SHEET_TTL_SEC", "180") or "180")   # кэш прайса, минуты (не сутки)
+_sheet_cache = {"key": None, "ts": 0.0, "rows": None}
+
+
+def _sheet_pick_bike(model, bikes):
+    """Один представитель модели из парка (тариф в Календаре — по модели, юнит не важен). → имя|None.
+    Матчим ТЕМ ЖЕ _bike_key, что и park_allowlist (снимает CC/СС): иначе «CB 300R» не сойдётся с
+    именем «CB 300CC R 9011» (pricing._candidates по _norm_alnum спотыкается о CC между моделью и суффиксом)."""
+    mk = _bike_key(model)
+    if not mk:
+        return None
+    for b in (bikes or []):
+        nm = b.get("name") if isinstance(b, dict) else None
+        if nm and mk in _bike_key(nm):
+            return nm
+    return None
+
+
+def price_sheet(ds, getter=None, _now=None, _fleet=None):
+    """Прайс по всему СДАВАЕМОМУ парку на дату-якорь ds (iso). По каждой модели allowlist (кроме
+    несдаваемых) — три quote() (1/7/30 дней) ЖИВЫМ Bridge. → list[{model,class,bike,cells}] или []
+    (нет источника). Кэш _SHEET_TTL сек по ds (только для боевого пути; при инъекции getter — без кэша).
+    getter/_now/_fleet инъектируются в тестах (боевой Bridge не дёргаем)."""
+    now = _now() if _now else time.time()
+    c = _sheet_cache
+    if getter is None and _fleet is None and c["key"] == ds and c["rows"] is not None \
+            and (now - c["ts"]) < _SHEET_TTL:
+        return c["rows"]
+    try:
+        allow = park_allowlist(getter)
+    except Exception:
+        allow = None
+    if not allow:
+        return []
+    models = [m for m in allow if _bike_key(m) not in _NON_RENTABLE_KEYS]
+    bikes = _fleet if _fleet is not None else pricing.fleet(_get=getter)
+    rows = []
+    for m in models:
+        bike = _sheet_pick_bike(m, bikes)
+        if not bike:
+            continue
+        cells = {}
+        for n, key in _SHEET_TERMS:
+            de = _iso_plus(ds, n)
+            q = None
+            if de:
+                try:
+                    q = pricing.quote(bike, ds, de, _get=getter)
+                except Exception:
+                    q = None
+            cells[key] = q
+        rows.append({"model": m, "class": bike_class(m), "bike": bike, "cells": cells})
+    if getter is None and _fleet is None:
+        c.update(key=ds, ts=now, rows=rows)
+    return rows
+
+
+def _sheet_total_cell(q):
+    """Сумма аренды из quote ('4928 ฿') или None (нет цифры — не выдумываем)."""
+    if not isinstance(q, dict):
+        return None
+    t = q.get("total")
+    return f"{t} ฿" if t is not None else None
+
+
+def _sheet_month_cell(q, lang="ru"):
+    """Месячная ячейка с КАПОМ низкого сезона — предикат РОВНО как в _client_price (total>cap_price
+    при cap_active → «от <cap> ฿»); иначе сумма месяца."""
+    if not isinstance(q, dict):
+        return None
+    total = q.get("total")
+    cap_active, cap_price = q.get("cap_active"), q.get("cap_price")
+    if cap_active and cap_price is not None and total is not None and total > cap_price:
+        return (f"from {cap_price} ฿" if lang == "en" else f"от {cap_price} ฿")
+    return f"{total} ฿" if total is not None else None
+
+
+def _sheet_deposit(cells):
+    for key in ("day", "week", "month"):
+        q = cells.get(key)
+        if isinstance(q, dict) and q.get("deposit") is not None:
+            return q["deposit"]
+    return None
+
+
+def _iso_to_human(ds):
+    try:
+        d = datetime.date.fromisoformat(ds)
+        return f"{d.day:02d}.{d.month:02d}.{d.year}"
+    except Exception:
+        return ds or ""
+
+
+def render_price_sheet(rows, ds, lang="ru") -> str:
+    """Детерминированный прайс-блок (КОД, не LLM): по строке на модель «1д · 7д · мес» + депозит.
+    Пустые модели (без единой цифры) пропускаем — числа не выдумываем. → текст или '' (нет цифр)."""
+    en = (lang == "en")
+    lines = []
+    for r in rows:
+        cells = r.get("cells") or {}
+        d = _sheet_total_cell(cells.get("day"))
+        w = _sheet_total_cell(cells.get("week"))
+        mo = _sheet_month_cell(cells.get("month"), lang)
+        if not (d or w or mo):
+            continue
+        na = "—"
+        dep = _sheet_deposit(cells)
+        if en:
+            row = f"- {r['model']}: 1 day — {d or na} · 7 days — {w or na} · month — {mo or na}"
+            if dep is not None:
+                row += f"; deposit {dep} ฿"
+        else:
+            row = f"- {r['model']}: 1 дн — {d or na} · 7 дн — {w or na} · месяц — {mo or na}"
+            if dep is not None:
+                row += f"; депозит {dep} ฿"
+        lines.append(row)
+    return "\n".join(lines)
+
+
+def _wrap_price_sheet(body, ds, lang="ru") -> str:
+    """Обёртка-инструкция вокруг детерминированного прайс-блока: цифры ДОСЛОВНО, мин-срок, без
+    обещаний «пришлю позже». LLM пишет только вежливое обрамление."""
+    human = _iso_to_human(ds)
+    if lang == "en":
+        return (
+            "PARK PRICE LIST from the Calendar — reproduce the numbers VERBATIM (do NOT recalculate, "
+            "round, add or drop models). Rental price: 1 day / 7 days / month (฿); deposit shown per "
+            f"model. Reference start date: {human}. Minimum rental: scooters from 5 days, motorcycles "
+            "from 3 (the «1 day» column is the daily tariff, not a 1-day rental). Availability for the "
+            "exact dates is confirmed per model — offer to check whichever the client wants. Present as "
+            "a clean list in ONE message; do NOT promise to send the price list later — it is right here:\n"
+            + body)
+    return (
+        "ПРАЙС ПО ПАРКУ из Календаря — приведи цифры ДОСЛОВНО (НЕ пересчитывай, НЕ округляй, НЕ "
+        "добавляй и НЕ убирай модели). Цена аренды: 1 день / 7 дней / месяц (฿); депозит — по каждой "
+        f"модели. Дата отсчёта: {human}. Минимальный срок: скутеры от 5 дней, мотоциклы от 3 (колонка "
+        "«1 день» — суточный тариф, а не аренда на один день). Наличие на точные даты подтверждаем по "
+        "каждой модели — предложи проверить те, что интересны. Подай аккуратным списком в ОДНОМ "
+        "сообщении; НЕ обещай прислать прайс позже — он уже здесь:\n" + body)
+
+
+# Прайс запрошен, но дат-якоря нет → просим даты ОДИН раз, без переспроса модели/опыта.
+_PRICE_SHEET_ASK_DATES = (
+    "ПРАЙС ПО ПАРКУ: клиент просит цены на все модели, но дат аренды в диалоге НЕТ. Попроси ОДИН "
+    "раз даты (начало и конец) — и сразу дашь полный прайс по парку. Модель и опыт НЕ переспрашивай "
+    "(клиент просит весь парк). До дат НЕ называй никаких чисел цены (в т.ч. из FAQ).")
+
+# Прайс запрошен, даты есть, но живой источник не отдал ни одной цифры → честный фолбэк БЕЗ чисел
+# и БЕЗ переспроса модели (не выдумываем и не зацикливаемся).
+_PRICE_SHEET_UNAVAILABLE = (
+    "ПРАЙС ПО ПАРКУ: точные цены из Календаря сейчас недоступны. НЕ называй никаких чисел (в т.ч. "
+    "из FAQ) и НЕ переспрашивай модель/опыт; ответь, что соберёшь актуальный прайс по паркам на эти "
+    "даты и вернёшься в ближайшее время.")
+
+
+def build_price_sheet_note(hints, lang="ru", getter=None):
+    """Прайс-блок для промпта, если клиент просит прайс по парку. → строка ИЛИ None (интент не тот).
+    None → обычный ценовой путь build_pricing_note."""
+    if not hints.get("price_sheet_q"):
+        return None
+    ds = hints.get("iso_start")
+    if not ds:
+        return _PRICE_SHEET_ASK_DATES
+    rows = price_sheet(ds, getter=getter)
+    body = render_price_sheet(rows, ds, lang)
+    if not body.strip():
+        return _PRICE_SHEET_UNAVAILABLE
+    return _wrap_price_sheet(body, ds, lang)
+
+
+def build_pricing_note(hints: dict, lang: str = "ru", getter=None) -> str:
     """Инструкция по цене для промпта. ИНВАРИАНТ: без котировки из Календаря — без числа.
     Правила цен v2: кап низкого сезона (п.1), минимальный срок (п.2), несколько моделей одной
-    строкой каждая (п.3), депозит при нескольких байках (п.4), J-текст дословно (п.5)."""
+    строкой каждая (п.3), депозит при нескольких байках (п.4), J-текст дословно (п.5).
+    Сценарий price_sheet (прайс по всему парку) перехватывается ПЕРВЫМ."""
     # (п.4) депозит при нескольких байках — инструкция дописывается к ЛЮБОМУ исходу цены.
     dep = (" " + DEPOSIT_MULTI_NOTE) if hints.get("deposit_multi_q") else ""
+    sheet = build_price_sheet_note(hints, lang=lang, getter=getter)
+    if sheet is not None:
+        return sheet + dep
     if not hints.get("has_dates"):
         return ("ЦЕНА: дат аренды в диалоге НЕТ — попроси у клиента даты (начало/конец) и срок. "
                 "НЕ называй НИКАКУЮ цену: ни точную, ни ориентир, ни «от X ฿», ни диапазон "
@@ -951,6 +1164,17 @@ def _pressure_block(pressure) -> str:
             "вопрос, инициативу брони оставляй клиенту, призыв к действию только по явному интересу."
         )
     return ""   # normal — базовое поведение без изменений (регресс не трогаем)
+
+
+# АНТИ-ЛУП: против переспросов уже известного (симптом «лупили какая модель/какой опыт» при
+# готовом ответе в диалоге) и против обещаний «пришлю прайс позже» при наличии блока ЦЕНА/ПРАЙС.
+ANTI_LOOP_NOTE = (
+    "\n\nБЕЗ ПЕРЕСПРОСОВ (СТРОГО): не спрашивай повторно то, что клиент УЖЕ сообщил или что видно "
+    "из диалога — даты/период аренды, «нужны все модели / весь прайс», что клиент сам менеджер/агент, "
+    "уже названный опыт. Есть в истории — бери оттуда, не переспрашивай. Если ниже передан блок "
+    "ЦЕНА/ПРАЙС с цифрами — приведи эти цифры и НЕ обещай «пришлю прайс/цены позже», «подготовлю "
+    "отдельно», «вернусь с прайсом»: нужные числа уже здесь, дай их сразу."
+)
 
 
 def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pricing_note: str = "",
@@ -1032,7 +1256,7 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         "клиент их видеть НЕ должен. Ответ начинай СРАЗУ по сути (первый контакт → "
         "приветствие → суть; иначе → сразу суть)."
         + pressure_block
-        + directive_block + park_block + greet + policy + scenario + price_block + "\n\n"
+        + directive_block + park_block + greet + policy + scenario + ANTI_LOOP_NOTE + price_block + "\n\n"
         + CRITICAL_FACTS + EXPERIENCE_SAFETY_RULE + playbook_block
         + "\n\nFAQ и эталонные формулировки:\n" + (faq or "(FAQ недоступен — опирайся на критичные факты выше)")
     )
@@ -1580,7 +1804,7 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
     lang = detect_lang_from_client(transcript)
     faq = faq if faq is not None else load_faq()
     # Двухфазная цена: даты есть → пробуем Календарь (pricing.quote), иначе/None → фолбэк.
-    price_note = build_pricing_note(extract_booking_hints(transcript))
+    price_note = build_pricing_note(extract_booking_hints(transcript), lang=lang)
     try:                                   # allowlist парка (Лист1); недоступен → None (fail-safe)
         allow = park_allowlist()
     except Exception as e:
