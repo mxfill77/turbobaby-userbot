@@ -2622,5 +2622,176 @@ class TestLocalDecSelfhealAdapt(Base):
         self.assertEqual(news[0]["task_text"], f"[шаг 2/2 родитель {pid}] шаг B")
 
 
+class TestLocalDecRed(Base):
+    """Шаг 5/7 родителя 185: красная механика локальной цепи (спека §4 «КРАСНОЕ В ЦЕПИ») —
+    NEEDS_APPROVAL шага → set_needs_approval штатным путём, цепь ждёт «да» (тик не релизит);
+    approve → ре-ран [ОДОБРЕНО ЧЕЛОВЕКОМ] → done → продолжение; reject / ⏱-просрочки /
+    ✋-повторное красное после approve → halt цепи БЕЗ думателя + сводка. Красное не ослаблено:
+    перерождение самопочинки с красным выводом снова даёт кнопку. Всё замокано."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["PC_LOCAL_DEC"] = "1"
+        os.environ.pop("PLAN_ADAPT", None)
+        o._loc_summarized.clear()
+        o._loc_adapt_finish.clear()
+        o._loc_adapted.clear()
+
+    def tearDown(self):
+        for k in ("PC_LOCAL_DEC", "PLAN_ADAPT"):
+            os.environ.pop(k, None)
+        o._loc_summarized.clear()
+        o._loc_adapt_finish.clear()
+        o._loc_adapted.clear()
+        super().tearDown()
+
+    # --- обвязка сцены (как в TestLocalDecChain) ---
+
+    def _mk_parent_done(self, plan_lines):
+        pid = self.fb.add(status="done", task_text="крупное ТЗ")
+        self.fb.tasks[pid]["from"] = o.PC_LOCAL_DEC_FROM
+        self.fb.tasks[pid]["result"] = ("🧩 Декомпозиция (локальный дирижёр PC): "
+                                        f"{len(plan_lines)} шагов.\n" + "\n".join(plan_lines))
+        return pid
+
+    def _mk_step(self, pid, i, n, status="new", text="кусок", result=None, updated=None):
+        tid = self.fb.add(status=status, task_text=f"[шаг {i}/{n} родитель {pid}] {text}",
+                          updated=updated)
+        self.fb.tasks[tid]["from"] = o.PC_LOCAL_DEC_FROM
+        self.fb.tasks[tid]["result"] = result
+        return tid
+
+    def _news(self):
+        return [t for t in self.fb.tasks.values() if t["status"] == "new"]
+
+    def _summaries(self, pid):
+        return [t for t in self.fb.tasks.values()
+                if str(t.get("task_text") or "").startswith(f"[сводка родитель {pid}]")]
+
+    def _boom_thinker(self):
+        return mock.patch.object(o, "_thinker_exec",
+                                 mock.Mock(side_effect=AssertionError("думатель не должен зваться")))
+
+    # --- маркеры красной механики байт-в-байт ---
+
+    def test_red_marks_byte_values(self):
+        self.assertEqual(o.MANUAL_MARK, "✋")
+        self.assertEqual(o.TIMEOUT_MARK, "⏱")
+        self.assertEqual(o._REJECT_PREFIX, "отклонено Филиппом")   # префикс devbot-отказа из спеки
+
+    # --- NEEDS_APPROVAL шага → set_needs_approval, цепь ждёт «да» ---
+
+    def test_red_step_sets_needs_approval_and_chain_waits(self):
+        o._selfheal_on = lambda: True                     # даже со включённой самопочинкой
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        sid = self._mk_step(pid, 1, 2, status="new", text="задеплой clasp")
+        self._claude(0, "NEEDS_APPROVAL: op=other | clasp redeploy Bridge")
+        o.process_new()                                   # шаг цепи = ШТАТНЫЙ путь одиночки
+        st = self.fb.tasks[sid]
+        self.assertEqual(st["status"], "needs_approval")  # НЕ failed: кнопку понесёт devbot
+        self.assertIn("op=other", st["result"])           # карточка (what) сохранена для devbot
+        before = len(self.fb.tasks)
+        with self._boom_thinker():
+            o.process_local_chains()                      # тик: ждём Филиппа
+        self.assertEqual(len(self.fb.tasks), before)      # ничего не релизнуто/не посталось
+        self.assertEqual(self._summaries(pid), [])        # цепь ЖИВА, не закрыта
+
+    # --- approve → ре-ран с нотой → done → продолжение цепи ---
+
+    def test_approve_reruns_and_continues_chain(self):
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        sid = self._mk_step(pid, 1, 2, status="approved", text="задеплой clasp",
+                            updated=iso_ago(10))
+        prompts = []
+        def fake(prompt, timeout, cwd, env):
+            prompts.append(prompt)
+            return (0, "сделал по одобрению\nRESULT: ок", "")
+        o.run_claude = fake
+        o.process_approved()
+        self.assertEqual(self.fb.tasks[sid]["status"], "done")
+        self.assertTrue(any("ОДОБРЕНО ЧЕЛОВЕКОМ" in p for p in prompts))
+        o.process_local_chains()                          # done → релиз следующего шага
+        news = self._news()
+        self.assertEqual(len(news), 1)
+        self.assertEqual(news[0]["task_text"], f"[шаг 2/2 родитель {pid}] шаг B")
+
+    # --- reject Филиппа → halt цепи без думателя ---
+
+    def test_reject_halts_chain_without_thinker(self):
+        o._selfheal_on = lambda: True
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="failed", result="отклонено Филиппом (кнопка)")
+        with self._boom_thinker():
+            o.process_local_chains()
+        self.assertEqual(len(self._news()), 0)            # halt: шаг 2 не релизнут
+        sums = self._summaries(pid)
+        self.assertEqual(len(sums), 1)
+        self.assertIn("❌ шаг 1/2", sums[0]["result"])
+
+    # --- просрочка needs_approval (30 мин) → ⏱-failed → halt без думателя ---
+
+    def test_na_timeout_halts_chain_without_thinker(self):
+        o._selfheal_on = lambda: True
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        sid = self._mk_step(pid, 1, 2, status="needs_approval",
+                            updated=iso_ago(o.APPROVAL_TTL + 999))
+        o.process_approval_timeouts()
+        self.assertEqual(self.fb.tasks[sid]["status"], "failed")
+        self.assertTrue(self.fb.tasks[sid]["result"].startswith(o.TIMEOUT_MARK))
+        with self._boom_thinker():
+            o.process_local_chains()
+        self.assertEqual(len(self._news()), 0)
+        self.assertEqual(len(self._summaries(pid)), 1)
+
+    # --- просрочка approved (одобрено, но не исполнено 30 мин) → ⏱-failed → halt без думателя ---
+
+    def test_approved_expiry_halts_chain_without_thinker(self):
+        o._selfheal_on = lambda: True
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        sid = self._mk_step(pid, 1, 2, status="approved", updated=iso_ago(4000))
+        called = {"n": 0}
+        def fake(*a, **k):
+            called["n"] += 1
+            return (0, "не должно вызваться")
+        o.run_claude = fake
+        o.process_approved()
+        self.assertEqual(called["n"], 0)                  # истёкшее не исполняем
+        self.assertEqual(self.fb.tasks[sid]["status"], "failed")
+        self.assertTrue(self.fb.tasks[sid]["result"].startswith(o.TIMEOUT_MARK))
+        with self._boom_thinker():
+            o.process_local_chains()
+        self.assertEqual(len(self._news()), 0)
+        self.assertEqual(len(self._summaries(pid)), 1)
+
+    # --- одобрено, но снова красное → ✋-ручная карта → halt без думателя (разрыв петли) ---
+
+    def test_reapproved_red_manual_card_halts_without_thinker(self):
+        o._selfheal_on = lambda: True
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        sid = self._mk_step(pid, 1, 2, status="approved", text="задеплой clasp",
+                            updated=iso_ago(10))
+        self._claude(0, "NEEDS_APPROVAL: op=other | снова красное")
+        o.process_approved()
+        st = self.fb.tasks[sid]
+        self.assertEqual(st["status"], "failed")          # НЕ needs_approval: ре-аппрув = петля
+        self.assertTrue(st["result"].startswith(o.MANUAL_MARK))
+        self.assertIn("вручную", st["result"])
+        with self._boom_thinker():
+            o.process_local_chains()
+        self.assertEqual(len(self._news()), 0)            # halt цепи
+        self.assertEqual(len(self._summaries(pid)), 1)
+
+    # --- красное НЕ ослаблено: перерождение самопочинки с красным выводом снова даёт кнопку ---
+
+    def test_reborn_red_step_gets_button_again(self):
+        o._selfheal_on = lambda: True
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        sid = self._mk_step(pid, 1, 2, status="new",
+                            text="[самопочинка шага 1, попытка 1] фикс с clasp")
+        self._claude(0, "NEEDS_APPROVAL: op=other | clasp redeploy")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[sid]["status"], "needs_approval")   # кнопка как раньше
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

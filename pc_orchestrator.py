@@ -82,6 +82,9 @@ WAKE_GRACE_SEC = int(os.getenv("PC_WAKE_GRACE", "120") or "120")                
 WAKE_JUMP_MARGIN = int(os.getenv("PC_WAKE_JUMP_MARGIN", "60") or "60")          # скачок wall-clock > POLL+это → «ПК проснулся»
 RESULT_MAX = 4500
 TIMEOUT_MARK = "⏱"       # маркер таймаут/сирота-диагнозов: думатель самопочинки их НЕ чинит
+MANUAL_MARK = "✋"        # маркер «headless доказанно не может» (снова красное ПОСЛЕ approve) —
+                         # зеркало ручной карты VPS «✋ ТРЕБУЕТСЯ РУЧНОЕ ДЕЙСТВИЕ»: думатель НЕ чинит
+                         # (переформулировка родила бы петлю ре-аппрувов), цепь = halt
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")   # ФОЛБЭК: явный путь из .env (может протухнуть при автообновлении)
 # Базовая папка версионных установок claude-code (AppData\Roaming\Claude\claude-code\<версия>\claude.exe).
 # Резолвим НОВЕЙШУЮ установку сами → путь переживает автообновление, даже когда .env-путь протух (WinError 2).
@@ -629,7 +632,9 @@ def process_approved():
             return
         if (_age_sec(task.get("updated")) or 0) > APPROVAL_TTL:
             log.info("APPROVED id=%s истёк (>%ss) → failed", tid, APPROVAL_TTL)
-            msg = "approve истёк (>30 мин) — повтори задачу"
+            # ⏱ первым символом: для шага локальной цепи просрочка approve = halt без думателя
+            # (гейт _loc_after_fail; переформулировка не вернёт ушедшего Филиппа)
+            msg = f"{TIMEOUT_MARK} approve истёк (>30 мин) — повтори задачу"
             bc.complete_task(tid, "failed", msg)
             _cowork(f"задача #{tid} (approved) → failed · {_clip(msg)}")
             _notify(_human("failed", tid, "approve истёк"))
@@ -637,7 +642,11 @@ def process_approved():
         status, result = run_task(tid, str(task.get("task_text") or ""),
                                   note="[ОДОБРЕНО ЧЕЛОВЕКОМ] предыдущий шаг подтверждён. ")
         if status == "needs_approval":
-            msg = "одобрено, но шаг снова упирается в красное — выполни вручную: " + result[:400]
+            # ✋ первым символом (зеркало ручной карты VPS): headless красное ДОКАЗАННО не проходит
+            # даже после «да» — для шага локальной цепи это терминальный halt без думателя
+            # (гейт _loc_after_fail; ре-аппрув/переформулировка = петля, рвём после ровно 1 круга)
+            msg = (f"{MANUAL_MARK} одобрено, но шаг снова упирается в красное — выполни вручную: "
+                   + result[:400])
             bc.complete_task(tid, "failed", msg)
             _cowork(f"задача #{tid} (approved) → failed · {_clip(msg)}")
             _notify(_human("failed", tid, "снова красное после approve — вручную"))
@@ -1292,6 +1301,18 @@ def _local_dec_plan(tid, text):
 # поэтому детект «ПК молчит» (PC_STEP_TIMEOUT) не нужен: зависший in_progress добьёт ПК-ливнесс
 # process_stuck_singles → failed → halt цепи следующим тиком; new ждёт своего FIFO-клейма;
 # needs_approval ждёт Филиппа (просрочку закроет process_approval_timeouts → failed → halt).
+#
+# КРАСНАЯ МЕХАНИКА ЦЕПИ (шаг 5/7 родителя 185, спека §4 «КРАСНОЕ В ЦЕПИ») — ШТАТНЫМ путём
+# одиночек, без спец-веток: шаг цепи = обычная задача очереди, NEEDS_APPROVAL в его выводе →
+# process_new → set_needs_approval (карточку с кнопками несёт devbot VPS: инбокс INBOX_TOPIC_ID,
+# прод 1160; from=Filipp-pcloc-dec включён в его QUEUE_FROMS_PC); тик цепи на needs_approval →
+# return (цепь ЖДЁТ «да», следующий шаг не релизится — sequential-модель). Approve → devbot ставит
+# approved → process_approved ре-ран с нотой [ОДОБРЕНО ЧЕЛОВЕКОМ] → done → тик релизит следующий
+# шаг (продолжение цепи). Reject («нет»/❌ — devbot финализирует failed «отклонено Филиппом»),
+# просрочка needs_approval/approved (⏱-диагнозы) и повторное красное после approve (✋-ручная
+# карта: headless доказанно не может) → halt цепи БЕЗ думателя (гейт _loc_after_fail) + сводка.
+# Красное НЕ ослаблено: перерождённые/скорректированные шаги идут тем же путём — красное снова
+# даст кнопку; approve обхода гейтов не создаёт.
 
 _LOC_STATUSES = ("new", "in_progress", "needs_approval", "approved", "done", "failed")
 _loc_summarized = set()    # родители, по которым сводка уже отправлена (дедуп-кэш памяти процесса;
@@ -1548,7 +1569,8 @@ def _loc_adapt_consult(pid, step_i, steps, remaining):
 
 def _loc_after_fail(pid, i, n, it, steps):
     """Провал шага локальной цепи (уже failed в очереди). Отказ Филиппа / ⏱-диагноз
-    (таймаут headless, ПК-ливнесс застрявшей in_progress, просрочка approve) → halt без
+    (таймаут headless, ПК-ливнесс застрявшей in_progress, просрочка approve/needs_approval) /
+    ✋-ручная карта (одобрено, но headless снова упёрся в красное) → halt без
     думателя; перерождение упало ПОВТОРНО → терминальный halt (🛑-карта); STEP_SELFHEAL=0 →
     прежний halt-on-fail; иначе думатель самопочинки → РОВНО одно перерождение с маркером
     «[самопочинка шага i, попытка 1]» + 🩹-карта. Halt в sequential-модели = просто НЕ релизить
@@ -1557,8 +1579,8 @@ def _loc_after_fail(pid, i, n, it, steps):
     конверта обязан стоять ПЕРВЫМ (^), а текст шага начинается с «[шаг i/N…»."""
     text = str(it.get("task_text") or "")
     fail_text = str(it.get("result") or "")
-    if fail_text.lstrip().startswith((_REJECT_PREFIX, TIMEOUT_MARK)):
-        _loc_post_summary(pid, steps)         # человек сказал «нет» / ⏱ — чинить нечего
+    if fail_text.lstrip().startswith((_REJECT_PREFIX, TIMEOUT_MARK, MANUAL_MARK)):
+        _loc_post_summary(pid, steps)         # человек сказал «нет» / ⏱ / ✋ — чинить нечего
         return
     if _HEAL_RE.search(text):
         _loc_post_card(pid, f"🛑 самопочинка не помогла (попытка 1 исчерпана): шаг {i}/{n} "
