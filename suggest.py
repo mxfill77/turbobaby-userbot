@@ -1029,6 +1029,45 @@ def _iso_to_human(ds):
         return ds or ""
 
 
+def _sheet_min_term_line(lang="ru") -> str:
+    """Строка минимального срока из РЕАЛЬНОГО источника (SCOOTER_MIN_DAYS/MOTO_MIN_DAYS —
+    правила цен v2, п.2), не литералы-цифры. Явно: колонка «1 день» — суточный ТАРИФ, а не
+    право взять байк на одни сутки (ниже мин-срока не оформляем)."""
+    if lang == "en":
+        return (f"Minimum rental: scooters from {SCOOTER_MIN_DAYS} days, "
+                f"motorcycles from {MOTO_MIN_DAYS} (the «1 day» column is the daily tariff, "
+                "not a one-day rental).")
+    return (f"Минимальный срок: скутеры от {SCOOTER_MIN_DAYS} дней, "
+            f"мотоциклы от {MOTO_MIN_DAYS} (колонка «1 день» — суточный тариф, а не аренда на один день).")
+
+
+def _sheet_low_season(rows) -> bool:
+    """Низкий сезон ПО ЖИВОМУ quote (а не по прибитой дате): хоть по одной модели активен кап
+    (cap_active) ИЛИ Bridge вернул season со словом low/низк. Капы существуют ТОЛЬКО в низкий
+    сезон (см. _sheet_month_cell / _client_price) → активный кап = низкий сезон."""
+    for r in rows:
+        for q in (r.get("cells") or {}).values():
+            if not isinstance(q, dict):
+                continue
+            if q.get("cap_active"):
+                return True
+            s = q.get("season")
+            if isinstance(s, str) and ("low" in s.lower() or "низ" in s.lower()):
+                return True
+    return False
+
+
+def _sheet_season_note(rows, lang="ru"):
+    """Сезонная пометка, ВЫВЕДЕННАЯ из дат расчёта через живой quote (cap_active/season), а НЕ
+    прибитая гвоздём (никакого хардкода «до 31.10»: у quote нет поля конца сезона — не выдумываем).
+    Низкий сезон → действуют месячные потолки; иначе None (сезон не утверждаем)."""
+    if not _sheet_low_season(rows):
+        return None
+    if lang == "en":
+        return "Prices reflect the LOW season for the calculated dates (monthly price caps apply)."
+    return "Цены рассчитаны на НИЗКИЙ сезон по датам расчёта (действуют месячные потолки цен)."
+
+
 def render_price_sheet(rows, ds, lang="ru") -> str:
     """Детерминированный прайс-блок (КОД, не LLM): по строке на модель «1д · 7д · мес» + депозит.
     Пустые модели (без единой цифры) пропускаем — числа не выдумываем. → текст или '' (нет цифр)."""
@@ -1055,33 +1094,33 @@ def render_price_sheet(rows, ds, lang="ru") -> str:
     return "\n".join(lines)
 
 
-def _wrap_price_sheet(body, ds, lang="ru") -> str:
-    """Обёртка-инструкция вокруг детерминированного прайс-блока: цифры ДОСЛОВНО, мин-срок, без
-    обещаний «пришлю позже». LLM пишет только вежливое обрамление."""
+def _wrap_price_sheet(body, ds, lang="ru", default_anchor=False) -> str:
+    """Обёртка-инструкция вокруг детерминированного прайс-блока: цифры И строки мин-срока/сезона
+    ДОСЛОВНО, без обещаний «пришлю позже». LLM пишет только вежливое обрамление. default_anchor —
+    дат клиент НЕ назвал: якорь = ближайшая дата (завтра); даты НЕ переспрашиваем (сетка готова)."""
     human = _iso_to_human(ds)
     if lang == "en":
+        anchor = (f"Dates not specified — the price is calculated from the nearest date ({human}, "
+                  "starting tomorrow); if the client names exact dates you will recalculate. Do NOT "
+                  "ask for dates — the price list is already here."
+                  if default_anchor else f"Reference start date: {human}.")
         return (
-            "PARK PRICE LIST from the Calendar — reproduce the numbers VERBATIM (do NOT recalculate, "
-            "round, add or drop models). Rental price: 1 day / 7 days / month (฿); deposit shown per "
-            f"model. Reference start date: {human}. Minimum rental: scooters from 5 days, motorcycles "
-            "from 3 (the «1 day» column is the daily tariff, not a 1-day rental). Availability for the "
-            "exact dates is confirmed per model — offer to check whichever the client wants. Present as "
-            "a clean list in ONE message; do NOT promise to send the price list later — it is right here:\n"
+            "PARK PRICE LIST from the Calendar — reproduce the numbers AND the minimum-rental / season "
+            "lines VERBATIM (do NOT recalculate, round, add or drop models). Rental price: 1 day / "
+            "7 days / month (฿); deposit shown per model. " + anchor + " Availability for the exact "
+            "dates is confirmed per model — offer to check whichever the client wants. Present as a "
+            "clean list in ONE message; do NOT promise to send the price list later — it is right here:\n"
             + body)
+    anchor = (f"Даты аренды клиент не назвал — прайс посчитан от ближайшей даты ({human}, старт "
+              "завтра); назовёт точные даты — пересчитаешь. НЕ переспрашивай даты: сетка уже готова."
+              if default_anchor else f"Дата отсчёта: {human}.")
     return (
-        "ПРАЙС ПО ПАРКУ из Календаря — приведи цифры ДОСЛОВНО (НЕ пересчитывай, НЕ округляй, НЕ "
-        "добавляй и НЕ убирай модели). Цена аренды: 1 день / 7 дней / месяц (฿); депозит — по каждой "
-        f"модели. Дата отсчёта: {human}. Минимальный срок: скутеры от 5 дней, мотоциклы от 3 (колонка "
-        "«1 день» — суточный тариф, а не аренда на один день). Наличие на точные даты подтверждаем по "
-        "каждой модели — предложи проверить те, что интересны. Подай аккуратным списком в ОДНОМ "
+        "ПРАЙС ПО ПАРКУ из Календаря — приведи цифры И строки мин-срока/сезона ДОСЛОВНО (НЕ "
+        "пересчитывай, НЕ округляй, НЕ добавляй и НЕ убирай модели). Цена аренды: 1 день / 7 дней / "
+        "месяц (฿); депозит — по каждой модели. " + anchor + " Наличие на точные даты подтверждаем "
+        "по каждой модели — предложи проверить те, что интересны. Подай аккуратным списком в ОДНОМ "
         "сообщении; НЕ обещай прислать прайс позже — он уже здесь:\n" + body)
 
-
-# Прайс запрошен, но дат-якоря нет → просим даты ОДИН раз, без переспроса модели/опыта.
-_PRICE_SHEET_ASK_DATES = (
-    "ПРАЙС ПО ПАРКУ: клиент просит цены на все модели, но дат аренды в диалоге НЕТ. Попроси ОДИН "
-    "раз даты (начало и конец) — и сразу дашь полный прайс по парку. Модель и опыт НЕ переспрашивай "
-    "(клиент просит весь парк). До дат НЕ называй никаких чисел цены (в т.ч. из FAQ).")
 
 # Прайс запрошен, даты есть, но живой источник не отдал ни одной цифры → честный фолбэк БЕЗ чисел
 # и БЕЗ переспроса модели (не выдумываем и не зацикливаемся).
@@ -1091,29 +1130,40 @@ _PRICE_SHEET_UNAVAILABLE = (
     "даты и вернёшься в ближайшее время.")
 
 
-def build_price_sheet_note(hints, lang="ru", getter=None):
+def build_price_sheet_note(hints, lang="ru", getter=None, today=None):
     """Прайс-блок для промпта, если клиент просит прайс по парку. → строка ИЛИ None (интент не тот).
-    None → обычный ценовой путь build_pricing_note."""
+    None → обычный ценовой путь build_pricing_note. ДАТЫ НЕ ГЕЙТ (решение владельца): нет дат в
+    диалоге → якорь = завтра (ближайшая дата старта), сетку считаем и выдаём САМИ, не переспрашивая.
+    Даты в диалоге → считаем по ним. today инъектируется в тестах (боевой путь — реальная дата)."""
     if not hints.get("price_sheet_q"):
         return None
     ds = hints.get("iso_start")
+    default_anchor = False
     if not ds:
-        return _PRICE_SHEET_ASK_DATES
+        # НЕ спрашиваем даты: дефолтное окно от ближайшей даты (старт = завтра).
+        base = today or datetime.date.today()
+        ds = (base + datetime.timedelta(days=1)).isoformat()
+        default_anchor = True
     rows = price_sheet(ds, getter=getter)
     body = render_price_sheet(rows, ds, lang)
     if not body.strip():
         return _PRICE_SHEET_UNAVAILABLE
-    return _wrap_price_sheet(body, ds, lang)
+    # Детерминированные строки КОДА (не LLM): мин-срок из констант, сезон из живого quote.
+    block = body + "\n" + _sheet_min_term_line(lang)
+    season = _sheet_season_note(rows, lang)
+    if season:
+        block += "\n" + season
+    return _wrap_price_sheet(block, ds, lang, default_anchor=default_anchor)
 
 
-def build_pricing_note(hints: dict, lang: str = "ru", getter=None) -> str:
+def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -> str:
     """Инструкция по цене для промпта. ИНВАРИАНТ: без котировки из Календаря — без числа.
     Правила цен v2: кап низкого сезона (п.1), минимальный срок (п.2), несколько моделей одной
     строкой каждая (п.3), депозит при нескольких байках (п.4), J-текст дословно (п.5).
     Сценарий price_sheet (прайс по всему парку) перехватывается ПЕРВЫМ."""
     # (п.4) депозит при нескольких байках — инструкция дописывается к ЛЮБОМУ исходу цены.
     dep = (" " + DEPOSIT_MULTI_NOTE) if hints.get("deposit_multi_q") else ""
-    sheet = build_price_sheet_note(hints, lang=lang, getter=getter)
+    sheet = build_price_sheet_note(hints, lang=lang, getter=getter, today=today)
     if sheet is not None:
         return sheet + dep
     if not hints.get("has_dates"):
@@ -1173,7 +1223,9 @@ ANTI_LOOP_NOTE = (
     "из диалога — даты/период аренды, «нужны все модели / весь прайс», что клиент сам менеджер/агент, "
     "уже названный опыт. Есть в истории — бери оттуда, не переспрашивай. Если ниже передан блок "
     "ЦЕНА/ПРАЙС с цифрами — приведи эти цифры и НЕ обещай «пришлю прайс/цены позже», «подготовлю "
-    "отдельно», «вернусь с прайсом»: нужные числа уже здесь, дай их сразу."
+    "отдельно», «вернусь с прайсом»: нужные числа уже здесь, дай их сразу. Если передан блок ПРАЙС "
+    "ПО ПАРКУ — вопрос про даты клиенту НЕ задавай: даты лишь уточняют расчёт, но НЕ нужны для "
+    "выдачи сетки (она уже посчитана от ближайшей даты)."
 )
 
 

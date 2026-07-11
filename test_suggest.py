@@ -1278,12 +1278,90 @@ class TestPriceSheet(unittest.TestCase):
         self.assertIn("НЕ обещай прислать прайс позже", note)
         self.assertIn("ДОСЛОВНО", note)                 # инвариант: цифры не переформатировать
 
-    def test_note_ask_dates_once_when_no_dates(self):
-        note = suggest.build_pricing_note({"price_sheet_q": True, "has_dates": False}, lang="ru")
-        self.assertIn("Попроси ОДИН раз даты", note)
-        self.assertIn("НЕ переспрашивай", note)         # модель/опыт не переспрашивать
-        # ни одной цены-числа быть не должно
-        self.assertNotIn("฿", note)
+    def test_note_no_dates_yields_sheet_no_date_question(self):
+        # прайс-интент БЕЗ дат → сетка СРАЗУ (день/7/месяц), НИ ОДНОГО вопроса про даты.
+        note = suggest.build_pricing_note(
+            {"price_sheet_q": True, "has_dates": False}, lang="ru",
+            getter=self._getter(), today=datetime.date(2026, 7, 11))
+        self.assertIn("ПРАЙС ПО ПАРКУ", note)
+        self.assertIn("1 дн — 450 ฿", note)              # реальные цифры сразу, без гейта дат
+        self.assertNotIn("Попроси", note)                # НЕ просим даты у клиента
+        self.assertIn("старт завтра", note)              # дефолтный якорь = ближайшая дата
+        self.assertIn("12.07.2026", note)                # завтра от 11.07 (инъекция today)
+        self.assertIn("НЕ переспрашивай даты", note)     # анти-луп: даты не блокируют выдачу
+
+    def test_dates_in_history_used_for_anchor(self):
+        # даты в истории (15.07–15.08) → расчёт по ним (якорь = дата из диалога, не «завтра»).
+        hints = suggest.extract_booking_hints(
+            "[клиент]: нужны цены на все модели на 15.07-15.08", today=datetime.date(2026, 7, 11))
+        note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter())
+        self.assertIn("Дата отсчёта: 15.07.2026", note)  # якорь из истории
+        self.assertIn("1 дн — 450 ฿", note)
+        self.assertNotIn("старт завтра", note)           # не дефолтный якорь
+
+    def test_min_term_line_ru_and_en(self):
+        hints = {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True}
+        ru = suggest.build_pricing_note(hints, lang="ru", getter=self._getter())
+        self.assertIn("Минимальный срок: скутеры от 5 дней, мотоциклы от 3", ru)
+        en = suggest.build_pricing_note(hints, lang="en", getter=self._getter())
+        self.assertIn("scooters from 5 days, motorcycles from 3", en)
+
+    def test_min_term_line_from_real_constants(self):
+        # строка мин-срока строится из SCOOTER_MIN_DAYS/MOTO_MIN_DAYS, не из литералов.
+        self.assertEqual((suggest.SCOOTER_MIN_DAYS, suggest.MOTO_MIN_DAYS), (5, 3))
+        line = suggest._sheet_min_term_line("ru")
+        self.assertIn(f"скутеры от {suggest.SCOOTER_MIN_DAYS} дней", line)
+        self.assertIn(f"мотоциклы от {suggest.MOTO_MIN_DAYS}", line)
+
+    def test_season_note_low_from_quote(self):
+        # кап активен в моке → сезонная пометка «низкий сезон» выведена из живого quote (не хардкод).
+        note = suggest.build_pricing_note(
+            {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True},
+            lang="ru", getter=self._getter())
+        self.assertIn("НИЗКИЙ сезон", note)
+        self.assertNotIn("31.10", note)                  # конкретную дату конца сезона НЕ выдумываем
+
+    def test_season_note_absent_when_no_cap(self):
+        # ни у одной модели кап не активен → сезонную пометку НЕ утверждаем.
+        def getter(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET_NAMES]}}
+            bike = params.get("bike", "")
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            bk = suggest._bike_key(bike)
+            key = next((k for k in self.TAR if suggest._bike_key(k) in bk), None)
+            if key is None:
+                return {"ok": False}
+            d1, d7, d30, dep, _ca, _cp = self.TAR[key]
+            total = {1: d1, 7: d7, 30: d30}.get(days, d1)
+            return {"ok": True, "data": {"day_price": round(total / max(days, 1)), "total": total,
+                    "deposit": dep, "available": True, "days": days, "cap_active": False,
+                    "cap_price": None, "text": f"{bike} {days}d {total}"}}
+        note = suggest.build_pricing_note(
+            {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True},
+            lang="ru", getter=getter)
+        self.assertIn("ПРАЙС ПО ПАРКУ", note)            # сетка всё равно есть
+        self.assertNotIn("НИЗКИЙ сезон", note)           # но сезон не утверждаем
+
+    def test_month_cap_reflected_in_note(self):
+        # кап низкого сезона отражён в месячной колонке промпт-блока («от <cap>»).
+        note = suggest.build_pricing_note(
+            {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True},
+            lang="ru", getter=self._getter())
+        self.assertIn("месяц — от 8500 ฿", note)         # NMAX капнут
+
+    def test_numbers_come_only_from_quote(self):
+        # инвариант: числа в блоке = суммы из quote (код подставляет, LLM не трогает).
+        rows = suggest.price_sheet("2026-07-15", getter=self._getter())
+        block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
+        for total in (450, 2800, 749, 4928, 700, 4200):   # day/week totals из TAR
+            self.assertIn(f"{total} ฿", block)
+
+    def test_anti_loop_forbids_date_question_on_price(self):
+        # ANTI_LOOP явно запрещает вопрос про даты при переданном ПРАЙС ПО ПАРКУ.
+        self.assertIn("вопрос про даты клиенту НЕ задавай", suggest.ANTI_LOOP_NOTE)
+        self.assertIn("ПРАЙС ПО ПАРКУ", suggest.ANTI_LOOP_NOTE)
 
     def test_note_unavailable_no_numbers_no_reask(self):
         empty = lambda p: {"ok": False}                 # Bridge не отдаёт цифр
