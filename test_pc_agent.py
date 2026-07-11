@@ -58,5 +58,31 @@ class TestChildStderrLog(unittest.TestCase):
         self.assertIn("BOOM_TRACEBACK_XYZ", data)
 
 
+class TestUnknownCommandReply(unittest.TestCase):
+    """ФИКС #171/3: неизвестная команда темы 205 → эхо + перечень РЕАЛЬНЫХ команд, не тишина."""
+
+    def test_echoes_unknown_and_lists_real_commands(self):
+        r = a.unknown_command_reply("статус контура")
+        self.assertIn("не знаю", r)
+        self.assertIn("статус контура", r)          # эхо непонятого
+        self.assertIn("умею", r)
+        self.assertIn("обнови userbot", r)          # реальная команда из роутинга
+        self.assertIn("стоп модербот", r)
+        self.assertIn("обновись", r)
+
+    def test_empty_command(self):
+        r = a.unknown_command_reply("")
+        self.assertIn("умею", r)
+        self.assertIn("обнови userbot", r)
+
+    def test_long_command_truncated(self):
+        r = a.unknown_command_reply("ы" * 500)
+        self.assertIn("…", r)
+        self.assertLess(len(r), 500 + 400)          # эхо обрезан, не раздувает ответ
+
+    def test_known_commands_nonempty(self):
+        self.assertTrue(len(a.KNOWN_COMMANDS) >= 7)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1144,6 +1144,145 @@ class TestClientWatchdog(unittest.TestCase):
             o._client_watch_last_run = 0.0
 
 
+class TestWatchdogClassFix(unittest.TestCase):
+    """Фикс КЛАССА вотчдога (вердикт #171): «не смог проверить» ≠ «мёртв».
+    Всё замокано (finder/логи/часы/очередь NOTE) — реальные процессы/CIM/schtasks НЕ трогаем."""
+
+    NOW = 2_000_000_000   # большой wall-clock: os.utime мтаймов лога считается относительно него
+
+    def setUp(self):
+        self._save = (o._cowork, o._notify, o._stopped)
+        self.notes, self.pushes = [], []
+        o._cowork = lambda line: self.notes.append(line)
+        o._notify = lambda text: self.pushes.append(text)
+        o._stopped = lambda: False
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        (o._cowork, o._notify, o._stopped) = self._save
+
+    def _spec(self, name, finder, logfile=None, skip=False):
+        raises = []
+        sp = {"name": name, "finder": finder,
+              "raiser": lambda: (raises.append(1) or (True, "detail")),
+              "logfile": logfile or os.path.join(self.tmp, "nope.log"),
+              "skip": lambda: skip}
+        sp["_raises"] = raises
+        return sp
+
+    def _logfile(self, name, age_sec):
+        """Лог с mtime = NOW - age_sec (относительно фейкового NOW)."""
+        p = os.path.join(self.tmp, name)
+        open(p, "w").close()
+        t = self.NOW - age_sec
+        os.utime(p, (t, t))
+        return p
+
+    # (а) CIM timeout/ERROR у finder → SKIP + WARN, БЕЗ рестарта
+    def test_a_finder_error_is_skip_not_death(self):
+        st = {}
+        sp = self._spec("userbot", finder=lambda: None)          # None = «не смог проверить»
+        out = o.client_watchdog_tick(now=self.NOW, specs=[sp], state=st,
+                                     cooldown=0, max_deaths=3, grace_until=0, log_stale=120, blind_alarm=3)
+        self.assertEqual(out["userbot"], "check_failed")
+        self.assertEqual(sp["_raises"], [])                       # НЕ рестартили
+        self.assertNotIn("userbot", st)                          # состояние смерти не трогали
+        self.assertEqual(st.get("__blind__"), 1)                 # цикл слеп
+
+    def test_a_finder_exception_is_skip_not_death(self):
+        st = {}
+        def boom():
+            raise RuntimeError("CIM boom")
+        sp = self._spec("userbot", finder=boom)
+        out = o.client_watchdog_tick(now=self.NOW, specs=[sp], state=st,
+                                     cooldown=0, max_deaths=3, grace_until=0, log_stale=120, blind_alarm=3)
+        self.assertEqual(out["userbot"], "check_failed")
+        self.assertEqual(sp["_raises"], [])
+
+    # (б) доказанная смерть (finder OK + пусто + лог протух) → рестарт как раньше
+    def test_b_proven_death_restarts(self):
+        st = {}
+        logf = self._logfile("userbot.log", age_sec=5000)         # протух (>120)
+        sp = self._spec("userbot", finder=lambda: [], logfile=logf)
+        out = o.client_watchdog_tick(now=self.NOW, specs=[sp], state=st,
+                                     cooldown=0, max_deaths=3, grace_until=0, log_stale=120, blind_alarm=3)
+        self.assertEqual(out["userbot"], "raise")
+        self.assertEqual(len(sp["_raises"]), 1)
+        self.assertEqual(st["userbot"]["deaths"], 1)
+        self.assertTrue(any("вотчдог поднял userbot" in n for n in self.notes))
+
+    def test_b_fresh_log_vetoes_restart(self):
+        """Свежий лог + нет PID → смерть НЕ доказана → рестарт отложен (третье условие)."""
+        st = {}
+        logf = self._logfile("userbot.log", age_sec=10)           # свеж (<120)
+        sp = self._spec("userbot", finder=lambda: [], logfile=logf)
+        out = o.client_watchdog_tick(now=self.NOW, specs=[sp], state=st,
+                                     cooldown=0, max_deaths=3, grace_until=0, log_stale=120, blind_alarm=3)
+        self.assertEqual(out["userbot"], "fresh_log")
+        self.assertEqual(sp["_raises"], [])
+        self.assertNotIn("userbot", st)                           # смерть не засчитана
+
+    # (в) 3 подряд слепых цикла → NOTE «вотчдог слеп», рестартов не было
+    def test_c_three_blind_cycles_alarm_no_restart(self):
+        st = {}
+        sp = self._spec("userbot", finder=lambda: None)
+        for t in (1, 2, 3):
+            o.client_watchdog_tick(now=self.NOW + t, specs=[sp], state=st,
+                                   cooldown=0, max_deaths=3, grace_until=0, log_stale=120, blind_alarm=3)
+        self.assertEqual(sp["_raises"], [])                       # ни одного рестарта
+        self.assertTrue(any("слеп" in n for n in self.notes))     # NOTE-алярм
+        self.assertTrue(any("слеп" in p for p in self.pushes))
+        self.assertFalse(any("поднял" in n for n in self.notes))  # никого не поднимали
+
+    def test_c_success_resets_blind_counter(self):
+        st = {"__blind__": 2}
+        logf = self._logfile("userbot.log", age_sec=1)            # свежий → alive-путь всё равно
+        sp = self._spec("userbot", finder=lambda: [123], logfile=logf)   # живой → успех finder'а
+        o.client_watchdog_tick(now=self.NOW, specs=[sp], state=st,
+                               cooldown=0, max_deaths=3, grace_until=0, log_stale=120, blind_alarm=3)
+        self.assertEqual(st["__blind__"], 0)                      # успешный finder обнулил
+
+    # (г) скачок часов (пробуждение) → grace 120с, вердиктов нет
+    def test_g_wake_detect(self):
+        self.assertTrue(o._woke_from_sleep(now=1000, prev=1000 - 200, poll=60, margin=60))   # gap 200 > 120
+        self.assertFalse(o._woke_from_sleep(now=1000, prev=1000 - 61, poll=60, margin=60))   # gap 61 < 120
+        self.assertFalse(o._woke_from_sleep(now=1000, prev=None, poll=60, margin=60))         # первый виток
+
+    def test_g_grace_suppresses_verdicts(self):
+        st = {}
+        logf = self._logfile("userbot.log", age_sec=5000)         # протух — в обычном цикле был бы рестарт
+        sp = self._spec("userbot", finder=lambda: [], logfile=logf)
+        out = o.client_watchdog_tick(now=self.NOW, specs=[sp], state=st,
+                                     cooldown=0, max_deaths=3, grace_until=self.NOW + 120,
+                                     log_stale=120, blind_alarm=3)
+        self.assertEqual(out, {"_": "grace"})                     # вердиктов нет
+        self.assertEqual(sp["_raises"], [])                       # рестарта нет
+        self.assertNotIn("userbot", st)
+
+    def test_g_grace_expired_normal(self):
+        """После окна grace нормальный цикл работает (не сломали норму)."""
+        st = {}
+        logf = self._logfile("userbot.log", age_sec=5000)
+        sp = self._spec("userbot", finder=lambda: [], logfile=logf)
+        out = o.client_watchdog_tick(now=self.NOW, specs=[sp], state=st,
+                                     cooldown=0, max_deaths=3, grace_until=self.NOW - 1,
+                                     log_stale=120, blind_alarm=3)
+        self.assertEqual(out["userbot"], "raise")
+
+    # три исхода finder напрямую (парсинг PID / пусто / None на сбое)
+    def test_finder_three_outcomes(self):
+        real = subprocess = None
+        with mock.patch.object(o.subprocess, "run") as run:
+            run.return_value = mock.Mock(stdout="123\n456\n", stderr="", returncode=0)
+            self.assertEqual(o._find_pids_by_script("userbot_listen.py"), [123, 456])
+            run.return_value = mock.Mock(stdout="", stderr="", returncode=0)
+            self.assertEqual(o._find_pids_by_script("userbot_listen.py"), [])          # честная пустота
+            run.return_value = mock.Mock(stdout="", stderr="err", returncode=1)
+            self.assertIsNone(o._find_pids_by_script("userbot_listen.py"))             # скрытый сбой → None
+            run.side_effect = o.subprocess.TimeoutExpired(cmd="powershell", timeout=20)
+            self.assertIsNone(o._find_pids_by_script("userbot_listen.py"))             # таймаут → None
+
+
 class TestSingletonLock(unittest.TestCase):
     """OS-синглтон демона (разбор #128, часть 4): lock_path/pid_alive инъектируются, tasklist
     НЕ дёргаем. Проверяем: свободный лок берётся; живой чужой → отказ; мёртвый холдер → забор;

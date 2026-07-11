@@ -64,6 +64,15 @@ WATCH_VERIFY_SLEEP = int(os.getenv("PC_WATCH_VERIFY", "20") or "20")
 CLIENT_WATCH_SEC = int(os.getenv("PC_CLIENT_WATCH_SEC", "300") or "300")        # проверка контура каждые 5 мин
 CLIENT_COOLDOWN_SEC = int(os.getenv("PC_CLIENT_COOLDOWN_SEC", "900") or "900")  # анти-флап: ≤1 подъём/процесс за 15 мин
 CLIENT_MAX_DEATHS = int(os.getenv("PC_CLIENT_MAX_DEATHS", "3") or "3")          # 3 смерти подряд → стоп + громкий NOTE
+# Фикс КЛАССА (вердикт #171): «не смог проверить» ≠ «мёртв». На просыпающемся/тормозящем ПК CIM-поиск
+# finder'а падает по таймауту → раньше возвращал [] → вотчдог считал процесс мёртвым → лишний старт →
+# дубль → Conflict (синглтон). Теперь: finder РАЗЛИЧАЕТ error/timeout от честной пустоты; рестарт
+# требует ТРЁХ условий (finder успешен + процесса нет + лог протух); grace после пробуждения; алярм
+# на слепоту вместо рестартов. Пороги — только СТРОЖЕ к рестарту, не слабее.
+CLIENT_LOG_STALE = int(os.getenv("PC_CLIENT_LOG_STALE", "120") or "120")        # свежий лог (≤ этого) ВЕТИРУЕТ рестарт
+CLIENT_BLIND_ALARM = int(os.getenv("PC_CLIENT_BLIND_ALARM", "3") or "3")        # N слепых циклов подряд → NOTE «вотчдог слеп»
+WAKE_GRACE_SEC = int(os.getenv("PC_WAKE_GRACE", "120") or "120")                # после пробуждения ПК — окно без вердиктов
+WAKE_JUMP_MARGIN = int(os.getenv("PC_WAKE_JUMP_MARGIN", "60") or "60")          # скачок wall-clock > POLL+это → «ПК проснулся»
 RESULT_MAX = 4500
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")   # ФОЛБЭК: явный путь из .env (может протухнуть при автообновлении)
 # Базовая папка версионных установок claude-code (AppData\Roaming\Claude\claude-code\<версия>\claude.exe).
@@ -1244,11 +1253,19 @@ def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_f
 # сбрасывает — не страшно). Всё внешнее (finder/raiser/now/state) инъектируется для тестов.
 
 _client_watch_state = {}      # name -> {"last_raise": float, "deaths": int, "halted": bool}
+                              # спец-ключ "__blind__" -> счётчик подряд СЛЕПЫХ циклов (finder не смог)
 _client_watch_last_run = 0.0  # монотонная метка последнего прогона контура (троттлинг 5 мин)
+_client_grace_until = 0.0     # wall-clock: до этого момента вердикты «мёртв»/рестарты подавлены (ПК проснулся)
+_loop_prev_wall = None        # wall-clock старта прошлой итерации главного цикла (детект скачка = сна)
 
 
 def _find_pids_by_script(script_name):
     """PID python-процессов, исполняющих <script_name> (фиксированный CIM-запрос, read-only).
+    ТРИ исхода — ключ фикса #171 («не смог проверить» ≠ «мёртв»):
+      • список PID — CIM отработал, процесс(ы) найдены;
+      • []         — CIM отработал, процессов НЕТ (честная пустота → повод к проверке смерти);
+      • None       — CIM упал/таймаут/скрытый сбой (просыпающийся/тормозящий ПК) — исход НЕИЗВЕСТЕН.
+    Раньше ошибка глушилась в [] → вотчдог принимал таймаут за смерть → лишний рестарт → дубль.
     script_name — литерал из спецификации контура (не пользовательский ввод)."""
     ps = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" "
           "| Where-Object { $_.CommandLine -like '*" + script_name + "*' } "
@@ -1256,10 +1273,18 @@ def _find_pids_by_script(script_name):
     try:
         p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                            capture_output=True, text=True, timeout=20)
-        return [int(x) for x in p.stdout.split() if x.strip().isdigit()]
     except Exception as e:
-        log.warning("контур-вотчдог: CIM-поиск %s не удался: %s", script_name, e)
-        return []
+        log.warning("контур-вотчдог: CIM-поиск %s не удался (%s) — исход НЕИЗВЕСТЕН, НЕ считаем мёртвым", script_name, e)
+        return None
+    pids = [int(x) for x in (p.stdout or "").split() if x.strip().isdigit()]
+    if pids:
+        return pids
+    # Пусто: отличаем ЧЕСТНУЮ пустоту (rc=0, тихий stderr) от СКРЫТОГО сбоя CIM (rc!=0 / ошибка в stderr).
+    if p.returncode != 0 or (p.stderr or "").strip():
+        log.warning("контур-вотчдог: CIM-поиск %s пуст, но rc=%s / stderr=%r — исход НЕИЗВЕСТЕН, НЕ считаем мёртвым",
+                    script_name, p.returncode, _tail((p.stderr or "").strip(), 120))
+        return None
+    return []
 
 
 def _raise_pc_agent():
@@ -1330,29 +1355,64 @@ def _client_watch_step(name, alive, now, state, cooldown, max_deaths):
     return "raise", st
 
 
-def client_watchdog_tick(now=None, specs=None, state=None, cooldown=None, max_deaths=None):
+def client_watchdog_tick(now=None, specs=None, state=None, cooldown=None, max_deaths=None,
+                         grace_until=None, log_stale=None, blind_alarm=None):
     """Один прогон контур-вотчдога. → dict name->action (для тестов/лога). Побочки: raiser()+NOTE.
-    Уважает рубильник pc_orchestrator.stop (клиентский контур при намеренной остановке не трогаем)."""
+    Уважает рубильник pc_orchestrator.stop (клиентский контур при намеренной остановке не трогаем).
+    Фикс #171: finder РАЗЛИЧАЕТ три исхода (см. _find_pids_by_script); «мёртв» требует ТРЁХ условий
+    (finder успешен + процесса нет + лог протух); grace после пробуждения ПК; слепой-счётчик → алярм."""
     now = time.time() if now is None else now
     specs = _client_watch_specs() if specs is None else specs
     state = _client_watch_state if state is None else state
     cooldown = CLIENT_COOLDOWN_SEC if cooldown is None else cooldown
     max_deaths = CLIENT_MAX_DEATHS if max_deaths is None else max_deaths
+    grace_until = _client_grace_until if grace_until is None else grace_until
+    log_stale = CLIENT_LOG_STALE if log_stale is None else log_stale
+    blind_alarm = CLIENT_BLIND_ALARM if blind_alarm is None else blind_alarm
     if _stopped():
         return {"_": "stopped"}
+    # (2) GRACE после пробуждения ПК: в окне WAKE_GRACE_SEC никаких вердиктов «мёртв»/рестартов —
+    # CIM на только что проснувшемся ПК медленный, «пусто» здесь недостоверно. Только логируем.
+    if grace_until and now < grace_until:
+        log.info("контур-вотчдог: grace после пробуждения ПК (%sс осталось) — вердикты отложены",
+                 int(grace_until - now))
+        return {"_": "grace"}
     out = {}
+    considered = 0        # сколько процессов реально проверяли (не skip)
+    any_success = False   # хоть один finder дал достоверный ответ (OK+список или OK+пусто)
     for sp in specs:
         name = sp["name"]
+        # skip (штатный простой, напр. модербот без токена) — это НЕ смерть, вне слепого-счётчика
         try:
             if sp.get("skip") and sp["skip"]():
                 out[name] = "skip"
                 state[name] = {"last_raise": 0.0, "deaths": 0, "halted": False}
                 continue
-            alive = bool(sp["finder"]())
         except Exception as e:
-            log.warning("контур-вотчдог: проверка %s не удалась: %s", name, e)
+            log.warning("контур-вотчдог: skip-проверка %s упала: %s", name, e)
+        considered += 1
+        # (1) finder РАЗЛИЧАЕТ три исхода. None (или исключение) = «не смог проверить» → SKIP цикла
+        # проверки ЭТОГО процесса, БЕЗ рестарта. Это НЕ смерть.
+        try:
+            pids = sp["finder"]()
+        except Exception as e:
+            log.warning("контур-вотчдог: finder %s упал (%s) — SKIP, без рестарта", name, e)
+            pids = None
+        if pids is None:
             out[name] = "check_failed"
+            log.warning("контур-вотчдог: не смог проверить %s (finder слеп) — SKIP цикла, БЕЗ рестарта", name)
             continue
+        any_success = True
+        alive = bool(pids)
+        if not alive:
+            # (1) «мёртв» (повод к рестарту) = finder УСПЕШЕН И процесса нет И лог протух > порога.
+            # Свежий лог = недавняя активность/возможная гонка CIM → рестарт ВЕТИРУЕМ (строже к рестарту).
+            log_age = _log_age_sec(sp.get("logfile"), now)
+            if log_age is not None and log_age <= log_stale:
+                out[name] = "fresh_log"
+                log.warning("контур-вотчдог: %s без PID, но лог свеж (%sс ≤ %sс) — смерть НЕ доказана, рестарт отложен",
+                            name, int(log_age), log_stale)
+                continue
         action, st = _client_watch_step(name, alive, now, state, cooldown, max_deaths)
         state[name] = st
         out[name] = action
@@ -1372,6 +1432,20 @@ def client_watchdog_tick(now=None, specs=None, state=None, cooldown=None, max_de
             log.error("контур-вотчдог: %s умер %s раз подряд — СТОП попыток, нужен разбор", name, st["deaths"])
             _cowork(f"вотчдог: {name} умер {st['deaths']} раза подряд — СТОП, нужен разбор")
             _notify(f"⚠️ Оркестратор: {name} умер {max_deaths} раза подряд — контур-вотчдог остановлен, нужен разбор")
+    # (1) Слепой-счётчик: цикл СЛЕП, если процессы проверяли, но НИ ОДИН finder не смог ответить.
+    # blind_alarm подряд слепых → NOTE «вотчдог слеп — глянь ПК» (алярм, НЕ рестарты). Любой успешный
+    # finder обнуляет счётчик. (На спящем/тормозящем ПК все CIM-запросы таймаутят вместе.)
+    if considered and not any_success:
+        blind = int(state.get("__blind__", 0)) + 1
+        state["__blind__"] = blind
+        out["__blind__"] = blind
+        if blind >= blind_alarm:
+            log.error("контур-вотчдог: %s циклов подряд СЛЕП (CIM не отвечает) — нужен глаз на ПК", blind)
+            _cowork(f"вотчдог слеп {blind} цикла подряд (CIM не отвечает) — глянь ПК (спит/тормозит?)")
+            _notify(f"⚠️ Оркестратор: контур-вотчдог слеп {blind} цикла подряд — CIM не отвечает, глянь ПК")
+            state["__blind__"] = 0   # сброс после алярма (не спамим каждый тик; ре-алярм ещё через blind_alarm)
+    elif any_success:
+        state["__blind__"] = 0
     return out
 
 
@@ -1383,6 +1457,15 @@ def maybe_client_watchdog(now=None):
         return None
     _client_watch_last_run = now
     return client_watchdog_tick(now=now)
+
+
+def _woke_from_sleep(now, prev, poll=None, margin=None):
+    """(2) Детект пробуждения ПК: между соседними итерациями главного цикла wall-clock скакнул
+    много больше интервала поллинга (ПК спал в S3/гибернации — состояния доступны, см. powercfg /a).
+    Чистая/тестируемая. prev=None (первый виток) → пробуждением НЕ считаем."""
+    poll = POLL_SEC if poll is None else poll
+    margin = WAKE_JUMP_MARGIN if margin is None else margin
+    return prev is not None and (now - prev) > (poll + margin)
 
 
 # ------------------- OS-синглтон демона (разбор #128, часть 4) ----------------
@@ -1487,8 +1570,19 @@ def _main_loop():
     if _stopped():
         log.info("рубильник pc_orchestrator.stop активен — не стартую поллинг")
         return
+    global _loop_prev_wall, _client_grace_until
     while not _stopped():
         try:
+            # (2) Детект сна/пробуждения ДО вотчдога: если ПК спал, wall-clock скакнёт — взводим grace,
+            # чтобы первый пост-пробуждение прогон вотчдога (троттлинг уже истёк) не принял медленный
+            # CIM за смерть и не рестартнул зря. Взводим ТОЛЬКО на реальном скачке; норм. виток не трогаем.
+            now = time.time()
+            if _woke_from_sleep(now, _loop_prev_wall):
+                _client_grace_until = now + WAKE_GRACE_SEC
+                gap = int(now - _loop_prev_wall)
+                log.warning("детект пробуждения ПК: скачок wall-clock %sс (>%s+%s) — grace вотчдога %sс",
+                            gap, POLL_SEC, WAKE_JUMP_MARGIN, WAKE_GRACE_SEC)
+            _loop_prev_wall = now
             poll_once()
             maybe_client_watchdog()   # часть 3: следим за pc_agent/userbot/moderation_bot (троттлинг 5 мин)
             if maybe_self_update():   # задача цикла обновила pc_orchestrator.py → эстафета новому

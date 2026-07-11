@@ -490,10 +490,34 @@ async def self_restart(context, chat_id):
 
 # ================================ обработчик ================================
 
-HELP = (
-    "не понял. Доступно: обнови userbot / статус / стоп userbot / старт userbot / сводка / обновись"
-    " / статус модербот / старт модербот / стоп модербот"
+# Реальные команды темы 205 — ЕДИНЫЙ источник для справки-подсказки. Перечень КАНОНИЧЕСКИЙ:
+# ровно то, что понимает on_message ниже (см. цепочку elif). Добавил команду в роутинг — добавь строку.
+KNOWN_COMMANDS = (
+    "обнови userbot (update) — стоп → git pull → старт",
+    "статус (status) — жив ли userbot + хвост лога",
+    "стоп userbot (stop)",
+    "старт userbot (start)",
+    "статус модербот (moderbot status)",
+    "старт модербот (moderbot start)",
+    "стоп модербот (moderbot stop)",
+    "сводка (summary) — дайджест лога",
+    "обновись (restart) — само-рестарт агента",
 )
+
+
+def unknown_command_reply(raw_text):
+    """(ФИКС #171/3) Ответ на НЕИЗВЕСТНУЮ команду в теме 205: эхо непонятого + перечень РЕАЛЬНЫХ
+    команд — вместо тишины/глухого «не понял» (инцидент со «статусом»). raw_text — оригинал (обрезаем)."""
+    echo = " ".join((raw_text or "").split())
+    if len(echo) > 80:
+        echo = echo[:80] + "…"
+    head = f"не знаю «{echo}»." if echo else "пустая команда."
+    cmds = "\n".join(f"  • {c}" for c in KNOWN_COMMANDS)
+    return f"{head} умею:\n{cmds}"
+
+
+# Совместимость: прежнее имя HELP всё ещё зовётся из else-ветки (теперь — динамический ответ).
+HELP = unknown_command_reply("")
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -558,7 +582,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await self_restart(context, chat_id)
 
         else:
-            await _send(context, chat_id, HELP)
+            alog.info("неизвестная команда: %r", (msg.text or "")[:120])
+            await _send(context, chat_id, unknown_command_reply(msg.text))
     except Exception as e:
         alog.exception("ошибка обработки команды")
         await _send(context, chat_id, f"ошибка: {e}")
