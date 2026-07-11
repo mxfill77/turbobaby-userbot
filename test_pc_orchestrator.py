@@ -1770,5 +1770,176 @@ class TestStuckSingles(Base):
         self.assertEqual(self.fb.tasks[tid]["status"], "failed")
 
 
+class TestLocalDec(Base):
+    """Локальный дирижёр-декомпозер (флаг PC_LOCAL_DEC, порт мозга VPS — шаг 2/7 родителя 185).
+    Всё замокано: думатель/кондуктор (_thinker_exec) не дёргает реальный claude."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["PC_LOCAL_DEC"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("PC_LOCAL_DEC", None)
+        super().tearDown()
+
+    def _add_parent(self, text="сделай большую фичу X: A, B и C"):
+        tid = self.fb.add(task_text=text)
+        self.fb.tasks[tid]["from"] = o.PC_LOCAL_DEC_FROM
+        return tid
+
+    # --- детект родителя ---
+
+    def test_flag_off_never_matches(self):
+        os.environ["PC_LOCAL_DEC"] = "0"
+        self.assertFalse(o._is_local_dec_parent(o.PC_LOCAL_DEC_FROM, "крупное ТЗ"))
+        os.environ.pop("PC_LOCAL_DEC", None)   # нет флага = тоже off
+        self.assertFalse(o._is_local_dec_parent(o.PC_LOCAL_DEC_FROM, "крупное ТЗ"))
+
+    def test_parent_match_requires_from_and_no_step_marker(self):
+        self.assertTrue(o._is_local_dec_parent(o.PC_LOCAL_DEC_FROM, "крупное ТЗ"))
+        # шаг цепи (маркер [шаг i/N родитель id]) — НЕ родитель
+        self.assertFalse(o._is_local_dec_parent(o.PC_LOCAL_DEC_FROM, "[шаг 2/5 родитель 7] сделай"))
+        # чужая метка from — не наш родитель
+        self.assertFalse(o._is_local_dec_parent("Filipp-pc-dev", "крупное ТЗ"))
+        self.assertFalse(o._is_local_dec_parent("", "крупное ТЗ"))
+
+    # --- парс плана (_PLAN_LINE_RE) ---
+
+    def test_plan_parse_dots_parens_and_garbage(self):
+        out = "1. первый шаг\n2) второй шаг\nмусорная строка без номера\n 3.  третий шаг\n"
+        self.assertEqual(o._plan_steps(out), ["первый шаг", "второй шаг", "третий шаг"])
+
+    def test_plan_parse_empty_and_none(self):
+        self.assertEqual(o._plan_steps(""), [])
+        self.assertEqual(o._plan_steps(None), [])
+        self.assertEqual(o._plan_steps("Вот план:\nникаких номеров"), [])
+
+    # --- 🔴-пометка красных шагов ---
+
+    def test_red_note_marks_red_steps(self):
+        note = o._dec_red_note(["поправь код в suggest.py", "clasp redeploy прод-деплой",
+                                "запиши строку в Лист 1"])
+        self.assertIn("🔴 красные шаги: 2, 3", note)
+        self.assertTrue(note.endswith("\n"))
+
+    def test_red_note_empty_for_clean_plan(self):
+        self.assertEqual(o._dec_red_note(["поправь код", "прогони тесты"]), "")
+
+    def test_red_note_is_display_only_not_plan_line(self):
+        # строка с 🔴 не матчит _PLAN_LINE_RE → restart-proof парс плана из result не ломается
+        note = o._dec_red_note(["clasp redeploy"])
+        self.assertIsNone(o._PLAN_LINE_RE.match(note.splitlines()[0]))
+
+    # --- планировщик: happy path ---
+
+    def test_plan_happy_path_done_with_plan_in_result(self):
+        tid = self._add_parent()
+        with mock.patch.object(o, "_thinker_exec", lambda p, t, tag: "1. шаг A\n2. шаг B"):
+            o.process_new()
+        t = self.fb.tasks[tid]
+        self.assertEqual(t["status"], "done")
+        self.assertIn("🧩 Декомпозиция (локальный дирижёр PC): 2 шагов", t["result"])
+        self.assertIn("1. шаг A", t["result"])
+        self.assertIn("2. шаг B", t["result"])
+
+    def test_planner_gets_ported_preamble_and_parent_text(self):
+        tid = self._add_parent(text="построй фичу Y")
+        seen = {}
+
+        def fake_exec(prompt, timeout, tag):
+            seen["prompt"], seen["timeout"], seen["tag"] = prompt, timeout, tag
+            return "1. a\n2. b"
+
+        with mock.patch.object(o, "_thinker_exec", fake_exec):
+            o.process_new()
+        self.assertTrue(seen["prompt"].startswith(o.PLANNER_PREAMBLE))
+        self.assertIn("D:\\turbobaby-bot", seen["prompt"])       # порт под ПК-репо
+        self.assertNotIn("/root/turbobaby-manager-bot", seen["prompt"])  # НЕ VPS-путь
+        self.assertTrue(seen["prompt"].endswith("построй фичу Y"))
+        self.assertEqual(seen["timeout"], o.PC_DEC_PLAN_TIMEOUT)
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+
+    # --- урок 166: красное в ТЗ не валит план ---
+
+    def test_lesson166_red_in_output_ignored_when_plan_present(self):
+        out = ("1. поправь код\n2. clasp redeploy прод\n"
+               "NEEDS_APPROVAL: op=other | какой-то хвост от модели")
+        tid = self._add_parent()
+        with mock.patch.object(o, "_thinker_exec", lambda p, t, tag: out):
+            o.process_new()
+        t = self.fb.tasks[tid]
+        self.assertEqual(t["status"], "done")                     # план есть → NA-хвост игнор
+        self.assertIn("🔴 красные шаги: 2", t["result"])          # красный шаг помечен
+
+    def test_pure_red_parent_failed_not_button(self):
+        # чисто-красное ТЗ (план пуст + NEEDS_APPROVAL) → честный failed с картой, НЕ needs_approval
+        tid = self._add_parent(text="задеплой прод")
+        with mock.patch.object(o, "_thinker_exec",
+                               lambda p, t, tag: "NEEDS_APPROVAL: op=other | деплой прода · red"):
+            o.process_new()
+        t = self.fb.tasks[tid]
+        self.assertEqual(t["status"], "failed")
+        self.assertIn("планировщик needs_approval", t["result"])
+
+    # --- фейл-ветки ---
+
+    def test_empty_plan_failed_with_tail(self):
+        tid = self._add_parent()
+        with mock.patch.object(o, "_thinker_exec", lambda p, t, tag: "не могу, расплывчато"):
+            o.process_new()
+        t = self.fb.tasks[tid]
+        self.assertEqual(t["status"], "failed")
+        self.assertIn("план пуст", t["result"])
+
+    def test_too_many_steps_failed(self):
+        out = "\n".join(f"{i}. шаг {i}" for i in range(1, o.MAX_STEPS + 2))   # 9 > 8
+        tid = self._add_parent()
+        with mock.patch.object(o, "_thinker_exec", lambda p, t, tag: out):
+            o.process_new()
+        t = self.fb.tasks[tid]
+        self.assertEqual(t["status"], "failed")
+        self.assertIn("упрости ТЗ", t["result"])
+
+    def test_thinker_failure_failed(self):
+        tid = self._add_parent()
+        with mock.patch.object(o, "_thinker_exec", lambda p, t, tag: None):
+            o.process_new()
+        t = self.fb.tasks[tid]
+        self.assertEqual(t["status"], "failed")
+        self.assertIn("планировщик локальной декомпозиции не отработал", t["result"])
+
+    # --- маршрутизация process_new ---
+
+    def test_process_new_routes_parent_to_planner_not_run_task(self):
+        tid = self._add_parent()
+        boom = mock.Mock(side_effect=AssertionError("run_task не должен зваться для родителя"))
+        with mock.patch.object(o, "run_task", boom), \
+             mock.patch.object(o, "_thinker_exec", lambda p, t, tag: "1. a\n2. b"):
+            o.process_new()
+        boom.assert_not_called()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+
+    def test_flag_off_parent_goes_old_path_run_task(self):
+        # PC_LOCAL_DEC=0 → родитель идёт ПРЕЖНИМ headless-путём (поведение байт-в-байт)
+        os.environ["PC_LOCAL_DEC"] = "0"
+        tid = self._add_parent()
+        with mock.patch.object(o, "run_task", lambda *a, **k: ("done", "RESULT: ок")), \
+             mock.patch.object(o, "_thinker_exec",
+                               mock.Mock(side_effect=AssertionError("планировщик не должен зваться"))):
+            o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+        self.assertEqual(self.fb.tasks[tid]["result"], "RESULT: ок")
+
+    def test_step_marked_task_not_planned(self):
+        # задача С маркером шага от того же from → НЕ родитель, идёт обычным путём
+        tid = self.fb.add(task_text="[шаг 1/3 родитель 9] сделай кусок")
+        self.fb.tasks[tid]["from"] = o.PC_LOCAL_DEC_FROM
+        with mock.patch.object(o, "run_task", lambda *a, **k: ("done", "RESULT: кусок готов")), \
+             mock.patch.object(o, "_thinker_exec",
+                               mock.Mock(side_effect=AssertionError("планировщик не должен зваться"))):
+            o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

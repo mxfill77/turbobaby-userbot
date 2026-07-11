@@ -580,6 +580,11 @@ def process_new():
         _cowork(f"задача #{tid} (рычаг {cmd}) → {status} · {_clip(result)}")
         _notify(_human(status, tid, result))
         return
+    # Локальный дирижёр (PC_LOCAL_DEC=1): родитель Filipp-pcloc-dec → строим план, НЕ исполняем
+    # как обычную задачу. Флаг off → False сразу (поведение байт-в-байт прежнее).
+    if _is_local_dec_parent(str(task.get("from") or ""), text):
+        _local_dec_plan(tid, text)
+        return
     # HEAD до задачи (только для дев-задач): диффом head_before..HEAD увидим новые коммиты задачи,
     # чтобы понять, надо ли перезапускать userbot/moderbot (авто-обновление вместо ручной команды).
     head_before = _git_out(["rev-parse", "HEAD"]) if _is_dev_task(text) else None
@@ -1028,6 +1033,143 @@ def _maybe_selfheal(tid, text, fail_text, frm=""):
     if not _selfheal_on():
         return False
     return _maybe_task_selfheal(tid, text, fail_text, frm)
+
+
+# ------------------- ЛОКАЛЬНЫЙ ДИРИЖЁР-ДЕКОМПОЗЕР (флаг PC_LOCAL_DEC) -----------
+# Порт мозга декомпозера VPS (docs/dec_port_spec.md в manager-bot, шаг 2/7 родителя 185):
+# при PC_LOCAL_DEC=1 демон берёт РОДИТЕЛЯ from=Filipp-pcloc-dec (lane=pc, БЕЗ маркера
+# «[шаг i/N родитель id]») и строит план ЛОКАЛЬНО — headless claude -p ТЕМ ЖЕ кондуктором
+# THINKER_MODEL/THINKER_FALLBACK (_thinker_exec: --max-turns 1, --allowed-tools '',
+# нейтральный cwd → планировщик НИЧЕГО не исполняет, красное не ослаблено). Парс плана —
+# _PLAN_LINE_RE («N. шаг» / «N) шаг», прочие строки молча игнор), потолок MAX_STEPS=8.
+# УРОК 166: красное в ТЗ — НЕ повод валить план (планировщик только планирует); NEEDS_APPROVAL
+# в выводе учитывается ТОЛЬКО при пустом плане (fail-safe чисто-красного родителя → честный
+# failed с картой, НЕ кнопка). 🔴-пометка красных шагов — только дисплей в result родителя
+# (строка с 🔴 не матчит _PLAN_LINE_RE → restart-proof парс плана из result цел); текст шагов
+# в очереди НЕ помечается. PC_LOCAL_DEC=0/нет → ветка не зовётся вовсе (поведение байт-в-байт
+# прежнее: такой родитель ушёл бы обычным headless-путём run_task). Релиз шагов/надзор цепи —
+# СЛЕДУЮЩИЕ куски порта (здесь только мозг-планировщик).
+MAX_STEPS = 8                                     # потолок шагов плана (как на VPS)
+PC_LOCAL_DEC_FROM = "Filipp-pcloc-dec"            # метка родителя локального дирижёра
+PC_DEC_PLAN_TIMEOUT = int(os.getenv("PC_DEC_PLAN_TIMEOUT", "600") or "600")  # план думается дольше починки
+
+_STEP_RE = re.compile(r"^\[шаг (\d+)/(\d+) родитель (\d+)\]")        # маркер шага цепи (match с начала)
+_PLAN_LINE_RE = re.compile(r"^\s*(\d{1,2})[.)]\s+(\S.*)")            # строка плана «N. шаг» / «N) шаг»
+# Красность шага (дословно с VPS): красное действие исполнитель шага спросит кнопкой сам —
+# пометка нужна владельцу заранее увидеть, где цепь встанет на «да».
+_HEADLESS_IMPOSSIBLE_RE = re.compile(
+    r"clasp|redeploy|\bsqlite3\b|set_fleet_(?:oil|service)|delete_event|confirmed\s*=\s*true|"
+    r"лист\s*1|\bcrm\b|зарплат|байки|транзакц|проводк|деньг|касс|удал(?:и|ени|яе|ён)|календар",
+    re.IGNORECASE)
+
+# Порт PLANNER_PREAMBLE под репо D:\turbobaby-bot (PC_NOTE не нужен: исполнитель шагов — ЭТОТ ПК).
+# Отличие от VPS-оригинала: планировщик здесь — чистый генератор без инструментов (_thinker_exec),
+# поэтому строка про read-only разведку заменена честной «решай по тексту ТЗ».
+PLANNER_PREAMBLE = (
+    "Ты — планировщик декомпозиции ПК-театра TurboBaby (репо D:\\turbobaby-bot). Твоя задача — "
+    "РАЗБИТЬ крупное ТЗ на шаги, НЕ выполняя его: ты чистый генератор без инструментов — файлы "
+    "не читаешь и не правишь, не коммитишь, не деплоишь, в таблицы не пишешь; решай по тексту ТЗ.\n"
+    "ФОРМАТ ОТВЕТА — СТРОГО и ТОЛЬКО нумерованный список шагов, каждый с новой строки "
+    "«N. <шаг>», без заголовков, без кода, без текста до/после списка. Шагов 2–7. Каждый шаг — "
+    "САМОДОСТАТОЧНОЕ дев-ТЗ (до 45 мин, ≤400 символов): исполнитель — headless-агент на ЭТОМ ПК "
+    "в репо D:\\turbobaby-bot — увидит ТОЛЬКО текст шага, поэтому впиши в каждый нужный контекст "
+    "(файлы, функции, что сделать, как проверить). Шаги строго в порядке исполнения; правки кода "
+    "раньше, деплой/рестарт/проверка — последними.\n"
+    "КРАСНАЯ ЗОНА В ТЗ — НЕ ПОВОД ОТКАЗЫВАТЬСЯ ОТ ПЛАНА (урок задачи 166): ты ТОЛЬКО планируешь "
+    "и сам ничего не исполняешь, поэтому упоминание clasp/деплоя/рабочих таблиц/денег/удаления в "
+    "ТЗ НЕ требует подтверждения на этапе плана — НЕ выводи NEEDS_APPROVAL из-за содержимого ТЗ. "
+    "Красное действие оформи ОТДЕЛЬНЫМ шагом (обычно последним): исполнитель ЭТОГО шага сам "
+    "спросит «да» Филиппа кнопкой по штатной механике. Если ТЗ явно говорит, что прод-применение "
+    "(деплой/рестарт) делается отдельно/хвостом — тем более просто строй план. ЕДИНСТВЕННОЕ "
+    "исключение: ВСЁ ТЗ целиком = одно красное действие и разбивать не на что (например «задеплой "
+    "прод») — тогда вместо списка выведи РОВНО одну строку "
+    "«NEEDS_APPROVAL: op=other | <карточка: что · куда · последствия>».\n\n"
+    "КРУПНОЕ ТЗ:\n"
+)
+
+
+def _local_dec_on():
+    """Флаг PC_LOCAL_DEC=1 в .env (демон load_dotenv'ит на старте). 0/нет → прежнее поведение."""
+    return (os.environ.get("PC_LOCAL_DEC") or "").strip() == "1"
+
+
+def _is_local_dec_parent(frm, text):
+    """Родитель локальной декомпозиции: флаг взведён + from=Filipp-pcloc-dec + текст БЕЗ маркера
+    «[шаг i/N родитель id]» (маркированный = шаг чужой/своей цепи, не родитель)."""
+    if not _local_dec_on():
+        return False
+    if str(frm or "") != PC_LOCAL_DEC_FROM:
+        return False
+    return not _STEP_RE.match(str(text or "").strip())
+
+
+def _plan_steps(out):
+    """Строки плана из вывода планировщика по _PLAN_LINE_RE (прочие строки молча игнор;
+    порядок — как в выводе). → список текстов шагов."""
+    steps = []
+    for ln in str(out or "").splitlines():
+        m = _PLAN_LINE_RE.match(ln)
+        if m:
+            steps.append(m.group(2).strip())
+    return steps
+
+
+def _dec_red_note(steps):
+    """🔴-пометка красных шагов плана (только дисплей в result родителя, тексты шагов не трогаем).
+    → строка с \\n на конце или '' (красных нет)."""
+    red = [str(i) for i, s in enumerate(steps, 1) if _HEADLESS_IMPOSSIBLE_RE.search(s)]
+    if not red:
+        return ""
+    return ("🔴 красные шаги: " + ", ".join(red)
+            + " — исполнитель шага спросит «да» кнопкой, сам не исполнит.\n")
+
+
+def _local_dec_plan(tid, text):
+    """Построить план декомпозиции для родителя Filipp-pcloc-dec ЛОКАЛЬНО (кондуктор
+    THINKER_MODEL/фолбэк, чистый генератор) и закрыть родителя: done с планом в result
+    (restart-proof источник плана) или честный failed с диагнозом. Красное НЕ ослаблено:
+    планировщик ничего не исполняет; урок 166 — NEEDS_APPROVAL в выводе валит родителя
+    ТОЛЬКО при пустом плане (чисто-красное ТЗ), и это failed-карта, НЕ кнопка."""
+    out = _thinker_exec(PLANNER_PREAMBLE + str(text or ""), PC_DEC_PLAN_TIMEOUT, "pcloc-dec-plan")
+    if out is None:
+        msg = ("планировщик локальной декомпозиции не отработал (кондуктор "
+               f"{THINKER_MODEL}/фолбэк {THINKER_FALLBACK or 'нет'}): сбой/таймаут claude -p — "
+               "план не построен, повтори задачу")[:RESULT_MAX]
+        bc.complete_task(tid, "failed", msg)
+        log.warning("pcloc-dec: id=%s планировщик не отработал → failed", tid)
+        _cowork(f"родитель #{tid} (pcloc-dec) → failed · {_clip(msg)}")
+        _notify(_human("failed", tid, "планировщик декомпозиции не отработал"))
+        return
+    steps = _plan_steps(out)
+    if not steps:
+        card = _detect_needs_approval(out)
+        if card:   # чисто-красный родитель (единственное исключение урока 166) → failed, НЕ кнопка
+            msg = ("планировщик needs_approval: " + card)[:RESULT_MAX]
+        else:
+            msg = ("план пуст: планировщик не вернул нумерованный список «N. <шаг>». "
+                   "Вывод (хвост): " + _tail(out, 700))[:RESULT_MAX]
+        bc.complete_task(tid, "failed", msg)
+        log.warning("pcloc-dec: id=%s пустой план → failed (%s)", tid, _clip(msg, 160))
+        _cowork(f"родитель #{tid} (pcloc-dec) → failed · {_clip(msg)}")
+        _notify(_human("failed", tid, msg))
+        return
+    if len(steps) > MAX_STEPS:
+        msg = (f"план из {len(steps)} шагов превышает потолок {MAX_STEPS} — "
+               "упрости ТЗ или разбей на два «декомпозируй:»")[:RESULT_MAX]
+        bc.complete_task(tid, "failed", msg)
+        log.warning("pcloc-dec: id=%s план %s шагов > %s → failed", tid, len(steps), MAX_STEPS)
+        _cowork(f"родитель #{tid} (pcloc-dec) → failed · {_clip(msg)}")
+        _notify(_human("failed", tid, msg))
+        return
+    plan_txt = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
+    result = (f"🧩 Декомпозиция (локальный дирижёр PC): {len(steps)} шагов.\n"
+              + plan_txt + "\n" + _dec_red_note(steps)
+              + "[план построен локально (PC_LOCAL_DEC); релиз шагов — следующий кусок порта]"
+              )[:RESULT_MAX]
+    bc.complete_task(tid, "done", result)
+    log.info("pcloc-dec: id=%s план из %s шагов построен (done)", tid, len(steps))
+    _cowork(f"родитель #{tid} (pcloc-dec) → done: план {len(steps)} шагов · {_clip(result)}")
+    _notify(_human("done", tid, f"декомпозиция: план из {len(steps)} шагов"))
 
 
 # ------------------- авто-обновление userbot/moderbot после дев-задач ----------
