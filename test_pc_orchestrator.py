@@ -2245,5 +2245,382 @@ class TestLocalDecChain(Base):
         self.assertEqual(len(self._news()), 0)
 
 
+class TestLocalDecSelfhealAdapt(Base):
+    """Шаг 4/7 родителя 185: самопочинка шага локальной цепи (думатель, РОВНО 1 перерождение,
+    ⏱-гейт, «отклонено Филиппом»/конверты не трогаются) + адаптация плана после done-шага
+    (keep/adjust/finish, лимит 2 коррекции restart-proof, fail-safe = keep, на последнем шаге
+    думатель не зовётся). Всё замокано, реальный claude не дёргается."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["PC_LOCAL_DEC"] = "1"
+        os.environ.pop("PLAN_ADAPT", None)
+        o._loc_summarized.clear()
+        o._loc_adapt_finish.clear()
+        o._loc_adapted.clear()
+
+    def tearDown(self):
+        for k in ("PC_LOCAL_DEC", "PLAN_ADAPT"):
+            os.environ.pop(k, None)
+        o._loc_summarized.clear()
+        o._loc_adapt_finish.clear()
+        o._loc_adapted.clear()
+        super().tearDown()
+
+    # --- обвязка сцены (как в TestLocalDecChain) ---
+
+    def _mk_parent_done(self, plan_lines, goal="крупное ТЗ"):
+        pid = self.fb.add(status="done", task_text=goal)
+        self.fb.tasks[pid]["from"] = o.PC_LOCAL_DEC_FROM
+        self.fb.tasks[pid]["result"] = ("🧩 Декомпозиция (локальный дирижёр PC): "
+                                        f"{len(plan_lines)} шагов.\n" + "\n".join(plan_lines))
+        return pid
+
+    def _mk_step(self, pid, i, n, status="done", text="кусок", result="RESULT: ок", k=0):
+        mark = f"[коррекция плана {k}] " if k else ""
+        tid = self.fb.add(status=status, task_text=f"[шаг {i}/{n} родитель {pid}] {mark}{text}")
+        self.fb.tasks[tid]["from"] = o.PC_LOCAL_DEC_FROM
+        self.fb.tasks[tid]["result"] = result
+        return tid
+
+    def _news(self):
+        return [t for t in self.fb.tasks.values() if t["status"] == "new"]
+
+    def _summaries(self, pid):
+        return [t for t in self.fb.tasks.values()
+                if str(t.get("task_text") or "").startswith(f"[сводка родитель {pid}]")]
+
+    def _cards(self, pid):
+        return [t for t in self.fb.tasks.values()
+                if str(t.get("task_text") or "").startswith(f"[карточка родитель {pid}]")]
+
+    def _adapt_cards(self, pid):
+        return [t for t in self.fb.tasks.values()
+                if str(t.get("task_text") or "").startswith(f"[коррекция плана родитель {pid}]")]
+
+    def _thinker(self, reply):
+        """Мок думателя: reply=строка (ответ) / None (сбой) / callable(prompt)->строка.
+        Копит промпты в self.prompts."""
+        self.prompts = []
+
+        def fake(prompt, timeout, tag):
+            self.prompts.append(prompt)
+            return reply(prompt) if callable(reply) else reply
+        return mock.patch.object(o, "_thinker_exec", fake)
+
+    def _boom_thinker(self):
+        return mock.patch.object(o, "_thinker_exec",
+                                 mock.Mock(side_effect=AssertionError("думатель не должен зваться")))
+
+    # ================= САМОПОЧИНКА ШАГА ЛОКАЛЬНОЙ ЦЕПИ =================
+
+    def test_selfheal_off_prior_haltonfail_byte_identical(self):
+        # STEP_SELFHEAL off (Base) → провал шага = прежний halt-on-fail: сводка, думатель не зовётся
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="failed", result="сломалось")
+        with self._boom_thinker():
+            o.process_local_chains()
+        self.assertEqual(len(self._news()), 0)
+        self.assertEqual(len(self._summaries(pid)), 1)
+        self.assertEqual(self._cards(pid), [])
+
+    def test_retry_rebirths_exactly_once_with_marker(self):
+        o._selfheal_on = lambda: True
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"], goal="цель-дословно")
+        self._mk_step(pid, 1, 2, status="failed", text="шаг A", result="claude exit=1: боль")
+        with self._thinker('{"verdict":"retry","fixed_step":"шаг A с верным путём","reason":"кривой путь"}'):
+            o.process_local_chains()
+        news = self._news()
+        self.assertEqual(len(news), 1)
+        self.assertEqual(news[0]["task_text"],
+                         f"[шаг 1/2 родитель {pid}] [самопочинка шага 1, попытка 1] шаг A с верным путём")
+        self.assertEqual(news[0]["from"], o.PC_LOCAL_DEC_FROM)
+        self.assertEqual(news[0]["lane"], "pc")
+        cards = self._cards(pid)
+        self.assertEqual(len(cards), 1)                      # 🩹-карта решения думателя
+        self.assertEqual(cards[0]["status"], "done")
+        self.assertIn("🩹", cards[0]["result"])
+        self.assertIn("попытка 1 из 1", cards[0]["result"])
+        self.assertEqual(self._summaries(pid), [])           # цепь ЖИВА — сводки нет
+        # промпт думателя несёт контекст родителя: цель + план + упавший шаг + провал
+        p = self.prompts[0]
+        self.assertIn("цель-дословно", p)
+        self.assertIn("1. шаг A", p)
+        self.assertIn("УПАВШИЙ ШАГ 1/2", p)
+        self.assertIn("claude exit=1: боль", p)
+
+    def test_reborn_failed_again_terminal_halt(self):
+        o._selfheal_on = lambda: True
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="failed", result="упал")
+        self._mk_step(pid, 1, 2, status="failed",
+                      text="[самопочинка шага 1, попытка 1] фикс", result="упал снова")
+        with self._boom_thinker():                            # повторный провал: думатель НЕ зовётся
+            o.process_local_chains()
+        self.assertEqual(len(self._news()), 0)                # перерождения №2 нет — петля невозможна
+        cards = self._cards(pid)
+        self.assertEqual(len(cards), 1)
+        self.assertIn("🛑 самопочинка не помогла (попытка 1 исчерпана)", cards[0]["result"])
+        self.assertEqual(len(self._summaries(pid)), 1)
+
+    def test_timeout_gate_no_thinker(self):
+        # ⏱-гейт: таймаут/сироту/просрочку approve думатель не чинит → сводка без консульта
+        o._selfheal_on = lambda: True
+        for diag in (f"{o.TIMEOUT_MARK} таймаут 2700s — headless прерван, задача не завершилась",
+                     f"{o.TIMEOUT_MARK} ПК-таймаут одиночки: задача провисела in_progress 9999с",
+                     f"{o.TIMEOUT_MARK} подтверждение не получено за 30 мин — задача провалена"):
+            self.fb.tasks.clear()
+            o._loc_summarized.clear()
+            pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+            self._mk_step(pid, 1, 2, status="failed", result=diag)
+            with self._boom_thinker():
+                o.process_local_chains()
+            self.assertEqual(len(self._news()), 0, diag)
+            self.assertEqual(len(self._summaries(pid)), 1, diag)
+
+    def test_reject_gate_no_thinker(self):
+        o._selfheal_on = lambda: True
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="failed", result="отклонено Филиппом (кнопка ❌)")
+        with self._boom_thinker():
+            o.process_local_chains()
+        self.assertEqual(len(self._news()), 0)
+        self.assertEqual(len(self._summaries(pid)), 1)
+
+    def test_thinker_halt_posts_card_and_summary(self):
+        o._selfheal_on = lambda: True
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="failed", result="непонятная боль")
+        with self._thinker('{"verdict":"halt","fixed_step":"","reason":"нужен человек"}'):
+            o.process_local_chains()
+        self.assertEqual(len(self._news()), 0)
+        cards = self._cards(pid)
+        self.assertEqual(len(cards), 1)
+        self.assertIn("думатель: halt, причина: нужен человек", cards[0]["result"])
+        self.assertEqual(len(self._summaries(pid)), 1)
+
+    def test_thinker_garbage_or_none_failsafe_halt(self):
+        o._selfheal_on = lambda: True
+        for reply in (None, "мусор без json", '{"verdict":"чинить"}',
+                      '{"verdict":"retry","fixed_step":""}'):   # retry без fixed = halt
+            self.fb.tasks.clear()
+            o._loc_summarized.clear()
+            pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+            self._mk_step(pid, 1, 2, status="failed", result="боль")
+            with self._thinker(reply):
+                o.process_local_chains()
+            self.assertEqual(len(self._news()), 0, str(reply))
+            self.assertEqual(len(self._summaries(pid)), 1, str(reply))
+
+    def test_rebirth_enqueue_fail_failsafe_halt(self):
+        o._selfheal_on = lambda: True
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="failed", result="боль")
+        real = self.fb.enqueue_task
+
+        def flaky(frm, text, lane="pc"):
+            if "[самопочинка шага" in text:
+                return {"ok": False, "error": "bridge down"}
+            return real(frm, text, lane)
+
+        with self._thinker('{"verdict":"retry","fixed_step":"фикс","reason":"r"}'), \
+             mock.patch.object(self.fb, "enqueue_task", flaky):
+            o.process_local_chains()
+        self.assertEqual(len(self._news()), 0)
+        self.assertEqual(len(self._summaries(pid)), 1)        # очередь не приняла → halt, не хуже
+
+    def test_timeout_diagnoses_carry_mark(self):
+        # фундамент ⏱-гейта: локальные таймаут-диагнозы несут TIMEOUT_MARK первым символом
+        tid = self.fb.add(status="new")
+        self._claude(raise_timeout=True)
+        o.process_new()
+        self.assertTrue(self.fb.tasks[tid]["result"].startswith(o.TIMEOUT_MARK))
+        stuck = self.fb.add(status="in_progress", updated=iso_ago(o.PC_SINGLE_STALE + 999))
+        o.process_stuck_singles()
+        self.assertTrue(self.fb.tasks[stuck]["result"].startswith(o.TIMEOUT_MARK))
+        na = self.fb.add(status="needs_approval", updated=iso_ago(o.APPROVAL_TTL + 999))
+        o.process_approval_timeouts()
+        self.assertTrue(self.fb.tasks[na]["result"].startswith(o.TIMEOUT_MARK))
+
+    def test_single_selfheal_timeout_and_convert_gates(self):
+        # паритет одиночек с VPS: ⏱-провал и конверт одобренной заявки думатель не трогает
+        o._selfheal_on = lambda: True
+        with self._boom_thinker():
+            self.assertFalse(o._maybe_selfheal(9, "обычная задача",
+                                               f"{o.TIMEOUT_MARK} таймаут 600s", frm="Filipp-pc"))
+            self.assertFalse(o._maybe_selfheal(9, "[конверт одобренной заявки 5] сделай красное",
+                                               "claude exit=1", frm="Filipp-pc"))
+
+    # ================= АДАПТАЦИЯ ПЛАНА ПОСЛЕ DONE-ШАГА =================
+
+    def test_adapt_off_keep_byte_identical(self):
+        # PLAN_ADAPT off → done-шаг = прежний релиз следующего, думатель не зовётся
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="done")
+        with self._boom_thinker():
+            o.process_local_chains()
+        news = self._news()
+        self.assertEqual(len(news), 1)
+        self.assertEqual(news[0]["task_text"], f"[шаг 2/2 родитель {pid}] шаг B")
+
+    def test_adapt_last_step_no_thinker(self):
+        # на последнем шаге думатель НЕ зовётся (экономия лимитов) → сразу сводка
+        os.environ["PLAN_ADAPT"] = "1"
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="done")
+        self._mk_step(pid, 2, 2, status="done")
+        with self._boom_thinker():
+            o.process_local_chains()
+        self.assertEqual(len(self._summaries(pid)), 1)
+
+    def test_adapt_keep_releases_next_and_dedups(self):
+        os.environ["PLAN_ADAPT"] = "1"
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B", "3. шаг C"])
+        self._mk_step(pid, 1, 3, status="done", result="RESULT: A готов")
+        with self._thinker('{"verdict":"keep","adjusted_steps":[],"reason":"план верен"}'):
+            o.process_local_chains()
+        news = self._news()
+        self.assertEqual(len(news), 1)
+        self.assertEqual(news[0]["task_text"], f"[шаг 2/3 родитель {pid}] шаг B")
+        self.assertIn((pid, 1), o._loc_adapted)               # дедуп: второй раз не спросим
+        # промпт думателя несёт результаты сделанных и оставшиеся шаги
+        p = self.prompts[0]
+        self.assertIn("шаг 1: RESULT: A готов", p)
+        self.assertIn("шаг 2: шаг B", p)
+        self.assertIn("шаг 3: шаг C", p)
+
+    def test_adapt_adjust_posts_card_and_releases_corrected(self):
+        os.environ["PLAN_ADAPT"] = "1"
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B", "3. шаг C"])
+        self._mk_step(pid, 1, 3, status="done")
+        with self._thinker('{"verdict":"adjust","adjusted_steps":["шаг B2","шаг C2"],'
+                           '"reason":"B устарел"}'):
+            o.process_local_chains()
+        cards = self._adapt_cards(pid)
+        self.assertEqual(len(cards), 1)                       # 🧭-карточка = restart-proof остаток
+        self.assertEqual(cards[0]["status"], "done")
+        self.assertEqual(cards[0]["task_text"], f"[коррекция плана родитель {pid}] после шага 1 (K=1)")
+        self.assertIn("🧭", cards[0]["result"])
+        self.assertIn("2. шаг B2", cards[0]["result"])
+        self.assertIn("3. шаг C2", cards[0]["result"])
+        news = self._news()
+        self.assertEqual(len(news), 1)                        # релиз ПЕРВОГО скорректированного
+        self.assertEqual(news[0]["task_text"],
+                         f"[шаг 2/3 родитель {pid}] [коррекция плана 1] шаг B2")
+        # restart-proof: план из очереди уже НОВЫЙ
+        plan, k_cnt, last_base = o._loc_current_plan(pid)
+        self.assertEqual(plan, {1: ("шаг A", 0), 2: ("шаг B2", 1), 3: ("шаг C2", 1)})
+        self.assertEqual((k_cnt, last_base), (1, 1))
+
+    def test_adapt_third_adjust_terminal_halt(self):
+        # счётчик K restart-proof из карточек очереди: 2 уже есть → третий adjust = 🛑 дрейф
+        os.environ["PLAN_ADAPT"] = "1"
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B", "3. шаг C"])
+        for k, base in ((1, 1), (2, 1)):
+            card = self.fb.add(status="done",
+                               task_text=f"[коррекция плана родитель {pid}] после шага 1 (K={k})")
+            self.fb.tasks[card]["from"] = o.PC_LOCAL_DEC_FROM
+            self.fb.tasks[card]["result"] = f"остаток {k}:\n2. шаг B{k}\n3. шаг C{k}"
+        self._mk_step(pid, 2, 3, status="done", text="шаг B2", k=2)
+        with self._thinker('{"verdict":"adjust","adjusted_steps":["шаг C3"],"reason":"ещё раз"}'):
+            o.process_local_chains()
+        self.assertEqual(len(self._news()), 0)                # релиза нет — терминальный halt
+        cards = self._cards(pid)
+        self.assertEqual(len(cards), 1)
+        self.assertIn("🛑 план дрейфует", cards[0]["result"])
+        self.assertIn("нужен", cards[0]["result"])
+        self.assertEqual(len(self._summaries(pid)), 1)
+        self.assertEqual(len(self._adapt_cards(pid)), 2)      # третья карточка НЕ создана
+
+    def test_adapt_over_max_steps_failsafe_keep(self):
+        os.environ["PLAN_ADAPT"] = "1"
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="done")
+        eight = "[" + ",".join(f'"s{j}"' for j in range(8)) + "]"   # 1+8 > MAX_STEPS=8
+        with self._thinker(f'{{"verdict":"adjust","adjusted_steps":{eight},"reason":"взрыв"}}'):
+            o.process_local_chains()
+        self.assertEqual(self._adapt_cards(pid), [])          # коррекция НЕ применена
+        news = self._news()
+        self.assertEqual(len(news), 1)                        # fail-safe keep: прежний шаг 2
+        self.assertEqual(news[0]["task_text"], f"[шаг 2/2 родитель {pid}] шаг B")
+
+    def test_adapt_finish_early_summary(self):
+        os.environ["PLAN_ADAPT"] = "1"
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B", "3. шаг C"])
+        self._mk_step(pid, 1, 3, status="done", result="RESULT: всё уже сделано")
+        with self._thinker('{"verdict":"finish","adjusted_steps":[],"reason":"цель достигнута"}'):
+            o.process_local_chains()
+        self.assertEqual(len(self._news()), 0)                # остаток НЕ релизится
+        cards = self._cards(pid)
+        self.assertEqual(len(cards), 1)
+        self.assertIn("🏁", cards[0]["result"])
+        sums = self._summaries(pid)
+        self.assertEqual(len(sums), 1)
+        self.assertIn("🏁 завершено досрочно: цель достигнута", sums[0]["result"])
+
+    def test_adapt_fresh_correction_step_not_reconsulted(self):
+        # шаг сам вышел из свежей коррекции (last_base == i) → думатель НЕ зовётся, релиз штатно
+        os.environ["PLAN_ADAPT"] = "1"
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B", "3. шаг C"])
+        card = self.fb.add(status="done",
+                           task_text=f"[коррекция плана родитель {pid}] после шага 1 (K=1)")
+        self.fb.tasks[card]["from"] = o.PC_LOCAL_DEC_FROM
+        self.fb.tasks[card]["result"] = "остаток:\n2. шаг B2\n3. шаг C2"
+        self._mk_step(pid, 1, 3, status="done")               # done ШАГА-БАЗЫ коррекции (i=1=last_base)
+        with self._boom_thinker():
+            o.process_local_chains()
+        news = self._news()
+        self.assertEqual(len(news), 1)
+        self.assertEqual(news[0]["task_text"],
+                         f"[шаг 2/3 родитель {pid}] [коррекция плана 1] шаг B2")
+
+    def test_adapt_thinker_failure_failsafe_keep(self):
+        os.environ["PLAN_ADAPT"] = "1"
+        for reply in (None, "мусор", '{"verdict":"adjust","adjusted_steps":[]}',
+                      '{"verdict":"переделать"}'):
+            self.fb.tasks.clear()
+            o._loc_summarized.clear()
+            o._loc_adapted.clear()
+            pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+            self._mk_step(pid, 1, 2, status="done")
+            with self._thinker(reply):
+                o.process_local_chains()
+            news = self._news()
+            self.assertEqual(len(news), 1, str(reply))        # keep: прежний план исполняется
+            self.assertEqual(news[0]["task_text"], f"[шаг 2/2 родитель {pid}] шаг B", str(reply))
+
+    def test_adapt_card_enqueue_fail_failsafe_keep(self):
+        os.environ["PLAN_ADAPT"] = "1"
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="done")
+        real = self.fb.enqueue_task
+
+        def flaky(frm, text, lane="pc"):
+            if text.startswith("[коррекция плана родитель"):
+                return {"ok": False, "error": "bridge down"}
+            return real(frm, text, lane)
+
+        with self._thinker('{"verdict":"adjust","adjusted_steps":["шаг B2"],"reason":"r"}'), \
+             mock.patch.object(self.fb, "enqueue_task", flaky):
+            o.process_local_chains()
+        news = self._news()
+        self.assertEqual(len(news), 1)                        # карточка не встала → keep
+        self.assertEqual(news[0]["task_text"], f"[шаг 2/2 родитель {pid}] шаг B")
+
+    # --- слои живут вместе: 🩹-перерождение done → релиз следующего (адаптация после реборна) ---
+
+    def test_reborn_done_continues_chain(self):
+        os.environ["PLAN_ADAPT"] = "1"
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="failed", result="упал")
+        self._mk_step(pid, 1, 2, status="done",
+                      text="[самопочинка шага 1, попытка 1] фикс", result="RESULT: со 2-й попытки")
+        with self._thinker('{"verdict":"keep","adjusted_steps":[],"reason":"ок"}'):
+            o.process_local_chains()
+        news = self._news()
+        self.assertEqual(len(news), 1)                        # цепь продолжилась штатно
+        self.assertEqual(news[0]["task_text"], f"[шаг 2/2 родитель {pid}] шаг B")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

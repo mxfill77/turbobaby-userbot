@@ -81,6 +81,7 @@ CLIENT_BLIND_ALARM = int(os.getenv("PC_CLIENT_BLIND_ALARM", "3") or "3")        
 WAKE_GRACE_SEC = int(os.getenv("PC_WAKE_GRACE", "120") or "120")                # после пробуждения ПК — окно без вердиктов
 WAKE_JUMP_MARGIN = int(os.getenv("PC_WAKE_JUMP_MARGIN", "60") or "60")          # скачок wall-clock > POLL+это → «ПК проснулся»
 RESULT_MAX = 4500
+TIMEOUT_MARK = "⏱"       # маркер таймаут/сирота-диагнозов: думатель самопочинки их НЕ чинит
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")   # ФОЛБЭК: явный путь из .env (может протухнуть при автообновлении)
 # Базовая папка версионных установок claude-code (AppData\Roaming\Claude\claude-code\<версия>\claude.exe).
 # Резолвим НОВЕЙШУЮ установку сами → путь переживает автообновление, даже когда .env-путь протух (WinError 2).
@@ -419,7 +420,8 @@ def run_task(tid, text, note=""):
             rc, out, err = run_claude(prompt, TASK_TIMEOUT, REPO, env)
         except TimeoutError:
             log.warning("id=%s ТАЙМАУТ %ss → failed", tid, TASK_TIMEOUT)
-            return "failed", f"таймаут {TASK_TIMEOUT}s — headless прерван, задача не завершилась"
+            return "failed", (f"{TIMEOUT_MARK} таймаут {TASK_TIMEOUT}s — headless прерван, "
+                              "задача не завершилась")
         except Exception as e:
             log.error("id=%s ошибка запуска: %s", tid, e)
             return "failed", f"ошибка запуска claude: {e}"
@@ -656,7 +658,7 @@ def process_approval_timeouts():
         tid = task.get("id")
         if (_age_sec(task.get("updated")) or 0) > APPROVAL_TTL:
             log.info("NEEDS_APPROVAL id=%s таймаут (>%ss) → failed", tid, APPROVAL_TTL)
-            msg = "подтверждение не получено за 30 мин — задача провалена"
+            msg = (f"{TIMEOUT_MARK} подтверждение не получено за 30 мин — задача провалена")
             bc.complete_task(tid, "failed", msg)
             _cowork(f"задача #{tid} → failed · {_clip(msg)}")
             _notify(_human("failed", tid, "подтверждение не получено за 30 мин"))
@@ -708,7 +710,7 @@ def process_stuck_singles(now=None):
         age = _age_sec(task.get("updated"), now=now) or 0
         if age <= PC_SINGLE_STALE:
             continue
-        msg = (f"ПК-таймаут одиночки: задача провисела in_progress {int(age)}с (> {PC_SINGLE_STALE}с) — "
+        msg = (f"{TIMEOUT_MARK} ПК-таймаут одиночки: задача провисела in_progress {int(age)}с (> {PC_SINGLE_STALE}с) — "
                "ПК был выключен, либо прогон застрял/оборвался посреди исполнения. Помечена failed "
                "ПК-ливнессом (не зависает вечно). Повтори при необходимости.")[:RESULT_MAX]
         bc.complete_task(tid, "failed", msg)
@@ -862,9 +864,27 @@ THINKER_FALLBACK = os.getenv("THINKER_FALLBACK", "opus-4.8").strip()            
 # Маркер перерождения одиночной задачи стоит ПЕРВЫМ в тексте → якорь ^ (страховка от ложного
 # срабатывания на ТЗ, где маркер лишь упомянут в теле). N = id исходной задачи.
 _HEAL_TASK_RE = re.compile(r"^\s*\[самопочинка задачи (\d+), попытка (\d+)\]")
+# Конверт одобренной заявки (маркер ОБЯЗАН стоять ПЕРВЫМ — якорь ^): самопочинка его НЕ трогает,
+# перерождение сдвинуло бы маркер и сломало бы разрыв петли ре-конвертов (спека, часть 2/2 §1).
+_CONVERT_RE = re.compile(r"^\s*\[конверт одобренной заявки\b")
 # Признак самомодификации демона для класса «плановый рестарт ≠ падение».
 _SELFMOD_RE = re.compile(r"pc[-_ ]?orchestrator|самомодифика", re.IGNORECASE)
 
+# Преамбула думателя ШАГА локальной цепи (порт THINKER_PREAMBLE VPS, спека часть 2/2 §1):
+# та же схема/строгость, но ключ fixed_step и контекст с родителем/планом (даёт _loc_selfheal_consult).
+THINKER_PREAMBLE = (
+    "Ты — думательный слой самопочинки ПК-оркестратора TurboBaby (мета-дирижёр). Шаг декомпозиции "
+    "упал при исполнении. Твоя задача — ТОЛЬКО диагноз и вердикт; ты НИЧЕГО не исполняешь, "
+    "инструментов у тебя нет, файлы не читаешь — решай строго по данным ниже.\n"
+    "Ответь СТРОГО ОДНИМ JSON-объектом, без текста до/после, без markdown-обёртки:\n"
+    '{"verdict":"retry"|"halt","fixed_step":"<новая формулировка шага>","reason":"<1 строка диагноза>"}\n'
+    "verdict=retry — ТОЛЬКО если провал починим переформулировкой шага (неверный путь/имя файла, "
+    "недостающий контекст, кривая команда) и правка очевидна; fixed_step тогда — САМОДОСТАТОЧНОЕ "
+    "дев-ТЗ ≤400 символов (исполнитель увидит ТОЛЬКО его, впиши нужный контекст). Во всех прочих "
+    "случаях (причина неясна, нужен человек, красная зона, объём не влезает в таймаут) — "
+    "verdict=halt и fixed_step пустой. Система даёт РОВНО ОДНУ попытку починки — не предлагай "
+    "многошаговых планов.\n\n"
+)
 TASK_THINKER_PREAMBLE = (
     "Ты — думательный слой самопочинки ПК-оркестратора TurboBaby (мета-дирижёр). Одиночная "
     "headless-задача упала при исполнении. Твоя задача — ТОЛЬКО диагноз и вердикт; ты НИЧЕГО "
@@ -1039,10 +1059,18 @@ def _maybe_selfheal(tid, text, fail_text, frm=""):
     коде (fail-safe). STEP_SELFHEAL=0/нет → False сразу (поведение байт-в-байт прежнее)."""
     if str(frm or "") == PC_LOCAL_DEC_FROM:
         # артефакт ЛОКАЛЬНОЙ цепи (шаг [шаг i/N]/родитель/synthetic) — НЕ одиночка: им владеет
-        # надзор цепи (process_local_chains: halt-on-fail сейчас, самопочинка ЦЕПИ — кусок шага 4);
+        # надзор цепи (process_local_chains → _loc_after_fail: свой думатель самопочинки шага);
         # одиночное перерождение сорвало бы маркеры/порядок цепи. False = голый failed → тик цепи.
         return False
     if not _selfheal_on():
+        return False
+    if str(fail_text or "").lstrip().startswith(TIMEOUT_MARK):
+        # ⏱-диагнозы (таймаут задачи / ПК-ливнесс застрявшей in_progress) думатель НЕ чинит:
+        # переформулировка не ускорит зависший claude и не оживит Bridge — честный failed
+        return False
+    if _CONVERT_RE.match(str(text or "")):
+        # конверт одобренной заявки НЕ перерождаем: маркер конверта обязан стоять ПЕРВЫМ,
+        # перерождение сдвинуло бы его → сломался бы разрыв петли ре-конвертов
         return False
     return _maybe_task_selfheal(tid, text, fail_text, frm)
 
@@ -1083,6 +1111,57 @@ _CARD_RE = re.compile(r"^\[карточка родитель (\d+)\]")          
 _ADAPT_BASE_RE = re.compile(r"после шага (\d+)")                     # база коррекции из task_text карточки
 ADAPT_REPLACED_MARK = "♻️ заменён коррекцией плана"                  # done-карта шага, заменённого адаптацией
 ADAPT_FINISH_MARK = "⏭ закрыт досрочно"                              # done-карта шага, закрытого finish'ем
+_REJECT_PREFIX = "отклонено Филиппом"     # префикс result devbot-отказа (halt цепи без думателя)
+PLAN_ADAPT_MAX = 2                        # потолок коррекций на цепь; третий adjust = дрейф плана → halt
+PLAN_ADAPT_TIMEOUT = int(os.getenv("PC_PLAN_ADAPT_TIMEOUT", "180") or "180")  # думатель адаптации — короткий ответ
+# Преамбула думателя адаптации плана (порт ADAPT_PREAMBLE VPS, спека часть 2/2 §2).
+ADAPT_PREAMBLE = (
+    "Ты — думательный слой адаптации плана ПК-оркестратора TurboBaby (мета-дирижёр). Очередной шаг "
+    "декомпозиции успешно завершён. Твоя задача — сверить результаты сделанного с целью родителя "
+    "и решить, верен ли ЕЩЁ оставшийся план; ты НИЧЕГО не исполняешь, инструментов у тебя нет, "
+    "файлы не читаешь — решай строго по данным ниже.\n"
+    "Ответь СТРОГО ОДНИМ JSON-объектом, без текста до/после, без markdown-обёртки:\n"
+    '{"verdict":"keep"|"adjust"|"finish","adjusted_steps":["<шаг>",...],"reason":"<1 строка>"}\n'
+    "verdict=keep — оставшийся план верен, исполнять как есть (adjusted_steps пустой). Это "
+    "ДЕФОЛТ: при малейшем сомнении — keep.\n"
+    "verdict=adjust — ТОЛЬКО если результаты сделанных шагов сделали оставшиеся лишними/"
+    "неверными и правка очевидна; adjusted_steps = НОВЫЙ полный список ОСТАВШИХСЯ шагов "
+    "(сделанные не трогай), каждый — САМОДОСТАТОЧНОЕ дев-ТЗ ≤400 символов (исполнитель увидит "
+    "ТОЛЬКО его текст, впиши нужный контекст).\n"
+    "verdict=finish — цель родителя УЖЕ достигнута, оставшиеся шаги не нужны вовсе "
+    "(adjusted_steps пустой).\n\n"
+)
+
+
+def _plan_adapt_on():
+    """Флаг PLAN_ADAPT=1 в .env (отдельно от STEP_SELFHEAL, независимый откат). 0/нет → прежнее
+    поведение (после done-шага всегда keep: релиз следующего шага прежнего плана)."""
+    return (os.environ.get("PLAN_ADAPT") or "").strip() == "1"
+
+
+def _parse_adapt_json(text):
+    """Строгий парс ответа думателя адаптации → {"verdict","adjusted_steps","reason"} или None
+    (None = fail-safe keep у вызывающего). Терпим обёртку-мусор вокруг JSON; verdict обязан быть
+    keep|adjust|finish; adjust без непустых adjusted_steps → None (пустой adjust = keep)."""
+    t = (text or "").strip()
+    i, j = t.find("{"), t.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        d = json.loads(t[i:j + 1])
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    v = str(d.get("verdict") or "").strip().lower()
+    if v not in ("keep", "adjust", "finish"):
+        return None
+    raw_steps = d.get("adjusted_steps")
+    steps = ([str(s).strip() for s in raw_steps if str(s).strip()]
+             if isinstance(raw_steps, list) else [])
+    if v == "adjust" and not steps:
+        return None
+    return {"verdict": v, "adjusted_steps": steps, "reason": str(d.get("reason") or "").strip()}
 # Красность шага (дословно с VPS): красное действие исполнитель шага спросит кнопкой сам —
 # пометка нужна владельцу заранее увидеть, где цепь встанет на «да».
 _HEADLESS_IMPOSSIBLE_RE = re.compile(
@@ -1217,8 +1296,10 @@ def _local_dec_plan(tid, text):
 _LOC_STATUSES = ("new", "in_progress", "needs_approval", "approved", "done", "failed")
 _loc_summarized = set()    # родители, по которым сводка уже отправлена (дедуп-кэш памяти процесса;
                            # после рестарта от дублей защищает скан очереди _loc_summary_exists)
-_loc_adapt_finish = {}     # pid → причина досрочного finish (кэш для 🏁-шапки сводки; наполняет
-                           # адаптация плана — следующий кусок порта, шаг 4)
+_loc_adapt_finish = {}     # pid → причина досрочного finish (кэш для 🏁-шапки сводки; сводка идёт
+                           # ТЕМ ЖЕ вызовом _loc_after_done — рестарт между ними не страшен)
+_loc_adapted = set()       # (pid, step_i), по которым думатель адаптации уже спрошен (память
+                           # процесса; после рестарта — максимум один лишний keep-вопрос)
 
 
 def _loc_enqueue(text):
@@ -1281,9 +1362,10 @@ def _loc_summary_exists(pid):
 
 
 def _loc_post_card(pid, text):
-    """Событийная карточка цепи (⚠️ план не восстановился; 🩹/🛑/🧭/🏁 — куски шага 4) —
+    """Событийная карточка цепи (🩹 retry / 🛑 terminal / 🏁 finish / ⚠️ план не восстановился) —
     synthetic-задачей прямым каналом (enqueue → claim → complete done): очередь — единственный
-    канал дирижёра наружу, devbot принесёт done-рапортом."""
+    канал дирижёра наружу, devbot принесёт done-рапортом. (🧭-карточка коррекции идёт отдельным
+    маркером _ADAPT_CARD_RE — она же restart-proof носитель остатка плана.)"""
     r = _loc_enqueue(f"[карточка родитель {pid}] событие локальной цепи")
     if not r.get("ok"):
         log.warning("pcloc-dec: карточка родителя %s не встала в очередь (%s)", pid, r.get("error"))
@@ -1402,31 +1484,182 @@ def _loc_release(pid, j, total, text, k=0):
     return True
 
 
+def _loc_parent_context(pid):
+    """Контекст родителя pid для думателей: (исходная цель дословно, план шагов). Родитель после
+    декомпозиции лежит в done (task_text = цель, result = план). Не нашли → заглушки (не валимся)."""
+    try:
+        r = bc.get_pending("done")
+        if r.get("ok"):
+            for it in r.get("items", []):
+                if int(it.get("id") or 0) == int(pid):
+                    return (str(it.get("task_text") or "").strip()[:1500],
+                            str(it.get("result") or "").strip()[:2000])
+    except Exception as e:
+        log.warning("pcloc-selfheal: контекст родителя %s не прочитан (%s)", pid, e)
+    return (f"(родитель {pid} не найден в очереди)", "(план недоступен)")
+
+
+def _loc_selfheal_consult(pid, step_i, step_n, step_text, fail_text):
+    """Думатель самопочинки шага локальной цепи: промпт = цель родителя ДОСЛОВНО + план шагов +
+    упавший шаг + суть провала. Возврат: dict {"verdict","fixed_step","reason"} или None
+    (любой сбой думателя = None = fail-safe прежний halt-on-fail)."""
+    goal, plan = _loc_parent_context(pid)
+    prompt = (THINKER_PREAMBLE +
+              f"ИСХОДНАЯ ЦЕЛЬ РОДИТЕЛЯ (дословно):\n{goal}\n\n"
+              f"ПЛАН ШАГОВ РОДИТЕЛЯ:\n{plan}\n\n"
+              f"УПАВШИЙ ШАГ {step_i}/{step_n} (текст дословно):\n{step_text}\n\n"
+              f"СУТЬ ПРОВАЛА:\n{str(fail_text or '')[:1200]}\n")
+    out = _thinker_exec(prompt, STEP_SELFHEAL_TIMEOUT, "pcloc-selfheal")
+    if out is None:
+        return None
+    verdict = _parse_thinker_json(out, fix_key="fixed_step")
+    if verdict is None:
+        log.warning("pcloc-selfheal: ответ думателя не распарсился (fail-safe halt): %.200s", out)
+    return verdict
+
+
+def _loc_adapt_consult(pid, step_i, steps, remaining):
+    """Думатель адаптации локальной цепи — ТА ЖЕ схема (ADAPT_PREAMBLE, кондуктор, --max-turns 1,
+    строгий JSON): сделанное берём из done-шагов снапшота (дубли номера — последний по id:
+    перерождение самопочинки затирает провал), оставшееся — из восстановленного плана (в очереди
+    его нет — шаги релизятся по одному). None = fail-safe keep."""
+    goal, plan_txt = _loc_parent_context(pid)
+    done_last = {}
+    for i, _n, it in sorted([s for s in steps if str(s[2].get("status")) == "done"],
+                            key=lambda x: (x[0], int(x[2].get("id") or 0))):
+        done_last[i] = str(it.get("result") or "").strip()
+    done_lines = [f"шаг {i}: {(done_last[i].splitlines() or ['(пусто)'])[0][:300]}"
+                  for i in sorted(done_last)] or ["(результатов пока нет)"]
+    rem_lines = [f"шаг {j}: {t[:400]}" for j, t in remaining]
+    prompt = (ADAPT_PREAMBLE +
+              f"ИСХОДНАЯ ЦЕЛЬ РОДИТЕЛЯ (дословно):\n{goal}\n\n"
+              f"ИСХОДНЫЙ ПЛАН ШАГОВ:\n{plan_txt}\n\n"
+              f"РЕЗУЛЬТАТЫ СДЕЛАННЫХ ШАГОВ (сжато; только что завершён шаг {step_i}):\n"
+              + "\n".join(done_lines) + "\n\n"
+              "ОСТАВШИЕСЯ ШАГИ ПЛАНА:\n" + "\n".join(rem_lines) + "\n")
+    out = _thinker_exec(prompt, PLAN_ADAPT_TIMEOUT, "pcloc-plan-adapt")
+    if out is None:
+        return None
+    v = _parse_adapt_json(out)
+    if v is None:
+        log.warning("pcloc-plan-adapt: ответ думателя не распарсился/пуст (fail-safe keep): %.200s", out)
+    return v
+
+
 def _loc_after_fail(pid, i, n, it, steps):
-    """Провал шага локальной цепи → halt-on-fail: сводка, дальше НЕ релизим (sequential-модель —
-    пропускать нечего, остальных шагов в очереди нет). Самопочинка шага (думатель, ровно одно
-    перерождение, 🩹/🛑-карты, гейты ⏱/отказа) — следующий кусок порта (шаг 4)."""
-    _loc_post_summary(pid, steps)
+    """Провал шага локальной цепи (уже failed в очереди). Отказ Филиппа / ⏱-диагноз
+    (таймаут headless, ПК-ливнесс застрявшей in_progress, просрочка approve) → halt без
+    думателя; перерождение упало ПОВТОРНО → терминальный halt (🛑-карта); STEP_SELFHEAL=0 →
+    прежний halt-on-fail; иначе думатель самопочинки → РОВНО одно перерождение с маркером
+    «[самопочинка шага i, попытка 1]» + 🩹-карта. Halt в sequential-модели = просто НЕ релизить
+    дальше + сводка (пропускать нечего — остальных шагов в очереди нет). FAIL-SAFE: любой сбой
+    думателя/enqueue = halt (не хуже прежнего). Конверты сюда не попадают структурно: маркер
+    конверта обязан стоять ПЕРВЫМ (^), а текст шага начинается с «[шаг i/N…»."""
+    text = str(it.get("task_text") or "")
+    fail_text = str(it.get("result") or "")
+    if fail_text.lstrip().startswith((_REJECT_PREFIX, TIMEOUT_MARK)):
+        _loc_post_summary(pid, steps)         # человек сказал «нет» / ⏱ — чинить нечего
+        return
+    if _HEAL_RE.search(text):
+        _loc_post_card(pid, f"🛑 самопочинка не помогла (попытка 1 исчерпана): шаг {i}/{n} "
+                            f"родителя {pid} упал повторно — цепочка остановлена, нужен человек.\n"
+                            f"{fail_text[:400]}")
+        _loc_post_summary(pid, steps)
+        return
+    if not _selfheal_on():
+        _loc_post_summary(pid, steps)         # прежний halt-on-fail (провал уже отрапортован ❌)
+        return
+    verdict = _loc_selfheal_consult(pid, i, n, text, fail_text)
+    if verdict is None or verdict["verdict"] != "retry" or not verdict["fixed_step"]:
+        reason = (verdict or {}).get("reason") or "(сбой думателя — fail-safe halt)"
+        _loc_post_card(pid, f"шаг {i}/{n} упал → думатель: halt, причина: {reason}\n"
+                            f"Цепочка остановлена (диагноз думателя выше).")
+        _loc_post_summary(pid, steps)
+        return
+    fixed, reason = verdict["fixed_step"], verdict["reason"] or "(без причины)"
+    r = _loc_enqueue((f"[шаг {i}/{n} родитель {pid}] "
+                      f"[самопочинка шага {i}, попытка 1] {fixed}")[:RESULT_MAX])
+    if not r.get("ok"):
+        log.warning("pcloc-dec: перерождение шага %s родителя %s не встало (%s) — fail-safe halt",
+                    i, pid, r.get("error"))
+        _loc_post_summary(pid, steps)         # очередь не приняла → halt (не хуже прежнего)
+        return
+    _loc_post_card(pid, f"🩹 шаг {i}/{n} упал → думатель: retry, правка: {fixed[:200]}, "
+                        f"причина: {reason[:200]}\n"
+                        f"Перерождён задачей id {r.get('id')} (lane=pc; попытка 1 из 1; повторный "
+                        f"провал = терминальный halt).\nИсходный провал: {fail_text[:400]}")
+    log.info("pcloc-dec: шаг %s/%s родителя %s перерождён задачей %s (retry)", i, n, pid, r.get("id"))
 
 
 def _loc_after_done(pid, i, n, it, steps):
-    """Done шага локальной цепи: план restart-proof из очереди → последний по плану → сводка;
-    план не восстановился → ⚠️-карточка + halt; иначе релиз СЛЕДУЮЩЕГО шага (сохраняя
-    K-происхождение). Адаптация плана (keep/adjust/finish думателем) — следующий кусок порта
-    (шаг 4): здесь всегда keep."""
-    plan, _k_cnt, _last_base = _loc_current_plan(pid)
+    """Done шага локальной цепи: план restart-proof из очереди → последний по плану → сводка
+    (думатель НЕ зовётся — экономия лимитов); план не восстановился → ⚠️-карточка + halt; иначе
+    при PLAN_ADAPT=1 адаптация (keep/adjust/finish): keep → релиз следующего шага прежнего плана;
+    adjust → карточка коррекции (restart-proof остаток плана в result) + релиз первого
+    скорректированного (счётчик K = карточки коррекций в очереди, лимит PLAN_ADAPT_MAX, дальше
+    halt «план дрейфует»); finish → 🏁-карта + сводка «завершено досрочно». Дедуп консультаций:
+    (pid, i) в _loc_adapted; шаг сам из свежей коррекции (last_base == i) → не переспрашиваем.
+    ЛЮБОЙ сбой думателя/карточки/потолок MAX_STEPS = fail-safe keep."""
+    plan, k_cnt, last_base = _loc_current_plan(pid)
     total = max(plan) if plan else n
     if i >= total:
         _loc_post_summary(pid, steps)
         return
-    nxt = plan.get(i + 1)
-    if nxt is None:
+    if plan.get(i + 1) is None:
         _loc_post_card(pid, f"⚠️ план родителя {pid} не восстановился из очереди (шаг {i + 1} "
                             f"не найден в result родителя/коррекций) — цепочка остановлена, "
                             f"поставь «декомпозируй:» заново.")
         _loc_post_summary(pid, steps)
         return
-    txt, k_origin = nxt
+    consult = (_plan_adapt_on() and last_base != i and (pid, i) not in _loc_adapted)
+    if consult:
+        _loc_adapted.add((pid, i))
+        remaining = [(j, plan[j][0]) for j in sorted(plan) if j > i]
+        verdict = _loc_adapt_consult(pid, i, steps, remaining)
+        if verdict is not None and verdict["verdict"] == "finish":
+            reason = (verdict["reason"] or "(без причины)")[:300]
+            _loc_adapt_finish[pid] = reason
+            _loc_post_card(pid, f"🏁 после шага {i} думатель решил: цель родителя {pid} достигнута "
+                                f"досрочно ({reason}) — оставшиеся шаги {i + 1}–{total} не релизятся.")
+            _loc_post_summary(pid, steps)
+            log.info("pcloc-plan-adapt: родитель %s finish после шага %s (%s)", pid, i, reason[:120])
+            return
+        if verdict is not None and verdict["verdict"] == "adjust":
+            new_steps = verdict["adjusted_steps"]
+            reason = (verdict["reason"] or "(без причины)")[:300]
+            k = k_cnt + 1
+            if k > PLAN_ADAPT_MAX:
+                _loc_post_card(pid, f"🛑 план дрейфует: думатель запросил коррекцию №{k} (лимит "
+                                    f"{PLAN_ADAPT_MAX} на цепь) — цепочка остановлена, нужен "
+                                    f"владелец. Диагноз думателя: {reason}")
+                _loc_post_summary(pid, steps)
+                log.info("pcloc-plan-adapt: родитель %s — adjust №%s (> лимита %s) → halt (дрейф)",
+                         pid, k, PLAN_ADAPT_MAX)
+                return
+            if i + len(new_steps) > MAX_STEPS:
+                log.warning("pcloc-plan-adapt: родитель %s adjust дал %s шагов (итог > потолка %s) "
+                            "— fail-safe keep", pid, len(new_steps), MAX_STEPS)
+            else:
+                new_total = i + len(new_steps)
+                numbered = "\n".join(f"{j}. {s}" for j, s in enumerate(new_steps, start=i + 1))
+                card = (f"🧭 после шага {i} думатель скорректировал план (коррекция "
+                        f"{k}/{PLAN_ADAPT_MAX}): {reason}\n"
+                        f"НОВЫЙ ОСТАВШИЙСЯ ПЛАН (шаги {i + 1}–{new_total}, релизятся по одному):\n"
+                        f"{numbered}\n"
+                        f"Итог плана {new_total} шагов; сделанные шаги 1–{i} не тронуты. "
+                        f"Третья коррекция = halt «план дрейфует».")
+                cr = _loc_enqueue(f"[коррекция плана родитель {pid}] после шага {i} (K={k})")
+                if cr.get("ok"):
+                    bc.claim_task(cr.get("id"))
+                    bc.complete_task(cr.get("id"), "done", card[:RESULT_MAX])
+                    _loc_release(pid, i + 1, new_total, new_steps[0], k=k)
+                    log.info("pcloc-plan-adapt: родитель %s adjust K=%s после шага %s → релиз "
+                             "скорректированного шага %s/%s", pid, k, i, i + 1, new_total)
+                    return
+                log.warning("pcloc-plan-adapt: карточка коррекции родителя %s не встала (%s) — "
+                            "fail-safe keep", pid, cr.get("error"))
+    # keep / fail-safe / адаптация выключена / уже спрошено → следующий шаг прежнего плана
+    txt, k_origin = plan[i + 1]
     _loc_release(pid, i + 1, total, txt, k=k_origin)
 
 
