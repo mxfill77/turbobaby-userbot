@@ -1241,6 +1241,108 @@ def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_f
     return " ; ".join(notes)
 
 
+# ------------------- реконсиляция детей на ЛЮБОЙ новый коммит (класс-фикс) ----
+# РАЗБОР c6d8a30: свежий код ДЕТЕЙ (suggest/pricing/booking/moderation_*) применялся к живым
+# процессам ТОЛЬКО когда (а) правку принёс дев-таск самого демона (maybe_update_bots по
+# head_before..HEAD), ЛИБО (б) вместе с ней сменился блоб pc_orchestrator.py (self-update →
+# _selfupdate_restart_children). Коммит, тронувший ТОЛЬКО файлы детей и пришедший ВНЕ дев-таска
+# (cowork/ручной коммит/git pull) — оставлял детей на СТАРОМ коде до следующей смены
+# pc_orchestrator.py. Так c6d8a30 (только suggest.py+тест) не подхватился, а f89da43 (менял
+# pc_orchestrator.py) — подхватился self-update'ом. ФИКС: каждый цикл демон сверяет HEAD с
+# последним ПРИМЕНЁННЫМ к детям коммитом; HEAD ушёл вперёд и в диффе есть файлы детей → рестарт
+# затронутых (ТА ЖЕ явная карта _FILE_PROCESS_RULES + гейт затронутых тестов + анти-флап +
+# рубильник — гейты НЕ ослабляем). Реагирует на изменённые файлы детей в диффе ДАЖЕ когда сам
+# pc_orchestrator.py не менялся. Красный гейт → метку НЕ двигаем (диапазон со стале-кодом доживёт
+# до фикс-коммита), но HEAD запоминаем, чтобы не гонять гейт каждый цикл (как _SU_REJECTED_BLOB).
+CHILD_RECONCILE_SEC = int(os.getenv("PC_CHILD_RECONCILE_SEC", "60") or "60")
+_last_child_commit = None         # коммит, чьи изменения детей уже применены (init = старт демона)
+_child_reconcile_rejected = None  # HEAD с КРАСНЫМ гейтом детей — не гоняем гейт каждый цикл
+_child_reconcile_last_run = 0.0   # троттлинг тела реконсиляции
+
+
+def _full_head():
+    """Полный хеш HEAD (для метки/диффа реконсиляции). git молчит → None."""
+    return _git_out(["rev-parse", "HEAD"])
+
+
+def reconcile_children_tick(head_fn=None, diff_fn=None, gate_fn=None, restart_fn=None,
+                            now=None, cooldown=None, state=None):
+    """Тело реконсиляции детей на новый коммит (без троттлинга — троттлит maybe_reconcile_children).
+    → строка-итог для лога ('' если нечего/рубильник). Всё внешнее инъектируется для тестов.
+    Метку/rejected хранит в модульных глобалах (переживают тики; рестарт демона сбрасывает —
+    первый прогон просто примет текущий HEAD как применённый, т.к. дети стартовали с ним)."""
+    global _last_child_commit, _child_reconcile_rejected
+    if _stopped():
+        return ""
+    head = (head_fn or _full_head)()
+    if not head:
+        return ""
+    if _last_child_commit is None:        # первый прогон: дети стартовали с текущим HEAD → он уже «применён»
+        _last_child_commit = head
+        return ""
+    if head == _last_child_commit or head == _child_reconcile_rejected:
+        return ""                         # нет нового коммита ИЛИ этот HEAD уже провалил гейт — ждём новый
+    changed = (diff_fn or _diff_names)(_last_child_commit, head)
+    ub_files, mb_files = _classify_changed(changed)
+    if not (ub_files or mb_files):
+        _last_child_commit = head         # тронуты только не-код-файлы детей (pc_orchestrator/доки/тесты) — двигаем метку
+        return ""
+    now = time.time() if now is None else now
+    cooldown = APPLY_COOLDOWN_SEC if cooldown is None else cooldown
+    state = _apply_restart_at if state is None else state
+    short = head[:9]
+    notes, gate_red = [], False
+    for kind, label, files in (("userbot", "userbot", ub_files), ("moderbot", "модербот", mb_files)):
+        if not files:
+            continue
+        mods = _affected_test_modules(files)
+        ok, gmsg = (gate_fn or _gate_test_modules)(mods)
+        if not ok:
+            gate_red = True
+            log.error("реконсиляция детей %s: гейт КРАСНЫЙ (%s) — рестарт отложен", kind, _tail(gmsg, 200))
+            _notify(f"⚠️ Оркестратор: {label} НЕ перезапущен — тесты красные (код запушен, применится после фикса)")
+            notes.append(f"{label}: тесты красные — рестарт отложен")
+            continue
+        if _apply_antiflap(kind, now, cooldown, state):   # уже рестартнули (дев-таск/self-update/прошлый тик) → код применён
+            log.info("реконсиляция детей %s: недавно рестартили — анти-флап, пропуск", kind)
+            notes.append(f"{label}: анти-флап (недавно рестартили) — пропуск")
+            continue
+        try:
+            rok, pids, detail = (restart_fn or _restart_via_pc_agent)(kind)
+        except Exception as e:
+            rok, pids, detail = False, [], f"исключение рестарта: {e}"
+        _stamp_apply_restart(kind, now, state)
+        if rok and pids:
+            log.info("реконсиляция детей: %s рестартнут до %s, PID %s", kind, short, pids)
+            _cowork(f"авто-применил {short}: рестарт {kind} (PID {', '.join(map(str, pids))})")
+            notes.append(f"{label} рестартнут (PID {', '.join(map(str, pids))})")
+        elif rok:                                          # рестарт не требовался (напр. модербот без токена)
+            log.info("реконсиляция детей: %s — %s", kind, detail)
+            _cowork(f"авто-применил {short}: рестарт {kind} — {_tail(detail, 160)}")
+            notes.append(f"{label}: {detail}")
+        else:
+            log.error("реконсиляция детей: рестарт %s НЕ УДАЛСЯ — %s", kind, detail)
+            _cowork(f"авто-применил {short}: рестарт {kind} НЕ удался — {_tail(detail, 160)}")
+            _notify(f"⚠️ Оркестратор: {label} не рестартнут (реконсиляция {short}): {_tail(detail, 160)}")
+            notes.append(f"{label}: рестарт НЕ удался")
+    if gate_red:
+        _child_reconcile_rejected = head   # метку НЕ двигаем: стале-код детей доживёт до фикс-коммита
+    else:
+        _last_child_commit = head
+        _child_reconcile_rejected = None
+    return " ; ".join(notes)
+
+
+def maybe_reconcile_children(now=None):
+    """Троттлинг реконсиляции детей: тело не чаще CHILD_RECONCILE_SEC. → строка|None (None = рано)."""
+    global _child_reconcile_last_run
+    now = time.time() if now is None else now
+    if now - _child_reconcile_last_run < CHILD_RECONCILE_SEC:
+        return None
+    _child_reconcile_last_run = now
+    return reconcile_children_tick()
+
+
 # ------------------- контур-вотчдог клиентского контура (часть 3) -------------
 # Демон каждые CLIENT_WATCH_SEC (5 мин) проверяет живость pc_agent/userbot/moderation_bot по
 # PID (CIM-поиск процесса = источник правды) + свежести их логов (диагностика). Мёртвого
@@ -1585,6 +1687,7 @@ def _main_loop():
             _loop_prev_wall = now
             poll_once()
             maybe_client_watchdog()   # часть 3: следим за pc_agent/userbot/moderation_bot (троттлинг 5 мин)
+            maybe_reconcile_children()  # класс-фикс c6d8a30: применить свежий код детей на ЛЮБОЙ новый коммит
             if maybe_self_update():   # задача цикла обновила pc_orchestrator.py → эстафета новому
                 log.info("=== ДЕМОН ВЫШЕЛ ПО SELF-UPDATE (эстафета новому процессу) ===")
                 return

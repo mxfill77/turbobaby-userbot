@@ -1495,6 +1495,117 @@ class TestSelfUpdateChildren(Base):
         self.assertEqual(kinds, [])
 
 
+class TestReconcileChildren(Base):
+    """Класс-фикс c6d8a30: реконсиляция детей на ЛЮБОЙ новый коммит (не только self-update/дев-таск).
+    Реагирует на изменённые файлы детей в диффе, когда pc_orchestrator.py НЕ менялся. git-дифф/
+    рестарт/гейт/время/реестр инъектируются — боевое НЕ трогаем."""
+
+    def setUp(self):
+        super().setUp()
+        self._save_rc = (o._last_child_commit, o._child_reconcile_rejected, o._child_reconcile_last_run)
+        o._last_child_commit = None
+        o._child_reconcile_rejected = None
+        o._child_reconcile_last_run = 0.0
+
+    def tearDown(self):
+        (o._last_child_commit, o._child_reconcile_rejected, o._child_reconcile_last_run) = self._save_rc
+        super().tearDown()
+
+    def _run(self, head, changed, **kw):
+        return o.reconcile_children_tick(
+            head_fn=lambda: head,
+            diff_fn=lambda a, b: changed,
+            gate_fn=kw.get("gate_fn", (lambda mods: (True, "ok"))),
+            restart_fn=kw.get("restart_fn"),
+            now=kw.get("now", 1000), cooldown=kw.get("cooldown", 120), state=kw.get("state"))
+
+    def test_first_tick_adopts_head_no_restart(self):
+        # первый прогон (метка None): текущий HEAD принят как применённый (дети стартовали с ним).
+        kinds = []
+        note = self._run("h1", ["suggest.py"],
+                         restart_fn=lambda k: kinds.append(k) or (True, [1], "x"), state={})
+        self.assertEqual((note, kinds), ("", []))
+        self.assertEqual(o._last_child_commit, "h1")
+
+    def test_child_only_commit_restarts_without_orchestrator_change(self):
+        # ГЛАВНОЕ: коммит тронул ТОЛЬКО suggest.py (pc_orchestrator.py НЕ менялся) → рестарт детей.
+        o._last_child_commit = "old"
+        kinds, cows = [], []
+        o._cowork = lambda s: cows.append(s)
+        note = self._run("c6d8a30ab", ["suggest.py", "test_suggest.py"],
+                         restart_fn=lambda k: kinds.append(k) or (True, [777], "PID поднят, лог свежий"),
+                         state={})
+        self.assertEqual(kinds, ["userbot", "moderbot"])          # suggest → оба рантайма
+        self.assertIn("userbot рестартнут", note)
+        self.assertTrue(any("авто-применил c6d8a30ab: рестарт userbot" in s for s in cows))
+        self.assertEqual(o._last_child_commit, "c6d8a30ab")       # метка сдвинута — второй раз не дёрнет
+
+    def test_no_child_files_advances_marker_only(self):
+        # коммит тронул только сам pc_orchestrator.py/доки → метку двигаем, никого не рестартим.
+        o._last_child_commit = "old"
+        kinds = []
+        note = self._run("new9", ["pc_orchestrator.py", "README.md"],
+                         restart_fn=lambda k: kinds.append(k) or (True, [1], "x"), state={})
+        self.assertEqual((note, kinds), ("", []))
+        self.assertEqual(o._last_child_commit, "new9")
+
+    def test_red_gate_holds_marker_and_remembers_head(self):
+        # гейт КРАСНЫЙ → метку НЕ двигаем (стале-код доживёт до фикса), HEAD запомнен (не гоняем гейт).
+        o._last_child_commit = "old"
+        kinds = []
+        note = self._run("bad1", ["suggest.py"],
+                         gate_fn=lambda mods: (False, "FAILED тест"),
+                         restart_fn=lambda k: kinds.append(k) or (True, [1], "x"), state={})
+        self.assertEqual(kinds, [])                               # красный гейт — не рестартим
+        self.assertIn("тесты красные", note)
+        self.assertEqual(o._last_child_commit, "old")             # метка на месте
+        self.assertEqual(o._child_reconcile_rejected, "bad1")
+        # повторный прогон того же HEAD — гейт НЕ гоняем (ранний выход)
+        gate_calls = []
+        note2 = self._run("bad1", ["suggest.py"],
+                          gate_fn=lambda mods: gate_calls.append(1) or (False, "x"),
+                          restart_fn=lambda k: (True, [1], "x"), state={})
+        self.assertEqual((note2, gate_calls), ("", []))
+
+    def test_antiflap_suppresses_when_recently_restarted(self):
+        # дев-таск/self-update только что рестартили userbot (штамп) → реконсиляция не дёргает повторно.
+        o._last_child_commit = "old"
+        kinds = []
+        note = self._run("c9", ["suggest.py"],
+                         restart_fn=lambda k: kinds.append(k) or (True, [1], "x"),
+                         state={"userbot": 950, "moderbot": 950}, now=1000, cooldown=120)
+        self.assertEqual(kinds, [])                               # анти-флап подавил оба
+        self.assertIn("анти-флап", note)
+        self.assertEqual(o._last_child_commit, "c9")              # применено (код уже стоит) — метка сдвинута
+
+    def test_no_new_commit_is_noop(self):
+        o._last_child_commit = "same"
+        note = self._run("same", ["suggest.py"], restart_fn=lambda k: (True, [1], "x"), state={})
+        self.assertEqual(note, "")
+
+    def test_stop_flag_no_reconcile(self):
+        o._stopped = lambda: True
+        o._last_child_commit = "old"
+        kinds = []
+        note = self._run("new", ["suggest.py"],
+                         restart_fn=lambda k: kinds.append(k) or (True, [1], "x"), state={})
+        self.assertEqual((note, kinds), ("", []))
+
+    def test_throttle_skips_until_interval(self):
+        # maybe_reconcile_children троттлит тело не чаще CHILD_RECONCILE_SEC.
+        o._child_reconcile_last_run = 1000.0
+        called = {"n": 0}
+        save = o.reconcile_children_tick
+        o.reconcile_children_tick = lambda *a, **k: called.__setitem__("n", called["n"] + 1) or ""
+        try:
+            self.assertIsNone(o.maybe_reconcile_children(now=1000.0 + o.CHILD_RECONCILE_SEC - 1))
+            self.assertEqual(called["n"], 0)
+            self.assertEqual(o.maybe_reconcile_children(now=1000.0 + o.CHILD_RECONCILE_SEC + 1), "")
+            self.assertEqual(called["n"], 1)
+        finally:
+            o.reconcile_children_tick = save
+
+
 class TestCommandLevers(Base):
     """(2) команды-рычаги: одиночная lane=pc задача-команда исполняется НАПРЯМУЮ, без headless claude."""
 
