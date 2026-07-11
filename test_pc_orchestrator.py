@@ -1941,5 +1941,309 @@ class TestLocalDec(Base):
         self.assertEqual(self.fb.tasks[tid]["status"], "done")
 
 
+class TestLocalDecChain(Base):
+    """Sequential-релиз и надзор локальной цепи (шаг 3/7 родителя 185): максимум один шаг цепи
+    в очереди, состояние ТОЛЬКО из очереди (restart-proof), synthetic-сводки/карточки прямым
+    каналом (enqueue→claim→done). Всё замокано."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["PC_LOCAL_DEC"] = "1"
+        o._loc_summarized.clear()
+        o._loc_adapt_finish.clear()
+
+    def tearDown(self):
+        os.environ.pop("PC_LOCAL_DEC", None)
+        o._loc_summarized.clear()
+        o._loc_adapt_finish.clear()
+        super().tearDown()
+
+    # --- обвязка сцены ---
+
+    def _mk_parent_done(self, plan_lines):
+        pid = self.fb.add(status="done", task_text="крупное ТЗ")
+        self.fb.tasks[pid]["from"] = o.PC_LOCAL_DEC_FROM
+        self.fb.tasks[pid]["result"] = ("🧩 Декомпозиция (локальный дирижёр PC): "
+                                        f"{len(plan_lines)} шагов — исполняю ПО ОДНОМУ.\n"
+                                        + "\n".join(plan_lines) + "\nШаг 1 уже в очереди.")
+        return pid
+
+    def _mk_step(self, pid, i, n, status="done", text="кусок", result="RESULT: ок", k=0):
+        mark = f"[коррекция плана {k}] " if k else ""
+        tid = self.fb.add(status=status, task_text=f"[шаг {i}/{n} родитель {pid}] {mark}{text}")
+        self.fb.tasks[tid]["from"] = o.PC_LOCAL_DEC_FROM
+        self.fb.tasks[tid]["result"] = result
+        return tid
+
+    def _news(self):
+        return [t for t in self.fb.tasks.values() if t["status"] == "new"]
+
+    def _summaries(self, pid):
+        return [t for t in self.fb.tasks.values()
+                if str(t.get("task_text") or "").startswith(f"[сводка родитель {pid}]")]
+
+    def _cards(self, pid):
+        return [t for t in self.fb.tasks.values()
+                if str(t.get("task_text") or "").startswith(f"[карточка родитель {pid}]")]
+
+    # --- маркеры/regex байт-в-байт из порт-спеки (docs/dec_port_spec.md, раздел 2) ---
+
+    def test_markers_byte_identical_to_spec(self):
+        self.assertEqual(o._STEP_RE.pattern, r"^\[шаг (\d+)/(\d+) родитель (\d+)\]")
+        self.assertEqual(o._SUM_RE.pattern, r"^\[сводка родитель (\d+)\]")
+        self.assertEqual(o._HEAL_RE.pattern, r"\[самопочинка шага (\d+), попытка (\d+)\]")
+        self.assertEqual(o._HEAL_TASK_RE.pattern, r"^\s*\[самопочинка задачи (\d+), попытка (\d+)\]")
+        self.assertEqual(o._ADAPT_MARK_RE.pattern, r"\[коррекция плана (\d+)\]")
+        self.assertEqual(o._ADAPT_CARD_RE.pattern, r"^\[коррекция плана родитель (\d+)\]")
+        self.assertEqual(o._CARD_RE.pattern, r"^\[карточка родитель (\d+)\]")
+        self.assertEqual(o._ADAPT_BASE_RE.pattern, r"после шага (\d+)")
+        self.assertEqual(o.ADAPT_REPLACED_MARK, "♻️ заменён коррекцией плана")
+        self.assertEqual(o.ADAPT_FINISH_MARK, "⏭ закрыт досрочно")
+
+    def test_heal_marker_searched_after_step_marker(self):
+        # маркер самопочинки идёт ПОСЛЕ [шаг i/N] → у шага regex search, у одиночки — якорь ^
+        t = "[шаг 2/5 родитель 7] [самопочинка шага 2, попытка 1] исправленный текст"
+        self.assertTrue(o._HEAL_RE.search(t))
+        self.assertFalse(o._HEAL_TASK_RE.match(t))
+
+    # --- релиз шага 1 из планировщика (crash-окно: шаг ДО закрытия родителя) ---
+
+    def test_plan_releases_step1_before_parent_done(self):
+        pid = self.fb.add(task_text="крупное ТЗ")
+        self.fb.tasks[pid]["from"] = o.PC_LOCAL_DEC_FROM
+        with mock.patch.object(o, "_thinker_exec", lambda p, t, tag: "1. шаг A\n2. шаг B"):
+            o.process_new()
+        self.assertEqual(self.fb.tasks[pid]["status"], "done")
+        news = self._news()
+        self.assertEqual(len(news), 1)
+        st1 = news[0]
+        self.assertEqual(st1["task_text"], f"[шаг 1/2 родитель {pid}] шаг A")
+        self.assertEqual(st1["from"], o.PC_LOCAL_DEC_FROM)   # VPS-надзор (Filipp-pc-dec) цепь НЕ видит
+        self.assertEqual(st1["lane"], "pc")
+        self.assertIn("исполняю ПО ОДНОМУ", self.fb.tasks[pid]["result"])
+        self.assertIn("1. шаг A", self.fb.tasks[pid]["result"])   # restart-proof источник плана
+
+    def test_step1_enqueue_fail_parent_stays_in_progress(self):
+        pid = self.fb.add(task_text="крупное ТЗ")
+        self.fb.tasks[pid]["from"] = o.PC_LOCAL_DEC_FROM
+        with mock.patch.object(o, "_thinker_exec", lambda p, t, tag: "1. a\n2. b"), \
+             mock.patch.object(self.fb, "enqueue_task",
+                               lambda *a, **k: {"ok": False, "error": "bridge down"}):
+            o.process_new()
+        # шаг 1 не встал → родитель НЕ закрыт (in_progress; зависание добьёт ПК-ливнесс)
+        self.assertEqual(self.fb.tasks[pid]["status"], "in_progress")
+
+    # --- sequential-релиз: максимум один шаг цепи в очереди ---
+
+    def test_done_step_releases_exactly_next_step(self):
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B", "3. шаг C"])
+        self._mk_step(pid, 1, 3, status="done", text="шаг A")
+        o.process_local_chains()
+        news = self._news()
+        self.assertEqual(len(news), 1)
+        self.assertEqual(news[0]["task_text"], f"[шаг 2/3 родитель {pid}] шаг B")
+        self.assertEqual(news[0]["from"], o.PC_LOCAL_DEC_FROM)
+
+    def test_waiting_step_releases_nothing(self):
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        for st in ("new", "in_progress", "needs_approval", "approved"):
+            self.fb.tasks.clear()
+            pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+            self._mk_step(pid, 1, 2, status=st, text="шаг A")
+            before = len(self.fb.tasks)
+            o.process_local_chains()
+            self.assertEqual(len(self.fb.tasks), before, f"статус {st} породил задачу")
+            self.assertEqual(self._summaries(pid), [], f"статус {st} породил сводку")
+
+    def test_release_keeps_correction_origin_marker(self):
+        self.assertTrue(o._loc_release(5, 2, 3, "текст", k=2))
+        news = self._news()
+        self.assertEqual(news[-1]["task_text"], "[шаг 2/3 родитель 5] [коррекция плана 2] текст")
+        self.assertTrue(o._loc_release(5, 3, 3, "хвост"))
+        self.assertEqual(self._news()[-1]["task_text"], "[шаг 3/3 родитель 5] хвост")
+
+    # --- финал цепи и сводка (synthetic прямым каналом enqueue→claim→done) ---
+
+    def test_final_step_done_posts_summary_synthetic(self):
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="done", result="RESULT: A готов")
+        self._mk_step(pid, 2, 2, status="done", result="RESULT: B готов")
+        o.process_local_chains()
+        sums = self._summaries(pid)
+        self.assertEqual(len(sums), 1)
+        self.assertEqual(sums[0]["status"], "done")   # прямой канал: enqueue→claim→done одним тиком
+        self.assertIn(f"🧩 Сводка декомпозиции (родитель {pid}, локальный дирижёр): 2/2 шагов done",
+                      sums[0]["result"])
+        self.assertIn("✅ шаг 1/2: RESULT: A готов", sums[0]["result"])
+        self.assertIn("✅ шаг 2/2: RESULT: B готов", sums[0]["result"])
+
+    def test_summary_idempotent_across_restart(self):
+        pid = self._mk_parent_done(["1. шаг A"])
+        self._mk_step(pid, 1, 1, status="done")
+        o.process_local_chains()
+        self.assertEqual(len(self._summaries(pid)), 1)
+        o._loc_summarized.clear()                     # эмуляция рестарта демона (кэш пуст)
+        o.process_local_chains()                      # restart-proof: скан очереди видит сводку
+        self.assertEqual(len(self._summaries(pid)), 1)
+        self.assertIn(pid, o._loc_summarized)
+
+    def test_failed_step_halts_chain_with_summary(self):
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="failed", result="сломалось")
+        o.process_local_chains()
+        self.assertEqual(len(self._news()), 0)        # halt: шаг 2 НЕ релизнут
+        sums = self._summaries(pid)
+        self.assertEqual(len(sums), 1)
+        self.assertIn("❌ шаг 1/2: сломалось", sums[0]["result"])
+        self.assertIn("есть упавшие/пропущенные", sums[0]["result"])
+
+    def test_summary_dedups_rebirth_by_id(self):
+        # дубль номера (провал + перерождение самопочинки) → в сводке последняя запись по id
+        pid = self._mk_parent_done(["1. шаг A"])
+        self._mk_step(pid, 1, 1, status="failed", result="упал")
+        self._mk_step(pid, 1, 1, status="done", text="[самопочинка шага 1, попытка 1] фикс",
+                      result="RESULT: со второй попытки")
+        o.process_local_chains()
+        sums = self._summaries(pid)
+        self.assertEqual(len(sums), 1)
+        self.assertIn("1/1 шагов done", sums[0]["result"])
+        self.assertIn("✅ шаг 1/1: RESULT: со второй попытки", sums[0]["result"])
+        self.assertNotIn("❌", sums[0]["result"])
+
+    # --- restart-proof: план ТОЛЬКО из очереди ---
+
+    def test_plan_restored_from_queue_with_adapt_cards(self):
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B", "3. шаг C"])
+        card = self.fb.add(status="done",
+                           task_text=f"[коррекция плана родитель {pid}] после шага 1 (K=1)")
+        self.fb.tasks[card]["from"] = o.PC_LOCAL_DEC_FROM
+        self.fb.tasks[card]["result"] = "🧭 новый остаток:\n2. шаг B2\n3. шаг C2"
+        plan, k_cnt, last_base = o._loc_current_plan(pid)
+        self.assertEqual(plan, {1: ("шаг A", 0), 2: ("шаг B2", 1), 3: ("шаг C2", 1)})
+        self.assertEqual((k_cnt, last_base), (1, 1))
+        # done скорректированного шага 2 → релиз шага 3 с K-происхождением
+        self._mk_step(pid, 2, 3, status="done", text="шаг B2", k=1)
+        o.process_local_chains()
+        news = self._news()
+        self.assertEqual(len(news), 1)
+        self.assertEqual(news[0]["task_text"], f"[шаг 3/3 родитель {pid}] [коррекция плана 1] шаг C2")
+
+    def test_plan_not_restored_warns_and_halts(self):
+        # родителя в done нет (очередь потеряла план) → ⚠️-карточка + сводка, релиза нет
+        self._mk_step(77, 1, 2, status="done")
+        o.process_local_chains()
+        self.assertEqual(len(self._news()), 0)
+        cards = self._cards(77)
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["status"], "done")
+        self.assertIn("⚠️ план родителя 77 не восстановился", cards[0]["result"])
+        self.assertEqual(len(self._summaries(77)), 1)
+
+    def test_orphaned_empty_adapt_card_is_keep(self):
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        card = self.fb.add(status="done",
+                           task_text=f"[коррекция плана родитель {pid}] после шага 1 (K=1)")
+        self.fb.tasks[card]["from"] = o.PC_LOCAL_DEC_FROM
+        self.fb.tasks[card]["result"] = "🧭 без нумерованного остатка"
+        plan, _, last_base = o._loc_current_plan(pid)
+        self.assertEqual(plan, {1: ("шаг A", 0), 2: ("шаг B", 0)})   # fail-safe keep
+        self.assertIsNone(last_base)
+
+    def test_fetch_error_skips_cycle_entirely(self):
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="done")
+        real = self.fb.get_pending
+
+        def flaky(status, lane="pc"):
+            if status == "failed":
+                return {"ok": False, "error": "quota"}
+            return real(status, lane)
+
+        with mock.patch.object(self.fb, "get_pending", flaky):
+            o.process_local_chains()
+        self.assertEqual(len(self._news()), 0)        # частичная картина → цикл пропущен целиком
+
+    # --- изоляция: чужое не трогаем, флаг off = noop ---
+
+    def test_vps_theatre_chains_untouched(self):
+        tid = self.fb.add(status="done", task_text="[шаг 1/2 родитель 50] кусок VPS-театра")
+        self.fb.tasks[tid]["from"] = "Filipp-pc-dec"   # цепь VPS-надзора — НЕ наша
+        single = self.fb.add(status="done", task_text="одиночка")
+        self.fb.tasks[single]["from"] = "Filipp-pc-dev"
+        before = {k: dict(v) for k, v in self.fb.tasks.items()}
+        o.process_local_chains()
+        self.assertEqual(self.fb.tasks, before)        # ни релизов, ни сводок, ни complete
+
+    def test_flag_off_supervision_noop(self):
+        os.environ["PC_LOCAL_DEC"] = "0"
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="done")
+        before = {k: dict(v) for k, v in self.fb.tasks.items()}
+        o.process_local_chains()
+        self.assertEqual(self.fb.tasks, before)
+
+    def test_stop_flag_supervision_noop(self):
+        o._stopped = lambda: True
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="done")
+        before = {k: dict(v) for k, v in self.fb.tasks.items()}
+        o.process_local_chains()
+        self.assertEqual(self.fb.tasks, before)
+
+    # --- шаг цепи не угоняется одиночной самопочинкой ---
+
+    def test_chain_step_failure_not_hijacked_by_single_selfheal(self):
+        o._selfheal_on = lambda: True
+        boom = mock.Mock(side_effect=AssertionError("одиночная самопочинка не должна зваться"))
+        with mock.patch.object(o, "_maybe_task_selfheal", boom):
+            self.assertFalse(o._maybe_selfheal(9, "[шаг 1/2 родитель 5] x", "err",
+                                               frm=o.PC_LOCAL_DEC_FROM))
+        boom.assert_not_called()
+
+    def test_single_task_selfheal_path_intact(self):
+        # регресс: обычная одиночка (не pcloc-dec) идёт в самопочинку как раньше
+        o._selfheal_on = lambda: True
+        with mock.patch.object(o, "_maybe_task_selfheal", lambda *a, **k: True) as _:
+            self.assertTrue(o._maybe_selfheal(9, "обычная задача", "err", frm="Filipp-pc-dev"))
+
+    # --- осиротевшие synthetic не исполняются headless'ом ---
+
+    def test_orphan_synthetic_finalized_not_executed(self):
+        for text, mark in ((f"[сводка родитель 7] сводный отчёт по шагам", "🧩 Сводка"),
+                           (f"[коррекция плана родитель 7] после шага 1 (K=1)", "🧭 карточка"),
+                           (f"[карточка родитель 7] событие локальной цепи", "🃏 карточка")):
+            self.fb.tasks.clear()
+            tid = self.fb.add(task_text=text)
+            self.fb.tasks[tid]["from"] = o.PC_LOCAL_DEC_FROM
+            boom = mock.Mock(side_effect=AssertionError("run_task не должен зваться"))
+            planner = mock.Mock(side_effect=AssertionError("планировщик не должен зваться"))
+            with mock.patch.object(o, "run_task", boom), \
+                 mock.patch.object(o, "_thinker_exec", planner):
+                o.process_new()
+            self.assertEqual(self.fb.tasks[tid]["status"], "done", text)
+            self.assertIn(mark, self.fb.tasks[tid]["result"])
+
+    # --- сквозной happy-path: план → шаги по одному → сводка ---
+
+    def test_end_to_end_two_step_chain(self):
+        pid = self.fb.add(task_text="сделай фичу из двух кусков")
+        self.fb.tasks[pid]["from"] = o.PC_LOCAL_DEC_FROM
+        with mock.patch.object(o, "_thinker_exec", lambda p, t, tag: "1. кусок A\n2. кусок B"):
+            o.process_new()                            # план + релиз шага 1
+        self._claude(0, "сделано\nRESULT: сделано")
+        o.process_new()                                # исполняем шаг 1 (обычный headless-путь)
+        o.process_local_chains()                       # done шага 1 → релиз шага 2
+        news = self._news()
+        self.assertEqual(len(news), 1)
+        self.assertEqual(news[0]["task_text"], f"[шаг 2/2 родитель {pid}] кусок B")
+        o.process_new()                                # исполняем шаг 2
+        o.process_local_chains()                       # финал → сводка
+        sums = self._summaries(pid)
+        self.assertEqual(len(sums), 1)
+        self.assertIn("2/2 шагов done", sums[0]["result"])
+        # инвариант доказан: в очереди никогда не было двух new-шагов цепи разом
+        self.assertEqual(len(self._news()), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

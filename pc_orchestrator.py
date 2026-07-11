@@ -580,9 +580,14 @@ def process_new():
         _cowork(f"задача #{tid} (рычаг {cmd}) → {status} · {_clip(result)}")
         _notify(_human(status, tid, result))
         return
-    # Локальный дирижёр (PC_LOCAL_DEC=1): родитель Filipp-pcloc-dec → строим план, НЕ исполняем
-    # как обычную задачу. Флаг off → False сразу (поведение байт-в-байт прежнее).
-    if _is_local_dec_parent(str(task.get("from") or ""), text):
+    # Локальный дирижёр (PC_LOCAL_DEC=1): осиротевшая synthetic (сводка/карточка — демон упал
+    # между enqueue и complete) → довести done, НЕ исполняя; родитель Filipp-pcloc-dec → строим
+    # план, НЕ исполняем как обычную задачу. Флаг off → False сразу (поведение байт-в-байт
+    # прежнее; from=Filipp-pcloc-dec до порта не существовал — чужого не задеваем).
+    frm = str(task.get("from") or "")
+    if frm == PC_LOCAL_DEC_FROM and _loc_finalize_orphan_synthetic(tid, text):
+        return
+    if _is_local_dec_parent(frm, text):
         _local_dec_plan(tid, text)
         return
     # HEAD до задачи (только для дев-задач): диффом head_before..HEAD увидим новые коммиты задачи,
@@ -714,10 +719,12 @@ def process_stuck_singles(now=None):
 
 
 def poll_once():
-    """Один цикл: добить орфанов-одиночек → довести одобренное → просроченные ожидания → новое → heartbeat."""
+    """Один цикл: добить орфанов-одиночек → довести одобренное → просроченные ожидания →
+    надзор локальных цепей (PC_LOCAL_DEC) → новое → heartbeat."""
     process_stuck_singles()       # этап 2: ПК-side ливнесс одиночек pc, застрявших в in_progress
     process_approved()
     process_approval_timeouts()
+    process_local_chains()        # локальный дирижёр: done-шаг → релиз следующего, финал → сводка
     process_new()
     _write_heartbeat()
 
@@ -1030,6 +1037,11 @@ def _maybe_selfheal(tid, text, fail_text, frm=""):
     """Провал одиночной задачи (исполнительский failed) → думательный слой, РОВНО 1 попытка.
     Возврат True = финализация сделана здесь; False = ничего не делал → прежний путь в вызывающем
     коде (fail-safe). STEP_SELFHEAL=0/нет → False сразу (поведение байт-в-байт прежнее)."""
+    if str(frm or "") == PC_LOCAL_DEC_FROM:
+        # артефакт ЛОКАЛЬНОЙ цепи (шаг [шаг i/N]/родитель/synthetic) — НЕ одиночка: им владеет
+        # надзор цепи (process_local_chains: halt-on-fail сейчас, самопочинка ЦЕПИ — кусок шага 4);
+        # одиночное перерождение сорвало бы маркеры/порядок цепи. False = голый failed → тик цепи.
+        return False
     if not _selfheal_on():
         return False
     return _maybe_task_selfheal(tid, text, fail_text, frm)
@@ -1047,14 +1059,30 @@ def _maybe_selfheal(tid, text, fail_text, frm=""):
 # failed с картой, НЕ кнопка). 🔴-пометка красных шагов — только дисплей в result родителя
 # (строка с 🔴 не матчит _PLAN_LINE_RE → restart-proof парс плана из result цел); текст шагов
 # в очереди НЕ помечается. PC_LOCAL_DEC=0/нет → ветка не зовётся вовсе (поведение байт-в-байт
-# прежнее: такой родитель ушёл бы обычным headless-путём run_task). Релиз шагов/надзор цепи —
-# СЛЕДУЮЩИЕ куски порта (здесь только мозг-планировщик).
+# прежнее: такой родитель ушёл бы обычным headless-путём run_task).
+# РЕЛИЗ ШАГОВ (шаг 3/7 родителя 185) — SEQUENTIAL: в очереди живёт максимум ОДИН шаг цепи,
+# следующий встаёт ТОЛЬКО после done предыдущего (веер дал бы гонку halt-on-fail и порядка
+# перерождений — у process_new нет guard'а последовательности). Шаги/synthetic идут
+# from=Filipp-pcloc-dec: VPS-надзор (process_pc_chains) группирует ТОЛЬКО from==Filipp-pc-dec —
+# к локальным цепям он СЛЕП, дирижёр локальный целиком. Состояние цепи — ТОЛЬКО из очереди
+# (restart-proof: план = нумерованный список в result родителя + карточки коррекций поверх);
+# в памяти процесса лишь дедуп-кэши (_loc_summarized/_loc_adapt_finish). Сводки/карточки =
+# synthetic-задачи lane=pc прямым каналом 86d8b03 (enqueue_pc_task → claim → complete done).
 MAX_STEPS = 8                                     # потолок шагов плана (как на VPS)
 PC_LOCAL_DEC_FROM = "Filipp-pcloc-dec"            # метка родителя локального дирижёра
 PC_DEC_PLAN_TIMEOUT = int(os.getenv("PC_DEC_PLAN_TIMEOUT", "600") or "600")  # план думается дольше починки
 
+# Маркеры цепи — БАЙТ-В-БАЙТ из порт-спеки (docs/dec_port_spec.md manager-bot, раздел 2):
 _STEP_RE = re.compile(r"^\[шаг (\d+)/(\d+) родитель (\d+)\]")        # маркер шага цепи (match с начала)
 _PLAN_LINE_RE = re.compile(r"^\s*(\d{1,2})[.)]\s+(\S.*)")            # строка плана «N. шаг» / «N) шаг»
+_SUM_RE = re.compile(r"^\[сводка родитель (\d+)\]")                  # synthetic-сводка цепи
+_HEAL_RE = re.compile(r"\[самопочинка шага (\d+), попытка (\d+)\]")  # search: маркер идёт ПОСЛЕ [шаг i/N]
+_ADAPT_MARK_RE = re.compile(r"\[коррекция плана (\d+)\]")            # K-происхождение шага (restart-proof счётчик)
+_ADAPT_CARD_RE = re.compile(r"^\[коррекция плана родитель (\d+)\]")  # карточка адаптации (остаток плана в result)
+_CARD_RE = re.compile(r"^\[карточка родитель (\d+)\]")               # событийная карточка цепи (🩹/🛑/🧭/⚠️/🏁)
+_ADAPT_BASE_RE = re.compile(r"после шага (\d+)")                     # база коррекции из task_text карточки
+ADAPT_REPLACED_MARK = "♻️ заменён коррекцией плана"                  # done-карта шага, заменённого адаптацией
+ADAPT_FINISH_MARK = "⏭ закрыт досрочно"                              # done-карта шага, закрытого finish'ем
 # Красность шага (дословно с VPS): красное действие исполнитель шага спросит кнопкой сам —
 # пометка нужна владельцу заранее увидеть, где цепь встанет на «да».
 _HEADLESS_IMPOSSIBLE_RE = re.compile(
@@ -1162,14 +1190,304 @@ def _local_dec_plan(tid, text):
         _notify(_human("failed", tid, msg))
         return
     plan_txt = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
-    result = (f"🧩 Декомпозиция (локальный дирижёр PC): {len(steps)} шагов.\n"
+    # РЕЛИЗ ШАГА 1 — ДО закрытия родителя (crash-окно спеки: шаг не встал → родитель остаётся
+    # in_progress, зависание честно добьёт ПК-ливнесс process_stuck_singles; done-родитель
+    # без шага 1 осиротил бы цепь молча). Только при ok шага 1 родитель закрывается done.
+    if not _loc_release(tid, 1, len(steps), steps[0]):
+        log.warning("pcloc-dec: id=%s шаг 1 не встал в очередь — родитель остаётся in_progress", tid)
+        return
+    result = (f"🧩 Декомпозиция (локальный дирижёр PC): {len(steps)} шагов — исполняю ПО ОДНОМУ "
+              "(lane=pc, sequential-релиз: следующий шаг встаёт только после done предыдущего).\n"
               + plan_txt + "\n" + _dec_red_note(steps)
-              + "[план построен локально (PC_LOCAL_DEC); релиз шагов — следующий кусок порта]"
-              )[:RESULT_MAX]
+              + "Шаг 1 уже в очереди. Красный шаг спросит «да» кнопкой. "
+                "После последнего шага пришлю сводку.")[:RESULT_MAX]
     bc.complete_task(tid, "done", result)
-    log.info("pcloc-dec: id=%s план из %s шагов построен (done)", tid, len(steps))
-    _cowork(f"родитель #{tid} (pcloc-dec) → done: план {len(steps)} шагов · {_clip(result)}")
-    _notify(_human("done", tid, f"декомпозиция: план из {len(steps)} шагов"))
+    log.info("pcloc-dec: id=%s план из %s шагов построен (done), шаг 1 релизнут", tid, len(steps))
+    _cowork(f"родитель #{tid} (pcloc-dec) → done: план {len(steps)} шагов, шаг 1 в очереди · {_clip(result)}")
+    _notify(_human("done", tid, f"декомпозиция: план из {len(steps)} шагов, шаг 1 в очереди"))
+
+
+# ---- sequential-релиз и надзор локальной цепи (шаг 3/7 родителя 185) ----
+# Порт process_pc_chains/_pc_chain_tick VPS-демона (docs/dec_port_spec.md, раздел 3) на локальную
+# почву: тот же снимок очереди, те же маркеры, но исполнитель шагов — ЭТОТ ЖЕ демон (process_new),
+# поэтому детект «ПК молчит» (PC_STEP_TIMEOUT) не нужен: зависший in_progress добьёт ПК-ливнесс
+# process_stuck_singles → failed → halt цепи следующим тиком; new ждёт своего FIFO-клейма;
+# needs_approval ждёт Филиппа (просрочку закроет process_approval_timeouts → failed → halt).
+
+_LOC_STATUSES = ("new", "in_progress", "needs_approval", "approved", "done", "failed")
+_loc_summarized = set()    # родители, по которым сводка уже отправлена (дедуп-кэш памяти процесса;
+                           # после рестарта от дублей защищает скан очереди _loc_summary_exists)
+_loc_adapt_finish = {}     # pid → причина досрочного finish (кэш для 🏁-шапки сводки; наполняет
+                           # адаптация плана — следующий кусок порта, шаг 4)
+
+
+def _loc_enqueue(text):
+    """Задача/synthetic локальной цепи в очередь lane=pc от имени дирижёра — ПРЯМОЙ канал
+    ПК↔Bridge (86d8b03: enqueue_pc_task, минуя splinter/devbot). → dict в форме Bridge-ответа."""
+    ok, nid, err = enqueue_pc_task(text, frm=PC_LOCAL_DEC_FROM)
+    return {"ok": ok, "id": nid, "error": err}
+
+
+def _loc_fetch_items():
+    """Все задачи полосы pc по статусам _LOC_STATUSES → items (у каждого есть status) | None
+    (ошибка чтения ЛЮБОГО статуса → пропустить цикл надзора ЦЕЛИКОМ: частичная картина цепи
+    опаснее ожидания)."""
+    items = []
+    for st in _LOC_STATUSES:
+        r = bc.get_pending(st)
+        if not r.get("ok"):
+            return None
+        for it in r.get("items", []):
+            if isinstance(it, dict):
+                it.setdefault("status", st)
+                items.append(it)
+    return items
+
+
+def _loc_group_chains(items):
+    """items полосы pc → {pid: [(step_i, step_n, item), …]} ТОЛЬКО локальных цепей
+    (from=Filipp-pcloc-dec + паттерн шага). Одиночки pc, цепи VPS-театра (from=Filipp-pc-dec)
+    и synthetic без [шаг i/N] (сводки/карточки/родитель) не попадают."""
+    chains = {}
+    for it in items:
+        if str(it.get("from") or "") != PC_LOCAL_DEC_FROM:
+            continue
+        m = _STEP_RE.match(str(it.get("task_text") or ""))
+        if m:
+            chains.setdefault(int(m.group(3)), []).append(
+                (int(m.group(1)), int(m.group(2)), it))
+    return chains
+
+
+def _loc_chain_steps(pid):
+    """Шаги цепи родителя pid (для осиротевшей сводки). Ошибка чтения → []."""
+    items = _loc_fetch_items()
+    return (_loc_group_chains(items).get(int(pid)) or []) if items is not None else []
+
+
+def _loc_summary_exists(pid):
+    """Сводка по родителю pid уже есть в очереди (в любом живом статусе)? Защита от дубля
+    после рестарта демона (кэш _loc_summarized живёт только в памяти процесса)."""
+    mark = f"[сводка родитель {pid}]"
+    for st in ("done", "new", "in_progress"):
+        try:
+            r = bc.get_pending(st)
+        except Exception:
+            continue
+        if r.get("ok") and any(str(it.get("task_text") or "").startswith(mark)
+                               for it in r.get("items", [])):
+            return True
+    return False
+
+
+def _loc_post_card(pid, text):
+    """Событийная карточка цепи (⚠️ план не восстановился; 🩹/🛑/🧭/🏁 — куски шага 4) —
+    synthetic-задачей прямым каналом (enqueue → claim → complete done): очередь — единственный
+    канал дирижёра наружу, devbot принесёт done-рапортом."""
+    r = _loc_enqueue(f"[карточка родитель {pid}] событие локальной цепи")
+    if not r.get("ok"):
+        log.warning("pcloc-dec: карточка родителя %s не встала в очередь (%s)", pid, r.get("error"))
+        return
+    sid = r.get("id")
+    bc.claim_task(sid)                    # даже если claim не прошёл — complete финализирует
+    bc.complete_task(sid, "done", str(text)[:RESULT_MAX])
+
+
+def _loc_summary_text(pid, steps):
+    """Сводка локальной цепи из переданных шагов (зеркало _pc_summary_text VPS). Дубли номера
+    (провал + перерождение самопочинки) — последняя запись по id; total = n-маркер последнего
+    релизнутого шага (несёт актуальный итог после коррекций плана)."""
+    rows = sorted([s for s in steps if str(s[2].get("status")) in ("done", "failed")],
+                  key=lambda x: (x[0], int(x[2].get("id") or 0)))
+    last = {}
+    for i, n, it in rows:
+        last[i] = (i, n, it)
+    rows = [last[k] for k in sorted(last)]
+    if not rows:
+        return f"🧩 Сводка декомпозиции (родитель {pid}, локальный дирижёр): шагов не найдено (очередь пуста?)"
+    n_done = sum(1 for _i, _n, it in rows if str(it.get("status")) == "done")
+    total = rows[-1][1]
+    head = f"🧩 Сводка декомпозиции (родитель {pid}, локальный дирижёр): {n_done}/{total} шагов done"
+    fin = _loc_adapt_finish.get(pid)
+    if fin:
+        head += f", 🏁 завершено досрочно: {fin}"
+    elif n_done < len(rows):
+        head += ", есть упавшие/пропущенные"
+    lines = [head]
+    for i, n, it in rows:
+        emoji = "✅" if str(it.get("status")) == "done" else "❌"
+        first = (str(it.get("result") or "").strip().splitlines() or ["(пусто)"])[0]
+        lines.append(f"{emoji} шаг {i}/{n}: {first[:400]}")
+    return "\n".join(lines)[:RESULT_MAX]
+
+
+def _loc_post_summary(pid, steps):
+    """Финал цепи → сводка synthetic-задачей прямым каналом (enqueue → claim → complete done).
+    Идемпотентно: _loc_summarized (память) + _loc_summary_exists (скан очереди — restart-proof)."""
+    if pid in _loc_summarized:
+        return
+    if _loc_summary_exists(pid):
+        _loc_summarized.add(pid)
+        return
+    text = _loc_summary_text(pid, steps)
+    r = _loc_enqueue(f"[сводка родитель {pid}] сводный отчёт по шагам")
+    if not r.get("ok"):
+        log.warning("pcloc-dec: сводка родителя %s не встала в очередь (%s)", pid, r.get("error"))
+        return
+    sid = r.get("id")
+    bc.claim_task(sid)
+    cm = bc.complete_task(sid, "done", text)
+    _loc_summarized.add(pid)
+    log.info("pcloc-dec: сводка родителя %s → задача %s (bridge_ok=%s)", pid, sid, cm.get("ok"))
+
+
+def _parse_numbered(text):
+    """Нумерованные строки «N. <текст>» → {N: <текст>} (восстановление плана из result родителя /
+    карточки коррекции). Прочие строки игнорируются."""
+    out = {}
+    for line in (text or "").splitlines():
+        m = _PLAN_LINE_RE.match(line)
+        if m:
+            out[int(m.group(1))] = m.group(2).strip()
+    return out
+
+
+def _loc_current_plan(pid):
+    """ТЕКУЩИЙ план цепи, restart-proof ИЗ ОЧЕРЕДИ (никакой памяти процесса): план родителя
+    (нумерованный список в result, done lane=pc) + карточки «[коррекция плана родитель pid]
+    после шага B…» (нумерованный остаток в result) поверх, в порядке id. → (plan: {номер:
+    (текст, K-происхождение; 0=исходный)}, K всего коррекций, база последней коррекции | None).
+    Ошибка чтения / родитель не найден → ({}, 0, None) — вызывающий даст честный halt-диагноз."""
+    try:
+        r = bc.get_pending("done")
+    except Exception as e:
+        log.warning("pcloc-dec: план родителя %s не прочитан (%s)", pid, e)
+        return {}, 0, None
+    if not r.get("ok"):
+        return {}, 0, None
+    parent_result, cards = "", []
+    for it in r.get("items", []):
+        if int(it.get("id") or 0) == int(pid):
+            parent_result = str(it.get("result") or "")
+        m = _ADAPT_CARD_RE.match(str(it.get("task_text") or ""))
+        if m and int(m.group(1)) == int(pid):
+            cards.append(it)
+    plan = {num: (txt, 0) for num, txt in _parse_numbered(parent_result).items()}
+    last_base = None
+    cards.sort(key=lambda x: int(x.get("id") or 0))
+    for k, card in enumerate(cards, 1):
+        bm = _ADAPT_BASE_RE.search(str(card.get("task_text") or ""))
+        nums = _parse_numbered(str(card.get("result") or ""))
+        if not bm or not nums:
+            continue          # осиротевшая/пустая коррекция — план не меняла (fail-safe keep)
+        base = int(bm.group(1))
+        plan = {num: v for num, v in plan.items() if num <= base}
+        plan.update({num: (txt, k) for num, txt in nums.items()})
+        last_base = base
+    return plan, len(cards), last_base
+
+
+def _loc_release(pid, j, total, text, k=0):
+    """Релиз шага j/total цепи pid (sequential: следующий шаг встаёт ТОЛЬКО после done
+    предыдущего — максимум один шаг цепи в очереди). k>0 → шаг из коррекции плана (маркер
+    для restart-proof счётчика/глаз). Enqueue-fail → warn, повтор следующим тиком (done-шаг
+    остаётся последним в снимке). → ok-флаг."""
+    mark = f"[коррекция плана {k}] " if k else ""
+    r = _loc_enqueue(f"[шаг {j}/{total} родитель {pid}] {mark}{text}"[:RESULT_MAX])
+    if not r.get("ok"):
+        log.warning("pcloc-dec: релиз шага %s/%s родителя %s не встал (%s) — повтор следующим циклом",
+                    j, total, pid, r.get("error"))
+        return False
+    log.info("pcloc-dec: шаг %s/%s родителя %s релизнут (id %s, lane=pc)", j, total, pid, r.get("id"))
+    return True
+
+
+def _loc_after_fail(pid, i, n, it, steps):
+    """Провал шага локальной цепи → halt-on-fail: сводка, дальше НЕ релизим (sequential-модель —
+    пропускать нечего, остальных шагов в очереди нет). Самопочинка шага (думатель, ровно одно
+    перерождение, 🩹/🛑-карты, гейты ⏱/отказа) — следующий кусок порта (шаг 4)."""
+    _loc_post_summary(pid, steps)
+
+
+def _loc_after_done(pid, i, n, it, steps):
+    """Done шага локальной цепи: план restart-proof из очереди → последний по плану → сводка;
+    план не восстановился → ⚠️-карточка + halt; иначе релиз СЛЕДУЮЩЕГО шага (сохраняя
+    K-происхождение). Адаптация плана (keep/adjust/finish думателем) — следующий кусок порта
+    (шаг 4): здесь всегда keep."""
+    plan, _k_cnt, _last_base = _loc_current_plan(pid)
+    total = max(plan) if plan else n
+    if i >= total:
+        _loc_post_summary(pid, steps)
+        return
+    nxt = plan.get(i + 1)
+    if nxt is None:
+        _loc_post_card(pid, f"⚠️ план родителя {pid} не восстановился из очереди (шаг {i + 1} "
+                            f"не найден в result родителя/коррекций) — цепочка остановлена, "
+                            f"поставь «декомпозируй:» заново.")
+        _loc_post_summary(pid, steps)
+        return
+    txt, k_origin = nxt
+    _loc_release(pid, i + 1, total, txt, k=k_origin)
+
+
+def _loc_chain_tick(pid, steps):
+    """Один тик надзора локальной цепи: смотрим ПОСЛЕДНИЙ шаг (максимальный номер, при дублях —
+    старший id: перерождение самопочинки). Ожидание → return (исполнитель — этот же демон:
+    new ждёт FIFO-клейма process_new, in_progress-зомби добьёт process_stuck_singles,
+    needs_approval ждёт Филиппа / process_approval_timeouts); done/failed → хуки цепи."""
+    i, n, it = max(steps, key=lambda s: (s[0], int(s[2].get("id") or 0)))
+    st = str(it.get("status") or "")
+    if st in ("new", "in_progress", "needs_approval", "approved"):
+        return
+    # терминальный статус: закрытая ранее цепь (рестарт демона) → в кэш и не трогать
+    if _loc_summary_exists(pid):
+        _loc_summarized.add(pid)
+        return
+    if st == "failed":
+        _loc_after_fail(pid, i, n, it, steps)
+    elif st == "done":
+        _loc_after_done(pid, i, n, it, steps)
+
+
+def process_local_chains():
+    """Надзор локальных цепей (каждый цикл демона): read-only снимок полосы pc → тик по каждой
+    СВОЕЙ цепи (from=Filipp-pcloc-dec). Чужое на полосе (одиночки, цепи VPS-театра Filipp-pc-dec)
+    не трогаем. Сбой тика одной цепи не валит остальные (доберём следующим циклом).
+    PC_LOCAL_DEC=0/нет → return сразу (поведение демона байт-в-байт прежнее)."""
+    if not _local_dec_on() or _stopped():
+        return
+    items = _loc_fetch_items()
+    if items is None:
+        return
+    chains = _loc_group_chains(items)
+    for pid in sorted(set(chains) - _loc_summarized):
+        try:
+            _loc_chain_tick(pid, chains[pid])
+        except Exception as e:
+            log.warning("pcloc-dec: тик цепи родителя %s упал (%s) — следующим циклом", pid, e)
+
+
+def _loc_finalize_orphan_synthetic(tid, text):
+    """Осиротевшая synthetic-задача локальной цепи (демон упал между enqueue и complete) →
+    довести done, НЕ исполняя headless'ом и НЕ отдавая планировщику как «родителя»
+    (порт одноимённой ветки process_new VPS-демона). True = финализирована здесь."""
+    sm = _SUM_RE.match(text)
+    if sm:
+        pid = int(sm.group(1))
+        bc.complete_task(tid, "done", _loc_summary_text(pid, _loc_chain_steps(pid)))
+        log.info("pcloc-dec: осиротевшая сводка id=%s доведена", tid)
+        return True
+    if _ADAPT_CARD_RE.match(text):
+        bc.complete_task(tid, "done", "🧭 карточка коррекции плана (осиротела при рестарте "
+                                      "демона; шаги коррекции уже в цепочке родителя)")
+        log.info("pcloc-dec: осиротевшая карточка адаптации id=%s доведена", tid)
+        return True
+    if _CARD_RE.match(text):
+        bc.complete_task(tid, "done", "🃏 карточка события цепи (осиротела при рестарте демона; "
+                                      "цепь родителя идёт своим ходом)")
+        log.info("pcloc-dec: осиротевшая карточка id=%s доведена", tid)
+        return True
+    return False
 
 
 # ------------------- авто-обновление userbot/moderbot после дев-задач ----------
