@@ -1088,22 +1088,32 @@ def _sheet_low_season(rows) -> bool:
     return False
 
 
+# Конец низкого сезона — ДОКУМЕНТИРОВАННАЯ граница парка (низкий сезон 16 мая–31 окт), не выдумка
+# per-quote. САМ ФАКТ низкого сезона выводим из живого quote (cap_active/season, см. _sheet_low_season);
+# дату конца берём из этой бизнес-константы (у quote поля конца сезона нет — параллельную дату-логику
+# не вводим, только фиксированную границу окна).
+_LOW_SEASON_END = {"ru": "31 октября", "en": "31 October"}
+
+
 def _sheet_season_note(rows, lang="ru"):
-    """Сезонная пометка, ВЫВЕДЕННАЯ из дат расчёта через живой quote (cap_active/season), а НЕ
-    прибитая гвоздём (никакого хардкода «до 31.10»: у quote нет поля конца сезона — не выдумываем).
-    Низкий сезон → действуют месячные потолки; иначе None (сезон не утверждаем)."""
+    """Сезонная пометка: НАЛИЧИЕ низкого сезона — из живого quote (cap_active/season), конец сезона —
+    документированная граница парка (_LOW_SEASON_END). Высокий сезон → None (сезон не утверждаем)."""
     if not _sheet_low_season(rows):
         return None
     if lang == "en":
-        return "Prices reflect the LOW season for the calculated dates (monthly price caps apply)."
-    return "Цены рассчитаны на НИЗКИЙ сезон по датам расчёта (действуют месячные потолки цен)."
+        return f"Low-season prices, valid until {_LOW_SEASON_END['en']}."
+    return f"Цены низкого сезона, действуют до {_LOW_SEASON_END['ru']}."
 
 
 def render_price_sheet(rows, ds, lang="ru") -> str:
-    """Детерминированный прайс-блок (КОД, не LLM): по строке на модель «1д · 7д · мес» + депозит.
-    Пустые модели (без единой цифры) пропускаем — числа не выдумываем. → текст или '' (нет цифр)."""
+    """Детерминированный прайс-блок (КОД, не LLM): КАРТОЧКА на каждый байк — заголовок модели +
+    строки Сутки/Неделя/Месяц + Депозит (число/паспорт). Между карточками — ПУСТАЯ строка.
+    Числа берём как есть из quote-ячеек (_sheet_total_cell/_sheet_month_cell: кап уже в месячной,
+    «от <cap>»); НЕ пересчитываем. Пустые модели (без единой цифры) пропускаем — не выдумываем.
+    → текст или '' (нет цифр)."""
     en = (lang == "en")
-    lines = []
+    na = "—"
+    blocks = []
     for r in rows:
         cells = r.get("cells") or {}
         d = _sheet_total_cell(cells.get("day"))
@@ -1111,18 +1121,22 @@ def render_price_sheet(rows, ds, lang="ru") -> str:
         mo = _sheet_month_cell(cells.get("month"), lang)
         if not (d or w or mo):
             continue
-        na = "—"
         dep = _sheet_deposit(cells)
+        card = [r["model"]]
         if en:
-            row = f"- {r['model']}: 1 day — {d or na} · 7 days — {w or na} · month — {mo or na}"
+            card.append(f"• Daily: {d or na}")
+            card.append(f"• Week (7 days): {w or na}")
+            card.append(f"• Month: {mo or na}")
             if dep is not None:
-                row += f"; deposit {dep} ฿"
+                card.append(f"• Deposit: {dep} ฿ / passport")
         else:
-            row = f"- {r['model']}: 1 дн — {d or na} · 7 дн — {w or na} · месяц — {mo or na}"
+            card.append(f"• Сутки: {d or na}")
+            card.append(f"• Неделя (7 дней): {w or na}")
+            card.append(f"• Месяц: {mo or na}")
             if dep is not None:
-                row += f"; депозит {dep} ฿"
-        lines.append(row)
-    return "\n".join(lines)
+                card.append(f"• Депозит: {dep} ฿ / паспорт")
+        blocks.append("\n".join(card))
+    return "\n\n".join(blocks)
 
 
 def _wrap_price_sheet(body, ds, lang="ru", default_anchor=False) -> str:
@@ -1179,11 +1193,11 @@ def build_price_sheet_note(hints, lang="ru", getter=None, today=None):
     body = render_price_sheet(rows, ds, lang)
     if not body.strip():
         return _PRICE_SHEET_UNAVAILABLE
-    # Детерминированные строки КОДА (не LLM): мин-срок из констант, сезон из живого quote.
-    block = body + "\n" + _sheet_min_term_line(lang)
+    # Детерминированные строки КОДА (не LLM): сезон из живого quote — В ШАПКУ прайса; мин-срок из
+    # констант — хвостом ПОД карточками моделей. Числа/формат карточек рендерит render_price_sheet.
     season = _sheet_season_note(rows, lang)
-    if season:
-        block += "\n" + season
+    header = (season + "\n\n") if season else ""
+    block = header + body + "\n\n" + _sheet_min_term_line(lang)
     return _wrap_price_sheet(block, ds, lang, default_anchor=default_anchor)
 
 

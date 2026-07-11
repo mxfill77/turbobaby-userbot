@@ -1267,7 +1267,7 @@ class TestPriceSheet(unittest.TestCase):
         note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter(),
                                           today=datetime.date(2026, 7, 11))
         self.assertIn("ПРАЙС ПО ПАРКУ", note)            # сетка по парку
-        self.assertIn("1 дн — 450 ฿", note)              # реальные цифры сразу
+        self.assertIn("• Сутки: 450 ฿", note)              # реальные цифры сразу
         self.assertNotIn("Попроси", note)                # НЕ просим даты
         self.assertNotIn("НЕ называй НИКАКУЮ цену", note)  # НЕ ушли в гейт дат
 
@@ -1287,22 +1287,40 @@ class TestPriceSheet(unittest.TestCase):
             self.assertNotIn(m, models)           # не-в-парке отсутствуют
 
     def test_render_deterministic_numbers(self):
+        # ЭТАП-формат: карточка на байк (заголовок + Сутки/Неделя/Месяц + Депозит), цифры из quote.
         rows = suggest.price_sheet("2026-07-15", getter=self._getter())
         block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
-        self.assertIn("- NMAX 155: 1 дн — 450 ฿ · 7 дн — 2800 ฿ · месяц — от 8500 ฿; депозит 5000 ฿", block)
-        self.assertIn("- ADV 350: 1 дн — 749 ฿ · 7 дн — 4928 ฿ · месяц — от 10900 ฿; депозит 7000 ฿", block)
+        self.assertIn("NMAX 155\n• Сутки: 450 ฿\n• Неделя (7 дней): 2800 ฿\n"
+                      "• Месяц: от 8500 ฿\n• Депозит: 5000 ฿ / паспорт", block)
+        self.assertIn("ADV 350\n• Сутки: 749 ฿\n• Неделя (7 дней): 4928 ฿\n"
+                      "• Месяц: от 10900 ฿\n• Депозит: 7000 ฿ / паспорт", block)
+
+    def test_render_blank_line_between_bike_cards(self):
+        # между карточками моделей — ПУСТАЯ строка; внутри карточки пустых строк нет (карточка цельная).
+        rows = suggest.price_sheet("2026-07-15", getter=self._getter())
+        block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
+        self.assertIn("\n\n", block)                                     # разделитель-пустая строка есть
+        cards = block.split("\n\n")
+        self.assertGreaterEqual(len(cards), 2)                           # ≥2 модели → ≥2 карточки
+        for c in cards:
+            self.assertNotIn("\n\n", c)                                  # карточка цельная (без пустых строк)
+            self.assertTrue(c.splitlines()[0].strip())                   # первая строка карточки — модель
 
     def test_month_cap_applied_only_when_over_cap(self):
         rows = suggest.price_sheet("2026-07-15", getter=self._getter())
         block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
         # XMAX кап НЕ активен → показываем СУММУ месяца (13000), не «от»
-        self.assertIn("- XMAX 300: 1 дн — 700 ฿ · 7 дн — 4200 ฿ · месяц — 13000 ฿", block)
+        self.assertIn("XMAX 300\n• Сутки: 700 ฿\n• Неделя (7 дней): 4200 ฿\n• Месяц: 13000 ฿", block)
+        self.assertNotIn("• Месяц: от 13000 ฿", block)
 
     def test_month_cap_en_prefix(self):
         rows = suggest.price_sheet("2026-07-15", getter=self._getter())
         block = suggest.render_price_sheet(rows, "2026-07-15", "en")
-        self.assertIn("month — from 8500 ฿", block)     # EN: «from», не «от»
-        self.assertNotIn("месяц", block)
+        self.assertIn("• Month: from 8500 ฿", block)    # EN: «from», не «от»
+        self.assertIn("NMAX 155\n• Daily: 450 ฿\n• Week (7 days): 2800 ฿\n"
+                      "• Month: from 8500 ฿\n• Deposit: 5000 ฿ / passport", block)
+        self.assertNotIn("месяц", block)                # RU-строк нет
+        self.assertNotIn("Сутки", block)
 
     # ---- ЭТАП 2: анти-луп в note ----
     def test_note_has_numbers_no_promise_no_reask(self):
@@ -1319,7 +1337,7 @@ class TestPriceSheet(unittest.TestCase):
             {"price_sheet_q": True, "has_dates": False}, lang="ru",
             getter=self._getter(), today=datetime.date(2026, 7, 11))
         self.assertIn("ПРАЙС ПО ПАРКУ", note)
-        self.assertIn("1 дн — 450 ฿", note)              # реальные цифры сразу, без гейта дат
+        self.assertIn("• Сутки: 450 ฿", note)              # реальные цифры сразу, без гейта дат
         self.assertNotIn("Попроси", note)                # НЕ просим даты у клиента
         self.assertIn("старт завтра", note)              # дефолтный якорь = ближайшая дата
         self.assertIn("12.07.2026", note)                # завтра от 11.07 (инъекция today)
@@ -1331,7 +1349,7 @@ class TestPriceSheet(unittest.TestCase):
             "[клиент]: нужны цены на все модели на 15.07-15.08", today=datetime.date(2026, 7, 11))
         note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter())
         self.assertIn("Дата отсчёта: 15.07.2026", note)  # якорь из истории
-        self.assertIn("1 дн — 450 ฿", note)
+        self.assertIn("• Сутки: 450 ฿", note)
         self.assertNotIn("старт завтра", note)           # не дефолтный якорь
 
     def test_min_term_line_ru_and_en(self):
@@ -1349,12 +1367,26 @@ class TestPriceSheet(unittest.TestCase):
         self.assertIn(f"мотоциклы от {suggest.MOTO_MIN_DAYS}", line)
 
     def test_season_note_low_from_quote(self):
-        # кап активен в моке → сезонная пометка «низкий сезон» выведена из живого quote (не хардкод).
+        # кап активен в моке → пометка низкого сезона выведена из живого quote (наличие сезона — не
+        # хардкод); конец сезона — документированная граница парка «до 31 октября».
         note = suggest.build_pricing_note(
             {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True},
             lang="ru", getter=self._getter())
-        self.assertIn("НИЗКИЙ сезон", note)
-        self.assertNotIn("31.10", note)                  # конкретную дату конца сезона НЕ выдумываем
+        self.assertIn("Цены низкого сезона, действуют до 31 октября", note)
+
+    def test_season_note_en(self):
+        # EN-аналог сезонной пометки низкого сезона.
+        note = suggest.build_pricing_note(
+            {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True},
+            lang="en", getter=self._getter())
+        self.assertIn("Low-season prices, valid until 31 October", note)
+
+    def test_season_note_in_header_above_cards(self):
+        # сезонная строка — В ШАПКЕ прайса (выше карточек моделей), а не в хвосте.
+        note = suggest.build_pricing_note(
+            {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True},
+            lang="ru", getter=self._getter())
+        self.assertLess(note.index("низкого сезона"), note.index("NMAX 155"))
 
     def test_season_note_absent_when_no_cap(self):
         # ни у одной модели кап не активен → сезонную пометку НЕ утверждаем.
@@ -1377,14 +1409,15 @@ class TestPriceSheet(unittest.TestCase):
             {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True},
             lang="ru", getter=getter)
         self.assertIn("ПРАЙС ПО ПАРКУ", note)            # сетка всё равно есть
-        self.assertNotIn("НИЗКИЙ сезон", note)           # но сезон не утверждаем
+        self.assertNotIn("низкого сезона", note)         # но сезон не утверждаем
+        self.assertNotIn("31 октября", note)             # и конец сезона не называем
 
     def test_month_cap_reflected_in_note(self):
         # кап низкого сезона отражён в месячной колонке промпт-блока («от <cap>»).
         note = suggest.build_pricing_note(
             {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True},
             lang="ru", getter=self._getter())
-        self.assertIn("месяц — от 8500 ฿", note)         # NMAX капнут
+        self.assertIn("• Месяц: от 8500 ฿", note)        # NMAX капнут (кап в месячной ячейке карточки)
 
     def test_numbers_come_only_from_quote(self):
         # инвариант: числа в блоке = суммы из quote (код подставляет, LLM не трогает).
@@ -1419,7 +1452,7 @@ class TestPriceSheet(unittest.TestCase):
         hints = {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True}
         note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter())
         sysp = suggest.make_system_prompt("FAQ", "ru", pricing_note=note)
-        self.assertIn("1 дн — 450 ฿", sysp)             # цифры доехали до промпта дословно
+        self.assertIn("• Сутки: 450 ฿", sysp)           # цифры-карточка доехали до промпта дословно
         self.assertIn("БЕЗ ПЕРЕСПРОСОВ", sysp)
 
 
