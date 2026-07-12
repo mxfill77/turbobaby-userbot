@@ -1359,14 +1359,15 @@ class TestPriceSheet(unittest.TestCase):
         self.assertNotIn("месяц", block)                # RU-строк нет
         self.assertNotIn("Сутки", block)
 
-    # ---- ЭТАП 2: анти-луп в note ----
+    # ---- ЭТАП 2: анти-луп в note (новый класс: блок в скобках, инструкция — метка) ----
     def test_note_has_numbers_no_promise_no_reask(self):
         hints = {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True}
         note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter())
         self.assertIn("ПРАЙС ПО ПАРКУ", note)
-        self.assertIn("450 ฿", note)                    # реальные цифры в блоке
-        self.assertIn("НЕ обещай прислать прайс позже", note)
-        self.assertIn("ДОСЛОВНО", note)                 # инвариант: цифры не переформатировать
+        self.assertIn("450 ฿", note)                    # реальные цифры в блоке (внутри скобок)
+        self.assertIn("[PRICE_SHEET]", note)            # инструкция про метку для LLM
+        self.assertIn("ДОСЛОВНО", note)                 # инвариант: вставит КОД дословно
+        self.assertIsNotNone(suggest._sheet_block_from_note(note))   # блок извлекаем для сборки
 
     def test_note_no_dates_yields_sheet_no_date_question(self):
         # прайс-интент БЕЗ дат → сетка СРАЗУ (день/7/месяц), НИ ОДНОГО вопроса про даты.
@@ -1485,12 +1486,19 @@ class TestPriceSheet(unittest.TestCase):
         self.assertIn("ЦЕНОВАЯ ПОЛИТИКА", sysp)
         self.assertIn("CLICK 125", sysp)
 
-    def test_sheet_block_threads_into_prompt_verbatim(self):
+    def test_sheet_block_hidden_from_prompt_marker_instead(self):
+        # НОВЫЙ класс (вёрстка 21:36 #276): сетку вставляет КОД — из промпта LLM блок ВЫРЕЗАН
+        # (переписать нечего по построению), вместо него метка-инструкция [PRICE_SHEET].
         hints = {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True}
         note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter())
         sysp = suggest.make_system_prompt("FAQ", "ru", pricing_note=note)
-        self.assertIn("• Сутки: 450 ฿", sysp)           # цифры-карточка доехали до промпта дословно
+        self.assertNotIn("• Сутки: 450 ฿", sysp)        # цифры сетки LLM НЕ видит
+        self.assertNotIn("<<<SHEET>>>", sysp)           # служебные скобки в промпт не текут
+        self.assertIn("[PRICE_SHEET]", sysp)            # метка-инструкция на месте
         self.assertIn("БЕЗ ПЕРЕСПРОСОВ", sysp)
+        # а извлечённый блок для сборки — дословный, с цифрами
+        block = suggest._sheet_block_from_note(note)
+        self.assertIn("• Сутки: 450 ฿", block)
 
 
 class TestPriceSheetMinAcrossVariants(unittest.TestCase):
@@ -1720,6 +1728,113 @@ class TestSheetAwarePricePolicy(unittest.TestCase):
             self.assertIn("Дат нет — сперва спроси даты", p)
             self.assertNotIn("ГОТОВЫЙ блок «ПРАЙС ПО ПАРКУ", p)
             self.assertIn("Этап 1 — ЦЕНА: назови цену по датам из Календаря", p)
+
+
+class TestSheetUntouchableBlock(unittest.TestCase):
+    """Класс-голден вёрстки 21:36 (#276): сетка = НЕПРИКОСНОВЕННЫЙ блок. LLM цифры не видит и не
+    переписывает; финал собирает КОД: intro + render_price_sheet ДОСЛОВНО + outro. Вёрстка —
+    плоский текст: группы «Скутеры:»/«Мотоциклы:», карточка-на-байк, пустые строки, БЕЗ markdown."""
+
+    ROWS = [
+        {"model": "NMAX 155", "class": ("scooter", 5, "этот байк"), "bike": "NMAX 155CC X",
+         "cells": {"day": {"total": 450}, "week": {"total": 2800},
+                   "month": {"total": 9000, "cap_active": True, "cap_price": 8500}},
+         "deposit": 3000},
+        {"model": "XMAX 300", "class": ("scooter", 5, "этот байк"), "bike": "XMAX 300CC X",
+         "cells": {"day": {"total": 790}, "week": {"total": 4700},
+                   "month": {"total": 23700, "cap_active": True, "cap_price": 8900}},
+         "deposit": 5000},
+        {"model": "CB 300R", "class": ("moto", 3, "мотоциклы"), "bike": "CB 300CC R",
+         "cells": {"day": {"total": 757}, "week": {"total": 4716},
+                   "month": {"total": 12491, "cap_active": True, "cap_price": 9900}},
+         "deposit": 15000},
+    ]
+
+    def test_render_groups_flat_no_markdown(self):
+        # ГОЛДЕН вёрстки: группы, карточки, пустые строки, ноль markdown-символов.
+        block = suggest.render_price_sheet(self.ROWS, "2026-07-15", "ru")
+        self.assertNotIn("**", block)                          # сырой markdown = живой провал #276
+        self.assertNotIn("__", block)
+        self.assertIn("Скутеры:\n\nNMAX 155\n• Сутки: 450 ฿", block)
+        self.assertIn("Мотоциклы:\n\nCB 300R\n• Сутки: 757 ฿", block)
+        self.assertLess(block.index("Скутеры:"), block.index("Мотоциклы:"))   # порядок групп
+        # карточка-на-байк + пустая строка между карточками внутри группы
+        self.assertIn("• Депозит: 3000 ฿ / паспорт\n\nXMAX 300\n• Сутки: 790 ฿", block)
+        self.assertIn("• Месяц: от 8900 ฿", block)             # цифры целы (регресс минимума)
+
+    def test_render_groups_en(self):
+        block = suggest.render_price_sheet(self.ROWS, "2026-07-15", "en")
+        self.assertIn("Scooters:\n\nNMAX 155\n• Daily: 450 ฿", block)
+        self.assertIn("Motorcycles:\n\nCB 300R", block)
+        self.assertNotIn("**", block)
+
+    def test_compose_marker_variants(self):
+        # Сборка кодом: метка отдельной строкой / в скобках с точкой / инлайн — intro+блок+outro.
+        block = "Скутеры:\n\nXMAX 300\n• Сутки: 790 ฿"
+        for marker in ("[PRICE_SHEET]", "PRICE_SHEET", "[price sheet].", "«[PRICE_SHEET]»"):
+            out = suggest.compose_sheet_draft(f"Здравствуйте!\n{marker}\nПодскажите модель.",
+                                              block, "ru")
+            self.assertEqual(out, "Здравствуйте!\n\n" + block + "\n\nПодскажите модель.", marker)
+
+    def test_compose_inline_marker(self):
+        block = "XMAX 300\n• Сутки: 790 ฿"
+        out = suggest.compose_sheet_draft("Вот прайс: [PRICE_SHEET] Жду вопросов.", block, "ru")
+        self.assertEqual(out, "Вот прайс:\n\n" + block + "\n\nЖду вопросов.")
+
+    def test_compose_no_marker_fallback_deterministic(self):
+        # LLM не выдал метку (или переписал прайс своим текстом) → его текст ОТБРАСЫВАЕМ,
+        # каркас детерминированный, блок дословно. Сетка доходит ВСЕГДА.
+        block = "XMAX 300\n• Сутки: 790 ฿\n• Месяц: от 8900 ฿"
+        bad_llm = "XMAX 300 — 790 ฿/сутки, **дешево**"        # однострочник + markdown, без метки
+        out = suggest.compose_sheet_draft(bad_llm, block, "ru")
+        self.assertIn(block, out)                              # блок дословно
+        self.assertNotIn("**", out)                            # LLM-переписывание не протекло
+        self.assertIn("Актуальный прайс", out)
+        out_en = suggest.compose_sheet_draft(bad_llm, block, "en")
+        self.assertIn("Here is our current price list:", out_en)
+
+    def test_generate_draft_assembles_by_code(self):
+        # Уровень generate_draft: fake-LLM ставит метку → финал собран КОДОМ, блок дословный.
+        hints = {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True}
+        rows = self.ROWS
+        with mock.patch.object(suggest, "price_sheet", return_value=rows):
+            note = suggest.build_pricing_note(hints, lang="ru", getter=lambda p: {"ok": False})
+        block = suggest._sheet_block_from_note(note)
+        self.assertIsNotNone(block)
+        fake = lambda system, user: "Здравствуйте! Вот наш прайс:\n[PRICE_SHEET]\nКакая модель интересна?"
+        draft = suggest.generate_draft("[клиент]: цены?", "ru", "FAQ",
+                                       pricing_note=note, call_llm=fake)
+        self.assertIn(block, draft)                            # рендер ДОСЛОВНО в черновике
+        self.assertTrue(draft.startswith("Здравствуйте! Вот наш прайс:"))
+        self.assertTrue(draft.endswith("Какая модель интересна?"))
+        self.assertNotIn("[PRICE_SHEET]", draft)               # метка заменена
+        self.assertNotIn("**", draft)
+
+    def test_generate_draft_llm_rewrite_cannot_leak(self):
+        # LLM вопреки всему переписал прайс однострочниками с ** и без метки → его текст отброшен,
+        # финал = детерминированный каркас + блок дословно. Модель прайс не переписывает НИКОГДА.
+        hints = {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True}
+        with mock.patch.object(suggest, "price_sheet", return_value=self.ROWS):
+            note = suggest.build_pricing_note(hints, lang="ru", getter=lambda p: {"ok": False})
+        block = suggest._sheet_block_from_note(note)
+        fake = lambda system, user: "**Скутеры**\n- XMAX 300 — 790 ฿/сутки, от 8900 ฿/месяц"
+        draft = suggest.generate_draft("[клиент]: цены?", "ru", "FAQ",
+                                       pricing_note=note, call_llm=fake)
+        self.assertIn(block, draft)
+        self.assertNotIn("**", draft)
+        self.assertNotIn("790 ฿/сутки", draft)                 # однострочник LLM не протёк
+
+    def test_regenerate_draft_same_class(self):
+        # Перегенерация (СТРАТЕГИЯ-директива) — тот же класс сборки кодом.
+        hints = {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True}
+        with mock.patch.object(suggest, "price_sheet", return_value=self.ROWS):
+            note = suggest.build_pricing_note(hints, lang="ru", getter=lambda p: {"ok": False})
+        block = suggest._sheet_block_from_note(note)
+        fake = lambda system, user: "Добрый день!\n[PRICE_SHEET]\nНа связи."
+        draft = suggest.regenerate_draft("[клиент]: цены?", "ru", "FAQ", False,
+                                         note, "мягче тон", call_llm=fake)
+        self.assertIn(block, draft)
+        self.assertNotIn("[PRICE_SHEET]", draft)
 
 
 if __name__ == "__main__":

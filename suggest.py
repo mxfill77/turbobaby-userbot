@@ -1208,14 +1208,16 @@ def _sheet_season_note(rows, lang="ru"):
 
 
 def render_price_sheet(rows, ds, lang="ru") -> str:
-    """Детерминированный прайс-блок (КОД, не LLM): КАРТОЧКА на каждый байк — заголовок модели +
-    строки Сутки/Неделя/Месяц + Депозит (число/паспорт). Между карточками — ПУСТАЯ строка.
-    Числа берём как есть из quote-ячеек (_sheet_total_cell/_sheet_month_cell: кап уже в месячной,
+    """Детерминированный прайс-блок (КОД, не LLM): группы «Скутеры:»/«Мотоциклы:» (по bike_class,
+    kind неизвестен → хвост без заголовка), внутри — КАРТОЧКА на каждый байк (формат aae1ed2):
+    заголовок модели + строки Сутки/Неделя/Месяц + Депозит (число/паспорт), между карточками
+    ПУСТАЯ строка. ПЛОСКИЙ ТЕКСТ БЕЗ markdown-символов (** в Telegram не рендерится — живой
+    провал вёрстки 21:36, черновик #276). Числа берём как есть из quote-ячеек (кап уже в месячной,
     «от <cap>»); НЕ пересчитываем. Пустые модели (без единой цифры) пропускаем — не выдумываем.
     → текст или '' (нет цифр)."""
     en = (lang == "en")
     na = "—"
-    blocks = []
+    groups = {"scooter": [], "moto": [], None: []}
     for r in rows:
         cells = r.get("cells") or {}
         d = _sheet_total_cell(cells.get("day"))
@@ -1241,36 +1243,94 @@ def render_price_sheet(rows, ds, lang="ru") -> str:
             card.append(f"• Месяц: {mo or na}")
             if dep is not None:
                 card.append(f"• Депозит: {dep} ฿ / паспорт")
-        blocks.append("\n".join(card))
-    return "\n\n".join(blocks)
+        cls = r.get("class")
+        kind = cls[0] if cls else None          # bike_class → (kind, min_days, label); XSR155 —
+        if kind not in ("scooter", "moto"):     # kind='scooter' (мин-срок 5д) → группа «Скутеры»
+            kind = None                         # неизвестный класс → хвост без заголовка
+        groups[kind].append("\n".join(card))
+    parts = []
+    if groups["scooter"]:
+        parts.append(("Scooters:" if en else "Скутеры:") + "\n\n" + "\n\n".join(groups["scooter"]))
+    if groups["moto"]:
+        parts.append(("Motorcycles:" if en else "Мотоциклы:") + "\n\n" + "\n\n".join(groups["moto"]))
+    if groups[None]:
+        parts.append("\n\n".join(groups[None]))
+    return "\n\n".join(parts)
+
+
+# Сетка = НЕПРИКОСНОВЕННЫЙ блок (класс-фикс вёрстки 21:36, черновик #276: LLM пересобирал
+# карточки в однострочники и вставлял сырые ** — markdown в Telegram не рендерится). Блок везём
+# ВНУТРИ pricing_note между служебными скобками (транспорт: сигнатуры целы, IPC-перегенерация
+# несёт блок автоматически), НО в промпт LLM он НЕ попадает (make_system_prompt вырезает) —
+# переписать прайс модели НЕЧЕГО по построению. LLM ставит метку [PRICE_SHEET], финал собирает
+# КОД: intro + вывод render_price_sheet ДОСЛОВНО + outro (compose_sheet_draft).
+_SHEET_OPEN, _SHEET_CLOSE = "<<<SHEET>>>", "<<<END_SHEET>>>"
+_SHEET_BLOCK_RE = re.compile(re.escape(_SHEET_OPEN) + r"\n(.*?)\n" + re.escape(_SHEET_CLOSE), re.S)
+_SHEET_MARKER = "[PRICE_SHEET]"
+# Метка в ответе LLM: отдельной строкой (\W покрывает скобки/кавычки/пунктуацию вокруг)
+# ИЛИ инлайн «[PRICE_SHEET]» — режем по первому попаданию.
+_SHEET_MARKER_LINE_RE = re.compile(r"^\W*PRICE[_ ]?SHEET\W*$", re.I | re.M)
+_SHEET_MARKER_INLINE_RE = re.compile(r"\[?PRICE[_ ]?SHEET\]?", re.I)
+
+
+def _sheet_block_from_note(pricing_note):
+    """Чистый прайс-блок из служебных скобок pricing_note → текст | None (не sheet-режим /
+    старый формат note без скобок — прежний путь)."""
+    m = _SHEET_BLOCK_RE.search(pricing_note or "")
+    return m.group(1) if m else None
+
+
+def compose_sheet_draft(llm_text, block, lang="ru"):
+    """Детерминированная сборка финального черновика: intro (LLM) + блок ДОСЛОВНО + outro (LLM).
+    Метку [PRICE_SHEET] ищем строкой, затем инлайн; НЕТ метки → LLM-текст ОТБРАСЫВАЕМ целиком
+    (он мог переписать прайс) и ставим детерминированные intro/outro (fail-safe: сетка дословно
+    доходит ВСЕГДА). Пустые intro/outro просто пропускаются."""
+    en = (lang == "en")
+    t = (llm_text or "").strip()
+    m = _SHEET_MARKER_LINE_RE.search(t) or _SHEET_MARKER_INLINE_RE.search(t)
+    if m:
+        intro, outro = t[:m.start()].strip(), t[m.end():].strip()
+    else:
+        log.warning("SHEET: LLM не выдал метку [PRICE_SHEET] — интро/концовка детерминированные")
+        intro = "Here is our current price list:" if en else "Актуальный прайс по нашему парку:"
+        outro = ("Tell me which model you like and your dates — I will check availability."
+                 if en else
+                 "Подскажите, какая модель вас заинтересовала и на какие даты — проверю наличие.")
+    parts = [p for p in (intro, block, outro) if p]
+    return "\n\n".join(parts)
 
 
 def _wrap_price_sheet(body, ds, lang="ru", default_anchor=False) -> str:
-    """Обёртка-инструкция вокруг детерминированного прайс-блока: цифры И строки мин-срока/сезона
-    ДОСЛОВНО, без обещаний «пришлю позже». LLM пишет только вежливое обрамление. default_anchor —
-    дат клиент НЕ назвал: якорь = ближайшая дата (завтра); даты НЕ переспрашиваем (сетка готова)."""
+    """Обёртка pricing_note: инструкция LLM (вступление + метка [PRICE_SHEET] + концовка, БЕЗ цен —
+    сетку вставит КОД дословно) + сам блок в служебных скобках (для compose_sheet_draft; в промпт
+    не попадает). default_anchor — дат клиент НЕ назвал: якорь = ближайшая дата (завтра); даты НЕ
+    переспрашиваем (сетка готова)."""
     human = _iso_to_human(ds)
     if lang == "en":
         anchor = (f"Dates not specified — the price is calculated from the nearest date ({human}, "
                   "starting tomorrow); if the client names exact dates you will recalculate. Do NOT "
-                  "ask for dates — the price list is already here."
+                  "ask for dates — the price list is already prepared."
                   if default_anchor else f"Reference start date: {human}.")
-        return (
-            "PARK PRICE LIST from the Calendar — reproduce the numbers AND the minimum-rental / season "
-            "lines VERBATIM (do NOT recalculate, round, add or drop models). Rental price: 1 day / "
-            "7 days / month (฿); deposit shown per model. " + anchor + " Availability for the exact "
-            "dates is confirmed per model — offer to check whichever the client wants. Present as a "
-            "clean list in ONE message; do NOT promise to send the price list later — it is right here:\n"
-            + body)
-    anchor = (f"Даты аренды клиент не назвал — прайс посчитан от ближайшей даты ({human}, старт "
-              "завтра); назовёт точные даты — пересчитаешь. НЕ переспрашивай даты: сетка уже готова."
-              if default_anchor else f"Дата отсчёта: {human}.")
-    return (
-        "ПРАЙС ПО ПАРКУ из Календаря — приведи цифры И строки мин-срока/сезона ДОСЛОВНО (НЕ "
-        "пересчитывай, НЕ округляй, НЕ добавляй и НЕ убирай модели). Цена аренды: 1 день / 7 дней / "
-        "месяц (฿); депозит — по каждой модели. " + anchor + " Наличие на точные даты подтверждаем "
-        "по каждой модели — предложи проверить те, что интересны. Подай аккуратным списком в ОДНОМ "
-        "сообщении; НЕ обещай прислать прайс позже — он уже здесь:\n" + body)
+        instr = (
+            "PARK PRICE LIST from the Calendar is READY — the CODE will insert it VERBATIM in place "
+            "of your [PRICE_SHEET] marker; you must NOT rewrite, reformat or repeat it. Build your "
+            "reply as: (1) a short intro (1–2 sentences, NO prices, NO model lists); (2) the marker "
+            "[PRICE_SHEET] on its OWN line; (3) a short outro (one sentence: offer to check "
+            "availability for the client's dates/model). Do not write any price or deposit numbers "
+            "anywhere — they are already in the list. " + anchor)
+    else:
+        anchor = (f"Даты аренды клиент не назвал — прайс посчитан от ближайшей даты ({human}, старт "
+                  "завтра); назовёт точные даты — пересчитаешь. НЕ переспрашивай даты: сетка уже готова."
+                  if default_anchor else f"Дата отсчёта: {human}.")
+        instr = (
+            "ПРАЙС ПО ПАРКУ из Календаря ГОТОВ — его вставит КОД ДОСЛОВНО на место твоей метки "
+            "[PRICE_SHEET]; переписывать, переформатировать или повторять прайс НЕЛЬЗЯ. Построй "
+            "ответ так: (1) короткое вступление (1–2 предложения, БЕЗ цен и БЕЗ перечисления "
+            "моделей); (2) ОТДЕЛЬНОЙ строкой ровно метка [PRICE_SHEET] — на её месте появится "
+            "прайс; (3) короткая концовка (одно предложение: предложи проверить наличие по "
+            "модели/датам клиента). Числа цен и депозитов сам НЕ пиши нигде — они уже в прайсе. "
+            + anchor)
+    return instr + "\n" + _SHEET_OPEN + "\n" + body + "\n" + _SHEET_CLOSE
 
 
 # Прайс запрошен, даты есть, но живой источник не отдал ни одной цифры → честный фолбэк БЕЗ чисел
@@ -1398,9 +1458,26 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
     # Класс-фикс У ИСТОЧНИКА конфликта: когда pricing_note — прайс по парку, сама политика говорит
     # «это И ЕСТЬ цена из Календаря — выдай дословно, даты не переспрашивай». Обычный путь (ЦЕНА
     # по датам / нет цены) — прежний текст байт-в-байт.
-    sheet_mode = bool(pricing_note) and ("ПРАЙС ПО ПАРКУ" in pricing_note
+    # Маркерный sheet-режим (блок в служебных скобках): сетку вставляет КОД, LLM цифры не видит и
+    # не пишет — класс «модель прайс не переписывает никогда» гарантирован по построению (живой
+    # провал вёрстки 21:36 #276: однострочники + сырые **). Legacy sheet (старая note без скобок,
+    # напр. из IPC при перегенерации) — прежняя политика «приведи дословно».
+    sheet_block = _sheet_block_from_note(pricing_note)
+    sheet_mode = bool(pricing_note) and (sheet_block is not None
+                                         or "ПРАЙС ПО ПАРКУ" in pricing_note
                                          or "PARK PRICE LIST" in pricing_note)
-    if sheet_mode:
+    if sheet_block is not None:
+        policy = (
+            "\n\nЦЕНОВАЯ ПОЛИТИКА (СТРОГО): прайс по всему парку УЖЕ посчитан из Календаря и "
+            "будет вставлен КОДОМ ДОСЛОВНО на место метки [PRICE_SHEET] — сам НИКАКИЕ цифры цен "
+            "и депозитов НЕ пиши (ни из FAQ, ни ориентиры, ни диапазоны). Твой ответ: короткое "
+            "вступление БЕЗ цен и БЕЗ перечисления моделей → ОТДЕЛЬНОЙ строкой ровно [PRICE_SHEET] "
+            "→ короткая концовка (предложи проверить наличие). Даты НЕ переспрашивай и НЕ жди их: "
+            "сетка посчитана от ближайшей даты, точные даты лишь уточнят расчёт потом. Вопрос об "
+            "опыте НЕ заменяет выдачу прайса. Про уменьшение депозита при нескольких байках сам "
+            "НЕ предлагай и НЕ обещай; на прямой вопрос клиента ответь ровно «уточню у менеджера»."
+        )
+    elif sheet_mode:
         policy = (
             "\n\nЦЕНОВАЯ ПОЛИТИКА (СТРОГО): ниже передан ГОТОВЫЙ блок «ПРАЙС ПО ПАРКУ из "
             "Календаря» — это И ЕСТЬ цена из Календаря, уже посчитанная по всему парку. Приведи "
@@ -1421,12 +1498,14 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
             "не для клиента. Про уменьшение депозита при нескольких байках сам НЕ предлагай и НЕ "
             "обещай; на прямой вопрос клиента ответь ровно «уточню у менеджера»."
         )
-    stage1 = (
-        "Этап 1 — ЦЕНА: приведи прайс-сетку из блока «ПРАЙС ПО ПАРКУ» ДОСЛОВНО — это и есть "
-        "цена; даты для этого НЕ нужны. "
-        if sheet_mode else
-        "Этап 1 — ЦЕНА: назови цену по датам из Календаря (если она в блоке ЦЕНА выше). "
-    )
+    if sheet_block is not None:
+        stage1 = ("Этап 1 — ЦЕНА: выведи ОТДЕЛЬНОЙ строкой метку [PRICE_SHEET] — прайс на её "
+                  "место вставит код; даты для этого НЕ нужны. ")
+    elif sheet_mode:
+        stage1 = ("Этап 1 — ЦЕНА: приведи прайс-сетку из блока «ПРАЙС ПО ПАРКУ» ДОСЛОВНО — это "
+                  "и есть цена; даты для этого НЕ нужны. ")
+    else:
+        stage1 = "Этап 1 — ЦЕНА: назови цену по датам из Календаря (если она в блоке ЦЕНА выше). "
     scenario = (
         "\n\n[ВНУТРЕННИЙ КОНТЕКСТ — только для тебя, клиенту НЕ показывать; номера этапов и "
         "слова «этап»/«стадия» в самом ответе НЕ упоминать]\n"
@@ -1441,7 +1520,14 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         "Это разметка ТВОЕЙ логики: определи текущий этап про себя и действуй по нему — но в "
         "тексте клиенту про этапы/стадии/«менеджер не назвал цену» не пиши, отвечай сразу по сути."
     )
-    price_block = ("\n\n" + pricing_note) if pricing_note else ""
+    # Маркерный sheet-режим: сам блок из промпта ВЫРЕЗАЕМ (LLM цифры не видит → переписать
+    # нечего); остаётся инструкция + пометка, что сетку вставит код на место [PRICE_SHEET].
+    pn_prompt = pricing_note
+    if sheet_block is not None:
+        pn_prompt = _SHEET_BLOCK_RE.sub(
+            "(прайс-сетка уже посчитана — КОД вставит её ДОСЛОВНО на место метки [PRICE_SHEET])",
+            pricing_note)
+    price_block = ("\n\n" + pn_prompt) if pn_prompt else ""
     # СТРАТЕГИЯ-директива менеджера: высший приоритет по СОДЕРЖАНИЮ/логике/тону ответа, НО
     # ценовую политику и критичные факты НЕ отменяет (они ниже — незыблемы).
     directive_block = ""
@@ -1728,7 +1814,12 @@ def generate_draft(transcript: str, lang: str, faq: str,
     call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
                                 park_models=park_models, playbook=playbook)
-    return _strip_service_prefix(call_llm(system, transcript))
+    out = _strip_service_prefix(call_llm(system, transcript))
+    # Сетка = неприкосновенный блок: финал собирает КОД (intro + render ДОСЛОВНО + outro).
+    block = _sheet_block_from_note(pricing_note)
+    if block is not None:
+        out = compose_sheet_draft(out, block, lang)
+    return out
 
 
 def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: bool,
@@ -1740,7 +1831,12 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
                                 directive=directive, park_models=park_models, playbook=playbook)
-    return _strip_service_prefix(call_llm(system, transcript))
+    out = _strip_service_prefix(call_llm(system, transcript))
+    # Тот же класс, что в generate_draft: сетку в финал вставляет КОД, не LLM.
+    block = _sheet_block_from_note(pricing_note)
+    if block is not None:
+        out = compose_sheet_draft(out, block, lang)
+    return out
 
 
 # ------------------------------- rate-limit ----------------------------------
