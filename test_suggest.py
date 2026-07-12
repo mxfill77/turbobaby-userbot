@@ -10,6 +10,7 @@ import test_isolation  # noqa: F401 — ПЕРВОЙ строкой: TESTING=1, 
 
 import os
 import json
+import time
 import asyncio
 import datetime
 import tempfile
@@ -1588,6 +1589,137 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
         self.assertEqual(suggest._sheet_min_deposit({"month": [new, old]}), 5000)
         # без цап — величина месяца = сумма (min из сумм)
         self.assertEqual(suggest._sheet_q_month({"total": 13000, "cap_active": False}), 13000)
+
+
+class TestPriceSheetManyVariantsRobust(unittest.TestCase):
+    """Класс-голден живого регресса 20:59 (после 551987e): реальный парк = МНОГО юнитов на модель
+    (~сотня живых quote на сетку). Требования класса: (1) битый юнит (quote кидает/молчит) НЕ валит
+    сетку — пропуск с логом, колонки из живых остальных; (2) построение параллельное и ограничено
+    дедлайном — на большом парке укладывается в разумную стену (последовательно 20:59 было 6м16с);
+    (3) минимум-по-вариантам НЕ ослаблен."""
+
+    # Парк как живой: XMAX 3 старых (кап 8900) + 6 новых (кап 9900), ADV 6 юнитов, NMAX одиночка.
+    OLD_XMAX = [f"XMAX 300CC OLD-{i} PHUKET 400{i}" for i in range(3)]
+    NEW_XMAX = [f"XMAX 300CC NEW-{i} PHUKET 870{i}" for i in range(6)]
+    ADV = [f"ADV 350CC UNIT-{i} PHUKET 580{i}" for i in range(6)]
+    FLEET_NAMES = OLD_XMAX + NEW_XMAX + ADV + ["NMAX 155CC BLACK PHUKET 4255"]
+    OLD = (790, 4700, 23700, 5000, True, 8900)
+    NEW = (939, 5600, 28170, 7000, True, 9900)
+    ADVT = (749, 4928, 14606, 7000, True, 10900)
+    NMAX = (450, 2800, 9000, 5000, True, 8500)
+
+    def setUp(self):
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+
+    def tearDown(self):
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+
+    def _getter(self, broken=(), slow=(), delay=0.0):
+        """Мок Bridge: broken — юниты, чей quote КИДАЕТ; slow — юниты со сном delay (для дедлайна)."""
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET_NAMES]}}
+            bike = params.get("bike", "")
+            if any(b in bike for b in broken):
+                raise RuntimeError(f"битый юнит {bike} (живой формат строки Лист1 сломал quote)")
+            if any(s in bike for s in slow):
+                time.sleep(delay)
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            up = bike.upper()
+            tar = (self.NMAX if "NMAX" in up else self.ADVT if "ADV" in up
+                   else self.NEW if "NEW" in up else self.OLD)
+            d1, d7, d30, dep, ca, cp = tar
+            total = {1: d1, 7: d7, 30: d30}.get(days, d1)
+            return {"ok": True, "data": {"day_price": round(total / max(days, 1)), "total": total,
+                    "deposit": dep, "available": True, "days": days, "cap_active": ca,
+                    "cap_price": cp, "text": f"{bike} {days}d {total}"}}
+        return fake
+
+    def test_broken_unit_skipped_grid_survives(self):
+        # ГОЛДЕН класса: один старый XMAX бит (quote кидает) → сетка ЦЕЛА, минимум всё ещё 8900
+        # (живы 2 других старых), остальные модели не задеты. Битый юнит никого не валит.
+        rows = suggest.price_sheet("2026-07-15", getter=self._getter(broken=("OLD-1",)))
+        block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
+        self.assertIn("XMAX 300\n• Сутки: 790 ฿\n• Неделя (7 дней): 4700 ฿\n"
+                      "• Месяц: от 8900 ฿\n• Депозит: 5000 ฿ / паспорт", block)
+        self.assertIn("ADV 350\n• Сутки: 749 ฿", block)
+        self.assertIn("NMAX 155\n• Сутки: 450 ฿", block)
+
+    def test_all_old_units_broken_min_falls_back_to_new(self):
+        # ВСЕ старые XMAX биты → колонки честно из живых НОВЫХ (от 9900) — не пустота и не обвал.
+        rows = suggest.price_sheet("2026-07-15",
+                                   getter=self._getter(broken=("OLD-0", "OLD-1", "OLD-2")))
+        block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
+        self.assertIn("XMAX 300\n• Сутки: 939 ฿", block)
+        self.assertIn("• Месяц: от 9900 ฿", block)
+        self.assertIn("NMAX 155\n• Сутки: 450 ฿", block)   # соседи не задеты
+
+    def test_many_variants_build_is_parallel_fast(self):
+        # Класс «разумное время»: 16 юнитов × 3 срока (48 quote) по 0.2с сна каждый. Последовательно
+        # это 9.6с; пул (8 воркеров) обязан уложиться заметно быстрее. Порог щедрый — не флапает.
+        t0 = time.time()
+        rows = suggest.price_sheet("2026-07-15",
+                                   getter=self._getter(slow=("XMAX", "ADV", "NMAX"), delay=0.2))
+        dt = time.time() - t0
+        self.assertTrue(rows)
+        self.assertLess(dt, 6.0, f"параллельный билд занял {dt:.1f}с — пул не работает")
+
+    def test_deadline_expired_units_skipped_not_hang(self):
+        # Юниты, висящие ДОЛЬШЕ дедлайна, пропускаются: сетка выходит из успевших, без зависания.
+        import unittest.mock as mock
+        with mock.patch.object(suggest, "_SHEET_DEADLINE", 1):
+            t0 = time.time()
+            rows = suggest.price_sheet("2026-07-15",
+                                       getter=self._getter(slow=("ADV",), delay=8.0))
+            dt = time.time() - t0
+        block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
+        self.assertLess(dt, 7.0, f"дедлайн не сработал: билд {dt:.1f}с")
+        self.assertIn("XMAX 300", block)                   # успевшие модели в сетке
+        self.assertNotIn("ADV 350\n• Сутки: 749 ฿", block)  # висящий юнит не дождались — без цифр
+
+
+class TestSheetAwarePricePolicy(unittest.TestCase):
+    """Класс-голден второй ноги живого регресса 20:59 (черновик #275): сетка ДОШЛА до промпта, но
+    ценовая политика («Дат нет — сперва спроси даты», цена только из блока «ЦЕНА из Календаря»)
+    конфликтовала с блоком «ПРАЙС ПО ПАРКУ» — LLM 9/10 переспрашивал даты/опыт, выбрасывая сетку.
+    Фикс у источника: при sheet-режиме политика сама велит выдать прайс дословно без переспроса."""
+
+    SHEET_NOTE = ("ПРАЙС ПО ПАРКУ из Календаря — приведи цифры И строки мин-срока/сезона ДОСЛОВНО…\n"
+                  "XMAX 300\n• Сутки: 593 ฿\n• Месяц: от 8900 ฿")
+
+    def test_sheet_mode_policy_orders_grid_not_date_question(self):
+        p = suggest.make_system_prompt("faq", "ru", pricing_note=self.SHEET_NOTE)
+        self.assertIn("ГОТОВЫЙ блок «ПРАЙС ПО ПАРКУ из Календаря»", p)
+        self.assertIn("Даты НЕ переспрашивай", p)
+        self.assertIn("Вопрос об опыте НЕ заменяет выдачу прайса", p)
+        self.assertNotIn("Дат нет — сперва спроси даты", p)      # конфликт-источник УБРАН
+        self.assertIn("приведи прайс-сетку из блока «ПРАЙС ПО ПАРКУ» ДОСЛОВНО", p)  # этап 1
+
+    def test_sheet_mode_en_note_triggers_too(self):
+        p = suggest.make_system_prompt("faq", "en",
+                                       pricing_note="PARK PRICE LIST from the Calendar …\nXMAX …")
+        self.assertIn("ГОТОВЫЙ блок «ПРАЙС ПО ПАРКУ из Календаря»", p)
+        self.assertNotIn("Дат нет — сперва спроси даты", p)
+
+    def test_regular_price_note_policy_unchanged(self):
+        # РЕГРЕСС: обычный ценовой путь (ЦЕНА по датам / вообще без цены) — прежняя политика.
+        for note in ("", "ЦЕНА из Календаря: XMAX 300 на 15.07–20.07 — 3500 ฿ …"):
+            p = suggest.make_system_prompt("faq", "ru", pricing_note=note)
+            self.assertIn("цену клиенту называй ТОЛЬКО если она передана ниже", p)
+            self.assertIn("Дат нет — сперва спроси даты", p)
+            self.assertNotIn("ГОТОВЫЙ блок «ПРАЙС ПО ПАРКУ", p)
+            self.assertIn("Этап 1 — ЦЕНА: назови цену по датам из Календаря", p)
 
 
 if __name__ == "__main__":

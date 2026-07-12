@@ -979,6 +979,14 @@ def _wrap_single(kind: str, phrase: str) -> str:
 # (инвариант как у кап-подстановки) — LLM их не сочиняет и не переформатирует.
 _SHEET_TERMS = ((1, "day"), (7, "week"), (30, "month"))     # дни аренды от даты-якоря → ключ ячейки
 _SHEET_TTL = int(os.getenv("PRICE_SHEET_TTL_SEC", "180") or "180")   # кэш прайса, минуты (не сутки)
+# Параллельность живых quote при построении сетки (класс-фикс регресса 20:59 после 551987e:
+# минимум-по-вариантам квотирует ВСЕ живые юниты — ~12 моделей × ~3 юнита × 3 срока ≈ сотня GET;
+# ПОСЛЕДОВАТЕЛЬНО по ~3.4с это 6м16с живого билда и замороженный Telethon-цикл. Пул сокращает
+# стену до десятков секунд; само МНОЖЕСТВО quote НЕ ослаблено — меняется только конкурентность).
+_SHEET_WORKERS = int(os.getenv("PRICE_SHEET_WORKERS", "8") or "8")
+# Дедлайн построения целиком: юнит, не успевший к дедлайну (висящий HTTP и т.п.), пропускается
+# С ЛОГОМ — сетка выходит из живых остальных, один битый юнит НЕ валит прайс целиком.
+_SHEET_DEADLINE = int(os.getenv("PRICE_SHEET_DEADLINE_SEC", "120") or "120")
 _sheet_cache = {"key": None, "ts": 0.0, "rows": None}
 
 
@@ -1059,29 +1067,60 @@ def price_sheet(ds, getter=None, _now=None, _fleet=None):
     bikes = _fleet if _fleet is not None else pricing.fleet(_get=getter)
     # Колонка какой ячейки чем минимизируется: сутки/неделя — по сумме, месяц — по кап-«от» величине.
     value_fn = {"day": _sheet_q_total, "week": _sheet_q_total, "month": _sheet_q_month}
-    rows = []
+    t0 = time.time()
+    # План живых вызовов: (модель × срок × КАЖДЫЙ живой вариант). Квотируем ПАРАЛЛЕЛЬНО пулом
+    # (класс-фикс 6м16с последовательного билда 20:59); memo (bike, de) страхует от дублей.
+    plan = []                       # (model, variants, {key: [(bike, de), ...]})
     for m in models:
         variants = _sheet_variants(m, bikes)
         if not variants:
             continue
-        # Квотируем КАЖДЫЙ живой вариант модели (старый/новый юнит) на 1/7/30 дней; ниже колонка =
-        # МИНИМУМ по вариантам через живой quote (точка правды та же, 8900 не хардкодим).
-        term_quotes = {}
+        per_term = {}
         for n, key in _SHEET_TERMS:
             de = _iso_plus(ds, n)
-            qs = []
-            if de:
-                for bike in variants:
-                    try:
-                        q = pricing.quote(bike, ds, de, _get=getter)
-                    except Exception:
-                        q = None
-                    if q is not None:
-                        qs.append(q)
-            term_quotes[key] = qs
+            per_term[key] = [(bike, de) for bike in variants] if de else []
+        plan.append((m, variants, per_term))
+
+    def _q_one(bike, de):
+        """Один живой quote юнита; ЛЮБОЙ сбой → None с логом (битый юнит НЕ валит сетку)."""
+        try:
+            return pricing.quote(bike, ds, de, _get=getter)
+        except Exception as e:
+            log.info(f"SHEET: quote юнита {bike} {ds}..{de} упал ({type(e).__name__}) — пропущен")
+            return None
+
+    import concurrent.futures as _cf
+    futs = {}                       # (bike, de) -> Future (memo в пределах построения)
+    ex = _cf.ThreadPoolExecutor(max_workers=max(1, _SHEET_WORKERS))
+    try:
+        for _, _, per_term in plan:
+            for pairs in per_term.values():
+                for bd in pairs:
+                    if bd not in futs:
+                        futs[bd] = ex.submit(_q_one, *bd)
+        deadline = t0 + _SHEET_DEADLINE
+        results = {}
+        for bd, fut in futs.items():
+            try:                    # просрочка дедлайна/сбой юнита → None (skip с логом), не обвал
+                results[bd] = fut.result(timeout=max(0.0, deadline - time.time()))
+            except Exception:
+                results[bd] = None
+                log.info(f"SHEET: юнит {bd[0]} до {bd[1]} не уложился в дедлайн {_SHEET_DEADLINE}с — пропущен")
+    finally:
+        # НЕ ждём зависшие HTTP: невзятые в работу отменяем, взятые дотекут в фоне (демон-длинножитель).
+        ex.shutdown(wait=False, cancel_futures=True)
+
+    rows = []
+    for m, variants, per_term in plan:
+        # Порядок квот = порядок вариантов парка (детерминизм при равенстве колонок); None — выпал.
+        term_quotes = {key: [q for q in (results.get(bd) for bd in pairs) if q is not None]
+                       for key, pairs in per_term.items()}
         cells = {key: _sheet_min_variant(term_quotes[key], value_fn[key]) for _, key in _SHEET_TERMS}
         rows.append({"model": m, "class": bike_class(m), "bike": variants[0], "cells": cells,
                      "deposit": _sheet_min_deposit(term_quotes)})
+    n_ok = sum(1 for v in results.values() if v is not None)
+    log.info(f"SHEET: сетка построена за {time.time() - t0:.1f}с — {len(rows)} моделей, "
+             f"{len(futs)} quote ({len(futs) - n_ok} пропущено), пул {_SHEET_WORKERS}")
     if getter is None and _fleet is None:
         c.update(key=ds, ts=now, rows=rows)
     return rows
@@ -1353,20 +1392,46 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         greet = (
             "\n\nЭто ПРОДОЛЖЕНИЕ диалога — НЕ здоровайся повторно, сразу отвечай по сути."
         )
-    policy = (
-        "\n\nЦЕНОВАЯ ПОЛИТИКА (СТРОГО): цену клиенту называй ТОЛЬКО если она передана ниже в "
-        "блоке «ЦЕНА из Календаря». Пока такой цены нет (или дат в диалоге нет) — НЕ называй "
-        "клиенту НИКАКУЮ цену: ни точную, ни ориентир, ни «от X», ни диапазон, ни «from», ни "
-        "ставку из FAQ. Дат нет — сперва спроси даты. Цена недоступна — скажи, что уточнишь "
-        "цену по датам и вернёшься, БЕЗ числа. Дневные ставки FAQ — ориентир ДЛЯ МЕНЕДЖЕРА, "
-        "не для клиента. Про уменьшение депозита при нескольких байках сам НЕ предлагай и НЕ "
-        "обещай; на прямой вопрос клиента ответь ровно «уточню у менеджера»."
+    # Живой провал 20:59 (черновик #275): сетка ПРАЙС ПО ПАРКУ дошла до промпта, но policy ниже
+    # («СТРОГО»: «Дат нет — сперва спроси даты», цена только из блока «ЦЕНА из Календаря») её не
+    # знала — LLM 9/10 следовал политике и переспрашивал даты/опыт, выбрасывая готовую сетку.
+    # Класс-фикс У ИСТОЧНИКА конфликта: когда pricing_note — прайс по парку, сама политика говорит
+    # «это И ЕСТЬ цена из Календаря — выдай дословно, даты не переспрашивай». Обычный путь (ЦЕНА
+    # по датам / нет цены) — прежний текст байт-в-байт.
+    sheet_mode = bool(pricing_note) and ("ПРАЙС ПО ПАРКУ" in pricing_note
+                                         or "PARK PRICE LIST" in pricing_note)
+    if sheet_mode:
+        policy = (
+            "\n\nЦЕНОВАЯ ПОЛИТИКА (СТРОГО): ниже передан ГОТОВЫЙ блок «ПРАЙС ПО ПАРКУ из "
+            "Календаря» — это И ЕСТЬ цена из Календаря, уже посчитанная по всему парку. Приведи "
+            "его цифры и строки мин-срока/сезона клиенту ДОСЛОВНО В ЭТОМ ЖЕ ответе. Даты НЕ "
+            "переспрашивай и НЕ жди их: сетка посчитана от ближайшей даты, точные даты лишь "
+            "уточнят расчёт потом. Вопрос об опыте НЕ заменяет выдачу прайса: сперва прайс, "
+            "остальное можно уточнить после него. НИКАКИХ других цен (FAQ/ориентиры/диапазоны) "
+            "не называй. Про уменьшение депозита при нескольких байках сам НЕ предлагай и НЕ "
+            "обещай; на прямой вопрос клиента ответь ровно «уточню у менеджера»."
+        )
+    else:
+        policy = (
+            "\n\nЦЕНОВАЯ ПОЛИТИКА (СТРОГО): цену клиенту называй ТОЛЬКО если она передана ниже в "
+            "блоке «ЦЕНА из Календаря». Пока такой цены нет (или дат в диалоге нет) — НЕ называй "
+            "клиенту НИКАКУЮ цену: ни точную, ни ориентир, ни «от X», ни диапазон, ни «from», ни "
+            "ставку из FAQ. Дат нет — сперва спроси даты. Цена недоступна — скажи, что уточнишь "
+            "цену по датам и вернёшься, БЕЗ числа. Дневные ставки FAQ — ориентир ДЛЯ МЕНЕДЖЕРА, "
+            "не для клиента. Про уменьшение депозита при нескольких байках сам НЕ предлагай и НЕ "
+            "обещай; на прямой вопрос клиента ответь ровно «уточню у менеджера»."
+        )
+    stage1 = (
+        "Этап 1 — ЦЕНА: приведи прайс-сетку из блока «ПРАЙС ПО ПАРКУ» ДОСЛОВНО — это и есть "
+        "цена; даты для этого НЕ нужны. "
+        if sheet_mode else
+        "Этап 1 — ЦЕНА: назови цену по датам из Календаря (если она в блоке ЦЕНА выше). "
     )
     scenario = (
         "\n\n[ВНУТРЕННИЙ КОНТЕКСТ — только для тебя, клиенту НЕ показывать; номера этапов и "
         "слова «этап»/«стадия» в самом ответе НЕ упоминать]\n"
         "ПОРЯДОК ДИАЛОГА (СТРОГО по этапам, не забегай вперёд):\n"
-        "Этап 1 — ЦЕНА: назови цену по датам из Календаря (если она в блоке ЦЕНА выше). "
+        + stage1 +
         "На этом этапе НЕ проси паспорт, апартаменты и шлемы — только цена и наличие.\n"
         "Этап 2 — ДОСТАВКА: когда клиент заинтересовался ценой — уточни район доставки и назови "
         "её стоимость по прайсу районов; добавь, что забор байка в конце аренды БЕСПЛАТНЫЙ.\n"
@@ -1968,7 +2033,11 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
     lang = detect_lang_from_client(transcript)
     faq = faq if faq is not None else load_faq()
     # Двухфазная цена: даты есть → пробуем Календарь (pricing.quote), иначе/None → фолбэк.
-    price_note = build_pricing_note(extract_booking_hints(transcript), lang=lang)
+    # В ПОТОКЕ (to_thread): построение сетки — живые HTTP-quote; синхронно оно морозило Telethon
+    # event loop (живой провал 20:52→20:59: 6м16с заморозки → «Security error… Too many messages
+    # had to be ignored» от Telegram). Поток снимает заморозку; сам билд ускорен пулом в price_sheet.
+    price_note = await asyncio.to_thread(
+        build_pricing_note, extract_booking_hints(transcript), lang=lang)
     try:                                   # allowlist парка (Лист1); недоступен → None (fail-safe)
         allow = park_allowlist()
     except Exception as e:
