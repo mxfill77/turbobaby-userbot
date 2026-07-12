@@ -1174,6 +1174,22 @@ class TestSalesPressureAndSafety(unittest.TestCase):
         self.assertLess(sysp.index("КРИТИЧНЫЕ ФАКТЫ"), sysp.index("ОПЫТ И БЕЗОПАСНОСТЬ"))
         self.assertLess(sysp.index("ОПЫТ И БЕЗОПАСНОСТЬ"), sysp.index("КНИГА ПРАВИЛ"))
 
+    def test_approval_whitelist_rule_always_and_positioned(self):
+        sysp = suggest.make_system_prompt("FAQ", "ru", playbook="ПРАВИЛО-X")
+        self.assertIn("БЕЛЫЙ СПИСОК", sysp)                    # белый список утверждаемого есть всегда
+        self.assertIn("уточню у команды и вернусь", sysp)      # деградация вместо утверждения
+        self.assertIn("[уточнить: цвет ADV350]", sysp)         # формат пометки менеджеру
+        self.assertIn("цвет, комплектацию", sysp)              # цвет/комплектация — запрещено утверждать
+        # рядом с критфактами: ПОСЛЕ CRITICAL_FACTS/ОПЫТ, ВЫШЕ playbook
+        self.assertLess(sysp.index("ОПЫТ И БЕЗОПАСНОСТЬ"), sysp.index("БЕЛЫЙ СПИСОК"))
+        self.assertLess(sysp.index("БЕЛЫЙ СПИСОК"), sysp.index("КНИГА ПРАВИЛ"))
+
+    def test_approval_whitelist_note_not_stripped_as_service(self):
+        # пометка «[уточнить: …]» адресована модератору — _strip_service_prefix её НЕ режет
+        # (её маркер — «[внутренн», не «[уточнить»); ведущий срез трогает только стадию сделки.
+        draft = "Уточню у команды и вернусь.\n[уточнить: цвет ADV350]"
+        self.assertEqual(suggest._strip_service_prefix(draft), draft)
+
 
 class TestPriceSheet(unittest.TestCase):
     """Прайс по всему парку: детект намерения, детерминированный рендер день/7/месяц из ЖИВОГО
