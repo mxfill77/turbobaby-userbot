@@ -1492,5 +1492,103 @@ class TestPriceSheet(unittest.TestCase):
         self.assertIn("БЕЗ ПЕРЕСПРОСОВ", sysp)
 
 
+class TestPriceSheetMinAcrossVariants(unittest.TestCase):
+    """Правило-класс: у модели с НЕСКОЛЬКИМИ живыми вариантами в парке (старый/новый юнит) каждая
+    колонка сетки (сутки/неделя/месяц-«от», депозит) = МИНИМУМ по вариантам через ЖИВОЙ quote.
+    Живой провал: XMAX показывал «от 9900» (кап нового 2023+), хотя в парке 3 старых XMAX под кап 8900
+    → завышали. Bridge замокан getter'ом (реальный Календарь НЕ трогаем), 8900 в коде НЕ хардкодим —
+    цифра приходит ТОЛЬКО из мок-quote старого юнита."""
+
+    # 3 живых СТАРЫХ XMAX (2020-2022, дешевле) + 1 НОВЫЙ (2023+, дороже) + одиночная NMAX для регресса.
+    OLD_XMAX = ["XMAX 300CC GREY PHUKET 4246", "XMAX 300CC BLUE PHUKET 4247",
+                "XMAX 300CC BLACK PHUKET 4248"]
+    NEW_XMAX = ["XMAX 300CC NEW 2023 PHUKET 7701"]
+    FLEET_NAMES = OLD_XMAX + NEW_XMAX + ["NMAX 155CC BLACK PHUKET 4255"]
+
+    # тариф: (day_total, week_total, month_total, deposit, cap_active, cap_price)
+    OLD = (790, 4700, 23700, 5000, True, 8900)     # старый XMAX: кап 8900, депозит 5000
+    NEW = (939, 5600, 28170, 7000, True, 9900)     # новый XMAX: кап 9900, депозит 7000
+    NMAX = (450, 2800, 9000, 5000, True, 8500)     # одиночная модель — регресс (не должна измениться)
+
+    def setUp(self):
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+
+    def tearDown(self):
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+
+    def _tar_for(self, bike):
+        """Тариф ПО ИМЕНИ юнита (не только по модели): новый 2023+ дороже старого; NMAX — своя."""
+        if "NMAX" in bike.upper():
+            return self.NMAX
+        if "2023" in bike or "NEW" in bike.upper():
+            return self.NEW
+        return self.OLD
+
+    def _getter(self):
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET_NAMES]}}
+            bike = params.get("bike", "")
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            d1, d7, d30, dep, ca, cp = self._tar_for(bike)
+            total = {1: d1, 7: d7, 30: d30}.get(days, d1)
+            return {"ok": True, "data": {"day_price": round(total / max(days, 1)), "total": total,
+                    "deposit": dep, "available": True, "days": days, "cap_active": ca,
+                    "cap_price": cp, "text": f"{bike} {days}d {total}"}}
+        return fake
+
+    def test_xmax_grid_is_min_over_old_and_new(self):
+        # ГОЛДЕН: живы старые XMAX (8900) рядом с новым (9900) → в сетке МИНИМУМ по каждой колонке.
+        rows = suggest.price_sheet("2026-07-15", getter=self._getter())
+        block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
+        self.assertIn("XMAX 300\n• Сутки: 790 ฿\n• Неделя (7 дней): 4700 ฿\n"
+                      "• Месяц: от 8900 ฿\n• Депозит: 5000 ฿ / паспорт", block)
+        self.assertNotIn("от 9900", block)     # кап нового юнита НЕ протекает
+        self.assertNotIn("939 ฿", block)       # суточный нового НЕ протекает
+        self.assertNotIn("7000 ฿", block)      # депозит нового НЕ протекает
+
+    def test_live_phrase_grid_shows_xmax_from_8900(self):
+        # Живой прогон «какие модели и цены» (дословная фраза клиента) → в сетке XMAX от 8900.
+        phrase = ("Какие марки и модели байков вы предлагаете? Какие у вас цены на аренду? "
+                  "(Стоимость за день, неделю и месяц для разных моделей.) Требуется ли депозит?")
+        hints = suggest.extract_booking_hints(f"[клиент]: {phrase}", today=datetime.date(2026, 7, 11))
+        self.assertTrue(hints["price_sheet_q"])
+        note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+        self.assertIn("ПРАЙС ПО ПАРКУ", note)
+        self.assertIn("XMAX 300\n• Сутки: 790 ฿", note)
+        self.assertIn("• Месяц: от 8900 ฿", note)
+        self.assertNotIn("от 9900", note)
+
+    def test_single_variant_model_unchanged(self):
+        # РЕГРЕСС: одиночная модель (один вариант в парке) — цифры БЕЗ изменений (мин по одному == он сам).
+        rows = suggest.price_sheet("2026-07-15", getter=self._getter())
+        block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
+        self.assertIn("NMAX 155\n• Сутки: 450 ฿\n• Неделя (7 дней): 2800 ฿\n"
+                      "• Месяц: от 8500 ฿\n• Депозит: 5000 ฿ / паспорт", block)
+
+    def test_min_helpers_pick_cheapest_column_independently(self):
+        # Юнит на редьюсер: сутки/неделя — по сумме, месяц — по кап-«от», депозит — общий минимум.
+        old = {"total": 23700, "deposit": 5000, "cap_active": True, "cap_price": 8900}
+        new = {"total": 28170, "deposit": 7000, "cap_active": True, "cap_price": 9900}
+        self.assertEqual(suggest._sheet_q_month(old), 8900)
+        self.assertEqual(suggest._sheet_q_month(new), 9900)
+        self.assertIs(suggest._sheet_min_variant([new, old], suggest._sheet_q_month), old)
+        self.assertEqual(suggest._sheet_min_deposit({"month": [new, old]}), 5000)
+        # без цап — величина месяца = сумма (min из сумм)
+        self.assertEqual(suggest._sheet_q_month({"total": 13000, "cap_active": False}), 13000)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

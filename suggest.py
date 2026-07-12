@@ -982,18 +982,61 @@ _SHEET_TTL = int(os.getenv("PRICE_SHEET_TTL_SEC", "180") or "180")   # кэш п
 _sheet_cache = {"key": None, "ts": 0.0, "rows": None}
 
 
-def _sheet_pick_bike(model, bikes):
-    """Один представитель модели из парка (тариф в Календаре — по модели, юнит не важен). → имя|None.
-    Матчим ТЕМ ЖЕ _bike_key, что и park_allowlist (снимает CC/СС): иначе «CB 300R» не сойдётся с
-    именем «CB 300CC R 9011» (pricing._candidates по _norm_alnum спотыкается о CC между моделью и суффиксом)."""
+def _sheet_variants(model, bikes):
+    """ВСЕ живые байки-варианты модели в парке (старый/новый юнит и т.п.). → list[str] имён (может
+    быть пуст). Тариф в Календаре Bridge отдаёт по ИМЕНИ юнита, и у вариантов одной модели он может
+    РАЗЛИЧАТЬСЯ (напр. XMAX старый 2020-2022 дешевле нового 2023+). Раньше брали одного представителя
+    и завышали, если жив дешёвый старый юнит; теперь колонки сетки = МИНИМУМ по вариантам (см.
+    price_sheet). Матчим ТЕМ ЖЕ _bike_key, что и park_allowlist (снимает CC/СС): иначе «CB 300R» не
+    сойдётся с именем «CB 300CC R 9011» (pricing._candidates по _norm_alnum спотыкается о CC)."""
     mk = _bike_key(model)
     if not mk:
-        return None
+        return []
+    out = []
     for b in (bikes or []):
         nm = b.get("name") if isinstance(b, dict) else None
         if nm and mk in _bike_key(nm):
-            return nm
-    return None
+            out.append(nm)
+    return out
+
+
+def _sheet_q_total(q):
+    """Числовая величина суточной/недельной колонки квоты (сумма аренды) или None."""
+    return q.get("total") if isinstance(q, dict) else None
+
+
+def _sheet_q_month(q):
+    """Числовая величина МЕСЯЧНОЙ колонки квоты — РОВНО как показывает _sheet_month_cell: кап-«от»
+    имеет приоритет (cap_active и total>cap_price → cap_price), иначе сумма месяца. → число|None."""
+    if not isinstance(q, dict):
+        return None
+    total = q.get("total")
+    cap_active, cap_price = q.get("cap_active"), q.get("cap_price")
+    if cap_active and cap_price is not None and total is not None and total > cap_price:
+        return cap_price
+    return total
+
+
+def _sheet_min_variant(quotes, value_fn):
+    """Из квот вариантов модели выбрать ту, что даёт МИНИМАЛЬНУЮ колонку (по value_fn); None-значения
+    пропускаем. → квота-победитель (самосогласованный dict — рендер/кап берёт из неё) или None (нет
+    ни одной цифры). Для одной-единственной модели-варианта == та самая квота (регресс без изменений)."""
+    best = best_v = None
+    for q in quotes:
+        v = value_fn(q)
+        if v is None:
+            continue
+        if best_v is None or v < best_v:
+            best_v, best = v, q
+    return best
+
+
+def _sheet_min_deposit(term_quotes):
+    """Минимальный депозит по ВСЕМ вариант-квотам модели (депозит — такая же колонка сетки: МИНИМУМ
+    по вариантам; старый юнит XMAX 5000 vs новый 7000 → 5000). → число|None (нет депозита)."""
+    deps = [q.get("deposit") for qs in term_quotes.values() for q in qs
+            if isinstance(q, dict) and q.get("deposit") is not None]
+    return min(deps) if deps else None
 
 
 def price_sheet(ds, getter=None, _now=None, _fleet=None):
@@ -1014,22 +1057,31 @@ def price_sheet(ds, getter=None, _now=None, _fleet=None):
         return []
     models = [m for m in allow if _bike_key(m) not in _NON_RENTABLE_KEYS]
     bikes = _fleet if _fleet is not None else pricing.fleet(_get=getter)
+    # Колонка какой ячейки чем минимизируется: сутки/неделя — по сумме, месяц — по кап-«от» величине.
+    value_fn = {"day": _sheet_q_total, "week": _sheet_q_total, "month": _sheet_q_month}
     rows = []
     for m in models:
-        bike = _sheet_pick_bike(m, bikes)
-        if not bike:
+        variants = _sheet_variants(m, bikes)
+        if not variants:
             continue
-        cells = {}
+        # Квотируем КАЖДЫЙ живой вариант модели (старый/новый юнит) на 1/7/30 дней; ниже колонка =
+        # МИНИМУМ по вариантам через живой quote (точка правды та же, 8900 не хардкодим).
+        term_quotes = {}
         for n, key in _SHEET_TERMS:
             de = _iso_plus(ds, n)
-            q = None
+            qs = []
             if de:
-                try:
-                    q = pricing.quote(bike, ds, de, _get=getter)
-                except Exception:
-                    q = None
-            cells[key] = q
-        rows.append({"model": m, "class": bike_class(m), "bike": bike, "cells": cells})
+                for bike in variants:
+                    try:
+                        q = pricing.quote(bike, ds, de, _get=getter)
+                    except Exception:
+                        q = None
+                    if q is not None:
+                        qs.append(q)
+            term_quotes[key] = qs
+        cells = {key: _sheet_min_variant(term_quotes[key], value_fn[key]) for _, key in _SHEET_TERMS}
+        rows.append({"model": m, "class": bike_class(m), "bike": variants[0], "cells": cells,
+                     "deposit": _sheet_min_deposit(term_quotes)})
     if getter is None and _fleet is None:
         c.update(key=ds, ts=now, rows=rows)
     return rows
@@ -1132,7 +1184,11 @@ def render_price_sheet(rows, ds, lang="ru") -> str:
         mo = _sheet_month_cell(cells.get("month"), lang)
         if not (d or w or mo):
             continue
-        dep = _sheet_deposit(cells)
+        # Депозит — МИНИМУМ по вариантам (row["deposit"], считается в price_sheet); фолбэк на скан
+        # ячеек для совместимости, если строку собрали без него.
+        dep = r.get("deposit")
+        if dep is None:
+            dep = _sheet_deposit(cells)
         card = [r["model"]]
         if en:
             card.append(f"• Daily: {d or na}")
