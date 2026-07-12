@@ -703,6 +703,42 @@ def bike_class(model):
     return None
 
 
+# --- XMAX 300: ДВА ПОКОЛЕНИЯ = ДВА ПРОДУКТА --------------------------------------
+# В парке (Лист1) XMAX двух поколений с РАЗНЫМИ тарифами: старое 2020-2022 (юниты БЕЗ токена «NEW»
+# в имени, дешевле, депозит 5000) и новое 2023+ («…CC NEW …» в имени, дороже, депозит 7000). Раньше
+# сетка/точечный quote схлопывали их МИНИМУМОМ по вариантам в одну строку — наценка нового поколения
+# пропадала. Теперь это ДВА продукта отдельными строками, каждый с ЖИВЫМИ цифрами по своим юнитам;
+# правило «минимум по вариантам» снято ТОЛЬКО для XMAX (для прочих моделей оно сохраняется).
+_XMAX_KEY = _bike_key("XMAX 300")          # 'xmax300'
+
+
+def _is_xmax_model(model) -> bool:
+    """Модель — это XMAX (в любой форме: «XMAX 300», «XMAX300», голый canon «XMAX» из детекта).
+    В парке XMAX только 300cc, поэтому ключа с префиксом 'xmax' достаточно."""
+    return _bike_key(model).startswith("xmax")
+
+
+def _xmax_is_new_gen(unit_name) -> bool:
+    """Юнит XMAX нового поколения — в имени отдельный токен NEW (Лист1: «XMAX 300CC NEW …»)."""
+    return bool(re.search(r"(?i)\bnew\b", str(unit_name or "")))
+
+
+# Продукты XMAX: (метка клиенту, предикат по имени юнита). Порядок = порядок строк в сетке/quote.
+_XMAX_PRODUCTS = (
+    ("XMAX 300", lambda nm: not _xmax_is_new_gen(nm)),          # старое поколение (без «NEW»)
+    ("XMAX 300 New Gen", _xmax_is_new_gen),                     # новое поколение 2023+
+)
+
+
+def _model_products_for_quote(model):
+    """Модель → продукты для ТОЧЕЧНОГО quote: [(метка, name_filter)]. XMAX разворачиваем в два
+    поколения (минимум-по-вариантам снят — показываем ОБА как отдельные строки); прочие модели —
+    один продукт с name_filter=None (поведение как раньше)."""
+    if _is_xmax_model(model):
+        return [(label, pred) for label, pred in _XMAX_PRODUCTS]
+    return [(model, None)]
+
+
 def _asks_deposit_reduction_multi(newest: str, recent: str, models) -> bool:
     """Явный вопрос клиента про уменьшение депозита при нескольких байках (правила цен v2, п.4).
     newest — последняя реплика клиента, recent — склейка последних реплик, models — найденные модели."""
@@ -890,10 +926,11 @@ def _iso_plus(iso_date, n_days):
         return None
 
 
-def _safe_quote_for_model(model, ds, de):
-    """pricing.quote_for_model без падений → всегда dict {status, quote}."""
+def _safe_quote_for_model(model, ds, de, getter=None, name_filter=None):
+    """pricing.quote_for_model без падений → всегда dict {status, quote}. name_filter сужает юниты
+    (напр. поколение XMAX); getter инъектируется в тестах (боевой путь — None, живой Bridge)."""
     try:
-        res = pricing.quote_for_model(model, ds, de)
+        res = pricing.quote_for_model(model, ds, de, _get=getter, name_filter=name_filter)
     except Exception:
         res = None
     if not isinstance(res, dict):
@@ -929,11 +966,12 @@ def _client_price(q: dict) -> str:
     return "; ".join(parts)
 
 
-def _resolve_model_price(model, ds, de, hint_days, monthly):
+def _resolve_model_price(model, ds, de, hint_days, monthly, getter=None, name_filter=None):
     """Цена для ОДНОЙ модели по датам ds..de. Возвращает (kind, phrase):
       ok    — цену использовать дословно (кап/J-текст/сборка внутри _client_price);
       min   — срок короче минимального: «<тип> сдаём от N дней» + цена на минимум;
-      sanity/none/error — фолбэк без числа."""
+      sanity/none/error — фолбэк без числа.
+    name_filter сужает юниты модели (поколение XMAX); getter инъектируется в тестах."""
     cls = bike_class(model)
     # (п.2) минимальный срок аренды: короче → предлагаем минимум и цену на него
     if cls and hint_days is not None and hint_days < cls[1]:
@@ -941,7 +979,7 @@ def _resolve_model_price(model, ds, de, hint_days, monthly):
         de_min = _iso_plus(ds, min_days)
         q = None
         if de_min:
-            res = _safe_quote_for_model(model, ds, de_min)
+            res = _safe_quote_for_model(model, ds, de_min, getter=getter, name_filter=name_filter)
             if res.get("status") == "ok" and res.get("quote") and \
                     pricing.sanity_days_ok(res["quote"].get("days"), min_days, monthly):
                 q = res["quote"]
@@ -949,7 +987,7 @@ def _resolve_model_price(model, ds, de, hint_days, monthly):
         if q:
             return ("min", f"{base}; цена за {min_days} дн: {_client_price(q)}")
         return ("min", f"{base}; точную цену за {min_days} дн уточню и вернусь")
-    res = _safe_quote_for_model(model, ds, de)
+    res = _safe_quote_for_model(model, ds, de, getter=getter, name_filter=name_filter)
     status, q = res.get("status"), res.get("quote")
     if status == "ok" and q:
         # SANITY-ГАРД: сверяем days из quote с длительностью из слов клиента.
@@ -1039,6 +1077,21 @@ def _sheet_min_variant(quotes, value_fn):
     return best
 
 
+def _sheet_products(model, variants):
+    """Продукты модели для сетки: (метка, свои_варианты). XMAX → ДВА поколения (старое / New Gen)
+    отдельными строками — минимум-по-вариантам для XMAX снят (тарифы поколений разные, минимум их
+    схлопнул бы в одну цену). Прочие модели — ОДИН продукт со всеми вариантами (минимум-по-вариантам
+    сохранён). Пустые поколения (нет живых юнитов) отбрасываем."""
+    if _is_xmax_model(model):
+        out = []
+        for label, pred in _XMAX_PRODUCTS:
+            vs = [v for v in variants if pred(v)]
+            if vs:
+                out.append((label, vs))
+        return out
+    return [(model, variants)]
+
+
 def _sheet_min_deposit(term_quotes):
     """Минимальный депозит по ВСЕМ вариант-квотам модели (депозит — такая же колонка сетки: МИНИМУМ
     по вариантам; старый юнит XMAX 5000 vs новый 7000 → 5000). → число|None (нет депозита)."""
@@ -1070,16 +1123,18 @@ def price_sheet(ds, getter=None, _now=None, _fleet=None):
     t0 = time.time()
     # План живых вызовов: (модель × срок × КАЖДЫЙ живой вариант). Квотируем ПАРАЛЛЕЛЬНО пулом
     # (класс-фикс 6м16с последовательного билда 20:59); memo (bike, de) страхует от дублей.
-    plan = []                       # (model, variants, {key: [(bike, de), ...]})
+    plan = []                       # (label, variants, {key: [(bike, de), ...]})
     for m in models:
         variants = _sheet_variants(m, bikes)
         if not variants:
             continue
-        per_term = {}
-        for n, key in _SHEET_TERMS:
-            de = _iso_plus(ds, n)
-            per_term[key] = [(bike, de) for bike in variants] if de else []
-        plan.append((m, variants, per_term))
+        # XMAX разворачиваем в два продукта-поколения (свои юниты у каждого); прочие — один продукт.
+        for label, vs in _sheet_products(m, variants):
+            per_term = {}
+            for n, key in _SHEET_TERMS:
+                de = _iso_plus(ds, n)
+                per_term[key] = [(bike, de) for bike in vs] if de else []
+            plan.append((label, vs, per_term))
 
     def _q_one(bike, de):
         """Один живой quote юнита; ЛЮБОЙ сбой → None с логом (битый юнит НЕ валит сетку)."""
@@ -1111,12 +1166,12 @@ def price_sheet(ds, getter=None, _now=None, _fleet=None):
         ex.shutdown(wait=False, cancel_futures=True)
 
     rows = []
-    for m, variants, per_term in plan:
+    for label, variants, per_term in plan:
         # Порядок квот = порядок вариантов парка (детерминизм при равенстве колонок); None — выпал.
         term_quotes = {key: [q for q in (results.get(bd) for bd in pairs) if q is not None]
                        for key, pairs in per_term.items()}
         cells = {key: _sheet_min_variant(term_quotes[key], value_fn[key]) for _, key in _SHEET_TERMS}
-        rows.append({"model": m, "class": bike_class(m), "bike": variants[0], "cells": cells,
+        rows.append({"model": label, "class": bike_class(label), "bike": variants[0], "cells": cells,
                      "deposit": _sheet_min_deposit(term_quotes)})
     n_ok = sum(1 for v in results.values() if v is not None)
     log.info(f"SHEET: сетка построена за {time.time() - t0:.1f}с — {len(rows)} моделей, "
@@ -1391,17 +1446,24 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
                 "назовёшь цену по датам.") + dep
     hint_days, monthly = hints.get("hint_days"), hints.get("monthly")
 
-    if len(models) == 1:
-        kind, phrase = _resolve_model_price(models[0], ds, de, hint_days, monthly)
+    # Разворачиваем модели в ПРОДУКТЫ: XMAX → два поколения отдельными строками (старое / New Gen),
+    # прочие модели — один продукт как раньше. (label, модель_для_quote, name_filter-по-имени-юнита.)
+    products = [(label, m, nf) for m in models for label, nf in _model_products_for_quote(m)]
+
+    if len(products) == 1:
+        label, m, nf = products[0]
+        kind, phrase = _resolve_model_price(m, ds, de, hint_days, monthly, getter=getter, name_filter=nf)
         return _wrap_single(kind, phrase) + dep
 
-    # (п.3) несколько моделей — раздельная цена по каждой, отдельной строкой в одном сообщении
+    # (п.3) несколько продуктов (несколько моделей ИЛИ два поколения XMAX) — раздельная цена по
+    # каждому, отдельной строкой в одном сообщении.
     bullets = []
-    for m in models:
-        _, phrase = _resolve_model_price(m, ds, de, hint_days, monthly)
-        bullets.append(f"- {m}: {phrase}")
-    header = ("ЦЕНЫ ПО МОДЕЛЯМ (клиент запросил несколько) — назови КАЖДУЮ отдельной строкой в "
-              "ОДНОМ сообщении, цену использовать ДОСЛОВНО, модели НЕ смешивай и НЕ суммируй:\n")
+    for label, m, nf in products:
+        _, phrase = _resolve_model_price(m, ds, de, hint_days, monthly, getter=getter, name_filter=nf)
+        bullets.append(f"- {label}: {phrase}")
+    header = ("ЦЕНЫ ПО МОДЕЛЯМ (клиент запросил несколько / модель с вариантами) — назови КАЖДУЮ "
+              "отдельной строкой в ОДНОМ сообщении, цену использовать ДОСЛОВНО, модели/варианты НЕ "
+              "смешивай и НЕ суммируй:\n")
     return header + "\n".join(bullets) + dep
 
 

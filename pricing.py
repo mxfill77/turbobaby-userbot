@@ -167,19 +167,23 @@ def _candidates(model, bikes):
     return [b for b in bikes if m in _norm_alnum(b.get("name"))]
 
 
-def quote_for_model(model, date_start, date_end, _get=None, _fleet=None):
+def quote_for_model(model, date_start, date_end, _get=None, _fleet=None, name_filter=None):
     """Резолв МОДЕЛЬ→конкретный байк и котировка. READ-ONLY (create_booking НЕ зовём).
     Возвращает {'status': ok|none_available|no_candidates|error, 'quote': dict|None}:
       ok            — нашли available байк, quote с ценой (использовать дословно);
       none_available— котировки получены, но все подходящие байки заняты на даты;
       no_candidates — нет модели/дат или в парке нет такой модели;
-      error         — парк/котировки недоступны (ошибка/таймаут/не-ok)."""
+      error         — парк/котировки недоступны (ошибка/таймаут/не-ok).
+    name_filter — необязательный предикат по ИМЕНИ юнита: сузить кандидатов до подмножества
+    (напр. поколение XMAX «старое/New Gen» — квотируем только юниты своего поколения)."""
     if not (model and date_start and date_end):
         return {"status": "no_candidates", "quote": None}
     bikes = _fleet if _fleet is not None else fleet(_get=_get)
     if not bikes:
         return {"status": "error", "quote": None}
     cands = _candidates(model, bikes)
+    if name_filter is not None:
+        cands = [b for b in cands if name_filter(b.get("name"))]
     if not cands:
         return {"status": "no_candidates", "quote": None}
     saw_quote = False

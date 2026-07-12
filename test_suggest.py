@@ -1502,11 +1502,12 @@ class TestPriceSheet(unittest.TestCase):
 
 
 class TestPriceSheetMinAcrossVariants(unittest.TestCase):
-    """Правило-класс: у модели с НЕСКОЛЬКИМИ живыми вариантами в парке (старый/новый юнит) каждая
-    колонка сетки (сутки/неделя/месяц-«от», депозит) = МИНИМУМ по вариантам через ЖИВОЙ quote.
-    Живой провал: XMAX показывал «от 9900» (кап нового 2023+), хотя в парке 3 старых XMAX под кап 8900
-    → завышали. Bridge замокан getter'ом (реальный Календарь НЕ трогаем), 8900 в коде НЕ хардкодим —
-    цифра приходит ТОЛЬКО из мок-quote старого юнита."""
+    """Правило-класс: минимум-по-вариантам для НЕ-XMAX-моделей (несколько живых юнитов одной модели →
+    каждая колонка сетки = МИНИМУМ по вариантам через ЖИВОЙ quote). XMAX — ИСКЛЮЧЕНИЕ (родитель 243,
+    шаг 1/7): два поколения = ДВА продукта отдельными строками («XMAX 300» старое / «XMAX 300 New Gen»
+    новое 2023+), минимум-по-вариантам для XMAX СНЯТ (иначе наценка нового поколения пропала бы —
+    старый провал показывал единый «от 8900»). Bridge замокан getter'ом (Календарь НЕ трогаем),
+    цифры приходят ТОЛЬКО из мок-quote своих юнитов, в коде НЕ хардкодятся."""
 
     # 3 живых СТАРЫХ XMAX (2020-2022, дешевле) + 1 НОВЫЙ (2023+, дороже) + одиночная NMAX для регресса.
     OLD_XMAX = ["XMAX 300CC GREY PHUKET 4246", "XMAX 300CC BLUE PHUKET 4247",
@@ -1557,18 +1558,21 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
                     "cap_price": cp, "text": f"{bike} {days}d {total}"}}
         return fake
 
-    def test_xmax_grid_is_min_over_old_and_new(self):
-        # ГОЛДЕН: живы старые XMAX (8900) рядом с новым (9900) → в сетке МИНИМУМ по каждой колонке.
+    def test_xmax_grid_splits_old_and_new_gen(self):
+        # ГОЛДЕН (родитель 243, шаг 1/7): живы старые XMAX (790/8900/деп5000) рядом с новым
+        # (939/9900/деп7000) → в сетке ДВЕ отдельные строки со СВОИМИ цифрами (минимум НЕ схлопывает).
         rows = suggest.price_sheet("2026-07-15", getter=self._getter())
         block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
         self.assertIn("XMAX 300\n• Сутки: 790 ฿\n• Неделя (7 дней): 4700 ฿\n"
-                      "• Месяц: от 8900 ฿\n• Депозит: 5000 ฿ / паспорт", block)
-        self.assertNotIn("от 9900", block)     # кап нового юнита НЕ протекает
-        self.assertNotIn("939 ฿", block)       # суточный нового НЕ протекает
-        self.assertNotIn("7000 ฿", block)      # депозит нового НЕ протекает
+                      "• Месяц: от 8900 ฿\n• Депозит: 5000 ฿ / паспорт", block)       # старое поколение
+        self.assertIn("XMAX 300 New Gen\n• Сутки: 939 ฿\n• Неделя (7 дней): 5600 ฿\n"
+                      "• Месяц: от 9900 ฿\n• Депозит: 7000 ฿ / паспорт", block)       # новое поколение
+        # обе строки живы и цены РАЗНЫЕ (не единый минимум)
+        self.assertIn("790 ฿", block)
+        self.assertIn("939 ฿", block)
 
-    def test_live_phrase_grid_shows_xmax_from_8900(self):
-        # Живой прогон «какие модели и цены» (дословная фраза клиента) → в сетке XMAX от 8900.
+    def test_live_phrase_grid_shows_both_xmax_gens(self):
+        # Живой прогон «какие модели и цены» (дословная фраза клиента) → в сетке ОБА поколения XMAX.
         phrase = ("Какие марки и модели байков вы предлагаете? Какие у вас цены на аренду? "
                   "(Стоимость за день, неделю и месяц для разных моделей.) Требуется ли депозит?")
         hints = suggest.extract_booking_hints(f"[клиент]: {phrase}", today=datetime.date(2026, 7, 11))
@@ -1576,9 +1580,10 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
         note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter(),
                                           today=datetime.date(2026, 7, 11))
         self.assertIn("ПРАЙС ПО ПАРКУ", note)
-        self.assertIn("XMAX 300\n• Сутки: 790 ฿", note)
+        self.assertIn("XMAX 300\n• Сутки: 790 ฿", note)             # старое поколение
         self.assertIn("• Месяц: от 8900 ฿", note)
-        self.assertNotIn("от 9900", note)
+        self.assertIn("XMAX 300 New Gen\n• Сутки: 939 ฿", note)     # новое поколение
+        self.assertIn("• Месяц: от 9900 ฿", note)
 
     def test_single_variant_model_unchanged(self):
         # РЕГРЕСС: одиночная модель (один вариант в парке) — цифры БЕЗ изменений (мин по одному == он сам).
@@ -1586,6 +1591,39 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
         block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
         self.assertIn("NMAX 155\n• Сутки: 450 ฿\n• Неделя (7 дней): 2800 ฿\n"
                       "• Месяц: от 8500 ฿\n• Депозит: 5000 ฿ / паспорт", block)
+
+    def test_pointwise_xmax_shows_both_gens(self):
+        # ГОЛДЕН (родитель 243, шаг 1/7): точечный quote по XMAX на неделю → ОБЕ строки-поколения
+        # со СВОИМИ цифрами (старое 4700 vs New Gen 5600), а не одна цена-минимум. Реальные фразы
+        # клиента (правило-класс: golden-тест детекта = дословное сообщение, не идеализированное).
+        for phrase in ("сколько стоит xmax на неделю с 15 июля?",
+                       "аренда xmax 15.07-22.07 сколько?",
+                       "цена xmax на неделю с 15 июля",
+                       "почём xmax на неделю с 15 июля?",
+                       "xmax на неделю с 15 июля какая цена?"):
+            hints = suggest.extract_booking_hints(f"[клиент]: {phrase}",
+                                                  today=datetime.date(2026, 7, 11))
+            note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter(),
+                                              today=datetime.date(2026, 7, 11))
+            self.assertIn("- XMAX 300: ", note, phrase)             # строка старого поколения
+            self.assertIn("- XMAX 300 New Gen: ", note, phrase)     # строка нового поколения
+            self.assertIn("7d 4700", note, phrase)                  # неделя старого — своя цифра
+            self.assertIn("7d 5600", note, phrase)                  # неделя нового — РАЗНАЯ цифра
+            # старую строку квотировал ТОЛЬКО старый юнит, новую — ТОЛЬКО новый (поколения не смешаны)
+            old_line = next(l for l in note.splitlines() if l.startswith("- XMAX 300:"))
+            new_line = next(l for l in note.splitlines() if l.startswith("- XMAX 300 New Gen:"))
+            self.assertNotIn("NEW", old_line.upper())
+            self.assertIn("NEW", new_line.upper())
+
+    def test_pointwise_non_xmax_single_line_unchanged(self):
+        # РЕГРЕСС: точечный quote по НЕ-XMAX (NMAX) — одна строка _wrap_single, без разворота вариантов.
+        hints = suggest.extract_booking_hints("[клиент]: сколько стоит nmax на неделю с 15 июля?",
+                                              today=datetime.date(2026, 7, 11))
+        note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+        self.assertIn("ЦЕНА из Календаря", note)          # одиночная модель → _wrap_single
+        self.assertNotIn("- NMAX", note)                  # НЕ развёрнута в bullets
+        self.assertNotIn("New Gen", note)                 # у NMAX поколений нет
 
     def test_min_helpers_pick_cheapest_column_independently(self):
         # Юнит на редьюсер: сутки/неделя — по сумме, месяц — по кап-«от», депозит — общий минимум.
@@ -1655,22 +1693,26 @@ class TestPriceSheetManyVariantsRobust(unittest.TestCase):
         return fake
 
     def test_broken_unit_skipped_grid_survives(self):
-        # ГОЛДЕН класса: один старый XMAX бит (quote кидает) → сетка ЦЕЛА, минимум всё ещё 8900
-        # (живы 2 других старых), остальные модели не задеты. Битый юнит никого не валит.
+        # ГОЛДЕН класса: один старый XMAX бит (quote кидает) → строка старого поколения ЦЕЛА
+        # (живы 2 других старых, 790/8900), New Gen тоже жив (939/9900), соседи не задеты.
         rows = suggest.price_sheet("2026-07-15", getter=self._getter(broken=("OLD-1",)))
         block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
         self.assertIn("XMAX 300\n• Сутки: 790 ฿\n• Неделя (7 дней): 4700 ฿\n"
                       "• Месяц: от 8900 ฿\n• Депозит: 5000 ฿ / паспорт", block)
+        self.assertIn("XMAX 300 New Gen\n• Сутки: 939 ฿", block)
         self.assertIn("ADV 350\n• Сутки: 749 ฿", block)
         self.assertIn("NMAX 155\n• Сутки: 450 ฿", block)
 
-    def test_all_old_units_broken_min_falls_back_to_new(self):
-        # ВСЕ старые XMAX биты → колонки честно из живых НОВЫХ (от 9900) — не пустота и не обвал.
+    def test_all_old_units_broken_only_new_gen_row_survives(self):
+        # ВСЕ старые XMAX биты → строка старого поколения выпадает (нет живых юнитов), остаётся
+        # только «XMAX 300 New Gen» (939/9900) — честно из живых, не пустота и не обвал.
         rows = suggest.price_sheet("2026-07-15",
                                    getter=self._getter(broken=("OLD-0", "OLD-1", "OLD-2")))
         block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
-        self.assertIn("XMAX 300\n• Сутки: 939 ฿", block)
+        self.assertIn("XMAX 300 New Gen\n• Сутки: 939 ฿", block)
         self.assertIn("• Месяц: от 9900 ฿", block)
+        self.assertNotIn("XMAX 300\n• Сутки: 790", block)  # старое поколение выпало (все юниты биты)
+        self.assertNotIn("XMAX 300\n• Сутки: 939", block)  # New Gen НЕ подменяет строку старого
         self.assertIn("NMAX 155\n• Сутки: 450 ฿", block)   # соседи не задеты
 
     def test_many_variants_build_is_parallel_fast(self):
