@@ -414,22 +414,81 @@ def parse_approval(reply_text: str):
 
 # ------------------------------- транскрипт ----------------------------------
 
+async def _resolve_replies(client, entity, msgs):
+    """§243/5: у каждого сообщения-reply подтянуть РЕПЛАЕННОЕ сообщение (цель) → attr
+    m._reply_target. Цель ищем сперва в уже выбранном окне (по id), иначе дозапрашиваем по id
+    (клиент отвечает reply'ем на сообщение из СТАРОЙ переписки — оно вне окна). Read-only,
+    fail-safe: любой сбой дозапроса → цель None (черновик от этого не падает). msgs — как
+    отдал iter_messages."""
+    by_id = {getattr(m, "id", None): m for m in msgs if getattr(m, "id", None) is not None}
+    need = {}  # reply_to_id -> [сообщения-reply, ссылающиеся на него]
+    for m in msgs:
+        rid = getattr(m, "reply_to_msg_id", None)
+        if not rid:
+            continue
+        target = by_id.get(rid)
+        if target is not None:
+            m._reply_target = target
+        else:
+            need.setdefault(rid, []).append(m)
+    if not need:
+        return msgs
+    try:                                   # дозапрос целей вне окна (в т.ч. из старой переписки)
+        fetched = await client.get_messages(entity, ids=list(need.keys()))
+    except Exception as e:
+        log.info(f"SUGGEST: дозапрос reply-целей не удался ({type(e).__name__}) — без контекста reply")
+        return msgs
+    for f in (fetched or []):
+        if f is None:
+            continue
+        for m in need.get(getattr(f, "id", None), []):
+            m._reply_target = f
+    return msgs
+
+
 async def _fetch_messages(client, entity, limit: int = MAX_MESSAGES):
-    """Выбрать последние сообщения диалога (newest-first, как отдаёт iter_messages)."""
+    """Выбрать последние сообщения диалога (newest-first, как отдаёт iter_messages) и подтянуть
+    цели reply-сообщений (см. _resolve_replies)."""
     msgs = []
     async for m in client.iter_messages(entity, limit=limit):
         msgs.append(m)
+    await _resolve_replies(client, entity, msgs)
     return msgs
+
+
+def _reply_target_snippet(rt, me_id: int):
+    """§243/5: краткое СОДЕРЖИМОЕ реплаенного сообщения для контекста черновика: автор +
+    гео-ссылка/адрес/телефон/текст и/или пометка о фото (на этапе брони — обычно паспорт).
+    Пусто → None (нечего добавлять)."""
+    if rt is None:
+        return None
+    who = "менеджер" if (getattr(rt, "sender_id", None) == me_id) else "клиент"
+    parts = []
+    if getattr(rt, "photo", None) is not None:
+        parts.append("фото (вероятно паспорт)")
+    txt = (getattr(rt, "message", None) or "").strip()
+    if txt:
+        parts.append(txt.replace("\n", " ⏎ "))
+    elif not parts and getattr(rt, "media", None) is not None:
+        parts.append("вложение")
+    if not parts:
+        return None
+    return f"{who}: " + " · ".join(parts)
 
 
 def transcript_from(msgs, me_id: int) -> str:
     """Текст диалога '[менеджер]/[клиент]: ...' в хронологическом порядке (old→new).
-    Ручные ответы менеджера видны (они отправлены с этого же аккаунта, sender_id==me)."""
+    Ручные ответы менеджера видны (они отправлены с этого же аккаунта, sender_id==me).
+    §243/5: если сообщение — reply, дописываем содержимое реплаенного (гео/фото-паспорт/
+    телефон/текст), чтобы «Вот» реплаем на данные из старой брони попало в контекст черновика."""
     lines = []
     for m in reversed(msgs):
         who = "менеджер" if (getattr(m, "sender_id", None) == me_id) else "клиент"
         body = (getattr(m, "message", None) or "").strip() or "[медиа/без текста]"
         body = body.replace("\n", " ⏎ ")
+        snippet = _reply_target_snippet(getattr(m, "_reply_target", None), me_id)
+        if snippet:
+            body = f"{body} ↩[в ответ на — {snippet}]"
         lines.append(f"[{who}]: {body}")
     return "\n".join(lines)
 

@@ -633,6 +633,93 @@ class TestGreeting(unittest.TestCase):
         self.assertTrue(suggest.first_contact_from(only, me, hours=18, now=lambda: now))
 
 
+class _ReplyMsg:
+    """Сообщение с полями, которые смотрит reply-логика (id/reply_to_msg_id/photo/media)."""
+    def __init__(self, mid, sender_id, message="", reply_to=None, photo=False,
+                 media=False, date=None):
+        self.id = mid
+        self.sender_id = sender_id
+        self.message = message
+        self.reply_to_msg_id = reply_to
+        self.photo = object() if photo else None
+        self.media = object() if media else None
+        self.date = date
+
+
+class _ReplyClient:
+    """Мок клиента для _resolve_replies: get_messages(ids=) отдаёт цели из store (переписка
+    вне окна). fail=True → get_messages падает (проверка fail-safe)."""
+    def __init__(self, store, fail=False):
+        self.store = store
+        self.fail = fail
+
+    async def get_messages(self, entity, ids=None):
+        if self.fail:
+            raise RuntimeError("boom")
+        return [self.store.get(i) for i in (ids or [])]
+
+
+class TestReplyContext(unittest.TestCase):
+    """Голден 12.07: клиент шлёт «Вот» реплаями на данные из СТАРОЙ брони (Maps-ссылка, фото
+    паспорта, телефон) — всё извлекается и попадает в контекст черновика."""
+
+    MAPS = "https://maps.app.goo.gl/abc123XYZ"
+    PHONE = "+66 81 234 5678"
+    ME = 42
+
+    def _window_and_store(self):
+        # старая переписка (ВНЕ окна выборки) — цели reply клиента (id 999):
+        store = {
+            10: _ReplyMsg(10, 999, message=f"Моя вилла: {self.MAPS}"),
+            11: _ReplyMsg(11, 999, photo=True),                # фото паспорта
+            12: _ReplyMsg(12, 999, message=f"Мой номер {self.PHONE}"),
+        }
+        # окно (newest-first, как iter_messages): три «Вот» реплаями на 10/11/12 + наш вопрос
+        window = [
+            _ReplyMsg(23, 999, message="Вот", reply_to=12),
+            _ReplyMsg(22, 999, message="Вот", reply_to=11),
+            _ReplyMsg(21, 999, message="Вот", reply_to=10),
+            _ReplyMsg(20, self.ME, message="Скиньте гео, паспорт и телефон"),
+        ]
+        return window, store
+
+    def test_reply_pulls_geo_photo_phone_from_old_booking(self):
+        window, store = self._window_and_store()
+        asyncio.run(suggest._resolve_replies(_ReplyClient(store), None, window))
+        tr = suggest.transcript_from(window, self.ME)
+        self.assertIn(self.MAPS, tr)                 # гео-ссылка извлечена
+        self.assertIn(self.PHONE, tr)                # телефон извлечён
+        self.assertIn("паспорт", tr.lower())         # фото → пометка про паспорт
+        # всё привязано к трём клиентским строкам-«Вот» (не потеряно в медиа-заглушке):
+        embedded = [ln for ln in tr.splitlines()
+                    if ln.startswith("[клиент]:") and "↩[в ответ на" in ln]
+        self.assertEqual(len(embedded), 3)
+
+    def test_reply_target_within_window(self):
+        # цель reply лежит В окне — дозапрос не нужен, контент всё равно подтянут
+        window = [
+            _ReplyMsg(31, 999, message="Вот", reply_to=30),
+            _ReplyMsg(30, 999, message=f"адрес {self.MAPS}"),
+        ]
+        asyncio.run(suggest._resolve_replies(_ReplyClient({}, fail=True), None, window))
+        tr = suggest.transcript_from(window, self.ME)
+        self.assertIn(self.MAPS, tr)
+
+    def test_reply_resolve_failsafe(self):
+        # дозапрос целей падает → без контекста reply, но черновик не рушится
+        window, store = self._window_and_store()
+        asyncio.run(suggest._resolve_replies(_ReplyClient(store, fail=True), None, window))
+        tr = suggest.transcript_from(window, self.ME)   # не бросает
+        self.assertNotIn("↩[в ответ на", tr)
+        self.assertIn("Вот", tr)
+
+    def test_non_reply_unaffected(self):
+        window = [_ReplyMsg(41, 999, message="Привет, сколько стоит NMAX?")]
+        asyncio.run(suggest._resolve_replies(_ReplyClient({}), None, window))
+        tr = suggest.transcript_from(window, self.ME)
+        self.assertEqual(tr, "[клиент]: Привет, сколько стоит NMAX?")
+
+
 class _ModBase(unittest.TestCase):
     """Общий каркас: SUGGEST включён, tmp-хранилища, восстановление глобалей."""
 
