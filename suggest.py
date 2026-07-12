@@ -1986,6 +1986,190 @@ def _strip_service_prefix(text: str) -> str:
     return t
 
 
+# --- ПОСТ-ЧЕК ЧЕРНОВИКА: утверждения ВНЕ белого списка → «уточню»-форма ----------
+# Шаг 4/7 (родитель #243). Промпт УЖЕ запрещает утверждать цвет/наличие/цену вне данных
+# (APPROVAL_WHITELIST_RULE), но LLM 12.07 всё равно выдавал живые провалы: «выбора по цвету, к
+# сожалению, нет», «светлого ADV 350 сейчас нет — есть чёрный», «9000 бат за 10 дней». Пост-чек —
+# детерминированная СТРАХОВКА поверх промпта: сканируем ГОТОВЫЙ черновик по сегментам, клеймим
+# ЯВНЫЕ нарушения кодом (цвет — любое утверждение о цвете; наличие — «сейчас нет / занят / свободен
+# на …»; цена — ИТОГ «<N> бат за <M> дней», которого нет в белом источнике цен), спорные («есть
+# ADV 350» — парк-перечень ИЛИ наличие-на-даты?) отдаём LLM-тайбрейку. Нарушение → сегмент
+# переписываем в «Уточню у команды и вернусь», а в КОНЦЕ добавляем пометку модератору
+# «[уточнить: …]» (её _strip_service_prefix не режет — маркер «[внутренн», не «[уточнить»).
+# FAIL-SAFE: нарушений нет → возвращаем ВХОД байт-в-байт; LLM-тайбрейк недоступен/спорно → НЕ трогаем.
+
+# Цвет: клиенту УТВЕРЖДАТЬ нельзя вообще (не в белом списке) → любой цвет-токен = нарушение.
+# \b перед основами, чтобы «прекрасный» (⊃ «красн») и т.п. не ловились.
+_PC_COLOR_RE = re.compile(
+    r"\bцвет\w*|\bcolou?rs?\b|"
+    r"\bч[ёе]рн(?:ый|ого|ому|ым|ом|ая|ой|ую|ое|ые|ых|еньк\w*)|"
+    r"\bбел(?:ый|ого|ая|ое|ые|ым|ой|еньк\w*)|\bсветл\w*|\bтёмн\w*|\bтемн\w*|"
+    r"\bкрасн(?:ый|ого|ому|ым|ом|ая|ой|ую|ое|ые|ых|еньк\w*)|\bсин(?:ий|его|яя|юю|ее|им\w*|их)|"
+    r"\bголуб(?:ой|ого|ому|ым|ом|ая|ой|ую|ое|ые|ых)|\bзелён\w*|\bзелен(?:ый|ого|ому|ым|ом|ая|ой|ую|ое|ые|ых)|"
+    r"\bсеребр\w*|\bсер(?:ый|ого|ая|ое|ые|ым|ой)|\bзолот\w*|\bоранж\w*|\bжёлт\w*|\bжелт\w*|"
+    r"\bкорич\w*|\bфиолет\w*|\bрозов\w*|\bбордов\w*|"
+    r"\bblack\b|\bwhite\b|\bred\b|\bblue\b|\bgreen\b|\bsilver\b|\bgold(?:en)?\b|\borange\b|\byellow\b|\bbrown\b",
+    re.I)
+
+# Наличие КОНКРЕТНОГО байка на даты/сейчас — вне белого списка. Ловим явные состояния склада
+# (не «есть <модель>» вообще — это парк-перечень, он РАЗРЕШЕН; такой спорный случай → LLM-тайбрейк).
+_PC_AVAIL_RE = re.compile(
+    r"сейчас\s+нет|уже\s+нет|пока\s+нет|нет\s+в\s+нали\w+|не\s+в\s+нали\w+|нету\b|"
+    r"не\s+остал\w+|разобрал\w*|\bзанят\w*|недоступ\w*|нет\s+свободн\w*|осталось\s+\d|"
+    r"свободен\s+на\b|свободна\s+на\b|доступен\s+на\b|доступна\s+на\b|в\s+наличии\s+на\b|"
+    r"есть\s+в\s+нали\w+|в\s+наличии\s+есть|"
+    r"sold\s*out|not\s+available|unavailable|out\s+of\s+stock|already\s+booked|in\s+stock",
+    re.I)
+
+# Цена клиенту — ТОЛЬКО дословно из белого источника (quote/сетка). Клеймим ИТОГ за период
+# «<N> бат за <M> дней/недель/месяц» (именно это врал бот 12.07: «9000 бат за 10 дней») — суточный
+# «449฿/день» из котировки НЕ трогаем (это не итог-за-период). Число сверяем с белым источником.
+_PC_CUR = r"(?:бат\w*|฿|baht|thb|тыс\w*|k\b)"
+_PC_PERIOD = r"за\s+\d{1,3}\s*(?:дн\w*|день|сут\w*|недел\w*|нед\b|мес\w*|month?s?|weeks?|days?)"
+_PC_PRICE_TOTAL_RE = re.compile(
+    r"(\d[\d\s.,]*\d|\d)\s*" + _PC_CUR + r"[^.\n]{0,40}?" + _PC_PERIOD +
+    r"|" + _PC_PERIOD + r"[^.\n]{0,40}?(\d[\d\s.,]*\d|\d)\s*" + _PC_CUR,
+    re.I)
+
+# Разбиение на сегменты С СОХРАНЕНИЕМ разделителей (точный round-trip): границы предложений и
+# переводы строк. Тире «—» границей НЕ считаем — «светлого ADV 350 сейчас нет — есть чёрный»
+# должно остаться ОДНИМ сегментом и клеймиться целиком.
+_PC_SPLIT_RE = re.compile(r'([.!?…]+["»)\]]?\s+|\n+)')
+
+
+def _pc_num(s):
+    """Число из строки-денежного-токена → int (снимаем пробелы/разделители тысяч) или None."""
+    d = re.sub(r"\D", "", str(s or ""))
+    return int(d) if d else None
+
+
+def _pc_wl_price_numbers(pricing_note: str):
+    """Белый источник цен — множество чисел из блока ЦЕНА/ПРАЙС (quote/сетка). Итог в черновике,
+    совпавший с этим множеством, считаем законным (пришёл из Календаря). Пусто → пустое множество
+    (тогда ЛЮБОЙ итог-за-период = утверждение вне данных)."""
+    return {v for tok in re.findall(r"\d[\d.,\s]*\d|\d", pricing_note or "")
+            for v in (_pc_num(tok),) if v is not None}
+
+
+def _pc_segments(text: str):
+    """Список [сегмент, разделитель] с точным round-trip: ''.join(s+p) == text."""
+    parts = _PC_SPLIT_RE.split(text or "")
+    return [[parts[i], parts[i + 1] if i + 1 < len(parts) else ""] for i in range(0, len(parts), 2)]
+
+
+def _pc_is_ask_form(low: str) -> bool:
+    """Сегмент уже в «уточню»-форме / это пометка модератору → повторно не клеймим."""
+    return ("уточн" in low or "[уточнить" in low
+            or "check with the team" in low or "get back to you" in low)
+
+
+def _pc_maybe(low: str, model) -> bool:
+    """Спорный случай для LLM-тайбрейка: назван КОНКРЕТНЫЙ байк + слово владения/готовности, но
+    без явного склад-состояния (детерминированные RE выше не сработали). «Есть ADV 350» — это
+    парк-перечень (разрешено) ИЛИ наличие-на-даты (запрещено)? Решает LLM."""
+    return bool(model) and bool(
+        re.search(r"\bесть\b|имеется|доступ\w*|свободн\w*|в\s+наличии|привез\w*|\bготов\w*", low))
+
+
+def _pc_llm_tiebreak(seg: str, transcript, call_llm):
+    """LLM-тайбрейк спорного сегмента. → 'color'|'avail'|'price' (нарушение) или None (чисто/сбой).
+    FAIL-SAFE: любая ошибка/непарс → None (не переписываем на сомнении)."""
+    sys = (
+        "Ты контролёр черновика менеджера аренды. Менеджеру НЕЛЬЗЯ УТВЕРЖДАТЬ клиенту как факт: "
+        "(1) цвет байка; (2) наличие КОНКРЕТНОГО байка на даты/сейчас; (3) точную цену/итог вне "
+        "прайса. РАЗРЕШЕНО: перечень моделей парка, депозит-правило, минимальные сроки, цены "
+        "дословно из прайса. Верни СТРОГО JSON без пояснений: "
+        "{\"violation\": true|false, \"kind\": \"color|avail|price|none\"}.")
+    try:
+        raw = call_llm(sys, "Фраза менеджера: " + (seg or ""))
+        m = re.search(r"\{.*\}", raw or "", re.S)
+        data = json.loads(m.group(0)) if m else {}
+        if data.get("violation"):
+            k = str(data.get("kind", "")).lower()
+            return k if k in ("color", "avail", "price") else "avail"
+    except Exception:
+        return None
+    return None
+
+
+def _pc_classify(seg: str, allowed, call_llm=None, transcript=None):
+    """Нарушения в сегменте → список (kind, mention). Пусто = сегмент чист.
+    Детерминированно: цвет/наличие/итог-цена-вне-данных; спорное → LLM-тайбрейк (если дан call_llm)."""
+    low = (seg or "").lower()
+    if not low.strip() or _pc_is_ask_form(low):
+        return []
+    models = _detect_models(low)
+    model = models[0] if models else None
+    found = []
+    if _PC_COLOR_RE.search(seg):
+        found.append(("color", model))
+    if _PC_AVAIL_RE.search(low):
+        found.append(("avail", model))
+    m = _PC_PRICE_TOTAL_RE.search(seg)
+    if m:
+        val = _pc_num(m.group(1) or m.group(2))
+        if val is not None and val not in allowed:
+            found.append(("price", str(val)))
+    if found:
+        return found
+    if call_llm and _pc_maybe(low, model):
+        k = _pc_llm_tiebreak(seg, transcript, call_llm)
+        if k:
+            return [(k, model if k != "price" else None)]
+    return []
+
+
+def _pc_manager_note(issues, en: bool) -> str:
+    """Пометка модератору «[уточнить: …]» из накопленных нарушений (для клиента её не видно —
+    _strip_service_prefix не режет, а модератор уточнит и правит перед одобрением)."""
+    label = {"color": "цвет" if not en else "colour",
+             "avail": "наличие" if not en else "availability",
+             "price": "цена" if not en else "price"}
+    parts = []
+    for kind in ("color", "avail", "price"):
+        ms = [m for k, m in issues if k == kind]
+        if not ms:
+            continue
+        uniq = []
+        for m in ms:
+            if m and m not in uniq:
+                uniq.append(m)
+        parts.append(label[kind] + ((" " + " ".join(uniq)) if uniq else ""))
+    return ("[уточнить: " + "; ".join(parts) + "]") if parts else ""
+
+
+def postcheck_draft(draft: str, lang: str = "ru", pricing_note: str = "",
+                    call_llm=None, transcript: str = None) -> str:
+    """Пост-чек ГОТОВОГО черновика: утверждения о цвете/наличии/цене ВНЕ белого списка → «уточню».
+    Нарушений нет → вход возвращается БАЙТ-В-БАЙТ (fail-safe). Сегмент-нарушение переписываем в
+    «Уточню у команды и вернусь», в конце — пометка модератору «[уточнить: …]»."""
+    text = draft or ""
+    if not text.strip():
+        return draft
+    allowed = _pc_wl_price_numbers(pricing_note)
+    en = (lang == "en")
+    ask = "Let me check with the team and get back to you." if en else "Уточню у команды и вернусь."
+    issues, out, changed, prev_ask = [], [], False, False
+    for seg, sep in _pc_segments(text):
+        hits = _pc_classify(seg, allowed, call_llm=call_llm, transcript=transcript)
+        if not hits:
+            out.append([seg, sep])
+            prev_ask = False
+            continue
+        changed = True
+        issues.extend(hits)
+        if prev_ask:                     # схлопываем подряд идущие «уточню» в одно
+            continue
+        newsep = "\n" if "\n" in sep else (" " if sep else "")
+        out.append([ask, newsep])
+        prev_ask = True
+    if not changed:
+        return draft
+    body = "".join(s + p for s, p in out).strip()
+    note = _pc_manager_note(issues, en)
+    return (body + "\n" + note) if note else body
+
+
 def generate_draft(transcript: str, lang: str, faq: str,
                    is_first_contact: bool = False, pricing_note: str = "", call_llm=None,
                    park_models=None, playbook: str = "") -> str:
@@ -1997,6 +2181,9 @@ def generate_draft(transcript: str, lang: str, faq: str,
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
                                 park_models=park_models, playbook=playbook)
     out = _strip_service_prefix(call_llm(system, transcript))
+    # Пост-чек ДО сборки сетки: сканируем LLM-текст (intro/outro), дословный прайс-блок КОДА не
+    # трогаем. Утверждения цвет/наличие/цена вне белого списка → «уточню»-форма + пометка модератору.
+    out = postcheck_draft(out, lang, pricing_note=pricing_note, call_llm=call_llm, transcript=transcript)
     # Сетка = неприкосновенный блок: финал собирает КОД (intro + render ДОСЛОВНО + outro).
     block = _sheet_block_from_note(pricing_note)
     if block is not None:
@@ -2014,6 +2201,8 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
                                 directive=directive, park_models=park_models, playbook=playbook)
     out = _strip_service_prefix(call_llm(system, transcript))
+    # Тот же пост-чек, что в generate_draft (до сборки сетки): цвет/наличие/цена вне данных → «уточню».
+    out = postcheck_draft(out, lang, pricing_note=pricing_note, call_llm=call_llm, transcript=transcript)
     # Тот же класс, что в generate_draft: сетку в финал вставляет КОД, не LLM.
     block = _sheet_block_from_note(pricing_note)
     if block is not None:

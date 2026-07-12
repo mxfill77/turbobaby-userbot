@@ -1191,6 +1191,92 @@ class TestSalesPressureAndSafety(unittest.TestCase):
         self.assertEqual(suggest._strip_service_prefix(draft), draft)
 
 
+class TestDraftPostcheck(unittest.TestCase):
+    """Пост-чек черновика (шаг 4/7 #243): утверждения о цвете/наличии/цене ВНЕ белого списка
+    переписываются в «уточню»-форму + пометка модератору. Голдены — ДОСЛОВНЫЕ живые провалы 12.07
+    (правило-класс CLAUDE.md: тест детекта = реальная фраза клиента/бота, не идеализация)."""
+
+    # три дословных провала 12.07, каждый ДОЛЖЕН блокироваться пост-чеком
+    G_COLOR = "выбора по цвету, к сожалению, нет"
+    G_AVAIL_COLOR = "светлого ADV 350 сейчас нет — есть чёрный"
+    G_PRICE = "9000 бат за 10 дней"
+
+    def _client_part(self, out):
+        """Часть, видимая клиенту (до пометки модератору «[уточнить: …]»)."""
+        return out.split("[уточнить", 1)[0]
+
+    def test_golden_color_blocked(self):
+        out = suggest.postcheck_draft(self.G_COLOR, "ru", pricing_note="")
+        self.assertNotEqual(out, self.G_COLOR)                       # переписан
+        self.assertIn("уточню у команды", out.lower())               # деградация вместо утверждения
+        self.assertNotIn("цвет", self._client_part(out).lower())     # цвет клиенту не утверждаем
+        self.assertIn("[уточнить: цвет", out)                        # пометка модератору
+
+    def test_golden_avail_color_blocked(self):
+        out = suggest.postcheck_draft(self.G_AVAIL_COLOR, "ru", pricing_note="")
+        self.assertNotEqual(out, self.G_AVAIL_COLOR)
+        self.assertIn("уточню у команды", out.lower())
+        cp = self._client_part(out).lower()
+        self.assertNotIn("чёрн", cp)                                 # цвет не утверждаем
+        self.assertNotIn("сейчас нет", cp)                           # наличие не утверждаем
+        self.assertIn("ADV350", out)                                 # модель в пометке модератору
+
+    def test_golden_price_total_blocked(self):
+        # 9000 нет в белом источнике цен (pricing_note без него) → итог-за-период клеймится
+        note = "ЦЕНА из Календаря: ADV 350 — 998฿/день."
+        out = suggest.postcheck_draft(self.G_PRICE, "ru", pricing_note=note)
+        self.assertNotEqual(out, self.G_PRICE)
+        self.assertIn("уточню у команды", out.lower())
+        self.assertNotIn("9000", self._client_part(out))             # выдуманный итог клиенту не уходит
+        self.assertIn("[уточнить: цена 9000]", out)
+
+    def test_price_from_whitelist_kept(self):
+        # тот же итог, но ЧИСЛО есть в белом источнике (пришло из Календаря) → НЕ трогаем
+        note = "ЦЕНА из Календаря: ADV 350 — за 10 дней 9000฿."
+        text = "ADV 350 — 9000 бат за 10 дней."
+        self.assertEqual(suggest.postcheck_draft(text, "ru", pricing_note=note), text)
+
+    def test_per_day_price_not_flagged(self):
+        # суточный тариф из котировки (не итог-за-период) пост-чек не переписывает
+        text = "NMAX на 7 дней — 449฿/день, депозит 3000฿."
+        self.assertEqual(suggest.postcheck_draft(text, "ru", pricing_note=""), text)
+
+    def test_clean_draft_byte_for_byte(self):
+        # нет нарушений → вход возвращается БАЙТ-В-БАЙТ (fail-safe, регресс не трогаем)
+        text = "Здравствуйте! Подскажите даты аренды — подберём вариант."
+        self.assertIs(suggest.postcheck_draft(text, "ru", pricing_note=""), text)
+
+    def test_park_enumeration_allowed(self):
+        # перечень моделей парка «есть NMAX и ADV 350» — в белом списке, не клеймим
+        text = "У нас есть NMAX 155 и ADV 350."
+        self.assertEqual(suggest.postcheck_draft(text, "ru", pricing_note=""), text)
+
+    def test_surrounding_text_preserved(self):
+        # нарушение в середине — соседние законные предложения целы, переписан только виновный сегмент
+        text = "Здравствуйте! Светлого ADV 350 сейчас нет. Чем ещё помочь?"
+        out = suggest.postcheck_draft(text, "ru", pricing_note="")
+        self.assertTrue(out.startswith("Здравствуйте!"))
+        self.assertIn("Чем ещё помочь?", out)
+        self.assertIn("Уточню у команды и вернусь.", out)
+        self.assertNotIn("Светлого", self._client_part(out))
+
+    def test_llm_tiebreak_flags_disputed(self):
+        # спорный «ADV 350 будет к пятнице» (готовность-на-дату, склад-RE молчит) → LLM-тайбрейк
+        def judge(_s, _u):
+            return '{"violation": true, "kind": "avail"}'
+        text = "ADV 350 точно готов будет к пятнице."
+        out = suggest.postcheck_draft(text, "ru", pricing_note="", call_llm=judge)
+        self.assertIn("уточню у команды", out.lower())
+        self.assertNotIn("пятниц", self._client_part(out).lower())
+
+    def test_llm_tiebreak_clears_disputed(self):
+        # тот же спорный, но LLM говорит «не нарушение» → НЕ трогаем (fail-safe на сомнении)
+        def judge(_s, _u):
+            return '{"violation": false, "kind": "none"}'
+        text = "ADV 350 готов вам помочь с выбором."
+        self.assertEqual(suggest.postcheck_draft(text, "ru", pricing_note="", call_llm=judge), text)
+
+
 class TestPriceSheet(unittest.TestCase):
     """Прайс по всему парку: детект намерения, детерминированный рендер день/7/месяц из ЖИВОГО
     формата ячеек Bridge, капы в месячной колонке, allowlist-фильтр (CLICK/не-в-парке), анти-луп.
