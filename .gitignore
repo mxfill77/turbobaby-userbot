@@ -27,3 +27,7 @@ client_chats.jsonl
 # авто-синк cowork → мозг (runtime-артефакты, не исходники)
 cowork_drop.log
 cowork_drop.offset
+
+# снимок надзора контур-вотчдога (runtime, пишет демон → читает status pc_agent)
+pc_orchestrator.client_watch.json
+pc_orchestrator.client_watch.json.tmp

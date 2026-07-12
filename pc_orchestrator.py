@@ -97,6 +97,7 @@ _CLAUDE_BASE = os.path.join(os.getenv("APPDATA") or os.path.join(os.path.expandu
 STOP_FLAG = os.path.join(REPO, "pc_orchestrator.stop")
 HEARTBEAT_FILE = os.path.join(REPO, "pc_orchestrator.heartbeat")
 LOCK_FILE = os.path.join(REPO, "pc_orchestrator.lock")       # OS-синглтон демона (разбор #128, часть 4)
+CLIENT_WATCH_FILE = os.path.join(REPO, "pc_orchestrator.client_watch.json")  # снимок НАДЗОРА контур-вотчдога → читает status pc_agent (отдельный процесс, RAM демона ему недоступна)
 SUPERSEDE_ENV = "PC_ORCH_SUPERSEDE_PID"                       # self-update: PID старого, которого сменяем
 LOG_PATH = os.path.join(REPO, "pc_orchestrator.log")
 NA_MARKER = "NEEDS_APPROVAL:"
@@ -2379,6 +2380,30 @@ def _client_watch_step(name, alive, now, state, cooldown, max_deaths):
     return "raise", st
 
 
+def _persist_client_watch(state, now, path=None):
+    """Снимок НАДЗОРА контур-вотчдога на диск — читает status pc_agent (ОТДЕЛЬНЫЙ процесс, RAM
+    демона ему недоступна). Пишем только реальных детей (dict-записи); спец-счётчики (__blind__ —
+    int) пропускаем. Атомарно (tmp+os.replace). Сбой записи НЕ должен ронять тик — тихий warning.
+    Схема: {ts, cooldown, max_deaths, children:{name:{deaths,halted,last_raise}}}."""
+    path = CLIENT_WATCH_FILE if path is None else path
+    children = {}
+    for name, ent in state.items():
+        if not isinstance(ent, dict):
+            continue                                    # __blind__ и прочие спец-счётчики — не дети
+        children[name] = {"deaths": int(ent.get("deaths") or 0),
+                          "halted": bool(ent.get("halted")),
+                          "last_raise": float(ent.get("last_raise") or 0.0)}
+    blob = {"ts": float(now), "cooldown": CLIENT_COOLDOWN_SEC,
+            "max_deaths": CLIENT_MAX_DEATHS, "children": children}
+    try:
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(blob, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        log.warning("контур-вотчдог: снимок надзора не записан (%s): %s", path, e)
+
+
 def client_watchdog_tick(now=None, specs=None, state=None, cooldown=None, max_deaths=None,
                          grace_until=None, log_stale=None, blind_alarm=None):
     """Один прогон контур-вотчдога. → dict name->action (для тестов/лога). Побочки: raiser()+NOTE.
@@ -2480,7 +2505,9 @@ def maybe_client_watchdog(now=None):
     if now - _client_watch_last_run < CLIENT_WATCH_SEC:
         return None
     _client_watch_last_run = now
-    return client_watchdog_tick(now=now)
+    out = client_watchdog_tick(now=now)
+    _persist_client_watch(_client_watch_state, now)   # снимок надзора на диск → status pc_agent видит под вотчдогом/cooldown/halt
+    return out
 
 
 def _woke_from_sleep(now, prev, poll=None, margin=None):

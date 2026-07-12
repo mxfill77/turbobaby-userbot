@@ -34,6 +34,7 @@ userbot_listen.py делается фиксированным CIM-запросо
 
 import os
 import io
+import json
 import time
 import asyncio
 import logging
@@ -57,6 +58,11 @@ USERBOT_LOG = REPO_DIR / "userbot.log"
 AGENT_LOG = REPO_DIR / "pc_agent.log"
 LOGS_DIR = REPO_DIR / "logs"        # ФИКС 1 (#128): сюда пишем stdout/stderr детей (append)
 AGENT_LOCK = REPO_DIR / "pc_agent.lock"  # singleton-гард: не запускать ДВА агента сразу
+# Надзор контур-вотчдога (пишет демон pc_orchestrator в своём процессе; читаем ФАКТ супервизии,
+# а не «кто запустил»). STOP_FLAG — рубильник демона: взведён → надзор намеренно выключен.
+CLIENT_WATCH_FILE = REPO_DIR / "pc_orchestrator.client_watch.json"
+STOP_FLAG = REPO_DIR / "pc_orchestrator.stop"
+WATCH_SNAPSHOT_STALE = int(os.getenv("PC_WATCH_SNAPSHOT_STALE", "900") or "900")  # снимок старше → «демон молчит» (≈3× цикла вотчдога)
 TASK_NAME = "pc_agent"  # ФИКС 3: имя задачи в Планировщике Windows — ДОЛЖНО совпадать с реальным
 
 # --- доступ (жёстко зашит) ---
@@ -365,13 +371,52 @@ def summarize_log():
     return digest, full
 
 
+def _read_watch_snapshot(path=None):
+    """Снимок надзора, записанный демоном (см. pc_orchestrator._persist_client_watch). → dict|None.
+    Любая ошибка (нет файла / битый JSON) → None (демон молчит), НЕ падаем."""
+    path = CLIENT_WATCH_FILE if path is None else path
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _supervision_label(name, snapshot, now, stop_present, stale=WATCH_SNAPSHOT_STALE):
+    """Человекочитаемое СОСТОЯНИЕ НАДЗОРА за <name> (вместо «кто запустил»). Чистая/тестируемая.
+      • рубильник взведён            → надзор намеренно выключен;
+      • снимка нет / протух          → «демон молчит» (надзор недоказуем, не врём «под вотчдогом»);
+      • halted                       → надзор сдался после N смертей подряд — нужен разбор;
+      • недавно поднимали (cooldown) → под вотчдогом, ждём окно до следующего подъёма;
+      • иначе                        → под вотчдогом (жив, надзор активен)."""
+    if stop_present:
+        return "выключен (рубильник pc_orchestrator.stop)"
+    if not snapshot:
+        return "? демон молчит"
+    ts = snapshot.get("ts")
+    if not isinstance(ts, (int, float)) or (now - ts) > stale:
+        return "? демон молчит (снимок протух)"
+    ent = (snapshot.get("children") or {}).get(name)
+    if not isinstance(ent, dict):
+        return "? нет в снимке демона"
+    if ent.get("halted"):
+        return f"ОСТАНОВЛЕН — умер {ent.get('deaths', '?')} раз подряд, нужен разбор"
+    deaths = int(ent.get("deaths") or 0)
+    last_raise = float(ent.get("last_raise") or 0.0)
+    cooldown = float(snapshot.get("cooldown") or 0.0)
+    if deaths > 0 and last_raise > 0 and (now - last_raise) < cooldown:
+        left = int(cooldown - (now - last_raise))
+        return f"под вотчдогом · cooldown (~{left}с до подъёма)"
+    return "под вотчдогом"
+
+
 def status_text():
-    alive, pids, managed = UB.status()
+    alive, pids, _managed = UB.status()
+    sup = _supervision_label("userbot", _read_watch_snapshot(), time.time(), STOP_FLAG.exists())
     head = (
         f"userbot: {'РАБОТАЕТ' if alive else 'не запущен'}"
-        + (f" (PID {', '.join(map(str, pids))}" if pids else "")
-        + (", агентом" if managed else (", вручную" if pids else ""))
-        + (")" if pids else "")
+        + (f" (PID {', '.join(map(str, pids))})" if pids else "")
+        + f" · надзор: {sup}"
     )
     last15 = _read_log_lines()[-15:]
     tail = "\n".join(last15) if last15 else "(userbot.log пуст или отсутствует)"

@@ -1190,6 +1190,51 @@ class TestClientWatchdog(unittest.TestCase):
             o._client_watch_last_run = 0.0
 
 
+class TestClientWatchSnapshot(unittest.TestCase):
+    """Снимок надзора на диск (_persist_client_watch) → его читает status pc_agent (отдельный
+    процесс). Пишем реальных детей, спец-счётчики (__blind__) пропускаем; атомарно; сбой не роняет."""
+
+    def test_persist_writes_children_skips_blind(self):
+        import json
+        st = {"userbot": {"deaths": 2, "halted": False, "last_raise": 1234.0},
+              "moderation_bot": {"deaths": 0, "halted": True, "last_raise": 5.0},
+              "__blind__": 3}                              # спец-счётчик (int) — НЕ ребёнок
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "snap.json")
+            o._persist_client_watch(st, now=9999.0, path=p)
+            blob = json.loads(Path(p).read_text(encoding="utf-8"))
+        self.assertEqual(blob["ts"], 9999.0)
+        self.assertEqual(blob["cooldown"], o.CLIENT_COOLDOWN_SEC)
+        self.assertEqual(blob["max_deaths"], o.CLIENT_MAX_DEATHS)
+        self.assertIn("userbot", blob["children"])
+        self.assertIn("moderation_bot", blob["children"])
+        self.assertNotIn("__blind__", blob["children"])   # int-счётчик отфильтрован
+        self.assertEqual(blob["children"]["userbot"]["deaths"], 2)
+        self.assertTrue(blob["children"]["moderation_bot"]["halted"])
+
+    def test_persist_write_failure_is_silent(self):
+        # путь в несуществующей директории → os.replace бросит; функция НЕ должна падать
+        bad = os.path.join(tempfile.gettempdir(), "no_such_dir_zzz", "snap.json")
+        try:
+            o._persist_client_watch({"userbot": {"deaths": 0}}, now=1.0, path=bad)
+        except Exception as e:
+            self.fail(f"_persist_client_watch не должен пробрасывать сбой записи: {e}")
+
+    def test_maybe_watchdog_persists_after_tick(self):
+        o._client_watch_last_run = 0.0
+        calls = []
+        save_tick, save_persist = o.client_watchdog_tick, o._persist_client_watch
+        try:
+            o.client_watchdog_tick = lambda now=None: {"userbot": "alive"}
+            o._persist_client_watch = lambda state, now, **k: calls.append(now)
+            self.assertIsNotNone(o.maybe_client_watchdog(now=10_000.0))   # прогон → снимок записан
+            self.assertIsNone(o.maybe_client_watchdog(now=10_050.0))      # троттл → ни тика, ни снимка
+            self.assertEqual(calls, [10_000.0])
+        finally:
+            o.client_watchdog_tick, o._persist_client_watch = save_tick, save_persist
+            o._client_watch_last_run = 0.0
+
+
 class TestWatchdogClassFix(unittest.TestCase):
     """Фикс КЛАССА вотчдога (вердикт #171): «не смог проверить» ≠ «мёртв».
     Всё замокано (finder/логи/часы/очередь NOTE) — реальные процессы/CIM/schtasks НЕ трогаем."""
