@@ -878,8 +878,22 @@ def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=Non
 # (поведение байт-в-байт прежнее). Красное НЕ ослаблено: думатель ничего не исполняет
 # (--allowed-tools '' + нейтральный cwd → без settings.json/pretool_guard), тема 829/инбокс 1160 нетронуты.
 STEP_SELFHEAL_TIMEOUT = int(os.getenv("PC_SELFHEAL_TIMEOUT", "180") or "180")   # думатель — короткий ответ
-THINKER_MODEL = os.getenv("THINKER_MODEL", "claude-fable-5").strip() or "claude-fable-5"  # своя голова думателя (НЕ SUGGEST_MODEL); ПОЛНЫЙ id — короткий алиас «fable-5» даёт 404 на claude -p (родитель #194)
-THINKER_FALLBACK = os.getenv("THINKER_FALLBACK", "claude-opus-4-8").strip()     # свой фолбэк думателя; ПОЛНЫЙ id — «opus-4.8» даёт 404 (родитель #194)
+# ФИКС-НАВСЕГДА класса «короткий алиас модели → claude -p HTTP 404 → exit=1» (родитель #194,
+# провал 205–208): живой демон мог УНАСЛЕДОВАТЬ короткий THINKER_MODEL=fable-5 /
+# THINKER_FALLBACK=opus-4.8 в os.environ (ancestor стартовал со старым .env; load_dotenv по
+# умолчанию override=False → унаследованное значение НЕ перезаписывается полным id из .env).
+# claude -p --model fable-5 → «model may not exist» 404 → exit=1 → планировщик/думатель молча
+# падает (fail-safe). Нормализуем короткий алиас → ПОЛНЫЙ id ЗДЕСЬ, на старте: иммунно к
+# застрявшему env, переживает наследование через _spawn_daemon и рестарты/перезагрузки ПК.
+_MODEL_ALIAS_FULL = {"fable-5": "claude-fable-5", "fable5": "claude-fable-5",
+                     "opus-4.8": "claude-opus-4-8", "opus-4-8": "claude-opus-4-8"}
+def _norm_model_id(m):
+    """Короткий алиас модели → ПОЛНЫЙ id (claude -p на коротком отвечает 404, #194). Неизвестное
+    значение возвращаем как есть — не ломаем валидные полные id, «sonnet» и будущие модели."""
+    m = (m or "").strip()
+    return _MODEL_ALIAS_FULL.get(m, m)
+THINKER_MODEL = _norm_model_id(os.getenv("THINKER_MODEL", "claude-fable-5")) or "claude-fable-5"  # своя голова думателя (НЕ SUGGEST_MODEL); нормализована в ПОЛНЫЙ id
+THINKER_FALLBACK = _norm_model_id(os.getenv("THINKER_FALLBACK", "claude-opus-4-8"))               # свой фолбэк думателя; нормализован в ПОЛНЫЙ id
 # Маркер перерождения одиночной задачи стоит ПЕРВЫМ в тексте → якорь ^ (страховка от ложного
 # срабатывания на ТЗ, где маркер лишь упомянут в теле). N = id исходной задачи.
 _HEAL_TASK_RE = re.compile(r"^\s*\[самопочинка задачи (\d+), попытка (\d+)\]")

@@ -1044,6 +1044,33 @@ class TestTaskSelfheal(Base):
         self.assertNotIn(vals.get("T"), ("fable-5", "opus-4.8"))             # не битый алиас #194
         self.assertNotEqual(vals.get("T"), vals.get("S"))                    # НЕ завязан на SUGGEST_MODEL
 
+    def test_thinker_model_normalizes_stale_short_alias_in_env(self):
+        # ГОЛДЕН реального провала 205–208 (не идеализированный clean-env, а ГРЯЗНЫЙ env как у живого
+        # демона): демон УНАСЛЕДОВАЛ короткий THINKER_MODEL=fable-5 / THINKER_FALLBACK=opus-4.8 в
+        # os.environ (ancestor стартовал со старым .env; load_dotenv override=False не перезаписал) →
+        # claude -p --model fable-5 → HTTP 404 «model may not exist» → exit=1 → планировщик молча
+        # падал. Модуль ОБЯЗАН нормализовать короткий алиас → ПОЛНЫЙ id НА СТАРТЕ, иммунно к
+        # застрявшему env (иначе self-update не лечит: новый демон наследует тот же короткий env).
+        import subprocess
+        env = dict(os.environ)
+        env["THINKER_MODEL"] = "fable-5"      # ровно то, что PEB показал в живом PID 1120
+        env["THINKER_FALLBACK"] = "opus-4.8"
+        code = ("import pc_orchestrator as m;"
+                "print('T=' + m.THINKER_MODEL);"
+                "print('F=' + m.THINKER_FALLBACK)")
+        p = subprocess.run([sys.executable, "-c", code], cwd=o.REPO, env=env,
+                           capture_output=True, text=True, timeout=60)
+        vals = {ln[0]: ln[2:] for ln in p.stdout.splitlines()
+                if len(ln) > 2 and ln[1] == "=" and ln[0] in "TF"}
+        diag = (p.stdout or "") + (p.stderr or "")
+        self.assertEqual(vals.get("T"), "claude-fable-5", diag)              # короткий env → ПОЛНЫЙ id
+        self.assertEqual(vals.get("F"), "claude-opus-4-8", diag)             # короткий env → ПОЛНЫЙ id
+        # направления нормализации (unit)
+        self.assertEqual(o._norm_model_id("fable-5"), "claude-fable-5")
+        self.assertEqual(o._norm_model_id("opus-4.8"), "claude-opus-4-8")
+        self.assertEqual(o._norm_model_id("claude-fable-5"), "claude-fable-5")   # полный id — как есть
+        self.assertEqual(o._norm_model_id("sonnet"), "sonnet")                   # неизвестный алиас — как есть
+
 
 class TestClientWatchdog(unittest.TestCase):
     """Контур-вотчдог (разбор #128, часть 3): finder/raiser/now/state инъектируются —
