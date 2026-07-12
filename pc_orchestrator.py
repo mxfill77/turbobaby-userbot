@@ -2093,11 +2093,17 @@ def git_ff_pull_tick(call_fn=None):
     r = call(["rev-parse", "--abbrev-ref", "HEAD"])
     if not r or r[0] != 0 or r[1] != branch:
         return ""
-    # 2. чистое дерево? грязно → НЕ трогаем (ff отвергнет незакоммиченные правки, не спорим с ними)
+    # 2. чистое дерево? «Чистота» = нет изменений TRACKED-файлов. Строки '?? ' (untracked) НЕ
+    # считаем грязью: в репо ПОСТОЯННО живут untracked pc_orchestrator.heartbeat /
+    # fetch_delivery.py — по старому условию (любой непустой porcelain) авто-фетч был
+    # заблокирован ВЕЧНО + NOTE-спам каждые GIT_PULL_SEC. ff-pull untracked не трогает
+    # (конфликт с приходящим одноимённым tracked-файлом отвергнет сам git → ветка «pull не удался»).
     r = call(["status", "--porcelain"])
     if not r or r[0] != 0:
         return ""                              # git недоступен — тихо
-    if r[1]:                                    # непустой вывод = есть незакоммиченные изменения
+    tracked_dirty = [ln for ln in (r[1] or "").splitlines()
+                     if ln.strip() and not ln.startswith("??")]
+    if tracked_dirty:                           # есть незакоммиченные правки TRACKED-файлов
         log.info("авто-фетч: рабочая копия грязная — git pull пропущен")
         _cowork("авто-фетч: рабочая копия грязная — git pull пропущен (жду чистого дерева)")
         return "грязно — пропуск"

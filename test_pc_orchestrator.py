@@ -1716,6 +1716,27 @@ class TestGitFfPull(Base):
         self.assertNotIn(("pull", "--ff-only", "origin", "main"), tr)
         self.assertTrue(any("грязная" in s for s in self.cows))
 
+    def test_untracked_only_does_not_block_pull(self):
+        # КЛАСС-ГОЛДЕН (живое дерево ПК): tracked-изменений НЕТ, но постоянные untracked
+        # (pc_orchestrator.heartbeat, fetch_delivery.py) дают непустой porcelain. По старому
+        # условию авто-фетч блокировался ВЕЧНО. Теперь '??'-строки грязью НЕ считаются →
+        # ff-pull проходит; NOTE «грязная» не спамится.
+        tr = []
+        note = o.git_ff_pull_tick(call_fn=self._call(
+            status="?? fetch_delivery.py\n?? pc_orchestrator.heartbeat",
+            head="loc", origin="rem", is_ancestor=0, trace=tr))
+        self.assertEqual(note, "ff → new1234ab")
+        self.assertIn(("pull", "--ff-only", "origin", "main"), tr)
+        self.assertFalse(any("грязная" in s for s in self.cows))
+
+    def test_untracked_plus_tracked_change_still_skips(self):
+        # РЕГРЕСС: untracked РЯДОМ с реальной tracked-правкой — грязь не ослаблена, пропуск.
+        tr = []
+        note = o.git_ff_pull_tick(call_fn=self._call(
+            status="?? pc_orchestrator.heartbeat\n M suggest.py", trace=tr))
+        self.assertEqual(note, "грязно — пропуск")
+        self.assertNotIn(("pull", "--ff-only", "origin", "main"), tr)
+
     def test_ahead_of_origin_skips_pull(self):
         # КЛАСС «main впереди»: чисто, HEAD НЕ предок origin, но origin — предок HEAD → мы строго
         # ВПЕРЕДИ (неотправленные локальные коммиты). ff нечего применять → ТИХИЙ пропуск БЕЗ NOTE
