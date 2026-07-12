@@ -2259,6 +2259,19 @@ class TestLocalDecChain(Base):
         self.assertIn("✅ шаг 1/2: RESULT: A готов", sums[0]["result"])
         self.assertIn("✅ шаг 2/2: RESULT: B готов", sums[0]["result"])
 
+    def test_summary_posts_cowork_note(self):
+        # шаг 5/5 родителя 221: постановка сводки пишет NOTE в cowork_log
+        # «сводка родитель <pid>: d/n done» — журнал замокан, проверяем формат и значения (d≠n)
+        cows = []
+        o._cowork = lambda line: cows.append(line)
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="done", result="RESULT: A готов")
+        self._mk_step(pid, 2, 2, status="failed", result="B упал")   # halt: 1 done из 2
+        o.process_local_chains()
+        self.assertEqual(len(self._summaries(pid)), 1)                # сводка встала в очередь
+        self.assertIn(f"сводка родитель {pid}: 1/2 done", cows)       # NOTE: формат + d/n значения
+        self.assertEqual(sum(1 for c in cows if c.startswith(f"сводка родитель {pid}:")), 1)
+
     def test_summary_idempotent_across_restart(self):
         pid = self._mk_parent_done(["1. шаг A"])
         self._mk_step(pid, 1, 1, status="done")
