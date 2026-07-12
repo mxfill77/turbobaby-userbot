@@ -1020,13 +1020,29 @@ class TestTaskSelfheal(Base):
         self.assertNotIn("sonnet", cmd)                                       # НЕ SUGGEST_MODEL
 
     def test_thinker_model_defaults_and_no_suggest_coupling(self):
-        # дефолты думателя — своя пара; старое имя переменной убрано; на SUGGEST_MODEL не завязан.
-        # ПОЛНЫЕ id моделей (не короткие алиасы): claude -p на ЭТОМ ПК отвечает 404 на «fable-5»/
-        # «opus-4.8» (родитель #194 упал именно так) и ok только на «claude-fable-5»/«claude-opus-4-8» —
-        # golden = реальная рабочая строка .env, а не идеализированный алиас.
-        self.assertEqual(o.THINKER_MODEL, "claude-fable-5")
-        self.assertEqual(o.THINKER_FALLBACK, "claude-opus-4-8")
+        # думатель — своя пара (НЕ SUGGEST_MODEL), старое имя убрано, модель — ПОЛНЫЙ id.
+        # Эффективное значение читаем во ВЛОЖЕННОМ процессе с ЧИСТЫМ env (без ambient
+        # THINKER_MODEL/FALLBACK): гейт self-update наследует env демона, где до рестарта лежит
+        # ПРЕЖНИЙ короткий алиас — само это наследование не должно ронять тест (иначе дедлок:
+        # гейт не проходит → демон не перечитает .env → в env вечно старый алиас). ПОЛНЫЙ id
+        # обязателен: короткий «fable-5»/«opus-4.8» → claude -p отвечает 404 (родитель #194).
         self.assertFalse(hasattr(o, "THINKER_MODEL_FALLBACK"))               # переименовано → THINKER_FALLBACK
+        import subprocess
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("THINKER_MODEL", "THINKER_FALLBACK")}
+        code = ("import pc_orchestrator as o;"
+                "print('T=' + o.THINKER_MODEL);"
+                "print('F=' + o.THINKER_FALLBACK);"
+                "print('S=' + o.SUGGEST_MODEL)")
+        p = subprocess.run([sys.executable, "-c", code], cwd=o.REPO, env=env,
+                           capture_output=True, text=True, timeout=60)
+        vals = {ln[0]: ln[2:] for ln in p.stdout.splitlines()
+                if len(ln) > 2 and ln[1] == "=" and ln[0] in "TFS"}
+        diag = (p.stdout or "") + (p.stderr or "")
+        self.assertTrue(vals.get("T", "").startswith("claude-"), diag)       # ПОЛНЫЙ id, не короткий алиас
+        self.assertTrue(vals.get("F", "").startswith("claude-"), diag)
+        self.assertNotIn(vals.get("T"), ("fable-5", "opus-4.8"))             # не битый алиас #194
+        self.assertNotEqual(vals.get("T"), vals.get("S"))                    # НЕ завязан на SUGGEST_MODEL
 
 
 class TestClientWatchdog(unittest.TestCase):

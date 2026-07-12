@@ -777,11 +777,18 @@ def _init_running_version():
 
 
 def _gate_unittests():
-    """Гейт self-update ступень 2: unittest собственных тестов демона (новым кодом). → (ok, msg)."""
+    """Гейт self-update ступень 2: unittest собственных тестов демона (новым кодом). → (ok, msg).
+    env-очистка THINKER_MODEL/FALLBACK: гейт обязан проверять новый код против ТЕКУЩЕГО .env
+    (каким его перечитает перезапущенный демон), а НЕ против значения, унаследованного в память
+    ЭТОГО демона со старта. Иначе прежний короткий алиас модели в env демона ронял бы golden-тест
+    и блокировал self-update, а перечитать .env демон может только рестартом → дедлок (хвост #194)."""
     try:
+        env = dict(os.environ)
+        for k in ("THINKER_MODEL", "THINKER_FALLBACK"):
+            env.pop(k, None)                     # подпроцесс перечитает их из .env (load_dotenv)
         p = subprocess.run([VENV_PY, "-m", "unittest", "test_pc_orchestrator", "test_pc_local_dec"], cwd=REPO,
                            capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           timeout=600)
+                           timeout=600, env=env)
         return p.returncode == 0, _tail((p.stderr or "") + (p.stdout or ""), 400)
     except Exception as e:
         return False, f"unittest-гейт не запустился: {e}"
