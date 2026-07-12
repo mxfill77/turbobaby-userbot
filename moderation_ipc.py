@@ -116,9 +116,16 @@ def init_db(path=None):
             """CREATE TABLE IF NOT EXISTS intake (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 text TEXT, status TEXT, created_ts TEXT, updated_ts TEXT,
-                posted_msg_id INTEGER, reason TEXT
+                posted_msg_id INTEGER, reason TEXT, client_id INTEGER
             )"""
         )
+        # МИГРАЦИЯ старых БД (O3-2.1 хвост §7): client_id — чтобы userbot ПОСЛЕ поста «🆕 БРОНЬ»
+        # нашёл в диалоге ЭТОГО клиента фото паспорта и переслал его СРАЗУ ЗА карточкой
+        # (окно привязки Splinter 5 мин). Хранится только id клиента, не контент.
+        try:
+            c.execute("ALTER TABLE intake ADD COLUMN client_id INTEGER")
+        except Exception:
+            pass  # колонка уже есть
         c.execute("CREATE INDEX IF NOT EXISTS idx_intake_status ON intake(status)")
 
 
@@ -147,14 +154,16 @@ def enqueue_draft(rec, path=None):
 
 # ------------------- O3-2c: очередь поста «🆕 БРОНЬ» → Входящие -----------------
 
-def save_intake_candidate(text, path=None):
+def save_intake_candidate(text, path=None, client_id=None):
     """Модербот сохраняет КАНДИДАТ поста (status='draft') под кнопкой «✅ В CRM». Возвращает id.
-    Ещё НЕ отправляется — ждёт подтверждения менеджера-авторизатора."""
+    Ещё НЕ отправляется — ждёт подтверждения менеджера-авторизатора. client_id (O3-2.1) —
+    id клиента диалога: userbot после поста перешлёт из этого диалога фото паспорта (если было)."""
     ts = _now_iso()
     with _conn(path) as c:
         cur = c.execute(
-            "INSERT INTO intake (text, status, created_ts, updated_ts) VALUES (?, 'draft', ?, ?)",
-            (text, ts, ts),
+            "INSERT INTO intake (text, status, created_ts, updated_ts, client_id) "
+            "VALUES (?, 'draft', ?, ?, ?)",
+            (text, ts, ts, client_id),
         )
         return cur.lastrowid
 

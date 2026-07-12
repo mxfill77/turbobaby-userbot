@@ -199,7 +199,10 @@ async def _post_booking_card(context, chat_id, draft, username):
     kb = None
     if intake_text:                                   # есть валидный пост → сохраняем кандидат + кнопка
         try:
-            intake_id = moderation_ipc.save_intake_candidate(intake_text)
+            # client_id (O3-2.1): userbot после поста «🆕 БРОНЬ» перешлёт из диалога ЭТОГО
+            # клиента фото паспорта (если было) сразу за карточкой — Splinter привяжет (окно 5 мин).
+            intake_id = moderation_ipc.save_intake_candidate(
+                intake_text, client_id=draft.get("client_id"))
             kb = _kb_intake(intake_id)
         except Exception as e:
             log.warning(f"intake candidate #{draft.get('id')}: {type(e).__name__}: {e}")

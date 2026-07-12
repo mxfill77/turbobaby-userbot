@@ -2074,11 +2074,29 @@ INBOX_GROUP_ID = int(os.getenv("INBOX_GROUP_ID", "-1003997419806") or "-10039974
 INTAKE_POST_PREFIX = "🆕 БРОНЬ"
 
 
-async def poll_and_post_intake(client, poster=None, group_id=None):
+async def _last_client_photo(client, client_id, limit=50):
+    """O3-2.1: последнее ВХОДЯЩЕЕ фото клиента в личке (паспорт шлют на этапе брони) →
+    Message | None. Read-only; ЛЮБОЙ сбой → None (fail-safe: пост карточки от фото не зависит)."""
+    try:
+        msgs = await client.get_messages(client_id, limit=limit)
+        for m in msgs:                                # newest-first
+            if getattr(m, "photo", None) is not None and not getattr(m, "out", False):
+                return m
+    except Exception as e:
+        log.info(f"SUGGEST: поиск фото у id{client_id} не удался ({type(e).__name__}) — пропуск")
+    return None
+
+
+async def poll_and_post_intake(client, poster=None, group_id=None, photo_finder=None,
+                               forwarder=None):
     """Исполнитель userbot: забрать подтверждённые заявки (intake status='pending') и ПОСТ во
     «Входящие брони» этим userbot-аккаунтом. SAFETY: адресат строго INBOX_GROUP_ID (константа),
     zero-out клиента сохранён; постим ТОЛЬКО текст, начинающийся с «🆕 БРОНЬ» (иначе INTAKE не
-    распознает). poster(client, group_id, text)->msg_id — инъекция для тестов. → число обработанных."""
+    распознает). O3-2.1: если в записи есть client_id и клиент присылал фото (паспорт) — фото
+    пересылается СРАЗУ ЗА карточкой (окно привязки Splinter 5 мин); нет фото/сбой → как раньше,
+    INTAKE-страж честно попросит сам. poster(client, group_id, text)->msg_id,
+    photo_finder(client, client_id)->Message|None, forwarder(client, gid, msg) — инъекции для
+    тестов. → число обработанных."""
     try:
         import moderation_ipc
         rows = moderation_ipc.fetch_pending_intake()
@@ -2104,6 +2122,23 @@ async def poll_and_post_intake(client, poster=None, group_id=None):
         except Exception as e:
             moderation_ipc.mark_intake(r["id"], "failed", reason=" ".join(str(e).split())[:200])
             log.warning(f"SUGGEST: пост заявки intake #{r['id']} упал: {type(e).__name__}: {e}")
+            continue
+        # O3-2.1: фото паспорта из диалога — СРАЗУ ЗА карточкой. Best-effort ПОСЛЕ mark posted:
+        # сбой пересылки НЕ трогает статус заявки (карточка уже стоит, страж попросит фото сам).
+        # SAFETY: forward строго в gid (внутренняя группа), клиенту ничего не шлём.
+        cid = r.get("client_id")
+        if cid:
+            try:
+                photo = await (photo_finder or _last_client_photo)(client, cid)
+                if photo is not None:
+                    if forwarder is not None:
+                        await forwarder(client, gid, photo)
+                    else:
+                        await client.forward_messages(gid, photo)
+                    log.info(f"SUGGEST: intake #{r['id']} — фото из диалога переслано за карточкой.")
+            except Exception as e:
+                log.warning(f"SUGGEST: intake #{r['id']} пересылка фото не удалась "
+                            f"({type(e).__name__}) — страж попросит сам.")
     return n
 
 

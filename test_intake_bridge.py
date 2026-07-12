@@ -235,5 +235,167 @@ class TestConfirmIntakeHandler(unittest.TestCase):
         self.assertTrue(any("В CRM" in t and c == "crm:42" for t, c in flat))
 
 
+# ------------- O3-2.1 (хвост §7): мост дособирает Maps-гео и фото паспорта -------------
+
+class TestBridgeAutoCollect(unittest.TestCase):
+    """(1) ссылка Google Maps из КЛИЕНТСКИХ строк → поле «Доставка:» поста; ссылки менеджера
+    (наши точки в приветствии) НЕ подхватываются; (2) фото из диалога пересылается СРАЗУ ЗА
+    карточкой (client_id через intake-очередь); (3) нет в диалоге → прежнее поведение (страж
+    честно попросит)."""
+
+    EX = {"model": "NMAX 155", "name": "Иван", "date_from": "2026-07-10",
+          "date_to_datetime": "2026-07-15", "deposit": "3000", "helmets": "2",
+          "contact": "@ivan"}
+    # реальный паттерн приветствия: менеджер шлёт ссылки НАШИХ точек (БангТао/Камала)
+    MGR_LINKS = ("[менеджер]: Наши точки: ⏎ https://maps.app.goo.gl/P4KsR1WT4dg6UTXb9 ⏎ "
+                 "https://maps.app.goo.gl/bHHtLL1N7Uz5mX7N9")
+    CLIENT_LINK = "https://maps.app.goo.gl/CLIENTxyz123"
+
+    # ---- client_maps_link ----
+    def test_maps_link_from_client_lines_only(self):
+        tr = (self.MGR_LINKS + "\n[клиент]: мы живём тут " + self.CLIENT_LINK + " приезжайте\n"
+              "[менеджер]: принято")
+        self.assertEqual(booking_draft.client_maps_link(tr), self.CLIENT_LINK)
+
+    def test_manager_links_alone_yield_none(self):
+        self.assertIsNone(booking_draft.client_maps_link(self.MGR_LINKS))
+        self.assertIsNone(booking_draft.client_maps_link("[клиент]: без ссылок"))
+        self.assertIsNone(booking_draft.client_maps_link(""))
+
+    def test_latest_client_link_wins_and_punct_stripped(self):
+        tr = ("[клиент]: старый адрес https://maps.app.goo.gl/OLD1\n"
+              "[клиент]: новый https://maps.app.goo.gl/NEW2, приезжайте")
+        self.assertEqual(booking_draft.client_maps_link(tr), "https://maps.app.goo.gl/NEW2")
+
+    # ---- build_intake: поле «Доставка:» ----
+    def test_intake_delivery_gets_client_geo_with_note(self):
+        ex = dict(self.EX, note="Патонг")
+        tr = self.MGR_LINKS + "\n[клиент]: наш отель " + self.CLIENT_LINK
+        txt = booking_draft.build_intake(ex, allowlist=ALLOW,
+                                         meta={"client_ref": "@ivan", "transcript": tr})
+        d = parse_intake(txt)
+        self.assertEqual(d["Доставка"], "Патонг · " + self.CLIENT_LINK)
+        self.assertNotIn("P4KsR1WT4dg6UTXb9", txt)     # гео проката НЕ утекает в заявку
+
+    def test_intake_delivery_geo_without_note(self):
+        ex = dict(self.EX)                              # note нет вовсе
+        tr = "[клиент]: адрес вот " + self.CLIENT_LINK
+        txt = booking_draft.build_intake(ex, allowlist=ALLOW,
+                                         meta={"client_ref": "@ivan", "transcript": tr})
+        self.assertEqual(parse_intake(txt)["Доставка"], self.CLIENT_LINK)
+
+    def test_intake_no_link_regression(self):
+        # (3) нет ссылки в диалоге → прежнее поведение байт-в-байт: note как было / поля нет.
+        ex = dict(self.EX, note="Патонг")
+        txt = booking_draft.build_intake(ex, allowlist=ALLOW,
+                                         meta={"client_ref": "@ivan",
+                                               "transcript": "[клиент]: просто текст"})
+        self.assertEqual(parse_intake(txt)["Доставка"], "Патонг")
+        ex2 = dict(self.EX)
+        txt2 = booking_draft.build_intake(ex2, allowlist=ALLOW,
+                                          meta={"client_ref": "@ivan",
+                                                "transcript": "[клиент]: просто текст"})
+        self.assertNotIn("Доставка:", txt2)             # страж честно попросит гео сам
+
+
+class TestBridgePassportForward(unittest.TestCase):
+    """(2) фото паспорта: client_id едет через intake-очередь; после поста карточки userbot
+    пересылает последнее клиентское фото СРАЗУ ЗА ней; нет фото/нет client_id/сбой → прежнее
+    поведение, статус posted не трогается."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._save_db = moderation_ipc.DB_PATH
+        moderation_ipc.DB_PATH = os.path.join(self._tmp.name, "ipc.db")
+        moderation_ipc.init_db()
+
+    def tearDown(self):
+        moderation_ipc.DB_PATH = self._save_db
+        self._tmp.cleanup()
+
+    def _pending(self, client_id=None):
+        iid = moderation_ipc.save_intake_candidate("🆕 БРОНЬ\nКлиент: X", client_id=client_id)
+        moderation_ipc.confirm_intake(iid)
+        return iid
+
+    def test_client_id_persisted_through_queue(self):
+        iid = self._pending(client_id=529849022)
+        row = moderation_ipc.get_intake(iid)
+        self.assertEqual(row["client_id"], 529849022)
+        rows = moderation_ipc.fetch_pending_intake()
+        self.assertEqual(rows[0]["client_id"], 529849022)
+
+    def test_photo_forwarded_right_after_card(self):
+        # ГЛАВНЫЙ сценарий: диалог с фото → пост карточки, затем СРАЗУ пересылка фото в ту же группу.
+        iid = self._pending(client_id=111)
+        order = []
+        async def poster(client, gid, text):
+            order.append(("post", gid)); return 777
+        async def finder(client, cid):
+            order.append(("find", cid)); return "PHOTO_MSG"
+        async def forwarder(client, gid, msg):
+            order.append(("fwd", gid, msg))
+        n = asyncio.run(suggest.poll_and_post_intake(object(), poster=poster,
+                                                     photo_finder=finder, forwarder=forwarder))
+        self.assertEqual(n, 1)
+        self.assertEqual(order, [("post", suggest.INBOX_GROUP_ID), ("find", 111),
+                                 ("fwd", suggest.INBOX_GROUP_ID, "PHOTO_MSG")])  # фото СРАЗУ ЗА карточкой
+        self.assertEqual(moderation_ipc.get_intake(iid)["status"], "posted")
+
+    def test_no_photo_in_dialog_regression(self):
+        # (3) фото в диалоге нет → пересылки нет, карточка как раньше (страж попросит фото).
+        self._pending(client_id=222)
+        fwd = []
+        async def poster(client, gid, text): return 1
+        async def finder(client, cid): return None
+        async def forwarder(client, gid, msg): fwd.append(msg)
+        n = asyncio.run(suggest.poll_and_post_intake(object(), poster=poster,
+                                                     photo_finder=finder, forwarder=forwarder))
+        self.assertEqual(n, 1)
+        self.assertEqual(fwd, [])
+
+    def test_no_client_id_regression(self):
+        # старые записи без client_id (миграция) → finder вообще не зовётся, поведение прежнее.
+        self._pending(client_id=None)
+        calls = []
+        async def poster(client, gid, text): return 1
+        async def finder(client, cid): calls.append(cid); return "X"
+        n = asyncio.run(suggest.poll_and_post_intake(object(), poster=poster, photo_finder=finder))
+        self.assertEqual(n, 1)
+        self.assertEqual(calls, [])
+
+    def test_forward_failure_does_not_touch_posted(self):
+        # сбой пересылки — best-effort: статус остаётся posted, исключение не всплывает.
+        iid = self._pending(client_id=333)
+        async def poster(client, gid, text): return 9
+        async def finder(client, cid): return "PHOTO"
+        async def forwarder(client, gid, msg): raise RuntimeError("flood wait")
+        n = asyncio.run(suggest.poll_and_post_intake(object(), poster=poster,
+                                                     photo_finder=finder, forwarder=forwarder))
+        self.assertEqual(n, 1)
+        row = moderation_ipc.get_intake(iid)
+        self.assertEqual(row["status"], "posted")
+        self.assertEqual(row["posted_msg_id"], 9)
+
+    def test_old_db_migrates_client_id_column(self):
+        # БД со СТАРОЙ схемой intake (без client_id) → init_db дособирает колонку (ALTER), не падает.
+        import sqlite3
+        old = os.path.join(self._tmp.name, "old.db")
+        c = sqlite3.connect(old)
+        c.execute("""CREATE TABLE intake (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT, status TEXT, created_ts TEXT, updated_ts TEXT,
+            posted_msg_id INTEGER, reason TEXT)""")
+        c.commit(); c.close()
+        save = moderation_ipc.DB_PATH
+        moderation_ipc.DB_PATH = old
+        try:
+            moderation_ipc.init_db()
+            iid = moderation_ipc.save_intake_candidate("🆕 БРОНЬ\nКлиент: Y", client_id=42)
+            self.assertEqual(moderation_ipc.get_intake(iid)["client_id"], 42)
+        finally:
+            moderation_ipc.DB_PATH = save
+
+
 if __name__ == "__main__":
     unittest.main()

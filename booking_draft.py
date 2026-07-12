@@ -323,6 +323,27 @@ def delivery_outside_phuket(note):
     return any(k in t for k in _NON_PHUKET) and not any(k in t for k in _PHUKET)
 
 
+# --- O3-2.1 (хвост §7): гео-ссылка Google Maps из КЛИЕНТСКИХ строк диалога ------
+# INTAKE требует гео точки доставки; если клиент УЖЕ кинул ссылку Maps в переписке — мост
+# дособирает её в поле «Доставка:» поста сам, чтобы страж не переспрашивал очевидное.
+_MAPS_URL_RE = re.compile(
+    r"https?://(?:maps\.app\.goo\.gl|goo\.gl/maps|maps\.google\.[^\s/]+|"
+    r"(?:www\.)?google\.[^\s/]+/maps)\S*", re.I)
+
+
+def client_maps_link(transcript):
+    """Последняя (самая свежая) ссылка Google Maps из строк «[клиент]: …» диалога → str | None.
+    Строки менеджера игнорируем ЖЁСТКО: менеджер сам шлёт в приветствии ссылки НАШИХ точек
+    (БангТао/Камала) — они НЕ адрес доставки клиента (иначе гео проката стало бы адресом)."""
+    link = None
+    for ln in str(transcript or "").splitlines():
+        if not ln.lstrip().startswith("[клиент]:"):
+            continue
+        for m in _MAPS_URL_RE.finditer(ln):
+            link = m.group(0).rstrip(".,;)»›\"'")   # хвостовая пунктуация чата — не часть URL
+    return link
+
+
 # ------------------------------- сборка карточки -----------------------------
 
 def build_card(ex, allowlist=None, quote_fn=None, today=None, meta=None):
@@ -510,8 +531,17 @@ def build_intake(ex, allowlist=None, meta=None):
     elif client_ref and not handle_at:               # idNNN как контакт (username уже в «Клиент»)
         lines.append(f"Контакт: {client_ref}")
 
+    # O3-2.1: поле «Доставка» дособираем гео-ссылкой Maps ИЗ КЛИЕНТСКИХ строк диалога (ссылки
+    # менеджера отфильтрованы в client_maps_link). Есть ссылка — она попадает в пост даже без
+    # note (страж перестаёт просить гео, оно уже есть); нет ссылки — прежнее поведение.
+    maps_link = client_maps_link(transcript)
+    delivery_parts = []
     if note and not delivery_bad:                    # доставка вне Пхукета (⚠️) — не включаем
-        lines.append(f"Доставка: {note}")
+        delivery_parts.append(note)
+    if maps_link and not any(maps_link in p for p in delivery_parts):
+        delivery_parts.append(maps_link)
+    if delivery_parts:
+        lines.append("Доставка: " + " · ".join(delivery_parts))
 
     helmets = _norm_field(ex.get("helmets"))
     if helmets:
