@@ -1879,5 +1879,179 @@ class TestSheetUntouchableBlock(unittest.TestCase):
         self.assertNotIn("[PRICE_SHEET]", draft)
 
 
+class TestSheetSubselection(unittest.TestCase):
+    """Подвыборки сетки («скутеры 200+», «мотоциклы до 400») — ДЕТЕРМИНИРОВАННЫЙ отбор КОДОМ из тех
+    же rows, что и полная сетка (та же точка правды), БЕЗ LLM-отбора моделей. Класс-голден живого
+    провала 12.07 15:46: XADV 750 (скутер 750cc) в «скутерах 200+» у LLM-отбора ТЕРЯЛСЯ. Тесты
+    детекта на РЕАЛЬНОЙ фразе клиента («скутеры 200+») + парафразах RU/EN + негативах."""
+
+    # тариф по модели: (day_total, week_total, month_total, deposit, cap_active, cap_price)
+    TAR = {
+        "NMAX 155": (450, 2800, 9000, 5000, True, 8500),       # скутер 155cc
+        "ADV 350": (749, 4928, 14606, 7000, True, 10900),      # скутер 350cc
+        "XADV 750": (2788, 18000, 55000, 25000, False, 0),     # скутер 750cc — тот, что «терялся»
+        "CB 300R": (757, 4716, 12491, 15000, True, 9900),      # мотоцикл 300cc
+        "CBR 650R": (1200, 7000, 22000, 20000, False, 0),      # мотоцикл 650cc
+    }
+    FLEET_NAMES = ["NMAX 155CC BLACK PHUKET 4255", "ADV 350CC BLACK PHUKET 5849",
+                   "XADV 750CC GREY PHUKET 4290", "CB 300CC R 9011", "CBR 650R PHUKET 4505"]
+
+    def setUp(self):
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+
+    def tearDown(self):
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+
+    def _getter(self):
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET_NAMES]}}
+            bike = params.get("bike", "")
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            bk = suggest._bike_key(bike)
+            key = next((k for k in self.TAR if suggest._bike_key(k) in bk), None)
+            if key is None:
+                return {"ok": False}
+            d1, d7, d30, dep, ca, cp = self.TAR[key]
+            total = {1: d1, 7: d7, 30: d30}.get(days, d1)
+            return {"ok": True, "data": {"day_price": round(total / max(days, 1)), "total": total,
+                    "deposit": dep, "available": True, "days": days, "cap_active": ca,
+                    "cap_price": cp, "text": f"{bike} {days}d {total}"}}
+        return fake
+
+    # ---- рабочий объём из метки модели ----
+    def test_model_cc_from_label(self):
+        self.assertEqual(suggest._model_cc("XADV 750"), 750)
+        self.assertEqual(suggest._model_cc("NMAX 155"), 155)
+        self.assertEqual(suggest._model_cc("CB 300R"), 300)
+        self.assertEqual(suggest._model_cc("XMAX 300 New Gen"), 300)   # New Gen без цифр не мешает
+        self.assertIsNone(suggest._model_cc("MT-03"))                  # 2-значный хвост серии — не cc
+        self.assertIsNone(suggest._model_cc("R7"))
+
+    # ---- детерминированная подвыборка rows (та же точка правды, что и сетка) ----
+    def test_filter_scooters_200plus_keeps_xadv(self):
+        # ГЛАВНОЕ требование задачи: XADV 750 (скутер 750cc) в «скутерах 200+» ПРИСУТСТВУЕТ.
+        rows = suggest.price_sheet("2026-07-15", getter=self._getter())
+        sub = suggest.filter_sheet_rows(rows, kind="scooter", cc_min=200)
+        models = [r["model"] for r in sub]
+        self.assertIn("XADV 750", models)          # 750cc скутер НЕ потерян (живой провал 12.07)
+        self.assertIn("ADV 350", models)
+        self.assertNotIn("NMAX 155", models)       # 155 < 200 — отсечён
+        self.assertNotIn("CB 300R", models)        # мотоцикл — не тот класс
+        self.assertNotIn("CBR 650R", models)
+
+    def test_filter_moto_up_to_400(self):
+        rows = suggest.price_sheet("2026-07-15", getter=self._getter())
+        sub = suggest.filter_sheet_rows(rows, kind="moto", cc_max=400)
+        models = [r["model"] for r in sub]
+        self.assertIn("CB 300R", models)           # 300 ≤ 400
+        self.assertNotIn("CBR 650R", models)       # 650 > 400 — отсечён
+        self.assertNotIn("XADV 750", models)       # скутер — не тот класс
+        self.assertNotIn("NMAX 155", models)
+
+    def test_filter_unknown_cc_kept_failopen(self):
+        # cc не прочли (MT-03 / R7) → строку класса НЕ выкидываем (fail-open, корень провала XADV).
+        rows = [{"model": "MT-03", "class": ("moto", 3, "мотоциклы"), "cells": {"day": {"total": 700}}}]
+        self.assertEqual([r["model"] for r in suggest.filter_sheet_rows(rows, kind="moto", cc_max=400)],
+                         ["MT-03"])
+        self.assertEqual([r["model"] for r in suggest.filter_sheet_rows(rows, kind="moto", cc_min=200)],
+                         ["MT-03"])
+
+    def test_full_sheet_unchanged_regression(self):
+        # РЕГРЕСС сетки: без подвыборки rows = ВЕСЬ парк, формат/цифры целы.
+        rows = suggest.price_sheet("2026-07-15", getter=self._getter())
+        block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
+        for m in ("NMAX 155", "ADV 350", "XADV 750", "CB 300R", "CBR 650R"):
+            self.assertIn(m, block)
+        self.assertIn("XADV 750\n• Сутки: 2788 ฿", block)   # цифры/формат карточки не тронуты
+        self.assertLess(block.index("Скутеры:"), block.index("Мотоциклы:"))
+
+    # ---- детект подвыборки из СЛОВ клиента (реальная фраза + парафразы RU/EN + негативы) ----
+    def test_parse_scooters_min_positive(self):
+        # «скутеры 200+» — дословная формулировка задачи (живой черновик 12.07 15:46) + парафразы.
+        for s in ["скутеры 200+",
+                  "какие есть скутеры от 200 кубов?",
+                  "интересуют скутеры больше 200",
+                  "покажите скутеры свыше 200 кубов",
+                  "scooters from 200cc please",
+                  "what scooters over 200 do you have?"]:
+            f = suggest._parse_sheet_filter(s.lower(), s.lower())
+            self.assertIsNotNone(f, s)
+            self.assertEqual(f["kind"], "scooter", s)
+            self.assertEqual(f["cc_min"], 200, s)
+            self.assertIsNone(f["cc_max"], s)
+
+    def test_parse_moto_max_positive(self):
+        for s in ["мотоциклы до 400",
+                  "какие мотоциклы до 400 кубов?",
+                  "мотоцикл не больше 400",
+                  "мотоциклы меньше 400 кубов",
+                  "motorcycles under 400cc",
+                  "what motorcycles up to 400 do you have?"]:
+            f = suggest._parse_sheet_filter(s.lower(), s.lower())
+            self.assertIsNotNone(f, s)
+            self.assertEqual(f["kind"], "moto", s)
+            self.assertEqual(f["cc_max"], 400, s)
+            self.assertIsNone(f["cc_min"], s)
+
+    def test_parse_negatives(self):
+        # Ни класса-подвыборки, ни границы cc → None (полная сетка). Даты/сроки за cc НЕ считаем.
+        for s in ["какие цены на все модели",
+                  "сколько стоит nmax",
+                  "пришлите прайс-лист",
+                  "нужны все модели на 15.07-15.08",     # даты, не cc; нет класс-слова
+                  "какие байки у вас есть?",              # «байк» — не scooter/moto
+                  "какие есть скутеры и мотоциклы?"]:     # оба класса → весь парк
+            self.assertIsNone(suggest._parse_sheet_filter(s.lower(), s.lower()), s)
+
+    # ---- сквозной путь: hints → build_pricing_note (КОД фильтрует, LLM не отбирает) ----
+    def test_end_to_end_scooters_200plus_keeps_xadv(self):
+        tr = "[клиент]: какие есть скутеры от 200 кубов и цены на аренду?"
+        h = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        self.assertTrue(h["price_sheet_q"])
+        self.assertEqual(h["sheet_filter"], {"kind": "scooter", "cc_min": 200, "cc_max": None})
+        note = suggest.build_pricing_note(h, lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+        self.assertIn("ПРАЙС ПО ПАРКУ", note)
+        self.assertIn("XADV 750", note)            # 750cc скутер в подвыборке — не потерян
+        self.assertIn("ADV 350", note)
+        self.assertNotIn("NMAX 155", note)         # 155 < 200 — отфильтрован КОДОМ
+        self.assertNotIn("CB 300R", note)          # мотоцикл — не тот класс
+        self.assertNotIn("CBR 650R", note)
+
+    def test_end_to_end_moto_up_to_400(self):
+        tr = "[клиент]: какие мотоциклы до 400 кубов и почём аренда?"
+        h = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        self.assertTrue(h["price_sheet_q"])
+        self.assertEqual(h["sheet_filter"], {"kind": "moto", "cc_min": None, "cc_max": 400})
+        note = suggest.build_pricing_note(h, lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+        self.assertIn("CB 300R", note)             # 300 ≤ 400
+        self.assertNotIn("CBR 650R", note)         # 650 > 400
+        self.assertNotIn("XADV 750", note)         # скутер — не тот класс
+        self.assertNotIn("NMAX 155", note)
+
+    def test_end_to_end_no_filter_full_grid_regression(self):
+        tr = "[клиент]: пришлите прайс по всему парку"
+        h = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        self.assertTrue(h["price_sheet_q"])
+        self.assertIsNone(h["sheet_filter"])
+        note = suggest.build_pricing_note(h, lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+        for m in ("NMAX 155", "ADV 350", "XADV 750", "CB 300R", "CBR 650R"):
+            self.assertIn(m, note)                 # без подвыборки — весь парк
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

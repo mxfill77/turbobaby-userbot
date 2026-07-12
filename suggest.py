@@ -832,6 +832,50 @@ def _asks_price_sheet(newest: str, recent: str) -> bool:
     return True
 
 
+# --- подвыборка прайса: класс (scooter/moto) + рабочий объём cc, ДЕТЕРМИНИРОВАННО из СЛОВ клиента --
+# Клиент сужает сетку: «скутеры 200+», «мотоциклы до 400». Разбор — строкой (не LLM): границы
+# отдаём в filter_sheet_rows, отбор моделей делает КОД по данным сетки. Потому XADV 750 в «скутерах
+# 200+» не теряется (у LLM-отбора терялся — живой черновик 12.07 15:46).
+_SF_SCOOTER_RE = re.compile(r"скутер\w*|мопед\w*|scooter\w*|moped\w*", re.I)
+_SF_MOTO_RE = re.compile(r"мотоцикл\w*|мотоцик\w*|мотик\w*|motorcycl\w*|\bmoto\b", re.I)
+# нижняя граница: «от 200», «(не «не»)больше/более 200», «свыше 200», «200+», «200 и больше/выше»,
+# «from/over/above 200». «не больше 200» — это ВЕРХНЯЯ граница, поэтому «больше/более» с «не» перед
+# ними в min НЕ ловим (lookbehind).
+_SF_MIN_RE = re.compile(
+    r"(?:(?:от|свыше|начиная\s+(?:от|с)|from|over|above|starting)|(?<!не )(?:больше|более))\s*(\d{2,4})"
+    r"|(\d{2,4})\s*(?:куб\w*\s*)?(?:\+|и\s*(?:больше|выше|более|старше)|and\s+(?:up|more|above|over))",
+    re.I)
+# верхняя граница: «до 400», «меньше/менее 400», «не больше/не более 400», «400 и меньше»,
+# «under/below/up to/max 400».
+_SF_MAX_RE = re.compile(
+    r"(?:до|меньше|менее|не\s+(?:больше|более)|под|under|below|up\s*to|max(?:imum)?|less\s+than)\s*(\d{2,4})"
+    r"|(\d{2,4})\s*(?:куб\w*\s*)?(?:и\s*)?(?:меньше|менее|ниже|or\s+less|and\s+(?:below|under))",
+    re.I)
+# Меньше 50 — это не рабочий объём (дата «до 15», срок «на 7 дней»): такую «границу» игнорируем.
+_SF_CC_MIN_PLAUSIBLE = 50
+
+
+def _parse_sheet_filter(newest: str, recent: str):
+    """Подвыборка сетки из СЛОВ клиента: класс (scooter/moto из скутер/мотоцикл-слов) и границы cc.
+    → dict {kind, cc_min, cc_max} или None (сужения нет). Оба класс-слова сразу (скутеры И мотоциклы)
+    → kind=None (весь парк). Отбор моделей по границам делает КОД (filter_sheet_rows), НЕ LLM."""
+    t = f"{newest or ''}\n{recent or ''}"
+    sc, mo = bool(_SF_SCOOTER_RE.search(t)), bool(_SF_MOTO_RE.search(t))
+    kind = "scooter" if (sc and not mo) else ("moto" if (mo and not sc) else None)
+
+    def _bound(rx):
+        for m in rx.finditer(t):
+            v = m.group(1) or m.group(2)
+            if v and int(v) >= _SF_CC_MIN_PLAUSIBLE:
+                return int(v)
+        return None
+
+    cc_min, cc_max = _bound(_SF_MIN_RE), _bound(_SF_MAX_RE)
+    if kind is None and cc_min is None and cc_max is None:
+        return None
+    return {"kind": kind, "cc_min": cc_min, "cc_max": cc_max}
+
+
 # Несдаваемые модели: физически в парке (Лист1), но правило KB/CRITICAL_FACTS «НЕ сдаём» —
 # в прайс по парку НЕ включаем (Honda Click 125). Ключи нормализованы как _bike_key.
 _NON_RENTABLE_KEYS = {_bike_key("CLICK 125")}   # {'click125'}
@@ -905,11 +949,13 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
         models = newest_models
     deposit_multi_q = _asks_deposit_reduction_multi(newest, recent, models)
     price_sheet_q = _asks_price_sheet(newest, recent)
+    sheet_filter = _parse_sheet_filter(newest, recent)
 
     return {"model": model, "models": models, "date_start": iso_start, "date_end": iso_end,
             "iso_start": iso_start, "iso_end": iso_end, "term_days": term_days,
             "hint_days": hint_days, "monthly": monthly, "has_dates": has_dates,
-            "deposit_multi_q": deposit_multi_q, "price_sheet_q": price_sheet_q}
+            "deposit_multi_q": deposit_multi_q, "price_sheet_q": price_sheet_q,
+            "sheet_filter": sheet_filter}
 
 
 # Инструкция про депозит при нескольких байках (правила цен v2, п.4).
@@ -1313,6 +1359,50 @@ def render_price_sheet(rows, ds, lang="ru") -> str:
     return "\n\n".join(parts)
 
 
+# --- подвыборка строк сетки: класс + рабочий объём cc, ДЕТЕРМИНИРОВАННО (КОД, не LLM-отбор) --------
+# Точка правды — те же rows из price_sheet, что и полная сетка (цифры/формат не трогаем, рендер тот
+# же). cc берём из метки модели: 3–4-значное число (150/300/750 …). Двузначные хвосты серии («MT-03»,
+# «R7») рабочим объёмом НЕ считаем → cc=None; в подвыборке такую строку НЕ выкидываем (fail-open),
+# иначе повторили бы живой провал «XADV 750 потерялся в скутерах 200+».
+_MODEL_CC_RE = re.compile(r"\d{3,4}")
+
+
+def _model_cc(label):
+    """Рабочий объём (cc) из метки модели: первое 3–4-значное число. → int|None (не прочли)."""
+    m = _MODEL_CC_RE.search(str(label or ""))
+    return int(m.group(0)) if m else None
+
+
+def _cc_in_range(cc, cc_min, cc_max):
+    """cc в границах [cc_min, cc_max] (любая граница None = без ограничения). cc не прочли (None) →
+    True: класс-совпадающую модель из подвыборки НЕ выбрасываем (анти-drop, XADV терялся у LLM)."""
+    if cc is None:
+        return True
+    if cc_min is not None and cc < cc_min:
+        return False
+    if cc_max is not None and cc > cc_max:
+        return False
+    return True
+
+
+def filter_sheet_rows(rows, kind=None, cc_min=None, cc_max=None):
+    """Детерминированная подвыборка строк сетки (та же точка правды — rows из price_sheet): по классу
+    байка (scooter/moto из bike_class) и рабочему объёму (cc из метки). Модели отбирает КОД, НЕ LLM;
+    формат/цифры строк не трогаем. kind/границы None = без соответствующего ограничения. cc не
+    прочли → строку оставляем (fail-open: «скутеры 200+» обязаны сохранить XADV 750). → list (может
+    быть [] — вызывающий решает, что делать с пустой подвыборкой)."""
+    out = []
+    for r in rows:
+        cls = r.get("class")
+        rkind = cls[0] if cls else None
+        if kind is not None and rkind != kind:
+            continue
+        if not _cc_in_range(_model_cc(r.get("model")), cc_min, cc_max):
+            continue
+        out.append(r)
+    return out
+
+
 # Сетка = НЕПРИКОСНОВЕННЫЙ блок (класс-фикс вёрстки 21:36, черновик #276: LLM пересобирал
 # карточки в однострочники и вставлял сырые ** — markdown в Telegram не рендерится). Блок везём
 # ВНУТРИ pricing_note между служебными скобками (транспорт: сигнатуры целы, IPC-перегенерация
@@ -1411,6 +1501,14 @@ def build_price_sheet_note(hints, lang="ru", getter=None, today=None):
         ds = (base + datetime.timedelta(days=1)).isoformat()
         default_anchor = True
     rows = price_sheet(ds, getter=getter)
+    # Подвыборка («скутеры 200+», «мотоциклы до 400») — КОД по данным сетки, не LLM-отбор. Пустая
+    # подвыборка (ничего не совпало) → показываем ПОЛНУЮ сетку, не немеем и не выдумываем.
+    sf = hints.get("sheet_filter")
+    if sf:
+        sub = filter_sheet_rows(rows, kind=sf.get("kind"),
+                                cc_min=sf.get("cc_min"), cc_max=sf.get("cc_max"))
+        if sub:
+            rows = sub
     body = render_price_sheet(rows, ds, lang)
     if not body.strip():
         return _PRICE_SHEET_UNAVAILABLE
