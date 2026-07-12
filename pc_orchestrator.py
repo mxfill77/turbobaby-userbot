@@ -868,8 +868,8 @@ def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=Non
 # (поведение байт-в-байт прежнее). Красное НЕ ослаблено: думатель ничего не исполняет
 # (--allowed-tools '' + нейтральный cwd → без settings.json/pretool_guard), тема 829/инбокс 1160 нетронуты.
 STEP_SELFHEAL_TIMEOUT = int(os.getenv("PC_SELFHEAL_TIMEOUT", "180") or "180")   # думатель — короткий ответ
-THINKER_MODEL = os.getenv("THINKER_MODEL", "fable-5").strip() or "fable-5"      # своя голова думателя (НЕ SUGGEST_MODEL)
-THINKER_FALLBACK = os.getenv("THINKER_FALLBACK", "opus-4.8").strip()            # свой фолбэк думателя
+THINKER_MODEL = os.getenv("THINKER_MODEL", "claude-fable-5").strip() or "claude-fable-5"  # своя голова думателя (НЕ SUGGEST_MODEL); ПОЛНЫЙ id — короткий алиас «fable-5» даёт 404 на claude -p (родитель #194)
+THINKER_FALLBACK = os.getenv("THINKER_FALLBACK", "claude-opus-4-8").strip()     # свой фолбэк думателя; ПОЛНЫЙ id — «opus-4.8» даёт 404 (родитель #194)
 # Маркер перерождения одиночной задачи стоит ПЕРВЫМ в тексте → якорь ^ (страховка от ложного
 # срабатывания на ТЗ, где маркер лишь упомянут в теле). N = id исходной задачи.
 _HEAL_TASK_RE = re.compile(r"^\s*\[самопочинка задачи (\d+), попытка (\d+)\]")

@@ -1020,9 +1020,12 @@ class TestTaskSelfheal(Base):
         self.assertNotIn("sonnet", cmd)                                       # НЕ SUGGEST_MODEL
 
     def test_thinker_model_defaults_and_no_suggest_coupling(self):
-        # дефолты думателя — своя пара; старое имя переменной убрано; на SUGGEST_MODEL не завязан
-        self.assertEqual(o.THINKER_MODEL, "fable-5")
-        self.assertEqual(o.THINKER_FALLBACK, "opus-4.8")
+        # дефолты думателя — своя пара; старое имя переменной убрано; на SUGGEST_MODEL не завязан.
+        # ПОЛНЫЕ id моделей (не короткие алиасы): claude -p на ЭТОМ ПК отвечает 404 на «fable-5»/
+        # «opus-4.8» (родитель #194 упал именно так) и ok только на «claude-fable-5»/«claude-opus-4-8» —
+        # golden = реальная рабочая строка .env, а не идеализированный алиас.
+        self.assertEqual(o.THINKER_MODEL, "claude-fable-5")
+        self.assertEqual(o.THINKER_FALLBACK, "claude-opus-4-8")
         self.assertFalse(hasattr(o, "THINKER_MODEL_FALLBACK"))               # переименовано → THINKER_FALLBACK
 
 
