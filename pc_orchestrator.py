@@ -1433,10 +1433,11 @@ def _loc_post_card(pid, text):
     bc.complete_task(sid, "done", str(text)[:RESULT_MAX])
 
 
-def _loc_summary_text(pid, steps):
-    """Сводка локальной цепи из переданных шагов (зеркало _pc_summary_text VPS). Дубли номера
-    (провал + перерождение самопочинки) — последняя запись по id; total = n-маркер последнего
-    релизнутого шага (несёт актуальный итог после коррекций плана)."""
+def _loc_summary_counts(steps):
+    """Дедуп-строки цепи → (rows, n_done, total) — общий для текста сводки и NOTE-журнала.
+    Дубли номера (провал + перерождение самопочинки) — последняя запись по id; total =
+    n-маркер последнего релизнутого шага (несёт актуальный итог после коррекций плана).
+    Пустой набор → ([], 0, 0)."""
     rows = sorted([s for s in steps if str(s[2].get("status")) in ("done", "failed")],
                   key=lambda x: (x[0], int(x[2].get("id") or 0)))
     last = {}
@@ -1444,9 +1445,17 @@ def _loc_summary_text(pid, steps):
         last[i] = (i, n, it)
     rows = [last[k] for k in sorted(last)]
     if not rows:
-        return f"🧩 Сводка декомпозиции (родитель {pid}, локальный дирижёр): шагов не найдено (очередь пуста?)"
+        return [], 0, 0
     n_done = sum(1 for _i, _n, it in rows if str(it.get("status")) == "done")
     total = rows[-1][1]
+    return rows, n_done, total
+
+
+def _loc_summary_text(pid, steps):
+    """Сводка локальной цепи из переданных шагов (зеркало _pc_summary_text VPS)."""
+    rows, n_done, total = _loc_summary_counts(steps)
+    if not rows:
+        return f"🧩 Сводка декомпозиции (родитель {pid}, локальный дирижёр): шагов не найдено (очередь пуста?)"
     head = f"🧩 Сводка декомпозиции (родитель {pid}, локальный дирижёр): {n_done}/{total} шагов done"
     fin = _loc_adapt_finish.get(pid)
     if fin:
@@ -1470,6 +1479,7 @@ def _loc_post_summary(pid, steps):
         _loc_summarized.add(pid)
         return
     text = _loc_summary_text(pid, steps)
+    _rows, n_done, total = _loc_summary_counts(steps)
     r = _loc_enqueue(f"[сводка родитель {pid}] сводный отчёт по шагам")
     if not r.get("ok"):
         log.warning("pcloc-dec: сводка родителя %s не встала в очередь (%s)", pid, r.get("error"))
@@ -1478,6 +1488,7 @@ def _loc_post_summary(pid, steps):
     bc.claim_task(sid)
     cm = bc.complete_task(sid, "done", text)
     _loc_summarized.add(pid)
+    _cowork(f"сводка родитель {pid}: {n_done}/{total} done")  # NOTE в журнал в момент постановки
     log.info("pcloc-dec: сводка родителя %s → задача %s (bridge_ok=%s)", pid, sid, cm.get("ok"))
 
 
