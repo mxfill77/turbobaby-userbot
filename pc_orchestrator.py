@@ -764,6 +764,19 @@ def _git_out(args):
         return None
 
 
+def _git_call(args, timeout=90):
+    """git в REPO → (returncode, stdout, stderr) | None (git недоступен/исключение).
+    В отличие от _git_out даёт returncode: для fetch/status/ff-only пустой stdout ≠ ошибка
+    (fetch пишет в stderr, чистое дерево = пустой status, merge-base --is-ancestor кодирует
+    ответ ТОЛЬКО кодом возврата). timeout щедрый — fetch ходит в сеть."""
+    try:
+        p = subprocess.run(["git"] + args, cwd=REPO, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except Exception:
+        return None
+
+
 def _blob_hash():
     """Хеш содержимого pc_orchestrator.py в HEAD — «версия» кода демона (дифф против запущенной)."""
     return _git_out(["rev-parse", "HEAD:pc_orchestrator.py"])
@@ -2044,6 +2057,86 @@ def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_f
     return " ; ".join(notes)
 
 
+# ------------------- периодический git fetch + FAST-FORWARD-ONLY pull ---------
+# Родитель #221: демон сам подтягивает свежий origin/main, чтобы штатный путь тика (self-update
+# с гейтом + реконсиляция детей по диффу) применил чужие/удалённые коммиты БЕЗ ручного git pull.
+# СТРОГИЕ условия pull: копия ЧИСТАЯ (нет незакоммиченных правок), мы на целевой ветке, локальный
+# HEAD строго ПОЗАДИ origin/<branch> И является её предком (fast-forward возможен). Любое иное
+# (грязно / detached / расхождение с локальными коммитами / не-ff) → ПРОПУСК + NOTE в cowork_log.
+# НИКОГДА merge/rebase: только ff (перематываем указатель, локальную историю не переписываем и не
+# смешиваем). После ff новый HEAD в ТОМ ЖЕ тике подхватят maybe_reconcile_children / maybe_self_update.
+GIT_PULL_SEC = int(os.getenv("PC_GIT_PULL_SEC", "300") or "300")     # авто-фетч не чаще раза в N сек
+GIT_PULL_BRANCH = os.getenv("PC_GIT_PULL_BRANCH", "main")            # тянем ff ТОЛЬКО эту ветку
+_git_pull_last_run = 0.0                                             # троттлинг тела авто-фетча
+
+
+def git_ff_pull_tick(call_fn=None):
+    """Тело авто-фетча (без троттлинга — троттлит maybe_git_ff_pull). git-вызовы инъектируются для тестов.
+    → строка-итог для лога/NOTE ('' = нечего делать / тихий пропуск: git недоступен, detached, уже
+    актуально, рубильник). Никогда не merge/rebase — только fast-forward."""
+    call = call_fn or _git_call
+    if _stopped():
+        return ""
+    branch = GIT_PULL_BRANCH
+    # 1. на целевой ветке? (detached HEAD / другая ветка — не наш случай, молча пропускаем)
+    r = call(["rev-parse", "--abbrev-ref", "HEAD"])
+    if not r or r[0] != 0 or r[1] != branch:
+        return ""
+    # 2. чистое дерево? грязно → НЕ трогаем (ff отвергнет незакоммиченные правки, не спорим с ними)
+    r = call(["status", "--porcelain"])
+    if not r or r[0] != 0:
+        return ""                              # git недоступен — тихо
+    if r[1]:                                    # непустой вывод = есть незакоммиченные изменения
+        log.info("авто-фетч: рабочая копия грязная — git pull пропущен")
+        _cowork("авто-фетч: рабочая копия грязная — git pull пропущен (жду чистого дерева)")
+        return "грязно — пропуск"
+    # 3. fetch origin (сеть; сбой не критичен — повторим на следующем интервале)
+    r = call(["fetch", "origin"])
+    if not r or r[0] != 0:
+        detail = _tail(r[2], 160) if r else "git недоступен"
+        log.warning("авто-фетч: git fetch origin не удался — %s", detail)
+        _cowork(f"авто-фетч: git fetch origin не удался — {detail} (пропуск, повтор позже)")
+        return "fetch не удался"
+    # 4. локальный HEAD vs origin/<branch>
+    loc = call(["rev-parse", "HEAD"])
+    rem = call(["rev-parse", f"origin/{branch}"])
+    if not loc or loc[0] != 0 or not rem or rem[0] != 0:
+        return ""                              # нет отслеживаемой ветки/ref — тихо
+    if loc[1] == rem[1]:
+        return ""                              # уже актуально — нечего тянуть
+    # 5. ff возможен ТОЛЬКО если локальный HEAD — предок origin/<branch> (код 0 = предок)
+    anc = call(["merge-base", "--is-ancestor", "HEAD", f"origin/{branch}"])
+    if not anc:
+        return ""                              # git недоступен — тихо
+    if anc[0] != 0:
+        # HEAD НЕ предок origin → разошлись (есть локальные коммиты) → не-ff. НИКОГДА не merge/rebase.
+        log.warning("авто-фетч: локальный %s разошёлся с origin/%s (не-ff) — git pull пропущен", branch, branch)
+        _cowork(f"авто-фетч: локальный {branch} разошёлся с origin (не-ff) — git pull пропущен, нужен разбор")
+        return "не-ff (расхождение) — пропуск"
+    # 6. чистое дерево + строго позади + ff возможен → тянем fast-forward-only
+    r = call(["pull", "--ff-only", "origin", branch])
+    if not r or r[0] != 0:
+        detail = _tail(r[2], 160) if r else "git недоступен"
+        log.error("авто-фетч: git pull --ff-only не удался — %s", detail)
+        _cowork(f"авто-фетч: git pull --ff-only не удался — {detail}")
+        return "pull не удался"
+    nh = call(["rev-parse", "--short", "HEAD"])
+    short = nh[1] if nh and nh[0] == 0 else "?"
+    log.info("авто-фетч: fast-forward %s → %s (origin/%s) — штатный путь применит self-update/детей", branch, short, branch)
+    _cowork(f"авто-фетч: fast-forward {branch} → {short} (штатный путь тика применит self-update/детей)")
+    return f"ff → {short}"
+
+
+def maybe_git_ff_pull(now=None):
+    """Троттлинг авто-фетча: тело не чаще GIT_PULL_SEC. → строка|None (None = рано)."""
+    global _git_pull_last_run
+    now = time.time() if now is None else now
+    if now - _git_pull_last_run < GIT_PULL_SEC:
+        return None
+    _git_pull_last_run = now
+    return git_ff_pull_tick()
+
+
 # ------------------- реконсиляция детей на ЛЮБОЙ новый коммит (класс-фикс) ----
 # РАЗБОР c6d8a30: свежий код ДЕТЕЙ (suggest/pricing/booking/moderation_*) применялся к живым
 # процессам ТОЛЬКО когда (а) правку принёс дев-таск самого демона (maybe_update_bots по
@@ -2490,6 +2583,7 @@ def _main_loop():
             _loop_prev_wall = now
             poll_once()
             maybe_client_watchdog()   # часть 3: следим за pc_agent/userbot/moderation_bot (троттлинг 5 мин)
+            maybe_git_ff_pull()       # родитель #221: подтянуть origin/main ff-only ДО реконсиляции/self-update (тот же тик применит)
             maybe_reconcile_children()  # класс-фикс c6d8a30: применить свежий код детей на ЛЮБОЙ новый коммит
             if maybe_self_update():   # задача цикла обновила pc_orchestrator.py → эстафета новому
                 log.info("=== ДЕМОН ВЫШЕЛ ПО SELF-UPDATE (эстафета новому процессу) ===")

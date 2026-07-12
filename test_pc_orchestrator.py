@@ -1652,6 +1652,123 @@ class TestReconcileChildren(Base):
             o.reconcile_children_tick = save
 
 
+class TestGitFfPull(Base):
+    """Родитель #221: периодический git fetch + FAST-FORWARD-ONLY pull origin/<branch>.
+    Тянем ТОЛЬКО чистое дерево на целевой ветке, строго позади origin и с возможным ff.
+    Грязно / не-ff / другая ветка / сбой → пропуск + NOTE, pull НЕ вызывается. Никогда merge/rebase.
+    git-вызовы инъектируются — боевой git не трогаем."""
+
+    def setUp(self):
+        super().setUp()
+        self._save_gp = o._git_pull_last_run
+        o._git_pull_last_run = 0.0
+        self.cows = []
+        o._cowork = lambda s: self.cows.append(s)
+
+    def tearDown(self):
+        o._git_pull_last_run = self._save_gp
+        super().tearDown()
+
+    def _call(self, *, branch="main", status="", head="loc", origin="rem", is_ancestor=0,
+              fetch=(0, "", ""), pull=(0, "Updating loc..new1", ""), new_head="new1234ab", trace=None):
+        """Фейковый _git_call: диспетчеризация по git-подкоманде. trace копит выполненные команды."""
+        def call(args, timeout=90):
+            if trace is not None:
+                trace.append(tuple(args))
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, branch, "")
+            if args == ["status", "--porcelain"]:
+                return (0, status, "")
+            if args == ["fetch", "origin"]:
+                return fetch
+            if args == ["rev-parse", "HEAD"]:
+                return (0, head, "")
+            if args == ["rev-parse", f"origin/{branch}"]:
+                return (0, origin, "")
+            if args == ["merge-base", "--is-ancestor", "HEAD", f"origin/{branch}"]:
+                return (is_ancestor, "", "")
+            if args == ["pull", "--ff-only", "origin", branch]:
+                return pull
+            if args == ["rev-parse", "--short", "HEAD"]:
+                return (0, new_head, "")
+            raise AssertionError(f"неожиданный git-вызов: {args}")
+        return call
+
+    def test_ff_when_clean_and_behind(self):
+        # ГЛАВНОЕ: чистая копия, HEAD позади и предок origin → git pull --ff-only, метка-итог.
+        tr = []
+        note = o.git_ff_pull_tick(call_fn=self._call(head="loc", origin="rem", is_ancestor=0, trace=tr))
+        self.assertEqual(note, "ff → new1234ab")
+        self.assertIn(("pull", "--ff-only", "origin", "main"), tr)
+        self.assertTrue(any("fast-forward main → new1234ab" in s for s in self.cows))
+
+    def test_dirty_tree_skips_pull(self):
+        # грязное дерево → pull НЕ вызываем (не спорим с незакоммиченными правками).
+        tr = []
+        note = o.git_ff_pull_tick(call_fn=self._call(status=" M suggest.py", trace=tr))
+        self.assertEqual(note, "грязно — пропуск")
+        self.assertNotIn(("pull", "--ff-only", "origin", "main"), tr)
+        self.assertTrue(any("грязная" in s for s in self.cows))
+
+    def test_non_ff_divergence_skips_pull(self):
+        # локальные коммиты → HEAD не предок origin (не-ff) → пропуск + NOTE, НИКОГДА merge/rebase.
+        tr = []
+        note = o.git_ff_pull_tick(call_fn=self._call(is_ancestor=1, trace=tr))
+        self.assertEqual(note, "не-ff (расхождение) — пропуск")
+        self.assertNotIn(("pull", "--ff-only", "origin", "main"), tr)
+        self.assertTrue(any("не-ff" in s for s in self.cows))
+
+    def test_up_to_date_noop(self):
+        # HEAD == origin → уже актуально, тихий no-op (без pull, без NOTE).
+        tr = []
+        note = o.git_ff_pull_tick(call_fn=self._call(head="same", origin="same", trace=tr))
+        self.assertEqual((note, self.cows), ("", []))
+        self.assertNotIn(("pull", "--ff-only", "origin", "main"), tr)
+
+    def test_wrong_branch_noop(self):
+        # не на целевой ветке (feature/detached) → тихий пропуск, даже fetch не гоняем.
+        tr = []
+        note = o.git_ff_pull_tick(call_fn=self._call(branch="feature", trace=tr))
+        self.assertEqual(note, "")
+        self.assertNotIn(("fetch", "origin"), tr)
+
+    def test_fetch_failure_skips(self):
+        # сбой сети на fetch → пропуск + NOTE, pull НЕ вызываем.
+        tr = []
+        note = o.git_ff_pull_tick(call_fn=self._call(fetch=(1, "", "could not resolve host"), trace=tr))
+        self.assertEqual(note, "fetch не удался")
+        self.assertNotIn(("pull", "--ff-only", "origin", "main"), tr)
+
+    def test_pull_failure_reported(self):
+        # ff внезапно отвергнут самим git (гонка) → NOTE об ошибке, метка HEAD не двигается сама.
+        note = o.git_ff_pull_tick(call_fn=self._call(pull=(1, "", "Not possible to fast-forward")))
+        self.assertEqual(note, "pull не удался")
+        self.assertTrue(any("не удался" in s for s in self.cows))
+
+    def test_stop_flag_no_pull(self):
+        o._stopped = lambda: True
+        note = o.git_ff_pull_tick(call_fn=self._call(trace=[]))
+        self.assertEqual(note, "")
+
+    def test_git_unavailable_silent(self):
+        # git недоступен (call → None) → тихий пропуск без исключений.
+        note = o.git_ff_pull_tick(call_fn=lambda args, timeout=90: None)
+        self.assertEqual((note, self.cows), ("", []))
+
+    def test_throttle_skips_until_interval(self):
+        o._git_pull_last_run = 1000.0
+        called = {"n": 0}
+        save = o.git_ff_pull_tick
+        o.git_ff_pull_tick = lambda *a, **k: called.__setitem__("n", called["n"] + 1) or ""
+        try:
+            self.assertIsNone(o.maybe_git_ff_pull(now=1000.0 + o.GIT_PULL_SEC - 1))
+            self.assertEqual(called["n"], 0)
+            self.assertEqual(o.maybe_git_ff_pull(now=1000.0 + o.GIT_PULL_SEC + 1), "")
+            self.assertEqual(called["n"], 1)
+        finally:
+            o.git_ff_pull_tick = save
+
+
 class TestCommandLevers(Base):
     """(2) команды-рычаги: одиночная lane=pc задача-команда исполняется НАПРЯМУЮ, без headless claude."""
 
