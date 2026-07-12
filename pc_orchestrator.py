@@ -779,7 +779,7 @@ def _init_running_version():
 def _gate_unittests():
     """Гейт self-update ступень 2: unittest собственных тестов демона (новым кодом). → (ok, msg)."""
     try:
-        p = subprocess.run([VENV_PY, "-m", "unittest", "test_pc_orchestrator"], cwd=REPO,
+        p = subprocess.run([VENV_PY, "-m", "unittest", "test_pc_orchestrator", "test_pc_local_dec"], cwd=REPO,
                            capture_output=True, text=True, encoding="utf-8", errors="replace",
                            timeout=600)
         return p.returncode == 0, _tail((p.stderr or "") + (p.stdout or ""), 400)
