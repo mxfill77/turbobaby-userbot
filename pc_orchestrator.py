@@ -2109,7 +2109,16 @@ def git_ff_pull_tick(call_fn=None):
     if not anc:
         return ""                              # git недоступен — тихо
     if anc[0] != 0:
-        # HEAD НЕ предок origin → разошлись (есть локальные коммиты) → не-ff. НИКОГДА не merge/rebase.
+        # HEAD НЕ предок origin → ff НЕВОЗМОЖЕН. Различаем два случая по обратному merge-base:
+        #   (а) origin/<branch> — предок HEAD (код 0) → мы строго ВПЕРЕДИ: локальные коммиты ещё не
+        #       отправлены, fetch применять НЕЧЕГО. Норма после локального коммита до push → ТИХИЙ
+        #       пропуск (без NOTE: спамить cowork_log каждый интервал о штатном состоянии незачем).
+        #   (б) ни один не предок другого → истинное РАСХОЖДЕНИЕ (не-ff) → пропуск + NOTE, нужен разбор.
+        # В обоих случаях НИКОГДА не merge/rebase.
+        fwd = call(["merge-base", "--is-ancestor", f"origin/{branch}", "HEAD"])
+        if fwd and fwd[0] == 0:
+            log.info("авто-фетч: локальный %s впереди origin/%s — тянуть нечего (пропуск)", branch, branch)
+            return "впереди origin — пропуск"
         log.warning("авто-фетч: локальный %s разошёлся с origin/%s (не-ff) — git pull пропущен", branch, branch)
         _cowork(f"авто-фетч: локальный {branch} разошёлся с origin (не-ff) — git pull пропущен, нужен разбор")
         return "не-ff (расхождение) — пропуск"

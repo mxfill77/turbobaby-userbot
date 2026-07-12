@@ -1670,8 +1670,12 @@ class TestGitFfPull(Base):
         super().tearDown()
 
     def _call(self, *, branch="main", status="", head="loc", origin="rem", is_ancestor=0,
-              fetch=(0, "", ""), pull=(0, "Updating loc..new1", ""), new_head="new1234ab", trace=None):
-        """Фейковый _git_call: диспетчеризация по git-подкоманде. trace копит выполненные команды."""
+              rev_ancestor=1, fetch=(0, "", ""), pull=(0, "Updating loc..new1", ""),
+              new_head="new1234ab", trace=None):
+        """Фейковый _git_call: диспетчеризация по git-подкоманде. trace копит выполненные команды.
+        is_ancestor  = код `merge-base --is-ancestor HEAD origin`  (0 = HEAD предок origin → позади/ff).
+        rev_ancestor = код обратного `--is-ancestor origin HEAD`   (0 = origin предок HEAD → мы впереди;
+                       ≠0 = ни один не предок → истинное расхождение). Спрашивается лишь при is_ancestor≠0."""
         def call(args, timeout=90):
             if trace is not None:
                 trace.append(tuple(args))
@@ -1687,6 +1691,8 @@ class TestGitFfPull(Base):
                 return (0, origin, "")
             if args == ["merge-base", "--is-ancestor", "HEAD", f"origin/{branch}"]:
                 return (is_ancestor, "", "")
+            if args == ["merge-base", "--is-ancestor", f"origin/{branch}", "HEAD"]:
+                return (rev_ancestor, "", "")
             if args == ["pull", "--ff-only", "origin", branch]:
                 return pull
             if args == ["rev-parse", "--short", "HEAD"]:
@@ -1710,10 +1716,23 @@ class TestGitFfPull(Base):
         self.assertNotIn(("pull", "--ff-only", "origin", "main"), tr)
         self.assertTrue(any("грязная" in s for s in self.cows))
 
-    def test_non_ff_divergence_skips_pull(self):
-        # локальные коммиты → HEAD не предок origin (не-ff) → пропуск + NOTE, НИКОГДА merge/rebase.
+    def test_ahead_of_origin_skips_pull(self):
+        # КЛАСС «main впереди»: чисто, HEAD НЕ предок origin, но origin — предок HEAD → мы строго
+        # ВПЕРЕДИ (неотправленные локальные коммиты). ff нечего применять → ТИХИЙ пропуск БЕЗ NOTE
+        # (штатное состояние до push, спамить cowork_log незачем). pull НЕ вызываем, merge/rebase — нет.
         tr = []
-        note = o.git_ff_pull_tick(call_fn=self._call(is_ancestor=1, trace=tr))
+        note = o.git_ff_pull_tick(call_fn=self._call(head="ahead2", origin="behind1",
+                                                     is_ancestor=1, rev_ancestor=0, trace=tr))
+        self.assertEqual(note, "впереди origin — пропуск")
+        self.assertNotIn(("pull", "--ff-only", "origin", "main"), tr)
+        self.assertEqual(self.cows, [])                      # впереди — не NOTE-worthy
+
+    def test_non_ff_divergence_skips_pull(self):
+        # КЛАСС «расхождение»: HEAD не предок origin И origin не предок HEAD (истинный не-ff, есть
+        # локальные коммиты по обе стороны) → пропуск + NOTE, нужен разбор. НИКОГДА merge/rebase.
+        tr = []
+        note = o.git_ff_pull_tick(call_fn=self._call(head="fork_l", origin="fork_r",
+                                                     is_ancestor=1, rev_ancestor=1, trace=tr))
         self.assertEqual(note, "не-ff (расхождение) — пропуск")
         self.assertNotIn(("pull", "--ff-only", "origin", "main"), tr)
         self.assertTrue(any("не-ff" in s for s in self.cows))
