@@ -12,6 +12,7 @@ test_golden_llm.py — GOLDEN-тесты ПОВЕДЕНИЯ на РЕАЛЬНО�
 """
 import test_isolation  # noqa: F401 — TESTING=1, боевой IPC заблокирован, BRIDGE_URL='' → локальный FAQ
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -91,6 +92,29 @@ class TestGoldenLLM(unittest.TestCase):
         self.assertFalse(hit, f"§243/6: черновик переспросил уже собранное {hit}\nЧЕРНОВИК: {d}")
         self.assertTrue(any(w in d for w in ["получил", "приняли", "принял", "есть", "спасибо"]),
                         f"§243/6: не подтвердил получение данных:\n{d}")
+
+    def test_style_step6_no_regreet_no_kanc_short(self):
+        # шаг 6/7 #253 стилевой голден: ПРОДОЛЖЕНИЕ диалога (приветствие уже уходило) →
+        # без повторного приветствия, без канцелярита, ≤3 коротких абзаца; клиент уже
+        # назвал скутер (NMAX) → опыт на скутерах, «на чём ездили» повторно НЕ спрашиваем.
+        tr = ("[менеджер]: Здравствуйте! Что хотели бы арендовать и на какие даты?\n"
+              "[клиент]: Раньше катал NMAX, хочу такой же на неделю. Оплата картой можно?")
+        d = self._gen(tr, first=False).strip()
+        low = d.lower()
+        # 1) без повторного приветствия в начале ответа
+        head = d.lstrip("!.,:;-—–()«\"' \t\n")
+        self.assertIsNone(suggest._GREETING_RE.match(head),
+                          f"повторное приветствие в начале: {d}")
+        # 2) без канцелярита
+        for kanc in ("спасибо за информацию", "принято к сведению", "зафиксировала запрос",
+                     "записала ваш запрос", "уточню и вернусь с расчётом"):
+            self.assertNotIn(kanc, low, f"канцелярит просочился ({kanc!r}): {d}")
+        # 3) не переспрашивает опыт на скутерах в лоб (он уже дан)
+        for reask in ("на чём ездили", "на чем ездили", "какой был опыт", "какие модели были"):
+            self.assertNotIn(reask, low, f"переспросил уже данный опыт ({reask!r}): {d}")
+        # 4) ≤3 коротких абзаца (тон STYLE_GUIDE: коротко и по делу)
+        paras = [p for p in re.split(r"\n\s*\n", d) if p.strip()]
+        self.assertLessEqual(len(paras), 3, f"больше 3 абзацев (простыня): {d}")
 
     def test_firm_more_insistent_than_normal(self):
         t = ("[клиент]: Здравствуйте, NMAX на неделю?\n"

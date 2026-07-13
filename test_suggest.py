@@ -1382,6 +1382,18 @@ class TestPlaybook(unittest.TestCase):
         self.assertNotIn("฿", suggest.STYLE_FEWSHOT)
         self.assertIn("НЕ называй клиенту НИКАКУЮ цену", sysp)  # кап-политика на месте
 
+    def test_style_step6_no_regreet_noreask_no_kanc(self):
+        # шаг 6/7 #253: ПОВЕРХ STYLE_GUIDE — не здороваться повторно, не переспрашивать
+        # уже данное (клиент назвал скутер = опыт на скутерах), убрать канцелярит.
+        sysp = suggest.make_system_prompt("FAQ", "ru")
+        self.assertIn("Приветствие НЕ повторяем", sysp)
+        self.assertIn("опыт на скутерах — отлично", sysp)
+        self.assertIn("БЕЗ канцелярита", sysp)
+        self.assertIn("Спасибо за информацию", sysp)          # пример канцелярита-запрета вшит
+        # правила лежат в стилевом блоке (ниже FAQ и критфактов), стиль не подменяет факты
+        self.assertLess(sysp.index("СТИЛЬ ОТВЕТА"), sysp.index("Приветствие НЕ повторяем"))
+        self.assertLess(sysp.index("КРИТИЧНЫЕ ФАКТЫ"), sysp.index("БЕЗ канцелярита"))
+
     def test_playbook_empty_skipped_generation_ok(self):
         # пусто → блока нет, генерация цела (fail-safe)
         self.assertNotIn("КНИГА ПРАВИЛ", suggest.make_system_prompt("FAQ", "ru", playbook=""))
