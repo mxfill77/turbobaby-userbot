@@ -581,6 +581,13 @@ def process_new():
         return
     log.info("CLAIM id=%s in_progress", tid)
     _cowork(f"взял задачу #{tid} (in_progress)")
+    if _is_revizor_owner_card(text):
+        # осиротевшая owner-карточка ревизора (краш между claim и set_needs_approval): закрыть,
+        # НЕ гнать headless фиктивный текст (пересоздастся следующим прогоном ревизора). Штатно
+        # сюда не попадаем — ревизор claim'ит и штампует needs_approval синхронно в maybe_revizor.
+        bc.complete_task(tid, "done", "🔍 ревизор: осиротевшая owner-карточка закрыта")
+        _cowork(f"ревизор: осиротевшая owner-карточка #{tid} закрыта")
+        return
     cmd = _match_command(text)                 # команда-рычаг? исполняем САМИ, без headless claude
     if cmd:
         status, result = _exec_command(cmd)
@@ -634,6 +641,12 @@ def process_approved():
         tid = task.get("id")
         if _stopped():
             return
+        if _is_revizor_owner_card(task.get("task_text")):
+            # info-карточка ревизора: approve = «принято», без headless-прогона фиктивного текста
+            bc.complete_task(tid, "done", "🔍 owner-находки ревизора приняты Филиппом")
+            _cowork(f"ревизор: owner-карточка #{tid} принята (approve)")
+            log.info("APPROVED id=%s ревизор-owner-карточка → принято", tid)
+            continue
         if (_age_sec(task.get("updated")) or 0) > APPROVAL_TTL:
             log.info("APPROVED id=%s истёк (>%ss) → failed", tid, APPROVAL_TTL)
             # ⏱ первым символом: для шага локальной цепи просрочка approve = halt без думателя
@@ -669,6 +682,8 @@ def process_approval_timeouts():
         return
     for task in [it for it in r.get("items", []) if _lane_ok(it)]:
         tid = task.get("id")
+        if _is_revizor_owner_card(task.get("task_text")):
+            continue      # info-карточка ревизора живёт до решения человека — не гасим по таймауту
         if (_age_sec(task.get("updated")) or 0) > APPROVAL_TTL:
             log.info("NEEDS_APPROVAL id=%s таймаут (>%ss) → failed", tid, APPROVAL_TTL)
             msg = (f"{TIMEOUT_MARK} подтверждение не получено за 30 мин — задача провалена")
@@ -2787,8 +2802,213 @@ def maybe_revizor(now=None, db_path=None, state_path=None):
             pass
     since = st.get("last_run")                       # None на самом первом прогоне → бутстрап (не разгребаем)
     result = revizor_tick(since=since, now=now, db_path=db_path) if since else None
+    if result:
+        try:
+            _revizor_route(result, now=now)          # шаг 4/7 (262): думатель по окну + маршрутизация находок
+        except Exception as e:
+            log.warning("ревизор: маршрутизация находок упала (fail-safe, метку всё равно ставим): %s", e)
     _revizor_write_state(now, state_path)            # метку ставим ВСЕГДА (вкл. бутстрап) → следующий прогон ограничен
     return result
+
+
+# ------------------- РЕВИЗОР: МАРШРУТИЗАЦИЯ НАХОДОК (шаг 4/7 родителя 262) -----
+# revizor_tick собрал пакеты активных окон (шаг 2), _revizor_consult судит окно думателем (шаг 3).
+# Здесь — РАЗВОДКА находок по каналам (сам ревизор НИЧЕГО не правит и клиентам НЕ пишет):
+#   task  → зелёная задача дирижёру from=Filipp-pcloc-dec (тот декомпозирует и исполнит; красные
+#           шаги спросят «да» кнопкой). Бюджет ≤REVIZOR_DAILY_BUDGET/сутки и дедуп ПО КЛАССУ — оба
+#           RESTART-PROOF из маркеров очереди «[ревизор дата=… класс=…]», не из памяти процесса.
+#   owner → ОДНА сводная карточка «🔍 Ревизор: находки» в инбокс 1160 (NEEDS_APPROVAL_TOPIC): цитаты
+#           по окнам, редактируем СУЩЕСТВУЮЩУЮ (тот же tid, маркер [ревизор-находки]) с дедупом строк.
+#   noise → только лог (ложные срабатывания наружу не выносим).
+# Пусто (окна чисты) → тишина + NOTE «ревизор: N окон, чисто». Сбой думателя по окну → fail-safe
+# пропуск окна; все окна без ответа → NOTE о сбое (наружу тишина). Очередь недоступна (бюджет/дедуп
+# не сверить) → находки отложены до следующего прогона (НЕ флудим вслепую) + NOTE.
+REVIZOR_DAILY_BUDGET = int(os.getenv("REVIZOR_DAILY_BUDGET", "2") or "2")   # потолок задач-находок/сутки
+REVIZOR_OWNER_FROM = "Filipp-revizor"      # from синтетической owner-карточки (НЕ дирижёрская цепь pcloc-dec)
+REVIZOR_OWNER_MARK = "[ревизор-находки]"   # маркер сводной owner-карточки в инбоксе 1160 (дедуп/гарды)
+_REVIZOR_TASK_RE = re.compile(r"^\[ревизор дата=(\d{4}-\d{2}-\d{2}) класс=([^\]]*)\]")  # маркер задачи-находки
+_REVIZOR_LIVE = ("new", "in_progress", "needs_approval", "approved")
+
+
+def _is_revizor_owner_card(text):
+    """task_text синтетической owner-карточки ревизора? Маркер-гейт для гардов process_new/
+    process_approved/process_approval_timeouts (info-карточка живёт до решения, не headless-задача)."""
+    return str(text or "").startswith(REVIZOR_OWNER_MARK)
+
+
+def _revizor_today(now):
+    """UTC-дата прогона 'YYYY-MM-DD' — ключ суточного бюджета задач-находок (restart-proof из маркера)."""
+    return datetime.datetime.fromtimestamp(float(now), datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+def _revizor_task_markers(items):
+    """items очереди lane=pc → list[(дата, класс)] уже поставленных задач-находок ревизора (по маркеру
+    _REVIZOR_TASK_RE). Источник бюджета/дедупа — ОЧЕРЕДЬ (restart-proof), не память процесса."""
+    out = []
+    for it in (items or []):
+        m = _REVIZOR_TASK_RE.match(str(it.get("task_text") or ""))
+        if m:
+            out.append((m.group(1), (m.group(2) or "").strip()))
+    return out
+
+
+def _revizor_enqueue_tasks(task_findings, items, now):
+    """Находки action=task → зелёные родители дирижёру from=Filipp-pcloc-dec. Бюджет
+    ≤REVIZOR_DAILY_BUDGET/сутки и дедуп ПО КЛАССУ — оба restart-proof из маркеров очереди (items).
+    Дедуп: класс уже среди поставленных ревизором задач → пропуск. → (enqueued:int, skipped:int)."""
+    today = _revizor_today(now)
+    prior = _revizor_task_markers(items)
+    today_count = sum(1 for d, _c in prior if d == today)
+    seen_classes = {c for _d, c in prior if c}          # дедуп по классу среди всех задач-находок в очереди
+    enq = skip = 0
+    for idx, f in enumerate(task_findings):
+        if today_count >= REVIZOR_DAILY_BUDGET:
+            rem = len(task_findings) - idx
+            skip += rem
+            log.info("ревизор: суточный бюджет задач (%d) исчерпан — %d находок отложено", REVIZOR_DAILY_BUDGET, rem)
+            break
+        cls = (f.get("class") or "").strip()
+        tt = (f.get("task_text") or "").strip()
+        if not tt:
+            skip += 1
+            continue
+        if cls and cls in seen_classes:
+            skip += 1
+            log.info("ревизор: задача класса '%s' уже в очереди — дедуп, пропуск (окно %s)", cls, f.get("client_id"))
+            continue
+        text = f"[ревизор дата={today} класс={cls}] {tt}"[:RESULT_MAX]
+        ok, nid, err = enqueue_pc_task(text, frm=PC_LOCAL_DEC_FROM)
+        if ok:
+            enq += 1
+            today_count += 1
+            if cls:
+                seen_classes.add(cls)
+            log.info("ревизор: задача-находка класса '%s' → дирижёр id=%s (окно %s)", cls, nid, f.get("client_id"))
+        else:
+            skip += 1
+            log.warning("ревизор: enqueue задачи-находки не удался (%s)", err)
+    return enq, skip
+
+
+def _revizor_owner_card_text(owner_findings, prior_lines=()):
+    """Сводная owner-карточка «🔍 Ревизор: находки» → текст для инбокса 1160. Цитаты по окнам,
+    строка = «• [класс X] окно cid: <цитата>»; дедуп по ТОЧНОЙ строке (мердж со строками прошлой
+    карточки prior_lines, чтобы не потерять неразобранные находки прошлых прогонов). Пусто → ''."""
+    seen, lines = set(), []
+    for ln in prior_lines:
+        s = str(ln).strip()
+        if s.startswith("•") and s not in seen:
+            seen.add(s)
+            lines.append(s)
+    for f in owner_findings:
+        cls = (f.get("class") or "?").strip() or "?"
+        ev = (f.get("evidence") or "").strip()
+        if not ev:
+            continue
+        line = f"• [класс {cls}] окно {f.get('client_id')}: {ev}"
+        if line not in seen:
+            seen.add(line)
+            lines.append(line)
+    if not lines:
+        return ""
+    head = ("🔍 Ревизор: находки — требуют твоего решения (спорный тариф / политика / неоднозначный "
+            "кейс). Ревизор сам ничего не правит и клиентам не пишет.")
+    return (head + "\n" + "\n".join(lines))[:RESULT_MAX]
+
+
+def _revizor_prior_lines(item):
+    """Строки-цитаты «• …» из текста прошлой owner-карточки (best-effort: поле what|result item)."""
+    txt = str((item or {}).get("what") or (item or {}).get("result") or "")
+    return [ln for ln in txt.splitlines() if ln.strip().startswith("•")]
+
+
+def _revizor_find_owner_card(items):
+    """Существующая owner-карточка ревизора в очереди (needs_approval, по маркеру) → item | None."""
+    for it in (items or []):
+        if str(it.get("status")) == "needs_approval" and _is_revizor_owner_card(it.get("task_text")):
+            return it
+    return None
+
+
+def _revizor_post_owner_card(owner_findings, items):
+    """ОДНА сводная owner-карточка в инбокс 1160 (NEEDS_APPROVAL_TOPIC): редактируем СУЩЕСТВУЮЩУЮ
+    (тот же tid, маркер) либо создаём (enqueue → claim → set_needs_approval, синхронно — в 'new' не
+    задерживается; гард process_new подстрахует краш). Всё через Bridge; ревизор клиентам не пишет."""
+    prior = _revizor_find_owner_card(items)
+    prior_lines = _revizor_prior_lines(prior) if prior is not None else ()
+    what = _revizor_owner_card_text(owner_findings, prior_lines)
+    if not what:
+        return
+    if prior is not None:
+        tid = prior.get("id")
+        bc.set_needs_approval(tid, what, topic=NEEDS_APPROVAL_TOPIC)      # редактируем существующую карточку
+        log.info("ревизор: owner-карточка обновлена (tid=%s, инбокс %s)", tid, NEEDS_APPROVAL_TOPIC)
+        return
+    ok, tid, err = enqueue_pc_task(REVIZOR_OWNER_MARK + " сводная карточка находок ревизора", frm=REVIZOR_OWNER_FROM)
+    if not ok:
+        log.warning("ревизор: owner-карточка не встала в очередь (%s)", err)
+        return
+    bc.claim_task(tid)                          # new → in_progress → needs_approval (штатный красный путь)
+    bc.set_needs_approval(tid, what, topic=NEEDS_APPROVAL_TOPIC)
+    log.info("ревизор: owner-карточка создана (tid=%s, инбокс %s)", tid, NEEDS_APPROVAL_TOPIC)
+
+
+def _revizor_route(packages, now=None):
+    """Шаг 4/7 (262). Каждое окно → думатель-ревизор (_revizor_consult); находки маршрутизируем по
+    action: task → дирижёр (бюджет/дедуп), owner → карточка 1160, noise → лог. Пусто → тишина +
+    NOTE «N окон, чисто». Сбой думателя по окну → fail-safe пропуск; все окна без ответа → NOTE о
+    сбое. Ревизор сам НИЧЕГО не правит и клиентам НЕ пишет. → dict-сводка (для теста/лога)."""
+    pkgs = list(packages or [])
+    n = len(pkgs)
+    if not n:
+        return {"windows": 0, "tasks": 0, "owner": 0, "noise": 0, "failed": 0}
+    now = time.time() if now is None else now
+    task_f, owner_f, noise_n, failed = [], [], 0, 0
+    for pkg in pkgs:
+        findings = _revizor_consult(pkg)
+        if findings is None:                    # думатель упал/не распарсился → fail-safe пропуск окна
+            failed += 1
+            continue
+        cid = (pkg or {}).get("client_id")
+        for raw in findings:
+            f = dict(raw)
+            f["client_id"] = cid
+            act = f.get("action")
+            if act == "task":
+                task_f.append(f)
+            elif act == "owner":
+                owner_f.append(f)
+            else:
+                noise_n += 1
+    if noise_n:
+        log.info("ревизор: %d находок класса noise (ложные срабатывания) — только лог", noise_n)
+    if not task_f and not owner_f:              # окна чисты (или только шум/сбой) → наружу тишина, NOTE в журнал
+        if failed >= n:
+            _cowork(f"ревизор: думатель не ответил ни по одному из {n} окон — прогон пропущен")
+        else:
+            tail = f" (+{noise_n} шум)" if noise_n else ""
+            _cowork(f"ревизор: {n} окон, чисто{tail}")
+        return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed}
+    items = _loc_fetch_items()                  # снимок очереди (все статусы) — бюджет/дедуп/поиск карточки
+    if items is None:                           # частичная картина опаснее ожидания → откладываем, не флудим
+        _cowork(f"ревизор: очередь недоступна — {len(task_f)} задач и {len(owner_f)} owner-находок отложены до след. прогона")
+        return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed, "deferred": True}
+    enq = skip = 0
+    if task_f:
+        enq, skip = _revizor_enqueue_tasks(task_f, items, now)
+    if owner_f:
+        _revizor_post_owner_card(owner_f, items)
+    parts = []
+    if enq:
+        parts.append(f"{enq} задач дирижёру")
+    if owner_f:
+        parts.append(f"owner-карточка 1160 ({len(owner_f)} цитат)")
+    if failed:
+        parts.append(f"{failed} окон без ответа думателя")
+    if not parts:                               # находки были, но все отсеяны бюджетом/дедупом
+        parts.append(f"находки отсеяны (бюджет/дедуп): task {len(task_f)}, skip {skip}")
+    _cowork("ревизор: " + ", ".join(parts))
+    return {"windows": n, "tasks": enq, "owner": len(owner_f), "noise": noise_n, "failed": failed}
 
 
 # ------------------- OS-синглтон демона (разбор #128, часть 4) ----------------

@@ -48,11 +48,13 @@ class FakeBridge:
             t["result"] = result
         return {"ok": True}
 
-    def set_needs_approval(self, tid, what):
+    def set_needs_approval(self, tid, what, topic=None):
         t = self.tasks.get(tid)
         if t:
             t["status"] = "needs_approval"
             t["result"] = what
+            t["what"] = what
+            t["topic"] = topic
         return {"ok": True}
 
     def task_heartbeat(self, tid):
@@ -3351,15 +3353,16 @@ class TestRevizorState(unittest.TestCase):
     """Метка прошлого прогона (restart-proof) + троттлинг/бутстрап maybe_revizor."""
 
     def setUp(self):
-        self._save = (o._cowork, o._notify, o._revizor_on)
+        self._save = (o._cowork, o._notify, o._revizor_on, o._revizor_route)
         o._cowork = lambda line: None
         o._notify = lambda text: None
         o._revizor_on = lambda: True
+        o._revizor_route = lambda *a, **k: None   # маршрутизацию (реальный claude) тут не дёргаем — она отдельно
         self.tmp = tempfile.mkdtemp()
         self.state = os.path.join(self.tmp, "revizor_state.json")
 
     def tearDown(self):
-        (o._cowork, o._notify, o._revizor_on) = self._save
+        (o._cowork, o._notify, o._revizor_on, o._revizor_route) = self._save
 
     def test_read_missing_state_is_empty(self):
         self.assertEqual(o._revizor_read_state(path=self.state), {})
@@ -3421,6 +3424,226 @@ class TestRevizorState(unittest.TestCase):
         # гейтит повторный прогон даже сразу после старта (в отличие от in-memory троттла).
         o._revizor_write_state(2_000_000.0, path=self.state)
         self.assertIsNone(o.maybe_revizor(now=2_000_000.0 + 5, state_path=self.state))
+
+
+# --------------------------- РЕВИЗОР: МАРШРУТИЗАЦИЯ (шаг 4/7, 262) ---------------------------
+
+_REV_NOW = 1_752_400_000.0   # фикс. wall-clock для стабильной даты бюджета (Date.now не дёргаем)
+
+
+class TestRevizorRouteHelpers(unittest.TestCase):
+    """Чистые части маршрутизации: маркеры бюджета/дедупа, текст owner-карточки."""
+
+    def test_today_utc_date(self):
+        self.assertEqual(len(o._revizor_today(_REV_NOW)), 10)          # YYYY-MM-DD
+        self.assertEqual(o._revizor_today(_REV_NOW), o._revizor_today(_REV_NOW + 3600))  # тот же день
+
+    def test_task_markers_parse(self):
+        today = o._revizor_today(_REV_NOW)
+        items = [{"task_text": f"[ревизор дата={today} класс=а] фикс детекта"},
+                 {"task_text": f"[ревизор дата=2020-01-01 класс=ж] старое"},
+                 {"task_text": "[шаг 1/3 родитель 5] обычный шаг"},   # не наш маркер
+                 {"task_text": None}]
+        got = o._revizor_task_markers(items)
+        self.assertEqual(got, [(today, "а"), ("2020-01-01", "ж")])
+
+    def test_owner_card_text_dedup_and_merge(self):
+        f = [{"class": "г", "evidence": "утечка «собрано»", "client_id": 555},
+             {"class": "г", "evidence": "утечка «собрано»", "client_id": 555},   # дубль → 1 строка
+             {"class": "", "evidence": "", "client_id": 7}]                       # пустая улика → пропуск
+        prior = ["• [класс а] окно 111: чужой тариф", "мусор не-строка"]
+        txt = o._revizor_owner_card_text(f, prior)
+        self.assertIn("🔍 Ревизор: находки", txt)
+        self.assertIn("окно 111", txt)                     # строка прошлой карточки сохранена
+        self.assertEqual(txt.count("утечка «собрано»"), 1)  # дедуп сработал
+        self.assertNotIn("окно 7", txt)                    # пустая улика не попала
+
+    def test_owner_card_text_empty(self):
+        self.assertEqual(o._revizor_owner_card_text([], ()), "")
+
+    def test_prior_lines_extracts_bullets(self):
+        item = {"what": "заголовок\n• [класс а] окно 1: x\nне буллет\n• [класс б] окно 2: y"}
+        self.assertEqual(o._revizor_prior_lines(item), ["• [класс а] окно 1: x", "• [класс б] окно 2: y"])
+
+    def test_is_owner_card_marker(self):
+        self.assertTrue(o._is_revizor_owner_card(o.REVIZOR_OWNER_MARK + " ..."))
+        self.assertFalse(o._is_revizor_owner_card("[шаг 1/2 родитель 3] x"))
+        self.assertFalse(o._is_revizor_owner_card(None))
+
+
+class TestRevizorEnqueueBudget(Base):
+    """Бюджет ≤2/сутки и дедуп по классу задач-находок — restart-proof из маркеров очереди."""
+
+    def _f(self, cls, cid=555, task="фикс детекта класса " + "x"):
+        return {"class": cls, "action": "task", "task_text": task, "client_id": cid}
+
+    def test_enqueue_puts_dec_parent(self):
+        enq, skip = o._revizor_enqueue_tasks([self._f("а")], [], _REV_NOW)
+        self.assertEqual((enq, skip), (1, 0))
+        news = [t for t in self.fb.tasks.values() if t["status"] == "new"]
+        self.assertEqual(len(news), 1)
+        self.assertEqual(news[0]["from"], o.PC_LOCAL_DEC_FROM)       # зелёный родитель дирижёру
+        self.assertTrue(news[0]["task_text"].startswith(f"[ревизор дата={o._revizor_today(_REV_NOW)} класс=а]"))
+
+    def test_budget_caps_at_two_per_day(self):
+        today = o._revizor_today(_REV_NOW)
+        items = [{"task_text": f"[ревизор дата={today} класс=а] уже", "status": "done"},
+                 {"task_text": f"[ревизор дата={today} класс=б] уже", "status": "done"}]
+        enq, skip = o._revizor_enqueue_tasks([self._f("в"), self._f("г")], items, _REV_NOW)
+        self.assertEqual(enq, 0)                                     # бюджет уже исчерпан сегодня
+        self.assertEqual(skip, 2)
+        self.assertEqual(len([t for t in self.fb.tasks.values()]), 0)
+
+    def test_budget_ignores_other_days(self):
+        items = [{"task_text": "[ревизор дата=2020-01-01 класс=а] вчера", "status": "done"},
+                 {"task_text": "[ревизор дата=2020-01-02 класс=б] позавчера", "status": "done"}]
+        enq, _skip = o._revizor_enqueue_tasks([self._f("в")], items, _REV_NOW)
+        self.assertEqual(enq, 1)                                     # прошлые дни бюджет сегодня не жгут
+
+    def test_dedup_by_class(self):
+        today = o._revizor_today(_REV_NOW)
+        items = [{"task_text": f"[ревизор дата={today} класс=а] уже есть", "status": "new"}]
+        enq, skip = o._revizor_enqueue_tasks([self._f("а"), self._f("б")], items, _REV_NOW)
+        self.assertEqual((enq, skip), (1, 1))                        # класс «а» дедуп, «б» поставлен
+        self.assertTrue(any("класс=б]" in t["task_text"] for t in self.fb.tasks.values()))
+
+    def test_dedup_within_batch(self):
+        enq, skip = o._revizor_enqueue_tasks([self._f("а"), self._f("а")], [], _REV_NOW)
+        self.assertEqual((enq, skip), (1, 1))                        # второй той же партии — дедуп
+
+
+class TestRevizorOwnerCard(Base):
+    """Сводная owner-карточка в инбокс 1160: создание, редактирование существующей, дедуп."""
+
+    def _f(self, cls="г", ev="спорный тариф", cid=555):
+        return {"class": cls, "action": "owner", "evidence": ev, "client_id": cid}
+
+    def test_create_new_card_to_1160(self):
+        o._revizor_post_owner_card([self._f()], [])
+        cards = [t for t in self.fb.tasks.values() if t["status"] == "needs_approval"]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["topic"], o.NEEDS_APPROVAL_TOPIC)     # тема = инбокс одобрений (1160 в проде)
+        self.assertEqual(cards[0]["from"], o.REVIZOR_OWNER_FROM)
+        self.assertTrue(cards[0]["task_text"].startswith(o.REVIZOR_OWNER_MARK))
+        self.assertIn("спорный тариф", cards[0]["what"])
+
+    def test_edit_existing_card_not_second(self):
+        tid = self.fb.add(status="needs_approval", task_text=o.REVIZOR_OWNER_MARK + " карточка")
+        self.fb.tasks[tid]["what"] = "🔍 Ревизор: находки\n• [класс а] окно 111: старое"
+        items = [dict(t) for t in self.fb.tasks.values()]
+        o._revizor_post_owner_card([self._f(cls="г", ev="новое", cid=222)], items)
+        cards = [t for t in self.fb.tasks.values() if t["status"] == "needs_approval"]
+        self.assertEqual(len(cards), 1)                                # НЕ вторая карточка — редактируем ту же
+        self.assertEqual(cards[0]["id"], tid)
+        self.assertIn("окно 111", cards[0]["what"])                    # старая находка сохранена (мердж)
+        self.assertIn("новое", cards[0]["what"])                       # новая добавлена
+
+    def test_empty_findings_no_card(self):
+        o._revizor_post_owner_card([{"class": "г", "evidence": "", "client_id": 1}], [])
+        self.assertEqual([t for t in self.fb.tasks.values() if t["status"] == "needs_approval"], [])
+
+
+class TestRevizorRoute(Base):
+    """Полная маршрутизация _revizor_route: разводка task/owner/noise, пусто/сбой → тишина+NOTE."""
+
+    def setUp(self):
+        super().setUp()
+        self._save_c = (o._revizor_consult,)
+        self.notes = []
+        o._cowork = lambda line: self.notes.append(line)
+
+    def tearDown(self):
+        (o._revizor_consult,) = self._save_c
+        super().tearDown()
+
+    def _consult(self, mapping):
+        """mapping: client_id → находки|None. Инъектируем вместо реального думателя."""
+        o._revizor_consult = lambda pkg: mapping.get(pkg.get("client_id"))
+
+    def test_empty_windows_note_clean(self):
+        self._consult({1: [], 2: []})
+        out = o._revizor_route([{"client_id": 1}, {"client_id": 2}], now=_REV_NOW)
+        self.assertEqual((out["tasks"], out["owner"]), (0, 0))
+        self.assertTrue(any("2 окон, чисто" in n for n in self.notes))
+        self.assertEqual([t for t in self.fb.tasks.values()], [])      # тишина: ничего не поставили
+
+    def test_all_thinker_fail_note_silence(self):
+        self._consult({1: None, 2: None})                              # думатель по всем окнам упал
+        out = o._revizor_route([{"client_id": 1}, {"client_id": 2}], now=_REV_NOW)
+        self.assertEqual(out["failed"], 2)
+        self.assertTrue(any("не ответил" in n for n in self.notes))
+        self.assertEqual([t for t in self.fb.tasks.values()], [])      # наружу тишина
+
+    def test_task_routed_to_dirijor(self):
+        self._consult({1: [{"class": "ж", "action": "task", "task_text": "котировать, не анкетировать"}]})
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual(out["tasks"], 1)
+        news = [t for t in self.fb.tasks.values() if t["status"] == "new"]
+        self.assertEqual(news[0]["from"], o.PC_LOCAL_DEC_FROM)
+        self.assertIn("котировать", news[0]["task_text"])
+
+    def test_owner_routed_to_card(self):
+        self._consult({1: [{"class": "г", "action": "owner", "evidence": "спорный тариф"}]})
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual(out["owner"], 1)
+        cards = [t for t in self.fb.tasks.values() if t["status"] == "needs_approval"]
+        self.assertEqual(len(cards), 1)
+        self.assertIn("спорный тариф", cards[0]["what"])
+
+    def test_noise_only_logged_no_side_effects(self):
+        self._consult({1: [{"class": "в", "action": "noise", "evidence": "ложное"}]})
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual((out["tasks"], out["owner"], out["noise"]), (0, 0, 1))
+        self.assertEqual([t for t in self.fb.tasks.values()], [])      # noise наружу не выносим
+
+    def test_queue_unavailable_defers(self):
+        self._consult({1: [{"class": "ж", "action": "task", "task_text": "фикс"}]})
+        save = o._loc_fetch_items
+        try:
+            o._loc_fetch_items = lambda: None                          # очередь недоступна
+            out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        finally:
+            o._loc_fetch_items = save
+        self.assertTrue(out.get("deferred"))
+        self.assertEqual(out["tasks"], 0)
+        self.assertTrue(any("очередь недоступна" in n for n in self.notes))
+
+    def test_empty_packages_no_note(self):
+        self._consult({})
+        out = o._revizor_route([], now=_REV_NOW)
+        self.assertEqual(out["windows"], 0)
+        self.assertEqual(self.notes, [])                               # окон нет вовсе → даже NOTE не пишем
+
+
+class TestRevizorGuards(Base):
+    """Маркер-гарды owner-карточки в process_new/approved/approval_timeouts."""
+
+    def test_orphan_card_in_new_closed_not_run(self):
+        tid = self.fb.add(status="new", task_text=o.REVIZOR_OWNER_MARK + " осиротела")
+        ran = {"n": 0}
+        _save = o.run_task
+        self.addCleanup(lambda: setattr(o, "run_task", _save))
+        o.run_task = lambda *a, **k: ran.__setitem__("n", ran["n"] + 1) or ("done", "x")
+        o.process_new()
+        self.assertEqual(ran["n"], 0)                                  # headless НЕ запускали
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+
+    def test_approval_timeout_skips_card(self):
+        tid = self.fb.add(status="needs_approval", task_text=o.REVIZOR_OWNER_MARK + " карточка",
+                          updated="2000-01-01T00:00:00+00:00")        # заведомо просрочена
+        o.process_approval_timeouts()
+        self.assertEqual(self.fb.tasks[tid]["status"], "needs_approval")  # НЕ погашена по таймауту
+
+    def test_approved_card_acknowledged_not_rerun(self):
+        tid = self.fb.add(status="approved", task_text=o.REVIZOR_OWNER_MARK + " карточка")
+        ran = {"n": 0}
+        _save = o.run_task
+        self.addCleanup(lambda: setattr(o, "run_task", _save))
+        o.run_task = lambda *a, **k: ran.__setitem__("n", ran["n"] + 1) or ("done", "x")
+        o.process_approved()
+        self.assertEqual(ran["n"], 0)                                  # approve не гонит headless
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+        self.assertIn("приняты", self.fb.tasks[tid]["result"])
 
 
 if __name__ == "__main__":
