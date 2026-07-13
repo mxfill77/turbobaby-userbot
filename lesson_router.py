@@ -1,0 +1,276 @@
+# -*- coding: utf-8 -*-
+"""
+lesson_router.py — обработчик задачи-урока для дирижёра (родитель 292, шаг 3/7).
+
+Урок (реплай-обучение менеджера на карточку черновика) уже прошёл шаги 1–2:
+moderation_core.process_lesson распознал замечание, submit_lesson поставил его ШТАТНОЙ
+задачей в очередь дирижёра (from=Filipp-pcloc-dec) с полным контекстом (build_lesson_task).
+Здесь — то, что делает дирижёр, забрав такую задачу: КЛАССИФИЦИРУЕТ замечание и МАРШРУТИЗИРУЕТ
+
+  • СТИЛЬ    — тон/длина/формулировка/приветствие/эмодзи/канцелярит → дописать правило в
+              «книгу правил» (playbook «Выученные правила», слой ПОВЕРХ STYLE_GUIDE);
+  • ФАКТ/ЛОГИКА — неверная цена/факт/модель/дата/правило расчёта/FAQ → правка кода/критфактов
+              /FAQ С ТЕСТОМ; это работа думателя → делегируем локальному планировщику
+              (delegate=True) с явным требованием теста; сами код не трогаем;
+  • НАДЗОР   — «ревизор должен ловить …» → дописать строку-класс в docs/revizor_checklist.md
+              (живой чек-лист думателя-ревизора; правило подхватится следующим тиком);
+  • НЕЯСНОЕ  — сигнал не распознан либо противоречив → карточка-уточнение ВЛАДЕЛЬЦУ в 1160,
+              НЕ УГАДЫВАЕМ (лучше переспросить человека, чем внести мусор в правила/код).
+
+КРАСНОЕ: Bridge / таблицы / деньги здесь НЕ трогаем. Стилевой append и надзорный append —
+чисто ТЕКСТОВЫЕ правки доков (playbook / чек-лист); факт/логика уходит планировщику, который
+сам ничего в деньги не пишет. Все побочные эффекты (запись доков, пуш в 1160) ИНЪЕКТИРУЕМЫ —
+модуль без I/O проверяется юнитом; боевые дефолты подтягиваются лениво.
+"""
+
+import os
+import re
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+REVIZOR_CHECKLIST = os.path.join(REPO, "docs", "revizor_checklist.md")
+
+# --- распознавание задачи-урока (формат moderation_core.build_lesson_task) ----------------
+# Первая строка билдера: «[урок:<kind> от @who] родитель 292 — …». Достаточно префикса «[урок:».
+_LESSON_HEAD_RE = re.compile(r"^\s*\[урок:", re.IGNORECASE)
+# Поля из тела задачи (мягкий парс — если формат чуть уедет, деградируем, а не падаем):
+_REMARK_RE = re.compile(r"(?ms)^Замечание:\s*(.+?)\s*(?:^Исходный черновик:|\Z)")
+_HEAD_META_RE = re.compile(r"^\s*\[урок:(?P<kind>[^\]]*?)\s+от\s+(?P<who>@?\S+)\]", re.IGNORECASE)
+_WINDOW_RE = re.compile(r"(?im)^окно диалога:\s*(.+)$")
+
+
+def is_lesson_task(text):
+    """True, если текст задачи — распознанный урок (шапка build_lesson_task «[урок:…]»)."""
+    return bool(_LESSON_HEAD_RE.match(str(text or "")))
+
+
+def parse_lesson_task(text):
+    """Разобрать задачу-урок в dict {remark, kind, who, window}. Всё best-effort: недостающее —
+    пустой строкой (классификатор работает по remark; остальное — только для карточки владельцу)."""
+    t = str(text or "")
+    m = _REMARK_RE.search(t)
+    remark = (m.group(1).strip() if m else "")
+    hm = _HEAD_META_RE.match(t)
+    kind = (hm.group("kind").strip() if hm else "")
+    who = (hm.group("who").strip() if hm else "")
+    wm = _WINDOW_RE.search(t)
+    window = (wm.group(1).strip() if wm else "")
+    return {"remark": remark, "kind": kind, "who": who, "window": window}
+
+
+# ------------------------------- классификация замечания ----------------------------------
+# Порядок приоритета намеренно НАДЗОР → ФАКТ → СТИЛЬ: явное упоминание системы-ревизора («ревизор
+# должен ловить…») — это надзор, даже если замечание попутно про приветствие; конкретный
+# фактический дефект (цена/депозит/модель) важнее общего тона. Сигнала нет вовсе → НЕЯСНОЕ
+# (не угадываем: пустое/размытое «плохо, переделай» уйдёт владельцу на уточнение).
+STYLE = "style"
+FACT = "fact"
+SUPERVISION = "supervision"
+UNCLEAR = "unclear"
+
+# НАДЗОР — замечание про сам ДЕТЕКТ/ревизора/чек-лист (что бот-надзор должен ЛОВИТЬ).
+_SUPERVISION_KW = (
+    "ревизор", "ревизора", "ревизору", "надзор", "детект", "детектор", "чек-лист", "чеклист",
+    "checklist", "supervis", "detector", "должен ловить", "должна ловить", "не поймал",
+    "не отловил", "пропустил находку", "автоприветств", "класс дефект", "новый класс",
+    "add to checklist", "should catch", "should flag", "should detect",
+)
+# ФАКТ/ЛОГИКА — неверные данные/расчёт/факт/FAQ (правится в коде/критфактах/FAQ, нужен тест).
+_FACT_KW = (
+    "цена", "цену", "цены", "стоимост", "тариф", "депозит", "скидк", "расч", "посчит", "считает",
+    "сумма", "сумму", "неправильн", "неверн", "ошиб", "врёт", "врет", "путает", "перепутал",
+    "факт", "модел", "марк", "байк", "скутер", "дата", "даты", "срок", "наличи", "парк",
+    "доставк", "логик", "формул", "правило расч", "wrong", "incorrect", "price", "deposit",
+    "discount", "model", "date", "fact", "calculation", "faq",
+)
+# СТИЛЬ — тон/длина/формулировка/приветствие/эмодзи/вежливость (правится правилом в playbook).
+_STYLE_KW = (
+    "тон", "груб", "сух", "холодн", "теплее", "живее", "по-человечески", "по человечески",
+    "длинн", "коротк", "короч", "простын", "многослов", "лаконичн", "эмодзи", "смайл", "приветств",
+    "здоровайся", "здороваться", "поздоровал", "канцелярит", "казённ", "казенн", "официоз",
+    "пафос", "формулиров", "звучит", "фраз", "вежлив", "мягче", "тепло", "greeting", "tone",
+    "wording", "phrasing", "shorter", "longer", "warmer", "friendlier", "polite", "emoji",
+)
+
+
+def _hits(low, kws):
+    return sum(1 for k in kws if k in low)
+
+
+def classify_lesson_remark(remark):
+    """Классифицировать замечание менеджера → (route, reason). route ∈ style|fact|supervision|
+    unclear. Пустое/безсигнальное («плохо, переделай») → unclear (НЕ угадываем — уйдёт владельцу).
+    Приоритет НАДЗОР→ФАКТ→СТИЛЬ: явный маркер старшей категории выигрывает у попутных слов младшей."""
+    low = " ".join(str(remark or "").split()).lower()
+    if not low:
+        return UNCLEAR, "пустое замечание"
+    sup, fact, sty = _hits(low, _SUPERVISION_KW), _hits(low, _FACT_KW), _hits(low, _STYLE_KW)
+    if sup:
+        return SUPERVISION, f"надзор-сигнал ({sup})"
+    if fact:
+        return FACT, f"факт/логика-сигнал ({fact})"
+    if sty:
+        return STYLE, f"стиль-сигнал ({sty})"
+    return UNCLEAR, "ни стиль, ни факт, ни надзор не распознаны"
+
+
+# ------------------------------- надзорный append (чек-лист ревизора) ---------------------
+# Русский алфавит для авто-выбора буквы нового класса (поле "class" находки ревизора = буква).
+_ALPHABET = "абвгдежзиклмнопрстуфхцчшщэюя"
+_CHECK_CLASS_RE = re.compile(r"^-\s*\[класс\s+(\S+)\]", re.IGNORECASE)
+
+
+def _next_class_letter(text):
+    """Следующая свободная буква класса по уже занятым в чек-листе (макс+1 по алфавиту). Все буквы
+    заняты / не распарсили → '' (вызывающий подставит fallback-метку)."""
+    used = set()
+    for ln in str(text or "").splitlines():
+        m = _CHECK_CLASS_RE.match(ln.strip())
+        if m:
+            used.add(m.group(1).strip().lower())
+    idx = -1
+    for i, ch in enumerate(_ALPHABET):
+        if ch in used:
+            idx = i
+    for ch in _ALPHABET[idx + 1:]:
+        if ch not in used:
+            return ch
+    return ""
+
+
+def _one_line(s):
+    return " ".join(str(s or "").split()).strip()
+
+
+def append_checklist_class(remark, path=None):
+    """Дописать НОВЫЙ класс-правило «- [класс X] <замечание>;» в docs/revizor_checklist.md (живой
+    чек-лист думателя-ревизора; правило попадёт в преамбулу СЛЕДУЮЩЕГО тика без правки кода). Только
+    ТЕКСТ чек-листа — Bridge/таблицы/деньги не касаемся. Дедуп по нормализованному тексту.
+    → 'added' | 'duplicate' | 'error' (FAIL-SAFE: файл недоступен → 'error', вызывающий не падает)."""
+    rule = _one_line(remark)
+    if not rule:
+        return "error"
+    p = path or REVIZOR_CHECKLIST
+    try:
+        with open(p, encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        return "error"
+    norm = rule.rstrip(";.").lower()
+    for ln in text.splitlines():
+        m = _CHECK_CLASS_RE.match(ln.strip())
+        if m and norm and norm in ln.lower():
+            return "duplicate"
+    letter = _next_class_letter(text) or "новый"
+    bullet = f"- [класс {letter}] {rule.rstrip(';')};"
+    # Вставляем после последней строки-класса (перед возможным хвостом файла), иначе — в конец.
+    lines = text.splitlines()
+    last = max((i for i, ln in enumerate(lines) if _CHECK_CLASS_RE.match(ln.strip())), default=None)
+    if last is None:
+        new_text = text.rstrip() + "\n" + bullet + "\n"
+    else:
+        lines.insert(last + 1, bullet)
+        new_text = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        return "added"
+    except Exception:
+        return "error"
+
+
+# ------------------------------- стилевой append (книга правил) ---------------------------
+def _default_append_style(rule):
+    """Боевой стилевой sink: правило → playbook «Выученные правила» (слой ПОВЕРХ STYLE_GUIDE в
+    промпте клиентского бота). Ленивый импорт suggest — тяжёлый модуль тянем только на реальном
+    уроке. → 'added' | 'duplicate' | 'error'."""
+    import suggest
+    return suggest.append_playbook_rule(rule)
+
+
+def _default_notify_owner(_card):
+    """Дефолт-заглушка канала владельца (1160): в standalone канала нет → False (не доставлено).
+    Демон-дирижёр инъектирует боевой sink (_notify_critical → инбокс 1160)."""
+    return False
+
+
+# ------------------------------- карточка-уточнение владельцу (1160) -----------------------
+def build_owner_clarification_card(parsed, reason=""):
+    """Карточка владельцу для НЕЯСНОГО урока: что за замечание, по какому окну, почему не поняли —
+    и просьба переформулировать (правка:/урок:/не так:) конкретнее. НЕ угадываем за владельца."""
+    remark = _one_line(parsed.get("remark")) or "(без текста)"
+    who = parsed.get("who") or "?"
+    window = parsed.get("window") or "?"
+    tail = f" — {reason}" if reason else ""
+    return ("🤔 Неясный урок — нужна расшифровка (не угадываю)\n"
+            f"От: {who} · {window}\n"
+            f"Замечание: {remark}\n"
+            f"Не понял, это про СТИЛЬ, ФАКТ/ЛОГИКУ или НАДЗОР{tail}. "
+            "Переформулируй конкретнее (правка:/урок:/не так:) — что именно поправить.")
+
+
+# ------------------------------- обработчик задачи-урока ----------------------------------
+def handle_lesson_task(text, append_style=None, append_checklist=None, notify_owner=None):
+    """Классифицировать урок и МАРШРУТИЗИРОВАТЬ. → dict:
+      route      — style|fact|supervision|unclear;
+      delegate   — True ТОЛЬКО для fact/логика (вызывающий отдаёт задачу планировщику; правка
+                   кода/критфактов/FAQ + ТЕСТ — работа думателя, не наша);
+      delegate_text — augmented-текст с требованием теста (для планировщика), иначе None;
+      status/result — для НЕ-delegate веток: как закрыть задачу (done/failed) и текст карточки.
+    Побочки инъектируемы (юнит подставляет фейки); боевые дефолты — playbook / чек-лист / 1160.
+    FAIL-SAFE: сбой любого sink → failed-карта (замечание НЕ теряем — видно владельцу, повторят)."""
+    parsed = parse_lesson_task(text)
+    remark = parsed["remark"]
+    route, reason = classify_lesson_remark(remark)
+    a_style = append_style or _default_append_style
+    a_check = append_checklist or append_checklist_class
+    notify = notify_owner or _default_notify_owner
+
+    if route == SUPERVISION:
+        try:
+            res = a_check(remark)
+        except Exception as e:                       # noqa: BLE001 — sink не должен ронять дирижёра
+            res = "error"; reason = f"{reason}; sink: {e}"
+        if res == "added":
+            return {"route": route, "delegate": False, "status": "done", "reason": reason,
+                    "result": f"🔍 НАДЗОР-урок: правило дописано в чек-лист ревизора — «{_one_line(remark)}»"}
+        if res == "duplicate":
+            return {"route": route, "delegate": False, "status": "done", "reason": reason,
+                    "result": f"🔍 НАДЗОР-урок: такое правило в чек-листе уже есть — «{_one_line(remark)}»"}
+        return {"route": route, "delegate": False, "status": "failed", "reason": reason,
+                "result": f"⚠️ НАДЗОР-урок не записан в чек-лист (sink={res}) — повтори: «{_one_line(remark)}»"}
+
+    if route == STYLE:
+        try:
+            res = a_style(remark)
+        except Exception as e:                       # noqa: BLE001
+            res = "error"; reason = f"{reason}; sink: {e}"
+        if res == "added":
+            return {"route": route, "delegate": False, "status": "done", "reason": reason,
+                    "result": f"📝 СТИЛЬ-урок: правило добавлено в книгу правил — «{_one_line(remark)}»"}
+        if res == "duplicate":
+            return {"route": route, "delegate": False, "status": "done", "reason": reason,
+                    "result": f"📝 СТИЛЬ-урок: такое правило уже есть — «{_one_line(remark)}»"}
+        return {"route": route, "delegate": False, "status": "failed", "reason": reason,
+                "result": f"⚠️ СТИЛЬ-урок не записан (sink={res}) — повтори: «{_one_line(remark)}»"}
+
+    if route == FACT:
+        # ФАКТ/ЛОГИКА: правка FAQ/критфактов/кода + ТЕСТ — работа думателя. Делегируем локальному
+        # планировщику (декомпозиция в шаги). Явно требуем тест и запрещаем Bridge/деньги.
+        note = ("\n\n[дирижёр: это ФАКТ/ЛОГИКА-урок] Разложи в шаги и поправь причину в коде/"
+                "критфактах/FAQ. ОБЯЗАТЕЛЬНО добавь юнит-тест с ДОСЛОВНОЙ фразой клиента из окна "
+                "(golden-правило CLAUDE.md). Bridge/таблицы/деньги НЕ трогай.")
+        return {"route": route, "delegate": True, "reason": reason,
+                "delegate_text": str(text or "") + note,
+                "status": "done", "result": "🛠 ФАКТ/ЛОГИКА-урок → локальному планировщику (правка+тест)"}
+
+    # UNCLEAR — не угадываем: карточка-уточнение владельцу в 1160.
+    card = build_owner_clarification_card(parsed, reason)
+    try:
+        delivered = bool(notify(card))
+    except Exception as e:                           # noqa: BLE001
+        delivered = False; reason = f"{reason}; notify: {e}"
+    result = ("🤔 Неясный урок → карточка-уточнение владельцу в 1160 (не угадываю)"
+              if delivered else
+              "🤔 Неясный урок: канал 1160 недоступен — карточка не доставлена, замечание в логе")
+    return {"route": UNCLEAR, "delegate": False, "status": "done", "reason": reason,
+            "result": result, "card": card, "delivered": delivered}

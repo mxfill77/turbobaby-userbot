@@ -40,6 +40,8 @@ import subprocess
 import urllib.request
 import urllib.parse
 
+import lesson_router          # обработчик задач-уроков (родитель 292, шаг 3): классификация+маршрут; suggest тянет лениво
+
 REPO = r"D:\turbobaby-bot"
 
 # .env грузим ДО чтения любых config-констант ниже (CLAUDE_BIN/LANE/POLL_SEC/…), иначе
@@ -612,6 +614,27 @@ def _exec_command(cmd, restart_fn=None, status_fn=None):
     return "failed", f"{kind}: рестарт не удался — {detail}"
 
 
+def _handle_lesson(tid, text):
+    """Обработать задачу-урок (родитель 292, шаг 3): дирижёр классифицирует замечание менеджера и
+    маршрутизирует. СТИЛЬ → правило в книгу правил (playbook); НАДЗОР → строка-класс в чек-лист
+    ревизора; ФАКТ/ЛОГИКА → локальному планировщику (правка кода/критфактов/FAQ + ТЕСТ); неясное →
+    карточка-уточнение владельцу в 1160 (не угадываем). Боевые sink'и: playbook / чек-лист / инбокс
+    1160 (_notify_critical). Bridge/таблицы/деньги не трогаем — только текст доков или делегирование."""
+    dec = lesson_router.handle_lesson_task(text, notify_owner=_notify_critical)
+    route = dec.get("route")
+    if dec.get("delegate"):                    # ФАКТ/ЛОГИКА — правка+тест = работа думателя-планировщика
+        log.info("LESSON id=%s route=%s → планировщик (правка+тест)", tid, route)
+        _cowork(f"урок #{tid} [{route}] → локальному планировщику (правка+тест)")
+        _local_dec_plan(tid, dec.get("delegate_text") or text)
+        return
+    status = dec.get("status") or "done"
+    result = (dec.get("result") or "урок обработан")[:RESULT_MAX]
+    bc.complete_task(tid, status, result)
+    log.info("LESSON id=%s route=%s → %s (%s)", tid, route, status, dec.get("reason"))
+    _cowork(f"урок #{tid} [{route}] → {status} · {_clip(result)}")
+    _notify_task(status, tid, result)
+
+
 def process_new():
     """Взять СТАРЕЙШУЮ new-задачу своей полосы, исполнить, записать результат/needs_approval."""
     if _stopped():
@@ -646,6 +669,12 @@ def process_new():
         log.info("COMMAND id=%s cmd=%s → %s", tid, cmd, status)
         _cowork(f"задача #{tid} (рычаг {cmd}) → {status} · {_clip(result)}")
         _notify_task(status, tid, result)
+        return
+    # Задача-урок (родитель 292, шаг 3): классифицируем замечание и маршрутизируем (СТИЛЬ/ФАКТ/
+    # НАДЗОР/неясное). ПЕРЕХВАТ ДО local-dec-планировщика: урок enqueue'ится from=Filipp-pcloc-dec,
+    # но это НЕ ТЗ на декомпозицию — свой обработчик (иначе _is_local_dec_parent отдал бы его планировщику).
+    if lesson_router.is_lesson_task(text):
+        _handle_lesson(tid, text)
         return
     # Локальный дирижёр (PC_LOCAL_DEC=1): осиротевшая synthetic (сводка/карточка — демон упал
     # между enqueue и complete) → довести done, НЕ исполняя; родитель Filipp-pcloc-dec → строим
