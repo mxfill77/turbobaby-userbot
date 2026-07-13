@@ -448,5 +448,85 @@ class TestRoutingIntoIPC(unittest.TestCase):
         self.assertEqual(moderation_ipc.fetch_new(), [])  # в IPC ничего
 
 
+class TestLessonInterception(unittest.TestCase):
+    """Родитель 292, шаг 1: перехват реплая-обучения на карточку черновика — триггер
+    («правка:»/«урок:»/«не так:»), парс замечания + окна диалога, права INTAKE_APPROVERS."""
+
+    DRAFT = {"id": 7, "draft": "черновик", "client_id": 555, "client_ref": "@petya"}
+
+    def setUp(self):
+        self._save = (suggest.INTAKE_APPROVERS, suggest.APPROVER_USERNAMES)
+        # учителя: Филипп ×2 аккаунта, Даня, Даша
+        suggest.INTAKE_APPROVERS = {"filipp", "filipp_alt", "danya", "dasha"}
+        suggest.APPROVER_USERNAMES = set()
+
+    def tearDown(self):
+        suggest.INTAKE_APPROVERS, suggest.APPROVER_USERNAMES = self._save
+
+    # --- триггер (parse_lesson) ---
+    def test_trigger_variants_parsed(self):
+        for text, kind, remark in (
+            ("правка: не пиши цену первой", "правка", "не пиши цену первой"),
+            ("Урок: всегда уточняй даты", "урок", "всегда уточняй даты"),
+            ("не так: тон слишком сухой", "не так", "тон слишком сухой"),
+            ("  ПРАВКА:  лишний пробел  ", "правка", "лишний пробел"),
+        ):
+            p = moderation_core.parse_lesson(text)
+            self.assertIsNotNone(p, text)
+            self.assertEqual(p["kind"], kind, text)
+            self.assertEqual(p["remark"], remark, text)
+
+    def test_non_trigger_is_none(self):
+        # обычные реплики (не уроки) не перехватываются
+        for text in ("сделай короче", "+", "нет", "что по ценам?", "правка без двоеточия",
+                     "перезвони и уточни", ""):
+            self.assertIsNone(moderation_core.parse_lesson(text), text)
+
+    def test_empty_remark_still_lesson(self):
+        p = moderation_core.parse_lesson("урок:")
+        self.assertEqual(p, {"kind": "урок", "remark": ""})
+
+    # --- права (process_lesson) ---
+    def test_non_lesson_passes_through(self):
+        d = moderation_core.process_lesson(self.DRAFT, "сделай короче", "danya")
+        self.assertEqual(d["decision"], "not_lesson")   # обычный reply-путь не трогаем
+
+    def test_approver_lesson_accepted_with_window(self):
+        d = moderation_core.process_lesson(self.DRAFT, "правка: не дави ценой", "danya")
+        self.assertEqual(d["decision"], "lesson")
+        self.assertEqual(d["kind"], "правка")
+        self.assertEqual(d["remark"], "не дави ценой")
+        self.assertEqual(d["window"], 555)              # окно диалога = client_id карточки
+        self.assertEqual(d["draft_id"], 7)
+
+    def test_all_four_teachers_allowed(self):
+        for who in ("filipp", "filipp_alt", "danya", "dasha"):
+            d = moderation_core.process_lesson(self.DRAFT, "урок: уточняй опыт", who)
+            self.assertEqual(d["decision"], "lesson", who)
+
+    def test_stranger_lesson_denied_politely(self):
+        d = moderation_core.process_lesson(self.DRAFT, "правка: пиши мягче", "stranger")
+        self.assertEqual(d["decision"], "denied")
+        self.assertIn("только Филипп", d["card"])
+        self.assertNotIn("window", d)                   # чужому окно/замечание не отдаём
+
+    def test_stranger_non_lesson_still_passes_through(self):
+        # у чужого обычный reply не блокируется этим перехватом (его отсекает process_reply-whitelist)
+        d = moderation_core.process_lesson(self.DRAFT, "+", "stranger")
+        self.assertEqual(d["decision"], "not_lesson")
+
+    def test_intake_approver_stricter_than_approve(self):
+        # approve открыт всем (APPROVER пуст), но учить всё равно нельзя вне INTAKE_APPROVERS
+        self.assertTrue(suggest.is_approver("stranger"))
+        self.assertFalse(suggest.is_intake_approver("stranger"))
+        self.assertTrue(suggest.is_intake_approver("@Danya"))   # @ и регистр нормализуются
+
+    def test_intake_falls_back_to_approve_when_unset(self):
+        suggest.INTAKE_APPROVERS = set()
+        suggest.APPROVER_USERNAMES = {"danya"}
+        self.assertTrue(suggest.is_intake_approver("danya"))
+        self.assertFalse(suggest.is_intake_approver("stranger"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

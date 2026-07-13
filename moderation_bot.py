@@ -297,6 +297,16 @@ async def on_group_message(update, context):
                                        "Голосовую расшифровку добавим позже.",
                                        reply_to_message_id=draft.get("card_msg_id"))
         return
+    # перехват реплая-обучения (родитель 292): «правка:»/«урок:»/«не так:» — не обычная правка
+    # черновика, а замечание в копилку обучения; права строже approve (только INTAKE_APPROVERS).
+    lesson = moderation_core.process_lesson(draft, msg.text or "", username)
+    if lesson["decision"] != "not_lesson":
+        if lesson["decision"] == "lesson":
+            log.info(f"LESSON[{lesson['kind']}] окно={lesson.get('window')} draft#{lesson.get('draft_id')} "
+                     f"от @{username}: {lesson.get('remark')}")
+        await context.bot.send_message(chat.id, lesson["card"],
+                                       reply_to_message_id=draft.get("card_msg_id"))
+        return
     dec = moderation_core.process_reply(draft, msg.text or "", username, suggest.load_faq(),
                                         suggest.SUGGEST_TEST_MODE)
     dec["_by"] = f"@{username}" if username else "?"

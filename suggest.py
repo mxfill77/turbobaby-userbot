@@ -84,6 +84,12 @@ def _csv_set(name: str):
 # Право approve/edit/reject. ПУСТОЙ список = любой участник группы может approve.
 APPROVER_USERNAMES = _csv_set("APPROVER_USERNAMES")
 
+# Право «учить» бота (перехват реплая-правки/урока на карточке черновика, родитель 292) —
+# СТРОЖЕ обычного approve: только владельцы-учителя (Филипп ×2 аккаунта, Даня, Даша).
+# Источник — env INTAKE_APPROVERS (CSV юзернеймов); сами юзернеймы в .env, не в коде.
+# Пусто → фолбэк на APPROVER_USERNAMES (обучение НЕ шире approve, а не «кто угодно»).
+INTAKE_APPROVERS = _csv_set("INTAKE_APPROVERS")
+
 # Токен бота-модератора (задача-2). Пусто → бот не поднимается, работает деградация
 # (reply-режим userbot). Токен НИКОГДА не логируем и не коммитим.
 MODERBOT_TOKEN = os.getenv("MODERBOT_TOKEN", "").strip()
@@ -744,6 +750,15 @@ def is_approver(username) -> bool:
     if not APPROVER_USERNAMES:
         return True
     return (username or "").lstrip("@").lower() in APPROVER_USERNAMES
+
+
+def is_intake_approver(username) -> bool:
+    """Вправе ли username УЧИТЬ бота (правка/урок/не так на карточке черновика). Строже
+    approve: только INTAKE_APPROVERS. Список не сконфигурирован (пуст) → фолбэк на общий
+    approver-whitelist (обучение не шире approve), но НЕ распахиваем шире approve."""
+    if not INTAKE_APPROVERS:
+        return is_approver(username)
+    return (username or "").lstrip("@").lower() in INTAKE_APPROVERS
 
 
 # ------------------------------- FAQ / LLM -----------------------------------

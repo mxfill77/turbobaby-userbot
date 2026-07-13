@@ -196,6 +196,45 @@ def process_reply(draft, reply_text, username, faq, test_mode, call_llm=None, re
             "card": f"[{_LEVEL_RU.get(intent, intent)}] Проверьте перед отправкой:\n\n{final}"}
 
 
+# ------------------- перехват реплая-обучения на карточку (родитель 292) ------
+# Менеджер отвечает на карточку черновика с ПРЕФИКСОМ-триггером — это НЕ обычная правка
+# текущего черновика, а ЗАМЕЧАНИЕ-урок в копилку обучения. Окно диалога = client_id из
+# карточки (revizor_recon §A.2: ключ окно→черновики). Права СТРОЖЕ approve: учить может
+# только INTAKE_APPROVERS (Филипп ×2, Даня, Даша); прочим — вежливый отказ реплаем.
+LESSON_TRIGGERS = ("правка:", "урок:", "не так:")
+
+
+def parse_lesson(reply_text):
+    """Если реплай начинается с триггера обучения ('правка:'/'урок:'/'не так:') — вернуть
+    {'kind': <триггер без двоеточия>, 'remark': <текст замечания после триггера>}; иначе None.
+    Регистр и ведущие пробелы игнорируем; пустое замечание допустимо (remark='')."""
+    t = (reply_text or "").lstrip()
+    low = t.lower()
+    for trig in LESSON_TRIGGERS:
+        if low.startswith(trig):
+            return {"kind": trig[:-1].strip(), "remark": t[len(trig):].strip()}
+    return None
+
+
+def process_lesson(draft, reply_text, username):
+    """Реплай-обучение на карточку черновика (родитель 292, шаг 1). Возвращает decision-dict
+    (без I/O):
+      not_lesson — реплай НЕ начинается с триггера обучения (обрабатывает обычный reply-путь);
+      denied     — триггер есть, но username не в INTAKE_APPROVERS → вежливый отказ реплаем;
+      lesson     — распознан урок от учителя: kind/remark + window (client_id окна диалога)."""
+    parsed = parse_lesson(reply_text)
+    if parsed is None:
+        return {"decision": "not_lesson"}
+    if not suggest.is_intake_approver(username):
+        return {"decision": "denied",
+                "card": "🙅 Учить бота (правка/урок/не так) могут только Филипп, Даня и Даша. "
+                        "Спасибо, что заметили — передайте им, поправим."}
+    return {"decision": "lesson", "kind": parsed["kind"], "remark": parsed["remark"],
+            "window": draft.get("client_id"), "draft_id": draft.get("id"),
+            "card": f"📝 Принял замечание ({parsed['kind']}) по окну "
+                    f"{draft.get('client_ref') or draft.get('client_id')} — учту."}
+
+
 # ------------------------- захват правки в playbook (Фаза 2) ------------------
 
 def _distill_system():
