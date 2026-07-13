@@ -249,6 +249,83 @@ def park_allowlist(getter=None):
     return allow or None   # пусто (ни одного совпадения) → тоже fail-safe, не ограничиваем на мусоре
 
 
+# --- ДЕТЕРМИНИРОВАННЫЙ РЕЗОЛВ МОДЕЛИ (Лист1/_bike_key + алиасы для ВСЕХ моделей) ---------------
+# Класс-0 (родитель #253): «XSR 155» детектился в ЛУПНЫЙ canon «XSR» (терялось «155»), а
+# pricing._candidates по substring матчил ВСЕ XSR-юниты (155 и 900) — неоднозначно, брал первый
+# доступный ⇒ подставлялась ЧУЖАЯ карточка парка (в живом провале — MT-03/≈5166฿, дырой в цене-нот).
+# Резолвим детект в КОНКРЕТНУЮ модель парка по _bike_key (тот же нормализатор, что park_allowlist —
+# снимает CC/СС). Точная фраза → точная модель; неоднозначная серия (в парке и XSR155, и XSR900) →
+# НЕ угадываем и НЕ подставляем — уточняем у клиента.
+_KEY_DISPLAY = {key: disp for disp, key in KNOWN_MODELS}   # 'xsr155' -> 'XSR 155'
+
+# Алиас (нормализованный _bike_key детекта) → КОНКРЕТНЫЙ ключ KNOWN_MODELS.
+_MODEL_ALIAS = {
+    "nmax": "nmax155", "nmax155": "nmax155",
+    "xmax": "xmax300", "xmax300": "xmax300",
+    "forza": "forza300", "forza300": "forza300",
+    "xadv": "xadv750", "xadv750": "xadv750",
+    "pcx150": "pcx150", "pcx160": "pcx160",
+    "adv150": "adv150", "adv160": "adv160", "adv350": "adv350",
+    "xsr155": "xsr155", "xsr900": "xsr900",
+    "cb300": "cb300r", "cb300r": "cb300r",
+    "cb650": "cb650r", "cb650r": "cb650r",
+    "cbr": "cbr650r", "cbr650": "cbr650r", "cbr650r": "cbr650r",
+    "rebel": "rebel300", "rebel300": "rebel300",
+    "mt": "mt03", "mt03": "mt03",
+    "ninja": "ninja400", "ninja400": "ninja400",
+    "vulcan": "vulcan650s", "vulcan650": "vulcan650s", "vulcan650s": "vulcan650s",
+    "r7": "r7", "click": "click125", "click125": "click125",
+}
+# СЕРИЯ без уточнения объёма → возможные ключи; конкретную выбираем ПЕРЕСЕЧЕНИЕМ с реальным парком.
+_MODEL_SERIES = {
+    "xsr": ("xsr155", "xsr900"),
+    "adv": ("adv150", "adv160", "adv350"),
+    "pcx": ("pcx150", "pcx160"),
+    "cb":  ("cb300r", "cb650r"),
+}
+
+
+def _fleet_model_keys(getter=None):
+    """Ключи KNOWN_MODELS, реально присутствующие в парке (Лист1) — по _bike_key имён байков.
+    Источник недоступен/пуст → None (fail-safe: не резолвим агрессивно, пусть работает как раньше)."""
+    names = _park_bike_names(getter=getter)
+    if not names:
+        return None
+    keys = [_bike_key(n) for n in names]
+    return {key for _, key in KNOWN_MODELS if any(key in k for k in keys)}
+
+
+def resolve_park_model(canon, getter=None):
+    """Детект модели (canon из _detect_model, напр. «XSR», «XSR 155», «MT-03») → КОНКРЕТНАЯ модель
+    парка по Лист1/_bike_key + алиасам. Возвращает (status, display, key):
+      'ok'        — однозначная модель парка (display='XSR 155', key='xsr155');
+      'ambiguous' — серия (XSR/ADV/…), а в парке НЕСКОЛЬКО вариантов → уточнить у клиента
+                    (display=list отображаемых имён, key=None); чужую карточку НЕ подставляем;
+      'unknown'   — не распознали / парк недоступен / модель не из серии-развилки → (None, None):
+                    fail-safe, вызывающий оставляет исходный canon и идёт прежним путём.
+    Инвариант: специфичная фраза клиента резолвится в РОВНО свою модель; голый серийный корень при
+    коллизии в парке НЕ угадывается."""
+    k = _bike_key(canon)
+    if not k:
+        return "unknown", None, None
+    present = _fleet_model_keys(getter=getter)
+    if not present:                                    # парк недоступен → не резолвим (как раньше)
+        return "unknown", None, None
+    key = _MODEL_ALIAS.get(k)
+    if key:
+        if key in present:
+            return "ok", _KEY_DISPLAY.get(key, canon), key
+        return "unknown", None, None                   # известная модель, но НЕ в парке → прежний путь
+    if k in _MODEL_SERIES:
+        matches = [key for key in _MODEL_SERIES[k] if key in present]
+        if len(matches) == 1:
+            return "ok", _KEY_DISPLAY.get(matches[0], canon), matches[0]
+        if len(matches) >= 2:
+            return "ambiguous", [_KEY_DISPLAY.get(x, x) for x in matches], None
+        return "unknown", None, None                   # серия не представлена в парке
+    return "unknown", None, None
+
+
 # ------------------------------- playbook (книга правил) ---------------------
 # Растущая книга правил (стиль/факты/запреты/выученные правки) — локальный файл. Подмешивается в
 # промпт СТРОГО НИЖЕ кап-цены и CRITICAL_FACTS (playbook их НЕ отменяет). Пополняется из одобренных
@@ -626,6 +703,21 @@ def _mk(day, month, today, year=None):
     return dt
 
 
+def _day_anchor(day, today):
+    """Дата с днём `day` ближайшего будущего, когда МЕСЯЦ не назван («с 20»): текущий месяц, а если
+    день уже прошёл (или невалиден для месяца, напр. 31 фев) — ближайший следующий месяц. Год-ролл
+    НЕ делаем как лечение (макс. 12 месяцев вперёд). Не нашли валидную дату → None."""
+    if not (1 <= day <= 31):
+        return None
+    for k in range(0, 13):
+        mo = (today.month - 1 + k) % 12 + 1
+        yr = today.year + (today.month - 1 + k) // 12
+        d = _safe_date(yr, mo, day)
+        if d is not None and (k > 0 or d >= today):
+            return d
+    return None
+
+
 def _resolve_range(d_s, m_s, d_e, m_e, today, y_s=None, y_e=None):
     """Собрать (start, end) из двух точек. Год-ролл end+1г ТОЛЬКО при реальном переходе через
     год (месяц конца < месяца начала, напр. дек→янв). Перепутанный порядок в одном месяце → SWAP
@@ -691,6 +783,13 @@ def _anchor_date(t, today):
     m = re.search(r"(\d{1,2})[./](\d{1,2})", t)
     if m:
         return _mk(int(m.group(1)), int(m.group(2)), today)
+    # ГОЛЫЙ ДЕНЬ БЕЗ МЕСЯЦА: «с 20 [на 2 недели]» → старт = 20-е ближайшего будущего (тек. месяц, а
+    # если день уже прошёл — следующий месяц; НЕ следующий год). Фиксирует старт из трекера, когда
+    # клиент дал только число+длительность — иначе цена-нот проваливалась в «уточни даты» (дыра, в
+    # которую LLM подставлял чужую карточку). Не хватаем «с 20 по/до …» (это диапазон, не старт+срок).
+    m = re.search(r"\bс\s+(\d{1,2})\b(?!\s*(?:по|до|-|\d|[./]))", t)
+    if m:
+        return _day_anchor(int(m.group(1)), today)
     return None
 
 
@@ -1726,6 +1825,28 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
                 "никакого числа (в т.ч. из FAQ); уточни модель и точные даты и скажи, что "
                 "назовёшь цену по датам.") + dep
     hint_days, monthly = hints.get("hint_days"), hints.get("monthly")
+
+    # ДЕТЕРМИНИРОВАННЫЙ РЕЗОЛВ модели в КОНКРЕТНУЮ модель парка (Лист1/_bike_key, алиасы) ДО quote:
+    # специфичная фраза → своя модель (не лупный серийный корень, который матчил бы чужие юниты);
+    # неоднозначная серия (в парке и XSR155, и XSR900) → НЕ угадываем и НЕ подставляем чужую
+    # карточку, а просим клиента уточнить модель. 'unknown' (парк недоступен/модель вне серии) →
+    # оставляем исходный canon (прежний путь, fail-safe).
+    # Резолвим ТОЛЬКО серийные корни (XSR/ADV/PCX/CB) — именно они матчат несколько юнитов и рискуют
+    # подставить чужую карточку. Конкретные модели (NMAX/MT-03/…) уже однозначны — их не трогаем.
+    resolved = []
+    for m in models:
+        if _bike_key(m) in _MODEL_SERIES:
+            st, disp, _key = resolve_park_model(m, getter=getter)
+            if st == "ambiguous":
+                opts = ", ".join(disp) if isinstance(disp, list) else str(disp)
+                return ("ЦЕНА: клиент назвал серию (" + str(m) + "), а в парке несколько вариантов ("
+                        + opts + ") с РАЗНОЙ ценой/классом — НЕ называй никакого числа и НЕ выбирай "
+                        "модель сам (чужую карточку не подставляй); уточни у клиента, какая именно "
+                        "модель нужна, и назови цену уже после уточнения.") + dep
+            resolved.append(disp if (st == "ok" and disp) else m)
+        else:
+            resolved.append(m)
+    models = resolved
 
     # Разворачиваем модели в ПРОДУКТЫ: XMAX → два поколения отдельными строками (старое / New Gen),
     # прочие модели — один продукт как раньше. (label, модель_для_quote, name_filter-по-имени-юнита.)

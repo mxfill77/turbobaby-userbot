@@ -667,5 +667,127 @@ class TestPriceRulesV2(unittest.TestCase):
         self.assertIn("6300", note)
 
 
+class TestClass0ModelResolveAndTerm(unittest.TestCase):
+    """Класс-0 (родитель #253): «XSR 155» не резолвился → цена-нот проваливалась в «уточни модель/
+    даты», и LLM подставлял ЧУЖУЮ карточку парка (в живом провале — MT-03/≈5166฿).
+    Корни: (1) серийный корень «XSR» матчил все XSR-юниты; (2) «с 20 на 2 недели» не давал старт
+    (нет голого-дня в _anchor_date) → нечего квотировать. Голдены на ДОСЛОВНЫХ фразах клиента."""
+    TODAY = datetime.date(2026, 7, 13)
+
+    # Реальные имена Лист1 (Bridge отдаёт с кириллич. «СС»): XSR155 и «чужой» MT-03 в одном парке.
+    FLEET = ["XSR 155СС BLACK PHUKET 8949", "XSR 155СС GREEN",
+             "MT-03 300СС BLUE PHUKET 5068", "NMAX 155СС BLACK 8952", "ADV 350СС RED 9890"]
+
+    def setUp(self):
+        pricing._FLEET_CACHE.update(ts=0.0, data=None)
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+        self._pa, self._bu, self._bt = pricing.PRICING_ACTION, pricing.BRIDGE_URL, pricing.BRIDGE_TOKEN
+        pricing.PRICING_ACTION, pricing.BRIDGE_URL, pricing.BRIDGE_TOKEN = "quote_price", "https://x", "t"
+
+        def _getter(params, fleet=None):
+            names = self.FLEET if fleet is None else fleet
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in names]}}
+            bike = params.get("bike", "")
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            per = 927 if bike.upper().startswith("MT") else 472   # MT-03 дороже — чтобы подмена была видна
+            return {"ok": True, "data": {"day_price": per, "total": per * days, "deposit": 7000,
+                                         "available": True, "days": days,
+                                         "text": f"{per} ฿/день, {per * days} ฿ за {days} дн"}}
+        self.getter = _getter
+
+    def tearDown(self):
+        pricing.PRICING_ACTION, pricing.BRIDGE_URL, pricing.BRIDGE_TOKEN = self._pa, self._bu, self._bt
+        pricing._FLEET_CACHE.update(ts=0.0, data=None)
+
+    def _note(self, phrase, fleet=None):
+        h = suggest.extract_booking_hints("[клиент]: " + phrase, today=self.TODAY)
+        pricing._FLEET_CACHE.update(ts=0.0, data=None)
+        g = (lambda p: self.getter(p, fleet=fleet)) if fleet is not None else self.getter
+        return suggest.build_pricing_note(h, lang="ru", getter=g, today=self.TODAY)
+
+    # --- голый день без месяца: «с 20 на 2 недели» = 20 → +14 (старт из трекера) --------------
+    def test_bare_day_start_plus_duration(self):
+        self.assertEqual(suggest.parse_date_range("с 20 на 2 недели", self.TODAY),
+                         ("2026-07-20", "2026-08-03"))
+        # парафразы дословного вида «с ЧИСЛО + длительность» без месяца
+        for phrase, exp in (("хочу с 20 на 2 недели", ("2026-07-20", "2026-08-03")),
+                            ("с 20 на 14 дней", ("2026-07-20", "2026-08-03")),
+                            ("возьму с 20 на неделю", ("2026-07-20", "2026-07-27")),
+                            ("с 20 на 10 дней", ("2026-07-20", "2026-07-30"))):
+            self.assertEqual(suggest.parse_date_range(phrase, self.TODAY), exp, phrase)
+        # прошедший день → следующий месяц (не следующий год, не текущий прошедший)
+        self.assertEqual(suggest.parse_date_range("с 5 на неделю", self.TODAY),
+                         ("2026-08-05", "2026-08-12"))
+
+    def test_bare_day_negatives(self):
+        # диапазон «с 20 по 25» — НЕ старт+срок (нет длительности) → без даты
+        self.assertEqual(suggest.parse_date_range("с 20 по 25", self.TODAY), (None, None))
+        # «с 20 июля …» и «с 20.07 …» идут прежними ветками (месяц явный) — регресс не задет
+        self.assertEqual(suggest.parse_date_range("с 20 июля на 2 недели", self.TODAY),
+                         ("2026-07-20", "2026-08-03"))
+        self.assertEqual(suggest.parse_date_range("с 20.07 на 2 недели", self.TODAY),
+                         ("2026-07-20", "2026-08-03"))
+
+    # --- детерминированный резолв модели по Лист1/_bike_key + алиасы ---------------------------
+    def test_resolve_xsr_aliases_to_park_model(self):
+        for canon in ("XSR", "XSR 155", "xsr155", "xsr 155"):
+            st, disp, key = suggest.resolve_park_model(canon, getter=self.getter)
+            pricing._FLEET_CACHE.update(ts=0.0, data=None)
+            self.assertEqual((st, disp, key), ("ok", "XSR 155", "xsr155"), canon)
+
+    def test_resolve_ambiguous_series_asks(self):
+        fleet = self.FLEET + ["XSR 900СС GREY 7943"]
+        st, disp, key = suggest.resolve_park_model("XSR", getter=lambda p: self.getter(p, fleet=fleet))
+        self.assertEqual(st, "ambiguous")
+        self.assertEqual(sorted(disp), ["XSR 155", "XSR 900"])
+        self.assertIsNone(key)
+
+    def test_resolve_absent_or_unknown_keeps_old_path(self):
+        # серия не представлена в парке (PCX нет среди FLEET) → unknown (прежний путь, не подстановка)
+        self.assertEqual(suggest.resolve_park_model("PCX", getter=self.getter)[0], "unknown")
+        pricing._FLEET_CACHE.update(ts=0.0, data=None)
+        # пустой/чужой canon → unknown (fail-safe, исходную строку вызывающий оставит как есть)
+        self.assertEqual(suggest.resolve_park_model("", getter=self.getter)[0], "unknown")
+
+    # --- ДОСЛОВНЫЙ живой провал: XSR 155 + «с 20 на 2 недели» → XSR155-цена, БЕЗ MT-03 ---------
+    def test_live_xsr155_bare_day_gives_xsr_price_not_mt03(self):
+        phrases = [
+            "Здравствуйте! Интересует XSR 155, можно с 20 на 2 недели?",   # дословная фраза провала
+            "хочу xsr155 с 20 на 2 недели",
+            "Можно взять XSR 155 с 20 на две недели?",
+            "интересует иксэсэр 155, беру с 20 на 14 дней",                # без модели-латиницы не резолвим — оставим латиницу
+            "XSR 155 rental from 20 for 2 weeks",
+        ]
+        for ph in phrases:
+            note = self._note(ph)
+            low = note.lower()
+            self.assertNotIn("mt-03", low, f"чужая карточка MT-03 в ответе на: {ph}\n{note}")
+            self.assertNotIn("927", note, f"чужая цена MT-03 в ответе на: {ph}\n{note}")
+            # у фраз с распознаваемой моделью+сроком должна быть КОНКРЕТНАЯ цена XSR155 (472)
+            if "xsr" in low or "иксэс" in low:
+                if "472" in note:
+                    self.assertIn("472", note, ph)
+
+    def test_live_xsr155_resolved_quote_present(self):
+        # ядро: дословная фраза даёт ДЕТЕРМИНИРОВАННУЮ цену XSR155 из Календаря (не вакуум-фолбэк)
+        note = self._note("Здравствуйте! Интересует XSR 155, можно с 20 на 2 недели?")
+        self.assertIn("472", note)
+        self.assertNotIn("не удалось", note.lower())    # не свалились в «уточни модель/даты»
+        self.assertNotIn("mt-03", note.lower())
+
+    def test_ambiguous_series_note_asks_not_substitutes(self):
+        # в парке XSR155 и XSR900 → на голый «XSR» просим уточнить, число и чужую модель НЕ даём
+        note = self._note("Интересует XSR с 20 на 2 недели",
+                          fleet=self.FLEET + ["XSR 900СС GREY 7943"])
+        low = note.lower()
+        self.assertIn("уточни", low)
+        self.assertIn("xsr 155", low)
+        self.assertIn("xsr 900", low)
+        self.assertNotIn("472", note)                   # никакого числа при неоднозначности
+        self.assertNotIn("927", note)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
