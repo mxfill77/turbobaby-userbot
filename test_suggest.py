@@ -1357,6 +1357,31 @@ class TestPlaybook(unittest.TestCase):
         self.assertLess(sysp.index("КРИТИЧНЫЕ ФАКТЫ"), sysp.index("КНИГА ПРАВИЛ"))
         self.assertLess(sysp.index("КНИГА ПРАВИЛ"), sysp.index("FAQ и эталонные"))
 
+    def test_style_fewshot_present_below_faq(self):
+        # STYLE_FEWSHOT (шаг 5/7 #253): эталон тона из client_chats.jsonl всегда в промпте,
+        # САМЫМ НИЗОМ (после FAQ) — тон, а не источник фактов/цен.
+        sysp = suggest.make_system_prompt("ТЕЛО-FAQ", "ru")
+        self.assertIn("СТИЛЬ ОТВЕТА", sysp)
+        self.assertIn("ПРИМЕРЫ ЖИВЫХ ОТВЕТОВ", sysp)
+        # реальные обороты менеджеров из живой базы:
+        self.assertIn("спасибо, что выбрали нас", sysp)
+        self.assertIn("Оплата каким способом удобнее", sysp)
+        self.assertIn("бронь закрепляется по 100% предоплате", sysp)
+        # приоритет: критфакты/парк-политика ВЫШЕ примеров, примеры — самым низом (после FAQ)
+        self.assertLess(sysp.index("КРИТИЧНЫЕ ФАКТЫ"), sysp.index("СТИЛЬ ОТВЕТА"))
+        self.assertLess(sysp.index("FAQ и эталонные"), sysp.index("ПРИМЕРЫ ЖИВЫХ ОТВЕТОВ"))
+        # 15–20 пар few-shot, как требует задача
+        self.assertGreaterEqual(len(suggest.STYLE_FEWSHOT_PAIRS), 15)
+        self.assertLessEqual(len(suggest.STYLE_FEWSHOT_PAIRS), 20)
+
+    def test_style_fewshot_no_price_without_dates_leak(self):
+        # Примеры НЕ должны протаскивать формат сетки, который код прячет от LLM (симв. ฿),
+        # и НЕ отменяют ценовую политику «нет дат — нет цены».
+        sysp = suggest.make_system_prompt("FAQ", "ru")
+        self.assertNotIn("• Сутки:", suggest.STYLE_FEWSHOT)
+        self.assertNotIn("฿", suggest.STYLE_FEWSHOT)
+        self.assertIn("НЕ называй клиенту НИКАКУЮ цену", sysp)  # кап-политика на месте
+
     def test_playbook_empty_skipped_generation_ok(self):
         # пусто → блока нет, генерация цела (fail-safe)
         self.assertNotIn("КНИГА ПРАВИЛ", suggest.make_system_prompt("FAQ", "ru", playbook=""))
