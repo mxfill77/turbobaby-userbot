@@ -544,9 +544,11 @@ def _proc_line(label, pids, extra=""):
     return base + (f" · {extra}" if extra else "")
 
 
-def _contour_status(finder=None):
-    """Статус клиентского контура: живость+PID userbot/moderation_bot/pc_agent/pc_orchestrator и
-    свежесть heartbeat демона. → многострочный текст (в результат задачи). finder — для тестов."""
+def _contour_status(finder=None, items=None, revizor_state=None):
+    """Статус клиентского контура: живость+PID userbot/moderation_bot/pc_agent/pc_orchestrator,
+    свежесть heartbeat демона, секция «в работе» (ТОЛЬКО живые локальные цепи — без призраков
+    финализированных родителей) и честная строка последнего тика ревизора. → многострочный текст
+    (в результат задачи). finder/items/revizor_state — для тестов (иначе живые источники)."""
     find = finder or _find_pids_by_script
     ub, mb = find("userbot_listen.py"), find("moderation_bot.py")
     ag, orch = find("pc_agent.py"), find("pc_orchestrator.py")
@@ -559,11 +561,25 @@ def _contour_status(finder=None):
                   f"свеж ({int(age)}с назад)" if age <= HEARTBEAT_STALE else f"ПРОТУХ ({int(age)}с назад)")
     except Exception:
         hb_txt = "нет"
-    return "\n".join(["📊 Статус контура:",
-                      _proc_line("userbot", ub),
-                      _proc_line("moderation_bot", mb, mb_extra),
-                      _proc_line("pc_agent", ag),
-                      _proc_line("pc_orchestrator", orch, f"heartbeat {hb_txt}")])
+    lines = ["📊 Статус контура:",
+             _proc_line("userbot", ub),
+             _proc_line("moderation_bot", mb, mb_extra),
+             _proc_line("pc_agent", ag),
+             _proc_line("pc_orchestrator", orch, f"heartbeat {hb_txt}"),
+             "🔧 В работе:"]
+    # Снимок очереди берём сами (если не подан). None = Bridge молчит: НЕ выдаём «ТИХО» (это было бы
+    # ложью «работы нет»), честно говорим «очередь недоступна». Пустой снимок/нет живых цепей → 🟢 ТИХО.
+    snap = items if items is not None else _loc_fetch_items()
+    if snap is None:
+        lines.append("  очередь недоступна (Bridge молчит)")
+    else:
+        active = _loc_active_chains(snap)
+        if active:
+            lines += [f"  • цепь {ch['pid']}: {ch['label']}" for ch in active]
+        else:
+            lines.append("  🟢 ТИХО")
+    lines.append(_revizor_tick_label(revizor_state))
+    return "\n".join(lines)
 
 
 def _exec_command(cmd, restart_fn=None, status_fn=None):
@@ -1443,6 +1459,49 @@ def _loc_chain_steps(pid):
     """Шаги цепи родителя pid (для осиротевшей сводки). Ошибка чтения → []."""
     items = _loc_fetch_items()
     return (_loc_group_chains(items).get(int(pid)) or []) if items is not None else []
+
+
+_LOC_OPEN = ("new", "in_progress", "needs_approval", "approved")   # НЕЗАКРЫТЫЙ статус шага/родителя
+
+
+def _loc_parent_status(items):
+    """{pid: status} по РОДИТЕЛЬСКИМ задачам pcloc-dec: from=Filipp-pcloc-dec, БЕЗ маркера шага и
+    БЕЗ synthetic-маркеров (сводка/карточка/коррекция). Родитель — носитель ТЗ, его id = pid цепи."""
+    parents = {}
+    for it in items:
+        if str(it.get("from") or "") != PC_LOCAL_DEC_FROM:
+            continue
+        txt = str(it.get("task_text") or "")
+        if (_STEP_RE.match(txt) or _SUM_RE.match(txt)
+                or _CARD_RE.match(txt) or _ADAPT_CARD_RE.match(txt)):
+            continue                                   # шаг/сводка/карточка — не родитель
+        pid = it.get("id")
+        if isinstance(pid, int):
+            parents[pid] = str(it.get("status") or "")
+    return parents
+
+
+def _loc_active_chains(items):
+    """Живые локальные цепи из снимка очереди → [{"pid": int, "label": str}], сорт. по pid.
+    ЖИВАЯ цепь (класс-фикс призраков статуса) — ТОЛЬКО по живым признакам:
+      • родитель pcloc-dec в new/in_progress (план строится / шаги ещё идут), ИЛИ
+      • есть НЕЗАКРЫТЫЙ шаг [шаг i/N родитель pid] (статус ∈ _LOC_OPEN).
+    Терминальный родитель (done/failed) без незакрытых шагов — ПРИЗРАК финализированной цепи: её
+    step-карточки живут в очереди как done/failed (диагноз-ноты июльских тест-эпизодов), но работы
+    за ней нет → в «в работе» НЕ показываем, сводка не обязательна (мёртвые родители её не имеют).
+    Ярлык живого шага — текущий (максимальный номер среди открытых); иначе «план строится»."""
+    parents = _loc_parent_status(items)
+    chains = _loc_group_chains(items)
+    active = {}
+    for pid, steps in chains.items():                  # 1) незакрытый шаг → цепь жива
+        open_steps = [(i, n, it) for (i, n, it) in steps if str(it.get("status")) in _LOC_OPEN]
+        if open_steps:
+            i, n, _it = max(open_steps, key=lambda s: (s[0], int(s[2].get("id") or 0)))
+            active[pid] = f"шаг {i}/{n}"
+    for pid, st in parents.items():                    # 2) живой родитель без открытых шагов
+        if pid not in active and st in ("new", "in_progress"):
+            active[pid] = "план строится"
+    return [{"pid": pid, "label": active[pid]} for pid in sorted(active)]
 
 
 def _loc_summary_exists(pid):
@@ -2702,6 +2761,29 @@ def _revizor_read_state(path=None):
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}
+
+
+def _fmt_tick(iso):
+    """ISO-метку тика → компактно «YYYY-MM-DD HH:MM[ UTC]». Непарсибельное → как есть (не врём)."""
+    s = str(iso)
+    try:
+        d, t = s.split("T", 1)
+        tz = " UTC" if ("+00:00" in t or t.endswith("Z")) else ""
+        return f"{d} {t[:5]}{tz}"
+    except Exception:
+        return s
+
+
+def _revizor_tick_label(state=None):
+    """Честная строка последнего тика ревизора для статуса. Метка на диске (restart-proof) есть →
+    «надзор: ревизор — последний тик <время>»; метки нет (ни разу не тикал / файл пуст/битый) →
+    «надзор: ревизор — тиков ещё не было». НЕ пишем «время неизвестно» — либо честное время из
+    метки, либо честное «тиков ещё не было»."""
+    st = _revizor_read_state() if state is None else state
+    last = (st or {}).get("last_run")
+    if not last:
+        return "надзор: ревизор — тиков ещё не было"
+    return f"надзор: ревизор — последний тик {_fmt_tick(last)}"
 
 
 def _revizor_write_state(now, path=None):

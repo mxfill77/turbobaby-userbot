@@ -2032,6 +2032,109 @@ class TestCommandLevers(Base):
         self.assertEqual(self.fb.tasks[tid]["status"], "done")
 
 
+class TestContourStatusChains(unittest.TestCase):
+    """Косметика «статус контура»: секция «в работе» = ТОЛЬКО живые локальные цепи (без призраков
+    финализированных родителей pcloc-dec) + честная строка тика ревизора. Чистые функции —
+    инъекция items/revizor_state, ни Bridge, ни диска."""
+
+    F = "Filipp-pcloc-dec"
+
+    def _parent(self, pid, status, text="тз: почини детект X"):
+        return {"id": pid, "from": self.F, "status": status, "task_text": text}
+
+    def _step(self, pid, i, n, status):
+        return {"id": 900 + pid + i, "from": self.F, "status": status,
+                "task_text": f"[шаг {i}/{n} родитель {pid}] сделай шаг"}
+
+    # ---- classifier: _loc_active_chains ----
+
+    def test_finalized_parent_without_summary_not_active(self):
+        # ЖИВОЙ провал 15:36: старый финализированный родитель pcloc-dec (failed) + его step-карточки
+        # done/failed висят в очереди → это ПРИЗРАК, работы за ним нет → НЕ в списке «в работе».
+        items = [self._parent(194, "failed", text="тз: тест-эпизод июля"),
+                 self._step(194, 1, 3, "done"), self._step(194, 2, 3, "failed")]
+        self.assertEqual(o._loc_active_chains(items), [])
+
+    def test_done_parent_all_steps_done_not_active(self):
+        items = [self._parent(200, "done"),
+                 self._step(200, 1, 2, "done"), self._step(200, 2, 2, "done")]
+        self.assertEqual(o._loc_active_chains(items), [])
+
+    def test_live_chain_step_2_of_5_active(self):
+        # живая цепь: шаг 2/5 ещё in_progress → в списке с ярлыком «шаг 2/5».
+        items = [self._parent(300, "done"),                     # родитель закрыт, но шаг ещё идёт
+                 self._step(300, 1, 5, "done"), self._step(300, 2, 5, "in_progress")]
+        active = o._loc_active_chains(items)
+        self.assertEqual(active, [{"pid": 300, "label": "шаг 2/5"}])
+
+    def test_live_parent_no_steps_is_plan_building(self):
+        # родитель new/in_progress, шагов ещё нет → «план строится» (живой признак родителя).
+        self.assertEqual(o._loc_active_chains([self._parent(310, "in_progress")]),
+                         [{"pid": 310, "label": "план строится"}])
+
+    def test_ghosts_excluded_live_included_sorted(self):
+        # смесь пяти призраков (194/200/206/207/208) и одной живой цепи → только живая, по pid.
+        items = []
+        for pid in (194, 200, 206, 207, 208):
+            items += [self._parent(pid, "failed"), self._step(pid, 1, 2, "failed")]
+        items += [self._parent(300, "done"), self._step(300, 2, 5, "needs_approval")]
+        self.assertEqual(o._loc_active_chains(items), [{"pid": 300, "label": "шаг 2/5"}])
+
+    def test_synthetic_summary_card_not_a_parent(self):
+        # synthetic-сводка/карточка pcloc-dec — НЕ родитель (не даёт ложную «план строится»).
+        items = [{"id": 500, "from": self.F, "status": "new",
+                  "task_text": "[сводка родитель 194] итог цепи"},
+                 {"id": 501, "from": self.F, "status": "new",
+                  "task_text": "[карточка родитель 194] событие"}]
+        self.assertEqual(o._loc_active_chains(items), [])
+
+    # ---- renderer: _contour_status ----
+
+    def _find(self, name):
+        return [42] if "userbot_listen" in name else []
+
+    def test_status_empty_system_tiho(self):
+        txt = o._contour_status(finder=self._find, items=[], revizor_state={})
+        self.assertIn("🔧 В работе:", txt)
+        self.assertIn("🟢 ТИХО", txt)
+
+    def test_status_regression_other_sections_intact(self):
+        # регресс: шапка и строки живости процессов на месте при любой секции «в работе».
+        txt = o._contour_status(finder=self._find, items=[], revizor_state={})
+        self.assertIn("📊 Статус контура", txt)
+        self.assertIn("userbot: жив", txt)
+        self.assertIn("pc_orchestrator", txt)
+
+    def test_status_lists_live_chain_hides_ghost(self):
+        items = [self._parent(194, "failed"), self._step(194, 1, 2, "failed"),   # призрак
+                 self._parent(300, "done"), self._step(300, 2, 5, "in_progress")]  # живая
+        txt = o._contour_status(finder=self._find, items=items, revizor_state={})
+        self.assertIn("• цепь 300: шаг 2/5", txt)
+        self.assertNotIn("194", txt)                    # призрак не показан
+        self.assertNotIn("🟢 ТИХО", txt)                # есть живая работа
+
+    def test_status_bridge_silent_not_tiho(self):
+        # снимок None (Bridge молчит: _loc_fetch_items вернул None) → НЕ «ТИХО» (это было бы
+        # ложью «работы нет»), а честное «очередь недоступна».
+        save = o._loc_fetch_items
+        self.addCleanup(lambda: setattr(o, "_loc_fetch_items", save))
+        o._loc_fetch_items = lambda: None
+        txt = o._contour_status(finder=self._find, revizor_state={})
+        self.assertIn("очередь недоступна", txt)
+        self.assertNotIn("🟢 ТИХО", txt)
+
+    # ---- revizor tick: _revizor_tick_label ----
+
+    def test_revizor_tick_from_mark(self):
+        lbl = o._revizor_tick_label({"last_run": "2026-07-13T13:21:17.969802+00:00"})
+        self.assertIn("последний тик 2026-07-13 13:21", lbl)
+        self.assertIn("UTC", lbl)
+        self.assertNotIn("неизвестно", lbl)
+
+    def test_revizor_tick_no_mark(self):
+        self.assertEqual(o._revizor_tick_label({}), "надзор: ревизор — тиков ещё не было")
+
+
 class TestDirectChannel(Base):
     """Этап 1 (развязка 328-pc): прямой канал ПК↔Bridge для одиночек pc — enqueue+claim минуя
     девбот-в-splinter. Дополнительный путь, тема 328 остаётся рабочей (регресс)."""
