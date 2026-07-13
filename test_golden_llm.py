@@ -212,6 +212,43 @@ class TestGoldenRevizor(unittest.TestCase):
         self.assertNotIn("г", classes,
                          f"ревизор ложно счёл служебную пометку карточки утечкой клиенту: {findings}")
 
+    # --- Автоприветствие Telegram Business (дополнение к цепи #262) ---
+    # Первое «от нас» = статичный автогритинг Business (мимо userbot/модерации, бот его не сочинял):
+    # старое поколение «спасибо, что выбрали нас» + ссылки точек БангТао/Камала.
+    _AG = ("Здравствуйте, спасибо, что выбрали нас 🤝 Наши точки: "
+           "https://maps.app.goo.gl/bangtao1 https://maps.app.goo.gl/kamala2 "
+           "Напишите, пожалуйста, что хотели бы арендовать, с какого числа и на какой срок.")
+
+    def test_revizor_clean_when_questionnaire_is_autogreeting(self):
+        # ЧИСТО: «анкета» на первом контакте — это САМ автогритинг Business (не ответ бота). Клиент
+        # первым содержательным сообщением дал модель+даты, но вопросы «что арендовать / с какого
+        # числа» исходят из статичного автоприветствия → ложная ж). Окно должно выйти чистым (или noise).
+        first = "Honda ADV350 с 15 по 22 июля, сколько выйдет?"
+        pkg = {"client_id": 5101, "client_name": "Пётр",
+               "incoming": [first],
+               "transcript": f"[менеджер]: {self._AG}\n[client]: {first}",
+               "sent": [], "drafts": [], "greeting": self._AG,
+               "last_ts": "2026-07-13T12:00:00+00:00"}
+        classes, findings = self._classes(pkg, "гритинг-анкета")
+        self.assertNotIn("ж", classes,
+                         f"ревизор ложно счёл статичный автогритинг анкетой ж): {findings}")
+        self.assertNotIn("е", classes,
+                         f"ревизор ложно счёл автогритинг повтором приветствия е): {findings}")
+
+    def test_revizor_flags_bot_regreet_after_autogreeting(self):
+        # НАХОДКА е): автогритинг Business уже поздоровался, а БОТ в своём ответе здоровается ПОВТОРНО
+        # («Здравствуйте!») — лишнее второе приветствие. На содержание автогритинга находок нет.
+        first = "Привет, что есть из скутеров?"
+        bot = "Здравствуйте! Из скутеров есть NMAX 155, ADV 350, Forza 300. Что интересно?"
+        pkg = {"client_id": 5102, "client_name": "Олег",
+               "incoming": [first],
+               "transcript": f"[менеджер]: {self._AG}\n[client]: {first}\n[менеджер]: {bot}",
+               "sent": [bot], "drafts": [], "greeting": self._AG,
+               "last_ts": "2026-07-13T13:00:00+00:00"}
+        classes, findings = self._classes(pkg, "повтор приветствия после автогритинга")
+        self.assertIn("е", classes,
+                      f"ревизор НЕ поймал повторное приветствие бота после автогритинга: {findings}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

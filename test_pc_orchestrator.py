@@ -3255,6 +3255,80 @@ class TestRevizorSelect(unittest.TestCase):
         self.assertEqual(o._revizor_db_rows(db_path=os.path.join(tempfile.gettempdir(), "no_db_zzz.db")), [])
 
 
+# ------- РЕВИЗОР: автоприветствие Telegram Business (дополнение к цепи #262) -------
+# Первое «от нас» = статичный автогритинг Business (мимо userbot/модерации). Детект детерминированный,
+# по сигнатурной фразе ОБОИХ поколений; голдены — ДОСЛОВНЫЕ реальные тексты владельца + парафразы,
+# негативы — обычное приветствие бота / реплика клиента / только депозит (правило-класс CLAUDE.md).
+# Старый текст (13.07): «Здравствуйте, спасибо, что выбрали нас 🤝 Наши точки: <maps БангТао> <maps Камала>…»
+_AG_OLD = ("Здравствуйте, спасибо, что выбрали нас 🤝 Наши точки: "
+           "https://maps.app.goo.gl/bangtao1 https://maps.app.goo.gl/kamala2 "
+           "Напишите, пожалуйста, что хотели бы арендовать, с какого числа и на какой срок.")
+_AG_NEW = "Уже смотрю ваше сообщение, отвечу через пару минут 🙏"   # новое поколение владельца
+
+
+class TestRevizorAutogreeting(unittest.TestCase):
+    """Детект автоприветствия Telegram Business + пометка пакета + рендер для думателя."""
+
+    def test_detect_positives_both_generations(self):
+        # ОБА поколения + парафразы (регистр/пунктуация/ё-е агностично)
+        for txt in (_AG_OLD, _AG_NEW,
+                    "спасибо что выбрали нас!",                 # без запятой
+                    "СПАСИБО, ЧТО ВЫБРАЛИ НАС",                 # верхний регистр
+                    "Уже смотрю ваше сообщение…",               # многоточие-Unicode
+                    "уже  смотрю   ваше  сообщение"):           # лишние пробелы
+            self.assertTrue(o._revizor_is_autogreeting(txt), f"не распознал автогритинг: {txt!r}")
+
+    def test_detect_negatives(self):
+        # обычное приветствие бота / реплика клиента / только депозит — НЕ автогритинг
+        for txt in ("Здравствуйте! Из скутеров есть NMAX 155, ADV 350. Что интересно?",
+                    "Honda ADV350 с 15 по 22 июля, сколько выйдет?",
+                    "Депозит — 3000 бат или паспорт, на выбор.",
+                    "", None):
+            self.assertFalse(o._revizor_is_autogreeting(txt), f"ложный автогритинг: {txt!r}")
+
+    def test_greeting_line_from_transcript_strips_role(self):
+        tr = f"[менеджер]: {_AG_OLD}\n[клиент]: Honda ADV350 с 15 по 22 июля?"
+        self.assertEqual(o._revizor_greeting_line([], tr), _AG_OLD)   # ярлык роли снят
+
+    def test_greeting_line_from_sent_when_not_in_transcript(self):
+        self.assertEqual(o._revizor_greeting_line([_AG_NEW], "[клиент]: привет"), _AG_NEW)
+
+    def test_greeting_line_none_when_absent(self):
+        tr = "[менеджер]: Здравствуйте! Что арендуем?\n[клиент]: NMAX"
+        self.assertIsNone(o._revizor_greeting_line(["Здравствуйте! Что арендуем?"], tr))
+
+    def test_build_package_marks_greeting(self):
+        rows = [_rev_row(1, 700, "2026-07-13T09:00:00+00:00", status="new",
+                         incoming="Honda ADV350 с 15 по 22 июля?",
+                         transcript=f"[менеджер]: {_AG_OLD}\n[клиент]: Honda ADV350 с 15 по 22 июля?")]
+        self.assertEqual(o._revizor_build_package(700, rows)["greeting"], _AG_OLD)
+
+    def test_build_package_greeting_none_without_autogreeting(self):
+        rows = [_rev_row(1, 701, "2026-07-13T09:00:00+00:00", status="sent",
+                         incoming="привет", final_text="Здравствуйте! Что арендуем?",
+                         transcript="[клиент]: привет")]
+        self.assertIsNone(o._revizor_build_package(701, rows)["greeting"])
+
+    def test_pkg_text_renders_autogreeting_block(self):
+        pkg = {"client_id": 700, "incoming": [], "sent": [], "drafts": [],
+               "transcript": "[клиент]: привет", "greeting": _AG_NEW}
+        txt = o._revizor_pkg_text(pkg)
+        self.assertIn("АВТОПРИВЕТСТВИЕ TELEGRAM BUSINESS", txt)
+        self.assertIn(_AG_NEW, txt)
+
+    def test_pkg_text_omits_block_without_greeting(self):
+        pkg = {"client_id": 701, "incoming": [], "sent": [], "drafts": [],
+               "transcript": "[клиент]: привет", "greeting": None}
+        self.assertNotIn("АВТОПРИВЕТСТВИЕ TELEGRAM BUSINESS", o._revizor_pkg_text(pkg))
+
+    def test_preamble_wires_autogreeting_rules(self):
+        # инструкции думателю: не судить содержание автогритинга; чек е про повтор ПОСЛЕ автогритинга
+        pre = o.REVIZOR_PREAMBLE
+        self.assertIn("АВТОПРИВЕТСТВИ", pre)
+        self.assertIn("Telegram Business", pre)
+        self.assertIn("не заводи", pre.replace("\n", " "))
+
+
 class TestRevizorConsult(unittest.TestCase):
     """Думатель-ревизор окна (шаг 3/7 262): рендер пакета, парс JSON-массива находок, consult с
     инъекцией _thinker_exec (реальный claude не дёргаем)."""
