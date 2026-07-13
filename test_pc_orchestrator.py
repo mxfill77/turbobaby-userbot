@@ -3323,10 +3323,67 @@ class TestRevizorAutogreeting(unittest.TestCase):
 
     def test_preamble_wires_autogreeting_rules(self):
         # инструкции думателю: не судить содержание автогритинга; чек е про повтор ПОСЛЕ автогритинга
-        pre = o.REVIZOR_PREAMBLE
+        pre = o._revizor_preamble()
         self.assertIn("АВТОПРИВЕТСТВИ", pre)
         self.assertIn("Telegram Business", pre)
         self.assertIn("не заводи", pre.replace("\n", " "))
+
+
+class TestRevizorChecklist(unittest.TestCase):
+    """Чек-лист классов ревизора вынесен в живой файл docs/revizor_checklist.md (механика «урок
+    навсегда»): _revizor_checklist читает файл КАЖДЫЙ тик, _revizor_preamble вклеивает его между
+    ролью и контрактом вывода; файла нет/пуст → встроенный дефолт (fail-safe)."""
+
+    def _norm(self, s):
+        return re.sub(r"\s+", " ", s).strip()
+
+    def _tmp(self, text):
+        fd, p = tempfile.mkstemp(suffix=".md")
+        os.close(fd)
+        Path(p).write_text(text, encoding="utf-8")
+        self.addCleanup(lambda: os.path.exists(p) and os.remove(p))
+        return p
+
+    def test_shipped_file_matches_builtin_default(self):
+        # тело живого файла (без md-комментария) == встроенный дефолт → пропажа файла не меняет суд
+        self.assertEqual(self._norm(o._revizor_checklist(o.REVIZOR_CHECKLIST_FILE)),
+                         self._norm(o.REVIZOR_CHECKLIST_DEFAULT))
+
+    def test_default_has_all_classes_and_autogreeting(self):
+        d = o.REVIZOR_CHECKLIST_DEFAULT
+        for cls in "абвгдеж":
+            self.assertIn(f"[класс {cls}]", d)
+        self.assertIn("ВАЖНО об АВТОПРИВЕТСТВИИ", d)      # правило автогритинга — часть чек-листа
+
+    def test_file_is_read_and_stripped_of_comments(self):
+        p = self._tmp("<!-- секрет для человека -->\n- [класс а] реальный пункт\n")
+        cl = o._revizor_checklist(p)
+        self.assertIn("- [класс а] реальный пункт", cl)
+        self.assertNotIn("секрет для человека", cl)       # md-комментарий не течёт в думателя
+
+    def test_new_item_lands_in_next_tick_preamble(self):
+        # дописанный класс попадает в преамбулу СЛЕДУЮЩЕГО прогона без правки кода
+        p = self._tmp(o.REVIZOR_CHECKLIST_DEFAULT + "\n- [класс з] тестовый новый дефект\n")
+        pre = o._revizor_preamble(p)
+        self.assertIn("[класс з] тестовый новый дефект", pre)
+        self.assertIn("думатель-ревизор", pre)            # роль-префикс на месте
+        self.assertIn("JSON-массив", pre)                 # контракт-суффикс на месте
+
+    def test_preamble_reads_file_each_call(self):
+        p = self._tmp("- [класс а] первый\n")
+        self.assertIn("[класс а] первый", o._revizor_preamble(p))
+        Path(p).write_text("- [класс а] второй\n", encoding="utf-8")   # тот же файл поменяли
+        pre = o._revizor_preamble(p)
+        self.assertIn("[класс а] второй", pre)            # прочитано заново, без рестарта
+        self.assertNotIn("первый", pre)
+
+    def test_missing_file_failsafe_default(self):
+        cl = o._revizor_checklist(os.path.join(tempfile.gettempdir(), "нет-такого-revizor-checklist.md"))
+        self.assertEqual(cl, o.REVIZOR_CHECKLIST_DEFAULT)  # файла нет → дефолт
+
+    def test_empty_file_failsafe_default(self):
+        p = self._tmp("   \n<!-- только комментарий -->\n\n")   # тело пустое после вырезки
+        self.assertEqual(o._revizor_checklist(p), o.REVIZOR_CHECKLIST_DEFAULT)
 
 
 class TestRevizorConsult(unittest.TestCase):
