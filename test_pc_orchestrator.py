@@ -6,6 +6,7 @@ test_pc_orchestrator.py — мок-тесты ПК-оркестратора. Б�
 """
 
 import os
+import re
 import sys
 import tempfile
 import datetime
@@ -3644,6 +3645,206 @@ class TestRevizorGuards(Base):
         self.assertEqual(ran["n"], 0)                                  # approve не гонит headless
         self.assertEqual(self.fb.tasks[tid]["status"], "done")
         self.assertIn("приняты", self.fb.tasks[tid]["result"])
+
+
+# ------------------- РЕВИЗОР: КОНТУРНЫЕ ТЕСТЫ (шаг 6/7 родителя 262) ---------------------
+# Сквозной прогон ВСЕГО контура ревизора: реальная sqlite-БД drafts → maybe_revizor → revizor_tick
+# (отбор окон/сборка пакетов) → _revizor_route → _revizor_consult (парс/валидация) → enqueue задач /
+# owner-карточка / бюджет / дедуп / метка на диск. Замокан ТОЛЬКО _thinker_exec (граница реального
+# claude) — всё остальное (парс JSON, маршрутизация, очередь FakeBridge, restart-proof метка) боевое.
+# Это отличает контурные тесты от юнитов выше (TestRevizor*): там части проверены по отдельности,
+# здесь — их СЦЕПКА в один демонский тик. Дефолт DIALOG_REVIZOR=0 проверен отдельным классом ниже.
+
+_REV_ACTIVE_TS = "2030-01-01T00:00:00+00:00"   # заведомо новее любой метки прогона → окно активно
+_REV_STALE_TS = "2020-01-01T00:00:00+00:00"    # заведомо старее метки → окно НЕ отбираем
+
+
+def _make_drafts_db(path, rows):
+    """Реальная moderation_ipc.db с таблицей drafts (recon §A) для контурного отбора окон."""
+    import sqlite3
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE drafts (id INTEGER PRIMARY KEY, client_id INTEGER, client_name TEXT, "
+              "incoming TEXT, transcript TEXT, draft TEXT, final_text TEXT, status TEXT, updated_ts TEXT)")
+    for r in rows:
+        c.execute("INSERT INTO drafts (client_id, client_name, incoming, transcript, draft, final_text, "
+                  "status, updated_ts) VALUES (?,?,?,?,?,?,?,?)",
+                  (r.get("client_id"), r.get("client_name"), r.get("incoming"), r.get("transcript"),
+                   r.get("draft"), r.get("final_text"), r.get("status", "sent"),
+                   r.get("updated_ts", _REV_ACTIVE_TS)))
+    c.commit(); c.close()
+
+
+class TestRevizorContour(Base):
+    """Сквозной контур ревизора: реальная БД → maybe_revizor → route → очередь/карточка/метка.
+    Мок только на границе LLM (_thinker_exec); вердикты думателя инъектируем по client_id окна."""
+
+    def setUp(self):
+        super().setUp()
+        self._save_r = (o._revizor_on, o._thinker_exec)
+        o._revizor_on = lambda: True                 # флаг включён (дефолт-0 проверяется отдельным классом)
+        self.notes = []
+        o._cowork = lambda line: self.notes.append(line)
+        self.audited = []                            # client_id окон, дошедших до думателя
+        self.tmp = tempfile.mkdtemp()
+        self.state = os.path.join(self.tmp, "revizor_state.json")
+        self.db = os.path.join(self.tmp, "moderation_ipc.db")
+
+    def tearDown(self):
+        (o._revizor_on, o._thinker_exec) = self._save_r
+        super().tearDown()
+
+    def _thinker(self, verdicts):
+        """verdicts: client_id(int) → JSON-строка ответа думателя | None (сбой/таймаут = None, как
+        боевой _thinker_exec). Инъектируем на границе LLM; фиксируем, какие окна аудировались."""
+        def fake(prompt, timeout, tag):
+            m = re.search(r"client_id=(\d+)", prompt)
+            cid = int(m.group(1)) if m else None
+            self.audited.append(cid)
+            return verdicts.get(cid)
+        o._thinker_exec = fake
+
+    def _seed_state(self, ts):
+        o._revizor_write_state(ts, path=self.state)
+
+    def _tasks_with(self, needle):
+        return [t for t in self.fb.tasks.values() if needle in str(t.get("task_text"))]
+
+    def test_contour_full_flow_task_owner_noise(self):
+        # три активных окна (task/owner/noise) + одно протухшее (НЕ аудируем)
+        _make_drafts_db(self.db, [
+            {"client_id": 100, "incoming": "первым же дал модель и даты, а мне анкету", "updated_ts": _REV_ACTIVE_TS},
+            {"client_id": 200, "incoming": "спорный тариф на месяц?", "updated_ts": _REV_ACTIVE_TS},
+            {"client_id": 300, "incoming": "обычный вопрос", "updated_ts": _REV_ACTIVE_TS},
+            {"client_id": 400, "incoming": "давно молчит", "updated_ts": _REV_STALE_TS},
+        ])
+        self._thinker({
+            100: '[{"class":"ж","evidence":"анкета на первом сообщении","action":"task",'
+                 '"task_text":"фикс детекта: модель+даты первым сообщением → котировать, не анкетировать"}]',
+            200: '[{"class":"г","evidence":"спорный тариф на месяц","action":"owner","task_text":""}]',
+            300: '[{"class":"в","evidence":"ложное срабатывание","action":"noise","task_text":""}]',
+        })
+        t0 = _REV_NOW
+        self._seed_state(t0)                                   # не бутстрап → следующий прогон тикает
+        now1 = t0 + o.REVIZOR_SEC + 1
+        out = o.maybe_revizor(now=now1, db_path=self.db, state_path=self.state)
+
+        self.assertEqual(sorted(self.audited), [100, 200, 300])   # протухшее окно 400 НЕ аудировали
+        self.assertEqual([p["client_id"] for p in out], [100, 200, 300])
+        # task → зелёный родитель дирижёру с маркером даты/класса
+        dec = [t for t in self.fb.tasks.values() if t.get("from") == o.PC_LOCAL_DEC_FROM]
+        self.assertEqual(len(dec), 1)
+        self.assertTrue(dec[0]["task_text"].startswith(f"[ревизор дата={o._revizor_today(now1)} класс=ж]"))
+        self.assertIn("котировать", dec[0]["task_text"])
+        # owner → одна сводная карточка в инбокс одобрений
+        cards = [t for t in self.fb.tasks.values() if t["status"] == "needs_approval"
+                 and o._is_revizor_owner_card(t.get("task_text"))]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["topic"], o.NEEDS_APPROVAL_TOPIC)
+        self.assertIn("спорный тариф", cards[0]["what"])
+        # noise наружу не вынесен (ни задачи, ни карточки под класс «в»)
+        self.assertEqual(self._tasks_with("класс=в]"), [])
+        # метка сдвинута вперёд (restart-proof троттл)
+        self.assertEqual(o._revizor_read_state(path=self.state)["ts"], now1)
+
+    def test_contour_budget_two_tasks_per_day(self):
+        _make_drafts_db(self.db, [{"client_id": c, "incoming": f"окно {c}"} for c in (100, 200, 300)])
+        mk = lambda cls: ('[{"class":"%s","evidence":"улика %s","action":"task",'
+                          '"task_text":"фикс класса %s"}]') % (cls, cls, cls)
+        self._thinker({100: mk("а"), 200: mk("б"), 300: mk("в")})   # 3 РАЗНЫХ класса → дедуп не при чём
+        self._seed_state(_REV_NOW)
+        o.maybe_revizor(now=_REV_NOW + o.REVIZOR_SEC + 1, db_path=self.db, state_path=self.state)
+        dec = [t for t in self.fb.tasks.values() if t.get("from") == o.PC_LOCAL_DEC_FROM]
+        self.assertEqual(len(dec), 2)                          # бюджет ≤2/сутки: третья отложена
+        self.assertEqual(self._tasks_with("класс=в]"), [])     # именно третья (в порядке окон) не встала
+
+    def test_contour_dedup_task_by_class_restart_proof(self):
+        # прогон 1: класс «а» встал в очередь; «рестарт» = свежий вызов, дедуп читает МАРКЕР из очереди
+        _make_drafts_db(self.db, [{"client_id": 100, "incoming": "окно"}])
+        self._thinker({100: '[{"class":"а","evidence":"e","action":"task","task_text":"фикс класса а"}]'})
+        self._seed_state(_REV_NOW)
+        o.maybe_revizor(now=_REV_NOW + o.REVIZOR_SEC + 1, db_path=self.db, state_path=self.state)
+        self.assertEqual(len(self._tasks_with("класс=а]")), 1)
+        # прогон 2 (период снова прошёл, окно снова активно): тот же класс → дедуп по очереди, не дублируем
+        o.maybe_revizor(now=_REV_NOW + 2 * (o.REVIZOR_SEC + 1), db_path=self.db, state_path=self.state)
+        self.assertEqual(len(self._tasks_with("класс=а]")), 1)  # restart-proof дедуп: вторая не встала
+
+    def test_contour_owner_card_single_across_runs(self):
+        _make_drafts_db(self.db, [{"client_id": 200, "incoming": "спорно"}])
+        # улика — уникальный токен, которого НЕТ в шапке карточки → счётчик ловит именно дубль строки
+        self._thinker({200: '[{"class":"г","evidence":"улика-спор-777","action":"owner","task_text":""}]'})
+        self._seed_state(_REV_NOW)
+        o.maybe_revizor(now=_REV_NOW + o.REVIZOR_SEC + 1, db_path=self.db, state_path=self.state)
+        o.maybe_revizor(now=_REV_NOW + 2 * (o.REVIZOR_SEC + 1), db_path=self.db, state_path=self.state)
+        cards = [t for t in self.fb.tasks.values() if t["status"] == "needs_approval"
+                 and o._is_revizor_owner_card(t.get("task_text"))]
+        self.assertEqual(len(cards), 1)                        # редактируем ту же карточку, не плодим вторую
+        self.assertEqual(cards[0]["what"].count("улика-спор-777"), 1)   # дедуп идентичной строки-цитаты
+
+    def test_contour_failsafe_thinker_timeout_silence(self):
+        # думатель молчит по ВСЕМ окнам (таймаут/сбой = None) → наружу тишина + NOTE, но метку ставим
+        _make_drafts_db(self.db, [{"client_id": 100, "incoming": "a"}, {"client_id": 200, "incoming": "b"}])
+        self._thinker({100: None, 200: None})
+        self._seed_state(_REV_NOW)
+        now1 = _REV_NOW + o.REVIZOR_SEC + 1
+        o.maybe_revizor(now=now1, db_path=self.db, state_path=self.state)
+        self.assertEqual(sorted(self.audited), [100, 200])     # дошли до думателя — он молчал
+        self.assertEqual([t for t in self.fb.tasks.values()], [])   # ни задач, ни карточек
+        self.assertTrue(any("не ответил" in n for n in self.notes))
+        self.assertEqual(o._revizor_read_state(path=self.state)["ts"], now1)  # троттл всё равно сдвинут
+
+    def test_contour_failsafe_route_crash_still_marks(self):
+        # маршрутизация упала внутри тика → maybe_revizor гасит исключение и ВСЁ РАВНО ставит метку
+        _make_drafts_db(self.db, [{"client_id": 100, "incoming": "a"}])
+        self._thinker({100: '[{"class":"ж","action":"task","task_text":"фикс"}]'})
+        save = o._revizor_route
+        self.addCleanup(lambda: setattr(o, "_revizor_route", save))
+        o._revizor_route = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("bang"))
+        self._seed_state(_REV_NOW)
+        now1 = _REV_NOW + o.REVIZOR_SEC + 1
+        try:
+            o.maybe_revizor(now=now1, db_path=self.db, state_path=self.state)
+        except Exception as e:
+            self.fail(f"maybe_revizor не должен пробрасывать сбой маршрутизации: {e}")
+        self.assertEqual(o._revizor_read_state(path=self.state)["ts"], now1)   # метка поставлена (не зациклимся)
+
+    def test_contour_throttle_restart_proof_no_audit(self):
+        # свежая метка на диске гейтит повторный прогон ДО периода — БД не читаем, окна не аудируем
+        _make_drafts_db(self.db, [{"client_id": 100, "incoming": "a"}])
+        self._thinker({100: '[{"class":"ж","action":"task","task_text":"фикс"}]'})
+        self._seed_state(_REV_NOW)
+        out = o.maybe_revizor(now=_REV_NOW + 5, db_path=self.db, state_path=self.state)  # период НЕ прошёл
+        self.assertIsNone(out)
+        self.assertEqual(self.audited, [])                     # думатель не дёрнут — контур не тикал
+        self.assertEqual(o._revizor_read_state(path=self.state)["ts"], _REV_NOW)  # метку не двигаем
+
+
+class TestRevizorDefaultOff(unittest.TestCase):
+    """Дефолт DIALOG_REVIZOR=0: без флага ревизор молчит целиком — ни тика, ни метки, ни чтения БД.
+    Проверяем НАСТОЯЩИЙ _revizor_on (не мок) при отсутствующем/нулевом флаге в окружении."""
+
+    def test_default_flag_is_off(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DIALOG_REVIZOR", None)             # флаг не задан → дефолт
+            self.assertFalse(o._revizor_on())
+
+    def test_flag_zero_is_off(self):
+        with mock.patch.dict(os.environ, {"DIALOG_REVIZOR": "0"}, clear=False):
+            self.assertFalse(o._revizor_on())
+
+    def test_flag_one_is_on(self):
+        with mock.patch.dict(os.environ, {"DIALOG_REVIZOR": "1"}, clear=False):
+            self.assertTrue(o._revizor_on())
+
+    def test_maybe_revizor_off_no_state_no_db(self):
+        tmp = tempfile.mkdtemp()
+        state = os.path.join(tmp, "revizor_state.json")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DIALOG_REVIZOR", None)
+            # db_path указывает на несуществующий файл — если бы ревизор тикал, увидели бы попытку чтения;
+            # но выключенный ревизор возвращает None ДО обращения к БД/метке.
+            out = o.maybe_revizor(now=_REV_NOW, db_path=os.path.join(tmp, "no.db"), state_path=state)
+        self.assertIsNone(out)
+        self.assertFalse(os.path.exists(state))                # метку НЕ ставим → демон байт-в-байт прежний
 
 
 if __name__ == "__main__":
