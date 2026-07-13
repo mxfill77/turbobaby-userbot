@@ -2671,28 +2671,134 @@ def _schtasks_run(task_name=TASK_NAME):
         return -1, f"schtasks не запустился: {e}"
 
 
-def watchdog(now=None, runner=None, verify_sleep=None):
-    """НАДЁЖНЫЙ вотчдог (урок инцидента 205 — тихого сбоя быть не должно):
-    heartbeat свежий → alive; протух и рубильник неактивен → schtasks /Run + ЛОГИРУЕМ его вывод +
-    ВЕРИФИЦИРУЕМ подъём; не поднялся → ГРОМКИЙ лог (не молча). → 'stopped'|'alive'|'restarted'|'failed_to_start'."""
+# --- внешний вотчдог: живость ПО ФАКТУ + антиспам (класс-фикс ложняка 13.07) ---
+# Живой провал: heartbeat пишется в КОНЦЕ poll_once, а run_task (claude -p) законно молотит
+# до 45 мин → на ЛЮБОЙ задаче длиннее HEARTBEAT_STALE (180с) heartbeat замирал, внешний
+# вотчдог считал живой демон мёртвым, schtasks /Run поднимал второй экземпляр (его штатно
+# гасил singleton-лок), heartbeat оставался старым → «не смог поднять» + пуш КАЖДЫЕ 5 мин
+# весь день (13.07: каждый алерт-слот лежит внутри окна CLAIM..COMPLETE задач 256–260).
+# Класс: живость = heartbeat свеж ИЛИ процесс демона реально жив (CIM по CommandLine, как в
+# client_watchdog — переживает и длинные задачи, и смену PID после self-update); алерт — один
+# на инцидент (переход жив→мёртв), состояние в файле (вотчдог — короткоживущий процесс,
+# память между тиками не живёт).
+WD_STATE_FILE = os.path.join(REPO, "pc_orchestrator.watchdog_state.json")
+WD_ALERT_COOLDOWN = int(os.getenv("PC_WD_ALERT_COOLDOWN", "900") or "900")   # флап-защита алерта, с
+
+
+def _find_daemon_pids():
+    """PID процессов САМОГО демона pc_orchestrator.py (без --watchdog-запусков — вотчдог тоже
+    исполняет pc_orchestrator.py! — и без своего PID). ТРИ исхода как у _find_pids_by_script
+    (#171): список | [] (честная пустота) | None (CIM не смог — смерть НЕ доказана)."""
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" "
+          "| Where-Object { $_.CommandLine -like '*pc_orchestrator.py*' "
+          "-and $_.CommandLine -notlike '*--watchdog*' } "
+          "| Select-Object -ExpandProperty ProcessId")
+    try:
+        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        log.warning("watchdog: CIM-поиск демона не удался (%s) — исход НЕИЗВЕСТЕН", e)
+        return None
+    pids = [int(x) for x in (p.stdout or "").split() if x.strip().isdigit()]
+    pids = [x for x in pids if x != os.getpid()]
+    if pids:
+        return pids
+    if p.returncode != 0 or (p.stderr or "").strip():
+        log.warning("watchdog: CIM-поиск демона пуст, но rc=%s / stderr=%r — исход НЕИЗВЕСТЕН",
+                    p.returncode, _tail((p.stderr or "").strip(), 120))
+        return None
+    return []
+
+
+def _wd_state_read(path=None):
+    """Состояние вотчдога {'state': 'alive'|'down', 'last_alert': ts} из файла → dict ({} = нет/бит)."""
+    try:
+        with open(path or WD_STATE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _wd_state_write(d, path=None):
+    try:
+        with open(path or WD_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except Exception as e:
+        log.warning("watchdog: state-файл не записался (%s) — антиспам деградирует, не критично", e)
+
+
+def watchdog(now=None, runner=None, verify_sleep=None, finder=None, state_path=None,
+             notify=None, cowork=None, wall_now=None):
+    """НАДЁЖНЫЙ вотчдог (урок 205 — тихого сбоя быть не должно; класс-фикс 13.07 — и ЛОЖНОГО
+    шума быть не должно): живость ПО ФАКТУ — heartbeat свеж ИЛИ процесс демона жив (длинная
+    задача, замершая heartbeat, или смена PID после self-update ≠ смерть). ДОКАЗАННО мёртв
+    (heartbeat протух И процессов нет) → schtasks /Run + верификация (heartbeat ИЛИ процесс);
+    не поднялся → РОВНО один алерт на инцидент (переход жив→мёртв, кулдаун WD_ALERT_COOLDOWN,
+    состояние в файле) + NOTE в cowork. CIM не смог → страховочный /Run БЕЗ алерта (смерть не
+    доказана; второй экземпляр штатно гасит singleton).
+    → 'stopped'|'alive'|'restarted'|'failed_to_start'|'unknown'."""
     if _stopped():
         log.info("watchdog: рубильник активен — демон намеренно не поднимается")
         return "stopped"
+    find = finder or _find_daemon_pids
+    tnow = wall_now if wall_now is not None else time.time()
+
+    def _mark_alive():
+        st = _wd_state_read(state_path)
+        if st.get("state") == "down":
+            log.info("watchdog: инцидент закрыт — демон снова жив")
+            (cowork or _cowork)("watchdog: демон снова жив — инцидент закрыт")
+        _wd_state_write({"state": "alive", "last_alert": float(st.get("last_alert") or 0.0)},
+                        state_path)
+
     if _heartbeat_fresh(now=now):
+        _mark_alive()
         return "alive"
-    log.warning("watchdog: heartbeat протух (>%ss) — демон не жив, поднимаю через schtasks", HEARTBEAT_STALE)
+    pids = find()
+    if pids:
+        # heartbeat замер, но демон ЖИВ по процессу: длинная задача держит poll_once (корень
+        # ложняка 13.07) либо только что был self-update (новый PID). НЕ поднимаем, НЕ шумим.
+        log.info("watchdog: heartbeat старше %sс, но процесс демона жив (PID %s) — "
+                 "длинная задача/рестарт, не трогаю", HEARTBEAT_STALE, pids)
+        _mark_alive()
+        return "alive"
+    if pids is None:
+        # Смерть НЕ доказана (#171: «не смог проверить» ≠ «мёртв») → страховочный /Run
+        # (живому не повредит: второй экземпляр гасит singleton), алерт НЕ шлём.
+        rc, out = (runner or _schtasks_run)()
+        log.warning("watchdog: heartbeat протух, CIM неясен — страховочный schtasks /Run rc=%s | %s "
+                    "(без алерта: смерть не доказана)", rc, _tail(out, 120))
+        return "unknown"
+    # ДОКАЗАННО мёртв: heartbeat протух И процессов демона нет → поднимаем.
+    log.warning("watchdog: heartbeat протух (>%ss) и процессов демона НЕТ — поднимаю через schtasks",
+                HEARTBEAT_STALE)
     rc, out = (runner or _schtasks_run)()
     log.warning("watchdog: schtasks /Run /TN %s → rc=%s | %s", TASK_NAME, rc, out)   # ЛОГ вывода (205)
     if verify_sleep is None:
         verify_sleep = WATCH_VERIFY_SLEEP
     if verify_sleep:
         time.sleep(verify_sleep)
-    if _heartbeat_fresh(now=now):
-        log.info("watchdog: демон поднялся — heartbeat свежий")
+    ver_pids = find()
+    if _heartbeat_fresh(now=now) or ver_pids:
+        log.info("watchdog: демон поднялся (heartbeat свежий / процесс жив)")
+        _mark_alive()
         return "restarted"
+    if ver_pids is None:
+        log.warning("watchdog: после /Run CIM неясен — подъём не подтверждён и не опровергнут, "
+                    "без алерта (перепроверим следующим тиком)")
+        return "unknown"
     log.error("watchdog: ТИХИЙ СБОЙ ПРЕДОТВРАЩЁН — демон НЕ поднялся после schtasks /Run (rc=%s). "
               "Нужно вмешательство.", rc)
-    _notify("⚠️ Оркестратор: watchdog не смог поднять демон через schtasks — проверь pc_orchestrator.log")
+    st = _wd_state_read(state_path)
+    if st.get("state") != "down" and (tnow - float(st.get("last_alert") or 0.0)) >= WD_ALERT_COOLDOWN:
+        (notify or _notify)("⚠️ Оркестратор: watchdog не смог поднять демон через schtasks — "
+                            "проверь pc_orchestrator.log")
+        (cowork or _cowork)("watchdog: демон мёртв, schtasks /Run не поднял — нужен разбор")
+        _wd_state_write({"state": "down", "last_alert": tnow}, state_path)
+    else:   # инцидент уже заявлен (или флап внутри кулдауна) — тишина, фиксируем только state
+        _wd_state_write({"state": "down", "last_alert": float(st.get("last_alert") or 0.0)},
+                        state_path)
     return "failed_to_start"
 
 

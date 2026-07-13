@@ -397,35 +397,139 @@ class TestApprovalTimeout(Base):
 
 
 class TestWatchdog(Base):
-    def test_alive(self):
+    """Внешний вотчдог: живость ПО ФАКТУ (heartbeat ИЛИ процесс) + антиспам алерта.
+    Класс-голдены ложняка 13.07: живой демон на длинной задаче (heartbeat замер) и self-update
+    смена PID НЕ считаются смертью; алерт — ровно один на инцидент."""
+
+    def setUp(self):
+        super().setUp()
+        self._save_hb = o._heartbeat_fresh
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self._tmp.name, "wd_state.json")
+        self.notes, self.pushes = [], []
+        self.cow = lambda s: self.notes.append(s)
+        self.push = lambda s: self.pushes.append(s)
+        self.runs = {"n": 0}
+
+    def tearDown(self):
+        o._heartbeat_fresh = self._save_hb
+        self._tmp.cleanup()
+        super().tearDown()
+
+    def _runner(self):
+        self.runs["n"] += 1
+        return (0, "SUCCESS: task run")
+
+    def _wd(self, finder, wall_now=None):
+        return o.watchdog(runner=self._runner, verify_sleep=0, finder=finder,
+                          state_path=self.state, notify=self.push, cowork=self.cow,
+                          wall_now=wall_now)
+
+    # (a) демон жив + heartbeat свеж → ТИШИНА: ни подъёма, ни алертов.
+    def test_a_alive_hb_fresh_silence(self):
         o._heartbeat_fresh = lambda *a, **k: True
-        called = {"n": 0}
-        r = o.watchdog(runner=lambda: (called.__setitem__("n", called["n"] + 1), (0, "x"))[1], verify_sleep=0)
+        finder_calls = {"n": 0}
+        def finder():
+            finder_calls["n"] += 1
+            return [111]
+        r = self._wd(finder)
         self.assertEqual(r, "alive")
-        self.assertEqual(called["n"], 0)             # живого не перезапускаем
+        self.assertEqual(self.runs["n"], 0)
+        self.assertEqual(self.pushes, [])
+        self.assertEqual(self.notes, [])
+        self.assertEqual(finder_calls["n"], 0)       # свежий heartbeat — CIM даже не дёргаем
 
-    def test_restart_success(self):
-        seq = iter([False, True])                    # протух → после /Run свежий
-        o._heartbeat_fresh = lambda *a, **k: next(seq)
-        calls = {"n": 0}
-        def runner():
-            calls["n"] += 1
-            return (0, "SUCCESS: task run")
-        r = o.watchdog(runner=runner, verify_sleep=0)
+    # КОРЕНЬ ложняка 13.07: heartbeat замер на длинной задаче, но процесс демона ЖИВ → тишина.
+    def test_long_task_hb_stale_process_alive_no_alert(self):
+        o._heartbeat_fresh = lambda *a, **k: False
+        r = self._wd(lambda: [2096])                 # живой PID демона (как 13.07 на задачах 256-260)
+        self.assertEqual(r, "alive")
+        self.assertEqual(self.runs["n"], 0)          # НЕ поднимаем второй экземпляр
+        self.assertEqual(self.pushes, [])            # НЕ спамим
+        self.assertEqual(self.notes, [])
+
+    # (c) self-update: PID сменился, heartbeat свеж → БЕЗ алерта (прежний PID никого не волнует).
+    def test_c_selfupdate_new_pid_hb_fresh_no_alert(self):
+        o._heartbeat_fresh = lambda *a, **k: True
+        r = self._wd(lambda: [55555])                # новый PID после эстафеты
+        self.assertEqual(r, "alive")
+        self.assertEqual(self.pushes, [])
+        # и вариант: heartbeat на миг рестарта протух, но НОВЫЙ процесс уже жив → тоже тишина
+        o._heartbeat_fresh = lambda *a, **k: False
+        r = self._wd(lambda: [55556])
+        self.assertEqual(r, "alive")
+        self.assertEqual(self.pushes, [])
+        self.assertEqual(self.runs["n"], 0)
+
+    # (b) ДОКАЗАННО мёртв → подъём + РОВНО один алерт + NOTE; инцидент длится → без повторов.
+    def test_b_dead_exactly_one_alert_and_note(self):
+        o._heartbeat_fresh = lambda *a, **k: False
+        dead = lambda: []                            # CIM честно: процессов нет (и после /Run)
+        r = self._wd(dead, wall_now=1_000_000.0)
+        self.assertEqual(r, "failed_to_start")
+        self.assertEqual(self.runs["n"], 1)          # попытка подъёма была
+        self.assertEqual(len(self.pushes), 1)        # РОВНО один алерт
+        self.assertEqual(len(self.notes), 1)         # + NOTE в cowork
+        self.assertIn("не смог поднять", self.pushes[0])
+        # следующие тики того же инцидента (каждые 5 мин) — ТИШИНА
+        for dt in (300.0, 600.0, 3600.0):
+            self._wd(dead, wall_now=1_000_000.0 + dt)
+        self.assertEqual(len(self.pushes), 1)
+        self.assertEqual(len(self.notes), 1)
+
+    # мёртв → schtasks поднял (процесс появился) → restarted, БЕЗ алерта.
+    def test_restart_success_by_process(self):
+        o._heartbeat_fresh = lambda *a, **k: False
+        seq = iter([[], [7777]])                     # до /Run пусто → после /Run процесс жив
+        r = self._wd(lambda: next(seq))
         self.assertEqual(r, "restarted")
-        self.assertEqual(calls["n"], 1)              # schtasks /Run позван
+        self.assertEqual(self.runs["n"], 1)
+        self.assertEqual(self.pushes, [])
 
-    def test_failed_to_start_loud(self):
-        o._heartbeat_fresh = lambda *a, **k: False   # так и не поднялся
-        r = o.watchdog(runner=lambda: (0, "SUCCESS"), verify_sleep=0)
-        self.assertEqual(r, "failed_to_start")       # НЕ тихо — громкий лог + пуш (урок 205)
+    # регресс прежнего пути: подъём подтверждён свежим heartbeat.
+    def test_restart_success_by_heartbeat(self):
+        hb = iter([False, True])
+        o._heartbeat_fresh = lambda *a, **k: next(hb)
+        r = self._wd(lambda: [])
+        self.assertEqual(r, "restarted")
+        self.assertEqual(self.runs["n"], 1)
+        self.assertEqual(self.pushes, [])
+
+    # CIM не смог (#171) → страховочный /Run, БЕЗ алерта (смерть не доказана).
+    def test_cim_blind_unknown_no_alert(self):
+        o._heartbeat_fresh = lambda *a, **k: False
+        r = self._wd(lambda: None)
+        self.assertEqual(r, "unknown")
+        self.assertEqual(self.runs["n"], 1)          # подстраховались (singleton защитит живого)
+        self.assertEqual(self.pushes, [])
+
+    # восстановление после инцидента: NOTE «инцидент закрыт» один раз; новый инцидент после
+    # кулдауна → НОВЫЙ алерт (переход жив→мёртв), внутри кулдауна → тишина (флап-защита).
+    def test_recovery_note_and_next_incident(self):
+        o._heartbeat_fresh = lambda *a, **k: False
+        dead = lambda: []
+        self._wd(dead, wall_now=1_000_000.0)                       # инцидент №1: алерт
+        self.assertEqual(len(self.pushes), 1)
+        o._heartbeat_fresh = lambda *a, **k: True
+        self.assertEqual(self._wd(dead, wall_now=1_000_100.0), "alive")   # ожил
+        self.assertTrue(any("снова жив" in s for s in self.notes))        # NOTE о закрытии
+        n_notes = len(self.notes)
+        self._wd(dead, wall_now=1_000_160.0)                       # всё ещё жив — без дублей NOTE
+        self.assertEqual(len(self.notes), n_notes)
+        o._heartbeat_fresh = lambda *a, **k: False
+        self._wd(dead, wall_now=1_000_200.0)                       # инцидент №2 ВНУТРИ кулдауна
+        self.assertEqual(len(self.pushes), 1)                      # флап-защита: алерта нет
+        o._heartbeat_fresh = lambda *a, **k: True
+        self._wd(dead, wall_now=1_000_300.0)                       # снова ожил
+        o._heartbeat_fresh = lambda *a, **k: False
+        self._wd(dead, wall_now=1_001_000.0)                       # инцидент №3 ПОСЛЕ кулдауна
+        self.assertEqual(len(self.pushes), 2)                      # новый переход → новый алерт
 
     def test_stopped_switch(self):
         o._stopped = lambda: True
-        calls = {"n": 0}
-        r = o.watchdog(runner=lambda: (calls.__setitem__("n", calls["n"] + 1), (0, "x"))[1], verify_sleep=0)
+        r = self._wd(lambda: [])
         self.assertEqual(r, "stopped")
-        self.assertEqual(calls["n"], 0)              # рубильник активен — не поднимаем
+        self.assertEqual(self.runs["n"], 0)          # рубильник активен — не поднимаем
 
 
 class TestUnit(unittest.TestCase):
