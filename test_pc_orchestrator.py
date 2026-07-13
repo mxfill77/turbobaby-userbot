@@ -3158,5 +3158,175 @@ class TestLocalDecRed(Base):
         self.assertEqual(self.fb.tasks[sid]["status"], "needs_approval")   # кнопка как раньше
 
 
+# --------------------------- РЕВИЗОР ДИАЛОГОВ (шаг 2/7, 262) ---------------------------
+
+def _rev_row(rid, client_id, updated_ts, status="new", incoming=None, draft=None,
+             final_text=None, transcript=None, client_name=None):
+    """Строка drafts для тестов ревизора (только колонки, которые читает ревизор)."""
+    return {"id": rid, "client_id": client_id, "client_name": client_name,
+            "incoming": incoming, "transcript": transcript, "draft": draft,
+            "final_text": final_text, "status": status, "updated_ts": updated_ts}
+
+
+class TestRevizorSelect(unittest.TestCase):
+    """Отбор окон с активностью и сборка пакета по окну (чистые функции, без БД)."""
+
+    def test_newer_parse_and_compare(self):
+        base = "2026-07-13T10:00:00+00:00"
+        self.assertTrue(o._revizor_newer("2026-07-13T10:00:01+00:00", base))   # строго новее
+        self.assertFalse(o._revizor_newer(base, base))                          # равно → не новее
+        self.assertFalse(o._revizor_newer("2026-07-13T09:59:59+00:00", base))   # старее
+        self.assertTrue(o._revizor_newer("что угодно", None))                   # нет метки → всё ново
+        self.assertFalse(o._revizor_newer("не-дата", base))                     # не парсится → не тянем
+
+    def test_select_groups_by_client_and_filters_by_since(self):
+        since = "2026-07-13T10:00:00+00:00"
+        rows = [
+            _rev_row(1, 111, "2026-07-13T09:00:00+00:00"),   # окно 111: только старое → пропуск
+            _rev_row(2, 222, "2026-07-13T09:00:00+00:00"),   # окно 222: старое +…
+            _rev_row(3, 222, "2026-07-13T11:00:00+00:00"),   # …свежее → активно
+            _rev_row(4, 333, "2026-07-13T12:00:00+00:00"),   # окно 333: свежее → активно
+            _rev_row(5, None, "2026-07-13T12:00:00+00:00"),  # без client_id → игнор
+        ]
+        self.assertEqual(o._revizor_select_windows(rows, since), [222, 333])
+
+    def test_select_since_none_takes_all_windows(self):
+        rows = [_rev_row(1, 111, "2026-07-13T09:00:00+00:00"),
+                _rev_row(2, 222, "2026-07-13T09:00:00+00:00")]
+        self.assertEqual(o._revizor_select_windows(rows, None), [111, 222])
+
+    def test_build_package_splits_client_sent_drafts(self):
+        rows = [
+            _rev_row(1, 222, "2026-07-13T09:00:00+00:00", status="sent",
+                     incoming="привет, какие цены?", draft="черновик-1",
+                     final_text="Привет! Тарифы такие…", transcript="[client]: привет",
+                     client_name="Иван"),
+            _rev_row(2, 222, "2026-07-13T11:00:00+00:00", status="new",
+                     incoming="а депозит?", draft="черновик-2",
+                     final_text="ОТКЛОНЁННЫЙ", transcript="[client]: привет\n[client]: а депозит?"),
+            _rev_row(3, 999, "2026-07-13T11:00:00+00:00", incoming="чужое окно"),
+        ]
+        pkg = o._revizor_build_package(222, rows)
+        self.assertEqual(pkg["client_id"], 222)
+        self.assertEqual(pkg["client_name"], "Иван")
+        self.assertEqual(pkg["incoming"], ["привет, какие цены?", "а депозит?"])
+        # sent — ТОЛЬКО final_text одобренных статусов (ready/sent/test_held); new не в счёт
+        self.assertEqual(pkg["sent"], ["Привет! Тарифы такие…"])
+        self.assertNotIn("ОТКЛОНЁННЫЙ", pkg["sent"])
+        self.assertEqual(pkg["drafts"], ["черновик-1", "черновик-2"])
+        self.assertEqual(pkg["transcript"], "[client]: привет\n[client]: а депозит?")  # самый свежий
+        self.assertEqual(pkg["last_ts"], "2026-07-13T11:00:00+00:00")
+
+    def test_build_package_sent_from_ready_and_test_held(self):
+        rows = [_rev_row(1, 5, "t1", status="ready", final_text="R"),
+                _rev_row(2, 5, "t2", status="test_held", final_text="T"),
+                _rev_row(3, 5, "t3", status="rejected", final_text="X")]
+        self.assertEqual(o._revizor_build_package(5, rows)["sent"], ["R", "T"])
+
+    def test_tick_builds_packages_for_active_windows_only(self):
+        o._cowork = lambda line: None
+        since = "2026-07-13T10:00:00+00:00"
+        rows = [_rev_row(1, 111, "2026-07-13T09:00:00+00:00"),   # старое → не активно
+                _rev_row(2, 222, "2026-07-13T11:00:00+00:00", incoming="свежее")]
+        pkgs = o.revizor_tick(since=since, rows=rows)
+        self.assertEqual([p["client_id"] for p in pkgs], [222])
+
+    def test_tick_reads_real_sqlite(self):
+        import sqlite3
+        o._cowork = lambda line: None
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "moderation_ipc.db")
+            c = sqlite3.connect(db)
+            c.execute("CREATE TABLE drafts (id INTEGER PRIMARY KEY, client_id INTEGER, "
+                      "client_name TEXT, incoming TEXT, transcript TEXT, draft TEXT, "
+                      "final_text TEXT, status TEXT, updated_ts TEXT)")
+            c.execute("INSERT INTO drafts (client_id, incoming, status, updated_ts) "
+                      "VALUES (777, 'свежий вопрос', 'sent', '2026-07-13T12:00:00+00:00')")
+            c.execute("INSERT INTO drafts (client_id, incoming, status, updated_ts) "
+                      "VALUES (888, 'старое', 'sent', '2026-07-13T08:00:00+00:00')")
+            c.commit(); c.close()
+            pkgs = o.revizor_tick(since="2026-07-13T10:00:00+00:00", db_path=db)
+        self.assertEqual([p["client_id"] for p in pkgs], [777])
+
+    def test_db_rows_missing_file_is_empty(self):
+        self.assertEqual(o._revizor_db_rows(db_path=os.path.join(tempfile.gettempdir(), "no_db_zzz.db")), [])
+
+
+class TestRevizorState(unittest.TestCase):
+    """Метка прошлого прогона (restart-proof) + троттлинг/бутстрап maybe_revizor."""
+
+    def setUp(self):
+        self._save = (o._cowork, o._notify, o._revizor_on)
+        o._cowork = lambda line: None
+        o._notify = lambda text: None
+        o._revizor_on = lambda: True
+        self.tmp = tempfile.mkdtemp()
+        self.state = os.path.join(self.tmp, "revizor_state.json")
+
+    def tearDown(self):
+        (o._cowork, o._notify, o._revizor_on) = self._save
+
+    def test_read_missing_state_is_empty(self):
+        self.assertEqual(o._revizor_read_state(path=self.state), {})
+
+    def test_write_then_read_roundtrip(self):
+        o._revizor_write_state(1_000_000.0, path=self.state)
+        st = o._revizor_read_state(path=self.state)
+        self.assertEqual(st["ts"], 1_000_000.0)
+        self.assertTrue(o._parse_iso(st["last_run"]) is not None)   # last_run — валидная iso
+
+    def test_write_failure_is_silent(self):
+        bad = os.path.join(self.tmp, "no_such_dir_zzz", "s.json")
+        try:
+            o._revizor_write_state(1.0, path=bad)
+        except Exception as e:
+            self.fail(f"_revizor_write_state не должен пробрасывать сбой: {e}")
+
+    def test_flag_off_returns_none_and_writes_nothing(self):
+        o._revizor_on = lambda: False
+        self.assertIsNone(o.maybe_revizor(now=1_000_000.0, state_path=self.state))
+        self.assertFalse(os.path.exists(self.state))               # выключено → метку не ставим
+
+    def test_bootstrap_sets_mark_without_tick(self):
+        calls = {"n": 0}
+        save = o.revizor_tick
+        try:
+            o.revizor_tick = lambda **k: calls.__setitem__("n", calls["n"] + 1) or []
+            out = o.maybe_revizor(now=1_000_000.0, state_path=self.state)
+        finally:
+            o.revizor_tick = save
+        self.assertIsNone(out)                                     # бутстрап: тик НЕ зовём
+        self.assertEqual(calls["n"], 0)
+        self.assertEqual(o._revizor_read_state(path=self.state)["ts"], 1_000_000.0)  # но метку поставили
+
+    def test_throttle_skips_before_period(self):
+        o._revizor_write_state(1_000_000.0, path=self.state)
+        # прошло меньше REVIZOR_SEC → None, метку не двигаем
+        out = o.maybe_revizor(now=1_000_000.0 + o.REVIZOR_SEC - 10, state_path=self.state)
+        self.assertIsNone(out)
+        self.assertEqual(o._revizor_read_state(path=self.state)["ts"], 1_000_000.0)
+
+    def test_after_period_runs_tick_with_since_prev_mark(self):
+        o._revizor_write_state(1_000_000.0, path=self.state)
+        prev_iso = o._revizor_read_state(path=self.state)["last_run"]
+        seen = {}
+        save = o.revizor_tick
+        try:
+            o.revizor_tick = lambda since=None, **k: seen.__setitem__("since", since) or [{"client_id": 1}]
+            now2 = 1_000_000.0 + o.REVIZOR_SEC + 1
+            out = o.maybe_revizor(now=now2, state_path=self.state)
+        finally:
+            o.revizor_tick = save
+        self.assertEqual(seen["since"], prev_iso)                  # since = метка прошлого прогона
+        self.assertEqual(out, [{"client_id": 1}])
+        self.assertEqual(o._revizor_read_state(path=self.state)["ts"], now2)  # метка сдвинута вперёд
+
+    def test_mark_is_restart_proof(self):
+        # «рестарт» = ничего в памяти не помним, читаем метку с диска: свежая метка на диске
+        # гейтит повторный прогон даже сразу после старта (в отличие от in-memory троттла).
+        o._revizor_write_state(2_000_000.0, path=self.state)
+        self.assertIsNone(o.maybe_revizor(now=2_000_000.0 + 5, state_path=self.state))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

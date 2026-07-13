@@ -2519,6 +2519,169 @@ def _woke_from_sleep(now, prev, poll=None, margin=None):
     return prev is not None and (now - prev) > (poll + margin)
 
 
+# ------------------- РЕВИЗОР ДИАЛОГОВ (флаг DIALOG_REVIZOR) --------------------
+# Шаг 2/7 родителя 262. Демон раз в REVIZOR_HOURS (дефолт 6) отбирает клиентские окна, где была
+# активность С ПРОШЛОГО ПРОГОНА, и собирает по каждому ПАКЕТ для ревизии (следующие шаги 262 его
+# обработают — здесь ТОЛЬКО read-only отбор+сборка, ничего не пишем ни в БД, ни клиенту).
+# Источник правды по окнам — таблица `drafts` в moderation_ipc.db (recon §A, docs/revizor_recon.md):
+# одна строка на реплику окна; client_id = peer_id клиента = идентификатор окна; updated_ts —
+# метка активности строки; incoming/transcript — реплики клиента; final_text при status ∈
+# ready/sent/test_held — НАШ отправленный клиенту текст; draft — черновик (до модерации).
+# RESTART-PROOF: метка прошлого прогона лежит НА ДИСКЕ (REVIZOR_STATE_FILE), период мерим от неё —
+# рестарт демона НЕ запускает ревизора раньше срока и НЕ теряет «докуда дошли». Первый прогон без
+# метки — БУТСТРАП: ставим метку, backlog истории не разгребаем (следующий прогон возьмёт since=она).
+# DIALOG_REVIZOR=0/нет → ветка не зовётся вовсе (поведение демона байт-в-байт прежнее).
+REVIZOR_HOURS = float(os.getenv("REVIZOR_HOURS", "6") or "6")   # период ревизии окон (дефолт 6 ч)
+REVIZOR_SEC = REVIZOR_HOURS * 3600.0
+REVIZOR_DB = os.path.join(REPO, "moderation_ipc.db")            # боевая очередь окон (read-only отбор)
+REVIZOR_STATE_FILE = os.path.join(REPO, "pc_orchestrator.revizor_state.json")  # метка прошлого прогона
+
+
+def _revizor_on():
+    """Флаг DIALOG_REVIZOR=1 в .env (демон load_dotenv'ит на старте). 0/нет → ревизор выключен."""
+    return (os.environ.get("DIALOG_REVIZOR") or "").strip() == "1"
+
+
+def _parse_iso(s):
+    """ISO-строка (updated_ts/метка прогона) → aware datetime UTC | None (не распарсилось)."""
+    try:
+        t = datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)
+    except Exception:
+        return None
+
+
+def _revizor_newer(ts_iso, since_iso):
+    """updated_ts строки строго новее метки прошлого прогона? since_iso falsy → True (нет метки —
+    всё считаем новым). ts_iso не парсится → False (не можем доказать активность → не тянем окно
+    каждый прогон)."""
+    if not since_iso:
+        return True
+    a, b = _parse_iso(ts_iso), _parse_iso(since_iso)
+    return bool(a and b and a > b)
+
+
+def _revizor_read_state(path=None):
+    """Метка прошлого прогона ревизора (restart-proof). → dict {last_run: iso, ts: float} | {}
+    (файла нет / битый json — пустой dict → бутстрап)."""
+    path = REVIZOR_STATE_FILE if path is None else path
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _revizor_write_state(now, path=None):
+    """Метка ЭТОГО прогона на диск, атомарно (tmp+os.replace). ts (float wall-clock) — троттлинг
+    между прогонами переживает рестарт демона; last_run (iso) — since для отбора окон СЛЕДУЮЩЕГО
+    прогона. Сбой записи НЕ роняет тик — тихий warning (как _persist_client_watch)."""
+    path = REVIZOR_STATE_FILE if path is None else path
+    iso = datetime.datetime.fromtimestamp(float(now), datetime.timezone.utc).isoformat()
+    blob = {"last_run": iso, "ts": float(now)}
+    try:
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(blob, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        log.warning("ревизор: метка прогона не записана (%s): %s", path, e)
+
+
+def _revizor_db_rows(db_path=None):
+    """Read-only чтение строк drafts (одна строка = реплика окна). Тянем нужные колонки (recon §A).
+    → list[dict] (пусто при любой ошибке чтения/отсутствии БД — fail-safe, ревизор просто молчит)."""
+    path = db_path or REVIZOR_DB
+    import sqlite3
+    try:
+        c = sqlite3.connect(path, timeout=5.0)
+        c.row_factory = sqlite3.Row
+        try:
+            cur = c.execute("SELECT id, client_id, client_name, incoming, transcript, draft, "
+                            "final_text, status, updated_ts FROM drafts "
+                            "WHERE client_id IS NOT NULL ORDER BY client_id, id")
+            return [dict(r) for r in cur.fetchall()]
+        finally:
+            c.close()
+    except Exception as e:
+        log.warning("ревизор: чтение drafts (%s) не удалось: %s", path, e)
+        return []
+
+
+def _revizor_select_windows(rows, since_iso):
+    """Отбор окон с активностью ПОСЛЕ since_iso (метка прошлого прогона). Группируем строки drafts по
+    client_id (окно); окно активно, если ЛЮБАЯ его строка новее since_iso (_revizor_newer).
+    since_iso None → все окна (но maybe_revizor на бутстрапе сюда не заходит). → sorted list[client_id]."""
+    by = {}
+    for r in rows:
+        cid = r.get("client_id")
+        if cid is None:
+            continue
+        by.setdefault(cid, []).append(r)
+    return sorted(cid for cid, rs in by.items()
+                  if any(_revizor_newer(x.get("updated_ts"), since_iso) for x in rs))
+
+
+def _revizor_build_package(client_id, rows):
+    """Пакет по ОДНОМУ окну (client_id) из строк drafts этого окна (recon §A). Чистая (строки уже
+    прочитаны) → тестируется без БД. → dict:
+      incoming   — реплики клиента (колонка incoming, непустые, в порядке id);
+      transcript — самый свежий транскрипт окна ('[роль]: текст', колонка transcript);
+      sent       — НАШИ отправленные клиенту (final_text при status ∈ ready/sent/test_held);
+      drafts     — черновики до модерации (колонка draft, любой статус)."""
+    rs = sorted((r for r in rows if r.get("client_id") == client_id),
+                key=lambda r: int(r.get("id") or 0))
+    incoming = [r.get("incoming") for r in rs if (r.get("incoming") or "").strip()]
+    transcript = next((r.get("transcript") for r in reversed(rs)
+                       if (r.get("transcript") or "").strip()), None)
+    sent = [r.get("final_text") for r in rs
+            if r.get("status") in ("ready", "sent", "test_held") and (r.get("final_text") or "").strip()]
+    drafts = [r.get("draft") for r in rs if (r.get("draft") or "").strip()]
+    client_name = next((r.get("client_name") for r in reversed(rs) if r.get("client_name")), None)
+    last_ts = max((r.get("updated_ts") for r in rs if r.get("updated_ts")), default=None)
+    return {"client_id": client_id, "client_name": client_name,
+            "incoming": incoming, "transcript": transcript,
+            "sent": sent, "drafts": drafts, "last_ts": last_ts}
+
+
+def revizor_tick(since=None, now=None, db_path=None, rows=None):
+    """Один прогон ревизора: отобрать окна с активностью ПОСЛЕ since (метка прошлого прогона) и
+    собрать по каждому пакет (реплики клиента + наши отправленные + черновики; источник — drafts
+    moderation_ipc.db, recon §A). READ-ONLY: ничего не пишет ни в БД, ни клиенту — только строит
+    пакеты (следующие шаги 262 их обработают). rows — инъекция для тестов (без БД). → list пакетов."""
+    rows = _revizor_db_rows(db_path) if rows is None else rows
+    active = _revizor_select_windows(rows, since)
+    packages = [_revizor_build_package(cid, rows) for cid in active]
+    log.info("ревизор: since=%s → окон с активностью %d (всего строк drafts %d)",
+             since, len(packages), len(rows))
+    if packages:
+        _cowork(f"ревизор: {len(packages)} окон с активностью с прошлого прогона — пакеты собраны")
+    return packages
+
+
+def maybe_revizor(now=None, db_path=None, state_path=None):
+    """Троттлинг ревизора по МЕТКЕ НА ДИСКЕ (restart-proof: период мерим от last_run прошлого прогона,
+    а не от старта процесса). DIALOG_REVIZOR=0/нет → None сразу. Первый прогон без метки — БУТСТРАП:
+    ставим метку, backlog не разгребаем (следующий прогон возьмёт since=эта метка). → list пакетов |
+    None (выключено / период не прошёл / бутстрап)."""
+    if not _revizor_on():
+        return None
+    now = time.time() if now is None else now
+    st = _revizor_read_state(state_path)
+    prev_ts = st.get("ts")
+    if prev_ts is not None:
+        try:
+            if (now - float(prev_ts)) < REVIZOR_SEC:
+                return None                          # период ещё не прошёл (мерим по диску → restart-proof)
+        except Exception:
+            pass
+    since = st.get("last_run")                       # None на самом первом прогоне → бутстрап (не разгребаем)
+    result = revizor_tick(since=since, now=now, db_path=db_path) if since else None
+    _revizor_write_state(now, state_path)            # метку ставим ВСЕГДА (вкл. бутстрап) → следующий прогон ограничен
+    return result
+
+
 # ------------------- OS-синглтон демона (разбор #128, часть 4) ----------------
 # Инцидент: ДВА pc_orchestrator одновременно (оба стартовали в одну секунду от Планировщика
 # поверх уже живого) → оба поллят очередь и наперегонки claim'ят задачи (двойное исполнение).
@@ -2636,6 +2799,7 @@ def _main_loop():
             _loop_prev_wall = now
             poll_once()
             maybe_client_watchdog()   # часть 3: следим за pc_agent/userbot/moderation_bot (троттлинг 5 мин)
+            maybe_revizor()           # шаг 2/7 (262): ревизор диалогов за DIALOG_REVIZOR (троттлинг REVIZOR_HOURS)
             maybe_git_ff_pull()       # родитель #221: подтянуть origin/main ff-only ДО реконсиляции/self-update (тот же тик применит)
             maybe_reconcile_children()  # класс-фикс c6d8a30: применить свежий код детей на ЛЮБОЙ новый коммит
             if maybe_self_update():   # задача цикла обновила pc_orchestrator.py → эстафета новому
