@@ -639,13 +639,14 @@ class TestGreeting(unittest.TestCase):
 class _ReplyMsg:
     """Сообщение с полями, которые смотрит reply-логика (id/reply_to_msg_id/photo/media)."""
     def __init__(self, mid, sender_id, message="", reply_to=None, photo=False,
-                 media=False, date=None):
+                 media=False, geo=False, date=None):
         self.id = mid
         self.sender_id = sender_id
         self.message = message
         self.reply_to_msg_id = reply_to
         self.photo = object() if photo else None
         self.media = object() if media else None
+        self.geo = object() if geo else None
         self.date = date
 
 
@@ -842,6 +843,96 @@ class TestCollectedTracker(unittest.TestCase):
     def test_phone_not_confused_with_dates(self):
         # «с 7 по 14» — это даты, НЕ телефон (короткие цифры)
         self.assertFalse(suggest.collected_facts("[клиент]: с 7 по 14 июля")["phone"])
+
+
+class TestCollectedAttachmentOnly(unittest.TestCase):
+    """Шаг 3/7 #253: сущность (гео/паспорт/тел/оплата) ✅ ТОЛЬКО по ФАКТУ вложения/данных в
+    сообщении клиента; слово-упоминание — ВСЕГДА ❌. Голдены на каждую сущность (слово → ❌,
+    вложение/номер/ссылка/скрин → ✅) + дословный диалог Ярославы 13.07 (паспорт/предоплата
+    словами, вопрос про крипту, но НЕ фото и НЕ оплата) → паспорт ❌, оплата ❌."""
+
+    MAPS = "https://maps.app.goo.gl/abc123XYZ"
+    ME = 42
+
+    # ---------- ГЕО: слово ❌, ссылка/координаты/пин ✅ ----------
+    def test_geo_word_only_is_false(self):
+        for phr in ("Живу на вилле в Патонге", "Апартаменты Karon Hill",
+                    "Скину локацию позже", "My condo is near the beach", "отель Hilton"):
+            self.assertFalse(suggest.collected_facts(f"[клиент]: {phr}")["geo"],
+                             f"слово-упоминание жилья ложно = гео ✅: {phr}")
+
+    def test_geo_link_or_coords_is_true(self):
+        for phr in (f"Вот адрес {self.MAPS}", "geo: 7.89, 98.29",
+                    "https://goo.gl/maps/xyz", "@7.8901,98.2999 моя вилла"):
+            self.assertTrue(suggest.collected_facts(f"[клиент]: {phr}")["geo"],
+                            f"реальная ссылка/координаты не = гео ✅: {phr}")
+
+    def test_geo_location_pin_attachment_is_true(self):
+        # прямой location-пин от клиента (медиа без текста) → «[локация]» → гео ✅
+        tr = suggest.transcript_from([_ReplyMsg(50, 999, geo=True)], self.ME)
+        self.assertTrue(suggest.collected_facts(tr)["geo"], f"пин-локация не собрана:\n{tr}")
+
+    # ---------- ПАСПОРТ: слово ❌, фото ✅ ----------
+    def test_passport_word_only_is_false(self):
+        for phr in ("Паспорт с собой привезу", "Нужен ли паспорт для аренды?",
+                    "Do you need my passport?", "У меня есть id card"):
+            self.assertFalse(suggest.collected_facts(f"[клиент]: {phr}")["passport"],
+                             f"слово «паспорт» ложно = паспорт ✅: {phr}")
+
+    def test_passport_direct_photo_is_true(self):
+        # прямое фото от клиента (медиа без подписи) → «[фото]» → паспорт ✅
+        tr = suggest.transcript_from([_ReplyMsg(51, 999, photo=True)], self.ME)
+        self.assertTrue(suggest.collected_facts(tr)["passport"], f"прямое фото не = паспорт ✅:\n{tr}")
+
+    def test_passport_reply_photo_is_true(self):
+        # reply на фото из старой переписки → маркер «вероятно паспорт» → паспорт ✅
+        store = {60: _ReplyMsg(60, 999, photo=True)}
+        window = [_ReplyMsg(61, 999, message="Вот", reply_to=60)]
+        asyncio.run(suggest._resolve_replies(_ReplyClient(store), None, window))
+        tr = suggest.transcript_from(window, self.ME)
+        self.assertTrue(suggest.collected_facts(tr)["passport"], f"reply-фото не = паспорт ✅:\n{tr}")
+
+    # ---------- ТЕЛЕФОН: слово ❌, номер ✅ ----------
+    def test_phone_word_only_is_false(self):
+        for phr in ("Дам телефон позже", "Мой номер скину в вотсап",
+                    "Call me on whatsapp", "телефон нужен?"):
+            self.assertFalse(suggest.collected_facts(f"[клиент]: {phr}")["phone"],
+                             f"слово «телефон/номер» без цифр ложно = тел ✅: {phr}")
+
+    def test_phone_number_is_true(self):
+        for phr in ("Мой номер +66 81 234 5678", "Телефон 89261234567", "whatsapp +79161112233"):
+            self.assertTrue(suggest.collected_facts(f"[клиент]: {phr}")["phone"],
+                            f"реальный номер не = тел ✅: {phr}")
+
+    # ---------- ОПЛАТА: слово/вопрос ❌, подтверждённая/чек ✅ ----------
+    def test_payment_word_or_question_is_false(self):
+        # «криптой можно?» и назначение предоплаты — НЕ оплата (задача 3/7)
+        for phr in ("Криптой можно?", "Можно оплатить криптой?", "Какая предоплата?",
+                    "Нужна ли предоплата?", "Предоплата нужна чтобы зафиксировать байк?",
+                    "А депозит это сколько?", "Как проходит оплата?",
+                    "банковский перевод принимаете?"):
+            self.assertFalse(suggest.collected_facts(f"[клиент]: {phr}")["payment"],
+                             f"вопрос/назначение/слово ложно = оплата ✅: {phr}")
+
+    def test_payment_confirmed_is_true(self):
+        for phr in ("Я уже оплатил депозит", "Перевёл предоплату, вот чек",
+                    "Оплату отправил, скрин перевода прикладываю", "Внёс предоплату",
+                    "Already paid the deposit", "Payment sent"):
+            self.assertTrue(suggest.collected_facts(f"[клиент]: {phr}")["payment"],
+                            f"подтверждённая оплата не = оплата ✅: {phr}")
+
+    # ---------- ДИАЛОГ ЯРОСЛАВЫ 13.07 → паспорт ❌, оплата ❌ ----------
+    def test_yaroslava_1307_passport_and_payment_false(self):
+        tr = (
+            "[клиент]: Здравствуйте! Хочу арендовать NMAX с 15 июля на 10 дней\n"
+            "[менеджер]: Здравствуйте! Депозит — деньги либо паспорт\n"
+            "[клиент]: А паспорт обязательно оставлять? Можно копию?\n"
+            "[клиент]: И какая предоплата нужна, чтобы забронировать?\n"
+            "[клиент]: Криптой можно оплатить предоплату?"
+        )
+        facts = suggest.collected_facts(tr)
+        self.assertFalse(facts["passport"], f"Ярослава: паспорт словом ложно ✅:\n{tr}")
+        self.assertFalse(facts["payment"], f"Ярослава: предоплата/крипта-вопрос ложно ✅:\n{tr}")
 
 
 class _ModBase(unittest.TestCase):
