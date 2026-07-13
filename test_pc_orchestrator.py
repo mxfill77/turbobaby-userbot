@@ -1185,14 +1185,15 @@ class TestClientWatchdog(unittest.TestCase):
     подъём + NOTE; анти-флап (кулдаун); 3 смерти подряд → стоп + громкий NOTE; skip; рубильник."""
 
     def setUp(self):
-        self._save = (o._cowork, o._notify, o._stopped)
-        self.notes, self.pushes = [], []
+        self._save = (o._cowork, o._notify, o._notify_critical, o._stopped)
+        self.notes, self.pushes, self.crit = [], [], []
         o._cowork = lambda line: self.notes.append(line)
         o._notify = lambda text: self.pushes.append(text)
+        o._notify_critical = lambda text: self.crit.append(text)   # критические инциденты → инбокс 1160
         o._stopped = lambda: False
 
     def tearDown(self):
-        (o._cowork, o._notify, o._stopped) = self._save
+        (o._cowork, o._notify, o._notify_critical, o._stopped) = self._save
 
     def _spec(self, name, alive_seq, raiser_ok=True, skip=False):
         """Спека процесса: alive_seq — очередь ответов finder (True/False по тикам).
@@ -1249,7 +1250,8 @@ class TestClientWatchdog(unittest.TestCase):
         self.assertEqual(out["moderation_bot"], "halt_now")
         self.assertEqual(len(sp["_raises"]), 2)        # подняли дважды, на 3-й — стоп
         self.assertTrue(st["moderation_bot"]["halted"])
-        self.assertTrue(any("нужен разбор" in p for p in self.pushes))   # громкий пуш
+        self.assertTrue(any("нужен разбор" in p for p in self.crit))     # критич. пуш → инбокс 1160 (НЕ личка)
+        self.assertEqual(self.pushes, [])                                 # 3-смерти-halt в личку НЕ дублируем
         # после halt дальше молчим
         out2 = o.client_watchdog_tick(now=4, specs=[sp], state=st, cooldown=0, max_deaths=3)
         self.assertEqual(out2["moderation_bot"], "halted")
@@ -1349,15 +1351,16 @@ class TestWatchdogClassFix(unittest.TestCase):
     NOW = 2_000_000_000   # большой wall-clock: os.utime мтаймов лога считается относительно него
 
     def setUp(self):
-        self._save = (o._cowork, o._notify, o._stopped)
-        self.notes, self.pushes = [], []
+        self._save = (o._cowork, o._notify, o._notify_critical, o._stopped)
+        self.notes, self.pushes, self.crit = [], [], []
         o._cowork = lambda line: self.notes.append(line)
         o._notify = lambda text: self.pushes.append(text)
+        o._notify_critical = lambda text: self.crit.append(text)   # критические инциденты → инбокс 1160
         o._stopped = lambda: False
         self.tmp = tempfile.mkdtemp()
 
     def tearDown(self):
-        (o._cowork, o._notify, o._stopped) = self._save
+        (o._cowork, o._notify, o._notify_critical, o._stopped) = self._save
 
     def _spec(self, name, finder, logfile=None, skip=False):
         raises = []
@@ -1429,7 +1432,8 @@ class TestWatchdogClassFix(unittest.TestCase):
                                    cooldown=0, max_deaths=3, grace_until=0, log_stale=120, blind_alarm=3)
         self.assertEqual(sp["_raises"], [])                       # ни одного рестарта
         self.assertTrue(any("слеп" in n for n in self.notes))     # NOTE-алярм
-        self.assertTrue(any("слеп" in p for p in self.pushes))
+        self.assertTrue(any("слеп" in p for p in self.crit))      # критич. пуш слепоты → инбокс 1160 (НЕ личка)
+        self.assertEqual(self.pushes, [])                         # halt-слепота в личку НЕ дублируется
         self.assertFalse(any("поднял" in n for n in self.notes))  # никого не поднимали
 
     def test_c_success_resets_blind_counter(self):
@@ -3976,6 +3980,56 @@ class TestRevizorDefaultOff(unittest.TestCase):
             out = o.maybe_revizor(now=_REV_NOW, db_path=os.path.join(tmp, "no.db"), state_path=state)
         self.assertIsNone(out)
         self.assertFalse(os.path.exists(state))                # метку НЕ ставим → демон байт-в-байт прежний
+
+
+class TestNotifyHygiene(unittest.TestCase):
+    """Гигиена уведомлений пульта (задача #: гигиена pc_agent):
+      • done/failed задач в личку НЕ дублируются (видны в темах постановки 328/829);
+      • needs_approval — call-to-action, пуш в личку остаётся;
+      • критические инциденты идут через _notify_critical (маршрут инбокс 1160 → личка-фолбэк)."""
+
+    def setUp(self):
+        self._save = (o._notify, o._notify_critical)
+        self.dm, self.crit = [], []
+        o._notify = lambda text: self.dm.append(text)
+        o._notify_critical = lambda text: self.crit.append(text)
+
+    def tearDown(self):
+        (o._notify, o._notify_critical) = self._save
+
+    def test_done_not_pushed_to_dm(self):
+        o._notify_task("done", 42, "готово")
+        self.assertEqual(self.dm, [])                 # done-дубль в личку НЕ шлётся
+
+    def test_failed_not_pushed_to_dm(self):
+        o._notify_task("failed", 42, "провал")
+        self.assertEqual(self.dm, [])                 # failed-дубль в личку НЕ шлётся
+
+    def test_needs_approval_still_pushed(self):
+        o._notify_task("needs_approval", 42, "нужно да")
+        self.assertEqual(len(self.dm), 1)             # call-to-action — оставляем пуш
+        self.assertIn("#42", self.dm[0])
+
+    def test_notify_critical_spawns_dispatch_with_flag(self):
+        """_notify_critical зовёт dispatch_notify с флагом --critical (маршрут форум→личка)."""
+        # снимаем моки setUp: тестируем НАСТОЯЩИЙ _notify_critical
+        (o._notify, o._notify_critical) = self._save
+        captured = {}
+        real_popen = o.subprocess.Popen
+
+        def fake_popen(argv, *a, **k):
+            captured["argv"] = argv
+            class _P:  # заглушка процесса
+                pass
+            return _P()
+        o.subprocess.Popen = fake_popen
+        try:
+            o._notify_critical("тест-инцидент")
+        finally:
+            o.subprocess.Popen = real_popen
+        self.assertIn("--critical", captured["argv"])
+        self.assertIn("тест-инцидент", captured["argv"])
+        self.assertIn(o.DNOTIFY, captured["argv"])
 
 
 if __name__ == "__main__":

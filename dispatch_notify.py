@@ -77,6 +77,11 @@ except Exception as e:
     HQ_CHAT_ID = int(os.getenv("HQ_CHAT_ID", "-1003853365891"))
     HQ_THREAD_ID = int(os.getenv("HQ_THREAD_ID", "205"))
 
+# Тема Инбокс HQ-форума: критические инциденты контура (доказанная смерть демона / 3-смерти-halt
+# клиент-бота / halt-слепота вотчдога) сыплются СЮДА, а не в личку. Личка Филиппа — ФОЛБЭК, если
+# форум недоступен (бота выкинуло из темы / форум лёг). Тот же чат HQ_CHAT_ID, другая тема.
+INBOX_THREAD_ID = int(os.getenv("HQ_INBOX_THREAD_ID", "1160"))
+
 
 def _api(method, payload):
     """POST в Bot API. Возвращает (ok, body). Токен/URL НЕ логируем."""
@@ -119,6 +124,30 @@ def send(text):
     return ("205", False)
 
 
+def send_critical(text):
+    """Критический инцидент контура → тема Инбокс HQ-форума (1160) ПЕРВЫМ каналом; личка Филиппа —
+    ФОЛБЭК при недоступности форума (бота выкинуло из темы / форум лёг / 403). Возвращает
+    (channel, ok). Зеркало send(), но маршрут перевёрнут: форум → личка (а не личка → тема)."""
+    if not TOKEN:
+        _log.info("нет AGENT_BOT_TOKEN — критическое уведомление пропущено")
+        return ("none", False)
+    ok, resp = _api("sendMessage",
+                    {"chat_id": HQ_CHAT_ID, "message_thread_id": INBOX_THREAD_ID, "text": text})
+    if ok:
+        _log.info(f"критич. в инбокс ok → {HQ_CHAT_ID}/{INBOX_THREAD_ID}")
+        return ("inbox", True)
+    _log.info(
+        f"инбокс {INBOX_THREAD_ID} не прошёл (code={resp.get('error_code')} "
+        f"{str(resp.get('description',''))[:80]}) — фолбэк в личку {DM_CHAT_ID}"
+    )
+    ok2, resp2 = _api("sendMessage", {"chat_id": DM_CHAT_ID, "text": text})
+    if ok2:
+        _log.info(f"фолбэк личка ok → {DM_CHAT_ID}")
+        return ("DM", True)
+    _log.info(f"фолбэк личка не прошёл (code={resp2.get('error_code')} {str(resp2.get('description',''))[:80]})")
+    return ("DM", False)
+
+
 def _read_stdin_json():
     try:
         raw = sys.stdin.read()
@@ -139,6 +168,12 @@ def _build(kind, hook):
 def main():
     args = list(sys.argv[1:])
     try:
+        if args and args[0] == "--critical":
+            # критический инцидент контура → инбокс 1160, личка — фолбэк (send_critical)
+            text = " ".join(args[1:]).strip() or "🔔 Оркестратор: критический инцидент"
+            channel, ok = send_critical(text)
+            _log.info(f"итог(критич): channel={channel} ok={ok} | {text[:90]}")
+            sys.exit(0)
         if args and args[0] == "--hook":
             kind = args[1] if len(args) > 1 else ""
             text = _build(kind, _read_stdin_json()) or f"🔔 Dispatch: {kind or 'событие'}"

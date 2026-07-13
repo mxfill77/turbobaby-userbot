@@ -66,6 +66,7 @@ APPROVAL_TTL = int(os.getenv("PC_APPROVAL_TTL", "1800") or "1800")     # 30 ми
 # дублируем: он про VPS/цепочки, а тут ТОЛЬКО одиночки lane=pc, которых он не видит.
 PC_SINGLE_STALE = int(os.getenv("PC_SINGLE_STALE", "5400") or "5400")  # 90 мин: орфан-одиночка in_progress → failed
 NEEDS_APPROVAL_TOPIC = int(os.getenv("PC_NA_TOPIC", "829") or "829")   # тема, куда Splinter постит карточку
+INBOX_TOPIC_ID = int(os.getenv("PC_INBOX_TOPIC", "1160") or "1160")    # тема Инбокс HQ-форума: критические инциденты контура (личка — фолбэк)
 HEARTBEAT_STALE = int(os.getenv("PC_HB_STALE", "180") or "180")        # watchdog: heartbeat протух
 WATCH_VERIFY_SLEEP = int(os.getenv("PC_WATCH_VERIFY", "20") or "20")
 # Контур-вотчдог клиентского контура (разбор #128, часть 3): демон — единственный надёжно
@@ -215,6 +216,30 @@ def _notify(text):
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
     except Exception as e:
         log.warning("пуш не отправлен: %s", e)
+
+
+def _notify_critical(text):
+    """Критический инцидент КОНТУРА (доказанная смерть демона / 3-смерти-halt клиент-бота /
+    halt-слепота контур-вотчдога) → тема Инбокс HQ-форума (INBOX_TOPIC_ID=1160); личка Филиппа —
+    ФОЛБЭК при недоступности форума. Маршрут «форум → личка» реализует dispatch_notify --critical.
+    Fire-and-forget: сбой доставки НЕ роняет тик демона. Гигиена пульта: сюда идут ТОЛЬКО реальные
+    инциденты (не рутинные done/failed задач — те видны в темах постановки 328/829, см. _notify_task)."""
+    try:
+        subprocess.Popen([VENV_PY, DNOTIFY, "--critical", text], cwd=REPO,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    except Exception as e:
+        log.warning("критический пуш не отправлен: %s", e)
+
+
+def _notify_task(kind, tid, text):
+    """Уведомление о жизненном цикле ЗАДАЧИ (done/failed/needs_approval). Гигиена пульта:
+    done/failed уже видны в темах постановки (328/задачи, 829/красное) — в личку их НЕ
+    дублируем (личка тонула в дублях карточек). needs_approval оставляем пушем: это
+    call-to-action, требующий реакции Филиппа. Итог в cowork_log и карточку темы пишет
+    вызывающий (bc.complete_task/_cowork) — эта функция ТОЛЬКО про личку-пуш."""
+    if kind in ("done", "failed"):
+        return                       # тема постановки уже показала карточку — личку не дублируем
+    _notify(_human(kind, tid, text))
 
 
 def _stopped():
@@ -594,7 +619,7 @@ def process_new():
         bc.complete_task(tid, status, result)
         log.info("COMMAND id=%s cmd=%s → %s", tid, cmd, status)
         _cowork(f"задача #{tid} (рычаг {cmd}) → {status} · {_clip(result)}")
-        _notify(_human(status, tid, result))
+        _notify_task(status, tid, result)
         return
     # Локальный дирижёр (PC_LOCAL_DEC=1): осиротевшая synthetic (сводка/карточка — демон упал
     # между enqueue и complete) → довести done, НЕ исполняя; родитель Filipp-pcloc-dec → строим
@@ -614,7 +639,7 @@ def process_new():
         bc.set_needs_approval(tid, result)
         log.info("NEEDS_APPROVAL id=%s", tid)
         _cowork(f"задача #{tid} → needs_approval (красное, жду «да»)")
-        _notify(_human("needs_approval", tid, result))
+        _notify_task("needs_approval", tid, result)
     else:
         # САМОПОЧИНКА (STEP_SELFHEAL=1): провал ОДИНОЧНОЙ задачи lane=pc → думатель, РОВНО 1 попытка.
         # True = финализировано внутри (перерождение / терминальный failed с диагнозом); False =
@@ -628,7 +653,7 @@ def process_new():
         log.info("COMPLETE id=%s status=%s", tid, status)
         # полный текст RESULT (done) / причины failed → штаб читает итог из cowork_log без скринов
         _cowork(f"задача #{tid} → {status} · {_clip(result)}")
-        _notify(_human(status, tid, result))
+        _notify_task(status, tid, result)
 
 
 def process_approved():
@@ -654,7 +679,7 @@ def process_approved():
             msg = f"{TIMEOUT_MARK} approve истёк (>30 мин) — повтори задачу"
             bc.complete_task(tid, "failed", msg)
             _cowork(f"задача #{tid} (approved) → failed · {_clip(msg)}")
-            _notify(_human("failed", tid, "approve истёк"))
+            _notify_task("failed", tid, "approve истёк")
             continue
         status, result = run_task(tid, str(task.get("task_text") or ""),
                                   note="[ОДОБРЕНО ЧЕЛОВЕКОМ] предыдущий шаг подтверждён. ")
@@ -666,11 +691,11 @@ def process_approved():
                    + result[:400])
             bc.complete_task(tid, "failed", msg)
             _cowork(f"задача #{tid} (approved) → failed · {_clip(msg)}")
-            _notify(_human("failed", tid, "снова красное после approve — вручную"))
+            _notify_task("failed", tid, "снова красное после approve — вручную")
         else:
             bc.complete_task(tid, status, result)
             _cowork(f"задача #{tid} (approved) → {status} · {_clip(result)}")
-            _notify(_human(status, tid, result))
+            _notify_task(status, tid, result)
         log.info("APPROVED id=%s → %s", tid, status)
 
 
@@ -689,7 +714,7 @@ def process_approval_timeouts():
             msg = (f"{TIMEOUT_MARK} подтверждение не получено за 30 мин — задача провалена")
             bc.complete_task(tid, "failed", msg)
             _cowork(f"задача #{tid} → failed · {_clip(msg)}")
-            _notify(_human("failed", tid, "подтверждение не получено за 30 мин"))
+            _notify_task("failed", tid, "подтверждение не получено за 30 мин")
 
 
 # ---------------- ПРЯМОЙ КАНАЛ ПК↔Bridge для ОДИНОЧЕК pc (развязка 328-pc, этап 1) --------------
@@ -745,7 +770,7 @@ def process_stuck_singles(now=None):
         log.warning("stuck-single: id=%s in_progress %sс > %sс → failed (ПК-ливнесс одиночки)",
                     tid, int(age), PC_SINGLE_STALE)
         _cowork(f"задача #{tid} (одиночка) → failed по ПК-таймауту ({int(age)}с) · {_clip(msg)}")
-        _notify(_human("failed", tid, "ПК-таймаут одиночки (застряла in_progress)"))
+        _notify_task("failed", tid, "ПК-таймаут одиночки (застряла in_progress)")
 
 
 def poll_once():
@@ -1082,7 +1107,7 @@ def _maybe_task_selfheal(tid, text, fail_text, frm):
         bc.complete_task(tid, "failed", msg)
         log.info("task-selfheal: id=%s (перерождение задачи %s) упал ПОВТОРНО → терминальный failed", tid, oid)
         _cowork(f"задача #{tid} (перерождение {oid}) → failed повторно · {_clip(msg)}")
-        _notify(_human("failed", tid, "самопочинка не помогла — нужен человек"))
+        _notify_task("failed", tid, "самопочинка не помогла — нужен человек")
         return True
     verdict = _task_selfheal_consult(text, fail_text)
     if verdict is None:
@@ -1096,7 +1121,7 @@ def _maybe_task_selfheal(tid, text, fail_text, frm):
         bc.complete_task(tid, "failed", msg)
         log.info("task-selfheal: id=%s → думатель halt (%s)", tid, reason[:120])
         _cowork(f"задача #{tid} → failed (думатель: halt) · {_clip(reason)}")
-        _notify(_human("failed", tid, "думатель: halt — нужен человек"))
+        _notify_task("failed", tid, "думатель: halt — нужен человек")
         return True
     reborn = f"[самопочинка задачи {tid}, попытка 1] {fixed}"[:RESULT_MAX]
     r = bc.enqueue_task(frm or "Filipp", reborn)
@@ -1111,7 +1136,7 @@ def _maybe_task_selfheal(tid, text, fail_text, frm):
     bc.complete_task(tid, "done", card)           # карточка решения → cowork_log/пуш (тема 829-красное нетронуто)
     log.info("task-selfheal: id=%s перерождён задачей %s (retry)", tid, nid)
     _cowork(f"задача #{tid} → самопочинка retry, перерождена #{nid} · {_clip(card)}")
-    _notify(_human("done", tid, f"самопочинка: перерождена задачей #{nid}"))
+    _notify_task("done", tid, f"самопочинка: перерождена задачей #{nid}")
     return True
 
 
@@ -1307,7 +1332,7 @@ def _local_dec_plan(tid, text):
         bc.complete_task(tid, "failed", msg)
         log.warning("pcloc-dec: id=%s планировщик не отработал → failed", tid)
         _cowork(f"родитель #{tid} (pcloc-dec) → failed · {_clip(msg)}")
-        _notify(_human("failed", tid, "планировщик декомпозиции не отработал"))
+        _notify_task("failed", tid, "планировщик декомпозиции не отработал")
         return
     steps = _plan_steps(out)
     if not steps:
@@ -1320,7 +1345,7 @@ def _local_dec_plan(tid, text):
         bc.complete_task(tid, "failed", msg)
         log.warning("pcloc-dec: id=%s пустой план → failed (%s)", tid, _clip(msg, 160))
         _cowork(f"родитель #{tid} (pcloc-dec) → failed · {_clip(msg)}")
-        _notify(_human("failed", tid, msg))
+        _notify_task("failed", tid, msg)
         return
     if len(steps) > MAX_STEPS:
         msg = (f"план из {len(steps)} шагов превышает потолок {MAX_STEPS} — "
@@ -1328,7 +1353,7 @@ def _local_dec_plan(tid, text):
         bc.complete_task(tid, "failed", msg)
         log.warning("pcloc-dec: id=%s план %s шагов > %s → failed", tid, len(steps), MAX_STEPS)
         _cowork(f"родитель #{tid} (pcloc-dec) → failed · {_clip(msg)}")
-        _notify(_human("failed", tid, msg))
+        _notify_task("failed", tid, msg)
         return
     plan_txt = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
     # РЕЛИЗ ШАГА 1 — ДО закрытия родителя (crash-окно спеки: шаг не встал → родитель остаётся
@@ -1345,7 +1370,7 @@ def _local_dec_plan(tid, text):
     bc.complete_task(tid, "done", result)
     log.info("pcloc-dec: id=%s план из %s шагов построен (done), шаг 1 релизнут", tid, len(steps))
     _cowork(f"родитель #{tid} (pcloc-dec) → done: план {len(steps)} шагов, шаг 1 в очереди · {_clip(result)}")
-    _notify(_human("done", tid, f"декомпозиция: план из {len(steps)} шагов, шаг 1 в очереди"))
+    _notify_task("done", tid, f"декомпозиция: план из {len(steps)} шагов, шаг 1 в очереди")
 
 
 # ---- sequential-релиз и надзор локальной цепи (шаг 3/7 родителя 185) ----
@@ -2495,7 +2520,8 @@ def client_watchdog_tick(now=None, specs=None, state=None, cooldown=None, max_de
         elif action == "halt_now":
             log.error("контур-вотчдог: %s умер %s раз подряд — СТОП попыток, нужен разбор", name, st["deaths"])
             _cowork(f"вотчдог: {name} умер {st['deaths']} раза подряд — СТОП, нужен разбор")
-            _notify(f"⚠️ Оркестратор: {name} умер {max_deaths} раза подряд — контур-вотчдог остановлен, нужен разбор")
+            # КРИТИЧЕСКИЙ инцидент (3-смерти-halt клиент-бота) → Инбокс 1160 (личка — фолбэк)
+            _notify_critical(f"⚠️ Оркестратор: {name} умер {max_deaths} раза подряд — контур-вотчдог остановлен, нужен разбор")
     # (1) Слепой-счётчик: цикл СЛЕП, если процессы проверяли, но НИ ОДИН finder не смог ответить.
     # blind_alarm подряд слепых → NOTE «вотчдог слеп — глянь ПК» (алярм, НЕ рестарты). Любой успешный
     # finder обнуляет счётчик. (На спящем/тормозящем ПК все CIM-запросы таймаутят вместе.)
@@ -2506,7 +2532,8 @@ def client_watchdog_tick(now=None, specs=None, state=None, cooldown=None, max_de
         if blind >= blind_alarm:
             log.error("контур-вотчдог: %s циклов подряд СЛЕП (CIM не отвечает) — нужен глаз на ПК", blind)
             _cowork(f"вотчдог слеп {blind} цикла подряд (CIM не отвечает) — глянь ПК (спит/тормозит?)")
-            _notify(f"⚠️ Оркестратор: контур-вотчдог слеп {blind} цикла подряд — CIM не отвечает, глянь ПК")
+            # КРИТИЧЕСКИЙ инцидент (halt-слепота вотчдога) → Инбокс 1160 (личка — фолбэк)
+            _notify_critical(f"⚠️ Оркестратор: контур-вотчдог слеп {blind} цикла подряд — CIM не отвечает, глянь ПК")
             state["__blind__"] = 0   # сброс после алярма (не спамим каждый тик; ре-алярм ещё через blind_alarm)
     elif any_success:
         state["__blind__"] = 0
@@ -3379,8 +3406,10 @@ def watchdog(now=None, runner=None, verify_sleep=None, finder=None, state_path=N
               "Нужно вмешательство.", rc)
     st = _wd_state_read(state_path)
     if st.get("state") != "down" and (tnow - float(st.get("last_alert") or 0.0)) >= WD_ALERT_COOLDOWN:
-        (notify or _notify)("⚠️ Оркестратор: watchdog не смог поднять демон через schtasks — "
-                            "проверь pc_orchestrator.log")
+        # КРИТИЧЕСКИЙ инцидент (доказанная смерть демона: heartbeat протух + процессов нет +
+        # schtasks /Run не поднял) → Инбокс 1160 (личка — фолбэк). notify инъектируется в тестах.
+        (notify or _notify_critical)("⚠️ Оркестратор: watchdog не смог поднять демон через schtasks — "
+                                     "проверь pc_orchestrator.log")
         (cowork or _cowork)("watchdog: демон мёртв, schtasks /Run не поднял — нужен разбор")
         _wd_state_write({"state": "down", "last_alert": tnow}, state_path)
     else:   # инцидент уже заявлен (или флап внутри кулдауна) — тишина, фиксируем только state
