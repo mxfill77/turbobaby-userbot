@@ -849,6 +849,62 @@ class TestCollectedTracker(unittest.TestCase):
         self.assertFalse(suggest.collected_facts("[клиент]: с 7 по 14 июля")["phone"])
 
 
+class TestDetectFirstMessageBooking(unittest.TestCase):
+    """Родитель #271 шаг 2/5: детект котируемой брони на ПЕРВОМ сообщении — модель+старт+срок.
+    Голдены из живого кейса 13.07 (класс «ж»: клиент дал всё сразу, надо котировать, а не анкету)
+    + парафразы RU/EN (правило-класс CLAUDE.md: реальная фраза, не идеал) + негативы (нет одного
+    из трёх полей → None). today фиксирован для детерминизма дат."""
+
+    TODAY = datetime.date(2026, 7, 13)
+
+    def _d(self, text):
+        return suggest.detect_first_message_booking(text, today=self.TODAY)
+
+    def test_live_case_xsr155(self):
+        # дословно из живого провала 13.07: «xsr 155» + «с 15 июля» + «на 2 недели».
+        r = self._d("Здравствуйте! Хочу xsr 155 с 15 июля на 2 недели")
+        self.assertIsNotNone(r)
+        self.assertEqual(r["model"], "XSR 155")
+        self.assertEqual(r["startDate"], "2026-07-15")
+        self.assertEqual(r["days"], 14)
+
+    def test_model_case_and_space_insensitive(self):
+        # «XSR155», «xsr  155», «Xsr 155» — все → 'XSR 155'.
+        for m in ("XSR155", "xsr  155", "Xsr 155", "хочу XSR-155"):
+            r = self._d(f"{m} с 15 июля на 2 недели")
+            self.assertIsNotNone(r, f"модель не поймана: {m}")
+            self.assertEqual(r["model"], "XSR 155", f"регистр/пробел сломали матч: {m}")
+
+    def test_term_units_days_weeks_months(self):
+        # срок в днях/неделях/месяцах → дни (единицы, что поддержаны _parse_term).
+        cases = {"на 10 дней": 10, "на 3 недели": 21, "на неделю": 7, "на месяц": 30}
+        for phr, days in cases.items():
+            r = self._d(f"nmax 155 с 20 июля {phr}")
+            self.assertIsNotNone(r, f"не собралось: {phr}")
+            self.assertEqual(r["days"], days, f"срок неверен: {phr}")
+
+    def test_start_variants(self):
+        # разные формы старта: «с 15 июля», «с 15.07», «завтра», голое «с 20».
+        for phr, iso in (("с 15 июля", "2026-07-15"), ("с 15.07", "2026-07-15"),
+                         ("завтра", "2026-07-14"), ("с 20", "2026-07-20")):
+            r = self._d(f"forza 300 {phr} на неделю")
+            self.assertIsNotNone(r, f"старт не пойман: {phr}")
+            self.assertEqual(r["startDate"], iso, f"дата старта неверна: {phr}")
+
+    def test_none_when_no_model(self):
+        # нет модели каталога (или голая серия «xsr» без объёма) → None.
+        self.assertIsNone(self._d("Здравствуйте! с 15 июля на 2 недели"))
+        self.assertIsNone(self._d("хочу xsr с 15 июля на 2 недели"))
+
+    def test_none_when_no_start(self):
+        # есть модель+срок, но нет даты старта → None (одна длительность не котируется).
+        self.assertIsNone(self._d("xsr 155 на 2 недели"))
+
+    def test_none_when_no_term(self):
+        # есть модель+старт, но нет срока → None.
+        self.assertIsNone(self._d("xsr 155 с 15 июля"))
+
+
 class TestCollectedAttachmentOnly(unittest.TestCase):
     """Шаг 3/7 #253: сущность (гео/паспорт/тел/оплата) ✅ ТОЛЬКО по ФАКТУ вложения/данных в
     сообщении клиента; слово-упоминание — ВСЕГДА ❌. Голдены на каждую сущность (слово → ❌,

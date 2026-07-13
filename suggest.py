@@ -700,6 +700,40 @@ def greeting_already_sent(transcript: str) -> bool:
     return False
 
 
+# --- детект «котируемой» брони на ПЕРВОМ же сообщении (родитель #271, класс «ж») ---------------
+# Клиент ПЕРВОЙ репликой даёт модель + старт + срок ⇒ надо КОТИРОВАТЬ, а не слать анкету/список
+# вопросов. Детерминированный детект (без сети/LLM): вытаскиваем ровно три обязательных поля.
+def _detect_catalog_model(text: str):
+    """Модель из КАТАЛОГА KNOWN_MODELS в тексте, нечувствительно к регистру/пробелам
+    («xsr 155», «XSR155», «xsr  155» → 'XSR 155'). Матчим по _bike_key (тот же нормализатор, что
+    park_allowlist/resolve_park_model — снимает регистр, пробелы, CC/СС и прочий не-alnum). При
+    нескольких совпадениях берём самый ДЛИННЫЙ ключ (специфичнее). Модели каталога нет → None.
+    Голый серийный корень («xsr» без объёма) не матчит — в каталоге только конкретные модели."""
+    key_text = _bike_key(text)
+    if not key_text:
+        return None
+    best = None
+    for disp, key in KNOWN_MODELS:
+        if key in key_text and (best is None or len(key) > len(best[1])):
+            best = (disp, key)
+    return best[0] if best else None
+
+
+def detect_first_message_booking(text: str, today=None):
+    """Из ОДНОГО сообщения клиента вытащить котируемую бронь: модель (каталог), дату старта
+    («с 15 июля») и срок («на 2 недели» → 14 дней; поддержка дней/недель/месяцев). Возвращает
+    {'model': 'XSR 155', 'startDate': 'YYYY-MM-DD', 'days': 14} ИЛИ None, если ХОТЯ БЫ ОДНОГО из
+    трёх полей нет. Детерминированно (без сети/LLM), переиспользует _anchor_date/_parse_term."""
+    today = today or datetime.date.today()
+    t = (text or "").lower().replace("–", "-").replace("—", "-").replace("ё", "е")
+    model = _detect_catalog_model(text)
+    anchor = _anchor_date(t, today)          # дата старта («с 15 июля», «завтра», «с 20»)
+    term = _parse_term(t)                    # (days, monthly) из «на N дней/недель/месяцев»
+    if not (model and anchor and term):
+        return None
+    return {"model": model, "startDate": anchor.isoformat(), "days": term[0]}
+
+
 async def read_transcript(client, entity, me_id: int, limit: int = MAX_MESSAGES) -> str:
     """Совместимость: выбрать сообщения и собрать транскрипт."""
     return transcript_from(await _fetch_messages(client, entity, limit), me_id)
