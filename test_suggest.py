@@ -794,8 +794,41 @@ class TestCollectedTracker(unittest.TestCase):
         tr = "[клиент]: NMAX с 7 по 14 июля"
         facts = suggest.collected_facts(tr)
         self.assertTrue(facts["model"])
-        self.assertTrue(facts["dates"])
+        self.assertTrue(facts["term"])    # диапазон задаёт длительность
+        self.assertTrue(facts["dates"])   # и конкретный старт
         self.assertFalse(facts["geo"])
+
+    def test_term_without_start_is_not_dates(self):
+        # §243 микро-фикс: одна ДЛИТЕЛЬНОСТЬ (без числа старта) → срок ✅, даты ❌.
+        # Живой провал: «на 10 дней» помечался «даты ✅» без даты старта. + парафразы RU.
+        for phr in ("на 10 дней", "на неделю", "на 2 недели", "на месяц", "на 5 дней"):
+            f = suggest.collected_facts(f"[клиент]: {phr}")
+            self.assertTrue(f["term"], f"срок не пойман: {phr}")
+            self.assertFalse(f["dates"], f"даты ложно пойманы без старта: {phr}")
+
+    def test_concrete_start_plus_term_sets_both(self):
+        # старт (число+месяц / dd.mm / «с завтрашнего») + длительность/диапазон → срок ✅ и даты ✅.
+        for phr in ("с 15 июля на 10 дней", "с 15.07 на 10 дней", "с завтрашнего на неделю",
+                    "с 7 по 14 июля", "10.07-15.07", "с 3 августа на 5 дней"):
+            f = suggest.collected_facts(f"[клиент]: {phr}")
+            self.assertTrue(f["dates"], f"конкретный старт не пойман: {phr}")
+            self.assertTrue(f["term"], f"срок не пойман: {phr}")
+
+    def test_start_only_is_dates_not_term(self):
+        # только старт, длительности нет → даты ✅, срок ❌.
+        for phr in ("приеду 15 июля", "старт 15.07", "прилетаю завтра"):
+            f = suggest.collected_facts(f"[клиент]: {phr}")
+            self.assertTrue(f["dates"], f"старт не пойман: {phr}")
+            self.assertFalse(f["term"], f"срок ложно пойман без длительности: {phr}")
+
+    def test_manager_note_splits_term_and_dates(self):
+        # пометка модератору различает срок/даты по обоим голденам.
+        self.assertEqual(
+            suggest.collected_manager_note(suggest.collected_facts("[клиент]: на 10 дней")),
+            "собрано: срок ✅")
+        self.assertEqual(
+            suggest.collected_manager_note(suggest.collected_facts("[клиент]: с 15 июля на 10 дней")),
+            "собрано: срок ✅ даты ✅")
 
     def test_payment_detected(self):
         self.assertTrue(suggest.collected_facts("[клиент]: Я уже оплатил депозит")["payment"])

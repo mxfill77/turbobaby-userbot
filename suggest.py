@@ -845,6 +845,20 @@ def _has_date_signal(text: str) -> bool:
     return any(mo in (text or "") for mo in _MONTHS)
 
 
+def _has_start_signal(text: str) -> bool:
+    """Конкретный СТАРТ аренды (в отличие от одной лишь ДЛИТЕЛЬНОСТИ): число+месяц («15 июля»),
+    dd.mm («15.07», «с 15.07»), «с 15 …», «завтра/послезавтра/сегодня» (в т.ч. «с завтрашнего»).
+    Одна длительность («на 10 дней», «на неделю») старта НЕ задаёт — сюда НЕ входит."""
+    t = (text or "").lower()
+    if re.search(r"послезавтра|завтра|сегодня", t):
+        return True
+    if re.search(r"\d{1,2}[.\-/]\d{1,2}", t):                 # 15.07 / 15/07
+        return True
+    if re.search(r"\d{1,2}\s+" + _MONTH_RE, t):               # 15 июля
+        return True
+    return False
+
+
 # --- намерение «прайс по всему парку / все модели / прайс-лист» (сценарий price_sheet) --------
 # Позитив: «цены на все модели», «прайс», «прайс-лист», «весь парк», «по всем байкам сколько».
 # Негатив: «сколько стоит NMAX» (одна модель), «всё включено?», «все новые байки?» (нет цены/парка).
@@ -1018,6 +1032,7 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
     if hint_days is None:
         hint_days = term_days
     has_dates = bool(iso_start or term_days) or _has_date_signal(newest)
+    has_start = bool(iso_start) or _has_start_signal(newest)   # конкретный старт, НЕ просто длительность
 
     # Несколько моделей в ОДНОМ запросе (правила цен v2, п.3) — берём из последней реплики;
     # одна/ноль → падаем на единственную разрешённую модель окна.
@@ -1035,6 +1050,7 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
     return {"model": model, "models": models, "date_start": iso_start, "date_end": iso_end,
             "iso_start": iso_start, "iso_end": iso_end, "term_days": term_days,
             "hint_days": hint_days, "monthly": monthly, "has_dates": has_dates,
+            "has_start": has_start,
             "deposit_multi_q": deposit_multi_q, "price_sheet_q": price_sheet_q,
             "sheet_filter": sheet_filter}
 
@@ -1064,14 +1080,17 @@ _COLL_PAYMENT = re.compile(r"оплат\w*|оплачен\w*|заплат\w*|п�
 
 def collected_facts(transcript: str, hints: dict = None, today=None) -> dict:
     """§243/6: что клиент УЖЕ прислал по окну диалога + reply-вложениям (см. transcript_from).
-    Ключи-булевы: model, dates, geo, passport, phone, payment. model/dates — из extract_booking_hints
-    (переиспользуем ту же логику последней брони), остальное — детерминированный скан клиентских строк
-    (reply-содержимое встроено в них). Ничего не найдено → все False (fail-safe: просто нет пометки)."""
+    Ключи-булевы: model, term, dates, geo, passport, phone, payment. model/term/dates — из
+    extract_booking_hints (переиспользуем ту же логику последней брони), остальное — детерминированный
+    скан клиентских строк (reply-содержимое встроено в них). term = ДЛИТЕЛЬНОСТЬ известна («на 10 дней»,
+    диапазон); dates = конкретный СТАРТ известен (число+месяц, «с завтрашнего», dd.mm). Слова длительности
+    старта НЕ дают. Ничего не найдено → все False (fail-safe: просто нет пометки)."""
     h = hints if hints is not None else extract_booking_hints(transcript, today=today)
     ctext = _client_text(transcript)   # только [клиент]: строки, lower, с встроенным reply-содержимым
     return {
         "model": bool(h.get("model")),
-        "dates": bool(h.get("has_dates") or h.get("iso_start") or h.get("term_days")),
+        "term":  bool(h.get("term_days") or (h.get("iso_start") and h.get("iso_end"))),
+        "dates": bool(h.get("iso_start") or h.get("has_start")),
         "geo": bool(_COLL_GEO.search(ctext)),
         "passport": bool(_COLL_PASSPORT.search(ctext)),
         "phone": bool(_COLL_PHONE.search(ctext)),
@@ -1082,7 +1101,8 @@ def collected_facts(transcript: str, hints: dict = None, today=None) -> dict:
 # Порядок и подписи собранного: (ключ, метка-для-промпта-RU/EN, короткая-метка-для-пометки-RU/EN).
 _COLL_LABELS = [
     ("model",    ("модель",         "model"),    ("модель",  "model")),
-    ("dates",    ("даты/срок",      "dates"),    ("даты",    "dates")),
+    ("term",     ("срок",           "term"),     ("срок",    "term")),
+    ("dates",    ("даты",           "dates"),    ("даты",    "dates")),
     ("geo",      ("локация",        "location"), ("гео",     "geo")),
     ("passport", ("фото паспорта",  "passport photo"), ("паспорт", "passport")),
     ("phone",    ("телефон",        "phone"),    ("тел",     "phone")),
