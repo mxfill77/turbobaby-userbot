@@ -528,5 +528,84 @@ class TestLessonInterception(unittest.TestCase):
         self.assertFalse(suggest.is_intake_approver("stranger"))
 
 
+class TestLessonEnqueue(unittest.TestCase):
+    """Родитель 292, шаг 2: распознанный урок → ШТАТНАЯ задача в очереди дирижёра
+    (from=Filipp-pcloc-dec) с ПОЛНЫМ контекстом (замечание + исходный черновик + окно диалога).
+    Прямого исполнения нет, гейт не обходим — проверяем только сам факт enqueue и его контекст."""
+
+    # живая карточка: окно 555 (@petya), исходный черновик — «дословный» текст менеджеру
+    DRAFT = {"id": 7, "draft": "Аренда от 1200฿/сутки, беру?", "client_id": 555, "client_ref": "@petya"}
+
+    def setUp(self):
+        self._save = (suggest.INTAKE_APPROVERS, suggest.APPROVER_USERNAMES)
+        suggest.INTAKE_APPROVERS = {"filipp", "filipp_alt", "danya", "dasha"}
+        suggest.APPROVER_USERNAMES = set()
+        self.calls = []
+        # фейк-enqueue: захватывает (task_text, frm) и отдаёт (ok, id, err) как enqueue_pc_task
+        self.fake = lambda text, frm: (self.calls.append((text, frm)) or (True, 4242, None))
+
+    def tearDown(self):
+        suggest.INTAKE_APPROVERS, suggest.APPROVER_USERNAMES = self._save
+
+    def test_lesson_enqueues_task_with_full_context(self):
+        # реплай-триггер от учителя → ровно одна задача в очереди с полным контекстом
+        d = moderation_core.submit_lesson(self.DRAFT, "правка: не дави ценой первой", "danya",
+                                          enqueue=self.fake)
+        self.assertEqual(d["decision"], "lesson")
+        self.assertTrue(d["queued"])
+        self.assertEqual(d["task_id"], 4242)
+        self.assertEqual(len(self.calls), 1)              # ровно один enqueue — прямого исполнения нет
+        text, frm = self.calls[0]
+        self.assertEqual(frm, "Filipp-pcloc-dec")         # штатный родитель локального дирижёра
+        # полный контекст: замечание + исходный черновик + окно диалога (id/ref) + автор
+        self.assertIn("не дави ценой первой", text)       # текст замечания
+        self.assertIn("Аренда от 1200฿/сутки", text)      # ИСХОДНЫЙ черновик дословно
+        self.assertIn("555", text)                        # окно диалога (client_id из карточки)
+        self.assertIn("@petya", text)                     # ref окна
+        self.assertIn("#7", text)                         # id черновика
+        self.assertIn("@danya", text)                     # кто учит
+        self.assertIn("правка", text)                     # тип урока
+
+    def test_not_lesson_does_not_enqueue(self):
+        d = moderation_core.submit_lesson(self.DRAFT, "сделай короче", "danya", enqueue=self.fake)
+        self.assertEqual(d["decision"], "not_lesson")
+        self.assertEqual(self.calls, [])                  # обычный reply в очередь дирижёра не идёт
+
+    def test_denied_stranger_does_not_enqueue(self):
+        d = moderation_core.submit_lesson(self.DRAFT, "урок: пиши мягче", "stranger", enqueue=self.fake)
+        self.assertEqual(d["decision"], "denied")
+        self.assertEqual(self.calls, [])                  # чужой урок не ставим в очередь
+
+    def test_empty_remark_still_enqueues_window(self):
+        # пустое замечание допустимо — задача всё равно несёт окно/черновик (учитель уточнит в окне)
+        d = moderation_core.submit_lesson(self.DRAFT, "урок:", "filipp", enqueue=self.fake)
+        self.assertEqual(d["decision"], "lesson")
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("client_id=555", self.calls[0][0])
+
+    def test_enqueue_failure_does_not_crash_and_flags_card(self):
+        # Bridge/сеть отвалились → обработчик не падает, замечание помечено непоставленным
+        boom = lambda text, frm: (False, None, "enqueue отклонён Bridge")
+        d = moderation_core.submit_lesson(self.DRAFT, "не так: сухой тон", "danya", enqueue=boom)
+        self.assertEqual(d["decision"], "lesson")
+        self.assertFalse(d["queued"])
+        self.assertIsNone(d["task_id"])
+        self.assertIn("не встало", d["card"])
+
+    def test_enqueue_exception_swallowed(self):
+        def raiser(text, frm):
+            raise RuntimeError("bridge down")
+        d = moderation_core.submit_lesson(self.DRAFT, "правка: тон", "danya", enqueue=raiser)
+        self.assertFalse(d["queued"])                     # исключение проглочено → queued=False
+        self.assertIn("bridge down", d["card"])
+
+    def test_build_lesson_task_pure(self):
+        # чистый билдер контекста без enqueue — та же полнота, отдельно проверяема
+        les = moderation_core.process_lesson(self.DRAFT, "правка: уточняй даты", "danya")
+        text = moderation_core.build_lesson_task(les, self.DRAFT, "danya")
+        for frag in ("уточняй даты", "Аренда от 1200฿/сутки", "555", "@petya", "#7"):
+            self.assertIn(frag, text, frag)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

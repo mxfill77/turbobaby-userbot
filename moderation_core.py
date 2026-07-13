@@ -235,6 +235,69 @@ def process_lesson(draft, reply_text, username):
                     f"{draft.get('client_ref') or draft.get('client_id')} — учту."}
 
 
+# ------------------- постановка урока в очередь дирижёра (родитель 292, шаг 2) ------
+# Распознанный урок (process_lesson → decision='lesson') становится ШТАТНОЙ задачей в очереди
+# дирижёра — from=Filipp-pcloc-dec (родитель локальной декомпозиции). Прямо НИЧЕГО не исполняем
+# и гейт очереди НЕ обходим: только enqueue (существующий канал pc_orchestrator.enqueue_pc_task),
+# claim/исполнение остаётся на демоне-дирижёре его обычным поллингом. Контекст задачи = текст
+# замечания + ИСХОДНЫЙ черновик + окно диалога (client_id/ref из карточки, id черновика).
+LESSON_TASK_FROM = "Filipp-pcloc-dec"   # зеркалит pc_orchestrator.PC_LOCAL_DEC_FROM (родитель pcloc-dec)
+
+
+def build_lesson_task(lesson, draft, username=None):
+    """Собрать ПОЛНЫЙ текст задачи-урока для очереди дирижёра из решения process_lesson и карточки.
+    Контекст (родитель 292): kind/замечание + исходный черновик + окно диалога (client_id/ref, id
+    черновика). Чистая функция (без I/O) — легко проверяется юнитом на полноту контекста."""
+    kind = lesson.get("kind") or "урок"
+    remark = (lesson.get("remark") or "").strip() or "(без текста — см. окно диалога)"
+    window = lesson.get("window") if lesson.get("window") is not None else draft.get("client_id")
+    ref = draft.get("client_ref") or (f"client_id={window}" if window is not None else "?")
+    draft_id = lesson.get("draft_id") if lesson.get("draft_id") is not None else draft.get("id")
+    original = (draft.get("draft") or draft.get("final_text") or "").strip() or "(пусто)"
+    who = f"@{username}" if username else "?"
+    return (f"[урок:{kind} от {who}] родитель 292 — замечание менеджера в копилку обучения\n"
+            f"окно диалога: {ref} (client_id={window}) · черновик #{draft_id}\n"
+            f"Замечание: {remark}\n"
+            f"Исходный черновик: {original}")
+
+
+def _default_lesson_enqueue(task_text, frm):
+    """Боевой enqueue урока: ленивый импорт pc_orchestrator (не тянем тяжёлый модуль в бот на
+    каждый апдейт — только при реальном уроке). → (ok, id|None, err|None)."""
+    import pc_orchestrator          # ленивый — событие редкое, импорт тут не грузит бота
+    return pc_orchestrator.enqueue_pc_task(task_text, frm=frm)
+
+
+def submit_lesson(draft, reply_text, username, enqueue=None):
+    """Обёртка над process_lesson (родитель 292, шаг 2): распознанный урок → ШТАТНАЯ задача в
+    очереди дирижёра (from=Filipp-pcloc-dec) с полным контекстом. Прямо ничего не исполняем,
+    гейт не обходим — только enqueue. `enqueue(task_text, frm) -> (ok, id, err)` инъектируется
+    (юнит подставляет фейк; прод берёт _default_lesson_enqueue). Возвращает decision-dict:
+      not_lesson/denied — как process_lesson (в очередь ничего не ставим);
+      lesson — плюс поля queued(bool)/task_id/task_text; enqueue-fail не роняет обработчик, а
+               помечает queued=False и дополняет карточку (замечание не потеряно — повторят)."""
+    dec = process_lesson(draft, reply_text, username)
+    if dec.get("decision") != "lesson":
+        return dec
+    task_text = build_lesson_task(dec, draft, username)
+    enq = enqueue if enqueue is not None else _default_lesson_enqueue
+    dec["task_text"] = task_text
+    try:
+        ok, tid, err = enq(task_text, LESSON_TASK_FROM)
+    except Exception as e:                      # noqa: BLE001 — сеть/Bridge не должны ронять бот
+        ok, tid, err = False, None, str(e)
+    dec["queued"] = bool(ok)
+    dec["task_id"] = tid
+    if not ok:
+        dec["card"] += f"\n⚠️ В очередь дирижёра не встало ({_clip_err(err)}) — повторите позже."
+    return dec
+
+
+def _clip_err(err, n=120):
+    s = str(err or "ошибка")
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
 # ------------------------- захват правки в playbook (Фаза 2) ------------------
 
 def _distill_system():

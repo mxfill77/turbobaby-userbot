@@ -299,11 +299,14 @@ async def on_group_message(update, context):
         return
     # перехват реплая-обучения (родитель 292): «правка:»/«урок:»/«не так:» — не обычная правка
     # черновика, а замечание в копилку обучения; права строже approve (только INTAKE_APPROVERS).
-    lesson = moderation_core.process_lesson(draft, msg.text or "", username)
+    # submit_lesson (шаг 2): распознанный урок → ШТАТНАЯ задача в очереди дирижёра (enqueue, гейт
+    # НЕ обходим — исполняет демон). Прямо ничего не исполняем здесь.
+    lesson = moderation_core.submit_lesson(draft, msg.text or "", username)
     if lesson["decision"] != "not_lesson":
         if lesson["decision"] == "lesson":
             log.info(f"LESSON[{lesson['kind']}] окно={lesson.get('window')} draft#{lesson.get('draft_id')} "
-                     f"от @{username}: {lesson.get('remark')}")
+                     f"от @{username}: {lesson.get('remark')} → queued={lesson.get('queued')} "
+                     f"task#{lesson.get('task_id')}")
         await context.bot.send_message(chat.id, lesson["card"],
                                        reply_to_message_id=draft.get("card_msg_id"))
         return
