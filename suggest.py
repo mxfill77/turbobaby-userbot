@@ -1279,16 +1279,18 @@ def collected_prompt_note(facts: dict, lang: str = "ru") -> str:
 
 
 def collected_manager_note(facts: dict, lang: str = "ru") -> str:
-    """Пометка модератору «собрано: гео ✅ паспорт ✅ тел ✅» (клиенту не видна — _strip_service_prefix
-    режет только НАЧАЛО, а это хвост). Ничего не собрано → '' (пометки нет)."""
+    """СЛУЖЕБНАЯ пометка модератору о собранном — в квадратных скобках, как «[уточнить: …]»
+    (шаг 4/7 #253): «[собрано: гео ✅ паспорт ✅ тел ✅]». Скобки → это служебный канал карточки,
+    а не тело ответа; client_facing_text её срезает (клиент «собрано:» не видит). Ничего не
+    собрано → '' (пометки нет)."""
     if not facts:
         return ""
     en = (lang == "en")
     parts = [lbl[1 if en else 0] + " ✅" for key, _, lbl in _COLL_LABELS if facts.get(key)]
     if not parts:
         return ""
-    head = "collected: " if en else "собрано: "
-    return head + " ".join(parts)
+    head = "[collected: " if en else "[собрано: "
+    return head + " ".join(parts) + "]"
 
 
 # Инструкция про депозит при нескольких байках (правила цен v2, п.4).
@@ -1663,13 +1665,16 @@ _LOW_SEASON_END = {"ru": "31 октября", "en": "31 October"}
 
 
 def _sheet_season_note(rows, lang="ru"):
-    """Сезонная пометка: НАЛИЧИЕ низкого сезона — из живого quote (cap_active/season), конец сезона —
-    документированная граница парка (_LOW_SEASON_END). Высокий сезон → None (сезон не утверждаем)."""
+    """Сезонная пометка — СЛУЖЕБНАЯ, для МОДЕРАТОРА (шаг 4/7 #253): в квадратных скобках, как
+    «[уточнить: …]». В КЛИЕНТСКОЕ тело её больше не кладём (клиент не должен читать «низкий сезон /
+    до 31 октября» в ответе). НАЛИЧИЕ низкого сезона — из живого quote (cap_active/season), конец
+    сезона — документированная граница парка (_LOW_SEASON_END). Высокий сезон → None (сезон не
+    утверждаем)."""
     if not _sheet_low_season(rows):
         return None
     if lang == "en":
-        return f"Low-season prices, valid until {_LOW_SEASON_END['en']}."
-    return f"Цены низкого сезона, действуют до {_LOW_SEASON_END['ru']}."
+        return f"[season: low, prices valid until {_LOW_SEASON_END['en']}]"
+    return f"[сезон: низкий, цены действуют до {_LOW_SEASON_END['ru']}]"
 
 
 def render_price_sheet(rows, ds, lang="ru") -> str:
@@ -1775,6 +1780,11 @@ def filter_sheet_rows(rows, kind=None, cc_min=None, cc_max=None):
 # КОД: intro + вывод render_price_sheet ДОСЛОВНО + outro (compose_sheet_draft).
 _SHEET_OPEN, _SHEET_CLOSE = "<<<SHEET>>>", "<<<END_SHEET>>>"
 _SHEET_BLOCK_RE = re.compile(re.escape(_SHEET_OPEN) + r"\n(.*?)\n" + re.escape(_SHEET_CLOSE), re.S)
+# Сезонная СЛУЖЕБНАЯ пометка (шаг 4/7 #253) едет тем же транспортом, что и SHEET-блок — внутри
+# служебных скобок pricing_note: в промпт LLM НЕ попадает (make_system_prompt вырезает), в
+# клиентское тело НЕ попадает; финал приклеивает её ХВОСТОМ черновика для модератора.
+_SEASON_OPEN, _SEASON_CLOSE = "<<<SEASON>>>", "<<<END_SEASON>>>"
+_SEASON_BLOCK_RE = re.compile(re.escape(_SEASON_OPEN) + r"\n(.*?)\n" + re.escape(_SEASON_CLOSE), re.S)
 _SHEET_MARKER = "[PRICE_SHEET]"
 # Метка в ответе LLM: отдельной строкой (\W покрывает скобки/кавычки/пунктуацию вокруг)
 # ИЛИ инлайн «[PRICE_SHEET]» — режем по первому попаданию.
@@ -1876,12 +1886,15 @@ def build_price_sheet_note(hints, lang="ru", getter=None, today=None):
     body = render_price_sheet(rows, ds, lang)
     if not body.strip():
         return _PRICE_SHEET_UNAVAILABLE
-    # Детерминированные строки КОДА (не LLM): сезон из живого quote — В ШАПКУ прайса; мин-срок из
-    # констант — хвостом ПОД карточками моделей. Числа/формат карточек рендерит render_price_sheet.
+    # Детерминированные строки КОДА (не LLM): мин-срок из констант — хвостом ПОД карточками моделей.
+    # Числа/формат карточек рендерит render_price_sheet. Сезонность (шаг 4/7 #253) в КЛИЕНТСКОЕ
+    # тело больше НЕ кладём — она уходит модератору отдельным служебным каналом (SEASON-скобки ниже).
+    block = body + "\n\n" + _sheet_min_term_line(lang)
+    note = _wrap_price_sheet(block, ds, lang, default_anchor=default_anchor)
     season = _sheet_season_note(rows, lang)
-    header = (season + "\n\n") if season else ""
-    block = header + body + "\n\n" + _sheet_min_term_line(lang)
-    return _wrap_price_sheet(block, ds, lang, default_anchor=default_anchor)
+    if season:
+        note += "\n" + _SEASON_OPEN + "\n" + season + "\n" + _SEASON_CLOSE
+    return note
 
 
 def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -> str:
@@ -2083,6 +2096,10 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         pn_prompt = _SHEET_BLOCK_RE.sub(
             "(прайс-сетка уже посчитана — КОД вставит её ДОСЛОВНО на место метки [PRICE_SHEET])",
             pricing_note)
+    # Сезонная СЛУЖЕБНАЯ пометка (шаг 4/7 #253) — только для модератора: из промпта LLM её ВЫРЕЗАЕМ,
+    # чтобы LLM не выдал «низкий сезон / до 31 октября» в клиентское тело.
+    if _SEASON_BLOCK_RE.search(pn_prompt or ""):
+        pn_prompt = _SEASON_BLOCK_RE.sub("", pn_prompt).rstrip()
     price_block = ("\n\n" + pn_prompt) if pn_prompt else ""
     # СТРАТЕГИЯ-директива менеджера: высший приоритет по СОДЕРЖАНИЮ/логике/тону ответа, НО
     # ценовую политику и критичные факты НЕ отменяет (они ниже — незыблемы).
@@ -2565,12 +2582,46 @@ def postcheck_draft(draft: str, lang: str = "ru", pricing_note: str = "",
 
 
 def _append_collected_note(draft: str, facts: dict, lang: str = "ru") -> str:
-    """§243/6: дописать в хвост черновика пометку модератору «собрано: гео ✅ паспорт ✅ тел ✅».
+    """§243/6: дописать в хвост черновика СЛУЖЕБНУЮ пометку модератору «[собрано: гео ✅ …]».
     Ничего не собрано → черновик БАЙТ-В-БАЙТ (fail-safe). Хвост → _strip_service_prefix не режет."""
     note = collected_manager_note(facts, lang)
     if not note:
         return draft
     return ((draft or "").rstrip() + "\n" + note) if (draft or "").strip() else draft
+
+
+def _season_service_note(pricing_note: str) -> str:
+    """Сезонная СЛУЖЕБНАЯ пометка «[сезон: …]» из служебных скобок pricing_note → текст | ''
+    (нет низкого сезона / не sheet-режим)."""
+    m = _SEASON_BLOCK_RE.search(pricing_note or "")
+    return m.group(1).strip() if m else ""
+
+
+def _append_season_note(draft: str, pricing_note: str) -> str:
+    """Шаг 4/7 #253: дописать в хвост черновика СЛУЖЕБНУЮ сезонную пометку «[сезон: …]» (для
+    модератора; client_facing_text её срезает — в клиентском теле сезонности нет). Нет пометки →
+    черновик БАЙТ-В-БАЙТ (fail-safe)."""
+    note = _season_service_note(pricing_note)
+    if not note:
+        return draft
+    return ((draft or "").rstrip() + "\n" + note) if (draft or "").strip() else draft
+
+
+# Служебные пометки модератору в теле черновика — квадратные скобки с известным маркером,
+# КАЖДАЯ отдельной строкой в хвосте ([уточнить: …]/[собрано: …]/[сезон: …] и EN-аналоги). Клиент
+# их видеть не должен: client_facing_text срезает такие строки перед отправкой (шаг 4/7 #253).
+_SERVICE_NOTE_LINE_RE = re.compile(
+    r"^[ \t]*\[(?:уточнить|собрано|collected|сезон|season)\b[^\n]*\][ \t]*$", re.I | re.M)
+
+
+def client_facing_text(draft: str) -> str:
+    """Текст, который увидит КЛИЕНТ: черновик БЕЗ служебных пометок модератору
+    ([уточнить: …]/[собрано: …]/[сезон: …]). Пометки живут в служебной части карточки, не в теле
+    ответа. Пустой вход → как есть (fail-safe)."""
+    if not (draft or "").strip():
+        return draft
+    out = _SERVICE_NOTE_LINE_RE.sub("", draft)
+    return re.sub(r"\n{3,}", "\n\n", out).strip()
 
 
 def generate_draft(transcript: str, lang: str, faq: str,
@@ -2593,7 +2644,8 @@ def generate_draft(transcript: str, lang: str, faq: str,
     block = _sheet_block_from_note(pricing_note)
     if block is not None:
         out = compose_sheet_draft(out, block, lang)
-    return _append_collected_note(out, facts, lang)
+    out = _append_collected_note(out, facts, lang)
+    return _append_season_note(out, pricing_note)
 
 
 def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: bool,
@@ -2614,7 +2666,8 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     block = _sheet_block_from_note(pricing_note)
     if block is not None:
         out = compose_sheet_draft(out, block, lang)
-    return _append_collected_note(out, facts, lang)
+    out = _append_collected_note(out, facts, lang)
+    return _append_season_note(out, pricing_note)
 
 
 # ------------------------------- rate-limit ----------------------------------

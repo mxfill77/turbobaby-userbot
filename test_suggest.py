@@ -776,11 +776,15 @@ class TestCollectedTracker(unittest.TestCase):
             return "Локацию и данные получил, спасибо! Осталось подобрать даты."
 
         d = suggest.generate_draft(tr, "ru", "FAQ", call_llm=capture)
-        self.assertIn("собрано: гео ✅ паспорт ✅ тел ✅", d)   # пометка модератору в хвосте
+        self.assertIn("[собрано: гео ✅ паспорт ✅ тел ✅]", d)   # СЛУЖЕБНАЯ пометка модератору в хвосте
         self.assertIn("УЖЕ ПОЛУЧЕНО", seen["system"])           # промпт нёс собранное
         # тело подтверждения не потеряно, пометка — отдельной хвостовой строкой
         self.assertIn("Локацию и данные получил", d)
-        self.assertTrue(d.rstrip().endswith("собрано: гео ✅ паспорт ✅ тел ✅"))
+        self.assertTrue(d.rstrip().endswith("[собрано: гео ✅ паспорт ✅ тел ✅]"))
+        # шаг 4/7 #253: клиентский текст (тело ответа) СЛУЖЕБНОЙ пометки НЕ содержит
+        client = suggest.client_facing_text(d)
+        self.assertNotIn("собрано:", client)
+        self.assertIn("Локацию и данные получил", client)
 
     def test_nothing_collected_leaves_draft_byte_for_byte(self):
         # чистый первый вопрос без данных → фактов нет → черновик и промпт без блока/пометки
@@ -826,10 +830,10 @@ class TestCollectedTracker(unittest.TestCase):
         # пометка модератору различает срок/даты по обоим голденам.
         self.assertEqual(
             suggest.collected_manager_note(suggest.collected_facts("[клиент]: на 10 дней")),
-            "собрано: срок ✅")
+            "[собрано: срок ✅]")
         self.assertEqual(
             suggest.collected_manager_note(suggest.collected_facts("[клиент]: с 15 июля на 10 дней")),
-            "собрано: срок ✅ даты ✅")
+            "[собрано: срок ✅ даты ✅]")
 
     def test_payment_detected(self):
         self.assertTrue(suggest.collected_facts("[клиент]: Я уже оплатил депозит")["payment"])
@@ -838,7 +842,7 @@ class TestCollectedTracker(unittest.TestCase):
 
     def test_manager_note_en(self):
         facts = {"geo": True, "phone": True, "passport": False}
-        self.assertEqual(suggest.collected_manager_note(facts, "en"), "collected: geo ✅ phone ✅")
+        self.assertEqual(suggest.collected_manager_note(facts, "en"), "[collected: geo ✅ phone ✅]")
 
     def test_phone_not_confused_with_dates(self):
         # «с 7 по 14» — это даты, НЕ телефон (короткие цифры)
@@ -1809,26 +1813,33 @@ class TestPriceSheet(unittest.TestCase):
         self.assertIn(f"мотоциклы от {suggest.MOTO_MIN_DAYS}", line)
 
     def test_season_note_low_from_quote(self):
-        # кап активен в моке → пометка низкого сезона выведена из живого quote (наличие сезона — не
-        # хардкод); конец сезона — документированная граница парка «до 31 октября».
+        # кап активен в моке → СЛУЖЕБНАЯ пометка низкого сезона выведена из живого quote (наличие
+        # сезона — не хардкод); конец сезона — документированная граница парка «до 31 октября».
+        # Шаг 4/7 #253: пометка в квадратных скобках (служебный канал модератора).
         note = suggest.build_pricing_note(
             {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True},
             lang="ru", getter=self._getter())
-        self.assertIn("Цены низкого сезона, действуют до 31 октября", note)
+        self.assertEqual(suggest._season_service_note(note),
+                         "[сезон: низкий, цены действуют до 31 октября]")
 
     def test_season_note_en(self):
-        # EN-аналог сезонной пометки низкого сезона.
+        # EN-аналог служебной сезонной пометки низкого сезона.
         note = suggest.build_pricing_note(
             {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True},
             lang="en", getter=self._getter())
-        self.assertIn("Low-season prices, valid until 31 October", note)
+        self.assertEqual(suggest._season_service_note(note),
+                         "[season: low, prices valid until 31 October]")
 
-    def test_season_note_in_header_above_cards(self):
-        # сезонная строка — В ШАПКЕ прайса (выше карточек моделей), а не в хвосте.
+    def test_season_note_not_in_client_sheet_block(self):
+        # Шаг 4/7 #253: сезонность УБРАНА из клиентского тела — в прайс-блоке (что вставится клиенту
+        # ДОСЛОВНО) ни «низкого сезона», ни «31 октября» больше нет; сезон — только служебной пометкой.
         note = suggest.build_pricing_note(
             {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True},
             lang="ru", getter=self._getter())
-        self.assertLess(note.index("низкого сезона"), note.index("NMAX 155"))
+        block = suggest._sheet_block_from_note(note)
+        self.assertIn("NMAX 155", block)                 # карточки на месте
+        self.assertNotIn("сезон", block.lower())         # сезонности в клиентском теле нет
+        self.assertNotIn("31 октября", block)
 
     def test_season_note_absent_when_no_cap(self):
         # ни у одной модели кап не активен → сезонную пометку НЕ утверждаем.
@@ -1851,7 +1862,7 @@ class TestPriceSheet(unittest.TestCase):
             {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True},
             lang="ru", getter=getter)
         self.assertIn("ПРАЙС ПО ПАРКУ", note)            # сетка всё равно есть
-        self.assertNotIn("низкого сезона", note)         # но сезон не утверждаем
+        self.assertEqual(suggest._season_service_note(note), "")  # служебной пометки сезона нет
         self.assertNotIn("31 октября", note)             # и конец сезона не называем
 
     def test_month_cap_reflected_in_note(self):
@@ -1898,11 +1909,42 @@ class TestPriceSheet(unittest.TestCase):
         sysp = suggest.make_system_prompt("FAQ", "ru", pricing_note=note)
         self.assertNotIn("• Сутки: 450 ฿", sysp)        # цифры сетки LLM НЕ видит
         self.assertNotIn("<<<SHEET>>>", sysp)           # служебные скобки в промпт не текут
+        self.assertNotIn("<<<SEASON>>>", sysp)          # сезонные служебные скобки тоже
+        self.assertNotIn("низкий", sysp.lower())        # LLM сезонность не видит → не выдаст клиенту
         self.assertIn("[PRICE_SHEET]", sysp)            # метка-инструкция на месте
         self.assertIn("БЕЗ ПЕРЕСПРОСОВ", sysp)
         # а извлечённый блок для сборки — дословный, с цифрами
         block = suggest._sheet_block_from_note(note)
         self.assertIn("• Сутки: 450 ฿", block)
+
+    def test_golden_client_text_free_of_service_notes(self):
+        # ГОЛДЕН шаг 4/7 #253: клиентский текст (тело ответа) НЕ содержит «собрано:» и служебных
+        # пометок ([уточнить:…]/[собрано:…]/[сезон:…]); сезонность и статус собранного уходят
+        # модератору отдельным служебным каналом. Собран прайс низкого сезона + собранные факты.
+        tr = ("[клиент]: какие модели и какие цены на аренду?\n"
+              "[клиент]: вот моя локация https://maps.google.com/?q=7.9,98.3\n"
+              "[клиент]: +66 812345678")
+        hints = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter())
+        self.assertNotEqual(suggest._season_service_note(note), "")  # предпосылка: низкий сезон есть
+
+        def llm(system, user):
+            return "Актуальный прайс по нашему парку:\n[PRICE_SHEET]\nПодскажите модель и даты."
+
+        d = suggest.generate_draft(tr, "ru", "FAQ", pricing_note=note, call_llm=llm)
+        # служебная часть карточки (полный черновик) — пометки ДЛЯ модератора видны
+        self.assertIn("[сезон: низкий, цены действуют до 31 октября]", d)
+        self.assertIn("[собрано:", d)
+        # клиентский текст — тело БЕЗ служебных пометок
+        client = suggest.client_facing_text(d)
+        self.assertNotIn("собрано:", client)
+        self.assertNotIn("[сезон", client)
+        self.assertNotIn("[уточнить", client)
+        self.assertNotIn("[собрано", client)
+        self.assertNotIn("низкого сезона", client)
+        self.assertNotIn("31 октября", client)
+        self.assertIn("Актуальный прайс", client)        # тело ответа цело
+        self.assertIn("NMAX 155", client)                # прайс-карточки на месте
 
 
 class TestPriceSheetMinAcrossVariants(unittest.TestCase):
@@ -2252,7 +2294,10 @@ class TestSheetUntouchableBlock(unittest.TestCase):
                                        pricing_note=note, call_llm=fake)
         self.assertIn(block, draft)                            # рендер ДОСЛОВНО в черновике
         self.assertTrue(draft.startswith("Здравствуйте! Вот наш прайс:"))
-        self.assertTrue(draft.endswith("Какая модель интересна?"))
+        # шаг 4/7 #253: хвост черновика — СЛУЖЕБНАЯ сезонная пометка (низкий сезон в ROWS), а
+        # тело ответа клиенту (без пометок) заканчивается фразой концовки LLM.
+        self.assertTrue(draft.rstrip().endswith("[сезон: низкий, цены действуют до 31 октября]"))
+        self.assertTrue(suggest.client_facing_text(draft).endswith("Какая модель интересна?"))
         self.assertNotIn("[PRICE_SHEET]", draft)               # метка заменена
         self.assertNotIn("**", draft)
 
