@@ -247,7 +247,8 @@ LESSON_TASK_FROM = "Filipp-pcloc-dec"   # зеркалит pc_orchestrator.PC_LO
 def build_lesson_task(lesson, draft, username=None):
     """Собрать ПОЛНЫЙ текст задачи-урока для очереди дирижёра из решения process_lesson и карточки.
     Контекст (родитель 292): kind/замечание + исходный черновик + окно диалога (client_id/ref, id
-    черновика). Чистая функция (без I/O) — легко проверяется юнитом на полноту контекста."""
+    черновика) + координата карточки в модер-группе (card_msg_id — точка реплая для подтверждения
+    «урок принят…» после коммита, шаг 4). Чистая функция (без I/O) — юнит проверяет полноту контекста."""
     kind = lesson.get("kind") or "урок"
     remark = (lesson.get("remark") or "").strip() or "(без текста — см. окно диалога)"
     window = lesson.get("window") if lesson.get("window") is not None else draft.get("client_id")
@@ -255,8 +256,13 @@ def build_lesson_task(lesson, draft, username=None):
     draft_id = lesson.get("draft_id") if lesson.get("draft_id") is not None else draft.get("id")
     original = (draft.get("draft") or draft.get("final_text") or "").strip() or "(пусто)"
     who = f"@{username}" if username else "?"
+    # Координата карточки черновика в модер-группе (родитель 292, шаг 4): подтверждение «урок
+    # принят…» ПОСЛЕ коммита moderation_bot пришлёт РЕПЛАЕМ именно на неё. Нет card_msg_id → «?».
+    card = draft.get("card_msg_id")
+    card_ref = f"msg={card}" if card is not None else "msg=?"
     return (f"[урок:{kind} от {who}] родитель 292 — замечание менеджера в копилку обучения\n"
             f"окно диалога: {ref} (client_id={window}) · черновик #{draft_id}\n"
+            f"карточка модер-группы: {card_ref}\n"
             f"Замечание: {remark}\n"
             f"Исходный черновик: {original}")
 

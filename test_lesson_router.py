@@ -225,5 +225,106 @@ class TestHandle(unittest.TestCase):
         self.assertEqual("failed", dec["status"])
 
 
+class TestAckAfterCommit(unittest.TestCase):
+    """Родитель 292, шаг 4: подтверждение «урок принят…» уходит ТОЛЬКО после РЕАЛЬНОГО коммита.
+    Ключевой инвариант — подтверждение НЕ уходит до коммита (gate ack_after_commit)."""
+
+    def test_ack_text_format(self):
+        # формат родителя 292: суть + куда записан + «применится со следующего ответа»
+        ack = lr.build_lesson_ack("депозит 3000, не 5000", "код/критфакты/FAQ + golden-тест")
+        self.assertIn("Урок принят", ack)
+        self.assertIn("депозит 3000, не 5000", ack)          # суть
+        self.assertIn("код/критфакты/FAQ + golden-тест", ack)  # куда записан
+        self.assertIn("применится со следующего ответа", ack)
+
+    def test_ack_withheld_without_commit(self):
+        # НЕТ коммита → подтверждение НЕ формируется (None). Это и есть «не уходит до коммита».
+        self.assertIsNone(lr.ack_after_commit("", "суть", "чек-лист", verify=lambda r: self.fail(
+            "verify не должен зваться на пустом ref")))
+        self.assertIsNone(lr.ack_after_commit(None, "суть", "чек-лист"))
+        # ref есть, но НЕ реальный коммит (verify=False) → всё равно None
+        self.assertIsNone(lr.ack_after_commit("deadbeef", "суть", "чек-лист", verify=lambda r: False))
+
+    def test_ack_sent_only_after_real_commit(self):
+        # verify подтвердил реальный коммит → подтверждение формируется с сутью и «куда»
+        seen = {}
+        def verify(ref):
+            seen["ref"] = ref
+            return True
+        ack = lr.ack_after_commit("abc1234", "цена нмакс исправлена", "код + golden-тест", verify=verify)
+        self.assertEqual("abc1234", seen["ref"])             # гейт реально проверял ИМЕННО этот ref
+        self.assertIsNotNone(ack)
+        self.assertIn("цена нмакс исправлена", ack)
+        self.assertIn("применится со следующего ответа", ack)
+
+    def test_verify_commit_failsafe(self):
+        # пустой ref → False без обращения к git; сбой раннера → False (нет доказательства коммита)
+        self.assertFalse(lr.verify_commit("", run=lambda r: self.fail("run на пустом ref")))
+        self.assertFalse(lr.verify_commit("   "))
+        self.assertFalse(lr.verify_commit("x", run=lambda r: (_ for _ in ()).throw(OSError("no git"))))
+        self.assertTrue(lr.verify_commit("realhash", run=lambda r: True))
+
+
+class TestLessonCardAndAckMaterial(unittest.TestCase):
+    """Шаг 4: задача-урок несёт координату карточки модер-группы (точка реплая), а handle_lesson_task
+    отдаёт материал подтверждения (суть/куда/пути-к-коммиту) для гейта после коммита."""
+
+    def test_parse_card_msg_id_from_real_builder(self):
+        import moderation_core
+        draft = {"id": 7, "client_id": 555, "client_ref": "Иван (555)",
+                 "draft": "Аренда от 1200฿/сутки", "card_msg_id": 90210}
+        les = {"kind": "не так", "remark": "цена неверная", "window": 555, "draft_id": 7}
+        text = moderation_core.build_lesson_task(les, draft, "danya")
+        self.assertIn("msg=90210", text)                     # координата карточки в тексте задачи
+        self.assertEqual("90210", lr.parse_lesson_task(text)["card_msg_id"])
+
+    def test_card_msg_id_absent_is_graceful(self):
+        # черновик без card_msg_id → «msg=?», парс отдаёт пусто (не падаем)
+        import moderation_core
+        text = moderation_core.build_lesson_task(
+            {"kind": "урок", "remark": "r", "window": 1, "draft_id": 1}, {"id": 1, "client_id": 1}, "danya")
+        self.assertIn("msg=?", text)
+        self.assertEqual("", lr.parse_lesson_task(text)["card_msg_id"])
+
+    def _task_card(self, remark, card="90210"):
+        return (f"[урок:правка от @danya] родитель 292 — замечание менеджера в копилку обучения\n"
+                f"окно диалога: Иван (555) (client_id=555) · черновик #7\n"
+                f"карточка модер-группы: msg={card}\n"
+                f"Замечание: {remark}\n"
+                f"Исходный черновик: Аренда от 1200฿/сутки")
+
+    def test_supervision_yields_ack_material_and_tracked_commit_path(self):
+        # НАДЗОР добавлен → есть суть, «куда», координата карточки И tracked-путь чек-листа к коммиту
+        dec = lr.handle_lesson_task(self._task_card("ревизор должен ловить выдуманную цену"),
+                                    append_checklist=lambda r: "added")
+        self.assertEqual("ревизор должен ловить выдуманную цену", dec["ack_subject"])
+        self.assertIn("чек-лист", dec["ack_where"])
+        self.assertEqual("90210", dec["card_msg_id"])
+        self.assertIn(lr._REVIZOR_REL, dec["commit_paths"])  # чек-лист отслеживается → коммитим его
+
+    def test_supervision_duplicate_has_nothing_to_commit(self):
+        # правило уже в чек-листе → коммитить нечего (пустые commit_paths) ⇒ подтверждение не задвоится
+        dec = lr.handle_lesson_task(self._task_card("ревизор должен ловить выдуманную цену"),
+                                    append_checklist=lambda r: "duplicate")
+        self.assertEqual("done", dec["status"])
+        self.assertEqual([], dec["commit_paths"])
+
+    def test_style_route_has_no_repo_commit_path(self):
+        # СТИЛЬ пишет в gitignored playbook manager-bot (свой контур) → в этом репо коммитить нечего
+        dec = lr.handle_lesson_task(self._task_card("звучит сухо, пиши теплее"),
+                                    append_style=lambda r: "added")
+        self.assertEqual(lr.STYLE, dec["route"])
+        self.assertEqual([], dec["commit_paths"])
+        self.assertIn("книг", dec["ack_where"].lower())      # «книгу правил»
+
+    def test_fact_route_carries_ack_material_for_planner_commit(self):
+        # ФАКТ делегируется; подтверждение уйдёт после коммита планировщика — материал уже собран
+        dec = lr.handle_lesson_task(self._task_card("депозит указал неправильно, он 3000"))
+        self.assertTrue(dec["delegate"])
+        self.assertEqual("депозит указал неправильно, он 3000", dec["ack_subject"])
+        self.assertIn("golden", dec["ack_where"].lower())
+        self.assertEqual("90210", dec["card_msg_id"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -614,17 +614,49 @@ def _exec_command(cmd, restart_fn=None, status_fn=None):
     return "failed", f"{kind}: рестарт не удался — {detail}"
 
 
+def _commit_lesson(tid, route, subject, paths):
+    """Закоммитить ЗАКОММИЧЕННЫЙ-диф урока (родитель 292, шаг 4): tracked-файлы, которые правка урока
+    изменила (НАДЗОР → docs/revizor_checklist.md). Стейджим ТОЛЬКО эти пути (без -A: служебные
+    heartbeat/*.json и чужие правки не тащим); нет реальной правки в индексе → None (коммитить нечего,
+    напр. СТИЛЬ пишет в gitignored playbook manager-bot — свой контур). → короткий хеш | None."""
+    paths = [p for p in (paths or []) if p]
+    if not paths:
+        return None
+    if not _git_call(["add", "--"] + paths):
+        return None
+    staged = _git_call(["diff", "--cached", "--name-only", "--"] + paths)
+    if not staged or not (staged[1] or "").strip():
+        return None                                  # правки нет (дедуп/уже закоммичено) → без коммита
+    msg = f"#292 урок [{route}] задача #{tid}: {(subject or '').strip()[:80]}".rstrip(": ")
+    rc = _git_call(["commit", "-m", msg, "--"] + paths)
+    if not rc or rc[0] != 0:
+        log.warning("LESSON id=%s: коммит урока не удался (%s)", tid, rc[2] if rc else "git недоступен")
+        return None
+    return _git_out(["rev-parse", "--short", "HEAD"])
+
+
+def _deliver_lesson_ack(card_msg_id, text):
+    """Доставка подтверждения «урок принят…» учителю. Реплай на карточку черновика в модер-группе
+    делает moderation_bot (шаг 5 — здесь его НЕ трогаем): дирижёр лишь ФИКСИРУЕТ готовое, уже
+    гейт-проверенное (после коммита) подтверждение с координатой карточки в журнал/лог. Fire-and-forget."""
+    log.info("LESSON ack (card msg=%s): %s", card_msg_id or "?", text)
+    _cowork(f"урок: подтверждение учителю (реплай на карточку msg={card_msg_id or '?'}) — {_clip(text)}")
+
+
 def _handle_lesson(tid, text):
-    """Обработать задачу-урок (родитель 292, шаг 3): дирижёр классифицирует замечание менеджера и
+    """Обработать задачу-урок (родитель 292, шаги 3–4): дирижёр классифицирует замечание менеджера и
     маршрутизирует. СТИЛЬ → правило в книгу правил (playbook); НАДЗОР → строка-класс в чек-лист
     ревизора; ФАКТ/ЛОГИКА → локальному планировщику (правка кода/критфактов/FAQ + ТЕСТ); неясное →
     карточка-уточнение владельцу в 1160 (не угадываем). Боевые sink'и: playbook / чек-лист / инбокс
-    1160 (_notify_critical). Bridge/таблицы/деньги не трогаем — только текст доков или делегирование."""
+    1160 (_notify_critical). Bridge/таблицы/деньги не трогаем — только текст доков или делегирование.
+    Шаг 4: применённый урок КОММИТИМ (итог = закоммиченный диф) и ТОЛЬКО после реального коммита шлём
+    подтверждение «урок принят…» учителю (инвариант «подтверждение не уходит до коммита»)."""
     dec = lesson_router.handle_lesson_task(text, notify_owner=_notify_critical)
     route = dec.get("route")
     if dec.get("delegate"):                    # ФАКТ/ЛОГИКА — правка+тест = работа думателя-планировщика
         log.info("LESSON id=%s route=%s → планировщик (правка+тест)", tid, route)
         _cowork(f"урок #{tid} [{route}] → локальному планировщику (правка+тест)")
+        # подтверждение «урок принят…» уйдёт ПОСЛЕ коммита планировщика (диф+golden) — шаг 5
         _local_dec_plan(tid, dec.get("delegate_text") or text)
         return
     status = dec.get("status") or "done"
@@ -633,6 +665,13 @@ def _handle_lesson(tid, text):
     log.info("LESSON id=%s route=%s → %s (%s)", tid, route, status, dec.get("reason"))
     _cowork(f"урок #{tid} [{route}] → {status} · {_clip(result)}")
     _notify_task(status, tid, result)
+    # Шаг 4: применённый урок → закоммитить его tracked-диф и ТОЛЬКО после реального коммита
+    # подтвердить учителю. Нет коммита (сбой/СТИЛЬ-playbook gitignored/дедуп) → подтверждение НЕ шлём.
+    if status == "done":
+        commit = _commit_lesson(tid, route, dec.get("ack_subject"), dec.get("commit_paths"))
+        ack = lesson_router.ack_after_commit(commit, dec.get("ack_subject"), dec.get("ack_where"))
+        if ack:
+            _deliver_lesson_ack(dec.get("card_msg_id"), ack)
 
 
 def process_new():

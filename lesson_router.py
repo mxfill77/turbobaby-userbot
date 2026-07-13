@@ -36,6 +36,9 @@ _LESSON_HEAD_RE = re.compile(r"^\s*\[урок:", re.IGNORECASE)
 _REMARK_RE = re.compile(r"(?ms)^Замечание:\s*(.+?)\s*(?:^Исходный черновик:|\Z)")
 _HEAD_META_RE = re.compile(r"^\s*\[урок:(?P<kind>[^\]]*?)\s+от\s+(?P<who>@?\S+)\]", re.IGNORECASE)
 _WINDOW_RE = re.compile(r"(?im)^окно диалога:\s*(.+)$")
+# Координата карточки черновика в модер-группе (шаг 4): подтверждение «урок принят…» уйдёт РЕПЛАЕМ
+# именно на неё. Билдер шага 2 кладёт строку «карточка модер-группы: msg=<id>».
+_CARD_RE = re.compile(r"(?im)^карточка модер-группы:\s*msg=(\S+)")
 
 
 def is_lesson_task(text):
@@ -54,7 +57,11 @@ def parse_lesson_task(text):
     who = (hm.group("who").strip() if hm else "")
     wm = _WINDOW_RE.search(t)
     window = (wm.group(1).strip() if wm else "")
-    return {"remark": remark, "kind": kind, "who": who, "window": window}
+    cm = _CARD_RE.search(t)
+    card_msg_id = (cm.group(1).strip() if cm else "")
+    if card_msg_id == "?":                           # плейсхолдер «неизвестна» → пусто (не реплаим в никуда)
+        card_msg_id = ""
+    return {"remark": remark, "kind": kind, "who": who, "window": window, "card_msg_id": card_msg_id}
 
 
 # ------------------------------- классификация замечания ----------------------------------
@@ -208,6 +215,73 @@ def build_owner_clarification_card(parsed, reason=""):
             "Переформулируй конкретнее (правка:/урок:/не так:) — что именно поправить.")
 
 
+# ------------------------------- подтверждение урока ПОСЛЕ коммита (шаг 4) -----------------
+# Итог задачи-урока = ЗАКОММИЧЕННЫЙ диф (правка кода/чек-листа + golden-тест на дословную фразу
+# клиента + живой реплей окна). ТОЛЬКО после реального коммита moderation_bot шлёт РЕПЛАЕМ на
+# карточку черновика в модер-группу: «урок принят: <суть> → <куда записан>, применится со следующего
+# ответа». Инвариант шага 4: подтверждение НЕ уходит до коммита — гейт ack_after_commit ниже даёт
+# текст ТОЛЬКО когда commit_ref — доказанный реальный коммит (иначе None: молчим).
+_REVIZOR_REL = os.path.join("docs", "revizor_checklist.md")   # tracked-файл; ← куда пишет НАДЗОР-урок
+# «Куда записан» для карточки-подтверждения (человекочитаемо) + tracked-файлы урока для коммита.
+_ROUTE_WHERE = {
+    STYLE: "книгу правил (слой «Выученные правила» поверх STYLE_GUIDE)",
+    SUPERVISION: "чек-лист ревизора",
+    FACT: "код/критфакты/FAQ + golden-тест",
+}
+_ROUTE_COMMIT_PATHS = {
+    SUPERVISION: [_REVIZOR_REL],   # чек-лист отслеживается git → есть что коммитить
+    STYLE: [],                     # playbook manager-bot gitignored (свой контур, читается «вживую»)
+    FACT: [],                      # диф+тест коммитит планировщик-думатель (делегирование)
+}
+
+
+def build_lesson_ack(subject, where):
+    """Текст подтверждения учителю (реплаем на карточку черновика в модер-группе) — формат родителя
+    292: «урок принят: <суть> → <куда записан>, применится со следующего ответа». Чистая функция;
+    зовётся ТОЛЬКО после коммита (см. ack_after_commit) — сам факт коммита здесь НЕ проверяет."""
+    subj = _one_line(subject) or "(см. окно диалога)"
+    dst = _one_line(where) or "книгу правил"
+    return f"✅ Урок принят: {subj} → записан в {dst}, применится со следующего ответа."
+
+
+def _default_git_verify(ref):
+    """Боевая проверка: ref — реальный коммит в REPO? `git rev-parse --verify --quiet <ref>^{commit}`
+    даёт код 0 только для существующего коммита. Без git/при сбое → False (нет доказательства)."""
+    import subprocess
+    try:
+        p = subprocess.run(["git", "rev-parse", "--verify", "--quiet", str(ref) + "^{commit}"],
+                           cwd=REPO, capture_output=True, text=True, timeout=15)
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
+def verify_commit(ref, run=None):
+    """True, если ref — ДОКАЗАННО реальный коммит (а не выдуманная строка/пустышка). Раннер
+    инъектируется (юнит без git). FAIL-SAFE: пусто/исключение → False (нет коммита → нет подтверждения)."""
+    ref = str(ref or "").strip()
+    if not ref:
+        return False
+    run = run or _default_git_verify
+    try:
+        return bool(run(ref))
+    except Exception:
+        return False
+
+
+def ack_after_commit(commit_ref, subject, where, verify=None):
+    """ГЕЙТ подтверждения урока (родитель 292, шаг 4). Вернуть текст «урок принят…» ТОЛЬКО если
+    commit_ref — доказанный реальный коммит; нет коммита / непроверяемый ref → None. Так реализован
+    инвариант «сначала коммит — потом подтверждение в модер-группу» (подтверждение НЕ уходит до
+    коммита). verify инъектируется (юнит проверяет обе ветки без git)."""
+    if not str(commit_ref or "").strip():
+        return None                                  # нет ref → коммита не было → молчим (не зовём verify)
+    verify = verify if verify is not None else verify_commit
+    if not verify(commit_ref):
+        return None
+    return build_lesson_ack(subject, where)
+
+
 # ------------------------------- обработчик задачи-урока ----------------------------------
 def handle_lesson_task(text, append_style=None, append_checklist=None, notify_owner=None):
     """Классифицировать урок и МАРШРУТИЗИРОВАТЬ. → dict:
@@ -215,7 +289,10 @@ def handle_lesson_task(text, append_style=None, append_checklist=None, notify_ow
       delegate   — True ТОЛЬКО для fact/логика (вызывающий отдаёт задачу планировщику; правка
                    кода/критфактов/FAQ + ТЕСТ — работа думателя, не наша);
       delegate_text — augmented-текст с требованием теста (для планировщика), иначе None;
-      status/result — для НЕ-delegate веток: как закрыть задачу (done/failed) и текст карточки.
+      status/result — для НЕ-delegate веток: как закрыть задачу (done/failed) и текст карточки;
+      ack_subject/ack_where/commit_paths/card_msg_id — материал для подтверждения учителю ПОСЛЕ
+                   коммита (шаг 4): суть урока, «куда записан», tracked-файлы к коммиту и координата
+                   карточки в модер-группе для реплая. Само подтверждение шлётся ТОЛЬКО после коммита.
     Побочки инъектируемы (юнит подставляет фейки); боевые дефолты — playbook / чек-лист / 1160.
     FAIL-SAFE: сбой любого sink → failed-карта (замечание НЕ теряем — видно владельцу, повторят)."""
     parsed = parse_lesson_task(text)
@@ -224,6 +301,11 @@ def handle_lesson_task(text, append_style=None, append_checklist=None, notify_ow
     a_style = append_style or _default_append_style
     a_check = append_checklist or append_checklist_class
     notify = notify_owner or _default_notify_owner
+    # Материал подтверждения (шаг 4) — одинаков для всех применённых веток; шлётся ТОЛЬКО после коммита.
+    subj = _one_line(remark)
+    card = parsed.get("card_msg_id") or ""
+    _ack = {"ack_subject": subj, "ack_where": _ROUTE_WHERE.get(route, "книгу правил"),
+            "commit_paths": list(_ROUTE_COMMIT_PATHS.get(route, [])), "card_msg_id": card}
 
     if route == SUPERVISION:
         try:
@@ -231,13 +313,14 @@ def handle_lesson_task(text, append_style=None, append_checklist=None, notify_ow
         except Exception as e:                       # noqa: BLE001 — sink не должен ронять дирижёра
             res = "error"; reason = f"{reason}; sink: {e}"
         if res == "added":
-            return {"route": route, "delegate": False, "status": "done", "reason": reason,
-                    "result": f"🔍 НАДЗОР-урок: правило дописано в чек-лист ревизора — «{_one_line(remark)}»"}
+            return {"route": route, "delegate": False, "status": "done", "reason": reason, **_ack,
+                    "result": f"🔍 НАДЗОР-урок: правило дописано в чек-лист ревизора — «{subj}»"}
         if res == "duplicate":
-            return {"route": route, "delegate": False, "status": "done", "reason": reason,
-                    "result": f"🔍 НАДЗОР-урок: такое правило в чек-листе уже есть — «{_one_line(remark)}»"}
-        return {"route": route, "delegate": False, "status": "failed", "reason": reason,
-                "result": f"⚠️ НАДЗОР-урок не записан в чек-лист (sink={res}) — повтори: «{_one_line(remark)}»"}
+            # правило уже в чек-листе (закоммичено ранее) → коммитить нечего, но урок применён
+            return {"route": route, "delegate": False, "status": "done", "reason": reason, **_ack,
+                    "commit_paths": [], "result": f"🔍 НАДЗОР-урок: такое правило в чек-листе уже есть — «{subj}»"}
+        return {"route": route, "delegate": False, "status": "failed", "reason": reason, **_ack,
+                "commit_paths": [], "result": f"⚠️ НАДЗОР-урок не записан в чек-лист (sink={res}) — повтори: «{subj}»"}
 
     if route == STYLE:
         try:
@@ -245,13 +328,13 @@ def handle_lesson_task(text, append_style=None, append_checklist=None, notify_ow
         except Exception as e:                       # noqa: BLE001
             res = "error"; reason = f"{reason}; sink: {e}"
         if res == "added":
-            return {"route": route, "delegate": False, "status": "done", "reason": reason,
-                    "result": f"📝 СТИЛЬ-урок: правило добавлено в книгу правил — «{_one_line(remark)}»"}
+            return {"route": route, "delegate": False, "status": "done", "reason": reason, **_ack,
+                    "result": f"📝 СТИЛЬ-урок: правило добавлено в книгу правил — «{subj}»"}
         if res == "duplicate":
-            return {"route": route, "delegate": False, "status": "done", "reason": reason,
-                    "result": f"📝 СТИЛЬ-урок: такое правило уже есть — «{_one_line(remark)}»"}
-        return {"route": route, "delegate": False, "status": "failed", "reason": reason,
-                "result": f"⚠️ СТИЛЬ-урок не записан (sink={res}) — повтори: «{_one_line(remark)}»"}
+            return {"route": route, "delegate": False, "status": "done", "reason": reason, **_ack,
+                    "result": f"📝 СТИЛЬ-урок: такое правило уже есть — «{subj}»"}
+        return {"route": route, "delegate": False, "status": "failed", "reason": reason, **_ack,
+                "commit_paths": [], "result": f"⚠️ СТИЛЬ-урок не записан (sink={res}) — повтори: «{subj}»"}
 
     if route == FACT:
         # ФАКТ/ЛОГИКА: правка FAQ/критфактов/кода + ТЕСТ — работа думателя. Делегируем локальному
@@ -259,7 +342,7 @@ def handle_lesson_task(text, append_style=None, append_checklist=None, notify_ow
         note = ("\n\n[дирижёр: это ФАКТ/ЛОГИКА-урок] Разложи в шаги и поправь причину в коде/"
                 "критфактах/FAQ. ОБЯЗАТЕЛЬНО добавь юнит-тест с ДОСЛОВНОЙ фразой клиента из окна "
                 "(golden-правило CLAUDE.md). Bridge/таблицы/деньги НЕ трогай.")
-        return {"route": route, "delegate": True, "reason": reason,
+        return {"route": route, "delegate": True, "reason": reason, **_ack,
                 "delegate_text": str(text or "") + note,
                 "status": "done", "result": "🛠 ФАКТ/ЛОГИКА-урок → локальному планировщику (правка+тест)"}
 
