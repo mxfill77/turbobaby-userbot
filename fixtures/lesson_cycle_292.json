@@ -1,0 +1,139 @@
+{
+  "_doc": "Фикстура полного цикла урока (родитель 292, шаг 5/7). Каждый сценарий — ЖИВОЙ реплай-обучения менеджера на карточку черновика в модер-группе, прогоняемый test_lesson_cycle.py через РЕАЛЬНЫЙ конвейер moderation_core → lesson_router → подтверждение. Golden-правило CLAUDE.md: в card.draft и remark — дословные формулировки из живого окна, не идеализированные. Ожидания (expect) — golden: чему обязан быть равен исход цикла. Побочки (enqueue/checklist/notify/commit) в тесте инъектируются фейками — боевых доков/очереди/1160 не касаемся.",
+  "teachers": ["filipp", "filipp_alt", "danya", "dasha"],
+  "cycles": [
+    {
+      "name": "fact_price_nmax",
+      "note": "ФАКТ/ЛОГИКА: неверная цена → делегирование планировщику с ТРЕБОВАНИЕМ golden-теста дословной фразой клиента; подтверждение уйдёт ПОСЛЕ его коммита (диф+golden).",
+      "card": {
+        "id": 7,
+        "client_id": 555,
+        "client_ref": "@petya",
+        "draft": "Аренда Nmax от 1200฿/сутки, беру?",
+        "card_msg_id": 90210
+      },
+      "client_phrase": "Сколько стоит нмакс на сутки?",
+      "teacher": "danya",
+      "reply_text": "не так: суточный тариф на Nmax 1500, а не 1200 — цена неверная",
+      "expect": {
+        "decision": "lesson",
+        "queued": true,
+        "is_lesson_task": true,
+        "route": "fact",
+        "delegate": true,
+        "task_text_has": ["суточный тариф на Nmax 1500", "Аренда Nmax от 1200฿/сутки", "555", "@petya", "#7", "@danya", "msg=90210"],
+        "delegate_text_has": ["юнит-тест", "ДОСЛОВНОЙ фразой клиента", "Bridge"],
+        "commit_paths": [],
+        "card_msg_id": "90210",
+        "ack_after_commit_has": ["Урок принят", "суточный тариф на Nmax 1500", "golden", "применится со следующего ответа"]
+      }
+    },
+    {
+      "name": "supervision_fake_price",
+      "note": "НАДЗОР: «ревизор должен ловить…» → новая строка-класс в чек-лист ревизора (tracked-файл = реальный диф), подтверждение ПОСЛЕ коммита чек-листа.",
+      "card": {
+        "id": 12,
+        "client_id": 777,
+        "client_ref": "@masha",
+        "draft": "Есть Aerox за 900฿, свободен на ваши даты",
+        "card_msg_id": 90310
+      },
+      "teacher": "filipp",
+      "reply_text": "урок: ревизор должен ловить выдуманную цену, которой нет в quote",
+      "checklist_seed": "Найди нарушения:\n- [класс а] числа не из quote;\n- [класс б] чужая модель;\n",
+      "expect": {
+        "decision": "lesson",
+        "queued": true,
+        "is_lesson_task": true,
+        "route": "supervision",
+        "delegate": false,
+        "status": "done",
+        "checklist_diff_has": ["[класс в]", "выдуманную цену"],
+        "commit_paths_rel": "docs/revizor_checklist.md",
+        "card_msg_id": "90310",
+        "ack_after_commit_has": ["Урок принят", "выдуманную цену", "чек-лист", "применится со следующего ответа"]
+      }
+    },
+    {
+      "name": "style_dry_tone",
+      "note": "СТИЛЬ: тон/канцелярит → правило в книгу правил (playbook manager-bot, gitignored, СВОЙ контур). В ЭТОМ репо коммитить нечего → подтверждение в модер-группу дирижёр НЕ шлёт (гейт ack: нет коммита → None).",
+      "card": {
+        "id": 20,
+        "client_id": 888,
+        "client_ref": "@kolya",
+        "draft": "Уведомляем вас о наличии транспортного средства для аренды.",
+        "card_msg_id": 90410
+      },
+      "teacher": "dasha",
+      "reply_text": "правка: звучит слишком сухо и по-канцелярски, пиши теплее и по-человечески",
+      "expect": {
+        "decision": "lesson",
+        "queued": true,
+        "is_lesson_task": true,
+        "route": "style",
+        "delegate": false,
+        "status": "done",
+        "style_rule_has": "по-канцелярски",
+        "card_msg_id": "90410",
+        "commit_paths": [],
+        "ack_withheld": true
+      }
+    },
+    {
+      "name": "unclear_redo",
+      "note": "НЕЯСНОЕ: размытое «переделай» — сигнала нет → НЕ угадываем, карточка-уточнение ВЛАДЕЛЬЦУ в 1160; подтверждение в модер-группу не шлём.",
+      "card": {
+        "id": 33,
+        "client_id": 999,
+        "client_ref": "@sveta",
+        "draft": "Здравствуйте! Чем помочь?",
+        "card_msg_id": 90510
+      },
+      "teacher": "danya",
+      "reply_text": "правка: плохо, переделай",
+      "expect": {
+        "decision": "lesson",
+        "queued": true,
+        "is_lesson_task": true,
+        "route": "unclear",
+        "delegate": false,
+        "status": "done",
+        "owner_card_has": ["Неясный урок", "плохо, переделай", "@danya"],
+        "owner_delivered": true,
+        "ack_withheld": true
+      }
+    }
+  ],
+  "guards": [
+    {
+      "name": "trigger_pravka",
+      "reply_text": "правка: не пиши цену первой",
+      "teacher": "danya",
+      "expect": {"decision": "lesson", "kind": "правка", "remark": "не пиши цену первой", "queued": true}
+    },
+    {
+      "name": "trigger_urok_caps_spaces",
+      "reply_text": "  УРОК:  всегда уточняй даты  ",
+      "teacher": "filipp",
+      "expect": {"decision": "lesson", "kind": "урок", "remark": "всегда уточняй даты", "queued": true}
+    },
+    {
+      "name": "trigger_ne_tak",
+      "reply_text": "не так: тон слишком сухой",
+      "teacher": "dasha",
+      "expect": {"decision": "lesson", "kind": "не так", "remark": "тон слишком сухой", "queued": true}
+    },
+    {
+      "name": "not_a_trigger_passes_through",
+      "reply_text": "сделай короче",
+      "teacher": "danya",
+      "expect": {"decision": "not_lesson", "queued": false}
+    },
+    {
+      "name": "stranger_denied_politely",
+      "reply_text": "правка: пиши мягче",
+      "teacher": "stranger",
+      "expect": {"decision": "denied", "queued": false, "card_has": "только Филипп"}
+    }
+  ]
+}
