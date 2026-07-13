@@ -102,12 +102,25 @@ def _api(method, payload):
         return False, {"ok": False, "description": type(e).__name__}
 
 
-def send(text):
-    """DM Филиппу; при неудаче — фолбэк в тему 205. Возвращает (channel, ok)."""
+def _chain_markup(pid):
+    """Инлайн-клавиатура управления цепью дирижёра: [⏹ Стоп цепи][📊 Статус цепи]. callback_data
+    «chain:stop:<pid>» / «chain:status:<pid>» слушает pc_agent (owner-gate: только владелец)."""
+    return {"inline_keyboard": [[
+        {"text": "⏹ Стоп цепи", "callback_data": f"chain:stop:{pid}"},
+        {"text": "📊 Статус цепи", "callback_data": f"chain:status:{pid}"},
+    ]]}
+
+
+def send(text, reply_markup=None):
+    """DM Филиппу; при неудаче — фолбэк в тему 205. Возвращает (channel, ok).
+    reply_markup (dict инлайн-клавиатуры) — необязательные кнопки; едут в обоих каналах."""
     if not TOKEN:
         _log.info("нет AGENT_BOT_TOKEN — уведомление пропущено")
         return ("none", False)
-    ok, resp = _api("sendMessage", {"chat_id": DM_CHAT_ID, "text": text})
+    dm = {"chat_id": DM_CHAT_ID, "text": text}
+    if reply_markup is not None:
+        dm["reply_markup"] = reply_markup
+    ok, resp = _api("sendMessage", dm)
     if ok:
         _log.info(f"DM ok → {DM_CHAT_ID}")
         return ("DM", True)
@@ -115,8 +128,10 @@ def send(text):
         f"DM не прошёл (code={resp.get('error_code')} {str(resp.get('description',''))[:80]}) "
         f"— фолбэк в тему {HQ_THREAD_ID}"
     )
-    ok2, resp2 = _api("sendMessage",
-                      {"chat_id": HQ_CHAT_ID, "message_thread_id": HQ_THREAD_ID, "text": text})
+    fb = {"chat_id": HQ_CHAT_ID, "message_thread_id": HQ_THREAD_ID, "text": text}
+    if reply_markup is not None:
+        fb["reply_markup"] = reply_markup
+    ok2, resp2 = _api("sendMessage", fb)
     if ok2:
         _log.info(f"фолбэк 205 ok → {HQ_CHAT_ID}/{HQ_THREAD_ID}")
         return ("205", True)
@@ -173,6 +188,13 @@ def main():
             text = " ".join(args[1:]).strip() or "🔔 Оркестратор: критический инцидент"
             channel, ok = send_critical(text)
             _log.info(f"итог(критич): channel={channel} ok={ok} | {text[:90]}")
+            sys.exit(0)
+        if args and args[0] == "--card":
+            # карточка управления цепью дирижёра: текст + кнопки [⏹ Стоп цепи][📊 Статус цепи]
+            pid = args[1] if len(args) > 1 else ""
+            text = " ".join(args[2:]).strip() or f"🧩 Цепь #{pid}"
+            channel, ok = send(text, _chain_markup(pid))
+            _log.info(f"итог(карточка цепи {pid}): channel={channel} ok={ok} | {text[:90]}")
             sys.exit(0)
         if args and args[0] == "--hook":
             kind = args[1] if len(args) > 1 else ""

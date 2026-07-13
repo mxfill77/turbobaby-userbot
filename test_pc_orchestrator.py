@@ -70,16 +70,19 @@ class FakeBridge:
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self._save = (o.bc, o.run_claude, o._notify, o._cowork, o._stopped, o._selfheal_on)
+        self._save = (o.bc, o.run_claude, o._notify, o._cowork, o._stopped, o._selfheal_on,
+                      o._notify_chain_card)
         self.fb = FakeBridge()
         o.bc = self.fb
         o._notify = lambda *a, **k: None
         o._cowork = lambda *a, **k: None
         o._stopped = lambda: False
         o._selfheal_on = lambda: False        # существующие тесты — прежнее поведение (флаг off)
+        o._notify_chain_card = lambda *a, **k: None   # не спавним dispatch_notify в тестах
 
     def tearDown(self):
-        (o.bc, o.run_claude, o._notify, o._cowork, o._stopped, o._selfheal_on) = self._save
+        (o.bc, o.run_claude, o._notify, o._cowork, o._stopped, o._selfheal_on,
+         o._notify_chain_card) = self._save
 
     def _claude(self, rc=0, out="готово\nRESULT: готово", err="", raise_timeout=False, write_marker=False):
         def fake(prompt, timeout, cwd, env):
@@ -4133,6 +4136,120 @@ class TestNotifyHygiene(unittest.TestCase):
         self.assertIn("--critical", captured["argv"])
         self.assertIn("тест-инцидент", captured["argv"])
         self.assertIn(o.DNOTIFY, captured["argv"])
+
+
+class TestChainControl(TestLocalDecChain):
+    """Кнопки управления цепью (стоп/статус) из карточки дирижёра. Механика стопа = вмешательство
+    21:05 13.07: текущий шаг доигрывает, дальше не релизим; сводка с нотой «остановлено владельцем».
+    Осиротевших шагов нет, статус честный, регресс релиза цел."""
+
+    def _sum_result(self, pid):
+        s = self._summaries(pid)
+        return s[0]["result"] if s else ""
+
+    # --- СТОП ---
+
+    def test_stop_posts_summary_with_owner_note(self):
+        pid = self._mk_parent_done(["1. A", "2. B", "3. C"])
+        self._mk_step(pid, 1, 3, status="done", text="A", result="RESULT: сделал A")
+        ok, msg = o._loc_stop_chain(pid)
+        self.assertTrue(ok)
+        self.assertIn(f"#{pid}", msg)
+        self.assertEqual(len(self._summaries(pid)), 1)
+        self.assertIn("остановлено владельцем", self._sum_result(pid))  # нота restart-proof в тексте
+
+    def test_stop_no_next_release_even_after_restart(self):
+        # сводка есть в очереди → тик цепи короткозамкнут ДО релиза, даже когда память процесса чиста
+        pid = self._mk_parent_done(["1. A", "2. B", "3. C"])
+        self._mk_step(pid, 1, 3, status="done", text="A")
+        self.assertTrue(o._loc_stop_chain(pid)[0])
+        o._loc_summarized.clear()                       # имитируем рестарт демона (память пуста)
+        o.process_local_chains()
+        news = [t for t in self._news() if str(t.get("task_text") or "").startswith("[шаг 2/3")]
+        self.assertEqual(news, [], "после стопа релизнулся следующий шаг (осиротил бы цепь)")
+
+    def test_stop_current_step_finishes_no_orphan(self):
+        # текущий шаг in_progress на момент стопа → доигрывает; его done НЕ релизит следующий
+        pid = self._mk_parent_done(["1. A", "2. B", "3. C"])
+        step2 = self._mk_step(pid, 2, 3, status="in_progress", text="B")
+        self._mk_step(pid, 1, 3, status="done", text="A")
+        self.assertTrue(o._loc_stop_chain(pid)[0])
+        o._loc_summarized.clear()
+        self.fb.tasks[step2]["status"] = "done"         # текущий шаг доработал сам
+        self.fb.tasks[step2]["result"] = "RESULT: доделал B"
+        o.process_local_chains()
+        news = [t for t in self._news() if str(t.get("task_text") or "").startswith("[шаг 3/3")]
+        self.assertEqual(news, [], "done текущего шага после стопа релизнул следующий")
+        self.assertEqual(len(self._summaries(pid)), 1, "сводка задублировалась")
+
+    def test_stop_idempotent_when_already_summarized(self):
+        pid = self._mk_parent_done(["1. A", "2. B"])
+        self._mk_step(pid, 1, 2, status="done", text="A")
+        self.assertTrue(o._loc_stop_chain(pid)[0])
+        n_before = len(self._summaries(pid))
+        o._loc_summarized.clear()                       # память сброшена, но сводка в очереди
+        ok, msg = o._loc_stop_chain(pid)
+        self.assertTrue(ok)
+        self.assertIn("уже закрыта", msg)
+        self.assertEqual(len(self._summaries(pid)), n_before, "второй стоп задублировал сводку")
+
+    def test_stop_unknown_chain_not_found(self):
+        ok, msg = o._loc_stop_chain(99999)
+        self.assertFalse(ok)
+        self.assertIn("не найдена", msg)
+
+    def test_stop_bridge_unreadable(self):
+        with mock.patch.object(o, "_loc_fetch_items", lambda: None):
+            ok, msg = o._loc_stop_chain(7)
+        self.assertFalse(ok)
+        self.assertIn("недоступна", msg)
+
+    # --- СТАТУС ---
+
+    def test_status_in_progress_honest(self):
+        pid = self._mk_parent_done(["1. A", "2. B", "3. C", "4. D", "5. E"])
+        self._mk_step(pid, 1, 5, status="done", text="A", result="RESULT: готово A")
+        self._mk_step(pid, 2, 5, status="in_progress", text="B")
+        st = o._loc_chain_status(pid)
+        self.assertIn("шаг 2/5", st)                    # текущий шаг честно из очереди
+        self.assertIn("Последний done: шаг 1/5", st)
+        self.assertIn("готово A", st)
+
+    def test_status_no_done_yet(self):
+        pid = self._mk_parent_done(["1. A", "2. B"])
+        self._mk_step(pid, 1, 2, status="in_progress", text="A")
+        st = o._loc_chain_status(pid)
+        self.assertIn("шаг 1/2", st)
+        self.assertIn("Последний done: пока нет", st)
+
+    def test_status_after_stop_shows_closed(self):
+        pid = self._mk_parent_done(["1. A", "2. B"])
+        self._mk_step(pid, 1, 2, status="done", text="A", result="RESULT: A")
+        o._loc_stop_chain(pid)
+        st = o._loc_chain_status(pid)
+        self.assertIn("закрыта", st)
+        self.assertIn("Последний done: шаг 1/2", st)
+
+    def test_status_unknown_chain(self):
+        self.assertIn("не найдена", o._loc_chain_status(99999))
+
+    # --- РЕГРЕСС РЕЛИЗА: стоп одной цепи не глушит другую ---
+
+    def test_release_regression_other_chain_unaffected(self):
+        stopped = self._mk_parent_done(["1. A", "2. B"])
+        self._mk_step(stopped, 1, 2, status="done", text="A")
+        live = self._mk_parent_done(["1. X", "2. Y"])
+        self._mk_step(live, 1, 2, status="done", text="X")
+        self.assertTrue(o._loc_stop_chain(stopped)[0])
+        o._loc_summarized.clear()
+        o.process_local_chains()
+        # остановленная НЕ релизит шаг 2; живая — релизит штатно
+        stopped_next = [t for t in self._news()
+                        if str(t.get("task_text") or "").startswith(f"[шаг 2/2 родитель {stopped}]")]
+        live_next = [t for t in self._news()
+                     if str(t.get("task_text") or "").startswith(f"[шаг 2/2 родитель {live}]")]
+        self.assertEqual(stopped_next, [])
+        self.assertEqual(len(live_next), 1)
 
 
 if __name__ == "__main__":

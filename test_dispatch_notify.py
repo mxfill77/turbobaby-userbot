@@ -56,5 +56,56 @@ class TestSendCritical(unittest.TestCase):
         self.assertEqual(self.calls, [])                # без токена — ни одного вызова API
 
 
+class TestChainCard(unittest.TestCase):
+    """Карточка управления цепью: send() прокидывает reply_markup, _chain_markup даёт две кнопки
+    с callback_data «chain:stop|status:<pid>» (их слушает pc_agent)."""
+
+    def setUp(self):
+        self._save = (dn._api, dn.TOKEN)
+        self.calls = []
+        dn.TOKEN = "test-token"
+
+    def tearDown(self):
+        (dn._api, dn.TOKEN) = self._save
+
+    def test_markup_has_stop_and_status_buttons(self):
+        mk = dn._chain_markup(42)
+        row = mk["inline_keyboard"][0]
+        datas = [b["callback_data"] for b in row]
+        self.assertIn("chain:stop:42", datas)
+        self.assertIn("chain:status:42", datas)
+        self.assertIn("⏹", row[0]["text"] + row[1]["text"])
+        self.assertIn("📊", row[0]["text"] + row[1]["text"])
+
+    def test_send_forwards_reply_markup_to_dm(self):
+        def api(method, payload):
+            self.calls.append(payload)
+            return True, {"ok": True}
+        dn._api = api
+        channel, ok = dn.send("🧩 план", dn._chain_markup(7))
+        self.assertEqual((channel, ok), ("DM", True))
+        self.assertEqual(self.calls[0]["chat_id"], dn.DM_CHAT_ID)
+        self.assertEqual(self.calls[0]["reply_markup"], dn._chain_markup(7))
+
+    def test_send_without_markup_omits_key(self):
+        def api(method, payload):
+            self.calls.append(payload)
+            return True, {"ok": True}
+        dn._api = api
+        dn.send("обычный текст")
+        self.assertNotIn("reply_markup", self.calls[0])
+
+    def test_card_markup_forwarded_on_forum_fallback(self):
+        # DM падает → кнопки едут и в тему-фолбэк
+        def api(method, payload):
+            self.calls.append(payload)
+            ok = "message_thread_id" in payload
+            return ok, {"ok": ok, "error_code": 403}
+        dn._api = api
+        dn.send("🧩 план", dn._chain_markup(9))
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.calls[1]["reply_markup"], dn._chain_markup(9))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

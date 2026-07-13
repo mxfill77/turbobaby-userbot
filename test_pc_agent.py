@@ -162,5 +162,25 @@ class TestSupervisionLabel(unittest.TestCase):
         self.assertNotIn("агентом", txt)
 
 
+class TestChainCallback(unittest.TestCase):
+    """Кнопки управления цепью дирижёра: разбор callback_data и owner-gate (только владелец)."""
+
+    def test_parse_stop_and_status(self):
+        self.assertEqual(a._chain_cb_parse("chain:stop:42"), ("stop", "42"))
+        self.assertEqual(a._chain_cb_parse("chain:status:7"), ("status", "7"))
+
+    def test_parse_rejects_foreign_callback(self):
+        self.assertIsNone(a._chain_cb_parse("m:12:yes"))     # callback модербота — не наш
+        self.assertIsNone(a._chain_cb_parse("chain:kill:1"))  # неизвестное действие
+        self.assertIsNone(a._chain_cb_parse("chain:stop:abc"))
+        self.assertIsNone(a._chain_cb_parse(""))
+        self.assertIsNone(a._chain_cb_parse(None))
+
+    def test_owner_gate(self):
+        self.assertTrue(a._chain_cb_authorized(a.ALLOWED_USER_ID))
+        self.assertFalse(a._chain_cb_authorized(a.ALLOWED_USER_ID + 1))
+        self.assertFalse(a._chain_cb_authorized(None))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

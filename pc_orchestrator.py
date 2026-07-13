@@ -218,6 +218,16 @@ def _notify(text):
         log.warning("пуш не отправлен: %s", e)
 
 
+def _notify_chain_card(pid, text):
+    """Карточка цепи владельцу с кнопками [⏹ Стоп цепи][📊 Статус цепи] (dispatch_notify --card,
+    fire-and-forget). callback слушает pc_agent (owner-gate). Сбой доставки тик демона не роняет."""
+    try:
+        subprocess.Popen([VENV_PY, DNOTIFY, "--card", str(pid), str(text)], cwd=REPO,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    except Exception as e:
+        log.warning("карточка цепи не отправлена (pid=%s): %s", pid, e)
+
+
 def _notify_critical(text):
     """Критический инцидент КОНТУРА (доказанная смерть демона / 3-смерти-halt клиент-бота /
     halt-слепота контур-вотчдога) → тема Инбокс HQ-форума (INBOX_TOPIC_ID=1160); личка Филиппа —
@@ -1387,6 +1397,8 @@ def _local_dec_plan(tid, text):
     log.info("pcloc-dec: id=%s план из %s шагов построен (done), шаг 1 релизнут", tid, len(steps))
     _cowork(f"родитель #{tid} (pcloc-dec) → done: план {len(steps)} шагов, шаг 1 в очереди · {_clip(result)}")
     _notify_task("done", tid, f"декомпозиция: план из {len(steps)} шагов, шаг 1 в очереди")
+    _notify_chain_card(tid, f"🧩 План цепи #{tid}: {len(steps)} шагов — исполняю по одному, "
+                            "шаг 1 в очереди. Управляй кнопками ниже.")
 
 
 # ---- sequential-релиз и надзор локальной цепи (шаг 3/7 родителя 185) ----
@@ -1551,14 +1563,19 @@ def _loc_summary_counts(steps):
     return rows, n_done, total
 
 
-def _loc_summary_text(pid, steps):
-    """Сводка локальной цепи из переданных шагов (зеркало _pc_summary_text VPS)."""
+def _loc_summary_text(pid, steps, note=None):
+    """Сводка локальной цепи из переданных шагов (зеркало _pc_summary_text VPS). note — нота
+    в шапке (напр. «⏹ остановлено владельцем»): она ЖЕ уходит в task_text/result сводки, поэтому
+    причина стопа restart-proof читается из очереди, без памяти процесса."""
     rows, n_done, total = _loc_summary_counts(steps)
     if not rows:
-        return f"🧩 Сводка декомпозиции (родитель {pid}, локальный дирижёр): шагов не найдено (очередь пуста?)"
+        base = f"🧩 Сводка декомпозиции (родитель {pid}, локальный дирижёр): "
+        return (base + (f"0 шагов done — {note}" if note else "шагов не найдено (очередь пуста?)"))[:RESULT_MAX]
     head = f"🧩 Сводка декомпозиции (родитель {pid}, локальный дирижёр): {n_done}/{total} шагов done"
     fin = _loc_adapt_finish.get(pid)
-    if fin:
+    if note:
+        head += f", {note}"
+    elif fin:
         head += f", 🏁 завершено досрочно: {fin}"
     elif n_done < len(rows):
         head += ", есть упавшие/пропущенные"
@@ -1590,6 +1607,75 @@ def _loc_post_summary(pid, steps):
     _loc_summarized.add(pid)
     _cowork(f"сводка родитель {pid}: {n_done}/{total} done")  # NOTE в журнал в момент постановки
     log.info("pcloc-dec: сводка родителя %s → задача %s (bridge_ok=%s)", pid, sid, cm.get("ok"))
+
+
+# ---- ручное управление цепью из карточки дирижёра (кнопки, owner-gate у pc_agent) ----
+# Механика «стоп» = вмешательство 21:05 13.07: текущий шаг доигрывает сам, дальше НЕ релизим.
+# Реализуется ТЕМ ЖЕ штатным путём, что halt/finish — постановкой сводки «[сводка родитель pid]»:
+# _loc_chain_tick проверяет _loc_summary_exists ДО _loc_after_done/_loc_after_fail, поэтому наличие
+# сводки короткозамыкает и релиз следующего шага, и самопочинку/адаптацию. Осиротевших шагов нет:
+# единственный живой шаг цепи (sequential — их максимум один) доводит надзор демона до терминала,
+# а тик, увидев сводку, релиз не делает. Нота «остановлено владельцем» лежит в тексте сводки →
+# restart-proof (причина стопа читается из очереди, без памяти процесса).
+
+def _loc_stop_chain(pid, by="владельцем"):
+    """Стоп цепи pid по кнопке владельца → (ok: bool, человекочит. текст). Идемпотентно: цепь уже
+    закрыта (сводка есть) → ничего не постим. Не нашли цепь → ok=False. Читаем очередь ЦЕЛИКОМ
+    (частичная картина опаснее ожидания — как весь надзор)."""
+    pid = int(pid)
+    items = _loc_fetch_items()
+    if items is None:
+        return False, f"цепь #{pid}: очередь Bridge недоступна — стоп не выполнен, повтори позже."
+    steps = _loc_group_chains(items).get(pid)
+    if not steps and pid not in _loc_parent_status(items):
+        return False, f"цепь #{pid} не найдена в очереди — стоп не требуется (возможно, уже закрыта)."
+    if _loc_summary_exists(pid):
+        _loc_summarized.add(pid)
+        return True, f"цепь #{pid} уже закрыта (сводка есть) — стоп не требуется."
+    note = f"⏹ остановлено {by}"
+    steps = steps or []
+    text = _loc_summary_text(pid, steps, note=note)
+    r = _loc_enqueue(f"[сводка родитель {pid}] {note}")
+    if not r.get("ok"):
+        log.warning("pcloc-dec: стоп-сводка родителя %s не встала (%s)", pid, r.get("error"))
+        return False, f"цепь #{pid}: не удалось поставить сводку-стоп ({r.get('error')}) — повтори."
+    sid = r.get("id")
+    bc.claim_task(sid)
+    bc.complete_task(sid, "done", text)
+    _loc_summarized.add(pid)
+    _rows, n_done, total = _loc_summary_counts(steps)
+    _cowork(f"цепь #{pid} остановлена ({by}): {n_done}/{total} done, следующий шаг не релизится")
+    log.info("pcloc-dec: цепь %s остановлена (%s) → сводка id=%s", pid, by, sid)
+    return True, (f"⏹ цепь #{pid} остановлена ({by}): {n_done}/{total} шагов done, дальше не релизится. "
+                  "Текущий шаг (если идёт) доработает сам.")
+
+
+def _loc_chain_status(pid):
+    """Честный статус цепи pid по снимку очереди → человекочит. строка «шаг i/N, последний done: …».
+    Никакой памяти процесса — только очередь."""
+    pid = int(pid)
+    items = _loc_fetch_items()
+    if items is None:
+        return f"цепь #{pid}: очередь Bridge недоступна — статус неизвестен, повтори позже."
+    steps = _loc_group_chains(items).get(pid) or []
+    if not steps and pid not in _loc_parent_status(items):
+        return f"цепь #{pid} не найдена в очереди (нет шагов и родителя — возможно, уже закрыта)."
+    active = {c["pid"]: c["label"] for c in _loc_active_chains(items)}
+    rows, n_done, total = _loc_summary_counts(steps)
+    done_rows = [r for r in rows if str(r[2].get("status")) == "done"]
+    if done_rows:
+        di, dn, dit = done_rows[-1]
+        first = (str(dit.get("result") or "").strip().splitlines() or ["(пусто)"])[0][:200]
+        last_done = f"шаг {di}/{dn}: {first}"
+    else:
+        last_done = "пока нет"
+    if pid in active:
+        head = f"📊 цепь #{pid}: {active[pid]} (в работе), done {n_done}"
+    elif _loc_summary_exists(pid):
+        head = f"📊 цепь #{pid}: закрыта, {n_done}/{total} шагов done"
+    else:
+        head = f"📊 цепь #{pid}: активных шагов нет, {n_done}/{total} шагов done"
+    return f"{head}. Последний done: {last_done}."
 
 
 def _parse_numbered(text):
@@ -1650,6 +1736,8 @@ def _loc_release(pid, j, total, text, k=0):
                     j, total, pid, r.get("error"))
         return False
     log.info("pcloc-dec: шаг %s/%s родителя %s релизнут (id %s, lane=pc)", j, total, pid, r.get("id"))
+    _notify_chain_card(pid, f"▶️ Цепь #{pid}: шаг {j}/{total} в очереди."
+                            + (f" (коррекция плана {k})" if k else ""))
     return True
 
 
@@ -3522,6 +3610,24 @@ if __name__ == "__main__":
         except Exception:
             pass
         print("рубильник снят")
+    elif arg == "--chain-stop":
+        # стоп цепи из карточки дирижёра (pc_agent зовёт субпроцессом после owner-gate)
+        pid = sys.argv[2] if len(sys.argv) > 2 else ""
+        try:
+            ok, msg = _loc_stop_chain(int(pid))
+        except Exception as e:
+            print(f"цепь #{pid}: стоп не выполнен ({e})")
+            sys.exit(1)
+        print(msg)
+        sys.exit(0 if ok else 1)
+    elif arg == "--chain-status":
+        # честный статус цепи из карточки дирижёра
+        pid = sys.argv[2] if len(sys.argv) > 2 else ""
+        try:
+            print(_loc_chain_status(int(pid)))
+        except Exception as e:
+            print(f"цепь #{pid}: статус недоступен ({e})")
+            sys.exit(1)
     elif arg == "--enqueue":
         # ПРЯМОЙ КАНАЛ (этап 1): инъекция одиночки lane=pc прямо в очередь Bridge, минуя splinter.
         # Демон подхватит обычным поллингом. Работает даже при лежащем Splinter/девботе.

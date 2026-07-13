@@ -34,6 +34,7 @@ userbot_listen.py делается фиксированным CIM-запросо
 
 import os
 import io
+import re
 import json
 import time
 import asyncio
@@ -45,7 +46,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.error import NetworkError, TimedOut
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram.ext import (ApplicationBuilder, MessageHandler, CallbackQueryHandler,
+                          filters, ContextTypes)
 
 import selfupdate_gate  # гейт самообновления (проверка нового кода перед рестартом)
 
@@ -565,6 +567,77 @@ def unknown_command_reply(raw_text):
 HELP = unknown_command_reply("")
 
 
+# ===================== кнопки управления цепями дирижёра =====================
+# Карточки цепи (dispatch_notify --card) несут кнопки [⏹ Стоп цепи][📊 Статус цепи] с
+# callback_data «chain:stop:<pid>» / «chain:status:<pid>». Тот же бот-токен (AGENT_BOT_TOKEN),
+# что шлёт карточки, ловит и их callback'и — обрабатываем ЗДЕСЬ. Действие исполняет демон
+# pc_orchestrator (субпроцессом, свой канал к Bridge), агент лишь роутит + гейтит владельца.
+
+CHAIN_CB_RE = re.compile(r"^chain:(stop|status):(\d+)$")
+
+
+def _chain_cb_parse(data):
+    """callback_data → (action, pid) | None (не наш callback)."""
+    m = CHAIN_CB_RE.match(str(data or ""))
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _chain_cb_authorized(uid):
+    """Кнопки цепи слушаются ТОЛЬКО от владельца (ALLOWED_USER_ID) — как и команды темы 205."""
+    return uid == ALLOWED_USER_ID
+
+
+def _chain_cli(action, pid):
+    """Действие над цепью через демон-CLI (свой канал к Bridge): pc_orchestrator --chain-<action>
+    <pid> → текст ответа. Демон читает/пишет очередь сам; агент только показывает результат."""
+    if not VENV_PY.exists():
+        return f"цепь #{pid}: не нашёл python venv ({VENV_PY})."
+    try:
+        r = subprocess.run(
+            [str(VENV_PY), str(REPO_DIR / "pc_orchestrator.py"), f"--chain-{action}", str(pid)],
+            capture_output=True, text=True, timeout=90, cwd=str(REPO_DIR),
+        )
+        out = (r.stdout or "").strip() or (r.stderr or "").strip()
+        return out or f"цепь #{pid}: пустой ответ демона ({action})."
+    except Exception as e:
+        return f"цепь #{pid}: ошибка {action} ({type(e).__name__}: {e})."
+
+
+async def on_chain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажатие кнопки цепи. Гейт: ТОЛЬКО владелец. Стоп/статус исполняет демон, ответ — в чат карточки."""
+    q = update.callback_query
+    if q is None:
+        return
+    parsed = _chain_cb_parse(q.data)
+    if parsed is None:
+        return                                   # чужой callback (напр. модербот) — не наш
+    uid = q.from_user.id if q.from_user else None
+    if not _chain_cb_authorized(uid):
+        alog.warning(f"chain-callback отклонён: id {uid}")
+        try:
+            await q.answer("⛔ нет прав", show_alert=True)
+        except Exception:
+            pass
+        return
+    action, pid = parsed
+    alog.info(f"chain-callback: {action} цепь {pid}")
+    try:
+        await q.answer("⏹ останавливаю цепь…" if action == "stop" else "📊 читаю статус…")
+    except Exception:
+        pass
+    reply = await asyncio.to_thread(_chain_cli, action, pid)
+    msg = q.message
+    if msg is None:
+        return
+    kwargs = {}
+    if getattr(msg, "message_thread_id", None):  # форум-фолбэк карточки → отвечаем в ту же тему
+        kwargs["message_thread_id"] = msg.message_thread_id
+    try:
+        await context.bot.send_message(msg.chat_id, reply, **kwargs)
+    except Exception:
+        alog.exception("chain-callback: не смог отправить ответ")
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat = update.effective_chat
@@ -834,6 +907,7 @@ def main():
 
         app = ApplicationBuilder().token(AGENT_BOT_TOKEN).build()
         app.add_handler(MessageHandler(filters.TEXT & ~filters.UpdateType.EDITED, on_message))
+        app.add_handler(CallbackQueryHandler(on_chain_callback))  # кнопки цепей дирижёра (owner-gate)
         app.add_error_handler(on_error)  # ФИКС 1: сетевые ошибки не роняют агента
         # cowork-синк через JobQueue (канонично, без create_task-мины). Планируем ТОЛЬКО при кредах
         # и наличии JobQueue (иначе просто отключаем — НЕ роняем агента).
