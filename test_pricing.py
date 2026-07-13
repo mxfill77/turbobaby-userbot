@@ -789,5 +789,124 @@ class TestClass0ModelResolveAndTerm(unittest.TestCase):
         self.assertNotIn("927", note)
 
 
+class TestStep2ModelTermQuoteDepositPercent(unittest.TestCase):
+    """Шаг 2/7 (родитель #253): названы модель+срок → черновик ОБЯЗАН нести живой quote ИМЕННО
+    этой модели на этот срок С ЕЁ ДЕПОЗИТОМ; карточка чужой модели блокируется пост-чеком; вопрос
+    «сколько будет N%» → процент от суммы ЭТОГО расчёта (код, не LLM). Голдены — ДОСЛОВНЫЕ фразы
+    клиента + парафразы (правило-класс CLAUDE.md). Bridge замокан: XSR155 (472฿/день, депозит 7000,
+    text БЕЗ депозита — проверяем, что депозит дописывает КОД) и чужой MT-03 (927฿/день, депозит
+    15000) в одном парке; XSR900 в парк НЕ кладём (иначе серия неоднозначна)."""
+    TODAY = datetime.date(2026, 7, 13)
+    FLEET = ["XSR 155СС BLACK PHUKET 8949", "XSR 155СС GREEN",
+             "MT-03 300СС BLUE PHUKET 5068", "NMAX 155СС BLACK 8952"]
+
+    def setUp(self):
+        pricing._FLEET_CACHE.update(ts=0.0, data=None)
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+        self._pa, self._bu, self._bt = pricing.PRICING_ACTION, pricing.BRIDGE_URL, pricing.BRIDGE_TOKEN
+        pricing.PRICING_ACTION, pricing.BRIDGE_URL, pricing.BRIDGE_TOKEN = "quote_price", "https://x", "t"
+
+        def _getter(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET]}}
+            bike = params.get("bike", "")
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            mt = bike.upper().startswith("MT")
+            per, dep = (927, 15000) if mt else (472, 7000)
+            return {"ok": True, "data": {"day_price": per, "total": per * days, "deposit": dep,
+                                         "available": True, "days": days,
+                                         "text": f"{per} ฿/день, {per * days} ฿ за {days} дн"}}
+        self.getter = _getter
+
+    def tearDown(self):
+        pricing.PRICING_ACTION, pricing.BRIDGE_URL, pricing.BRIDGE_TOKEN = self._pa, self._bu, self._bt
+        pricing._FLEET_CACHE.update(ts=0.0, data=None)
+
+    def _note(self, transcript):
+        h = suggest.extract_booking_hints(transcript, today=self.TODAY)
+        pricing._FLEET_CACHE.update(ts=0.0, data=None)
+        return suggest.build_pricing_note(h, lang="ru", getter=self.getter, today=self.TODAY)
+
+    # --- ГОЛДЕН: модель+срок → quote XSR155 на 14 дней + ЕЁ депозит ---------------------------
+    def test_golden_xsr155_two_weeks_quote_with_deposit(self):
+        note = self._note("[клиент]: XSR 155 с 20 июля на 2 недели")
+        self.assertIn("472", note)                       # суточный тариф XSR155 из Календаря
+        self.assertIn("6608", note)                      # итог за 14 дней = 472*14 (live-quote)
+        self.assertIn("депозит 7000 ฿", note)            # ЕЁ депозит дописан КОДОМ (в text его нет)
+        self.assertNotIn("927", note)                    # чужой тариф MT-03 не подставлен
+        self.assertNotIn("15000", note)                  # чужой депозит MT-03 не подставлен
+        self.assertNotIn("не удалось", note.lower())     # не свалились в «уточни модель/даты»
+
+    def test_golden_paraphrases_model_term_carry_deposit(self):
+        # дословная фраза + парафразы «модель + срок» → в каждом ответе живой quote XSR155 + депозит
+        for ph in ("Здравствуйте! XSR 155 с 20 июля на 2 недели, посчитайте.",
+                   "хочу xsr155 с 20 июля на 14 дней",
+                   "Можно XSR 155 с 20.07 на 2 недели?",
+                   "XSR 155, аренда с 20 июля на 2 недели",
+                   "беру XSR 155 с 20 на 2 недели"):
+            note = self._note("[клиент]: " + ph)
+            self.assertIn("472", note, ph)
+            self.assertIn("6608", note, ph)
+            self.assertIn("депозит 7000 ฿", note, ph)
+
+    # --- ГОЛДЕН: «10% это какая сумма» → 10% от суммы ЭТОГО расчёта -----------------------------
+    def test_golden_percent_of_calculation(self):
+        # окно диалога: модель+срок в первой реплике, вопрос про процент — в последней
+        tr = ("[клиент]: XSR 155 с 20 июля на 2 недели\n"
+              "[менеджер]: секунду\n"
+              "[клиент]: 10% это какая сумма")
+        note = self._note(tr)
+        self.assertIn("6608", note)                      # база расчёта — итог XSR155 на 14 дней
+        self.assertIn("661 ฿", note)                     # 10% от 6608 = 660.8 → 661 (КОД посчитал)
+        self.assertIn("10%", note)
+
+    def test_golden_percent_paraphrases(self):
+        for ph in ("10% это какая сумма",
+                   "а сколько будет 10%?",
+                   "10 процентов это сколько",
+                   "how much is 10%?",
+                   "what's 10% of that?"):
+            tr = f"[клиент]: XSR 155 с 20 июля на 2 недели\n[клиент]: {ph}"
+            note = self._note(tr)
+            self.assertIn("661 ฿", note, ph)
+
+    def test_percent_detector_positive_negative(self):
+        for pos in ("10% это какая сумма", "сколько будет 10%", "10 процентов это сколько",
+                    "how much is 10%"):
+            self.assertEqual(suggest._asks_percent_amount(pos, pos), 10, pos)
+        for neg in ("даю скидку 10% сам", "депозит меньше на 10 процентов", "привет",
+                    "нужен nmax на неделю"):
+            self.assertIsNone(suggest._asks_percent_amount(neg, neg), neg)
+
+    def test_percent_no_quote_no_number(self):
+        # процент спросили, но цены нет (парк недоступен) → число НЕ называем, просим уточнить
+        empty = lambda p: {"ok": False}
+        h = suggest.extract_booking_hints(
+            "[клиент]: XSR 155 с 20 июля на 2 недели\n[клиент]: 10% это какая сумма", today=self.TODAY)
+        note = suggest.build_pricing_note(h, lang="ru", getter=empty, today=self.TODAY)
+        self.assertNotIn("661", note)
+        self.assertIn("10%", note)                       # вопрос отражён, но без числа
+
+    # --- ГОЛДЕН: карточка чужой модели блокируется пост-чеком чисел ----------------------------
+    def test_foreign_model_card_blocked_by_postcheck(self):
+        note = self._note("[клиент]: XSR 155 с 20 июля на 2 недели")   # белый список = числа XSR155
+        draft = ("XSR 155 — 6608 ฿ за 14 дней, депозит 7000 ฿. "
+                 "А MT-03 — 12978 ฿ за 14 дней, депозит 15000 ฿.")
+        out = suggest.postcheck_draft(draft, "ru", pricing_note=note)
+        client = out.split("[уточнить", 1)[0]
+        self.assertIn("6608", client)                    # своя сумма (из quote) цела
+        self.assertIn("7000", client)                    # свой депозит цел
+        self.assertNotIn("12978", client)                # чужая сумма MT-03 вырезана
+        self.assertNotIn("15000", client)                # чужой депозит MT-03 вырезан
+        self.assertIn("уточню у команды", out.lower())
+
+    def test_own_deposit_and_total_kept_by_postcheck(self):
+        # весь черновик из чисел quote XSR155 → пост-чек не трогает (fail-safe, регресс)
+        note = self._note("[клиент]: XSR 155 с 20 июля на 2 недели")
+        draft = "XSR 155: 6608 ฿ за 14 дней, депозит 7000 ฿."
+        self.assertEqual(suggest.postcheck_draft(draft, "ru", pricing_note=note), draft)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

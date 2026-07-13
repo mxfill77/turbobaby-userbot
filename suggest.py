@@ -934,6 +934,28 @@ def _explicit_monthly(text: str) -> bool:
     return bool(re.search(r"месяц|\bmonth\b|monthly", text or ""))
 
 
+# «сколько будет N%» / «N% это какая сумма» — клиент просит ПОСЧИТАТЬ процент от суммы расчёта
+# (шаг 2/7 #253). Нужны ОБА: сам процент (число+% / «процентов» / percent) И вопрос-о-сумме
+# («сколько/какая сумма/это сколько/how much»). Просто «скидка 10%» без вопроса-о-сумме сюда НЕ
+# попадает (это не запрос посчитать). Процент считаем КОДОМ от total живого quote (не LLM).
+_PCT_TOKEN_RE = re.compile(r"(\d{1,3})\s*(?:%|процент\w*|percent)", re.I)
+_PCT_ASK_RE = re.compile(
+    r"скольк|как(?:ая|ую|ой)\s+сумм|это\s+скольк|\bсумм\w*|\bэто\b|how\s+much|what.?s\b|составит|получ",
+    re.I)
+
+
+def _asks_percent_amount(newest: str, recent: str):
+    """Клиент спрашивает «сколько будет N%» / «N% это какая сумма» → N (int 1..100) или None.
+    Ищем в последней реплике, затем в окне; процент И вопрос-о-сумме обязаны быть вместе."""
+    for src in (newest or "", recent or ""):
+        mt = _PCT_TOKEN_RE.search(src)
+        if mt and _PCT_ASK_RE.search(src):
+            n = int(mt.group(1))
+            if 1 <= n <= 100:
+                return n
+    return None
+
+
 def _has_date_signal(text: str) -> bool:
     if re.search(r"\d{1,2}[.\-/]\d{1,2}", text or ""):
         return True
@@ -1145,13 +1167,14 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
     deposit_multi_q = _asks_deposit_reduction_multi(newest, recent, models)
     price_sheet_q = _asks_price_sheet(newest, recent)
     sheet_filter = _parse_sheet_filter(newest, recent)
+    percent_q = _asks_percent_amount(newest, recent)   # «сколько будет N%» → процент от суммы расчёта
 
     return {"model": model, "models": models, "date_start": iso_start, "date_end": iso_end,
             "iso_start": iso_start, "iso_end": iso_end, "term_days": term_days,
             "hint_days": hint_days, "monthly": monthly, "has_dates": has_dates,
             "has_start": has_start,
             "deposit_multi_q": deposit_multi_q, "price_sheet_q": price_sheet_q,
-            "sheet_filter": sheet_filter}
+            "sheet_filter": sheet_filter, "percent_q": percent_q}
 
 
 # ------------------- §243/6: трекер собранного по диалогу + reply-вложениям -------------------
@@ -1281,7 +1304,14 @@ def _client_price(q: dict) -> str:
             parts.append("свободен на эти даты")
         return "; ".join(parts)
     if isinstance(q.get("text"), str) and q["text"].strip():
-        return q["text"].strip()               # J-цена дословно (п.5)
+        phrase = q["text"].strip()             # J-цена дословно (п.5)
+        # шаг 2/7 #253: депозит модели ОБЯЗАН быть в котировке (клиент назвал модель+срок → его
+        # депозит выводим из quote). J-текст Календаря депозит не всегда несёт — дописываем из
+        # поля deposit, если его числа ещё нет во фразе (иначе не дублируем).
+        dep = q.get("deposit")
+        if dep is not None and str(dep) not in phrase:
+            phrase += f"; депозит {dep} ฿"
+        return phrase
     parts = []
     if q.get("day_price") is not None:
         parts.append(f"{q['day_price']} ฿/день")
@@ -1295,11 +1325,13 @@ def _client_price(q: dict) -> str:
 
 
 def _resolve_model_price(model, ds, de, hint_days, monthly, getter=None, name_filter=None):
-    """Цена для ОДНОЙ модели по датам ds..de. Возвращает (kind, phrase):
+    """Цена для ОДНОЙ модели по датам ds..de. Возвращает (kind, phrase, quote):
       ok    — цену использовать дословно (кап/J-текст/сборка внутри _client_price);
       min   — срок короче минимального: «<тип> сдаём от N дней» + цена на минимум;
       sanity/none/error — фолбэк без числа.
-    name_filter сужает юниты модели (поколение XMAX); getter инъектируется в тестах."""
+    quote — dict котировки, из которой собрана фраза (или None, если числа нет): нужен вызывающему
+    для деривативов (процент от суммы этого расчёта, шаг 2/7 #253). name_filter сужает юниты модели
+    (поколение XMAX); getter инъектируется в тестах."""
     cls = bike_class(model)
     # (п.2) минимальный срок аренды: короче → предлагаем минимум и цену на него
     if cls and hint_days is not None and hint_days < cls[1]:
@@ -1313,28 +1345,50 @@ def _resolve_model_price(model, ds, de, hint_days, monthly, getter=None, name_fi
                 q = res["quote"]
         base = f"{label} сдаём от {min_days} дней (короче срок не оформляем)"
         if q:
-            return ("min", f"{base}; цена за {min_days} дн: {_client_price(q)}")
-        return ("min", f"{base}; точную цену за {min_days} дн уточню и вернусь")
+            return ("min", f"{base}; цена за {min_days} дн: {_client_price(q)}", q)
+        return ("min", f"{base}; точную цену за {min_days} дн уточню и вернусь", None)
     res = _safe_quote_for_model(model, ds, de, getter=getter, name_filter=name_filter)
     status, q = res.get("status"), res.get("quote")
     if status == "ok" and q:
         # SANITY-ГАРД: сверяем days из quote с длительностью из слов клиента.
         if not pricing.sanity_days_ok(q.get("days"), hint_days, monthly):
             return ("sanity", "расчёт по датам не сходится (длительность подозрительная) — НЕ "
-                              "называй никакого числа; ответь, что уточню цену по датам и вернусь")
-        return ("ok", _client_price(q))
+                              "называй никакого числа; ответь, что уточню цену по датам и вернусь", None)
+        return ("ok", _client_price(q), q)
     if status == "none_available":
         return ("none", "на эти даты все подходящие байки заняты — НЕ называй числа; ответь, что "
-                        "уточню наличие и цену на эти даты и вернусь")
+                        "уточню наличие и цену на эти даты и вернусь", None)
     return ("error", "точная цена из Календаря сейчас недоступна — НЕ называй никакого числа "
-                     "(в т.ч. из FAQ); ответь, что уточнишь цену и вернёшься")
+                     "(в т.ч. из FAQ); ответь, что уточнишь цену и вернёшься", None)
 
 
 def _wrap_single(kind: str, phrase: str) -> str:
     if kind == "ok":
         return ("ЦЕНА из Календаря бронирования (использовать ДОСЛОВНО, не пересчитывать и не "
-                "округлять): " + phrase + ".")
+                "округлять; это ЕДИНСТВЕННАЯ запрошенная модель — цены/депозиты ДРУГИХ моделей "
+                "в этом ответе НЕ приводи): " + phrase + ".")
     return "ЦЕНА: " + phrase + "."
+
+
+def _percent_amount(pct, total):
+    """N% от суммы расчёта → целое число ฿ (округление к ближайшему), или None если сумма не задана."""
+    try:
+        return round(int(total) * int(pct) / 100)
+    except (TypeError, ValueError):
+        return None
+
+
+def _percent_line(pct, q) -> str:
+    """Инструкция-довесок к ЦЕНЕ: клиент спросил «сколько будет N%» → считаем N% от total этого
+    quote КОДОМ и кладём готовое число в блок ЦЕНА (оно попадает в белый список пост-чека → LLM
+    вправе его назвать). Нет total → просим уточнить без числа. Строка начинается с пробела."""
+    total = q.get("total") if isinstance(q, dict) else None
+    amount = _percent_amount(pct, total)
+    if amount is None:
+        return (f" Клиент спрашивает, сколько будет {pct}% — точную сумму назову после расчёта по "
+                f"датам, БЕЗ числа.")
+    return (f" Клиент спрашивает, сколько будет {pct}%: это {pct}% от суммы этого расчёта "
+            f"({total} ฿) = {amount} ฿ — назови клиенту именно это число.")
 
 
 # ============================ ПРАЙС ПО ВСЕМУ ПАРКУ (price_sheet) ============================
@@ -1854,14 +1908,23 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
 
     if len(products) == 1:
         label, m, nf = products[0]
-        kind, phrase = _resolve_model_price(m, ds, de, hint_days, monthly, getter=getter, name_filter=nf)
-        return _wrap_single(kind, phrase) + dep
+        kind, phrase, q = _resolve_model_price(m, ds, de, hint_days, monthly, getter=getter,
+                                               name_filter=nf)
+        note = _wrap_single(kind, phrase)
+        # «сколько будет N%» → процент считаем КОДОМ от суммы ЭТОГО расчёта (шаг 2/7 #253); число
+        # ложится в блок ЦЕНА → пройдёт пост-чек. Есть live-quote (ok/min) → считаем; иначе просим
+        # уточнить без числа.
+        pct = hints.get("percent_q")
+        if pct:
+            note += _percent_line(pct, q if kind in ("ok", "min") else None)
+        return note + dep
 
     # (п.3) несколько продуктов (несколько моделей ИЛИ два поколения XMAX) — раздельная цена по
     # каждому, отдельной строкой в одном сообщении.
     bullets = []
     for label, m, nf in products:
-        _, phrase = _resolve_model_price(m, ds, de, hint_days, monthly, getter=getter, name_filter=nf)
+        _, phrase, _q = _resolve_model_price(m, ds, de, hint_days, monthly, getter=getter,
+                                             name_filter=nf)
         bullets.append(f"- {label}: {phrase}")
     header = ("ЦЕНЫ ПО МОДЕЛЯМ (клиент запросил несколько / модель с вариантами) — назови КАЖДУЮ "
               "отдельной строкой в ОДНОМ сообщении, цену использовать ДОСЛОВНО, модели/варианты НЕ "
@@ -2316,6 +2379,16 @@ _PC_PRICE_TOTAL_RE = re.compile(
     r"|" + _PC_PERIOD + r"[^.\n]{0,40}?(\d[\d\s.,]*\d|\d)\s*" + _PC_CUR,
     re.I)
 
+# Депозит с ЧИСЛОМ — тоже число цены, выводимое только из quote по модели+сроку (шаг 2/7 #253):
+# «депозит 3000 ฿», «залог 15000 бат», «deposit 7000 baht». Правило депозита БЕЗ числа («деньги
+# либо паспорт») не ловим — здесь обязателен денежный токен рядом с числом. Число сверяем с белым
+# источником; чужой депозит (карточка не той модели) отсекается. Проверяем ТОЛЬКО когда белый
+# источник непуст (есть live-quote) — иначе прежняя терпимость к депозиту-ориентиру (регресс цел).
+_PC_DEPOSIT_RE = re.compile(
+    r"(?:депозит\w*|залог\w*|deposit)\D{0,20}(\d[\d\s.,]*\d|\d)\s*" + _PC_CUR +
+    r"|(\d[\d\s.,]*\d|\d)\s*" + _PC_CUR + r"\D{0,20}(?:депозит\w*|залог\w*|deposit)",
+    re.I)
+
 # Разбиение на сегменты С СОХРАНЕНИЕМ разделителей (точный round-trip): границы предложений и
 # переводы строк. Тире «—» границей НЕ считаем — «светлого ADV 350 сейчас нет — есть чёрный»
 # должно остаться ОДНИМ сегментом и клеймиться целиком.
@@ -2395,6 +2468,14 @@ def _pc_classify(seg: str, allowed, call_llm=None, transcript=None):
         val = _pc_num(m.group(1) or m.group(2))
         if val is not None and val not in allowed:
             found.append(("price", str(val)))
+    # депозит с числом вне белого источника — только когда источник цен непуст (есть live-quote):
+    # тогда депозит обязан быть выводим из quote модели+срока; чужой/выдуманный депозит клеймим.
+    if allowed:
+        md = _PC_DEPOSIT_RE.search(seg)
+        if md:
+            val = _pc_num(md.group(1) or md.group(2))
+            if val is not None and val not in allowed:
+                found.append(("price", str(val)))
     if found:
         return found
     if call_llm and _pc_maybe(low, model):
