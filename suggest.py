@@ -1039,6 +1039,88 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
             "sheet_filter": sheet_filter}
 
 
+# ------------------- §243/6: трекер собранного по диалогу + reply-вложениям -------------------
+# Что клиент УЖЕ прислал (по окну диалога и подтянутым reply-вложениям из transcript_from): модель,
+# срок/даты, гео, фото паспорта, телефон, оплата. Собранное НЕ переспрашиваем; в промпт кладём
+# «уже получено — подтверди и не проси повторно», в черновик — пометку модератору «собрано: …».
+# Скан по КЛИЕНТСКИМ строкам (reply-содержимое встроено в них через transcript_from).
+
+# Гео: ссылка на карты ИЛИ явный маркер жилья/локации (клиент СООБЩАЕТ адрес, не спрашивает).
+_COLL_GEO = re.compile(
+    r"maps\.app\.goo\.gl|goo\.gl/maps|google\.[a-z.]+/maps|maps\.google|geo:\s*-?\d"
+    r"|@-?\d{1,2}\.\d{3,},-?\d{1,3}\.\d{3,}"
+    r"|\b(?:вилл\w*|апартамент\w*|кондо\w*|отел[ья]\w*|resort|hotel|villa|apartment|condo)\b", re.I)
+# Фото паспорта: маркер из reply-вложения ИЛИ клиент прямо пишет про паспорт/passport/id.
+_COLL_PASSPORT = re.compile(r"вероятно\s+паспорт|паспорт\w*|passport|\bid\s*card\b", re.I)
+# Телефон: международный (+..) ИЛИ длинный цифровой прогон ИЛИ ключевик рядом с цифрами.
+_COLL_PHONE = re.compile(r"\+\d[\d\s\-()]{7,}\d|\b\d{9,}\b"
+                         r"|(?:тел|номер|phone|whats\s*app|whatsapp|вайбер|viber)\D{0,12}\d[\d\s\-()]{5,}\d",
+                         re.I)
+# Оплата: клиент сообщает, что оплатил/перевёл/внёс предоплату.
+_COLL_PAYMENT = re.compile(r"оплат\w*|оплачен\w*|заплат\w*|перевёл|перевел|перевод\w*|предоплат\w*"
+                           r"|внёс|внес\b|внесл\w*|чек\s+(?:об\s+)?оплат"
+                           r"|\bpaid\b|payment\s+(?:made|done|sent)|transfer(?:red)?|deposit\s+paid", re.I)
+
+
+def collected_facts(transcript: str, hints: dict = None, today=None) -> dict:
+    """§243/6: что клиент УЖЕ прислал по окну диалога + reply-вложениям (см. transcript_from).
+    Ключи-булевы: model, dates, geo, passport, phone, payment. model/dates — из extract_booking_hints
+    (переиспользуем ту же логику последней брони), остальное — детерминированный скан клиентских строк
+    (reply-содержимое встроено в них). Ничего не найдено → все False (fail-safe: просто нет пометки)."""
+    h = hints if hints is not None else extract_booking_hints(transcript, today=today)
+    ctext = _client_text(transcript)   # только [клиент]: строки, lower, с встроенным reply-содержимым
+    return {
+        "model": bool(h.get("model")),
+        "dates": bool(h.get("has_dates") or h.get("iso_start") or h.get("term_days")),
+        "geo": bool(_COLL_GEO.search(ctext)),
+        "passport": bool(_COLL_PASSPORT.search(ctext)),
+        "phone": bool(_COLL_PHONE.search(ctext)),
+        "payment": bool(_COLL_PAYMENT.search(ctext)),
+    }
+
+
+# Порядок и подписи собранного: (ключ, метка-для-промпта-RU/EN, короткая-метка-для-пометки-RU/EN).
+_COLL_LABELS = [
+    ("model",    ("модель",         "model"),    ("модель",  "model")),
+    ("dates",    ("даты/срок",      "dates"),    ("даты",    "dates")),
+    ("geo",      ("локация",        "location"), ("гео",     "geo")),
+    ("passport", ("фото паспорта",  "passport photo"), ("паспорт", "passport")),
+    ("phone",    ("телефон",        "phone"),    ("тел",     "phone")),
+    ("payment",  ("оплата",         "payment"),  ("оплата",  "payment")),
+]
+
+
+def collected_prompt_note(facts: dict, lang: str = "ru") -> str:
+    """Блок в system-промпт: перечень уже полученного + запрет переспрашивать. Пусто → ''."""
+    if not facts:
+        return ""
+    en = (lang == "en")
+    got = [lbl[1 if en else 0] for key, lbl, _ in _COLL_LABELS if facts.get(key)]
+    if not got:
+        return ""
+    if en:
+        return ("\n\n★ ALREADY RECEIVED FROM THE CLIENT (in the dialog/attachments — do NOT ask "
+                "again): " + ", ".join(got) + ". Briefly confirm you got it (e.g. «got your "
+                "location and details») and move to the next step — never re-request what the "
+                "client has already sent.")
+    return ("\n\n★ УЖЕ ПОЛУЧЕНО ОТ КЛИЕНТА (есть в диалоге/вложениях — НЕ переспрашивай): "
+            + ", ".join(got) + ". Коротко подтверди получение (напр. «локацию и данные получил») "
+            "и переходи к следующему шагу — НЕ проси повторно то, что клиент уже прислал.")
+
+
+def collected_manager_note(facts: dict, lang: str = "ru") -> str:
+    """Пометка модератору «собрано: гео ✅ паспорт ✅ тел ✅» (клиенту не видна — _strip_service_prefix
+    режет только НАЧАЛО, а это хвост). Ничего не собрано → '' (пометки нет)."""
+    if not facts:
+        return ""
+    en = (lang == "en")
+    parts = [lbl[1 if en else 0] + " ✅" for key, _, lbl in _COLL_LABELS if facts.get(key)]
+    if not parts:
+        return ""
+    head = "collected: " if en else "собрано: "
+    return head + " ".join(parts)
+
+
 # Инструкция про депозит при нескольких байках (правила цен v2, п.4).
 DEPOSIT_MULTI_NOTE = ("ДЕПОЗИТ: клиент спрашивает про уменьшение депозита при нескольких байках "
                       "— сам скидку/снижение депозита НЕ предлагай и НЕ обещай; ответь ровно: "
@@ -1682,7 +1764,8 @@ ANTI_LOOP_NOTE = (
 
 
 def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pricing_note: str = "",
-                       directive: str = "", park_models=None, playbook: str = "", pressure=None) -> str:
+                       directive: str = "", park_models=None, playbook: str = "", pressure=None,
+                       collected=None) -> str:
     lang_name = "русском" if lang == "ru" else "английском"
     if is_first_contact:
         greet = (
@@ -1798,6 +1881,8 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
             "\n\nКНИГА ПРАВИЛ (стиль/факты/запреты/выученные правки — СОБЛЮДАЙ; но она НЕ отменяет "
             "ценовую политику и критичные факты ВЫШЕ — те приоритетнее):\n" + playbook.strip()
         )
+    # §243/6: СОБРАННОЕ по диалогу/вложениям — «уже получено, не переспрашивай». Пусто → блока нет.
+    collected_block = collected_prompt_note(collected, lang) if collected else ""
     # УРОВЕНЬ НАПОРА — на уровне базовой установки (высокий приоритет, ВЫШЕ playbook «без давления»).
     pressure_block = _pressure_block(pressure if pressure is not None else SALES_PRESSURE)
     return (
@@ -1812,7 +1897,7 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         "клиент их видеть НЕ должен. Ответ начинай СРАЗУ по сути (первый контакт → "
         "приветствие → суть; иначе → сразу суть)."
         + pressure_block
-        + directive_block + park_block + greet + policy + scenario + ANTI_LOOP_NOTE + price_block + "\n\n"
+        + directive_block + park_block + collected_block + greet + policy + scenario + ANTI_LOOP_NOTE + price_block + "\n\n"
         + CRITICAL_FACTS + EXPERIENCE_SAFETY_RULE + APPROVAL_WHITELIST_RULE + playbook_block
         + "\n\nFAQ и эталонные формулировки:\n" + (faq or "(FAQ недоступен — опирайся на критичные факты выше)")
     )
@@ -2229,6 +2314,15 @@ def postcheck_draft(draft: str, lang: str = "ru", pricing_note: str = "",
     return (body + "\n" + note) if note else body
 
 
+def _append_collected_note(draft: str, facts: dict, lang: str = "ru") -> str:
+    """§243/6: дописать в хвост черновика пометку модератору «собрано: гео ✅ паспорт ✅ тел ✅».
+    Ничего не собрано → черновик БАЙТ-В-БАЙТ (fail-safe). Хвост → _strip_service_prefix не режет."""
+    note = collected_manager_note(facts, lang)
+    if not note:
+        return draft
+    return ((draft or "").rstrip() + "\n" + note) if (draft or "").strip() else draft
+
+
 def generate_draft(transcript: str, lang: str, faq: str,
                    is_first_contact: bool = False, pricing_note: str = "", call_llm=None,
                    park_models=None, playbook: str = "") -> str:
@@ -2237,8 +2331,10 @@ def generate_draft(transcript: str, lang: str, faq: str,
     park_models — allowlist моделей реального парка (Лист1); None → без ограничения (fail-safe).
     playbook — книга правил (ниже кап-цены/критфактов); '' → без блока (fail-safe)."""
     call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
+    # §243/6: что клиент УЖЕ прислал (модель/даты/гео/паспорт/тел/оплата) — не переспрашиваем.
+    facts = collected_facts(transcript)
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
-                                park_models=park_models, playbook=playbook)
+                                park_models=park_models, playbook=playbook, collected=facts)
     out = _strip_service_prefix(call_llm(system, transcript))
     # Пост-чек ДО сборки сетки: сканируем LLM-текст (intro/outro), дословный прайс-блок КОДА не
     # трогаем. Утверждения цвет/наличие/цена вне белого списка → «уточню»-форма + пометка модератору.
@@ -2247,7 +2343,7 @@ def generate_draft(transcript: str, lang: str, faq: str,
     block = _sheet_block_from_note(pricing_note)
     if block is not None:
         out = compose_sheet_draft(out, block, lang)
-    return out
+    return _append_collected_note(out, facts, lang)
 
 
 def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: bool,
@@ -2257,8 +2353,10 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     УРОВНЯ поверх ИСХОДНОГО клиентского контекста (транскрипт+FAQ+кап-цена), а НЕ как патч к старому
     тексту. Инварианты (ценовая политика/критфакты/парк/playbook) сохраняются — они в make_system_prompt."""
     call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
+    facts = collected_facts(transcript)
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
-                                directive=directive, park_models=park_models, playbook=playbook)
+                                directive=directive, park_models=park_models, playbook=playbook,
+                                collected=facts)
     out = _strip_service_prefix(call_llm(system, transcript))
     # Тот же пост-чек, что в generate_draft (до сборки сетки): цвет/наличие/цена вне данных → «уточню».
     out = postcheck_draft(out, lang, pricing_note=pricing_note, call_llm=call_llm, transcript=transcript)
@@ -2266,7 +2364,7 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     block = _sheet_block_from_note(pricing_note)
     if block is not None:
         out = compose_sheet_draft(out, block, lang)
-    return out
+    return _append_collected_note(out, facts, lang)
 
 
 # ------------------------------- rate-limit ----------------------------------

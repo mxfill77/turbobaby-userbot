@@ -222,24 +222,26 @@ class TestTwoPhaseDraft(unittest.TestCase):
                                                     call_llm=self._refllm, faq="FAQ"))
         return suggest.pending.get(mid)["draft"]
 
+    # §243/6: транскрипты несут модель+даты → в хвост черновика добавляется пометка
+    # модератору «собрано: …»; проверяем маркер-ветку по началу строки.
     def test_phase_a_no_dates_asks(self):
-        self.assertEqual(self._run("Сколько стоит NMAX?"), "ASK_DATES")
+        self.assertTrue(self._run("Сколько стоит NMAX?").startswith("ASK_DATES"))
 
     def test_phase_b_quote_ok_uses_figure(self):
         pricing.quote_for_model = lambda *a, **k: {"status": "ok", "quote": {
             "day_price": 900, "total": 6300, "deposit": 7000, "available": True, "days": 7}}
-        self.assertEqual(self._run("NMAX 10.07-17.07 почём?"), "HAS_PRICE")
+        self.assertTrue(self._run("NMAX 10.07-17.07 почём?").startswith("HAS_PRICE"))
 
     def test_phase_b_bad_days_sanity_fallback(self):
         # SANITY: quote days=360 при hint 5 дней → фолбэк, цифры НЕ уходят
         pricing.quote_for_model = lambda *a, **k: {"status": "ok", "quote": {
             "day_price": 219, "total": 78858, "deposit": 3000, "available": True, "days": 360}}
         draft = self._run("NMAX с 5 по 10 июля")   # hint ~5 дней
-        self.assertEqual(draft, "FALLBACK")
+        self.assertTrue(draft.startswith("FALLBACK"), draft)
 
     def test_phase_b_quote_error_fallback(self):
         # quote_for_model → error (setUp) → фолбэк, без FAQ-числа
-        self.assertEqual(self._run("NMAX 10.07-17.07"), "FALLBACK")
+        self.assertTrue(self._run("NMAX 10.07-17.07").startswith("FALLBACK"))
 
 
 class TestFleetResolve(unittest.TestCase):

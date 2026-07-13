@@ -262,7 +262,8 @@ class TestPureLogic(unittest.TestCase):
             return "перегенерённый ответ"
         out = suggest.regenerate_draft("[клиент]: NMAX на месяц?", "ru", "FAQ", False,
                                        "ЦЕНА из Календаря: 500฿/день", "жёстче про депозит", call_llm=fake)
-        self.assertEqual(out, "перегенерённый ответ")
+        # §243/6: NMAX+месяц собраны → в хвосте пометка модератору; тело ответа цело
+        self.assertTrue(out.startswith("перегенерённый ответ"), out)
         self.assertIn("жёстче про депозит", seen["system"])      # директива в system
         self.assertIn("ЦЕНА из Календаря", seen["system"])       # кап сохранён
         self.assertIn("CLICK 125", seen["system"])               # критфакты сохранены
@@ -447,9 +448,11 @@ class TestFullFlow(unittest.TestCase):
         res = asyncio.run(suggest.on_moderation_reply(ev, jitter=lambda: 0, sleep=_nosleep))
         self.assertEqual(res["action"], "approve")
         self.assertTrue(res["sent"])
-        # отправка КЛИЕНТУ (id 999) с текстом черновика (среди отправок; после неё — ack в группу)
+        # отправка КЛИЕНТУ (id 999) с текстом черновика (среди отправок; после неё — ack в группу).
+        # §243/6: NMAX+неделя собраны → в хвосте черновика пометка модератору; тело ответа цело.
         client_sends = [t for t in self.client.sent if t[0] == 999]
-        self.assertIn((999, "DRAFT ответа клиенту"), client_sends)
+        self.assertTrue(any(txt.startswith("DRAFT ответа клиенту") for _, txt in client_sends),
+                        client_sends)
         self.assertEqual(res["ack"], "✅ Отправлено клиенту")
         pairs = self._pairs_lines()
         self.assertEqual(pairs[-1]["action"], "approve")
@@ -504,7 +507,7 @@ class TestFullFlow(unittest.TestCase):
         )
         rec = suggest.pending.get(mid)
         self.assertTrue(rec["first_contact"])
-        self.assertEqual(rec["draft"], "GREETED")
+        self.assertTrue(rec["draft"].startswith("GREETED"), rec["draft"])  # +хвост «собрано: …»
 
     def test_no_regreet_when_greeting_in_history(self):
         # приветствие уже уходило (наше «Здравствуйте» в истории) → повторно НЕ здороваемся.
@@ -520,7 +523,7 @@ class TestFullFlow(unittest.TestCase):
         )
         rec = suggest.pending.get(mid)
         self.assertFalse(rec["first_contact"])
-        self.assertEqual(rec["draft"], "CONT")
+        self.assertTrue(rec["draft"].startswith("CONT"), rec["draft"])   # +хвост «собрано: …»
 
     def test_lang_stable_latin_model_name_stays_ru(self):
         # русский диалог + последняя реплика «Adv 350» (латиница) → черновик остаётся RU, НЕ EN.
@@ -718,6 +721,94 @@ class TestReplyContext(unittest.TestCase):
         asyncio.run(suggest._resolve_replies(_ReplyClient({}), None, window))
         tr = suggest.transcript_from(window, self.ME)
         self.assertEqual(tr, "[клиент]: Привет, сколько стоит NMAX?")
+
+
+class TestCollectedTracker(unittest.TestCase):
+    """§243/6: трекер собранного по окну диалога + reply-вложениям. Голден 12.07: три «Вот»
+    реплаями на гео/фото-паспорт/телефон → собрано {geo,passport,phone}, черновик не переспрашивает,
+    в хвосте пометка «собрано: гео ✅ паспорт ✅ тел ✅»."""
+
+    MAPS = "https://maps.app.goo.gl/abc123XYZ"
+    PHONE = "+66 81 234 5678"
+    ME = 42
+
+    def _three_vot_transcript(self):
+        """Тот же голден-кейс, что TestReplyContext: три «Вот» реплаями подтянули данные СТАРОЙ брони."""
+        store = {
+            10: _ReplyMsg(10, 999, message=f"Моя вилла: {self.MAPS}"),
+            11: _ReplyMsg(11, 999, photo=True),                # фото паспорта
+            12: _ReplyMsg(12, 999, message=f"Мой номер {self.PHONE}"),
+        }
+        window = [
+            _ReplyMsg(23, 999, message="Вот", reply_to=12),
+            _ReplyMsg(22, 999, message="Вот", reply_to=11),
+            _ReplyMsg(21, 999, message="Вот", reply_to=10),
+            _ReplyMsg(20, self.ME, message="Скиньте гео, паспорт и телефон"),
+        ]
+        asyncio.run(suggest._resolve_replies(_ReplyClient(store), None, window))
+        return suggest.transcript_from(window, self.ME)
+
+    def test_golden_three_vot_collects_geo_passport_phone(self):
+        tr = self._three_vot_transcript()
+        facts = suggest.collected_facts(tr)
+        self.assertTrue(facts["geo"], f"гео (Maps) не собрано:\n{tr}")
+        self.assertTrue(facts["passport"], f"паспорт (фото) не собран:\n{tr}")
+        self.assertTrue(facts["phone"], f"телефон не собран:\n{tr}")
+
+    def test_golden_prompt_says_no_reask_and_confirm(self):
+        tr = self._three_vot_transcript()
+        facts = suggest.collected_facts(tr)
+        p = suggest.make_system_prompt("FAQ", "ru", collected=facts)
+        self.assertIn("УЖЕ ПОЛУЧЕНО", p)
+        self.assertIn("НЕ переспрашивай", p)
+        self.assertIn("локацию и данные получил", p)   # инструктируем фразу-подтверждение
+        for lbl in ("локация", "фото паспорта", "телефон"):
+            self.assertIn(lbl, p)
+
+    def test_golden_draft_has_manager_note_and_no_reask(self):
+        tr = self._three_vot_transcript()
+        # fake-LLM «отвечает как модель по инструкции»: подтверждает, не переспрашивает
+        seen = {}
+
+        def capture(system, user):
+            seen["system"] = system
+            return "Локацию и данные получил, спасибо! Осталось подобрать даты."
+
+        d = suggest.generate_draft(tr, "ru", "FAQ", call_llm=capture)
+        self.assertIn("собрано: гео ✅ паспорт ✅ тел ✅", d)   # пометка модератору в хвосте
+        self.assertIn("УЖЕ ПОЛУЧЕНО", seen["system"])           # промпт нёс собранное
+        # тело подтверждения не потеряно, пометка — отдельной хвостовой строкой
+        self.assertIn("Локацию и данные получил", d)
+        self.assertTrue(d.rstrip().endswith("собрано: гео ✅ паспорт ✅ тел ✅"))
+
+    def test_nothing_collected_leaves_draft_byte_for_byte(self):
+        # чистый первый вопрос без данных → фактов нет → черновик и промпт без блока/пометки
+        tr = "[клиент]: Здравствуйте! А что у вас есть?"
+        facts = suggest.collected_facts(tr)
+        self.assertFalse(any(facts.values()), facts)
+        d = suggest.generate_draft(tr, "ru", "FAQ", call_llm=lambda s, u: "Здравствуйте! ...")
+        self.assertNotIn("собрано:", d)
+        self.assertNotIn("УЖЕ ПОЛУЧЕНО", suggest.make_system_prompt("FAQ", "ru", collected=facts))
+
+    def test_model_and_dates_from_hints(self):
+        tr = "[клиент]: NMAX с 7 по 14 июля"
+        facts = suggest.collected_facts(tr)
+        self.assertTrue(facts["model"])
+        self.assertTrue(facts["dates"])
+        self.assertFalse(facts["geo"])
+
+    def test_payment_detected(self):
+        self.assertTrue(suggest.collected_facts("[клиент]: Я уже оплатил депозит")["payment"])
+        self.assertTrue(suggest.collected_facts("[клиент]: Перевёл предоплату, вот чек")["payment"])
+        self.assertFalse(suggest.collected_facts("[клиент]: Сколько стоит аренда?")["payment"])
+
+    def test_manager_note_en(self):
+        facts = {"geo": True, "phone": True, "passport": False}
+        self.assertEqual(suggest.collected_manager_note(facts, "en"), "collected: geo ✅ phone ✅")
+
+    def test_phone_not_confused_with_dates(self):
+        # «с 7 по 14» — это даты, НЕ телефон (короткие цифры)
+        self.assertFalse(suggest.collected_facts("[клиент]: с 7 по 14 июля")["phone"])
 
 
 class _ModBase(unittest.TestCase):

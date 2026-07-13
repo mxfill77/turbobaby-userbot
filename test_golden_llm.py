@@ -72,6 +72,26 @@ class TestGoldenLLM(unittest.TestCase):
         self.assertTrue(any(w in d for w in _EXPERIENCE), f"A.2: не спросил про опыт:\n{d}")
         self.assertNotIn("есть ли у вас права", d)          # не в лоб
 
+    def test_collected_no_reask_after_three_vot(self):
+        # §243/6 голден 12.07: клиент тремя «Вот» реплаями прислал гео/паспорт/телефон (подтянуто
+        # в транскрипт). Черновик ПОДТВЕРЖДАЕТ получение и НЕ переспрашивает то же самое.
+        tr = ("[менеджер]: Скиньте гео, паспорт и телефон\n"
+              "[клиент]: Вот ↩[в ответ на — клиент: Моя вилла: https://maps.app.goo.gl/abc123XYZ]\n"
+              "[клиент]: Вот ↩[в ответ на — клиент: фото (вероятно паспорт)]\n"
+              "[клиент]: Вот ↩[в ответ на — клиент: Мой номер +66 81 234 5678]")
+        facts = suggest.collected_facts(tr)
+        sysp = suggest.make_system_prompt(self.faq, "ru", is_first_contact=False,
+                                          park_models=self.allow, playbook=suggest.load_playbook(),
+                                          collected=facts)
+        d = suggest._cli_llm(sysp, tr).strip().lower()
+        reask = ["скиньте гео", "пришлите гео", "нужна локация", "пришлите паспорт",
+                 "скиньте паспорт", "фото паспорта", "ваш номер", "пришлите телефон",
+                 "скиньте телефон", "укажите телефон"]
+        hit = [w for w in reask if w in d]
+        self.assertFalse(hit, f"§243/6: черновик переспросил уже собранное {hit}\nЧЕРНОВИК: {d}")
+        self.assertTrue(any(w in d for w in ["получил", "приняли", "принял", "есть", "спасибо"]),
+                        f"§243/6: не подтвердил получение данных:\n{d}")
+
     def test_firm_more_insistent_than_normal(self):
         t = ("[клиент]: Здравствуйте, NMAX на неделю?\n"
              "[менеджер]: Здравствуйте! Yamaha NMAX 155 — 3500฿ за неделю.\n"
