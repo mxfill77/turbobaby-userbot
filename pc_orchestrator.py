@@ -2535,6 +2535,47 @@ REVIZOR_HOURS = float(os.getenv("REVIZOR_HOURS", "6") or "6")   # период �
 REVIZOR_SEC = REVIZOR_HOURS * 3600.0
 REVIZOR_DB = os.path.join(REPO, "moderation_ipc.db")            # боевая очередь окон (read-only отбор)
 REVIZOR_STATE_FILE = os.path.join(REPO, "pc_orchestrator.revizor_state.json")  # метка прошлого прогона
+REVIZOR_TIMEOUT = int(os.getenv("REVIZOR_TIMEOUT", "300") or "300")            # думатель-ревизор окна (одно окно, длинный контекст)
+
+# Преамбула ДУМАТЕЛЯ-РЕВИЗОРА окна (шаг 3/7 родителя 262). Тот же _thinker_exec-паттерн, что и
+# самопочинка (read-only, --max-turns 1, --allowed-tools '', нейтральный cwd → НИЧЕГО не исполняет,
+# файлы не читает — судит строго по данным пакета). Модель THINKER_MODEL=claude-fable-5, фолбэк
+# claude-opus-4-8, таймаут REVIZOR_TIMEOUT=300с. Задача — ПОСТ-ФАКТУМ аудит одного клиентского окна
+# (реплики клиента + наши отправленные + черновики) по фиксированному чек-листу дефектов ответа.
+# Выход — СТРОГО JSON-массив находок (пустой [] = нарушений нет); каждая находка маршрутизируется
+# позднейшими шагами 262 по полю action. Думатель ничего не чинит и не ставит задач сам.
+REVIZOR_PREAMBLE = (
+    "Ты — думатель-ревизор клиентских диалогов ассистента аренды мототехники TurboBaby. Тебе дают "
+    "ОДНО клиентское окно ПОСТ-ФАКТУМ: реплики клиента, ТЕКСТ, отправленный клиенту (наши ответы), и "
+    "черновики до модерации. Твоя задача — ТОЛЬКО аудит по чек-листу ниже; ты НИЧЕГО не исполняешь, "
+    "инструментов нет, файлы не читаешь — суди строго по данным пакета.\n"
+    "Найди нарушения РОВНО из этого чек-листа (класс = буква):\n"
+    "  а) числа не из quote — цена/депозит/скидка/срок в отправленном, которых НЕТ во входных данных "
+    "(похоже на выдуманную цифру, а не взятую из тарифа);\n"
+    "  б) чужая модель — в ответе фигурирует модель/марка техники, которую клиент НЕ спрашивал и о "
+    "которой мы речи не вели (подмена модели);\n"
+    "  в) переспрос данного — мы переспрашиваем то, что клиент УЖЕ явно сообщил в этом окне (модель, "
+    "даты, срок, опыт и т.п.);\n"
+    "  г) утечка служебного — в ОТПРАВЛЕННОМ клиенту тексте просочились внутренние маркеры: «собрано», "
+    "«[уточнить», строка сезонной пометки — то, что клиент видеть не должен;\n"
+    "  д) ложная ✅ трекера — галочка ✅ у пункта, который на самом деле НЕ собран/не подтверждён "
+    "(трекер врёт, что данные есть);\n"
+    "  е) повтор приветствия/канцелярит — повторное приветствие в НЕ первом ответе окна либо "
+    "канцелярский официоз вместо живой речи;\n"
+    "  ж) анкета на первом сообщении — клиент ПЕРВЫМ же сообщением дал модель И даты, а мы в ответ "
+    "шлём анкету/список вопросов вместо тарифа (надо было котировать, а не допрашивать).\n"
+    "Для КАЖДОЙ находки укажи action:\n"
+    "  task — дефект чинится правкой кода/промпта suggest (детект/гард/шаблон) → дай task_text: "
+    "САМОДОСТАТОЧНОЕ дев-ТЗ ≤400 символов (исполнитель увидит ТОЛЬКО его, впиши класс, окно и "
+    "дословную улику);\n"
+    "  owner — нужно решение человека (спорный тариф, política, неоднозначный кейс) — task_text пустой;\n"
+    "  noise — по факту не нарушение (ложное срабатывание) — task_text пустой; такие НЕ включай, если "
+    "сомневаешься — лучше noise, чем ложная задача.\n"
+    "Ответь СТРОГО ОДНИМ JSON-массивом, без текста до/после, без markdown-обёртки:\n"
+    '[{"class":"а".."ж","evidence":"<дословная улика ≤200 символов>","action":"task"|"owner"|"noise",'
+    '"task_text":"<дев-ТЗ ≤400 или пусто>"}]\n'
+    "Нарушений нет → верни пустой массив []. Не выдумывай находок сверх чек-листа.\n\n"
+)
 
 
 def _revizor_on():
@@ -2643,6 +2684,74 @@ def _revizor_build_package(client_id, rows):
     return {"client_id": client_id, "client_name": client_name,
             "incoming": incoming, "transcript": transcript,
             "sent": sent, "drafts": drafts, "last_ts": last_ts}
+
+
+_REVIZOR_ACTIONS = ("task", "owner", "noise")
+_REVIZOR_EVIDENCE_MAX = 200
+_REVIZOR_TASK_MAX = 400
+
+
+def _revizor_pkg_text(package):
+    """Пакет окна (_revizor_build_package) → компактный текст для думателя. Клипуем секции — одно окно
+    должно влезть в контекст/таймаут; транскрипт даёт полный ход диалога, incoming/sent/drafts —
+    явные срезы (клиент / наши отправленные / черновики)."""
+    p = package or {}
+
+    def _join(items, cap):
+        return "\n".join(f"- {str(x).strip()}" for x in (items or []) if str(x).strip())[:cap] or "—"
+
+    cid = p.get("client_id")
+    name = (p.get("client_name") or "").strip() or "?"
+    transcript = (p.get("transcript") or "").strip()[:4000] or "—"
+    return (f"ОКНО: client_id={cid} client_name={name}\n\n"
+            f"ТРАНСКРИПТ ОКНА (ход диалога, '[роль]: текст'):\n{transcript}\n\n"
+            f"РЕПЛИКИ КЛИЕНТА (входящие):\n{_join(p.get('incoming'), 2000)}\n\n"
+            f"ОТПРАВЛЕНО КЛИЕНТУ (наши одобренные ответы):\n{_join(p.get('sent'), 3000)}\n\n"
+            f"ЧЕРНОВИКИ (до модерации):\n{_join(p.get('drafts'), 2000)}\n")
+
+
+def _parse_revizor_json(text):
+    """Строгий парс ответа думателя-ревизора → list находок [{class,evidence,action,task_text}] или None
+    (fail-safe: массив вообще не распарсился). Терпим обёртку-мусор вокруг массива (от первой [ до
+    последней ]). Каждый элемент валидируем: dict с action ∈ task|owner|noise; class/evidence/task_text —
+    строки (клипуем evidence≤200, task_text≤400). Кривые элементы отбрасываем; пустой [] → []."""
+    t = (text or "").strip()
+    i, j = t.find("["), t.rfind("]")
+    if i < 0 or j <= i:
+        return None
+    try:
+        arr = json.loads(t[i:j + 1])
+    except Exception:
+        return None
+    if not isinstance(arr, list):
+        return None
+    out = []
+    for it in arr:
+        if not isinstance(it, dict):
+            continue
+        action = str(it.get("action") or "").strip().lower()
+        if action not in _REVIZOR_ACTIONS:
+            continue
+        out.append({"class": str(it.get("class") or "").strip()[:8],
+                    "evidence": str(it.get("evidence") or "").strip()[:_REVIZOR_EVIDENCE_MAX],
+                    "action": action,
+                    "task_text": str(it.get("task_text") or "").strip()[:_REVIZOR_TASK_MAX]})
+    return out
+
+
+def _revizor_consult(package):
+    """Думатель-ревизор ОДНОГО окна: _thinker_exec(REVIZOR_PREAMBLE + текст пакета) → список находок
+    чек-листа. Read-only, --max-turns 1, THINKER_MODEL/фолбэк, таймаут REVIZOR_TIMEOUT=300с. Возврат:
+    list находок (пустой [] = нарушений нет) или None при ЛЮБОМ сбое думателя / нераспарсенном ответе
+    (fail-safe: upstream просто пропускает окно, ничего не ломается). Инъектируется в тестах."""
+    prompt = REVIZOR_PREAMBLE + _revizor_pkg_text(package)
+    out = _thinker_exec(prompt, REVIZOR_TIMEOUT, "dialog-revizor")
+    if out is None:
+        return None
+    findings = _parse_revizor_json(out)
+    if findings is None:
+        log.warning("revizor: ответ думателя-ревизора не распарсился (fail-safe пропуск): %.200s", out)
+    return findings
 
 
 def revizor_tick(since=None, now=None, db_path=None, rows=None):

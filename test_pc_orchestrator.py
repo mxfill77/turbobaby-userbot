@@ -3252,6 +3252,101 @@ class TestRevizorSelect(unittest.TestCase):
         self.assertEqual(o._revizor_db_rows(db_path=os.path.join(tempfile.gettempdir(), "no_db_zzz.db")), [])
 
 
+class TestRevizorConsult(unittest.TestCase):
+    """Думатель-ревизор окна (шаг 3/7 262): рендер пакета, парс JSON-массива находок, consult с
+    инъекцией _thinker_exec (реальный claude не дёргаем)."""
+
+    def _pkg(self, **kw):
+        base = {"client_id": 555, "client_name": "Пётр",
+                "incoming": ["Какие марки и модели, какие цены на аренду на неделю?"],
+                "transcript": "[client]: Какие марки и модели, какие цены на аренду на неделю?",
+                "sent": ["Здравствуйте! Уточните, пожалуйста, модель и даты аренды."],
+                "drafts": ["черновик"], "last_ts": "2026-07-13T12:00:00+00:00"}
+        base.update(kw)
+        return base
+
+    def test_pkg_text_has_all_sections(self):
+        txt = o._revizor_pkg_text(self._pkg())
+        self.assertIn("client_id=555", txt)
+        self.assertIn("ТРАНСКРИПТ", txt)
+        self.assertIn("Какие марки и модели", txt)          # реплика клиента внутри
+        self.assertIn("ОТПРАВЛЕНО КЛИЕНТУ", txt)
+        self.assertIn("Уточните, пожалуйста, модель", txt)
+
+    def test_pkg_text_empty_sections_dash(self):
+        txt = o._revizor_pkg_text({"client_id": 1, "incoming": [], "sent": [], "drafts": [], "transcript": None})
+        self.assertIn("—", txt)                              # пустые секции не роняют рендер
+
+    def test_parse_valid_array(self):
+        raw = ('[{"class":"ж","evidence":"первым сообщением дал модель+даты, а мы шлём анкету",'
+               '"action":"task","task_text":"фикс: при первом сообщении с моделью+датами котировать, не анкетировать"}]')
+        out = o._parse_revizor_json(raw)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["class"], "ж")
+        self.assertEqual(out[0]["action"], "task")
+        self.assertTrue(out[0]["task_text"].startswith("фикс:"))
+
+    def test_parse_empty_array_is_no_findings(self):
+        self.assertEqual(o._parse_revizor_json("[]"), [])     # нарушений нет → []
+
+    def test_parse_tolerates_wrapper_garbage(self):
+        raw = 'вот находки: [{"class":"г","evidence":"утечка «собрано» в отправленном","action":"owner"}] всё'
+        out = o._parse_revizor_json(raw)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["action"], "owner")
+        self.assertEqual(out[0]["task_text"], "")             # owner → пустой task_text
+
+    def test_parse_drops_bad_items(self):
+        raw = ('[{"class":"а","evidence":"e","action":"task","task_text":"t"},'
+               '"строка-не-объект",'
+               '{"class":"б","action":"unknown"},'          # чужой action → отброшен
+               '{"class":"в","evidence":"переспрос дат","action":"noise"}]')
+        out = o._parse_revizor_json(raw)
+        self.assertEqual([f["action"] for f in out], ["task", "noise"])
+
+    def test_parse_clips_evidence_and_task(self):
+        raw = o.json.dumps([{"class": "д", "evidence": "x" * 500, "action": "task", "task_text": "y" * 900}])
+        out = o._parse_revizor_json(raw)
+        self.assertEqual(len(out[0]["evidence"]), 200)
+        self.assertEqual(len(out[0]["task_text"]), 400)
+
+    def test_parse_non_array_is_none(self):
+        self.assertIsNone(o._parse_revizor_json('{"class":"а"}'))   # объект, не массив → None
+        self.assertIsNone(o._parse_revizor_json("не json вовсе"))
+        self.assertIsNone(o._parse_revizor_json(""))
+
+    def test_consult_injects_thinker_and_parses(self):
+        seen = {}
+        save = o._thinker_exec
+        try:
+            o._thinker_exec = lambda prompt, timeout, tag: seen.update(prompt=prompt, timeout=timeout, tag=tag) or \
+                '[{"class":"ж","evidence":"анкета на первом сообщении","action":"task","task_text":"котировать"}]'
+            out = o._revizor_consult(self._pkg())
+        finally:
+            o._thinker_exec = save
+        self.assertEqual(seen["timeout"], o.REVIZOR_TIMEOUT)
+        self.assertEqual(seen["tag"], "dialog-revizor")
+        self.assertIn("чек-листу", seen["prompt"])            # преамбула вклеена
+        self.assertIn("Какие марки и модели", seen["prompt"])  # текст пакета вклеен
+        self.assertEqual(out[0]["class"], "ж")
+
+    def test_consult_thinker_none_is_failsafe(self):
+        save = o._thinker_exec
+        try:
+            o._thinker_exec = lambda *a, **k: None            # думатель упал/таймаут
+            self.assertIsNone(o._revizor_consult(self._pkg()))
+        finally:
+            o._thinker_exec = save
+
+    def test_consult_unparseable_is_none(self):
+        save = o._thinker_exec
+        try:
+            o._thinker_exec = lambda *a, **k: "болтовня без массива"
+            self.assertIsNone(o._revizor_consult(self._pkg()))
+        finally:
+            o._thinker_exec = save
+
+
 class TestRevizorState(unittest.TestCase):
     """Метка прошлого прогона (restart-proof) + троттлинг/бутстрап maybe_revizor."""
 
