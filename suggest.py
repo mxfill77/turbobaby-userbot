@@ -766,6 +766,31 @@ def strip_greeting(text: str) -> str:
     return s
 
 
+# Сигнатуры автоприветствия Telegram Business (обе поколения владельца) — держать СИНХРОННЫМИ с
+# _REVIZOR_AUTOGREETING_RES (pc_orchestrator.py:3003). Автогритинг уходит с нашего аккаунта мимо
+# бота/модерации, но в транскрипте реальной истории виден как строка [менеджер]:.
+_AUTOGREETING_RES = (
+    re.compile(r"спасибо\W+что\W+выбрали\W+нас", re.IGNORECASE),
+    re.compile(r"уже\W+смотрю\W+ваше\W+сообщени", re.IGNORECASE),
+)
+
+
+def autogreeting_already_sent(transcript: str) -> bool:
+    """В окне уже уходило автоприветствие Telegram Business («Спасибо, что выбрали нас…» /
+    «Уже смотрю ваше сообщение…»)? Сканируем строки [менеджер]: (автогритинг с нашего аккаунта).
+    _GREETING_RE его НЕ ловит (не слово-привет), поэтому greeting_already_sent тут молчит — это
+    root cause класса «е»: бот здоровается ПОВЕРХ автоприветствия. Детект детерминированный
+    (ё→е, пунктуация-агностично); сигнатуры держать синхронными с _REVIZOR_AUTOGREETING_RES
+    (pc_orchestrator.py:3003). Пусто → False."""
+    for ln in (transcript or "").split("\n"):
+        if not ln.startswith("[менеджер]:"):
+            continue
+        body = ln[len("[менеджер]:"):].replace("ё", "е")
+        if any(rx.search(body) for rx in _AUTOGREETING_RES):
+            return True
+    return False
+
+
 # --- детект «котируемой» брони на ПЕРВОМ же сообщении (родитель #271, класс «ж») ---------------
 # Клиент ПЕРВОЙ репликой даёт модель + старт + срок ⇒ надо КОТИРОВАТЬ, а не слать анкету/список
 # вопросов. Детерминированный детект (без сети/LLM): вытаскиваем ровно три обязательных поля.
@@ -2215,7 +2240,10 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         )
     else:
         greet = (
-            "\n\nЭто ПРОДОЛЖЕНИЕ диалога — НЕ здоровайся повторно, сразу отвечай по сути."
+            "\n\nЭто ПРОДОЛЖЕНИЕ диалога (клиент уже поздоровался/получил автоприветствие) — "
+            "НЕ здоровайся повторно. НЕ начинай ответ с «Здравствуйте/Привет/Приветствую/Добрый "
+            "день|утро|вечер/Спасибо, что написали|выбрали нас/Hello/Hi» и подобных зачинов — "
+            "сразу отвечай по сути."
         )
     # Живой провал 20:59 (черновик #275): сетка ПРАЙС ПО ПАРКУ дошла до промпта, но policy ниже
     # («СТРОГО»: «Дат нет — сперва спроси даты», цена только из блока «ЦЕНА из Календаря») её не
@@ -3369,9 +3397,15 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
     client_ref = f"@{sender.username}" if getattr(sender, "username", None) else f"id{sender.id}"
     msgs = await _fetch_messages(client, sender)
     transcript = transcript_from(msgs, me_id)
-    # Приветствие ОДИН РАЗ на диалог: первый контакт по окну И приветствие ещё не уходило
-    # (учитываем автоприветствие / прошлый наш ответ из транскрипта).
-    first = first_contact_from(msgs, me_id) and not greeting_already_sent(transcript)
+    # Приветствие ОДИН РАЗ на диалог. Два независимых сигнала из истории окна:
+    #  • is_first_bot_reply — это первый ответ бота (нет наших сообщений) И слово-приветствие
+    #    ещё не уходило прошлым нашим ответом;
+    #  • has_autogreeting — в окне уже было автоприветствие Telegram Business «спасибо, что
+    #    выбрали нас…» (класс «е»; _GREETING_RE его не ловит, поэтому нужен отдельный детект).
+    # Здороваемся только когда это первый ответ бота И автогритинга не было.
+    is_first_bot_reply = first_contact_from(msgs, me_id) and not greeting_already_sent(transcript)
+    has_autogreeting = autogreeting_already_sent(transcript)
+    first = is_first_bot_reply and not has_autogreeting
     last_client_line = ""
     for ln in reversed(transcript.split("\n")):
         if ln.startswith("[клиент]:"):
@@ -3408,6 +3442,15 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
         log.warning(f"SUGGEST: пустой черновик для {client_ref} — пропускаю.")
         await post_mod_note(client, f"⚠️ Черновик НЕ сгенерирован для {client_ref}: пустой вывод LLM")
         return None
+    # Гард повторного приветствия (родитель #311): LLM порой здоровается вопреки промпту. Если это
+    # НЕ первый ответ бота ИЛИ уже было автоприветствие Business — детерминированно срезаем зачин
+    # из черновика перед отправкой (belt-and-suspenders поверх промпта «не здоровайся повторно»).
+    if (not is_first_bot_reply) or has_autogreeting:
+        stripped = strip_greeting(draft)
+        if stripped != draft:
+            why = "автоприветствие Business в окне" if has_autogreeting else "не первый ответ бота"
+            log.info(f"SUGGEST: срезано повторное приветствие в черновике для {client_ref} ({why}).")
+            draft = stripped
 
     rec = {
         "client_id": client_id, "client_ref": client_ref, "lang": lang,

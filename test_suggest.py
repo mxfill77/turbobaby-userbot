@@ -162,6 +162,30 @@ class TestPureLogic(unittest.TestCase):
         # приветствие у КЛИЕНТА не считается нашим
         self.assertFalse(suggest.greeting_already_sent("[клиент]: Здравствуйте!"))
 
+    def test_autogreeting_already_sent(self):
+        # РЕАЛЬНЫЕ дословные автоприветствия Telegram Business (класс «е» ревизора), которые
+        # _GREETING_RE НЕ ловит (не слово-привет) → нужен отдельный детект. Строка [менеджер]:.
+        self.assertTrue(suggest.autogreeting_already_sent(
+            "[менеджер]: Спасибо, что выбрали нас! Мы в БангТао и Камале.\n[клиент]: NMAX есть?"))
+        self.assertTrue(suggest.autogreeting_already_sent(
+            "[менеджер]: Уже смотрю ваше сообщение, отвечу через минуту"))
+        # ё→е и пунктуация-агностично (парафразы форматирования владельца)
+        self.assertTrue(suggest.autogreeting_already_sent(
+            "[менеджер]: Спасибо,   что  выбрали  нас 🙏"))
+        self.assertTrue(suggest.autogreeting_already_sent(
+            "[менеджер]: Уже смотрю ваше сообщение."))  # регекс матчит префикс «сообщени»
+        # НЕГАТИВЫ: автогритинг у КЛИЕНТА не наш; обычный наш ответ; слово-привет (это ловит
+        # greeting_already_sent, но НЕ autogreeting); чистый первый контакт без нашей строки.
+        self.assertFalse(suggest.autogreeting_already_sent(
+            "[клиент]: Спасибо, что выбрали нас"))
+        self.assertFalse(suggest.autogreeting_already_sent(
+            "[менеджер]: NMAX стоит 449฿/день"))
+        self.assertFalse(suggest.autogreeting_already_sent(
+            "[менеджер]: Здравствуйте! Что арендуете?"))
+        self.assertFalse(suggest.autogreeting_already_sent(
+            "[клиент]: Какие марки и модели, какие цены на аренду?"))
+        self.assertFalse(suggest.autogreeting_already_sent(""))
+
     def test_strip_greeting(self):
         # одиночные зачины RU: срез + восстановление первой заглавной остатка
         self.assertEqual(suggest.strip_greeting("Здравствуйте! Аренда 500฿/день"),
