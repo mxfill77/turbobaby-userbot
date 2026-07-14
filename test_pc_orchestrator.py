@@ -71,7 +71,7 @@ class FakeBridge:
 class Base(unittest.TestCase):
     def setUp(self):
         self._save = (o.bc, o.run_claude, o._notify, o._cowork, o._stopped, o._selfheal_on,
-                      o._notify_chain_card)
+                      o._notify_chain_card, o._loc_mark_chain_final)
         self.fb = FakeBridge()
         o.bc = self.fb
         o._notify = lambda *a, **k: None
@@ -79,10 +79,11 @@ class Base(unittest.TestCase):
         o._stopped = lambda: False
         o._selfheal_on = lambda: False        # существующие тесты — прежнее поведение (флаг off)
         o._notify_chain_card = lambda *a, **k: None   # не спавним dispatch_notify в тестах
+        o._loc_mark_chain_final = lambda pid, path=None: None  # боевой state-файл в тестах не пишем
 
     def tearDown(self):
         (o.bc, o.run_claude, o._notify, o._cowork, o._stopped, o._selfheal_on,
-         o._notify_chain_card) = self._save
+         o._notify_chain_card, o._loc_mark_chain_final) = self._save
 
     def _claude(self, rc=0, out="готово\nRESULT: готово", err="", raise_timeout=False, write_marker=False):
         def fake(prompt, timeout, cwd, env):
@@ -4364,6 +4365,68 @@ class TestChainControl(TestLocalDecChain):
                      if str(t.get("task_text") or "").startswith(f"[шаг 2/2 родитель {live}]")]
         self.assertEqual(stopped_next, [])
         self.assertEqual(len(live_next), 1)
+
+
+class TestChainCardDedup(unittest.TestCase):
+    """Класс-голдены спам-лупа 14:25 14.07 (залп «План цепи #101» при рестарте демона):
+    «отправлено» — в state-файле (restart-proof, ключ = родитель+sha1 текста, т.е. версия
+    плана+шаг), финализированные цепи не анонсируются никогда, событие = ровно одна карточка."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self._tmp.name, "chain_cards.json")
+        self.sent = []
+        self.spawn = lambda pid, text: self.sent.append((pid, text))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_event_sent_exactly_once(self):
+        # событие → ровно одна карточка; повтор того же события — тишина.
+        r1 = o._notify_chain_card(101, "🧩 План цепи #101: 2 шагов", state_path=self.state,
+                                  spawn=self.spawn)
+        r2 = o._notify_chain_card(101, "🧩 План цепи #101: 2 шагов", state_path=self.state,
+                                  spawn=self.spawn)
+        self.assertTrue(r1)
+        self.assertFalse(r2)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_restart_zero_repeats(self):
+        # ГЛАВНЫЙ голден: «рестарт демона» = новая память процесса, ТОТ ЖЕ state-файл →
+        # ноль повторов по всем историческим событиям.
+        events = [f"▶️ Цепь #101: шаг {j}/5 в очереди." for j in range(1, 6)]
+        for e in events:
+            o._notify_chain_card(101, e, state_path=self.state, spawn=self.spawn)
+        self.assertEqual(len(self.sent), 5)
+        # «рестарт»: свежий список отправок (память умерла), state-файл пережил
+        self.sent.clear()
+        for e in events:
+            o._notify_chain_card(101, e, state_path=self.state, spawn=self.spawn)
+        self.assertEqual(self.sent, [])                      # НОЛЬ повторов после рестарта
+
+    def test_different_events_both_sent(self):
+        o._notify_chain_card(200, "▶️ Цепь #200: шаг 1/3 в очереди.", state_path=self.state,
+                             spawn=self.spawn)
+        o._notify_chain_card(200, "▶️ Цепь #200: шаг 2/3 в очереди.", state_path=self.state,
+                             spawn=self.spawn)
+        self.assertEqual(len(self.sent), 2)                  # разные события — обе уходят
+
+    def test_finalized_chain_always_silent(self):
+        # финализированная цепь → тишина НАВСЕГДА, даже для новых текстов (артефакты 101).
+        o._loc_mark_chain_final(101, path=self.state)
+        r = o._notify_chain_card(101, "🧩 План цепи #101: новая версия", state_path=self.state,
+                                 spawn=self.spawn)
+        self.assertFalse(r)
+        self.assertEqual(self.sent, [])
+        # соседняя живая цепь не задета
+        self.assertTrue(o._notify_chain_card(102, "🧩 План цепи #102", state_path=self.state,
+                                             spawn=self.spawn))
+
+    def test_sent_history_capped(self):
+        for i in range(o.CHAIN_CARD_SENT_MAX + 50):
+            o._notify_chain_card(300, f"событие {i}", state_path=self.state, spawn=self.spawn)
+        st = o._chain_cards_read(self.state)
+        self.assertLessEqual(len(st["sent"]), o.CHAIN_CARD_SENT_MAX)   # история не пухнет
 
 
 if __name__ == "__main__":

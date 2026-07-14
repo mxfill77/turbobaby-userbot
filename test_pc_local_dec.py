@@ -113,13 +113,19 @@ class LocBase(unittest.TestCase):
         os.environ["STEP_SELFHEAL"] = "1"
         os.environ["PLAN_ADAPT"] = "1"
         self._save = (o.bc, o.run_task, o._thinker_exec, o._notify, o._cowork, o._stopped,
-                      o.maybe_update_bots)
+                      o.maybe_update_bots, o._notify_chain_card, o._loc_mark_chain_final)
         self.fb = FakeBridge()
         o.bc = self.fb
         o._notify = lambda *a, **k: None
         o._cowork = lambda *a, **k: None
         o._stopped = lambda: False
         o.maybe_update_bots = lambda *a, **k: ""
+        # СПАМ-ЛУП 14:25 14.07: незамоканный _notify_chain_card стрелял из гейт-тестов РЕАЛЬНЫМИ
+        # subprocess-карточками фикстурной цепи 101 в личку (41 шт при каждом прогоне гейта).
+        # Тесты НИКОГДА не шлют наружу: карточки копим в self.chain_cards, state-файл не трогаем.
+        self.chain_cards = []
+        o._notify_chain_card = lambda pid, text, **kw: self.chain_cards.append((pid, text))
+        o._loc_mark_chain_final = lambda pid, path=None: None   # боевой state-файл в тестах не пишем
         o._loc_summarized.clear()
         o._loc_adapt_finish.clear()
         o._loc_adapted.clear()
@@ -158,7 +164,7 @@ class LocBase(unittest.TestCase):
 
     def tearDown(self):
         (o.bc, o.run_task, o._thinker_exec, o._notify, o._cowork, o._stopped,
-         o.maybe_update_bots) = self._save
+         o.maybe_update_bots, o._notify_chain_card, o._loc_mark_chain_final) = self._save
         o._loc_summarized.clear()
         o._loc_adapt_finish.clear()
         o._loc_adapted.clear()

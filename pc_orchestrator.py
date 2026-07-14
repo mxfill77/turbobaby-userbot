@@ -34,6 +34,7 @@ import time
 import json
 import shutil
 import logging
+import hashlib
 import datetime
 import tempfile
 import subprocess
@@ -220,14 +221,76 @@ def _notify(text):
         log.warning("пуш не отправлен: %s", e)
 
 
-def _notify_chain_card(pid, text):
-    """Карточка цепи владельцу с кнопками [⏹ Стоп цепи][📊 Статус цепи] (dispatch_notify --card,
-    fire-and-forget). callback слушает pc_agent (owner-gate). Сбой доставки тик демона не роняет."""
+# --- карточки цепи: restart-proof дедуп + мьют финализированных (спам-луп 14:25 14.07) ---
+# Живой провал: залп «План цепи #101» (41 карточка исторических версий) в личку при рестарте
+# демона 0bd46c0. Корень двойной: (1) гейт-тесты test_pc_local_dec звали НЕзамоканный
+# _notify_chain_card — каждый прогон гейта стрелял реальными subprocess-карточками фикстурной
+# цепи 101 (LocBase теперь мокает); (2) у самой функции не было ни restart-proof дедупа, ни
+# исключения финализированных цепей. Класс: «отправлено» — в state-файле по ключу события
+# (родитель + sha1 текста карточки: текст несёт версию плана и номер шага), финализированные
+# цепи (сводка поставлена / помечены вручную) не анонсируются НИКОГДА.
+CHAIN_CARD_STATE = os.path.join(REPO, "pc_orchestrator.chain_cards.json")
+CHAIN_CARD_SENT_MAX = 500          # кап истории ключей (старые события дедупить незачем)
+
+
+def _chain_cards_read(path=None):
+    """State карточек цепей {'sent': [ключи], 'final': [pid]} → dict ({} при отсутствии/бое)."""
     try:
-        subprocess.Popen([VENV_PY, DNOTIFY, "--card", str(pid), str(text)], cwd=REPO,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        with open(path or CHAIN_CARD_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _chain_cards_write(d, path=None):
+    try:
+        with open(path or CHAIN_CARD_STATE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning("state карточек цепей не записался (%s) — дедуп деградирует, не критично", e)
+
+
+def _loc_mark_chain_final(pid, path=None):
+    """Пометить цепь pid финализированной: её карточки БОЛЬШЕ НИКОГДА не анонсируются
+    (restart-proof). Зовётся при постановке сводки (halt/finish/стоп) и при узнавании
+    закрытой цепи после рестарта; вручную — для исторических артефактов (цепь 101)."""
+    st = _chain_cards_read(path)
+    fin = set(int(x) for x in (st.get("final") or []))
+    if int(pid) in fin:
+        return
+    fin.add(int(pid))
+    st["final"] = sorted(fin)
+    _chain_cards_write(st, path)
+
+
+def _notify_chain_card(pid, text, state_path=None, spawn=None):
+    """Карточка цепи владельцу с кнопками [⏹ Стоп цепи][📊 Статус цепи] (dispatch_notify --card,
+    fire-and-forget). callback слушает pc_agent (owner-gate). Сбой доставки тик демона не роняет.
+    Дедуп restart-proof: ключ события (pid+sha1 текста) в CHAIN_CARD_STATE — рестарт демона НЕ
+    повторяет уже отправленные; финализированные цепи (final) не анонсируются никогда."""
+    st = _chain_cards_read(state_path)
+    if int(pid) in set(int(x) for x in (st.get("final") or [])):
+        log.info("карточка цепи %s подавлена: цепь финализирована", pid)
+        return False
+    key = f"{pid}:{hashlib.sha1(str(text).encode('utf-8')).hexdigest()[:12]}"
+    sent = list(st.get("sent") or [])
+    if key in sent:
+        log.info("карточка цепи %s подавлена: событие уже отправлялось (restart-proof дедуп)", pid)
+        return False
+    try:
+        if spawn is not None:
+            spawn(pid, text)
+        else:
+            subprocess.Popen([VENV_PY, DNOTIFY, "--card", str(pid), str(text)], cwd=REPO,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL)
     except Exception as e:
         log.warning("карточка цепи не отправлена (pid=%s): %s", pid, e)
+        return False
+    st["sent"] = (sent + [key])[-CHAIN_CARD_SENT_MAX:]
+    _chain_cards_write(st, state_path)
+    return True
 
 
 def _notify_critical(text):
@@ -1673,6 +1736,7 @@ def _loc_post_summary(pid, steps):
     bc.claim_task(sid)
     cm = bc.complete_task(sid, "done", text)
     _loc_summarized.add(pid)
+    _loc_mark_chain_final(pid)      # финализированная цепь карточек больше не анонсирует (restart-proof)
     _cowork(f"сводка родитель {pid}: {n_done}/{total} done")  # NOTE в журнал в момент постановки
     log.info("pcloc-dec: сводка родителя %s → задача %s (bridge_ok=%s)", pid, sid, cm.get("ok"))
 
@@ -1711,6 +1775,7 @@ def _loc_stop_chain(pid, by="владельцем"):
     bc.claim_task(sid)
     bc.complete_task(sid, "done", text)
     _loc_summarized.add(pid)
+    _loc_mark_chain_final(pid)      # стоп владельцем = финал: карточки цепи замолкают навсегда
     _rows, n_done, total = _loc_summary_counts(steps)
     _cowork(f"цепь #{pid} остановлена ({by}): {n_done}/{total} done, следующий шаг не релизится")
     log.info("pcloc-dec: цепь %s остановлена (%s) → сводка id=%s", pid, by, sid)
@@ -2001,6 +2066,7 @@ def _loc_chain_tick(pid, steps):
     # терминальный статус: закрытая ранее цепь (рестарт демона) → в кэш и не трогать
     if _loc_summary_exists(pid):
         _loc_summarized.add(pid)
+        _loc_mark_chain_final(pid)  # узнанная закрытая цепь — карточки замолкают (restart-proof)
         return
     if st == "failed":
         _loc_after_fail(pid, i, n, it, steps)
