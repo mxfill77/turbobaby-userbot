@@ -13,6 +13,7 @@ Bridge недоступен / ошибка / таймаут / не-ok → get_de
 """
 
 import os
+import re
 import json
 import time
 import logging
@@ -89,3 +90,137 @@ def get_delivery_zones(_get=None, _now=None):
     c["data"] = zones
     log.info(f"get_delivery_zones ok: {len(zones)} зон")
     return zones
+
+
+# ===========================================================================
+# resolve_maps_link — из ссылки Google Maps достать (lat, lon) точки доставки
+# ===========================================================================
+#
+# Клиент кидает точку в переписку короткой ссылкой (maps.app.goo.gl/…) или полным
+# URL Google Maps. Чтобы посчитать зону/цену доставки по координатам, ссылку надо
+# ПРЕВРАТИТЬ в (lat, lon). Порядок:
+#   1) координаты уже в самой ссылке (?q=lat,lng, @lat,lng, !3d…!4d…, %2C-кодирование,
+#      обрезанный мессенджером хвост) — берём БЕЗ сети;
+#   2) короткая ссылка (maps.app.goo.gl / goo.gl) — разворачиваем по HTTP-редиректу
+#      (с таймаутом, БЕЗ исполнения JS) и парсим конечный URL;
+#   3) place-ссылка без координат / битая ссылка / не-строка → None (честный фолбэк,
+#      как у зон: не выдумываем координаты).
+# Никогда не роняет вызывающий код: любые сетевые исключения проглатываются → None.
+
+MAPS_TIMEOUT = int(os.getenv("MAPS_RESOLVE_TIMEOUT", "8") or "8")
+# Хосты коротких ссылок, которые надо разворачивать редиректом (без координат в URL).
+_MAPS_SHORT_HOSTS = ("maps.app.goo.gl", "app.goo.gl", "goo.gl", "g.co")
+# Сколько редиректов пройти при разворачивании (защита от циклов).
+_MAPS_MAX_HOPS = 5
+
+# Пары координат в разных местах URL. Требуем десятичную точку (реальные гео-точки её
+# всегда имеют) — так не ловим случайные «q=1,2» из мусора. Диапазоны валидируем отдельно.
+_LATLON = r"(-?\d{1,3}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)"
+# ?q=/query=/ll=/destination=/daddr=/center= — явно заданная точка.
+_RE_MAPS_QUERY = re.compile(r"[?&](?:q|query|ll|sll|destination|daddr|center)=" + _LATLON, re.I)
+# !3dLAT!4dLNG — точный пин места в data-хвосте развёрнутого URL.
+_RE_MAPS_3D4D = re.compile(r"!3d(-?\d{1,3}\.\d+)!4d(-?\d{1,3}\.\d+)")
+# @LAT,LNG,zoom — центр вьюпорта (менее точен, потому в самом конце приоритета).
+_RE_MAPS_AT = re.compile(r"@" + _LATLON)
+
+
+def _valid_latlon(lat, lon):
+    """(lat, lon) как float в допустимых диапазонах, иначе None."""
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (TypeError, ValueError):
+        return None
+    if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+        return (lat, lon)
+    return None
+
+
+def _parse_coords_from_url(url):
+    """Достать (lat, lon) из строки URL Google Maps или None. Сначала URL-декодируем
+    (%2C→',', %2F→'/' и т.п.), затем пробуем форматы по убыванию точности точки:
+    ?q=/query=… → !3d…!4d… → @…,…. Устойчив к обрезанному мессенджером хвосту."""
+    if not url:
+        return None
+    try:
+        dec = urllib.parse.unquote(url)
+    except Exception:
+        dec = url
+    for rx in (_RE_MAPS_QUERY, _RE_MAPS_3D4D, _RE_MAPS_AT):
+        m = rx.search(dec)
+        if m:
+            r = _valid_latlon(m.group(1), m.group(2))
+            if r:
+                return r
+    return None
+
+
+def _is_short_maps_link(url):
+    """URL — короткая ссылка Google Maps (maps.app.goo.gl / goo.gl / g.co)?"""
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    host = host.split("@")[-1].split(":")[0]  # срезать креды/порт, если есть
+    return host in _MAPS_SHORT_HOSTS or host.endswith(".app.goo.gl")
+
+
+def _default_expand(url):
+    """Развернуть короткую ссылку по цепочке HTTP-редиректов (БЕЗ исполнения JS),
+    вернуть конечный URL. Тело не грузим — читаем только заголовок Location.
+    Может кинуть (таймаут/сеть) — ловится в resolve_maps_link."""
+    cur = url
+    for _ in range(_MAPS_MAX_HOPS):
+        req = urllib.request.Request(
+            cur, method="HEAD",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; TurboBaby/1.0)"})
+        # Не даём urllib молча ходить по редиректам — сами читаем Location.
+        opener = urllib.request.build_opener(_NoRedirectHandler)
+        resp = opener.open(req, timeout=MAPS_TIMEOUT)
+        try:
+            code = resp.getcode()
+            if code in (301, 302, 303, 307, 308):
+                loc = resp.headers.get("Location")
+                if not loc:
+                    return cur
+                cur = urllib.parse.urljoin(cur, loc)
+                continue
+            return resp.geturl()
+        finally:
+            resp.close()
+    return cur
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Не следовать редиректам автоматически — вернуть 3xx-ответ вызывающему коду."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def resolve_maps_link(url, _expand=None):
+    """Ссылка Google Maps → (lat, lon) точки доставки, либо None.
+    Короткие maps.app.goo.gl/goo.gl разворачиваются HTTP-редиректом (с таймаутом, без JS);
+    поддержаны форматы ?q=lat,lng, @lat,lng, !3d…!4d…, %2C-кодирование и обрезанные
+    мессенджером хвосты. place-ссылка без координат / битая ссылка / не-строка → None.
+    _expand — инъекция сети для тестов. НИКОГДА не роняет вызывающий код."""
+    if not isinstance(url, str):
+        return None
+    url = url.strip()
+    if not url:
+        return None
+    # 1) координаты уже в ссылке — берём без сети
+    coords = _parse_coords_from_url(url)
+    if coords:
+        return coords
+    # 2) короткая ссылка — развернуть редиректом и распарсить конечный URL
+    if _is_short_maps_link(url):
+        expander = _expand or _default_expand
+        try:
+            final = expander(url)
+        except Exception as e:
+            log.info(f"resolve_maps_link: разворот не удался ({type(e).__name__}) — None")
+            return None
+        if isinstance(final, str):
+            return _parse_coords_from_url(final)
+    # 3) place-ссылка без координат / битая ссылка → None
+    return None

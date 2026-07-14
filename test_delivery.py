@@ -109,5 +109,133 @@ class TestDeliveryZones(unittest.TestCase):
         self.assertEqual(still, good)   # валидные зоны не затёрты провалом Bridge
 
 
+class TestResolveMapsLink(unittest.TestCase):
+    """Ссылка Google Maps → (lat, lon) | None. Сеть замокана через _expand (короткие
+    ссылки НЕ ходят в интернет). На каждый формат координат — позитив, на place/битые — None."""
+
+    PHUKET = (7.8804, 98.3923)  # ориентир: точка на Пхукете (lat≈7.88, lon≈98.39)
+
+    def _assert_close(self, got, want):
+        self.assertIsNotNone(got)
+        self.assertAlmostEqual(got[0], want[0], places=4)
+        self.assertAlmostEqual(got[1], want[1], places=4)
+
+    # ------------------------- прямые координаты в URL -----------------------
+
+    def test_format_q_param(self):
+        url = "https://www.google.com/maps?q=7.8804,98.3923"
+        self._assert_close(delivery.resolve_maps_link(url), self.PHUKET)
+
+    def test_format_at(self):
+        url = "https://www.google.com/maps/@7.8804,98.3923,17z"
+        self._assert_close(delivery.resolve_maps_link(url), self.PHUKET)
+
+    def test_format_percent2c_encoded(self):
+        # запятая закодирована как %2C (частый вид при пересылке)
+        url = "https://maps.google.com/?q=7.8804%2C98.3923"
+        self._assert_close(delivery.resolve_maps_link(url), self.PHUKET)
+
+    def test_format_3d4d_pin(self):
+        # точный пин места в data-хвосте развёрнутого URL
+        url = ("https://www.google.com/maps/place/Villa/@7.9,98.4,17z/"
+               "data=!3m1!4b1!3d7.8804!4d98.3923")
+        self._assert_close(delivery.resolve_maps_link(url), self.PHUKET)
+
+    def test_format_query_param_alias(self):
+        url = "https://www.google.com/maps/search/?api=1&query=7.8804,98.3923"
+        self._assert_close(delivery.resolve_maps_link(url), self.PHUKET)
+
+    def test_truncated_messenger_tail(self):
+        # мессенджер обрезал длинный хвост после координат — точка ещё в query
+        url = "https://www.google.com/maps?q=7.8804,98.3923&z=17&hl=ru&ent"  # хвост &entry=… срезан
+        self._assert_close(delivery.resolve_maps_link(url), self.PHUKET)
+
+    def test_truncated_tail_mid_coordinate(self):
+        # хвост срезан ПОСЛЕ валидной дробной части lon — координата всё ещё парсится
+        url = "https://www.google.com/maps?q=7.8804,98.39"
+        got = delivery.resolve_maps_link(url)
+        self.assertIsNotNone(got)
+        self.assertAlmostEqual(got[0], 7.8804, places=3)
+        self.assertAlmostEqual(got[1], 98.39, places=2)
+
+    def test_direct_coords_do_not_hit_network(self):
+        # если координаты уже в ссылке — _expand НЕ должен вызываться
+        calls = {"n": 0}
+        def expander(u):
+            calls["n"] += 1
+            return u
+        delivery.resolve_maps_link("https://maps.google.com/?q=7.88,98.39", _expand=expander)
+        self.assertEqual(calls["n"], 0)
+
+    # ------------------------- короткие ссылки (мок сети) --------------------
+
+    def test_short_link_expands_to_coords(self):
+        short = "https://maps.app.goo.gl/AbCdEf123"
+        final = "https://www.google.com/maps/place/X/@7.8804,98.3923,17z/data=!3d7.8804!4d98.3923"
+        got = delivery.resolve_maps_link(short, _expand=lambda u: final)
+        self._assert_close(got, self.PHUKET)
+
+    def test_short_link_gooogl_expands(self):
+        short = "https://goo.gl/maps/xyz"
+        got = delivery.resolve_maps_link(short, _expand=lambda u: "https://maps.google.com/?q=7.88,98.39")
+        self.assertIsNotNone(got)
+
+    def test_short_link_calls_expander_with_url(self):
+        seen = {}
+        short = "https://maps.app.goo.gl/Zzz"
+        def expander(u):
+            seen["u"] = u
+            return "https://maps.google.com/?q=7.88,98.39"
+        delivery.resolve_maps_link(short, _expand=expander)
+        self.assertEqual(seen.get("u"), short)
+
+    # ------------------------------- None-случаи -----------------------------
+
+    def test_short_link_place_without_coords_is_none(self):
+        # развернулась в place-ссылку без координат → None
+        short = "https://maps.app.goo.gl/NoCoords"
+        final = "https://www.google.com/maps/place/Some+Cafe/"
+        self.assertIsNone(delivery.resolve_maps_link(short, _expand=lambda u: final))
+
+    def test_short_link_expand_raises_is_none(self):
+        def boom(u):
+            raise RuntimeError("timeout")
+        self.assertIsNone(delivery.resolve_maps_link("https://maps.app.goo.gl/x", _expand=boom))
+
+    def test_short_link_expand_returns_non_string_is_none(self):
+        self.assertIsNone(delivery.resolve_maps_link("https://maps.app.goo.gl/x", _expand=lambda u: None))
+
+    def test_place_link_without_coords_is_none(self):
+        url = "https://www.google.com/maps/place/Villa+Sunrise/"
+        self.assertIsNone(delivery.resolve_maps_link(url))
+
+    def test_broken_link_is_none(self):
+        self.assertIsNone(delivery.resolve_maps_link("https://example.com/not-a-map"))
+        self.assertIsNone(delivery.resolve_maps_link("just some text, no url"))
+
+    def test_non_string_is_none(self):
+        self.assertIsNone(delivery.resolve_maps_link(None))
+        self.assertIsNone(delivery.resolve_maps_link(12345))
+        self.assertIsNone(delivery.resolve_maps_link(["https://maps.app.goo.gl/x"]))
+
+    def test_empty_is_none(self):
+        self.assertIsNone(delivery.resolve_maps_link(""))
+        self.assertIsNone(delivery.resolve_maps_link("   "))
+
+    def test_out_of_range_coords_is_none(self):
+        # lat 98 недопустима (>90) — не путаем порядок lat/lng
+        url = "https://www.google.com/maps?q=98.3923,7.8804&extra=999.999,999.999"
+        self.assertIsNone(delivery.resolve_maps_link(url))
+
+    def test_non_map_short_domain_not_expanded(self):
+        # не короткая ссылка Maps — сеть не дёргаем, координат нет → None
+        calls = {"n": 0}
+        def expander(u):
+            calls["n"] += 1
+            return "https://maps.google.com/?q=7.88,98.39"
+        self.assertIsNone(delivery.resolve_maps_link("https://bit.ly/abc", _expand=expander))
+        self.assertEqual(calls["n"], 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
