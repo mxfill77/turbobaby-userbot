@@ -207,9 +207,10 @@ class TestBridgeMoneyTablesUntouched(unittest.TestCase):
 
     # Разрешённый импортный контур урока: файловые правки доков + ленивый playbook-sink (текст) +
     # read-only git-verify коммита + LLM-классификатор урока (родитель 334: json — парс вывода думателя;
-    # ленивый pc_orchestrator — переиспользование read-only _thinker_exec). Ничего из БД/Bridge/сети/
-    # pricing тут быть НЕ должно (см. _FORBIDDEN — контур денег/сети/таблиц закрыт по построению).
-    _ALLOWED = {"os", "re", "suggest", "subprocess", "json", "pc_orchestrator"}
+    # ленивый pc_orchestrator — переиспользование read-only _thinker_exec) + time (штамп created_at и
+    # часы таймаута low-ожидания, шаг 4 — read-only, вне денег/сети). Ничего из БД/Bridge/сети/pricing
+    # тут быть НЕ должно (см. _FORBIDDEN — контур денег/сети/таблиц закрыт по построению).
+    _ALLOWED = {"os", "re", "suggest", "subprocess", "json", "pc_orchestrator", "time"}
     _FORBIDDEN = {"sqlite3", "moderation_ipc", "pricing", "requests", "httpx", "urllib",
                   "urllib.request", "socket", "aiohttp", "telethon", "psycopg2"}
 

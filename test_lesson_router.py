@@ -846,5 +846,106 @@ class TestLessonLowConfidence(unittest.TestCase):
         self.assertNotIn("pending_low", dec)                   # не ожидание — сразу в работу
 
 
+class TestLessonLowWaitTimeout(unittest.TestCase):
+    """Родитель 334, шаг 4/6: таймаут ожидания ответа на low-уточнение. Учитель молчит на «верно?»
+    дольше 24ч → урок НЕ теряем: карточка-уточнение владельцу в 1160 + СНЯТИЕ ожидания. Повторный
+    тик карточку НЕ задваивает. Время ПОДМЕНЯЕМ (now инъектируется), Telegram/1160 — фейками."""
+
+    _DAY = 24 * 3600
+
+    def _pending(self, created_at=1_000_000.0):
+        # состояние ожидания как из _enter_low_wait (с меткой времени created_at)
+        return {"text": "[урок:правка от @danya] родитель 334 …", "route": lr.FACT, "class": "ФАКТ",
+                "reading": "депозит назван неверно", "plan": "p", "remark": "депозит вроде не так",
+                "draft": "Аренда Nmax от 1200฿/сутки", "window": "Иван (555)", "who": "@danya",
+                "card_msg_id": "90210", "created_at": created_at}
+
+    def test_enter_low_wait_stamps_created_at(self):
+        # _enter_low_wait штампует created_at (epoch) → таймаут-тику есть от чего считать возраст
+        dec = lr.handle_lesson_task(
+            self._task_task("депозит вроде не так"),
+            classify=lambda r, d="", w="": {"reading": "r", "class": "ФАКТ", "confidence": "low",
+                                            "plan": "p", "route": lr.FACT},
+            reply_moderation=lambda cid, t: True)
+        self.assertEqual("waiting", dec["status"])
+        self.assertIn("created_at", dec["pending_low"])
+        self.assertGreater(dec["pending_low"]["created_at"], 0)
+
+    def _task_task(self, remark, card="90210"):
+        return (f"[урок:правка от @danya] родитель 334 — замечание менеджера в копилку обучения\n"
+                f"окно диалога: Иван (555) (client_id=555) · черновик #7\n"
+                f"карточка модер-группы: msg={card}\n"
+                f"Замечание: {remark}\n"
+                f"Исходный черновик: Аренда Nmax от 1200฿/сутки")
+
+    def test_not_expired_before_24h_no_card(self):
+        # молчание < 24ч → тик НЕ трогает: ждём ответа учителя (None, карточки нет)
+        pending = self._pending(created_at=1_000_000.0)
+        now = 1_000_000.0 + self._DAY - 60          # 23ч59м — ещё рано
+        self.assertIsNone(lr.check_low_wait_timeout(
+            pending, now=now, notify_owner=lambda c: self.fail("рано — владельца НЕ зовём")))
+        self.assertNotIn("timed_out", pending)      # ожидание НЕ снято
+
+    def test_expired_after_24h_cards_owner_and_clears_wait(self):
+        # молчание ≥ 24ч → карточка-уточнение владельцу в 1160 + ожидание снято (clear_wait)
+        sent = {}
+        pending = self._pending(created_at=1_000_000.0)
+        now = 1_000_000.0 + self._DAY + 1           # 24ч+ — таймаут
+        dec = lr.check_low_wait_timeout(
+            pending, now=now, notify_owner=lambda c: (sent.__setitem__("card", c), ("инбокс 1160", True))[1])
+        self.assertEqual(lr.UNCLEAR, dec["route"])
+        self.assertEqual("timeout_to_owner", dec["resumed"])
+        self.assertTrue(dec["clear_wait"])          # ожидание снять
+        self.assertEqual("done", dec["status"])
+        self.assertTrue(dec["delivered"])
+        self.assertEqual("инбокс 1160", dec["channel"])
+        self.assertIn("депозит вроде не так", sent["card"])   # замечание в карточке владельцу
+        self.assertIn("доставлено через инбокс 1160", dec["result"])
+        self.assertTrue(pending["timed_out"])       # состояние помечено снятым
+
+    def test_second_tick_does_not_duplicate_card(self):
+        # ключ шага 4: ПОВТОРНЫЙ тик по уже сработавшему таймауту карточку НЕ задваивает (идемпотентно)
+        calls = {"n": 0}
+        pending = self._pending(created_at=1_000_000.0)
+        now = 1_000_000.0 + self._DAY + 1
+        def notify(card):
+            calls["n"] += 1
+            return ("инбокс 1160", True)
+        dec1 = lr.check_low_wait_timeout(pending, now=now, notify_owner=notify)
+        self.assertIsNotNone(dec1)
+        self.assertEqual(1, calls["n"])
+        # тик ещё раз (демон не успел удалить pending) → None, владельца НЕ зовём повторно
+        dec2 = lr.check_low_wait_timeout(pending, now=now + self._DAY, notify_owner=notify)
+        self.assertIsNone(dec2)
+        self.assertEqual(1, calls["n"])             # карточка отправлена РОВНО один раз
+
+    def test_missing_created_at_is_not_timed_out_blindly(self):
+        # нет метки времени → возраст 0 → НЕ таймаутим вслепую (свежее/неизвестное состояние)
+        pending = {"remark": "r", "route": lr.FACT}
+        self.assertEqual(0.0, lr.low_wait_age_sec(pending, now=9_999_999_999.0))
+        self.assertIsNone(lr.check_low_wait_timeout(
+            pending, now=9_999_999_999.0, notify_owner=lambda c: self.fail("нет метки → не таймаутим")))
+
+    def test_expired_owner_channel_down_is_failsafe(self):
+        # канал 1160 упал при таймауте → не роняем, урок виден в результате/логе, ожидание всё равно снято
+        pending = self._pending(created_at=1_000_000.0)
+        now = 1_000_000.0 + self._DAY + 1
+        dec = lr.check_low_wait_timeout(
+            pending, now=now, notify_owner=lambda c: (_ for _ in ()).throw(RuntimeError("1160 down")))
+        self.assertFalse(dec["delivered"])
+        self.assertIn("не доставлена", dec["result"])
+        self.assertTrue(dec["clear_wait"])          # даже при провале доставки ожидание снимаем (урок в логе)
+        self.assertTrue(pending["timed_out"])
+
+    def test_custom_timeout_respected(self):
+        # timeout инъектируем (демон может задать иной порог) — тик считает по нему
+        pending = self._pending(created_at=1_000_000.0)
+        self.assertIsNone(lr.check_low_wait_timeout(
+            pending, now=1_000_000.0 + 100, timeout=200, notify_owner=lambda c: self.fail("рано")))
+        dec = lr.check_low_wait_timeout(
+            pending, now=1_000_000.0 + 250, timeout=200, notify_owner=lambda c: ("инбокс 1160", True))
+        self.assertEqual("timeout_to_owner", dec["resumed"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

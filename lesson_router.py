@@ -442,6 +442,30 @@ def build_lesson_low_defer():
     return "🤷 Отложил — по-прежнему неясно после поправки, разберётся владелец (карточка ушла ему)."
 
 
+# Таймаут ожидания ответа учителя на low-уточнение (шаг 4): молчит >24ч → урок НЕ теряем, отдаём владельцу.
+LESSON_LOW_WAIT_TIMEOUT = int(os.getenv("LESSON_LOW_WAIT_TIMEOUT", str(24 * 3600)) or str(24 * 3600))
+
+
+def _now_epoch():
+    """Текущее epoch-время (боевой дефолт штампа created_at / часов таймаута). Инъекция now в тестах
+    подменяет время — сам time тянем лениво, чтобы модуль оставался без I/O на импорте."""
+    import time
+    return time.time()
+
+
+def low_wait_age_sec(pending, now=None):
+    """Возраст low-ожидания в секундах по pending['created_at'] (epoch). Нет/битая метка → 0.0 (не
+    таймаутим вслепую — свежее состояние). now инъектируется в тестах (подмена времени)."""
+    try:
+        created = float((pending or {}).get("created_at") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if created <= 0:
+        return 0.0
+    now = _now_epoch() if now is None else float(now)
+    return max(0.0, now - created)
+
+
 # Короткие согласия учителя («да/верно/точно…») отделяем от ТЕКСТОВОЙ поправки: строгие маркеры
 # согласия + допустимые «наполнители» рядом (всё/так/конечно). Поправка — любой ответ, где строгого
 # маркера нет (в т.ч. «нет, дело в цене»). Регистр/пунктуация/эмодзи по краям снимаются.
@@ -565,11 +589,13 @@ def _apply_high(route, text, parsed, remark, reason, reading, plan, cls,
     return dec
 
 
-def _enter_low_wait(llm, text, parsed, remark, reply_mod):
+def _enter_low_wait(llm, text, parsed, remark, reply_mod, now=None):
     """confidence=low: НЕ берём урок в работу вслепую. Реплаем в ТУ ЖЕ модер-группу спрашиваем учителя
     «Понял так: <reading> — верно?» и возвращаем СОСТОЯНИЕ ОЖИДАНИЯ (pending_low) — вызывающий (демон)
     его сохраняет и по ответу учителя зовёт resume_low_lesson. status='waiting' → задача не закрывается.
-    Сбой реплая состояние НЕ теряет (pending_low всё равно в dec; демон повторит/учитель ответит)."""
+    Сбой реплая состояние НЕ теряет (pending_low всё равно в dec; демон повторит/учитель ответит).
+    created_at (epoch) штампуем для таймаута: молчит учитель >24ч → check_low_wait_timeout снимет
+    ожидание и отдаст урок владельцу (шаг 4). now инъектируется в тестах."""
     reading = _one_line(llm.get("reading"))
     plan = _one_line(llm.get("plan"))
     cls = llm.get("class")
@@ -582,7 +608,8 @@ def _enter_low_wait(llm, text, parsed, remark, reply_mod):
         reason = f"{reason}; mod-reply: {e}"
     pending = {"text": str(text or ""), "route": llm.get("route"), "class": cls, "reading": reading,
                "plan": plan, "remark": remark, "draft": parsed.get("draft", ""),
-               "window": parsed.get("window", ""), "who": parsed.get("who", ""), "card_msg_id": card}
+               "window": parsed.get("window", ""), "who": parsed.get("who", ""), "card_msg_id": card,
+               "created_at": _now_epoch() if now is None else float(now)}
     return {"route": llm.get("route"), "confidence": "low", "delegate": False, "status": "waiting",
             "reason": reason, "confirm": confirm, "pending_low": pending, "card_msg_id": card,
             "reading": reading, "plan": plan, "llm_class": cls,
@@ -664,6 +691,47 @@ def resume_low_lesson(pending, reply_text, is_approver, classify=None, append_st
         result = "🤷 Урок снова неясен после поправки: канал 1160 недоступен — карточка не доставлена, замечание в логе"
     return {"route": UNCLEAR, "confidence": "low", "delegate": False, "status": "done",
             "resumed": "deferred_to_owner", "reason": reason, "defer": defer, "card": owner_card,
+            "delivered": delivered, "channel": channel, "result": result}
+
+
+def check_low_wait_timeout(pending, now=None, notify_owner=None, timeout=None):
+    """Тик таймаута low-ожидания (шаг 4). Учитель молчит на уточнение «верно?» дольше timeout
+    (по умолчанию LESSON_LOW_WAIT_TIMEOUT=24ч)? → урок НЕ теряем: карточка-уточнение владельцу в 1160
+    (как для неясного) + СНЯТИЕ ожидания (clear_wait=True — демон удаляет pending). Демон зовёт это
+    штатным тиком по каждому висящему pending_low. → dec при срабатывании либо None, если:
+      • ещё рано (возраст < timeout) — ждём ответа учителя;
+      • нет метки времени (created_at) — не таймаутим вслепую;
+      • таймаут уже сработал по этому состоянию (pending['timed_out']) — ИДЕМПОТЕНТНОСТЬ: повторный
+        тик карточку НЕ задваивает (метим pending ДО доставки).
+    notify_owner/now инъектируемы (юнит без Telegram/1160, с подменой времени). FAIL-SAFE как в
+    handle_lesson_task: канал 1160 упал → урок в результате/логе (не теряем)."""
+    pending = pending or {}
+    if pending.get("timed_out"):                     # уже сняли по таймауту → карточку не задваиваем
+        return None
+    timeout = LESSON_LOW_WAIT_TIMEOUT if timeout is None else timeout
+    if low_wait_age_sec(pending, now) < timeout:
+        return None                                  # ещё ждём ответа учителя (или метки времени нет → 0)
+    pending["timed_out"] = True                      # метим ДО доставки → повторный тик уже вернёт None
+    notify = notify_owner or _default_notify_owner
+    hours = max(1, int(timeout) // 3600)
+    owner_parsed = {"remark": pending.get("remark", ""), "who": pending.get("who", ""),
+                    "window": pending.get("window", ""), "card_msg_id": pending.get("card_msg_id", "")}
+    card = build_owner_clarification_card(owner_parsed, f"учитель не ответил на уточнение за {hours}ч")
+    channel = ""
+    reason = f"low-ожидание: нет ответа учителя >{hours}ч → отдано владельцу, ожидание снято"
+    try:
+        delivered, channel = _normalize_delivery(notify(card))
+    except Exception as e:                           # noqa: BLE001 — доставка не должна ронять тик демона
+        delivered, channel = False, ""; reason = f"{reason}; notify: {e}"
+    if delivered:
+        via = f" — доставлено через {channel}" if channel else ""
+        result = (f"⏳ Урок без ответа учителя {hours}ч → карточка-уточнение владельцу в 1160{via} "
+                  "(ожидание снято, урок не потерян)")
+    else:
+        result = (f"⏳ Урок без ответа учителя {hours}ч: канал 1160 недоступен — карточка не доставлена, "
+                  "замечание в логе (ожидание снято)")
+    return {"route": UNCLEAR, "confidence": "low", "delegate": False, "status": "done",
+            "resumed": "timeout_to_owner", "clear_wait": True, "reason": reason, "card": card,
             "delivered": delivered, "channel": channel, "result": result}
 
 
