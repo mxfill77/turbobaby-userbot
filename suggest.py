@@ -2886,6 +2886,131 @@ def client_facing_text(draft: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", out).strip()
 
 
+# ===================== ГАРД СВЕРКИ ЦЕНЫ ЧЕРНОВИКА С КОТИРОВКОЙ (#310, шаг 3/5) =====================
+# Пост-чек (postcheck_draft) клеймит числа-итоги ВНЕ белого источника, но белый источник — это ВЕСЬ
+# блок ЦЕНА (и суточная ставка 449, и итог 1685). Живой провал 504608015 «на 5 дней — 2 245 ฿» дошёл
+# до клиента: 2245 не в белом списке, но узкий _PC_PERIOD его не распознал (разведка guard-quote-price
+# §4). Этот гард — ДЕТЕРМИНИРОВАННАЯ сверка ПРЯМО с котировкой quote: extract_money_figures вынимает
+# rate/total/deposit из текста, каждое сверяется с числами quote для ТОЙ ЖЕ модели+дат. Расхождение →
+# ответ клиенту НЕ уходит: лог (окно/модель/даты/quote↔текст) + перегенерация с жёсткими числами из
+# quote; после N неудач — детерминированный фолбэк-шаблон строго из quote (числа LLM не касается).
+
+
+def quote_price_numbers(quote) -> set:
+    """Множество ЛЕГИТИМНЫХ денежных чисел котировки (истина): суточная ставка, итог за срок, депозит,
+    кап-цена низкого сезона. Всё, что клиенту называть МОЖНО. Не dict/пусто → пустое множество."""
+    if not isinstance(quote, dict):
+        return set()
+    nums = set()
+    for key in ("day_price", "total", "deposit", "cap_price"):
+        v = quote.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            nums.add(int(v))
+    return nums
+
+
+def quote_price_mismatches(draft: str, quote) -> list:
+    """Числа rate/total/deposit из ТЕКСТА черновика, которых НЕТ среди чисел котировки (contradiction).
+    Пусто = текст согласован с quote (или сверять нечем: нет quote/нет чисел/нет денег в тексте).
+    'amount' (прочая сумма без явной ценовой роли) НЕ клеймим — сверяем ровно цену/ставку/депозит."""
+    allowed = quote_price_numbers(quote)
+    if not allowed:
+        return []                       # нечем сверять — гард молчит (fail-safe)
+    bad = []
+    for fig in extract_money_figures(draft or ""):
+        if fig["kind"] in ("rate", "total", "deposit") and fig["value"] not in allowed:
+            bad.append(fig)
+    return bad
+
+
+def _quote_hard_directive(quote, model=None, ds=None, de=None, lang="ru") -> str:
+    """Директива-верхнего-уровня для перегенерации: ЖЁСТКИЕ числа строго из quote, запрет считать
+    ставку×дни. Идёт в regenerate_draft(directive=…) — поверх исходного контекста."""
+    en = (lang == "en")
+    dp, total, dep = quote.get("day_price"), quote.get("total"), quote.get("deposit")
+    cap_active, cap_price = quote.get("cap_active"), quote.get("cap_price")
+    nums = []
+    if cap_active and cap_price is not None and total is not None and total > cap_price:
+        nums.append((f"аренда от {cap_price} ฿/мес (низкий сезон)" if not en
+                     else f"rental from {cap_price} ฿/mo (low season)"))
+    else:
+        if dp is not None:
+            nums.append((f"суточная ставка {dp} ฿/день" if not en else f"daily rate {dp} ฿/day"))
+        if total is not None:
+            nums.append((f"ИТОГО за весь срок {total} ฿ (НЕ умножай ставку на число дней)"
+                         if not en else
+                         f"TOTAL for the whole period {total} ฿ (do NOT multiply the daily rate by days)"))
+    if dep is not None:
+        nums.append((f"депозит {dep} ฿" if not en else f"deposit {dep} ฿"))
+    who = (f" для {model}" if model and not en else (f" for {model}" if model and en else ""))
+    head = (f"ЦЕНУ{who} бери ДОСЛОВНО из Календаря и НИКАК не пересчитывай: " if not en
+            else f"Take the PRICE{who} VERBATIM from the Calendar and do NOT recompute it: ")
+    tail = (". Никаких других денежных сумм в ответе не пиши." if not en
+            else ". Do not write any other money amounts in the reply.")
+    return head + "; ".join(nums) + tail
+
+
+def price_fallback_from_quote(quote, model=None, ds=None, de=None, lang="ru") -> str:
+    """Детерминированный фолбэк-ответ ТОЛЬКО из quote (числа собирает КОД через _client_price — точка
+    правды фразы цены, LLM не участвует). Префикс — модель+срок, если известны."""
+    phrase = _client_price(quote) if isinstance(quote, dict) else ""
+    if not phrase:
+        return ""
+    en = (lang == "en")
+    days = quote.get("days") if isinstance(quote, dict) else None
+    prefix = ""
+    if model and days:
+        prefix = (f"{model} на {days} дн.: " if not en else f"{model} for {days} days: ")
+    elif model:
+        prefix = f"{model}: "
+    return prefix + phrase
+
+
+def guard_quote_price(draft: str, quote, model=None, ds=None, de=None, lang="ru",
+                      regenerate=None, max_retries=2, window=None) -> dict:
+    """Гард ПЕРЕД ОТПРАВКОЙ ответа с ценой: сверяет числа текста с котировкой quote (та же модель+даты).
+    Согласовано → отдаём черновик как есть. Расхождение → лог + перегенерация с жёсткими числами из
+    quote (regenerate(directive)->str, до max_retries раз); после N неудач — фолбэк-шаблон строго из
+    quote. Возвращает dict(text, ok, source∈{draft,regen,fallback,unverified}, attempts, mismatches).
+    Нечем сверять (нет quote/нет чисел) → source='unverified', черновик БАЙТ-В-БАЙТ (fail-safe)."""
+    if not quote_price_numbers(quote):
+        return {"text": draft, "ok": True, "source": "unverified", "attempts": 0, "mismatches": []}
+
+    def _log_mismatch(stage, bad, text):
+        log.warning(
+            "guard_quote_price MISMATCH [%s] окно=%s модель=%s даты=%s..%s | quote=%s | текст=%s | draft=%r",
+            stage, window, model, ds, de, sorted(quote_price_numbers(quote)),
+            [{"kind": b["kind"], "value": b["value"]} for b in bad], (text or "")[:200])
+
+    bad = quote_price_mismatches(draft, quote)
+    if not bad:
+        return {"text": draft, "ok": True, "source": "draft", "attempts": 0, "mismatches": []}
+    _log_mismatch("initial", bad, draft)
+
+    directive = _quote_hard_directive(quote, model, ds, de, lang)
+    attempts, last_bad = 0, bad
+    if callable(regenerate):
+        for _ in range(max(0, int(max_retries))):
+            attempts += 1
+            try:
+                cand = regenerate(directive)
+            except Exception:
+                log.warning("guard_quote_price: перегенерация упала (окно=%s), попытка %s", window, attempts)
+                break
+            cand_bad = quote_price_mismatches(cand, quote)
+            if not cand_bad:
+                return {"text": cand, "ok": True, "source": "regen", "attempts": attempts,
+                        "mismatches": bad}
+            last_bad = cand_bad
+            _log_mismatch(f"regen#{attempts}", cand_bad, cand)
+
+    fb = price_fallback_from_quote(quote, model, ds, de, lang)
+    log.warning("guard_quote_price: после %s попыток → фолбэк-шаблон из quote (окно=%s): %r",
+                attempts, window, fb)
+    return {"text": fb, "ok": bool(fb), "source": "fallback", "attempts": attempts,
+            "mismatches": last_bad}
+
+
 def generate_draft(transcript: str, lang: str, faq: str,
                    is_first_contact: bool = False, pricing_note: str = "", call_llm=None,
                    park_models=None, playbook: str = "") -> str:
