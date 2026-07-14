@@ -209,6 +209,29 @@ class TestDecisions(unittest.TestCase):
         self.assertEqual(seen["directive"], "дожимай на ADV")             # реплика = директива
         self.assertEqual(seen["transcript"], "[клиент]: NMAX?")           # исходный контекст
 
+    def test_reply_strategy_accumulates_window_directives(self):
+        # client_windows (#365 шаг 3): директивы окна КОПЯТСЯ — вторая перегенерация видит ОБЕ.
+        # Кейс живого провала: «новые по умолчанию, года только по запросу» терялась на СЛЕДУЮЩЕЙ
+        # перегенерации (regen получал лишь последнюю реплику).
+        seen = []
+        def fake_regen(draft, faq, directive):
+            seen.append(directive)
+            return "R"
+        d1 = "новые по умолчанию, года только по запросу"
+        d2 = "жёстче про депозит"
+        draft = dict(self.STRAT_DRAFT)   # directive пуст → первая правка окна
+        r1 = moderation_core.process_reply(draft, d1, "d", "FAQ", test_mode=False,
+                                           call_llm=_llm("strategy"), regen=fake_regen)
+        # IPC-персист: кумулятив из решения ложится обратно в запись окна (как set_candidate в _apply)
+        draft["directive"] = r1["directive"]
+        r2 = moderation_core.process_reply(draft, d2, "d", "FAQ", test_mode=False,
+                                           call_llm=_llm("strategy"), regen=fake_regen)
+        # первая перегенерация — только d1; вторая — ОБЕ директивы окна подмешаны в промпт
+        self.assertIn(d1, seen[0]); self.assertNotIn(d2, seen[0])
+        self.assertIn(d1, seen[1]); self.assertIn(d2, seen[1])
+        # решение хранит кумулятив (уйдёт в IPC → следующий цикл окна увидит обе)
+        self.assertIn(d1, r2["directive"]); self.assertIn(d2, r2["directive"])
+
     def test_reconfirm_mandatory_all_levels(self):
         for intent in ("cosmetic", "dictation"):
             d = moderation_core.process_reply(self.DRAFT, "x", "d", "FAQ", test_mode=False,

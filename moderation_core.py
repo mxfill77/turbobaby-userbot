@@ -163,6 +163,55 @@ def _default_regen(draft, faq, directive):
         park_models=allow, playbook=pb)
 
 
+# ----------- кумулятивные директивы окна диалога (client_windows, #365 шаг 3) -----------
+# Директивы модератора в рамках ОДНОГО окна диалога КОПЯТСЯ: каждая strategy-перегенерация
+# подмешивает ВСЕ прежние директивы окна + новую, а не только последнюю. Кейс живого провала:
+# «новые по умолчанию, года только по запросу» терялась при СЛЕДУЮЩЕЙ перегенерации, потому что
+# regen получал лишь последнюю реплику. Накопитель — сама запись черновика в IPC (колонка
+# directive): туда пишем кумулятивный блок, оттуда же читаем прежние директивы на новом цикле
+# (set_candidate персистит, следующий reply приходит на тот же черновик и видит накопленное).
+_WINDOW_DIRECTIVE_BULLET = "• "
+
+
+def split_window_directives(blob):
+    """Разобрать накопленный блок директив окна обратно в список (порядок старые→новые).
+    Понимает и одиночную директиву без маркера (легаси/первая правка), и наш маркированный блок."""
+    if not (blob or "").strip():
+        return []
+    lines = [ln.strip() for ln in blob.splitlines() if ln.strip()]
+    if any(ln.startswith(_WINDOW_DIRECTIVE_BULLET) for ln in lines):
+        out = []
+        for ln in lines:
+            if ln.startswith(_WINDOW_DIRECTIVE_BULLET):
+                ln = ln[len(_WINDOW_DIRECTIVE_BULLET):].strip()
+            if ln:
+                out.append(ln)
+        return out
+    return [blob.strip()]   # одиночная директива (возможно многострочная) — как одна
+
+
+def join_window_directives(items):
+    """Собрать накопленные директивы окна в ОДИН блок для хранения/подмешивания в перегенерацию.
+    Одна директива — как есть (без маркера, чтобы «Запомнить как правило» видел чистую формулировку);
+    несколько — маркированным списком (перегенерация обязана учесть ВСЕ директивы окна)."""
+    items = [i.strip() for i in items if (i or "").strip()]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return "\n".join(_WINDOW_DIRECTIVE_BULLET + i for i in items)
+
+
+def merge_window_directives(prior_blob, new_directive):
+    """Кумулятив директив окна: прежние (из draft.directive) + новая, без повторов, порядок сохранён
+    (старые→новые). Возвращает блок для regen И для персиста обратно в запись окна."""
+    items = split_window_directives(prior_blob)
+    nd = (new_directive or "").strip()
+    if nd and nd not in items:
+        items.append(nd)
+    return join_window_directives(items)
+
+
 def process_reply(draft, reply_text, username, faq, test_mode, call_llm=None, regen=None):
     """Свободный reply менеджера, ТРЁХУРОВНЕВЫЙ. Возвращает decision-dict (без I/O). Whitelist.
     call_llm — классификатор (interpret); regen(draft,faq,directive)->str — СТРАТЕГИЯ-перегенерация
@@ -183,16 +232,21 @@ def process_reply(draft, reply_text, username, faq, test_mode, call_llm=None, re
         return out
 
     # cosmetic / strategy / dictation → правка. СТРАТЕГИЯ перегенерит с нуля по директиве.
+    directive = reply_text
     if intent == "strategy":
         regen = regen or _default_regen
-        final = (regen(draft, faq, reply_text) or "").strip()
+        # client_windows: директивы окна КУМУЛЯТИВНЫ — перегенерация видит ВСЕ прежние директивы
+        # окна (из draft.directive) + новую, иначе прежняя директива окна терялась на след. цикле.
+        directive = merge_window_directives(draft.get("directive"), reply_text)
+        final = (regen(draft, faq, directive) or "").strip()
     else:
         final = res["final_text"]
 
     # ЛЮБОЙ уровень правки → повторное подтверждение (стратегия/диктовка/косметика = обязательный ✅).
-    # directive = формулировка модератора: сохранится в IPC для кнопки «Запомнить как правило».
+    # directive = формулировка(-и) модератора: стратегия копит кумулятив окна, косметика/диктовка —
+    # разовая реплика. Сохранится в IPC (для кнопки «Запомнить как правило» и накопления окна).
     return {"decision": "confirm", "final_text": final, "answer": None, "level": intent,
-            "directive": reply_text,
+            "directive": directive,
             "card": f"[{_LEVEL_RU.get(intent, intent)}] Проверьте перед отправкой:\n\n{final}"}
 
 
