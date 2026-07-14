@@ -2067,6 +2067,16 @@ _SHEET_MARKER = "[PRICE_SHEET]"
 _SHEET_MARKER_LINE_RE = re.compile(r"^\W*PRICE[_ ]?SHEET\W*$", re.I | re.M)
 _SHEET_MARKER_INLINE_RE = re.compile(r"\[?PRICE[_ ]?SHEET\]?", re.I)
 
+# ТОЧЕЧНЫЙ quote (одна модель+даты) едет тем же транспортом, что SHEET-блок — детерминированная
+# строка ЦЕНЫ в служебных скобках pricing_note: в промпт LLM НЕ попадает (make_system_prompt
+# вырезает), а в финал её вставляет КОД (compose_quote_draft). Так strategy-перегенерация несёт
+# цену Bridge КОДОМ и НЕ зависит от того, «донёс» ли LLM цифры (класс тот же, что у сетки #276).
+_QUOTE_OPEN, _QUOTE_CLOSE = "<<<QUOTE>>>", "<<<END_QUOTE>>>"
+_QUOTE_BLOCK_RE = re.compile(re.escape(_QUOTE_OPEN) + r"\n(.*?)\n" + re.escape(_QUOTE_CLOSE), re.S)
+# Метка [QUOTE] в ответе LLM (опциональная точка вставки): только явная скобочная форма, чтобы
+# случайное слово «quote» в тексте её не триггерило.
+_QUOTE_MARKER_RE = re.compile(r"\[\s*QUOTE\s*\]", re.I)
+
 
 def _sheet_block_from_note(pricing_note):
     """Чистый прайс-блок из служебных скобок pricing_note → текст | None (не sheet-режим /
@@ -2093,6 +2103,43 @@ def compose_sheet_draft(llm_text, block, lang="ru"):
                  "Подскажите, какая модель вас заинтересовала и на какие даты — проверю наличие.")
     parts = [p for p in (intro, block, outro) if p]
     return "\n\n".join(parts)
+
+
+def _quote_block_from_note(pricing_note):
+    """Детерминированная строка ЦЕНЫ точечного quote (из служебных скобок pricing_note) → текст |
+    None (не точечный-quote-режим). Питает compose_quote_draft."""
+    m = _QUOTE_BLOCK_RE.search(pricing_note or "")
+    return m.group(1) if m else None
+
+
+def compose_quote_draft(llm_text, block, lang="ru"):
+    """Точечный quote-блок Bridge попадает в финал КОДОМ (как compose_sheet_draft для сетки), чтобы
+    strategy-перегенерация НЕ зависела от того, донёс ли LLM цифры:
+      • есть метка [QUOTE] → intro (LLM) + блок ДОСЛОВНО + outro (LLM);
+      • метки нет, но ВСЕ денежные числа блока уже в клиентском теле (LLM донёс цену) → текст как
+        есть, не дублируем;
+      • метки нет и хотя бы одно денежное число блока потеряно (LLM цену не привёл) → приклеиваем
+        блок хвостом (FAIL-SAFE: цена Bridge доходит клиенту ВСЕГДА).
+    Сверяем ДЕНЕЖНЫЕ величины (extract_money_figures — та же точка правды, что пост-чек), а не сырые
+    цифры: модельное число (NMAX 155) и счётчик срока (5 дней) на решение не влияют. В отличие от
+    сетки, при отсутствии метки LLM-текст НЕ отбрасываем — точечная цена вплетена в живой ответ, а
+    не самостоятельный блок; отбросить его = потерять весь ответ."""
+    t = (llm_text or "").strip()
+    b = (block or "").strip()
+    if not b:
+        return t
+    m = _QUOTE_MARKER_RE.search(t)
+    if m:
+        intro, outro = t[:m.start()].strip(), t[m.end():].strip()
+        return "\n\n".join(p for p in (intro, b, outro) if p)
+    if not t:
+        return b
+    want = {f["value"] for f in extract_money_figures(b)}
+    have = {f["value"] for f in extract_money_figures(client_facing_text(t))}
+    if want and want <= have:                    # все денежные числа Bridge уже у клиента — не дублируем
+        return t
+    log.warning("QUOTE: LLM не привёл цену точечного quote — цена Bridge добавлена КОДОМ хвостом")
+    return t + "\n\n" + b
 
 
 def _wrap_price_sheet(body, ds, lang="ru", default_anchor=False) -> str:
@@ -2237,7 +2284,15 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
         pct = hints.get("percent_q")
         if pct:
             note += _percent_line(pct, q if kind in ("ok", "min") else None)
-        return note + dep + units
+        note += dep + units
+        # Чистый точечный quote (одна единица, одна цена, без процента) → детерминированную строку
+        # ЦЕНЫ кладём в служебные скобки: strategy-перегенерация донесёт цену Bridge КОДОМ
+        # (compose_quote_draft в generate/regenerate), не полагаясь на то, что LLM её перепишет.
+        # N-юнитов «за каждый» / процент — блок не собираем (нет единой клиентской строки).
+        if kind == "ok" and not units and not pct:
+            qline = f"{label} — {phrase}." if label else (phrase.rstrip(".") + ".")
+            note += "\n" + _QUOTE_OPEN + "\n" + qline + "\n" + _QUOTE_CLOSE
+        return note
 
     # (п.3) несколько продуктов (несколько моделей ИЛИ два поколения XMAX) — раздельная цена по
     # каждому, отдельной строкой в одном сообщении.
@@ -2382,6 +2437,10 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
     # чтобы LLM не выдал «низкий сезон / до 31 октября» в клиентское тело.
     if _SEASON_BLOCK_RE.search(pn_prompt or ""):
         pn_prompt = _SEASON_BLOCK_RE.sub("", pn_prompt).rstrip()
+    # Точечный quote-блок — служебный транспорт для compose_quote_draft (цена Bridge вставится КОДОМ):
+    # из промпта его ВЫРЕЗАЕМ (сама цена уже есть в инструкции ЦЕНА выше — дубль LLM не нужен).
+    if _QUOTE_BLOCK_RE.search(pn_prompt or ""):
+        pn_prompt = _QUOTE_BLOCK_RE.sub("", pn_prompt).rstrip()
     price_block = ("\n\n" + pn_prompt) if pn_prompt else ""
     # СТРАТЕГИЯ-директива менеджера: высший приоритет по СОДЕРЖАНИЮ/логике/тону ответа, НО
     # ценовую политику и критичные факты НЕ отменяет (они ниже — незыблемы).
@@ -2986,6 +3045,10 @@ def generate_draft(transcript: str, lang: str, faq: str,
     block = _sheet_block_from_note(pricing_note)
     if block is not None:
         out = compose_sheet_draft(out, block, lang)
+    # Точечный quote: цену Bridge в финал доносит КОД (fail-safe, если LLM её не привёл).
+    qblock = _quote_block_from_note(pricing_note)
+    if qblock is not None:
+        out = compose_quote_draft(out, qblock, lang)
     out = _append_collected_note(out, facts, lang)
     return _append_season_note(out, pricing_note)
 
@@ -3008,6 +3071,11 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     block = _sheet_block_from_note(pricing_note)
     if block is not None:
         out = compose_sheet_draft(out, block, lang)
+    # Точечный quote-блок: strategy-перегенерация несёт цену Bridge КОДОМ — не зависит от того,
+    # донёс ли LLM цифры (главная цель шага; сетка была покрыта, точечный quote — теперь).
+    qblock = _quote_block_from_note(pricing_note)
+    if qblock is not None:
+        out = compose_quote_draft(out, qblock, lang)
     out = _append_collected_note(out, facts, lang)
     return _append_season_note(out, pricing_note)
 

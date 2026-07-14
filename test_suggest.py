@@ -2686,6 +2686,127 @@ class TestSheetUntouchableBlock(unittest.TestCase):
         self.assertNotIn("[PRICE_SHEET]", draft)
 
 
+class TestPointQuoteCodeBlock(unittest.TestCase):
+    """#365 (родитель 4, шаг 2/6): ТОЧЕЧНЫЙ quote несёт цену Bridge в финал КОДОМ — как сетка
+    PRICE_SHEET. strategy-перегенерация больше НЕ зависит от того, «донёс» ли LLM цифры: цена лежит
+    в служебных скобках pricing_note (в промпт не течёт — вырезается), а compose_quote_draft вставляет
+    её КОДОМ (метка [QUOTE] → точка вставки; цифры уже в тексте → не дублируем; цену LLM потерял →
+    приклеиваем блок хвостом, fail-safe)."""
+
+    FLEET = ["NMAX 155CC BLACK PHUKET 4255", "ADV 350CC BLACK PHUKET 5849"]
+
+    def setUp(self):
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+
+    def tearDown(self):
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+
+    def _getter(self):
+        # Одна модель, ЧИСТАЯ котировка Bridge: итог за срок 1685 ฿, депозит 3000 ฿, без капа и без
+        # J-текста (сборка day/total/deposit) — детерминированная строка ЦЕНЫ (числа только из Bridge).
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET]}}
+            if suggest._bike_key("NMAX 155") not in suggest._bike_key(params.get("bike", "")):
+                return {"ok": False}
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            return {"ok": True, "data": {"day_price": 337, "total": 1685, "deposit": 3000,
+                    "available": True, "days": days, "cap_active": False, "cap_price": 0}}
+        return fake
+
+    def _hints(self, **extra):
+        h = {"has_dates": True, "iso_start": "2026-07-15", "iso_end": "2026-07-20",
+             "model": "NMAX 155", "hint_days": 5}
+        h.update(extra)
+        return h
+
+    def _note(self, **extra):
+        return suggest.build_pricing_note(self._hints(**extra), lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+
+    def test_build_note_carries_quote_block(self):
+        # Чистый точечный quote «ok» → в pricing_note детерминированная строка ЦЕНЫ в служебных скобках.
+        note = self._note()
+        block = suggest._quote_block_from_note(note)
+        self.assertIsNotNone(block)                          # блок собран
+        self.assertIn("1685", block)                         # итог за срок из Bridge
+        self.assertIn("3000", block)                         # депозит из Bridge
+        self.assertIn("ЦЕНА из Календаря", note)             # инструкция LLM (прежний путь) цела
+
+    def test_prompt_strips_quote_block(self):
+        # Служебный блок в промпт LLM НЕ течёт (как SHEET): цифры цены остаются в инструкции ЦЕНА,
+        # но сырых скобок/дубля блока в system нет.
+        sysp = suggest.make_system_prompt("FAQ", "ru", pricing_note=self._note())
+        self.assertNotIn("<<<QUOTE>>>", sysp)
+        self.assertNotIn("<<<END_QUOTE>>>", sysp)
+        self.assertIn("ЦЕНА из Календаря", sysp)             # цена всё же в промпте (в инструкции)
+        self.assertIn("1685", sysp)
+
+    def test_units_and_percent_skip_block(self):
+        # N-юнитов «за каждый» и процент — единой клиентской строки ЦЕНЫ нет → блок НЕ собираем.
+        note_units = self._note(units_count=2)
+        self.assertIsNone(suggest._quote_block_from_note(note_units))
+        self.assertIn("ЗА КАЖДЫЙ", note_units)
+        note_pct = self._note(percent_q=50)
+        self.assertIsNone(suggest._quote_block_from_note(note_pct))
+
+    def test_compose_marker_intro_block_outro(self):
+        # Метка [QUOTE] → intro (LLM) + блок ДОСЛОВНО + outro (LLM).
+        block = "NMAX 155 — 337 ฿/день; итого 1685 ฿; депозит 3000 ฿."
+        out = suggest.compose_quote_draft("Отличный выбор!\n[QUOTE]\nЖду ответа.", block, "ru")
+        self.assertEqual(out, "Отличный выбор!\n\n" + block + "\n\nЖду ответа.")
+
+    def test_compose_no_dup_when_carried(self):
+        # LLM донёс все цифры блока → возвращаем текст как есть (без дубля).
+        block = "NMAX 155 — 337 ฿/день; итого 1685 ฿; депозит 3000 ฿."
+        carried = "NMAX 155 на 5 дней — 1685 ฿, депозит 3000 ฿ (337 ฿/день). Бронируем?"
+        self.assertEqual(suggest.compose_quote_draft(carried, block, "ru"), carried)
+
+    def test_compose_failsafe_appends_lost_price(self):
+        # LLM потерял цену → блок Bridge приклеен хвостом (цена доходит клиенту ВСЕГДА).
+        block = "NMAX 155 — 337 ฿/день; итого 1685 ฿; депозит 3000 ฿."
+        lost = "Уточню цену по датам и вернусь."
+        out = suggest.compose_quote_draft(lost, block, "ru")
+        self.assertTrue(out.startswith(lost))
+        self.assertIn(block, out)
+        self.assertIn("1685", out)
+
+    def test_strategy_regen_carries_price_by_code(self):
+        # ЯДРО ШАГА: strategy-перегенерация — LLM цену НЕ привёл, но цифры Bridge дошли до финала
+        # КОДОМ (compose_quote_draft), а не потерялись. Промпт нёс директиву и инструкцию цены, но
+        # НЕ сырой служебный блок.
+        note = self._note()
+        seen = {}
+        def drop_price(system, user):
+            seen["system"] = system
+            return "Готов помочь с NMAX — уточню детали и вернусь."   # LLM цену потерял
+        out = suggest.regenerate_draft("[клиент]: nmax на 5 дней с 15 июля, сколько?", "ru", "FAQ",
+                                       False, note, "дожимай на бронь", call_llm=drop_price)
+        self.assertIn("1685", out)                           # итог из Bridge дошёл КОДОМ
+        self.assertIn("3000", out)                           # депозит из Bridge дошёл КОДОМ
+        self.assertIn("дожимай на бронь", seen["system"])    # директива стратегии в промпте
+        self.assertNotIn("<<<QUOTE>>>", seen["system"])      # сырой блок в промпт не утёк
+
+    def test_strategy_regen_no_dup_when_llm_carries(self):
+        # LLM честно привёл цифры Bridge → код НЕ дублирует их (обратная совместимость с прежним путём).
+        note = self._note()
+        def carry(system, user):
+            return "NMAX на 5 дней — 1685 ฿, депозит 3000 ฿ (337 ฿/день). Бронируем?"
+        out = suggest.regenerate_draft("[клиент]: nmax на 5 дней с 15 июля, сколько?", "ru", "FAQ",
+                                       False, note, "дожимай", call_llm=carry)
+        self.assertEqual(suggest.client_facing_text(out).count("1685"), 1)   # без дубля цены
+        self.assertEqual(suggest.client_facing_text(out).count("3000"), 1)   # без дубля депозита
+
+
 class TestSheetSubselection(unittest.TestCase):
     """Подвыборки сетки («скутеры 200+», «мотоциклы до 400») — ДЕТЕРМИНИРОВАННЫЙ отбор КОДОМ из тех
     же rows, что и полная сетка (та же точка правды), БЕЗ LLM-отбора моделей. Класс-голден живого
