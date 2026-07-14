@@ -40,6 +40,8 @@ _WINDOW_RE = re.compile(r"(?im)^окно диалога:\s*(.+)$")
 # Координата карточки черновика в модер-группе (шаг 4): подтверждение «урок принят…» уйдёт РЕПЛАЕМ
 # именно на неё. Билдер шага 2 кладёт строку «карточка модер-группы: msg=<id>».
 _CARD_RE = re.compile(r"(?im)^карточка модер-группы:\s*msg=(\S+)")
+# Исходный черновик (последняя секция билдера) — питает LLM-классификатор (что именно правит замечание).
+_DRAFT_RE = re.compile(r"(?ms)^Исходный черновик:\s*(.+?)\s*\Z")
 
 
 def is_lesson_task(text):
@@ -62,7 +64,10 @@ def parse_lesson_task(text):
     card_msg_id = (cm.group(1).strip() if cm else "")
     if card_msg_id == "?":                           # плейсхолдер «неизвестна» → пусто (не реплаим в никуда)
         card_msg_id = ""
-    return {"remark": remark, "kind": kind, "who": who, "window": window, "card_msg_id": card_msg_id}
+    dm = _DRAFT_RE.search(t)
+    draft = (dm.group(1).strip() if dm else "")
+    return {"remark": remark, "kind": kind, "who": who, "window": window,
+            "card_msg_id": card_msg_id, "draft": draft}
 
 
 # ------------------------------- классификация замечания ----------------------------------
@@ -400,31 +405,34 @@ def ack_after_commit(commit_ref, subject, where, verify=None):
     return build_lesson_ack(subject, where)
 
 
-# ------------------------------- обработчик задачи-урока ----------------------------------
-def handle_lesson_task(text, append_style=None, append_checklist=None, notify_owner=None):
-    """Классифицировать урок и МАРШРУТИЗИРОВАТЬ. → dict:
-      route      — style|fact|supervision|unclear;
-      delegate   — True ТОЛЬКО для fact/логика (вызывающий отдаёт задачу планировщику; правка
-                   кода/критфактов/FAQ + ТЕСТ — работа думателя, не наша);
-      delegate_text — augmented-текст с требованием теста (для планировщика), иначе None;
-      status/result — для НЕ-delegate веток: как закрыть задачу (done/failed) и текст карточки;
-      ack_subject/ack_where/commit_paths/card_msg_id — материал для подтверждения учителю ПОСЛЕ
-                   коммита (шаг 4): суть урока, «куда записан», tracked-файлы к коммиту и координата
-                   карточки в модер-группе для реплая. Само подтверждение шлётся ТОЛЬКО после коммита.
-    Побочки инъектируемы (юнит подставляет фейки); боевые дефолты — playbook / чек-лист / 1160.
-    FAIL-SAFE: сбой любого sink → failed-карта (замечание НЕ теряем — видно владельцу, повторят)."""
-    parsed = parse_lesson_task(text)
-    remark = parsed["remark"]
-    route, reason = classify_lesson_remark(remark)
-    a_style = append_style or _default_append_style
-    a_check = append_checklist or append_checklist_class
-    notify = notify_owner or _default_notify_owner
-    # Материал подтверждения (шаг 4) — одинаков для всех применённых веток; шлётся ТОЛЬКО после коммита.
-    subj = _one_line(remark)
-    card = parsed.get("card_msg_id") or ""
-    _ack = {"ack_subject": subj, "ack_where": _ROUTE_WHERE.get(route, "книгу правил"),
-            "commit_paths": list(_ROUTE_COMMIT_PATHS.get(route, [])), "card_msg_id": card}
+# ------------------------------- реплай-понимание в модер-группу (родитель 334, шаг 2) -----
+def build_lesson_understanding(reading, plan):
+    """Реплай учителю в модер-группу на сообщение с уроком для confidence=high: дирижёр берёт урок В
+    РАБОТУ СРАЗУ и тут же отвечает, ЧТО понял и ЧТО делает — «Понял так: <reading>. Делаю: <plan>».
+    Пустые reading/plan → нейтральная заглушка (формат не роняем). Чистая функция."""
+    r = _one_line(reading) or "суть замечания (см. окно диалога)"
+    p = _one_line(plan) or "беру урок в работу по штатному пайплайну"
+    return f"👍 Понял так: {r}. Делаю: {p}"
 
+
+def _default_reply_moderation(_card_msg_id, _text):
+    """Дефолт-заглушка реплая в модер-группу на сообщение с уроком: в standalone канала нет → False
+    (не доставлено). Демон-дирижёр инъектирует боевой sink (реплай через moderation_bot, шаг 5).
+    understanding уже лежит в результате задачи — сбой доставки урок не теряет."""
+    return False
+
+
+def _lesson_llm_enabled():
+    """Боевой рубильник LLM-классификатора урока (по умолчанию OFF → поведение байт-в-байт keyword-
+    прежнее; тесты, инъектирующие classify, включают путь явно вне зависимости от флага)."""
+    return str(os.getenv("LESSON_LLM_ROUTE", "")).strip().lower() in ("1", "true", "yes", "on")
+
+
+# ------------------------------- обработчик задачи-урока ----------------------------------
+def _dispatch_route(route, text, parsed, remark, reason, a_style, a_check, notify, _ack):
+    """Исполнить УЖЕ ВЫБРАННЫЙ маршрут урока (SUPERVISION/STYLE/FACT/UNCLEAR) — общее ядро и для
+    keyword-, и для LLM-high-классификации. → dec-dict (контракт см. handle_lesson_task)."""
+    subj = _ack["ack_subject"]
     if route == SUPERVISION:
         try:
             res = a_check(remark)
@@ -480,3 +488,74 @@ def handle_lesson_task(text, append_style=None, append_checklist=None, notify_ow
         result = "🤔 Неясный урок: канал 1160 недоступен — карточка не доставлена, замечание в логе"
     return {"route": UNCLEAR, "delegate": False, "status": "done", "reason": reason,
             "result": result, "card": card, "delivered": delivered, "channel": channel}
+
+
+def handle_lesson_task(text, append_style=None, append_checklist=None, notify_owner=None,
+                       classify=None, reply_moderation=None):
+    """Классифицировать урок и МАРШРУТИЗИРОВАТЬ. → dict:
+      route      — style|fact|supervision|unclear;
+      delegate   — True ТОЛЬКО для fact/логика (вызывающий отдаёт задачу планировщику; правка
+                   кода/критфактов/FAQ + ТЕСТ — работа думателя, не наша);
+      delegate_text — augmented-текст с требованием теста (для планировщика), иначе None;
+      status/result — для НЕ-delegate веток: как закрыть задачу (done/failed) и текст карточки;
+      ack_subject/ack_where/commit_paths/card_msg_id — материал для подтверждения учителю ПОСЛЕ
+                   коммита (шаг 4): суть урока, «куда записан», tracked-файлы к коммиту и координата
+                   карточки в модер-группе для реплая. Само подтверждение шлётся ТОЛЬКО после коммита.
+    Классификация двухслойна (родитель 334): LLM-думатель classify (шаг 1) ПОВЕРХ keyword. Если
+    думатель вернул confidence=high — урок берётся В РАБОТУ СРАЗУ по LLM-маршруту, а учителю уходит
+    РЕПЛАЕМ в модер-группу «Понял так: <reading>. Делаю: <plan>» (шаг 2, sink reply_moderation);
+    дальше — ШТАТНЫЙ пайплайн (диф→коммит→«урок принят») без изменений, БЕЗ карточки-уточнения
+    «переформулируй конкретнее» (для high её не шлём — класс очевиден). confidence=low / None / сбой
+    думателя / рубильник LESSON_LLM_ROUTE выключен → откат на keyword-классификатор (поведение прежнее,
+    включая карточку-уточнение владельцу для неясного). Результат high несёт confidence/reading/plan/
+    understanding/llm_class для рапорта. Побочки инъектируемы (юнит подставляет фейки); боевые дефолты —
+    playbook / чек-лист / 1160 / реплай модер-группы. FAIL-SAFE: сбой любого sink → failed-карта."""
+    parsed = parse_lesson_task(text)
+    remark = parsed["remark"]
+    a_style = append_style or _default_append_style
+    a_check = append_checklist or append_checklist_class
+    notify = notify_owner or _default_notify_owner
+    reply_mod = reply_moderation or _default_reply_moderation
+
+    # LLM-классификатор (шаг 1) ПОВЕРХ keyword. Инъекция classify = явное намерение теста → идём в LLM
+    # всегда; без инъекции — только при боевом рубильнике (иначе байт-в-байт прежний keyword-путь и
+    # НИКАКОГО claude-подпроцесса в юнитах). Сбой думателя → llm=None → откат (поведение не хуже).
+    use_llm = classify is not None or _lesson_llm_enabled()
+    run_classify = classify or classify_lesson_llm
+    llm = None
+    if use_llm:
+        try:
+            llm = run_classify(remark, parsed.get("draft", ""), parsed.get("window", ""))
+        except Exception:                            # noqa: BLE001 — сбой думателя не роняет дирижёра
+            llm = None
+    high = bool(llm and llm.get("confidence") == "high" and llm.get("route"))
+    if high:
+        route, reason = llm["route"], f"LLM-high: класс {llm.get('class')}"
+    else:
+        route, reason = classify_lesson_remark(remark)
+
+    # Материал подтверждения (шаг 4) — одинаков для всех применённых веток; шлётся ТОЛЬКО после коммита.
+    subj = _one_line(remark)
+    card = parsed.get("card_msg_id") or ""
+    _ack = {"ack_subject": subj, "ack_where": _ROUTE_WHERE.get(route, "книгу правил"),
+            "commit_paths": list(_ROUTE_COMMIT_PATHS.get(route, [])), "card_msg_id": card}
+
+    # confidence=high: урок берётся В РАБОТУ СРАЗУ — ДО пайплайна отвечаем учителю реплаем в модер-группу
+    # на сообщение с уроком «Понял так: <reading>. Делаю: <plan>». Сбой доставки не роняет и урок не
+    # теряет (understanding остаётся в результате; пайплайн идёт штатно).
+    understanding = None
+    if high:
+        understanding = build_lesson_understanding(llm.get("reading"), llm.get("plan"))
+        try:
+            reply_mod(card, understanding)
+        except Exception as e:                       # noqa: BLE001 — реплай не должен ронять дирижёра
+            reason = f"{reason}; mod-reply: {e}"
+
+    dec = _dispatch_route(route, text, parsed, remark, reason, a_style, a_check, notify, _ack)
+    if high:
+        dec["confidence"] = "high"
+        dec["understanding"] = understanding
+        dec["reading"] = _one_line(llm.get("reading"))
+        dec["plan"] = _one_line(llm.get("plan"))
+        dec["llm_class"] = llm.get("class")
+    return dec

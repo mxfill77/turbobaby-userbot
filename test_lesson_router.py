@@ -517,5 +517,136 @@ class TestLessonClassifyLLM(unittest.TestCase):
         self.assertEqual(lr.SUPERVISION, dec["route"])
 
 
+class TestLessonHighConfidence(unittest.TestCase):
+    """Родитель 334, шаг 2/6: confidence=high — урок берётся В РАБОТУ СРАЗУ по LLM-маршруту, учителю
+    уходит РЕПЛАЕМ в модер-группу «Понял так: <reading>. Делаю: <plan>», дальше ШТАТНЫЙ пайплайн без
+    изменений и БЕЗ карточки «переформулируй конкретнее». Классификатор мокаем (реальный claude не
+    дёргаем). Golden-правило CLAUDE.md: замечания — дословные реплики учителя."""
+
+    def _task(self, remark, card="90210"):
+        return (f"[урок:правка от @danya] родитель 334 — замечание менеджера в копилку обучения\n"
+                f"окно диалога: Иван (555) (client_id=555) · черновик #7\n"
+                f"карточка модер-группы: msg={card}\n"
+                f"Замечание: {remark}\n"
+                f"Исходный черновик: Аренда Nmax от 1200฿/сутки")
+
+    def _high(self, cls, route, reading="суть ясна", plan="правлю причину"):
+        def classify(remark, draft="", window=""):
+            return {"reading": reading, "class": cls, "confidence": "high",
+                    "plan": plan, "route": route}
+        return classify
+
+    def test_understanding_format_exact(self):
+        u = lr.build_lesson_understanding("суточный тариф Nmax назван неверно",
+                                          "поправить тариф Nmax в критфактах + тест")
+        self.assertIn("Понял так: суточный тариф Nmax назван неверно", u)
+        self.assertIn("Делаю: поправить тариф Nmax в критфактах + тест", u)
+
+    def test_high_fact_takes_immediately_and_replies_to_mod_group(self):
+        # дословная реплика про неверную цену, confidence=high ФАКТ → route fact, делегируем,
+        # а В МОДЕР-ГРУППУ на сообщение с уроком (card_msg_id) ушёл реплай «Понял так… Делаю…».
+        sent = {}
+        def reply_mod(card_msg_id, text):
+            sent["card"], sent["text"] = card_msg_id, text
+            return True
+        dec = lr.handle_lesson_task(
+            self._task("суточный тариф на Nmax 1500, а не 1200 — цена неверная"),
+            classify=self._high("ФАКТ", lr.FACT, reading="суточный тариф Nmax назван неверно",
+                                plan="поправить тариф Nmax в критфактах + тест"),
+            reply_moderation=reply_mod)
+        self.assertEqual(lr.FACT, dec["route"])
+        self.assertTrue(dec["delegate"])                       # штатный пайплайн: планировщик диф→коммит
+        self.assertEqual("high", dec["confidence"])
+        self.assertEqual("90210", sent["card"])                # реплай на сообщение с уроком
+        self.assertIn("Понял так: суточный тариф Nmax назван неверно", sent["text"])
+        self.assertIn("Делаю: поправить тариф Nmax в критфактах + тест", sent["text"])
+        self.assertEqual(sent["text"], dec["understanding"])   # то же в результате задачи (рапорт)
+
+    def test_high_style_runs_normal_pipeline_no_clarification(self):
+        # confidence=high СТИЛЬ → штатный стиль-пайплайн (playbook), НИКАКОЙ карточки-уточнения
+        seen = {}
+        dec = lr.handle_lesson_task(
+            self._task("звучит слишком сухо и по-канцелярски, пиши теплее"),
+            classify=self._high("СТИЛЬ", lr.STYLE),
+            append_style=lambda r: (seen.__setitem__("rule", r), "added")[1],
+            notify_owner=lambda c: self.fail("владельца НЕ зовём для high (не «неясно»)"),
+            reply_moderation=lambda cid, t: True)
+        self.assertEqual(lr.STYLE, dec["route"])
+        self.assertEqual("done", dec["status"])
+        self.assertIn("сухо", seen["rule"])
+        self.assertNotIn("переформулируй", dec.get("result", "").lower())
+
+    def test_high_overrides_keyword_unclear(self):
+        # ключевой смысл шага: РАЗМЫТАЯ по ключевым словам реплика («плохо, переделай» → keyword UNCLEAR),
+        # но LLM уверен (high СТИЛЬ) → урок В РАБОТУ, а НЕ карточка «переформулируй конкретнее».
+        dec = lr.handle_lesson_task(
+            self._task("плохо, переделай"),
+            classify=self._high("СТИЛЬ", lr.STYLE, reading="тон слишком резкий", plan="смягчить тон"),
+            append_style=lambda r: "added",
+            notify_owner=lambda c: self.fail("для high владельца-уточнение НЕ шлём"),
+            reply_moderation=lambda cid, t: True)
+        self.assertEqual(lr.STYLE, dec["route"])               # не UNCLEAR — high перекрыл keyword
+        self.assertIn("LLM-high", dec["reason"])
+
+    def test_low_confidence_falls_back_to_keyword(self):
+        # confidence=low → откат на keyword-классификатор (старое поведение), understanding НЕ шлём
+        dec = lr.handle_lesson_task(
+            self._task("депозит указал неправильно, он 3000"),
+            classify=lambda r, d="", w="": {"reading": "r", "class": "СТИЛЬ", "confidence": "low",
+                                             "plan": "p", "route": lr.STYLE},
+            reply_moderation=lambda cid, t: self.fail("low → реплай-понимание НЕ шлём"))
+        self.assertEqual(lr.FACT, dec["route"])                # keyword: «депозит…неправильно» = ФАКТ
+        self.assertNotIn("confidence", dec)                    # high-поля отсутствуют
+
+    def test_llm_none_falls_back_to_keyword(self):
+        # думатель вернул None (брак/сбой) → keyword-классификатор, реплай-понимание не шлём
+        dec = lr.handle_lesson_task(
+            self._task("звучит сухо, пиши теплее"),
+            classify=lambda r, d="", w="": None,
+            append_style=lambda r: "added",
+            reply_moderation=lambda cid, t: self.fail("None → реплай НЕ шлём"))
+        self.assertEqual(lr.STYLE, dec["route"])
+        self.assertNotIn("understanding", dec)
+
+    def test_classify_exception_is_failsafe_keyword(self):
+        # сбой думателя (исключение) не роняет — откат на keyword
+        dec = lr.handle_lesson_task(
+            self._task("ревизор должен ловить выдуманную цену"),
+            classify=lambda r, d="", w="": (_ for _ in ()).throw(RuntimeError("claude down")),
+            append_checklist=lambda r: "added",
+            reply_moderation=lambda cid, t: self.fail("сбой classify → high-путь не идёт"))
+        self.assertEqual(lr.SUPERVISION, dec["route"])
+
+    def test_reply_sink_failure_does_not_lose_lesson(self):
+        # реплай в модер-группу упал → урок ВСЁ РАВНО берётся в работу (пайплайн идёт), understanding в dec
+        dec = lr.handle_lesson_task(
+            self._task("депозит указал неправильно, он 3000"),
+            classify=self._high("ФАКТ", lr.FACT),
+            reply_moderation=lambda cid, t: (_ for _ in ()).throw(OSError("mod group down")))
+        self.assertEqual(lr.FACT, dec["route"])
+        self.assertTrue(dec["delegate"])
+        self.assertIsNotNone(dec["understanding"])
+
+    def test_classify_receives_remark_draft_window(self):
+        # думатель питается ДОСЛОВНЫМ замечанием + черновиком + окном (парс из тела задачи)
+        seen = {}
+        def classify(remark, draft="", window=""):
+            seen.update(remark=remark, draft=draft, window=window)
+            return {"reading": "r", "class": "ФАКТ", "confidence": "high", "plan": "p", "route": lr.FACT}
+        lr.handle_lesson_task(self._task("цена неверная — тариф другой"),
+                              classify=classify, reply_moderation=lambda cid, t: True)
+        self.assertEqual("цена неверная — тариф другой", seen["remark"])
+        self.assertIn("Nmax", seen["draft"])                   # исходный черновик распарсен и передан
+        self.assertIn("555", seen["window"])
+
+    def test_default_no_injection_stays_keyword(self):
+        # БЕЗ инъекции classify и с выключенным рубильником — чистый keyword-путь (никакого claude)
+        self.assertFalse(lr._lesson_llm_enabled())             # рубильник по умолчанию OFF
+        dec = lr.handle_lesson_task(self._task("звучит сухо, пиши теплее"),
+                                    append_style=lambda r: "added")
+        self.assertEqual(lr.STYLE, dec["route"])
+        self.assertNotIn("confidence", dec)                    # LLM-путь не активировался
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
