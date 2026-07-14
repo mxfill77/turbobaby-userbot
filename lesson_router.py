@@ -23,6 +23,7 @@ moderation_core.process_lesson распознал замечание, submit_les
 модуль без I/O проверяется юнитом; боевые дефолты подтягиваются лениво.
 """
 
+import json
 import os
 import re
 
@@ -118,6 +119,107 @@ def classify_lesson_remark(remark):
     if sty:
         return STYLE, f"стиль-сигнал ({sty})"
     return UNCLEAR, "ни стиль, ни факт, ни надзор не распознаны"
+
+
+# ------------------------------- LLM-классификатор урока (THINKER_MODEL) -------------------
+# Родитель 334, шаг 1/6: думательная классификация урока по тому же _thinker_exec-паттерну, что и
+# самопочинка/ревизор (read-only, --max-turns 1, --allowed-tools '', нейтральный cwd → ничего не
+# исполняет, файлы не читает — судит строго по данным). Вход — замечание модератора ДОСЛОВНО +
+# черновик ответа + окно диалога; выход СТРОГО ОДИН JSON-объект
+# {"reading","class":СТИЛЬ|ФАКТ|НАДЗОР,"confidence":high|low,"plan"}. Это надстройка НАД keyword-
+# классификатором classify_lesson_remark: даёт трактовку и план, разводит размытые формулировки,
+# которых не берут ключевые слова. FAIL-SAFE: любой сбой думателя / брак JSON после РОВНО одного
+# ретрая → None (вызывающий откатывается на keyword-классификатор — поведение не хуже прежнего).
+# Думатель ИНЪЕКТИРУЕМ (юнит подставляет фейк); боевой дефолт лениво тянет pc_orchestrator._thinker_exec.
+LESSON_CLASSIFY_TIMEOUT = int(os.getenv("LESSON_CLASSIFY_TIMEOUT", "120") or "120")   # думатель — короткий ответ
+
+# Русские ярлыки класса из вывода думателя (спека 334) → внутренние маршруты модуля (style/fact/supervision).
+_LLM_CLASS_TO_ROUTE = {"СТИЛЬ": STYLE, "ФАКТ": FACT, "НАДЗОР": SUPERVISION}
+
+LESSON_CLASSIFY_PREAMBLE = (
+    "Ты — думательный слой дирижёра TurboBaby, который КЛАССИФИЦИРУЕТ урок от модератора: менеджер "
+    "поправил черновик ответа клиенту и оставил замечание. Твоя задача — ТОЛЬКО понять, чего касается "
+    "замечание, и отнести его к ОДНОМУ классу; ты НИЧЕГО не исполняешь, инструментов нет, файлы не "
+    "читаешь — суди строго по данным ниже.\n"
+    "Классы (выбери РОВНО один):\n"
+    "  СТИЛЬ  — тон/длина/формулировка/приветствие/эмодзи/вежливость/канцелярит (правится правилом в "
+    "книге стиля, код не трогается);\n"
+    "  ФАКТ   — неверные данные/расчёт/цена/депозит/модель/дата/наличие/логика/FAQ (правится в коде/"
+    "критфактах/FAQ, нужен тест);\n"
+    "  НАДЗОР — замечание про сам бот-надзор/ревизора/детект/чек-лист: что система ДОЛЖНА ЛОВИТЬ "
+    "(дописывается класс-правило в чек-лист ревизора).\n"
+    "Если сигнал размытый или противоречивый — выбери НАИБОЛЕЕ близкий класс, но поставь "
+    "confidence=low (низкую уверенность позже перепроверит человек). confidence=high — только когда "
+    "класс очевиден из самого замечания.\n"
+    "Ответь СТРОГО ОДНИМ JSON-объектом, без текста до/после, без markdown-обёртки:\n"
+    '{"reading":"<трактовка замечания одной фразой>","class":"СТИЛЬ"|"ФАКТ"|"НАДЗОР",'
+    '"confidence":"high"|"low","plan":"<что именно поправит, 1-2 строки>"}\n\n'
+)
+# Нудж на РЕТРАЙ: думатель без состояния, второй вызов получает базовый промпт + напоминание строгости.
+_LESSON_RETRY_NUDGE = ("ПРЕДЫДУЩИЙ ОТВЕТ был невалиден. Верни СТРОГО ОДИН JSON-объект с полями "
+                       "reading/class/confidence/plan (class ∈ СТИЛЬ|ФАКТ|НАДЗОР) и НИЧЕГО больше.\n\n")
+
+
+def build_lesson_classify_prompt(remark, draft="", window=""):
+    """Промпт думателя-классификатора: статичная преамбула (роль + классы + контракт вывода) + КОНКРЕТНЫЕ
+    данные урока — замечание модератора ДОСЛОВНО, черновик ответа, окно диалога. Пустые поля → «(нет)»."""
+    return (LESSON_CLASSIFY_PREAMBLE +
+            "ЗАМЕЧАНИЕ МОДЕРАТОРА (дословно):\n" + (str(remark or "").strip() or "(пусто)") + "\n\n" +
+            "ЧЕРНОВИК ОТВЕТА (его правит замечание):\n" + (str(draft or "").strip() or "(нет)") + "\n\n" +
+            "ОКНО ДИАЛОГА (контекст):\n" + (str(window or "").strip() or "(нет)") + "\n")
+
+
+def _parse_lesson_class_json(text):
+    """Строгий парс ответа думателя → {reading, class, confidence, plan, route} или None (fail-safe →
+    ретрай/откат). Терпим мусор-обёртку вокруг JSON (от первой { до последней }), но class ОБЯЗАН быть
+    из СТИЛЬ|ФАКТ|НАДЗОР — иначе брак → None. confidence вне high|low консервативно приводим к low
+    (не теряем урок, но и не доверяем как явному). reading/plan — свободный текст, нормализуем в строку."""
+    t = str(text or "").strip()
+    i, j = t.find("{"), t.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        d = json.loads(t[i:j + 1])
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    cls = str(d.get("class") or "").strip().upper()
+    route = _LLM_CLASS_TO_ROUTE.get(cls)
+    if route is None:                                # класс не из enum → брак (ретрай/откат), не угадываем
+        return None
+    conf = str(d.get("confidence") or "").strip().lower()
+    if conf not in ("high", "low"):
+        conf = "low"
+    return {"reading": _one_line(d.get("reading")), "class": cls, "confidence": conf,
+            "plan": _one_line(d.get("plan")), "route": route}
+
+
+def _default_lesson_thinker(prompt):
+    """Боевой думатель классификатора = pc_orchestrator._thinker_exec (тот же кондуктор Fable5→fallback,
+    read-only, ничего не исполняет). Ленивый импорт: тяжёлый pc_orchestrator тянем ТОЛЬКО на реальном
+    вызове (и разрываем цикл импорта — pc_orchestrator сам импортит lesson_router). Сбой → None."""
+    import pc_orchestrator
+    return pc_orchestrator._thinker_exec(prompt, LESSON_CLASSIFY_TIMEOUT, "lesson-classify")
+
+
+def classify_lesson_llm(remark, draft="", window="", think=None):
+    """Думательная классификация урока на THINKER_MODEL. Вход: замечание ДОСЛОВНО + черновик + окно.
+    → dict {reading, class(СТИЛЬ|ФАКТ|НАДЗОР), confidence(high|low), plan, route} или None (fail-safe).
+    РОВНО один ретрай: первый вызов — базовый промпт; если ответ не распарсился/брак — второй вызов с
+    напоминанием строгости; повторный брак / сбой думателя → None (вызывающий откатится на keyword-
+    классификатор). think инъектируется в тестах (реальный claude не дёргаем)."""
+    think = think or _default_lesson_thinker
+    base = build_lesson_classify_prompt(remark, draft, window)
+    for prompt in (base, _LESSON_RETRY_NUDGE + base):     # база + РОВНО один ретрай с нуджем
+        try:
+            out = think(prompt)
+        except Exception:                                # noqa: BLE001 — сбой думателя не роняет дирижёра
+            out = None
+        parsed = _parse_lesson_class_json(out) if out is not None else None
+        if parsed is not None:
+            return parsed
+    return None
 
 
 # ------------------------------- надзорный append (чек-лист ревизора) ---------------------

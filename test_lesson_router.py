@@ -434,5 +434,88 @@ class TestClassifyLiveRemarks(unittest.TestCase):
             self.assertEqual(want, self._route(remark), remark)
 
 
+class TestLessonClassifyLLM(unittest.TestCase):
+    """Родитель 334, шаг 1/6: думательный классификатор урока (THINKER_MODEL, _thinker_exec-паттерн).
+    Реальный claude НЕ дёргаем — думатель инъектируем фейком. Юнит-вызов на 2 примерах (ФАКТ/СТИЛЬ)
+    + ретрай + fail-safe. Golden-правило CLAUDE.md: замечания — дословные реплики учителя."""
+
+    def test_two_examples_classify(self):
+        # ПРИМЕР 1 (ФАКТ): дословная реплика учителя про неверную цену → class ФАКТ, route fact
+        fact_json = ('{"reading":"суточный тариф Nmax назван неверно",'
+                     '"class":"ФАКТ","confidence":"high","plan":"поправить тариф Nmax в критфактах + тест"}')
+        dec = lr.classify_lesson_llm("суточный тариф на Nmax 1500, а не 1200 — цена неверная",
+                                     draft="Аренда Nmax от 1200฿/сутки", window="Иван (555)",
+                                     think=lambda prompt: fact_json)
+        self.assertEqual("ФАКТ", dec["class"])
+        self.assertEqual(lr.FACT, dec["route"])
+        self.assertEqual("high", dec["confidence"])
+        self.assertIn("тариф", dec["reading"])
+        self.assertTrue(dec["plan"])
+
+        # ПРИМЕР 2 (СТИЛЬ): дословная реплика про тон → class СТИЛЬ, route style
+        style_json = ('{"reading":"ответ звучит сухо/канцелярски","class":"СТИЛЬ",'
+                      '"confidence":"high","plan":"переписать теплее, по-человечески"}')
+        dec2 = lr.classify_lesson_llm("звучит слишком сухо и по-канцелярски, пиши теплее",
+                                      draft="Аренда доступна.", window="Маша (777)",
+                                      think=lambda prompt: style_json)
+        self.assertEqual("СТИЛЬ", dec2["class"])
+        self.assertEqual(lr.STYLE, dec2["route"])
+
+    def test_prompt_carries_verbatim_remark_draft_window(self):
+        seen = {}
+        def think(prompt):
+            seen["prompt"] = prompt
+            return '{"reading":"r","class":"НАДЗОР","confidence":"low","plan":"p"}'
+        dec = lr.classify_lesson_llm("ревизор должен ловить выдуманную цену",
+                                     draft="Есть Aerox за 900฿", window="Петя (888)", think=think)
+        self.assertEqual(lr.SUPERVISION, dec["route"])
+        self.assertIn("ревизор должен ловить выдуманную цену", seen["prompt"])  # замечание ДОСЛОВНО
+        self.assertIn("Есть Aerox за 900฿", seen["prompt"])                     # черновик в промпте
+        self.assertIn("Петя (888)", seen["prompt"])                            # окно в промпте
+
+    def test_one_retry_on_bad_json_then_ok(self):
+        # первый ответ — мусор (без JSON), второй — валиден: РОВНО один ретрай спасает
+        calls = {"n": 0}
+        def think(prompt):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "извини, не смог"                # брак → ретрай
+            return '{"reading":"r","class":"ФАКТ","confidence":"low","plan":"p"}'
+        dec = lr.classify_lesson_llm("депозит неправильный, он 3000", think=think)
+        self.assertEqual(2, calls["n"])                # был ровно один ретрай
+        self.assertEqual(lr.FACT, dec["route"])
+
+    def test_no_more_than_one_retry_failsafe_none(self):
+        # брак дважды подряд → None (fail-safe: вызывающий откатится на keyword-классификатор)
+        calls = {"n": 0}
+        def think(prompt):
+            calls["n"] += 1
+            return "мусор без json"
+        self.assertIsNone(lr.classify_lesson_llm("плохо, переделай", think=think))
+        self.assertEqual(2, calls["n"])                # база + ровно один ретрай, не больше
+
+    def test_invalid_class_is_rejected(self):
+        # class вне СТИЛЬ|ФАКТ|НАДЗОР → брак (None после ретрая), не угадываем маршрут
+        self.assertIsNone(lr.classify_lesson_llm(
+            "x", think=lambda p: '{"reading":"r","class":"НЕЯСНО","confidence":"high","plan":"p"}'))
+
+    def test_bad_confidence_normalized_to_low(self):
+        # неведомая уверенность → консервативно low (урок не теряем, но и не доверяем как явному)
+        dec = lr.classify_lesson_llm(
+            "x", think=lambda p: '{"reading":"r","class":"СТИЛЬ","confidence":"maybe","plan":"p"}')
+        self.assertEqual("low", dec["confidence"])
+
+    def test_thinker_exception_is_failsafe_none(self):
+        # сбой думателя (исключение) не роняет — оба вызова падают → None
+        self.assertIsNone(lr.classify_lesson_llm(
+            "x", think=lambda p: (_ for _ in ()).throw(RuntimeError("claude down"))))
+
+    def test_json_with_wrapper_garbage_parsed(self):
+        # думатель обернул JSON в текст/markdown — берём от первой { до последней }
+        dec = lr.classify_lesson_llm("x", think=lambda p: (
+            'вот ответ:\n```json\n{"reading":"r","class":"НАДЗОР","confidence":"high","plan":"p"}\n```'))
+        self.assertEqual(lr.SUPERVISION, dec["route"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
