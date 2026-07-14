@@ -533,8 +533,11 @@ class TestLessonEnqueue(unittest.TestCase):
     (from=Filipp-pcloc-dec) с ПОЛНЫМ контекстом (замечание + исходный черновик + окно диалога).
     Прямого исполнения нет, гейт не обходим — проверяем только сам факт enqueue и его контекст."""
 
-    # живая карточка: окно 555 (@petya), исходный черновик — «дословный» текст менеджеру
-    DRAFT = {"id": 7, "draft": "Аренда от 1200฿/сутки, беру?", "client_id": 555, "client_ref": "@petya"}
+    # живая карточка: окно 555 (@petya), исходный черновик — «дословный» текст менеджеру,
+    # card_msg_id=9099 — координата карточки в модер-группе (реплай-точка для подтверждения
+    # «урок принят…» после коммита). draft_by_card грузит его в прод (SELECT * → card_msg_id).
+    DRAFT = {"id": 7, "draft": "Аренда от 1200฿/сутки, беру?", "client_id": 555,
+             "client_ref": "@petya", "card_msg_id": 9099}
 
     def setUp(self):
         self._save = (suggest.INTAKE_APPROVERS, suggest.APPROVER_USERNAMES)
@@ -565,6 +568,7 @@ class TestLessonEnqueue(unittest.TestCase):
         self.assertIn("#7", text)                         # id черновика
         self.assertIn("@danya", text)                     # кто учит
         self.assertIn("правка", text)                     # тип урока
+        self.assertIn("msg=9099", text)                   # message_id карточки — для ответа-подтверждения
 
     def test_not_lesson_does_not_enqueue(self):
         d = moderation_core.submit_lesson(self.DRAFT, "сделай короче", "danya", enqueue=self.fake)
@@ -603,8 +607,30 @@ class TestLessonEnqueue(unittest.TestCase):
         # чистый билдер контекста без enqueue — та же полнота, отдельно проверяема
         les = moderation_core.process_lesson(self.DRAFT, "правка: уточняй даты", "danya")
         text = moderation_core.build_lesson_task(les, self.DRAFT, "danya")
-        for frag in ("уточняй даты", "Аренда от 1200฿/сутки", "555", "@petya", "#7"):
+        for frag in ("уточняй даты", "Аренда от 1200฿/сутки", "555", "@petya", "#7", "msg=9099"):
             self.assertIn(frag, text, frag)
+
+    def test_card_msg_id_preserved_and_roundtrips_for_ack(self):
+        # message_id карточки должен ДОЖИТЬ в payload и распарситься обратно потребителем
+        # (lesson_router) — иначе подтверждение «урок принят…» уйдёт «в никуда». Это связка
+        # билдер↔потребитель по РЕАЛЬНОМУ полю (правило-класс «тест ≠ реальность»).
+        import lesson_router
+        d = moderation_core.submit_lesson(self.DRAFT, "урок: пиши мягче", "danya", enqueue=self.fake)
+        self.assertTrue(d["queued"])
+        text = self.calls[0][0]
+        self.assertIn("карточка модер-группы: msg=9099", text)   # координата в payload
+        parsed = lesson_router.parse_lesson_task(text)           # обратный разбор потребителем
+        self.assertEqual(parsed["card_msg_id"], "9099")          # id дожил → реплай-точка есть
+
+    def test_no_card_msg_id_yields_no_reply_target(self):
+        # карточка без message_id → билдер кладёт плейсхолдер, потребитель НЕ реплаит в никуда
+        # (parse_lesson_task гасит 'msg=?' в пустую строку) — fail-safe, а не мусорный реплай.
+        import lesson_router
+        draft = dict(self.DRAFT); draft.pop("card_msg_id")
+        d = moderation_core.submit_lesson(draft, "урок: пиши мягче", "danya", enqueue=self.fake)
+        self.assertTrue(d["queued"])
+        parsed = lesson_router.parse_lesson_task(self.calls[0][0])
+        self.assertEqual(parsed["card_msg_id"], "")              # нет id → нет реплай-точки
 
 
 if __name__ == "__main__":
