@@ -211,6 +211,25 @@ AVAILABILITY_INVARIANT_RULE = (
 )
 
 
+# ПОКОЛЕНИЯ МОДЕЛИ — по умолчанию только актуальное (в промпт ВСЕГДА, рядом с инвариантом наличия).
+# Живой провал @cryptopeppa (03:13 15.07): на «XMAX 300 на 5 дней» бот сам вываливал ОБА поколения с
+# годами выпуска («старый 2020-2022 / новый 2023+») и спрашивал «старое или новое?», хотя клиент про
+# поколения не спрашивал. Глобальное правило: по умолчанию предлагаем ЛИШЬ актуальное поколение (New
+# Gen) — без годов и без слова «старый»; прежнее поколение и года — ТОЛЬКО по явному запросу клиента.
+# Код-страховка того же класса: _model_products_for_quote отдаёт прежнее поколение лишь при old_gen_q.
+# Наличие при этом НЕ ослабляем (AVAILABILITY_INVARIANT_RULE выше остаётся в силе).
+GENERATION_DEFAULT_RULE = (
+    "\n\nПОКОЛЕНИЯ МОДЕЛИ (ПО УМОЛЧАНИЮ — ТОЛЬКО АКТУАЛЬНОЕ): если у модели несколько поколений "
+    "(напр. XMAX 300 — прежнее и New Gen), по умолчанию предлагай клиенту ТОЛЬКО актуальное "
+    "поколение (New Gen) ОДНОЙ ценой. НЕ пиши года выпуска («2020-2022», «2023+», «2021 года» и "
+    "т.п.), НЕ пиши слово «старый»/«старое поколение» и НЕ спрашивай клиента «старое или новое?» — "
+    "он про поколения не спрашивал. Прежнее поколение и года упоминай ТОЛЬКО если клиент САМ явно "
+    "про них спросил (напр. «а старый xmax есть?») — тогда приведи обе строки-поколения. Это правило "
+    "про то, ЧТО предлагать (модель/поколение), а НЕ про наличие: наличие конкретного байка на даты "
+    "по-прежнему НЕ утверждай (правило наличия выше остаётся в силе)."
+)
+
+
 # --- СТИЛЬ РЕАЛЬНЫХ МЕНЕДЖЕРОВ + FEW-SHOT (шаг 5/7 родитель #253) ----------------
 # Собрано из ЖИВОЙ базы переписок с клиентами (client_chats.jsonl, роль company =
 # наш менеджер @turbophuket). Это ЭТАЛОН ТОНА/ФОРМУЛИРОВОК/ДЛИНЫ, а НЕ новый источник
@@ -1158,13 +1177,36 @@ _XMAX_PRODUCTS = (
 )
 
 
-def _model_products_for_quote(model):
-    """Модель → продукты для ТОЧЕЧНОГО quote: [(метка, name_filter)]. XMAX разворачиваем в два
-    поколения (минимум-по-вариантам снят — показываем ОБА как отдельные строки); прочие модели —
-    один продукт с name_filter=None (поведение как раньше)."""
+def _model_products_for_quote(model, want_old_gen=False):
+    """Модель → продукты для ТОЧЕЧНОГО quote: [(метка, name_filter)]. ЕДИНЫЙ гэттер поколений (тот же
+    в первичной генерации и в strategy-перегенерации — год поколения в клиентское тело не течёт нигде):
+      • XMAX по умолчанию (want_old_gen=False) → ТОЛЬКО актуальное поколение (New Gen) ОДНОЙ строкой,
+        без годов и без «старый/новый» вопроса (глобальное правило поколений, кейс @cryptopeppa 15.07);
+      • XMAX + явный запрос клиента про прежнее поколение (want_old_gen=True, «а старый xmax есть?») →
+        ОБА поколения отдельными строками (старое / New Gen), как каталог по явной просьбе;
+      • прочие модели — один продукт с name_filter=None (поведение как раньше)."""
     if _is_xmax_model(model):
-        return [(label, pred) for label, pred in _XMAX_PRODUCTS]
+        prods = _XMAX_PRODUCTS if want_old_gen else _XMAX_PRODUCTS[1:]   # [1:] = только New Gen
+        return [(label, pred) for label, pred in prods]
     return [(model, None)]
+
+
+# Клиент ЯВНО просит ПРЕЖНЕЕ поколение (XMAX): «старый xmax», «старое поколение», «прежнее»,
+# «не новый», «old (gen)», модель-годы 2018-2022. Только тогда показываем оба поколения; иначе
+# по умолчанию — лишь актуальное (New Gen). Формы «стар…» перечислены явно, чтобы НЕ ловить «старт».
+_OLD_GEN_RE = re.compile(
+    r"стар(?:ый|ое|ую|ая|ого|ом|ым|ой|ше|еньк\w*)"        # старый/старое поколение, старше (не «старт»)
+    r"|прежн\w+"                                            # прежнее поколение
+    r"|\bold(?:er)?\b|old[-\s]?gen|previous\s+gen"         # old / older / old gen / previous gen
+    r"|не\s+нов\w+|not\s+new"                               # не новый / not new
+    r"|\b20(?:1[89]|2[0-2])\b",                             # модель-годы 2018-2022 (прежнее поколение)
+    re.I)
+
+
+def _asks_old_gen(newest: str, recent: str) -> bool:
+    """Клиент ЯВНО просит прежнее поколение модели (см. _OLD_GEN_RE) → True. Ищем во ВСЁМ окне
+    (newest+recent): запрос про «старый xmax» часто приходит РЕПЛИКОЙ ПОЗЖЕ дат первичной брони."""
+    return bool(_OLD_GEN_RE.search(f"{newest or ''}\n{recent or ''}"))
 
 
 def _asks_deposit_reduction_multi(newest: str, recent: str, models) -> bool:
@@ -1483,13 +1525,15 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
     sheet_filter = _parse_sheet_filter(newest, recent)
     percent_q = _asks_percent_amount(newest, recent)   # «сколько будет N%» → процент от суммы расчёта
     units_count = _units_count(newest, models)         # «пара/два юнита одной модели» → цена «за каждый»
+    old_gen_q = _asks_old_gen(newest, recent)          # «а старый xmax есть?» → прежнее поколение по запросу
 
     return {"model": model, "models": models, "date_start": iso_start, "date_end": iso_end,
             "iso_start": iso_start, "iso_end": iso_end, "term_days": term_days,
             "hint_days": hint_days, "monthly": monthly, "has_dates": has_dates,
             "has_start": has_start,
             "deposit_multi_q": deposit_multi_q, "price_sheet_q": price_sheet_q,
-            "sheet_filter": sheet_filter, "percent_q": percent_q, "units_count": units_count}
+            "sheet_filter": sheet_filter, "percent_q": percent_q, "units_count": units_count,
+            "old_gen_q": old_gen_q}
 
 
 # ------------------- §243/6: трекер собранного по диалогу + reply-вложениям -------------------
@@ -2299,9 +2343,13 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
             resolved.append(m)
     models = resolved
 
-    # Разворачиваем модели в ПРОДУКТЫ: XMAX → два поколения отдельными строками (старое / New Gen),
-    # прочие модели — один продукт как раньше. (label, модель_для_quote, name_filter-по-имени-юнита.)
-    products = [(label, m, nf) for m in models for label, nf in _model_products_for_quote(m)]
+    # Разворачиваем модели в ПРОДУКТЫ через ЕДИНЫЙ гэттер поколений: XMAX по умолчанию → ТОЛЬКО
+    # актуальное поколение (New Gen) одной строкой, без годов; прежнее поколение (старое + New Gen
+    # двумя строками) — лишь по явному запросу клиента (old_gen_q, «а старый xmax есть?»). Прочие
+    # модели — один продукт как раньше. (label, модель_для_quote, name_filter-по-имени-юнита.)
+    want_old_gen = bool(hints.get("old_gen_q"))
+    products = [(label, m, nf) for m in models
+                for label, nf in _model_products_for_quote(m, want_old_gen=want_old_gen)]
 
     if len(products) == 1:
         label, m, nf = products[0]
@@ -2531,7 +2579,7 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         + pressure_block
         + directive_block + park_block + collected_block + greet + policy + scenario + ANTI_LOOP_NOTE + price_block + "\n\n"
         + CRITICAL_FACTS + EXPERIENCE_SAFETY_RULE + APPROVAL_WHITELIST_RULE
-        + AVAILABILITY_INVARIANT_RULE + playbook_block
+        + AVAILABILITY_INVARIANT_RULE + GENERATION_DEFAULT_RULE + playbook_block
         + "\n\nFAQ и эталонные формулировки:\n" + (faq or "(FAQ недоступен — опирайся на критичные факты выше)")
         + STYLE_FEWSHOT
     )

@@ -310,6 +310,19 @@ class TestPureLogic(unittest.TestCase):
         self.assertNotIn("ДИРЕКТИВА МЕНЕДЖЕРА",                  # без директивы блока нет
                          suggest.make_system_prompt("FAQ", "ru"))
 
+    def test_generation_default_rule_in_prompt(self):
+        # Глобальное правило поколений в системном промпте (кейс @cryptopeppa 15.07): по умолчанию
+        # ТОЛЬКО актуальное поколение (New Gen), без годов и без «старый»; прежнее/года — по явному
+        # запросу; инвариант наличия НЕ ослаблен (правило поколений про модель, не про наличие).
+        sysp = suggest.make_system_prompt("FAQ", "ru")
+        self.assertIn("ПОКОЛЕНИЯ МОДЕЛИ (ПО УМОЛЧАНИЮ — ТОЛЬКО АКТУАЛЬНОЕ)", sysp)
+        self.assertIn("New Gen", sysp)
+        self.assertIn("НЕ пиши года выпуска", sysp)                 # без годов поколений
+        self.assertIn("«старый»", sysp)                             # без слова «старый»
+        self.assertIn("ТОЛЬКО если клиент САМ явно про них спросил", sysp)
+        self.assertIn("НАЛИЧИЕ, ДЕФИЦИТ И ОСОБЫЕ УСЛОВИЯ", sysp)    # гард наличия на месте (не ослаблен)
+        self.assertIn("правило наличия выше остаётся в силе", sysp)
+
     def test_regenerate_draft_injects_directive(self):
         seen = {}
         def fake(system, user):
@@ -2475,23 +2488,44 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
         self.assertIn("NMAX 155\n• Сутки: 450 ฿\n• Неделя (7 дней): 2800 ฿\n"
                       "• Месяц: от 8500 ฿\n• Депозит: 5000 ฿ / паспорт", block)
 
-    def test_pointwise_xmax_shows_both_gens(self):
-        # ГОЛДЕН (родитель 243, шаг 1/7): точечный quote по XMAX на неделю → ОБЕ строки-поколения
-        # со СВОИМИ цифрами (старое 4700 vs New Gen 5600), а не одна цена-минимум. Реальные фразы
-        # клиента (правило-класс: golden-тест детекта = дословное сообщение, не идеализированное).
-        for phrase in ("сколько стоит xmax на неделю с 15 июля?",
+    def test_pointwise_xmax_default_new_gen_only(self):
+        # ГОЛДЕН (кейс @cryptopeppa 03:13 15.07): БЕЗ запроса про поколение точечный quote по XMAX
+        # даёт ОДНУ цену New Gen — без старого поколения, без годов, без «старый/новый» вопроса.
+        # Реальные фразы клиента (правило-класс: golden-тест детекта = дословное сообщение).
+        for phrase in ("XMAX 300 на 5 дней с 15 июля",
+                       "сколько стоит xmax на неделю с 15 июля?",
                        "аренда xmax 15.07-22.07 сколько?",
                        "цена xmax на неделю с 15 июля",
                        "почём xmax на неделю с 15 июля?",
                        "xmax на неделю с 15 июля какая цена?"):
             hints = suggest.extract_booking_hints(f"[клиент]: {phrase}",
                                                   today=datetime.date(2026, 7, 11))
+            self.assertFalse(hints["old_gen_q"], phrase)            # прежнее поколение НЕ запрошено
             note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter(),
                                               today=datetime.date(2026, 7, 11))
-            self.assertIn("- XMAX 300: ", note, phrase)             # строка старого поколения
-            self.assertIn("- XMAX 300 New Gen: ", note, phrase)     # строка нового поколения
-            self.assertIn("7d 4700", note, phrase)                  # неделя старого — своя цифра
-            self.assertIn("7d 5600", note, phrase)                  # неделя нового — РАЗНАЯ цифра
+            self.assertIn("New Gen", note, phrase)                  # актуальное поколение в ответе
+            self.assertNotIn("- XMAX 300:", note, phrase)           # строки старого поколения НЕТ
+            self.assertNotIn("4700", note, phrase)                  # цифра старого поколения не течёт
+            # квотирован ТОЛЬКО новый юнит (New Gen) — цена актуального поколения (5600 за неделю / 939 сут)
+            self.assertTrue("5600" in note or "939" in note, phrase)
+
+    def test_pointwise_xmax_explicit_old_gen_shows_both(self):
+        # ГОЛДЕН (кейс @cryptopeppa): ЯВНЫЙ запрос «а старый xmax есть?» (репликой ПОЗЖЕ дат первичной
+        # брони) → ОБЕ строки-поколения со СВОИМИ цифрами (старое 4700 vs New Gen 5600). Года допустимы.
+        for older in ("а старый xmax есть?",
+                      "а прежнее поколение xmax есть?",
+                      "есть xmax старой версии?",
+                      "интересует xmax 2021 года",
+                      "is there an old xmax?"):
+            tr = f"[клиент]: xmax на неделю с 15 июля какая цена?\n[клиент]: {older}"
+            hints = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+            self.assertTrue(hints["old_gen_q"], older)              # прежнее поколение запрошено ЯВНО
+            note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter(),
+                                              today=datetime.date(2026, 7, 11))
+            self.assertIn("- XMAX 300: ", note, older)             # строка старого поколения
+            self.assertIn("- XMAX 300 New Gen: ", note, older)     # строка нового поколения
+            self.assertIn("7d 4700", note, older)                  # неделя старого — своя цифра
+            self.assertIn("7d 5600", note, older)                  # неделя нового — РАЗНАЯ цифра
             # старую строку квотировал ТОЛЬКО старый юнит, новую — ТОЛЬКО новый (поколения не смешаны)
             old_line = next(l for l in note.splitlines() if l.startswith("- XMAX 300:"))
             new_line = next(l for l in note.splitlines() if l.startswith("- XMAX 300 New Gen:"))
@@ -2510,9 +2544,9 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
         self.assertNotIn("ЗА КАЖДЫЙ", note)               # одна единица — пометки «за каждый» нет
 
     def test_pointwise_pair_xmax_price_per_each(self):
-        # ГОЛДЕН #365 шаг 2/7: «пару скутеров xmax 16-24 июля» → цена И депозит ЗА КАЖДЫЙ юнит;
-        # общий итог за 2 шт. НЕ выдуман (числа — только из Bridge, код не умножает). Дословная
-        # фраза клиента + парафразы RU (правило-класс CLAUDE.md: golden-детект = реальная фраза).
+        # ГОЛДЕН #365 шаг 2/7 + правило поколений (кейс @cryptopeppa): «пару скутеров xmax 16-24 июля»
+        # БЕЗ запроса про поколение → New Gen ОДНОЙ строкой, цена И депозит ЗА КАЖДЫЙ юнит; общий итог
+        # за 2 шт. НЕ выдуман. Дословная фраза клиента + парафразы RU (правило-класс CLAUDE.md).
         for phrase in ("пару скутеров xmax 16-24 июля",
                        "два xmax на 16-24 июля",
                        "нужны два скутера xmax с 16 по 24 июля",
@@ -2521,28 +2555,44 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
             hints = suggest.extract_booking_hints(f"[клиент]: {phrase}",
                                                   today=datetime.date(2026, 7, 11))
             self.assertEqual(hints["units_count"], 2, phrase)     # детект N юнитов одной модели
+            self.assertFalse(hints["old_gen_q"], phrase)          # прежнее поколение НЕ запрошено
             note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter(),
                                               today=datetime.date(2026, 7, 11))
             self.assertIn("ЗА КАЖДЫЙ", note, phrase)              # цена/депозит помечены «за каждый»
-            self.assertIn("- XMAX 300: ", note, phrase)          # оба поколения — раздельными строками
-            self.assertIn("- XMAX 300 New Gen: ", note, phrase)
-            self.assertIn("790", note, phrase)                   # цена старого поколения из Bridge
+            self.assertIn("New Gen", note, phrase)               # только актуальное поколение
+            self.assertNotIn("- XMAX 300:", note, phrase)        # строки старого поколения НЕТ
+            self.assertNotIn("790", note, phrase)                # цена старого поколения не течёт
             self.assertIn("939", note, phrase)                   # цена нового поколения из Bridge
-            self.assertIn("5000", note, phrase)                  # депозит старого из Bridge
             self.assertIn("7000", note, phrase)                  # депозит нового из Bridge
             # ВЫДУМАННОГО общего итога за 2 шт. в блоке НЕТ (код не суммирует и не умножает):
-            self.assertNotIn("1580", note, phrase)               # 2×790 не выдумано
             self.assertNotIn("1878", note, phrase)               # 2×939 не выдумано
-            self.assertNotIn("10000", note, phrase)              # 2×5000 (депозит) не выдумано
             self.assertNotIn("14000", note, phrase)              # 2×7000 (депозит) не выдумано
-            # #365 родитель4 шаг3/6: живые цены поколений едут в служебный quote-блок → strategy-путь
-            # донесёт их КОДОМ; пометка «за каждый» и в блоке, итог за 2 шт. по-прежнему не выдуман.
+            # #365 родитель4 шаг3/6: живая цена New Gen едет в служебный quote-блок → strategy-путь
+            # донесёт её КОДОМ; пометка «за каждый» и в блоке, итог за 2 шт. по-прежнему не выдуман.
             block = suggest._quote_block_from_note(note)
             self.assertIsNotNone(block, phrase)
-            self.assertIn("790", block, phrase)                  # старое поколение — своя цена
             self.assertIn("939", block, phrase)                  # новое поколение — своя цена
             self.assertIn("ЗА КАЖДЫЙ", block, phrase)            # цена/депозит за каждый юнит
-            self.assertNotIn("1580", block, phrase)              # итог за 2 шт. не выдуман и в блоке
+            self.assertNotIn("1878", block, phrase)              # итог за 2 шт. не выдуман и в блоке
+
+    def test_pointwise_pair_xmax_explicit_old_gen_both(self):
+        # Пара XMAX + ЯВНЫЙ запрос про прежнее поколение → ОБА поколения раздельными строками, цена/
+        # депозит «за каждый», итог за 2 шт. не выдуман. Года по явной просьбе клиента допустимы.
+        # «пару…» — в ПОСЛЕДНЕЙ (новейшей) реплике: детект N юнитов читает только её; «старый» —
+        # раньше в окне (old_gen_q сканирует всё окно newest+recent).
+        tr = "[клиент]: а старый xmax тоже есть?\n[клиент]: пару скутеров xmax 16-24 июля"
+        hints = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        self.assertEqual(hints["units_count"], 2)
+        self.assertTrue(hints["old_gen_q"])
+        note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+        self.assertIn("- XMAX 300: ", note)                      # оба поколения — раздельными строками
+        self.assertIn("- XMAX 300 New Gen: ", note)
+        self.assertIn("790", note)                               # старое поколение — своя цена
+        self.assertIn("939", note)                               # новое поколение — своя цена
+        self.assertIn("ЗА КАЖДЫЙ", note)
+        self.assertNotIn("1580", note)                           # 2×790 не выдумано
+        self.assertNotIn("1878", note)                           # 2×939 не выдумано
 
     def test_units_count_detect_real_phrases(self):
         # Правило-класс CLAUDE.md: детект на РЕАЛЬНОЙ фразе клиента + парафразы RU/EN + негативы.

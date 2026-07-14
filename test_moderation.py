@@ -351,9 +351,12 @@ class TestEndToEndMax2stix(unittest.TestCase):
 
     def _assert_compliant(self, out, ctx=""):
         low = suggest.client_facing_text(out).lower()
-        # (1) цена И депозит ЗА КАЖДЫЙ юнит доехали клиенту КОДОМ (LLM их потерял)
-        for num in ("790", "939", "5000", "7000"):
+        # (1) цена И депозит ЗА КАЖДЫЙ юнит доехали клиенту КОДОМ (LLM их потерял). БЕЗ запроса про
+        # поколение — ТОЛЬКО актуальное (New Gen 939/7000); прежнее поколение (790/5000) не предлагаем.
+        for num in ("939", "7000"):
             self.assertIn(num, out, f"{ctx}: нет цены/депозита {num} за каждый юнит:\n{out}")
+        for old_num in ("790", "5000"):
+            self.assertNotIn(old_num, out, f"{ctx}: прежнее поколение {old_num} утекло без запроса:\n{out}")
         self.assertIn("ЗА КАЖДЫЙ", out, f"{ctx}: пометка «за каждый» потеряна:\n{out}")
         self.assertIn("New Gen", out, f"{ctx}: поколение помечено не New Gen:\n{out}")
         # выдуманного общего итога за 2 шт. нет (код не суммирует — числа только из Bridge)
