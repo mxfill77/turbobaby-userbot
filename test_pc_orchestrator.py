@@ -28,6 +28,7 @@ class FakeBridge:
     def __init__(self):
         self.tasks = {}
         self._id = 0
+        self.hb = {}
 
     def add(self, status="new", lane="pc", task_text="сделай X", updated=None):
         self._id += 1
@@ -62,6 +63,7 @@ class FakeBridge:
         return {"ok": True}
 
     def task_heartbeat(self, tid):
+        self.hb[tid] = self.hb.get(tid, 0) + 1     # счётчик тиков heartbeat по задаче (для тестов ожидания)
         return {"ok": True}
 
     def enqueue_task(self, frm, text, lane="pc"):
@@ -75,6 +77,9 @@ class Base(unittest.TestCase):
     def setUp(self):
         self._save = (o.bc, o.run_claude, o._notify, o._cowork, o._stopped, o._selfheal_on,
                       o._notify_chain_card, o._loc_mark_chain_final)
+        self._save_lw = o.LESSON_WAIT_STATE       # ждущие low-уроки: боевой state-файл в тестах не читаем
+        o.LESSON_WAIT_STATE = os.path.join(tempfile.mkdtemp(), "lesson_waits.json")
+        self.addCleanup(lambda: setattr(o, "LESSON_WAIT_STATE", self._save_lw))
         self.fb = FakeBridge()
         o.bc = self.fb
         o._notify = lambda *a, **k: None
@@ -4492,6 +4497,133 @@ class TestUnclearLessonHonestReport(Base):
         tid = self.fb.add(task_text=self._task("что-то не то"))
         o._handle_lesson(tid, self.fb.tasks[tid]["task_text"])
         self.assertIn("не доставлена", self.fb.tasks[tid]["result"])
+
+
+class TestLessonWaitReaper(Base):
+    """КЛАСС-ФИКС инцидента 354: low-урок в ожидании ответа учителя (переспрос «верно?») ЖИВ — не
+    гибнет ложно от process_stuck_singles на 90-й минуте. heartbeat тикает; ЕДИНСТВЕННЫЙ предел
+    ожидания — 24ч → карточка владельцу в 1160; ответ учителя «да» после ДОЛГОЙ паузы → resume
+    берёт урок в работу; регресс реапера на НАСТОЯЩИХ зависаниях (не в ожидании) цел."""
+
+    _T0 = 1_000_000.0        # база epoch для created_at/now (детерминизм — время инъектируем)
+
+    def setUp(self):
+        super().setUp()
+        self._save_owner = o._deliver_owner_card         # инъекции owner-канала не должны течь в другие тесты
+        self.addCleanup(lambda: setattr(o, "_deliver_owner_card", self._save_owner))
+
+    def _pending(self, route="style", created_ago=0.0):
+        return {"text": "[урок:правка от @danya] замечание\nЗамечание: пиши короче, без воды",
+                "route": route, "class": "СТИЛЬ", "reading": "писать короче",
+                "plan": "добавить правило в книгу правил", "remark": "пиши короче, без воды",
+                "draft": "", "window": "Света (999)", "who": "@danya", "card_msg_id": "90510",
+                "created_at": self._T0 - created_ago}
+
+    def _waiting_dec(self, route="style", created_ago=0.0):
+        return {"route": route, "confidence": "low", "delegate": False, "status": "waiting",
+                "pending_low": self._pending(route, created_ago), "llm_class": "СТИЛЬ",
+                "result": "🤔 неуверенно → спросил учителя «верно?», жду «да»"}
+
+    def _enter(self, tid, route="style", created_ago=0.0):
+        # штатный путь: думатель вернул low-waiting dec → _handle_lesson уводит урок в ожидание
+        with mock.patch.object(o.lesson_router, "handle_lesson_task",
+                               return_value=self._waiting_dec(route, created_ago)):
+            o._handle_lesson(tid, self.fb.tasks[tid]["task_text"])
+
+    def test_enter_wait_keeps_in_progress_and_saves(self):
+        tid = self.fb.add(status="in_progress", updated=iso_ago(10))
+        self._enter(tid)
+        self.assertEqual("in_progress", self.fb.tasks[tid]["status"])   # НЕ закрыта — ждём подтверждения
+        self.assertIn(tid, o._lesson_wait_ids())                         # ожидание сохранено на диск
+        self.assertGreaterEqual(self.fb.hb.get(tid, 0), 1)               # heartbeat тикнут сразу
+
+    def test_reaper_skips_waiting_lesson(self):
+        # даже со СТАРЫМ updated (>90 мин) ждущий урок исключён из реапа — не орфан
+        tid = self.fb.add(status="in_progress", updated=iso_ago(o.PC_SINGLE_STALE + 3600))
+        self._enter(tid)
+        o.process_stuck_singles()
+        self.assertEqual("in_progress", self.fb.tasks[tid]["status"])   # ЖИВ, не failed
+
+    def test_waiting_2h_alive(self):
+        # ГОЛДЕН: урок ждёт 2ч+ (<24ч) → жив; тик держит heartbeat, реапер молчит
+        tid = self.fb.add(status="in_progress", updated=iso_ago(o.PC_SINGLE_STALE + 1000))
+        self._enter(tid)
+        hb0 = self.fb.hb.get(tid, 0)
+        o._deliver_owner_card = lambda *a, **k: ("инбокс 1160", True)
+        o.process_lesson_waits(now=self._T0 + 2 * 3600)
+        o.process_stuck_singles()
+        self.assertEqual("in_progress", self.fb.tasks[tid]["status"])
+        self.assertGreater(self.fb.hb.get(tid, 0), hb0)                  # heartbeat тикнул ещё раз
+        self.assertIn(tid, o._lesson_wait_ids())                         # ожидание не снято (<24ч)
+
+    def test_24h_timeout_to_owner_is_sole_limit(self):
+        # ЕДИНСТВЕННЫЙ предел: молчит учитель >24ч → карточка владельцу 1160 + задача done + снятие
+        tid = self.fb.add(status="in_progress", updated=iso_ago(60))
+        self._enter(tid)
+        cards = []
+        o._deliver_owner_card = lambda text, *a, **k: (cards.append(text) or ("инбокс 1160", True))
+        o.process_lesson_waits(now=self._T0 + 24 * 3600 + 60)
+        self.assertEqual("done", self.fb.tasks[tid]["status"])
+        self.assertNotIn(tid, o._lesson_wait_ids())                     # ожидание снято
+        self.assertEqual(1, len(cards))                                  # ровно одна карточка владельцу
+        o.process_lesson_waits(now=self._T0 + 25 * 3600)                # повторный тик — не задваивает
+        self.assertEqual(1, len(cards))
+
+    def test_resume_yes_after_long_pause(self):
+        # ГОЛДЕН: ответ учителя «да» после ДОЛГОЙ паузы (10ч, <24ч) → resume берёт урок В РАБОТУ
+        tid = self.fb.add(status="in_progress", updated=iso_ago(o.PC_SINGLE_STALE + 2000))
+        self._enter(tid)
+        o._deliver_owner_card = lambda *a, **k: ("инбокс 1160", True)
+        o.process_lesson_waits(now=self._T0 + 10 * 3600)                # долго ждал — но жив
+        self.assertEqual("in_progress", self.fb.tasks[tid]["status"])
+        added = []
+        dec = o.resume_lesson_wait(tid, "да", is_approver=True,
+                                   append_style=lambda r: (added.append(r) or "added"),
+                                   reply_moderation=lambda c, t: True)
+        self.assertEqual("approved", dec.get("resumed"))                # учитель подтвердил трактовку
+        self.assertEqual("done", self.fb.tasks[tid]["status"])          # урок доведён
+        self.assertNotIn(tid, o._lesson_wait_ids())                     # ожидание снято
+        self.assertEqual(1, len(added))                                  # правило записано в книгу правил
+
+    def test_resume_yes_non_approver_stays_waiting(self):
+        # «да» НЕ от аппрувера → игнор, урок жив и ждёт уполномоченного
+        tid = self.fb.add(status="in_progress", updated=iso_ago(60))
+        self._enter(tid)
+        dec = o.resume_lesson_wait(tid, "да", is_approver=False,
+                                   append_style=lambda r: "added", reply_moderation=lambda c, t: True)
+        self.assertEqual("waiting", dec.get("status"))
+        self.assertEqual("in_progress", self.fb.tasks[tid]["status"])   # не закрыт
+        self.assertIn(tid, o._lesson_wait_ids())                         # ожидание НЕ снято
+
+    def test_reaper_still_reaps_real_stuck(self):
+        # РЕГРЕСС: настоящий зависший одиночка (НЕ в ожидании) реапится как прежде
+        tid = self.fb.add(status="in_progress", updated=iso_ago(o.PC_SINGLE_STALE + 300))
+        o.process_stuck_singles()
+        self.assertEqual("failed", self.fb.tasks[tid]["status"])
+        self.assertIn("ПК-таймаут", self.fb.tasks[tid]["result"])
+
+    def test_selfheal_drops_wait_when_not_in_progress(self):
+        # задача закрыта вне resume-шва → ожидание снимается (self-heal), тик не трогает чужой статус
+        tid = self.fb.add(status="in_progress", updated=iso_ago(60))
+        self._enter(tid)
+        self.fb.tasks[tid]["status"] = "done"
+        o.process_lesson_waits(now=self._T0 + 60)
+        self.assertNotIn(tid, o._lesson_wait_ids())
+
+    def test_poll_once_protects_waiting(self):
+        # весь цикл: process_lesson_waits ДО реапера → ждущий урок переживает poll_once
+        tid = self.fb.add(status="in_progress", updated=iso_ago(o.PC_SINGLE_STALE + 500))
+        self._enter(tid)
+        import time as _time                                            # poll_once не инъектирует now →
+        st = o._lesson_waits_read()                                     # ставим свежую метку (age<24ч под реальным now)
+        st[str(tid)]["created_at"] = _time.time()
+        o._lesson_waits_write(st)
+        o._deliver_owner_card = lambda *a, **k: ("инбокс 1160", True)
+        with mock.patch.object(o, "_write_heartbeat", lambda: None), \
+             mock.patch.object(o, "process_new", lambda: None), \
+             mock.patch.object(o, "process_local_chains", lambda: None):
+            o.poll_once()
+        self.assertEqual("in_progress", self.fb.tasks[tid]["status"])   # жив после полного цикла
 
 
 if __name__ == "__main__":

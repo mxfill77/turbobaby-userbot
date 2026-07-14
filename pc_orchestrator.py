@@ -732,16 +732,12 @@ def _deliver_lesson_ack(card_msg_id, text):
     _cowork(f"урок: подтверждение учителю (реплай на карточку msg={card_msg_id or '?'}) — {_clip(text)}")
 
 
-def _handle_lesson(tid, text):
-    """Обработать задачу-урок (родитель 292, шаги 3–4): дирижёр классифицирует замечание менеджера и
-    маршрутизирует. СТИЛЬ → правило в книгу правил (playbook); НАДЗОР → строка-класс в чек-лист
-    ревизора; ФАКТ/ЛОГИКА → локальному планировщику (правка кода/критфактов/FAQ + ТЕСТ); неясное →
-    карточка-уточнение владельцу в 1160 (не угадываем). Боевые sink'и: playbook / чек-лист / инбокс
-    1160 (_deliver_owner_card — СИНХРОННАЯ доставка с подтверждением канала, рапорт честный «доставлено
-    через X», не гадательный). Bridge/таблицы/деньги не трогаем — только текст доков или делегирование.
-    Шаг 4: применённый урок КОММИТИМ (итог = закоммиченный диф) и ТОЛЬКО после реального коммита шлём
-    подтверждение «урок принят…» учителю (инвариант «подтверждение не уходит до коммита»)."""
-    dec = lesson_router.handle_lesson_task(text, notify_owner=_deliver_owner_card)
+def _finalize_lesson_dec(tid, text, dec):
+    """Довести УЖЕ ПОЛУЧЕННЫЙ dec урока — общее ядро первичного _handle_lesson и resume_lesson_wait
+    (возобновление по ответу учителя). Ветку waiting здесь НЕ трогаем (её ловит вызывающий): delegate →
+    локальный планировщик; иначе complete_task + (для done, шаг 4) коммит tracked-дифа урока и ТОЛЬКО
+    после реального коммита подтверждение «урок принят…» учителю (инвариант «подтверждение не уходит до
+    коммита»). Нет коммита (сбой/СТИЛЬ-playbook gitignored/дедуп/UNCLEAR) → подтверждение НЕ шлём."""
     route = dec.get("route")
     if dec.get("delegate"):                    # ФАКТ/ЛОГИКА — правка+тест = работа думателя-планировщика
         log.info("LESSON id=%s route=%s → планировщик (правка+тест)", tid, route)
@@ -755,13 +751,167 @@ def _handle_lesson(tid, text):
     log.info("LESSON id=%s route=%s → %s (%s)", tid, route, status, dec.get("reason"))
     _cowork(f"урок #{tid} [{route}] → {status} · {_clip(result)}")
     _notify_task(status, tid, result)
-    # Шаг 4: применённый урок → закоммитить его tracked-диф и ТОЛЬКО после реального коммита
-    # подтвердить учителю. Нет коммита (сбой/СТИЛЬ-playbook gitignored/дедуп) → подтверждение НЕ шлём.
     if status == "done":
         commit = _commit_lesson(tid, route, dec.get("ack_subject"), dec.get("commit_paths"))
         ack = lesson_router.ack_after_commit(commit, dec.get("ack_subject"), dec.get("ack_where"))
         if ack:
             _deliver_lesson_ack(dec.get("card_msg_id"), ack)
+
+
+def _handle_lesson(tid, text):
+    """Обработать задачу-урок (родитель 292, шаги 3–4): дирижёр классифицирует замечание менеджера и
+    маршрутизирует. СТИЛЬ → правило в книгу правил (playbook); НАДЗОР → строка-класс в чек-лист
+    ревизора; ФАКТ/ЛОГИКА → локальному планировщику (правка кода/критфактов/FAQ + ТЕСТ); неясное →
+    карточка-уточнение владельцу в 1160 (не угадываем). Боевые sink'и: playbook / чек-лист / инбокс
+    1160 (_deliver_owner_card — СИНХРОННАЯ доставка с подтверждением канала, рапорт честный «доставлено
+    через X», не гадательный). Bridge/таблицы/деньги не трогаем — только текст доков или делегирование.
+    confidence=low (родитель 334, шаг 3): урок В РАБОТУ НЕ БЕРЁМ — спросили учителя «верно?» и ЖДЁМ.
+    status='waiting' → задача НЕ закрывается: сохраняем pending_low на диск и оставляем in_progress под
+    защитой process_lesson_waits (реапер одиночек её НЕ трогает; heartbeat тикаем сами; ЕДИНСТВЕННЫЙ
+    предел ожидания — 24ч → карточка владельцу в 1160, шаг 4). Класс-фикс инцидента 354."""
+    dec = lesson_router.handle_lesson_task(text, notify_owner=_deliver_owner_card)
+    if dec.get("status") == "waiting" and dec.get("pending_low"):
+        _enter_lesson_wait(tid, dec)
+        return
+    _finalize_lesson_dec(tid, text, dec)
+
+
+# ---------------- ПК-side ОЖИДАНИЕ low-урока: подтверждение учителя (родитель 334, шаги 3–4) ----------
+# КЛАСС-ФИКС инцидента 354. confidence=low урок остаётся in_progress, ЗАКОННО ожидая ответа учителя
+# «верно?» в модер-группе. Демон держит его живым САМ, чтобы одиночный ПК-ливнесс (process_stuck_singles,
+# 90 мин) не убил его ложно как орфана:
+#   (1) состояние pending_low лежит НА ДИСКЕ (restart-proof, ключ = tid);
+#   (2) каждый тик мы ТИКАЕМ task_heartbeat (updated свеж → реапер одиночек не срубает) И реапер
+#       ДОПОЛНИТЕЛЬНО исключает ждущие tid'ы (замок инварианта, не зависит от тайминга поллинга);
+#   (3) ЕДИНСТВЕННЫЙ предел ожидания — check_low_wait_timeout (24ч, шаг 4): молчит учитель >24ч →
+#       карточка владельцу в 1160, ожидание снято. Урок НЕ теряем, но и НЕ висит вечно.
+# resume_lesson_wait — шов возобновления по ответу учителя (голден зовёт напрямую; боевой роутинг
+# ответа из модер-группы делает moderation_bot отдельным шагом — его здесь НЕ трогаем).
+LESSON_WAIT_STATE = os.path.join(REPO, "pc_orchestrator.lesson_waits.json")
+
+
+def _lesson_waits_read(path=None):
+    """State ждущих low-уроков {str(tid): pending_low} → dict ({} при отсутствии/бое — fail-safe)."""
+    try:
+        with open(path or LESSON_WAIT_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _lesson_waits_write(d, path=None):
+    try:
+        with open(path or LESSON_WAIT_STATE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning("state ждущих low-уроков не записался (%s) — ожидание деградирует, не критично", e)
+
+
+def _lesson_wait_ids(path=None):
+    """Множество tid законно-ждущих low-уроков (реапер одиночек их исключает). Битые ключи игнорируем."""
+    ids = set()
+    for k in _lesson_waits_read(path):
+        try:
+            ids.add(int(k))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
+def _enter_lesson_wait(tid, dec, path=None):
+    """Урок ушёл в ожидание подтверждения учителя (confidence=low): СОХРАНЯЕМ pending_low на диск под tid
+    и ОСТАВЛЯЕМ задачу in_progress (НЕ закрываем). Тикаем heartbeat сразу — updated свеж с первой секунды
+    ожидания. Задача теперь под защитой process_lesson_waits: реапер её не тронет, предел ожидания — 24ч."""
+    st = _lesson_waits_read(path)
+    st[str(tid)] = dec.get("pending_low") or {}
+    _lesson_waits_write(st, path)
+    try:
+        bc.task_heartbeat(tid)
+    except Exception as e:                       # noqa: BLE001 — heartbeat-тик не должен ронять обработку урока
+        log.warning("LESSON wait id=%s: первый heartbeat не прошёл (%s) — тикнём следующим циклом", tid, e)
+    log.info("LESSON id=%s → ОЖИДАНИЕ подтверждения учителя (low, класс %s) — держим in_progress, реапер исключает",
+             tid, dec.get("llm_class") or dec.get("route"))
+    _cowork(f"урок #{tid} [low] → жду «да»/поправку учителя (in_progress под защитой, предел ожидания 24ч)")
+
+
+def process_lesson_waits(now=None, path=None):
+    """Тик ждущих low-уроков (класс-фикс 354). Для КАЖДОГО сохранённого ожидания:
+      • урок уже не in_progress (учитель ответил и resume закрыл, либо иное) → снимаем ожидание;
+      • иначе ТИКАЕМ task_heartbeat (updated свеж → реапер одиночек не срубает законное ожидание);
+      • check_low_wait_timeout: молчит учитель >24ч → карточка владельцу в 1160 + задача done, ожидание
+        снято (ЕДИНСТВЕННЫЙ предел ожидания, шаг 4 родителя 334). Идемпотентно (timed_out метится в
+        pending, персистим). now/path инъектируемы. FAIL-SAFE: сбой sink/heartbeat не роняет тик."""
+    if _stopped():
+        return
+    st = _lesson_waits_read(path)
+    if not st:
+        return
+    # какие из ждущих tid ещё реально in_progress на Bridge — остальные ожидания снимаем (self-heal).
+    # get_pending упал → live=None: НЕ снимаем вслепую (fail-safe), только тикаем/таймаутим.
+    r = bc.get_pending("in_progress")
+    live = ({int(it.get("id")) for it in r.get("items", []) if _lane_ok(it) and it.get("id") is not None}
+            if r.get("ok") else None)
+    changed = False
+    for key in list(st.keys()):
+        try:
+            tid = int(key)
+        except (TypeError, ValueError):
+            del st[key]; changed = True; continue
+        pending = st.get(key) or {}
+        if live is not None and tid not in live:
+            del st[key]; changed = True
+            log.info("LESSON wait id=%s снято: задача больше не in_progress", tid)
+            continue
+        try:
+            bc.task_heartbeat(tid)               # держим updated свежим → реапер одиночек не тронет
+        except Exception as e:                   # noqa: BLE001
+            log.warning("LESSON wait id=%s: heartbeat не прошёл (%s)", tid, e)
+        try:
+            dec = lesson_router.check_low_wait_timeout(pending, now=now, notify_owner=_deliver_owner_card)
+        except Exception as e:                   # noqa: BLE001 — тик таймаута не должен ронять поллинг
+            log.warning("LESSON wait id=%s: check_low_wait_timeout упал (%s)", tid, e)
+            dec = None
+        st[key] = pending; changed = True        # pending мутирован (timed_out) → персистим (идемпотентность restart-proof)
+        if dec is None:
+            continue                             # ещё в пределах 24ч — ждём ответа учителя
+        result = (dec.get("result") or "урок отдан владельцу по 24ч-таймауту")[:RESULT_MAX]
+        bc.complete_task(tid, dec.get("status") or "done", result)
+        _notify_task(dec.get("status") or "done", tid, result)
+        log.warning("LESSON wait id=%s: 24ч без ответа учителя → %s, ожидание снято · %s",
+                    tid, dec.get("status") or "done", _clip(result))
+        _cowork(f"урок #{tid} [low]: 24ч без ответа учителя → отдан владельцу в 1160, ожидание снято")
+        if dec.get("clear_wait"):
+            del st[key]
+    if changed:
+        _lesson_waits_write(st, path)
+
+
+def resume_lesson_wait(tid, reply_text, is_approver, path=None, classify=None,
+                       append_style=None, append_checklist=None, reply_moderation=None):
+    """Возобновить ждущий low-урок по ОТВЕТУ учителя (шов для будущего moderation_bot-роутинга ответа
+    из модер-группы; голден зовёт напрямую). Грузим pending_low и зовём lesson_router.resume_low_lesson:
+      • «да» НЕ от аппрувера → остаёмся в ожидании (state не трогаем, задача так же под защитой);
+      • «да» от аппрувера / поправка→high → урок В РАБОТУ (finalize: коммит+подтверждение либо планировщик);
+      • снова неясно после поправки → отложено владельцу в 1160 (done).
+    Ожидание снимаем во ВСЕХ терминальных ветках (не-waiting). → dec | None (нет такого ожидания).
+    Sink'и инъектируемы (голден без Telegram/1160/git); боевые дефолты — playbook/чек-лист/1160/думатель."""
+    st = _lesson_waits_read(path)
+    pending = st.get(str(tid))
+    if pending is None:
+        log.info("resume_lesson_wait id=%s: нет активного ожидания — игнор", tid)
+        return None
+    dec = lesson_router.resume_low_lesson(
+        pending, reply_text, is_approver, classify=classify, append_style=append_style,
+        append_checklist=append_checklist, notify_owner=_deliver_owner_card, reply_moderation=reply_moderation)
+    if dec.get("status") == "waiting":           # «да» не от уполномоченного — ждём дальше, ожидание НЕ снимаем
+        log.info("resume_lesson_wait id=%s: %s — остаёмся в ожидании", tid, dec.get("resumed"))
+        return dec
+    st.pop(str(tid), None)                        # терминально → снимаем ожидание ДО финализации задачи
+    _lesson_waits_write(st, path)
+    _finalize_lesson_dec(tid, str(pending.get("text") or ""), dec)
+    log.info("resume_lesson_wait id=%s: %s → ожидание снято", tid, dec.get("resumed"))
+    return dec
 
 
 def process_new():
@@ -934,7 +1084,10 @@ def process_stuck_singles(now=None):
     VPS/цепочки, здесь ТОЛЬКО одиночки lane=pc, которых он не видит. Порог > TASK_TIMEOUT, поэтому
     живой синхронный прогон демона (≤45 мин) под нож не попадёт — реапится лишь орфан мёртвого
     процесса. lane СТРОГО (чужие полосы не трогаем: _lane_ok). updated=None → не реапим (fail-safe,
-    идиома `or 0` как в process_approval_timeouts)."""
+    идиома `or 0` как в process_approval_timeouts). ИСКЛЮЧЕНИЕ (класс-фикс 354): урок в состоянии
+    low-ожидания (_lesson_wait_ids) НЕ орфан — он ЗАКОННО ждёт ответа учителя in_progress; его предел —
+    24ч → карточка 1160 (process_lesson_waits), а НЕ 90-мин ливнесс одиночек. Настоящие зависания
+    (не в ожидании) реапер добивает как прежде — регресс цел."""
     if _stopped():
         return
     r = bc.get_pending("in_progress")
@@ -942,8 +1095,11 @@ def process_stuck_singles(now=None):
         log.warning("get_pending(in_progress) ошибка: %s", r.get("error"))
         return
     now = now or datetime.datetime.now(datetime.timezone.utc)
+    waiting = _lesson_wait_ids()          # законно-ждущие low-уроки (родитель 334): НЕ орфаны — не реапим
     for task in [it for it in r.get("items", []) if _lane_ok(it)]:
         tid = task.get("id")
+        if tid in waiting:
+            continue                      # урок законно ждёт ответа учителя (in_progress); предел — 24ч, не реапер
         age = _age_sec(task.get("updated"), now=now) or 0
         if age <= PC_SINGLE_STALE:
             continue
@@ -958,8 +1114,9 @@ def process_stuck_singles(now=None):
 
 
 def poll_once():
-    """Один цикл: добить орфанов-одиночек → довести одобренное → просроченные ожидания →
-    надзор локальных цепей (PC_LOCAL_DEC) → новое → heartbeat."""
+    """Один цикл: держать ждущие low-уроки живыми → добить орфанов-одиночек → довести одобренное →
+    просроченные ожидания → надзор локальных цепей (PC_LOCAL_DEC) → новое → heartbeat."""
+    process_lesson_waits()        # класс-фикс 354: heartbeat ждущим low-урокам + 24ч-таймаут → 1160 (ДО реапера)
     process_stuck_singles()       # этап 2: ПК-side ливнесс одиночек pc, застрявших в in_progress
     process_approved()
     process_approval_timeouts()
