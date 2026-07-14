@@ -10,11 +10,15 @@ test_lesson_router.py — юниты обработчика задачи-уро�
 
 import test_isolation  # noqa: F401 — ПЕРВОЙ строкой: TESTING=1, боевой IPC/токен недоступны
 
+import inspect
+import json
 import os
 import tempfile
 import unittest
 
 import lesson_router as lr
+import moderation_core as mc
+import suggest
 
 
 class TestClassify(unittest.TestCase):
@@ -945,6 +949,220 @@ class TestLessonLowWaitTimeout(unittest.TestCase):
         dec = lr.check_low_wait_timeout(
             pending, now=1_000_000.0 + 250, timeout=200, notify_owner=lambda c: ("инбокс 1160", True))
         self.assertEqual("timeout_to_owner", dec["resumed"])
+
+
+FIXTURE_292 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "lesson_cycle_292.json")
+TEACHERS = ("filipp", "filipp_alt", "danya", "dasha")
+
+
+class TestLesson334Golden332AndInvariants(unittest.TestCase):
+    """Родитель 334, шаг 5/6 — ПРИЁМОЧНЫЙ голден LLM-классификатора урока на РЕАЛЬНОМ провале #332 +
+    замок инвариантов. Голден-фраза (правило-класс CLAUDE.md: дословный урок из живого окна): менеджер
+    поправил черновик-подтверждение бота и оставил урок «не говори "локацию и данные получил", если
+    клиент прислал их в прошлой брони» — это про ЛОГИКУ ТРЕКЕРА / СВЕЖЕСТЬ СЕССИИ, класс ФАКТ.
+
+    Разрыв «тест ≠ реальность», который закрывает #334: keyword-классификатор такую фразу НЕ ловит
+    (в ней нет ни цены/модели/даты, ни тона) → UNCLEAR → карточка владельцу «переформулируй». Думатель
+    же читает её как ФАКТ/high → урок берётся В РАБОТУ СРАЗУ, БЕЗ «переформулируй». Прогоняем ОДНУ
+    живую фразу через все ветки #334 (high / low / «да» / поправка / таймаут) + замок инвариантов:
+    триггер только от INTAKE_APPROVERS, «урок принят» ТОЛЬКО после коммита, клиенту НИЧЕГО не шлётся,
+    регресс цикла 292 цел. Реальный claude НЕ дёргаем — классификатор инъектируем фейком; текст задачи
+    собираем РЕАЛЬНЫМ moderation_core.build_lesson_task, чтобы конвейер сборки был живой."""
+
+    # Дословный урок #332 + черновик, который он правит (бот подтвердил получение уже присланного).
+    REMARK = 'не говори "локацию и данные получил", если клиент прислал их в прошлой брони'
+    DRAFT_TEXT = "Локацию и данные получил, спасибо! Оформляю бронь."
+    CARD = {"id": 42, "client_id": 606, "client_ref": "@nikita",
+            "draft": DRAFT_TEXT, "card_msg_id": 90332}
+    # Прочтение думателя — ПРО ТРЕКЕР/СВЕЖЕСТЬ СЕССИИ (ожидаемый контракт классификатора для этой фразы).
+    READING = ("не подтверждать «локацию и данные получил», когда они уже пришли в прошлой брони — "
+               "вопрос свежести сессии и логики трекера окна")
+    PLAN = "поправить логику трекера сессии: не слать «получил», если данные уже есть в прошлой брони + тест"
+
+    def setUp(self):
+        # process_lesson/триггер-гейт судят по suggest.INTAKE_APPROVERS — ставим учителей фикстуры.
+        self._save = (suggest.INTAKE_APPROVERS, suggest.APPROVER_USERNAMES)
+        suggest.INTAKE_APPROVERS = set(TEACHERS)
+        suggest.APPROVER_USERNAMES = set()
+
+    def tearDown(self):
+        suggest.INTAKE_APPROVERS, suggest.APPROVER_USERNAMES = self._save
+
+    def _task_text(self, who="danya"):
+        # РЕАЛЬНЫЙ конвейер сборки задачи: reply-урок → process_lesson → build_lesson_task (не идеал-текст).
+        lesson = mc.process_lesson(self.CARD, "не так: " + self.REMARK, who)
+        self.assertEqual("lesson", lesson["decision"])
+        return mc.build_lesson_task(lesson, self.CARD, who)
+
+    def _classify(self, confidence="high", cls="ФАКТ", route=None):
+        route = lr.FACT if route is None else route
+        def classify(remark, draft="", window=""):
+            return {"reading": self.READING, "class": cls, "confidence": confidence,
+                    "plan": self.PLAN, "route": route}
+        return classify
+
+    # --- сам разрыв #332: keyword одна не берёт фразу, думатель получает её ДОСЛОВНО ------------
+    def test_keyword_alone_would_send_reformulate_card(self):
+        # КОРЕНЬ #334: без думателя keyword не находит ни факт/модель/дату/тон → UNCLEAR («переформулируй»)
+        route, _ = lr.classify_lesson_remark(self.REMARK)
+        self.assertEqual(lr.UNCLEAR, route)
+
+    def test_thinker_prompt_carries_verbatim_332_remark(self):
+        # промпт думателя несёт урок #332 ДОСЛОВНО + черновик, который он правит (реальный claude не зовём)
+        prompt = lr.build_lesson_classify_prompt(self.REMARK, self.DRAFT_TEXT, "Никита (606)")
+        self.assertIn(self.REMARK, prompt)
+        self.assertIn(self.DRAFT_TEXT, prompt)
+
+    # --- ветка high: урок В РАБОТУ, ФАКТ, прочтение про трекер/свежесть, БЕЗ «переформулируй» ----
+    def test_high_golden_fact_taken_no_reformulate(self):
+        sent = {}
+        dec = lr.handle_lesson_task(
+            self._task_text(),
+            classify=self._classify("high"),
+            notify_owner=lambda c: self.fail("для high карточку-«переформулируй» владельцу НЕ шлём"),
+            reply_moderation=lambda cid, t: (sent.update(card=cid, text=t), True)[1])
+        self.assertEqual(lr.FACT, dec["route"])                 # класс ФАКТ
+        self.assertEqual("ФАКТ", dec["llm_class"])
+        self.assertEqual("high", dec["confidence"])
+        self.assertTrue(dec["delegate"])                        # урок В РАБОТУ (планировщику), не карточка
+        # прочтение — про ЛОГИКУ ТРЕКЕРА / СВЕЖЕСТЬ СЕССИИ
+        low = dec["reading"].lower()
+        self.assertTrue("трекер" in low and ("свежест" in low or "сесси" in low), dec["reading"])
+        # реплай учителю «Понял так… Делаю…» в модер-группу на карточку урока, БЕЗ «переформулируй»
+        self.assertEqual("90332", sent["card"])
+        self.assertIn("Понял так", sent["text"])
+        self.assertIn("Делаю", sent["text"])
+        self.assertNotIn("переформулируй", sent["text"].lower())
+        self.assertNotIn("переформулируй", dec["result"].lower())
+        # ФАКТ-делегат требует golden-тест ДОСЛОВНОЙ фразой клиента (правило-класс CLAUDE.md)
+        self.assertIn("ДОСЛОВНОЙ фразой клиента", dec["delegate_text"])
+
+    # --- ветка low: та же фраза размыта → спросили учителя «верно?», ждём, БЕЗ «переформулируй» --
+    def test_low_asks_teacher_and_waits(self):
+        sent = {}
+        dec = lr.handle_lesson_task(
+            self._task_text(),
+            classify=self._classify("low"),
+            notify_owner=lambda c: self.fail("low: владельца в момент вопроса НЕ зовём"),
+            reply_moderation=lambda cid, t: (sent.update(card=cid, text=t), True)[1])
+        self.assertEqual("waiting", dec["status"])              # урок не закрыт — ждём подтверждения
+        self.assertFalse(dec["delegate"])                       # в работу пока НЕ отдали
+        self.assertIn("pending_low", dec)
+        self.assertEqual("90332", sent["card"])
+        self.assertIn("верно?", sent["text"])
+        self.assertNotIn("Делаю", sent["text"])                # это НЕ high-реплай
+        self.assertNotIn("переформулируй", sent["text"].lower())
+
+    # --- ветка «да»: подтверждение аппрувера → урок В РАБОТУ как high ---------------------------
+    def test_yes_from_approver_takes_as_high(self):
+        dec0 = lr.handle_lesson_task(self._task_text(), classify=self._classify("low"),
+                                     reply_moderation=lambda cid, t: True)
+        sent = {}
+        dec = lr.resume_low_lesson(dec0["pending_low"], "да", is_approver=True,
+                                   reply_moderation=lambda cid, t: (sent.update(text=t), True)[1])
+        self.assertEqual(lr.FACT, dec["route"])
+        self.assertEqual("high", dec["confidence"])
+        self.assertEqual("approved", dec["resumed"])
+        self.assertTrue(dec["delegate"])
+        self.assertIn("Делаю", sent["text"])                   # «Понял так… Делаю…» после согласия
+
+    # --- ИНВАРИАНТ (в ветке «да»): подтверждает ТОЛЬКО INTAKE_APPROVERS -------------------------
+    def test_yes_from_non_approver_is_ignored(self):
+        dec0 = lr.handle_lesson_task(self._task_text(), classify=self._classify("low"),
+                                     reply_moderation=lambda cid, t: True)
+        dec = lr.resume_low_lesson(dec0["pending_low"], "да", is_approver=False,
+                                   append_checklist=lambda r: self.fail("без аппрувера урок не применяем"),
+                                   reply_moderation=lambda cid, t: self.fail("на чужое «да» не отвечаем"))
+        self.assertEqual("waiting", dec["status"])
+        self.assertEqual("ignored_non_approver", dec["resumed"])
+
+    # --- ветка поправка: текстовая правка → РОВНО одна пере-классификация → high ----------------
+    def test_correction_reclassifies_once_to_high(self):
+        dec0 = lr.handle_lesson_task(self._task_text(), classify=self._classify("low"),
+                                     reply_moderation=lambda cid, t: True)
+        calls = {"n": 0}
+        correction = "нет, дело в трекере: не подтверждай данные, если они из прошлой брони"
+        def classify2(remark, draft="", window=""):
+            calls["n"] += 1
+            self.assertIn("трекер", remark)                    # пере-классификация по ТЕКСТУ поправки
+            return {"reading": "логика трекера сессии: не слать «получил» на старые данные",
+                    "class": "ФАКТ", "confidence": "high", "plan": "поправить трекер + тест", "route": lr.FACT}
+        sent = {}
+        dec = lr.resume_low_lesson(dec0["pending_low"], correction, is_approver=True,
+                                   classify=classify2,
+                                   reply_moderation=lambda cid, t: (sent.update(text=t), True)[1])
+        self.assertEqual(1, calls["n"])                        # РОВНО одна пере-классификация
+        self.assertEqual("reclassified_high", dec["resumed"])
+        self.assertEqual(lr.FACT, dec["route"])
+        self.assertTrue(dec["delegate"])
+        self.assertIn("трекер", sent["text"].lower())
+
+    # --- ветка таймаут: учитель молчит >24ч → карточка владельцу в 1160, ожидание снято ---------
+    def test_timeout_cards_owner_and_clears_wait(self):
+        dec0 = lr.handle_lesson_task(self._task_text(), classify=self._classify("low"),
+                                     reply_moderation=lambda cid, t: True)
+        pending = dec0["pending_low"]
+        sent = {}
+        dec = lr.check_low_wait_timeout(
+            pending, now=pending["created_at"] + 24 * 3600 + 1,
+            notify_owner=lambda c: (sent.__setitem__("card", c), ("инбокс 1160", True))[1])
+        self.assertEqual(lr.UNCLEAR, dec["route"])
+        self.assertEqual("timeout_to_owner", dec["resumed"])
+        self.assertTrue(dec["clear_wait"])                     # ожидание снято
+        self.assertIn(self.REMARK, sent["card"])               # урок #332 НЕ потерян — в карточке владельцу
+
+    # --- ИНВАРИАНТ: триггер урока принимаем ТОЛЬКО от INTAKE_APPROVERS --------------------------
+    def test_trigger_only_from_intake_approvers(self):
+        for who in TEACHERS:
+            d = mc.process_lesson(self.CARD, "не так: " + self.REMARK, who)
+            self.assertEqual("lesson", d["decision"], who)
+        d = mc.process_lesson(self.CARD, "не так: " + self.REMARK, "stranger")
+        self.assertEqual("denied", d["decision"])              # чужой не может учить
+        self.assertNotIn("remark", d)                          # и урок/окно ему не отдаём
+
+    # --- ИНВАРИАНТ: «урок принят» формируется ТОЛЬКО после доказанного коммита ------------------
+    def test_ack_only_after_commit(self):
+        subj, where = self.REMARK, lr._ROUTE_WHERE[lr.FACT]
+        self.assertIsNone(lr.ack_after_commit("", subj, where))                       # нет ref → молчим
+        self.assertIsNone(lr.ack_after_commit("abc", subj, where, verify=lambda r: False))  # не коммит
+        ack = lr.ack_after_commit("abc1234", subj, where, verify=lambda r: True)
+        self.assertIn("Урок принят", ack)
+        self.assertIn("применится со следующего ответа", ack)
+
+    # --- ИНВАРИАНТ: клиенту НИЧЕГО не шлётся — у дирижёра урока нет клиентского sink'а ----------
+    def test_no_client_facing_sink_in_api(self):
+        # замок API: единственные побочки — книга правил / чек-лист / владелец-1160 / реплай в МОДЕР-группу.
+        # Ни одного клиентского канала: добавление DM-клиенту как параметра провалит этот замок.
+        params = set(inspect.signature(lr.handle_lesson_task).parameters) - {"text"}
+        self.assertEqual({"append_style", "append_checklist", "notify_owner", "classify",
+                          "reply_moderation"}, params)
+
+    def test_high_reply_goes_to_mod_group_not_client(self):
+        # реплай уходит на КАРТОЧКУ урока в модер-группе (card_msg_id), а НЕ в client_id окна
+        sent = {}
+        lr.handle_lesson_task(self._task_text(), classify=self._classify("high"),
+                              reply_moderation=lambda cid, t: (sent.update(card=cid), True)[1])
+        self.assertEqual(str(self.CARD["card_msg_id"]), sent["card"])
+        self.assertNotEqual(str(self.CARD["client_id"]), sent["card"])   # не в личку клиента
+
+    # --- ИНВАРИАНТ: регресс цикла 292 цел (LLM-слой НЕ изменил keyword-поведение/дефолт) --------
+    def test_cycle_292_keyword_routes_unchanged(self):
+        with open(FIXTURE_292, encoding="utf-8") as f:
+            fx = json.load(f)
+        want = {"fact_price_nmax": lr.FACT, "supervision_fake_price": lr.SUPERVISION,
+                "style_dry_tone": lr.STYLE, "unclear_redo": lr.UNCLEAR}
+        for c in fx["cycles"]:
+            remark = mc.parse_lesson(c["reply_text"])["remark"]
+            self.assertEqual(want[c["name"]], lr.classify_lesson_remark(remark)[0], c["name"])
+
+    def test_default_path_stays_keyword_no_llm(self):
+        # рубильник LLM по умолчанию OFF + без инъекции classify → чистый keyword-путь (поведение 292):
+        # #332 без думателя keyword→UNCLEAR → карточка владельцу; LLM-поля не появляются.
+        self.assertFalse(lr._lesson_llm_enabled())
+        dec = lr.handle_lesson_task(self._task_text(), notify_owner=lambda c: ("инбокс 1160", True),
+                                    reply_moderation=lambda cid, t: self.fail("keyword-путь реплай не шлёт"))
+        self.assertEqual(lr.UNCLEAR, dec["route"])
+        self.assertNotIn("confidence", dec)                    # LLM-путь не активировался
 
 
 if __name__ == "__main__":
