@@ -162,6 +162,37 @@ class TestPureLogic(unittest.TestCase):
         # приветствие у КЛИЕНТА не считается нашим
         self.assertFalse(suggest.greeting_already_sent("[клиент]: Здравствуйте!"))
 
+    def test_strip_greeting(self):
+        # одиночные зачины RU: срез + восстановление первой заглавной остатка
+        self.assertEqual(suggest.strip_greeting("Здравствуйте! Аренда 500฿/день"),
+                         "Аренда 500฿/день")
+        self.assertEqual(suggest.strip_greeting("Привет, хочу арендовать байк"),
+                         "Хочу арендовать байк")
+        self.assertEqual(suggest.strip_greeting("Добрый день, какие есть модели?"),
+                         "Какие есть модели?")
+        # business-автоприветствия (класс «е» ревизора) — реальные дословные тексты
+        self.assertEqual(suggest.strip_greeting("Спасибо, что написали! Уже смотрю ваше сообщение"),
+                         "Уже смотрю ваше сообщение")
+        self.assertEqual(suggest.strip_greeting("Спасибо, что выбрали нас. NMAX свободен"),
+                         "NMAX свободен")
+        # комбинация зачинов подряд + эмодзи между ними
+        self.assertEqual(
+            suggest.strip_greeting("Здравствуйте! 😊 Спасибо, что выбрали нас. NMAX свободен"),
+            "NMAX свободен")
+        # EN-зачин
+        self.assertEqual(suggest.strip_greeting("Hi there, bikes available"),
+                         "There, bikes available")
+        # НЕТ зачина → текст без изменений (кавычки/скобки не трогаем)
+        self.assertEqual(suggest.strip_greeting("Хонда Клик 125 доступна"),
+                         "Хонда Клик 125 доступна")
+        self.assertEqual(suggest.strip_greeting("«Honda» в наличии"),
+                         "«Honda» в наличии")
+        # первый символ остатка — цифра: регистр не трогаем
+        self.assertEqual(suggest.strip_greeting("Здравствуйте! 500฿ в сутки"),
+                         "500฿ в сутки")
+        # пустой/None-safe
+        self.assertEqual(suggest.strip_greeting(""), "")
+
     def test_parse_approval(self):
         self.assertEqual(suggest.parse_approval("+"), ("approve", None))
         self.assertEqual(suggest.parse_approval("да"), ("approve", None))
