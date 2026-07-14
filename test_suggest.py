@@ -1936,6 +1936,37 @@ class TestGuardQuotePrice(unittest.TestCase):
         self.assertIn("8500", d)
         self.assertIn("низкий сезон", d)
 
+    def test_window_504608015_end_to_end_337(self):
+        # ШАГ 4/5 (родитель #310): ДОСЛОВНАЯ репродукция провала окна 504608015 с ИСТИННЫМИ числами.
+        # Котировка NMAX 155 на 5–10 июля (5 дней): суточная 337, ИТОГ за срок 1685 (дисконт),
+        # депозит 3000. Бот прислал наивный итог 2 245 ฿ (449 ฿/день = 337 тут ни при чём — 449×5).
+        # Гард ОБЯЗАН заблокировать и без regenerate выдать ответ строго из quote: 1685/337/3000.
+        q = {"day_price": 337, "total": 1685, "deposit": 3000, "available": True, "days": 5}
+        self.assertEqual(suggest.quote_price_numbers(q), {337, 1685, 3000})
+
+        bad = "NMAX 155 на 5 дней — 2 245 ฿ (449 ฿/день), депозит 3 000 ฿."
+        # 2245 (итог) и 449 (ставка) — вне quote → расхождение; депозит 3000 легитимен
+        miss = suggest.quote_price_mismatches(bad, q)
+        self.assertTrue(any(m["value"] == 2245 and m["kind"] == "total" for m in miss))
+        self.assertTrue(any(m["value"] == 449 and m["kind"] == "rate" for m in miss))
+        self.assertFalse(any(m["value"] == 3000 for m in miss))
+
+        # без regenerate-колбэка → сразу детерминированный фолбэк строго из quote
+        r = suggest.guard_quote_price(bad, q, model="NMAX 155",
+                                      ds="2026-07-05", de="2026-07-10", window=504608015)
+        self.assertNotEqual(r["source"], "draft")   # черновик НЕ ушёл клиенту
+        self.assertEqual(r["source"], "fallback")
+        self.assertTrue(r["ok"])
+        # ответ несёт истинные 1685/337/3000 и НЕ несёт наивные 2245/449
+        vals = {f["value"] for f in suggest.extract_money_figures(r["text"])}
+        self.assertIn(1685, vals)
+        self.assertIn(337, vals)
+        self.assertIn(3000, vals)
+        self.assertNotIn(2245, vals)
+        self.assertNotIn(449, vals)
+        # фолбэк сам согласован с quote (проходит повторную сверку начисто)
+        self.assertEqual(suggest.quote_price_mismatches(r["text"], q), [])
+
 
 class TestPriceSheet(unittest.TestCase):
     """Прайс по всему парку: детект намерения, детерминированный рендер день/7/месяц из ЖИВОГО
