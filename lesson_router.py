@@ -196,8 +196,24 @@ def _default_append_style(rule):
 
 def _default_notify_owner(_card):
     """Дефолт-заглушка канала владельца (1160): в standalone канала нет → False (не доставлено).
-    Демон-дирижёр инъектирует боевой sink (_notify_critical → инбокс 1160)."""
+    Демон-дирижёр инъектирует боевой sink (_deliver_owner_card → send_critical, инбокс 1160)."""
     return False
+
+
+def _normalize_delivery(raw):
+    """Нормализовать ответ owner-sink → (delivered: bool, channel: str). Боевой sink демона
+    (_deliver_owner_card → dispatch_notify.send_critical) ПОДТВЕРЖДАЕТ доставку и отдаёт КАНАЛ
+    ('инбокс 1160' / 'личка-фолбэк') кортежем (channel, ok) → рапорт честный «доставлено через X».
+    Юнит-фейки/дефолт возвращают bool → канал неизвестен (''). Строка трактуется как имя канала.
+    Так закрыт разрыв: fire-and-forget-sink возвращал None ⇒ delivered=False ⇒ ложное «недоступен»
+    при реально дошедшей карточке — теперь sink обязан вернуть настоящий статус доставки."""
+    if isinstance(raw, tuple) and len(raw) == 2:
+        channel, ok = raw
+        return bool(ok), (str(channel).strip() if ok else "")
+    if isinstance(raw, str):
+        s = raw.strip()
+        return bool(s), s
+    return bool(raw), ""
 
 
 # ------------------------------- карточка-уточнение владельцу (1160) -----------------------
@@ -346,14 +362,19 @@ def handle_lesson_task(text, append_style=None, append_checklist=None, notify_ow
                 "delegate_text": str(text or "") + note,
                 "status": "done", "result": "🛠 ФАКТ/ЛОГИКА-урок → локальному планировщику (правка+тест)"}
 
-    # UNCLEAR — не угадываем: карточка-уточнение владельцу в 1160.
+    # UNCLEAR — не угадываем: карточка-уточнение владельцу в 1160. Рапорт ЧЕСТНЫЙ: доставку берём
+    # из ответа sink'а (delivered + канал), а не гадаем. Раньше боевой sink был fire-and-forget и
+    # возвращал None → всегда «недоступен», хотя карточка реально доходила (обходным каналом).
     card = build_owner_clarification_card(parsed, reason)
+    channel = ""
     try:
-        delivered = bool(notify(card))
+        delivered, channel = _normalize_delivery(notify(card))
     except Exception as e:                           # noqa: BLE001
-        delivered = False; reason = f"{reason}; notify: {e}"
-    result = ("🤔 Неясный урок → карточка-уточнение владельцу в 1160 (не угадываю)"
-              if delivered else
-              "🤔 Неясный урок: канал 1160 недоступен — карточка не доставлена, замечание в логе")
+        delivered, channel = False, ""; reason = f"{reason}; notify: {e}"
+    if delivered:
+        via = f" — доставлено через {channel}" if channel else ""
+        result = f"🤔 Неясный урок → карточка-уточнение владельцу в 1160{via} (не угадываю)"
+    else:
+        result = "🤔 Неясный урок: канал 1160 недоступен — карточка не доставлена, замечание в логе"
     return {"route": UNCLEAR, "delegate": False, "status": "done", "reason": reason,
-            "result": result, "card": card, "delivered": delivered}
+            "result": result, "card": card, "delivered": delivered, "channel": channel}

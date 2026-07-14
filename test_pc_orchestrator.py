@@ -4429,5 +4429,67 @@ class TestChainCardDedup(unittest.TestCase):
         self.assertLessEqual(len(st["sent"]), o.CHAIN_CARD_SENT_MAX)   # история не пухнет
 
 
+class TestOwnerCardDelivery(unittest.TestCase):
+    """Доставка owner-карточки НЕЯСНОГО урока в 1160: СИНХРОННО, с подтверждением канала (send
+    инъектируется — реального Bot API/сети не касаемся). Разрыв, который чиним: fire-and-forget
+    _notify_critical возвращал None → рапорт всегда «1160 недоступно», хотя карточка реально
+    доходила. Теперь _deliver_owner_card отдаёт (канал, ok) → рапорт честный «доставлено через X»."""
+
+    def test_inbox_channel_mapped_human(self):
+        # send_critical дошёл инбоксом 1160 → человекочитаемый канал + True
+        ch, ok = o._deliver_owner_card("карточка", send=lambda t: ("inbox", True))
+        self.assertTrue(ok)
+        self.assertEqual(f"инбокс {o.INBOX_TOPIC_ID}", ch)
+
+    def test_fallback_dm_channel_mapped_human(self):
+        # инбокс лёг → send_critical ушёл в личку-фолбэк; канал честно назван фолбэком
+        ch, ok = o._deliver_owner_card("карточка", send=lambda t: ("DM", True))
+        self.assertTrue(ok)
+        self.assertEqual("личку (фолбэк)", ch)
+
+    def test_not_delivered_returns_empty_channel(self):
+        # оба канала не прошли (ok=False) → пустой канал + False (рапорт скажет «не доставлена»)
+        self.assertEqual(("", False), o._deliver_owner_card("карточка", send=lambda t: ("DM", False)))
+
+    def test_send_exception_is_failsafe(self):
+        # сбой доставки НЕ роняет тик демона → ('', False)
+        self.assertEqual(("", False),
+                         o._deliver_owner_card("карточка", send=lambda t: (_ for _ in ()).throw(OSError("net"))))
+
+
+class TestUnclearLessonHonestReport(Base):
+    """ГОЛДЕН живого провала (урок-цикл): неясный урок → карточка ДОСТАВЛЕНА, рапорт БЕЗ ложного
+    «1160 недоступно». Сквозь реальный _handle_lesson + lesson_router на FakeBridge; доставку
+    подтверждаем инъекцией _deliver_owner_card (сеть/Bot API не трогаем)."""
+
+    def _task(self, remark):
+        return ("[урок:правка от @danya] родитель 292 — замечание менеджера\n"
+                "окно диалога: Света (999) (client_id=999) · черновик #33\n"
+                "карточка модер-группы: msg=90510\n"
+                f"Замечание: {remark}\n"
+                "Исходный черновик: Здравствуйте! Чем помочь?")
+
+    def test_unclear_delivered_report_is_honest(self):
+        self._save_owner = o._deliver_owner_card
+        self.addCleanup(lambda: setattr(o, "_deliver_owner_card", self._save_owner))
+        o._deliver_owner_card = lambda text: (f"инбокс {o.INBOX_TOPIC_ID}", True)   # карточка ДОШЛА
+        tid = self.fb.add(task_text=self._task("плохо, переделай"))
+        o._handle_lesson(tid, self.fb.tasks[tid]["task_text"])
+        t = self.fb.tasks[tid]
+        self.assertEqual("done", t["status"])
+        self.assertIn("доставлено через инбокс", t["result"])
+        self.assertNotIn("недоступ", t["result"])           # НЕТ ложной жалобы «1160 недоступно»
+        self.assertNotIn("не доставлена", t["result"])
+
+    def test_unclear_undelivered_report_is_honest_too(self):
+        # обратная честность: доставка реально провалилась → рапорт говорит «не доставлена» (не врёт в плюс)
+        self._save_owner = o._deliver_owner_card
+        self.addCleanup(lambda: setattr(o, "_deliver_owner_card", self._save_owner))
+        o._deliver_owner_card = lambda text: ("", False)
+        tid = self.fb.add(task_text=self._task("что-то не то"))
+        o._handle_lesson(tid, self.fb.tasks[tid]["task_text"])
+        self.assertIn("не доставлена", self.fb.tasks[tid]["result"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

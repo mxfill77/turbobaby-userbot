@@ -211,6 +211,43 @@ class TestHandle(unittest.TestCase):
         self.assertFalse(dec["delivered"])
         self.assertIn("не доставлена", dec["result"])
 
+    def test_unclear_delivered_reports_channel_honestly(self):
+        # ГОЛДЕН живого провала: карточка ДОШЛА (sink подтвердил канал (channel, ok)) — рапорт обязан
+        # сказать «доставлено через <канал>» и НЕ содержать ложного «недоступен»/«не доставлена».
+        # Так закрыт разрыв: исполнитель рапортовал «1160 недоступно», хотя карточка реально дошла.
+        dec = lr.handle_lesson_task(self._task("плохо, переделай"),
+                                    notify_owner=lambda c: ("инбокс 1160", True))
+        self.assertEqual(lr.UNCLEAR, dec["route"])
+        self.assertTrue(dec["delivered"])
+        self.assertEqual("инбокс 1160", dec["channel"])
+        self.assertIn("доставлено через инбокс 1160", dec["result"])
+        self.assertNotIn("недоступен", dec["result"])       # НЕТ ложной жалобы на недоступность
+        self.assertNotIn("не доставлена", dec["result"])
+
+    def test_unclear_delivered_via_fallback_channel_is_honest(self):
+        # доставка ушла ФОЛБЭКОМ (личка вместо инбокса) — рапорт всё равно честный «доставлено через …»
+        dec = lr.handle_lesson_task(self._task("что-то не то"),
+                                    notify_owner=lambda c: ("личку (фолбэк)", True))
+        self.assertTrue(dec["delivered"])
+        self.assertIn("доставлено через личку (фолбэк)", dec["result"])
+        self.assertNotIn("недоступен", dec["result"])
+
+    def test_unclear_sink_reports_not_delivered(self):
+        # sink ЧЕСТНО отрапортовал провал доставки (channel, ok=False) → «не доставлена», канал пуст
+        dec = lr.handle_lesson_task(self._task("не то"),
+                                    notify_owner=lambda c: ("", False))
+        self.assertFalse(dec["delivered"])
+        self.assertEqual("", dec["channel"])
+        self.assertIn("не доставлена", dec["result"])
+
+    def test_unclear_fire_and_forget_sink_cannot_confirm(self):
+        # РЕГРЕССИЯ, из-за которой был ложный рапорт: fire-and-forget-sink (Popen) возвращал None —
+        # доставку ПОДТВЕРДИТЬ невозможно ⇒ delivered=False. Отсюда требование: боевой sink обязан
+        # вернуть НАСТОЯЩИЙ статус (channel, ok), а не None (см. _deliver_owner_card).
+        dec = lr.handle_lesson_task(self._task("переделай"), notify_owner=lambda c: None)
+        self.assertFalse(dec["delivered"])
+        self.assertIn("не доставлена", dec["result"])
+
     def test_style_sink_error_is_failed_not_crash(self):
         dec = lr.handle_lesson_task(self._task("пиши короче"),
                                     append_style=lambda r: (_ for _ in ()).throw(OSError("disk")))

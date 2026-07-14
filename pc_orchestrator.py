@@ -698,6 +698,28 @@ def _commit_lesson(tid, route, subject, paths):
     return _git_out(["rev-parse", "--short", "HEAD"])
 
 
+def _deliver_owner_card(text, send=None):
+    """СИНХРОННАЯ доставка owner-карточки НЕЯСНОГО урока тем же рабочим каналом, что несёт
+    критические/needs_approval карточки в 1160 (dispatch_notify.send_critical: инбокс 1160 первым,
+    личка Филиппа — фолбэк). В отличие от fire-and-forget _notify_critical (Popen → None: доставку
+    НЕ подтверждает, отсюда ложный рапорт «1160 недоступен» при реально дошедшей карточке), ЖДЁТ
+    ответ Bot API и возвращает (канал, ok) → рапорт урока честный «доставлено через X».
+    send инъектируется в тестах. FAIL-SAFE: любой сбой → ('', False) — урок не теряем (карточка/
+    замечание остаются в результате задачи и логе; Bridge/деньги здесь не касаемся)."""
+    try:
+        if send is None:
+            import dispatch_notify           # ленивый: тянем только на реальном неясном уроке
+            send = dispatch_notify.send_critical
+        channel, ok = send(text)
+    except Exception as e:                    # noqa: BLE001 — доставка не должна ронять тик демона
+        log.warning("owner-карточка неясного урока: доставка не удалась: %s", e)
+        return ("", False)
+    if not ok:
+        return ("", False)
+    human = {"inbox": f"инбокс {INBOX_TOPIC_ID}", "DM": "личку (фолбэк)"}.get(channel, channel)
+    return (human, True)
+
+
 def _deliver_lesson_ack(card_msg_id, text):
     """Доставка подтверждения «урок принят…» учителю. Реплай на карточку черновика в модер-группе
     делает moderation_bot (шаг 5 — здесь его НЕ трогаем): дирижёр лишь ФИКСИРУЕТ готовое, уже
@@ -711,10 +733,11 @@ def _handle_lesson(tid, text):
     маршрутизирует. СТИЛЬ → правило в книгу правил (playbook); НАДЗОР → строка-класс в чек-лист
     ревизора; ФАКТ/ЛОГИКА → локальному планировщику (правка кода/критфактов/FAQ + ТЕСТ); неясное →
     карточка-уточнение владельцу в 1160 (не угадываем). Боевые sink'и: playbook / чек-лист / инбокс
-    1160 (_notify_critical). Bridge/таблицы/деньги не трогаем — только текст доков или делегирование.
+    1160 (_deliver_owner_card — СИНХРОННАЯ доставка с подтверждением канала, рапорт честный «доставлено
+    через X», не гадательный). Bridge/таблицы/деньги не трогаем — только текст доков или делегирование.
     Шаг 4: применённый урок КОММИТИМ (итог = закоммиченный диф) и ТОЛЬКО после реального коммита шлём
     подтверждение «урок принят…» учителю (инвариант «подтверждение не уходит до коммита»)."""
-    dec = lesson_router.handle_lesson_task(text, notify_owner=_notify_critical)
+    dec = lesson_router.handle_lesson_task(text, notify_owner=_deliver_owner_card)
     route = dec.get("route")
     if dec.get("delegate"):                    # ФАКТ/ЛОГИКА — правка+тест = работа думателя-планировщика
         log.info("LESSON id=%s route=%s → планировщик (правка+тест)", tid, route)
