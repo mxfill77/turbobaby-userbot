@@ -324,6 +324,32 @@ class TestPureLogic(unittest.TestCase):
         self.assertIn("CLICK 125", seen["system"])               # критфакты сохранены
         self.assertEqual(seen["user"], "[клиент]: NMAX на месяц?")  # исходный транскрипт = user
 
+    def test_strategy_regen_keeps_point_quote_price_from_block(self):
+        # Класс #365 шаг 1/7: СТРАТЕГИЯ-перегенерация обязана донести ТОЧЕЧНЫЙ quote-блок (цифры из
+        # Bridge) в финал — и НЕ пропустить итог, которого в блоке нет. Блок едет в pricing_note (IPC
+        # несёт его в перегенерацию), политика промпта его описывает, пост-чек вайтлистит только цифры
+        # Bridge. Голден живого окна 504608015: «NMAX 155 на 5 дней — 2245 ฿, депозит 3000 ฿».
+        # (PRICE_SHEET-случай сборки кодом покрыт TestSheetUntouchableBlock.test_regenerate_draft_same_class.)
+        note = suggest._wrap_single("ok", "NMAX 155 — за 5 дней 2245 ฿, депозит 3000 ฿")
+        seen = {}
+        def fake(system, user):
+            seen["system"] = system
+            # LLM честно приводит цифры блока ДОСЛОВНО и вдобавок выдумывает свой итог ВНЕ блока:
+            return ("Отличный выбор — NMAX 155 на 5 дней 2245 ฿, депозит 3000 ฿. "
+                    "Также за 7 дней это 9999 ฿ — выгодно.")
+        out = suggest.regenerate_draft("[клиент]: NMAX 155 на 5 дней, посчитайте?", "ru", "FAQ",
+                                       False, note, "дожимай на бронь", call_llm=fake)
+        # политика промпта ЗНАЕТ о блоке: и сам quote-блок, и ценовая политика лежат в system
+        self.assertIn("ЦЕНА из Календаря", seen["system"])          # точечный quote-блок в промпте
+        self.assertIn("ЦЕНОВАЯ ПОЛИТИКА", seen["system"])           # политика описывает блок
+        self.assertIn("дожимай на бронь", seen["system"])           # директива стратегии
+        # финал СОДЕРЖИТ цены из блока (Bridge), но НЕ выдуманный LLM итог вне блока
+        self.assertIn("2245", out)                                  # итог-за-период из блока уцелел
+        self.assertIn("3000", out)                                  # депозит из блока уцелел
+        self.assertNotIn("9999", suggest.client_facing_text(out))   # число вне блока клиенту не течёт
+        self.assertIn("Уточню у команды", out)                      # вне-блока итог → «уточню»-форма
+        self.assertIn("[уточнить: цена 9999]", out)                 # пометка модератору
+
     def test_rate_limiter_hour_and_day(self):
         t = [1000.0]
         rl = suggest.RateLimiter(per_hour=2, per_day=3, now=lambda: t[0])
