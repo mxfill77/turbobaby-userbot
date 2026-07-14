@@ -1164,6 +1164,60 @@ def _explicit_monthly(text: str) -> bool:
     return bool(re.search(r"месяц|\bmonth\b|monthly", text or ""))
 
 
+# «N юнитов ОДНОЙ модели»: клиент просит несколько единиц одной модели («пара XMAX», «два скутера»,
+# «2 xmax»). Цена/депозит Bridge на такой запрос — ЗА КАЖДЫЙ юнит; общий итог НЕ выдумываем (числа
+# только из quote, KB правила цен v2 п.4 «депозит при нескольких байках»). Слово-число («пара/два»)
+# считаем ЮНИТАМИ лишь при байк/юнит-контексте (скутер/байк/шт) ИЛИ явной модели — «два дня/недели»
+# (срок) исключаем хвост-проверкой. Цифра+существительное («2 скутера») самодостаточна.
+_UNITS_DIGIT_RE = re.compile(
+    r"\b([2-9]|1[0-9])\s*(?:шт\b|штук\w*|юнит\w*|единиц\w*|байк\w*|скутер\w*|мотоцикл\w*|мотик\w*"
+    r"|bike|scooter|unit)", re.I)
+_UNITS_CTX_RE = re.compile(
+    r"скутер|байк|мотоцикл|мотик|штук|\bшт\b|юнит|единиц|\bbike|\bscooter|\bunit", re.I)
+_UNITS_TIME_TAIL_RE = re.compile(
+    r"\s*(?:дн\w*|недел\w*|нед\b|месяц\w*|сут\w*|day|week|month)", re.I)
+_UNITS_WORD_MAP = (
+    (re.compile(r"пар[ауеы]|\bpair\b|\bcouple\b", re.I), 2),
+    (re.compile(r"\bдв[ае]\b|\bдвух\b|\bоб[ае]\b|\bboth\b|\btwo\b", re.I), 2),
+    (re.compile(r"\bтр[её]х\b|\bтри\b|\bthree\b", re.I), 3),
+    (re.compile(r"\bчетыр[её]х\b|\bчетыре\b|\bfour\b", re.I), 4),
+)
+
+
+def _units_count(newest: str, models):
+    """Сколько ЮНИТОВ одной модели просит клиент («пара»/«два»/«2 скутера») → int ≥ 2 или None.
+    Разные модели (len(models) ≥ 2) — это НЕ N юнитов одной модели, а разные модели (их считает
+    путь буллетов) → None. Слово-число без байк/юнит-контекста и без модели («на два дня») НЕ в счёт."""
+    t = newest or ""
+    md = _UNITS_DIGIT_RE.search(t)
+    if md:
+        return int(md.group(1))
+    if len(models or []) >= 2:
+        return None
+    has_ctx = bool(_UNITS_CTX_RE.search(t))
+    single_model = bool(models) and len(models) == 1
+    if not (has_ctx or single_model):
+        return None
+    for rx, n in _UNITS_WORD_MAP:
+        m = rx.search(t)
+        if m and not _UNITS_TIME_TAIL_RE.match(t[m.end():]):    # «два дня/недели» — срок, не юниты
+            return n
+    return None
+
+
+def _units_count_note(n, lang="ru") -> str:
+    """Довесок к блоку ЦЕНА: клиент просит N юнитов одной модели → цена/депозит Bridge выше = ЗА
+    КАЖДЫЙ юнит; общий итог за N штук НЕ считаем и НЕ выдумываем (числа только из quote — п.4).
+    Строка начинается с пробела (клеится к note, как DEPOSIT_MULTI_NOTE)."""
+    if lang == "en":
+        return (f" MULTIPLE UNITS: the client asks for {n} units of this model — the price AND "
+                f"deposit above are PER UNIT (say «each»); do NOT compute or invent a grand total "
+                f"for {n} units, the manager will confirm the total for the quantity.")
+    return (f" НЕСКОЛЬКО ЮНИТОВ: клиент просит {n} ед. этой модели — цена И депозит выше указаны "
+            f"ЗА КАЖДЫЙ юнит (так и подпиши: «за каждый»); общую сумму за {n} шт. сам НЕ считай и "
+            f"НЕ выдумывай — итог по количеству уточнит менеджер.")
+
+
 # «сколько будет N%» / «N% это какая сумма» — клиент просит ПОСЧИТАТЬ процент от суммы расчёта
 # (шаг 2/7 #253). Нужны ОБА: сам процент (число+% / «процентов» / percent) И вопрос-о-сумме
 # («сколько/какая сумма/это сколько/how much»). Просто «скидка 10%» без вопроса-о-сумме сюда НЕ
@@ -1398,13 +1452,14 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
     price_sheet_q = _asks_price_sheet(newest, recent)
     sheet_filter = _parse_sheet_filter(newest, recent)
     percent_q = _asks_percent_amount(newest, recent)   # «сколько будет N%» → процент от суммы расчёта
+    units_count = _units_count(newest, models)         # «пара/два юнита одной модели» → цена «за каждый»
 
     return {"model": model, "models": models, "date_start": iso_start, "date_end": iso_end,
             "iso_start": iso_start, "iso_end": iso_end, "term_days": term_days,
             "hint_days": hint_days, "monthly": monthly, "has_dates": has_dates,
             "has_start": has_start,
             "deposit_multi_q": deposit_multi_q, "price_sheet_q": price_sheet_q,
-            "sheet_filter": sheet_filter, "percent_q": percent_q}
+            "sheet_filter": sheet_filter, "percent_q": percent_q, "units_count": units_count}
 
 
 # ------------------- §243/6: трекер собранного по диалогу + reply-вложениям -------------------
@@ -2125,6 +2180,9 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
     Сценарий price_sheet (прайс по всему парку) перехватывается ПЕРВЫМ."""
     # (п.4) депозит при нескольких байках — инструкция дописывается к ЛЮБОМУ исходу цены.
     dep = (" " + DEPOSIT_MULTI_NOTE) if hints.get("deposit_multi_q") else ""
+    # «N юнитов одной модели» (пара XMAX): цена/депозит Bridge = ЗА КАЖДЫЙ, общий итог не выдумываем.
+    _uc = hints.get("units_count")
+    units = _units_count_note(_uc, lang) if (_uc and _uc >= 2) else ""
     sheet = build_price_sheet_note(hints, lang=lang, getter=getter, today=today)
     if sheet is not None:
         return sheet + dep
@@ -2179,7 +2237,7 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
         pct = hints.get("percent_q")
         if pct:
             note += _percent_line(pct, q if kind in ("ok", "min") else None)
-        return note + dep
+        return note + dep + units
 
     # (п.3) несколько продуктов (несколько моделей ИЛИ два поколения XMAX) — раздельная цена по
     # каждому, отдельной строкой в одном сообщении.
@@ -2191,7 +2249,7 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
     header = ("ЦЕНЫ ПО МОДЕЛЯМ (клиент запросил несколько / модель с вариантами) — назови КАЖДУЮ "
               "отдельной строкой в ОДНОМ сообщении, цену использовать ДОСЛОВНО, модели/варианты НЕ "
               "смешивай и НЕ суммируй:\n")
-    return header + "\n".join(bullets) + dep
+    return header + "\n".join(bullets) + dep + units
 
 
 def _pressure_block(pressure) -> str:

@@ -2381,6 +2381,53 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
         self.assertIn("ЦЕНА из Календаря", note)          # одиночная модель → _wrap_single
         self.assertNotIn("- NMAX", note)                  # НЕ развёрнута в bullets
         self.assertNotIn("New Gen", note)                 # у NMAX поколений нет
+        self.assertNotIn("ЗА КАЖДЫЙ", note)               # одна единица — пометки «за каждый» нет
+
+    def test_pointwise_pair_xmax_price_per_each(self):
+        # ГОЛДЕН #365 шаг 2/7: «пару скутеров xmax 16-24 июля» → цена И депозит ЗА КАЖДЫЙ юнит;
+        # общий итог за 2 шт. НЕ выдуман (числа — только из Bridge, код не умножает). Дословная
+        # фраза клиента + парафразы RU (правило-класс CLAUDE.md: golden-детект = реальная фраза).
+        for phrase in ("пару скутеров xmax 16-24 июля",
+                       "два xmax на 16-24 июля",
+                       "нужны два скутера xmax с 16 по 24 июля",
+                       "2 скутера xmax с 16 по 24 июля",
+                       "хотим пару xmax на 16-24.07"):
+            hints = suggest.extract_booking_hints(f"[клиент]: {phrase}",
+                                                  today=datetime.date(2026, 7, 11))
+            self.assertEqual(hints["units_count"], 2, phrase)     # детект N юнитов одной модели
+            note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter(),
+                                              today=datetime.date(2026, 7, 11))
+            self.assertIn("ЗА КАЖДЫЙ", note, phrase)              # цена/депозит помечены «за каждый»
+            self.assertIn("- XMAX 300: ", note, phrase)          # оба поколения — раздельными строками
+            self.assertIn("- XMAX 300 New Gen: ", note, phrase)
+            self.assertIn("790", note, phrase)                   # цена старого поколения из Bridge
+            self.assertIn("939", note, phrase)                   # цена нового поколения из Bridge
+            self.assertIn("5000", note, phrase)                  # депозит старого из Bridge
+            self.assertIn("7000", note, phrase)                  # депозит нового из Bridge
+            # ВЫДУМАННОГО общего итога за 2 шт. в блоке НЕТ (код не суммирует и не умножает):
+            self.assertNotIn("1580", note, phrase)               # 2×790 не выдумано
+            self.assertNotIn("1878", note, phrase)               # 2×939 не выдумано
+            self.assertNotIn("10000", note, phrase)              # 2×5000 (депозит) не выдумано
+            self.assertNotIn("14000", note, phrase)              # 2×7000 (депозит) не выдумано
+
+    def test_units_count_detect_real_phrases(self):
+        # Правило-класс CLAUDE.md: детект на РЕАЛЬНОЙ фразе клиента + парафразы RU/EN + негативы.
+        for phrase, n in (("пару скутеров xmax 16-24 июля", 2),
+                          ("два xmax на 16-24 июля", 2),
+                          ("нужны два скутера xmax", 2),
+                          ("2 скутера xmax с 16 по 24 июля", 2),
+                          ("хочу пару байков", 2),
+                          ("two xmax scooters, july 16-24", 2),
+                          ("нужно 3 скутера", 3)):
+            h = suggest.extract_booking_hints(f"[клиент]: {phrase}", today=datetime.date(2026, 7, 11))
+            self.assertEqual(h["units_count"], n, phrase)
+        for phrase in ("сколько стоит xmax 16-24 июля",    # одна единица — не «за каждый»
+                       "xmax на два дня",                   # «два дня» — срок аренды, не юниты
+                       "здравствуйте!",                     # приветствие
+                       "какой депозит на xmax?",            # только про депозит
+                       "nmax и xmax на 16-24 июля"):        # разные модели, не N юнитов одной
+            h = suggest.extract_booking_hints(f"[клиент]: {phrase}", today=datetime.date(2026, 7, 11))
+            self.assertIsNone(h["units_count"], phrase)
 
     def test_min_helpers_pick_cheapest_column_independently(self):
         # Юнит на редьюсер: сутки/неделя — по сумме, месяц — по кап-«от», депозит — общий минимум.
