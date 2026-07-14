@@ -14,7 +14,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import pc_orchestrator as o
+os.environ["LESSON_LLM_ROUTE"] = "0"   # боевой .env-рубильник не течёт в тесты (деплой 334);
+                                       # ставим ДО импорта o: load_dotenv(override=False) не перепишет
+
+import pc_orchestrator as o           # noqa: E402
 
 
 def iso_ago(sec):

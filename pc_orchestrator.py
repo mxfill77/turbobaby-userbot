@@ -42,6 +42,10 @@ import urllib.request
 import urllib.parse
 
 import lesson_router          # обработчик задач-уроков (родитель 292, шаг 3): классификация+маршрут; suggest тянет лениво
+# ДЕПЛОЙ #334 шаг 6/6 (2026-07-14, одобрен владельцем): LLM-маршрут уроков в бою —
+# LESSON_LLM_ROUTE=1 в .env ПОСТОЯННО; коммит-веха триггерит эстафету демона (новый процесс
+# импортирует свежий lesson_router b088eb1→0b83582 и перечитает .env). Fail-safe в router:
+# сбой думателя/рубильник off → keyword-путь; полный откат = флаг off + рестарт.
 
 REPO = r"D:\turbobaby-bot"
 

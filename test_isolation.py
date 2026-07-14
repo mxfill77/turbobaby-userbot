@@ -22,6 +22,11 @@ import os
 
 # 1) Взводим TESTING ДО импорта suggest/moderation_ipc, чтобы флаги считались при импорте.
 os.environ["TESTING"] = "1"
+# Рубильники БОЕВОГО .env не текут в тесты (деплой 334: LESSON_LLM_ROUTE=1 в .env ронял
+# «default = keyword»-тесты и гнал РЕАЛЬНЫЙ думатель прямо из гейта — 350с и краснота).
+# Ставим "0" ДО импортов: load_dotenv(override=False) в модулях его не перепишет; тесты
+# LLM-пути включают рубильник сами (локально) и инжектят think-фейк.
+os.environ["LESSON_LLM_ROUTE"] = "0"
 
 import suggest            # noqa: E402
 import moderation_ipc     # noqa: E402
