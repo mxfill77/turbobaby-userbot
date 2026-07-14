@@ -1676,6 +1676,100 @@ class TestDraftPostcheck(unittest.TestCase):
         self.assertEqual(suggest.postcheck_draft(text, "ru", pricing_note="", call_llm=judge), text)
 
 
+class TestExtractMoneyFigures(unittest.TestCase):
+    """extract_money_figures (шаг 2/5 #310): разбор денежных чисел из ТЕКСТА ответа бота с
+    классификацией rate/total/deposit/amount. Голдены — ДОСЛОВНЫЕ живые ответы бота (правило-класс
+    CLAUDE.md), включая провал окна 504608015 «NMAX 155 на 5 дней — 2 245 ฿ (449 ฿/день)»."""
+
+    def _kinds(self, text):
+        """{kind: {values}} для удобных проверок по классу."""
+        d = {}
+        for f in suggest.extract_money_figures(text):
+            d.setdefault(f["kind"], set()).add(f["value"])
+        return d
+
+    def test_golden_window_504608015(self):
+        # ДОСЛОВНЫЙ живой провал: итог за период 2245, суточная ставка 449; «155» (модель) и
+        # «5» (срок) деньгами НЕ считаются
+        d = self._kinds("NMAX 155 на 5 дней — 2 245 ฿ (449 ฿/день)")
+        self.assertIn(2245, d.get("total", set()))
+        self.assertIn(449, d.get("rate", set()))
+        all_vals = {v for vs in d.values() for v in vs}
+        self.assertNotIn(155, all_vals)      # номер модели — не деньги
+        self.assertNotIn(5, all_vals)        # счётчик срока — не деньги
+
+    def test_correct_quote_period_total(self):
+        # корректный ответ с period-total из quote (1685) вместо наивного 449×5
+        d = self._kinds("NMAX 155 на 5 дней — 1 685 ฿ (337 ฿/день)")
+        self.assertIn(1685, d.get("total", set()))
+        self.assertIn(337, d.get("rate", set()))
+
+    def test_deposit_classified(self):
+        d = self._kinds("Итого 2245 ฿ за 5 дней, депозит 3000 бат.")
+        self.assertIn(2245, d.get("total", set()))
+        self.assertIn(3000, d.get("deposit", set()))
+
+    def test_deposit_without_currency(self):
+        # «депозит 3000» без символа валюты — контекст депозита достаточен
+        d = self._kinds("Депозит 3000, оплата при получении.")
+        self.assertIn(3000, d.get("deposit", set()))
+
+    def test_rate_glued_currency(self):
+        # «449฿/день» без пробела — терпимость к слитному формату
+        d = self._kinds("Аренда 449฿/день.")
+        self.assertIn(449, d.get("rate", set()))
+
+    def test_rate_in_words_per_day(self):
+        # «в день» словами вместо «/день»
+        d = self._kinds("449 бат в день, депозит 3000 бат.")
+        self.assertIn(449, d.get("rate", set()))
+        self.assertIn(3000, d.get("deposit", set()))
+
+    def test_bare_number_tolerated(self):
+        # голое «3000» без валюты и контекста — извлекаем как денежную сумму
+        d = self._kinds("3000")
+        self.assertIn(3000, d.get("amount", set()))
+
+    def test_thousand_separators(self):
+        # разделители тысяч: пробел, запятая, точка — все дают одно число
+        for s in ("2 245 ฿", "2,245 ฿", "2.245 ฿"):
+            d = self._kinds(s)
+            all_vals = {v for vs in d.values() for v in vs}
+            self.assertIn(2245, all_vals, s)
+
+    def test_english_answer(self):
+        d = self._kinds("NMAX 155 for 5 days — 1 685 THB (337 THB/day)")
+        self.assertIn(1685, d.get("total", set()))
+        self.assertIn(337, d.get("rate", set()))
+        all_vals = {v for vs in d.values() for v in vs}
+        self.assertNotIn(155, all_vals)
+        self.assertNotIn(5, all_vals)
+
+    def test_day_count_not_money(self):
+        # «на 7 дней» — 7 счётчик срока, не деньги; ставка 449 всё же извлекается
+        d = self._kinds("NMAX на 7 дней — 449 ฿/день, депозит 3000 ฿.")
+        all_vals = {v for vs in d.values() for v in vs}
+        self.assertNotIn(7, all_vals)
+        self.assertIn(449, d.get("rate", set()))
+        self.assertIn(3000, d.get("deposit", set()))
+
+    def test_model_cc_not_money(self):
+        # объём двигателя «155 cc» и номер модели — не деньги
+        d = self._kinds("NMAX 155 cc — отличный выбор.")
+        self.assertEqual(suggest.extract_money_figures("NMAX 155 cc — отличный выбор."), [])
+        self.assertEqual(d, {})
+
+    def test_empty_and_none(self):
+        self.assertEqual(suggest.extract_money_figures(""), [])
+        self.assertEqual(suggest.extract_money_figures(None), [])
+
+    def test_order_preserved_and_raw(self):
+        figs = suggest.extract_money_figures("на 5 дней — 2 245 ฿ (449 ฿/день)")
+        self.assertEqual([f["value"] for f in figs], [2245, 449])   # порядок появления
+        self.assertEqual(figs[0]["value"], 2245)
+        self.assertTrue(figs[0]["raw"].startswith("2"))             # raw — исходный токен
+
+
 class TestPriceSheet(unittest.TestCase):
     """Прайс по всему парку: детект намерения, детерминированный рендер день/7/месяц из ЖИВОГО
     формата ячеек Bridge, капы в месячной колонке, allowlist-фильтр (CLICK/не-в-парке), анти-луп.

@@ -2591,6 +2591,71 @@ def _pc_wl_price_numbers(pricing_note: str):
             for v in (_pc_num(tok),) if v is not None}
 
 
+# --- Разбор денежных чисел из ТЕКСТА ответа бота (шаг 2/5 родитель #310) --------------------
+# extract_money_figures: достаёт ВСЕ денежные числа ответа с грубой классификацией — суточная
+# ставка «฿/день» (rate), итог за период (total), депозит (deposit), прочая денежная сумма
+# (amount). Питает будущий гард сверки текста с котировкой: живой провал окна 504608015
+# «NMAX 155 на 5 дней — 2 245 ฿ (449 ฿/день)» → total=2245, rate=449; при этом «155» (модель)
+# и «5» (срок) деньгами НЕ считаются. Терпима к форматам «2 245 ฿», «449฿/день», «3000»,
+# «депозит 3000 бат», «1685 THB», «337 THB/day».
+_MF_CUR = r"(?:฿|бат\w*|baht\w*|thb)"
+_MF_NUM = r"\d[\d\s .,]*\d|\d"
+_MF_SCAN_RE = re.compile(r"(?<![\d.,])(" + _MF_NUM + r")\s*(" + _MF_CUR + r")?", re.I)
+# ставка «/день»: между числом и «день» ОБЯЗАТЕЛЕН коннектор (/ | в | за | per | a) — иначе
+# «5 дней» (счётчик срока) ложно попал бы в суточную ставку.
+_MF_RATE_TAIL = re.compile(
+    r"^\s*(?:/\s*|за\s+|в\s+|per\s+|a\s+)(?:฿|бат\w*|baht\w*|thb)?\s*(?:день|дн\w*|сут\w*|day)\b",
+    re.I)
+_MF_PERIOD = re.compile(
+    r"(?:за|на|for)\s*\d{1,3}\s*(?:дн\w*|день|сут\w*|недел\w*|нед\b|мес\w*|months?|weeks?|days?)",
+    re.I)
+_MF_DEPOSIT = re.compile(r"депозит|залог|deposit", re.I)
+_MF_TOTAL_KW = re.compile(r"итог\w*|всего|total|сумм\w*", re.I)
+_MF_MODEL_TAIL = re.compile(
+    r"(?:nmax|adv|pcx|click|forza|xmax|vario|aerox|filano|scoopy|grand|fino|burgman|lead|zoomer)"
+    r"\s*$", re.I)
+_MF_UNIT_HEAD = re.compile(
+    r"^\s*(?:cc\b|куб\w*|км\b|km\b|%|час\w*|год\b|лет\b|шт\b|дн\w*|день|сут\w*|недел\w*|нед\b|"
+    r"мес\w*|day|week|month)", re.I)
+
+
+def extract_money_figures(text: str):
+    """Денежные числа из текста ответа → список dict(kind, value, raw) в порядке появления.
+    kind ∈ {'rate','deposit','total','amount'}. Модельные числа (NMAX 155) и счётчики срока
+    (5 дней) деньгами НЕ считаются. value — int (пробелы/разделители тысяч сняты)."""
+    s = text or ""
+    out = []
+    for m in _MF_SCAN_RE.finditer(s):
+        value = _pc_num(m.group(1))
+        if value is None:
+            continue
+        has_cur = bool(m.group(2))
+        before = s[max(0, m.start(1) - 28):m.start(1)]
+        after = s[m.end():m.end() + 18]
+        is_rate = bool(_MF_RATE_TAIL.search(after))
+        near = before.lower() + " " + after.lower()
+        is_deposit = bool(_MF_DEPOSIT.search(near))
+        is_total = bool(_MF_PERIOD.search(near) or _MF_TOTAL_KW.search(before.lower()))
+        # без валюты и вне явного денежного контекста — отсекаем модельные числа (NMAX 155)
+        # и единицы/счётчики (5 дней, 155 cc); голое число оставляем только если оно похоже
+        # на цену (итог-за-период ИЛИ >=1000).
+        if not has_cur and not is_rate and not is_deposit:
+            if _MF_MODEL_TAIL.search(before) or _MF_UNIT_HEAD.match(after):
+                continue
+            if not is_total and value < 1000:
+                continue
+        if is_rate:
+            kind = "rate"
+        elif is_deposit:
+            kind = "deposit"
+        elif is_total:
+            kind = "total"
+        else:
+            kind = "amount"
+        out.append({"kind": kind, "value": value, "raw": m.group(0).strip()})
+    return out
+
+
 def _pc_segments(text: str):
     """Список [сегмент, разделитель] с точным round-trip: ''.join(s+p) == text."""
     parts = _PC_SPLIT_RE.split(text or "")
