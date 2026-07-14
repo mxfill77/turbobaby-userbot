@@ -1800,6 +1800,132 @@ class TestDraftPostcheck(unittest.TestCase):
         self.assertEqual(suggest.postcheck_draft(text, "ru", pricing_note=""), text)
 
 
+class TestGuardAvailability(unittest.TestCase):
+    """guard_availability (родитель4, шаг 4/6): гард ПЕРЕД отправкой — бот НЕ утверждает наличие/
+    дефицит/особые условия без данных. Форма по образцу удалённого guard_quote_price: клейм без
+    данных → перегенерация с жёсткой директивой → после N неудач безопасный фолбэк. Голдены —
+    реальные формулировки бота-«продавца» (дефицит/срочность/спецусловия), а не идеализация."""
+
+    Q_FREE = {"status": "ok"}                 # Bridge: подходящий байк свободен на даты
+    Q_BUSY = {"status": "none_available"}     # Bridge: все юниты заняты на даты
+
+    def test_state_from_various_data(self):
+        self.assertIs(suggest.availability_state(True), True)
+        self.assertIs(suggest.availability_state(False), False)
+        self.assertIs(suggest.availability_state({"available": True}), True)
+        self.assertIs(suggest.availability_state({"available": False}), False)
+        self.assertIs(suggest.availability_state(self.Q_FREE), True)
+        self.assertIs(suggest.availability_state(self.Q_BUSY), False)
+        self.assertIsNone(suggest.availability_state(None))
+        self.assertIsNone(suggest.availability_state({"status": "error"}))
+
+    def test_claims_detected_by_kind(self):
+        kinds = lambda t: {c["kind"] for c in suggest.availability_claims(t)}
+        self.assertIn("avail_neg", kinds("Этой модели сейчас нет в наличии."))
+        self.assertIn("avail_pos", kinds("NMAX 155 свободен на ваши даты."))
+        self.assertIn("scarcity", kinds("Остался последний байк, успевайте!"))
+        self.assertIn("special", kinds("Сделаю особые условия специально для вас."))
+        # чистый черновик — клеймов нет
+        self.assertEqual(suggest.availability_claims("Здравствуйте! Назовите даты аренды."), [])
+
+    def test_neg_not_double_counted_as_pos(self):
+        # «нет в наличии» — только avail_neg, «в наличии» внутри отрицания НЕ считаем за avail_pos
+        cl = suggest.availability_claims("Этой модели нет в наличии.")
+        self.assertEqual([c["kind"] for c in cl], ["avail_neg"])
+
+    def test_no_claims_clean_passthrough(self):
+        # нет клеймов наличия → черновик БАЙТ-В-БАЙТ (fail-safe), source='clean'
+        draft = "Здравствуйте! Подскажите даты — подберём вариант и уточним цену по Календарю."
+        r = suggest.guard_availability(draft)
+        self.assertEqual(r["source"], "clean")
+        self.assertTrue(r["ok"])
+        self.assertIs(r["text"], draft)
+        self.assertEqual(r["violations"], [])
+
+    def test_avail_pos_supported_by_data_passes(self):
+        # «свободен на даты» + Bridge подтвердил ok → утверждение подкреплено данными, source='draft'
+        draft = "NMAX 155 свободен на ваши даты."
+        r = suggest.guard_availability(draft, avail=self.Q_FREE, model="NMAX 155")
+        self.assertEqual(r["source"], "draft")
+        self.assertEqual(r["text"], draft)
+
+    def test_avail_neg_supported_by_data_passes(self):
+        # «занят на даты» + Bridge none_available → подкреплено, не трогаем
+        draft = "К сожалению, этот байк занят на ваши даты."
+        r = suggest.guard_availability(draft, avail=self.Q_BUSY, model="NMAX 155")
+        self.assertEqual(r["source"], "draft")
+
+    def test_avail_pos_without_data_is_violation(self):
+        # то же «свободен», но данных наличия НЕТ (avail=None) → нарушение инварианта
+        bad = suggest.availability_violations("NMAX 155 свободен на ваши даты.", None)
+        self.assertTrue(any(b["kind"] == "avail_pos" for b in bad))
+
+    def test_avail_pos_contradicts_data_is_violation(self):
+        # «свободен», а Bridge говорит none_available → противоречие данным = нарушение
+        bad = suggest.availability_violations("NMAX 155 свободен на ваши даты.", self.Q_BUSY)
+        self.assertTrue(any(b["kind"] == "avail_pos" for b in bad))
+
+    def test_scarcity_always_violation_even_with_data(self):
+        # дефицит/срочность источника данных НЕ имеют → нарушение ДАЖE при наличии quote
+        bad = suggest.availability_violations("Остался последний, успевайте забронировать!", self.Q_FREE)
+        self.assertTrue(any(b["kind"] == "scarcity" for b in bad))
+
+    def test_special_always_violation(self):
+        # особые/персональные условия назначает менеджер → всегда нарушение
+        bad = suggest.availability_violations("Сделаю вам персональную скидку, только для вас.", self.Q_FREE)
+        self.assertTrue(any(b["kind"] == "special" for b in bad))
+
+    def test_regenerate_fixes_violation(self):
+        # клейм без данных → перегенерация с жёсткой директивой отдаёт чистый текст, source='regen'
+        bad = "Остался последний NMAX 155, успевайте — свободен на ваши даты!"
+        good = "Уточню наличие NMAX 155 по вашим датам у команды и вернусь."
+        calls = []
+
+        def regen(directive):
+            calls.append(directive)
+            return good
+        r = suggest.guard_availability(bad, avail=None, model="NMAX 155", regenerate=regen, max_retries=2)
+        self.assertEqual(r["source"], "regen")
+        self.assertEqual(r["attempts"], 1)
+        self.assertEqual(r["text"], good)
+        self.assertIn("НЕ утверждай наличие", calls[0])              # директива несёт запрет
+
+    def test_fallback_after_n_failures(self):
+        # перегенерация упорно продолжает клеймить → после N попыток безопасный фолбэк
+        bad = "Остался последний байк, успевайте!"
+        attempts = {"n": 0}
+
+        def regen(directive):
+            attempts["n"] += 1
+            return "Точно последний, разбирают быстро — успевайте!"   # всё ещё дефицит
+        r = suggest.guard_availability(bad, avail=None, model="NMAX 155", regenerate=regen, max_retries=2)
+        self.assertEqual(r["source"], "fallback")
+        self.assertEqual(r["attempts"], 2)
+        self.assertEqual(attempts["n"], 2)
+        # фолбэк безопасен: обещает уточнить и сам НЕ содержит клеймов наличия/дефицита
+        self.assertEqual(suggest.availability_claims(r["text"]), [])
+        self.assertIn("уточню наличие", r["text"].lower())
+
+    def test_no_regenerate_goes_to_fallback(self):
+        # нарушение без regenerate-колбэка → сразу безопасный фолбэк
+        r = suggest.guard_availability("Остался последний, успевайте!", avail=None,
+                                       model="NMAX 155", max_retries=0)
+        self.assertEqual(r["source"], "fallback")
+        self.assertEqual(suggest.availability_claims(r["text"]), [])
+
+    def test_fallback_text_is_clean_ru_en(self):
+        # оба фолбэка (RU/EN) сами не триггерят гард (иначе луп) — клеймов наличия нет
+        self.assertEqual(suggest.availability_claims(suggest.availability_fallback(model="NMAX 155")), [])
+        self.assertEqual(
+            suggest.availability_claims(suggest.availability_fallback(model="NMAX 155", lang="en")), [])
+
+    def test_en_special_and_scarcity_flagged(self):
+        # EN-формулировки дефицита/спецусловий тоже ловятся (парк англоязычных клиентов)
+        bad = suggest.availability_violations("Last one, hurry! Special offer just for you.", None)
+        self.assertTrue(any(b["kind"] == "scarcity" for b in bad))
+        self.assertTrue(any(b["kind"] == "special" for b in bad))
+
+
 class TestExtractMoneyFigures(unittest.TestCase):
     """extract_money_figures (шаг 2/5 #310): разбор денежных чисел из ТЕКСТА ответа бота с
     классификацией rate/total/deposit/amount. Голдены — ДОСЛОВНЫЕ живые ответы бота (правило-класс

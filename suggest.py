@@ -193,6 +193,24 @@ APPROVAL_WHITELIST_RULE = (
 )
 
 
+# ИНВАРИАНТ НАЛИЧИЯ/ДЕФИЦИТА/ОСОБЫХ УСЛОВИЙ (в промпт ВСЕГДА, рядом с белым списком — высокий
+# приоритет). У бота НЕТ данных о складе, дефиците и персональных условиях: наличие проверяет только
+# Календарь/менеджер, спеццены/скидки назначает менеджер. APPROVAL_WHITELIST_RULE перекрывает наличие
+# конкретного байка; здесь ДОБАВЛЕНЫ дефицит-срочность и особые условия (белый список их явно не
+# называл) и запрет собран одним жёстким блоком. Программно страхует guard_availability (родитель4,
+# шаг 4/6): клейм наличия/дефицита/спецусловий без данных → перегенерация, затем безопасный фолбэк.
+AVAILABILITY_INVARIANT_RULE = (
+    "\n\nНАЛИЧИЕ, ДЕФИЦИТ И ОСОБЫЕ УСЛОВИЯ (ЖЁСТКО, БЕЗ ДАННЫХ — НЕ УТВЕРЖДАТЬ): у тебя НЕТ данных о "
+    "складе, дефиците и персональных условиях. Клиенту как ФАКТ ЗАПРЕЩЕНО: (1) подтверждать или "
+    "отрицать наличие/занятость конкретного байка на даты («свободен»/«в наличии», «занят»/«нет в "
+    "наличии»); (2) создавать дефицит и срочность («последний», «остался один», «почти всё "
+    "разобрали», «разбирают», «успевайте», «только сегодня»); (3) обещать особые/персональные "
+    "условия, спеццены или скидки «специально для вас». Ничего из этого не выдумывай и не намекай. "
+    "Наличие проверяет Календарь/менеджер, особые условия назначает менеджер — вместо утверждения "
+    "напиши, что уточнишь наличие по датам/модели и вернёшься, без чисел скидок и без обещаний."
+)
+
+
 # --- СТИЛЬ РЕАЛЬНЫХ МЕНЕДЖЕРОВ + FEW-SHOT (шаг 5/7 родитель #253) ----------------
 # Собрано из ЖИВОЙ базы переписок с клиентами (client_chats.jsonl, роль company =
 # наш менеджер @turbophuket). Это ЭТАЛОН ТОНА/ФОРМУЛИРОВОК/ДЛИНЫ, а НЕ новый источник
@@ -2512,7 +2530,8 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         "приветствие → суть; иначе → сразу суть)."
         + pressure_block
         + directive_block + park_block + collected_block + greet + policy + scenario + ANTI_LOOP_NOTE + price_block + "\n\n"
-        + CRITICAL_FACTS + EXPERIENCE_SAFETY_RULE + APPROVAL_WHITELIST_RULE + playbook_block
+        + CRITICAL_FACTS + EXPERIENCE_SAFETY_RULE + APPROVAL_WHITELIST_RULE
+        + AVAILABILITY_INVARIANT_RULE + playbook_block
         + "\n\nFAQ и эталонные формулировки:\n" + (faq or "(FAQ недоступен — опирайся на критичные факты выше)")
         + STYLE_FEWSHOT
     )
@@ -3047,6 +3066,175 @@ def client_facing_text(draft: str) -> str:
         return draft
     out = _SERVICE_NOTE_LINE_RE.sub("", draft)
     return re.sub(r"\n{3,}", "\n\n", out).strip()
+
+
+# ===================== ГАРД НАЛИЧИЯ/ДЕФИЦИТА/ОСОБЫХ УСЛОВИЙ (родитель4, шаг 4/6) =====================
+# Пара к AVAILABILITY_INVARIANT_RULE: детерминированная страховка ПЕРЕД отправкой, по образцу удалённого
+# guard_quote_price (#310) — та же форма (сверка текста ↔ данные → перегенерация → фолбэк). Инвариант:
+# бот НЕ утверждает наличие/занятость конкретного байка, дефицит/срочность и особые/персональные условия
+# БЕЗ данных. Данные о наличии — только из Bridge (quote.available / quote_for_model.status); дефицита и
+# спецусловий у бота источника НЕТ вовсе → такие клеймы нарушают инвариант ВСЕГДА. Нарушение → ответ НЕ
+# уходит: лог (окно/модель/даты/клеймы) + перегенерация с жёсткой директивой (regenerate(directive)); после
+# N неудач — безопасный фолбэк «уточню наличие и вернусь». Нет клеймов наличия → черновик байт-в-байт.
+# Пост-чек postcheck_draft клеймит наличие переписыванием сегмента в «уточню» (мягко, для модератора);
+# этот гард — жёсткий пояс с перегенерацией/фолбэком, дополняет пост-чек, а не дублирует его.
+
+# Наличие ОТРИЦАЕТСЯ (занят/нет/разобрали) — состояние склада, вне данных без Bridge.
+_AV_NEG_RE = re.compile(
+    r"сейчас\s+нет|уже\s+нет|пока\s+нет|нет\s+в\s+нали\w+|не\s+в\s+нали\w+|нету\b|"
+    r"не\s+остал\w+|разобран\w*|\bзанят\w*|недоступ\w*|нет\s+свободн\w*|"
+    r"sold\s*out|not\s+available|unavailable|out\s+of\s+stock|already\s+booked", re.I)
+# Наличие УТВЕРЖДАЕТСЯ (свободен/в наличии/доступен на даты) — тоже вне данных без Bridge.
+_AV_POS_RE = re.compile(
+    r"есть\s+в\s+нали\w+|в\s+нали\w+\b|свободен\b|свободна\b|доступен\b|доступна\b|"
+    r"\bavailable\b|in\s+stock", re.I)
+# ДЕФИЦИТ/СРОЧНОСТЬ — источника данных НЕТ, клейм запрещён ВСЕГДА.
+_AV_SCARCITY_RE = re.compile(
+    r"послед\w+\s+(?:байк\w*|штук\w*|шт\b|один|одна|экземпляр\w*)|остал\w+\s+(?:один|одна|1\b)|"
+    r"осталось\s+\d|мало\s+остал\w+|почти\s+(?:всё|все)\s+разобрал\w*|разбира\w+|успева\w+|"
+    r"успей\w*|спеши\w+|торопи\w+|только\s+сегодня\b|"
+    r"last\s+one|only\s+\d+\s+left|almost\s+gone|selling\s+fast|hurry|going\s+fast|only\s+today", re.I)
+# ОСОБЫЕ/ПЕРСОНАЛЬНЫЕ УСЛОВИЯ и спеццены — назначает менеджер, у бота источника НЕТ, запрещено ВСЕГДА.
+_AV_SPECIAL_RE = re.compile(
+    r"особ\w+\s+услови\w+|специальн\w+\s+(?:услови\w+|предложени\w+|цен\w+)|"
+    r"персональн\w+\s+(?:скидк\w+|цен\w+|услови\w+)|скидк\w+\s+(?:специально\s+)?(?:для\s+вас|лично\s+вам)|"
+    r"только\s+для\s+вас|эксклюзив\w*|"
+    r"special\s+(?:offer|deal|conditions?|price|discount)|just\s+for\s+you|exclusive\b|personal\s+discount",
+    re.I)
+
+
+def availability_claims(draft: str) -> list:
+    """Клеймы наличия/дефицита/особых условий в ТЕКСТЕ ответа → список dict(kind, raw) в порядке
+    появления. kind ∈ {'avail_pos','avail_neg','scarcity','special'}. avail_pos не считаем внутри
+    отрицания («нет в наличии» = только avail_neg, не avail_pos). Пусто → клеймов нет."""
+    s = draft or ""
+    claims, neg_spans = [], []
+    for m in _AV_NEG_RE.finditer(s):
+        neg_spans.append((m.start(), m.end()))
+        claims.append({"kind": "avail_neg", "raw": m.group(0).strip()})
+    for m in _AV_POS_RE.finditer(s):
+        span = (m.start(), m.end())
+        if any(span[0] < e and s0 < span[1] for s0, e in neg_spans):
+            continue                                   # «в наличии» внутри «нет в наличии» — уже avail_neg
+        pre = s[max(0, m.start() - 6):m.start()].lower()
+        if re.search(r"\b(?:не|нет)\s*$", pre):        # непосредственно отрицаемое «свободен» и т.п.
+            continue
+        claims.append({"kind": "avail_pos", "raw": m.group(0).strip()})
+    for m in _AV_SCARCITY_RE.finditer(s):
+        claims.append({"kind": "scarcity", "raw": m.group(0).strip()})
+    for m in _AV_SPECIAL_RE.finditer(s):
+        claims.append({"kind": "special", "raw": m.group(0).strip()})
+    return claims
+
+
+def availability_state(avail):
+    """Состояние наличия из данных Bridge → True (свободен) / False (занят) / None (данных нет).
+    Принимает bool, quote-dict (поле available), результат quote_for_model ({status}). Дефицит и
+    особые условия НИКОГДА не подтверждаются данными — их обрабатывает availability_violations."""
+    if isinstance(avail, bool):
+        return avail
+    if isinstance(avail, dict):
+        if isinstance(avail.get("available"), bool):
+            return avail["available"]
+        st = avail.get("status")
+        if st == "ok":
+            return True
+        if st == "none_available":
+            return False
+    return None
+
+
+def _av_unsupported(claims, state) -> list:
+    """Клеймы, НЕ подтверждённые данными: avail_pos ок только при state=True, avail_neg только при
+    state=False; scarcity/special — данных-источника нет → всегда нарушение."""
+    bad = []
+    for c in claims:
+        if c["kind"] == "avail_pos" and state is True:
+            continue
+        if c["kind"] == "avail_neg" and state is False:
+            continue
+        bad.append(c)
+    return bad
+
+
+def availability_violations(draft: str, avail=None) -> list:
+    """Клеймы наличия/дефицита/особых условий из текста, НЕ подтверждённые данными Bridge (avail).
+    Пусто = черновик согласован (клеймов нет ИЛИ наличие точно подтверждено данными)."""
+    return _av_unsupported(availability_claims(draft), availability_state(avail))
+
+
+def _availability_hard_directive(lang: str = "ru") -> str:
+    """Директива-верхнего-уровня для перегенерации: запрет утверждать наличие/дефицит/особые условия
+    без данных, вместо этого — «уточню наличие и вернусь». В regenerate_draft(directive=…)."""
+    if lang == "en":
+        return ("Do NOT assert availability of a specific bike (\"free\"/\"in stock\", "
+                "\"booked\"/\"not available\"), do NOT create scarcity or urgency (\"last one\", "
+                "\"almost gone\", \"hurry\", \"only today\") and do NOT promise any special or "
+                "personal conditions, prices or discounts — there is NO data for any of that. "
+                "Instead say you will check availability for the client's dates/model with the team "
+                "and get back. Write no other availability, scarcity or special-offer claims.")
+    return ("НЕ утверждай наличие конкретного байка («свободен»/«в наличии», «занят»/«нет в "
+            "наличии»), НЕ создавай дефицит и срочность («последний», «почти разобрали», "
+            "«успевайте», «только сегодня») и НЕ обещай никакие особые/персональные условия, "
+            "спеццены или скидки — данных на это НЕТ. Вместо этого напиши, что уточнишь наличие по "
+            "датам/модели у команды и вернёшься. Других утверждений о наличии, дефиците или "
+            "спецпредложениях не пиши.")
+
+
+def availability_fallback(model=None, ds=None, de=None, lang: str = "ru") -> str:
+    """Детерминированный безопасный фолбэк, если перегенерация не смогла: обещаем проверить наличие
+    и вернуться, без утверждений о складе/дефиците/скидках. Сам не содержит клеймов наличия."""
+    who = (" " + str(model)) if model else ""
+    if lang == "en":
+        return f"Let me check availability{who} for your dates with the team and get back to you."
+    return f"Уточню наличие{who} по вашим датам у команды и вернусь."
+
+
+def guard_availability(draft: str, avail=None, model=None, ds=None, de=None, lang: str = "ru",
+                       regenerate=None, max_retries: int = 2, window=None) -> dict:
+    """Гард ПЕРЕД отправкой: черновик не должен УТВЕРЖДАТЬ наличие/дефицит/особые условия без данных.
+    Нет клеймов наличия → отдаём черновик как есть (source='clean'). Клеймы, подтверждённые данными
+    Bridge (avail) → как есть (source='draft'). Клейм БЕЗ данных → лог + перегенерация с жёсткой
+    директивой (regenerate(directive)->str, до max_retries раз); после N неудач → безопасный фолбэк
+    (source='fallback'). Возвращает dict(text, ok, source∈{clean,draft,regen,fallback}, attempts,
+    violations). По образцу удалённого guard_quote_price (#310)."""
+    state = availability_state(avail)
+    claims = availability_claims(draft)
+    if not claims:
+        return {"text": draft, "ok": True, "source": "clean", "attempts": 0, "violations": []}
+    bad = _av_unsupported(claims, state)
+    if not bad:
+        return {"text": draft, "ok": True, "source": "draft", "attempts": 0, "violations": []}
+
+    def _log(stage, items, text):
+        log.warning(
+            "guard_availability VIOLATION [%s] окно=%s модель=%s даты=%s..%s | клеймы=%s | draft=%r",
+            stage, window, model, ds, de,
+            [{"kind": b["kind"], "raw": b["raw"]} for b in items], (text or "")[:200])
+
+    _log("initial", bad, draft)
+    directive = _availability_hard_directive(lang)
+    attempts, last_bad = 0, bad
+    if callable(regenerate):
+        for _ in range(max(0, int(max_retries))):
+            attempts += 1
+            try:
+                cand = regenerate(directive)
+            except Exception:
+                log.warning("guard_availability: перегенерация упала (окно=%s), попытка %s", window, attempts)
+                break
+            cand_bad = availability_violations(cand, avail)
+            if not cand_bad:
+                return {"text": cand, "ok": True, "source": "regen", "attempts": attempts,
+                        "violations": bad}
+            last_bad = cand_bad
+            _log(f"regen#{attempts}", cand_bad, cand)
+
+    fb = availability_fallback(model, ds, de, lang)
+    log.warning("guard_availability: после %s попыток → безопасный фолбэк (окно=%s): %r",
+                attempts, window, fb)
+    return {"text": fb, "ok": bool(fb), "source": "fallback", "attempts": attempts,
+            "violations": last_bad}
 
 
 def generate_draft(transcript: str, lang: str, faq: str,
