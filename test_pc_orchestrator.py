@@ -3479,6 +3479,15 @@ class TestRevizorChecklist(unittest.TestCase):
         self.assertIn("думатель-ревизор", pre)            # роль-префикс на месте
         self.assertIn("JSON-массив", pre)                 # контракт-суффикс на месте
 
+    def test_suffix_forbids_deploy_steps_in_task_text(self):
+        # МАНДАТ 14.07: контракт вывода велит думателю НЕ вписывать деплой/рестарт в task_text,
+        # а осознанный рестарт прода помечать action=owner (не зелёная задача).
+        s = o.REVIZOR_PREAMBLE_SUFFIX
+        self.assertIn("код", s)
+        self.assertIn("тест", s.lower())
+        self.assertTrue(any(w in s.lower() for w in ("деплой", "рестарт", "taskkill", "schtasks")))
+        self.assertIn("owner", s)                          # осознанный рестарт → owner-путь назван
+
     def test_preamble_reads_file_each_call(self):
         p = self._tmp("- [класс а] первый\n")
         self.assertIn("[класс а] первый", o._revizor_preamble(p))
@@ -3855,6 +3864,111 @@ class TestRevizorRoute(Base):
         out = o._revizor_route([], now=_REV_NOW)
         self.assertEqual(out["windows"], 0)
         self.assertEqual(self.notes, [])                               # окон нет вовсе → даже NOTE не пишем
+
+
+# ---- МАНДАТ 14.07: авто-задачи ревизора НЕ заказывают деплой/рестарт прода ----
+# Живой урок: цепи 310/311 из находок ревизора доходили до КРАСНЫХ шагов «деплой+рестарт прод-ботов»
+# (✋ владельцу), хотя применение делает авто-reconcile. Голдены: находка «рестартни бота» → owner-
+# карточка (не задача); обычная находка → задача БЕЗ деплой-шагов. Реальные дев-ТЗ-фразы из провала.
+
+class TestRevizorDeployWords(unittest.TestCase):
+    """Детектор деплой/рестарт-слов в task_text (пост-фильтр). Реальная фраза живого провала 14.07
+    (цепь 310/311 «деплой+рестарт прод-ботов») + парафразы RU/EN; негативы — чистое код+тест-ТЗ."""
+
+    POS = [
+        "деплой и рестарт прод-ботов после правки",                    # дословный живой провал 310/311
+        "перезапусти userbot и moderbot",
+        "рестартни бота, чтобы правка подхватилась",
+        "redeploy the suggest module and restart the bots",
+        "выполни deploy и reboot userbot",
+        "taskkill userbot.py и подними заново",
+        "обнови schtasks-задачу оркестратора",
+        "убей процесс модербота и перезагрузи",
+    ]
+    NEG = [
+        "фикс детекта прайс-интента в suggest.py + голден с реальной фразой клиента",
+        "добавь гард переспроса дат в suggest, покрой юнит-тестом",
+        "поправь шаблон ответа: не переспрашивать уже данную модель; тест на класс в",
+        "исправь ложную ✅ трекера в collect_booking — юнит на класс д",
+        "",
+        None,
+    ]
+
+    def test_positives_flagged(self):
+        for t in self.POS:
+            self.assertTrue(o._revizor_task_wants_deploy(t), f"НЕ поймал деплой/рестарт: {t!r}")
+
+    def test_negatives_pass(self):
+        for t in self.NEG:
+            self.assertFalse(o._revizor_task_wants_deploy(t), f"ложно принял за деплой: {t!r}")
+
+    def test_demote_moves_task_to_owner(self):
+        f = {"class": "ж", "action": "task", "client_id": 42, "evidence": "",
+             "task_text": "фикс детекта + деплой и рестарт прод-ботов"}
+        g = o._revizor_demote_deploy_task(f)
+        self.assertEqual(g["action"], "owner")
+        self.assertEqual(g["task_text"], "")                           # owner-карточка task_text не несёт
+        self.assertIn("деплой", g["evidence"])                         # суть находки видна владельцу (из task_text)
+        self.assertEqual(g["client_id"], 42)                           # окно сохранено
+
+    def test_demote_keeps_existing_evidence(self):
+        f = {"class": "ж", "action": "task", "client_id": 7, "evidence": "живая улика окна",
+             "task_text": "рестартни бота"}
+        g = o._revizor_demote_deploy_task(f)
+        self.assertEqual(g["evidence"], "живая улика окна")            # непустую улику не затираем
+
+
+class TestRevizorDeployRouting(Base):
+    """Голдены маршрутизации: находка с деплой/рестарт-шагом → owner-карточка (не зелёная задача);
+    обычная находка → задача дирижёру. + страховка enqueue (деплой-ТЗ в очередь не встаёт)."""
+
+    def setUp(self):
+        super().setUp()
+        self._save_c = (o._revizor_consult,)
+        self.notes = []
+        o._cowork = lambda line: self.notes.append(line)
+
+    def tearDown(self):
+        (o._revizor_consult,) = self._save_c
+        super().tearDown()
+
+    def _consult(self, mapping):
+        o._revizor_consult = lambda pkg: mapping.get(pkg.get("client_id"))
+
+    def test_restart_finding_becomes_owner_card_not_task(self):
+        # ГОЛДЕН: «рестартни бота» в task_text → owner-карточка 1160, НИ ОДНОЙ зелёной задачи дирижёру
+        self._consult({1: [{"class": "ж", "action": "task",
+                            "task_text": "фикс детекта + деплой и рестарт прод-ботов"}]})
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual(out["tasks"], 0)                              # задачей НЕ поставлено
+        self.assertEqual(out["demoted"], 1)
+        self.assertEqual(out["owner"], 1)                              # ушло в owner-карточку
+        news = [t for t in self.fb.tasks.values() if t["status"] == "new"]
+        self.assertEqual(news, [])                                     # дирижёру зелёной задачи нет
+        cards = [t for t in self.fb.tasks.values() if t["status"] == "needs_approval"]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["from"], o.REVIZOR_OWNER_FROM)
+        self.assertTrue(any("деплой-шаг" in n for n in self.notes))    # журнал-ритуал: перевод отмечен в NOTE
+
+    def test_ordinary_finding_becomes_task_without_deploy(self):
+        # ГОЛДЕН: обычная находка (только код+тест) → зелёная задача дирижёру, деплой-слов в ней нет
+        self._consult({1: [{"class": "ж", "action": "task",
+                            "task_text": "фикс детекта прайс-интента в suggest.py + голден"}]})
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual(out["tasks"], 1)
+        self.assertEqual(out["demoted"], 0)
+        news = [t for t in self.fb.tasks.values() if t["status"] == "new"]
+        self.assertEqual(len(news), 1)
+        self.assertEqual(news[0]["from"], o.PC_LOCAL_DEC_FROM)
+        self.assertFalse(o._revizor_task_wants_deploy(news[0]["task_text"]))  # в задаче нет деплой-шагов
+
+    def test_enqueue_guard_drops_deploy_task(self):
+        # СТРАХОВКА: если деплой-ТЗ дошло до enqueue напрямую — в очередь НЕ ставим (skip), не задача
+        f = {"class": "ж", "action": "task", "client_id": 5,
+             "task_text": "деплой и рестарт прод-ботов"}
+        enq, skip = o._revizor_enqueue_tasks([f], [], _REV_NOW)
+        self.assertEqual((enq, skip), (0, 1))
+        self.assertEqual([t for t in self.fb.tasks.values() if t["status"] == "new"], [])
 
 
 class TestRevizorGuards(Base):

@@ -2848,13 +2848,17 @@ REVIZOR_PREAMBLE_SUFFIX = (
     "Для КАЖДОЙ находки укажи action:\n"
     "  task — дефект чинится правкой кода/промпта suggest (детект/гард/шаблон) → дай task_text: "
     "САМОДОСТАТОЧНОЕ дев-ТЗ ≤400 символов (исполнитель увидит ТОЛЬКО его, впиши класс, окно и "
-    "дословную улику);\n"
-    "  owner — нужно решение человека (спорный тариф, política, неоднозначный кейс) — task_text пустой;\n"
+    "дословную улику). task_text описывает ТОЛЬКО правку КОДА + ТЕСТЫ/ГОЛДЕНЫ — НЕ вписывай в него "
+    "шаги деплоя, рестарта/перезапуска ботов, taskkill, schtasks: применение правки и рестарт делает "
+    "авто-reconcile контура САМ. Если дефект требует ОСОЗНАННОГО рестарта/деплоя прода — это НЕ task, "
+    "а action=owner (решение принимает человек);\n"
+    "  owner — нужно решение человека (спорный тариф, политика, неоднозначный кейс, ОСОЗНАННЫЙ "
+    "рестарт/деплой прод-ботов) — task_text пустой;\n"
     "  noise — по факту не нарушение (ложное срабатывание) — task_text пустой; такие НЕ включай, если "
     "сомневаешься — лучше noise, чем ложная задача.\n"
     "Ответь СТРОГО ОДНИМ JSON-массивом, без текста до/после, без markdown-обёртки:\n"
     '[{"class":"а".."ж","evidence":"<дословная улика ≤200 символов>","action":"task"|"owner"|"noise",'
-    '"task_text":"<дев-ТЗ ≤400 или пусто>"}]\n'
+    '"task_text":"<дев-ТЗ ≤400 (ТОЛЬКО код+тесты, без деплоя/рестарта) или пусто>"}]\n'
     "Нарушений нет → верни пустой массив []. Не выдумывай находок сверх чек-листа.\n\n"
 )
 
@@ -3211,6 +3215,39 @@ def _revizor_task_markers(items):
     return out
 
 
+# МАНДАТ РЕВИЗОРА (живой урок 14.07): авто-задачи-находки НЕ заказывают деплой/рестарт прода —
+# применение правки и рестарт делает авто-reconcile контура (maybe_update_bots) САМ. Цепи 310/311 из
+# находок ревизора доходили до КРАСНЫХ шагов «деплой+рестарт прод-ботов» (✋ владельцу), хотя это
+# делается автоматически. Осознанный рестарт/деплой прода — решение ЧЕЛОВЕКА → owner-карточка, не
+# зелёная задача. Первый рубеж — промпт (SUFFIX выше велит думателю не вписывать такие шаги и
+# помечать их action=owner); ЭТО — страховка кодом: task_text с деплой/рестарт-словами перехватываем
+# ниже (в _revizor_route → owner-карточка; в enqueue → last-resort пропуск, чтобы деплой-шаг НИКОГДА
+# не встал зелёной задачей). Red: Bridge/таблицы/деньги не трогаем — только маршрутизация находок.
+_REVIZOR_DEPLOY_RE = re.compile(
+    r"деплой|редеплой|redeploy|deploy|рестарт|перезапус|перезагруз|restart|reboot|"
+    r"taskkill|schtasks|kill\s+(?:process|процесс)|убей\s+процесс",
+    re.I)
+
+
+def _revizor_task_wants_deploy(task_text):
+    """Дев-ТЗ находки ревизора требует деплоя/рестарта/taskkill/schtasks? Мандат: авто-задача
+    ограничена кодом+тестами+голденами — применение и рестарт делает авто-reconcile. Совпадение →
+    находку переводим в owner-карточку (осознанный рестарт прода — решение человека, не задача)."""
+    return bool(_REVIZOR_DEPLOY_RE.search(str(task_text or "")))
+
+
+def _revizor_demote_deploy_task(f):
+    """Находка action=task, чей task_text просит деплой/рестарт → owner-карточка (мандат: авто-задачи
+    не заказывают деплой/рестарт прода). Улику для карточки берём из evidence, а если пусто — из
+    самого task_text (чтобы владелец видел суть). task_text гасим (owner-карточка его не несёт)."""
+    g = dict(f)
+    g["action"] = "owner"
+    if not (str(g.get("evidence") or "").strip()):
+        g["evidence"] = str(f.get("task_text") or "").strip()[:_REVIZOR_EVIDENCE_MAX]
+    g["task_text"] = ""
+    return g
+
+
 def _revizor_enqueue_tasks(task_findings, items, now):
     """Находки action=task → зелёные родители дирижёру from=Filipp-pcloc-dec. Бюджет
     ≤REVIZOR_DAILY_BUDGET/сутки и дедуп ПО КЛАССУ — оба restart-proof из маркеров очереди (items).
@@ -3230,6 +3267,11 @@ def _revizor_enqueue_tasks(task_findings, items, now):
         tt = (f.get("task_text") or "").strip()
         if not tt:
             skip += 1
+            continue
+        if _revizor_task_wants_deploy(tt):              # страховка: деплой/рестарт-шаг НЕ ставим зелёной задачей
+            skip += 1
+            log.warning("ревизор: задача-находка класса '%s' содержит деплой/рестарт-слова в task_text — "
+                        "в очередь НЕ ставим (должна была стать owner-карточкой), окно %s", cls, f.get("client_id"))
             continue
         if cls and cls in seen_classes:
             skip += 1
@@ -3322,7 +3364,7 @@ def _revizor_route(packages, now=None):
     if not n:
         return {"windows": 0, "tasks": 0, "owner": 0, "noise": 0, "failed": 0}
     now = time.time() if now is None else now
-    task_f, owner_f, noise_n, failed = [], [], 0, 0
+    task_f, owner_f, noise_n, failed, demoted = [], [], 0, 0, 0
     for pkg in pkgs:
         findings = _revizor_consult(pkg)
         if findings is None:                    # думатель упал/не распарсился → fail-safe пропуск окна
@@ -3334,13 +3376,21 @@ def _revizor_route(packages, now=None):
             f["client_id"] = cid
             act = f.get("action")
             if act == "task":
-                task_f.append(f)
+                if _revizor_task_wants_deploy(f.get("task_text")):   # мандат: авто-задача деплой/рестарт не заказывает
+                    owner_f.append(_revizor_demote_deploy_task(f))   # → owner-карточка (осознанный рестарт — решение человека)
+                    demoted += 1
+                    log.info("ревизор: находка класса '%s' просит деплой/рестарт в task_text → "
+                             "owner-карточка (авто-задача деплой не заказывает), окно %s", f.get("class"), cid)
+                else:
+                    task_f.append(f)
             elif act == "owner":
                 owner_f.append(f)
             else:
                 noise_n += 1
     if noise_n:
         log.info("ревизор: %d находок класса noise (ложные срабатывания) — только лог", noise_n)
+    if demoted:
+        log.info("ревизор: %d находок с деплой/рестарт-шагами переведены из задач в owner-карточки", demoted)
     if not task_f and not owner_f:              # окна чисты (или только шум/сбой) → наружу тишина, NOTE в журнал
         if failed >= n:
             _cowork(f"ревизор: думатель не ответил ни по одному из {n} окон — прогон пропущен")
@@ -3351,7 +3401,8 @@ def _revizor_route(packages, now=None):
     items = _loc_fetch_items()                  # снимок очереди (все статусы) — бюджет/дедуп/поиск карточки
     if items is None:                           # частичная картина опаснее ожидания → откладываем, не флудим
         _cowork(f"ревизор: очередь недоступна — {len(task_f)} задач и {len(owner_f)} owner-находок отложены до след. прогона")
-        return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed, "deferred": True}
+        return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed,
+                "demoted": demoted, "deferred": True}
     enq = skip = 0
     if task_f:
         enq, skip = _revizor_enqueue_tasks(task_f, items, now)
@@ -3362,12 +3413,14 @@ def _revizor_route(packages, now=None):
         parts.append(f"{enq} задач дирижёру")
     if owner_f:
         parts.append(f"owner-карточка 1160 ({len(owner_f)} цитат)")
+    if demoted:
+        parts.append(f"{demoted} с деплой-шагом → owner (не задача)")
     if failed:
         parts.append(f"{failed} окон без ответа думателя")
     if not parts:                               # находки были, но все отсеяны бюджетом/дедупом
         parts.append(f"находки отсеяны (бюджет/дедуп): task {len(task_f)}, skip {skip}")
     _cowork("ревизор: " + ", ".join(parts))
-    return {"windows": n, "tasks": enq, "owner": len(owner_f), "noise": noise_n, "failed": failed}
+    return {"windows": n, "tasks": enq, "owner": len(owner_f), "noise": noise_n, "failed": failed, "demoted": demoted}
 
 
 # ------------------- OS-синглтон демона (разбор #128, часть 4) ----------------
