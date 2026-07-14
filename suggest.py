@@ -32,6 +32,7 @@ import tempfile
 import subprocess
 
 import pricing  # каркас получения точной цены из Календаря (Bridge); пусто → фолбэк
+import delivery  # резолвер зоны/цены доставки по maps-ссылке клиента (Bridge); пусто → [уточнить]
 
 log = logging.getLogger("suggest")
 
@@ -1527,13 +1528,26 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
     units_count = _units_count(newest, models)         # «пара/два юнита одной модели» → цена «за каждый»
     old_gen_q = _asks_old_gen(newest, recent)          # «а старый xmax есть?» → прежнее поколение по запросу
 
+    # Гео для ДОСТАВКИ (шаг 5/7 #12): первая maps-ссылка в репликах клиента (новейшая первой). Ловим
+    # ТОЛЬКО саму ссылку (упоминание «вилла/локация» без URL — не гео); питает резолвер доставки в
+    # build_pricing_note. Локация «липкая» — берём по всему диалогу, не только по booking-окну.
+    # Сканируем СЫРЫЕ строки клиента (не _client_messages: тот lowercase'ит — токен короткой goo.gl-
+    # ссылки регистрозависим, разворот редиректом сломался бы).
+    maps_link = None
+    for ln in reversed((transcript or "").split("\n")):
+        if ln.startswith("[клиент]:"):
+            ml = delivery.extract_maps_link(ln[len("[клиент]:"):])
+            if ml:
+                maps_link = ml
+                break
+
     return {"model": model, "models": models, "date_start": iso_start, "date_end": iso_end,
             "iso_start": iso_start, "iso_end": iso_end, "term_days": term_days,
             "hint_days": hint_days, "monthly": monthly, "has_dates": has_dates,
             "has_start": has_start,
             "deposit_multi_q": deposit_multi_q, "price_sheet_q": price_sheet_q,
             "sheet_filter": sheet_filter, "percent_q": percent_q, "units_count": units_count,
-            "old_gen_q": old_gen_q}
+            "old_gen_q": old_gen_q, "maps_link": maps_link}
 
 
 # ------------------- §243/6: трекер собранного по диалогу + reply-вложениям -------------------
@@ -2151,6 +2165,15 @@ _QUOTE_BLOCK_RE = re.compile(re.escape(_QUOTE_OPEN) + r"\n(.*?)\n" + re.escape(_
 # случайное слово «quote» в тексте её не триггерило.
 _QUOTE_MARKER_RE = re.compile(r"\[\s*QUOTE\s*\]", re.I)
 
+# Служебный блок ДОСТАВКИ (шаг 5/7 #12) — ТОТ ЖЕ транспорт, что <<<QUOTE>>>: цену доставки в финал
+# вставляет КОД (compose_delivery_draft), из промпта блок ВЫРЕЗАЕТСЯ — LLM цифру доставки НЕ
+# генерирует и НЕ правит. Отдельный блок (а НЕ внутри <<<QUOTE>>>), чтобы приклейка строки доставки
+# не задваивала строку ЦЕНЫ аренды (у неё своё денежное число — guard compose_quote_draft иначе
+# счёл бы весь quote-блок «недонесённым» и повторил бы цену аренды).
+_DELIVERY_OPEN, _DELIVERY_CLOSE = "<<<DELIVERY>>>", "<<<END_DELIVERY>>>"
+_DELIVERY_BLOCK_RE = re.compile(
+    re.escape(_DELIVERY_OPEN) + r"\n(.*?)\n" + re.escape(_DELIVERY_CLOSE), re.S)
+
 
 def _sheet_block_from_note(pricing_note):
     """Чистый прайс-блок из служебных скобок pricing_note → текст | None (не sheet-режим /
@@ -2214,6 +2237,62 @@ def compose_quote_draft(llm_text, block, lang="ru"):
         return t
     log.warning("QUOTE: LLM не привёл цену точечного quote — цена Bridge добавлена КОДОМ хвостом")
     return t + "\n\n" + b
+
+
+def _delivery_block_from_note(pricing_note):
+    """Клиентская строка ЦЕНЫ доставки из служебных скобок pricing_note → текст | None (не
+    delivery-режим). Питает compose_delivery_draft."""
+    m = _DELIVERY_BLOCK_RE.search(pricing_note or "")
+    return m.group(1) if m else None
+
+
+def compose_delivery_draft(llm_text, block, lang="ru"):
+    """Строку ДОСТАВКИ Bridge в финал доносит КОД (тот же класс, что compose_quote_draft): цену
+    доставки LLM не видит (блок вырезан из промпта make_system_prompt) → приклеиваем хвостом.
+    Если денежное число доставки ПОЧЕМУ-ТО уже в клиентском теле — не дублируем (guard как у quote)."""
+    t = (llm_text or "").strip()
+    b = (block or "").strip()
+    if not b:
+        return t
+    if not t:
+        return b
+    want = {f["value"] for f in extract_money_figures(b)}
+    have = {f["value"] for f in extract_money_figures(client_facing_text(t))}
+    if want and want <= have:                    # цена доставки уже у клиента — не дублируем
+        return t
+    return t + "\n\n" + b
+
+
+def _delivery_quote_line(text, lang="ru", _resolve=None):
+    """Клиентская строка ДОСТАВКИ по maps-ссылке клиента (несёт КОД, не LLM), либо None.
+    None → ссылки нет ИЛИ доставку не определили (uncertain/[уточнить]): остаётся текущий честный
+    путь — район уточнит менеджер, цифру НЕ выдумываем. Число даём ТОЛЬКО при zone/out_belt.
+    _resolve — инъекция для тестов (по умолчанию delivery.resolve_delivery_from_text; сеть/Bridge)."""
+    try:
+        res = (_resolve or delivery.resolve_delivery_from_text)(text)
+    except Exception as e:
+        log.info(f"_delivery_quote_line: резолв упал ({type(e).__name__}) — без строки доставки")
+        return None
+    if not isinstance(res, dict) or res.get("status") not in ("zone", "out_belt"):
+        return None
+    price = res.get("price")
+    if isinstance(price, bool) or not isinstance(price, (int, float)):
+        return None
+    n = int(price)
+    if lang == "en":
+        return f"Delivery — {n} ฿ (bike pickup at the end of the rental is free)."
+    return f"Доставка — {n} ฿ (забор байка в конце аренды — бесплатный)."
+
+
+def _delivery_note_block(hints, lang="ru"):
+    """Служебный <<<DELIVERY>>>-блок для pricing_note (тот же транспорт, что <<<QUOTE>>>), либо ''
+    если доставку не определили по maps-ссылке клиента. Ставится рядом с quote-блоком в
+    build_pricing_note; в промпт не попадает, в финал его вставит compose_delivery_draft (КОД)."""
+    text = hints.get("maps_link") if isinstance(hints, dict) else None
+    line = _delivery_quote_line(text, lang)
+    if not line:
+        return ""
+    return "\n" + _DELIVERY_OPEN + "\n" + line + "\n" + _DELIVERY_CLOSE
 
 
 def _wrap_price_sheet(body, ds, lang="ru", default_anchor=False) -> str:
@@ -2372,6 +2451,9 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
             base = f"{label} — {phrase}" if label else phrase.rstrip(".")
             qline = (base + ". " + _units_per_each_line(_uc, lang)) if units else (base + ".")
             note += "\n" + _QUOTE_OPEN + "\n" + qline + "\n" + _QUOTE_CLOSE
+            # ДОСТАВКА (шаг 5/7 #12): по maps-ссылке клиента считаем цену доставки КОДОМ и несём её
+            # тем же транспортом рядом с quote-блоком; нет ссылки/зон/Bridge → '' (честный [уточнить]).
+            note += _delivery_note_block(hints, lang)
         return note
 
     # (п.3) несколько продуктов (несколько моделей ИЛИ два поколения XMAX) — раздельная цена по
@@ -2394,6 +2476,8 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
     if units and ok_lines:
         block = "\n".join(ok_lines) + "\n" + _units_per_each_line(_uc, lang)
         note += "\n" + _QUOTE_OPEN + "\n" + block + "\n" + _QUOTE_CLOSE
+        # ДОСТАВКА (шаг 5/7 #12): та же врезка рядом с quote-блоком и в multi-юнит случае.
+        note += _delivery_note_block(hints, lang)
     return note
 
 
@@ -2531,6 +2615,10 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
     # из промпта его ВЫРЕЗАЕМ (сама цена уже есть в инструкции ЦЕНА выше — дубль LLM не нужен).
     if _QUOTE_BLOCK_RE.search(pn_prompt or ""):
         pn_prompt = _QUOTE_BLOCK_RE.sub("", pn_prompt).rstrip()
+    # Блок ДОСТАВКИ (шаг 5/7 #12) — служебный транспорт для compose_delivery_draft: из промпта его
+    # ВЫРЕЗАЕМ, чтобы LLM цену доставки не видел (не сгенерировал/не переписал); вставит её КОД.
+    if _DELIVERY_BLOCK_RE.search(pn_prompt or ""):
+        pn_prompt = _DELIVERY_BLOCK_RE.sub("", pn_prompt).rstrip()
     price_block = ("\n\n" + pn_prompt) if pn_prompt else ""
     # СТРАТЕГИЯ-директива менеджера: высший приоритет по СОДЕРЖАНИЮ/логике/тону ответа, НО
     # ценовую политику и критичные факты НЕ отменяет (они ниже — незыблемы).
@@ -3309,6 +3397,10 @@ def generate_draft(transcript: str, lang: str, faq: str,
     qblock = _quote_block_from_note(pricing_note)
     if qblock is not None:
         out = compose_quote_draft(out, qblock, lang)
+    # Цену доставки (если резолвер её посчитал) в финал доносит КОД тем же классом, что quote.
+    dblock = _delivery_block_from_note(pricing_note)
+    if dblock is not None:
+        out = compose_delivery_draft(out, dblock, lang)
     out = _append_collected_note(out, facts, lang)
     return _append_season_note(out, pricing_note)
 
@@ -3336,6 +3428,10 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     qblock = _quote_block_from_note(pricing_note)
     if qblock is not None:
         out = compose_quote_draft(out, qblock, lang)
+    # Тот же класс: strategy-перегенерация несёт цену доставки КОДОМ (не зависит от LLM).
+    dblock = _delivery_block_from_note(pricing_note)
+    if dblock is not None:
+        out = compose_delivery_draft(out, dblock, lang)
     out = _append_collected_note(out, facts, lang)
     return _append_season_note(out, pricing_note)
 

@@ -227,6 +227,42 @@ def resolve_maps_link(url, _expand=None):
     return None
 
 
+# URL любой ссылки в свободном тексте реплики клиента (из неё выдёргиваем maps-ссылку).
+_URL_IN_TEXT_RE = re.compile(r"https?://\S+", re.I)
+# Хвостовая пунктуация/кавычки, налипающие на URL в переписке — срезаем перед разбором.
+_URL_TRAILING = ").,;>»\"'«"
+
+
+def _looks_like_maps_url(u):
+    """URL — ссылка Google Maps? Короткая (maps.app.goo.gl/goo.gl/g.co) ИЛИ полный
+    google.*/maps / maps.google.* . Прочие ссылки (bit.ly, сайт виллы) — нет."""
+    if _is_short_maps_link(u):
+        return True
+    try:
+        host = urllib.parse.urlparse(u).netloc.lower().split("@")[-1].split(":")[0]
+        path = (urllib.parse.urlparse(u).path or "").lower()
+    except Exception:
+        return False
+    if host.startswith("maps.google."):
+        return True
+    if host == "google.com" or host.startswith("www.google.") or host.startswith("google.") or ".google." in host:
+        return "/maps" in path
+    return False
+
+
+def extract_maps_link(text):
+    """Первая ссылка Google Maps в свободном тексте (реплика клиента) → URL | None.
+    Ловим ТОЛЬКО саму ссылку (http(s)://…maps…): упоминание «вилла/локация» без URL — не гео.
+    Не роняет вызывающий код (не-строка/мусор → None)."""
+    if not isinstance(text, str):
+        return None
+    for m in _URL_IN_TEXT_RE.finditer(text):
+        u = m.group(0).rstrip(_URL_TRAILING)
+        if _looks_like_maps_url(u):
+            return u
+    return None
+
+
 # ===========================================================================
 # resolve_delivery — (lat, lon) точки + зоны из Bridge → зона/цена доставки | [уточнить]
 # ===========================================================================
@@ -361,3 +397,35 @@ def resolve_delivery(lat, lon, zones, cfg=None):
 
     # 3) далеко / вне Пхукета → честный фолбэк.
     return _uncertain(round(nearest_d, 3))
+
+
+# ===========================================================================
+# resolve_delivery_from_text — оркестратор пайплайна доставки от текста клиента
+# ===========================================================================
+#
+# Склеивает три ступени в один вход для конвейера черновика: свободный текст реплики клиента →
+# extract_maps_link → resolve_maps_link → get_delivery_zones(Bridge) → resolve_delivery.
+# Контракт для вызывающего кода (build_pricing_note):
+#   • в тексте НЕТ maps-ссылки            → None  (доставку НЕ трогаем: остаётся текущий честный
+#                                                   путь — район уточняет менеджер);
+#   • ссылка есть, но координаты/зоны/Bridge не дались → dict status=uncertain, marker=[уточнить]
+#                                                   (цену НЕ выдумываем);
+#   • координаты + зоны Bridge            → dict status=zone/out_belt с ценой доставки.
+# FAIL-SAFE: любое исключение внутри → None (конвейер просто не добавит строку доставки).
+
+
+def resolve_delivery_from_text(text, _get_zones=None, _resolve_maps=None, cfg=None):
+    """Текст клиента → результат resolve_delivery, либо None если maps-ссылки в тексте нет.
+    _get_zones/_resolve_maps/cfg — инъекция для тестов. НИКОГДА не роняет вызывающий код."""
+    try:
+        url = extract_maps_link(text)
+        if not url:
+            return None
+        coords = (_resolve_maps or resolve_maps_link)(url)
+        if not coords:                       # ссылка была, но координат нет → честный [уточнить]
+            return resolve_delivery(None, None, None, cfg=cfg)
+        zones = (_get_zones or get_delivery_zones)()
+        return resolve_delivery(coords[0], coords[1], zones, cfg=cfg)
+    except Exception as e:
+        log.info(f"resolve_delivery_from_text упал ({type(e).__name__}) — None")
+        return None

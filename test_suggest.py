@@ -3014,6 +3014,168 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         self.assertEqual(suggest.client_facing_text(out).count("3000"), 1)   # без дубля депозита
 
 
+class TestDeliveryCodeBlock(unittest.TestCase):
+    """#12 (шаг 5/7): цена ДОСТАВКИ по maps-ссылке клиента едет в финал КОДОМ — тем же транспортом,
+    что <<<QUOTE>>>. Резолвер (extract_maps_link→resolve_maps_link→zones→resolve_delivery) даёт
+    число ТОЛЬКО при zone/out_belt; нет ссылки/зон/Bridge → честный [уточнить] (строки нет).
+    LLM цифру доставки НЕ видит (блок вырезан из промпта) и НЕ генерирует."""
+
+    FLEET = ["NMAX 155CC BLACK PHUKET 4255"]
+
+    def setUp(self):
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN, suggest.delivery.resolve_delivery_from_text)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+
+    def tearDown(self):
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN, suggest.delivery.resolve_delivery_from_text) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+
+    def _stub_delivery(self, result):
+        # подменяем сетевой резолвер: при непустом тексте (есть maps_link) → заданный result.
+        suggest.delivery.resolve_delivery_from_text = lambda text, **kw: (result if text else None)
+
+    def _getter(self):
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET]}}
+            if suggest._bike_key("NMAX 155") not in suggest._bike_key(params.get("bike", "")):
+                return {"ok": False}
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            return {"ok": True, "data": {"day_price": 337, "total": 1685, "deposit": 3000,
+                    "available": True, "days": days, "cap_active": False, "cap_price": 0}}
+        return fake
+
+    def _hints(self, **extra):
+        h = {"has_dates": True, "iso_start": "2026-07-15", "iso_end": "2026-07-20",
+             "model": "NMAX 155", "hint_days": 5,
+             "maps_link": "https://www.google.com/maps?q=7.88,98.33"}
+        h.update(extra)
+        return h
+
+    def _note(self, **extra):
+        return suggest.build_pricing_note(self._hints(**extra), lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+
+    ZONE = {"status": "zone", "zone": "Раваи", "price": 815, "distance_km": 1.0, "marker": None}
+    UNCERTAIN = {"status": "uncertain", "zone": None, "price": None,
+                 "distance_km": None, "marker": "[уточнить]"}
+
+    # ------------------------------- helpers ---------------------------------
+
+    def test_delivery_line_zone_ru(self):
+        line = suggest._delivery_quote_line("x", "ru", _resolve=lambda t: self.ZONE)
+        self.assertIn("815", line)
+        self.assertIn("Доставка", line)
+
+    def test_delivery_line_zone_en(self):
+        line = suggest._delivery_quote_line("x", "en", _resolve=lambda t: self.ZONE)
+        self.assertIn("815", line)
+        self.assertIn("Delivery", line)
+
+    def test_delivery_line_out_belt(self):
+        r = {"status": "out_belt", "zone": None, "price": 1490, "distance_km": 8.0, "marker": None}
+        self.assertIn("1490", suggest._delivery_quote_line("x", "ru", _resolve=lambda t: r))
+
+    def test_delivery_line_uncertain_none(self):
+        # нет координат/зон/Bridge → [уточнить] → строки НЕ даём (цену не выдумываем)
+        self.assertIsNone(suggest._delivery_quote_line("x", "ru", _resolve=lambda t: self.UNCERTAIN))
+
+    def test_delivery_line_no_link_none(self):
+        self.assertIsNone(suggest._delivery_quote_line("x", "ru", _resolve=lambda t: None))
+
+    def test_delivery_line_resolver_raises_none(self):
+        def boom(t):
+            raise RuntimeError("bridge down")
+        self.assertIsNone(suggest._delivery_quote_line("x", "ru", _resolve=boom))
+
+    # ------------------------- build_pricing_note ----------------------------
+
+    def test_build_note_carries_delivery_block(self):
+        self._stub_delivery(self.ZONE)
+        note = self._note()
+        dblock = suggest._delivery_block_from_note(note)
+        self.assertIsNotNone(dblock)                         # блок доставки собран
+        self.assertIn("815", dblock)                         # цена зоны из резолвера
+        self.assertIsNotNone(suggest._quote_block_from_note(note))   # quote-блок аренды НЕ сломан
+        self.assertIn("1685", note)                          # цена аренды на месте
+
+    def test_build_note_uncertain_no_delivery_block(self):
+        self._stub_delivery(self.UNCERTAIN)
+        self.assertIsNone(suggest._delivery_block_from_note(self._note()))
+
+    def test_build_note_no_link_no_delivery_block(self):
+        self._stub_delivery(self.ZONE)
+        note = suggest.build_pricing_note(self._hints(maps_link=None), lang="ru",
+                                          getter=self._getter(), today=datetime.date(2026, 7, 11))
+        self.assertIsNone(suggest._delivery_block_from_note(note))
+
+    def test_units_carry_delivery_block(self):
+        self._stub_delivery(self.ZONE)
+        note = self._note(units_count=2)
+        self.assertIn("815", suggest._delivery_block_from_note(note) or "")
+
+    # ------------------------- prompt / compose ------------------------------
+
+    def test_prompt_strips_delivery_block(self):
+        # LLM цифру доставки НЕ видит: ни сырых скобок, ни самого числа 290 в system-промпте.
+        self._stub_delivery(self.ZONE)
+        sysp = suggest.make_system_prompt("FAQ", "ru", pricing_note=self._note())
+        self.assertNotIn("<<<DELIVERY>>>", sysp)
+        self.assertNotIn("<<<END_DELIVERY>>>", sysp)
+        self.assertNotIn("815", sysp)                        # цена доставки в промпт не утекла
+
+    def test_compose_delivery_appends_by_code(self):
+        block = "Доставка — 290 ฿ (забор байка в конце аренды — бесплатный)."
+        out = suggest.compose_delivery_draft("NMAX на 5 дней — 1685 ฿, депозит 3000 ฿.", block, "ru")
+        self.assertIn("290", out)
+        self.assertIn(block, out)
+
+    def test_compose_delivery_no_dup_when_present(self):
+        block = "Доставка — 290 ฿ (забор байка в конце аренды — бесплатный)."
+        carried = "NMAX — 1685 ฿. Доставка — 290 ฿ до вашей виллы. Бронируем?"
+        self.assertEqual(suggest.compose_delivery_draft(carried, block, "ru"), carried)
+
+    # ------------------------- end-to-end (regen) ----------------------------
+
+    def test_regen_carries_delivery_by_code(self):
+        # ЯДРО ШАГА: strategy-перегенерация — LLM цену доставки НЕ привёл, но 290 дошло КОДОМ, и
+        # цена аренды НЕ задвоилась (доставка своим блоком, не внутри quote).
+        self._stub_delivery(self.ZONE)
+        note = self._note()
+        seen = {}
+        def drop(system, user):
+            seen["system"] = system
+            return "NMAX на 5 дней — 1685 ฿, депозит 3000 ฿ (337 ฿/день). Бронируем?"
+        out = suggest.regenerate_draft(
+            "[клиент]: nmax на 5 дней с 15 июля, вот локация https://www.google.com/maps?q=7.88,98.33",
+            "ru", "FAQ", False, note, "дожимай", call_llm=drop)
+        self.assertIn("815", out)                            # доставка дошла КОДОМ
+        self.assertEqual(suggest.client_facing_text(out).count("1685"), 1)   # аренда НЕ задвоена
+        self.assertNotIn("815", seen["system"])              # LLM цену доставки не видел
+
+    # ---------------------- extract_booking_hints (гео) ----------------------
+
+    def test_hints_extracts_maps_link_realistic(self):
+        # реальная фраза клиента с локацией: ссылку кладём в maps_link (регистр токена сохранён)
+        tr = ("[клиент]: nmax на неделю с 15 июля\n"
+              "[клиент]: вот моя вилла, кину локацию https://maps.app.goo.gl/aZ9xQ2 спасибо")
+        h = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        self.assertEqual(h["maps_link"], "https://maps.app.goo.gl/aZ9xQ2")
+
+    def test_hints_no_link_when_only_mention(self):
+        # «локация/вилла» словами без ссылки → maps_link None (упоминание ≠ гео)
+        h = suggest.extract_booking_hints("[клиент]: моя вилла в Раваи, локация рядом с пляжем",
+                                          today=datetime.date(2026, 7, 11))
+        self.assertIsNone(h["maps_link"])
+
+
 class TestSheetSubselection(unittest.TestCase):
     """Подвыборки сетки («скутеры 200+», «мотоциклы до 400») — ДЕТЕРМИНИРОВАННЫЙ отбор КОДОМ из тех
     же rows, что и полная сетка (та же точка правды), БЕЗ LLM-отбора моделей. Класс-голден живого

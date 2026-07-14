@@ -339,5 +339,99 @@ class TestResolveDelivery(unittest.TestCase):
         self.assertEqual(r["price"], 1700)
 
 
+class TestExtractMapsLink(unittest.TestCase):
+    """Из СВОБОДНОГО текста реплики клиента вытащить именно maps-ссылку (не любой URL)."""
+
+    def test_full_google_maps_url(self):
+        t = "Вот моя вилла: https://www.google.com/maps?q=7.8804,98.3923 приезжайте"
+        self.assertEqual(delivery.extract_maps_link(t),
+                         "https://www.google.com/maps?q=7.8804,98.3923")
+
+    def test_short_maps_link(self):
+        t = "локация https://maps.app.goo.gl/AbCdEf123 спасибо"
+        self.assertEqual(delivery.extract_maps_link(t), "https://maps.app.goo.gl/AbCdEf123")
+
+    def test_short_link_case_preserved(self):
+        # токен короткой ссылки регистрозависим — extract НЕ должен его портить
+        t = "here https://maps.app.goo.gl/aZ9xQ2"
+        self.assertEqual(delivery.extract_maps_link(t), "https://maps.app.goo.gl/aZ9xQ2")
+
+    def test_maps_google_host(self):
+        self.assertEqual(delivery.extract_maps_link("https://maps.google.com/?q=7.88,98.39"),
+                         "https://maps.google.com/?q=7.88,98.39")
+
+    def test_trailing_punctuation_stripped(self):
+        t = "адрес (https://www.google.com/maps?q=7.88,98.39)."
+        self.assertEqual(delivery.extract_maps_link(t), "https://www.google.com/maps?q=7.88,98.39")
+
+    def test_non_maps_url_ignored(self):
+        self.assertIsNone(delivery.extract_maps_link("сайт виллы https://bit.ly/abc и всё"))
+        self.assertIsNone(delivery.extract_maps_link("https://example.com/villa"))
+
+    def test_mention_without_url_is_none(self):
+        # «вилла/локация» без ссылки — не гео
+        self.assertIsNone(delivery.extract_maps_link("моя вилла в Раваи, локация рядом с пляжем"))
+
+    def test_first_of_several(self):
+        t = ("https://example.com/x потом "
+             "https://maps.app.goo.gl/First далее https://maps.google.com/?q=1.1,2.2")
+        self.assertEqual(delivery.extract_maps_link(t), "https://maps.app.goo.gl/First")
+
+    def test_non_string_is_none(self):
+        self.assertIsNone(delivery.extract_maps_link(None))
+        self.assertIsNone(delivery.extract_maps_link(123))
+
+
+class TestResolveDeliveryFromText(unittest.TestCase):
+    """Оркестратор текст→доставка. Сеть/Bridge инъектируются: без ссылки → None; ссылка без
+    координат → [уточнить]; координаты+зоны → цена; исключение внутри → None (fail-safe)."""
+
+    ZONES = [{"name": "Раваи", "lat": 7.88, "lon": 98.33, "radius_km": 5, "price": 250}]
+
+    def test_no_link_returns_none(self):
+        # нет ссылки → None (доставку не трогаем — сеть/зоны НЕ дёргаем)
+        called = {"z": 0}
+        def zones():
+            called["z"] += 1
+            return self.ZONES
+        r = delivery.resolve_delivery_from_text("просто текст без ссылки", _get_zones=zones)
+        self.assertIsNone(r)
+        self.assertEqual(called["z"], 0)
+
+    def test_link_with_coords_and_zones_gives_price(self):
+        t = "локация https://www.google.com/maps?q=7.88,98.33"
+        r = delivery.resolve_delivery_from_text(t, _get_zones=lambda: self.ZONES)
+        self.assertEqual(r["status"], "zone")
+        self.assertEqual(r["zone"], "Раваи")
+        self.assertEqual(r["price"], 250)
+
+    def test_link_but_no_coords_is_uncertain(self):
+        # place-ссылка без координат → [уточнить], НЕ падение и НЕ выдуманная цена
+        t = "вот https://www.google.com/maps/place/Villa+Sunrise/"
+        r = delivery.resolve_delivery_from_text(t, _get_zones=lambda: self.ZONES)
+        self.assertEqual(r["status"], "uncertain")
+        self.assertEqual(r["marker"], "[уточнить]")
+
+    def test_coords_but_no_zones_is_uncertain(self):
+        # координаты есть, но Bridge зоны не отдал (None) → [уточнить]
+        t = "https://www.google.com/maps?q=7.88,98.33"
+        r = delivery.resolve_delivery_from_text(t, _get_zones=lambda: None)
+        self.assertEqual(r["status"], "uncertain")
+        self.assertEqual(r["marker"], "[уточнить]")
+
+    def test_short_link_expands_via_injected_resolver(self):
+        t = "loc https://maps.app.goo.gl/Xyz"
+        r = delivery.resolve_delivery_from_text(
+            t, _get_zones=lambda: self.ZONES, _resolve_maps=lambda u: (7.88, 98.33))
+        self.assertEqual(r["price"], 250)
+
+    def test_exception_inside_returns_none(self):
+        def boom():
+            raise RuntimeError("bridge down")
+        r = delivery.resolve_delivery_from_text(
+            "https://www.google.com/maps?q=7.88,98.33", _get_zones=boom)
+        self.assertIsNone(r)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
