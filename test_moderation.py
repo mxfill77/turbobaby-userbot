@@ -273,6 +273,152 @@ class TestDecisions(unittest.TestCase):
         self.assertEqual(d["directive"], "будь мягче")
 
 
+class TestEndToEndMax2stix(unittest.TestCase):
+    """СКВОЗНЫЕ голдены кейса @max2stix (#365 родитель4, шаг 5/6): весь strategy-путь
+    process_reply → regen → suggest.regenerate_draft(+guard_availability), а НЕ отдельные функции.
+    Правило-класс CLAUDE.md: дословная живая фраза клиента, не идеализация. Проверяем ПОВЕДЕНИЕ
+    сборки при «плохом» LLM (теряет цену): цена/депозит ЗА КАЖДЫЙ юнит доходят клиенту КОДОМ; в
+    финале нет «вернусь» (директива «сразу выдавай цены»), нет ГОДОВ поколений (только метка
+    New Gen), нет утверждений о дефиците. Клиенту НИЧЕГО не шлётся (мок-LLM, гард read-only)."""
+
+    # Живой парк @max2stix: 2 старых XMAX (дешевле, деп 5000) + 1 новый 2023+ (дороже, деп 7000).
+    FLEET_NAMES = ["XMAX 300CC GREY PHUKET 4246", "XMAX 300CC BLUE PHUKET 4247",
+                   "XMAX 300CC NEW 2023 PHUKET 7701"]
+    OLD = (790, 4700, 23700, 5000, True, 8900)     # старое поколение: тариф, депозит, кап
+    NEW = (939, 5600, 28170, 7000, True, 9900)     # новое поколение (2023+): дороже, деп 7000
+
+    def setUp(self):
+        self._wl = suggest.APPROVER_USERNAMES
+        suggest.APPROVER_USERNAMES = set()
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+
+    def tearDown(self):
+        suggest.APPROVER_USERNAMES = self._wl
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+
+    def _getter(self):
+        """Живой Bridge (мок): цена ПО ЮНИТУ (новый 2023+ дороже). text — ЧИСТАЯ ценовая строка БЕЗ
+        сырого имени юнита/года: поколение несёт МЕТКА (New Gen), а не год в клиентском теле."""
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET_NAMES]}}
+            bike = params.get("bike", "")
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            new = "2023" in bike or "NEW" in bike.upper()
+            d1, d7, d30, dep, ca, cp = self.NEW if new else self.OLD
+            total = {1: d1, 7: d7, 30: d30}.get(days, d1)
+            return {"ok": True, "data": {"day_price": round(total / max(days, 1)), "total": total,
+                    "deposit": dep, "available": True, "days": days, "cap_active": ca,
+                    "cap_price": cp, "text": f"{days} дн — {total} ฿"}}
+        return fake
+
+    _TODAY = datetime.date(2026, 7, 11)
+
+    def _pricing_note(self, phrase):
+        hints = suggest.extract_booking_hints(f"[клиент]: {phrase}", today=self._TODAY)
+        self.assertEqual(hints["units_count"], 2, phrase)     # детект «пара» юнитов одной модели
+        return suggest.build_pricing_note(hints, lang="ru", getter=self._getter(), today=self._TODAY)
+
+    def _regen_factory(self, note, seen_systems, llm_body):
+        """Продакшн-сборка strategy-перегенерации как единый regen(draft, faq, directive):
+        suggest.regenerate_draft (цена Bridge КОДОМ, пост-чек) → guard_availability (read-only гард
+        дефицита/наличия). llm_body(system, user) — «плохой» LLM, теряющий цену (её донесёт КОД)."""
+        def _llm_capture(system, user):
+            seen_systems.append(system)
+            return llm_body(system, user)
+
+        def regen(draft, faq, directive):
+            out = suggest.regenerate_draft(draft.get("transcript"), draft.get("lang", "ru"), faq,
+                                           draft.get("first_contact", False), note, directive,
+                                           call_llm=_llm_capture)
+            g = suggest.guard_availability(out, avail=self._getter()({"action": "quote_price",
+                                           "bike": "XMAX 300", "date_start": "2026-07-16",
+                                           "date_end": "2026-07-24"}), model="XMAX 300")
+            self.assertIn(g["source"], ("clean", "draft"), g)   # чистый черновик — гард не сфолбэчил
+            return g["text"]
+        return regen
+
+    def _assert_compliant(self, out, ctx=""):
+        low = suggest.client_facing_text(out).lower()
+        # (1) цена И депозит ЗА КАЖДЫЙ юнит доехали клиенту КОДОМ (LLM их потерял)
+        for num in ("790", "939", "5000", "7000"):
+            self.assertIn(num, out, f"{ctx}: нет цены/депозита {num} за каждый юнит:\n{out}")
+        self.assertIn("ЗА КАЖДЫЙ", out, f"{ctx}: пометка «за каждый» потеряна:\n{out}")
+        self.assertIn("New Gen", out, f"{ctx}: поколение помечено не New Gen:\n{out}")
+        # выдуманного общего итога за 2 шт. нет (код не суммирует — числа только из Bridge)
+        for made_up in ("1580", "1878", "10000", "14000"):
+            self.assertNotIn(made_up, out, f"{ctx}: выдуман итог {made_up}:\n{out}")
+        # (2) без «вернусь» — директива «сразу выдавай цены»
+        self.assertNotIn("вернус", low, f"{ctx}: обещание «вернусь» просочилось:\n{out}")
+        # (3) без ГОДОВ поколений — поколение только меткой New Gen
+        for yr in ("2020", "2021", "2022", "2023", "2024"):
+            self.assertNotIn(yr, out, f"{ctx}: год поколения {yr} утёк клиенту:\n{out}")
+        # (4) без утверждений о дефиците/срочности
+        for scar in ("последн", "успевай", "разбирают", "не упуст", "только сегодня", "спеши",
+                     "last one", "hurry"):
+            self.assertNotIn(scar, low, f"{ctx}: дефицит/срочность просочились ({scar!r}):\n{out}")
+
+    def test_pair_xmax_price_directive_end_to_end(self):
+        # ГОЛДЕН (1): «пару скутеров xmax 16-24 июля» + директива «сразу выдавай цены» → черновик с
+        # ценой ЗА КАЖДЫЙ, без «вернусь», без годов поколений, без дефицита. LLM теряет цену — её
+        # доносит КОД. Дословная фраза клиента + парафразы RU (правило-класс CLAUDE.md).
+        note = self._pricing_note("пару скутеров xmax 16-24 июля")
+        seen = []
+        # «плохой» LLM: следует директиве (сразу к ценам, без «вернусь»), но САМИ цифры теряет.
+        drop = lambda s, u: "Отличный выбор! Пара XMAX 300 на 16–24 июля — вот цены за каждый скутер:"
+        draft = {"id": 1, "transcript": "[клиент]: пару скутеров xmax 16-24 июля", "lang": "ru",
+                 "first_contact": False, "directive": "", "pricing_note": note,
+                 "draft": "старый черновик", "final_text": "старый черновик"}
+        d = moderation_core.process_reply(draft, "сразу выдавай цены", "d", "FAQ", test_mode=False,
+                                          call_llm=_llm("strategy"),
+                                          regen=self._regen_factory(note, seen, drop))
+        self.assertEqual(d["decision"], "confirm")
+        self._assert_compliant(d["final_text"], "e2e (1)")
+        # директива дошла до промпта, а инварианты (анти-«вернусь», дефицит, «за каждый») в системнике
+        self.assertIn("сразу выдавай цены", seen[0])
+        self.assertIn("вернусь с прайсом", seen[0])            # ANTI_LOOP: не обещай «вернусь»
+        self.assertIn("дефицит", seen[0].lower())              # AVAILABILITY_INVARIANT_RULE
+        self.assertIn("ЗА КАЖДЫЙ", seen[0])                    # инструкция N-юнитов в промпте
+
+    def test_pair_xmax_two_directives_both_hold_end_to_end(self):
+        # ГОЛДЕН (2): ДВЕ директивы окна подряд — держатся ОБЕ. Первая перегенерация видит d1, вторая —
+        # d1 И d2 (кумулятив окна), финал по-прежнему compliant (цена за каждый / без «вернусь» /
+        # без годов / без дефицита). Кейс: модератор уточняет стратегию в два приёма.
+        note = self._pricing_note("пару скутеров xmax 16-24 июля")
+        seen = []
+        drop = lambda s, u: "Отличный выбор! Пара XMAX 300 на 16–24 июля — держите цены за каждый:"
+        d1 = "сразу выдавай цены"
+        d2 = "поколения помечай как New Gen, годы не пиши"
+        draft = {"id": 1, "transcript": "[клиент]: пару скутеров xmax 16-24 июля", "lang": "ru",
+                 "first_contact": False, "directive": "", "pricing_note": note,
+                 "draft": "старый черновик", "final_text": "старый черновик"}
+        r1 = moderation_core.process_reply(draft, d1, "d", "FAQ", test_mode=False,
+                                           call_llm=_llm("strategy"),
+                                           regen=self._regen_factory(note, seen, drop))
+        draft["directive"] = r1["directive"]     # IPC-персист кумулятива обратно в окно (как _apply)
+        r2 = moderation_core.process_reply(draft, d2, "d", "FAQ", test_mode=False,
+                                           call_llm=_llm("strategy"),
+                                           regen=self._regen_factory(note, seen, drop))
+        # первая перегенерация — только d1; вторая — ОБЕ директивы окна в промпте
+        self.assertIn(d1, seen[0]); self.assertNotIn(d2, seen[0])
+        self.assertIn(d1, seen[1]); self.assertIn(d2, seen[1])
+        # кумулятив ушёл в решение → следующий цикл окна увидит обе
+        self.assertIn(d1, r2["directive"]); self.assertIn(d2, r2["directive"])
+        # финал второй перегенерации по-прежнему compliant
+        self._assert_compliant(r2["final_text"], "e2e (2)")
+
+
 class TestRememberRule(unittest.TestCase):
     """Фаза 2: кнопка «📌 Запомнить как правило» — approver-гейт, дистилляция, append, дедуп, fail-safe."""
 
