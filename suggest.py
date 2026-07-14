@@ -2639,25 +2639,13 @@ _PC_AVAIL_RE = re.compile(
     r"sold\s*out|not\s+available|unavailable|out\s+of\s+stock|already\s+booked|in\s+stock",
     re.I)
 
-# Цена клиенту — ТОЛЬКО дословно из белого источника (quote/сетка). Клеймим ИТОГ за период
-# «<N> бат за <M> дней/недель/месяц» (именно это врал бот 12.07: «9000 бат за 10 дней») — суточный
-# «449฿/день» из котировки НЕ трогаем (это не итог-за-период). Число сверяем с белым источником.
-_PC_CUR = r"(?:бат\w*|฿|baht|thb|тыс\w*|k\b)"
-_PC_PERIOD = r"за\s+\d{1,3}\s*(?:дн\w*|день|сут\w*|недел\w*|нед\b|мес\w*|month?s?|weeks?|days?)"
-_PC_PRICE_TOTAL_RE = re.compile(
-    r"(\d[\d\s.,]*\d|\d)\s*" + _PC_CUR + r"[^.\n]{0,40}?" + _PC_PERIOD +
-    r"|" + _PC_PERIOD + r"[^.\n]{0,40}?(\d[\d\s.,]*\d|\d)\s*" + _PC_CUR,
-    re.I)
-
-# Депозит с ЧИСЛОМ — тоже число цены, выводимое только из quote по модели+сроку (шаг 2/7 #253):
-# «депозит 3000 ฿», «залог 15000 бат», «deposit 7000 baht». Правило депозита БЕЗ числа («деньги
-# либо паспорт») не ловим — здесь обязателен денежный токен рядом с числом. Число сверяем с белым
-# источником; чужой депозит (карточка не той модели) отсекается. Проверяем ТОЛЬКО когда белый
-# источник непуст (есть live-quote) — иначе прежняя терпимость к депозиту-ориентиру (регресс цел).
-_PC_DEPOSIT_RE = re.compile(
-    r"(?:депозит\w*|залог\w*|deposit)\D{0,20}(\d[\d\s.,]*\d|\d)\s*" + _PC_CUR +
-    r"|(\d[\d\s.,]*\d|\d)\s*" + _PC_CUR + r"\D{0,20}(?:депозит\w*|залог\w*|deposit)",
-    re.I)
+# Цена/депозит клиенту — ТОЛЬКО дословно из белого источника (quote/сетка). Разбор денежных чисел
+# черновика (итог-за-период / суточная ставка / депозит) делаем ЕДИНОЙ функцией extract_money_figures
+# (ниже): она отделяет суточную ставку «449฿/день» (kind='rate', НЕ клеймим) от итога-за-срок
+# (kind='total') и депозита, распознаёт срок при любой формулировке («за/на/—/for N дней», «N дней:»).
+# Клеймление чисел вне белого источника — в _pc_classify. Прежний узкий _PC_PRICE_TOTAL_RE («за» без
+# «на»/«—»/«for») пропускал живой итог окна 504608015 «на 5 дней — 2 245 ฿» — заменён этим разбором
+# (#310: гард guard_quote_price свёрнут в пост-чек, точка правды разбора денег одна).
 
 # Разбиение на сегменты С СОХРАНЕНИЕМ разделителей (точный round-trip): границы предложений и
 # переводы строк. Тире «—» границей НЕ считаем — «светлого ADV 350 сейчас нет — есть чёрный»
@@ -2682,10 +2670,12 @@ def _pc_wl_price_numbers(pricing_note: str):
 # --- Разбор денежных чисел из ТЕКСТА ответа бота (шаг 2/5 родитель #310) --------------------
 # extract_money_figures: достаёт ВСЕ денежные числа ответа с грубой классификацией — суточная
 # ставка «฿/день» (rate), итог за период (total), депозит (deposit), прочая денежная сумма
-# (amount). Питает будущий гард сверки текста с котировкой: живой провал окна 504608015
-# «NMAX 155 на 5 дней — 2 245 ฿ (449 ฿/день)» → total=2245, rate=449; при этом «155» (модель)
-# и «5» (срок) деньгами НЕ считаются. Терпима к форматам «2 245 ฿», «449฿/день», «3000»,
-# «депозит 3000 бат», «1685 THB», «337 THB/day».
+# (amount). Единая точка правды разбора денег: питает пост-чек черновика (_pc_classify клеймит
+# total/deposit вне белого источника). Живой провал окна 504608015 «NMAX 155 на 5 дней — 2 245 ฿
+# (449 ฿/день)» → total=2245, rate=449; при этом «155» (модель) и «5» (срок) деньгами НЕ считаются.
+# Терпима к форматам «2 245 ฿», «449฿/день», «3000», «депозит 3000 бат», «1685 THB», «337 THB/day».
+# Каждый фиг несёт has_cur — был ли валютный токен рядом с числом (пост-чек клеймит total/deposit
+# только с валютой, отсекая счётчики вроде «на 5 дней для 2 гостей»).
 _MF_CUR = r"(?:฿|бат\w*|baht\w*|thb)"
 _MF_NUM = r"\d[\d\s .,]*\d|\d"
 _MF_SCAN_RE = re.compile(r"(?<![\d.,])(" + _MF_NUM + r")\s*(" + _MF_CUR + r")?", re.I)
@@ -2694,8 +2684,11 @@ _MF_SCAN_RE = re.compile(r"(?<![\d.,])(" + _MF_NUM + r")\s*(" + _MF_CUR + r")?",
 _MF_RATE_TAIL = re.compile(
     r"^\s*(?:/\s*|за\s+|в\s+|per\s+|a\s+)(?:฿|бат\w*|baht\w*|thb)?\s*(?:день|дн\w*|сут\w*|day)\b",
     re.I)
+# Период-фраза «N дней/недель/месяцев». Предлог за/на/for/в — НЕОБЯЗАТЕЛЕН: живые итоги-за-срок
+# пишут по-разному — «за 5 дней», «на 5 дней», «— 5 дней», «for 5 days», «5 дней:». Узкое «за»
+# пропускало живой провал окна 504608015 «на 5 дней — 2 245 ฿». Падежи покрыты дн\w*/недел\w*/мес\w*.
 _MF_PERIOD = re.compile(
-    r"(?:за|на|for)\s*\d{1,3}\s*(?:дн\w*|день|сут\w*|недел\w*|нед\b|мес\w*|months?|weeks?|days?)",
+    r"(?:за|на|for|в)?\s*\d{1,3}\s*(?:дн\w*|день|сут\w*|недел\w*|нед\b|мес\w*|months?|weeks?|days?)",
     re.I)
 _MF_DEPOSIT = re.compile(r"депозит|залог|deposit", re.I)
 _MF_TOTAL_KW = re.compile(r"итог\w*|всего|total|сумм\w*", re.I)
@@ -2740,7 +2733,7 @@ def extract_money_figures(text: str):
             kind = "total"
         else:
             kind = "amount"
-        out.append({"kind": kind, "value": value, "raw": m.group(0).strip()})
+        out.append({"kind": kind, "value": value, "raw": m.group(0).strip(), "has_cur": has_cur})
     return out
 
 
@@ -2798,19 +2791,20 @@ def _pc_classify(seg: str, allowed, call_llm=None, transcript=None):
         found.append(("color", model))
     if _PC_AVAIL_RE.search(low):
         found.append(("avail", model))
-    m = _PC_PRICE_TOTAL_RE.search(seg)
-    if m:
-        val = _pc_num(m.group(1) or m.group(2))
-        if val is not None and val not in allowed:
-            found.append(("price", str(val)))
-    # депозит с числом вне белого источника — только когда источник цен непуст (есть live-quote):
-    # тогда депозит обязан быть выводим из quote модели+срока; чужой/выдуманный депозит клеймим.
-    if allowed:
-        md = _PC_DEPOSIT_RE.search(seg)
-        if md:
-            val = _pc_num(md.group(1) or md.group(2))
-            if val is not None and val not in allowed:
-                found.append(("price", str(val)))
+    # Цена/депозит: разбор чисел делегируем extract_money_figures (единая точка правды разбора денег,
+    # #310 — сюда свёрнут гард guard_quote_price). Клеймим ИТОГ-за-период (kind='total') и ДЕПОЗИТ с
+    # валютным токеном, чьё число вне белого источника; суточную ставку («449฿/день» → kind='rate') и
+    # голые немонетарные числа НЕ трогаем. Итог ловится при любой формулировке срока («за/на/—/for N
+    # дней», «N дней:») — _MF_PERIOD распознаёт период без обязательного предлога. Валютный токен рядом
+    # обязателен (has_cur) — как в прежнем _PC_PRICE_TOTAL_RE: отсекает счётчики («на 5 дней для 2
+    # гостей»). Депозит сверяем ТОЛЬКО при непустом белом источнике (есть live-quote), как прежде.
+    for fig in extract_money_figures(seg):
+        if not fig.get("has_cur"):
+            continue
+        if fig["kind"] == "total" and fig["value"] not in allowed:
+            found.append(("price", str(fig["value"])))
+        elif fig["kind"] == "deposit" and allowed and fig["value"] not in allowed:
+            found.append(("price", str(fig["value"])))
     if found:
         return found
     if call_llm and _pc_maybe(low, model):
@@ -2912,131 +2906,6 @@ def client_facing_text(draft: str) -> str:
         return draft
     out = _SERVICE_NOTE_LINE_RE.sub("", draft)
     return re.sub(r"\n{3,}", "\n\n", out).strip()
-
-
-# ===================== ГАРД СВЕРКИ ЦЕНЫ ЧЕРНОВИКА С КОТИРОВКОЙ (#310, шаг 3/5) =====================
-# Пост-чек (postcheck_draft) клеймит числа-итоги ВНЕ белого источника, но белый источник — это ВЕСЬ
-# блок ЦЕНА (и суточная ставка 449, и итог 1685). Живой провал 504608015 «на 5 дней — 2 245 ฿» дошёл
-# до клиента: 2245 не в белом списке, но узкий _PC_PERIOD его не распознал (разведка guard-quote-price
-# §4). Этот гард — ДЕТЕРМИНИРОВАННАЯ сверка ПРЯМО с котировкой quote: extract_money_figures вынимает
-# rate/total/deposit из текста, каждое сверяется с числами quote для ТОЙ ЖЕ модели+дат. Расхождение →
-# ответ клиенту НЕ уходит: лог (окно/модель/даты/quote↔текст) + перегенерация с жёсткими числами из
-# quote; после N неудач — детерминированный фолбэк-шаблон строго из quote (числа LLM не касается).
-
-
-def quote_price_numbers(quote) -> set:
-    """Множество ЛЕГИТИМНЫХ денежных чисел котировки (истина): суточная ставка, итог за срок, депозит,
-    кап-цена низкого сезона. Всё, что клиенту называть МОЖНО. Не dict/пусто → пустое множество."""
-    if not isinstance(quote, dict):
-        return set()
-    nums = set()
-    for key in ("day_price", "total", "deposit", "cap_price"):
-        v = quote.get(key)
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            nums.add(int(v))
-    return nums
-
-
-def quote_price_mismatches(draft: str, quote) -> list:
-    """Числа rate/total/deposit из ТЕКСТА черновика, которых НЕТ среди чисел котировки (contradiction).
-    Пусто = текст согласован с quote (или сверять нечем: нет quote/нет чисел/нет денег в тексте).
-    'amount' (прочая сумма без явной ценовой роли) НЕ клеймим — сверяем ровно цену/ставку/депозит."""
-    allowed = quote_price_numbers(quote)
-    if not allowed:
-        return []                       # нечем сверять — гард молчит (fail-safe)
-    bad = []
-    for fig in extract_money_figures(draft or ""):
-        if fig["kind"] in ("rate", "total", "deposit") and fig["value"] not in allowed:
-            bad.append(fig)
-    return bad
-
-
-def _quote_hard_directive(quote, model=None, ds=None, de=None, lang="ru") -> str:
-    """Директива-верхнего-уровня для перегенерации: ЖЁСТКИЕ числа строго из quote, запрет считать
-    ставку×дни. Идёт в regenerate_draft(directive=…) — поверх исходного контекста."""
-    en = (lang == "en")
-    dp, total, dep = quote.get("day_price"), quote.get("total"), quote.get("deposit")
-    cap_active, cap_price = quote.get("cap_active"), quote.get("cap_price")
-    nums = []
-    if cap_active and cap_price is not None and total is not None and total > cap_price:
-        nums.append((f"аренда от {cap_price} ฿/мес (низкий сезон)" if not en
-                     else f"rental from {cap_price} ฿/mo (low season)"))
-    else:
-        if dp is not None:
-            nums.append((f"суточная ставка {dp} ฿/день" if not en else f"daily rate {dp} ฿/day"))
-        if total is not None:
-            nums.append((f"ИТОГО за весь срок {total} ฿ (НЕ умножай ставку на число дней)"
-                         if not en else
-                         f"TOTAL for the whole period {total} ฿ (do NOT multiply the daily rate by days)"))
-    if dep is not None:
-        nums.append((f"депозит {dep} ฿" if not en else f"deposit {dep} ฿"))
-    who = (f" для {model}" if model and not en else (f" for {model}" if model and en else ""))
-    head = (f"ЦЕНУ{who} бери ДОСЛОВНО из Календаря и НИКАК не пересчитывай: " if not en
-            else f"Take the PRICE{who} VERBATIM from the Calendar and do NOT recompute it: ")
-    tail = (". Никаких других денежных сумм в ответе не пиши." if not en
-            else ". Do not write any other money amounts in the reply.")
-    return head + "; ".join(nums) + tail
-
-
-def price_fallback_from_quote(quote, model=None, ds=None, de=None, lang="ru") -> str:
-    """Детерминированный фолбэк-ответ ТОЛЬКО из quote (числа собирает КОД через _client_price — точка
-    правды фразы цены, LLM не участвует). Префикс — модель+срок, если известны."""
-    phrase = _client_price(quote) if isinstance(quote, dict) else ""
-    if not phrase:
-        return ""
-    en = (lang == "en")
-    days = quote.get("days") if isinstance(quote, dict) else None
-    prefix = ""
-    if model and days:
-        prefix = (f"{model} на {days} дн.: " if not en else f"{model} for {days} days: ")
-    elif model:
-        prefix = f"{model}: "
-    return prefix + phrase
-
-
-def guard_quote_price(draft: str, quote, model=None, ds=None, de=None, lang="ru",
-                      regenerate=None, max_retries=2, window=None) -> dict:
-    """Гард ПЕРЕД ОТПРАВКОЙ ответа с ценой: сверяет числа текста с котировкой quote (та же модель+даты).
-    Согласовано → отдаём черновик как есть. Расхождение → лог + перегенерация с жёсткими числами из
-    quote (regenerate(directive)->str, до max_retries раз); после N неудач — фолбэк-шаблон строго из
-    quote. Возвращает dict(text, ok, source∈{draft,regen,fallback,unverified}, attempts, mismatches).
-    Нечем сверять (нет quote/нет чисел) → source='unverified', черновик БАЙТ-В-БАЙТ (fail-safe)."""
-    if not quote_price_numbers(quote):
-        return {"text": draft, "ok": True, "source": "unverified", "attempts": 0, "mismatches": []}
-
-    def _log_mismatch(stage, bad, text):
-        log.warning(
-            "guard_quote_price MISMATCH [%s] окно=%s модель=%s даты=%s..%s | quote=%s | текст=%s | draft=%r",
-            stage, window, model, ds, de, sorted(quote_price_numbers(quote)),
-            [{"kind": b["kind"], "value": b["value"]} for b in bad], (text or "")[:200])
-
-    bad = quote_price_mismatches(draft, quote)
-    if not bad:
-        return {"text": draft, "ok": True, "source": "draft", "attempts": 0, "mismatches": []}
-    _log_mismatch("initial", bad, draft)
-
-    directive = _quote_hard_directive(quote, model, ds, de, lang)
-    attempts, last_bad = 0, bad
-    if callable(regenerate):
-        for _ in range(max(0, int(max_retries))):
-            attempts += 1
-            try:
-                cand = regenerate(directive)
-            except Exception:
-                log.warning("guard_quote_price: перегенерация упала (окно=%s), попытка %s", window, attempts)
-                break
-            cand_bad = quote_price_mismatches(cand, quote)
-            if not cand_bad:
-                return {"text": cand, "ok": True, "source": "regen", "attempts": attempts,
-                        "mismatches": bad}
-            last_bad = cand_bad
-            _log_mismatch(f"regen#{attempts}", cand_bad, cand)
-
-    fb = price_fallback_from_quote(quote, model, ds, de, lang)
-    log.warning("guard_quote_price: после %s попыток → фолбэк-шаблон из quote (окно=%s): %r",
-                attempts, window, fb)
-    return {"text": fb, "ok": bool(fb), "source": "fallback", "attempts": attempts,
-            "mismatches": last_bad}
 
 
 def generate_draft(transcript: str, lang: str, faq: str,

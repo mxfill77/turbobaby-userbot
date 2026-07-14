@@ -1730,6 +1730,49 @@ class TestDraftPostcheck(unittest.TestCase):
         text = "ADV 350 готов вам помочь с выбором."
         self.assertEqual(suggest.postcheck_draft(text, "ru", pricing_note="", call_llm=judge), text)
 
+    # --- ГОЛДЕН: дыра пост-чека чисел закрыта (#310) — итог-за-период с ЛЮБЫМ предлогом клеймится ---
+    # Живой провал окна 504608015 (аудит 13:22): черновик писал «на 5 дней — 2 245 ฿» (наивное 449×5)
+    # при quote-итоге 1685 ฿. Узкий _PC_PERIOD ловил только «за N дней» → «на 5 дней» проскакивал мимо
+    # пост-чека. Разбор денег свёрнут в extract_money_figures (точка правды одна), период ловится при
+    # любой формулировке. Голдены — ДОСЛОВНАЯ живая фраза (правило-класс CLAUDE.md) + парафразы RU/EN.
+    PN_504608015 = "ЦЕНА из Календаря: NMAX 155 — 337 ฿/день, за 5 дней 1685 ฿, депозит 3000 ฿."
+
+    def test_golden_window_504608015_na_period_blocked(self):
+        # ДОСЛОВНАЯ живая фраза провала: предлог «на», а НЕ «за» — раньше проскакивала
+        draft = "NMAX 155 на 5 дней — 2 245 ฿ (449 ฿/день)"
+        out = suggest.postcheck_draft(draft, "ru", pricing_note=self.PN_504608015)
+        self.assertNotEqual(out, draft)                              # черновик переписан
+        client = self._client_part(out)
+        self.assertNotIn("2245", client.replace(" ", ""))           # наивный итог клиенту НЕ уходит
+        self.assertNotIn("449", client)                             # весь сегмент → «уточню», без чисел
+        self.assertIn("уточню у команды", out.lower())
+        self.assertIn("[уточнить: цена 2245]", out)                 # пометка модератору
+
+    def test_golden_window_legit_total_1685_kept(self):
+        # тот же срок «на 5 дней», но ИСТИННЫЙ итог 1685 из quote → НЕ трогаем (негатив, регресс)
+        draft = "NMAX 155 на 5 дней — 1 685 ฿ (337 ฿/день)."
+        self.assertEqual(suggest.postcheck_draft(draft, "ru", pricing_note=self.PN_504608015), draft)
+
+    def test_period_total_paraphrases_blocked(self):
+        # парафразы того же провала: «—» без предлога, «N дней:», обратный порядок, EN «for … days»,
+        # падежи (суток) — ВСЕ формулировки итога-за-срок обязаны клеймиться пост-чеком
+        for draft in ("Итого 2 245 ฿ за 5 дней.",
+                      "На 5 дней получится 2 245 бат.",
+                      "— 5 дней — 2 245 ฿.",
+                      "5 дней: 2 245 ฿.",
+                      "NMAX 155 for 5 days — 2 245 THB",
+                      "За период выйдет 2245฿ за 5 суток."):
+            out = suggest.postcheck_draft(draft, "ru", pricing_note=self.PN_504608015)
+            self.assertNotEqual(out, draft, draft)                  # переписан
+            self.assertNotIn("2245", self._client_part(out).replace(" ", ""), draft)
+            self.assertIn("уточню у команды", out.lower(), draft)
+
+    def test_daily_rate_not_flagged_after_widening(self):
+        # РЕГРЕСС фикса дыры: суточная ставка «449 ฿/день» рядом с «на 7 дней» — НЕ итог-за-период,
+        # пост-чек не клеймит её даже теперь, когда «на N дней» распознаётся
+        text = "NMAX на 7 дней — 449 ฿/день, депозит 3000 ฿."
+        self.assertEqual(suggest.postcheck_draft(text, "ru", pricing_note=""), text)
+
 
 class TestExtractMoneyFigures(unittest.TestCase):
     """extract_money_figures (шаг 2/5 #310): разбор денежных чисел из ТЕКСТА ответа бота с
@@ -1823,149 +1866,6 @@ class TestExtractMoneyFigures(unittest.TestCase):
         self.assertEqual([f["value"] for f in figs], [2245, 449])   # порядок появления
         self.assertEqual(figs[0]["value"], 2245)
         self.assertTrue(figs[0]["raw"].startswith("2"))             # raw — исходный токен
-
-
-class TestGuardQuotePrice(unittest.TestCase):
-    """guard_quote_price (#310, шаг 3/5): гард ПЕРЕД отправкой ответа с ценой — сверка чисел текста
-    с котировкой quote (та же модель+даты) через extract_money_figures; расхождение → перегенерация с
-    жёсткими числами из quote, после N неудач → фолбэк-шаблон строго из quote. Голдены — ДОСЛОВНЫЙ живой
-    провал окна 504608015 (правило-класс CLAUDE.md) + парафразы RU/EN."""
-
-    # Котировка NMAX 155 на 5 дней (истина): суточная 449, ИТОГ за срок 1685 (дисконт), депозит 3000.
-    Q = {"day_price": 449, "total": 1685, "deposit": 3000, "available": True, "days": 5}
-
-    def test_numbers_and_membership(self):
-        self.assertEqual(suggest.quote_price_numbers(self.Q), {449, 1685, 3000})
-        self.assertEqual(suggest.quote_price_numbers(None), set())
-        self.assertEqual(suggest.quote_price_numbers({}), set())
-
-    def test_clean_draft_passes(self):
-        # текст согласован с quote (449/1685/3000) → отдаём как есть, source='draft'
-        ok = "NMAX 155 на 5 дней — 1 685 ฿ (449 ฿/день); депозит 3000 ฿."
-        r = suggest.guard_quote_price(ok, self.Q, model="NMAX 155", ds="2026-07-20", de="2026-07-25")
-        self.assertEqual(r["source"], "draft")
-        self.assertTrue(r["ok"])
-        self.assertEqual(r["text"], ok)
-        self.assertEqual(r["mismatches"], [])
-
-    def test_golden_window_504608015_mismatch(self):
-        # ДОСЛОВНЫЙ живой провал: итог 2 245 (наивное 449×5) НЕТ в quote → расхождение по total
-        bad = "NMAX 155 на 5 дней — 2 245 ฿ (449 ฿/день)"
-        miss = suggest.quote_price_mismatches(bad, self.Q)
-        self.assertTrue(any(m["value"] == 2245 and m["kind"] == "total" for m in miss))
-        self.assertFalse(any(m["value"] == 449 for m in miss))   # ставка 449 легитимна
-
-    def test_mismatch_paraphrases_ru_en(self):
-        # парафразы того же провала: «—» без «за», EN «for … days» — все ловятся сверкой с quote
-        for bad in ("Итого 2245 ฿ за 5 дней.",
-                    "На 5 дней получится 2 245 бат.",
-                    "NMAX 155 for 5 days — 2 245 THB",
-                    "Total 2245 THB for the period."):
-            self.assertTrue(suggest.quote_price_mismatches(bad, self.Q), bad)
-
-    def test_deposit_mismatch(self):
-        # депозит из текста (5000) не совпал с quote (3000) → расхождение
-        miss = suggest.quote_price_mismatches("Депозит 5000 ฿.", self.Q)
-        self.assertTrue(any(m["value"] == 5000 and m["kind"] == "deposit" for m in miss))
-
-    def test_regenerate_fixes(self):
-        # расхождение → перегенерация с жёсткими числами → чистый текст, source='regen'
-        bad = "NMAX 155 на 5 дней — 2 245 ฿ (449 ฿/день)"
-        good = "NMAX 155 на 5 дней — 1 685 ฿ (449 ฿/день), депозит 3000 ฿."
-        calls = []
-
-        def regen(directive):
-            calls.append(directive)
-            return good
-        r = suggest.guard_quote_price(bad, self.Q, model="NMAX 155", regenerate=regen, max_retries=2)
-        self.assertEqual(r["source"], "regen")
-        self.assertEqual(r["attempts"], 1)
-        self.assertEqual(r["text"], good)
-        self.assertIn("1685", calls[0].replace(" ", ""))    # директива несёт жёсткий итог из quote
-
-    def test_fallback_after_n_failures(self):
-        # перегенерация всё время врёт → после N попыток фолбэк-шаблон СТРОГО из quote
-        bad = "NMAX 155 на 5 дней — 2 245 ฿"
-        attempts = {"n": 0}
-
-        def regen(directive):
-            attempts["n"] += 1
-            return "Итого 2 245 ฿ за 5 дней."    # LLM упорно ошибается (наивный итог)
-        r = suggest.guard_quote_price(bad, self.Q, model="NMAX 155", regenerate=regen, max_retries=2)
-        self.assertEqual(r["source"], "fallback")
-        self.assertEqual(r["attempts"], 2)
-        self.assertEqual(attempts["n"], 2)
-        # фолбэк собран из quote: несёт легитимные 1685/449/3000 и НЕ несёт наивный 2245
-        vals = {f["value"] for f in suggest.extract_money_figures(r["text"])}
-        self.assertIn(1685, vals)
-        self.assertNotIn(2245, vals)
-
-    def test_no_regenerate_goes_to_fallback(self):
-        # расхождение без regenerate-колбэка → сразу фолбэк из quote
-        r = suggest.guard_quote_price("2 245 ฿ за 5 дней", self.Q, model="NMAX 155", max_retries=0)
-        self.assertEqual(r["source"], "fallback")
-        self.assertNotIn(2245, {f["value"] for f in suggest.extract_money_figures(r["text"])})
-
-    def test_unverified_when_no_quote(self):
-        # нечем сверять (нет чисел quote) → черновик БАЙТ-В-БАЙТ, source='unverified'
-        draft = "NMAX 155 — 9 999 ฿"
-        r = suggest.guard_quote_price(draft, None)
-        self.assertEqual(r["source"], "unverified")
-        self.assertEqual(r["text"], draft)
-        r2 = suggest.guard_quote_price(draft, {"available": True})
-        self.assertEqual(r2["source"], "unverified")
-
-    def test_no_money_in_draft_passes(self):
-        # в черновике нет денег → сверять нечего, отдаём как есть
-        draft = "Здравствуйте! NMAX 155 отлично подойдёт, свободен на ваши даты."
-        r = suggest.guard_quote_price(draft, self.Q, model="NMAX 155")
-        self.assertEqual(r["source"], "draft")
-        self.assertEqual(r["text"], draft)
-
-    def test_fallback_template_from_quote(self):
-        # price_fallback_from_quote — сборка КОДОМ из _client_price (точка правды), с префиксом модель+срок
-        fb = suggest.price_fallback_from_quote(self.Q, model="NMAX 155")
-        self.assertIn("NMAX 155", fb)
-        self.assertIn("1685", fb.replace(" ", ""))
-        self.assertIn("449", fb)
-
-    def test_cap_directive_uses_cap_price(self):
-        # кап низкого сезона (total>cap_price) → директива на месячную кап-цену, не суточную сборку
-        qcap = {"day_price": 300, "total": 9000, "deposit": 5000, "cap_active": True, "cap_price": 8500}
-        d = suggest._quote_hard_directive(qcap, model="NMAX 155")
-        self.assertIn("8500", d)
-        self.assertIn("низкий сезон", d)
-
-    def test_window_504608015_end_to_end_337(self):
-        # ШАГ 4/5 (родитель #310): ДОСЛОВНАЯ репродукция провала окна 504608015 с ИСТИННЫМИ числами.
-        # Котировка NMAX 155 на 5–10 июля (5 дней): суточная 337, ИТОГ за срок 1685 (дисконт),
-        # депозит 3000. Бот прислал наивный итог 2 245 ฿ (449 ฿/день = 337 тут ни при чём — 449×5).
-        # Гард ОБЯЗАН заблокировать и без regenerate выдать ответ строго из quote: 1685/337/3000.
-        q = {"day_price": 337, "total": 1685, "deposit": 3000, "available": True, "days": 5}
-        self.assertEqual(suggest.quote_price_numbers(q), {337, 1685, 3000})
-
-        bad = "NMAX 155 на 5 дней — 2 245 ฿ (449 ฿/день), депозит 3 000 ฿."
-        # 2245 (итог) и 449 (ставка) — вне quote → расхождение; депозит 3000 легитимен
-        miss = suggest.quote_price_mismatches(bad, q)
-        self.assertTrue(any(m["value"] == 2245 and m["kind"] == "total" for m in miss))
-        self.assertTrue(any(m["value"] == 449 and m["kind"] == "rate" for m in miss))
-        self.assertFalse(any(m["value"] == 3000 for m in miss))
-
-        # без regenerate-колбэка → сразу детерминированный фолбэк строго из quote
-        r = suggest.guard_quote_price(bad, q, model="NMAX 155",
-                                      ds="2026-07-05", de="2026-07-10", window=504608015)
-        self.assertNotEqual(r["source"], "draft")   # черновик НЕ ушёл клиенту
-        self.assertEqual(r["source"], "fallback")
-        self.assertTrue(r["ok"])
-        # ответ несёт истинные 1685/337/3000 и НЕ несёт наивные 2245/449
-        vals = {f["value"] for f in suggest.extract_money_figures(r["text"])}
-        self.assertIn(1685, vals)
-        self.assertIn(337, vals)
-        self.assertIn(3000, vals)
-        self.assertNotIn(2245, vals)
-        self.assertNotIn(449, vals)
-        # фолбэк сам согласован с quote (проходит повторную сверку начисто)
-        self.assertEqual(suggest.quote_price_mismatches(r["text"], q), [])
 
 
 class TestPriceSheet(unittest.TestCase):
