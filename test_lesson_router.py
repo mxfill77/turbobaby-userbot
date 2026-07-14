@@ -326,5 +326,76 @@ class TestLessonCardAndAckMaterial(unittest.TestCase):
         self.assertEqual("90210", dec["card_msg_id"])
 
 
+class TestDefaultRouteDestinations(unittest.TestCase):
+    """Родитель 306, шаг 3/6: связать 4 класса классификатора с ИМЕНОВАННЫМИ В СПЕКЕ адресатами
+    через РЕАЛЬНЫЕ дефолты модуля — не только инъектированные фейки. Разрыв «тест ≠ реальность»
+    (как в #306 шаг 2/6 про message_id): юниты классификатора проверяли КОНСТАНТУ маршрута, а
+    handle-тесты подставляли фейк-sink'и, но НИКТО не проверял, что ДЕФОЛТНЫЙ sink каждого класса
+    бьёт в свой адресат спеки: СТИЛЬ→playbook поверх STYLE_GUIDE, НАДЗОР→docs/revizor_checklist.md,
+    ФАКТ→код/критфакты/FAQ+тест, НЕЯСНОЕ→владельцу 1160. Тихий репойнт дефолта прошёл бы мимо тестов.
+    Прод-доки/1160 не трогаем: STYLE-sink подменяем спаем, остальное — через константы/материал."""
+
+    def test_style_default_sink_is_playbook_over_style_guide(self):
+        # СТИЛЬ-дефолт РЕАЛЬНО пишет в playbook «Выученные правила» (слой ПОВЕРХ STYLE_GUIDE
+        # клиентского бота), а не куда попало. Прод-playbook не трогаем — спай вместо боевого append.
+        import suggest
+        seen = {}
+        orig = suggest.append_playbook_rule
+        suggest.append_playbook_rule = lambda rule, now=None: (seen.__setitem__("rule", rule), "added")[1]
+        self.addCleanup(lambda: setattr(suggest, "append_playbook_rule", orig))
+        self.assertTrue(str(suggest.STYLE_GUIDE).strip())          # адресат-база стиля существует
+        self.assertEqual("added", lr._default_append_style("звучит слишком сухо, пиши теплее"))
+        self.assertEqual("звучит слишком сухо, пиши теплее", seen["rule"])  # правило ушло в playbook
+
+    def test_supervision_default_path_is_revizor_checklist(self):
+        # НАДЗОР-дефолт целится в docs/revizor_checklist.md (живой чек-лист ревизора) — путь из спеки.
+        self.assertEqual(os.path.join("docs", "revizor_checklist.md"), lr._REVIZOR_REL)
+        self.assertTrue(lr.REVIZOR_CHECKLIST.replace("\\", "/").endswith("docs/revizor_checklist.md"))
+        # и handle БЕЗ инъекции чек-листа сообщает ИМЕННО этот tracked-путь к коммиту (адресат надзора)
+        dec = lr.handle_lesson_task(self._sup_task(), append_checklist=lambda r: "duplicate")
+        self.assertEqual(lr.SUPERVISION, dec["route"])
+        # duplicate → коммитить нечего, но «куда записан» всё равно указывает на чек-лист ревизора
+        self.assertIn("чек-лист", dec["ack_where"])
+
+    def _sup_task(self):
+        return ("[урок:урок от @filipp] родитель 306 — замечание менеджера\n"
+                "окно диалога: Маша (777) (client_id=777) · черновик #12\n"
+                "карточка модер-группы: msg=90310\n"
+                "Замечание: ревизор должен ловить выдуманную цену, которой нет в quote\n"
+                "Исходный черновик: Есть Aerox за 900฿")
+
+    def test_unclear_default_owner_channel_undelivered_in_standalone(self):
+        # Дефолт-канал владельца (1160) в standalone ОТСУТСТВУЕТ → недоставлено (демон инъектит боевой
+        # _notify_critical → инбокс 1160). Проверяем, что дефолт честно возвращает False, а не «ок».
+        self.assertFalse(lr._default_notify_owner("любая карточка-уточнение"))
+
+    def test_four_class_where_map_matches_spec_destinations(self):
+        # Единая карта «применённый класс → куда записан» отражает адресатов спеки шага 3 дословно:
+        self.assertIn("STYLE_GUIDE", lr._ROUTE_WHERE[lr.STYLE])          # СТИЛЬ → поверх STYLE_GUIDE
+        self.assertIn("чек-лист", lr._ROUTE_WHERE[lr.SUPERVISION])        # НАДЗОР → чек-лист ревизора
+        self.assertIn("FAQ", lr._ROUTE_WHERE[lr.FACT])                    # ФАКТ → код/критфакты/FAQ+тест
+        self.assertNotIn(lr.UNCLEAR, lr._ROUTE_WHERE)                     # НЕЯСНОЕ → не в правило/код, а владельцу
+
+
+class TestClassifyLiveRemarks(unittest.TestCase):
+    """Golden-правило CLAUDE.md: классификатор обязан верно разводить ДОСЛОВНЫЕ реплики учителя из
+    живого цикла (fixtures/lesson_cycle_292.json), а не только идеализированные парафразы. Берём
+    remark ровно как в фикстуре (после снятия триггера правка:/урок:/не так:) → тот же класс, что
+    ждёт цикл. Это анти-разрыв «тест ≠ реальность» на входе классификатора (а не только в handle)."""
+
+    def _route(self, remark):
+        return lr.classify_lesson_remark(remark)[0]
+
+    def test_live_fixture_remarks_route_as_expected(self):
+        # (замечание из живого окна, ожидаемый класс) — дословно из lesson_cycle_292.json
+        for remark, want in (
+            ("суточный тариф на Nmax 1500, а не 1200 — цена неверная", lr.FACT),
+            ("ревизор должен ловить выдуманную цену, которой нет в quote", lr.SUPERVISION),
+            ("звучит слишком сухо и по-канцелярски, пиши теплее и по-человечески", lr.STYLE),
+            ("плохо, переделай", lr.UNCLEAR),
+        ):
+            self.assertEqual(want, self._route(remark), remark)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
