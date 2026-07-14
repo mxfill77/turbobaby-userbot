@@ -15,6 +15,7 @@ Bridge недоступен / ошибка / таймаут / не-ok → get_de
 import os
 import re
 import json
+import math
 import time
 import logging
 import urllib.request
@@ -224,3 +225,139 @@ def resolve_maps_link(url, _expand=None):
             return _parse_coords_from_url(final)
     # 3) place-ссылка без координат / битая ссылка → None
     return None
+
+
+# ===========================================================================
+# resolve_delivery — (lat, lon) точки + зоны из Bridge → зона/цена доставки | [уточнить]
+# ===========================================================================
+#
+# Чистая функция (без сети, без I/O, детерминирована). Логика:
+#   1) haversine-дистанция от точки до якоря каждой зоны;
+#   2) ближайший якорь, чья дистанция ≤ его радиус_км → цена ЭТОЙ зоны
+#      (на границе двух зон побеждает БЛИЖАЙШИЙ якорь — не «первый в списке»);
+#   3) иначе если есть якорь с дистанцией ≤ радиус_км + OUT_BELT_KM (5 км) →
+#      периферийный пояс: OUT_BELT_PRICE (1490);
+#   4) иначе (далеко / вне Пхукета / нет валидных якорей / битая точка) → маркер [уточнить].
+#
+# FAIL-SAFE (не ослаблять): любая неоднозначность — нет координат, зона без якоря/радиуса,
+# зона в радиусе но без цены, вообще нет валидных зон — уводит в «[уточнить]», а НЕ в
+# случайную цену. Лучше переспросить, чем назвать неверную стоимость доставки.
+
+# Ширина периферийного пояса за границей зоны (км) и цена доставки в нём.
+OUT_BELT_KM = float(os.getenv("DELIVERY_OUT_BELT_KM", "5") or "5")
+OUT_BELT_PRICE = int(os.getenv("DELIVERY_OUT_BELT_PRICE", "1490") or "1490")
+# Маркер честного фолбэка — то же слово, что и по всему контуру доставки.
+DELIVERY_MARKER = "[уточнить]"
+
+_EARTH_R_KM = 6371.0088
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """Дистанция по большому кругу между двумя гео-точками, км."""
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * _EARTH_R_KM * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _zone_anchor(z):
+    """Якорь зоны (lat, lon) в допустимых диапазонах, либо None. Терпим к схеме:
+    плоские lat/lon(lng), вложенный anchor/center-словарь, либо пара-список coords."""
+    if not isinstance(z, dict):
+        return None
+    lat = z.get("lat", z.get("latitude"))
+    lon = z.get("lon", z.get("lng", z.get("longitude")))
+    if lat is None or lon is None:
+        for key in ("anchor", "center", "coords", "point"):
+            sub = z.get(key)
+            if isinstance(sub, dict):
+                lat = sub.get("lat", sub.get("latitude"))
+                lon = sub.get("lon", sub.get("lng", sub.get("longitude")))
+                break
+            if isinstance(sub, (list, tuple)) and len(sub) == 2:
+                lat, lon = sub[0], sub[1]
+                break
+    return _valid_latlon(lat, lon)
+
+
+def _zone_radius_km(z):
+    """Радиус зоны в км (float > 0), либо None при отсутствии/мусоре."""
+    if not isinstance(z, dict):
+        return None
+    r = z.get("radius_km", z.get("radius", z.get("r_km")))
+    try:
+        r = float(r)
+    except (TypeError, ValueError):
+        return None
+    return r if r > 0 else None
+
+
+def _zone_price(z):
+    """Цена доставки зоны (число), либо None при отсутствии/мусоре."""
+    if not isinstance(z, dict):
+        return None
+    p = z.get("price", z.get("price_thb", z.get("cost")))
+    if isinstance(p, bool):  # bool — подкласс int, но не цена
+        return None
+    return p if isinstance(p, (int, float)) else None
+
+
+def resolve_delivery(lat, lon, zones, cfg=None):
+    """Точка доставки (lat, lon) + список зон Bridge → результат зоны/цены доставки.
+
+    Возвращает dict:
+      {"status": "zone",     "zone": <имя>, "price": <цена зоны>, "distance_km": <d>, "marker": None}
+      {"status": "out_belt", "zone": None,  "price": OUT_BELT_PRICE, "distance_km": <d>, "marker": None}
+      {"status": "uncertain","zone": None,  "price": None, "distance_km": <d|None>, "marker": "[уточнить]"}
+
+    cfg — необязательный dict-оверрайд: out_belt_km, out_belt_price, marker.
+    Чистая: без сети/I/O, детерминирована. Fail-safe: любая неоднозначность → uncertain."""
+    cfg = cfg or {}
+    out_belt_km = float(cfg.get("out_belt_km", OUT_BELT_KM))
+    out_belt_price = cfg.get("out_belt_price", OUT_BELT_PRICE)
+    marker = cfg.get("marker", DELIVERY_MARKER)
+
+    def _uncertain(dist=None):
+        return {"status": "uncertain", "zone": None, "price": None,
+                "distance_km": dist, "marker": marker}
+
+    pt = _valid_latlon(lat, lon)
+    if pt is None:                       # нет/битая координата → честный фолбэк
+        return _uncertain()
+    if not isinstance(zones, (list, tuple)) or not zones:
+        return _uncertain()              # зон нет (Bridge недоступен) → фолбэк
+
+    plat, plon = pt
+    # Собираем валидные якоря: (дистанция, радиус, цена, имя). Битые зоны молча пропускаем.
+    anchors = []
+    for z in zones:
+        a = _zone_anchor(z)
+        r = _zone_radius_km(z)
+        if a is None or r is None:
+            continue
+        d = _haversine_km(plat, plon, a[0], a[1])
+        anchors.append((d, r, _zone_price(z), (z.get("name") if isinstance(z, dict) else None)))
+    if not anchors:
+        return _uncertain()              # ни одного валидного якоря → фолбэк
+
+    anchors.sort(key=lambda t: t[0])     # по возрастанию дистанции — ближайший первым
+    nearest_d = anchors[0][0]
+
+    # 1) ближайший якорь, покрывающий точку своим радиусом → цена его зоны.
+    for d, r, price, name in anchors:    # уже отсортированы: первый покрывающий = ближайший
+        if d <= r:
+            if price is None:            # покрыт, но цена зоны неизвестна → fail-safe
+                return _uncertain(round(d, 3))
+            return {"status": "zone", "zone": name, "price": price,
+                    "distance_km": round(d, 3), "marker": None}
+
+    # 2) периферийный пояс: любой якорь в пределах радиус + OUT_BELT_KM.
+    for d, r, _price, _name in anchors:
+        if d <= r + out_belt_km:
+            return {"status": "out_belt", "zone": None, "price": out_belt_price,
+                    "distance_km": round(d, 3), "marker": None}
+
+    # 3) далеко / вне Пхукета → честный фолбэк.
+    return _uncertain(round(nearest_d, 3))

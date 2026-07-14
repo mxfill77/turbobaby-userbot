@@ -237,5 +237,107 @@ class TestResolveMapsLink(unittest.TestCase):
         self.assertEqual(calls["n"], 0)
 
 
+class TestResolveDelivery(unittest.TestCase):
+    """Чистый резолвер зоны/цены доставки по (lat, lon). Без сети — зоны передаются прямо.
+    Инварианты: покрытие радиусом → цена зоны; на границе двух зон побеждает БЛИЖАЙШИЙ якорь;
+    за границей в поясе OUT_BELT_KM → 1490; далеко/битая точка/нет зон → маркер [уточнить]."""
+
+    # Два якоря на одной широте (7.88), разнесены по долготе примерно на ~5.5 км.
+    # На lon≈98.39 расстояние: до A(98.36)≈3.3 км, до B(98.42)≈2.2 км — B ближе.
+    ZONES = [
+        {"name": "ЗонаA", "lat": 7.88, "lon": 98.36, "radius_km": 6, "price": 300},
+        {"name": "ЗонаB", "lat": 7.88, "lon": 98.42, "radius_km": 6, "price": 500},
+    ]
+
+    def test_inside_single_zone(self):
+        # точка прямо на якоре ЗонаB → её цена
+        r = delivery.resolve_delivery(7.88, 98.42, self.ZONES)
+        self.assertEqual(r["status"], "zone")
+        self.assertEqual(r["zone"], "ЗонаB")
+        self.assertEqual(r["price"], 500)
+        self.assertIsNone(r["marker"])
+
+    def test_border_nearest_anchor_wins(self):
+        # КЛЮЧЕВОЙ: точка в перекрытии обеих зон (обе покрывают радиусом 6 км), но ближе к B
+        # (до A≈4.4 км, до B≈2.2 км). Победитель — ближайший якорь (B, 500), а НЕ первый
+        # в списке (A, 300).
+        r = delivery.resolve_delivery(7.88, 98.40, self.ZONES)
+        self.assertEqual(r["status"], "zone")
+        self.assertEqual(r["zone"], "ЗонаB")
+        self.assertEqual(r["price"], 500)
+        # и если поменять порядок зон — результат тот же (побеждает близость, не позиция)
+        r2 = delivery.resolve_delivery(7.88, 98.40, list(reversed(self.ZONES)))
+        self.assertEqual(r2["zone"], "ЗонаB")
+        self.assertEqual(r2["price"], 500)
+
+    def test_border_nearest_to_A(self):
+        # симметрия: точка ближе к A → цена A
+        r = delivery.resolve_delivery(7.88, 98.37, self.ZONES)
+        self.assertEqual(r["zone"], "ЗонаA")
+        self.assertEqual(r["price"], 300)
+
+    def test_out_belt_price(self):
+        # маленький радиус: точка вне радиуса, но в пределах радиус+OUT_BELT_KM → 1490
+        zones = [{"name": "Z", "lat": 7.88, "lon": 98.39, "radius_km": 1, "price": 300}]
+        # ~3 км восточнее якоря: вне радиуса 1, но внутри 1+5
+        r = delivery.resolve_delivery(7.88, 98.415, zones)
+        self.assertEqual(r["status"], "out_belt")
+        self.assertEqual(r["price"], delivery.OUT_BELT_PRICE)
+        self.assertEqual(r["price"], 1490)
+
+    def test_far_returns_marker(self):
+        # далеко за поясом (другой конец света) → [уточнить]
+        r = delivery.resolve_delivery(55.75, 37.62, self.ZONES)  # Москва
+        self.assertEqual(r["status"], "uncertain")
+        self.assertIsNone(r["price"])
+        self.assertEqual(r["marker"], "[уточнить]")
+
+    def test_no_zones_marker(self):
+        for z in (None, [], ()):
+            r = delivery.resolve_delivery(7.88, 98.39, z)
+            self.assertEqual(r["status"], "uncertain")
+            self.assertEqual(r["marker"], "[уточнить]")
+
+    def test_bad_point_marker(self):
+        # битые/вне диапазона координаты → [уточнить], НЕ падение
+        for lat, lon in ((None, 98.39), (7.88, None), (200, 300), ("x", "y")):
+            r = delivery.resolve_delivery(lat, lon, self.ZONES)
+            self.assertEqual(r["status"], "uncertain")
+            self.assertEqual(r["marker"], "[уточнить]")
+
+    def test_zone_without_anchor_skipped(self):
+        # зона без якоря/радиуса молча пропускается, валидная — работает
+        zones = [
+            {"name": "Битая", "price": 999},                       # нет lat/lon/radius
+            {"name": "OK", "lat": 7.88, "lon": 98.39, "radius_km": 5, "price": 250},
+        ]
+        r = delivery.resolve_delivery(7.88, 98.39, zones)
+        self.assertEqual(r["zone"], "OK")
+        self.assertEqual(r["price"], 250)
+
+    def test_covered_zone_without_price_is_marker(self):
+        # покрыт радиусом, но у зоны нет цены → fail-safe [уточнить] (не выдумываем цену)
+        zones = [{"name": "БезЦены", "lat": 7.88, "lon": 98.39, "radius_km": 5}]
+        r = delivery.resolve_delivery(7.88, 98.39, zones)
+        self.assertEqual(r["status"], "uncertain")
+        self.assertEqual(r["marker"], "[уточнить]")
+
+    def test_nested_anchor_shape(self):
+        # вложенный anchor-словарь и alias lng — тоже понимаем
+        zones = [{"name": "Nested", "anchor": {"lat": 7.88, "lng": 98.39},
+                  "radius_km": 5, "price": 200}]
+        r = delivery.resolve_delivery(7.88, 98.39, zones)
+        self.assertEqual(r["zone"], "Nested")
+        self.assertEqual(r["price"], 200)
+
+    def test_cfg_override(self):
+        # cfg перекрывает пояс и цену/маркер
+        zones = [{"name": "Z", "lat": 7.88, "lon": 98.39, "radius_km": 1, "price": 300}]
+        r = delivery.resolve_delivery(7.88, 98.415, zones,
+                                      cfg={"out_belt_price": 1700})
+        self.assertEqual(r["status"], "out_belt")
+        self.assertEqual(r["price"], 1700)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
