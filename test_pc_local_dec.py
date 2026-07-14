@@ -595,5 +595,132 @@ class TestFlagOffAndIsolation(LocBase):
         self.assertIn("Сводка декомпозиции", row["result"])
 
 
+# ---- (Ж) вотчдог застрявшей МЕЖДУ ШАГАМИ цепи: потерянный релиз → reconcile-досдвиг ----
+# Инцидент 15.07 (cowork_log 00:35): цепь 365 стоит на 3/7 с 23:06 — последний шаг done, следующий
+# НЕ релизнут, 0 in_progress; штатный тик релизит СОБЫТИЙНО, а событие потеряно → цепь висит навсегда,
+# stuck-single (in_progress) слеп. Вотчдог process_stuck_chains досдвигает reconcile'ом ИЗ ОЧЕРЕДИ.
+
+class TestChainWatchdogStuck(LocBase):
+    def _wd_cards(self):
+        return [t for (_pid, t) in self.chain_cards if str(t).startswith("🩺")]
+
+    def test_lost_release_watchdog_continues_chain_summary_not_duplicated(self):
+        # ГОЛДЕН: шаг done + ПОТЕРЯННЫЙ релиз следующего → вотчдог продолжает цепь; финал-сводка ×1.
+        pid = self.plan_parent("1. первый\n2. второй\n3. третий")
+        self.exec_step("done", "первый готов")
+        o.process_local_chains()                                   # штатно релизит шаг 2
+        sid2 = self.exec_step("done", "второй готов")              # шаг 2 done
+        # РЕЛИЗ ШАГА 3 ПОТЕРЯН: штатный тик НЕ отработал (событие пропало / демон уснул в consult).
+        self.assertFalse(self.fb.chain_news(), "шаг 3 не релизнут — цепь застряла между шагами")
+        # свежий done → вотчдог ещё молчит (не гонка со штатным тиком)
+        o.process_stuck_chains()
+        self.assertFalse(self.fb.chain_news(), "done свежий → вотчдог ждёт PC_CHAIN_STALE")
+        self.assertEqual(self._wd_cards(), [])
+        # шаг 2 висит done дольше порога → вотчдог досдвигает шаг 3 из плана очереди
+        self.fb.rows[sid2]["updated"] = now_iso(ago_sec=o.PC_CHAIN_STALE + 60)
+        o.process_stuck_chains()
+        news = self.fb.chain_news()
+        self.assertEqual(len(news), 1)
+        self.assertTrue(news[0]["task_text"].startswith(f"[шаг 3/3 родитель {pid}]"))
+        self.assertIn("третий", news[0]["task_text"])
+        self.assertEqual(news[0]["lane"], "pc")
+        self.assertEqual(self.thinker_calls, 0, "вотчдог думателя-самопочинки НЕ зовёт")
+        self.assertTrue(self._wd_cards() and f"#{pid}" in self._wd_cards()[0], "🩺-карточка владельцу")
+        # цепь снова движется → вотчдог её больше не трогает (шаг 3 open)
+        n_rows = len(self.fb.rows)
+        o.process_stuck_chains()
+        self.assertEqual(len(self.fb.rows), n_rows, "открытый шаг → вотчдог молчит (нет дублей)")
+        # шаг 3 исполнен → штатный финал → сводка ×1
+        self.exec_step("done", "третий готов")
+        o.process_local_chains()
+        sums = self.fb.summaries(pid)
+        self.assertEqual(len(sums), 1)
+        self.assertIn("3/3 шагов done", sums[0]["result"])
+        # ФИНАЛ-СВОДКА НЕ ДУБЛИРУЕТСЯ: лишние проходы вотчдога/тика/рестарт кэшей — сводка остаётся ×1
+        o.process_stuck_chains()
+        o.process_local_chains()
+        o._loc_summarized.clear()
+        o.process_stuck_chains()
+        self.assertEqual(len(self.fb.summaries(pid)), 1)
+        self.assertFalse(self.fb.chain_news(), "цепь закрыта — новых шагов вотчдог не плодит")
+
+    def test_watchdog_ignores_failed_last_step(self):
+        # последний шаг failed — епархия _loc_after_fail (halt/самопочинка), НЕ вотчдога
+        pid = self.plan_parent()
+        sid = self.exec_step("failed", "провал шага")
+        self.fb.rows[sid]["updated"] = now_iso(ago_sec=o.PC_CHAIN_STALE + 60)
+        n_rows = len(self.fb.rows)
+        o.process_stuck_chains()
+        self.assertEqual(len(self.fb.rows), n_rows, "failed вотчдог не досдвигает и не плодит")
+        self.assertFalse(self.fb.summaries(pid))
+        self.assertEqual((self.thinker_calls, self.adapt_calls), (0, 0))
+        self.assertEqual(self._wd_cards(), [])
+
+    def test_watchdog_ignores_open_step(self):
+        # есть открытый шаг (цепь движется) → вотчдог молчит даже при протухшем updated
+        pid = self.plan_parent()
+        sid = self.fb.chain_news()[0]["id"]
+        self.fb.rows[sid]["updated"] = now_iso(ago_sec=o.PC_CHAIN_STALE + 60)
+        n_rows = len(self.fb.rows)
+        o.process_stuck_chains()
+        self.assertEqual(len(self.fb.rows), n_rows)
+        self.assertFalse(self.fb.summaries(pid))
+        self.assertEqual(self._wd_cards(), [])
+
+    def test_watchdog_no_release_when_plan_exhausted(self):
+        # последний шаг плана done+протух, сводки нет → вотчдог НЕ релизит и НЕ делает сводку
+        # (финал — работа штатного тика; вотчдог только досдвигает ОСТАВШИЕСЯ шаги)
+        pid = self.plan_parent("1. первый\n2. второй")
+        self.exec_step("done", "первый готов")
+        o.process_local_chains()                                   # релиз шага 2
+        sid2 = self.exec_step("done", "второй готов")              # последний шаг done
+        self.fb.rows[sid2]["updated"] = now_iso(ago_sec=o.PC_CHAIN_STALE + 60)
+        n_rows = len(self.fb.rows)
+        o.process_stuck_chains()
+        self.assertEqual(len(self.fb.rows), n_rows, "план исчерпан → вотчдог не трогает (сводка — тик)")
+        self.assertFalse(self.fb.summaries(pid))
+        self.assertEqual(self._wd_cards(), [])
+        # а штатный тик закрывает цепь сводкой как обычно
+        o.process_local_chains()
+        self.assertEqual(len(self.fb.summaries(pid)), 1)
+
+    def test_watchdog_flag_off_does_not_read_queue(self):
+        os.environ["PC_LOCAL_DEC"] = "0"
+        tid = self.fb.enqueue_task(o.PC_LOCAL_DEC_FROM, "[шаг 1/2 родитель 9] кусок")["id"]
+        self.fb.rows[tid]["status"] = "done"
+        self.fb.rows[tid]["updated"] = now_iso(ago_sec=o.PC_CHAIN_STALE + 60)
+        self.fb.calls = 0
+        n_rows = len(self.fb.rows)
+        o.process_stuck_chains()
+        self.assertEqual(self.fb.calls, 0, "флаг off → вотчдог очередь даже не читает")
+        self.assertEqual(len(self.fb.rows), n_rows)
+
+    def test_watchdog_ignores_vps_theatre_chain(self):
+        # цепь VPS-театра (from=Filipp-pc-dec) на той же полосе: вотчдог её НЕ группирует
+        tid = self.fb.enqueue_task("Filipp-pc-dec", "[шаг 1/3 родитель 55] кусок")["id"]
+        self.fb.rows[tid]["status"] = "done"
+        self.fb.rows[tid]["updated"] = now_iso(ago_sec=o.PC_CHAIN_STALE + 60)
+        n_rows = len(self.fb.rows)
+        o.process_stuck_chains()
+        self.assertEqual(len(self.fb.rows), n_rows, "чужой театр вотчдог не досдвигает")
+        self.assertEqual(self._wd_cards(), [])
+
+    def test_watchdog_restart_proof_no_double_release(self):
+        # рестарт демона (кэши пусты) между досдвигом и персистом: повторный reconcile не плодит дубль
+        pid = self.plan_parent("1. первый\n2. второй\n3. третий")
+        self.exec_step("done", "первый готов")
+        o.process_local_chains()
+        sid2 = self.exec_step("done", "второй готов")
+        self.fb.rows[sid2]["updated"] = now_iso(ago_sec=o.PC_CHAIN_STALE + 60)
+        o.process_stuck_chains()                                   # досдвиг шага 3
+        self.assertEqual(len(self.fb.chain_news()), 1)
+        o._loc_summarized.clear()
+        o._loc_adapted.clear()
+        n_rows = len(self.fb.rows)
+        o.process_stuck_chains()                                   # «после рестарта» — шаг 3 уже open
+        self.assertEqual(len(self.fb.rows), n_rows, "открытый шаг 3 → повторного релиза нет")
+        self.assertEqual(len(self.fb.chain_news()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
