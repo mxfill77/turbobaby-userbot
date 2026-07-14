@@ -148,6 +148,97 @@ class TestLessonFullCycle(unittest.TestCase):
             self.assertEqual(exp["commit_paths"], dec2.get("commit_paths"))
 
 
+class TestLessonLiveReplay(unittest.TestCase):
+    """Родитель 306, шаг 4/6 — ИТОГ задачи-урока: закоммиченный диф + голден-тест дословно из ЭТОГО
+    черновика + ЖИВОЙ РЕПЛЕЙ окна, где новый черновик УЧИТЫВАЕТ правку.
+
+    Гейт подтверждения обещает учителю «применится со следующего ответа» (build_lesson_ack). До сих
+    пор весь цикл проверял диф+ack, но НИКТО не проверял само это обещание: что применённый артефакт
+    (playbook / чек-лист ревизора) РЕАЛЬНО возвращается в промпт СЛЕДУЮЩЕЙ генерации того же окна.
+    Тихий обрыв инъекции (playbook перестали подмешивать в make_system_prompt; преамбула ревизора
+    перестала читать чек-лист) превратил бы «применится со следующего ответа» в ЛОЖЬ, а старые тесты
+    остались бы зелёными — классический разрыв «тест ≠ реальность» (правило CLAUDE.md).
+
+    Замыкаем петлю на ДОСЛОВНОЙ формулировке из живого окна: применяем урок РЕАЛЬНЫМ sink'ом во
+    ВРЕМЕННЫЙ артефакт (боевые manager-bot/docs и чек-лист не трогаем) и пересобираем промпт
+    следующей генерации — выученное правило обязано быть в нём дословно, а в ПРОМПТЕ ДО применения
+    его нет (замыкание именно на диф, не тавтология). LLM/Bridge не зовём: доказываем не текст ответа,
+    а что правка ДОЛЕТАЕТ до промпта, который его породит, — сильнейшая детерминированная гарантия
+    обещанного «со следующего ответа»."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fx = _load_fixture()
+
+    def setUp(self):
+        self._save = (suggest.INTAKE_APPROVERS, suggest.APPROVER_USERNAMES)
+        suggest.INTAKE_APPROVERS = set(self.fx["teachers"])
+        suggest.APPROVER_USERNAMES = set()
+
+    def tearDown(self):
+        suggest.INTAKE_APPROVERS, suggest.APPROVER_USERNAMES = self._save
+
+    def _cycle(self, sink):
+        for sc in self.fx["cycles"]:
+            if sc.get("replay", {}).get("sink") == sink:
+                return sc
+        self.fail(f"в фикстуре нет цикла с replay.sink={sink}")
+
+    def _live_remark(self, sc):
+        """Дословное замечание, как его получит sink дирижёра: реальный submit_lesson → задача →
+        parse_lesson_task (та же цепочка, что в боевом цикле; триггер правка:/урок:/не так: снят)."""
+        calls = []
+        fake = lambda text, frm: (calls.append((text, frm)) or (True, 4242, None))
+        mc.submit_lesson(sc["card"], sc["reply_text"], sc["teacher"], enqueue=fake)
+        self.assertEqual(1, len(calls))
+        return lr.parse_lesson_task(calls[0][0])["remark"]
+
+    def test_style_learned_rule_reaches_next_system_prompt(self):
+        # СТИЛЬ: playbook → следующая генерация того же окна подмешивает КНИГУ ПРАВИЛ в системный промпт.
+        sc = self._cycle("playbook")
+        rep = sc["replay"]
+        remark = self._live_remark(sc)
+        fd, pb_path = tempfile.mkstemp(suffix=".md", text=True)
+        os.close(fd)
+        with open(pb_path, "w", encoding="utf-8") as f:
+            f.write(rep["seed"])
+        self.addCleanup(lambda: os.path.exists(pb_path) and os.remove(pb_path))
+        orig = suggest.PLAYBOOK_FILE
+        suggest.PLAYBOOK_FILE = pb_path                        # боевой manager-bot/docs/playbook.md не трогаем
+        self.addCleanup(lambda: setattr(suggest, "PLAYBOOK_FILE", orig))
+
+        self.assertEqual("added", suggest.append_playbook_rule(remark))   # диф урока применён (реальный sink)
+        # ЖИВОЙ РЕПЛЕЙ окна: пересобираем системный промпт СЛЕДУЮЩЕГО ответа (продолжение диалога)
+        prompt = suggest.make_system_prompt(faq="", lang="ru", is_first_contact=False,
+                                            playbook=suggest.load_playbook())
+        for frag in rep["next_gen_has"]:
+            self.assertIn(frag, prompt, frag)                 # выученное правило долетело до промпта ДОСЛОВНО
+        # анти-тавтология: до применения урока (playbook пуст) правила в промпте НЕТ — замыкание на диф
+        base = suggest.make_system_prompt(faq="", lang="ru", is_first_contact=False, playbook="")
+        self.assertNotIn(rep["absent_before"], base)
+
+    def test_supervision_learned_class_reaches_next_revizor_preamble(self):
+        # НАДЗОР: чек-лист → преамбула СЛЕДУЮЩЕГО тика ревизора (собирается пер-вызов, читает файл).
+        import pc_orchestrator as o
+        sc = self._cycle("checklist")
+        rep = sc["replay"]
+        remark = self._live_remark(sc)
+        fd, ck_path = tempfile.mkstemp(suffix=".md", text=True)
+        os.close(fd)
+        with open(ck_path, "w", encoding="utf-8") as f:
+            f.write(sc["checklist_seed"])
+        self.addCleanup(lambda: os.path.exists(ck_path) and os.remove(ck_path))
+
+        self.assertEqual("added", lr.append_checklist_class(remark, ck_path))  # диф урока применён (реальный sink)
+        # ЖИВОЙ РЕПЛЕЙ: преамбула ревизора пересобирается на КАЖДОМ прогоне из живого чек-листа
+        preamble = o._revizor_preamble(ck_path)
+        for frag in rep["next_gen_has"]:
+            self.assertIn(frag, preamble, frag)               # новый класс попал в следующий прогон дословно
+        # анти-тавтология: встроенный дефолт (файла нет) выученного класса НЕ содержит
+        base = o._revizor_preamble(os.path.join(tempfile.gettempdir(), "no_such_checklist_zzz.md"))
+        self.assertNotIn(rep["absent_before"], base)
+
+
 class TestLessonCycleGuards(unittest.TestCase):
     """Гейт входа в цикл (guards[]): триггер обучения, права INTAKE_APPROVERS, не-урок мимо."""
 
