@@ -2409,6 +2409,14 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
             self.assertNotIn("1878", note, phrase)               # 2×939 не выдумано
             self.assertNotIn("10000", note, phrase)              # 2×5000 (депозит) не выдумано
             self.assertNotIn("14000", note, phrase)              # 2×7000 (депозит) не выдумано
+            # #365 родитель4 шаг3/6: живые цены поколений едут в служебный quote-блок → strategy-путь
+            # донесёт их КОДОМ; пометка «за каждый» и в блоке, итог за 2 шт. по-прежнему не выдуман.
+            block = suggest._quote_block_from_note(note)
+            self.assertIsNotNone(block, phrase)
+            self.assertIn("790", block, phrase)                  # старое поколение — своя цена
+            self.assertIn("939", block, phrase)                  # новое поколение — своя цена
+            self.assertIn("ЗА КАЖДЫЙ", block, phrase)            # цена/депозит за каждый юнит
+            self.assertNotIn("1580", block, phrase)              # итог за 2 шт. не выдуман и в блоке
 
     def test_units_count_detect_real_phrases(self):
         # Правило-класс CLAUDE.md: детект на РЕАЛЬНОЙ фразе клиента + парафразы RU/EN + негативы.
@@ -2751,11 +2759,21 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         self.assertIn("ЦЕНА из Календаря", sysp)             # цена всё же в промпте (в инструкции)
         self.assertIn("1685", sysp)
 
-    def test_units_and_percent_skip_block(self):
-        # N-юнитов «за каждый» и процент — единой клиентской строки ЦЕНЫ нет → блок НЕ собираем.
+    def test_units_carry_block_per_each(self):
+        # #365 родитель4 шаг3/6: N юнитов одной модели → quote-блок несём ТОЖЕ, но цена/депозит в
+        # нём помечены ЗА КАЖДЫЙ юнит (итог за N шт. КОД не выдумывает — числа только из Bridge).
         note_units = self._note(units_count=2)
-        self.assertIsNone(suggest._quote_block_from_note(note_units))
-        self.assertIn("ЗА КАЖДЫЙ", note_units)
+        block = suggest._quote_block_from_note(note_units)
+        self.assertIsNotNone(block)                          # блок собран (страт-путь несёт цену)
+        self.assertIn("1685", block)                         # цена за КАЖДЫЙ юнит из Bridge
+        self.assertIn("3000", block)                         # депозит за КАЖДЫЙ юнит из Bridge
+        self.assertIn("ЗА КАЖДЫЙ", block)                    # пометка «за каждый» в самом блоке
+        self.assertIn("ЗА КАЖДЫЙ", note_units)               # и в инструкции LLM
+        self.assertNotIn("3370", block)                      # 2×1685 итог НЕ выдуман
+        self.assertNotIn("6000", block)                      # 2×3000 депозит НЕ выдуман
+
+    def test_percent_skips_block(self):
+        # Процент — единой клиентской строки ЦЕНЫ нет (сумма вплетена в инструкцию) → блок НЕ собираем.
         note_pct = self._note(percent_q=50)
         self.assertIsNone(suggest._quote_block_from_note(note_pct))
 
@@ -2795,6 +2813,19 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         self.assertIn("3000", out)                           # депозит из Bridge дошёл КОДОМ
         self.assertIn("дожимай на бронь", seen["system"])    # директива стратегии в промпте
         self.assertNotIn("<<<QUOTE>>>", seen["system"])      # сырой блок в промпт не утёк
+
+    def test_strategy_regen_units_carry_per_each_by_code(self):
+        # N юнитов: strategy-перегенерация теряет цену → блок с ценой/депозитом ЗА КАЖДЫЙ юнит
+        # доходит клиенту КОДОМ (итог за 2 шт. по-прежнему не выдуман).
+        note = self._note(units_count=2)
+        def drop_price(system, user):
+            return "Отличный выбор — уточню детали и вернусь."     # LLM цену потерял
+        out = suggest.regenerate_draft("[клиент]: пару nmax на 5 дней с 15 июля, сколько?", "ru",
+                                       "FAQ", False, note, "дожимай", call_llm=drop_price)
+        self.assertIn("1685", out)                           # цена за каждый юнит дошла КОДОМ
+        self.assertIn("3000", out)                           # депозит за каждый юнит дошёл КОДОМ
+        self.assertIn("ЗА КАЖДЫЙ", out)                      # пометка «за каждый» у клиента
+        self.assertNotIn("3370", out)                        # 2×1685 итог не выдуман
 
     def test_strategy_regen_no_dup_when_llm_carries(self):
         # LLM честно привёл цифры Bridge → код НЕ дублирует их (обратная совместимость с прежним путём).

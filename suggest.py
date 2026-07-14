@@ -1218,6 +1218,18 @@ def _units_count_note(n, lang="ru") -> str:
             f"НЕ выдумывай — итог по количеству уточнит менеджер.")
 
 
+def _units_per_each_line(n, lang="ru") -> str:
+    """Клиентская строка ХВОСТОМ точечного quote-блока N юнитов (compose_quote_draft): цена/депозит
+    Bridge выше — ЗА КАЖДЫЙ юнит; итог за N шт. КОД не суммирует и не выдумывает (уточнит менеджер).
+    В отличие от _units_count_note (инструкция LLM) это ДОСЛОВНЫЙ клиентский текст — попадает в тело
+    как есть, если strategy-перегенерация теряет цену."""
+    if lang == "en":
+        return (f"Price and deposit above are PER UNIT (the client asks for {n}); the total for the "
+                f"quantity will be confirmed by the manager.")
+    return (f"Цена и депозит выше — ЗА КАЖДЫЙ юнит (клиент просит {n} шт.); итог по количеству "
+            f"уточнит менеджер.")
+
+
 # «сколько будет N%» / «N% это какая сумма» — клиент просит ПОСЧИТАТЬ процент от суммы расчёта
 # (шаг 2/7 #253). Нужны ОБА: сам процент (число+% / «процентов» / percent) И вопрос-о-сумме
 # («сколько/какая сумма/это сколько/how much»). Просто «скидка 10%» без вопроса-о-сумме сюда НЕ
@@ -2285,26 +2297,38 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
         if pct:
             note += _percent_line(pct, q if kind in ("ok", "min") else None)
         note += dep + units
-        # Чистый точечный quote (одна единица, одна цена, без процента) → детерминированную строку
-        # ЦЕНЫ кладём в служебные скобки: strategy-перегенерация донесёт цену Bridge КОДОМ
-        # (compose_quote_draft в generate/regenerate), не полагаясь на то, что LLM её перепишет.
-        # N-юнитов «за каждый» / процент — блок не собираем (нет единой клиентской строки).
-        if kind == "ok" and not units and not pct:
-            qline = f"{label} — {phrase}." if label else (phrase.rstrip(".") + ".")
+        # Точечный quote → детерминированную строку ЦЕНЫ кладём в служебные скобки: strategy-
+        # перегенерация донесёт цену Bridge КОДОМ (compose_quote_draft в generate/regenerate), не
+        # полагаясь на то, что LLM её перепишет. N ЮНИТОВ одной модели — блок несём ТОЖЕ, но с
+        # пометкой «цена/депозит ЗА КАЖДЫЙ юнит» (итог за N шт. КОД НЕ суммирует — числа только из
+        # Bridge). Процент — единой клиентской строки ЦЕНЫ нет (сумма вплетена в инструкцию), пропуск.
+        if kind == "ok" and not pct:
+            base = f"{label} — {phrase}" if label else phrase.rstrip(".")
+            qline = (base + ". " + _units_per_each_line(_uc, lang)) if units else (base + ".")
             note += "\n" + _QUOTE_OPEN + "\n" + qline + "\n" + _QUOTE_CLOSE
         return note
 
     # (п.3) несколько продуктов (несколько моделей ИЛИ два поколения XMAX) — раздельная цена по
     # каждому, отдельной строкой в одном сообщении.
     bullets = []
+    ok_lines = []
     for label, m, nf in products:
-        _, phrase, _q = _resolve_model_price(m, ds, de, hint_days, monthly, getter=getter,
-                                             name_filter=nf)
+        kind, phrase, _q = _resolve_model_price(m, ds, de, hint_days, monthly, getter=getter,
+                                                name_filter=nf)
         bullets.append(f"- {label}: {phrase}")
+        if kind == "ok":                    # только строки с ЖИВОЙ ценой Bridge едут в quote-блок
+            ok_lines.append(f"- {label}: {phrase}")
     header = ("ЦЕНЫ ПО МОДЕЛЯМ (клиент запросил несколько / модель с вариантами) — назови КАЖДУЮ "
               "отдельной строкой в ОДНОМ сообщении, цену использовать ДОСЛОВНО, модели/варианты НЕ "
               "смешивай и НЕ суммируй:\n")
-    return header + "\n".join(bullets) + dep + units
+    note = header + "\n".join(bullets) + dep + units
+    # N ЮНИТОВ одной модели с вариантами (пара XMAX: два поколения) → живые цены поколений тоже
+    # несём в служебный quote-блок для strategy-пути; цена/депозит ЗА КАЖДЫЙ юнит, итог за N шт.
+    # КОД НЕ суммирует (units set ТОЛЬКО при ОДНОЙ модели — _units_count даёт None на len(models)≥2).
+    if units and ok_lines:
+        block = "\n".join(ok_lines) + "\n" + _units_per_each_line(_uc, lang)
+        note += "\n" + _QUOTE_OPEN + "\n" + block + "\n" + _QUOTE_CLOSE
+    return note
 
 
 def _pressure_block(pressure) -> str:
