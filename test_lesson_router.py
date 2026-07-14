@@ -588,15 +588,21 @@ class TestLessonHighConfidence(unittest.TestCase):
         self.assertEqual(lr.STYLE, dec["route"])               # не UNCLEAR — high перекрыл keyword
         self.assertIn("LLM-high", dec["reason"])
 
-    def test_low_confidence_falls_back_to_keyword(self):
-        # confidence=low → откат на keyword-классификатор (старое поведение), understanding НЕ шлём
+    def test_low_confidence_asks_teacher_not_high_pipeline(self):
+        # confidence=low (шаг 3) → НЕ берём урок в работу вслепую и НЕ шлём understanding «Делаю…»:
+        # спрашиваем учителя «верно?» реплаем в модер-группу и ждём (status=waiting, pending_low).
+        sent = {}
         dec = lr.handle_lesson_task(
             self._task("депозит указал неправильно, он 3000"),
-            classify=lambda r, d="", w="": {"reading": "r", "class": "СТИЛЬ", "confidence": "low",
-                                             "plan": "p", "route": lr.STYLE},
-            reply_moderation=lambda cid, t: self.fail("low → реплай-понимание НЕ шлём"))
-        self.assertEqual(lr.FACT, dec["route"])                # keyword: «депозит…неправильно» = ФАКТ
-        self.assertNotIn("confidence", dec)                    # high-поля отсутствуют
+            classify=lambda r, d="", w="": {"reading": "депозит назван неверно", "class": "ФАКТ",
+                                             "confidence": "low", "plan": "p", "route": lr.FACT},
+            reply_moderation=lambda cid, t: (sent.update(card=cid, text=t), True)[1])
+        self.assertEqual("waiting", dec["status"])             # урок не закрыт — ждём подтверждения
+        self.assertFalse(dec["delegate"])                      # в работу пока НЕ отдали
+        self.assertEqual("low", dec["confidence"])
+        self.assertIn("pending_low", dec)                      # состояние ожидания сохранено
+        self.assertIn("верно?", sent["text"])                  # спросили «верно?» в модер-группе
+        self.assertNotIn("Делаю", sent["text"])                # это НЕ high-реплай «Понял так… Делаю…»
 
     def test_llm_none_falls_back_to_keyword(self):
         # думатель вернул None (брак/сбой) → keyword-классификатор, реплай-понимание не шлём
@@ -646,6 +652,198 @@ class TestLessonHighConfidence(unittest.TestCase):
                                     append_style=lambda r: "added")
         self.assertEqual(lr.STYLE, dec["route"])
         self.assertNotIn("confidence", dec)                    # LLM-путь не активировался
+
+
+class TestLessonLowConfidence(unittest.TestCase):
+    """Родитель 334, шаг 3/6: confidence=low — урок НЕ берётся вслепую. Реплаем в ТУ ЖЕ модер-группу
+    спрашиваем учителя «Понял так: <reading> — верно? Ответь "да" или поправь одним сообщением» и
+    сохраняем состояние ожидания. По ответу: «да» от INTAKE_APPROVERS → урок в работу как high;
+    текстовая поправка → РОВНО одна пере-классификация; снова low → «отложил, разберёт владелец» +
+    карточка в 1160. Классификатор мокаем (реальный claude не дёргаем)."""
+
+    def _task(self, remark, card="90210"):
+        return (f"[урок:правка от @danya] родитель 334 — замечание менеджера в копилку обучения\n"
+                f"окно диалога: Иван (555) (client_id=555) · черновик #7\n"
+                f"карточка модер-группы: msg={card}\n"
+                f"Замечание: {remark}\n"
+                f"Исходный черновик: Аренда Nmax от 1200฿/сутки")
+
+    def _low(self, cls, route, reading="суть не до конца ясна", plan="уточню и поправлю"):
+        def classify(remark, draft="", window=""):
+            return {"reading": reading, "class": cls, "confidence": "low", "plan": plan, "route": route}
+        return classify
+
+    # --- текстовые билдеры ветки low --------------------------------------------------------
+    def test_confirm_text_format_exact(self):
+        c = lr.build_lesson_low_confirm("депозит назван неверно")
+        self.assertIn("Понял так: депозит назван неверно", c)
+        self.assertIn("верно?", c)
+        self.assertIn('Ответь "да"', c)
+        self.assertIn("поправь одним сообщением", c)
+
+    def test_confirm_empty_reading_is_graceful(self):
+        self.assertIn("верно?", lr.build_lesson_low_confirm(""))    # формат не роняем
+
+    def test_affirmative_detects_short_agreement(self):
+        for yes in ("да", "Да!", "да, верно", "всё так", "верно", "точно", "ага", "yes",
+                    "ок", "да все верно", "правильно 👍"):
+            self.assertTrue(lr.is_lesson_affirmative(yes), yes)
+
+    def test_affirmative_rejects_correction_text(self):
+        # текстовая поправка (в т.ч. начинается с «нет») — НЕ согласие
+        for no in ("нет, дело в цене", "плохо, переделай", "депозит 3000, а не 5000",
+                   "поправь тон, слишком сухо", "", "   ", "это про надзор — ревизор должен ловить"):
+            self.assertFalse(lr.is_lesson_affirmative(no), repr(no))
+
+    # --- вход в ожидание --------------------------------------------------------------------
+    def test_low_enters_wait_and_replies_to_mod_group(self):
+        sent = {}
+        dec = lr.handle_lesson_task(
+            self._task("депозит вроде не так"),
+            classify=self._low("ФАКТ", lr.FACT, reading="депозит назван неверно"),
+            reply_moderation=lambda cid, t: (sent.update(card=cid, text=t), True)[1],
+            notify_owner=lambda c: self.fail("владельца НЕ зовём в момент ожидания (не «неясно»)"))
+        self.assertEqual("waiting", dec["status"])
+        self.assertEqual("low", dec["confidence"])
+        self.assertEqual("90210", sent["card"])                # реплай на сообщение с уроком
+        self.assertIn("Понял так: депозит назван неверно", sent["text"])
+        self.assertIn("верно?", sent["text"])
+        # состояние ожидания несёт всё для возобновления
+        p = dec["pending_low"]
+        self.assertEqual(lr.FACT, p["route"])
+        self.assertEqual("90210", p["card_msg_id"])
+        self.assertIn("депозит вроде не так", p["remark"])
+        self.assertIn("Nmax", p["draft"])                      # черновик сохранён для пере-классификации
+
+    def test_low_reply_sink_failure_still_saves_state(self):
+        # реплай в модер-группу упал → состояние ожидания ВСЁ РАВНО возвращаем (не теряем урок)
+        dec = lr.handle_lesson_task(
+            self._task("что-то с ценой"),
+            classify=self._low("ФАКТ", lr.FACT),
+            reply_moderation=lambda cid, t: (_ for _ in ()).throw(OSError("mod group down")))
+        self.assertEqual("waiting", dec["status"])
+        self.assertIn("pending_low", dec)
+
+    # --- resume: «да» от аппрувера ----------------------------------------------------------
+    def test_resume_yes_from_approver_takes_lesson_as_high(self):
+        # «да» от INTAKE_APPROVERS → урок в работу как high по маршруту из pending (учитель согласился)
+        sent = {}
+        dec0 = lr.handle_lesson_task(self._task("депозит вроде не так"),
+                                     classify=self._low("ФАКТ", lr.FACT, reading="депозит назван неверно",
+                                                        plan="поправить депозит в критфактах + тест"),
+                                     reply_moderation=lambda cid, t: True)
+        dec = lr.resume_low_lesson(dec0["pending_low"], "да", is_approver=True,
+                                   reply_moderation=lambda cid, t: (sent.update(card=cid, text=t), True)[1])
+        self.assertEqual(lr.FACT, dec["route"])
+        self.assertEqual("high", dec["confidence"])
+        self.assertEqual("approved", dec["resumed"])
+        self.assertTrue(dec["delegate"])                       # ФАКТ → штатно планировщику
+        self.assertEqual("90210", sent["card"])                # реплай «Понял так… Делаю…» в модер-группу
+        self.assertIn("Понял так: депозит назван неверно", sent["text"])
+        self.assertIn("Делаю: поправить депозит в критфактах + тест", sent["text"])
+
+    def test_resume_yes_style_runs_style_sink(self):
+        seen = {}
+        pending = {"text": self._task("тон вроде сухой"), "route": lr.STYLE, "class": "СТИЛЬ",
+                   "reading": "тон сух", "plan": "смягчить тон", "remark": "тон вроде сухой",
+                   "draft": "", "window": "555", "card_msg_id": "90210"}
+        dec = lr.resume_low_lesson(pending, "да, верно", is_approver=True,
+                                   append_style=lambda r: (seen.__setitem__("rule", r), "added")[1],
+                                   reply_moderation=lambda cid, t: True)
+        self.assertEqual(lr.STYLE, dec["route"])
+        self.assertEqual("done", dec["status"])
+        self.assertIn("тон вроде сухой", seen["rule"])         # исходное замечание ушло в книгу правил
+
+    def test_resume_yes_from_non_approver_is_ignored(self):
+        # «да» НЕ от INTAKE_APPROVERS → подтверждение не принимаем, продолжаем ждать уполномоченного
+        pending = {"text": self._task("депозит вроде не так"), "route": lr.FACT, "class": "ФАКТ",
+                   "reading": "r", "plan": "p", "remark": "депозит вроде не так", "card_msg_id": "90210"}
+        dec = lr.resume_low_lesson(pending, "да", is_approver=False,
+                                   append_style=lambda r: self.fail("не применяем без аппрувера"),
+                                   append_checklist=lambda r: self.fail("не применяем без аппрувера"),
+                                   reply_moderation=lambda cid, t: self.fail("не отвечаем на чужое «да»"))
+        self.assertEqual("waiting", dec["status"])
+        self.assertEqual("ignored_non_approver", dec["resumed"])
+
+    # --- resume: текстовая поправка ---------------------------------------------------------
+    def test_resume_correction_reclassifies_once_to_high(self):
+        # текстовая поправка → РОВНО одна пере-классификация; вернулся high → урок в работу как high
+        calls = {"n": 0}
+        def classify(remark, draft="", window=""):
+            calls["n"] += 1
+            self.assertIn("депозит 3000", remark)              # пере-классифицируем по ТЕКСТУ поправки
+            return {"reading": "депозит 3000, не 5000", "class": "ФАКТ", "confidence": "high",
+                    "plan": "поправить депозит + тест", "route": lr.FACT}
+        sent = {}
+        pending = {"text": self._task("вроде не так с депозитом"), "route": lr.STYLE, "class": "СТИЛЬ",
+                   "reading": "r", "plan": "p", "remark": "вроде не так с депозитом",
+                   "draft": "Аренда Nmax от 1200฿/сутки", "window": "555", "card_msg_id": "90210"}
+        dec = lr.resume_low_lesson(pending, "нет, депозит 3000, не 5000", is_approver=True,
+                                   classify=classify,
+                                   reply_moderation=lambda cid, t: (sent.update(text=t), True)[1])
+        self.assertEqual(1, calls["n"])                        # РОВНО одна пере-классификация
+        self.assertEqual(lr.FACT, dec["route"])                # новый класс из поправки
+        self.assertEqual("high", dec["confidence"])
+        self.assertEqual("reclassified_high", dec["resumed"])
+        self.assertTrue(dec["delegate"])
+        self.assertIn("Понял так: депозит 3000, не 5000", sent["text"])
+
+    def test_resume_correction_still_low_defers_to_owner(self):
+        # поправка снова low → «отложил, разберёт владелец» реплаем + карточка-уточнение владельцу в 1160
+        replies = []
+        sent_owner = {}
+        pending = {"text": self._task("вроде не то"), "route": lr.STYLE, "class": "СТИЛЬ",
+                   "reading": "r", "plan": "p", "remark": "вроде не то",
+                   "draft": "черновик", "window": "555", "card_msg_id": "90210"}
+        dec = lr.resume_low_lesson(
+            pending, "ну переделай как-нибудь", is_approver=True,
+            classify=lambda r, d="", w="": {"reading": "r2", "class": "СТИЛЬ", "confidence": "low",
+                                            "plan": "p2", "route": lr.STYLE},
+            notify_owner=lambda c: (sent_owner.__setitem__("card", c), ("инбокс 1160", True))[1],
+            reply_moderation=lambda cid, t: (replies.append(t), True)[1])
+        self.assertEqual(lr.UNCLEAR, dec["route"])
+        self.assertEqual("deferred_to_owner", dec["resumed"])
+        self.assertEqual("done", dec["status"])
+        self.assertTrue(dec["delivered"])
+        self.assertEqual("инбокс 1160", dec["channel"])
+        self.assertTrue(any("тлож" in r.lower() for r in replies))   # реплай «отложил…» в модер-группу
+        self.assertIn("ну переделай как-нибудь", sent_owner["card"])  # поправка — в карточке владельцу
+        self.assertIn("доставлено через инбокс 1160", dec["result"])
+
+    def test_resume_correction_classify_none_defers_to_owner(self):
+        # пере-классификация вернула None (брак/сбой) → так же откладываем владельцу (не угадываем)
+        dec = lr.resume_low_lesson(
+            {"text": self._task("не то"), "route": lr.FACT, "class": "ФАКТ", "reading": "r",
+             "plan": "p", "remark": "не то", "draft": "", "window": "", "card_msg_id": "90210"},
+            "ещё какая-то невнятица", is_approver=True,
+            classify=lambda r, d="", w="": None,
+            notify_owner=lambda c: ("инбокс 1160", True),
+            reply_moderation=lambda cid, t: True)
+        self.assertEqual(lr.UNCLEAR, dec["route"])
+        self.assertEqual("deferred_to_owner", dec["resumed"])
+
+    def test_resume_defer_owner_channel_down_is_failsafe(self):
+        # канал 1160 упал при откладывании → не роняем, замечание видно в результате/логе
+        dec = lr.resume_low_lesson(
+            {"text": self._task("не то"), "route": lr.FACT, "class": "ФАКТ", "reading": "r",
+             "plan": "p", "remark": "не то", "draft": "", "window": "", "card_msg_id": "90210"},
+            "снова невнятно", is_approver=True,
+            classify=lambda r, d="", w="": {"reading": "r", "class": "ФАКТ", "confidence": "low",
+                                            "plan": "p", "route": lr.FACT},
+            notify_owner=lambda c: (_ for _ in ()).throw(RuntimeError("1160 down")),
+            reply_moderation=lambda cid, t: True)
+        self.assertFalse(dec["delivered"])
+        self.assertIn("не доставлена", dec["result"])
+
+    def test_high_confidence_still_immediate_no_wait(self):
+        # регрессия шага 2: confidence=high по-прежнему берётся СРАЗУ (не в ожидание)
+        dec = lr.handle_lesson_task(self._task("депозит указал неправильно, он 3000"),
+                                    classify=lambda r, d="", w="": {"reading": "r", "class": "ФАКТ",
+                                                                    "confidence": "high", "plan": "p",
+                                                                    "route": lr.FACT},
+                                    reply_moderation=lambda cid, t: True)
+        self.assertEqual("high", dec["confidence"])
+        self.assertNotIn("pending_low", dec)                   # не ожидание — сразу в работу
 
 
 if __name__ == "__main__":

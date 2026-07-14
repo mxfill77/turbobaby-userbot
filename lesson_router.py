@@ -422,6 +422,54 @@ def _default_reply_moderation(_card_msg_id, _text):
     return False
 
 
+# ------------------------------- ветка confidence=low: подтверждение в модер-группе (шаг 3) -----
+# confidence=low (класс размыт) — урок В РАБОТУ НЕ БЕРЁМ вслепую. Реплаем в ТУ ЖЕ модер-группу на
+# сообщение с уроком спрашиваем учителя: «Понял так: <reading> — верно? Ответь "да" или поправь одним
+# сообщением», и СОХРАНЯЕМ состояние ожидания (pending_low). По ответу возобновляем (resume_low_lesson):
+# «да» от INTAKE_APPROVERS → урок в работу как high (маршрут уже согласован учителем); текстовая
+# поправка → РОВНО одна пере-классификация (high → в работу; снова low/брак → «отложил, разберёт
+# владелец» + карточка в 1160). Все sink'и инъектируемы; текстовые билдеры — чистые функции.
+def build_lesson_low_confirm(reading):
+    """Реплай учителю в модер-группу для confidence=low: короткая трактовка + просьба подтвердить «да»
+    ИЛИ поправить одним сообщением. Пустой reading → нейтральная заглушка (формат не роняем)."""
+    r = _one_line(reading) or "суть замечания (см. окно диалога)"
+    return f'🤔 Понял так: {r} — верно? Ответь "да" или поправь одним сообщением.'
+
+
+def build_lesson_low_defer():
+    """Реплай учителю, когда после его поправки урок ВСЁ РАВНО неясен (снова low): честно откладываем —
+    разберёт владелец (карточка-уточнение ушла ему в 1160). Не угадываем за учителя."""
+    return "🤷 Отложил — по-прежнему неясно после поправки, разберётся владелец (карточка ушла ему)."
+
+
+# Короткие согласия учителя («да/верно/точно…») отделяем от ТЕКСТОВОЙ поправки: строгие маркеры
+# согласия + допустимые «наполнители» рядом (всё/так/конечно). Поправка — любой ответ, где строгого
+# маркера нет (в т.ч. «нет, дело в цене»). Регистр/пунктуация/эмодзи по краям снимаются.
+_LESSON_AFFIRM_STRONG = frozenset((
+    "да", "да-да", "ага", "угу", "верно", "точно", "именно", "правильно", "подтверждаю",
+    "yes", "yep", "yeah", "correct", "right", "ок", "окей", "ok", "okay",
+))
+_LESSON_AFFIRM_FILLER = frozenset(("всё", "все", "так", "конечно", "именно", "точно", "супер", "отлично"))
+# Согласия БЕЗ строгого маркера, но однозначные как фраза (иначе «так»/«всё» сами по себе размыты).
+_LESSON_AFFIRM_PHRASES = frozenset(("всё так", "все так", "так и есть", "всё верно", "все верно"))
+_AFFIRM_STRIP = ".,!?…-—\"'«»()[]{} \t👍✅🙂"
+
+
+def is_lesson_affirmative(text):
+    """True, если ответ учителя — короткое СОГЛАСИЕ («да», «верно», «да, всё так»), а НЕ текстовая
+    поправка. Согласие = известная фраза-согласие ЛИБО ≥1 строгий маркер и все слова из согласий/
+    наполнителей (≤4 слова); иначе поправка (пере-классифицируем). «нет, …» / «плохо, переделай» → False."""
+    toks = [t.strip(_AFFIRM_STRIP) for t in _one_line(text).lower().split()]
+    toks = [t for t in toks if t]
+    if not toks or len(toks) > 4:
+        return False
+    if " ".join(toks) in _LESSON_AFFIRM_PHRASES:
+        return True
+    if not any(t in _LESSON_AFFIRM_STRONG for t in toks):
+        return False
+    return all(t in _LESSON_AFFIRM_STRONG or t in _LESSON_AFFIRM_FILLER for t in toks)
+
+
 def _lesson_llm_enabled():
     """Боевой рубильник LLM-классификатора урока (по умолчанию OFF → поведение байт-в-байт keyword-
     прежнее; тесты, инъектирующие classify, включают путь явно вне зависимости от флага)."""
@@ -490,6 +538,135 @@ def _dispatch_route(route, text, parsed, remark, reason, a_style, a_check, notif
             "result": result, "card": card, "delivered": delivered, "channel": channel}
 
 
+def _ack_material(route, remark, card):
+    """Материал подтверждения (шаг 4) для применённой ветки: суть/куда записан/tracked-пути/координата
+    карточки. Един для keyword-, LLM-high- и resume-путей."""
+    return {"ack_subject": _one_line(remark), "ack_where": _ROUTE_WHERE.get(route, "книгу правил"),
+            "commit_paths": list(_ROUTE_COMMIT_PATHS.get(route, [])), "card_msg_id": card or ""}
+
+
+def _apply_high(route, text, parsed, remark, reason, reading, plan, cls,
+                a_style, a_check, notify, reply_mod, card):
+    """Взять урок В РАБОТУ СРАЗУ по LLM-маршруту (high или подтверждённый low): ответить учителю реплаем
+    в модер-группу «Понял так: <reading>. Делаю: <plan>», затем исполнить маршрут штатным пайплайном.
+    Реплай инъектируем; его сбой урок НЕ теряет (understanding остаётся в результате). → dec с high-полями."""
+    _ack = _ack_material(route, remark, card)
+    understanding = build_lesson_understanding(reading, plan)
+    try:
+        reply_mod(card, understanding)
+    except Exception as e:                           # noqa: BLE001 — реплай не должен ронять дирижёра
+        reason = f"{reason}; mod-reply: {e}"
+    dec = _dispatch_route(route, text, parsed, remark, reason, a_style, a_check, notify, _ack)
+    dec["confidence"] = "high"
+    dec["understanding"] = understanding
+    dec["reading"] = _one_line(reading)
+    dec["plan"] = _one_line(plan)
+    dec["llm_class"] = cls
+    return dec
+
+
+def _enter_low_wait(llm, text, parsed, remark, reply_mod):
+    """confidence=low: НЕ берём урок в работу вслепую. Реплаем в ТУ ЖЕ модер-группу спрашиваем учителя
+    «Понял так: <reading> — верно?» и возвращаем СОСТОЯНИЕ ОЖИДАНИЯ (pending_low) — вызывающий (демон)
+    его сохраняет и по ответу учителя зовёт resume_low_lesson. status='waiting' → задача не закрывается.
+    Сбой реплая состояние НЕ теряет (pending_low всё равно в dec; демон повторит/учитель ответит)."""
+    reading = _one_line(llm.get("reading"))
+    plan = _one_line(llm.get("plan"))
+    cls = llm.get("class")
+    card = parsed.get("card_msg_id") or ""
+    confirm = build_lesson_low_confirm(reading)
+    reason = f"LLM-low: класс {cls} — спросил учителя «верно?» реплаем в модер-группе, жду ответа"
+    try:
+        reply_mod(card, confirm)
+    except Exception as e:                           # noqa: BLE001 — реплай не должен ронять дирижёра
+        reason = f"{reason}; mod-reply: {e}"
+    pending = {"text": str(text or ""), "route": llm.get("route"), "class": cls, "reading": reading,
+               "plan": plan, "remark": remark, "draft": parsed.get("draft", ""),
+               "window": parsed.get("window", ""), "who": parsed.get("who", ""), "card_msg_id": card}
+    return {"route": llm.get("route"), "confidence": "low", "delegate": False, "status": "waiting",
+            "reason": reason, "confirm": confirm, "pending_low": pending, "card_msg_id": card,
+            "reading": reading, "plan": plan, "llm_class": cls,
+            "result": (f"🤔 Урок неуверенно классифицирован ({cls}) → спросил учителя «верно?» "
+                       "реплаем в модер-группе, жду «да»/поправку")}
+
+
+def resume_low_lesson(pending, reply_text, is_approver, classify=None, append_style=None,
+                      append_checklist=None, notify_owner=None, reply_moderation=None):
+    """Возобновить обработку низко-уверенного урока по ОТВЕТУ учителя в модер-группе (шаг 3). pending —
+    сохранённое _enter_low_wait состояние. Ветви:
+      • «да» от INTAKE_APPROVERS (is_approver=True) → урок В РАБОТУ как high по маршруту из pending
+        (учитель согласился с трактовкой); «да» НЕ от аппрувера → игнор, ждём уполномоченного;
+      • текстовая поправка → РОВНО одна пере-классификация (classify по тексту поправки):
+          – вернулся high → в работу как high с НОВЫМ прочтением;
+          – снова low / брак → реплай «отложил, разберёт владелец» + карточка-уточнение владельцу в 1160.
+    Все sink'и инъектируемы (юнит без Telegram/1160/claude). FAIL-SAFE как в handle_lesson_task."""
+    a_style = append_style or _default_append_style
+    a_check = append_checklist or append_checklist_class
+    notify = notify_owner or _default_notify_owner
+    reply_mod = reply_moderation or _default_reply_moderation
+    pending = pending or {}
+    text = str(pending.get("text") or "")
+    parsed = parse_lesson_task(text) if text else {}
+    card = pending.get("card_msg_id") or parsed.get("card_msg_id") or ""
+
+    # (1) короткое «да» → согласие с трактовкой. Применяем ТОЛЬКО от INTAKE_APPROVERS (гейт спеки).
+    if is_lesson_affirmative(reply_text):
+        if not is_approver:
+            return {"route": pending.get("route"), "confidence": "low", "status": "waiting",
+                    "delegate": False, "resumed": "ignored_non_approver",
+                    "reason": "«да» не от INTAKE_APPROVERS — подтверждение игнорируется, жду уполномоченного",
+                    "result": "🤔 Подтверждение «да» пришло не от аппрувера — жду ответа уполномоченного"}
+        route = pending.get("route")
+        remark = pending.get("remark") or parsed.get("remark") or ""
+        dec = _apply_high(route, text, parsed, remark, f"LLM-low → approver подтвердил «да» (класс {pending.get('class')})",
+                          pending.get("reading"), pending.get("plan"), pending.get("class"),
+                          a_style, a_check, notify, reply_mod, card)
+        dec["resumed"] = "approved"
+        return dec
+
+    # (2) текстовая поправка → РОВНО одна пере-классификация по тексту поправки (+ прежний контекст).
+    correction = _one_line(reply_text)
+    run_classify = classify or classify_lesson_llm
+    try:
+        llm2 = run_classify(correction, pending.get("draft", ""), pending.get("window", ""))
+    except Exception:                                # noqa: BLE001 — сбой думателя не роняет дирижёра
+        llm2 = None
+    if llm2 and llm2.get("confidence") == "high" and llm2.get("route"):
+        # поправка прояснила класс → в работу как high с НОВЫМ прочтением; поправку кладём в замечание
+        # (её и запишет STYLE/НАДЗОР-sink; FACT-планировщик увидит её в augmented-тексте задачи).
+        text2 = text + f"\n\n[поправка учителя]: {correction}" if text else correction
+        parsed2 = dict(parsed); parsed2["remark"] = correction
+        dec = _apply_high(llm2["route"], text2, parsed2, correction,
+                          f"LLM-low → поправка учителя → high класс {llm2.get('class')}",
+                          llm2.get("reading"), llm2.get("plan"), llm2.get("class"),
+                          a_style, a_check, notify, reply_mod, card)
+        dec["resumed"] = "reclassified_high"
+        return dec
+
+    # (3) снова low / брак → «отложил, разберёт владелец» реплаем + карточка-уточнение владельцу в 1160.
+    defer = build_lesson_low_defer()
+    reason = f"поправка учителя снова неясна ({(llm2 or {}).get('confidence', 'брак')}) → отложено владельцу"
+    try:
+        reply_mod(card, defer)
+    except Exception as e:                           # noqa: BLE001
+        reason = f"{reason}; mod-reply: {e}"
+    owner_parsed = dict(parsed); owner_parsed["remark"] = correction or parsed.get("remark", "")
+    owner_card = build_owner_clarification_card(owner_parsed, "повторно неясно после поправки учителя")
+    channel = ""
+    try:
+        delivered, channel = _normalize_delivery(notify(owner_card))
+    except Exception as e:                           # noqa: BLE001
+        delivered, channel = False, ""; reason = f"{reason}; notify: {e}"
+    if delivered:
+        via = f" — доставлено через {channel}" if channel else ""
+        result = f"🤷 Урок снова неясен после поправки → отложен владельцу в 1160{via} (не угадываю)"
+    else:
+        result = "🤷 Урок снова неясен после поправки: канал 1160 недоступен — карточка не доставлена, замечание в логе"
+    return {"route": UNCLEAR, "confidence": "low", "delegate": False, "status": "done",
+            "resumed": "deferred_to_owner", "reason": reason, "defer": defer, "card": owner_card,
+            "delivered": delivered, "channel": channel, "result": result}
+
+
 def handle_lesson_task(text, append_style=None, append_checklist=None, notify_owner=None,
                        classify=None, reply_moderation=None):
     """Классифицировать урок и МАРШРУТИЗИРОВАТЬ. → dict:
@@ -516,6 +693,7 @@ def handle_lesson_task(text, append_style=None, append_checklist=None, notify_ow
     a_check = append_checklist or append_checklist_class
     notify = notify_owner or _default_notify_owner
     reply_mod = reply_moderation or _default_reply_moderation
+    card = parsed.get("card_msg_id") or ""
 
     # LLM-классификатор (шаг 1) ПОВЕРХ keyword. Инъекция classify = явное намерение теста → идём в LLM
     # всегда; без инъекции — только при боевом рубильнике (иначе байт-в-байт прежний keyword-путь и
@@ -528,34 +706,21 @@ def handle_lesson_task(text, append_style=None, append_checklist=None, notify_ow
             llm = run_classify(remark, parsed.get("draft", ""), parsed.get("window", ""))
         except Exception:                            # noqa: BLE001 — сбой думателя не роняет дирижёра
             llm = None
-    high = bool(llm and llm.get("confidence") == "high" and llm.get("route"))
-    if high:
-        route, reason = llm["route"], f"LLM-high: класс {llm.get('class')}"
-    else:
-        route, reason = classify_lesson_remark(remark)
 
-    # Материал подтверждения (шаг 4) — одинаков для всех применённых веток; шлётся ТОЛЬКО после коммита.
-    subj = _one_line(remark)
-    card = parsed.get("card_msg_id") or ""
-    _ack = {"ack_subject": subj, "ack_where": _ROUTE_WHERE.get(route, "книгу правил"),
-            "commit_paths": list(_ROUTE_COMMIT_PATHS.get(route, [])), "card_msg_id": card}
+    # confidence=high (шаг 2): урок берётся В РАБОТУ СРАЗУ по LLM-маршруту — реплай «Понял так… Делаю…»
+    # в модер-группу + штатный пайплайн, БЕЗ карточки-уточнения (класс очевиден).
+    if llm and llm.get("confidence") == "high" and llm.get("route"):
+        return _apply_high(llm["route"], text, parsed, remark, f"LLM-high: класс {llm.get('class')}",
+                           llm.get("reading"), llm.get("plan"), llm.get("class"),
+                           a_style, a_check, notify, reply_mod, card)
 
-    # confidence=high: урок берётся В РАБОТУ СРАЗУ — ДО пайплайна отвечаем учителю реплаем в модер-группу
-    # на сообщение с уроком «Понял так: <reading>. Делаю: <plan>». Сбой доставки не роняет и урок не
-    # теряет (understanding остаётся в результате; пайплайн идёт штатно).
-    understanding = None
-    if high:
-        understanding = build_lesson_understanding(llm.get("reading"), llm.get("plan"))
-        try:
-            reply_mod(card, understanding)
-        except Exception as e:                       # noqa: BLE001 — реплай не должен ронять дирижёра
-            reason = f"{reason}; mod-reply: {e}"
+    # confidence=low (шаг 3): класс размыт — НЕ угадываем и НЕ берём вслепую. Реплаем в ТУ ЖЕ модер-группу
+    # спрашиваем учителя «верно?» и сохраняем состояние ожидания (resume_low_lesson доведёт по ответу).
+    if llm and llm.get("confidence") == "low" and llm.get("route"):
+        return _enter_low_wait(llm, text, parsed, remark, reply_mod)
 
-    dec = _dispatch_route(route, text, parsed, remark, reason, a_style, a_check, notify, _ack)
-    if high:
-        dec["confidence"] = "high"
-        dec["understanding"] = understanding
-        dec["reading"] = _one_line(llm.get("reading"))
-        dec["plan"] = _one_line(llm.get("plan"))
-        dec["llm_class"] = llm.get("class")
-    return dec
+    # Откат на keyword-классификатор: LLM выключен / думатель вернул None (брак/сбой). Поведение прежнее,
+    # включая карточку-уточнение владельцу для неясного (высокоуверенного LLM-сигнала не было).
+    route, reason = classify_lesson_remark(remark)
+    _ack = _ack_material(route, remark, card)
+    return _dispatch_route(route, text, parsed, remark, reason, a_style, a_check, notify, _ack)
