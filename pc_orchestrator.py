@@ -2488,6 +2488,7 @@ _FILE_PROCESS_RULES = (
     (lambda n: n.startswith("userbot"),   ("userbot",)),              # userbot_listen.py и т.п.
     (lambda n: n.startswith("suggest"),   ("userbot", "moderbot")),   # suggest*.py — общий рантайм
     (lambda n: n.startswith("pricing"),   ("userbot", "moderbot")),   # pricing*.py — общий рантайм
+    (lambda n: n.startswith("delivery"),  ("userbot", "moderbot")),   # delivery*.py — резолвер доставки, импортит suggest → общий рантайм (живой кейс dae330a: без правила userbot жил на старом коде 2ч+)
     (lambda n: n.startswith("booking"),   ("userbot",)),              # booking_draft.py и др. booking-модули
     (lambda n: n == "moderation_ipc.py",  ("userbot",)),              # IPC модерации → рестарт userbot
     (lambda n: n == "moderation_bot.py",  ("moderbot",)),             # сам модербот
@@ -2881,7 +2882,8 @@ def reconcile_children_tick(head_fn=None, diff_fn=None, gate_fn=None, restart_fn
         return ""                         # нет нового коммита ИЛИ этот HEAD уже провалил гейт — ждём новый
     changed = (diff_fn or _diff_names)(_last_child_commit, head)
     ub_files, mb_files = _classify_changed(changed)
-    if not (ub_files or mb_files):
+    pc_agent_hit = any("pc_agent" in _procs_for_file(p) for p in changed)   # pc_agent.py в диффе → та же ручная карта, что в self-update
+    if not (ub_files or mb_files or pc_agent_hit):
         _last_child_commit = head         # тронуты только не-код-файлы детей (pc_orchestrator/доки/тесты) — двигаем метку
         return ""
     now = time.time() if now is None else now
@@ -2889,6 +2891,13 @@ def reconcile_children_tick(head_fn=None, diff_fn=None, gate_fn=None, restart_fn
     state = _apply_restart_at if state is None else state
     short = head[:9]
     notes, gate_red = [], False
+    if pc_agent_hit:                      # агент себя чужими руками не рестартует — только пометка (ручная карта, как в _selfupdate_restart_children)
+        msg = ("pc_agent изменён — ЖДЁТ РУЧНОГО рестарта (Планировщик/сам подхватит), "
+               "чужими руками не трогаю")
+        log.info("реконсиляция детей: %s", msg)
+        _cowork(f"авто-применил {short}: {msg}")
+        _notify(f"ℹ️ Оркестратор: {msg} (реконсиляция {short})")
+        notes.append(msg)
     for kind, label, files in (("userbot", "userbot", ub_files), ("moderbot", "модербот", mb_files)):
         if not files:
             continue

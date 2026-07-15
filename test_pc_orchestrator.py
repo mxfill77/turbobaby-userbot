@@ -1573,6 +1573,8 @@ class TestFileProcessMap(unittest.TestCase):
         self.assertEqual(o._procs_for_file("moderation_core.py"), {"moderbot"})
         self.assertEqual(o._procs_for_file("suggest.py"), {"userbot", "moderbot"})
         self.assertEqual(o._procs_for_file("pricing_rules.py"), {"userbot", "moderbot"})
+        self.assertEqual(o._procs_for_file("delivery.py"), {"userbot", "moderbot"})   # резолвер доставки → общий рантайм (dae330a)
+        self.assertEqual(o._procs_for_file("fetch_delivery.py"), set())               # утилита-фетчер, НЕ рантайм ботов
         self.assertEqual(o._procs_for_file("pc_agent.py"), {"pc_agent"})
         self.assertEqual(o._procs_for_file("README.md"), set())
         self.assertEqual(o._procs_for_file("CLAUDE.md"), set())
@@ -1753,6 +1755,42 @@ class TestReconcileChildren(Base):
         self.assertIn("userbot рестартнут", note)
         self.assertTrue(any("авто-применил c6d8a30ab: рестарт userbot" in s for s in cows))
         self.assertEqual(o._last_child_commit, "c6d8a30ab")       # метка сдвинута — второй раз не дёрнет
+
+    def test_golden_direct_delivery_commit_restarts_userbot(self):
+        # ГОЛДЕН живого кейса dae330a: прямой коммит (НЕ дев-таск, пришёл фетчем/pull) тронул
+        # delivery.py → авто-рестарт userbot. Раньше delivery.py не было в _FILE_PROCESS_RULES →
+        # реконсиляция считала его не-код-файлом → userbot жил на старом коде 2ч+.
+        o._last_child_commit = "old"
+        kinds, cows = [], []
+        o._cowork = lambda s: cows.append(s)
+        note = self._run("dae330a00", ["delivery.py", "test_delivery.py"],
+                         restart_fn=lambda k: kinds.append(k) or (True, [828], "PID поднят, лог свежий"),
+                         state={})
+        self.assertIn("userbot", kinds)                           # userbot рестартнут по delivery.py
+        self.assertIn("userbot рестартнут", note)
+        self.assertTrue(any("авто-применил dae330a00: рестарт userbot" in s for s in cows))
+        self.assertEqual(o._last_child_commit, "dae330a00")       # метка сдвинута — второй раз не дёрнет
+
+    def test_golden_docs_only_commit_no_restart(self):
+        # ГОЛДЕН: коммит тронул ТОЛЬКО docs/ (и notes/) → никого не рестартим, метку двигаем.
+        o._last_child_commit = "old"
+        kinds = []
+        note = self._run("d0c50000", ["docs/task_notes/n.md", "notes/plan.md", "docs/readme.txt"],
+                         restart_fn=lambda k: kinds.append(k) or (True, [1], "x"), state={})
+        self.assertEqual((note, kinds), ("", []))
+        self.assertEqual(o._last_child_commit, "d0c50000")
+
+    def test_pc_agent_commit_manual_note_not_restarted(self):
+        # pc_agent.py в диффе ВНЕ self-update → реконсиляция даёт пометку «ждёт ручного рестарта»,
+        # но чужими руками НЕ рестартит (та же ручная карта, что в _selfupdate_restart_children).
+        o._last_child_commit = "old"
+        kinds, cows = [], []
+        o._cowork = lambda s: cows.append(s)
+        note = self._run("a9e17c000", ["pc_agent.py"],
+                         restart_fn=lambda k: kinds.append(k) or (True, [1], "x"), state={})
+        self.assertEqual(kinds, [])                               # агент чужими руками НЕ рестартим
+        self.assertIn("РУЧНОГО рестарта", note)
+        self.assertEqual(o._last_child_commit, "a9e17c000")       # пометка разовая — метку двигаем (не спамим каждый тик)
 
     def test_no_child_files_advances_marker_only(self):
         # коммит тронул только сам pc_orchestrator.py/доки → метку двигаем, никого не рестартим.
