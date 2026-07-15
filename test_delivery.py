@@ -192,10 +192,46 @@ class TestResolveMapsLink(unittest.TestCase):
     # ------------------------------- None-случаи -----------------------------
 
     def test_short_link_place_without_coords_is_none(self):
-        # развернулась в place-ссылку без координат → None
+        # развернулась в place-ссылку без координат (ни в URL, ни в теле) → None
         short = "https://maps.app.goo.gl/NoCoords"
         final = "https://www.google.com/maps/place/Some+Cafe/"
         self.assertIsNone(delivery.resolve_maps_link(short, _expand=lambda u: final))
+
+    # ------------------------- ЖИВОЙ place-линк: пин только в ТЕЛЕ ------------
+
+    # Реальный провал из tmp/geo-recon.md: короткая share-ссылка на объект разворачивается в
+    # place-URL, где координат НЕТ вовсе (только текстовый адрес + hex-CID). Реальный пин
+    # `8.0407335, 98.3433216` (Сайюан/Раваи, Пхукет) лежит ЛИШЬ в теле — staticmap `center=…`.
+    # Продовый _default_expand отдаёт «конечный URL\n+тело», парсер тем же _LATLON берёт center=.
+    GEO_RECON_FINAL_URL = (
+        "https://www.google.com/maps/place/79,+Meat+Point+%7C+steaks,+burgers,+skewers,"
+        "+79+Soi+Saiyuan,+Mueang,+Phuket,+83100/data=!4m2!3m1!1s0x30502f24a5443265:"
+        "0xa4cc15728db01dbd!18m1!1e1?utm_source=mstt_1&entry=gps&coh=192189&g_st=ac"
+    )
+    # Фрагмент тела: центр статической карты — пара в порядке lat,lon (как в живом ответе).
+    GEO_RECON_BODY = (
+        "<html>…\"https://maps.googleapis.com/maps/api/staticmap?"
+        "center=8.0407335%2C98.3433216&zoom=16&size=800x600\"…</html>"
+    )
+    GEO_RECON_PIN = (8.0407335, 98.3433216)
+
+    def test_recon_place_link_coords_from_body_on_phuket(self):
+        # ГОЛДЕН живого формата: в конечном URL координат нет вовсе — доказываем это, затем
+        # показываем, что резолвер достаёт пин из ТЕЛА и точка определяется «на Пхукете».
+        self.assertIsNone(delivery._parse_coords_from_url(self.GEO_RECON_FINAL_URL))
+        short = "https://maps.app.goo.gl/c4G4B3sNrfJZBSue6?g_st=ac"
+        # _expand имитирует продовый разворот: «конечный URL\n+тело» (redirect → финальный URL из recon)
+        page = self.GEO_RECON_FINAL_URL + "\n" + self.GEO_RECON_BODY
+        got = delivery.resolve_maps_link(short, _expand=lambda u: page)
+        self._assert_close(got, self.GEO_RECON_PIN)
+        # «на Пхукете»: точка внутри bbox острова (lat 7.6–8.3, lon 98.2–98.5), НЕ свап (lat≤90)
+        self.assertTrue(7.6 <= got[0] <= 8.3 and 98.2 <= got[1] <= 98.5)
+
+    def test_recon_place_link_no_body_coords_is_none(self):
+        # тот же конечный URL, но тело без координат → честный None (fail-safe не ослаблен)
+        short = "https://maps.app.goo.gl/c4G4B3sNrfJZBSue6?g_st=ac"
+        page = self.GEO_RECON_FINAL_URL + "\n<html>no coordinates here</html>"
+        self.assertIsNone(delivery.resolve_maps_link(short, _expand=lambda u: page))
 
     def test_short_link_expand_raises_is_none(self):
         def boom(u):
@@ -541,6 +577,34 @@ class TestDeliveryGoldens(unittest.TestCase):
         r, _ = self._run(text, self.ZONES)
         self.assertEqual(r["status"], "uncertain")
         self.assertEqual(r["marker"], "[уточнить]")
+
+    # 7) ЖИВОЙ place-линк, пин только в теле → точка «на Пхукете», не [уточнить] --------
+    # Зона Пхукета вокруг реального пина из tmp/geo-recon.md (Сайюан/Раваи, 8.0407,98.3433).
+    ZONES_PHUKET = [{"name": "Сайюан", "lat": 8.0407, "lon": 98.3433,
+                     "radius_km": 5, "price": 350}]
+    # Конечный URL из recon (координат в нём нет) + фрагмент тела с пином в staticmap center=.
+    _RECON_FINAL_URL = (
+        "https://www.google.com/maps/place/79,+Meat+Point+%7C+steaks,+burgers,+skewers,"
+        "+79+Soi+Saiyuan,+Mueang,+Phuket,+83100/data=!4m2!3m1!1s0x30502f24a5443265:"
+        "0xa4cc15728db01dbd!18m1!1e1?utm_source=mstt_1&entry=gps&g_st=ac"
+    )
+    _RECON_PAGE = (
+        _RECON_FINAL_URL + "\n<html>…\"https://maps.googleapis.com/maps/api/staticmap?"
+        "center=8.0407335%2C98.3433216&zoom=16&size=800x600\"…</html>"
+    )
+
+    def test_golden_recon_place_link_resolves_on_phuket(self):
+        # Живой сценарий #22: клиент кинул короткую share-ссылку на заведение. Разворот
+        # (замокан конечным URL из recon + тело) даёт пин из тела → точка попадает в зону
+        # Пхукета, а НЕ в ложный [уточнить]. redirect имитируем через _resolve_maps→resolve_maps_link.
+        text = "локация тут https://maps.app.goo.gl/c4G4B3sNrfJZBSue6?g_st=ac спасибо"
+        r, z = self._run(text, self.ZONES_PHUKET, resolve_maps=lambda u: delivery.resolve_maps_link(
+            u, _expand=lambda _u: self._RECON_PAGE))
+        self.assertEqual(r["status"], "zone")     # определилась «на Пхукете», не [уточнить]
+        self.assertEqual(r["zone"], "Сайюан")
+        self.assertEqual(r["price"], 350)
+        self.assertIsNone(r["marker"])
+        self.assertEqual(z, 1)                    # зоны Bridge запрошены — координаты нашлись
 
 
 if __name__ == "__main__":

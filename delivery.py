@@ -103,8 +103,9 @@ def get_delivery_zones(_get=None, _now=None):
 #   1) координаты уже в самой ссылке (?q=lat,lng, @lat,lng, !3d…!4d…, %2C-кодирование,
 #      обрезанный мессенджером хвост) — берём БЕЗ сети;
 #   2) короткая ссылка (maps.app.goo.gl / goo.gl) — разворачиваем по HTTP-редиректу
-#      (с таймаутом, БЕЗ исполнения JS) и парсим конечный URL;
-#   3) place-ссылка без координат / битая ссылка / не-строка → None (честный фолбэк,
+#      (с таймаутом, БЕЗ исполнения JS) и парсим конечный URL; если в конечном URL координат
+#      нет (place-ссылка — пин только в теле), догружаем тело GET'ом и парсим `center=…`/`!3d!4d`;
+#   3) координат нет ни в URL, ни в теле / битая ссылка / не-строка → None (честный фолбэк,
 #      как у зон: не выдумываем координаты).
 # Никогда не роняет вызывающий код: любые сетевые исключения проглатываются → None.
 
@@ -113,6 +114,10 @@ MAPS_TIMEOUT = int(os.getenv("MAPS_RESOLVE_TIMEOUT", "8") or "8")
 _MAPS_SHORT_HOSTS = ("maps.app.goo.gl", "app.goo.gl", "goo.gl", "g.co")
 # Сколько редиректов пройти при разворачивании (защита от циклов).
 _MAPS_MAX_HOPS = 5
+_MAPS_UA = "Mozilla/5.0 (compatible; TurboBaby/1.0)"
+# Потолок чтения тела финальной страницы (place-ссылки без координат в URL): координаты
+# пина лежат в staticmap `center=…`/JSON-инициализации в начале документа — мегабайты не тянем.
+_MAPS_BODY_CAP = int(os.getenv("MAPS_BODY_CAP_BYTES", "2000000") or "2000000")
 
 # Пары координат в разных местах URL. Требуем десятичную точку (реальные гео-точки её
 # всегда имеют) — так не ловим случайные «q=1,2» из мусора. Диапазоны валидируем отдельно.
@@ -166,15 +171,29 @@ def _is_short_maps_link(url):
     return host in _MAPS_SHORT_HOSTS or host.endswith(".app.goo.gl")
 
 
+def _fetch_body(url):
+    """GET тела финальной страницы (для place-ссылок, где координат в URL нет вовсе — пин
+    лежит только в теле: staticmap `center=lat,lon`/JSON-инициализация). Читаем не более
+    _MAPS_BODY_CAP байт, возвращаем текст. Может кинуть (таймаут/сеть) — ловится выше."""
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": _MAPS_UA})
+    with urllib.request.urlopen(req, timeout=MAPS_TIMEOUT) as r:
+        return r.read(_MAPS_BODY_CAP).decode("utf-8", "replace")
+
+
 def _default_expand(url):
-    """Развернуть короткую ссылку по цепочке HTTP-редиректов (БЕЗ исполнения JS),
-    вернуть конечный URL. Тело не грузим — читаем только заголовок Location.
+    """Развернуть короткую ссылку по цепочке HTTP-редиректов (HEAD, БЕЗ исполнения JS) до
+    конечного URL. Если координаты уже в конечном URL (?q=/@/!3d!4d) — возвращаем URL как есть.
+    Если координат в URL НЕТ (place-ссылка: share по объекту `data=…!1s<feature-id>…`, пин
+    только в теле) — догружаем тело GET'ом и возвращаем «URL\\n+тело» одной строкой, чтобы
+    _parse_coords_from_url достал пару из staticmap `center=…`/`!3d!4d` тела. Тот же порядок
+    lat,lon и та же валидация — свап/вьюпорт не проходят (fail-safe держит).
     Может кинуть (таймаут/сеть) — ловится в resolve_maps_link."""
     cur = url
+    final = None
     for _ in range(_MAPS_MAX_HOPS):
         req = urllib.request.Request(
             cur, method="HEAD",
-            headers={"User-Agent": "Mozilla/5.0 (compatible; TurboBaby/1.0)"})
+            headers={"User-Agent": _MAPS_UA})
         # Не даём urllib молча ходить по редиректам — сами читаем Location.
         opener = urllib.request.build_opener(_NoRedirectHandler)
         resp = opener.open(req, timeout=MAPS_TIMEOUT)
@@ -183,13 +202,26 @@ def _default_expand(url):
             if code in (301, 302, 303, 307, 308):
                 loc = resp.headers.get("Location")
                 if not loc:
-                    return cur
+                    final = cur
+                    break
                 cur = urllib.parse.urljoin(cur, loc)
                 continue
-            return resp.geturl()
+            final = resp.geturl()
+            break
         finally:
             resp.close()
-    return cur
+    if final is None:
+        final = cur
+    # координаты уже в URL → тело не нужно (быстрый путь, без второго запроса)
+    if _parse_coords_from_url(final):
+        return final
+    # place-ссылка без координат в URL — пин только в теле: догружаем тело GET'ом
+    try:
+        body = _fetch_body(final)
+    except Exception as e:
+        log.info(f"_default_expand: тело не скачалось ({type(e).__name__}) — только URL")
+        return final
+    return final + "\n" + body if body else final
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -202,8 +234,11 @@ def resolve_maps_link(url, _expand=None):
     """Ссылка Google Maps → (lat, lon) точки доставки, либо None.
     Короткие maps.app.goo.gl/goo.gl разворачиваются HTTP-редиректом (с таймаутом, без JS);
     поддержаны форматы ?q=lat,lng, @lat,lng, !3d…!4d…, %2C-кодирование и обрезанные
-    мессенджером хвосты. place-ссылка без координат / битая ссылка / не-строка → None.
-    _expand — инъекция сети для тестов. НИКОГДА не роняет вызывающий код."""
+    мессенджером хвосты. place-ссылка без координат в URL — координаты берём из ТЕЛА
+    развёрнутой страницы (staticmap `center=…`/`!3d!4d`, тем же парсером). Координат нет
+    ни в URL, ни в теле / битая ссылка / не-строка → None.
+    _expand — инъекция сети для тестов (возвращает конечный URL, а для place-ссылок — «URL\\n+тело»).
+    НИКОГДА не роняет вызывающий код."""
     if not isinstance(url, str):
         return None
     url = url.strip()
