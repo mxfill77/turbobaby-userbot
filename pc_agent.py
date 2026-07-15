@@ -603,39 +603,80 @@ def _chain_cli(action, pid):
         return f"цепь #{pid}: ошибка {action} ({type(e).__name__}: {e})."
 
 
-async def on_chain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Нажатие кнопки цепи. Гейт: ТОЛЬКО владелец. Стоп/статус исполняет демон, ответ — в чат карточки."""
-    q = update.callback_query
-    if q is None:
-        return
-    parsed = _chain_cb_parse(q.data)
-    if parsed is None:
-        return                                   # чужой callback (напр. модербот) — не наш
-    uid = q.from_user.id if q.from_user else None
+def _chain_cb_route(data, uid):
+    """ЧИСТОЕ решение по нажатию кнопки цепи — без Telegram/сети, потому легко голденить.
+
+    Инцидент (14.07 23:37 и 15.07 10:59): тап по «Статус/Стоп цепи» молчал — ни тоста, ни
+    действия. Корень класса: (1) живой pc_agent крутился на коде ДО появления обработчика
+    → callback уходил в никуда; (2) даже в новом коде ветка «не разобрал data» делала голый
+    return БЕЗ answerCallbackQuery → «часики» на кнопке висли вечно = та же тишина.
+
+    Классовый инвариант ЭТОЙ функции: поле answer ВСЕГДА непусто → на любой тап есть чем
+    мгновенно снять «часики». Возвращает dict:
+      ok:     bool          — исполнять ли действие демоном (_chain_cli)
+      action: 'stop'|'status'|None
+      pid:    str|None
+      answer: str           — текст мгновенного answerCallbackQuery (тост), НИКОГДА не пустой
+      alert:  bool          — show_alert (модалка) — для отказов/устаревших карточек
+      note:   str|None      — пояснение в чат (для отказа/устаревшей); None → шлём вывод демона
+    """
+    parsed = _chain_cb_parse(data)
     if not _chain_cb_authorized(uid):
-        alog.warning(f"chain-callback отклонён: id {uid}")
-        try:
-            await q.answer("⛔ нет прав", show_alert=True)
-        except Exception:
-            pass
-        return
+        # owner-gate раньше разбора: чужому не подсказываем формат кнопок.
+        return {"ok": False, "action": None, "pid": None,
+                "answer": "⛔ нет прав", "alert": True, "note": None}
+    if parsed is None:
+        # Наш бот (AGENT_BOT_TOKEN) шлёт ТОЛЬКО карточки цепи → неразобранный callback = старый
+        # формат / протухшая карточка. Честно говорим это, а не молчим.
+        return {"ok": False, "action": None, "pid": None,
+                "answer": "карточка устарела", "alert": True,
+                "note": "⚠️ Не разберу кнопку этой карточки (устаревший/битый формат). "
+                        "Пришли «статус» — дам актуальную картинку."}
     action, pid = parsed
-    alog.info(f"chain-callback: {action} цепь {pid}")
-    try:
-        await q.answer("⏹ останавливаю цепь…" if action == "stop" else "📊 читаю статус…")
-    except Exception:
-        pass
-    reply = await asyncio.to_thread(_chain_cli, action, pid)
+    return {"ok": True, "action": action, "pid": pid,
+            "answer": ("⏹ останавливаю цепь…" if action == "stop" else "📊 читаю статус…"),
+            "alert": False, "note": None}
+
+
+async def _chain_reply(context, q, text):
+    """Ответ в чат/тему карточки (форум-фолбэк → та же тема). Никогда не роняет обработчик."""
     msg = q.message
     if msg is None:
         return
     kwargs = {}
-    if getattr(msg, "message_thread_id", None):  # форум-фолбэк карточки → отвечаем в ту же тему
+    if getattr(msg, "message_thread_id", None):
         kwargs["message_thread_id"] = msg.message_thread_id
     try:
-        await context.bot.send_message(msg.chat_id, reply, **kwargs)
+        await context.bot.send_message(msg.chat_id, text, **kwargs)
     except Exception:
         alog.exception("chain-callback: не смог отправить ответ")
+
+
+async def on_chain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажатие кнопки цепи. Гейт: ТОЛЬКО владелец. Стоп/статус исполняет демон, ответ — в чат карточки.
+
+    Порядок жёсткий: сперва МГНОВЕННЫЙ answerCallbackQuery (снять «часики» на кнопке при ЛЮБОМ
+    исходе), затем видимое сообщение. Даже если тост не дошёл (протухший query «too old» / сеть) —
+    всё равно отдаём ответ отдельным сообщением, чтобы тап никогда не выглядел «проглоченным»."""
+    q = update.callback_query
+    if q is None:
+        return
+    uid = q.from_user.id if q.from_user else None
+    route = _chain_cb_route(q.data, uid)
+    alog.info(f"chain-callback: data={q.data!r} uid={uid} → action={route['action']} ok={route['ok']}")
+    # 1) МГНОВЕННЫЙ ACK — снимаем «часики» при любом исходе. Провал (query too old/сеть) не глотаем молча.
+    try:
+        await q.answer(route["answer"], show_alert=route["alert"])
+    except Exception as e:
+        alog.warning(f"chain-callback: answerCallbackQuery не прошёл ({type(e).__name__}: {e}) — ответлю сообщением")
+    # 2) отказ / устаревшая карточка: без действия, но с честным пояснением (если есть)
+    if not route["ok"]:
+        if route["note"]:
+            await _chain_reply(context, q, route["note"])
+        return
+    # 3) действие исполняет демон (свой канал к Bridge), результат — сообщением в чат карточки
+    reply = await asyncio.to_thread(_chain_cli, route["action"], route["pid"])
+    await _chain_reply(context, q, reply)
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):

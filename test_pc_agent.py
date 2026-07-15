@@ -8,12 +8,15 @@ logs/<имя>_stderr.log (APPEND), чтобы смерть ребёнка ост
 import os
 import sys
 import time
+import types
+import asyncio
 import tempfile
 import subprocess
 import unittest
 from pathlib import Path
 
 import pc_agent as a
+import dispatch_notify as dn
 
 
 class TestChildStderrLog(unittest.TestCase):
@@ -180,6 +183,155 @@ class TestChainCallback(unittest.TestCase):
         self.assertTrue(a._chain_cb_authorized(a.ALLOWED_USER_ID))
         self.assertFalse(a._chain_cb_authorized(a.ALLOWED_USER_ID + 1))
         self.assertFalse(a._chain_cb_authorized(None))
+
+
+class TestChainCallbackRoute(unittest.TestCase):
+    """ГОЛДЕН роутинга кнопок цепи. Инцидент 14.07 23:37 / 15.07 10:59: тап молчал.
+    Классовый инвариант: answer НИКОГДА не пуст → тап всегда снимает «часики»; неизвестный/
+    протухший callback → честное «карточка устарела», а не тишина. Данные берём РЕАЛЬНЫЕ —
+    ровно те, что эмитит dispatch_notify._chain_markup (тест ≠ идеализация)."""
+
+    OWNER = a.ALLOWED_USER_ID
+    STRANGER = a.ALLOWED_USER_ID + 1
+
+    def _real_cb(self, pid):
+        """Достаём callback_data так, как их реально кладёт продюсер карточек."""
+        row = dn._chain_markup(pid)["inline_keyboard"][0]
+        return row[0]["callback_data"], row[1]["callback_data"]  # (stop, status)
+
+    def test_real_callback_data_shape(self):
+        stop_cb, status_cb = self._real_cb(42)
+        self.assertEqual(stop_cb, "chain:stop:42")
+        self.assertEqual(status_cb, "chain:status:42")
+
+    def test_owner_stop_routes_to_action(self):
+        stop_cb, _ = self._real_cb(42)
+        r = a._chain_cb_route(stop_cb, self.OWNER)
+        self.assertTrue(r["ok"])
+        self.assertEqual((r["action"], r["pid"]), ("stop", "42"))
+        self.assertTrue(r["answer"])                 # непустой ACK
+        self.assertFalse(r["alert"])
+        self.assertIsNone(r["note"])
+
+    def test_owner_status_routes_to_action(self):
+        _, status_cb = self._real_cb(7)
+        r = a._chain_cb_route(status_cb, self.OWNER)
+        self.assertTrue(r["ok"])
+        self.assertEqual((r["action"], r["pid"]), ("status", "7"))
+        self.assertTrue(r["answer"])
+
+    def test_owner_stale_card_is_honest_not_silent(self):
+        # неразобранный/протухший callback владельца → «карточка устарела» + пояснение, НЕ тишина
+        for bad in ("chain:kill:1", "chain:stop:abc", "m:12:yes", "", None):
+            r = a._chain_cb_route(bad, self.OWNER)
+            self.assertFalse(r["ok"], bad)
+            self.assertIsNone(r["action"], bad)
+            self.assertIn("устарела", r["answer"], bad)
+            self.assertTrue(r["alert"], bad)
+            self.assertIn("статус", (r["note"] or "").lower(), bad)
+
+    def test_stranger_denied_before_parse(self):
+        stop_cb, _ = self._real_cb(42)
+        r = a._chain_cb_route(stop_cb, self.STRANGER)
+        self.assertFalse(r["ok"])
+        self.assertIn("нет прав", r["answer"])
+        self.assertTrue(r["alert"])
+        self.assertIsNone(r["note"])
+
+    def test_answer_never_empty_invariant(self):
+        # ядро фикса: на ЛЮБОЙ вход — непустой мгновенный ACK
+        for data in ("chain:stop:1", "chain:status:2", "garbage", "", None):
+            for uid in (self.OWNER, self.STRANGER, None):
+                r = a._chain_cb_route(data, uid)
+                self.assertTrue(r["answer"], f"пустой answer для data={data!r} uid={uid}")
+
+
+class _FakeQuery:
+    def __init__(self, data, uid, chat_id=a.HQ_CHAT_ID, thread=None):
+        self.data = data
+        self.from_user = types.SimpleNamespace(id=uid) if uid is not None else None
+        self.message = types.SimpleNamespace(chat_id=chat_id, message_thread_id=thread)
+        self.answers = []
+
+    async def answer(self, text=None, show_alert=False):
+        self.answers.append((text, show_alert))
+
+
+class _FakeBot:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, chat_id, text, **kwargs):
+        self.sent.append((chat_id, text, kwargs))
+
+
+class TestChainCallbackHandlerGolden(unittest.TestCase):
+    """Сквозной голден обработчика: тап → (мгновенный answerCallbackQuery) + видимое сообщение,
+    действие роутится в демон. Реальные callback_data из dispatch_notify. _chain_cli замокан."""
+
+    def setUp(self):
+        self._save_cli = a._chain_cli
+        self._calls = []
+        a._chain_cli = lambda action, pid: self._calls.append((action, pid)) or f"OK:{action}:{pid}"
+
+    def tearDown(self):
+        a._chain_cli = self._save_cli
+
+    def _run(self, data, uid, thread=None):
+        q = _FakeQuery(data, uid, thread=thread)
+        bot = _FakeBot()
+        update = types.SimpleNamespace(callback_query=q)
+        context = types.SimpleNamespace(bot=bot)
+        asyncio.run(a.on_chain_callback(update, context))
+        return q, bot
+
+    def test_owner_stop_acks_and_confirms(self):
+        stop_cb = dn._chain_markup(42)["inline_keyboard"][0][0]["callback_data"]
+        q, bot = self._run(stop_cb, a.ALLOWED_USER_ID)
+        self.assertEqual(len(q.answers), 1)             # мгновенный ACK ровно один
+        self.assertTrue(q.answers[0][0])                # непустой текст тоста
+        self.assertEqual(self._calls, [("stop", "42")]) # действие ушло в демон
+        self.assertEqual(len(bot.sent), 1)              # подтверждение сообщением
+        self.assertIn("OK:stop:42", bot.sent[0][1])
+
+    def test_owner_status_forum_thread_preserved(self):
+        status_cb = dn._chain_markup(9)["inline_keyboard"][0][1]["callback_data"]
+        q, bot = self._run(status_cb, a.ALLOWED_USER_ID, thread=205)
+        self.assertEqual(self._calls, [("status", "9")])
+        self.assertEqual(bot.sent[0][2].get("message_thread_id"), 205)  # ответ в ту же тему
+
+    def test_owner_stale_card_answers_and_explains_no_action(self):
+        q, bot = self._run("chain:kill:1", a.ALLOWED_USER_ID)
+        self.assertEqual(len(q.answers), 1)
+        self.assertIn("устарела", q.answers[0][0])
+        self.assertTrue(q.answers[0][1])                # show_alert
+        self.assertEqual(self._calls, [])               # НИКАКОГО действия
+        self.assertEqual(len(bot.sent), 1)              # но честное пояснение прислали
+        self.assertIn("устаре", bot.sent[0][1].lower())
+
+    def test_stranger_denied_no_action_no_message(self):
+        stop_cb = dn._chain_markup(42)["inline_keyboard"][0][0]["callback_data"]
+        q, bot = self._run(stop_cb, a.ALLOWED_USER_ID + 1)
+        self.assertEqual(len(q.answers), 1)
+        self.assertIn("нет прав", q.answers[0][0])
+        self.assertEqual(self._calls, [])               # действие не исполнено
+        self.assertEqual(bot.sent, [])                  # чужому в чат ничего не шлём
+
+    def test_answer_failure_still_sends_visible_reply(self):
+        # протухший query: answerCallbackQuery бросает («too old») — но видимый ответ всё равно есть
+        stop_cb = dn._chain_markup(5)["inline_keyboard"][0][0]["callback_data"]
+        q = _FakeQuery(stop_cb, a.ALLOWED_USER_ID)
+
+        async def _boom(text=None, show_alert=False):
+            raise RuntimeError("query is too old")
+        q.answer = _boom
+        bot = _FakeBot()
+        update = types.SimpleNamespace(callback_query=q)
+        context = types.SimpleNamespace(bot=bot)
+        asyncio.run(a.on_chain_callback(update, context))
+        self.assertEqual(self._calls, [("stop", "5")])  # действие исполнено несмотря на провал тоста
+        self.assertEqual(len(bot.sent), 1)              # и видимое сообщение отправлено
+        self.assertIn("OK:stop:5", bot.sent[0][1])
 
 
 if __name__ == "__main__":
