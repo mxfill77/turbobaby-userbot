@@ -101,13 +101,16 @@ def get_delivery_zones(_get=None, _now=None):
 # Клиент кидает точку в переписку короткой ссылкой (maps.app.goo.gl/…) или полным
 # URL Google Maps. Чтобы посчитать зону/цену доставки по координатам, ссылку надо
 # ПРЕВРАТИТЬ в (lat, lon). Порядок:
-#   1) координаты уже в самой ссылке (?q=lat,lng, @lat,lng, !3d…!4d…, %2C-кодирование,
+#   1) НАДЁЖНЫЕ координаты уже в самой ссылке (?q=lat,lng, @lat,lng, !3d…!4d…, %2C-кодирование,
 #      обрезанный мессенджером хвост) — берём БЕЗ сети;
 #   2) короткая ссылка (maps.app.goo.gl / goo.gl) — разворачиваем по HTTP-редиректу
 #      (с таймаутом, БЕЗ исполнения JS) и парсим конечный URL; если в конечном URL координат
-#      нет (place-ссылка — пин только в теле), догружаем тело GET'ом и парсим `center=…`/`!3d!4d`;
-#   3) координат нет ни в URL, ни в теле / битая ссылка / не-строка → None (честный фолбэк,
-#      как у зон: не выдумываем координаты).
+#      нет (place-ссылка), догружаем тело GET'ом и ищем в нём ТОЛЬКО точный пин `!3d…!4d…`
+#      (метаданные place). Вьюпорт-центроид (`center=` статической карты / og:image) —
+#      НЕнадёжен и НЕ используется (решение ASK #51): это центр картинки, а не точка клиента,
+#      цену по нему не называем никогда;
+#   3) надёжных координат нет ни в URL, ни точного пина в теле / битая ссылка / не-строка →
+#      None (честный фолбэк [уточнить]: не выдумываем координаты и не берём вьюпорт-центроид).
 # Никогда не роняет вызывающий код: любые сетевые исключения проглатываются → None.
 
 MAPS_TIMEOUT = int(os.getenv("MAPS_RESOLVE_TIMEOUT", "8") or "8")
@@ -116,18 +119,22 @@ _MAPS_SHORT_HOSTS = ("maps.app.goo.gl", "app.goo.gl", "goo.gl", "g.co")
 # Сколько редиректов пройти при разворачивании (защита от циклов).
 _MAPS_MAX_HOPS = 5
 _MAPS_UA = "Mozilla/5.0 (compatible; TurboBaby/1.0)"
-# Потолок чтения тела финальной страницы (place-ссылки без координат в URL): координаты
-# пина лежат в staticmap `center=…`/JSON-инициализации в начале документа — мегабайты не тянем.
+# Потолок чтения тела финальной страницы (place-ссылки без координат в URL): точный пин
+# `!3d!4d` (метаданные place) лежит в начале документа — мегабайты не тянем. Вьюпорт-центроид
+# `center=` статической карты в теле есть, но его НЕ используем (ASK #51).
 _MAPS_BODY_CAP = int(os.getenv("MAPS_BODY_CAP_BYTES", "2000000") or "2000000")
 
 # Пары координат в разных местах URL. Требуем десятичную точку (реальные гео-точки её
 # всегда имеют) — так не ловим случайные «q=1,2» из мусора. Диапазоны валидируем отдельно.
 _LATLON = r"(-?\d{1,3}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)"
-# ?q=/query=/ll=/destination=/daddr=/center= — явно заданная точка.
-_RE_MAPS_QUERY = re.compile(r"[?&](?:q|query|ll|sll|destination|daddr|center)=" + _LATLON, re.I)
-# !3dLAT!4dLNG — точный пин места в data-хвосте развёрнутого URL.
+# ?q=/query=/ll=/destination=/daddr= — явно заданная КЛИЕНТОМ точка (надёжно).
+# `center=` НАМЕРЕННО исключён (решение ASK #51): это центр статической карты/og:image —
+# вьюпорт-центроид страницы, а НЕ пин клиента; по нему цену не называем.
+_RE_MAPS_QUERY = re.compile(r"[?&](?:q|query|ll|sll|destination|daddr)=" + _LATLON, re.I)
+# !3dLAT!4dLNG — точный пин места в data-хвосте развёрнутого URL / метаданных place (надёжно).
 _RE_MAPS_3D4D = re.compile(r"!3d(-?\d{1,3}\.\d+)!4d(-?\d{1,3}\.\d+)")
-# @LAT,LNG,zoom — центр вьюпорта (менее точен, потому в самом конце приоритета).
+# @LAT,LNG,zoom в САМОЙ ссылке клиента — надёжно (то, что клиент расшарил). В ТЕЛЕ страницы
+# `@` не берём (там это вьюпорт карты) — тело парсит только точный пин, см. _parse_pin_from_body.
 _RE_MAPS_AT = re.compile(r"@" + _LATLON)
 
 
@@ -144,9 +151,9 @@ def _valid_latlon(lat, lon):
 
 
 def _parse_coords_from_url(url):
-    """Достать (lat, lon) из строки URL Google Maps или None. Сначала URL-декодируем
-    (%2C→',', %2F→'/' и т.п.), затем пробуем форматы по убыванию точности точки:
-    ?q=/query=… → !3d…!4d… → @…,…. Устойчив к обрезанному мессенджером хвосту."""
+    """Достать НАДЁЖНЫЕ (lat, lon) из строки URL Google Maps или None. Сначала URL-декодируем
+    (%2C→',', %2F→'/' и т.п.), затем пробуем надёжные форматы: ?q=/query=… → !3d…!4d… → @…,….
+    Устойчив к обрезанному мессенджером хвосту. Вьюпорт-центроид `center=` НЕ парсим (ASK #51)."""
     if not url:
         return None
     try:
@@ -162,6 +169,24 @@ def _parse_coords_from_url(url):
     return None
 
 
+def _parse_pin_from_body(body):
+    """Достать ТОЧНЫЙ пин места (lat, lon) из ТЕЛА развёрнутой place-страницы, либо None.
+    Решение ASK #51: из тела берём ТОЛЬКО точный пин `!3d<lat>!4d<lon>` (метаданные place),
+    а НЕ вьюпорт-центроид (`center=` статической карты / og:image — центр картинки, не точка
+    клиента). Нет точного пина в теле → None → честный [уточнить] (цену по центроиду не
+    называем никогда)."""
+    if not body:
+        return None
+    try:
+        dec = urllib.parse.unquote(body)
+    except Exception:
+        dec = body
+    m = _RE_MAPS_3D4D.search(dec)
+    if m:
+        return _valid_latlon(m.group(1), m.group(2))
+    return None
+
+
 def _is_short_maps_link(url):
     """URL — короткая ссылка Google Maps (maps.app.goo.gl / goo.gl / g.co)?"""
     try:
@@ -173,9 +198,10 @@ def _is_short_maps_link(url):
 
 
 def _fetch_body(url):
-    """GET тела финальной страницы (для place-ссылок, где координат в URL нет вовсе — пин
-    лежит только в теле: staticmap `center=lat,lon`/JSON-инициализация). Читаем не более
-    _MAPS_BODY_CAP байт, возвращаем текст. Может кинуть (таймаут/сеть) — ловится выше."""
+    """GET тела финальной страницы (для place-ссылок, где координат в URL нет вовсе). Ищем в
+    теле ТОЛЬКО точный пин `!3d!4d` (метаданные place); вьюпорт-центроид `center=` статической
+    карты игнорируем (ASK #51). Читаем не более _MAPS_BODY_CAP байт, возвращаем текст.
+    Может кинуть (таймаут/сеть) — ловится выше."""
     req = urllib.request.Request(url, method="GET", headers={"User-Agent": _MAPS_UA})
     with urllib.request.urlopen(req, timeout=MAPS_TIMEOUT) as r:
         return r.read(_MAPS_BODY_CAP).decode("utf-8", "replace")
@@ -183,12 +209,11 @@ def _fetch_body(url):
 
 def _default_expand(url):
     """Развернуть короткую ссылку по цепочке HTTP-редиректов (HEAD, БЕЗ исполнения JS) до
-    конечного URL. Если координаты уже в конечном URL (?q=/@/!3d!4d) — возвращаем URL как есть.
-    Если координат в URL НЕТ (place-ссылка: share по объекту `data=…!1s<feature-id>…`, пин
-    только в теле) — догружаем тело GET'ом и возвращаем «URL\\n+тело» одной строкой, чтобы
-    _parse_coords_from_url достал пару из staticmap `center=…`/`!3d!4d` тела. Тот же порядок
-    lat,lon и та же валидация — свап/вьюпорт не проходят (fail-safe держит).
-    Может кинуть (таймаут/сеть) — ловится в resolve_maps_link."""
+    конечного URL. Если НАДЁЖНЫЕ координаты уже в конечном URL (?q=/@/!3d!4d) — возвращаем URL
+    как есть. Если их в URL НЕТ (place-ссылка: share по объекту `data=…!1s<feature-id>…`) —
+    догружаем тело GET'ом и возвращаем «URL\\n+тело» одной строкой; из тела resolve_maps_link
+    берёт ТОЛЬКО точный пин `!3d!4d` (метаданные place), а вьюпорт-центроид `center=` статической
+    карты игнорирует (ASK #51). Может кинуть (таймаут/сеть) — ловится в resolve_maps_link."""
     cur = url
     final = None
     # Не даём urllib молча ходить по редиректам — сами читаем Location.
@@ -222,10 +247,11 @@ def _default_expand(url):
             resp.close()
     if final is None:
         final = cur
-    # координаты уже в URL → тело не нужно (быстрый путь, без второго запроса)
+    # надёжные координаты уже в URL → тело не нужно (быстрый путь, без второго запроса)
     if _parse_coords_from_url(final):
         return final
-    # place-ссылка без координат в URL — пин только в теле: догружаем тело GET'ом
+    # place-ссылка без координат в URL — точный пин (!3d!4d) может быть в теле: догружаем тело
+    # GET'ом (вьюпорт-центроид center= при разборе тела игнорируется, ASK #51)
     try:
         body = _fetch_body(final)
     except Exception as e:
@@ -243,10 +269,11 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 def resolve_maps_link(url, _expand=None):
     """Ссылка Google Maps → (lat, lon) точки доставки, либо None.
     Короткие maps.app.goo.gl/goo.gl разворачиваются HTTP-редиректом (с таймаутом, без JS);
-    поддержаны форматы ?q=lat,lng, @lat,lng, !3d…!4d…, %2C-кодирование и обрезанные
-    мессенджером хвосты. place-ссылка без координат в URL — координаты берём из ТЕЛА
-    развёрнутой страницы (staticmap `center=…`/`!3d!4d`, тем же парсером). Координат нет
-    ни в URL, ни в теле / битая ссылка / не-строка → None.
+    надёжные форматы ?q=lat,lng, @lat,lng, !3d…!4d…, %2C-кодирование и обрезанные мессенджером
+    хвосты. place-ссылка без координат в URL — из ТЕЛА развёрнутой страницы берём ТОЛЬКО точный
+    пин `!3d!4d` (метаданные place); вьюпорт-центроид `center=` статической карты/og:image
+    НЕнадёжен и игнорируется (решение ASK #51: цену по центроиду не называем). Надёжных координат
+    нет ни в URL, ни точного пина в теле / битая ссылка / не-строка → None.
     _expand — инъекция сети для тестов (возвращает конечный URL, а для place-ссылок — «URL\\n+тело»).
     НИКОГДА не роняет вызывающий код."""
     if not isinstance(url, str):
@@ -254,11 +281,11 @@ def resolve_maps_link(url, _expand=None):
     url = url.strip()
     if not url:
         return None
-    # 1) координаты уже в ссылке — берём без сети
+    # 1) надёжные координаты уже в ссылке — берём без сети
     coords = _parse_coords_from_url(url)
     if coords:
         return coords
-    # 2) короткая ссылка — развернуть редиректом и распарсить конечный URL
+    # 2) короткая ссылка — развернуть редиректом и распарсить
     if _is_short_maps_link(url):
         expander = _expand or _default_expand
         try:
@@ -267,8 +294,16 @@ def resolve_maps_link(url, _expand=None):
             log.info(f"resolve_maps_link: разворот не удался ({type(e).__name__}) — None")
             return None
         if isinstance(final, str):
-            return _parse_coords_from_url(final)
-    # 3) place-ссылка без координат / битая ссылка → None
+            # _default_expand отдаёт «конечный URL\n+тело» для place-ссылок. Разделяем источники:
+            # из URL — надёжные координаты клиента; из ТЕЛА — ТОЛЬКО точный пин (!3d!4d), вьюпорт
+            # (center= статической карты) не берём (ASK #51).
+            url_part, _sep, body_part = final.partition("\n")
+            coords = _parse_coords_from_url(url_part)
+            if coords:
+                return coords
+            if body_part:
+                return _parse_pin_from_body(body_part)
+    # 3) place-ссылка без надёжных координат / битая ссылка → None
     return None
 
 

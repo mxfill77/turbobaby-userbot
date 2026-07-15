@@ -211,38 +211,50 @@ class TestResolveMapsLink(unittest.TestCase):
         final = "https://www.google.com/maps/place/Some+Cafe/"
         self.assertIsNone(delivery.resolve_maps_link(short, _expand=lambda u: final))
 
-    # ------------------------- ЖИВОЙ place-линк: пин только в ТЕЛЕ ------------
+    # ------- ЖИВОЙ place-линк «Meat Point»: в теле ТОЛЬКО вьюпорт-центроид (ASK #51) -------
 
-    # Реальный провал из tmp/geo-recon.md: короткая share-ссылка на объект разворачивается в
-    # place-URL, где координат НЕТ вовсе (только текстовый адрес + hex-CID). Реальный пин
-    # `8.0407335, 98.3433216` (Сайюан/Раваи, Пхукет) лежит ЛИШЬ в теле — staticmap `center=…`.
-    # Продовый _default_expand отдаёт «конечный URL\n+тело», парсер тем же _LATLON берёт center=.
+    # Реальный кейс из tmp/geo-recon.md: короткая share-ссылка на объект разворачивается в
+    # place-URL, где координат НЕТ вовсе (только текстовый адрес + hex-CID). В теле единственная
+    # координатная пара — `center=8.0407335,98.3433216` статической карты, т.е. ВЬЮПОРТ-ЦЕНТРОИД
+    # (центр картинки), а НЕ пин заведения. Решение ASK #51: по центроиду цену не называем —
+    # нет точного пина `!3d!4d` в теле ⇒ ссылка честно уходит в [уточнить].
     GEO_RECON_FINAL_URL = (
         "https://www.google.com/maps/place/79,+Meat+Point+%7C+steaks,+burgers,+skewers,"
         "+79+Soi+Saiyuan,+Mueang,+Phuket,+83100/data=!4m2!3m1!1s0x30502f24a5443265:"
         "0xa4cc15728db01dbd!18m1!1e1?utm_source=mstt_1&entry=gps&coh=192189&g_st=ac"
     )
-    # Фрагмент тела: центр статической карты — пара в порядке lat,lon (как в живом ответе).
+    # Фрагмент ЖИВОГО тела: единственная пара — center= статической карты (вьюпорт-центроид).
     GEO_RECON_BODY = (
         "<html>…\"https://maps.googleapis.com/maps/api/staticmap?"
         "center=8.0407335%2C98.3433216&zoom=16&size=800x600\"…</html>"
     )
-    GEO_RECON_PIN = (8.0407335, 98.3433216)
+    GEO_RECON_CENTROID = (8.0407335, 98.3433216)   # НЕ пин — вьюпорт; цену по нему НЕ даём
 
-    def test_recon_place_link_coords_from_body_on_phuket(self):
-        # ГОЛДЕН живого формата: в конечном URL координат нет вовсе — доказываем это, затем
-        # показываем, что резолвер достаёт пин из ТЕЛА и точка определяется «на Пхукете».
+    def test_golden_meatpoint_centroid_body_is_none(self):
+        # ГОЛДЕН ASK #51 (живая ссылка Meat Point): в конечном URL координат нет вовсе, а в теле —
+        # лишь вьюпорт-центроид center=. Точного пина `!3d!4d` нет → resolve_maps_link=None
+        # (честный [уточнить]). Центроид НЕ выдаём как точку клиента.
         self.assertIsNone(delivery._parse_coords_from_url(self.GEO_RECON_FINAL_URL))
+        # тело с одним лишь center= НЕ даёт координат: из тела берём только точный пин `!3d!4d`
+        self.assertIsNone(delivery._parse_pin_from_body(self.GEO_RECON_BODY))
         short = "https://maps.app.goo.gl/c4G4B3sNrfJZBSue6?g_st=ac"
-        # _expand имитирует продовый разворот: «конечный URL\n+тело» (redirect → финальный URL из recon)
         page = self.GEO_RECON_FINAL_URL + "\n" + self.GEO_RECON_BODY
+        self.assertIsNone(delivery.resolve_maps_link(short, _expand=lambda u: page))
+
+    def test_place_link_exact_pin_in_body_resolves(self):
+        # КОНТРАСТ к центроиду: если в теле place-страницы ЕСТЬ точный пин `!3d!4d` (метаданные
+        # place) — берём именно его (надёжный источник), а вьюпорт-центроид center= рядом игнорим.
+        short = "https://maps.app.goo.gl/PinInBody"
+        body = ("<html>…/data=!3m1!4b1!3d7.771!4d98.327!… "
+                "staticmap?center=8.0407335%2C98.3433216&zoom=16…</html>")   # центроид рядом — игнор
+        page = self.GEO_RECON_FINAL_URL + "\n" + body
         got = delivery.resolve_maps_link(short, _expand=lambda u: page)
-        self._assert_close(got, self.GEO_RECON_PIN)
-        # «на Пхукете»: точка внутри bbox острова (lat 7.6–8.3, lon 98.2–98.5), НЕ свап (lat≤90)
-        self.assertTrue(7.6 <= got[0] <= 8.3 and 98.2 <= got[1] <= 98.5)
+        self.assertIsNotNone(got)
+        self.assertAlmostEqual(got[0], 7.771, places=3)   # взят пин !3d!4d, НЕ центроид 8.04…
+        self.assertAlmostEqual(got[1], 98.327, places=3)
 
     def test_recon_place_link_no_body_coords_is_none(self):
-        # тот же конечный URL, но тело без координат → честный None (fail-safe не ослаблен)
+        # тот же конечный URL, но тело вообще без координат → честный None (fail-safe не ослаблен)
         short = "https://maps.app.goo.gl/c4G4B3sNrfJZBSue6?g_st=ac"
         page = self.GEO_RECON_FINAL_URL + "\n<html>no coordinates here</html>"
         self.assertIsNone(delivery.resolve_maps_link(short, _expand=lambda u: page))
@@ -523,15 +535,12 @@ class TestLivePositionalZones(unittest.TestCase):
         r = delivery.resolve_delivery(7.771, 98.327, dict_zone)
         self.assertEqual((r["zone"], r["price"]), ("Раваи", 590))
 
-    def test_golden_meatpoint_pin_out_belt_on_live_zones(self):
-        # ЧЕСТНЫЙ голден живого пина Meat Point (8.0407335, 98.3433216 — центр острова из тела)
-        # против ЖИВЫХ зон: ближайший якорь «Таланг север» (5.83 км, r=5) — вне радиуса, но в
-        # поясе +5 км → out_belt/1490. НЕ подгоняем синтетическую зону под пин ради «590».
-        r = delivery.resolve_delivery(8.0407335, 98.3433216, LIVE_ZONES)
-        self.assertEqual(r["status"], "out_belt")
-        self.assertEqual(r["price"], 1490)
-        self.assertEqual(r["price"], delivery.OUT_BELT_PRICE)
-        self.assertIsNone(r["marker"])
+    # NB: удалён прежний test_golden_meatpoint_pin_out_belt_on_live_zones — он подавал координату
+    # вьюпорт-центроида (8.0407335, 98.3433216) в resolve_delivery и ждал out_belt/1490. Решение
+    # ASK #51: по центроиду цену не называем ВООБЩЕ — такая координата до resolve_delivery не
+    # доходит (resolve_maps_link отдаёт None → [уточнить]). Голден Meat Point теперь — [уточнить]
+    # (см. TestResolveMapsLink.test_golden_meatpoint_centroid_body_is_none и
+    # TestDeliveryGoldens.test_golden_meatpoint_centroid_uncertain).
 
 
 class TestDefaultExpandRedirectChain(unittest.TestCase):
@@ -539,12 +548,13 @@ class TestDefaultExpandRedirectChain(unittest.TestCase):
     заставляет urllib поднять HTTPError на opener.open (а НЕ вернуть 3xx-ответ). Раньше это
     роняло разворот на первом же 302 → короткие ссылки молча деградировали в None (ложный
     [уточнить]). Проверяем, что _default_expand ловит HTTPError КАК ОТВЕТ, читает Location,
-    проходит цепочку до 200 и — для place-ссылки без координат в URL — догружает тело.
-    Вся сеть замокана мок-opener'ом (302+Location дословно) — тест не ходит в интернет."""
+    проходит цепочку до 200 и — для place-ссылки без координат в URL — догружает тело. Механика
+    разворота (Bug A) ортогональна ASK #51 и остаётся валидной; но координаты из тела Meat Point
+    НЕ извлекаем — там лишь вьюпорт-центроид center= (не пин). Сеть замокана — без интернета."""
 
     # Живые артефакты кейса «79 Meat Point» (tmp/geo-recon.md): короткая share-ссылка,
     # конечный place-URL (координат в нём НЕТ) и фрагмент живого тела с единственной парой —
-    # center= статической карты (og:image пина), запятая %2C-кодирована ровно как в проде.
+    # center= статической карты (ВЬЮПОРТ-ЦЕНТРОИД, не пин), запятая %2C-кодирована как в проде.
     SHORT = "https://maps.app.goo.gl/c4G4B3sNrfJZBSue6?g_st=ac"
     MID = "https://maps.app.goo.gl/_intermediate_hop_"
     FINAL = ("https://www.google.com/maps/place/79,+Meat+Point+%7C+steaks,+burgers,+skewers,"
@@ -552,7 +562,7 @@ class TestDefaultExpandRedirectChain(unittest.TestCase):
              "0xa4cc15728db01dbd!18m1!1e1?utm_source=mstt_1&entry=gps&g_st=ac")
     BODY = ('<html>…<meta content="https://maps.googleapis.com/maps/api/staticmap?'
             'center=8.0407335%2C98.3433216&zoom=16&size=800x600&markers=…">…</html>')
-    PIN = (8.0407335, 98.3433216)
+    CENTROID = (8.0407335, 98.3433216)   # вьюпорт-центроид тела — цену по нему НЕ даём (ASK #51)
 
     class _Resp200:
         """Фейк конечного 200-ответа (как HTTPResponse после разворота)."""
@@ -584,33 +594,37 @@ class TestDefaultExpandRedirectChain(unittest.TestCase):
         self.addCleanup(setattr, delivery, "_fetch_body", saved_fetch)
 
     def test_single_302_hop_then_body(self):
-        # один 302 → конечный URL без координат → тело догружено → «URL\n+тело»
+        # один 302 → конечный URL без координат → тело догружено → «URL\n+тело» (механика Bug A).
+        # Тело несёт лишь вьюпорт-центроид center= → координат из него НЕ извлекаем (ASK #51).
         self._mock_net({self.SHORT: self.FINAL})
         out = delivery._default_expand(self.SHORT)
-        self.assertEqual(out, self.FINAL + "\n" + self.BODY)
-        self.assertEqual(delivery._parse_coords_from_url(out), self.PIN)
+        self.assertEqual(out, self.FINAL + "\n" + self.BODY)          # редирект пройден, тело добавлено
+        self.assertIsNone(delivery._parse_pin_from_body(self.BODY))   # точного пина нет — центроид игнор
+        self.assertIsNone(delivery.resolve_maps_link(self.SHORT))     # сквозь публичный API → None
 
     def test_multi_hop_chain_walked(self):
-        # цепочка 302→302→200 проходится целиком (не падает на первом Location)
+        # цепочка 302→302→200 проходится целиком (не падает на первом Location, механика Bug A)
         self._mock_net({self.SHORT: self.MID, self.MID: self.FINAL})
         out = delivery._default_expand(self.SHORT)
-        self.assertTrue(out.startswith(self.FINAL))
-        self.assertEqual(delivery._parse_coords_from_url(out), self.PIN)
+        self.assertTrue(out.startswith(self.FINAL))                   # дошли до конечного URL
+        self.assertIsNone(delivery.resolve_maps_link(self.SHORT))     # тело — центроид → None (ASK #51)
 
-    def test_resolve_maps_link_full_path_yields_pin(self):
-        # сквозь публичный resolve_maps_link (реальный _default_expand, мок-сеть) → живой пин
+    def test_resolve_maps_link_full_path_yields_none(self):
+        # сквозь публичный resolve_maps_link (реальный _default_expand, мок-сеть): тело Meat Point
+        # несёт лишь вьюпорт-центроид → None → честный [уточнить] (ASK #51), НЕ координата.
         self._mock_net({self.SHORT: self.FINAL})
-        self.assertEqual(delivery.resolve_maps_link(self.SHORT), self.PIN)
+        self.assertIsNone(delivery.resolve_maps_link(self.SHORT))
 
-    def test_end_to_end_meatpoint_out_belt_1490(self):
-        # СКВОЗНОЙ живой сценарий #51: короткая ссылка → 302+Location → place-URL → тело →
-        # пин (центр острова) → ЖИВЫЕ зоны → out_belt/1490 (реальный итог, НЕ ложный [уточнить]).
+    def test_end_to_end_meatpoint_uncertain(self):
+        # СКВОЗНОЙ живой сценарий #51 (после решения ASK #51): короткая ссылка → 302+Location →
+        # place-URL → тело с одним вьюпорт-центроидом → точного пина нет → [уточнить]. Цену по
+        # центроиду НЕ называем (раньше здесь ошибочно выходило out_belt/1490).
         self._mock_net({self.SHORT: self.FINAL})
         text = f"локация тут {self.SHORT} спасибо"
         r = delivery.resolve_delivery_from_text(text, _get_zones=lambda: LIVE_ZONES)
-        self.assertEqual(r["status"], "out_belt")
-        self.assertEqual(r["price"], 1490)
-        self.assertIsNone(r["marker"])
+        self.assertEqual(r["status"], "uncertain")
+        self.assertEqual(r["marker"], "[уточнить]")
+        self.assertIsNone(r["price"])
 
 
 class TestDeliveryGoldens(unittest.TestCase):
@@ -619,13 +633,15 @@ class TestDeliveryGoldens(unittest.TestCase):
     Прогоняем реальные реплики клиента через resolve_delivery_from_text (текст →
     extract_maps_link → resolve_maps_link → зоны Bridge → resolve_delivery), инъектируя
     зоны и разворот коротких ссылок. Ни один голден не ходит в интернет/Bridge — вход
-    фиксирован, выход детерминирован. Шесть канонических сценариев родителя #12:
+    фиксирован, выход детерминирован. Канонические сценарии родителя #12 + решение ASK #51:
       1) точка в зоне                          → цена зоны
       2) точка на границе двух зон             → БЛИЖАЙШИЙ якорь (не первый в списке)
       3) точка в поясе +5 км за границей зоны  → 1490 (OUT_BELT_PRICE)
       4) точка вне острова (Москва)            → отказ [уточнить]
       5) битая/обрезанная maps-ссылка          → [уточнить] (цену не выдумываем)
       6) place-ссылка без координат            → [уточнить]
+      7) place-ссылка, в теле лишь ВЬЮПОРТ-ЦЕНТРОИД (Meat Point) → [уточнить] (ASK #51)
+      8) place-ссылка, в теле ТОЧНЫЙ пин Раваи → цена зоны 590 (надёжная координата)
 
     Зоны — синтетические, но с прозрачной геометрией (общая широта 7.88; 1° долготы на
     этой широте ≈ 110.3 км), чтобы дистанции/победитель проверялись глазами."""
@@ -722,9 +738,10 @@ class TestDeliveryGoldens(unittest.TestCase):
         self.assertEqual(r["status"], "uncertain")
         self.assertEqual(r["marker"], "[уточнить]")
 
-    # 7) ЖИВОЙ place-линк, пин только в теле → цена доставки, НЕ ложный [уточнить] --------
-    # Конечный URL из recon (координат в нём нет) + фрагмент ЖИВОГО тела с пином в staticmap
-    # center= (единственная координатная пара, %2C-кодирована как в проде).
+    # 7) ЖИВОЙ place-линк Meat Point: в теле лишь ВЬЮПОРТ-ЦЕНТРОИД → [уточнить] (ASK #51) -----
+    # Конечный URL из recon (координат в нём нет) + фрагмент ЖИВОГО тела, где единственная
+    # координатная пара — center= статической карты (вьюпорт-центроид, %2C-кодирован как в проде).
+    # По центроиду цену НЕ называем: точного пина `!3d!4d` в теле нет → честный [уточнить].
     _RECON_FINAL_URL = (
         "https://www.google.com/maps/place/79,+Meat+Point+%7C+steaks,+burgers,+skewers,"
         "+79+Soi+Saiyuan,+Mueang,+Phuket,+83100/data=!4m2!3m1!1s0x30502f24a5443265:"
@@ -735,19 +752,42 @@ class TestDeliveryGoldens(unittest.TestCase):
         "center=8.0407335%2C98.3433216&zoom=16&size=800x600\"…</html>"
     )
 
-    def test_golden_recon_place_link_resolves_on_live_zones(self):
-        # Живой сценарий #51: клиент кинул короткую share-ссылку на заведение. Разворот
-        # (замокан конечным URL из recon + тело) даёт пин из тела (8.0407335, 98.3433216).
-        # Против ЖИВЫХ зон прода (позиционный формат!) это out_belt/1490 — реальная цена
-        # доставки, а НЕ ложный [уточнить] (корневой баг). Синтетическую зону под пин НЕ
-        # подгоняем: голден на живой фикстуре — как учит CLAUDE.md (мок = живой формат).
+    def test_golden_meatpoint_centroid_uncertain(self):
+        # ГОЛДЕН ASK #51 (сценарий 7): клиент кинул короткую share-ссылку Meat Point. Разворот
+        # (замокан конечным URL из recon + тело) даёт в теле ЛИШЬ вьюпорт-центроид center= —
+        # точного пина `!3d!4d` нет. По центроиду цену не называем: [уточнить], а НЕ out_belt/1490
+        # (прежнее ошибочное поведение). Против ЖИВЫХ зон прода (позиционный формат).
         text = "локация тут https://maps.app.goo.gl/c4G4B3sNrfJZBSue6?g_st=ac спасибо"
         r, z = self._run(text, LIVE_ZONES, resolve_maps=lambda u: delivery.resolve_maps_link(
             u, _expand=lambda _u: self._RECON_PAGE))
-        self.assertEqual(r["status"], "out_belt")  # цена доставки определилась, не [уточнить]
-        self.assertEqual(r["price"], 1490)
+        self.assertEqual(r["status"], "uncertain")   # цену по центроиду НЕ выдаём
+        self.assertEqual(r["marker"], "[уточнить]")
+        self.assertIsNone(r["price"])
+        self.assertEqual(z, 0)                        # координат нет → зоны Bridge не запрошены
+
+    # 8) ЖИВОЙ place-линк, в теле ТОЧНЫЙ пин Раваи → надёжная координата → цена зоны 590 --------
+    # Пара к сценарию 7: тело place-страницы несёт точный пин `!3d7.771!4d98.327` (якорь Раваи,
+    # метаданные place) — это НАДЁЖНЫЙ источник (не вьюпорт). Против ЖИВЫХ зон прода → зона
+    # Раваи, 590. Центроид center= рядом в теле НАМЕРЕННО отличается — берём пин, не его.
+    _RAWAI_PIN_PAGE = (
+        "https://www.google.com/maps/place/Rawai+Beach/data=!4m2!3m1!1s0x0:0x0"
+        "\n<html>…/data=!3m1!4b1!3d7.771!4d98.327!8m2… "
+        "\"https://maps.googleapis.com/maps/api/staticmap?"
+        "center=8.0407335%2C98.3433216&zoom=16&size=800x600\"…</html>"
+    )
+
+    def test_golden_reliable_rawai_pin_resolves_590(self):
+        # ГОЛДЕН ASK #51 (сценарий 8): «надёжная координата Раваи → 590». Клиент кинул короткую
+        # ссылку; тело даёт точный пин `!3d7.771!4d98.327` (надёжно) — берём его, вьюпорт-центроид
+        # 8.04… игнорим. Против ЖИВЫХ зон прода → зона Раваи, 590 (не [уточнить]).
+        text = "локация тут https://maps.app.goo.gl/RawaiPinInBody спасибо"
+        r, z = self._run(text, LIVE_ZONES, resolve_maps=lambda u: delivery.resolve_maps_link(
+            u, _expand=lambda _u: self._RAWAI_PIN_PAGE))
+        self.assertEqual(r["status"], "zone")
+        self.assertEqual(r["zone"], "Раваи")
+        self.assertEqual(r["price"], 590)
         self.assertIsNone(r["marker"])
-        self.assertEqual(z, 1)                     # зоны Bridge запрошены — координаты нашлись
+        self.assertEqual(z, 1)                        # пин найден → зоны Bridge запрошены
 
 
 if __name__ == "__main__":
