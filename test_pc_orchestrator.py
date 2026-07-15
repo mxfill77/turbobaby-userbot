@@ -3870,6 +3870,87 @@ class TestRevizorRouteHelpers(unittest.TestCase):
         self.assertFalse(o._is_revizor_owner_card(None))
 
 
+class TestRevizorPostrelease(unittest.TestCase):
+    """ШАГ 5/6 (92): ПОСТ-РЕЛИЗНАЯ сверка живых черновиков окна ТЕМ ЖЕ чек-листом #92, что e2e-смоук
+    (suggest._smoke_checks). Эталон инъектируем — Bridge/сеть не трогаем. Чистый черновик → находок
+    нет; грязный → провалы всех 6 чеков → owner-находки (класс #92). Пост-релизная особинка: без
+    эталона J/доставки эти два чека находок НЕ заводят (нет ground-truth ≠ «черновик врёт»); text-only
+    чеки (годы/наличие/депозит/вернусь) — всегда."""
+
+    J_LINE = "2400 ฿ за 5 дней (Скидка за срок 15%, 480 ฿ в день); депозит 3000 ฿"
+    DELIVERY_LINE = "Доставка — 590 ฿ (забор байка в конце аренды — бесплатный)."
+
+    def _exp(self, **over):
+        e = {"j_line": self.J_LINE, "delivery_line": self.DELIVERY_LINE,
+             "zone": "Раваи", "zone_price": 590, "full_data": True}
+        e.update(over)
+        return e
+
+    _CLEAN = ("Здравствуйте! Рассчитал аренду NMAX 👍\n"
+              "NMAX — 2400 ฿ за 5 дней (Скидка за срок 15%, 480 ฿ в день); депозит 3000 ฿.\n"
+              "Доставка — 590 ฿ (забор байка в конце аренды — бесплатный).")
+    # Грязный: строка J ПЕРЕСОБРАНА (нет «Скидки за срок»), доставка 700 (не зона 590), год «2023
+    # года», отписка «вернусь», клеймы наличия «свободен/в наличии», конфликт депозита 3000 vs 5000.
+    _DIRTY = ("Здравствуйте! Байк 2023 года свободен и в наличии 👍\n"
+              "NMAX — 2400 ฿ за 5 дней; депозит 3000 ฿.\n"
+              "Ещё депозит 5000 ฿ или паспорт.\n"
+              "Доставка — 700 ฿.\n"
+              "Уточню детали и вернусь.")
+
+    def test_clean_draft_no_findings(self):
+        pkg = {"client_id": 42, "sent": [self._CLEAN], "drafts": []}
+        self.assertEqual(o._revizor_postrelease_findings(pkg, exp=self._exp()), [])
+
+    def test_dirty_draft_all_six_checks_flagged(self):
+        pkg = {"client_id": 77, "sent": [self._DIRTY], "drafts": []}
+        found = o._revizor_postrelease_findings(pkg, exp=self._exp())
+        names = {f["check"] for f in found}
+        self.assertEqual(names, {"строка J дословно", "доставка = цена зоны", "нет годов",
+                                 "нет «вернусь/уточним» при полных данных",
+                                 "нет утверждений о наличии", "депозит без противоречий"})
+        self.assertTrue(all(f["class"] == "#92" and f["action"] == "owner"
+                            and f["client_id"] == 77 and not f["task_text"] for f in found))
+
+    def test_missing_expectation_skips_j_and_delivery(self):
+        # Эталон J/доставки НЕ выведен (пусто) → эти два чека находок не заводят даже на грязном
+        # черновике; text-only чеки (годы/наличие/депозит) — заводят. Реаск гасится full_data=False.
+        pkg = {"client_id": 9, "drafts": [self._DIRTY]}
+        exp = self._exp(j_line="", delivery_line="", zone=None, zone_price=None, full_data=False)
+        found = o._revizor_postrelease_findings(pkg, exp=exp)
+        names = {f["check"] for f in found}
+        self.assertEqual(names, {"нет годов", "нет утверждений о наличии", "депозит без противоречий"})
+
+    def test_no_live_texts_no_bridge_no_findings(self):
+        # Окно без sent/drafts → сверять нечего, эталон (Bridge) НЕ строим.
+        boom = lambda *a, **k: (_ for _ in ()).throw(AssertionError("эталон строить не должны"))
+        self.assertEqual(o._revizor_postrelease_findings({"client_id": 1}, exp_fn=boom), [])
+
+    def test_dedup_same_defect_across_texts(self):
+        # Один и тот же дефект в sent И drafts → одна находка на класс (дедуп по имени чека).
+        pkg = {"client_id": 5, "sent": [self._DIRTY], "drafts": [self._DIRTY]}
+        found = o._revizor_postrelease_findings(pkg, exp=self._exp())
+        self.assertEqual(len(found), 6)                       # 6 дефектов, не 12 (дедуп sent+drafts)
+        self.assertEqual(len(found), len({f["check"] for f in found}))
+
+    def test_findings_render_into_owner_card(self):
+        pkg = {"client_id": 77, "sent": [self._DIRTY], "drafts": []}
+        found = o._revizor_postrelease_findings(pkg, exp=self._exp())
+        card = o._revizor_owner_card_text(found)
+        self.assertIn("🔍 Ревизор: находки", card)
+        self.assertIn("[класс #92]", card)
+        self.assertIn("окно 77", card)
+        self.assertIn("нет годов", card)
+
+    def test_expectations_no_context_skips_bridge(self):
+        # _revizor_expectations: окно без модели/пина → эталон пустой, getter/resolve НЕ зовём.
+        boom = lambda *a, **k: (_ for _ in ()).throw(AssertionError("Bridge звать не должны"))
+        exp = o._revizor_expectations({"client_id": 1, "transcript": "[клиент]: привет, как дела?"},
+                                      getter=boom, resolve_delivery=boom)
+        self.assertIsNone(exp["j_line"])
+        self.assertIsNone(exp["zone_price"])
+        self.assertFalse(exp["full_data"])
+
+
 class TestRevizorEnqueueBudget(Base):
     """Бюджет ≤2/сутки и дедуп по классу задач-находок — restart-proof из маркеров очереди."""
 

@@ -3870,6 +3870,123 @@ def _revizor_post_owner_card(owner_findings, items):
     log.info("ревизор: owner-карточка создана (tid=%s, инбокс %s)", tid, NEEDS_APPROVAL_TOPIC)
 
 
+# ---------- РЕВИЗОР: ПОСТ-РЕЛИЗНАЯ СВЕРКА ЖИВЫХ ЧЕРНОВИКОВ (шаг 5/6 родителя 92) ----------
+# К LLM-думателю (классы а–ж) добавлен ДЕТЕРМИНИРОВАННЫЙ пост-релизный проход по ЖИВЫМ черновикам
+# окна ТЕМ ЖЕ чек-листом #92, что гоняет e2e-смоук suggest.runLiveSmoke (suggest._smoke_checks) —
+# один источник правды на проверку и смоука, и пост-релиза (правило-класс: «мок = живой формат»,
+# а здесь ещё жёстче — тот же КОД проверки):
+#   1) строка столбца J — ДОСЛОВНО в отправленном/черновике;
+#   2) доставка = цена ЗОНЫ пина (Раваи → 590), а не выдумка;
+#   3) год поколения (20xx) в тело не утёк;
+#   4) при ПОЛНЫХ данных нет отписки «вернусь/уточню и вернусь»;
+#   5) нет УТВЕРЖДЕНИЙ о наличии без данных Bridge;
+#   6) депозит без самопротиворечия.
+# Эталон (строка J / строка доставки / зона / цена / полнота данных) строится из ТЕХ ЖЕ живых
+# источников, что питают черновик (suggest._smoke_expectations по клиентской модели+датам+пину).
+# Пост-релизная особинка: если эталон J/доставки НЕ выводится (нет заявочного контекста / Bridge
+# недоступен) — эти два чека НЕ заводят находок (нет ground-truth ≠ «черновик врёт»); text-only
+# чеки (годы/наличие/депозит/вернусь) идут ВСЕГДА. Провалы → owner-карточка (класс #92). Ревизор
+# сам ничего не правит и клиентам не пишет. READ-ONLY: Bridge зовём только на quote/delivery-эталон.
+_REVIZOR_PR_CLASS = "#92"                 # класс пост-релизных находок чек-листа транспорта QUOTE/DELIVERY
+# Чеки, которым нужен ВНЕШНИЙ эталон: без него (пустой эталон) провал — НЕ находка (пост-релиз).
+_REVIZOR_PR_NEEDS_J = "строка J дословно"
+_REVIZOR_PR_NEEDS_DELIVERY = "доставка = цена зоны"
+
+
+def _revizor_live_texts(package):
+    """ЖИВЫЕ клиентские тексты окна для пост-релизной сверки: отправленные клиенту (sent) + черновики
+    до модерации (drafts). Отдаём СЫРОЙ текст — сами чеки снимают служебные блоки (client_facing_text).
+    → list[(метка, текст)] (пусто → сверять нечего)."""
+    p = package or {}
+    out = []
+    for s in (p.get("sent") or []):
+        t = str(s or "").strip()
+        if t:
+            out.append(("sent", t))
+    for d in (p.get("drafts") or []):
+        t = str(d or "").strip()
+        if t:
+            out.append(("draft", t))
+    return out
+
+
+def _revizor_expectations(package, getter=None, resolve_delivery=None, today=None):
+    """Эталон чек-листа #92 для ЖИВОГО окна из ТЕХ ЖЕ источников, что питают черновик (как в
+    suggest e2e-смоуке): строку столбца J и строку доставки — из pricing_note по клиентской
+    модели+датам, зону/цену — из резолвера пина клиента. getter/resolve_delivery=None → ЖИВОЙ
+    Bridge (read-only). Нет модели И пина в окне → эталон не строим (Bridge не дёргаем, останутся
+    только text-only чеки). ЛЮБОЙ сбой → эталон без J/доставки (fail-safe: те два чека находок не
+    заводят). → dict(j_line, delivery_line, zone, zone_price, full_data)."""
+    empty = {"j_line": None, "delivery_line": None, "zone": None, "zone_price": None, "full_data": False}
+    try:
+        import suggest
+        p = package or {}
+        transcript = (p.get("transcript") or "\n".join(str(x) for x in (p.get("incoming") or [])))
+        if not str(transcript).strip():
+            return empty
+        hints = suggest.extract_booking_hints(transcript, today=today)
+        if not (hints.get("model") or hints.get("maps_link")):
+            return empty                 # нет заявочного контекста — эталон не нужен, Bridge не зовём
+        probe = {"lang": "ru", "maps_link": hints.get("maps_link")}
+        return suggest._smoke_expectations(transcript, probe, getter, resolve_delivery, today)
+    except Exception as e:
+        log.warning("ревизор: эталон #92 окна %s не построен (fail-safe, только text-only чеки): %s",
+                    (package or {}).get("client_id"), e)
+        return empty
+
+
+def _revizor_checklist_findings(text, exp, checks_fn=None):
+    """ОДИН живой текст через чек-лист #92 (suggest._smoke_checks — ТОТ ЖЕ код, что e2e-смоук) →
+    список ПРОВАЛИВШИХСЯ чеков. Пост-релизная особинка: провал чека, которому нужен ВНЕШНИЙ эталон
+    (строка J / доставка), но эталона нет — НЕ находка (мы не смогли вывести ground-truth, а не
+    «черновик врёт»); text-only чеки (годы/наличие/депозит/вернусь) — всегда. checks_fn инъектируется
+    в тестах. → list dict-чеков (name, ok=False, expected, fact)."""
+    e = exp or {}
+    if checks_fn is None:
+        import suggest
+        checks_fn = suggest._smoke_checks
+    out = []
+    for c in checks_fn(text, e):
+        if c.get("ok"):
+            continue
+        name = c.get("name")
+        if name == _REVIZOR_PR_NEEDS_J and not str(e.get("j_line") or "").strip():
+            continue                      # нет эталонной строки J — не находка
+        if name == _REVIZOR_PR_NEEDS_DELIVERY and (not str(e.get("delivery_line") or "").strip()
+                                                   or e.get("zone_price") is None):
+            continue                      # зона/цена пина не выведены — не находка
+        out.append(c)
+    return out
+
+
+def _revizor_postrelease_findings(package, exp=None, getter=None, resolve_delivery=None,
+                                  today=None, checks_fn=None, exp_fn=None):
+    """Пост-релизная сверка ЖИВЫХ черновиков окна чек-листом #92 → находки owner-карточки (action=
+    owner, класс #92). Прогоняем КАЖДЫЙ отправленный/черновиковый текст; дедуп по имени чека (одна
+    находка на класс дефекта в окне). exp — готовый эталон (инъекция теста); None → строим из окна
+    (_revizor_expectations, живой Bridge). exp_fn/checks_fn инъектируются в тестах. → list находок."""
+    p = package or {}
+    cid = p.get("client_id")
+    texts = _revizor_live_texts(p)
+    if not texts:
+        return []
+    if exp is None:
+        exp = (exp_fn or _revizor_expectations)(p, getter=getter,
+                                                resolve_delivery=resolve_delivery, today=today)
+    seen, out = set(), []
+    for _label, txt in texts:
+        for c in _revizor_checklist_findings(txt, exp, checks_fn=checks_fn):
+            name = c.get("name")
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append({"class": _REVIZOR_PR_CLASS, "client_id": cid, "action": "owner",
+                        "check": name,      # имя чека отдельным полем (owner-карточка его игнорит) — для теста/лога
+                        "evidence": (f"чек «{name}»: {c.get('fact')}")[:_REVIZOR_EVIDENCE_MAX],
+                        "task_text": ""})
+    return out
+
+
 def _revizor_route(packages, now=None):
     """Шаг 4/7 (262). Каждое окно → думатель-ревизор (_revizor_consult); находки маршрутизируем по
     action: task → дирижёр (бюджет/дедуп), owner → карточка 1160, noise → лог. Пусто → тишина +
@@ -3881,6 +3998,19 @@ def _revizor_route(packages, now=None):
         return {"windows": 0, "tasks": 0, "owner": 0, "noise": 0, "failed": 0}
     now = time.time() if now is None else now
     task_f, owner_f, noise_n, failed, demoted = [], [], 0, 0, 0
+    # ШАГ 5/6 (92): ДЕТЕРМИНИРОВАННАЯ пост-релизная сверка живых черновиков чек-листом #92 — НЕ зависит
+    # от LLM-думателя (даже если он упадёт ниже, транспортные регрессии QUOTE/DELIVERY поймаем). Сбой по
+    # окну — fail-safe пропуск, не роняет прогон. Находки текут в ТУ ЖЕ owner-карточку, что классы а–ж.
+    for pkg in pkgs:
+        try:
+            pr = _revizor_postrelease_findings(pkg)
+            if pr:
+                owner_f.extend(pr)
+                log.info("ревизор: пост-релиз окно %s — %d находок чек-листа #92 → owner-карточка",
+                         (pkg or {}).get("client_id"), len(pr))
+        except Exception as e:
+            log.warning("ревизор: пост-релизная сверка окна %s упала (fail-safe): %s",
+                        (pkg or {}).get("client_id"), e)
     for pkg in pkgs:
         findings = _revizor_consult(pkg)
         if findings is None:                    # думатель упал/не распарсился → fail-safe пропуск окна
