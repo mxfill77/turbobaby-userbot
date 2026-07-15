@@ -16,6 +16,7 @@ process_approved/process_approval_timeouts/process_stuck_singles. Без сет�
 
 import datetime
 import os
+import tempfile
 import unittest
 
 os.environ["LESSON_LLM_ROUTE"] = "0"   # боевой .env-рубильник не течёт в тесты (деплой 334);
@@ -117,6 +118,12 @@ class LocBase(unittest.TestCase):
         os.environ["PLAN_ADAPT"] = "1"
         self._save = (o.bc, o.run_task, o._thinker_exec, o._notify, o._cowork, o._stopped,
                       o.maybe_update_bots, o._notify_chain_card, o._loc_mark_chain_final)
+        # ИЗОЛЯЦИЯ ждущих low-уроков: process_stuck_singles читает LESSON_WAIT_STATE. Без стаба
+        # реапер видел БОЕВОЙ pc_orchestrator.lesson_waits.json (напр. живой инцидент #102) и путал
+        # тестовый шаг с тем же id за «законно ждущий урок» → регресс-тест ливнесса падал ложно.
+        self._save_lw = o.LESSON_WAIT_STATE
+        o.LESSON_WAIT_STATE = os.path.join(tempfile.mkdtemp(), "lesson_waits.json")
+        self.addCleanup(lambda: setattr(o, "LESSON_WAIT_STATE", self._save_lw))
         self.fb = FakeBridge()
         o.bc = self.fb
         o._notify = lambda *a, **k: None

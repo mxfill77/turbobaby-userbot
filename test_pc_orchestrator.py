@@ -8,6 +8,8 @@ test_pc_orchestrator.py — мок-тесты ПК-оркестратора. Б�
 import os
 import re
 import sys
+import json
+import types
 import tempfile
 import datetime
 import unittest
@@ -4844,6 +4846,124 @@ class TestLessonWaitReaper(Base):
              mock.patch.object(o, "process_local_chains", lambda: None):
             o.poll_once()
         self.assertEqual("in_progress", self.fb.tasks[tid]["status"])   # жив после полного цикла
+
+
+class _FakeHTTPResp:
+    """Мини-контекст-менеджер под urlopen: .read() → заранее заданное тело (bytes)."""
+    def __init__(self, body):
+        self._body = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+    def read(self):
+        return self._body
+
+
+class TestLessonReaskDelivery(Base):
+    """КЛАСС-ФИКС инцидента #102: ПЕРЕСПРОС low-урока «верно?» РЕАЛЬНО доходит до учителя — реплаем в
+    модер-группу на карточку черновика, с проверкой факта доставки (message_id) и ретраем. Недоставлен
+    после ретраев → урок НЕ висит молча: падает failed с диагнозом + карточка-уточнение владельцу в 1160.
+    Переспрос и ack приёма урока («Принял…») — РАЗНЫЕ сообщения (ack шлёт moderation_bot, здесь не дублируем)."""
+
+    def setUp(self):
+        super().setUp()
+        self._save_owner = o._deliver_owner_card          # инъекции owner-канала не должны течь в другие тесты
+        self.addCleanup(lambda: setattr(o, "_deliver_owner_card", self._save_owner))
+
+    def _task(self, remark, card="368"):
+        return ("[урок:правка от @turbophuket] родитель 292 — замечание менеджера в копилку обучения\n"
+                "окно диалога: @cryptopeppa (client_id=529849022) · черновик #303\n"
+                f"карточка модер-группы: msg={card}\n"
+                f"Замечание: {remark}\n"
+                "Исходный черновик: Локацию и данные получил, спасибо 🤝")
+
+    def _force_low(self, cls="ФАКТ", route=None):
+        # думатель вернул confidence=low по маршруту route (реальный claude не дёргаем)
+        route = route if route is not None else o.lesson_router.FACT
+        return mock.patch.multiple(
+            o.lesson_router,
+            _lesson_llm_enabled=lambda: True,
+            classify_lesson_llm=lambda remark, draft="", window="": {
+                "reading": "бот подтвердил приём данных, хотя клиент прислал только гео",
+                "class": cls, "confidence": "low", "plan": "поправить квитанцию + тест", "route": route})
+
+    # --- низкоуровневый транспорт _moderation_reply_send -----------------------------------
+    def test_send_extracts_message_id_from_bot_api(self):
+        fake_suggest = types.SimpleNamespace(MODERBOT_TOKEN="T", MOD_GROUP_ID=-100500)
+        with mock.patch.dict(sys.modules, {"suggest": fake_suggest}), \
+             mock.patch.object(o.urllib.request, "urlopen",
+                               lambda req, timeout=8: _FakeHTTPResp({"ok": True, "result": {"message_id": 777}})):
+            ok, mid, diag = o._moderation_reply_send(368, "🤔 верно?")
+        self.assertTrue(ok)
+        self.assertEqual(777, mid)                                  # факт доставки = message_id из ответа
+
+    def test_send_api_error_is_honest_false(self):
+        fake_suggest = types.SimpleNamespace(MODERBOT_TOKEN="T", MOD_GROUP_ID=-100500)
+        with mock.patch.dict(sys.modules, {"suggest": fake_suggest}), \
+             mock.patch.object(o.urllib.request, "urlopen",
+                               lambda req, timeout=8: _FakeHTTPResp({"ok": False, "description": "chat not found"})):
+            ok, mid, diag = o._moderation_reply_send(368, "🤔 верно?")
+        self.assertFalse(ok)
+        self.assertIsNone(mid)
+        self.assertIn("chat not found", diag)                      # честный диагноз, не тихий no-op
+
+    def test_send_no_token_is_honest_false(self):
+        fake_suggest = types.SimpleNamespace(MODERBOT_TOKEN="", MOD_GROUP_ID=-100500)
+        with mock.patch.dict(sys.modules, {"suggest": fake_suggest}):
+            ok, mid, diag = o._moderation_reply_send(368, "verno?")
+        self.assertFalse(ok)
+        self.assertIn("MODERBOT_TOKEN", diag)
+
+    # --- ретрай + вердикт _reply_moderation_lesson ----------------------------------------
+    def test_reask_retries_then_delivers(self):
+        calls = {"n": 0}
+        def flaky(card, text):
+            calls["n"] += 1
+            return (False, None, "timeout") if calls["n"] == 1 else (True, 42, "")
+        mid = o._reply_moderation_lesson(368, "🤔 верно?", send=flaky, retries=2)
+        self.assertEqual(42, mid)                                  # доставлен со 2-й попытки → message_id
+        self.assertEqual(2, calls["n"])
+
+    def test_reask_all_attempts_fail_returns_false(self):
+        calls = {"n": 0}
+        def dead(card, text):
+            calls["n"] += 1
+            return (False, None, "chat not found")
+        self.assertIs(False, o._reply_moderation_lesson(368, "t", send=dead, retries=3))
+        self.assertEqual(3, calls["n"])                            # ретраил ровно 3 раза, потом сдался
+
+    # --- сквозь _handle_lesson: доставлено → ожидание; провал → failed --------------------
+    def test_low_lesson_reask_delivered_as_reply_enters_wait(self):
+        # ГОЛДЕН: low-урок → переспрос ДОСТАВЛЕН реплаем на карточку → урок в ожидании, не закрыт
+        sent = {}
+        o._deliver_owner_card = lambda text: self.fail("владельца не зовём — переспрос ДОШЁЛ")
+        tid = self.fb.add(status="in_progress", task_text=self._task("не пиши «данные получил» на одно гео"))
+        with self._force_low(), \
+             mock.patch.object(o, "_moderation_reply_send",
+                               lambda card, text: (sent.update(card=card, text=text), (True, 900, ""))[1]):
+            o._handle_lesson(tid, self.fb.tasks[tid]["task_text"])
+        self.assertEqual("in_progress", self.fb.tasks[tid]["status"])   # НЕ закрыт — ждём ответа учителя
+        self.assertIn(tid, o._lesson_wait_ids())                         # ожидание сохранено
+        self.assertEqual("368", sent["card"])                            # РЕПЛАЙ на карточку черновика (там где учитель писал)
+        self.assertIn("верно?", sent["text"])                            # это ПЕРЕСПРОС, отдельное сообщение
+        self.assertNotIn("Принял замечание", sent["text"])               # НЕ подменяем ack приёма урока
+
+    def test_low_lesson_reask_api_error_fails_not_silent_wait(self):
+        # ГОЛДЕН (#102): переспрос НЕ доставлен (API-ошибка после ретраев) → урок failed с диагнозом +
+        # карточка владельцу; НЕ остаётся тихо «в ожидании»
+        cards = []
+        o._deliver_owner_card = lambda text: (cards.append(text) or (f"инбокс {o.INBOX_TOPIC_ID}", True))
+        tid = self.fb.add(status="in_progress", task_text=self._task("что-то не так с депозитом"))
+        with self._force_low(), \
+             mock.patch.object(o, "_moderation_reply_send", lambda card, text: (False, None, "chat not found")):
+            o._handle_lesson(tid, self.fb.tasks[tid]["task_text"])
+        t = self.fb.tasks[tid]
+        self.assertEqual("failed", t["status"])                         # НЕ висит молча — упал
+        self.assertNotIn(tid, o._lesson_wait_ids())                      # в ожидание не ушёл
+        self.assertIn("НЕ доставлен", t["result"])                       # диагноз в результате
+        self.assertEqual(1, len(cards))                                  # карточка-уточнение ушла владельцу
+        self.assertIn("не дошёл до учителя", cards[0])
 
 
 if __name__ == "__main__":

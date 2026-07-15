@@ -719,14 +719,32 @@ class TestLessonLowConfidence(unittest.TestCase):
         self.assertIn("депозит вроде не так", p["remark"])
         self.assertIn("Nmax", p["draft"])                      # черновик сохранён для пере-классификации
 
-    def test_low_reply_sink_failure_still_saves_state(self):
-        # реплай в модер-группу упал → состояние ожидания ВСЁ РАВНО возвращаем (не теряем урок)
+    def test_low_reply_api_error_fails_with_diagnosis_not_silent_wait(self):
+        # КЛАСС-ФИКС #102: реплай-переспрос упал (API-ошибка) → урок НЕ висит молча в ожидании, а падает
+        # failed с ДИАГНОЗОМ + карточка-уточнение владельцу в 1160 (переспрос не дошёл — решай вручную).
+        owner = {}
         dec = lr.handle_lesson_task(
             self._task("что-то с ценой"),
             classify=self._low("ФАКТ", lr.FACT),
-            reply_moderation=lambda cid, t: (_ for _ in ()).throw(OSError("mod group down")))
-        self.assertEqual("waiting", dec["status"])
-        self.assertIn("pending_low", dec)
+            reply_moderation=lambda cid, t: (_ for _ in ()).throw(OSError("mod group down")),
+            notify_owner=lambda c: (owner.update(card=c), ("инбокс 1160", True))[1])
+        self.assertEqual("failed", dec["status"])                 # НЕ waiting — тихого ожидания нет
+        self.assertNotIn("pending_low", dec)                      # в ожидание не уходим
+        self.assertIn("НЕ доставлен", dec["reason"])              # диагноз: переспрос не дошёл
+        self.assertIn("mod group down", dec["reason"])            # конкретная причина в диагнозе
+        self.assertIn("card", owner)                              # карточка ушла владельцу
+        self.assertTrue(dec["delivered"])                         # доставку владельцу подтвердили
+        self.assertIn("НЕ доставлен", dec["result"])
+
+    def test_low_reply_no_message_id_fails_not_waits(self):
+        # реплай «доставлен» без message_id (Bot API ok, но факт не подтверждён) → falsy → тоже failed
+        dec = lr.handle_lesson_task(
+            self._task("что-то с ценой"),
+            classify=self._low("СТИЛЬ", lr.STYLE),
+            reply_moderation=lambda cid, t: False,                # не доставлено (нет message_id)
+            notify_owner=lambda c: ("инбокс 1160", True))
+        self.assertEqual("failed", dec["status"])
+        self.assertIn("не подтвердил доставку", dec["reason"].lower() + dec["result"].lower())
 
     # --- resume: «да» от аппрувера ----------------------------------------------------------
     def test_resume_yes_from_approver_takes_lesson_as_high(self):

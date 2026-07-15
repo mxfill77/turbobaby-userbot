@@ -40,6 +40,7 @@ import tempfile
 import subprocess
 import urllib.request
 import urllib.parse
+import urllib.error
 
 import lesson_router          # обработчик задач-уроков (родитель 292, шаг 3): классификация+маршрут; suggest тянет лениво
 # ДЕПЛОЙ #334 шаг 6/6 (2026-07-14, одобрен владельцем): LLM-маршрут уроков в бою —
@@ -766,18 +767,102 @@ def _finalize_lesson_dec(tid, text, dec):
             _deliver_lesson_ack(dec.get("card_msg_id"), ack)
 
 
+# ---- Боевой sink ПЕРЕСПРОСА/ПОНИМАНИЯ урока РЕПЛАЕМ в МОДЕР-ГРУППУ (класс-фикс инцидента #102) ----
+# Инцидент #102 (00:36 16.07, повтор 14.07 18:04): демон писал в журнал «жду да/поправку», но ПЕРЕСПРОС
+# «Понял так: … — верно?» в модер-группу НЕ уходил. Корень (read-only разбор): _handle_lesson звал
+# lesson_router.handle_lesson_task БЕЗ reply_moderation → текст переспроса генерился, но молча падал в
+# _default_reply_moderation (заглушка → False). Ни send/reply, ни chat_id/reply_to — ТИХИЙ no-op, без
+# ошибки API. Учитель ничего не видел; урок висел in_progress «в ожидании» ответа, которого не спросили.
+# Фикс: боевой sink РЕАЛЬНО шлёт реплай на карточку черновика (card_msg_id) в модер-группу MODERBOT_TOKEN'ом,
+# ПОДТВЕРЖДАЕТ факт доставки по message_id из ответа Bot API, РЕТРАИТ; так и не доставил → False (тогда
+# lesson_router._enter_low_wait роняет урок в failed + карточка владельцу — НЕ тихое ожидание).
+# Ack приёма урока («📝 Принял замечание… учту») шлёт moderation_bot на intake — это ДРУГОЕ сообщение,
+# здесь его НЕ дублируем (переспрос и ack — разные сообщения). Двух getUpdates не создаём (только
+# sendMessage) → с живым moderation_bot не конфликтует. FAIL-SAFE: любой сбой → честный (False, …, диагноз).
+MODREPLY_RETRIES = max(1, int(os.getenv("LESSON_MODREPLY_RETRIES", "2") or "2"))
+
+
+def _moderation_reply_send(reply_to_msg_id, text):
+    """Низкоуровневая доставка реплая в МОДЕР-ГРУППУ (Bot API sendMessage, MODERBOT_TOKEN → MOD_GROUP_ID,
+    reply_to_message_id=карточка черновика). → (ok: bool, message_id: int|None, diag: str). Токен/URL НЕ
+    логируем. Нет токена/группы → честный (False, None, диагноз), а не тихий no-op. Карточку могли удалить
+    → allow_sending_without_reply, чтобы переспрос всё равно дошёл в группу (не пропал)."""
+    import suggest                                    # ленивый: MODERBOT_TOKEN/MOD_GROUP_ID уже из .env
+    token = (getattr(suggest, "MODERBOT_TOKEN", "") or "").strip()
+    chat = getattr(suggest, "MOD_GROUP_ID", None)
+    if not token:
+        return (False, None, "нет MODERBOT_TOKEN — реплай в модер-группу невозможен")
+    if chat is None:
+        return (False, None, "нет MOD_GROUP_ID — некуда слать реплай в модер-группу")
+    payload = {"chat_id": chat, "text": text}
+    try:
+        payload["reply_to_message_id"] = int(reply_to_msg_id)
+        payload["allow_sending_without_reply"] = True
+    except (TypeError, ValueError):
+        pass                                          # нет валидной координаты → шлём в группу без реплая (не молчим)
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request("https://api.telegram.org/bot" + token + "/sendMessage",
+                                 data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            body = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            body = {"ok": False, "description": f"HTTP {getattr(e, 'code', '?')}"}
+    except Exception as e:                            # noqa: BLE001 — сеть не роняет тик демона
+        return (False, None, type(e).__name__)
+    if body.get("ok"):
+        mid = (body.get("result") or {}).get("message_id")
+        if mid:
+            return (True, int(mid), "")
+        return (False, None, "Bot API ok, но нет message_id — факт доставки не подтверждён")
+    return (False, None, f"Bot API отказал: {str(body.get('description'))[:80]}")
+
+
+def _reply_moderation_lesson(card_msg_id, text, send=None, retries=None):
+    """Боевой reply_moderation-sink дирижёра (инъектируется в lesson_router): доставляет ПЕРЕСПРОС/ПОНИМАНИЕ
+    урока РЕПЛАЕМ в модер-группу (на карточку черновика card_msg_id) с ПРОВЕРКОЙ факта доставки по message_id
+    и РЕТРАЕМ. Доставлено → message_id (int, truthy). Не доставлено после MODREPLY_RETRIES попыток → False:
+    вызывающий (_enter_low_wait) уводит урок в failed + карточку владельцу (не тихое ожидание, инцидент #102).
+    send/retries инъектируемы (голден без сети)."""
+    snd = send or _moderation_reply_send
+    attempts = max(1, int(MODREPLY_RETRIES if retries is None else retries))
+    diag = "?"
+    for i in range(1, attempts + 1):
+        try:
+            ok, mid, diag = snd(card_msg_id, text)
+        except Exception as e:                        # noqa: BLE001 — sink не роняет дирижёра
+            ok, mid, diag = False, None, f"{type(e).__name__}: {e}"
+        if ok and mid:
+            log.info("LESSON reply в модер-группу ДОСТАВЛЕН (msg=%s, попытка %d/%d, card=%s)",
+                     mid, i, attempts, card_msg_id or "?")
+            return mid
+        log.warning("LESSON reply в модер-группу не доставлен (попытка %d/%d, card=%s): %s",
+                    i, attempts, card_msg_id or "?", diag or "?")
+    log.error("LESSON reply в модер-группу НЕ доставлен после %d попыток (card=%s): %s — урок упадёт failed",
+              attempts, card_msg_id or "?", diag or "?")
+    return False
+
+
 def _handle_lesson(tid, text):
     """Обработать задачу-урок (родитель 292, шаги 3–4): дирижёр классифицирует замечание менеджера и
     маршрутизирует. СТИЛЬ → правило в книгу правил (playbook); НАДЗОР → строка-класс в чек-лист
     ревизора; ФАКТ/ЛОГИКА → локальному планировщику (правка кода/критфактов/FAQ + ТЕСТ); неясное →
     карточка-уточнение владельцу в 1160 (не угадываем). Боевые sink'и: playbook / чек-лист / инбокс
     1160 (_deliver_owner_card — СИНХРОННАЯ доставка с подтверждением канала, рапорт честный «доставлено
-    через X», не гадательный). Bridge/таблицы/деньги не трогаем — только текст доков или делегирование.
-    confidence=low (родитель 334, шаг 3): урок В РАБОТУ НЕ БЕРЁМ — спросили учителя «верно?» и ЖДЁМ.
-    status='waiting' → задача НЕ закрывается: сохраняем pending_low на диск и оставляем in_progress под
-    защитой process_lesson_waits (реапер одиночек её НЕ трогает; heartbeat тикаем сами; ЕДИНСТВЕННЫЙ
-    предел ожидания — 24ч → карточка владельцу в 1160, шаг 4). Класс-фикс инцидента 354."""
-    dec = lesson_router.handle_lesson_task(text, notify_owner=_deliver_owner_card)
+    через X», не гадательный) + reply_moderation (_reply_moderation_lesson — реплай переспроса/понимания
+    в модер-группу с проверкой message_id и ретраем). Bridge/таблицы/деньги не трогаем — только текст
+    доков или делегирование.
+    confidence=low (родитель 334, шаг 3): урок В РАБОТУ НЕ БЕРЁМ — спросили учителя «верно?» РЕПЛАЕМ и,
+    ТОЛЬКО ЕСЛИ переспрос реально доставлен, ЖДЁМ. status='waiting' → задача НЕ закрывается: сохраняем
+    pending_low на диск и оставляем in_progress под защитой process_lesson_waits (реапер одиночек её НЕ
+    трогает; heartbeat тикаем сами; предел ожидания — 24ч → карточка владельцу в 1160, шаг 4). Переспрос
+    НЕ доставлен (класс-фикс #102) → dec.status='failed' → _finalize_lesson_dec закрывает урок failed с
+    диагнозом (карточку владельцу уже отправил _enter_low_wait). Класс-фиксы инцидентов 354 и #102."""
+    dec = lesson_router.handle_lesson_task(text, notify_owner=_deliver_owner_card,
+                                           reply_moderation=_reply_moderation_lesson)
     if dec.get("status") == "waiting" and dec.get("pending_low"):
         _enter_lesson_wait(tid, dec)
         return

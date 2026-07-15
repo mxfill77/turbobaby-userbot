@@ -416,9 +416,11 @@ def build_lesson_understanding(reading, plan):
 
 
 def _default_reply_moderation(_card_msg_id, _text):
-    """Дефолт-заглушка реплая в модер-группу на сообщение с уроком: в standalone канала нет → False
-    (не доставлено). Демон-дирижёр инъектирует боевой sink (реплай через moderation_bot, шаг 5).
-    understanding уже лежит в результате задачи — сбой доставки урок не теряет."""
+    """Дефолт-заглушка реплая в модер-группу: в standalone канала нет → False (НЕ доставлено). Боевой
+    sink инъектирует ДЕМОН (_reply_moderation_lesson: реплай через MODERBOT_TOKEN на карточку черновика,
+    ретрай, проверка message_id). КОНТРАКТ: truthy = реплай ДОСТАВЛЕН (боевое = message_id); falsy = НЕ
+    доставлен → low-урок падает failed с диагнозом, а не висит молча (инцидент #102). Для high-ветки
+    understanding и так лежит в результате задачи — сбой реплая урок не теряет."""
     return False
 
 
@@ -589,32 +591,66 @@ def _apply_high(route, text, parsed, remark, reason, reading, plan, cls,
     return dec
 
 
-def _enter_low_wait(llm, text, parsed, remark, reply_mod, now=None):
-    """confidence=low: НЕ берём урок в работу вслепую. Реплаем в ТУ ЖЕ модер-группу спрашиваем учителя
-    «Понял так: <reading> — верно?» и возвращаем СОСТОЯНИЕ ОЖИДАНИЯ (pending_low) — вызывающий (демон)
-    его сохраняет и по ответу учителя зовёт resume_low_lesson. status='waiting' → задача не закрывается.
-    Сбой реплая состояние НЕ теряет (pending_low всё равно в dec; демон повторит/учитель ответит).
-    created_at (epoch) штампуем для таймаута: молчит учитель >24ч → check_low_wait_timeout снимет
-    ожидание и отдаст урок владельцу (шаг 4). now инъектируется в тестах."""
+def _enter_low_wait(llm, text, parsed, remark, reply_mod, notify, now=None):
+    """confidence=low: НЕ берём урок в работу вслепую. РЕПЛАЕМ в ТУ ЖЕ модер-группу (на карточку черновика,
+    там где учитель написал правку) спрашиваем «Понял так: <reading> — верно?» с ПРОВЕРКОЙ ФАКТА ДОСТАВКИ.
+    Боевой reply_mod возвращает message_id (truthy) при доставленном реплае — тогда возвращаем СОСТОЯНИЕ
+    ОЖИДАНИЯ (pending_low, status='waiting'): демон держит урок живым и по ответу учителя зовёт
+    resume_low_lesson. created_at (epoch) штампуем для 24ч-таймаута (check_low_wait_timeout).
+
+    КЛАСС-ФИКС инцидента #102 (переспрос не доходил до учителя, а демон писал «жду да/поправку»): если
+    reply_mod вернул FALSY (нет message_id) или УПАЛ (API-ошибка / нет канала) — это УЖЕ после ретраев в
+    боевом sink — урок НЕ оставляем тихо ждать: status='failed' с ДИАГНОЗОМ + карточка-уточнение владельцу
+    в 1160 (пусть разберёт вручную). «Тихое ожидание при недоставленном переспросе» = баг, который мы чиним.
+    now инъектируется в тестах; reply_mod/notify инъектируемы (голден без сети/Telegram)."""
     reading = _one_line(llm.get("reading"))
     plan = _one_line(llm.get("plan"))
     cls = llm.get("class")
     card = parsed.get("card_msg_id") or ""
     confirm = build_lesson_low_confirm(reading)
-    reason = f"LLM-low: класс {cls} — спросил учителя «верно?» реплаем в модер-группе, жду ответа"
+    # (a) ДОСТАВКА переспроса реплаем + проверка факта. reply_mod уже ретраит внутри (боевой sink);
+    #     сюда доходит финальный вердикт: truthy (доставлено, боевое = message_id) или falsy/исключение.
+    delivered, diag = False, ""
     try:
-        reply_mod(card, confirm)
-    except Exception as e:                           # noqa: BLE001 — реплай не должен ронять дирижёра
-        reason = f"{reason}; mod-reply: {e}"
+        delivered = bool(reply_mod(card, confirm))
+        if not delivered:
+            diag = "Bot API не подтвердил доставку (нет message_id)"
+    except Exception as e:                           # noqa: BLE001 — sink не должен ронять дирижёра
+        delivered, diag = False, f"реплай упал: {e}"
+
+    # (b) НЕ ДОСТАВЛЕНО → урок НЕ висит молча: failed с диагнозом + карточка-уточнение владельцу в 1160.
+    if not delivered:
+        reason = (f"LLM-low ({cls}): ПЕРЕСПРОС «верно?» НЕ доставлен в модер-группу ({diag}) — "
+                  "урок отдан владельцу, тихое ожидание не допускаем (инцидент #102)")
+        owner_parsed = dict(parsed); owner_parsed["remark"] = remark or parsed.get("remark", "")
+        owner_card = build_owner_clarification_card(
+            owner_parsed, f"переспрос «верно?» не дошёл до учителя ({diag}) — реши вручную")
+        channel = ""
+        try:
+            deliv_owner, channel = _normalize_delivery(notify(owner_card))
+        except Exception as e:                       # noqa: BLE001
+            deliv_owner, channel = False, ""; reason = f"{reason}; notify: {e}"
+        if deliv_owner:
+            via = f" — карточка владельцу в 1160{(' через ' + channel) if channel else ''}"
+        else:
+            via = " — карточка владельцу НЕ доставлена (замечание в логе)"
+        return {"route": llm.get("route"), "confidence": "low", "delegate": False, "status": "failed",
+                "reason": reason, "confirm": confirm, "card_msg_id": card, "reading": reading,
+                "plan": plan, "llm_class": cls, "delivered": deliv_owner, "channel": channel, "card": owner_card,
+                "result": (f"⚠️ Переспрос «верно?» по low-уроку ({cls}) НЕ доставлен в модер-группу "
+                           f"({diag}){via} — урок не висит молча")}
+
+    # (c) ДОСТАВЛЕНО → штатное ожидание ответа учителя (pending_low на диск, задача in_progress под защитой).
     pending = {"text": str(text or ""), "route": llm.get("route"), "class": cls, "reading": reading,
                "plan": plan, "remark": remark, "draft": parsed.get("draft", ""),
                "window": parsed.get("window", ""), "who": parsed.get("who", ""), "card_msg_id": card,
                "created_at": _now_epoch() if now is None else float(now)}
+    reason = f"LLM-low: класс {cls} — спросил учителя «верно?» реплаем в модер-группе (ДОСТАВЛЕНО), жду ответа"
     return {"route": llm.get("route"), "confidence": "low", "delegate": False, "status": "waiting",
             "reason": reason, "confirm": confirm, "pending_low": pending, "card_msg_id": card,
             "reading": reading, "plan": plan, "llm_class": cls,
             "result": (f"🤔 Урок неуверенно классифицирован ({cls}) → спросил учителя «верно?» "
-                       "реплаем в модер-группе, жду «да»/поправку")}
+                       "реплаем в модер-группе (доставлено), жду «да»/поправку")}
 
 
 def resume_low_lesson(pending, reply_text, is_approver, classify=None, append_style=None,
@@ -785,7 +821,7 @@ def handle_lesson_task(text, append_style=None, append_checklist=None, notify_ow
     # confidence=low (шаг 3): класс размыт — НЕ угадываем и НЕ берём вслепую. Реплаем в ТУ ЖЕ модер-группу
     # спрашиваем учителя «верно?» и сохраняем состояние ожидания (resume_low_lesson доведёт по ответу).
     if llm and llm.get("confidence") == "low" and llm.get("route"):
-        return _enter_low_wait(llm, text, parsed, remark, reply_mod)
+        return _enter_low_wait(llm, text, parsed, remark, reply_mod, notify)
 
     # Откат на keyword-классификатор: LLM выключен / думатель вернул None (брак/сбой). Поведение прежнее,
     # включая карточку-уточнение владельцу для неясного (высокоуверенного LLM-сигнала не было).
