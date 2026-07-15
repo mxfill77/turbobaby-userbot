@@ -3520,5 +3520,170 @@ class TestSheetSubselection(unittest.TestCase):
             self.assertIn(m, note)                 # без подвыборки — весь парк
 
 
+class TestTeamRegistryBlock(unittest.TestCase):
+    """ЖЁСТКИЙ блок команды КОДОМ ДО LLM (родитель: инцидент @Pleummmm 15.07 11:23 — userbot
+    сгенерил черновик на окно ОФИС-МЕНЕДЖЕРА). ГОЛДЕН: сообщение от участника реестра → НУЛЕВАЯ
+    реакция конвейера (ни _fetch_messages, ни LLM, ни черновика/приветствия, ни отправки).
+    НЕГАТИВ: обычный клиент → конвейер работает штатно. Слой 2: intake от внутреннего id не
+    постится во «Входящие брони»."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        d = self._tmp.name
+        self._reg = suggest.TEAM_REGISTRY
+        self._mode = suggest.SUGGEST_MODE
+        self._test = suggest.SUGGEST_TEST_MODE
+        self._mg = suggest.MOD_GROUP_ID
+        self._pending = suggest.pending
+        self._pairs = suggest.PAIRS_FILE
+        self._appr = suggest.APPROVER_USERNAMES
+        suggest.SUGGEST_MODE = True
+        suggest.SUGGEST_TEST_MODE = False
+        suggest.reset_disabled()
+        suggest.MOD_GROUP_ID = -1009999999999
+        suggest.pending = suggest.PendingStore(os.path.join(d, "pending.jsonl"))
+        suggest.PAIRS_FILE = os.path.join(d, "pairs.jsonl")
+        suggest.limiter = suggest.RateLimiter(6, 15)
+        # Реестр из живого инцидента: офис-менеджер @Pleummmm (Пым) + коллега Earth + аккаунт
+        # только по id (username нет) + внутренняя рабочая группа.
+        suggest.TEAM_REGISTRY = {"usernames": {"pleummmm", "earth"},
+                                 "user_ids": {770099}, "group_ids": {-1005550000}}
+        self.me = 42
+
+    def tearDown(self):
+        suggest.TEAM_REGISTRY = self._reg
+        suggest.SUGGEST_MODE = self._mode
+        suggest.SUGGEST_TEST_MODE = self._test
+        suggest.MOD_GROUP_ID = self._mg
+        suggest.pending = self._pending
+        suggest.PAIRS_FILE = self._pairs
+        suggest.APPROVER_USERNAMES = self._appr
+        suggest.reset_disabled()
+        self._tmp.cleanup()
+
+    def _run(self, sender, text):
+        """Прогнать on_client_message; вернуть (res, client, llm_calls). counting_llm считает
+        КАЖДЫЙ заход в генерацию — для блока команды список ОБЯЗАН остаться пустым."""
+        calls = []
+
+        def counting_llm(_s, _u):
+            calls.append(1)
+            return "DRAFT ответа клиенту"
+
+        client = FakeClient(history=[
+            FakeHistMsg(sender.id, text),
+            FakeHistMsg(self.me, "Здравствуйте! Что хотите арендовать?"),
+        ])
+        res = asyncio.run(suggest.on_client_message(
+            client, sender, self.me, call_llm=counting_llm, faq="FAQ"))
+        return res, client, calls
+
+    # ---- ГОЛДЕН: участник реестра → нулевая реакция (РЕАЛЬНЫЕ формы идентичности) ----
+    def test_office_manager_username_zero_pipeline(self):
+        # РЕАЛЬНЫЙ офис-менеджер @Pleummmm из окна 15.07 11:23; текст — нарочно «клиентская» фраза
+        # (прайс+модели), но ИДЕНТИЧНОСТЬ перевешивает: конвейер не реагирует НИКАК.
+        res, client, calls = self._run(
+            FakeSender(770777, username="Pleummmm", first="Пым"),
+            "Скинь прайс на аренду и какие модели свободны на след неделю?")
+        self.assertIsNone(res)
+        self.assertEqual(client.sent, [])         # ни в группу модерации, ни клиенту
+        self.assertEqual(calls, [])               # LLM НЕ вызывался — блок ДО генерации
+        self.assertIsNone(suggest.pending.get(1))  # pending пуст
+
+    def test_office_manager_username_case_insensitive(self):
+        res, client, calls = self._run(FakeSender(770778, username="PLEUMMMM"),
+                                       "Какие цены на аренду скутеров?")
+        self.assertIsNone(res)
+        self.assertEqual(client.sent, [])
+        self.assertEqual(calls, [])
+
+    def test_second_team_member_username(self):
+        res, client, calls = self._run(FakeSender(770779, username="Earth", first="Earth"),
+                                       "@turbophuket глянь бронь на завтра")
+        self.assertIsNone(res)
+        self.assertEqual(client.sent, [])
+        self.assertEqual(calls, [])
+
+    def test_team_member_by_id_without_username(self):
+        # аккаунт без username, но id в реестре → тоже блок (коллега пишет из лички)
+        res, client, calls = self._run(FakeSender(770099, username=None, first="Даня"),
+                                       "Привет, аренда есть на неделю?")
+        self.assertIsNone(res)
+        self.assertEqual(client.sent, [])
+        self.assertEqual(calls, [])
+
+    def test_approver_counts_as_internal(self):
+        # staff-approver (из .env APPROVER_USERNAMES) — внутренний даже без записи в team_registry.json
+        suggest.APPROVER_USERNAMES = {"managerx"}
+        res, client, calls = self._run(FakeSender(770780, username="managerx"), "тест из офиса")
+        self.assertIsNone(res)
+        self.assertEqual(calls, [])
+
+    # ---- НЕГАТИВ: обычный клиент → конвейер РАБОТАЕТ (черновик на модерацию, не клиенту) ----
+    def test_ordinary_client_pipeline_runs(self):
+        res, client, calls = self._run(FakeSender(999, username="client1"),
+                                       "Привет, сколько стоит NMAX на неделю?")
+        self.assertIsNotNone(res)
+        self.assertTrue(calls)                                                 # LLM вызван
+        self.assertTrue(any(c[0] == suggest.MOD_GROUP_ID for c in client.sent))  # черновик в группу
+        self.assertEqual([c for c in client.sent if c[0] == 999], [])          # клиенту — ничего
+
+    def test_ordinary_client_by_id_runs(self):
+        res, _client, calls = self._run(FakeSender(123456, username=None, first="Гость"),
+                                        "какие байки есть в аренду?")
+        self.assertIsNotNone(res)
+        self.assertTrue(calls)
+
+    # ---- helper-функции реестра ----
+    def test_registry_helpers(self):
+        self.assertTrue(suggest.is_internal_sender(FakeSender(1, username="pleummmm")))
+        self.assertTrue(suggest.is_internal_sender(FakeSender(1, username="@Earth")))
+        self.assertTrue(suggest.is_internal_sender(FakeSender(770099)))           # по id
+        self.assertFalse(suggest.is_internal_sender(FakeSender(2, username="client1")))
+        self.assertFalse(suggest.is_internal_sender(None))
+        self.assertTrue(suggest.is_internal_chat(-1005550000))
+        self.assertFalse(suggest.is_internal_chat(-1))
+        self.assertFalse(suggest.is_internal_chat(None))
+        self.assertTrue(suggest.is_internal_user_id(770099))
+        self.assertFalse(suggest.is_internal_user_id(999))
+        self.assertFalse(suggest.is_internal_user_id(None))
+
+    def test_registry_loader_failsafe(self):
+        # нет файла / битый JSON → пустой реестр (не падаем)
+        empty = suggest._load_team_registry(os.path.join(self._tmp.name, "нет-такого.json"))
+        self.assertEqual(empty, {"usernames": set(), "user_ids": set(), "group_ids": set()})
+
+    # ---- СЛОЙ 2: intake от внутреннего id НЕ постится во «Входящие брони» ----
+    def test_intake_second_layer_skips_internal(self):
+        import moderation_ipc
+        uniq = "🆕 БРОНЬ [реестр-тест-внутр] окно офис-менеджера"
+        iid = moderation_ipc.save_intake_candidate(uniq, client_id=770099)
+        moderation_ipc.confirm_intake(iid)
+        posts = []
+
+        async def poster(_c, gid, text):
+            posts.append((gid, text))
+            return 111
+
+        asyncio.run(suggest.poll_and_post_intake(FakeClient(), poster=poster))
+        self.assertNotIn(uniq, [t for _, t in posts])                 # наружу НЕ ушло
+        self.assertEqual(moderation_ipc.get_intake(iid)["status"], "skipped")
+
+    def test_intake_second_layer_posts_ordinary_client(self):
+        import moderation_ipc
+        uniq = "🆕 БРОНЬ [реестр-тест-клиент] обычный client1"
+        iid = moderation_ipc.save_intake_candidate(uniq, client_id=999)
+        moderation_ipc.confirm_intake(iid)
+        posts = []
+
+        async def poster(_c, gid, text):
+            posts.append((gid, text))
+            return 222
+
+        asyncio.run(suggest.poll_and_post_intake(FakeClient(), poster=poster))
+        self.assertIn(uniq, [t for _, t in posts])                    # обычный клиент — постим
+        self.assertEqual(moderation_ipc.get_intake(iid)["status"], "posted")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

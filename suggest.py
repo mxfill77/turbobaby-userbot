@@ -91,6 +91,89 @@ APPROVER_USERNAMES = _csv_set("APPROVER_USERNAMES")
 # Пусто → фолбэк на APPROVER_USERNAMES (обучение НЕ шире approve, а не «кто угодно»).
 INTAKE_APPROVERS = _csv_set("INTAKE_APPROVERS")
 
+# ----------------------- реестр команды (внутренние аккаунты) ----------------
+# ЖЁСТКИЙ блок КОДОМ ДО LLM (родитель: инцидент 15.07 11:23 — userbot сгенерил черновик на
+# ЛС офис-менеджера @Pleummmm): сообщения ОТ участников команды и В внутренних группах
+# ИСКЛЮЧАЮТСЯ из клиентского конвейера ЦЕЛИКОМ — ни черновиков, ни автоприветствий, ни сбора
+# intake. Источник — team_registry.json (usernames/ids вне кода, правится вручную). Сверх файла
+# внутренними считаются все approve/intake-аккаунты (staff — НЕ клиенты, черновики им не готовим).
+TEAM_REGISTRY_FILE = os.path.join(BASE_DIR, "team_registry.json")
+
+
+def _load_team_registry(path=None):
+    """Прочитать реестр команды из JSON. FAIL-SAFE: нет файла/битый/не-словарь → пустой реестр
+    (usernames/user_ids/group_ids). usernames — lower без @; ids — int (в т.ч. отрицательные
+    id групп). Ключи-мусор игнорируем молча (fail-safe: генерация от реестра не ломается)."""
+    path = path or TEAM_REGISTRY_FILE
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    def _ids(seq):
+        out = set()
+        for x in (seq or []):
+            s = str(x).strip()
+            if s.lstrip("-").isdigit():
+                out.add(int(s))
+        return out
+
+    usernames = {str(u).strip().lstrip("@").lower()
+                 for u in (data.get("usernames") or []) if str(u).strip()}
+    return {"usernames": usernames,
+            "user_ids": _ids(data.get("user_ids")),
+            "group_ids": _ids(data.get("group_ids"))}
+
+
+TEAM_REGISTRY = _load_team_registry()
+
+
+def reload_team_registry(path=None):
+    """Перечитать реестр (горячая замена/тесты). Обновляет глобаль TEAM_REGISTRY, возвращает её."""
+    global TEAM_REGISTRY
+    TEAM_REGISTRY = _load_team_registry(path)
+    return TEAM_REGISTRY
+
+
+def _team_usernames():
+    """Полный набор внутренних usernames: реестр ∪ approve-whitelist ∪ intake-approvers
+    (staff-аккаунты — не клиенты; их черновики/приветствия/intake конвейер не готовит)."""
+    return TEAM_REGISTRY["usernames"] | APPROVER_USERNAMES | INTAKE_APPROVERS
+
+
+def is_internal_sender(sender) -> bool:
+    """Отправитель — участник команды (по user_id ИЛИ по username)? True → окно диалога
+    ИСКЛЮЧАЕТСЯ из клиентского конвейера ЦЕЛИКОМ (ни черновика, ни приветствия, ни intake).
+    sender=None → False (обычный путь; блок точечный, не глушит всё при отсутствии данных)."""
+    if sender is None:
+        return False
+    uid = getattr(sender, "id", None)
+    if uid is not None and uid in TEAM_REGISTRY["user_ids"]:
+        return True
+    uname = (getattr(sender, "username", None) or "").lstrip("@").lower()
+    return bool(uname) and uname in _team_usernames()
+
+
+def is_internal_user_id(user_id) -> bool:
+    """Второй слой (intake): клиент из intake-записи — участник команды по user_id?
+    intake-строка несёт только client_id (без username), поэтому здесь проверка по id."""
+    try:
+        return int(user_id) in TEAM_REGISTRY["user_ids"]
+    except (TypeError, ValueError):
+        return False
+
+
+def is_internal_chat(chat_id) -> bool:
+    """Внутренняя (командная/рабочая) группа по id? True → конвейер её не трогает. userbot_listen
+    пропускает только ЛС, но групповые/intake-пути должны видеть тот же реестр (defense-in-depth)."""
+    try:
+        return int(chat_id) in TEAM_REGISTRY["group_ids"]
+    except (TypeError, ValueError):
+        return False
+
 # Токен бота-модератора (задача-2). Пусто → бот не поднимается, работает деградация
 # (reply-режим userbot). Токен НИКОГДА не логируем и не коммитим.
 MODERBOT_TOKEN = os.getenv("MODERBOT_TOKEN", "").strip()
@@ -3873,6 +3956,14 @@ async def poll_and_post_intake(client, poster=None, group_id=None, photo_finder=
     gid = group_id if group_id is not None else INBOX_GROUP_ID
     n = 0
     for r in rows:
+        # СЛОЙ 2 (defense-in-depth к блоку on_client_message): даже если заявка команды как-то
+        # доехала до очереди — не постим её во «Входящие брони». intake-строка несёт client_id
+        # (без username) → сверяем по id-реестру команды. Помечаем 'skipped', наружу ничего.
+        if is_internal_user_id(r.get("client_id")):
+            moderation_ipc.mark_intake(r["id"], "skipped", reason="внутренний аккаунт команды (реестр)")
+            log.info(f"SUGGEST: intake #{r['id']} от внутреннего id{r.get('client_id')} — "
+                     f"пропущен (реестр команды, слой 2).")
+            continue
         text = (r.get("text") or "").strip()
         if not text.startswith(INTAKE_POST_PREFIX):   # защита: не тот формат — не постим наружу
             moderation_ipc.mark_intake(r["id"], "failed", reason="текст не начинается с 🆕 БРОНЬ")
@@ -3913,6 +4004,15 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
     """Врезка в on_incoming: собрать диалог → черновик → на модерацию.
     bot-режим → в IPC (бот запостит карточку с кнопками); иначе reply-режим (в группу)."""
     if not is_enabled():
+        return None
+    # ЖЁСТКИЙ блок КОДОМ ДО LLM (слой 1; родитель: инцидент @Pleummmm 15.07 11:23): сообщение
+    # от участника команды/внутреннего аккаунта → окно ИСКЛЮЧЕНО из конвейера ЦЕЛИКОМ — НУЛЕВАЯ
+    # реакция (ни _fetch_messages, ни generate_draft, ни приветствия, ни intake ниже по потоку).
+    if is_internal_sender(sender):
+        ref = (f"@{sender.username}" if getattr(sender, "username", None)
+               else f"id{getattr(sender, 'id', None)}")
+        log.info(f"SUGGEST: внутренний аккаунт команды {ref} — окно вне клиентского конвейера "
+                 f"(без черновика/приветствия/intake).")
         return None
     client_id = sender.id
     client_ref = f"@{sender.username}" if getattr(sender, "username", None) else f"id{sender.id}"

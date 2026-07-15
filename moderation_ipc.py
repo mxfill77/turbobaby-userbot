@@ -186,8 +186,9 @@ def fetch_pending_intake(path=None):
 
 
 def mark_intake(intake_id, status, posted_msg_id=None, reason=None, path=None):
-    """Итог постинга userbot'ом: posted (ушло, posted_msg_id) | failed (reason)."""
-    assert status in ("posted", "failed")
+    """Итог постинга userbot'ом: posted (ушло, posted_msg_id) | failed (reason) |
+    skipped (намеренно НЕ постим — напр. внутренний аккаунт команды из реестра, reason)."""
+    assert status in ("posted", "failed", "skipped")
     with _conn(path) as c:
         c.execute(
             "UPDATE intake SET status=?, posted_msg_id=?, reason=?, updated_ts=? WHERE id=?",

@@ -57,6 +57,11 @@ suggest.MODERBOT_TOKEN = ""          # боевой токен недоступ�
 suggest.SUGGEST_MODE = False         # главный рубильник OFF (тесты включают точечно)
 suggest.SUGGEST_TEST_MODE = False    # чистый дефолт (тесты TEST_MODE ставят True сами)
 suggest.APPROVER_USERNAMES = set()   # пустой whitelist = любой approver (как в чистом env)
+suggest.INTAKE_APPROVERS = set()     # пусто → is_intake_approver фолбэкает на approver-whitelist
+# Реестр команды из team_registry.json не течёт в общие тесты (сообщение от @Pleummmm иначе бы
+# молча выпадало из конвейера в тестах, написанных под чистое окружение). Тесты блока команды
+# ставят свой реестр сами (и восстанавливают в tearDown).
+suggest.TEAM_REGISTRY = {"usernames": set(), "user_ids": set(), "group_ids": set()}
 suggest.MOD_GROUP_ID = None
 suggest.MOD_GROUP_NAME = ""
 suggest.BRIDGE_URL = ""              # сеть недоступна: load_faq падает на локальный файл, не в Bridge
