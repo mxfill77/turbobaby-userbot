@@ -14,6 +14,7 @@ import time
 import asyncio
 import datetime
 import tempfile
+import logging
 import unittest
 from unittest import mock
 
@@ -472,6 +473,40 @@ class TestSendGuards(unittest.TestCase):
             self.assertEqual(c.sent, [])          # клиенту ничего
         finally:
             suggest.SUGGEST_TEST_MODE = old
+
+    def test_send_strips_internal_markers_before_send(self):
+        # Шаг 2/5 родитель #55: гард исходящих в ТОЧКЕ отправки — клиенту уходит текст БЕЗ
+        # внутренних маркеров («Этап N»/«собрано»/«[уточнить»), и факт среза виден в штатном логе
+        # с ОКНОМ (client_id) и тем, ЧТО вырезано.
+        c = FakeClient()
+        draft = ("Здравствуйте! XSR 155 — 1685 THB/сутки.\n"
+                 "Этап 3: ждём паспорт.\n"
+                 "[уточнить: даты аренды]")
+        with self.assertLogs("suggest", level="WARNING") as cm:
+            ok, _ = asyncio.run(
+                suggest.send_to_client(c, 777, draft, sleep=_nosleep, jitter=lambda: 0)
+            )
+        self.assertTrue(ok)
+        sent_text = c.sent[0][1]
+        self.assertNotIn("Этап 3", sent_text)             # внутренний маркер не течёт клиенту
+        self.assertNotIn("[уточнить", sent_text)
+        self.assertIn("1685", sent_text)                  # полезный текст цел
+        blob = "\n".join(cm.output)
+        self.assertIn("stripInternalMarkers", blob)       # штатный лог сработал
+        self.assertIn("777", blob)                        # с указанием окна (client_id)
+        self.assertIn("Этап 3", blob)                     # и что именно вырезано
+
+    def test_send_clean_text_no_strip_log(self):
+        # Чистый текст без маркеров уходит как есть и НЕ пишет предупреждение о срезе.
+        c = FakeClient()
+        log = logging.getLogger("suggest")
+        with self.assertLogs(log, level="WARNING") as cm:
+            log.warning("SUGGEST[sentinel] проба")        # sentinel: assertLogs требует ≥1 записи
+            asyncio.run(
+                suggest.send_to_client(c, 5, "XSR 155 — 1685 THB/сутки", sleep=_nosleep, jitter=lambda: 0)
+            )
+        self.assertEqual(c.sent, [(5, "XSR 155 — 1685 THB/сутки")])
+        self.assertNotIn("stripInternalMarkers", "\n".join(cm.output))
 
     def test_flood_disables_suggest(self):
         class MyFlood(Exception):

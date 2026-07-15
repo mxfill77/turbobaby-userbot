@@ -3508,6 +3508,22 @@ def stripInternalMarkers(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", out).strip()
 
 
+def _strip_internal_markers_for_send(text: str, window) -> str:
+    """Обёртка над stripInternalMarkers для ТОЧКИ ОТПРАВКИ клиенту (шаг 2/5 родитель #55):
+    чистит исходящий текст от внутренних маркеров и, ЕСЛИ что-то вырезано, пишет в штатный лог
+    ЧТО (сами строки-маркеры) и в каком ОКНЕ (window = id клиента/диалога). Строки вычисляем по
+    тому же _INTERNAL_MARKER_RE, что и сам strip, — так лог показывает ровно удалённое. Ничего не
+    сработало → тихо возвращает очищенный текст (с точностью до нормализации пробелов)."""
+    cleaned = stripInternalMarkers(text)
+    removed = [ln.strip() for ln in (text or "").splitlines()
+               if _INTERNAL_MARKER_RE.search(ln)]
+    if removed:
+        log.warning(
+            f"SUGGEST[stripInternalMarkers] окно={window}: вырезано перед отправкой — "
+            f"{' | '.join(removed)}")
+    return cleaned
+
+
 # ===================== ГАРД НАЛИЧИЯ/ДЕФИЦИТА/ОСОБЫХ УСЛОВИЙ (родитель4, шаг 4/6) =====================
 # Пара к AVAILABILITY_INVARIANT_RULE: детерминированная страховка ПЕРЕД отправкой, по образцу удалённого
 # guard_quote_price (#310) — та же форма (сверка текста ↔ данные → перегенерация → фолбэк). Инвариант:
@@ -3865,6 +3881,10 @@ async def send_to_client(client, client_id, text, sleep=None, jitter=None):
     if not ok:
         log.warning(f"SUGGEST: отправка отклонена — {reason}")
         return False, reason
+    # Гард исходящих (шаг 2/5 родитель #55): ЛЮБОЙ текст клиенту чистим от ВНУТРЕННИХ маркеров
+    # («Этап N»/«менеджер ещё не назвал»/«собрано»/«[уточнить») СТРОГО ДО фактического send —
+    # клиент внутренней кухни сделки видеть не должен. Сработало → в штатный лог (что / окно).
+    text = _strip_internal_markers_for_send(text, client_id)
     try:
         async with client.action(client_id, "typing"):
             await sleep(jitter())
