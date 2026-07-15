@@ -1240,6 +1240,43 @@ def _asks_deposit_reduction_multi(newest: str, recent: str, models) -> bool:
     return bool(dep and less and (multi or len(models or []) >= 2))
 
 
+# Клиент ЯВНО выбрал ПАСПОРТ как депозит (KB: депозит = деньги ЛИБО паспорт, не оба). Ловим ДВА
+# сигнала В ОДНОЙ реплике — «паспорт» И депозит-контекст (залог/депозит/«вместо денег»): «фото
+# паспорта пришлю» + отдельный вопрос «какой депозит?» НЕ должны давать ложный выбор паспорта.
+_DP_PASSPORT_RE = re.compile(r"паспорт|passport", re.I)
+_DP_DEPOSIT_CTX_RE = re.compile(
+    r"залог|депозит|deposit|вместо\s+денег|вместо\s+деньг\w*|вместо\s+нал\w*"
+    r"|instead\s+of\s+(?:the\s+)?(?:money|cash|deposit)", re.I)
+
+
+def _deposit_passport_chosen(window) -> bool:
+    """Клиент выбрал ПАСПОРТ вместо денежного депозита → True. window — реплики клиента (любой
+    порядок); ОБА сигнала (паспорт + залог/депозит/«вместо денег») обязаны быть в ОДНОЙ реплике."""
+    for msg in (window or []):
+        s = msg or ""
+        if _DP_PASSPORT_RE.search(s) and _DP_DEPOSIT_CTX_RE.search(s):
+            return True
+    return False
+
+
+# Строка цены несёт сумму депозита из Bridge («депозит 3000 ฿», «депозит 3000 бат», «deposit 3000 THB»)
+# — при выборе паспорта её меняем на «депозит: паспорт» без числа (тело ответа и quote-хвост не
+# противоречат друг другу). Сама цена/итог не трогается — совпадение только на депозит-сумме.
+_DEPOSIT_SUM_RE = re.compile(
+    r"(?:депозит|залог|deposit)\w*\s*[:\-—]?\s*\d[\d\s]*\s*(?:฿|бат\w*|(?:thb|baht)\b)", re.I)
+
+
+def _deposit_as_passport(phrase: str, lang: str = "ru") -> str:
+    """Клиент выбрал ПАСПОРТ (KB: депозит = деньги ЛИБО паспорт, не оба): сумму депозита из Bridge в
+    строке цены заменяем на «депозит: паспорт» (без числа). Нет суммы во фразе → дописываем явно."""
+    repl = "deposit: passport" if lang == "en" else "депозит: паспорт"
+    new, n = _DEPOSIT_SUM_RE.subn(repl, phrase or "")
+    if n:
+        return new
+    base = (phrase or "").rstrip().rstrip(".")
+    return (base + "; " + repl) if base else repl
+
+
 def _explicit_monthly(text: str) -> bool:
     """monthly ТОЛЬКО по явному слову клиента, НЕ по длительности диапазона."""
     return bool(re.search(r"месяц|\bmonth\b|monthly", text or ""))
@@ -1547,6 +1584,7 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
     percent_q = _asks_percent_amount(newest, recent)   # «сколько будет N%» → процент от суммы расчёта
     units_count = _units_count(newest, models)         # «пара/два юнита одной модели» → цена «за каждый»
     old_gen_q = _asks_old_gen(newest, recent)          # «а старый xmax есть?» → прежнее поколение по запросу
+    deposit_passport_q = _deposit_passport_chosen(window)   # «паспорт в залог» → депозит без суммы
 
     # Гео для ДОСТАВКИ (шаг 5/7 #12): первая maps-ссылка в репликах клиента (новейшая первой). Ловим
     # ТОЛЬКО саму ссылку (упоминание «вилла/локация» без URL — не гео); питает резолвер доставки в
@@ -1567,7 +1605,8 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
             "has_start": has_start,
             "deposit_multi_q": deposit_multi_q, "price_sheet_q": price_sheet_q,
             "sheet_filter": sheet_filter, "percent_q": percent_q, "units_count": units_count,
-            "old_gen_q": old_gen_q, "maps_link": maps_link}
+            "old_gen_q": old_gen_q, "deposit_passport_q": deposit_passport_q,
+            "maps_link": maps_link}
 
 
 # ------------------- §243/6: трекер собранного по диалогу + reply-вложениям -------------------
@@ -2450,10 +2489,17 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
     products = [(label, m, nf) for m in models
                 for label, nf in _model_products_for_quote(m, want_old_gen=want_old_gen)]
 
+    # Клиент выбрал ПАСПОРТ как депозит (KB: деньги ЛИБО паспорт, не оба): сумму депозита из Bridge в
+    # строке цены меняем на «депозит: паспорт» ДО _wrap_single — так и инструкция LLM (тело ответа), и
+    # quote-хвост несут паспорт, а не число (иначе тело=«паспорт», хвост=«депозит 3000 ฿» — противоречие).
+    passport_dep = bool(hints.get("deposit_passport_q"))
+
     if len(products) == 1:
         label, m, nf = products[0]
         kind, phrase, q = _resolve_model_price(m, ds, de, hint_days, monthly, getter=getter,
                                                name_filter=nf)
+        if passport_dep:
+            phrase = _deposit_as_passport(phrase, lang)
         note = _wrap_single(kind, phrase)
         # «сколько будет N%» → процент считаем КОДОМ от суммы ЭТОГО расчёта (шаг 2/7 #253); число
         # ложится в блок ЦЕНА → пройдёт пост-чек. Есть live-quote (ok/min) → считаем; иначе просим
@@ -2486,6 +2532,8 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
     for label, m, nf in products:
         kind, phrase, _q = _resolve_model_price(m, ds, de, hint_days, monthly, getter=getter,
                                                 name_filter=nf)
+        if passport_dep:
+            phrase = _deposit_as_passport(phrase, lang)
         bullets.append(f"- {label}: {phrase}")
         if kind == "ok":                    # только строки с ЖИВОЙ ценой Bridge едут в quote-блок
             ok_lines.append(f"- {label}: {_scrub_gen_year(phrase)}")   # год поколения в хвост не течёт

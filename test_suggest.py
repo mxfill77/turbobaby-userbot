@@ -2891,6 +2891,48 @@ class TestSheetUntouchableBlock(unittest.TestCase):
         self.assertNotIn("[PRICE_SHEET]", draft)
 
 
+class TestDepositPassportChosen(unittest.TestCase):
+    """#22 шаг4/7: детект выбора ПАСПОРТА как депозита (KB: деньги ЛИБО паспорт, не оба). Правило-класс
+    CLAUDE.md: живые фразы клиента + парафразы RU/EN в позитивах, контрпримеры в негативах."""
+
+    def test_positives(self):
+        for phr in ("паспорт в залог оставлю",
+                    "давайте депозит паспортом",
+                    "можно вместо денег паспорт оставить?",
+                    "оставлю паспорт вместо депозита",
+                    "залог паспортом, наличные не хочу",
+                    "passport as deposit is fine",
+                    "can I leave my passport instead of the cash deposit?"):
+            self.assertTrue(suggest._deposit_passport_chosen([phr]), phr)
+
+    def test_negatives(self):
+        # фото паспорта для брони (не выбор депозита) / вопрос про депозит без паспорта / выбор ДЕНЕГ /
+        # приветствие / паспорт вне депозит-контекста
+        for phr in ("пришлю фото паспорта для брони",
+                    "какой депозит?",
+                    "депозит 3000 нормально, внесу наличными",
+                    "привет, какие цены?",
+                    "паспорт готовлю к поездке"):
+            self.assertFalse(suggest._deposit_passport_chosen([phr]), phr)
+
+    def test_two_signals_must_share_one_message(self):
+        # «фото паспорта» и «какой депозит?» в РАЗНЫХ репликах окна → НЕ выбор паспорта (ложь ушла).
+        self.assertFalse(suggest._deposit_passport_chosen(
+            ["какой депозит?", "фото паспорта уже отправил"]))
+
+    def test_deposit_as_passport_replaces_sum(self):
+        self.assertEqual(
+            suggest._deposit_as_passport("NMAX 155 — 337 ฿/день, за 5 дней 1685 ฿, депозит 3000 ฿"),
+            "NMAX 155 — 337 ฿/день, за 5 дней 1685 ฿, депозит: паспорт")
+        # разные форматы суммы депозита (бат / THB) — тоже в паспорт, итог/ставка целы
+        self.assertNotIn("3000", suggest._deposit_as_passport("итого 1685 ฿; депозит 3000 бат"))
+        self.assertIn("депозит: паспорт", suggest._deposit_as_passport("депозит 3000 бат"))
+        self.assertEqual(suggest._deposit_as_passport("deposit 7000 THB", "en"), "deposit: passport")
+        # нет суммы депозита во фразе → дописываем явно
+        self.assertEqual(suggest._deposit_as_passport("NMAX на 5 дней — 1685 ฿."),
+                         "NMAX на 5 дней — 1685 ฿; депозит: паспорт")
+
+
 class TestPointQuoteCodeBlock(unittest.TestCase):
     """#365 (родитель 4, шаг 2/6): ТОЧЕЧНЫЙ quote несёт цену Bridge в финал КОДОМ — как сетка
     PRICE_SHEET. strategy-перегенерация больше НЕ зависит от того, «донёс» ли LLM цифры: цена лежит
@@ -2955,6 +2997,28 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         self.assertNotIn("<<<END_QUOTE>>>", sysp)
         self.assertIn("ЦЕНА из Календаря", sysp)             # цена всё же в промпте (в инструкции)
         self.assertIn("1685", sysp)
+
+    def test_deposit_sum_default_no_passport(self):
+        # РЕЖИМ «сумма из Bridge» (паспорт НЕ выбран): и инструкция LLM, и quote-хвост несут число
+        # депозита 3000 — прежнее поведение цело.
+        note = self._note()
+        block = suggest._quote_block_from_note(note)
+        self.assertIn("депозит 3000 ฿", block)               # сумма депозита из Bridge в хвосте
+        self.assertIn("3000", note)                          # и в инструкции LLM (теле ответа)
+        self.assertNotIn("паспорт", block.lower())
+
+    def test_deposit_passport_quote_block(self):
+        # РЕЖИМ «паспорт»: клиент выбрал паспорт как депозит → в quote-хвосте «депозит: паспорт»
+        # БЕЗ суммы; итог за срок (1685) цел. Тело ответа (инструкция) и хвост НЕ противоречат.
+        note = self._note(deposit_passport_q=True)
+        block = suggest._quote_block_from_note(note)
+        self.assertIsNotNone(block)
+        self.assertIn("депозит: паспорт", block)             # паспорт без суммы в хвосте
+        self.assertNotIn("3000", block)                      # сумма депозита Bridge подавлена
+        self.assertIn("1685", block)                         # цена/итог за срок цел
+        # тело ответа (инструкция LLM) тоже несёт паспорт, а НЕ число — противоречия нет
+        self.assertNotIn("3000", note)
+        self.assertIn("паспорт", note)
 
     def test_units_carry_block_per_each(self):
         # #365 родитель4 шаг3/6: N юнитов одной модели → quote-блок несём ТОЖЕ, но цена/депозит в
