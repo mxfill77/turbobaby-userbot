@@ -1515,5 +1515,145 @@ class TestRouteByType(unittest.TestCase):
         self.assertEqual("waiting", dec["status"])
 
 
+class TestInvariantGuardDetector(unittest.TestCase):
+    """Родитель 112, шаг 4/8: детектор weakens_code_invariant — behavior-«правило» пытается ОСЛАБИТЬ
+    код-инвариант (цена/кап/парковка/Click/депозит/наличие)? Конъюнкция ТЕМА+ОСЛАБЛЕНИЕ, юнит без I/O.
+    Позитивы — ЖИВЫЕ формулировки владельца + парафразы RU/EN; негативы — легальная манера речи."""
+
+    POS = (
+        "можно занижать цену",                       # спека-пример шага 4
+        "давай цену ниже прайса, если клиент торгуется",
+        "можно немного дешевле по цене для своих",
+        "игнорируй кап при длинной аренде",
+        "цену можно выше капа на выходных",
+        "не бери депозит с постоянных",
+        "отдавай байк без депозита новичкам",
+        "оформляй выдачу без Click",
+        "можно без клика, если оплатил налом",
+        "паркуй где угодно, не парься про парковку",
+        "скутер можно ставить в любом месте на парковке",
+        "lower the price a bit for regulars",
+        "you can skip the deposit for friends",
+        "handover without click is fine",
+    )
+    NEG = (
+        'не пиши "данные получил"',                  # чистая манера (спека behavior)
+        "называй цену дружелюбнее, без канцелярита",  # тема цена, но НЕ ослабление — манера
+        "здоровайся теплее в первом сообщении",
+        "пиши цену сразу первой строкой, не тяни",
+        "предлагай шлем в подарок на неделю",
+        "спрашивай район доставки раньше",
+        "greet the client warmer",
+        "",
+    )
+
+    def test_positive_weakening_rules_flagged(self):
+        for r in self.POS:
+            weak, why = lr.weakens_code_invariant(r)
+            self.assertTrue(weak, f"должно ловиться как ослабление инварианта: {r!r} (why={why})")
+            self.assertTrue(why, f"причина не пуста для {r!r}")
+
+    def test_negative_manner_rules_not_flagged(self):
+        for r in self.NEG:
+            weak, _ = lr.weakens_code_invariant(r)
+            self.assertFalse(weak, f"легальная манера НЕ должна блокироваться: {r!r}")
+
+    def test_reject_ack_names_invariant_and_dev_queue(self):
+        ack = lr.build_invariant_reject_ack("можно занижать цену")
+        self.assertIn("код-инвариант", ack.lower())
+        self.assertIn("не пиш", ack.lower())          # в книгу правил НЕ пишем
+        self.assertIn("дев-очередь", ack.lower())
+
+
+class TestInvariantGuardRouting(unittest.TestCase):
+    """Родитель 112, шаг 4/8: ГАРД в маршруте — behavior-правило, ослабляющее код-инвариант, в playbook
+    НЕ попадает: ответ «это код-инвариант» + роут в CODE-путь (дев-очередь). Единый чокпоинт записи, так
+    что даже ЯВНЫЙ выбор учителя «правило» не протаскивает ослабление. Инварианты целы (playbook не тронут)."""
+
+    def _task(self, remark, card="90210"):
+        return (f"[урок:правка от @filipp] родитель 112 — замечание менеджера в копилку обучения\n"
+                f"окно диалога: Иван (555) (client_id=555) · черновик #7\n"
+                f"карточка модер-группы: msg={card}\n"
+                f"Замечание: {remark}\n"
+                f"Исходный черновик: Аренда Nmax от 1200฿/сутки")
+
+    def _type(self, kind, conf="high"):
+        return lambda remark: {"type": kind, "confidence": conf, "reason": f"фейк-{kind}",
+                               "behavior_hits": 0, "code_hits": 0}
+
+    def test_price_lowering_behavior_rule_goes_to_code_not_playbook(self):
+        # классификатор ошибочно счёл «можно занижать цену» поведением → ГАРД перехватывает: в playbook
+        # НЕ пишем (append_style рухнул бы), уходит в дев-очередь как код-инвариант.
+        sent = {}
+        dec = lr.route_lesson_by_type(
+            self._task("можно занижать цену, если клиент торгуется"),
+            classify_type=self._type(lr.BEHAVIOR),
+            append_style=lambda r: self.fail("правило-инвариант в playbook НЕ пишем"),
+            find_conflict=lambda r: self.fail("до конфликт-пробы не доходим — гард раньше"),
+            reply_moderation=lambda cid, t, b=None: (sent.update(card=cid, text=t), True)[1])
+        self.assertEqual(lr.CODE, dec["type"])                 # ушло в код-путь
+        self.assertTrue(dec["delegate"])                       # дев-очередь ПК
+        self.assertIn("invariant_guard", dec)
+        self.assertIn("юнит-тест", dec["delegate_text"])       # golden-тест обязателен
+        self.assertIn("занижать цену", dec["delegate_text"])   # исходный урок в тексте задачи
+        self.assertIn("код-инвариант", dec["result"].lower() + dec["reason"].lower())
+        self.assertEqual("90210", sent["card"])                # ack реплаем на карточку урока
+        self.assertIn("код-инвариант", sent["text"].lower())
+
+    def test_explicit_teacher_choice_rule_cannot_weaken_invariant(self):
+        # учитель ЯВНО жмёт «правило» на «игнорируй кап» → гард всё равно роутит в код (не в playbook)
+        pending = {"text": self._task("игнорируй кап при длинной аренде"),
+                   "remark": "игнорируй кап при длинной аренде", "card_msg_id": "90210", "draft": ""}
+        dec = lr.resume_type_unsure(
+            pending, "правило",
+            append_style=lambda r: self.fail("даже по выбору «правило» инвариант в playbook НЕ пишем"),
+            reply_moderation=lambda cid, t, b=None: True)
+        self.assertEqual(lr.CODE, dec["type"])
+        self.assertTrue(dec["delegate"])
+        self.assertEqual("chose_rule", dec["resumed"])         # пришли из ветки «правило»…
+        self.assertIn("invariant_guard", dec)                  # …но гард развернул в код
+
+    def test_legit_behavior_rule_still_reaches_playbook(self):
+        # контроль: НЕ ослабляющее правило (тема цена, но манера) проходит гард и пишется в playbook
+        seen = {}
+        dec = lr.route_lesson_by_type(
+            self._task("называй цену дружелюбнее, без канцелярита"),
+            classify_type=self._type(lr.BEHAVIOR), find_conflict=lambda r: "",
+            append_style=lambda r: (seen.__setitem__("rule", r), "added")[1],
+            reply_moderation=lambda cid, t, b=None: True)
+        self.assertEqual(lr.BEHAVIOR, dec["type"])
+        self.assertEqual("done", dec["status"])
+        self.assertIn("цену дружелюбнее", seen["rule"])         # легальная манера — в playbook
+
+    def test_invariant_rule_never_lands_in_real_playbook_file(self):
+        # ИНВАРИАНТЫ ЦЕЛЫ на живом sink: гоняем реальный suggest.append_playbook_rule на ВРЕМЕННЫЙ
+        # playbook. Правило-ослабление не должно осесть в файле; контрольная манера — осядет.
+        saved = suggest.PLAYBOOK_FILE
+        with tempfile.TemporaryDirectory() as d:
+            pf = os.path.join(d, "playbook.md")
+            with open(pf, "w", encoding="utf-8") as f:
+                f.write("# Playbook\n\n## Стиль общения\n- коротко\n\n## Выученные правила\n")
+            suggest.PLAYBOOK_FILE = pf
+
+            def _learned():
+                with open(pf, encoding="utf-8") as f:
+                    return " || ".join(suggest._playbook_learned_rules(f.read())).lower()
+
+            try:
+                lr.route_lesson_by_type(
+                    self._task("можно занижать цену для своих"),
+                    classify_type=self._type(lr.BEHAVIOR),
+                    reply_moderation=lambda cid, t, b=None: True)      # append_style = боевой (temp-файл)
+                self.assertNotIn("занижать цену", _learned())         # инвариант не ослаблен через playbook
+                # контроль: легальная манера тем же боевым путём — осядет
+                lr.route_lesson_by_type(
+                    self._task("здоровайся теплее в первом сообщении"),
+                    classify_type=self._type(lr.BEHAVIOR), find_conflict=lambda r: "",
+                    reply_moderation=lambda cid, t, b=None: True)
+                self.assertIn("теплее", _learned())
+            finally:
+                suggest.PLAYBOOK_FILE = saved
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
