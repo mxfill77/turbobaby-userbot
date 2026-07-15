@@ -217,6 +217,48 @@ class TestPureLogic(unittest.TestCase):
         # пустой/None-safe
         self.assertEqual(suggest.strip_greeting(""), "")
 
+    def test_strip_greeting_for_window(self):
+        # stripGreeting(draft, history) — гард повторного приветствия перед отправкой (#311→#56).
+        draft = "Здравствуйте! NMAX свободен, 449฿/день"
+        # ПОЗИТИВЫ (окно = продолжение) → зачин срезан:
+        #  • автоприветствие Telegram Business (реальный дословный текст класса «е»)
+        self.assertEqual(
+            suggest.strip_greeting_for_window(
+                draft, "[менеджер]: Спасибо, что выбрали нас! Мы в БангТао и Камале.\n"
+                       "[клиент]: NMAX есть?"),
+            "NMAX свободен, 449฿/день")
+        #  • второе поколение автоприветствия владельца
+        self.assertEqual(
+            suggest.strip_greeting_for_window(
+                draft, "[менеджер]: Уже смотрю ваше сообщение\n[клиент]: сколько NMAX?"),
+            "NMAX свободен, 449฿/день")
+        #  • наш прошлый ответ, начатый приветствием
+        self.assertEqual(
+            suggest.strip_greeting_for_window(
+                draft, "[менеджер]: Здравствуйте! Что арендуете?\n[клиент]: NMAX"),
+            "NMAX свободен, 449฿/день")
+        #  • наш прошлый ответ БЕЗ приветствия — всё равно продолжение, второй раз не здороваемся
+        self.assertEqual(
+            suggest.strip_greeting_for_window(
+                draft, "[менеджер]: Какие даты вас интересуют?\n[клиент]: с 20 июля"),
+            "NMAX свободен, 449฿/день")
+        # НЕГАТИВЫ (чистое окно) → черновик БЕЗ изменений, фирменное приветствие цело:
+        #  • первый контакт: в окне только клиент
+        self.assertEqual(
+            suggest.strip_greeting_for_window(draft, "[клиент]: Здравствуйте, что есть из байков?"),
+            draft)
+        #  • приветствие/автогритинг у КЛИЕНТА не считается нашим
+        self.assertEqual(
+            suggest.strip_greeting_for_window(draft, "[клиент]: Спасибо, что выбрали нас — шучу 😄"),
+            draft)
+        #  • пустая история
+        self.assertEqual(suggest.strip_greeting_for_window(draft, ""), draft)
+        #  • нет зачина в черновике → как есть даже на продолжении
+        self.assertEqual(
+            suggest.strip_greeting_for_window(
+                "NMAX свободен", "[менеджер]: Здравствуйте!\n[клиент]: ок"),
+            "NMAX свободен")
+
     def test_parse_approval(self):
         self.assertEqual(suggest.parse_approval("+"), ("approve", None))
         self.assertEqual(suggest.parse_approval("да"), ("approve", None))
