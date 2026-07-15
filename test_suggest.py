@@ -1813,6 +1813,91 @@ class TestDraftPostcheck(unittest.TestCase):
         self.assertEqual(suggest.postcheck_draft(text, "ru", pricing_note=""), text)
 
 
+class TestFreePickupPostcheck(unittest.TestCase):
+    """Пост-чек забора (шаг 5/7 #22): бесплатный забор в конце аренды — ТОЛЬКО при ОПЛАЧЕННОЙ
+    доставке. Без доставки/самовывоз забор платный как доставка зоны; самопротиворечие «заберём
+    бесплатно — заберите сами» запрещено. Голдены — реальные формулировки менеджера/бота, а не
+    идеализация (правило-класс CLAUDE.md)."""
+
+    def _fp(self, low):
+        return bool(suggest._FP_FREE_RE.search(low))
+
+    # --- ЯДРО ШАГА: точка без доставки → нет обещания бесплатного забора ---
+    def test_self_pickup_strips_free_pickup(self):
+        # Самопротиворечие в одном черновике: «заберёте сами» + «забор бесплатный».
+        draft = ("Байк заберёте сами по адресу магазина. Забор байка в конце аренды бесплатный. "
+                 "Бронируем?")
+        out = suggest.postcheck_free_pickup(draft, "ru")
+        self.assertNotIn("бесплатн", out.lower())          # обещание бесплатного забора снято
+        self.assertIn("заберёте сами", out.lower())        # остальной текст на месте
+        self.assertIn("Бронируем?", out)
+
+    def test_point_without_delivery_no_free_pickup(self):
+        # «Точка без доставки»: delivery_paid=False → бесплатного забора не обещаем даже без слова
+        # «самовывоз» в тексте (клиент прислал точку, но доставку не берёт).
+        draft = "Отлично, вот наш адрес. Забор байка в конце аренды — бесплатный."
+        out = suggest.postcheck_free_pickup(draft, "ru", delivery_paid=False)
+        self.assertNotIn("бесплатн", out.lower())
+        self.assertNotIn("забор", out.lower())
+
+    def test_paren_clause_stripped_keeps_price(self):
+        # Клауза в скобках вырезается, цена доставки и точка остаются.
+        draft = "Заберёте сами. Доставка — 590 ฿ (забор байка в конце аренды — бесплатный)."
+        out = suggest.postcheck_free_pickup(draft, "ru")
+        self.assertIn("590", out)
+        self.assertNotIn("бесплатн", out.lower())
+        self.assertIn("Доставка — 590 ฿.", out)
+
+    def test_comma_clause_stripped(self):
+        # Живая формулировка: «... доставка, забор ... бесплатный» при самовывозе → хвост срезан.
+        draft = "Самовывоз из Камалы, забор байка в конце аренды бесплатный."
+        out = suggest.postcheck_free_pickup(draft, "ru")
+        self.assertNotIn("бесплатн", out.lower())
+        self.assertIn("Самовывоз из Камалы", out)
+
+    def test_en_self_pickup_strips_free_pickup(self):
+        draft = "You'll pick it up yourself at our shop. Bike pickup at the end of the rental is free."
+        out = suggest.postcheck_free_pickup(draft, "en")
+        self.assertNotIn("free", out.lower())
+        self.assertIn("pick it up yourself", out.lower())
+
+    # --- НЕГАТИВЫ: законный бесплатный забор при оплаченной доставке НЕ трогаем ---
+    def test_paid_delivery_free_pickup_untouched(self):
+        # Доставку клиент берёт (нет сигнала самовывоза) → бесплатный забор легитимен, вход байт-в-байт.
+        draft = "Найхарн — 590 бат доставка, забор байка в конце аренды бесплатный."
+        self.assertEqual(suggest.postcheck_free_pickup(draft, "ru"), draft)
+
+    def test_code_delivery_line_untouched(self):
+        # КОД-строка доставки (compose_delivery_draft) — оплаченная зона, без самовывоза: не трогаем.
+        draft = "Доставка — 290 ฿ (забор байка в конце аренды — бесплатный)."
+        self.assertEqual(suggest.postcheck_free_pickup(draft, "ru"), draft)
+
+    def test_no_free_pickup_mention_untouched(self):
+        # Нет обещания бесплатного забора вовсе → вход без изменений (fail-safe).
+        draft = "Самовывоз из нашего магазина по адресу, работаем с 9 до 20."
+        self.assertIs(suggest.postcheck_free_pickup(draft, "ru"), draft)
+
+    def test_regex_catches_live_phrasings(self):
+        # Детект обещания на реальных/парафразных формулировках (позитивы) и контрпримерах (негативы).
+        pos = [
+            "забор байка в конце аренды — бесплатный",
+            "забор в конце аренды бесплатный",
+            "заберём байк бесплатно в конце аренды",
+            "bike pickup at the end of the rental is free",
+            "free pickup at the end",
+        ]
+        for p in pos:
+            self.assertTrue(self._fp(p), p)
+        neg = [
+            "доставка 590 бат",                     # только доставка, без забора
+            "депозит 3000 бат или паспорт",         # депозит
+            "заберёте байк сами по адресу",         # самовывоз без слова «бесплатный»
+            "we deliver for a fee",                 # платная доставка, не забор
+        ]
+        for n in neg:
+            self.assertFalse(self._fp(n), n)
+
+
 class TestGuardAvailability(unittest.TestCase):
     """guard_availability (родитель4, шаг 4/6): гард ПЕРЕД отправкой — бот НЕ утверждает наличие/
     дефицит/особые условия без данных. Форма по образцу удалённого guard_quote_price: клейм без
