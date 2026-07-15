@@ -271,6 +271,42 @@ class TestPureLogic(unittest.TestCase):
                 "NMAX свободен", "[менеджер]: Здравствуйте!\n[клиент]: ок"),
             "NMAX свободен")
 
+    def test_strip_internal_markers(self):
+        # Шаг 3/5 родитель #55: чистая stripInternalMarkers режет строки с внутренними
+        # служебными маркерами и оставляет полезный текст. По кейсу на каждый из 4 паттернов.
+        #  • «Этап \d»
+        self.assertEqual(
+            suggest.stripInternalMarkers("NMAX свободен\nЭтап 3: ждём паспорт"),
+            "NMAX свободен")
+        #  • «менеджер ещё не назвал» (в т.ч. вариант «еще» без ё)
+        self.assertEqual(
+            suggest.stripInternalMarkers("Цена 500฿\nменеджер ещё не назвал модель"),
+            "Цена 500฿")
+        self.assertEqual(
+            suggest.stripInternalMarkers("Цена 500฿\nменеджер еще не назвал сроки"),
+            "Цена 500฿")
+        #  • «собрано»
+        self.assertEqual(
+            suggest.stripInternalMarkers("XSR 155 в наличии\nсобрано: даты, модель"),
+            "XSR 155 в наличии")
+        #  • «[уточнить»
+        self.assertEqual(
+            suggest.stripInternalMarkers("Аренда доступна\n[уточнить: даты аренды]"),
+            "Аренда доступна")
+        #  • маркер в СЕРЕДИНЕ текста — вырезается вся строка, соседние целы
+        self.assertEqual(
+            suggest.stripInternalMarkers(
+                "Здравствуйте!\nЭтап 2: ждём фото\nNMAX 449฿/день"),
+            "Здравствуйте!\nNMAX 449฿/день")
+        #  • НЕСКОЛЬКО маркеров сразу — все строки со следами вон, полезное цело
+        self.assertEqual(
+            suggest.stripInternalMarkers(
+                "Этап 1\nCLICK 125 свободен\n[уточнить: сроки]\nсобрано: модель\n449฿/день"),
+            "CLICK 125 свободен\n449฿/день")
+        #  • НЕГАТИВ: текст без маркеров возвращается без изменений
+        clean = "Здравствуйте! XSR 155 — 1685 THB/сутки. Свободен на ваши даты."
+        self.assertEqual(suggest.stripInternalMarkers(clean), clean)
+
     def test_parse_approval(self):
         self.assertEqual(suggest.parse_approval("+"), ("approve", None))
         self.assertEqual(suggest.parse_approval("да"), ("approve", None))
