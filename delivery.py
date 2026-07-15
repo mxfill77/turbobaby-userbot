@@ -20,6 +20,7 @@ import time
 import logging
 import urllib.request
 import urllib.parse
+import urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -190,13 +191,22 @@ def _default_expand(url):
     Может кинуть (таймаут/сеть) — ловится в resolve_maps_link."""
     cur = url
     final = None
+    # Не даём urllib молча ходить по редиректам — сами читаем Location.
+    opener = urllib.request.build_opener(_NoRedirectHandler)
     for _ in range(_MAPS_MAX_HOPS):
         req = urllib.request.Request(
             cur, method="HEAD",
             headers={"User-Agent": _MAPS_UA})
-        # Не даём urllib молча ходить по редиректам — сами читаем Location.
-        opener = urllib.request.build_opener(_NoRedirectHandler)
-        resp = opener.open(req, timeout=MAPS_TIMEOUT)
+        try:
+            resp = opener.open(req, timeout=MAPS_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            # 3xx (и любой не-2xx) прилетает от opener'а как HTTPError, а НЕ возвращается:
+            # с _NoRedirectHandler редирект-хендлер отдаёт None ⇒ urllib поднимает HTTPError.
+            # Сам объект ошибки И ЕСТЬ ответ (у него есть .getcode()/.headers/.close()) —
+            # из него и читаем код + Location. Без этого разворот падал на ПЕРВОМ же 302
+            # (живой goo.gl отдаёт ровно `302 Found` + `Location: …/maps/place/…`), и вся
+            # цепочка коротких ссылок молча деградировала в None ⇒ ложный [уточнить].
+            resp = e
         try:
             code = resp.getcode()
             if code in (301, 302, 303, 307, 308):
@@ -333,10 +343,29 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     return 2 * _EARTH_R_KM * math.asin(min(1.0, math.sqrt(a)))
 
 
+def _zone_as_dict(z):
+    """Привести зону к dict-схеме. Живой Bridge отдаёт зоны ПОЗИЦИОННЫМ списком
+    `[name, lat, lon, price, radius]` (как сырые строки листа: см. fixtures/
+    delivery_zones_get.live.json — `["Раваи", 7.771, 98.327, 590, 4]`), а не словарём.
+    Разворачиваем такой список в те же ключи, что у dict-схемы, чтобы _zone_anchor/
+    _zone_radius_km/_zone_price/имя работали единообразно на ОБОИХ форматах.
+    dict — возвращаем как есть; список <5 полей или прочий мусор → {} (зона отфильтруется
+    как битая якорем/радиусом — fail-safe, а не выдуманная цена)."""
+    if isinstance(z, dict):
+        return z
+    if isinstance(z, (list, tuple)) and len(z) >= 5:
+        name, lat, lon, price, radius = z[0], z[1], z[2], z[3], z[4]
+        return {"name": name, "lat": lat, "lon": lon,
+                "price": price, "radius_km": radius}
+    return {}
+
+
 def _zone_anchor(z):
     """Якорь зоны (lat, lon) в допустимых диапазонах, либо None. Терпим к схеме:
-    плоские lat/lon(lng), вложенный anchor/center-словарь, либо пара-список coords."""
-    if not isinstance(z, dict):
+    позиционный список `[name,lat,lon,price,radius]` (живой Bridge), плоские lat/lon(lng),
+    вложенный anchor/center-словарь, либо пара-список coords."""
+    z = _zone_as_dict(z)
+    if not z:
         return None
     lat = z.get("lat", z.get("latitude"))
     lon = z.get("lon", z.get("lng", z.get("longitude")))
@@ -354,9 +383,9 @@ def _zone_anchor(z):
 
 
 def _zone_radius_km(z):
-    """Радиус зоны в км (float > 0), либо None при отсутствии/мусоре."""
-    if not isinstance(z, dict):
-        return None
+    """Радиус зоны в км (float > 0), либо None при отсутствии/мусоре.
+    Принимает позиционный список Bridge и dict-схему (см. _zone_as_dict)."""
+    z = _zone_as_dict(z)
     r = z.get("radius_km", z.get("radius", z.get("r_km")))
     try:
         r = float(r)
@@ -366,9 +395,9 @@ def _zone_radius_km(z):
 
 
 def _zone_price(z):
-    """Цена доставки зоны (число), либо None при отсутствии/мусоре."""
-    if not isinstance(z, dict):
-        return None
+    """Цена доставки зоны (число), либо None при отсутствии/мусоре.
+    Принимает позиционный список Bridge и dict-схему (см. _zone_as_dict)."""
+    z = _zone_as_dict(z)
     p = z.get("price", z.get("price_thb", z.get("cost")))
     if isinstance(p, bool):  # bool — подкласс int, но не цена
         return None
@@ -404,12 +433,13 @@ def resolve_delivery(lat, lon, zones, cfg=None):
     # Собираем валидные якоря: (дистанция, радиус, цена, имя). Битые зоны молча пропускаем.
     anchors = []
     for z in zones:
-        a = _zone_anchor(z)
-        r = _zone_radius_km(z)
+        zd = _zone_as_dict(z)            # позиционный список Bridge → dict-схема
+        a = _zone_anchor(zd)
+        r = _zone_radius_km(zd)
         if a is None or r is None:
             continue
         d = _haversine_km(plat, plon, a[0], a[1])
-        anchors.append((d, r, _zone_price(z), (z.get("name") if isinstance(z, dict) else None)))
+        anchors.append((d, r, _zone_price(zd), zd.get("name")))
     if not anchors:
         return _uncertain()              # ни одного валидного якоря → фолбэк
 

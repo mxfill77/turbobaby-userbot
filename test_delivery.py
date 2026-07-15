@@ -6,9 +6,23 @@ test_delivery.py — мок-тесты клиента зон доставки (d
 повторный вызов в пределах TTL берётся из кэша, БЕЗ обращения к сети.
 """
 
+import io
+import os
+import json
+import email.message
 import unittest
 
 import delivery
+
+# --- ЖИВАЯ фикстура ответа Bridge delivery_zones_get (снята с прода 2026-07-15) -------------
+# Класс-урок (CLAUDE.md): мок внешнего ответа обязан КОПИРОВАТЬ живой формат. Живой Bridge
+# отдаёт зоны ПОЗИЦИОННЫМ списком `[name, lat, lon, price, radius]`, а не словарём — раньше
+# резолвер (dict-only) молча ронял все зоны. Голдены зон гоняем на этой реальной фикстуре.
+_FIXT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "fixtures", "delivery_zones_get.live.json")
+with open(_FIXT, encoding="utf-8") as _f:
+    LIVE_BRIDGE_RESPONSE = json.load(_f)
+LIVE_ZONES = LIVE_BRIDGE_RESPONSE["zones"]   # 16 зон, позиционный формат прода
 
 
 class TestDeliveryZones(unittest.TestCase):
@@ -469,6 +483,136 @@ class TestResolveDeliveryFromText(unittest.TestCase):
         self.assertIsNone(r)
 
 
+class TestLivePositionalZones(unittest.TestCase):
+    """Bug B (трасса #51): живой Bridge отдаёт зоны ПОЗИЦИОННЫМ списком
+    `[name, lat, lon, price, radius]`, не словарём — резолвер обязан парсить ОБА формата.
+    Гоняем на реальной фикстуре прода (fixtures/delivery_zones_get.live.json), а не на
+    идеализированном dict-моке (класс-урок «мок = живой формат»)."""
+
+    def test_extract_zones_from_live_response(self):
+        # сырой ответ прода → 16 позиционных зон (первая — Раваи из живого листа)
+        zones = delivery._extract_zones(LIVE_BRIDGE_RESPONSE)
+        self.assertEqual(len(zones), 16)
+        self.assertEqual(zones[0], ["Раваи", 7.771, 98.327, 590, 4])
+
+    def test_positional_zone_helpers(self):
+        # парсеры якоря/радиуса/цены понимают позиционный список дословно как из прода
+        z = ["Раваи", 7.771, 98.327, 590, 4]
+        self.assertEqual(delivery._zone_anchor(z), (7.771, 98.327))
+        self.assertEqual(delivery._zone_radius_km(z), 4.0)
+        self.assertEqual(delivery._zone_price(z), 590)
+
+    def test_positional_zone_short_list_is_broken(self):
+        # список <5 полей — битая зона: молча отфильтровывается (fail-safe, не выдумка)
+        self.assertIsNone(delivery._zone_anchor(["Раваи", 7.771]))
+        self.assertIsNone(delivery._zone_radius_km(["Раваи", 7.771, 98.327]))
+
+    def test_golden_rawai_point_resolves_590(self):
+        # ГОЛДЕН «Раваи → 590»: точка ровно на якоре Раваи из живой фикстуры → зона Раваи, 590.
+        # Именно позиционный формат зон — если бы парсер остался dict-only, тут был бы [уточнить].
+        r = delivery.resolve_delivery(7.771, 98.327, LIVE_ZONES)
+        self.assertEqual(r["status"], "zone")
+        self.assertEqual(r["zone"], "Раваи")
+        self.assertEqual(r["price"], 590)
+        self.assertIsNone(r["marker"])
+
+    def test_golden_dict_and_positional_agree(self):
+        # тот же результат на dict-эквиваленте живой зоны — оба формата сходятся
+        dict_zone = [{"name": "Раваи", "lat": 7.771, "lon": 98.327,
+                      "price": 590, "radius_km": 4}]
+        r = delivery.resolve_delivery(7.771, 98.327, dict_zone)
+        self.assertEqual((r["zone"], r["price"]), ("Раваи", 590))
+
+    def test_golden_meatpoint_pin_out_belt_on_live_zones(self):
+        # ЧЕСТНЫЙ голден живого пина Meat Point (8.0407335, 98.3433216 — центр острова из тела)
+        # против ЖИВЫХ зон: ближайший якорь «Таланг север» (5.83 км, r=5) — вне радиуса, но в
+        # поясе +5 км → out_belt/1490. НЕ подгоняем синтетическую зону под пин ради «590».
+        r = delivery.resolve_delivery(8.0407335, 98.3433216, LIVE_ZONES)
+        self.assertEqual(r["status"], "out_belt")
+        self.assertEqual(r["price"], 1490)
+        self.assertEqual(r["price"], delivery.OUT_BELT_PRICE)
+        self.assertIsNone(r["marker"])
+
+
+class TestDefaultExpandRedirectChain(unittest.TestCase):
+    """Bug A (трасса #51): реальный goo.gl отдаёт `302 Found` + `Location`, а _NoRedirectHandler
+    заставляет urllib поднять HTTPError на opener.open (а НЕ вернуть 3xx-ответ). Раньше это
+    роняло разворот на первом же 302 → короткие ссылки молча деградировали в None (ложный
+    [уточнить]). Проверяем, что _default_expand ловит HTTPError КАК ОТВЕТ, читает Location,
+    проходит цепочку до 200 и — для place-ссылки без координат в URL — догружает тело.
+    Вся сеть замокана мок-opener'ом (302+Location дословно) — тест не ходит в интернет."""
+
+    # Живые артефакты кейса «79 Meat Point» (tmp/geo-recon.md): короткая share-ссылка,
+    # конечный place-URL (координат в нём НЕТ) и фрагмент живого тела с единственной парой —
+    # center= статической карты (og:image пина), запятая %2C-кодирована ровно как в проде.
+    SHORT = "https://maps.app.goo.gl/c4G4B3sNrfJZBSue6?g_st=ac"
+    MID = "https://maps.app.goo.gl/_intermediate_hop_"
+    FINAL = ("https://www.google.com/maps/place/79,+Meat+Point+%7C+steaks,+burgers,+skewers,"
+             "+79+Soi+Saiyuan,+Mueang,+Phuket,+83100/data=!4m2!3m1!1s0x30502f24a5443265:"
+             "0xa4cc15728db01dbd!18m1!1e1?utm_source=mstt_1&entry=gps&g_st=ac")
+    BODY = ('<html>…<meta content="https://maps.googleapis.com/maps/api/staticmap?'
+            'center=8.0407335%2C98.3433216&zoom=16&size=800x600&markers=…">…</html>')
+    PIN = (8.0407335, 98.3433216)
+
+    class _Resp200:
+        """Фейк конечного 200-ответа (как HTTPResponse после разворота)."""
+        headers = {}
+        def __init__(self, url): self._url = url
+        def getcode(self): return 200
+        def geturl(self): return self._url
+        def close(self): pass
+
+    def _mock_net(self, chain):
+        """Подменить сеть delivery: build_opener → opener с 302+Location по `chain` (url→Location),
+        поднимая HTTPError ровно как живой _NoRedirectHandler; _fetch_body → BODY. С откатом."""
+        test = self
+
+        class _Opener:
+            def open(self, req, timeout=None):
+                u = req.full_url
+                if u in chain:                     # 3xx-хоп: HTTPError с Location (как в проде)
+                    h = email.message.Message()
+                    h["Location"] = chain[u]
+                    raise delivery.urllib.error.HTTPError(u, 302, "Found", h, io.BytesIO(b""))
+                return test._Resp200(u)            # конечная страница 200
+
+        saved_build = delivery.urllib.request.build_opener
+        saved_fetch = delivery._fetch_body
+        delivery.urllib.request.build_opener = lambda *a, **k: _Opener()
+        delivery._fetch_body = lambda url: test.BODY
+        self.addCleanup(setattr, delivery.urllib.request, "build_opener", saved_build)
+        self.addCleanup(setattr, delivery, "_fetch_body", saved_fetch)
+
+    def test_single_302_hop_then_body(self):
+        # один 302 → конечный URL без координат → тело догружено → «URL\n+тело»
+        self._mock_net({self.SHORT: self.FINAL})
+        out = delivery._default_expand(self.SHORT)
+        self.assertEqual(out, self.FINAL + "\n" + self.BODY)
+        self.assertEqual(delivery._parse_coords_from_url(out), self.PIN)
+
+    def test_multi_hop_chain_walked(self):
+        # цепочка 302→302→200 проходится целиком (не падает на первом Location)
+        self._mock_net({self.SHORT: self.MID, self.MID: self.FINAL})
+        out = delivery._default_expand(self.SHORT)
+        self.assertTrue(out.startswith(self.FINAL))
+        self.assertEqual(delivery._parse_coords_from_url(out), self.PIN)
+
+    def test_resolve_maps_link_full_path_yields_pin(self):
+        # сквозь публичный resolve_maps_link (реальный _default_expand, мок-сеть) → живой пин
+        self._mock_net({self.SHORT: self.FINAL})
+        self.assertEqual(delivery.resolve_maps_link(self.SHORT), self.PIN)
+
+    def test_end_to_end_meatpoint_out_belt_1490(self):
+        # СКВОЗНОЙ живой сценарий #51: короткая ссылка → 302+Location → place-URL → тело →
+        # пин (центр острова) → ЖИВЫЕ зоны → out_belt/1490 (реальный итог, НЕ ложный [уточнить]).
+        self._mock_net({self.SHORT: self.FINAL})
+        text = f"локация тут {self.SHORT} спасибо"
+        r = delivery.resolve_delivery_from_text(text, _get_zones=lambda: LIVE_ZONES)
+        self.assertEqual(r["status"], "out_belt")
+        self.assertEqual(r["price"], 1490)
+        self.assertIsNone(r["marker"])
+
+
 class TestDeliveryGoldens(unittest.TestCase):
     """ДЕТЕРМИНИРОВАННЫЕ ГОЛДЕНЫ сквозного конвейера доставки — вся сеть ЗАМОКАНА.
 
@@ -578,11 +722,9 @@ class TestDeliveryGoldens(unittest.TestCase):
         self.assertEqual(r["status"], "uncertain")
         self.assertEqual(r["marker"], "[уточнить]")
 
-    # 7) ЖИВОЙ place-линк, пин только в теле → точка «на Пхукете», не [уточнить] --------
-    # Зона Пхукета вокруг реального пина из tmp/geo-recon.md (Сайюан/Раваи, 8.0407,98.3433).
-    ZONES_PHUKET = [{"name": "Сайюан", "lat": 8.0407, "lon": 98.3433,
-                     "radius_km": 5, "price": 350}]
-    # Конечный URL из recon (координат в нём нет) + фрагмент тела с пином в staticmap center=.
+    # 7) ЖИВОЙ place-линк, пин только в теле → цена доставки, НЕ ложный [уточнить] --------
+    # Конечный URL из recon (координат в нём нет) + фрагмент ЖИВОГО тела с пином в staticmap
+    # center= (единственная координатная пара, %2C-кодирована как в проде).
     _RECON_FINAL_URL = (
         "https://www.google.com/maps/place/79,+Meat+Point+%7C+steaks,+burgers,+skewers,"
         "+79+Soi+Saiyuan,+Mueang,+Phuket,+83100/data=!4m2!3m1!1s0x30502f24a5443265:"
@@ -593,18 +735,19 @@ class TestDeliveryGoldens(unittest.TestCase):
         "center=8.0407335%2C98.3433216&zoom=16&size=800x600\"…</html>"
     )
 
-    def test_golden_recon_place_link_resolves_on_phuket(self):
-        # Живой сценарий #22: клиент кинул короткую share-ссылку на заведение. Разворот
-        # (замокан конечным URL из recon + тело) даёт пин из тела → точка попадает в зону
-        # Пхукета, а НЕ в ложный [уточнить]. redirect имитируем через _resolve_maps→resolve_maps_link.
+    def test_golden_recon_place_link_resolves_on_live_zones(self):
+        # Живой сценарий #51: клиент кинул короткую share-ссылку на заведение. Разворот
+        # (замокан конечным URL из recon + тело) даёт пин из тела (8.0407335, 98.3433216).
+        # Против ЖИВЫХ зон прода (позиционный формат!) это out_belt/1490 — реальная цена
+        # доставки, а НЕ ложный [уточнить] (корневой баг). Синтетическую зону под пин НЕ
+        # подгоняем: голден на живой фикстуре — как учит CLAUDE.md (мок = живой формат).
         text = "локация тут https://maps.app.goo.gl/c4G4B3sNrfJZBSue6?g_st=ac спасибо"
-        r, z = self._run(text, self.ZONES_PHUKET, resolve_maps=lambda u: delivery.resolve_maps_link(
+        r, z = self._run(text, LIVE_ZONES, resolve_maps=lambda u: delivery.resolve_maps_link(
             u, _expand=lambda _u: self._RECON_PAGE))
-        self.assertEqual(r["status"], "zone")     # определилась «на Пхукете», не [уточнить]
-        self.assertEqual(r["zone"], "Сайюан")
-        self.assertEqual(r["price"], 350)
+        self.assertEqual(r["status"], "out_belt")  # цена доставки определилась, не [уточнить]
+        self.assertEqual(r["price"], 1490)
         self.assertIsNone(r["marker"])
-        self.assertEqual(z, 1)                    # зоны Bridge запрошены — координаты нашлись
+        self.assertEqual(z, 1)                     # зоны Bridge запрошены — координаты нашлись
 
 
 if __name__ == "__main__":
