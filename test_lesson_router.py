@@ -1255,5 +1255,265 @@ class TestLesson334Golden332AndInvariants(unittest.TestCase):
         self.assertNotIn("confidence", dec)                    # LLM-путь не активировался
 
 
+class TestRouteByType(unittest.TestCase):
+    """Родитель 112, шаг 3/8: маршрут урока по ВТОРОЙ оси type = behavior|code|unsure.
+      • behavior → немедленная запись в playbook + ack Филиппу «действует со следующего черновика»;
+                   конфликт с записанным правилом → показать оба, спросить кнопками какое оставить;
+      • code     → в дев-очередь ПК (delegate + golden-тест);
+      • unsure   → переспрос кнопками «правило / нужен код», ответ дороутит урок.
+    Все побочки инъектируем фейками (без Telegram/1160/playbook/claude). Golden-правило CLAUDE.md:
+    позитивы — ЖИВЫЕ формулировки + парафразы; спека-примеры дословно."""
+
+    def _task(self, remark, card="90210"):
+        return (f"[урок:правка от @filipp] родитель 112 — замечание менеджера в копилку обучения\n"
+                f"окно диалога: Иван (555) (client_id=555) · черновик #7\n"
+                f"карточка модер-группы: msg={card}\n"
+                f"Замечание: {remark}\n"
+                f"Исходный черновик: Аренда Nmax от 1200฿/сутки")
+
+    def _type(self, kind, conf="high"):
+        def classify_type(remark):
+            return {"type": kind, "confidence": conf, "reason": f"фейк-{kind}",
+                    "behavior_hits": 0, "code_hits": 0}
+        return classify_type
+
+    # --- текстовые билдеры ---------------------------------------------------------------------
+    def test_behavior_ack_format_exact(self):
+        # формат спеки 112/3 ДОСЛОВНО: «Понял так: <правило> — действует со следующего черновика»
+        ack = lr.build_behavior_ack('не пиши "данные получил"')
+        self.assertIn('Понял так: не пиши "данные получил"', ack)
+        self.assertIn("действует со следующего черновика", ack)
+
+    def test_conflict_card_shows_both_rules(self):
+        card = lr.build_behavior_conflict_card("не здоровайся дважды", "здоровайся дважды")
+        self.assertIn("НОВОЕ: не здоровайся дважды", card)
+        self.assertIn("СТАРОЕ: здоровайся дважды", card)
+        self.assertIn("какое оставить", card.lower())
+
+    def test_type_unsure_ask_offers_both_buttons(self):
+        ask = lr.build_type_unsure_ask("что-то с ценой")
+        self.assertIn("правило", ask.lower())
+        self.assertIn("код", ask.lower())
+
+    # --- ветка behavior ------------------------------------------------------------------------
+    def test_behavior_writes_playbook_and_acks_filipp(self):
+        seen, sent = {}, {}
+        dec = lr.route_lesson_by_type(
+            self._task('не пиши "данные получил", это по-роботски'),
+            classify_type=self._type(lr.BEHAVIOR),
+            find_conflict=lambda r: "",                       # конфликта нет
+            append_style=lambda r: (seen.__setitem__("rule", r), "added")[1],
+            reply_moderation=lambda cid, t, b=None: (sent.update(card=cid, text=t), True)[1])
+        self.assertEqual(lr.BEHAVIOR, dec["type"])
+        self.assertEqual("done", dec["status"])
+        self.assertFalse(dec["delegate"])
+        self.assertIn("данные получил", seen["rule"])          # правило ушло в playbook НЕМЕДЛЕННО
+        self.assertEqual("90210", sent["card"])                # ack реплаем на карточку урока
+        self.assertIn("действует со следующего черновика", sent["text"])
+
+    def test_behavior_duplicate_is_done_not_failed(self):
+        dec = lr.route_lesson_by_type(
+            self._task("звучит сухо, пиши теплее"),
+            classify_type=self._type(lr.BEHAVIOR), find_conflict=lambda r: "",
+            append_style=lambda r: "duplicate", reply_moderation=lambda cid, t, b=None: True)
+        self.assertEqual("done", dec["status"])
+        self.assertIn("уже есть", dec["result"])
+
+    def test_behavior_sink_error_is_failed(self):
+        dec = lr.route_lesson_by_type(
+            self._task("пиши короче и живее"),
+            classify_type=self._type(lr.BEHAVIOR), find_conflict=lambda r: "",
+            append_style=lambda r: (_ for _ in ()).throw(OSError("disk")),
+            reply_moderation=lambda cid, t, b=None: True)
+        self.assertEqual(lr.BEHAVIOR, dec["type"])
+        self.assertEqual("failed", dec["status"])
+        self.assertIn("короче", dec["result"])
+
+    def test_behavior_conflict_shows_both_and_asks_which_to_keep(self):
+        # новое правило противоречит записанному → НЕ затираем: показываем оба + кнопки, ждём выбора
+        asked = {}
+        dec = lr.route_lesson_by_type(
+            self._task("не здоровайся дважды в одном диалоге"),
+            classify_type=self._type(lr.BEHAVIOR),
+            find_conflict=lambda r: "здоровайся дважды в одном диалоге",
+            append_style=lambda r: self.fail("при конфликте вслепую НЕ пишем"),
+            reply_moderation=lambda cid, t, b=None: (asked.update(text=t, buttons=b), True)[1])
+        self.assertEqual("waiting", dec["status"])
+        self.assertEqual("behavior_conflict", dec["resolve"])
+        self.assertIn("pending_conflict", dec)
+        self.assertEqual([lr.BEHAVIOR_KEEP_NEW, lr.BEHAVIOR_KEEP_OLD], dec["buttons"])
+        self.assertEqual([lr.BEHAVIOR_KEEP_NEW, lr.BEHAVIOR_KEEP_OLD], asked["buttons"])  # кнопки в реплае
+        self.assertIn("НОВОЕ: не здоровайся дважды", asked["text"])                        # показали оба
+        self.assertIn("СТАРОЕ: здоровайся дважды", asked["text"])
+        p = dec["pending_conflict"]
+        self.assertEqual("не здоровайся дважды в одном диалоге", p["new_rule"])
+        self.assertEqual("здоровайся дважды в одном диалоге", p["old_rule"])
+
+    def test_behavior_conflict_undelivered_goes_to_owner_not_silent(self):
+        # переспрос-конфликт не дошёл → НЕ затираем и НЕ молчим: failed + карточка владельцу (фикс #102)
+        owner = {}
+        dec = lr.route_lesson_by_type(
+            self._task("не здоровайся дважды"),
+            classify_type=self._type(lr.BEHAVIOR),
+            find_conflict=lambda r: "здоровайся дважды",
+            reply_moderation=lambda cid, t, b=None: False,     # переспрос не доставлен
+            notify_owner=lambda c: (owner.update(card=c), ("инбокс 1160", True))[1])
+        self.assertEqual("failed", dec["status"])
+        self.assertNotIn("pending_conflict", dec)
+        self.assertTrue(dec["delivered"])
+        self.assertIn("card", owner)                           # ушла владельцу
+        self.assertIn("не затёр", dec["result"].lower())
+
+    # --- ветка code ----------------------------------------------------------------------------
+    def test_code_delegates_to_dev_queue_with_golden_test(self):
+        dec = lr.route_lesson_by_type(
+            self._task("цена берётся из столбца J, а не из K"),
+            classify_type=self._type(lr.CODE),
+            append_style=lambda r: self.fail("code в playbook НЕ пишем"),
+            reply_moderation=lambda cid, t, b=None: self.fail("code в модер-группу ack НЕ шлём"))
+        self.assertEqual(lr.CODE, dec["type"])
+        self.assertTrue(dec["delegate"])                       # в дев-очередь ПК, как ФАКТ
+        self.assertIn("столбца J", dec["delegate_text"])
+        self.assertIn("юнит-тест", dec["delegate_text"])       # golden-тест обязателен
+        self.assertIn("ДОСЛОВНОЙ фразой клиента", dec["delegate_text"])
+        self.assertIn("Bridge", dec["delegate_text"])          # деньги/Bridge запрещены
+
+    # --- ветка unsure --------------------------------------------------------------------------
+    def test_unsure_asks_with_buttons_and_waits(self):
+        asked = {}
+        dec = lr.route_lesson_by_type(
+            self._task("плохо, переделай"),
+            classify_type=self._type(lr.UNSURE, conf="low"),
+            reply_moderation=lambda cid, t, b=None: (asked.update(text=t, buttons=b), True)[1],
+            notify_owner=lambda c: self.fail("в момент переспроса владельца НЕ зовём"))
+        self.assertEqual(lr.UNSURE, dec["type"])
+        self.assertEqual("waiting", dec["status"])
+        self.assertEqual("type_choice", dec["resolve"])
+        self.assertIn("pending_type", dec)
+        self.assertEqual([lr.TYPE_CHOICE_RULE, lr.TYPE_CHOICE_CODE], dec["buttons"])
+        self.assertEqual([lr.TYPE_CHOICE_RULE, lr.TYPE_CHOICE_CODE], asked["buttons"])
+        self.assertEqual("90210", dec["pending_type"]["card_msg_id"])
+
+    def test_unsure_undelivered_goes_to_owner(self):
+        dec = lr.route_lesson_by_type(
+            self._task("что-то не то"),
+            classify_type=self._type(lr.UNSURE, conf="low"),
+            reply_moderation=lambda cid, t, b=None: False,
+            notify_owner=lambda c: ("инбокс 1160", True))
+        self.assertEqual("failed", dec["status"])
+        self.assertTrue(dec["delivered"])
+        self.assertIn("не висит молча", dec["result"])
+
+    # --- resume: выбор кнопки unsure → дороутинг ------------------------------------------------
+    def test_resume_choice_rule_routes_to_behavior(self):
+        seen, sent = {}, {}
+        pending = {"text": self._task('не пиши "данные получил"'), "remark": 'не пиши "данные получил"',
+                   "card_msg_id": "90210", "who": "@filipp", "window": "555", "draft": ""}
+        dec = lr.resume_type_unsure(pending, "правило", find_conflict=lambda r: "",
+                                    append_style=lambda r: (seen.__setitem__("rule", r), "added")[1],
+                                    reply_moderation=lambda cid, t, b=None: (sent.update(text=t), True)[1])
+        self.assertEqual(lr.BEHAVIOR, dec["type"])
+        self.assertEqual("chose_rule", dec["resumed"])
+        self.assertEqual("done", dec["status"])
+        self.assertIn("данные получил", seen["rule"])          # дороутили в playbook
+        self.assertIn("действует со следующего черновика", sent["text"])
+
+    def test_resume_choice_code_routes_to_dev_queue(self):
+        pending = {"text": self._task("цена из столбца J"), "remark": "цена из столбца J",
+                   "card_msg_id": "90210", "draft": ""}
+        dec = lr.resume_type_unsure(pending, "нужен код")
+        self.assertEqual(lr.CODE, dec["type"])
+        self.assertEqual("chose_code", dec["resumed"])
+        self.assertTrue(dec["delegate"])
+        self.assertIn("столбца J", dec["delegate_text"])
+
+    def test_resume_choice_unrecognized_keeps_waiting(self):
+        pending = {"text": self._task("не то"), "remark": "не то", "card_msg_id": "90210"}
+        dec = lr.resume_type_unsure(pending, "ну не знаю",
+                                    reply_moderation=lambda cid, t, b=None: self.fail("не дороутим вслепую"))
+        self.assertEqual("waiting", dec["status"])
+        self.assertEqual("choice_unrecognized", dec["resumed"])
+        self.assertEqual([lr.TYPE_CHOICE_RULE, lr.TYPE_CHOICE_CODE], dec["buttons"])
+
+    def test_resume_choice_synonyms_accepted(self):
+        # живые синонимы кнопок: «поведение/behavior» → rule; «code/дев» → code
+        pend_rule = {"text": self._task("тон сух"), "remark": "тон сух", "card_msg_id": "1"}
+        d1 = lr.resume_type_unsure(pend_rule, "поведение", find_conflict=lambda r: "",
+                                   append_style=lambda r: "added", reply_moderation=lambda cid, t, b=None: True)
+        self.assertEqual("chose_rule", d1["resumed"])
+        d2 = lr.resume_type_unsure({"text": self._task("цифра"), "remark": "цифра", "card_msg_id": "1"},
+                                   "в дев-очередь")
+        self.assertEqual("chose_code", d2["resumed"])
+
+    # --- resume: разрешение конфликта behavior -------------------------------------------------
+    def test_resume_conflict_keep_new_replaces_and_acks(self):
+        seen, sent = {}, {}
+        pending = {"new_rule": "не здоровайся дважды", "old_rule": "здоровайся дважды",
+                   "remark": "не здоровайся дважды", "card_msg_id": "90210"}
+        dec = lr.resume_behavior_conflict(
+            pending, "оставить новое",
+            replace_style=lambda old, new: (seen.update(old=old, new=new), "replaced")[1],
+            reply_moderation=lambda cid, t, b=None: (sent.update(text=t), True)[1])
+        self.assertEqual("done", dec["status"])
+        self.assertEqual("kept_new", dec["resolved"])
+        self.assertEqual("здоровайся дважды", seen["old"])     # старое передано на удаление
+        self.assertEqual("не здоровайся дважды", seen["new"])  # новое записано
+        self.assertIn("действует со следующего черновика", sent["text"])
+
+    def test_resume_conflict_keep_old_writes_nothing(self):
+        sent = {}
+        pending = {"new_rule": "не здоровайся дважды", "old_rule": "здоровайся дважды", "card_msg_id": "90210"}
+        dec = lr.resume_behavior_conflict(
+            pending, "оставить старое",
+            replace_style=lambda old, new: self.fail("оставили старое → ничего не заменяем"),
+            reply_moderation=lambda cid, t, b=None: (sent.update(text=t), True)[1])
+        self.assertEqual("done", dec["status"])
+        self.assertEqual("kept_old", dec["resolved"])
+        self.assertIn("здоровайся дважды", sent["text"])       # ack про прежнее правило
+        self.assertIn("оставили СТАРОЕ", dec["result"])
+
+    def test_resume_conflict_replace_error_is_failed(self):
+        dec = lr.resume_behavior_conflict(
+            {"new_rule": "не X", "old_rule": "X", "card_msg_id": "1"}, "новое",
+            replace_style=lambda old, new: "error", reply_moderation=lambda cid, t, b=None: True)
+        self.assertEqual("failed", dec["status"])
+        self.assertEqual("kept_new", dec["resolved"])
+
+    def test_resume_conflict_choice_unrecognized_waits(self):
+        dec = lr.resume_behavior_conflict(
+            {"new_rule": "не X", "old_rule": "X", "card_msg_id": "1"}, "хм",
+            replace_style=lambda old, new: self.fail("не решаем вслепую"),
+            reply_moderation=lambda cid, t, b=None: self.fail("не отвечаем на невнятицу"))
+        self.assertEqual("waiting", dec["status"])
+        self.assertEqual("choice_unrecognized", dec["resolved"])
+
+    # --- РЕАЛЬНЫЙ классификатор второй оси (не только фейк) — анти-разрыв «тест ≠ реальность» ----
+    def test_real_classify_type_behavior_end_to_end(self):
+        # БЕЗ инъекции classify_type — живой classify_lesson_type: спека-пример behavior → playbook+ack
+        seen = {}
+        dec = lr.route_lesson_by_type(
+            self._task('не пиши "данные получил"'),
+            find_conflict=lambda r: "",
+            append_style=lambda r: (seen.__setitem__("rule", r), "added")[1],
+            reply_moderation=lambda cid, t, b=None: True)
+        self.assertEqual(lr.BEHAVIOR, dec["type"])
+        self.assertEqual("done", dec["status"])
+        self.assertIn("данные получил", seen["rule"])
+
+    def test_real_classify_type_code_end_to_end(self):
+        # живой classify_lesson_type: спека-пример code → дев-очередь ПК
+        dec = lr.route_lesson_by_type(self._task("цена из столбца J"))
+        self.assertEqual(lr.CODE, dec["type"])
+        self.assertTrue(dec["delegate"])
+
+    def test_real_classify_type_unsure_asks_buttons(self):
+        # живой classify_lesson_type: размытое → unsure → переспрос кнопками
+        dec = lr.route_lesson_by_type(
+            self._task("плохо, переделай"),
+            reply_moderation=lambda cid, t, b=None: True)
+        self.assertEqual(lr.UNSURE, dec["type"])
+        self.assertEqual("waiting", dec["status"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

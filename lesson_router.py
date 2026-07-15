@@ -504,12 +504,13 @@ def build_lesson_understanding(reading, plan):
     return f"👍 Понял так: {r}. Делаю: {p}"
 
 
-def _default_reply_moderation(_card_msg_id, _text):
+def _default_reply_moderation(_card_msg_id, _text, _buttons=None):
     """Дефолт-заглушка реплая в модер-группу: в standalone канала нет → False (НЕ доставлено). Боевой
     sink инъектирует ДЕМОН (_reply_moderation_lesson: реплай через MODERBOT_TOKEN на карточку черновика,
     ретрай, проверка message_id). КОНТРАКТ: truthy = реплай ДОСТАВЛЕН (боевое = message_id); falsy = НЕ
     доставлен → low-урок падает failed с диагнозом, а не висит молча (инцидент #102). Для high-ветки
-    understanding и так лежит в результате задачи — сбой реплая урок не теряет."""
+    understanding и так лежит в результате задачи — сбой реплая урок не теряет. _buttons (опц., родитель
+    112 шаг 3) — список подписей inline-кнопок переспроса; боевой sink рендерит их клавиатурой."""
     return False
 
 
@@ -917,3 +918,322 @@ def handle_lesson_task(text, append_style=None, append_checklist=None, notify_ow
     route, reason = classify_lesson_remark(remark)
     _ack = _ack_material(route, remark, card)
     return _dispatch_route(route, text, parsed, remark, reason, a_style, a_check, notify, _ack)
+
+
+# ============ ВТОРАЯ ОСЬ В ДЕЛЕ: МАРШРУТ УРОКА ПО type (родитель 112, шаг 3/8) =============
+# Шаги 1–2 дали КЛАССИФИКАТОР второй оси (classify_lesson_type → behavior|code|unsure) и playbook с
+# FIFO-лимитом. Здесь — то, что дирижёр ДЕЛАЕТ, разведя урок по типу его ПРИРОДЫ (а не адресата):
+#   • behavior → НЕМЕДЛЕННО пишем правило в playbook и тут же отвечаем Филиппу реплаем «Понял так:
+#                <правило> — действует со следующего черновика». Если новое правило КОНФЛИКТУЕТ с уже
+#                записанным (та же тема — обратный смысл) — НЕ затираем вслепую: показываем ОБА и
+#                спрашиваем кнопками, какое оставить (resume_behavior_conflict доведёт по выбору);
+#   • code     → как в первой оси ФАКТ: в дев-очередь ПК (delegate=True, правка кода + ОБЯЗАТЕЛЬНЫЙ
+#                golden-тест; Bridge/деньги не трогаем — это работа думателя-планировщика);
+#   • unsure   → тип неясен → НЕ угадываем: переспрос учителю кнопками «правило / нужен код»; ответ
+#                ДОРОУТИТ урок (resume_type_unsure) в behavior- или code-ветку.
+# Все побочки инъектируемы (юнит без Telegram/1160/playbook/claude); текстовые билдеры — чистые
+# функции. Ветка «переспрос не дошёл» повторяет фикс #102: урок не висит молча — уходит владельцу.
+
+# Подписи inline-кнопок переспроса типа (unsure) и разрешения конфликта (behavior).
+TYPE_CHOICE_RULE = "правило"
+TYPE_CHOICE_CODE = "нужен код"
+_TYPE_CHOICE_BUTTONS = (TYPE_CHOICE_RULE, TYPE_CHOICE_CODE)
+BEHAVIOR_KEEP_NEW = "оставить новое"
+BEHAVIOR_KEEP_OLD = "оставить старое"
+_BEHAVIOR_CONFLICT_BUTTONS = (BEHAVIOR_KEEP_NEW, BEHAVIOR_KEEP_OLD)
+
+
+def build_behavior_ack(rule):
+    """Ack учителю на behavior-урок: правило записано в playbook и вступает в силу со следующего
+    черновика. Формат спеки 112/3 ДОСЛОВНО: «Понял так: <правило> — действует со следующего
+    черновика». Пустое правило → нейтральная заглушка (формат не роняем). Чистая функция."""
+    r = _one_line(rule) or "(см. окно диалога)"
+    return f"👍 Понял так: {r} — действует со следующего черновика."
+
+
+def build_behavior_conflict_card(new_rule, old_rule):
+    """Карточка КОНФЛИКТА поведенческих правил: новое правило противоречит уже записанному (та же
+    тема, обратный смысл). Показываем ОБА и спрашиваем, какое оставить — НЕ затираем вслепую.
+    Кнопки «оставить новое» / «оставить старое» несёт dec отдельно. Чистая функция."""
+    n = _one_line(new_rule) or "(пусто)"
+    o = _one_line(old_rule) or "(пусто)"
+    return ("⚠️ Новое правило конфликтует с уже записанным — какое оставить?\n"
+            f"НОВОЕ: {n}\n"
+            f"СТАРОЕ: {o}\n"
+            "Нажми «оставить новое» (заменю) или «оставить старое» (новое не запишу).")
+
+
+def build_type_unsure_ask(remark):
+    """Переспрос учителю для unsure-типа: не поняли, это ПРАВИЛО поведения (в playbook) или нужен
+    КОД (дев-очередь ПК)? Кнопки «правило» / «нужен код» несёт dec. Не угадываем тип. Чистая функция."""
+    r = _one_line(remark) or "(см. окно диалога)"
+    return (f"🤔 Не понял тип урока: «{r}» — это правило поведения или нужен код?\n"
+            "Нажми «правило» (запишу в книгу правил) или «нужен код» (отправлю в дев-очередь ПК).")
+
+
+def _default_find_conflict(rule):
+    """Боевой поиск конфликта behavior-правила = suggest.find_playbook_conflict (читает боевой
+    playbook). Ленивый импорт suggest. Сбой → '' (нет клэша — не блокируем запись)."""
+    try:
+        import suggest
+        return suggest.find_playbook_conflict(rule)
+    except Exception:                                # noqa: BLE001 — сбой пробы не роняет дирижёра
+        return ""
+
+
+def _default_replace_style(old_rule, new_rule):
+    """Боевая замена конфликтующего правила = suggest.replace_playbook_rule (убрать старое, дописать
+    новое). Ленивый импорт suggest. → 'replaced'|'added'|'error'."""
+    import suggest
+    return suggest.replace_playbook_rule(old_rule, new_rule)
+
+
+def _normalize_type_choice(choice):
+    """Ответ учителя на переспрос типа → TYPE_CHOICE_RULE | TYPE_CHOICE_CODE | '' (не распознан).
+    Принимаем и подпись кнопки, и живые синонимы (behavior/поведение · code/дев/разработка)."""
+    c = _one_line(choice).lower().strip(_AFFIRM_STRIP)
+    if not c:
+        return ""
+    if "правил" in c or "поведен" in c or "behavior" in c or c == "rule":
+        return TYPE_CHOICE_RULE
+    if "код" in c or "code" in c or "дев" in c or "разработ" in c:
+        return TYPE_CHOICE_CODE
+    return ""
+
+
+def _normalize_conflict_choice(choice):
+    """Ответ учителя на конфликт → BEHAVIOR_KEEP_NEW | BEHAVIOR_KEEP_OLD | '' (не распознан)."""
+    c = _one_line(choice).lower()
+    if not c:
+        return ""
+    if "нов" in c or "new" in c:
+        return BEHAVIOR_KEEP_NEW
+    if "стар" in c or "прежн" in c or "old" in c:
+        return BEHAVIOR_KEEP_OLD
+    return ""
+
+
+def _apply_code_type(text, parsed, remark, card, reason):
+    """CODE-урок (вторая ось) → в дев-очередь ПК как ФАКТ первой оси: delegate=True, augmented-текст с
+    ТРЕБОВАНИЕМ golden-теста дословной фразой клиента и запретом Bridge/денег. Правку делает думатель-
+    планировщик — сами код не трогаем. Материал подтверждения собран (ack после коммита планировщика)."""
+    note = ("\n\n[дирижёр: это CODE-урок (вторая ось type)] Разложи в шаги и поправь причину в коде/"
+            "критфактах/резолверах/гардах. ОБЯЗАТЕЛЬНО добавь юнит-тест с ДОСЛОВНОЙ фразой клиента из "
+            "окна (golden-правило CLAUDE.md). Bridge/таблицы/деньги НЕ трогай.")
+    _ack = _ack_material(FACT, remark, card)         # code лечится как факт: код + golden-тест
+    return {"type": CODE, "route": FACT, "delegate": True, "reason": reason, **_ack,
+            "delegate_text": str(text or "") + note, "status": "done",
+            "result": "🛠 CODE-урок (вторая ось) → в дев-очередь ПК (правка + golden-тест)"}
+
+
+def _apply_behavior_type(text, parsed, remark, card, a_style, replace, conflict, reply_mod, notify, reason):
+    """BEHAVIOR-урок (вторая ось): НЕМЕДЛЕННАЯ запись правила в playbook + ack Филиппу. Перед записью —
+    проба конфликта: новое правило противоречит уже записанному (та же тема, обратный смысл)? Тогда НЕ
+    затираем — реплаем показываем ОБА и спрашиваем кнопками, какое оставить (status=waiting, pending_
+    conflict; resume_behavior_conflict доведёт). Нет конфликта → append + ack «действует со следующего
+    черновика». FAIL-SAFE: sink упал → failed; переспрос-конфликт не дошёл → урок владельцу (не молча)."""
+    # (1) конфликт с уже записанным поведенческим правилом → показать оба, спросить какое оставить.
+    try:
+        clash = conflict(remark)
+    except Exception as e:                           # noqa: BLE001 — проба не должна ронять дирижёра
+        clash = ""; reason = f"{reason}; conflict-probe: {e}"
+    if clash:
+        cardtext = build_behavior_conflict_card(remark, clash)
+        try:
+            delivered = bool(reply_mod(card, cardtext, list(_BEHAVIOR_CONFLICT_BUTTONS)))
+        except Exception as e:                       # noqa: BLE001
+            delivered = False; reason = f"{reason}; mod-reply: {e}"
+        if not delivered:                            # спросить не смогли → НЕ затираем, отдаём владельцу
+            owner_parsed = dict(parsed); owner_parsed["remark"] = remark
+            owner_card = build_owner_clarification_card(
+                owner_parsed, f"новое правило конфликтует со старым «{_one_line(clash)}», а спросить не смог — реши вручную")
+            channel = ""
+            try:
+                deliv_owner, channel = _normalize_delivery(notify(owner_card))
+            except Exception as e:                   # noqa: BLE001
+                deliv_owner, channel = False, ""; reason = f"{reason}; notify: {e}"
+            via = (f" — карточка владельцу в 1160{(' через ' + channel) if channel else ''}"
+                   if deliv_owner else " — карточка владельцу НЕ доставлена (замечание в логе)")
+            return {"type": BEHAVIOR, "route": STYLE, "delegate": False, "status": "failed",
+                    "reason": f"{reason}; конфликт-переспрос не доставлен", "card": owner_card,
+                    "old_rule": clash, "new_rule": remark, "delivered": deliv_owner, "channel": channel,
+                    "result": f"⚠️ Конфликт поведенческих правил, но переспрос не доставлен{via} — не затёр вслепую"}
+        pending = {"text": str(text or ""), "remark": remark, "new_rule": remark, "old_rule": clash,
+                   "card_msg_id": card, "who": parsed.get("who", ""), "window": parsed.get("window", "")}
+        return {"type": BEHAVIOR, "route": STYLE, "delegate": False, "status": "waiting",
+                "resolve": "behavior_conflict", "reason": reason, "pending_conflict": pending,
+                "buttons": list(_BEHAVIOR_CONFLICT_BUTTONS), "card_msg_id": card, "conflict_card": cardtext,
+                "old_rule": clash, "new_rule": remark,
+                "result": f"⚠️ Новое правило конфликтует с записанным — спросил кнопками, какое оставить: «{_one_line(remark)}»"}
+
+    # (2) нет конфликта → НЕМЕДЛЕННАЯ запись правила в playbook + ack Филиппу реплаем в модер-группу.
+    try:
+        res = a_style(remark)
+    except Exception as e:                           # noqa: BLE001
+        res = "error"; reason = f"{reason}; sink: {e}"
+    _ack = _ack_material(STYLE, remark, card)
+    if res in ("added", "duplicate"):
+        ack = build_behavior_ack(remark)
+        try:
+            reply_mod(card, ack)
+        except Exception as e:                       # noqa: BLE001 — ack не должен ронять запись
+            reason = f"{reason}; ack-reply: {e}"
+        note = "правило записано в playbook" if res == "added" else "такое правило в playbook уже есть"
+        return {"type": BEHAVIOR, "route": STYLE, "delegate": False, "status": "done", "reason": reason,
+                **_ack, "ack_understanding": ack,
+                "result": f"📝 BEHAVIOR-урок: {note}, ack Филиппу «действует со следующего черновика» — «{_one_line(remark)}»"}
+    return {"type": BEHAVIOR, "route": STYLE, "delegate": False, "status": "failed", "reason": reason,
+            **_ack, "commit_paths": [],
+            "result": f"⚠️ BEHAVIOR-урок не записан в playbook (sink={res}) — повтори: «{_one_line(remark)}»"}
+
+
+def _ask_type_unsure(text, parsed, remark, card, reply_mod, notify, reason):
+    """unsure-тип: НЕ угадываем — переспрос учителю реплаем в модер-группу кнопками «правило / нужен
+    код», сохраняем pending_type (resume_type_unsure дороутит по выбору). Переспрос не дошёл (фикс
+    #102) → урок не висит молча: failed + карточка-уточнение владельцу в 1160."""
+    ask = build_type_unsure_ask(remark)
+    try:
+        delivered = bool(reply_mod(card, ask, list(_TYPE_CHOICE_BUTTONS)))
+    except Exception as e:                           # noqa: BLE001
+        delivered = False; reason = f"{reason}; mod-reply: {e}"
+    if not delivered:                                # переспрос не дошёл → владельцу, не молча
+        owner_parsed = dict(parsed); owner_parsed["remark"] = remark
+        owner_card = build_owner_clarification_card(
+            owner_parsed, "переспрос типа (правило/код) не дошёл до учителя — реши вручную")
+        channel = ""
+        try:
+            deliv_owner, channel = _normalize_delivery(notify(owner_card))
+        except Exception as e:                       # noqa: BLE001
+            deliv_owner, channel = False, ""; reason = f"{reason}; notify: {e}"
+        via = (f" — карточка владельцу в 1160{(' через ' + channel) if channel else ''}"
+               if deliv_owner else " — карточка владельцу НЕ доставлена (замечание в логе)")
+        return {"type": UNSURE, "route": UNCLEAR, "delegate": False, "status": "failed",
+                "reason": f"{reason}; переспрос типа не доставлен", "card": owner_card,
+                "delivered": deliv_owner, "channel": channel,
+                "result": f"⚠️ Переспрос типа (правило/код) не доставлен{via} — урок не висит молча"}
+    pending = {"text": str(text or ""), "remark": remark, "card_msg_id": card,
+               "who": parsed.get("who", ""), "window": parsed.get("window", ""),
+               "draft": parsed.get("draft", "")}
+    return {"type": UNSURE, "route": UNCLEAR, "delegate": False, "status": "waiting",
+            "resolve": "type_choice", "reason": reason, "pending_type": pending,
+            "buttons": list(_TYPE_CHOICE_BUTTONS), "card_msg_id": card, "ask": ask,
+            "result": "🤔 Тип урока неясен → спросил кнопками «правило / нужен код», жду выбора"}
+
+
+def route_lesson_by_type(text, append_style=None, replace_style=None, find_conflict=None,
+                         notify_owner=None, reply_moderation=None, classify_type=None):
+    """Развести урок по ВТОРОЙ оси type = behavior | code | unsure (родитель 112, шаг 3/8). → dec:
+      type       — behavior|code|unsure;
+      behavior   → НЕМЕДЛЕННАЯ запись правила в playbook + ack Филиппу «действует со следующего
+                   черновика»; конфликт с записанным правилом → status=waiting + pending_conflict
+                   (спросили кнопками «оставить новое/старое», resume_behavior_conflict доведёт);
+      code       → delegate=True, delegate_text в дев-очередь ПК (правка кода + golden-тест);
+      unsure     → status=waiting + pending_type (спросили кнопками «правило/нужен код»,
+                   resume_type_unsure дороутит по ответу).
+    Классификатор второй оси и все побочки инъектируемы (юнит без Telegram/1160/playbook/claude);
+    боевые дефолты — playbook / замена правила / поиск конфликта / 1160 / реплай модер-группы.
+    FAIL-SAFE: сбой любого sink → failed-карта; переспрос не дошёл → урок владельцу (не молча)."""
+    parsed = parse_lesson_task(text)
+    remark = parsed["remark"]
+    a_style = append_style or _default_append_style
+    replace = replace_style or _default_replace_style
+    conflict = find_conflict or _default_find_conflict
+    notify = notify_owner or _default_notify_owner
+    reply_mod = reply_moderation or _default_reply_moderation
+    ctype = classify_type or classify_lesson_type
+    card = parsed.get("card_msg_id") or ""
+
+    t = ctype(remark) or {}
+    kind = t.get("type")
+    reason = f"вторая ось type={kind} ({t.get('reason', '')})".strip()
+    if kind == BEHAVIOR:
+        return _apply_behavior_type(text, parsed, remark, card, a_style, replace, conflict,
+                                    reply_mod, notify, reason)
+    if kind == CODE:
+        return _apply_code_type(text, parsed, remark, card, reason)
+    # unsure (или неведомый тип) → переспрос кнопками «правило / нужен код», ответ дороутит урок.
+    return _ask_type_unsure(text, parsed, remark, card, reply_mod, notify, reason)
+
+
+def resume_type_unsure(pending, choice, append_style=None, replace_style=None, find_conflict=None,
+                       notify_owner=None, reply_moderation=None):
+    """Учитель нажал кнопку в ответ на unsure-переспрос (шаг 3): «правило» → маршрут behavior (запись
+    в playbook + ack/конфликт); «нужен код» → маршрут code (дев-очередь ПК). Непонятный ответ (не
+    кнопка) → остаёмся ждать (не угадываем). Все sink'и инъектируемы. FAIL-SAFE как в route_lesson_by_type."""
+    a_style = append_style or _default_append_style
+    replace = replace_style or _default_replace_style
+    conflict = find_conflict or _default_find_conflict
+    notify = notify_owner or _default_notify_owner
+    reply_mod = reply_moderation or _default_reply_moderation
+    pending = pending or {}
+    text = str(pending.get("text") or "")
+    parsed = parse_lesson_task(text) if text else {}
+    remark = pending.get("remark") or parsed.get("remark") or ""
+    card = pending.get("card_msg_id") or parsed.get("card_msg_id") or ""
+    ch = _normalize_type_choice(choice)
+
+    if ch == TYPE_CHOICE_RULE:                       # → behavior
+        dec = _apply_behavior_type(text, parsed, remark, card, a_style, replace, conflict,
+                                   reply_mod, notify, "тип уточнён учителем → правило (behavior)")
+        dec["resumed"] = "chose_rule"
+        return dec
+    if ch == TYPE_CHOICE_CODE:                       # → code
+        dec = _apply_code_type(text, parsed, remark, card, "тип уточнён учителем → код (code)")
+        dec["resumed"] = "chose_code"
+        return dec
+    # непонятный ответ → не дороутим вслепую, ждём валидного выбора кнопки
+    return {"type": UNSURE, "route": UNCLEAR, "delegate": False, "status": "waiting",
+            "resumed": "choice_unrecognized", "pending_type": pending,
+            "buttons": list(_TYPE_CHOICE_BUTTONS), "card_msg_id": card,
+            "reason": f"ответ «{_one_line(choice)}» не распознан как кнопка — жду «правило»/«нужен код»",
+            "result": "🤔 Не понял выбор — нажми «правило» или «нужен код»"}
+
+
+def resume_behavior_conflict(pending, choice, replace_style=None, reply_moderation=None):
+    """Учитель выбрал, какое правило оставить при конфликте (шаг 3): «оставить новое» → заменить
+    (убрать старое, записать новое) + ack «действует со следующего черновика»; «оставить старое» →
+    ничего не пишем, ack «оставляю прежнее». Непонятный выбор → ждём. sink'и инъектируемы.
+    FAIL-SAFE: замена упала → failed (правило не потеряно, повтор)."""
+    replace = replace_style or _default_replace_style
+    reply_mod = reply_moderation or _default_reply_moderation
+    pending = pending or {}
+    new_rule = pending.get("new_rule") or pending.get("remark") or ""
+    old_rule = pending.get("old_rule") or ""
+    card = pending.get("card_msg_id") or ""
+    ch = _normalize_conflict_choice(choice)
+
+    if ch == BEHAVIOR_KEEP_NEW:                       # заменить старое новым
+        try:
+            res = replace(old_rule, new_rule)
+        except Exception as e:                       # noqa: BLE001
+            res = "error"
+        _ack = _ack_material(STYLE, new_rule, card)
+        if res in ("replaced", "added"):
+            ack = build_behavior_ack(new_rule)
+            try:
+                reply_mod(card, ack)
+            except Exception:                        # noqa: BLE001
+                pass
+            return {"type": BEHAVIOR, "route": STYLE, "delegate": False, "status": "done",
+                    "resolved": "kept_new", **_ack, "ack_understanding": ack,
+                    "result": f"📝 Конфликт разрешён: оставили НОВОЕ правило (заменил старое) — «{_one_line(new_rule)}»"}
+        return {"type": BEHAVIOR, "route": STYLE, "delegate": False, "status": "failed",
+                "resolved": "kept_new", **_ack, "commit_paths": [],
+                "result": f"⚠️ Не смог заменить правило (sink={res}) — повтори: «{_one_line(new_rule)}»"}
+
+    if ch == BEHAVIOR_KEEP_OLD:                       # оставить прежнее, новое не записываем
+        ack = f"👍 Понял — оставляю прежнее правило: «{_one_line(old_rule)}». Новое не записываю."
+        try:
+            reply_mod(card, ack)
+        except Exception:                            # noqa: BLE001
+            pass
+        return {"type": BEHAVIOR, "route": STYLE, "delegate": False, "status": "done",
+                "resolved": "kept_old", "ack_understanding": ack, "card_msg_id": card,
+                "result": f"📝 Конфликт разрешён: оставили СТАРОЕ правило — «{_one_line(old_rule)}» (новое не записано)"}
+
+    # непонятный выбор → ждём валидную кнопку (не угадываем)
+    return {"type": BEHAVIOR, "route": STYLE, "delegate": False, "status": "waiting",
+            "resolved": "choice_unrecognized", "pending_conflict": pending,
+            "buttons": list(_BEHAVIOR_CONFLICT_BUTTONS), "card_msg_id": card,
+            "reason": f"ответ «{_one_line(choice)}» не распознан — жду «оставить новое»/«оставить старое»",
+            "result": "🤔 Не понял выбор — нажми «оставить новое» или «оставить старое»"}

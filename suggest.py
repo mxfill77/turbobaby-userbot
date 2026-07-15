@@ -664,6 +664,100 @@ def append_playbook_rule(rule, now=None):
         return "error"
 
 
+# --- конфликт/замена выученного правила (родитель 112, шаг 3/8) --------------
+# behavior-урок пишется в playbook НЕМЕДЛЕННО, но новое правило может ПРОТИВОРЕЧИТЬ уже записанному
+# (та же тема — противоположный смысл: «здоровайся дважды» ↔ «НЕ здоровайся дважды»). Такой клэш
+# дедуп _rules_similar НЕ ловит (он про ПОХОЖИЕ той же полярности) — а тут смысл ОБРАТНЫЙ. Ловим по
+# ПОЛЯРНОСТИ: одинаковая тема (содержательные слова без отрицаний) + РАЗНОЕ наличие отрицания. Это
+# детерминированный сигнал (анти-антонимы вроде «короче»↔«длиннее» намеренно НЕ трогаем — там нет
+# чистого маркера, гадать не будем; дирижёр покажет оба и спросит только на явном флипе отрицания).
+_NEGATION_TOKENS = frozenset((
+    "не", "нельзя", "нет", "без", "никогда", "ни", "запрещено",
+    "don't", "dont", "never", "no", "not", "avoid", "without", "stop",
+))
+
+
+def _rule_polarity(s):
+    """Полярность правила: True, если несёт отрицание (не/never/don't…)."""
+    return any(t in _NEGATION_TOKENS for t in _norm_rule(s).split())
+
+
+def _rule_topic(s):
+    """Содержательные слова правила БЕЗ отрицаний — «о чём» оно (для сравнения тем при поиске клэша)."""
+    return {t for t in _norm_rule(s).split() if t not in _NEGATION_TOKENS}
+
+
+def find_playbook_conflict(rule, text=None):
+    """Найти уже записанное выученное правило, КОНФЛИКТУЮЩЕЕ с новым: та же тема (высокое
+    пересечение содержательных слов ИЛИ вложенность), но ПРОТИВОПОЛОЖНАЯ полярность (одно с
+    отрицанием, другое без). → текст конфликтующего правила ЛИБО '' (клэша нет). Это НЕ дедуп:
+    дедуп ловит похожие ОДНОЙ полярности, здесь — похожие ПРОТИВОПОЛОЖНОЙ. text=None → боевой
+    playbook (load_playbook); в тестах передаётся явно. FAIL-SAFE: пусто/битьё → ''."""
+    rule = " ".join(str(rule or "").split()).strip()
+    if not rule:
+        return ""
+    topic_new = _rule_topic(rule)
+    if not topic_new:
+        return ""
+    pol_new = _rule_polarity(rule)
+    text = load_playbook() if text is None else text
+    for e in _playbook_learned_rules(text):
+        topic_old = _rule_topic(e)
+        if not topic_old:
+            continue
+        inter, union = topic_new & topic_old, topic_new | topic_old
+        same_topic = (topic_new <= topic_old or topic_old <= topic_new
+                      or (len(inter) / len(union) if union else 0) >= 0.6)
+        if same_topic and _rule_polarity(e) != pol_new:
+            return e
+    return ""
+
+
+def replace_playbook_rule(old_rule, new_rule, now=None):
+    """Заменить конфликтующее выученное правило: удалить bullet(ы), похожие на old_rule (по _rules_
+    similar, ЛЮБОЙ полярности) из секции «Выученные правила», затем дописать new_rule штатным append
+    (с датой/дедупом/FIFO). Разрешение конфликта «оставить новое». → 'replaced' (старое найдено и
+    убрано) | 'added' (старого не нашли — просто дописали) | 'error'. FAIL-SAFE: файл недоступен →
+    'error'. Удаление ДО append важно: без него new_rule (обратная полярность old) осел бы как
+    'duplicate' (Jaccard с отрицанием ≥0.6) и не записался бы вовсе."""
+    new_rule = " ".join(str(new_rule or "").split()).strip()
+    if not new_rule:
+        return "error"
+    try:
+        with open(PLAYBOOK_FILE, encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        return "error"
+    removed = False
+    old = str(old_rule or "").strip()
+    if old:
+        lines = text.splitlines()
+        start = next((i for i, ln in enumerate(lines)
+                      if ln.strip().lower().startswith(_LEARNED_HEADER.lower())), None)
+        if start is not None:
+            end = next((j for j in range(start + 1, len(lines))
+                        if lines[j].strip().startswith("## ")), len(lines))
+            keep = []
+            for j, ln in enumerate(lines):
+                if start < j < end and ln.strip().startswith("-"):
+                    body = re.sub(r"^\(\d{4}-\d{2}-\d{2}\)\s*", "", ln.strip().lstrip("-").strip())
+                    if _rules_similar(old, body):
+                        removed = True
+                        continue                     # выкидываем старое конфликтующее правило
+                keep.append(ln)
+            if removed:
+                text = "\n".join(keep) + ("\n" if text.endswith("\n") else "")
+                try:
+                    with open(PLAYBOOK_FILE, "w", encoding="utf-8") as f:
+                        f.write(text)
+                except Exception:
+                    return "error"
+    res = append_playbook_rule(new_rule, now=now)
+    if res == "error":
+        return "error"
+    return "replaced" if removed else "added"
+
+
 # ------------------------------- рантайм-стоп --------------------------------
 
 _disabled = False  # флип при флуде — авто-стоп до перезапуска/сброса

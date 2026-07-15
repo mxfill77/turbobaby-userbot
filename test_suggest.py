@@ -1815,6 +1815,82 @@ class TestPlaybookAppend(unittest.TestCase):
         self.assertIn("район доставки перед расчётом", cap["s"])
 
 
+class TestPlaybookConflict(unittest.TestCase):
+    """Родитель 112, шаг 3/8: конфликт/замена выученного правила. Конфликт = та же ТЕМА, ОБРАТНАЯ
+    полярность (одно с «не», другое без) — то, что дедуп НЕ ловит. Замена «оставить новое» убирает
+    старое и дописывает новое. Всё во ВРЕМЕННЫЙ playbook (боевой не трогаем)."""
+
+    SEED = ("# Playbook\n\n## Стиль общения\n- коротко\n\n## Выученные правила\n"
+            "- (2026-07-01) Здоровайся дважды в одном диалоге для теплоты\n"
+            "- (2026-07-02) Всегда предлагай шлем в подарок на неделю аренды\n")
+
+    def setUp(self):
+        self._pf = suggest.PLAYBOOK_FILE
+        self._tmp = tempfile.TemporaryDirectory()
+        self._file = os.path.join(self._tmp.name, "playbook.md")
+        with open(self._file, "w", encoding="utf-8") as f:
+            f.write(self.SEED)
+        suggest.PLAYBOOK_FILE = self._file
+
+    def tearDown(self):
+        suggest.PLAYBOOK_FILE = self._pf
+        self._tmp.cleanup()
+
+    def _read(self):
+        with open(self._file, encoding="utf-8") as f:
+            return f.read()
+
+    def test_conflict_detected_on_polarity_flip(self):
+        # «не здоровайся дважды» ↔ записанное «здоровайся дважды» — та же тема, обратный смысл → клэш
+        clash = suggest.find_playbook_conflict("не здоровайся дважды в одном диалоге")
+        self.assertIn("Здоровайся дважды", clash)
+
+    def test_no_conflict_for_same_polarity_or_other_topic(self):
+        # та же полярность (не конфликт, это дедуп-территория) и другая тема → клэша нет
+        self.assertEqual("", suggest.find_playbook_conflict("здоровайся дважды в одном диалоге"))
+        self.assertEqual("", suggest.find_playbook_conflict("не предлагай скидку без менеджера"))
+
+    def test_conflict_empty_rule_is_safe(self):
+        self.assertEqual("", suggest.find_playbook_conflict("   "))
+
+    def test_conflict_reads_only_learned_section_not_style_guide(self):
+        # клэш ищем среди ВЫУЧЕННЫХ правил, а не в статичном «Стиль общения» (там «коротко» — не трогаем)
+        self.assertEqual("", suggest.find_playbook_conflict("не коротко, а развёрнуто"))
+
+    def test_replace_keeps_new_removes_old(self):
+        # «оставить новое»: убрать старое конфликтующее правило, дописать новое (обратной полярности)
+        st = suggest.replace_playbook_rule("Здоровайся дважды в одном диалоге для теплоты",
+                                           "Не здоровайся дважды в одном диалоге",
+                                           now=datetime.date(2026, 7, 16))
+        self.assertEqual("replaced", st)
+        txt = self._read()
+        self.assertIn("Не здоровайся дважды", txt)                       # новое записано
+        self.assertNotIn("Здоровайся дважды в одном диалоге для теплоты", txt)  # старое убрано
+        self.assertIn("шлем в подарок", txt)                            # соседнее правило не тронуто
+
+    def test_replace_without_matching_old_just_appends(self):
+        # старого не нашли (пусто/нет похожего) → просто дописать новое, статус 'added'
+        st = suggest.replace_playbook_rule("", "Совсем новое правило про пунктуальность",
+                                           now=datetime.date(2026, 7, 16))
+        self.assertEqual("added", st)
+        self.assertIn("Совсем новое правило про пунктуальность", self._read())
+
+    def test_replace_new_rule_survives_despite_dedup(self):
+        # КЛЮЧ: без удаления старого новое (обратная полярность) осело бы как duplicate. Проверяем,
+        # что после replace новое ПРИСУТСТВУЕТ (значит удаление-до-append сработало).
+        suggest.replace_playbook_rule("Здоровайся дважды в одном диалоге для теплоты",
+                                      "Не здоровайся дважды в одном диалоге")
+        rules = " || ".join(suggest._playbook_learned_rules(self._read())).lower()
+        self.assertIn("не здоровайся дважды", rules)
+
+    def test_replace_empty_new_is_error(self):
+        self.assertEqual("error", suggest.replace_playbook_rule("что-то", "   "))
+
+    def test_replace_failsafe_on_missing_target(self):
+        suggest.PLAYBOOK_FILE = os.path.join(self._tmp.name, "nope", "playbook.md")
+        self.assertEqual("error", suggest.replace_playbook_rule("старое", "новое"))
+
+
 class TestSalesPressureAndSafety(unittest.TestCase):
     """Хвост 2 — рычаг SALES_PRESSURE НАД базой; Хвост 1 — жёсткое правило опыт/безопасность."""
 
