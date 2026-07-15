@@ -3882,5 +3882,164 @@ class TestTeamRegistryBlock(unittest.TestCase):
         self.assertEqual(moderation_ipc.get_intake(iid)["status"], "posted")
 
 
+class TestRunLiveSmoke(unittest.TestCase):
+    """#92 шаг 3/6: e2e-смоук runLiveSmoke под TEST_MODE — сквозная проверка транспорта QUOTE/
+    DELIVERY на ЖИВОМ формате прода: строка столбца J ДОСЛОВНО, доставка = цена ЗОНЫ (Раваи 590),
+    год поколения не утёк, при полных данных нет «вернусь/уточним», нет утверждений о наличии,
+    депозит без противоречий. Провал → status='failed' + карточка с диффом ОЖИДАНИЕ/ФАКТ. Оба
+    внешних источника замоканы ЖИВЫМ форматом (правило-класс CLAUDE.md): позиционные зоны листа
+    (fixtures/delivery_zones_get.live.json) через РЕАЛЬНЫЙ delivery.resolve_delivery + строка
+    столбца J дословно в поле text котировки."""
+
+    FLEET = ["NMAX 155CC BLACK PHUKET 4255", "ADV 350CC BLACK PHUKET 5849"]
+    TODAY = datetime.date(2026, 7, 15)
+    J_LINE = "2400 ฿ за 5 дней (Скидка за срок 15%, 480 ฿ в день); депозит 3000 ฿"
+
+    def setUp(self):
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+
+    def tearDown(self):
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+
+    def _getter(self):
+        # Bridge отдаёт ГОТОВУЮ строку столбца J (со «Скидкой за срок N%») в поле text — как живой
+        # Календарь; депозит уже словами в тексте. Правило-класс: мок = живой формат прода.
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET]}}
+            if suggest._bike_key("NMAX 155") not in suggest._bike_key(params.get("bike", "")):
+                return {"ok": False}
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            return {"ok": True, "data": {"day_price": 480, "total": 2400, "deposit": 3000,
+                    "available": True, "days": days, "cap_active": False, "cap_price": 0,
+                    "text": self.J_LINE}}
+        return fake
+
+    def _resolve(self):
+        # ЖИВОЙ формат зон Bridge: ПОЗИЦИОННЫЙ список листа [name,lat,lon,price,radius] из фикстуры,
+        # прогнанный через РЕАЛЬНЫЙ delivery.resolve_delivery на координатах зоны Раваи → 590.
+        with open(os.path.join(suggest.BASE_DIR, "fixtures",
+                               "delivery_zones_get.live.json"), encoding="utf-8") as f:
+            zones = json.load(f)["zones"]
+
+        def resolve(text):
+            return suggest.delivery.resolve_delivery(7.771, 98.327, zones)
+        return resolve
+
+    def _run(self, **kw):
+        return asyncio.run(suggest.runLiveSmoke(today=self.TODAY, require_test_mode=False, **kw))
+
+    def test_green_full_data_passes(self):
+        # ЯДРО: полная проба (модель+даты+пин) → все 6 чеков зелёные, карточки нет.
+        def clean(system, user):
+            return "Здравствуйте! Рассчитал аренду NMAX на ваши даты 👍 Детали ниже."
+        r = self._run(getter=self._getter(), resolve_delivery=self._resolve(), call_llm=clean)
+        self.assertEqual(r["status"], "passed", r["card"])
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["card"], "")
+        self.assertTrue(all(c["ok"] for c in r["checks"]))
+        client = suggest.client_facing_text(r["draft"])
+        self.assertIn(self.J_LINE, client)                       # строка J посимвольно у клиента
+        self.assertIn("Доставка — 590 ฿", client)                # доставка = цена зоны Раваи
+
+    def test_red_violations_flagged_with_diff_card(self):
+        # Живой контур «промахнулся» (wait_draft отдаёт черновик с остаточными нарушениями): год,
+        # реаск, наличие, конфликт депозита — красные; транспорт J/доставки цел → эти зелёные.
+        async def bad(win):
+            return ("Здравствуйте! Байк 2023 года свободен и в наличии 👍\n"
+                    "NMAX — 2400 ฿ за 5 дней (Скидка за срок 15%, 480 ฿ в день); депозит 3000 ฿.\n"
+                    "Ещё депозит 5000 ฿ или паспорт.\n"
+                    "Доставка — 590 ฿ (забор байка в конце аренды — бесплатный).\n"
+                    "Уточню детали и вернусь.")
+        r = self._run(getter=self._getter(), resolve_delivery=self._resolve(), wait_draft=bad)
+        self.assertEqual(r["status"], "failed")
+        self.assertFalse(r["ok"])
+        by = {c["name"]: c["ok"] for c in r["checks"]}
+        self.assertTrue(by["строка J дословно"])                 # транспорт J донёс строку дословно
+        self.assertTrue(by["доставка = цена зоны"])              # доставка = цена зоны
+        self.assertFalse(by["нет годов"])                        # «2023 года» — красный
+        self.assertFalse(by["нет «вернусь/уточним» при полных данных"])
+        self.assertFalse(by["нет утверждений о наличии"])        # «свободен/в наличии»
+        self.assertFalse(by["депозит без противоречий"])         # 3000 vs 5000
+        self.assertIn("ОЖИДАНИЕ/ФАКТ", r["card"])                # карточка с диффом
+        self.assertIn("нет годов", r["card"])
+        self.assertIn("2023", r["card"])
+
+    def test_red_j_line_not_verbatim_fails(self):
+        # Черновик ПЕРЕСОБРАЛ строку J (потерял «Скидку за срок») → чек «строка J дословно» красный,
+        # в карточке ожидание — дословная строка столбца J.
+        async def reworded(win):
+            return ("NMAX — 2400 ฿ за 5 дней; депозит 3000 ฿.\n"          # «Скидка за срок» вырезана
+                    "Доставка — 590 ฿ (забор байка в конце аренды — бесплатный).")
+        r = self._run(getter=self._getter(), resolve_delivery=self._resolve(), wait_draft=reworded)
+        self.assertFalse(r["ok"])
+        by = {c["name"]: c["ok"] for c in r["checks"]}
+        self.assertFalse(by["строка J дословно"])
+        self.assertTrue(by["доставка = цена зоны"])
+        self.assertIn("Скидка за срок 15%", r["card"])           # ожидание — дословная строка J
+
+    def test_red_delivery_missing_fails(self):
+        # Черновик БЕЗ строки доставки → чек «доставка = цена зоны» красный.
+        async def nodelivery(win):
+            return "NMAX — 2400 ฿ за 5 дней (Скидка за срок 15%, 480 ฿ в день); депозит 3000 ฿."
+        r = self._run(getter=self._getter(), resolve_delivery=self._resolve(), wait_draft=nodelivery)
+        self.assertFalse(r["ok"])
+        by = {c["name"]: c["ok"] for c in r["checks"]}
+        self.assertTrue(by["строка J дословно"])
+        self.assertFalse(by["доставка = цена зоны"])
+        self.assertIn("доставки нет в черновике", r["card"])
+
+    def test_send_delivers_probe_two_messages(self):
+        # Проба уходит в ТЕСТОВОЕ окно ДВУМЯ сообщениями (модель+даты, затем пин отдельно).
+        sent = []
+
+        async def send(win, text):
+            sent.append((win, text))
+
+        def clean(system, user):
+            return "Ок, детали ниже."
+        r = self._run(getter=self._getter(), resolve_delivery=self._resolve(), call_llm=clean,
+                      send=send, test_window="@testwin")
+        self.assertEqual(r["status"], "passed", r["card"])
+        self.assertEqual(len(sent), 2)                           # два отдельных сообщения
+        self.assertTrue(all(w == "@testwin" for w, _ in sent))
+        self.assertIn("NMAX", sent[0][1])                        # 1-е: модель + даты
+        self.assertIn("google.com/maps", sent[1][1])             # 2-е: пин отдельно
+
+    def test_send_failure_is_failed_step_not_crash(self):
+        # Сбой доставки пробы → status='failed' + карточка с причиной (шаг помечается failed), не краш.
+        async def boom(win, text):
+            raise RuntimeError("нет коннекта к тестовому окну")
+        r = self._run(getter=self._getter(), resolve_delivery=self._resolve(), send=boom,
+                      test_window="@testwin")
+        self.assertEqual(r["status"], "failed")
+        self.assertFalse(r["ok"])
+        self.assertIn("send упал", r["card"])
+
+    def test_skip_when_test_mode_off(self):
+        # БЕЗОПАСНОСТЬ: без SUGGEST_TEST_MODE смоук НИЧЕГО не делает (skipped ≠ провал) — живого
+        # клиента проба не касается.
+        sent = []
+
+        async def send(win, text):
+            sent.append(text)
+        with mock.patch.object(suggest, "SUGGEST_TEST_MODE", False):
+            r = asyncio.run(suggest.runLiveSmoke(today=self.TODAY, send=send, test_window="@w",
+                                                 getter=self._getter(), resolve_delivery=self._resolve()))
+        self.assertEqual(r["status"], "skipped")
+        self.assertTrue(r["ok"])                                 # skip не считается провалом
+        self.assertEqual(r["draft"], "")
+        self.assertEqual(sent, [])                               # в окно ничего не ушло
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

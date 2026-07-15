@@ -3793,6 +3793,295 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     return strip_greeting_for_window(out, transcript)
 
 
+# ============================ E2E-СМОУК (TEST_MODE) ==========================
+# runLiveSmoke — СКВОЗНОЙ e2e-смоук ЖИВОГО контура suggest ПОД TEST_MODE (SUGGEST_TEST_MODE):
+# шлёт в ТЕСТОВОЕ окно пробу «модель + даты + якорная maps-ссылка», ждёт готовый черновик и
+# проверяет, что транспорт (<<<QUOTE>>>/<<<DELIVERY>>>, #92 и смежные) донёс инварианты:
+#   • строка столбца J — ДОСЛОВНО (посимвольно) в черновике клиента;
+#   • доставка = цена ЗОНЫ по ссылке (Раваи → 590), а НЕ выдумка/[уточнить];
+#   • год поколения (20xx) в клиентское тело не утёк;
+#   • при ПОЛНЫХ данных (модель+даты+ссылка) нет отписки «вернусь/уточню и вернусь»;
+#   • нет УТВЕРЖДЕНИЙ о наличии без данных Bridge;
+#   • депозит без самопротиворечия (одна сумма ЛИБО паспорт, не два значения сразу).
+# Провал → status='failed' + КАРТОЧКА с диффом ОЖИДАНИЕ/ФАКТ по каждому провалившемуся чеку
+# (её печатает шаг/оркестратор). BEЗОПАСНОСТЬ: смоук пишет ТОЛЬКО в тестовое окно и ТОЛЬКО при
+# SUGGEST_TEST_MODE=on; вне TEST_MODE не делает НИЧЕГО (status='skipped') — живого клиента проба
+# не касается. send/wait_draft/getter/resolve_delivery/call_llm инъектируются (мок-тесты копируют
+# ЖИВОЙ формат прода: позиционные зоны листа + строка столбца J дословно — правило-класс CLAUDE.md).
+
+_SMOKE_MONTHS_GEN = ("", "января", "февраля", "марта", "апреля", "мая", "июня",
+                     "июля", "августа", "сентября", "октября", "ноября", "декабря")
+
+# Отписка-реаск «вернусь/уточню и вернусь/пришлю позже» — при ПОЛНЫХ данных это уход от ответа
+# (цена и зона уже посчитаны). EN-аналоги тоже. «уточню район?» без «вернусь» не ловим (легитимно).
+_SMOKE_REASK_RE = re.compile(
+    r"верн[её]мся|вернусь|верн[её]т(?:есь|ся)|"
+    r"пришл[юё][^.\n]{0,30}(?:позже|потом|прайс)|напиш[уеё][^.\n]{0,20}позже|"
+    r"уточн\w+[^.\n]{0,40}\bверн|подготовл\w+[^.\n]{0,20}(?:позже|отдельно)|"
+    r"get\s+back\s+to\s+you|will\s+get\s+back|i['’]?ll\s+get\s+back",
+    re.I)
+
+
+def _smoke_today(today=None):
+    return today or datetime.date.today()
+
+
+def _smoke_default_probe(today=None):
+    """Проба по умолчанию: NMAX 155 на 5 дней (окно СЛЕДУЮЩЕГО месяца, всегда в будущем и в ОДНОМ
+    месяце) + якорная ссылка с координатами зоны Раваи (fixtures/delivery_zones_get.live.json:
+    [\"Раваи\", 7.771, 98.327, 590, 4] → цена 590). Зона/цена — ожидание чека доставки."""
+    d = _smoke_today(today)
+    yr = d.year + (1 if d.month == 12 else 0)
+    mo = d.month % 12 + 1
+    ds = datetime.date(yr, mo, 6)
+    de = datetime.date(yr, mo, 11)
+    return {"model": "NMAX 155", "iso_start": ds.isoformat(), "iso_end": de.isoformat(),
+            "maps_link": "https://www.google.com/maps/place/Rawai+Beach/@7.771,98.327,15z",
+            "lang": "ru", "zone": "Раваи", "zone_price": 590}
+
+
+def _smoke_client_lines(probe):
+    """Реплики пробы (БЕЗ транскрипт-префикса — так уходят в живое тестовое окно). ДВА сообщения:
+    (1) модель + даты словами, (2) якорная maps-ссылка ОТДЕЛЬНО — как реальный клиент шлёт пин
+    самостоятельным сообщением (иначе числа в URL забивают парсер дат — «мок = живой формат»)."""
+    ds = datetime.date.fromisoformat(probe["iso_start"])
+    de = datetime.date.fromisoformat(probe["iso_end"])
+    if ds.month == de.month:
+        when = f"с {ds.day} по {de.day} {_SMOKE_MONTHS_GEN[de.month]}"
+    else:
+        when = (f"с {ds.day} {_SMOKE_MONTHS_GEN[ds.month]} "
+                f"по {de.day} {_SMOKE_MONTHS_GEN[de.month]}")
+    return [f"Здравствуйте! Хочу арендовать {probe['model']} {when}.",
+            f"Вот точка доставки: {probe['maps_link']}"]
+
+
+def _with_delivery_resolver(resolve_delivery, fn):
+    """Выполнить fn(), временно подменив delivery.resolve_delivery_from_text инъекцией (смоук/тесты).
+    Без инъекции — как есть (живой Bridge). ВСЕГДА восстанавливает исходный резолвер (finally)."""
+    if resolve_delivery is None:
+        return fn()
+    saved = delivery.resolve_delivery_from_text
+    delivery.resolve_delivery_from_text = resolve_delivery
+    try:
+        return fn()
+    finally:
+        delivery.resolve_delivery_from_text = saved
+
+
+def _smoke_local_draft(transcript, probe, getter, resolve_delivery, call_llm, today, faq):
+    """Локальный прогон ТОГО ЖЕ кода (build_pricing_note → generate_draft) — дефолт, если живой
+    wait_draft не задан (CI/self-contained смоук). Delivery резолвится через инъекцию (позиц. зоны)."""
+    lang = probe.get("lang", "ru")
+
+    def _build():
+        note = build_pricing_note(extract_booking_hints(transcript, today=_smoke_today(today)),
+                                  lang=lang, getter=getter, today=_smoke_today(today))
+        return generate_draft(transcript, lang, faq or "", pricing_note=note, call_llm=call_llm)
+
+    return _with_delivery_resolver(resolve_delivery, _build)
+
+
+def _smoke_expectations(transcript, probe, getter, resolve_delivery, today):
+    """Ожидания смоука из ТЕХ ЖЕ живых источников, что питают черновик: строку столбца J и строку
+    доставки берём из служебных блоков pricing_note (транспорт), зону/цену — из ЖИВОГО ответа
+    резолвера (точка правды), иначе — из пробы (fail-safe)."""
+    lang = probe.get("lang", "ru")
+    hints = extract_booking_hints(transcript, today=_smoke_today(today))
+
+    def _build():
+        return build_pricing_note(hints, lang=lang, getter=getter, today=_smoke_today(today))
+
+    note = _with_delivery_resolver(resolve_delivery, _build)
+    zone, zprice = probe.get("zone"), probe.get("zone_price")
+    try:
+        res = (resolve_delivery or delivery.resolve_delivery_from_text)(probe.get("maps_link"))
+    except Exception:
+        res = None
+    if isinstance(res, dict) and res.get("status") == "zone":
+        zone = res.get("zone", zone)
+        if isinstance(res.get("price"), (int, float)) and not isinstance(res.get("price"), bool):
+            zprice = res.get("price")
+    return {
+        "j_line": _quote_block_from_note(note),
+        "delivery_line": _delivery_block_from_note(note),
+        "zone": zone, "zone_price": zprice,
+        "full_data": bool(hints.get("model") and hints.get("has_dates") and hints.get("maps_link")),
+    }
+
+
+# Сумму депозита берём ТОЛЬКО у слова-якоря «депозит/залог/deposit» (не по всему тексту: иначе цена
+# доставки «590 ฿» из соседней строки ложно зачлась бы депозитом — extract_money_figures ловит «депозит»
+# из ПРЕДЫДУЩЕЙ строки в своё окно контекста). «паспорт как депозит» — отдельный якорь.
+_SMOKE_DEP_AMOUNT_RE = re.compile(
+    r"(?:депозит|залог|deposit)\D{0,14}?(\d[\d\s]{0,6}\d|\d)\s*(?:฿|бат|thb|baht)", re.I)
+_SMOKE_DEP_PASSPORT_RE = re.compile(
+    r"(?:депозит|залог)[^.\n]{0,16}паспорт|паспорт[^.\n]{0,20}(?:депозит|залог)|"
+    r"deposit[^.\n]{0,16}passport", re.I)
+
+
+def _smoke_deposit_conflict(text) -> str:
+    """Противоречие депозита → строка-описание, иначе ''. Конфликт: ДВЕ разные суммы депозита ИЛИ
+    сумма депозита и «паспорт» одновременно (KB: деньги ЛИБО паспорт, не оба)."""
+    s = text or ""
+    deps = sorted({int(m.group(1).replace(" ", "")) for m in _SMOKE_DEP_AMOUNT_RE.finditer(s)})
+    passport = bool(_SMOKE_DEP_PASSPORT_RE.search(s))
+    if len(deps) > 1:
+        return "разные суммы депозита: " + ", ".join(f"{v} ฿" for v in deps)
+    if deps and passport:
+        return f"и сумма депозита ({deps[0]} ฿), и «паспорт» одновременно"
+    return ""
+
+
+def _smoke_checks(draft, exp) -> list:
+    """Чеки инвариантов #92 и смежных по ГОТОВОМУ черновику → список dict(name, ok, expected, fact)."""
+    client = client_facing_text(draft)
+    checks = []
+
+    # 1) строка столбца J — ДОСЛОВНО (посимвольно) в клиентском тексте
+    j = exp.get("j_line")
+    j_lines = [ln.strip() for ln in (j or "").split("\n") if ln.strip()]
+    missing = [ln for ln in j_lines if ln not in client]
+    checks.append({
+        "name": "строка J дословно",
+        "ok": bool(j_lines) and not missing,
+        "expected": j if j_lines else "(строка столбца J из quote-блока)",
+        "fact": ("quote-блок не собран — цена не доехала" if not j_lines
+                 else ("не найдено дословно: " + " | ".join(missing) if missing
+                       else "строка J в черновике посимвольно")),
+    })
+
+    # 2) доставка = цена ЗОНЫ (Раваи 590), а не выдумка/[уточнить]
+    dl = exp.get("delivery_line")
+    zprice, zone = exp.get("zone_price"), exp.get("zone")
+    dl_ok = bool(dl) and dl in client and zprice is not None and str(int(zprice)) in dl
+    checks.append({
+        "name": "доставка = цена зоны",
+        "ok": dl_ok,
+        "expected": dl if dl else f"строка доставки с ценой зоны {zone} ({zprice} ฿)",
+        "fact": (dl if (dl and dl in client)
+                 else ("строки доставки нет в черновике" if dl else "доставка не резолвилась в зону")),
+    })
+
+    # 3) год поколения (20xx) в клиентское тело НЕ утёк
+    yrs = _GEN_YEAR_RE.findall(client)
+    checks.append({
+        "name": "нет годов",
+        "ok": not yrs,
+        "expected": "год поколения (20xx) в тексте отсутствует",
+        "fact": ("годы в тексте: " + ", ".join(sorted(set(yrs))) if yrs else "годов нет"),
+    })
+
+    # 4) при ПОЛНЫХ данных нет отписки «вернусь/уточню и вернусь»
+    m = _SMOKE_REASK_RE.search(client) if exp.get("full_data") else None
+    checks.append({
+        "name": "нет «вернусь/уточним» при полных данных",
+        "ok": m is None,
+        "expected": "при полных данных — конкретный ответ без «вернусь/уточню и вернусь»",
+        "fact": (f"отписка: «{m.group(0).strip()}»" if m else "отписки нет"),
+    })
+
+    # 5) нет УТВЕРЖДЕНИЙ о наличии без данных Bridge
+    viol = availability_violations(client, avail=None)
+    checks.append({
+        "name": "нет утверждений о наличии",
+        "ok": not viol,
+        "expected": "наличие/дефицит/особые условия без данных не утверждаются",
+        "fact": ("клеймы наличия: " + "; ".join(c["raw"] for c in viol) if viol
+                 else "клеймов наличия нет"),
+    })
+
+    # 6) депозит без самопротиворечия
+    conflict = _smoke_deposit_conflict(client)
+    checks.append({
+        "name": "депозит без противоречий",
+        "ok": not conflict,
+        "expected": "депозит один: сумма ЛИБО паспорт, без двух значений",
+        "fact": (conflict or "депозит согласован"),
+    })
+    return checks
+
+
+def _smoke_card(probe, checks, note=None) -> str:
+    """Карточка провала: дифф ОЖИДАНИЕ/ФАКТ по КАЖДОМУ провалившемуся чеку (для шага/оркестратора)."""
+    p = probe or {}
+    head = (f"проба: {p.get('model')} {p.get('iso_start')}..{p.get('iso_end')} "
+            f"зона {p.get('zone')} ({p.get('zone_price')} ฿)")
+    lines = ["🧪 E2E-СМОУК ПРОВАЛЕН — дифф ОЖИДАНИЕ/ФАКТ:", head]
+    if note:
+        lines.append(f"— причина: {note}")
+    for c in (checks or []):
+        if c.get("ok"):
+            continue
+        lines.append(f"— [{c['name']}]")
+        lines.append(f"    ожидание: {c['expected']}")
+        lines.append(f"    факт:     {c['fact']}")
+    return "\n".join(lines)
+
+
+def _smoke_result(status, ok, probe, checks=None, card="", draft="", reason=""):
+    return {"status": status, "ok": ok, "probe": probe, "checks": checks or [],
+            "card": card, "draft": draft, "reason": reason}
+
+
+async def runLiveSmoke(*, probe=None, test_window=None, send=None, wait_draft=None,
+                       getter=None, resolve_delivery=None, call_llm=None, today=None,
+                       faq="", require_test_mode=True) -> dict:
+    """Сквозной e2e-смоук ЖИВОГО контура suggest ПОД TEST_MODE. Возвращает dict(status∈{passed,
+    failed,skipped}, ok, probe, checks, card, draft, reason). Провал → status='failed' + card
+    с диффом ОЖИДАНИЕ/ФАКТ (шаг/оркестратор его печатает и помечает шаг failed).
+
+    send(test_window, text)  — доставка пробы в ТЕСТОВОЕ окно (инъекция; вне неё проба не уходит);
+    wait_draft(test_window)  — ожидание готового черновика из живого контура; None → локальный
+                               прогон того же кода (getter/resolve_delivery/call_llm — инъекции).
+    БЕЗОПАСНОСТЬ: без SUGGEST_TEST_MODE не делаем НИЧЕГО (skipped) — живого клиента не касаемся."""
+    if require_test_mode and not SUGGEST_TEST_MODE:
+        log.info("runLiveSmoke: SUGGEST_TEST_MODE=off — смоук ПРОПУЩЕН (живого клиента не касаемся).")
+        return _smoke_result("skipped", True, None, reason="SUGGEST_TEST_MODE off")
+
+    probe = probe or _smoke_default_probe(today)
+    lines = _smoke_client_lines(probe)
+    transcript = "\n".join("[клиент]: " + ln for ln in lines)
+
+    # 1) шлём пробу в тестовое окно (только через инъекцию send — иначе проба никуда не уходит).
+    # Каждую реплику ОТДЕЛЬНЫМ сообщением — как реальный клиент (пин самостоятельным сообщением).
+    if send is not None:
+        try:
+            for ln in lines:
+                await send(test_window, ln)
+        except Exception as e:
+            reason = f"send упал: {type(e).__name__}: {e}"
+            log.warning("runLiveSmoke: %s", reason)
+            return _smoke_result("failed", False, probe, card=_smoke_card(probe, [], reason),
+                                 reason=reason)
+
+    # 2) ждём готовый черновик (живой контур) ИЛИ локальный прогон того же кода
+    try:
+        if wait_draft is not None:
+            draft = await wait_draft(test_window)
+        else:
+            draft = _smoke_local_draft(transcript, probe, getter, resolve_delivery, call_llm,
+                                       today, faq)
+    except Exception as e:
+        reason = f"черновик не получен: {type(e).__name__}: {e}"
+        log.warning("runLiveSmoke: %s", reason)
+        return _smoke_result("failed", False, probe, card=_smoke_card(probe, [], reason),
+                             reason=reason)
+    if not (draft or "").strip():
+        reason = "черновик пуст"
+        return _smoke_result("failed", False, probe, card=_smoke_card(probe, [], reason),
+                             reason=reason)
+
+    # 3) ожидания из тех же живых источников + 4) чеки инвариантов
+    exp = _smoke_expectations(transcript, probe, getter, resolve_delivery, today)
+    checks = _smoke_checks(draft, exp)
+    ok = all(c["ok"] for c in checks)
+    card = "" if ok else _smoke_card(probe, checks)
+    if not ok:
+        log.warning("runLiveSmoke: ПРОВАЛ\n%s", card)
+    return _smoke_result("passed" if ok else "failed", ok, probe, checks=checks, card=card,
+                         draft=draft)
+
+
 # ------------------------------- rate-limit ----------------------------------
 
 class RateLimiter:
