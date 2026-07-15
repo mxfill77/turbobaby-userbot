@@ -81,6 +81,78 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(lr.FACT, self._route("Звучит нормально, но цена неверная"))
 
 
+class TestClassifyType(unittest.TestCase):
+    """Родитель 112, шаг 1/8: ВТОРАЯ ось урока — type = behavior | code | unsure + уверенность.
+    Ортогональна classify_lesson_remark (та про адресата, эта про природу урока). Golden-правило
+    CLAUDE.md: позитивы — ЖИВЫЕ формулировки + парафразы RU/EN; негативы — размытое «переделай»."""
+
+    def _type(self, remark):
+        return lr.classify_lesson_type(remark)["type"]
+
+    def test_spec_two_examples(self):
+        # ДВА примера прямо из спеки шага 1/8 — дословно
+        self.assertEqual(lr.BEHAVIOR, self._type('не пиши "данные получил"'))
+        self.assertEqual(lr.CODE, self._type("цена из столбца J"))
+
+    def test_behavior_positives(self):
+        # ПОВЕДЕНИЕ: тон/формулировки/что говорить-не говорить/дефолты/порядок вопросов
+        for phrase in (
+            "Не пиши «данные получил», это звучит по-роботски",
+            "Звучит слишком сухо — пиши теплее и по-человечески",
+            "Не обещай наличие, просто предложи посмотреть",
+            "Сначала спроси даты, потом модель — порядок вопросов другой",
+            "По умолчанию предлагай Nmax, если клиент не назвал модель",
+            "Don't say we got the data, just answer the question",
+            "The tone is too cold, warmer wording please",
+        ):
+            self.assertEqual(lr.BEHAVIOR, self._type(phrase), phrase)
+
+    def test_code_positives(self):
+        # МАШИНА: цифры/поля-столбцы/гарды/инварианты/резолверы/транспорт/интеграции
+        for phrase in (
+            "Цена берётся из столбца J, а не из K",
+            "Депозит считается неправильно — поправь формулу",
+            "Резолвер зон доставки роняет позиционный список",
+            "Гард не пропускает выдуманную цену, которой нет в quote",
+            "Инвариант суммы нарушен при округлении",
+            "The price must come from column J of the sheet",
+            "Deposit number is wrong in the integration",
+        ):
+            self.assertEqual(lr.CODE, self._type(phrase), phrase)
+
+    def test_unsure_negatives(self):
+        # размытое/пустое → unsure (не угадываем тип)
+        for phrase in ("", "   ", "Плохо, переделай", "Не так", "Так не пойдёт", "Что-то не то"):
+            self.assertEqual(lr.UNSURE, self._type(phrase), repr(phrase))
+
+    def test_confidence_high_for_clean_signal(self):
+        # чистый сигнал одной оси → high; behavior|code всегда приходят с high (инвариант)
+        for phrase, want_type in (('не пиши "данные получил"', lr.BEHAVIOR),
+                                  ("цена из столбца J", lr.CODE)):
+            d = lr.classify_lesson_type(phrase)
+            self.assertEqual(want_type, d["type"], phrase)
+            self.assertEqual("high", d["confidence"], phrase)
+
+    def test_confidence_low_for_unsure(self):
+        # unsure всегда несёт confidence=low (правило спеки «при низкой — type=unsure»)
+        d = lr.classify_lesson_type("плохо, переделай")
+        self.assertEqual(lr.UNSURE, d["type"])
+        self.assertEqual("low", d["confidence"])
+
+    def test_mixed_signal_without_dominance_is_unsure(self):
+        # обе оси зацепились без резкого перевеса → тип неясен → unsure (не угадываем)
+        d = lr.classify_lesson_type("короче про цену")     # behavior «короче» ≈ code «цена»
+        self.assertEqual(lr.UNSURE, d["type"])
+        self.assertEqual("low", d["confidence"])
+
+    def test_axis_is_orthogonal_to_route(self):
+        # НАДЗОР-урок (первая ось = supervision) по ВТОРОЙ оси = code (правка машины-детектора):
+        # оси независимы, второй тип не дублирует маршрут
+        remark = "ревизор должен ловить выдуманную цену, которой нет в quote"
+        self.assertEqual(lr.SUPERVISION, lr.classify_lesson_remark(remark)[0])
+        self.assertEqual(lr.CODE, self._type(remark))
+
+
 class TestParse(unittest.TestCase):
     """Разбор задачи-урока (контракт с build_lesson_task шага 2)."""
 
