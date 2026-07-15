@@ -722,5 +722,139 @@ class TestChainWatchdogStuck(LocBase):
         self.assertEqual(len(self.fb.chain_news()), 1)
 
 
+# ------------- ПРИОРИТЕТ pc-полосы: owner (328/829/Dispatch) ⟩ ревизорские цепи -------------
+
+class TestPriorityHelpers(unittest.TestCase):
+    """Юниты классификаторов приоритета (чистые, без Bridge): что считается ревизорской цепью и
+    какая НЕЗАКРЫТАЯ работа — owner-работа (перед ней ревизорская цепь уступает)."""
+
+    def test_is_revizor_parent_text(self):
+        self.assertTrue(o._is_revizor_parent_text("[ревизор дата=2026-07-15 класс=спор_тариф] почини"))
+        self.assertFalse(o._is_revizor_parent_text("[шаг 1/2 родитель 5] кусок"))
+        self.assertFalse(o._is_revizor_parent_text("обычное дев-ТЗ"))
+
+    def test_revizor_chain_pids_from_snapshot(self):
+        items = [
+            {"id": 5, "from": o.PC_LOCAL_DEC_FROM, "status": "done",
+             "task_text": "[ревизор дата=2026-07-15 класс=X] почини"},
+            {"id": 6, "from": o.PC_LOCAL_DEC_FROM, "status": "done", "task_text": "обычное owner-ТЗ"},
+            {"id": 7, "from": "Filipp", "status": "new", "task_text": "[ревизор дата=2026-07-15 класс=Y] чужой from"},
+        ]
+        self.assertEqual(o._revizor_chain_pids(items), {5})   # только pcloc-dec-родитель с маркером
+
+    def test_owner_work_pending_true_only_for_owner(self):
+        rev = [
+            {"id": 5, "from": o.PC_LOCAL_DEC_FROM, "status": "done",
+             "task_text": "[ревизор дата=2026-07-15 класс=X] почини"},
+            {"id": 6, "from": o.PC_LOCAL_DEC_FROM, "status": "new",
+             "task_text": "[шаг 2/3 родитель 5] кусок ревизорской цепи"},
+        ]
+        self.assertFalse(o._owner_work_pending(rev), "ревизорский родитель+шаг — не owner-работа")
+        self.assertTrue(o._owner_work_pending(rev + [
+            {"id": 7, "from": "Filipp", "status": "new", "task_text": "срочная задача из 328"}]),
+            "одиночка владельца — owner-работа")
+        self.assertTrue(o._owner_work_pending([
+            {"id": 9, "from": o.PC_LOCAL_DEC_FROM, "status": "done", "task_text": "крупное owner-ТЗ"},
+            {"id": 10, "from": o.PC_LOCAL_DEC_FROM, "status": "new",
+             "task_text": "[шаг 2/2 родитель 9] кусок owner-цепи"}]),
+            "шаг owner-цепи (pid не ревизорский) — owner-работа")
+
+    def test_synthetic_and_revizor_card_not_owner_work(self):
+        items = [
+            {"id": 11, "from": o.PC_LOCAL_DEC_FROM, "status": "new", "task_text": "[сводка родитель 5] отчёт"},
+            {"id": 12, "from": o.PC_LOCAL_DEC_FROM, "status": "new", "task_text": "[карточка родитель 5] событие"},
+            {"id": 13, "from": o.PC_LOCAL_DEC_FROM, "status": "new",
+             "task_text": "[коррекция плана родитель 5] после шага 1 (K=1)"},
+            {"id": 14, "from": o.REVIZOR_OWNER_FROM, "status": "needs_approval",
+             "task_text": o.REVIZOR_OWNER_MARK + " находки ревизора"},
+        ]
+        self.assertFalse(o._owner_work_pending(items),
+                         "synthetic-артефакты дирижёра и info-карточка ревизора — не owner-работа")
+
+    def test_closed_owner_task_not_pending(self):
+        # завершённая owner-задача (done/failed) уступку не держит — уступаем только НЕЗАКРЫТОЙ работе
+        self.assertFalse(o._owner_work_pending([
+            {"id": 20, "from": "Filipp", "status": "done", "task_text": "уже сделано"},
+            {"id": 21, "from": "Filipp", "status": "failed", "task_text": "провалено"}]))
+
+
+class TestPriorityOwnerOverRevizor(LocBase):
+    """ГОЛДЕН приоритета pc-полосы: owner-ТЗ (328/829/Dispatch) впереди ревизорских цепей; ревизорская
+    цепь уступает МЕЖДУ шагами (текущий шаг доработан, следующий не берётся, пока есть owner-работа)."""
+
+    REV = "[ревизор дата=2026-07-15 класс=спор_тариф] почини срез окна 529849022"
+
+    def _revizor_parent(self, plan="1. первый шаг\n2. второй шаг"):
+        """Ревизорская цепь через РЕАЛЬНЫЙ конвейер: родитель [ревизор …] → декомпозиция → шаг 1 релизнут."""
+        self.plan_out = plan
+        pid = self.fb.enqueue_task(o.PC_LOCAL_DEC_FROM, self.REV)["id"]
+        o.process_new()                                # process_new декомпозирует ревизорского родителя
+        return pid
+
+    def test_owner_arrives_during_active_revizor_chain_next_slot(self):
+        # ГОЛДЕН ТЗ: owner-ТЗ приходит при активной ревизорской цепи → исполняется следующим слотом.
+        pid = self._revizor_parent()
+        self.assertTrue(self.fb.chain_news()[0]["task_text"].startswith(f"[шаг 1/2 родитель {pid}]"))
+        self.exec_step("done", "первый готов")         # ТЕКУЩИЙ шаг ревизорской цепи доработан (done)
+        owner = self.fb.enqueue_task("Filipp", "срочная owner-задача из 328")["id"]  # owner-ТЗ при активной цепи
+        # надзор: ревизорская цепь УСТУПАЕТ — шаг 2 НЕ релизится, пока есть owner-работа
+        o.process_local_chains()
+        self.assertEqual(self.fb.chain_news(), [], "ревизорский шаг 2 не встал — цепь уступила owner")
+        self.assertEqual(self.adapt_calls, 0, "уступка ДО думателя адаптации — лимиты не тратим")
+        # owner исполняется СЛЕДУЮЩИМ слотом (process_new берёт owner, ревизорского шага в очереди нет)
+        self.exec_queue.append(("done", "RESULT: owner готов"))
+        o.process_new()
+        self.assertEqual(self.fb.rows[owner]["status"], "done")
+        # owner-очередь опустела → ревизорская цепь ПРОДОЛЖАЕТСЯ: шаг 2 релизнут
+        o.process_local_chains()
+        news = self.fb.chain_news()
+        self.assertEqual(len(news), 1)
+        self.assertTrue(news[0]["task_text"].startswith(f"[шаг 2/2 родитель {pid}]"))
+
+    def test_process_new_claims_owner_before_revizor_parent(self):
+        # owner всегда впереди ревизорского РОДИТЕЛЯ в клейме, даже если ревизорский родитель старше (меньше id)
+        rev = self.fb.enqueue_task(o.PC_LOCAL_DEC_FROM, self.REV)["id"]            # ревизорский родитель (id меньше)
+        owner = self.fb.enqueue_task("Filipp", "owner-задача из Dispatch")["id"]   # id больше, но приоритетнее
+        self.exec_queue.append(("done", "RESULT: owner готов"))
+        o.process_new()
+        self.assertEqual(self.fb.rows[owner]["status"], "done", "owner взят ПЕРВЫМ (впереди ревизорского родителя)")
+        self.assertEqual(self.fb.rows[rev]["status"], "new", "ревизорский родитель ждёт следующего слота")
+        # owner опустел → ревизорский родитель клеймится штатно (декомпозиция)
+        self.plan_out = "1. первый\n2. второй"
+        o.process_new()
+        self.assertEqual(self.fb.rows[rev]["status"], "done")                      # декомпозирован
+        self.assertTrue(self.fb.chain_news()[0]["task_text"].startswith(f"[шаг 1/2 родитель {rev}]"))
+
+    def test_revizor_chain_releases_normally_without_owner(self):
+        # РЕГРЕСС: без owner-работы ревизорская цепь релизит следующий шаг как обычно (уступки нет)
+        pid = self._revizor_parent()
+        self.exec_step("done", "первый готов")
+        o.process_local_chains()
+        news = self.fb.chain_news()
+        self.assertEqual(len(news), 1)
+        self.assertTrue(news[0]["task_text"].startswith(f"[шаг 2/2 родитель {pid}]"))
+
+    def test_watchdog_revizor_chain_yields_to_owner(self):
+        # СТРАХОВОЧНЫЙ путь: застрявшая между шагами ревизорская цепь НЕ досдвигается вотчдогом, пока
+        # есть owner-работа (ни 🩺-карточки, ни релиза); owner опустел → досдвиг штатно.
+        pid = self._revizor_parent()
+        sid1 = self.exec_step("done", "первый готов")
+        owner = self.fb.enqueue_task("Filipp", "owner-задача из 829")["id"]
+        self.fb.rows[sid1]["updated"] = now_iso(ago_sec=o.PC_CHAIN_STALE + 60)     # шаг протух → вотчдог активен
+        wd_before = [t for (_p, t) in self.chain_cards if str(t).startswith("🩺")]
+        o.process_stuck_chains()
+        self.assertEqual(self.fb.chain_news(), [], "вотчдог не досдвинул ревизорскую цепь (уступка owner)")
+        wd_after = [t for (_p, t) in self.chain_cards if str(t).startswith("🩺")]
+        self.assertEqual(wd_before, wd_after, "🩺-карточка на уступке не постится")
+        # owner исполнен → уступки больше нет → вотчдог досдвигает шаг 2
+        self.exec_queue.append(("done", "RESULT: owner готов"))
+        o.process_new()
+        self.assertEqual(self.fb.rows[owner]["status"], "done")
+        o.process_stuck_chains()
+        news = self.fb.chain_news()
+        self.assertEqual(len(news), 1)
+        self.assertTrue(news[0]["task_text"].startswith(f"[шаг 2/2 родитель {pid}]"))
+
+
 if __name__ == "__main__":
     unittest.main()

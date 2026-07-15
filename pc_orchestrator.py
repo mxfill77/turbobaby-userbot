@@ -933,7 +933,13 @@ def process_new():
     items = [it for it in r.get("items", []) if _lane_ok(it)]
     if not items:
         return
-    task = sorted(items, key=lambda x: int(x.get("id") or 0))[0]   # FIFO
+    # ПРИОРИТЕТ pc-полосы: задачи ВЛАДЕЛЬЦА (328/829/Dispatch) впереди РЕВИЗОРСКИХ родителей — среди
+    # new-задач ревизорский родитель ([ревизор дата=… класс=…]) клеймится ПОСЛЕ owner-работы; внутри
+    # каждой группы — прежний FIFO по id. Ревизорские шаги в new не соперничают: они не релизятся, пока
+    # есть owner-работа (уступка МЕЖДУ шагами, _loc_after_done/вотчдог) — а уже релизнутый «текущий шаг
+    # дорабатывает» штатно. Нет owner-задач → ревизорский родитель клеймится как прежде.
+    task = sorted(items, key=lambda x: (_is_revizor_parent_text(x.get("task_text")),
+                                        int(x.get("id") or 0)))[0]
     tid = task.get("id")
     text = str(task.get("task_text") or "")
     cl = bc.claim_task(tid)
@@ -2176,7 +2182,67 @@ def _loc_after_fail(pid, i, n, it, steps):
     log.info("pcloc-dec: шаг %s/%s родителя %s перерождён задачей %s (retry)", i, n, pid, r.get("id"))
 
 
-def _loc_after_done(pid, i, n, it, steps):
+# ---------------- ПРИОРИТЕТ pc-полосы: owner (328/829/Dispatch) ⟩ ревизорские цепи ------------
+# Правило приоритета очереди pc: постановки ВЛАДЕЛЬЦА (темы 328/829/Dispatch — всё, что НЕ порождено
+# самим ревизором) всегда впереди РЕВИЗОРСКИХ цепей. Ревизорская цепь — pcloc-dec-родитель, чей
+# task_text несёт маркер «[ревизор дата=… класс=…]» (_REVIZOR_TASK_RE); её шаги/сводки/карточки —
+# та же дирижёрская механика. Рычагов два: (1) КЛЕЙМ — process_new клеймит ревизорского родителя
+# ПОСЛЕ owner-задач; (2) УСТУПКА МЕЖДУ ШАГАМИ — done-шаг ревизорской цепи НЕ релизит следующий, пока
+# есть незакрытая owner-работа (текущий шаг доработан, следующий не берётся). Всё restart-proof из
+# очереди: родитель после декомпозиции живёт в done с исходным task_text (маркер [ревизор …] цел).
+
+def _is_revizor_parent_text(text):
+    """task_text — родитель РЕВИЗОРСКОЙ цепи (маркер «[ревизор дата=… класс=…]», _REVIZOR_TASK_RE)?
+    Клейм-гейт process_new (owner впереди ревизорских родителей) и признак ревизорской цепи в снимке."""
+    return bool(_REVIZOR_TASK_RE.match(str(text or "")))
+
+
+def _revizor_chain_pids(items):
+    """pid-ы РЕВИЗОРСКИХ цепей из снимка полосы: id pcloc-dec-родителя, чей task_text — [ревизор …].
+    Родитель после декомпозиции лежит в done с исходным task_text → restart-proof из очереди, без памяти."""
+    pids = set()
+    for it in (items or []):
+        if str(it.get("from") or "") != PC_LOCAL_DEC_FROM:
+            continue
+        if _is_revizor_parent_text(it.get("task_text")):
+            pid = it.get("id")
+            if isinstance(pid, int):
+                pids.add(pid)
+    return pids
+
+
+def _is_owner_work(it, revizor_pids):
+    """Задача полосы — OWNER-работа (постановка 328/829/Dispatch), которой ревизорская цепь уступает?
+    НЕ owner: info-карточка ревизора (from=Filipp-revizor), ревизорский родитель/шаг ревизорской цепи,
+    synthetic-артефакты дирижёра (сводка/карточка/коррекция). Owner: одиночки/дев-ТЗ/уроки владельца +
+    owner-родители декомпозиции и шаги owner-цепей (pcloc-dec, чей pid НЕ ревизорский)."""
+    frm = str(it.get("from") or "")
+    txt = str(it.get("task_text") or "")
+    if frm == REVIZOR_OWNER_FROM:
+        return False                                   # info-карточка ревизора живёт до решения — не работа
+    if frm != PC_LOCAL_DEC_FROM:
+        return True                                    # одиночка/дев-ТЗ/урок владельца на полосе pc
+    if _is_revizor_parent_text(txt):
+        return False                                   # ревизорский родитель
+    m = _STEP_RE.match(txt)
+    if m:
+        return int(m.group(3)) not in revizor_pids     # шаг owner-цепи = owner; шаг ревизорской = нет
+    if _SUM_RE.match(txt) or _CARD_RE.match(txt) or _ADAPT_CARD_RE.match(txt):
+        return False                                   # synthetic-артефакт дирижёра — не owner-работа
+    return True                                        # owner-родитель декомпозиции
+
+
+def _owner_work_pending(items, revizor_pids=None):
+    """В снимке полосы есть НЕЗАКРЫТАЯ (new/in_progress/needs_approval/approved) owner-работа, перед
+    которой ревизорская цепь обязана уступить? revizor_pids можно передать заранее (не пересчитывать)."""
+    pids = revizor_pids if revizor_pids is not None else _revizor_chain_pids(items)
+    for it in (items or []):
+        if str(it.get("status") or "") in _LOC_OPEN and _is_owner_work(it, pids):
+            return True
+    return False
+
+
+def _loc_after_done(pid, i, n, it, steps, items=None):
     """Done шага локальной цепи: план restart-proof из очереди → последний по плану → сводка
     (думатель НЕ зовётся — экономия лимитов); план не восстановился → ⚠️-карточка + halt; иначе
     при PLAN_ADAPT=1 адаптация (keep/adjust/finish): keep → релиз следующего шага прежнего плана;
@@ -2196,6 +2262,16 @@ def _loc_after_done(pid, i, n, it, steps):
                             f"поставь «декомпозируй:» заново.")
         _loc_post_summary(pid, steps)
         return
+    # УСТУПКА МЕЖДУ ШАГАМИ: ревизорская цепь НЕ релизит следующий шаг, пока в очереди есть незакрытая
+    # owner-работа (328/829/Dispatch). Текущий шаг доработан (done), owner-задачу возьмёт process_new
+    # следующим слотом; цепь продолжится, когда owner-очередь опустеет (переоценка КАЖДЫЙ тик — состояние
+    # из очереди, кэшей нет). Думателя адаптации тоже не тратим на уступке. items не передан → прежний путь.
+    if items is not None:
+        rev_pids = _revizor_chain_pids(items)
+        if pid in rev_pids and _owner_work_pending(items, rev_pids):
+            log.info("pcloc-dec: ревизорская цепь %s уступает owner-задачам — шаг %s/%s не релизим",
+                     pid, i + 1, total)
+            return
     consult = (_plan_adapt_on() and last_base != i and (pid, i) not in _loc_adapted)
     if consult:
         _loc_adapted.add((pid, i))
@@ -2248,7 +2324,7 @@ def _loc_after_done(pid, i, n, it, steps):
     _loc_release(pid, i + 1, total, txt, k=k_origin)
 
 
-def _loc_chain_tick(pid, steps):
+def _loc_chain_tick(pid, steps, items=None):
     """Один тик надзора локальной цепи: смотрим ПОСЛЕДНИЙ шаг (максимальный номер, при дублях —
     старший id: перерождение самопочинки). Ожидание → return (исполнитель — этот же демон:
     new ждёт FIFO-клейма process_new, in_progress-зомби добьёт process_stuck_singles,
@@ -2265,7 +2341,7 @@ def _loc_chain_tick(pid, steps):
     if st == "failed":
         _loc_after_fail(pid, i, n, it, steps)
     elif st == "done":
-        _loc_after_done(pid, i, n, it, steps)
+        _loc_after_done(pid, i, n, it, steps, items)   # items → уступка ревизорской цепи owner-задачам
 
 
 def process_local_chains():
@@ -2281,7 +2357,7 @@ def process_local_chains():
     chains = _loc_group_chains(items)
     for pid in sorted(set(chains) - _loc_summarized):
         try:
-            _loc_chain_tick(pid, chains[pid])
+            _loc_chain_tick(pid, chains[pid], items)
         except Exception as e:
             log.warning("pcloc-dec: тик цепи родителя %s упал (%s) — следующим циклом", pid, e)
 
@@ -2302,7 +2378,7 @@ def process_local_chains():
 # до персиста релиза лишь честно доводит тот же reconcile (сходится); финализированную цепь узнаём
 # по _loc_summary_exists и молчим — финал-сводка НЕ дублируется.
 
-def _loc_watchdog_tick(pid, steps, now):
+def _loc_watchdog_tick(pid, steps, now, items=None):
     """Один тик вотчдога цепи pid: застряла ли она МЕЖДУ шагами и надо ли досдвинуть следующий.
     Реагирует ТОЛЬКО на явный межшаговый провал (все признаки — из снимка очереди):
       • нет ни одного открытого шага (new/in_progress/needs_approval/approved) — цепь не движется;
@@ -2332,6 +2408,13 @@ def _loc_watchdog_tick(pid, steps, now):
     if nxt is None:
         return                                   # план не восстановился — шаг не выдумываем (⚠️-halt ведёт штатный тик)
     txt, k_origin = nxt
+    # УСТУПКА МЕЖДУ ШАГАМИ (та же, что в штатном _loc_after_done): ревизорская цепь, застрявшая между
+    # шагами, НЕ досдвигается вотчдогом, пока есть незакрытая owner-работа — приоритет owner держится и
+    # на страховочном пути. Ни карточки, ни релиза: продолжим, когда owner-очередь опустеет.
+    if items is not None and pid in _revizor_chain_pids(items) and _owner_work_pending(items):
+        log.info("pcloc-wd: ревизорская цепь %s застряла, но уступает owner-задачам — авто-релиз "
+                 "шага %s/%s отложен", pid, i + 1, total)
+        return
     _notify_chain_card(pid, f"🩺 Вотчдог цепи #{pid}: шаг {i + 1}/{total} не был релизнут штатно "
                             f"(потерянное событие) — авто-релиз reconcile'ом из очереди.")
     if _loc_release(pid, i + 1, total, txt, k=k_origin):
@@ -2357,7 +2440,7 @@ def process_stuck_chains(now=None):
     chains = _loc_group_chains(items)
     for pid in sorted(set(chains) - _loc_summarized):
         try:
-            _loc_watchdog_tick(pid, chains[pid], now)
+            _loc_watchdog_tick(pid, chains[pid], now, items)
         except Exception as e:
             log.warning("pcloc-wd: вотчдог цепи родителя %s упал (%s) — следующим циклом", pid, e)
 
