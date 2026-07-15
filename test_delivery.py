@@ -433,5 +433,115 @@ class TestResolveDeliveryFromText(unittest.TestCase):
         self.assertIsNone(r)
 
 
+class TestDeliveryGoldens(unittest.TestCase):
+    """ДЕТЕРМИНИРОВАННЫЕ ГОЛДЕНЫ сквозного конвейера доставки — вся сеть ЗАМОКАНА.
+
+    Прогоняем реальные реплики клиента через resolve_delivery_from_text (текст →
+    extract_maps_link → resolve_maps_link → зоны Bridge → resolve_delivery), инъектируя
+    зоны и разворот коротких ссылок. Ни один голден не ходит в интернет/Bridge — вход
+    фиксирован, выход детерминирован. Шесть канонических сценариев родителя #12:
+      1) точка в зоне                          → цена зоны
+      2) точка на границе двух зон             → БЛИЖАЙШИЙ якорь (не первый в списке)
+      3) точка в поясе +5 км за границей зоны  → 1490 (OUT_BELT_PRICE)
+      4) точка вне острова (Москва)            → отказ [уточнить]
+      5) битая/обрезанная maps-ссылка          → [уточнить] (цену не выдумываем)
+      6) place-ссылка без координат            → [уточнить]
+
+    Зоны — синтетические, но с прозрачной геометрией (общая широта 7.88; 1° долготы на
+    этой широте ≈ 110.3 км), чтобы дистанции/победитель проверялись глазами."""
+
+    # Два перекрывающихся якоря на широте 7.88, разнесены по долготе на ~6.6 км (r=6 → зоны
+    # перекрываются в середине). Плюс отдельная «узкая» зона для пояса. Цены различны, чтобы
+    # голден однозначно указывал зону-победителя.
+    ZONES = [
+        {"name": "ЗонаA", "lat": 7.88, "lon": 98.36, "radius_km": 6, "price": 300},
+        {"name": "ЗонаB", "lat": 7.88, "lon": 98.42, "radius_km": 6, "price": 500},
+    ]
+    # Узкая зона (r=1) для пояса: точка вне радиуса, но в пределах 1+OUT_BELT_KM.
+    ZONES_NARROW = [{"name": "Узкая", "lat": 7.88, "lon": 98.39, "radius_km": 1, "price": 300}]
+
+    def _run(self, text, zones, resolve_maps=None):
+        """Сквозной прогон с замоканной сетью: зоны и (опц.) разворот ссылки инъектируются."""
+        called = {"z": 0}
+        def _zones():
+            called["z"] += 1
+            return zones
+        kw = {"_get_zones": _zones}
+        if resolve_maps is not None:
+            kw["_resolve_maps"] = resolve_maps
+        r = delivery.resolve_delivery_from_text(text, **kw)
+        return r, called["z"]
+
+    # 1) точка в зоне ---------------------------------------------------------
+    def test_golden_point_inside_zone(self):
+        # координата ровно на якоре ЗонаB → её цена 500
+        text = "Вилла тут https://www.google.com/maps?q=7.88,98.42 заберите завтра к 15:00"
+        r, _ = self._run(text, self.ZONES)
+        self.assertEqual(r["status"], "zone")
+        self.assertEqual(r["zone"], "ЗонаB")
+        self.assertEqual(r["price"], 500)
+        self.assertIsNone(r["marker"])
+
+    # 2) граница двух зон → ближайший якорь ------------------------------------
+    def test_golden_border_nearest_anchor_wins(self):
+        # точка в перекрытии обеих зон, но ближе к B (до A≈4.4 км, до B≈2.2 км) → цена B (500),
+        # а НЕ первого в списке A (300). Обрезанный мессенджером хвост запятой снимается extract'ом.
+        text = "локация виллы https://www.google.com/maps?q=7.88,98.40, приезжайте пораньше"
+        r, _ = self._run(text, self.ZONES)
+        self.assertEqual(r["status"], "zone")
+        self.assertEqual(r["zone"], "ЗонаB")
+        self.assertEqual(r["price"], 500)
+        # порядок зон не влияет — побеждает близость, не позиция
+        r2, _ = self._run(text, list(reversed(self.ZONES)))
+        self.assertEqual(r2["zone"], "ЗонаB")
+        self.assertEqual(r2["price"], 500)
+
+    # 3) пояс +5 км → 1490 ----------------------------------------------------
+    def test_golden_out_belt_1490(self):
+        # ~2.8 км восточнее узкого якоря (r=1): вне радиуса, но внутри 1+OUT_BELT_KM(5) → 1490
+        text = "тут https://www.google.com/maps?q=7.88,98.415 спасибо"
+        r, _ = self._run(text, self.ZONES_NARROW)
+        self.assertEqual(r["status"], "out_belt")
+        self.assertEqual(r["price"], 1490)
+        self.assertEqual(r["price"], delivery.OUT_BELT_PRICE)
+        self.assertIsNone(r["marker"])
+
+    # 4) вне острова → [уточнить] ---------------------------------------------
+    def test_golden_off_island_uncertain(self):
+        # координата в Москве — далеко за поясом любой зоны Пхукета → честный отказ
+        text = "адрес https://www.google.com/maps?q=55.7558,37.6173 квартира 5"
+        r, _ = self._run(text, self.ZONES)
+        self.assertEqual(r["status"], "uncertain")
+        self.assertIsNone(r["price"])
+        self.assertEqual(r["marker"], "[уточнить]")
+
+    # 5) битая/обрезанная ссылка → [уточнить] ---------------------------------
+    def test_golden_truncated_link_uncertain(self):
+        # мессенджер обрезал ссылку ДО второй координаты: q=7.88 без пары. Ссылка распознана как
+        # maps (host+/maps), но координат нет → resolve_maps=None → [уточнить] (цену не выдумываем).
+        text = "вот https://www.google.com/maps?q=7.88"
+        r, z = self._run(text, self.ZONES)
+        self.assertEqual(r["status"], "uncertain")
+        self.assertEqual(r["marker"], "[уточнить]")
+        self.assertEqual(z, 0)          # зоны Bridge даже не запрашивались — координат ведь нет
+
+    def test_golden_broken_short_link_uncertain(self):
+        # обрезанная КОРОТКАЯ ссылка: разворот (замокан) отдал place-страницу без координат → [уточнить]
+        text = "локация https://maps.app.goo.gl/AbC"
+        final_no_coords = "https://www.google.com/maps/place/Some+Villa/"
+        r, _ = self._run(text, self.ZONES, resolve_maps=lambda u: delivery.resolve_maps_link(
+            u, _expand=lambda _u: final_no_coords))
+        self.assertEqual(r["status"], "uncertain")
+        self.assertEqual(r["marker"], "[уточнить]")
+
+    # 6) place-ссылка без координат → [уточнить] ------------------------------
+    def test_golden_place_link_without_coords_uncertain(self):
+        # полная place-ссылка без пары координат в URL → [уточнить] (не выдумываем зону/цену)
+        text = "приезжайте https://www.google.com/maps/place/Villa+Sunrise+Rawai/ спасибо"
+        r, _ = self._run(text, self.ZONES)
+        self.assertEqual(r["status"], "uncertain")
+        self.assertEqual(r["marker"], "[уточнить]")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
