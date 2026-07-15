@@ -1907,6 +1907,26 @@ def _client_price(q: dict) -> str:
     return "; ".join(parts)
 
 
+def _quote_j_line(q, phrase, passport_dep=False) -> str:
+    """Строка ЦЕНЫ для СЛУЖЕБНОГО quote-блока (fail-safe хвост) — ДОСЛОВНАЯ строка столбца J листа
+    (q["text"]: несёт «(Скидка за срок N%, … в день)» и депозит словами, как в Календаре) БЕЗ
+    пересборки. Дописку депозита/деривативы клиентского пути (_client_price) в хвост НЕ тащим: на
+    живом J-тексте депозит уже есть словами — реассемблированная фраза задвоила бы его. ИНВАРИАНТЫ
+    клиентской фразы, обязанные доехать в хвост, оставляют phrase (сборку клиентского пути):
+      • выбор паспорта как депозита (#22 шаг4: хвост без суммы) — passport_dep;
+      • кап низкого сезона (J-текст переопределён на «аренда от cap ฿/мес») — total > cap_price.
+    Нет J-текста (сборка из day/total/deposit) → phrase (прежний путь)."""
+    if passport_dep or not isinstance(q, dict):
+        return phrase
+    total, cap_price = q.get("total"), q.get("cap_price")
+    if q.get("cap_active") and cap_price is not None and total is not None and total > cap_price:
+        return phrase                          # кап-переопределение J-текста доезжает в хвост
+    txt = q.get("text")
+    if isinstance(txt, str) and txt.strip():
+        return txt.strip()                     # столбец J ДОСЛОВНО (со «Скидкой за срок»)
+    return phrase
+
+
 def _resolve_model_price(model, ds, de, hint_days, monthly, getter=None, name_filter=None):
     """Цена для ОДНОЙ модели по датам ds..de. Возвращает (kind, phrase, quote):
       ok    — цену использовать дословно (кап/J-текст/сборка внутри _client_price);
@@ -1947,9 +1967,11 @@ def _resolve_model_price(model, ds, de, hint_days, monthly, getter=None, name_fi
 
 def _wrap_single(kind: str, phrase: str) -> str:
     if kind == "ok":
-        return ("ЦЕНА из Календаря бронирования (использовать ДОСЛОВНО, не пересчитывать и не "
-                "округлять; это ЕДИНСТВЕННАЯ запрошенная модель — цены/депозиты ДРУГИХ моделей "
-                "в этом ответе НЕ приводи): " + phrase + ".")
+        return ("ЦЕНА из Календаря бронирования (использовать ДОСЛОВНО, не пересчитывать, не "
+                "округлять и НЕ переформатировать — приведи строку как есть и НЕ опускай её часть "
+                "про скидку за срок «(Скидка за срок N%, … в день)», если она в строке; это "
+                "ЕДИНСТВЕННАЯ запрошенная модель — цены/депозиты ДРУГИХ моделей в этом ответе НЕ "
+                "приводи): " + phrase + ".")
     return "ЦЕНА: " + phrase + "."
 
 
@@ -2644,9 +2666,11 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
         # пометкой «цена/депозит ЗА КАЖДЫЙ юнит» (итог за N шт. КОД НЕ суммирует — числа только из
         # Bridge). Процент — единой клиентской строки ЦЕНЫ нет (сумма вплетена в инструкцию), пропуск.
         if kind == "ok" and not pct:
-            # Год поколения из сырого имени юнита (J-текст Bridge) в quote-хвост не течёт: поколение
-            # несёт метка label (New Gen), год выпуска убираем — как в клиентском теле (см. _scrub_gen_year).
-            qphrase = _scrub_gen_year(phrase)
+            # В quote-хвост кладём ДОСЛОВНУЮ строку столбца J (со «Скидкой за срок N%») БЕЗ пересборки
+            # клиентского пути; паспорт/кап-инварианты доезжают через phrase (см. _quote_j_line).
+            # Год поколения из сырого имени юнита (J-текст Bridge) в хвост не течёт: поколение несёт
+            # метка label (New Gen), год выпуска убираем — как в клиентском теле (см. _scrub_gen_year).
+            qphrase = _scrub_gen_year(_quote_j_line(q, phrase, passport_dep))
             base = f"{label} — {qphrase}" if label else qphrase.rstrip(".")
             qline = (base + ". " + _units_per_each_line(_uc, lang)) if units else (base + ".")
             note += "\n" + _QUOTE_OPEN + "\n" + qline + "\n" + _QUOTE_CLOSE
@@ -2660,16 +2684,18 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
     bullets = []
     ok_lines = []
     for label, m, nf in products:
-        kind, phrase, _q = _resolve_model_price(m, ds, de, hint_days, monthly, getter=getter,
-                                                name_filter=nf)
+        kind, phrase, q = _resolve_model_price(m, ds, de, hint_days, monthly, getter=getter,
+                                               name_filter=nf)
         if passport_dep:
             phrase = _deposit_as_passport(phrase, lang)
         bullets.append(f"- {label}: {phrase}")
         if kind == "ok":                    # только строки с ЖИВОЙ ценой Bridge едут в quote-блок
-            ok_lines.append(f"- {label}: {_scrub_gen_year(phrase)}")   # год поколения в хвост не течёт
+            # тот же транспорт: ДОСЛОВНЫЙ столбец J (со «Скидкой за срок») без пересборки, год не течёт
+            ok_lines.append(f"- {label}: {_scrub_gen_year(_quote_j_line(q, phrase, passport_dep))}")
     header = ("ЦЕНЫ ПО МОДЕЛЯМ (клиент запросил несколько / модель с вариантами) — назови КАЖДУЮ "
-              "отдельной строкой в ОДНОМ сообщении, цену использовать ДОСЛОВНО, модели/варианты НЕ "
-              "смешивай и НЕ суммируй:\n")
+              "отдельной строкой в ОДНОМ сообщении, цену использовать ДОСЛОВНО (не переформатируй и "
+              "НЕ опускай часть про скидку за срок «(Скидка за срок N%, … в день)»), модели/варианты "
+              "НЕ смешивай и НЕ суммируй:\n")
     note = header + "\n".join(bullets) + dep + units
     # N ЮНИТОВ одной модели с вариантами (пара XMAX: два поколения) → живые цены поколений тоже
     # несём в служебный quote-блок для strategy-пути; цена/депозит ЗА КАЖДЫЙ юнит, итог за N шт.
