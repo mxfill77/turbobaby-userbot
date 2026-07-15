@@ -2420,6 +2420,107 @@ class TestLocalDec(Base):
         self.assertEqual(t["status"], "failed")
         self.assertIn("планировщик локальной декомпозиции не отработал", t["result"])
 
+    # --- ОБЯЗАТЕЛЬНЫЙ финальный смоук цепи домена suggest/delivery/moderation (родитель 92, шаг 4/6) ---
+
+    def test_domain_detector_matches_suggest_delivery_moderation(self):
+        self.assertTrue(o._chain_touches_suggest_domain(["поправь цену в suggest.py"]))
+        self.assertTrue(o._chain_touches_suggest_domain(["правка delivery: зона Раваи"]))
+        self.assertTrue(o._chain_touches_suggest_domain(["moderation_core: фикс правила"]))
+        self.assertTrue(o._chain_touches_suggest_domain(["почини модерацию алертов"]))
+        self.assertTrue(o._chain_touches_suggest_domain(["пересчёт доставки по зоне"]))
+        # не домен → False (смоук не навязываем цепям, которых он не касается)
+        self.assertFalse(o._chain_touches_suggest_domain(["рефактор pc_agent", "прогони тесты"]))
+        self.assertFalse(o._chain_touches_suggest_domain([]))
+        self.assertFalse(o._chain_touches_suggest_domain(None))
+
+    def test_append_smoke_step_added_last_for_domain_chain(self):
+        steps = o._append_smoke_step(["поправь цену в suggest.py", "прогони тесты"])
+        self.assertEqual(len(steps), 3)
+        self.assertTrue(o._is_smoke_step(steps[-1]))                     # смоук — ПОСЛЕДНИЙ шаг
+        self.assertIn("runLiveSmoke", steps[-1])
+        self.assertEqual(steps[:2], ["поправь цену в suggest.py", "прогони тесты"])  # ТЗ не тронуто
+
+    def test_append_smoke_step_skipped_for_unrelated_chain(self):
+        steps = ["рефактор pc_agent.py", "обнови README"]
+        self.assertEqual(o._append_smoke_step(steps), steps)            # не домен → без смоука
+        self.assertIsNot(o._append_smoke_step(steps), steps)           # исходный список не мутируем
+
+    def test_append_smoke_step_idempotent_no_double(self):
+        once = o._append_smoke_step(["фикс delivery зон"])
+        twice = o._append_smoke_step(once)
+        self.assertEqual(once, twice)                                   # повтор не дублирует смоук
+        self.assertEqual(sum(o._is_smoke_step(s) for s in twice), 1)
+
+    def test_planner_auto_adds_smoke_step_for_domain_plan(self):
+        # ЯДРО (родитель 92): план, трогающий suggest → авто-финальный смоук в result родителя
+        tid = self._add_parent(text="почини прайс в suggest")
+        with mock.patch.object(o, "_thinker_exec",
+                               lambda p, t, tag: "1. поправь suggest.py\n2. прогони тесты"):
+            o.process_new()
+        t = self.fb.tasks[tid]
+        self.assertEqual(t["status"], "done")
+        self.assertIn("3 шагов", t["result"])                          # 2 шага ТЗ + обязательный смоук
+        self.assertIn("3. " + o.SMOKE_STEP_MARK, t["result"])          # смоук — последним номером
+
+    def test_planner_no_smoke_for_unrelated_plan(self):
+        tid = self._add_parent(text="рефактор pc_agent")
+        with mock.patch.object(o, "_thinker_exec",
+                               lambda p, t, tag: "1. правка pc_agent.py\n2. прогони тесты"):
+            o.process_new()
+        t = self.fb.tasks[tid]
+        self.assertEqual(t["status"], "done")
+        self.assertNotIn(o.SMOKE_STEP_MARK, t["result"])
+        self.assertIn("2 шагов", t["result"])
+
+    def test_smoke_exempt_from_max_steps_cap(self):
+        # план ровно MAX_STEPS шагов ТЗ (домен) + смоук = MAX_STEPS+1, но по потолку НЕ валится
+        out = "\n".join(f"{i}. правка suggest часть {i}" for i in range(1, o.MAX_STEPS + 1))
+        tid = self._add_parent()
+        with mock.patch.object(o, "_thinker_exec", lambda p, t, tag: out):
+            o.process_new()
+        t = self.fb.tasks[tid]
+        self.assertEqual(t["status"], "done")                          # смоук сверх потолка — не failed
+        self.assertIn(f"{o.MAX_STEPS + 1} шагов", t["result"])
+        self.assertIn(o.SMOKE_STEP_MARK, t["result"])
+
+    # --- прямое исполнение смоук-шага: провал смоука → шаг failed (родитель 92) ---
+
+    def test_exec_smoke_step_failed_marks_failed(self):
+        r = {"status": "failed", "card": "ОЖИДАНИЕ: доставка 590\nФАКТ: доставка 0"}
+        status, res = o._exec_smoke_step(smoke_fn=lambda: r)
+        self.assertEqual(status, "failed")
+        self.assertIn("ПРОВАЛЕН", res)
+        self.assertIn("ОЖИДАНИЕ: доставка 590", res)                    # карточка ОЖИДАНИЕ/ФАКТ в result
+
+    def test_exec_smoke_step_passed_and_skipped_are_done(self):
+        for st in ("passed", "skipped"):
+            status, res = o._exec_smoke_step(smoke_fn=lambda st=st: {"status": st})
+            self.assertEqual(status, "done", st)
+            self.assertIn(st, res)
+
+    def test_exec_smoke_step_crash_is_failed(self):
+        def boom():
+            raise RuntimeError("контур молчит")
+        status, res = o._exec_smoke_step(smoke_fn=boom)
+        self.assertEqual(status, "failed")                             # недостоверный прогон → failed
+        self.assertIn("RuntimeError", res)
+
+    def test_exec_smoke_step_unknown_status_is_failed(self):
+        status, _ = o._exec_smoke_step(smoke_fn=lambda: {"status": "weird"})
+        self.assertEqual(status, "failed")                             # неизвестный статус → провал
+
+    def test_process_new_routes_smoke_step_direct_not_headless(self):
+        # смоук-шаг в очереди → демон исполняет САМ (без headless run_task); провал → шаг failed
+        tid = self.fb.add(task_text=f"[шаг 3/3 родитель 92] {o.SMOKE_STEP_TEXT}")
+        self.fb.tasks[tid]["from"] = o.PC_LOCAL_DEC_FROM
+        boom = mock.Mock(side_effect=AssertionError("headless run_task для смоука не зовём"))
+        with mock.patch.object(o, "run_task", boom), \
+             mock.patch.object(o, "_run_live_smoke", lambda: {"status": "failed", "card": "дифф"}):
+            o.process_new()
+        boom.assert_not_called()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertIn("ПРОВАЛЕН", self.fb.tasks[tid]["result"])
+
     # --- маршрутизация process_new ---
 
     def test_process_new_routes_parent_to_planner_not_run_task(self):

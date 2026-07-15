@@ -963,6 +963,13 @@ def process_new():
         _cowork(f"задача #{tid} (рычаг {cmd}) → {status} · {_clip(result)}")
         _notify_task(status, tid, result)
         return
+    if _is_smoke_step(text):        # обязательный финальный смоук цепи — исполняем САМИ, без headless
+        status, result = _exec_smoke_step()
+        bc.complete_task(tid, status, result)
+        log.info("SMOKE id=%s → %s", tid, status)
+        _cowork(f"смоук-шаг #{tid} → {status} · {_clip(result)}")
+        _notify_task(status, tid, result)
+        return
     # Задача-урок (родитель 292, шаг 3): классифицируем замечание и маршрутизируем (СТИЛЬ/ФАКТ/
     # НАДЗОР/неясное). ПЕРЕХВАТ ДО local-dec-планировщика: урок enqueue'ится from=Filipp-pcloc-dec,
     # но это НЕ ТЗ на декомпозицию — свой обработчик (иначе _is_local_dec_parent отдал бы его планировщику).
@@ -1675,6 +1682,83 @@ def _dec_red_note(steps):
             + " — исполнитель шага спросит «да» кнопкой, сам не исполнит.\n")
 
 
+# ---- ОБЯЗАТЕЛЬНЫЙ ФИНАЛЬНЫЙ СМОУК ЦЕПИ (родитель 92, шаг 4/6) ----------------
+# Любая цепь, ТРОГАЮЩАЯ suggest/delivery/moderation, ОБЯЗАНА завершаться сквозным e2e-смоуком
+# suggest.runLiveSmoke (уже в репо): авто-дописываем его ПОСЛЕДНИМ шагом плана — после шага(ов)
+# применения (правки кода/деплой идут раньше, проверка последней — контракт PLANNER_PREAMBLE).
+# Смоук исполняет САМ демон НАПРЯМУЮ (как команду-рычаг), без headless — детерминированный вердикт:
+# runLiveSmoke status='failed' → шаг цепи failed (регрессия транспорта QUOTE/DELIVERY встаёт цепью
+# штатным гейтом _loc_after_fail), passed/skipped → done. Без SUGGEST_TEST_MODE смоук skipped
+# (живого клиента не касается) → шаг done. Смоук — сверх потолка MAX_STEPS (обязателен, не «шаг ТЗ»).
+_SMOKE_DOMAIN_RE = re.compile(
+    r"suggest|delivery|moderation|модерац|доставк|прайс|\bquote\b|черновик|зон[аеуой]",
+    re.IGNORECASE)
+SMOKE_STEP_MARK = "🔬 обязательный смоук-шаг"        # якорь авто-добавленного финального шага цепи
+_SMOKE_STEP_RE = re.compile(re.escape(SMOKE_STEP_MARK))
+SMOKE_STEP_TEXT = (
+    SMOKE_STEP_MARK + " цепи (родитель 92, авто-добавлен): прогони СКВОЗНОЙ e2e-смоук живого "
+    "контура suggest — демон исполнит его САМ через suggest.runLiveSmoke под SUGGEST_TEST_MODE, "
+    "headless тут не нужен. Провал смоука (транспорт QUOTE/DELIVERY донёс не то: строка столбца J "
+    "не дословно / цена зоны не та / год утёк / ложное «уточним») помечает ЭТОТ шаг failed и "
+    "останавливает цепь; passed/skipped (TEST_MODE off) → done.")
+
+
+def _chain_touches_suggest_domain(steps):
+    """Цепь трогает suggest/delivery/moderation? True, если ЛЮБОЙ шаг плана поминает домен (имена
+    модулей suggest/delivery/moderation или их RU-синонимы: доставка/модерация/прайс/зона/…). → bool."""
+    return any(_SMOKE_DOMAIN_RE.search(str(s or "")) for s in (steps or []))
+
+
+def _append_smoke_step(steps):
+    """Дописать ОБЯЗАТЕЛЬНЫЙ финальный смоук-шаг, если цепь трогает домен и его ещё нет
+    (идемпотентно: авто-добавление поверх уже добавленного / вписанного планировщиком смоука не
+    дублируем). Смоук всегда ПОСЛЕДНИЙ. → новый список (исходный не мутируем)."""
+    steps = list(steps or [])
+    if not _chain_touches_suggest_domain(steps):
+        return steps
+    if any(_SMOKE_STEP_RE.search(str(s or "")) for s in steps):
+        return steps
+    return steps + [SMOKE_STEP_TEXT]
+
+
+def _is_smoke_step(text):
+    """Текст задачи — авто-добавленный обязательный смоук-шаг цепи (по якорю)? Работает и с
+    префиксом «[шаг i/N родитель id] …» (search, не match). → bool."""
+    return bool(_SMOKE_STEP_RE.search(str(text or "")))
+
+
+def _run_live_smoke():
+    """Прогнать suggest.runLiveSmoke живого контура (ленивый импорт suggest — тяжёлый модуль;
+    вне TEST_MODE смоук сам вернёт skipped, живого клиента не касаясь). → dict-результат смоука."""
+    import asyncio
+    import suggest
+    return asyncio.run(suggest.runLiveSmoke())
+
+
+def _exec_smoke_step(smoke_fn=None):
+    """Исполнить смоук-шаг цепи НАПРЯМУЮ (без headless), детерминированный вердикт → (status, result):
+    runLiveSmoke status='failed' → ('failed', карточка ОЖИДАНИЕ/ФАКТ) — шаг встаёт failed, цепь
+    halt'ится штатным гейтом; passed/skipped → ('done', итог). Любой СБОЙ самого прогона → failed
+    (недостоверный смоук = регрессия не исключена → цепь не пускаем дальше). smoke_fn — для тестов."""
+    fn = smoke_fn or _run_live_smoke
+    try:
+        r = fn() or {}
+    except Exception as e:
+        return "failed", (f"{SMOKE_STEP_MARK}: смоук НЕ отработал — {type(e).__name__}: {e} "
+                          "(недостоверный прогон → шаг failed, цепь остановлена)")[:RESULT_MAX]
+    status = str(r.get("status") or "")
+    if status == "failed":
+        body = (str(r.get("card") or "").strip() or str(r.get("reason") or "").strip()
+                or "провал без карточки")
+        return "failed", (f"{SMOKE_STEP_MARK}: смоук ПРОВАЛЕН — цепь остановлена.\n{body}")[:RESULT_MAX]
+    if status in ("passed", "skipped"):
+        tail = ("SUGGEST_TEST_MODE off — смоук пропущен (живого клиента не касались)"
+                if status == "skipped" else "инварианты транспорта QUOTE/DELIVERY на месте")
+        return "done", f"{SMOKE_STEP_MARK}: смоук {status} — {tail}."[:RESULT_MAX]
+    return "failed", (f"{SMOKE_STEP_MARK}: смоук вернул неизвестный статус {status!r} → "
+                      "трактую как провал (шаг failed)")[:RESULT_MAX]
+
+
 def _local_dec_plan(tid, text):
     """Построить план декомпозиции для родителя Filipp-pcloc-dec ЛОКАЛЬНО (кондуктор
     THINKER_MODEL/фолбэк, чистый генератор) и закрыть родителя: done с планом в result
@@ -1712,6 +1796,10 @@ def _local_dec_plan(tid, text):
         _cowork(f"родитель #{tid} (pcloc-dec) → failed · {_clip(msg)}")
         _notify_task("failed", tid, msg)
         return
+    # ОБЯЗАТЕЛЬНЫЙ финальный смоук (родитель 92): цепь домена suggest/delivery/moderation ДОЛЖНА
+    # заканчиваться сквозным e2e-смоуком. Дописываем СВЕРХ потолка (проверка MAX_STEPS выше — на
+    # шагах ТЗ; смоук обязателен, не «шаг плана»). Идемпотентно: уже вписанный смоук не дублируем.
+    steps = _append_smoke_step(steps)
     plan_txt = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
     # РЕЛИЗ ШАГА 1 — ДО закрытия родителя (crash-окно спеки: шаг не встал → родитель остаётся
     # in_progress, зависание честно добьёт ПК-ливнесс process_stuck_singles; done-родитель
