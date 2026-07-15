@@ -3216,6 +3216,52 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         return suggest.build_pricing_note(self._hints(**extra), lang="ru", getter=self._getter(),
                                           today=datetime.date(2026, 7, 11))
 
+    # Живой формат СТОЛБЦА J Календаря: строка ЦЕНЫ со «скидкой за срок N%» в скобках + депозит
+    # словами (депозит уже в строке — реассемблировать нечего). Правило-класс CLAUDE.md: мок
+    # внешнего источника КОПИРУЕТ живой формат прода (текст J дословно), а не идеализированную схему.
+    J_LINE = "2400 ฿ за 5 дней (Скидка за срок 15%, 480 ฿ в день); депозит 3000 ฿"
+
+    def _getter_j(self):
+        # Тот же одиночный NMAX, но Bridge отдаёт ГОТОВУЮ строку столбца J (со «Скидкой за срок N%»)
+        # в поле text — как живой Календарь; депозит уже словами в тексте (дописки не будет).
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET]}}
+            if suggest._bike_key("NMAX 155") not in suggest._bike_key(params.get("bike", "")):
+                return {"ok": False}
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            return {"ok": True, "data": {"day_price": 480, "total": 2400, "deposit": 3000,
+                    "available": True, "days": days, "cap_active": False, "cap_price": 0,
+                    "text": self.J_LINE}}
+        return fake
+
+    def _note_j(self, **extra):
+        return suggest.build_pricing_note(self._hints(**extra), lang="ru", getter=self._getter_j(),
+                                          today=datetime.date(2026, 7, 11))
+
+    def test_golden_quote_block_carries_column_j_verbatim(self):
+        # ГОЛДЕН #92 шаг 2/6: лист с ценой И скидкой за срок → строка столбца J едет в служебный
+        # quote-блок ПОСИМВОЛЬНО, включая процент «(Скидка за срок 15%, … в день)». Код не
+        # переформатирует и не опускает скидку (транспорт шага 1/6 #92, коммит 1db63e7).
+        block = suggest._quote_block_from_note(self._note_j())
+        self.assertIsNotNone(block)                          # блок собран
+        self.assertIn(self.J_LINE, block)                    # строка J посимвольно (со скидкой за срок)
+        self.assertIn("(Скидка за срок 15%, 480 ฿ в день)", block)   # процент срока цел дословно
+
+    def test_golden_draft_carries_column_j_verbatim(self):
+        # ГОЛДЕН #92 шаг 2/6: тот же J-текст доходит до ЧЕРНОВИКА клиента дословно — LLM цену/скидку
+        # потерял, но строка столбца J пришла КОДОМ (compose/regenerate, fail-safe), не переформатирована.
+        note = self._note_j()
+        def drop_price(system, user):
+            return "Готов помочь с NMAX — уточню детали и вернусь."   # LLM цену/скидку потерял
+        out = suggest.regenerate_draft("[клиент]: nmax на 5 дней с 15 июля, сколько?", "ru", "FAQ",
+                                       False, note, "дожимай на бронь", call_llm=drop_price)
+        client = suggest.client_facing_text(out)
+        self.assertIn(self.J_LINE, client)                   # строка столбца J дословно у клиента
+        self.assertIn("Скидка за срок 15%", client)          # процент срока не потерян и не переформатирован
+        self.assertNotIn("<<<QUOTE>>>", out)                 # сырые служебные скобки не утекли клиенту
+
     def test_build_note_carries_quote_block(self):
         # Чистый точечный quote «ok» → в pricing_note детерминированная строка ЦЕНЫ в служебных скобках.
         note = self._note()
