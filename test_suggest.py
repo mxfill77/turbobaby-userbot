@@ -325,6 +325,15 @@ class TestPureLogic(unittest.TestCase):
         clean = "Здравствуйте! XSR 155 — 1685 THB/сутки. Свободен на ваши даты."
         self.assertEqual(suggest.stripInternalMarkers(clean), clean)
 
+    def test_strip_internal_markers_golden_529849022(self):
+        # ГОЛДЕН живого окна 529849022 (шаг 4/5 родитель #55): черновик — ОДНА строка,
+        # где сразу ДВА внутренних маркера («менеджер ещё не назвал» + «Этап 1»). Клиент
+        # такого видеть не должен: строка со следом стадии сделки режется ЦЕЛИКОМ, и, так как
+        # весь черновик — эта строка, наружу не уходит НИЧЕГО (пустой результат). Фраза дословная.
+        draft = ("Клиент готов бронировать по датам 7 июля на неделю, "
+                 "менеджер ещё не назвал цену — сейчас Этап 1.")
+        self.assertEqual(suggest.stripInternalMarkers(draft), "")
+
     def test_parse_approval(self):
         self.assertEqual(suggest.parse_approval("+"), ("approve", None))
         self.assertEqual(suggest.parse_approval("да"), ("approve", None))
