@@ -1767,6 +1767,53 @@ class TestPlaybookAppend(unittest.TestCase):
         self.assertIn("шлем в подарок", sysp)
         self.assertIn("КНИГА ПРАВИЛ", sysp)
 
+    def test_rule_limit_fifo_evicts_oldest(self):
+        # лимит числа правил: при переполнении новое ВЫТЕСНЯЕТ самые ранние (FIFO), кап держится.
+        save = suggest.PLAYBOOK_MAX_RULES
+        suggest.PLAYBOOK_MAX_RULES = 3
+        try:
+            # секция уже несёт 1 seed-правило («реального парка»); добьём сверх капа пятью РАЗНЫМИ.
+            for r in ("всегда предлагай шлем подарком при недельной аренде",
+                      "уточняй район доставки до финального расчёта цены",
+                      "не употребляй канцелярит в приветствии клиента",
+                      "предлагай длительный прокат со скидкой сразу",
+                      "напоминай про залог только после выбора модели"):
+                self.assertEqual(suggest.append_playbook_rule(r), "added")
+            rules = suggest._playbook_learned_rules(self._read())
+            self.assertEqual(len(rules), 3)                       # кап соблюдён
+            joined = " || ".join(rules).lower()
+            self.assertIn("залог только после выбора", joined)    # новейшее осталось
+            self.assertNotIn("реального парка", joined)           # самое старое (seed) вытеснено
+            self.assertNotIn("шлем подарком", joined)             # ранние вытеснены
+            self.assertNotIn("район доставки до финального", joined)
+        finally:
+            suggest.PLAYBOOK_MAX_RULES = save
+
+    def test_written_rule_reaches_both_generation_paths(self):
+        # шаг 2/8: записанное правило попадает в промпт СЛЕДУЮЩЕЙ генерации в ОБОИХ путях —
+        # первичка (generate_draft) и strategy-перегенерация (regenerate_draft). «Следующая генерация»
+        # читает книгу заново через load_playbook — ровно как боевые вызовы (suggest.py / moderation_core).
+        self.assertEqual(suggest.append_playbook_rule("Всегда уточняй район доставки перед расчётом"), "added")
+        pb = suggest.load_playbook()
+        self.assertIn("район доставки перед расчётом", pb)
+
+        cap = {}
+        def capture(system, user):
+            cap["s"] = system
+            return "ok"
+
+        # путь 1 — первичка
+        suggest.generate_draft("[клиент]: привет", "ru", "FAQ", call_llm=capture, playbook=pb)
+        self.assertIn("КНИГА ПРАВИЛ", cap["s"])
+        self.assertIn("район доставки перед расчётом", cap["s"])
+
+        # путь 2 — strategy-перегенерация (директива поверх исходного контекста)
+        cap.clear()
+        suggest.regenerate_draft("[клиент]: привет", "ru", "FAQ", False, "", "сделай теплее",
+                                 call_llm=capture, playbook=pb)
+        self.assertIn("КНИГА ПРАВИЛ", cap["s"])
+        self.assertIn("район доставки перед расчётом", cap["s"])
+
 
 class TestSalesPressureAndSafety(unittest.TestCase):
     """Хвост 2 — рычаг SALES_PRESSURE НАД базой; Хвост 1 — жёсткое правило опыт/безопасность."""

@@ -565,6 +565,12 @@ def resolve_park_model(canon, getter=None):
 # правок модератора. Bridge не трогаем — источник локальный.
 PLAYBOOK_FILE = os.path.join(BASE_DIR, "manager-bot", "docs", "playbook.md")
 
+# Лимит числа ВЫУЧЕННЫХ правил в книге. Playbook подмешивается в КАЖДЫЙ промпт (и в первичке, и в
+# strategy-пути), поэтому не должен расти безгранично — раздутая книга и раздувает промпт, и топит
+# свежий урок в старых. При достижении капа новое правило ВЫТЕСНЯЕТ самые ранние (FIFO): последний
+# урок учителя важнее давнего. Переопределяется env PLAYBOOK_MAX_RULES; ≤0 → без лимита (fail-open).
+PLAYBOOK_MAX_RULES = int(os.getenv("PLAYBOOK_MAX_RULES", "100") or "100")
+
 
 def load_playbook():
     """Текст книги правил из PLAYBOOK_FILE. Нет файла/пусто/ошибка чтения → '' (FAIL-SAFE:
@@ -634,6 +640,18 @@ def append_playbook_rule(rule, now=None):
     else:
         end = next((j for j in range(start + 1, len(lines)) if lines[j].strip().startswith("## ")),
                    len(lines))
+        # FIFO-вытеснение по лимиту: книга подмешивается в каждый промпт → держим не более
+        # PLAYBOOK_MAX_RULES выученных правил. Освобождаем место под новое, удаляя самые РАННИЕ bullets
+        # секции (свежий урок важнее давнего); индексы после удаления сдвигаются — границы пересчитываем.
+        if PLAYBOOK_MAX_RULES > 0:
+            bullets = [j for j in range(start + 1, end) if lines[j].strip().startswith("-")]
+            if len(bullets) >= PLAYBOOK_MAX_RULES:
+                drop = set(bullets[:len(bullets) - PLAYBOOK_MAX_RULES + 1])   # оставить место под новое
+                lines = [ln for i, ln in enumerate(lines) if i not in drop]
+                start = next((i for i, ln in enumerate(lines)
+                              if ln.strip().lower().startswith(_LEARNED_HEADER.lower())), start)
+                end = next((j for j in range(start + 1, len(lines)) if lines[j].strip().startswith("## ")),
+                           len(lines))
         while end - 1 > start and not lines[end - 1].strip():   # вставляем после последнего правила
             end -= 1
         lines.insert(end, bullet)
