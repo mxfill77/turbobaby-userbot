@@ -758,6 +758,87 @@ def replace_playbook_rule(old_rule, new_rule, now=None):
     return "replaced" if removed else "added"
 
 
+# --- показ/удаление выученного правила (родитель 112, шаг 5/8) ---------------
+# /rules показывает выученные правила С НОМЕРАМИ, удаление — репликой по номеру ИЛИ тексту. Нумерация
+# и селектор-номер ОБЯЗАНЫ совпадать: обе берут правила в ПОРЯДКЕ ФАЙЛА (старые→новые, ровно как
+# кладёт append). Текстовый селектор матчим тем же _rules_similar, что дедуп/замена — единый матчинг.
+def list_playbook_rules(text=None):
+    """Выученные правила книги как список dict {'n','date','rule'} в порядке файла (n — 1-based,
+    совпадает и с показом /rules, и с номером-селектором remove_playbook_rule). text=None → боевой
+    playbook (load_playbook); в тестах передаётся явно. FAIL-SAFE: пусто/битьё → []."""
+    text = load_playbook() if text is None else text
+    out, inside, n = [], False, 0
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if s.startswith("## "):
+            inside = s.lower().startswith(_LEARNED_HEADER.lower())
+            continue
+        if inside and s.startswith("-"):
+            raw = s.lstrip("-").strip()
+            m = re.match(r"^\((\d{4}-\d{2}-\d{2})\)\s*(.*)$", raw)
+            date = m.group(1) if m else ""
+            rule = (m.group(2).strip() if m else raw)
+            if rule:
+                n += 1
+                out.append({"n": n, "date": date, "rule": rule})
+    return out
+
+
+def remove_playbook_rule(selector):
+    """Удалить ОДНО выученное правило из playbook.md по СЕЛЕКТОРУ — номеру (1-based, как в /rules)
+    ЛИБО тексту (нечёткое совпадение _rules_similar, тот же матчинг, что дедуп/замена). Пишем только
+    строку правила из секции «Выученные правила», прочее (стиль/факты) не трогаем. → dict:
+      {'status':'removed','n':i,'rule':body,'remaining':k} — правило убрано;
+      {'status':'not_found'}   — номер вне диапазона / текст ни с чем не сходится;
+      {'status':'ambiguous','matches':[{'n','rule'},…]} — текст сходится с >1 правилом (не гадаем);
+      {'status':'empty'}       — выученных правил в книге нет;
+      {'status':'error'}       — файл недоступен/ошибка записи (FAIL-SAFE).
+    Дедуп/лимит — забота append_playbook_rule; здесь точечное удаление по одному правилу."""
+    try:
+        with open(PLAYBOOK_FILE, encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        return {"status": "error"}
+    lines = text.splitlines()
+    start = next((i for i, ln in enumerate(lines)
+                  if ln.strip().lower().startswith(_LEARNED_HEADER.lower())), None)
+    bullets = []                                   # (line_index, body) в порядке файла = нумерация /rules
+    if start is not None:
+        end = next((j for j in range(start + 1, len(lines)) if lines[j].strip().startswith("## ")),
+                   len(lines))
+        for j in range(start + 1, end):
+            s = lines[j].strip()
+            if s.startswith("-"):
+                body = re.sub(r"^\(\d{4}-\d{2}-\d{2}\)\s*", "", s.lstrip("-").strip())
+                if body:
+                    bullets.append((j, body))
+    if not bullets:
+        return {"status": "empty"}
+    sel = " ".join(str(selector or "").split()).strip()
+    if re.fullmatch(r"\d+", sel):                  # селектор-номер (1-based)
+        n = int(sel)
+        if not (1 <= n <= len(bullets)):
+            return {"status": "not_found"}
+        idx = n - 1
+    else:                                          # селектор-текст → нечёткое совпадение
+        hits = [k for k, (_, body) in enumerate(bullets) if _rules_similar(sel, body)]
+        if not hits:
+            return {"status": "not_found"}
+        if len(hits) > 1:                          # несколько похожих — не гадаем, просим номер
+            return {"status": "ambiguous",
+                    "matches": [{"n": k + 1, "rule": bullets[k][1]} for k in hits]}
+        idx = hits[0]
+    j_del, body_del = bullets[idx]
+    keep = [ln for i, ln in enumerate(lines) if i != j_del]
+    new_text = "\n".join(keep) + ("\n" if text.endswith("\n") else "")
+    try:
+        with open(PLAYBOOK_FILE, "w", encoding="utf-8") as f:
+            f.write(new_text)
+    except Exception:
+        return {"status": "error"}
+    return {"status": "removed", "n": idx + 1, "rule": body_del, "remaining": len(bullets) - 1}
+
+
 # ------------------------------- рантайм-стоп --------------------------------
 
 _disabled = False  # флип при флуде — авто-стоп до перезапуска/сброса

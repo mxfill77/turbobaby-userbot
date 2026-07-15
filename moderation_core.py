@@ -22,6 +22,7 @@ SAFETY: сами функции клиенту ничего не шлют. В TE
 """
 
 import json
+import re
 
 import suggest  # переиспользуем is_approver / parse_approval / модель / ключ
 
@@ -356,6 +357,99 @@ def submit_lesson(draft, reply_text, username, enqueue=None):
 def _clip_err(err, n=120):
     s = str(err or "ошибка")
     return s if len(s) <= n else s[:n - 1] + "…"
+
+
+# ------------------------- /rules: показ и удаление выученных правил (родитель 112, шаг 5/8) ----
+# Учитель управляет КНИГОЙ ПРАВИЛ прямо из модер-группы: `/rules` показывает выученные правила С
+# НОМЕРАМИ, удаление — РЕПЛАЕМ на эту карточку по номеру ИЛИ тексту («удали 3» / «удали <текст>» /
+# голый «3»). Итог удаления — ПОДТВЕРЖДЕНИЕ ответным сообщением (что убрано и сколько осталось), а
+# не молчаливая правка. Права строже approve — книгой правит только INTAKE_APPROVERS (как уроками).
+# Дедуп/лимит книги живут в хранилище (suggest.append_playbook_rule), удаление — точечное по одному.
+# Функции чистые (без Telegram): показ/удаление инъектируемы, юнит гоняет их без файла/бота.
+RULES_SHOW_TRIGGERS = ("/rules", "правила")
+RULES_DELETE_VERBS = ("удали", "удалить", "убери", "убрать", "удаление", "delete", "del", "rm")
+_RULES_NUM_RE = re.compile(r"^[#№]?\s*\d+$")
+_RULES_WORD_RE = re.compile(r"^(правило|правила|правил|rule)\s*[№#]?\s*", re.IGNORECASE)
+
+
+def is_rules_command(text):
+    """True, если реплика — команда показа книги правил (`/rules`, регистр/пробелы терпимы; голое
+    слово «правила» тоже считаем командой). Аргументы после /rules игнорируем."""
+    t = (text or "").strip().lower()
+    return t == "правила" or t == "/rules" or t.startswith("/rules ") or t.startswith("/rules@")
+
+
+def render_rules_card(username, list_rules=None):
+    """Карточка `/rules`: выученные правила книги С НОМЕРАМИ (номер = селектор для удаления). Права
+    строже approve — смотреть/править книгу могут только INTAKE_APPROVERS. list_rules инъектируем
+    (юнит без файла; прод — suggest.list_playbook_rules). → текст карточки."""
+    if not suggest.is_intake_approver(username):
+        return "🙅 Смотреть и править книгу правил могут только Филипп, Даня и Даша."
+    rules = (list_rules or suggest.list_playbook_rules)()
+    if not rules:
+        return "📖 Книга правил пуста — выученных правил пока нет."
+    out = ["📖 Выученные правила (удалить — реплаем «удали N» или «удали <текст>»):"]
+    for r in rules:
+        date = f" ({r['date']})" if r.get("date") else ""
+        out.append(f"{r['n']}.{date} {r['rule']}")
+    return "\n".join(out)
+
+
+def parse_rules_delete(reply_text):
+    """Селектор удаления из реплая на карточку `/rules`: номер ИЛИ текст правила. Формы: «удали 3» /
+    «удалить правило 3» / «убери <текст>» / «delete 3» / голый «3». Ведущий глагол и слово «правило»
+    отбрасываем. Голый ТЕКСТ без глагола НЕ считаем удалением (не роняем случайный реплай в удаление)
+    — только голый номер однозначен. → строка-селектор ЛИБО None (реплай не про удаление)."""
+    t = " ".join((reply_text or "").split()).strip()
+    if not t:
+        return None
+    low = t.lower()
+    verb = next((v for v in RULES_DELETE_VERBS if low == v or low.startswith(v + " ")), None)
+    if verb is not None:
+        rest = _RULES_WORD_RE.sub("", t[len(verb):].strip()).strip()
+        return rest or None
+    if _RULES_NUM_RE.match(t):                       # голый номер на карточке-списке — однозначно удаление
+        return t.lstrip("#№ ").strip()
+    return None
+
+
+def process_rules_delete(reply_text, username, remove=None):
+    """Удаление правила из книги реплаем на карточку `/rules` — по номеру или тексту, С ПОДТВЕРЖДЕНИЕМ
+    ответным сообщением (карточка-итог: что убрано и сколько осталось). Права строже approve (только
+    INTAKE_APPROVERS). remove инъектируем (юнит без файла; прод — suggest.remove_playbook_rule).
+    → decision-dict (без I/O):
+      not_rules — реплай не про удаление правила (обычный reply-путь обрабатывает дальше);
+      denied    — селектор есть, но username не в INTAKE_APPROVERS → вежливый отказ;
+      removed/not_found/ambiguous/empty/error — итог удаления + карточка-подтверждение."""
+    selector = parse_rules_delete(reply_text)
+    if selector is None:
+        return {"decision": "not_rules"}
+    if not suggest.is_intake_approver(username):
+        return {"decision": "denied",
+                "card": "🙅 Править книгу правил могут только Филипп, Даня и Даша."}
+    remove = remove or suggest.remove_playbook_rule
+    try:
+        res = remove(selector)
+    except Exception as e:                           # noqa: BLE001 — сбой хранилища не роняет бот
+        return {"decision": "error",
+                "card": f"⚠️ Не удалось удалить правило ({_clip_err(e)}) — попробуйте позже."}
+    st = (res or {}).get("status")
+    if st == "removed":
+        return {"decision": "removed", "n": res.get("n"), "rule": res.get("rule"),
+                "card": f"🗑 Удалил правило #{res.get('n')}: «{res.get('rule')}». "
+                        f"Осталось правил: {res.get('remaining')}."}
+    if st == "ambiguous":
+        opts = "; ".join(f"#{m['n']} «{m['rule']}»" for m in res.get("matches", []))
+        return {"decision": "ambiguous",
+                "card": f"🤔 Под «{selector}» подходит несколько правил: {opts}. "
+                        f"Уточни номером — удалю одно."}
+    if st == "empty":
+        return {"decision": "empty", "card": "📖 Книга правил пуста — удалять нечего."}
+    if st == "not_found":
+        return {"decision": "not_found",
+                "card": f"❓ Не нашёл правила «{selector}» в книге. Пришли /rules и удаляй по номеру."}
+    return {"decision": "error",
+            "card": "⚠️ Не удалось удалить правило (книга недоступна) — попробуйте позже."}
 
 
 # ------------------------- захват правки в playbook (Фаза 2) ------------------
