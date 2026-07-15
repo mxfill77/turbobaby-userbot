@@ -2575,6 +2575,27 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
             self.assertIn("ЗА КАЖДЫЙ", block, phrase)            # цена/депозит за каждый юнит
             self.assertNotIn("1878", block, phrase)              # итог за 2 шт. не выдуман и в блоке
 
+    def test_pointwise_quote_tail_scrubs_gen_year(self):
+        # ГОЛДЕН (родитель 22, шаг 3/7): J-текст Bridge несёт СЫРОЕ имя юнита с годом поколения
+        # («XMAX 300CC NEW 2023 PHUKET 7701»); в quote-хвост черновика год НЕ течёт — поколение несёт
+        # МЕТКА New Gen (как в клиентском теле), а год выпуска убран. Реальные фразы клиента + парафразы.
+        for phrase in ("сколько стоит xmax 16-24 июля",
+                       "xmax с 16 по 24 июля почём?",
+                       "цена на xmax 16-24 июля",
+                       "аренда xmax 16-24.07 сколько",
+                       "почём xmax на 16-24 июля?"):
+            hints = suggest.extract_booking_hints(f"[клиент]: {phrase}",
+                                                  today=datetime.date(2026, 7, 11))
+            self.assertFalse(hints["old_gen_q"], phrase)          # прежнее поколение НЕ запрошено
+            note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter(),
+                                              today=datetime.date(2026, 7, 11))
+            block = suggest._quote_block_from_note(note)
+            self.assertIsNotNone(block, phrase)                   # quote-блок собран
+            self.assertIn("New Gen", block, phrase)               # поколение несёт метка (New Gen)
+            self.assertIn("939", block, phrase)                   # живая цена Bridge цела
+            for yr in ("2020", "2021", "2022", "2023", "2024"):   # ГОД поколения в хвост НЕ утёк
+                self.assertNotIn(yr, block, f"{phrase}: год {yr} утёк в quote-хвост:\n{block}")
+
     def test_pointwise_pair_xmax_explicit_old_gen_both(self):
         # Пара XMAX + ЯВНЫЙ запрос про прежнее поколение → ОБА поколения раздельными строками, цена/
         # депозит «за каждый», итог за 2 шт. не выдуман. Года по явной просьбе клиента допустимы.

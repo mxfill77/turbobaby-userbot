@@ -1171,6 +1171,26 @@ def _xmax_is_new_gen(unit_name) -> bool:
     return bool(re.search(r"(?i)\bnew\b", str(unit_name or "")))
 
 
+# Год выпуска поколения в СЫРОМ имени юнита (J-текст Bridge несёт имя вида «…XMAX 300 NEW 2023-…»)
+# течёт клиенту в quote-хвост черновика. Поколение обязано нести МЕТКА (New Gen) — как в клиентском
+# теле по правилу промпта (GEN_DEFAULT_RULE: «НЕ пиши года выпуска»), а год выпуска клиенту не
+# показываем. Чистим год-в-имени (диапазон «2020-2022» / «2023+» / «2021 года» / одиночный 20xx),
+# но НЕ цену: год-токен перед валютой (฿/бат/THB/baht) — это сумма, его не трогаем.
+_GEN_YEAR_RE = re.compile(
+    r"\b20\d\d(?:\s*[-–]\s*20\d\d|\s*\+|\s*года?)?(?!\s*(?:฿|бат|thb|baht))",
+    re.I)
+
+
+def _scrub_gen_year(text: str) -> str:
+    """Убрать год выпуска поколения из клиентской строки цены (поколение несёт метка New Gen, не год).
+    Цену не трогаем — год-токен перед валютой (฿/бат/THB) сохраняем. Осиротевший после выреза дефис
+    («NEW 2023-» → «NEW -») и сдвоенные пробелы схлопываем."""
+    s = _GEN_YEAR_RE.sub("", str(text or ""))
+    s = re.sub(r"\s+[-–](?=\s|$)", "", s)          # висячий дефис от «2023-»
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
+
 # Продукты XMAX: (метка клиенту, предикат по имени юнита). Порядок = порядок строк в сетке/quote.
 _XMAX_PRODUCTS = (
     ("XMAX 300", lambda nm: not _xmax_is_new_gen(nm)),          # старое поколение (без «NEW»)
@@ -2448,7 +2468,10 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
         # пометкой «цена/депозит ЗА КАЖДЫЙ юнит» (итог за N шт. КОД НЕ суммирует — числа только из
         # Bridge). Процент — единой клиентской строки ЦЕНЫ нет (сумма вплетена в инструкцию), пропуск.
         if kind == "ok" and not pct:
-            base = f"{label} — {phrase}" if label else phrase.rstrip(".")
+            # Год поколения из сырого имени юнита (J-текст Bridge) в quote-хвост не течёт: поколение
+            # несёт метка label (New Gen), год выпуска убираем — как в клиентском теле (см. _scrub_gen_year).
+            qphrase = _scrub_gen_year(phrase)
+            base = f"{label} — {qphrase}" if label else qphrase.rstrip(".")
             qline = (base + ". " + _units_per_each_line(_uc, lang)) if units else (base + ".")
             note += "\n" + _QUOTE_OPEN + "\n" + qline + "\n" + _QUOTE_CLOSE
             # ДОСТАВКА (шаг 5/7 #12): по maps-ссылке клиента считаем цену доставки КОДОМ и несём её
@@ -2465,7 +2488,7 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
                                                 name_filter=nf)
         bullets.append(f"- {label}: {phrase}")
         if kind == "ok":                    # только строки с ЖИВОЙ ценой Bridge едут в quote-блок
-            ok_lines.append(f"- {label}: {phrase}")
+            ok_lines.append(f"- {label}: {_scrub_gen_year(phrase)}")   # год поколения в хвост не течёт
     header = ("ЦЕНЫ ПО МОДЕЛЯМ (клиент запросил несколько / модель с вариантами) — назови КАЖДУЮ "
               "отдельной строкой в ОДНОМ сообщении, цену использовать ДОСЛОВНО, модели/варианты НЕ "
               "смешивай и НЕ суммируй:\n")
