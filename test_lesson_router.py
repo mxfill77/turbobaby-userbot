@@ -1240,7 +1240,10 @@ class TestLesson334Golden332AndInvariants(unittest.TestCase):
         with open(FIXTURE_292, encoding="utf-8") as f:
             fx = json.load(f)
         want = {"fact_price_nmax": lr.FACT, "supervision_fake_price": lr.SUPERVISION,
-                "style_dry_tone": lr.STYLE, "unclear_redo": lr.UNCLEAR}
+                "style_dry_tone": lr.STYLE, "unclear_redo": lr.UNCLEAR,
+                # урок №292/152: чистая формулировка без цен/тарифов/моделей — keyword-ось её НЕ берёт
+                # (→ UNCLEAR); класс ФАКТ ставит LLM-слой (в фикстуре форсирован полем cycle.llm).
+                "fact_data_received_geo_only": lr.UNCLEAR}
         for c in fx["cycles"]:
             remark = mc.parse_lesson(c["reply_text"])["remark"]
             self.assertEqual(want[c["name"]], lr.classify_lesson_remark(remark)[0], c["name"])

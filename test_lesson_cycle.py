@@ -98,7 +98,11 @@ class TestLessonFullCycle(unittest.TestCase):
         append_style = lambda r: seen.__setitem__("style", r) or "added"
         notify_owner = lambda c: seen.__setitem__("owner", c) or True
 
-        dec2 = lr.handle_lesson_task(task_text, append_style=append_style,
+        # Цикл с `llm` — думательная классификация ФОРСИРОВАНА фикстурой (маршрут как в проде с
+        # LESSON_LLM_ROUTE=1: замечание, которое keyword-ось не берёт, LLM относит к классу). Без `llm`
+        # classify=None → байт-в-байт прежний keyword-путь (реальный claude в юните не дёргаем).
+        classify = (lambda remark, draft="", window="", _l=sc["llm"]: _l) if sc.get("llm") else None
+        dec2 = lr.handle_lesson_task(task_text, append_style=append_style, classify=classify,
                                      append_checklist=append_checklist, notify_owner=notify_owner)
         self.assertEqual(exp["route"], dec2["route"])
         self.assertEqual(exp["delegate"], dec2.get("delegate", False))
