@@ -152,6 +152,47 @@ class TestClassifyType(unittest.TestCase):
         self.assertEqual(lr.SUPERVISION, lr.classify_lesson_remark(remark)[0])
         self.assertEqual(lr.CODE, self._type(remark))
 
+    # ===== КЛАСС-ФИКС #164: условие на состоянии данных/трекера → code (речь-акт не перевешивает) =====
+    def test_golden_292_code_on_both_axes(self):
+        # УРОК 292 (разбор #164): раньше ось-2 давала behavior на «не пиши», хотя это ФАКТ на СОСТОЯНИИ
+        # ДАННЫХ. Фикс-класс: условие «если клиент прислал только локацию» → code ОБЕИМИ осями.
+        remark = 'не пиши "данные получил", если клиент прислал только локацию'
+        self.assertEqual(lr.CODE, self._type(remark))                    # ось-2: природа = code
+        self.assertEqual("high", lr.classify_lesson_type(remark)["confidence"])
+        self.assertEqual(lr.FACT, lr.classify_lesson_remark(remark)[0])  # ось-1: маршрут = факт/логика
+
+    def test_golden_data_condition_positives_are_code(self):
+        # ЖИВАЯ 292 + парафразы RU/EN: правило с условием на состоянии данных/трекера → code НЕЗАВИСИМО
+        # от глагола речи («не пиши»/«не подтверждай»/«нельзя писать»/«don't confirm»).
+        for phrase in (
+            'не пиши "данные получил", если клиент прислал только локацию — данных ещё нет',
+            'не подтверждай "данные получил", если пришла только геолокация',
+            "когда данные ещё не собраны, не пиши что всё получил",
+            'нельзя писать "данные получены", пока не прислал паспорт',
+            "don't confirm data received when the tracker is still empty",
+        ):
+            self.assertEqual(lr.CODE, self._type(phrase), phrase)
+
+    def test_golden_behavior_without_data_condition(self):
+        # Чистая манера/тон/дефолт-предложение БЕЗ условия на данных → behavior (речь-акт остаётся собой):
+        # спека-голдены задачи + условие-фолбэк дефолта (условие лишь «когда действует», суть — что предлагать).
+        for phrase in (
+            "пиши теплее, без канцелярита",
+            "не предлагай старое поколение по умолчанию",
+            "По умолчанию предлагай Nmax, если клиент не назвал модель",   # условие-фолбэк дефолта ≠ данные
+            "если клиент злится, отвечай мягче",                           # условие на настроении ≠ данные
+        ):
+            self.assertEqual(lr.BEHAVIOR, self._type(phrase), phrase)
+
+    def test_golden_bridge_silent_is_code(self):
+        # «не называй цену, если Bridge молчит» → code (цена/Bridge — машина; условие лишь усиливает).
+        self.assertEqual(lr.CODE, self._type("не называй цену, если Bridge молчит"))
+
+    def test_data_condition_bare_manner_stays_behavior(self):
+        # ЗАМОК регресса: БЕЗ условия «данные получил» — это МАНЕРА (робо-фраза) → behavior (step6/спека).
+        # Именно УСЛОВИЕ, а не слово «данные», переводит урок в code.
+        self.assertEqual(lr.BEHAVIOR, self._type('не пиши "данные получил"'))
+
 
 class TestParse(unittest.TestCase):
     """Разбор задачи-урока (контракт с build_lesson_task шага 2)."""
@@ -1051,9 +1092,12 @@ class TestLesson334Golden332AndInvariants(unittest.TestCase):
     поправил черновик-подтверждение бота и оставил урок «не говори "локацию и данные получил", если
     клиент прислал их в прошлой брони» — это про ЛОГИКУ ТРЕКЕРА / СВЕЖЕСТЬ СЕССИИ, класс ФАКТ.
 
-    Разрыв «тест ≠ реальность», который закрывает #334: keyword-классификатор такую фразу НЕ ловит
-    (в ней нет ни цены/модели/даты, ни тона) → UNCLEAR → карточка владельцу «переформулируй». Думатель
-    же читает её как ФАКТ/high → урок берётся В РАБОТУ СРАЗУ, БЕЗ «переформулируй». Прогоняем ОДНУ
+    Разрыв «тест ≠ реальность»: раньше keyword-классификатор такую фразу НЕ ловил (ни цена/модель/дата,
+    ни тон) → UNCLEAR → карточка владельцу «переформулируй». КЛАСС-ФИКС #164 закрыл разрыв на keyword-
+    слое: правило с УСЛОВИЕМ на состоянии данных/трекера («…если/когда данные собраны/присланы/получены…»)
+    ловится как ФАКТ независимо от речь-акта «не говори/пиши» (см. test_keyword_now_catches_...). Думатель
+    сверху даёт ПРОЧТЕНИЕ/ПЛАН (трекер/свежесть сессии) и уверенность → урок берётся В РАБОТУ СРАЗУ,
+    БЕЗ «переформулируй» и с осмысленным «Понял так… Делаю…». Прогоняем ОДНУ
     живую фразу через все ветки #334 (high / low / «да» / поправка / таймаут) + замок инвариантов:
     триггер только от INTAKE_APPROVERS, «урок принят» ТОЛЬКО после коммита, клиенту НИЧЕГО не шлётся,
     регресс цикла 292 цел. Реальный claude НЕ дёргаем — классификатор инъектируем фейком; текст задачи
@@ -1091,11 +1135,14 @@ class TestLesson334Golden332AndInvariants(unittest.TestCase):
                     "plan": self.PLAN, "route": route}
         return classify
 
-    # --- сам разрыв #332: keyword одна не берёт фразу, думатель получает её ДОСЛОВНО ------------
-    def test_keyword_alone_would_send_reformulate_card(self):
-        # КОРЕНЬ #334: без думателя keyword не находит ни факт/модель/дату/тон → UNCLEAR («переформулируй»)
+    # --- КЛАСС-ФИКС #164: keyword ТЕПЕРЬ берёт трекер-условие как ФАКТ (речь-акт не перевешивает) ---
+    def test_keyword_now_catches_data_condition_as_fact(self):
+        # До фикса: keyword не находил ни факт/модель/дату/тон → UNCLEAR. Класс-фикс #164: правило с
+        # УСЛОВИЕМ на состоянии данных/трекера («…если клиент прислал…получил») → ФАКТ независимо от
+        # «не говори». Думатель сверху всё равно даёт прочтение/план (трекер/свежесть) — но keyword
+        # больше не роняет такую фразу в UNCLEAR/«переформулируй».
         route, _ = lr.classify_lesson_remark(self.REMARK)
-        self.assertEqual(lr.UNCLEAR, route)
+        self.assertEqual(lr.FACT, route)
 
     def test_thinker_prompt_carries_verbatim_332_remark(self):
         # промпт думателя несёт урок #332 ДОСЛОВНО + черновик, который он правит (реальный claude не зовём)
@@ -1235,26 +1282,30 @@ class TestLesson334Golden332AndInvariants(unittest.TestCase):
         self.assertEqual(str(self.CARD["card_msg_id"]), sent["card"])
         self.assertNotEqual(str(self.CARD["client_id"]), sent["card"])   # не в личку клиента
 
-    # --- ИНВАРИАНТ: регресс цикла 292 цел (LLM-слой НЕ изменил keyword-поведение/дефолт) --------
-    def test_cycle_292_keyword_routes_unchanged(self):
+    # --- ИНВАРИАНТ: остальные циклы 292 стабильны; сам 292 keyword ТЕПЕРЬ берёт как ФАКТ (фикс #164) --
+    def test_cycle_292_keyword_routes(self):
         with open(FIXTURE_292, encoding="utf-8") as f:
             fx = json.load(f)
         want = {"fact_price_nmax": lr.FACT, "supervision_fake_price": lr.SUPERVISION,
                 "style_dry_tone": lr.STYLE, "unclear_redo": lr.UNCLEAR,
-                # урок №292/152: чистая формулировка без цен/тарифов/моделей — keyword-ось её НЕ берёт
-                # (→ UNCLEAR); класс ФАКТ ставит LLM-слой (в фикстуре форсирован полем cycle.llm).
-                "fact_data_received_geo_only": lr.UNCLEAR}
+                # урок №292/152: КЛАСС-ФИКС #164 — условие на состоянии данных/трекера («если клиент
+                # прислал только локацию — данных ещё нет») ловится keyword-осью как ФАКТ (речь-акт «не
+                # пиши» больше не перевешивает). LLM-слой сверху даёт прочтение/план — но keyword уже не роняет в UNCLEAR.
+                "fact_data_received_geo_only": lr.FACT}
         for c in fx["cycles"]:
             remark = mc.parse_lesson(c["reply_text"])["remark"]
             self.assertEqual(want[c["name"]], lr.classify_lesson_remark(remark)[0], c["name"])
 
-    def test_default_path_stays_keyword_no_llm(self):
-        # рубильник LLM по умолчанию OFF + без инъекции classify → чистый keyword-путь (поведение 292):
-        # #332 без думателя keyword→UNCLEAR → карточка владельцу; LLM-поля не появляются.
+    def test_default_path_keyword_catches_data_condition_as_fact(self):
+        # Рубильник LLM по умолчанию OFF + без инъекции classify → чистый keyword-путь. КЛАСС-ФИКС #164:
+        # трекер-условие #332 keyword берёт как ФАКТ → делегирует планировщику (правка+golden-тест), а
+        # НЕ роняет в UNCLEAR/«переформулируй». LLM-поля (confidence/reading) при этом НЕ появляются.
         self.assertFalse(lr._lesson_llm_enabled())
         dec = lr.handle_lesson_task(self._task_text(), notify_owner=lambda c: ("инбокс 1160", True),
                                     reply_moderation=lambda cid, t: self.fail("keyword-путь реплай не шлёт"))
-        self.assertEqual(lr.UNCLEAR, dec["route"])
+        self.assertEqual(lr.FACT, dec["route"])
+        self.assertTrue(dec["delegate"])                       # → планировщику (код+тест), не карточка владельцу
+        self.assertIn("ДОСЛОВНОЙ фразой клиента", dec["delegate_text"])
         self.assertNotIn("confidence", dec)                    # LLM-путь не активировался
 
 
