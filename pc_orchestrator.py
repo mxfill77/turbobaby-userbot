@@ -4290,6 +4290,10 @@ def _main_loop():
     _init_running_version()
     log.info("=== ДЕМОН СТАРТ (lane=%s, poll=%ss, task_timeout=%ss, approval_ttl=%ss, claude=%s, commit=%s) ===",
              LANE, POLL_SEC, TASK_TIMEOUT, APPROVAL_TTL, CLAUDE_BIN, RUNNING_COMMIT)
+    # Селективный тест-гейт авто-применения (порт VPS): подтверждаем состояние флагов в баннере,
+    # чтобы факт включения/дефолта (0=полный прогон всех тестов) читался прямо из лога старта.
+    log.info("=== ФЛАГИ ГЕЙТА: GATE_STEP_SELECTIVE=%s GATE_SINGLE_SELECTIVE=%s (селективный тест-гейт авто-применения; 0=полный прогон) ===",
+             int(_gate_step_selective_on()), int(_gate_single_selective_on()))
     if _stopped():
         log.info("рубильник pc_orchestrator.stop активен — не стартую поллинг")
         return
