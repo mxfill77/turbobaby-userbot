@@ -42,6 +42,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
+import gate_selective         # селективный тест-гейт авто-применения (порт VPS GATE_STEP/SINGLE_SELECTIVE); чистый, без сети
 import lesson_router          # обработчик задач-уроков (родитель 292, шаг 3): классификация+маршрут; suggest тянет лениво
 # ДЕПЛОЙ #334 шаг 6/6 (2026-07-14, одобрен владельцем): LLM-маршрут уроков в бою —
 # LESSON_LLM_ROUTE=1 в .env ПОСТОЯННО; коммит-веха триггерит эстафету демона (новый процесс
@@ -1078,9 +1079,12 @@ def process_new():
     if _is_local_dec_parent(frm, text):
         _local_dec_plan(tid, text)
         return
-    # HEAD до задачи (только для дев-задач): диффом head_before..HEAD увидим новые коммиты задачи,
-    # чтобы понять, надо ли перезапускать userbot/moderbot (авто-обновление вместо ручной команды).
-    head_before = _git_out(["rev-parse", "HEAD"]) if _is_dev_task(text) else None
+    # HEAD до задачи: для дев-задач («тз:») — всегда; для ШАГОВ цепи — под GATE_STEP_SELECTIVE
+    # (иначе head_before=None → maybe_update_bots ничего не применит, прежнее поведение). Диффом
+    # head_before..HEAD увидим новые коммиты задачи → нужен ли рестарт userbot/moderbot.
+    head_before = (_git_out(["rev-parse", "HEAD"])
+                   if _is_dev_task(text) or (_gate_step_selective_on() and gate_selective.parse_step(text)[0])
+                   else None)
     status, result = run_task(tid, text)
     if status == "needs_approval":
         bc.set_needs_approval(tid, result)
@@ -2694,6 +2698,19 @@ def _is_dev_task(text):
     return bool(_RE_DEV_TASK.match(str(text or "")))
 
 
+def _gate_step_selective_on():
+    """Флаг GATE_STEP_SELECTIVE=1 (.env): селективный гейт затронутых тестов на ПРОМЕЖУТОЧНЫХ шагах
+    цепи (финальный шаг всё равно полный, неубираемо). 0/нет → прежний гейт затронутых модулей
+    (байт-в-байт). Порт VPS-образца d288947; независимый откат от GATE_SINGLE_SELECTIVE."""
+    return gate_selective.env_on("GATE_STEP_SELECTIVE")
+
+
+def _gate_single_selective_on():
+    """Флаг GATE_SINGLE_SELECTIVE=1 (.env): селективный гейт для ОДИНОЧНЫХ (не-цепь) дев-задач с
+    fail-safe в полный гейт. 0/нет → прежнее поведение. Порт VPS-образца 9c3c3e7."""
+    return gate_selective.env_on("GATE_SINGLE_SELECTIVE")
+
+
 def _changed_files_since(head_before):
     """Файлы, изменённые НОВЫМИ коммитами задачи (head_before..HEAD). → список путей.
     Нет head_before / git молчит / нет новых коммитов → [] (обновлять нечего)."""
@@ -2799,7 +2816,12 @@ def maybe_update_bots(tid, text, head_before, changed_fn=None, gate_fn=None,
     ('' если обновлять нечего). Уважает стоп-флаг. Всё внешнее инъектируется для тестов."""
     if _stopped():
         return ""
-    if not (is_dev_fn or _is_dev_task)(text):
+    # Дев-задача («тз:…») применяется всегда; ШАГ цепи («[шаг i/N…]») — только под GATE_STEP_SELECTIVE
+    # (иначе шаги бот не авто-применяют — прежнее поведение байт-в-байт). Контент шага не помечен «тз»,
+    # поэтому дев-признак шага — сам git-дифф рантайм-файлов (ниже _classify_changed отсеет не-рантайм).
+    is_step, step_i, step_n = gate_selective.parse_step(text)
+    step_apply = is_step and _gate_step_selective_on()
+    if not ((is_dev_fn or _is_dev_task)(text) or step_apply):
         return ""
     changed = (changed_fn or _changed_files_since)(head_before)
     if not changed:
@@ -2808,11 +2830,19 @@ def maybe_update_bots(tid, text, head_before, changed_fn=None, gate_fn=None,
     if not (ub_files or mb_files):
         return ""
     commit = (head_fn or _head_commit)()
+    # Селективный гейт (порт VPS): промежуточный шаг цепи / одиночка под флагом → только затронутые
+    # тесты; финальный шаг → полный гейт (неубираем); сбой селектора → полный (fail-safe). Флаги
+    # off (дефолт) → mode=off → прежний путь _affected_test_modules байт-в-байт.
     notes = []
     for kind, label, files in (("userbot", "userbot", ub_files), ("moderbot", "модербот", mb_files)):
         if not files:
             continue
-        mods = _affected_test_modules(files)
+        run_mods, gmode = gate_selective.decide(
+            files, REPO, is_step=is_step, step_i=step_i, step_n=step_n,
+            step_selective=_gate_step_selective_on(), single_selective=_gate_single_selective_on())
+        mods = _affected_test_modules(files) if gmode == gate_selective.MODE_OFF else run_mods
+        if gmode != gate_selective.MODE_OFF:
+            log.info("авто-обновление %s: гейт mode=%s, модулей=%s", kind, gmode, len(mods or []))
         ok, gmsg = (gate_fn or _gate_test_modules)(mods)
         if not ok:
             log.error("авто-обновление %s: гейт КРАСНЫЙ (%s) — рестарт отложен", kind, gmsg)

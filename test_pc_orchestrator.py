@@ -913,6 +913,79 @@ class TestAutoUpdateBots(Base):
         self.assertTrue(ok)
 
 
+class TestSelectiveGateWiring(Base):
+    """Селективный гейт в maybe_update_bots (порт VPS GATE_STEP/SINGLE_SELECTIVE). Флаги читаются
+    из os.environ — ставим/снимаем на время теста; gate_fn перехватывает список гоняемых модулей."""
+
+    def _set_flag(self, name, val):
+        prev = os.environ.get(name)
+        if val is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = val
+        self.addCleanup(lambda: (os.environ.__setitem__(name, prev) if prev is not None
+                                 else os.environ.pop(name, None)))
+
+    def _run(self, text, changed):
+        """→ (captured_mods_первого_вызова_gate, note). Рестарт всегда зелёный, гейт зелёный."""
+        captured = []
+        note = o.maybe_update_bots(
+            5, text, "old",
+            changed_fn=lambda hb: changed,
+            gate_fn=lambda mods: (captured.append(list(mods or [])), (True, "ok"))[1],
+            restart_fn=lambda kind: (True, [1], "ok"),
+            head_fn=lambda: "c0ffee1")
+        return (captured[0] if captured else None), note
+
+    def test_single_flag_off_is_legacy_affected(self):
+        # дефолт (флаг off): одиночка → прежний путь _affected_test_modules; userbot_listen без теста → []
+        self._set_flag("GATE_SINGLE_SELECTIVE", None)
+        mods, _ = self._run("тз: правка", ["userbot_listen.py"])
+        self.assertEqual(mods, [])                     # прежнее поведение: пусто → гейт без тестов
+
+    def test_single_selective_failsafe_full(self):
+        # флаг on + правка без сопоставимого теста → fail-safe в ПОЛНЫЙ гейт (не «пусто без гейта»)
+        self._set_flag("GATE_SINGLE_SELECTIVE", "1")
+        mods, _ = self._run("тз: правка", ["userbot_listen.py"])
+        self.assertIn("test_pc_orchestrator", mods)    # полный список репо
+        self.assertGreater(len(mods), 5)
+
+    def test_single_selective_affected(self):
+        # флаг on + правка с тестом → только затронутый модуль
+        self._set_flag("GATE_SINGLE_SELECTIVE", "1")
+        mods, _ = self._run("тз: правка suggest", ["suggest.py"])
+        self.assertEqual(mods, ["test_suggest"])
+
+    def test_step_flag_off_no_apply(self):
+        # дефолт: ШАГ цепи бот НЕ авто-применяет (прежнее поведение) → пустая нота, гейт не звался
+        self._set_flag("GATE_STEP_SELECTIVE", None)
+        mods, note = self._run("[шаг 2/5 родитель 92] правь suggest", ["suggest.py"])
+        self.assertIsNone(mods)                        # gate_fn не вызывался
+        self.assertEqual(note, "")
+
+    def test_step_selective_intermediate(self):
+        # флаг on + промежуточный шаг → селектив (затронутый модуль), рестарт состоялся
+        self._set_flag("GATE_STEP_SELECTIVE", "1")
+        mods, note = self._run("[шаг 2/5 родитель 92] правь suggest", ["suggest.py"])
+        self.assertEqual(mods, ["test_suggest"])
+        self.assertIn("обновлён", note)
+
+    def test_step_selective_final_full(self):
+        # флаг on + ФИНАЛЬНЫЙ шаг → полный гейт (неубираем), даже если затронут лишь один тест
+        self._set_flag("GATE_STEP_SELECTIVE", "1")
+        mods, _ = self._run("[шаг 5/5 родитель 92] финал suggest", ["suggest.py"])
+        self.assertIn("test_pc_orchestrator", mods)
+        self.assertIn("test_suggest", mods)
+        self.assertGreater(len(mods), 5)
+
+    def test_step_flag_does_not_enable_single_apply_semantics(self):
+        # GATE_STEP_SELECTIVE не влияет на одиночку: одиночка при step=1/single=0 → прежний путь
+        self._set_flag("GATE_STEP_SELECTIVE", "1")
+        self._set_flag("GATE_SINGLE_SELECTIVE", None)
+        mods, _ = self._run("тз: правка suggest", ["suggest.py"])
+        self.assertEqual(mods, ["test_suggest"])       # legacy affected (совпадает с селективом здесь)
+
+
 class TestAutoUpdateInProcessNew(Base):
     """Интеграция: done дев-задачи → суффикс авто-обновления попадает в результат/карточку."""
 
