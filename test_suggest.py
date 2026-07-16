@@ -1001,6 +1001,22 @@ class TestCollectedTracker(unittest.TestCase):
         self.assertTrue(facts["passport"], f"паспорт (фото) не собран:\n{tr}")
         self.assertTrue(facts["phone"], f"телефон не собран:\n{tr}")
 
+    def test_lesson292_geo_only_confirms_location_not_details(self):
+        """Урок №292 (родитель 152): клиент прислал ТОЛЬКО локацию (пин) — пример-подсказка обязана
+        подтверждать РОВНО локацию («локацию получил»), а не хвалиться «данные получил» (паспорта/тел/
+        оплаты не было). Голден-фраза из живого окна (правило-класс CLAUDE.md): один пин виллы."""
+        loc_only = f"[клиент]: Привет! Вот моя вилла: {self.MAPS}"
+        facts = suggest.collected_facts(loc_only)
+        self.assertTrue(facts["geo"])
+        self.assertFalse(any(facts[k] for k in facts if k != "geo"), facts)
+        note = suggest.collected_prompt_note(facts, "ru")
+        self.assertIn("локацию получил", note)          # пример подтверждает ТОЛЬКО локацию
+        self.assertNotIn("данные получил", note)         # и НЕ приписывает несуществующие «данные»
+        self.assertIn("подтверждай ТОЛЬКО перечисленное", note)  # явный запрет-приписка в промпте
+        # анти-тавтология: как только к гео добавится реальный факт — «данные» законны
+        facts_more = dict(facts, passport=True)
+        self.assertIn("локацию и данные получил", suggest.collected_prompt_note(facts_more, "ru"))
+
     def test_golden_prompt_says_no_reask_and_confirm(self):
         tr = self._three_vot_transcript()
         facts = suggest.collected_facts(tr)

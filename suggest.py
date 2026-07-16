@@ -2006,6 +2006,20 @@ _COLL_LABELS = [
 ]
 
 
+def _confirm_example(facts: dict, en: bool) -> str:
+    """Урок №292: пример-подсказка подтверждения обязана ОТРАЖАТЬ РОВНО собранное, а не хвалиться
+    «данные получил» на любой набор. Если клиент прислал ТОЛЬКО локацию/гео — пример подтверждает
+    ТОЛЬКО локацию («локацию получил»), без приписки «и данные» (паспорт/тел/оплаты не было). Гео +
+    что-то ещё → «локацию и данные получил»; гео нет → «данные получил»."""
+    has_geo = bool(facts.get("geo"))
+    only_geo = has_geo and not any(facts.get(k) for k in facts if k != "geo")
+    if only_geo:
+        return "got your location" if en else "локацию получил"
+    if has_geo:
+        return "got your location and details" if en else "локацию и данные получил"
+    return "got your details" if en else "данные получил"
+
+
 def collected_prompt_note(facts: dict, lang: str = "ru") -> str:
     """Блок в system-промпт: перечень уже полученного + запрет переспрашивать. Пусто → ''."""
     if not facts:
@@ -2014,14 +2028,16 @@ def collected_prompt_note(facts: dict, lang: str = "ru") -> str:
     got = [lbl[1 if en else 0] for key, lbl, _ in _COLL_LABELS if facts.get(key)]
     if not got:
         return ""
+    example = _confirm_example(facts, en)
     if en:
         return ("\n\n★ ALREADY RECEIVED FROM THE CLIENT (in the dialog/attachments — do NOT ask "
-                "again): " + ", ".join(got) + ". Briefly confirm you got it (e.g. «got your "
-                "location and details») and move to the next step — never re-request what the "
-                "client has already sent.")
+                "again): " + ", ".join(got) + f". Briefly confirm you got it (e.g. «{example}») "
+                "and move to the next step — confirm ONLY what is listed above, never claim data "
+                "the client has not sent, and never re-request what the client has already sent.")
     return ("\n\n★ УЖЕ ПОЛУЧЕНО ОТ КЛИЕНТА (есть в диалоге/вложениях — НЕ переспрашивай): "
-            + ", ".join(got) + ". Коротко подтверди получение (напр. «локацию и данные получил») "
-            "и переходи к следующему шагу — НЕ проси повторно то, что клиент уже прислал.")
+            + ", ".join(got) + f". Коротко подтверди получение (напр. «{example}») "
+            "и переходи к следующему шагу — подтверждай ТОЛЬКО перечисленное выше, НЕ приписывай "
+            "данные, которых клиент не присылал, и НЕ проси повторно то, что клиент уже прислал.")
 
 
 def collected_manager_note(facts: dict, lang: str = "ru") -> str:
