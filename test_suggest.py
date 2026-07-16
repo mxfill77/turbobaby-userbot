@@ -1017,6 +1017,35 @@ class TestCollectedTracker(unittest.TestCase):
         facts_more = dict(facts, passport=True)
         self.assertIn("локацию и данные получил", suggest.collected_prompt_note(facts_more, "ru"))
 
+    def test_lesson292_step3_geo_only_verbatim_cryptopeppa_303(self):
+        """Урок №292, шаг 3/6 (родитель 152): ДОСЛОВНАЯ гео-only фраза из ЖИВОГО окна @cryptopeppa
+        (client_id=529849022, черновик #303). Клиент прислал ТОЛЬКО пин-локацию — короткую ссылку
+        Google Maps (снята дословно из userbot-лога окна #303, сообщение от 2026-07-15). Живой провал:
+        бот ответил «Локацию и данные получил», хотя паспорт/тел/оплату клиент НЕ присылал. Golden-
+        правило CLAUDE.md: тест несёт дословную фразу клиента, а не идеализированную — на один лишь пин
+        черновик подтверждает РОВНО локацию и НЕ хвалится «данные получил»."""
+        LIVE_PIN = "https://maps.app.goo.gl/c4G4B3sNrfJZBSue6?g_st=ac"   # дословно из окна #303
+        facts = suggest.collected_facts(f"[клиент]: {LIVE_PIN}")
+        self.assertTrue(facts["geo"], f"живой пин не собран как гео:\n{LIVE_PIN}")
+        self.assertFalse(any(facts[k] for k in facts if k != "geo"), facts)  # ровно локация, «данных» нет
+        note = suggest.collected_prompt_note(facts, "ru")
+        self.assertIn("локацию получил", note)          # пример подтверждает ТОЛЬКО локацию
+        self.assertNotIn("данные получил", note)         # и НЕ приписывает несуществующие «данные»
+        # черновик по этому окну: LLM следует подсказке промпта → тело подтверждает локацию без «данные получил»
+        seen = {}
+
+        def cap(system, user):
+            seen["system"] = system
+            return "Локацию получил, спасибо 🤝 Уточню детали по вашему адресу."
+
+        d = suggest.generate_draft(f"[клиент]: {LIVE_PIN}", "ru", "FAQ", call_llm=cap)
+        self.assertIn("локацию получил", seen["system"])     # промпт велит подтвердить ТОЛЬКО локацию
+        self.assertNotIn("данные получил", seen["system"])   # и не инструктирует ложную квитанцию
+        self.assertIn("[собрано: гео ✅]", d)                 # служебная пометка: собрана ровно гео
+        client = suggest.client_facing_text(d)
+        self.assertIn("Локацию получил", client)             # локацию подтверждает
+        self.assertNotIn("данные получил", client.lower())   # но не хвалится «данные получил»
+
     def test_golden_prompt_says_no_reask_and_confirm(self):
         tr = self._three_vot_transcript()
         facts = suggest.collected_facts(tr)
