@@ -333,6 +333,23 @@ PICKUP_RULE = (
 )
 
 
+# ЛЕКСИКА КВИТАНЦИИ (дефект #303/2: «факты ≠ артефакты»). Слово «получили» = про реально пришедшее
+# ВЛОЖЕНИЕ (фото/скан документа, подтверждённая оплата). Про ИНФОРМАЦИЮ (модель/даты/срок/локация/
+# телефон/выбор паспорта как залога) — «понял/учли/принял», а НЕ «получили». Живой провал @cryptopeppa:
+# бот на выбор «депозит паспортом» БЕЗ реального фото писал «паспорт получили» — намерение/способ выдал
+# за полученный документ. Код-страховка того же класса — _confirm_example (пример-подсказка отражает
+# ровно собранное: «получили» лишь для фото/оплаты).
+RECEIPT_LEXICON_RULE = (
+    "\n\nЛЕКСИКА КВИТАНЦИИ (ЖЁСТКО): слово «получили»/«получил» пиши ТОЛЬКО про реально пришедшее "
+    "ВЛОЖЕНИЕ — фото или скан документа, либо подтверждённую оплату (чек/скрин). Про ИНФОРМАЦИЮ "
+    "(модель, даты, срок, локацию/адрес/район, номер телефона, а также ВЫБОР паспорта как залога) "
+    "говори «понял», «учли», «принял» — НЕ «получили». В частности «депозит паспортом» без реально "
+    "присланного ФОТО/скана паспорта — это выбранный СПОСОБ залога, а не полученный документ: НЕ пиши "
+    "«паспорт получили», пока фото/скан паспорта реально не пришёл в диалог (напиши, что вариант "
+    "«паспорт в залог» понял/принял)."
+)
+
+
 # --- СТИЛЬ РЕАЛЬНЫХ МЕНЕДЖЕРОВ + FEW-SHOT (шаг 5/7 родитель #253) ----------------
 # Собрано из ЖИВОЙ базы переписок с клиентами (client_chats.jsonl, роль company =
 # наш менеджер @turbophuket). Это ЭТАЛОН ТОНА/ФОРМУЛИРОВОК/ДЛИНЫ, а НЕ новый источник
@@ -959,6 +976,21 @@ async def _fetch_messages(client, entity, limit: int = MAX_MESSAGES):
     return msgs
 
 
+def _geo_marker(geo) -> str:
+    """Маркер локации-ПИНА для транскрипта. С координатами, если гео-объект их несёт (telethon
+    GeoPoint: .lat/.long) — тогда «[локация 7.771000,98.327000]»; иначе голый «[локация]».
+    Координаты нужны резолверу доставки (пин → зона/цена, как maps-ссылка); сам маркер по-прежнему
+    ловится трекером гео (_COLL_GEO по префиксу «[локаци»). Битые/пустые координаты → голый маркер."""
+    lat = getattr(geo, "lat", None)
+    lon = getattr(geo, "long", getattr(geo, "lon", None))
+    try:
+        if lat is not None and lon is not None:
+            return f"[локация {float(lat):.6f},{float(lon):.6f}]"
+    except (TypeError, ValueError):
+        pass
+    return "[локация]"
+
+
 def _reply_target_snippet(rt, me_id: int):
     """§243/5: краткое СОДЕРЖИМОЕ реплаенного сообщения для контекста черновика: автор +
     гео-ссылка/адрес/телефон/текст и/или пометка о фото (на этапе брони — обычно паспорт).
@@ -969,8 +1001,8 @@ def _reply_target_snippet(rt, me_id: int):
     parts = []
     if getattr(rt, "photo", None) is not None:
         parts.append("фото (вероятно паспорт)")
-    if getattr(rt, "geo", None) is not None:          # локация-пин в reply-цели → маркер вложения
-        parts.append("[локация]")
+    if getattr(rt, "geo", None) is not None:          # локация-пин в reply-цели → маркер вложения (с коорд.)
+        parts.append(_geo_marker(rt.geo))
     txt = (getattr(rt, "message", None) or "").strip()
     if txt:
         parts.append(txt.replace("\n", " ⏎ "))
@@ -994,7 +1026,7 @@ def transcript_from(msgs, me_id: int) -> str:
             if getattr(m, "photo", None) is not None:  # чтобы трекер ловил ВЛОЖЕНИЕ, а не слово-упоминание
                 body = "[фото]"
             elif getattr(m, "geo", None) is not None:
-                body = "[локация]"
+                body = _geo_marker(m.geo)              # координаты пина — резолверу доставки (пин → зона)
             else:
                 body = "[медиа/без текста]"
         body = body.replace("\n", " ⏎ ")
@@ -1837,6 +1869,11 @@ _NON_RENTABLE_KEYS = {_bike_key("CLICK 125")}   # {'click125'}
 BOOKING_WINDOW = 3  # сколько последних реплик клиента смотрим, чтобы дособрать ОДНУ бронь
 
 
+# Гео-ПИН с координатами в маркере «[локация lat,lon]» (ставит _geo_marker в transcript_from при
+# Telegram-локации). Требуем десятичную точку в обоих числах — как в maps-парсере delivery._LATLON.
+_GEO_PIN_RE = re.compile(r"\[локаци\w*\s+(-?\d{1,3}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)\]")
+
+
 def extract_booking_hints(transcript: str, today=None) -> dict:
     """Модель + даты ТОЛЬКО из ПОСЛЕДНЕЙ релевантной брони клиента (не из всего диалога).
     База — последняя реплика клиента; до 2 предыдущих его реплик смотрим лишь чтобы дособрать
@@ -1915,11 +1952,23 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
     # Сканируем СЫРЫЕ строки клиента (не _client_messages: тот lowercase'ит — токен короткой goo.gl-
     # ссылки регистрозависим, разворот редиректом сломался бы).
     maps_link = None
+    geo_pin = None
     for ln in reversed((transcript or "").split("\n")):
         if ln.startswith("[клиент]:"):
-            ml = delivery.extract_maps_link(ln[len("[клиент]:"):])
-            if ml:
-                maps_link = ml
+            if maps_link is None:
+                ml = delivery.extract_maps_link(ln[len("[клиент]:"):])
+                if ml:
+                    maps_link = ml
+            if geo_pin is None:
+                # гео-ПИН Telegram: координаты уже в маркере «[локация lat,lon]» (см. _geo_marker/
+                # transcript_from) — источник координат доставки, когда клиент кинул пин, а не ссылку.
+                mg = _GEO_PIN_RE.search(ln)
+                if mg:
+                    try:
+                        geo_pin = (float(mg.group(1)), float(mg.group(2)))
+                    except (TypeError, ValueError):
+                        geo_pin = None
+            if maps_link is not None and geo_pin is not None:
                 break
 
     return {"model": model, "models": models, "date_start": iso_start, "date_end": iso_end,
@@ -1929,7 +1978,7 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
             "deposit_multi_q": deposit_multi_q, "price_sheet_q": price_sheet_q,
             "sheet_filter": sheet_filter, "percent_q": percent_q, "units_count": units_count,
             "old_gen_q": old_gen_q, "deposit_passport_q": deposit_passport_q,
-            "maps_link": maps_link}
+            "maps_link": maps_link, "geo_pin": geo_pin}
 
 
 # ------------------- §243/6: трекер собранного по диалогу + reply-вложениям -------------------
@@ -1956,7 +2005,7 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
 _COLL_GEO = re.compile(
     r"maps\.app\.goo\.gl|goo\.gl/maps|google\.[a-z.]+/maps|maps\.google|geo:\s*-?\d"
     r"|@-?\d{1,2}\.\d{3,},-?\d{1,3}\.\d{3,}"
-    r"|\[локаци\w*\]"
+    r"|\[локаци\w*"          # «[локация]» ИЛИ «[локация lat,lon]» (пин с координатами) — по префиксу
     r"|(?:hotel|apartment|accommodation|villa)\s+name\s*[:\-—]\s*\S"        # «Hotel Name: Cape Sienna …»
     r"|назван\w+\s+(?:отел|апартамент|виллы|жиль|жилищ)\w*\s*[:\-—]?\s*\S",  # «Название отеля: …»
     re.I)
@@ -2022,17 +2071,27 @@ _COLL_LABELS = [
 
 
 def _confirm_example(facts: dict, en: bool) -> str:
-    """Урок №292: пример-подсказка подтверждения обязана ОТРАЖАТЬ РОВНО собранное, а не хвалиться
-    «данные получил» на любой набор. Если клиент прислал ТОЛЬКО локацию/гео — пример подтверждает
-    ТОЛЬКО локацию («локацию получил»), без приписки «и данные» (паспорт/тел/оплаты не было). Гео +
-    что-то ещё → «локацию и данные получил»; гео нет → «данные получил»."""
-    has_geo = bool(facts.get("geo"))
-    only_geo = has_geo and not any(facts.get(k) for k in facts if k != "geo")
+    """Пример-подсказка подтверждения. Урок №292: отражает РОВНО собранное (не хвалится «данные» на
+    любой набор). Дефект #303/2 (лексика «факты ≠ артефакты»): «получили» — ТОЛЬКО про реальное
+    ВЛОЖЕНИЕ (фото паспорта / оплата); ИНФОРМАЦИЮ (локация/модель/срок/даты/телефон) подтверждаем
+    «учли», а НЕ «получили». Фото+оплата → «фото и оплату получили»; вложение + инфо → «… получили,
+    остальное учли»; только локация → «локацию учли»; только прочая инфа → «всё учли»."""
+    has_photo = bool(facts.get("passport"))
+    has_pay = bool(facts.get("payment"))
+    has_info = any(facts.get(k) for k in ("model", "term", "dates", "geo", "phone"))
+    if has_photo or has_pay:                          # реальные вложения → «получили»
+        if en:
+            got = " and ".join(w for w in (("photo" if has_photo else None),
+                                           ("payment" if has_pay else None)) if w)
+            return f"got your {got}" + (", the rest noted" if has_info else "")
+        got = " и ".join(w for w in (("фото" if has_photo else None),
+                                     ("оплату" if has_pay else None)) if w)
+        return f"{got} получили" + (", остальное учли" if has_info else "")
+    # только ИНФОРМАЦИЯ (вложений нет) → «учли», не «получили»
+    only_geo = bool(facts.get("geo")) and not any(facts.get(k) for k in ("model", "term", "dates", "phone"))
     if only_geo:
-        return "got your location" if en else "локацию получил"
-    if has_geo:
-        return "got your location and details" if en else "локацию и данные получил"
-    return "got your details" if en else "данные получил"
+        return "noted your location" if en else "локацию учли"
+    return "noted your details" if en else "всё учли"
 
 
 def collected_prompt_note(facts: dict, lang: str = "ru") -> str:
@@ -2045,14 +2104,18 @@ def collected_prompt_note(facts: dict, lang: str = "ru") -> str:
         return ""
     example = _confirm_example(facts, en)
     if en:
-        return ("\n\n★ ALREADY RECEIVED FROM THE CLIENT (in the dialog/attachments — do NOT ask "
-                "again): " + ", ".join(got) + f". Briefly confirm you got it (e.g. «{example}») "
-                "and move to the next step — confirm ONLY what is listed above, never claim data "
-                "the client has not sent, and never re-request what the client has already sent.")
+        return ("\n\n★ ALREADY PROVIDED BY THE CLIENT (in the dialog/attachments — do NOT ask "
+                "again): " + ", ".join(got) + f". Briefly acknowledge it (e.g. «{example}») "
+                "and move to the next step — acknowledge ONLY what is listed above, never claim data "
+                "the client has not sent, and never re-request what the client has already sent. "
+                "Say «received/got» ONLY about a real attachment (photo/payment); for information "
+                "(model/dates/location/phone) say «noted».")
     return ("\n\n★ УЖЕ ПОЛУЧЕНО ОТ КЛИЕНТА (есть в диалоге/вложениях — НЕ переспрашивай): "
-            + ", ".join(got) + f". Коротко подтверди получение (напр. «{example}») "
+            + ", ".join(got) + f". Коротко подтверди (напр. «{example}») "
             "и переходи к следующему шагу — подтверждай ТОЛЬКО перечисленное выше, НЕ приписывай "
-            "данные, которых клиент не присылал, и НЕ проси повторно то, что клиент уже прислал.")
+            "данные, которых клиент не присылал, и НЕ проси повторно то, что клиент уже прислал. "
+            "Слово «получили» — ТОЛЬКО про реальное вложение (фото/оплата); про информацию "
+            "(модель/даты/локацию/телефон) говори «учли/понял».")
 
 
 def collected_manager_note(facts: dict, lang: str = "ru") -> str:
@@ -2677,6 +2740,14 @@ _DELIVERY_OPEN, _DELIVERY_CLOSE = "<<<DELIVERY>>>", "<<<END_DELIVERY>>>"
 _DELIVERY_BLOCK_RE = re.compile(
     re.escape(_DELIVERY_OPEN) + r"\n(.*?)\n" + re.escape(_DELIVERY_CLOSE), re.S)
 
+# ФОЛБЭК-блок ДОСТАВКИ (дефект #303/1): клиент дал локацию (ссылку/пин), но сопоставить её с зоной
+# НЕ удалось (uncertain/[уточнить]) → инструкция LLM «спроси район, вот доступные районы». В отличие
+# от <<<DELIVERY>>> этот блок НЕ несёт цену и ВИДЕН LLM (это подсказка «что спросить», не квитанция) —
+# make_system_prompt вплетает его текст в Этап 2, а сырые маркеры из промпта вырезает.
+_DELIVERY_ASK_OPEN, _DELIVERY_ASK_CLOSE = "<<<DELIVERY_ASK>>>", "<<<END_DELIVERY_ASK>>>"
+_DELIVERY_ASK_BLOCK_RE = re.compile(
+    re.escape(_DELIVERY_ASK_OPEN) + r"\n(.*?)\n" + re.escape(_DELIVERY_ASK_CLOSE), re.S)
+
 
 def _sheet_block_from_note(pricing_note):
     """Чистый прайс-блок из служебных скобок pricing_note → текст | None (не sheet-режим /
@@ -2766,36 +2837,122 @@ def compose_delivery_draft(llm_text, block, lang="ru"):
     return t + "\n\n" + b
 
 
-def _delivery_quote_line(text, lang="ru", _resolve=None):
-    """Клиентская строка ДОСТАВКИ по maps-ссылке клиента (несёт КОД, не LLM), либо None.
-    None → ссылки нет ИЛИ доставку не определили (uncertain/[уточнить]): остаётся текущий честный
-    путь — район уточнит менеджер, цифру НЕ выдумываем. Число даём ТОЛЬКО при zone/out_belt.
-    _resolve — инъекция для тестов (по умолчанию delivery.resolve_delivery_from_text; сеть/Bridge)."""
-    try:
-        res = (_resolve or delivery.resolve_delivery_from_text)(text)
-    except Exception as e:
-        log.info(f"_delivery_quote_line: резолв упал ({type(e).__name__}) — без строки доставки")
-        return None
+def _delivery_client_line(res, lang="ru"):
+    """Клиентская строка ДОСТАВКИ из результата резолва (dict resolve_delivery) → текст | None.
+    zone → «Доставка в <зона> — N ฿ …» (называем ЗОНУ), out_belt → «Доставка — N ฿ …» (зоны нет);
+    uncertain/None/битая цена → None (цифру НЕ выдумываем — уводим в фолбэк-вопрос про район).
+    Дефект #303/1: при оплаченной доставке забор байка в конце аренды бесплатный."""
     if not isinstance(res, dict) or res.get("status") not in ("zone", "out_belt"):
         return None
     price = res.get("price")
     if isinstance(price, bool) or not isinstance(price, (int, float)):
         return None
     n = int(price)
+    zone = res.get("zone")
     if lang == "en":
-        return f"Delivery — {n} ฿ (bike pickup at the end of the rental is free)."
-    return f"Доставка — {n} ฿ (забор байка в конце аренды — бесплатный)."
+        where = f" to {zone}" if zone else ""
+        return (f"Delivery{where} — {n} ฿ (with paid delivery, bike pickup at the end of the "
+                f"rental is free).")
+    where = f" в {zone}" if zone else ""
+    return (f"Доставка{where} — {n} ฿ (при оплаченной доставке забор байка в конце аренды "
+            f"бесплатный).")
 
 
-def _delivery_note_block(hints, lang="ru"):
-    """Служебный <<<DELIVERY>>>-блок для pricing_note (тот же транспорт, что <<<QUOTE>>>), либо ''
-    если доставку не определили по maps-ссылке клиента. Ставится рядом с quote-блоком в
-    build_pricing_note; в промпт не попадает, в финал его вставит compose_delivery_draft (КОД)."""
-    text = hints.get("maps_link") if isinstance(hints, dict) else None
-    line = _delivery_quote_line(text, lang)
-    if not line:
-        return ""
-    return "\n" + _DELIVERY_OPEN + "\n" + line + "\n" + _DELIVERY_CLOSE
+def _delivery_quote_line(text, lang="ru", _resolve=None):
+    """Клиентская строка ДОСТАВКИ по maps-ссылке клиента (несёт КОД, не LLM), либо None. Тонкая
+    обёртка над резолвером+_delivery_client_line (сохранена для существующих мок-тестов). None →
+    ссылки нет ИЛИ доставку не определили (uncertain): район уточнит менеджер, цифру НЕ выдумываем.
+    _resolve — инъекция для тестов (по умолчанию delivery.resolve_delivery_from_text; сеть/Bridge)."""
+    try:
+        res = (_resolve or delivery.resolve_delivery_from_text)(text)
+    except Exception as e:
+        log.info(f"_delivery_quote_line: резолв упал ({type(e).__name__}) — без строки доставки")
+        return None
+    return _delivery_client_line(res, lang)
+
+
+def _resolve_delivery_for_draft(hints, _resolve_coords=None, _resolve_text=None):
+    """ЕДИНЫЙ резолв доставки для черновика (независим от ценового исхода). Порядок источников:
+    сперва гео-ПИН (готовые координаты hints['geo_pin']), затем maps-ссылка (hints['maps_link']).
+    Возвращает dict resolve_delivery (status=zone/out_belt/uncertain), либо None — клиент НЕ давал ни
+    пина, ни ссылки (доставку не трогаем: обычный путь Этапа 2). Инъекции для тестов; не роняет код."""
+    if not isinstance(hints, dict):
+        return None
+    pin = hints.get("geo_pin")
+    if pin:
+        try:
+            res = (_resolve_coords or delivery.resolve_delivery_from_coords)(pin[0], pin[1])
+        except Exception as e:
+            log.info(f"_resolve_delivery_for_draft: пин упал ({type(e).__name__})")
+            res = None
+        if isinstance(res, dict):
+            return res
+    text = hints.get("maps_link")
+    if text:
+        try:
+            res = (_resolve_text or delivery.resolve_delivery_from_text)(text)
+        except Exception as e:
+            log.info(f"_resolve_delivery_for_draft: ссылка упала ({type(e).__name__})")
+            res = None
+        if isinstance(res, dict):
+            return res
+    return None
+
+
+def _delivery_zone_names(_zones=None):
+    """Имена зон доставки из Bridge (для фолбэк-перечня районов) → list[str] (может быть пустым).
+    Не роняет вызывающий код: Bridge недоступен / мусор → []."""
+    try:
+        zones = _zones if _zones is not None else delivery.get_delivery_zones()
+    except Exception:
+        zones = None
+    names = []
+    for z in (zones or []):
+        try:
+            nm = delivery._zone_as_dict(z).get("name")
+        except Exception:
+            nm = None
+        if nm:
+            names.append(str(nm))
+    return names
+
+
+def _delivery_ask_block(lang="ru", _zones=None):
+    """ФОЛБЭК-блок <<<DELIVERY_ASK>>>: клиент дал локацию, но зону НЕ определили — инструкция LLM
+    спросить РАЙОН доставки, перечислив доступные районы (имена зон Bridge). Зоны недоступны → без
+    списка (общий вопрос про район). Блок ВИДЕН LLM (это «что спросить», не цена)."""
+    names = _delivery_zone_names(_zones)
+    if lang == "en":
+        body = ("DELIVERY (location not matched to a zone): the client shared a location, but we "
+                "could NOT map it to a delivery zone — ask which district the delivery is for")
+        if names:
+            body += " (our districts: " + ", ".join(names) + ")"
+        body += "; do NOT name any delivery price until the district is clear."
+    else:
+        body = ("ДОСТАВКА (локацию с зоной не сопоставили): клиент дал локацию, но сопоставить её с "
+                "зоной доставки НЕ удалось — спроси у клиента, в какой РАЙОН нужна доставка")
+        if names:
+            body += " (наши районы: " + ", ".join(names) + ")"
+        body += "; цену доставки НЕ называй, пока район не ясен."
+    return "\n" + _DELIVERY_ASK_OPEN + "\n" + body + "\n" + _DELIVERY_ASK_CLOSE
+
+
+def _delivery_note_block(hints, lang="ru", _resolve=None, _zones=None):
+    """Секция ДОСТАВКИ для pricing_note (единая точка, НЕзависимая от ценового исхода — дефект
+    #303/1). По локации клиента (пин ИЛИ maps-ссылка):
+      • zone/out_belt → служебный <<<DELIVERY>>>-блок с клиентской строкой (цену доносит КОД через
+        compose_delivery_draft; make_system_prompt по наличию блока НЕ велит спрашивать район);
+      • uncertain (точку дали, но зону не свели) → <<<DELIVERY_ASK>>>-блок с перечнем районов
+        (фолбэк-вопрос: район уточняем, цену не выдумываем);
+      • ни пина, ни ссылки → '' (доставку не трогаем — обычный путь Этапа 2).
+    _resolve/_zones — инъекция для тестов."""
+    res = _resolve_delivery_for_draft(hints) if _resolve is None else _resolve(hints)
+    if res is None:
+        return ""                                    # ни пина, ни ссылки — доставку не трогаем
+    line = _delivery_client_line(res, lang)
+    if line:
+        return "\n" + _DELIVERY_OPEN + "\n" + line + "\n" + _DELIVERY_CLOSE
+    return _delivery_ask_block(lang, _zones=_zones)  # uncertain → фолбэк-вопрос с перечнем районов
 
 
 def _wrap_price_sheet(body, ds, lang="ru", default_anchor=False) -> str:
@@ -2877,10 +3034,19 @@ def build_price_sheet_note(hints, lang="ru", getter=None, today=None):
 
 
 def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -> str:
+    """Инструкция по цене для промпта + секция ДОСТАВКИ. ЦЕНОВУЮ часть считает _build_pricing_note_core;
+    доставку (пин/ссылка → зона/цена ЛИБО фолбэк-вопрос про район) добавляет _delivery_note_block ОДИН
+    раз, НЕзависимо от ценового исхода (дефект #303/1: район не спрашиваем, если зону определили)."""
+    note = _build_pricing_note_core(hints, lang=lang, getter=getter, today=today) or ""
+    return note + _delivery_note_block(hints, lang)
+
+
+def _build_pricing_note_core(hints: dict, lang: str = "ru", getter=None, today=None) -> str:
     """Инструкция по цене для промпта. ИНВАРИАНТ: без котировки из Календаря — без числа.
     Правила цен v2: кап низкого сезона (п.1), минимальный срок (п.2), несколько моделей одной
     строкой каждая (п.3), депозит при нескольких байках (п.4), J-текст дословно (п.5).
-    Сценарий price_sheet (прайс по всему парку) перехватывается ПЕРВЫМ."""
+    Сценарий price_sheet (прайс по всему парку) перехватывается ПЕРВЫМ.
+    ДОСТАВКУ здесь НЕ добавляем — её централизованно доклеивает build_pricing_note (обёртка)."""
     # (п.4) депозит при нескольких байках — инструкция дописывается к ЛЮБОМУ исходу цены.
     dep = (" " + DEPOSIT_MULTI_NOTE) if hints.get("deposit_multi_q") else ""
     # «N юнитов одной модели» (пара XMAX): цена/депозит Bridge = ЗА КАЖДЫЙ, общий итог не выдумываем.
@@ -2966,9 +3132,6 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
             base = f"{label} — {qphrase}" if label else qphrase.rstrip(".")
             qline = (base + ". " + _units_per_each_line(_uc, lang)) if units else (base + ".")
             note += "\n" + _QUOTE_OPEN + "\n" + qline + "\n" + _QUOTE_CLOSE
-            # ДОСТАВКА (шаг 5/7 #12): по maps-ссылке клиента считаем цену доставки КОДОМ и несём её
-            # тем же транспортом рядом с quote-блоком; нет ссылки/зон/Bridge → '' (честный [уточнить]).
-            note += _delivery_note_block(hints, lang)
         return note
 
     # (п.3) несколько продуктов (несколько моделей ИЛИ два поколения XMAX) — раздельная цена по
@@ -2995,8 +3158,6 @@ def build_pricing_note(hints: dict, lang: str = "ru", getter=None, today=None) -
     if units and ok_lines:
         block = "\n".join(ok_lines) + "\n" + _units_per_each_line(_uc, lang)
         note += "\n" + _QUOTE_OPEN + "\n" + block + "\n" + _QUOTE_CLOSE
-        # ДОСТАВКА (шаг 5/7 #12): та же врезка рядом с quote-блоком и в multi-юнит случае.
-        note += _delivery_note_block(hints, lang)
     return note
 
 
@@ -3049,7 +3210,10 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
             "\n\nЭто ПРОДОЛЖЕНИЕ диалога (клиент уже поздоровался/получил автоприветствие) — "
             "НЕ здоровайся повторно. НЕ начинай ответ с «Здравствуйте/Привет/Приветствую/Добрый "
             "день|утро|вечер/Спасибо, что написали|выбрали нас/Hello/Hi» и подобных зачинов — "
-            "сразу отвечай по сути."
+            "сразу отвечай по сути. И НЕ повторяй СОЦ-ДОКАЗАТЕЛЬСТВО (отзывы, рейтинг, «точки на "
+            "карте / на Google Maps с отзывами», «N+ довольных клиентов/аренд», ссылки на отзывы) — "
+            "оно уместно ТОЛЬКО в первом приветствии; в продолжении диалога его НЕ дублируй, отвечай "
+            "лаконично по сути запроса."
         )
     # Живой провал 20:59 (черновик #275): сетка ПРАЙС ПО ПАРКУ дошла до промпта, но policy ниже
     # («СТРОГО»: «Дат нет — сперва спроси даты», цена только из блока «ЦЕНА из Календаря») её не
@@ -3105,15 +3269,34 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
                   "и есть цена; даты для этого НЕ нужны. ")
     else:
         stage1 = "Этап 1 — ЦЕНА: назови цену по датам из Календаря (если она в блоке ЦЕНА выше). "
+    # Этап 2 — ДОСТАВКА (дефект #303/1): если по локации клиента (пин/ссылка) зона и цена доставки
+    # УЖЕ определены (служебный <<<DELIVERY>>>-блок ниже) — район НЕ переспрашиваем, цену доносит КОД.
+    # Если локацию с зоной свести не удалось (<<<DELIVERY_ASK>>>-блок) — спрашиваем район с перечнем
+    # районов (фолбэк). Локации нет вовсе — прежний общий путь «уточни район доставки».
+    _dlv_resolved = bool(_DELIVERY_BLOCK_RE.search(pricing_note or ""))
+    _dlv_ask_m = _DELIVERY_ASK_BLOCK_RE.search(pricing_note or "")
+    if _dlv_resolved:
+        stage2 = (
+            "Этап 2 — ДОСТАВКА: зона и стоимость доставки УЖЕ определены по локации клиента и "
+            "добавлены КОДОМ ниже — район у клиента НЕ переспрашивай и перечень районов НЕ давай; "
+            "подтверди доставку в его зону и добавь, что забор байка в конце аренды БЕСПЛАТНЫЙ ПРИ "
+            "ОПЛАЧЕННОЙ доставке (при самовывозе бесплатного забора НЕ обещай).\n")
+    elif _dlv_ask_m:
+        stage2 = (
+            "Этап 2 — " + _dlv_ask_m.group(1).strip() + " Добавь, что забор байка в конце аренды "
+            "БЕСПЛАТНЫЙ ПРИ ОПЛАЧЕННОЙ доставке (при самовывозе бесплатного забора НЕ обещай).\n")
+    else:
+        stage2 = (
+            "Этап 2 — ДОСТАВКА: когда клиент заинтересовался ценой — уточни район доставки и назови "
+            "её стоимость по прайсу районов; добавь, что забор байка в конце аренды БЕСПЛАТНЫЙ ПРИ "
+            "ОПЛАЧЕННОЙ доставке (если клиент забирает сам/самовывоз — бесплатного забора НЕ обещай).\n")
     scenario = (
         "\n\n[ВНУТРЕННИЙ КОНТЕКСТ — только для тебя, клиенту НЕ показывать; номера этапов и "
         "слова «этап»/«стадия» в самом ответе НЕ упоминать]\n"
         "ПОРЯДОК ДИАЛОГА (СТРОГО по этапам, не забегай вперёд):\n"
         + stage1 +
         "На этом этапе НЕ проси паспорт, апартаменты и шлемы — только цена и наличие.\n"
-        "Этап 2 — ДОСТАВКА: когда клиент заинтересовался ценой — уточни район доставки и назови "
-        "её стоимость по прайсу районов; добавь, что забор байка в конце аренды БЕСПЛАТНЫЙ ПРИ "
-        "ОПЛАЧЕННОЙ доставке (если клиент забирает сам/самовывоз — бесплатного забора НЕ обещай).\n"
+        + stage2 +
         "Этап 3 — БРОНЬ: только когда клиент готов бронировать — запроси качественное фото "
         "паспорта, название апартаментов (или ссылку Google Maps), количество шлемов и "
         "номер(а) телефона. Раньше этапа 3 документы/апартаменты/шлемы не запрашивай.\n"
@@ -3139,6 +3322,10 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
     # ВЫРЕЗАЕМ, чтобы LLM цену доставки не видел (не сгенерировал/не переписал); вставит её КОД.
     if _DELIVERY_BLOCK_RE.search(pn_prompt or ""):
         pn_prompt = _DELIVERY_BLOCK_RE.sub("", pn_prompt).rstrip()
+    # Фолбэк-блок ДОСТАВКИ (<<<DELIVERY_ASK>>>): его текст УЖЕ вплетён в Этап 2 сценария — сырые
+    # маркеры из промпта ВЫРЕЗАЕМ (дубля и утечки «<<<…>>>» клиенту быть не должно).
+    if _DELIVERY_ASK_BLOCK_RE.search(pn_prompt or ""):
+        pn_prompt = _DELIVERY_ASK_BLOCK_RE.sub("", pn_prompt).rstrip()
     price_block = ("\n\n" + pn_prompt) if pn_prompt else ""
     # СТРАТЕГИЯ-директива менеджера: высший приоритет по СОДЕРЖАНИЮ/логике/тону ответа, НО
     # ценовую политику и критичные факты НЕ отменяет (они ниже — незыблемы).
@@ -3187,7 +3374,8 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         + pressure_block
         + directive_block + park_block + collected_block + greet + policy + scenario + ANTI_LOOP_NOTE + price_block + "\n\n"
         + CRITICAL_FACTS + EXPERIENCE_SAFETY_RULE + APPROVAL_WHITELIST_RULE
-        + AVAILABILITY_INVARIANT_RULE + GENERATION_DEFAULT_RULE + PICKUP_RULE + playbook_block
+        + AVAILABILITY_INVARIANT_RULE + GENERATION_DEFAULT_RULE + PICKUP_RULE + RECEIPT_LEXICON_RULE
+        + playbook_block
         + "\n\nFAQ и эталонные формулировки:\n" + (faq or "(FAQ недоступен — опирайся на критичные факты выше)")
         + STYLE_FEWSHOT
     )

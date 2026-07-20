@@ -529,3 +529,21 @@ def resolve_delivery_from_text(text, _get_zones=None, _resolve_maps=None, cfg=No
     except Exception as e:
         log.info(f"resolve_delivery_from_text упал ({type(e).__name__}) — None")
         return None
+
+
+def resolve_delivery_from_coords(lat, lon, _get_zones=None, cfg=None):
+    """ГОТОВЫЕ координаты точки доставки (гео-ПИН Telegram: клиент кинул локацию, а не ссылку) →
+    результат resolve_delivery, либо None если координаты битые/не заданы (пина по сути нет).
+    Зоны берём из Bridge (get_delivery_zones); их недоступность → resolve_delivery честно даст
+    uncertion ([уточнить]) — цену по пину не выдумываем. _get_zones/cfg — инъекция для тестов.
+    Тот же контракт, что resolve_delivery_from_text (dict status=zone/out_belt/uncertain), но вход —
+    уже координаты, а не текст со ссылкой. НИКОГДА не роняет вызывающий код."""
+    try:
+        pt = _valid_latlon(lat, lon)
+        if pt is None:                       # нет/битые координаты → пина нет (не [уточнить], а None)
+            return None
+        zones = (_get_zones or get_delivery_zones)()
+        return resolve_delivery(pt[0], pt[1], zones, cfg=cfg)
+    except Exception as e:
+        log.info(f"resolve_delivery_from_coords упал ({type(e).__name__}) — None")
+        return None

@@ -495,6 +495,40 @@ class TestResolveDeliveryFromText(unittest.TestCase):
         self.assertIsNone(r)
 
 
+class TestResolveDeliveryFromCoords(unittest.TestCase):
+    """Гео-ПИН (готовые координаты) → доставка. Зоны инъектируются: координаты+зоны → цена;
+    координаты без зон → [уточнить]; битые координаты → None (пина нет); исключение → None."""
+
+    ZONES = [{"name": "Раваи", "lat": 7.88, "lon": 98.33, "radius_km": 5, "price": 250}]
+
+    def test_coords_and_zones_give_price(self):
+        r = delivery.resolve_delivery_from_coords(7.88, 98.33, _get_zones=lambda: self.ZONES)
+        self.assertEqual(r["status"], "zone")
+        self.assertEqual(r["zone"], "Раваи")
+        self.assertEqual(r["price"], 250)
+
+    def test_coords_but_no_zones_is_uncertain(self):
+        # Bridge зон не отдал → [уточнить] (цену по пину не выдумываем)
+        r = delivery.resolve_delivery_from_coords(7.88, 98.33, _get_zones=lambda: None)
+        self.assertEqual(r["status"], "uncertain")
+        self.assertEqual(r["marker"], "[уточнить]")
+
+    def test_far_point_out_of_zones_is_uncertain(self):
+        # Бангкок — вне всех зон Пхукета → [уточнить], НЕ случайная цена
+        r = delivery.resolve_delivery_from_coords(13.7563, 100.5018, _get_zones=lambda: self.ZONES)
+        self.assertEqual(r["status"], "uncertain")
+
+    def test_bad_coords_return_none(self):
+        # нет/битые координаты → None (пина по сути нет — не [уточнить])
+        self.assertIsNone(delivery.resolve_delivery_from_coords(None, None, _get_zones=lambda: self.ZONES))
+        self.assertIsNone(delivery.resolve_delivery_from_coords(999, 999, _get_zones=lambda: self.ZONES))
+
+    def test_exception_inside_returns_none(self):
+        def boom():
+            raise RuntimeError("bridge down")
+        self.assertIsNone(delivery.resolve_delivery_from_coords(7.88, 98.33, _get_zones=boom))
+
+
 class TestLivePositionalZones(unittest.TestCase):
     """Bug B (трасса #51): живой Bridge отдаёт зоны ПОЗИЦИОННЫМ списком
     `[name, lat, lon, price, radius]`, не словарём — резолвер обязан парсить ОБА формата.

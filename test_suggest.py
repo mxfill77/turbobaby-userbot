@@ -1002,49 +1002,57 @@ class TestCollectedTracker(unittest.TestCase):
         self.assertTrue(facts["phone"], f"телефон не собран:\n{tr}")
 
     def test_lesson292_geo_only_confirms_location_not_details(self):
-        """Урок №292 (родитель 152): клиент прислал ТОЛЬКО локацию (пин) — пример-подсказка обязана
-        подтверждать РОВНО локацию («локацию получил»), а не хвалиться «данные получил» (паспорта/тел/
-        оплаты не было). Голден-фраза из живого окна (правило-класс CLAUDE.md): один пин виллы."""
+        """Урок №292 (родитель 152) + дефект #303/2 (лексика «факты ≠ артефакты»): клиент прислал
+        ТОЛЬКО локацию (пин) — пример-подсказка подтверждает РОВНО локацию, но словом «учли» (локация
+        = ИНФОРМАЦИЯ, не вложение), а НЕ «получили»; и НЕ хвалится «данные» (паспорта/тел/оплаты не
+        было). Голден-фраза из живого окна (правило-класс CLAUDE.md): один пин виллы."""
         loc_only = f"[клиент]: Привет! Вот моя вилла: {self.MAPS}"
         facts = suggest.collected_facts(loc_only)
         self.assertTrue(facts["geo"])
         self.assertFalse(any(facts[k] for k in facts if k != "geo"), facts)
         note = suggest.collected_prompt_note(facts, "ru")
-        self.assertIn("локацию получил", note)          # пример подтверждает ТОЛЬКО локацию
+        self.assertIn("локацию учли", note)             # локация = информация → «учли», не «получили»
+        self.assertNotIn("локацию получил", note)        # #303/2: про информацию «получили» НЕ пишем
         self.assertNotIn("данные получил", note)         # и НЕ приписывает несуществующие «данные»
         self.assertIn("подтверждай ТОЛЬКО перечисленное", note)  # явный запрет-приписка в промпте
-        # анти-тавтология: как только к гео добавится реальный факт — «данные» законны
+        # реальное ВЛОЖЕНИЕ (фото паспорта) → «получили» законно; локация остаётся «учли»
         facts_more = dict(facts, passport=True)
-        self.assertIn("локацию и данные получил", suggest.collected_prompt_note(facts_more, "ru"))
+        note_more = suggest.collected_prompt_note(facts_more, "ru")
+        self.assertIn("фото получили", note_more)        # фото = вложение → «получили»
+        self.assertIn("остальное учли", note_more)       # локация (инфо) — «учли», не «получили»
 
     def test_lesson292_step3_geo_only_verbatim_cryptopeppa_303(self):
         """Урок №292, шаг 3/6 (родитель 152): ДОСЛОВНАЯ гео-only фраза из ЖИВОГО окна @cryptopeppa
         (client_id=529849022, черновик #303). Клиент прислал ТОЛЬКО пин-локацию — короткую ссылку
         Google Maps (снята дословно из userbot-лога окна #303, сообщение от 2026-07-15). Живой провал:
-        бот ответил «Локацию и данные получил», хотя паспорт/тел/оплату клиент НЕ присылал. Golden-
-        правило CLAUDE.md: тест несёт дословную фразу клиента, а не идеализированную — на один лишь пин
-        черновик подтверждает РОВНО локацию и НЕ хвалится «данные получил»."""
+        бот ответил «Локацию и данные получил», хотя паспорт/тел/оплату клиент НЕ присылал. Дефект
+        #303/2 (лексика «факты ≠ артефакты»): локация — ИНФОРМАЦИЯ, её подтверждаем «учли», а «получили»
+        оставляем реальным вложениям (фото/оплата). Golden-правило CLAUDE.md: дословная фраза клиента —
+        на один лишь пин черновик подтверждает РОВНО локацию словом «учли», без «получили»/«данные»."""
         LIVE_PIN = "https://maps.app.goo.gl/c4G4B3sNrfJZBSue6?g_st=ac"   # дословно из окна #303
         facts = suggest.collected_facts(f"[клиент]: {LIVE_PIN}")
         self.assertTrue(facts["geo"], f"живой пин не собран как гео:\n{LIVE_PIN}")
         self.assertFalse(any(facts[k] for k in facts if k != "geo"), facts)  # ровно локация, «данных» нет
         note = suggest.collected_prompt_note(facts, "ru")
-        self.assertIn("локацию получил", note)          # пример подтверждает ТОЛЬКО локацию
+        self.assertIn("локацию учли", note)             # локация = информация → «учли»
+        self.assertNotIn("локацию получил", note)        # #303/2: про информацию «получили» НЕ пишем
         self.assertNotIn("данные получил", note)         # и НЕ приписывает несуществующие «данные»
-        # черновик по этому окну: LLM следует подсказке промпта → тело подтверждает локацию без «данные получил»
+        # черновик по этому окну: LLM следует подсказке промпта → тело подтверждает локацию словом «учли»
         seen = {}
 
         def cap(system, user):
             seen["system"] = system
-            return "Локацию получил, спасибо 🤝 Уточню детали по вашему адресу."
+            return "Локацию учли, спасибо 🤝 Уточню детали по вашему адресу."
 
         d = suggest.generate_draft(f"[клиент]: {LIVE_PIN}", "ru", "FAQ", call_llm=cap)
-        self.assertIn("локацию получил", seen["system"])     # промпт велит подтвердить ТОЛЬКО локацию
+        self.assertIn("локацию учли", seen["system"])        # промпт велит подтвердить локацию словом «учли»
+        self.assertNotIn("локацию получил", seen["system"])  # и НЕ моделирует «получили» для информации
         self.assertNotIn("данные получил", seen["system"])   # и не инструктирует ложную квитанцию
+        self.assertIn("ЛЕКСИКА КВИТАНЦИИ", seen["system"])   # #303/2: правило-лексика в промпте
         self.assertIn("[собрано: гео ✅]", d)                 # служебная пометка: собрана ровно гео
         client = suggest.client_facing_text(d)
-        self.assertIn("Локацию получил", client)             # локацию подтверждает
-        self.assertNotIn("данные получил", client.lower())   # но не хвалится «данные получил»
+        self.assertIn("Локацию учли", client)                # локацию подтверждает словом «учли»
+        self.assertNotIn("получил", client.lower())          # но не «получил» (это про вложения)
 
     def test_golden_prompt_says_no_reask_and_confirm(self):
         tr = self._three_vot_transcript()
@@ -1052,7 +1060,9 @@ class TestCollectedTracker(unittest.TestCase):
         p = suggest.make_system_prompt("FAQ", "ru", collected=facts)
         self.assertIn("УЖЕ ПОЛУЧЕНО", p)
         self.assertIn("НЕ переспрашивай", p)
-        self.assertIn("локацию и данные получил", p)   # инструктируем фразу-подтверждение
+        # three_vot = гео+паспорт(фото)+телефон: фото = вложение → «получили», локация/тел (инфо) → «учли»
+        self.assertIn("фото получили", p)              # инструктируем фразу-подтверждение (вложение)
+        self.assertIn("остальное учли", p)             # информацию — «учли», не «получили» (#303/2)
         for lbl in ("локация", "фото паспорта", "телефон"):
             self.assertIn(lbl, p)
 
@@ -3935,6 +3945,207 @@ class TestDeliveryCodeBlock(unittest.TestCase):
         self.assertIsNone(h["maps_link"])
 
 
+def _has_thai_letters(s):
+    """Тайские буквы/гласные/тоны в строке (класс регрессий «тайский в выводе»), НО НЕ знак бата
+    ฿ (U+0E3F) — он легитимен в ценах. Возвращает True при наличии тайских СИМВОЛОВ языка."""
+    return any(("ก" <= ch <= "ฺ") or ("เ" <= ch <= "๛") for ch in (s or ""))
+
+
+class TestDeliveryZoneResolveInDraft(unittest.TestCase):
+    """Дефект #303/1 (@cryptopeppa 20.07 23:59): зона доставки резолвится по maps-ссылке ИЛИ гео-пину
+    → тариф СРАЗУ в черновик, район у клиента НЕ переспрашиваем. Только при неопределённой зоне
+    (точка вне зон / нет координат) — фолбэк-вопрос с перечнем районов. Зоны — ЖИВОЙ формат Bridge."""
+
+    with open(os.path.join(suggest.BASE_DIR, "fixtures", "delivery_zones_get.live.json"),
+              encoding="utf-8") as _f:
+        ZONES = json.load(_f)["zones"]           # позиционный список листа [name,lat,lon,price,radius]
+    RAWAI = (7.771, 98.327)                       # якорь зоны Раваи (цена 590 из фикстуры)
+    FAR = (13.7563, 100.5018)                     # Бангкок — заведомо вне всех зон Пхукета
+
+    def setUp(self):
+        self._save = (suggest.delivery.resolve_delivery_from_text,
+                      suggest.delivery.resolve_delivery_from_coords,
+                      suggest.delivery.get_delivery_zones)
+        suggest.delivery.get_delivery_zones = lambda *a, **k: self.ZONES
+
+    def tearDown(self):
+        (suggest.delivery.resolve_delivery_from_text,
+         suggest.delivery.resolve_delivery_from_coords,
+         suggest.delivery.get_delivery_zones) = self._save
+
+    def _hints(self, **extra):
+        h = {"has_dates": False, "model": None, "models": [], "maps_link": None, "geo_pin": None,
+             "deposit_multi_q": False, "units_count": None, "old_gen_q": False,
+             "deposit_passport_q": False, "percent_q": None, "sheet_filter": None,
+             "price_sheet_q": False, "iso_start": None, "iso_end": None, "hint_days": None,
+             "monthly": False}
+        h.update(extra)
+        return h
+
+    def _resolve_at(self, lat, lon):
+        # реальный resolve_delivery на живых зонах — по заданной точке (мок «мок = живой формат»)
+        return lambda text=None, *a, **k: suggest.delivery.resolve_delivery(lat, lon, self.ZONES)
+
+    # ------------------------- Maps-ссылка → зона → тариф --------------------------
+
+    def test_maps_link_resolves_zone_into_draft_no_district_question(self):
+        # ЖИВОЙ КЕЙС @cryptopeppa: у бота есть maps-ссылка → зона+цена в черновик, район НЕ спрашиваем.
+        suggest.delivery.resolve_delivery_from_text = self._resolve_at(*self.RAWAI)
+        note = suggest.build_pricing_note(self._hints(maps_link="https://maps.app.goo.gl/x"), lang="ru")
+        dblock = suggest._delivery_block_from_note(note)
+        self.assertIsNotNone(dblock)                         # строка доставки собрана
+        self.assertIn("590", dblock)                         # цена зоны Раваи из Bridge
+        self.assertIn("Раваи", dblock)                       # имя зоны названо (не безымянно)
+        p = suggest.make_system_prompt("FAQ", "ru", pricing_note=note)
+        self.assertIn("район у клиента НЕ переспрашивай", p)  # зона определена → район не спрашиваем
+        self.assertNotIn("уточни район доставки и назови", p)  # старый фолбэк-вопрос НЕ активен
+        self.assertNotIn("<<<DELIVERY>>>", p)                # сырой служебный маркер не утёк
+        self.assertNotIn("Доставка в Раваи — 590", p)        # КЛИЕНТСКУЮ строку доставки LLM не видит
+
+    def test_maps_link_out_belt_no_zone_name(self):
+        # точка в периферийном поясе (за радиусом зоны, ≤ +5 км) → цена пояса без имени зоны
+        suggest.delivery.resolve_delivery_from_text = lambda text=None, *a, **k: {
+            "status": "out_belt", "zone": None, "price": 1490, "distance_km": 8.0, "marker": None}
+        note = suggest.build_pricing_note(self._hints(maps_link="https://x"), lang="ru")
+        dblock = suggest._delivery_block_from_note(note)
+        self.assertIn("1490", dblock)
+        self.assertIn("Доставка — 1490", dblock)             # без « в <зона>» (пояс — имени зоны нет)
+
+    # ------------------------------ Гео-пин → зона → тариф ----------------------------
+
+    def test_geo_pin_resolves_zone_into_draft(self):
+        # клиент кинул ЛОКАЦИЮ (пин) — координаты в hints.geo_pin → зона/цена в черновик (реальный
+        # resolve_delivery_from_coords через Bridge-зоны), маркер маршрут той же формы, что ссылка.
+        note = suggest.build_pricing_note(self._hints(geo_pin=self.RAWAI), lang="ru")
+        dblock = suggest._delivery_block_from_note(note)
+        self.assertIsNotNone(dblock)
+        self.assertIn("590", dblock)
+        self.assertIn("Раваи", dblock)
+
+    def test_transcript_geo_pin_marker_extracts_coords_and_geo_fact(self):
+        # transcript_from пишет пин как «[локация lat,lon]»; hints достаёт coords, трекер — гео-факт
+        tr = "[клиент]: nmax на 5 дней\n[клиент]: [локация 7.771000,98.327000]"
+        h = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        self.assertEqual(h["geo_pin"], (7.771, 98.327))
+        self.assertTrue(suggest.collected_facts(tr)["geo"])  # маркер-пин с координатами ловится как гео
+
+    def test_geo_pin_preferred_over_link(self):
+        # есть и пин, и ссылка → берём ПИН (явную расшаренную точку); coords резолвятся первыми
+        suggest.delivery.resolve_delivery_from_text = self._resolve_at(*self.FAR)   # ссылка «увела бы»
+        note = suggest.build_pricing_note(
+            self._hints(geo_pin=self.RAWAI, maps_link="https://x"), lang="ru")
+        dblock = suggest._delivery_block_from_note(note)
+        self.assertIn("Раваи", dblock)                       # зона по ПИНУ, не по ссылке
+
+    # -------------------- вне зон / нет координат → фолбэк с перечнем ---------------------
+
+    def test_out_of_zones_falls_back_to_district_question_with_list(self):
+        # точка далеко вне всех зон (Бангкок) → uncertain → фолбэк-вопрос С ПЕРЕЧНЕМ районов, БЕЗ цены
+        suggest.delivery.resolve_delivery_from_text = self._resolve_at(*self.FAR)
+        note = suggest.build_pricing_note(self._hints(maps_link="https://maps.app.goo.gl/far"), lang="ru")
+        self.assertIsNone(suggest._delivery_block_from_note(note))   # цену НЕ выдумываем
+        ask = suggest._DELIVERY_ASK_BLOCK_RE.search(note)
+        self.assertIsNotNone(ask)                                    # фолбэк-блок собран
+        self.assertIn("Раваи", ask.group(1))                        # перечень районов из Bridge
+        self.assertIn("Патонг", ask.group(1))
+        p = suggest.make_system_prompt("FAQ", "ru", pricing_note=note)
+        self.assertIn("в какой РАЙОН", p)                            # спрашиваем район
+        self.assertIn("Раваи", p)                                    # с перечнем районов
+        self.assertNotIn("<<<DELIVERY_ASK>>>", p)                   # сырые маркеры не утекли
+
+    def test_link_without_coords_falls_back_with_list(self):
+        # ссылка была, но координат из неё не достали → resolve_delivery(None,None,None) = uncertain
+        suggest.delivery.resolve_delivery_from_text = lambda text=None, *a, **k: (
+            suggest.delivery.resolve_delivery(None, None, None) if text else None)
+        note = suggest.build_pricing_note(self._hints(maps_link="https://x"), lang="ru")
+        self.assertIsNone(suggest._delivery_block_from_note(note))
+        self.assertIsNotNone(suggest._DELIVERY_ASK_BLOCK_RE.search(note))
+
+    def test_uncertain_without_bridge_zones_generic_ask(self):
+        # зоны Bridge недоступны → фолбэк-вопрос без перечня (общий), но БЕЗ падения/цены
+        suggest.delivery.get_delivery_zones = lambda *a, **k: None
+        suggest.delivery.resolve_delivery_from_text = lambda text=None, *a, **k: (
+            suggest.delivery.resolve_delivery(None, None, None) if text else None)
+        note = suggest.build_pricing_note(self._hints(maps_link="https://x"), lang="ru")
+        ask = suggest._DELIVERY_ASK_BLOCK_RE.search(note)
+        self.assertIsNotNone(ask)
+        self.assertNotIn("наши районы", ask.group(1))               # зон нет → без перечня
+
+    def test_no_location_keeps_default_delivery_stage(self):
+        # ни пина, ни ссылки → доставку не трогаем: прежний общий путь Этапа 2 (уточни район)
+        note = suggest.build_pricing_note(self._hints(), lang="ru")
+        self.assertIsNone(suggest._delivery_block_from_note(note))
+        self.assertIsNone(suggest._DELIVERY_ASK_BLOCK_RE.search(note))
+        p = suggest.make_system_prompt("FAQ", "ru", pricing_note=note)
+        self.assertIn("уточни район доставки", p)                    # прежний общий путь Этапа 2
+
+    # --------------------------------- анти-тайский ----------------------------------
+
+    def test_no_thai_in_delivery_line(self):
+        res = {"status": "zone", "zone": "Раваи", "price": 590, "distance_km": 1.0, "marker": None}
+        self.assertFalse(_has_thai_letters(suggest._delivery_client_line(res, "ru")))
+        self.assertFalse(_has_thai_letters(suggest._delivery_client_line(res, "en")))
+
+    def test_no_thai_in_ask_block(self):
+        self.assertFalse(_has_thai_letters(suggest._delivery_ask_block("ru", _zones=self.ZONES)))
+        self.assertFalse(_has_thai_letters(suggest._delivery_ask_block("en", _zones=self.ZONES)))
+
+    def test_no_thai_in_generated_draft_with_zone(self):
+        # сквозной черновик с резолвом зоны: клиентское тело без тайских БУКВ (฿ легитимен)
+        suggest.delivery.resolve_delivery_from_text = self._resolve_at(*self.RAWAI)
+        note = suggest.build_pricing_note(self._hints(maps_link="https://x"), lang="ru")
+        d = suggest.generate_draft("[клиент]: вот локация https://x", "ru", "FAQ",
+                                   pricing_note=note, call_llm=lambda s, u: "Доставку подтверждаю.")
+        self.assertFalse(_has_thai_letters(suggest.client_facing_text(d)))
+
+
+class TestReceiptLexiconDefect303(unittest.TestCase):
+    """Дефект #303/2 «факты ≠ артефакты»: «получили» — ТОЛЬКО про реальное вложение (фото/оплата);
+    информацию (в т.ч. выбор паспорта как залога БЕЗ фото) подтверждаем «понял/учли», не «получили»."""
+
+    def test_lexicon_rule_in_prompt(self):
+        p = suggest.make_system_prompt("FAQ", "ru")
+        self.assertIn("ЛЕКСИКА КВИТАНЦИИ", p)
+        self.assertIn("НЕ пиши «паспорт получили»", p)
+
+    def test_passport_deposit_intent_without_photo_is_not_received(self):
+        # «депозит паспортом» БЕЗ фото → passport-факт False (намерение ≠ полученный документ)
+        tr = "[клиент]: nmax на 5 дней с 15 июля, депозит оставлю паспортом"
+        facts = suggest.collected_facts(tr, today=datetime.date(2026, 7, 11))
+        self.assertFalse(facts["passport"])                  # нет фото → не «получен»
+        note = suggest.collected_prompt_note(facts, "ru")
+        self.assertNotIn("паспорт получили", note)           # намерение-паспорт не звучит как «получили»
+        self.assertNotIn("паспорт", note.lower())            # «паспорт» в собранном (got) не появляется
+        # пример-подтверждение по инфо-только (модель/срок/даты) — «всё учли», без «получили»
+        self.assertEqual(suggest._confirm_example(facts, en=False), "всё учли")
+
+    def test_confirm_example_geo_only_uses_uchli(self):
+        facts = {"geo": True}
+        self.assertEqual(suggest._confirm_example(facts, en=False), "локацию учли")
+        self.assertNotIn("получил", suggest._confirm_example(facts, en=False))
+
+    def test_confirm_example_photo_uses_poluchili(self):
+        facts = {"passport": True, "geo": True}
+        ex = suggest._confirm_example(facts, en=False)
+        self.assertIn("фото получили", ex)                   # вложение → «получили»
+        self.assertIn("остальное учли", ex)                  # локация (инфо) → «учли»
+
+
+class TestLaconicSocialProofDefect303(unittest.TestCase):
+    """Дефект #303/3: соц-доказательство (точки/отзывы) — только в ПЕРВОМ приветствии; в продолжении
+    диалога его не дублируем (лаконичность)."""
+
+    def test_first_contact_prompt_has_no_suppression(self):
+        p = suggest.make_system_prompt("FAQ", "ru", is_first_contact=True)
+        self.assertNotIn("НЕ повторяй СОЦ-ДОКАЗАТЕЛЬСТВО", p)
+
+    def test_continuation_prompt_suppresses_social_proof(self):
+        p = suggest.make_system_prompt("FAQ", "ru", is_first_contact=False)
+        self.assertIn("СОЦ-ДОКАЗАТЕЛЬСТВО", p)
+        self.assertIn("отзыв", p.lower())
+        self.assertIn("только в первом приветствии", p.lower())
+
+
 class TestSheetSubselection(unittest.TestCase):
     """Подвыборки сетки («скутеры 200+», «мотоциклы до 400») — ДЕТЕРМИНИРОВАННЫЙ отбор КОДОМ из тех
     же rows, что и полная сетка (та же точка правды), БЕЗ LLM-отбора моделей. Класс-голден живого
@@ -4341,7 +4552,7 @@ class TestRunLiveSmoke(unittest.TestCase):
         self.assertTrue(all(c["ok"] for c in r["checks"]))
         client = suggest.client_facing_text(r["draft"])
         self.assertIn(self.J_LINE, client)                       # строка J посимвольно у клиента
-        self.assertIn("Доставка — 590 ฿", client)                # доставка = цена зоны Раваи
+        self.assertIn("Доставка в Раваи — 590 ฿", client)        # доставка = цена ЗОНЫ Раваи (с именем зоны)
 
     def test_red_violations_flagged_with_diff_card(self):
         # Живой контур «промахнулся» (wait_draft отдаёт черновик с остаточными нарушениями): год,
@@ -4350,7 +4561,7 @@ class TestRunLiveSmoke(unittest.TestCase):
             return ("Здравствуйте! Байк 2023 года свободен и в наличии 👍\n"
                     "NMAX — 2400 ฿ за 5 дней (Скидка за срок 15%, 480 ฿ в день); депозит 3000 ฿.\n"
                     "Ещё депозит 5000 ฿ или паспорт.\n"
-                    "Доставка — 590 ฿ (забор байка в конце аренды — бесплатный).\n"
+                    "Доставка в Раваи — 590 ฿ (при оплаченной доставке забор байка в конце аренды бесплатный).\n"
                     "Уточню детали и вернусь.")
         r = self._run(getter=self._getter(), resolve_delivery=self._resolve(), wait_draft=bad)
         self.assertEqual(r["status"], "failed")
@@ -4371,7 +4582,7 @@ class TestRunLiveSmoke(unittest.TestCase):
         # в карточке ожидание — дословная строка столбца J.
         async def reworded(win):
             return ("NMAX — 2400 ฿ за 5 дней; депозит 3000 ฿.\n"          # «Скидка за срок» вырезана
-                    "Доставка — 590 ฿ (забор байка в конце аренды — бесплатный).")
+                    "Доставка в Раваи — 590 ฿ (при оплаченной доставке забор байка в конце аренды бесплатный).")
         r = self._run(getter=self._getter(), resolve_delivery=self._resolve(), wait_draft=reworded)
         self.assertFalse(r["ok"])
         by = {c["name"]: c["ok"] for c in r["checks"]}
