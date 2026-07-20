@@ -1424,6 +1424,50 @@ class TestCollectedAttachmentOnly(unittest.TestCase):
         self.assertFalse(facts["payment"], f"Ярослава: предоплата/крипта-вопрос ложно ✅:\n{tr}")
 
 
+class TestTrackerDocsPromiseNoPassportTick766498048(unittest.TestCase):
+    """Шаг 2/5 (родитель #242) — класс «д» (документы обещаны, не присланы): живое окно
+    client_id=766498048. Клиент документы В ОКНО НЕ прислал, лишь обещает «I'll send the necessary
+    documents by tomorrow». Обещание = намерение, не полученный файл → трекер черновика обязан идти
+    БЕЗ «✅» у пункта «паспорт» (правило §243/6: ✅ ставим на ФАКТ вложения, а не на слова о нём).
+    Правило-класс CLAUDE.md: гоняем ДОСЛОВНУЮ фразу клиента сквозь ДЕТЕКТ (collected_facts →
+    collected_manager_note/_append_collected_note), а не подставляем facts руками. В окне намеренно
+    есть РЕАЛЬНО собранные гео (отель) и телефон — трекер непустой, и на его фоне отсутствие
+    «паспорт ✅» — осмысленный голден, а не «просто ничего не собрано»."""
+
+    # Дословная фраза-обещание документов из живого окна + реальные гео (имя отеля) и номер телефона.
+    WINDOW = ("[клиент]: Hotel Name: Cape Sienna Gourmet Hotel & Villas\n"
+              "[клиент]: My number +66 812345678\n"
+              "[клиент]: I'll send the necessary documents by tomorrow")
+
+    def test_docs_promise_passport_not_collected(self):
+        # Сквозь детект: гео и телефон РЕАЛЬНО собраны, паспорт — только обещан → ❌.
+        facts = suggest.collected_facts(self.WINDOW)
+        self.assertTrue(facts["geo"], f"названный отель не = гео ✅:\n{self.WINDOW}")
+        self.assertTrue(facts["phone"], f"реальный номер не = тел ✅:\n{self.WINDOW}")
+        self.assertFalse(facts["passport"],
+                         f"обещание прислать документы ложно = паспорт ✅:\n{self.WINDOW}")
+
+    def test_tracker_note_has_no_passport_tick(self):
+        # Трекер черновика (служебная пометка модератору): гео ✅ и тел ✅ есть, паспорт ✅ — НЕТ.
+        facts = suggest.collected_facts(self.WINDOW)
+        for lang, geo_lbl, phone_lbl, pass_lbl in (
+                ("en", "geo ✅", "phone ✅", "passport ✅"),
+                ("ru", "гео ✅", "тел ✅", "паспорт ✅")):
+            note = suggest.collected_manager_note(facts, lang)
+            self.assertIn(geo_lbl, note, note)
+            self.assertIn(phone_lbl, note, note)
+            self.assertNotIn(pass_lbl, note,
+                             f"трекер {lang} содержит «паспорт ✅» на обещание документов: {note}")
+
+    def test_draft_tail_tracker_has_no_passport_tick(self):
+        # В хвосте черновика тот же трекер: пункт «паспорт» БЕЗ ✅ (пометка целиком без «passport ✅»).
+        facts = suggest.collected_facts(self.WINDOW)
+        draft = suggest._append_collected_note("Sure! We have a PCX available for you.", facts, "en")
+        self.assertIn("[collected: geo ✅ phone ✅]", draft, draft)
+        self.assertNotIn("passport ✅", draft,
+                         f"хвост черновика содержит «passport ✅» на обещание документов:\n{draft}")
+
+
 class _ModBase(unittest.TestCase):
     """Общий каркас: SUGGEST включён, tmp-хранилища, восстановление глобалей."""
 
