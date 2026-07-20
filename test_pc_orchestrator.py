@@ -1642,7 +1642,7 @@ class TestFileProcessMap(unittest.TestCase):
 
     def test_explicit_map(self):
         self.assertEqual(o._procs_for_file("userbot_listen.py"), {"userbot"})
-        self.assertEqual(o._procs_for_file("booking_draft.py"), {"userbot"})
+        self.assertEqual(o._procs_for_file("booking_draft.py"), {"moderbot"})   # build_intake исполняет moderbot (импорт только в moderation_bot), НЕ userbot
         self.assertEqual(o._procs_for_file("moderation_ipc.py"), {"userbot"})    # → userbot, НЕ moderbot
         self.assertEqual(o._procs_for_file("moderation_bot.py"), {"moderbot"})
         self.assertEqual(o._procs_for_file("moderation_core.py"), {"moderbot"})
