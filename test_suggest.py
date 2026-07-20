@@ -1439,6 +1439,14 @@ class TestTrackerDocsPromiseNoPassportTick766498048(unittest.TestCase):
               "[клиент]: My number +66 812345678\n"
               "[клиент]: I'll send the necessary documents by tomorrow")
 
+    # RU-двойник того же класса «д»: клиент документ НЕ прислал, обещает «пришлю завтра».
+    # Правило-класс CLAUDE.md: дословная живая формулировка + гео/тел собраны реально → трекер непустой.
+    WINDOW_RU = ("[клиент]: Название отеля: Cape Sienna Gourmet Hotel & Villas\n"
+                 "[клиент]: Мой номер +66 812345678\n"
+                 "[клиент]: Документы пришлю завтра")
+
+    ME = 42
+
     def test_docs_promise_passport_not_collected(self):
         # Сквозь детект: гео и телефон РЕАЛЬНО собраны, паспорт — только обещан → ❌.
         facts = suggest.collected_facts(self.WINDOW)
@@ -1466,6 +1474,39 @@ class TestTrackerDocsPromiseNoPassportTick766498048(unittest.TestCase):
         self.assertIn("[collected: geo ✅ phone ✅]", draft, draft)
         self.assertNotIn("passport ✅", draft,
                          f"хвост черновика содержит «passport ✅» на обещание документов:\n{draft}")
+
+    def test_ru_promise_tomorrow_no_passport_tick(self):
+        # НОВЫЙ кейс «обещал прислать завтра → паспорт без ✅»: RU-двойник живого окна.
+        # «Документы пришлю завтра» = обещание, не файл → гео ✅ и тел ✅ есть, паспорт ✅ — НЕТ.
+        facts = suggest.collected_facts(self.WINDOW_RU)
+        self.assertTrue(facts["geo"], f"названный отель не = гео ✅:\n{self.WINDOW_RU}")
+        self.assertTrue(facts["phone"], f"реальный номер не = тел ✅:\n{self.WINDOW_RU}")
+        self.assertFalse(facts["passport"],
+                         f"обещание «пришлю завтра» ложно = паспорт ✅:\n{self.WINDOW_RU}")
+        note = suggest.collected_manager_note(facts, "ru")
+        self.assertIn("гео ✅", note, note)
+        self.assertIn("тел ✅", note, note)
+        self.assertNotIn("паспорт ✅", note,
+                         f"трекер содержит «паспорт ✅» на обещание «пришлю завтра»: {note}")
+
+    def test_tracker_passport_tick_when_document_really_sent(self):
+        # ПАРНЫЙ позитив (регрессия «не сломать»): то же окно, но документ РЕАЛЬНО прислан —
+        # клиент вкладывает фото паспорта (не обещание) → в трекере «passport ✅» СТОИТ.
+        # msgs newest-first для transcript_from; фото без подписи → «[фото]» → паспорт ✅.
+        window = [
+            _ReplyMsg(3, 999, photo=True),                                  # реальное фото документа
+            _ReplyMsg(2, 999, message="My number +66 812345678"),
+            _ReplyMsg(1, 999, message="Hotel Name: Cape Sienna Gourmet Hotel & Villas"),
+        ]
+        tr = suggest.transcript_from(window, self.ME)
+        facts = suggest.collected_facts(tr)
+        self.assertTrue(facts["passport"], f"реальное фото документа не = паспорт ✅:\n{tr}")
+        note = suggest.collected_manager_note(facts, "en")
+        self.assertIn("passport ✅", note,
+                      f"трекер без «passport ✅» при реально присланном документе: {note}")
+        draft = suggest._append_collected_note("Sure! We have a PCX available for you.", facts, "en")
+        self.assertIn("passport ✅", draft,
+                      f"хвост черновика без «passport ✅» при реально присланном документе:\n{draft}")
 
 
 class _ModBase(unittest.TestCase):
