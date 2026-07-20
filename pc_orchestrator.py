@@ -855,9 +855,12 @@ def _reply_moderation_lesson(card_msg_id, text, send=None, retries=None):
 
 
 def _handle_lesson(tid, text):
-    """Обработать задачу-урок (родитель 292, шаги 3–4): дирижёр классифицирует замечание менеджера и
-    маршрутизирует. СТИЛЬ → правило в книгу правил (playbook); НАДЗОР → строка-класс в чек-лист
-    ревизора; ФАКТ/ЛОГИКА → локальному планировщику (правка кода/критфактов/FAQ + ТЕСТ); неясное →
+    """Обработать задачу-урок (родитель 112, шаг 8/8 + 292/334): дирижёр классифицирует замечание
+    менеджера ВТОРОЙ осью (route_lesson_urok) и маршрутизирует. BEHAVIOR → правило в книгу правил
+    (playbook) + реплай учителю «✅ Принято…» (мгновенное применение к черновику); CODE → карточка
+    владельцу «нужен код-фикс: <суть>» + готовый текст задачи (код НЕ правим и НЕ делегируем — осознанная
+    задача через гейт); UNSURE → ФОЛБЭК на 1-ю ось handle_lesson_task: СТИЛЬ → книга правил; НАДЗОР →
+    строка-класс в чек-лист ревизора; ФАКТ/ЛОГИКА → локальному планировщику (правка+ТЕСТ); неясное →
     карточка-уточнение владельцу в 1160 (не угадываем). Боевые sink'и: playbook / чек-лист / инбокс
     1160 (_deliver_owner_card — СИНХРОННАЯ доставка с подтверждением канала, рапорт честный «доставлено
     через X», не гадательный) + reply_moderation (_reply_moderation_lesson — реплай переспроса/понимания
@@ -869,8 +872,12 @@ def _handle_lesson(tid, text):
     трогает; heartbeat тикаем сами; предел ожидания — 24ч → карточка владельцу в 1160, шаг 4). Переспрос
     НЕ доставлен (класс-фикс #102) → dec.status='failed' → _finalize_lesson_dec закрывает урок failed с
     диагнозом (карточку владельцу уже отправил _enter_low_wait). Класс-фиксы инцидентов 354 и #102."""
-    dec = lesson_router.handle_lesson_task(text, notify_owner=_deliver_owner_card,
-                                           reply_moderation=_reply_moderation_lesson)
+    # #112 шаг 8/8: живой канал «урок:» РЕШАЕТ по 2-й оси (behavior→playbook+«принято» /
+    # code→карточка владельцу «нужен код-фикс», без авто-правки / unsure→фолбэк на 1-ю ось
+    # handle_lesson_task с её LLM/supervision/low-conf переспросом). Контракт dec и ветка
+    # waiting+pending_low — прежние (фолбэк-путь их и порождает), поэтому обработка ниже не меняется.
+    dec = lesson_router.route_lesson_urok(text, notify_owner=_deliver_owner_card,
+                                          reply_moderation=_reply_moderation_lesson)
     if dec.get("status") == "waiting" and dec.get("pending_low"):
         _enter_lesson_wait(tid, dec)
         return

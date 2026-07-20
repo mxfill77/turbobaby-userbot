@@ -4820,8 +4820,10 @@ class TestLessonWaitReaper(Base):
                 "result": "🤔 неуверенно → спросил учителя «верно?», жду «да»"}
 
     def _enter(self, tid, route="style", created_ago=0.0):
-        # штатный путь: думатель вернул low-waiting dec → _handle_lesson уводит урок в ожидание
-        with mock.patch.object(o.lesson_router, "handle_lesson_task",
+        # штатный путь: живой канал урок: вернул low-waiting dec → _handle_lesson уводит урок в ожидание.
+        # #112 шаг 8/8: _handle_lesson теперь зовёт route_lesson_urok (2-я ось; low-wait рождается в её
+        # unsure-фолбэке на handle_lesson_task) — патчим ИМЕННО этот шов, поведение ожидания то же.
+        with mock.patch.object(o.lesson_router, "route_lesson_urok",
                                return_value=self._waiting_dec(route, created_ago)):
             o._handle_lesson(tid, self.fb.tasks[tid]["task_text"])
 
@@ -4952,11 +4954,17 @@ class TestLessonReaskDelivery(Base):
                 "Исходный черновик: Локацию и данные получил, спасибо 🤝")
 
     def _force_low(self, cls="ФАКТ", route=None):
-        # думатель вернул confidence=low по маршруту route (реальный claude не дёргаем)
+        # думатель 1-й оси вернул confidence=low по маршруту route (реальный claude не дёргаем).
+        # #112 шаг 8/8: _handle_lesson входит через route_lesson_urok (2-я ось); low-wait живёт в её
+        # unsure-фолбэке на handle_lesson_task — форсим classify_lesson_type=unsure, чтобы канал ушёл
+        # в фолбэк, где и срабатывает низкоуверенный LLM-путь (иначе keyword-тип увёл бы в behavior/code).
         route = route if route is not None else o.lesson_router.FACT
         return mock.patch.multiple(
             o.lesson_router,
             _lesson_llm_enabled=lambda: True,
+            classify_lesson_type=lambda remark: {"type": o.lesson_router.UNSURE, "confidence": "low",
+                                                 "reason": "форс-unsure (тест low-wait)",
+                                                 "behavior_hits": 0, "code_hits": 0},
             classify_lesson_llm=lambda remark, draft="", window="": {
                 "reading": "бот подтвердил приём данных, хотя клиент прислал только гео",
                 "class": cls, "confidence": "low", "plan": "поправить квитанцию + тест", "route": route})
@@ -5037,6 +5045,55 @@ class TestLessonReaskDelivery(Base):
         self.assertIn("НЕ доставлен", t["result"])                       # диагноз в результате
         self.assertEqual(1, len(cards))                                  # карточка-уточнение ушла владельцу
         self.assertIn("не дошёл до учителя", cards[0])
+
+
+class TestLessonUrokChannel(Base):
+    """#112 шаг 8/8: живой канал «урок:» сквозь _handle_lesson → route_lesson_urok.
+      • behavior → правило в playbook + реплай «✅ Принято» + ЗАПИСЬ В ЖУРНАЛ уроков (cowork) + задача done;
+      • code     → карточка владельцу «нужен код-фикс» БЕЗ авто-правки/делегирования (планировщик НЕ зван)
+                   + журнал + done.
+    Права/анти-тайский/живой-реплей покрыты router-level в test_lesson_urok. Playbook/владелец/реплай —
+    инъекции (боевую книгу и 1160 не трогаем)."""
+
+    def _task(self, remark, card="90777"):
+        return ("[урок:урок от @filipp] родитель 112 — замечание менеджера в копилку обучения\n"
+                "окно диалога: @nikita (client_id=606) · черновик #42\n"
+                f"карточка модер-группы: msg={card}\n"
+                f"Замечание: {remark}\n"
+                "Исходный черновик: Локацию и данные получил, спасибо! Оформляю бронь.")
+
+    def setUp(self):
+        super().setUp()
+        self.cows = []
+        o._cowork = lambda line: self.cows.append(line)
+
+    def test_behavior_playbook_prinyato_and_journal(self):
+        acks, rules = [], []
+        with mock.patch.object(o.lesson_router, "_default_append_style",
+                               lambda rule: (rules.append(rule), "added")[1]), \
+             mock.patch.object(o.lesson_router, "_default_find_conflict", lambda rule: ""), \
+             mock.patch.object(o, "_reply_moderation_lesson",
+                               lambda card, text: (acks.append((str(card), text)), 900)[1]):
+            tid = self.fb.add(status="in_progress", task_text=self._task('не пиши "данные получил"'))
+            o._handle_lesson(tid, self.fb.tasks[tid]["task_text"])
+        self.assertEqual("done", self.fb.tasks[tid]["status"])
+        self.assertTrue(rules and "данные получил" in rules[0])          # правило ушло в playbook
+        self.assertTrue(acks and "Принято" in acks[0][1])                # ответ «✅ Принято» реплаем
+        self.assertEqual("90777", acks[0][0])                            # на карточку урока
+        self.assertTrue(any("урок #" in c for c in self.cows))           # ЗАПИСЬ В ЖУРНАЛ уроков (cowork)
+
+    def test_code_owner_card_no_delegate_no_code_change_and_journal(self):
+        cards = []
+        with mock.patch.object(o, "_deliver_owner_card",
+                               lambda text: (cards.append(text), (f"инбокс {o.INBOX_TOPIC_ID}", True))[1]), \
+             mock.patch.object(o, "_local_dec_plan",
+                               lambda *a, **k: self.fail("code-урок канала урок: НЕ делегируем планировщику")):
+            tid = self.fb.add(status="in_progress", task_text=self._task("цена берётся из столбца J, а не из K"))
+            o._handle_lesson(tid, self.fb.tasks[tid]["task_text"])
+        self.assertEqual("done", self.fb.tasks[tid]["status"])
+        self.assertTrue(cards and "нужен код-фикс" in cards[0].lower())   # карточка владельцу
+        self.assertIn("Готовый текст задачи", cards[0])                   # + готовый текст задачи (копипаст)
+        self.assertTrue(any("урок #" in c for c in self.cows))           # журнал уроков
 
 
 if __name__ == "__main__":

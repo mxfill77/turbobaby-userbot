@@ -1382,3 +1382,186 @@ def resume_behavior_conflict(pending, choice, replace_style=None, reply_moderati
             "buttons": list(_BEHAVIOR_CONFLICT_BUTTONS), "card_msg_id": card,
             "reason": f"ответ «{_one_line(choice)}» не распознан — жду «оставить новое»/«оставить старое»",
             "result": "🤔 Не понял выбор — нажми «оставить новое» или «оставить старое»"}
+
+
+# ============ ЖИВОЙ КАНАЛ «урок:» — обучение ОДНИМ сообщением (родитель 112, шаг 8/8) =======
+# Шаги 1–7 построили ВТОРУЮ ось (classify_lesson_type behavior|code|unsure, route_lesson_by_type,
+# playbook-гард, /rules, приёмочный голден, эстафету демона), но НЕ завели её в живой путь «урок:»
+# (демон гнал урок ТОЛЬКО через 1-ю ось handle_lesson_task style|fact|supervision|unclear). Здесь —
+# ШОВ, который дирижёр зовёт на задачу-урок ВМЕСТО handle_lesson_task. Политика канала (решение
+# владельца по развилке #112/8):
+#   • behavior → НЕМЕДЛЕННО правило в playbook + реплай учителю «✅ Принято: <правило>» (мгновенное
+#                применение — «урок:» это лёгкий канал обучения ПОВЕДЕНИЮ);
+#   • code     → карточка владельцу «🛠 нужен код-фикс: <суть>» с ГОТОВЫМ текстом задачи (копипаст в
+#                тз/дев-очередь). КОД НЕ ПРАВИМ и НЕ ДЕЛЕГИРУЕМ авто-планировщику: правка клиентского
+#                кода — осознанная задача через гейт, а не побочка одного сообщения в чате;
+#   • unsure   → ФОЛБЭК на 1-ю ось handle_lesson_task (там LLM-классификатор, supervision-роут в
+#                чек-лист ревизора и low-confidence переспрос «верно?» — их НЕ теряем).
+# КРАСНОЕ то же, что во всём модуле: playbook/1160/реплай — ИНЪЕКТИРУЕМЫЕ побочки; Bridge/таблицы/
+# деньги не касаемся. Гард playbook (behavior-правило не смеет ОСЛАБЛЯТЬ код-инвариант) держим и тут:
+# такое уходит в CODE-путь = карточка владельцу, а НЕ строка в книге правил (playbook не дыра в гардах).
+# Никаких висящих кнопочных ожиданий канал не плодит: конфликт правил → синхронно владельцу (не затираем
+# вслепую, но и не заводим pending-состояние без резюма). Всё однопроходно → задача закрывается за тик.
+
+def build_behavior_accepted_ack(rule):
+    """Реплай учителю на behavior-урок канала «урок:»: правило принято в книгу правил и действует со
+    следующего черновика. Формат решения #112/8 — «✅ Принято: <правило>». Пустое правило → нейтральная
+    заглушка (формат не роняем). Чистая функция (build_behavior_ack оставлен нетронутым для route_
+    lesson_by_type: там свой формат «Понял так…», голдены на него не ломаем)."""
+    r = _one_line(rule) or "(см. окно диалога)"
+    return f"✅ Принято: {r} → записано в книгу правил, применится со следующего черновика."
+
+
+def build_code_fix_card(remark, text=""):
+    """Карточка владельцу для CODE-урока канала «урок:»: код САМИ не правим — отдаём владельцу СУТЬ +
+    ГОТОВЫЙ текст задачи (копипаст в тз/дев-очередь). В задачу зашиты окно/черновик из контекста урока и
+    ОБЯЗАТЕЛЬНОЕ требование golden-теста дословной фразой клиента + запрет Bridge/денег (golden-правило
+    CLAUDE.md). text — полный текст задачи-урока (build_lesson_task); пустой → деградируем на remark."""
+    r = _one_line(remark) or "(см. окно диалога)"
+    parsed = parse_lesson_task(text) if text else {}
+    who = parsed.get("who") or "?"
+    window = parsed.get("window") or "?"
+    draft = _one_line(parsed.get("draft")) or "(нет)"
+    ready = (f"код-фикс (урок от {who}): {r}\n"
+             f"окно диалога: {window}\n"
+             f"черновик, который правит замечание: {draft}\n"
+             "Требование: поправить причину в коде/резолверах/гардах/критфактах + ОБЯЗАТЕЛЬНО golden-тест "
+             "с ДОСЛОВНОЙ фразой клиента из окна (golden-правило CLAUDE.md). Bridge/таблицы/деньги НЕ трогать.")
+    return ("🛠 Нужен код-фикс (урок из модер-группы) — код сам НЕ правлю, только карточка (осознанная "
+            "задача через гейт).\n"
+            f"Суть: {r}\n"
+            f"Окно: {window}\n\n"
+            "Готовый текст задачи (копипаст в тз/дев-очередь):\n"
+            f"{ready}")
+
+
+def _apply_code_owner_card(text, parsed, remark, card, reason, notify=None):
+    """CODE-урок канала «урок:» → карточка владельцу «нужен код-фикс» (delegate=False, код НЕ трогаем и
+    НЕ делегируем — политика #112/8). Доставку берём из ответа sink'а честно (delivered+канал), урок не
+    теряем даже при недоставке (замечание в результате/логе). → dec (route=FACT для рапорта, но delegate
+    False и commit_paths пусты — коммитить/делегировать нечего)."""
+    notify = notify or _default_notify_owner
+    cardtext = build_code_fix_card(remark, text)
+    channel = ""
+    try:
+        delivered, channel = _normalize_delivery(notify(cardtext))
+    except Exception as e:                               # noqa: BLE001 — доставка не роняет дирижёра
+        delivered, channel = False, ""; reason = f"{reason}; notify: {e}"
+    subj = _one_line(remark)
+    if delivered:
+        via = f" — доставлено через {channel}" if channel else ""
+        result = f"🛠 CODE-урок → карточка «нужен код-фикс» владельцу в 1160{via} (код не трогаю, не делегирую): «{subj}»"
+    else:
+        result = f"🛠 CODE-урок: карточка «нужен код-фикс» владельцу НЕ доставлена — замечание в логе: «{subj}»"
+    return {"type": CODE, "route": FACT, "delegate": False, "status": "done", "reason": reason,
+            "code_fix_card": cardtext, "card": cardtext, "delivered": delivered, "channel": channel,
+            "commit_paths": [], "card_msg_id": card, "ack_subject": subj, "result": result}
+
+
+def route_lesson_urok(text, append_style=None, find_conflict=None, notify_owner=None,
+                      reply_moderation=None, classify_type=None, fallback_first_axis=None):
+    """ЖИВОЙ роутер канала «урок:» (родитель 112, шаг 8/8) — то, что дирижёр зовёт на задачу-урок ВМЕСТО
+    handle_lesson_task. Вторая ось classify_lesson_type РЕШАЕТ маршрут:
+      behavior → playbook + реплай «✅ Принято: <правило>» (мгновенное применение к черновику);
+      code     → карточка владельцу «нужен код-фикс: <суть>» + готовый текст задачи (код НЕ правим,
+                 НЕ делегируем — осознанная задача через гейт);
+      unsure   → ФОЛБЭК на 1-ю ось handle_lesson_task (LLM-классификатор / supervision-чек-лист /
+                 low-confidence переспрос «верно?» — их сохраняем).
+    Гард держим и тут: behavior-правило, ОСЛАБЛЯЮЩЕЕ код-инвариант (цена/кап/парковка/Click/депозит), в
+    playbook НЕ пишем — уходит в CODE-путь (карточка владельцу). Конфликт с записанным правилом → СИНХРОННО
+    владельцу (не затираем вслепую), без висящих кнопочных ожиданий. Все побочки инъектируемы (юнит без
+    Telegram/1160/playbook/claude). FAIL-SAFE: сбой sink → failed/лог, урок не теряется.
+
+    → dec (контракт _finalize_lesson_dec): behavior/code → delegate=False, status done/failed, commit_paths=[]
+      (ack учителю уже отправлен реплаем внутри — двойного «принято» после коммита не будет, playbook
+      gitignored → _commit_lesson=None → ack_after_commit=None); unsure → dec 1-й оси КАК ЕСТЬ (может нести
+      waiting+pending_low — его ловит _handle_lesson штатно). fallback_first_axis инъектируется в тестах."""
+    parsed = parse_lesson_task(text)
+    remark = parsed["remark"]
+    a_style = append_style or _default_append_style
+    conflict = find_conflict or _default_find_conflict
+    notify = notify_owner or _default_notify_owner
+    reply_mod = reply_moderation or _default_reply_moderation
+    ctype = classify_type or classify_lesson_type
+    card = parsed.get("card_msg_id") or ""
+
+    t = ctype(remark) or {}
+    kind = t.get("type")
+    base = f"канал урок: вторая ось type={kind} ({t.get('reason', '')})".rstrip(" ()")
+
+    # UNSURE (или неведомый тип) → ФОЛБЭК на 1-ю ось: НЕ угадываем тип сами и НЕ плодим кнопочный
+    # переспрос — отдаём полноценному handle_lesson_task (LLM/supervision/low-conf). dec возвращаем КАК
+    # ЕСТЬ (может быть waiting+pending_low — его штатно доведёт _handle_lesson).
+    if kind not in (BEHAVIOR, CODE):
+        run = fallback_first_axis or handle_lesson_task
+        dec = run(text, append_style=append_style, notify_owner=notify_owner,
+                  reply_moderation=reply_moderation)
+        if isinstance(dec, dict):
+            dec.setdefault("type", UNSURE)
+            dec["axis2_fallback"] = True
+            dec["reason"] = f"{base}; фолбэк на 1-ю ось" + (f"; {dec.get('reason')}" if dec.get("reason") else "")
+        return dec
+
+    # CODE → карточка владельцу «нужен код-фикс» (код не трогаем, не делегируем).
+    if kind == CODE:
+        return _apply_code_owner_card(text, parsed, remark, card, base, notify)
+
+    # BEHAVIOR:
+    # (0) ГАРД: правило ослабляет код-инвариант? → это НЕ манера речи, а кодовый гард → карточка владельцу
+    #     (CODE-путь), в playbook НЕ пишем (playbook не дыра в гардах — единый чокпоинт записи behavior).
+    weak, why = weakens_code_invariant(remark)
+    if weak:
+        ack = build_invariant_reject_ack(remark)
+        try:
+            reply_mod(card, ack)
+        except Exception as e:                           # noqa: BLE001 — ack не роняет маршрут
+            base = f"{base}; ack-reply: {e}"
+        dec = _apply_code_owner_card(
+            text, parsed, remark, card,
+            f"{base}; behavior-правило ослабляет код-инвариант ({why}) → в код, не в playbook", notify)
+        dec["invariant_guard"] = why
+        dec["ack_understanding"] = ack
+        dec["result"] = (f"🛡 Правило-инвариант: «{_one_line(remark)}» ослабляет код-гард ({why}) — в playbook "
+                         "НЕ записал, карточка «нужен код-фикс» владельцу (меняется кодом с тестом)")
+        return dec
+
+    # (1) КОНФЛИКТ с уже записанным поведенческим правилом (та же тема, обратный смысл)? → НЕ затираем
+    #     вслепую: синхронно показываем владельцу ОБА (без кнопочного pending — канал однопроходный).
+    try:
+        clash = conflict(remark)
+    except Exception as e:                               # noqa: BLE001 — проба не роняет дирижёра
+        clash = ""; base = f"{base}; conflict-probe: {e}"
+    if clash:
+        cardtext = build_behavior_conflict_card(remark, clash)
+        channel = ""
+        try:
+            delivered, channel = _normalize_delivery(notify(cardtext))
+        except Exception as e:                           # noqa: BLE001
+            delivered, channel = False, ""; base = f"{base}; notify: {e}"
+        via = (f" — владельцу в 1160{(' через ' + channel) if channel else ''}"
+               if delivered else " — карточка владельцу НЕ доставлена (замечание в логе)")
+        return {"type": BEHAVIOR, "route": STYLE, "delegate": False, "status": "done",
+                "reason": f"{base}; конфликт со старым правилом «{_one_line(clash)}» → владельцу (не затираю)",
+                "old_rule": clash, "new_rule": remark, "conflict_card": cardtext, "card": cardtext,
+                "delivered": delivered, "channel": channel, "commit_paths": [], "card_msg_id": card,
+                "result": f"⚠️ Новое правило конфликтует с записанным → отдал владельцу{via} (не затёр вслепую): «{_one_line(remark)}»"}
+
+    # (2) нет конфликта → НЕМЕДЛЕННАЯ запись в playbook + реплай учителю «✅ Принято: …».
+    try:
+        res = a_style(remark)
+    except Exception as e:                               # noqa: BLE001
+        res = "error"; base = f"{base}; sink: {e}"
+    _ack = _ack_material(STYLE, remark, card)
+    if res in ("added", "duplicate"):
+        ack = build_behavior_accepted_ack(remark)
+        try:
+            reply_mod(card, ack)
+        except Exception as e:                           # noqa: BLE001 — ack не роняет запись
+            base = f"{base}; ack-reply: {e}"
+        note = "правило записано в playbook" if res == "added" else "такое правило в playbook уже есть"
+        return {"type": BEHAVIOR, "route": STYLE, "delegate": False, "status": "done", "reason": base,
+                **_ack, "ack_understanding": ack,
+                "result": f"📝 BEHAVIOR-урок (канал урок:): {note}, «принято» учителю — «{_one_line(remark)}»"}
+    return {"type": BEHAVIOR, "route": STYLE, "delegate": False, "status": "failed", "reason": base,
+            **_ack, "commit_paths": [],
+            "result": f"⚠️ BEHAVIOR-урок не записан в playbook (sink={res}) — повтори: «{_one_line(remark)}»"}
