@@ -1211,6 +1211,63 @@ class TestFilterBookingQuestions(unittest.TestCase):
         self.assertEqual(suggest.filter_booking_questions(None, {"geo": True}), [])
 
 
+class TestFilterBookingQuestionsLiveWindow766498048(unittest.TestCase):
+    """Шаг 3/5 (родитель #241): живой кейс окна client_id=766498048 сквозь ДЕТЕКТ (не facts-заглушку).
+    Клиент ПЕРВЫМ сообщением заполнил поле-метку «Hotel Name: Cape Sienna Gourmet Hotel & Villas» →
+    отель НАЗВАН. Правило-класс CLAUDE.md (golden-тесты детекта = ДОСЛОВНАЯ фраза клиента + mock=реальность):
+    гоняем реальную фразу через collected_facts → filter_booking_questions, а не подставляем facts руками.
+    Ожидание: вопрос «the name of your apartment/hotel» вычеркнут, незакрытые (даты, модель) остаются.
+    Плюс контрольные кейсы «все поля даны» → пусто и «ничего не дано» → все вопросы остаются."""
+
+    # ДОСЛОВНОЕ первое сообщение клиента из живого окна (родитель #241).
+    LIVE_MSG = "[клиент]: Hotel Name: Cape Sienna Gourmet Hotel & Villas"
+    # Реальный набор вопросов оформления брони (EN, как в окне: имя отеля + незакрытые даты/модель).
+    QUESTIONS = [
+        "Could you please tell me the name of your apartment/hotel?",
+        "What dates would you like to rent the bike for?",
+        "Which model are you interested in?",
+    ]
+
+    def test_hotel_name_given_hotel_question_dropped_dates_model_kept(self):
+        # Сквозь детект: имя отеля названо → geo собран, срок/модель/даты НЕ собраны.
+        facts = suggest.collected_facts(self.LIVE_MSG)
+        self.assertTrue(facts["geo"], f"названный отель не распознан как локация:\n{self.LIVE_MSG}")
+        self.assertFalse(facts["dates"], facts)
+        self.assertFalse(facts["model"], facts)
+        kept = suggest.filter_booking_questions(self.QUESTIONS, facts, "en")
+        self.assertNotIn(self.QUESTIONS[0], kept)          # «name of your apartment/hotel» — вычеркнут
+        self.assertEqual(kept, [self.QUESTIONS[1], self.QUESTIONS[2]])  # даты+модель остаются, порядок цел
+
+    def test_all_fields_given_all_questions_dropped(self):
+        # «Все поля даны»: имя отеля + модель + даты + срок + телефон + оплата + фото паспорта в окне.
+        # Порядок как в живом окне (новейшее — последней строкой): деталь брони (модель+даты+срок)
+        # идёт последней, поэтому extract_booking_hints берёт её как актуальную бронь.
+        window = ("[клиент]: Hotel Name: Cape Sienna Gourmet Hotel & Villas\n"
+                  "[клиент]: Мой номер +66 812345678\n"
+                  "[клиент]: Уже оплатил депозит, вот чек\n"
+                  "[клиент]: [фото] вероятно паспорт\n"
+                  "[клиент]: Хочу Honda PCX на 10 дней с 25 июля")
+        facts = suggest.collected_facts(window, today=datetime.date(2026, 7, 20))
+        for k in ("geo", "model", "term", "dates", "phone", "payment", "passport"):
+            self.assertTrue(facts[k], f"поле {k} не собрано в окне «все поля даны»:\n{facts}")
+        qs = [
+            "Could you please tell me the name of your apartment/hotel?",
+            "Which model are you interested in?",
+            "What dates would you like to rent for?",
+            "How many days do you need the bike?",
+            "Please send a photo of your passport",
+            "What is your phone number?",
+            "How would you like to pay the deposit?",
+        ]
+        self.assertEqual(suggest.filter_booking_questions(qs, facts, "en"), [])  # всё собрано → анкета пуста
+
+    def test_nothing_given_all_questions_kept(self):
+        # «Ничего не дано»: нейтральное приветствие без единого поля → ни один вопрос не вычёркиваем.
+        facts = suggest.collected_facts("[клиент]: Hi! How does the rental work?")
+        self.assertFalse(any(facts.values()), facts)       # ни одно поле не собрано
+        self.assertEqual(suggest.filter_booking_questions(self.QUESTIONS, facts, "en"), self.QUESTIONS)
+
+
 class TestDetectFirstMessageBooking(unittest.TestCase):
     """Родитель #271 шаг 2/5: детект котируемой брони на ПЕРВОМ сообщении — модель+старт+срок.
     Голдены из живого кейса 13.07 (класс «ж»: клиент дал всё сразу, надо котировать, а не анкету)
@@ -1300,6 +1357,16 @@ class TestCollectedAttachmentOnly(unittest.TestCase):
                     "Do you need my passport?", "У меня есть id card"):
             self.assertFalse(suggest.collected_facts(f"[клиент]: {phr}")["passport"],
                              f"слово «паспорт» ложно = паспорт ✅: {phr}")
+
+    def test_passport_promise_to_send_is_false(self):
+        # #242: ОБЕЩАНИЕ прислать фото/файл документа позже — намерение, не полученный документ → ❌.
+        # Дословные живые формулировки RU/EN + парафразы (правило-класс CLAUDE.md: реальная фраза).
+        for phr in ("Фото паспорта пришлю завтра", "Скину паспорт вечером",
+                    "паспорт сфоткаю и отправлю позже", "документ вышлю как приеду",
+                    "I'll send the passport photo tomorrow", "I'll send my passport later",
+                    "will send passport photo in the evening"):
+            self.assertFalse(suggest.collected_facts(f"[клиент]: {phr}")["passport"],
+                             f"обещание прислать паспорт ложно = паспорт ✅: {phr}")
 
     def test_passport_direct_photo_is_true(self):
         # прямое фото от клиента (медиа без подписи) → «[фото]» → паспорт ✅

@@ -1,0 +1,121 @@
+# task 2026-07-20 — фильтр вопросов оформления брони (шаг 1/5, родитель 241)
+
+Разведка (ничего не менялось). Задача: найти код, который (а) формирует список
+вопросов для оформления брони и (б) извлекает уже сообщённые клиентом поля из окна
+диалога, чтобы не переспрашивать.
+
+## Главный вывод по «name of your apartment / Hotel Name»
+
+Дословных строк **«name of your apartment», «Hotel Name», «booking questions»** в
+репо ПК-контура **НЕТ** (grep по всем файлам — ноль). Явного хардкод-списка вопросов
+здесь тоже нет. Причина: сам «список вопросов» (что спросить у клиента, какими
+формулировками) живёт в LLM-системнике / КНИГЕ ПРАВИЛ (playbook) и в KB на **VPS**
+(Brain/Splinter/INTAKE), а не в этом репо. ПК-контур делает обратную половину:
+детерминированно вычисляет, что клиент **уже** прислал, и вкладывает в промпт запрет
+переспрашивать это. То есть «фильтр вопросов» реализован не как вычёркивание пунктов
+из списка, а как блок-инструкция «УЖЕ ПОЛУЧЕНО … НЕ переспрашивай».
+
+Набор полей брони (фактически «вопросы») в ПК-контуре задан двумя местами:
+`booking_draft.EXTRACT_FIELDS` (карточка менеджеру) и `suggest._COLL_LABELS`
+(трекер собранного). Формулировки-вопросы клиенту — только в промптах LLM.
+
+## 1. Где перечислены поля/«вопросы» брони
+
+### booking_draft.py — экстрактор карточки заявки (кнопка «📋 Бронь»)
+- `EXTRACT_FIELDS` — `booking_draft.py:35`
+  `("model","name","date_from","date_to_datetime","price_day","deposit","helmets","contact","note")`.
+- `_EXTRACT_SYSTEM` — `booking_draft.py:44-65`: системный промпт LLM-экстрактора,
+  по полю расписано, что брать; «чего нет — null, не выдумывать».
+- `build_card()` — `booking_draft.py:349-475`: собирает карточку-черновик менеджеру
+  по колонкам листа (C=модель, D=имя, E/F=даты, H=цена, S=залог, T=шлемы, U=контакт,
+  V=примечание); на каждое отсутствующее поле кладёт `⚠️ нет … (X)` — это и есть
+  «что ещё надо дособрать».
+- `build_intake()` — `booking_draft.py:483-557`: текст поста «🆕 БРОНЬ» для CRM из
+  ВАЛИДНЫХ полей; невалидные/пустые НЕ включает — «пусть INTAKE честно спросит».
+
+### collect_booking_prompt.txt — карточка предварительной брони (LLM-парсер диалога)
+- Файл целиком (`collect_booking_prompt.txt:1-38`): системник, извлекающий
+  `model_requested, date_start/end, term_days, client_name, phone, deposit,
+  has_passport_photo, delivery(локация/район/area), helmets, experience_raw, agent`
+  и возвращающий готовую карточку «🆕 БРОНЬ …». Это ближайший аналог «списка полей
+  для оформления», но формулировок-вопросов клиенту тут нет — только парсинг.
+- Потребитель: `collect_booking.py` (ЭТАП 2) — читает 50 сообщений диалога
+  (`read_transcript` `collect_booking.py:104-120`), шлёт транскрипт в Anthropic
+  с этим промптом (`call_llm` `:125-136`), дописывает `@username` в «Клиент»
+  (`add_username` `:141-155`), по `--send` кладёт во внутреннюю группу Входящие.
+
+## 2. Механизм извлечения уже сообщённых полей из окна диалога (ГЛАВНОЕ по задаче)
+
+Всё в `suggest.py`.
+
+### 2.1 База: модель/срок/даты последней брони
+- `extract_booking_hints(transcript, today)` — `suggest.py:1840-1932`.
+  Берёт окно последних клиентских реплик (`_client_messages(...)[-BOOKING_WINDOW:]`),
+  новейшая первой; тянет модель+даты **только из последней релевантной брони** (разные
+  модель/даты = разные брони, старую отбрасывает). Возвращает dict:
+  `model, models, date_start/end, iso_start/iso_end, term_days, hint_days, monthly,
+  has_dates, has_start, deposit_*_q, price_sheet_q, sheet_filter, percent_q,
+  units_count, old_gen_q, deposit_passport_q, maps_link`.
+
+### 2.2 Трекер «что клиент уже прислал» — как хранятся распознанные поля
+- `collected_facts(transcript, hints, today)` — `suggest.py:1973-1994`.
+  **Возвращает dict из 7 булевых ключей**:
+  `{"model","term","dates","geo","passport","phone","payment"}` — True/False.
+  - `model/term/dates` — из `extract_booking_hints` (та же логика последней брони);
+    `term` = известна длительность, `dates` = известен конкретный старт.
+  - `geo/passport/phone/payment` — детерминированный regex-скан ТОЛЬКО клиентских
+    строк (`_client_text`, lower, со встроенным reply-содержимым).
+- Правило ✅ (комментарий `suggest.py:1941-1946`): сущность True **только по ФАКТУ
+  вложения/данных**, а не по слову-упоминанию. Regex-детекторы:
+  - `_COLL_GEO` — `suggest.py:1950-1953` (maps-ссылка / geo-коорд / пин `[локация]`;
+    слово «вилла/апартаменты» без ссылки — НЕ гео).
+  - `_COLL_PASSPORT` — `suggest.py:1956` (реальное фото/файл документа В ОКНЕ: `[фото]`
+    / reply-маркер «вероятно паспорт»; слово «паспорт» без фото И обещание «пришлю
+    завтра»/«I'll send tomorrow» — ❌: ✅ только по факту вложения, #242).
+  - `_COLL_PHONE` — `suggest.py:1959-1961` (реальный номер: `+..`, длинный прогон
+    цифр, ключевик+цифры).
+  - `_COLL_PAYMENT` — `suggest.py:1965-1970` (подтверждённая: «оплатил/перевёл/внёс»,
+    «вот чек», `paid`; вопрос «криптой можно?» и голое «оплата/предоплата» — ❌).
+- Порядок и подписи полей: `_COLL_LABELS` — `suggest.py:1998-2006`
+  `[(key,(ru_prompt,en_prompt),(ru_short,en_short))]` для `model/term/dates/geo/
+  passport/phone/payment`.
+
+### 2.3 Как собранное превращается в «не переспрашивай»
+- `collected_prompt_note(facts, lang)` — `suggest.py:2023-2040`: блок в системник LLM
+  «★ УЖЕ ПОЛУЧЕНО ОТ КЛИЕНТА … НЕ переспрашивай: <перечень>. Коротко подтверди …».
+  Именно этот блок **фильтрует вопросы** — LLM не задаёт вопрос по уже собранному полю.
+- `_confirm_example(facts, en)` — `suggest.py:2009-2020`: пример-подтверждение отражает
+  РОВНО собранное (только гео → «локацию получил»; урок №292).
+- `collected_manager_note(facts, lang)` — `suggest.py:2043-2055`: служебная пометка
+  модератору «[собрано: гео ✅ паспорт ✅ …]» (не видна клиенту).
+
+### 2.4 Точки вызова (проводка)
+- `generate_draft` — `suggest.py:3946`: `facts = collected_facts(transcript)` →
+  `make_system_prompt(..., collected=facts)`; в системнике блок собирается на
+  `suggest.py:3095-3096` (`collected_block = collected_prompt_note(...)`).
+- `regenerate_draft` — `suggest.py:3979`: то же для СТРАТЕГИЯ-перегенерации.
+- `_append_collected_note` — `suggest.py:3681-3687`: дописывает «[собрано: …]» в хвост
+  черновика (пометка модератору).
+- `client_facing_text` — `suggest.py:3714-…` + `_SERVICE_NOTE_LINE_RE`
+  `suggest.py:3710-3711`: срезает служебные `[уточнить:]/[собрано:]/[сезон:]` строки
+  перед показом клиенту.
+
+## 3. Сопутствующее (модель парка, hints как подхват)
+- `booking_draft.thread_model()` — `booking_draft.py:185-207`: подхватывает
+  нормализованное имя модели из сохранённого треда через
+  `suggest.extract_booking_hints` (когда экстракция дала неточное имя).
+- `booking_draft.classify_model/classify_deposit/resolve_price` — `:147-303`:
+  валидации полей заявки (парк-allowlist, залог ИЛИ-ИЛИ, цена только из Bridge).
+
+## 4. Итог для родителя 241
+- «Список вопросов» как таковой в ПК-репо не хранится — он в LLM-промптах/playbook/KB
+  (частично на VPS). Поля брони заданы в `booking_draft.EXTRACT_FIELDS`
+  (`booking_draft.py:35`), `collect_booking_prompt.txt` и трекере
+  `suggest._COLL_LABELS` (`suggest.py:1998`).
+- «Фильтр уже-собранного» = `suggest.collected_facts` (`suggest.py:1973`,
+  хранит 7 булевых полей `model/term/dates/geo/passport/phone/payment`) +
+  `collected_prompt_note` (`suggest.py:2023`, инструкция «не переспрашивай»).
+  Извлечение фактов: `extract_booking_hints` (`suggest.py:1840`) + regex-детекторы
+  `_COLL_GEO/_COLL_PASSPORT/_COLL_PHONE/_COLL_PAYMENT` (`suggest.py:1950-1970`).
+- Если правка касается англ. формулировок «name of your apartment / Hotel Name» —
+  их источник вне этого репо (VPS Brain/INTAKE); тут менять нечего, только поля/фильтр.
