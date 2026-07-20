@@ -344,6 +344,24 @@ def client_maps_link(transcript):
     return link
 
 
+# O3-2.1 ЭТАП 2 (б): Telegram ГЕО-ПИН (вложение-локация) как точка доставки — БЕЗ текстовой ссылки.
+# transcript_from кодирует гео-вложение маркером «[локация]» (медиа без подписи) / reply-целью;
+# также ловим сырые координаты «geo:lat,lon» и «@lat,lon». Тот же словарь детекта, что _COLL_GEO
+# в suggest (attachment-подмножество). Строки менеджера игнорируем — как в client_maps_link.
+_GEO_PIN_RE = re.compile(r"\[локаци\w*\]|geo:\s*-?\d|@-?\d{1,2}\.\d{3,},-?\d{1,3}\.\d{3,}", re.I)
+
+
+def client_geo_pin(transcript):
+    """True, если в КЛИЕНТСКИХ строках есть гео-ПИН/координаты (Telegram гео-вложение → маркер
+    «[локация]») БЕЗ текстовой Maps-ссылки. Даёт точку доставки, когда клиент кинул пин, а не URL."""
+    for ln in str(transcript or "").splitlines():
+        if not ln.lstrip().startswith("[клиент]:"):
+            continue
+        if _GEO_PIN_RE.search(ln):
+            return True
+    return False
+
+
 # ------------------------------- сборка карточки -----------------------------
 
 def build_card(ex, allowlist=None, quote_fn=None, today=None, meta=None):
@@ -534,12 +552,15 @@ def build_intake(ex, allowlist=None, meta=None):
     # O3-2.1: поле «Доставка» дособираем гео-ссылкой Maps ИЗ КЛИЕНТСКИХ строк диалога (ссылки
     # менеджера отфильтрованы в client_maps_link). Есть ссылка — она попадает в пост даже без
     # note (страж перестаёт просить гео, оно уже есть); нет ссылки — прежнее поведение.
+    # ЭТАП 2 (б): нет URL, но клиент кинул гео-ПИН/координаты ([локация]) → отражаем точку в поле.
     maps_link = client_maps_link(transcript)
     delivery_parts = []
     if note and not delivery_bad:                    # доставка вне Пхукета (⚠️) — не включаем
         delivery_parts.append(note)
     if maps_link and not any(maps_link in p for p in delivery_parts):
         delivery_parts.append(maps_link)
+    elif not maps_link and client_geo_pin(transcript):
+        delivery_parts.append("точка на карте (пин в диалоге)")
     if delivery_parts:
         lines.append("Доставка: " + " · ".join(delivery_parts))
 
@@ -554,6 +575,26 @@ def build_intake(ex, allowlist=None, meta=None):
 
     if len(lines) <= 1:                              # только заголовок, валидных полей нет
         return None
+
+    # ЭТАП 2 (а): ЧЕСТНЫЙ хвост «не хватает» для карточки «Входящие брони» — чтобы менеджер доносил
+    # ТОЛЬКО недостающее (точку доставки / фото паспорта), а не всё подряд. Источник — collected_facts
+    # (то же детерминированное окно, что и фильтр вопросов): geo = ссылка/пин/координаты/названо жильё;
+    # passport = ФАКТ фото/файла в окне ([фото]/«вероятно паспорт»). Депозит-правило и окно НЕ трогаем —
+    # это лишь подсказка менеджеру. Транскрипта нет (старый вызов) → хвоста нет (нечего оценивать).
+    if transcript:
+        try:
+            facts = suggest.collected_facts(transcript)
+        except Exception:
+            facts = {}
+        gaps = []
+        if not facts.get("geo"):
+            gaps.append("точка (гео/Maps)")
+        if not facts.get("passport"):
+            # фото: build_intake видит только транскрипт, а фактическую пересылку решает отдельный
+            # скан живого диалога (poll_and_post_intake) → честно помечаем неопределённость, не «нет».
+            gaps.append("фото паспорта (проверьте — в окне не найдено, возможно приложено пересылкой)")
+        if gaps:
+            lines.append("❗ Не хватает: " + "; ".join(gaps))
     return "\n".join(lines)
 
 

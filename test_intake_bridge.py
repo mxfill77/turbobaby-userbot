@@ -397,5 +397,71 @@ class TestBridgePassportForward(unittest.TestCase):
             moderation_ipc.DB_PATH = save
 
 
+class TestBridgeMissingGaps(unittest.TestCase):
+    """O3-2.1 ЭТАП 2: (а) карточка ЧЕСТНО перечисляет «не хватает: точка / фото» из collected_facts —
+    менеджер доносит ТОЛЬКО недостающее; (б) Telegram гео-ПИН (маркер [локация]), не только URL,
+    даёт точку доставки. 4 кейса: точка есть/нет × фото есть/нет + гео-пин + регрессия без транскрипта.
+    Фото помечаем ЧЕСТНО как неопределённость (живой скан диалога — отдельный источник)."""
+
+    EX = {"model": "NMAX 155", "name": "Иван", "date_from": "2026-07-22",
+          "date_to_datetime": "2026-07-27", "deposit": "3000", "helmets": "2", "contact": "@ivan"}
+    CLINK = "https://maps.app.goo.gl/CLIENThotel7"
+    MGR_PIN = "[менеджер]: наша точка [локация]"     # пин менеджера НЕ считается точкой клиента
+
+    def _card(self, tr):
+        return booking_draft.build_intake(self.EX, allowlist=ALLOW,
+                                          meta={"client_ref": "@ivan", "transcript": tr})
+
+    # --- кейс 1: точка (URL) ЕСТЬ + фото ЕСТЬ → «не хватает» строки нет вовсе ---
+    def test_both_present_no_gaps(self):
+        tr = "[клиент]: мы тут " + self.CLINK + "\n[клиент]: [фото]"
+        txt = self._card(tr)
+        self.assertNotIn("Не хватает", txt)
+        self.assertEqual(parse_intake(txt)["Доставка"], self.CLINK)
+
+    # --- кейс 2 (+б): точка = ГЕО-ПИН + фото НЕТ → Доставка из пина, в недостающем только фото ---
+    def test_geo_pin_present_photo_missing(self):
+        tr = "[клиент]: вот наш адрес [локация]"
+        txt = self._card(tr)
+        self.assertEqual(parse_intake(txt)["Доставка"], "точка на карте (пин в диалоге)")
+        self.assertIn("Не хватает", txt)
+        self.assertNotIn("точка (гео/Maps)", txt)   # точка ЕСТЬ (пин) → её нет в недостающем
+        self.assertIn("фото паспорта", txt)          # фото — недостающее (мягко, с оговоркой)
+
+    # --- кейс 3: точки НЕТ + фото ЕСТЬ → в недостающем только точка ---
+    def test_geo_missing_photo_present(self):
+        tr = "[клиент]: привет, хочу байк\n[клиент]: [фото]"
+        txt = self._card(tr)
+        self.assertIn("Не хватает: точка (гео/Maps)", txt)
+        self.assertNotIn("фото паспорта", txt)       # фото собрано → не в недостающем
+        self.assertNotIn("Доставка:", txt)           # ни note, ни ссылки, ни пина
+
+    # --- кейс 4: обеих НЕТ → карточка честно перечисляет и точку, и фото ---
+    def test_both_missing_lists_both(self):
+        tr = "[клиент]: просто хочу арендовать"
+        txt = self._card(tr)
+        self.assertTrue(txt.startswith("🆕 БРОНЬ"))
+        self.assertIn("точка (гео/Maps)", txt)
+        self.assertIn("фото паспорта", txt)
+
+    # --- пин МЕНЕДЖЕРА не считается точкой клиента (как и ссылки менеджера) ---
+    def test_manager_pin_not_client_point(self):
+        tr = self.MGR_PIN + "\n[клиент]: хочу байк"
+        txt = self._card(tr)
+        self.assertNotIn("Доставка:", txt)
+        self.assertIn("Не хватает: точка (гео/Maps)", txt)
+
+    # --- регрессия: транскрипта нет (старый вызов) → хвоста «не хватает» нет, байт-в-байт ---
+    def test_no_transcript_no_gap_tail(self):
+        txt = booking_draft.build_intake(self.EX, allowlist=ALLOW, meta={"client_ref": "@ivan"})
+        self.assertNotIn("Не хватает", txt)
+
+    # --- тайский НЕ появляется в хвосте (класс регрессий: автосбор/шаблоны не тянут тайский) ---
+    def test_no_thai_in_gaps(self):
+        tr = "[клиент]: просто хочу арендовать"
+        txt = self._card(tr)
+        self.assertFalse(any("฀" <= ch <= "๿" for ch in txt))
+
+
 if __name__ == "__main__":
     unittest.main()
