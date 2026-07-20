@@ -2055,6 +2055,68 @@ def collected_manager_note(facts: dict, lang: str = "ru") -> str:
     return head + " ".join(parts) + "]"
 
 
+# ------------------- фильтр списка вопросов брони по уже собранным полям (шаг 2/5 #241) -------------------
+# Сам список вопросов оформления брони (что и какими словами спросить у клиента) живёт в LLM-промпте/
+# playbook/KB (частично на VPS) — см. docs/task-2026-07-20-questions-filter.md. Здесь — детерминированный
+# фильтр обратной половины: перед отправкой клиенту вычёркиваем пункты, данные по которым клиент УЖЕ дал
+# в окне (collected_facts). Каждый вопрос сопоставляем с полем(ями) по ключевым словам (RU/EN) и исключаем
+# ТОЛЬКО когда ВСЕ затронутые вопросом поля уже собраны (составной вопрос про ещё-неизвестное поле
+# остаётся — реальный вопрос не теряем). Вопрос без совпадения с полем оставляем (не знаем — не режем).
+# Каждый вычеркнутый пункт логируем (аудит: что и почему исключили). Поля — те же ключи, что в _COLL_LABELS.
+_QUESTION_FIELD_PATTERNS = [
+    ("model", re.compile(
+        r"модел|байк|скутер|мотоцикл|какую\s+(?:технику|машину|модель)"
+        r"|\bmodel\b|\bbike\b|scooter|motorbike|which.*(?:model|bike|scooter)", re.I)),
+    ("dates", re.compile(
+        r"как(?:ую|ие)\s+дат|на\s+как(?:ое|ие)\s+числ|с\s+как(?:ого|ой)\s+(?:числа|даты)"
+        r"|когда\s+(?:вам\s+)?(?:нужен|заб|нача|приед|приле|старт|аренд)|дат\w*\s+(?:заезда|начала|старта|аренды)"
+        r"|заезд|check[-\s]?in|what.*date|when.*(?:start|need|arrive|rent|pick|begin)|start\s+date", re.I)),
+    ("term", re.compile(
+        r"на\s+сколько|сколько\s+дней|как\s+долго|срок\s+аренд|длительн|период\s+аренд"
+        r"|how\s+long|how\s+many\s+days|rental\s+period|duration", re.I)),
+    ("geo", re.compile(
+        r"отел|адрес|апартамент|вилл\w*|где\s+(?:вы\s+)?(?:останов|прожив|живёте|живете|находит)"
+        r"|куда\s+(?:вам\s+)?(?:до)?став|локац|район\s+прожив|name\s+of\s+your\s+(?:apartment|hotel)"
+        r"|\bhotel\b|apartment|\baddress\b|where.*(?:stay|located|deliver)|delivery\s+(?:address|location)", re.I)),
+    ("passport", re.compile(
+        r"паспорт|фото\s+документ|скан\s+документ|документ\w*\s+(?:пришл|скинь|фото)"
+        r"|passport|\bid\s+(?:photo|card|copy)\b|photo\s+of\s+your\s+(?:passport|id)", re.I)),
+    ("phone", re.compile(
+        r"телефон|ваш\s+номер|номер\s+(?:телефона|для\s+связи|whats\s*app)|контактн\w*\s+(?:номер|телефон)"
+        r"|для\s+связи|whats\s*app|whatsapp|\bphone\b|contact\s+number|your\s+(?:phone\s+)?number", re.I)),
+    ("payment", re.compile(
+        r"оплат|как\s+(?:вам\s+)?удобн\w*\s+(?:внести|заплат|оплат)|способ\s+оплат|предоплат"
+        r"|\bpay\b|payment\s+method|how.*(?:pay|deposit)|\bdeposit\b", re.I)),
+]
+
+
+def filter_booking_questions(questions, facts: dict, lang: str = "ru"):
+    """Шаг 2/5 (родитель #241): убрать из списка вопросов оформления брони пункты, данные по которым
+    клиент УЖЕ дал в окне. facts — из collected_facts (булевы model/term/dates/geo/passport/phone/payment).
+    Каждый вопрос сопоставляем с полем(ями) по ключевым словам (_QUESTION_FIELD_PATTERNS, RU/EN) и
+    исключаем ТОЛЬКО если ВСЕ затронутые вопросом поля уже собраны — составной вопрос про ещё-неизвестное
+    поле остаётся (реальный вопрос не теряем). Вопрос без совпадения с полем оставляем (не знаем — не режем).
+    Возвращает НОВЫЙ список оставшихся вопросов в исходном порядке; каждый вычеркнутый пункт логируем."""
+    items = list(questions or [])
+    if not items:
+        return items
+    facts = facts or {}
+    collected = {k for k, v in facts.items() if v}
+    if not collected:
+        return items   # нечего исключать — вернуть как есть
+    label = {key: lbl[0 if lang != "en" else 1] for key, lbl, _ in _COLL_LABELS}
+    kept = []
+    for q in items:
+        text = q if isinstance(q, str) else str(q)
+        matched = {key for key, pat in _QUESTION_FIELD_PATTERNS if pat.search(text)}
+        if matched and matched <= collected:
+            log.info("filter_booking_questions: вычеркнут вопрос [уже собрано: %s] — %r",
+                     ", ".join(sorted(label.get(k, k) for k in matched)), text)
+            continue
+        kept.append(q)
+    return kept
+
+
 # Инструкция про депозит при нескольких байках (правила цен v2, п.4).
 DEPOSIT_MULTI_NOTE = ("ДЕПОЗИТ: клиент спрашивает про уменьшение депозита при нескольких байках "
                       "— сам скидку/снижение депозита НЕ предлагай и НЕ обещай; ответь ровно: "

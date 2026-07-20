@@ -1139,6 +1139,78 @@ class TestCollectedTracker(unittest.TestCase):
         self.assertFalse(suggest.collected_facts("[клиент]: с 7 по 14 июля")["phone"])
 
 
+class TestFilterBookingQuestions(unittest.TestCase):
+    """Шаг 2/5 (родитель #241): filter_booking_questions вычёркивает из списка вопросов оформления
+    брони пункты, данные по которым клиент УЖЕ дал в окне (по collected_facts). Голдены — реальные
+    формулировки вопросов оформления (отель/адрес, даты, модель, паспорт, телефон, оплата)."""
+
+    def test_geo_question_dropped_when_location_collected(self):
+        qs = ["Как называется ваш отель / адрес проживания?",
+              "На какие даты нужен байк?",
+              "Какая модель вас интересует?"]
+        facts = {"geo": True}
+        kept = suggest.filter_booking_questions(qs, facts)
+        self.assertNotIn(qs[0], kept)                 # гео уже дано → вопрос про отель/адрес вычеркнут
+        self.assertEqual(kept, [qs[1], qs[2]])        # остальные (даты/модель не собраны) остаются, порядок цел
+
+    def test_multiple_collected_fields_all_dropped(self):
+        qs = ["Какую модель хотите арендовать?",
+              "На сколько дней аренда?",
+              "С какого числа вам нужен байк?",
+              "Куда доставить — ваш адрес/отель?",
+              "Пришлите, пожалуйста, фото паспорта",
+              "Ваш номер телефона для связи?",
+              "Каким способом удобно внести оплату?"]
+        facts = {"model": True, "term": True, "dates": True, "geo": True,
+                 "passport": True, "phone": True, "payment": True}
+        self.assertEqual(suggest.filter_booking_questions(qs, facts), [])  # всё собрано → список пуст
+
+    def test_english_questions_match_english_fields(self):
+        qs = ["What is the name of your apartment / hotel address?",
+              "Which model would you like?",
+              "How many days do you need the bike for?"]
+        facts = {"geo": True}
+        kept = suggest.filter_booking_questions(qs, facts, "en")
+        self.assertNotIn(qs[0], kept)                 # EN гео-вопрос («name of your apartment») вычеркнут
+        self.assertEqual(kept, [qs[1], qs[2]])
+
+    def test_compound_question_kept_when_one_field_unknown(self):
+        # составной вопрос про гео (собрано) И депозит/оплату (НЕ собрано) — НЕ теряем: реальный вопрос остаётся
+        qs = ["Подскажите ваш адрес и каким способом будете вносить оплату?"]
+        facts = {"geo": True}
+        self.assertEqual(suggest.filter_booking_questions(qs, facts), qs)
+
+    def test_no_facts_returns_all(self):
+        qs = ["Какая модель?", "Какие даты?"]
+        self.assertEqual(suggest.filter_booking_questions(qs, {}), qs)          # ничего не собрано → все вопросы
+        self.assertEqual(suggest.filter_booking_questions(qs, None), qs)
+
+    def test_unmatched_question_is_kept(self):
+        # вопрос, не сопоставимый ни с одним полем, — оставляем (не знаем, о чём он)
+        qs = ["Планируете ли вы шлем для пассажира?"]
+        facts = {"geo": True, "model": True}
+        self.assertEqual(suggest.filter_booking_questions(qs, facts), qs)
+
+    def test_dates_question_dropped_but_model_question_kept(self):
+        qs = ["На какие даты бронируем?", "Какой байк выбираете?"]
+        facts = {"dates": True}                       # даты есть, модель — нет
+        kept = suggest.filter_booking_questions(qs, facts)
+        self.assertEqual(kept, [qs[1]])
+
+    def test_filtered_item_is_logged(self):
+        qs = ["Как называется ваш отель?", "Какие даты?"]
+        with self.assertLogs("suggest", level="INFO") as cm:
+            suggest.filter_booking_questions(qs, {"geo": True})
+        joined = "\n".join(cm.output)
+        self.assertIn("вычеркнут вопрос", joined)     # факт вычёркивания залогирован
+        self.assertIn("отель", joined)                # с текстом самого пункта
+        self.assertIn("локация", joined)              # и с меткой собранного поля
+
+    def test_empty_input_returns_empty(self):
+        self.assertEqual(suggest.filter_booking_questions([], {"geo": True}), [])
+        self.assertEqual(suggest.filter_booking_questions(None, {"geo": True}), [])
+
+
 class TestDetectFirstMessageBooking(unittest.TestCase):
     """Родитель #271 шаг 2/5: детект котируемой брони на ПЕРВОМ сообщении — модель+старт+срок.
     Голдены из живого кейса 13.07 (класс «ж»: клиент дал всё сразу, надо котировать, а не анкету)
