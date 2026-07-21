@@ -41,6 +41,8 @@ load_dotenv()
 # suggest импортируем ПОСЛЕ load_dotenv — модуль читает конфиг (SUGGEST_MODE и пр.)
 # из окружения на импорте; иначе флаги из .env не подхватятся.
 import suggest  # noqa: E402
+import trainer  # noqa: E402  ГРУППА-ТРЕНАЖЁР (изолированный путь; боевой поток не задет)
+import booking_draft  # noqa: E402  (текст-команда «до crm» в тренажёре — мост 2.1, read-only)
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -212,6 +214,136 @@ async def _suggest_ipc_poller(client):
         await asyncio.sleep(3)
 
 
+# ============================ ГРУППА-ТРЕНАЖЁР ================================
+# Изолированный путь: активен ТОЛЬКО в привязанной группе «Тренеровка» (по chat_id).
+# Боевой поток реальных клиентов (on_incoming, ЛС) НЕ задет ничем. userbot — единственный,
+# кто шлёт клиентские ответы в группу; ТЕКСТ-команды (заново/до crm/урок:/отмени урок N)
+# работают ВСЕГДА (даже если модербот-панель кнопок недоступна).
+
+async def _trainer_send(client, chat_id, text):
+    """Пост в группу тренажёра, с анти-тайским фильтром. Не роняет обработчик."""
+    try:
+        await client.send_message(chat_id, trainer.strip_thai(text))
+    except Exception as e:
+        log.warning(f"{_now()} | ТРЕНАЖЁР: не смог запостить в группу: {e}")
+
+
+async def _trainer_reply(event, text):
+    """Обычная клиентская реплика владельца → ПОЛНЫЙ боевой пайплайн (как от клиента ТЕСТ-N),
+    ответ ПРЯМО В ГРУППУ. Копим сессионный транскрипт сами (Bot API историю не читает,
+    а в группе есть модербот — его строки в транскрипт попадать не должны)."""
+    client = event.client
+    chat_id = event.chat_id
+    transcript = trainer.append_turn(trainer.get_transcript(), "client", text)
+    first = not trainer.has_manager_turn(transcript)   # приветствие — один раз на ТЕСТ-клиента
+    try:
+        lang = suggest.detect_lang_from_client(transcript)
+        hints = suggest.extract_booking_hints(transcript)
+        price_note = await asyncio.to_thread(suggest.build_pricing_note, hints, lang)
+        allow = suggest.park_allowlist()
+        pb = suggest.load_playbook()
+        faq = suggest.load_faq()
+        draft = await asyncio.to_thread(
+            suggest.generate_draft, transcript, lang, faq, first, price_note, None, allow, pb)
+    except Exception as e:
+        log.warning(f"{_now()} | ТРЕНАЖЁР: сбой генерации ответа: {e}")
+        await _trainer_send(client, chat_id, "⚠️ Не удалось сгенерировать ответ (см. userbot.log).")
+        return
+    draft = trainer.strip_thai(draft or "")
+    n = trainer.get_n()
+    k = len(suggest.list_playbook_rules())
+    await _trainer_send(client, chat_id, trainer.render_answer(n, k, draft))
+    # фиксируем обмен: транскрипт + последняя пара (для кнопок «До CRM»/«Обучить» модербота)
+    transcript = trainer.append_turn(transcript, "manager", draft)
+    trainer.record_turn(text, transcript, draft)
+
+
+async def _trainer_crm(event):
+    """ТЕКСТ-команда «до crm»: текущий диалог ТЕСТ-клиента → мост 2.1 → карточка «🆕 БРОНЬ [ТЕСТ]»
+    ТОЛЬКО в саму группу тренажёра (боевые «Входящие брони» НЕ трогаем; в CRM не пишем)."""
+    client = event.client
+    chat_id = event.chat_id
+    transcript = trainer.get_transcript()
+    if not transcript.strip():
+        await _trainer_send(client, chat_id, "⚠️ Диалог ТЕСТ-клиента пуст — нечего заводить в CRM.")
+        return
+    try:
+        meta = {"transcript": transcript, "client_ref": "ТЕСТ", "client_name": "ТЕСТ"}
+        card, intake_text = await asyncio.to_thread(
+            booking_draft.make_booking_and_intake, transcript, None, None, None, None, meta)
+    except Exception as e:
+        log.warning(f"{_now()} | ТРЕНАЖЁР: сбой моста 2.1: {e}")
+        await _trainer_send(client, chat_id, "⚠️ Не удалось собрать заявку (см. userbot.log).")
+        return
+    body = (intake_text or card or "⚠️ Из диалога заявку собрать не удалось.").strip()
+    await _trainer_send(client, chat_id, trainer.crm_card(body))
+
+
+async def _trainer_reset(event):
+    """ТЕКСТ-команда «заново»: полный сброс контекста ТЕСТ-клиента, инкремент N."""
+    n = trainer.reset()
+    await _trainer_send(event.client, event.chat_id,
+                        f"🔄 Сброшено. Новый клиент ТЕСТ-{n} — контекст (факты + память диалога) очищен.")
+
+
+async def on_trainer_group(event):
+    """Входящее сообщение в ГРУППЕ. Действуем ТОЛЬКО в привязанной группе тренажёра; всё прочее —
+    мимо (боевой контур не трогаем). Ленивая привязка по первому сообщению владельца в группе
+    с title «Тренеровка». Ботов (в т.ч. модербот) и свои сообщения игнорируем."""
+    if not event.is_group:
+        return
+    sender = await event.get_sender()
+    if not isinstance(sender, User) or sender.bot:
+        return  # только живые люди; модербот/каналы — не клиентские реплики
+    if (sender.username or "").lower() in OWN_USERNAMES:
+        return
+    chat_id = event.chat_id
+    bound = trainer.bound_chat_id()
+    if bound is None:
+        # ленивая привязка: строго по title «Тренеровка» (иначе НЕ наша группа — выходим)
+        try:
+            chat = await event.get_chat()
+            title = getattr(chat, "title", "") or ""
+        except Exception:
+            title = ""
+        if not trainer.title_matches(title):
+            return
+        trainer.bind_chat(chat_id)
+        await _trainer_send(
+            event.client, chat_id,
+            f"🎓 Группа-тренажёр привязана: chat_id={chat_id}, title=«{title}». "
+            f"Пиши как клиент — отвечу ТЕСТ-клиентом. Команды: заново · до crm · урок: … · отмени урок N.")
+        bound = chat_id
+    if int(chat_id) != int(bound):
+        return  # строгая ИЗОЛЯЦИЯ: другая группа — не тренажёр
+
+    text = event.raw_text or ""
+    username = sender.username
+    kind, payload = trainer.parse_command(text)
+    if kind == "reset":
+        await _trainer_reset(event)
+        return
+    if kind == "crm":
+        await _trainer_crm(event)
+        return
+    if kind == "lesson":
+        if not suggest.is_approver(username):
+            await _trainer_send(event.client, chat_id, "⛔ Учить бота может только approver.")
+            return
+        dec = await asyncio.to_thread(trainer.apply_lesson, payload)
+        await _trainer_send(event.client, chat_id, dec["card"])
+        return
+    if kind == "cancel":
+        if not suggest.is_approver(username):
+            await _trainer_send(event.client, chat_id, "⛔ Откатывать правила может только approver.")
+            return
+        dec = trainer.cancel_lesson(payload)
+        await _trainer_send(event.client, chat_id, dec["card"])
+        return
+    # обычная реплика ТЕСТ-клиента → боевой пайплайн, ответ в группу
+    await _trainer_reply(event, text)
+
+
 async def main():
     # Singleton-гард ДО подключения: если живой экземпляр уже есть — выходим,
     # чтобы не было двух клиентов на одной session.
@@ -222,8 +354,20 @@ async def main():
     # чтобы Telethon корректно привязался к event loop.
     client = TelegramClient(SESSION, API_ID, API_HASH)
     client.add_event_handler(on_incoming, events.NewMessage(incoming=True))
+    # ГРУППА-ТРЕНАЖЁР: отдельный хендлер только на ГРУППОВЫЕ входящие (func=is_group), чтобы
+    # ЛС-путь (on_incoming) не задевать. Внутри — строгая изоляция по привязанному chat_id.
+    client.add_event_handler(
+        on_trainer_group, events.NewMessage(incoming=True, func=lambda e: e.is_group))
     # Второй хендлер (модерация) вешаем ПОСЛЕ старта — когда известен id группы
     # (может резолвиться по имени через iter_dialogs). См. блок после get_me ниже.
+
+    # ГРУППА-ТРЕНАЖЁР хранит сессионное состояние в moderation_ipc.meta (общий канал с модерботом).
+    # init_db идемпотентна — гарантируем таблицу meta даже без bot-режима. Не критично для ЛС-пути.
+    try:
+        import moderation_ipc
+        moderation_ipc.init_db()
+    except Exception as e:
+        log.warning(f"{_now()} | ТРЕНАЖЁР: init IPC meta: {e}")
 
     log.info(f"{_now()} | --- userbot_listen ЗАПУСК (ЭТАП C: слушаю, НЕ отвечаю) ---")
     try:

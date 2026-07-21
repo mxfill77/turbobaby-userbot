@@ -3381,6 +3381,13 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
     )
 
 
+def default_llm_caller():
+    """Публичный доступ к текущей голове LLM (CLI по подписке Max либо API-ключ) — тем же
+    выбором, что generate_draft. Нужен внешним потребителям (напр. гипотезы «🎓 Обучить»
+    в тренажёре, процесс модербота), чтобы не дёргать приватные _cli_llm/_default_llm."""
+    return _cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm
+
+
 def _default_llm(system: str, user: str) -> str:
     import anthropic
     c = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)

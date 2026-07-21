@@ -1,0 +1,381 @@
+# -*- coding: utf-8 -*-
+"""
+test_trainer.py — ГРУППА-ТРЕНАЖЁР клиентского бота (изолированный контур ПК).
+
+Прогонять с TESTING=1 (изоляция боевого IPC; moderation_ipc уводит DB в tmp):
+    TESTING=1 python -m unittest test_trainer -v
+
+Покрытие (по ТЗ):
+  • «Заново» чистит контекст ТЕСТ-клиента (collected_facts пуст) и N++;
+  • урок применяется со следующего ответа (behavior → playbook → в system-prompt), источник «тренажёр»;
+  • «отмени урок N» откатывает правило и снимает пометку источника;
+  • CRM-карточка из тренажёра помечена [ТЕСТ] (боевые «Входящие брони» не трогаем);
+  • изоляция: is_trainer_chat строго по привязанному chat_id (вне группы — боевой путь);
+  • шапка [тренажёр | ТЕСТ-N | правил: K] присутствует; подсказка-строка присутствует;
+  • анти-тайский: тайские буквы в выводе не появляются (знак бата ฿ сохраняется);
+  • команды панели — только approver (тап чужого → отказ, без сброса);
+  • ТЕКСТ-команды работают как дубль независимо от модербота (fallback).
+"""
+
+import os
+import json
+import tempfile
+import unittest
+
+os.environ.setdefault("TESTING", "1")
+
+import trainer
+import suggest
+import moderation_ipc
+
+
+def _dict_store():
+    """dict-backed get/set для сессионного состояния (вместо moderation_ipc.meta)."""
+    d = {}
+
+    def get(k):
+        return d.get(k)
+
+    def set(k, v):
+        d[k] = "" if v is None else str(v)
+
+    return d, get, set
+
+
+# ------------------------------- шапка / подсказка ---------------------------
+
+class TestHeaderAndHint(unittest.TestCase):
+    def test_header_exact(self):
+        self.assertEqual(trainer.header(3, 7), "[тренажёр | ТЕСТ-3 | правил: 7]")
+
+    def test_render_answer_has_header_and_hint(self):
+        r = trainer.render_answer(2, 5, "Здравствуйте! Что вас интересует?")
+        self.assertIn("[тренажёр | ТЕСТ-2 | правил: 5]", r)
+        self.assertIn("Здравствуйте!", r)
+        self.assertIn("команды:", r)          # подсказка-строка присутствует
+        self.assertTrue(trainer.has_header(r))
+
+    def test_has_header_negative(self):
+        self.assertFalse(trainer.has_header("Здравствуйте, обычный текст"))
+        self.assertFalse(trainer.has_header(""))
+
+
+# ------------------------------- команды -------------------------------------
+
+class TestCommandParse(unittest.TestCase):
+    def test_reset(self):
+        for t in ("заново", "Заново", " сброс ", "/reset", "новый клиент"):
+            self.assertEqual(trainer.parse_command(t)[0], "reset", t)
+
+    def test_crm(self):
+        for t in ("до crm", "В CRM", "crm", "/crm"):
+            self.assertEqual(trainer.parse_command(t)[0], "crm", t)
+
+    def test_lesson(self):
+        kind, payload = trainer.parse_command("урок: не здоровайся дважды")
+        self.assertEqual(kind, "lesson")
+        self.assertEqual(payload, "не здоровайся дважды")
+
+    def test_cancel(self):
+        self.assertEqual(trainer.parse_command("отмени урок 2"), ("cancel", 2))
+        self.assertEqual(trainer.parse_command("отменить урок #5"), ("cancel", 5))
+
+    def test_plain_client_message_is_not_command(self):
+        # обычная клиентская реплика → не команда (идёт в пайплайн)
+        for t in ("привет", "какие цены на аренду?", "хочу скутер на неделю"):
+            self.assertEqual(trainer.parse_command(t), (None, None), t)
+
+
+# ------------------------------- транскрипт ----------------------------------
+
+class TestTranscript(unittest.TestCase):
+    def test_append_client_and_manager(self):
+        t = trainer.append_turn("", "client", "привет")
+        self.assertEqual(t, "[клиент]: привет")
+        t = trainer.append_turn(t, "manager", "Здравствуйте!")
+        self.assertEqual(t, "[клиент]: привет\n[менеджер]: Здравствуйте!")
+
+    def test_manager_turn_strips_header_and_hint(self):
+        # в транскрипт кладём ТОЛЬКО клиентское тело ответа (без шапки/подсказки тренажёра)
+        full = trainer.render_answer(1, 0, "Привет! Чем помочь?")
+        t = trainer.append_turn("", "manager", full)
+        self.assertEqual(t, "[менеджер]: Привет! Чем помочь?")
+        self.assertNotIn("тренажёр", t)
+        self.assertNotIn("команды:", t)
+
+    def test_has_manager_turn_first_contact(self):
+        self.assertFalse(trainer.has_manager_turn("[клиент]: привет"))
+        self.assertTrue(trainer.has_manager_turn("[клиент]: привет\n[менеджер]: hi"))
+
+
+# ------------------------------- анти-тайский --------------------------------
+
+class TestAntiThai(unittest.TestCase):
+    def test_strip_thai_letters_keeps_baht(self):
+        s = "Доставка в Раваи — 590 ฿ สวัสดี ครับ"
+        out = trainer.strip_thai(s)
+        self.assertFalse(any(("ก" <= c <= "ฺ") or ("เ" <= c <= "๛") for c in out),
+                         "тайских букв в выводе быть не должно")
+        self.assertIn("฿", out)               # знак бата легитимен — сохраняется
+        self.assertIn("Доставка в Раваи", out)
+
+    def test_strip_thai_noop_on_clean(self):
+        s = "Здравствуйте! Скутер 300 ฿/сутки."
+        self.assertEqual(trainer.strip_thai(s), s)
+
+    def test_render_answer_run_through_strip_is_thai_free(self):
+        r = trainer.strip_thai(trainer.render_answer(1, 0, "Цена 300 ฿ สวัสดี"))
+        self.assertFalse(any(("ก" <= c <= "ฺ") or ("เ" <= c <= "๛") for c in r))
+
+
+# ------------------------------- гипотезы ------------------------------------
+
+class TestHypotheses(unittest.TestCase):
+    def test_parse_strips_numbering_and_dedupes(self):
+        raw = ("1. Не здоровайся дважды в одном диалоге\n"
+               "2) Сразу называй цену, не тяни\n"
+               "- Предлагай доставку явно\n"
+               "Не здоровайся дважды в одном диалоге\n")   # дубль
+        hyps = trainer.parse_hypotheses(raw)
+        self.assertEqual(len(hyps), 3)
+        self.assertEqual(hyps[0], "Не здоровайся дважды в одном диалоге")
+        self.assertEqual(hyps[1], "Сразу называй цену, не тяни")
+
+    def test_parse_caps_at_limit(self):
+        raw = "\n".join(f"правило номер {i}" for i in range(10))
+        self.assertEqual(len(trainer.parse_hypotheses(raw, limit=4)), 4)
+
+    def test_prompt_mentions_both_turns(self):
+        system, user = trainer.hypotheses_prompt("сколько стоит?", "300 бат в сутки")
+        self.assertIn("сколько стоит?", user)
+        self.assertIn("300 бат в сутки", user)
+
+
+# ------------------------------- сессионное состояние + сброс ----------------
+
+class TestStateReset(unittest.TestCase):
+    def test_reset_clears_context_and_increments_n(self):
+        d, get, set = _dict_store()
+        set(trainer.K_N, 1)
+        set(trainer.K_TRANSCRIPT, "[клиент]: хочу скутер на 5 дней, паспорт есть\n[менеджер]: ок")
+        set(trainer.K_INCOMING, "хочу скутер")
+        set(trainer.K_ANSWER, "ок")
+        # до сброса — факты из транскрипта есть (модель/срок/паспорт)
+        facts_before = suggest.collected_facts(trainer.get_transcript(get))
+        self.assertTrue(any(facts_before.values()))
+        n = trainer.reset(get, set)
+        self.assertEqual(n, 2)                                   # N++
+        self.assertEqual(trainer.get_transcript(get), "")        # транскрипт очищен
+        # collected_facts — ДЕРИВАТ транскрипта: пустой транскрипт ⇒ все факты False
+        self.assertFalse(set_of_true(suggest.collected_facts(trainer.get_transcript(get))))
+        self.assertEqual(trainer.get_last_pair(get), ("", ""))
+        self.assertEqual(trainer.get_hyps(get), [])
+
+    def test_record_turn_and_last_pair(self):
+        d, get, set = _dict_store()
+        trainer.record_turn("привет", "[клиент]: привет\n[менеджер]: hi", "hi", set)
+        self.assertEqual(trainer.get_last_pair(get), ("привет", "hi"))
+        self.assertEqual(trainer.get_transcript(get), "[клиент]: привет\n[менеджер]: hi")
+
+    def test_hyps_roundtrip(self):
+        d, get, set = _dict_store()
+        trainer.set_hyps(["a", "b"], set)
+        self.assertEqual(trainer.get_hyps(get), ["a", "b"])
+
+
+def set_of_true(facts):
+    return {k for k, v in facts.items() if v}
+
+
+# ------------------------------- изоляция ------------------------------------
+
+class TestIsolation(unittest.TestCase):
+    def test_is_trainer_chat_by_bound_meta(self):
+        d, get, set = _dict_store()
+        self.assertFalse(trainer.is_trainer_chat(-100500, get))     # ничего не привязано
+        trainer.bind_chat(-100500, get, set)
+        self.assertTrue(trainer.is_trainer_chat(-100500, get))      # в группе — тренажёрный путь
+        self.assertFalse(trainer.is_trainer_chat(-999, get))        # другая группа — боевой путь
+        self.assertFalse(trainer.is_trainer_chat(None, get))
+
+    def test_bind_inits_n_to_one(self):
+        d, get, set = _dict_store()
+        trainer.bind_chat(-777, get, set)
+        self.assertEqual(trainer.get_n(get), 1)
+
+    def test_env_override_wins(self):
+        old = trainer.TRAINER_GROUP_ID_ENV
+        trainer.TRAINER_GROUP_ID_ENV = -100777
+        try:
+            d, get, set = _dict_store()          # meta пуст — но env-override задан
+            self.assertTrue(trainer.is_trainer_chat(-100777, get))
+            self.assertFalse(trainer.is_trainer_chat(-100500, get))
+        finally:
+            trainer.TRAINER_GROUP_ID_ENV = old
+
+    def test_title_matches(self):
+        self.assertTrue(trainer.title_matches("Тренеровка"))
+        self.assertTrue(trainer.title_matches(" тренеровка "))
+        self.assertFalse(trainer.title_matches("Модерация ответов"))
+
+
+# ------------------------------- урок: behavior|code (инъекции) --------------
+
+class TestLessonRouting(unittest.TestCase):
+    def test_behavior_appends_and_marks_source(self):
+        calls, marked = {}, {}
+
+        def _append(r):
+            calls["rule"] = r
+            return "added"
+
+        dec = trainer.apply_lesson(
+            "не здоровайся дважды",
+            append_rule=_append,
+            classify=lambda r: "behavior",
+            mark=lambda r: marked.setdefault("rule", r))
+        self.assertEqual(dec["axis"], "behavior")
+        self.assertIn("Принято", dec["card"])
+        self.assertIn("тренажёр", dec["card"])          # источник помечен в карточке
+        self.assertEqual(calls["rule"], "не здоровайся дважды")
+        self.assertEqual(marked["rule"], "не здоровайся дважды")
+
+    def test_code_makes_owner_card_no_append(self):
+        def _fail(_r):
+            raise AssertionError("append_rule НЕ должен вызываться для code-урока")
+
+        dec = trainer.apply_lesson(
+            "если клиент прислал паспорт, ставь галочку passport",
+            append_rule=_fail, classify=lambda r: "code", mark=_fail)
+        self.assertEqual(dec["axis"], "code")
+        self.assertIn("код-фикс", dec["card"])
+
+    def test_empty_lesson(self):
+        dec = trainer.apply_lesson("   ", append_rule=lambda r: "added",
+                                   classify=lambda r: "behavior", mark=lambda r: None)
+        self.assertEqual(dec["status"], "error")
+
+    def test_classify_lesson_real(self):
+        # реальный классификатор 2-й оси (lesson_router)
+        self.assertEqual(trainer.classify_lesson("пиши короче, без воды"), "behavior")
+        self.assertEqual(
+            trainer.classify_lesson("если клиент прислал паспорт, ставь галочку passport"), "code")
+
+
+# ------------- урок применяется со следующего ответа + откат (интеграция) ----
+
+class TestLessonAppliesAndCancels(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.pb = os.path.join(self.tmp, "playbook.md")
+        with open(self.pb, "w", encoding="utf-8") as f:
+            f.write("# playbook\n")
+        self._old_pb = suggest.PLAYBOOK_FILE
+        self._old_side = trainer.TRAINER_RULES_FILE
+        suggest.PLAYBOOK_FILE = self.pb
+        trainer.TRAINER_RULES_FILE = os.path.join(self.tmp, "trainer_rules.json")
+
+    def tearDown(self):
+        suggest.PLAYBOOK_FILE = self._old_pb
+        trainer.TRAINER_RULES_FILE = self._old_side
+
+    def test_behavior_rule_reaches_next_system_prompt_with_source(self):
+        remark = "сразу называй цену, не тяни с ответом"
+        dec = trainer.apply_lesson(remark, classify=lambda r: "behavior")   # реальный suggest.append + mark
+        self.assertEqual(dec["axis"], "behavior")
+        self.assertIn(remark, suggest.load_playbook())                      # записано в книгу
+        # применится со СЛЕДУЮЩЕГО ответа — правило попадает в system-prompt генератора
+        sysp = suggest.make_system_prompt("", "ru", False, "", playbook=suggest.load_playbook())
+        self.assertIn(remark, sysp)
+        self.assertTrue(trainer.is_trainer_rule(remark))                    # источник «тренажёр»
+
+    def test_cancel_lesson_rolls_back_and_unmarks(self):
+        remark = "предлагай доставку явно в первом ответе"
+        trainer.apply_lesson(remark, classify=lambda r: "behavior")
+        self.assertIn(remark, suggest.load_playbook())
+        self.assertTrue(trainer.is_trainer_rule(remark))
+        dec = trainer.cancel_lesson(1)                                      # «отмени урок 1»
+        self.assertEqual(dec["status"], "removed")
+        self.assertNotIn(remark, suggest.load_playbook())                  # правило откатано
+        self.assertFalse(trainer.is_trainer_rule(remark))                  # пометка снята
+
+    def test_cancel_out_of_range(self):
+        dec = trainer.cancel_lesson(9)
+        self.assertEqual(dec["status"], "empty")                            # правил нет
+
+
+# ------------------------------- CRM-карточка [ТЕСТ] -------------------------
+
+class TestCrmCard(unittest.TestCase):
+    def test_crm_card_marked_test(self):
+        card = trainer.crm_card("Клиент: ТЕСТ\nМодель: Yamaha")
+        self.assertTrue(card.startswith("🆕 БРОНЬ [ТЕСТ]"))
+        self.assertIn("Yamaha", card)
+
+
+# ------------------------------- модербот: панель owner-only (async) ---------
+
+class TestModerbotCallbackGate(unittest.IsolatedAsyncioTestCase):
+    """Кнопки панели тренажёра только для approver; тап чужого → отказ, без сброса.
+    approver-тап «Заново» реально инкрементит N. Модербот использует боевой moderation_ipc.meta
+    (под TESTING — tmp DB)."""
+
+    def setUp(self):
+        import moderation_bot
+        self.mb = moderation_bot
+        moderation_ipc.init_db()
+        self._old_appr = suggest.APPROVER_USERNAMES
+        suggest.APPROVER_USERNAMES = {"mike"}
+        moderation_ipc.set_meta(trainer.K_N, "5")
+        moderation_ipc.set_meta(trainer.K_TRANSCRIPT, "[клиент]: привет\n[менеджер]: hi")
+
+    def tearDown(self):
+        suggest.APPROVER_USERNAMES = self._old_appr
+
+    def _fakes(self, username, chat_id=-100500):
+        sent = []
+
+        class Bot:
+            async def send_message(self, cid, text, **kw):
+                sent.append((cid, text))
+
+        class Ctx:
+            bot = Bot()
+
+        class User:
+            def __init__(self, u):
+                self.username = u
+
+        class Msg:
+            def __init__(self, cid):
+                self.chat_id = cid
+
+        class Q:
+            def __init__(self, u, cid):
+                self.from_user = User(u)
+                self.message = Msg(cid)
+
+        return Ctx(), Q(username, chat_id), sent
+
+    async def test_foreign_tap_refused_no_reset(self):
+        ctx, q, sent = self._fakes("intruder")
+        await self.mb._trainer_callback(ctx, q, "tr:reset")
+        self.assertTrue(any("⛔" in t for _, t in sent), "чужому — отказ")
+        self.assertEqual(trainer.get_n(), 5, "сброс НЕ должен произойти для чужого")
+
+    async def test_approver_reset_works(self):
+        ctx, q, sent = self._fakes("mike")
+        await self.mb._trainer_callback(ctx, q, "tr:reset")
+        self.assertEqual(trainer.get_n(), 6, "approver-тап «Заново» → N++")
+        self.assertTrue(any("ТЕСТ-6" in t for _, t in sent))
+
+    async def test_fallback_textcommand_reset_without_moderbot(self):
+        # ТЕКСТ-команда «заново» = дубль кнопки: сброс через trainer.reset без участия модербота
+        moderation_ipc.set_meta(trainer.K_N, "7")
+        n = trainer.reset()
+        self.assertEqual(n, 8)
+        self.assertEqual(trainer.get_transcript(), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -33,6 +33,7 @@ import suggest            # noqa: E402  (после load_dotenv — читает
 import moderation_core    # noqa: E402
 import moderation_ipc     # noqa: E402
 import booking_draft      # noqa: E402  (O3 кусок 1 «Кнопка Бронь»: экстракция заявки, read-only)
+import trainer            # noqa: E402  (ГРУППА-ТРЕНАЖЁР: панель кнопок под ответом userbot)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -249,12 +250,109 @@ async def _confirm_intake(context, q, data):
         await context.bot.send_message(q.message.chat_id, note.strip())
 
 
+# ---------------------- ГРУППА-ТРЕНАЖЁР: панель кнопок ------------------------
+# Единственная роль модербота в группе «Тренеровка»: под КАЖДЫМ ответом userbot (шапка
+# «[тренажёр …») повесить панель [🔄 Заново][📋 До CRM][🎓 Обучить] и обработать нажатия.
+# Клиентские ответы шлёт ТОЛЬКО userbot; модербот в диалог ТЕСТ-клиента текстов НЕ пишет.
+# Права на кнопки — approver (в группе это владелец). Дубль кнопок ТЕКСТ-командами держит
+# userbot (работают, даже если модербот лёг).
+
+def _kb_trainer_panel():
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Заново", callback_data="tr:reset"),
+        InlineKeyboardButton("📋 До CRM", callback_data="tr:crm"),
+        InlineKeyboardButton("🎓 Обучить", callback_data="tr:teach"),
+    ]])
+
+
+def _kb_trainer_hyps(hyps):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    rows = []
+    for i, h in enumerate(hyps):
+        label = f"{i + 1}. " + (h[:40] + "…" if len(h) > 40 else h)
+        rows.append([InlineKeyboardButton(label, callback_data=f"tr:hyp:{i}")])
+    rows.append([InlineKeyboardButton("✍️ другое (напишу текстом)", callback_data="tr:hyp:other")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _trainer_callback(context, q, data):
+    """Нажатия панели тренажёра (tr:*). approver-гейт. Результаты (сброс/CRM-карта/гипотезы/
+    принятое правило) постим В САМУ ГРУППУ тренажёра. Боевые «Входящие брони»/CRM не трогаем."""
+    import asyncio
+    chat_id = q.message.chat_id
+    username = (q.from_user.username if q.from_user else None)
+    if not suggest.is_approver(username):
+        await context.bot.send_message(chat_id, "⛔ Кнопки тренажёра — только для approver.")
+        return
+    if data == "tr:reset":
+        n = trainer.reset()
+        await context.bot.send_message(chat_id, f"🔄 Новый клиент ТЕСТ-{n} — контекст (факты + память диалога) очищен.")
+        return
+    if data == "tr:crm":
+        transcript = trainer.get_transcript()
+        if not transcript.strip():
+            await context.bot.send_message(chat_id, "⚠️ Диалог ТЕСТ-клиента пуст — нечего заводить в CRM.")
+            return
+        try:
+            meta = {"transcript": transcript, "client_ref": "ТЕСТ", "client_name": "ТЕСТ"}
+            card, intake_text = await asyncio.to_thread(
+                booking_draft.make_booking_and_intake, transcript, None, None, None, None, meta)
+        except Exception as e:
+            log.warning(f"trainer crm: {type(e).__name__}: {e}")
+            await context.bot.send_message(chat_id, "⚠️ Не удалось собрать заявку (см. moderation_bot.log).")
+            return
+        body = (intake_text or card or "⚠️ Из диалога заявку собрать не удалось.").strip()
+        await context.bot.send_message(chat_id, trainer.strip_thai(trainer.crm_card(body)))
+        return
+    if data == "tr:teach":
+        incoming, answer = trainer.get_last_pair()
+        if not (incoming and answer):
+            await context.bot.send_message(chat_id, "⚠️ Нет последнего ответа ТЕСТ-клиента — сначала напиши как клиент.")
+            return
+        try:
+            system, user = trainer.hypotheses_prompt(incoming, answer)
+            llm = suggest.default_llm_caller()
+            raw = await asyncio.to_thread(llm, system, user)
+            hyps = trainer.parse_hypotheses(raw)
+        except Exception as e:
+            log.warning(f"trainer teach: {type(e).__name__}: {e}")
+            hyps = []
+        if not hyps:
+            await context.bot.send_message(chat_id, "⚠️ Не удалось предложить гипотезы — напиши урок текстом: «урок: …».")
+            return
+        trainer.set_hyps(hyps)
+        await context.bot.send_message(
+            chat_id, "🎓 Что улучшить в ответе? Выбери правило (тап = запомнить), или «другое»:",
+            reply_markup=_kb_trainer_hyps(hyps))
+        return
+    if data.startswith("tr:hyp:"):
+        sel = data[len("tr:hyp:"):]
+        if sel == "other":
+            await context.bot.send_message(chat_id, "✍️ Напиши правило текстом: «урок: <твоё правило>».")
+            return
+        try:
+            i = int(sel)
+        except ValueError:
+            return
+        hyps = trainer.get_hyps()
+        if not (0 <= i < len(hyps)):
+            await context.bot.send_message(chat_id, "⚠️ Гипотеза устарела — нажми «🎓 Обучить» заново.")
+            return
+        dec = await asyncio.to_thread(trainer.apply_lesson, hyps[i])
+        await context.bot.send_message(chat_id, dec["card"])
+        return
+
+
 # ------------------------------- хендлеры ------------------------------------
 
 async def on_callback(update, context):
     q = update.callback_query
     await q.answer()
     data = q.data or ""
+    if data.startswith("tr:"):    # ГРУППА-ТРЕНАЖЁР: панель [Заново][До CRM][Обучить] и гипотезы
+        await _trainer_callback(context, q, data)
+        return
     if data.startswith("crm:"):   # O3-2c: «✅ В CRM» — своя маршрутизация (не m:{id}:action)
         await _confirm_intake(context, q, data)
         return
@@ -282,6 +380,18 @@ async def on_group_message(update, context):
     msg = update.effective_message
     chat = update.effective_chat
     if msg is None or chat is None:
+        return
+    # ГРУППА-ТРЕНАЖЁР: если это привязанная группа тренажёра — единственная роль модербота тут
+    # панель кнопок под ответом userbot (шапка «[тренажёр …»). Никакой модерации и, ВАЖНО, НЕ
+    # перетираем mod_chat (иначе боевые карточки уехали бы в тренажёр). Выходим сразу.
+    if trainer.is_trainer_chat(chat.id):
+        if trainer.has_header(msg.text or ""):
+            try:
+                await context.bot.send_message(
+                    chat.id, "⬆️ управление ТЕСТ-клиентом:",
+                    reply_to_message_id=msg.message_id, reply_markup=_kb_trainer_panel())
+            except Exception as e:
+                log.warning(f"trainer panel: {e}")
         return
     # запоминаем группу (для постинга, если MOD_GROUP_ID не задан)
     if chat.type in ("group", "supergroup"):
