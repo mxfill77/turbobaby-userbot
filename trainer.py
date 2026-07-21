@@ -127,6 +127,22 @@ def _clean_manager(text):
     return "\n".join(out).strip()
 
 
+def client_body(text, has_photo=False, geo_marker=None):
+    """Тело клиентской реплики для транскрипта — ПО ТЕМ ЖЕ правилам, что suggest.transcript_from
+    (ЛС-путь): текст (если есть) → иначе фото «[фото]» → иначе гео-маркер «[локация lat,lon]» →
+    иначе «[медиа/без текста]». Врезка чинит тренажёрный путь: гео-ПИН и фото Telegram доходят
+    до collected_facts и резолвера доставки МАРКЕРАМИ (иначе, собирая турн из event.raw_text,
+    мы теряли вложения → пин не резолвился в зону, паспорт-фото не засчитывалось в трекер)."""
+    t = (text or "").strip()
+    if t:
+        return text
+    if has_photo:
+        return "[фото]"
+    if geo_marker:
+        return geo_marker
+    return "[медиа/без текста]"
+
+
 def append_turn(transcript, role, text):
     """Дописать реплику в накопительный транскрипт. role: 'client' (владелец=ТЕСТ-клиент) |
     'manager' (ответ бота). Возвращает новый транскрипт (старый не мутируется)."""

@@ -340,8 +340,15 @@ async def on_trainer_group(event):
         dec = trainer.cancel_lesson(payload)
         await _trainer_send(event.client, chat_id, dec["card"])
         return
-    # обычная реплика ТЕСТ-клиента → боевой пайплайн, ответ в группу
-    await _trainer_reply(event, text)
+    # обычная реплика ТЕСТ-клиента → боевой пайплайн, ответ в группу.
+    # Вложения (гео-ПИН/фото) собираем МАРКЕРАМИ, как transcript_from в ЛС-пути: иначе пин не
+    # резолвится в зону, а фото паспорта не засчитывается трекером (event.raw_text их не несёт).
+    msg = event.message
+    geo = getattr(msg, "geo", None)
+    gm = suggest.geo_marker(geo) if geo is not None else None
+    has_photo = getattr(msg, "photo", None) is not None
+    body = trainer.client_body(text, has_photo=has_photo, geo_marker=gm)
+    await _trainer_reply(event, body)
 
 
 async def main():

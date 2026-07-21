@@ -313,6 +313,81 @@ class TestCrmCard(unittest.TestCase):
         self.assertIn("Yamaha", card)
 
 
+# --------- ВЛОЖЕНИЯ в тренажёре: гео-ПИН и фото доходят маркерами (регресс ТЕСТ-2) -----
+# Дефекты живого прогона (ТЕСТ-2, 01:07-01:09): турн собирался из event.raw_text → гео-ПИН и
+# фото Telegram ТЕРЯЛИСЬ. Следствие: пин не резолвился в зону (бот спрашивал район), а фото
+# паспорта не засчитывалось трекером. Фикс: trainer.client_body ставит те же маркеры, что
+# suggest.transcript_from (ЛС-путь) — «[локация lat,lon]» и «[фото]».
+
+class TestTrainerMediaBody(unittest.TestCase):
+    def test_client_body_priority(self):
+        # текст > фото > гео > медиа-без-текста (как transcript_from)
+        self.assertEqual(trainer.client_body("хочу скутер"), "хочу скутер")
+        self.assertEqual(trainer.client_body("", has_photo=True), "[фото]")
+        self.assertEqual(trainer.client_body("", geo_marker="[локация 7.77,98.33]"),
+                         "[локация 7.77,98.33]")
+        self.assertEqual(trainer.client_body("  ", has_photo=True,
+                                             geo_marker="[локация 7.77,98.33]"), "[фото]")
+        self.assertEqual(trainer.client_body(""), "[медиа/без текста]")
+
+    def test_geo_marker_public_wrapper(self):
+        class Geo:
+            def __init__(s, lat, lon):
+                s.lat, s.long = lat, lon
+        self.assertEqual(suggest.geo_marker(Geo(7.771, 98.327)), "[локация 7.771000,98.327000]")
+
+
+class TestTrainerMediaFacts(unittest.TestCase):
+    """Голдены ТЕСТ-2: пин с координатами → зона + geo✅; фото → passport✅; регресс
+    ссылки-без-координат (ТЕСТ-1) → честный вопрос остаётся (geo НЕ выдумывается)."""
+
+    def _transcript_with_geo_and_photo(self):
+        class Geo:
+            def __init__(s, lat, lon):
+                s.lat, s.long = lat, lon
+        t = trainer.append_turn("", "client",
+                                trainer.client_body("хочу на 7 дней с 1 по 8 августа"))
+        t = trainer.append_turn(t, "manager", "Здравствуйте! Уточню.")
+        # клиент кинул гео-ПИН (Telegram location) — отдельным сообщением, без текста
+        t = trainer.append_turn(t, "client",
+                                trainer.client_body("", geo_marker=suggest.geo_marker(Geo(7.771, 98.327))))
+        # затем фото паспорта — тоже отдельным сообщением, без подписи
+        t = trainer.append_turn(t, "client", trainer.client_body("", has_photo=True))
+        return t
+
+    def test_geo_pin_resolves_zone_and_geo_fact(self):
+        t = self._transcript_with_geo_and_photo()
+        # 1) трекер видит гео
+        self.assertTrue(suggest.collected_facts(t)["geo"])
+        # 2) координаты пина дошли до hints и до резолвера доставки → ЗОНА (не вопрос про район)
+        hints = suggest.extract_booking_hints(t)
+        self.assertEqual(hints.get("geo_pin"), (7.771, 98.327))
+        res = suggest._resolve_delivery_for_draft(
+            hints, _resolve_coords=lambda lat, lon: {"status": "zone", "zone": "Раваи", "price": 590})
+        self.assertEqual(res["status"], "zone")
+        self.assertEqual(res["price"], 590)
+
+    def test_photo_marks_passport_fact(self):
+        t = self._transcript_with_geo_and_photo()
+        self.assertTrue(suggest.collected_facts(t)["passport"])
+
+    def test_link_without_coords_stays_honest_question(self):
+        # РЕГРЕСС ТЕСТ-1: ссылка-без-координат — НЕ пин: координат нет (geo_pin=None), маркер
+        # «[локация lat,lon]» НЕ подставляется, текст ссылки сохраняется как есть. Резолвер
+        # доставки уходит по maps_link и БЕЗ координат честно даёт [уточнить] (вопрос про район),
+        # а НЕ выдуманную зону — то же поведение, что вчера на ТЕСТ-1.
+        link = "вот https://maps.app.goo.gl/c4G4B3sNrfJZBSue6"
+        body = trainer.client_body(link)                 # текст есть → гео-маркер НЕ подставляем
+        self.assertEqual(body, link)
+        t = trainer.append_turn("", "client", body)
+        hints = suggest.extract_booking_hints(t)
+        self.assertIsNone(hints.get("geo_pin"))          # координат нет — пина не выдумали
+        res = suggest._resolve_delivery_for_draft(
+            hints, _resolve_text=lambda u: {"status": "uncertain", "marker": "[уточнить]",
+                                            "zone": None, "price": None})
+        self.assertEqual(res["status"], "uncertain")     # честный вопрос про район остаётся
+
+
 # ------------------------------- модербот: панель owner-only (async) ---------
 
 class TestModerbotCallbackGate(unittest.IsolatedAsyncioTestCase):
