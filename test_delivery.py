@@ -494,6 +494,48 @@ class TestResolveDeliveryFromText(unittest.TestCase):
             "https://www.google.com/maps?q=7.88,98.33", _get_zones=boom)
         self.assertIsNone(r)
 
+    # ГОЛДЕН живого инцидента (тренажёр ТЕСТ-1, 00:37): именно эта короткая ссылка —
+    # https://maps.app.goo.gl/c4G4B3sNrfJZBSue6 — это place-share ПО FEATURE-ID
+    # (data=!1s0x…:0x…), координат НЕТ ни в конечном URL, ни точного пина `!3d!4d` в теле;
+    # единственная пара в теле — вьюпорт center=8.04…,98.34… (центр острова, ~30 км от Сайюана,
+    # НЕ точка клиента). Полный путь текст→доставка обязан честно уйти в [уточнить], а НЕ выдумать
+    # зону по центроиду (ASK #51). Здесь прогоняем РЕАЛЬНЫЙ resolve_maps_link с замоканным
+    # разворотом (живой формат конечного URL+тела), сквозь РЕАЛЬНЫЙ resolve_delivery_from_text.
+    _MEATPOINT_FINAL = (
+        "https://www.google.com/maps/place/79,+Meat+Point+%7C+steaks,+burgers,+skewers,"
+        "+79+Soi+Saiyuan,+Mueang,+Phuket,+83100/data=!4m2!3m1!1s0x30502f24a5443265:"
+        "0xa4cc15728db01dbd!18m1!1e1?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAES&skid=e77d485a"
+    )
+    _MEATPOINT_BODY = (
+        "<html>…\"https://maps.googleapis.com/maps/api/staticmap?"
+        "center=8.0407335%2C98.3433216&zoom=16&size=800x600\"…</html>"
+    )
+
+    def test_golden_meatpoint_link_end_to_end_uncertain(self):
+        page = self._MEATPOINT_FINAL + "\n" + self._MEATPOINT_BODY
+        text = "вот моя точка https://maps.app.goo.gl/c4G4B3sNrfJZBSue6 привезите сюда"
+        r = delivery.resolve_delivery_from_text(
+            text, _get_zones=lambda: self.ZONES,
+            _resolve_maps=lambda u: delivery.resolve_maps_link(u, _expand=lambda x: page))
+        self.assertEqual(r["status"], "uncertain")            # честный фолбэк-вопрос
+        self.assertEqual(r["marker"], "[уточнить]")
+        self.assertIsNone(r["zone"])                          # зону по центроиду НЕ выдумали
+        self.assertIsNone(r["price"])
+
+    def test_golden_meatpoint_shape_with_real_pin_resolves(self):
+        # КОНТРАСТ (регресс полной maps-ссылки): тот же place-URL, но в теле ЕСТЬ точный пин
+        # `!3d!4d` внутри зоны Раваи → та же цепочка даёт зону/цену (fail-safe не «залипает» на None).
+        body = ("<html>…/data=!3m1!4b1!3d7.88!4d98.33!… "
+                "staticmap?center=8.0407335%2C98.3433216&zoom=16…</html>")   # центроид рядом — игнор
+        page = self._MEATPOINT_FINAL + "\n" + body
+        text = "локация https://maps.app.goo.gl/c4G4B3sNrfJZBSue6"
+        r = delivery.resolve_delivery_from_text(
+            text, _get_zones=lambda: self.ZONES,
+            _resolve_maps=lambda u: delivery.resolve_maps_link(u, _expand=lambda x: page))
+        self.assertEqual(r["status"], "zone")
+        self.assertEqual(r["zone"], "Раваи")
+        self.assertEqual(r["price"], 250)
+
 
 class TestResolveDeliveryFromCoords(unittest.TestCase):
     """Гео-ПИН (готовые координаты) → доставка. Зоны инъектируются: координаты+зоны → цена;
