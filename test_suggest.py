@@ -4468,6 +4468,180 @@ class TestExtractRequestedModels(unittest.TestCase):
             self.assertIsNone(suggest.extract_requested_models(s), str(s))
 
 
+class TestModelGuardSheet(unittest.TestCase):
+    """Гвард-модель (шаг 3/7 #274): прайс-блок черновика фильтруется по ЯВНО запрошенным клиентом
+    моделям/классу (extract_requested_models) — карточки ЧУЖИХ моделей в сетку НЕ попадают.
+    Запроса нет (None) → сетка прежняя (полная/подвыборка). Запрос из ПОСЛЕДНЕЙ реплики (не окна);
+    каталог-вопрос («какие модели, например nmax») перечень НЕ сужает — класс 22:27 цел."""
+
+    # тариф по модели: (day_total, week_total, month_total, deposit, cap_active, cap_price)
+    TAR = {
+        "NMAX 155": (450, 2800, 9000, 5000, True, 8500),     # скутер 155cc — класс 150–160
+        "PCX 160": (400, 2500, 8000, 4000, True, 7500),      # скутер 160cc — класс 150–160
+        "ADV 350": (749, 4928, 14606, 7000, True, 10900),    # скутер 350cc — чужой для 150–160
+        "XADV 750": (2788, 18000, 55000, 25000, False, 0),   # скутер 750cc — НЕ «ADV»
+        "CB 300R": (757, 4716, 12491, 15000, True, 9900),    # мотоцикл 300cc
+        "MT-03": (800, 5000, 15000, 15000, False, 0),        # мотоцикл, cc из метки не читается
+    }
+    FLEET_NAMES = ["NMAX 155CC BLACK PHUKET 4255", "PCX 160CC WHITE PHUKET 3011",
+                   "ADV 350CC BLACK PHUKET 5849", "XADV 750CC GREY PHUKET 4290",
+                   "CB 300CC R 9011", "MT-03 BLUE PHUKET 7788"]
+    ALL = ("NMAX 155", "PCX 160", "ADV 350", "XADV 750", "CB 300R", "MT-03")
+
+    def setUp(self):
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+
+    def tearDown(self):
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+
+    def _getter(self):
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET_NAMES]}}
+            bike = params.get("bike", "")
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            bk = suggest._bike_key(bike)
+            key = next((k for k in self.TAR if suggest._bike_key(k) in bk), None)
+            if key is None:
+                return {"ok": False}
+            d1, d7, d30, dep, ca, cp = self.TAR[key]
+            total = {1: d1, 7: d7, 30: d30}.get(days, d1)
+            return {"ok": True, "data": {"day_price": round(total / max(days, 1)), "total": total,
+                    "deposit": dep, "available": True, "days": days, "cap_active": ca,
+                    "cap_price": cp, "text": f"{bike} {days}d {total}"}}
+        return fake
+
+    def _rows(self):
+        return suggest.price_sheet("2026-07-15", getter=self._getter())
+
+    # ---- отбор строк по явному запросу (КОД, не LLM) ----
+    def test_model_match_by_key_prefix(self):
+        # canon «PCX» накрывает конкретную модель парка; чужие модели не проходят.
+        sub = suggest.filter_rows_by_requested(self._rows(), [{"type": "model", "canon": "PCX"}])
+        self.assertEqual([r["model"] for r in sub], ["PCX 160"])
+
+    def test_series_adv_does_not_catch_xadv(self):
+        # «ADV» — серия ADV (150/160/350); XADV — ДРУГАЯ модель, префиксом не ловится.
+        sub = suggest.filter_rows_by_requested(self._rows(), [{"type": "model", "canon": "ADV"}])
+        self.assertEqual([r["model"] for r in sub], ["ADV 350"])
+
+    def test_model_with_unreadable_cc_matched_by_canon(self):
+        # MT-03: cc из метки не читается, но по СВОЕМУ canon модель матчится как раньше.
+        sub = suggest.filter_rows_by_requested(self._rows(), [{"type": "model", "canon": "MT-03"}])
+        self.assertEqual([r["model"] for r in sub], ["MT-03"])
+
+    def test_cc_class_band(self):
+        sub = suggest.filter_rows_by_requested(
+            self._rows(), [{"type": "cc_class", "cc_min": 150, "cc_max": 160, "label": "150–160cc"}])
+        self.assertEqual([r["model"] for r in sub], ["NMAX 155", "PCX 160"])
+
+    def test_cc_class_unreadable_cc_not_included(self):
+        # Класс 300–350: MT-03 (кубатура из метки НЕ читается) в класс НЕ попадает — цель гварда
+        # «чужие блоки не включать», fail-open здесь вернул бы чужой блок (антипод filter_sheet_rows).
+        sub = suggest.filter_rows_by_requested(
+            self._rows(), [{"type": "cc_class", "cc_min": 300, "cc_max": 350, "label": "300–350cc"}])
+        models = [r["model"] for r in sub]
+        self.assertEqual(models, ["ADV 350", "CB 300R"])
+        self.assertNotIn("MT-03", models)
+
+    def test_mixed_class_and_model_union(self):
+        sub = suggest.filter_rows_by_requested(
+            self._rows(), [{"type": "cc_class", "cc_min": 150, "cc_max": 160, "label": "150–160cc"},
+                           {"type": "model", "canon": "MT-03"}])
+        self.assertEqual([r["model"] for r in sub], ["NMAX 155", "PCX 160", "MT-03"])
+
+    # ---- сквозной путь: живая фраза → hints → build_pricing_note ----
+    def test_end_to_end_160cc_and_pcx_no_foreign_blocks(self):
+        # Дословная пара родителя #274 («160 кубов и PCX») в прайс-запросе → в блоке ТОЛЬКО
+        # класс 150–160 + PCX, карточек чужих моделей НЕТ.
+        tr = "[клиент]: Пришлите прайс: интересуют 160 кубов и PCX"
+        h = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        self.assertTrue(h["price_sheet_q"])
+        self.assertEqual(h["requested_models"],
+                         [{"type": "cc_class", "cc_min": 150, "cc_max": 160, "label": "150–160cc"},
+                          {"type": "model", "canon": "PCX"}])
+        note = suggest.build_pricing_note(h, lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+        self.assertIn("ПРАЙС ПО ПАРКУ", note)
+        self.assertIn("NMAX 155", note)                    # класс 150–160
+        self.assertIn("PCX 160", note)                     # запрошенная модель
+        for m in ("ADV 350", "XADV 750", "CB 300R", "MT-03"):
+            self.assertNotIn(m, note)                      # чужие блоки НЕ включены
+
+    def test_end_to_end_enum_class_narrows_but_keeps_sheet(self):
+        # «какие цены на скутеры 160 кубов?» — каталог-форма, но ЯВНЫЙ класс сужает:
+        # подвыборка скутеров (sheet_filter) ∩ класс 150–160 (гвард).
+        tr = "[клиент]: какие цены на скутеры 160 кубов?"
+        h = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        self.assertTrue(h["price_sheet_q"])
+        self.assertEqual(h["requested_models"],
+                         [{"type": "cc_class", "cc_min": 150, "cc_max": 160, "label": "150–160cc"}])
+        note = suggest.build_pricing_note(h, lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+        self.assertIn("NMAX 155", note)
+        self.assertIn("PCX 160", note)
+        for m in ("ADV 350", "XADV 750", "CB 300R", "MT-03"):
+            self.assertNotIn(m, note)
+
+    def test_end_to_end_catalog_with_model_example_keeps_full_grid(self):
+        # Каталог-вопрос с моделью-примером (класс 22:27: смещение к ПОКАЗУ) — перечень НЕ сужаем.
+        tr = "[клиент]: какие модели предлагаете, например nmax, и какие цены?"
+        h = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        self.assertTrue(h["price_sheet_q"])
+        self.assertIsNone(h["requested_models"])           # модель-пример съедена каталог-вопросом
+        note = suggest.build_pricing_note(h, lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+        for m in self.ALL:
+            self.assertIn(m, note)                         # полная сетка цела
+
+    def test_end_to_end_prior_window_mention_not_used(self):
+        # Запрос гварда — из ПОСЛЕДНЕЙ реплики: старое «интересует nmax» сетку НЕ режет (22:27).
+        tr = ("[клиент]: привет, интересует nmax\n"
+              "[менеджер]: Здравствуйте!\n"
+              "[клиент]: пришлите прайс-лист")
+        h = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        self.assertTrue(h["price_sheet_q"])
+        self.assertIsNone(h["requested_models"])
+        note = suggest.build_pricing_note(h, lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+        for m in self.ALL:
+            self.assertIn(m, note)
+
+    def test_end_to_end_requested_absent_falls_back_full(self):
+        # Запрошенной модели в сетке НЕТ (Rebel вне парка) → полная сетка (не немеем), как у
+        # пустой подвыборки sheet_filter.
+        tr = "[клиент]: пришлите прайс на ребел"
+        h = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        self.assertTrue(h["price_sheet_q"])
+        self.assertEqual(h["requested_models"], [{"type": "model", "canon": "REBEL"}])
+        note = suggest.build_pricing_note(h, lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+        for m in self.ALL:
+            self.assertIn(m, note)
+
+    def test_no_request_null_behavior_unchanged(self):
+        # Клиент модель не указал (null) → поведение прежнее: полная сетка.
+        tr = "[клиент]: пришлите прайс по всему парку"
+        h = suggest.extract_booking_hints(tr, today=datetime.date(2026, 7, 11))
+        self.assertTrue(h["price_sheet_q"])
+        self.assertIsNone(h["requested_models"])
+        note = suggest.build_pricing_note(h, lang="ru", getter=self._getter(),
+                                          today=datetime.date(2026, 7, 11))
+        for m in self.ALL:
+            self.assertIn(m, note)
+
+
 class TestTeamRegistryBlock(unittest.TestCase):
     """ЖЁСТКИЙ блок команды КОДОМ ДО LLM (родитель: инцидент @Pleummmm 15.07 11:23 — userbot
     сгенерил черновик на окно ОФИС-МЕНЕДЖЕРА). ГОЛДЕН: сообщение от участника реестра → НУЛЕВАЯ

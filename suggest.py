@@ -2095,6 +2095,17 @@ def extract_requested_models(text):
     return [it for _, it in sorted(items, key=lambda x: x[0])]
 
 
+def _catalog_scope_asked(text) -> bool:
+    """Реплика просит ПЕРЕЧЕНЬ («какие модели/байки у вас…») или охват «все модели/весь парк» —
+    признаки те же, что в _asks_price_sheet (enum / all-scope). Для гвард-модели (шаг 3/7 #274):
+    при таком вопросе полная сетка и есть ответ — модель-пример рядом («например nmax») перечень
+    НЕ сужает (владельческое смещение к показу прайса, класс 22:27)."""
+    t = str(text or "")
+    if _PS_ALL_SCOPE.search(t):
+        return True
+    return bool(_PS_ENUM_CUE.search(t)) and bool(_PS_FLEET_NOUN.search(t))
+
+
 # Несдаваемые модели: физически в парке (Лист1), но правило KB/CRITICAL_FACTS «НЕ сдаём» —
 # в прайс по парку НЕ включаем (Honda Click 125). Ключи нормализованы как _bike_key.
 _NON_RENTABLE_KEYS = {_bike_key("CLICK 125")}   # {'click125'}
@@ -2186,6 +2197,13 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
     deposit_multi_q = _asks_deposit_reduction_multi(newest, recent, models)
     price_sheet_q = _asks_price_sheet(newest, recent)
     sheet_filter = _parse_sheet_filter(newest, recent)
+    # Гвард-модель (шаг 3/7 #274): ЯВНО запрошенные модели/класс — из ПОСЛЕДНЕЙ реплики, не всего
+    # окна (старое «интересует nmax» не должно резать каталог-ответ — класс живого провала 22:27).
+    # Каталог-вопрос сохраняет ПЕРЕЧЕНЬ: модель-пример в нём запрос не сужает (model-элементы
+    # выкидываем), а явный класс («какие модели 160 кубов») — сужает (cc_class остаётся).
+    requested_models = extract_requested_models(newest)
+    if requested_models and _catalog_scope_asked(newest):
+        requested_models = [it for it in requested_models if it["type"] != "model"] or None
     percent_q = _asks_percent_amount(newest, recent)   # «сколько будет N%» → процент от суммы расчёта
     units_count = _units_count(newest, models)         # «пара/два юнита одной модели» → цена «за каждый»
     old_gen_q = _asks_old_gen(newest, recent)          # «а старый xmax есть?» → прежнее поколение по запросу
@@ -2223,7 +2241,8 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
             "date_status": date_status,                                   # past|today|tomorrow|future|None
             "start_seen": _seen.isoformat() if _seen else None,           # дата в прочтении клиента
             "deposit_multi_q": deposit_multi_q, "price_sheet_q": price_sheet_q,
-            "sheet_filter": sheet_filter, "percent_q": percent_q, "units_count": units_count,
+            "sheet_filter": sheet_filter, "requested_models": requested_models,
+            "percent_q": percent_q, "units_count": units_count,
             "old_gen_q": old_gen_q, "deposit_passport_q": deposit_passport_q,
             "maps_link": maps_link, "geo_pin": geo_pin}
 
@@ -3149,6 +3168,29 @@ def filter_sheet_rows(rows, kind=None, cc_min=None, cc_max=None):
     return out
 
 
+def filter_rows_by_requested(rows, requested):
+    """Гвард-модель (шаг 3/7 #274): строки сетки, соответствующие ЯВНОМУ запросу клиента
+    (extract_requested_models) — конкретным моделям/сериям и/или cc-классу. Матч модели — по
+    префиксу _bike_key (canon «PCX» накрывает PCX 150/160; «ADV» НЕ ловит XADV — тот с «x»);
+    матч класса — по cc из метки (_model_cc). Нечитаемая кубатура (MT-03, R7) классом НЕ
+    считается — здесь fail-open вернул бы чужой блок обратно, а цель гварда обратная:
+    блоки чужих моделей НЕ включать (по своему canon такая модель матчится как раньше).
+    → list (может быть [] — деградацию решает вызывающий)."""
+    keys = [k for k in (_bike_key(it.get("canon")) for it in requested or []
+                        if it.get("type") == "model") if k]
+    bands = [(it["cc_min"], it["cc_max"]) for it in requested or []
+             if it.get("type") == "cc_class"
+             and it.get("cc_min") is not None and it.get("cc_max") is not None]
+    out = []
+    for r in rows:
+        rkey = _bike_key(r.get("model"))
+        cc = _model_cc(r.get("model"))
+        if any(rkey.startswith(k) for k in keys) \
+                or (cc is not None and any(lo <= cc <= hi for lo, hi in bands)):
+            out.append(r)
+    return out
+
+
 # Сетка = НЕПРИКОСНОВЕННЫЙ блок (класс-фикс вёрстки 21:36, черновик #276: LLM пересобирал
 # карточки в однострочники и вставлял сырые ** — markdown в Telegram не рендерится). Блок везём
 # ВНУТРИ pricing_note между служебными скобками (транспорт: сигнатуры целы, IPC-перегенерация
@@ -3573,6 +3615,15 @@ def build_price_sheet_note(hints, lang="ru", getter=None, today=None):
     if sf:
         sub = filter_sheet_rows(rows, kind=sf.get("kind"),
                                 cc_min=sf.get("cc_min"), cc_max=sf.get("cc_max"))
+        if sub:
+            rows = sub
+    # Гвард-модель (шаг 3/7 #274): клиент ЯВНО запросил модели/класс (requested_models из
+    # extract_requested_models) → в прайс-блоке ТОЛЬКО они, карточки чужих моделей не включаем.
+    # Запроса нет (None) → поведение прежнее. Пустое пересечение (запрошенного в сетке нет) →
+    # полная сетка, как у подвыборки выше (не немеем и не выдумываем — владельческое решение).
+    req = hints.get("requested_models")
+    if req:
+        sub = filter_rows_by_requested(rows, req)
         if sub:
             rows = sub
     body = render_price_sheet(rows, ds, lang)
