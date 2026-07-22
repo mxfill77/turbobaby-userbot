@@ -4553,8 +4553,13 @@ def main():
 
 def _main_loop():
     _init_running_version()
+    # claude= печатаем РЕЗОЛЬВНУТЫЙ путь, а не сырой CLAUDE_BIN из .env. Живой прокол 22.07:
+    # баннер бодро писал `claude=…\2.1.197\claude.exe`, хотя такого каталога на диске уже НЕТ
+    # (автообновлятор его снёс) — демон при этом прекрасно работал на 2.1.217, но диагностика
+    # по логу вела строго не туда. Лог обязан показывать то, что исполняется.
     log.info("=== ДЕМОН СТАРТ (lane=%s, poll=%ss, task_timeout=%ss, approval_ttl=%ss, claude=%s, commit=%s) ===",
-             LANE, POLL_SEC, TASK_TIMEOUT, APPROVAL_TTL, CLAUDE_BIN, RUNNING_COMMIT)
+             LANE, POLL_SEC, TASK_TIMEOUT, APPROVAL_TTL,
+             (resolve_claude() or "НЕ НАЙДЕН"), RUNNING_COMMIT)
     # Селективный тест-гейт авто-применения (порт VPS): подтверждаем состояние флагов в баннере,
     # чтобы факт включения/дефолта (0=полный прогон всех тестов) читался прямо из лога старта.
     log.info("=== ФЛАГИ ГЕЙТА: GATE_STEP_SELECTIVE=%s GATE_SINGLE_SELECTIVE=%s (селективный тест-гейт авто-применения; 0=полный прогон) ===",
