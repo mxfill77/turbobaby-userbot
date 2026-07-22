@@ -2779,6 +2779,7 @@ _FILE_PROCESS_RULES = (
     (lambda n: n.startswith("pricing"),   ("userbot", "moderbot")),   # pricing*.py — общий рантайм
     (lambda n: n.startswith("delivery"),  ("userbot", "moderbot")),   # delivery*.py — резолвер доставки, импортит suggest → общий рантайм (живой кейс dae330a: без правила userbot жил на старом коде 2ч+)
     (lambda n: n.startswith("booking"),   ("moderbot",)),             # booking_draft.py — ПО ИМПОРТАМ грузит ТОЛЬКО moderation_bot (make_booking_and_intake/build_intake); userbot booking* не импортит (ни напрямую, ни через suggest) → рестарт moderbot, НЕ userbot (мисроут c809924)
+    (lambda n: n == "trainer.py",         ("userbot", "moderbot")),   # trainer.py — ПО ФАКТУ импортят ОБА: userbot_listen.py:44 (рендер/турны тренажёра) и moderation_bot.py:36 (панель, гипотезы, уроки); без правила правка ТОЛЬКО trainer.py не рестартила никого и живые боты доживали на старом коде (тот же класс, что delivery.py dae330a). Точное имя, не префикс: trainer_rules.json — данные, читаются на вызове, рестарта не требуют
     (lambda n: n == "moderation_ipc.py",  ("userbot",)),              # IPC модерации → рестарт userbot
     (lambda n: n == "moderation_bot.py",  ("moderbot",)),             # сам модербот
     (lambda n: n == "moderation_core.py", ("moderbot",)),             # ядро модерации

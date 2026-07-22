@@ -1655,11 +1655,21 @@ class TestFileProcessMap(unittest.TestCase):
         self.assertEqual(o._procs_for_file("suggest.py"), {"userbot", "moderbot"})
         self.assertEqual(o._procs_for_file("pricing_rules.py"), {"userbot", "moderbot"})
         self.assertEqual(o._procs_for_file("delivery.py"), {"userbot", "moderbot"})   # резолвер доставки → общий рантайм (dae330a)
+        # trainer.py: карта ПО ФАКТУ импортов — userbot_listen.py:44 И moderation_bot.py:36 (оба
+        # модульного уровня) → общий рантайм. Без правила правка только trainer.py не рестартила никого.
+        self.assertEqual(o._procs_for_file("trainer.py"), {"userbot", "moderbot"})
+        self.assertEqual(o._procs_for_file("trainer_rules.json"), set())              # данные правил, не код → рестарт не нужен
+        self.assertEqual(o._procs_for_file("test_trainer.py"), set())                 # тест — не рантайм
         self.assertEqual(o._procs_for_file("fetch_delivery.py"), set())               # утилита-фетчер, НЕ рантайм ботов
         self.assertEqual(o._procs_for_file("pc_agent.py"), {"pc_agent"})
         self.assertEqual(o._procs_for_file("README.md"), set())
         self.assertEqual(o._procs_for_file("CLAUDE.md"), set())
         self.assertEqual(o._procs_for_file("test_suggest.py"), set())            # тест — не рантайм
+
+    def test_classify_trainer_to_both(self):
+        ub, mb = o._classify_changed(["trainer.py"])
+        self.assertIn("trainer.py", ub)
+        self.assertIn("trainer.py", mb)
 
     def test_classify_moderation_ipc_to_userbot(self):
         ub, mb = o._classify_changed(["moderation_ipc.py"])
@@ -1851,6 +1861,23 @@ class TestReconcileChildren(Base):
         self.assertIn("userbot рестартнут", note)
         self.assertTrue(any("авто-применил dae330a00: рестарт userbot" in s for s in cows))
         self.assertEqual(o._last_child_commit, "dae330a00")       # метка сдвинута — второй раз не дёрнет
+
+    def test_golden_trainer_commit_restarts_both_bots(self):
+        # ГОЛДЕН класса dae330a на trainer.py: коммит тронул ТОЛЬКО trainer.py (+ его тест) →
+        # рестарт ОБОИХ ботов (импорт модульного уровня в userbot_listen.py:44 и moderation_bot.py:36).
+        # До правила trainer.py не был в карте → реконсиляция считала его не-код-файлом и живые боты
+        # доживали на старом коде (кейс e3b8994: UX-фикс гипотез поднял только модербота — по
+        # moderation_bot.py; правка одного trainer.py не подняла бы никого).
+        o._last_child_commit = "old"
+        kinds, cows = [], []
+        o._cowork = lambda s: cows.append(s)
+        note = self._run("7ra1ne200", ["trainer.py", "test_trainer.py"],
+                         restart_fn=lambda k: kinds.append(k) or (True, [909], "PID поднят, лог свежий"),
+                         state={})
+        self.assertEqual(kinds, ["userbot", "moderbot"])          # trainer → оба рантайма
+        self.assertIn("userbot рестартнут", note)
+        self.assertIn("модербот рестартнут", note)
+        self.assertEqual(o._last_child_commit, "7ra1ne200")
 
     def test_golden_docs_only_commit_no_restart(self):
         # ГОЛДЕН: коммит тронул ТОЛЬКО docs/ (и notes/) → никого не рестартим, метку двигаем.
