@@ -4468,11 +4468,9 @@ class TestExtractRequestedModels(unittest.TestCase):
             self.assertIsNone(suggest.extract_requested_models(s), str(s))
 
 
-class TestModelGuardSheet(unittest.TestCase):
-    """Гвард-модель (шаг 3/7 #274): прайс-блок черновика фильтруется по ЯВНО запрошенным клиентом
-    моделям/классу (extract_requested_models) — карточки ЧУЖИХ моделей в сетку НЕ попадают.
-    Запроса нет (None) → сетка прежняя (полная/подвыборка). Запрос из ПОСЛЕДНЕЙ реплики (не окна);
-    каталог-вопрос («какие модели, например nmax») перечень НЕ сужает — класс 22:27 цел."""
+class _SheetFixture:
+    """Общий стенд сетки для гвард-модели (шаги 3–4/7 #274): фейковый Bridge-getter в ЖИВОМ
+    формате (fleet + quote), тарифы по моделям парка, сброс кэшей. Миксин к unittest.TestCase."""
 
     # тариф по модели: (day_total, week_total, month_total, deposit, cap_active, cap_price)
     TAR = {
@@ -4524,6 +4522,13 @@ class TestModelGuardSheet(unittest.TestCase):
 
     def _rows(self):
         return suggest.price_sheet("2026-07-15", getter=self._getter())
+
+
+class TestModelGuardSheet(_SheetFixture, unittest.TestCase):
+    """Гвард-модель (шаг 3/7 #274): прайс-блок черновика фильтруется по ЯВНО запрошенным клиентом
+    моделям/классу (extract_requested_models) — карточки ЧУЖИХ моделей в сетку НЕ попадают.
+    Запроса нет (None) → сетка прежняя (полная/подвыборка). Запрос из ПОСЛЕДНЕЙ реплики (не окна);
+    каталог-вопрос («какие модели, например nmax») перечень НЕ сужает — класс 22:27 цел."""
 
     # ---- отбор строк по явному запросу (КОД, не LLM) ----
     def test_model_match_by_key_prefix(self):
@@ -4640,6 +4645,194 @@ class TestModelGuardSheet(unittest.TestCase):
                                           today=datetime.date(2026, 7, 11))
         for m in self.ALL:
             self.assertIn(m, note)
+
+
+class TestModelClaimReject(_SheetFixture, unittest.TestCase):
+    """Браковка по расхождению (шаг 4/7 #274): текст черновика ЗАЯВЛЯЕТ модель предметом прайса
+    («дам развёрнуто по Nmax» — дословная формулировка родителя), а карточки прайс-блока — про
+    ЧУЖУЮ (MT-03) → model_claim_mismatch даёт причину. Заявленная модель В блоке есть (полная
+    сетка) / заявки нет (голое упоминание, служебный хвост, детерм. интро) / не sheet-режим → None."""
+
+    def _note(self, canons=None, lang="ru"):
+        """Нота как у build_price_sheet_note: сетка живого рендера (при canons — отфильтрованная,
+        как гвард шага 3), хвост мин-срока, служебные SHEET-скобки."""
+        rows = self._rows()
+        if canons:
+            rows = suggest.filter_rows_by_requested(
+                rows, [{"type": "model", "canon": c} for c in canons])
+        block = (suggest.render_price_sheet(rows, "2026-07-15", lang)
+                 + "\n\n" + suggest._sheet_min_term_line(lang))
+        return suggest._wrap_price_sheet(block, "2026-07-15", lang)
+
+    def _draft(self, llm_text, note, lang="ru"):
+        """Финальная сборка sheet-режима — тем же кодом, что прод (compose_sheet_draft)."""
+        return suggest.compose_sheet_draft(llm_text, suggest._sheet_block_from_note(note), lang)
+
+    # ---- позитивы: заявка на одну модель, в блоке карточки чужой → браковка ----
+    def test_verbatim_claim_nmax_body_mt03_rejected(self):
+        # ДОСЛОВНАЯ формулировка родителя #274: «дам развёрнуто по Nmax» — а тело даёт MT-03.
+        note = self._note(canons=["MT-03"])
+        draft = self._draft("Дам развёрнуто по Nmax.\n[PRICE_SHEET]\nПодойдут ли вам даты?", note)
+        reason = suggest.model_claim_mismatch(draft, note)
+        self.assertTrue(reason)
+        self.assertIn("NMAX", reason)          # что заявлено
+        self.assertIn("MT-03", reason)         # что реально в блоке (причина читаемая, в лог)
+
+    def test_paraphrases_rejected(self):
+        # Парафразы заявки RU/EN (модель + ценовое слово в одном предложении).
+        note = self._note(canons=["MT-03"])
+        for intro in ("Вот подробные цены по NMAX:",
+                      "Ниже стоимость аренды Nmax.",
+                      "Скидываю тарифы на NMAX 155.",
+                      "Here are the detailed rates for the Nmax:",
+                      "Please find the Nmax pricing below:"):
+            draft = self._draft(intro + "\n[PRICE_SHEET]\nКакие даты?", note)
+            self.assertTrue(suggest.model_claim_mismatch(draft, note), intro)
+
+    def test_cyrillic_synonym_claim_rejected(self):
+        # Кириллический синоним (словарь шага 2): заявлен «мт-03», в блоке — только NMAX.
+        note = self._note(canons=["NMAX"])
+        draft = self._draft("Вот цены на мт-03:\n[PRICE_SHEET]\nНа какие даты смотрим?", note)
+        reason = suggest.model_claim_mismatch(draft, note)
+        self.assertTrue(reason)
+        self.assertIn("MT-03", reason)
+
+    # ---- негативы: браковки НЕТ ----
+    def test_claim_present_in_block_full_grid_ok(self):
+        # Полная сетка: заявленная NMAX В блоке есть (среди прочих) — расхождения нет.
+        note = self._note()
+        draft = self._draft("Дам развёрнуто по Nmax.\n[PRICE_SHEET]\nКакие даты?", note)
+        self.assertIsNone(suggest.model_claim_mismatch(draft, note))
+
+    def test_no_model_in_text_ok(self):
+        # Интро без модели перед чужой сеткой — заявки нет.
+        note = self._note(canons=["MT-03"])
+        draft = self._draft("Актуальный прайс по нашему парку:\n[PRICE_SHEET]\nКакие даты?", note)
+        self.assertIsNone(suggest.model_claim_mismatch(draft, note))
+
+    def test_mention_without_price_cue_not_claim(self):
+        # Голое упоминание — не заявка: модель и ценовое слово в РАЗНЫХ предложениях
+        # (законный фолбэк «запрошенного нет — вот прайс остального» браковать нельзя).
+        note = self._note(canons=["MT-03"])
+        draft = self._draft("Nmax сейчас недоступен. Вот прайс по остальному парку:\n"
+                            "[PRICE_SHEET]\nЧто приглянулось?", note)
+        self.assertIsNone(suggest.model_claim_mismatch(draft, note))
+
+    def test_en_advise_is_not_adv_claim(self):
+        # Границы букв: английское «advise» — НЕ заявка модели ADV (substring дал бы ложный брак).
+        note = self._note(canons=["NMAX"])
+        draft = self._draft("I'd advise checking the rates below.\n[PRICE_SHEET]\nYour dates?",
+                            note, lang="en")
+        self.assertIsNone(suggest.model_claim_mismatch(draft, note))
+
+    def test_collected_service_tail_not_claim(self):
+        # Служебный хвост модератору ([собрано: модель NMAX…, цены…]) — не заявка (срезается
+        # client_facing_text), иначе фолбэк полной сетки бракавался бы из-за хвоста.
+        note = self._note(canons=["MT-03"])
+        draft = (self._draft("Актуальный прайс по нашему парку:\n[PRICE_SHEET]\nКакие даты?", note)
+                 + "\n[собрано: модель NMAX ✅, цены ✅]")
+        self.assertIsNone(suggest.model_claim_mismatch(draft, note))
+
+    def test_marker_lost_deterministic_intro_ok(self):
+        # LLM потерял метку → compose отбрасывает его текст (свой штатный механизм), заявки нет.
+        note = self._note(canons=["MT-03"])
+        draft = self._draft("Дам развёрнуто по Nmax, вот цены.", note)   # без [PRICE_SHEET]
+        self.assertIsNone(suggest.model_claim_mismatch(draft, note))
+
+    def test_non_sheet_note_none(self):
+        # Не sheet-режим (нота без служебных скобок) — гвард молчит.
+        self.assertIsNone(suggest.model_claim_mismatch(
+            "Дам развёрнуто по Nmax. Цена 450 ฿/сутки.", "ЦЕНА: NMAX 450 ฿/сутки, скажи её клиенту."))
+
+
+class TestModelMismatchRejectFlow(_SheetFixture, unittest.TestCase):
+    """Проводка браковки (шаг 4/7 #274) в on_client_message: расхождение «заявлен Nmax — в блоке
+    MT-03» бракует черновик ШТАТНЫМ каналом отбраковки-до-модерации (как сбой генерации): причина
+    в лог + видимая заметка 🛑 в группу, карточки/pending НЕТ. Чистый sheet-черновик идёт как раньше."""
+
+    def setUp(self):
+        super().setUp()
+        self._tmp = tempfile.TemporaryDirectory()
+        d = self._tmp.name
+        self._mode = suggest.SUGGEST_MODE
+        self._test = suggest.SUGGEST_TEST_MODE
+        self._mg = suggest.MOD_GROUP_ID
+        self._pending = suggest.pending
+        self._pairs = suggest.PAIRS_FILE
+        self._note_fn = suggest.build_pricing_note
+        suggest.SUGGEST_MODE = True
+        suggest.SUGGEST_TEST_MODE = False
+        suggest.reset_disabled()
+        suggest.MOD_GROUP_ID = -1009999999999
+        suggest.pending = suggest.PendingStore(os.path.join(d, "pending.jsonl"))
+        suggest.PAIRS_FILE = os.path.join(d, "pairs.jsonl")
+        suggest.limiter = suggest.RateLimiter(6, 15)
+        self.me = 42
+        self.client = FakeClient(history=[
+            FakeHistMsg(self.me, "Здравствуйте! Что хотите арендовать?"),
+            FakeHistMsg(999, "Пришлите прайс, пожалуйста"),
+        ])
+        self.sender = FakeSender(999, username="client1")
+
+    def tearDown(self):
+        suggest.SUGGEST_MODE = self._mode
+        suggest.SUGGEST_TEST_MODE = self._test
+        suggest.MOD_GROUP_ID = self._mg
+        suggest.pending = self._pending
+        suggest.PAIRS_FILE = self._pairs
+        suggest.build_pricing_note = self._note_fn
+        suggest.reset_disabled()
+        self._tmp.cleanup()
+        super().tearDown()
+
+    def _wire_note(self, canons):
+        """Подменить build_pricing_note ГОТОВОЙ нотой с сеткой live-рендера (дефект-симуляция:
+        здоровый путь шага 3 чужой блок не строит — подсовываем испорченную ноту транспортом)."""
+        rows = suggest.price_sheet("2026-07-15", getter=self._getter())
+        if canons:
+            rows = suggest.filter_rows_by_requested(
+                rows, [{"type": "model", "canon": c} for c in canons])
+        block = (suggest.render_price_sheet(rows, "2026-07-15", "ru")
+                 + "\n\n" + suggest._sheet_min_term_line("ru"))
+        note = suggest._wrap_price_sheet(block, "2026-07-15", "ru")
+        suggest.build_pricing_note = lambda hints, lang="ru": note
+        # Сетка собрана — гасим конфиг Bridge, чтобы park_allowlist() внутри on_client_message
+        # не пошёл живым HTTP на фикстурный URL (tearDown вернёт сохранённое).
+        suggest.pricing.BRIDGE_URL = ""
+        suggest.pricing.BRIDGE_TOKEN = ""
+
+    def test_mismatch_rejected_visible_note_no_card(self):
+        self._wire_note(["MT-03"])
+        llm = lambda s, u: "Дам развёрнуто по Nmax.\n[PRICE_SHEET]\nПодойдут ли даты?"
+        with self.assertLogs(logging.getLogger("suggest"), level="WARNING") as cm:
+            res = asyncio.run(suggest.on_client_message(
+                self.client, self.sender, self.me, call_llm=llm, faq="FAQ"))
+        self.assertIsNone(res)
+        notes = [t for t in self.client.sent
+                 if t[0] == suggest.MOD_GROUP_ID and "ЗАБРАКОВАН" in t[1]]
+        self.assertEqual(len(notes), 1)                       # видимая заметка в группу — одна
+        self.assertTrue(notes[0][1].lstrip().startswith("🛑"))
+        self.assertIn("@client1", notes[0][1])
+        self.assertIn("NMAX", notes[0][1])                    # причина: что заявлено
+        self.assertIn("MT-03", notes[0][1])                   # и что реально в блоке
+        # карточки-черновика НЕТ ни в группе, ни клиенту; pending пуст
+        self.assertFalse(any("Черновик ответа клиенту" in t[1] for t in self.client.sent))
+        self.assertEqual(len(self.client.sent), 1)
+        # причина браковки ЗАЛОГИРОВАНА (штатный лог suggest)
+        blob = "\n".join(cm.output)
+        self.assertIn("ЗАБРАКОВАН", blob)
+        self.assertIn("NMAX", blob)
+        self.assertIn("MT-03", blob)
+
+    def test_clean_sheet_draft_posts_card_as_before(self):
+        # Расхождения нет (заявленная модель в блоке) → карточка постится штатно, браковки нет.
+        self._wire_note(["MT-03"])
+        llm = lambda s, u: "Дам развёрнуто по MT-03.\n[PRICE_SHEET]\nПодойдут ли даты?"
+        res = asyncio.run(suggest.on_client_message(
+            self.client, self.sender, self.me, call_llm=llm, faq="FAQ"))
+        self.assertIsNotNone(res)
+        self.assertTrue(any("Черновик ответа клиенту" in t[1] for t in self.client.sent))
+        self.assertFalse(any("ЗАБРАКОВАН" in t[1] for t in self.client.sent))
 
 
 class TestTeamRegistryBlock(unittest.TestCase):

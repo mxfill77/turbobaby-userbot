@@ -3191,6 +3191,75 @@ def filter_rows_by_requested(rows, requested):
     return out
 
 
+# --- Гвард-модель, шаг 4/7 #274: браковка черновика по расхождению «заявленная модель ≠ блок» ----
+# Текст черновика ЗАЯВЛЯЕТ модель предметом прайса («дам развёрнуто по Nmax»), а карточки
+# прайс-блока — про ЧУЖУЮ (MT-03): черновик врёт о собственном теле. Кто из двух неправ — коду
+# не видно (фильтр сетки упустил запрос ИЛИ LLM пообещал не то), чинить нечего — черновик
+# бракуется ЦЕЛИКОМ штатным каналом отбраковки-до-модерации (см. врезку в on_client_message:
+# причина в лог + видимая заметка в группу, карточки/IPC нет). Заявка ≠ голое упоминание:
+# модель и ценовое слово должны стоять в ОДНОМ предложении — «NMAX — отличный выбор!» перед
+# полной сеткой черновик не бракует.
+_CLAIM_PRICE_CUE_RE = re.compile(
+    r"\bпрайс\w*|\bцен\w*|\bстоимост\w*|\bтариф\w*|\bразв[её]рнут\w*|\bподробн\w*|\bрасклад\w*"
+    r"|\bprice\w*|\bpricing\b|\brates?\b|\bcost\w*|\bdetail\w*|\bbreakdown\b", re.I)
+# Токен модели в тексте ЧЕРНОВИКА — по границам букв (лукэраунды, как у кириллических синонимов):
+# ложная заявка бракует ответ клиенту целиком, substring-семантика _MODEL_TOKENS дала бы «adv»
+# в английском «advise». Цифры вплотную допустимы («adv350»).
+_CLAIM_MODEL_RES = [
+    (re.compile(r"(?<![a-zа-яё])" + re.escape(tok) + r"(?![a-zа-яё])"), tok)
+    for tok in _MODEL_TOKENS
+] + _MODEL_SYNONYM_RES
+
+
+def _claimed_models(text):
+    """Модели, ЗАЯВЛЕННЫЕ текстом черновика как предмет прайса: токен модели и ценовое слово в
+    ОДНОМ предложении (_pc_segments). → список canon (как _detect_models), порядок появления;
+    более длинная модель поглощает свой префикс (ADV ⊂ ADV350)."""
+    found = []
+    for seg, _sep in _pc_segments(str(text or "").lower()):
+        if not _CLAIM_PRICE_CUE_RE.search(seg):
+            continue
+        for rx, tok in _CLAIM_MODEL_RES:
+            if rx.search(seg):
+                canon = tok.upper().replace(" ", "")
+                if canon not in found:
+                    found.append(canon)
+    return [c for c in found if not any(o != c and o.startswith(c) for o in found)]
+
+
+def _sheet_block_models(block):
+    """Метки моделей, чьи КАРТОЧКИ стоят в прайс-блоке (формат render_price_sheet, aae1ed2):
+    заголовок карточки — непустая строка НЕ с «•», за которой идёт строка с «•». Групповые шапки
+    («Скутеры:»/«Motorcycles:») и хвост мин-срока под правило не подпадают (за ними пусто/текст)."""
+    lines = (block or "").split("\n")
+    return [ln.strip() for i, ln in enumerate(lines)
+            if ln.strip() and not ln.strip().startswith("•")
+            and i + 1 < len(lines) and lines[i + 1].strip().startswith("•")]
+
+
+def model_claim_mismatch(draft, pricing_note):
+    """Расхождение «в тексте черновика заявлена модель — в прайс-блоке карточки ЧУЖОЙ» → причина
+    браковки (строка) | None (расхождения нет / не sheet-режим / заявки нет). Сверка тем же
+    префикс-матчем _bike_key, что filter_rows_by_requested; хотя бы ОДНА заявленная модель в
+    блоке есть (полная сетка, каталог) → расхождения нет. Сам КОД-блок и служебные хвосты
+    ([собрано: модель …]) из текста-заявки исключены (client_facing_text)."""
+    block = _sheet_block_from_note(pricing_note)
+    if not block:
+        return None
+    in_sheet = _sheet_block_models(block)
+    if not in_sheet:
+        return None
+    text = client_facing_text((draft or "").replace(block, ""))
+    claimed = _claimed_models(text)
+    if not claimed:
+        return None
+    block_keys = [_bike_key(m) for m in in_sheet]
+    if any(bk.startswith(_bike_key(c)) for c in claimed for bk in block_keys):
+        return None
+    return (f"в тексте заявлено: {', '.join(claimed)}; в прайс-блоке: {', '.join(in_sheet)} — "
+            f"карточки чужой модели")
+
+
 # Сетка = НЕПРИКОСНОВЕННЫЙ блок (класс-фикс вёрстки 21:36, черновик #276: LLM пересобирал
 # карточки в однострочники и вставлял сырые ** — markdown в Telegram не рендерится). Блок везём
 # ВНУТРИ pricing_note между служебными скобками (транспорт: сигнатуры целы, IPC-перегенерация
@@ -5863,6 +5932,15 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
             why = "автоприветствие Business в окне" if has_autogreeting else "не первый ответ бота"
             log.info(f"SUGGEST: срезано повторное приветствие в черновике для {client_ref} ({why}).")
             draft = stripped
+    # Гвард-модель (шаг 4/7 #274): текст черновика заявляет модель («дам развёрнуто по Nmax»),
+    # а карточки прайс-блока — чужой (MT-03) ⇒ черновик врёт о собственном теле. Бракуем ШТАТНЫМ
+    # каналом отбраковки-до-модерации (тем же, что сбой/пустая генерация): причина в лог + видимая
+    # заметка в группу, карточки/IPC нет — кривой прайс не доезжает ни до модератора, ни до клиента.
+    mismatch = model_claim_mismatch(draft, price_note)
+    if mismatch:
+        log.warning(f"SUGGEST: черновик ЗАБРАКОВАН (гвард-модель) для {client_ref}: {mismatch}")
+        await post_mod_note(client, f"🛑 Черновик ЗАБРАКОВАН (гвард-модель) для {client_ref}: {mismatch}")
+        return None
 
     rec = {
         "client_id": client_id, "client_ref": client_ref, "lang": lang,
