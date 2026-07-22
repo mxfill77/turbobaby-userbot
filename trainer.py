@@ -218,6 +218,34 @@ def parse_hypotheses(text, limit=4):
     return out
 
 
+TG_MSG_LIMIT = 4096                       # жёсткий лимит Telegram на длину текста сообщения
+HYPS_TITLE = "🎓 Что улучшить в ответе? Тапни номер (тап = запомнить), или «✍️ другое»:"
+HYPS_TITLE_CONT = "🎓 …продолжение списка гипотез:"
+_HYPS_CUT = " …[обрезано]"
+
+
+def hyps_messages(hyps, limit=TG_MSG_LIMIT):
+    """ПОЛНЫЕ тексты гипотез нумерованным списком в САМОМ сообщении (кнопки — только номера
+    [1]..[N], их подписи Telegram режет по ширине — читаемость живёт здесь). → список частей;
+    клавиатуру вешать на ПОСЛЕДНЮЮ. Нумерация = индекс в hyps (тот же, что в callback_data).
+
+    Лимит 4096: список длиннее части рвём ПО ГРАНИЦЕ гипотезы на несколько сообщений (ничего не
+    теряем); только если ОДНА гипотеза длиннее целой части — усекаем её с явным маркером."""
+    items = [strip_thai(str(h or "").strip()) for h in (hyps or [])]
+    parts, cur = [], HYPS_TITLE
+    for i, h in enumerate(items):
+        block = f"{i + 1}. {h}"
+        if len(cur) + 2 + len(block) > limit:          # не влезает в текущую часть → новая часть
+            parts.append(cur)
+            cur = HYPS_TITLE_CONT
+            room = limit - len(cur) - 2
+            if len(block) > room:                      # одна гипотеза длиннее части — честный маркер
+                block = block[:max(0, room - len(_HYPS_CUT))] + _HYPS_CUT
+        cur += "\n\n" + block
+    parts.append(cur)
+    return parts
+
+
 # ------------------------------- пометка источника правил --------------------
 
 def _norm_rule(s):

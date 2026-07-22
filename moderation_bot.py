@@ -287,13 +287,21 @@ def _kb_trainer_panel():
     ]])
 
 
-def _kb_trainer_hyps(hyps):
+def _kb_trainer_hyps(hyps, per_row=5):
+    """Кнопки гипотез = ТОЛЬКО номера [1]..[N] + [✍️ другое]: полные формулировки печатаются
+    списком в самом сообщении (trainer.hyps_messages) — подпись inline-кнопки Telegram режет по
+    ширине, и владелец не мог дочитать правило. callback_data прежний (tr:hyp:<i> / tr:hyp:other) —
+    маршрутизация и старые обработчики не меняются."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    rows = []
-    for i, h in enumerate(hyps):
-        label = f"{i + 1}. " + (h[:40] + "…" if len(h) > 40 else h)
-        rows.append([InlineKeyboardButton(label, callback_data=f"tr:hyp:{i}")])
-    rows.append([InlineKeyboardButton("✍️ другое (напишу текстом)", callback_data="tr:hyp:other")])
+    rows, row = [], []
+    for i in range(len(hyps or [])):
+        row.append(InlineKeyboardButton(str(i + 1), callback_data=f"tr:hyp:{i}"))
+        if len(row) >= per_row:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✍️ другое", callback_data="tr:hyp:other")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -343,9 +351,10 @@ async def _trainer_callback(context, q, data):
             await context.bot.send_message(chat_id, "⚠️ Не удалось предложить гипотезы — напиши урок текстом: «урок: …».")
             return
         trainer.set_hyps(hyps)
-        await context.bot.send_message(
-            chat_id, "🎓 Что улучшить в ответе? Выбери правило (тап = запомнить), или «другое»:",
-            reply_markup=_kb_trainer_hyps(hyps))
+        parts = trainer.hyps_messages(hyps)      # полные формулировки — в тексте, кнопки = номера
+        for p in parts[:-1]:
+            await context.bot.send_message(chat_id, p)
+        await context.bot.send_message(chat_id, parts[-1], reply_markup=_kb_trainer_hyps(hyps))
         return
     if data.startswith("tr:hyp:"):
         sel = data[len("tr:hyp:"):]

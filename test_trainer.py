@@ -452,6 +452,160 @@ class TestModerbotCallbackGate(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trainer.get_transcript(), "")
 
 
+# --------- РЕНДЕР гипотез: полный текст в сообщении, кнопки = номера --------------
+
+LONG_HYP = ("Не отвечай одной строкой на вопрос о доставке: сначала уточни адрес или район, "
+            "затем назови стоимость доставки именно для этого района и срок подачи байка, "
+            "и только после этого предлагай перейти к оформлению брони — иначе клиент уходит.")
+
+
+class TestHypsRender(unittest.TestCase):
+    """Живой провал 22.07: подпись inline-кнопки Telegram режет по ширине — владелец не мог
+    дочитать гипотезу. Полные формулировки печатаются нумерованным списком В СООБЩЕНИИ."""
+
+    def test_long_hypothesis_full_in_message(self):
+        self.assertGreater(len(LONG_HYP), 200)
+        parts = trainer.hyps_messages(["коротко", LONG_HYP])
+        self.assertEqual(len(parts), 1)
+        self.assertIn(LONG_HYP, parts[0])                      # ЦЕЛИКОМ, без «…»
+        self.assertIn("2. " + LONG_HYP, parts[0])              # под своим номером
+        self.assertNotIn("…[обрезано]", parts[0])
+        self.assertTrue(parts[0].startswith(trainer.HYPS_TITLE))
+
+    def test_any_n_numbered_from_one(self):
+        for n in (2, 3, 5, 7):
+            parts = trainer.hyps_messages([f"правило {i}" for i in range(n)])
+            body = "\n".join(parts)
+            for i in range(n):
+                self.assertIn(f"{i + 1}. правило {i}", body)
+            self.assertNotIn(f"{n + 1}. ", body)
+
+    def test_empty_list_returns_title_only(self):
+        self.assertEqual(trainer.hyps_messages([]), [trainer.HYPS_TITLE])
+
+    def test_limit_4096_splits_by_hypothesis_boundary(self):
+        hyps = [f"г{i} " + "я" * 900 for i in range(9)]        # ~8.2k символов
+        parts = trainer.hyps_messages(hyps)
+        self.assertGreater(len(parts), 1, "длинный список обязан разбиться, а не обрезаться")
+        for p in parts:
+            self.assertLessEqual(len(p), trainer.TG_MSG_LIMIT)
+        body = "\n".join(parts)
+        for i, h in enumerate(hyps):                            # ничего не потеряно
+            self.assertIn(f"{i + 1}. {h}", body)
+        self.assertNotIn("…[обрезано]", body)
+        for p in parts[1:]:
+            self.assertTrue(p.startswith(trainer.HYPS_TITLE_CONT))
+
+    def test_single_giant_hypothesis_truncated_with_marker(self):
+        parts = trainer.hyps_messages(["ю" * 6000])
+        for p in parts:
+            self.assertLessEqual(len(p), trainer.TG_MSG_LIMIT)
+        self.assertIn("…[обрезано]", "\n".join(parts))          # усечение — только явное
+
+    def test_no_thai_in_render(self):
+        parts = trainer.hyps_messages(["скажи цену 500 ฿ สวัสดี сразу"])
+        self.assertNotIn("สวัสดี", parts[0])
+        self.assertIn("฿", parts[0])
+
+
+class TestHypsKeyboard(unittest.TestCase):
+    def test_buttons_are_numbers_and_carry_index(self):
+        import moderation_bot
+        hyps = [LONG_HYP, "б", "в", "г", "д", "е"]
+        kb = moderation_bot._kb_trainer_hyps(hyps)
+        flat = [b for row in kb.inline_keyboard for b in row]
+        self.assertEqual([b.text for b in flat[:-1]], ["1", "2", "3", "4", "5", "6"])
+        self.assertEqual([b.callback_data for b in flat[:-1]],
+                         [f"tr:hyp:{i}" for i in range(6)])     # индекс, а не текст — маппинг надёжен
+        self.assertEqual(flat[-1].callback_data, "tr:hyp:other")
+        self.assertIn("другое", flat[-1].text)
+        self.assertTrue(all(len(row) <= 5 for row in kb.inline_keyboard))
+
+    def test_n_not_four(self):
+        import moderation_bot
+        for n in (2, 3, 5):
+            kb = moderation_bot._kb_trainer_hyps([f"г{i}" for i in range(n)])
+            flat = [b for row in kb.inline_keyboard for b in row]
+            self.assertEqual(len(flat), n + 1)                  # N номеров + «другое»
+            self.assertEqual([b.text for b in flat[:-1]], [str(i + 1) for i in range(n)])
+
+
+class TestHypsTapMapping(unittest.IsolatedAsyncioTestCase):
+    """Тап по номеру выбирает ИМЕННО ту гипотезу (и «✍️ другое» работает как раньше)."""
+
+    def setUp(self):
+        import moderation_bot
+        self.mb = moderation_bot
+        moderation_ipc.init_db()
+        self._old_appr = suggest.APPROVER_USERNAMES
+        suggest.APPROVER_USERNAMES = {"mike"}
+        self._old_apply = trainer.apply_lesson
+        self.applied = []
+        trainer.apply_lesson = lambda remark: (self.applied.append(remark)
+                                               or {"card": f"✅ урок: {remark}"})
+
+    def tearDown(self):
+        suggest.APPROVER_USERNAMES = self._old_appr
+        trainer.apply_lesson = self._old_apply
+
+    def _fakes(self, username="mike", chat_id=-100500):
+        sent = []
+
+        class Bot:
+            async def send_message(self, cid, text, **kw):
+                sent.append((cid, text, kw.get("reply_markup")))
+
+        class Ctx:
+            bot = Bot()
+
+        class User:
+            def __init__(self, u):
+                self.username = u
+
+        class Msg:
+            def __init__(self, cid):
+                self.chat_id = cid
+
+        class Q:
+            def __init__(self, u, cid):
+                self.from_user = User(u)
+                self.message = Msg(cid)
+
+        return Ctx(), Q(username, chat_id), sent
+
+    async def test_tap_number_picks_that_hypothesis(self):
+        trainer.set_hyps(["первая", LONG_HYP, "третья"])
+        ctx, q, sent = self._fakes()
+        await self.mb._trainer_callback(ctx, q, "tr:hyp:1")     # кнопка «2» → индекс 1
+        self.assertEqual(self.applied, [LONG_HYP])
+
+    async def test_other_button_unchanged(self):
+        ctx, q, sent = self._fakes()
+        await self.mb._trainer_callback(ctx, q, "tr:hyp:other")
+        self.assertEqual(self.applied, [])
+        self.assertTrue(any("урок:" in t for _, t, _ in sent))
+
+    async def test_teach_posts_full_text_and_number_buttons(self):
+        moderation_ipc.set_meta(trainer.K_INCOMING, "а сколько доставка?")
+        moderation_ipc.set_meta(trainer.K_ANSWER, "500 бат")
+        old_llm = suggest.default_llm_caller
+        suggest.default_llm_caller = lambda: (lambda s, u: f"коротко\n{LONG_HYP}\nтретья")
+        try:
+            ctx, q, sent = self._fakes()
+            await self.mb._trainer_callback(ctx, q, "tr:teach")
+        finally:
+            suggest.default_llm_caller = old_llm
+        body = "\n".join(t for _, t, _ in sent)
+        self.assertIn(LONG_HYP, body)                           # формулировка читаема ЦЕЛИКОМ
+        kb = sent[-1][2]                                        # клавиатура — на последней части
+        self.assertIsNotNone(kb)
+        flat = [b for row in kb.inline_keyboard for b in row]
+        self.assertEqual([b.text for b in flat], ["1", "2", "3", "✍️ другое"])
+        # тап по номеру «2» из этой же выдачи → та самая длинная гипотеза
+        await self.mb._trainer_callback(ctx, q, flat[1].callback_data)
+        self.assertEqual(self.applied, [LONG_HYP])
+
+
 # --------- накопление окна диалога + токен состояния (регресс ТЕСТ-4 раздвоения) ------
 
 class TestTrainerAccumulation(unittest.TestCase):
