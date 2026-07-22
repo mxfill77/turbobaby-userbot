@@ -45,11 +45,17 @@ _log = logging.getLogger("dispatch_notify")
 _log.setLevel(logging.INFO)
 _log.propagate = False
 try:
-    _h = logging.FileHandler(NOTIFY_LOG, encoding="utf-8")
-    _h.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
-    _log.addHandler(_h)
+    import log_setup                       # ротация + тестовый лог в temp (см. log_setup)
+    _h = log_setup.rotating_handler(NOTIFY_LOG)
+    if _h is not None:
+        _log.addHandler(_h)
 except Exception:
-    pass
+    try:
+        _h = logging.FileHandler(NOTIFY_LOG, encoding="utf-8")
+        _h.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+        _log.addHandler(_h)
+    except Exception:
+        pass
 
 
 def _load_env(path):

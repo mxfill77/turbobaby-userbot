@@ -26,11 +26,17 @@ log = logging.getLogger("pricing")
 log.setLevel(logging.INFO)
 log.propagate = False
 try:
-    _h = logging.FileHandler(os.path.join(HERE, "pricing.log"), encoding="utf-8")
-    _h.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
-    log.addHandler(_h)
+    import log_setup                       # ротация + тестовый лог в temp (см. log_setup)
+    _h = log_setup.rotating_handler(os.path.join(HERE, "pricing.log"))
+    if _h is not None:
+        log.addHandler(_h)
 except Exception:
-    pass
+    try:
+        _h = logging.FileHandler(os.path.join(HERE, "pricing.log"), encoding="utf-8")
+        _h.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+        log.addHandler(_h)
+    except Exception:
+        pass
 
 PRICING_ACTION = os.getenv("PRICING_ACTION", "").strip()   # пусто → фаза (б) всегда фолбэк
 BRIDGE_URL = os.getenv("BRIDGE_URL", "").strip()

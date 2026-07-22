@@ -83,13 +83,19 @@ load_dotenv()
 AGENT_BOT_TOKEN = os.getenv("AGENT_BOT_TOKEN", "").strip()
 
 # --- логирование агента: файл (utf-8) + stdout ---
+_AGENT_FMT = "%(asctime)s | %(levelname)s | %(message)s"
+try:
+    import log_setup                       # ротация + тестовый лог в temp (см. log_setup)
+    _fh = log_setup.rotating_handler(AGENT_LOG, fmt=_AGENT_FMT)
+except Exception:
+    _fh = None
+if _fh is None:
+    _fh = logging.FileHandler(AGENT_LOG, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter(_AGENT_FMT))
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.FileHandler(AGENT_LOG, encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
+    format=_AGENT_FMT,
+    handlers=[_fh, logging.StreamHandler()],
 )
 # Глушим болтливый сетевой лог PTB, оставляем свои сообщения.
 logging.getLogger("httpx").setLevel(logging.WARNING)

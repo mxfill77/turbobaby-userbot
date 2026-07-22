@@ -59,13 +59,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOCK_FILE = os.path.join(BASE_DIR, "userbot.lock")
 
 # Логирование: файл (utf-8) + stdout. Каждая строка самодостаточна (своя ISO-дата).
+try:
+    import log_setup                       # ротация + тестовый лог в temp (см. log_setup)
+    _ub_h = log_setup.rotating_handler(LOG_FILE, fmt="%(message)s")
+except Exception:
+    _ub_h = None
+if _ub_h is None:
+    _ub_h = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    _ub_h.setFormatter(logging.Formatter("%(message)s"))
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
+    handlers=[_ub_h, logging.StreamHandler()],
 )
 log = logging.getLogger("userbot")
 

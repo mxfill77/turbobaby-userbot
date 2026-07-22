@@ -28,11 +28,17 @@ log = logging.getLogger("delivery")
 log.setLevel(logging.INFO)
 log.propagate = False
 try:
-    _h = logging.FileHandler(os.path.join(HERE, "delivery.log"), encoding="utf-8")
-    _h.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
-    log.addHandler(_h)
+    import log_setup                       # ротация + тестовый лог в temp (см. log_setup)
+    _h = log_setup.rotating_handler(os.path.join(HERE, "delivery.log"))
+    if _h is not None:
+        log.addHandler(_h)
 except Exception:
-    pass
+    try:
+        _h = logging.FileHandler(os.path.join(HERE, "delivery.log"), encoding="utf-8")
+        _h.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+        log.addHandler(_h)
+    except Exception:
+        pass
 
 BRIDGE_URL = os.getenv("BRIDGE_URL", "").strip()
 BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()

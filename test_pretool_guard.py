@@ -12,7 +12,13 @@ import tempfile
 import subprocess
 import unittest
 
-import pretool_guard as g
+# Разведение тестового и боевого лога — ДО импорта гарда и ДО любого subprocess-прогона.
+# Прямой запуск `python -m unittest` ловится и сам (log_setup._started_as_test_runner), но
+# ДЕТИ (гард запускается subprocess'ом) наследуют только окружение — без этой строки фикстуры
+# снова осядут в боевом pretool_guard.log, как 21:39.
+os.environ["TURBOBABY_TEST_LOGS"] = "1"
+
+import pretool_guard as g  # noqa: E402
 
 PROJ = r"D:\turbobaby-bot"
 
@@ -414,8 +420,97 @@ class TestHeadlessUnchanged(unittest.TestCase):
             self.assertEqual(g.decide_for_role(bash(c), headless=False)[0], "defer", c)
 
 
+class TestAllowFloodFalsePositives(unittest.TestCase):
+    """ГОЛДЕНЫ по разбору Allow-потопа 22:27. Из 20 последних подтверждений 6 были ложными:
+    3 × запись СВОИХ ЖЕ файлов памяти и 3 × запись во временный скретчпад сессии. Оба —
+    рабочая зона самой сессии, подтверждением они ничего не защищали, а поток притуплял
+    внимание к настоящему красному. Дословные пути из живого лога."""
+
+    MEM = r"C:\Users\mxfill1\.claude\projects\D--turbobaby-bot\memory\rc-effort-override.md"
+    MEM_IDX = r"C:\Users\mxfill1\.claude\projects\D--turbobaby-bot\memory\MEMORY.md"
+    SCRATCH = (r"C:\Users\mxfill1\AppData\Local\Temp\claude\D--turbobaby-bot"
+               r"\b0e2e361-1db0-478d-93f5-3bb6e8415847\scratchpad\condump.ps1")
+
+    def test_memory_store_is_not_config(self):
+        for p in (self.MEM, self.MEM_IDX):
+            self.assertFalse(g._is_claude_path(p), p)
+            self.assertEqual(g.decide_for_role(edit(p), headless=False)[0], "defer", p)
+
+    def test_session_scratchpad_passes(self):
+        self.assertEqual(g.decide_for_role(edit(self.SCRATCH), headless=False)[0], "defer")
+
+    def test_claude_config_stays_red(self):
+        """Сужение `.claude` НЕ открывает конфиг: settings/hooks/agents/commands — по-прежнему Allow."""
+        for p in (os.path.join(PROJ, ".claude", "settings.json"),
+                  os.path.join(PROJ, ".claude", "settings.local.json"),
+                  r"C:\Users\mxfill1\.claude\settings.json",
+                  r"C:\Users\mxfill1\.claude\hooks\evil.py",
+                  r"C:\Users\mxfill1\.claude\agents\x.md",
+                  r"C:\Users\mxfill1\.claude.json"):
+            self.assertTrue(g._is_claude_path(p), p)
+            self.assertEqual(g.decide_for_role(edit(p), headless=False)[:2], ("ask", "edit_claude"), p)
+
+    def test_shell_cannot_bypass_the_config_gate(self):
+        """Конфиг закрыт для Write/Edit — значит закрыт и для ОБХОДА через шелл. Иначе дыра
+        тривиальна: сессия пишет settings.json.new (внутри репо, зелёное) и копирует его поверх
+        боевого одной командой, молча расширив собственные права."""
+        for cmd in ("cp .claude/settings.json.new .claude/settings.json",
+                    "copy .claude\\settings.json.new .claude\\settings.json",
+                    "mv /tmp/x.json .claude/settings.local.json",
+                    "echo '{}' > .claude/settings.json",
+                    "Copy-Item x.json C:\\Users\\mxfill1\\.claude\\hooks\\evil.py"):
+            self.assertEqual(g.decide_for_role(bash(cmd), headless=False)[:2],
+                             ("ask", "edit_claude"), cmd)
+
+    def test_reading_config_stays_green(self):
+        for cmd in ("cat .claude/settings.json", "type .claude\\settings.json",
+                    "Get-Content .claude/settings.json"):
+            self.assertEqual(g.decide_for_role(bash(cmd), headless=False)[0], "defer", cmd)
+
+    def test_outside_write_that_is_not_sanctioned_stays_red(self):
+        for p in (r"C:\Windows\System32\drivers\etc\hosts", r"C:\Users\mxfill1\Documents\x.txt",
+                  r"C:\Users\mxfill1\.claude\projects\D--turbobaby-bot\session.jsonl"):
+            self.assertEqual(g.decide_for_role(edit(p), headless=False)[0], "ask", p)
+
+
+class TestPowerShellTool(unittest.TestCase):
+    """PowerShell — ОТДЕЛЬНЫЙ от Bash инструмент и основной шелл этого ПК. До фикса он не попадал
+    ни в matcher хука, ни в классификацию: `PowerShell(Remove-Item -Recurse …)` шёл МИМО красного
+    гейта целиком. Красное на PowerShell-форме обязано спрашивать так же, как на bash-форме."""
+
+    def _ps(self, cmd):
+        return {"tool_name": "PowerShell", "tool_input": {"command": cmd}, "cwd": PROJ}
+
+    def test_powershell_red_forms_ask(self):
+        for cmd, kind in (("Remove-Item -Recurse -Force C:\\data", "delete"),
+                          ("Stop-Process -Id 1 -Force", "kill"),
+                          ("Invoke-WebRequest https://example.com", "network"),
+                          ("Get-Content .env", "env")):
+            self.assertEqual(g.decide(self._ps(cmd))[:2], ("ask", kind), cmd)
+            self.assertEqual(g.decide_for_role(self._ps(cmd), headless=False)[0], "ask", cmd)
+
+    def test_powershell_readonly_passes(self):
+        for cmd in ("Get-CimInstance Win32_Process | Select-Object Id",
+                    "Get-ChildItem D:\\turbobaby-bot",
+                    "Get-Content pc_orchestrator.log -Tail 20"):
+            self.assertEqual(g.decide_for_role(self._ps(cmd), headless=False)[0], "defer", cmd)
+
+
 class TestGuardLog(unittest.TestCase):
     """Смягчение не должно стоить прозрачности: пишем КАЖДОЕ решение обеих ролей."""
+
+    def test_test_run_never_writes_to_live_log(self):
+        """ГОЛДЕН разведения тестового и боевого лога. Живой факт 21:39: фикстуры прогона
+        (`clasp push`, `sqlite3 bookings.db "select 1"`, пустая команда) осели в БОЕВОМ
+        pretool_guard.log и попали в разбор «последних 20 Allow» как реальные события."""
+        import log_setup
+        live = os.path.join(PROJ, "pretool_guard.log")
+        before = os.path.getsize(live) if os.path.isfile(live) else 0
+        env = dict(os.environ, TURBOBABY_TEST_LOGS="1")
+        self.assertNotEqual(log_setup.log_path(live, env), live)
+        g._log("interactive", "Bash", "ask", "clasp", "clasp push")   # фикстура как в живом логе
+        after = os.path.getsize(live) if os.path.isfile(live) else 0
+        self.assertEqual(before, after, "фикстура теста дописалась в БОЕВОЙ pretool_guard.log")
 
     def _tmp(self):
         fd, p = tempfile.mkstemp(suffix=".guardlog")

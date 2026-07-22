@@ -3802,31 +3802,65 @@ _CLAUDE_BASE = (_claude_base_dirs() or
                 [os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "Claude", "claude-code")])[0]
 
 
-def _resolve_claude_once():
-    """Один проход резолва (без ретраев). Порядок: PATH-шим → CLAUDE_BIN из окружения (если жив) →
-    CLAUDE_BIN ПРЯМО из .env-файла (спасает сервис-контекст) → новейшая версия claude-code по ВСЕМ
-    профилям → кандидаты иных схем установки. → путь|None."""
-    w = shutil.which("claude")
-    if w and os.path.isfile(w):
-        return w
-    if CLAUDE_BIN and os.path.isabs(CLAUDE_BIN) and os.path.isfile(CLAUDE_BIN):
-        return CLAUDE_BIN
-    envbin = _env_file_claude_bin()             # ← КЛЮЧ: не зависит от %APPDATA%/load_dotenv/cwd
-    if envbin:
-        return envbin
+_RE_VER_DIR = re.compile(r"^\d+(?:\.\d+)+$")
+
+
+def _ver_key(name):
+    nums = re.findall(r"\d+", name or "")
+    return tuple(int(n) for n in nums) if nums else (0,)
+
+
+def _pinned_version(path):
+    """Версия ВЕРСИОННОЙ установки по пути (…/claude-code/2.1.217/claude.exe → (2,1,217));
+    иная схема установки → None (такой пин — осознанный выбор пути, не отставшая версия)."""
+    parent = os.path.basename(os.path.dirname(path or ""))
+    return _ver_key(parent) if _RE_VER_DIR.match(parent or "") else None
+
+
+def _newest_versioned():
+    """(ключ_версии, путь) новейшей версионной установки по всем базам, или None."""
     try:
         cands = []
         for base in _claude_base_dirs():
             for d in glob.glob(os.path.join(base, "*")):
                 exe = os.path.join(d, "claude.exe")
                 if os.path.isfile(exe):
-                    nums = re.findall(r"\d+", os.path.basename(d))
-                    cands.append((tuple(int(n) for n in nums) if nums else (0,), exe))
+                    cands.append((_ver_key(os.path.basename(d)), exe))
         if cands:
             cands.sort()
-            return cands[-1][1]
+            return cands[-1]
     except Exception:
         pass
+    return None
+
+
+def _honor_pin(pin, newest):
+    """Пин версии — ПОЛ, а не потолок: живой, но ОТСТАВШИЙ от автообновления версионный пин не
+    смеет побеждать новейшую установку (живой факт: CLAUDE_BIN=…\\2.1.215 при наличии 2.1.217).
+    Не-версионный пин и рубильник CLAUDE_BIN_STRICT=1 уважаем как есть."""
+    if (os.getenv("CLAUDE_BIN_STRICT", "") or "").strip() not in ("", "0"):
+        return pin
+    pv = _pinned_version(pin)
+    if pv is None or newest is None or newest[0] <= pv:
+        return pin
+    return newest[1]
+
+
+def _resolve_claude_once():
+    """Один проход резолва (без ретраев). Порядок: PATH-шим → CLAUDE_BIN из окружения (если жив и
+    не отстал) → CLAUDE_BIN ПРЯМО из .env-файла (спасает сервис-контекст) → новейшая версия
+    claude-code по ВСЕМ профилям → кандидаты иных схем установки. → путь|None."""
+    w = shutil.which("claude")
+    if w and os.path.isfile(w):
+        return w
+    newest = _newest_versioned()                # нужен и сам по себе, и для сверки с пином
+    if CLAUDE_BIN and os.path.isabs(CLAUDE_BIN) and os.path.isfile(CLAUDE_BIN):
+        return _honor_pin(CLAUDE_BIN, newest)
+    envbin = _env_file_claude_bin()             # ← КЛЮЧ: не зависит от %APPDATA%/load_dotenv/cwd
+    if envbin:
+        return _honor_pin(envbin, newest)
+    if newest:
+        return newest[1]
     home = os.path.expanduser("~")
     local = os.getenv("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
     for c in (os.path.join(home, ".local", "bin", "claude.exe"),

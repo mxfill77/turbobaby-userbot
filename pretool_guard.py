@@ -16,7 +16,9 @@ pretool_guard.py — PreToolUse-хук Claude Code для ПК (D:\\turbobaby-bo
   НЕИЗВЕСТНОЕ / ошибка анализа → ask (FAIL-SAFE, в сторону подтверждения).
 
 КРАСНЫЙ список (НЕ смягчать): правка/чтение .env и секретов; удаление файлов
-(del/rm/rmdir/Remove-Item); правка .claude/*; kill/taskkill/schtasks/Stop-Process;
+(del/rm/rmdir/Remove-Item); правка КОНФИГА .claude (settings*.json / hooks / agents / commands /
+plugins / skills — вектор само-эскалации; память и стенограммы агента там же конфигом НЕ
+считаются); kill/taskkill/schtasks/Stop-Process;
 git push --force / reset --hard / clean; sqlite3 / SQL-запись в БД; запись/исполнение вне
 D:\\turbobaby-bot; сеть кроме git/Bridge/Telegram (curl/wget/ssh/scp/…); python-скрипт с
 боевой записью (Bridge create_booking/add_transaction/… , os.remove/rmtree, SQL-write);
@@ -63,7 +65,12 @@ PROJ_N = os.path.normcase(os.path.normpath(PROJECT))
 VENV_PY = os.path.join(PROJECT, "venv", "Scripts", "python.exe")
 DNOTIFY = os.path.join(PROJECT, "dispatch_notify.py")
 GUARD_LOG = os.path.join(PROJECT, "pretool_guard.log")   # под *.log в .gitignore — в репо не уедет
-GUARD_LOG_MAX = 2 * 1024 * 1024                          # 2 МБ → ротация в .log.1 (лог не растёт вечно)
+GUARD_LOG_MAX = 2 * 1024 * 1024                          # 2 МБ → ротация (лог не растёт вечно)
+
+try:  # общая ротация + разведение тестового и боевого лога (см. log_setup)
+    import log_setup
+except Exception:                                        # гард обязан работать даже без модуля
+    log_setup = None
 
 # --- КРАСНЫЕ признаки Bash-команды → (regex, kind) ---
 _RED_CMD = [
@@ -138,6 +145,20 @@ def _human(kind, obj=""):
     return tpl.get(kind, "Требуется подтверждение операции")
 _RE_ENV = re.compile(r"(?i)(\.env(\b|['\"\s]|$)|\.session\b)")            # .env / *.session в команде
 _RE_SQL_WRITE = re.compile(r"(?i)\b(UPDATE|DELETE\s+FROM|INSERT\s+INTO|DROP\s+TABLE)\b")
+# Путь конфига Claude Code, упомянутый В КОМАНДЕ шелла (обход Write/Edit-гейта через cp/mv/>).
+_RE_CLAUDE_CFG_CMD = re.compile(
+    r"(?i)\.claude[\\/](settings[\w.-]*\.json|hooks|agents|commands|plugins|skills)|(?<![\w.])\.claude\.json\b")
+# Чистое ЧТЕНИЕ конфига остаётся зелёным. Список смотрелок задан явно: проверять «команда
+# выглядит read-only» общим списком нельзя — `echo '{}' > .claude/settings.json` начинается с
+# echo и прошёл бы как безобидный, а это перезапись конфига.
+_RE_CFG_VIEW = re.compile(r"(?i)^\s*(cat|type|head|tail|more|less|grep|rg|findstr|select-string|"
+                          r"get-content|get-item|get-childitem|test-path|ls|dir|git)\b")
+_RE_REDIRECT = re.compile(r">>?")
+
+
+def _is_pure_config_read(cmd):
+    """True ⇔ команда только СМОТРИТ конфиг: известная смотрелка и НИ ОДНОГО перенаправления."""
+    return bool(_RE_CFG_VIEW.match(cmd or "")) and not _RE_REDIRECT.search(cmd or "")
 _RE_OUTSIDE_WRITE = re.compile(r"(?i)(>>?|out-file|set-content|new-item|move-item|copy-item)\s+[\"']?([a-z]:[\\/][^\"'\s]+)")
 
 # --- ЗЕЛЁНЫЕ признаки Bash-команды (проверяются ПОСЛЕ красных) ---
@@ -180,9 +201,65 @@ def _is_secret_path(path):
             or ".session" in b or b.endswith(".key") or b.endswith(".pem") or "secret" in b)
 
 
+# Внутри `.claude` красное — ТОЛЬКО конфиг (вектор само-эскалации: правами и хуками сессия
+# расширяет собственные полномочия). Рабочие данные агента там же — НЕ конфиг: память
+# (projects/<репо>/memory/*.md), стенограммы (*.jsonl), сессии/тудушки/снапшоты шелла. Живой
+# факт аудита 22:27: 3 из 20 последних Allow — это запись СВОИХ ЖЕ файлов памяти
+# (rc-effort-override.md, claude-bin-stale-version.md, MEMORY.md). Подтверждения на них не
+# защищают ничего, а поток притупляет внимание к настоящему красному.
+_CLAUDE_CFG_FILE = re.compile(r"(?i)^(settings(\.[\w.-]+)?\.json|\.?claude\.json|[\w.-]*mcp[\w.-]*\.json)$")
+_CLAUDE_CFG_DIR = ("hooks", "agents", "commands", "plugins", "skills")
+
+
 def _is_claude_path(path):
+    """True ⇔ путь — КОНФИГ Claude Code (settings*.json / mcp-конфиг / hooks|agents|commands|
+    plugins|skills внутри `.claude`). Память, стенограммы и прочие рабочие данные агента → False."""
     n = os.path.normcase(os.path.normpath(path or ""))
-    return (os.sep + ".claude" + os.sep) in n or n.endswith(os.sep + ".claude")
+    parts = n.split(os.sep)
+    try:
+        i = max(k for k, p in enumerate(parts) if p == ".claude")
+    except ValueError:
+        if os.path.basename(n) in (".claude.json", "claude.json"):
+            return True                       # ~/.claude.json лежит РЯДОМ с каталогом, не внутри
+        return False
+    tail = parts[i + 1:]
+    if not tail:
+        return False                          # сам каталог .claude — не файл конфига
+    if _CLAUDE_CFG_FILE.match(tail[-1]):
+        return True
+    return any(seg in _CLAUDE_CFG_DIR for seg in tail[:-1])
+
+
+# Скретчпад сессии (%TEMP%\claude\<проект>\<сессия>\scratchpad\…) — САНКЦИОНИРОВАННАЯ временная
+# зона harness'а: изолирована от репо и от данных пользователя, живёт один сеанс. Требование
+# «правки только внутри репо» защищает от правок ЧУЖОГО кода, а не от временных файлов, ради
+# которых скретчпад и существует. Живой факт аудита: 3 из 20 Allow — запись собственных
+# временных скриптов разбора.
+def _is_scratchpad(path):
+    n = os.path.normcase(os.path.normpath(path or ""))
+    parts = n.split(os.sep)
+    return "scratchpad" in parts and "claude" in parts and (
+        os.sep + "temp" + os.sep in n or os.sep + "tmp" + os.sep in n)
+
+
+def _is_memory_store(path):
+    """Хранилище памяти агента: `.claude/projects/<репо>/memory/**`. Это СОБСТВЕННЫЕ заметки
+    сессии, а не чужой код и не конфиг — правило «только внутри репо» защищает от правок чужого,
+    и на память оно не про то. Конфигом эти файлы не являются (см. _is_claude_path), значит
+    расширить свои права через них нельзя."""
+    parts = os.path.normcase(os.path.normpath(path or "")).split(os.sep)
+    try:
+        i = parts.index("memory")
+    except ValueError:
+        return False
+    return ".claude" in parts[:i] and "projects" in parts[:i]
+
+
+def _sanctioned_outside(path):
+    """Зоны ВНЕ репо, где запись не требует подтверждения: временный скретчпад сессии и
+    хранилище памяти агента. Оба — рабочая зона самой сессии, не вектор эскалации.
+    Живой факт аудита 22:27: 6 из 20 последних Allow были именно про них."""
+    return _is_scratchpad(path) or _is_memory_store(path)
 
 
 def _is_test_target(path):
@@ -277,7 +354,7 @@ def _decide_write(ti, cwd):
         return ("ask", "edit_secret", os.path.basename(path))
     if _is_claude_path(path):
         return ("ask", "edit_claude", os.path.basename(path))
-    if not _inside_project(path):
+    if not _inside_project(path) and not _sanctioned_outside(path):
         return ("ask", "write_outside", path)
     return ("defer", "", "")
 
@@ -306,6 +383,13 @@ def _decide_bash(cmd, cwd):
             return ("ask", kind, obj)
     if _RE_ENV.search(cmd):
         return ("ask", "env", "")
+    # Конфиг `.claude` защищён для инструментов Write/Edit — значит его надо защитить и от
+    # ОБХОДА через шелл. Иначе дыра тривиальна: сессия пишет settings.json.new (внутри репо,
+    # зелёное) и копирует его поверх боевого одной командой `cp`, молча расширив свои права.
+    # Чтение конфига остаётся зелёным (ветка _RE_READONLY_SHELL ниже — cat/type/Get-Content).
+    m = _RE_CLAUDE_CFG_CMD.search(cmd)
+    if m and not _is_pure_config_read(cmd):
+        return ("ask", "edit_claude", m.group(0))
     m = _RE_OUTSIDE_WRITE.search(cmd)
     if m and not _inside_project(m.group(2)):
         return ("ask", "outside", m.group(2))
@@ -334,7 +418,11 @@ def decide(data):
         return _decide_write(ti, cwd)
     if tool == "Read":
         return _decide_read(ti, cwd)
-    if tool == "Bash":
+    # PowerShell — ОТДЕЛЬНЫЙ инструмент от Bash, и на этом ПК он основной. До правки он не
+    # попадал ни в matcher хука, ни под классификацию: `PowerShell(Remove-Item …)` проходил
+    # мимо КРАСНОГО гейта целиком. Красные признаки (Remove-Item / Stop-Process /
+    # Invoke-WebRequest / .env) уже описаны в _RED_CMD в PowerShell-форме — переиспользуем их.
+    if tool in ("Bash", "PowerShell"):
         return _decide_bash(ti.get("command") or "", cwd)
     return ("defer", "", "")  # Grep/Glob/прочие read-only инструменты
 
@@ -402,7 +490,7 @@ def decide_for_role(data, headless):
     if headless or action != "ask":
         return action, kind, obj
     cmd = ""
-    if (data.get("tool_name") or "") == "Bash":
+    if (data.get("tool_name") or "") in ("Bash", "PowerShell"):
         cmd = (data.get("tool_input") or {}).get("command") or ""
     if _stays_red(kind, obj, cmd):
         return action, kind, obj
@@ -428,9 +516,16 @@ def _log_line(role, tool, action, kind, detail):
 def _log(role, tool, action, kind, detail, path=None):
     """Дописать решение в лог. Смягчение не должно стоить прозрачности: пишем ОБЕ роли и ОБА
     решения (defer и ask). Лог вторичен — никогда не роняет решение гарда."""
-    p = path or os.getenv("PRETOOL_GUARD_LOG") or GUARD_LOG
+    p = path or os.getenv("PRETOOL_GUARD_LOG")
+    if not p:
+        # Под тестом лог уезжает в temp: фикстуры прогона (clasp push / sqlite3 / пустая
+        # команда) не имеют права оседать в боевом файле — они неотличимы от настоящих
+        # действий владельца и искажают разбор «кто просил Allow» (живой факт 21:39).
+        p = log_setup.log_path(GUARD_LOG) if log_setup else GUARD_LOG
     try:
-        if os.path.isfile(p) and os.path.getsize(p) > GUARD_LOG_MAX:
+        if log_setup:
+            log_setup.rotate_if_needed(p, GUARD_LOG_MAX)
+        elif os.path.isfile(p) and os.path.getsize(p) > GUARD_LOG_MAX:
             bak = p + ".1"
             try:
                 if os.path.isfile(bak):
@@ -533,7 +628,7 @@ def main():
         action, kind, obj = ("ask", "unknown", "")
     _log(role, tool, action, kind, detail)
     if action == "ask":
-        _emit_ask(_card(kind, obj, detail if tool == "Bash" else ""))
+        _emit_ask(_card(kind, obj, detail if tool in ("Bash", "PowerShell") else ""))
     sys.exit(0)  # defer
 
 

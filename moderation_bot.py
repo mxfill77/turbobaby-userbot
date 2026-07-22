@@ -35,10 +35,18 @@ import moderation_ipc     # noqa: E402
 import booking_draft      # noqa: E402  (O3 кусок 1 «Кнопка Бронь»: экстракция заявки, read-only)
 import trainer            # noqa: E402  (ГРУППА-ТРЕНАЖЁР: панель кнопок под ответом userbot)
 
+try:
+    import log_setup                       # ротация + тестовый лог в temp (см. log_setup)
+    _mb_h = log_setup.rotating_handler("moderation_bot.log")
+except Exception:
+    _mb_h = None
+if _mb_h is None:
+    _mb_h = logging.FileHandler("moderation_bot.log", encoding="utf-8")
+    _mb_h.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(message)s",
-    handlers=[logging.FileHandler("moderation_bot.log", encoding="utf-8"), logging.StreamHandler()],
+    handlers=[_mb_h, logging.StreamHandler()],
 )
 log = logging.getLogger("moderation_bot")
 

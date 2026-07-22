@@ -650,6 +650,66 @@ class TestResolveClaude(unittest.TestCase):
             with mock.patch.object(o.shutil, "which", return_value=None):
                 self.assertEqual(o.resolve_claude(), exe)          # протухший .env → берём установленную версию
 
+    def test_live_but_stale_pin_loses_to_newer_install(self):
+        """ГОЛДЕН авто-подхвата обновлений: пин в .env — ПОЛ, а не потолок.
+
+        Мёртвый пин мы пропускали и раньше (os.path.isfile), но ЖИВОЙ, ОТСТАВШИЙ пин молча
+        побеждал новейшую установку. Живой факт 22.07: CLAUDE_BIN=…\\2.1.215\\claude.exe при
+        стоящей рядом 2.1.217 → резолвер отдавал 2.1.215. Версия берётся ЧИСЛОВЫМ ключом:
+        mtime каталога врёт (у 2.1.215 и 2.1.217 он совпал)."""
+        with tempfile.TemporaryDirectory() as base:
+            for v in ("2.1.215", "2.1.217"):
+                os.makedirs(os.path.join(base, v))
+                open(os.path.join(base, v, "claude.exe"), "w").close()
+            o._CLAUDE_BASE = base
+            o.CLAUDE_BIN = os.path.join(base, "2.1.215", "claude.exe")   # живой, но отставший
+            with mock.patch.object(o.shutil, "which", return_value=None):
+                got = o.resolve_claude()
+            self.assertEqual(os.path.basename(os.path.dirname(got)), "2.1.217")
+
+    def test_pin_on_newest_is_kept(self):
+        with tempfile.TemporaryDirectory() as base:
+            for v in ("2.1.215", "2.1.217"):
+                os.makedirs(os.path.join(base, v))
+                open(os.path.join(base, v, "claude.exe"), "w").close()
+            o._CLAUDE_BASE = base
+            pin = os.path.join(base, "2.1.217", "claude.exe")
+            o.CLAUDE_BIN = pin
+            with mock.patch.object(o.shutil, "which", return_value=None):
+                self.assertEqual(o.resolve_claude(), pin)
+
+    def test_non_versioned_pin_is_honoured(self):
+        """Пин ИНОЙ схемы (не …/<версия>/claude.exe) — осознанный выбор пути, а не отставшая
+        версия: его не подменяем, даже если рядом стоит версионная установка."""
+        with tempfile.TemporaryDirectory() as base:
+            os.makedirs(os.path.join(base, "9.9.9"))
+            open(os.path.join(base, "9.9.9", "claude.exe"), "w").close()
+            o._CLAUDE_BASE = base
+            o.CLAUDE_BIN = sys.executable                    # …\Scripts\python.exe — не версионная схема
+            with mock.patch.object(o.shutil, "which", return_value=None):
+                self.assertEqual(o.resolve_claude(), sys.executable)
+
+    def test_strict_switch_freezes_on_pinned_version(self):
+        """Осознанно замереть на старой версии всё ещё можно — рубильником CLAUDE_BIN_STRICT=1."""
+        with tempfile.TemporaryDirectory() as base:
+            for v in ("2.1.215", "2.1.217"):
+                os.makedirs(os.path.join(base, v))
+                open(os.path.join(base, v, "claude.exe"), "w").close()
+            o._CLAUDE_BASE = base
+            pin = os.path.join(base, "2.1.215", "claude.exe")
+            o.CLAUDE_BIN = pin
+            os.environ["CLAUDE_BIN_STRICT"] = "1"
+            try:
+                with mock.patch.object(o.shutil, "which", return_value=None):
+                    self.assertEqual(o.resolve_claude(), pin)
+            finally:
+                os.environ.pop("CLAUDE_BIN_STRICT", None)
+
+    def test_version_key_is_numeric_not_lexicographic(self):
+        self.assertGreater(o._ver_key("2.1.217"), o._ver_key("2.1.99"))
+        self.assertEqual(o._pinned_version(os.path.join("x", "2.1.217", "claude.exe")), (2, 1, 217))
+        self.assertIsNone(o._pinned_version(os.path.join("x", "Scripts", "claude.exe")))
+
     def test_newest_version_glob(self):
         o.CLAUDE_BIN = r"C:\nope\claude.exe"
         with tempfile.TemporaryDirectory() as base:
@@ -1270,6 +1330,60 @@ class TestTaskSelfheal(Base):
         self.assertEqual(o._norm_model_id("opus-4.8"), "claude-opus-4-8")
         self.assertEqual(o._norm_model_id("claude-fable-5"), "claude-fable-5")   # полный id — как есть
         self.assertEqual(o._norm_model_id("sonnet"), "sonnet")                   # неизвестный алиас — как есть
+
+
+class TestThinkerEffort(unittest.TestCase):
+    """ГОЛДЕН глубины мышления на пути, который .claude/settings.json НЕ читает.
+
+    Думатель намеренно живёт в нейтральном cwd (tempdir), чтобы не тянуть hooks/pretool_guard
+    репо. Вместе с ними он терял и `effortLevel` — при доктрине «каждая задача ultrathink» это
+    тихая деградация ровно там, где рассуждение и нужно. Значения обязаны браться из ТОГО ЖЕ
+    settings.json, а не дублироваться константой (иначе два источника правды разъедутся)."""
+
+    def test_reads_effort_and_budget_from_repo_settings(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "settings.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"effortLevel": "xhigh", "env": {"MAX_THINKING_TOKENS": "31999"}}, f)
+            self.assertEqual(o.repo_thinking_settings(p), ("xhigh", "31999"))
+
+    def test_live_repo_settings_are_ultrathink(self):
+        """Боевой файл репо — не абстракция: доктрина должна лежать именно в нём."""
+        eff, mtt = o.repo_thinking_settings(o.REPO_SETTINGS)
+        self.assertEqual(eff, "xhigh")
+        self.assertTrue(int(mtt) >= 31999, mtt)
+
+    def test_broken_or_missing_settings_fall_back_to_doctrine(self):
+        with tempfile.TemporaryDirectory() as d:
+            missing = os.path.join(d, "нет.json")
+            self.assertEqual(o.repo_thinking_settings(missing), (o.DEFAULT_EFFORT, o.DEFAULT_MTT))
+            broken = os.path.join(d, "battle.json")
+            with open(broken, "w", encoding="utf-8") as f:
+                f.write("{ это не json")
+            self.assertEqual(o.repo_thinking_settings(broken), (o.DEFAULT_EFFORT, o.DEFAULT_MTT))
+
+    def test_thinker_command_carries_effort_and_budget(self):
+        captured = {}
+
+        class _P:
+            returncode = 0
+            stdout = '{"result":"ok"}'
+            stderr = ""
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            captured["env"] = kw.get("env") or {}
+            return _P()
+
+        with mock.patch.object(o, "resolve_claude", return_value=r"C:\x\claude.exe"), \
+             mock.patch.object(o, "_claude_budget_gate", return_value=(True, "")), \
+             mock.patch.object(o.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(o._thinker_exec("думай", 30, "тест"), "ok")
+        cmd = captured["cmd"]
+        self.assertIn("--effort", cmd)
+        self.assertEqual(cmd[cmd.index("--effort") + 1], "xhigh")
+        self.assertEqual(captured["env"].get("MAX_THINKING_TOKENS"), "31999")
+        self.assertNotIn("ANTHROPIC_API_KEY", captured["env"])   # регресс: подписка, не платный ключ
 
 
 class TestClientWatchdog(unittest.TestCase):

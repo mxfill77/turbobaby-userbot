@@ -52,11 +52,19 @@ log = logging.getLogger("rc_supervisor")
 log.setLevel(logging.INFO)
 log.propagate = False
 try:
-    _h = logging.FileHandler(LOG_PATH, encoding="utf-8")
-    _h.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
-    log.addHandler(_h)
+    # Ротация обязательна: супервизор пишет строку на КАЖДЫЙ круг вечного цикла (живой замер —
+    # ~4 строки в минуту при заблокированном канале), без ротации файл растёт до бесконечности.
+    import log_setup
+    _h = log_setup.rotating_handler(LOG_PATH)
+    if _h is not None:
+        log.addHandler(_h)
 except Exception:
-    pass
+    try:
+        _h = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        _h.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+        log.addHandler(_h)
+    except Exception:
+        pass
 
 
 def _ver_key(name):

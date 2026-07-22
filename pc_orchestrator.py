@@ -154,8 +154,16 @@ MARKER_TOKEN_ENV = "PRETOOL_MARKER_TOKEN"   # env: токен нашего за�
 MARKER_SEP = "\x1f"                          # демон принимает ТОЛЬКО карточки со своим токеном (fix ghost:
 #   subprocess-тесты гарда наследовали боевой маркер и писали фикстурные карточки — «призрак PID 1»).
 
-logging.basicConfig(filename=LOG_PATH, level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s")
+_ORCH_FMT = "%(asctime)s %(levelname)s %(message)s"
+try:
+    import log_setup                       # ротация + тестовый лог в temp (см. log_setup)
+    _orch_h = log_setup.rotating_handler(LOG_PATH, fmt=_ORCH_FMT)
+except Exception:
+    _orch_h = None
+if _orch_h is not None:
+    logging.basicConfig(level=logging.INFO, handlers=[_orch_h])
+else:
+    logging.basicConfig(filename=LOG_PATH, level=logging.INFO, format=_ORCH_FMT)
 log = logging.getLogger("pc_orchestrator")
 
 BRIDGE_URL = os.getenv("BRIDGE_URL", "").strip()
@@ -473,18 +481,21 @@ def _claude_base_dirs():
     return out
 
 
-def _resolve_claude_once():
-    """Один проход по всем местам (без ретраев). → путь | None. Порядок:
-      1) PATH-шим: shutil.which('claude') — учитывает PATHEXT (claude.cmd/.exe/.bat);
-      2) CLAUDE_BIN из .env — только если файл реально существует;
-      3) НОВЕЙШАЯ версия claude-code по всем базам (вкл. реальную MSIX-Packages — фикс «не найден в бою»);
-      4) явные кандидаты других схем установки (_claude_candidates)."""
-    w = shutil.which("claude")                       # 1) PATH-шим (.cmd/.exe через PATHEXT)
-    if w and os.path.isfile(w):
-        return w
-    if CLAUDE_BIN and os.path.isabs(CLAUDE_BIN) and os.path.isfile(CLAUDE_BIN):  # 2) .env, если жив
-        return CLAUDE_BIN
-    try:                                             # 3) новейшая версионная установка (все базы)
+_RE_VER_DIR = re.compile(r"^\d+(?:\.\d+)+$")
+
+
+def _pinned_version(path):
+    """Версия ВЕРСИОННОЙ установки по пути (…/claude-code/2.1.217/claude.exe → (2,1,217)).
+    Путь иной схемы (native-инсталлер, npm-шим, ручная копия) → None: такой пин трогать нельзя."""
+    parent = os.path.basename(os.path.dirname(path or ""))
+    return _ver_key(parent) if _RE_VER_DIR.match(parent or "") else None
+
+
+def _newest_versioned():
+    """(ключ_версии, путь) новейшей версионной установки по всем базам, или None.
+    «Новейшая» — по ЧИСЛОВОМУ ключу: mtime каталога врёт (живой факт 22.07 — у 2.1.215 и 2.1.217
+    совпал LastWriteTime, и выбор «по времени» отдавал СТАРУЮ)."""
+    try:
         cands = []
         for base in _claude_base_dirs():
             for d in glob.glob(os.path.join(base, "*")):
@@ -493,9 +504,39 @@ def _resolve_claude_once():
                     cands.append((_ver_key(os.path.basename(d)), exe))
         if cands:
             cands.sort()
-            return cands[-1][1]
+            return cands[-1]
     except Exception:
         pass
+    return None
+
+
+def _resolve_claude_once():
+    """Один проход по всем местам (без ретраев). → путь | None. Порядок:
+      1) PATH-шим: shutil.which('claude') — учитывает PATHEXT (claude.cmd/.exe/.bat);
+      2) CLAUDE_BIN из .env — только если файл реально существует И не отстал от автообновления;
+      3) НОВЕЙШАЯ версия claude-code по всем базам (вкл. реальную MSIX-Packages — фикс «не найден в бою»);
+      4) явные кандидаты других схем установки (_claude_candidates).
+
+    ПИН ВЕРСИИ — ПОЛ, А НЕ ПОТОЛОК. CLAUDE_BIN в .env указывает на конкретную версию и протухает
+    на каждом автообновлении CLI. Мёртвый путь мы и раньше пропускали (os.path.isfile), но
+    ЖИВОЙ, НО СТАРЫЙ пин молча побеждал новейшую установку — проверено живьём: при
+    CLAUDE_BIN=…\\2.1.215\\claude.exe резолвер отдавал 2.1.215, хотя рядом стояла 2.1.217.
+    Поэтому версионный пин уступает более новой версии. Пин ИНОЙ схемы (не …/<версия>/claude.exe)
+    уважаем как есть — это осознанный выбор пути, а не отставшая версия. Осознанно замереть на
+    старой версии можно рубильником CLAUDE_BIN_STRICT=1."""
+    w = shutil.which("claude")                       # 1) PATH-шим (.cmd/.exe через PATHEXT)
+    if w and os.path.isfile(w):
+        return w
+    newest = _newest_versioned()                     # 3) считаем заранее: нужен для сверки с пином
+    if CLAUDE_BIN and os.path.isabs(CLAUDE_BIN) and os.path.isfile(CLAUDE_BIN):  # 2) .env, если жив
+        strict = (os.getenv("CLAUDE_BIN_STRICT", "") or "").strip() not in ("", "0")
+        pv = _pinned_version(CLAUDE_BIN)
+        if strict or pv is None or newest is None or newest[0] <= pv:
+            return CLAUDE_BIN
+        log.info("CLAUDE_BIN(%s) отстал от автообновления — беру %s", CLAUDE_BIN, newest[1])
+        return newest[1]
+    if newest:
+        return newest[1]
     for c in _claude_candidates():                   # 4) другие схемы установки
         if os.path.isfile(c):
             return c
@@ -1676,6 +1717,33 @@ def _parse_thinker_json(text, fix_key="fixed_task"):
             "reason": str(d.get("reason") or "").strip()}
 
 
+REPO_SETTINGS = os.path.join(REPO, ".claude", "settings.json")
+DEFAULT_EFFORT = "xhigh"
+DEFAULT_MTT = "31999"
+_thinking_cache = None
+
+
+def repo_thinking_settings(path=None):
+    """(effortLevel, MAX_THINKING_TOKENS) из .claude/settings.json — ЕДИНСТВЕННОГО источника
+    правды по глубине мышления. Нужны путям, которые сам settings.json НЕ читают: думатель
+    крутится в нейтральном cwd (tempdir), чтобы не тянуть hooks/pretool_guard репо, — но вместе
+    с ними теряет и effortLevel. Файл не прочитан/битый → доктринальные дефолты репо."""
+    global _thinking_cache
+    if path is None and _thinking_cache is not None:
+        return _thinking_cache
+    eff, mtt = DEFAULT_EFFORT, DEFAULT_MTT
+    try:
+        with open(path or REPO_SETTINGS, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        eff = str(j.get("effortLevel") or eff).strip() or DEFAULT_EFFORT
+        mtt = str((j.get("env") or {}).get("MAX_THINKING_TOKENS") or mtt).strip() or DEFAULT_MTT
+    except Exception:
+        pass
+    if path is None:
+        _thinking_cache = (eff, mtt)
+    return eff, mtt
+
+
 def _thinker_exec(prompt, timeout, tag):
     """Думатель = ПЕРЕИСПОЛЬЗОВАННЫЙ кондуктор Fable5→fallback (--fallback-model одним вызовом CLI),
     но ЧИСТЫЙ генератор: --max-turns 1 (один ответ, без инструментального цикла) + --allowed-tools ''
@@ -1699,7 +1767,14 @@ def _thinker_exec(prompt, timeout, tag):
     env.pop("ANTHROPIC_API_KEY", None)          # идём по ~/.claude (подписка), не по платному ключу
     env.pop("OPENAI_API_KEY", None)
     env["PYTHONIOENCODING"] = "utf-8"
-    cmd = [cbin, "-p", prompt, "--model", THINKER_MODEL,
+    # Глубина размышления ЯВНО. Нейтральный cwd (tempdir) — сознательное решение выше: он
+    # отсекает hooks/pretool_guard репо. Но вместе с ними отсекается и `effortLevel` из
+    # .claude/settings.json, и думатель молча уходил на дефолт CLI — при доктрине «каждая
+    # задача ultrathink» это тихая деградация ровно там, где рассуждение и нужно. Значения
+    # берём из ТОГО ЖЕ settings.json (единственный источник правды), а не дублируем константой.
+    eff, mtt = repo_thinking_settings()
+    env["MAX_THINKING_TOKENS"] = mtt
+    cmd = [cbin, "-p", prompt, "--model", THINKER_MODEL, "--effort", eff,
            "--output-format", "json", "--max-turns", "1", "--allowed-tools", ""]
     if THINKER_FALLBACK:                         # кондуктор: фолбэк исполняет сам CLI в этом же вызове
         cmd += ["--fallback-model", THINKER_FALLBACK]
