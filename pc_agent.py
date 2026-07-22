@@ -51,6 +51,11 @@ from telegram.ext import (ApplicationBuilder, MessageHandler, CallbackQueryHandl
 
 import selfupdate_gate  # гейт самообновления (проверка нового кода перед рестартом)
 
+# Скрытый запуск служебных консольных подпроцессов (powershell/tasklist/taskkill/git/боты):
+# без флага каждый console-ребёнок создавал новое окно → «мигающие чёрные окна» (инцидент-каскад
+# 22.07, тот же класс, что NO_WINDOW в pc_orchestrator). POSIX → 0.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 # --- пути (всё относительно этого файла = D:\turbobaby-bot) ---
 REPO_DIR = Path(__file__).resolve().parent
 VENV_PY = REPO_DIR / "venv" / "Scripts" / "python.exe"
@@ -128,7 +133,7 @@ def _find_userbot_pids():
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW,
         )
         return [int(x) for x in out.stdout.split() if x.strip().isdigit()]
     except Exception as e:
@@ -141,7 +146,7 @@ def _taskkill(pid):
     try:
         r = subprocess.run(
             ["taskkill", "/PID", str(pid), "/F", "/T"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=15, creationflags=NO_WINDOW,
         )
         return r.returncode == 0
     except Exception as e:
@@ -178,7 +183,8 @@ class UserbotProcess:
         # ФИКС 1 (#128): stdout+stderr ребёнка → logs/userbot_stderr.log (смерть оставит traceback).
         logf = _child_log_handle("userbot")
         self.proc = subprocess.Popen([str(VENV_PY), str(LISTEN_SCRIPT)], cwd=str(REPO_DIR),
-                                     stdout=logf, stderr=subprocess.STDOUT)
+                                     stdout=logf, stderr=subprocess.STDOUT,
+                                     creationflags=NO_WINDOW)
         alog.info(f"userbot запущен агентом, PID {self.proc.pid}")
 
         # 2) Подстраховка от гонки: подождём и перепроверим. Если экземпляров >1 —
@@ -249,7 +255,7 @@ class UserbotProcess:
         try:
             pull = subprocess.run(
                 ["git", "-C", str(REPO_DIR), "pull"],
-                capture_output=True, text=True, timeout=120,
+                capture_output=True, text=True, timeout=120, creationflags=NO_WINDOW,
             )
             pull_out = (pull.stdout + pull.stderr).strip() or "(git pull: пустой вывод)"
         except Exception as e:
@@ -273,7 +279,7 @@ def _find_moderbot_pids():
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW,
         )
         return [int(x) for x in out.stdout.split() if x.strip().isdigit()]
     except Exception as e:
@@ -308,7 +314,8 @@ class ModerbotProcess:
         # ФИКС 1 (#128): stdout+stderr ребёнка → logs/moderbot_stderr.log (смерть оставит traceback).
         logf = _child_log_handle("moderbot")
         self.proc = subprocess.Popen([str(VENV_PY), str(MODERBOT_SCRIPT)], cwd=str(REPO_DIR),
-                                     stdout=logf, stderr=subprocess.STDOUT)
+                                     stdout=logf, stderr=subprocess.STDOUT,
+                                     creationflags=NO_WINDOW)
         alog.info(f"moderation_bot запущен агентом, PID {self.proc.pid}")
         time.sleep(2.0)
         pids = _find_moderbot_pids()
@@ -471,7 +478,7 @@ def _git_pull():
     try:
         r = subprocess.run(
             ["git", "-C", str(REPO_DIR), "pull", "--ff-only"],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=120, creationflags=NO_WINDOW,
         )
         out = (r.stdout + r.stderr).strip() or "(пустой вывод)"
         return (r.returncode == 0), out
@@ -596,6 +603,7 @@ def _chain_cli(action, pid):
         r = subprocess.run(
             [str(VENV_PY), str(REPO_DIR / "pc_orchestrator.py"), f"--chain-{action}", str(pid)],
             capture_output=True, text=True, timeout=90, cwd=str(REPO_DIR),
+            creationflags=NO_WINDOW,
         )
         out = (r.stdout or "").strip() or (r.stderr or "").strip()
         return out or f"цепь #{pid}: пустой ответ демона ({action})."
@@ -771,7 +779,7 @@ def _agent_pid_alive(pid: int) -> bool:
     try:
         out = subprocess.run(
             ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, creationflags=NO_WINDOW,
         )
         return f'"{pid}"' in out.stdout or f",{pid}," in out.stdout
     except Exception:

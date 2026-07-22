@@ -13,6 +13,10 @@ selfupdate_gate.py — гейт самообновления pc_agent.
 
 import subprocess
 
+# Скрытый запуск подпроцессов гейта (py_compile/import-smoke): без флага каждый console-ребёнок
+# создавал новое окно — «мигающие чёрные окна» (инцидент-каскад 22.07). POSIX → 0.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def code_gate(py_exe, cwd, compile_files, import_smoke, timeout=60):
     """Проверить здоровье кода перед самоперезапуском. Возвращает (ok: bool, msg: str).
@@ -24,6 +28,7 @@ def code_gate(py_exe, cwd, compile_files, import_smoke, timeout=60):
         r = subprocess.run(
             [str(py_exe), "-m", "py_compile", *[str(f) for f in compile_files]],
             cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
+            creationflags=NO_WINDOW,
         )
         if r.returncode != 0:
             return False, "py_compile: " + ((r.stderr or r.stdout).strip()[:500] or "ошибка компиляции")
@@ -34,6 +39,7 @@ def code_gate(py_exe, cwd, compile_files, import_smoke, timeout=60):
         r = subprocess.run(
             [str(py_exe), "-c", f"import {import_smoke}"],
             cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
+            creationflags=NO_WINDOW,
         )
         if r.returncode != 0:
             return False, "import-smoke: " + ((r.stderr or r.stdout).strip()[:500] or "ошибка импорта")

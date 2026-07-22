@@ -114,6 +114,15 @@ MANUAL_MARK = "✋"        # маркер «headless доказанно не м�
                          # зеркало ручной карты VPS «✋ ТРЕБУЕТСЯ РУЧНОЕ ДЕЙСТВИЕ»: думатель НЕ чинит
                          # (переформулировка родила бы петлю ре-аппрувов), цепь = halt
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")   # ФОЛБЭК: явный путь из .env (может протухнуть при автообновлении)
+# Скрытый запуск ВСЕХ служебных консольных подпроцессов (git/powershell/schtasks/tasklist/
+# unittest/claude/дочерние python): без этого флага каждый console-ребёнок демона создавал
+# НОВОЕ окно → «мигающие чёрные окна» на ПК владельца (инцидент-каскад 22.07). POSIX → 0.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# Бюджет процессов claude на ПК (зеркало VPS oom2 1520c68): ПЕРЕД спавном headless claude -p
+# считаем ЖИВЫЕ CLI-процессы claude.exe; лимит достигнут → ждём слот, не дождались → отказ,
+# 3 отказа подряд → карточка владельцу (инцидент 22.07: 18×claude.exe, ПК тормозит).
+MAX_CLAUDE_PROCS = int(os.getenv("PC_MAX_CLAUDE_PROCS", "2") or "2")
+CLAUDE_BUDGET_WAIT_SEC = int(os.getenv("PC_CLAUDE_BUDGET_WAIT_SEC", "60") or "60")
 # Базовая папка версионных установок claude-code (AppData\Roaming\Claude\claude-code\<версия>\claude.exe).
 # Резолвим НОВЕЙШУЮ установку сами → путь переживает автообновление, даже когда .env-путь протух (WinError 2).
 _CLAUDE_BASE = os.path.join(os.getenv("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming"),
@@ -228,7 +237,8 @@ def _cowork(line):
     """Строка-итог в cowork_log через скрипт (fire-and-forget)."""
     try:
         subprocess.Popen([VENV_PY, os.path.join(REPO, "cowork_log_append.py"), "NOTE Orchestrator: " + line],
-                         cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+                         cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         creationflags=NO_WINDOW)
     except Exception as e:
         log.warning("cowork_log не записан: %s", e)
 
@@ -237,7 +247,8 @@ def _notify(text):
     """Пуш Филиппу через dispatch_notify (fire-and-forget, человекочитаемо)."""
     try:
         subprocess.Popen([VENV_PY, DNOTIFY, text], cwd=REPO,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         creationflags=NO_WINDOW)
     except Exception as e:
         log.warning("пуш не отправлен: %s", e)
 
@@ -305,7 +316,7 @@ def _notify_chain_card(pid, text, state_path=None, spawn=None):
         else:
             subprocess.Popen([VENV_PY, DNOTIFY, "--card", str(pid), str(text)], cwd=REPO,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             stdin=subprocess.DEVNULL)
+                             stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
     except Exception as e:
         log.warning("карточка цепи не отправлена (pid=%s): %s", pid, e)
         return False
@@ -322,7 +333,8 @@ def _notify_critical(text):
     инциденты (не рутинные done/failed задач — те видны в темах постановки 328/829, см. _notify_task)."""
     try:
         subprocess.Popen([VENV_PY, DNOTIFY, "--critical", text], cwd=REPO,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         creationflags=NO_WINDOW)
     except Exception as e:
         log.warning("критический пуш не отправлен: %s", e)
 
@@ -508,10 +520,76 @@ def run_claude(prompt, timeout, cwd, env):
         # (cp1251) → кириллица в карточках 829 превращалась в кракозябры. replace → не падаем на
         # неведомом байте, а подставляем �. PYTHONIOENCODING=utf-8 ребёнку выставлен в run_task().
         p = subprocess.run([cbin, "-p", prompt], cwd=cwd, capture_output=True,
-                           encoding="utf-8", errors="replace", timeout=timeout, env=env)
+                           encoding="utf-8", errors="replace", timeout=timeout, env=env,
+                           creationflags=NO_WINDOW)
         return p.returncode, (p.stdout or ""), (p.stderr or "")
     except subprocess.TimeoutExpired:
         raise TimeoutError("claude -p timeout")
+
+
+# --- бюджет процессов claude (зеркало VPS oom2 1520c68; инцидент-каскад 22.07) ---------------
+# 22.07 владелец увидел 18×claude.exe (ПК тормозит): накопились агент-процессы старых сессий
+# Claude Desktop. Демон каскад НЕ плодил (у всех PPID = Electron-app), но класс закрываем и
+# здесь: ЛЮБОЙ наш спавн headless claude (run_task, думатель) сперва проверяет бюджет живых
+# CLI-процессов claude.exe. Fail-open при недоступном счёте: бюджет — гард от каскада, а не
+# жёсткий замок; битый CIM (класс #171) не смеет остановить работу демона.
+
+_claude_budget_denials = 0     # отказов бюджета ПОДРЯД (успешный проход сбрасывает)
+
+
+def _count_claude_procs(runner=None):
+    """Число ЖИВЫХ CLI-процессов claude.exe (claude-code): headless-дети демона + агент-сессии
+    Claude Desktop. Electron-процессы самого приложения (--type=…) НЕ считаем — это UI владельца,
+    постоянный фон ~10 шт. → int | None (powershell/CIM не смог — счёт неизвестен, fail-open)."""
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | "
+          "Where-Object { $_.CommandLine -match 'claude-code' "
+          "-and $_.CommandLine -notmatch '--type=' } | "
+          "Measure-Object | Select-Object -ExpandProperty Count")
+    try:
+        p = (runner or subprocess.run)(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW)
+    except Exception as e:
+        log.warning("бюджет claude: счёт процессов не удался (%s) — fail-open", e)
+        return None
+    out = (p.stdout or "").strip()
+    if p.returncode != 0 or not out.isdigit():
+        return None
+    return int(out)
+
+
+def _claude_budget_gate(counter=None, sleeper=None, notifier=None, wait_sec=None, poll_sec=5):
+    """Гейт бюджета ПЕРЕД спавном headless claude: живых CLI-claude ≥ MAX_CLAUDE_PROCS → ждём
+    слот до wait_sec (кто-то завершится), не дождались → отказ. 3 отказа ПОДРЯД → карточка
+    владельцу (на ПК копятся claude.exe — каскад как 22.07, нужен разбор) и счётчик заново
+    (карточку не спамим каждый отказ). Счёт недоступен (CIM boom) → fail-open.
+    → (ok: bool, detail: str). counter/sleeper/notifier — инъекция для тестов."""
+    global _claude_budget_denials
+    count = (counter or _count_claude_procs)()
+    if count is None or count < MAX_CLAUDE_PROCS:
+        _claude_budget_denials = 0
+        return True, f"живых claude: {'?' if count is None else count}/{MAX_CLAUDE_PROCS}"
+    wait_sec = CLAUDE_BUDGET_WAIT_SEC if wait_sec is None else wait_sec
+    _sleep = sleeper or time.sleep
+    slept = 0
+    while slept < wait_sec:
+        _sleep(poll_sec)
+        slept += poll_sec
+        count = (counter or _count_claude_procs)()
+        if count is None or count < MAX_CLAUDE_PROCS:
+            _claude_budget_denials = 0
+            return True, f"дождались слота через {slept}s (живых: {'?' if count is None else count})"
+    _claude_budget_denials += 1
+    detail = (f"живых claude {count} ≥ лимит {MAX_CLAUDE_PROCS}, слот не освободился за "
+              f"{wait_sec}s (отказ №{_claude_budget_denials} подряд)")
+    log.error("бюджет claude: %s", detail)
+    if _claude_budget_denials >= 3:
+        (notifier or _notify_critical)(
+            f"⚠️ Бюджет claude-процессов ПК: {_claude_budget_denials} отказов подряд — живых "
+            f"claude.exe {count} ≥ лимит {MAX_CLAUDE_PROCS}. Возможен каскад процессов "
+            "(как 18×claude.exe 22.07) — нужен разбор/чистка на ПК.")
+        _claude_budget_denials = 0
+    return False, detail
 
 
 def run_task(tid, text, note=""):
@@ -528,6 +606,11 @@ def run_task(tid, text, note=""):
                "Проверь установку/автообновление claude-code.")
         log.error("id=%s НЕ НАЙДЕН claude: %s", tid, msg)
         return "failed", msg
+    ok_budget, budget_detail = _claude_budget_gate()   # бюджет процессов claude ПЕРЕД спавном (1520c68)
+    if not ok_budget:
+        log.error("id=%s бюджет claude исчерпан: %s — headless НЕ запущен", tid, budget_detail)
+        return "failed", (f"бюджет claude-процессов исчерпан ({budget_detail}) — headless не "
+                          "запущен; задача уйдёт обычным путём ретрая")
     run_token = f"{os.getpid()}-{int(time.time() * 1000)}-{tid}"   # контекст запуска: pid+ts+tid
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)          # headless идёт по ~/.claude (подписка), не платный API
@@ -1266,7 +1349,7 @@ def _git_out(args):
     """git в REPO → stdout.strip() | None (тихо: git недоступен/ошибка — self-update просто молчит)."""
     try:
         p = subprocess.run(["git"] + args, cwd=REPO, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=15)
+                           encoding="utf-8", errors="replace", timeout=15, creationflags=NO_WINDOW)
         return p.stdout.strip() if p.returncode == 0 else None
     except Exception:
         return None
@@ -1279,7 +1362,7 @@ def _git_call(args, timeout=90):
     ответ ТОЛЬКО кодом возврата). timeout щедрый — fetch ходит в сеть."""
     try:
         p = subprocess.run(["git"] + args, cwd=REPO, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout)
+                           encoding="utf-8", errors="replace", timeout=timeout, creationflags=NO_WINDOW)
         return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
     except Exception:
         return None
@@ -1312,7 +1395,7 @@ def _gate_unittests():
             env.pop(k, None)                     # подпроцесс перечитает их из .env (load_dotenv)
         p = subprocess.run([VENV_PY, "-m", "unittest", "test_pc_orchestrator", "test_pc_local_dec"], cwd=REPO,
                            capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           timeout=600, env=env)
+                           timeout=600, env=env, creationflags=NO_WINDOW)
         return p.returncode == 0, _tail((p.stderr or "") + (p.stdout or ""), 400)
     except Exception as e:
         return False, f"unittest-гейт не запустился: {e}"
@@ -1323,7 +1406,8 @@ def _spawn_daemon():
     Передаём PC_ORCH_SUPERSEDE_PID=<свой PID>: новый в acquire_singleton дождётся смерти старого
     (нас) прежде чем забрать лок — эстафета без перекрытия (разбор #128, часть 4)."""
     try:
-        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | NO_WINDOW)
         env = dict(os.environ)
         env[SUPERSEDE_ENV] = str(os.getpid())
         subprocess.Popen([VENV_PY, os.path.join(REPO, "pc_orchestrator.py")], cwd=REPO,
@@ -1515,6 +1599,13 @@ def _thinker_exec(prompt, timeout, tag):
     if not cbin:
         log.warning("%s: claude не найден — думатель недоступен (fail-safe)", tag)
         return None
+    # Бюджет процессов claude и для думателя (1520c68), но БЕЗ ожидания (wait_sec=0):
+    # думатель живёт внутри тика демона — блокировать тик минуту нельзя, лимит занят → fail-safe
+    # None (upstream отдаст прежний голый failed, это штатно).
+    ok_budget, budget_detail = _claude_budget_gate(wait_sec=0)
+    if not ok_budget:
+        log.warning("%s: бюджет claude исчерпан (%s) — думатель пропущен (fail-safe)", tag, budget_detail)
+        return None
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)          # идём по ~/.claude (подписка), не по платному ключу
     env.pop("OPENAI_API_KEY", None)
@@ -1525,7 +1616,8 @@ def _thinker_exec(prompt, timeout, tag):
         cmd += ["--fallback-model", THINKER_FALLBACK]
     try:
         p = subprocess.run(cmd, cwd=tempfile.gettempdir(), capture_output=True,
-                           encoding="utf-8", errors="replace", timeout=timeout, env=env)
+                           encoding="utf-8", errors="replace", timeout=timeout, env=env,
+                           creationflags=NO_WINDOW)
     except Exception as e:
         log.warning("%s: думатель не отработал (%s) — fail-safe", tag, e)
         return None
@@ -2771,7 +2863,7 @@ def _gate_test_modules(mods):
     try:
         p = subprocess.run([VENV_PY, "-m", "unittest", *mods], cwd=REPO,
                            capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           timeout=600)
+                           timeout=600, creationflags=NO_WINDOW)
         return p.returncode == 0, _tail((p.stderr or "") + (p.stdout or ""), 400)
     except Exception as e:
         return False, f"unittest-гейт не запустился: {e}"
@@ -3197,7 +3289,7 @@ def _find_pids_by_script(script_name):
           "| Select-Object -ExpandProperty ProcessId")
     try:
         p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW)
     except Exception as e:
         log.warning("контур-вотчдог: CIM-поиск %s не удался (%s) — исход НЕИЗВЕСТЕН, НЕ считаем мёртвым", script_name, e)
         return None
@@ -4212,7 +4304,7 @@ def _lock_pid_alive(pid):
     """Жив ли процесс по PID (Windows, без psutil). Инъектируется в тестах."""
     try:
         r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10, creationflags=NO_WINDOW)
         return f'"{pid}"' in r.stdout or f",{pid}," in r.stdout
     except Exception:
         return False
@@ -4301,6 +4393,10 @@ def _main_loop():
     # чтобы факт включения/дефолта (0=полный прогон всех тестов) читался прямо из лога старта.
     log.info("=== ФЛАГИ ГЕЙТА: GATE_STEP_SELECTIVE=%s GATE_SINGLE_SELECTIVE=%s (селективный тест-гейт авто-применения; 0=полный прогон) ===",
              int(_gate_step_selective_on()), int(_gate_single_selective_on()))
+    # Бюджет headless-claude (зеркало VPS oom2 1520c68, инцидент-каскад 22.07) — в баннер,
+    # чтобы действующий лимит читался прямо из лога старта.
+    log.info("=== БЮДЖЕТ CLAUDE: MAX_CLAUDE_PROCS=%s (wait=%ss; счёт живых CLI-claude.exe перед спавном; 3 отказа подряд → карточка) ===",
+             MAX_CLAUDE_PROCS, CLAUDE_BUDGET_WAIT_SEC)
     if _stopped():
         log.info("рубильник pc_orchestrator.stop активен — не стартую поллинг")
         return
@@ -4349,7 +4445,8 @@ def _schtasks_run(task_name=TASK_NAME):
     """Запустить задачу Планировщика. Возврат (rc, output). Инъектируется в тестах."""
     try:
         p = subprocess.run(["schtasks", "/Run", "/TN", task_name], capture_output=True,
-                           encoding="utf-8", errors="replace", timeout=30)   # utf-8: русский вывод schtasks читаем в логе
+                           encoding="utf-8", errors="replace", timeout=30,   # utf-8: русский вывод schtasks читаем в логе
+                           creationflags=NO_WINDOW)
         return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
     except Exception as e:
         return -1, f"schtasks не запустился: {e}"
@@ -4379,7 +4476,7 @@ def _find_daemon_pids():
           "| Select-Object -ExpandProperty ProcessId")
     try:
         p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW)
     except Exception as e:
         log.warning("watchdog: CIM-поиск демона не удался (%s) — исход НЕИЗВЕСТЕН", e)
         return None

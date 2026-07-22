@@ -20,6 +20,7 @@ os.environ["LESSON_LLM_ROUTE"] = "0"   # боевой .env-рубильник н
                                        # ставим ДО импорта o: load_dotenv(override=False) не перепишет
 
 import pc_orchestrator as o           # noqa: E402
+import selfupdate_gate                # noqa: E402  (голден «гейт не спавнит claude»)
 
 
 def iso_ago(sec):
@@ -79,6 +80,11 @@ class Base(unittest.TestCase):
     def setUp(self):
         self._save = (o.bc, o.run_claude, o._notify, o._cowork, o._stopped, o._selfheal_on,
                       o._notify_chain_card, o._loc_mark_chain_final)
+        # бюджет claude (инцидент-каскад 22.07): в тестах НЕ считаем реальные процессы ПК
+        # (powershell/CIM) — гейт всегда открыт; сам гейт тестирует TestClaudeBudget отдельно
+        self._save_budget = o._claude_budget_gate
+        o._claude_budget_gate = lambda *a, **k: (True, "тест: бюджет пропущен")
+        self.addCleanup(lambda: setattr(o, "_claude_budget_gate", self._save_budget))
         self._save_lw = o.LESSON_WAIT_STATE       # ждущие low-уроки: боевой state-файл в тестах не читаем
         o.LESSON_WAIT_STATE = os.path.join(tempfile.mkdtemp(), "lesson_waits.json")
         self.addCleanup(lambda: setattr(o, "LESSON_WAIT_STATE", self._save_lw))
@@ -5094,6 +5100,153 @@ class TestLessonUrokChannel(Base):
         self.assertTrue(cards and "нужен код-фикс" in cards[0].lower())   # карточка владельцу
         self.assertIn("Готовый текст задачи", cards[0])                   # + готовый текст задачи (копипаст)
         self.assertTrue(any("урок #" in c for c in self.cows))           # журнал уроков
+
+
+class TestClaudeBudget(unittest.TestCase):
+    """Бюджет процессов claude (зеркало VPS oom2 1520c68; инцидент-каскад 22.07: 18×claude.exe).
+    Всё замокано: counter/sleeper/notifier инъектируются, реальные процессы/CIM не трогаем."""
+
+    def setUp(self):
+        o._claude_budget_denials = 0
+        self.addCleanup(setattr, o, "_claude_budget_denials", 0)
+
+    def test_budget_free_allows(self):
+        ok, detail = o._claude_budget_gate(counter=lambda: 1, sleeper=lambda s: None)
+        self.assertTrue(ok)
+        self.assertIn(f"1/{o.MAX_CLAUDE_PROCS}", detail)
+        self.assertEqual(o._claude_budget_denials, 0)
+
+    def test_budget_full_waits_then_allows(self):
+        # лимит занят, на втором опросе слот освободился → ok (спали, но дождались)
+        seq = iter([o.MAX_CLAUDE_PROCS, o.MAX_CLAUDE_PROCS, o.MAX_CLAUDE_PROCS - 1])
+        slept = []
+        ok, detail = o._claude_budget_gate(counter=lambda: next(seq),
+                                           sleeper=slept.append, wait_sec=60)
+        self.assertTrue(ok)
+        self.assertTrue(slept)                              # ждали, не мгновенно
+        self.assertEqual(o._claude_budget_denials, 0)       # успех сбрасывает отказы
+
+    def test_budget_full_denies_after_wait(self):
+        ok, detail = o._claude_budget_gate(counter=lambda: o.MAX_CLAUDE_PROCS + 3,
+                                           sleeper=lambda s: None, wait_sec=10)
+        self.assertFalse(ok)
+        self.assertEqual(o._claude_budget_denials, 1)
+        self.assertIn("лимит", detail)
+
+    def test_three_denials_send_card_and_reset(self):
+        cards = []
+        for i in range(3):
+            ok, _ = o._claude_budget_gate(counter=lambda: 99, sleeper=lambda s: None,
+                                          notifier=cards.append, wait_sec=0)
+            self.assertFalse(ok)
+        self.assertEqual(len(cards), 1)                     # карточка ровно одна — на 3-м отказе
+        self.assertIn("каскад", cards[0])
+        self.assertEqual(o._claude_budget_denials, 0)       # после карточки счётчик заново
+
+    def test_fail_open_when_count_unavailable(self):
+        # CIM/powershell не смог (None) → fail-open: бюджет не смеет остановить демон
+        ok, detail = o._claude_budget_gate(counter=lambda: None, sleeper=lambda s: None)
+        self.assertTrue(ok)
+        self.assertIn("?", detail)
+
+    def test_count_parses_digit_and_fails_open_on_junk(self):
+        class _P:
+            def __init__(self, rc, out): self.returncode, self.stdout = rc, out
+        self.assertEqual(o._count_claude_procs(runner=lambda *a, **k: _P(0, "3\n")), 3)
+        self.assertIsNone(o._count_claude_procs(runner=lambda *a, **k: _P(0, "мусор")))
+        self.assertIsNone(o._count_claude_procs(runner=lambda *a, **k: _P(1, "5")))
+        def boom(*a, **k):
+            raise RuntimeError("CIM boom")
+        self.assertIsNone(o._count_claude_procs(runner=boom))
+
+    def test_run_task_budget_denied_no_spawn(self):
+        # бюджет исчерпан → run_task возвращает failed И headless claude НЕ спавнится
+        spawned = []
+        def spy_claude(prompt, timeout, cwd, env):
+            spawned.append(prompt)
+            return (0, "RESULT: не должно случиться", "")
+        saved = (o.run_claude, o._claude_budget_gate)
+        o.run_claude = spy_claude
+        o._claude_budget_gate = lambda *a, **k: (False, "лимит 2 занят (тест)")
+        try:
+            with mock.patch.object(o, "resolve_claude", lambda: sys.executable):
+                status, result = o.run_task(1, "тз: что-нибудь")
+        finally:
+            o.run_claude, o._claude_budget_gate = saved
+        self.assertEqual(status, "failed")
+        self.assertIn("бюджет claude", result)
+        self.assertEqual(spawned, [])                       # спавна НЕ было
+
+    def test_thinker_budget_denied_failsafe_none(self):
+        # думатель при занятом бюджете → None (fail-safe), без ожидания и без спавна
+        ran = []
+        def spy_run(*a, **k):
+            ran.append(a)
+            raise AssertionError("думатель не должен спавнить при занятом бюджете")
+        saved = o._claude_budget_gate
+        o._claude_budget_gate = lambda *a, **k: (False, "лимит (тест)")
+        try:
+            with mock.patch.object(o, "resolve_claude", lambda: sys.executable), \
+                    mock.patch.object(o.subprocess, "run", spy_run):
+                self.assertIsNone(o._thinker_exec("p", 5, "t"))
+        finally:
+            o._claude_budget_gate = saved
+        self.assertEqual(ran, [])
+
+
+class TestGateSpawnsNoClaude(unittest.TestCase):
+    """ГОЛДЕН класса-каскада (22.07, зеркало VPS fixture-guard 6e7e726): прогон ГЕЙТОВ демона
+    не порождает НИ ОДНОГО процесса claude. Перехватываем subprocess.run целиком и проверяем
+    argv каждого спавна: гейт затронутых тестов зовёт ТОЛЬКО venv-python -m unittest, гейт
+    self-update — только python -m py_compile / -c import; строки 'claude' нет нигде.
+    Заодно фиксируем NO_WINDOW: служебный спавн идёт скрыто (мигающие чёрные окна 22.07)."""
+
+    class _P:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def test_test_gate_spawns_only_unittest_no_claude(self):
+        seen = []
+        def spy(cmd, **kw):
+            seen.append((list(cmd), kw))
+            return self._P()
+        with mock.patch.object(o.subprocess, "run", spy):
+            ok, _ = o._gate_test_modules(["test_delivery"])
+        self.assertTrue(ok)
+        self.assertEqual(len(seen), 1)                       # ровно один спавн
+        cmd, kw = seen[0]
+        self.assertEqual(cmd[:3], [o.VENV_PY, "-m", "unittest"])   # и это unittest, не claude
+        for c in cmd:
+            self.assertNotIn("claude", str(c).lower())
+        self.assertEqual(kw.get("creationflags"), o.NO_WINDOW)     # скрытый запуск (окна не мигают)
+
+    def test_selfupdate_unittest_gate_no_claude(self):
+        seen = []
+        def spy(cmd, **kw):
+            seen.append((list(cmd), kw))
+            return self._P()
+        with mock.patch.object(o.subprocess, "run", spy):
+            ok, _ = o._gate_unittests()
+        self.assertTrue(ok)
+        for cmd, kw in seen:
+            for c in cmd:
+                self.assertNotIn("claude", str(c).lower())
+            self.assertEqual(kw.get("creationflags"), o.NO_WINDOW)
+
+    def test_selfupdate_code_gate_spawns_only_python(self):
+        # selfupdate_gate.code_gate (py_compile + import-smoke) НА РЕАЛЬНЫХ подпроцессах:
+        # это python-спавны, claude в argv нет. Живой прогон — гейт остаётся рабочим, не только мок.
+        ok, msg = selfupdate_gate.code_gate(
+            sys.executable, o.REPO, ["gate_selective.py"], "gate_selective", timeout=60)
+        self.assertTrue(ok, msg)
+
+    def test_empty_mods_no_spawn_at_all(self):
+        def boom(*a, **k):
+            raise AssertionError("без затронутых тестов гейт не должен спавнить ничего")
+        with mock.patch.object(o.subprocess, "run", boom):
+            ok, msg = o._gate_test_modules([])
+        self.assertTrue(ok)
 
 
 if __name__ == "__main__":
