@@ -354,7 +354,10 @@ class TestPureLogic(unittest.TestCase):
 
     def test_generate_draft_uses_injected_llm(self):
         d = suggest.generate_draft("[клиент]: привет", "ru", "FAQ", call_llm=_fake_llm)
-        self.assertEqual(d, "DRAFT ответа клиенту")
+        # Текст LLM цел; хвостом КОД дописал завершающий вопрос (ТЕСТ-7: ответ обязан двигать
+        # клиента дальше, а не заканчиваться «в пустоту») — см. ensure_closing_question.
+        self.assertTrue(d.startswith("DRAFT ответа клиенту"))
+        self.assertEqual(d.count("?"), 1)
 
     def test_prompt_forbids_leaking_stage_context(self):
         # Класс-фикс: промпт явно запрещает начинать ответ с описания ситуации/этапа и
@@ -1729,7 +1732,7 @@ class TestCliLlm(unittest.TestCase):
              mock.patch.object(suggest, "_cli_llm", lambda s, u: calls.__setitem__("cli", calls["cli"] + 1) or "черновик"), \
              mock.patch.object(suggest, "_default_llm", lambda s, u: calls.__setitem__("api", 1) or "нет"):
             d = suggest.generate_draft("[клиент]: привет", "ru", "FAQ")
-        self.assertEqual(d, "черновик")
+        self.assertTrue(d.startswith("черновик"))                # текст CLI цел (+ завершающий вопрос)
         self.assertEqual((calls["cli"], calls["api"]), (1, 0))   # флаг ON → CLI, платный API не тронут
 
     def test_injected_call_llm_wins_over_flag(self):
@@ -4924,6 +4927,208 @@ class TestPastStartDateGate(unittest.TestCase):
             self.assertFalse(_has_thai_letters(pickup), f"тайские буквы в подаче ({lang})")
             self.assertFalse(_has_thai_letters(suggest._past_start_sheet_note(
                 datetime.date(2026, 7, 20), self.TODAY, lang)))
+
+
+class TestClosingQuestion(unittest.TestCase):
+    """ГОЛДЕНЫ ЗАВЕРШАЮЩЕГО ВОПРОСА (живой ТЕСТ-7 22.07.2026: бот назвал цену и доставку и ЗАМОЛЧАЛ —
+    паспорт/телефон/время и точка подачи не собраны). Методика взята из ЖИВЫХ успешных окон
+    client_chats.jsonl — см. docs/sales-method-2026-07-22.md: в корпусе 84% сообщений менеджера БЕЗ
+    вопроса, 14% — РОВНО ОДИН, два и более ≈0%. Порядок недостающего:
+      даты подтверждены → фото паспорта → телефон → время и точка подачи → подтверждение брони."""
+
+    TODAY = datetime.date(2026, 7, 22)          # «сегодня» ТЕСТ-7 (Пхукет)
+    FULL = {"model": True, "term": True, "dates": True, "geo": True,
+            "passport": True, "phone": True, "payment": True}
+
+    def _facts(self, **over):
+        f = dict(self.FULL)
+        f.update(over)
+        return f
+
+    # ---------------- ГОЛДЕН 1: полный набор фактов → предложение подтвердить бронь ----------------
+    def test_golden_all_facts_offers_to_confirm_booking(self):
+        self.assertEqual(suggest.next_step(self.FULL, ready=True), "confirm")
+        q = suggest.next_step_question("confirm", "ru")
+        self.assertIn("подтверждаем бронь", q.lower())
+        draft = suggest.ensure_closing_question("Всё принято, байк за вами.", self.FULL,
+                                                "ru", ready=True)
+        self.assertIn("подтверждаем бронь", draft.lower())
+        self.assertEqual(draft.count("?"), 1)
+        # ...и ничего из уже собранного не переспрашивается
+        for word in ("паспорт", "телефон", "даты"):
+            self.assertNotIn(word, draft.lower(), f"переспросили собранное: {word}")
+
+    def test_golden_all_facts_offers_to_confirm_booking_en(self):
+        draft = suggest.ensure_closing_question("Everything is set.", self.FULL, "en", ready=True)
+        self.assertIn("confirm the booking", draft.lower())
+        self.assertEqual(draft.count("?"), 1)
+
+    # ---------------- ГОЛДЕН 2: нет паспорта → просьба фото паспорта В КОНЦЕ ответа ----------------
+    def test_golden_missing_passport_asks_photo_at_the_end(self):
+        facts = self._facts(passport=False)
+        self.assertEqual(suggest.next_step(facts, ready=True), "passport")
+        body = "NMAX 155CC | дней: 5 стоимость: 2470, депозит: 3 000 бат. Доставка на Патонг — 290 бат."
+        draft = suggest.ensure_closing_question(body, facts, "ru", ready=True)
+        self.assertTrue(draft.startswith(body))                  # ответ по сути цел, вопрос — ХВОСТОМ
+        self.assertTrue(draft.rstrip().endswith("?"), draft)     # именно в КОНЦЕ
+        self.assertIn("фото паспорта", draft.lower())
+        self.assertEqual(draft.count("?"), 1)
+
+    def test_golden_live_test7_no_longer_ends_silent(self):
+        # ЖИВОЙ ТЕСТ-7 дословно: цена и доставка названы, дальше была ТИШИНА. Теперь ответ
+        # заканчивается ОДНИМ следующим шагом (паспорт — клиент уже сказал «Возьму»).
+        tr = ("[клиент]: Здравствуйте! Нужен nmax с 28 июля по 5 августа\n"
+              "[менеджер]: NMAX 155CC | дней: 8 стоимость: 3675, депозит: 3 000 бат\n"
+              "[клиент]: Возьму. Доставка на Патонг сколько?")
+        facts = suggest.collected_facts(tr, today=self.TODAY)
+        self.assertTrue(suggest.client_ready_to_book(tr))         # «Возьму» = готовность
+        self.assertFalse(facts["passport"])
+        silent = "Доставка на Патонг — 290 бат, забор байка в конце аренды бесплатный."
+        draft = suggest.ensure_closing_question(silent, facts, "ru", ready=True)
+        self.assertNotEqual(draft, silent, "ответ снова закончился «в пустоту»")
+        self.assertIn("фото паспорта", draft.lower())
+        self.assertEqual(draft.count("?"), 1)
+
+    # ---------------- ГОЛДЕН 3: РОВНО ОДИН вопрос ----------------
+    def test_golden_exactly_one_question_never_two(self):
+        facts = self._facts(passport=False, phone=False, geo=False)
+        # не хватает трёх полей — анкету НЕ выдаём, спрашиваем только первое по приоритету
+        draft = suggest.ensure_closing_question("Отлично, зафиксировали.", facts, "ru", ready=True)
+        self.assertEqual(draft.count("?"), 1)
+        self.assertIn("паспорт", draft.lower())
+        self.assertNotIn("whatsapp", draft.lower())               # телефон — это СЛЕДУЮЩИЙ ход
+        self.assertNotIn("во сколько", draft.lower())             # подача — тем более
+
+    def test_golden_existing_question_is_left_byte_for_byte(self):
+        # Вопрос в черновике УЖЕ есть → второго не добавляем никогда (вход БАЙТ-В-БАЙТ).
+        facts = self._facts(passport=False)
+        body = "Доставка на Патонг — 290 бат. Пришлёте фото паспорта?"
+        self.assertEqual(suggest.ensure_closing_question(body, facts, "ru", ready=True), body)
+        other = "Во сколько удобно принять байк?"
+        self.assertEqual(suggest.ensure_closing_question(other, facts, "ru", ready=True), other)
+
+    def test_empty_draft_untouched(self):
+        for empty in ("", "   ", None):
+            self.assertEqual(suggest.ensure_closing_question(empty, self.FULL, "ru"), empty)
+
+    # ---------------- ГОЛДЕН 4: гейт дат приоритетнее воронки ----------------
+    def test_golden_past_start_asks_dates_not_next_funnel_step(self):
+        # Живой кейс 76e0664/735ffa5: старт 20 июля при «сегодня» 22 июля уже ПРОШЁЛ → трекер даёт
+        # dates=False, значит завершающий вопрос — уточнение ДАТ, а не следующий шаг воронки.
+        tr = "[клиент]: Хочу nmax с 20 по 25 июля, беру. Вот мой +79001234567"
+        facts = suggest.collected_facts(tr, today=self.TODAY)
+        self.assertFalse(facts["dates"])                          # прошедший старт ≠ собранные даты
+        self.assertTrue(facts["phone"])                           # телефон при этом собран
+        self.assertEqual(suggest.next_step(facts, ready=True), "dates")
+        draft = suggest.ensure_closing_question("По NMAX сейчас уточним наличие.", facts,
+                                                "ru", ready=True)
+        self.assertIn("даты", draft.lower())
+        self.assertEqual(draft.count("?"), 1)
+
+    def test_golden_future_start_goes_down_the_funnel_regression(self):
+        # Регресс: валидный будущий старт → даты собраны, воронка идёт дальше (не переспрашиваем даты).
+        tr = "[клиент]: Хочу nmax с 28 июля по 5 августа, беру"
+        facts = suggest.collected_facts(tr, today=self.TODAY)
+        self.assertTrue(facts["dates"])
+        self.assertEqual(suggest.next_step(facts, ready=True), "passport")
+
+    def test_sheet_mode_never_asks_dates(self):
+        # ANTI_LOOP_NOTE: при ПРАЙСЕ ПО ПАРКУ даты спрашивать нельзя → закрываем выбором модели.
+        facts = {"model": False, "term": False, "dates": False}
+        self.assertEqual(suggest.next_step(facts, sheet_mode=True), "model")
+        draft = suggest.ensure_closing_question("Вот прайс по парку.", facts, "ru", sheet_mode=True)
+        self.assertIn("модель", draft.lower())
+        self.assertNotIn("даты", draft.lower())
+
+    # ---------------- ГОЛДЕН 5: не забегаем вперёд (Этап 3) ----------------
+    def test_not_ready_client_gets_booking_offer_not_documents(self):
+        # Клиент ещё не сказал «беру» → паспорт/шлемы/апартаменты НЕ просим (Этап 3 сценария),
+        # закрываем вопросом готовности — ровно как живые менеджеры («Бронируем ?»).
+        facts = self._facts(passport=False, phone=False, geo=False)
+        self.assertEqual(suggest.next_step(facts, ready=False), "offer")
+        draft = suggest.ensure_closing_question("NMAX на ваши даты — 3675 бат.", facts, "ru")
+        self.assertIn("бронируем", draft.lower())
+        self.assertNotIn("паспорт", draft.lower())
+        self.assertEqual(draft.count("?"), 1)
+
+    def test_ready_signals_from_live_dialogs(self):
+        # Живые формулировки согласия из дампа (окна 268/99/224/526).
+        for phrase in ("Возьму.", "Бронируем", "Давайте так", "Подходит", "Я у вас возьму мотоцикл",
+                       "Let's book it"):
+            self.assertTrue(suggest.client_ready_to_book(f"[клиент]: {phrase}"), phrase)
+        for phrase in ("Здравствуйте!", "А какая цена?", "Есть фото?"):
+            self.assertFalse(suggest.client_ready_to_book(f"[клиент]: {phrase}"), phrase)
+        # данные оформления сами по себе = этап брони начат
+        self.assertTrue(suggest.client_ready_to_book("[клиент]: +79001234567"))
+
+    # ---------------- ГОЛДЕН 6: регресс #241 — собранное не переспрашивается ----------------
+    def test_golden_241_collected_is_never_re_asked(self):
+        # Живая фраза окна #241: отель назван полем-меткой + телефон прислан → эти шаги пропускаем.
+        tr = ("[клиент]: Hotel Name: Cape Sienna Gourmet Hotel & Villas\n"
+              "[клиент]: nmax с 28 июля по 5 августа, беру, мой номер +79001234567\n"
+              "[клиент]: [фото]")
+        facts = suggest.collected_facts(tr, today=self.TODAY)
+        self.assertTrue(facts["geo"] and facts["phone"] and facts["passport"] and facts["dates"])
+        self.assertEqual(suggest.next_step(facts, ready=True), "confirm")   # спрашивать нечего
+        draft = suggest.ensure_closing_question("Фото получили, остальное учли.", facts,
+                                                "ru", ready=True)
+        for word in ("паспорт", "телефон", "whatsapp", "отель", "адрес"):
+            self.assertNotIn(word, draft.lower(), f"переспросили уже собранное: {word}")
+        # и фильтр вопросов #241 цел — анкета по собранным полям пуста
+        self.assertEqual(suggest.filter_booking_questions(
+            ["Пришлите фото паспорта", "Ваш номер телефона?", "Название отеля?"], facts), [])
+
+    def test_next_step_note_matches_collected_tracker(self):
+        # Правило в промпте считает шаг ПО ТОМУ ЖЕ трекеру, что и «не переспрашивай» → спорить нечем.
+        facts = self._facts(phone=False)
+        note = suggest.next_step_note(facts, "ru", ready=True)
+        self.assertIn("ЗАВЕРШАЮЩИЙ ВОПРОС", note)
+        self.assertIn("РОВНО ОДИН вопрос", note)
+        self.assertIn("телефон", note.lower())
+        self.assertNotIn("паспорт", note.lower())                 # паспорт собран — шага нет
+
+    def test_prompt_carries_closing_rule(self):
+        facts = self._facts(passport=False)
+        sysp = suggest.make_system_prompt("FAQ", "ru", collected=facts, ready=True)
+        self.assertIn("ЗАВЕРШАЮЩИЙ ВОПРОС", sysp)
+        self.assertIn("фото паспорта", sysp)
+        self.assertIn("Этап 3 — БРОНЬ", sysp)                     # прежний сценарий цел
+
+    # ---------------- ГОЛДЕН 7: лаконичность ----------------
+    def test_golden_closing_question_is_short_and_has_no_social_proof(self):
+        # Ответ не раздувается: приписка — ОДНА короткая фраза без соц-доказательства
+        # (отзывы/точки на картах/«N довольных клиентов» — только в первом приветствии).
+        body = "Доставка на Патонг — 290 бат."
+        for step_facts, ready in ((self._facts(passport=False), True),
+                                  (self._facts(passport=False, phone=False, geo=False), False),
+                                  ({"dates": False}, False),
+                                  (self.FULL, True)):
+            draft = suggest.ensure_closing_question(body, step_facts, "ru", ready=ready)
+            added = draft[len(body):]
+            self.assertLessEqual(len(added), 70, f"приписка раздулась: {added!r}")
+            self.assertEqual(draft.count("?"), 1)
+            for junk in ("отзыв", "google maps", "maps.app", "довольных", "рейтинг", "★"):
+                self.assertNotIn(junk, draft.lower(), f"соц-доказательство в продолжении: {junk}")
+
+    def test_golden_service_notes_stay_last_question_stays_in_client_body(self):
+        # Служебные пометки модератору — хвостом; вопрос обязан остаться в КЛИЕНТСКОМ теле.
+        facts = self._facts(passport=False)
+        body = "Доставка на Патонг — 290 бат.\n[собрано: гео ✅ тел ✅]\n[сезон: низкий]"
+        draft = suggest.ensure_closing_question(body, facts, "ru", ready=True)
+        client = suggest.client_facing_text(draft)
+        self.assertTrue(client.rstrip().endswith("?"), client)
+        self.assertIn("фото паспорта", client.lower())
+        self.assertTrue(draft.rstrip().endswith("[сезон: низкий]"))   # пометки остались последними
+
+    # ---------------- ГОЛДЕН 8: анти-тайский ----------------
+    def test_no_thai_in_closing_questions(self):
+        for lang in ("ru", "en"):
+            for step in suggest._NEXT_STEP_QUESTIONS:
+                q = suggest.next_step_question(step, lang)
+                self.assertTrue(q)
+                self.assertFalse(_has_thai_letters(q), f"тайские буквы в вопросе {step}/{lang}")
+            for facts, ready in ((self.FULL, True), ({"dates": False}, False)):
+                self.assertFalse(_has_thai_letters(suggest.next_step_note(facts, lang, ready=ready)))
 
 
 if __name__ == "__main__":

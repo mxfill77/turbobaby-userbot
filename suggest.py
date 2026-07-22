@@ -2303,6 +2303,124 @@ def filter_booking_questions(questions, facts: dict, lang: str = "ru"):
     return kept
 
 
+# ---------- ЗАВЕРШАЮЩИЙ ВОПРОС: каждый ответ двигает клиента ровно на ОДИН шаг ----------
+# Живой ТЕСТ-7 (22.07.2026): бот назвал цену и доставку и ЗАМОЛЧАЛ — паспорт/телефон/время и точка
+# подачи не собраны, диалог к брони никто не двигал. Методика выведена из ЖИВЫХ успешных окон
+# (docs/sales-method-2026-07-22.md; client_chats.jsonl, 9 разобранных диалогов + частотка по 15 845
+# сообщениям менеджера): 84% сообщений менеджера БЕЗ вопроса, 14% — РОВНО ОДИН, два и более ≈0%.
+# Порядок недостающего у живых менеджеров:
+#   даты подтверждены → фото паспорта → телефон → время и точка подачи → подтверждение брони,
+# причём паспорт/апартаменты/шлемы просят ТОЛЬКО когда клиент готов бронировать («Возьму», «Бронируем»)
+# — до этого закрывают вопросом готовности «Бронируем ?» (Этап 3 сценария, не забегаем вперёд).
+# ГЕЙТ ДАТ ПРИОРИТЕТНЕЕ ВОРОНКИ: прошедший старт → collected_facts даёт dates=False (см. #735ffa5),
+# значит завершающий вопрос = уточнение дат, а не следующий шаг воронки (иначе бронь на несуществующие
+# даты). В sheet-режиме (ПРАЙС ПО ПАРКУ) даты спрашивать НЕЛЬЗЯ (ANTI_LOOP_NOTE) → закрываем выбором модели.
+_NEXT_STEP_QUESTIONS = {
+    "dates":    ("Подскажите даты — с какого числа и на какой срок?",
+                 "Could you tell me the dates — from when and for how long?"),
+    "model":    ("Какая модель интересует?",
+                 "Which model are you interested in?"),
+    "offer":    ("Бронируем?",
+                 "Shall we book it?"),
+    "passport": ("Пришлёте качественное фото паспорта?",
+                 "Could you send a clear photo of your passport?"),
+    "phone":    ("Подскажете номер телефона с доступом в WhatsApp?",
+                 "Could you share a phone number with WhatsApp access?"),
+    "pickup":   ("Во сколько и куда удобно подать байк?",
+                 "What time and where would you like the bike delivered?"),
+    "confirm":  ("Всё есть — подтверждаем бронь?",
+                 "Everything is in — shall I confirm the booking?"),
+}
+
+# Человекочитаемая подпись шага для промпта (RU/EN).
+_NEXT_STEP_LABELS = {
+    "dates":    ("уточнить даты аренды", "clarify the rental dates"),
+    "model":    ("узнать, какая модель интересует", "ask which model they want"),
+    "offer":    ("предложить оформить бронь", "offer to book"),
+    "passport": ("попросить качественное фото паспорта", "ask for a clear passport photo"),
+    "phone":    ("попросить номер телефона (с доступом в WhatsApp)",
+                 "ask for a phone number (with WhatsApp access)"),
+    "pickup":   ("уточнить время и точку подачи байка",
+                 "ask for the delivery time and place"),
+    "confirm":  ("предложить подтвердить бронь", "offer to confirm the booking"),
+}
+
+# Клиент СОГЛАСИЛСЯ / готов оформлять — живые формулировки из дампа («Возьму.», «Бронируем»,
+# «Давайте», «Подходит», «Его»). До этого сигнала паспорт/шлемы/апартаменты НЕ просим.
+_READY_RE = re.compile(
+    r"\bберу\b|\bвозьму\b|брониру\w*|заброни\w*|оформля\w*|оформи\w*"
+    r"|давайте\s+(?:оформ\w*|брон\w*|так|этот|эту|его|её|ее)|подходит\b|устраивает\b"
+    r"|готов\w*\s+(?:брон\w*|оформ\w*|взять)"
+    r"|let'?s\s+book|shall\s+we\s+book|book\s+it|i'?ll\s+take\s+it|i\s+want\s+to\s+book"
+    r"|works\s+for\s+me|sounds\s+good", re.I)
+
+
+def client_ready_to_book(transcript: str) -> bool:
+    """Клиент готов оформлять бронь: явный сигнал согласия в его репликах ЛИБО он уже прислал
+    данные оформления (фото паспорта / телефон / оплату) — тогда этап брони начат по факту.
+    Локация сама по себе готовности НЕ даёт (её называют ещё на этапе расчёта доставки)."""
+    ctext = _client_text(transcript or "")
+    if _READY_RE.search(ctext):
+        return True
+    f = collected_facts(transcript or "")
+    return bool(f.get("passport") or f.get("phone") or f.get("payment"))
+
+
+def next_step(facts: dict, sheet_mode: bool = False, ready: bool = False) -> str:
+    """ОДИН следующий шаг по приоритету недостающего в collected_facts → ключ _NEXT_STEP_QUESTIONS.
+    Приоритет: даты → (готовность) → паспорт → телефон → время и точка подачи → подтверждение брони.
+    Даты ❌ (в т.ч. ПРОШЕДШИЙ старт — трекер их не считает собранными) перебивают всю воронку;
+    в sheet-режиме вместо дат закрываем выбором модели (даты там спрашивать запрещено)."""
+    facts = facts or {}
+    if not facts.get("dates"):
+        return "model" if sheet_mode else "dates"
+    if not ready:
+        return "offer"          # рано просить документы — сперва согласие клиента (Этап 3)
+    if not facts.get("passport"):
+        return "passport"
+    if not facts.get("phone"):
+        return "phone"
+    if not facts.get("geo"):
+        return "pickup"
+    return "confirm"
+
+
+def next_step_question(step: str, lang: str = "ru") -> str:
+    """Готовая формулировка завершающего вопроса для шага. Неизвестный шаг → ''."""
+    pair = _NEXT_STEP_QUESTIONS.get(step)
+    return "" if not pair else pair[1 if lang == "en" else 0]
+
+
+def next_step_note(facts: dict, lang: str = "ru", sheet_mode: bool = False,
+                   ready: bool = False) -> str:
+    """Блок в system-промпт: закончи ответ РОВНО ОДНИМ следующим шагом. Пусто не бывает —
+    шаг есть всегда (даже «нечего спрашивать» → предложение подтвердить бронь)."""
+    step = next_step(facts, sheet_mode, ready)
+    en = (lang == "en")
+    label = _NEXT_STEP_LABELS.get(step, ("", ""))[1 if en else 0]
+    example = next_step_question(step, lang)
+    # Ссылку на блок собранного даём ТОЛЬКО когда он реально есть: иначе маркер «УЖЕ ПОЛУЧЕНО» /
+    # «ALREADY PROVIDED» просочился бы в промпт при пустом трекере (ложный след для читателя и тестов).
+    has_collected = any((facts or {}).values())
+    if en:
+        seen = " (see ALREADY PROVIDED above)" if has_collected else ""
+        return ("\n\n★ CLOSING QUESTION (STRICT): every reply must END with ONE next step — never "
+                "answer and go silent. Your next step now: " + label + " (e.g. «" + example + "»). "
+                "Ask EXACTLY ONE question per reply — no questionnaires, no second question, no "
+                "listing everything you still need. Never re-ask what the client has already sent"
+                + seen + ". If the PRICE instruction above already prescribes a specific closing "
+                "question (confirm the dates / pick-up time) — ask THAT one, it IS the closing "
+                "question and it stays the only one.")
+    seen = " (см. блок выше)" if has_collected else ""
+    return ("\n\n★ ЗАВЕРШАЮЩИЙ ВОПРОС (ЖЁСТКО): каждый ответ ЗАКАНЧИВАЕТСЯ ОДНИМ следующим шагом — "
+            "не отвечай «в пустоту» и не замолкай. Твой следующий шаг сейчас: " + label +
+            " (напр. «" + example + "»). Задай РОВНО ОДИН вопрос за ответ — никаких анкет, "
+            "второго вопроса и перечисления всего, чего ещё не хватает. НЕ переспрашивай то, что "
+            "клиент уже прислал" + seen + ". Если инструкция ЦЕНА выше уже задала конкретный "
+            "вопрос (уточнить даты / время подачи) — задай ИМЕННО его, он и есть завершающий и "
+            "остаётся единственным.")
+
+
 # Инструкция про депозит при нескольких байках (правила цен v2, п.4).
 DEPOSIT_MULTI_NOTE = ("ДЕПОЗИТ: клиент спрашивает про уменьшение депозита при нескольких байках "
                       "— сам скидку/снижение депозита НЕ предлагай и НЕ обещай; ответь ровно: "
@@ -3419,7 +3537,7 @@ ANTI_LOOP_NOTE = (
 
 def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pricing_note: str = "",
                        directive: str = "", park_models=None, playbook: str = "", pressure=None,
-                       collected=None) -> str:
+                       collected=None, ready: bool = False) -> str:
     lang_name = "русском" if lang == "ru" else "английском"
     if is_first_contact:
         greet = (
@@ -3579,6 +3697,10 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         )
     # §243/6: СОБРАННОЕ по диалогу/вложениям — «уже получено, не переспрашивай». Пусто → блока нет.
     collected_block = collected_prompt_note(collected, lang) if collected else ""
+    # ЗАВЕРШАЮЩИЙ ВОПРОС (живой ТЕСТ-7): ответ обязан двигать клиента ровно на ОДИН следующий шаг.
+    # Шаг считаем по недостающему в collected (тот же трекер, что и «не переспрашивай») — значит
+    # правило по построению не спорит с фильтром #241 и с гейтом дат.
+    next_step_block = next_step_note(collected or {}, lang, sheet_mode=sheet_mode, ready=ready)
     # УРОВЕНЬ НАПОРА — на уровне базовой установки (высокий приоритет, ВЫШЕ playbook «без давления»).
     pressure_block = _pressure_block(pressure if pressure is not None else SALES_PRESSURE)
     return (
@@ -3593,7 +3715,8 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         "клиент их видеть НЕ должен. Ответ начинай СРАЗУ по сути (первый контакт → "
         "приветствие → суть; иначе → сразу суть)."
         + pressure_block
-        + directive_block + park_block + collected_block + greet + policy + scenario + ANTI_LOOP_NOTE + price_block + "\n\n"
+        + directive_block + park_block + collected_block + greet + policy + scenario
+        + next_step_block + ANTI_LOOP_NOTE + price_block + "\n\n"
         + CRITICAL_FACTS + EXPERIENCE_SAFETY_RULE + APPROVAL_WHITELIST_RULE
         + AVAILABILITY_INVARIANT_RULE + GENERATION_DEFAULT_RULE + PICKUP_RULE + RECEIPT_LEXICON_RULE
         + playbook_block
@@ -4171,6 +4294,36 @@ def postcheck_free_pickup(draft: str, lang: str = "ru", delivery_paid=None) -> s
     return body if body else draft
 
 
+# --- СТРАХОВКА ЗАВЕРШАЮЩЕГО ВОПРОСА (пара к next_step_note, как postcheck_free_pickup к PICKUP_RULE) ---
+# Живой ТЕСТ-7: LLM ответил на вопрос и замолчал — воронка встала. КОД гарантирует то, о чём просит
+# промпт: если в клиентском теле черновика вопроса НЕТ — дописываем РОВНО ОДИН по приоритету
+# недостающего (next_step). Вопрос в теле УЖЕ есть → вход БАЙТ-В-БАЙТ (второго не добавляем никогда:
+# «не больше одного вопроса за раз»). Служебные пометки модератору ([уточнить:…]/[собрано:…]/[сезон:…])
+# живут хвостом — вопрос вставляем ПЕРЕД ними, чтобы он остался в клиентском теле.
+_CLOSING_Q_RE = re.compile(r"[?？]")
+_SERVICE_TAIL_RE = re.compile(
+    r"(?:[ \t]*\n[ \t]*\[(?:уточнить|собрано|collected|сезон|season)\b[^\n]*\][ \t]*)+\s*\Z", re.I)
+
+
+def ensure_closing_question(draft: str, facts: dict, lang: str = "ru",
+                            sheet_mode: bool = False, ready: bool = False) -> str:
+    """Дописать завершающий вопрос, если черновик его потерял. Вопрос уже есть / пустой вход →
+    БАЙТ-В-БАЙТ (fail-safe). Вопрос берём из next_step по тем же collected_facts, поэтому уже
+    собранное НЕ переспрашивается, а прошедший старт даёт уточнение дат, а не шаг воронки."""
+    text = draft or ""
+    if not text.strip():
+        return draft
+    m = _SERVICE_TAIL_RE.search(text)
+    body, tail = (text[:m.start()], text[m.start():]) if m else (text, "")
+    if not body.strip() or _CLOSING_Q_RE.search(body):
+        return draft
+    q = next_step_question(next_step(facts, sheet_mode, ready), lang)
+    if not q:
+        return draft
+    sep = "\n\n" if "\n" in body.strip() else " "
+    return body.rstrip() + sep + q + tail
+
+
 def _append_collected_note(draft: str, facts: dict, lang: str = "ru") -> str:
     """§243/6: дописать в хвост черновика СЛУЖЕБНУЮ пометку модератору «[собрано: гео ✅ …]».
     Ничего не собрано → черновик БАЙТ-В-БАЙТ (fail-safe). Хвост → _strip_service_prefix не режет."""
@@ -4437,8 +4590,11 @@ def generate_draft(transcript: str, lang: str, faq: str,
     call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
     # §243/6: что клиент УЖЕ прислал (модель/даты/гео/паспорт/тел/оплата) — не переспрашиваем.
     facts = collected_facts(transcript)
+    ready = client_ready_to_book(transcript)
+    sheet_mode = _sheet_block_from_note(pricing_note) is not None or "ПРАЙС ПО ПАРКУ" in (pricing_note or "")
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
-                                park_models=park_models, playbook=playbook, collected=facts)
+                                park_models=park_models, playbook=playbook, collected=facts,
+                                ready=ready)
     out = _strip_service_prefix(call_llm(system, transcript))
     # Пост-чек ДО сборки сетки: сканируем LLM-текст (intro/outro), дословный прайс-блок КОДА не
     # трогаем. Утверждения цвет/наличие/цена вне белого списка → «уточню»-форма + пометка модератору.
@@ -4458,6 +4614,8 @@ def generate_draft(transcript: str, lang: str, faq: str,
     dblock = _delivery_block_from_note(pricing_note)
     if dblock is not None:
         out = compose_delivery_draft(out, dblock, lang)
+    # ТЕСТ-7: ответ обязан двигать клиента дальше — если вопроса нет, КОД дописывает ровно один.
+    out = ensure_closing_question(out, facts, lang, sheet_mode=sheet_mode, ready=ready)
     out = _append_collected_note(out, facts, lang)
     return _append_season_note(out, pricing_note)
 
@@ -4470,9 +4628,11 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     тексту. Инварианты (ценовая политика/критфакты/парк/playbook) сохраняются — они в make_system_prompt."""
     call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
     facts = collected_facts(transcript)
+    ready = client_ready_to_book(transcript)
+    sheet_mode = _sheet_block_from_note(pricing_note) is not None or "ПРАЙС ПО ПАРКУ" in (pricing_note or "")
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
                                 directive=directive, park_models=park_models, playbook=playbook,
-                                collected=facts)
+                                collected=facts, ready=ready)
     out = _strip_service_prefix(call_llm(system, transcript))
     # Тот же пост-чек, что в generate_draft (до сборки сетки): цвет/наличие/цена вне данных → «уточню».
     out = postcheck_draft(out, lang, pricing_note=pricing_note, call_llm=call_llm, transcript=transcript)
@@ -4491,6 +4651,8 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     dblock = _delivery_block_from_note(pricing_note)
     if dblock is not None:
         out = compose_delivery_draft(out, dblock, lang)
+    # Тот же класс, что в generate_draft: ответ не заканчивается «в пустоту».
+    out = ensure_closing_question(out, facts, lang, sheet_mode=sheet_mode, ready=ready)
     out = _append_collected_note(out, facts, lang)
     out = _append_season_note(out, pricing_note)
     # Гард повторного приветствия ПЕРЕД ОТПРАВКОЙ (родитель #311 → #56): strategy-перегенерация
