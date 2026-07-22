@@ -452,5 +452,104 @@ class TestModerbotCallbackGate(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trainer.get_transcript(), "")
 
 
+# --------- накопление окна диалога + токен состояния (регресс ТЕСТ-4 раздвоения) ------
+
+class TestTrainerAccumulation(unittest.TestCase):
+    def test_seq_bump_and_reset_bumps_seq(self):
+        d, get, put = _dict_store()
+        put(trainer.K_SEQ, 0)
+        self.assertEqual(trainer.bump_seq(get, put), 1)
+        self.assertEqual(trainer.bump_seq(get, put), 2)
+        put(trainer.K_N, 4)
+        n = trainer.reset(get, put)
+        self.assertEqual(n, 5)
+        self.assertEqual(trainer.get_seq(get), 3)          # сброс тоже инкрементит токен
+
+    def test_set_transcript_persists_and_incoming(self):
+        d, get, put = _dict_store()
+        trainer.set_transcript("[клиент]: привет", incoming="привет", set=put)
+        self.assertEqual(trainer.get_transcript(get), "[клиент]: привет")
+        self.assertEqual(trainer.get_last_pair(get)[0], "привет")
+
+    def test_window_is_cumulative_across_events(self):
+        # текст (даты) + гео-ПИН разными событиями → collected_facts КУМУЛЯТИВНЫ по окну
+        # (а не по одному событию): и даты, и гео видны одновременно → нет переспроса собранного.
+        class Geo:
+            def __init__(s, lat, lon):
+                s.lat, s.long = lat, lon
+        t = trainer.append_turn("", "client",
+                                trainer.client_body("аренда с 1 по 8 августа на 7 дней"))
+        t = trainer.append_turn(t, "client",
+                                trainer.client_body("", geo_marker=suggest.geo_marker(Geo(7.771, 98.327))))
+        f = suggest.collected_facts(t)
+        self.assertTrue(f["dates"])          # даты из первого события
+        self.assertTrue(f["term"])
+        self.assertTrue(f["geo"])            # гео из второго — В ТОМ ЖЕ окне
+        self.assertEqual(suggest.extract_booking_hints(t).get("geo_pin"), (7.771, 98.327))
+
+
+class TestTrainerDebounce(unittest.IsolatedAsyncioTestCase):
+    """Регресс ТЕСТ-4 раздвоения: два близких Telegram-события (текст+пин) → ОДИН ответ по
+    ПОЛНОМУ окну; гонка/клоббер контекста исключены; сброс инвалидирует отложенный ответ."""
+
+    def setUp(self):
+        import userbot_listen
+        self.ub = userbot_listen
+        moderation_ipc.init_db()
+        for k in (trainer.K_TRANSCRIPT, trainer.K_INCOMING, trainer.K_ANSWER, trainer.K_HYPS):
+            moderation_ipc.set_meta(k, "")
+        moderation_ipc.set_meta(trainer.K_N, "4")
+        moderation_ipc.set_meta(trainer.K_SEQ, "0")
+        moderation_ipc.set_meta(trainer.K_CHAT, "-100999")
+        self._old_deb = self.ub.TRAINER_DEBOUNCE_SEC
+        self.ub.TRAINER_DEBOUNCE_SEC = 0.05
+        self._gen_calls = []
+
+        async def fake_gen(transcript, first):
+            self._gen_calls.append(transcript)
+            return "Ответ бота ТЕСТ-клиенту"
+        self._old_gen = self.ub._trainer_generate
+        self.ub._trainer_generate = fake_gen
+
+    def tearDown(self):
+        self.ub.TRAINER_DEBOUNCE_SEC = self._old_deb
+        self.ub._trainer_generate = self._old_gen
+
+    def _event(self, chat_id=-100999):
+        sent = []
+
+        class Client:
+            async def send_message(self, cid, text, **kw):
+                sent.append((cid, text))
+
+        class Ev:
+            def __init__(s):
+                s.client = Client()
+                s.chat_id = chat_id
+        return Ev(), sent
+
+    async def test_two_rapid_events_one_reply_full_context(self):
+        import asyncio
+        ev, sent = self._event()
+        await self.ub._trainer_client_turn(ev, "хочу yamaha с 1 по 8 августа")
+        await self.ub._trainer_client_turn(ev, "[локация 7.771000,98.327000]")
+        await asyncio.sleep(0.25)
+        self.assertEqual(len(sent), 1, f"ожидался ОДИН ответ, а не {len(sent)}")
+        self.assertEqual(len(self._gen_calls), 1, "генерация должна пройти ОДИН раз")
+        full = self._gen_calls[0]
+        self.assertIn("yamaha", full)                          # контекст текста…
+        self.assertIn("[локация 7.771000,98.327000]", full)    # …И пина — в ОДНОМ окне
+        self.assertTrue(any("[тренажёр | ТЕСТ-4" in m for _, m in sent))
+
+    async def test_reset_invalidates_pending_reply(self):
+        import asyncio
+        ev, sent = self._event()
+        await self.ub._trainer_client_turn(ev, "хочу скутер")
+        trainer.reset()                                        # сброс до срабатывания дебаунса
+        await asyncio.sleep(0.25)
+        self.assertEqual(len(sent), 0, "после сброса устаревший ответ постить нельзя")
+        self.assertEqual(len(self._gen_calls), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

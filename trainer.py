@@ -42,6 +42,11 @@ K_TRANSCRIPT = "trainer_transcript"
 K_INCOMING = "trainer_incoming"
 K_ANSWER = "trainer_answer"
 K_HYPS = "trainer_hyps"
+# Монотонный токен «состояние диалога менялось»: каждый клиентский турн и сброс инкрементят его.
+# Дебаунс-ответ, запланированный на токене S, исполняется, только если токен всё ещё S (иначе —
+# пришёл более свежий турн / был сброс → устаревший ответ не постим). Кросс-процессный (в meta):
+# сброс кнопкой модербота инвалидирует отложенный ответ userbot.
+K_SEQ = "trainer_seq"
 
 TRAINER_RULES_FILE = os.path.join(BASE_DIR, "trainer_rules.json")
 TRAINER_SOURCE = "тренажёр"
@@ -342,6 +347,28 @@ def set_hyps(hyps, set=None):
     (set or _default_set)(K_HYPS, json.dumps(list(hyps or []), ensure_ascii=False))
 
 
+def set_transcript(transcript, incoming=None, set=None):
+    """Персистнуть НАКОПИТЕЛЬНЫЙ транскрипт (клиентский турн добавлен, ответа ещё нет).
+    incoming (если задан) — последняя ТЕКСТовая реплика клиента (для гипотез «🎓»)."""
+    set = set or _default_set
+    set(K_TRANSCRIPT, transcript)
+    if incoming is not None:
+        set(K_INCOMING, incoming)
+
+
+def get_seq(get=None):
+    return _to_int((get or _default_get)(K_SEQ), 0) or 0
+
+
+def bump_seq(get=None, set=None):
+    """Инкремент токена состояния диалога (новый клиентский турн / сброс). → новый токен."""
+    get = get or _default_get
+    set = set or _default_set
+    s = get_seq(get) + 1
+    set(K_SEQ, s)
+    return s
+
+
 def record_turn(incoming, transcript, answer, set=None):
     """Зафиксировать один обмен: накопительный транскрипт + последняя пара клиент/бот
     (для кнопок «До CRM»/«Обучить», которые работают в процессе модербота)."""
@@ -363,6 +390,7 @@ def reset(get=None, set=None):
     set(K_INCOMING, "")
     set(K_ANSWER, "")
     set(K_HYPS, "")
+    set(K_SEQ, get_seq(get) + 1)   # инвалидируем отложенный дебаунс-ответ старого ТЕСТ-клиента
     return n
 
 

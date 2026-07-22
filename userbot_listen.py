@@ -220,6 +220,14 @@ async def _suggest_ipc_poller(client):
 # кто шлёт клиентские ответы в группу; ТЕКСТ-команды (заново/до crm/урок:/отмени урок N)
 # работают ВСЕГДА (даже если модербот-панель кнопок недоступна).
 
+# Дебаунс склейки близких Telegram-событий в ОДИН турн/ответ (текст+вложение приходят
+# отдельными апдейтами). Родитель ТЕСТ-4: без склейки бот отвечал ДВАЖДЫ, и из-за гонки
+# (оба обработчика читали транскрипт до записи) каждый ответ видел лишь СВОЙ кусок контекста.
+TRAINER_DEBOUNCE_SEC = float(os.getenv("TRAINER_DEBOUNCE_SEC", "8") or "8")
+# Сериализация мутаций транскрипта и генерации ВНУТРИ процесса userbot (единственный генератор).
+_TRAINER_LOCK = asyncio.Lock()
+
+
 async def _trainer_send(client, chat_id, text):
     """Пост в группу тренажёра, с анти-тайским фильтром. Не роняет обработчик."""
     try:
@@ -228,34 +236,64 @@ async def _trainer_send(client, chat_id, text):
         log.warning(f"{_now()} | ТРЕНАЖЁР: не смог запостить в группу: {e}")
 
 
-async def _trainer_reply(event, text):
-    """Обычная клиентская реплика владельца → ПОЛНЫЙ боевой пайплайн (как от клиента ТЕСТ-N),
-    ответ ПРЯМО В ГРУППУ. Копим сессионный транскрипт сами (Bot API историю не читает,
-    а в группе есть модербот — его строки в транскрипт попадать не должны)."""
-    client = event.client
+async def _trainer_generate(transcript, first):
+    """ОДИН черновик по ПОЛНОМУ накопленному транскрипту (боевой пайплайн: прайс/зоны/generate).
+    collected_facts и доставка считаются по всему окну диалога, а не по одному событию."""
+    lang = suggest.detect_lang_from_client(transcript)
+    hints = suggest.extract_booking_hints(transcript)
+    price_note = await asyncio.to_thread(suggest.build_pricing_note, hints, lang)
+    allow = suggest.park_allowlist()
+    pb = suggest.load_playbook()
+    faq = suggest.load_faq()
+    draft = await asyncio.to_thread(
+        suggest.generate_draft, transcript, lang, faq, first, price_note, None, allow, pb)
+    return trainer.strip_thai(draft or "")
+
+
+async def _trainer_client_turn(event, body):
+    """Клиентская реплика владельца → ДОБАВИТЬ в накопительный транскрипт (атомарно, под локом,
+    чтобы параллельные события не затирали друг друга) и запланировать ОДИН дебаунс-ответ."""
     chat_id = event.chat_id
-    transcript = trainer.append_turn(trainer.get_transcript(), "client", text)
-    first = not trainer.has_manager_turn(transcript)   # приветствие — один раз на ТЕСТ-клиента
+    async with _TRAINER_LOCK:
+        is_text = bool((body or "").strip()) and not body.startswith("[")
+        transcript = trainer.append_turn(trainer.get_transcript(), "client", body)
+        trainer.set_transcript(transcript, incoming=body if is_text else None)
+        my_seq = trainer.bump_seq()
+    asyncio.create_task(_trainer_debounced_reply(event, chat_id, my_seq))
+
+
+async def _trainer_debounced_reply(event, chat_id, my_seq):
+    """Через TRAINER_DEBOUNCE_SEC после последнего события — ОДИН ответ по ПОЛНОМУ транскрипту.
+    Если за окно пришёл новый турн или был сброс (токен seq сменился, в т.ч. кнопкой модербота) —
+    эта задача устаревает и молчит (ответит задача самого свежего турна)."""
     try:
-        lang = suggest.detect_lang_from_client(transcript)
-        hints = suggest.extract_booking_hints(transcript)
-        price_note = await asyncio.to_thread(suggest.build_pricing_note, hints, lang)
-        allow = suggest.park_allowlist()
-        pb = suggest.load_playbook()
-        faq = suggest.load_faq()
-        draft = await asyncio.to_thread(
-            suggest.generate_draft, transcript, lang, faq, first, price_note, None, allow, pb)
-    except Exception as e:
-        log.warning(f"{_now()} | ТРЕНАЖЁР: сбой генерации ответа: {e}")
-        await _trainer_send(client, chat_id, "⚠️ Не удалось сгенерировать ответ (см. userbot.log).")
+        await asyncio.sleep(TRAINER_DEBOUNCE_SEC)
+    except asyncio.CancelledError:
         return
-    draft = trainer.strip_thai(draft or "")
-    n = trainer.get_n()
-    k = len(suggest.list_playbook_rules())
-    await _trainer_send(client, chat_id, trainer.render_answer(n, k, draft))
-    # фиксируем обмен: транскрипт + последняя пара (для кнопок «До CRM»/«Обучить» модербота)
-    transcript = trainer.append_turn(transcript, "manager", draft)
-    trainer.record_turn(text, transcript, draft)
+    if trainer.get_seq() != my_seq:
+        return
+    async with _TRAINER_LOCK:
+        if trainer.get_seq() != my_seq:
+            return
+        transcript = trainer.get_transcript()
+        if not transcript.strip():
+            return
+        first = not trainer.has_manager_turn(transcript)   # приветствие — один раз на ТЕСТ-клиента
+        incoming, _ans = trainer.get_last_pair()
+        try:
+            draft = await _trainer_generate(transcript, first)
+        except Exception as e:
+            log.warning(f"{_now()} | ТРЕНАЖЁР: сбой генерации ответа: {e}")
+            await _trainer_send(event.client, chat_id, "⚠️ Не удалось сгенерировать ответ (см. userbot.log).")
+            return
+        if trainer.get_seq() != my_seq:   # сброс/новый турн ВО ВРЕМЯ генерации → устаревший ответ не постим
+            return
+        n = trainer.get_n()
+        k = len(suggest.list_playbook_rules())
+        await _trainer_send(event.client, chat_id, trainer.render_answer(n, k, draft))
+        # фиксируем обмен: транскрипт + последняя пара (для кнопок «До CRM»/«Обучить» модербота)
+        transcript = trainer.append_turn(transcript, "manager", draft)
+        trainer.record_turn(incoming, transcript, draft)
 
 
 async def _trainer_crm(event):
@@ -348,7 +386,7 @@ async def on_trainer_group(event):
     gm = suggest.geo_marker(geo) if geo is not None else None
     has_photo = getattr(msg, "photo", None) is not None
     body = trainer.client_body(text, has_photo=has_photo, geo_marker=gm)
-    await _trainer_reply(event, body)
+    await _trainer_client_turn(event, body)
 
 
 async def main():

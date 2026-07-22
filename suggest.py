@@ -2893,6 +2893,11 @@ def _resolve_delivery_for_draft(hints, _resolve_coords=None, _resolve_text=None)
             log.info(f"_resolve_delivery_for_draft: пин упал ({type(e).__name__})")
             res = None
         if isinstance(res, dict):
+            # Трассировка (родитель ТЕСТ-4: пин на Пхукете → 1490 out_belt): координаты пина +
+            # исход резолва (зона/дистанция/пояс) в лог — чтобы «зона не та» была диагностируема
+            # (out_belt = точка ВНЕ радиуса всех зон, но в поясе +5 км; это НЕ баг парсинга).
+            log.info("DELIVERY пин %s → status=%s zone=%s price=%s dist=%s",
+                     pin, res.get("status"), res.get("zone"), res.get("price"), res.get("distance_km"))
             return res
     text = hints.get("maps_link")
     if text:
