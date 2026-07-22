@@ -351,25 +351,40 @@ def extract_maps_link(text):
 # resolve_delivery — (lat, lon) точки + зоны из Bridge → зона/цена доставки | [уточнить]
 # ===========================================================================
 #
-# Чистая функция (без сети, без I/O, детерминирована). Логика:
-#   1) haversine-дистанция от точки до якоря каждой зоны;
-#   2) ближайший якорь, чья дистанция ≤ его радиус_км → цена ЭТОЙ зоны
-#      (на границе двух зон побеждает БЛИЖАЙШИЙ якорь — не «первый в списке»);
-#   3) иначе если есть якорь с дистанцией ≤ радиус_км + OUT_BELT_KM (5 км) →
-#      периферийный пояс: OUT_BELT_PRICE (1490);
-#   4) иначе (далеко / вне Пхукета / нет валидных якорей / битая точка) → маркер [уточнить].
+# Чистая функция (без сети, без I/O, детерминирована). Модель «БЛИЖАЙШИЙ ЯКОРЬ ПОБЕЖДАЕТ»:
+#   1) сначала внешняя граница — bbox острова Пхукет (PHUKET_BBOX): точка ВНЕ bbox → честный
+#      [уточнить]/«согласование» (материк за мостом Сарасин и Ко Яо мы НЕ прайсуем);
+#   2) внутри bbox: haversine-дистанция от точки до якоря КАЖДОЙ зоны, берём зону с
+#      МИНИМАЛЬНОЙ дистанцией → её цена. На границе двух зон побеждает БЛИЖАЙШИЙ якорь
+#      (не «первый в списке»). РАДИУСЫ зон в расчёте НЕ участвуют (колонка радиуса в листе —
+#      legacy, оставлена, но резолвер её игнорирует); периферийный пояс OUT_BELT тоже НЕ
+#      участвует (конфиг OUT_BELT_KM/OUT_BELT_PRICE оставлен как legacy, но не применяется);
+#   3) битая точка / нет валидных якорей / у ближайшей зоны нет цены → маркер [уточнить].
 #
-# FAIL-SAFE (не ослаблять): любая неоднозначность — нет координат, зона без якоря/радиуса,
-# зона в радиусе но без цены, вообще нет валидных зон — уводит в «[уточнить]», а НЕ в
+# FAIL-SAFE (не ослаблять): любая неоднозначность — нет координат, точка вне bbox Пхукета,
+# нет ни одного валидного якоря, у ближайшей зоны нет цены — уводит в «[уточнить]», а НЕ в
 # случайную цену. Лучше переспросить, чем назвать неверную стоимость доставки.
 
-# Ширина периферийного пояса за границей зоны (км) и цена доставки в нём.
+# LEGACY (модель «ближайший якорь»): периферийный пояс OUT_BELT в расчёте БОЛЬШЕ НЕ участвует.
+# Константы оставлены как legacy (конфиг листа «Доставка» их всё ещё несёт), но resolve_delivery
+# их не применяет — граница теперь bbox острова, а не пояс за радиусом.
 OUT_BELT_KM = float(os.getenv("DELIVERY_OUT_BELT_KM", "5") or "5")
 OUT_BELT_PRICE = int(os.getenv("DELIVERY_OUT_BELT_PRICE", "1490") or "1490")
+# Внешняя граница прайсинга доставки — bbox острова Пхукет (включая мост Сарасин на севере).
+# Точка ВНЕ bbox = материк/дальние острова → цену не называем, честный [уточнить]/согласование.
+PHUKET_BBOX_LAT = (7.74, 8.21)
+PHUKET_BBOX_LON = (98.23, 98.47)
 # Маркер честного фолбэка — то же слово, что и по всему контуру доставки.
 DELIVERY_MARKER = "[уточнить]"
 
 _EARTH_R_KM = 6371.0088
+
+
+def _in_phuket_bbox(lat, lon):
+    """Точка (lat, lon) внутри bbox острова Пхукет? Вне bbox (материк за Сарасином, Ко Яо и т.п.)
+    доставку не прайсуем — честный [уточнить]/согласование."""
+    return (PHUKET_BBOX_LAT[0] <= lat <= PHUKET_BBOX_LAT[1]
+            and PHUKET_BBOX_LON[0] <= lon <= PHUKET_BBOX_LON[1])
 
 
 def _haversine_km(lat1, lon1, lat2, lon2):
@@ -446,16 +461,18 @@ def _zone_price(z):
 def resolve_delivery(lat, lon, zones, cfg=None):
     """Точка доставки (lat, lon) + список зон Bridge → результат зоны/цены доставки.
 
+    Модель «ближайший якорь побеждает»: цена = зона с МИНИМАЛЬНОЙ дистанцией до якоря.
+    Радиусы зон и периферийный пояс OUT_BELT в расчёте НЕ участвуют (legacy). Внешняя
+    граница — bbox острова Пхукет (PHUKET_BBOX): точка вне bbox → [уточнить]/согласование.
+
     Возвращает dict:
       {"status": "zone",     "zone": <имя>, "price": <цена зоны>, "distance_km": <d>, "marker": None}
-      {"status": "out_belt", "zone": None,  "price": OUT_BELT_PRICE, "distance_km": <d>, "marker": None}
       {"status": "uncertain","zone": None,  "price": None, "distance_km": <d|None>, "marker": "[уточнить]"}
 
-    cfg — необязательный dict-оверрайд: out_belt_km, out_belt_price, marker.
-    Чистая: без сети/I/O, детерминирована. Fail-safe: любая неоднозначность → uncertain."""
+    cfg — необязательный dict-оверрайд: marker (out_belt_km/out_belt_price принимаются, но
+    как legacy игнорируются). Чистая: без сети/I/O, детерминирована. Fail-safe: любая
+    неоднозначность → uncertain."""
     cfg = cfg or {}
-    out_belt_km = float(cfg.get("out_belt_km", OUT_BELT_KM))
-    out_belt_price = cfg.get("out_belt_price", OUT_BELT_PRICE)
     marker = cfg.get("marker", DELIVERY_MARKER)
 
     def _uncertain(dist=None):
@@ -465,42 +482,37 @@ def resolve_delivery(lat, lon, zones, cfg=None):
     pt = _valid_latlon(lat, lon)
     if pt is None:                       # нет/битая координата → честный фолбэк
         return _uncertain()
+    plat, plon = pt
+    if not _in_phuket_bbox(plat, plon):  # вне острова Пхукет (материк/дальние острова) → фолбэк
+        log.info("resolve_delivery пин (%s,%s) вне bbox Пхукета → [уточнить]", plat, plon)
+        return _uncertain()
     if not isinstance(zones, (list, tuple)) or not zones:
         return _uncertain()              # зон нет (Bridge недоступен) → фолбэк
 
-    plat, plon = pt
-    # Собираем валидные якоря: (дистанция, радиус, цена, имя). Битые зоны молча пропускаем.
+    # Собираем валидные якоря: (дистанция, цена, имя). Радиус НЕ требуется и НЕ используется
+    # (legacy). Битые зоны без якоря молча пропускаем (fail-safe, а не выдуманная цена).
     anchors = []
     for z in zones:
         zd = _zone_as_dict(z)            # позиционный список Bridge → dict-схема
         a = _zone_anchor(zd)
-        r = _zone_radius_km(zd)
-        if a is None or r is None:
+        if a is None:
             continue
         d = _haversine_km(plat, plon, a[0], a[1])
-        anchors.append((d, r, _zone_price(zd), zd.get("name")))
+        anchors.append((d, _zone_price(zd), zd.get("name")))
     if not anchors:
         return _uncertain()              # ни одного валидного якоря → фолбэк
 
-    anchors.sort(key=lambda t: t[0])     # по возрастанию дистанции — ближайший первым
-    nearest_d = anchors[0][0]
-
-    # 1) ближайший якорь, покрывающий точку своим радиусом → цена его зоны.
-    for d, r, price, name in anchors:    # уже отсортированы: первый покрывающий = ближайший
-        if d <= r:
-            if price is None:            # покрыт, но цена зоны неизвестна → fail-safe
-                return _uncertain(round(d, 3))
-            return {"status": "zone", "zone": name, "price": price,
-                    "distance_km": round(d, 3), "marker": None}
-
-    # 2) периферийный пояс: любой якорь в пределах радиус + OUT_BELT_KM.
-    for d, r, _price, _name in anchors:
-        if d <= r + out_belt_km:
-            return {"status": "out_belt", "zone": None, "price": out_belt_price,
-                    "distance_km": round(d, 3), "marker": None}
-
-    # 3) далеко / вне Пхукета → честный фолбэк.
-    return _uncertain(round(nearest_d, 3))
+    anchors.sort(key=lambda t: t[0])     # по возрастанию дистанции — ближайший якорь первым
+    d, price, name = anchors[0]          # БЛИЖАЙШИЙ якорь побеждает (не «первый в списке»)
+    if price is None:                    # ближайшая зона без цены → fail-safe
+        log.info("resolve_delivery пин (%s,%s) → зона=%s дистанция=%s ЦЕНЫ НЕТ → [уточнить]",
+                 plat, plon, name, round(d, 3))
+        return _uncertain(round(d, 3))
+    # диаг-лог: пин → зона, дистанция, цена
+    log.info("resolve_delivery пин (%s,%s) → зона=%s дистанция=%s цена=%s",
+             plat, plon, name, round(d, 3), price)
+    return {"status": "zone", "zone": name, "price": price,
+            "distance_km": round(d, 3), "marker": None}
 
 
 # ===========================================================================

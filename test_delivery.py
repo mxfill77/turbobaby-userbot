@@ -301,8 +301,9 @@ class TestResolveMapsLink(unittest.TestCase):
 
 class TestResolveDelivery(unittest.TestCase):
     """Чистый резолвер зоны/цены доставки по (lat, lon). Без сети — зоны передаются прямо.
-    Инварианты: покрытие радиусом → цена зоны; на границе двух зон побеждает БЛИЖАЙШИЙ якорь;
-    за границей в поясе OUT_BELT_KM → 1490; далеко/битая точка/нет зон → маркер [уточнить]."""
+    Модель «ближайший якорь побеждает»: цена = зона с МИН. дистанцией до якоря; РАДИУСЫ и
+    OUT_BELT в расчёте НЕ участвуют (legacy); внешняя граница — bbox Пхукета (вне → [уточнить]);
+    битая точка / нет зон / у ближайшей зоны нет цены → маркер [уточнить]."""
 
     # Два якоря на одной широте (7.88), разнесены по долготе примерно на ~5.5 км.
     # На lon≈98.39 расстояние: до A(98.36)≈3.3 км, до B(98.42)≈2.2 км — B ближе.
@@ -338,17 +339,34 @@ class TestResolveDelivery(unittest.TestCase):
         self.assertEqual(r["zone"], "ЗонаA")
         self.assertEqual(r["price"], 300)
 
-    def test_out_belt_price(self):
-        # маленький радиус: точка вне радиуса, но в пределах радиус+OUT_BELT_KM → 1490
+    def test_radius_ignored_nearest_zone_wins(self):
+        # РАДИУС в расчёте НЕ участвует (модель «ближайший якорь»): точка далеко за старым
+        # радиусом зоны всё равно получает цену БЛИЖАЙШЕЙ зоны. Раньше здесь был периферийный
+        # пояс OUT_BELT → 1490; теперь пояса нет — единственная зона Z и есть ближайшая.
         zones = [{"name": "Z", "lat": 7.88, "lon": 98.39, "radius_km": 1, "price": 300}]
-        # ~3 км восточнее якоря: вне радиуса 1, но внутри 1+5
-        r = delivery.resolve_delivery(7.88, 98.415, zones)
-        self.assertEqual(r["status"], "out_belt")
-        self.assertEqual(r["price"], delivery.OUT_BELT_PRICE)
-        self.assertEqual(r["price"], 1490)
+        r = delivery.resolve_delivery(7.88, 98.415, zones)   # ~2.8 км от якоря, внутри bbox
+        self.assertEqual(r["status"], "zone")
+        self.assertEqual(r["zone"], "Z")
+        self.assertEqual(r["price"], 300)
+        self.assertIsNone(r["marker"])
+
+    def test_off_bbox_uncertain(self):
+        # точка ВНЕ bbox Пхукета (материк за Сарасином) → [уточнить] (материк не прайсуем)
+        r = delivery.resolve_delivery(8.25, 98.30, self.ZONES)
+        self.assertEqual(r["status"], "uncertain")
+        self.assertIsNone(r["price"])
+        self.assertEqual(r["marker"], "[уточнить]")
+
+    def test_off_bbox_gates_even_with_near_anchor(self):
+        # bbox-гейт срабатывает ДАЖЕ если рядом есть якорь: точка чуть севернее bbox (lat 8.29 >
+        # 8.21) + зона ровно там → всё равно [уточнить] (граница острова важнее близости).
+        zones = [{"name": "Материк", "lat": 8.30, "lon": 98.30, "price": 700}]
+        r = delivery.resolve_delivery(8.29, 98.30, zones)
+        self.assertEqual(r["status"], "uncertain")
+        self.assertEqual(r["marker"], "[уточнить]")
 
     def test_far_returns_marker(self):
-        # далеко за поясом (другой конец света) → [уточнить]
+        # далеко вне острова (другой конец света) → [уточнить]
         r = delivery.resolve_delivery(55.75, 37.62, self.ZONES)  # Москва
         self.assertEqual(r["status"], "uncertain")
         self.assertIsNone(r["price"])
@@ -392,13 +410,99 @@ class TestResolveDelivery(unittest.TestCase):
         self.assertEqual(r["zone"], "Nested")
         self.assertEqual(r["price"], 200)
 
-    def test_cfg_override(self):
-        # cfg перекрывает пояс и цену/маркер
-        zones = [{"name": "Z", "lat": 7.88, "lon": 98.39, "radius_km": 1, "price": 300}]
-        r = delivery.resolve_delivery(7.88, 98.415, zones,
-                                      cfg={"out_belt_price": 1700})
-        self.assertEqual(r["status"], "out_belt")
-        self.assertEqual(r["price"], 1700)
+    def test_cfg_marker_override(self):
+        # cfg перекрывает маркер фолбэка; out_belt_* принимаются, но как legacy игнорируются
+        r = delivery.resolve_delivery(55.75, 37.62, self.ZONES,   # Москва — вне bbox → uncertain
+                                      cfg={"marker": "??", "out_belt_price": 1700})
+        self.assertEqual(r["status"], "uncertain")
+        self.assertEqual(r["marker"], "??")
+        self.assertIsNone(r["price"])
+
+
+# --- МОК-НАБОР 20 зон для голденов модели «ближайший якорь» --------------------------------
+# Класс-урок (CLAUDE.md): мок = ЖИВОЙ формат Bridge → зоны ПОЗИЦИОННЫМ списком
+# `[name, lat, lon, price, radius]`. Это 16 живых зон прода (fixtures/delivery_zones_get.live.json)
+# + 5 правок ЧАСТИ 2 УЖЕ применены (Майкхао сдвинут; добавлены Майкхао север/Сарасин/Паклок
+# север/Банг Тао север, радиусы новых = 0). Набор детерминирован — голдены логики резолвера
+# не зависят от живого Bridge (живая проверка — ЧАСТЬ 3). Радиусы оставлены как поле формата
+# (legacy) — резолвер их игнорирует; у новых строк radius=0 (в старой модели такая зона молча
+# выпадала бы — здесь она полноправна, что и проверяют голдены новых зон).
+MOCK_ZONES_20 = [
+    ["Раваи",          7.771,  98.327,  590, 4],
+    ["Чалонг",         7.8465, 98.339,  590, 4],
+    ["Пхукет-таун",    7.8804, 98.3923, 490, 4],
+    ["Кейп Панва",     7.805,  98.412,  590, 4],
+    ["Паклок",         7.9645, 98.4085, 490, 5],
+    ["Таланг восток",  7.9256, 98.3672, 490, 5],
+    ["Таланг север",   7.9931, 98.3655, 390, 5],
+    ["Майкхао",        8.108,  98.306,  990, 6],   # ИЗМЕНЕНА (ЧАСТЬ 2): было 8.143,98.302
+    ["Аэропорт",       8.1132, 98.3169, 690, 3],
+    ["Найтон",         8.055,  98.276,  590, 4],
+    ["Банг Тао",       7.991,  98.293,  290, 4],
+    ["Сурин",          7.9788, 98.277,  290, 3],
+    ["Камала",         7.9505, 98.283,  290, 4],
+    ["Патонг",         7.8965, 98.2965, 290, 4],
+    ["Карон",          7.8475, 98.2945, 390, 3],
+    ["Ката",           7.82,   98.2985, 490, 3],
+    ["Майкхао север",  8.145,  98.315,  1290, 0],  # ДОБАВЛЕНА (ЧАСТЬ 2), радиус=0
+    ["Сарасин",        8.180,  98.325,  1590, 0],  # ДОБАВЛЕНА (ЧАСТЬ 2), радиус=0
+    ["Паклок север",   8.0508, 98.4098, 490, 0],   # ДОБАВЛЕНА (ЧАСТЬ 2), радиус=0
+    ["Банг Тао север", 8.0362, 98.3352, 290, 0],   # ДОБАВЛЕНА (ЧАСТЬ 2), радиус=0
+]
+
+
+class TestNearestAnchorGoldens(unittest.TestCase):
+    """ГОЛДЕНЫ модели «ближайший якорь побеждает» на МОК-наборе 20 зон (позиционный формат
+    Bridge, ЧАСТЬ 2 применена). Детерминировано, без сети/Bridge: точка → resolve_delivery →
+    (зона, цена). Проверяем ровно ТЗ: цена = зона с мин. дистанцией до якоря; радиусы/OUT_BELT
+    не участвуют; вне bbox Пхукета → [уточнить]. Часть точек требует НОВЫХ зон ЧАСТИ 2 —
+    поэтому набор мок, а не живой (живая проверка — ЧАСТЬ 3)."""
+
+    # (lat, lon, ожидаемая цена, ожидаемая зона) — дословно из ТЗ.
+    GOLDENS = [
+        (8.036241, 98.335240, 290,  "Банг Тао север"),
+        (8.050831, 98.409821, 490,  "Паклок север"),
+        (8.1745,   98.3416,   1590, "Сарасин"),
+        (8.115,    98.30,     990,  "Майкхао"),
+        (8.15,     98.31,     1290, "Майкхао север"),
+        (8.113,    98.317,    690,  "Аэропорт"),
+        (7.995,    98.366,    390,  "Таланг север"),
+    ]
+    # Регресс южных зон (точки ровно на якорях) — цены не должны «поехать» от новой модели.
+    SOUTH_REGRESS = [
+        (7.8965, 98.2965, 290, "Патонг"),
+        (7.8475, 98.2945, 390, "Карон"),
+        (7.82,   98.2985, 490, "Ката"),
+        (7.771,  98.327,  590, "Раваи"),
+        (7.8465, 98.339,  590, "Чалонг"),
+    ]
+
+    def test_goldens_nearest_anchor(self):
+        for lat, lon, price, zone in self.GOLDENS:
+            with self.subTest(point=(lat, lon), zone=zone):
+                r = delivery.resolve_delivery(lat, lon, MOCK_ZONES_20)
+                self.assertEqual(r["status"], "zone")
+                self.assertEqual(r["zone"], zone)
+                self.assertEqual(r["price"], price)
+                self.assertIsNone(r["marker"])
+
+    def test_south_zones_regress(self):
+        for lat, lon, price, zone in self.SOUTH_REGRESS:
+            with self.subTest(point=(lat, lon), zone=zone):
+                r = delivery.resolve_delivery(lat, lon, MOCK_ZONES_20)
+                self.assertEqual(r["zone"], zone)
+                self.assertEqual(r["price"], price)
+
+    def test_golden_mainland_off_bbox_uncertain(self):
+        # материк 8.25,98.30 — севернее bbox Пхукета (lat > 8.21) → честный [уточнить]
+        r = delivery.resolve_delivery(8.25, 98.30, MOCK_ZONES_20)
+        self.assertEqual(r["status"], "uncertain")
+        self.assertIsNone(r["price"])
+        self.assertEqual(r["marker"], "[уточнить]")
+
+    def test_mock_set_is_20_zones(self):
+        # страховка: мок = 16 живых + 4 добавленных = 20 строк (Майкхао изменён на месте)
+        self.assertEqual(len(MOCK_ZONES_20), 20)
 
 
 class TestExtractMapsLink(unittest.TestCase):
@@ -712,7 +816,7 @@ class TestDeliveryGoldens(unittest.TestCase):
     фиксирован, выход детерминирован. Канонические сценарии родителя #12 + решение ASK #51:
       1) точка в зоне                          → цена зоны
       2) точка на границе двух зон             → БЛИЖАЙШИЙ якорь (не первый в списке)
-      3) точка в поясе +5 км за границей зоны  → 1490 (OUT_BELT_PRICE)
+      3) точка далеко за старым радиусом зоны  → цена БЛИЖАЙШЕЙ зоны (радиус/OUT_BELT — legacy)
       4) точка вне острова (Москва)            → отказ [уточнить]
       5) битая/обрезанная maps-ссылка          → [уточнить] (цену не выдумываем)
       6) place-ссылка без координат            → [уточнить]
@@ -722,14 +826,14 @@ class TestDeliveryGoldens(unittest.TestCase):
     Зоны — синтетические, но с прозрачной геометрией (общая широта 7.88; 1° долготы на
     этой широте ≈ 110.3 км), чтобы дистанции/победитель проверялись глазами."""
 
-    # Два перекрывающихся якоря на широте 7.88, разнесены по долготе на ~6.6 км (r=6 → зоны
-    # перекрываются в середине). Плюс отдельная «узкая» зона для пояса. Цены различны, чтобы
-    # голден однозначно указывал зону-победителя.
+    # Два якоря на широте 7.88, разнесены по долготе на ~6.6 км. Радиус в расчёте не участвует
+    # (legacy) — оставлен в моке лишь как поле формата. Цены различны, чтобы голден однозначно
+    # указывал зону-победителя по БЛИЗОСТИ якоря.
     ZONES = [
         {"name": "ЗонаA", "lat": 7.88, "lon": 98.36, "radius_km": 6, "price": 300},
         {"name": "ЗонаB", "lat": 7.88, "lon": 98.42, "radius_km": 6, "price": 500},
     ]
-    # Узкая зона (r=1) для пояса: точка вне радиуса, но в пределах 1+OUT_BELT_KM.
+    # Одна узкая зона (r=1, legacy): точка далеко за старым радиусом всё равно получает её цену.
     ZONES_NARROW = [{"name": "Узкая", "lat": 7.88, "lon": 98.39, "radius_km": 1, "price": 300}]
 
     def _run(self, text, zones, resolve_maps=None):
@@ -768,14 +872,15 @@ class TestDeliveryGoldens(unittest.TestCase):
         self.assertEqual(r2["zone"], "ЗонаB")
         self.assertEqual(r2["price"], 500)
 
-    # 3) пояс +5 км → 1490 ----------------------------------------------------
-    def test_golden_out_belt_1490(self):
-        # ~2.8 км восточнее узкого якоря (r=1): вне радиуса, но внутри 1+OUT_BELT_KM(5) → 1490
+    # 3) радиус/OUT_BELT — legacy: далеко за старым радиусом → цена БЛИЖАЙШЕЙ зоны -----------
+    def test_golden_radius_ignored_nearest_zone(self):
+        # ~2.8 км восточнее узкого якоря (r=1): раньше был периферийный пояс OUT_BELT → 1490.
+        # Теперь радиус в расчёте НЕ участвует → ближайшая (единственная) зона Узкая, цена 300.
         text = "тут https://www.google.com/maps?q=7.88,98.415 спасибо"
         r, _ = self._run(text, self.ZONES_NARROW)
-        self.assertEqual(r["status"], "out_belt")
-        self.assertEqual(r["price"], 1490)
-        self.assertEqual(r["price"], delivery.OUT_BELT_PRICE)
+        self.assertEqual(r["status"], "zone")
+        self.assertEqual(r["zone"], "Узкая")
+        self.assertEqual(r["price"], 300)
         self.assertIsNone(r["marker"])
 
     # 4) вне острова → [уточнить] ---------------------------------------------
