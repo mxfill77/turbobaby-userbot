@@ -1986,6 +1986,115 @@ def _parse_sheet_filter(newest: str, recent: str):
     return {"kind": kind, "cc_min": cc_min, "cc_max": cc_max}
 
 
+# --- запрошенные клиентом МОДЕЛИ/КЛАСС (гвард-модель, шаг 2/7 родителя #274) -------------------
+# Экстрактор «ЧТО клиент явно просил» — вход будущего гварда сверки черновика с запросом
+# (docs/guard-model.md): конкретные модели (PCX / NMax / MT-03 …) и/или класс по кубатуре.
+# Регистронезависимо: латиница из _MODEL_TOKENS + кириллические написания. «160 кубов» — это
+# КЛАСС 150–160cc, не точное число: в речи клиента малые скутеры 150/155/160 — один класс,
+# точное 160 отсекло бы NMAX 155. Числа-ГРАНИЦЫ («от 200 кубов», «до 400cc») классом НЕ
+# считаем — их разбирает _parse_sheet_filter (подвыборка сетки).
+_MODEL_SYNONYMS = {   # кириллическое написание → латинский токен _MODEL_TOKENS (canon единый)
+    "нмакс": "nmax", "н-макс": "nmax",
+    "пцх": "pcx",
+    "хмакс": "xmax", "х-макс": "xmax",
+    "форза": "forza",
+    "адв": "adv",
+    "мт-03": "mt-03", "мт03": "mt-03", "мт 03": "mt-03",
+    "ниндзя": "ninja",
+    "ребел": "rebel", "ребель": "rebel",
+    "вулкан": "vulcan",
+    "клик": "click",
+}
+# Синоним матчится ЦЕЛЫМ словом (лукэраунды по буквам, цифры вплотную можно): «адв 350»/«адв350» —
+# да, «адвокат»/«кликните» — нет. Латиница остаётся на substring-семантике _MODEL_TOKENS.
+_MODEL_SYNONYM_RES = [
+    (re.compile(r"(?<![a-zа-яё])" + re.escape(syn) + r"(?![a-zа-яё])"), tok)
+    for syn, tok in _MODEL_SYNONYMS.items()
+]
+# Полосы cc-классов (по кубатурам парка Лист1): упомянутая кубатура → накрывающая полоса;
+# вне полос — точечный класс (cc, cc).
+_CC_CLASS_BANDS = (
+    (125, 125),
+    (150, 160),     # PCX/NMAX/ADV/XSR малые — один класс в речи клиента
+    (300, 350),     # XMAX/FORZA/CB300/REBEL 300 + ADV 350
+    (400, 400),
+    (650, 700),
+    (750, 750),
+    (900, 900),
+)
+# Упоминание кубатуры: число + куб-слово (кубов/кубиков/cc/сс/см3). ГОЛОЕ число кубатурой не
+# считаем — иначе даты («до 15») и сроки («на 10 дней») стали бы «классом».
+_CC_MENTION_RE = re.compile(r"(\d{2,4})\s*(?:куб\w*|cc|сс|см3|см³)\b", re.I)
+
+
+def _cc_class(cc):
+    """Кубатура из речи клиента → класс (cc_min, cc_max): накрывающая полоса _CC_CLASS_BANDS
+    («160» → 150–160), вне полос — точечный класс (cc, cc)."""
+    for lo, hi in _CC_CLASS_BANDS:
+        if lo <= cc <= hi:
+            return lo, hi
+    return cc, cc
+
+
+def _cc_bound_spans(t):
+    """Спаны выражений-ГРАНИЦ cc («от 200», «до 400 кубов», «200+») — упоминание кубатуры внутри
+    них НЕ запрос класса (это подвыборка _parse_sheet_filter)."""
+    out = []
+    for rx in (_SF_MIN_RE, _SF_MAX_RE):
+        out.extend(m.span() for m in rx.finditer(t))
+    return out
+
+
+def extract_requested_models(text):
+    """ЯВНО запрошенные клиентом модели/класс из его текста (регистронезависимо). → список
+    элементов в порядке появления во фразе ИЛИ None, если явного запроса нет:
+      {"type": "model", "canon": "PCX"}  — конкретная модель/серия (canon как у _detect_models);
+      {"type": "cc_class", "cc_min": 150, "cc_max": 160, "label": "150–160cc"} — класс по кубатуре.
+    «160 кубов и PCX» → [класс 150–160cc, PCX]. Кубатура вплотную к модели («PCX 160cc») — это
+    сама модель, отдельный класс не заявлен; границы («от 200 кубов») — тоже не класс."""
+    t = str(text or "").lower()
+    if not t.strip():
+        return None
+    pos = {}                                            # canon → позиция ПЕРВОГО упоминания
+    for tok in _MODEL_TOKENS:
+        i = t.find(tok)
+        if i >= 0:
+            canon = tok.upper().replace(" ", "")
+            if i < pos.get(canon, len(t) + 1):
+                pos[canon] = i
+    for rx, tok in _MODEL_SYNONYM_RES:
+        m = rx.search(t)
+        if m:
+            canon = tok.upper().replace(" ", "")
+            if m.start() < pos.get(canon, len(t) + 1):
+                pos[canon] = m.start()
+    # снять префикс, поглощённый более длинной моделью (ADV ⊂ ADV160) — как в _detect_models
+    items = [(i, {"type": "model", "canon": c}) for c, i in pos.items()
+             if not any(o != c and o.startswith(c) for o in pos)]
+    bounds = _cc_bound_spans(t)
+    seen = set()
+    for m in _CC_MENTION_RE.finditer(t):
+        s = m.start(1)
+        if any(bs <= s < be for bs, be in bounds):
+            continue                                    # число-граница, не класс
+        head = t[:s].rstrip(" -–")
+        if any(head.endswith(x) for x in _MODEL_TOKENS) \
+                or any(head.endswith(x) for x in _MODEL_SYNONYMS):
+            continue                                    # «PCX 160cc» — кубатура модели, не класс
+        cc = int(m.group(1))
+        if cc < _SF_CC_MIN_PLAUSIBLE:
+            continue                                    # «до 15», «10 дней» — не рабочий объём
+        lo, hi = _cc_class(cc)
+        if (lo, hi) in seen:
+            continue
+        seen.add((lo, hi))
+        label = f"{lo}–{hi}cc" if lo != hi else f"{lo}cc"
+        items.append((s, {"type": "cc_class", "cc_min": lo, "cc_max": hi, "label": label}))
+    if not items:
+        return None
+    return [it for _, it in sorted(items, key=lambda x: x[0])]
+
+
 # Несдаваемые модели: физически в парке (Лист1), но правило KB/CRITICAL_FACTS «НЕ сдаём» —
 # в прайс по парку НЕ включаем (Honda Click 125). Ключи нормализованы как _bike_key.
 _NON_RENTABLE_KEYS = {_bike_key("CLICK 125")}   # {'click125'}

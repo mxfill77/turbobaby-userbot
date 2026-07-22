@@ -4382,6 +4382,92 @@ class TestSheetSubselection(unittest.TestCase):
             self.assertIn(m, note)                 # без подвыборки — весь парк
 
 
+class TestExtractRequestedModels(unittest.TestCase):
+    """extract_requested_models (шаг 2/7 #274): ЯВНО запрошенные клиентом модели/класс.
+    Регистронезависимый словарь синонимов (латиница + кириллица), «160 кубов» → класс 150–160cc,
+    границы («от 200 кубов») классом НЕ считаются, нет явного запроса → None."""
+
+    def test_phrase_160cc_and_pcx(self):
+        # Дословная фраза постановки задачи: класс + модель, порядок появления во фразе.
+        self.assertEqual(
+            suggest.extract_requested_models("160 кубов и PCX"),
+            [{"type": "cc_class", "cc_min": 150, "cc_max": 160, "label": "150–160cc"},
+             {"type": "model", "canon": "PCX"}])
+
+    def test_paraphrases_160cc_and_pcx(self):
+        # Парафразы RU/EN той же пары «класс 150–160cc + PCX» (порядок во фразе любой).
+        for s in ["Есть что-то 160 кубов? И PCX интересует",
+                  "Хочу PCX или другой скутер 160 кубов",
+                  "Do you have 160cc scooters and PCX?",
+                  "PCX свободен? или любой 160сс",
+                  "160 кубиков и pcx — что по ценам?"]:
+            got = suggest.extract_requested_models(s)
+            self.assertIsNotNone(got, s)
+            kinds = {(it["type"], it.get("canon") or it.get("label")) for it in got}
+            self.assertIn(("model", "PCX"), kinds, s)
+            self.assertIn(("cc_class", "150–160cc"), kinds, s)
+
+    def test_case_insensitive_model_synonyms(self):
+        for s in ["NMax свободен?", "nmax свободен?", "НМАКС свободен?", "Нмакс на завтра"]:
+            self.assertEqual(suggest.extract_requested_models(s),
+                             [{"type": "model", "canon": "NMAX"}], s)
+
+    def test_mt03_variants(self):
+        self.assertEqual(suggest.extract_requested_models("Есть ли MT-03 на июль?"),
+                         [{"type": "model", "canon": "MT-03"}])
+        self.assertEqual(suggest.extract_requested_models("мт-03 свободен?"),
+                         [{"type": "model", "canon": "MT-03"}])
+
+    def test_cyrillic_synonyms(self):
+        self.assertEqual(suggest.extract_requested_models("Ниндзя есть в наличии?"),
+                         [{"type": "model", "canon": "NINJA"}])
+        self.assertEqual(suggest.extract_requested_models("хонда клик на месяц"),
+                         [{"type": "model", "canon": "CLICK"}])
+        self.assertEqual(suggest.extract_requested_models("Вулкан или Ребел?"),
+                         [{"type": "model", "canon": "VULCAN"},
+                          {"type": "model", "canon": "REBEL"}])
+
+    def test_multiple_models_order(self):
+        got = suggest.extract_requested_models("PCX или NMax? может, MT-03")
+        self.assertEqual([it["canon"] for it in got], ["PCX", "NMAX", "MT-03"])
+
+    def test_cc_band_membership(self):
+        # 155 и 160 — одна полоса 150–160; 300 → 300–350; 125 — точечная полоса.
+        self.assertEqual(suggest.extract_requested_models("что-нибудь 155 кубов"),
+                         [{"type": "cc_class", "cc_min": 150, "cc_max": 160,
+                           "label": "150–160cc"}])
+        self.assertEqual(suggest.extract_requested_models("интересует 300 кубов"),
+                         [{"type": "cc_class", "cc_min": 300, "cc_max": 350,
+                           "label": "300–350cc"}])
+        self.assertEqual(suggest.extract_requested_models("есть 125 кубов?"),
+                         [{"type": "cc_class", "cc_min": 125, "cc_max": 125,
+                           "label": "125cc"}])
+
+    def test_model_cc_attached_not_class(self):
+        # Кубатура вплотную к модели — это САМА модель, отдельный класс не заявлен.
+        self.assertEqual(suggest.extract_requested_models("PCX 160cc есть?"),
+                         [{"type": "model", "canon": "PCX"}])
+        self.assertEqual(suggest.extract_requested_models("adv 160cc есть?"),
+                         [{"type": "model", "canon": "ADV160"}])
+
+    def test_bounds_are_not_class(self):
+        # Границы cc — дело _parse_sheet_filter (подвыборка сетки), НЕ запрос класса → None.
+        for s in ["какие есть скутеры от 200 кубов?",
+                  "мотоциклы до 400 кубов",
+                  "скутеры 200 кубов и больше",
+                  "scooters from 200cc please"]:
+            self.assertIsNone(suggest.extract_requested_models(s), s)
+
+    def test_negatives_no_request(self):
+        for s in ["Здравствуйте! Байк свободен на завтра?",
+                  "сколько стоит аренда на 10 дней?",
+                  "какие цены на все модели?",
+                  "адвокат посоветовал вашу компанию",   # «адв» внутри слова — не модель
+                  "кликните по ссылке",                   # «клик» внутри слова — не модель
+                  "", None]:
+            self.assertIsNone(suggest.extract_requested_models(s), str(s))
+
+
 class TestTeamRegistryBlock(unittest.TestCase):
     """ЖЁСТКИЙ блок команды КОДОМ ДО LLM (родитель: инцидент @Pleummmm 15.07 11:23 — userbot
     сгенерил черновик на окно ОФИС-МЕНЕДЖЕРА). ГОЛДЕН: сообщение от участника реестра → НУЛЕВАЯ
