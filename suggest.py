@@ -2150,10 +2150,15 @@ def collected_facts(transcript: str, hints: dict = None, today=None) -> dict:
     Ничего не найдено → все False (fail-safe: просто нет пометки)."""
     h = hints if hints is not None else extract_booking_hints(transcript, today=today)
     ctext = _client_text(transcript)   # только [клиент]: строки, lower, с встроенным reply-содержимым
+    # ПРОШЕДШИЙ СТАРТ — даты НЕ считаем собранными: старт назван, но невалиден (гейт как раз просит
+    # его уточнить). Иначе в ОДНОМ промпте жили бы два противоположных указания: трекер «даты уже
+    # получены — не переспрашивай» и ЦЕНА «уточни даты, они прошли». Длительность (term) при этом
+    # известна и остаётся ✅ — переспрашивать надо именно СТАРТ.
+    start_past = _gate_start_date(h, today)[0] == "past"
     return {
         "model": bool(h.get("model")),
         "term":  bool(h.get("term_days") or (h.get("iso_start") and h.get("iso_end"))),
-        "dates": bool(h.get("iso_start") or h.get("has_start")),
+        "dates": bool(h.get("iso_start") or h.get("has_start")) and not start_past,
         "geo": bool(_COLL_GEO.search(ctext)),
         "passport": bool(_COLL_PASSPORT.search(ctext)),
         "phone": bool(_COLL_PHONE.search(ctext)),

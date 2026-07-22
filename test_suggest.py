@@ -1096,9 +1096,14 @@ class TestCollectedTracker(unittest.TestCase):
         self.assertNotIn("собрано:", d)
         self.assertNotIn("УЖЕ ПОЛУЧЕНО", suggest.make_system_prompt("FAQ", "ru", collected=facts))
 
+    # «Сегодня» ИНЪЕКТИРУЕМ там, где во фразе прибитые июль/август: с реальной датой на стене эти
+    # старты рано или поздно утекают в ПРОШЛОЕ, а прошедший старт — это «даты ❌» (гейт просит их
+    # уточнить, см. TestPastStartDateGate). Тест обязан проверять РАСПОЗНАВАНИЕ старта, а не календарь.
+    TODAY_FIX = datetime.date(2026, 7, 1)
+
     def test_model_and_dates_from_hints(self):
         tr = "[клиент]: NMAX с 7 по 14 июля"
-        facts = suggest.collected_facts(tr)
+        facts = suggest.collected_facts(tr, today=self.TODAY_FIX)
         self.assertTrue(facts["model"])
         self.assertTrue(facts["term"])    # диапазон задаёт длительность
         self.assertTrue(facts["dates"])   # и конкретный старт
@@ -1116,7 +1121,7 @@ class TestCollectedTracker(unittest.TestCase):
         # старт (число+месяц / dd.mm / «с завтрашнего») + длительность/диапазон → срок ✅ и даты ✅.
         for phr in ("с 15 июля на 10 дней", "с 15.07 на 10 дней", "с завтрашнего на неделю",
                     "с 7 по 14 июля", "10.07-15.07", "с 3 августа на 5 дней"):
-            f = suggest.collected_facts(f"[клиент]: {phr}")
+            f = suggest.collected_facts(f"[клиент]: {phr}", today=self.TODAY_FIX)
             self.assertTrue(f["dates"], f"конкретный старт не пойман: {phr}")
             self.assertTrue(f["term"], f"срок не пойман: {phr}")
 
@@ -1133,7 +1138,8 @@ class TestCollectedTracker(unittest.TestCase):
             suggest.collected_manager_note(suggest.collected_facts("[клиент]: на 10 дней")),
             "[собрано: срок ✅]")
         self.assertEqual(
-            suggest.collected_manager_note(suggest.collected_facts("[клиент]: с 15 июля на 10 дней")),
+            suggest.collected_manager_note(
+                suggest.collected_facts("[клиент]: с 15 июля на 10 дней", today=self.TODAY_FIX)),
             "[собрано: срок ✅ даты ✅]")
 
     def test_payment_detected(self):
@@ -4888,6 +4894,26 @@ class TestPastStartDateGate(unittest.TestCase):
         self.assertIn("старт завтра", note)                          # якорь = ближайшая дата
         self.assertIn("уже прошло", note)                            # и просьба уточнить даты
         self.assertNotIn("2027", note)                               # по заролленному году не считали
+
+    # ---------------- трекер собранного не спорит с гейтом ----------------
+    def test_past_start_is_not_collected_dates(self):
+        # Два противоположных указания в ОДНОМ промпте недопустимы: пока старт прошедший, «даты»
+        # НЕ собраны (гейт просит их уточнить), а вопрос про даты НЕ выкидывается фильтром.
+        tr = "[клиент]: Хочу nmax с 20 по 25 июля, сколько будет?"
+        hints = suggest.extract_booking_hints(tr, today=self.TODAY)
+        facts = suggest.collected_facts(tr, hints, today=self.TODAY)
+        self.assertFalse(facts["dates"])                         # старт невалиден → не собрано
+        self.assertTrue(facts["term"])                            # длительность известна (5 дней)
+        self.assertTrue(facts["model"])
+        kept = suggest.filter_booking_questions(["На какие даты нужен байк?"], facts, "ru")
+        self.assertEqual(kept, ["На какие даты нужен байк?"])     # вопрос про даты остаётся
+
+    def test_future_start_still_collected_dates_regression(self):
+        tr = "[клиент]: Хочу nmax с 28 июля по 5 августа, сколько будет?"
+        hints = suggest.extract_booking_hints(tr, today=self.TODAY)
+        facts = suggest.collected_facts(tr, hints, today=self.TODAY)
+        self.assertTrue(facts["dates"])                           # прежнее поведение цело
+        self.assertTrue(facts["term"])
 
     # ---------------- анти-тайский ----------------
     def test_no_thai_in_gate_texts(self):
