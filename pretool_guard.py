@@ -19,7 +19,31 @@ pretool_guard.py — PreToolUse-хук Claude Code для ПК (D:\\turbobaby-bo
 (del/rm/rmdir/Remove-Item); правка .claude/*; kill/taskkill/schtasks/Stop-Process;
 git push --force / reset --hard / clean; sqlite3 / SQL-запись в БД; запись/исполнение вне
 D:\\turbobaby-bot; сеть кроме git/Bridge/Telegram (curl/wget/ssh/scp/…); python-скрипт с
-боевой записью (Bridge create_booking/add_transaction/… , os.remove/rmtree, SQL-write).
+боевой записью (Bridge create_booking/add_transaction/… , os.remove/rmtree, SQL-write);
+живые таблицы (clasp / Apps Script / Sheets API).
+
+РАЗВОД ПО РОЛИ (регрессия удобства после оживления гарда в 0014ea6). Гард был мёртв (bash
+съедал бэкслеши в пути), ожил — и КАЖДАЯ небелая команда интерактивной RC-сессии стала
+требовать Allow: `_decide_bash` заканчивается на ("ask","unknown"), а решение хука
+ПЕРЕКРЫВАЕТ permissions.allow. Владелец тонет в подтверждениях. Лечим НЕ глобальным
+ослаблением, а разводом по роли:
+
+  HEADLESS (демон pc_orchestrator и его дети/субагенты) — поведение ПРЕЖНЕЕ, байт-в-байт:
+      строгий `decide()` без единого послабления. Жёсткость демона не трогаем.
+  ИНТЕРАКТИВ (RC-сессия владельца, сессии Claude Desktop) — красным остаётся ТОЛЬКО
+      доктринальное (см. `_stays_red`), остальное молча пропускается, но ЛОГИРУЕТСЯ.
+
+Роль определяется ПО ФАКТУ и ПЕРЕИСПОЛЬЗУЕТ уже существующий механизм: демон штампует
+КАЖДОМУ своему headless-ребёнку env `PRETOOL_ASK_MARKER` (pc_orchestrator.run_task, это
+ЕДИНСТВЕННЫЙ путь спавна headless — run_claude), и гард этот штамп уже читает в `_emit_ask`.
+env наследуется вниз по дереву процессов, значит субагенты headless-ребёнка тоже помечены.
+Родственный счётчик `_count_claude_procs` различает роль обходом цепи PPID через CIM — здесь
+так НЕЛЬЗЯ: это powershell-вызов (timeout 20с) на КАЖДЫЙ tool-call хука. Штамп демона — тот
+же факт, но бесплатно.
+
+ЛОГ (`pretool_guard.log`, под *.log в .gitignore): пишется КАЖДОЕ решение обеих ролей —
+смягчение не должно стоить прозрачности. Строка: время | роль | инструмент | решение | вид |
+команда (обрезана, значения токенов/паролей замаскированы).
 """
 import sys
 import os
@@ -27,6 +51,7 @@ import re
 import json
 import shlex
 import subprocess
+import datetime
 
 try:  # хук-протокол Claude Code читает stdout как UTF-8; форсим, чтобы 🔴/кириллица не бились
     sys.stdout.reconfigure(encoding="utf-8")
@@ -37,6 +62,8 @@ PROJECT = r"D:\turbobaby-bot"
 PROJ_N = os.path.normcase(os.path.normpath(PROJECT))
 VENV_PY = os.path.join(PROJECT, "venv", "Scripts", "python.exe")
 DNOTIFY = os.path.join(PROJECT, "dispatch_notify.py")
+GUARD_LOG = os.path.join(PROJECT, "pretool_guard.log")   # под *.log в .gitignore — в репо не уедет
+GUARD_LOG_MAX = 2 * 1024 * 1024                          # 2 МБ → ротация в .log.1 (лог не растёт вечно)
 
 # --- КРАСНЫЕ признаки Bash-команды → (regex, kind) ---
 _RED_CMD = [
@@ -49,6 +76,9 @@ _RED_CMD = [
     (re.compile(r"(?i)git\s+reset\s+--hard"), "git_force"),
     (re.compile(r"(?i)git\s+clean(\s|$)"), "git_force"),
     (re.compile(r"(?i)(^|[\s;&|(])sqlite3([\s;&|)]|$)"), "sqlite"),
+    (re.compile(r"(?i)(^|[\s;&|(])clasp([\s;&|)]|$)"), "clasp"),
+    # живые таблицы напрямую (не через Bridge): Apps Script / Sheets API / gspread
+    (re.compile(r"(?i)script\.google\.com|sheets\.googleapis\.com|(^|[\s;&|(])gspread([\s;&|)]|$)"), "live_sheet"),
     (re.compile(r"(?i)(^|[\s;&|(])(curl|wget|iwr|irm)([\s;&|)]|$)|invoke-webrequest|invoke-restmethod"), "network"),
     (re.compile(r"(?i)(^|[\s;&|(])(ssh|scp|sftp|nc|ncat|telnet)([\s;&|)]|$)"), "network"),
 ]
@@ -93,6 +123,8 @@ def _human(kind, obj=""):
         "schtasks": "Хочу выполнить операцию Планировщика задач (schtasks)",
         "git_force": "Хочу перезаписать git-историю (push --force / reset --hard / clean)",
         "sqlite": ("Хочу записать в базу данных " + o) if o else "Хочу записать в базу данных (sqlite)",
+        "clasp": "Хочу выполнить clasp (код Apps Script живых таблиц)",
+        "live_sheet": "Хочу обратиться к ЖИВЫМ таблицам напрямую (Лист1 / CRM / Календарь)",
         "network": ("Хочу выйти в сеть к " + o) if o else "Хочу выполнить сетевую команду (curl/wget/ssh)",
         "env": "Хочу обратиться к .env / секретам",
         "outside": ("Хочу записать за пределами проекта: " + o) if o else "Хочу выполнить операцию за пределами проекта",
@@ -125,6 +157,10 @@ _RED_PY_TOKENS = [
     "set_fleet_oil", "set_fleet_service", "delete_event", "closing_upsert",
     "os.remove", "os.unlink", "shutil.rmtree", "rmtree(", "os.rmdir",
 ]
+
+# Живые таблицы из python-кода (Лист1/CRM/Календарь напрямую, минуя Bridge). Отдельно от
+# _RED_PY_TOKENS: у них своя карточка, и в _stays_red они красные безусловно.
+_LIVE_SHEET_TOKENS = ["gspread", "sheets.googleapis.com", "script.google.com"]
 
 
 def _inside_project(path):
@@ -220,6 +256,9 @@ def _scan_python(cmd, cwd):
     blob = cmd + "\n" + content
     if _RE_ENV.search(blob):
         return ("ask", "env", "")
+    for tok in _LIVE_SHEET_TOKENS:
+        if tok in blob:
+            return ("ask", "live_sheet", tok)
     for tok in _RED_PY_TOKENS:
         if tok in blob:
             return ("ask", "py_write", tok)
@@ -300,6 +339,111 @@ def decide(data):
     return ("defer", "", "")  # Grep/Glob/прочие read-only инструменты
 
 
+# ------------------------------- роль и доктрина ------------------------------
+
+ASK_MARKER_ENV = "PRETOOL_ASK_MARKER"   # штамп демона на КАЖДОМ headless-ребёнке (pc_orchestrator.run_task)
+
+# Массовое удаление (красное) vs удаление ОДНОГО явного файла (в интерактиве зелёное).
+_RE_DEL_TAIL = re.compile(r"(?i)(?:^|[\s;&|(])(?:del|erase|rmdir|rd|rm|remove-item)\b(.*)$")
+_RE_DEL_RECURSE = re.compile(r"(?i)(^|\s)(-[a-z]*r[a-z]*|/s|-recurse\w*)(\s|$)")
+_RE_SCHTASKS_QUERY = re.compile(r"(?i)\bschtasks\b[^;&|]*\s/query\b")
+
+
+def is_headless(env=None):
+    """Роль ПО ФАКТУ. True ⇔ headless-ребёнок демона (или его субагент): демон штампует
+    env PRETOOL_ASK_MARKER каждому спавну (единственный путь — run_task→run_claude), env
+    наследуется вниз по дереву процессов. Интерактивные сессии владельца (RC-сессия под
+    rc_supervisor, сессии Claude Desktop) этого штампа не имеют. env — инъекция для тестов."""
+    e = os.environ if env is None else env
+    return bool((e.get(ASK_MARKER_ENV) or "").strip())
+
+
+def _is_mass_delete(cmd):
+    """Массовое удаление ⇔ рекурсивный флаг (-r/-rf/-Recurse//s), маска (*/?) или БОЛЬШЕ ОДНОЙ
+    цели. Удаление одного явного файла массовым НЕ считается (доктрина владельца: красное —
+    именно «массовые удаления»)."""
+    m = _RE_DEL_TAIL.search(cmd or "")
+    tail = m.group(1) if m else (cmd or "")
+    if "*" in tail or "?" in tail:
+        return True
+    if _RE_DEL_RECURSE.search(tail):
+        return True
+    targets = [t for t in re.findall(r"[^\s\"';|&]+", tail)
+               if not t.startswith("-") and not t.startswith("/")]
+    return len(targets) > 1
+
+
+def _stays_red(kind, obj, cmd):
+    """Доктрина ИНТЕРАКТИВНОЙ сессии: что и после разведения ролей продолжает спрашивать Allow.
+    Всё, что сюда не попало, в интерактиве пропускается молча (и пишется в лог)."""
+    if kind in ("env", "edit_secret", "read_secret",     # .env и секреты
+                "sqlite",                                 # живая БД
+                "clasp", "live_sheet",                    # живые таблицы (Лист1 / CRM / Календарь)
+                "kill",                                   # остановка процессов
+                "git_force",                              # git clean/reset --hard = массовый снос работы
+                "network",                                # выход в сеть = канал утечки секретов
+                "outside", "write_outside",               # требование п.1: правки ТОЛЬКО внутри репо
+                "edit_claude"):                           # иначе сессия молча расширит собственные права
+        return True
+    if kind == "delete":
+        return _is_mass_delete(cmd)
+    if kind == "schtasks":
+        return not _RE_SCHTASKS_QUERY.search(cmd or "")   # /query — чтение, остальное = контроль задач
+    if kind == "py_write":
+        return obj in _RED_PY_TOKENS      # боевой токен = красное; «скрипт не прочитан»/«-m X» = неизвестность
+    return False                          # unknown и прочее — источник потопа, в интерактиве молча
+
+
+def decide_for_role(data, headless):
+    """Решение С УЧЁТОМ РОЛИ. headless → строгий decide() БЕЗ послаблений (жёсткость демона и
+    его детей прежняя). Интерактив → красным остаётся только доктринальное. Возвращает
+    (action, kind, obj); kind/obj сохраняются и при смягчении — они нужны логу."""
+    action, kind, obj = decide(data)
+    if headless or action != "ask":
+        return action, kind, obj
+    cmd = ""
+    if (data.get("tool_name") or "") == "Bash":
+        cmd = (data.get("tool_input") or {}).get("command") or ""
+    if _stays_red(kind, obj, cmd):
+        return action, kind, obj
+    return ("defer", kind, obj)
+
+
+# ------------------------------- лог прозрачности -----------------------------
+
+_RE_SECRET_VALUE = re.compile(
+    r"(?i)([A-Za-z_]*(?:token|api_?key|secret|password|passwd|pwd)[A-Za-z_]*)(\s*[=:]\s*)(\S+)")
+
+
+def _log_line(role, tool, action, kind, detail):
+    """Одна строка лога. Значения токенов/паролей маскируем: лог обязан быть безопасным
+    артефактом (сам файл под *.log в .gitignore, но печатать секреты нельзя и локально)."""
+    d = _RE_SECRET_VALUE.sub(lambda m: m.group(1) + m.group(2) + "***", (detail or "").replace("\n", " "))
+    if len(d) > 300:
+        d = d[:300] + "…"
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return f"{ts} | {role} | {tool or '-'} | {action} | {kind or '-'} | {d}"
+
+
+def _log(role, tool, action, kind, detail, path=None):
+    """Дописать решение в лог. Смягчение не должно стоить прозрачности: пишем ОБЕ роли и ОБА
+    решения (defer и ask). Лог вторичен — никогда не роняет решение гарда."""
+    p = path or os.getenv("PRETOOL_GUARD_LOG") or GUARD_LOG
+    try:
+        if os.path.isfile(p) and os.path.getsize(p) > GUARD_LOG_MAX:
+            bak = p + ".1"
+            try:
+                if os.path.isfile(bak):
+                    os.remove(bak)
+                os.replace(p, bak)
+            except Exception:
+                pass
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(_log_line(role, tool, action, kind, detail) + "\n")
+    except Exception:
+        pass
+
+
 # ------------------------------- вывод/пуш -----------------------------------
 
 def _card(kind, obj="", raw_cmd=""):
@@ -355,7 +499,7 @@ def _emit_ask(card):
     # Сигнал headless→демон (pc_orchestrator): в headless карточку не показать интерактивно,
     # поэтому при заданном env пишем красную карточку в файл-маркер — демон детектит и ставит
     # NEEDS_APPROVAL. В интерактивной сессии env не задан → поведение не меняется.
-    mk = os.environ.get("PRETOOL_ASK_MARKER")
+    mk = os.environ.get(ASK_MARKER_ENV)
     if mk:
         _write_marker(mk, card)
     _push(card)
@@ -372,15 +516,24 @@ def main():
         data = json.load(sys.stdin)
     except Exception:
         sys.exit(0)  # вход не распарсили → штатный flow (defer)
+    headless = is_headless()
+    role = "headless" if headless else "interactive"
+    tool, detail = "", ""
     try:
-        action, kind, obj = decide(data)
+        tool = data.get("tool_name") or ""
+        ti = data.get("tool_input") or {}
+        detail = ti.get("command") or ti.get("file_path") or ti.get("notebook_path") or ""
     except Exception:
+        pass
+    try:
+        action, kind, obj = decide_for_role(data, headless)
+    except Exception:
+        # FAIL-SAFE в ЛЮБОЙ роли: ошибку анализа НЕ смягчаем (иначе сбой гарда = тихий пропуск,
+        # а permissions.allow здесь широкий — гард единственный красный гейт).
         action, kind, obj = ("ask", "unknown", "")
+    _log(role, tool, action, kind, detail)
     if action == "ask":
-        raw = ""
-        if (data.get("tool_name") or "") == "Bash":
-            raw = (data.get("tool_input") or {}).get("command", "") or ""
-        _emit_ask(_card(kind, obj, raw))
+        _emit_ask(_card(kind, obj, detail if tool == "Bash" else ""))
     sys.exit(0)  # defer
 
 

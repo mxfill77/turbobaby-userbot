@@ -303,5 +303,195 @@ class TestMarkerIsolation(unittest.TestCase):
                 pass
 
 
+# ============================ РОЛЬ: интерактив vs headless ============================
+# Регрессия удобства после оживления гарда (0014ea6): интерактивная RC-сессия требовала Allow
+# на КАЖДУЮ небелую команду. Развод по роли — красное только доктринальное в интерактиве,
+# жёсткость демона и его детей БЕЗ изменений.
+
+# Команды, которые в ИНТЕРАКТИВЕ обязаны проходить молча, а в HEADLESS — по-прежнему спрашивать.
+GREEN_IN_INTERACTIVE = (
+    'powershell -NoProfile -Command "Get-Date -Format o"',   # было ("ask","unknown") — главный источник потопа
+    "npm --version",
+    "mkdir -p tmp/scratch",
+    "rm tmp/scratch/one.txt",                                 # ОДИН явный файл — не «массовое удаление»
+    "schtasks /Query /TN TurboBabyRC",                        # /Query — чтение, не контроль задач
+    "venv/Scripts/python.exe no_such_script.py",              # py_write «скрипт не прочитан» = неизвестность, не боевая запись
+)
+
+# (команда, ожидаемый вид) — красное В ЛЮБОЙ роли по доктрине владельца.
+RED_IN_BOTH_ROLES = (
+    ('sqlite3 bookings.db "select 1"', "sqlite"),
+    ("clasp push", "clasp"),
+    ("taskkill /PID 1234 /F", "kill"),
+    ('powershell -NoProfile -Command "Stop-Process -Id 1234"', "kill"),
+    ("rm -rf tmp/scratch", "delete"),                         # рекурсивное = массовое
+    ("del *.tmp", "delete"),                                  # маска = массовое
+    ("rm a.txt b.txt", "delete"),                             # больше одной цели = массовое
+    ("cat .env", "env"),
+    ("schtasks /End /TN TurboBabyRC", "schtasks"),
+    ('venv/Scripts/python.exe -c "import bridge; bridge.create_booking()"', "py_write"),
+    ("python -c \"import gspread\"", "live_sheet"),
+)
+
+
+class TestRoleDetection(unittest.TestCase):
+    """Роль ПО ФАКТУ через штамп демона PRETOOL_ASK_MARKER (переиспользуем существующий
+    механизм pc_orchestrator.run_task, а не заводим второй)."""
+
+    def test_marker_means_headless(self):
+        self.assertTrue(g.is_headless({"PRETOOL_ASK_MARKER": r"D:\turbobaby-bot\pc_ask_42.marker"}))
+
+    def test_no_marker_means_interactive(self):
+        self.assertFalse(g.is_headless({}))
+        self.assertFalse(g.is_headless({"PRETOOL_ASK_MARKER": ""}))
+        self.assertFalse(g.is_headless({"PRETOOL_ASK_MARKER": "   "}))
+
+
+class TestInteractiveGreen(unittest.TestCase):
+    """ГОЛДЕН: зелёная команда в интерактивной сессии → НОЛЬ Allow."""
+
+    def test_green_passes_silently(self):
+        for c in GREEN_IN_INTERACTIVE:
+            self.assertEqual(g.decide_for_role(bash(c), headless=False)[0], "defer", c)
+
+    def test_unknown_is_softened_only_in_interactive(self):
+        d = bash("some-unheard-of-tool --flag")
+        self.assertEqual(g.decide(d), ("ask", "unknown", ""))          # строгий классификатор не изменён
+        self.assertEqual(g.decide_for_role(d, headless=False)[0], "defer")
+        self.assertEqual(g.decide_for_role(d, headless=True)[0], "ask")
+
+    def test_edits_inside_repo_pass_but_outside_and_dotclaude_stay_red(self):
+        self.assertEqual(g.decide_for_role(edit(os.path.join(PROJ, "suggest.py")), False)[0], "defer")
+        # требование п.1: Edit разрешён ТОЛЬКО внутри репо — вне репо остаётся Allow
+        self.assertEqual(g.decide_for_role(edit(r"C:\Windows\Temp\x.py"), False)[0], "ask")
+        # .claude/* — иначе сессия молча расширила бы собственные права
+        self.assertEqual(g.decide_for_role(edit(os.path.join(PROJ, ".claude", "settings.json")), False)[0], "ask")
+
+
+class TestInteractiveRed(unittest.TestCase):
+    """ГОЛДЕНЫ: sqlite3 / clasp / .env / kill / массовое удаление — Allow обязателен."""
+
+    def test_doctrine_red_still_asks(self):
+        for cmd, kind in RED_IN_BOTH_ROLES:
+            action, got_kind, _ = g.decide_for_role(bash(cmd), headless=False)
+            self.assertEqual(action, "ask", cmd)
+            self.assertEqual(got_kind, kind, cmd)
+
+    def test_read_env_asks(self):
+        action, kind, _ = g.decide_for_role(read(os.path.join(PROJ, ".env")), headless=False)
+        self.assertEqual((action, kind), ("ask", "read_secret"))
+
+    def test_mass_delete_vs_single_file(self):
+        self.assertFalse(g._is_mass_delete("rm tmp/one.txt"))
+        self.assertFalse(g._is_mass_delete("del old.log"))
+        for c in ("rm -rf tmp/", "rm -r tmp", "del *.tmp", "rmdir /s tmp",
+                  "Remove-Item -Recurse -Force tmp", "rm a.txt b.txt"):
+            self.assertTrue(g._is_mass_delete(c), c)
+
+
+class TestHeadlessUnchanged(unittest.TestCase):
+    """РЕГРЕСС: headless-контур НЕ ТРОНУТ — решение ребёнка демона совпадает со строгим
+    классификатором до последнего поля, для зелёных И красных."""
+
+    def test_headless_equals_strict_decide(self):
+        cases = ([bash(c) for c in GREEN_IN_INTERACTIVE]
+                 + [bash(c) for c, _ in RED_IN_BOTH_ROLES]
+                 + [bash("git status"), bash("venv/Scripts/python.exe -m unittest test_suggest"),
+                    edit(os.path.join(PROJ, "suggest.py")), edit(r"C:\Windows\Temp\x.py"),
+                    read(os.path.join(PROJ, ".env"))])
+        for d in cases:
+            self.assertEqual(g.decide_for_role(d, headless=True), g.decide(d), d)
+
+    def test_headless_still_asks_on_everything_interactive_now_passes(self):
+        for c in GREEN_IN_INTERACTIVE:
+            self.assertEqual(g.decide_for_role(bash(c), headless=True)[0], "ask", c)
+
+    def test_green_for_both_roles_stays_green(self):
+        """Что было зелёным ДО развода — зелено в обеих ролях (развод не ужесточает демона)."""
+        for c in ("git status", "git commit -m 'x'", "venv/Scripts/python.exe -m unittest test_suggest",
+                  'venv/Scripts/python.exe cowork_log_append.py "DONE x"'):
+            self.assertEqual(g.decide_for_role(bash(c), headless=True)[0], "defer", c)
+            self.assertEqual(g.decide_for_role(bash(c), headless=False)[0], "defer", c)
+
+
+class TestGuardLog(unittest.TestCase):
+    """Смягчение не должно стоить прозрачности: пишем КАЖДОЕ решение обеих ролей."""
+
+    def _tmp(self):
+        fd, p = tempfile.mkstemp(suffix=".guardlog")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.isfile(p) and os.remove(p))
+        return p
+
+    def test_log_writes_decision(self):
+        p = self._tmp()
+        g._log("interactive", "Bash", "defer", "unknown", "npm --version", path=p)
+        with open(p, encoding="utf-8") as f:
+            line = f.read().strip()
+        for part in ("interactive", "Bash", "defer", "unknown", "npm --version"):
+            self.assertIn(part, line)
+
+    def test_secret_values_are_masked(self):
+        line = g._log_line("interactive", "Bash", "defer", "", 'set TELEGRAM_TOKEN=8123:AAF-real-secret')
+        self.assertIn("TELEGRAM_TOKEN=***", line)
+        self.assertNotIn("AAF-real-secret", line)
+
+    def test_long_command_truncated(self):
+        line = g._log_line("headless", "Bash", "ask", "unknown", "x" * 900)
+        self.assertLess(len(line), 400)
+        self.assertTrue(line.endswith("…"))
+
+
+class TestRoleEndToEnd(unittest.TestCase):
+    """Живой прогон процессом: интерактив = БЕЗ штампа демона в env."""
+
+    def _run(self, data, env_extra=None, raw=None):
+        env = dict(os.environ, PRETOOL_NOPUSH="1", PYTHONIOENCODING="utf-8")
+        env.pop("PRETOOL_ASK_MARKER", None)     # нет штампа демона ⇒ роль = интерактивная сессия
+        env.pop("PRETOOL_MARKER_TOKEN", None)
+        env.update(env_extra or {})
+        return subprocess.run([sys.executable, os.path.join(PROJ, "pretool_guard.py")],
+                              input=(raw if raw is not None else json.dumps(data)),
+                              capture_output=True, text=True, encoding="utf-8", env=env, timeout=30)
+
+    def test_interactive_green_zero_allow_but_logged(self):
+        fd, logp = tempfile.mkstemp(suffix=".guardlog")
+        os.close(fd)
+        try:
+            p = self._run(bash('powershell -NoProfile -Command "Get-Date -Format o"'),
+                          env_extra={"PRETOOL_GUARD_LOG": logp})
+            self.assertEqual(p.returncode, 0)
+            self.assertEqual(p.stdout.strip(), "")          # ← НОЛЬ Allow: карточки нет
+            with open(logp, encoding="utf-8") as f:
+                logged = f.read()
+            self.assertIn("interactive", logged)            # ← но след в логе есть
+            self.assertIn("defer", logged)
+            self.assertIn("Get-Date", logged)
+        finally:
+            try:
+                os.remove(logp)
+            except Exception:
+                pass
+
+    def test_interactive_sqlite_still_asks(self):
+        p = self._run(bash('sqlite3 bookings.db "select 1"'))
+        out = json.loads(p.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertIn("базу данных", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_interactive_clasp_still_asks(self):
+        p = self._run(bash("clasp push"))
+        out = json.loads(p.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertIn("Apps Script", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_internal_error_is_not_softened(self):
+        """FAIL-SAFE: сбой анализа → ask В ЛЮБОЙ роли (гард — единственный красный гейт при
+        широком permissions.allow, тихий пропуск на ошибке недопустим)."""
+        p = self._run({"tool_name": "Bash", "tool_input": "кривой вход", "cwd": PROJ})
+        out = json.loads(p.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
