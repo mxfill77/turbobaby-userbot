@@ -8,10 +8,18 @@
   но ЖИВАЯ консоль — интерактивной сессии claude нужен TTY) → rc_supervisor.py (вечный цикл
   «claude ‑‑remote‑control turbobaby-pc» + резолв новейшей версии CLI перед каждым стартом).
 
-  УСТАНОВКА (нужна ПОВЫШЕННАЯ PowerShell — обычный токен получает «Access is denied»):
-    Register-ScheduledTask -TaskName pc_remote_control -Force -Xml `
-      (Get-Content 'D:\turbobaby-bot\pc_remote_control.task.xml' -Raw -Encoding UTF8)
-    Start-ScheduledTask -TaskName pc_remote_control
+  УСТАНОВЛЕНО 22.07 под именем TurboBabyRC (владелец завёл задачу этим именем; /TN
+  перекрывает URI ниже, оба пути рабочие). Установка требует ПОВЫШЕННОЙ PowerShell —
+  обычный токен получает «Access is denied»:
+    schtasks /Create /XML "D:\turbobaby-bot\pc_remote_control.task.xml" /TN "TurboBabyRC"
+    Start-ScheduledTask -TaskName TurboBabyRC
+  (schtasks разбирает XML ДО проверки прав — проверено: битый файл даёт «malformed»,
+  наш даёт «Access denied», значит UTF-8 он читает нормально.)
+
+  ЭКСПЛУАТАЦИЯ: перед рестартом задачи убедись, что старая сессия мертва —
+  осиротевший «claude --remote-control turbobaby-pc» переживает смерть супервизора и
+  занимает имя устройства (живой прокол 22.07: первый старт задачи повис с НУЛЁМ
+  TCP-соединений, пока рядом догорала прежняя сессия с тем же именем).
 
   Триггер — ВХОД В СИСТЕМУ (как у pc_agent), а не «загрузка ПК»: сессии нужен интерактивный
   токен пользователя, до логина его не существует.

@@ -38,6 +38,9 @@ client_chats.jsonl
 cowork_drop.log
 cowork_drop.offset
 
+# локальный переключатель отладки канала Remote Control (кладётся руками на время разбора)
+rc_debug.flag
+
 # снимок надзора контур-вотчдога (runtime, пишет демон → читает status pc_agent)
 pc_orchestrator.client_watch.json
 pc_orchestrator.client_watch.json.tmp

@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 rc_supervisor.py — вечный сеанс Claude Code Remote Control на ПК (ОСНОВНОЙ канал владельца,
-Termux — в резерве). Поднимается задачей Планировщика `pc_remote_control` при входе в систему.
+Termux — в резерве). Поднимается задачей Планировщика `TurboBabyRC` при входе в систему
+(шаблон задачи — pc_remote_control.task.xml; имя задаётся ключом /TN при установке).
 
 ПОЧЕМУ ОБЁРТКА, А НЕ ПРЯМОЙ ЗАПУСК claude ИЗ ПЛАНИРОВЩИКА (как у pc_agent):
   1) remote-control — это ФЛАГ ИНТЕРАКТИВНОЙ сессии (`claude --remote-control [имя]`), а не
@@ -35,6 +36,13 @@ LOG_PATH = os.path.join(REPO, "rc_remote_control.log")
 SESSION_NAME = os.getenv("RC_SESSION_NAME", "turbobaby-pc")
 RESTART_DELAY = int(os.getenv("RC_RESTART_DELAY", "15") or "15")   # сек между выходом и подъёмом
 MUTEX_NAME = "Global\\turbobaby_rc_supervisor"
+# Диагностика канала. Сессию поднимает ПЛАНИРОВЩИК, её stdout/stderr перехватить нельзя:
+# любое перенаправление убивает TTY, без которого интерактивная сессия не живёт. Поэтому
+# просим сам CLI писать отладку в ФАЙЛ (--debug-file) — TTY цел, диагностика есть.
+# Включатель — файл-флаг rc_debug.flag рядом с супервизором (env для задачи Планировщика
+# без прав администратора не задать, а флаг кладётся обычным пользователем).
+DEBUG_FLAG = os.path.join(REPO, "rc_debug.flag")
+DEBUG_LOG = os.path.join(REPO, "rc_session_debug.log")   # под *.log в .gitignore — в репо не уедет
 
 log = logging.getLogger("rc_supervisor")
 log.setLevel(logging.INFO)
@@ -142,10 +150,19 @@ def acquire_singleton(name=MUTEX_NAME):
         return True, None
 
 
-def run_once(claude, runner=None, name=SESSION_NAME):
+def debug_args(exists=None):
+    """Аргументы отладки сессии: есть файл-флаг rc_debug.flag → ['--debug-file', <лог>], иначе [].
+    Путь можно переопределить env RC_DEBUG_FILE. exists — инъекция для тестов."""
+    _exists = exists or os.path.exists
+    if not _exists(DEBUG_FLAG):
+        return []
+    return ["--debug-file", os.getenv("RC_DEBUG_FILE") or DEBUG_LOG]
+
+
+def run_once(claude, runner=None, name=SESSION_NAME, dbg=None):
     """Один прогон интерактивной сессии Remote Control. Консоль/stdin/stdout НЕ перенаправляем
     (иначе TTY исчезнет и интерактивная сессия не поднимется). → код выхода."""
-    cmd = [claude, "--remote-control", name]
+    cmd = [claude, "--remote-control", name] + (debug_args() if dbg is None else dbg)
     p = (runner or subprocess.run)(cmd, cwd=REPO)
     return getattr(p, "returncode", 0)
 

@@ -5,7 +5,7 @@
 ' ничего не мигает. Именно поэтому здесь НЕ pythonw.exe и НЕ CREATE_NO_WINDOW: они убирают
 ' саму консоль, а вместе с ней TTY, без которого интерактивная сессия не поднимется.
 '
-' Задача Планировщика pc_remote_control зовёт:
+' Задача Планировщика TurboBabyRC (шаблон — pc_remote_control.task.xml) зовёт:
 '   wscript.exe //B //Nologo "D:\turbobaby-bot\rc_remote_control.vbs"
 Option Explicit
 Dim sh, cmd

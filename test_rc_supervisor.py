@@ -118,6 +118,51 @@ class TestSupervisorLoop(unittest.TestCase):
         self.assertEqual(runs, [])
 
 
+class TestDebugArgs(unittest.TestCase):
+    """Диагностика канала: stdout/stderr сессии перехватить нельзя (перенаправление убивает
+    TTY), поэтому просим сам CLI писать отладку в файл. Включатель — файл-флаг: env для задачи
+    Планировщика без прав администратора не задать, а флаг кладётся обычным пользователем."""
+
+    def test_off_without_flag(self):
+        self.assertEqual(rc.debug_args(exists=lambda p: False), [])
+
+    def test_on_with_flag(self):
+        args = rc.debug_args(exists=lambda p: True)
+        self.assertEqual(args[0], "--debug-file")
+        self.assertTrue(args[1].endswith(".log"))     # под *.log в .gitignore — секреты не уедут
+
+    def test_flag_path_is_repo_local(self):
+        self.assertTrue(rc.DEBUG_FLAG.startswith(rc.REPO))
+        self.assertTrue(rc.DEBUG_LOG.startswith(rc.REPO))
+
+    def test_run_once_appends_debug_args(self):
+        seen = {}
+
+        class _P:
+            returncode = 0
+
+        def runner(cmd, **kw):
+            seen["cmd"] = cmd
+            return _P()
+
+        rc.run_once(r"C:\ver\claude.exe", runner=runner, dbg=["--debug-file", "x.log"])
+        self.assertEqual(seen["cmd"][-2:], ["--debug-file", "x.log"])
+        self.assertEqual(seen["cmd"][1:3], ["--remote-control", rc.SESSION_NAME])
+
+    def test_run_once_clean_without_debug(self):
+        seen = {}
+
+        class _P:
+            returncode = 0
+
+        def runner(cmd, **kw):
+            seen["cmd"] = cmd
+            return _P()
+
+        rc.run_once(r"C:\ver\claude.exe", runner=runner, dbg=[])
+        self.assertEqual(len(seen["cmd"]), 3)         # ничего лишнего в боевом запуске
+
+
 class TestNoWindowKilling(unittest.TestCase):
     """Интерактивной сессии нужен ЖИВОЙ TTY: run_once НЕ имеет права перенаправлять stdio или
     гасить консоль (CREATE_NO_WINDOW/pythonw). Скрытость даёт wscript (WshShell.Run …, 0)."""
