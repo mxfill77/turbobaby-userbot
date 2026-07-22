@@ -150,6 +150,52 @@ def acquire_singleton(name=MUTEX_NAME):
         return True, None
 
 
+# Маркеры НЕПРИГОДНОГО для Remote Control входа — дословно из штатного `claude doctor`.
+# Живой прокол 22.07: `claude auth status` бодро отвечал loggedIn=true / max, а мост при этом
+# не поднимался НИКОГДА, потому что вход был выдан без скоупа user:profile. Сессия при этом не
+# падала и не ругалась — просто жила пустым процессом. Проверять надо ИМЕННО doctor.
+RC_BLOCKERS = (
+    "Remote Control requires",
+    "Not signed in to claude.ai",
+    "missing the user:profile scope",
+    "subscription auth not active",
+)
+
+
+def rc_ready(claude, runner=None, timeout=120):
+    """Готов ли контур поднять мост Remote Control → (ok, detail).
+
+    FAIL-OPEN: если сам doctor не запустился/завис — НЕ блокируем канал (гард обязан ловить
+    известную поломку, а не становиться новой точкой отказа)."""
+    try:
+        p = (runner or subprocess.run)([claude, "doctor"], capture_output=True, text=True,
+                                       encoding="utf-8", errors="replace",
+                                       timeout=timeout, cwd=REPO)
+    except Exception as e:
+        return True, "doctor не отработал (%s) — не блокируем" % type(e).__name__
+    out = (getattr(p, "stdout", "") or "") + (getattr(p, "stderr", "") or "")
+    hits = [m for m in RC_BLOCKERS if m in out]
+    if hits:
+        return False, "; ".join(hits)
+    return True, "doctor: препятствий для Remote Control нет"
+
+
+def notify_owner(text, runner=None):
+    """Карточка владельцу через существующий dispatch_notify (тема 1160, личка — фолбэк).
+    Fire-and-forget: канал уже сломан, уведомление не смеет сломать ещё и супервизор."""
+    py = os.path.join(REPO, "venv", "Scripts", "python.exe")
+    if not os.path.isfile(py):
+        py = sys.executable
+    try:
+        (runner or subprocess.run)([py, os.path.join(REPO, "dispatch_notify.py"),
+                                    "--critical", text],
+                                   capture_output=True, timeout=30, cwd=REPO)
+        return True
+    except Exception as e:
+        log.warning("карточка владельцу не ушла (%s)", type(e).__name__)
+        return False
+
+
 def debug_args(exists=None):
     """Аргументы отладки сессии: есть файл-флаг rc_debug.flag → ['--debug-file', <лог>], иначе [].
     Путь можно переопределить env RC_DEBUG_FILE. exists — инъекция для тестов."""
@@ -167,18 +213,21 @@ def run_once(claude, runner=None, name=SESSION_NAME, dbg=None):
     return getattr(p, "returncode", 0)
 
 
-def main(resolver=None, runner=None, sleeper=None, rounds=None, singleton=None):
-    """Вечный цикл: резолв claude → сессия → пауза → снова. rounds — ограничитель для тестов
-    (None = бесконечно), singleton — инъекция гарда-синглтона (иначе тесты зависели бы от того,
-    жив ли РЕАЛЬНЫЙ супервизор на этой машине: мьютекс-то один на всю ОС)."""
+def main(resolver=None, runner=None, sleeper=None, rounds=None, singleton=None,
+         ready=None, notifier=None):
+    """Вечный цикл: резолв claude → ПРЕ-ФЛАЙТ → сессия → пауза → снова. rounds — ограничитель
+    для тестов (None = бесконечно), singleton/ready/notifier — инъекции для тестов (мьютекс один
+    на всю ОС, а doctor и Telegram в тестах дёргать нельзя)."""
     ok, _handle = (singleton or acquire_singleton)()
     if not ok:
         log.info("супервизор уже запущен (мьютекс занят) — вторая копия выходит")
         return 0
     _resolve = resolver or resolve_claude
+    _ready = ready or rc_ready
     _sleep = sleeper or time.sleep
     log.info("супервизор стартовал (pid=%s, сессия='%s', cwd=%s)", os.getpid(), SESSION_NAME, REPO)
     n = 0
+    warned = False          # карточку о непригодном входе шлём ОДИН раз, а не каждый круг
     while rounds is None or n < rounds:
         n += 1
         claude = _resolve()
@@ -187,6 +236,24 @@ def main(resolver=None, runner=None, sleeper=None, rounds=None, singleton=None):
                       "жду %s с", RESTART_DELAY)
             _sleep(RESTART_DELAY)
             continue
+        # ПРЕ-ФЛАЙТ: без пригодного входа мост Remote Control не поднимется, а сессия при этом
+        # НЕ падает — просто живёт пустым процессом (живой прокол 22.07: «задача Running,
+        # процесс есть» при полностью мёртвом канале). Не плодим зомби: пишем диагноз и ждём.
+        ok_rc, detail = _ready(claude)
+        if not ok_rc:
+            log.error("Remote Control НЕДОСТУПЕН: %s — сессию НЕ поднимаю (иначе будет живой "
+                      "процесс при мёртвом канале). Нужен `claude auth login` в ВИДИМОМ окне "
+                      "под этим пользователем; жду %s с", detail, RESTART_DELAY)
+            if not warned:
+                (notifier or notify_owner)(
+                    "⚠️ Канал Remote Control на ПК не поднимается: " + detail +
+                    ". Нужен вход руками: открой обычное окно терминала и выполни "
+                    "`claude auth login` (аккаунт claude.ai), затем разреши Remote Control. "
+                    "Супервизор ждёт и поднимет канал сам, как только вход станет пригодным.")
+                warned = True
+            _sleep(RESTART_DELAY)
+            continue
+        warned = False
         log.info("старт сессии: %s --remote-control %s", claude, SESSION_NAME)
         try:
             rc = run_once(claude, runner=runner)

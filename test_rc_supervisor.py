@@ -184,6 +184,90 @@ class TestNoWindowKilling(unittest.TestCase):
         self.assertEqual(seen.get("cwd"), rc.REPO)
 
 
+class TestPreflight(unittest.TestCase):
+    """ГОЛДЕН живого прокола 22.07: задача Running, процесс claude жив — а канал МЁРТВ.
+    `claude auth status` при этом отвечал loggedIn=true/max и ничего не подозревал; правду
+    сказал только `claude doctor`: вход выдан БЕЗ скоупа user:profile, мост не поднимется.
+    Значит пре-флайт обязан смотреть doctor и НЕ плодить пустых процессов."""
+
+    # дословный фрагмент живого вывода doctor (правило-класс «мок = живой формат»)
+    DOCTOR_BAD = (
+        "Remote Control\n"
+        "Remote Control requires a claude.ai subscription. Run claude auth login to sign in "
+        "with your claude.ai account.\n"
+        "- Not signed in to claude.ai\n"
+        "- claude.ai subscription auth not active\n"
+        "- Sign-in is missing the user:profile scope\n"
+        "\n4 warnings found\n"
+    )
+    DOCTOR_OK = "Remote Control\n- Connected\n\n0 warnings found\n"
+
+    class _P:
+        def __init__(self, out="", err="", rc=0):
+            self.stdout, self.stderr, self.returncode = out, err, rc
+
+    def test_blocked_login_detected(self):
+        ok, detail = rc.rc_ready(r"C:\c.exe", runner=lambda *a, **k: self._P(self.DOCTOR_BAD))
+        self.assertFalse(ok)
+        self.assertIn("user:profile", detail)
+
+    def test_healthy_login_passes(self):
+        ok, detail = rc.rc_ready(r"C:\c.exe", runner=lambda *a, **k: self._P(self.DOCTOR_OK))
+        self.assertTrue(ok)
+
+    def test_fail_open_when_doctor_breaks(self):
+        def boom(*a, **k):
+            raise OSError("doctor не запустился")
+        ok, detail = rc.rc_ready(r"C:\c.exe", runner=boom)
+        self.assertTrue(ok)                       # гард не смеет сам стать точкой отказа
+        self.assertIn("не блокируем", detail)
+
+    def test_blockers_found_in_stderr_too(self):
+        ok, _ = rc.rc_ready(r"C:\c.exe", runner=lambda *a, **k: self._P("", self.DOCTOR_BAD))
+        self.assertFalse(ok)
+
+    def test_no_session_spawned_when_not_ready(self):
+        runs, cards, slept = [], [], []
+        rc.main(resolver=lambda: r"C:\ver\claude.exe",
+                runner=lambda *a, **k: runs.append(a),
+                sleeper=slept.append, singleton=lambda: (True, None),
+                ready=lambda c: (False, "Sign-in is missing the user:profile scope"),
+                notifier=cards.append, rounds=3)
+        self.assertEqual(runs, [])                # НИ ОДНОГО пустого процесса-зомби
+        self.assertEqual(len(cards), 1)           # карточка владельцу ровно одна, не спам
+        self.assertIn("auth login", cards[0])
+        self.assertEqual(slept, [rc.RESTART_DELAY] * 3)
+
+    def test_session_spawned_when_ready(self):
+        runs = []
+
+        class _R:
+            returncode = 0
+
+        def runner(cmd, **kw):
+            runs.append(cmd)
+            return _R()
+
+        rc.main(resolver=lambda: r"C:\ver\claude.exe", runner=runner,
+                sleeper=lambda s: None, singleton=lambda: (True, None),
+                ready=lambda c: (True, "ок"), notifier=lambda t: None, rounds=2)
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[0][1:3], ["--remote-control", rc.SESSION_NAME])
+
+    def test_card_repeats_after_recovery(self):
+        # починили → сломалось снова: владелец должен узнать повторно (флаг сбрасывается)
+        seq = iter([(False, "нет входа"), (True, "ок"), (False, "нет входа")])
+        cards = []
+
+        class _R:
+            returncode = 0
+
+        rc.main(resolver=lambda: r"C:\ver\claude.exe", runner=lambda *a, **k: _R(),
+                sleeper=lambda s: None, singleton=lambda: (True, None),
+                ready=lambda c: next(seq), notifier=cards.append, rounds=3)
+        self.assertEqual(len(cards), 2)
+
+
 class TestLauncherFiles(unittest.TestCase):
     """Цепочка запуска обязана остаться скрытой И консольной: wscript → VBS → venv-python."""
 
