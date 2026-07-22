@@ -9,6 +9,7 @@ Anthropic: оба замоканы. Реальной отправки клиен
 import test_isolation  # noqa: F401 — ПЕРВОЙ строкой: TESTING=1, боевой IPC/токен недоступны
 
 import os
+import re
 import json
 import time
 import asyncio
@@ -4670,6 +4671,233 @@ class TestRunLiveSmoke(unittest.TestCase):
         self.assertTrue(r["ok"])                                 # skip не считается провалом
         self.assertEqual(r["draft"], "")
         self.assertEqual(sent, [])                               # в окно ничего не ушло
+
+
+class TestPastStartDateGate(unittest.TestCase):
+    """ЖИВОЙ ДЕФЕКТ (тренажёр ТЕСТ-7, 22.07): клиент «с 20 по 25 июля», сегодня 22 июля → бот МОЛЧА
+    посчитал котировку (parse_date_range заролил старт на 2027-07-20 — год-ролл _mk сработал как
+    «лечение» прошедшей даты). Гейт: старт РАНЬШЕ сегодняшнего дня (по ПХУКЕТУ) → переспрос БЕЗ
+    цены; старт сегодня/завтра → штатная котировка + уточнение времени подачи; будущее — без
+    изменений; «в декабре про январь» — БУДУЩЕЕ (год-ролл цел). Формат мока Bridge — живой
+    (quote_price c day_price/total/deposit/days), как в TestPointQuoteCodeBlock."""
+
+    FLEET = ["NMAX 155CC BLACK PHUKET 4255"]
+    TODAY = datetime.date(2026, 7, 22)          # живая дата инцидента
+
+    def setUp(self):
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+
+    def tearDown(self):
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+
+    def _getter(self):
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET]}}
+            if suggest._bike_key("NMAX 155") not in suggest._bike_key(params.get("bike", "")):
+                return {"ok": False}
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            return {"ok": True, "data": {"day_price": 337, "total": 1685, "deposit": 3000,
+                    "available": True, "days": days, "cap_active": False, "cap_price": 0}}
+        return fake
+
+    def _note(self, text, today=None, lang="ru"):
+        today = today or self.TODAY
+        hints = suggest.extract_booking_hints(text, today=today)
+        return hints, suggest.build_pricing_note(hints, lang=lang, getter=self._getter(), today=today)
+
+    def _assert_no_price(self, note):
+        """Ни одной суммы/тарифа: нет «N ฿/бат/baht/THB», нет чисел ЦЕНОВОГО порядка (в белом списке
+        пост-чека только дни/месяцы дат, ничего ≥100) — значит ЛЮБОЙ итог, который сочинит LLM,
+        будет заклеймлён postcheck_draft."""
+        self.assertIsNone(re.search(r"\d[\d\s.,]*\s*(?:฿|бат|baht|thb)", note, re.I),
+                          f"в переспросе появилась сумма: {note}")
+        big = {n for n in suggest._pc_wl_price_numbers(note) if n >= 100}
+        self.assertEqual(big, set(), f"в белый список пост-чека попало число цены: {note}")
+        for n in ("337", "1685", "3000"):                 # числа мока Bridge не просочились
+            self.assertNotIn(n, note)
+
+    # ---------------- ГОЛДЕН 1: прошедшие даты → переспрос БЕЗ цены ----------------
+    def test_golden_past_dates_ask_without_price(self):
+        # ДОСЛОВНАЯ фраза живого кейса (правило-класс CLAUDE.md: голден детекта = реальное
+        # сообщение клиента, а не идеализированная формулировка).
+        hints, note = self._note("[клиент]: Хочу nmax с 20 по 25 июля, сколько будет?")
+        self.assertEqual(hints["date_status"], "past")
+        self.assertEqual(hints["start_seen"], "2026-07-20")      # прочтение клиента, не ролл 2027
+        self.assertIn("УЖЕ ПРОШЁЛ", note)
+        self.assertIn("20 июля", note)                            # называем ИМЕННО ту дату
+        self.assertIn("22 июля", note)                            # и сегодняшнюю (Пхукет)
+        self.assertIn("Уточните, пожалуйста, даты", note)          # дословный пример переспроса
+        self.assertIn("август", note)                              # вариант «следующий месяц»
+        self.assertNotIn("2027", note)                             # молчаливый год-ролл не всплыл
+        self._assert_no_price(note)
+
+    def test_golden_past_dates_paraphrases(self):
+        # Парафразы того же живого смысла (RU/EN) — гейт на СТАРТЕ, а не на формулировке.
+        for text in ("[клиент]: nmax 20.07-25.07 сколько?",
+                     "[клиент]: аренда nmax с 20 июля на неделю, цена?",
+                     "[клиент]: сколько стоит nmax с 21 по 30 июля?"):
+            with self.subTest(text=text):
+                hints, note = self._note(text)
+                self.assertEqual(hints["date_status"], "past")
+                self.assertIn("УЖЕ ПРОШЁЛ", note)
+                self._assert_no_price(note)
+
+    def test_golden_past_dates_en(self):
+        hints, note = self._note("[клиент]: nmax 20.07-25.07, how much?", lang="en")
+        self.assertEqual(hints["date_status"], "past")
+        self.assertIn("IN THE PAST", note)
+        self.assertIn("20 July", note)
+        self.assertIn("Could you confirm the dates", note)
+        self.assertIn("August", note)
+        self._assert_no_price(note)
+
+    def test_golden_past_dates_draft_has_no_price(self):
+        # СКВОЗЬ ЧЕРНОВИК: LLM всё же сочинил сумму → пост-чек клеймит её (белый список цен пуст,
+        # потому что котировки не было). Цена клиенту не уезжает молча.
+        _h, note = self._note("[клиент]: Хочу nmax с 20 по 25 июля, сколько будет?")
+        draft = suggest.postcheck_draft("Аренда NMAX — 1685 ฿ за 5 дней.", "ru", pricing_note=note)
+        self.assertIn("[уточнить:", draft)                         # пометка модератору появилась
+        self.assertNotIn("1685 ฿", suggest.client_facing_text(draft))   # сумма клиенту НЕ уехала
+
+    # ---------------- ГОЛДЕН 2: сегодня/завтра → котировка + время подачи ----------------
+    def test_golden_start_today_quotes_and_asks_pickup_time(self):
+        hints, note = self._note("[клиент]: Хочу nmax с 22 по 27 июля, сколько будет?")
+        self.assertEqual(hints["date_status"], "today")
+        self.assertIn("1685", note)                                # штатная котировка на месте
+        self.assertIn("ЦЕНА из Календаря", note)
+        self.assertIn("ВРЕМЯ ПОДАЧИ", note)                        # + уточнение времени подачи
+        self.assertIn("СЕГОДНЯ", note)
+        self.assertNotIn("УЖЕ ПРОШЁЛ", note)
+
+    def test_golden_start_tomorrow_quotes_and_asks_pickup_time(self):
+        hints, note = self._note("[клиент]: Хочу nmax с 23 по 28 июля, сколько будет?")
+        self.assertEqual(hints["date_status"], "tomorrow")
+        self.assertIn("1685", note)
+        self.assertIn("ВРЕМЯ ПОДАЧИ", note)
+        self.assertIn("ЗАВТРА", note)
+
+    def test_golden_pickup_note_en(self):
+        _h, note = self._note("[клиент]: nmax 23.07-28.07, how much?", lang="en")
+        self.assertIn("1685", note)
+        self.assertIn("PICK-UP TIME", note)
+        self.assertIn("tomorrow", note)
+
+    # ---------------- ГОЛДЕН 3: будущее — штатная котировка (регресс) ----------------
+    def test_golden_future_dates_unchanged(self):
+        hints, note = self._note("[клиент]: Хочу nmax с 28 июля по 5 августа, сколько будет?")
+        self.assertEqual(hints["date_status"], "future")
+        self.assertIn("1685", note)
+        self.assertIn("337", note)
+        self.assertNotIn("УЖЕ ПРОШЁЛ", note)
+        self.assertNotIn("ВРЕМЯ ПОДАЧИ", note)                     # подача не при чём — старт не скоро
+        self.assertIsNotNone(suggest._quote_block_from_note(note))  # quote-блок цел (транспорт #92)
+
+    def test_golden_future_note_byte_for_byte_as_before_gate(self):
+        # РЕГРЕСС: на будущем старте нота ПОБАЙТОВО равна ноте, собранной без участия гейта
+        # (hints без date_status — как их собирает вызывающий вручную).
+        hints, note = self._note("[клиент]: Хочу nmax с 28 июля по 5 августа, сколько будет?")
+        bare = {k: v for k, v in hints.items() if k not in ("date_status", "start_seen")}
+        note_bare = suggest.build_pricing_note(bare, lang="ru", getter=self._getter(),
+                                               today=self.TODAY)
+        self.assertEqual(note, note_bare)
+
+    # ---------------- ГОЛДЕН 4: ГОД-РОЛЛ (декабрь → январь) = БУДУЩЕЕ ----------------
+    def test_golden_year_roll_january_from_december_is_future(self):
+        # Клиент в декабре пишет «с 5 по 10 января» → это ЯНВАРЬ СЛЕДУЮЩЕГО года (+14 дней), а НЕ
+        # прошлое: ближайшее вхождение — будущее. Котируем штатно, переспроса быть НЕ должно.
+        dec = datetime.date(2025, 12, 22)
+        hints, note = self._note("[клиент]: nmax с 5 по 10 января, сколько?", today=dec)
+        self.assertEqual((hints["iso_start"], hints["iso_end"]), ("2026-01-05", "2026-01-10"))
+        self.assertEqual(hints["date_status"], "future")
+        self.assertEqual(hints["start_seen"], "2026-01-05")
+        self.assertIn("1685", note)                                # цена названа
+        self.assertNotIn("УЖЕ ПРОШЁЛ", note)
+
+    def test_golden_year_roll_dec_to_jan_range_is_future(self):
+        # «с 28 декабря по 3 января» в декабре — переход через год, старт в БУДУЩЕМ (штатная ветка).
+        dec = datetime.date(2025, 12, 22)
+        hints, note = self._note("[клиент]: nmax с 28 декабря по 3 января", today=dec)
+        self.assertEqual((hints["iso_start"], hints["iso_end"]), ("2025-12-28", "2026-01-03"))
+        self.assertEqual(hints["date_status"], "future")
+        self.assertIn("1685", note)
+
+    def test_nearest_occurrence_rule_both_directions(self):
+        # Правило «ближайшее вхождение» посимвольно: −2 дня → прошлое, −351 день → следующий год.
+        jul = datetime.date(2026, 7, 22)
+        self.assertEqual(suggest.start_date_status("2027-07-20", jul), "past")     # ролл «лечил» прошлое
+        self.assertEqual(suggest.start_date_status("2027-01-20", jul), "future")   # −183 дня → следующий год
+        dec = datetime.date(2025, 12, 22)
+        self.assertEqual(suggest.start_date_status("2026-01-05", dec), "future")   # год-ролл цел
+        # ЯВНЫЙ год клиента снимает неоднозначность — читаем буквально, ближайшее вхождение не ищем.
+        self.assertEqual(suggest.start_date_status("2027-07-20", jul, "с 20 по 25 июля 2027"), "future")
+        self.assertEqual(suggest.start_date_status("2026-07-20", jul, "20.07.2026-25.07.2026"), "past")
+        self.assertIsNone(suggest.start_date_status(None, jul))                    # нет старта → гейт молчит
+        self.assertIsNone(suggest.start_date_status("не дата", jul))
+
+    # ---------------- ГОЛДЕН 5: ТАЙМЗОНА — решаем по Пхукету, не по UTC ----------------
+    def test_golden_timezone_phuket_wins_on_day_border(self):
+        # ГРАНИЦА СУТОК: UTC 21.07 18:30 = 22.07 01:30 на Пхукете. По UTC «сегодня» = 21 июля, по
+        # Пхукету — 22 июля.
+        utc_now = datetime.datetime(2026, 7, 21, 18, 30, tzinfo=datetime.timezone.utc)
+        self.assertEqual(utc_now.date(), datetime.date(2026, 7, 21))               # UTC-дата
+        self.assertEqual(suggest.today_phuket(utc_now), datetime.date(2026, 7, 22))  # дата Пхукета
+        self.assertEqual(suggest.now_phuket(utc_now).hour, 1)                       # 01:30 по Пхукету
+
+    def test_golden_timezone_decides_gate_on_day_border(self):
+        # Тот же момент, живой запрос «с 21 по 26 июля»: по UTC старт = «сегодня» (котировали бы),
+        # по ПХУКЕТУ он УЖЕ ПРОШЁЛ → переспрос БЕЗ цены. Решение принимается по Пхукету.
+        utc_now = datetime.datetime(2026, 7, 21, 18, 30, tzinfo=datetime.timezone.utc)
+        text = "[клиент]: nmax с 21 по 26 июля, сколько?"
+        _h_utc, note_utc = self._note(text, today=utc_now.date())                  # КАК БЫЛО БЫ по UTC
+        self.assertIn("1685", note_utc)                                            # по UTC — котировка
+        hints, note = self._note(text, today=suggest.today_phuket(utc_now))        # как ДОЛЖНО быть
+        self.assertEqual(hints["date_status"], "past")
+        self.assertIn("УЖЕ ПРОШЁЛ", note)
+        self.assertIn("21 июля", note)
+        self._assert_no_price(note)
+
+    def test_today_phuket_offset_is_utc_plus_7_without_tzdata(self):
+        # Смещение фиксированное +07:00 (Таиланд без DST) — голден зелёный на ЛЮБОМ интерпретаторе,
+        # в т.ч. без пакета tzdata (системный python этого ПК его не имеет).
+        self.assertEqual(suggest.PHUKET_TZ.utcoffset(None), datetime.timedelta(hours=7))
+        utc_now = datetime.datetime(2026, 1, 15, 23, 10, tzinfo=datetime.timezone.utc)  # зима: DST нет
+        self.assertEqual(suggest.now_phuket(utc_now).hour, 6)
+        self.assertEqual(suggest.today_phuket(utc_now), datetime.date(2026, 1, 16))
+        naive = datetime.datetime(2026, 1, 15, 23, 10)      # наивный трактуем как UTC, не как локаль ПК
+        self.assertEqual(suggest.today_phuket(naive), datetime.date(2026, 1, 16))
+
+    # ---------------- ПРАЙС ПО ПАРКУ: сетку не блокируем, но и по прошлому не считаем ----------------
+    def test_price_sheet_past_dates_keeps_grid_and_asks_dates(self):
+        # Владельческое «даты НЕ гейт» цело: прайс выдаём (анти-луп), но якорь — ближайшая дата,
+        # а не прошедшая/заролленная, плюс просьба уточнить даты.
+        hints = suggest.extract_booking_hints(
+            "[клиент]: пришлите цены на все модели, аренда с 20 по 25 июля", today=self.TODAY)
+        self.assertEqual(hints["date_status"], "past")
+        note = suggest.build_pricing_note(hints, lang="ru", getter=self._getter(), today=self.TODAY)
+        self.assertIn("ПРАЙС ПО ПАРКУ", note)                       # сетка на месте
+        self.assertIn("старт завтра", note)                          # якорь = ближайшая дата
+        self.assertIn("уже прошло", note)                            # и просьба уточнить даты
+        self.assertNotIn("2027", note)                               # по заролленному году не считали
+
+    # ---------------- анти-тайский ----------------
+    def test_no_thai_in_gate_texts(self):
+        for lang in ("ru", "en"):
+            _h, past = self._note("[клиент]: nmax 20.07-25.07, сколько?", lang=lang)
+            _h2, pickup = self._note("[клиент]: nmax 23.07-28.07, сколько?", lang=lang)
+            self.assertFalse(_has_thai_letters(past), f"тайские буквы в переспросе ({lang})")
+            self.assertFalse(_has_thai_letters(pickup), f"тайские буквы в подаче ({lang})")
+            self.assertFalse(_has_thai_letters(suggest._past_start_sheet_note(
+                datetime.date(2026, 7, 20), self.TODAY, lang)))
 
 
 if __name__ == "__main__":

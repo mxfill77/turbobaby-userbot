@@ -142,6 +142,10 @@ class TestHintsAndNote(unittest.TestCase):
 
     _HINTS = {"has_dates": True, "model": "NMAX", "iso_start": "2026-07-10",
               "iso_end": "2026-07-17", "hint_days": 7, "monthly": False}
+    # «Сегодня» ИНЪЕКТИРУЕМ (как в test_extract_numeric_dates): даты фикстуры обязаны быть в
+    # БУДУЩЕМ относительно него, иначе гейт прошедшего старта (suggest.start_date_status) честно
+    # перехватывает расчёт до Календаря — и тест ценовой ветки зависел бы от календаря на стене.
+    _TODAY = datetime.date(2026, 7, 3)
 
     def _with_qfm(self, ret):
         saved = pricing.quote_for_model
@@ -151,21 +155,21 @@ class TestHintsAndNote(unittest.TestCase):
     def test_note_quote_ok_carries_figure(self):
         self._with_qfm({"status": "ok", "quote": {"day_price": 900, "total": 6300,
                                                   "deposit": 7000, "available": True, "days": 7}})
-        note = suggest.build_pricing_note(dict(self._HINTS))
+        note = suggest.build_pricing_note(dict(self._HINTS), today=self._TODAY)
         self.assertIn("Календаря", note)
         self.assertIn("900", note)
         self.assertIn("6300", note)
 
     def test_note_error_is_fallback_no_faq_number(self):
         self._with_qfm({"status": "error", "quote": None})
-        note = suggest.build_pricing_note(dict(self._HINTS))
+        note = suggest.build_pricing_note(dict(self._HINTS), today=self._TODAY)
         self.assertIn("уточн", note.lower())
         for faq_price in ("449", "939", "998", "1185", "1798"):
             self.assertNotIn(faq_price, note)
 
     def test_note_none_available_no_number(self):
         self._with_qfm({"status": "none_available", "quote": None})
-        note = suggest.build_pricing_note(dict(self._HINTS)).lower()
+        note = suggest.build_pricing_note(dict(self._HINTS), today=self._TODAY).lower()
         self.assertIn("заняты", note)
         for faq_price in ("449", "939", "998", "1185", "1798"):
             self.assertNotIn(faq_price, note)
@@ -215,6 +219,17 @@ class TestTwoPhaseDraft(unittest.TestCase):
             return "FALLBACK"
         return "OTHER"
 
+    # ЖИВОЙ путь on_client_message «сегодня» НЕ инъектирует (боевая дата) — значит даты в реплике
+    # клиента обязаны быть в БУДУЩЕМ ОТНОСИТЕЛЬНО СЕГОДНЯ, а не прибитыми: с прибитой «10.07»
+    # тест жил ровно до того дня, пока дата не утекла в прошлое, и дальше проверял бы уже гейт
+    # прошедшего старта (переспрос дат), а не ту ценовую ветку, ради которой написан.
+    def _ddmm(self, offset_days):
+        d = suggest.today_phuket() + datetime.timedelta(days=offset_days)
+        return f"{d.day:02d}.{d.month:02d}"
+
+    def _range(self, start_offset, span_days):
+        return f"{self._ddmm(start_offset)}-{self._ddmm(start_offset + span_days)}"
+
     def _run(self, client_line):
         client = FakeClient([FakeHistMsg(42, "Здравствуйте! Что арендуем?"),
                              FakeHistMsg(999, client_line)])
@@ -230,18 +245,18 @@ class TestTwoPhaseDraft(unittest.TestCase):
     def test_phase_b_quote_ok_uses_figure(self):
         pricing.quote_for_model = lambda *a, **k: {"status": "ok", "quote": {
             "day_price": 900, "total": 6300, "deposit": 7000, "available": True, "days": 7}}
-        self.assertTrue(self._run("NMAX 10.07-17.07 почём?").startswith("HAS_PRICE"))
+        self.assertTrue(self._run(f"NMAX {self._range(7, 7)} почём?").startswith("HAS_PRICE"))
 
     def test_phase_b_bad_days_sanity_fallback(self):
         # SANITY: quote days=360 при hint 5 дней → фолбэк, цифры НЕ уходят
         pricing.quote_for_model = lambda *a, **k: {"status": "ok", "quote": {
             "day_price": 219, "total": 78858, "deposit": 3000, "available": True, "days": 360}}
-        draft = self._run("NMAX с 5 по 10 июля")   # hint ~5 дней
+        draft = self._run(f"NMAX {self._range(7, 5)}")   # hint ~5 дней
         self.assertTrue(draft.startswith("FALLBACK"), draft)
 
     def test_phase_b_quote_error_fallback(self):
         # quote_for_model → error (setUp) → фолбэк, без FAQ-числа
-        self.assertTrue(self._run("NMAX 10.07-17.07").startswith("FALLBACK"))
+        self.assertTrue(self._run(f"NMAX {self._range(7, 7)}").startswith("FALLBACK"))
 
 
 class TestFleetResolve(unittest.TestCase):

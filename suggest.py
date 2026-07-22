@@ -1215,7 +1215,7 @@ def detect_first_message_booking(text: str, today=None):
     («с 15 июля») и срок («на 2 недели» → 14 дней; поддержка дней/недель/месяцев). Возвращает
     {'model': 'XSR 155', 'startDate': 'YYYY-MM-DD', 'days': 14} ИЛИ None, если ХОТЯ БЫ ОДНОГО из
     трёх полей нет. Детерминированно (без сети/LLM), переиспользует _anchor_date/_parse_term."""
-    today = today or datetime.date.today()
+    today = today or today_phuket()
     t = (text or "").lower().replace("–", "-").replace("—", "-").replace("ё", "е")
     model = _detect_catalog_model(text)
     anchor = _anchor_date(t, today)          # дата старта («с 15 июля», «завтра», «с 20»)
@@ -1299,6 +1299,32 @@ _MONTHS = ("январ", "феврал", "март", "апрел", "мая", "и
 
 def _client_text(transcript: str) -> str:
     return "\n".join(l for l in (transcript or "").split("\n") if l.startswith("[клиент]:")).lower()
+
+
+# ------------------- «СЕГОДНЯ» — ПО ПХУКЕТУ, а не по локали сервера/UTC -------------------
+# Весь клиентский контур живёт по времени Пхукета: «сегодня/завтра», «дата уже прошла» и якорь
+# прайса обязаны считаться в Asia/Bangkok. На ГРАНИЦЕ СУТОК UTC даёт ДРУГОЙ день (UTC 21.07 18:30 =
+# 22.07 01:30 на Пхукете): по UTC старт «с 21 июля» выглядел бы «сегодня» (котируем), по Пхукету он
+# уже ПРОШЁЛ (переспрашиваем) — решение обязано приниматься по Пхукету.
+# Смещение ФИКСИРОВАННОЕ (+07:00): Таиланд без перехода на летнее время (UTC+7 с 1920 г.), поэтому
+# НЕ тянем zoneinfo — на системном python этого ПК пакета tzdata нет вовсе (ZoneInfoNotFoundError на
+# ZoneInfo("Asia/Bangkok")), а голдены обязаны быть зелёными на ЛЮБОМ интерпретаторе, не только в venv.
+PHUKET_TZ = datetime.timezone(datetime.timedelta(hours=7), "Asia/Bangkok")
+
+
+def now_phuket(now=None) -> datetime.datetime:
+    """Текущий момент по Пхукету (aware datetime). now — инъекция в тестах: любой datetime; наивный
+    трактуем как UTC (а не как локаль машины — иначе тест зависел бы от таймзоны ПК)."""
+    dt = now or datetime.datetime.now(datetime.timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(PHUKET_TZ)
+
+
+def today_phuket(now=None) -> datetime.date:
+    """«Сегодня» по Пхукету — ЕДИНАЯ точка правды дат клиентского контура (разбор дат клиента,
+    гейт прошедшего старта, якорь прайса). Заменяет datetime.date.today() (локаль сервера)."""
+    return now_phuket(now).date()
 
 
 _MONTH_RE = r"(январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)"
@@ -1428,7 +1454,7 @@ def parse_date_range(text, today=None):
     Поддержка: «10.07-15.07», «с 5 по 10.07», «5–10 июля», «с 5 по 10 июля», «с 28 декабря по
     3 января» (год-ролл), «на неделю/месяц с 5 июля», «завтра на 3 дня», перепутанный порядок
     (swap). Год-ролл end+1г — ТОЛЬКО при реальном переходе через год, НЕ как лечение."""
-    today = today or datetime.date.today()
+    today = today or today_phuket()
     t = (text or "").lower().replace("–", "-").replace("—", "-").replace("ё", "е")
     dmw = [(int(m.group(1)), _mon(m.group(2))) for m in re.finditer(r"(\d{1,2})\s+" + _MONTH_RE, t)]
     dmy = re.findall(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", t)
@@ -1458,6 +1484,63 @@ def parse_date_range(text, today=None):
     if e < s:                                               # финальная страховка: swap, НЕ год-ролл
         s, e = e, s
     return s.isoformat(), e.isoformat()
+
+
+# ------------------- ГЕЙТ СТАРТА АРЕНДЫ: прошедшие даты НЕ котируем -------------------
+# ЖИВОЙ ДЕФЕКТ (тренажёр ТЕСТ-7, 22.07): клиент «с 20 по 25 июля», сегодня 22 июля → бот МОЛЧА выдал
+# котировку. Механика: _mk() роллит уже прошедшую дату на СЛЕДУЮЩИЙ год (parse_date_range вернул
+# 2027-07-20…2027-07-25) — год-ролл нужен для «в декабре про январь», но на «позавчера» он молча
+# превращает описку/прошлое в бронь через год, и цена уезжает клиенту без единого вопроса.
+#
+# ПРАВИЛО «БЛИЖАЙШЕЕ ВХОЖДЕНИЕ»: у даты без явного года два прочтения — в этом году и в следующем;
+# клиент имел в виду то, что БЛИЖЕ к сегодня.
+#   • «20 июля» при 22 июля: −2 дня против +363 → ближайшее ПРОШЛОЕ → переспрос БЕЗ цены;
+#   • «5 января» при 22 декабря: −351 против +14 → ближайшее БУДУЩЕЕ → штатная котировка (год-ролл цел).
+# Граница ровно посередине — полгода. Явный год в тексте («с 20 июля 2027») читаем БУКВАЛЬНО, без
+# поиска ближайшего вхождения: клиент сам снял неоднозначность.
+# Сравнение — с «сегодня» ПО ПХУКЕТУ (today_phuket), не по UTC/локали: см. PHUKET_TZ.
+_PAST_ROLL_MAX_DAYS = 182
+_EXPLICIT_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+
+
+def _iso_date(iso):
+    try:
+        return datetime.date.fromisoformat(str(iso))
+    except (ValueError, TypeError):
+        return None
+
+
+def _nearest_start(iso_start, today, text=None):
+    """Дата старта В ПРОЧТЕНИИ КЛИЕНТА — ближайшее к `today` вхождение названного дня/месяца.
+    parse_date_range уже перенёс прошедшую дату на +1 год; если её вхождение в ПРОШЛОМ ближе
+    (не дальше _PAST_ROLL_MAX_DAYS назад) и явного года в тексте НЕТ — клиент имел в виду именно
+    его. → date | None (дату не разобрали)."""
+    d = _iso_date(iso_start)
+    if d is None:
+        return None
+    if text and _EXPLICIT_YEAR_RE.search(text):
+        return d                                    # год назван явно → читаем буквально
+    prev = _safe_date(d.year - 1, d.month, d.day)   # 29 фев в невисокосном → None (падаем на d)
+    if prev and prev < today and (today - prev).days <= _PAST_ROLL_MAX_DAYS:
+        return prev
+    return d
+
+
+def start_date_status(iso_start, today=None, text=None):
+    """Статус старта аренды для гейта котировки → 'past' | 'today' | 'tomorrow' | 'future' | None.
+    None — старта нет/не разобрали (гейт молчит, прежние ветки не трогаем). text — сообщение
+    клиента, из которого взяты даты (нужен, чтобы увидеть ЯВНЫЙ год)."""
+    today = today or today_phuket()
+    d = _nearest_start(iso_start, today, text)
+    if d is None:
+        return None
+    if d < today:
+        return "past"
+    if d == today:
+        return "today"
+    if d == today + datetime.timedelta(days=1):
+        return "tomorrow"
+    return "future"
 
 
 def _client_messages(transcript: str):
@@ -1893,6 +1976,8 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
 
     model = iso_start = iso_end = term_days = None
     monthly = False
+    iso_src = None            # РЕПЛИКА, из которой взяты даты (окно, а не одно сообщение) — по ней
+                              # гейт старта видит ЯВНЫЙ год клиента (см. start_date_status)
 
     for idx, msg in enumerate(window):
         m_model = _detect_model(msg)
@@ -1902,6 +1987,7 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
             model = m_model
             if s and e:
                 iso_start, iso_end = s, e
+                iso_src = msg
             if t:
                 term_days = t[0]
             monthly = _explicit_monthly(msg)
@@ -1915,6 +2001,7 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
         if iso_start is None and term_days is None:
             if s and e:
                 iso_start, iso_end = s, e
+                iso_src = msg
                 monthly = monthly or _explicit_monthly(msg)
             elif t:
                 term_days = t[0]
@@ -1935,6 +2022,13 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
         hint_days = term_days
     has_dates = bool(iso_start or term_days) or _has_date_signal(newest)
     has_start = bool(iso_start) or _has_start_signal(newest)   # конкретный старт, НЕ просто длительность
+
+    # ГЕЙТ СТАРТА (прошедшие даты не котируем): статус считаем ЗДЕСЬ — только тут виден исходный
+    # текст реплики (явный год) вместе с уже разобранной датой. Даты из ОКНА последних реплик —
+    # статус берётся от той реплики, что реально дала даты (iso_src), а не от новейшей.
+    _today = today or today_phuket()
+    date_status = start_date_status(iso_start, _today, iso_src) if iso_start else None
+    _seen = _nearest_start(iso_start, _today, iso_src) if iso_start else None
 
     # Несколько моделей в ОДНОМ запросе (правила цен v2, п.3) — берём из последней реплики;
     # одна/ноль → падаем на единственную разрешённую модель окна.
@@ -1982,6 +2076,8 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
             "iso_start": iso_start, "iso_end": iso_end, "term_days": term_days,
             "hint_days": hint_days, "monthly": monthly, "has_dates": has_dates,
             "has_start": has_start,
+            "date_status": date_status,                                   # past|today|tomorrow|future|None
+            "start_seen": _seen.isoformat() if _seen else None,           # дата в прочтении клиента
             "deposit_multi_q": deposit_multi_q, "price_sheet_q": price_sheet_q,
             "sheet_filter": sheet_filter, "percent_q": percent_q, "units_count": units_count,
             "old_gen_q": old_gen_q, "deposit_passport_q": deposit_passport_q,
@@ -3008,6 +3104,94 @@ _PRICE_SHEET_UNAVAILABLE = (
     "даты и вернёшься в ближайшее время.")
 
 
+# ------------------- ГЕЙТ ДАТ В ЦЕНОВОМ ПУТИ (прошедший старт / сегодня-завтра) -------------------
+# Инструкции LLM БЕЗ ЕДИНОГО ЧИСЛА ЦЕНЫ: на прошедшем старте цену не называем вообще (пост-чек
+# черновика строит белый список цен из pricing_note — здесь он пуст, значит ЛЮБОЕ число из ответа
+# LLM будет заклеймлено). Текст RU/EN, тайского нет.
+_MONTHS_GEN_RU = ("января", "февраля", "марта", "апреля", "мая", "июня",
+                  "июля", "августа", "сентября", "октября", "ноября", "декабря")
+_MONTHS_NOM_RU = ("январь", "февраль", "март", "апрель", "май", "июнь",
+                  "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь")
+_MONTHS_EN = ("January", "February", "March", "April", "May", "June",
+              "July", "August", "September", "October", "November", "December")
+
+
+def _human_day(d, lang="ru") -> str:
+    """Дата словами клиента: «20 июля» / «20 July» (без года — год в переспросе только запутает)."""
+    if d is None:
+        return ""
+    return f"{d.day} {_MONTHS_EN[d.month - 1]}" if lang == "en" else f"{d.day} {_MONTHS_GEN_RU[d.month - 1]}"
+
+
+def _next_month_name(today, lang="ru") -> str:
+    """Название СЛЕДУЮЩЕГО месяца («август» / «August») — подсказка-вариант в переспросе дат."""
+    idx = today.month % 12
+    return _MONTHS_EN[idx] if lang == "en" else _MONTHS_NOM_RU[idx]
+
+
+def _past_start_note(seen, today, lang="ru") -> str:
+    """ЦЕНА-инструкция на ПРОШЕДШЕМ старте: НИКАКОЙ цены, вежливый переспрос дат + дословный пример."""
+    seen_h, today_h = _human_day(seen, lang), _human_day(today, lang)
+    nxt = _next_month_name(today, lang)
+    if lang == "en":
+        return ("PRICE: the rental start the client named is IN THE PAST — {seen} (today is {today}, "
+                "Phuket time). Do NOT calculate and do NOT name ANY price (no exact figure, no "
+                "estimate, no «from X ฿», no range, nothing from the FAQ), and do NOT silently move "
+                "these dates to another year — first ask the client. Politely ask to confirm the "
+                "dates, for example: «Could you confirm the dates, please — {seen} has already "
+                "passed. Did you mean the coming days, or {nxt}?» We name the price right after the "
+                "client confirms the dates.").format(seen=seen_h, today=today_h, nxt=nxt)
+    return ("ЦЕНА: старт аренды, который назвал клиент, УЖЕ ПРОШЁЛ — {seen} (сегодня {today}, время "
+            "Пхукета). НЕ считай и НЕ называй НИКАКУЮ цену (ни точную, ни ориентир, ни «от X ฿», ни "
+            "диапазон, ни из FAQ) и НЕ переноси эти даты на другой год молча — сначала спроси "
+            "клиента. Вежливо уточни даты, например: «Уточните, пожалуйста, даты — {seen} уже "
+            "прошло. Вы имели в виду ближайшие дни или {nxt}?» Цену назовём сразу после того, как "
+            "клиент подтвердит даты.").format(seen=seen_h, today=today_h, nxt=nxt)
+
+
+def _pickup_time_note(status, seen, lang="ru") -> str:
+    """Старт СЕГОДНЯ/ЗАВТРА: котируем штатно, но ОБЯЗАТЕЛЬНО уточняем ВРЕМЯ подачи."""
+    if status not in ("today", "tomorrow"):
+        return ""
+    day_h = _human_day(seen, lang)
+    if lang == "en":
+        word = "today" if status == "today" else "tomorrow"
+        return (" PICK-UP TIME: the rental starts {word} ({day}) — after the price, ask in ONE short "
+                "question what time the client wants the bike delivered/picked up (do not add any "
+                "numbers of your own).").format(word=word, day=day_h)
+    word = "СЕГОДНЯ" if status == "today" else "ЗАВТРА"
+    return (" ВРЕМЯ ПОДАЧИ: старт аренды {word} ({day}) — назвав цену, ОДНИМ коротким вопросом уточни "
+            "удобное ВРЕМЯ подачи байка (своих чисел не добавляй).").format(word=word, day=day_h)
+
+
+def _past_start_sheet_note(seen, today, lang="ru") -> str:
+    """Тот же гейт для ПРАЙСА ПО ПАРКУ: сетку НЕ блокируем (решение владельца «даты не гейт», анти-луп),
+    но считаем её от ближайшей даты, а не от прошедшей, и просим уточнить даты в концовке."""
+    seen_h, today_h = _human_day(seen, lang), _human_day(today, lang)
+    nxt = _next_month_name(today, lang)
+    if lang == "en":
+        return ("\nDATES: the start the client named has already passed ({seen}, today is {today}, "
+                "Phuket) — the list above is calculated from the nearest date, NOT from those dates. "
+                "In the outro ask to confirm the dates («{seen} has already passed — did you mean the "
+                "coming days, or {nxt}?»); add no numbers of your own.").format(
+                    seen=seen_h, today=today_h, nxt=nxt)
+    return ("\nДАТЫ: названный клиентом старт уже прошёл ({seen}, сегодня {today}, Пхукет) — прайс "
+            "выше посчитан от ближайшей даты, а НЕ по этим датам. В концовке попроси уточнить даты "
+            "(«{seen} уже прошло — вы имели в виду ближайшие дни или {nxt}?»); своих чисел не "
+            "добавляй.").format(seen=seen_h, today=today_h, nxt=nxt)
+
+
+def _gate_start_date(hints, today=None):
+    """Статус старта + дата в прочтении клиента → (status, seen_date). Готовый date_status из
+    extract_booking_hints имеет приоритет (он посчитан на ТЕКСТЕ реплики — там виден явный год);
+    hints, собранные вызывающим вручную, доводим по iso_start (fail-safe, без текста)."""
+    hints = hints or {}
+    today = today or today_phuket()
+    seen = _iso_date(hints.get("start_seen")) or _nearest_start(hints.get("iso_start"), today)
+    status = hints.get("date_status") or start_date_status(hints.get("iso_start"), today)
+    return status, seen
+
+
 def build_price_sheet_note(hints, lang="ru", getter=None, today=None):
     """Прайс-блок для промпта, если клиент просит прайс по парку. → строка ИЛИ None (интент не тот).
     None → обычный ценовой путь build_pricing_note. ДАТЫ НЕ ГЕЙТ (решение владельца): нет дат в
@@ -3015,11 +3199,19 @@ def build_price_sheet_note(hints, lang="ru", getter=None, today=None):
     Даты в диалоге → считаем по ним. today инъектируется в тестах (боевой путь — реальная дата)."""
     if not hints.get("price_sheet_q"):
         return None
+    base = today or today_phuket()
     ds = hints.get("iso_start")
     default_anchor = False
+    # ГЕЙТ ДАТ (прайс-ветка): старт клиента уже ПРОШЁЛ → сетку НЕ блокируем (владелец: «даты не
+    # гейт», анти-луп), но и по прошедшим/заролленным на год датам её НЕ считаем — падаем на
+    # ближайший якорь и просим уточнить даты в концовке (см. _past_start_sheet_note ниже).
+    past_seen = None
+    if ds:
+        _st, _seen = _gate_start_date(hints, base)
+        if _st == "past":
+            past_seen, ds = _seen, None
     if not ds:
         # НЕ спрашиваем даты: дефолтное окно от ближайшей даты (старт = завтра).
-        base = today or datetime.date.today()
         ds = (base + datetime.timedelta(days=1)).isoformat()
         default_anchor = True
     rows = price_sheet(ds, getter=getter)
@@ -3039,6 +3231,8 @@ def build_price_sheet_note(hints, lang="ru", getter=None, today=None):
     # тело больше НЕ кладём — она уходит модератору отдельным служебным каналом (SEASON-скобки ниже).
     block = body + "\n\n" + _sheet_min_term_line(lang)
     note = _wrap_price_sheet(block, ds, lang, default_anchor=default_anchor)
+    if past_seen is not None:
+        note += _past_start_sheet_note(past_seen, base, lang)
     season = _sheet_season_note(rows, lang)
     if season:
         note += "\n" + _SEASON_OPEN + "\n" + season + "\n" + _SEASON_CLOSE
@@ -3067,6 +3261,16 @@ def _build_pricing_note_core(hints: dict, lang: str = "ru", getter=None, today=N
     sheet = build_price_sheet_note(hints, lang=lang, getter=getter, today=today)
     if sheet is not None:
         return sheet + dep
+    # ГЕЙТ СТАРТА ДО КОТИРОВКИ (живой дефект ТЕСТ-7 22.07): старт РАНЬШЕ сегодняшнего дня (по
+    # Пхукету) → цену НЕ считаем и НЕ называем, вежливо переспрашиваем даты. Стоит ПОСЛЕ прайс-
+    # ветки (у неё свой режим: сетка + просьба уточнить) и ДО любого обращения к Календарю.
+    _today = today or today_phuket()
+    status, seen = _gate_start_date(hints, _today)
+    if status == "past" and seen is not None:
+        return _past_start_note(seen, _today, lang) + dep
+    # Старт сегодня/завтра → котируем штатно, но добавляем уточнение ВРЕМЕНИ подачи (ниже, к
+    # ветками с живой ценой).
+    pickup = _pickup_time_note(status, seen, lang)
     if not hints.get("has_dates"):
         return ("ЦЕНА: дат аренды в диалоге НЕТ — попроси у клиента даты (начало/конец) и срок. "
                 "НЕ называй НИКАКУЮ цену: ни точную, ни ориентир, ни «от X ฿», ни диапазон "
@@ -3129,7 +3333,7 @@ def _build_pricing_note_core(hints: dict, lang: str = "ru", getter=None, today=N
         pct = hints.get("percent_q")
         if pct:
             note += _percent_line(pct, q if kind in ("ok", "min") else None)
-        note += dep + units
+        note += dep + units + pickup
         # Точечный quote → детерминированную строку ЦЕНЫ кладём в служебные скобки: strategy-
         # перегенерация донесёт цену Bridge КОДОМ (compose_quote_draft в generate/regenerate), не
         # полагаясь на то, что LLM её перепишет. N ЮНИТОВ одной модели — блок несём ТОЖЕ, но с
@@ -3163,7 +3367,7 @@ def _build_pricing_note_core(hints: dict, lang: str = "ru", getter=None, today=N
               "отдельной строкой в ОДНОМ сообщении, цену использовать ДОСЛОВНО (не переформатируй и "
               "НЕ опускай часть про скидку за срок «(Скидка за срок N%, … в день)»), модели/варианты "
               "НЕ смешивай и НЕ суммируй:\n")
-    note = header + "\n".join(bullets) + dep + units
+    note = header + "\n".join(bullets) + dep + units + pickup
     # N ЮНИТОВ одной модели с вариантами (пара XMAX: два поколения) → живые цены поколений тоже
     # несём в служебный quote-блок для strategy-пути; цена/депозит ЗА КАЖДЫЙ юнит, итог за N шт.
     # КОД НЕ суммирует (units set ТОЛЬКО при ОДНОЙ модели — _units_count даёт None на len(models)≥2).
@@ -4322,7 +4526,7 @@ _SMOKE_REASK_RE = re.compile(
 
 
 def _smoke_today(today=None):
-    return today or datetime.date.today()
+    return today or today_phuket()
 
 
 def _smoke_default_probe(today=None):
