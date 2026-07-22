@@ -236,7 +236,9 @@ class TestPreflight(unittest.TestCase):
         self.assertEqual(runs, [])                # НИ ОДНОГО пустого процесса-зомби
         self.assertEqual(len(cards), 1)           # карточка владельцу ровно одна, не спам
         self.assertIn("auth login", cards[0])
-        self.assertEqual(slept, [rc.RESTART_DELAY] * 3)
+        # пауза ДЛИННАЯ, а не обычные 15 с: состояние само не изменится, а лог за ночь распух бы
+        self.assertEqual(slept, [rc.NOT_READY_DELAY] * 3)
+        self.assertGreater(rc.NOT_READY_DELAY, rc.RESTART_DELAY)
 
     def test_session_spawned_when_ready(self):
         runs = []

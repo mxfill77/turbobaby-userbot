@@ -35,6 +35,10 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(REPO, "rc_remote_control.log")
 SESSION_NAME = os.getenv("RC_SESSION_NAME", "turbobaby-pc")
 RESTART_DELAY = int(os.getenv("RC_RESTART_DELAY", "15") or "15")   # сек между выходом и подъёмом
+# Пауза, когда канал ЗАБЛОКИРОВАН и чинится только руками владельца (нет пригодного входа).
+# Отдельная и длинная: ждать 15 с бессмысленно — состояние не изменится само, а лог за ночь
+# распухнет от одинаковых строк (живой замер: ~4 строки в минуту).
+NOT_READY_DELAY = int(os.getenv("RC_NOT_READY_DELAY", "300") or "300")
 MUTEX_NAME = "Global\\turbobaby_rc_supervisor"
 # Диагностика канала. Сессию поднимает ПЛАНИРОВЩИК, её stdout/stderr перехватить нельзя:
 # любое перенаправление убивает TTY, без которого интерактивная сессия не живёт. Поэтому
@@ -243,7 +247,7 @@ def main(resolver=None, runner=None, sleeper=None, rounds=None, singleton=None,
         if not ok_rc:
             log.error("Remote Control НЕДОСТУПЕН: %s — сессию НЕ поднимаю (иначе будет живой "
                       "процесс при мёртвом канале). Нужен `claude auth login` в ВИДИМОМ окне "
-                      "под этим пользователем; жду %s с", detail, RESTART_DELAY)
+                      "под этим пользователем; жду %s с", detail, NOT_READY_DELAY)
             if not warned:
                 (notifier or notify_owner)(
                     "⚠️ Канал Remote Control на ПК не поднимается: " + detail +
@@ -251,7 +255,7 @@ def main(resolver=None, runner=None, sleeper=None, rounds=None, singleton=None,
                     "`claude auth login` (аккаунт claude.ai), затем разреши Remote Control. "
                     "Супервизор ждёт и поднимет канал сам, как только вход станет пригодным.")
                 warned = True
-            _sleep(RESTART_DELAY)
+            _sleep(NOT_READY_DELAY)
             continue
         warned = False
         log.info("старт сессии: %s --remote-control %s", claude, SESSION_NAME)
