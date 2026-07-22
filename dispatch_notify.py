@@ -17,6 +17,7 @@ dispatch_notify.py — fire-and-forget Telegram-уведомление от Disp
   python dispatch_notify.py "любой текст"          # прямая отправка (аргумент)
   echo '{"message":"..."}' | python dispatch_notify.py --hook notification
   python dispatch_notify.py --hook stop
+  python dispatch_notify.py --hook session_end     # ЗАВЕРШЕНИЕ Code-сессии → тема 1160 + cowork_log
 """
 
 import os
@@ -25,13 +26,19 @@ import io
 import json
 import logging
 import contextlib
+import subprocess
 import urllib.request
 import urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(HERE, ".env")
 NOTIFY_LOG = os.path.join(HERE, "dispatch_notify.log")
+COWORK_LOG = os.path.join(HERE, "cowork_hook.log")   # вывод ОТДЕЛЁННОЙ записи в cowork_log
 HTTP_TIMEOUT = 8  # сек
+SUMMARY_MAX = 300     # символов краткой сводки в карточке завершения сессии
+# Скрытый спавн cowork_log_append (класс «мигающие чёрные окна» 22.07: каждый console-ребёнок
+# без этого флага открывал НОВОЕ окно на ПК владельца). POSIX → 0.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # --- лог ТОЛЬКО в свой файл (не трогаем root / pc_agent.log) ---
 _log = logging.getLogger("dispatch_notify")
@@ -163,10 +170,87 @@ def send_critical(text):
     return ("DM", False)
 
 
-def _read_stdin_json():
+def _cowork(line, spawner=None):
+    """ВТОРОЙ канал ритуала: строка-итог в cowork_log (мозг) через cowork_log_append.py.
+
+    ОТДЕЛЁННЫЙ (detached) спавн, НЕ ждём: живой замер — карточка в Telegram уходит за ~1 с, а
+    запись в cowork_log это ДВА round-trip к Bridge на VPS (~8 с). Синхронное ожидание держало
+    SessionEnd-хук ~9.4 с, и Claude Code гасил его на выходе сессии («SessionEnd hook … failed:
+    Hook cancelled») — оба канала терялись. Теперь хук отдаёт управление сразу, а запись в мозг
+    доживает сама (DETACHED_PROCESS переживает смерть сессии-родителя).
+    Вывод ребёнка льём в ОТДЕЛЬНЫЙ cowork_hook.log: два процесса, дописывающие один файл, рвут
+    друг другу строки (живой прогон: строка лога осталась обрезком «…ена (pid=2416)»).
+    → bool: True = процесс записи запущен (не «запись подтверждена»)."""
+    py = os.path.join(HERE, "venv", "Scripts", "python.exe")
+    if not os.path.isfile(py):
+        py = sys.executable
+    cmd = [py, os.path.join(HERE, "cowork_log_append.py"), line]
+    flags = NO_WINDOW | getattr(subprocess, "DETACHED_PROCESS", 0)
     try:
-        raw = sys.stdin.read()
-        return json.loads(raw) if raw and raw.strip().startswith("{") else {}
+        sink = open(COWORK_LOG, "a", encoding="utf-8")
+    except Exception:
+        sink = subprocess.DEVNULL
+    try:
+        p = (spawner or subprocess.Popen)(cmd, stdout=sink, stderr=sink,
+                                          stdin=subprocess.DEVNULL, creationflags=flags,
+                                          close_fds=True, cwd=HERE)
+        _log.info(f"cowork_log: запись отделена (pid={getattr(p, 'pid', '?')}) | {line[:90]}")
+        return True
+    except Exception as e:
+        _log.info(f"cowork_log: спавн не удался ({type(e).__name__}) | {line[:90]}")
+        return False
+    finally:
+        # дескриптор УЖЕ унаследован ребёнком — свою копию закрываем сразу, иначе процесс-хук
+        # держит лог открытым до выхода (в тестах это ResourceWarning, в бою — лишний хэндл)
+        if sink is not subprocess.DEVNULL:
+            try:
+                sink.close()
+            except Exception:
+                pass
+
+
+def _summary_from_transcript(path, limit=SUMMARY_MAX):
+    """Краткая сводка сессии = ПОСЛЕДНИЙ текстовый ответ ассистента из живого transcript.
+
+    Формат снят с ЖИВОГО файла ~/.claude/projects/<repo>/<session>.jsonl (фикстура
+    fixtures/session_end_transcript.live.jsonl): построчный JSON, у ассистентских строк
+    message.role='assistant' и message.content — СПИСОК блоков типов text | thinking |
+    tool_use; работа субагентов помечена isSidechain=true. Сводка — только text главной
+    ветки: thinking и tool_use сводкой не являются, сайдчейн — не итог сессии.
+    → str ('' если текстового ответа нет / файл недоступен)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return ""
+    for raw in reversed(lines):
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(obj, dict) or obj.get("isSidechain"):
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = " ".join(str(block.get("text") or "").split())
+                if text:
+                    return text[:limit] + ("…" if len(text) > limit else "")
+    return ""
+
+
+def _read_stdin_json():
+    # BOM/пробелы срезаем ЯВНО: живой stdin хука приходит чистым, но любой перенаправляющий
+    # слой (PowerShell-пайп) ставит ﻿ впереди — strip() его НЕ убирает, и полезная
+    # нагрузка молча превращалась в {} (сводка вырождалась в «без текстового итога»).
+    try:
+        raw = (sys.stdin.read() or "").lstrip("﻿ \t\r\n")
+        return json.loads(raw) if raw.startswith("{") else {}
     except Exception:
         return {}
 
@@ -177,6 +261,14 @@ def _build(kind, hook):
         return "🔔 Dispatch ждёт твоего разрешения/ввода" + (f": {ctx}" if ctx else ".")
     if kind == "stop":
         return "✅ Dispatch: задача завершена."
+    if kind == "session_end":
+        # ЗАВЕРШЕНИЕ Code-сессии (в т.ч. Remote Control с телефона): карточка-итог владельцу.
+        summary = _summary_from_transcript(hook.get("transcript_path") or "")
+        if not summary:
+            reason = str(hook.get("reason") or "").strip()
+            summary = (f"без текстового итога (причина: {reason})" if reason
+                       else "без текстового итога")
+        return "✅ Code-сессия завершена: " + summary
     return None
 
 
@@ -198,7 +290,18 @@ def main():
             sys.exit(0)
         if args and args[0] == "--hook":
             kind = args[1] if len(args) > 1 else ""
+            # Диагностика бюджета размышления: хук — РЕБЁНОК сессии, значит видит её env. Строка
+            # доказывает по ФАКТУ, что блок env из .claude/settings.json доехал до живой сессии
+            # (иначе «настроено» проверялось бы только по файлу). Не секрет — печатать можно.
+            _log.info(f"хук={kind} | MAX_THINKING_TOKENS={os.getenv('MAX_THINKING_TOKENS') or '-'}")
             text = _build(kind, _read_stdin_json()) or f"🔔 Dispatch: {kind or 'событие'}"
+            if kind == "session_end":
+                # ДВА КАНАЛА финала (как у Dispatch): карточка в тему Инбокс 1160 — ПЕРВЫМ
+                # (личка = фолбэк, маршрут send_critical) И строка-итог в cowork_log.
+                channel, ok = send_critical(text)
+                _cowork(text)
+                _log.info(f"итог(session_end): channel={channel} ok={ok} | {text[:90]}")
+                sys.exit(0)
         elif args:
             text = " ".join(args).strip()
         elif not sys.stdin.isatty():

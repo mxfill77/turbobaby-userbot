@@ -1,0 +1,57 @@
+<?xml version="1.0"?>
+<!--
+  pc_remote_control — задача Планировщика для ОСНОВНОГО канала владельца (Claude Code Remote
+  Control). Стиль скопирован с существующей задачи pc_agent: вход в систему → InteractiveToken,
+  без лимита времени, IgnoreNew, RestartOnFailure 3×PT1M.
+
+  Цепочка запуска: wscript (//B, без окна) → rc_remote_control.vbs (WshShell.Run …, 0: скрытая,
+  но ЖИВАЯ консоль — интерактивной сессии claude нужен TTY) → rc_supervisor.py (вечный цикл
+  «claude ‑‑remote‑control turbobaby-pc» + резолв новейшей версии CLI перед каждым стартом).
+
+  УСТАНОВКА (нужна ПОВЫШЕННАЯ PowerShell — обычный токен получает «Access is denied»):
+    Register-ScheduledTask -TaskName pc_remote_control -Force -Xml `
+      (Get-Content 'D:\turbobaby-bot\pc_remote_control.task.xml' -Raw -Encoding UTF8)
+    Start-ScheduledTask -TaskName pc_remote_control
+
+  Триггер — ВХОД В СИСТЕМУ (как у pc_agent), а не «загрузка ПК»: сессии нужен интерактивный
+  токен пользователя, до логина его не существует.
+-->
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <URI>\pc_remote_control</URI>
+    <Description>Claude Code Remote Control - osnovnoj kanal vladel'ca: wscript -> rc_remote_control.vbs (skrytaja konsol') -> rc_supervisor.py -> claude --remote-control turbobaby-pc v D:\turbobaby-bot</Description>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-3727781399-3432839651-1010305476-1002</UserId>
+      <LogonType>InteractiveToken</LogonType>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <RestartOnFailure>
+      <Count>3</Count>
+      <Interval>PT1M</Interval>
+    </RestartOnFailure>
+    <IdleSettings>
+      <Duration>PT10M</Duration>
+      <WaitTimeout>PT1H</WaitTimeout>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+  </Settings>
+  <Triggers>
+    <LogonTrigger />
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Windows\System32\wscript.exe</Command>
+      <Arguments>//B //Nologo "D:\turbobaby-bot\rc_remote_control.vbs"</Arguments>
+      <WorkingDirectory>D:\turbobaby-bot</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

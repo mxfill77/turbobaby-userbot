@@ -547,42 +547,117 @@ def run_claude(prompt, timeout, cwd, env):
 # здесь: ЛЮБОЙ наш спавн headless claude (run_task, думатель) сперва проверяет бюджет живых
 # CLI-процессов claude.exe. Fail-open при недоступном счёте: бюджет — гард от каскада, а не
 # жёсткий замок; битый CIM (класс #171) не смеет остановить работу демона.
+#
+# ВАРИАНТ A (счёт ПО РОДИТЕЛЮ, решение владельца 22.07 при переводе Remote Control в основной
+# канал). Раньше считали ВСЕ CLI-claude на машине, поэтому в бюджет демона попадали ЧУЖИЕ
+# процессы: интерактивные RC-сессии владельца и агент-сессии Claude Desktop (в живом снимке
+# fixtures/claude_procs.live.json их 8 из 9!). При лимите 2 это глушило демона наглухо — работал
+# бы не гард от каскада, а «владелец открыл сессию с телефона → демон встал». Теперь считаем
+# ТОЛЬКО СВОИХ ПОТОМКОВ (цепочка PPID упирается в PID этого демона): headless-дети run_task/
+# думателя и их субагенты. Почему не «поднять лимит до 4» (вариант B): потолок лишь отодвигается —
+# 3 чужие сессии снова его выберут, а headless-каскад демона упрётся в тот же потолок. Счёт по
+# родителю разделяет ДВА РАЗНЫХ явления, а не смешивает их в одном числе.
 
 _claude_budget_denials = 0     # отказов бюджета ПОДРЯД (успешный проход сбрасывает)
 
+# Снимок процессов для счёта по родителю. Фильтр claude.exe тот же (claude-code, без --type= —
+# Electron-процессы UI это не CLI), но отдаём НЕ число, а PID/PPID/время создания + PID/PPID/время
+# ВСЕХ процессов: по ним поднимаемся от каждого claude вверх, до себя. Формат снят живым пробой в
+# fixtures/claude_procs.live.json — голдены стоят на нём (правило-класс «мок = живой формат»).
+_PROC_SNAPSHOT_PS = (
+    "$c = Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | "
+    "Where-Object { $_.CommandLine -match 'claude-code' -and $_.CommandLine -notmatch '--type=' } | "
+    "Select-Object ProcessId,ParentProcessId,"
+    "@{n='Created';e={if ($_.CreationDate) { $_.CreationDate.ToString('yyyyMMddHHmmss') } else { '' }}}; "
+    "$t = Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,"
+    "@{n='Created';e={if ($_.CreationDate) { $_.CreationDate.ToString('yyyyMMddHHmmss') } else { '' }}}; "
+    "ConvertTo-Json -Compress -Depth 3 @{claude=@($c);tree=@($t)}"
+)
+_ANCESTRY_MAX_HOPS = 12        # предохранитель от петли/битого дерева PPID
 
-def _count_claude_procs(runner=None):
-    """Число ЖИВЫХ CLI-процессов claude.exe (claude-code): headless-дети демона + агент-сессии
-    Claude Desktop. Electron-процессы самого приложения (--type=…) НЕ считаем — это UI владельца,
-    постоянный фон ~10 шт. → int | None (powershell/CIM не смог — счёт неизвестен, fail-open)."""
-    ps = ("Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | "
-          "Where-Object { $_.CommandLine -match 'claude-code' "
-          "-and $_.CommandLine -notmatch '--type=' } | "
-          "Measure-Object | Select-Object -ExpandProperty Count")
+
+def _is_descendant(pid, root, parents, created, hops=_ANCESTRY_MAX_HOPS):
+    """pid — потомок root? Идём вверх по PPID до root или до обрыва. → bool.
+
+    Цепь рвём, если родитель СОЗДАН ПОЗЖЕ ребёнка: Windows переиспользует PID, и PPID мёртвого
+    родителя может указывать на чужой свежий процесс. Это не теория — живой факт ЭТОГО ПК:
+    у userbot/moderbot/демона PPID=5980, а процесса 5980 в системе уже нет."""
+    seen = set()
+    cur = pid
+    for _ in range(hops):
+        if cur in seen:
+            return False                       # петля в дереве — считаем «не наш»
+        seen.add(cur)
+        parent = parents.get(cur)
+        if not parent or parent == cur:
+            return False                       # корень дерева / самоссылка
+        c_child, c_parent = created.get(cur, ""), created.get(parent, "")
+        if c_child and c_parent and c_parent > c_child:
+            return False                       # родитель моложе ребёнка → PID переиспользован
+        if parent == root:
+            return True
+        cur = parent
+    return False
+
+
+def _count_claude_procs(runner=None, own_pid=None):
+    """Число ЖИВЫХ CLI-claude.exe, порождённых ИМЕННО ЭТИМ демоном (headless-дети run_task/
+    думателя и их субагенты). Интерактивные сессии владельца — RC-сессия (родитель
+    rc_supervisor.py) и агент-сессии Claude Desktop (родитель Electron) — В БЮДЖЕТ НЕ ВХОДЯТ.
+    → int | None (powershell/CIM не смог или ответ не разобрался — fail-open).
+    own_pid — инъекция корня для тестов (по умолчанию PID текущего процесса)."""
     try:
         p = (runner or subprocess.run)(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PROC_SNAPSHOT_PS],
             capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW)
     except Exception as e:
         log.warning("бюджет claude: счёт процессов не удался (%s) — fail-open", e)
         return None
-    out = (p.stdout or "").strip()
-    if p.returncode != 0 or not out.isdigit():
+    out = (p.stdout or "").strip().lstrip("﻿")
+    if p.returncode != 0 or not out.startswith("{"):
         return None
-    return int(out)
+    try:
+        data = json.loads(out)
+        claude, tree = data["claude"], data["tree"]
+    except Exception as e:
+        log.warning("бюджет claude: снимок процессов не разобран (%s) — fail-open", e)
+        return None
+    if isinstance(claude, dict):          # ConvertTo-Json схлопывает список из ОДНОГО элемента
+        claude = [claude]
+    if isinstance(tree, dict):
+        tree = [tree]
+    parents, created = {}, {}
+    for e in list(tree) + list(claude):
+        try:
+            pid = int(e["ProcessId"])
+        except Exception:
+            continue
+        parents.setdefault(pid, int(e.get("ParentProcessId") or 0))
+        created.setdefault(pid, str(e.get("Created") or ""))
+    root = os.getpid() if own_pid is None else own_pid
+    n = 0
+    for e in claude:
+        try:
+            pid = int(e["ProcessId"])
+        except Exception:
+            continue
+        if _is_descendant(pid, root, parents, created):
+            n += 1
+    return n
 
 
 def _claude_budget_gate(counter=None, sleeper=None, notifier=None, wait_sec=None, poll_sec=5):
-    """Гейт бюджета ПЕРЕД спавном headless claude: живых CLI-claude ≥ MAX_CLAUDE_PROCS → ждём
-    слот до wait_sec (кто-то завершится), не дождались → отказ. 3 отказа ПОДРЯД → карточка
-    владельцу (на ПК копятся claude.exe — каскад как 22.07, нужен разбор) и счётчик заново
-    (карточку не спамим каждый отказ). Счёт недоступен (CIM boom) → fail-open.
+    """Гейт бюджета ПЕРЕД спавном headless claude: НАШИХ живых headless-claude ≥ MAX_CLAUDE_PROCS
+    → ждём слот до wait_sec (кто-то завершится), не дождались → отказ. 3 отказа ПОДРЯД → карточка
+    владельцу (демон плодит своих детей — каскад, нужен разбор) и счётчик заново (карточку не
+    спамим каждый отказ). Счёт недоступен (CIM boom) → fail-open. Интерактивные RC-сессии
+    владельца в счёт НЕ входят (вариант A, счёт по родителю) — они демона не блокируют.
     → (ok: bool, detail: str). counter/sleeper/notifier — инъекция для тестов."""
     global _claude_budget_denials
     count = (counter or _count_claude_procs)()
     if count is None or count < MAX_CLAUDE_PROCS:
         _claude_budget_denials = 0
-        return True, f"живых claude: {'?' if count is None else count}/{MAX_CLAUDE_PROCS}"
+        return True, f"наших headless-claude: {'?' if count is None else count}/{MAX_CLAUDE_PROCS}"
     wait_sec = CLAUDE_BUDGET_WAIT_SEC if wait_sec is None else wait_sec
     _sleep = sleeper or time.sleep
     slept = 0
@@ -594,14 +669,14 @@ def _claude_budget_gate(counter=None, sleeper=None, notifier=None, wait_sec=None
             _claude_budget_denials = 0
             return True, f"дождались слота через {slept}s (живых: {'?' if count is None else count})"
     _claude_budget_denials += 1
-    detail = (f"живых claude {count} ≥ лимит {MAX_CLAUDE_PROCS}, слот не освободился за "
+    detail = (f"НАШИХ headless-claude {count} ≥ лимит {MAX_CLAUDE_PROCS}, слот не освободился за "
               f"{wait_sec}s (отказ №{_claude_budget_denials} подряд)")
     log.error("бюджет claude: %s", detail)
     if _claude_budget_denials >= 3:
         (notifier or _notify_critical)(
-            f"⚠️ Бюджет claude-процессов ПК: {_claude_budget_denials} отказов подряд — живых "
-            f"claude.exe {count} ≥ лимит {MAX_CLAUDE_PROCS}. Возможен каскад процессов "
-            "(как 18×claude.exe 22.07) — нужен разбор/чистка на ПК.")
+            f"⚠️ Бюджет claude-процессов ПК: {_claude_budget_denials} отказов подряд — НАШИХ "
+            f"headless-claude {count} ≥ лимит {MAX_CLAUDE_PROCS} (счёт по родителю: интерактивные "
+            "RC-сессии сюда НЕ входят). Значит каскад плодит сам демон — нужен разбор на ПК.")
         _claude_budget_denials = 0
     return False, detail
 
@@ -4410,7 +4485,7 @@ def _main_loop():
              int(_gate_step_selective_on()), int(_gate_single_selective_on()))
     # Бюджет headless-claude (зеркало VPS oom2 1520c68, инцидент-каскад 22.07) — в баннер,
     # чтобы действующий лимит читался прямо из лога старта.
-    log.info("=== БЮДЖЕТ CLAUDE: MAX_CLAUDE_PROCS=%s (wait=%ss; счёт живых CLI-claude.exe перед спавном; 3 отказа подряд → карточка) ===",
+    log.info("=== БЮДЖЕТ CLAUDE: MAX_CLAUDE_PROCS=%s (wait=%ss; счёт ПО РОДИТЕЛЮ — только НАШИ headless-потомки, интерактивные RC-сессии не в счёт; 3 отказа подряд → карточка) ===",
              MAX_CLAUDE_PROCS, CLAUDE_BUDGET_WAIT_SEC)
     if _stopped():
         log.info("рубильник pc_orchestrator.stop активен — не стартую поллинг")

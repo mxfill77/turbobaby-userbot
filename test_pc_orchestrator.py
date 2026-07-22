@@ -5176,12 +5176,13 @@ class TestClaudeBudget(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("?", detail)
 
-    def test_count_parses_digit_and_fails_open_on_junk(self):
+    def test_count_fails_open_on_junk(self):
         class _P:
             def __init__(self, rc, out): self.returncode, self.stdout = rc, out
-        self.assertEqual(o._count_claude_procs(runner=lambda *a, **k: _P(0, "3\n")), 3)
         self.assertIsNone(o._count_claude_procs(runner=lambda *a, **k: _P(0, "мусор")))
-        self.assertIsNone(o._count_claude_procs(runner=lambda *a, **k: _P(1, "5")))
+        self.assertIsNone(o._count_claude_procs(runner=lambda *a, **k: _P(0, "3\n")))   # старый формат «просто число» больше не наш
+        self.assertIsNone(o._count_claude_procs(runner=lambda *a, **k: _P(1, '{"claude":[],"tree":[]}')))
+        self.assertIsNone(o._count_claude_procs(runner=lambda *a, **k: _P(0, '{"claude":[]}')))  # нет ключа tree
         def boom(*a, **k):
             raise RuntimeError("CIM boom")
         self.assertIsNone(o._count_claude_procs(runner=boom))
@@ -5219,6 +5220,111 @@ class TestClaudeBudget(unittest.TestCase):
         finally:
             o._claude_budget_gate = saved
         self.assertEqual(ran, [])
+
+
+class TestClaudeBudgetByParent(unittest.TestCase):
+    """ГОЛДЕН варианта A (счёт ПО РОДИТЕЛЮ) на ЖИВОМ снимке процессов ПК.
+
+    fixtures/claude_procs.live.json снят пробой 22.07 в момент, когда на машине одновременно жили:
+      • 7 CLI-claude агент-сессий Claude Desktop (PPID 18628 = Electron-приложение);
+      • ИНТЕРАКТИВНАЯ RC-сессия владельца pid 8680 (PPID 21396 = rc_supervisor.py);
+      • HEADLESS-ребёнок питон-родителя pid 15724 (PPID 17744) — ровно то, что плодит демон.
+    Формат — дословный вывод живого powershell-снимка (правило-класс «мок = живой формат»):
+    ключи ProcessId/ParentProcessId/Created, ветки claude/tree."""
+
+    FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "fixtures", "claude_procs.live.json")
+    DAEMON_LIKE_PID = 17744     # питон-родитель headless-ребёнка 15724 (роль «демон»)
+    RC_SUPERVISOR_PID = 21396   # родитель ИНТЕРАКТИВНОЙ RC-сессии 8680
+    ELECTRON_PID = 18628        # Claude Desktop: 7 чужих агент-сессий
+
+    class _P:
+        def __init__(self, rc, out): self.returncode, self.stdout = rc, out
+
+    @classmethod
+    def setUpClass(cls):
+        with open(cls.FIX, encoding="utf-8") as f:
+            cls.live = f.read()
+
+    def _count(self, own_pid, blob=None):
+        return o._count_claude_procs(runner=lambda *a, **k: self._P(0, blob or self.live),
+                                     own_pid=own_pid)
+
+    def test_live_fixture_shape(self):
+        data = json.loads(self.live)
+        self.assertEqual(len(data["claude"]), 9)          # 7 Desktop + 1 RC + 1 headless
+        self.assertGreater(len(data["tree"]), 100)
+        self.assertEqual(set(data["claude"][0]), {"ProcessId", "ParentProcessId", "Created"})
+
+    def test_counts_only_own_headless_children(self):
+        # демон видит РОВНО одного своего headless-ребёнка из девяти живых CLI-claude
+        self.assertEqual(self._count(self.DAEMON_LIKE_PID), 1)
+
+    def test_interactive_rc_session_not_counted(self):
+        # ГЛАВНОЕ владельца: интерактивная RC-сессия в бюджет демона НЕ входит…
+        self.assertEqual(self._count(self.DAEMON_LIKE_PID), 1)
+        # …и она же прекрасно считается, если корнем взять её собственного родителя-супервизора
+        self.assertEqual(self._count(self.RC_SUPERVISOR_PID), 1)
+
+    def test_desktop_agent_sessions_not_counted(self):
+        # 7 агент-сессий Claude Desktop (каскад 22.07) — тоже мимо бюджета демона…
+        self.assertEqual(self._count(self.DAEMON_LIKE_PID), 1)
+        # …а по корню-Electron их видно ВОСЕМЬ, не семь: пробник, породивший headless-ребёнка
+        # 15724, сам был запущен ИЗ сессии Claude Desktop (15724→17744→14912→8660→18628). Число
+        # честное по живому снимку — подгонять фикстуру под «красивую» семёрку нельзя
+        # (правило-класс: честный итог живого пина важнее ожидаемого).
+        self.assertEqual(self._count(self.ELECTRON_PID), 8)
+
+    def test_rc_session_lives_outside_desktop_tree(self):
+        # RC-сессия поднята wscript'ом/Планировщиком, а не из приложения: её цепь предков
+        # (8680→21396→18764→5772) до Electron НЕ доходит — потому она и не «чужой хвост» демона.
+        data = json.loads(self.live)
+        parents = {int(e["ProcessId"]): int(e["ParentProcessId"]) for e in data["tree"]}
+        created = {int(e["ProcessId"]): str(e.get("Created") or "") for e in data["tree"]}
+        self.assertFalse(o._is_descendant(8680, self.ELECTRON_PID, parents, created))
+        self.assertTrue(o._is_descendant(8680, self.RC_SUPERVISOR_PID, parents, created))
+
+    def test_unrelated_root_counts_zero(self):
+        self.assertEqual(self._count(999999), 0)          # чужой PID — ни одного нашего
+
+    def test_grandchildren_counted(self):
+        # субагент headless-ребёнка (внук демона) — тоже НАШ расход, считаем
+        data = json.loads(self.live)
+        data["claude"].append({"ProcessId": 40001, "ParentProcessId": 15724, "Created": "20260722190000"})
+        data["tree"].append({"ProcessId": 40001, "ParentProcessId": 15724, "Created": "20260722190000"})
+        self.assertEqual(self._count(self.DAEMON_LIKE_PID, json.dumps(data)), 2)
+
+    def test_pid_reuse_breaks_chain(self):
+        # Живой факт ЭТОГО ПК: у ботов PPID=5980, а процесса 5980 нет — PID переиспользуем.
+        # Если «родитель» СОЗДАН ПОЗЖЕ ребёнка, это не родитель, а тёзка → цепь рвём.
+        data = json.loads(self.live)
+        tree = {int(e["ProcessId"]): e for e in data["tree"]}
+        tree[self.DAEMON_LIKE_PID]["Created"] = "20260722235959"   # «демон» моложе своего ребёнка
+        data["tree"] = list(tree.values())
+        self.assertEqual(self._count(self.DAEMON_LIKE_PID, json.dumps(data)), 0)
+
+    def test_single_element_json_not_collapsed(self):
+        # ConvertTo-Json схлопывает список из ОДНОГО элемента в объект — живой формат, не теория
+        one = {"claude": {"ProcessId": 15724, "ParentProcessId": 17744, "Created": "20260722185500"},
+               "tree": {"ProcessId": 15724, "ParentProcessId": 17744, "Created": "20260722185500"}}
+        self.assertEqual(self._count(self.DAEMON_LIKE_PID, json.dumps(one)), 1)
+
+    def test_gate_respects_limit_for_headless(self):
+        # лимит по-прежнему СОБЛЮДАЕТСЯ для headless: счёт ≥ лимита → отказ
+        o._claude_budget_denials = 0
+        self.addCleanup(setattr, o, "_claude_budget_denials", 0)
+        ok, detail = o._claude_budget_gate(counter=lambda: o.MAX_CLAUDE_PROCS,
+                                           sleeper=lambda s: None, wait_sec=0)
+        self.assertFalse(ok)
+        self.assertIn("headless", detail)
+
+    def test_gate_open_when_only_interactive_alive(self):
+        # 9 живых CLI-claude на машине, но ни один не наш → счёт 0 → гейт ОТКРЫТ (раньше замок)
+        cnt = self._count(self.DAEMON_LIKE_PID + 12345)
+        self.assertEqual(cnt, 0)
+        ok, detail = o._claude_budget_gate(counter=lambda: cnt, sleeper=lambda s: None)
+        self.assertTrue(ok)
+        self.assertIn(f"0/{o.MAX_CLAUDE_PROCS}", detail)
 
 
 class TestGateSpawnsNoClaude(unittest.TestCase):
