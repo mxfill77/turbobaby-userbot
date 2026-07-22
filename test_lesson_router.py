@@ -193,6 +193,77 @@ class TestClassifyType(unittest.TestCase):
         # Именно УСЛОВИЕ, а не слово «данные», переводит урок в code.
         self.assertEqual(lr.BEHAVIOR, self._type('не пиши "данные получил"'))
 
+    # ===== КЛАСС-ФИКС живого кейса 22.07 16:49 (ОБРАТНЫЙ #164): упоминание денег ≠ правка расчёта =====
+    def test_golden_live_1649_wording_is_behavior(self):
+        """ЖИВОЙ ДЕФЕКТ 22.07 16:49 ДОСЛОВНО: урок ушёл CODE-карточкой владельцу из-за ОДНОГО слова
+        «тариф» в _CODE_KW (beh=0, cod=1 → «чистый code-сигнал»). Это чистое ПОВЕДЕНИЕ: правило о
+        ФОРМУЛИРОВКЕ уже вычисленного (не обещать уточнить то, что уже посчитано) — LLM исполняет его
+        из playbook. Обе оси разводим одинаково: ось-2 behavior, ось-1 стиль (книга правил)."""
+        remark = ("не жди с ответом уточню-и-вернусь — сразу указывай стоимость, "
+                  "если тариф известен")
+        d = lr.classify_lesson_type(remark)
+        self.assertEqual(lr.BEHAVIOR, d["type"], d)                       # ось-2: природа = поведение
+        self.assertEqual("high", d["confidence"], d)
+        self.assertEqual(lr.STYLE, lr.classify_lesson_remark(remark)[0])  # ось-1: маршрут = книга правил
+
+    def test_golden_wording_positives_are_behavior(self):
+        # Формулировка УЖЕ ВЫЧИСЛЕННОГО результата (не обещать/не дублировать/не переспрашивать/сразу
+        # называть) → behavior ДАЖЕ со словами цена/тариф/стоимость/доставка. Парафразы RU/EN.
+        for phrase in (
+            "не жди с ответом уточню-и-вернусь — сразу указывай стоимость, если тариф известен",
+            "не обещай перезвонить с ценой, если тариф уже назван — просто повтори цифру",
+            "не дублируй стоимость доставки, если уже написал её выше",
+            "не переспрашивай даты, если клиент их назвал — сразу давай цену",
+            "don't promise to check the price later, state it right away",
+        ):
+            self.assertEqual(lr.BEHAVIOR, self._type(phrase), phrase)
+
+    def test_golden_source_and_condition_stay_code(self):
+        """КОНТРАСТ (граница с обеих сторон): урок, меняющий ИСТОЧНИК или УСЛОВИЕ расчёта, остаётся
+        code — речь-акт «сразу называй» его НЕ перетягивает. Включает регресс #164-стороны: «цену
+        бери из столбца J» и «не называй цену, если Bridge молчит»."""
+        for phrase in (
+            "цену бери из столбца J",                          # ИСТОЧНИК → code (регресс #164 цел)
+            "не называй цену, если Bridge молчит",             # УСЛОВИЕ/недоступность → code
+            "сразу указывай стоимость из столбца J",           # тот же речь-акт + ИСТОЧНИК → code
+            "сразу называй цену, если Bridge молчит",          # тот же речь-акт + недоступность → code
+            "не обещай скидку — пересчитай её по формуле",     # способ расчёта → code
+        ):
+            self.assertEqual(lr.CODE, self._type(phrase), phrase)
+
+    def test_golden_live_1649_routes_to_playbook_not_owner_card(self):
+        """ЖИВОЙ КОНТУР целиком (route_lesson_urok, канал «урок:»): тот же урок ДОСЛОВНО обязан уйти
+        ПРАВИЛОМ В PLAYBOOK с реплаем «✅ Принято…», а НЕ карточкой «нужен код-фикс» владельцу — как
+        было в живом дефекте 16:49. Все побочки инъектированы (без Telegram/1160/playbook)."""
+        task = ('[урок:правка от @Filipp] родитель 292 — обучение на карточку черновика\n'
+                'окно диалога: клиент 12345\n'
+                'карточка модер-группы: msg=777\n'
+                'Замечание: не жди с ответом уточню-и-вернусь — сразу указывай стоимость, '
+                'если тариф известен\n'
+                'Исходный черновик: Уточню стоимость и вернусь к вам.')
+        seen = {}
+
+        def _style(rule):
+            seen["style"] = rule
+            return "added"
+
+        def _owner(card):
+            seen["owner"] = card
+            return ("инбокс 1160", True)
+
+        def _reply(card_msg_id, text, buttons=None):
+            seen["reply"] = text
+            return 1
+
+        dec = lr.route_lesson_urok(task, append_style=_style, find_conflict=lambda r: "",
+                                   notify_owner=_owner, reply_moderation=_reply)
+        self.assertEqual(lr.BEHAVIOR, dec["type"], dec)
+        self.assertEqual("done", dec["status"], dec)
+        self.assertFalse(dec.get("delegate"), dec)
+        self.assertIn("style", seen)                     # правило записано в книгу правил
+        self.assertNotIn("owner", seen)                  # карточка «нужен код-фикс» НЕ ушла владельцу
+        self.assertIn("Принято", seen.get("reply", ""))  # учителю ушёл ack о принятом правиле
+
 
 class TestParse(unittest.TestCase):
     """Разбор задачи-урока (контракт с build_lesson_task шага 2)."""
