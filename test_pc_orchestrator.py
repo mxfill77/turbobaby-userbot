@@ -1776,6 +1776,11 @@ class TestFileProcessMap(unittest.TestCase):
         self.assertEqual(o._procs_for_file("test_trainer.py"), set())                 # тест — не рантайм
         self.assertEqual(o._procs_for_file("fetch_delivery.py"), set())               # утилита-фетчер, НЕ рантайм ботов
         self.assertEqual(o._procs_for_file("pc_agent.py"), {"pc_agent"})
+        # log_setup.py — общая ротация логов: файловый хендлер вешается НА ИМПОРТЕ, значит новый
+        # порог/путь подхватывается только рестартом. Без правила правка одного log_setup.py не
+        # рестартила бы никого — ровно класс delivery.py dae330a (живой бот на старом коде часами).
+        self.assertEqual(o._procs_for_file("log_setup.py"), {"userbot", "moderbot", "pc_agent"})
+        self.assertEqual(o._procs_for_file("test_log_setup.py"), set())          # тест — не рантайм
         self.assertEqual(o._procs_for_file("README.md"), set())
         self.assertEqual(o._procs_for_file("CLAUDE.md"), set())
         self.assertEqual(o._procs_for_file("test_suggest.py"), set())            # тест — не рантайм
