@@ -4419,6 +4419,34 @@ class TestTeamRegistryBlock(unittest.TestCase):
         self.assertIsNone(res)
         self.assertEqual(calls, [])
 
+    def test_earth_changed_username_blocked_by_id(self):
+        # ГОЛДЕН инцидента 22.07 14:25: Earth СМЕНИЛ username — в реестре был стейл 'earth', живой
+        # @extthiwxer по username НЕ совпадает, фильтр промахнулся → черновик родился и уехал в
+        # тренажёр. Фикс: ГЛАВНЫЙ КЛЮЧ — id. Идентичности РЕАЛЬНЫЕ (из боевых draft-строк IPC):
+        # Earth = @extthiwxer id 8562625260; Пым = @Pleummmm id 659135499. Блок ПО ID при ЛЮБОМ
+        # username → ноль реакций.
+        suggest.TEAM_REGISTRY = {"usernames": {"pleummmm", "earth"},   # намеренно СТЕЙЛ-username
+                                 "user_ids": {8562625260, 659135499}, "group_ids": set()}
+        res, client, calls = self._run(
+            FakeSender(8562625260, username="extthiwxer", first="extthiwxer"),
+            "Здравствуйте! Хочу арендовать байк на неделю")
+        self.assertIsNone(res)
+        self.assertEqual(client.sent, [])         # ни черновика, ни приветствия — никуда
+        self.assertEqual(calls, [])               # LLM не вызывался
+        # Пым по id — так же, даже если username сменится
+        res2, client2, calls2 = self._run(FakeSender(659135499, username="somethingnew"), "привет")
+        self.assertIsNone(res2)
+        self.assertEqual(client2.sent, [])
+        self.assertEqual(calls2, [])
+
+    def test_live_registry_file_has_earth_and_pym_ids(self):
+        # РЕГРЕСС ДАННЫХ: боевой team_registry.json обязан держать ОБА живых id (ключ — id,
+        # username вторичен). Читаем реальный файл, как его читает рантайм.
+        reg = suggest._load_team_registry()
+        self.assertIn(8562625260, reg["user_ids"], "Earth (id) выпал из реестра")
+        self.assertIn(659135499, reg["user_ids"], "Пым (id) выпал из реестра")
+        self.assertIn("extthiwxer", reg["usernames"])
+
     # ---- НЕГАТИВ: обычный клиент → конвейер РАБОТАЕТ (черновик на модерацию, не клиенту) ----
     def test_ordinary_client_pipeline_runs(self):
         res, client, calls = self._run(FakeSender(999, username="client1"),

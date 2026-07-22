@@ -559,6 +559,116 @@ class TestDegradationAndExecutor(unittest.TestCase):
         self.assertEqual(moderation_ipc.get(did)["status"], "failed")
 
 
+class TestTrainerLeakGuard(unittest.TestCase):
+    """Протечка 22.07 14:25: mod_chat оказался отравлен id группы ТРЕНАЖЁРА → боевые карточки
+    клиентов (@extthiwxer, кнопки Да/Отклонить/Бронь) уехали в «Тренеровку». ГОЛДЕНЫ: (1) белый
+    список назначения — карточка модерации НЕ может быть отправлена в trainer-группу; (2) STAFF-SKIP —
+    черновик внутреннего аккаунта карточкой НЕ постится вовсе; (3) mod_chat не учится в группе
+    тренажёра (в т.ч. ДО привязки — по title)."""
+
+    TRAINER_CHAT = -5193185299    # реальный id «Тренеровки» из инцидента
+
+    def setUp(self):
+        import trainer
+        import moderation_bot
+        self.trainer = trainer
+        self.mb = moderation_bot
+        self._tmp = tempfile.TemporaryDirectory()
+        self._save = (moderation_ipc.DB_PATH, suggest.TEAM_REGISTRY, moderation_bot.MOD_GROUP_ID)
+        moderation_ipc.DB_PATH = os.path.join(self._tmp.name, "ipc.db")
+        moderation_ipc.init_db()
+        moderation_ipc.set_meta(trainer.K_CHAT, str(self.TRAINER_CHAT))   # тренажёр привязан
+        # Реальные id инцидента: Earth=@extthiwxer 8562625260, Пым=@Pleummmm 659135499
+        suggest.TEAM_REGISTRY = {"usernames": {"pleummmm", "extthiwxer"},
+                                 "user_ids": {8562625260, 659135499}, "group_ids": set()}
+
+    def tearDown(self):
+        (moderation_ipc.DB_PATH, suggest.TEAM_REGISTRY, self.mb.MOD_GROUP_ID) = self._save
+        self._tmp.cleanup()
+
+    def test_target_chat_never_trainer_group(self):
+        # mod_chat отравлен id тренажёра (как в инциденте) → _target_chat обязан дать None
+        self.mb.MOD_GROUP_ID = None
+        moderation_ipc.set_meta("mod_chat", str(self.TRAINER_CHAT))
+        self.assertIsNone(self.mb._target_chat(), "карточки в тренажёр уходить НЕ должны")
+        # здоровый mod_chat (реальная «Модерация ответов») → работает
+        moderation_ipc.set_meta("mod_chat", "-5031790861")
+        self.assertEqual(self.mb._target_chat(), -5031790861)
+
+    def test_target_chat_env_override_also_guarded(self):
+        # даже если MOD_GROUP_ID из env ошибочно указали на тренажёр → None (белый список жёсткий)
+        self.mb.MOD_GROUP_ID = self.TRAINER_CHAT
+        self.assertIsNone(self.mb._target_chat())
+
+    def test_poll_new_staff_skip_no_card(self):
+        # ГОЛДЕН STAFF-SKIP: черновик РЕАЛЬНОГО внутреннего (@extthiwxer id 8562625260) уже в
+        # очереди (как в инциденте — попал до ужесточения реестра) → карточка НЕ постится ВОВСЕ,
+        # черновик закрывается rejected; обычный клиент из той же очереди — постится штатно.
+        self.mb.MOD_GROUP_ID = -5031790861
+        did_staff = moderation_ipc.enqueue_draft(
+            {"client_id": 8562625260, "client_ref": "@extthiwxer", "lang": "ru",
+             "incoming": "заказ на доставку", "draft": "D1", "first_contact": False})
+        did_client = moderation_ipc.enqueue_draft(
+            {"client_id": 999, "client_ref": "@client1", "lang": "ru",
+             "incoming": "аренда", "draft": "D2", "first_contact": False})
+        posted = []
+
+        class Bot:
+            async def send_message(self, chat, text, **kw):
+                posted.append((chat, text))
+
+                class M:
+                    message_id = 700 + len(posted)
+                return M()
+
+        class Ctx:
+            bot = Bot()
+
+        asyncio.run(self.mb.job_poll_new(Ctx()))
+        self.assertEqual(len(posted), 1, "карточка только у ОБЫЧНОГО клиента")
+        self.assertIn("@client1", posted[0][1])
+        self.assertEqual(moderation_ipc.get(did_staff)["status"], "rejected")   # закрыт, не висит new
+        self.assertIn("STAFF-SKIP", moderation_ipc.get(did_staff)["reason"] or "")
+        self.assertEqual(moderation_ipc.get(did_client)["status"], "posted")
+
+    def test_group_message_does_not_learn_mod_chat_in_trainer(self):
+        # в группе тренажёра (по chat_id И по title до привязки) mod_chat НЕ учится
+        moderation_ipc.set_meta("mod_chat", "")
+
+        class Chat:
+            def __init__(self, cid, title):
+                self.id, self.title, self.type = cid, title, "group"
+
+        class Msg:
+            reply_to_message = None
+            text = "просто сообщение"
+            message_id = 1
+            voice = None
+
+        class Upd:
+            def __init__(self, cid, title):
+                self.effective_message = Msg()
+                self.effective_chat = Chat(cid, title)
+                self.effective_user = None
+
+        class Ctx:
+            class bot:
+                @staticmethod
+                async def send_message(*a, **k):
+                    pass
+
+        # привязанная группа тренажёра
+        asyncio.run(self.mb.on_group_message(Upd(self.TRAINER_CHAT, "Тренеровка"), Ctx()))
+        self.assertFalse(moderation_ipc.get_meta("mod_chat"), "mod_chat не должен выучиться")
+        # ДО привязки: chat_id ещё не в meta, но title = «Тренеровка» → тоже не учим (корень протечки)
+        moderation_ipc.set_meta(self.trainer.K_CHAT, "")
+        asyncio.run(self.mb.on_group_message(Upd(-777555, "Тренеровка"), Ctx()))
+        self.assertFalse(moderation_ipc.get_meta("mod_chat"))
+        # обычная рабочая группа → учится штатно
+        asyncio.run(self.mb.on_group_message(Upd(-5031790861, "Модерация ответов"), Ctx()))
+        self.assertEqual(moderation_ipc.get_meta("mod_chat"), "-5031790861")
+
+
 class TestRoutingIntoIPC(unittest.TestCase):
     """on_client_message: bot-режим → в IPC (не в группу); деградация → в группу."""
 

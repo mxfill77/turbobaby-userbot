@@ -429,11 +429,38 @@ async def main():
         # клиента, из уже поднятого me. Появится в логе после рестарта.
         log.info(f"{_now()} | Premium аккаунта: {getattr(me, 'premium', None)} "
                  f"(нужно для транскрипции голосовых reply).")
+        # STAFF-РЕЗОЛВ (инцидент 22.07 @extthiwxer=Earth: стейл-username в реестре → фильтр мимо):
+        # карточки ФАКТИЧЕСКИХ профилей внутренних аккаунтов (реестр по id) в лог — владелец
+        # сверяет глазами «Earth = @… id …». Read-only (get_entity), fail-safe.
+        for uid in sorted(suggest.TEAM_REGISTRY.get("user_ids") or []):
+            try:
+                ent = await client.get_entity(uid)
+                uname = f"@{ent.username}" if getattr(ent, "username", None) else "(без username)"
+                name = " ".join(filter(None, [getattr(ent, "first_name", None),
+                                              getattr(ent, "last_name", None)])) or "?"
+                log.info(f"{_now()} | STAFF-РЕЗОЛВ: id={uid} {uname} «{name}» — внутренний контур, "
+                         f"сообщения НЕ обрабатываются (ноль реакций).")
+            except Exception as e:
+                log.warning(f"{_now()} | STAFF-РЕЗОЛВ: id={uid} не разрезолвился: {e}")
         if suggest.is_enabled():
             # Резолвим группу модерации (по ID из env или по имени) и вешаем 2-й хендлер.
             gid = await suggest.resolve_mod_group(client)
             if gid is not None:
                 client.add_event_handler(on_moderation, events.NewMessage(chats=gid))
+                # САМОЛЕЧЕНИЕ протечки 22.07: mod_chat в IPC-meta (куда модербот постит карточки)
+                # оказался отравлен id группы ТРЕНАЖЁРА → боевые карточки уехали в «Тренеровку».
+                # userbot знает НАСТОЯЩИЙ id «Модерации ответов» (резолв по имени) — если meta
+                # пуста или указывает на тренажёр, чиним на резолвленный gid.
+                try:
+                    import moderation_ipc
+                    v = moderation_ipc.get_meta("mod_chat")
+                    cur = int(v) if v and v.lstrip("-").isdigit() else None
+                    if cur is None or trainer.is_trainer_chat(cur):
+                        moderation_ipc.set_meta("mod_chat", str(int(gid)))
+                        log.warning(f"{_now()} | mod_chat вылечен: {cur} → {gid} "
+                                    f"(боевые карточки снова в «Модерацию ответов»).")
+                except Exception as e:
+                    log.warning(f"{_now()} | самолечение mod_chat: {e}")
             # Исполнитель решений бота-модератора (bot-режим) — только при наличии токена.
             if suggest.MODERBOT_TOKEN:
                 asyncio.create_task(_suggest_ipc_poller(client))

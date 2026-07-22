@@ -55,11 +55,21 @@ POLL_SEC = 3
 
 
 def _target_chat():
-    """Куда постить карточки: MOD_GROUP_ID из env или чат, где бота уже видели."""
+    """Куда постить карточки: MOD_GROUP_ID из env или чат, где бота уже видели.
+    ЖЁСТКИЙ белый список назначения (протечка 22.07 14:25: mod_chat оказался отравлен id группы
+    ТРЕНАЖЁРА → боевые карточки клиентов ушли в «Тренеровку»): группа тренажёра НИКОГДА не может
+    быть целью боевых карточек — совпадение цели с trainer chat_id ⇒ None (карточки ждут в
+    очереди, протечки нет), громкий лог."""
     if MOD_GROUP_ID is not None:
-        return MOD_GROUP_ID
-    v = moderation_ipc.get_meta("mod_chat")
-    return int(v) if v and v.lstrip("-").isdigit() else None
+        target = MOD_GROUP_ID
+    else:
+        v = moderation_ipc.get_meta("mod_chat")
+        target = int(v) if v and v.lstrip("-").isdigit() else None
+    if target is not None and trainer.is_trainer_chat(target):
+        log.error(f"mod_chat={target} указывает на группу ТРЕНАЖЁРА — боевые карточки туда НЕ шлю "
+                  "(белый список назначения); жду перепривязки mod_chat.")
+        return None
+    return target
 
 
 def _kb_initial():
@@ -111,6 +121,17 @@ async def job_poll_new(context):
         log.warning(f"poll_new: {e}")
         return
     for r in rows:
+        # STAFF-SKIP (слой 3, инцидент 22.07 @extthiwxer=Earth): внутренний аккаунт команды →
+        # карточка модерации НЕ создаётся ВОВСЕ (даже если черновик как-то попал в очередь до
+        # ужесточения реестра). Черновик закрываем rejected с причиной — не висит вечно new.
+        try:
+            if suggest.is_internal_user_id(r.get("client_id")):
+                moderation_ipc.mark(r["id"], "rejected", reason="internal staff (STAFF-SKIP)")
+                log.info(f"STAFF-SKIP: черновик #{r['id']} от внутреннего id{r.get('client_id')} "
+                         f"({r.get('client_ref')}) — карточку модерации НЕ пощу.")
+                continue
+        except Exception as e:
+            log.warning(f"STAFF-SKIP чек #{r.get('id')}: {e}")
         try:
             head = f"✏️ Черновик клиенту {r['client_ref']}"
             if r.get("first_contact"):
@@ -381,10 +402,12 @@ async def on_group_message(update, context):
     chat = update.effective_chat
     if msg is None or chat is None:
         return
-    # ГРУППА-ТРЕНАЖЁР: если это привязанная группа тренажёра — единственная роль модербота тут
-    # панель кнопок под ответом userbot (шапка «[тренажёр …»). Никакой модерации и, ВАЖНО, НЕ
-    # перетираем mod_chat (иначе боевые карточки уехали бы в тренажёр). Выходим сразу.
-    if trainer.is_trainer_chat(chat.id):
+    # ГРУППА-ТРЕНАЖЁР: если это привязанная группа тренажёра ИЛИ группа с её title (защита ДО
+    # привязки — корень протечки 22.07: модербота добавили в «Тренеровку», первое сообщение пришло
+    # раньше привязки userbot'ом, is_trainer_chat=False → mod_chat выучился = id тренажёра, и
+    # боевые карточки уехали туда) — единственная роль модербота тут панель кнопок под ответом
+    # userbot (шапка «[тренажёр …»). Никакой модерации и НИКОГДА не учим mod_chat. Выходим сразу.
+    if trainer.is_trainer_chat(chat.id) or trainer.title_matches(getattr(chat, "title", "") or ""):
         if trainer.has_header(msg.text or ""):
             try:
                 await context.bot.send_message(
