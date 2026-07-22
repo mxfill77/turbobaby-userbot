@@ -4835,6 +4835,130 @@ class TestModelMismatchRejectFlow(_SheetFixture, unittest.TestCase):
         self.assertFalse(any("ЗАБРАКОВАН" in t[1] for t in self.client.sent))
 
 
+class TestWindow7562315636(_SheetFixture, unittest.TestCase):
+    """ГОЛДЕН окна 7562315636 (шаг 5/7 #274): клиент просит «160 кубов и PCX», а живые черновики
+    котировали MT-03 — один заявлял «дам развёрнуто по Nmax», но выводил блок MT-03. Сквозной
+    прогон on_client_message, оба слоя гварда:
+      • здоровый путь (шаг 3): чужие карточки отфильтрованы НА СБОРКЕ ноты — карточка модератора
+        несёт ТОЛЬКО класс 150–160 (NMAX 155) + PCX 160, ни MT-03/ADV/XADV/CB;
+      • браковка (шаг 4): расходящийся черновик до модератора НЕ доезжает (🛑 с причиной, карточки
+        нет) — и когда LLM котирует MT-03 при ЧИСТОМ блоке, и в живой форме окна (испорченная нота
+        привезла блок MT-03 при заявке «по Nmax»)."""
+
+    # Дословная пара родителя #274 в прайс-запросе (как в голденах шагов 2–3).
+    WINDOW_MSG = "Пришлите прайс: интересуют 160 кубов и PCX"
+
+    def setUp(self):
+        super().setUp()
+        self._tmp = tempfile.TemporaryDirectory()
+        d = self._tmp.name
+        self._mode = suggest.SUGGEST_MODE
+        self._test = suggest.SUGGEST_TEST_MODE
+        self._mg = suggest.MOD_GROUP_ID
+        self._pending = suggest.pending
+        self._pairs = suggest.PAIRS_FILE
+        self._note_fn = suggest.build_pricing_note
+        suggest.SUGGEST_MODE = True
+        suggest.SUGGEST_TEST_MODE = False
+        suggest.reset_disabled()
+        suggest.MOD_GROUP_ID = -1009999999999
+        suggest.pending = suggest.PendingStore(os.path.join(d, "pending.jsonl"))
+        suggest.PAIRS_FILE = os.path.join(d, "pairs.jsonl")
+        suggest.limiter = suggest.RateLimiter(6, 15)
+        self.me = 42
+        self.client = FakeClient(history=[
+            FakeHistMsg(self.me, "Здравствуйте! Что хотите арендовать?"),
+            FakeHistMsg(999, self.WINDOW_MSG),
+        ])
+        self.sender = FakeSender(999, username="client1")
+
+    def tearDown(self):
+        suggest.SUGGEST_MODE = self._mode
+        suggest.SUGGEST_TEST_MODE = self._test
+        suggest.MOD_GROUP_ID = self._mg
+        suggest.pending = self._pending
+        suggest.PAIRS_FILE = self._pairs
+        suggest.build_pricing_note = self._note_fn
+        suggest.reset_disabled()
+        self._tmp.cleanup()
+        super().tearDown()
+
+    def _wire_live_note(self):
+        """ЗДОРОВЫЙ путь ноты: ЖИВОЙ build_pricing_note с фикстурным Bridge-getter (инъекция
+        только сети и даты — сборка блока и фильтр шага 3 продовые)."""
+        real, getter = self._note_fn, self._getter()
+        suggest.build_pricing_note = (
+            lambda hints, lang="ru": real(hints, lang=lang, getter=getter,
+                                          today=datetime.date(2026, 7, 11)))
+
+    def _wire_broken_note(self):
+        """ЖИВАЯ форма окна (до гварда): нота привозит блок ЧУЖОЙ модели MT-03 (дефект-симуляция
+        транспортом — здоровый путь шага 3 такой блок больше не строит)."""
+        rows = suggest.filter_rows_by_requested(
+            suggest.price_sheet("2026-07-15", getter=self._getter()),
+            [{"type": "model", "canon": "MT-03"}])
+        block = (suggest.render_price_sheet(rows, "2026-07-15", "ru")
+                 + "\n\n" + suggest._sheet_min_term_line("ru"))
+        note = suggest._wrap_price_sheet(block, "2026-07-15", "ru")
+        suggest.build_pricing_note = lambda hints, lang="ru": note
+        # Сетка собрана — гасим конфиг Bridge, чтобы park_allowlist не пошёл живым HTTP.
+        suggest.pricing.BRIDGE_URL = ""
+        suggest.pricing.BRIDGE_TOKEN = ""
+
+    def _run(self, llm_text):
+        return asyncio.run(suggest.on_client_message(
+            self.client, self.sender, self.me, call_llm=lambda s, u: llm_text, faq="FAQ"))
+
+    # ---- слой 1 (шаг 3): здоровый путь — чужие блоки отфильтрованы, карточка чистая ----
+    def test_healthy_card_only_requested_models(self):
+        self._wire_live_note()
+        res = self._run("Дам развёрнуто по Nmax.\n[PRICE_SHEET]\nПодойдут ли вам даты?")
+        self.assertIsNotNone(res)
+        cards = [t for t in self.client.sent
+                 if t[0] == suggest.MOD_GROUP_ID and "Черновик ответа клиенту" in t[1]]
+        self.assertEqual(len(cards), 1)
+        card = cards[0][1]
+        self.assertIn("@client1", card)
+        self.assertIn("NMAX 155", card)            # класс 150–160
+        self.assertIn("PCX 160", card)             # запрошенная модель
+        for foreign in ("MT-03", "ADV 350", "XADV 750", "CB 300R"):
+            self.assertNotIn(foreign, card)        # чужие блоки НЕ доехали (шаг 3)
+        # заявка «по Nmax» ПОДТВЕРЖДЕНА блоком (NMAX 155 в карточках) — браковки нет
+        self.assertFalse(any("ЗАБРАКОВАН" in t[1] for t in self.client.sent))
+
+    # ---- слой 2 (шаг 4): LLM котирует MT-03 при ЧИСТОМ блоке → браковка ----
+    def test_llm_quotes_mt03_over_clean_block_rejected(self):
+        self._wire_live_note()
+        with self.assertLogs(logging.getLogger("suggest"), level="WARNING") as cm:
+            res = self._run("Вот подробные цены по MT-03:\n[PRICE_SHEET]\nПодойдут ли даты?")
+        self.assertIsNone(res)
+        notes = [t for t in self.client.sent
+                 if t[0] == suggest.MOD_GROUP_ID and "ЗАБРАКОВАН" in t[1]]
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0][1].lstrip().startswith("🛑"))
+        self.assertIn("MT-03", notes[0][1])        # что заявлено текстом
+        self.assertIn("NMAX 155", notes[0][1])     # что реально в блоке
+        self.assertIn("PCX 160", notes[0][1])
+        self.assertFalse(any("Черновик ответа клиенту" in t[1] for t in self.client.sent))
+        self.assertEqual(len(self.client.sent), 1)  # 🛑 — единственная отправка
+        self.assertIn("ЗАБРАКОВАН", "\n".join(cm.output))
+
+    # ---- слой 2 (шаг 4): живая форма окна — заявка «по Nmax», блок MT-03 → браковка ----
+    def test_window_verbatim_claim_nmax_block_mt03_rejected(self):
+        self._wire_broken_note()
+        with self.assertLogs(logging.getLogger("suggest"), level="WARNING") as cm:
+            res = self._run("Дам развёрнуто по Nmax.\n[PRICE_SHEET]\nПодойдут ли вам даты?")
+        self.assertIsNone(res)
+        notes = [t for t in self.client.sent if "ЗАБРАКОВАН" in t[1]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("NMAX", notes[0][1])         # что заявлено
+        self.assertIn("MT-03", notes[0][1])        # что реально в блоке
+        self.assertFalse(any("Черновик ответа клиенту" in t[1] for t in self.client.sent))
+        blob = "\n".join(cm.output)
+        self.assertIn("NMAX", blob)
+        self.assertIn("MT-03", blob)
+
+
 class TestTeamRegistryBlock(unittest.TestCase):
     """ЖЁСТКИЙ блок команды КОДОМ ДО LLM (родитель: инцидент @Pleummmm 15.07 11:23 — userbot
     сгенерил черновик на окно ОФИС-МЕНЕДЖЕРА). ГОЛДЕН: сообщение от участника реестра → НУЛЕВАЯ
