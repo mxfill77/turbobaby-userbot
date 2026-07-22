@@ -22,16 +22,42 @@ from unittest import mock
 import suggest
 
 
-def _cli_json(result="", main="claude-fable-5", main_in=2766, main_out=31, is_error=False):
+def _cli_json(result="", main="claude-fable-5", main_in=2766, main_out=31, is_error=False,
+              main_cache_read=0, main_cache_create=0):
     """Собрать stdout как у claude --output-format json: поле result + modelUsage с реальной головой
-    (main, большой inputTokens) и служебным haiku (крошечный вход). Для тестов _cli_llm/_parse_cli_json."""
+    (main) и служебным haiku (крошечный фикс-вход). Для тестов _cli_llm/_parse_cli_json.
+    main_cache_read/main_cache_create — поля КЭША ПРОМПТА: в живом ответе прода почти весь вход
+    настоящей головы лежит именно там, а inputTokens близок к нулю (см. голден с живой выдачей ниже)."""
     return json.dumps({
         "type": "result", "is_error": is_error, "result": result,
         "modelUsage": {
-            "claude-haiku-4-5-20251001": {"inputTokens": 505, "outputTokens": 13},
-            main: {"inputTokens": main_in, "outputTokens": main_out},
+            "claude-haiku-4-5-20251001": {"inputTokens": 505, "outputTokens": 13,
+                                          "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0},
+            main: {"inputTokens": main_in, "outputTokens": main_out,
+                   "cacheReadInputTokens": main_cache_read,
+                   "cacheCreationInputTokens": main_cache_create},
         },
     })
+
+
+# ЖИВАЯ выдача claude CLI 2.1.217 (замер 23.07.2026, cwd=temp, --model sonnet --fallback-model sonnet,
+# system-промпт 24 984 символа). Скопирована ДОСЛОВНО — правило-класс CLAUDE.md «мок обязан копировать
+# живой формат». Прежняя фикстура давала настоящей голове большой inputTokens и потому НЕ ловила
+# дефект: с кэшем промпта у головы input≈0, а весь объём — в cacheRead/cacheCreation.
+_LIVE_MODEL_USAGE = {
+    "claude-haiku-4-5-20251001": {
+        "inputTokens": 551, "outputTokens": 22,
+        "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0, "costUSD": 0.000661,
+        "contextWindow": 200000, "maxOutputTokens": 32000,
+    },
+    "claude-sonnet-5": {
+        "inputTokens": 2, "outputTokens": 51,
+        "cacheReadInputTokens": 29339, "cacheCreationInputTokens": 16329,
+        "webSearchRequests": 0, "costUSD": 0.1075467,
+        "contextWindow": 1000000, "maxOutputTokens": 64000,
+    },
+}
 
 
 # ------------------------------- моки Telegram -------------------------------
@@ -1686,6 +1712,28 @@ class TestCliLlm(unittest.TestCase):
             _cli_json(result="OK", main="claude-sonnet-5", main_in=3077, main_out=4))
         self.assertEqual(text, "OK")
         self.assertEqual(real, "claude-sonnet-5")   # НЕ haiku, хотя у него output больше (12 > 4)
+
+    def test_golden_live_head_is_sonnet_not_the_haiku_helper(self):
+        """ГОЛДЕН НА ЖИВОЙ ВЫДАЧЕ (замер 23.07.2026). С кэшем промпта у настоящей головы
+        inputTokens=2, а весь system-промпт лежит в cacheRead(29339)+cacheCreation(16329);
+        у служебного haiku input=551 без кэша. Сравнение по ОДНОМУ inputTokens объявляло головой
+        haiku — и лог врал владельцу, что клиентам отвечает haiku, хотя отвечал sonnet."""
+        raw = json.dumps({"type": "result", "is_error": False, "result": "OK",
+                          "modelUsage": _LIVE_MODEL_USAGE})
+        text, real = suggest._parse_cli_json(raw)
+        self.assertEqual(text, "OK")
+        self.assertEqual(real, "claude-sonnet-5")
+        self.assertNotIn("haiku", real)
+        # полный вход = свежий + прочитанный из кэша + записанный в кэш
+        self.assertEqual(suggest._mu_input_total(_LIVE_MODEL_USAGE["claude-sonnet-5"]), 45670)
+        self.assertEqual(suggest._mu_input_total(_LIVE_MODEL_USAGE["claude-haiku-4-5-20251001"]), 551)
+        # битые/пустые записи не роняют счёт (fail-safe)
+        self.assertEqual(suggest._mu_input_total(None), 0)
+        self.assertEqual(suggest._mu_input_total({"inputTokens": "нет"}), 0)
+        # регресс: БЕЗ кэша (старый формат) поведение прежнее — голова по объёму входа
+        text2, real2 = suggest._parse_cli_json(
+            _cli_json(result="ok", main="claude-fable-5", main_in=2766))
+        self.assertEqual(real2, "claude-fable-5")
 
     def test_cli_parse_is_error_returns_empty(self):
         text, real = suggest._parse_cli_json(_cli_json(result="что-то", is_error=True))

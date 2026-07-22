@@ -35,14 +35,17 @@ FAIL-SAFE ВЕЗДЕ. Любая ошибка сети/Bridge/парса → з�
 """
 
 import os
+import time
 import json
 import datetime
+import contextlib
 import urllib.request
 import urllib.parse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 SIDECAR = os.path.join(BASE_DIR, "trainer_log_doc.json")
+LOCK_FILE = os.path.join(BASE_DIR, "trainer_log.lock")
 
 DOC_NAME = "KB_trainer_log"            # имя дока в мозге (для KB_MASTER и когда он попадёт в манифест)
 KIND_CLIENT, KIND_BOT, KIND_BTN, KIND_LESSON = "client", "bot", "btn", "lesson"
@@ -54,8 +57,43 @@ MAX_CHARS = int(os.getenv("TRAINER_LOG_MAX_CHARS", "1000000") or "1000000")
 KEEP_CHARS = int(os.getenv("TRAINER_LOG_KEEP_CHARS", "700000") or "700000")
 HTTP_TIMEOUT = int(os.getenv("TRAINER_LOG_TIMEOUT", "30") or "30")
 
+# ЗАГОЛОВОК-ЛЕГЕНДА дока (первая строка, положена Штабом при создании: «TRN LOG v1 | …»).
+# Новые события ложатся СВЕРХУ, поэтому без пиннинга легенда уехала бы вниз, а при ротации —
+# первой же в архив: живой док остался бы без описания собственного формата.
+HEADER_MARK = "TRN LOG"
+
+# СЕРИАЛИЗАЦИЯ ЗАПИСИ. Bridge умеет только read+write ЦЕЛОГО дока — значит два потребителя
+# (userbot и moderbot) в один момент делают read-modify-write, и запись, пришедшая второй,
+# ЗАТИРАЕТ строку первой. Событие теряется молча, а ТЗ требует «писать ВСЁ». Оба процесса живут
+# на ОДНОМ ПК, поэтому критическую секцию закрываем файловым локом (тот же идиом O_CREAT|O_EXCL,
+# что userbot.lock/moderation_bot.lock). Лок протух (владелец умер посреди HTTP) → забираем.
+# Не дождались за LOCK_WAIT_SEC → пишем ВСЁ РАВНО с предупреждением: потерять событие хуже,
+# чем рискнуть редкой гонкой.
+LOCK_STALE_SEC = int(os.getenv("TRAINER_LOG_LOCK_STALE", str(4 * HTTP_TIMEOUT + 30)))
+LOCK_WAIT_SEC = int(os.getenv("TRAINER_LOG_LOCK_WAIT", str(2 * HTTP_TIMEOUT + 10)))
+
 import logging
 log = logging.getLogger("trainer_log")   # хендлеры вешает процесс-хозяин (userbot/moderbot)
+
+
+# --- ГАРД ТЕСТОВОГО КОНТЕКСТА (иначе гейт пишет мусор в ЖИВОЙ док мозга) ----------------------
+# ЖИВОЙ ИНЦИДЕНТ 23.07.2026: точки записи повесили на боевые обработчики (moderation_bot.
+# _trainer_callback и т.п.), а юнит-тесты эти обработчики ДЁРГАЮТ по-настоящему. Как только в
+# сайдкар лёг file id, ДВА прогона гейта залили в KB_trainer_log 30 строк из фикстур («хочу
+# скутер», «Ответ бота ТЕСТ-клиенту», TEST-1/4/6) и растянули гейт с 18с до 106с на сетевых
+# round-trip'ах. Точка правды «идёт тестовый прогон» в репозитории одна — log_setup.is_test_context
+# (TESTING / TURBOBABY_TEST_LOGS / PYTEST_CURRENT_TEST / запуск через unittest|pytest); тем же
+# сигналом логи уводятся в temp, а moderation_ipc — на тестовую БД.
+# Гард срабатывает ТОЛЬКО на боевом транспорте: если вызывающий инжектировал get/post (мок-тесты
+# самого trainer_log), запись идёт как обычно — там сети нет и проверять нечего.
+
+def in_test_context() -> bool:
+    """Идёт тестовый прогон? Ошибка импорта log_setup → False (боевой путь важнее, fail-safe)."""
+    try:
+        from log_setup import is_test_context
+        return bool(is_test_context())
+    except Exception:
+        return False
 
 
 # ------------------------------- конфиг канала -------------------------------
@@ -173,6 +211,74 @@ def write_doc(did, text, env=None, post=None):
     return True
 
 
+# ------------------------------- лок записи ----------------------------------
+
+def _lock_age(path):
+    """Возраст лок-файла в секундах или None (лока нет/не прочитать)."""
+    try:
+        return max(0.0, time.time() - os.path.getmtime(path))
+    except OSError:
+        return None
+
+
+@contextlib.contextmanager
+def doc_lock(path=None, wait=None, stale=None, sleep=0.25):
+    """Критическая секция read-modify-write дока. Отдаёт True (лок наш) либо False (не дождались —
+    вызывающий пишет всё равно, но с предупреждением). Никогда не бросает и никогда не оставляет
+    лок висеть: снимаем в finally, а протухший (старше stale) забираем у мёртвого владельца."""
+    path = path or LOCK_FILE
+    wait = LOCK_WAIT_SEC if wait is None else wait
+    stale = LOCK_STALE_SEC if stale is None else stale
+    deadline = time.time() + max(0, wait)
+    mine = False
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode("utf-8"))
+            finally:
+                os.close(fd)
+            mine = True
+            break
+        except FileExistsError:
+            age = _lock_age(path)
+            if age is not None and age > stale:
+                log.warning("trainer_log: лок протух (%.0fс) — забираю", age)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                continue
+            if time.time() >= deadline:
+                log.warning("trainer_log: лок занят дольше %sс — пишу без него (риск гонки)", wait)
+                break
+            time.sleep(sleep)
+        except OSError as e:                      # каталог недоступен и т.п. — лок не обязателен
+            log.warning("trainer_log: лок недоступен (%s) — пишу без него", type(e).__name__)
+            break
+    try:
+        yield mine
+    finally:
+        if mine:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+# ------------------------------- заголовок дока ------------------------------
+
+def split_header(text):
+    """Отделить заголовок-легенду («TRN LOG v1 | …», первая строка) от тела лога → (header, body).
+    Заголовка нет → ('', text). Нужен, чтобы новые события ложились ПОД легенду, а не над ней,
+    и чтобы ротация не унесла легенду в архив первой же."""
+    t = (text or "").replace("\r\n", "\n").lstrip("\n")
+    if not t.startswith(HEADER_MARK):
+        return "", (text or "").replace("\r\n", "\n")
+    head, _, rest = t.partition("\n")
+    return head.rstrip(), rest.lstrip("\n")
+
+
 # ------------------------------- ротация -------------------------------------
 
 def rotate(text, max_chars=None, keep_chars=None):
@@ -193,35 +299,48 @@ def rotate(text, max_chars=None, keep_chars=None):
 
 # ------------------------------- публичная запись ----------------------------
 
-def append(n, kind, text, now=None, env=None, get=None, post=None, sidecar_path=None):
+def append(n, kind, text, now=None, env=None, get=None, post=None, sidecar_path=None,
+           lock_path=None):
     """Дописать ОДНО событие тренажёра в KB_trainer_log. → dict(status, line):
       status='ok'      — строка легла в док;
       status='no_doc'  — file id ещё не задан (Штаб не завёл док) — НЕ ошибка, просто не пишем;
       status='error'   — канал недоступен/Bridge отказал (тренажёр при этом жив).
-    Новая строка идёт ПЕРВОЙ (свежее сверху) — тем же порядком, что cowork_log."""
+    Новое событие идёт ПЕРВЫМ (свежее сверху) — тем же порядком, что cowork_log, но ПОД
+    заголовком-легендой дока, если он есть. read-modify-write закрыт файловым локом (два
+    процесса пишут в один док)."""
     line = format_line(n, kind, text, now)
+    # Тестовый прогон на БОЕВОМ транспорте — в живой док мозга не пишем НИКОГДА (см. in_test_context).
+    if get is None and post is None and in_test_context():
+        log.info("trainer_log: тестовый контекст — в живой док не пишу: %s", line[:160])
+        return {"status": "test", "line": line}
     did = doc_id(sidecar_path)
     if not did:
         log.info("trainer_log: doc_id не задан — событие не записано: %s", line[:160])
         return {"status": "no_doc", "line": line}
     env = env if env is not None else _env_file()
-    old = read_doc(did, env, get)
-    if old is None:
-        return {"status": "error", "line": line}
-    fresh, spill = rotate(line + "\n" + old)
-    if spill:
-        aid = archive_id(sidecar_path)
-        if aid:
-            prev = read_doc(aid, env, get) or ""
-            if write_doc(aid, (spill + "\n" + prev).strip(), env, post):
-                log.warning("trainer_log: ротация — %s символов срезано в архив", len(spill))
+    # Читаем и пишем ПОД ЛОКОМ: между read и write не должен влезть второй процесс (иначе его
+    # строка исчезнет вместе с нашей перезаписью целого дока).
+    with doc_lock(lock_path):
+        old = read_doc(did, env, get)
+        if old is None:
+            return {"status": "error", "line": line}
+        head, body = split_header(old)             # легенда дока остаётся ПЕРВОЙ строкой
+        merged = (line + "\n" + body) if body.strip() else line
+        fresh, spill = rotate(merged)
+        if spill:
+            aid = archive_id(sidecar_path)
+            if aid:
+                prev = read_doc(aid, env, get) or ""
+                if write_doc(aid, (spill + "\n" + prev).strip(), env, post):
+                    log.warning("trainer_log: ротация — %s символов срезано в архив", len(spill))
+                else:
+                    fresh, spill = merged, ""      # архив не принял → НИЧЕГО не теряем
             else:
-                fresh, spill = line + "\n" + old, ""    # архив не принял → НИЧЕГО не теряем
-        else:
-            log.warning("trainer_log: лог перерос %s символов, но archive_id не задан — "
-                        "срез НЕ делаю (историю молча не теряем)", MAX_CHARS)
-            fresh = line + "\n" + old
-    return {"status": "ok" if write_doc(did, fresh, env, post) else "error", "line": line}
+                log.warning("trainer_log: лог перерос %s символов, но archive_id не задан — "
+                            "срез НЕ делаю (историю молча не теряем)", MAX_CHARS)
+                fresh = merged
+        out = (head + "\n" + fresh) if head else fresh
+        return {"status": "ok" if write_doc(did, out, env, post) else "error", "line": line}
 
 
 def safe_append(n, kind, text, **kw):

@@ -4009,17 +4009,38 @@ def _resolve_claude(retries=1, retry_sleep=2.0):
     return None
 
 
+_MU_INPUT_FIELDS = ("inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")
+
+
+def _mu_input_total(usage) -> int:
+    """ПОЛНЫЙ вход головы из записи modelUsage: свежие + прочитанные из кэша + записанные в кэш.
+    Считать надо ВСЕ три поля — см. _real_model_from_json."""
+    u = usage or {}
+    total = 0
+    for f in _MU_INPUT_FIELDS:
+        try:
+            total += int(u.get(f) or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
 def _real_model_from_json(data: dict) -> str:
     """Реально отработавшая ГОЛОВА из modelUsage (--output-format json). CLI под капотом дёргает
     служебный haiku-помощник (заголовок сессии и т.п.) — у него всегда крошечный фикс-вход (~505 ткн),
-    поэтому реальную голову опознаём по МАКСИМУ inputTokens, а НЕ по outputTokens: при фолбэке основная
+    поэтому реальную голову опознаём по ОБЪЁМУ ВХОДА, а НЕ по outputTokens: при фолбэке основная
     модель может дать МЕНЬШЕ output, чем служебный haiku (замер: sonnet=4 vs haiku=12) — по output лог
-    соврал бы про модель. Нет modelUsage → ''."""
+    соврал бы про модель.
+    ★ ВХОД СЧИТАЕМ ПОЛНОСТЬЮ (замер 23.07.2026, живой claude 2.1.217): с включённым КЭШЕМ ПРОМПТА у
+    настоящей головы поле inputTokens почти пустое, а весь system-промпт лежит в cacheRead/
+    cacheCreation — живой ответ был {sonnet: input=2, cacheRead=29339, cacheCreation=16329} против
+    {haiku: input=551}. Сравнение по ОДНОМУ inputTokens объявляло головой служебный haiku, и лог
+    месяцами врал владельцу, что клиентам отвечает haiku, хотя отвечал sonnet. Нет modelUsage → ''."""
     mu = data.get("modelUsage") if isinstance(data, dict) else None
     if not isinstance(mu, dict) or not mu:
         return ""
     try:
-        return max(mu.items(), key=lambda kv: (kv[1] or {}).get("inputTokens", 0))[0]
+        return max(mu.items(), key=lambda kv: _mu_input_total(kv[1]))[0]
     except Exception:
         return ""
 

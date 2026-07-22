@@ -86,12 +86,14 @@ class TestAppend(unittest.TestCase):
     def _append(self, bridge, text="привет", kind="client", n=5, sidecar=None):
         return trainer_log.append(n, kind, text, now=NOW, env=ENV,
                                   get=bridge.get, post=bridge.post,
-                                  sidecar_path=sidecar or self._sidecar)
+                                  sidecar_path=sidecar or self._sidecar,
+                                  lock_path=self._lock)
 
     def setUp(self):
         import tempfile, json
         self._dir = tempfile.TemporaryDirectory()
         self._sidecar = os.path.join(self._dir.name, "trainer_log_doc.json")
+        self._lock = os.path.join(self._dir.name, "trainer_log.lock")
         with open(self._sidecar, "w", encoding="utf-8") as f:
             json.dump({"doc_id": self.DID}, f)
         self._old_env = os.environ.pop("TRAINER_LOG_DOC_ID", None)
@@ -110,6 +112,48 @@ class TestAppend(unittest.TestCase):
         self.assertIn("старое событие", text)                       # прошлое не затёрто
         self.assertEqual(b.writes[0][0], self.DID)                  # писали ПО ID, а не по имени
         self.assertEqual(b.reads, [self.DID])
+        self.assertFalse(os.path.exists(self._lock))                # лок снят, не висит
+
+    def test_header_stays_first_line(self):
+        """Легенда дока, положенная Штабом при создании, обязана остаться ПЕРВОЙ строкой:
+        события ложатся под неё, иначе описание формата уезжает вниз и первым же уходит в архив."""
+        head = ("TRN LOG v1 | Полный лог тренажёра «Тренеровка» (клиентский контур) | "
+                "формат: TRN <дата время> | TEST-N | client|bot|btn|lesson | <текст>")
+        b = FakeBridge({self.DID: head})
+        self.assertEqual(self._append(b, "первое событие")["status"], "ok")
+        self.assertEqual(self._append(b, "второе событие")["status"], "ok")
+        lines = b.docs[self.DID].splitlines()
+        self.assertEqual(lines[0], head)                            # легенда — всё ещё первая
+        self.assertIn("второе событие", lines[1])                   # свежее — сразу под ней
+        self.assertIn("первое событие", lines[2])                   # старое — ниже
+        self.assertEqual(len(lines), 3)
+        # split_header — чистая и обратимая
+        self.assertEqual(trainer_log.split_header(head + "\nx\ny"), (head, "x\ny"))
+        self.assertEqual(trainer_log.split_header("x\ny"), ("", "x\ny"))
+        self.assertEqual(trainer_log.split_header(""), ("", ""))
+        self.assertEqual(trainer_log.split_header("TRN LOG v1\r\nx"), ("TRN LOG v1", "x"))
+
+    def test_header_survives_rotation(self):
+        import tempfile, json
+        head = "TRN LOG v1 | легенда"
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "s.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"doc_id": "DOC", "archive_id": "ARCH"}, f)
+            old = head + "\n" + "\n".join(f"TRN старое {i}" for i in range(60))
+            b = FakeBridge({"DOC": old, "ARCH": ""})
+            om, ok_ = trainer_log.MAX_CHARS, trainer_log.KEEP_CHARS
+            trainer_log.MAX_CHARS, trainer_log.KEEP_CHARS = 200, 120
+            try:
+                res = trainer_log.append(1, "btn", "новое", now=NOW, env=ENV, get=b.get,
+                                         post=b.post, sidecar_path=p,
+                                         lock_path=os.path.join(d, "l.lock"))
+            finally:
+                trainer_log.MAX_CHARS, trainer_log.KEEP_CHARS = om, ok_
+            self.assertEqual(res["status"], "ok")
+            self.assertTrue(b.docs["DOC"].startswith(head))         # легенда НЕ уехала в архив
+            self.assertNotIn(head, b.docs["ARCH"])
+            self.assertIn("TRN старое 59", b.docs["ARCH"])           # в архив ушло самое старое
 
     def test_no_doc_id_means_no_network_and_honest_status(self):
         import json
@@ -127,8 +171,40 @@ class TestAppend(unittest.TestCase):
         self.assertEqual(self._append(FakeBridge({self.DID: ""}, fail_write=True))["status"],
                          "error")
         # safe_append не бросает даже при полностью битом окружении
-        self.assertIn(trainer_log.safe_append(1, "bot", "x", env={}, sidecar_path=self._sidecar),
+        b = FakeBridge({}, fail_read=True)
+        self.assertIn(trainer_log.safe_append(1, "bot", "x", env={}, sidecar_path=self._sidecar,
+                                              get=b.get, post=b.post, lock_path=self._lock),
                       ("no_doc", "error"))
+
+    def test_test_run_never_writes_to_the_live_doc(self):
+        """ЖИВОЙ ИНЦИДЕНТ 23.07: как только в сайдкар лёг file id, ДВА прогона гейта залили в
+        KB_trainer_log 30 строк из фикстур (боевые обработчики дёргаются тестами по-настоящему) и
+        растянули гейт с 18с до 106с на сетевых round-trip'ах. Тестовый прогон обязан молчать."""
+        self.assertTrue(trainer_log.in_test_context(), "юнит-тест обязан опознаваться как тест")
+        calls = []
+
+        def boom_get(*a, **kw):
+            calls.append("get"); raise AssertionError("сеть в тестах трогать нельзя")
+
+        def boom_post(*a, **kw):
+            calls.append("post"); raise AssertionError("сеть в тестах трогать нельзя")
+
+        old = trainer_log._get, trainer_log._post
+        trainer_log._get, trainer_log._post = boom_get, boom_post
+        try:
+            res = trainer_log.append(7, "btn", "🎓 Обучить", sidecar_path=self._sidecar,
+                                     lock_path=self._lock)
+            self.assertEqual(res["status"], "test")
+            self.assertEqual(trainer_log.safe_append(7, "client", "хочу скутер",
+                                                     sidecar_path=self._sidecar,
+                                                     lock_path=self._lock), "test")
+        finally:
+            trainer_log._get, trainer_log._post = old
+        self.assertEqual(calls, [], "в тестовом контексте не должно быть НИ ОДНОГО обращения к сети")
+        # …но мок-тесты самого модуля (инъекция get/post) продолжают проверять запись как обычно
+        b = FakeBridge({self.DID: "TRN LOG v1 | легенда"})
+        self.assertEqual(self._append(b, "строка мок-теста")["status"], "ok")
+        self.assertIn("строка мок-теста", b.docs[self.DID])
 
     def test_env_var_wins_over_sidecar(self):
         os.environ["TRAINER_LOG_DOC_ID"] = "ENV_ID"
@@ -203,6 +279,77 @@ class TestRotation(unittest.TestCase):
             self.assertIn("TRN старое 49", b.docs[aid])             # самое старое — в архиве
             self.assertIn("TRN архивное 0", b.docs[aid])            # прежний архив не затёрт
             self.assertNotIn("TRN старое 49", b.docs[did])
+
+
+class TestWriteLock(unittest.TestCase):
+    """Bridge умеет только read+write ЦЕЛОГО дока, а потребителей два (userbot + moderbot) на одном
+    ПК. Без сериализации вторая запись затирает строку первой — событие теряется молча, а ТЗ
+    требует «писать ВСЁ». Критическая секция закрыта файловым локом."""
+
+    def setUp(self):
+        import tempfile
+        self._dir = tempfile.TemporaryDirectory()
+        self.lock = os.path.join(self._dir.name, "trainer_log.lock")
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def test_lock_is_exclusive_and_released(self):
+        with trainer_log.doc_lock(self.lock, wait=0) as mine:
+            self.assertTrue(mine)
+            self.assertTrue(os.path.exists(self.lock))
+            with trainer_log.doc_lock(self.lock, wait=0) as second:
+                self.assertFalse(second)                            # занят — второй не получил
+        self.assertFalse(os.path.exists(self.lock))                 # снят в finally
+
+    def test_busy_lock_does_not_swallow_the_event(self):
+        """Не дождались лока → пишем ВСЁ РАВНО (с предупреждением): потерять событие хуже,
+        чем рискнуть редкой гонкой."""
+        did = "DOC"
+        import tempfile, json
+        p = os.path.join(self._dir.name, "s.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"doc_id": did}, f)
+        b = FakeBridge({did: "TRN старое"})
+        old_wait = trainer_log.LOCK_WAIT_SEC
+        trainer_log.LOCK_WAIT_SEC = 0            # в бою ждём ~70с (4 HTTP по 30с) — в тесте не ждём
+        try:
+            with trainer_log.doc_lock(self.lock, wait=0):           # лок держит «другой процесс»
+                res = trainer_log.append(1, "btn", "событие", now=NOW, env=ENV, get=b.get,
+                                         post=b.post, sidecar_path=p, lock_path=self.lock)
+        finally:
+            trainer_log.LOCK_WAIT_SEC = old_wait
+        self.assertEqual(res["status"], "ok")
+        self.assertIn("событие", b.docs[did])
+
+    def test_stale_lock_is_taken_over(self):
+        with open(self.lock, "w", encoding="utf-8") as f:
+            f.write("99999")                                        # владелец умер посреди HTTP
+        old_mtime = os.path.getmtime(self.lock) - 10_000
+        os.utime(self.lock, (old_mtime, old_mtime))
+        with trainer_log.doc_lock(self.lock, wait=0, stale=60) as mine:
+            self.assertTrue(mine, "протухший лок обязан забираться, иначе лог встанет навсегда")
+        self.assertFalse(os.path.exists(self.lock))
+
+    def test_lock_never_raises_on_broken_path(self):
+        bad = os.path.join(self._dir.name, "нет-такого-каталога", "l.lock")
+        with trainer_log.doc_lock(bad, wait=0) as mine:
+            self.assertFalse(mine)                                  # лок не взяли, но и не упали
+
+    def test_two_sequential_writers_keep_both_lines(self):
+        """Модель гонки: два потребителя пишут подряд — обе строки обязаны уцелеть."""
+        import tempfile, json
+        p = os.path.join(self._dir.name, "s.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"doc_id": "DOC"}, f)
+        b = FakeBridge({"DOC": "TRN LOG v1 | легенда"})
+        for who, txt in (("btn", "модербот: тап номера 2"), ("bot", "userbot: ответ клиенту")):
+            trainer_log.append(9, who, txt, now=NOW, env=ENV, get=b.get, post=b.post,
+                               sidecar_path=p, lock_path=self.lock)
+        doc = b.docs["DOC"]
+        self.assertIn("модербот: тап номера 2", doc)
+        self.assertIn("userbot: ответ клиенту", doc)
+        self.assertTrue(doc.startswith("TRN LOG v1 | легенда"))
 
 
 class TestWiring(unittest.TestCase):
