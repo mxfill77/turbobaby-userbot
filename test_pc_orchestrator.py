@@ -1772,6 +1772,12 @@ class TestFileProcessMap(unittest.TestCase):
         # trainer.py: карта ПО ФАКТУ импортов — userbot_listen.py:44 И moderation_bot.py:36 (оба
         # модульного уровня) → общий рантайм. Без правила правка только trainer.py не рестартила никого.
         self.assertEqual(o._procs_for_file("trainer.py"), {"userbot", "moderbot"})
+        # trainer_log.py — лог тренажёра в мозг: импортят ОБА (userbot пишет реплики/ответы/команды,
+        # moderbot — нажатия кнопок и уроки). Правило ТОЧНОЕ по имени, а не префикс «trainer»:
+        # рядом лежат ДАННЫЕ (trainer_rules.json / trainer_log_doc.json), читаемые на вызове.
+        self.assertEqual(o._procs_for_file("trainer_log.py"), {"userbot", "moderbot"})
+        self.assertEqual(o._procs_for_file("trainer_log_doc.json"), set())            # file id дока — данные, не код
+        self.assertEqual(o._procs_for_file("test_trainer_log.py"), set())             # тест — не рантайм
         self.assertEqual(o._procs_for_file("trainer_rules.json"), set())              # данные правил, не код → рестарт не нужен
         self.assertEqual(o._procs_for_file("test_trainer.py"), set())                 # тест — не рантайм
         self.assertEqual(o._procs_for_file("fetch_delivery.py"), set())               # утилита-фетчер, НЕ рантайм ботов

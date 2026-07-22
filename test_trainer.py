@@ -509,29 +509,165 @@ class TestHypsRender(unittest.TestCase):
 
 
 class TestHypsKeyboard(unittest.TestCase):
+    """Кнопки-ТУМБЛЕРЫ: номер отмечается ✅ прямо на кнопке, запись — по «✔ Применить»."""
+
+    def _flat(self, kb):
+        return [b for row in kb.inline_keyboard for b in row]
+
     def test_buttons_are_numbers_and_carry_index(self):
         import moderation_bot
         hyps = [LONG_HYP, "б", "в", "г", "д", "е"]
-        kb = moderation_bot._kb_trainer_hyps(hyps)
-        flat = [b for row in kb.inline_keyboard for b in row]
-        self.assertEqual([b.text for b in flat[:-1]], ["1", "2", "3", "4", "5", "6"])
-        self.assertEqual([b.callback_data for b in flat[:-1]],
+        flat = self._flat(moderation_bot._kb_trainer_hyps(hyps))
+        self.assertEqual([b.text for b in flat[:6]], ["1", "2", "3", "4", "5", "6"])
+        self.assertEqual([b.callback_data for b in flat[:6]],
                          [f"tr:hyp:{i}" for i in range(6)])     # индекс, а не текст — маппинг надёжен
-        self.assertEqual(flat[-1].callback_data, "tr:hyp:other")
-        self.assertIn("другое", flat[-1].text)
-        self.assertTrue(all(len(row) <= 5 for row in kb.inline_keyboard))
+        self.assertEqual([b.callback_data for b in flat[6:]],
+                         ["tr:hyp:apply", "tr:hyp:cancel", "tr:hyp:other"])
+        self.assertIn("Применить", flat[6].text)
+        self.assertIn("Отмена", flat[7].text)
+        self.assertIn("другое", flat[8].text)
+        self.assertTrue(all(len(row) <= 5 for row in kb_rows(moderation_bot, hyps)))
+
+    def test_selected_numbers_are_marked_on_the_button(self):
+        import moderation_bot
+        hyps = ["а", "б", "в"]
+        flat = self._flat(moderation_bot._kb_trainer_hyps(hyps, [0, 2]))
+        self.assertEqual([b.text for b in flat[:3]], ["✅1", "2", "✅3"])
+        # callback_data не меняется от отметки — маршрутизация тумблера стабильна
+        self.assertEqual([b.callback_data for b in flat[:3]],
+                         ["tr:hyp:0", "tr:hyp:1", "tr:hyp:2"])
+        self.assertEqual([b.text for b in self._flat(
+            moderation_bot._kb_trainer_hyps(hyps, []))[:3]], ["1", "2", "3"])
 
     def test_n_not_four(self):
         import moderation_bot
         for n in (2, 3, 5):
-            kb = moderation_bot._kb_trainer_hyps([f"г{i}" for i in range(n)])
-            flat = [b for row in kb.inline_keyboard for b in row]
-            self.assertEqual(len(flat), n + 1)                  # N номеров + «другое»
-            self.assertEqual([b.text for b in flat[:-1]], [str(i + 1) for i in range(n)])
+            flat = self._flat(moderation_bot._kb_trainer_hyps([f"г{i}" for i in range(n)]))
+            self.assertEqual(len(flat), n + 3)                  # N номеров + Применить/Отмена/другое
+            self.assertEqual([b.text for b in flat[:n]], [str(i + 1) for i in range(n)])
+
+
+def kb_rows(moderation_bot, hyps):
+    """Ряды клавиатуры БЕЗ служебных (проверяем ширину только у рядов с номерами)."""
+    return moderation_bot._kb_trainer_hyps(hyps).inline_keyboard[:-2]
+
+
+class TestMultiSelectLessons(unittest.TestCase):
+    """ТЗ п.7: тумблеры + «Применить»; КАЖДАЯ отмеченная гипотеза — ОТДЕЛЬНОЕ правило со своим
+    номером (совместимо с «отмени урок N»), подтверждение — ОДНИМ сообщением."""
+
+    def test_toggle_is_pure_and_idempotent(self):
+        self.assertEqual(trainer._toggle([], 2), [2])
+        self.assertEqual(trainer._toggle([2], 2), [])
+        self.assertEqual(trainer._toggle([2, 0], 1), [0, 1, 2])   # всегда отсортирован
+        self.assertEqual(trainer._toggle([0, 1, 2], 1), [0, 2])
+
+    def test_selection_roundtrip_and_reset_on_new_hyps(self):
+        d, get, set = _dict_store()
+        trainer.set_hyps(["а", "б", "в"], set=set)
+        self.assertEqual(trainer.toggle_selection(0, get, set), [0])
+        self.assertEqual(trainer.toggle_selection(2, get, set), [0, 2])
+        self.assertEqual(trainer.selected_hypotheses(get), ["а", "в"])
+        self.assertEqual(trainer.toggle_selection(0, get, set), [2])
+        trainer.set_hyps(["новые"], set=set)                      # новая выдача → отметки сброшены
+        self.assertEqual(trainer.get_selection(get), [])
+
+    def test_selection_ignores_stale_indices(self):
+        d, get, set = _dict_store()
+        trainer.set_hyps(["а", "б"], set=set)
+        trainer.set_selection([0, 5], set)                        # 5 — устаревший индекс
+        self.assertEqual(trainer.selected_hypotheses(get), ["а"])
+        set(trainer.K_HYP_SEL, "не json")                         # битьё → пусто, не падаем
+        self.assertEqual(trainer.get_selection(get), [])
+
+    def test_each_selected_hypothesis_becomes_its_own_rule(self):
+        added = []
+        rules = [{"n": 1, "rule": "первое"}, {"n": 2, "rule": "второе"}]
+        dec = trainer.apply_lessons(
+            ["первое", "второе"],
+            append_rule=lambda r: added.append(r) or "added",
+            classify=lambda r: "behavior", mark=lambda r: True,
+            list_rules=lambda: rules)
+        self.assertEqual(added, ["первое", "второе"])             # ДВА отдельных правила
+        self.assertEqual(dec["accepted"], [(1, "первое"), (2, "второе")])
+        self.assertEqual(dec["card"].count("✅"), 1)               # ОДНО подтверждение, не два
+        self.assertIn("#1 — первое", dec["card"])
+        self.assertIn("#2 — второе", dec["card"])
+
+    def test_apply_lessons_reports_code_duplicate_and_empty(self):
+        dec = trainer.apply_lessons(["почини парсер дат"],
+                                    append_rule=lambda r: "added",
+                                    classify=lambda r: "code", list_rules=lambda: [])
+        self.assertEqual(dec["code"], ["почини парсер дат"])
+        self.assertEqual(dec["accepted"], [])
+        self.assertIn("код-фикс", dec["card"])
+        dup = trainer.apply_lessons(["уже было"], append_rule=lambda r: "duplicate",
+                                    classify=lambda r: "behavior", list_rules=lambda: [])
+        self.assertEqual(dup["duplicates"], ["уже было"])
+        empty = trainer.apply_lessons([], list_rules=lambda: [])
+        self.assertIn("Ничего не отмечено", empty["card"])
+        # сбой книги правил не роняет карточку (fail-safe)
+        boom = trainer.apply_lessons(["x"], append_rule=lambda r: "added",
+                                     classify=lambda r: "behavior", mark=lambda r: True,
+                                     list_rules=lambda: (_ for _ in ()).throw(RuntimeError("нет")))
+        self.assertIn("x", boom["card"])
+
+
+class TestPendingFreeTextLesson(unittest.TestCase):
+    """ТЗ п.8: «✍ другое» БЕЗ ПРЕФИКСА — ждём следующее сообщение владельца, TTL 10 минут."""
+
+    def test_pending_lifecycle_and_ttl(self):
+        d, get, set = _dict_store()
+        trainer.start_pending_lesson("mike", now=1000, set=set)
+        self.assertEqual(trainer.pending_lesson(now=1000, get=get), "mike")
+        self.assertEqual(trainer.pending_lesson(now=1000 + 599, get=get), "mike")
+        self.assertIsNone(trainer.pending_lesson(now=1000 + 601, get=get))   # TTL 10 мин истёк
+        self.assertIsNone(trainer.pending_lesson(now=1000, get=lambda k: ""))
+
+    def test_take_is_once_and_owner_scoped(self):
+        d, get, set = _dict_store()
+        trainer.start_pending_lesson("mike", now=1000, set=set)
+        self.assertFalse(trainer.take_pending_lesson("someone", now=1000, get=get, set=set))
+        self.assertTrue(trainer.take_pending_lesson("@mike", now=1000, get=get, set=set))
+        self.assertFalse(trainer.take_pending_lesson("mike", now=1000, get=get, set=set))  # уже забрали
+
+    def test_reset_clears_pending_and_selection(self):
+        d, get, set = _dict_store()
+        trainer.set_hyps(["а", "б"], set=set)
+        trainer.toggle_selection(1, get, set)
+        trainer.start_pending_lesson("mike", now=1000, set=set)
+        trainer.reset(get, set)
+        self.assertEqual(trainer.get_selection(get), [])
+        self.assertIsNone(trainer.pending_lesson(now=1000, get=get))
+
+    def test_wiring_userbot_catches_pending_text(self):
+        """Проводка (userbot_listen.py импортить в тестах нельзя — Telethon и живая сессия):
+        проверяем ПО ИСХОДНИКУ, что ловец свободного текста реально подключён и что ловит его
+        именно userbot (в группе он видит ВСЕ сообщения, модербот — не обязательно)."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "userbot_listen.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("trainer.pending_lesson()", src)
+        self.assertIn("trainer.take_pending_lesson(username)", src)
+        self.assertIn("trainer.apply_lesson, text.strip()", src)   # ДОСЛОВНО, без префикса
+        with open(os.path.join(here, "moderation_bot.py"), encoding="utf-8") as f:
+            mb = f.read()
+        self.assertIn("trainer.start_pending_lesson(username)", mb)  # кнопка ставит ожидание
+        self.assertIn("trainer.apply_lessons", mb)                   # «Применить» пишет пачкой
+        self.assertIn("trainer.toggle_selection", mb)                # номер — тумблер
+
+    def test_free_text_is_saved_verbatim(self):
+        # ДОСЛОВНО: опечатки и разговорную форму (голосовой ввод) НЕ правим.
+        said = "не надо повторять про доствку в кажном ответе ага"
+        added = []
+        dec = trainer.apply_lesson(said, append_rule=lambda r: added.append(r) or "added",
+                                   classify=lambda r: "behavior", mark=lambda r: True)
+        self.assertEqual(added, [said])
+        self.assertIn(said, dec["card"])
 
 
 class TestHypsTapMapping(unittest.IsolatedAsyncioTestCase):
-    """Тап по номеру выбирает ИМЕННО ту гипотезу (и «✍️ другое» работает как раньше)."""
+    """Тап по номеру ОТМЕЧАЕТ именно ту гипотезу; запись — только по «✔ Применить»."""
 
     def setUp(self):
         import moderation_bot
@@ -540,13 +676,21 @@ class TestHypsTapMapping(unittest.IsolatedAsyncioTestCase):
         self._old_appr = suggest.APPROVER_USERNAMES
         suggest.APPROVER_USERNAMES = {"mike"}
         self._old_apply = trainer.apply_lesson
+        self._old_applies = trainer.apply_lessons
         self.applied = []
         trainer.apply_lesson = lambda remark: (self.applied.append(remark)
                                                or {"card": f"✅ урок: {remark}"})
+        trainer.apply_lessons = lambda remarks, **kw: (self.applied.extend(remarks)
+                                                       or {"card": "✅ Принято уроков: "
+                                                                   f"{len(remarks)}"})
+        trainer.set_selection([])
 
     def tearDown(self):
         suggest.APPROVER_USERNAMES = self._old_appr
         trainer.apply_lesson = self._old_apply
+        trainer.apply_lessons = self._old_applies
+        trainer.set_selection([])
+        trainer.clear_pending_lesson()
 
     def _fakes(self, username="mike", chat_id=-100500):
         sent = []
@@ -570,20 +714,63 @@ class TestHypsTapMapping(unittest.IsolatedAsyncioTestCase):
             def __init__(self, u, cid):
                 self.from_user = User(u)
                 self.message = Msg(cid)
+                self.edits = []
+
+            async def edit_message_reply_markup(self, reply_markup=None):
+                self.edits.append(reply_markup)
 
         return Ctx(), Q(username, chat_id), sent
 
-    async def test_tap_number_picks_that_hypothesis(self):
+    async def test_tap_number_only_marks_and_writes_nothing(self):
         trainer.set_hyps(["первая", LONG_HYP, "третья"])
         ctx, q, sent = self._fakes()
         await self.mb._trainer_callback(ctx, q, "tr:hyp:1")     # кнопка «2» → индекс 1
-        self.assertEqual(self.applied, [LONG_HYP])
+        self.assertEqual(self.applied, [])                      # тап НЕ пишет правило
+        self.assertEqual(trainer.get_selection(), [1])          # он ставит отметку
+        self.assertEqual(trainer.selected_hypotheses(), [LONG_HYP])
+        marks = [b.text for row in q.edits[-1].inline_keyboard for b in row][:3]
+        self.assertEqual(marks, ["1", "✅2", "3"])               # ✅ видно прямо на кнопке
+        await self.mb._trainer_callback(ctx, q, "tr:hyp:1")     # повторный тап снимает
+        self.assertEqual(trainer.get_selection(), [])
 
-    async def test_other_button_unchanged(self):
+    async def test_apply_writes_all_marked_in_one_message(self):
+        trainer.set_hyps(["первая", LONG_HYP, "третья"])
+        ctx, q, sent = self._fakes()
+        await self.mb._trainer_callback(ctx, q, "tr:hyp:0")
+        await self.mb._trainer_callback(ctx, q, "tr:hyp:2")
+        self.assertEqual(self.applied, [])
+        await self.mb._trainer_callback(ctx, q, "tr:hyp:apply")
+        self.assertEqual(self.applied, ["первая", "третья"])    # обе, каждая отдельным правилом
+        self.assertEqual(len([t for _, t, _ in sent if "Принято уроков" in t]), 1)  # ОДНО сообщение
+        self.assertEqual(trainer.get_selection(), [])           # отметки сняты после применения
+
+    async def test_cancel_drops_marks_and_writes_nothing(self):
+        trainer.set_hyps(["первая", "вторая"])
+        ctx, q, sent = self._fakes()
+        await self.mb._trainer_callback(ctx, q, "tr:hyp:0")
+        await self.mb._trainer_callback(ctx, q, "tr:hyp:cancel")
+        self.assertEqual(self.applied, [])
+        self.assertEqual(trainer.get_selection(), [])
+        self.assertTrue(any("Отменено" in t for _, t, _ in sent))
+
+    async def test_other_button_starts_pending_without_prefix(self):
         ctx, q, sent = self._fakes()
         await self.mb._trainer_callback(ctx, q, "tr:hyp:other")
         self.assertEqual(self.applied, [])
-        self.assertTrue(any("урок:" in t for _, t, _ in sent))
+        self.assertEqual(trainer.pending_lesson(), "mike")      # ждём следующий текст владельца
+        body = "\n".join(t for _, t, _ in sent)
+        self.assertIn("СЛЕДУЮЩИМ сообщением", body)
+        self.assertIn("не нужен", body)                         # префикс «урок:» больше не требуем
+        self.assertNotIn("Напиши правило текстом", body)        # прежней инструкции-префикса нет
+
+    async def test_non_approver_cannot_toggle_or_apply(self):
+        trainer.set_hyps(["первая"])
+        ctx, q, sent = self._fakes(username="stranger")
+        await self.mb._trainer_callback(ctx, q, "tr:hyp:0")
+        await self.mb._trainer_callback(ctx, q, "tr:hyp:apply")
+        self.assertEqual(self.applied, [])
+        self.assertEqual(trainer.get_selection(), [])
+        self.assertTrue(all("только для approver" in t for _, t, _ in sent))
 
     async def test_teach_posts_full_text_and_number_buttons(self):
         moderation_ipc.set_meta(trainer.K_INCOMING, "а сколько доставка?")
@@ -600,10 +787,11 @@ class TestHypsTapMapping(unittest.IsolatedAsyncioTestCase):
         kb = sent[-1][2]                                        # клавиатура — на последней части
         self.assertIsNotNone(kb)
         flat = [b for row in kb.inline_keyboard for b in row]
-        self.assertEqual([b.text for b in flat], ["1", "2", "3", "✍️ другое"])
-        # тап по номеру «2» из этой же выдачи → та самая длинная гипотеза
+        self.assertEqual([b.text for b in flat],
+                         ["1", "2", "3", "✔ Применить", "✖ Отмена", "✍️ другое"])
+        # тап по номеру «2» из этой же выдачи → отмечена та самая длинная гипотеза
         await self.mb._trainer_callback(ctx, q, flat[1].callback_data)
-        self.assertEqual(self.applied, [LONG_HYP])
+        self.assertEqual(trainer.selected_hypotheses(), [LONG_HYP])
 
 
 # --------- накопление окна диалога + токен состояния (регресс ТЕСТ-4 раздвоения) ------

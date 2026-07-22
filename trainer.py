@@ -42,6 +42,15 @@ K_TRANSCRIPT = "trainer_transcript"
 K_INCOMING = "trainer_incoming"
 K_ANSWER = "trainer_answer"
 K_HYPS = "trainer_hyps"
+# МУЛЬТИВЫБОР гипотез: номера-тумблеры копятся здесь (JSON-список индексов), пока владелец не
+# нажал «✔ Применить». Состояние кросс-процессное (кнопки жмут в модерботе) и переживает
+# перезапуск процесса — иначе половина отмеченного терялась бы на ровном месте.
+K_HYP_SEL = "trainer_hyp_sel"
+# «✍ другое» БЕЗ ПРЕФИКСА: после нажатия ждём СЛЕДУЮЩЕЕ текстовое сообщение владельца и пишем
+# его правилом ДОСЛОВНО. Флаг ожидания — «<unix_ts>|<username>»: ставит модербот (кнопка),
+# снимает тот, кто первым увидел сообщение (userbot видит в группе ВСЁ, поэтому он и ловит).
+K_PENDING = "trainer_pending_lesson"
+PENDING_TTL_SEC = int(os.getenv("TRAINER_PENDING_TTL_SEC", "600") or "600")   # 10 минут
 # Монотонный токен «состояние диалога менялось»: каждый клиентский турн и сброс инкрементят его.
 # Дебаунс-ответ, запланированный на токене S, исполняется, только если токен всё ещё S (иначе —
 # пришёл более свежий турн / был сброс → устаревший ответ не постим). Кросс-процессный (в meta):
@@ -219,7 +228,9 @@ def parse_hypotheses(text, limit=4):
 
 
 TG_MSG_LIMIT = 4096                       # жёсткий лимит Telegram на длину текста сообщения
-HYPS_TITLE = "🎓 Что улучшить в ответе? Тапни номер (тап = запомнить), или «✍️ другое»:"
+HYPS_TITLE = ("🎓 Что улучшить в ответе? Номера — ТУМБЛЕРЫ (тап = отметить ✅, повторный тап "
+              "снимает). Отметь всё нужное и жми «✔ Применить». Или «✍️ другое» — напишешь "
+              "правило своими словами следующим сообщением:")
 HYPS_TITLE_CONT = "🎓 …продолжение списка гипотез:"
 _HYPS_CUT = " …[обрезано]"
 
@@ -373,6 +384,150 @@ def get_hyps(get=None):
 
 def set_hyps(hyps, set=None):
     (set or _default_set)(K_HYPS, json.dumps(list(hyps or []), ensure_ascii=False))
+    (set or _default_set)(K_HYP_SEL, "")      # новый список гипотез → отметки старого не тянем
+
+
+# --- МУЛЬТИВЫБОР гипотез (кнопки-тумблеры) -----------------------------------
+# Раньше тап по номеру СРАЗУ писал правило и закрывал тему: отметить две-три гипотезы за раз было
+# нельзя, а промах пальцем сразу становился выученным правилом. Теперь номер — тумблер, а запись
+# происходит только по «✔ Применить»; каждая отмеченная гипотеза идёт ОТДЕЛЬНЫМ правилом со своим
+# номером (⇒ «отмени урок N» продолжает работать поштучно).
+
+def _toggle(sel, i):
+    """Чистый тумблер: индекс i есть в списке → убрать, нет → добавить. → НОВЫЙ сорт. список."""
+    s = set(int(x) for x in (sel or []))
+    i = int(i)
+    s.discard(i) if i in s else s.add(i)
+    return sorted(s)
+
+
+def get_selection(get=None):
+    """Отмеченные номера гипотез (0-based индексы) → список int. Битьё/пусто → []."""
+    raw = (get or _default_get)(K_HYP_SEL) or ""
+    try:
+        v = json.loads(raw) if raw else []
+    except Exception:
+        return []
+    return sorted({int(x) for x in v}) if isinstance(v, list) else []
+
+
+def set_selection(sel, set=None):
+    (set or _default_set)(K_HYP_SEL, json.dumps(sorted({int(x) for x in (sel or [])})))
+
+
+def toggle_selection(i, get=None, set=None):
+    """Тумблер номера i в сохранённом выборе. → новый список отметок."""
+    sel = _toggle(get_selection(get or _default_get), i)
+    set_selection(sel, set or _default_set)
+    return sel
+
+
+def selected_hypotheses(get=None):
+    """Тексты отмеченных гипотез в порядке номеров (устаревшие индексы молча отбрасываем)."""
+    get = get or _default_get
+    hyps = get_hyps(get)
+    return [hyps[i] for i in get_selection(get) if 0 <= i < len(hyps)]
+
+
+def apply_lessons(remarks, append_rule=None, classify=None, mark=None, list_rules=None):
+    """Применить НЕСКОЛЬКО уроков разом: каждый — ОТДЕЛЬНЫМ правилом со своим номером.
+    → dict(accepted=[(n, rule), …], duplicates=[…], code=[…], errors=[…], card='<одно сообщение>').
+    Пустой список → карточка-предупреждение (нечего применять). Инъекции — как в apply_lesson."""
+    items = [" ".join(str(r or "").split()).strip() for r in (remarks or [])]
+    items = [r for r in items if r]
+    if not items:
+        return {"accepted": [], "duplicates": [], "code": [], "errors": [],
+                "card": "⚠️ Ничего не отмечено — тапни номера гипотез и нажми «✔ Применить»."}
+    accepted, duplicates, code, errors = [], [], [], []
+    for r in items:
+        dec = apply_lesson(r, append_rule=append_rule, classify=classify, mark=mark)
+        if dec.get("axis") == "code":
+            code.append(r)
+        elif dec.get("status") == "added":
+            accepted.append(r)
+        elif dec.get("status") == "duplicate":
+            duplicates.append(r)
+        else:
+            errors.append(r)
+    # номера правил — из книги ПОСЛЕ записи (та же нумерация, что /rules и «отмени урок N»)
+    numbers = {}
+    try:
+        if list_rules is None:
+            import suggest
+            list_rules = suggest.list_playbook_rules
+        for row in list_rules() or []:
+            numbers[_norm_rule(row.get("rule"))] = row.get("n")
+    except Exception:
+        numbers = {}
+
+    def _num(r):
+        n = numbers.get(_norm_rule(r))
+        return f"#{n} — " if n else "• "
+
+    lines = []
+    if accepted:
+        lines.append(f"✅ Принято уроков: {len(accepted)} (источник «{TRAINER_SOURCE}», применятся "
+                     "со следующего ответа):")
+        lines += [_num(r) + r for r in accepted]
+    if duplicates:
+        lines.append("↩️ Уже было в книге правил (не задваиваем):")
+        lines += [_num(r) + r for r in duplicates]
+    if code:
+        lines.append("🛠 Нужен код-фикс — правилом поведения этого не выучить:")
+        lines += ["• " + r for r in code]
+    if errors:
+        lines.append("⚠️ Не удалось записать:")
+        lines += ["• " + r for r in errors]
+    return {"accepted": [(numbers.get(_norm_rule(r)), r) for r in accepted],
+            "duplicates": duplicates, "code": code, "errors": errors,
+            "card": "\n".join(lines)}
+
+
+# --- «✍ другое» БЕЗ ПРЕФИКСА (pending-ожидание свободного текста) -------------
+# Раньше кнопка просила владельца НАПЕЧАТАТЬ «урок: …» — то есть вручную поставить префикс, чего
+# голосовой ввод не делает вовсе. Теперь кнопка ставит флаг ожидания, а СЛЕДУЮЩЕЕ текстовое
+# сообщение владельца становится правилом ЦЕЛИКОМ и ДОСЛОВНО (опечатки/расшифровку НЕ правим).
+# TTL 10 минут: забытое ожидание не должно однажды съесть случайную реплику как правило.
+
+def start_pending_lesson(username, now=None, set=None):
+    """Включить ожидание свободного текста от ЭТОГО владельца. → метка времени (int)."""
+    import time as _t
+    ts = int(now if now is not None else _t.time())
+    (set or _default_set)(K_PENDING, f"{ts}|{(username or '').lstrip('@')}")
+    return ts
+
+
+def pending_lesson(now=None, get=None):
+    """Активное ожидание → username (может быть ''), иначе None (нет ожидания / истёк TTL)."""
+    import time as _t
+    raw = (get or _default_get)(K_PENDING) or ""
+    if "|" not in raw:
+        return None
+    ts, _, user = raw.partition("|")
+    ts = _to_int(ts)
+    if ts is None:
+        return None
+    now = int(now if now is not None else _t.time())
+    return user if (now - ts) <= PENDING_TTL_SEC else None
+
+
+def clear_pending_lesson(set=None):
+    (set or _default_set)(K_PENDING, "")
+
+
+def take_pending_lesson(username, now=None, get=None, set=None):
+    """Забрать ожидание, если оно активно и принадлежит ЭТОМУ пользователю: снимает флаг и
+    отдаёт True (текст можно писать правилом). Иначе False, флаг не трогаем.
+    Кто первым забрал — тот и применяет (двойного правила не будет: append дедупит)."""
+    get = get or _default_get
+    set = set or _default_set
+    who = pending_lesson(now, get)
+    if who is None:
+        return False
+    if who and (username or "").lstrip("@").lower() != who.lower():
+        return False
+    clear_pending_lesson(set)
+    return True
 
 
 def set_transcript(transcript, incoming=None, set=None):
@@ -418,6 +573,8 @@ def reset(get=None, set=None):
     set(K_INCOMING, "")
     set(K_ANSWER, "")
     set(K_HYPS, "")
+    set(K_HYP_SEL, "")             # отметки тумблеров старого ТЕСТ-клиента не переезжают
+    set(K_PENDING, "")             # и ожидание «✍ другое» тоже снимаем (иначе съест первую реплику)
     set(K_SEQ, get_seq(get) + 1)   # инвалидируем отложенный дебаунс-ответ старого ТЕСТ-клиента
     return n
 

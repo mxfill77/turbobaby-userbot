@@ -1,0 +1,5 @@
+{
+  "_note": "file id Brain-дока KB_trainer_log и его архива. Заполняет ШТАБ: канал Bridge создавать доки НЕ УМЕЕТ (имена резолвятся по фиксированному манифесту list_brain, write_doc name=KB_trainer_log отвечает unknown_name), но и read_doc, и write_doc принимают id= — значит достаточно передать сюда file id уже созданного пустого дока. Пока doc_id пуст, trainer_log ничего не пишет (status=no_doc) и тренажёр работает как работал. Приоритет: переменные окружения TRAINER_LOG_DOC_ID / TRAINER_LOG_ARCHIVE_DOC_ID выше этого файла. Секретов тут нет — file id регистрируется открытой строкой в KB_MASTER.",
+  "doc_id": "",
+  "archive_id": ""
+}

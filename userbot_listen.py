@@ -42,6 +42,7 @@ load_dotenv()
 # из окружения на импорте; иначе флаги из .env не подхватятся.
 import suggest  # noqa: E402
 import trainer  # noqa: E402  ГРУППА-ТРЕНАЖЁР (изолированный путь; боевой поток не задет)
+import trainer_log  # noqa: E402  ЛОГ ТРЕНАЖЁРА в мозг (KB_trainer_log; fail-safe, ничего не блокирует)
 import booking_draft  # noqa: E402  (текст-команда «до crm» в тренажёре — мост 2.1, read-only)
 
 API_ID = int(os.getenv("API_ID", "0"))
@@ -255,6 +256,16 @@ async def _trainer_generate(transcript, first):
     return trainer.strip_thai(draft or "")
 
 
+async def _trn_log(kind, text, n=None):
+    """Событие тренажёра → KB_trainer_log. Никогда не блокирует и не роняет обработчик
+    (сеть Bridge уходит в поток; ошибки глотает сам trainer_log)."""
+    try:
+        n = trainer.get_n() if n is None else n
+        await asyncio.to_thread(trainer_log.safe_append, n, kind, text)
+    except Exception as e:
+        log.info(f"{_now()} | ТРЕНАЖЁР: лог в мозг не записан: {type(e).__name__}: {e}")
+
+
 async def _trainer_client_turn(event, body):
     """Клиентская реплика владельца → ДОБАВИТЬ в накопительный транскрипт (атомарно, под локом,
     чтобы параллельные события не затирали друг друга) и запланировать ОДИН дебаунс-ответ."""
@@ -264,6 +275,7 @@ async def _trainer_client_turn(event, body):
         transcript = trainer.append_turn(trainer.get_transcript(), "client", body)
         trainer.set_transcript(transcript, incoming=body if is_text else None)
         my_seq = trainer.bump_seq()
+    await _trn_log(trainer_log.KIND_CLIENT, body)     # реплика клиента (текст/гео/фото) — в мозг
     asyncio.create_task(_trainer_debounced_reply(event, chat_id, my_seq))
 
 
@@ -295,10 +307,13 @@ async def _trainer_debounced_reply(event, chat_id, my_seq):
             return
         n = trainer.get_n()
         k = len(suggest.list_playbook_rules())
-        await _trainer_send(event.client, chat_id, trainer.render_answer(n, k, draft))
+        answer = trainer.render_answer(n, k, draft)
+        await _trainer_send(event.client, chat_id, answer)
         # фиксируем обмен: транскрипт + последняя пара (для кнопок «До CRM»/«Обучить» модербота)
         transcript = trainer.append_turn(transcript, "manager", draft)
         trainer.record_turn(incoming, transcript, draft)
+    # ответ бота в мозг — ЦЕЛИКОМ: с шапкой [тренажёр|ТЕСТ-N|правил:K] и служебными тегами
+    await _trn_log(trainer_log.KIND_BOT, answer, n)
 
 
 async def _trainer_crm(event):
@@ -320,6 +335,7 @@ async def _trainer_crm(event):
         return
     body = (intake_text or card or "⚠️ Из диалога заявку собрать не удалось.").strip()
     await _trainer_send(client, chat_id, trainer.crm_card(body))
+    await _trn_log(trainer_log.KIND_BTN, "До CRM (текст-команда): карточка [ТЕСТ] собрана")
 
 
 async def _trainer_reset(event):
@@ -327,6 +343,7 @@ async def _trainer_reset(event):
     n = trainer.reset()
     await _trainer_send(event.client, event.chat_id,
                         f"🔄 Сброшено. Новый клиент ТЕСТ-{n} — контекст (факты + память диалога) очищен.")
+    await _trn_log(trainer_log.KIND_BTN, f"Заново (текст-команда): старт нового ТЕСТ-{n}", n)
 
 
 async def on_trainer_group(event):
@@ -363,6 +380,21 @@ async def on_trainer_group(event):
     text = event.raw_text or ""
     username = sender.username
     kind, payload = trainer.parse_command(text)
+    # «✍ другое» БЕЗ ПРЕФИКСА: модербот кнопкой поставил ожидание — СЛЕДУЮЩЕЕ текстовое сообщение
+    # владельца становится правилом ЦЕЛИКОМ и ДОСЛОВНО (голосовой ввод/опечатки НЕ правим). Ловит
+    # именно userbot: в группе он видит ВСЕ сообщения, а модербот — не обязательно (privacy-режим).
+    # Команда управления (заново / до crm / урок: … / отмени урок N) ожидание НЕ съедает — она
+    # остаётся командой, ожидание живёт дальше до своего TTL.
+    if kind is None and text.strip() and trainer.pending_lesson() is not None:
+        if not suggest.is_approver(username):
+            await _trainer_send(event.client, chat_id, "⛔ Учить бота может только approver.")
+            return
+        if trainer.take_pending_lesson(username):
+            dec = await asyncio.to_thread(trainer.apply_lesson, text.strip())
+            await _trainer_send(event.client, chat_id, dec["card"])
+            await _trn_log(trainer_log.KIND_LESSON,
+                           f"«другое» (свободный текст, дословно): {text.strip()} → {dec['card']}")
+            return
     if kind == "reset":
         await _trainer_reset(event)
         return
@@ -375,6 +407,7 @@ async def on_trainer_group(event):
             return
         dec = await asyncio.to_thread(trainer.apply_lesson, payload)
         await _trainer_send(event.client, chat_id, dec["card"])
+        await _trn_log(trainer_log.KIND_LESSON, f"урок: {payload} → {dec['card']}")
         return
     if kind == "cancel":
         if not suggest.is_approver(username):
@@ -382,6 +415,7 @@ async def on_trainer_group(event):
             return
         dec = trainer.cancel_lesson(payload)
         await _trainer_send(event.client, chat_id, dec["card"])
+        await _trn_log(trainer_log.KIND_LESSON, f"отмени урок {payload} → {dec['card']}")
         return
     # обычная реплика ТЕСТ-клиента → боевой пайплайн, ответ в группу.
     # Вложения (гео-ПИН/фото) собираем МАРКЕРАМИ, как transcript_from в ЛС-пути: иначе пин не

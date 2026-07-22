@@ -481,7 +481,11 @@ class TestPureLogic(unittest.TestCase):
         self.assertIn("2245", out)                                  # итог-за-период из блока уцелел
         self.assertIn("3000", out)                                  # депозит из блока уцелел
         self.assertNotIn("9999", suggest.client_facing_text(out))   # число вне блока клиенту не течёт
-        self.assertIn("Уточню у команды", out)                      # вне-блока итог → «уточню»-форма
+        # РЕШЕНИЕ ВЛАДЕЛЬЦА 23.07 (пакет «Тренажёр v2», п. А-2/А-3): когда расчёт ГОТОВ и его цифра
+        # звучит клиенту, отписка «Уточню у команды и вернусь» из клиентского тела УХОДИТ — она и
+        # была тем классом, что убивал живые ТЕСТ-7/ТЕСТ-10. Предохранитель не потерян: выдуманное
+        # число вырезано, а модератор видит его в служебной пометке.
+        self.assertNotIn("Уточню у команды", suggest.client_facing_text(out))
         self.assertIn("[уточнить: цена 9999]", out)                 # пометка модератору
 
     def test_rate_limiter_hour_and_day(self):
@@ -5129,6 +5133,265 @@ class TestClosingQuestion(unittest.TestCase):
                 self.assertFalse(_has_thai_letters(q), f"тайские буквы в вопросе {step}/{lang}")
             for facts, ready in ((self.FULL, True), ({"dates": False}, False)):
                 self.assertFalse(_has_thai_letters(suggest.next_step_note(facts, lang, ready=ready)))
+
+
+class TestFunnelTailFix(unittest.TestCase):
+    """ГОЛДЕНЫ ФИКСА КЛАССА «хвост воронки» (пакет «Тренажёр v2», 23.07.2026).
+
+    ИСТОЧНИК — ЖИВОЙ прогон группы-тренажёра ТЕСТ-7..10 (22.07 23:36–23:50). Транскрипт снят ПО
+    ФАКТУ из moderation_ipc.meta (ключ trainer_transcript) и переносится СЮДА ДОСЛОВНО, вместе с
+    «неудобной» формой чисел («с 25ого по 30ое июля») — правило-класс CLAUDE.md: голден детекта =
+    РЕАЛЬНАЯ фраза клиента, а не идеализированная формулировка.
+
+    Корень провала (воспроизведён): порядковая форма дня не разбиралась → окно откатывалось на
+    ПРЕДЫДУЩУЮ реплику с ПРОШЕДШИМ стартом → dates ❌ → завершающий вопрос переспрашивал ровно то,
+    что клиент только что назвал, а расчёт не строился (отсюда же «уточню и вернусь»)."""
+
+    TODAY = datetime.date(2026, 7, 22)          # «сегодня» живого прогона (Пхукет)
+
+    # ЖИВОЕ окно ТЕСТ-10 ДОСЛОВНО (moderation_ipc.meta), до последнего ответа бота
+    LIVE = ("[клиент]: Здравствуйте! Хочу XMAX 300 с 20 по 25 июля, залог паспортом, 1 шлем, "
+            "доставка сюда\n"
+            "[клиент]: [локация 8.036270,98.335260]\n"
+            "[менеджер]: Здравствуйте! Спасибо, что выбрали нас 🤝 ⏎ XMAX 300, залог паспортом и "
+            "1 шлем — учли, точку для доставки тоже увидели. Только даты уточните, пожалуйста: "
+            "20 июля уже прошло (сегодня 22-е) — вы имели в виду ближайшие дни или другой период? "
+            "⏎  ⏎ Доставка в Банг Тао север — 290 ฿ (при оплаченной доставке забор байка в конце "
+            "аренды бесплатный). ⏎ [собрано: модель ✅ срок ✅ гео ✅]\n"
+            "[клиент]: Да, даты с 25ого по 30ое июля")
+
+    # Живой ответ бота на эту реплику (тот самый дефект: подтвердил даты и тут же переспросил их)
+    LIVE_ANSWER = ("Отлично, даты учли — XMAX 300, 25–30 июля, 5 дней.\n\n"
+                   "Уточню наличие на эти даты и вернусь с точной стоимостью.\n\n"
+                   "Доставка в Банг Тао север — 290 ฿ (при оплаченной доставке забор байка в конце "
+                   "аренды бесплатный).\n\n"
+                   "Подскажите даты — с какого числа и на какой срок?")
+
+    def _note_with_quote(self):
+        """Блок ЦЕНА с ЖИВЫМ расчётом Bridge + служебный <<<QUOTE>>> (как строит build_pricing_note)."""
+        note = suggest._wrap_single("ok", "XMAX 300 — за 5 дней 4500 ฿, депозит 5000 ฿")
+        return (note + "\n" + suggest._QUOTE_OPEN +
+                "\nXMAX 300 (New Gen) — за 5 дней 4500 ฿; депозит 5000 ฿.\n" + suggest._QUOTE_CLOSE)
+
+    # ---------- ГОЛДЕН 1: РЕАЛЬНАЯ фраза клиента разбирается в даты ----------
+    def test_golden_live_ordinal_dates_are_parsed(self):
+        # ДОСЛОВНАЯ фраза живого провала + парафразы RU/EN. Раньше все они давали (None, None).
+        for phrase in ("Да, даты с 25ого по 30ое июля",
+                       "с 25-ого по 30-ое июля",
+                       "даты с 25ого числа по 30ое июля",
+                       "с 25го по 30е июля",
+                       "с 25.07 по 30.07",                    # цифровая форма (её пишут и EN-клиенты)
+                       "с 25 по 30 июля"):                    # контроль: «обычная» форма как была
+            s, e = suggest.parse_date_range(phrase, self.TODAY)
+            self.assertEqual((s, e), ("2026-07-25", "2026-07-30"), phrase)
+            self.assertTrue(suggest._has_start_signal(phrase), phrase)
+        # EN-порядковые окончания нормализуются тем же классом (цифровая часть освобождается)
+        self.assertEqual(suggest.norm_day_ordinals("from 25th to 30th"), "from 25 to 30")
+
+    def test_known_boundary_english_month_names_are_not_parsed(self):
+        """ИЗВЕСТНАЯ ГРАНИЦА (не чинится этим пакетом, вынесена владельцу отдельным пунктом):
+        _MON_MAP/_MONTH_RE знают ТОЛЬКО русские названия месяцев, поэтому «from July 25 to July 30»
+        дат не даёт — и EN-клиент попадает в ту же воронку переспроса. Расширять _MONTH_RE на
+        английские основы вслепую опасно (нет \\b-границ: «may» как модальный глагол, «mar»/«aug»
+        внутри слов) — это отдельный класс со своими голденами. Тест фиксирует ФАКТ, чтобы граница
+        не была тихой: как только EN-месяцы появятся, он честно упадёт и потребует обновления."""
+        self.assertEqual(suggest.parse_date_range("from July 25 to July 30", self.TODAY),
+                         (None, None))
+        self.assertEqual(suggest.parse_date_range("from the 25th to the 30th of july", self.TODAY),
+                         (None, None))
+        # …а цифровая EN-форма работает (клиенты чаще пишут именно так)
+        self.assertEqual(suggest.parse_date_range("from 25.07 to 30.07", self.TODAY),
+                         ("2026-07-25", "2026-07-30"))
+
+    def test_golden_ordinal_normalizer_is_idempotent_and_safe(self):
+        # Нормализация не должна портить то, что и так работало (даты-точки, годы, сроки, модели).
+        for text in ("10.07-15.07", "с 5 июля на 10 дней", "с 20 июля 2027", "NMAX 155 на месяц"):
+            self.assertEqual(suggest.norm_day_ordinals(text), text, text)
+        # идемпотентность: повторный прогон ничего не меняет
+        once = suggest.norm_day_ordinals("с 25ого по 30ое июля")
+        self.assertEqual(suggest.norm_day_ordinals(once), once)
+        self.assertEqual(once, "с 25 по 30 июля")
+        # НЕГАТИВ: одна длительность старта не даёт (класс не расширился)
+        self.assertFalse(suggest._has_start_signal("на 5 дней"))
+        self.assertEqual(suggest.parse_date_range("привет, а сколько стоит?", self.TODAY),
+                         (None, None))
+
+    # ---------- ГОЛДЕН 2: «клиент только что дал даты → нет вопроса про даты» ----------
+    def test_golden_live_dates_just_given_are_never_re_asked(self):
+        facts = suggest.collected_facts(self.LIVE, today=self.TODAY)
+        self.assertTrue(facts["dates"], "живые даты клиента снова не разобрались")
+        just = suggest.client_just_provided(self.LIVE, today=self.TODAY)
+        self.assertIn("dates", just)
+        # шаг воронки — уже НЕ «спроси даты»
+        self.assertEqual(suggest.next_step(facts, ready=False, just=just), "offer")
+        draft = suggest.ensure_closing_question("Отлично, даты учли — XMAX 300, 25–30 июля.",
+                                                facts, "ru", ready=False, just=just)
+        self.assertNotIn("подскажите даты", draft.lower())
+        self.assertIn("бронируем", draft.lower())
+        self.assertEqual(draft.count("?"), 1)
+
+    def test_golden_live_duplicate_date_question_is_cut(self):
+        # Даже если LLM переспросил сам — КОД режет вопрос про УЖЕ собранное поле.
+        facts = suggest.collected_facts(self.LIVE, today=self.TODAY)
+        out = suggest.drop_answered_questions(self.LIVE_ANSWER, facts)
+        self.assertNotIn("Подскажите даты", out)
+        self.assertIn("даты учли", out)                     # подтверждение осталось
+        # а вопрос про НЕсобранное не трогаем (fail-safe)
+        keep = "Пришлёте качественное фото паспорта?"
+        self.assertEqual(suggest.drop_answered_questions(keep, facts), keep)
+
+    def test_past_start_named_now_asks_to_correct_not_to_repeat(self):
+        # Клиент назвал старт В ТЕКУЩЕЙ реплике, но он ПРОШЁЛ: спрашиваем ПОПРАВКУ, а не «дайте даты».
+        tr = "[клиент]: Хочу nmax\n[клиент]: с 20 июля на 5 дней"
+        facts = suggest.collected_facts(tr, today=self.TODAY)
+        just = suggest.client_just_provided(tr, today=self.TODAY)
+        self.assertFalse(facts["dates"])
+        self.assertEqual(suggest.next_step(facts, just=just), "dates_fix")
+        q = suggest.next_step_question("dates_fix", "ru")
+        self.assertIn("уже прошла", q.lower())
+        # клиент про даты НЕ говорил вовсе → прежний вопрос «подскажите даты» цел (регресс)
+        self.assertEqual(suggest.next_step({"dates": False}, just=set()), "dates")
+
+    # ---------- ГОЛДЕН 3: всё собрано → CTA следующего шага брони ----------
+    def test_golden_all_collected_gives_next_booking_step_cta(self):
+        tr = ("[клиент]: Hotel Name: Cape Sienna\n"
+              "[клиент]: nmax с 28 июля по 5 августа, беру, мой +79001234567")
+        facts = suggest.collected_facts(tr, today=self.TODAY)
+        just = suggest.client_just_provided(tr, today=self.TODAY)
+        self.assertTrue(facts["dates"] and facts["geo"] and facts["phone"])
+        # готов бронировать, паспорта нет → CTA = фото паспорта (следующий шаг брони, не тишина)
+        self.assertEqual(suggest.next_step(facts, ready=True, just=just), "passport")
+        draft = suggest.ensure_closing_question("Всё учли.", facts, "ru", ready=True, just=just)
+        self.assertIn("фото паспорта", draft.lower())
+        self.assertEqual(draft.count("?"), 1)
+        # всё-всё собрано → подтверждение брони
+        full = dict(facts, passport=True)
+        self.assertEqual(suggest.next_step(full, ready=True, just=just), "confirm")
+
+    # ---------- ГОЛДЕН 4: цена рассчитана → ЦИФРА в тексте клиенту ----------
+    def test_golden_computed_price_figure_reaches_client_body(self):
+        note = self._note_with_quote()
+        self.assertEqual(suggest.computed_price_figures(note) & {4500, 5000}, {4500, 5000})
+        silent = "Отлично, всё учли — подберу вариант."
+        out = suggest.ensure_price_figure(silent, note, "ru")
+        self.assertIn("4500", suggest.client_facing_text(out))
+        # цифра уже в теле → вход БАЙТ-В-БАЙТ (не дублируем)
+        had = "XMAX 300 — за 5 дней 4500 ฿; депозит 5000 ฿."
+        self.assertEqual(suggest.ensure_price_figure(had, note, "ru"), had)
+        # расчёта нет → гарантию не требуем (fail-safe)
+        self.assertEqual(suggest.ensure_price_figure(silent, "", "ru"), silent)
+
+    def test_golden_service_tag_does_not_replace_the_figure(self):
+        # «[уточнить: цена N]» — пометка МОДЕРАТОРУ; клиент её не видит, значит цифру она не заменяет.
+        note = self._note_with_quote()
+        draft = "Уточню у команды и вернусь.\n[уточнить: цена 9999]"
+        out = suggest.ensure_price_figure(draft, note, "ru")
+        client = suggest.client_facing_text(out)
+        self.assertIn("4500", client)
+        self.assertNotIn("уточнить", client.lower())
+        self.assertIn("[уточнить: цена 9999]", out)          # модератору пометка осталась
+
+    # ---------- ГОЛДЕН 5: «уточню и вернусь» при готовом расчёте ----------
+    def test_golden_deflection_dies_when_calculation_is_ready(self):
+        note = self._note_with_quote()
+        draft = ("Отлично, даты учли — XMAX 300, 25–30 июля, 5 дней. "
+                 "Уточню наличие на эти даты и вернусь с точной стоимостью.\n\n"
+                 "XMAX 300 (New Gen) — за 5 дней 4500 ฿; депозит 5000 ฿.")
+        out = suggest.drop_price_deflection(draft, note, "ru")
+        low = suggest.client_facing_text(out).lower()
+        self.assertNotIn("вернусь", low)
+        self.assertNotIn("уточню наличие", low)
+        self.assertIn("4500", out)                           # сама цена уцелела
+        self.assertIn("даты учли", out)                      # прочий смысл ответа цел
+
+    def test_deflection_stays_when_there_is_no_calculation(self):
+        # Расчёта нет → «уточню и вернусь» легитимно и ОСТАЁТСЯ предохранителем (fail-safe).
+        draft = "Уточню наличие на эти даты и вернусь с точной стоимостью."
+        self.assertEqual(suggest.drop_price_deflection(draft, "", "ru"), draft)
+        blocked = ("ЦЕНА: точная цена из Календаря сейчас недоступна — НЕ называй никакого числа.")
+        self.assertEqual(suggest.drop_price_deflection(draft, blocked, "ru"), draft)
+
+    # ---------- ГОЛДЕН 6: блок доставки не дублируется ----------
+    def test_golden_delivery_block_is_not_repeated_in_window(self):
+        block = suggest._delivery_client_line(
+            {"status": "zone", "zone": "Банг Тао север", "price": 290}, "ru")
+        self.assertIn("290", block)
+        body = "Отлично, даты учли — XMAX 300, 25–30 июля."
+        # тариф уже прозвучал в этом окне (живой ТЕСТ-10) → второй раз НЕ повторяем
+        out = suggest.compose_delivery_draft(body, block, "ru", transcript=self.LIVE)
+        self.assertEqual(out, body)
+        # окна нет / тариф ещё не звучал → прежнее поведение (блок доносит КОД)
+        self.assertIn("290", suggest.compose_delivery_draft(body, block, "ru"))
+        fresh = "[клиент]: привет\n[менеджер]: Здравствуйте! Что подобрать?"
+        self.assertIn("290", suggest.compose_delivery_draft(body, block, "ru", transcript=fresh))
+        # …и повтор, сделанный САМИМ LLM, тоже снимаем (живой ТЕСТ-10 — строка была в его тексте)
+        repeated = body + "\n\n" + block
+        self.assertNotIn("290", suggest.drop_repeated_delivery(repeated, self.LIVE, "ru"))
+        self.assertEqual(suggest.drop_repeated_delivery(repeated, fresh, "ru"), repeated)
+        # клиент спросил про доставку ПРЯМО СЕЙЧАС → отвечаем, а не немеем (fail-safe)
+        asked = self.LIVE + "\n[клиент]: а доставка сколько будет?"
+        self.assertIn("290", suggest.drop_repeated_delivery(repeated, asked, "ru"))
+
+    # ---------- ГОЛДЕН 7: статус собранного не врёт ----------
+    def test_golden_term_is_question_mark_on_unconfirmed_dates(self):
+        # ЖИВОЙ первый ход ТЕСТ-10: старт «20 июля» ПРОШЁЛ → «[собрано: … срок ✅]» врал.
+        tr = ("[клиент]: Здравствуйте! Хочу XMAX 300 с 20 по 25 июля, залог паспортом, 1 шлем, "
+              "доставка сюда\n[клиент]: [локация 8.036270,98.335260]")
+        facts = suggest.collected_facts(tr, today=self.TODAY)
+        self.assertFalse(facts["dates"])
+        self.assertTrue(facts["term"])
+        unc = suggest.unconfirmed_fields(tr, facts, today=self.TODAY)
+        self.assertEqual(unc, {"dates", "term"})
+        note = suggest.collected_manager_note(facts, "ru", unc)
+        self.assertIn("срок ❓", note)
+        self.assertIn("даты ❓", note)
+        self.assertNotIn("срок ✅", note)
+        self.assertIn("модель ✅", note)                      # подтверждённое — по-прежнему ✅
+        # даты подтверждены → всё как раньше, ❓ ниоткуда не берётся (регресс)
+        ok = suggest.collected_facts(self.LIVE, today=self.TODAY)
+        self.assertEqual(suggest.unconfirmed_fields(self.LIVE, ok, today=self.TODAY), set())
+        self.assertNotIn("❓", suggest.collected_manager_note(ok, "ru", set()))
+        # клиент назвал ТОЛЬКО длительность (старта не было) → срок честно ✅, а не ❓
+        only_term = "[клиент]: NMAX на 5 дней, посчитайте"
+        f2 = suggest.collected_facts(only_term, today=self.TODAY)
+        self.assertEqual(suggest.unconfirmed_fields(only_term, f2, today=self.TODAY), set())
+
+    # ---------- ГОЛДЕН 8: «сегодня» — Asia/Bangkok, без съезда на границе суток ----------
+    def test_golden_today_is_phuket_even_at_midnight_boundary(self):
+        # UTC 22.07 17:28 = 23.07 00:28 на Пхукете (реальный момент этой сессии) — «сегодня» 23-е.
+        utc_night = datetime.datetime(2026, 7, 22, 17, 28, tzinfo=datetime.timezone.utc)
+        self.assertEqual(suggest.today_phuket(utc_night), datetime.date(2026, 7, 23))
+        # UTC 22.07 16:59 = 22.07 23:59 на Пхукете (момент живого прогона) — ещё 22-е
+        self.assertEqual(suggest.today_phuket(
+            datetime.datetime(2026, 7, 22, 16, 59, tzinfo=datetime.timezone.utc)),
+            datetime.date(2026, 7, 22))
+        # смещение фиксированное +07:00 (Таиланд без летнего времени) — и зимой тоже
+        self.assertEqual(suggest.today_phuket(
+            datetime.datetime(2026, 1, 15, 17, 30, tzinfo=datetime.timezone.utc)),
+            datetime.date(2026, 1, 16))
+        # и гейт старта считается по ЭТОМУ «сегодня»
+        self.assertEqual(suggest.start_date_status("2026-07-22", suggest.today_phuket(utc_night)),
+                         "past")
+
+    # ---------- ГОЛДЕН 9: сквозной прогон живого окна через generate_draft ----------
+    def test_golden_live_window_end_to_end(self):
+        """Регресс всей связки: живая реплика → нет переспроса дат, нет «уточню и вернусь»,
+        цифра расчёта у клиента, тариф доставки не задвоен, ровно один вопрос."""
+        note = (self._note_with_quote() + "\n" + suggest._DELIVERY_OPEN +
+                "\nДоставка в Банг Тао север — 290 ฿ (при оплаченной доставке забор байка в конце "
+                "аренды бесплатный).\n" + suggest._DELIVERY_CLOSE)
+        with mock.patch.object(suggest, "today_phuket", lambda now=None: self.TODAY):
+            out = suggest.generate_draft(self.LIVE, "ru", "FAQ", False, note,
+                                         call_llm=lambda s, u: self.LIVE_ANSWER)
+        client = suggest.client_facing_text(out)
+        low = client.lower()
+        self.assertNotIn("подскажите даты", low)             # (1) переспроса нет
+        self.assertNotIn("вернусь", low)                     # (2) отписки нет
+        self.assertIn("4500", client)                        # (3) цифра расчёта звучит клиенту
+        self.assertEqual(client.count("290"), 0)             # тариф доставки уже звучал — не дублируем
+        self.assertEqual(client.count("?"), 1)               # ровно ОДИН вопрос
+        self.assertIn("[собрано:", out)                      # служебная пометка модератору на месте
+        self.assertNotIn("❓", out)                           # даты подтверждены → без вопросиков
 
 
 if __name__ == "__main__":

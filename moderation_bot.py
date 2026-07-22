@@ -34,6 +34,7 @@ import moderation_core    # noqa: E402
 import moderation_ipc     # noqa: E402
 import booking_draft      # noqa: E402  (O3 кусок 1 «Кнопка Бронь»: экстракция заявки, read-only)
 import trainer            # noqa: E402  (ГРУППА-ТРЕНАЖЁР: панель кнопок под ответом userbot)
+import trainer_log        # noqa: E402  (ЛОГ ТРЕНАЖЁРА в мозг: нажатия кнопок и уроки; fail-safe)
 
 try:
     import log_setup                       # ротация + тестовый лог в temp (см. log_setup)
@@ -295,27 +296,45 @@ def _kb_trainer_panel():
     ]])
 
 
-def _kb_trainer_hyps(hyps, per_row=5):
+def _kb_trainer_hyps(hyps, selected=None, per_row=5):
     """Кнопки гипотез = ТОЛЬКО номера [1]..[N] + [✍️ другое]: полные формулировки печатаются
     списком в самом сообщении (trainer.hyps_messages) — подпись inline-кнопки Telegram режет по
     ширине, и владелец не мог дочитать правило. callback_data прежний (tr:hyp:<i> / tr:hyp:other) —
-    маршрутизация и старые обработчики не меняются."""
+    маршрутизация и старые обработчики не меняются.
+    МУЛЬТИВЫБОР: номер — ТУМБЛЕР, отмеченный показываем как «✅N»; запись происходит по
+    «✔ Применить», отмена выбора — «✖ Отмена» (промах пальцем больше не становится правилом)."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    sel = set(int(x) for x in (selected or []))
     rows, row = [], []
     for i in range(len(hyps or [])):
-        row.append(InlineKeyboardButton(str(i + 1), callback_data=f"tr:hyp:{i}"))
+        title = ("✅" + str(i + 1)) if i in sel else str(i + 1)
+        row.append(InlineKeyboardButton(title, callback_data=f"tr:hyp:{i}"))
         if len(row) >= per_row:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton("✔ Применить", callback_data="tr:hyp:apply"),
+                 InlineKeyboardButton("✖ Отмена", callback_data="tr:hyp:cancel")])
     rows.append([InlineKeyboardButton("✍️ другое", callback_data="tr:hyp:other")])
     return InlineKeyboardMarkup(rows)
 
 
+async def _trn_log(kind, text, n=None):
+    """Событие тренажёра → KB_trainer_log (Brain). Сеть уводим в поток, ошибки глотает сам
+    trainer_log: лог наблюдения не имеет права задержать или уронить панель кнопок."""
+    import asyncio
+    try:
+        n = trainer.get_n() if n is None else n
+        await asyncio.to_thread(trainer_log.safe_append, n, kind, text)
+    except Exception as e:
+        log.info(f"trainer_log: {type(e).__name__}: {e}")
+
+
 async def _trainer_callback(context, q, data):
     """Нажатия панели тренажёра (tr:*). approver-гейт. Результаты (сброс/CRM-карта/гипотезы/
-    принятое правило) постим В САМУ ГРУППУ тренажёра. Боевые «Входящие брони»/CRM не трогаем."""
+    принятое правило) постим В САМУ ГРУППУ тренажёра. Боевые «Входящие брони»/CRM не трогаем.
+    Каждое нажатие и каждый урок пишем в KB_trainer_log (ТЗ п.9)."""
     import asyncio
     chat_id = q.message.chat_id
     username = (q.from_user.username if q.from_user else None)
@@ -325,6 +344,7 @@ async def _trainer_callback(context, q, data):
     if data == "tr:reset":
         n = trainer.reset()
         await context.bot.send_message(chat_id, f"🔄 Новый клиент ТЕСТ-{n} — контекст (факты + память диалога) очищен.")
+        await _trn_log(trainer_log.KIND_BTN, f"🔄 Заново → старт нового ТЕСТ-{n}", n)
         return
     if data == "tr:crm":
         transcript = trainer.get_transcript()
@@ -341,6 +361,7 @@ async def _trainer_callback(context, q, data):
             return
         body = (intake_text or card or "⚠️ Из диалога заявку собрать не удалось.").strip()
         await context.bot.send_message(chat_id, trainer.strip_thai(trainer.crm_card(body)))
+        await _trn_log(trainer_log.KIND_BTN, "📋 До CRM → карточка [ТЕСТ] собрана")
         return
     if data == "tr:teach":
         incoming, answer = trainer.get_last_pair()
@@ -358,27 +379,65 @@ async def _trainer_callback(context, q, data):
         if not hyps:
             await context.bot.send_message(chat_id, "⚠️ Не удалось предложить гипотезы — напиши урок текстом: «урок: …».")
             return
-        trainer.set_hyps(hyps)
+        trainer.set_hyps(hyps)                   # новый список → отметки тумблеров обнуляются
         parts = trainer.hyps_messages(hyps)      # полные формулировки — в тексте, кнопки = номера
         for p in parts[:-1]:
             await context.bot.send_message(chat_id, p)
-        await context.bot.send_message(chat_id, parts[-1], reply_markup=_kb_trainer_hyps(hyps))
+        await context.bot.send_message(chat_id, parts[-1], reply_markup=_kb_trainer_hyps(hyps, []))
+        await _trn_log(trainer_log.KIND_BTN,
+                       "🎓 Обучить → гипотезы: " + " | ".join(f"{i + 1}. {h}"
+                                                              for i, h in enumerate(hyps)))
         return
     if data.startswith("tr:hyp:"):
         sel = data[len("tr:hyp:"):]
+        hyps = trainer.get_hyps()
         if sel == "other":
-            await context.bot.send_message(chat_id, "✍️ Напиши правило текстом: «урок: <твоё правило>».")
+            # БЕЗ ПРЕФИКСА: ставим ожидание, следующее текстовое сообщение владельца станет
+            # правилом ЦЕЛИКОМ и ДОСЛОВНО (голосовой ввод/опечатки не правим). Ловит userbot —
+            # он видит в группе ВСЕ сообщения; TTL ожидания 10 минут.
+            trainer.start_pending_lesson(username)
+            await context.bot.send_message(
+                chat_id, "✍️ Слушаю: напиши правило СЛЕДУЮЩИМ сообщением — запишу его целиком, "
+                         "как сказано (префикс «урок:» не нужен). Жду 10 минут.")
+            await _trn_log(trainer_log.KIND_BTN, "✍️ другое → жду свободный текст правила (10 мин)")
+            return
+        if sel == "cancel":
+            trainer.set_selection([])
+            try:
+                await q.edit_message_reply_markup(reply_markup=_kb_trainer_hyps(hyps, []))
+            except Exception:
+                pass
+            await context.bot.send_message(chat_id, "✖ Отменено — ничего не записано.")
+            await _trn_log(trainer_log.KIND_BTN, "✖ Отмена → отметки сняты, ничего не записано")
+            return
+        if sel == "apply":
+            picked = trainer.selected_hypotheses()
+            dec = await asyncio.to_thread(trainer.apply_lessons, picked)
+            trainer.set_selection([])
+            try:
+                await q.edit_message_reply_markup(reply_markup=_kb_trainer_hyps(hyps, []))
+            except Exception:
+                pass
+            await context.bot.send_message(chat_id, dec["card"])   # ОДНО сообщение со списком
+            await _trn_log(trainer_log.KIND_LESSON, "✔ Применить → " + dec["card"])
             return
         try:
             i = int(sel)
         except ValueError:
             return
-        hyps = trainer.get_hyps()
         if not (0 <= i < len(hyps)):
             await context.bot.send_message(chat_id, "⚠️ Гипотеза устарела — нажми «🎓 Обучить» заново.")
             return
-        dec = await asyncio.to_thread(trainer.apply_lesson, hyps[i])
-        await context.bot.send_message(chat_id, dec["card"])
+        # ТУМБЛЕР: тап помечает/снимает ✅ прямо на кнопке; в книгу правил пока НИЧЕГО не пишем.
+        picked = trainer.toggle_selection(i)
+        try:
+            await q.edit_message_reply_markup(reply_markup=_kb_trainer_hyps(hyps, picked))
+        except Exception as e:
+            log.warning(f"trainer hyp toggle: {e}")
+        mark = "отмечена" if i in picked else "снята"
+        await _trn_log(trainer_log.KIND_BTN,
+                       f"номер {i + 1} {mark} (отмечено сейчас: "
+                       f"{', '.join(str(x + 1) for x in picked) or '—'})")
         return
 
 

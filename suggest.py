@@ -1301,6 +1301,12 @@ def _client_text(transcript: str) -> str:
     return "\n".join(l for l in (transcript or "").split("\n") if l.startswith("[клиент]:")).lower()
 
 
+def _manager_text(transcript: str) -> str:
+    """Реплики МЕНЕДЖЕРА окна (то, что клиент от нас уже слышал). Нужен, чтобы не повторять в
+    каждом ответе неизменившиеся блоки (тариф доставки) — см. compose_delivery_draft."""
+    return "\n".join(l for l in (transcript or "").split("\n") if l.startswith("[менеджер]:"))
+
+
 # ------------------- «СЕГОДНЯ» — ПО ПХУКЕТУ, а не по локали сервера/UTC -------------------
 # Весь клиентский контур живёт по времени Пхукета: «сегодня/завтра», «дата уже прошла» и якорь
 # прайса обязаны считаться в Asia/Bangkok. На ГРАНИЦЕ СУТОК UTC даёт ДРУГОЙ день (UTC 21.07 18:30 =
@@ -1335,6 +1341,30 @@ _MON_MAP = {"январ": 1, "феврал": 2, "март": 3, "апрел": 4, 
 
 def _mon(stem):
     return _MON_MAP.get(stem)
+
+
+# --- ПОРЯДКОВЫЕ ФОРМЫ ДНЯ: «25ого», «30ое», «25-е», «1st» — тоже даты -------------------------
+# ЖИВОЙ ПРОВАЛ (тренажёр ТЕСТ-10, 22.07 23:49, транскрипт из moderation_ipc.meta): клиент поправил
+# даты дословно «Да, даты с 25ого по 30ое июля» — разбор дат НЕ увидел в этом СТАРТА вообще
+# (parse_date_range → (None, None)), окно откатилось на ПРЕДЫДУЩУЮ реплику «с 20 по 25 июля», гейт
+# признал её прошедшей → dates ❌ → завершающий вопрос «Подскажите даты…» переспросил ровно то, что
+# клиент только что назвал. Корень — не воронка, а НЕРАЗОБРАННАЯ живая форма числа: порядковое
+# окончание, приклеенное к цифре. Нормализуем ЕДИНОЙ точкой правды перед любым разбором дат.
+# Окончание срезаем ТОЛЬКО приклеенное к цифре (или через дефис): «25ого/25-ого/2-е/1st». Через
+# ПРОБЕЛ не режем — иначе «на 3 ей неделе» и прочая живая речь начала бы менять числа.
+_ORDINAL_TAIL_RE = re.compile(
+    r"(?<=\d)-?(?:ого|его|ому|ему|ые|ое|ый|ий|ой|ей|го|е)\b"
+    r"|(?<=\d)(?:st|nd|rd|th)\b", re.I)
+# «с 25 числа по 30 число» — слово-паразит между числом и предлогом ломало диапазон.
+_DAY_WORD_RE = re.compile(r"(?<=\d)\s+числ\w*", re.I)
+
+
+def norm_day_ordinals(text: str) -> str:
+    """Живые порядковые формы дня → голое число: «25ого»→«25», «30-ое»→«30», «1st»→«1»,
+    «25 числа»→«25». ИДЕМПОТЕНТНА (повторный вызов ничего не меняет), пустой вход → как есть."""
+    if not text:
+        return text
+    return _DAY_WORD_RE.sub("", _ORDINAL_TAIL_RE.sub("", text))
 
 
 def _safe_date(y, m, d):
@@ -1398,6 +1428,7 @@ def _resolve_range(d_s, m_s, d_e, m_e, today, y_s=None, y_e=None):
 
 def _parse_term(t):
     """Срок из слов → (days:int, monthly:bool) или None."""
+    t = norm_day_ordinals(t or "")     # «на 5ый день»/«на 3-и сутки» — та же нормализация, что у дат
     if re.search(r"\bна\s+месяц\b", t) or re.search(r"\bмесяц\b", t):
         return (30, True)
     m = re.search(r"на\s+(\d{1,3})\s*(нед|недел)", t)
@@ -1455,7 +1486,10 @@ def parse_date_range(text, today=None):
     3 января» (год-ролл), «на неделю/месяц с 5 июля», «завтра на 3 дня», перепутанный порядок
     (swap). Год-ролл end+1г — ТОЛЬКО при реальном переходе через год, НЕ как лечение."""
     today = today or today_phuket()
-    t = (text or "").lower().replace("–", "-").replace("—", "-").replace("ё", "е")
+    # Порядковые формы дня («25ого по 30ое июля») нормализуем ДО разбора — иначе живая реплика
+    # клиента не даёт ни диапазона, ни старта (корень провала ТЕСТ-10, см. norm_day_ordinals).
+    t = norm_day_ordinals(
+        (text or "").lower().replace("–", "-").replace("—", "-").replace("ё", "е"))
     dmw = [(int(m.group(1)), _mon(m.group(2))) for m in re.finditer(r"(\d{1,2})\s+" + _MONTH_RE, t)]
     dmy = re.findall(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", t)
     mwm = re.search(_MONTH_RE, t)
@@ -1816,6 +1850,7 @@ def _asks_percent_amount(newest: str, recent: str):
 
 
 def _has_date_signal(text: str) -> bool:
+    text = norm_day_ordinals(text or "")     # «с 25ого по 30ое» — тоже сигнал дат
     if re.search(r"\d{1,2}[.\-/]\d{1,2}", text or ""):
         return True
     if _parse_term(text):
@@ -1829,7 +1864,7 @@ def _has_start_signal(text: str) -> bool:
     """Конкретный СТАРТ аренды (в отличие от одной лишь ДЛИТЕЛЬНОСТИ): число+месяц («15 июля»),
     dd.mm («15.07», «с 15.07»), «с 15 …», «завтра/послезавтра/сегодня» (в т.ч. «с завтрашнего»).
     Одна длительность («на 10 дней», «на неделю») старта НЕ задаёт — сюда НЕ входит."""
-    t = (text or "").lower()
+    t = norm_day_ordinals((text or "").lower())
     if re.search(r"послезавтра|завтра|сегодня", t):
         return True
     if re.search(r"\d{1,2}[.\-/]\d{1,2}", t):                 # 15.07 / 15/07
@@ -2226,15 +2261,45 @@ def collected_prompt_note(facts: dict, lang: str = "ru") -> str:
             "(модель/даты/локацию/телефон) говори «учли/понял».")
 
 
-def collected_manager_note(facts: dict, lang: str = "ru") -> str:
+def unconfirmed_fields(transcript: str, facts: dict = None, today=None) -> set:
+    """Поля, про которые клиент что-то СКАЗАЛ, но подтверждёнными они НЕ считаются → в пометке
+    модератору идут с «❓», а не «✅». Живой ТЕСТ-10: старт «20 июля» уже прошёл → dates ❌, а
+    длительность (term) при этом ✅ — и пометка «[собрано: срок ✅]» врала о состоянии диалога
+    (срок посчитан по НЕПОДТВЕРЖДЁННЫМ датам). Правило: клиент СТАРТ назвал (`_has_start_signal`),
+    но гейт его не принял → и «даты», и «срок» помечаем ❓. Старта клиент не называл вовсе (одна
+    длительность «на 5 дней») → ничего не помечаем: это не «неоднозначно», это просто не собрано,
+    а сама длительность подтверждена честно."""
+    facts = facts if facts is not None else collected_facts(transcript, today=today)
+    if facts.get("dates"):
+        return set()
+    if not _has_start_signal(_client_text(transcript or "")):
+        return set()
+    out = {"dates"}
+    if facts.get("term"):
+        out.add("term")
+    return out
+
+
+def collected_manager_note(facts: dict, lang: str = "ru", unconfirmed=None) -> str:
     """СЛУЖЕБНАЯ пометка модератору о собранном — в квадратных скобках, как «[уточнить: …]»
     (шаг 4/7 #253): «[собрано: гео ✅ паспорт ✅ тел ✅]». Скобки → это служебный канал карточки,
     а не тело ответа; client_facing_text её срезает (клиент «собрано:» не видит). Ничего не
-    собрано → '' (пометки нет)."""
-    if not facts:
-        return ""
+    собрано → '' (пометки нет).
+    unconfirmed — поля, названные клиентом, но НЕ подтверждённые (прошедший старт / неоднозначно):
+    выводим их с «❓» ВНЕ зависимости от значения facts. Пометка обязана отражать реальное
+    состояние диалога, а не радовать галочкой (живой ТЕСТ-10: «срок ✅» при прошедших датах)."""
     en = (lang == "en")
-    parts = [lbl[1 if en else 0] + " ✅" for key, _, lbl in _COLL_LABELS if facts.get(key)]
+    unconfirmed = set(unconfirmed or ())
+    if not facts and not unconfirmed:
+        return ""
+    facts = facts or {}
+    parts = []
+    for key, _, lbl in _COLL_LABELS:
+        name = lbl[1 if en else 0]
+        if key in unconfirmed:
+            parts.append(name + " ❓")
+        elif facts.get(key):
+            parts.append(name + " ✅")
     if not parts:
         return ""
     head = "[collected: " if en else "[собрано: "
@@ -2318,6 +2383,13 @@ def filter_booking_questions(questions, facts: dict, lang: str = "ru"):
 _NEXT_STEP_QUESTIONS = {
     "dates":    ("Подскажите даты — с какого числа и на какой срок?",
                  "Could you tell me the dates — from when and for how long?"),
+    # Клиент даты В ЭТОМ СООБЩЕНИИ НАЗВАЛ, но старт не проходит гейт (прошедший/неоднозначный):
+    # переспрашивать «подскажите даты» НЕЛЬЗЯ — это выглядит как «я тебя не слушал». Спрашиваем
+    # ИМЕННО поправку (живой ТЕСТ-10: «даты учли» и тут же «подскажите даты» в одном сообщении).
+    "dates_fix": ("Названная дата уже прошла — подскажите, пожалуйста, актуальные: с какого числа "
+                  "и на какой срок?",
+                  "The date you named has already passed — could you confirm the actual ones: from "
+                  "when and for how long?"),
     "model":    ("Какая модель интересует?",
                  "Which model are you interested in?"),
     "offer":    ("Бронируем?",
@@ -2335,6 +2407,8 @@ _NEXT_STEP_QUESTIONS = {
 # Человекочитаемая подпись шага для промпта (RU/EN).
 _NEXT_STEP_LABELS = {
     "dates":    ("уточнить даты аренды", "clarify the rental dates"),
+    "dates_fix": ("попросить ПОПРАВИТЬ даты (названная уже прошла) — не спрашивать их заново",
+                  "ask to CORRECT the dates (the one named has passed) — do not ask for them anew"),
     "model":    ("узнать, какая модель интересует", "ask which model they want"),
     "offer":    ("предложить оформить бронь", "offer to book"),
     "passport": ("попросить качественное фото паспорта", "ask for a clear passport photo"),
@@ -2366,14 +2440,43 @@ def client_ready_to_book(transcript: str) -> bool:
     return bool(f.get("passport") or f.get("phone") or f.get("payment"))
 
 
-def next_step(facts: dict, sheet_mode: bool = False, ready: bool = False) -> str:
+def last_client_message(transcript: str) -> str:
+    """ПОСЛЕДНЯЯ реплика клиента окна (без метки роли). Нет клиентских строк → ''."""
+    msgs = [ln[len("[клиент]:"):].strip()
+            for ln in (transcript or "").split("\n") if ln.startswith("[клиент]:")]
+    return msgs[-1] if msgs else ""
+
+
+def client_just_provided(transcript: str, today=None) -> set:
+    """Поля, которые клиент дал ИМЕННО В ТЕКУЩЕМ (последнем) сообщении, — их переспрашивать
+    ЗАПРЕЩЕНО (живой ТЕСТ-10: «даты учли» + «Подскажите даты …» в одном ответе).
+    Считаем ТЕМИ ЖЕ детекторами, что collected_facts, но по ОДНОЙ реплике; для дат добавляем
+    СЫРОЙ сигнал старта (`_has_start_signal`) — клиент даты назвал, даже если гейт их не принял
+    (прошедший старт). → множество ключей из _COLL_LABELS. Пустая реплика → set()."""
+    last = last_client_message(transcript)
+    if not last.strip():
+        return set()
+    one = "[клиент]: " + last
+    got = {k for k, v in collected_facts(one, today=today).items() if v}
+    if _has_start_signal(last):
+        got.add("dates")
+    return got
+
+
+def next_step(facts: dict, sheet_mode: bool = False, ready: bool = False, just=None) -> str:
     """ОДИН следующий шаг по приоритету недостающего в collected_facts → ключ _NEXT_STEP_QUESTIONS.
     Приоритет: даты → (готовность) → паспорт → телефон → время и точка подачи → подтверждение брони.
     Даты ❌ (в т.ч. ПРОШЕДШИЙ старт — трекер их не считает собранными) перебивают всю воронку;
-    в sheet-режиме вместо дат закрываем выбором модели (даты там спрашивать запрещено)."""
+    в sheet-режиме вместо дат закрываем выбором модели (даты там спрашивать запрещено).
+    just — поля из ТЕКУЩЕЙ реплики клиента (client_just_provided): поле, названное клиентом прямо
+    сейчас, НЕ переспрашиваем «с нуля» — для дат это шаг 'dates_fix' (попроси ПОПРАВИТЬ), для
+    остальных полей шаг просто пропускаем и идём дальше по воронке."""
     facts = facts or {}
+    just = just or set()
     if not facts.get("dates"):
-        return "model" if sheet_mode else "dates"
+        if sheet_mode:
+            return "model"
+        return "dates_fix" if "dates" in just else "dates"
     if not ready:
         return "offer"          # рано просить документы — сперва согласие клиента (Этап 3)
     if not facts.get("passport"):
@@ -2392,31 +2495,40 @@ def next_step_question(step: str, lang: str = "ru") -> str:
 
 
 def next_step_note(facts: dict, lang: str = "ru", sheet_mode: bool = False,
-                   ready: bool = False) -> str:
+                   ready: bool = False, just=None) -> str:
     """Блок в system-промпт: закончи ответ РОВНО ОДНИМ следующим шагом. Пусто не бывает —
-    шаг есть всегда (даже «нечего спрашивать» → предложение подтвердить бронь)."""
-    step = next_step(facts, sheet_mode, ready)
+    шаг есть всегда (даже «нечего спрашивать» → предложение подтвердить бронь).
+    just — поля из ТЕКУЩЕЙ реплики клиента: их переспрашивать запрещено (см. next_step)."""
+    step = next_step(facts, sheet_mode, ready, just)
     en = (lang == "en")
     label = _NEXT_STEP_LABELS.get(step, ("", ""))[1 if en else 0]
     example = next_step_question(step, lang)
     # Ссылку на блок собранного даём ТОЛЬКО когда он реально есть: иначе маркер «УЖЕ ПОЛУЧЕНО» /
     # «ALREADY PROVIDED» просочился бы в промпт при пустом трекере (ложный след для читателя и тестов).
     has_collected = any((facts or {}).values())
+    # Поля из ТЕКУЩЕЙ реплики — отдельным жёстким запретом (живой ТЕСТ-10: «даты учли» и тут же
+    # «Подскажите даты …»). Пусто → строки нет (промпт не мусорим).
+    label_of = {key: lbl[1 if en else 0] for key, lbl, _ in _COLL_LABELS}
+    fresh = [label_of[k] for k, _, _ in _COLL_LABELS if k in (just or set())]
     if en:
+        just_note = (" The client named this IN THE CURRENT message: " + ", ".join(fresh) +
+                     " — asking for it again is FORBIDDEN.") if fresh else ""
         seen = " (see ALREADY PROVIDED above)" if has_collected else ""
         return ("\n\n★ CLOSING QUESTION (STRICT): every reply must END with ONE next step — never "
                 "answer and go silent. Your next step now: " + label + " (e.g. «" + example + "»). "
                 "Ask EXACTLY ONE question per reply — no questionnaires, no second question, no "
                 "listing everything you still need. Never re-ask what the client has already sent"
-                + seen + ". If the PRICE instruction above already prescribes a specific closing "
-                "question (confirm the dates / pick-up time) — ask THAT one, it IS the closing "
-                "question and it stays the only one.")
+                + seen + "." + just_note + " If the PRICE instruction above already prescribes a "
+                "specific closing question (confirm the dates / pick-up time) — ask THAT one, it IS "
+                "the closing question and it stays the only one.")
+    just_note = ("  Клиент назвал это В ТЕКУЩЕМ сообщении: " + ", ".join(fresh) +
+                 " — переспрашивать это ЗАПРЕЩЕНО.") if fresh else ""
     seen = " (см. блок выше)" if has_collected else ""
     return ("\n\n★ ЗАВЕРШАЮЩИЙ ВОПРОС (ЖЁСТКО): каждый ответ ЗАКАНЧИВАЕТСЯ ОДНИМ следующим шагом — "
             "не отвечай «в пустоту» и не замолкай. Твой следующий шаг сейчас: " + label +
             " (напр. «" + example + "»). Задай РОВНО ОДИН вопрос за ответ — никаких анкет, "
             "второго вопроса и перечисления всего, чего ещё не хватает. НЕ переспрашивай то, что "
-            "клиент уже прислал" + seen + ". Если инструкция ЦЕНА выше уже задала конкретный "
+            "клиент уже прислал" + seen + "." + just_note + " Если инструкция ЦЕНА выше уже задала конкретный "
             "вопрос (уточнить даты / время подачи) — задай ИМЕННО его, он и есть завершающий и "
             "остаётся единственным.")
 
@@ -3046,10 +3158,13 @@ def _delivery_block_from_note(pricing_note):
     return m.group(1) if m else None
 
 
-def compose_delivery_draft(llm_text, block, lang="ru"):
+def compose_delivery_draft(llm_text, block, lang="ru", transcript=None):
     """Строку ДОСТАВКИ Bridge в финал доносит КОД (тот же класс, что compose_quote_draft): цену
     доставки LLM не видит (блок вырезан из промпта make_system_prompt) → приклеиваем хвостом.
-    Если денежное число доставки ПОЧЕМУ-ТО уже в клиентском теле — не дублируем (guard как у quote)."""
+    Если денежное число доставки ПОЧЕМУ-ТО уже в клиентском теле — не дублируем (guard как у quote).
+    transcript: тариф доставки, УЖЕ названный клиенту в этом окне и НЕ изменившийся, второй раз НЕ
+    повторяем (живой ТЕСТ-10: «Доставка в Банг Тао север — 290 ฿ …» слово-в-слово в каждом ответе —
+    живой менеджер соц-доказательство и уже сказанное не повторяет, docs/sales-method-2026-07-22.md)."""
     t = (llm_text or "").strip()
     b = (block or "").strip()
     if not b:
@@ -3060,6 +3175,11 @@ def compose_delivery_draft(llm_text, block, lang="ru"):
     have = {f["value"] for f in extract_money_figures(client_facing_text(t))}
     if want and want <= have:                    # цена доставки уже у клиента — не дублируем
         return t
+    if want and transcript:
+        said = {f["value"] for f in extract_money_figures(_manager_text(transcript))}
+        if want <= said:
+            log.info("compose_delivery_draft: тариф доставки уже назван в этом окне — не повторяем")
+            return t
     return t + "\n\n" + b
 
 
@@ -3537,7 +3657,7 @@ ANTI_LOOP_NOTE = (
 
 def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pricing_note: str = "",
                        directive: str = "", park_models=None, playbook: str = "", pressure=None,
-                       collected=None, ready: bool = False) -> str:
+                       collected=None, ready: bool = False, just=None) -> str:
     lang_name = "русском" if lang == "ru" else "английском"
     if is_first_contact:
         greet = (
@@ -3700,7 +3820,8 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
     # ЗАВЕРШАЮЩИЙ ВОПРОС (живой ТЕСТ-7): ответ обязан двигать клиента ровно на ОДИН следующий шаг.
     # Шаг считаем по недостающему в collected (тот же трекер, что и «не переспрашивай») — значит
     # правило по построению не спорит с фильтром #241 и с гейтом дат.
-    next_step_block = next_step_note(collected or {}, lang, sheet_mode=sheet_mode, ready=ready)
+    next_step_block = next_step_note(collected or {}, lang, sheet_mode=sheet_mode, ready=ready,
+                                     just=just)
     # УРОВЕНЬ НАПОРА — на уровне базовой установки (высокий приоритет, ВЫШЕ playbook «без давления»).
     pressure_block = _pressure_block(pressure if pressure is not None else SALES_PRESSURE)
     return (
@@ -4340,10 +4461,11 @@ _SERVICE_TAIL_RE = re.compile(
 
 
 def ensure_closing_question(draft: str, facts: dict, lang: str = "ru",
-                            sheet_mode: bool = False, ready: bool = False) -> str:
+                            sheet_mode: bool = False, ready: bool = False, just=None) -> str:
     """Дописать завершающий вопрос, если черновик его потерял. Вопрос уже есть / пустой вход →
     БАЙТ-В-БАЙТ (fail-safe). Вопрос берём из next_step по тем же collected_facts, поэтому уже
-    собранное НЕ переспрашивается, а прошедший старт даёт уточнение дат, а не шаг воронки."""
+    собранное НЕ переспрашивается, а прошедший старт даёт уточнение дат, а не шаг воронки.
+    just — поля из ТЕКУЩЕЙ реплики клиента: их не переспрашиваем (см. next_step)."""
     text = draft or ""
     if not text.strip():
         return draft
@@ -4351,20 +4473,192 @@ def ensure_closing_question(draft: str, facts: dict, lang: str = "ru",
     body, tail = (text[:m.start()], text[m.start():]) if m else (text, "")
     if not body.strip() or _CLOSING_Q_RE.search(body):
         return draft
-    q = next_step_question(next_step(facts, sheet_mode, ready), lang)
+    q = next_step_question(next_step(facts, sheet_mode, ready, just), lang)
     if not q:
         return draft
     sep = "\n\n" if "\n" in body.strip() else " "
     return body.rstrip() + sep + q + tail
 
 
-def _append_collected_note(draft: str, facts: dict, lang: str = "ru") -> str:
+# --- ЗАПРЕТ ПЕРЕСПРОСА УЖЕ СОБРАННОГО (детерминированная пара к «НЕ переспрашивай» в промпте) ---
+# ЖИВОЙ ТЕСТ-10: клиент дал даты — ответ подтвердил «даты учли» и ТУТ ЖЕ спросил «Подскажите даты
+# — с какого числа и на какой срок?». Промптовое «не переспрашивай» это не удержало. КОД режет
+# вопрос-предложение, ВСЕ поля которого уже собраны (тот же матчинг полей, что filter_booking_questions
+# — _QUESTION_FIELD_PATTERNS). Вопрос без совпадения с полем НЕ трогаем (не знаем — не режем);
+# если после реза вопросов не осталось, ровно один нужный допишет ensure_closing_question.
+# Служебный хвост ([уточнить:…]/[собрано:…]) не трогаем — он живёт после клиентского тела.
+
+
+def _is_question_segment(seg: str, sep: str = "") -> bool:
+    """Сегмент _pc_segments — ВОПРОС? Знак «?» уезжает в РАЗДЕЛИТЕЛЬ (_PC_SPLIT_RE забирает
+    терминальную пунктуацию вместе с пробелом), поэтому смотрим сегмент ВМЕСТЕ с его хвостом —
+    иначе вопрос в середине ответа детектором не виден вовсе."""
+    return bool(_CLOSING_Q_RE.search((seg or "") + (sep or "")))
+
+
+def drop_answered_questions(draft: str, facts: dict, lang: str = "ru") -> str:
+    """Убрать из черновика вопросы про поля, которые клиент УЖЕ дал (facts=collected_facts).
+    Нечего резать / пустой вход → БАЙТ-В-БАЙТ (fail-safe). Каждый вырезанный вопрос логируем."""
+    text = draft or ""
+    collected = {k for k, v in (facts or {}).items() if v}
+    if not text.strip() or not collected:
+        return draft
+    m = _SERVICE_TAIL_RE.search(text)
+    body, tail = (text[:m.start()], text[m.start():]) if m else (text, "")
+    out, changed = [], False
+    for seg, sep in _pc_segments(body):
+        if _is_question_segment(seg, sep):
+            matched = {key for key, pat in _QUESTION_FIELD_PATTERNS if pat.search(seg)}
+            if matched and matched <= collected:
+                log.info("drop_answered_questions: вырезан вопрос [уже собрано: %s] — %r",
+                         ", ".join(sorted(matched)), seg.strip())
+                changed = True
+                continue
+        out.append([seg, sep])
+    if not changed:
+        return draft
+    new_body = "".join(s + p for s, p in out).strip()
+    new_body = re.sub(r"\n{3,}", "\n\n", new_body)
+    if not new_body:
+        return draft                      # весь ответ был переспросом — лучше отдать как есть
+    return new_body + (("\n" + tail.strip()) if tail.strip() else "")
+
+
+# --- УЖЕ ОЗВУЧЕННЫЙ И НЕИЗМЕНИВШИЙСЯ БЛОК НЕ ПОВТОРЯЕМ (тариф доставки) ------------------------
+# Живой ТЕСТ-10: строка «Доставка в Банг Тао север — 290 ฿ (при оплаченной доставке забор байка в
+# конце аренды бесплатный)» звучала клиенту слово-в-слово в КАЖДОМ ответе. Живой менеджер уже
+# сказанное не повторяет (docs/sales-method-2026-07-22.md, §2: соц-доказательство и повтор блоков —
+# ровно один раз). compose_delivery_draft закрывает повтор КОД-блока; здесь режем повтор, который
+# сделал сам LLM. ИСКЛЮЧЕНИЕ: клиент спросил про доставку в ТЕКУЩЕЙ реплике — тогда ответ уместен
+# и мы не немеем.
+_DELIVERY_MENTION_RE = re.compile(r"доставк\w*|подвез\w*|\bdelivery\b|\bdeliver\b", re.I)
+
+
+def drop_repeated_delivery(draft: str, transcript: str = None, lang: str = "ru") -> str:
+    """Убрать из черновика повтор тарифа ДОСТАВКИ, который уже прозвучал в этом окне с ТЕМ ЖЕ
+    числом. Тариф не звучал / изменился / клиент спросил про доставку сейчас / резать нечего →
+    БАЙТ-В-БАЙТ (fail-safe)."""
+    text = draft or ""
+    if not text.strip() or not (transcript or "").strip():
+        return draft
+    if _DELIVERY_MENTION_RE.search(last_client_message(transcript)):
+        return draft                       # клиент спросил про доставку сейчас — отвечаем
+    said_lines = [l for l in _manager_text(transcript).splitlines()
+                  if _DELIVERY_MENTION_RE.search(l)]
+    said = {f["value"] for f in extract_money_figures("\n".join(said_lines))}
+    if not said:
+        return draft
+    m = _SERVICE_TAIL_RE.search(text)
+    body, tail = (text[:m.start()], text[m.start():]) if m else (text, "")
+    out, changed = [], False
+    for seg, sep in _pc_segments(body):
+        figs = {f["value"] for f in extract_money_figures(seg)}
+        if _DELIVERY_MENTION_RE.search(seg) and figs and figs <= said:
+            log.info("drop_repeated_delivery: тариф доставки уже звучал в окне — повтор снят: %r",
+                     seg.strip())
+            changed = True
+            continue
+        out.append([seg, sep])
+    if not changed:
+        return draft
+    new_body = re.sub(r"\n{3,}", "\n\n", "".join(s + p for s, p in out).strip())
+    if not new_body:
+        return draft
+    return new_body + (("\n" + tail.strip()) if tail.strip() else "")
+
+
+def _append_collected_note(draft: str, facts: dict, lang: str = "ru", unconfirmed=None) -> str:
     """§243/6: дописать в хвост черновика СЛУЖЕБНУЮ пометку модератору «[собрано: гео ✅ …]».
-    Ничего не собрано → черновик БАЙТ-В-БАЙТ (fail-safe). Хвост → _strip_service_prefix не режет."""
-    note = collected_manager_note(facts, lang)
+    Ничего не собрано → черновик БАЙТ-В-БАЙТ (fail-safe). Хвост → _strip_service_prefix не режет.
+    unconfirmed — поля с «❓» (названы клиентом, но не подтверждены), см. unconfirmed_fields."""
+    note = collected_manager_note(facts, lang, unconfirmed)
     if not note:
         return draft
     return ((draft or "").rstrip() + "\n" + note) if (draft or "").strip() else draft
+
+
+# --- ОТПИСКА «УТОЧНЮ И ВЕРНУСЬ» ПРИ ГОТОВОМ РАСЧЁТЕ (детерминированная пара к стилевому правилу) ---
+# ЖИВЫЕ ТЕСТ-7 (23:38) и ТЕСТ-10 (23:49): «Уточню наличие на эти даты и вернусь с точной стоимостью».
+# ПОЧЕМУ ветка «после дозаполнения» этот класс пропускала — по факту ДВЕ дыры сразу:
+#   1) расчёта в тот момент действительно НЕ БЫЛО: даты клиента не разобрались (порядковая форма
+#      «25ого/30ое», см. norm_day_ordinals) → гейт дат заблокировал котировку → стилевое правило
+#      «если расчёт готов — не отписывайся» по условию не применялось вовсе;
+#   2) сам пост-чек черновика такой сегмент НЕ смотрит: _pc_is_ask_form видит слово «уточн» и
+#      считает сегмент уже безопасной «уточню»-формой — то есть отписка проходит НАСКВОЗЬ.
+# Дыра 1 закрыта разбором дат. Дыра 2 закрывается здесь: когда цифры ПОСЧИТАНЫ источником (Bridge:
+# служебные блоки <<<QUOTE>>>/<<<SHEET>>>/<<<DELIVERY>>> или инструкция «ЦЕНА из Календаря») и
+# реально доехали до клиентского тела — предложение-отписку вырезаем КОДОМ. Нет посчитанных цифр →
+# черновик БАЙТ-В-БАЙТ: там «уточню и вернусь» легитимно и остаётся предохранителем.
+_PRICE_OK_MARKS = ("ЦЕНА из Календаря бронирования", "ЦЕНЫ ПО МОДЕЛЯМ")
+# Отписка = обещание вернуться позже (в любой форме) ИЛИ «уточню наличие/цену» с обещанием.
+_DEFLECT_RE = re.compile(
+    r"верн[уёе]\w*\s+(?:к\s+вам\s+)?(?:с\s+\w+\s+)?(?:позже|чуть\s+позже)?"
+    r"|верн[уёе]мся|вернусь\b|отпишус[ья]\b|напишу\s+(?:вам\s+)?позже|сообщу\s+позже"
+    r"|пришлю\s+(?:вам\s+)?(?:расч[её]т|цену|стоимость|прайс)\s+позже"
+    r"|get\s+back\s+to\s+you|come\s+back\s+to\s+you|let\s+you\s+know\s+later"
+    r"|check\s+with\s+the\s+team", re.I)
+
+
+def computed_price_figures(pricing_note: str) -> set:
+    """Денежные числа, реально ПОСЧИТАННЫЕ источником (Bridge), а не выдуманные LLM: из служебных
+    блоков <<<QUOTE>>>/<<<SHEET>>>/<<<DELIVERY>>>, а при их отсутствии — из блока ЦЕНА, помеченного
+    живым расчётом Календаря. Нет расчёта → пустое множество (гарантии цифры не требуем)."""
+    note = pricing_note or ""
+    blocks = [m.group(1) for rx in (_QUOTE_BLOCK_RE, _SHEET_BLOCK_RE, _DELIVERY_BLOCK_RE)
+              for m in rx.finditer(note)]
+    if not blocks and any(mark in note for mark in _PRICE_OK_MARKS):
+        blocks = [note]
+    return {f["value"] for b in blocks for f in extract_money_figures(b)}
+
+
+def drop_price_deflection(draft: str, pricing_note: str = "", lang: str = "ru") -> str:
+    """Вырезать предложения-отписки («уточню наличие и вернусь», «вернусь с точной стоимостью»),
+    когда расчёт ГОТОВ и его цифра уже в клиентском теле. Нет расчёта / цифра до клиента не дошла /
+    резать нечего → черновик БАЙТ-В-БАЙТ (fail-safe: предохранитель «уточню» не трогаем).
+    Предложение с ПОСЧИТАННОЙ цифрой не режем никогда (иначе унесли бы саму цену)."""
+    text = draft or ""
+    figures = computed_price_figures(pricing_note)
+    if not text.strip() or not figures:
+        return draft
+    m = _SERVICE_TAIL_RE.search(text)
+    body, tail = (text[:m.start()], text[m.start():]) if m else (text, "")
+    if not {f["value"] for f in extract_money_figures(client_facing_text(body))} & figures:
+        return draft                        # цифры клиенту не доехали — отписка пока честная
+    out, changed = [], False
+    for seg, sep in _pc_segments(body):
+        if _DEFLECT_RE.search(seg) and not ({f["value"] for f in extract_money_figures(seg)} & figures):
+            log.warning("drop_price_deflection: вырезана отписка при готовом расчёте — %r", seg.strip())
+            changed = True
+            continue
+        out.append([seg, sep])
+    if not changed:
+        return draft
+    new_body = re.sub(r"\n{3,}", "\n\n", "".join(s + p for s, p in out).strip())
+    if not new_body:
+        return draft                        # весь ответ был отпиской — лучше отдать как есть
+    return new_body + (("\n" + tail.strip()) if tail.strip() else "")
+
+
+def ensure_price_figure(draft: str, pricing_note: str = "", lang: str = "ru") -> str:
+    """ЦИФРА ЦЕНЫ ОБЯЗАНА ЗВУЧАТЬ КЛИЕНТУ: расчёт есть (Bridge посчитал), а в клиентском теле ни
+    одного его числа — дописываем ДОСЛОВНУЮ строку расчёта хвостом. Служебная пометка модератору
+    «[уточнить: цена N]» цифру НЕ заменяет: её клиент не видит (client_facing_text срезает).
+    Нет расчёта / цифра уже в теле / нечего вставить → БАЙТ-В-БАЙТ (fail-safe)."""
+    text = draft or ""
+    figures = computed_price_figures(pricing_note)
+    if not text.strip() or not figures:
+        return draft
+    m = _SERVICE_TAIL_RE.search(text)
+    body, tail = (text[:m.start()], text[m.start():]) if m else (text, "")
+    if {f["value"] for f in extract_money_figures(client_facing_text(body))} & figures:
+        return draft
+    block = _quote_block_from_note(pricing_note) or _delivery_block_from_note(pricing_note) \
+        or _sheet_block_from_note(pricing_note)
+    if not (block or "").strip():
+        return draft
+    log.warning("ensure_price_figure: цена посчитана, но в теле её не было — строка расчёта "
+                "добавлена КОДОМ (пометка модератору цифру не заменяет)")
+    return body.rstrip() + "\n\n" + block.strip() + (("\n" + tail.strip()) if tail.strip() else "")
 
 
 def _season_service_note(pricing_note: str) -> str:
@@ -4625,10 +4919,11 @@ def generate_draft(transcript: str, lang: str, faq: str,
     # §243/6: что клиент УЖЕ прислал (модель/даты/гео/паспорт/тел/оплата) — не переспрашиваем.
     facts = collected_facts(transcript)
     ready = client_ready_to_book(transcript)
+    just = client_just_provided(transcript)     # названное В ТЕКУЩЕЙ реплике — переспрос запрещён
     sheet_mode = _sheet_block_from_note(pricing_note) is not None or "ПРАЙС ПО ПАРКУ" in (pricing_note or "")
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
                                 park_models=park_models, playbook=playbook, collected=facts,
-                                ready=ready)
+                                ready=ready, just=just)
     out = _strip_service_prefix(call_llm(system, transcript))
     # Пост-чек ДО сборки сетки: сканируем LLM-текст (intro/outro), дословный прайс-блок КОДА не
     # трогаем. Утверждения цвет/наличие/цена вне белого списка → «уточню»-форма + пометка модератору.
@@ -4647,10 +4942,18 @@ def generate_draft(transcript: str, lang: str, faq: str,
     # Цену доставки (если резолвер её посчитал) в финал доносит КОД тем же классом, что quote.
     dblock = _delivery_block_from_note(pricing_note)
     if dblock is not None:
-        out = compose_delivery_draft(out, dblock, lang)
-    # ТЕСТ-7: ответ обязан двигать клиента дальше — если вопроса нет, КОД дописывает ровно один.
-    out = ensure_closing_question(out, facts, lang, sheet_mode=sheet_mode, ready=ready)
-    out = _append_collected_note(out, facts, lang)
+        out = compose_delivery_draft(out, dblock, lang, transcript=transcript)
+    # Тариф доставки, уже названный в этом окне и не изменившийся, второй раз не звучит.
+    out = drop_repeated_delivery(out, transcript, lang)
+    # ЦЕНА ПОСЧИТАНА → цифра обязана звучать клиенту, а отписке «уточню и вернусь» места нет
+    # (живые ТЕСТ-7/ТЕСТ-10). Порядок: сперва донести цифру, потом снять отписку — иначе
+    # «уточню…» вырезалось бы у ответа, где цены ещё нет в теле.
+    out = ensure_price_figure(out, pricing_note, lang)
+    out = drop_price_deflection(out, pricing_note, lang)
+    # ТЕСТ-10: вопрос про уже собранное — вон; ТЕСТ-7: вопроса нет вовсе — КОД дописывает ровно один.
+    out = drop_answered_questions(out, facts, lang)
+    out = ensure_closing_question(out, facts, lang, sheet_mode=sheet_mode, ready=ready, just=just)
+    out = _append_collected_note(out, facts, lang, unconfirmed_fields(transcript, facts))
     return _append_season_note(out, pricing_note)
 
 
@@ -4663,10 +4966,11 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
     facts = collected_facts(transcript)
     ready = client_ready_to_book(transcript)
+    just = client_just_provided(transcript)
     sheet_mode = _sheet_block_from_note(pricing_note) is not None or "ПРАЙС ПО ПАРКУ" in (pricing_note or "")
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
                                 directive=directive, park_models=park_models, playbook=playbook,
-                                collected=facts, ready=ready)
+                                collected=facts, ready=ready, just=just)
     out = _strip_service_prefix(call_llm(system, transcript))
     # Тот же пост-чек, что в generate_draft (до сборки сетки): цвет/наличие/цена вне данных → «уточню».
     out = postcheck_draft(out, lang, pricing_note=pricing_note, call_llm=call_llm, transcript=transcript)
@@ -4684,10 +4988,15 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     # Тот же класс: strategy-перегенерация несёт цену доставки КОДОМ (не зависит от LLM).
     dblock = _delivery_block_from_note(pricing_note)
     if dblock is not None:
-        out = compose_delivery_draft(out, dblock, lang)
-    # Тот же класс, что в generate_draft: ответ не заканчивается «в пустоту».
-    out = ensure_closing_question(out, facts, lang, sheet_mode=sheet_mode, ready=ready)
-    out = _append_collected_note(out, facts, lang)
+        out = compose_delivery_draft(out, dblock, lang, transcript=transcript)
+    # Тот же класс, что в generate_draft: повтора блока нет, цифра расчёта у клиента, отписки нет,
+    # переспроса нет, ответ не заканчивается «в пустоту».
+    out = drop_repeated_delivery(out, transcript, lang)
+    out = ensure_price_figure(out, pricing_note, lang)
+    out = drop_price_deflection(out, pricing_note, lang)
+    out = drop_answered_questions(out, facts, lang)
+    out = ensure_closing_question(out, facts, lang, sheet_mode=sheet_mode, ready=ready, just=just)
+    out = _append_collected_note(out, facts, lang, unconfirmed_fields(transcript, facts))
     out = _append_season_note(out, pricing_note)
     # Гард повторного приветствия ПЕРЕД ОТПРАВКОЙ (родитель #311 → #56): strategy-перегенерация
     # уходит клиенту через карточку модерации МИМО on_client_message, где живёт основной гард.
