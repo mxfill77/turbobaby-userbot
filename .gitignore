@@ -44,3 +44,14 @@ rc_debug.flag
 # снимок надзора контур-вотчдога (runtime, пишет демон → читает status pc_agent)
 pc_orchestrator.client_watch.json
 pc_orchestrator.client_watch.json.tmp
+
+# гигиена 2026-07-23: бэкапы секретов, ротация логов, runtime-состояние демона,
+# правила тренажёра и рабочие блокноты — ничему из этого нельзя уехать в git-историю
+.env.bak*
+*.log.1
+pc_orchestrator.*.json
+trainer_rules.json
+tmp/
+notes/
+docs/task_notes/
+fetch_delivery.py
