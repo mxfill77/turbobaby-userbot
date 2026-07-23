@@ -1,0 +1,459 @@
+diff --git a/pretool_guard.py b/pretool_guard.py
+index 05e169a..e45757f 100644
+--- a/pretool_guard.py
++++ b/pretool_guard.py
+@@ -7,9 +7,11 @@
+ в Telegram владельцу. Читающий python (recon/gate/tests/reports через write_doc в журналы) — не трогает (defer).
+ 
+ ПОЗИЦИЯ БЕЗОПАСНОСТИ: hook ТОЛЬКО ДОБАВЛЯЕТ подтверждения (никогда не выдаёт новых разрешений).
+-- red/неоднозначный python → "ask" (+карточка).
+-- зелёный python и всё прочее → exit 0 (defer к штатным allow/ask rules; venv python уже в allow).
+-- FAIL-SAFE: нечитаемо/непонятно → "ask" (в сторону подтверждения, НЕ пропуска).
++- red python → "ask" (+карточка); жёсткие классы (процессы/секреты) → "deny".
++- зелёный python, ambiguous (в3, ниже) и всё прочее → exit 0 (defer к штатным allow/ask/deny
++  rules; venv python уже в allow, доктринальное красное держит ask/deny-слой settings).
++- FAIL-SAFE РАЗБОРА: сбой разбора цепи → скан по СЫРОЙ команде, т.е. КРАСНЕЕ (см. _scan);
++  доктринальные проверки (red-токены, sqlite, процессы, секреты) идут ДО любого ambiguous-выхода.
+ ПЕРЕКЛАССИФИКАЦИЯ 02.07 (меньше шума, ask только где «да» реально решает):
+ - tests/*.py и gate.py → ранний defer БЕЗ чтения содержимого (моки по определению);
+ - memory.db через python-код → defer (своя БД бота; sqlite3 CLI остаётся ask в settings);
+@@ -35,9 +37,17 @@
+     `bash -c`, $(…), `…`) → deny БЕЗ карточки, лог `env_hard_block`, approve НЕВОЗМОЖЕН.
+     Сканируется ТОЛЬКО ТЕКСТ КОМАНДЫ: содержимое .py-целей НЕ проверяется (иначе любой боевой
+     скрипт с load_env() встал бы намертво).
++в3 (23.07.2026, доктрина «шквал подтверждений»): AMBIGUOUS САМ ПО СЕБЕ НЕ КРАСНЫЙ. Незнакомая
++команда, python без внятной цели (stdin/heredoc `python3 - <<EOF`, неизвестный -m, нечитаемый
++.py, кривое квотирование) → defer к слоям settings (allow/ask/deny). Красное гарда — ТОЛЬКО
++доктринальный список: живые таблицы/CRM/деньги (RED_TOKENS), файл секретов, SQL-write вне
++memory.db (с в3 ловится и в heredoc/stdin — проверка поднята ДО ambiguous-выходов), kill/stop
++боевых процессов, PID 1. clasp/массовые удаления/git-force держит ask/deny-слой settings —
++гард их не дублирует. Конверт «не распознал операцию» упразднён вместе с ambiguous-ask
++(хелперы дедупа карточек оставлены: их контракт держит test_guard_inbox).
+ Единая точка классификации — classify(cmd, cwd) → (kind, hit, blob), kind ∈ block/red/ambiguous/
+ green; can_approve(kind, hit) и decision(kind, hit, reason) — чистые (их зовут тесты, ничего не
+-исполняя). Направление fail-safe прежнее: любой сбой разбора → скан по СЫРОЙ команде (краснее).
++исполняя). Направление fail-safe разбора прежнее: сбой разбора → скан по СЫРОЙ команде (краснее).
+ 
+ НЕ трогает реальный гейт записи confirmed=true в Bridge (ReadFleet.js) — тот независим (третий слой защиты).
+ Зона 🟢 (конфиг агента; прод Splinter/таблицы не трогает). НИЧЕГО не печатает в stdout, кроме JSON-решения.
+@@ -70,10 +80,10 @@ _INFO_FLAGS = {"--version", "-V", "-VV", "--help", "-h"}
+ _ENV_ASSIGN = re.compile(r"^\w+=")   # env-префикс VAR=val перед интерпретатором (PRETOOL_NOPUSH=1 …)
+ _SQLITE_WRITE = re.compile(r"\b(UPDATE|DELETE\s+FROM|INSERT\s+INTO|DROP\s+TABLE)\b", re.IGNORECASE)
+ 
+-# Дедуп ambiguous-карточек в рамках одной задачи/сессии (UX-фикс 08.07.2026, спам-инцидент задачи 163:
+-# 4 ОДИНАКОВЫХ конверта «не распознал операцию» за 4 минуты). Повтор той же команды → счётчик ×N
+-# правит ТУ ЖЕ Telegram-карточку (editMessageText), нового сообщения НЕ шлёт. Стор — файл на сессию
+-# в /tmp (чистится ребутом); запись старше TTL = новая карточка (сессии переиспользуют id редко).
++# Дедуп ambiguous-карточек (UX-фикс 08.07.2026, спам-инцидент задачи 163). в3 (23.07.2026):
++# ambiguous → defer, путь ambiguous-карточек из main() удалён — дедуп в бою НЕ зовётся. Хелперы
++# (_dedup_bump/_dedup_save_mid/_edit) оставлены как движок повторных карточек: их контракт держит
++# test_guard_inbox (5), формат стора /tmp на сессию с TTL прежний.
+ _DEDUP_DIR = os.environ.get("PRETOOL_DEDUP_DIR") or "/tmp/cc_pretool_dedup"
+ _DEDUP_TTL = 4 * 3600
+ 
+@@ -160,8 +170,9 @@ def can_approve(kind, hit=""):
+ 
+ def decision(kind, hit, reason):
+     """Чистая функция «классификация → решение хука» (её зовут тесты, ничего не исполняя):
+-    block → deny (approve НЕВОЗМОЖЕН), red/ambiguous → ask, green → None (defer)."""
+-    if kind == "green":
++    block → deny (approve НЕВОЗМОЖЕН), red → ask, ambiguous/green → None (defer). в3 23.07.2026:
++    ambiguous сам по себе не красный — решают слои settings (доктринальное красное там ask/deny)."""
++    if kind in ("green", "ambiguous"):
+         return None
+     return {"hookSpecificOutput": {
+         "hookEventName": "PreToolUse",
+@@ -220,6 +231,8 @@ _ACTIONS = {
+                "изменит НЕизвестную базу данных (не свою memory.db)",
+                "какая это БД и почему пишем не в memory.db — memory.db через код шёл бы без вопроса"),
+ }
++# в3 23.07.2026: штатно НЕдостижимо (ambiguous → defer, main() до карточки не доходит);
++# оставлено фолбэком _card на случай red-hit вне _ACTIONS (карточка не падает, а страшнеет).
+ _AMBIGUOUS = ("не распознал операцию — скрипт может писать в рабочие данные, но точную операцию не разобрал",
+               "неизвестно — не могу гарантировать, что скрипт только читает",
+               "команда в карточке — подтверждай, только если понимаешь, что она делает")
+@@ -767,33 +780,43 @@ def _analyze(cmd, cwd, scan=None):
+     for tok in RED_TOKENS:
+         if tok in scan:
+             return "red", RED_TOKEN_HIT[tok], cmd
++    # 1б) SQL-write в тексте команды (heredoc/stdin/инлайн) — в3: раньше такие формы прятались за
++    #     ambiguous-ask, теперь ambiguous defer'ится → доктринальный sqlite проверяется ДО любого
++    #     ambiguous-выхода. memory.db — своя БД (зелёная доктрина 02.07), скан-представление
++    #     чтит «данные ≠ команда» (UPDATE в шаблоне grep не краснит).
++    if _SQLITE_WRITE.search(scan) and ".db" in scan and "memory.db" not in scan:
++        return "red", "sqlite", cmd
+     # 2) разобрать команду на токены
+     try:
+         toks = shlex.split(cmd)
+     except Exception:
+-        return "ambiguous", "ambiguous", cmd   # кривое квотирование → подтверждаем на всякий
++        return "ambiguous", "ambiguous", cmd   # кривое квотирование → ambiguous (в3: defer)
+     content = ""
+     i = 0
+     saw_target = False
+-    while i < len(toks):
+-        t = toks[i]
++    amb = False        # в3: ambiguous КОПИТСЯ, а не выходит сразу — красное в ЧИТАЕМОЙ части команды
++    while i < len(toks):                     # важнее (иначе `python3 red.py && python3 нет_такого.py`
++        t = toks[i]                          # ушёл бы в defer, не отсканировав red.py)
+         if t == "-c":                                  # инлайн-код в следующем токене
+             content += (toks[i + 1] if i + 1 < len(toks) else "")
+             saw_target = True
+             i += 2; continue
+-        if t == "-":                                   # stdin → прочитать нечего
+-            return "ambiguous", "ambiguous", cmd
++        if t == "-":                                   # stdin: тело heredoc уже отсканировано по scan (шаг 1)
++            amb = True
++            i += 1; continue
+         if t == "-m":                                  # модуль (py_compile/pytest/json.tool — ОБРАБАТЫВАЮТ файлы-
+             mod = toks[i + 1] if i + 1 < len(toks) else ""   # аргументы, НЕ исполняют их write-логику → не читаем
+             if mod in _GREEN_MODULES:                  # арг-файлы: иначе `-m py_compile splinter.py` ложно ловит
+                 return "green", "", cmd                # токены из ИСХОДНИКА splinter.py (он их определяет)
+-            return "ambiguous", "ambiguous", cmd
++            amb = True
++            i += 2; continue
+         if t.endswith(".py"):
+             body = _read_file(t, cwd)
+             if body is None:
+-                return "ambiguous", "ambiguous", cmd   # путь есть, файл не прочли → подтверждаем
+-            content += body
+-            saw_target = True
++                amb = True                             # путь есть, файл не прочли → ambiguous (в3: defer)
++            else:
++                content += body
++                saw_target = True
+         i += 1
+     blob = cmd + "\n" + content
+     for tok in RED_TOKENS:
+@@ -803,6 +826,8 @@ def _analyze(cmd, cwd, scan=None):
+     # переклассификация 02.07; прямой sqlite3 CLI остаётся ask в settings). SQL-write в ИНУЮ БД → ask.
+     if _SQLITE_WRITE.search(blob) and ".db" in blob and "memory.db" not in blob:
+         return "red", "sqlite", blob
++    if amb:
++        return "ambiguous", "ambiguous", blob          # доктринального красного нет → в3: defer
+     if not saw_target:
+         # Инфо-флаги (--version/-V/--help) НИЧЕГО не исполняют → зелёное (сужение ambiguous 06.07):
+         # все не-интерпретаторные, не-`VAR=val` токены ∈ _INFO_FLAGS и хотя бы один есть.
+@@ -810,7 +835,7 @@ def _analyze(cmd, cwd, scan=None):
+         rest = [t for t in _args_after_interp(toks) if not _ENV_ASSIGN.match(t)]
+         if rest and all(t in _INFO_FLAGS for t in rest):
+             return "green", "", blob
+-        return "ambiguous", "ambiguous", blob          # python без внятной цели (REPL и т.п.) → подтверждаем
++        return "ambiguous", "ambiguous", blob          # python без внятной цели (REPL/heredoc) → в3: defer
+     return "green", "", blob
+ 
+ 
+@@ -828,26 +853,18 @@ def main():
+     try:
+         kind, hit, blob = classify(cmd, cwd)
+     except Exception:
+-        kind, hit, blob = "ambiguous", "ambiguous", cmd  # любая ошибка анализа → fail-safe ask
+-    if kind == "green":
+-        _defer()                                       # читающий python / не-python → штатные rules
++        kind, hit, blob = "ambiguous", "ambiguous", cmd  # сбой анализа → в3: defer (красное держат settings)
++    if kind in ("green", "ambiguous"):
++        _defer()                  # читающий python / не-python / ambiguous (в3) → штатные allow/ask/deny
+     if not can_approve(kind, hit):
+         why = _block_reason(hit, blob)                 # ЖЁСТКИЙ БЛОК: deny + журнал. Ниже по коду —
+         _guard_log(hit, cmd, why)                      # карточка, пуш и маркер-конверт: сюда НЕ доходим,
+         _emit(decision(kind, hit, why))                # т.е. approve по этой команде невозможен физически
+-    test = _is_test_script(cmd)
+-    count, mid = 1, None
+-    if hit == "ambiguous":                             # дедуп ТОЛЬКО ambiguous (инцидент 163); red —
+-        count, mid = _dedup_bump(data.get("session_id"), cmd)   # конкретная операция, каждая пушится
+-    card = _card(hit, blob, test, cmd=cmd, count=count)
++    test = _is_test_script(cmd)                        # дальше ТОЛЬКО red: конкретная операция, каждая пушится
++    card = _card(hit, blob, test, cmd=cmd)
+     _guard_write_marker(os.environ.get("CC_TASK_ID", "").strip(), hit, card)
+     if not test:                  # 🧪-тестовые карточки в личку НЕ пушим (утечки 01–05.07); ask остаётся
+-        if count <= 1:
+-            new_mid = _push(card)
+-            if new_mid:
+-                _dedup_save_mid(data.get("session_id"), cmd, new_mid)
+-        else:
+-            _edit(mid, card)      # повтор → счётчик ×N в ТОЙ ЖЕ карточке, нового сообщения НЕТ
++        _push(card)
+     _ask(card)
+ 
+ 
+diff --git a/tests/test_pretool_hardblock.py b/tests/test_pretool_hardblock.py
+index ad6a578..09365dd 100644
+--- a/tests/test_pretool_hardblock.py
++++ b/tests/test_pretool_hardblock.py
+@@ -6,7 +6,11 @@
+       ломал headless (красное не исполнялось даже после «да» владельца);
+   (б) данные ≠ команда         — красное слово в ПОИСКОВОМ ШАБЛОНЕ grep/rg/sed/awk не краснит команду,
+       но ОПЕРАНДЫ и соседние звенья цепи остаются под сканом (дыру не открыли);
+-  (в) hard-block файла секретов — обращение к нему в ЛЮБОЙ позиции цепи → deny, событие env_hard_block.
++  (в) hard-block файла секретов — обращение к нему в ЛЮБОЙ позиции цепи → deny, событие env_hard_block;
++  (г) в3 (23.07.2026)          — ambiguous САМ ПО СЕБЕ не красный: незнакомая команда, heredoc/stdin,
++      неизвестный -m, нечитаемый .py, кривое квотирование → defer (решение None, конверта НЕТ);
++      красное гарда — ТОЛЬКО доктринальный список (таблицы/CRM/деньги, секреты, sqlite вне memory.db,
++      kill/stop боевых, PID 1) — и оно ловится И СКВОЗЬ heredoc (секция 13).
+ 
+ ТЕСТ НИЧЕГО НЕ ИСПОЛНЯЕТ: только импорт модуля и ЧИСТЫЕ функции classify()/can_approve()/decision()/
+ _card()/_guard_log(). Ни одна проверяемая строка не уходит в shell — ни один процесс не трогается.
+@@ -193,11 +197,11 @@ print("(11) регресс: python-скан НЕ ослаблен:")
+ kind, hit, _b = cls('python3 -c "' + TRX + '(amount=500)"')
+ res.append(ok(kind == "red" and hit == TRX, "инлайн денежная операция → красное (" + hit + ")"))
+ kind, hit, _b = cls("python3 -")
+-res.append(ok(kind == "ambiguous" and hit == "ambiguous", "stdin '-' → ambiguous (fail-safe цел)"))
++res.append(ok(kind == "ambiguous" and hit == "ambiguous", "stdin '-' → класс ambiguous (в3: решение defer, см. 13)"))
+ kind, hit, _b = cls("python3 -m some_unknown_module")
+-res.append(ok(kind == "ambiguous", "неизвестный -m → ambiguous"))
++res.append(ok(kind == "ambiguous", "неизвестный -m → класс ambiguous"))
+ res.append(ok(PG.can_approve("red", TRX) and PG.can_approve("ambiguous", "ambiguous"),
+-              "красное/ambiguous по-прежнему approve-able (жёсткое — только два события)"))
++              "красное по-прежнему approve-able (жёсткое — только два события)"))
+ 
+ print("(12) журнал жёстких блоков (событие пишется, значений секретов в строке нет):")
+ tmp = tempfile.mkdtemp(prefix="pt_hb_")
+@@ -215,5 +219,46 @@ res.append(ok(all(r.get("cmd") for r in rows), "команда в строке 
+ res.append(ok(PG.HARD_BLOCK_HITS == ("proc_hard_block", "env_hard_block"),
+               "имена событий журнала = ключи жёсткого блока"))
+ 
++
++def is_defer_ambiguous(cmd):
++    """в3: класс ambiguous, решение хука None (defer) — ни ask, ни deny, конверта НЕТ."""
++    kind, hit, _b = cls(cmd)
++    return kind == "ambiguous" and hit == "ambiguous" and PG.decision(kind, hit, "") is None
++
++
++print("(13) в3: ambiguous сам по себе НЕ красный — defer; красное только по доктрине:")
++HD_Q = ("python3 - <<PYEOF\n"
++        "import json\n"
++        "q = json.load(open('tmp/tasks_queue.json'))\n"
++        "print(len(q))\n"
++        "PYEOF")
++res.append(ok(is_defer_ambiguous(HD_Q), "python3 - <<PYEOF (чтение очереди) → defer (зелёное)"))
++res.append(ok(is_defer_ambiguous("python3 -"), "stdin '-' без heredoc → defer"))
++res.append(ok(is_defer_ambiguous("python3 -m some_unknown_module"), "неизвестный -m → defer"))
++res.append(ok(is_defer_ambiguous("python3 'незакрытая кавычка"), "кривое квотирование → defer"))
++res.append(ok(is_green("frobnicate --such-flag-much-unknown"), "незнакомая не-python команда → defer"))
++
++print("(13б) …но доктринальное красное СКВОЗЬ heredoc/stdin ловится по-прежнему:")
++kind, hit, _b = cls("python3 - <<PYEOF\nfrom bridge_client import api\n" + TRX + "(amount=500)\nPYEOF")
++res.append(ok(kind == "red" and hit == TRX, "heredoc с денежной операцией → красное (" + hit + ")"))
++kind, hit, _b = cls("python3 - <<PYEOF\nimport sqlite3\ncon = sqlite3.connect('/root/x/tasks.db')\n"
++                    "con.execute('UPDATE tasks SET s=1')\nPYEOF")
++res.append(ok(kind == "red" and hit == "sqlite", "heredoc с UPDATE чужой .db → красное (sqlite)"))
++res.append(ok(is_defer_ambiguous("python3 - <<PYEOF\nimport sqlite3\ncon = sqlite3.connect('memory.db')\n"
++                                 "con.execute('UPDATE tasks SET s=1')\nPYEOF"),
++              "тот же UPDATE в СВОЮ memory.db → defer (доктрина 02.07 цела)"))
++res.append(ok(is_block("python3 - <<PYEOF\nimport os\nos.system('cat " + ENVF + "')\nPYEOF",
++                       "env_hard_block"), "heredoc с чтением секретов → блок"))
++res.append(ok(is_block("python3 - <<PYEOF\nimport os\nos.system('" + PK + " -9 " + SPL + "')\nPYEOF",
++                       "proc_hard_block"), "heredoc с гашением боевого процесса → блок"))
++FLEET_OIL = "set_fleet_" + "oil"
++tmp2 = tempfile.mkdtemp(prefix="pt_v3_").replace(os.sep, "/")   # forward slashes: shlex ест бэкслэши ПК-клона
++with open(tmp2 + "/fx_red_live.py", "w", encoding="utf-8") as _f:
++    _f.write("# фикстура\nprint('" + FLEET_OIL + "')\n")
++kind, hit, _b = cls("python3 " + tmp2 + "/fx_red_live.py && python3 " + tmp2 + "/fx_absent.py")
++shutil.rmtree(tmp2, ignore_errors=True)
++res.append(ok(kind == "red" and hit == FLEET_OIL,
++              "red.py && нечитаемый.py → красное (ambiguous-звено red-скан НЕ заслоняет)"))
++
+ print("\nИТОГ:", "ВСЕ PASS" if all(res) else "ЕСТЬ FAIL (%d/%d)" % (sum(res), len(res)))
+ sys.exit(0 if all(res) else 1)
+diff --git a/tests/test_pretool_infoflags.py b/tests/test_pretool_infoflags.py
+index 6fdca2b..aa40433 100644
+--- a/tests/test_pretool_infoflags.py
++++ b/tests/test_pretool_infoflags.py
+@@ -4,7 +4,9 @@
+ (platform/sysconfig/site) → ЗЕЛЁНОЕ (defer), а не ложный ambiguous-ask. Раньше
+ `venv/bin/python3 --version` не имел .py-цели → падал в ask, хотя venv python в allow.
+ 
+-КРАСНОЕ и настоящий ambiguous (stdin `-`, неизвестный `-m`, нечитаемый .py) — ОСТАЮТСЯ ask.
++КРАСНОЕ — ОСТАЁТСЯ ask. в3 (23.07.2026): настоящий ambiguous (stdin `-`, неизвестный `-m`,
++нечитаемый .py, флаг вне белого списка) → defer БЕЗ конверта — ambiguous сам по себе не красный,
++решают слои settings; красное гарда — только доктринальный список.
+ Пуши глушим PRETOOL_NOPUSH=1 (ноль карточек в личку).
+ """
+ import os
+@@ -69,12 +71,12 @@ with open(red, "w", encoding="utf-8") as f:
+ res.append(ok(is_ask(PY + " " + red), "скрипт с set_fleet_oil → ask"))
+ res.append(ok(is_ask(PY + " -c \"add_transaction(amount=500)\""), "inline add_transaction → ask"))
+ 
+-print("Настоящий ambiguous → по-прежнему ask (fail-safe цел):")
+-res.append(ok(is_ask(PY + " -"), "stdin '-' → ask"))
+-res.append(ok(is_ask(PY + " -m some_unknown_module"), "неизвестный -m → ask"))
+-res.append(ok(is_ask(PY + " --version --frobnicate"), "флаг вне белого списка → ask"))
++print("Настоящий ambiguous → в3: defer БЕЗ конверта (сам по себе не красный):")
++res.append(ok(is_green(PY + " -"), "stdin '-' → defer"))
++res.append(ok(is_green(PY + " -m some_unknown_module"), "неизвестный -m → defer"))
++res.append(ok(is_green(PY + " --version --frobnicate"), "флаг вне белого списка → defer"))
+ missing = os.path.join(tmp, "nope_missing.py")
+-res.append(ok(is_ask(PY + " " + missing), "нечитаемый .py-путь → ask"))
++res.append(ok(is_green(PY + " " + missing), "нечитаемый .py-путь → defer"))
+ 
+ print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
+ sys.exit(0 if all(res) else 1)
+diff --git a/tests/test_pretool_probe_dedup.py b/tests/test_pretool_probe_dedup.py
+index f3ecedb..8a8f293 100644
+--- a/tests/test_pretool_probe_dedup.py
++++ b/tests/test_pretool_probe_dedup.py
+@@ -1,17 +1,14 @@
+-"""UX-фикс стража красной зоны headless (08.07.2026, спам-инцидент задачи 163: 4 одинаковых
+-конверта «не распознал операцию» за 13:24–13:28).
+-
+-Три слоя фикса:
+-(1) ambiguous-карточка НЕСЁТ саму команду в теле (строка «Команда: …», первые ~200 симв.) —
+-    владелец решает из уведомления, а не «глянь выше вручную» (в headless «выше» некуда);
+-(2) ДЕДУП: одинаковая нераспознанная команда в рамках одной сессии(=задачи) = ОДНА карточка,
+-    повторы копятся счётчиком «Повтор: ×N» правкой ТОЙ ЖЕ карточки (edit), не новыми сообщениями;
+-(3) классификатор знает читающие probe-паттерны репо: env-префикс + инфо-флаг → зелёное
+-    (корень инцидента 163: `PRETOOL_NOPUSH=1 venv/bin/python3 --version` падал в ambiguous),
+-    env-префикс + tests/* → зелёное; node --check / node tests/*harness* / cat / grep / diff —
+-    не-python → defer ещё до анализа (probe «может писать» не считается).
+-Ask-философия НЕ ослаблена: настоящая неопределённость (stdin, нечитаемый .py, неизвестный -m,
+-red-токены) — по-прежнему конверт. Пуши в тесте — только мок-счётчик NOTIFY_COUNT_FILE (сети нет).
++"""Судьба ambiguous-конвертов стража красной зоны headless.
++
++История: UX-фикс 08.07.2026 (спам-инцидент задачи 163) дал ambiguous-карточке команду в теле
++и дедуп «Повтор: ×N». в3 (23.07.2026, доктрина «шквал подтверждений»): ambiguous САМ ПО СЕБЕ
++НЕ КРАСНЫЙ — незнакомая команда, python без внятной цели (stdin/heredoc, неизвестный -m,
++нечитаемый .py) → defer к слоям settings БЕЗ конверта и БЕЗ пуша. Конверт «не распознал
++операцию» упразднён; дедуп из main() удалён вместе с ним (хелперы живы — test_guard_inbox).
++
++Красное гарда — ТОЛЬКО доктринальный список (таблицы/CRM/деньги, секреты, sqlite вне memory.db,
++kill/stop боевых, PID 1): red-конверт как раньше, КАЖДЫЙ пушится (red не дедупится).
++Пуши в тесте — только мок-счётчик NOTIFY_COUNT_FILE (сети нет).
+ """
+ import os
+ import sys
+@@ -25,14 +22,12 @@ PY = os.path.join(ROOT, "venv", "bin", "python3")
+ PRETOOL = os.path.join(ROOT, "pretool_guard.py")
+ 
+ TMP = tempfile.mkdtemp(prefix="pt_pd_")
+-DEDUP = os.path.join(TMP, "dedup")
+ 
+ 
+ def run(cmd, session="s-default", count_file=None, nopush=True):
+     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd},
+                           "cwd": ROOT, "session_id": session})
+     env = dict(os.environ)
+-    env["PRETOOL_DEDUP_DIR"] = DEDUP
+     env.pop("PRETOOL_NOPUSH", None)
+     env.pop("NOTIFY_COUNT_FILE", None)
+     if nopush:
+@@ -74,61 +69,34 @@ for cmd in [
+     r = run(cmd, session="s-probe")
+     res.append(ok(r.returncode == 0 and '"ask"' not in r.stdout, cmd[:80] + " → без конверта"))
+ 
+-print("(2) неизвестный скрипт с записью → конверт С КОМАНДОЙ в теле:")
++print("(2) в3: настоящий ambiguous → defer БЕЗ конверта и БЕЗ пуша:")
+ missing = os.path.join(TMP, "fx_writer_probe.py")   # нет на диске → нечитаем → ambiguous
+-cmd_m = PY + " " + missing
+-r = run(cmd_m, session="s-card")
+-res.append(ok(r.returncode == 0 and '"ask"' in r.stdout, "нечитаемый скрипт → ask (конверт)"))
+-res.append(ok("Команда:" in r.stdout and missing in r.stdout, "команда включена в тело карточки"))
+-res.append(ok("глянь команду выше" not in r.stdout, "«глянь выше вручную» из карточки убран"))
+-r = run(PY + " -", session="s-card")
+-res.append(ok('"ask"' in r.stdout and "Команда:" in r.stdout, "stdin '-' → конверт с командой в теле"))
+-long_cmd = PY + " -m unknown_mod_" + "x" * 300
+-r = run(long_cmd, session="s-card")
+-res.append(ok('"ask"' in r.stdout and "…" in r.stdout, "длинная команда обрезана ~200 симв. (…)"))
+-
+-print("(3) ДЕДУП: повтор той же команды = счётчик ×N, не новое сообщение:")
+-cnt = os.path.join(TMP, "cnt_dedup.txt")
+-r1 = run(cmd_m, session="s-dedup", count_file=cnt, nopush=False)
+-res.append(ok('"ask"' in r1.stdout and "Повтор:" not in r1.stdout, "1-й раз: карточка без счётчика"))
+-res.append(ok(len(lines(cnt)) == 1 and not lines(cnt)[0].startswith("EDIT "),
+-              "1-й раз: ровно ОДНА отправка (новое сообщение)"))
+-r2 = run(cmd_m, session="s-dedup", count_file=cnt, nopush=False)
+-res.append(ok('"ask"' in r2.stdout and "×2" in r2.stdout, "2-й раз: ask остался, счётчик ×2 в карточке"))
+-r3 = run(cmd_m, session="s-dedup", count_file=cnt, nopush=False)
+-res.append(ok("×3" in r3.stdout, "3-й раз: счётчик ×3"))
+-tail = lines(cnt)[1:]
+-res.append(ok(len(tail) == 2 and all(t.startswith("EDIT ") for t in tail),
+-              "повторы = ПРАВКА той же карточки (EDIT), новых сообщений НОЛЬ"))
+-res.append(ok(any("×3" in t for t in tail), "счётчик ×3 дошёл до правки карточки"))
+-
+-print("(4) границы дедупа:")
+-r = run(cmd_m, session="s-other", count_file=os.path.join(TMP, "cnt_o.txt"), nopush=False)
+-res.append(ok("Повтор:" not in r.stdout, "другая сессия → свой счёт (карточка без ×N)"))
+-r = run(PY + " " + os.path.join(TMP, "fx_writer_probe2.py"), session="s-dedup")
+-res.append(ok('"ask"' in r.stdout and "Повтор:" not in r.stdout, "другая команда в той же сессии → без ×N"))
++cnt_amb = os.path.join(TMP, "cnt_amb.txt")
++for cmd in [PY + " " + missing,
++            PY + " -",
++            PY + " -m unknown_mod_" + "x" * 300,
++            PY + " --version --frobnicate"]:
++    r = run(cmd, session="s-amb", count_file=cnt_amb, nopush=False)
++    res.append(ok(r.returncode == 0 and r.stdout.strip() == "", cmd[:70] + " → defer (пустой stdout)"))
++res.append(ok(lines(cnt_amb) == [], "ноль пушей: ambiguous-карточек больше не существует"))
++
++print("(3) red — по-прежнему конверт, КАЖДЫЙ пушится (red не дедупится):")
+ cnt_red = os.path.join(TMP, "cnt_red.txt")
+ red = os.path.join(TMP, "fx_red_live.py")
+ with open(red, "w", encoding="utf-8") as f:
+     f.write("# фикстура регресса\nprint('set_fleet_oil')\n")
+ for _ in range(2):
+     r = run(PY + " " + red, session="s-red", count_file=cnt_red, nopush=False)
+-res.append(ok('"ask"' in r.stdout and "Повтор:" not in r.stdout and len(lines(cnt_red)) == 2,
+-              "red НЕ дедупится (конкретная операция: каждая карточка пушится, как раньше)"))
+-
+-print("(5) fail-safe и ask-философия целы:")
+-env_bad = run(cmd_m, session="s-fs")
+-# сломанный стор: PRETOOL_DEDUP_DIR указывает в файл → makedirs падает → (1, None), ask стоит
+-payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd_m},
+-                      "cwd": ROOT, "session_id": "s-fs2"})
+-env = dict(os.environ, PRETOOL_NOPUSH="1", PRETOOL_DEDUP_DIR=os.path.join(red, "x"))
+-rb = subprocess.run([PY, PRETOOL], input=payload, capture_output=True, text=True, timeout=60, env=env)
+-res.append(ok('"ask"' in env_bad.stdout and '"ask"' in rb.stdout,
+-              "сломанный дедуп-стор → ask как раньше (fail-safe)"))
+-for cmd in [PY + " -", PY + " -m some_unknown_module",
+-            "PRETOOL_NOPUSH=1 " + PY + " --version --frobnicate"]:
+-    r = run(cmd, session="s-ask")
+-    res.append(ok('"ask"' in r.stdout, cmd[:70] + " → по-прежнему конверт (ask не ослаблен)"))
++res.append(ok('"ask"' in r.stdout and "Лист1" in r.stdout, "red-скрипт → конверт с операцией (ask)"))
++res.append(ok("Повтор:" not in r.stdout and "не распознал операцию" not in r.stdout,
++              "в конверте нет счётчика ×N и нет формулировки ambiguous"))
++res.append(ok(len(lines(cnt_red)) == 2 and not any(t.startswith("EDIT ") for t in lines(cnt_red)),
++              "2 запуска = 2 отдельных пуша (дедуп red как не было, так и нет)"))
++
++print("(4) defer не ослабил red: ambiguous-звено не заслоняет красное читаемое:")
++r = run(PY + " " + red + " && " + PY + " " + missing, session="s-mix")
++res.append(ok('"ask"' in r.stdout and "Лист1" in r.stdout,
++              "компаунд red.py && нечитаемый.py → конверт по red"))
+ 
+ shutil.rmtree(TMP, ignore_errors=True)
+ print("\nИТОГ:", "ВСЕ PASS" if all(res) else "ЕСТЬ FAIL (%d/%d)" % (sum(res), len(res)))
+diff --git a/tests/test_pretool_commit_msg.py b/tests/test_pretool_commit_msg.py
+index ce1be2c..936ebf0 100644
+--- a/tests/test_pretool_commit_msg.py
++++ b/tests/test_pretool_commit_msg.py
+@@ -5,7 +5,8 @@
+ git шёл в _analyze → ветка -m видела «не-зелёный модуль» → ложный конверт «не распознал операцию».
+ Фикс: для СКАНА интерпретатора payload'ы -m/-am/--message git-команды вырезаются (_strip_git_msg);
+ классификация самого git не меняется (git → не-python → defer к штатным allow/ask rules).
+-Настоящие python-команды — как раньше (red/ambiguous/green нетронуты). Пуши замучены PRETOOL_NOPUSH.
++Настоящие python-команды: red/green как раньше; ambiguous с в3 (23.07.2026) — defer БЕЗ конверта
++(сам по себе не красный, решают слои settings). Пуши замучены PRETOOL_NOPUSH.
+ """
+ import os, sys, json, shutil, tempfile, subprocess
+ 
+@@ -56,18 +57,19 @@ r = run(PY + " " + red)
+ res.append(ok('"ask"' in r.stdout and "Лист1" in r.stdout, "python с red-токеном → red-конверт"))
+ missing = os.path.join(TMP, "fx_absent.py")
+ r = run(PY + " " + missing)
+-res.append(ok('"ask"' in r.stdout and "не распознал операцию" in r.stdout,
+-              "нечитаемый .py → ambiguous-конверт (fail-safe цел)"))
++res.append(ok(r.returncode == 0 and '"ask"' not in r.stdout,
++              "нечитаемый .py → defer (в3: ambiguous сам по себе не красный)"))
+ r = run("PRETOOL_NOPUSH=1 " + PY + " --version")
+ res.append(ok(r.returncode == 0 and '"ask"' not in r.stdout, "инфо-флаг → зелёное (регресс 163)"))
+ r = run(PY + " " + os.path.join(ROOT, "tests", "test_fmt.py"))
+ res.append(ok(r.returncode == 0 and '"ask"' not in r.stdout, "tests/* → зелёное (регресс 02.07)"))
+ 
+-print("(3) интерпретатор ВНЕ -m в git-команде по-прежнему ловится (страж не ослаблен):")
++print("(3) интерпретатор ВНЕ -m в git-команде по-прежнему сканится (страж не ослаблен):")
+ r = run(f'git commit -m "правка" && {PY} {red}')
+ res.append(ok('"ask"' in r.stdout, "компаунд git…&&python red-скрипт → конверт остался"))
+ r = run(f'git commit -m "правка" && {PY} {missing}')
+-res.append(ok('"ask"' in r.stdout, "компаунд git…&&python нечитаемый → конверт остался"))
++res.append(ok(r.returncode == 0 and '"ask"' not in r.stdout,
++              "компаунд git…&&python нечитаемый → defer (в3, red в компаунде ловится — выше)"))
+ 
+ print("(4) _strip_git_msg: границы и fail-safe:")
+ sys.path.insert(0, ROOT)

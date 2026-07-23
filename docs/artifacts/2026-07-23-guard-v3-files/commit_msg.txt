@@ -1,0 +1,24 @@
+guard в3: ambiguous сам по себе НЕ красный — defer к слоям settings; красное только по доктрине
+
+pretool_guard: незнакомая команда, python без внятной цели (stdin/heredoc `python3 - <<EOF`,
+неизвестный -m, нечитаемый .py, кривое квотирование) → defer (решение None, конверта и пуша НЕТ);
+конверт «не распознал операцию» и дедуп ×N из main() упразднены (хелперы дедупа оставлены —
+их контракт держит test_guard_inbox). Красное гарда — ТОЛЬКО доктринальный список: RED_TOKENS
+(живые таблицы/CRM/деньги), файл секретов, SQL-write вне memory.db, kill/stop боевых процессов,
+PID 1; clasp/массовые удаления/git-force держит ask/deny-слой settings (гард не дублирует).
+Доктринальное красное при этом УСИЛЕНО — закрыты две дыры, которые открылись бы с ambiguous-defer:
+(а) sqlite-write теперь ловится и в heredoc/stdin — проверка поднята ДО ambiguous-выходов (шаг 1б
+_analyze); (б) ambiguous-звено компаунда не заслоняет red-скан читаемой части: ambiguous копится
+флагом, red/sqlite проверяются после чтения всего читаемого (`python3 red.py && python3
+нет_такого.py` → red, а не defer). Сбой классификации целиком → defer (красное держат settings);
+fail-safe разбора прежний (сбой разбора цепи → скан по сырой команде, краснее).
+
+Голден test_pretool_hardblock §13/13б (классификацией, красные литералы конкатенацией):
+restart splinter / start orchestrator-daemon → зелёное; stop splinter, pkill -9 splinter,
+kill -SIGKILL 1 → deny; python3 - <<PYEOF с чтением очереди → defer; cat .env → deny; heredoc
+с денежной операцией / UPDATE чужой .db → red, с секретами / гашением боевого → block; UPDATE
+в memory.db → defer (доктрина 02.07 цела); red.py && нечитаемый.py → red. 79/79 PASS (прогнано
+на ПК-клоне). test_pretool_infoflags / test_pretool_commit_msg / test_pretool_probe_dedup
+перелочены на в3 (ambiguous → defer без конверта; red пушится каждый, дедупа нет) — VPS-гейт.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
