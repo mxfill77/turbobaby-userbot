@@ -5848,18 +5848,16 @@ class TestFunnelTailFix(unittest.TestCase):
         # EN-порядковые окончания нормализуются тем же классом (цифровая часть освобождается)
         self.assertEqual(suggest.norm_day_ordinals("from 25th to 30th"), "from 25 to 30")
 
-    def test_known_boundary_english_month_names_are_not_parsed(self):
-        """ИЗВЕСТНАЯ ГРАНИЦА (не чинится этим пакетом, вынесена владельцу отдельным пунктом):
-        _MON_MAP/_MONTH_RE знают ТОЛЬКО русские названия месяцев, поэтому «from July 25 to July 30»
-        дат не даёт — и EN-клиент попадает в ту же воронку переспроса. Расширять _MONTH_RE на
-        английские основы вслепую опасно (нет \\b-границ: «may» как модальный глагол, «mar»/«aug»
-        внутри слов) — это отдельный класс со своими голденами. Тест фиксирует ФАКТ, чтобы граница
-        не была тихой: как только EN-месяцы появятся, он честно упадёт и потребует обновления."""
+    def test_boundary_english_month_names_now_parsed(self):
+        """ГРАНИЦА ЗАКРЫТА (бывший test_known_boundary_english_month_names_are_not_parsed):
+        _MONTH_RE выучил английские основы — с \\b-границами и защитой модального «may», ровно
+        от тех опасностей, ради которых граница жила отдельным голденом. Обе фразы старой
+        границы теперь дают даты; полный класс EN-форм — TestEnglishDates."""
         self.assertEqual(suggest.parse_date_range("from July 25 to July 30", self.TODAY),
-                         (None, None))
+                         ("2026-07-25", "2026-07-30"))
         self.assertEqual(suggest.parse_date_range("from the 25th to the 30th of july", self.TODAY),
-                         (None, None))
-        # …а цифровая EN-форма работает (клиенты чаще пишут именно так)
+                         ("2026-07-25", "2026-07-30"))
+        # …и цифровая EN-форма работает как раньше
         self.assertEqual(suggest.parse_date_range("from 25.07 to 30.07", self.TODAY),
                          ("2026-07-25", "2026-07-30"))
 
@@ -6052,6 +6050,73 @@ class TestFunnelTailFix(unittest.TestCase):
         self.assertEqual(client.count("?"), 1)               # ровно ОДИН вопрос
         self.assertIn("[собрано:", out)                      # служебная пометка модератору на месте
         self.assertNotIn("❓", out)                           # даты подтверждены → без вопросиков
+
+
+class TestEnglishDates(unittest.TestCase):
+    """EN-даты клиента наравне с русскими: «July 25», «25 July», «Jul 25-30», «25th of July»
+    и смешанные («с 25 July по 30»). Закрывает границу из TestFunnelTailFix (бывший голден
+    «EN-месяцы не разбираются»). Правило-класс CLAUDE.md: формы клиента дословно + парафразы
+    RU/EN в позитивах, контрпримеры (модальный may, «maybe», приветствие) в негативах."""
+
+    TODAY = datetime.date(2026, 7, 22)          # то же «сегодня», что у живого окна ТЕСТ-10
+    JUL = ("2026-07-25", "2026-07-30")
+
+    # ---- форма 1: «July 25» (месяц-перед-днём) ----
+    def test_month_first_july_25(self):
+        self.assertEqual(suggest.parse_date_range("July 25 for 5 days", self.TODAY), self.JUL)
+        self.assertEqual(suggest.parse_date_range("from July 25 to July 30", self.TODAY), self.JUL)
+        self.assertTrue(suggest._has_start_signal("July 25"))
+        # одиночная дата без срока — как и русская «25 июля»: диапазона НЕ даёт
+        self.assertEqual(suggest.parse_date_range("July 25", self.TODAY), (None, None))
+
+    # ---- форма 2: «25 July» (день-перед-месяцем) ----
+    def test_day_first_25_july(self):
+        self.assertEqual(suggest.parse_date_range("from 25 July to 30 July", self.TODAY), self.JUL)
+        self.assertEqual(suggest.parse_date_range("на неделю с 25 July", self.TODAY),
+                         ("2026-07-25", "2026-08-01"))
+        self.assertTrue(suggest._has_start_signal("25 July"))
+
+    # ---- форма 3: «Jul 25-30» (сокращение месяца + диапазон дней) ----
+    def test_abbrev_month_day_range(self):
+        self.assertEqual(suggest.parse_date_range("Jul 25-30", self.TODAY), self.JUL)
+        self.assertEqual(suggest.parse_date_range("July 25-30", self.TODAY), self.JUL)
+        self.assertEqual(suggest.parse_date_range("25-30 jul", self.TODAY), self.JUL)
+        # EN-связки диапазона наравне с «по/до»
+        self.assertEqual(suggest.parse_date_range("July 25 to 30", self.TODAY), self.JUL)
+        self.assertEqual(suggest.parse_date_range("25 to 30 July", self.TODAY), self.JUL)
+
+    # ---- форма 4: «25th of July» (порядковая форма + of/the) ----
+    def test_ordinal_of_july(self):
+        self.assertEqual(suggest.norm_day_ordinals("25th of July"), "25 July")
+        self.assertEqual(suggest.norm_day_ordinals("the 25th of July"), "25 July")
+        self.assertEqual(suggest.parse_date_range("from the 25th of July to the 30th",
+                                                  self.TODAY), self.JUL)
+        self.assertEqual(suggest.parse_date_range("25th of July - 30th of July", self.TODAY),
+                         self.JUL)
+
+    # ---- смешанные RU/EN (клиент мешает языки в одной фразе) ----
+    def test_mixed_ru_en(self):
+        self.assertEqual(suggest.parse_date_range("с 25 July по 30", self.TODAY), self.JUL)
+        self.assertEqual(suggest.parse_date_range("с 25 July по 30 июля", self.TODAY), self.JUL)
+        self.assertEqual(suggest.parse_date_range("July 25 по 30", self.TODAY), self.JUL)
+        # та же ветка чинит и чисто русскую форму «месяц у старта, конец голым днём»
+        self.assertEqual(suggest.parse_date_range("с 25 июля до 30", self.TODAY), self.JUL)
+
+    # ---- негативы: EN-слова, похожие на месяцы, дат НЕ дают ----
+    def test_negatives_no_false_months(self):
+        for phrase in ("maybe 5-10 days",                    # «may» внутри слова — не месяц
+                       "may i rent a bike?",                 # модальный may без цифр
+                       "may i rent it for 5 days",           # модальный may + срок без старта
+                       "it may take 5 to 10 days",           # модальный may + диапазон чисел
+                       "hello, how much is it?",             # приветствие без дат
+                       "we are 2, marina and august"):       # имена, а не месяцы-с-числом
+            self.assertEqual(suggest.parse_date_range(phrase, self.TODAY), (None, None), phrase)
+        # …а «may» в месячном контексте — работает (цифра вплотную / in перед словом);
+        # май-2026 уже прошёл → парсер честно роллит на 2027 (гейт прошлого — отдельный слой)
+        self.assertEqual(suggest.parse_date_range("from 5 to 10 may", self.TODAY),
+                         ("2027-05-05", "2027-05-10"))
+        self.assertEqual(suggest.parse_date_range("in may from 5 to 10", self.TODAY),
+                         ("2027-05-05", "2027-05-10"))
 
 
 if __name__ == "__main__":

@@ -1333,14 +1333,45 @@ def today_phuket(now=None) -> datetime.date:
     return now_phuket(now).date()
 
 
-_MONTH_RE = r"(январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)"
+# EN-месяцы клиентов («July 25», «25 July», «Jul 25-30») — наравне с русскими. Латинские
+# основы ТОЛЬКО в \b-границах: без них «may» (модальный глагол), «mar»/«aug» внутри слов дают
+# ложные месяцы — ровно та опасность, из-за которой граница жила отдельным голденом.
+_MONTH_EN = (r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?"
+             r"|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?")
+_MONTH_RE = (r"((?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)"
+             r"|\b(?:" + _MONTH_EN + r")\b)")
+# EN пишут месяц и ПЕРЕД днём («July 25») — отдельный паттерн ТОЛЬКО для латиницы:
+# по-русски «июля 25» не пишут, а трогать RU-разбор без нужды опасно для голденов.
+_EN_MONTH_FIRST_RE = re.compile(r"\b(" + _MONTH_EN + r")\b\s+(\d{1,2})\b")
 _MON_MAP = {"январ": 1, "феврал": 2, "март": 3, "апрел": 4, "май": 5, "мая": 5,
             "июн": 6, "июл": 7, "август": 8, "сентябр": 9, "октябр": 10,
             "ноябр": 11, "декабр": 12}
+_MON_MAP_EN = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+               "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
 
 
 def _mon(stem):
+    """Основа месяца → номер. EN-формы (jul/july/sept/september…) канонизируем первыми 3 буквами."""
+    if stem and stem[:1].isascii():
+        return _MON_MAP_EN.get(stem[:3].lower())
     return _MON_MAP.get(stem)
+
+
+# «may» — ещё и модальный глагол («may i rent…»): в отрыве от цифры месяцем считаем ТОЛЬКО
+# в месячном контексте — цифра вплотную или in/for/of/until/till/during перед словом.
+_MAY_MONTH_CTX_RE = re.compile(r"\d\s*-?\s*may\b|\bmay\s*[,.]?\s*\d"
+                               r"|\b(?:in|for|of|until|till|during)\s+may\b")
+
+
+def _standalone_month(t):
+    """Месяц, названный СЛОВОМ отдельно от чисел диапазона («в июле с 5 по 10», «in may from
+    5 to 10»). EN «may» без месячного контекста пропускаем (модальный глагол), идём к
+    следующему месяцу в тексте; ничего не нашли → None."""
+    for m in re.finditer(_MONTH_RE, t):
+        stem = m.group(1)
+        if stem != "may" or _MAY_MONTH_CTX_RE.search(t):
+            return _mon(stem)
+    return None
 
 
 # --- ПОРЯДКОВЫЕ ФОРМЫ ДНЯ: «25ого», «30ое», «25-е», «1st» — тоже даты -------------------------
@@ -1357,14 +1388,20 @@ _ORDINAL_TAIL_RE = re.compile(
     r"|(?<=\d)(?:st|nd|rd|th)\b", re.I)
 # «с 25 числа по 30 число» — слово-паразит между числом и предлогом ломало диапазон.
 _DAY_WORD_RE = re.compile(r"(?<=\d)\s+числ\w*", re.I)
+# EN-обвязка дня той же нормализацией: артикль перед числом («the 25th») и «of» между днём
+# и месяцем («25th of July») — после среза EN-фразы разбирает общий код дат.
+_EN_THE_DAY_RE = re.compile(r"\bthe\s+(?=\d)", re.I)
+_EN_OF_MONTH_RE = re.compile(r"(?<=\d)\s+of\s+(?=(?:" + _MONTH_EN + r")\b)", re.I)
 
 
 def norm_day_ordinals(text: str) -> str:
     """Живые порядковые формы дня → голое число: «25ого»→«25», «30-ое»→«30», «1st»→«1»,
-    «25 числа»→«25». ИДЕМПОТЕНТНА (повторный вызов ничего не меняет), пустой вход → как есть."""
+    «25 числа»→«25», «the 25th»→«25», «25th of July»→«25 July». ИДЕМПОТЕНТНА (повторный
+    вызов ничего не меняет), пустой вход → как есть."""
     if not text:
         return text
-    return _DAY_WORD_RE.sub("", _ORDINAL_TAIL_RE.sub("", text))
+    t = _DAY_WORD_RE.sub("", _ORDINAL_TAIL_RE.sub("", text))
+    return _EN_OF_MONTH_RE.sub(" ", _EN_THE_DAY_RE.sub("", t))
 
 
 def _safe_date(y, m, d):
@@ -1439,7 +1476,7 @@ def _parse_term(t):
     m = re.search(r"на\s+(\d{1,3})\s*(дн|дня|дней|день|сут)", t)
     if m:
         return (int(m.group(1)), False)
-    m = re.search(r"на\s+(\d{1,3})\s*(day|days|week|weeks|month)", t)
+    m = re.search(r"(?:на|for)\s+(\d{1,3})\s*(day|days|week|weeks|month)", t)
     if m:
         n, u = int(m.group(1)), m.group(2)
         if u.startswith("week"):
@@ -1470,6 +1507,9 @@ def _anchor_date(t, today):
     m = re.search(r"(\d{1,2})[./](\d{1,2})", t)
     if m:
         return _mk(int(m.group(1)), int(m.group(2)), today)
+    m = _EN_MONTH_FIRST_RE.search(t)         # «July 25 for 5 days» (EN, месяц-перед-днём)
+    if m:
+        return _mk(int(m.group(2)), _mon(m.group(1)), today)
     # ГОЛЫЙ ДЕНЬ БЕЗ МЕСЯЦА: «с 20 [на 2 недели]» → старт = 20-е ближайшего будущего (тек. месяц, а
     # если день уже прошёл — следующий месяц; НЕ следующий год). Фиксирует старт из трекера, когда
     # клиент дал только число+длительность — иначе цена-нот проваливалась в «уточни даты» (дыра, в
@@ -1484,29 +1524,43 @@ def parse_date_range(text, today=None):
     """Диапазон дат из слов клиента → (iso_start, iso_end) или (None, None).
     Поддержка: «10.07-15.07», «с 5 по 10.07», «5–10 июля», «с 5 по 10 июля», «с 28 декабря по
     3 января» (год-ролл), «на неделю/месяц с 5 июля», «завтра на 3 дня», перепутанный порядок
-    (swap). Год-ролл end+1г — ТОЛЬКО при реальном переходе через год, НЕ как лечение."""
+    (swap); EN-формы наравне с русскими: «July 25», «25 July», «Jul 25-30», «25th of July»,
+    смешанные («с 25 July по 30»). Год-ролл end+1г — ТОЛЬКО при реальном переходе через год,
+    НЕ как лечение."""
     today = today or today_phuket()
-    # Порядковые формы дня («25ого по 30ое июля») нормализуем ДО разбора — иначе живая реплика
-    # клиента не даёт ни диапазона, ни старта (корень провала ТЕСТ-10, см. norm_day_ordinals).
+    # Порядковые формы дня («25ого по 30ое июля», «25th of July») нормализуем ДО разбора — иначе
+    # живая реплика клиента не даёт ни диапазона, ни старта (корень ТЕСТ-10, см. norm_day_ordinals).
     t = norm_day_ordinals(
         (text or "").lower().replace("–", "-").replace("—", "-").replace("ё", "е"))
-    dmw = [(int(m.group(1)), _mon(m.group(2))) for m in re.finditer(r"(\d{1,2})\s+" + _MONTH_RE, t)]
+    # Точки «день+месяц» ОБОИХ порядков: день-перед-месяцем (RU/EN) и месяц-перед-днём (EN,
+    # «July 25»). Месяц-первые матчи, пересекающиеся с день-первыми, отбрасываем — в «25 may
+    # 30 june» связка «may 30» не смеет украсть день у соседних точек. Итог — по позиции в тексте.
+    dfm = list(re.finditer(r"(\d{1,2})\s+" + _MONTH_RE, t))
+    mfm = [m for m in _EN_MONTH_FIRST_RE.finditer(t)
+           if not any(m.start() < d.end() and d.start() < m.end() for d in dfm)]
+    pts = sorted([(m.start(), m.end(), int(m.group(1)), _mon(m.group(2))) for m in dfm] +
+                 [(m.start(), m.end(), int(m.group(2)), _mon(m.group(1))) for m in mfm])
     dmy = re.findall(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", t)
-    mwm = re.search(_MONTH_RE, t)
-    mw = _mon(mwm.group(1)) if mwm else None
-    rng = re.search(r"(?:с\s*)?(\d{1,2})\s*(?:-|по|до)\s*(\d{1,2})", t)
+    # месяц диапазона голых чисел: у ЕДИНСТВЕННОЙ точки он надёжнее слова, взятого поиском по
+    # всему тексту («i may arrive 5-10 july» — месяц july, а не модальный may)
+    mw = pts[0][3] if len(pts) == 1 else _standalone_month(t)
+    rng = re.search(r"(?:с\s*)?(\d{1,2})\s*(?:-|по|до|to|till|until)\s*(\d{1,2})", t)
     term = _parse_term(t)
 
     s = e = None
-    if len(dmw) >= 2:                                        # «28 декабря по 3 января»
-        s, e = _resolve_range(dmw[0][0], dmw[0][1], dmw[1][0], dmw[1][1], today)
+    if len(pts) >= 2:                                       # «28 декабря по 3 января» / «July 25 to July 30»
+        s, e = _resolve_range(pts[0][2], pts[0][3], pts[1][2], pts[1][3], today)
     elif len(dmy) >= 2:                                      # «10.07-15.07»
         s, e = _resolve_range(int(dmy[0][0]), int(dmy[0][1]), int(dmy[1][0]), int(dmy[1][1]),
                               today, dmy[0][2] or None, dmy[1][2] or None)
-    elif rng and (mw or len(dmy) == 1):                     # «с 5 по 10 июля» / «с 5 по 10.07» / «5-10 июля»
+    elif rng and (mw or len(dmy) == 1):                     # «с 5 по 10 июля» / «Jul 25-30» / «с 5 по 10.07»
         month = mw if mw else int(dmy[0][1])
         yhint = (dmy[0][2] or None) if len(dmy) == 1 else None
         s, e = _resolve_range(int(rng.group(1)), month, int(rng.group(2)), month, today, yhint, yhint)
+    elif len(pts) == 1 and (m2 := re.match(                 # «с 25 July по 30» / «с 25 июля до 30»:
+            r"\w*\s*(?:-|по|до|to|till|until)\s*(\d{1,2})\b",  # месяц назван у СТАРТА, конец — голым
+            t[pts[0][1]:])):                                   # днём сразу за точкой
+        s, e = _resolve_range(pts[0][2], pts[0][3], int(m2.group(1)), pts[0][3], today)
     elif term:                                              # «на неделю с 5 июля» / «завтра на 3 дня»
         anchor = _anchor_date(t, today)
         if anchor:
@@ -1869,7 +1923,9 @@ def _has_start_signal(text: str) -> bool:
         return True
     if re.search(r"\d{1,2}[.\-/]\d{1,2}", t):                 # 15.07 / 15/07
         return True
-    if re.search(r"\d{1,2}\s+" + _MONTH_RE, t):               # 15 июля
+    if re.search(r"\d{1,2}\s+" + _MONTH_RE, t):               # 15 июля / 15 July
+        return True
+    if _EN_MONTH_FIRST_RE.search(t):                          # July 15 (EN, месяц-перед-днём)
         return True
     return False
 
