@@ -50,6 +50,8 @@ pc_orchestrator.client_watch.json.tmp
 .env.bak*
 *.log.1
 pc_orchestrator.*.json
+pc_orchestrator.heartbeat
+pc_ask_*.marker
 trainer_rules.json
 tmp/
 notes/
