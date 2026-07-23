@@ -163,7 +163,11 @@ def _is_pure_config_read(cmd):
 _RE_OUTSIDE_WRITE = re.compile(r"(?i)(>>?|out-file|set-content|new-item|move-item|copy-item)\s+[\"']?([a-z]:[\\/][^\"'\s]+)")
 
 # --- ЗЕЛЁНЫЕ признаки Bash-команды (проверяются ПОСЛЕ красных) ---
-_RE_SAFE_SCRIPTS = re.compile(r"(?i)(cowork_log_append|dispatch_notify)\.py")
+# Доверенные скрипты — зелёные ПО ИМЕНИ модуля, содержимое не сканируется (их тела законно
+# читают конфиг с секретами; гейтуются в репо review+git). brain_writer — ЕДИНСТВЕННЫЙ
+# легальный канал записи в Brain-доки с ПК (класс 328, образец VPS-cclog): секреты Bridge
+# берёт сам процесс писателя, вызывающие скрипты их не читают и в коде не видят.
+_RE_SAFE_SCRIPTS = re.compile(r"(?i)(cowork_log_append|dispatch_notify|brain_writer)\.py")
 _RE_GIT_SAFE = re.compile(r"(?i)(^|[\s;&|(])git\s+(status|diff|log|add|commit|push|fetch|pull|branch|show|check-ignore|rev-parse|remote|ls-files|config\s+--get)")
 _RE_TESTS = re.compile(r"(?i)-m\s+(pytest|py_compile|unittest)(\s|$)|(^|[\s/\\])pytest(\s|$)")
 _RE_READONLY_SHELL = re.compile(r"(?i)^\s*(ls|dir|echo|type|cat|head|tail|wc|stat|findstr|grep|rg|get-content|get-childitem|select-string|get-item|get-ciminstance|test-path|measure-object|where|get-command|git|py|python\s+--version)\b")

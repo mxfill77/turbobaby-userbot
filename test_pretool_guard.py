@@ -52,6 +52,14 @@ class TestGreenDefer(unittest.TestCase):
                   'venv/Scripts/python.exe dispatch_notify.py --hook stop'):
             self._defer(bash(c))
 
+    def test_brain_writer_green_by_module_name_not_content(self):
+        # доверенный писатель в мозг (класс 328): зелёный ПО ИМЕНИ модуля — содержимое НЕ
+        # сканируется, хотя тело модуля законно читает конфиг с секретами (скан дал бы env).
+        for c in ('venv/Scripts/python.exe brain_writer.py --name cowork_log "NOTE проба"',
+                  'venv/Scripts/python.exe brain_writer.py --id 13kp-54bz "строка"',
+                  "venv/Scripts/python.exe brain_writer.py --name index --probe"):
+            self._defer(bash(c))
+
     def test_test_runner_modules_defer_without_scanning_args(self):
         # -m unittest / -m pytest c тест-файлами-аргументами: green-модуль, арг-файлы НЕ сканируем
         # (порт VPS-урока). Тест-файлы содержат красные токены-фикстуры — не должны триггерить ask.
@@ -128,6 +136,20 @@ class TestRedAsk(unittest.TestCase):
 
     def test_python_touches_env(self):
         self._ask(bash('venv/Scripts/python.exe -c "open(\'.env\').read()"'))
+
+    def test_oneoff_script_reading_secret_config_stays_red(self):
+        # класс 328 («утренний ASK про пульс»): одноразовый скрипт, который САМ читает конфиг
+        # с секретами ради записи в мозг, — красный в ОБЕИХ ролях (скан тела находит доступ
+        # к секретам). Легальный канал — доверенный писатель brain_writer (см. CLAUDE.md).
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "oneoff_pulse.py")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write('vals = open(".env").read()  # сам лезет за секретами\n')
+            data = bash('venv/Scripts/python.exe "%s" "строка статуса"' % p)
+            self.assertEqual(g.decide(data)[:2], ("ask", "env"))
+            self.assertEqual(g.decide_for_role(data, headless=True)[0], "ask")
+            self.assertEqual(g.decide_for_role(data, headless=False)[0], "ask")
 
     def test_nontest_script_still_scanned(self):
         # красное НЕ ослаблено: не-тест .py по-прежнему сканируется на боевую запись.
@@ -421,7 +443,8 @@ class TestRolesAgree(unittest.TestCase):
     def test_green_for_both_roles_stays_green(self):
         """Что было зелёным ДО переноса — зелено в обеих ролях (доктрина не ужесточает)."""
         for c in ("git status", "git commit -m 'x'", "venv/Scripts/python.exe -m unittest test_suggest",
-                  'venv/Scripts/python.exe cowork_log_append.py "DONE x"'):
+                  'venv/Scripts/python.exe cowork_log_append.py "DONE x"',
+                  'venv/Scripts/python.exe brain_writer.py --name cowork_log "NOTE x"'):
             self.assertEqual(g.decide_for_role(bash(c), headless=True)[0], "defer", c)
             self.assertEqual(g.decide_for_role(bash(c), headless=False)[0], "defer", c)
 
