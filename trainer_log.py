@@ -51,11 +51,21 @@ DOC_NAME = "KB_trainer_log"            # имя дока в мозге (для K
 KIND_CLIENT, KIND_BOT, KIND_BTN, KIND_LESSON = "client", "bot", "btn", "lesson"
 KINDS = (KIND_CLIENT, KIND_BOT, KIND_BTN, KIND_LESSON)
 
+def _int_env(name, default):
+    """Числовая настройка из окружения с ПОЛНОЙ защитой (идиом log_setup._int_env). Мусор/пусто →
+    default. Без try мусор в env ронял бы ИМПОРТ модуля, а его импортит userbot_listen на уровне
+    модуля ⇒ не поднимался бы весь userbot. Заявленный «FAIL-SAFE ВЕЗДЕ» обязан начинаться здесь."""
+    try:
+        return int(os.getenv(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+
 # 1 МБ — порог ротации из ТЗ. Считаем в СИМВОЛАХ (Bridge отдаёт/принимает текст, не байты).
-MAX_CHARS = int(os.getenv("TRAINER_LOG_MAX_CHARS", "1000000") or "1000000")
+MAX_CHARS = _int_env("TRAINER_LOG_MAX_CHARS", 1000000)
 # Сколько символов оставляем в живом доке после среза (свежий хвост), остальное — в архив.
-KEEP_CHARS = int(os.getenv("TRAINER_LOG_KEEP_CHARS", "700000") or "700000")
-HTTP_TIMEOUT = int(os.getenv("TRAINER_LOG_TIMEOUT", "30") or "30")
+KEEP_CHARS = _int_env("TRAINER_LOG_KEEP_CHARS", 700000)
+HTTP_TIMEOUT = _int_env("TRAINER_LOG_TIMEOUT", 30)
 
 # ЗАГОЛОВОК-ЛЕГЕНДА дока (первая строка, положена Штабом при создании: «TRN LOG v1 | …»).
 # Новые события ложатся СВЕРХУ, поэтому без пиннинга легенда уехала бы вниз, а при ротации —
@@ -69,8 +79,8 @@ HEADER_MARK = "TRN LOG"
 # что userbot.lock/moderation_bot.lock). Лок протух (владелец умер посреди HTTP) → забираем.
 # Не дождались за LOCK_WAIT_SEC → пишем ВСЁ РАВНО с предупреждением: потерять событие хуже,
 # чем рискнуть редкой гонкой.
-LOCK_STALE_SEC = int(os.getenv("TRAINER_LOG_LOCK_STALE", str(4 * HTTP_TIMEOUT + 30)))
-LOCK_WAIT_SEC = int(os.getenv("TRAINER_LOG_LOCK_WAIT", str(2 * HTTP_TIMEOUT + 10)))
+LOCK_STALE_SEC = _int_env("TRAINER_LOG_LOCK_STALE", 4 * HTTP_TIMEOUT + 30)
+LOCK_WAIT_SEC = _int_env("TRAINER_LOG_LOCK_WAIT", 2 * HTTP_TIMEOUT + 10)
 
 import logging
 log = logging.getLogger("trainer_log")   # хендлеры вешает процесс-хозяин (userbot/moderbot)

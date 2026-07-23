@@ -377,6 +377,45 @@ class TestWiring(unittest.TestCase):
             self.assertIn(anchor, src, f"нажатие не логируется: {anchor}")
         self.assertIn("trainer_log.KIND_LESSON", src)
 
+    def test_env_garbage_never_breaks_the_import(self):
+        """Настройки читаются с полной защитой: мусор в env → дефолт. Без этого ValueError падал бы
+        на ИМПОРТЕ модуля, а его импортит userbot_listen на уровне модуля ⇒ не поднялся бы весь
+        userbot (заявленный «FAIL-SAFE ВЕЗДЕ» обязан начинаться с разбора конфига)."""
+        self.assertEqual(trainer_log._int_env("НЕТ_ТАКОЙ_ПЕРЕМЕННОЙ", 42), 42)
+        for junk in ("", "  ", "много", "1e6", "10.5", None):
+            os.environ["TRAINER_LOG_PROBE"] = "" if junk is None else junk
+            try:
+                self.assertEqual(trainer_log._int_env("TRAINER_LOG_PROBE", 7), 7, repr(junk))
+            finally:
+                os.environ.pop("TRAINER_LOG_PROBE", None)
+        os.environ["TRAINER_LOG_PROBE"] = "123"
+        try:
+            self.assertEqual(trainer_log._int_env("TRAINER_LOG_PROBE", 7), 123)
+        finally:
+            os.environ.pop("TRAINER_LOG_PROBE", None)
+        # …и сам модуль переимпортируется с мусором в окружении
+        os.environ["TRAINER_LOG_MAX_CHARS"] = "не число"
+        try:
+            import importlib
+            importlib.reload(trainer_log)
+            self.assertEqual(trainer_log.MAX_CHARS, 1000000)
+        finally:
+            os.environ.pop("TRAINER_LOG_MAX_CHARS", None)
+            import importlib
+            importlib.reload(trainer_log)
+
+    def test_log_write_is_fire_and_forget_in_both_consumers(self):
+        """Лог наблюдения НЕ ИМЕЕТ ПРАВА держать диалог. В userbot запись вызывается прямо в
+        клиентском турне (до планирования ответа), а модербот собран без concurrent_updates —
+        PTB обрабатывает апдейты ПОСЛЕДОВАТЕЛЬНО, и зависшая на Bridge запись тормозила бы
+        модерацию РЕАЛЬНЫХ клиентов. Значит в обоих _trn_log обязан планировать задачу, а не ждать."""
+        for name in ("userbot_listen.py", "moderation_bot.py"):
+            src = self._src(name)
+            body = src.split("async def _trn_log", 1)[1].split("\nasync def ", 1)[0]
+            self.assertIn("asyncio.create_task(_write())", body, name)
+            self.assertNotIn("await asyncio.to_thread(trainer_log.safe_append", body.split(
+                "async def _write", 1)[0], name)   # до вложенной корутины ожидания сети нет
+
     def test_auto_apply_map_covers_this_module(self):
         """Правка trainer_log.py обязана рестартить ОБА бота — иначе живые процессы доживут
         на старом коде (класс delivery.py dae330a)."""

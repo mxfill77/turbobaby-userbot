@@ -257,13 +257,26 @@ async def _trainer_generate(transcript, first):
 
 
 async def _trn_log(kind, text, n=None):
-    """Событие тренажёра → KB_trainer_log. Никогда не блокирует и не роняет обработчик
-    (сеть Bridge уходит в поток; ошибки глотает сам trainer_log)."""
+    """Событие тренажёра → KB_trainer_log ФОНОМ. Наблюдение НЕ ИМЕЕТ ПРАВА задерживать диалог:
+    запись — это до 2 HTTP к Bridge (по 30с) плюс ожидание файлового лока, а вызывается она прямо
+    в клиентском турне (_trainer_client_turn ждёт её ДО планирования ответа). Поэтому здесь только
+    ПЛАНИРУЕМ задачу и сразу возвращаемся — сам await мгновенный, сеть живёт в фоне.
+    Ошибки глотает trainer_log; исключение планирования (нет живого цикла) тоже не роняет вызов."""
     try:
         n = trainer.get_n() if n is None else n
-        await asyncio.to_thread(trainer_log.safe_append, n, kind, text)
-    except Exception as e:
-        log.info(f"{_now()} | ТРЕНАЖЁР: лог в мозг не записан: {type(e).__name__}: {e}")
+    except Exception:
+        n = 0
+
+    async def _write():
+        try:
+            await asyncio.to_thread(trainer_log.safe_append, n, kind, text)
+        except Exception as e:
+            log.info(f"{_now()} | ТРЕНАЖЁР: лог в мозг не записан: {type(e).__name__}: {e}")
+
+    try:
+        asyncio.create_task(_write())
+    except RuntimeError:
+        pass                      # цикла нет — лог наблюдения не критичен
 
 
 async def _trainer_client_turn(event, body):

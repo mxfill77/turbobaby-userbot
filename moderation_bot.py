@@ -321,14 +321,26 @@ def _kb_trainer_hyps(hyps, selected=None, per_row=5):
 
 
 async def _trn_log(kind, text, n=None):
-    """Событие тренажёра → KB_trainer_log (Brain). Сеть уводим в поток, ошибки глотает сам
-    trainer_log: лог наблюдения не имеет права задержать или уронить панель кнопок."""
+    """Событие тренажёра → KB_trainer_log (Brain) ФОНОМ. КРИТИЧНО именно здесь: приложение
+    собрано ApplicationBuilder().token(...).build() без concurrent_updates, то есть PTB обрабатывает
+    апдейты ПОСЛЕДОВАТЕЛЬНО — зависшая на Bridge запись лога тренажёра тормозила бы модерацию
+    РЕАЛЬНЫХ клиентов. Поэтому только ПЛАНИРУЕМ задачу и сразу возвращаемся."""
     import asyncio
     try:
         n = trainer.get_n() if n is None else n
-        await asyncio.to_thread(trainer_log.safe_append, n, kind, text)
-    except Exception as e:
-        log.info(f"trainer_log: {type(e).__name__}: {e}")
+    except Exception:
+        n = 0
+
+    async def _write():
+        try:
+            await asyncio.to_thread(trainer_log.safe_append, n, kind, text)
+        except Exception as e:
+            log.info(f"trainer_log: {type(e).__name__}: {e}")
+
+    try:
+        asyncio.create_task(_write())
+    except RuntimeError:
+        pass                      # цикла нет — лог наблюдения не критичен
 
 
 async def _trainer_callback(context, q, data):
