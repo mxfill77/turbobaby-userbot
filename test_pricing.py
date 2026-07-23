@@ -212,8 +212,10 @@ class TestTwoPhaseDraft(unittest.TestCase):
         # маркеры, УНИКАЛЬНЫЕ для ноты (не пересекаются с текстом ПОЛИТИКИ/СЦЕНАРИЯ в промпте)
         if "дат аренды в диалоге НЕТ" in system:
             return "ASK_DATES"
+        if "на место метки [QUOTE]" in system:
+            return "HAS_PRICE"                 # маркерный quote-режим (вариант Б #274): цифр в промпте нет
         if "использовать ДОСЛОВНО" in system:
-            return "HAS_PRICE"
+            return "HAS_PRICE"                 # фразовые ветки (несколько моделей / процент)
         if ("сейчас недоступна" in system or "все подходящие байки заняты" in system
                 or "не удалось однозначно разобрать" in system or "не сходится" in system):
             return "FALLBACK"

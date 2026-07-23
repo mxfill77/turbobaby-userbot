@@ -3634,11 +3634,13 @@ class TestDepositPassportChosen(unittest.TestCase):
 
 
 class TestPointQuoteCodeBlock(unittest.TestCase):
-    """#365 (родитель 4, шаг 2/6): ТОЧЕЧНЫЙ quote несёт цену Bridge в финал КОДОМ — как сетка
-    PRICE_SHEET. strategy-перегенерация больше НЕ зависит от того, «донёс» ли LLM цифры: цена лежит
-    в служебных скобках pricing_note (в промпт не течёт — вырезается), а compose_quote_draft вставляет
-    её КОДОМ (метка [QUOTE] → точка вставки; цифры уже в тексте → не дублируем; цену LLM потерял →
-    приклеиваем блок хвостом, fail-safe)."""
+    """#365 (родитель 4, шаг 2/6) + вариант Б развилки #274 (шаг 7): ТОЧЕЧНЫЙ quote несёт цену
+    Bridge в финал ТОЛЬКО КОДОМ — как сетка PRICE_SHEET, полностью маркерным режимом. Цена лежит
+    в служебных скобках pricing_note (в промпт не течёт — вырезается), инструкция ЦЕНА велит LLM
+    поставить метку [QUOTE] и цифр НЕ называть, а compose_quote_draft вставляет канон ВСЕГДА
+    (метка [QUOTE] → точка вставки; метки нет → блок хвостом, fail-safe). Дедуп #365 «цифры уже
+    в тексте → не дублируем» СНЯТ решением владельца: живой смоук 23.07 показал, что он пропускает
+    ПАРАФРАЗ с верными цифрами и рушит инвариант #92 «строка J дословно»."""
 
     FLEET = ["NMAX 155CC BLACK PHUKET 4255", "ADV 350CC BLACK PHUKET 5849"]
 
@@ -3736,13 +3738,14 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         self.assertIn("ЦЕНА из Календаря", note)             # инструкция LLM (прежний путь) цела
 
     def test_prompt_strips_quote_block(self):
-        # Служебный блок в промпт LLM НЕ течёт (как SHEET): цифры цены остаются в инструкции ЦЕНА,
-        # но сырых скобок/дубля блока в system нет.
+        # Вариант Б #274: служебный блок в промпт НЕ течёт (как SHEET), и ЦИФР цены LLM больше НЕ
+        # видит вовсе — инструкция ЦЕНА велит поставить метку [QUOTE], строку вставит КОД.
         sysp = suggest.make_system_prompt("FAQ", "ru", pricing_note=self._note())
         self.assertNotIn("<<<QUOTE>>>", sysp)
         self.assertNotIn("<<<END_QUOTE>>>", sysp)
-        self.assertIn("ЦЕНА из Календаря", sysp)             # цена всё же в промпте (в инструкции)
-        self.assertIn("1685", sysp)
+        self.assertIn("ЦЕНА из Календаря", sysp)             # инструкция ЦЕНА на месте
+        self.assertIn("[QUOTE]", sysp)                       # точка вставки канона для кода
+        self.assertNotIn("1685", sysp)                       # итог в промпт НЕ утёк (нет парафраза)
 
     def test_deposit_sum_default_no_passport(self):
         # РЕЖИМ «сумма из Bridge» (паспорт НЕ выбран): и инструкция LLM, и quote-хвост несут число
@@ -3790,11 +3793,15 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         out = suggest.compose_quote_draft("Отличный выбор!\n[QUOTE]\nЖду ответа.", block, "ru")
         self.assertEqual(out, "Отличный выбор!\n\n" + block + "\n\nЖду ответа.")
 
-    def test_compose_no_dup_when_carried(self):
-        # LLM донёс все цифры блока → возвращаем текст как есть (без дубля).
+    def test_compose_appends_canon_even_when_llm_carried_numbers(self):
+        # ФЛИП #365 (вариант Б #274): «LLM донёс цифры» больше НЕ отменяет канон — живой смоук
+        # 23.07: парафраз с ВЕРНЫМИ числами оставлял черновик без канонической строки J (#92).
+        # Канон клеится ВСЕГДА; в живом пути дубль не растёт — цифр в промпте LLM теперь нет.
         block = "NMAX 155 — 337 ฿/день; итого 1685 ฿; депозит 3000 ฿."
         carried = "NMAX 155 на 5 дней — 1685 ฿, депозит 3000 ฿ (337 ฿/день). Бронируем?"
-        self.assertEqual(suggest.compose_quote_draft(carried, block, "ru"), carried)
+        out = suggest.compose_quote_draft(carried, block, "ru")
+        self.assertTrue(out.startswith(carried))
+        self.assertIn(block, out)                            # канон дословно, несмотря на парафраз
 
     def test_compose_failsafe_appends_lost_price(self):
         # LLM потерял цену → блок Bridge приклеен хвостом (цена доходит клиенту ВСЕГДА).
@@ -3834,15 +3841,19 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         self.assertIn("ЗА КАЖДЫЙ", out)                      # пометка «за каждый» у клиента
         self.assertNotIn("3370", out)                        # 2×1685 итог не выдуман
 
-    def test_strategy_regen_no_dup_when_llm_carries(self):
-        # LLM честно привёл цифры Bridge → код НЕ дублирует их (обратная совместимость с прежним путём).
+    def test_strategy_regen_marker_inserts_canon_once(self):
+        # ЖИВОЙ путь варианта Б #274: LLM цифр НЕ видит и ставит метку [QUOTE] → строку цены
+        # вставляет КОД ровно ОДИН раз (без дубля — по построению, а не по дедупу), метка клиенту
+        # не течёт.
         note = self._note()
-        def carry(system, user):
-            return "NMAX на 5 дней — 1685 ฿, депозит 3000 ฿ (337 ฿/день). Бронируем?"
+        def marker(system, user):
+            return "Отличный выбор!\n[QUOTE]\nБронируем?"
         out = suggest.regenerate_draft("[клиент]: nmax на 5 дней с 15 июля, сколько?", "ru", "FAQ",
-                                       False, note, "дожимай", call_llm=carry)
-        self.assertEqual(suggest.client_facing_text(out).count("1685"), 1)   # без дубля цены
-        self.assertEqual(suggest.client_facing_text(out).count("3000"), 1)   # без дубля депозита
+                                       False, note, "дожимай", call_llm=marker)
+        client = suggest.client_facing_text(out)
+        self.assertEqual(client.count("1685"), 1)            # цифра у клиента ровно один раз (КОДОМ)
+        self.assertEqual(client.count("3000"), 1)
+        self.assertNotIn("[QUOTE]", client)                  # метка заменена строкой, не утекла
 
 
 class TestDeliveryCodeBlock(unittest.TestCase):
@@ -3968,28 +3979,35 @@ class TestDeliveryCodeBlock(unittest.TestCase):
         self.assertIn("290", out)
         self.assertIn(block, out)
 
-    def test_compose_delivery_no_dup_when_present(self):
+    def test_compose_delivery_appends_canon_even_when_number_present(self):
+        # ФЛИП #365 (вариант Б #274): цифра доставки в теле LLM (живой смоук 23.07 — sonnet-5 взял
+        # 590 из few-shot FAQ) больше НЕ отменяет канон: каноническая строка доставки клеится
+        # ВСЕГДА (кроме тарифа, УЖЕ названного в окне, — см. test_golden_delivery_block_…).
         block = "Доставка — 290 ฿ (забор байка в конце аренды — бесплатный)."
         carried = "NMAX — 1685 ฿. Доставка — 290 ฿ до вашей виллы. Бронируем?"
-        self.assertEqual(suggest.compose_delivery_draft(carried, block, "ru"), carried)
+        out = suggest.compose_delivery_draft(carried, block, "ru")
+        self.assertTrue(out.startswith(carried))
+        self.assertIn(block, out)                            # канон дословно, несмотря на цифру LLM
 
     # ------------------------- end-to-end (regen) ----------------------------
 
     def test_regen_carries_delivery_by_code(self):
-        # ЯДРО ШАГА: strategy-перегенерация — LLM цену доставки НЕ привёл, но 290 дошло КОДОМ, и
-        # цена аренды НЕ задвоилась (доставка своим блоком, не внутри quote).
+        # ЯДРО ШАГА: strategy-перегенерация — LLM цифр не видел (маркерный режим Б #274), поставил
+        # [QUOTE]; и цена аренды, и 815 доставки дошли КОДОМ, аренда НЕ задвоена (доставка своим
+        # блоком, не внутри quote).
         self._stub_delivery(self.ZONE)
         note = self._note()
         seen = {}
         def drop(system, user):
             seen["system"] = system
-            return "NMAX на 5 дней — 1685 ฿, депозит 3000 ฿ (337 ฿/день). Бронируем?"
+            return "Отличный выбор!\n[QUOTE]\nДоставку к вам организуем. Бронируем?"
         out = suggest.regenerate_draft(
             "[клиент]: nmax на 5 дней с 15 июля, вот локация https://www.google.com/maps?q=7.88,98.33",
             "ru", "FAQ", False, note, "дожимай", call_llm=drop)
         self.assertIn("815", out)                            # доставка дошла КОДОМ
-        self.assertEqual(suggest.client_facing_text(out).count("1685"), 1)   # аренда НЕ задвоена
+        self.assertEqual(suggest.client_facing_text(out).count("1685"), 1)   # аренда ровно один раз
         self.assertNotIn("815", seen["system"])              # LLM цену доставки не видел
+        self.assertNotIn("1685", seen["system"])             # и цену аренды тоже (вариант Б)
 
     # ---------------------- extract_booking_hints (гео) ----------------------
 
@@ -5221,6 +5239,23 @@ class TestRunLiveSmoke(unittest.TestCase):
         self.assertIn(self.J_LINE, client)                       # строка J посимвольно у клиента
         self.assertIn("Доставка в Раваи — 590 ฿", client)        # доставка = цена ЗОНЫ Раваи (с именем зоны)
 
+    def test_green_paraphrase_with_correct_numbers_now_passes(self):
+        # РЕГРЕСС живого провала 23.07 (развилка #274 шаг 7, смоук failed 2/2): sonnet-5 донёс ВСЕ
+        # цифры ПАРАФРАЗОМ («Даты и локацию учли — Раваи, доставка туда N бат… NMAX 155 | 5 дней:
+        # N бат…»), дедуп #365 склейку пропустил → канонических строк J/доставки у клиента не было.
+        # Вариант Б: канон вставляет КОД ВСЕГДА → тот же парафраз больше НЕ роняет смоук. Форма
+        # текста — живой черновик провала (правило-класс: голден = реальная фраза), числа — мока.
+        def paraphrase(system, user):
+            return ("Даты и локацию учли — Раваи, доставка туда 590 бат, и заберём байк бесплатно, "
+                    "так как доставка оплачивается 🙏\n"
+                    "NMAX 155 | 5 дней: 2400 бат (480/день), депозит 3000 бат.\n"
+                    "Бронируем?")
+        r = self._run(getter=self._getter(), resolve_delivery=self._resolve(), call_llm=paraphrase)
+        self.assertEqual(r["status"], "passed", r["card"])
+        client = suggest.client_facing_text(r["draft"])
+        self.assertIn(self.J_LINE, client)                       # строка J дословно — по построению
+        self.assertIn("Доставка в Раваи — 590 ฿", client)        # каноническая строка доставки
+
     def test_red_violations_flagged_with_diff_card(self):
         # Живой контур «промахнулся» (wait_draft отдаёт черновик с остаточными нарушениями): год,
         # реаск, наличие, конфликт депозита — красные; транспорт J/доставки цел → эти зелёные.
@@ -5793,9 +5828,9 @@ class TestFunnelTailFix(unittest.TestCase):
                    "Подскажите даты — с какого числа и на какой срок?")
 
     def _note_with_quote(self):
-        """Блок ЦЕНА с ЖИВЫМ расчётом Bridge + служебный <<<QUOTE>>> (как строит build_pricing_note)."""
-        note = suggest._wrap_single("ok", "XMAX 300 — за 5 дней 4500 ฿, депозит 5000 ฿")
-        return (note + "\n" + suggest._QUOTE_OPEN +
+        """Блок ЦЕНА с ЖИВЫМ расчётом Bridge + служебный <<<QUOTE>>> — как строит build_pricing_note
+        в маркерном режиме варианта Б #274 (инструкция [QUOTE] БЕЗ цифр; цифры только в блоке)."""
+        return (suggest._quote_marker_note() + "\n" + suggest._QUOTE_OPEN +
                 "\nXMAX 300 (New Gen) — за 5 дней 4500 ฿; депозит 5000 ฿.\n" + suggest._QUOTE_CLOSE)
 
     # ---------- ГОЛДЕН 1: РЕАЛЬНАЯ фраза клиента разбирается в даты ----------
