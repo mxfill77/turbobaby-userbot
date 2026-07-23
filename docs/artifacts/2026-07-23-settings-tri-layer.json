@@ -1,0 +1,127 @@
+{
+  "model": "claude-fable-5",
+  "effortLevel": "xhigh",
+  "alwaysThinkingEnabled": true,
+  "env": {
+    "MAX_THINKING_TOKENS": "31999"
+  },
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Bash",
+      "Bash(*)",
+      "PowerShell",
+      "PowerShell(*)",
+      "Read",
+      "Edit(//d/turbobaby-bot/**)",
+      "Write(//d/turbobaby-bot/**)",
+      "Edit(//c/Users/mxfill1/.claude/projects/**/memory/**)",
+      "Write(//c/Users/mxfill1/.claude/projects/**/memory/**)",
+      "Edit(//c/Users/mxfill1/AppData/Local/Temp/claude/**)",
+      "Write(//c/Users/mxfill1/AppData/Local/Temp/claude/**)"
+    ],
+    "ask": [
+      "Read(//d/turbobaby-bot/.env)",
+      "Read(//d/turbobaby-bot/.env.*)",
+      "Read(//d/turbobaby-bot/*.session)",
+      "Edit(//d/turbobaby-bot/.env)",
+      "Write(//d/turbobaby-bot/.env)",
+      "Edit(//d/turbobaby-bot/.claude/**)",
+      "Write(//d/turbobaby-bot/.claude/**)",
+      "Edit(//c/Users/mxfill1/.claude/settings*.json)",
+      "Write(//c/Users/mxfill1/.claude/settings*.json)",
+      "Edit(//c/Users/mxfill1/.claude.json)",
+      "Write(//c/Users/mxfill1/.claude.json)",
+      "WebFetch",
+      "WebSearch",
+      "Bash(sqlite3 *)",
+      "Bash(sqlite3:*)",
+      "Bash(clasp *)",
+      "Bash(clasp:*)",
+      "Bash(ssh *)",
+      "Bash(scp *)",
+      "Bash(sftp *)",
+      "Bash(curl *)",
+      "Bash(curl:*)",
+      "Bash(wget *)",
+      "Bash(taskkill *)",
+      "Bash(taskkill:*)",
+      "Bash(kill *)",
+      "Bash(pkill *)",
+      "Bash(systemctl kill*)",
+      "Bash(systemctl stop*)",
+      "Bash(rm -r *)",
+      "Bash(rm -rf *)",
+      "Bash(git push --force*)",
+      "Bash(git push * --force*)",
+      "Bash(git push -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(git reset * --hard*)",
+      "Bash(git clean *)",
+      "PowerShell(Remove-Item *)",
+      "PowerShell(Stop-Process *)",
+      "PowerShell(Invoke-WebRequest *)",
+      "PowerShell(Invoke-RestMethod *)",
+      "PowerShell(iwr *)",
+      "PowerShell(irm *)",
+      "PowerShell(taskkill *)",
+      "PowerShell(sqlite3 *)",
+      "PowerShell(clasp *)"
+    ],
+    "deny": [
+      "Bash(rm -rf /)",
+      "Bash(rm -rf /*)",
+      "Bash(chmod -R 777 /)",
+      "Bash(chmod -R 777 /*)",
+      "Bash(dd of=/dev/*)",
+      "Bash(dd * of=/dev/*)",
+      "Bash(*--dangerously-skip-permissions*)",
+      "Bash(*--no-verify*)",
+      "PowerShell(*--dangerously-skip-permissions*)",
+      "PowerShell(*--no-verify*)"
+    ]
+  },
+  "hooks": {
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D:/turbobaby-bot/venv/Scripts/python.exe D:/turbobaby-bot/dispatch_notify.py --hook notification"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D:/turbobaby-bot/venv/Scripts/python.exe D:/turbobaby-bot/dispatch_notify.py --hook stop"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D:/turbobaby-bot/venv/Scripts/python.exe D:/turbobaby-bot/dispatch_notify.py --hook session_end"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell|Edit|Write|Read|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D:/turbobaby-bot/venv/Scripts/python.exe D:/turbobaby-bot/pretool_guard.py"
+          }
+        ]
+      }
+    ]
+  }
+}

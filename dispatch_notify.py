@@ -8,6 +8,10 @@ dispatch_notify.py — fire-and-forget Telegram-уведомление от Disp
 Канал: ЛИЧКА Филиппу (chat_id из pc_agent.ALLOWED_USER_ID) — основной; если DM недоступна
 (бот не может инициировать диалог / 403 / getUpdates-ошибка) → ФОЛБЭК в тему 205
 (pc_agent.HQ_CHAT_ID / HQ_THREAD_ID). Константы берём из pc_agent (единый источник).
+Маршрут send_critical (перевёрнутый: тема Инбокс 1160 → личка-фолбэк) везут ДВА хука:
+--hook session_end (карточка финала сессии) и --hook notification (сессия ЖДЁТ разрешения/
+ввода — пинг с текстом ожидающей команды из transcript-а; раньше такой пинг уезжал в
+Termux-мост на телефоне, моста больше нет).
 
 НЕ НАВРЕДИ: любые сетевые/HTTP-ошибки проглатываются, короткий лог в dispatch_notify.log,
 ВСЕГДА exit 0 — уведомление никогда не роняет вызывающий процесс/сессию. Таймаут на запрос.
@@ -21,6 +25,7 @@ dispatch_notify.py — fire-and-forget Telegram-уведомление от Disp
 """
 
 import os
+import re
 import sys
 import io
 import json
@@ -250,6 +255,48 @@ def _summary_from_transcript(path, limit=SUMMARY_MAX):
     return ""
 
 
+# Маска значений токенов/паролей в тексте, уходящем в Telegram — копия pretool_guard.
+# _RE_SECRET_VALUE (гарда НЕ импортируем: notify обязан оставаться самодостаточным
+# fire-and-forget без лишних зависимостей).
+_RE_SECRET_VALUE = re.compile(
+    r"(?i)([A-Za-z_]*(?:token|api_?key|secret|password|passwd|pwd)[A-Za-z_]*)(\s*[=:]\s*)(\S+)")
+CMD_MAX = 220     # символов команды в пинге ожидания: карточка должна остаться читаемой
+
+
+def _last_tool_command(path, limit=CMD_MAX):
+    """Команда, ждущая разрешения = ПОСЛЕДНИЙ tool_use в transcript-е сессии (тот же живой
+    формат, что у _summary_from_transcript). Сам Notification-хук команду НЕ передаёт (в его
+    payload только «Claude needs your permission to use Bash») — достаём из transcript_path.
+    Сайдчейн не отсеиваем: разрешения может ждать и инструмент субагента. Значения токенов/
+    паролей маскируем, длину режем. → 'Bash: git status' | '' (нет tool_use / файл недоступен)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return ""
+    for raw in reversed(lines):
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        msg = obj.get("message") if isinstance(obj, dict) else None
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                continue
+            ti = block.get("input") or {}
+            detail = " ".join(str(ti.get("command") or ti.get("file_path")
+                                  or ti.get("notebook_path") or "").split())
+            text = str(block.get("name") or "?") + ((": " + detail) if detail else "")
+            text = _RE_SECRET_VALUE.sub(lambda m: m.group(1) + m.group(2) + "***", text)
+            return text[:limit] + ("…" if len(text) > limit else "")
+    return ""
+
+
 def _read_stdin_json():
     # BOM/пробелы срезаем ЯВНО: живой stdin хука приходит чистым, но любой перенаправляющий
     # слой (PowerShell-пайп) ставит ﻿ впереди — strip() его НЕ убирает, и полезная
@@ -263,8 +310,14 @@ def _read_stdin_json():
 
 def _build(kind, hook):
     if kind == "notification":
+        # Пинг «жду разрешения»: текст события + КОМАНДА, которая ждёт (payload хука команду
+        # не содержит — берём последний tool_use из transcript-а). Маршрут — тема 1160 (main).
         ctx = str(hook.get("message") or hook.get("notification") or "").strip()
-        return "🔔 Dispatch ждёт твоего разрешения/ввода" + (f": {ctx}" if ctx else ".")
+        text = "🔔 Dispatch ждёт твоего разрешения/ввода" + (f": {ctx}" if ctx else ".")
+        cmd = _last_tool_command(str(hook.get("transcript_path") or ""))
+        if cmd:
+            text += "\nКоманда: " + cmd
+        return text
     if kind == "stop":
         return "✅ Dispatch: задача завершена."
     if kind == "session_end":
@@ -307,6 +360,12 @@ def main():
                 channel, ok = send_critical(text)
                 _cowork(text)
                 _log.info(f"итог(session_end): channel={channel} ok={ok} | {text[:90]}")
+                sys.exit(0)
+            if kind == "notification":
+                # Сессия ЖДЁТ разрешения → тема Инбокс 1160 ПЕРВЫМ каналом (личка — фолбэк,
+                # маршрут send_critical): раньше пинг уезжал в Termux-мост, моста больше нет.
+                channel, ok = send_critical(text)
+                _log.info(f"итог(notification): channel={channel} ok={ok} | {text[:90]}")
                 sys.exit(0)
         elif args:
             text = " ".join(args).strip()

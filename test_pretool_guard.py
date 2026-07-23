@@ -674,5 +674,146 @@ class TestRoleEndToEnd(unittest.TestCase):
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
 
 
+class TestShkvalClassification(unittest.TestCase):
+    """Задача «шквал подтверждений» (2026-07-23), проверка КЛАССИФИКАЦИЕЙ (не исполнением):
+    зелёная рутина интерактивной сессии обязана проходить БЕЗ промпта (defer), доктринально
+    красное — спрашивать (ask) — в ОБЕИХ ролях. Фразы — дословно из карточки задачи
+    («kill splinter», запись в CRM), а не идеализированные (правило-класс голденов)."""
+
+    ROUTINE = [
+        "wc -l userbot.log",
+        "grep -n ERROR userbot.log",
+        "cat pc_agent.py",
+        "head -50 userbot.log",
+        "tail -20 dispatch_notify.log",
+        "stat suggest.py",
+        "which python",          # не в списке смотрелок → unknown, доктрина смягчает в defer
+        "ls -la",
+        "git status",
+        "git log --oneline -5",
+        "git diff -- suggest.py",
+        "git add suggest.py",
+        "git commit -m 'фикс'",
+        "venv/Scripts/python.exe -m py_compile suggest.py",
+        "venv/Scripts/python.exe -m unittest test_pricing",
+        'venv/Scripts/python.exe cowork_log_append.py "DONE x"',
+        'venv/Scripts/python.exe -c "print(1+1)"',
+    ]
+
+    def test_routine_defers_in_both_roles(self):
+        for c in self.ROUTINE:
+            for headless in (False, True):
+                self.assertEqual(g.decide_for_role(bash(c), headless=headless)[0], "defer",
+                                 (c, headless))
+
+    def test_routine_edit_in_repo_defers(self):
+        self.assertEqual(g.decide_for_role(edit(os.path.join(PROJ, "suggest.py")), False)[0],
+                         "defer")
+
+    def test_env_read_asks(self):
+        for headless in (False, True):
+            self.assertEqual(g.decide_for_role(read(os.path.join(PROJ, ".env")),
+                                               headless=headless)[0], "ask")
+        self.assertEqual(g.decide_for_role(bash("cat .env"), False)[0], "ask")
+
+    def test_kill_splinter_asks(self):
+        for c in ("kill splinter", "taskkill /IM splinter.exe /F", "pkill splinter"):
+            for headless in (False, True):
+                action, kind, _ = g.decide_for_role(bash(c), headless=headless)
+                self.assertEqual((action, kind), ("ask", "kill"), (c, headless))
+
+    def test_crm_write_asks(self):
+        # запись в живые таблицы/CRM: clasp, gspread из python, sqlite-INSERT — всё ask
+        cases = [
+            ("clasp push", "clasp"),
+            ('venv/Scripts/python.exe -c "import gspread; gspread.service_account()"',
+             "live_sheet"),
+            ('sqlite3 bookings.db "INSERT INTO b VALUES (1)"', "sqlite"),
+        ]
+        for c, kind in cases:
+            for headless in (False, True):
+                action, got_kind, _ = g.decide_for_role(bash(c), headless=headless)
+                self.assertEqual((action, got_kind), ("ask", kind), (c, headless))
+
+    def test_git_force_asks(self):
+        for c in ("git push --force origin main", "git reset --hard HEAD~1", "git clean -fd"):
+            for headless in (False, True):
+                self.assertEqual(g.decide_for_role(bash(c), headless=headless)[0], "ask",
+                                 (c, headless))
+
+
+class TestSettingsThreeLayers(unittest.TestCase):
+    """Трёхслойная схема прав (та же задача): allow широкий на рутину, ask — только
+    доктринально красное, deny — абсолютный запрет, bypassPermissions выключен, гард
+    зарегистрирован PreToolUse-хуком (слой сужения поверх широкого allow), Notification-хук
+    на месте. Строго проверяем ПОДГОТОВЛЕННЫЙ файл docs/artifacts/2026-07-23-settings-tri-layer.json
+    (headless не имеет права писать sensitive .claude/settings.json — файл применяет владелец
+    после «да», см. одноимённый .md); боевой файл — мягко: хуки обязаны быть уже сейчас,
+    слои — как только файл применён (появился ключ deny)."""
+
+    STAGED = os.path.join(PROJ, "docs", "artifacts", "2026-07-23-settings-tri-layer.json")
+    LIVE = os.path.join(PROJ, ".claude", "settings.json")
+
+    @staticmethod
+    def _load(path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_staged_allow_is_broad_routine(self):
+        allow = self._load(self.STAGED)["permissions"]["allow"]
+        for rule in ("Bash", "PowerShell", "Read",
+                     "Edit(//d/turbobaby-bot/**)", "Write(//d/turbobaby-bot/**)"):
+            self.assertIn(rule, allow)
+
+    def test_staged_ask_is_doctrinal_only(self):
+        ask = self._load(self.STAGED)["permissions"]["ask"]
+        for rule in ("Read(//d/turbobaby-bot/.env)", "Edit(//d/turbobaby-bot/.env)",
+                     "Bash(sqlite3 *)", "Bash(clasp *)", "Bash(kill *)", "Bash(pkill *)",
+                     "Bash(taskkill *)", "Bash(rm -rf *)", "Bash(git push --force*)",
+                     "Edit(//d/turbobaby-bot/.claude/**)", "PowerShell(Stop-Process *)"):
+            self.assertIn(rule, ask)
+        # рутина в ask НЕ живёт — иначе шквал вернётся
+        for rule in ask:
+            for green in ("git status", "git commit", "git add", "grep", "wc ",
+                          "py_compile", "unittest", "cat "):
+                self.assertNotIn(green, rule, rule)
+
+    def test_staged_deny_absolute(self):
+        deny = self._load(self.STAGED)["permissions"]["deny"]
+        for rule in ("Bash(rm -rf /)", "Bash(chmod -R 777 /)", "Bash(dd of=/dev/*)",
+                     "Bash(*--dangerously-skip-permissions*)", "Bash(*--no-verify*)"):
+            self.assertIn(rule, deny)
+
+    def test_staged_no_bypass_permissions(self):
+        perms = self._load(self.STAGED)["permissions"]
+        self.assertEqual(perms.get("defaultMode"), "acceptEdits")
+        self.assertNotIn("bypassPermissions", json.dumps(perms))
+
+    def test_staged_hooks_guard_and_notification(self):
+        hooks = self._load(self.STAGED)["hooks"]
+        pre = hooks["PreToolUse"][0]
+        for tool in ("Bash", "PowerShell", "Edit", "Write", "Read"):
+            self.assertIn(tool, pre["matcher"])       # PowerShell — основной инструмент ПК
+        self.assertIn("pretool_guard.py", pre["hooks"][0]["command"])
+        self.assertIn("--hook notification", hooks["Notification"][0]["hooks"][0]["command"])
+
+    def test_live_hooks_registered_for_interactive(self):
+        # интерактивная роль получает гард ИЗ ЭТОГО файла (роль в matcher не участвует) —
+        # регистрация обязана быть уже в текущем боевом settings.json
+        hooks = self._load(self.LIVE)["hooks"]
+        self.assertIn("pretool_guard.py", hooks["PreToolUse"][0]["hooks"][0]["command"])
+        self.assertIn("--hook notification", hooks["Notification"][0]["hooks"][0]["command"])
+
+    def test_live_three_layers_once_applied(self):
+        perms = self._load(self.LIVE).get("permissions") or {}
+        if "deny" not in perms:
+            self.skipTest("итоговый settings ещё не применён владельцем (ждёт «да»)")
+        staged = self._load(self.STAGED)
+        live = self._load(self.LIVE)
+        self.assertEqual(live["permissions"]["deny"], staged["permissions"]["deny"])
+        self.assertIn("PowerShell", live["hooks"]["PreToolUse"][0]["matcher"])
+        self.assertNotEqual(perms.get("defaultMode"), "bypassPermissions")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

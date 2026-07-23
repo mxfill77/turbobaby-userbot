@@ -8,8 +8,11 @@ HQ-форума (1160), а личка Филиппа — ФОЛБЭК при н�
 не читать .env (send_critical при пустом токене молча выходит).
 """
 
+import io
 import json
 import os
+import sys
+import tempfile
 import unittest
 
 import dispatch_notify as dn
@@ -198,6 +201,92 @@ class TestCoworkDetached(unittest.TestCase):
         def boom(*a, **k):
             raise OSError("нет python")
         self.assertFalse(dn._cowork("DONE тест", spawner=boom))   # НЕ роняем сессию
+
+
+class TestNotificationPing(unittest.TestCase):
+    """Пинг «сессия ждёт разрешения» (задача «шквал подтверждений», 2026-07-23): маршрут —
+    тема Инбокс 1160 первым каналом (раньше DM-first; исторический Termux-мост умер), в тексте —
+    ОЖИДАЮЩАЯ КОМАНДА. Payload Notification-хука команду не содержит («Claude needs your
+    permission to use Bash») — команду достаём последним tool_use из ЖИВОГО transcript-а
+    (та же фикстура session_end_transcript.live.jsonl: её хвост главной ветки — Bash git status,
+    после него attachment-строка, которую парсер обязан перешагнуть)."""
+
+    def setUp(self):
+        self._save = (dn._api, dn.TOKEN)
+        self.calls = []
+        dn.TOKEN = "test-token"
+
+    def tearDown(self):
+        (dn._api, dn.TOKEN) = self._save
+
+    def test_command_extracted_from_live_fixture(self):
+        self.assertEqual(dn._last_tool_command(FIX_TRANSCRIPT), "Bash: git status")
+
+    def test_missing_transcript_gives_empty(self):
+        self.assertEqual(dn._last_tool_command(FIX_TRANSCRIPT + ".нет"), "")
+
+    def test_build_has_message_and_command(self):
+        text = dn._build("notification", {
+            "message": "Claude needs your permission to use Bash",
+            "transcript_path": FIX_TRANSCRIPT,
+        })
+        self.assertIn("ждёт твоего разрешения", text)
+        self.assertIn("Claude needs your permission to use Bash", text)
+        self.assertIn("Команда: Bash: git status", text)
+
+    def test_build_without_transcript_has_no_command_line(self):
+        text = dn._build("notification", {"message": "ввод"})
+        self.assertIn("ждёт твоего разрешения", text)
+        self.assertNotIn("Команда:", text)
+
+    def test_secret_values_masked_in_command(self):
+        line = {"isSidechain": False, "type": "assistant",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "name": "Bash",
+                     "input": {"command": "BRIDGE_TOKEN=abc123 venv/Scripts/python.exe x.py"}}]}}
+        fd, p = tempfile.mkstemp(suffix=".jsonl")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(line) + "\n")
+            cmd = dn._last_tool_command(p)
+        finally:
+            os.remove(p)
+        self.assertIn("BRIDGE_TOKEN=***", cmd)
+        self.assertNotIn("abc123", cmd)
+
+    def test_long_command_truncated(self):
+        line = {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "x" * 999}}]}}
+        fd, p = tempfile.mkstemp(suffix=".jsonl")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(line) + "\n")
+            cmd = dn._last_tool_command(p)
+        finally:
+            os.remove(p)
+        self.assertTrue(cmd.endswith("…"))
+        self.assertLessEqual(len(cmd), dn.CMD_MAX + 1)
+
+    def test_main_routes_to_inbox_1160_first(self):
+        # проводка main(): --hook notification → send_critical (payload с темой 1160), не send()
+        def api(method, payload):
+            self.calls.append(payload)
+            return True, {"ok": True}
+        dn._api = api
+        saved_argv, saved_stdin = sys.argv, sys.stdin
+        try:
+            sys.argv = ["dispatch_notify.py", "--hook", "notification"]
+            sys.stdin = io.StringIO(json.dumps({
+                "message": "Claude needs your permission to use Bash",
+                "transcript_path": FIX_TRANSCRIPT}))
+            with self.assertRaises(SystemExit):
+                dn.main()
+        finally:
+            sys.argv, sys.stdin = saved_argv, saved_stdin
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0]["chat_id"], dn.HQ_CHAT_ID)
+        self.assertEqual(self.calls[0]["message_thread_id"], dn.INBOX_THREAD_ID)   # 1160
+        self.assertIn("Команда: Bash: git status", self.calls[0]["text"])
 
 
 class TestStdinBom(unittest.TestCase):
