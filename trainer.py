@@ -26,6 +26,9 @@ trainer.py — ГРУППА-ТРЕНАЖЁР клиентского бота (к
 import os
 import re
 import json
+import logging
+
+log = logging.getLogger("trainer")     # хендлеры вешает процесс-хозяин (userbot/moderbot)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -440,7 +443,8 @@ def apply_lessons(remarks, append_rule=None, classify=None, mark=None, list_rule
                 "card": "⚠️ Ничего не отмечено — тапни номера гипотез и нажми «✔ Применить»."}
     accepted, duplicates, code, errors = [], [], [], []
     for r in items:
-        dec = apply_lesson(r, append_rule=append_rule, classify=classify, mark=mark)
+        dec = apply_lesson(r, append_rule=append_rule, classify=classify, mark=mark,
+                           list_rules=list_rules)
         if dec.get("axis") == "code":
             code.append(r)
         elif dec.get("status") == "added":
@@ -594,12 +598,23 @@ def classify_lesson(remark):
     return "code" if t == "code" else "behavior"
 
 
-def apply_lesson(remark, append_rule=None, classify=None, mark=None):
-    """Провести урок из тренажёра через существующий канал «урок:» (2-я ось):
-      • behavior → append_playbook_rule + пометка источника «тренажёр»; применится со следующего
-        черновика (playbook подмешивается в system-prompt) → dict(axis='behavior', status, card);
-      • code → карточка владельцу «нужен код-фикс» (в playbook НЕ пишем) → dict(axis='code', card).
-    append_rule/classify/mark инъектируются в тестах; иначе боевые suggest/lesson_router/сайдкар."""
+def _rule_number(rule, list_rules=None):
+    """Номер правила в книге ПОСЛЕ записи (та же нумерация, что /rules и «отмени урок N») или
+    None. FAIL-SAFE: сбой чтения книги не роняет урок — просто карточка без номера."""
+    try:
+        if list_rules is None:
+            import suggest
+            list_rules = suggest.list_playbook_rules
+        for row in list_rules() or []:
+            if _norm_rule(row.get("rule")) == _norm_rule(rule):
+                return row.get("n")
+    except Exception:
+        return None
+    return None
+
+
+def _apply_lesson(remark, append_rule=None, classify=None, mark=None, list_rules=None):
+    """Ядро apply_lesson (может бросить — снаружи fail-safe обёртка)."""
     remark = " ".join(str(remark or "").split()).strip()
     if not remark:
         return {"axis": "behavior", "status": "error",
@@ -613,18 +628,40 @@ def apply_lesson(remark, append_rule=None, classify=None, mark=None):
         import suggest
         append_rule = suggest.append_playbook_rule
     status = append_rule(remark)
+    num = None
     if status in ("added", "duplicate"):
         (mark or mark_source)(remark)
-        card = (f"✅ Принято: {remark} → записано в книгу правил (источник «{TRAINER_SOURCE}»), "
+        # номер — как у кнопочного пути (apply_lessons): текстовый «урок: …» равноправен,
+        # владелец должен видеть #N сразу, чтобы «отмени урок N» работал без похода в /rules
+        num = _rule_number(remark, list_rules)
+        tag = f"урок #{num}: " if num else ""
+        card = (f"✅ Принято: {tag}{remark} → записано в книгу правил (источник «{TRAINER_SOURCE}»), "
                 "применится со следующего ответа.")
     else:
         card = f"⚠️ Не удалось записать правило (status={status})."
-    return {"axis": "behavior", "status": status, "card": card}
+    return {"axis": "behavior", "status": status, "card": card, "n": num}
 
 
-def cancel_lesson(n, remove_rule=None, list_rules=None, unmark=None):
-    """«отмени урок N» — откат правила N (нумерация как в /rules). remove_rule/list_rules/unmark
-    инъектируются; иначе боевой suggest + сайдкар. Возвращает dict(status, card)."""
+def apply_lesson(remark, append_rule=None, classify=None, mark=None, list_rules=None):
+    """Провести урок из тренажёра через существующий канал «урок:» (2-я ось):
+      • behavior → append_playbook_rule + пометка источника «тренажёр»; применится со следующего
+        черновика (playbook подмешивается в system-prompt) → dict(axis='behavior', status, card,
+        n=<номер правила в книге — тот же, что у кнопочного пути и «отмени урок N»>);
+      • code → карточка владельцу «нужен код-фикс» (в playbook НЕ пишем) → dict(axis='code', card).
+    append_rule/classify/mark/list_rules инъектируются в тестах; иначе боевые suggest/lesson_router.
+    НИКОГДА не бросает (обработчик группы не имеет права упасть на уроке): исключение внутри →
+    status='error' + карточка-ошибка; след — в лог процесса, а карточку в TRN пишет вызывающий."""
+    try:
+        return _apply_lesson(remark, append_rule, classify, mark, list_rules)
+    except Exception as e:
+        log.warning("apply_lesson упал: %s: %s", type(e).__name__, e, exc_info=True)
+        return {"axis": "behavior", "status": "error",
+                "card": f"⚠️ Урок не применён — внутренняя ошибка ({type(e).__name__}), "
+                        "см. лог процесса. Правило можно повторить."}
+
+
+def _cancel_lesson(n, remove_rule=None, list_rules=None, unmark=None):
+    """Ядро cancel_lesson (может бросить — снаружи fail-safe обёртка)."""
     if remove_rule is None or list_rules is None:
         import suggest
         remove_rule = remove_rule or suggest.remove_playbook_rule
@@ -643,3 +680,17 @@ def cancel_lesson(n, remove_rule=None, list_rules=None, unmark=None):
     else:
         card = f"⚠️ Не удалось отменить урок #{n} (status={status})."
     return {"status": status, "card": card}
+
+
+def cancel_lesson(n, remove_rule=None, list_rules=None, unmark=None):
+    """«отмени урок N» — откат правила N (нумерация как в /rules). remove_rule/list_rules/unmark
+    инъектируются; иначе боевой suggest + сайдкар. Возвращает dict(status, card).
+    НИКОГДА не бросает: исключение внутри → status='error' + карточка-ошибка (след — в лог
+    процесса; карточку в TRN пишет вызывающий)."""
+    try:
+        return _cancel_lesson(n, remove_rule, list_rules, unmark)
+    except Exception as e:
+        log.warning("cancel_lesson(#%s) упал: %s: %s", n, type(e).__name__, e, exc_info=True)
+        return {"status": "error",
+                "card": f"⚠️ Урок #{n} не отменён — внутренняя ошибка ({type(e).__name__}), "
+                        "см. лог процесса. Команду можно повторить."}

@@ -315,6 +315,9 @@ async def _trainer_debounced_reply(event, chat_id, my_seq):
         except Exception as e:
             log.warning(f"{_now()} | ТРЕНАЖЁР: сбой генерации ответа: {e}")
             await _trainer_send(event.client, chat_id, "⚠️ Не удалось сгенерировать ответ (см. userbot.log).")
+            # ветка «упало» обязана быть видна в TRN-логе (иначе тишина неотличима от «не жали»)
+            await _trn_log(trainer_log.KIND_BOT,
+                           f"⚠️ сбой генерации ответа: {type(e).__name__}: {e}")
             return
         if trainer.get_seq() != my_seq:   # сброс/новый турн ВО ВРЕМЯ генерации → устаревший ответ не постим
             return
@@ -337,6 +340,8 @@ async def _trainer_crm(event):
     transcript = trainer.get_transcript()
     if not transcript.strip():
         await _trainer_send(client, chat_id, "⚠️ Диалог ТЕСТ-клиента пуст — нечего заводить в CRM.")
+        await _trn_log(trainer_log.KIND_BTN,
+                       "⚠️ До CRM (текст-команда): диалог пуст — карточка не собрана")
         return
     try:
         meta = {"transcript": transcript, "client_ref": "ТЕСТ", "client_name": "ТЕСТ"}
@@ -345,6 +350,8 @@ async def _trainer_crm(event):
     except Exception as e:
         log.warning(f"{_now()} | ТРЕНАЖЁР: сбой моста 2.1: {e}")
         await _trainer_send(client, chat_id, "⚠️ Не удалось собрать заявку (см. userbot.log).")
+        await _trn_log(trainer_log.KIND_BTN,
+                       f"⚠️ До CRM (текст-команда): сбой моста 2.1 — {type(e).__name__}: {e}")
         return
     body = (intake_text or card or "⚠️ Из диалога заявку собрать не удалось.").strip()
     await _trainer_send(client, chat_id, trainer.crm_card(body))
@@ -401,6 +408,8 @@ async def on_trainer_group(event):
     if kind is None and text.strip() and trainer.pending_lesson() is not None:
         if not suggest.is_approver(username):
             await _trainer_send(event.client, chat_id, "⛔ Учить бота может только approver.")
+            await _trn_log(trainer_log.KIND_LESSON,
+                           f"⛔ отказ: @{username or '?'} не approver — свободный текст правила не принят")
             return
         if trainer.take_pending_lesson(username):
             dec = await asyncio.to_thread(trainer.apply_lesson, text.strip())
@@ -417,6 +426,8 @@ async def on_trainer_group(event):
     if kind == "lesson":
         if not suggest.is_approver(username):
             await _trainer_send(event.client, chat_id, "⛔ Учить бота может только approver.")
+            await _trn_log(trainer_log.KIND_LESSON,
+                           f"⛔ отказ: @{username or '?'} не approver — «урок: …» не принят")
             return
         dec = await asyncio.to_thread(trainer.apply_lesson, payload)
         await _trainer_send(event.client, chat_id, dec["card"])
@@ -425,6 +436,8 @@ async def on_trainer_group(event):
     if kind == "cancel":
         if not suggest.is_approver(username):
             await _trainer_send(event.client, chat_id, "⛔ Откатывать правила может только approver.")
+            await _trn_log(trainer_log.KIND_LESSON,
+                           f"⛔ отказ: @{username or '?'} не approver — «отмени урок {payload}» не выполнена")
             return
         dec = trainer.cancel_lesson(payload)
         await _trainer_send(event.client, chat_id, dec["card"])

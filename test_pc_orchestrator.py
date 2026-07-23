@@ -5507,5 +5507,182 @@ class TestGateSpawnsNoClaude(unittest.TestCase):
         self.assertTrue(ok)
 
 
+class TestLessonCommitRetry(Base):
+    """Пакет «полнота лога» п.6: провал _commit_lesson НЕ оставляет docs/revizor_checklist.md
+    грязным. Раньше сорванный git commit бросал файл модифицированным навсегда → git_ff_pull_tick
+    видел tracked-грязь и пропускал pull ВЕЧНО (+NOTE-спам). Теперь: добавленные строки — в спул,
+    пути — откат к HEAD, владельцу — карточка, докоммит — следующим циклом демона."""
+
+    REL = os.path.join("docs", "revizor_checklist.md")
+    BASE = "# чек-лист ревизора\n- старый класс: цена без брони"
+    NEW_LINE = "- новый класс: мок обязан копировать живой формат"
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.tmp, "docs"), exist_ok=True)
+        self._old_repo = o.REPO
+        o.REPO = self.tmp                                  # файлы урока живут в песочнице
+        self.addCleanup(lambda: setattr(o, "REPO", self._old_repo))
+        self.retry = os.path.join(self.tmp, "lesson_retry.json")
+        self.cards = []                                    # карточки владельцу (вместо _notify_critical)
+        self._write(self.BASE + "\n" + self.NEW_LINE + "\n")   # урок дописал строку → файл грязный
+
+    def _write(self, text):
+        with open(os.path.join(self.tmp, self.REL), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _read(self):
+        with open(os.path.join(self.tmp, self.REL), encoding="utf-8") as f:
+            return f.read()
+
+    def _git(self, commit_rc=1, commit_err="fatal: Unable to create index.lock: File exists",
+             trace=None):
+        """Мини-git по живому контракту _git_call: (rc, stdout, stderr); checkout РЕАЛЬНО
+        возвращает файл к HEAD (иначе тест «дерево чистое» ничего бы не доказывал)."""
+        tr = trace if trace is not None else []
+
+        def call(args, timeout=90):
+            tr.append(tuple(args[:2]))
+            if args[0] == "add":
+                return (0, "", "")
+            if args[0] == "diff":
+                return (0, self.REL, "")
+            if args[0] == "commit":
+                return (commit_rc, "", commit_err if commit_rc else "")
+            if args[0] == "show":
+                return (0, self.BASE, "")
+            if args[0] == "checkout":
+                self._write(self.BASE + "\n")
+                return (0, "", "")
+            if args[0] == "rev-parse":
+                return (0, "abc1234", "")
+            return (0, "", "")
+        return call, tr
+
+    def test_commit_failure_rolls_back_spools_and_cards(self):
+        """ЮНИТ НА ПРОВАЛ (требование п.6): сорванный коммит → откат к HEAD (дерево чистое,
+        авто-фетч жив) + добавленные строки в спуле + ровно одна карточка владельцу."""
+        call, tr = self._git()
+        res = o._commit_lesson(7, "НАДЗОР", "мок = живой формат", [self.REL], call_fn=call,
+                               ack_where="чек-лист ревизора", card_msg_id="555",
+                               retry_path=self.retry, notify=self.cards.append)
+        self.assertIsNone(res)                             # коммита не было — ack не уйдёт (гейт шага 4)
+        self.assertIn(("checkout", "HEAD"), tr)            # откат к HEAD выполнен
+        self.assertEqual(self._read(), self.BASE + "\n")   # дерево ЧИСТОЕ — вечного блокера нет
+        with open(self.retry, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["added"][self.REL], [self.NEW_LINE])   # строка урока не потеряна
+        self.assertEqual(data["ack_where"], "чек-лист ревизора")     # материал для запоздалого ack
+        self.assertEqual(data["card_msg_id"], "555")
+        self.assertEqual(len(self.cards), 1)               # карточка владельцу — одна, не спам
+        self.assertIn("не прошёл", self.cards[0])
+        self.assertIn("Авто-фетч не заблокирован", self.cards[0])
+        # грязи после отката нет → git_ff_pull_tick больше не скажет «грязно — пропуск»
+
+    def test_commit_success_path_untouched(self):
+        call, tr = self._git(commit_rc=0)
+        res = o._commit_lesson(7, "НАДЗОР", "тема", [self.REL], call_fn=call,
+                               retry_path=self.retry, notify=self.cards.append)
+        self.assertEqual(res, "abc1234")                   # штатный путь как был
+        self.assertFalse(os.path.exists(self.retry))       # спул не заводился
+        self.assertEqual(self.cards, [])
+        self.assertNotIn(("checkout", "HEAD"), tr)         # и откатов не было
+
+    def test_no_real_diff_means_no_spool_no_card(self):
+        def call(args, timeout=90):
+            if args[0] == "add":
+                return (0, "", "")
+            if args[0] == "diff":
+                return (0, "", "")                         # индекс пуст (дедуп) — коммитить нечего
+            raise AssertionError(f"лишний git-вызов: {args}")
+        res = o._commit_lesson(7, "СТИЛЬ", "т", [self.REL], call_fn=call,
+                               retry_path=self.retry, notify=self.cards.append)
+        self.assertIsNone(res)
+        self.assertFalse(os.path.exists(self.retry))
+        self.assertEqual(self.cards, [])
+
+    def test_retry_commits_next_cycle_and_acks_late(self):
+        """Следующий цикл: строки из спула накладываются на актуальный файл, коммит проходит,
+        спул снят, запоздалое подтверждение учителю уходит ТОЛЬКО теперь (после коммита)."""
+        call, _ = self._git()                              # цикл 1: провал → спул + откат
+        o._commit_lesson(7, "НАДЗОР", "мок = живой формат", [self.REL], call_fn=call,
+                         ack_where="чек-лист ревизора", card_msg_id="42",
+                         retry_path=self.retry, notify=self.cards.append)
+        acks = []
+        save_ack = o._deliver_lesson_ack
+        save_verify = o.lesson_router.verify_commit
+        o._deliver_lesson_ack = lambda mid, text: acks.append((mid, text))
+        o.lesson_router.verify_commit = lambda ref: True   # хеш фейкового git «существует»
+        self.addCleanup(lambda: setattr(o, "_deliver_lesson_ack", save_ack))
+        self.addCleanup(lambda: setattr(o.lesson_router, "verify_commit", save_verify))
+        call2, tr2 = self._git(commit_rc=0)                # цикл 2: git ожил
+        note = o.lesson_commit_retry_tick(call_fn=call2, path=self.retry)
+        self.assertIn("повторный коммит abc1234", note)
+        self.assertIn(self.NEW_LINE, self._read())         # строка урока вернулась в файл
+        self.assertIn(("commit", "-m"), tr2)
+        self.assertFalse(os.path.exists(self.retry))       # спул снят
+        self.assertEqual(acks[0][0], "42")                 # подтверждение — на ту же карточку
+        self.assertIn("Урок принят", acks[0][1])
+
+    def test_retry_when_lines_already_in_head_clears_spool(self):
+        """pull/руки уже принесли строки в HEAD → повторять нечего: спул снят БЕЗ коммита."""
+        o._lesson_retry_save({"tid": 7, "route": "НАДЗОР", "msg": "m", "paths": [self.REL],
+                              "added": {self.REL: [self.NEW_LINE]}, "attempts": 0}, self.retry)
+        self._write(self.BASE + "\n" + self.NEW_LINE + "\n")   # файл уже содержит строку
+
+        def call(args, timeout=90):
+            if args[0] == "add":
+                return (0, "", "")
+            if args[0] == "diff":
+                return (0, "", "")                         # против HEAD пусто
+            raise AssertionError(f"коммит не должен вызываться: {args}")
+        note = o.lesson_commit_retry_tick(call_fn=call, path=self.retry)
+        self.assertIn("уже в HEAD", note)
+        self.assertFalse(os.path.exists(self.retry))
+
+    def test_retry_failure_rolls_back_again_and_counts(self):
+        """git всё ещё лежит: снова откат (дерево чистое), спул цел, счётчик попыток растёт."""
+        call, _ = self._git()
+        o._commit_lesson(7, "Н", "т", [self.REL], call_fn=call, retry_path=self.retry,
+                         notify=self.cards.append)
+        call2, tr2 = self._git(commit_rc=1)
+        self.assertIn("попытка 1", o.lesson_commit_retry_tick(call_fn=call2, path=self.retry))
+        self.assertIn(("checkout", "HEAD"), tr2)           # снова откат — авто-фетч жив
+        self.assertEqual(self._read(), self.BASE + "\n")
+        with open(self.retry, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["attempts"], 1)
+        self.assertIn("попытка 2", o.lesson_commit_retry_tick(call_fn=call2, path=self.retry))
+        self.assertEqual(len(self.cards), 1)               # карточка ушла ОДИН раз, ретраи не спамят
+
+    def test_maybe_retry_throttles_and_needs_spool(self):
+        save = (o.LESSON_RETRY_FILE, o._lesson_retry_last)
+        o.LESSON_RETRY_FILE, o._lesson_retry_last = self.retry, 0.0
+        save_tick = o.lesson_commit_retry_tick
+        called = {"n": 0}
+        o.lesson_commit_retry_tick = lambda *a, **k: called.__setitem__("n", called["n"] + 1) or "тик"
+        try:
+            self.assertIsNone(o.maybe_lesson_commit_retry(now=1000.0))   # спула нет → даже не тикаем
+            with open(self.retry, "w", encoding="utf-8") as f:
+                json.dump({"added": {self.REL: ["x"]}}, f)
+            self.assertEqual(o.maybe_lesson_commit_retry(now=2000.0), "тик")
+            self.assertIsNone(o.maybe_lesson_commit_retry(now=2000.0 + o.LESSON_RETRY_SEC - 1))
+            self.assertEqual(o.maybe_lesson_commit_retry(now=2000.0 + o.LESSON_RETRY_SEC + 1), "тик")
+            self.assertEqual(called["n"], 2)
+        finally:
+            o.lesson_commit_retry_tick = save_tick
+            o.LESSON_RETRY_FILE, o._lesson_retry_last = save
+
+    def test_main_loop_wired(self):
+        """Проводка: повтор коммита урока реально стоит в главном цикле демона (до авто-фетча —
+        успешный докоммит делает дерево чистым к моменту pull-проверки)."""
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "pc_orchestrator.py"), encoding="utf-8") as f:
+            src = f.read()
+        body = src.split("def _main_loop", 1)[1]
+        self.assertIn("maybe_lesson_commit_retry()", body)
+        self.assertLess(body.index("maybe_lesson_commit_retry()"), body.index("maybe_git_ff_pull()"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

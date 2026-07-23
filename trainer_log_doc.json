@@ -1,5 +1,5 @@
 {
   "_note": "file id Brain-дока KB_trainer_log и его архива. Док создан Штабом 23.07.2026 (канал Bridge создавать доки НЕ УМЕЕТ: имена резолвятся по фиксированному манифесту list_brain, write_doc name=KB_trainer_log отвечает unknown_name — зато и read_doc, и write_doc принимают id=). Читается НА КАЖДОМ вызове (кэша нет), поэтому смена id рестарта ботов НЕ требует. Приоритет: переменные окружения TRAINER_LOG_DOC_ID / TRAINER_LOG_ARCHIVE_DOC_ID выше этого файла. Секретов тут нет — file id зарегистрирован открытой строкой в KB_MASTER.",
   "doc_id": "13kp-54bzN2Xua8R5VN4EaXR7IElTKg4O",
-  "archive_id": ""
+  "archive_id": "1lOco1SI58UNT0a4-TBuU3yYeZzbPkWUP"
 }

@@ -30,6 +30,12 @@ file id. Пока id не задан — модуль честно НЕ ПИШЕ
 (archive_id). Архива нет → срез НЕ делаем и пишем предупреждение в лог процесса: молча терять
 историю нельзя (лучше распухший док, чем тихо съеденный хвост).
 
+ДОСТАВКА (пакет «полнота лога»): каждая операция канала ретраится с экспоненциальным бэкоффом
+(TRAINER_LOG_RETRIES × TRAINER_LOG_BACKOFF·2^k). Так и не доставили → строка НЕ теряется: уходит
+в ЛОКАЛЬНЫЙ СПУЛ (trainer_log.spool, по строке на событие) и дозаписывается в док при СЛЕДУЮЩЕМ
+успешном append (свежее сверху, спул — под ним, хронология сохраняется). Статус доставки каждой
+записи логируется в лог процесса (ok / spooled / error), чтобы «не дошло» было видно, а не молчало.
+
 FAIL-SAFE ВЕЗДЕ. Любая ошибка сети/Bridge/парса → запись не удалась, исключение НЕ летит наружу,
 тренажёр не ломается. Лог мозга не имеет права уронить клиентский контур.
 """
@@ -46,6 +52,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 SIDECAR = os.path.join(BASE_DIR, "trainer_log_doc.json")
 LOCK_FILE = os.path.join(BASE_DIR, "trainer_log.lock")
+SPOOL_FILE = os.path.join(BASE_DIR, "trainer_log.spool")   # недоставленные TRN-строки (gitignored)
 
 DOC_NAME = "KB_trainer_log"            # имя дока в мозге (для KB_MASTER и когда он попадёт в манифест)
 KIND_CLIENT, KIND_BOT, KIND_BTN, KIND_LESSON = "client", "bot", "btn", "lesson"
@@ -66,6 +73,11 @@ MAX_CHARS = _int_env("TRAINER_LOG_MAX_CHARS", 1000000)
 # Сколько символов оставляем в живом доке после среза (свежий хвост), остальное — в архив.
 KEEP_CHARS = _int_env("TRAINER_LOG_KEEP_CHARS", 700000)
 HTTP_TIMEOUT = _int_env("TRAINER_LOG_TIMEOUT", 30)
+# ДОСТАВКА: попыток на КАЖДУЮ операцию канала (1 = без ретраев) и база экспоненциального бэкоффа
+# (пауза перед k-м повтором = BACKOFF_SEC · 2^(k-1)). Вызовы живут в фоновом потоке
+# (asyncio.to_thread из _trn_log), поэтому паузы диалог не задерживают.
+RETRIES = _int_env("TRAINER_LOG_RETRIES", 3)
+BACKOFF_SEC = _int_env("TRAINER_LOG_BACKOFF", 2)
 
 # ЗАГОЛОВОК-ЛЕГЕНДА дока (первая строка, положена Штабом при создании: «TRN LOG v1 | …»).
 # Новые события ложатся СВЕРХУ, поэтому без пиннинга легенда уехала бы вниз, а при ротации —
@@ -78,9 +90,10 @@ HEADER_MARK = "TRN LOG"
 # на ОДНОМ ПК, поэтому критическую секцию закрываем файловым локом (тот же идиом O_CREAT|O_EXCL,
 # что userbot.lock/moderation_bot.lock). Лок протух (владелец умер посреди HTTP) → забираем.
 # Не дождались за LOCK_WAIT_SEC → пишем ВСЁ РАВНО с предупреждением: потерять событие хуже,
-# чем рискнуть редкой гонкой.
-LOCK_STALE_SEC = _int_env("TRAINER_LOG_LOCK_STALE", 4 * HTTP_TIMEOUT + 30)
-LOCK_WAIT_SEC = _int_env("TRAINER_LOG_LOCK_WAIT", 2 * HTTP_TIMEOUT + 10)
+# чем рискнуть редкой гонкой. Пороги масштабируются на RETRIES: держатель лока теперь законно
+# может пережидать ретраи с бэкоффом (иначе живого владельца посчитали бы протухшим).
+LOCK_STALE_SEC = _int_env("TRAINER_LOG_LOCK_STALE", 4 * HTTP_TIMEOUT * RETRIES + 30)
+LOCK_WAIT_SEC = _int_env("TRAINER_LOG_LOCK_WAIT", 2 * HTTP_TIMEOUT * RETRIES + 10)
 
 import logging
 log = logging.getLogger("trainer_log")   # хендлеры вешает процесс-хозяин (userbot/moderbot)
@@ -221,6 +234,62 @@ def write_doc(did, text, env=None, post=None):
     return True
 
 
+# ------------------------------- ретрай с бэкоффом ---------------------------
+
+def _retry(op, failed, what, retries=None, sleep=None):
+    """Повторить операцию канала до retries раз с экспоненциальным бэкоффом. op() — операция,
+    failed(res) — предикат «не удалось». → последний результат (удачный или нет). Никогда не
+    бросает сверх того, что глотают сами read_doc/write_doc; sleep инъектируется в тестах."""
+    retries = max(1, RETRIES if retries is None else retries)
+    sleep = time.sleep if sleep is None else sleep
+    res = op()
+    for attempt in range(1, retries):
+        if not failed(res):
+            return res
+        delay = max(0, BACKOFF_SEC) * (2 ** (attempt - 1))
+        log.info("trainer_log: %s не удался (попытка %s/%s) — повтор через %sс",
+                 what, attempt, retries, delay)
+        try:
+            sleep(delay)
+        except Exception:
+            pass
+        res = op()
+    return res
+
+
+# ------------------------------- локальный спул ------------------------------
+# Недоставленные TRN-строки НЕ теряем: складываем в локальный файл (по строке на событие,
+# хронологически — старые сверху) и дозаписываем в док при СЛЕДУЮЩЕМ успешном append.
+# Спул трогаем только ПОД doc_lock (как и сам док) — второй процесс не съест чужие строки.
+
+def _spool_read(path=None):
+    """Недоставленные строки из спула (хронологический порядок) → list[str]. Нет/битый → []."""
+    try:
+        with open(path or SPOOL_FILE, encoding="utf-8") as f:
+            return [ln.rstrip("\n") for ln in f if ln.strip()]
+    except OSError:
+        return []
+
+
+def _spool_add(line, path=None):
+    """Дописать недоставленную строку в спул. → True (сохранили) | False (и спул не удался)."""
+    try:
+        with open(path or SPOOL_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        return True
+    except OSError as e:
+        log.warning("trainer_log: спул недоступен (%s) — строка ПОТЕРЯНА: %s",
+                    type(e).__name__, line[:160])
+        return False
+
+
+def _spool_clear(path=None):
+    try:
+        os.remove(path or SPOOL_FILE)
+    except OSError:
+        pass
+
+
 # ------------------------------- лок записи ----------------------------------
 
 def _lock_age(path):
@@ -309,15 +378,26 @@ def rotate(text, max_chars=None, keep_chars=None):
 
 # ------------------------------- публичная запись ----------------------------
 
+def _to_spool(line, spool_path, why):
+    """Недоставленную строку — в спул (статус доставки логируем ЧЕСТНО). → dict как у append."""
+    if _spool_add(line, spool_path):
+        log.warning("trainer_log: доставка не удалась (%s) — строка в спуле, дозапишу при "
+                    "следующем успехе: %s", why, line[:160])
+        return {"status": "spooled", "line": line}
+    return {"status": "error", "line": line}
+
+
 def append(n, kind, text, now=None, env=None, get=None, post=None, sidecar_path=None,
-           lock_path=None):
+           lock_path=None, spool_path=None, retries=None, sleep=None):
     """Дописать ОДНО событие тренажёра в KB_trainer_log. → dict(status, line):
-      status='ok'      — строка легла в док;
+      status='ok'      — строка легла в док (вместе с ней дозаписан накопленный спул, если был);
       status='no_doc'  — file id ещё не задан (Штаб не завёл док) — НЕ ошибка, просто не пишем;
-      status='error'   — канал недоступен/Bridge отказал (тренажёр при этом жив).
+      status='spooled' — канал не ответил после ретраев; строка СОХРАНЕНА в локальный спул и
+                         дозапишется при следующем успешном append (событие НЕ потеряно);
+      status='error'   — не удалась даже запись в спул (тренажёр при этом жив).
     Новое событие идёт ПЕРВЫМ (свежее сверху) — тем же порядком, что cowork_log, но ПОД
     заголовком-легендой дока, если он есть. read-modify-write закрыт файловым локом (два
-    процесса пишут в один док)."""
+    процесса пишут в один док); спул трогаем под тем же локом. retries/sleep — тестовые инъекции."""
     line = format_line(n, kind, text, now)
     # Тестовый прогон на БОЕВОМ транспорте — в живой док мозга не пишем НИКОГДА (см. in_test_context).
     if get is None and post is None and in_test_context():
@@ -331,17 +411,22 @@ def append(n, kind, text, now=None, env=None, get=None, post=None, sidecar_path=
     # Читаем и пишем ПОД ЛОКОМ: между read и write не должен влезть второй процесс (иначе его
     # строка исчезнет вместе с нашей перезаписью целого дока).
     with doc_lock(lock_path):
-        old = read_doc(did, env, get)
+        old = _retry(lambda: read_doc(did, env, get), lambda r: r is None, "read_doc",
+                     retries, sleep)
         if old is None:
-            return {"status": "error", "line": line}
+            return _to_spool(line, spool_path, "канал недоступен на чтении")
+        pending = _spool_read(spool_path)          # недоставленное ранее — дозаписываем СЕЙЧАС
         head, body = split_header(old)             # легенда дока остаётся ПЕРВОЙ строкой
-        merged = (line + "\n" + body) if body.strip() else line
+        stack = [line] + list(reversed(pending))   # свежее сверху; спул под новой строкой
+        merged = "\n".join(stack + ([body] if body.strip() else []))
         fresh, spill = rotate(merged)
         if spill:
             aid = archive_id(sidecar_path)
             if aid:
-                prev = read_doc(aid, env, get) or ""
-                if write_doc(aid, (spill + "\n" + prev).strip(), env, post):
+                prev = _retry(lambda: read_doc(aid, env, get), lambda r: r is None,
+                              "read_doc(архив)", retries, sleep) or ""
+                if _retry(lambda: write_doc(aid, (spill + "\n" + prev).strip(), env, post),
+                          lambda r: not r, "write_doc(архив)", retries, sleep):
                     log.warning("trainer_log: ротация — %s символов срезано в архив", len(spill))
                 else:
                     fresh, spill = merged, ""      # архив не принял → НИЧЕГО не теряем
@@ -350,11 +435,21 @@ def append(n, kind, text, now=None, env=None, get=None, post=None, sidecar_path=
                             "срез НЕ делаю (историю молча не теряем)", MAX_CHARS)
                 fresh = merged
         out = (head + "\n" + fresh) if head else fresh
-        return {"status": "ok" if write_doc(did, out, env, post) else "error", "line": line}
+        if not _retry(lambda: write_doc(did, out, env, post), lambda r: not r, "write_doc",
+                      retries, sleep):
+            return _to_spool(line, spool_path, "канал недоступен на записи")
+        if pending:
+            _spool_clear(spool_path)
+            log.info("trainer_log: доставлено ok — строка + %s из спула (спул очищен)", len(pending))
+        else:
+            log.info("trainer_log: доставлено ok: %s", line[:120])
+        return {"status": "ok", "line": line, "spool_delivered": len(pending)}
 
 
 def safe_append(n, kind, text, **kw):
-    """Обёртка для боевых точек вызова: НИКОГДА не бросает и не блокирует. → status-строка."""
+    """Обёртка для боевых точек вызова: НИКОГДА не бросает и не блокирует.
+    → status-строка: 'ok' | 'no_doc' | 'spooled' | 'error' | 'test' (статус доставки —
+    он же уже залогирован внутри append)."""
     try:
         return append(n, kind, text, **kw).get("status", "error")
     except Exception as e:                                  # pragma: no cover — тотальный fail-safe

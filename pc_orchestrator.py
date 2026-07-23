@@ -911,25 +911,195 @@ def _exec_command(cmd, restart_fn=None, status_fn=None):
     return "failed", f"{kind}: рестарт не удался — {detail}"
 
 
-def _commit_lesson(tid, route, subject, paths):
+# ---- провал коммита урока НЕ смеет вечно блокировать авто-фетч (пакет «полнота лога», п.6) ----
+# Класс: НАДЗОР-урок дописал строку в docs/revizor_checklist.md, а git commit сорвался (index.lock
+# параллельного git / хук / битый конфиг). Раньше файл оставался ГРЯЗНЫМ навсегда →
+# git_ff_pull_tick видел tracked-грязь и пропускал pull ВЕЧНО (+NOTE «грязная» каждые GIT_PULL_SEC).
+# Фикс: добавленные уроком СТРОКИ уводим в спул (gitignored: pc_orchestrator.*.json), пути
+# откатываем к HEAD (дерево чистое — авто-фетч жив), владельцу карточка, а коммит повторяется
+# следующим циклом демона: строки НАКЛАДЫВАЮТСЯ на актуальный файл (за это время мог пройти
+# ff-pull — тупая перезапись затёрла бы чужие строки чек-листа), затем штатный add+commit.
+
+LESSON_RETRY_FILE = os.path.join(REPO, "pc_orchestrator.lesson_retry.json")
+LESSON_RETRY_SEC = int(os.getenv("PC_LESSON_RETRY_SEC", "300") or "300")
+_lesson_retry_last = 0.0
+
+
+def _lesson_retry_load(path=None):
+    """Спул недокоммиченного урока → dict | None (нет/бит/пуст)."""
+    try:
+        with open(path or LESSON_RETRY_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) and d.get("added") else None
+    except Exception:
+        return None
+
+
+def _lesson_retry_save(data, path=None):
+    try:
+        with open(path or LESSON_RETRY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=0)
+        return True
+    except Exception as e:                            # noqa: BLE001 — спул не роняет тик
+        log.warning("LESSON retry: спул не записан: %s", e)
+        return False
+
+
+def _lesson_retry_clear(path=None):
+    try:
+        os.remove(path or LESSON_RETRY_FILE)
+    except OSError:
+        pass
+
+
+def _lesson_added_lines(rel, call):
+    """Строки, которые правка урока ДОБАВИЛА в tracked-файл против HEAD (по ним повторим коммит).
+    git show недоступен → считаем базой пустоту: лишние «добавленные» строки безопасны — наложение
+    на актуальный файл пропускает уже существующие."""
+    try:
+        with open(os.path.join(REPO, rel), encoding="utf-8") as f:
+            want = f.read()
+    except OSError:
+        return []
+    show = call(["show", "HEAD:" + rel.replace(os.sep, "/")])
+    base = show[1] if show and show[0] == 0 else ""
+    have = set(base.splitlines())
+    return [ln for ln in want.splitlines() if ln.strip() and ln not in have]
+
+
+def _lesson_commit_spool(tid, route, subject, msg, paths, detail, ack_where=None,
+                         card_msg_id=None, call=None, path=None, notify=None):
+    """Провал коммита урока: правку — в спул, пути — к HEAD (дерево чистое), владельцу — карточку.
+    Повтор сделает lesson_commit_retry_tick следующим циклом. FAIL-SAFE: сбои глотаем, но карточка
+    честно говорит, удался ли откат."""
+    call = call or _git_call
+    added = {}
+    for rel in paths:
+        lines = _lesson_added_lines(rel, call)
+        if lines:
+            added[rel] = lines
+    rb = call(["checkout", "HEAD", "--"] + paths)     # дерево к HEAD в ЛЮБОМ случае (блокер снят)
+    rolled = bool(rb and rb[0] == 0)
+    if not added:
+        log.warning("LESSON id=%s: коммит не удался (%s), но добавленных строк не нашли — "
+                    "только откат к HEAD (%s), повторять нечего",
+                    tid, detail, "ok" if rolled else "не удался")
+        return
+    _lesson_retry_save({"tid": tid, "route": route, "msg": msg, "paths": paths, "added": added,
+                        "ack_subject": subject or "", "ack_where": ack_where or "",
+                        "card_msg_id": card_msg_id or "", "attempts": 0, "detail": detail}, path)
+    (notify or _notify_critical)(
+        f"⚠️ Урок #{tid} [{route}]: git commit не прошёл ({detail}). Правка чек-листа снята с "
+        f"рабочего дерева (откат к HEAD{'' if rolled else ' НЕ УДАЛСЯ — дерево может быть грязным'}) "
+        "и сохранена в спул — демон докоммитит её следующим циклом. Авто-фетч не заблокирован.")
+    _cowork(f"урок #{tid}: коммит не удался ({detail}) — правка в спуле, откат к HEAD, "
+            "повтор следующим циклом")
+
+
+def _commit_lesson(tid, route, subject, paths, call_fn=None, ack_where=None, card_msg_id=None,
+                   retry_path=None, notify=None):
     """Закоммитить ЗАКОММИЧЕННЫЙ-диф урока (родитель 292, шаг 4): tracked-файлы, которые правка урока
     изменила (НАДЗОР → docs/revizor_checklist.md). Стейджим ТОЛЬКО эти пути (без -A: служебные
     heartbeat/*.json и чужие правки не тащим); нет реальной правки в индексе → None (коммитить нечего,
-    напр. СТИЛЬ пишет в gitignored playbook manager-bot — свой контур). → короткий хеш | None."""
+    напр. СТИЛЬ пишет в gitignored playbook manager-bot — свой контур). → короткий хеш | None.
+    ПРОВАЛ коммита НЕ оставляет пути грязными (вечный блокер авто-фетча): правка уходит в спул,
+    пути откатываются к HEAD, владельцу карточка, повтор — следующим циклом (см. блок выше)."""
+    call = call_fn or _git_call
     paths = [p for p in (paths or []) if p]
     if not paths:
         return None
-    if not _git_call(["add", "--"] + paths):
-        return None
-    staged = _git_call(["diff", "--cached", "--name-only", "--"] + paths)
-    if not staged or not (staged[1] or "").strip():
-        return None                                  # правки нет (дедуп/уже закоммичено) → без коммита
     msg = f"#292 урок [{route}] задача #{tid}: {(subject or '').strip()[:80]}".rstrip(": ")
-    rc = _git_call(["commit", "-m", msg, "--"] + paths)
-    if not rc or rc[0] != 0:
-        log.warning("LESSON id=%s: коммит урока не удался (%s)", tid, rc[2] if rc else "git недоступен")
+    ok_add = call(["add", "--"] + paths)
+    if ok_add and ok_add[0] == 0:
+        staged = call(["diff", "--cached", "--name-only", "--"] + paths)
+        if staged and staged[0] == 0 and not (staged[1] or "").strip():
+            return None                              # правки нет (дедуп/уже закоммичено) → без коммита
+        rc = call(["commit", "-m", msg, "--"] + paths) if staged and staged[0] == 0 else None
+        if rc and rc[0] == 0:
+            nh = call(["rev-parse", "--short", "HEAD"])
+            return nh[1] if nh and nh[0] == 0 else None
+        detail = _tail(rc[2], 160) if rc else (_tail(staged[2], 160) if staged else "git недоступен")
+    else:
+        detail = _tail(ok_add[2], 160) if ok_add else "git недоступен"
+    log.warning("LESSON id=%s: коммит урока не удался (%s) — правка в спул, пути к HEAD", tid, detail)
+    _lesson_commit_spool(tid, route, subject, msg, paths, detail, ack_where=ack_where,
+                         card_msg_id=card_msg_id, call=call, path=retry_path, notify=notify)
+    return None
+
+
+def lesson_commit_retry_tick(call_fn=None, path=None):
+    """Повтор коммита урока из спула. Добавленные уроком строки накладываются на АКТУАЛЬНЫЙ файл
+    (пропуская уже существующие), затем штатный add+diff+commit. Успех → спул снят + запоздалое
+    подтверждение учителю (инвариант «ack только после коммита» цел). Строки уже в HEAD (pull/руки
+    принесли) → спул снят без коммита. Провал → снова откат к HEAD и попытка следующим циклом.
+    → строка-итог для лога | '' (спула нет)."""
+    data = _lesson_retry_load(path)
+    if not data:
+        return ""
+    call = call_fn or _git_call
+    tid = data.get("tid")
+    paths = [p for p in (data.get("paths") or []) if p]
+    for rel, lines in (data.get("added") or {}).items():
+        fp = os.path.join(REPO, rel)
+        try:
+            cur = ""
+            try:
+                with open(fp, encoding="utf-8") as f:
+                    cur = f.read()
+            except FileNotFoundError:
+                pass
+            have = set(cur.splitlines())
+            missing = [ln for ln in lines if ln not in have]
+            if not missing:
+                continue
+            body = (cur.rstrip("\n") + "\n") if cur.strip() else ""
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(body + "\n".join(missing) + "\n")
+        except OSError as e:
+            log.warning("LESSON retry: файл %s недоступен: %s", rel, e)
+    ok_add = call(["add", "--"] + paths)
+    staged = (call(["diff", "--cached", "--name-only", "--"] + paths)
+              if ok_add and ok_add[0] == 0 else None)
+    if staged and staged[0] == 0 and not (staged[1] or "").strip():
+        _lesson_retry_clear(path)                     # всё уже в HEAD — повторять нечего
+        _cowork(f"урок #{tid}: повтор коммита не нужен — строки уже в HEAD, спул снят")
+        return "уже в HEAD — спул снят"
+    rc = (call(["commit", "-m", str(data.get("msg") or f"#292 урок: повтор #{tid}"), "--"] + paths)
+          if staged and staged[0] == 0 else None)
+    if rc and rc[0] == 0:
+        nh = call(["rev-parse", "--short", "HEAD"])
+        commit = nh[1] if nh and nh[0] == 0 else None
+        _lesson_retry_clear(path)
+        log.info("LESSON id=%s: повторный коммит урока прошёл (%s) — спул снят", tid, commit or "?")
+        _cowork(f"урок #{tid}: повторный коммит прошёл ({commit or '?'}) — спул снят")
+        try:                                          # подтверждение учителю — ТОЛЬКО теперь (после коммита)
+            ack = lesson_router.ack_after_commit(commit, data.get("ack_subject"),
+                                                 data.get("ack_where"))
+            if ack:
+                _deliver_lesson_ack(data.get("card_msg_id"), ack)
+        except Exception as e:                        # noqa: BLE001 — ack не роняет тик
+            log.warning("LESSON retry: подтверждение учителю не собрано: %s", e)
+        return f"повторный коммит {commit or '?'}"
+    call(["checkout", "HEAD", "--"] + paths)          # снова к HEAD: дерево чистое, авто-фетч жив
+    data["attempts"] = int(data.get("attempts") or 0) + 1
+    _lesson_retry_save(data, path)
+    detail = _tail(rc[2], 160) if rc else "git недоступен"
+    log.warning("LESSON id=%s: повторный коммит снова не удался (попытка %s: %s) — следующий цикл",
+                tid, data["attempts"], detail)
+    return f"повтор не удался (попытка {data['attempts']})"
+
+
+def maybe_lesson_commit_retry(now=None):
+    """Троттлинг повтора коммита урока: не чаще LESSON_RETRY_SEC и только при живом спуле.
+    → строка-итог | None (рано/спула нет)."""
+    global _lesson_retry_last
+    if not os.path.exists(LESSON_RETRY_FILE):
         return None
-    return _git_out(["rev-parse", "--short", "HEAD"])
+    now = time.time() if now is None else now
+    if now - _lesson_retry_last < LESSON_RETRY_SEC:
+        return None
+    _lesson_retry_last = now
+    return lesson_commit_retry_tick()
 
 
 def _deliver_owner_card(text, send=None):
@@ -982,7 +1152,10 @@ def _finalize_lesson_dec(tid, text, dec):
     _cowork(f"урок #{tid} [{route}] → {status} · {_clip(result)}")
     _notify_task(status, tid, result)
     if status == "done":
-        commit = _commit_lesson(tid, route, dec.get("ack_subject"), dec.get("commit_paths"))
+        # ack_where/card_msg_id прокидываем в _commit_lesson: при провале коммита они лягут в спул,
+        # и запоздалое подтверждение учителю соберёт lesson_commit_retry_tick ПОСЛЕ повторного коммита
+        commit = _commit_lesson(tid, route, dec.get("ack_subject"), dec.get("commit_paths"),
+                                ack_where=dec.get("ack_where"), card_msg_id=dec.get("card_msg_id"))
         ack = lesson_router.ack_after_commit(commit, dec.get("ack_subject"), dec.get("ack_where"))
         if ack:
             _deliver_lesson_ack(dec.get("card_msg_id"), ack)
@@ -4588,6 +4761,7 @@ def _main_loop():
             poll_once()
             maybe_client_watchdog()   # часть 3: следим за pc_agent/userbot/moderation_bot (троттлинг 5 мин)
             maybe_revizor()           # шаг 2/7 (262): ревизор диалогов за DIALOG_REVIZOR (троттлинг REVIZOR_HOURS)
+            maybe_lesson_commit_retry()  # пакет «полнота лога» п.6: докоммитить урок из спула (провал коммита ≠ вечная грязь)
             maybe_git_ff_pull()       # родитель #221: подтянуть origin/main ff-only ДО реконсиляции/self-update (тот же тик применит)
             maybe_reconcile_children()  # класс-фикс c6d8a30: применить свежий код детей на ЛЮБОЙ новый коммит
             if maybe_self_update():   # задача цикла обновила pc_orchestrator.py → эстафета новому

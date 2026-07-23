@@ -255,6 +255,46 @@ class TestLessonRouting(unittest.TestCase):
                                    classify=lambda r: "behavior", mark=lambda r: None)
         self.assertEqual(dec["status"], "error")
 
+    def test_text_path_lesson_gets_number_like_buttons(self):
+        """Пакет «полнота лога» п.3: урок ТЕКСТОВОГО пути («урок: …» / «✍ другое») получает #N
+        в карточке — та же нумерация, что кнопочный apply_lessons и «отмени урок N»."""
+        rules = [{"n": 1, "rule": "старое"}, {"n": 2, "rule": "не здоровайся дважды"}]
+        dec = trainer.apply_lesson("не здоровайся дважды", append_rule=lambda r: "added",
+                                   classify=lambda r: "behavior", mark=lambda r: True,
+                                   list_rules=lambda: rules)
+        self.assertEqual(dec["n"], 2)
+        self.assertIn("урок #2", dec["card"])
+        # дубликат тоже показывает номер СУЩЕСТВУЮЩЕГО правила
+        dup = trainer.apply_lesson("старое", append_rule=lambda r: "duplicate",
+                                   classify=lambda r: "behavior", mark=lambda r: True,
+                                   list_rules=lambda: rules)
+        self.assertEqual(dup["n"], 1)
+        # книга недоступна → урок принят, карточка честная, но без номера (fail-safe)
+        boom = trainer.apply_lesson("x", append_rule=lambda r: "added",
+                                    classify=lambda r: "behavior", mark=lambda r: True,
+                                    list_rules=lambda: (_ for _ in ()).throw(RuntimeError("нет")))
+        self.assertIsNone(boom["n"])
+        self.assertIn("Принято", boom["card"])
+
+    def test_apply_lesson_never_raises(self):
+        """Пакет «полнота лога» п.4: исключение ВНУТРИ урока не роняет обработчик группы —
+        status='error' + карточка-ошибка (след в лог; карточку в TRN пишет вызывающий)."""
+        dec = trainer.apply_lesson(
+            "урок с падением",
+            append_rule=lambda r: (_ for _ in ()).throw(RuntimeError("книга сломана")),
+            classify=lambda r: "behavior", mark=lambda r: True)
+        self.assertEqual(dec["status"], "error")
+        self.assertIn("внутренняя ошибка", dec["card"])
+        self.assertIn("RuntimeError", dec["card"])                  # тип виден владельцу
+
+    def test_cancel_lesson_never_raises(self):
+        dec = trainer.cancel_lesson(
+            3, remove_rule=lambda n: (_ for _ in ()).throw(RuntimeError("книга сломана")),
+            list_rules=lambda: [], unmark=lambda r: True)
+        self.assertEqual(dec["status"], "error")
+        self.assertIn("не отменён", dec["card"])
+        self.assertIn("RuntimeError", dec["card"])
+
     def test_classify_lesson_real(self):
         # реальный классификатор 2-й оси (lesson_router)
         self.assertEqual(trainer.classify_lesson("пиши короче, без воды"), "behavior")

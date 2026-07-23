@@ -51,6 +51,8 @@ pc_orchestrator.client_watch.json.tmp
 *.log.1
 pc_orchestrator.*.json
 pc_orchestrator.heartbeat
+# спул недоставленных TRN-строк лога тренажёра (runtime, дозаписывается в док при успехе)
+trainer_log.spool
 pc_ask_*.marker
 trainer_rules.json
 tmp/

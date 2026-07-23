@@ -352,6 +352,9 @@ async def _trainer_callback(context, q, data):
     username = (q.from_user.username if q.from_user else None)
     if not suggest.is_approver(username):
         await context.bot.send_message(chat_id, "⛔ Кнопки тренажёра — только для approver.")
+        # отказ — тоже событие обучения: в TRN, чтобы «не жали» и «жали, но отказано» различались
+        await _trn_log(trainer_log.KIND_BTN,
+                       f"⛔ отказ: @{username or '?'} не approver — кнопка {data} не выполнена")
         return
     if data == "tr:reset":
         n = trainer.reset()
@@ -362,6 +365,7 @@ async def _trainer_callback(context, q, data):
         transcript = trainer.get_transcript()
         if not transcript.strip():
             await context.bot.send_message(chat_id, "⚠️ Диалог ТЕСТ-клиента пуст — нечего заводить в CRM.")
+            await _trn_log(trainer_log.KIND_BTN, "⚠️ 📋 До CRM: диалог пуст — карточка не собрана")
             return
         try:
             meta = {"transcript": transcript, "client_ref": "ТЕСТ", "client_name": "ТЕСТ"}
@@ -370,6 +374,8 @@ async def _trainer_callback(context, q, data):
         except Exception as e:
             log.warning(f"trainer crm: {type(e).__name__}: {e}")
             await context.bot.send_message(chat_id, "⚠️ Не удалось собрать заявку (см. moderation_bot.log).")
+            await _trn_log(trainer_log.KIND_BTN,
+                           f"⚠️ 📋 До CRM: сбой моста 2.1 — {type(e).__name__}: {e}")
             return
         body = (intake_text or card or "⚠️ Из диалога заявку собрать не удалось.").strip()
         await context.bot.send_message(chat_id, trainer.strip_thai(trainer.crm_card(body)))
@@ -379,7 +385,10 @@ async def _trainer_callback(context, q, data):
         incoming, answer = trainer.get_last_pair()
         if not (incoming and answer):
             await context.bot.send_message(chat_id, "⚠️ Нет последнего ответа ТЕСТ-клиента — сначала напиши как клиент.")
+            await _trn_log(trainer_log.KIND_BTN,
+                           "⚠️ 🎓 Обучить: нет последней пары клиент/бот — гипотезы не запрошены")
             return
+        llm_err = None
         try:
             system, user = trainer.hypotheses_prompt(incoming, answer)
             llm = suggest.default_llm_caller()
@@ -387,9 +396,13 @@ async def _trainer_callback(context, q, data):
             hyps = trainer.parse_hypotheses(raw)
         except Exception as e:
             log.warning(f"trainer teach: {type(e).__name__}: {e}")
-            hyps = []
+            hyps, llm_err = [], f"{type(e).__name__}: {e}"
         if not hyps:
             await context.bot.send_message(chat_id, "⚠️ Не удалось предложить гипотезы — напиши урок текстом: «урок: …».")
+            # «LLM упал» и «LLM ответил пусто» — РАЗНЫЕ ветки, обе видны в TRN раздельно
+            await _trn_log(trainer_log.KIND_BTN, "⚠️ 🎓 Обучить: " +
+                           (f"сбой LLM гипотез — {llm_err}" if llm_err
+                            else "LLM вернул 0 гипотез (пустой разбор)"))
             return
         trainer.set_hyps(hyps)                   # новый список → отметки тумблеров обнуляются
         parts = trainer.hyps_messages(hyps)      # полные формулировки — в тексте, кнопки = номера
@@ -439,6 +452,8 @@ async def _trainer_callback(context, q, data):
             return
         if not (0 <= i < len(hyps)):
             await context.bot.send_message(chat_id, "⚠️ Гипотеза устарела — нажми «🎓 Обучить» заново.")
+            await _trn_log(trainer_log.KIND_BTN,
+                           f"⚠️ тап по устаревшей гипотезе №{i + 1} (актуальных: {len(hyps)}) — не применена")
             return
         # ТУМБЛЕР: тап помечает/снимает ✅ прямо на кнопке; в книгу правил пока НИЧЕГО не пишем.
         picked = trainer.toggle_selection(i)

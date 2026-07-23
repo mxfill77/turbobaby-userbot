@@ -83,17 +83,20 @@ class TestLineFormat(unittest.TestCase):
 class TestAppend(unittest.TestCase):
     DID = "1AbcTrainerLogDocId"
 
-    def _append(self, bridge, text="привет", kind="client", n=5, sidecar=None):
+    def _append(self, bridge, text="привет", kind="client", n=5, sidecar=None, retries=1):
+        # retries=1 и sleep-заглушка: тесты канала не должны спать реальный бэкофф
         return trainer_log.append(n, kind, text, now=NOW, env=ENV,
                                   get=bridge.get, post=bridge.post,
                                   sidecar_path=sidecar or self._sidecar,
-                                  lock_path=self._lock)
+                                  lock_path=self._lock, spool_path=self._spool,
+                                  retries=retries, sleep=lambda s: None)
 
     def setUp(self):
         import tempfile, json
         self._dir = tempfile.TemporaryDirectory()
         self._sidecar = os.path.join(self._dir.name, "trainer_log_doc.json")
         self._lock = os.path.join(self._dir.name, "trainer_log.lock")
+        self._spool = os.path.join(self._dir.name, "trainer_log.spool")
         with open(self._sidecar, "w", encoding="utf-8") as f:
             json.dump({"doc_id": self.DID}, f)
         self._old_env = os.environ.pop("TRAINER_LOG_DOC_ID", None)
@@ -147,7 +150,8 @@ class TestAppend(unittest.TestCase):
             try:
                 res = trainer_log.append(1, "btn", "новое", now=NOW, env=ENV, get=b.get,
                                          post=b.post, sidecar_path=p,
-                                         lock_path=os.path.join(d, "l.lock"))
+                                         lock_path=os.path.join(d, "l.lock"),
+                                         spool_path=os.path.join(d, "s.spool"))
             finally:
                 trainer_log.MAX_CHARS, trainer_log.KEEP_CHARS = om, ok_
             self.assertEqual(res["status"], "ok")
@@ -166,15 +170,30 @@ class TestAppend(unittest.TestCase):
         self.assertEqual(b.writes, [])                              # в сеть НЕ ходили вовсе
         self.assertIn("TRN ", res["line"])                          # строка всё равно собрана
 
-    def test_channel_failure_is_error_not_exception(self):
-        self.assertEqual(self._append(FakeBridge({}, fail_read=True))["status"], "error")
-        self.assertEqual(self._append(FakeBridge({self.DID: ""}, fail_write=True))["status"],
-                         "error")
+    def test_channel_failure_spools_not_raises(self):
+        """Канал упал → строка НЕ теряется: уходит в локальный спул (status='spooled'),
+        исключение наружу не летит. Спул растёт по мере провалов (хронологически)."""
+        self.assertEqual(self._append(FakeBridge({}, fail_read=True))["status"], "spooled")
+        self.assertEqual(self._append(FakeBridge({self.DID: ""}, fail_write=True),
+                                      "вторая")["status"], "spooled")
+        spooled = trainer_log._spool_read(self._spool)
+        self.assertEqual(len(spooled), 2)                           # обе недоставленные — в спуле
+        self.assertIn("привет", spooled[0])
+        self.assertIn("вторая", spooled[1])
         # safe_append не бросает даже при полностью битом окружении
         b = FakeBridge({}, fail_read=True)
         self.assertIn(trainer_log.safe_append(1, "bot", "x", env={}, sidecar_path=self._sidecar,
-                                              get=b.get, post=b.post, lock_path=self._lock),
-                      ("no_doc", "error"))
+                                              get=b.get, post=b.post, lock_path=self._lock,
+                                              spool_path=self._spool, retries=1,
+                                              sleep=lambda s: None),
+                      ("no_doc", "spooled", "error"))
+        # спул недоступен (каталог не существует) → честный 'error', но НЕ исключение
+        bad_spool = os.path.join(self._dir.name, "нет-каталога", "s.spool")
+        res = trainer_log.append(1, "bot", "x", now=NOW, env=ENV, sidecar_path=self._sidecar,
+                                 get=FakeBridge({}, fail_read=True).get, post=b.post,
+                                 lock_path=self._lock, spool_path=bad_spool,
+                                 retries=1, sleep=lambda s: None)
+        self.assertEqual(res["status"], "error")
 
     def test_test_run_never_writes_to_the_live_doc(self):
         """ЖИВОЙ ИНЦИДЕНТ 23.07: как только в сайдкар лёг file id, ДВА прогона гейта залили в
@@ -250,7 +269,9 @@ class TestRotation(unittest.TestCase):
             trainer_log.MAX_CHARS = 100
             try:
                 res = trainer_log.append(1, "btn", "новое", now=NOW, env=ENV,
-                                         get=b.get, post=b.post, sidecar_path=p)
+                                         get=b.get, post=b.post, sidecar_path=p,
+                                         lock_path=os.path.join(d, "l.lock"),
+                                         spool_path=os.path.join(d, "s.spool"))
             finally:
                 trainer_log.MAX_CHARS = old_max
             self.assertEqual(res["status"], "ok")
@@ -271,7 +292,9 @@ class TestRotation(unittest.TestCase):
             trainer_log.MAX_CHARS, trainer_log.KEEP_CHARS = 200, 120
             try:
                 res = trainer_log.append(1, "btn", "новое", now=NOW, env=ENV,
-                                         get=b.get, post=b.post, sidecar_path=p)
+                                         get=b.get, post=b.post, sidecar_path=p,
+                                         lock_path=os.path.join(d, "l.lock"),
+                                         spool_path=os.path.join(d, "s.spool"))
             finally:
                 trainer_log.MAX_CHARS, trainer_log.KEEP_CHARS = old_max, old_keep
             self.assertEqual(res["status"], "ok")
@@ -279,6 +302,136 @@ class TestRotation(unittest.TestCase):
             self.assertIn("TRN старое 49", b.docs[aid])             # самое старое — в архиве
             self.assertIn("TRN архивное 0", b.docs[aid])            # прежний архив не затёрт
             self.assertNotIn("TRN старое 49", b.docs[did])
+
+
+class TestDeliveryRetryAndSpool(unittest.TestCase):
+    """Пакет «полнота лога»: доставка ретраится с бэкоффом, недоставленное копится в локальном
+    спуле и дозаписывается при СЛЕДУЮЩЕМ успешном append — событие не теряется НИКОГДА."""
+
+    DID = "1AbcTrainerLogDocId"
+
+    def setUp(self):
+        import tempfile, json
+        self._dir = tempfile.TemporaryDirectory()
+        self.sidecar = os.path.join(self._dir.name, "trainer_log_doc.json")
+        self.lock = os.path.join(self._dir.name, "trainer_log.lock")
+        self.spool = os.path.join(self._dir.name, "trainer_log.spool")
+        with open(self.sidecar, "w", encoding="utf-8") as f:
+            json.dump({"doc_id": self.DID}, f)
+        self._old_env = os.environ.pop("TRAINER_LOG_DOC_ID", None)
+
+    def tearDown(self):
+        self._dir.cleanup()
+        if self._old_env is not None:
+            os.environ["TRAINER_LOG_DOC_ID"] = self._old_env
+
+    def _append(self, bridge, text, retries=1, sleep=None, get=None):
+        return trainer_log.append(3, "client", text, now=NOW, env=ENV,
+                                  get=get or bridge.get, post=bridge.post,
+                                  sidecar_path=self.sidecar, lock_path=self.lock,
+                                  spool_path=self.spool, retries=retries,
+                                  sleep=sleep or (lambda s: None))
+
+    def test_retry_with_exponential_backoff_then_success(self):
+        """Два срыва чтения подряд → третья попытка доходит; паузы растут ×2 (бэкофф)."""
+        b = FakeBridge({self.DID: "TRN старое"})
+        fails = {"n": 0}
+        delays = []
+
+        def flaky_get(url, params):
+            if fails["n"] < 2:
+                fails["n"] += 1
+                raise OSError("timed out")                          # живой класс: сеть мигнула
+            return b.get(url, params)
+
+        res = self._append(b, "дошло с третьей", retries=3, sleep=delays.append, get=flaky_get)
+        self.assertEqual(res["status"], "ok")
+        self.assertIn("дошло с третьей", b.docs[self.DID])
+        self.assertEqual(delays, [trainer_log.BACKOFF_SEC, trainer_log.BACKOFF_SEC * 2])
+        self.assertFalse(os.path.exists(self.spool))                 # успех → спул не заводился
+
+    def test_retry_exhausted_goes_to_spool(self):
+        """Все попытки сорвались → status='spooled', строка в спуле, попыток ровно retries."""
+        b = FakeBridge({}, fail_read=True)
+        delays = []
+        res = self._append(b, "не дошло", retries=3, sleep=delays.append)
+        self.assertEqual(res["status"], "spooled")
+        self.assertEqual(len(b.reads), 3)                            # ретраили, не сдались сразу
+        self.assertEqual(delays, [trainer_log.BACKOFF_SEC, trainer_log.BACKOFF_SEC * 2])
+        self.assertIn("не дошло", "\n".join(trainer_log._spool_read(self.spool)))
+
+    def test_spool_drains_on_next_success_in_order(self):
+        """Дозапись: накопленный спул уезжает в док при следующем успехе — свежее сверху,
+        спул под новой строкой (хронология сохранена), спул очищен."""
+        dead = FakeBridge({}, fail_read=True)
+        self.assertEqual(self._append(dead, "первая недоставленная")["status"], "spooled")
+        self.assertEqual(self._append(dead, "вторая недоставленная")["status"], "spooled")
+        live = FakeBridge({self.DID: "TRN LOG v1 | легенда\nTRN древняя строка"})
+        res = self._append(live, "свежая при живом канале")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["spool_delivered"], 2)
+        lines = live.docs[self.DID].splitlines()
+        self.assertEqual(lines[0], "TRN LOG v1 | легенда")           # легенда осталась первой
+        self.assertIn("свежая при живом канале", lines[1])           # новое — сверху
+        self.assertIn("вторая недоставленная", lines[2])             # спул — под ним, свежее выше
+        self.assertIn("первая недоставленная", lines[3])
+        self.assertIn("древняя строка", lines[4])                    # старое тело не затёрто
+        self.assertFalse(os.path.exists(self.spool))                 # спул очищен после доставки
+        # повторный успех спул заново не дозаписывает (доставлено ровно один раз)
+        self.assertEqual(self._append(live, "ещё одна")["spool_delivered"], 0)
+
+    def test_spool_survives_failed_drain(self):
+        """Дренаж сорвался на ЗАПИСИ: старый спул цел, новая строка дописана в его хвост."""
+        dead = FakeBridge({}, fail_read=True)
+        self._append(dead, "старая недоставленная")
+        half = FakeBridge({self.DID: "TRN тело"}, fail_write=True)   # читается, но не пишется
+        self.assertEqual(self._append(half, "новая при полуживом")["status"], "spooled")
+        spooled = trainer_log._spool_read(self.spool)
+        self.assertEqual(len(spooled), 2)
+        self.assertIn("старая недоставленная", spooled[0])           # хронология не сломана
+        self.assertIn("новая при полуживом", spooled[1])
+
+
+class TestLiveSidecar(unittest.TestCase):
+    """Сайдкар РЕПОЗИТОРИЯ (trainer_log_doc.json): оба file id заведены Штабом, ротация с этими
+    id работает сквозняком (доказательство «архив подключён», а не только выглядит подключённым)."""
+
+    ARCHIVE_ID = "1lOco1SI58UNT0a4-TBuU3yYeZzbPkWUP"
+
+    def setUp(self):
+        self._env = {k: os.environ.pop(k, None)
+                     for k in ("TRAINER_LOG_DOC_ID", "TRAINER_LOG_ARCHIVE_DOC_ID")}
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is not None:
+                os.environ[k] = v
+
+    def test_repo_sidecar_has_both_ids(self):
+        self.assertTrue(trainer_log.doc_id(), "doc_id пропал из сайдкара репо")
+        self.assertEqual(trainer_log.archive_id(), self.ARCHIVE_ID,
+                         "archive_id архива KB_trainer_log (док Штаба) обязан лежать в сайдкаре")
+
+    def test_rotation_goes_into_the_real_archive_id(self):
+        """Сквозная ротация ровно с БОЕВЫМ сайдкаром: срез уходит в док с ЭТИМ archive_id."""
+        import tempfile
+        did = trainer_log.doc_id()
+        b = FakeBridge({did: "\n".join(f"TRN старое {i}" for i in range(50)),
+                        self.ARCHIVE_ID: "TRN архивное 0"})
+        om, ok_ = trainer_log.MAX_CHARS, trainer_log.KEEP_CHARS
+        trainer_log.MAX_CHARS, trainer_log.KEEP_CHARS = 200, 120
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                res = trainer_log.append(1, "btn", "новое", now=NOW, env=ENV,
+                                         get=b.get, post=b.post,
+                                         lock_path=os.path.join(d, "l.lock"),
+                                         spool_path=os.path.join(d, "s.spool"))
+        finally:
+            trainer_log.MAX_CHARS, trainer_log.KEEP_CHARS = om, ok_
+        self.assertEqual(res["status"], "ok")
+        self.assertIn("TRN старое 49", b.docs[self.ARCHIVE_ID])      # самое старое — в архиве Штаба
+        self.assertIn("TRN архивное 0", b.docs[self.ARCHIVE_ID])     # прежний архив не затёрт
+        self.assertIn("новое", b.docs[did])
 
 
 class TestWriteLock(unittest.TestCase):
@@ -316,7 +469,8 @@ class TestWriteLock(unittest.TestCase):
         try:
             with trainer_log.doc_lock(self.lock, wait=0):           # лок держит «другой процесс»
                 res = trainer_log.append(1, "btn", "событие", now=NOW, env=ENV, get=b.get,
-                                         post=b.post, sidecar_path=p, lock_path=self.lock)
+                                         post=b.post, sidecar_path=p, lock_path=self.lock,
+                                         spool_path=os.path.join(self._dir.name, "s.spool"))
         finally:
             trainer_log.LOCK_WAIT_SEC = old_wait
         self.assertEqual(res["status"], "ok")
@@ -345,7 +499,8 @@ class TestWriteLock(unittest.TestCase):
         b = FakeBridge({"DOC": "TRN LOG v1 | легенда"})
         for who, txt in (("btn", "модербот: тап номера 2"), ("bot", "userbot: ответ клиенту")):
             trainer_log.append(9, who, txt, now=NOW, env=ENV, get=b.get, post=b.post,
-                               sidecar_path=p, lock_path=self.lock)
+                               sidecar_path=p, lock_path=self.lock,
+                               spool_path=os.path.join(self._dir.name, "s.spool"))
         doc = b.docs["DOC"]
         self.assertIn("модербот: тап номера 2", doc)
         self.assertIn("userbot: ответ клиенту", doc)
@@ -376,6 +531,25 @@ class TestWiring(unittest.TestCase):
                        "✖ Отмена", "✔ Применить"):
             self.assertIn(anchor, src, f"нажатие не логируется: {anchor}")
         self.assertIn("trainer_log.KIND_LESSON", src)
+
+    def test_all_failure_branches_are_logged(self):
+        """Пакет «полнота лога» п.2: ветки «отказано/упало/пусто/устарело» пишутся в TRN — иначе
+        тишина в логе неотличима от «кнопки не жали» и разбор прогона по мозгу врёт."""
+        ub = self._src("userbot_listen.py")
+        for anchor in ("⛔ отказ: @",                # approver-гейт (урок/отмена/свободный текст)
+                       "сбой генерации ответа",     # генерация черновика упала
+                       "сбой моста 2.1",            # «до crm» упал
+                       "диалог пуст"):              # «до crm» по пустому диалогу
+            self.assertIn(anchor, ub, f"userbot: ветка не видна в TRN: {anchor}")
+        mb = self._src("moderation_bot.py")
+        for anchor in ("⛔ отказ: @",                # approver-гейт кнопок
+                       "сбой моста 2.1",            # 📋 До CRM упал
+                       "диалог пуст",               # 📋 До CRM по пустому диалогу
+                       "нет последней пары",        # 🎓 Обучить без обмена
+                       "сбой LLM гипотез",          # 🎓 Обучить: LLM упал
+                       "LLM вернул 0 гипотез",      # 🎓 Обучить: LLM ответил пусто (другая ветка!)
+                       "устаревшей гипотезе"):      # тап по номеру из старого списка
+            self.assertIn(anchor, mb, f"moderbot: ветка не видна в TRN: {anchor}")
 
     def test_env_garbage_never_breaks_the_import(self):
         """Настройки читаются с полной защитой: мусор в env → дефолт. Без этого ValueError падал бы
