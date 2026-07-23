@@ -6,14 +6,15 @@ pretool_guard.py — PreToolUse-хук Claude Code для ПК (D:\\turbobaby-bo
 
 ПОЗИЦИЯ БЕЗОПАСНОСТИ (как на VPS): хук ТОЛЬКО ДОБАВЛЯЕТ подтверждения, НИКОГДА не выдаёт
 новых разрешений. Он не возвращает permissionDecision="allow" — авто-allow зелёного делает
-список permissions.allow в settings.json. Хук лишь форсит "ask" (+🔔 пуш) на КРАСНОМ и
-НЕИЗВЕСТНОМ. Значит ошибка классификации может только ДОБАВИТЬ лишний ask (безопасная
-сторона), но не пропустить опасное.
+список permissions.allow в settings.json. Хук лишь форсит "ask" (+🔔 пуш) на КРАСНОМ по
+доктринальному списку. Значит ошибка классификации может только ДОБАВИТЬ лишний ask
+(безопасная сторона), но не пропустить опасное.
 
 Трёхцветно:
   ЗЕЛЁНОЕ  → defer (exit 0, без вывода) → штатные allow-правила решают.
-  КРАСНОЕ  → ask (карточка в сессии) + 🔔 через dispatch_notify.
-  НЕИЗВЕСТНОЕ / ошибка анализа → ask (FAIL-SAFE, в сторону подтверждения).
+  КРАСНОЕ  (доктринальный список `_stays_red`) → ask (карточка в сессии) + 🔔 dispatch_notify.
+  НЕИЗВЕСТНОЕ → defer с логом (доктрина VPS: незнакомая команда сама по себе НЕ красная);
+  ошибка анализа самого гарда → ask (FAIL-SAFE, в сторону подтверждения, В ЛЮБОЙ роли).
 
 КРАСНЫЙ список (НЕ смягчать): правка/чтение .env и секретов; удаление файлов
 (del/rm/rmdir/Remove-Item); правка КОНФИГА .claude (settings*.json / hooks / agents / commands /
@@ -24,24 +25,24 @@ D:\\turbobaby-bot; сеть кроме git/Bridge/Telegram (curl/wget/ssh/scp/�
 боевой записью (Bridge create_booking/add_transaction/… , os.remove/rmtree, SQL-write);
 живые таблицы (clasp / Apps Script / Sheets API).
 
-РАЗВОД ПО РОЛИ (регрессия удобства после оживления гарда в 0014ea6). Гард был мёртв (bash
-съедал бэкслеши в пути), ожил — и КАЖДАЯ небелая команда интерактивной RC-сессии стала
-требовать Allow: `_decide_bash` заканчивается на ("ask","unknown"), а решение хука
-ПЕРЕКРЫВАЕТ permissions.allow. Владелец тонет в подтверждениях. Лечим НЕ глобальным
-ослаблением, а разводом по роли:
-
-  HEADLESS (демон pc_orchestrator и его дети/субагенты) — поведение ПРЕЖНЕЕ, байт-в-байт:
-      строгий `decide()` без единого послабления. Жёсткость демона не трогаем.
-  ИНТЕРАКТИВ (RC-сессия владельца, сессии Claude Desktop) — красным остаётся ТОЛЬКО
-      доктринальное (см. `_stays_red`), остальное молча пропускается, но ЛОГИРУЕТСЯ.
+ДОКТРИНА РЕШЕНИЯ (перенос списка с VPS, кейс 314). Исторически красное делилось по роли
+(регрессия удобства после оживления гарда в 0014ea6): интерактиву — только доктринальное
+(`_stays_red`), headless-детям демона — строгий `decide()`, где НЕИЗВЕСТНОЕ = ask. Кейс 314
+(2026-07-23 14:33/14:56) показал цену строгости: headless-задача упала в NEEDS_APPROVAL на
+ЧИСТОМ ЧТЕНИИ — `wc -l` по файлам репо и цикл ожидания `until grep …; do sleep 5; done`.
+Доктрина VPS теперь действует В ОБЕИХ РОЛЯХ: незнакомая команда сама по себе НЕ красная;
+Allow спрашивает ТОЛЬКО доктринальный список `_stays_red` (живые таблицы, .env/секреты,
+sqlite, clasp, kill/schtasks-контроль, массовые удаления, git-force, сеть, запись вне репо,
+конфиг .claude, боевые py-токены). `decide()` остаётся строгим классификатором (kind нужен
+логу и карточке), решение принимает `decide_for_role`. Ошибка анализа — по-прежнему ask.
 
 Роль определяется ПО ФАКТУ и ПЕРЕИСПОЛЬЗУЕТ уже существующий механизм: демон штампует
 КАЖДОМУ своему headless-ребёнку env `PRETOOL_ASK_MARKER` (pc_orchestrator.run_task, это
 ЕДИНСТВЕННЫЙ путь спавна headless — run_claude), и гард этот штамп уже читает в `_emit_ask`.
 env наследуется вниз по дереву процессов, значит субагенты headless-ребёнка тоже помечены.
-Родственный счётчик `_count_claude_procs` различает роль обходом цепи PPID через CIM — здесь
-так НЕЛЬЗЯ: это powershell-вызов (timeout 20с) на КАЖДЫЙ tool-call хука. Штамп демона — тот
-же факт, но бесплатно.
+Решение роль больше НЕ меняет, но остаётся нужна: колонке роли в логе и КАНАЛУ ask —
+headless пишет красную карточку в файл-маркер демону (NEEDS_APPROVAL), интерактив
+показывает её в сессии.
 
 ЛОГ (`pretool_guard.log`, под *.log в .gitignore): пишется КАЖДОЕ решение обеих ролей —
 смягчение не должно стоить прозрачности. Строка: время | роль | инструмент | решение | вид |
@@ -165,7 +166,13 @@ _RE_OUTSIDE_WRITE = re.compile(r"(?i)(>>?|out-file|set-content|new-item|move-ite
 _RE_SAFE_SCRIPTS = re.compile(r"(?i)(cowork_log_append|dispatch_notify)\.py")
 _RE_GIT_SAFE = re.compile(r"(?i)(^|[\s;&|(])git\s+(status|diff|log|add|commit|push|fetch|pull|branch|show|check-ignore|rev-parse|remote|ls-files|config\s+--get)")
 _RE_TESTS = re.compile(r"(?i)-m\s+(pytest|py_compile|unittest)(\s|$)|(^|[\s/\\])pytest(\s|$)")
-_RE_READONLY_SHELL = re.compile(r"(?i)^\s*(ls|dir|echo|type|cat|head|tail|findstr|grep|rg|get-content|get-childitem|select-string|get-item|get-ciminstance|test-path|measure-object|where|get-command|git|py|python\s+--version)\b")
+_RE_READONLY_SHELL = re.compile(r"(?i)^\s*(ls|dir|echo|type|cat|head|tail|wc|stat|findstr|grep|rg|get-content|get-childitem|select-string|get-item|get-ciminstance|test-path|measure-object|where|get-command|git|py|python\s+--version)\b")
+# Цикл ОЖИДАНИЯ вида `until <смотрелка>; do sleep N; done[; <смотрелка>]` — зелёный: чистое
+# чтение + sleep (кейс 314: headless ждал вердикт фонового прогона в task-output). Условие и
+# необязательный хвост после done обязаны начинаться с известной смотрелки; красные признаки
+# ВСЕЙ команды (curl в хвосте, .env в пути и т.п.) уже проверены выше по _decide_bash.
+_RE_UNTIL_WAIT = re.compile(
+    r"(?is)^\s*until\s+(!?\s*[^;]+?)\s*;\s*do\s+sleep\s+[\d.]+\s*;?\s*done\s*(?:;\s*(\S.*))?$")
 _RE_PY = re.compile(r"(?i)(^|[\s/\\])(python3?|python\.exe|venv[\\/]scripts[\\/]python(\.exe)?)(\s|$)")
 _GREEN_MODULES = {"py_compile", "pytest", "unittest", "json.tool"}
 # .py-цели в сырой команде (устойчиво к shlex, который на Windows-путях с «\» ломает токены)
@@ -404,6 +411,12 @@ def _decide_bash(cmd, cwd):
         if _all_py_targets_are_tests(cmd):        # прямой запуск только test_*.py → без контент-скана
             return ("defer", "", "")
         return _scan_python(cmd, cwd)
+    m = _RE_UNTIL_WAIT.match(cmd)
+    if m:
+        cond = (m.group(1) or "").lstrip("! \t")
+        tail = m.group(2) or ""
+        if _RE_READONLY_SHELL.match(cond) and (not tail or _RE_READONLY_SHELL.match(tail)):
+            return ("defer", "", "")
     if _RE_READONLY_SHELL.search(cmd):
         return ("defer", "", "")
     return ("ask", "unknown", "")
@@ -462,8 +475,8 @@ def _is_mass_delete(cmd):
 
 
 def _stays_red(kind, obj, cmd):
-    """Доктрина ИНТЕРАКТИВНОЙ сессии: что и после разведения ролей продолжает спрашивать Allow.
-    Всё, что сюда не попало, в интерактиве пропускается молча (и пишется в лог)."""
+    """Доктринальный список (перенос с VPS, действует В ОБЕИХ ролях): что продолжает
+    спрашивать Allow. Всё, что сюда не попало, пропускается молча (и пишется в лог)."""
     if kind in ("env", "edit_secret", "read_secret",     # .env и секреты
                 "sqlite",                                 # живая БД
                 "clasp", "live_sheet",                    # живые таблицы (Лист1 / CRM / Календарь)
@@ -479,15 +492,18 @@ def _stays_red(kind, obj, cmd):
         return not _RE_SCHTASKS_QUERY.search(cmd or "")   # /query — чтение, остальное = контроль задач
     if kind == "py_write":
         return obj in _RED_PY_TOKENS      # боевой токен = красное; «скрипт не прочитан»/«-m X» = неизвестность
-    return False                          # unknown и прочее — источник потопа, в интерактиве молча
+    return False                          # unknown и прочее: незнакомое САМО ПО СЕБЕ не красное (доктрина VPS)
 
 
 def decide_for_role(data, headless):
-    """Решение С УЧЁТОМ РОЛИ. headless → строгий decide() БЕЗ послаблений (жёсткость демона и
-    его детей прежняя). Интерактив → красным остаётся только доктринальное. Возвращает
+    """Решение ПО ДОКТРИНЕ (перенос списка с VPS, кейс 314): Allow спрашивает только
+    доктринальное (_stays_red) — В ОБЕИХ РОЛЯХ, незнакомая команда сама по себе не красная.
+    Раньше headless шёл строгим decide() без послаблений, и чистое чтение (`wc -l` по репо,
+    until-grep-ожидание output) роняло задачу демона в NEEDS_APPROVAL. Параметр headless
+    решение больше не меняет (оставлен вызывающим: роль нужна логу и каналу ask). Возвращает
     (action, kind, obj); kind/obj сохраняются и при смягчении — они нужны логу."""
     action, kind, obj = decide(data)
-    if headless or action != "ask":
+    if action != "ask":
         return action, kind, obj
     cmd = ""
     if (data.get("tool_name") or "") in ("Bash", "PowerShell"):

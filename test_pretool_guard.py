@@ -148,6 +148,10 @@ class TestRedAsk(unittest.TestCase):
 
 
 class TestUnknownAsk(unittest.TestCase):
+    """Строгий КЛАССИФИКАТОР decide() метит незнакомое как ("ask","unknown") — kind нужен логу.
+    РЕШЕНИЕ же принимает decide_for_role: по доктрине VPS незнакомое само по себе НЕ красное
+    и молча пропускается в ОБЕИХ ролях (см. TestDoctrineGreen / TestCase314HeadlessReadonly)."""
+
     def _ask(self, data):
         self.assertEqual(g.decide(data)[0], "ask", data)
 
@@ -309,13 +313,14 @@ class TestMarkerIsolation(unittest.TestCase):
                 pass
 
 
-# ============================ РОЛЬ: интерактив vs headless ============================
-# Регрессия удобства после оживления гарда (0014ea6): интерактивная RC-сессия требовала Allow
-# на КАЖДУЮ небелую команду. Развод по роли — красное только доктринальное в интерактиве,
-# жёсткость демона и его детей БЕЗ изменений.
+# ============================ ДОКТРИНА (обе роли) ============================
+# Перенос доктринального списка с VPS (кейс 314): незнакомая команда сама по себе НЕ красная,
+# Allow спрашивает только _stays_red — В ОБЕИХ РОЛЯХ. Исторически доктрина действовала лишь в
+# интерактиве (развод по роли после 0014ea6), а headless шёл строгим decide(): чистое чтение
+# (`wc -l` по репо, until-grep-ожидание) роняло задачу демона в NEEDS_APPROVAL.
 
-# Команды, которые в ИНТЕРАКТИВЕ обязаны проходить молча, а в HEADLESS — по-прежнему спрашивать.
-GREEN_IN_INTERACTIVE = (
+# Команды, которые по доктрине обязаны проходить молча В ОБЕИХ ролях (раньше headless спрашивал).
+GREEN_UNDER_DOCTRINE = (
     'powershell -NoProfile -Command "Get-Date -Format o"',   # было ("ask","unknown") — главный источник потопа
     "npm --version",
     "mkdir -p tmp/scratch",
@@ -353,18 +358,20 @@ class TestRoleDetection(unittest.TestCase):
         self.assertFalse(g.is_headless({"PRETOOL_ASK_MARKER": "   "}))
 
 
-class TestInteractiveGreen(unittest.TestCase):
-    """ГОЛДЕН: зелёная команда в интерактивной сессии → НОЛЬ Allow."""
+class TestDoctrineGreen(unittest.TestCase):
+    """ГОЛДЕН: не-доктринальная команда → НОЛЬ Allow в ОБЕИХ ролях."""
 
-    def test_green_passes_silently(self):
-        for c in GREEN_IN_INTERACTIVE:
-            self.assertEqual(g.decide_for_role(bash(c), headless=False)[0], "defer", c)
+    def test_green_passes_silently_in_both_roles(self):
+        for c in GREEN_UNDER_DOCTRINE:
+            for headless in (False, True):
+                self.assertEqual(g.decide_for_role(bash(c), headless=headless)[0], "defer",
+                                 (c, headless))
 
-    def test_unknown_is_softened_only_in_interactive(self):
+    def test_unknown_is_softened_in_both_roles(self):
         d = bash("some-unheard-of-tool --flag")
         self.assertEqual(g.decide(d), ("ask", "unknown", ""))          # строгий классификатор не изменён
         self.assertEqual(g.decide_for_role(d, headless=False)[0], "defer")
-        self.assertEqual(g.decide_for_role(d, headless=True)[0], "ask")
+        self.assertEqual(g.decide_for_role(d, headless=True)[0], "defer")   # кейс 314: headless тоже
 
     def test_edits_inside_repo_pass_but_outside_and_dotclaude_stay_red(self):
         self.assertEqual(g.decide_for_role(edit(os.path.join(PROJ, "suggest.py")), False)[0], "defer")
@@ -374,18 +381,20 @@ class TestInteractiveGreen(unittest.TestCase):
         self.assertEqual(g.decide_for_role(edit(os.path.join(PROJ, ".claude", "settings.json")), False)[0], "ask")
 
 
-class TestInteractiveRed(unittest.TestCase):
-    """ГОЛДЕНЫ: sqlite3 / clasp / .env / kill / массовое удаление — Allow обязателен."""
+class TestDoctrineRed(unittest.TestCase):
+    """ГОЛДЕНЫ: sqlite3 / clasp / .env / kill / массовое удаление — Allow обязателен В ЛЮБОЙ роли."""
 
     def test_doctrine_red_still_asks(self):
         for cmd, kind in RED_IN_BOTH_ROLES:
-            action, got_kind, _ = g.decide_for_role(bash(cmd), headless=False)
-            self.assertEqual(action, "ask", cmd)
-            self.assertEqual(got_kind, kind, cmd)
+            for headless in (False, True):
+                action, got_kind, _ = g.decide_for_role(bash(cmd), headless=headless)
+                self.assertEqual(action, "ask", (cmd, headless))
+                self.assertEqual(got_kind, kind, (cmd, headless))
 
     def test_read_env_asks(self):
-        action, kind, _ = g.decide_for_role(read(os.path.join(PROJ, ".env")), headless=False)
-        self.assertEqual((action, kind), ("ask", "read_secret"))
+        for headless in (False, True):
+            action, kind, _ = g.decide_for_role(read(os.path.join(PROJ, ".env")), headless=headless)
+            self.assertEqual((action, kind), ("ask", "read_secret"))
 
     def test_mass_delete_vs_single_file(self):
         self.assertFalse(g._is_mass_delete("rm tmp/one.txt"))
@@ -395,29 +404,83 @@ class TestInteractiveRed(unittest.TestCase):
             self.assertTrue(g._is_mass_delete(c), c)
 
 
-class TestHeadlessUnchanged(unittest.TestCase):
-    """РЕГРЕСС: headless-контур НЕ ТРОНУТ — решение ребёнка демона совпадает со строгим
-    классификатором до последнего поля, для зелёных И красных."""
+class TestRolesAgree(unittest.TestCase):
+    """РЕГРЕСС переноса доктрины: роль решение БОЛЬШЕ НЕ МЕНЯЕТ — headless и интерактив
+    совпадают до последнего поля на зелёных, красных и Edit/Read-кейсах."""
 
-    def test_headless_equals_strict_decide(self):
-        cases = ([bash(c) for c in GREEN_IN_INTERACTIVE]
+    def test_headless_equals_interactive(self):
+        cases = ([bash(c) for c in GREEN_UNDER_DOCTRINE]
                  + [bash(c) for c, _ in RED_IN_BOTH_ROLES]
                  + [bash("git status"), bash("venv/Scripts/python.exe -m unittest test_suggest"),
                     edit(os.path.join(PROJ, "suggest.py")), edit(r"C:\Windows\Temp\x.py"),
                     read(os.path.join(PROJ, ".env"))])
         for d in cases:
-            self.assertEqual(g.decide_for_role(d, headless=True), g.decide(d), d)
-
-    def test_headless_still_asks_on_everything_interactive_now_passes(self):
-        for c in GREEN_IN_INTERACTIVE:
-            self.assertEqual(g.decide_for_role(bash(c), headless=True)[0], "ask", c)
+            self.assertEqual(g.decide_for_role(d, headless=True),
+                             g.decide_for_role(d, headless=False), d)
 
     def test_green_for_both_roles_stays_green(self):
-        """Что было зелёным ДО развода — зелено в обеих ролях (развод не ужесточает демона)."""
+        """Что было зелёным ДО переноса — зелено в обеих ролях (доктрина не ужесточает)."""
         for c in ("git status", "git commit -m 'x'", "venv/Scripts/python.exe -m unittest test_suggest",
                   'venv/Scripts/python.exe cowork_log_append.py "DONE x"'):
             self.assertEqual(g.decide_for_role(bash(c), headless=True)[0], "defer", c)
             self.assertEqual(g.decide_for_role(bash(c), headless=False)[0], "defer", c)
+
+
+class TestCase314HeadlessReadonly(unittest.TestCase):
+    """ГОЛДЕН кейса 314 (2026-07-23 14:33/14:56 → id=314 NEEDS_APPROVAL): headless-задача
+    считала строки файлов репо (`wc -l`) и ждала вердикт фонового прогона циклом until-grep —
+    строгий гард давал ("ask","unknown") на ЧИСТОМ ЧТЕНИИ, демон ронял задачу. Команды —
+    ДОСЛОВНО из pretool_guard.log (правило репо: голден = живая строка, не идеализация);
+    хвост until-строки в логе обрезан на 300 знаках — восстановлен `cat` того же output."""
+
+    WC = ("wc -l D:/turbobaby-bot/suggest.py D:/turbobaby-bot/test_suggest.py "
+          "D:/turbobaby-bot/test_golden_llm.py D:/turbobaby-bot/pc_orchestrator.py")
+    OUT = (r"C:\Users\mxfill1\AppData\Local\Temp\claude\D--turbobaby-bot"
+           r"\40f1c77d-93b3-4d19-a89c-7002dd27f235\tasks\beo05ww9a.output")
+    UNTIL = ('until grep -qE "^(OK|FAILED)" "%s" 2>/dev/null; do sleep 5; done; cat "%s"'
+             % (OUT, OUT))
+
+    def test_case314_green_in_both_roles(self):
+        for cmd in (self.WC, self.UNTIL):
+            for headless in (False, True):
+                self.assertEqual(g.decide_for_role(bash(cmd), headless=headless)[0], "defer",
+                                 (cmd, headless))
+
+    def test_wc_stat_until_are_classifier_green(self):
+        # не смягчение unknown, а ЗЕЛЁНОЕ классификатором: смотрелки wc/stat и цикл ожидания
+        for cmd in (self.WC, self.UNTIL, "stat suggest.py",
+                    "until grep -q RESULT out.log; do sleep 5; done"):
+            self.assertEqual(g.decide(bash(cmd))[0], "defer", cmd)
+
+    def test_until_wait_does_not_whitelist_red(self):
+        # красное внутри цикла/хвоста цикл не обеляет: red-признаки всей команды первичны
+        for cmd, kind in (("until grep -q X f; do sleep 5; done; rm -rf tmp", "delete"),
+                          ("until curl -s https://x/ok; do sleep 5; done", "network"),
+                          ("until grep -q X .env; do sleep 5; done", "env")):
+            action, got_kind, _ = g.decide_for_role(bash(cmd), headless=True)
+            self.assertEqual((action, got_kind), ("ask", kind), cmd)
+
+    def test_e2e_headless_until_no_ask_no_marker(self):
+        """Живой прогон процессом в headless-роли (штамп демона в env): ноль Allow, красная
+        карточка в файл-маркер демону НЕ пишется — NEEDS_APPROVAL на чтении больше нет."""
+        fd, mk = tempfile.mkstemp(suffix=".marker")
+        os.close(fd)
+        os.remove(mk)   # начинаем с чистого (несуществующего) пути
+        env = dict(os.environ, PRETOOL_NOPUSH="1", PYTHONIOENCODING="utf-8", PRETOOL_ASK_MARKER=mk)
+        try:
+            for cmd in (self.WC, self.UNTIL):
+                p = subprocess.run([sys.executable, os.path.join(PROJ, "pretool_guard.py")],
+                                   input=json.dumps(bash(cmd)), capture_output=True,
+                                   text=True, encoding="utf-8", env=env, timeout=30)
+                self.assertEqual(p.returncode, 0, cmd)
+                self.assertEqual(p.stdout.strip(), "", cmd)          # ← НОЛЬ Allow
+            self.assertFalse(os.path.isfile(mk),
+                             "красная карточка ушла демону на чистом чтении (кейс 314)")
+        finally:
+            try:
+                os.remove(mk)
+            except Exception:
+                pass
 
 
 class TestAllowFloodFalsePositives(unittest.TestCase):
