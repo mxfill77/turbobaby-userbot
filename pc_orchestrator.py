@@ -565,6 +565,20 @@ def resolve_claude(retries=1, retry_sleep=2.0):
     return None
 
 
+# --- модель ИСПОЛНИТЕЛЯ headless-задач lane=pc (решение владельца 24.07.2026, тема 328) -------
+# Раньше run_claude звал claude -p БЕЗ --model: модель ТИХО бралась из .claude/settings.json
+# (model=claude-fable-5 — он же дефолт интерактивных сессий репо). Env-ручки ORCH_MODEL /
+# EXECUTOR_MODEL / EXECUTOR_EFFORT — имена VPS-полосы, ПК-код их НЕ читает: «запрошен sonnet —
+# берётся fable» ровно отсюда (мёртвая ручка в .env ничего не переключает). Правка
+# .claude/settings.json — красная зона pretool_guard (вектор само-эскалации), поэтому источник
+# правды исполнителя — ЭТА константа: смена модели = правка строки + коммит → self-update сам
+# перезапустит демон штатным потоком. Env сознательно НЕ читаем (детерминизм: застрявший .env /
+# унаследованный os.environ не смеют молча переключить модель — класс #194). SUGGEST_MODEL
+# (клиентский suggest, fable) и THINKER_MODEL (думатель, fable) не задеты — у них свои явные
+# --model. Полный id обязателен: короткий алиас → HTTP 404 у claude -p (класс #194).
+EXECUTOR_MODEL = "claude-opus-4-8"
+
+
 def run_claude(prompt, timeout, cwd, env):
     """Запуск headless claude -p. Возврат (returncode, stdout, stderr). Таймаут → TimeoutError.
     Инъектируется в тестах (реальный claude не дёргаем). Путь резолвится версионно-независимо."""
@@ -578,9 +592,11 @@ def run_claude(prompt, timeout, cwd, env):
         # УРОВЕНЬ УСИЛИЙ ЯВНО (24.07.2026): claude -p принимает --effort. cwd=REPO уже даёт
         # effortLevel из .claude/settings.json НЕЯВНО, но клиентский флаг/cse-конфиг может его
         # перебить (класс rc-effort-override) — передаём явно из ТОГО ЖЕ источника правды
-        # (settings.json через repo_thinking_settings, дефолт xhigh). prompt держим ПОСЛЕДНИМ.
+        # (settings.json через repo_thinking_settings, дефолт xhigh). МОДЕЛЬ ТОЖЕ ЯВНО
+        # (24.07.2026, тема 328): --model EXECUTOR_MODEL — исполнитель на Opus, settings.json
+        # остаётся про интерактивные сессии (Fable). prompt держим ПОСЛЕДНИМ.
         eff = task_metrics.norm_effort(repo_thinking_settings()[0])
-        argv = [cbin, "-p", "--effort", eff, prompt]
+        argv = [cbin, "-p", "--model", EXECUTOR_MODEL, "--effort", eff, prompt]
         p = subprocess.run(argv, cwd=cwd, capture_output=True,
                            encoding="utf-8", errors="replace", timeout=timeout, env=env,
                            creationflags=NO_WINDOW)
@@ -832,7 +848,7 @@ def run_task(tid, text, note=""):
     try:
         eff, _ = repo_thinking_settings()
         log.info(task_metrics.metrics_line(
-            task=tid, lane="pc", model=_repo_model(), effort=task_metrics.norm_effort(eff),
+            task=tid, lane="pc", model=EXECUTOR_MODEL, effort=task_metrics.norm_effort(eff),
             start_iso=_start,
             end_iso=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
             dur_s=time.monotonic() - _t0, outcome=status, attempts=_mctx.get("attempts", 0),
@@ -1947,17 +1963,6 @@ def repo_thinking_settings(path=None):
     if path is None:
         _thinking_cache = (eff, mtt)
     return eff, mtt
-
-
-def _repo_model(path=None):
-    """Модель, под которой РЕАЛЬНО идёт headless-задача: run_task зовёт claude -p с cwd=REPO без
-    --model, значит модель берётся из .claude/settings.json (ключ model). Для строки METRICS
-    читаем её оттуда же (единый источник правды). Файл не прочитан/битый → доктринальный дефолт."""
-    try:
-        with open(path or REPO_SETTINGS, "r", encoding="utf-8") as f:
-            return str(json.load(f).get("model") or "claude-fable-5").strip() or "claude-fable-5"
-    except Exception:
-        return "claude-fable-5"
 
 
 def _thinker_exec(prompt, timeout, tag):

@@ -302,6 +302,31 @@ class TestEncoding(Base):
         self.assertEqual(captured.get("errors"), "replace")     # не падаем на неведомом байте
         self.assertIn("кириллица жива", out)
 
+    def test_run_claude_passes_executor_model_and_effort(self):
+        # ГОЛДЕН исполнителя (тема 328, 24.07.2026): модель и усилие в argv ЯВНО — Opus 4.8 /
+        # xhigh, ПОЛНЫЙ id (короткий алиас → HTTP 404, класс #194). Без --model claude -p молча
+        # брал model из .claude/settings.json (claude-fable-5 — дефолт интерактивных сессий),
+        # а env-ручки ORCH_MODEL/EXECUTOR_MODEL (имена VPS-полосы) на ПК не читаются вовсе.
+        captured = {}
+
+        class _P:
+            returncode = 0
+            stdout = "RESULT: ок"
+            stderr = ""
+
+        def fake_run(cmd, **kw):
+            captured["argv"] = cmd
+            return _P()
+
+        with mock.patch.object(o.subprocess, "run", fake_run), \
+                mock.patch.object(o, "resolve_claude", lambda: r"C:\x\claude.exe"):
+            o.run_claude("p", 10, o.REPO, {"X": "1"})
+        argv = captured["argv"]
+        self.assertEqual(o.EXECUTOR_MODEL, "claude-opus-4-8")               # решение владельца 24.07
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-opus-4-8")
+        self.assertEqual(argv[argv.index("--effort") + 1], "xhigh")
+        self.assertEqual(argv[-1], "p")                                     # prompt строго последним
+
     def test_child_env_has_pythonioencoding_utf8(self):
         captured = {}
 
@@ -5750,6 +5775,7 @@ class TestMetricsLine(unittest.TestCase):
         metrics = [s for s in seen if isinstance(s, str) and s.startswith("METRICS ")]
         self.assertTrue(metrics, "run_task обязан писать строку METRICS в лог")
         self.assertIn("task=77 lane=pc", metrics[-1])
+        self.assertIn("model=claude-opus-4-8", metrics[-1])   # METRICS показывает модель ИЗ КОМАНДЫ (EXECUTOR_MODEL), не settings.json
         self.assertIn("effort=xhigh", metrics[-1])
         self.assertIn("outcome=done attempts=2", metrics[-1])
         self.assertIn("tokens_in=na tokens_out=na", metrics[-1])
