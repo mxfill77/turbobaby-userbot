@@ -5684,5 +5684,88 @@ class TestLessonCommitRetry(Base):
         self.assertLess(body.index("maybe_lesson_commit_retry()"), body.index("maybe_git_ff_pull()"))
 
 
+class TestMetricsLine(unittest.TestCase):
+    """Строка METRICS: дословный формат (голден), norm_effort, extract_tokens, selfheal_count,
+    и что обёртка run_task РЕАЛЬНО пишет строку METRICS в лог на завершении задачи."""
+
+    def test_format_exact(self):
+        line = o.task_metrics.metrics_line(
+            task=42, lane="pc", model="claude-fable-5", effort="xhigh",
+            start_iso="2026-07-24T14:00:00+00:00", end_iso="2026-07-24T14:00:37+00:00",
+            dur_s=37.4, outcome="done", attempts=2, selfheals=1,
+            tokens_in=None, tokens_out=None)
+        self.assertEqual(
+            line,
+            "METRICS task=42 lane=pc model=claude-fable-5 effort=xhigh "
+            "start=2026-07-24T14:00:00+00:00 end=2026-07-24T14:00:37+00:00 dur_s=37 "
+            "outcome=done attempts=2 selfheals=1 tokens_in=na tokens_out=na")
+
+    def test_effort_norm_default_xhigh(self):
+        self.assertEqual(o.task_metrics.norm_effort("XHIGH"), "xhigh")
+        self.assertEqual(o.task_metrics.norm_effort("bogus"), "xhigh")
+        self.assertEqual(o.task_metrics.norm_effort(""), "xhigh")
+        self.assertEqual(o.task_metrics.norm_effort(None), "xhigh")
+        self.assertEqual(o.task_metrics.norm_effort("max"), "max")
+
+    def test_extract_tokens(self):
+        self.assertEqual(
+            o.task_metrics.extract_tokens({"usage": {"input_tokens": 12, "output_tokens": 3}}), (12, 3))
+        self.assertEqual(
+            o.task_metrics.extract_tokens({"modelUsage": {"claude-fable-5": {"inputTokens": 5, "outputTokens": 7}}}),
+            (5, 7))
+        self.assertEqual(o.task_metrics.extract_tokens("not-json"), (None, None))
+        self.assertEqual(o.task_metrics.extract_tokens({}), (None, None))
+
+    def test_extract_tokens_full_input_with_cache(self):
+        # ПОЛНЫЙ вход = input + cacheRead + cacheCreation (иначе с кэшем промпта соврём владельцу).
+        # Живой формат (замер 23.07): sonnet input=2, cacheRead=29339, cacheCreation=16329 → 45670.
+        self.assertEqual(
+            o.task_metrics.extract_tokens({"modelUsage": {"claude-sonnet-4-6": {
+                "inputTokens": 2, "cacheReadInputTokens": 29339,
+                "cacheCreationInputTokens": 16329, "outputTokens": 8}}}),
+            (45670, 8))
+        self.assertEqual(
+            o.task_metrics.extract_tokens({"usage": {
+                "input_tokens": 2, "cache_read_input_tokens": 100,
+                "cache_creation_input_tokens": 50, "output_tokens": 9}}),
+            (152, 9))
+
+    def test_selfheal_count(self):
+        self.assertEqual(o.task_metrics.selfheal_count("обычная задача"), 0)
+        self.assertEqual(o.task_metrics.selfheal_count("[самопочинка задачи 3, попытка 1] чинись"), 1)
+        self.assertEqual(o.task_metrics.selfheal_count("[самопочинка шага 2, попытка 2]"), 2)
+
+    def test_run_task_emits_metrics(self):
+        seen = []
+
+        def fake_impl(tid, text, note="", _mctx=None):
+            if _mctx is not None:
+                _mctx["attempts"] = 2
+            return "done", "RESULT: ок"
+
+        with mock.patch.object(o, "_run_task_impl", fake_impl), \
+                mock.patch.object(o.log, "info", lambda *a, **k: seen.append(a[0] if a else "")):
+            st, r = o.run_task(77, "простая задача")
+        self.assertEqual(st, "done")
+        metrics = [s for s in seen if isinstance(s, str) and s.startswith("METRICS ")]
+        self.assertTrue(metrics, "run_task обязан писать строку METRICS в лог")
+        self.assertIn("task=77 lane=pc", metrics[-1])
+        self.assertIn("effort=xhigh", metrics[-1])
+        self.assertIn("outcome=done attempts=2", metrics[-1])
+        self.assertIn("tokens_in=na tokens_out=na", metrics[-1])
+
+    def test_metrics_attempts_zero_when_no_spawn(self):
+        # Ранний выход _run_task_impl ДО цикла (claude не найден) → ни одной headless-попытки:
+        # METRICS обязан честно писать attempts=0, а не 1 (иначе over-count спавнов в агрегате).
+        seen = []
+        with mock.patch.object(o, "resolve_claude", lambda *a, **k: None), \
+                mock.patch.object(o.log, "info", lambda *a, **k: seen.append(a[0] if a else "")):
+            st, r = o.run_task(78, "любая задача")
+        self.assertEqual(st, "failed")
+        metrics = [s for s in seen if isinstance(s, str) and s.startswith("METRICS ")]
+        self.assertTrue(metrics, "METRICS должна писаться и на раннем провале")
+        self.assertIn("outcome=failed attempts=0", metrics[-1])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

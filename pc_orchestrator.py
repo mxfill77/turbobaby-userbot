@@ -43,6 +43,7 @@ import urllib.parse
 import urllib.error
 
 import gate_selective         # селективный тест-гейт авто-применения (порт VPS GATE_STEP/SINGLE_SELECTIVE); чистый, без сети
+import task_metrics           # единый формат строки METRICS (обе полосы) + norm_effort/extract_tokens/selfheal_count
 import lesson_router          # обработчик задач-уроков (родитель 292, шаг 3): классификация+маршрут; suggest тянет лениво
 # ДЕПЛОЙ #334 шаг 6/6 (2026-07-14, одобрен владельцем): LLM-маршрут уроков в бою —
 # LESSON_LLM_ROUTE=1 в .env ПОСТОЯННО; коммит-веха триггерит эстафету демона (новый процесс
@@ -574,7 +575,13 @@ def run_claude(prompt, timeout, cwd, env):
         # encoding=utf-8 + errors=replace: без явной кодировки text=True берёт локаль Windows
         # (cp1251) → кириллица в карточках 829 превращалась в кракозябры. replace → не падаем на
         # неведомом байте, а подставляем �. PYTHONIOENCODING=utf-8 ребёнку выставлен в run_task().
-        p = subprocess.run([cbin, "-p", prompt], cwd=cwd, capture_output=True,
+        # УРОВЕНЬ УСИЛИЙ ЯВНО (24.07.2026): claude -p принимает --effort. cwd=REPO уже даёт
+        # effortLevel из .claude/settings.json НЕЯВНО, но клиентский флаг/cse-конфиг может его
+        # перебить (класс rc-effort-override) — передаём явно из ТОГО ЖЕ источника правды
+        # (settings.json через repo_thinking_settings, дефолт xhigh). prompt держим ПОСЛЕДНИМ.
+        eff = task_metrics.norm_effort(repo_thinking_settings()[0])
+        argv = [cbin, "-p", "--effort", eff, prompt]
+        p = subprocess.run(argv, cwd=cwd, capture_output=True,
                            encoding="utf-8", errors="replace", timeout=timeout, env=env,
                            creationflags=NO_WINDOW)
         return p.returncode, (p.stdout or ""), (p.stderr or "")
@@ -722,7 +729,7 @@ def _claude_budget_gate(counter=None, sleeper=None, notifier=None, wait_sec=None
     return False, detail
 
 
-def run_task(tid, text, note=""):
+def _run_task_impl(tid, text, note="", _mctx=None):
     """Исполнить задачу через headless claude -p. → (status, result). status ∈ done|failed|needs_approval.
     Контракт результата (фикс ложного done задачи #24): done ТОЛЬКО при непустом stdout со строкой
     «RESULT: <итог>»; пустой stdout → один авто-повтор (транзиент), снова пустой → failed с хвостом
@@ -751,6 +758,8 @@ def run_task(tid, text, note=""):
     prompt = (note + PREAMBLE) if note else PREAMBLE
     prompt += text
     for attempt in (1, 2):
+        if _mctx is not None:
+            _mctx["attempts"] = attempt   # число headless-попыток этого запуска (1 или 2) для METRICS
         try:  # ЧИСТИМ маркер ПЕРЕД КАЖДОЙ попыткой headless (в т.ч. перед авто-повтором):
             if os.path.exists(marker_path):   # иначе красная карточка прошлого прогона протекла бы
                 os.remove(marker_path)        # в результат нового (ложное needs_approval).
@@ -809,6 +818,29 @@ def run_task(tid, text, note=""):
                               "подтверждено. stdout(хвост): " + _tail(out_s)
                               + (" | stderr(хвост): " + err_tail if err_tail else ""))[:RESULT_MAX]
         return "done", out_s[:RESULT_MAX]
+
+
+def run_task(tid, text, note=""):
+    """Обёртка-наблюдаемость над _run_task_impl: та же сигнатура/возврат, но по завершении пишет
+    ОДНУ структурную строку METRICS в лог демона (модель/усилие/тайминги/исход/попытки/самопочинки/
+    канал). tokens_in/out=na — ПК-исполнитель в ТЕКСТ-режиме (claude -p без --output-format json
+    токены не отдаёт). Замер в try/except — его сбой НИКОГДА не меняет исход задачи."""
+    _mctx = {"attempts": 0}   # 0 = ни одной headless-попытки (ранний выход: claude не найден / бюджет)
+    _t0 = time.monotonic()
+    _start = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    status, result = _run_task_impl(tid, text, note, _mctx)
+    try:
+        eff, _ = repo_thinking_settings()
+        log.info(task_metrics.metrics_line(
+            task=tid, lane="pc", model=_repo_model(), effort=task_metrics.norm_effort(eff),
+            start_iso=_start,
+            end_iso=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            dur_s=time.monotonic() - _t0, outcome=status, attempts=_mctx.get("attempts", 0),
+            selfheals=task_metrics.selfheal_count(text, note),
+            tokens_in=None, tokens_out=None))
+    except Exception as _e:
+        log.warning("METRICS не записан (pc id=%s): %s", tid, _e)
+    return status, result
 
 
 # ------------------------------- обработчики цикла ---------------------------
@@ -1915,6 +1947,17 @@ def repo_thinking_settings(path=None):
     if path is None:
         _thinking_cache = (eff, mtt)
     return eff, mtt
+
+
+def _repo_model(path=None):
+    """Модель, под которой РЕАЛЬНО идёт headless-задача: run_task зовёт claude -p с cwd=REPO без
+    --model, значит модель берётся из .claude/settings.json (ключ model). Для строки METRICS
+    читаем её оттуда же (единый источник правды). Файл не прочитан/битый → доктринальный дефолт."""
+    try:
+        with open(path or REPO_SETTINGS, "r", encoding="utf-8") as f:
+            return str(json.load(f).get("model") or "claude-fable-5").strip() or "claude-fable-5"
+    except Exception:
+        return "claude-fable-5"
 
 
 def _thinker_exec(prompt, timeout, tag):
