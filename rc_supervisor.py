@@ -86,11 +86,24 @@ GRACE_SECONDS = int(os.getenv("RC_LIVENESS_GRACE", "180") or "180")
 # Запасной клапан: RC_LIVENESS=0 полностью выключает зомби-киллер (откат к «рестарт лишь по
 # выходу процесса» — прежнее поведение) на случай, если проба в бою окажется ложно-срабатывающей.
 LIVENESS_ENABLED = os.getenv("RC_LIVENESS", "1") != "0"
+# Порог свежести ДЛЯ СЕРВЕРНОЙ ветки — шире общего 1200с. rc-server пишет веху лога раз в 100 поллов,
+# и в простое интервал между вехами разрастается >20 мин (backoff поллинга), а poll-соединение кратко
+# рвётся при реконнекте → общий предикат ложно приговаривал ЖИВОЙ простаивающий сервер и рестартовал
+# его каждые 20–76 мин, плодя новую Environment на КАЖДЫЙ старт (churn мёртвых сред 24.07 — разбор в
+# docs/artifacts/2026-07-24-rc-churn-liveness.md). Час перекрывает разрыв вех с запасом. Именованный
+# канал остаётся на общем LIVENESS_MAX_AGE (его соединения тают ~за 15 мин — 1200с ему достаточно).
+SERVER_LIVENESS_MAX_AGE = int(os.getenv("RC_SERVER_LIVENESS_MAX_LOG_AGE", "3600") or "3600")
+# Счётчик страйков: ветку гасим как зомби только после STRIKES ПОДРЯД мёртвых проверок, а не одной.
+# Мгновенная просадка соединений при реконнекте (0 conns на один 30-с тик) больше не убивает живой
+# процесс — предикат смерти обязан держаться ~STRIKES*CHECK_INTERVAL с непрерывно. Реальный зомби
+# (стабильно стар+0conn) ловится за это время (по умолчанию ~90с после порога).
+LIVENESS_STRIKES = int(os.getenv("RC_LIVENESS_STRIKES", "3") or "3")
 
 # Две ветки супервизора. `mode` — аргументы claude ПОСЛЕ бинаря и ДО --debug-file:
 #   rc-server:     ['rc']                          → постоянный сервер-Environment (устройство)
 #   named-channel: ['--remote-control', <имя>]     → именованная интерактивная сессия
-SERVER_SPEC = {"label": "rc-server", "mode": ("rc",), "log": SERVER_LOG}
+SERVER_SPEC = {"label": "rc-server", "mode": ("rc",), "log": SERVER_LOG,
+               "max_age": SERVER_LIVENESS_MAX_AGE}
 NAMED_SPEC = {"label": "named-channel", "mode": ("--remote-control", SESSION_NAME), "log": NAMED_LOG}
 BRANCHES = (SERVER_SPEC, NAMED_SPEC)
 
@@ -320,10 +333,13 @@ def channel_alive(age_sec, established, max_age=None):
 
 def probe_alive(spec, pid, now=None, getmtime=None, conns=None, max_age=None):
     """Живость канала ветки: свежесть её --debug-file + установленные соединения pid → предикат
-    channel_alive. Инъекции now/getmtime/conns — для тестов без файловой системы и netstat."""
+    channel_alive. Порог свежести берётся ПЕР-BRANCH из spec["max_age"] (у сервера шире — 3600с),
+    когда явный max_age не задан; ключа нет → общий LIVENESS_MAX_AGE (именованный канал = 1200с).
+    Инъекции now/getmtime/conns/max_age — для тестов без файловой системы и netstat."""
     age = log_age(spec["log"], now=now, getmtime=getmtime)
     est = (conns or established_conns)(pid)
-    return channel_alive(age, est, max_age=max_age)
+    _max = max_age if max_age is not None else spec.get("max_age")
+    return channel_alive(age, est, max_age=_max)
 
 
 def default_spawn(claude, spec, verbose=None, popen=None):
@@ -381,11 +397,13 @@ def default_gate(claude, ready=None, notifier=None, now=None):
 
 
 def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
-                     sleeper=None, killer=None, rounds=None, checks=None, grace_checks=None):
+                     sleeper=None, killer=None, rounds=None, checks=None, grace_checks=None,
+                     strikes_needed=None):
     """Вечный НЕЗАВИСИМЫЙ цикл ОДНОЙ ветки (свой поток): резолв шима → пре-флайт → подъём процесса
     → монитор → пауза → снова. Монитор рестартует по ДВУМ причинам: процесс ВЫШЕЛ сам (poll!=None)
-    ЛИБО зомби — процесс жив, но канал мёртв по probe_alive (после грейс-периода, если проба не
-    выключена RC_LIVENESS=0). rounds/checks/grace_checks — ограничители/инъекции для тестов
+    ЛИБО зомби — процесс жив, но канал мёртв по probe_alive _strikes_needed проверок ПОДРЯД (после
+    грейс-периода, если проба не выключена RC_LIVENESS=0). Порог свежести — пер-branch (spec["max_age"]).
+    rounds/checks/grace_checks/strikes_needed — ограничители/инъекции для тестов
     (None = боевой бесконечный режим). → 0."""
     _resolve = resolver or resolve_claude
     _spawn = spawner or default_spawn
@@ -394,6 +412,7 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
     _sleep = sleeper or time.sleep
     _kill = killer or default_kill
     _grace = max(1, GRACE_SECONDS // max(1, CHECK_INTERVAL)) if grace_checks is None else grace_checks
+    _strikes_needed = LIVENESS_STRIKES if strikes_needed is None else strikes_needed
     n = 0
     while rounds is None or n < rounds:
         n += 1
@@ -416,6 +435,7 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
         log.info("[%s] старт pid=%s: %s %s", spec["label"], getattr(proc, "pid", "?"),
                  claude, " ".join(spec["mode"]))
         c = 0
+        strikes = 0
         while checks is None or c < checks:
             c += 1
             _sleep(CHECK_INTERVAL)
@@ -425,13 +445,21 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
                          spec["label"], code, RESTART_DELAY)
                 break
             # Зомби: процесс жив, но канал мёртв. Только ПОСЛЕ грейса и только если проба включена
-            # (RC_LIVENESS=0 = запасной клапан, откат к «рестарт лишь по выходу процесса»).
+            # (RC_LIVENESS=0 = запасной клапан, откат к «рестарт лишь по выходу процесса»). Гасим НЕ по
+            # одному тику, а после _strikes_needed ПОДРЯД мёртвых проверок: мгновенная просадка соединений
+            # при реконнекте (0 conns на один тик) сбрасывает счётчик и НЕ убивает здоровый простаивающий
+            # сервер (класс churn 24.07). Порог свежести лога — пер-branch, из spec (у сервера шире).
             if LIVENESS_ENABLED and c > _grace and not _alive(spec, proc.pid):
-                log.info("[%s] ЗОМБИ: лог протух (>%s с) И 0 соединений — гашу pid=%s, рестарт",
-                         spec["label"], LIVENESS_MAX_AGE, getattr(proc, "pid", "?"))
-                if proc.poll() is None:
-                    _kill(proc)
-                break
+                strikes += 1
+                if strikes >= _strikes_needed:
+                    log.info("[%s] ЗОМБИ: канал мёртв %s проверок подряд (лог протух И 0 соединений)"
+                             " — гашу pid=%s, рестарт", spec["label"], strikes,
+                             getattr(proc, "pid", "?"))
+                    if proc.poll() is None:
+                        _kill(proc)
+                    break
+            else:
+                strikes = 0
         _sleep(RESTART_DELAY)
     return 0
 

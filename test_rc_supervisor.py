@@ -479,5 +479,87 @@ class TestLauncherFiles(unittest.TestCase):
         self.assertIn(r"<WorkingDirectory>D:\turbobaby-bot</WorkingDirectory>", xml)
 
 
+class TestChurnFixServerLiveness(unittest.TestCase):
+    """ГОЛДЕН фикса churn 24.07 (docs/artifacts/2026-07-24-rc-churn-liveness.md): ложная зомби-проба
+    гасила ЖИВОЙ простаивающий сервер каждые 20–76 мин, плодя новую Environment на каждый старт.
+    Фикс: (а) серверу — свой, более широкий порог свежести лога (3600с vs 1200с у именованного);
+    (б) счётчик страйков — гасим только после N ПОДРЯД мёртвых проверок, а не одной (мгновенная
+    просадка соединений при реконнекте больше не убивает процесс)."""
+
+    SHIM = r"C:\Users\u\.local\bin\claude.exe"
+
+    def _run(self, spec, alive, **kw):
+        spawns, kills, slept = [], [], []
+
+        def spawner(claude, sp):
+            spawns.append((claude, sp["label"]))
+            return _FakeProc(poll_value=None)                 # процесс всегда жив по poll
+
+        rc.supervise_branch(
+            spec, resolver=lambda: self.SHIM, spawner=spawner,
+            alive=alive, gate=lambda c: (True, "ok"),
+            sleeper=slept.append, killer=kills.append,
+            rounds=kw.pop("rounds", 1), checks=kw.pop("checks", 6),
+            grace_checks=kw.pop("grace_checks", 0),
+            strikes_needed=kw.pop("strikes_needed", 3),
+        )
+        return spawns, kills, slept
+
+    # --- (а) пер-branch порог свежести: сервер шире, именованный как раньше ---
+    def test_server_threshold_wider_named_keeps_1200(self):
+        # ГОЛДЕН пер-branch: ОДИН и тот же возраст лога 1500с (>1200, <3600), 0 соединений →
+        # СЕРВЕР (порог 3600) ещё ЖИВ, ИМЕНОВАННЫЙ (порог 1200) уже МЁРТВ. Порог реально свой.
+        server_alive = rc.probe_alive(rc.SERVER_SPEC, pid=1,
+                                      now=5000.0, getmtime=lambda p: 5000.0 - 1500,
+                                      conns=lambda pid: 0)
+        named_dead = rc.probe_alive(rc.NAMED_SPEC, pid=1,
+                                    now=5000.0, getmtime=lambda p: 5000.0 - 1500,
+                                    conns=lambda pid: 0)
+        self.assertTrue(server_alive)                        # сервер на 3600 — 1500с ещё свеж
+        self.assertFalse(named_dead)                         # named на 1200 — 1500с уже протух
+
+    def test_config_server_wide_named_default_strikes_three(self):
+        self.assertEqual(rc.SERVER_SPEC.get("max_age"), rc.SERVER_LIVENESS_MAX_AGE)
+        self.assertGreaterEqual(rc.SERVER_LIVENESS_MAX_AGE, 3600)     # серверу — не меньше часа
+        self.assertIsNone(rc.NAMED_SPEC.get("max_age"))              # named — на общем 1200
+        self.assertEqual(rc.LIVENESS_STRIKES, 3)
+
+    # --- (б) страйки: живой сервер в простое НЕ рестартуется ---
+    def test_idle_server_survives_connection_blip(self):
+        # ЖИВОЙ сервер: соединение просело на 2 тика (реконнект), потом живо → страйки сброшены,
+        # процесс НЕ гасится (ни одного kill), спавн ровно один.
+        seq = iter([False, False, True, True, True, True])
+        spawns, kills, _ = self._run(rc.SERVER_SPEC, alive=lambda sp, pid: next(seq),
+                                     rounds=1, checks=6, strikes_needed=3)
+        self.assertEqual(len(kills), 0)                      # 2 мёртвых тика подряд < 3 → жив
+        self.assertEqual(len(spawns), 1)
+
+    # --- (б) мёртвый сервер: гасим РОВНО после 3-го страйка, не раньше, и рестартуем ---
+    def test_dead_server_killed_after_three_strikes(self):
+        spawns, kills, slept = self._run(rc.SERVER_SPEC, alive=lambda sp, pid: False,
+                                         rounds=1, checks=6, strikes_needed=3)
+        self.assertEqual(len(kills), 1)                      # погашен один раз
+        self.assertEqual(slept.count(rc.CHECK_INTERVAL), 3)  # ровно на 3-й проверке (не 1-й, не 2-й)
+
+    def test_two_consecutive_dead_checks_not_enough(self):
+        # ровно 2 мёртвых тика — НЕ гасим (нужно 3 ПОДРЯД)
+        spawns, kills, _ = self._run(rc.SERVER_SPEC, alive=lambda sp, pid: False,
+                                     rounds=1, checks=2, strikes_needed=3)
+        self.assertEqual(len(kills), 0)
+
+    def test_dead_server_restarted_next_round(self):
+        # мёртвый сервер погашен и ПОДНЯТ заново (рестарт): за 2 раунда — 2 спавна и 2 гашения
+        spawns, kills, _ = self._run(rc.SERVER_SPEC, alive=lambda sp, pid: False,
+                                     rounds=2, checks=6, strikes_needed=3)
+        self.assertEqual(len(spawns), 2)
+        self.assertEqual(len(kills), 2)
+
+    # --- именованный канал ведёт себя как раньше: тоже гасится при стабильно мёртвом канале ---
+    def test_named_channel_zombie_still_killed(self):
+        spawns, kills, _ = self._run(rc.NAMED_SPEC, alive=lambda sp, pid: False,
+                                     rounds=1, checks=6, strikes_needed=3)
+        self.assertEqual(len(kills), 1)                      # реальный зомби именованного — погашен
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
