@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-test_rc_supervisor.py — супервизор канала Claude Code Remote Control (задача pc_remote_control).
-Реального claude НЕ запускаем: резолвер и цикл принимают инъекции.
-Запуск: D:\\turbobaby-bot\\venv\\Scripts\\python.exe -m unittest test_rc_supervisor -v
+test_rc_supervisor.py — ДВУХРЕЖИМНЫЙ супервизор канала Claude Code Remote Control
+(задача pc_remote_control). Реального claude НЕ запускаем: резолвер, спавн, проба живости и цикл
+принимают инъекции. Запуск:
+    D:\\turbobaby-bot\\venv\\Scripts\\python.exe -m unittest test_rc_supervisor -v
 """
 
 import os
+import tempfile
 import unittest
 
 import rc_supervisor as rc
@@ -67,130 +69,296 @@ class TestVersionResolve(unittest.TestCase):
                                 newest=lambda: r"C:\ver\claude.exe")
         self.assertEqual(exe, r"C:\ver\claude.exe")
 
+    def test_native_shim_preferred_over_versioned(self):
+        # Живой прокол 24.07: нативный ВЕЧНЫЙ шим ~/.local/bin/claude.exe (2.1.218) есть, но
+        # .local\bin НЕ в PATH → which пуст. Резолвер обязан взять вечный шим, а НЕ протухающий
+        # версионный Desktop-каталог (иначе RC навсегда завязан на версию Claude Desktop и
+        # ловит WinError 2 на каждом апдейте — класс «CLAUDE_BIN стухшая версия»).
+        native = os.path.join(os.path.expanduser("~"), ".local", "bin", "claude.exe")
+        exe = rc.resolve_claude(which=lambda n: None,
+                                isfile=lambda p: p == native,
+                                newest=lambda: r"C:\ver\claude.exe")
+        self.assertEqual(exe, native)
+
     def test_none_when_nothing_found(self):
         self.assertIsNone(rc.resolve_claude(which=lambda n: None,
                                             isfile=lambda p: False,
                                             newest=lambda: None))
 
 
-class TestSupervisorLoop(unittest.TestCase):
-    """Канал обязан жить ВСЕГДА: RestartOnFailure Планировщика даёт лишь 3 попытки, поэтому
-    подъём сессии после каждого выхода — здесь, в вечном цикле."""
+class TestBuildCmd(unittest.TestCase):
+    """ГОЛДЕН: обе ветки резолвятся на ШИМ и несут правильный режим + СВОЙ --debug-file.
+    Сервер — постоянный Environment (устройство в списке Devices), именованный — сессии с телефона."""
 
-    def test_restarts_after_each_exit(self):
-        runs, slept = [], []
+    SHIM = r"C:\Users\u\.local\bin\claude.exe"
 
-        class _P:
-            returncode = 0
+    def test_server_branch_cmd(self):
+        # `claude rc` = постоянный сервер-Environment (регистрирует устройство)
+        cmd = rc.build_cmd(self.SHIM, rc.SERVER_SPEC)
+        self.assertEqual(cmd, [self.SHIM, "rc", "--debug-file", rc.SERVER_LOG])
 
-        def runner(cmd, **kw):
-            runs.append(cmd)
-            return _P()
+    def test_named_branch_cmd(self):
+        # `claude --remote-control <имя>` = именованная интерактивная сессия
+        cmd = rc.build_cmd(self.SHIM, rc.NAMED_SPEC)
+        self.assertEqual(cmd, [self.SHIM, "--remote-control", rc.SESSION_NAME,
+                               "--debug-file", rc.NAMED_LOG])
 
-        rc.main(resolver=lambda: r"C:\ver\claude.exe", runner=runner,
-                sleeper=slept.append, singleton=lambda: (True, None), rounds=3)
-        self.assertEqual(len(runs), 3)                       # три подъёма подряд
-        self.assertEqual(runs[0][1:], ["--remote-control", rc.SESSION_NAME])
-        self.assertEqual(slept, [rc.RESTART_DELAY] * 3)      # пауза между подъёмами
+    def test_both_branches_use_resolved_binary_and_own_log(self):
+        s = rc.build_cmd(self.SHIM, rc.SERVER_SPEC)
+        n = rc.build_cmd(self.SHIM, rc.NAMED_SPEC)
+        self.assertEqual(s[0], self.SHIM)             # обе ветки — на резолвнутый бинарь (шим)
+        self.assertEqual(n[0], self.SHIM)
+        self.assertNotEqual(rc.SERVER_LOG, rc.NAMED_LOG)   # у каждой ветки СВОЙ лог живости
+        self.assertIn("--debug-file", s)              # --debug-file ВСЕГДА (сигнал живости)
+        self.assertIn("--debug-file", n)
 
-    def test_crash_does_not_break_loop(self):
-        slept = []
+    def test_verbose_only_when_asked(self):
+        self.assertNotIn("--verbose", rc.build_cmd(self.SHIM, rc.SERVER_SPEC, verbose=False))
+        self.assertIn("--verbose", rc.build_cmd(self.SHIM, rc.SERVER_SPEC, verbose=True))
 
-        def runner(cmd, **kw):
-            raise OSError("сессия упала")
 
-        rc.main(resolver=lambda: r"C:\ver\claude.exe", runner=runner,
-                sleeper=slept.append, singleton=lambda: (True, None), rounds=2)
-        self.assertEqual(slept, [rc.RESTART_DELAY] * 2)      # падение = не выход из цикла
+class TestLiveness(unittest.TestCase):
+    """ГОЛДЕН пробы живости (класс «0 TCP ≠ зомби»): единый предикат — канал жив, если лог СВЕЖ
+    ИЛИ есть соединения; мёртв только когда НЕТ обоих. Простаивающий-но-живой (свежий лог, 0 TCP)
+    не приговаривается, реально застрявший (старый лог, 0 TCP) — приговаривается."""
+
+    MAX = 1200
+
+    # --- единый предикат channel_alive ---
+    def test_fresh_log_zero_tcp_is_alive(self):
+        # ГОЛДЕН: свежий лог, 0 TCP → ЖИВ (иначе простаивающий канал ложно убивался бы)
+        self.assertTrue(rc.channel_alive(age_sec=10, established=0, max_age=self.MAX))
+
+    def test_old_log_zero_tcp_is_dead(self):
+        # ГОЛДЕН: старый лог, 0 TCP → МЁРТВ (настоящий зомби ловится)
+        self.assertFalse(rc.channel_alive(age_sec=9999, established=0, max_age=self.MAX))
+
+    def test_old_log_with_connection_is_alive(self):
+        # старый лог, но есть соединение → ЖИВ (соединение спасает при редком логе)
+        self.assertTrue(rc.channel_alive(age_sec=9999, established=1, max_age=self.MAX))
+
+    def test_fresh_log_with_connection_is_alive(self):
+        self.assertTrue(rc.channel_alive(age_sec=5, established=3, max_age=self.MAX))
+
+    def test_missing_log_zero_tcp_is_dead(self):
+        # лога ещё/уже нет (None) и 0 соединений → МЁРТВ
+        self.assertFalse(rc.channel_alive(age_sec=None, established=0, max_age=self.MAX))
+
+    def test_boundary_age_equals_max_is_fresh(self):
+        self.assertTrue(rc.channel_alive(age_sec=self.MAX, established=0, max_age=self.MAX))
+        self.assertFalse(rc.channel_alive(age_sec=self.MAX + 1, established=0, max_age=self.MAX))
+
+    # --- probe_alive: связка свежести лога + соединений ---
+    def test_probe_fresh_log_zero_tcp_alive(self):
+        # свежий лог (mtime = now-10), 0 соединений → ЖИВ
+        ok = rc.probe_alive(rc.SERVER_SPEC, pid=4242,
+                            now=1000.0, getmtime=lambda p: 990.0,
+                            conns=lambda pid: 0, max_age=self.MAX)
+        self.assertTrue(ok)
+
+    def test_probe_old_log_zero_tcp_dead(self):
+        # старый лог (mtime = now-9999), 0 соединений → МЁРТВ
+        ok = rc.probe_alive(rc.SERVER_SPEC, pid=4242,
+                            now=10000.0, getmtime=lambda p: 1.0,
+                            conns=lambda pid: 0, max_age=self.MAX)
+        self.assertFalse(ok)
+
+    def test_probe_old_log_but_connected_alive(self):
+        ok = rc.probe_alive(rc.NAMED_SPEC, pid=4242,
+                            now=10000.0, getmtime=lambda p: 1.0,
+                            conns=lambda pid: 2, max_age=self.MAX)
+        self.assertTrue(ok)
+
+    # --- established_conns: разбор ЖИВОГО формата netstat -ano (правило-класс «мок = живой формат») ---
+    LIVE_NETSTAT = (
+        "\r\n"
+        "Active Connections\r\n"
+        "\r\n"
+        "  Proto  Local Address          Foreign Address        State           PID\r\n"
+        "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1080\r\n"
+        "  TCP    192.168.1.5:54120      160.79.104.10:443     ESTABLISHED     1304\r\n"
+        "  TCP    192.168.1.5:54121      160.79.104.10:443     ESTABLISHED     1304\r\n"
+        "  TCP    192.168.1.5:54999      140.82.113.25:443     ESTABLISHED     9999\r\n"
+        "  TCP    127.0.0.1:49670        127.0.0.1:49671       ESTABLISHED     1304\r\n"
+    )
+
+    class _NP:
+        def __init__(self, out):
+            self.stdout = out
+
+    def test_established_conns_counts_only_matching_pid(self):
+        runner = lambda *a, **k: self._NP(self.LIVE_NETSTAT)
+        self.assertEqual(rc.established_conns(1304, runner=runner), 3)   # три ESTABLISHED у 1304
+        self.assertEqual(rc.established_conns(9999, runner=runner), 1)
+        self.assertEqual(rc.established_conns(5, runner=runner), 0)      # LISTENING/чужие — мимо
+
+    def test_established_conns_zero_when_netstat_breaks(self):
+        def boom(*a, **k):
+            raise OSError("netstat не запустился")
+        self.assertEqual(rc.established_conns(1304, runner=boom), 0)
+
+
+class _FakeProc:
+    """Заглушка процесса ветки: poll() → None (жив) или код выхода; pid для лога."""
+
+    def __init__(self, poll_value=None, pid=4242):
+        self._poll = poll_value
+        self.pid = pid
+
+    def poll(self):
+        return self._poll
+
+
+class TestSuperviseBranch(unittest.TestCase):
+    """Канал КАЖДОЙ ветки живёт ВСЕГДА и НЕЗАВИСИМО: рестарт по ВЫХОДУ процесса ЛИБО по зомби-пробе
+    (процесс жив, но канал мёртв). Живой процесс НЕ рестартуется."""
+
+    SHIM = r"C:\Users\u\.local\bin\claude.exe"
+
+    def _run(self, spec, **kw):
+        spawns, kills, slept = [], [], []
+        pf = kw.pop("proc_factory", lambda: _FakeProc())
+
+        def spawner(claude, sp):
+            spawns.append((claude, sp["label"]))
+            return pf()
+
+        rc.supervise_branch(
+            spec,
+            resolver=kw.pop("resolver", lambda: self.SHIM),
+            spawner=kw.pop("spawner", spawner),
+            alive=kw.pop("alive", lambda sp, pid: True),
+            gate=kw.pop("gate", lambda c: (True, "ok")),
+            sleeper=slept.append,
+            killer=kills.append,
+            rounds=kw.pop("rounds", 1),
+            checks=kw.pop("checks", 3),
+            grace_checks=kw.pop("grace_checks", 0),
+        )
+        return spawns, kills, slept
+
+    def test_live_process_not_restarted(self):
+        # процесс жив (poll None) и канал жив (alive True) → за 3 проверки НИ киллов, ни новых спавнов
+        spawns, kills, slept = self._run(rc.NAMED_SPEC, rounds=1, checks=3,
+                                         proc_factory=lambda: _FakeProc(poll_value=None),
+                                         alive=lambda sp, pid: True)
+        self.assertEqual(len(spawns), 1)                 # подняли ОДИН раз и не трогали
+        self.assertEqual(len(kills), 0)
+        self.assertEqual(spawns[0][0], self.SHIM)        # ветка резолвится на ШИМ
+        self.assertEqual(slept.count(rc.CHECK_INTERVAL), 3)   # три круга мониторинга
+
+    def test_dead_exited_process_restarted(self):
+        # процесс ВЫШЕЛ сам (poll=7) → рестарт каждый раунд; киллер не нужен (уже мёртв)
+        spawns, kills, slept = self._run(rc.SERVER_SPEC, rounds=3, checks=5,
+                                         proc_factory=lambda: _FakeProc(poll_value=7))
+        self.assertEqual(len(spawns), 3)                 # три подъёма подряд
+        self.assertEqual(len(kills), 0)
+
+    def test_zombie_process_killed_and_restarted(self):
+        # процесс жив (poll None), но канал мёртв (alive False) → гасим и рестартуем
+        spawns, kills, slept = self._run(rc.NAMED_SPEC, rounds=2, checks=5, grace_checks=0,
+                                         proc_factory=lambda: _FakeProc(poll_value=None),
+                                         alive=lambda sp, pid: False)
+        self.assertEqual(len(spawns), 2)
+        self.assertEqual(len(kills), 2)                  # каждый зомби ПОГАШЕН перед рестартом
+
+    def test_grace_period_skips_liveness(self):
+        # в грейс-окне зомби-проба НЕ гоняется — свежий процесс не убивается на старте
+        spawns, kills, slept = self._run(rc.NAMED_SPEC, rounds=1, checks=2, grace_checks=2,
+                                         proc_factory=lambda: _FakeProc(poll_value=None),
+                                         alive=lambda sp, pid: False)   # «мёртв», но грейс защищает
+        self.assertEqual(len(spawns), 1)
+        self.assertEqual(len(kills), 0)
+
+    def test_liveness_killswitch_off_no_zombie_kill(self):
+        # RC_LIVENESS=0: зомби-киллер выключен, откат к «рестарт лишь по выходу процесса»
+        saved = rc.LIVENESS_ENABLED
+        rc.LIVENESS_ENABLED = False
+        try:
+            spawns, kills, slept = self._run(rc.SERVER_SPEC, rounds=1, checks=3, grace_checks=0,
+                                             proc_factory=lambda: _FakeProc(poll_value=None),
+                                             alive=lambda sp, pid: False)
+            self.assertEqual(len(spawns), 1)             # процесс жив по poll → не трогаем
+            self.assertEqual(len(kills), 0)
+        finally:
+            rc.LIVENESS_ENABLED = saved
+
+    def test_both_branches_resolve_to_shim(self):
+        # обе ветки через ОДИН резолвер → ШИМ; спавнер видит именно его
+        for spec in rc.BRANCHES:
+            spawns, kills, _ = self._run(spec, rounds=1, checks=1, grace_checks=1,
+                                         proc_factory=lambda: _FakeProc(poll_value=None))
+            self.assertEqual(spawns[0][0], self.SHIM, spec["label"])
 
     def test_missing_claude_waits_and_retries(self):
         runs, slept = [], []
-        rc.main(resolver=lambda: None, runner=lambda *a, **k: runs.append(a),
-                sleeper=slept.append, singleton=lambda: (True, None), rounds=2)
-        self.assertEqual(runs, [])                           # без бинаря ничего не спавним
+        rc.supervise_branch(rc.SERVER_SPEC, resolver=lambda: None,
+                            spawner=lambda c, s: runs.append(1),
+                            gate=lambda c: (True, "ok"), sleeper=slept.append,
+                            killer=lambda p: None, rounds=2)
+        self.assertEqual(runs, [])                       # без бинаря ничего не спавним
         self.assertEqual(slept, [rc.RESTART_DELAY] * 2)
 
-    def test_second_instance_exits_without_spawning(self):
-        # синглтон: вторая копия (ручной запуск поверх задачи) НЕ поднимает второе устройство
-        runs = []
-        rc.main(resolver=lambda: r"C:\ver\claude.exe", runner=lambda *a, **k: runs.append(a),
-                sleeper=lambda s: None, singleton=lambda: (False, None), rounds=5)
-        self.assertEqual(runs, [])
+    def test_not_ready_gate_waits_without_spawn(self):
+        runs, slept = [], []
+        rc.supervise_branch(rc.NAMED_SPEC, resolver=lambda: self.SHIM,
+                            spawner=lambda c, s: runs.append(1),
+                            gate=lambda c: (False, "нет входа"), sleeper=slept.append,
+                            killer=lambda p: None, rounds=2)
+        self.assertEqual(runs, [])                       # непригодный вход → НИ одного зомби-процесса
+        self.assertEqual(slept, [rc.NOT_READY_DELAY] * 2)  # пауза ДЛИННАЯ, а не 15 с
+        self.assertGreater(rc.NOT_READY_DELAY, rc.RESTART_DELAY)
 
 
-class TestDebugArgs(unittest.TestCase):
-    """Диагностика канала: stdout/stderr сессии перехватить нельзя (перенаправление убивает
-    TTY), поэтому просим сам CLI писать отладку в файл. Включатель — файл-флаг: env для задачи
-    Планировщика без прав администратора не задать, а флаг кладётся обычным пользователем."""
+class TestDefaultSpawnNoWindow(unittest.TestCase):
+    """default_spawn: интерактивной сессии нужен ЖИВОЙ TTY скрытой консоли — НЕ перенаправлять stdio
+    и НЕ гасить консоль (CREATE_NO_WINDOW/pythonw). Лог живости усекается (свежий mtime)."""
 
-    def test_off_without_flag(self):
-        self.assertEqual(rc.debug_args(exists=lambda p: False), [])
+    SHIM = r"C:\Users\u\.local\bin\claude.exe"
 
-    def test_on_with_flag(self):
-        args = rc.debug_args(exists=lambda p: True)
-        self.assertEqual(args[0], "--debug-file")
-        self.assertTrue(args[1].endswith(".log"))     # под *.log в .gitignore — секреты не уедут
+    def setUp(self):
+        self.log = os.path.join(tempfile.gettempdir(), "rc_test_spawn_liveness.log")
+        with open(self.log, "w", encoding="utf-8") as f:
+            f.write("stale content that must be truncated")
+        self.spec = {"label": "t", "mode": ("rc",), "log": self.log}
 
-    def test_flag_path_is_repo_local(self):
-        self.assertTrue(rc.DEBUG_FLAG.startswith(rc.REPO))
-        self.assertTrue(rc.DEBUG_LOG.startswith(rc.REPO))
+    def tearDown(self):
+        try:
+            os.remove(self.log)
+        except OSError:
+            pass
 
-    def test_run_once_appends_debug_args(self):
+    def test_no_creationflags_no_stdio_redirect(self):
         seen = {}
 
-        class _P:
-            returncode = 0
+        def fake_popen(cmd, **kw):
+            seen["cmd"], seen["kw"] = cmd, kw
+            return _FakeProc()
 
-        def runner(cmd, **kw):
-            seen["cmd"] = cmd
-            return _P()
-
-        rc.run_once(r"C:\ver\claude.exe", runner=runner, dbg=["--debug-file", "x.log"])
-        self.assertEqual(seen["cmd"][-2:], ["--debug-file", "x.log"])
-        self.assertEqual(seen["cmd"][1:3], ["--remote-control", rc.SESSION_NAME])
-
-    def test_run_once_clean_without_debug(self):
-        seen = {}
-
-        class _P:
-            returncode = 0
-
-        def runner(cmd, **kw):
-            seen["cmd"] = cmd
-            return _P()
-
-        rc.run_once(r"C:\ver\claude.exe", runner=runner, dbg=[])
-        self.assertEqual(len(seen["cmd"]), 3)         # ничего лишнего в боевом запуске
-
-
-class TestNoWindowKilling(unittest.TestCase):
-    """Интерактивной сессии нужен ЖИВОЙ TTY: run_once НЕ имеет права перенаправлять stdio или
-    гасить консоль (CREATE_NO_WINDOW/pythonw). Скрытость даёт wscript (WshShell.Run …, 0)."""
-
-    def test_run_once_keeps_console_and_stdio(self):
-        seen = {}
-
-        class _P:
-            returncode = 7
-
-        def runner(cmd, **kw):
-            seen.update(kw)
-            return _P()
-
-        self.assertEqual(rc.run_once(r"C:\ver\claude.exe", runner=runner), 7)
-        self.assertNotIn("creationflags", seen)              # консоль не гасим
+        rc.default_spawn(self.SHIM, self.spec, verbose=False, popen=fake_popen)
+        self.assertNotIn("creationflags", seen["kw"])          # консоль не гасим
         for k in ("stdout", "stderr", "stdin"):
-            self.assertNotIn(k, seen)                        # stdio не перенаправляем
-        self.assertEqual(seen.get("cwd"), rc.REPO)
+            self.assertNotIn(k, seen["kw"])                    # stdio не перенаправляем
+        self.assertEqual(seen["kw"].get("cwd"), rc.REPO)
+        self.assertEqual(seen["cmd"][0], self.SHIM)            # запускаем ШИМ
+        self.assertIn("--debug-file", seen["cmd"])
+
+    def test_spawn_truncates_liveness_log(self):
+        rc.default_spawn(self.SHIM, self.spec, verbose=False, popen=lambda cmd, **kw: _FakeProc())
+        self.assertEqual(os.path.getsize(self.log), 0)         # старый хвост усечён, mtime=now
+
+    def test_spawn_returns_none_on_popen_error(self):
+        def boom(cmd, **kw):
+            raise OSError("не поднялся")
+        self.assertIsNone(rc.default_spawn(self.SHIM, self.spec, verbose=False, popen=boom))
 
 
-class TestPreflight(unittest.TestCase):
+class TestPreflightGate(unittest.TestCase):
     """ГОЛДЕН живого прокола 22.07: задача Running, процесс claude жив — а канал МЁРТВ.
-    `claude auth status` при этом отвечал loggedIn=true/max и ничего не подозревал; правду
-    сказал только `claude doctor`: вход выдан БЕЗ скоупа user:profile, мост не поднимется.
-    Значит пре-флайт обязан смотреть doctor и НЕ плодить пустых процессов."""
+    `claude auth status` при этом отвечал loggedIn=true/max; правду сказал только `claude doctor`:
+    вход выдан БЕЗ скоупа user:profile. Пре-флайт смотрит doctor и НЕ плодит пустых процессов;
+    карточка владельцу — одна на ОБЕ ветки (дедуп между потоками)."""
 
-    # дословный фрагмент живого вывода doctor (правило-класс «мок = живой формат»)
     DOCTOR_BAD = (
         "Remote Control\n"
         "Remote Control requires a claude.ai subscription. Run claude auth login to sign in "
@@ -226,48 +394,61 @@ class TestPreflight(unittest.TestCase):
         ok, _ = rc.rc_ready(r"C:\c.exe", runner=lambda *a, **k: self._P("", self.DOCTOR_BAD))
         self.assertFalse(ok)
 
-    def test_no_session_spawned_when_not_ready(self):
-        runs, cards, slept = [], [], []
-        rc.main(resolver=lambda: r"C:\ver\claude.exe",
-                runner=lambda *a, **k: runs.append(a),
-                sleeper=slept.append, singleton=lambda: (True, None),
-                ready=lambda c: (False, "Sign-in is missing the user:profile scope"),
-                notifier=cards.append, rounds=3)
-        self.assertEqual(runs, [])                # НИ ОДНОГО пустого процесса-зомби
-        self.assertEqual(len(cards), 1)           # карточка владельцу ровно одна, не спам
+    def test_gate_ok_passes_without_card(self):
+        cards = []
+        ok, _ = rc.default_gate(r"C:\c.exe", ready=lambda c: (True, "ок"),
+                                notifier=cards.append)
+        self.assertTrue(ok)
+        self.assertEqual(cards, [])               # всё хорошо — владельца не дёргаем
+
+    def test_gate_blocked_notifies_once_then_dedup(self):
+        rc._notify_ts[0] = 0.0                    # сброс дедуп-метки
+        cards = []
+        bad = lambda c: (False, "Sign-in is missing the user:profile scope")
+        # первый провал — карточка уходит
+        rc.default_gate(r"C:\c.exe", ready=bad, notifier=cards.append, now=1000.0)
+        # второй провал СРАЗУ (другая ветка) — дубль подавлен
+        rc.default_gate(r"C:\c.exe", ready=bad, notifier=cards.append, now=1000.0 + 5)
+        self.assertEqual(len(cards), 1)
         self.assertIn("auth login", cards[0])
-        # пауза ДЛИННАЯ, а не обычные 15 с: состояние само не изменится, а лог за ночь распух бы
-        self.assertEqual(slept, [rc.NOT_READY_DELAY] * 3)
+        # спустя NOT_READY_DELAY — можно снова
+        rc.default_gate(r"C:\c.exe", ready=bad, notifier=cards.append,
+                        now=1000.0 + rc.NOT_READY_DELAY + 1)
+        self.assertEqual(len(cards), 2)
+
+
+class TestMain(unittest.TestCase):
+    """Один синглтон-супервизор поднимает ОБЕ ветки в потоках; вторая копия молча выходит."""
+
+    def test_second_instance_exits_without_launching(self):
+        launched = []
+        code = rc.main(singleton=lambda: (False, None), branch_runner=lambda spec: launched.append(spec))
+        self.assertEqual(code, 0)
+        self.assertEqual(launched, [])            # вторая копия НЕ поднимает веток
+
+    def test_launches_both_branches(self):
+        launched = []
+        rc.main(singleton=lambda: (True, None), branch_runner=lambda spec: launched.append(spec["label"]))
+        self.assertEqual(sorted(launched), ["named-channel", "rc-server"])   # обе ветки подняты
+
+
+class TestConfigPaths(unittest.TestCase):
+    """Пути и задержки: логи веток и флаг — в репо (под *.log / .gitignore); пауза «не готов» —
+    ДЛИННАЯ, чтобы лог за ночь не распух."""
+
+    def test_flag_and_branch_logs_are_repo_local(self):
+        self.assertTrue(rc.DEBUG_FLAG.startswith(rc.REPO))
+        self.assertTrue(rc.SERVER_LOG.startswith(rc.REPO))
+        self.assertTrue(rc.NAMED_LOG.startswith(rc.REPO))
+        self.assertTrue(rc.SERVER_LOG.endswith(".log"))
+        self.assertTrue(rc.NAMED_LOG.endswith(".log"))
+
+    def test_not_ready_delay_is_longer(self):
         self.assertGreater(rc.NOT_READY_DELAY, rc.RESTART_DELAY)
 
-    def test_session_spawned_when_ready(self):
-        runs = []
-
-        class _R:
-            returncode = 0
-
-        def runner(cmd, **kw):
-            runs.append(cmd)
-            return _R()
-
-        rc.main(resolver=lambda: r"C:\ver\claude.exe", runner=runner,
-                sleeper=lambda s: None, singleton=lambda: (True, None),
-                ready=lambda c: (True, "ок"), notifier=lambda t: None, rounds=2)
-        self.assertEqual(len(runs), 2)
-        self.assertEqual(runs[0][1:3], ["--remote-control", rc.SESSION_NAME])
-
-    def test_card_repeats_after_recovery(self):
-        # починили → сломалось снова: владелец должен узнать повторно (флаг сбрасывается)
-        seq = iter([(False, "нет входа"), (True, "ок"), (False, "нет входа")])
-        cards = []
-
-        class _R:
-            returncode = 0
-
-        rc.main(resolver=lambda: r"C:\ver\claude.exe", runner=lambda *a, **k: _R(),
-                sleeper=lambda s: None, singleton=lambda: (True, None),
-                ready=lambda c: next(seq), notifier=cards.append, rounds=3)
-        self.assertEqual(len(cards), 2)
+    def test_liveness_threshold_covers_idle_intervals(self):
+        # порог свежести обязан перекрывать и лог-вехи (~10 мин), и таяние соединений (~15 мин)
+        self.assertGreaterEqual(rc.LIVENESS_MAX_AGE, 15 * 60)
 
 
 class TestLauncherFiles(unittest.TestCase):
@@ -282,7 +463,6 @@ class TestLauncherFiles(unittest.TestCase):
     def test_vbs_runs_hidden_via_console_python(self):
         vbs = self._read("rc_remote_control.vbs")
         self.assertIn("sh.Run cmd, 0, True", vbs)            # 0 = окно скрыто
-        # проверяем ИМЕННО командную строку, а не пояснения в комментариях
         cmdline = [l for l in vbs.splitlines() if l.strip().startswith("cmd =")][0]
         self.assertIn("rc_supervisor.py", cmdline)
         self.assertIn(r"venv\Scripts\python.exe", cmdline)   # НЕ pythonw: ему нечем дать TTY
