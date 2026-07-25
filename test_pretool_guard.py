@@ -998,5 +998,94 @@ class TestScriptArgsNotRedInShellChecks(unittest.TestCase):
         self.assertIn(_RMRF + " D:/x", out)    # второй сегмент цел
 
 
+class TestDataNotOperation(unittest.TestCase):
+    """Класс «боевые слова в ДАННЫХ — не операция» (порт с VPS 25.07.2026). Четыре случая ТЗ:
+    запись в журнал и сообщение коммита с красными словами → зелёное; реальная опасная операция
+    → красное; секреты → блок. Все проверки — через чистую decide(), ничего не исполняется."""
+
+    JOURNAL = ('python cowork_log_append.py "DONE RC 2026-07-25: слой сужен, убраны os.remove '
+               'и rm -rf из признаков; демон 79694 active"')
+
+    def _kind(self, cmd, tool="Bash"):
+        return g.decide({"tool_name": tool, "tool_input": {"command": cmd}, "cwd": PROJ})[0]
+
+    # --- (1) ДАННЫЕ: красные слова в аргументе/сообщении → зелёное -------------------------
+    def test_journal_write_with_red_words_is_green(self):
+        """Живой провал: точка с запятой ВНУТРИ текста записи рвала команду, кавычка оставалась
+        непарной, аргумент переставал вырезаться — и запись в журнал краснела как удаление."""
+        self.assertEqual(self._kind(self.JOURNAL), "defer")
+        self.assertEqual(self._kind("cd D:\\turbobaby-bot; " + self.JOURNAL, "PowerShell"), "defer")
+        self.assertNotIn("rm -rf", g._scan_text(self.JOURNAL))
+
+    def test_git_commit_message_with_red_words_is_green(self):
+        for cmd in ('git commit -m "фикс: убрал rm -rf и Remove-Item из скрипта"',
+                    'git commit -am "чистка: sqlite3 и clasp больше не зовём"',
+                    'git commit --message="удалил Stop-Process из вотчдога"',
+                    'git commit -m"правка: убрал rm -rf из вотчдога"'):
+            self.assertEqual(self._kind(cmd), "defer", cmd)
+
+    def test_unquoted_git_msg_tail_is_not_a_message(self):
+        """Граница класса: БЕЗ кавычек `-mтекст` несёт ровно одно слово, остальное — обычные
+        аргументы git, и они обязаны остаться под сканом. Вырезаем payload, а не хвост строки."""
+        self.assertEqual(self._kind("git commit -mправка убрал rm -rf D:/x"), "ask")
+
+    def test_search_pattern_with_red_words_is_green(self):
+        for cmd in ('grep -n "Remove-Item" pretool_guard.py',
+                    'grep -e "rm -rf" docs/CLAUDE.md',
+                    'rg "Stop-Process" .',
+                    'findstr "sqlite3" notes.txt'):
+            self.assertEqual(self._kind(cmd), "defer", cmd)
+
+    # --- (2) ОПЕРАЦИЯ: реальное опасное → красное ------------------------------------------
+    def test_real_dangerous_operation_stays_red(self):
+        for cmd in ("rm -rf D:/turbobaby-bot/docs",
+                    "Remove-Item -Recurse -Force D:\\turbobaby-bot",
+                    "git reset --hard origin/main",
+                    "sqlite3 moderation_ipc.db \"delete from q\"",
+                    "Stop-Process -Name python"):
+            self.assertEqual(self._kind(cmd, "PowerShell"), "ask", cmd)
+
+    def test_data_stripping_does_not_hide_neighbour_in_chain(self):
+        """Вырезание данных НЕ прячет соседний кусок цепи."""
+        for cmd in (self.JOURNAL + " && rm -rf D:/turbobaby-bot",
+                    'git commit -m "текст" ; Remove-Item -Recurse D:/x',
+                    'grep -n "foo" a.py | rm -rf D:/y'):
+            self.assertEqual(self._kind(cmd, "PowerShell"), "ask", cmd)
+
+    def test_substitution_in_data_is_not_stripped(self):
+        """Аргумент/шаблон, который САМ исполняет команду, данными не считается."""
+        for cmd in ('python cowork_log_append.py "$(rm -rf D:/turbobaby-bot)"',
+                    'grep -e "$(rm -rf D:/x)" f.txt'):
+            self.assertEqual(self._kind(cmd), "ask", cmd)
+
+    # --- (3) СЕКРЕТЫ: блок ------------------------------------------------------------------
+    def test_secrets_stay_blocked(self):
+        for cmd in ("Get-Content .env", "cat .env", "type .env",
+                    "grep -n TOKEN .env", "python reader.py .env"):
+            self.assertEqual(self._kind(cmd, "PowerShell"), "ask", cmd)
+        self.assertEqual(g.decide(read(r"D:\turbobaby-bot\.env"))[0], "ask")
+
+    def test_secret_path_survives_search_pattern_stripping(self):
+        """Вырезается ШАБЛОН, а не операнд-файл: .env обязан остаться видимым скану."""
+        self.assertIn(".env", g._scan_text("grep -n TOKEN .env"))
+
+    # --- (4) разбор сегментов: регрессы ------------------------------------------------------
+    def test_split_segments_respects_quotes(self):
+        parts = g._split_segments('python x.py "a; b | c" && rm -rf D:/z')
+        self.assertEqual(len(parts), 3)                       # сегмент, разделитель, сегмент
+        self.assertIn("a; b | c", parts[0])                   # разделители в кавычках не режут
+        self.assertEqual(parts[1], "&&")
+        self.assertIn("rm -rf D:/z", parts[2])
+
+    def test_ampersand_is_call_operator_on_pc(self):
+        """PowerShell: `&` — оператор вызова, не связка; сегмент не режем, но и не теряем."""
+        cmd = '& "C:/Users/x/.local/bin/claude.EXE" --version'
+        self.assertIn("claude", g._scan_text(cmd))
+
+    def test_git_msg_stripping_does_not_touch_real_git_red(self):
+        self.assertEqual(self._kind("git push --force origin main"), "ask")
+        self.assertEqual(self._kind("git clean -fd"), "ask")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

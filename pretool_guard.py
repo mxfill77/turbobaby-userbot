@@ -339,20 +339,201 @@ def _looks_like_secret_arg(tok):
     return _is_secret_path(t) or bool(_RE_ENV.search(t))
 
 
-# Разделители сегментов шелла. Сегменты сохраняем ЦЕЛИКОМ и режем аргументы только ВНУТРИ
-# каждого: иначе `python x.py && rm -rf D:\turbobaby-bot` спрятал бы удаление в вырезанном
-# хвосте. Разделитель внутри кавычек ломает shlex → сегмент возвращается как есть (безопасная
-# сторона: не вырезали ничего).
-_RE_SHELL_SEP = re.compile(r"(\s*(?:&&|\|\||[;|]|\n)\s*)")
+# --------------------- разбор команды для СКАН-ТЕКСТА (порт VPS 25.07.2026) -------------------
+# Класс один: БОЕВЫЕ СЛОВА В ДАННЫХ — это не операция. Скан-текст строится посегментно; сегменты
+# сохраняются ЦЕЛИКОМ (иначе `python x.py && rm -rf D:\turbobaby-bot` спрятал бы удаление в
+# вырезанном хвосте), а ВНУТРИ каждого вырезаются именно данные: позиционные аргументы
+# .py-скрипта (уже было), текст `git -m` и поисковый шаблон grep/rg/sed/awk/Select-String.
+
+_RE_ENV_ASSIGN = re.compile(r"^\w+=")      # env-префикс VAR=val перед именем команды
+_WRAPPERS = {"sudo", "doas", "env", "nohup", "nice", "ionice", "time", "timeout",
+             "stdbuf", "xargs", "systemd-run"}
+# Поисковые команды. К серверному набору добавлены ПК-специфичные Select-String / sls / findstr:
+# на этой машине основной шелл PowerShell, и ищут обычно ими.
+_SEARCH_CMDS = {"grep", "egrep", "fgrep", "zgrep", "rg", "ag", "ack", "sed", "awk", "gawk",
+                "mawk", "select-string", "sls", "findstr"}
+_PATTERN_FLAGS = {"-e", "-E", "-n", "--regexp", "--expression", "-pattern"}
+_EXEC_IN_PATTERN = re.compile(
+    r"\$\(|`|\bsystem\s*\(|\bpopen\s*\(|\|\s*['\"]?\s*(?:sh|bash|zsh|xargs)\b")
+
+
+def _base(tok):
+    """Имя команды без пути, кавычек и .exe, нижним регистром (C:\\bin\\grep.exe → grep)."""
+    name = os.path.basename((tok or "").strip("'\"")).lower()
+    return name[:-4] if name.endswith(".exe") else name
+
+
+def _split_segments(cmd):
+    """Команда → [сегмент, разделитель, сегмент, …] С УВАЖЕНИЕМ К КАВЫЧКАМ. Контракт как у
+    прежнего _RE_SHELL_SEP.split (чётные — сегменты, нечётные — разделители дословно), но
+    разделитель ВНУТРИ кавычек больше не режет.
+
+    Живой провал 25.07.2026: запись в журнал
+    `python cowork_log_append.py "DONE …, убраны os.remove и rm -rf …; демон 79694 active"`
+    рвалась по точке с запятой ВНУТРИ текста записи. Кавычка оставалась непарной, shlex падал,
+    аргумент переставал вырезаться — и гард видел «rm -rf» рядом с путём репозитория. Владелец
+    не мог записать в журнал строку, где эти слова просто УПОМЯНУТЫ.
+
+    `&` разделителем НЕ считаем — на ПК это оператор вызова PowerShell (`& "C:\\…\\claude.exe"`),
+    а не связка команд. Дыры это не создаёт: не разрезанный кусок сканируется целиком."""
+    out, buf, q, i, n = [], [], None, 0, len(cmd or "")
+    while i < n:
+        ch = cmd[i]
+        if q:
+            buf.append(ch)
+            if ch == "\\" and q == '"' and i + 1 < n:
+                buf.append(cmd[i + 1])
+                i += 2
+                continue
+            if ch == q:
+                q = None
+            i += 1
+            continue
+        if ch in "'\"":
+            q = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if cmd[i:i + 2] in ("&&", "||"):
+            out.append("".join(buf))
+            out.append(cmd[i:i + 2])
+            buf = []
+            i += 2
+            continue
+        if ch in ";|\n":
+            out.append("".join(buf))
+            out.append(ch)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    out.append("".join(buf))
+    return out
+
+
+def _cmd_index(toks):
+    """Индекс слова-КОМАНДЫ сегмента: пропускает env-префикс (VAR=val) и обёртки
+    (sudo/env/timeout N/…). None — команды в сегменте нет. Разбор СТРУКТУРНЫЙ, а не по подстроке:
+    `cat pretool_guard.log` поисковой командой не станет от того, что рядом есть слово grep."""
+    i, hops = 0, 0
+    while i < len(toks) and _RE_ENV_ASSIGN.match(toks[i]):
+        i += 1
+    while i < len(toks) and hops < 4:
+        name = _base(toks[i])
+        if name not in _WRAPPERS:
+            return i
+        i += 1
+        while i < len(toks) and toks[i].startswith("-"):
+            i += 1
+        if name in ("timeout", "nice", "ionice") and i < len(toks) \
+                and re.match(r"^[\d.]+[smhd]?$", toks[i]):
+            i += 1
+        while i < len(toks) and _RE_ENV_ASSIGN.match(toks[i]):
+            i += 1
+        hops += 1
+    return i if i < len(toks) else None
+
+
+def _strip_git_msg(seg):
+    """Текст `git commit -m "…"` — ДАННЫЕ, а не операция (нюанс bd5d516 на VPS). Сообщение
+    коммита несёт боевые слова В ТЕКСТЕ: «убрал rm -rf из скрипта» — это описание правки, а не
+    удаление. Вырезаются payload'ы -m/-am/--message во всех формах (-m txt, --message=txt,
+    приклеенное -mtxt). Не git или сбой разбора → сегмент КАК ЕСТЬ (fail-safe: скан полный,
+    `git commit -m "x" && rm -rf y` ловится вторым сегментом)."""
+    try:
+        toks = shlex.split(seg)
+    except Exception:
+        return seg
+    i0 = 0
+    while i0 < len(toks) and _RE_ENV_ASSIGN.match(toks[i0]):
+        i0 += 1
+    if i0 >= len(toks) or _base(toks[i0]) != "git":
+        return seg
+    out, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("-m", "-am", "--message"):
+            out.append(t)
+            i += 2
+            continue
+        if t.startswith("--message="):
+            out.append("--message")
+            i += 1
+            continue
+        if re.match(r"^-a?m.", t):        # приклеенный payload: -mтекст / -amтекст
+            out.append("-m")
+            i += 1
+            continue
+        out.append(t)
+        i += 1
+    return " ".join(out)
+
+
+def _strip_search_pattern(toks, idx):
+    """→ (токены БЕЗ поискового шаблона, вырезанные). Шаблон = аргумент -e/-E/-n/-Pattern либо
+    ПЕРВЫЙ позиционный у поисковой команды. Операнды-ФАЙЛЫ не трогаем — иначе
+    `grep -n TOKEN .env` перестал бы блокироваться. Шаблон с признаком ИСПОЛНЕНИЯ
+    ($(…) / `…` / system( / | sh) не вырезаем: это уже не данные."""
+    if idx is None or idx >= len(toks) or _base(toks[idx]) not in _SEARCH_CMDS:
+        return toks, []
+    drop, pat_seen, i = set(), False, idx + 1
+    while i < len(toks):
+        t = toks[i]
+        if t.lower() in _PATTERN_FLAGS and i + 1 < len(toks):
+            drop.add(i + 1)
+            pat_seen = True
+            i += 2
+            continue
+        if t.startswith("-") and t != "-":
+            i += 1
+            continue
+        if not pat_seen:
+            drop.add(i)
+            pat_seen = True
+        i += 1
+    keep, dropped = [], []
+    for k, t in enumerate(toks):
+        if k in drop and not _EXEC_IN_PATTERN.search(t):
+            dropped.append(t)
+        else:
+            keep.append(t)
+    return keep, dropped
+
+
+def _mask(seg, dropped):
+    """Убрать шаблоны из ТЕКСТА сегмента (в кавычках или без), сохранив всё прочее ДОСЛОВНО —
+    red-скан не должен слабеть от переклейки токенов (на Windows shlex ест «\\» в путях).
+    Форма не нашлась → текст как есть, то есть краснее."""
+    out = seg
+    for d in dropped:
+        for form in ('"' + d + '"', "'" + d + "'", d):
+            if d and form in out:
+                out = out.replace(form, " ", 1)
+                break
+    return out
 
 
 def _scan_text(cmd):
-    """Текст для поиска КРАСНЫХ признаков: позиционные аргументы .py-скриптов вырезаны
-    посегментно. Исполняется всегда ИСХОДНАЯ команда — правится только то, по чему ищем."""
+    """Текст для поиска КРАСНЫХ признаков. Исполняется всегда ИСХОДНАЯ команда — правится только
+    то, по чему ищем. Внутри сегмента порядок: текст git -m → аргументы .py-скрипта → поисковый
+    шаблон. Сегменты и разделители сохраняются, чтобы соседний кусок цепи остался под сканом."""
     if not cmd:
         return cmd
-    parts = _RE_SHELL_SEP.split(cmd)
-    return "".join(p if i % 2 else _strip_script_cli_args(p) for i, p in enumerate(parts))
+    out = []
+    for i, p in enumerate(_split_segments(cmd)):
+        if i % 2:
+            out.append(p)                       # разделитель — дословно
+            continue
+        clean = _strip_script_cli_args(_strip_git_msg(p))
+        try:
+            toks = shlex.split(clean)
+        except Exception:
+            out.append(clean)                   # кривое квотирование → сегмент как есть (краснее)
+            continue
+        _keep, dropped = _strip_search_pattern(toks, _cmd_index(toks))
+        out.append(_mask(clean, dropped))
+    return "".join(out)
 
 
 # «Доверие по происхождению» (порт VPS a5c148e): файл ПОД git приехал в репо через review+git —
