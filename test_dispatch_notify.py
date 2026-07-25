@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import dispatch_notify as dn
 
@@ -301,6 +302,90 @@ class TestStdinBom(unittest.TestCase):
             self.assertEqual(dn._read_stdin_json(), {"reason": "clear"})
         finally:
             dn.sys.stdin = saved
+
+
+class TestSessionMetrics(unittest.TestCase):
+    """Метрики СЕССИИ (26.07.2026): третья полоса пишет ту же строку METRICS, что и два демона.
+    Формат транскрипта снят с живого файла ~/.claude/projects/<repo>/<session>.jsonl."""
+
+    LINES = [
+        {"type": "user", "timestamp": "2026-07-24T21:34:27.310Z", "effort": "xhigh",
+         "entrypoint": "claude-desktop"},
+        {"type": "last-prompt", "lastPrompt": "ultrathink ТОЛЬКО read-only, ничего не менять"},
+        {"type": "assistant", "timestamp": "2026-07-24T21:35:00.000Z",
+         "message": {"role": "assistant", "model": "claude-opus-5",
+                     "usage": {"input_tokens": 2, "cache_read_input_tokens": 1000,
+                               "cache_creation_input_tokens": 500, "output_tokens": 40}}},
+        {"type": "assistant", "timestamp": "2026-07-24T21:35:03.500Z",
+         "message": {"role": "assistant", "model": "claude-opus-5",
+                     "usage": {"input_tokens": 3, "cache_read_input_tokens": 2000,
+                               "cache_creation_input_tokens": 0, "output_tokens": 60}}},
+    ]
+
+    def _transcript(self):
+        fd, p = tempfile.mkstemp(suffix=".jsonl")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for d in self.LINES:
+                f.write(json.dumps(d, ensure_ascii=False) + "\n")
+        self.addCleanup(lambda: os.path.exists(p) and os.remove(p))
+        return p
+
+    def test_format_matches_both_lanes(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_EFFORT": "xhigh",
+                                          "CLAUDE_CODE_SESSION_ID": "78d27126-abcd",
+                                          "CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}):
+            line = dn._session_metrics_line(self._transcript())
+        self.assertTrue(line.startswith("METRICS "), line)
+        self.assertIn(" task=78d27126 ", line)
+        self.assertIn(" model=claude-opus-5 ", line)
+        self.assertIn(" effort=xhigh ", line)
+        self.assertIn(" src=claude-desktop ", line)
+        self.assertIn(" outcome=done ", line)
+        # все поля общего формата на месте
+        keys = [p.split("=")[0] for p in line.split()[1:]]
+        for k in ("task", "lane", "type", "mode", "src", "model", "effort", "start", "end",
+                  "dur_s", "outcome", "attempts", "selfheals", "tokens_in", "tokens_out"):
+            self.assertIn(k, keys, k)
+
+    def test_lane_distinguishes_session(self):
+        """Отдельное значение полосы: не pc и не vps."""
+        with mock.patch.dict(os.environ, {"CLAUDE_EFFORT": "xhigh"}):
+            line = dn._session_metrics_line(self._transcript())
+        self.assertIn(" lane=session ", line)
+        self.assertNotIn(" lane=pc ", line)
+        self.assertNotIn(" lane=vps ", line)
+        self.assertEqual(dn.SESSION_LANE, "session")
+
+    def test_duration_is_fractional(self):
+        """Длительность с дробной частью: 21:34:27.310 → 21:35:03.500 = 36.19 с."""
+        with mock.patch.dict(os.environ, {"CLAUDE_EFFORT": "xhigh"}):
+            line = dn._session_metrics_line(self._transcript())
+        self.assertIn(" dur_s=36.19 ", line)
+
+    def test_type_from_prompt(self):
+        """Тип задачи — из последнего запроса владельца, теми же признаками, что у полос."""
+        with mock.patch.dict(os.environ, {"CLAUDE_EFFORT": "xhigh"}):
+            line = dn._session_metrics_line(self._transcript())
+        self.assertIn(" type=read ", line)
+
+    def test_tokens_include_cache(self):
+        """ПОЛНЫЙ вход: input + cacheRead + cacheCreation (2+1000+500 + 3+2000+0 = 3505)."""
+        with mock.patch.dict(os.environ, {"CLAUDE_EFFORT": "xhigh"}):
+            line = dn._session_metrics_line(self._transcript())
+        self.assertIn(" tokens_in=3505 ", line)
+        self.assertTrue(line.endswith(" tokens_out=100"), line)   # последнее поле, пробела за ним нет
+
+    def test_effort_from_environment_wins(self):
+        """Уровень усилий берём из ЖИВОГО окружения сессии, а не из файла настроек."""
+        with mock.patch.dict(os.environ, {"CLAUDE_EFFORT": "high"}):
+            line = dn._session_metrics_line(self._transcript())
+        self.assertIn(" effort=high ", line)
+
+    def test_failsafe_no_transcript(self):
+        """Замерить нечего → пустая строка, и session_end от этого не падает."""
+        self.assertEqual(dn._session_metrics_line("/нет/такого/файла.jsonl"), "")
+        self.assertEqual(dn._session_metrics_line(""), "")
+        self.assertFalse(dn._write_session_metrics(""))
 
 
 if __name__ == "__main__":

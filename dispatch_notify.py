@@ -27,6 +27,7 @@ Termux-мост на телефоне, моста больше нет).
 import os
 import re
 import sys
+import time
 import io
 import json
 import logging
@@ -297,6 +298,136 @@ def _last_tool_command(path, limit=CMD_MAX):
     return ""
 
 
+# ------------------------- МЕТРИКИ СЕССИИ (26.07.2026) ---------------------------------------
+# Обе полосы демонов пишут строку METRICS на задачу, а СЕССИЯ была единственным каналом без
+# замеров: ни модели, ни уровня усилий, ни длительности. Оказалось, сессия знает о себе всё —
+# надо лишь взять из двух разных мест:
+#   уровень усилий — ПРЯМО В ОКРУЖЕНИИ: CLAUDE_EFFORT (хук — ребёнок сессии и видит её env);
+#   модель         — в ТРАНСКРИПТЕ: message.model ассистентских строк (в окружении её НЕТ);
+#   длительность   — по timestamp первой и последней строки транскрипта, с дробной частью;
+#   токены         — usage ассистентских строк, ПОЛНЫЙ вход (input+cacheRead+cacheCreation),
+#                    как того требует доктрина task_metrics: по одному input метрика соврала бы.
+# Формат — общий task_metrics.metrics_line, чтобы `grep METRICS` работал по всем трём полосам.
+# Пишем в лог ПК-полосы: у сессии своего журнала нет, а поля lane/mode/src делают строку
+# однозначной — перепутать её с задачей демона нельзя.
+SESSION_LANE = "session"          # третье значение полосы: не pc и не vps
+
+
+def _iso_ts(v):
+    """'2026-07-24T21:34:27.310Z' → datetime | None. Чужие форматы не угадываем."""
+    import datetime
+    t = str(v or "").strip()
+    if not t:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(t.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _session_facts(path):
+    """Один проход по транскрипту → факты сессии. Ничего не печатает и не бросает.
+    → dict(model, effort, entrypoint, first, last, tokens_in, tokens_out, prompt, turns)."""
+    f = {"model": None, "effort": None, "entrypoint": None, "first": None, "last": None,
+         "tokens_in": 0, "tokens_out": 0, "prompt": "", "turns": 0, "seen_usage": False}
+    import json as _json
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except Exception:
+        return f
+    with fh:
+        for raw in fh:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                d = _json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            ts = _iso_ts(d.get("timestamp"))
+            if ts is not None:
+                if f["first"] is None:
+                    f["first"] = ts
+                f["last"] = ts
+            for k, key in (("effort", "effort"), ("entrypoint", "entrypoint")):
+                if d.get(k):
+                    f[key] = d[k]
+            if d.get("type") == "last-prompt" and isinstance(d.get("lastPrompt"), str):
+                f["prompt"] = d["lastPrompt"]
+            msg = d.get("message")
+            if isinstance(msg, dict) and msg.get("model"):
+                f["model"] = msg["model"]
+                f["turns"] += 1
+                u = msg.get("usage")
+                if isinstance(u, dict):
+                    for k in ("input_tokens", "cache_read_input_tokens",
+                              "cache_creation_input_tokens"):
+                        if k in u:
+                            f["seen_usage"] = True
+                        try:
+                            f["tokens_in"] += int(u.get(k) or 0)
+                        except (TypeError, ValueError):
+                            pass
+                    try:
+                        f["tokens_out"] += int(u.get("output_tokens") or 0)
+                    except (TypeError, ValueError):
+                        pass
+    return f
+
+
+def _session_metrics_line(path, outcome="done"):
+    """Строка METRICS завершившейся сессии → str ('' если замерить нечего).
+    Fail-safe целиком: сбой замера НЕ отменяет ни карточку владельцу, ни запись в журнал."""
+    try:
+        import task_metrics
+        f = _session_facts(path)
+        if f["first"] is None and not f["model"]:
+            return ""                                  # транскрипта нет/пуст — замерять нечего
+        dur = 0.0
+        if f["first"] is not None and f["last"] is not None:
+            dur = max(0.0, (f["last"] - f["first"]).total_seconds())
+        sid = (os.getenv("CLAUDE_CODE_SESSION_ID") or "").strip()
+        if not sid:
+            sid = os.path.basename(str(path or "")).replace(".jsonl", "")
+        effort = task_metrics.norm_effort(os.getenv("CLAUDE_EFFORT") or f["effort"])
+        src = (os.getenv("CLAUDE_CODE_ENTRYPOINT") or f["entrypoint"] or "").strip() or None
+        return task_metrics.metrics_line(
+            task=(sid[:8] or "na"), lane=SESSION_LANE, model=f["model"],
+            effort=effort,
+            start_iso=(f["first"].isoformat(timespec="seconds") if f["first"] else None),
+            end_iso=(f["last"].isoformat(timespec="seconds") if f["last"] else None),
+            dur_s=dur, outcome=outcome, attempts=max(1, f["turns"]), selfheals=0,
+            tokens_in=(f["tokens_in"] if f["seen_usage"] else None),
+            tokens_out=(f["tokens_out"] if f["seen_usage"] else None),
+            task_text=f["prompt"],
+            mode=("test" if task_metrics.under_test(
+                (sys.argv[0] if sys.argv else ""), os.environ, sys.modules) else "prod"),
+            src=src)
+    except Exception:
+        return ""
+
+
+def _write_session_metrics(line):
+    """Дописать строку в журнал ПК-полосы (через log_setup — под тестом уедет в temp)."""
+    if not line:
+        return False
+    try:
+        try:
+            import log_setup
+            path = log_setup.log_path("pc_orchestrator.log")
+        except Exception:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "pc_orchestrator.log")
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("%s,000 INFO %s\n" % (stamp, line))
+        return True
+    except Exception:
+        return False
+
+
 def _read_stdin_json():
     # BOM/пробелы срезаем ЯВНО: живой stdin хука приходит чистым, но любой перенаправляющий
     # слой (PowerShell-пайп) ставит ﻿ впереди — strip() его НЕ убирает, и полезная
@@ -353,12 +484,22 @@ def main():
             # доказывает по ФАКТУ, что блок env из .claude/settings.json доехал до живой сессии
             # (иначе «настроено» проверялось бы только по файлу). Не секрет — печатать можно.
             _log.info(f"хук={kind} | MAX_THINKING_TOKENS={os.getenv('MAX_THINKING_TOKENS') or '-'}")
-            text = _build(kind, _read_stdin_json()) or f"🔔 Dispatch: {kind or 'событие'}"
+            payload = _read_stdin_json()
+            text = _build(kind, payload) or f"🔔 Dispatch: {kind or 'событие'}"
             if kind == "session_end":
                 # ДВА КАНАЛА финала (как у Dispatch): карточка в тему Инбокс 1160 — ПЕРВЫМ
                 # (личка = фолбэк, маршрут send_critical) И строка-итог в cowork_log.
                 channel, ok = send_critical(text)
                 _cowork(text)
+                # ТРЕТЬЯ ПОЛОСА получает свой замер: до этого сессии не писали ни модели, ни
+                # усилий, ни длительности. Строка идёт в лог ПК-полосы тем же форматом, что у
+                # обоих демонов, и помечена lane=session — перепутать с задачей нельзя.
+                _m = _session_metrics_line(str(payload.get("transcript_path") or ""),
+                                           outcome=(str(payload.get("reason") or "").strip() or "done"))
+                if _write_session_metrics(_m):
+                    _log.info("METRICS сессии записан: %.160s", _m)
+                else:
+                    _log.info("METRICS сессии не записан (замерить нечего)")
                 _log.info(f"итог(session_end): channel={channel} ok={ok} | {text[:90]}")
                 sys.exit(0)
             if kind == "notification":
