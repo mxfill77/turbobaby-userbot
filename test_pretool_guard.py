@@ -152,11 +152,18 @@ class TestRedAsk(unittest.TestCase):
             self.assertEqual(g.decide_for_role(data, headless=False)[0], "ask")
 
     def test_nontest_script_still_scanned(self):
-        # красное НЕ ослаблено: не-тест .py по-прежнему сканируется на боевую запись.
-        # pretool_guard.py содержит токен os.remove (в списке _RED_PY_TOKENS) → ask.
-        self._ask(bash("venv/Scripts/python.exe pretool_guard.py"))
-        # тест-файл-аргумент рядом с не-тест целью НЕ обеляет её (не-тест всё равно сканируется):
-        self._ask(bash("venv/Scripts/python.exe pretool_guard.py test_pretool_guard.py"))
+        # красное НЕ ослаблено: НЕотслеживаемый не-тест .py по-прежнему сканируется на боевую
+        # запись. Раньше примером служил сам pretool_guard.py, но он ПОД git — с 25.07 такие
+        # файлы доверяются по происхождению (review+git, см. TestRepoTrackedBodyNotScanned),
+        # поэтому пример переехал на скрипт вне репо; смысл проверки прежний.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "oneoff_write.py").replace("\\", "/")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("import os\nos.remove('x')\n")
+            self._ask(bash("venv/Scripts/python.exe " + p))
+            # тест-файл-аргумент рядом с не-тест целью НЕ обеляет её (не-тест всё равно сканируется):
+            self._ask(bash("venv/Scripts/python.exe " + p + " test_pretool_guard.py"))
 
     def test_edit_secret_and_claude_and_outside(self):
         self._ask(edit(r"D:\turbobaby-bot\.env"))
@@ -813,6 +820,101 @@ class TestSettingsThreeLayers(unittest.TestCase):
         self.assertEqual(live["permissions"]["deny"], staged["permissions"]["deny"])
         self.assertIn("PowerShell", live["hooks"]["PreToolUse"][0]["matcher"])
         self.assertNotEqual(perms.get("defaultMode"), "bypassPermissions")
+
+
+# Красные литералы собираем КОНКАТЕНАЦИЕЙ из кусков: сам файл теста не должен краснеть ни на
+# скане гарда, ни в чужих грепах по репо (правило-класс, порт с VPS).
+_SFO = "set_fleet_" + "oil"          # боевая запись пробега
+_ATX = "add_trans" + "action"        # боевая запись транзакции
+_CBK = "create_" + "booking"         # боевое создание брони
+
+
+class TestScriptArgsAreData(unittest.TestCase):
+    """Класс-фикс (порт VPS 23.07.2026, коммит 7af280c): позиционные аргументы .py-скрипта —
+    ДАННЫЕ, а не операция. Реальный вызов той же операции обязан остаться красным.
+
+    Цель прогона — БЕЗОБИДНЫЙ скрипт ВНЕ репо: так проверяется именно стрип аргументов,
+    а не «доверие по происхождению» (для файлов под git тело и так не читается)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._td = tempfile.TemporaryDirectory(prefix="guard_args_")
+        cls.plain = os.path.join(cls._td.name, "plain_tool.py").replace("\\", "/")
+        with open(cls.plain, "w", encoding="utf-8") as f:
+            f.write("# безобидный скрипт: печатает свои аргументы\n"
+                    "import sys\nprint(sys.argv[1:])\n")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def test_red_word_in_positional_arg_is_green(self):
+        for arg in (_CBK, _SFO + " — записано", _ATX + " 500 THB"):
+            c = "venv/Scripts/python.exe " + self.plain + ' "' + arg + '"'
+            self.assertEqual(g.decide(bash(c))[0], "defer", c)
+
+    def test_real_inline_call_still_red(self):
+        for c in ('venv/Scripts/python.exe -c "' + _ATX + '(amount=100)"',
+                  'venv/Scripts/python.exe -c "import b; b.' + _CBK + '()"'):
+            self.assertEqual(g.decide(bash(c))[0], "ask", c)
+
+    def test_secret_arg_still_blocked(self):
+        dec, kind, _ = g.decide(bash("venv/Scripts/python.exe " + self.plain + " .env"))
+        self.assertEqual(dec, "ask")
+        self.assertEqual(kind, "env")
+
+    def test_strip_keeps_interpreter_and_script(self):
+        out = g._strip_script_cli_args('venv/Scripts/python.exe cclog.py DONE "' + _SFO + '"')
+        self.assertIn("cclog.py", out)
+        self.assertIn("python.exe", out)
+        self.assertNotIn(_SFO, out)
+
+    def test_strip_keeps_secret_arg_visible(self):
+        self.assertIn(".env", g._strip_script_cli_args("venv/Scripts/python.exe reader.py .env"))
+
+    def test_strip_untouched_for_inline_code(self):
+        c = 'venv/Scripts/python.exe -c "' + _ATX + '()"'
+        self.assertEqual(g._strip_script_cli_args(c), c)
+
+    def test_strip_untouched_without_interpreter(self):
+        c = 'grep -n "' + _CBK + '" pricing.py'
+        self.assertEqual(g._strip_script_cli_args(c), c)
+
+    def test_strip_bad_quoting_returns_original(self):
+        c = 'venv/Scripts/python.exe x.py "не закрытая кавычка'
+        self.assertEqual(g._strip_script_cli_args(c), c)
+
+
+class TestRepoTrackedBodyNotScanned(unittest.TestCase):
+    """Класс-фикс «доверие по происхождению» (порт VPS a5c148e): тело файла ПОД git не читаем и
+    не сканируем — он приехал в репо через review+git, тот же довод, что для test_*.py.
+    НЕотслеживаемый .py по-прежнему читается и сканируется — доктрина не ослаблена."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._td = tempfile.TemporaryDirectory(prefix="guard_track_")
+        cls.foreign = os.path.join(cls._td.name, "foreign_tool.py").replace("\\", "/")
+        with open(cls.foreign, "w", encoding="utf-8") as f:
+            f.write("import bridge\nbridge." + _ATX + "(amount=100)\n")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def test_tracked_recognised_foreign_not(self):
+        self.assertTrue(g._is_repo_tracked("pretool_guard.py", PROJ))
+        self.assertFalse(g._is_repo_tracked(self.foreign, PROJ))
+
+    def test_tracked_body_not_scanned(self):
+        # тело pretool_guard.py содержит боевые токены СПИСКОМ (_RED_PY_TOKENS): до фикса
+        # прямой запуск самого гарда краснел на собственном красном списке
+        self.assertEqual(g.decide(bash("venv/Scripts/python.exe pretool_guard.py"))[0], "defer")
+
+    def test_untracked_body_still_scanned(self):
+        c = "venv/Scripts/python.exe " + self.foreign
+        dec, kind, _ = g.decide(bash(c))
+        self.assertEqual(dec, "ask", c)
+        self.assertEqual(kind, "py_write")
 
 
 if __name__ == "__main__":

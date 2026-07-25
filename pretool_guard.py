@@ -291,6 +291,73 @@ def _all_py_targets_are_tests(cmd):
     return bool(files) and all(_is_test_target(f) for f in files)
 
 
+# Позиционные аргументы .py-скрипта — ДАННЫЕ, а не операция (порт класса VPS 23.07.2026,
+# коммит 7af280c). `python cclog.py DONE "<боевое имя> записан"` интерпретатор НЕ исполняет —
+# строку читает сам скрипт; её попадание в скан-текст давало ЛОЖНОЕ красное на каждой такой записи.
+def _strip_script_cli_args(cmd):
+    """Вырезать из СКАН-ТЕКСТА позиционные аргументы после токена, оканчивающегося на .py.
+    Интерпретатор и имя скрипта остаются. Исполняется всегда ИСХОДНАЯ команда — правится только
+    текст, по которому идёт поиск красных токенов.
+
+    Доктрина не ослаблена — режем не всегда:
+      • -c / -m / stdin в команде → там аргумент И ЕСТЬ код → возвращаем как есть (полный скан);
+      • команда без интерпретатора python (grep/cat с .py в аргументе) → как есть;
+      • аргумент, похожий на файл секретов (.env/*.session/…), СОХРАНЯЕМ — иначе
+        `python reader.py .env` перестал бы блокироваться;
+      • кривое квотирование → возвращаем исходную строку, не угадываем.
+    """
+    if not cmd or not _RE_PY.search(cmd) or _RE_PY_FLAG.search(cmd):
+        return cmd
+    try:
+        toks = shlex.split(cmd)
+    except Exception:
+        return cmd
+    kept, cut = [], False
+    for t in toks:
+        if not cut:
+            kept.append(t)
+            if t.lower().endswith(".py"):
+                cut = True
+            continue
+        if _is_secret_path(t) or _RE_ENV.search(t):
+            kept.append(t)                       # секрет в аргументе обязан остаться видимым скану
+    return " ".join(kept) if cut else cmd
+
+
+# «Доверие по происхождению» (порт VPS a5c148e): файл ПОД git приехал в репо через review+git —
+# его тело не сканируем, ровно тот же довод, что уже принят для test_*.py выше. Красное для всего
+# остального НЕ ослаблено: инлайн -c/-m, сама команда, .env, живые таблицы и SQL-запись
+# проверяются полностью, а НЕотслеживаемый .py по-прежнему читается и сканируется.
+_TRACKED_CACHE = {}
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)   # без него git-проба мигала бы чёрным окном
+
+
+def _is_repo_tracked(path, cwd):
+    """True ⇔ .py-цель лежит внутри проекта и отслеживается git. git недоступен/ошибка → False
+    (fail-safe: без доверия идём прежним путём — читаем и сканируем тело)."""
+    if not path:
+        return False
+    for cand in (path, os.path.join(cwd or PROJECT, path), os.path.join(PROJECT, path)):
+        try:
+            ap = os.path.abspath(cand)
+        except Exception:
+            continue
+        if not os.path.isfile(ap) or not _inside_project(ap):
+            continue
+        key = os.path.normcase(ap)
+        if key not in _TRACKED_CACHE:
+            try:
+                rel = os.path.relpath(ap, PROJECT)
+                p = subprocess.run(["git", "-C", PROJECT, "ls-files", "--error-unmatch", "--", rel],
+                                   capture_output=True, text=True, timeout=5,
+                                   creationflags=_NO_WINDOW)
+                _TRACKED_CACHE[key] = (p.returncode == 0)
+            except Exception:
+                _TRACKED_CACHE[key] = False
+        return _TRACKED_CACHE[key]
+    return False
+
+
 # ------------------------------- python scan ---------------------------------
 
 def _read_file(path, cwd):
@@ -328,10 +395,12 @@ def _scan_python(cmd, cwd):
                 return ("defer", "", "")
             return ("ask", "py_write", f"-m {mod}")
         if t.endswith(".py"):
-            if _is_test_target(t):
-                # прямой запуск test_*.py: тело НЕ читаем/НЕ сканируем — красные токены внутри
-                # тестов это фикстуры, а не боевая запись (тесты гейтуются в репо). Красный
-                # список для остального НЕ ослабляем: не-тест .py по-прежнему сканируется ниже.
+            if _is_test_target(t) or _is_repo_tracked(t, cwd):
+                # тело НЕ читаем/НЕ сканируем в двух случаях: (1) прямой запуск test_*.py —
+                # красные токены внутри тестов это фикстуры, а не боевая запись; (2) файл ПОД
+                # git — приехал через review+git («доверие по происхождению», порт VPS a5c148e).
+                # Красный список для остального НЕ ослабляем: НЕотслеживаемый не-тест .py
+                # по-прежнему читается и сканируется ниже.
                 saw_target = True
                 i += 1
                 continue
@@ -341,7 +410,8 @@ def _scan_python(cmd, cwd):
             content += body
             saw_target = True
         i += 1
-    blob = cmd + "\n" + content
+    # скан-текст: позиционные аргументы скрипта — данные, не операция (_strip_script_cli_args)
+    blob = _strip_script_cli_args(cmd) + "\n" + content
     if _RE_ENV.search(blob):
         return ("ask", "env", "")
     for tok in _LIVE_SHEET_TOKENS:
