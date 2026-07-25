@@ -10,6 +10,8 @@
     "allow": [
       "Bash",
       "Bash(*)",
+      "Bash(ssh -i ~/.ssh/turbobaby_vps root@5.223.94.179 *)",
+      "Bash(ssh -i ~/.ssh/turbobaby_vps root@5.223.94.179:*)",
       "PowerShell",
       "PowerShell(*)",
       "Read",
@@ -38,9 +40,6 @@
       "Bash(sqlite3:*)",
       "Bash(clasp *)",
       "Bash(clasp:*)",
-      "Bash(ssh *)",
-      "Bash(scp *)",
-      "Bash(sftp *)",
       "Bash(curl *)",
       "Bash(curl:*)",
       "Bash(wget *)",

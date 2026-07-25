@@ -157,10 +157,107 @@ _RE_CFG_VIEW = re.compile(r"(?i)^\s*(cat|type|head|tail|more|less|grep|rg|findst
 _RE_REDIRECT = re.compile(r">>?")
 
 
+# НАМЕРЕНИЕ ЗАПИСИ в конфиг: перенаправление, пишущие командлеты/утилиты, python-запись.
+# Именно оно и есть красное; всё остальное — просто смотрение.
+_RE_CFG_WRITE = re.compile(
+    r"(?i)>>?|\bset-content\b|\badd-content\b|\bout-file\b|\bnew-item\b|\bcopy-item\b|"
+    r"\bmove-item\b|\bremove-item\b|\btee\b|(^|[\s;&|(])(cp|mv|sed\s+-i|truncate)([\s;&|)]|$)|"
+    r"open\s*\([^)]*['\"][wax]|\.write\s*\(|json\.dump\s*\(|\.writelines\s*\(")
+# ЧТЕНИЕ конфига: смотрелка ГДЕ УГОДНО в команде (не обязательно первым словом) либо
+# python-чтение. Прежняя проверка требовала, чтобы команда НАЧИНАЛАСЬ со смотрелки, и
+# `python -c "json.load(open('.claude/settings.json'))"` давал карточку «хочу изменить конфиг» —
+# на чистом чтении. Класс тот же, что и всюду сегодня: судим по ДЕЙСТВИЮ, а не по позиции слова.
+_RE_CFG_READ = re.compile(
+    r"(?i)(^|[\s;&|(])(cat|type|head|tail|more|less|grep|rg|findstr|ls|dir|git)([\s;&|)]|$)|"
+    r"\bget-content\b|\bget-item\b|\bget-childitem\b|\bselect-string\b|\btest-path\b|"
+    r"json\.load\b|\.read\s*\(|\breadlines\s*\(|\bio\.open\b|\bopen\s*\(")
+
+
 def _is_pure_config_read(cmd):
-    """True ⇔ команда только СМОТРИТ конфиг: известная смотрелка и НИ ОДНОГО перенаправления."""
-    return bool(_RE_CFG_VIEW.match(cmd or "")) and not _RE_REDIRECT.search(cmd or "")
+    """True ⇔ команда только СМОТРИТ конфиг: есть признак чтения и НЕТ ни одного признака записи.
+    Оба условия обязательны — `echo '{}' > .claude/settings.json` начинается с безобидного echo,
+    но несёт перенаправление, и остаётся красным."""
+    c = cmd or ""
+    if _RE_CFG_WRITE.search(c):
+        return False
+    return bool(_RE_CFG_READ.search(c))
 _RE_OUTSIDE_WRITE = re.compile(r"(?i)(>>?|out-file|set-content|new-item|move-item|copy-item)\s+[\"']?([a-z]:[\\/][^\"'\s]+)")
+
+# ------------------------- СЕТЬ: выход наружу против своего канала -----------------------------
+# Прежний признак был подстрочный: слово ssh/nc где угодно в строке красило команду. За сутки это
+# дало 148 карточек из 245 — почти все на РАБОЧЕМ канале `ssh … root@<свой сервер>`, который и так
+# разрешён явным правилом в settings.json, а заодно на `Get-Command ssh`, на `$HOME/.ssh/ключ` и на
+# слове «SSH» ВНУТРИ текста записи в журнал. Владелец жал «разрешить» не глядя — это не защита, а
+# привычка её игнорировать.
+# Сузили по тому же принципу, что и всё сегодня: смотрим ДЕЙСТВИЕ, а не подстроку.
+#   • инструмент должен стоять в КОМАНДНОЙ позиции сегмента (структурно, через _cmd_index);
+#   • ssh/scp/sftp К СВОЕЙ машине — рабочий канал, вопрос не задаём;
+#   • ssh к НЕизвестному хосту, curl/wget/iwr/irm/nc/telnet — как было, красное.
+_SSH_TOOLS = {"ssh", "scp", "sftp"}
+_OPEN_NET_TOOLS = {"curl", "wget", "iwr", "irm", "nc", "ncat", "telnet",
+                   "invoke-webrequest", "invoke-restmethod"}
+_SSH_OWN_EXTRA = {"5.223.94.179", "splinter"}     # свой VPS: явно, а не «что найдётся в конфиге»
+_OWN_HOSTS_CACHE = []
+
+
+def _own_ssh_hosts():
+    """Свои хосты: явный список + все Host из ~/.ssh/config (их владелец завёл сам)."""
+    if _OWN_HOSTS_CACHE:
+        return _OWN_HOSTS_CACHE[0]
+    hosts = set(_SSH_OWN_EXTRA)
+    try:
+        cfg = os.path.join(os.path.expanduser("~"), ".ssh", "config")
+        if os.path.isfile(cfg):
+            with open(cfg, "r", encoding="utf-8", errors="ignore") as f:
+                for ln in f:
+                    p = ln.strip().split()
+                    if len(p) >= 2 and p[0].lower() == "host":
+                        hosts.update(x.lower() for x in p[1:] if "*" not in x)
+    except Exception:
+        pass
+    _OWN_HOSTS_CACHE.append(hosts)
+    return hosts
+
+
+def _ssh_target(toks, idx):
+    """Хост из аргументов ssh/scp/sftp: первый токен, который не флаг и не значение флага."""
+    i, skip = idx + 1, {"-i", "-o", "-p", "-l", "-F", "-b", "-c", "-e", "-m", "-w", "-J", "-L", "-R", "-D"}
+    while i < len(toks):
+        t = toks[i]
+        if t in skip:
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        host = t.split("@")[-1].split(":")[0].strip("'\"")
+        return host.lower()
+    return ""
+
+
+def _net_cmd_kind(cmd):
+    """→ None (сетевой команды нет) | 'own' (ssh/scp/sftp к своей машине) | 'open' (выход наружу).
+    Разбор структурный: инструмент обязан стоять в КОМАНДНОЙ позиции сегмента."""
+    kind = None
+    for i, seg in enumerate(_split_segments(cmd or "")):
+        if i % 2:
+            continue
+        try:
+            toks = shlex.split(seg)
+        except Exception:
+            toks = seg.split()
+        j = _cmd_index(toks)
+        if j is None or j >= len(toks):
+            continue
+        name = _base(toks[j])
+        if name in _OPEN_NET_TOOLS:
+            return "open"
+        if name in _SSH_TOOLS:
+            host = _ssh_target(toks, j)
+            if host and host not in _own_ssh_hosts():
+                return "open"
+            kind = kind or "own"
+    return kind
 
 # --- ЗЕЛЁНЫЕ признаки Bash-команды (проверяются ПОСЛЕ красных) ---
 # Доверенные скрипты — зелёные ПО ИМЕНИ модуля, содержимое не сканируется (их тела законно
@@ -347,7 +444,13 @@ def _looks_like_secret_arg(tok):
 
 _RE_ENV_ASSIGN = re.compile(r"^\w+=")      # env-префикс VAR=val перед именем команды
 _WRAPPERS = {"sudo", "doas", "env", "nohup", "nice", "ionice", "time", "timeout",
-             "stdbuf", "xargs", "systemd-run"}
+             "stdbuf", "xargs", "systemd-run",
+             # Ключевые слова шелла тоже стоят ПЕРЕД командой. Без них структурный разбор не
+             # видел `until curl …; do sleep 5; done` — команда цикла пряталась за словом until,
+             # и выход в сеть внутри ожидания переставал краснеть. Поймано существующим тестом
+             # test_until_wait_does_not_whitelist_red при сужении сетевого признака 25.07.2026.
+             "until", "while", "if", "then", "do", "done", "else", "elif", "!",
+             "exec", "command"}
 # Поисковые команды. К серверному набору добавлены ПК-специфичные Select-String / sls / findstr:
 # на этой машине основной шелл PowerShell, и ищут обычно ими.
 _SEARCH_CMDS = {"grep", "egrep", "fgrep", "zgrep", "rg", "ag", "ack", "sed", "awk", "gawk",
@@ -667,8 +770,13 @@ def _decide_bash(cmd, cwd):
     # секретам из аргументов НЕ вырезаются. `_RE_OUTSIDE_WRITE` ниже намеренно смотрит СЫРУЮ
     # команду: перенаправление `> C:\…` стоит после имени скрипта и вырезанием пряталось бы.
     scan = _scan_text(cmd)
+    netk = _net_cmd_kind(scan)
     for rx, kind in _RED_CMD:
         if rx.search(scan):
+            # Сеть: красное — только НАСТОЯЩИЙ выход наружу. Свой ssh-канал и упоминание слова
+            # в тексте карточки не порождают (см. _net_cmd_kind).
+            if kind == "network" and netk != "open":
+                continue
             obj = ""
             if kind == "delete":
                 obj = _extract_delete_target(scan) or ""
