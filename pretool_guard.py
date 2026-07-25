@@ -319,9 +319,40 @@ def _strip_script_cli_args(cmd):
             if t.lower().endswith(".py"):
                 cut = True
             continue
-        if _is_secret_path(t) or _RE_ENV.search(t):
-            kept.append(t)                       # секрет в аргументе обязан остаться видимым скану
+        if _looks_like_secret_arg(t) or _RE_ARG_EXEC.search(t):
+            kept.append(t)   # путь к секрету и подстановка команды обязаны остаться видимыми скану
     return " ".join(kept) if cut else cmd
+
+
+# Аргумент, который САМ исполняет команду ($(…), `…`, ${…}), вырезать нельзя: это не данные,
+# а операция. Иначе `cclog.py "$(rm -rf …)"` спрятал бы удаление за видом текста записи.
+_RE_ARG_EXEC = re.compile(r"\$\(|`|\$\{")
+
+
+def _looks_like_secret_arg(tok):
+    """Аргумент — ПУТЬ к секрету, а не проза, где слово просто встретилось.
+    `.env`, `../.env`, `C:/proj/.env`, `x.session` → да (вырезать нельзя);
+    `DONE: правил .env и настройки` → нет (пробелы ⇒ это текст записи, а не путь)."""
+    t = (tok or "").strip().strip("'\"")
+    if not t or any(c.isspace() for c in t):
+        return False
+    return _is_secret_path(t) or bool(_RE_ENV.search(t))
+
+
+# Разделители сегментов шелла. Сегменты сохраняем ЦЕЛИКОМ и режем аргументы только ВНУТРИ
+# каждого: иначе `python x.py && rm -rf D:\turbobaby-bot` спрятал бы удаление в вырезанном
+# хвосте. Разделитель внутри кавычек ломает shlex → сегмент возвращается как есть (безопасная
+# сторона: не вырезали ничего).
+_RE_SHELL_SEP = re.compile(r"(\s*(?:&&|\|\||[;|]|\n)\s*)")
+
+
+def _scan_text(cmd):
+    """Текст для поиска КРАСНЫХ признаков: позиционные аргументы .py-скриптов вырезаны
+    посегментно. Исполняется всегда ИСХОДНАЯ команда — правится только то, по чему ищем."""
+    if not cmd:
+        return cmd
+    parts = _RE_SHELL_SEP.split(cmd)
+    return "".join(p if i % 2 else _strip_script_cli_args(p) for i, p in enumerate(parts))
 
 
 # «Доверие по происхождению» (порт VPS a5c148e): файл ПОД git приехал в репо через review+git —
@@ -410,8 +441,8 @@ def _scan_python(cmd, cwd):
             content += body
             saw_target = True
         i += 1
-    # скан-текст: позиционные аргументы скрипта — данные, не операция (_strip_script_cli_args)
-    blob = _strip_script_cli_args(cmd) + "\n" + content
+    # скан-текст: позиционные аргументы скрипта — данные, не операция (_scan_text, посегментно)
+    blob = _scan_text(cmd) + "\n" + content
     if _RE_ENV.search(blob):
         return ("ask", "env", "")
     for tok in _LIVE_SHEET_TOKENS:
@@ -450,25 +481,30 @@ def _decide_read(ti, cwd):
 def _decide_bash(cmd, cwd):
     if not cmd:
         return ("defer", "", "")
+    # Красное ищем в СКАН-ТЕКСТЕ: позиционные аргументы .py-скриптов — ДАННЫЕ, а не операция
+    # (класс-фикс, порт с VPS). Сегменты шелла сохранены целиком, подстановки команд и пути к
+    # секретам из аргументов НЕ вырезаются. `_RE_OUTSIDE_WRITE` ниже намеренно смотрит СЫРУЮ
+    # команду: перенаправление `> C:\…` стоит после имени скрипта и вырезанием пряталось бы.
+    scan = _scan_text(cmd)
     for rx, kind in _RED_CMD:
-        if rx.search(cmd):
+        if rx.search(scan):
             obj = ""
             if kind == "delete":
-                obj = _extract_delete_target(cmd) or ""
+                obj = _extract_delete_target(scan) or ""
             elif kind == "kill":
-                obj = _extract_kill_target(cmd) or ""
+                obj = _extract_kill_target(scan) or ""
             elif kind == "network":
-                obj = _extract_host(cmd) or ""
+                obj = _extract_host(scan) or ""
             elif kind == "sqlite":
-                obj = _extract_db(cmd) or ""
+                obj = _extract_db(scan) or ""
             return ("ask", kind, obj)
-    if _RE_ENV.search(cmd):
+    if _RE_ENV.search(scan):
         return ("ask", "env", "")
     # Конфиг `.claude` защищён для инструментов Write/Edit — значит его надо защитить и от
     # ОБХОДА через шелл. Иначе дыра тривиальна: сессия пишет settings.json.new (внутри репо,
     # зелёное) и копирует его поверх боевого одной командой `cp`, молча расширив свои права.
     # Чтение конфига остаётся зелёным (ветка _RE_READONLY_SHELL ниже — cat/type/Get-Content).
-    m = _RE_CLAUDE_CFG_CMD.search(cmd)
+    m = _RE_CLAUDE_CFG_CMD.search(scan)
     if m and not _is_pure_config_read(cmd):
         return ("ask", "edit_claude", m.group(0))
     m = _RE_OUTSIDE_WRITE.search(cmd)

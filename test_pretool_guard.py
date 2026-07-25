@@ -917,5 +917,86 @@ class TestRepoTrackedBodyNotScanned(unittest.TestCase):
         self.assertEqual(kind, "py_write")
 
 
+# Красные слова — конкатенацией: файл теста не должен краснеть ни на скане, ни в чужих грепах.
+_DOTENV = "." + "env"
+_CFGJSON = ".clau" + "de/settings.json"
+_RMRF = "rm " + "-rf"
+_SQLITE = "sqlite" + "3"
+_SSHW = "ss" + "h"
+_RESET = "git reset " + "--hard"
+_CLASP = "cla" + "sp"
+
+
+class TestScriptArgsNotRedInShellChecks(unittest.TestCase):
+    """Вторая половина класс-фикса: красные признаки ищутся в СКАН-ТЕКСТЕ (_scan_text), поэтому
+    слова из красного списка ВНУТРИ аргумента журнальной записи больше не дают карточку.
+    Опасное остаётся красным: сегменты шелла сохраняются целиком, подстановки команд и пути к
+    секретам из аргументов не вырезаются, перенаправления проверяются по СЫРОЙ команде."""
+
+    J = "venv/Scripts/python.exe cowork_log_append.py "
+
+    def _defer(self, c):
+        self.assertEqual(g.decide(bash(c))[0], "defer", c)
+
+    def _ask(self, c, kind=None):
+        d, k, _ = g.decide(bash(c))
+        self.assertEqual(d, "ask", c)
+        if kind:
+            self.assertEqual(k, kind, c)
+
+    # (а) запись в журнал со словами из красного списка В АРГУМЕНТЕ → зелёное
+    def test_journal_with_red_words_is_green(self):
+        for text in ("DONE правил " + _DOTENV + " и вернул как было",
+                     "DONE перенёс " + _CFGJSON + " в настройки сессий",
+                     "DONE удалил каталог сборки, " + _RMRF + " не потребовался",
+                     "DONE разобрал базу через " + _SQLITE + ", только чтение",
+                     "DONE закрыл вход по " + _SSHW + " паролем",
+                     "DONE откатил через " + _RESET + " и проверил",
+                     "DONE выкатка " + _CLASP + " не делалась"):
+            self._defer(self.J + '"' + text + '"')
+
+    # (б) реальная опасная операция → красное
+    def test_real_dangerous_stays_red(self):
+        self._ask(_RMRF + " D:/turbobaby-bot/pricing.py", "delete")
+        self._ask(_RESET + " HEAD~1", "git_force")
+        self._ask(_SQLITE + ' memory.db "UPDATE x SET y=1"', "sqlite")
+        self._ask("curl https://example.com/x", "network")
+
+    def test_compound_second_segment_still_red(self):
+        # сегменты шелла сохраняются: опасное во ВТОРОМ сегменте не прячется вырезанием
+        self._ask(self.J + '"DONE проба" && ' + _RMRF + " D:/turbobaby-bot", "delete")
+        self._ask(self.J + '"DONE проба"; ' + _SQLITE + ' memory.db "DELETE FROM t"', "sqlite")
+        self._ask(self.J + '"DONE проба" | curl https://example.com', "network")
+
+    def test_command_substitution_in_arg_stays_red(self):
+        # аргумент, который САМ исполняет команду, — не данные: вырезать нельзя
+        self._ask(self.J + '"DONE $(' + _RMRF + ' D:/turbobaby-bot)"', "delete")
+
+    # (в) обращение к секретам → блок
+    def test_secret_access_still_blocked(self):
+        self._ask("venv/Scripts/python.exe reader.py " + _DOTENV, "env")
+        self._ask("cat " + _DOTENV, "env")
+        self._ask("venv/Scripts/python.exe reader.py C:/proj/" + _DOTENV, "env")
+        self.assertEqual(g.decide(edit(r"D:\turbobaby-bot\.env"))[1], "edit_secret")
+        self.assertEqual(g.decide(read(r"D:\turbobaby-bot\.env"))[1], "read_secret")
+
+    def test_claude_config_via_shell_stays_red(self):
+        self._ask("cp new.json " + _CFGJSON, "edit_claude")
+
+    def test_redirect_after_script_still_red(self):
+        # перенаправление стоит ПОСЛЕ имени скрипта — потому _RE_OUTSIDE_WRITE смотрит сырую команду
+        self._ask('venv/Scripts/python.exe x.py > C:/Users/mxfill1/evil.txt', "outside")
+
+    # (г) чтение файла вне репозитория → как раньше (зелёное)
+    def test_read_outside_repo_unchanged(self):
+        self._defer('cat "C:/Users/mxfill1/notes.txt"')
+        self.assertEqual(g.decide(read(r"C:\Users\mxfill1\notes.txt"))[0], "defer")
+
+    def test_scan_text_keeps_segments(self):
+        out = g._scan_text(self.J + '"DONE ' + _RMRF + '" && ' + _RMRF + " D:/x")
+        self.assertNotIn("DONE", out)          # аргумент записи вырезан
+        self.assertIn(_RMRF + " D:/x", out)    # второй сегмент цел
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
