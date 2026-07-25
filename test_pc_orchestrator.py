@@ -5867,5 +5867,95 @@ class TestMetricsLine(unittest.TestCase):
         self.assertIn("outcome=failed attempts=0", metrics[-1])
 
 
+class TestRevizorIpcChecks(unittest.TestCase):
+    """Подключение двух детерминированных чеков черновиков (модуль reviewer) к действующему
+    ревизору. Третий чек модуля — _jcheck — НЕ подключён намеренно: он дублирует работающий
+    #92 «строка J дословно», и тест ниже сторожит, что его даже не вызывают."""
+
+    DEP_TEXT = "Депозит 3000 ฿ и паспорт — нужны оба сразу"
+    YEAR_TEXT = "YAMAHA XMAX 300, 2021 г.в., пробег небольшой"
+    CID = 111222333
+
+    def _pkg(self, *texts, cid=None):
+        return {"client_id": self.CID if cid is None else cid, "sent": list(texts), "drafts": []}
+
+    def test_depcheck_fires(self):
+        out = o._revizor_ipc_findings(self._pkg(self.DEP_TEXT))
+        self.assertEqual([f["check"] for f in out], ["depcheck"], out)
+        self.assertEqual(out[0]["class"], "#93")
+        self.assertEqual(out[0]["action"], "owner")
+        self.assertEqual(out[0]["client_id"], self.CID)
+        self.assertIn("depcheck", out[0]["evidence"])
+
+    def test_yearcheck_fires(self):
+        out = o._revizor_ipc_findings(self._pkg(self.YEAR_TEXT))
+        self.assertEqual([f["check"] for f in out], ["yearcheck"], out)
+        self.assertEqual(out[0]["class"], "#93")
+
+    def test_both_checks_in_one_window(self):
+        out = o._revizor_ipc_findings(self._pkg(self.DEP_TEXT, self.YEAR_TEXT))
+        self.assertEqual(sorted(f["check"] for f in out), ["depcheck", "yearcheck"], out)
+
+    def test_jcheck_duplicate_is_not_called(self):
+        """ДУБЛЬ НЕ ВЫЗЫВАЕТСЯ: если бы подключили review_record целиком, _jcheck отработал бы —
+        и одна и та же находка пошла бы владельцу дважды (своя + #92)."""
+        import reviewer as rv
+        with mock.patch.object(rv, "_jcheck", side_effect=AssertionError("дубль вызван")) as m:
+            out = o._revizor_ipc_findings(self._pkg(self.DEP_TEXT, self.YEAR_TEXT))
+        self.assertFalse(m.called, "_jcheck не должен вызываться")
+        self.assertEqual(len(out), 2)
+        self.assertNotIn("jcheck", [f["check"] for f in out])
+        self.assertEqual(o._REVIZOR_IPC_CHECKS, ("depcheck", "yearcheck"))
+
+    def test_dedup_one_finding_per_check_in_window(self):
+        out = o._revizor_ipc_findings(self._pkg(self.DEP_TEXT, self.DEP_TEXT + " ещё раз"))
+        self.assertEqual(len(out), 1, out)
+
+    def test_staff_window_skipped(self):
+        import reviewer as rv
+        staff = sorted(rv.STAFF_IDS)[0]
+        self.assertEqual(o._revizor_ipc_findings(self._pkg(self.DEP_TEXT, cid=staff)), [])
+
+    def test_clean_window_and_empty_package(self):
+        self.assertEqual(o._revizor_ipc_findings(self._pkg("Здравствуйте! Чем помочь?")), [])
+        self.assertEqual(o._revizor_ipc_findings({}), [])
+        self.assertEqual(o._revizor_ipc_findings(None), [])
+
+    def test_failing_check_does_not_kill_window(self):
+        """Упавший чек пропускаем поштучно — второй обязан отработать."""
+        def boom(_t):
+            raise RuntimeError("чек сломан")
+        out = o._revizor_ipc_findings(
+            self._pkg(self.YEAR_TEXT),
+            checks_fn=(("depcheck", boom), ("yearcheck", __import__("reviewer")._yearcheck)))
+        self.assertEqual([f["check"] for f in out], ["yearcheck"], out)
+
+    def test_routing_same_path_as_other_findings(self):
+        """Маршрутизация ТА ЖЕ: находка попадает в owner-карточку через _revizor_route, вместе с
+        остальными, с тем же снимком очереди (бюджет/дедуп) — своего канала у неё нет."""
+        posted = {}
+
+        def fake_post(owner_findings, items):
+            posted["findings"] = list(owner_findings)
+            return True
+
+        with mock.patch.object(o, "_revizor_postrelease_findings", return_value=[]), \
+             mock.patch.object(o, "_revizor_consult", return_value=[]), \
+             mock.patch.object(o, "_loc_fetch_items", return_value=[]), \
+             mock.patch.object(o, "_revizor_post_owner_card", side_effect=fake_post), \
+             mock.patch.object(o, "_cowork"):
+            res = o._revizor_route([self._pkg(self.DEP_TEXT)], now=1000.0)
+        self.assertEqual(res["owner"], 1, res)
+        self.assertEqual(res["tasks"], 0)
+        self.assertEqual([f["check"] for f in posted.get("findings", [])], ["depcheck"])
+        self.assertEqual(posted["findings"][0]["class"], "#93")
+
+    def test_owner_card_line_renders_class(self):
+        out = o._revizor_ipc_findings(self._pkg(self.DEP_TEXT))
+        text = o._revizor_owner_card_text(out)
+        self.assertIn("[класс #93]", text)
+        self.assertIn(str(self.CID), text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

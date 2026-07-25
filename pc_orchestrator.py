@@ -4610,6 +4610,63 @@ def _revizor_postrelease_findings(package, exp=None, getter=None, resolve_delive
     return out
 
 
+# ------------- ДЕТЕРМИНИРОВАННЫЕ ЧЕКИ ЧЕРНОВИКОВ (модуль reviewer, подключены 26.07.2026) ------
+# Модуль reviewer.py спасён из забытого клона (коммит dc7ecd1) и до сих пор не вызывался ниоткуда.
+# Из трёх его чеков подключаем ДВА — те, что не покрывает ни чек-лист думателя (классы а–ж), ни
+# пост-релизная сверка #92:
+#   depcheck  — депозит требует ОБА (деньги И паспорт одновременно); «или» = нормальный выбор, не находка;
+#   yearcheck — год ПОКОЛЕНИЯ (рядом с моделью / «г.в.»), но НЕ в денежном контексте.
+# Третий чек модуля (_jcheck) НЕ подключаем НАМЕРЕННО: он дублирует работающий #92 «строка J
+# дословно». Поэтому зовём две функции ПОИМЁННО, а не review_record — так дубль не только не
+# используется, но и физически не исполняется (сторожит test_jcheck_duplicate_is_not_called).
+_REVIZOR_IPC_CLASS = "#93"                       # класс находок детерминированных чеков черновиков
+_REVIZOR_IPC_CHECKS = ("depcheck", "yearcheck")  # ровно эти два; jcheck сюда не входит
+
+
+def _revizor_ipc_findings(package, checks_fn=None):
+    """Детерминированные чеки черновиков окна → находки owner-карточки (action=owner, класс #93).
+    Импорт reviewer ЛЕНИВЫЙ — ровно как moderation_ipc внутри самого reviewer: нет модуля → тик
+    работает как раньше, а не падает. STAFF-окна пропускаем тем же списком, что и review_record.
+    Дедуп по имени чека — одна находка на класс дефекта в окне, как у #92. Упавший чек пропускаем
+    поштучно, окно не роняем. checks_fn инъектируется в тестах. → list находок."""
+    p = package or {}
+    cid = p.get("client_id")
+    texts = _revizor_live_texts(p)
+    if not texts:
+        return []
+    try:
+        import reviewer as _rv
+    except Exception as e:                       # модуля нет/сломан → тик как раньше, без находок
+        log.warning("ревизор: модуль чеков черновиков недоступен (fail-safe): %s", e)
+        return []
+    try:
+        if cid in _rv.STAFF_IDS:                 # внутренний контур клиентскими чеками не проверяем
+            return []
+    except Exception:
+        pass
+    if checks_fn is None:
+        checks_fn = (("depcheck", _rv._depcheck), ("yearcheck", _rv._yearcheck))
+    seen, out = set(), []
+    for _label, txt in texts:
+        for name, fn in checks_fn:
+            if name in seen:
+                continue
+            try:
+                detail = fn(txt)
+            except Exception as e:
+                log.warning("ревизор: чек «%s» упал на окне %s (fail-safe, чек пропущен): %s",
+                            name, cid, e)
+                continue
+            if not detail:
+                continue
+            seen.add(name)
+            out.append({"class": _REVIZOR_IPC_CLASS, "client_id": cid, "action": "owner",
+                        "check": name,
+                        "evidence": (f"чек «{name}»: {detail}")[:_REVIZOR_EVIDENCE_MAX],
+                        "task_text": ""})
+    return out
+
+
 def _revizor_route(packages, now=None):
     """Шаг 4/7 (262). Каждое окно → думатель-ревизор (_revizor_consult); находки маршрутизируем по
     action: task → дирижёр (бюджет/дедуп), owner → карточка 1160, noise → лог. Пусто → тишина +
@@ -4621,9 +4678,11 @@ def _revizor_route(packages, now=None):
         return {"windows": 0, "tasks": 0, "owner": 0, "noise": 0, "failed": 0}
     now = time.time() if now is None else now
     task_f, owner_f, noise_n, failed, demoted = [], [], 0, 0, 0
-    # ШАГ 5/6 (92): ДЕТЕРМИНИРОВАННАЯ пост-релизная сверка живых черновиков чек-листом #92 — НЕ зависит
-    # от LLM-думателя (даже если он упадёт ниже, транспортные регрессии QUOTE/DELIVERY поймаем). Сбой по
-    # окну — fail-safe пропуск, не роняет прогон. Находки текут в ТУ ЖЕ owner-карточку, что классы а–ж.
+    # ДЕТЕРМИНИРОВАННЫЕ ПРОХОДЫ — НЕ зависят от LLM-думателя (даже если он упадёт ниже, регрессии
+    # поймаем). Их два, и оба текут в ТУ ЖЕ owner-карточку, что классы а–ж, с тем же бюджетом и
+    # дедупом; сбой по окну — fail-safe пропуск, прогон не роняется:
+    #   #92 — пост-релизная сверка транспорта QUOTE/DELIVERY (шаг 5/6 родителя 92);
+    #   #93 — чеки черновиков depcheck/yearcheck (модуль reviewer, подключены 26.07.2026).
     for pkg in pkgs:
         try:
             pr = _revizor_postrelease_findings(pkg)
@@ -4633,6 +4692,15 @@ def _revizor_route(packages, now=None):
                          (pkg or {}).get("client_id"), len(pr))
         except Exception as e:
             log.warning("ревизор: пост-релизная сверка окна %s упала (fail-safe): %s",
+                        (pkg or {}).get("client_id"), e)
+        try:
+            ipc = _revizor_ipc_findings(pkg)
+            if ipc:
+                owner_f.extend(ipc)
+                log.info("ревизор: чеки черновиков окно %s — %d находок класса %s → owner-карточка",
+                         (pkg or {}).get("client_id"), len(ipc), _REVIZOR_IPC_CLASS)
+        except Exception as e:
+            log.warning("ревизор: чеки черновиков окна %s упали (fail-safe): %s",
                         (pkg or {}).get("client_id"), e)
     for pkg in pkgs:
         findings = _revizor_consult(pkg)
