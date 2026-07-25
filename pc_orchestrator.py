@@ -167,6 +167,17 @@ else:
     logging.basicConfig(filename=LOG_PATH, level=logging.INFO, format=_ORCH_FMT)
 log = logging.getLogger("pc_orchestrator")
 
+# ТЕСТ-ПРОГОН ПРОТИВ БОЕВОГО (порт с VPS 25.07.2026). На ПК разведение УЖЕ своё и остаётся как
+# есть: log_setup уводит лог теста в temp (а не глушит) и намеренно НЕ смотрит на «unittest в
+# sys.modules» — демон импортирует gate_selective, который гоняет тесты, и боевой лог уехал бы в
+# temp ровно тогда, когда нужен. Здесь добавляем ВТОРОЙ признак из общего модуля: он опознаёт
+# тест ПО ИМЕНИ ВХОДНОГО ФАЙЛА и по тест-флагам окружения. Нужен для поля mode= в строке METRICS.
+_UNDER_TEST = task_metrics.under_test((sys.argv[0] if sys.argv else ""), os.environ, sys.modules)
+try:
+    _UNDER_TEST = _UNDER_TEST or log_setup.is_test_context()
+except Exception:                       # log_setup мог не импортироваться (см. блок выше)
+    pass
+
 BRIDGE_URL = os.getenv("BRIDGE_URL", "").strip()
 BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
 
@@ -853,7 +864,10 @@ def run_task(tid, text, note=""):
             end_iso=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
             dur_s=time.monotonic() - _t0, outcome=status, attempts=_mctx.get("attempts", 0),
             selfheals=task_metrics.selfheal_count(text, note),
-            tokens_in=None, tokens_out=None))
+            tokens_in=None, tokens_out=None,
+            task_text=text,
+            mode=("test" if _UNDER_TEST else "prod"),
+            src=(os.path.basename((sys.argv[0] if sys.argv else "") or "") or None)))
     except Exception as _e:
         log.warning("METRICS не записан (pc id=%s): %s", tid, _e)
     return status, result

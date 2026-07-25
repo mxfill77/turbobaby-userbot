@@ -5718,12 +5718,86 @@ class TestMetricsLine(unittest.TestCase):
             task=42, lane="pc", model="claude-fable-5", effort="xhigh",
             start_iso="2026-07-24T14:00:00+00:00", end_iso="2026-07-24T14:00:37+00:00",
             dur_s=37.4, outcome="done", attempts=2, selfheals=1,
-            tokens_in=None, tokens_out=None)
+            tokens_in=None, tokens_out=None,
+            task_text="ultrathink Приземлить проверенный гард из origin/main",
+            mode="prod", src="pc_orchestrator.py")
         self.assertEqual(
             line,
-            "METRICS task=42 lane=pc model=claude-fable-5 effort=xhigh "
-            "start=2026-07-24T14:00:00+00:00 end=2026-07-24T14:00:37+00:00 dur_s=37 "
+            "METRICS task=42 lane=pc type=code mode=prod src=pc_orchestrator.py "
+            "model=claude-fable-5 effort=xhigh "
+            "start=2026-07-24T14:00:00+00:00 end=2026-07-24T14:00:37+00:00 dur_s=37.40 "
             "outcome=done attempts=2 selfheals=1 tokens_in=na tokens_out=na")
+
+    def test_old_call_without_new_fields_still_works(self):
+        """Обратная совместимость: вызов без task_text/mode/src не падает и честно даёт na."""
+        line = o.task_metrics.metrics_line(
+            task=7, lane="pc", model="m", effort="xhigh", start_iso="s", end_iso="e",
+            dur_s=1, outcome="done", attempts=1, selfheals=0)
+        self.assertIn(" type=other mode=na src=na ", line)
+
+    def test_under_test_detects_direct_script_run(self):
+        """ДЫРА, закрытая 25.07.2026 (сначала на VPS, теперь здесь): КОПИЯ теста под чужим именем
+        и прямой запуск файла test_*.py писали строки в БОЕВОЙ журнал как живые задачи."""
+        M = o.task_metrics
+        self.assertTrue(M.under_test("D:/x/test_pc_orchestrator.py", {}, ()))
+        self.assertTrue(M.under_test("/tmp/old_om.py", {"ORCH_TEST_MODE": "1"}, ()))
+        self.assertTrue(M.under_test("x.py", {"PYTEST_CURRENT_TEST": "t"}, ()))
+        self.assertTrue(M.under_test("x.py", {}, ("pytest",)))
+        self.assertTrue(M.under_test("x.py", {"ORCH_DAEMON_TEST": "1"}, ()))
+        self.assertFalse(M.under_test("D:/turbobaby-bot/pc_orchestrator.py", {}, ()))
+        self.assertFalse(M.under_test("pc_orchestrator.py", {"ORCH_TEST_MODE": "0"}, ()))
+
+    def test_task_type_on_live_owner_phrases(self):
+        """ГОЛДЕН типа задачи на ДОСЛОВНЫХ формулировках владельца из журнала (правило репо:
+        детект проверяется реальными фразами, а не идеализированными)."""
+        M = o.task_metrics
+        cases = [
+            ("ultrathink ТОЛЬКО read-only. Ответ ТЕКСТОМ в 328 И краткий итог 3-5 строк в result.", "read"),
+            ("ultrathink Read-only живая проверка гарда + обновление пульса. Код не менять, не коммитить.", "read"),
+            ("[замер Opus 5 — read-only] Ответь ОДНОЙ строкой: сколько файлов *.py лежит в каталоге tests", "read"),
+            ("ultrathink Замер влияния ключевого слова на уровень усилий.", "read"),
+            ("ultrathink Приземлить проверенный фикс из GitHub через merge.", "code"),
+            ("[шаг 2/6 родитель 185] поправить карточку приёма", "code"),
+            ("ultrathink Класс-фикс гарда: позиционные аргументы скрипта не делают команду красной.", "build"),
+            ("ultrathink Выкатить одометр в прод.", "build"),
+            ("ultrathink Очистить и достроить метрики.", "build"),
+            ("ultrathink Перезапустить демон оркестратора, чтобы вступили новые пороги гейтов (коммит 0bbca3d).", "other"),
+        ]
+        for text, want in cases:
+            got, marker = M.task_type_explain(text)
+            self.assertEqual(got, want, "%s ← %s (признак: %s)" % (got, text[:60], marker))
+        self.assertEqual(M.task_type(""), "other")
+        self.assertEqual(M.task_type(None), "other")
+
+    def test_duration_keeps_fraction(self):
+        """Короткие задачи больше не схлопываются в dur_s=0: формат резал int(round(...))."""
+        M = o.task_metrics
+        mk = lambda d: M.metrics_line(task=1, lane="pc", model="m", effort="xhigh", start_iso="s",
+                                      end_iso="e", dur_s=d, outcome="done", attempts=1, selfheals=0)
+        self.assertIn(" dur_s=0.83 ", mk(0.834))
+        self.assertIn(" dur_s=0.01 ", mk(0.009))
+        self.assertIn(" dur_s=176.00 ", mk(176))
+
+    def test_run_task_marks_mode_and_source(self):
+        """СКВОЗНО: обёртка run_task кладёт в строку METRICS режим прогона, имя входного файла и
+        текст задания (из него считается type). Исполнитель замокан — ни claude, ни сети."""
+        cap = {}
+        real_ml = o.task_metrics.metrics_line
+
+        def spy(**kw):
+            cap.update(kw)
+            return real_ml(**kw)
+
+        with mock.patch.object(o, "_run_task_impl", return_value=("done", "ок")), \
+             mock.patch.object(o.task_metrics, "metrics_line", side_effect=spy):
+            o.run_task(4242, "ultrathink ТОЛЬКО read-only. Ничего не менять, не коммитить.")
+        self.assertEqual(cap.get("mode"), "test")
+        self.assertTrue(str(cap.get("src") or "").startswith(("test_", "unittest", "python")),
+                        "src=%r" % cap.get("src"))
+        line = real_ml(**cap)
+        self.assertIn(" lane=pc ", line)
+        self.assertIn(" type=read ", line)
+        self.assertIn(" mode=test ", line)
 
     def test_effort_norm_default_xhigh(self):
         self.assertEqual(o.task_metrics.norm_effort("XHIGH"), "xhigh")

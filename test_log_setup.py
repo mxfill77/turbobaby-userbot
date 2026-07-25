@@ -30,6 +30,25 @@ class TestTestContextDetection(unittest.TestCase):
         for env in ({}, {"TESTING": "0"}, {"TURBOBABY_TEST_LOGS": ""}, {"TESTING": "   "}):
             self.assertFalse(log_setup.is_test_context(env), env)
 
+    def test_entrypoint_test_file_is_test_runner(self):
+        """ДЫРА 25.07.2026, симметричная серверной: `python test_pc_orchestrator.py` НАПРЯМУЮ
+        (без -m unittest) не взводит ни TESTING, ни PYTEST_CURRENT_TEST — и строки теста уходили
+        в БОЕВОЙ лог. Запуск файла test_*.py — тоже способ запустить тест; на боевом демоне
+        ложного срабатывания нет, его входной файл называется иначе."""
+        import sys as _s
+        import types as _t
+        old_argv, old_main = _s.argv[:], _s.modules.get("__main__")
+        try:
+            _s.modules["__main__"] = _t.ModuleType("__fake_main__")   # как при прямом запуске
+            _s.argv = ["D:\\turbobaby-bot\\test_pc_orchestrator.py"]
+            self.assertTrue(log_setup._started_as_test_runner())
+            _s.argv = ["D:\\turbobaby-bot\\pc_orchestrator.py"]
+            self.assertFalse(log_setup._started_as_test_runner())
+        finally:
+            _s.argv = old_argv
+            if old_main is not None:
+                _s.modules["__main__"] = old_main
+
     def test_daemon_importing_unittest_is_not_test_context(self):
         """РЕГРЕСС: демон импортирует gate_selective, который гоняет тесты. Признак «unittest
         есть в sys.modules» увёл бы БОЕВОЙ pc_orchestrator.log в temp — живая диагностика

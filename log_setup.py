@@ -66,6 +66,12 @@ def _started_as_test_runner():
         argv0 = os.path.basename(sys.argv[0] or "").lower()
         if argv0.startswith("pytest") or argv0.startswith("py.test"):
             return True
+        # 25.07.2026: `python test_pc_orchestrator.py` НАПРЯМУЮ (без -m unittest) не взводит ни
+        # TESTING, ни PYTEST_CURRENT_TEST — и строки теста уходили в БОЕВОЙ лог. Запуск файла
+        # test_*.py — это тоже способ запустить тест, а не «unittest где-то в модулях»: боевые
+        # процессы контура так не называются, ложного срабатывания у демона быть не может.
+        if argv0.startswith("test_"):
+            return True
         return os.path.normpath(sys.argv[0] or "").lower().endswith(
             os.path.join("unittest", "__main__.py"))
     except Exception:
