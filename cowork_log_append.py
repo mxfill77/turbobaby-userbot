@@ -165,6 +165,11 @@ def main():
             raise RuntimeError("write_doc не ok: " + json.dumps(w, ensure_ascii=False)[:300])
         spool_clear()
         extra = f" | досланы отложенные: {len(pending)}" if pending else ""
+        # w["chars"] — это text.length НА СТОРОНЕ МОСТА, то есть UTF-16 code units: каждый эмодзи
+        # вне BMP (📦 🔴 …) считается ЗА ДВА. Python len() того же текста будет МЕНЬШЕ. Живой замер
+        # 28.07: мост отрапортовал 759635, кодовых точек в доке 759548, не-BMP символов ровно 87 —
+        # сходится до единицы. Это НЕ усыхание дока: два числа просто в разных единицах, сравнивать
+        # их между собой нельзя (я на этом уже споткнулся — гард тут ни при чём).
         print("OK: записано в мозг, символов:", w.get("chars", "?"), extra)
     except Exception as e:
         spool_add(new_line)
