@@ -88,6 +88,14 @@ class Base(unittest.TestCase):
         self._save_lw = o.LESSON_WAIT_STATE       # ждущие low-уроки: боевой state-файл в тестах не читаем
         o.LESSON_WAIT_STATE = os.path.join(tempfile.mkdtemp(), "lesson_waits.json")
         self.addCleanup(lambda: setattr(o, "LESSON_WAIT_STATE", self._save_lw))
+        # ЗАПРЕТ грязного дерева (класс 28.07): в тестах дерево по умолчанию ЧИСТОЕ — живой git не
+        # дёргаем и не зависим от состояния рабочей копии. Сам запрет проверяет
+        # TestDirtyTreeBlocksRestart, подменяя это же место своим списком.
+        self._save_dirty = o._dirty_tracked
+        o._dirty_tracked = lambda runner=None: []
+        o._DIRTY_WARNED.clear()
+        self.addCleanup(o._DIRTY_WARNED.clear)
+        self.addCleanup(lambda: setattr(o, "_dirty_tracked", self._save_dirty))
         self.fb = FakeBridge()
         o.bc = self.fb
         o._notify = lambda *a, **k: None
@@ -1002,6 +1010,177 @@ class TestAutoUpdateBots(Base):
     def test_gate_no_tests_passes(self):
         ok, msg = o._gate_test_modules([])            # нет затронутых тестов → зелено (config-правка)
         self.assertTrue(ok)
+
+
+class TestDirtyTreeBlocksRestart(Base):
+    """Класс 28.07: авто-рестарт не смеет увозить в бой НЕЗАКОММИЧЕННЫЙ код.
+
+    Инцидент: self-update 1f5d10d→580d0d4 диффил от СВОЕГО запущенного коммита, поймал в диапазон
+    старый 7a3c9b6 (suggest.py, pricing.py) и поднял userbot 16900 / moderbot 9592 вместе с
+    незакоммиченным detectVehicleType из рабочего дерева — python грузит модули С ДИСКА, а не из
+    коммита. Обошлось лишь потому, что функцию никто не вызывает.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.sent, self.cw = [], []
+        o._notify = lambda t, *a, **k: self.sent.append(t)
+        o._cowork = lambda t, *a, **k: self.cw.append(t)
+
+    def _upd(self, changed, dirty, restarts):
+        return o.maybe_update_bots(
+            5, "тз: правка", "old",
+            changed_fn=lambda hb: changed,
+            gate_fn=lambda mods: (True, "ok"),
+            restart_fn=lambda kind: restarts.append(kind) or (True, [4321], "ok"),
+            head_fn=lambda: "abc1234",
+            dirty_fn=lambda: dirty)
+
+    # ── (1) чистое дерево → рестарт идёт, строка журнала обычная ──────────────────
+    def test_clean_tree_restarts_and_note_is_normal(self):
+        kinds = []
+        note = self._upd(["suggest.py"], [], kinds)
+        self.assertEqual(sorted(kinds), ["moderbot", "userbot"])
+        self.assertIn("userbot обновлён до abc1234", note)
+        self.assertNotIn("ОТМЕНЁН", note)
+        self.assertEqual(self.sent, [])                 # чисто → владельца не дёргаем
+
+    # ── (2) грязный файл, который несёт ЭТОТ процесс → рестарта НЕТ + сигнал ──────
+    def test_dirty_file_of_this_process_blocks_restart(self):
+        kinds = []
+        note = self._upd(["suggest.py"], ["suggest.py"], kinds)
+        self.assertEqual(kinds, [])                     # рестарта НЕ было
+        self.assertIn("рестарт ОТМЕНЁН — грязное дерево: suggest.py", note)
+        self.assertTrue(self.sent, "сигнал владельцу обязан уйти, а не тишина")
+        joined = " ".join(self.sent)
+        self.assertIn("suggest.py", joined)             # поимённо
+        self.assertIn("abc1234", joined)                # с коммитом
+        self.assertIn("userbot", joined)                # с именем процесса
+
+    # ── (3) грязный файл, к этому процессу не относящийся → рестарт идёт ──────────
+    def test_dirty_file_of_another_process_does_not_block(self):
+        """booking_draft.py несёт ТОЛЬКО модербот — userbot рестартится как обычно."""
+        kinds = []
+        note = self._upd(["userbot_listen.py"], ["booking_draft.py"], kinds)
+        self.assertEqual(kinds, ["userbot"])
+        self.assertIn("userbot обновлён", note)
+        self.assertEqual(self.sent, [])
+
+    def test_dirty_non_runtime_file_does_not_block(self):
+        """README/доки рантайма ботов не несут — карта _FILE_PROCESS_RULES их не знает."""
+        kinds = []
+        self._upd(["userbot_listen.py"], ["README.md", "docs/artifacts/x.md"], kinds)
+        self.assertEqual(kinds, ["userbot"])
+
+    # ── (4) сигнал ровно один раз, а не каждый цикл ───────────────────────────────
+    def test_signal_sent_once_not_every_cycle(self):
+        for _ in range(4):
+            self._upd(["suggest.py"], ["suggest.py"], [])
+        self.assertEqual(len(self.sent), 2, self.sent)   # по одному на userbot и модербот
+        self.assertEqual(len(self.cw), 2, self.cw)
+
+    def test_signal_repeats_when_dirty_set_changes(self):
+        self._upd(["userbot_listen.py"], ["suggest.py"], [])
+        n1 = len(self.sent)
+        self._upd(["userbot_listen.py"], ["suggest.py", "pricing.py"], [])
+        self.assertGreater(len(self.sent), n1, "состав грязного изменился — сказать обязаны заново")
+
+    def test_clean_tree_resets_memory(self):
+        self._upd(["userbot_listen.py"], ["suggest.py"], [])
+        self._upd(["userbot_listen.py"], [], [])                # вычистили
+        self._upd(["userbot_listen.py"], ["suggest.py"], [])    # снова грязно
+        self.assertEqual(len(self.sent), 2, "после чистого дерева отказ снова заслуживает карточки")
+
+    def test_git_silent_is_not_clean(self):
+        """git не ответил → «не знаю» ≠ «чисто»: рестарт не идём."""
+        kinds = []
+        note = self._upd(["userbot_listen.py"], None, kinds)
+        self.assertEqual(kinds, [])
+        self.assertIn("ОТМЕНЁН", note)
+
+    # ── тот самый путь инцидента: дети self-update ────────────────────────────────
+    def test_selfupdate_children_blocked_and_journal_is_honest(self):
+        kinds = []
+        note = o._selfupdate_restart_children(
+            "1f5d10d", "580d0d4",
+            diff_fn=lambda a, b: ["suggest.py", "pricing.py"],
+            restart_fn=lambda kind: kinds.append(kind) or (True, [1], "ok"),
+            state={}, dirty_fn=lambda: ["suggest.py"])
+        self.assertEqual(kinds, [])
+        self.assertIn("ОТМЕНЁН", note)
+        self.assertFalse([c for c in self.cw if c.startswith("авто-применил")],
+                         "«авто-применил» не имеет права появиться: коммит в бой НЕ уехал")
+        self.assertTrue([c for c in self.cw if "ОТМЕНЁН" in c and "suggest.py" in c],
+                        "журнал обязан прямо сказать про грязное дерево и назвать файлы")
+
+    def test_selfupdate_children_clean_writes_applied_line(self):
+        kinds = []
+        o._selfupdate_restart_children(
+            "1f5d10d", "580d0d4",
+            diff_fn=lambda a, b: ["suggest.py"],
+            restart_fn=lambda kind: kinds.append(kind) or (True, [11], "ok"),
+            state={}, dirty_fn=lambda: [])
+        self.assertEqual(sorted(kinds), ["moderbot", "userbot"])
+        self.assertTrue([c for c in self.cw if c.startswith("авто-применил 580d0d4")])
+
+    # ── пункт 4: то же ограничение на само обновление демона ──────────────────────
+    def _su(self, dirty, spawned):
+        return o.maybe_self_update(
+            blob_fn=lambda: "blob-new", head_fn=lambda: "bbb2222",
+            code_gate=lambda: (True, "ok"), tests_gate=lambda: (True, "ok"),
+            spawner=lambda: spawned.append(1) or True,
+            children_fn=lambda *a, **k: "", dirty_fn=lambda: dirty)
+
+    def test_daemon_self_update_blocked_by_its_own_dirty_file(self):
+        saved = (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB)
+        o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB = "blob-old", "aaa1111", None
+        try:
+            spawned = []
+            self.assertFalse(self._su(["pc_orchestrator.py"], spawned))
+            self.assertEqual(spawned, [], "новый демон не поднимался")
+            self.assertIsNone(o._SU_REJECTED_BLOB,
+                              "блоб не отвергаем: вычищенное дерево обязано разблокировать")
+            self.assertIn("pc_orchestrator.py", " ".join(self.sent))
+        finally:
+            (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB) = saved
+
+    def test_daemon_self_update_goes_when_its_files_are_clean(self):
+        saved = (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB)
+        o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB = "blob-old", "aaa1111", None
+        try:
+            spawned = []
+            self.assertTrue(self._su(["suggest.py"], spawned))   # чужой файл демону не помеха
+            self.assertEqual(spawned, [1])
+        finally:
+            (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB) = saved
+
+    def test_dirty_names_arrive_whole(self):
+        """РЕГРЕСС: первая версия читала `status --porcelain` и резала имя по фиксированной колонке,
+        а _git_call делает .strip() ВСЕГО вывода — первая строка теряла ведущий пробел и имя
+        приезжало «c_orchestrator.py», мимо карты процессов: гард молча открывался. Поймано живой
+        проверкой на реальном дереве."""
+        seen = {}
+
+        def runner(args, timeout=None):
+            seen["args"] = args
+            return (0, "pc_orchestrator.py\ntest_pc_orchestrator.py", "")
+
+        real = self._save_dirty          # Base подменил модульный _dirty_tracked заглушкой «чисто»
+        self.assertEqual(real(runner=runner), ["pc_orchestrator.py", "test_pc_orchestrator.py"])
+        self.assertEqual(seen["args"], ["diff", "--name-only", "HEAD"])   # без колонок статуса
+        self.assertEqual(o._dirty_for_proc("orchestrator", lambda: real(runner=runner)),
+                         ["pc_orchestrator.py"])
+
+    def test_git_failure_is_unknown_not_clean(self):
+        real = self._save_dirty
+        self.assertIsNone(real(runner=lambda a, timeout=None: (1, "", "fatal")))
+        self.assertIsNone(real(runner=lambda a, timeout=None: None))
+
+    def test_daemon_runtime_covers_its_top_imports(self):
+        """Демон грузит не только свой модуль: грязный gate_selective уедет в бой так же."""
+        for f in ("pc_orchestrator.py", "gate_selective.py", "task_metrics.py",
+                  "lesson_router.py", "log_setup.py"):
+            self.assertEqual(o._dirty_for_proc("orchestrator", lambda: [f]), [f], f)
 
 
 class TestSelectiveGateWiring(Base):

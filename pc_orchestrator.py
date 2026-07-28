@@ -1792,10 +1792,11 @@ def _spawn_daemon():
 
 
 def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=None, head_fn=None,
-                      children_fn=None):
+                      children_fn=None, dirty_fn=None):
     """→ True = гейт пройден, новый процесс запущен, ТЕКУЩИЙ должен выйти (эстафета передана).
-    False = обновляться нечему/нельзя (нет диффа, рубильник, гейт провален, spawn не удался) —
-    продолжаем на старом коде. Провал гейта запоминается по блобу (без перегона каждый цикл)."""
+    False = обновляться нечему/нельзя (нет диффа, рубильник, ГРЯЗНОЕ ДЕРЕВО, гейт провален, spawn
+    не удался) — продолжаем на старом коде. Провал гейта запоминается по блобу (без перегона
+    каждый цикл); грязное дерево по блобу НЕ запоминаем — вычистили, и обновление пойдёт само."""
     global _SU_REJECTED_BLOB
     if _stopped():
         return False
@@ -1805,6 +1806,13 @@ def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=Non
     if new_blob == _SU_REJECTED_BLOB:
         return False                        # этот код уже провалил гейт — ждём следующего коммита
     new_commit = (head_fn or _head_commit)()
+    # ВОРОТА (28.07), пункт 4: тот же запрет — на само обновление демона. Новый процесс поднимется
+    # из файлов НА ДИСКЕ, поэтому грязный pc_orchestrator.py (или его верхний импорт) увёз бы в бой
+    # незакоммиченный код ровно так же, как это случилось с ботами.
+    dirty = _dirty_block("orchestrator", new_commit, "self-update демона",
+                         label="демон (self-update)", dirty_fn=dirty_fn)
+    if dirty:
+        return False              # блоб НЕ помечаем отвергнутым: чистое дерево обязано разблокировать
     log.info("self-update: pc_orchestrator.py изменился (%s→%s) — гоняю гейт", RUNNING_COMMIT, new_commit)
     ok, msg = (code_gate or self_update_ok)()
     if not ok:
@@ -3247,6 +3255,85 @@ def _classify_changed(paths):
     return ub, mb
 
 
+# ───────── ЗАПРЕТ АВТО-РЕСТАРТА ПОВЕРХ ГРЯЗНОГО ДЕРЕВА (класс 28.07.2026) ─────────
+# Живой инцидент: демон обновил себя 1f5d10d→580d0d4, диффил от СВОЕГО запущенного коммита,
+# поймал в диапазон старый 7a3c9b6 (suggest.py, pricing.py) и рестартнул userbot 16900 и
+# moderbot 9592. Python грузит модули С ДИСКА, а не из коммита — и вместе с коммитом в бой уехал
+# НЕЗАКОММИЧЕННЫЙ detectVehicleType из рабочего дерева. Обошлось только потому, что функцию
+# никто не вызывает: повезло, а не защитило.
+#
+# Правило: авто-рестарт боевого процесса разрешён ТОЛЬКО когда чисты файлы, которые ЭТОТ процесс
+# несёт. Грязно — рестарт НЕ выполняется, владелец получает карточку с поимённым списком.
+# РУЧНОЙ рычаг владельца (_exec_command «рестартни userbot») под запрет НЕ попадает: там решает
+# человек, он дерево видит.
+# Считаем только ОТСЛЕЖИВАЕМЫЕ правки: untracked-файла в коммите не было вовсе, сказать про него
+# «коммит уехал не целиком» нельзя — та же граница, что у авто-фетча ниже.
+_ORCH_RUNTIME = ("pc_orchestrator.py", "gate_selective.py", "task_metrics.py",
+                 "lesson_router.py", "log_setup.py")   # что несёт САМ демон (его верхние импорты)
+_DIRTY_WARNED = {}      # процесс → (коммит, кортеж грязных файлов), о которых уже сказали
+
+
+def _dirty_tracked(runner=None):
+    """Отслеживаемые файлы с незакоммиченными правками (индекс + рабочее дерево против HEAD).
+    → список путей | None, если git не ответил: «не знаю» это НЕ «чисто», и решать рестарт по
+    незнанию мы не станем.
+
+    Берём `git diff --name-only HEAD`, а НЕ `status --porcelain`: у porcelain имя лежит в
+    ФИКСИРОВАННОЙ колонке (ln[3:]), а наш _git_call делает .strip() ВСЕГО вывода — первая строка
+    теряла ведущий пробел, и имя приезжало обрезанным («c_orchestrator.py»), мимо карты процессов.
+    То есть гард молча открывался. Поймано ЖИВОЙ проверкой на реальном дереве 28.07 — здесь имя
+    приходит отдельной строкой без колонок, обрезать нечего.
+    Untracked в этот список не входят по определению — и правильно: в коммите их не было вовсе."""
+    r = (runner or _git_call)(["diff", "--name-only", "HEAD"], timeout=30)
+    if not r or r[0] != 0:
+        return None
+    return [ln.strip() for ln in (r[1] or "").splitlines() if ln.strip()]
+
+
+def _dirty_for_proc(kind, dirty_fn=None):
+    """Грязные файлы, которые несёт процесс kind. Для ботов — по той же карте, что решает рестарт;
+    для демона — его собственный модуль и верхние импорты. → список | None (состояние неизвестно)."""
+    dirty = (dirty_fn or _dirty_tracked)()
+    if dirty is None:
+        return None
+    if kind == "orchestrator":
+        return sorted(p for p in dirty if os.path.basename(p).lower() in _ORCH_RUNTIME)
+    return sorted(p for p in dirty if kind in _procs_for_file(p))
+
+
+def _dirty_block(kind, commit, where, label=None, dirty_fn=None, notifier=None,
+                 cowork=None, state=None):
+    """ВОРОТА авто-рестарта. → список грязных файлов (рестарт ЗАПРЕЩЁН) | [] (можно).
+
+    Отказ — не молчание: лог + строка в журнал + карточка владельцу с именем процесса, коммитом и
+    ПОИМЁННЫМ списком. Ровно ОДИН раз на пару «коммит + состав грязного»: пока ничего не менялось,
+    долбить владельца каждым циклом незачем; изменилось — сказать обязаны заново. Дерево вычистили
+    → память сбрасываем, следующий отказ снова заслуживает карточки."""
+    st = _DIRTY_WARNED if state is None else state
+    files = _dirty_for_proc(kind, dirty_fn)
+    if files is None:
+        files = ["<git не ответил: состояние дерева неизвестно>"]
+    if not files:
+        st.pop(kind, None)
+        return []
+    key = (str(commit), tuple(files))
+    if st.get(kind) != key:
+        st[kind] = key
+        name = label or kind
+        log.error("%s: дерево ГРЯЗНОЕ — авто-рестарт «%s» ЗАПРЕЩЁН; файлы: %s",
+                  where, name, ", ".join(files))
+        (cowork or _cowork)(
+            "авто-рестарт %s ОТМЕНЁН при %s (%s): дерево грязное, коммит в бой уехал бы НЕ целиком "
+            "— %s" % (name, commit, where, ", ".join(files)))
+        (notifier or _notify)(
+            "⛔ Оркестратор: авто-рестарт «%s» ОТМЕНЁН — рабочее дерево грязное.\n"
+            "Коммит %s в бой уехал бы НЕ целиком: python грузит модули С ДИСКА, вместе с коммитом "
+            "поднялся бы незакоммиченный код.\n"
+            "Грязные файлы этого процесса (%d): %s\n"
+            "Закоммить или откати их — рестарт пойдёт сам." % (name, commit, len(files), ", ".join(files)))
+    return files
+
+
 def _affected_test_modules(paths):
     """Тест-модули для изменённых .py: сам test_*.py и test_<stem> при наличии на диске. → отсортированный список."""
     mods = set()
@@ -3319,9 +3406,10 @@ def _restart_via_pc_agent(kind, settle=0.5, wait_cycles=20):
 
 
 def maybe_update_bots(tid, text, head_before, changed_fn=None, gate_fn=None,
-                      restart_fn=None, is_dev_fn=None, head_fn=None):
+                      restart_fn=None, is_dev_fn=None, head_fn=None, dirty_fn=None):
     """После done дев-задачи применить свежий код к боту(ам). → строка-суффикс для карточки/cowork
-    ('' если обновлять нечего). Уважает стоп-флаг. Всё внешнее инъектируется для тестов."""
+    ('' если обновлять нечего). Уважает стоп-флаг и ЗАПРЕТ грязного дерева (_dirty_block):
+    рестарт идёт только если чисты файлы, которые несёт ЭТОТ бот. Всё внешнее инъектируется."""
     if _stopped():
         return ""
     # Дев-задача («тз:…») применяется всегда; ШАГ цепи («[шаг i/N…]») — только под GATE_STEP_SELECTIVE
@@ -3344,6 +3432,13 @@ def maybe_update_bots(tid, text, head_before, changed_fn=None, gate_fn=None,
     notes = []
     for kind, label, files in (("userbot", "userbot", ub_files), ("moderbot", "модербот", mb_files)):
         if not files:
+            continue
+        # ВОРОТА (28.07): грязное дерево по файлам ЭТОГО бота → рестарта нет. Проверяем ДО гейта:
+        # гонять тесты ради рестарта, которого не будет, незачем.
+        dirty = _dirty_block(kind, commit, "авто-обновление после задачи", label=label,
+                             dirty_fn=dirty_fn)
+        if dirty:
+            notes.append(f"{label}: рестарт ОТМЕНЁН — грязное дерево: {', '.join(dirty)}")
             continue
         run_mods, gmode = gate_selective.decide(
             files, REPO, is_step=is_step, step_i=step_i, step_n=step_n,
@@ -3402,7 +3497,7 @@ def _diff_names(old_commit, new_commit):
 
 
 def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_fn=None,
-                                 now=None, cooldown=None, state=None):
+                                 now=None, cooldown=None, state=None, dirty_fn=None):
     """После УСПЕШНОГО self-update демона: рестарт затронутых детей по ЯВНОЙ карте на основе диффа
     old..new. → строка-итог для лога/cowork ('' если никого не трогали). Правила:
       • userbot/moderbot → штатный рестарт механикой вотчдога (_restart_via_pc_agent), с уважением
@@ -3440,6 +3535,13 @@ def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_f
         if _apply_antiflap(kind, now, cooldown, state):
             log.info("self-update дети: %s недавно рестартили — анти-флап, рестарт пропущен", kind)
             notes.append(f"{label}: анти-флап (недавно рестартили) — рестарт пропущен")
+            continue
+        # ВОРОТА (28.07): именно здесь 28.07 в бой уехал незакоммиченный код. Строка «авто-применил
+        # <коммит>» ниже имеет право появиться ТОЛЬКО когда уехал ИМЕННО коммит; грязно — вместо неё
+        # честная строка отказа с поимённым списком (её пишет сам _dirty_block).
+        dirty = _dirty_block(kind, new_commit, "self-update детей", label=label, dirty_fn=dirty_fn)
+        if dirty:
+            notes.append(f"{label}: рестарт ОТМЕНЁН — грязное дерево: {', '.join(dirty)}")
             continue
         try:
             ok, pids, detail = (restart_fn or _restart_via_pc_agent)(kind)
