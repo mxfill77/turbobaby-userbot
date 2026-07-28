@@ -45,6 +45,13 @@ class FakeBridge:
 
     def post(self, url, payload):
         self.writes.append(dict(payload))
+        if payload.get("action") == "create_brain_plain":     # живой формат ReadDocs.createBrainPlain_
+            nid = "NEW%d" % (len(self.docs) + 1)
+            self.docs[nid] = payload.get("text", "")
+            if payload.get("key"):
+                self.names[payload["key"]] = nid
+            return {"ok": True, "id": nid, "name": payload.get("name"),
+                    "key": payload.get("key") or ""}
         if self.fail_write:
             return {"ok": False, "error": "write_failed", "message": "getFileById"}
         did = self._resolve(payload)
@@ -175,6 +182,36 @@ class TestFailSafe(Base):
         # транспорта обязан отказаться — урок KB_trainer_log 23.07 (гейт писал в живой док)
         with self.assertRaises(bw.BrainWriterError) as cm:
             bw.apply(lambda old: old + "x", name="cowork_log", env=ENV)
+        self.assertIn("тестовый контекст", str(cm.exception))
+
+
+class TestCreatePlain(Base):
+    """Создание нового Brain-дока: единственный легальный путь с ПК (секреты у писателя, не у скрипта)."""
+
+    def test_create_registers_and_is_addressable_by_name(self):
+        r = bw.create_plain("KB_проба_архив", key="проба_архив", text="история целиком",
+                            env=ENV, post=self.bridge.post)
+        self.assertTrue(r["ok"])
+        self.assertEqual(self.bridge.docs[r["id"]], "история целиком")
+        # зарегистрирован в манифесте → тем же каналом читается по ИМЕНИ
+        self.assertEqual(bw.read_text(name="проба_архив", env=ENV, get=self.bridge.get),
+                         "история целиком")
+
+    def test_create_without_key_not_in_manifest(self):
+        r = bw.create_plain("KB_безымянный", text="текст", env=ENV, post=self.bridge.post)
+        self.assertTrue(r["ok"])
+        self.assertEqual(bw.read_text(doc_id=r["id"], env=ENV, get=self.bridge.get), "текст")
+
+    def test_create_needs_name(self):
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            bw.create_plain("   ", text="x", env=ENV, post=self.bridge.post)
+        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(self.bridge.writes, [])
+
+    def test_create_blocked_in_test_context_without_mock(self):
+        """Под гейтом/юнитами без инжектированного транспорта живой Brain не трогаем."""
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            bw.create_plain("KB_живой", text="x", env=ENV)
         self.assertIn("тестовый контекст", str(cm.exception))
 
 

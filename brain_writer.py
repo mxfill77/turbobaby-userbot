@@ -165,6 +165,36 @@ def read_text(doc_id="", name="", env=None, get=None):
     return _read(url, token, addr, ref, get)
 
 
+def create_plain(name, key="", text="", env=None, post=None):
+    """Создать НОВЫЙ plain-док в папке Brain (Bridge-экшен create_brain_plain) и, если задан key,
+    зарегистрировать его в манифесте — после этого док адресуется по имени, как остальные.
+
+    Зачем отдельной функцией: канал дозаписи (append/apply) доки СОЗДАВАТЬ не умеет, только
+    перезаписывать существующие. А создавать их скриптом-однодневкой нельзя — он читал бы
+    BRIDGE_TOKEN сам (запрет класса 328). Значит создание живёт здесь, у доверенного писателя:
+    секреты берёт этот модуль, вызывающий их не видит. → dict ответа Bridge (ok, id, …)."""
+    url, token = _config(env)
+    if not url or not token:
+        raise BrainWriterError("нет BRIDGE_URL/BRIDGE_TOKEN в окружении/конфиге", 1)
+    if not (name or "").strip():
+        raise BrainWriterError("нужно имя нового дока", 1)
+    if post is None and _in_test_context():
+        raise BrainWriterError("тестовый контекст (гейт/юнит): живой Brain НЕ трогаем — "
+                               "инжектируй post мок-тестом", 1)
+    payload = {"action": "create_brain_plain", "token": token, "name": name, "text": text}
+    if key:
+        payload["key"] = key
+    try:
+        r = (post or _post)(url, payload)
+    except Exception as e:
+        raise BrainWriterError("create_brain_plain(%s) упал: %s: %s"
+                               % (name, type(e).__name__, e), 4)
+    if not (isinstance(r, dict) and r.get("ok")):
+        raise BrainWriterError("create_brain_plain(%s) не ok: %s"
+                               % (name, json.dumps(r, ensure_ascii=False)[:300]), 4)
+    return r
+
+
 # ------------------------------- запись (движок) -----------------------------
 
 def _backup(old, tag, backup_dir=None):
