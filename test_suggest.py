@@ -195,17 +195,57 @@ class TestPureLogic(unittest.TestCase):
         self.assertEqual(suggest.detectVehicleType("Привет, как дела?"), "unknown")
         self.assertEqual(suggest.detectVehicleType(None), "unknown")
 
-    def test_enforce_vehicle_word(self):
-        # 'car': слово «байк» в ЛЮБОМ склонении → «авто» (страховка кодом поверх LLM).
-        self.assertEqual(
-            suggest.enforce_vehicle_word("Отличный байк, байки топ, забор байка бесплатный", "car"),
-            "Отличный авто, авто топ, забор авто бесплатный")
-        self.assertNotIn("байк", suggest.enforce_vehicle_word("мотобайк для вас", "car").lower())
-        # 'bike'/'unknown' → черновик БАЙТ-В-БАЙТ (для unknown нейтральность несёт промпт).
-        self.assertEqual(suggest.enforce_vehicle_word("Байк NMAX свободен", "bike"),
-                         "Байк NMAX свободен")
-        self.assertEqual(suggest.enforce_vehicle_word("Байк NMAX свободен", "unknown"),
-                         "Байк NMAX свободен")
+    def test_enforce_vehicle_word_notes_and_never_rewrites(self):
+        """28.07: слепая замена «байк»→«авто» снята. Текст клиента не трогаем — вешаем пометку.
+
+        Что рождала замена вживую: «байк NMAX» → «авто NMAX» (NMAX — скутер, модель остаётся, а
+        слово рядом врёт), «Квадробайк» → «Квадроавто», «Озеро Байкал» → «Озеро авто», «байкер» →
+        «авто». Теперь на 'car'-треде черновик уходит модератору КАК ЕСТЬ, с пометкой.
+        """
+        NOTE = suggest._VEHICLE_NOTE["ru"]
+        src = "Рекомендую байк NMAX — 590 бат/сутки."
+        out = suggest.enforce_vehicle_word(src, "car")
+        self.assertTrue(out.startswith(src), "тело черновика обязано остаться байт-в-байт")
+        self.assertNotIn("авто NMAX", out)          # ← ровно тот живой дефект
+        self.assertTrue(out.endswith(NOTE))         # пометка отдельной строкой в хвосте
+        self.assertIn("байк", out)                  # слово клиента на месте
+
+        # идемпотентность: второй прогон второй пометки не добавляет
+        self.assertEqual(suggest.enforce_vehicle_word(out, "car"), out)
+
+        # ЛОЖНЫХ пометок быть не должно: границы слова
+        for clean in ("Квадробайк тоже есть.", "Озеро Байкал в туре.", "Наш байкер довезёт."):
+            self.assertEqual(suggest.enforce_vehicle_word(clean, "car"), clean, clean)
+            self.assertFalse(suggest.vehicle_mismatch(clean, "car"), clean)
+
+        # склонения — пометка ставится
+        for d in ("Есть байки: NMAX, PCX.", "На байке удобно.", "Забор байка бесплатный.",
+                  "Мотобайк свободен."):
+            self.assertTrue(suggest.vehicle_mismatch(d, "car"), d)
+
+        # 'bike'/'unknown' → черновик БАЙТ-В-БАЙТ (для unknown нейтральность несёт промпт)
+        for vt in ("bike", "unknown"):
+            self.assertEqual(suggest.enforce_vehicle_word("Байк NMAX свободен", vt),
+                             "Байк NMAX свободен")
+
+        # EN-тред получает EN-пометку
+        en = suggest.enforce_vehicle_word("I recommend a байк NMAX.", "car", lang="en")
+        self.assertTrue(en.endswith(suggest._VEHICLE_NOTE["en"]))
+
+    def test_vehicle_note_never_reaches_client(self):
+        """Пометка — служебный канал карточки: оба среза перед отправкой её убирают."""
+        draft = suggest.enforce_vehicle_word("Рекомендую байк NMAX.", "car")
+        self.assertIn("тип ТС", draft)
+        # слой 1: client_facing_text (текст, который увидит клиент)
+        client = suggest.client_facing_text(draft)
+        self.assertNotIn("тип ТС", client)
+        self.assertEqual(client, "Рекомендую байк NMAX.")
+        # слой 2: stripInternalMarkers (фильтр в точке отправки)
+        self.assertNotIn("тип ТС", suggest.stripInternalMarkers(draft))
+        # EN-пометка режется тем же каналом
+        en = suggest.enforce_vehicle_word("Recommend a байк NMAX.", "car", lang="en")
+        self.assertNotIn("vehicle type", suggest.client_facing_text(en))
+        self.assertNotIn("vehicle type", suggest.stripInternalMarkers(en))
 
     def test_make_system_prompt_vehicle_type(self):
         # 'car' — блок ТИП ТС запрещает слово «байк» и велит говорить «авто»/«машина».
@@ -222,18 +262,25 @@ class TestPureLogic(unittest.TestCase):
         self.assertNotIn("ТИП ТС", p_bike)
         self.assertIn("CLICK 125", p_bike)
 
-    def test_generate_draft_car_thread_drops_bike_word(self):
-        # ПРОВЕРКА ЗАДАЧИ: локальный прогон suggest на треде про японский седан → черновик БЕЗ «байк».
-        # LLM (мок) вопреки промпту вернул «байк» — детерминированная страховка обязана его снять.
-        bike_llm = lambda _s, _u: "Здравствуйте! Рекомендую байк для аренды, байки у нас отличные."
+    def test_generate_draft_car_thread_notes_instead_of_rewriting(self):
+        """СКВОЗНОЙ прогон конвейера: тред про седан, LLM вопреки промпту вернул байк.
+
+        Контракт с 28.07: черновик НЕ переписываем (замена «байк»→«авто» рождала «авто NMAX» —
+        NMAX это скутер), а вешаем служебную пометку модератору. Клиенту пометка не уходит.
+        """
+        bike_llm = lambda _s, _u: "Здравствуйте! Рекомендую байк NMAX, байки у нас отличные."
         d = suggest.generate_draft("[клиент]: Здравствуйте! Ищу японский седан на неделю",
                                    "ru", "FAQ", is_first_contact=True, call_llm=bike_llm)
-        self.assertNotIn("байк", d.lower())
-        self.assertIn("авто", d.lower())
-        # Регресс: на байк-треде слово «байк» остаётся нетронутым.
+        self.assertIn("байк NMAX", d)                      # текст модели НЕ переписан
+        self.assertNotIn("авто NMAX", d)                   # ← живой дефект больше не рождается
+        self.assertIn(suggest._VEHICLE_NOTE["ru"], d)      # модератор предупреждён
+        self.assertNotIn("тип ТС", suggest.client_facing_text(d))   # клиенту пометка не уйдёт
+
+        # Регресс: на байк-треде и слово на месте, и пометки нет.
         d_bike = suggest.generate_draft("[клиент]: Здравствуйте! Хочу арендовать байк",
                                         "ru", "FAQ", is_first_contact=True, call_llm=bike_llm)
         self.assertIn("байк", d_bike.lower())
+        self.assertNotIn("тип ТС", d_bike)
 
     def test_is_partner_chat(self):
         # Партнёрское окно опознаётся по имени (title/username), маркеры export_all.GROUPS_TO_EXPORT.
