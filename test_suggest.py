@@ -180,6 +180,61 @@ class TestPureLogic(unittest.TestCase):
                          suggest.detect_lang_from_client(t2))
         self.assertEqual(suggest.detect_lang_from_client(t2), "ru")
 
+    def test_detect_vehicle_type(self):
+        # обязательные кейсы задачи
+        self.assertEqual(suggest.detectVehicleType("японский седан"), "car")
+        self.assertEqual(suggest.detectVehicleType("подать байк"), "bike")
+        self.assertEqual(suggest.detectVehicleType(""), "unknown")
+        # авто-слова и марка (префиксом токена, склонение ловится); моточные бренды НЕ авто
+        self.assertEqual(suggest.detectVehicleType("нужна машина на неделю"), "car")
+        self.assertEqual(suggest.detectVehicleType("хочу тойоту"), "car")
+        self.assertEqual(suggest.detectVehicleType("есть иномарки?"), "car")
+        # байк/мото/скутер → bike; нейтральное и None → unknown
+        self.assertEqual(suggest.detectVehicleType("какой скутер посоветуете"), "bike")
+        self.assertEqual(suggest.detectVehicleType("мотоцикл на 3 дня"), "bike")
+        self.assertEqual(suggest.detectVehicleType("Привет, как дела?"), "unknown")
+        self.assertEqual(suggest.detectVehicleType(None), "unknown")
+
+    def test_enforce_vehicle_word(self):
+        # 'car': слово «байк» в ЛЮБОМ склонении → «авто» (страховка кодом поверх LLM).
+        self.assertEqual(
+            suggest.enforce_vehicle_word("Отличный байк, байки топ, забор байка бесплатный", "car"),
+            "Отличный авто, авто топ, забор авто бесплатный")
+        self.assertNotIn("байк", suggest.enforce_vehicle_word("мотобайк для вас", "car").lower())
+        # 'bike'/'unknown' → черновик БАЙТ-В-БАЙТ (для unknown нейтральность несёт промпт).
+        self.assertEqual(suggest.enforce_vehicle_word("Байк NMAX свободен", "bike"),
+                         "Байк NMAX свободен")
+        self.assertEqual(suggest.enforce_vehicle_word("Байк NMAX свободен", "unknown"),
+                         "Байк NMAX свободен")
+
+    def test_make_system_prompt_vehicle_type(self):
+        # 'car' — блок ТИП ТС запрещает слово «байк» и велит говорить «авто»/«машина».
+        p_car = suggest.make_system_prompt("FAQ", "ru", vehicle_type="car")
+        self.assertIn("ТИП ТС", p_car)
+        self.assertIn("«байк»/«мотобайк» НЕ", p_car)
+        self.assertIn("«авто»/«машина»", p_car)
+        # 'unknown' — нейтральное «технику», без навязывания «байк».
+        p_unknown = suggest.make_system_prompt("FAQ", "ru", vehicle_type="unknown")
+        self.assertIn("НЕЙТРАЛЬНОЕ", p_unknown)
+        self.assertIn("технику", p_unknown)
+        # дефолт (bike) — блока ТИП ТС нет (регресс байт-в-байт); инварианты целы.
+        p_bike = suggest.make_system_prompt("FAQ", "ru")
+        self.assertNotIn("ТИП ТС", p_bike)
+        self.assertIn("CLICK 125", p_bike)
+
+    def test_generate_draft_car_thread_drops_bike_word(self):
+        # ПРОВЕРКА ЗАДАЧИ: локальный прогон suggest на треде про японский седан → черновик БЕЗ «байк».
+        # LLM (мок) вопреки промпту вернул «байк» — детерминированная страховка обязана его снять.
+        bike_llm = lambda _s, _u: "Здравствуйте! Рекомендую байк для аренды, байки у нас отличные."
+        d = suggest.generate_draft("[клиент]: Здравствуйте! Ищу японский седан на неделю",
+                                   "ru", "FAQ", is_first_contact=True, call_llm=bike_llm)
+        self.assertNotIn("байк", d.lower())
+        self.assertIn("авто", d.lower())
+        # Регресс: на байк-треде слово «байк» остаётся нетронутым.
+        d_bike = suggest.generate_draft("[клиент]: Здравствуйте! Хочу арендовать байк",
+                                        "ru", "FAQ", is_first_contact=True, call_llm=bike_llm)
+        self.assertIn("байк", d_bike.lower())
+
     def test_greeting_already_sent(self):
         self.assertTrue(suggest.greeting_already_sent(
             "[менеджер]: Здравствуйте! Что арендуете?\n[клиент]: NMAX"))

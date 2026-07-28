@@ -1260,6 +1260,52 @@ def detect_first_message_booking(text: str, today=None):
     return {"model": model, "startDate": anchor.isoformat(), "days": term[0]}
 
 
+# --- ДЕТЕКТ ТИПА ТС: клиент про АВТО (вне нашего каталога) против байка/мото/скутера ----------
+# Стемы для substring-матча (клиент склоняет: «машину/машины», «иномарки»). Марки — ТОЛЬКО
+# авто-производители; байко-моточные бренды (Honda/Yamaha/Suzuki и т.п.) НЕ включаем — у нас парк
+# на них, они не признак «клиент про машину». Марки матчим ПРЕФИКСОМ ТОКЕНА (не подстрокой), иначе
+# «переносить» ложно ловит «рено».
+_CAR_WORD_STEMS = ("седан", "авто", "машин", "иномарк")
+_CAR_BRAND_STEMS = (
+    "тойот", "ниссан", "мазд", "мицубис", "форд", "мерседес", "ауди", "киа", "хендай",
+    "лексус", "вольво", "фольксваген", "рено", "пежо", "шевроле", "субару", "тесла",
+    "toyota", "nissan", "mazda", "mitsubishi", "ford", "mercedes", "audi", "kia",
+    "hyundai", "lexus", "volvo", "volkswagen", "renault", "peugeot", "chevrolet",
+    "subaru", "tesla",
+)
+_BIKE_WORD_STEMS = ("байк", "мото", "скутер")
+
+
+def detectVehicleType(text):
+    """Тип ТС по тексту клиента: 'car' | 'bike' | 'unknown'. Чистая функция (без сети/LLM/глобалов).
+    'car' — слова «седан/авто/машин/иномарк» ИЛИ авто-марка (Toyota, Nissan… — префиксом токена,
+    моточные бренды сюда НЕ входят). 'bike' — «байк/мото/скутер». Иначе 'unknown'. Приоритет у авто
+    (спорный «мото или авто» → 'car'); шаг 1/6, уточнение приоритета — за родителем."""
+    t = (text or "").lower().replace("ё", "е")
+    tokens = re.findall(r"[a-zа-я0-9]+", t)
+    is_car = (any(w in t for w in _CAR_WORD_STEMS)
+              or any(tok.startswith(b) for tok in tokens for b in _CAR_BRAND_STEMS))
+    if is_car:
+        return "car"
+    if any(w in t for w in _BIKE_WORD_STEMS):
+        return "bike"
+    return "unknown"
+
+
+# Слово-нянька для 'car'-страховки: сущ. «байк/мотобайк» в ЛЮБОМ склонении (байка/байком/байки…).
+_BIKE_NOUN_RE = re.compile(r"(?:мото)?байк\w*", re.I)
+
+
+def enforce_vehicle_word(draft, vehicle_type, lang="ru"):
+    """Детерминированная СТРАХОВКА поверх промпта (класс «страховка кодом поверх LLM»): на 'car'-треде
+    слово «байк» в готовом черновике ЗАПРЕЩЕНО — заменяем его (в любом склонении) на «авто»
+    (индеклинабельно — новых склонений не плодит). 'bike'/'unknown' → черновик БАЙТ-В-БАЙТ: для
+    'unknown' нейтральность («технику») несёт промпт, запрещённого слова там нет. Чистая функция."""
+    if vehicle_type != "car" or not draft:
+        return draft
+    return _BIKE_NOUN_RE.sub("авто", draft)
+
+
 async def read_transcript(client, entity, me_id: int, limit: int = MAX_MESSAGES) -> str:
     """Совместимость: выбрать сообщения и собрать транскрипт."""
     return transcript_from(await _fetch_messages(client, entity, limit), me_id)
@@ -3996,7 +4042,7 @@ ANTI_LOOP_NOTE = (
 
 def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pricing_note: str = "",
                        directive: str = "", park_models=None, playbook: str = "", pressure=None,
-                       collected=None, ready: bool = False, just=None) -> str:
+                       collected=None, ready: bool = False, just=None, vehicle_type: str = "bike") -> str:
     lang_name = "русском" if lang == "ru" else "английском"
     if is_first_contact:
         greet = (
@@ -4182,6 +4228,23 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
                                      just=just)
     # УРОВЕНЬ НАПОРА — на уровне базовой установки (высокий приоритет, ВЫШЕ playbook «без давления»).
     pressure_block = _pressure_block(pressure if pressure is not None else SALES_PRESSURE)
+    # ТИП ТС (шаг 2/6 родитель #4): дефолт «байк» больше НЕ хардкодим — слово выбираем по тексту
+    # треда (detectVehicleType в generate_draft). 'car' → слово «байк» запрещено (клиент про АВТО, не
+    # про наш парк); 'unknown' → нейтральное «технику», пока клиент не назвал тип; 'bike' → блока нет
+    # (регресс байт-в-байт). Детерминированную страховку на 'car' держит enforce_vehicle_word ниже.
+    if vehicle_type == "car":
+        vehicle_block = (
+            "\n\n★ ТИП ТС (ВЫСШИЙ приоритет по формулировке ответа): клиент пишет про АВТО "
+            "(машину/седан/иномарку), а НЕ про мотобайк. В ЭТОМ ответе слово «байк»/«мотобайк» НЕ "
+            "используй — называй технику «авто»/«машина». Наличие и цены авто НЕ выдумывай."
+        )
+    elif vehicle_type == "unknown":
+        vehicle_block = (
+            "\n\n★ ТИП ТС: клиент ещё НЕ уточнил, какой транспорт нужен — используй НЕЙТРАЛЬНОЕ "
+            "слово «техника»/«технику», не навязывай «байк», пока клиент не назвал тип или модель."
+        )
+    else:
+        vehicle_block = ""   # bike/дефолт — формулировку не меняем (регресс байт-в-байт)
     return (
         "Ты — менеджер проката мотобайков TurboBaby (Пхукет). По переписке с клиентом "
         f"составь ОДИН короткий, вежливый ответ на {lang_name} языке (язык клиента). "
@@ -4193,6 +4256,7 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         "цену», «сейчас Этап N», «Этап 1/2/3», «стадия…» — это ВНУТРЕННИЕ пометки для тебя, "
         "клиент их видеть НЕ должен. Ответ начинай СРАЗУ по сути (первый контакт → "
         "приветствие → суть; иначе → сразу суть)."
+        + vehicle_block
         + pressure_block
         + directive_block + park_block + collected_block + greet + policy + scenario
         + next_step_block + ANTI_LOOP_NOTE + price_block + "\n\n"
@@ -5300,9 +5364,12 @@ def generate_draft(transcript: str, lang: str, faq: str,
     ready = client_ready_to_book(transcript)
     just = client_just_provided(transcript)     # названное В ТЕКУЩЕЙ реплике — переспрос запрещён
     sheet_mode = _sheet_block_from_note(pricing_note) is not None or "ПРАЙС ПО ПАРКУ" in (pricing_note or "")
+    # Тип ТС — по тексту треда (шаг 2/6 #4): дефолт «байк» не хардкодим. Питает формулировку промпта
+    # и детерминированную страховку enforce_vehicle_word на финале.
+    vehicle_type = detectVehicleType(transcript)
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
                                 park_models=park_models, playbook=playbook, collected=facts,
-                                ready=ready, just=just)
+                                ready=ready, just=just, vehicle_type=vehicle_type)
     out = _strip_service_prefix(call_llm(system, transcript))
     # Пост-чек ДО сборки сетки: сканируем LLM-текст (intro/outro), дословный прайс-блок КОДА не
     # трогаем. Утверждения цвет/наличие/цена вне белого списка → «уточню»-форма + пометка модератору.
@@ -5333,7 +5400,9 @@ def generate_draft(transcript: str, lang: str, faq: str,
     out = drop_answered_questions(out, facts, lang)
     out = ensure_closing_question(out, facts, lang, sheet_mode=sheet_mode, ready=ready, just=just)
     out = _append_collected_note(out, facts, lang, unconfirmed_fields(transcript, facts))
-    return _append_season_note(out, pricing_note)
+    out = _append_season_note(out, pricing_note)
+    # Страховка типа ТС ПОСЛЕДНИМ шагом (после дописок КОДА): на 'car'-треде «байк» → «авто».
+    return enforce_vehicle_word(out, vehicle_type, lang)
 
 
 def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: bool,
@@ -5347,9 +5416,11 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     ready = client_ready_to_book(transcript)
     just = client_just_provided(transcript)
     sheet_mode = _sheet_block_from_note(pricing_note) is not None or "ПРАЙС ПО ПАРКУ" in (pricing_note or "")
+    # Тип ТС по тексту треда — тот же класс, что в generate_draft (шаг 2/6 #4): дефолт «байк» не хардкодим.
+    vehicle_type = detectVehicleType(transcript)
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
                                 directive=directive, park_models=park_models, playbook=playbook,
-                                collected=facts, ready=ready, just=just)
+                                collected=facts, ready=ready, just=just, vehicle_type=vehicle_type)
     out = _strip_service_prefix(call_llm(system, transcript))
     # Тот же пост-чек, что в generate_draft (до сборки сетки): цвет/наличие/цена вне данных → «уточню».
     out = postcheck_draft(out, lang, pricing_note=pricing_note, call_llm=call_llm, transcript=transcript)
@@ -5382,7 +5453,9 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     # Если в окне уже был наш ответ/автоприветствие Business, а LLM снова поздоровался — срезаем
     # зачин детерминированно (belt поверх промпта «не здоровайся повторно»). Первый контакт
     # (в транскрипте нет строки [менеджер]:) → черновик не трогаем, фирменное приветствие цело.
-    return strip_greeting_for_window(out, transcript)
+    out = strip_greeting_for_window(out, transcript)
+    # Страховка типа ТС ПОСЛЕДНИМ шагом (тот же класс, что в generate_draft): 'car' → «байк»→«авто».
+    return enforce_vehicle_word(out, vehicle_type, lang)
 
 
 # ============================ E2E-СМОУК (TEST_MODE) ==========================
