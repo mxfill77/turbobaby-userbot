@@ -185,7 +185,7 @@ class TestPureLogic(unittest.TestCase):
         self.assertEqual(suggest.detectVehicleType("японский седан"), "car")
         self.assertEqual(suggest.detectVehicleType("подать байк"), "bike")
         self.assertEqual(suggest.detectVehicleType(""), "unknown")
-        # авто-слова и марка (префиксом токена, склонение ловится); моточные бренды НЕ авто
+        # авто-слова и марка (склонение ловится); моточные бренды НЕ авто
         self.assertEqual(suggest.detectVehicleType("нужна машина на неделю"), "car")
         self.assertEqual(suggest.detectVehicleType("хочу тойоту"), "car")
         self.assertEqual(suggest.detectVehicleType("есть иномарки?"), "car")
@@ -194,6 +194,90 @@ class TestPureLogic(unittest.TestCase):
         self.assertEqual(suggest.detectVehicleType("мотоцикл на 3 дня"), "bike")
         self.assertEqual(suggest.detectVehicleType("Привет, как дела?"), "unknown")
         self.assertEqual(suggest.detectVehicleType(None), "unknown")
+
+    def test_detect_vehicle_type_live_phrases(self):
+        """ГОЛДЕНЫ — ДОСЛОВНЫЕ фразы из живого корпуса (правило-класс CLAUDE.md).
+
+        Замер 29.07.2026 по 178 боевым тредам moderation_ipc.db и 710 диалогам client_chats.jsonl:
+        подстроковый матч давал 45 ложных «авто» из 56 — каждый четвёртый тред. Разбор целиком:
+        docs/artifacts/2026-07-29-vehicle-type-live-corpus.md. Ни одна фраза здесь не придумана.
+        """
+        # --- ЛОЖНЫЕ «авто», которые больше не должны рождаться (13 тредов «автовокзал» и т.д.)
+        self.assertEqual(suggest.detectVehicleType(
+            "Привет, Филипп! Можно я сегодня возьму один байк из офиса, чтобы доехать домой? "
+            "Сегодня мне нужно отвезти младшего брата на автовокзал — он едет домой, в Сонгкхлу."
+        ), "bike")
+        self.assertEqual(suggest.detectVehicleType(
+            "К сожалению байк будет сегодня готов примерно в14-15 часов к выдаче. Сегодня все "
+            "сотрудники у аудиторов на переоформлении документов задерживаются."
+        ), "bike")
+        # наш собственный текст, который прежде объявлялся запросом про авто (стем марки «ауди»).
+        # 'unknown', а не 'bike': латиницы в словаре детекта нет вовсе — «MOTO» он не видит и
+        # никогда не видел (остаток задачи, не регресс).
+        self.assertEqual(suggest.detectVehicleType("Аудио от TURBOBABY MOTO PHUKET"), "unknown")
+        # «автомат» — это коробка СКУТЕРА, а не марка авто
+        for phrase in ("у него автомат коробка робот",
+                       "На автомате, а так разницы нету",
+                       "скидка от срока работает автоматичкская",
+                       "Более автоматизировано",
+                       "Я уже забронировал билет на автобус и боюсь не успеть вовремя",
+                       "у нас в Олд Тауне, огромный автосервис, мы делаем все виды ремонта",
+                       "Норм автоответ",
+                       "Подбор источников: чаты, где точно есть ваша аудитория",
+                       "Вода попала в сцепление, нужно промыть моторный отсек"):
+            self.assertNotIn(suggest.detectVehicleType(phrase), ("car", "mixed"), phrase)
+
+        # --- СМЕШАННЫЙ запрос: авто названо, но и байк тоже → словарь не ограничиваем
+        self.assertEqual(suggest.detectVehicleType(
+            "У него опыт вождения форзы 350 есть, по сути тоже самое. Права тоже у него есть "
+            "на машину и байк."
+        ), "mixed")
+        self.assertEqual(suggest.detectVehicleType("нужна машина или байк"), "mixed")
+        self.assertEqual(suggest.detectVehicleType("АВТО И МОТО ПХУКЕТ"), "mixed")
+
+        # --- ЧЕСТНЫЕ «авто» обязаны остаться 'car' (те самые 11 тредов из 56)
+        for phrase in ("Подскажите, у вас авто есть?",
+                       "По бюджету не могу сказать, седанчик какой нибудь нормальный",
+                       "Думаю надо предлагать автомобили созвучные с его бюджетом",
+                       "Есть высокие авто ? Х5 может ?",
+                       "Добрый день, а у вас есть машины в аренду? 6 мест",
+                       "Nissan March 2021 - 500 бат/сутки",
+                       "Toyota Yaris 2020 - 600",
+                       "Где эта машина?",
+                       "Я стараюсь ездить на машине как можно больше."):
+            self.assertEqual(suggest.detectVehicleType(phrase), "car", phrase)
+
+        # --- регресс байковых склонений и ловушек границы слова
+        for phrase in ("Есть байки: NMAX, PCX.", "Забор байка бесплатный.", "Мотобайк свободен.",
+                       "Ищу большой байк, с мотором до 125сс"):
+            self.assertEqual(suggest.detectVehicleType(phrase), "bike", phrase)
+        for phrase in ("Квадробайк тоже есть.", "Озеро Байкал в туре.", "Наш байкер довезёт."):
+            self.assertEqual(suggest.detectVehicleType(phrase), "unknown", phrase)
+
+        # --- ДАВНОСТЬ ЗАПРОСА (живой id=353): в январе брал NMAX, 28.07 спрашивает про авто.
+        # Без этого правила 7 честных авто-тредов из 11 уезжали в 'mixed' из-за прошлой аренды.
+        self.assertEqual(suggest.detectVehicleType(
+            "[клиент]: В итоге байк будет нужен 6 января, возврат 19 января\n"
+            "[менеджер]: NMAX 155CC | дней: 14 стоимость: 5671, депозит: 3 000 бат\n"
+            "[клиент]: Подскажите, у вас авто есть?"
+        ), "car")
+        # тот же тред в обратном порядке — свежий запрос снова про байк
+        self.assertEqual(suggest.detectVehicleType(
+            "[клиент]: Подскажите, у вас авто есть?\n"
+            "[клиент]: В итоге байк будет нужен 6 января, возврат 19 января"
+        ), "bike")
+        # реплика МЕНЕДЖЕРА про байк не перебивает свежий запрос клиента про авто
+        self.assertEqual(suggest.detectVehicleType(
+            "[менеджер]: К сожалению байк будет сегодня готов примерно в14-15 часов к выдаче\n"
+            "[клиент]: Подскажите, у вас авто есть?"
+        ), "car")
+        # клиент транспорт не называл вовсе → откат на весь текст, как было раньше
+        self.assertEqual(suggest.detectVehicleType(
+            "[менеджер]: К сожалению байк будет сегодня готов примерно в14-15 часов к выдаче\n"
+            "[клиент]: Хорошо, спасибо"
+        ), "bike")
+        # «Мопед, машина» — ОДИН запрос, названы оба (живая реплика корпуса B)
+        self.assertEqual(suggest.detectVehicleType("Мопед, машина"), "mixed")
 
     def test_enforce_vehicle_word_notes_and_never_rewrites(self):
         """28.07: слепая замена «байк»→«авто» снята. Текст клиента не трогаем — вешаем пометку.
@@ -247,12 +331,59 @@ class TestPureLogic(unittest.TestCase):
         self.assertNotIn("vehicle type", suggest.client_facing_text(en))
         self.assertNotIn("vehicle type", suggest.stripInternalMarkers(en))
 
+    def test_mixed_request_notes_without_limiting_vocabulary(self):
+        """Смешанный запрос (29.07.2026): клиент назвал и авто, и байк.
+
+        Живой случай — «Права тоже у него есть на машину и байк» в треде про аренду ADV 350:
+        прежде приоритет 'car' ограничивал словарь на честном байковом треде. Теперь словарь не
+        трогаем, черновик уходит как есть, а менеджер получает пометку «клиент упомянул авто».
+        """
+        NOTE = suggest._VEHICLE_MIXED_NOTE["ru"]
+        src = "Рекомендую байк NMAX — 590 бат/сутки."
+        out = suggest.enforce_vehicle_word(src, "mixed")
+        self.assertTrue(out.startswith(src), "тело черновика обязано остаться байт-в-байт")
+        self.assertIn("байк NMAX", out)                 # слово про наш парк на месте
+        self.assertTrue(out.endswith(NOTE))
+        self.assertEqual(suggest.enforce_vehicle_word(out, "mixed"), out)   # идемпотентно
+        # пустой черновик пометкой не «оживляем»
+        self.assertEqual(suggest.enforce_vehicle_word("", "mixed"), "")
+        # пометка — служебный канал: клиенту не уходит ни одним из двух срезов
+        self.assertNotIn("тип ТС", suggest.client_facing_text(out))
+        self.assertEqual(suggest.client_facing_text(out), src)
+        self.assertNotIn("тип ТС", suggest.stripInternalMarkers(out))
+        # EN-тред получает EN-пометку, и её тоже срезают
+        en = suggest.enforce_vehicle_word("I recommend a байк NMAX.", "mixed", lang="en")
+        self.assertTrue(en.endswith(suggest._VEHICLE_MIXED_NOTE["en"]))
+        self.assertNotIn("vehicle type", suggest.client_facing_text(en))
+        self.assertNotIn("vehicle type", suggest.stripInternalMarkers(en))
+
+    def test_generate_draft_mixed_thread_keeps_bike_words(self):
+        """СКВОЗНОЙ прогон: живая фраза со смешанным упоминанием — байк в черновике цел."""
+        bike_llm = lambda _s, _u: "Здравствуйте! Рекомендую байк NMAX, байки у нас отличные."
+        thread = ("[клиент]: У него опыт вождения форзы 350 есть, по сути тоже самое. "
+                  "Права тоже у него есть на машину и байк.")
+        d = suggest.generate_draft(thread, "ru", "FAQ", is_first_contact=True, call_llm=bike_llm)
+        self.assertIn("байк NMAX", d)                                  # словарь не ограничен
+        self.assertIn(suggest._VEHICLE_MIXED_NOTE["ru"], d)            # менеджер предупреждён
+        self.assertNotIn(suggest._VEHICLE_NOTE["ru"], d)               # но НЕ пометкой про конфликт
+        self.assertNotIn("тип ТС", suggest.client_facing_text(d))      # клиенту пометка не уйдёт
+
     def test_make_system_prompt_vehicle_type(self):
-        # 'car' — блок ТИП ТС запрещает слово «байк» и велит говорить «авто»/«машина».
+        # 'car' (переписан 29.07.2026) — блок про ФАКТЫ, а не про словарь. Запрет слова снят:
+        # он бил ДО генерации по 45 живым байковым тредам из 178.
         p_car = suggest.make_system_prompt("FAQ", "ru", vehicle_type="car")
         self.assertIn("ТИП ТС", p_car)
-        self.assertIn("«байк»/«мотобайк» НЕ", p_car)
-        self.assertIn("«авто»/«машина»", p_car)
+        self.assertNotIn("«байк»/«мотобайк» НЕ", p_car)      # ← прежний запрет словаря снят
+        self.assertIn("запрета на слово «байк» нет", p_car)
+        # бизнес-правило владельца: отказ не даём, фактов по авто не выдумываем, ведём к менеджеру
+        self.assertIn("ОТКАЗ", p_car)
+        self.assertIn("НЕ выдумывай", p_car)
+        self.assertIn("к менеджеру", p_car)
+        # 'mixed' — словарь не ограничен вовсе, но по авто те же ограничения по фактам
+        p_mixed = suggest.make_system_prompt("FAQ", "ru", vehicle_type="mixed")
+        self.assertIn("словарь", p_mixed.lower())
+        self.assertIn("НЕ ограничен", p_mixed)
+        self.assertIn("НЕ выдумывай", p_mixed)
         # 'unknown' — нейтральное «технику», без навязывания «байк».
         p_unknown = suggest.make_system_prompt("FAQ", "ru", vehicle_type="unknown")
         self.assertIn("НЕЙТРАЛЬНОЕ", p_unknown)
