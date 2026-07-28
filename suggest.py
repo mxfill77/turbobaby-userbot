@@ -1306,6 +1306,96 @@ def enforce_vehicle_word(draft, vehicle_type, lang="ru"):
     return _BIKE_NOUN_RE.sub("авто", draft)
 
 
+# --- ГАРД ПАРТНЁРСКИХ ЧАТОВ (шаг 3/6 родитель #4) --------------------------------------------
+# Собеседник в партнёрском чате — ПАРТНЁР (другой прокат/координатор), а не конечный клиент. Его
+# доставку/подачу байка мы НЕ организуем и НЕ подтверждаем ОТ НАШЕГО лица: черновик, собранный
+# клиентским промптом, порой обещает «подадим/привезём» или спрашивает «во сколько подать» — это
+# берёт на нас чужую доставку. Гард (страховка кодом поверх LLM) заменяет такие утверждающе-
+# организующие формулировки на уточняющий вопрос партнёру БЕЗ обязательств с нашей стороны.
+# Маркеры выровнены с export_all.GROUPS_TO_EXPORT: имя партнёрского чата несёт «партнёрк…/turbostm».
+_PARTNER_CHAT_MARKERS = ("партнерк", "turbostm", "turbo stm")
+
+
+def is_partner_chat(entity) -> bool:
+    """Партнёрский ли это чат — по title/name/username сущности Telethon (для вызывающего кода, чтобы
+    выставить флаг is_partner). Нормализуем lower+ё→е; маркер из _PARTNER_CHAT_MARKERS в любом из полей
+    → True. None/без полей/обычный клиентский DM → False (fail-safe: клиентский путь гард не трогает).
+    Чистая функция (без сети/LLM)."""
+    if entity is None:
+        return False
+    for attr in ("title", "name", "username", "first_name", "last_name"):
+        v = getattr(entity, attr, None)
+        if isinstance(v, str) and v:
+            s = v.lower().replace("ё", "е")
+            if any(m in s for m in _PARTNER_CHAT_MARKERS):
+                return True
+    return False
+
+
+# Доставка/подача ОТ НАШЕГО лица (1-е лицо мн.ч.) — обещание, которого в партнёрском чате быть не должно.
+# Текст сегмента поступает УЖЕ нормализованным (lower, ё→е), поэтому «привезём» ищем как «привезем».
+_PARTNER_COMMIT_RE = re.compile(
+    r"(?<![а-яa-z])(?:подадим|привезем|доставим|подвезем|довезем)", re.I)
+# Организующий ВОПРОС о подаче/доставке («во сколько подать», «когда привезти», «куда подавать»).
+_PARTNER_ORG_Q_RE = re.compile(
+    r"(?:во\s+сколько|когда|куда|к\s+как\w+\s+времени)[^.!?\n]{0,40}?"
+    r"(?:подать|подавать|подаем|привезти|подвезти|доставить|подадим|привезем)", re.I)
+# «организуем …доставку/подачу» — организация чужой доставки нашими силами.
+_PARTNER_ORG_RE = re.compile(r"организуем", re.I)
+_PARTNER_DELIVERY_NOUN_RE = re.compile(r"доставк|подач|подвоз|привоз|довоз", re.I)
+# EN-двойник (партнёр пишет по-английски): «we will deliver/bring/drop off …» — обещание от нас.
+# «\bdeliver\b» НЕ ловит существительное «delivery» (нет границы r|y) → канон себя не триггерит.
+_PARTNER_COMMIT_EN_RE = re.compile(
+    r"\bwe\b[^.!?\n]{0,15}?\b(?:deliver|bring|drop off|drop it off)\b", re.I)
+# Границы предложений/строк для посегментной замены (склейка обратно = исходник байт-в-байт).
+_PARTNER_SEG_RE = re.compile(r"[^.!?\n]*(?:[.!?]+|\n|$)")
+
+_PARTNER_CLARIFY_RU = ("Уточните, пожалуйста, кто и во сколько организует подачу байка клиенту — "
+                       "со своей стороны доставку не берём и от нашего лица её не подтверждаем.")
+_PARTNER_CLARIFY_EN = ("Could you clarify who arranges the bike delivery and at what time — we "
+                       "don't take it on or confirm the delivery on our side.")
+
+
+def _partner_delivery_offends(seg_norm: str) -> bool:
+    """seg_norm — сегмент, УЖЕ приведённый к lower и ё→е. True, если несёт утверждающе-организующую
+    доставку ОТ НАШЕГО лица: 1-е лицо мн.ч. (подадим/привезём/доставим/подвезём) ЛИБО организующий
+    вопрос «во сколько подать/когда привезти…» ЛИБО «организуем …доставку/подачу». Чистая проверка."""
+    return bool(
+        _PARTNER_COMMIT_RE.search(seg_norm)
+        or _PARTNER_ORG_Q_RE.search(seg_norm)
+        or _PARTNER_COMMIT_EN_RE.search(seg_norm)
+        or (_PARTNER_ORG_RE.search(seg_norm) and _PARTNER_DELIVERY_NOUN_RE.search(seg_norm)))
+
+
+def enforce_partner_delivery_guard(draft, is_partner, lang="ru"):
+    """Детерминированная СТРАХОВКА поверх промпта: в партнёрском чате (is_partner) утверждающе-
+    организующие формулировки доставки ОТ НАШЕГО лица заменяем на уточняющий вопрос партнёру БЕЗ
+    обязательств. Посегментно: offending-предложение → каноническая строка (соседние дубли схлопнуты),
+    остальной текст и разметка строк — БАЙТ-В-БАЙТ. Нет is_partner / нет ни одного маркера → черновик
+    неизменен. Чистая функция (без сети/LLM/глобалов)."""
+    if not is_partner or not draft:
+        return draft
+    if not _partner_delivery_offends(draft.lower().replace("ё", "е")):
+        return draft                       # маркеров нет — черновик БАЙТ-В-БАЙТ
+    canon = _PARTNER_CLARIFY_EN if lang == "en" else _PARTNER_CLARIFY_RU
+    out, prev_canon = [], False
+    for seg in _PARTNER_SEG_RE.findall(draft):
+        if seg == "":
+            continue
+        if _partner_delivery_offends(seg.lower().replace("ё", "е")):
+            if prev_canon:                 # соседний offending-сегмент — канон уже стоит, дубль не плодим
+                continue
+            if out and not out[-1][-1:].isspace():
+                out.append(" ")            # отделяем канон от предыдущего предложения пробелом
+            out.append(canon + ("\n" if seg.endswith("\n") else ""))
+            prev_canon = True
+        else:
+            out.append(seg)
+            if seg.strip():                # реальный текст сбрасывает дедуп; чистый \n/пробел — нет
+                prev_canon = False
+    return "".join(out).strip()
+
+
 async def read_transcript(client, entity, me_id: int, limit: int = MAX_MESSAGES) -> str:
     """Совместимость: выбрать сообщения и собрать транскрипт."""
     return transcript_from(await _fetch_messages(client, entity, limit), me_id)
@@ -4042,7 +4132,8 @@ ANTI_LOOP_NOTE = (
 
 def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pricing_note: str = "",
                        directive: str = "", park_models=None, playbook: str = "", pressure=None,
-                       collected=None, ready: bool = False, just=None, vehicle_type: str = "bike") -> str:
+                       collected=None, ready: bool = False, just=None, vehicle_type: str = "bike",
+                       is_partner: bool = False) -> str:
     lang_name = "русском" if lang == "ru" else "английском"
     if is_first_contact:
         greet = (
@@ -4245,6 +4336,20 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         )
     else:
         vehicle_block = ""   # bike/дефолт — формулировку не меняем (регресс байт-в-байт)
+    # ПАРТНЁРСКИЙ ЧАТ (шаг 3/6 родитель #4): собеседник — партнёр, не конечный клиент. Доставку/подачу
+    # байка от НАШЕГО лица не подтверждаем и не организуем; про подачу — уточняющий вопрос БЕЗ
+    # обязательств. Дефолт False → блока нет (регресс байт-в-байт). Детерминированную страховку на
+    # is_partner держит enforce_partner_delivery_guard на финале generate_draft/regenerate_draft.
+    if is_partner:
+        partner_block = (
+            "\n\n★ ПАРТНЁРСКИЙ ЧАТ (ВЫСШИЙ приоритет по формулировке): собеседник — ПАРТНЁР, а НЕ "
+            "конечный клиент. Доставку/подачу байка от НАШЕГО лица НЕ подтверждай и НЕ организуй: "
+            "слова «подадим», «привезём», «доставим», «во сколько подать» — под запретом. Если речь о "
+            "подаче/доставке — задай УТОЧНЯЮЩИЙ вопрос партнёру БЕЗ обязательств с нашей стороны (кто "
+            "её организует и во сколько), саму доставку на себя не бери."
+        )
+    else:
+        partner_block = ""   # обычный клиентский чат — формулировку не меняем (регресс байт-в-байт)
     return (
         "Ты — менеджер проката мотобайков TurboBaby (Пхукет). По переписке с клиентом "
         f"составь ОДИН короткий, вежливый ответ на {lang_name} языке (язык клиента). "
@@ -4257,6 +4362,7 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         "клиент их видеть НЕ должен. Ответ начинай СРАЗУ по сути (первый контакт → "
         "приветствие → суть; иначе → сразу суть)."
         + vehicle_block
+        + partner_block
         + pressure_block
         + directive_block + park_block + collected_block + greet + policy + scenario
         + next_step_block + ANTI_LOOP_NOTE + price_block + "\n\n"
@@ -5353,11 +5459,13 @@ def guard_availability(draft: str, avail=None, model=None, ds=None, de=None, lan
 
 def generate_draft(transcript: str, lang: str, faq: str,
                    is_first_contact: bool = False, pricing_note: str = "", call_llm=None,
-                   park_models=None, playbook: str = "") -> str:
+                   park_models=None, playbook: str = "", is_partner: bool = False) -> str:
     """Сгенерировать черновик. call_llm(system, user)->str инъектируется в тестах; иначе по флагу
     SUGGEST_LLM_VIA_CLI — claude CLI (подписка Max) либо _default_llm (платный API-ключ).
     park_models — allowlist моделей реального парка (Лист1); None → без ограничения (fail-safe).
-    playbook — книга правил (ниже кап-цены/критфактов); '' → без блока (fail-safe)."""
+    playbook — книга правил (ниже кап-цены/критфактов); '' → без блока (fail-safe).
+    is_partner — партнёрский чат (шаг 3/6 #4): доставку от нашего лица не подтверждаем; дефолт
+    False → регресс байт-в-байт."""
     call_llm = call_llm or (_cli_llm if SUGGEST_LLM_VIA_CLI else _default_llm)
     # §243/6: что клиент УЖЕ прислал (модель/даты/гео/паспорт/тел/оплата) — не переспрашиваем.
     facts = collected_facts(transcript)
@@ -5369,7 +5477,7 @@ def generate_draft(transcript: str, lang: str, faq: str,
     vehicle_type = detectVehicleType(transcript)
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
                                 park_models=park_models, playbook=playbook, collected=facts,
-                                ready=ready, just=just, vehicle_type=vehicle_type)
+                                ready=ready, just=just, vehicle_type=vehicle_type, is_partner=is_partner)
     out = _strip_service_prefix(call_llm(system, transcript))
     # Пост-чек ДО сборки сетки: сканируем LLM-текст (intro/outro), дословный прайс-блок КОДА не
     # трогаем. Утверждения цвет/наличие/цена вне белого списка → «уточню»-форма + пометка модератору.
@@ -5402,12 +5510,15 @@ def generate_draft(transcript: str, lang: str, faq: str,
     out = _append_collected_note(out, facts, lang, unconfirmed_fields(transcript, facts))
     out = _append_season_note(out, pricing_note)
     # Страховка типа ТС ПОСЛЕДНИМ шагом (после дописок КОДА): на 'car'-треде «байк» → «авто».
-    return enforce_vehicle_word(out, vehicle_type, lang)
+    out = enforce_vehicle_word(out, vehicle_type, lang)
+    # Гард партнёрского чата — САМЫМ последним (поверх всех дописок/страховок): утверждающе-
+    # организующую доставку от нашего лица → уточняющий вопрос партнёру без обязательств.
+    return enforce_partner_delivery_guard(out, is_partner, lang)
 
 
 def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: bool,
                      pricing_note: str, directive: str, call_llm=None, park_models=None,
-                     playbook: str = "") -> str:
+                     playbook: str = "", is_partner: bool = False) -> str:
     """СТРАТЕГИЯ-перегенерация черновика С НУЛЯ: реплика модератора идёт как ДИРЕКТИВА ВЕРХНЕГО
     УРОВНЯ поверх ИСХОДНОГО клиентского контекста (транскрипт+FAQ+кап-цена), а НЕ как патч к старому
     тексту. Инварианты (ценовая политика/критфакты/парк/playbook) сохраняются — они в make_system_prompt."""
@@ -5420,7 +5531,8 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     vehicle_type = detectVehicleType(transcript)
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
                                 directive=directive, park_models=park_models, playbook=playbook,
-                                collected=facts, ready=ready, just=just, vehicle_type=vehicle_type)
+                                collected=facts, ready=ready, just=just, vehicle_type=vehicle_type,
+                                is_partner=is_partner)
     out = _strip_service_prefix(call_llm(system, transcript))
     # Тот же пост-чек, что в generate_draft (до сборки сетки): цвет/наличие/цена вне данных → «уточню».
     out = postcheck_draft(out, lang, pricing_note=pricing_note, call_llm=call_llm, transcript=transcript)
@@ -5455,7 +5567,10 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     # (в транскрипте нет строки [менеджер]:) → черновик не трогаем, фирменное приветствие цело.
     out = strip_greeting_for_window(out, transcript)
     # Страховка типа ТС ПОСЛЕДНИМ шагом (тот же класс, что в generate_draft): 'car' → «байк»→«авто».
-    return enforce_vehicle_word(out, vehicle_type, lang)
+    out = enforce_vehicle_word(out, vehicle_type, lang)
+    # Гард партнёрского чата — САМЫМ последним (тот же класс, что в generate_draft): доставку от
+    # нашего лица → уточняющий вопрос партнёру без обязательств.
+    return enforce_partner_delivery_guard(out, is_partner, lang)
 
 
 # ============================ E2E-СМОУК (TEST_MODE) ==========================
@@ -6122,9 +6237,14 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
         pb = load_playbook()
     except Exception:
         pb = ""
+    # Партнёрский чат (шаг 3/6 #4): признак по имени окна (title/username). Обычный клиентский DM →
+    # False (регресс байт-в-байт); партнёрское окно → гард не даёт черновику подтверждать доставку
+    # партнёра от нашего лица. Групповую маршрутизацию партнёрок держит вызывающий контур (userbot).
+    is_partner = is_partner_chat(sender)
     try:
         draft = generate_draft(transcript, lang, faq, is_first_contact=first,
-                               pricing_note=price_note, call_llm=call_llm, park_models=allow, playbook=pb)
+                               pricing_note=price_note, call_llm=call_llm, park_models=allow,
+                               playbook=pb, is_partner=is_partner)
     except Exception as e:   # сбой генератора (напр. claude CLI не найден / API-ошибка) — НЕ молчим
         reason = " ".join(str(e).split())[:200] or type(e).__name__
         log.warning(f"SUGGEST: сбой генерации для {client_ref}: {reason}")
