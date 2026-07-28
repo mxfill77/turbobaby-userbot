@@ -1378,10 +1378,18 @@ _PARTNER_COMMIT_EN_RE = re.compile(
 # Границы предложений/строк для посегментной замены (склейка обратно = исходник байт-в-байт).
 _PARTNER_SEG_RE = re.compile(r"[^.!?\n]*(?:[.!?]+|\n|$)")
 
-_PARTNER_CLARIFY_RU = ("Уточните, пожалуйста, кто и во сколько организует подачу байка клиенту — "
-                       "со своей стороны доставку не берём и от нашего лица её не подтверждаем.")
-_PARTNER_CLARIFY_EN = ("Could you clarify who arranges the bike delivery and at what time — we "
-                       "don't take it on or confirm the delivery on our side.")
+# ОТРИЦАНИЕ — это ровно та формулировка, которой мы и добиваемся («доставку не берём»): пометки
+# такой сегмент заслуживать не должен. Текст сегмента приходит УЖЕ нормализованным (lower, ё→е).
+_PARTNER_NEG_RE = re.compile(
+    r"(?:^|[^а-яa-z])не\s+(?:подадим|привезем|доставим|подвезем|довезем)")
+
+# Пометка модератору — тот же служебный канал карточки, что «[уточнить: …]» и «[тип ТС: …]»:
+# отдельная строка в квадратных скобках в хвосте, её срезают client_facing_text и
+# stripInternalMarkers. Называет ИМЕННО ЧТО смутило и цитирует фрагмент-триггер.
+_PARTNER_NOTE_RU = ("[партнёрский чат: обещание доставки от нашего лица («%s») — "
+                    "проверь перед отправкой]")
+_PARTNER_NOTE_EN = ("[partner chat: the draft commits to delivery on our side (\"%s\") — "
+                    "check before sending]")
 
 
 def _partner_delivery_offends(seg_norm: str) -> bool:
@@ -1395,33 +1403,52 @@ def _partner_delivery_offends(seg_norm: str) -> bool:
         or (_PARTNER_ORG_RE.search(seg_norm) and _PARTNER_DELIVERY_NOUN_RE.search(seg_norm)))
 
 
-def enforce_partner_delivery_guard(draft, is_partner, lang="ru"):
-    """Детерминированная СТРАХОВКА поверх промпта: в партнёрском чате (is_partner) утверждающе-
-    организующие формулировки доставки ОТ НАШЕГО лица заменяем на уточняющий вопрос партнёру БЕЗ
-    обязательств. Посегментно: offending-предложение → каноническая строка (соседние дубли схлопнуты),
-    остальной текст и разметка строк — БАЙТ-В-БАЙТ. Нет is_partner / нет ни одного маркера → черновик
-    неизменен. Чистая функция (без сети/LLM/глобалов)."""
+def partner_delivery_trigger(draft, is_partner=True) -> str:
+    """Фрагмент-триггер: обещание доставки ОТ НАШЕГО лица в партнёрском черновике. «» — чисто.
+
+    Считаем ПОСЕГМЕНТНО, потому что отрицание живёт в своём предложении: «Доставку не берём, но
+    привезём документы» обязано дать пометку по второму сегменту, а «Мы не доставим — забирает
+    клиент сам» не должно дать её вовсе. Третье лицо («партнёр привезёт») сюда не попадает по
+    построению: _PARTNER_COMMIT_RE знает только 1-е лицо мн.ч. Чистая функция."""
     if not is_partner or not draft:
-        return draft
-    if not _partner_delivery_offends(draft.lower().replace("ё", "е")):
-        return draft                       # маркеров нет — черновик БАЙТ-В-БАЙТ
-    canon = _PARTNER_CLARIFY_EN if lang == "en" else _PARTNER_CLARIFY_RU
-    out, prev_canon = [], False
+        return ""
     for seg in _PARTNER_SEG_RE.findall(draft):
-        if seg == "":
+        if not seg:
             continue
-        if _partner_delivery_offends(seg.lower().replace("ё", "е")):
-            if prev_canon:                 # соседний offending-сегмент — канон уже стоит, дубль не плодим
-                continue
-            if out and not out[-1][-1:].isspace():
-                out.append(" ")            # отделяем канон от предыдущего предложения пробелом
-            out.append(canon + ("\n" if seg.endswith("\n") else ""))
-            prev_canon = True
-        else:
-            out.append(seg)
-            if seg.strip():                # реальный текст сбрасывает дедуп; чистый \n/пробел — нет
-                prev_canon = False
-    return "".join(out).strip()
+        norm = seg.lower().replace("ё", "е")
+        if _PARTNER_NEG_RE.search(norm):
+            continue                       # отрицание — это и есть нужная формулировка
+        for rx in (_PARTNER_COMMIT_RE, _PARTNER_ORG_Q_RE, _PARTNER_COMMIT_EN_RE):
+            m = rx.search(norm)
+            if m:
+                return m.group(0).strip()
+        if _PARTNER_ORG_RE.search(norm) and _PARTNER_DELIVERY_NOUN_RE.search(norm):
+            return _PARTNER_ORG_RE.search(norm).group(0).strip()
+    return ""
+
+
+def enforce_partner_delivery_guard(draft, is_partner, lang="ru"):
+    """ПОМЕТКА МЕНЕДЖЕРУ вместо переписывания предложения (28.07.2026).
+
+    Что было: offending-ПРЕДЛОЖЕНИЕ целиком заменялось каноном. Прогон по РЕАЛЬНЫМ выгрузкам
+    data_export/partners (4139 сообщений, 2024-11-22…2026-05-23) дал 5 попаданий, и замена в них
+    уничтожала суть, а не только обещание: «С 12 до 13 нмакс привезем к вам, окей ?» теряло окно
+    времени и модель; «Фоточи по колодкам, если что завтра же привезём» превращалось в канон про
+    доставку, хотя речь про фото колодок; «Доставка цена от района, куда нужно доставить ?» —
+    наш же вопрос о цене — исчезал целиком.
+
+    Что стало: текст черновика НЕ ТРОГАЕМ. Промпт-блок «ПАРТНЁРСКИЙ ЧАТ» работает ДО генерации —
+    это верный слой, он остаётся. Если обещание всё же просочилось, черновик уходит модератору С
+    ПОМЕТКОЙ, которая НАЗЫВАЕТ, что смутило, и цитирует фрагмент. Отрицание и третье лицо пометки
+    не дают. Идемпотентна. Не партнёрский чат → черновик БАЙТ-В-БАЙТ, как и раньше."""
+    trig = partner_delivery_trigger(draft, is_partner)
+    if not trig:
+        return draft
+    tmpl = _PARTNER_NOTE_EN if str(lang or "").lower().startswith("en") else _PARTNER_NOTE_RU
+    note = tmpl % trig
+    if note in draft:
+        return draft
+    return draft.rstrip() + "\n" + note
 
 
 async def read_transcript(client, entity, me_id: int, limit: int = MAX_MESSAGES) -> str:
@@ -5259,8 +5286,8 @@ def _append_season_note(draft: str, pricing_note: str) -> str:
 # КАЖДАЯ отдельной строкой в хвосте ([уточнить: …]/[собрано: …]/[сезон: …] и EN-аналоги). Клиент
 # их видеть не должен: client_facing_text срезает такие строки перед отправкой (шаг 4/7 #253).
 _SERVICE_NOTE_LINE_RE = re.compile(
-    r"^[ \t]*\[(?:уточнить|собрано|collected|сезон|season|тип ТС|vehicle type)\b[^\n]*\][ \t]*$",
-    re.I | re.M)
+    r"^[ \t]*\[(?:уточнить|собрано|collected|сезон|season|тип ТС|vehicle type"
+    r"|партн[её]рский чат|partner chat)\b[^\n]*\][ \t]*$", re.I | re.M)
 
 
 def client_facing_text(draft: str) -> str:
@@ -5281,7 +5308,8 @@ def client_facing_text(draft: str) -> str:
 # (подключим отдельным шагом чейна). Регистр не учитываем (re.I).
 _INTERNAL_MARKER_RE = re.compile(
     r"Этап\s*\d|менеджер\s+(?:ещё|еще)\s+не\s+назвал|собрано|\[уточнить"
-    r"|\[тип ТС|\[vehicle type", re.I)      # пометка о конфликте типа ТС — тоже служебная (28.07)
+    r"|\[тип ТС|\[vehicle type"             # пометка о конфликте типа ТС — тоже служебная (28.07)
+    r"|\[партн[её]рский чат|\[partner chat", re.I)   # …и пометка партнёрского гарда (28.07)
 
 
 def stripInternalMarkers(text: str) -> str:

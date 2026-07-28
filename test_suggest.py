@@ -294,33 +294,73 @@ class TestPureLogic(unittest.TestCase):
         self.assertFalse(suggest.is_partner_chat(_E(title="Аренда байков")))
         self.assertFalse(suggest.is_partner_chat(None))
 
-    def test_enforce_partner_delivery_guard(self):
-        canon = suggest._PARTNER_CLARIFY_RU
-        # Утверждающе-организующая доставка ОТ НАШЕГО лица → уточняющий вопрос без обязательств.
-        one = suggest.enforce_partner_delivery_guard("Подадим байк к 10:00.", True)
-        self.assertEqual(one, canon)
-        # Приветствие цело, обе delivery-формулировки схлопнуты в один канон (дедуп соседних).
+    def test_partner_guard_notes_and_never_rewrites(self):
+        """28.07: замена ПРЕДЛОЖЕНИЯ снята — текст черновика не трогаем, вешаем пометку.
+
+        Прогон по РЕАЛЬНЫМ выгрузкам data_export/partners (4139 сообщений, 2024-11…2026-05) дал
+        5 попаданий, и замена в них уничтожала суть, а не только обещание: «С 12 до 13 нмакс
+        привезем к вам» теряло окно времени и модель; «Фоточи по колодкам, если что завтра же
+        привезём» превращалось в канон про доставку, хотя речь о фото колодок.
+        """
+        # строка ИЗ ВЫГРУЗКИ (Партнерка_STM_Turbobaby.json, 2025-11-28)
+        src = "С 12 до 13 нмакс привезем к вам, окей ?"
+        out = suggest.enforce_partner_delivery_guard(src, True)
+        self.assertTrue(out.startswith(src), "тело черновика обязано остаться байт-в-байт")
+        self.assertIn("С 12 до 13", out)               # окно времени цело
+        self.assertIn("нмакс", out)                    # модель цела
+        self.assertIn("партнёрский чат", out)          # пометка есть
+        self.assertIn("привезем", out)                 # и НАЗЫВАЕТ фрагмент-триггер
+        self.assertEqual(suggest.enforce_partner_delivery_guard(out, True), out)   # идемпотентно
+
+        # строка ИЗ ВЫГРУЗКИ (2025-11-29): тема не про доставку — суть обязана уцелеть
+        pads = "Фоточи по колодкам, если что завтра же привезём"
+        self.assertTrue(suggest.enforce_partner_delivery_guard(pads, True).startswith(pads))
+
+        # ОТРИЦАНИЕ пометки не даёт вовсе — это и есть нужная нам формулировка
+        for neg in ("Мы не доставим — забирает клиент сам.",
+                    "Со своей стороны не привезём, подача на вашей стороне."):
+            self.assertEqual(suggest.enforce_partner_delivery_guard(neg, True), neg, neg)
+            self.assertEqual(suggest.partner_delivery_trigger(neg), "", neg)
+
+        # но отрицание в ОДНОМ предложении не глушит обещание в другом
+        both = "Доставку не берём. Но привезём документы к 10:00."
+        self.assertIn("партнёрский чат", suggest.enforce_partner_delivery_guard(both, True))
+
+        # ТРЕТЬЕ ЛИЦО — не наше обязательство → пометки нет
+        for third in ("Партнёр сам привезёт байк клиенту.",
+                      "Клиент заберёт байк сам.",
+                      "Курьер доставит документы завтра."):
+            self.assertEqual(suggest.enforce_partner_delivery_guard(third, True), third, third)
+            self.assertEqual(suggest.partner_delivery_trigger(third), "", third)
+
         mixed = suggest.enforce_partner_delivery_guard(
             "Привет! Да, подадим байк в Патонг. Во сколько подать байк клиенту?", True)
-        self.assertEqual(mixed, "Привет! " + canon)
-        for w in ("подадим", "во сколько подать", "привезём"):
-            self.assertNotIn(w, mixed.lower())
-        # «привезём» (1-е лицо мн.ч.) тоже под гардом.
-        self.assertNotIn("привезём", suggest.enforce_partner_delivery_guard(
-            "Привезём байк утром.", True).lower())
-        # EN-черновик → английский канон.
-        self.assertEqual(
-            suggest.enforce_partner_delivery_guard("We will deliver the bike at 10.", True, "en"),
-            suggest._PARTNER_CLARIFY_EN)
-        # Доставка ПАРТНЁРА (3-е лицо) — это НЕ наше обязательство → черновик БАЙТ-В-БАЙТ.
-        third = "Партнёр сам привезёт байк клиенту."
-        self.assertEqual(suggest.enforce_partner_delivery_guard(third, True), third)
+        self.assertTrue(mixed.startswith("Привет! Да, подадим байк в Патонг."), mixed)
+        self.assertIn("партнёрский чат", mixed)
+        # «привезём» (1-е лицо мн.ч.) даёт пометку, но текст цел
+        one = suggest.enforce_partner_delivery_guard("Привезём байк утром.", True)
+        self.assertTrue(one.startswith("Привезём байк утром."))
+        self.assertIn("партнёрский чат", one)
+        # EN-черновик → EN-пометка, текст цел
+        en = suggest.enforce_partner_delivery_guard("We will deliver the bike at 10.", True, "en")
+        self.assertTrue(en.startswith("We will deliver the bike at 10."))
+        self.assertIn("partner chat", en)
         # Партнёрский чат без delivery-обещаний → БАЙТ-В-БАЙТ.
         plain = "Здравствуйте! Рады сотрудничеству, обсудим условия."
         self.assertEqual(suggest.enforce_partner_delivery_guard(plain, True), plain)
         # is_partner=False (обычный клиент) → БАЙТ-В-БАЙТ, даже с «подадим» (клиенту мы доставляем).
         self.assertEqual(suggest.enforce_partner_delivery_guard("Подадим байк к 10:00.", False),
                          "Подадим байк к 10:00.")
+
+    def test_partner_note_never_reaches_client(self):
+        """Пометка — служебный канал карточки: оба среза перед отправкой её убирают."""
+        d = suggest.enforce_partner_delivery_guard("Подадим байк к 10:00.", True)
+        self.assertIn("партнёрский чат", d)
+        self.assertEqual(suggest.client_facing_text(d), "Подадим байк к 10:00.")
+        self.assertNotIn("партнёрский чат", suggest.stripInternalMarkers(d))
+        en = suggest.enforce_partner_delivery_guard("We will deliver it at 10.", True, "en")
+        self.assertNotIn("partner chat", suggest.client_facing_text(en))
+        self.assertNotIn("partner chat", suggest.stripInternalMarkers(en))
 
     def test_make_system_prompt_partner(self):
         # is_partner — блок ПАРТНЁРСКИЙ ЧАТ запрещает подтверждать доставку от нашего лица.
@@ -333,22 +373,27 @@ class TestPureLogic(unittest.TestCase):
         self.assertNotIn("ПАРТНЁРСКИЙ ЧАТ", p0)
         self.assertIn("CLICK 125", p0)
 
-    def test_generate_draft_partner_delivery_guarded(self):
-        # ПРОВЕРКА ЗАДАЧИ (диалог по мотивам окна 45349667): партнёр координирует подачу байка своему
-        # клиенту. LLM (мок) вопреки промпту обещает «подадим/во сколько подать» от нашего лица —
-        # гард обязан заменить это на уточняющий вопрос партнёру без обязательств с нашей стороны.
+    def test_generate_draft_partner_delivery_noted_not_rewritten(self):
+        """СКВОЗНОЙ прогон (диалог по мотивам окна 45349667): партнёр координирует подачу байка.
+
+        Контракт с 28.07: LLM вопреки промпту обещает доставку от нашего лица — текст НЕ
+        переписываем (замена предложения на реальных выгрузках уничтожала суть), а вешаем пометку,
+        которая называет фрагмент-триггер. Клиенту пометка не уходит.
+        """
         tr = ("[клиент]: Привет! Наш клиент берёт Nmax на 3 дня в Патонге, "
               "договоримся по подаче байка?")
         partner_llm = lambda _s, _u: ("Привет! Да, подадим байк в Патонг. "
                                       "Во сколько подать байк клиенту?")
         d = suggest.generate_draft(tr, "ru", "FAQ", call_llm=partner_llm, is_partner=True)
-        for w in ("подадим", "во сколько подать", "привезём", "доставим"):
-            self.assertNotIn(w, d.lower())
-        self.assertIn("Уточните, пожалуйста", d)
-        self.assertIn("не берём", d)
-        # Регресс: тот же тред/мок БЕЗ is_partner → обещание доставки остаётся (клиенту мы доставляем).
+        self.assertIn("подадим байк в Патонг", d)          # обещание модели ЦЕЛО, не переписано
+        # (хвостовой вопрос модели меняет ДРУГОЙ этап конвейера — ensure_closing_question, не гард)
+        self.assertIn("партнёрский чат", d)                # пометка есть
+        self.assertIn("подадим", d.split("[партнёрский чат")[1])   # и называет триггер
+        self.assertNotIn("партнёрский чат", suggest.client_facing_text(d))   # клиенту не уйдёт
+        # Регресс: тот же тред/мок БЕЗ is_partner → ни пометки, ни правок (клиенту мы доставляем).
         d0 = suggest.generate_draft(tr, "ru", "FAQ", call_llm=partner_llm, is_partner=False)
         self.assertIn("подадим", d0.lower())
+        self.assertNotIn("партнёрский чат", d0)
 
     def test_greeting_already_sent(self):
         self.assertTrue(suggest.greeting_already_sent(
