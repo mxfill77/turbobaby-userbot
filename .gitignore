@@ -53,6 +53,8 @@ pc_orchestrator.*.json
 pc_orchestrator.heartbeat
 # спул недоставленных TRN-строк лога тренажёра (runtime, дозаписывается в док при успехе)
 trainer_log.spool
+# спул недоставленных строк-итогов в cowork_log (runtime, дошлётся следующим успешным вызовом)
+cowork_log.spool
 pc_ask_*.marker
 trainer_rules.json
 tmp/

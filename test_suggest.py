@@ -6119,5 +6119,124 @@ class TestEnglishDates(unittest.TestCase):
                          ("2027-05-05", "2027-05-10"))
 
 
+class TestParkSourceSplitsEmptyFromFailure(unittest.TestCase):
+    """Откуда взят парк: live / snapshot / empty / none / unconfigured. До 28.07 «пусто» и
+    «не получено» сливались в один пустой список — различить было нечем."""
+
+    def setUp(self):
+        self._pf = suggest.PARK_LIST_FILE
+        self._url, self._tok = suggest.pricing.BRIDGE_URL, suggest.pricing.BRIDGE_TOKEN
+        self._tmp = tempfile.TemporaryDirectory()
+        suggest.PARK_LIST_FILE = os.path.join(self._tmp.name, "no_park.md")    # снимка НЕТ
+        suggest.pricing.BRIDGE_URL = "https://x/exec"                          # попытка БЫЛА
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+
+    def tearDown(self):
+        suggest.PARK_LIST_FILE = self._pf
+        suggest.pricing.BRIDGE_URL, suggest.pricing.BRIDGE_TOKEN = self._url, self._tok
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+        self._tmp.cleanup()
+
+    def test_live_source(self):
+        g = lambda p: {"ok": True, "data": {"bikes": [{"name": "NMAX 155CC BLACK 4255"}]}}
+        allow, src = suggest.park_allowlist_status(getter=g)
+        self.assertEqual(src, suggest.PARK_LIVE)
+        self.assertIn("NMAX 155", allow)
+
+    def test_failure_without_snapshot_is_none(self):
+        allow, src = suggest.park_allowlist_status(getter=lambda p: {"ok": False})
+        self.assertEqual(src, suggest.PARK_NONE)          # ← это СБОЙ
+        self.assertIsNone(allow)
+
+    def test_really_empty_park_is_empty_not_none(self):
+        allow, src = suggest.park_allowlist_status(
+            getter=lambda p: {"ok": True, "data": {"bikes": []}})
+        self.assertEqual(src, suggest.PARK_EMPTY)         # ← это НЕ сбой
+        self.assertIsNone(allow)
+
+    def test_snapshot_used_when_bridge_down(self):
+        pf = os.path.join(self._tmp.name, "park_list.md")
+        with open(pf, "w", encoding="utf-8") as f:
+            f.write("| № | Название | Номер |\n|---|---|---|\n"
+                    "| 1 | NMAX 155CC BLACK 4255 | 4255 |\n")
+        suggest.PARK_LIST_FILE = pf
+        allow, src = suggest.park_allowlist_status(getter=lambda p: {"ok": False})
+        self.assertEqual(src, suggest.PARK_SNAPSHOT)
+        self.assertIn("NMAX 155", allow)
+
+    def test_unconfigured_bridge_is_not_a_failure(self):
+        suggest.pricing.BRIDGE_URL, suggest.pricing.BRIDGE_TOKEN = "", ""
+        _, src = suggest.park_allowlist_status()
+        self.assertEqual(src, suggest.PARK_UNCONFIGURED)  # dev/тесты — черновик не блокируем
+
+    def test_legacy_park_allowlist_signature_unchanged(self):
+        self.assertIsNone(suggest.park_allowlist(getter=lambda p: {"ok": False}))
+
+
+class TestNoDraftWhenParkUnavailable(unittest.TestCase):
+    """Инцидент 28.07 09:24: парк не получен, а черновик всё равно собирался. Теперь при СБОЕ
+    черновика нет — вместо него заметка менеджеру. При реально пустом парке отвечаем как раньше."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        d = self._tmp.name
+        self._mode, self._test = suggest.SUGGEST_MODE, suggest.SUGGEST_TEST_MODE
+        self._mg, self._pending, self._pairs = (suggest.MOD_GROUP_ID, suggest.pending,
+                                                suggest.PAIRS_FILE)
+        self._pf, self._note = suggest.PARK_LIST_FILE, suggest.build_pricing_note
+        self._url, self._tok = suggest.pricing.BRIDGE_URL, suggest.pricing.BRIDGE_TOKEN
+        suggest.SUGGEST_MODE, suggest.SUGGEST_TEST_MODE = True, False
+        suggest.reset_disabled()
+        suggest.MOD_GROUP_ID = -1009999999999
+        suggest.pending = suggest.PendingStore(os.path.join(d, "pending.jsonl"))
+        suggest.PAIRS_FILE = os.path.join(d, "pairs.jsonl")
+        suggest.limiter = suggest.RateLimiter(6, 15)
+        suggest.build_pricing_note = lambda hints, lang="ru": ""
+        suggest.PARK_LIST_FILE = os.path.join(d, "no_park.md")       # снимка НЕТ
+        suggest.pricing.BRIDGE_URL, suggest.pricing.BRIDGE_TOKEN = "https://x/exec", "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+        self.me = 42
+        self.client = FakeClient(history=[
+            FakeHistMsg(self.me, "Здравствуйте! Что хотите арендовать?"),
+            FakeHistMsg(999, "Пришлите прайс, пожалуйста"),
+        ])
+        self.sender = FakeSender(999, username="client1")
+
+    def tearDown(self):
+        suggest.SUGGEST_MODE, suggest.SUGGEST_TEST_MODE = self._mode, self._test
+        suggest.MOD_GROUP_ID, suggest.pending = self._mg, self._pending
+        suggest.PAIRS_FILE, suggest.PARK_LIST_FILE = self._pairs, self._pf
+        suggest.build_pricing_note = self._note
+        suggest.pricing.BRIDGE_URL, suggest.pricing.BRIDGE_TOKEN = self._url, self._tok
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+        suggest.reset_disabled()
+        self._tmp.cleanup()
+
+    def test_bridge_down_no_draft_and_manager_notified(self):
+        llm = lambda s, u: "Черновик, которого быть не должно"
+        with mock.patch.object(suggest.pricing, "fleet_status", return_value=([], False)):
+            res = asyncio.run(suggest.on_client_message(
+                self.client, self.sender, self.me, call_llm=llm, faq="FAQ"))
+        self.assertIsNone(res)
+        notes = [t for t in self.client.sent if "данные парка недоступны" in str(t[1])]
+        self.assertEqual(len(notes), 1)                  # ровно одна заметка менеджеру
+        self.assertIn("@client1", notes[0][1])
+        self.assertTrue(notes[0][1].lstrip().startswith("⚠️"))
+        # черновика нет ни в группе, ни клиенту
+        self.assertFalse(any("Черновик ответа клиенту" in str(t[1]) for t in self.client.sent))
+
+    def test_really_empty_park_still_answers(self):
+        llm = lambda s, u: "Добрый день! Уточните даты аренды."
+        with mock.patch.object(suggest.pricing, "fleet_status", return_value=([], True)):
+            asyncio.run(suggest.on_client_message(
+                self.client, self.sender, self.me, call_llm=llm, faq="FAQ"))
+        self.assertFalse(any("данные парка недоступны" in str(t[1]) for t in self.client.sent))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

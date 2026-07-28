@@ -925,5 +925,86 @@ class TestStep2ModelTermQuoteDepositPercent(unittest.TestCase):
         self.assertEqual(suggest.postcheck_draft(draft, "ru", pricing_note=note), draft)
 
 
+import urllib.error
+
+
+def _http_err(code):
+    return urllib.error.HTTPError("https://x/exec", code, "boom", None, None)
+
+
+class TestFleetStatusSplitsEmptyFromFailure(unittest.TestCase):
+    """«Парк реально пуст» и «парк не получен» — РАЗНЫЕ исходы. Раньше оба давали [] и были
+    неразличимы: 28.07 мост отдал 404, а вызывающий код увидел то же, что при пустом парке."""
+
+    def setUp(self):
+        pricing._FLEET_CACHE["data"] = None
+        pricing._FLEET_CACHE["ts"] = 0
+
+    def tearDown(self):
+        pricing._FLEET_CACHE["data"] = None
+        pricing._FLEET_CACHE["ts"] = 0
+
+    def test_live_ok_with_bikes(self):
+        g = lambda p: {"ok": True, "data": {"bikes": [{"name": "NMAX 155CC BLACK 4255"}]}}
+        bikes, ok = pricing.fleet_status(_get=g)
+        self.assertTrue(ok)
+        self.assertEqual([b["name"] for b in bikes], ["NMAX 155CC BLACK 4255"])
+
+    def test_really_empty_park_is_not_a_failure(self):
+        bikes, ok = pricing.fleet_status(_get=lambda p: {"ok": True, "data": {"bikes": []}})
+        self.assertTrue(ok)                      # ← мост ответил: парк ДЕЙСТВИТЕЛЬНО пуст
+        self.assertEqual(bikes, [])
+
+    def test_bridge_failure_is_not_empty_park(self):
+        def boom(p):
+            raise _http_err(404)
+        bikes, ok = pricing.fleet_status(_get=boom, _sleep=lambda s: None)
+        self.assertFalse(ok)                     # ← сбой отличим от пустого парка
+        self.assertEqual(bikes, [])
+
+    def test_non_ok_answer_is_failure(self):
+        _, ok = pricing.fleet_status(_get=lambda p: {"ok": False})
+        self.assertFalse(ok)
+
+    def test_retry_recovers_single_flap(self):
+        calls = []
+
+        def flaky(p):
+            calls.append(1)
+            if len(calls) == 1:
+                raise _http_err(404)             # ровно отказ 28.07
+            return {"ok": True, "data": {"bikes": [{"name": "ADV 350CC BLACK 5849"}]}}
+
+        bikes, ok = pricing.fleet_status(_get=flaky, _sleep=lambda s: None)
+        self.assertTrue(ok)                      # ← одного повтора хватило
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(bikes), 1)
+
+    def test_permanent_error_not_retried(self):
+        calls = []
+
+        def denied(p):
+            calls.append(1)
+            raise _http_err(403)
+
+        _, ok = pricing.fleet_status(_get=denied, _sleep=lambda s: None)
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 1)          # 403 постоянный — второй заход бессмыслен
+
+    def test_stale_cache_returned_but_marked_not_ok(self):
+        pricing._FLEET_CACHE["data"] = [{"name": "CB 300CC R 9011"}]
+        pricing._FLEET_CACHE["ts"] = 0           # кэш стух (TTL истёк)
+
+        def boom(p):
+            raise _http_err(500)
+
+        bikes, ok = pricing.fleet_status(_get=boom, _now=lambda: 10 ** 9, _sleep=lambda s: None)
+        self.assertEqual(len(bikes), 1)          # данные отдаём…
+        self.assertFalse(ok)                     # …но честно помечаем: не свежие
+
+    def test_fleet_wrapper_still_returns_list(self):
+        self.assertEqual(pricing.fleet(_get=lambda p: {"ok": False}), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

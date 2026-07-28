@@ -462,16 +462,15 @@ def _bike_key(name):
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
-def _park_bike_names(getter=None):
-    """Имена байков реального парка. Приоритет — живой Bridge pricing.fleet() (отражает Лист1),
-    фолбэк — локальный park_list.md (снимок Байки.xlsx Лист1). → list[str] (или [] если нет источника)."""
-    try:
-        bikes = pricing.fleet(_get=getter)
-        names = [b.get("name") for b in (bikes or []) if isinstance(b, dict) and b.get("name")]
-        if names:
-            return names
-    except Exception as e:
-        log.info(f"park: fleet упал ({type(e).__name__}) — пробую park_list.md")
+# Откуда взялись имена парка. Разводит случаи, которые раньше сливались в пустой список:
+#   live/snapshot — данные есть; empty — мост ответил, парк ПУСТ; none — СБОЙ (попытка была,
+#   данных нет ниоткуда); unconfigured — моста в контуре нет вовсе (dev/тесты), это не сбой.
+PARK_LIVE, PARK_SNAPSHOT, PARK_EMPTY, PARK_NONE, PARK_UNCONFIGURED = (
+    "live", "snapshot", "empty", "none", "unconfigured")
+
+
+def _read_park_snapshot():
+    """Имена из локального снимка park_list.md (Байки.xlsx Лист1). → list[str] ([] если нет)."""
     try:
         names = []
         with open(PARK_LIST_FILE, encoding="utf-8") as f:
@@ -485,18 +484,54 @@ def _park_bike_names(getter=None):
         return names
     except Exception as e:
         log.info(f"park: park_list.md не прочитан ({type(e).__name__})")
-    return []
+        return []
+
+
+def _park_bike_names_status(getter=None):
+    """Имена байков парка + ОТКУДА они взяты. → (list[str], источник из PARK_*).
+    Приоритет: живой Bridge (pricing.fleet_status) → снимок park_list.md → ничего."""
+    attempted = getter is not None or bool(pricing.BRIDGE_URL and pricing.BRIDGE_TOKEN)
+    live_ok = False
+    try:
+        bikes, live_ok = pricing.fleet_status(_get=getter)
+        names = [b.get("name") for b in (bikes or []) if isinstance(b, dict) and b.get("name")]
+        if names and live_ok:
+            return names, PARK_LIVE
+    except Exception as e:
+        log.info(f"park: fleet упал ({type(e).__name__}) — пробую park_list.md")
+    snap = _read_park_snapshot()
+    if snap:
+        # Раньше подмена живого парка снимком проходила МОЛЧА — в логе не было ни строки.
+        log.warning(f"park: имена взяты из СНИМКА park_list.md ({len(snap)} шт.) — "
+                    f"живой парк {'пуст' if live_ok else 'НЕ получен'}")
+        return snap, PARK_SNAPSHOT
+    if live_ok:
+        return [], PARK_EMPTY          # мост ответил: парк действительно пуст — это НЕ сбой
+    return [], (PARK_NONE if attempted else PARK_UNCONFIGURED)
+
+
+def _park_bike_names(getter=None):
+    """Имена байков парка (см. _park_bike_names_status). СОВМЕСТИМОСТЬ: только список."""
+    return _park_bike_names_status(getter=getter)[0]
+
+
+def park_allowlist_status(getter=None):
+    """Модели парка для показа клиенту + источник. → (list[str] | None, источник).
+    None = НЕ ограничивать (fail-safe). Источник PARK_NONE = данных парка нет: вызывающий
+    обязан НЕ собирать черновик, а сказать менеджеру."""
+    names, source = _park_bike_names_status(getter=getter)
+    if not names:
+        return None, source
+    keys = [_bike_key(n) for n in names]
+    allow = [disp for disp, key in KNOWN_MODELS if any(key in k for k in keys)]
+    return (allow or None), source   # ни одного совпадения → fail-safe, не ограничиваем на мусоре
 
 
 def park_allowlist(getter=None):
     """Модели РЕАЛЬНОГО парка (Лист1) для показа клиенту. → list[str] отображаемых имён ИЛИ None.
-    None = источник недоступен/пуст → НЕ ограничивать (FAIL-SAFE: бот отвечает как раньше, не онемел)."""
-    names = _park_bike_names(getter=getter)
-    if not names:
-        return None
-    keys = [_bike_key(n) for n in names]
-    allow = [disp for disp, key in KNOWN_MODELS if any(key in k for k in keys)]
-    return allow or None   # пусто (ни одного совпадения) → тоже fail-safe, не ограничиваем на мусоре
+    None = источник недоступен/пуст → НЕ ограничивать (FAIL-SAFE: бот отвечает как раньше, не онемел).
+    СОВМЕСТИМОСТЬ: теряет признак сбоя — новый код зовёт park_allowlist_status()."""
+    return park_allowlist_status(getter=getter)[0]
 
 
 # --- ДЕТЕРМИНИРОВАННЫЙ РЕЗОЛВ МОДЕЛИ (Лист1/_bike_key + алиасы для ВСЕХ моделей) ---------------
@@ -5996,11 +6031,20 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
     # had to be ignored» от Telegram). Поток снимает заморозку; сам билд ускорен пулом в price_sheet.
     price_note = await asyncio.to_thread(
         build_pricing_note, extract_booking_hints(transcript), lang=lang)
-    try:                                   # allowlist парка (Лист1); недоступен → None (fail-safe)
-        allow = park_allowlist()
+    try:                                   # allowlist парка (Лист1) + ОТКУДА он взят
+        allow, park_src = park_allowlist_status()
     except Exception as e:
-        allow = None
-        log.info(f"SUGGEST: park_allowlist упал ({type(e).__name__}) — без ограничения моделей")
+        allow, park_src = None, PARK_NONE
+        log.info(f"SUGGEST: park_allowlist упал ({type(e).__name__}) — парк считаю НЕполученным")
+    if park_src == PARK_NONE:
+        # Класс 28.07 09:24: мост отдал 404, парк не получен НИ ОТКУДА, а черновик всё равно
+        # собирался — LLM без ограничения моделей мог предложить то, чего в парке нет. Нет данных →
+        # нет черновика: клиенту молчим, менеджеру говорим. «Парк реально пуст» (PARK_EMPTY) и
+        # «моста в контуре нет» (PARK_UNCONFIGURED) сюда НЕ попадают — это не сбой.
+        log.warning(f"SUGGEST: парк НЕ получен для {client_ref} — черновик не собираю")
+        await post_mod_note(client, f"⚠️ Черновик НЕ собран для {client_ref}: данные парка "
+                                    f"недоступны (ни Bridge, ни снимок park_list.md) — проверьте мост")
+        return None
     try:                                   # книга правил; недоступна → '' (fail-safe)
         pb = load_playbook()
     except Exception:

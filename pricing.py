@@ -16,9 +16,11 @@ import os
 import re
 import json
 import time
+import socket
 import logging
 import urllib.request
 import urllib.parse
+import urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -106,32 +108,85 @@ def quote(bike, date_start, date_end, _get=None):
     return q
 
 
+# --------------------- ПОВТОР при разовом сбое транспорта ---------------------
+# Мост — веб-приложение Apps Script: /exec отвечает 302 на googleusercontent, и цель
+# редиректа ИНОГДА отдаёт 404. Это флакость транспорта, а не «адреса нет»: 28.07 запрос
+# парка упал с 404, а живые пробы тем же адресом с этого же ПК дали HTTP 200
+# (docs/artifacts/2026-07-28-journal-write-fixes.md §1). Поэтому 404 здесь ВРЕМЕННЫЙ и
+# повторяется — ровно один раз, чтобы разовый отказ не доезжал до клиента.
+_RETRY_HTTP = (404, 429, 500, 502, 503, 504)
+RETRY_TRIES = int(os.getenv("BRIDGE_RETRY_TRIES", "2") or "2")
+RETRY_PAUSE_SEC = float(os.getenv("BRIDGE_RETRY_PAUSE", "1") or "1")
+
+
+def transient(e):
+    """Временный ли сбой (стоит повторить). HTTPError проверяем ПЕРВЫМ: он наследник URLError."""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in _RETRY_HTTP
+    return isinstance(e, (urllib.error.URLError, TimeoutError, socket.timeout, OSError))
+
+
+def get_retry(getter, params, tries=None, _sleep=None):
+    """getter(params) с повтором при временном сбое. → (данные, None) | (None, исключение).
+    Постоянные ошибки (401/403 и прочее) НЕ повторяем — второй заход даст тот же ответ."""
+    n = RETRY_TRIES if tries is None else tries
+    sleeper = _sleep if _sleep is not None else time.sleep
+    last = None
+    for i in range(max(1, n)):
+        try:
+            return getter(params), None
+        except Exception as e:
+            last = e
+            if i + 1 >= n or not transient(e):
+                break
+            log.info(f"повтор после временного сбоя ({type(e).__name__}) — попытка {i + 2}/{n}")
+            try:
+                sleeper(RETRY_PAUSE_SEC)
+            except Exception:
+                pass
+    return None, last
+
+
 # ------------------------------- парк (fleet) --------------------------------
 
-def fleet(_get=None, _now=None):
-    """Список байков парка (read-only GET action=fleet), кэш на FLEET_TTL секунд.
-    Возвращает list[dict] (или [] при недоступности). _get/_now — инъекция для тестов."""
+def fleet_status(_get=None, _now=None, _sleep=None):
+    """Парк + ЧЕСТНЫЙ признак, получены ли данные. → (list[dict], ok: bool).
+
+    ok=True  — источник ответил и ответ распознан. ПУСТОЙ список при ok=True означает
+               «парк реально пуст», а не «мост лёг».
+    ok=False — данные НЕ получены (нет конфига / сеть / ответ не-ok). Список при этом
+               может быть непустым (отдаём стухший кэш), но считать его свежим нельзя.
+
+    Разводит ровно те два случая, которые были неразличимы: fleet() отдавала [] и когда
+    парк пуст, и когда мост упал, — вызывающий код видел одно и то же."""
     now = _now() if _now else time.time()
     c = _FLEET_CACHE
     if c["data"] is not None and (now - c["ts"]) < FLEET_TTL:
-        return c["data"]
+        return c["data"], True
     if not (BRIDGE_URL and BRIDGE_TOKEN) and _get is None:
-        return c["data"] or []
+        return (c["data"] or []), False
     getter = _get or _default_get
-    try:
-        data = getter({"action": "fleet", "token": BRIDGE_TOKEN})
-    except Exception as e:
-        log.info(f"fleet упал ({type(e).__name__}) — отдаю кэш/пусто")
-        return c["data"] or []
+    data, err = get_retry(getter, {"action": "fleet", "token": BRIDGE_TOKEN}, _sleep=_sleep)
+    if err is not None:
+        log.info(f"fleet упал ({type(err).__name__}) — данные НЕ получены, отдаю кэш/пусто")
+        return (c["data"] or []), False
     bikes = None
     if isinstance(data, dict) and data.get("ok"):
         src = data.get("data") if isinstance(data.get("data"), dict) else data
         if isinstance(src, dict) and isinstance(src.get("bikes"), list):
             bikes = src["bikes"]
     if bikes is None:
-        return c["data"] or []
+        log.info("fleet: ответ не-ok/без списка — данные НЕ получены, отдаю кэш/пусто")
+        return (c["data"] or []), False
     c["ts"] = now
     c["data"] = bikes
+    return bikes, True
+
+
+def fleet(_get=None, _now=None):
+    """Список байков парка. СОВМЕСТИМОСТЬ: отдаёт только список, поэтому сбой моста здесь
+    неотличим от пустого парка. Новый код обязан звать fleet_status()."""
+    bikes, _ok = fleet_status(_get=_get, _now=_now)
     return bikes
 
 
