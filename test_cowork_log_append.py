@@ -287,5 +287,42 @@ class TestShrinkGuard(unittest.TestCase):
         self.assertEqual(cla.spool_read(), ["DONE прошлая отложенная", self.LINE])
 
 
+class TestStdinEncoding(unittest.TestCase):
+    """29.07.2026: кириллица из пайпа ложилась в мозг мохибейком.
+
+    Живой случай: `printf '…тип ТС…' | python cowork_log_append.py` на Windows дал в доке
+    «С‚РёРї РўРЎ» — sys.stdin декодировал UTF-8-байты кодировкой консоли (cp1251). Пять строк
+    подряд, среди них два ARTIFACT и два DONE. Ни один гард этого не видит: длина растёт, текст
+    непустой, обратное чтение совпадает с тем, что записали. Ловится только глазами.
+    """
+
+    class _Stream:
+        def __init__(self, raw):
+            self.buffer = io.BytesIO(raw)
+
+    def test_utf8_pipe_is_not_mangled(self):
+        text = "DONE тип ТС: убраны ложные вердикты «авто» — переход 45→1"
+        got = cla.read_stdin_text(self._Stream(text.encode("utf-8")))
+        self.assertEqual(got, text)
+        # ровно тот мохибейк, который лёг в живой журнал
+        self.assertNotIn("С‚РёРї", got)
+        self.assertNotIn("Р ", got)
+
+    def test_cp1251_pipe_still_readable(self):
+        """Родная консоль Windows шлёт cp1251 — её тоже понимаем, а не портим."""
+        text = "DONE строка из консоли"
+        self.assertEqual(cla.read_stdin_text(self._Stream(text.encode("cp1251"))), text)
+
+    def test_broken_bytes_do_not_empty_the_line(self):
+        """Битые байты не должны превратиться в пустую строку: пустая = отказ записи."""
+        got = cla.read_stdin_text(self._Stream(b"DONE \xff\xfe\x00 hvost"))
+        self.assertTrue(got.strip())
+        self.assertIn("DONE", got)
+
+    def test_text_stream_without_buffer_works(self):
+        """Подменённый в тестах StringIO (без .buffer) читаем как есть."""
+        self.assertEqual(cla.read_stdin_text(io.StringIO("DONE уже текст")), "DONE уже текст")
+
+
 if __name__ == "__main__":
     unittest.main()

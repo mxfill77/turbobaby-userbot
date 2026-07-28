@@ -154,8 +154,28 @@ def compose(new_line, pending, old):
     return "  \n".join([new_line] + list(reversed(pending))) + "  \n" + old
 
 
+def read_stdin_text(stream=None):
+    """stdin как UTF-8 ЯВНО. Живой дефект 29.07.2026: на Windows sys.stdin декодирует ТЕКСТ
+    кодировкой консоли (здесь cp1251), а пайп шлёт UTF-8 — и кириллица легла в мозг мохибейком
+    («С‚РёРї РўРЎ» вместо «тип ТС»), пять строк подряд, включая два ARTIFACT и два DONE. Мохибейк
+    не ломает ни один гард: длина растёт, текст непустой, обратное чтение совпадает с записанным —
+    поэтому ловится он только глазами владельца. Читаем байты сами: UTF-8, иначе cp1251 (так шлёт
+    родная консоль Windows), иначе UTF-8 с заменой — но пустую строку из-за кодировки не отдаём."""
+    stream = stream if stream is not None else sys.stdin
+    buf = getattr(stream, "buffer", None)
+    if buf is None:                      # подменённый в тесте StringIO — там уже текст
+        return stream.read()
+    raw = buf.read()
+    for enc in ("utf-8", "cp1251"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def main():
-    msg = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else sys.stdin.read().strip()
+    msg = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else read_stdin_text().strip()
     if not msg:
         sys.stderr.write("ОШИБКА: пустая строка-итог\n"); sys.exit(1)
     # ОДНА запись = ОДНА строка: result задачи бывает многострочным, а перенос внутри записи
