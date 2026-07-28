@@ -1,6 +1,16 @@
 # -*- coding: utf-8 -*-
 # cowork_log_append.py — прямая запись строки-итога в мозг (cowork_log) через Bridge.
 # Запуск: python cowork_log_append.py "DONE Dispatch <время>: что сделал"
+#
+# ГАРД УСЫХАНИЯ (класс 17.07.2026, образец — VPS cclog.py:200-203). Запись идёт циклом
+# read_doc → склейка → write_doc, то есть документ ПЕРЕЗАПИСЫВАЕТСЯ целиком. Значит любая
+# кривизна чтения превращается в потерю журнала: мост отвечает {"ok":true,"text":""} и когда
+# док действительно пуст, и когда чтение сорвалось. Прежний гард ловил только None, а ""
+# проходил насквозь — и 758 575 символов уехали бы в одну строку. Отсюда два правила:
+#   1) пустой текст от моста = ОТКАЗ ЧТЕНИЯ, а не пустой документ;
+#   2) новый текст короче старого = аномалия сборки, запись отменяется.
+# Оба отказа падают в общий except main(), поэтому строка НЕ теряется, а уходит в спул ровно
+# как при таймауте: защита не смеет превращаться в потерю записи.
 import os, sys, json, time, socket, datetime, urllib.request, urllib.parse, urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -15,6 +25,15 @@ SPOOL_PATH = os.path.join(HERE, "cowork_log.spool")   # имя по образц
 _RETRY_HTTP = (404, 429, 500, 502, 503, 504)
 RETRY_TRIES = int(os.getenv("BRIDGE_RETRY_TRIES", "2") or "2")
 RETRY_PAUSE_SEC = float(os.getenv("BRIDGE_RETRY_PAUSE", "1") or "1")
+
+
+class ShrinkGuard(RuntimeError):
+    """Отказ гарда усыхания: писать НЕ будем, чтобы не укоротить журнал.
+
+    Отдельный тип — ради честного заголовка в stderr: это не сбой моста, а наш сознательный
+    отказ. Наследуется от RuntimeError, чтобы общий except в main() отработал как обычно и
+    положил строку в спул."""
+
 
 def load_env(path):
     vals = {}
@@ -99,6 +118,13 @@ def spool_clear(path=None):
         pass
 
 
+def compose(new_line, pending, old):
+    """Текст дока после дозаписи: новейшая строка сверху, отложенные следом (от новых к старым),
+    ниже — прежний текст целиком. Вынесено отдельной функцией, чтобы гард монотонности можно было
+    проверить тестом, подменив сборку на «усыхающую»: по построению склейка только ДОБАВЛЯЕТ."""
+    return "  \n".join([new_line] + list(reversed(pending))) + "  \n" + old
+
+
 def main():
     msg = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else sys.stdin.read().strip()
     if not msg:
@@ -121,7 +147,18 @@ def main():
         if old is None:
             raise RuntimeError("read_doc ok, но текст не найден — НЕ пишу, чтобы не затереть. Ответ: " + json.dumps(r, ensure_ascii=False)[:300])
         # Новейшая строка сверху; отложенные — следом, от новых к старым (порядок журнала цел).
-        new_text = "  \n".join([new_line] + list(reversed(pending))) + "  \n" + old
+        new_text = compose(new_line, pending, old)
+        # ГАРД 1 (класс 17.07): пустой текст — ОТКАЗ ЧТЕНИЯ, а не пустой журнал. Тот же ответ
+        # {"ok":true,"text":""} мост отдаёт и при сорванном чтении; писать поверх = затереть док.
+        if not old.strip():
+            raise ShrinkGuard("read_doc вернул ПУСТОЙ текст — считаю это отказом чтения, а не "
+                              "пустым журналом (в доке %d символов, записали бы %d)"
+                              % (len(old), len(new_text)))
+        # ГАРД 2: монотонность длины (образец cclog.py:200-203). Склейка выше только ДОБАВЛЯЕТ,
+        # поэтому срабатывание — аномалия сборки: лучше не записать, чем укоротить журнал.
+        if len(new_text) < len(old):
+            raise ShrinkGuard("новый текст КОРОЧЕ старого (было %d символов, стало бы %d) — "
+                              "запись отменена" % (len(old), len(new_text)))
         w = with_retry(lambda: post(url, {"action": "write_doc", "token": token,
                                           "name": DOC_NAME, "text": new_text}))
         if not (isinstance(w, dict) and w.get("ok")):
@@ -131,7 +168,8 @@ def main():
         print("OK: записано в мозг, символов:", w.get("chars", "?"), extra)
     except Exception as e:
         spool_add(new_line)
-        sys.stderr.write("ОШИБКА Bridge: " + str(e) + "\nОТЛОЖЕНО (строка НЕ потеряна, уйдёт "
+        head = "ГАРД УСЫХАНИЯ (запись отменена)" if isinstance(e, ShrinkGuard) else "ОШИБКА Bridge"
+        sys.stderr.write(head + ": " + str(e) + "\nОТЛОЖЕНО (строка НЕ потеряна, уйдёт "
                          "следующим успешным вызовом): " + new_line + "\nСпул: " + SPOOL_PATH + "\n")
         sys.exit(1)
 

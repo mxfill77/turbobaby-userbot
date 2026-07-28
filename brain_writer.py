@@ -27,8 +27,13 @@ FAIL-SAFE ВСЕЙ ЗАПИСИ (как у kb_master_append_2307, теперь �
   • идемпотентность: дописываемый текст уже в доке → no-op, повтор ничего не задваивает;
   • бэкап: старый текст целиком ложится в tmp/brain_backup_<тег>_<штамп>.txt ДО записи
     (откат = запись этим текстом);
+  • ГАРД УСЫХАНИЯ (класс 17.07.2026, образец VPS cclog.py:200-203): пустой текст от моста —
+    это ОТКАЗ ЧТЕНИЯ, а не пустой док (тот же {"ok":true,"text":""} приходит и при сорванном
+    чтении), а новый текст короче старого не пишется вовсе; осознанное сокращение объявляется
+    явно — apply(…, allow_shrink=True);
   • ОБРАТНОЕ ЧТЕНИЕ: после записи док читается заново, текст сверяется ДОСЛОВНО, маркер
-    считается (ровно 1), возвращается фрагмент вокруг вставки — FACT, не «наверное»;
+    считается (ровно 1), СВЕРЯЕТСЯ ДЛИНА (наличие строки не отличает «легло целиком» от
+    «легло вместо дока»), возвращается фрагмент вокруг вставки — FACT, не «наверное»;
   • гард тестового контекста: под гейтом/юнитами (log_setup.is_test_context) живой док не
     трогаем, если транспорт не инжектирован мок-тестом — урок инцидента KB_trainer_log 23.07
     (гейт залил 30 фикстурных строк в живой док).
@@ -47,11 +52,15 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 BACKUP_DIR = os.path.join(BASE_DIR, "tmp")
 HTTP_TIMEOUT = 30
+# Запас на сверке длины обратного чтения: Docs при clear()+setText() нормализуют хвостовой
+# перевод строки, поэтому строгое равенство давало бы ложный отказ на ±1 символ. Усечение
+# (ради которого сверка и заведена) на порядки крупнее этого запаса.
+_READBACK_SLACK = 2
 
 
 class BrainWriterError(RuntimeError):
     """Отказ канала с честной причиной; .code — код выхода CLI (1 конфиг/аргументы,
-    2 чтение, 3 якорь, 4 запись, 5 верификация обратным чтением)."""
+    2 чтение, 3 якорь, 4 запись, 5 верификация обратным чтением, 6 гард усыхания)."""
     def __init__(self, msg, code=1):
         super().__init__(msg)
         self.code = code
@@ -137,6 +146,13 @@ def _read(url, token, addr, ref, get):
     text = _doc_text(r)
     if text is None:
         raise BrainWriterError("read_doc(%s) ok, но текста нет — НЕ пишу, чтобы не затереть" % ref, 2)
+    # Пустой текст = ОТКАЗ ЧТЕНИЯ, а не пустой док: тот же ответ {"ok":true,"text":""} мост отдаёт
+    # и при сорванном чтении, а канал доки не создаёт — только перезаписывает существующие.
+    # Проверка стоит ЗДЕСЬ, поэтому закрывает и первое чтение, и обратное.
+    if not text.strip():
+        raise BrainWriterError("read_doc(%s) вернул ПУСТОЙ текст (%d символов) — считаю это ОТКАЗОМ "
+                               "ЧТЕНИЯ, а не пустым доком: писать поверх значит затереть"
+                               % (ref, len(text)), 2)
     return text
 
 
@@ -163,12 +179,15 @@ def _backup(old, tag, backup_dir=None):
 
 
 def apply(mutate, doc_id="", name="", expect=None, marker=None,
-          backup_tag="", backup_dir=None, env=None, get=None, post=None):
+          backup_tag="", backup_dir=None, env=None, get=None, post=None, allow_shrink=False):
     """Движок записи: read → mutate(старый текст) → бэкап → write → ОБРАТНОЕ ЧТЕНИЕ.
 
     mutate: str → str | None (None = no-op, ничего не пишем); ValueError из mutate = «якорь
     не прошёл» — док НЕ тронут. expect — строка, обязанная лечь в док ДОСЛОВНО (сверка по
     живому доку после записи); marker — строка-маркер, обязанная встретиться РОВНО 1 раз.
+    allow_shrink — снять ГАРД УСЫХАНИЯ (по умолчанию новый текст короче старого = отказ, код 6).
+    Объявляется ЯВНО одноразовыми скриптами, которые режут док осознанно; молчаливое
+    укорачивание журнала запрещено — это и есть класс 17.07.
     → dict: status ok|noop, doc, backup, back (текст обратного чтения), before_chars,
     after_chars, fragment.
     Любой отказ — BrainWriterError с честной причиной (см. коды в классе)."""
@@ -187,6 +206,11 @@ def apply(mutate, doc_id="", name="", expect=None, marker=None,
     if new is None or new == old:
         return {"status": "noop", "doc": ref, "backup": None, "back": old,
                 "before_chars": len(old), "after_chars": len(old), "fragment": ""}
+    # ГАРД УСЫХАНИЯ (класс 17.07, образец cclog.py:200-203): молча укоротить док нельзя.
+    if not allow_shrink and len(new) < len(old):
+        raise BrainWriterError("ГАРД УСЫХАНИЯ (%s): новый текст короче старого (было %d символов, "
+                               "стало бы %d) — НЕ пишу; осознанное сокращение объявляется "
+                               "allow_shrink=True" % (ref, len(old), len(new)), 6)
     backup = _backup(old, backup_tag or (name or doc_id), backup_dir)
     try:
         w = (post or _post)(url, dict(addr, action="write_doc", token=token, text=new))
@@ -198,6 +222,16 @@ def apply(mutate, doc_id="", name="", expect=None, marker=None,
                                % (ref, json.dumps(w, ensure_ascii=False)[:300], backup), 4)
     # ОБРАТНОЕ ЧТЕНИЕ — верификация по живому доку, не по локальной склейке
     back = _read(url, token, addr, ref, get)
+    # СВЕРКА ДЛИНЫ. Проверка «expect есть в тексте» НЕ отличает «легло целиком» от «легло ВМЕСТО
+    # дока»: усечённый док тоже содержит новую строку. Сравниваем с длиной ДО записи и с длиной
+    # отправленного (последнее — с запасом _READBACK_SLACK на нормализацию хвоста в Docs).
+    if not allow_shrink and len(back) < len(old):
+        raise BrainWriterError("ОБРАТНОЕ ЧТЕНИЕ (%s): док УКОРОТИЛСЯ — было %d символов, стало %d "
+                               "(бэкап: %s)" % (ref, len(old), len(back), backup), 5)
+    if len(back) < len(new) - _READBACK_SLACK:
+        raise BrainWriterError("ОБРАТНОЕ ЧТЕНИЕ (%s): отправляли %d символов, в доке %d — запись "
+                               "легла НЕ ЦЕЛИКОМ (бэкап: %s)"
+                               % (ref, len(new), len(back), backup), 5)
     if expect is not None and expect not in back:
         raise BrainWriterError("ОБРАТНОЕ ЧТЕНИЕ (%s): текст в доке НЕ найден дословно — "
                                "разберись перед повтором (бэкап: %s)" % (ref, backup), 5)

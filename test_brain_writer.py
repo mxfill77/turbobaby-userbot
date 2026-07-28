@@ -178,7 +178,66 @@ class TestFailSafe(Base):
         self.assertIn("тестовый контекст", str(cm.exception))
 
 
+class TestShrinkGuard(Base):
+    """Класс 17.07: пустое чтение и укорачивание дока блокируются, обратное чтение сверяет ДЛИНУ."""
+
+    def test_empty_read_is_failure_not_empty_doc(self):
+        self.bridge.docs["FID1"] = ""
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            self._append("строка", name="cowork_log")
+        self.assertEqual(cm.exception.code, 2)            # именно ОТКАЗ ЧТЕНИЯ
+        self.assertIn("ПУСТОЙ текст", str(cm.exception))
+        self.assertEqual(self.bridge.writes, [])          # док не тронут
+
+    def test_whitespace_only_read_is_failure(self):
+        self.bridge.docs["FID1"] = "   \n\n"
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            self._append("строка", name="cowork_log")
+        self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(self.bridge.writes, [])
+
+    def test_shrinking_mutate_blocked_with_both_lengths(self):
+        old = self.bridge.docs["FID1"]
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            bw.apply(lambda o: "коротко", name="cowork_log", env=ENV,
+                     get=self.bridge.get, post=self.bridge.post, backup_dir=self._tmp.name)
+        self.assertEqual(cm.exception.code, 6)
+        self.assertIn("было %d символов" % len(old), str(cm.exception))
+        self.assertIn("стало бы 7", str(cm.exception))
+        self.assertEqual(self.bridge.writes, [])
+        self.assertEqual(os.listdir(self._tmp.name), [])  # до бэкапа дело не дошло
+
+    def test_declared_shrink_allowed(self):
+        """Осознанное сокращение возможно — но только объявленное ЯВНО."""
+        res = bw.apply(lambda o: o[:10], name="cowork_log", env=ENV, allow_shrink=True,
+                       get=self.bridge.get, post=self.bridge.post, backup_dir=self._tmp.name)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(self.bridge.docs["FID1"], "старая стр")
+
+    def test_readback_length_catches_truncation_that_line_check_misses(self):
+        """Мост ответил ok, строка в доке ЕСТЬ — но док усечён. Ловит только сверка длины."""
+        self.bridge.lie_on_write = "строка\nобрывок"
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            self._append("строка", name="cowork_log")
+        self.assertIn("строка", self.bridge.docs["FID1"])   # проверка «наличие строки» прошла бы
+        self.assertEqual(cm.exception.code, 5)
+        self.assertIn("УКОРОТИЛСЯ", str(cm.exception))
+
+    def test_normal_append_grows(self):
+        old = self.bridge.docs["FID1"]
+        res = self._append("NOTE рост", name="cowork_log")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["before_chars"], len(old))
+        self.assertGreater(res["after_chars"], res["before_chars"])
+
+
 class TestReadText(Base):
+    def test_read_empty_is_failure(self):
+        self.bridge.docs["FID1"] = ""
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            bw.read_text(doc_id="FID1", env=ENV, get=self.bridge.get)
+        self.assertEqual(cm.exception.code, 2)
+
     def test_read_by_name_and_id(self):
         self.assertEqual(bw.read_text(name="index", env=ENV, get=self.bridge.get), MINI_DOC)
         self.assertEqual(bw.read_text(doc_id="FID1", env=ENV, get=self.bridge.get),
