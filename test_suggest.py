@@ -5480,9 +5480,12 @@ class TestTeamRegistryBlock(unittest.TestCase):
         self.assertFalse(suggest.is_internal_user_id(None))
 
     def test_registry_loader_failsafe(self):
-        # нет файла / битый JSON → пустой реестр (не падаем)
+        # нет файла / битый JSON → пустой реестр (не падаем); пусты ОБА блока — и команда, и
+        # неклиентские окна (реестр один файл, загрузчик один).
         empty = suggest._load_team_registry(os.path.join(self._tmp.name, "нет-такого.json"))
-        self.assertEqual(empty, {"usernames": set(), "user_ids": set(), "group_ids": set()})
+        self.assertEqual(empty, {"usernames": set(), "user_ids": set(), "group_ids": set(),
+                                 "nonclient_usernames": set(), "nonclient_user_ids": set(),
+                                 "nonclient_titles": set()})
 
     # ---- СЛОЙ 2: intake от внутреннего id НЕ постится во «Входящие брони» ----
     def test_intake_second_layer_skips_internal(self):
@@ -5514,6 +5517,235 @@ class TestTeamRegistryBlock(unittest.TestCase):
         asyncio.run(suggest.poll_and_post_intake(FakeClient(), poster=poster))
         self.assertIn(uniq, [t for _, t in posts])                    # обычный клиент — постим
         self.assertEqual(moderation_ipc.get_intake(iid)["status"], "posted")
+
+
+class _NoFetchClient(FakeClient):
+    """Клиент, который ВЗРЫВАЕТСЯ на выборке диалога. Доказательство «черновик не создаётся
+    ВОВСЕ»: ранний выход обязан случиться ДО _fetch_messages — иначе тест падает здесь."""
+
+    def iter_messages(self, entity, limit=50):
+        raise AssertionError("_fetch_messages вызван — раннего выхода НЕ было")
+
+
+class TestNonClientWindowBlock(unittest.TestCase):
+    """НЕКЛИЕНТСКИЕ ОКНА, которые НЕ наша команда (партнёры/контрагенты) → черновик НЕ РОЖДАЕТСЯ
+    ВОВСЕ. Родитель — аудит корпуса 29.07 (docs/artifacts/2026-07-29-draft-audit.md, класс 5):
+    58 карточек из 178 (33%) собраны на окна, где собеседник не клиент; 9 из них — партнёрские
+    (@phuket_travel_admin id 45349667, @PHUKET_NICK id 7562315636), и is_internal_sender их не
+    ловит: они не в команде. ГОЛДЕНЫ: опознание ПО ID при любом username (главный ключ), запасные
+    пути по username и по имени окна («Партнёрка STM», id не снят), три окна разведки → ноль
+    вызовов LLM и ноль выборок диалога; клиент из той же очереди → конвейер БЕЗ ИЗМЕНЕНИЙ."""
+
+    # Живые идентичности партнёрских окон (боевые draft-строки IPC + client_chats.jsonl).
+    SLAVA_ID, SLAVA_UNAME = 45349667, "phuket_travel_admin"
+    NICK_ID, NICK_UNAME = 7562315636, "PHUKET_NICK"
+    STM_TITLE = "Партнёрка STM"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        d = self._tmp.name
+        self._reg = suggest.TEAM_REGISTRY
+        self._mode = suggest.SUGGEST_MODE
+        self._test = suggest.SUGGEST_TEST_MODE
+        self._mg = suggest.MOD_GROUP_ID
+        self._pending = suggest.pending
+        self._pairs = suggest.PAIRS_FILE
+        self._note_fn = suggest.build_pricing_note
+        self._park_fn = suggest.park_allowlist_status
+        suggest.SUGGEST_MODE = True
+        suggest.SUGGEST_TEST_MODE = False
+        suggest.reset_disabled()
+        suggest.MOD_GROUP_ID = -1009999999999
+        suggest.pending = suggest.PendingStore(os.path.join(d, "pending.jsonl"))
+        suggest.PAIRS_FILE = os.path.join(d, "pairs.jsonl")
+        suggest.limiter = suggest.RateLimiter(6, 15)
+        # Клиентский путь не должен ходить в сеть (Bridge/прайс) — инъекция как в соседних классах.
+        suggest.build_pricing_note = lambda hints, lang="ru": "ЦЕНА: уточняется"
+        suggest.park_allowlist_status = lambda getter=None: (["NMAX 155"], suggest.PARK_SNAPSHOT)
+        # БОЕВОЙ реестр (как его читает рантайм): проверяем не выдуманный список, а живой файл.
+        suggest.TEAM_REGISTRY = suggest._load_team_registry()
+        self.me = 42
+
+    def tearDown(self):
+        suggest.TEAM_REGISTRY = self._reg
+        suggest.SUGGEST_MODE = self._mode
+        suggest.SUGGEST_TEST_MODE = self._test
+        suggest.MOD_GROUP_ID = self._mg
+        suggest.pending = self._pending
+        suggest.PAIRS_FILE = self._pairs
+        suggest.build_pricing_note = self._note_fn
+        suggest.park_allowlist_status = self._park_fn
+        suggest.reset_disabled()
+        self._tmp.cleanup()
+
+    def _run(self, sender, text, client=None):
+        """Прогнать on_client_message; вернуть (res, client, llm_calls). По умолчанию клиент
+        ВЗРЫВАЕТСЯ на выборке диалога — для неклиентских окон это и есть проверка «до фетча»."""
+        calls = []
+
+        def counting_llm(_s, _u):
+            calls.append(1)
+            return "DRAFT ответа клиенту"
+
+        client = client if client is not None else _NoFetchClient()
+        res = asyncio.run(suggest.on_client_message(
+            client, sender, self.me, call_llm=counting_llm, faq="FAQ"))
+        return res, client, calls
+
+    def _client_run(self, sender, text):
+        """Тот же прогон, но с НОРМАЛЬНЫМ клиентом (история есть) — для клиентского негатива."""
+        return self._run(sender, text, client=FakeClient(history=[
+            FakeHistMsg(sender.id, text),
+            FakeHistMsg(self.me, "Здравствуйте! Что хотите арендовать?"),
+        ]))
+
+    # ---- ГОЛДЕН: опознание ПО ЧИСЛОВОМУ id (главный ключ) ----
+    def test_partner_by_id_zero_pipeline(self):
+        res, client, calls = self._run(
+            FakeSender(self.SLAVA_ID, username=self.SLAVA_UNAME, first="Slava агент мото"),
+            "Привет, есть запрос по авто — что можешь предложить?")
+        self.assertIsNone(res)
+        self.assertEqual(client.sent, [])        # ни в модерацию, ни партнёру — ничего
+        self.assertEqual(calls, [])              # LLM НЕ вызывался: черновика не было вовсе
+        self.assertIsNone(suggest.pending.get(1))
+
+    def test_partner_id_beats_changed_username(self):
+        # Класс инцидента 22.07 (Earth сменил username): username протух → ловит id.
+        res, client, calls = self._run(
+            FakeSender(self.NICK_ID, username="totally_new_handle_2026"),
+            "Привет, какая минимальная цена на 300 кубов? Есть клиент")
+        self.assertIsNone(res)
+        self.assertEqual(client.sent, [])
+        self.assertEqual(calls, [])
+        self.assertIn("опознан по id",
+                      suggest.non_client_window_ref(FakeSender(self.NICK_ID, username="x")))
+
+    # ---- ЗАПАСНОЙ путь: username, когда id окна другой/не снят ----
+    def test_partner_by_username_fallback(self):
+        res, client, calls = self._run(
+            FakeSender(999777333, username=self.NICK_UNAME),   # id НЕ из реестра
+            "Привет, есть запрос")
+        self.assertIsNone(res)
+        self.assertEqual(client.sent, [])
+        self.assertEqual(calls, [])
+        self.assertIn("опознан по username",
+                      suggest.non_client_window_ref(FakeSender(999777333, username="PHUKET_NICK")))
+
+    # ---- ЗАПАСНОЙ путь: имя окна (у «Партнёрка STM» числового id нет) ----
+    def test_partner_group_by_window_name(self):
+        res, client, calls = self._run(FakeDialog(self.STM_TITLE, -1005550001), "какие цены?")
+        self.assertIsNone(res)
+        self.assertEqual(client.sent, [])
+        self.assertEqual(calls, [])
+        # ё в имени и регистр не мешают (нормализация lower+ё→е)
+        self.assertIsNotNone(suggest.non_client_window_ref(FakeDialog("ПАРТНЕРКА STM", -1)))
+        self.assertIsNotNone(suggest.non_client_window_ref(
+            FakeSender(1, username=None, first="Партнёрка STM (авто)")))
+
+    # ---- ГОЛДЕН разведки 28–29.07: ТРИ партнёрских окна → ни одного черновика ----
+    def test_three_recon_windows_produce_no_draft(self):
+        windows = [
+            FakeSender(self.SLAVA_ID, username=self.SLAVA_UNAME, first="Slava агент мото"),
+            FakeSender(self.NICK_ID, username=self.NICK_UNAME, first="PHUKETNICK"),
+            FakeDialog(self.STM_TITLE, -1005550001),
+        ]
+        for w in windows:
+            with self.subTest(window=getattr(w, "username", None) or getattr(w, "title", None)):
+                res, client, calls = self._run(w, "Привет, есть запрос")
+                self.assertIsNone(res)
+                self.assertEqual(client.sent, [])
+                self.assertEqual(calls, [])
+
+    def test_live_registry_file_has_partner_ids(self):
+        # РЕГРЕСС ДАННЫХ: боевой team_registry.json держит оба живых id + запасное имя окна.
+        reg = suggest._load_team_registry()
+        self.assertIn(self.SLAVA_ID, reg["nonclient_user_ids"], "@phuket_travel_admin выпал")
+        self.assertIn(self.NICK_ID, reg["nonclient_user_ids"], "@PHUKET_NICK выпал")
+        self.assertIn(self.SLAVA_UNAME, reg["nonclient_usernames"])
+        self.assertIn(self.NICK_UNAME.lower(), reg["nonclient_usernames"])
+        self.assertIn("партнерка stm", reg["nonclient_titles"])   # нормализовано: lower+ё→е
+
+    # ---- НЕГАТИВ: обычный клиент — конвейер работает БЕЗ ИЗМЕНЕНИЙ ----
+    def test_ordinary_client_pipeline_unchanged(self):
+        res, client, calls = self._client_run(FakeSender(999, username="client1"),
+                                              "Привет, сколько стоит NMAX на неделю?")
+        self.assertIsNotNone(res)
+        self.assertTrue(calls)                                       # LLM вызван
+        cards = [t for t in client.sent if t[0] == suggest.MOD_GROUP_ID]
+        self.assertEqual(len(cards), 1)
+        self.assertIn("DRAFT ответа клиенту", cards[0][1])           # тело черновика — как отдал LLM
+        self.assertEqual([c for c in client.sent if c[0] == 999], [])  # клиенту — ничего
+
+    def test_client_with_partner_like_text_not_blocked(self):
+        # ТЕКСТ похож на партнёрский («есть запрос»), но ИДЕНТИЧНОСТЬ клиентская → черновик есть.
+        # Признак — только реестр: по словам окна не исключаем (иначе выпадут живые клиенты).
+        res, _c, calls = self._client_run(FakeSender(529849022, username="cryptopeppa"),
+                                          "Привет, есть запрос — xmax с 5 по 10 августа")
+        self.assertIsNotNone(res)
+        self.assertTrue(calls)
+
+    # ---- РЕГРЕСС STAFF-фильтра (слой 1) на БОЕВОМ реестре ----
+    def test_staff_filter_regress_on_live_registry(self):
+        for uid, uname in ((8562625260, "extthiwxer"), (659135499, "Pleummmm")):
+            with self.subTest(uid=uid):
+                res, client, calls = self._run(FakeSender(uid, username=uname), "привет")
+                self.assertIsNone(res)
+                self.assertEqual(client.sent, [])
+                self.assertEqual(calls, [])
+
+    # ---- реестр дополняется БЕЗ правки кода ----
+    def test_registry_extended_without_code_change(self):
+        path = os.path.join(self._tmp.name, "reg.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"usernames": [], "user_ids": [], "group_ids": [],
+                       "nonclient_user_ids": [777000111],
+                       "nonclient_usernames": ["new_partner_2026"],
+                       "nonclient_titles": ["Партнёрка Сомчая"]}, f, ensure_ascii=False)
+        try:
+            suggest.reload_team_registry(path)                    # горячая замена, кода не трогали
+            res, _c, calls = self._run(FakeSender(777000111, username="whatever"), "привет")
+            self.assertIsNone(res)
+            self.assertEqual(calls, [])
+            res2, _c2, calls2 = self._run(FakeSender(1, username="New_Partner_2026"), "привет")
+            self.assertIsNone(res2)
+            self.assertEqual(calls2, [])
+            res3, _c3, calls3 = self._run(FakeDialog("Партнерка Сомчая", -100777), "привет")
+            self.assertIsNone(res3)
+            self.assertEqual(calls3, [])
+            # прежние партнёры в этом реестре НЕ значатся → клиентский путь для них открыт
+            self.assertIsNone(suggest.non_client_window_ref(
+                FakeSender(self.SLAVA_ID, username=self.SLAVA_UNAME)))
+        finally:
+            suggest.TEAM_REGISTRY = suggest._load_team_registry()
+
+    # ---- helper: формы и fail-safe ----
+    def test_ref_helper_shapes_and_failsafe(self):
+        self.assertIsNone(suggest.non_client_window_ref(None))
+        self.assertIsNone(suggest.non_client_window_ref(FakeSender(999, username="client1")))
+        # реестр БЕЗ ключей nonclient_* (ручной dict соседних тестов) → None, а не KeyError
+        saved = suggest.TEAM_REGISTRY
+        suggest.TEAM_REGISTRY = {"usernames": {"pleummmm"}, "user_ids": {770099},
+                                 "group_ids": set()}
+        try:
+            self.assertIsNone(suggest.non_client_window_ref(
+                FakeSender(self.SLAVA_ID, username=self.SLAVA_UNAME)))
+            res, _c, calls = self._client_run(FakeSender(999, username="client1"), "привет")
+            self.assertIsNotNone(res)          # клиентский путь на старом реестре жив
+            self.assertTrue(calls)
+        finally:
+            suggest.TEAM_REGISTRY = saved
+
+    def test_loader_reads_nonclient_block(self):
+        path = os.path.join(self._tmp.name, "reg2.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"nonclient_user_ids": ["45349667", 7562315636, "мусор"],
+                       "nonclient_usernames": ["@Phuket_Travel_Admin", " ", "phuket_nick"],
+                       "nonclient_titles": ["Партнёрка STM"]}, f, ensure_ascii=False)
+        reg = suggest._load_team_registry(path)
+        self.assertEqual(reg["nonclient_user_ids"], {45349667, 7562315636})   # мусор отброшен
+        self.assertEqual(reg["nonclient_usernames"], {"phuket_travel_admin", "phuket_nick"})
+        self.assertEqual(reg["nonclient_titles"], {"партнерка stm"})
+        self.assertEqual(reg["usernames"], set())          # блок команды пуст — блоки независимы
 
 
 class TestRunLiveSmoke(unittest.TestCase):

@@ -100,10 +100,16 @@ INTAKE_APPROVERS = _csv_set("INTAKE_APPROVERS")
 TEAM_REGISTRY_FILE = os.path.join(BASE_DIR, "team_registry.json")
 
 
+def _norm_window_name(s) -> str:
+    """Имя окна к сравнимому виду: lower + ё→е (как в is_partner_chat). Не строка → ''."""
+    return str(s or "").strip().lower().replace("ё", "е")
+
+
 def _load_team_registry(path=None):
     """Прочитать реестр команды из JSON. FAIL-SAFE: нет файла/битый/не-словарь → пустой реестр
-    (usernames/user_ids/group_ids). usernames — lower без @; ids — int (в т.ч. отрицательные
-    id групп). Ключи-мусор игнорируем молча (fail-safe: генерация от реестра не ломается)."""
+    (usernames/user_ids/group_ids + nonclient_*). usernames — lower без @; ids — int (в т.ч.
+    отрицательные id групп); nonclient_titles — имена окон, нормализованные lower+ё→е.
+    Ключи-мусор игнорируем молча (fail-safe: генерация от реестра не ломается)."""
     path = path or TEAM_REGISTRY_FILE
     try:
         with open(path, encoding="utf-8") as f:
@@ -121,11 +127,18 @@ def _load_team_registry(path=None):
                 out.add(int(s))
         return out
 
-    usernames = {str(u).strip().lstrip("@").lower()
-                 for u in (data.get("usernames") or []) if str(u).strip()}
-    return {"usernames": usernames,
+    def _unames(seq):
+        return {str(u).strip().lstrip("@").lower() for u in (seq or []) if str(u).strip()}
+
+    def _titles(seq):
+        return {_norm_window_name(t) for t in (seq or []) if str(t).strip()}
+
+    return {"usernames": _unames(data.get("usernames")),
             "user_ids": _ids(data.get("user_ids")),
-            "group_ids": _ids(data.get("group_ids"))}
+            "group_ids": _ids(data.get("group_ids")),
+            "nonclient_usernames": _unames(data.get("nonclient_usernames")),
+            "nonclient_user_ids": _ids(data.get("nonclient_user_ids")),
+            "nonclient_titles": _titles(data.get("nonclient_titles"))}
 
 
 TEAM_REGISTRY = _load_team_registry()
@@ -173,6 +186,42 @@ def is_internal_chat(chat_id) -> bool:
         return int(chat_id) in TEAM_REGISTRY["group_ids"]
     except (TypeError, ValueError):
         return False
+
+
+# --- НЕКЛИЕНТСКИЕ ОКНА, которые НЕ наша команда (партнёры/контрагенты) -------------------------
+# Родитель — аудит корпуса 29.07 (docs/artifacts/2026-07-29-draft-audit.md, класс 5): 58 карточек
+# из 178 (33%) собраны на окна, где собеседник вообще не клиент. Команду держит is_internal_sender
+# (слой 1), но ПАРТНЁР (другой прокат, агент по авто) в реестре команды не значится — и бот отвечал
+# ему клиентским прайсом и брал на нас его доставку (живые id=317/342/360, разбор в
+# docs/artifacts/2026-07-29-partner-handoff-recon.md). Опознание — ПО ЧИСЛОВОМУ id (главный ключ:
+# инцидент 22.07 показал, что username протухает), username/имя окна — ЗАПАСНОЙ путь для окон, чей
+# id ещё не снят (группа «Партнёрка STM»). Список — в team_registry.json, дополняется БЕЗ правки кода.
+def non_client_window_ref(entity):
+    """Окно из НЕклиентского реестра? → метка «кто это и по чему опознан» (непустая строка, для
+    лога), иначе None. Порядок: id → username (точно) → имя окна (подстрокой, lower+ё→е).
+    entity=None / реестр без ключей nonclient_* (ручной dict в тестах) → None — fail-safe:
+    клиентский путь не трогаем. Чистая функция (без сети/LLM)."""
+    if entity is None:
+        return None
+    uname = (getattr(entity, "username", None) or "").lstrip("@").lower()
+    uid = getattr(entity, "id", None)
+    ref = f"@{uname}" if uname else f"id{uid}"
+    try:
+        if uid is not None and uid in (TEAM_REGISTRY.get("nonclient_user_ids") or set()):
+            return f"{ref} (id {uid}, опознан по id)"
+    except TypeError:                       # нехешируемый id — не блокируем (fail-safe)
+        pass
+    if uname and uname in (TEAM_REGISTRY.get("nonclient_usernames") or set()):
+        return f"{ref} (опознан по username)"
+    titles = TEAM_REGISTRY.get("nonclient_titles") or set()
+    if titles:
+        for attr in ("title", "name", "first_name", "last_name"):
+            v = getattr(entity, attr, None)
+            if isinstance(v, str) and v:
+                s = _norm_window_name(v)
+                if any(t and t in s for t in titles):
+                    return f"«{v}» (опознан по имени окна)"
+    return None
 
 # Токен бота-модератора (задача-2). Пусто → бот не поднимается, работает деградация
 # (reply-режим userbot). Токен НИКОГДА не логируем и не коммитим.
@@ -6346,6 +6395,14 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
         ref = (f"@{sender.username}" if getattr(sender, "username", None)
                else f"id{getattr(sender, 'id', None)}")
         log.info(f"SUGGEST: внутренний аккаунт команды {ref} — окно вне клиентского конвейера "
+                 f"(без черновика/приветствия/intake).")
+        return None
+    # СЛОЙ 2 (аудит корпуса 29.07, класс 5): окно НЕ клиентское, но и не наша команда — партнёр/
+    # контрагент из nonclient_*-реестра. Выход ЗДЕСЬ, ДО _fetch_messages/прайса/generate_draft:
+    # черновик не «собирается и прячется», а НЕ СОЗДАЁТСЯ ВОВСЕ — ни одного вызова модели.
+    non_client = non_client_window_ref(sender)
+    if non_client:
+        log.info(f"SUGGEST: неклиентское окно {non_client} — вне клиентского конвейера "
                  f"(без черновика/приветствия/intake).")
         return None
     client_id = sender.id
