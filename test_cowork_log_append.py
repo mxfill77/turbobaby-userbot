@@ -10,6 +10,7 @@ googleusercontent, цель редиректа иногда 404), писател
 
 import io
 import os
+import re
 import sys
 import contextlib
 import tempfile
@@ -123,6 +124,69 @@ class TestSpool(unittest.TestCase):
                          ["DONE самая новая", "DONE поновее", "DONE старая"])
 
 
+class TestStampContract(unittest.TestCase):
+    """КОНТРАКТ строки журнала: «<ТИП> <ГГГГ-ММ-ДД ЧЧ:ММ UTC>: <текст>» — на ВСЕХ трёх путях записи.
+
+    До 28.07 дату получали только строки БЕЗ типа: `msg.startswith(("DONE","NOTE","ASK"))` отдавал
+    строку как есть. Живой замер: серверный сплиттер видел 80 записей из 1747 — резать журнал было
+    не по чему. Три пути: оркестратор (pc_orchestrator._cowork), хук SessionEnd
+    (dispatch_notify._cowork), ручная строка (CLI/stdin).
+    """
+
+    STAMP = "2026-07-28 21:05 UTC"
+    RE_CONTRACT = re.compile(r"^(DONE|NOTE|ASK|PLAN|BLOCKED|WAITING|SKIPPED) "
+                             r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC: \S")
+
+    def _contract(self, line):
+        self.assertRegex(line, self.RE_CONTRACT, "не по контракту: %r" % line)
+
+    def test_path_1_orchestrator(self):
+        """pc_orchestrator._cowork шлёт «NOTE Orchestrator: …» — раньше уходило БЕЗ даты вообще."""
+        line = cla.stamp_line("NOTE Orchestrator: авто-фетч: рабочая копия грязная", self.STAMP)
+        self._contract(line)
+        self.assertEqual(line, "NOTE 2026-07-28 21:05 UTC: Orchestrator: авто-фетч: рабочая копия грязная")
+
+    def test_path_2_hook_done(self):
+        """Хук SessionEnd шлёт готовую строку сессии — тип есть, даты в формате контракта нет."""
+        line = cla.stamp_line("DONE Dispatch 28.07 18:35: класс 17.07 закрыт", self.STAMP)
+        self._contract(line)
+        self.assertTrue(line.startswith("DONE 2026-07-28 21:05 UTC: Dispatch 28.07 18:35:"), line)
+
+    def test_path_2_hook_ask(self):
+        """ASK — тот же контракт: развилка обязана быть видна сплиттеру наравне с DONE."""
+        line = cla.stamp_line("ASK Dispatch: нужен выбор владельца", self.STAMP)
+        self._contract(line)
+        # съедается ТОЛЬКО тип: «Dispatch:» — уже тело записи, автора не теряем
+        self.assertEqual(line, "ASK 2026-07-28 21:05 UTC: Dispatch: нужен выбор владельца")
+
+    def test_path_3_manual_plain_text(self):
+        """Ручная строка без типа — итог сессии, тип DONE (прежнее поведение сохранено)."""
+        line = cla.stamp_line("проверил состояние userbot-репо", self.STAMP)
+        self._contract(line)
+        self.assertEqual(line, "DONE 2026-07-28 21:05 UTC: проверил состояние userbot-репо")
+
+    def test_every_type_gets_the_stamp(self):
+        for t in cla.LOG_TYPES:
+            self._contract(cla.stamp_line(t + " тело записи", self.STAMP))
+
+    def test_idempotent_on_already_stamped(self):
+        """Спул дошлёт ту же строку вторым вызовом — второй штамп ставить нельзя."""
+        once = cla.stamp_line("NOTE Orchestrator: строка", self.STAMP)
+        twice = cla.stamp_line(once, "2099-01-01 00:00 UTC")
+        self.assertEqual(twice, once)
+
+    def test_type_matched_by_word_boundary(self):
+        """«DONEC …» — не тип: без границы слова любая строка на DONE… ломала бы контракт."""
+        line = cla.stamp_line("DONEC срочная заметка", self.STAMP)
+        self.assertTrue(line.startswith("DONE 2026-07-28 21:05 UTC: DONEC"), line)
+
+    def test_stamp_format_matches_writer(self):
+        """Формат штампа — один и тот же у контракта и у main() (STAMP_FMT)."""
+        import datetime
+        s = datetime.datetime(2026, 7, 28, 21, 5, tzinfo=datetime.timezone.utc).strftime(cla.STAMP_FMT)
+        self.assertEqual(s, self.STAMP)
+
+
 class TestShrinkGuard(unittest.TestCase):
     """Класс 17.07: писатель НЕ смеет затереть журнал — и НЕ смеет потерять строку.
 
@@ -201,6 +265,19 @@ class TestShrinkGuard(unittest.TestCase):
         self.assertTrue(sent.startswith(self.LINE))         # новейшее сверху
         self.assertTrue(sent.endswith("A" * 5000))          # прежний текст цел
         self.assertEqual(cla.spool_read(), [])              # спул вычищен
+
+    def test_multiline_message_becomes_one_record(self):
+        """ОДНА запись = ОДНА строка: многострочный result не смеет рвать разбор по заголовкам."""
+        self._bridge_returns("A" * 5000)
+        sys.argv = ["cowork_log_append.py",
+                    "NOTE Orchestrator: задача #7 → done\nвторая строка\nтретья"]
+        exc, _ = self._run_main()
+        self.assertIsNone(exc)
+        head = self.writes[0]["text"].split("  \n")[0]
+        self.assertNotIn("\n", head)                       # переносы схлопнуты
+        self.assertIn("вторая строка", head)               # текст не потерян
+        self.assertIn("третья", head)
+        self.assertTrue(head.startswith("NOTE 2"), head)   # и запись по контракту
 
     def test_pending_lines_survive_guard_trip(self):
         """Гард не смеет съесть и ОТЛОЖЕННЫЕ: они остаются в спуле вместе с новой."""

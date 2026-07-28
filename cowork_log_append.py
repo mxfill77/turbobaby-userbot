@@ -11,7 +11,7 @@
 #   2) новый текст короче старого = аномалия сборки, запись отменяется.
 # Оба отказа падают в общий except main(), поэтому строка НЕ теряется, а уходит в спул ровно
 # как при таймауте: защита не смеет превращаться в потерю записи.
-import os, sys, json, time, socket, datetime, urllib.request, urllib.parse, urllib.error
+import os, re, sys, json, time, socket, datetime, urllib.request, urllib.parse, urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(HERE, ".env")
@@ -118,6 +118,35 @@ def spool_clear(path=None):
         pass
 
 
+# ─────────────────── КОНТРАКТ СТРОКИ ЖУРНАЛА (28.07.2026) ───────────────────
+# «<ТИП> <ГГГГ-ММ-ДД ЧЧ:ММ UTC>: <текст>» — ОДНА запись = ОДНА строка.
+#
+# Зачем: серверная ротация делит журнал по ЗАГОЛОВКАМ записей (regex «тип + дата»), а дату до сих
+# пор получали только строки БЕЗ типа — `msg.startswith(("DONE","NOTE","ASK"))` возвращал строку
+# как есть. Живой замер 28.07: сплиттер видел 80 записей из 1747 (4.6%), резать журнал было не по
+# чему. Теперь дату получает КАЖДАЯ строка; уже проштампованная (например, дошланная из спула)
+# второй штамп не получает — функция идемпотентна.
+LOG_TYPES = ("DONE", "NOTE", "ASK", "PLAN", "BLOCKED", "WAITING", "SKIPPED")
+STAMP_FMT = "%Y-%m-%d %H:%M UTC"
+_TYPE_ALT = "|".join(LOG_TYPES)
+_RE_STAMPED = re.compile(r"^(?:%s)\s+\d{4}-\d{2}-\d{2}\b" % _TYPE_ALT)   # тип И дата уже есть
+_RE_TYPED = re.compile(r"^(%s)\b[\s:]*" % _TYPE_ALT)                     # тип есть, даты нет
+
+
+def stamp_line(msg, stamp):
+    """Привести строку к контракту. Три случая, ровно по трём путям записи:
+      • уже «<ТИП> <дата>…» (спул, повторная досылка)        → отдаём как есть (идемпотентность);
+      • «NOTE Orchestrator: …» / «ASK Dispatch …» (тип есть) → дату вставляем СРАЗУ ПОСЛЕ типа;
+      • голый текст (ручная строка)                          → это итог сессии, тип DONE.
+    Переносы схлопываются вызывающим (main): многострочная запись рвёт разбор по заголовкам."""
+    if _RE_STAMPED.match(msg):
+        return msg
+    m = _RE_TYPED.match(msg)
+    if m:
+        return "%s %s: %s" % (m.group(1), stamp, msg[m.end():].lstrip())
+    return "DONE %s: %s" % (stamp, msg)
+
+
 def compose(new_line, pending, old):
     """Текст дока после дозаписи: новейшая строка сверху, отложенные следом (от новых к старым),
     ниже — прежний текст целиком. Вынесено отдельной функцией, чтобы гард монотонности можно было
@@ -129,10 +158,13 @@ def main():
     msg = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else sys.stdin.read().strip()
     if not msg:
         sys.stderr.write("ОШИБКА: пустая строка-итог\n"); sys.exit(1)
+    # ОДНА запись = ОДНА строка: result задачи бывает многострочным, а перенос внутри записи
+    # рвёт разбор журнала по заголовкам (и может подсунуть сплиттеру ложный заголовок).
+    msg = " ".join(msg.split())
     env = load_env(ENV_PATH)
     url = env.get("BRIDGE_URL"); token = env.get("BRIDGE_TOKEN")
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    new_line = msg if msg.startswith(("DONE", "NOTE", "ASK")) else "DONE " + stamp + ": " + msg
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime(STAMP_FMT)
+    new_line = stamp_line(msg, stamp)
     if not url or not token:
         spool_add(new_line)
         sys.stderr.write("ОШИБКА: нет BRIDGE_URL/BRIDGE_TOKEN в .env\nОТЛОЖЕНО в "

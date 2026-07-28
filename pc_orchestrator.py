@@ -268,9 +268,16 @@ bc = Bridge()
 # ------------------------------- утилиты -------------------------------------
 
 def _cowork(line):
-    """Строка-итог в cowork_log через скрипт (fire-and-forget)."""
+    """Строка-итог в cowork_log через скрипт (fire-and-forget).
+
+    КОНТРАКТ СТРОКИ ЖУРНАЛА (28.07.2026): «<ТИП> <ГГГГ-ММ-ДД ЧЧ:ММ UTC>: <текст>», ОДНА запись =
+    ОДНА строка. ТИП ставим здесь (наши строки всегда NOTE — знает только источник), ДАТУ ставит
+    единственная точка штампа cowork_log_append.stamp_line. Переносы схлопываем В ИСТОЧНИКЕ:
+    result задачи бывает многострочным (_clip режет длину, но НЕ переносы), а многострочная
+    запись рвёт разбор журнала по заголовкам — и может подсунуть сплиттеру ложный заголовок."""
     try:
-        subprocess.Popen([VENV_PY, os.path.join(REPO, "cowork_log_append.py"), "NOTE Orchestrator: " + line],
+        one = " ".join(str(line or "").split())
+        subprocess.Popen([VENV_PY, os.path.join(REPO, "cowork_log_append.py"), "NOTE Orchestrator: " + one],
                          cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                          creationflags=NO_WINDOW)
     except Exception as e:
