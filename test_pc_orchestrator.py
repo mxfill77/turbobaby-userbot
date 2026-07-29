@@ -88,6 +88,9 @@ class Base(unittest.TestCase):
         self._save_lw = o.LESSON_WAIT_STATE       # ждущие low-уроки: боевой state-файл в тестах не читаем
         o.LESSON_WAIT_STATE = os.path.join(tempfile.mkdtemp(), "lesson_waits.json")
         self.addCleanup(lambda: setattr(o, "LESSON_WAIT_STATE", self._save_lw))
+        self._save_af = o.AUTOFETCH_STATE_FILE    # признак состояния авто-фетча: свежий на КАЖДЫЙ тест
+        o.AUTOFETCH_STATE_FILE = os.path.join(tempfile.mkdtemp(), "autofetch.json")  # (prev=None → чистый лист)
+        self.addCleanup(lambda: setattr(o, "AUTOFETCH_STATE_FILE", self._save_af))
         # ЗАПРЕТ грязного дерева (класс 28.07): в тестах дерево по умолчанию ЧИСТОЕ — живой git не
         # дёргаем и не зависим от состояния рабочей копии. Сам запрет проверяет
         # TestDirtyTreeBlocksRestart, подменяя это же место своим списком.
@@ -2450,6 +2453,70 @@ class TestGitFfPull(Base):
             self.assertEqual(called["n"], 1)
         finally:
             o.git_ff_pull_tick = save
+
+    # ── строки состояния пишутся при СМЕНЕ состояния, а не каждый цикл ──
+    def test_dirty_journal_once_until_state_changes(self):
+        # ГЛАВНОЕ (родитель: спам «грязная» каждый цикл, 47 строк/сутки): при НЕИЗМЕННОМ составе
+        # грязного строка уходит в журнал РОВНО раз; сменился состав — новая строка; стало чисто —
+        # ОДНА строка «снова чистое», между ними тишина.
+        o._dirty_tracked = lambda runner=None: ["suggest.py"]
+        for _ in range(3):                          # три цикла подряд — грязно, состав тот же
+            self.assertEqual(o.git_ff_pull_tick(call_fn=self._call(status=" M suggest.py")), "грязно — пропуск")
+        dirty = [s for s in self.cows if "грязная" in s]
+        self.assertEqual(len(dirty), 1, "одинаковое грязное состояние — ровно одна строка")
+        self.assertIn("suggest.py", dirty[0], "строка обязана назвать файл поимённо")
+        # состав грязного сменился → новая строка
+        o._dirty_tracked = lambda runner=None: ["pricing.py", "suggest.py"]
+        self.assertEqual(o.git_ff_pull_tick(call_fn=self._call(status=" M suggest.py")), "грязно — пропуск")
+        self.assertEqual(len([s for s in self.cows if "грязная" in s]), 2, "сменился состав — вторая строка")
+        # дерево вычистили + актуально → ОДНА строка «снова чистое», дальше тишина
+        o._dirty_tracked = lambda runner=None: []
+        self.assertEqual(o.git_ff_pull_tick(call_fn=self._call(head="same", origin="same")), "")
+        self.assertEqual(o.git_ff_pull_tick(call_fn=self._call(head="same", origin="same")), "")
+        self.assertEqual(len([s for s in self.cows if "снова чист" in s]), 1,
+                         "возврат к чистому — ровно одна строка, дальше тишина")
+
+    def test_dirty_state_survives_daemon_restart(self):
+        # ПУНКТ 3: признак на ДИСКЕ → перезапуск демона в том же грязном состоянии строку НЕ родит.
+        # Эмулируем «уже сказали до рестарта», записав признак в state-файл руками (новый процесс его
+        # прочитает вместо памяти).
+        o._dirty_tracked = lambda runner=None: ["suggest.py"]
+        o._autofetch_state_write({"cond": "dirty:suggest.py"})   # состояние ДО рестарта
+        note = o.git_ff_pull_tick(call_fn=self._call(status=" M suggest.py"))
+        self.assertEqual(note, "грязно — пропуск")
+        self.assertEqual([s for s in self.cows if "грязная" in s], [],
+                         "то же грязное состояние после рестарта — журнал молчит")
+
+    def test_fetch_failure_journaled_once(self):
+        # периодика fetch-сбоя по тому же правилу: сеть лежит — строка одна, а не каждый цикл.
+        for _ in range(3):
+            self.assertEqual(o.git_ff_pull_tick(call_fn=self._call(fetch=(1, "", "could not resolve host"))),
+                             "fetch не удался")
+        self.assertEqual(len([s for s in self.cows if "fetch origin не удался" in s]), 1)
+
+    def test_non_ff_journaled_once(self):
+        # периодика не-ff по тому же правилу: расхождение висит — строка одна.
+        for _ in range(3):
+            self.assertEqual(o.git_ff_pull_tick(call_fn=self._call(head="fork_l", origin="fork_r",
+                                                                   is_ancestor=1, rev_ancestor=1)),
+                             "не-ff (расхождение) — пропуск")
+        self.assertEqual(len([s for s in self.cows if "не-ff" in s]), 1)
+
+    def test_first_clean_tick_is_silent(self):
+        # свежий демон на чистом актуальном дереве НЕ объявляет «снова чистое» на ровном месте.
+        self.assertEqual(o.git_ff_pull_tick(call_fn=self._call(head="same", origin="same")), "")
+        self.assertEqual(self.cows, [])
+
+    def test_recovery_line_after_dirty_then_ff(self):
+        # ff после грязи: одна строка «грязная», затем ОДНА строка про fast-forward; лишней «снова
+        # чистое» ff не плодит (свою строку он уже сказал).
+        o._dirty_tracked = lambda runner=None: ["suggest.py"]
+        self.assertEqual(o.git_ff_pull_tick(call_fn=self._call(status=" M suggest.py")), "грязно — пропуск")
+        o._dirty_tracked = lambda runner=None: []
+        self.assertEqual(o.git_ff_pull_tick(call_fn=self._call(head="loc", origin="rem", is_ancestor=0)),
+                         "ff → new1234ab")
+        self.assertEqual(len([s for s in self.cows if "fast-forward" in s]), 1)
+        self.assertEqual([s for s in self.cows if "снова чист" in s], [], "ff не плодит лишней recovery-строки")
 
 
 class TestCommandLevers(Base):

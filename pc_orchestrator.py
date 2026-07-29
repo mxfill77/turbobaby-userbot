@@ -3576,6 +3576,56 @@ GIT_PULL_SEC = int(os.getenv("PC_GIT_PULL_SEC", "300") or "300")     # авто-
 GIT_PULL_BRANCH = os.getenv("PC_GIT_PULL_BRANCH", "main")            # тянем ff ТОЛЬКО эту ветку
 _git_pull_last_run = 0.0                                             # троттлинг тела авто-фетча
 
+# ── строки состояния авто-фетча пишем при СМЕНЕ состояния, а НЕ каждый цикл ──
+# Живой замер (лог демона за сутки 28→29.07): 47 строк «рабочая копия грязная» = 7 заходов грязи
+# по 5-минутному циклу. Одинаковая строка каждые GIT_PULL_SEC — главный двигатель роста журнала и
+# лишняя нагрузка на мост (каждая строка = отдельный вызов cowork_log_append → запись в Brain).
+# Правило (как у _dirty_block / _DIRTY_WARNED, но ПЕРЕЖИВАЕТ рестарт демона — признак на ДИСКЕ):
+#   стало грязным — ОДНА строка с поимённым списком; сменился состав грязного — новая строка;
+#   стало чистым — ОДНА строка; между ними ТИШИНА. Перезапуск демона в том же состоянии строку
+#   НЕ родит (источник истины — файл, а не память процесса). Файл gitignored (pc_orchestrator.*.json)
+#   — сам он грязью для авто-фетча не станет. То же правило накрывает ВСЕ периодические ветки тика
+#   (грязно / fetch не удался / не-ff / pull не удался); ff — событие, пишется всегда.
+AUTOFETCH_STATE_FILE = os.path.join(REPO, "pc_orchestrator.autofetch.json")
+_AUTOFETCH_CLEAN_MSG = "авто-фетч: рабочее дерево снова чистое — пропуск снят, фетч/pull штатны"
+
+
+def _autofetch_state_read(path=None):
+    """Признак состояния авто-фетча → dict ({} при отсутствии/бое: «не знаю» = чистый лист)."""
+    try:
+        with open(path or AUTOFETCH_STATE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _autofetch_state_write(d, path=None):
+    try:
+        with open(path or AUTOFETCH_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+    except Exception as e:                            # noqa: BLE001 — дедуп не роняет тик
+        log.warning("state авто-фетча не записался (%s) — дедуп журнала деградирует, не критично", e)
+
+
+def _autofetch_note(cond, msg, *, quiet_from_fresh=False, path=None, cowork=None):
+    """Строку о состоянии авто-фетча в журнал ТОЛЬКО при СМЕНЕ состояния.
+    cond — сигнатура состояния ('ok' | 'dirty:<файлы>' | 'fetch_failed' | 'non_ff' | 'pull_failed').
+    msg  — что писать при ВХОДЕ в состояние ('' = состояние фиксируем молча, без строки: так делает
+           ff — свою строку он уже написал сам).
+    quiet_from_fresh — не писать msg, если ПРЕЖНЕГО состояния не было: первый чистый тик демона не
+           должен объявлять «снова чистое» на ровном месте.
+    Признак фиксируем ДО журнала (restart-proof, как _dirty_block). → True, если состояние сменилось."""
+    d = _autofetch_state_read(path)
+    prev = d.get("cond")
+    if prev == cond:
+        return False                                  # то же состояние — тишина
+    d["cond"] = cond
+    _autofetch_state_write(d, path)
+    if msg and not (quiet_from_fresh and prev is None):
+        (cowork or _cowork)(msg)
+    return True
+
 
 def git_ff_pull_tick(call_fn=None):
     """Тело авто-фетча (без троттлинга — троттлит maybe_git_ff_pull). git-вызовы инъектируются для тестов.
@@ -3600,15 +3650,23 @@ def git_ff_pull_tick(call_fn=None):
     tracked_dirty = [ln for ln in (r[1] or "").splitlines()
                      if ln.strip() and not ln.startswith("??")]
     if tracked_dirty:                           # есть незакоммиченные правки TRACKED-файлов
-        log.info("авто-фетч: рабочая копия грязная — git pull пропущен")
-        _cowork("авто-фетч: рабочая копия грязная — git pull пропущен (жду чистого дерева)")
+        # Поимённый список берём у _dirty_tracked (diff --name-only HEAD — чистые имена без колонок
+        # porcelain, чей ведущий пробел .strip() съедает у первой строки, см. класс 28.07). Строку
+        # шлём РОВНО при смене состава грязного: та же грязь = тишина, перезапуск демона тоже молчит.
+        files = sorted(_dirty_tracked(call) or [])
+        listed = ", ".join(files) if files else "(git не назвал файлы)"
+        if _autofetch_note("dirty:" + "|".join(files),
+                           f"авто-фетч: рабочая копия грязная — git pull пропущен, жду чистого дерева; "
+                           f"файлы ({len(files)}): {listed}"):
+            log.info("авто-фетч: рабочая копия грязная — git pull пропущен; файлы: %s", listed)
         return "грязно — пропуск"
     # 3. fetch origin (сеть; сбой не критичен — повторим на следующем интервале)
     r = call(["fetch", "origin"])
     if not r or r[0] != 0:
         detail = _tail(r[2], 160) if r else "git недоступен"
-        log.warning("авто-фетч: git fetch origin не удался — %s", detail)
-        _cowork(f"авто-фетч: git fetch origin не удался — {detail} (пропуск, повтор позже)")
+        if _autofetch_note("fetch_failed",
+                           f"авто-фетч: git fetch origin не удался — {detail} (пропуск, повтор позже)"):
+            log.warning("авто-фетч: git fetch origin не удался — %s", detail)
         return "fetch не удался"
     # 4. локальный HEAD vs origin/<branch>
     loc = call(["rev-parse", "HEAD"])
@@ -3616,6 +3674,7 @@ def git_ff_pull_tick(call_fn=None):
     if not loc or loc[0] != 0 or not rem or rem[0] != 0:
         return ""                              # нет отслеживаемой ветки/ref — тихо
     if loc[1] == rem[1]:
+        _autofetch_note("ok", _AUTOFETCH_CLEAN_MSG, quiet_from_fresh=True)  # снимет прежний «пропуск»
         return ""                              # уже актуально — нечего тянуть
     # 5. ff возможен ТОЛЬКО если локальный HEAD — предок origin/<branch> (код 0 = предок)
     anc = call(["merge-base", "--is-ancestor", "HEAD", f"origin/{branch}"])
@@ -3630,22 +3689,27 @@ def git_ff_pull_tick(call_fn=None):
         # В обоих случаях НИКОГДА не merge/rebase.
         fwd = call(["merge-base", "--is-ancestor", f"origin/{branch}", "HEAD"])
         if fwd and fwd[0] == 0:
-            log.info("авто-фетч: локальный %s впереди origin/%s — тянуть нечего (пропуск)", branch, branch)
+            # чистое дерево, просто впереди origin (штатно до push) → состояние ok, восстановление
+            # объявляем той же строкой «снова чистое», если раньше был пропуск; иначе тишина.
+            if _autofetch_note("ok", _AUTOFETCH_CLEAN_MSG, quiet_from_fresh=True):
+                log.info("авто-фетч: локальный %s впереди origin/%s — тянуть нечего (пропуск)", branch, branch)
             return "впереди origin — пропуск"
-        log.warning("авто-фетч: локальный %s разошёлся с origin/%s (не-ff) — git pull пропущен", branch, branch)
-        _cowork(f"авто-фетч: локальный {branch} разошёлся с origin (не-ff) — git pull пропущен, нужен разбор")
+        if _autofetch_note("non_ff",
+                           f"авто-фетч: локальный {branch} разошёлся с origin (не-ff) — git pull пропущен, нужен разбор"):
+            log.warning("авто-фетч: локальный %s разошёлся с origin/%s (не-ff) — git pull пропущен", branch, branch)
         return "не-ff (расхождение) — пропуск"
     # 6. чистое дерево + строго позади + ff возможен → тянем fast-forward-only
     r = call(["pull", "--ff-only", "origin", branch])
     if not r or r[0] != 0:
         detail = _tail(r[2], 160) if r else "git недоступен"
-        log.error("авто-фетч: git pull --ff-only не удался — %s", detail)
-        _cowork(f"авто-фетч: git pull --ff-only не удался — {detail}")
+        if _autofetch_note("pull_failed", f"авто-фетч: git pull --ff-only не удался — {detail}"):
+            log.error("авто-фетч: git pull --ff-only не удался — %s", detail)
         return "pull не удался"
     nh = call(["rev-parse", "--short", "HEAD"])
     short = nh[1] if nh and nh[0] == 0 else "?"
     log.info("авто-фетч: fast-forward %s → %s (origin/%s) — штатный путь применит self-update/детей", branch, short, branch)
     _cowork(f"авто-фетч: fast-forward {branch} → {short} (штатный путь тика применит self-update/детей)")
+    _autofetch_note("ok", "", quiet_from_fresh=True)   # состояние → ok молча: ff-строка уже сказала о движении
     return f"ff → {short}"
 
 
