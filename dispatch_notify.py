@@ -432,6 +432,14 @@ def _read_stdin_json():
     # BOM/пробелы срезаем ЯВНО: живой stdin хука приходит чистым, но любой перенаправляющий
     # слой (PowerShell-пайп) ставит ﻿ впереди — strip() его НЕ убирает, и полезная
     # нагрузка молча превращалась в {} (сводка вырождалась в «без текстового итога»).
+    # Кодировку задаём ЯВНО: по умолчанию Python берёт системную кодовую страницу (на этом ПК
+    # cp1251), и payload хука с кириллицей приезжал мохибейком либо ронял чтение. Живой след
+    # 29.07 10:47:31 — карточка не доставлена: Telegram вернул 400 «strings must be encoded in
+    # UTF-8», и DM, и фолбэк в тему. Тот же класс, что 093119e и правка stdin в pretool_guard.
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     try:
         raw = (sys.stdin.read() or "").lstrip("﻿ \t\r\n")
         return json.loads(raw) if raw.startswith("{") else {}
@@ -511,6 +519,10 @@ def main():
         elif args:
             text = " ".join(args).strip()
         elif not sys.stdin.isatty():
+            try:                      # см. _read_stdin_json: кодировку stdin задаём явно
+                sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
             text = (sys.stdin.read() or "").strip() or "🔔 Dispatch"
         else:
             text = "🔔 Dispatch"

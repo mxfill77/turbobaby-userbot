@@ -44,9 +44,23 @@ env наследуется вниз по дереву процессов, зна
 headless пишет красную карточку в файл-маркер демону (NEEDS_APPROVAL), интерактив
 показывает её в сессии.
 
+КАРТОЧКА (правка 2026-07-29). Владелец жал подтверждения не читая — значит они не защищали, а
+обесценивали редкую настоящую. Два изменения, оба по одному принципу «судим по ДЕЙСТВИЮ»:
+  • ШУМ СНЯТ там, где действие безобидно: `clasp` разведён ПО ПОДКОМАНДЕ (чтение — зелёное;
+    `push` зелёный, если прод ЗАКРЕПЛЁН на номере версии — реестр `clasp_prod_pins.json`, под
+    git и без правок; `deploy`/`undeploy`/`run` — красное); работа во ВРЕМЕННЫХ каталогах из
+    .gitignore (`tmp/`, `%TEMP%\\claude\\**`) удалением не краснеет; `scp`/`sftp` к СВОЕЙ машине
+    больше не считается выходом наружу (разбирали первый позиционный аргумент, а это локальный
+    источник); `2>&1` и `2>/dev/null` перестали считаться записью в файл.
+  • КАЧЕСТВО ОСТАВШИХСЯ: карточка читается за 3 секунды — ЧТО меняется, у какого ОБЪЕКТА, какое
+    ЧИСЛО и одна строка ОТКАТА, сырая команда последней и обрезанной. Нет ни объекта, ни числа →
+    карточки НЕТ, вместо неё строка в журнал (свод CLAUDE.md п.5): признак сработал на подстроке,
+    а не на действии. Hard-блок (`_HARD_CARD` — сбой разбора самого гарда) спрашивает всегда.
+
 ЛОГ (`pretool_guard.log`, под *.log в .gitignore): пишется КАЖДОЕ решение обеих ролей —
 смягчение не должно стоить прозрачности. Строка: время | роль | инструмент | решение | вид |
-команда (обрезана, значения токенов/паролей замаскированы).
+команда (обрезана, значения токенов/паролей замаскированы). Решение `journal` — это подавленная
+карточка без объекта: действие прошло молча, но след остался.
 """
 import sys
 import os
@@ -58,6 +72,14 @@ import datetime
 
 try:  # хук-протокол Claude Code читает stdout как UTF-8; форсим, чтобы 🔴/кириллица не бились
     sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+try:  # ВХОД тоже UTF-8: json.load(sys.stdin) брал системную кодовую страницу (на этом ПК cp1251),
+    # и любая команда с кириллицей приезжала мохибейком — «эхо ПРОБА» в логе и, что хуже, В САМОЙ
+    # КАРТОЧКЕ: владелец видел «Команда: РїРѕР»РѕСЃР°» вместо текста. Класс тот же, что 093119e
+    # (cowork_log читает stdin как UTF-8) — правило CLAUDE.md п.9: класс-фикс на ОБЕ полосы.
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 
@@ -132,6 +154,9 @@ def _human(kind, obj=""):
         "git_force": "Хочу перезаписать git-историю (push --force / reset --hard / clean)",
         "sqlite": ("Хочу записать в базу данных " + o) if o else "Хочу записать в базу данных (sqlite)",
         "clasp": "Хочу выполнить clasp (код Apps Script живых таблиц)",
+        "clasp_push": "Хочу залить код в Apps Script (clasp push), пин прода НЕ подтверждён",
+        "clasp_deploy": "Хочу ДВИНУТЬ ПРОД Apps Script (clasp deploy/undeploy — живые таблицы)",
+        "clasp_run": "Хочу ИСПОЛНИТЬ функцию Apps Script в живом контуре (clasp run)",
         "live_sheet": "Хочу обратиться к ЖИВЫМ таблицам напрямую (Лист1 / CRM / Календарь)",
         "network": ("Хочу выйти в сеть к " + o) if o else "Хочу выполнить сетевую команду (curl/wget/ssh)",
         "env": "Хочу обратиться к .env / секретам",
@@ -155,12 +180,18 @@ _RE_CLAUDE_CFG_CMD = re.compile(
 _RE_CFG_VIEW = re.compile(r"(?i)^\s*(cat|type|head|tail|more|less|grep|rg|findstr|select-string|"
                           r"get-content|get-item|get-childitem|test-path|ls|dir|git)\b")
 _RE_REDIRECT = re.compile(r">>?")
+# Перенаправление, которое ДЕЙСТВИТЕЛЬНО пишет файл. `2>&1` (стдерр в стдаут) и `2>/dev/null`
+# (в пустоту) файлов не создают — а прежний признак `>>?` считал их записью. Живой счёт за сутки:
+# 4 карточки «хочу изменить конфиг Claude» из 4 — все на `ls -la …/.claude/ 2>&1` и
+# `grep … .claude/settings.json 2>/dev/null`, то есть на ЧИСТОМ ЧТЕНИИ. Тот же класс, что и всё
+# в 8401d33: судим по ДЕЙСТВИЮ, а не по подстроке.
+_REDIR_TO_FILE = r">>?\s*(?!&|/dev/null\b|\$null\b|nul(?:[\s;|&]|$))"
 
 
 # НАМЕРЕНИЕ ЗАПИСИ в конфиг: перенаправление, пишущие командлеты/утилиты, python-запись.
 # Именно оно и есть красное; всё остальное — просто смотрение.
 _RE_CFG_WRITE = re.compile(
-    r"(?i)>>?|\bset-content\b|\badd-content\b|\bout-file\b|\bnew-item\b|\bcopy-item\b|"
+    r"(?i)" + _REDIR_TO_FILE + r"|\bset-content\b|\badd-content\b|\bout-file\b|\bnew-item\b|\bcopy-item\b|"
     r"\bmove-item\b|\bremove-item\b|\btee\b|(^|[\s;&|(])(cp|mv|sed\s+-i|truncate)([\s;&|)]|$)|"
     r"open\s*\([^)]*['\"][wax]|\.write\s*\(|json\.dump\s*\(|\.writelines\s*\(")
 # ЧТЕНИЕ конфига: смотрелка ГДЕ УГОДНО в команде (не обязательно первым словом) либо
@@ -219,26 +250,55 @@ def _own_ssh_hosts():
     return hosts
 
 
-def _ssh_target(toks, idx):
-    """Хост из аргументов ssh/scp/sftp: первый токен, который не флаг и не значение флага."""
-    i, skip = idx + 1, {"-i", "-o", "-p", "-l", "-F", "-b", "-c", "-e", "-m", "-w", "-J", "-L", "-R", "-D"}
+# Удалённая цель scp/sftp: `[логин@]хост:путь`. Имя хоста — минимум два символа, иначе под
+# признак попала бы буква диска Windows (`C:\tmp\x`). Локальный путь (`"$SP/runner.sh"`,
+# `/d/turbobaby-bot/x`) двоеточия в этой позиции не имеет и целью не считается.
+_RE_SCP_REMOTE = re.compile(r"^(?:[^@/\\:]+@)?([A-Za-z0-9_.\-]{2,}):")
+_SSH_FLAG_WITH_VALUE = {"-i", "-o", "-p", "-P", "-l", "-F", "-b", "-c", "-e", "-m", "-w",
+                        "-J", "-L", "-R", "-D", "-S", "-Q"}
+
+
+def _ssh_targets(toks, idx):
+    """Хосты из аргументов ssh/scp/sftp. → список (может быть пустым).
+
+    Для `ssh` цель — первый позиционный аргумент. Для `scp`/`sftp` это НЕВЕРНО: первым
+    позиционным идёт ЛОКАЛЬНЫЙ ИСТОЧНИК, а хост живёт в аргументе вида `root@хост:/путь`.
+    Прежний разбор брал первый позиционный всегда — и на рабочей команде
+    `scp -i ~/.ssh/ключ "$SP/файл.py" root@<свой VPS>:/tmp/файл.py` считал «хостом» строку
+    `$sp/файл.py`, не находил её в своих → «выход наружу» → карточка. Живой счёт за сутки:
+    15 карточек «хочу выйти в сеть» из 15 — все на СВОЁМ канале, который доктрина гарда
+    (и явное правило settings.json) считает рабочим и молчаливым."""
+    name = _base(toks[idx]) if idx < len(toks) else ""
+    positional, i = [], idx + 1
     while i < len(toks):
         t = toks[i]
-        if t in skip:
+        if t in _SSH_FLAG_WITH_VALUE:
             i += 2
             continue
-        if t.startswith("-"):
+        if t.startswith("-") and t != "-":
             i += 1
             continue
-        host = t.split("@")[-1].split(":")[0].strip("'\"")
-        return host.lower()
-    return ""
+        positional.append(t.strip("'\""))
+        i += 1
+    if name == "ssh":
+        return [positional[0].split("@")[-1].split(":")[0].lower()] if positional else []
+    hosts = []
+    for t in positional:
+        m = _RE_SCP_REMOTE.match(t)
+        if m:
+            hosts.append(m.group(1).lower())
+        elif "@" in t and not re.match(r"^[A-Za-z]:[\\/]", t):
+            # форма с логином, но разобрать не вышло → считаем ЧУЖИМ (fail-safe: молчать нельзя)
+            hosts.append((t.split("@")[-1].split(":")[0] or t).lower())
+    return hosts       # пусто = удалённой цели нет (локальное копирование, `ssh -V`) → не сеть
 
 
-def _net_cmd_kind(cmd):
-    """→ None (сетевой команды нет) | 'own' (ssh/scp/sftp к своей машине) | 'open' (выход наружу).
+def _net_scan(cmd):
+    """→ (вид, цель). Вид: None (сетевой команды нет) | 'own' (ssh/scp/sftp к своей машине) |
+    'open' (выход наружу). Цель — хост или, если хоста не разобрать, имя самого инструмента:
+    у карточки обязан быть объект, а «инструмент в командной позиции» — объект всегда.
     Разбор структурный: инструмент обязан стоять в КОМАНДНОЙ позиции сегмента."""
-    kind = None
+    kind, target = None, ""
     for i, seg in enumerate(_split_segments(cmd or "")):
         if i % 2:
             continue
@@ -251,13 +311,147 @@ def _net_cmd_kind(cmd):
             continue
         name = _base(toks[j])
         if name in _OPEN_NET_TOOLS:
-            return "open"
+            return "open", (_extract_host(seg) or name)
         if name in _SSH_TOOLS:
-            host = _ssh_target(toks, j)
-            if host and host not in _own_ssh_hosts():
-                return "open"
-            kind = kind or "own"
-    return kind
+            hosts = _ssh_targets(toks, j)
+            foreign = [h for h in hosts if h not in _own_ssh_hosts()]
+            if foreign:
+                return "open", foreign[0]
+            # хостов нет вовсе (`ssh -V`, локальное `scp a b`) — наружу команда не идёт
+            kind, target = kind or "own", target or (hosts[0] if hosts else name)
+    return kind, target
+
+
+def _net_cmd_kind(cmd):
+    """Совместимая обёртка над _net_scan: только вид, без цели."""
+    return _net_scan(cmd)[0]
+
+
+# ---------------------- clasp: развод по ПОДКОМАНДЕ, а не по имени утилиты ---------------------
+# `clasp` целиком считался красным — за сутки это 10 карточек, из которых 6 были ЧТЕНИЕМ
+# (`list`, `pull`, `status`, `deployments`, `--version`). Владелец жал их не глядя, и на этом фоне
+# единственная настоящая — продвижение прода на новую версию — ничем не выделялась.
+#   • читающие подкоманды → зелёное;
+#   • `push` заливает код в HEAD скрипт-проекта. Прод-деплой, ЗАКРЕПЛЁННЫЙ на номере версии, от
+#     этого не меняется — значит при пиновом проде push зелёный; пин не подтверждён → красное;
+#   • `deploy`/`undeploy`/`run` и всё прочее → красное: это выкатка и исполнение в живом контуре.
+_CLASP_READ_SUB = {"status", "pull", "versions", "deployments", "logs", "list",
+                   "--version", "-v", "help", "--help", "-h"}
+_CLASP_META_SUB = {"--version", "-v", "--help", "-h"}
+CLASP_PINS = os.path.join(PROJECT, "clasp_prod_pins.json")   # реестр пинов, ПОД git (review+git)
+
+
+def _to_win_path(p):
+    """MSYS/POSIX-путь → путь Windows (`/d/turbobaby-bot/tmp` → `D:\\turbobaby-bot\\tmp`)."""
+    s = (p or "").strip().strip("'\"")
+    if re.match(r"^/[A-Za-z]/", s):
+        s = s[1] + ":" + s[2:]
+    return s.replace("/", os.sep)
+
+
+def _clasp_call(cmd):
+    """clasp В КОМАНДНОЙ ПОЗИЦИИ сегмента → (подкоманда, каталог из предшествующего `cd`).
+    None — слова `clasp` как команды в строке нет (`which clasp`, `echo "clasp deploy"`,
+    путь `~/.clasprc.json`): судим по ДЕЙСТВИЮ, а не по подстроке."""
+    cd_hint = ""
+    for i, seg in enumerate(_split_segments(cmd or "")):
+        if i % 2:
+            continue
+        try:
+            toks = shlex.split(seg)
+        except Exception:
+            toks = seg.split()
+        j = _cmd_index(toks)
+        if j is None or j >= len(toks):
+            continue
+        name = _base(toks[j])
+        if name == "cd" and j + 1 < len(toks):
+            cd_hint = toks[j + 1].strip("'\"")
+            continue
+        if name != "clasp":
+            continue
+        sub = ""
+        for t in toks[j + 1:]:
+            t = t.strip("'\"")
+            if t.startswith("-") and t.lower() not in _CLASP_META_SUB:
+                continue
+            sub = t.lower()
+            break
+        return sub, cd_hint
+    return None
+
+
+def _clasp_script_id(cd_hint, cwd):
+    """scriptId проекта Apps Script из `.clasp.json` рабочего каталога (учитывая `cd` в самой
+    команде). Не нашли — пустая строка: без опознанного проекта пин не подтвердить."""
+    for base in (_to_win_path(cd_hint) if cd_hint else "", cwd or PROJECT, PROJECT):
+        if not base:
+            continue
+        try:
+            d = base if os.path.isabs(base) else os.path.join(cwd or PROJECT, base)
+            with open(os.path.join(d, ".clasp.json"), encoding="utf-8") as f:
+                sid = (json.load(f) or {}).get("scriptId") or ""
+            if sid:
+                return sid
+        except Exception:
+            continue
+    return ""
+
+
+_PIN_CACHE = {}
+
+
+def _clasp_prod_pinned(script_id):
+    """True ⇔ в реестре `clasp_prod_pins.json` этот scriptId помечен продом, ЗАКРЕПЛЁННЫМ на
+    номере версии. Реестр обязан быть ПОД git и БЕЗ незакоммиченных правок — иначе сессия
+    расширила бы себе права, дописав пин сама (та же дыра, что закрыта для конфига `.claude`).
+    Любой сбой/сомнение → False: непроверенный пин пином не считается."""
+    if not script_id:
+        return False
+    if script_id in _PIN_CACHE:
+        return _PIN_CACHE[script_id]
+    ok = False
+    try:
+        if _is_repo_tracked(CLASP_PINS, PROJECT):
+            p = subprocess.run(["git", "-C", PROJECT, "status", "--porcelain", "--",
+                                os.path.basename(CLASP_PINS)],
+                               capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW)
+            if p.returncode == 0 and not (p.stdout or "").strip():
+                with open(CLASP_PINS, encoding="utf-8") as f:
+                    reg = json.load(f) or {}
+                for item in reg.get("projects") or []:
+                    if (item.get("script_id") or "") != script_id:
+                        continue
+                    ver = item.get("pinned_version")
+                    ok = isinstance(ver, int) and ver >= 1 and bool(item.get("prod_deployment_id"))
+                    break
+    except Exception:
+        ok = False
+    _PIN_CACHE[script_id] = ok
+    return ok
+
+
+def _clasp_decide(cmd, cwd):
+    """→ None (clasp не команда) | (kind, obj). ЗЕЛЁНЫЕ виды: clasp_read (читающие подкоманды) и
+    clasp_push_pinned (заливка кода при проде, закреплённом на номере версии). КРАСНЫЕ:
+    clasp_push (пин не подтверждён), clasp_deploy (выкатка/снятие деплоя), clasp_run
+    (исполнение функции в живом контуре), clasp (прочее — login/clone/create/…)."""
+    call = _clasp_call(cmd)
+    if call is None:
+        return None
+    sub, cd_hint = call
+    sid = _clasp_script_id(cd_hint, cwd)
+    tail = ("…" + sid[-8:]) if sid else "проект не опознан"
+    obj = "clasp %s · %s" % (sub or "(без подкоманды)", tail)
+    if sub in _CLASP_READ_SUB:
+        return ("clasp_read", obj)
+    if sub == "push":
+        return ("clasp_push_pinned", obj) if _clasp_prod_pinned(sid) else ("clasp_push", obj)
+    if sub in ("deploy", "undeploy", "redeploy"):
+        return ("clasp_deploy", obj)
+    if sub == "run":
+        return ("clasp_run", obj)
+    return ("clasp", obj)
 
 # --- ЗЕЛЁНЫЕ признаки Bash-команды (проверяются ПОСЛЕ красных) ---
 # Доверенные скрипты — зелёные ПО ИМЕНИ модуля, содержимое не сканируется (их тела законно
@@ -350,6 +544,37 @@ def _is_scratchpad(path):
         os.sep + "temp" + os.sep in n or os.sep + "tmp" + os.sep in n)
 
 
+# ВРЕМЕННЫЕ каталоги, которых нет в git: `tmp/` внутри репозитория (.gitignore:60) и весь
+# `%TEMP%\claude\**` (скретчпад сессии и соседние рабочие каталоги harness'а). Работа в них —
+# это работа сессии со СВОИМИ черновиками: они не едут в историю, не видны прод-контуру и
+# живут один сеанс. Подтверждение на них ничего не защищает.
+_RE_TEMP_CLAUDE = re.compile(r"(?i)(^|[\\/])(temp|tmp)[\\/]claude[\\/]")
+
+
+def _is_temp_zone(path):
+    """True ⇔ путь лежит во временной зоне из .gitignore. Неразрешимый путь → False (fail-safe:
+    непонятное не считаем временным). `..` в пути снимает доверие целиком — иначе
+    `tmp/../suggest.py` проехал бы как «временный»."""
+    s = (path or "").strip().strip("'\"").replace("\\", "/")
+    if not s or ".." in s.split("/"):
+        return False
+    if _RE_TEMP_CLAUDE.search(s):
+        return True                            # в т.ч. с неразвёрнутым $LOCALAPPDATA/%TEMP%
+    if s.startswith("$") or s.startswith("%") or s.startswith("~"):
+        return False                           # переменную не развернуть → не угадываем
+    try:
+        ap = s if os.path.isabs(s) or re.match(r"^[A-Za-z]:", s) else os.path.join(PROJECT, s)
+        if re.match(r"^/[A-Za-z]/", ap):       # MSYS-форма /d/turbobaby-bot/… → D:\turbobaby-bot\…
+            ap = ap[1] + ":" + ap[2:]
+        ap = os.path.normcase(os.path.normpath(ap))
+    except Exception:
+        return False
+    if not _inside_project(ap):
+        return False
+    rel = os.path.relpath(ap, PROJ_N).split(os.sep)
+    return bool(rel) and rel[0] == "tmp"
+
+
 def _is_memory_store(path):
     """Хранилище памяти агента: `.claude/projects/<репо>/memory/**`. Это СОБСТВЕННЫЕ заметки
     сессии, а не чужой код и не конфиг — правило «только внутри репо» защищает от правок чужого,
@@ -364,10 +589,10 @@ def _is_memory_store(path):
 
 
 def _sanctioned_outside(path):
-    """Зоны ВНЕ репо, где запись не требует подтверждения: временный скретчпад сессии и
-    хранилище памяти агента. Оба — рабочая зона самой сессии, не вектор эскалации.
-    Живой факт аудита 22:27: 6 из 20 последних Allow были именно про них."""
-    return _is_scratchpad(path) or _is_memory_store(path)
+    """Зоны ВНЕ репо, где запись не требует подтверждения: временные каталоги harness'а
+    (`%TEMP%\\claude\\**`, включая скретчпад) и хранилище памяти агента. Оба — рабочая зона самой
+    сессии, не вектор эскалации. Живой факт аудита 22:27: 6 из 20 последних Allow были про них."""
+    return _is_scratchpad(path) or _is_temp_zone(path) or _is_memory_store(path)
 
 
 def _is_test_target(path):
@@ -727,8 +952,11 @@ def _scan_python(cmd, cwd):
         i += 1
     # скан-текст: позиционные аргументы скрипта — данные, не операция (_scan_text, посегментно)
     blob = _scan_text(cmd) + "\n" + content
-    if _RE_ENV.search(blob):
-        return ("ask", "env", "")
+    m = _RE_ENV.search(blob)
+    if m:
+        # объект называем ДОСЛОВНО найденным именем: у карточки .env объект обязан быть, иначе
+        # правило «нет объекта → журнал» проглотило бы её (тело скрипта в команде не видно)
+        return ("ask", "env", m.group(0).strip("'\" "))
     for tok in _LIVE_SHEET_TOKENS:
         if tok in blob:
             return ("ask", "live_sheet", tok)
@@ -770,20 +998,26 @@ def _decide_bash(cmd, cwd):
     # секретам из аргументов НЕ вырезаются. `_RE_OUTSIDE_WRITE` ниже намеренно смотрит СЫРУЮ
     # команду: перенаправление `> C:\…` стоит после имени скрипта и вырезанием пряталось бы.
     scan = _scan_text(cmd)
-    netk = _net_cmd_kind(scan)
+    netk, nettarget = _net_scan(scan)
     for rx, kind in _RED_CMD:
         if rx.search(scan):
             # Сеть: красное — только НАСТОЯЩИЙ выход наружу. Свой ssh-канал и упоминание слова
-            # в тексте карточки не порождают (см. _net_cmd_kind).
+            # в тексте карточки не порождают (см. _net_scan).
             if kind == "network" and netk != "open":
                 continue
+            if kind == "clasp":
+                # Разводим по подкоманде: чтение — зелёное, выкатка/исполнение — красное.
+                cl = _clasp_decide(scan, cwd)
+                if cl is None:
+                    continue                  # `clasp` словом в тексте, а не командой
+                return ("ask", cl[0], cl[1])
             obj = ""
             if kind == "delete":
                 obj = _extract_delete_target(scan) or ""
             elif kind == "kill":
                 obj = _extract_kill_target(scan) or ""
             elif kind == "network":
-                obj = _extract_host(scan) or ""
+                obj = nettarget or _extract_host(scan) or ""
             elif kind == "sqlite":
                 obj = _extract_db(scan) or ""
             return ("ask", kind, obj)
@@ -848,6 +1082,56 @@ _RE_DEL_TAIL = re.compile(r"(?i)(?:^|[\s;&|(])(?:del|erase|rmdir|rd|rm|remove-it
 _RE_DEL_RECURSE = re.compile(r"(?i)(^|\s)(-[a-z]*r[a-z]*|/s|-recurse\w*)(\s|$)")
 _RE_SCHTASKS_QUERY = re.compile(r"(?i)\bschtasks\b[^;&|]*\s/query\b")
 
+_DEL_CMDS = {"del", "erase", "rmdir", "rd", "rm", "remove-item", "ri"}
+_RE_CMDEXE_FLAG = re.compile(r"^/[A-Za-z]{1,2}$")   # /f /s /q cmd.exe — не путь MSYS вида /d/…
+
+
+def _delete_scan(cmd):
+    """Разбор удаления ПОСЕГМЕНТНО → (цели, рекурсивно, есть маска).
+
+    Хвост берётся ТОЛЬКО из своего сегмента. Прежний разбор тянул `.*$` до конца строки, и
+    команда `rm -f память/один.md; ls память/один.md 2>&1` выглядела удалением ЧЕТЫРЁХ целей
+    (файл, `ls`, файл ещё раз, `2>&1`) — ложное «массовое удаление» на удалении ОДНОГО файла.
+    Цели отдаются с приклеенным каталогом из предшествующего `cd` — иначе относительное имя
+    (`rm -f token.txt` после `cd "$SP"`) не сопоставить ни с одной зоной."""
+    hint, targets, recurse, mask = "", [], False, False
+    for i, seg in enumerate(_split_segments(cmd or "")):
+        if i % 2:
+            continue
+        try:
+            toks = shlex.split(seg)
+        except Exception:
+            toks = seg.split()
+        j = _cmd_index(toks)
+        if j is None or j >= len(toks):
+            continue
+        name = _base(toks[j])
+        if name == "cd" and j + 1 < len(toks):
+            hint = toks[j + 1].strip("'\"")
+            continue
+        if name not in _DEL_CMDS:
+            continue
+        for t in toks[j + 1:]:
+            if t.startswith("-") or _RE_CMDEXE_FLAG.match(t):
+                if _RE_DEL_RECURSE.search(" " + t + " "):
+                    recurse = True
+                continue
+            t = t.strip("'\"")
+            if not t:
+                continue
+            if "*" in t or "?" in t:
+                mask = True
+            targets.append(t if (re.match(r"^([A-Za-z]:|[/\\~$%])", t) or not hint)
+                           else hint.rstrip("/\\") + "/" + t)
+    return targets, recurse, mask
+
+
+def _delete_targets_all_temp(cmd):
+    """True ⇔ удаление ЦЕЛИКОМ живёт во временных зонах из .gitignore (`tmp/`, `%TEMP%\\claude\\**`).
+    Пустой список целей или хоть одна цель вне зоны → False: послабление не распространяется."""
+    targets, _rec, _mask = _delete_scan(cmd)
+    return bool(targets) and all(_is_temp_zone(t) for t in targets)
+
 
 def is_headless(env=None):
     """Роль ПО ФАКТУ. True ⇔ headless-ребёнок демона (или его субагент): демон штампует
@@ -861,16 +1145,18 @@ def is_headless(env=None):
 def _is_mass_delete(cmd):
     """Массовое удаление ⇔ рекурсивный флаг (-r/-rf/-Recurse//s), маска (*/?) или БОЛЬШЕ ОДНОЙ
     цели. Удаление одного явного файла массовым НЕ считается (доктрина владельца: красное —
-    именно «массовые удаления»)."""
+    именно «массовые удаления»). Разбор посегментный (_delete_scan); если сегмент удаления не
+    нашёлся вовсе — падаем на прежний подстрочный разбор, чтобы не ослабить признак."""
+    targets, recurse, mask = _delete_scan(cmd)
+    if targets or recurse or mask:
+        return bool(mask or recurse or len(targets) > 1)
     m = _RE_DEL_TAIL.search(cmd or "")
     tail = m.group(1) if m else (cmd or "")
-    if "*" in tail or "?" in tail:
+    if "*" in tail or "?" in tail or _RE_DEL_RECURSE.search(tail):
         return True
-    if _RE_DEL_RECURSE.search(tail):
-        return True
-    targets = [t for t in re.findall(r"[^\s\"';|&]+", tail)
-               if not t.startswith("-") and not t.startswith("/")]
-    return len(targets) > 1
+    rest = [t for t in re.findall(r"[^\s\"';|&]+", tail)
+            if not t.startswith("-") and not t.startswith("/")]
+    return len(rest) > 1
 
 
 def _stays_red(kind, obj, cmd):
@@ -879,14 +1165,20 @@ def _stays_red(kind, obj, cmd):
     if kind in ("env", "edit_secret", "read_secret",     # .env и секреты
                 "sqlite",                                 # живая БД
                 "clasp", "live_sheet",                    # живые таблицы (Лист1 / CRM / Календарь)
+                "clasp_deploy", "clasp_run", "clasp_push",  # выкатка / исполнение / заливка без пина
                 "kill",                                   # остановка процессов
                 "git_force",                              # git clean/reset --hard = массовый снос работы
                 "network",                                # выход в сеть = канал утечки секретов
                 "outside", "write_outside",               # требование п.1: правки ТОЛЬКО внутри репо
                 "edit_claude"):                           # иначе сессия молча расширит собственные права
         return True
+    if kind in ("clasp_read", "clasp_push_pinned"):
+        return False        # чтение проекта и заливка кода при проде НА ВЕРСИИ — прод не двигают
     if kind == "delete":
-        return _is_mass_delete(cmd)
+        # Временные каталоги из .gitignore (`tmp/`, `%TEMP%\claude\**`) — рабочие черновики самой
+        # сессии: в git не едут, прод-контур их не видит, живут один сеанс. Уборка за собой
+        # подтверждения не стоит. Хоть одна цель вне зоны — красное как было.
+        return _is_mass_delete(cmd) and not _delete_targets_all_temp(cmd)
     if kind == "schtasks":
         return not _RE_SCHTASKS_QUERY.search(cmd or "")   # /query — чтение, остальное = контроль задач
     if kind == "py_write":
@@ -956,12 +1248,119 @@ def _log(role, tool, action, kind, detail, path=None):
 
 # ------------------------------- вывод/пуш -----------------------------------
 
+# ОДНА строка отката на вид операции: карточка без ответа «а если не то?» решения не даёт.
+# Формулировки честные — там, где отката нет, так и написано.
+_ROLLBACK = {
+    "delete": "Откат: удалённое не вернуть — только из git или бэкапа",
+    "kill": "Откат: поднять процесс заново (сторож поднимет сам, если он под ним)",
+    "schtasks": "Откат: обратная команда schtasks (/change /enable ↔ /disable)",
+    "git_force": "Откат: git reflog → git reset --hard <прежний хеш>",
+    "sqlite": "Откат: восстановить БД из бэкапа; бэкапа нет — сделать ДО записи",
+    "clasp": "Откат: зависит от подкоманды — эффект в проекте Apps Script вручную",
+    "clasp_push": "Откат: залить прежний код (tmp/bridge_v<прежняя>); прод НА ВЕРСИИ не двигается",
+    "clasp_deploy": "Откат: clasp deploy -i <deploymentId> -V <прежняя версия из clasp deployments>",
+    "clasp_run": "Откат: автоматического нет — функция уже отработала в живых таблицах",
+    "live_sheet": "Откат: история версий Google Sheets (Файл → История версий)",
+    "network": "Откат: чтение отката не требует; ОТПРАВЛЕННОЕ не вернуть",
+    "env": "Откат: .env вне git — вернуть из .env.bak*",
+    "edit_secret": "Откат: .env вне git — вернуть из .env.bak*",
+    "read_secret": "Откат: не нужен (чтение), но значение окажется в контексте сессии",
+    "edit_claude": "Откат: git checkout -- .claude/settings.json (файл под git)",
+    "outside": "Откат: удалить созданное вручную — это вне репозитория",
+    "write_outside": "Откат: удалить созданное вручную — это вне репозитория",
+    "py_write": "Откат: боевую запись Bridge снимает только обратная операция (void_last/…)",
+    "unknown": "Откат: неизвестен — гард не разобрал команду",
+}
+
+_RE_NUM_VERSION = re.compile(r"(?i)(?:^|\s)-V\s+(\d+)")
+_RE_NUM_PID = re.compile(r"(\d+)")
+
+# Виды, карточка которых обязательна ДАЖЕ без объекта и числа, — hard-блок:
+#   • `unknown` — сбой разбора самого гарда: на нём молчать нельзя ни при каких условиях;
+#   • `.env` и секреты — прямое требование владельца «.env не трогать»: правило «нет объекта →
+#     журнал» не имеет права его обойти, даже если имя файла осталось внутри тела скрипта.
+_HARD_CARD = ("unknown", "env", "edit_secret", "read_secret")
+
+
+def _card_fields(kind, obj="", raw_cmd=""):
+    """→ (объект, число). Объект — ЧТО именно трогаем (файл, хост, PID, проект); число — версия,
+    PID, сколько целей. Пустая пара означает: признак сработал на ПОДСТРОКЕ, а не на действии."""
+    o, n = (obj or "").strip(), ""
+    cmd = raw_cmd or ""
+    if kind == "delete":
+        targets, _rec, _mask = _delete_scan(cmd)
+        o = o or (targets[0] if targets else "")
+        if targets:
+            n = "%d цел%s" % (len(targets), "ь" if len(targets) == 1 else "и")
+    elif kind == "kill":
+        n = ""                      # число (PID) уже внутри объекта — второй строкой это шум
+    elif kind == "schtasks":
+        m = re.search(r"(?i)(?:/tn|-taskname)\s+[\"']?([^\"'\s;|&]+)", cmd)
+        o = o or (m.group(1) if m else "")
+    elif kind.startswith("clasp"):
+        m = _RE_NUM_VERSION.search(cmd)
+        if m:
+            n = "версия " + m.group(1)
+        else:
+            d = re.search(r"(?i)-i\s+(\S{12,})", cmd)
+            n = ("деплой …" + d.group(1)[-8:]) if d else ""
+    elif kind == "git_force":
+        m = re.search(r"(?i)git\s+(push|reset|clean)\b([^;|&]*)", cmd)
+        o = o or ((m.group(1) + (" " + m.group(2).strip() if m.group(2).strip() else "")).strip()
+                  if m else "")
+    elif kind == "env":
+        m = _RE_ENV.search(_scan_text(cmd)) if cmd else None
+        o = o or (m.group(0).strip("'\" ") if m else "")
+    elif kind == "live_sheet":
+        o = o or (_extract_host(cmd) or "")
+    return o.strip(), n.strip()
+
+
+def _rollback(kind, raw_cmd=""):
+    """Одна строка отката. Для выкатки Apps Script собирается ПО КОМАНДЕ: тот же деплой, прежняя
+    версия — ровно та строка, которой владелец сам откатывался (артефакт 2026-07-29). id деплоя
+    маскируем хвостом: карточка обязана читаться, полный id есть в `clasp deployments`."""
+    if kind == "clasp_deploy":
+        m = re.search(r"(?i)-i\s+(\S{12,})", raw_cmd or "")
+        dep = ("…" + m.group(1)[-6:]) if m else "<deploymentId>"
+        if re.search(r"(?i)(^|\s)clasp\s+undeploy\b", raw_cmd or ""):
+            return "Откат: clasp deploy -i %s -V <снятая версия> (вернуть удалённый деплой)" % dep
+        return "Откат: clasp deploy -i %s -V <прежняя версия из clasp deployments>" % dep
+    return _ROLLBACK.get(kind, "Откат: обратной операцией вручную")
+
+
 def _card(kind, obj="", raw_cmd=""):
-    """Человеческая карточка: первая строка — ЧТО хочу + зачем, затем (для прозрачности) сырая команда."""
-    card = "🔴 " + _human(kind, obj) + " — разрешить?"
+    """Человеческая карточка. Обязательный минимум за 3 секунды: ЧТО меняется (первая строка),
+    у какого ОБЪЕКТА, какое ЧИСЛО и одна строка ОТКАТА. Сырая команда — последней и обрезанной:
+    она для прозрачности, а не для чтения."""
+    o, n = _card_fields(kind, obj, raw_cmd)
+    lines = ["🔴 " + _human(kind, obj) + " — разрешить?"]
+    if o:
+        lines.append("Объект: " + o)
+    if n:
+        lines.append("Число: " + n)
+    lines.append(_rollback(kind, raw_cmd))
     if raw_cmd:
-        card += "\nКоманда: " + raw_cmd.strip()
-    return card
+        c = " ".join(raw_cmd.split())
+        lines.append("Команда: " + (c if len(c) <= 200 else c[:200] + "…"))
+    return "\n".join(lines)
+
+
+def card_or_journal(kind, obj="", raw_cmd=""):
+    """→ текст карточки либо None (карточки нет — вместо неё строка в журнал).
+
+    Правило владельца, свод CLAUDE.md п.5: «нет числа или имени (PID, путь, таблица, хост) —
+    карточки быть не должно». Признак без объекта — это срабатывание на ПОДСТРОКЕ, а не на
+    действии: живой пример суток — `echo "---SCHTASKS XML---"` внутри команды `ls`, где слова
+    Планировщика нет ни в одной командной позиции. Исключение — hard-блок `_HARD_CARD` (сбой
+    разбора самого гарда): он спрашивает всегда. Любой сбой здесь → карточка (FAIL-SAFE)."""
+    try:
+        o, n = _card_fields(kind, obj, raw_cmd)
+        if not o and not n and kind not in _HARD_CARD:
+            return None
+    except Exception:
+        pass
+    return _card(kind, obj, raw_cmd)
 
 
 def _push(card):
@@ -1041,10 +1440,15 @@ def main():
         # FAIL-SAFE в ЛЮБОЙ роли: ошибку анализа НЕ смягчаем (иначе сбой гарда = тихий пропуск,
         # а permissions.allow здесь широкий — гард единственный красный гейт).
         action, kind, obj = ("ask", "unknown", "")
-    _log(role, tool, action, kind, detail)
+    card = None
     if action == "ask":
-        _emit_ask(_card(kind, obj, detail if tool in ("Bash", "PowerShell") else ""))
-    sys.exit(0)  # defer
+        card = card_or_journal(kind, obj, detail if tool in ("Bash", "PowerShell") else "")
+        if card is None:
+            action = "journal"   # объекта и числа нет → вместо карточки строка в журнал
+    _log(role, tool, action, kind, detail)
+    if card is not None:
+        _emit_ask(card)
+    sys.exit(0)  # defer / journal
 
 
 if __name__ == "__main__":

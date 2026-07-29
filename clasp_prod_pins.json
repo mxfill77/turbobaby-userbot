@@ -1,0 +1,29 @@
+{
+  "_doc": [
+    "Реестр ПИНОВ прод-деплоев Apps Script. Читает pretool_guard: `clasp push` заливает код в",
+    "HEAD скрипт-проекта, и если ПРОД закреплён на НОМЕРЕ ВЕРСИИ (а не на @HEAD), заливка прод",
+    "не двигает — значит подтверждения не требует. Пин не подтверждён → карточка, как было.",
+    "",
+    "Файл обязан быть ПОД git и БЕЗ незакоммиченных правок: иначе сессия расширила бы себе",
+    "права, дописав пин сама (та же дыра, что закрыта для конфига .claude). Грязный или",
+    "неотслеживаемый файл гард пином НЕ считает.",
+    "",
+    "prod_deployment_id намеренно в МАСКИРОВАННОМ виде (как в артефактах): гарду важен сам факт",
+    "закреплённого прод-деплоя, а полный id — часть боевого адреса /exec, ему в git не место.",
+    "",
+    "Обновлять при КАЖДОМ продвижении прода: pinned_version = номер версии, на которую переведён",
+    "прод-деплой; checked_at = дата, когда это подтверждено выводом `clasp deployments`."
+  ],
+  "projects": [
+    {
+      "name": "TurboBaby Bridge (Apps Script)",
+      "script_id": "12iXPDU_wxcyslItPW6X41ODuoVxx2smmlQBfhSwI6Lt42MTrYbv9HhOJ",
+      "prod_deployment_id": "AKfycb…hXNOqw",
+      "pinned_version": 76,
+      "checked_at": "2026-07-29",
+      "checked_by": "clasp deploy -i AKfycb…hXNOqw -V 76 (перевод прода с @75 на @76), подтверждено clasp deployments",
+      "evidence": "docs/artifacts/2026-07-29-cowork-log-rotation.md",
+      "rollback": "clasp deploy -i AKfycb…hXNOqw -V 75"
+    }
+  ]
+}
