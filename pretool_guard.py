@@ -87,6 +87,30 @@ PROJECT = r"D:\turbobaby-bot"
 PROJ_N = os.path.normcase(os.path.normpath(PROJECT))
 VENV_PY = os.path.join(PROJECT, "venv", "Scripts", "python.exe")
 DNOTIFY = os.path.join(PROJECT, "dispatch_notify.py")
+
+# Клон боевого репозитория сервера на этом ПК. Каталог ЦЕЛИКОМ НЕ открыт и открыт не будет:
+# там демон, splinter, devbot и деньги — молчаливая запись туда опаснее нескольких карточек.
+_MANAGER_CLONE = r"D:\foreign\turbobaby-manager-bot"
+
+# ── ИСХОДНИКИ САМОГО ГАРДА: явный ПОИМЁННЫЙ список (НЕ маска, НЕ каталог) ──────────────────
+# Граница: ЗАПИСЬ В ФАЙЛ НИЧЕГО НЕ ИСПОЛНЯЕТ. Правка этих четырёх файлов ИНСТРУМЕНТОМ записи
+# (Edit/Write/MultiEdit) карточки не рождает. ИСПОЛНЕНИЕ не ослаблено ничем: Bash, инлайн `-c`,
+# запуск скрипта краснеют как раньше — карве-аут живёт ТОЛЬКО в _decide_write.
+#
+# Зачем поимённо. Файлы гарда перечисляют имена опасных операций — это их работа. Открывать под
+# них каталог нельзя: `D:\foreign\turbobaby-manager-bot` — рабочее дерево боевого сервера.
+# Поэтому ровно четыре пути, и добавление пятого — отдельное осознанное решение.
+#
+# Те же пути продублированы в `.claude/settings.json` (permissions.allow), чтобы список был виден
+# В ПРАВИЛАХ, а не только в коде: хук возвращает решение ПОВЕРХ слоя настроек, зелёными должны быть
+# ОБА. Расхождение двух списков сторожит тест `test_guard_sources_mirrored_in_settings`.
+_GUARD_SOURCES = (
+    os.path.join(PROJECT, "pretool_guard.py"),
+    os.path.join(PROJECT, "test_pretool_guard.py"),
+    os.path.join(_MANAGER_CLONE, "pretool_guard.py"),
+    os.path.join(_MANAGER_CLONE, "tests", "test_guard_card_min.py"),
+)
+_GUARD_SOURCES_N = frozenset(os.path.normcase(os.path.normpath(p)) for p in _GUARD_SOURCES)
 GUARD_LOG = os.path.join(PROJECT, "pretool_guard.log")   # под *.log в .gitignore — в репо не уедет
 GUARD_LOG_MAX = 2 * 1024 * 1024                          # 2 МБ → ротация (лог не растёт вечно)
 
@@ -513,6 +537,18 @@ def _inside_project(path):
     except Exception:
         return False
     return ap == PROJ_N or ap.startswith(PROJ_N + os.sep)
+
+
+def _is_guard_source(path):
+    """ТОЧНОЕ совпадение с одним из `_GUARD_SOURCES`. Ни маски, ни префикса каталога: сосед по
+    каталогу (`D:\\foreign\\turbobaby-manager-bot\\bot.py`) сюда НЕ попадает."""
+    if not path:
+        return False
+    try:
+        ap = path if os.path.isabs(path) else os.path.join(PROJECT, path)
+        return os.path.normcase(os.path.normpath(ap)) in _GUARD_SOURCES_N
+    except Exception:
+        return False
 
 
 def _is_secret_path(path):
@@ -996,6 +1032,11 @@ def _decide_write(ti, cwd):
         return ("ask", "edit_secret", os.path.basename(path))
     if _is_claude_path(path):
         return ("ask", "edit_claude", os.path.basename(path))
+    # Исходники самого гарда — запись инструментом, она НИЧЕГО НЕ ИСПОЛНЯЕТ. Стоит СТРОГО ПОСЛЕ
+    # секретов и конфига `.claude` (те спрашивают всегда, карве-аут их не обходит) и ДО проверки
+    # «вне проекта» — иначе два файла гарда в клоне сервера так и остались бы `write_outside`.
+    if _is_guard_source(path):
+        return ("defer", "", "")
     if not _inside_project(path) and not _sanctioned_outside(path):
         return ("ask", "write_outside", path)
     return ("defer", "", "")

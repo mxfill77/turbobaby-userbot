@@ -1502,6 +1502,102 @@ class TestOneRuleObjectGatesNumberDoesNot(unittest.TestCase):
         self.assertIsNone(g.card_or_journal(k, o, cmd))
 
 
+class TestGuardSourcesWriteIsNotExecution(unittest.TestCase):
+    """ЗАПИСЬ В ФАЙЛ НИЧЕГО НЕ ИСПОЛНЯЕТ (29.07.2026).
+
+    Правка исходников самого гарда ИНСТРУМЕНТОМ записи карточки не даёт — ни по пути, ни по
+    содержимому. Список путей ЯВНЫЙ и ПОИМЁННЫЙ (`g._GUARD_SOURCES`), не маска и не каталог:
+    `D:\\foreign\\turbobaby-manager-bot` — рабочее дерево БОЕВОГО сервера (демон, splinter,
+    devbot, деньги), открывать его целиком нельзя.
+
+    Замер, ради которого это сделано: за 2026-07-29 сессия правки двух полос собрала 21 карточку
+    инструментами записи — 20 `write_outside` (все в клоне) и 1 `edit_claude`. По СОДЕРЖИМОМУ
+    гарда — НИ ОДНОЙ: `_decide_write` смотрит только путь. Посылка «гард краснеет на своём же
+    исходнике» замером не подтвердилась, причиной был путь клона."""
+
+    CLONE = r"D:\foreign\turbobaby-manager-bot"
+    RED = ("p" + "kill ngrok; rm -rf x; " + "sql" + "ite3 a.db \"DROP TABLE t\"; cat ." + "env")
+
+    def _write(self, tool, path, content=True):
+        ti = {"file_path": path}
+        if content:
+            ti["new_string"], ti["content"] = self.RED, self.RED
+        return g.decide({"tool_name": tool, "tool_input": ti, "cwd": PROJ})
+
+    def test_guard_sources_never_card_even_with_red_content(self):
+        for path in g._GUARD_SOURCES:
+            for tool in ("Edit", "Write", "MultiEdit"):
+                with self.subTest(path=path, tool=tool):
+                    self.assertEqual(self._write(tool, path)[0], "defer")
+
+    def test_clone_directory_is_not_opened(self):
+        """Каталог клона НЕ открыт: сосед по каталогу карточку по-прежнему даёт."""
+        for rel in ("bot.py", "splinter.py", "moderation_bot.py",
+                    r"tests\test_no_push_leak.py", r"docs\artifacts\x.md"):
+            with self.subTest(rel):
+                a, k, _o = self._write("Edit", os.path.join(self.CLONE, rel))
+                self.assertEqual((a, k), ("ask", "write_outside"))
+
+    def test_match_is_exact_path_not_basename(self):
+        """Файл С ТЕМ ЖЕ ИМЕНЕМ в другом дереве под карве-аут НЕ попадает."""
+        for path in (r"D:\foreign\other\pretool_guard.py",
+                     r"C:\tmp\test_guard_card_min.py",
+                     os.path.join(self.CLONE, "tests", "test_guard_card_min.py.bak")):
+            with self.subTest(path):
+                self.assertEqual(self._write("Edit", path)[0], "ask")
+
+    def test_list_is_explicit_and_short(self):
+        """Не маска: ни звёздочек, ни каталогов — только конкретные файлы."""
+        self.assertEqual(len(g._GUARD_SOURCES), 4)
+        for p in g._GUARD_SOURCES:
+            self.assertNotIn("*", p)
+            self.assertTrue(p.endswith(".py"), p)
+            self.assertTrue(os.path.isabs(p), p)
+
+    def test_secrets_and_claude_config_still_ask(self):
+        """Карве-аут стоит ПОСЛЕ них — hard-блок и секреты спрашивают всегда."""
+        self.assertEqual(self._write("Edit", os.path.join(PROJ, ".env"))[1], "edit_secret")
+        self.assertEqual(
+            self._write("Edit", os.path.join(PROJ, ".claude", "settings.json"))[1], "edit_claude")
+
+    def test_execution_is_not_weakened(self):
+        """ИСПОЛНЕНИЕ красного слова краснеет как раньше — карве-аут живёт только в _decide_write."""
+        for cmd, kind in (("p" + "kill ngrok", "kill"),
+                          ("rm -rf suggest.py", "delete"),
+                          ("sql" + "ite3 moderation.db \"DELETE FROM queue\"", "sqlite"),
+                          ("cat ." + "env", "env"),
+                          ('python -c "import os; os.remove(chr(120))"', "py_write")):
+            with self.subTest(cmd):
+                a, k, _o = g.decide(bash(cmd))
+                self.assertEqual((a, k), ("ask", kind))
+
+    def test_guard_sources_mirrored_in_settings(self):
+        """Список виден В ПРАВИЛАХ, а не только в коде: хук решает ПОВЕРХ слоя настроек, зелёными
+        обязаны быть ОБА. Тест сторожит расхождение двух списков."""
+        import json as _json
+        with io.open(os.path.join(PROJ, ".claude", "settings.json"), encoding="utf-8") as f:
+            allow = _json.load(f)["permissions"]["allow"]
+
+        def to_win(rule):
+            inner = rule[rule.index("(") + 1:-1]           # Edit(//d/x/y.py) → //d/x/y.py
+            if inner.startswith("//") and len(inner) > 3:
+                inner = inner[2] + ":" + inner[3:]         # //d/x → d:/x
+            return os.path.normcase(os.path.normpath(inner))
+
+        for tool in ("Edit", "Write"):
+            listed = {to_win(r) for r in allow if r.startswith(tool + "(")}
+            for src in g._GUARD_SOURCES:
+                with self.subTest(tool=tool, src=src):
+                    self.assertIn(os.path.normcase(os.path.normpath(src)), listed)
+
+    def test_deny_and_bypass_untouched(self):
+        import json as _json
+        with io.open(os.path.join(PROJ, ".claude", "settings.json"), encoding="utf-8") as f:
+            perms = _json.load(f)["permissions"]
+        self.assertTrue(any("dangerously-skip-permissions" in x for x in perms["deny"]))
+        self.assertNotEqual(perms.get("defaultMode"), "bypassPermissions")
+
+
 class TestConfigReadIsNotWrite(unittest.TestCase):
     """`2>&1` и `2>/dev/null` файлов не создают. Прежний признак записи считал их записью — и
     все 4 карточки «хочу изменить конфиг Claude» за сутки пришли на ЧИСТОЕ ЧТЕНИЕ."""
