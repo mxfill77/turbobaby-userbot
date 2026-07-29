@@ -1355,6 +1355,44 @@ _BIKE_WORD_RE = re.compile(
     + r"|мопед" + _VEH_END + _VEH_R
     + r"|мото(?!р(?!оллер)))", re.I)
 
+# --- АНГЛИЙСКИЙ СЛОЙ (29.07.2026) -------------------------------------------------------------
+# Контур клиентский RU+EN, а латиницы в СЛОВАХ детекта не было вовсе (в МАРКАХ она была всегда —
+# toyota/nissan/… выше). Живьём это значило: тип ТС у англоязычного клиента не определялся НИКОГДА.
+# Дословно из корпуса B: «I Need bike» (#173), «Hello, I would like to rent motorcycle for the
+# Phuket location» (#543), «Hello , I'm looking for monthly rent motorcycle .» (#400), «Hi! I need
+# a sport bike (Yamaha yzf / Honda cbr/ Kawasaki ninja) 300-500 for a week» (#207) — все 'unknown'.
+#
+# Принцип тот же, что вчера у русского: ГРАНИЦЫ СЛОВА, а не подстрока. Ловушки подстроки — car в
+# care/careful/card/cargo/carry/carrier/career/cart/scarf, van в advance/vanilla, auto в
+# automatic/automation/automatically. Три из них в корпусе ЖИВЫЕ: «he went to take care of some
+# business» (care ×3), «we have his identification card documents» (card ×1), «i would like to
+# request an advance of 1,000 bath» (advance ×1).
+#
+# Границы латиницы СТРОЖЕ русских: кроме букв закрыты ЦИФРЫ и «_». Это тоже живая ловушка, а не
+# перестраховка — тред #0, рекламный прайс: «t.me/auto_moto_thailand» (2 совпадения). С русскими
+# границами «auto» и «moto» там отдельные токены, и прайс рекламной площадки уезжает в 'mixed'.
+_VEH_EN_L = r"(?<![a-zа-яё0-9_])"
+_VEH_EN_R = r"(?![a-zа-яё0-9_])"
+
+# Альтернативы — от длинной к короткой (для чтения; re откатывается и порядок на результат не
+# влияет). «s?» — английское множественное: cars/sedans/bikes/scooters.
+# «truck» и «vehicle» в словарь НЕ взяты — это ЖИВАЯ ловушка корпуса B, а не осторожность. Тайские
+# сотрудники пишут через машинный перевод, и รถ выходит как car/truck/vehicle применительно к нашим
+# СКУТЕРАМ: «Where does this Max N truck need to be delivered?», «Does the N-Max 4255 truck require
+# a deposit?», «Does the X Max 5773 vehicle need to be replaced for the customer again?» (truck ×2,
+# vehicle ×8 — все до одного про байки парка). «vehicle» вдобавок родовое: байк — тоже vehicle.
+# «taxi» (×5) — не запрос аренды: «staff take a taxi to pick up the car».
+_CAR_EN_STEMS = ("automobile", "minivan", "sedan", "auto", "car", "suv", "van")
+_CAR_EN_RE = re.compile(
+    _VEH_EN_L + r"(?:" + "|".join(_CAR_EN_STEMS) + r")s?" + _VEH_EN_R, re.I)
+
+# «moto» отдельным словом НЕ берём — зеркало русского правила «мото — префикс, а не слово». Живьём
+# это бренд и URL: «Аудио от TURBOBABY MOTO PHUKET» (наш собственный текст) и
+# «t.me/auto_moto_thailand». Полные слова ниже покрывают то, что клиент пишет на самом деле.
+_BIKE_EN_STEMS = ("motorcycle", "motorbike", "scooter", "moped", "bike")
+_BIKE_EN_RE = re.compile(
+    _VEH_EN_L + r"(?:" + "|".join(_BIKE_EN_STEMS) + r")s?" + _VEH_EN_R, re.I)
+
 # Реплика клиента в транскрипте окна (тот же префикс, что у _client_text ниже).
 _CLIENT_LINE_PREFIX = "[клиент]:"
 
@@ -1362,8 +1400,9 @@ _CLIENT_LINE_PREFIX = "[клиент]:"
 def _vehicle_of(text):
     """Вердикт по ОДНОМУ куску текста, без учёта истории треда. Чистая функция."""
     t = (text or "").lower().replace("ё", "е")
-    is_car = bool(_CAR_WORD_RE.search(t)) or bool(_CAR_BRAND_RE.search(t))
-    is_bike = bool(_BIKE_WORD_RE.search(t))
+    is_car = (bool(_CAR_WORD_RE.search(t)) or bool(_CAR_BRAND_RE.search(t))
+              or bool(_CAR_EN_RE.search(t)))
+    is_bike = bool(_BIKE_WORD_RE.search(t)) or bool(_BIKE_EN_RE.search(t))
     if is_car and is_bike:
         return "mixed"
     if is_car:
@@ -1394,7 +1433,10 @@ def detectVehicleType(text):
     смотрим текст целиком, как раньше: реплика менеджера «байк будет готов» оставляет тред байком.
 
     Все слова — по границам слова с закрытым списком окончаний (см. комментарий выше):
-    «машину»/«машине»/«автомобилей» ловятся, «автовокзал»/«автомат»/«автобус»/«аудитория» — нет."""
+    «машину»/«машине»/«автомобилей» ловятся, «автовокзал»/«автомат»/«автобус»/«аудитория» — нет.
+    Английский (29.07.2026) — тем же принципом и в тех же трёх вердиктах: «I need bike» → 'bike',
+    «do you have a car?» → 'car', «a car or a bike» → 'mixed'; care/card/carry/scarf, advance,
+    automatic — НЕ ловятся. Разбор на живом корпусе: docs/artifacts/2026-07-29-vehicle-type-en.md."""
     for line in reversed([l for l in (text or "").split("\n")
                           if l.startswith(_CLIENT_LINE_PREFIX)]):
         verdict = _vehicle_of(line)
@@ -1407,8 +1449,13 @@ def detectVehicleType(text):
 # «(?:мото)?байк\w*» без левой границы ловила «Квадробайк», «Байкал», «байкер» — и, пока функция
 # ЗАМЕНЯЛА слово, рождала «Квадроавто», «Озеро авто», «Наш авто довезёт». Теперь по этой регулярке
 # ничего не заменяется, но и ложную пометку модератору она вешать не должна.
+# EN-половина (29.07.2026) — иначе дыра, открытая ЭТОЙ ЖЕ правкой: англоязычный тред теперь может
+# получить вердикт 'car', а англоязычный черновик («we have scooters and bikes») словом «байк» не
+# пишется — и пометка _VEHICLE_NOTE["en"], которая в коде лежит с самого начала, не сработала бы
+# НИКОГДА. Список тот же, что у _BIKE_EN_RE, границы те же.
 _BIKE_NOUN_RE = re.compile(
-    r"(?<![а-яёa-z])(?:мото)?байк(?:ами|ах|ам|ов|ом|а|у|е|и)?(?![а-яёa-z])", re.I)
+    r"(?<![а-яёa-z])(?:мото)?байк(?:ами|ах|ам|ов|ом|а|у|е|и)?(?![а-яёa-z])"
+    r"|" + _VEH_EN_L + r"(?:" + "|".join(_BIKE_EN_STEMS) + r")s?" + _VEH_EN_R, re.I)
 
 # Пометка модератору о конфликте типа ТС. Служебный канал карточки — тот же, что «[уточнить: …]»
 # и «[собрано: …]»: отдельная строка в квадратных скобках в хвосте, которую перед отправкой

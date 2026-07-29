@@ -212,8 +212,8 @@ class TestPureLogic(unittest.TestCase):
             "сотрудники у аудиторов на переоформлении документов задерживаются."
         ), "bike")
         # наш собственный текст, который прежде объявлялся запросом про авто (стем марки «ауди»).
-        # 'unknown', а не 'bike': латиницы в словаре детекта нет вовсе — «MOTO» он не видит и
-        # никогда не видел (остаток задачи, не регресс).
+        # 'unknown', а не 'bike', и ПОСЛЕ добавления английского (29.07.2026) тоже: «moto»
+        # отдельным словом в словарь НЕ взято — живьём это бренд и URL, а не запрос клиента.
         self.assertEqual(suggest.detectVehicleType("Аудио от TURBOBABY MOTO PHUKET"), "unknown")
         # «автомат» — это коробка СКУТЕРА, а не марка авто
         for phrase in ("у него автомат коробка робот",
@@ -279,6 +279,65 @@ class TestPureLogic(unittest.TestCase):
         # «Мопед, машина» — ОДИН запрос, названы оба (живая реплика корпуса B)
         self.assertEqual(suggest.detectVehicleType("Мопед, машина"), "mixed")
 
+    def test_detect_vehicle_type_english_live_phrases(self):
+        """АНГЛИЙСКИЙ (29.07.2026). До этой правки латиницы в СЛОВАХ детекта не было вовсе —
+        англоязычный клиент типом ТС не покрывался НИКОГДА, все фразы ниже давали 'unknown'.
+
+        Позитивы — ДОСЛОВНЫЕ реплики живых клиентов (правило-класс CLAUDE.md), источники:
+        корпус A `moderation_ipc.db` (id=311) и корпус B `client_chats.jsonl` (треды #173, #207,
+        #348, #400, #543, #550, #3). Разбор целиком: docs/artifacts/2026-07-29-vehicle-type-en.md.
+        """
+        # --- ЖИВЫЕ англоязычные запросы клиентов → 'bike' (все до правки были 'unknown')
+        for phrase in ("I will rent a motorcycle when I arrive at the local area on August 3.",
+                       "Hello, I would like to rent motorcycle for the Phuket location\U0001f642",
+                       "Hello , I’m looking for monthly rent motorcycle .",
+                       "I Need bike",
+                       "Hi! I need a sport bike (Yamaha yzf / Honda cbr/ Kawasaki ninja) "
+                       "300-500 for a week",
+                       "Добрый день что то есть в наличии maxi scooter, 29.12-14.01?",
+                       "Ok i dlya bike toje yest strahovka da?",
+                       "Can I go to Mai big bike"):
+            self.assertEqual(suggest.detectVehicleType(phrase), "bike", phrase)
+
+        # --- запрос про авто по-английски → 'car'. ЧЕСТНО: живого EN-запроса про авто в обоих
+        # корпусах НЕТ НИ ОДНОГО (единственные живые EN-«car» — машинный перевод тайского у
+        # СОТРУДНИКА, см. негативы ниже), поэтому эти четыре фразы СКОНСТРУИРОВАНЫ, а не сняты.
+        for phrase in ("do you have a car?",
+                       "Any cars available for tomorrow?",
+                       "Do you have a sedan or an SUV?",
+                       "We need a minivan for 6 people"):
+            self.assertEqual(suggest.detectVehicleType(phrase), "car", phrase)
+
+        # --- смешанный запрос по-английски даёт ТОТ ЖЕ вердикт 'mixed', в том числе вперемешку
+        for phrase in ("I need a car or a bike",
+                       "Do you rent cars or only scooters?",
+                       "a car and a motorbike, please",
+                       "нужна машина or bike"):
+            self.assertEqual(suggest.detectVehicleType(phrase), "mixed", phrase)
+
+        # --- ЛОВУШКИ ПОДСТРОКИ. Первые три — ДОСЛОВНО из живого корпуса (care ×3, card ×1,
+        # advance ×1; «advance» — это incoming боевой карточки id=228), четвёртая — рекламный
+        # прайс треда #0, где «auto» и «moto» сидят внутри URL через «_».
+        for phrase in ("he went to take care of some business.",
+                       "but we have his identification card documents.",
+                       "I would like to request an advance of 2,000 baht.",
+                       "3. t.me/auto_moto_thailand - 1 пост в день (30 постов)",
+                       # остальные — те же ловушки морфологией, названные владельцем
+                       "Please carry the scarf and put the cargo in the carrier",
+                       "a career in carbon cards and carpets",
+                       "Is the transmission automatic?",
+                       "automation is carried out carefully",
+                       "vanilla latte in advance",
+                       "Our biker will bring it"):
+            self.assertEqual(suggest.detectVehicleType(phrase), "unknown", phrase)
+
+        # --- «truck»/«vehicle» СОЗНАТЕЛЬНО вне словаря: живьём это машинный перевод тайского รถ
+        # применительно к нашим СКУТЕРАМ (truck ×2, vehicle ×8 — все про байки парка).
+        for phrase in ("Where does this Max N truck need to be delivered?",
+                       "Does the N-Max 4255 truck require a deposit?",
+                       "Does the X Max 5773 vehicle need to be replaced for the customer again?"):
+            self.assertNotIn(suggest.detectVehicleType(phrase), ("car", "mixed"), phrase)
+
     def test_enforce_vehicle_word_notes_and_never_rewrites(self):
         """28.07: слепая замена «байк»→«авто» снята. Текст клиента не трогаем — вешаем пометку.
 
@@ -315,6 +374,22 @@ class TestPureLogic(unittest.TestCase):
         # EN-тред получает EN-пометку
         en = suggest.enforce_vehicle_word("I recommend a байк NMAX.", "car", lang="en")
         self.assertTrue(en.endswith(suggest._VEHICLE_NOTE["en"]))
+
+        # 29.07.2026: НАСТОЯЩИЙ англоязычный черновик слова «байк» не содержит — он пишет
+        # «bike»/«scooter». До добавления EN-половины в _BIKE_NOUN_RE пометка _VEHICLE_NOTE["en"]
+        # не могла сработать НИ РАЗУ: конфликт искался только по кириллице.
+        for d in ("We have scooters and bikes available from 590 THB/day.",
+                  "I recommend the NMAX bike.", "A motorbike suits you better.",
+                  "This moped is free on your dates.", "Our motorcycles are all automatic."):
+            self.assertTrue(suggest.vehicle_mismatch(d, "car"), d)
+            out_en = suggest.enforce_vehicle_word(d, "car", lang="en")
+            self.assertTrue(out_en.startswith(d), "тело черновика — байт-в-байт")
+            self.assertTrue(out_en.endswith(suggest._VEHICLE_NOTE["en"]), d)
+        # и ложных срабатываний на EN-границах слова тоже быть не должно
+        for clean in ("Our biker will bring it.", "Please take care of the cargo.",
+                      "The transmission is automatic."):
+            self.assertFalse(suggest.vehicle_mismatch(clean, "car"), clean)
+            self.assertEqual(suggest.enforce_vehicle_word(clean, "car", lang="en"), clean, clean)
 
     def test_vehicle_note_never_reaches_client(self):
         """Пометка — служебный канал карточки: оба среза перед отправкой её убирают."""
