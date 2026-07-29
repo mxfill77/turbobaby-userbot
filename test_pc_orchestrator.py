@@ -6203,5 +6203,38 @@ class TestRevizorIpcChecks(unittest.TestCase):
         self.assertIn(str(self.CID), text)
 
 
+class TestSessionWatchWiring(unittest.TestCase):
+    """Детектор НЕМОТЫ сессий висит на тике демона (инцидент 29.07, PID 21216): демон —
+    «единственный надёжно выживающий процесс» и подхватывает новый код self-update'ом."""
+
+    def setUp(self):
+        o._session_watch_last_run = 0.0
+
+    def tearDown(self):
+        o._session_watch_last_run = 0.0
+
+    def test_throttled_to_its_own_interval(self):
+        calls = []
+        tick = lambda now=None: calls.append(now) or []
+        self.assertIsNotNone(o.maybe_session_watch(now=1000, ticker=tick))
+        self.assertIsNone(o.maybe_session_watch(now=1000 + o.SESSION_WATCH_SEC - 1, ticker=tick))
+        self.assertIsNotNone(o.maybe_session_watch(now=1000 + o.SESSION_WATCH_SEC + 1, ticker=tick))
+        self.assertEqual(len(calls), 2)
+
+    def test_findings_are_logged_loudly(self):
+        found = [{"pid": 21216, "session_id": "bc8c785c-4ecf-4290-8986-6104acbe5cf5", "age": 10380}]
+        got = o.maybe_session_watch(now=1000, ticker=lambda now=None: found)
+        self.assertEqual(got, found)
+
+    def test_detector_crash_does_not_break_the_daemon_tick(self):
+        """НЕ НАВРЕДИ: сорвавшийся надзор глотается — демон продолжает поллинг."""
+        def boom(now=None):
+            raise RuntimeError("сорвался")
+        self.assertIsNone(o.maybe_session_watch(now=1000, ticker=boom))
+
+    def test_interval_is_a_minute_scale(self):
+        self.assertLessEqual(o.SESSION_WATCH_SEC, 300)   # обнаружение немоты — минуты, не часы
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

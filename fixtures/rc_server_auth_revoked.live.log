@@ -1,0 +1,25 @@
+# ФИКСТУРА: хвост rc_server_debug.log при ПРОТУХШЕЙ авторизации (инцидент 28→29.07.2026).
+# Происхождение каждой части названо честно (правило-класс «мок обязан копировать живой формат»):
+#   • строки [bridge:session] Spawning … — сняты МНОЮ с живого rc_server_debug.log 29.07 (формат
+#     дословный, включая [DEBUG] и sdkUrl);
+#   • строки отказа/падения и блок StopWork — цитаты из docs/artifacts/
+#     2026-07-29-rc-token-staleness-prevention.md, снятые с живого лога 28→29.07. В цитатах
+#     артефакта часть значений усечена многоточием (`sessionId=…`, `cse_01VL18wK…`) — так и
+#     оставлено: детектор НАМЕРЕННО не зависит от того, что внутри многоточий (ищет куски по
+#     отдельности внутри строки), и обязан совпасть как на усечённой, так и на полной форме.
+#     Живой полной строки падения на ПК не осталось: сторож усекает лог при каждом подъёме ветки.
+# Время в логе — UTC.
+#
+# --- 1. РАЗОВЫЙ 401, ПЕРЕЖИТЫЙ РЕФРЕШЕМ: детектор обязан ПРОМОЛЧАТЬ (нет падения за секунды) ---
+2026-07-29T05:03:46.478Z [DEBUG] [bridge:api] StopWork: 401 received, attempting token refresh
+2026-07-29T05:03:46.489Z [DEBUG] [bridge:api] StopWork: Token refreshed, retrying request
+2026-07-29T05:03:47.362Z [DEBUG] [bridge:api] POST https://api.anthropic.com/v1/code/work/cse_01VL18wK.../stop -> 200
+#
+# --- 2. МУСОР, на котором голый греп по `401` даёт 78 % ложных (артефакт, п.4) ---
+2026-07-29T05:03:23.401Z [DEBUG] [auto-mode] context comparison: mainLoopTokens=[REDACTED] estimated_tokens=401
+#
+# --- 3. НАСТОЯЩИЙ ОТКАЗ: протухший токен + сессия убита за 2 с → рестарт ветки ---
+2026-07-29T05:03:43.393Z [DEBUG] [bridge:session] Spawning sessionId=[REDACTED] sdkUrl=https://api.anthropic.com/v1/code/sessions/cse_01VL18wKrkBWsKVwmifPHQ7c accessToken=[REDACTED]
+2026-07-29T05:03:43.827Z [DEBUG] [code-session] Get session_01VL18wKrkBWsKVwmifPHQ7c failed 401: OAuth access token has been revoked.
+2026-07-29T05:03:45.978Z [DEBUG] [bridge:session] sessionId=… failed exit_code=1 pid=11272
+2026-07-29T05:03:46.068Z [DEBUG] [bridge:session] … workId=cse_01VL18wK… exited status=failed duration=2s

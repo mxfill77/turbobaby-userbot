@@ -103,9 +103,18 @@ LIVENESS_STRIKES = int(os.getenv("RC_LIVENESS_STRIKES", "3") or "3")
 #   rc-server:     ['rc']                          → постоянный сервер-Environment (устройство)
 #   named-channel: ['--remote-control', <имя>]     → именованная интерактивная сессия
 SERVER_SPEC = {"label": "rc-server", "mode": ("rc",), "log": SERVER_LOG,
-               "max_age": SERVER_LIVENESS_MAX_AGE}
+               "max_age": SERVER_LIVENESS_MAX_AGE, "auth_watch": True}
 NAMED_SPEC = {"label": "named-channel", "mode": ("--remote-control", SESSION_NAME), "log": NAMED_LOG}
 BRANCHES = (SERVER_SPEC, NAMED_SPEC)
+
+# Детектор ПРОТУХШЕЙ авторизации (вариант «а» артефакта 2026-07-29-rc-token-staleness-prevention):
+# после ротации кредов сервер отдаёт НОВЫМ воркерам протухший токен — каждая новая сессия
+# владельца умирает за 2–3 с, а все пробы живости зелены. Лечение — рестарт ветки rc-server.
+# Импорт мягкий: детектор не смеет стать новой точкой отказа канала.
+try:
+    import rc_auth_detect
+except Exception:
+    rc_auth_detect = None
 
 log = logging.getLogger("rc_supervisor")
 log.setLevel(logging.INFO)
@@ -398,13 +407,17 @@ def default_gate(claude, ready=None, notifier=None, now=None):
 
 def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
                      sleeper=None, killer=None, rounds=None, checks=None, grace_checks=None,
-                     strikes_needed=None):
+                     strikes_needed=None, auth=None, notifier=None):
     """Вечный НЕЗАВИСИМЫЙ цикл ОДНОЙ ветки (свой поток): резолв шима → пре-флайт → подъём процесса
     → монитор → пауза → снова. Монитор рестартует по ДВУМ причинам: процесс ВЫШЕЛ сам (poll!=None)
     ЛИБО зомби — процесс жив, но канал мёртв по probe_alive _strikes_needed проверок ПОДРЯД (после
     грейс-периода, если проба не выключена RC_LIVENESS=0). Порог свежести — пер-branch (spec["max_age"]).
+    ТРЕТЬЯ причина, только у ветки с spec["auth_watch"] (rc-server): ПРОТУХШАЯ АВТОРИЗАЦИЯ —
+    новые сессии убиты дословным «token has been revoked» и падением за секунды (rc_auth_detect).
+    Грейс её НЕ касается: этот отказ виден с первой же убитой сессии, а ждать 3 минуты значит
+    подарить владельцу ещё один труп.
     rounds/checks/grace_checks/strikes_needed — ограничители/инъекции для тестов
-    (None = боевой бесконечный режим). → 0."""
+    (None = боевой бесконечный режим); auth/notifier — инъекция детектора кредов. → 0."""
     _resolve = resolver or resolve_claude
     _spawn = spawner or default_spawn
     _alive = alive or probe_alive
@@ -413,6 +426,9 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
     _kill = killer or default_kill
     _grace = max(1, GRACE_SECONDS // max(1, CHECK_INTERVAL)) if grace_checks is None else grace_checks
     _strikes_needed = LIVENESS_STRIKES if strikes_needed is None else strikes_needed
+    _auth = auth if auth is not None else rc_auth_detect
+    _notify = notifier or notify_owner
+    _auth_on = bool(spec.get("auth_watch") and _auth is not None and getattr(_auth, "ENABLED", True))
     n = 0
     while rounds is None or n < rounds:
         n += 1
@@ -436,6 +452,9 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
                  claude, " ".join(spec["mode"]))
         c = 0
         strikes = 0
+        # Состояние детектора кредов заводим НА ЖИЗНЬ ПРОЦЕССА: default_spawn только что усёк
+        # лог ветки, значит смещение 0 — честная точка отсчёта, старые улики не в счёт.
+        auth_state = _auth.new_state() if _auth_on else None
         while checks is None or c < checks:
             c += 1
             _sleep(CHECK_INTERVAL)
@@ -444,6 +463,24 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
                 log.info("[%s] процесс вышел (exit=%s) — рестарт через %s с",
                          spec["label"], code, RESTART_DELAY)
                 break
+            # Протухшая авторизация: сервер жив и здоров по всем пробам, но НОВЫЕ сессии убиты
+            # (дословная фраза + падение за секунды). Рестарт = новый сервер со свежими кредами.
+            if auth_state is not None:
+                try:
+                    auth_state = _auth.scan(spec["log"], auth_state)
+                    if _auth.should_restart(auth_state):
+                        log.info("[%s] %s — гашу pid=%s, рестарт",
+                                 spec["label"], _auth.describe(auth_state), getattr(proc, "pid", "?"))
+                        _notify("♻️ Канал Remote Control: " + _auth.describe(auth_state) +
+                                ". Сторож перезапустил rc-server — новые сессии поднимутся на "
+                                "свежих кредах. На телефоне может смениться Environment.")
+                        if proc.poll() is None:
+                            _kill(proc)
+                        break
+                except Exception as e:      # детектор не смеет уронить сторож
+                    log.warning("[%s] детектор кредов сорвался (%s)", spec["label"],
+                                type(e).__name__)
+                    auth_state = None
             # Зомби: процесс жив, но канал мёртв. Только ПОСЛЕ грейса и только если проба включена
             # (RC_LIVENESS=0 = запасной клапан, откат к «рестарт лишь по выходу процесса»). Гасим НЕ по
             # одному тику, а после _strikes_needed ПОДРЯД мёртвых проверок: мгновенная просадка соединений

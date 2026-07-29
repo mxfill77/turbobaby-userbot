@@ -101,6 +101,12 @@ except Exception as e:
 # форум недоступен (бота выкинуло из темы / форум лёг). Тот же чат HQ_CHAT_ID, другая тема.
 INBOX_THREAD_ID = int(os.getenv("HQ_INBOX_THREAD_ID", "1160"))
 
+# Тема ПОСТАНОВКИ ЗАДАЧ владельца (328) — туда же, куда владелец кладёт задания и куда смотрит
+# по ходу дня. Сигналы про САМИ ЗАДАНИЯ (например «немая сессия: задание не начало исполняться»,
+# session_watch.py) уместны рядом с заданием, а не в инбоксе аварий контура: владелец читает 328
+# в том же контексте, в каком ставил задачу. Маршрут — send_topic (тема → 1160 → личка).
+TASKS_THREAD_ID = int(os.getenv("HQ_TASKS_TOPIC", "328"))
+
 
 def _api(method, payload):
     """POST в Bot API. Возвращает (ok, body). Токен/URL НЕ логируем."""
@@ -180,6 +186,30 @@ def send_critical(text):
         return ("DM", True)
     _log.info(f"фолбэк личка не прошёл (code={resp2.get('error_code')} {str(resp2.get('description',''))[:80]})")
     return ("DM", False)
+
+
+def send_topic(text, thread_id=None):
+    """Сообщение в ЗАДАННУЮ тему HQ-форума (по умолчанию 328 — тема постановки задач владельца).
+    Каскад: тема → инбокс 1160 → личка. Возвращает (channel, ok).
+
+    ЗАЧЕМ отдельный маршрут, а не send_critical: 1160 — это тема АВАРИЙ КОНТУРА (смерть демона,
+    halt клиент-бота). Сигнал «задание не начало исполняться» — не авария контура, он про
+    конкретное задание владельца, и место ему рядом с заданием (328). Фолбэки оставлены оба,
+    чтобы сигнал не утонул, если бота выкинуло из темы постановки."""
+    tid = TASKS_THREAD_ID if thread_id is None else int(thread_id)
+    if not TOKEN:
+        _log.info("нет AGENT_BOT_TOKEN — уведомление в тему пропущено")
+        return ("none", False)
+    ok, resp = _api("sendMessage",
+                    {"chat_id": HQ_CHAT_ID, "message_thread_id": tid, "text": text})
+    if ok:
+        _log.info(f"в тему {tid} ok → {HQ_CHAT_ID}/{tid}")
+        return (f"topic:{tid}", True)
+    _log.info(
+        f"тема {tid} не прошла (code={resp.get('error_code')} "
+        f"{str(resp.get('description',''))[:80]}) — фолбэк инбокс/личка"
+    )
+    return send_critical(text)
 
 
 def _cowork(line, spawner=None):
@@ -478,6 +508,19 @@ def main():
             text = " ".join(args[1:]).strip() or "🔔 Оркестратор: критический инцидент"
             channel, ok = send_critical(text)
             _log.info(f"итог(критич): channel={channel} ok={ok} | {text[:90]}")
+            sys.exit(0)
+        if args and args[0] == "--topic":
+            # сигнал в тему постановки задач (328 по умолчанию): `--topic [id] <текст>`.
+            # Печатаем итог в stdout: вызывающий (session_watch) обязан знать, ДОШЛО ли, иначе
+            # он пометит сессию «уже сигналили» по несостоявшейся отправке и сигнал пропадёт.
+            rest = args[1:]
+            tid = None
+            if rest and rest[0].lstrip("-").isdigit():
+                tid, rest = int(rest[0]), rest[1:]
+            text = " ".join(rest).strip() or "🔔 Dispatch"
+            channel, ok = send_topic(text, tid)
+            _log.info(f"итог(тема): channel={channel} ok={ok} | {text[:90]}")
+            print(f"channel={channel} ok={int(bool(ok))}")
             sys.exit(0)
         if args and args[0] == "--card":
             # карточка управления цепью дирижёра: текст + кнопки [⏹ Стоп цепи][📊 Статус цепи]

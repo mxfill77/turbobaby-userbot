@@ -209,6 +209,32 @@ class _FakeProc:
         return self._poll
 
 
+class _Auth:
+    """Двойник детектора протухшей авторизации (rc_auth_detect). По умолчанию ИНЕРТЕН — иначе
+    прежние тесты ветки rc-server полезли бы читать БОЕВОЙ rc_server_debug.log и их вердикт
+    зависел бы от содержимого живого лога (класс «тест обязан быть детерминирован»).
+    fire_at=N → на N-й проверке объявляет «пора рестартовать»."""
+
+    ENABLED = True
+
+    def __init__(self, fire_at=None):
+        self.fire_at = fire_at
+        self.scans = 0
+
+    def new_state(self):
+        return {"failures": 0}
+
+    def scan(self, path, state):
+        self.scans += 1
+        return state
+
+    def should_restart(self, state):
+        return self.fire_at is not None and self.scans >= self.fire_at
+
+    def describe(self, state):
+        return "протухшая авторизация: 1 новых сессий подряд убито"
+
+
 class TestSuperviseBranch(unittest.TestCase):
     """Канал КАЖДОЙ ветки живёт ВСЕГДА и НЕЗАВИСИМО: рестарт по ВЫХОДУ процесса ЛИБО по зомби-пробе
     (процесс жив, но канал мёртв). Живой процесс НЕ рестартуется."""
@@ -234,6 +260,8 @@ class TestSuperviseBranch(unittest.TestCase):
             rounds=kw.pop("rounds", 1),
             checks=kw.pop("checks", 3),
             grace_checks=kw.pop("grace_checks", 0),
+            auth=kw.pop("auth", _Auth()),
+            notifier=kw.pop("notifier", lambda t: True),
         )
         return spawns, kills, slept
 
@@ -502,6 +530,7 @@ class TestChurnFixServerLiveness(unittest.TestCase):
             rounds=kw.pop("rounds", 1), checks=kw.pop("checks", 6),
             grace_checks=kw.pop("grace_checks", 0),
             strikes_needed=kw.pop("strikes_needed", 3),
+            auth=kw.pop("auth", _Auth()), notifier=lambda t: True,
         )
         return spawns, kills, slept
 
@@ -559,6 +588,67 @@ class TestChurnFixServerLiveness(unittest.TestCase):
         spawns, kills, _ = self._run(rc.NAMED_SPEC, alive=lambda sp, pid: False,
                                      rounds=1, checks=6, strikes_needed=3)
         self.assertEqual(len(kills), 1)                      # реальный зомби именованного — погашен
+
+
+class TestAuthStalenessWiring(unittest.TestCase):
+    """ВАРИАНТ «а» артефакта 2026-07-29-rc-token-staleness-prevention: сторож рестартует ветку
+    rc-server, когда авторизация протухла (новые сессии убиты). Здесь — ВШИВКА в supervise_branch;
+    сам разбор лога проверяет test_rc_auth_detect."""
+
+    SHIM = r"C:\Users\u\.local\bin\claude.exe"
+
+    def _run(self, spec, auth, **kw):
+        spawns, kills, cards = [], [], []
+
+        def spawner(claude, sp):
+            spawns.append(sp["label"])
+            return _FakeProc(poll_value=None)          # процесс ЖИВ по poll и по зомби-пробе
+
+        rc.supervise_branch(
+            spec, resolver=lambda: self.SHIM, spawner=spawner,
+            alive=lambda sp, pid: True, gate=lambda c: (True, "ok"),
+            sleeper=lambda s: None, killer=kills.append,
+            rounds=kw.pop("rounds", 1), checks=kw.pop("checks", 4),
+            grace_checks=kw.pop("grace_checks", 0),
+            auth=auth, notifier=cards.append,
+        )
+        return spawns, kills, cards
+
+    def test_server_restarted_when_auth_stale(self):
+        """Все пробы живости ЗЕЛЕНЫ (процесс жив, канал жив) — и всё равно рестарт: именно это
+        отличает отказ авторизации от всего, что сторож умел ловить раньше."""
+        spawns, kills, cards = self._run(rc.SERVER_SPEC, _Auth(fire_at=2), rounds=1, checks=4)
+        self.assertEqual(len(kills), 1)                # погашен, несмотря на живой канал
+        self.assertEqual(len(spawns), 1)
+        self.assertEqual(len(cards), 1)                # владелец предупреждён о смене Environment
+        self.assertIn("Remote Control", cards[0])
+
+    def test_healthy_auth_never_restarts(self):
+        """Детектор молчит → поведение сторожа байт-в-байт прежнее: ни гашения, ни карточки."""
+        spawns, kills, cards = self._run(rc.SERVER_SPEC, _Auth(fire_at=None), rounds=1, checks=4)
+        self.assertEqual((kills, cards), ([], []))
+        self.assertEqual(len(spawns), 1)
+
+    def test_named_channel_has_no_auth_watch(self):
+        """Детектор — только у серверной ветки: именованный канал новые сессии не порождает,
+        и трогать его по чужой улике нельзя."""
+        auth = _Auth(fire_at=1)
+        spawns, kills, cards = self._run(rc.NAMED_SPEC, auth, rounds=1, checks=4)
+        self.assertEqual(auth.scans, 0, "у named-channel детектор не должен даже опрашиваться")
+        self.assertEqual((kills, cards), ([], []))
+
+    def test_spec_flags(self):
+        self.assertTrue(rc.SERVER_SPEC.get("auth_watch"))
+        self.assertFalse(rc.NAMED_SPEC.get("auth_watch"))
+
+    def test_detector_crash_does_not_kill_supervisor(self):
+        """НЕ НАВРЕДИ: сорвавшийся детектор гасит СЕБЯ, а не канал владельца."""
+        class Boom(_Auth):
+            def scan(self, path, state):
+                raise RuntimeError("сорвался")
+        spawns, kills, cards = self._run(rc.SERVER_SPEC, Boom(), rounds=1, checks=3)
+        self.assertEqual((kills, cards), ([], []))
+        self.assertEqual(len(spawns), 1)
 
 
 if __name__ == "__main__":

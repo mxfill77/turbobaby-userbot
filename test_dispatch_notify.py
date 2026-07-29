@@ -65,6 +65,58 @@ class TestSendCritical(unittest.TestCase):
         self.assertEqual(self.calls, [])                # без токена — ни одного вызова API
 
 
+class TestSendTopic(unittest.TestCase):
+    """send_topic: сигнал про ЗАДАНИЕ едет в тему постановки 328 — рядом с самим заданием, а не
+    в инбокс аварий контура 1160. Фолбэки (инбокс → личка) на месте, чтобы сигнал не утонул."""
+
+    def setUp(self):
+        self._save = (dn._api, dn.TOKEN)
+        self.calls = []
+        dn.TOKEN = "test-token"
+
+    def tearDown(self):
+        (dn._api, dn.TOKEN) = self._save
+
+    def test_goes_to_tasks_topic_328_first(self):
+        def api(method, payload):
+            self.calls.append(payload)
+            return True, {"ok": True}
+        dn._api = api
+        channel, ok = dn.send_topic("🔇 НЕМАЯ сессия")
+        self.assertEqual((channel, ok), ("topic:328", True))
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0]["chat_id"], dn.HQ_CHAT_ID)
+        self.assertEqual(self.calls[0]["message_thread_id"], dn.TASKS_THREAD_ID)
+
+    def test_topic_is_328(self):
+        self.assertEqual(dn.TASKS_THREAD_ID, 328)
+        self.assertNotEqual(dn.TASKS_THREAD_ID, dn.INBOX_THREAD_ID)
+
+    def test_falls_back_to_inbox_then_dm(self):
+        """Бота выкинуло из темы постановки → сигнал НЕ теряется: инбокс, затем личка."""
+        def api(method, payload):
+            self.calls.append(payload)
+            ok = "message_thread_id" not in payload      # обе темы падают, личка проходит
+            return ok, {"ok": ok, "error_code": 400, "description": "thread not found"}
+        dn._api = api
+        channel, ok = dn.send_topic("🔇 НЕМАЯ сессия")
+        self.assertEqual((channel, ok), ("DM", True))
+        self.assertEqual([c.get("message_thread_id") for c in self.calls],
+                         [dn.TASKS_THREAD_ID, dn.INBOX_THREAD_ID, None])
+
+    def test_explicit_thread_id_wins(self):
+        dn._api = lambda m, p: (self.calls.append(p), (True, {"ok": True}))[1]
+        channel, ok = dn.send_topic("текст", 829)
+        self.assertEqual(channel, "topic:829")
+        self.assertEqual(self.calls[0]["message_thread_id"], 829)
+
+    def test_no_token_skips(self):
+        dn.TOKEN = ""
+        dn._api = lambda *a, **k: self.calls.append(a) or (True, {})
+        self.assertEqual(dn.send_topic("текст"), ("none", False))
+        self.assertEqual(self.calls, [])
+
+
 class TestChainCard(unittest.TestCase):
     """Карточка управления цепью: send() прокидывает reply_markup, _chain_markup даёт две кнопки
     с callback_data «chain:stop|status:<pid>» (их слушает pc_agent)."""

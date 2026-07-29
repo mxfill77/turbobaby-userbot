@@ -4079,6 +4079,48 @@ def maybe_client_watchdog(now=None):
     return out
 
 
+# ---------------- ДЕТЕКТОР НЕМОТЫ СЕССИЙ (session_watch, инцидент 29.07) ----------------
+# Немая сессия — это «процесс жив, а работы нет»: транскрипт .jsonl не создан и ни одного
+# tool_use. Живой случай: RC-сессия PID 21216 за 2 ч 53 мин выдала 529 heartbeat, 0 запросов к
+# модели и 0 транскрипта — владелец узнал через два часа и только потому, что спросил. Ни
+# контур-вотчдог (он спрашивает «процесс жив?»), ни ливнесс одиночек (он судит по статусу задачи
+# в Bridge), ни сторож RC (у него лог свеж — heartbeat же пишется) такую сессию не видят.
+# Хозяин детектора — ЭТОТ тик: демон и так «единственный надёжно выживающий процесс» (см.
+# CLIENT_WATCH_SEC) и подхватывает новый код self-update'ом, без ручного рестарта чего-либо.
+# Разбор и пороги — session_watch.py + docs/artifacts/2026-07-29-mute-session-21216-evidence.md.
+SESSION_WATCH_SEC = int(os.getenv("PC_SESSION_WATCH_SEC", "60") or "60")
+_session_watch_last_run = 0.0
+
+
+def maybe_session_watch(now=None, ticker=None):
+    """Троттлинг детектора немоты: тело прогоняем не чаще SESSION_WATCH_SEC.
+    → список отсигналенных находок | None (None = ещё рано / детектор недоступен).
+    НЕ НАВРЕДИ: любой срыв детектора глотаем — надзор не смеет уронить демона."""
+    global _session_watch_last_run
+    now = time.time() if now is None else now
+    if now - _session_watch_last_run < SESSION_WATCH_SEC:
+        return None
+    _session_watch_last_run = now
+    fn = ticker
+    if fn is None:
+        try:
+            import session_watch
+            fn = session_watch.tick
+        except Exception as e:
+            log.warning("детектор немоты недоступен (%s)", type(e).__name__)
+            return None
+    try:
+        sent = fn(now=now)
+    except Exception as e:
+        log.warning("детектор немоты сорвался (%s) — тик пропущен", type(e).__name__)
+        return None
+    for f in sent or []:
+        log.error("НЕМАЯ сессия: pid=%s sid=%s прожила %sс без транскрипта и tool_use — "
+                  "карточка владельцу ушла", f.get("pid"), str(f.get("session_id"))[:8],
+                  int(f.get("age") or 0))
+    return sent
+
+
 def _woke_from_sleep(now, prev, poll=None, margin=None):
     """(2) Детект пробуждения ПК: между соседними итерациями главного цикла wall-clock скакнул
     много больше интервала поллинга (ПК спал в S3/гибернации — состояния доступны, см. powercfg /a).
@@ -5063,6 +5105,7 @@ def _main_loop():
             _loop_prev_wall = now
             poll_once()
             maybe_client_watchdog()   # часть 3: следим за pc_agent/userbot/moderation_bot (троттлинг 5 мин)
+            maybe_session_watch()     # инцидент 29.07: немая сессия (жива, но не работает) → карточка в 328
             maybe_revizor()           # шаг 2/7 (262): ревизор диалогов за DIALOG_REVIZOR (троттлинг REVIZOR_HOURS)
             maybe_lesson_commit_retry()  # пакет «полнота лога» п.6: докоммитить урок из спула (провал коммита ≠ вечная грязь)
             maybe_git_ff_pull()       # родитель #221: подтянуть origin/main ff-only ДО реконсиляции/self-update (тот же тик применит)
