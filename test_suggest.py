@@ -737,6 +737,55 @@ class TestPureLogic(unittest.TestCase):
             suggest.strip_greeting_for_window(draft, history),
             "Подберём для вас байк по актуальному прайсу…")
 
+    def test_has_greeting_in_window(self):
+        # hasGreetingInWindow(msgs) — окно как СПИСОК сообщений (m.out = исходящее/наше). ПОЗИТИВЫ:
+        class M:                       # минимальный дубль Telethon-сообщения (out + message)
+            def __init__(self, out, message):
+                self.out, self.message = out, message
+        #  • наше слово-приветствие в начале нашего сообщения
+        self.assertTrue(suggest.hasGreetingInWindow([
+            M(True, "Здравствуйте! Что арендуете?"), M(False, "NMAX")]))
+        self.assertTrue(suggest.hasGreetingInWindow([M(True, "Добрый день, какие модели?")]))
+        self.assertTrue(suggest.hasGreetingInWindow([M(True, "Привет, я на связи")]))
+        #  • автоприветствие Telegram Business (обе поколения владельца, ё→е, пунктуация-агностично)
+        self.assertTrue(suggest.hasGreetingInWindow([
+            M(True, "Спасибо, что выбрали нас! Мы в БангТао и Камале."), M(False, "NMAX есть?")]))
+        self.assertTrue(suggest.hasGreetingInWindow([M(True, "Уже смотрю ваше сообщение 🙏")]))
+        # НЕГАТИВЫ:
+        #  • приветствие у КЛИЕНТА (out=False) нашим не считается
+        self.assertFalse(suggest.hasGreetingInWindow([
+            M(False, "Здравствуйте!"), M(False, "Спасибо, что выбрали нас — шучу 😄")]))
+        #  • наши сообщения без приветствия
+        self.assertFalse(suggest.hasGreetingInWindow([
+            M(True, "NMAX стоит 449฿/день"), M(True, "Какие даты вас интересуют?")]))
+        #  • пустое окно / None-safe
+        self.assertFalse(suggest.hasGreetingInWindow([]))
+        self.assertFalse(suggest.hasGreetingInWindow(None))
+
+    def test_strip_leading_greeting(self):
+        # stripLeadingGreeting(text) — срез зачина ВКЛЮЧАЯ обращение по имени «Имя, здравствуйте!».
+        self.assertEqual(suggest.stripLeadingGreeting("Имя, здравствуйте! Аренда 500฿/день"),
+                         "Аренда 500฿/день")
+        self.assertEqual(suggest.stripLeadingGreeting("Анна, добрый день, какие модели?"),
+                         "Какие модели?")
+        self.assertEqual(suggest.stripLeadingGreeting("Иван, привет! NMAX свободен"),
+                         "NMAX свободен")
+        # имя строчными + следом зачин — тоже срезаем, остаток капитализируем
+        self.assertEqual(suggest.stripLeadingGreeting("макс, здравствуйте, есть ADV 350?"),
+                         "Есть ADV 350?")
+        # НЕТ имени → ведёт себя как strip_greeting (совместимость)
+        self.assertEqual(suggest.stripLeadingGreeting("Здравствуйте! NMAX свободен"),
+                         "NMAX свободен")
+        self.assertEqual(suggest.stripLeadingGreeting("Добрый день, какие есть модели?"),
+                         "Какие есть модели?")
+        # обращение по имени БЕЗ зачина — НЕ трогаем (это не приветствие)
+        self.assertEqual(suggest.stripLeadingGreeting("Иван, что по цене?"),
+                         "Иван, что по цене?")
+        # нет ни имени, ни зачина → как есть; пустой/None-safe
+        self.assertEqual(suggest.stripLeadingGreeting("Хонда Клик 125 доступна"),
+                         "Хонда Клик 125 доступна")
+        self.assertEqual(suggest.stripLeadingGreeting(""), "")
+
     def test_strip_internal_markers(self):
         # Шаг 3/5 родитель #55: чистая stripInternalMarkers режет строки с внутренними
         # служебными маркерами и оставляет полезный текст. По кейсу на каждый из 4 паттернов.
