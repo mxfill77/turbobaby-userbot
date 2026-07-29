@@ -4935,14 +4935,149 @@ def _pc_wl_price_numbers(pricing_note: str):
 # Терпима к форматам «2 245 ฿», «449฿/день», «3000», «депозит 3000 бат», «1685 THB», «337 THB/day».
 # Каждый фиг несёт has_cur — был ли валютный токен рядом с числом (пост-чек клеймит total/deposit
 # только с валютой, отсекая счётчики вроде «на 5 дней для 2 гостей»).
-_MF_CUR = r"(?:฿|бат\w*|baht\w*|thb)"
+# --- ВАЛЮТЫ И РОЛИ ДЕНЕГ — ВНЕШНИЙ КОНФИГ (money_currencies.json) -----------------------------
+# Родитель: живой случай 07.07 (карточки 204/205, окно @marcoit41) — «222 USDT — депозит», а через
+# МИНУТУ «Депозит за байк — 289 USDT». Денежный пост-чек этого НЕ увидел: _MF_CUR знал ТОЛЬКО
+# батовые токены (฿|бат|baht|thb), поэтому у «222 USDT» has_cur=False, а _pc_classify такие фиги
+# пропускает («if not fig.get("has_cur"): continue») — суммы в USDT/USD/EUR/рублях уходили клиенту
+# НАСКВОЗЬ, мимо всей денежной страховки. Разведка корпуса 29.07: usdt звучит в 19 черновиках и в
+# 31 реплике тредов, доллары/рубли/крипта — ещё в 35 тредах.
+# Список валют и РОЛЕВЫХ слов (депозит/доставка/аренда/допы/итого) вынесен в money_currencies.json:
+# ДОПОЛНЯЕТСЯ БЕЗ ИЗМЕНЕНИЯ ЛОГИКИ (как team_registry.json). FAIL-SAFE здесь ИНОЙ, чем у реестра
+# команды: нет файла/битый/не-словарь → работает ВСТРОЕННЫЙ минимум ниже (пустой набор обнулил бы и
+# батовую ветку — регресс хуже отсутствия фичи). Записи файла МЕРЖАТСЯ поверх минимума.
+MONEY_CONFIG_FILE = os.path.join(BASE_DIR, "money_currencies.json")
+
+_MONEY_CUR_FALLBACK = [
+    {"code": "THB",  "label": "฿",    "label_en": "THB",  "tokens": ["฿", "бат", "baht", "thb"]},
+    {"code": "USDT", "label": "USDT", "label_en": "USDT", "tokens": ["usdt", "tether"]},
+    {"code": "USD",  "label": "$",    "label_en": "$",    "tokens": ["$", "usd", "доллар", "dollar"]},
+    {"code": "EUR",  "label": "€",    "label_en": "€",    "tokens": ["€", "eur", "евро"]},
+    {"code": "RUB",  "label": "₽",    "label_en": "RUB",  "tokens": ["₽", "rub", "руб", "рубл"]},
+]
+# Порядок ролей = ПРИОРИТЕТ при нескольких ролевых словах в одной клаузе: «Итого к оплате сейчас за
+# депозит: 289 USDT» — это ДЕПОЗИТ, а не итог.
+_MONEY_ROLE_FALLBACK = [
+    {"key": "deposit",  "label": "депозит",  "label_en": "deposit",  "tokens": ["депозит", "залог", "deposit"]},
+    {"key": "delivery", "label": "доставка", "label_en": "delivery", "tokens": ["доставк", "подвез", "delivery"]},
+    {"key": "rent",     "label": "аренда",   "label_en": "rental",   "tokens": ["аренд", "прокат", "стоимост", "rental", "rent"]},
+    {"key": "extra",    "label": "допы",     "label_en": "extras",   "tokens": ["кофр", "шлем", "helmet", "top box"]},
+    {"key": "total",    "label": "итого",    "label_en": "total",    "tokens": ["итого", "всего", "к оплате", "total"]},
+]
+
+
+def _money_token_pat(tok):
+    """Токен конфига → кусок регекса. Латиница — ТОЧНОЕ слово (\\busd\\b не ловится внутри «usdt»);
+    кириллица — основа + окончание («бат» → баты/батов/батами); символ (฿ $ € ₽) — как есть."""
+    t = str(tok or "").strip()
+    if not t:
+        return None
+    esc = re.escape(t)
+    if t[0].isalpha():
+        return r"\b" + esc + (r"\b" if t.isascii() else r"\w*")
+    return esc
+
+
+def _money_merge(base, extra, key):
+    """Записи файла поверх встроенного минимума: совпал code/key — токены ДОПОЛНЯЮТ встроенные
+    (порядок сохраняем), новый code/key — добавляется целиком в конец. Мусор игнорируем молча."""
+    out = [dict(e, tokens=list(e["tokens"])) for e in base]
+    idx = {e[key]: e for e in out}
+    for e in (extra or []):
+        if not isinstance(e, dict):
+            continue
+        k = str(e.get(key) or "").strip()
+        if not k:
+            continue
+        cur = idx.get(k)
+        if cur is None:
+            cur = {key: k, "label": str(e.get("label") or k),
+                   "label_en": str(e.get("label_en") or e.get("label") or k), "tokens": []}
+            out.append(cur)
+            idx[k] = cur
+        else:
+            if e.get("label"):
+                cur["label"] = str(e["label"])
+            if e.get("label_en"):
+                cur["label_en"] = str(e["label_en"])
+        for t in (e.get("tokens") or []):
+            t = str(t).strip()
+            if t and t not in cur["tokens"]:
+                cur["tokens"].append(t)
+    return out
+
+
+def _load_money_config(path=None):
+    """Валюты/роли денежного пост-чека: встроенный минимум + money_currencies.json поверх него.
+    FAIL-SAFE: нет файла/битый/не-словарь → ровно встроенный минимум (детект НЕ обнуляется)."""
+    path = path or MONEY_CONFIG_FILE
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    curs = _money_merge(_MONEY_CUR_FALLBACK, data.get("currencies"), "code")
+    roles = _money_merge(_MONEY_ROLE_FALLBACK, data.get("roles"), "key")
+    for e in curs + roles:
+        pats = [p for p in (_money_token_pat(t) for t in e["tokens"]) if p]
+        e["alt"] = "|".join(pats)
+        e["re"] = re.compile("(?:" + e["alt"] + ")", re.I) if pats else re.compile(r"(?!x)x")
+    return {"currencies": curs, "roles": roles,
+            "cur_alt": "|".join(e["alt"] for e in curs if e["alt"]) or "฿"}
+
+
+MONEY_CONFIG = _load_money_config()
 _MF_NUM = r"\d[\d\s .,]*\d|\d"
-_MF_SCAN_RE = re.compile(r"(?<![\d.,])(" + _MF_NUM + r")\s*(" + _MF_CUR + r")?", re.I)
-# ставка «/день»: между числом и «день» ОБЯЗАТЕЛЕН коннектор (/ | в | за | per | a) — иначе
-# «5 дней» (счётчик срока) ложно попал бы в суточную ставку.
-_MF_RATE_TAIL = re.compile(
-    r"^\s*(?:/\s*|за\s+|в\s+|per\s+|a\s+)(?:฿|бат\w*|baht\w*|thb)?\s*(?:день|дн\w*|сут\w*|day)\b",
-    re.I)
+
+
+def _build_money_regexes():
+    """Пересобрать регексы разбора денег из MONEY_CONFIG (на импорте и при горячей замене конфига).
+    Валютная альтернация — единственное, что тут меняется от конфига; форма чисел и коннекторы
+    ставки остались прежними (батовая ветка обязана вести себя байт-в-байт)."""
+    global _MF_CUR, _MF_SCAN_RE, _MF_RATE_TAIL, _MONEY_ANY_CUR_RE, _MONEY_CUR_PREFIX_RE
+    _MF_CUR = "(?:" + MONEY_CONFIG["cur_alt"] + ")"
+    _MF_SCAN_RE = re.compile(r"(?<![\d.,])(" + _MF_NUM + r")\s*(" + _MF_CUR + r")?", re.I)
+    # ставка «/день»: между числом и «день» ОБЯЗАТЕЛЕН коннектор (/ | в | за | per | a) — иначе
+    # «5 дней» (счётчик срока) ложно попал бы в суточную ставку.
+    _MF_RATE_TAIL = re.compile(
+        r"^\s*(?:/\s*|за\s+|в\s+|per\s+|a\s+)" + _MF_CUR + r"?\s*(?:день|дн\w*|сут\w*|day)\b", re.I)
+    _MONEY_ANY_CUR_RE = re.compile(_MF_CUR, re.I)
+    # валюта ВПЛОТНУЮ ПЕРЕД числом («$100», «€50», «฿590») — суффиксный скан её не видит.
+    _MONEY_CUR_PREFIX_RE = re.compile("(" + _MF_CUR + r")\s*$", re.I)
+
+
+_build_money_regexes()
+
+
+def reload_money_config(path=None):
+    """Перечитать money_currencies.json (горячая замена/тесты) и пересобрать регексы. → MONEY_CONFIG."""
+    global MONEY_CONFIG
+    MONEY_CONFIG = _load_money_config(path)
+    _build_money_regexes()
+    return MONEY_CONFIG
+
+
+def _money_cur_code(tok):
+    """Валютный токен («USDT», «батов», «฿») → код валюты из конфига или None."""
+    t = str(tok or "").strip()
+    if not t:
+        return None
+    for c in MONEY_CONFIG["currencies"]:
+        if c["re"].fullmatch(t):
+            return c["code"]
+    return None
+
+
+def _money_cur_label(code, en=False):
+    """Код валюты → ярлык для пометки модератору («THB» → «฿», «USDT» → «USDT»). Нет кода → ''."""
+    for c in MONEY_CONFIG["currencies"]:
+        if c["code"] == code:
+            return c["label_en"] if en else c["label"]
+    return ""
+
+
 # Период-фраза «N дней/недель/месяцев». Предлог за/на/for/в — НЕОБЯЗАТЕЛЕН: живые итоги-за-срок
 # пишут по-разному — «за 5 дней», «на 5 дней», «— 5 дней», «for 5 days», «5 дней:». Узкое «за»
 # пропускало живой провал окна 504608015 «на 5 дней — 2 245 ฿». Падежи покрыты дн\w*/недел\w*/мес\w*.
@@ -4960,18 +5095,22 @@ _MF_UNIT_HEAD = re.compile(
 
 
 def extract_money_figures(text: str):
-    """Денежные числа из текста ответа → список dict(kind, value, raw) в порядке появления.
-    kind ∈ {'rate','deposit','total','amount'}. Модельные числа (NMAX 155) и счётчики срока
-    (5 дней) деньгами НЕ считаются. value — int (пробелы/разделители тысяч сняты)."""
+    """Денежные числа из текста ответа → список dict(kind, value, raw, has_cur, cur, pos) в порядке
+    появления. kind ∈ {'rate','deposit','total','amount'}; cur — КОД валюты из money_currencies.json
+    (THB/USDT/USD/EUR/RUB/…) или None, если валютного токена рядом не было. Модельные числа
+    (NMAX 155) и счётчики срока (5 дней) деньгами НЕ считаются. value — int (пробелы/разделители
+    тысяч сняты). Валюта считается «рядом» и СУФФИКСОМ («289 USDT»), и ПРЕФИКСОМ («$100», «฿590»)."""
     s = text or ""
     out = []
     for m in _MF_SCAN_RE.finditer(s):
         value = _pc_num(m.group(1))
         if value is None:
             continue
-        has_cur = bool(m.group(2))
         before = s[max(0, m.start(1) - 28):m.start(1)]
         after = s[m.end():m.end() + 18]
+        pre = _MONEY_CUR_PREFIX_RE.search(before)          # «$100» / «฿590» — валюта перед числом
+        cur = _money_cur_code(m.group(2)) or (_money_cur_code(pre.group(1)) if pre else None)
+        has_cur = bool(m.group(2)) or bool(pre)
         is_rate = bool(_MF_RATE_TAIL.search(after))
         near = before.lower() + " " + after.lower()
         is_deposit = bool(_MF_DEPOSIT.search(near))
@@ -4992,7 +5131,8 @@ def extract_money_figures(text: str):
             kind = "total"
         else:
             kind = "amount"
-        out.append({"kind": kind, "value": value, "raw": m.group(0).strip(), "has_cur": has_cur})
+        out.append({"kind": kind, "value": value, "raw": m.group(0).strip(), "has_cur": has_cur,
+                    "cur": cur, "pos": m.start(1), "end": m.end()})
     return out
 
 
@@ -5058,7 +5198,12 @@ def _pc_classify(seg: str, allowed, call_llm=None, transcript=None):
     # обязателен (has_cur) — как в прежнем _PC_PRICE_TOTAL_RE: отсекает счётчики («на 5 дней для 2
     # гостей»). Депозит сверяем ТОЛЬКО при непустом белом источнике (есть live-quote), как прежде.
     for fig in extract_money_figures(seg):
-        if not fig.get("has_cur"):
+        # ПЕРЕПИСЫВАНИЕ сегмента в «уточню» оставлено на БАТОВОЙ ветке — ровно там, где оно
+        # отлажено голденами и живыми провалами. Валюты сверх бата (USDT/USD/EUR/руб) закрывает
+        # НОВЫЙ денежный пост-чек postcheck_money — ПОМЕТКОЙ модератору, без правки клиентского
+        # текста (курс 28.07: «пометка менеджеру вместо слепой замены»; деструктивную ветку на
+        # новые валюты не тянем — цена ложного переписывания выше цены лишней пометки).
+        if not fig.get("has_cur") or fig.get("cur") != "THB":
             continue
         if fig["kind"] == "total" and fig["value"] not in allowed:
             found.append(("price", str(fig["value"])))
@@ -5122,6 +5267,258 @@ def postcheck_draft(draft: str, lang: str = "ru", pricing_note: str = "",
     body = "".join(s + p for s, p in out).strip()
     note = _pc_manager_note(issues, en)
     return (body + "\n" + note) if note else body
+
+
+# --- ДЕНЕЖНЫЙ ПОСТ-ЧЕК: ОДНА СУММА ЗА ОДНО И ТО ЖЕ, И НИ ОДНОГО ЧИСЛА ИЗ ГОЛОВЫ ----------------
+# Родитель — живой случай 07.07 в окне @marcoit41 (карточки 204/205, разбор корпуса
+# docs/artifacts/2026-07-29-draft-audit.md, класс 1): за ОДНУ МИНУТУ клиенту ушло «222 USDT —
+# депозит, 289 USDT — аренда», а следом «Депозит за байк — 289 USDT». Ни один прежний чек этого не
+# ловил: батовый _MF_CUR не видел USDT вовсе, а сверки «одна роль — одна сумма» не было НИ ОДНОЙ.
+#
+# Чек делает ДВЕ вещи и НИЧЕГО не переписывает — черновик уходит модератору С ПОМЕТКОЙ:
+#   1) ПРОТИВОРЕЧИЕ: одна и та же РОЛЬ суммы (депозит/доставка/аренда — не путая разные позиции)
+#      с РАЗНЫМИ числами в одной валюте — внутри черновика и/или против того, что менеджер уже
+#      назвал в ЭТОМ окне. Пометка называет ОБЕ суммы: «⚠️ противоречие: депозит 222 USDT и 289 USDT».
+#   2) СУММА НЕ ИЗ ИСТОЧНИКОВ: числа, которых нет НИ в расчёте/прайсе (pricing_note), НИ в репликах
+#      треда (клиент + менеджер). Бот не называет чисел из головы — расширение «сочинённой цены»
+#      (прежде только батовый итог-за-период) на ВСЕ валюты и роли.
+# FAIL-SAFE: нечего сказать → черновик возвращается БАЙТ-В-БАЙТ (тот же объект).
+
+# Клауза — кусок предложения между разделителями позиций. ТИРЕ разделителем НЕ считаем: «222 USDT —
+# депозит» обязано остаться ОДНОЙ клаузой, иначе число потеряет свою роль. «⏎» — так транскрипт
+# хранит перевод строки.
+_MONEY_CLAUSE_SPLIT_RE = re.compile(r"[,;.!?\n\r…⏎()|«»\"]+")
+_MONEY_LINE_SPLIT_RE = re.compile(r"[\n\r⏎]+")
+# Срок как КВАЛИФИКАТОР позиции: «7 дней» и «14 дней» — РАЗНЫЕ позиции, их суммы сравнивать нельзя.
+_MONEY_PERIOD_RE = re.compile(
+    r"(\d{1,3})\s*(?:дн\w*|день|сут\w*|недел\w*|нед\b|мес\w*|days?|weeks?|months?)", re.I)
+# Роли, по которым СРАВНИВАЕМ суммы. «итого»/«допы» намеренно вне сверки: итог законно меняется от
+# состава (аренда+депозит+доставка), а допы — это разные позиции с одним словом.
+_MONEY_ROLES_CHECKED = ("deposit", "delivery", "rent")
+# Насколько далеко ищем валюту для числа, при котором её не написали («+222 депозит» после строки
+# «289 usdt» — это USDT). Назад окно шире: валюту называют РАНЬШЕ суммы.
+_MONEY_CUR_BACK, _MONEY_CUR_FWD = 300, 120
+# Насколько близко к БЕЗВАЛЮТНОМУ числу обязано стоять ролевое слово, чтобы число считалось этой
+# суммой, и ниже какой суммы безвалютное число ценой не считаем (шлемы/даты/проценты).
+_MONEY_ROLE_NEAR, _MONEY_BARE_MIN = 10, 100
+# Как далеко ВВЕРХ ищем модель-квалификатор, если в своей строке её нет (заголовок блока прайса).
+_MONEY_MODEL_BACK = 300
+
+
+def _money_clause_at(s: str, pos: int):
+    """(клауза, её смещение в тексте) — кусок между разделителями позиций, внутри которого стоит
+    символ pos. Плюс примыкающий БЕСЦИФРОВОЙ короткий хвост: «6406 (аренда) + 7000 (депозит)» —
+    роль стоит в СЛЕДУЮЩЕЙ клаузе, но относится к этому числу. Хвост с цифрами не берём — это уже
+    соседняя позиция."""
+    left = 0
+    for m in _MONEY_CLAUSE_SPLIT_RE.finditer(s, 0, pos):
+        left = m.end()
+    m = _MONEY_CLAUSE_SPLIT_RE.search(s, pos)
+    clause = s[left:(m.start() if m else len(s))]
+    if m:
+        m2 = _MONEY_CLAUSE_SPLIT_RE.search(s, m.end())
+        nxt = s[m.end():(m2.start() if m2 else len(s))]
+        if nxt.strip() and len(nxt) <= 20 and not any(ch.isdigit() for ch in nxt):
+            clause += " " + nxt
+    return clause, left
+
+
+def _money_line_at(s: str, pos: int) -> str:
+    """Строка текста, внутри которой стоит символ pos (модель-квалификатор ищем по строке: в
+    строке-ряду сетки «NMAX 155CC | дней: 7, стоимость: 3 099 бат» модель стоит ДО клаузы суммы)."""
+    left = 0
+    for m in _MONEY_LINE_SPLIT_RE.finditer(s, 0, pos):
+        left = m.end()
+    m = _MONEY_LINE_SPLIT_RE.search(s, pos)
+    return s[left:(m.start() if m else len(s))]
+
+
+def _money_models_at(s: str, pos: int):
+    """Модель-КВАЛИФИКАТОР суммы: из своей строки, иначе из БЛИЖАЙШЕЙ строки ВЫШЕ. Карточка прайса
+    печатает модель заголовком блока («NMAX 155» ⏎ «• Депозит: 3000 ฿»), поэтому по одной строке
+    модель не видна — и депозиты РАЗНЫХ моделей ложно слипались в одно «противоречие» (живой
+    ложняк корпуса 29.07: 8 карточек прайс-листа из 22)."""
+    got = _detect_models(_money_line_at(s, pos).lower())
+    if got:
+        return tuple(got)
+    head = s[max(0, pos - _MONEY_MODEL_BACK):pos]
+    for ln in reversed(_MONEY_LINE_SPLIT_RE.split(head)[:-1]):
+        got = _detect_models(ln.lower())
+        if got:
+            return tuple(got)
+    return ()
+
+
+def _money_role_at(text: str, at: int, at_end: int):
+    """(роль, расстояние в символах) для числа [at, at_end) внутри клаузы: берём БЛИЖАЙШЕЕ ролевое
+    слово, при равном расстоянии — по порядку ролей в конфиге. Живой ложняк 29.07 (карточка 311):
+    «доставка 290 бат + депозит 7 000 бат» при фиксированном приоритете делала ДОСТАВКУ депозитом и
+    рождала пустое «противоречие: депозит 290 и 7000». Ролевого слова нет → (None, None)."""
+    s = text or ""
+    best, best_d, best_i = None, None, None
+    for i, r in enumerate(MONEY_CONFIG["roles"]):
+        for m in r["re"].finditer(s):
+            d = (at - m.end()) if m.end() <= at else (m.start() - at_end)
+            d = max(d, 0)
+            if best_d is None or d < best_d or (d == best_d and i < best_i):
+                best, best_d, best_i = r["key"], d, i
+    return best, best_d
+
+
+def _money_role_of(text: str):
+    """Роль по ролевым словам текста без привязки к позиции (порядок конфига = приоритет)."""
+    for r in MONEY_CONFIG["roles"]:
+        if r["re"].search(text or ""):
+            return r["key"]
+    return None
+
+
+def _money_role_label(key, en: bool = False) -> str:
+    for r in MONEY_CONFIG["roles"]:
+        if r["key"] == key:
+            return r["label_en"] if en else r["label"]
+    return str(key or "")
+
+
+def _money_infer_cur(s: str, pos: int):
+    """Валюта числа, при котором её не написали, — по БЛИЖАЙШЕМУ валютному токену вокруг («+222
+    депозит» сразу после «289 usdt» → USDT). Валюты рядом нет → None (в сверку такое число попадёт
+    только со своими же безвалютными — бат с USDT не столкнём)."""
+    lo, hi = max(0, pos - _MONEY_CUR_BACK), min(len(s), pos + _MONEY_CUR_FWD)
+    best, best_d = None, None
+    for m in _MONEY_ANY_CUR_RE.finditer(s, lo, hi):
+        d = (pos - m.end()) if m.end() <= pos else (m.start() - pos)
+        if best_d is None or d < best_d:
+            best, best_d = _money_cur_code(m.group(0)), d
+    return best
+
+
+def money_role_figures(text: str):
+    """Деньги текста в РОЛЕВОМ разрезе: [{value, cur, role, models, period, has_cur, raw, kind}].
+    role — по словам КЛАУЗЫ (депозит/доставка/аренда/допы/итого), models/period — квалификаторы
+    позиции: суммы сравнимы, только если это ОДНА И ТА ЖЕ позиция (та же модель, тот же срок)."""
+    s = text or ""
+    out = []
+    for f in extract_money_figures(s):
+        pos, end = f.get("pos", 0), f.get("end", 0)
+        if not f["has_cur"]:
+            # Число БЕЗ валюты рядом — деньги только по строгим признакам. Иначе в роль «депозит»
+            # затягивало кубатуру («NMAX 155 … депозит 3000 ฿»), проценты скидки («скидка 27%,
+            # депозит: 7000 бат»), числа дат («20–25 июля, залог паспортом») — живые ложняки
+            # корпуса 29.07: 30 карточек из 34 в первом прогоне были именно такими.
+            if _MF_MODEL_TAIL.search(s[max(0, pos - 28):pos]) or _MF_UNIT_HEAD.match(s[end:end + 18]):
+                continue
+        clause, left = _money_clause_at(s, pos)
+        line = _money_line_at(s, pos)
+        role, dist = _money_role_at(clause, pos - left, end - left)
+        if role and not f["has_cur"] and (dist > _MONEY_ROLE_NEAR or f["value"] < _MONEY_BARE_MIN):
+            # безвалютное число берём в роль, только если ролевое слово стоит ВПЛОТНУЮ («+222
+            # депозит» — живая реплика менеджера окна @marcoit41) и сумма правдоподобна как цена
+            role = None
+        per = _MONEY_PERIOD_RE.search(clause) or _MONEY_PERIOD_RE.search(line)
+        out.append({"value": f["value"], "cur": f.get("cur") or _money_infer_cur(s, pos),
+                    "role": role, "has_cur": f.get("has_cur", False), "raw": f["raw"],
+                    "kind": f["kind"], "models": _money_models_at(s, pos),
+                    "period": _pc_num(per.group(1)) if per else None})
+    return out
+
+
+def money_contradictions(draft: str, transcript: str = ""):
+    """Противоречия «одна роль — разные суммы»: [(role, cur, [сумма, сумма, …])] в порядке роли.
+    Сравниваем ТОЛЬКО одинаковые позиции: та же роль + та же валюта + та же модель + тот же срок.
+    Источники — сам черновик и реплики МЕНЕДЖЕРА этого окна (что клиент от нас уже слышал).
+    Флагим, только если хотя бы одна из сумм — из ЧЕРНОВИКА (чужой давний разнобой не наш повод)."""
+    dfigs = [f for f in money_role_figures(draft or "") if f["role"] in _MONEY_ROLES_CHECKED]
+    if not dfigs:
+        return []
+    tfigs = [f for f in money_role_figures(_manager_text(transcript or ""))
+             if f["role"] in _MONEY_ROLES_CHECKED]
+    buckets = {}
+    for f, from_draft in [(f, True) for f in dfigs] + [(f, False) for f in tfigs]:
+        key = (f["role"], f["cur"], f["models"], f["period"])
+        b = buckets.setdefault(key, {"vals": [], "draft": set()})
+        if f["value"] not in b["vals"]:
+            b["vals"].append(f["value"])
+        if from_draft:
+            b["draft"].add(f["value"])
+    out = []
+    for (role, cur, _m, _p), b in buckets.items():
+        if len(b["vals"]) > 1 and b["draft"]:
+            out.append((role, cur, sorted(b["vals"])))
+    order = {r: i for i, r in enumerate(_MONEY_ROLES_CHECKED)}
+    return sorted(out, key=lambda t: (order.get(t[0], 9), t[2]))
+
+
+def _money_source_numbers(pricing_note: str = "", transcript: str = "") -> set:
+    """Числа, которые где-то РЕАЛЬНО прозвучали: расчёт/прайс карточки + ВЕСЬ тред (реплики клиента
+    и менеджера). Сумма черновика вне этого множества — названа ботом из головы."""
+    return _pc_wl_price_numbers(pricing_note) | _pc_wl_price_numbers(transcript)
+
+
+def money_unsourced(draft: str, pricing_note: str = "", transcript: str = ""):
+    """Суммы черновика, которых НЕТ ни в одном источнике → [(значение, код валюты)] по порядку.
+    Берём только настоящие деньги: число с ВАЛЮТОЙ рядом либо с ролью (депозит/доставка/аренда) —
+    так год «2020», кубатура «155cc» и счётчики срока в пометку не попадают."""
+    src = _money_source_numbers(pricing_note, transcript)
+    out, seen = [], set()
+    for f in money_role_figures(draft or ""):
+        if not (f["has_cur"] or f["role"] in _MONEY_ROLES_CHECKED):
+            continue
+        if f["value"] in src or f["value"] in seen:
+            continue
+        seen.add(f["value"])
+        out.append((f["value"], f["cur"] if f["has_cur"] else None))
+    return out
+
+
+def _money_strip_code_blocks(body: str, pricing_note: str = "") -> str:
+    """Убрать из анализа ДОСЛОВНЫЙ блок расчёта/сетки/доставки. Его строки печатает КОД из
+    Bridge/Календаря, а не сочиняет модель: депозиты РАЗНЫХ моделей в прайс-карточке законно
+    разные, и противоречием это не является (живой ложняк корпуса 29.07 — 7 карточек прайс-листа
+    из 18). Разнобой ищем в тексте, который написала МОДЕЛЬ, и против сказанного клиенту."""
+    out = body or ""
+    for get in (_sheet_block_from_note, _quote_block_from_note, _delivery_block_from_note):
+        blk = (get(pricing_note or "") or "").strip()
+        if blk and blk in out:
+            out = out.replace(blk, "\n")
+    return out
+
+
+def money_manager_note(contras, unsourced, lang: str = "ru") -> str:
+    """Пометка модератору «[деньги: …]» — называет ОБЕ спорные суммы и все суммы из головы.
+    Клиент её не видит: client_facing_text/stripInternalMarkers срезают строку по маркеру."""
+    en = str(lang or "").lower().startswith("en")
+    parts = []
+    for role, cur, vals in (contras or []):
+        lbl = _money_cur_label(cur, en)
+        joined = (" vs " if en else " и ").join(f"{v} {lbl}".strip() for v in vals)
+        parts.append(("⚠️ conflict: " if en else "⚠️ противоречие: ")
+                     + _money_role_label(role, en) + " " + joined)
+    if unsourced:
+        vals = ", ".join(f"{v} {_money_cur_label(c, en)}".strip() for v, c in unsourced)
+        parts.append(("⚠️ figure not from any source: " if en else "⚠️ сумма не из источников: ") + vals)
+    if not parts:
+        return ""
+    return ("[money: " if en else "[деньги: ") + "; ".join(parts) + "]"
+
+
+def postcheck_money(draft: str, pricing_note: str = "", transcript: str = "",
+                    lang: str = "ru") -> str:
+    """Денежный пост-чек ВСЕХ валют: противоречие «одна роль — разные суммы» и сумма из головы →
+    ПОМЕТКА модератору в хвост. Текст черновика НЕ трогаем (её решает человек). Претензий нет /
+    пустой вход → черновик БАЙТ-В-БАЙТ (fail-safe)."""
+    text = draft or ""
+    if not text.strip():
+        return draft
+    # анализируем КЛИЕНТСКОЕ тело без служебных пометок (их числа — не деньги) и без дословного
+    # КОД-блока расчёта (он не сочинён моделью и внутри себя не противоречив).
+    body = _money_strip_code_blocks(client_facing_text(text), pricing_note)
+    note = money_manager_note(money_contradictions(body, transcript),
+                              money_unsourced(body, pricing_note, transcript), lang)
+    if not note or note in text:
+        return draft
+    log.warning("postcheck_money: %s", note)
+    return text.rstrip() + "\n" + note
 
 
 # --- ПОСТ-ЧЕК ЗАБОРА: бесплатный забор ТОЛЬКО при оплаченной доставке (шаг 5/7 #22) ----------
@@ -5206,7 +5603,8 @@ def postcheck_free_pickup(draft: str, lang: str = "ru", delivery_paid=None) -> s
 # живут хвостом — вопрос вставляем ПЕРЕД ними, чтобы он остался в клиентском теле.
 _CLOSING_Q_RE = re.compile(r"[?？]")
 _SERVICE_TAIL_RE = re.compile(
-    r"(?:[ \t]*\n[ \t]*\[(?:уточнить|собрано|collected|сезон|season)\b[^\n]*\][ \t]*)+\s*\Z", re.I)
+    r"(?:[ \t]*\n[ \t]*\[(?:уточнить|собрано|collected|сезон|season|деньги|money)\b[^\n]*\][ \t]*)+"
+    r"\s*\Z", re.I)
 
 
 def ensure_closing_question(draft: str, facts: dict, lang: str = "ru",
@@ -5432,6 +5830,7 @@ def _append_season_note(draft: str, pricing_note: str) -> str:
 # их видеть не должен: client_facing_text срезает такие строки перед отправкой (шаг 4/7 #253).
 _SERVICE_NOTE_LINE_RE = re.compile(
     r"^[ \t]*\[(?:уточнить|собрано|collected|сезон|season|тип ТС|vehicle type"
+    r"|деньги|money"                        # денежная пометка (противоречие/сумма из головы, 29.07)
     r"|партн[её]рский чат|partner chat)\b[^\n]*\][ \t]*$", re.I | re.M)
 
 
@@ -5454,6 +5853,7 @@ def client_facing_text(draft: str) -> str:
 _INTERNAL_MARKER_RE = re.compile(
     r"Этап\s*\d|менеджер\s+(?:ещё|еще)\s+не\s+назвал|собрано|\[уточнить"
     r"|\[тип ТС|\[vehicle type"             # пометка о конфликте типа ТС — тоже служебная (28.07)
+    r"|\[деньги|\[money"                    # …и денежная пометка пост-чека всех валют (29.07)
     r"|\[партн[её]рский чат|\[partner chat", re.I)   # …и пометка партнёрского гарда (28.07)
 
 
@@ -5711,6 +6111,10 @@ def generate_draft(transcript: str, lang: str, faq: str,
     # ТЕСТ-10: вопрос про уже собранное — вон; ТЕСТ-7: вопроса нет вовсе — КОД дописывает ровно один.
     out = drop_answered_questions(out, facts, lang)
     out = ensure_closing_question(out, facts, lang, sheet_mode=sheet_mode, ready=ready, just=just)
+    # Деньги ВСЕХ валют — по ГОТОВОМУ тексту (после дописок КОДА): противоречие «одна роль — разные
+    # суммы» и сумма из головы → ПОМЕТКА модератору. Текст не трогаем (живой случай 204/205: USDT
+    # проходил насквозь, потому что денежный разбор знал только баты).
+    out = postcheck_money(out, pricing_note, transcript, lang)
     out = _append_collected_note(out, facts, lang, unconfirmed_fields(transcript, facts))
     out = _append_season_note(out, pricing_note)
     # Тип ТС ПОСЛЕДНИМ шагом (после дописок КОДА): на 'car'-треде с байком в тексте — ПОМЕТКА
@@ -5763,6 +6167,9 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     out = drop_price_deflection(out, pricing_note, lang)
     out = drop_answered_questions(out, facts, lang)
     out = ensure_closing_question(out, facts, lang, sheet_mode=sheet_mode, ready=ready, just=just)
+    # Тот же денежный пост-чек всех валют, что в generate_draft: strategy-перегенерация тоже уходит
+    # клиенту через карточку — противоречие сумм и число из головы обязаны быть видны модератору.
+    out = postcheck_money(out, pricing_note, transcript, lang)
     out = _append_collected_note(out, facts, lang, unconfirmed_fields(transcript, facts))
     out = _append_season_note(out, pricing_note)
     # Гард повторного приветствия ПЕРЕД ОТПРАВКОЙ (родитель #311 → #56): strategy-перегенерация

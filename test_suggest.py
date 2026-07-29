@@ -2859,6 +2859,199 @@ class TestFreePickupPostcheck(unittest.TestCase):
             self.assertFalse(self._fp(n), n)
 
 
+class TestMoneyPostcheckAllCurrencies(unittest.TestCase):
+    """Денежный пост-чек ВСЕХ валют (29.07.2026): противоречие «одна роль — разные суммы» и сумма,
+    которой нет ни в одном источнике → ПОМЕТКА модератору, текст черновика не трогаем.
+    Голдены — ДОСЛОВНЫЕ карточки 204/205 боевой базы (окно @marcoit41, 07.07): «222 USDT — депозит»,
+    а через МИНУТУ «Депозит за байк — 289 USDT». Прежний чек этого не видел вовсе: валютный регекс
+    знал только бат/฿/THB, и у «222 USDT» has_cur=False (правило-класс CLAUDE.md: голден детекта —
+    реальная фраза, а не идеализация)."""
+
+    # реальные реплики окна (адрес кошелька укорочен — в голдене он роли не играет)
+    TR_204 = (
+        "[клиент]: У меня знакомый летит из Эстонии, будет на Банг Тао, попросил найти байк ему. "
+        "Какой процесс бронирования и сколько депозит?\n"
+        "[менеджер]: Депозит 7000 бат\n"
+        "[менеджер]: Кофр +500 бат\n"
+        "[клиент]: Какие у вас есть способы оплаты? Я в Китае живу, рублей у меня нет.\n"
+        "[менеджер]: Способы оплаты: перевод в крипте (USDT, TRC20), тайский банковский перевод по QR, "
+        "а также перевод на Сбер/Тинькофф или наличные баты при получении.\n"
+        "[клиент]: Сколько будет цена в долларах за депозит? Кофр тоже нужен\n"
+        "[менеджер]: 289 usdt\n"
+        "[менеджер]: +222 депозит\n"
+        "[клиент]: Значит 222 + 289?\n"
+        "[менеджер]: Да")
+    TR_205 = TR_204 + "\n[клиент]: 511 долларов"
+    D_204 = ("Да, всё верно: 222 USDT — депозит, 289 USDT — аренда с кофром, итого 511 USDT. "
+             "Если пока хотите внести только депозит — достаточно перевести 222 USDT на кошелёк "
+             "TRC20, который я отправлял выше, остальное можно оплатить при получении.")
+    D_205 = ("Спасибо за ожидание — вернусь к вам с уточнением по сумме. Депозит за байк — 289 USDT, "
+             "кофр — +500 бат (это примерно 15 USDT). Итого к оплате сейчас за депозит: 289 USDT. "
+             "Предоплату 222 USDT за аренду можно внести вместе с ним или при получении байка — "
+             "как вам удобнее. После оплаты пришлите, пожалуйста, скрин перевода 🤝")
+
+    # ---------------- 1. валюты: USDT/USD/EUR/руб распознаются как деньги ----------------
+    def test_usdt_recognised_as_money(self):
+        figs = suggest.extract_money_figures("Депозит за байк — 289 USDT")
+        self.assertEqual([(f["value"], f["cur"], f["has_cur"]) for f in figs], [(289, "USDT", True)])
+
+    def test_all_configured_currencies_recognised(self):
+        cases = [("депозит 289 USDT", "USDT"), ("депозит 200 долларов", "USD"),
+                 ("депозит $200", "USD"), ("депозит 180 EUR", "EUR"), ("депозит 20000 рублей", "RUB"),
+                 ("депозит 7000 бат", "THB"), ("депозит 7000 ฿", "THB"), ("депозит ฿7000", "THB")]
+        for text, code in cases:
+            figs = [f for f in suggest.extract_money_figures(text) if f["has_cur"]]
+            self.assertTrue(figs, text)
+            self.assertEqual(figs[0]["cur"], code, text)
+
+    def test_usd_token_not_matched_inside_usdt(self):
+        # «usd» — ТОЧНОЕ слово: «289 USDT» обязан остаться USDT, а не долларом
+        self.assertEqual(suggest.extract_money_figures("289 usdt")[0]["cur"], "USDT")
+
+    # ---------------- 2. ГЛАВНОЕ: противоречие двух депозитов ----------------
+    def test_live_205_deposit_contradiction_names_both_sums(self):
+        out = suggest.postcheck_money(self.D_205, "", self.TR_205, "ru")
+        self.assertNotEqual(out, self.D_205)
+        self.assertIn("⚠️ противоречие: депозит 222 USDT и 289 USDT", out)
+        # клиентское тело НЕ тронуто — решает модератор
+        self.assertEqual(suggest.client_facing_text(out), self.D_205)
+
+    def test_contradiction_inside_one_draft(self):
+        draft = "Депозит — 3000 бат. Ой, поправлюсь: депозит 5000 бат, вернём в конце аренды."
+        out = suggest.postcheck_money(draft, "", "", "ru")
+        self.assertIn("⚠️ противоречие: депозит 3000 ฿ и 5000 ฿", out)
+
+    def test_currencies_do_not_collide(self):
+        # депозит 7000 бат в треде и 289 USDT в черновике — РАЗНЫЕ валюты, это не противоречие
+        draft = "Депозит за байк — 289 USDT."
+        tr = "[менеджер]: Депозит 7000 бат\n[менеджер]: 289 usdt"
+        self.assertNotIn("противоречие", suggest.postcheck_money(draft, "", tr, "ru"))
+
+    def test_roles_not_confused(self):
+        # живой ложняк карточки 311: «доставка 290 бат + депозит 7 000 бат» — это РАЗНЫЕ позиции
+        draft = "Оплата — доставка 290 бат + депозит 7,000 бат, бронь по 100% предоплате."
+        tr = "[менеджер]: Доставка 290 THB\n[менеджер]: Депозит 7,000 THB"
+        self.assertIs(suggest.postcheck_money(draft, "", tr, "ru"), draft)
+
+    def test_price_sheet_rows_are_not_contradiction(self):
+        # прайс-карточка КОДА: у каждой модели свой депозит — это не разнобой
+        block = ("NMAX 155\n• Депозит: 3000 ฿ / паспорт\n\nXMAX 300\n• Депозит: 5000 ฿ / паспорт")
+        note = "<<<SHEET>>>\n" + block + "\n<<<END>>>"
+        draft = "Актуальный прайс по нашему парку:\n\n" + block + "\n\nКакая модель интересна?"
+        self.assertIs(suggest.postcheck_money(draft, note, "", "ru"), draft)
+
+    # ---------------- 3. сумма, которой нет ни в одном источнике ----------------
+    def test_live_204_unsourced_total_flagged(self):
+        out = suggest.postcheck_money(self.D_204, "", self.TR_204, "ru")
+        self.assertIn("⚠️ сумма не из источников: 511 USDT", out)
+        self.assertEqual(suggest.client_facing_text(out), self.D_204)
+
+    def test_client_reply_is_a_source(self):
+        # то же число 511, но клиент его УЖЕ назвал в треде → из головы оно не взято
+        out = suggest.postcheck_money("Итого к оплате 511 USDT.", "", self.TR_205, "ru")
+        self.assertIs(out, "Итого к оплате 511 USDT.")
+
+    def test_unsourced_in_any_currency(self):
+        for text, tail in (("Депозит — 200 USDT.", "200 USDT"), ("Депозит — 20000 рублей.", "20000 ₽"),
+                           ("Депозит — 180 EUR.", "180 €"), ("Депозит — 6000 бат.", "6000 ฿")):
+            self.assertIn("⚠️ сумма не из источников: " + tail,
+                          suggest.postcheck_money(text, "", "", "ru"), text)
+
+    def test_quote_figures_are_sourced(self):
+        # цифра из расчёта Bridge (pricing_note) — законна, пометки нет
+        note = "ЦЕНА из Календаря: NMAX 155 — 1685 ฿ за 5 дней, депозит 3000 ฿."
+        draft = "NMAX 155 на 5 дней — 1685 ฿, депозит 3000 ฿."
+        self.assertIs(suggest.postcheck_money(draft, note, "", "ru"), draft)
+
+    def test_years_cc_and_counters_not_money(self):
+        # год, кубатура, проценты и счётчики в пометку не попадают
+        draft = ("XMAX 300 (2020-2022) на 5 дней, скидка за срок 18%, 1 шлем, депозит 3000 ฿ — "
+                 "заберём 20–25 июля.")
+        note = "ЦЕНА из Календаря: депозит 3000 ฿."
+        self.assertIs(suggest.postcheck_money(draft, note, "", "ru"), draft)
+
+    # ---------------- 4. чистые случаи: байт-в-байт ----------------
+    def test_thread_without_money_byte_for_byte(self):
+        draft = "Здравствуйте! Подскажите даты аренды и модель — подберём вариант. 🤝"
+        self.assertIs(suggest.postcheck_money(draft, "", "[клиент]: привет", "ru"), draft)
+
+    def test_consistent_sum_clean(self):
+        draft = "Депозит за байк — 289 USDT, вернём в конце аренды."
+        tr = "[менеджер]: 289 usdt депозит"
+        self.assertIs(suggest.postcheck_money(draft, "", tr, "ru"), draft)
+
+    def test_empty_input_untouched(self):
+        self.assertIs(suggest.postcheck_money("", "", "", "ru"), "")
+        self.assertIsNone(suggest.postcheck_money(None, "", "", "ru"))
+
+    # ---------------- 5. регрессы: батовая логика и свободный забор ----------------
+    def test_thb_postcheck_draft_regression(self):
+        # прежний батовый пост-чек не изменился: выдуманный итог-за-период всё так же клеймится…
+        note = "ЦЕНА из Календаря: ADV 350 — 998฿/день."
+        out = suggest.postcheck_draft("9000 бат за 10 дней", "ru", pricing_note=note)
+        self.assertIn("[уточнить: цена 9000]", out)
+        # …а суточная ставка и цена из белого списка — нет
+        self.assertEqual(suggest.postcheck_draft("NMAX на 7 дней — 449฿/день, депозит 3000฿.",
+                                                 "ru", pricing_note=""),
+                         "NMAX на 7 дней — 449฿/день, депозит 3000฿.")
+
+    def test_free_pickup_regression(self):
+        # «свободный забор» живёт своей логикой и денежной пометкой не ломается
+        draft = "Найхарн — 590 бат доставка, забор байка в конце аренды бесплатный."
+        self.assertEqual(suggest.postcheck_free_pickup(draft, "ru"), draft)
+        out = suggest.postcheck_money(draft, "", "[менеджер]: Доставка Найхарн 590 бат", "ru")
+        self.assertIs(out, draft)
+
+    # ---------------- 6. пометка служебная и не тайская ----------------
+    def test_note_is_service_only(self):
+        out = suggest.postcheck_money(self.D_205, "", self.TR_205, "ru")
+        self.assertNotIn("[деньги", suggest.client_facing_text(out))     # клиент пометку не видит
+        self.assertNotIn("[деньги", suggest.stripInternalMarkers(out))
+        self.assertFalse(_has_thai_letters(out), "тайские буквы в денежной пометке")
+
+    def test_en_note(self):
+        out = suggest.postcheck_money("Deposit is 289 USDT.", "", "[manager]: deposit 222 USDT", "en")
+        self.assertIn("[money:", out)
+        self.assertFalse(_has_thai_letters(out))
+
+    # ---------------- 7. конфиг валют дополняется БЕЗ правки кода ----------------
+    def test_new_currency_from_config_no_code_change(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "money_currencies.json")
+            with open(path, "w", encoding="utf-8") as f:
+                _json.dump({"currencies": [{"code": "AED", "label": "AED", "tokens": ["aed", "дирхам"]}]},
+                           f, ensure_ascii=False)
+            try:
+                suggest.reload_money_config(path)
+                figs = suggest.extract_money_figures("депозит 900 дирхамов")
+                self.assertEqual((figs[0]["value"], figs[0]["cur"]), (900, "AED"))
+                self.assertEqual(suggest.extract_money_figures("депозит 7000 бат")[0]["cur"], "THB")
+            finally:
+                suggest.reload_money_config()
+
+    def test_missing_config_falls_back_to_builtin(self):
+        # файла нет → работает встроенный минимум (батовая ветка НЕ обнуляется)
+        try:
+            suggest.reload_money_config(os.path.join(os.sep, "нет-такого-файла.json"))
+            self.assertEqual(suggest.extract_money_figures("депозит 7000 бат")[0]["cur"], "THB")
+            self.assertEqual(suggest.extract_money_figures("депозит 289 USDT")[0]["cur"], "USDT")
+        finally:
+            suggest.reload_money_config()
+
+    def test_shipped_config_covers_live_currencies(self):
+        # РЕГРЕСС ДАННЫХ: боевой money_currencies.json держит валюты, реально звучащие в корпусе
+        codes = {c["code"] for c in suggest._load_money_config()["currencies"]}
+        self.assertTrue({"THB", "USDT", "USD", "EUR", "RUB"} <= codes, codes)
+
+    # ---------------- 8. сквозной черновик ----------------
+    def test_note_reaches_generated_draft(self):
+        out = suggest.generate_draft(self.TR_205, "ru", "FAQ", call_llm=lambda s, u: self.D_205)
+        self.assertIn("⚠️ противоречие: депозит 222 USDT и 289 USDT", out)
+        self.assertNotIn("[деньги", suggest.client_facing_text(out))
+
+
 class TestGuardAvailability(unittest.TestCase):
     """guard_availability (родитель4, шаг 4/6): гард ПЕРЕД отправкой — бот НЕ утверждает наличие/
     дефицит/особые условия без данных. Форма по образцу удалённого guard_quote_price: клейм без
