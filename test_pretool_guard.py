@@ -1427,6 +1427,81 @@ class TestCardMinimumAndJournal(unittest.TestCase):
             os.remove(logp)
 
 
+class TestOneRuleObjectGatesNumberDoesNot(unittest.TestCase):
+    """ЕДИНОЕ ПРАВИЛО ОБЕИХ ПОЛОС (29.07.2026): ОБЪЕКТ — гейт, ЧИСЛО — поле.
+
+    Класс, который здесь закрыт, — РАСХОЖДЕНИЕ ПОЛОС. Сервер гасил карточку при отсутствии
+    объекта ИЛИ числа и потому молча съел ЧЕТЫРЕ операции, у которых числа нет ПО ПРИРОДЕ:
+    отмену последней проводки (ДЕНЬГИ), стоп сервиса по имени, pkill по имени, SQL в чужую БД.
+    ПК гасил карточку только когда пусто И объект, И число — то есть безобъектная команда с любой
+    цифрой карточку РОЖДАЛА (это обрывало задачи 12 и 27). Обе полосы сведены в card_gate()."""
+
+    FOUR = (
+        # (метка, команда, ожидаемый kind, что обязано быть видно в объекте)
+        ("отмена последней проводки (ДЕНЬГИ)",
+         'venv/Scripts/python.exe -c "from bridge import void_last; void_last()"',
+         "py_write", "void_last"),
+        ("стоп сервиса по имени", "systemctl stop nginx", "kill", "nginx"),
+        ("pkill по имени", "pkill ngrok", "kill", "ngrok"),
+        ("SQL в чужую БД", 'sqlite3 /var/lib/other/app.db "UPDATE users SET banned=1"',
+         "sqlite", "app.db"),
+    )
+
+    def test_four_lost_operations_card_again_with_empty_number(self):
+        for label, cmd, want_kind, want_obj in self.FOUR:
+            with self.subTest(label):
+                a, k, o = g.decide_for_role(bash(cmd), headless=False)
+                self.assertEqual((a, k), ("ask", want_kind), label)
+                card = g.card_or_journal(k, o, cmd)
+                self.assertIsNotNone(card, label + ": карточка обязана родиться")
+                obj, num = g._card_fields(k, o, cmd)
+                self.assertIn(want_obj, obj, label + ": объект виден")
+                self.assertEqual(num, "", label + ": числа нет ПО ПРИРОДЕ операции")
+                self.assertIn("Объект: ", card, label)
+
+    def test_number_without_object_does_not_card(self):
+        """Дыра ПОЛОСЫ ПК: раньше любая цифра в безобъектной команде рождала карточку."""
+        self.assertFalse(g.card_gate("delete", "", "3 цели"))
+        self.assertFalse(g.card_gate("schtasks", "", "версия 76"))
+
+    def test_object_alone_is_enough(self):
+        self.assertTrue(g.card_gate("kill", "ngrok", ""))
+        self.assertTrue(g.card_gate("sqlite", "app.db", ""))
+
+    def test_nothing_at_all_goes_to_journal(self):
+        self.assertFalse(g.card_gate("schtasks", "", ""))
+        self.assertFalse(g.card_gate("delete", "", ""))
+
+    def test_hard_block_and_money_always_card(self):
+        for kind in ("unknown", "env", "edit_secret", "read_secret", "py_write"):
+            self.assertTrue(g.card_gate(kind, "", ""), kind)
+
+    def test_core_red_zone_keeps_its_card(self):
+        """Парк/CRM/деньги/удаление/kill по PID — карточка на месте."""
+        for label, cmd in (("удаление", "rm -rf suggest.py"),
+                           ("kill по PID", "taskkill /PID 12345 /F"),
+                           ("живая БД", 'sqlite3 moderation.db "DELETE FROM queue"'),
+                           ("выкатка прода", _CL + " deploy -i AKfycbXXXXXXXXXXXX -V 76"),
+                           ("секреты", "cat .env")):
+            with self.subTest(label):
+                a, k, o = g.decide_for_role(bash(cmd), headless=False)
+                self.assertEqual(a, "ask", label)
+                self.assertIsNotNone(g.card_or_journal(k, o, cmd), label)
+
+    def test_service_restart_stays_green(self):
+        """restart/start — штатный поток, красными их НЕ делаем (зеркало _GREEN_VERBS сервера)."""
+        for cmd in ("systemctl restart splinter", "systemctl start moderation_bot"):
+            with self.subTest(cmd):
+                self.assertNotEqual(g.decide_for_role(bash(cmd), headless=False)[1], "kill")
+
+    def test_objectless_operation_text_still_silent(self):
+        """Тот случай, что обрывал задачи 12 и 27: об операции говорят, объекта нет."""
+        cmd = 'ls -la *.log* 2>/dev/null | head -40; echo "---SCHTASKS XML---"; ls *.xml'
+        a, k, o = g.decide_for_role(bash(cmd), headless=False)
+        self.assertEqual((a, k), ("ask", "schtasks"))
+        self.assertIsNone(g.card_or_journal(k, o, cmd))
+
+
 class TestConfigReadIsNotWrite(unittest.TestCase):
     """`2>&1` и `2>/dev/null` файлов не создают. Прежний признак записи считал их записью — и
     все 4 карточки «хочу изменить конфиг Claude» за сутки пришли на ЧИСТОЕ ЧТЕНИЕ."""
