@@ -113,7 +113,14 @@ AssertionError: Tuples differ: ('defer', 'unknown') != ('ask', 'network')
 |---|---|
 | секреты | `cat .env`, `Get-Content .env`, `grep -n TOKEN .env`, `python reader.py .env`, `cat bot.session`, `Read(.env)` → **ask** |
 | снятие боевых процессов | `Stop-Process -Name python -Force`, `taskkill /PID … /F`, `pkill -f userbot_listen` → **ask** |
-| живые таблицы | `clasp push`, `gspread.open('Лист1')`, `script.google.com/macros`, `sheets.googleapis.com` → **ask** |
+| живые таблицы | `clasp push`, `gspread.open('Лист1')`, `script.google.com/macros`, `sheets.googleapis.com` → **ask** ⚠️ **см. поправку ниже про `clasp push`** |
+
+> **⚠️ Поправка 31.07: `clasp push` спрашивает НЕ всегда.** В `.claude/settings.json` строки
+> `Bash(clasp push:*)` и `PowerShell(clasp push *)` стоят в списке **`allow`**, а в гарде есть
+> отдельный вид `clasp_push_pinned` — заливка в прод, закреплённый на номере версии, проходит
+> по пину.
+> Ложный диагноз: «правка живых таблиц молча не пройдёт, гард спросит» — по закреплённому пину
+> проходит. Считать `clasp push` безусловно спрашивающим нельзя.
 | массовые удаления и БД | `rm -rf …`, `Remove-Item -Recurse -Force`, `sqlite3 … delete from`, `git reset --hard` → **ask** |
 | чужая сеть | `ssh root@203.0.113.7`, `scp … user@evil.example.com`, `curl`, `wget`, `nc` → **ask** |
 | запись в конфиг | `echo '{}' > .claude/settings.json`, `Set-Content … settings.json`, `cp … settings.json` → **ask** |
