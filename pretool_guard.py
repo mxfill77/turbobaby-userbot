@@ -276,42 +276,124 @@ _RE_SQL_WRITE = re.compile(
 # Путь конфига Claude Code, упомянутый В КОМАНДЕ шелла (обход Write/Edit-гейта через cp/mv/>).
 _RE_CLAUDE_CFG_CMD = re.compile(
     r"(?i)\.claude[\\/](settings[\w.-]*\.json|hooks|agents|commands|plugins|skills)|(?<![\w.])\.claude\.json\b")
-# Чистое ЧТЕНИЕ конфига остаётся зелёным. Список смотрелок задан явно: проверять «команда
-# выглядит read-only» общим списком нельзя — `echo '{}' > .claude/settings.json` начинается с
-# echo и прошёл бы как безобидный, а это перезапись конфига.
-_RE_CFG_VIEW = re.compile(r"(?i)^\s*(cat|type|head|tail|more|less|grep|rg|findstr|select-string|"
-                          r"get-content|get-item|get-childitem|test-path|ls|dir|git)\b")
 _RE_REDIRECT = re.compile(r">>?")
 # Перенаправление, которое ДЕЙСТВИТЕЛЬНО пишет файл. `2>&1` (стдерр в стдаут) и `2>/dev/null`
 # (в пустоту) файлов не создают — а прежний признак `>>?` считал их записью. Живой счёт за сутки:
 # 4 карточки «хочу изменить конфиг Claude» из 4 — все на `ls -la …/.claude/ 2>&1` и
 # `grep … .claude/settings.json 2>/dev/null`, то есть на ЧИСТОМ ЧТЕНИИ. Тот же класс, что и всё
 # в 8401d33: судим по ДЕЙСТВИЮ, а не по подстроке.
-_REDIR_TO_FILE = r">>?\s*(?!&|/dev/null\b|\$null\b|nul(?:[\s;|&]|$))"
+# Четвёртое исключение — ЧИСЛОВАЯ цель (`awk 'NR>10 && NR<20' .claude/settings.json`): `>` здесь
+# оператор сравнения, а не перенаправление. Исключение доказуемо безопасно для ЭТОГО признака:
+# путь конфига числом не бывает, поэтому `> .claude/settings.json` под него не подпадает НИКОГДА,
+# а `echo x > 10` создаёт файл `10` — и конфиг всё равно не трогает.
+_REDIR_TO_FILE = r">>?\s*(?!&|/dev/null\b|\$null\b|nul(?:[\s;|&]|$)|\d+(?![\w./\\-]))"
 
 
-# НАМЕРЕНИЕ ЗАПИСИ в конфиг: перенаправление, пишущие командлеты/утилиты, python-запись.
-# Именно оно и есть красное; всё остальное — просто смотрение.
+# ── КОНФИГ: ЧТЕНИЕ ≠ ПРАВКА (правка 30.07.2026, четвёртая группа того же класса) ─────────────
+# Наличие файла, окружение и база уже разведены по ДЕЙСТВИЮ (`_env_probe_only`,
+# `_py_reads_process_env`, `_sqlite_decide`). Конфиг был четвёртым: класс `edit_claude` вешался
+# по ИМЕНИ файла, а смотрелки перечислялись горсткой (`cat|type|head|tail|grep|ls|git`). Живой
+# счёт задачи 71 (30.07): ДВЕ карточки «хочу изменить конфиг Claude Code» — на
+# `wc -l … .claude/settings.json` (счёт строк) и `sed -n '20,32p' .claude/settings.json`
+# (печать диапазона). Ни та, ни другая не пишет ни байта: класс присвоен по имени файла.
+#
+# Оба перечня — БЕЛЫЕ и поимённые (тот же приём, что `_EXISTS_CMDS` для наличия файла). Общим
+# признаком «команда выглядит read-only» проверять нельзя: `echo '{}' > .claude/settings.json`
+# начинается с безобидного echo. Судим по ДЕЙСТВИЮ: смотрелка → зелёное, писатель → красное,
+# писатель БЬЁТ смотрелку (`cat x | tee .claude/settings.json` — запись).
+#
+# ЗАПИСЬ: перенаправление, копирование/переименование, редактор, in-place-флаги, python-запись.
+_CFG_WRITE_CMDS = ("cp", "mv", "copy", "xcopy", "robocopy", "move", "ren", "rename", "tee",
+                   "truncate", "sponge", "dd", "ln", "install", "patch",
+                   # редакторы: слово `code` СЮДА НЕ КЛАДЁМ — это обычное английское слово, оно
+                   # красило `echo "=== fable in code ==="` (та же ошибка «по подстроке», что
+                   # чиним). Редактор, которого нет в перечне, и так остаётся красным: у него нет
+                   # признака ЧТЕНИЯ, а без него `_is_pure_config_read` возвращает False.
+                   "notepad", "notepad++", "wordpad", "vim", "vi", "nano", "emacs")
+_CFG_WRITE_CMDLETS = ("set-content", "add-content", "out-file", "new-item", "copy-item",
+                      "move-item", "remove-item", "rename-item", "clear-content",
+                      "set-itemproperty", "start-process")
+_RE_CFG_REDIR = re.compile(r"(?i)" + _REDIR_TO_FILE)
 _RE_CFG_WRITE = re.compile(
-    r"(?i)" + _REDIR_TO_FILE + r"|\bset-content\b|\badd-content\b|\bout-file\b|\bnew-item\b|\bcopy-item\b|"
-    r"\bmove-item\b|\bremove-item\b|\btee\b|(^|[\s;&|(])(cp|mv|sed\s+-i|truncate)([\s;&|)]|$)|"
-    r"open\s*\([^)]*['\"][wax]|\.write\s*\(|json\.dump\s*\(|\.writelines\s*\(")
-# ЧТЕНИЕ конфига: смотрелка ГДЕ УГОДНО в команде (не обязательно первым словом) либо
-# python-чтение. Прежняя проверка требовала, чтобы команда НАЧИНАЛАСЬ со смотрелки, и
-# `python -c "json.load(open('.claude/settings.json'))"` давал карточку «хочу изменить конфиг» —
-# на чистом чтении. Класс тот же, что и всюду сегодня: судим по ДЕЙСТВИЮ, а не по позиции слова.
+    r"(?i)\b(" + "|".join(_CFG_WRITE_CMDLETS) + r")\b"
+    r"|(^|[\s;&|(])(" + "|".join(re.escape(c) for c in _CFG_WRITE_CMDS) + r")([\s;&|)]|$)"
+    # in-place-флаги смотрелок: `sed -i` правит файл на месте, `sort -o` пишет в свою же цель
+    r"|\bsed\s+(-\S*i\b|--in-place)|\bsort\s+(-\S+\s+)*-o\b"
+    r"|open\s*\([^)]*['\"][wax]|\.write\s*\(|\bwrite_text\s*\(|\bwrite_bytes\s*\("
+    r"|json\.dump\s*\(|\.writelines\s*\(|\bshutil\.(copy\w*|move)\s*\("
+    r"|\bos\.(replace|rename|remove|unlink)\s*\(")
+# ЧТЕНИЕ: смотрелка ГДЕ УГОДНО в команде (не обязательно первым словом) либо python-чтение.
+# Требование «команда НАЧИНАЕТСЯ со смотрелки» снято раньше — `python -c
+# "json.load(open('.claude/settings.json'))"` давало карточку «хочу изменить конфиг» на чистом
+# чтении. Сейчас снята и вторая половина того же дефекта: список смотрелок был короче реальной
+# работы (счёт строк, печать диапазона, форматирование, сверка, хеш).
+_CFG_VIEW_CMDS = ("cat", "type", "head", "tail", "more", "less", "nl", "wc", "sed", "awk",
+                  "gawk", "grep", "egrep", "fgrep", "rg", "findstr", "jq", "diff", "cmp",
+                  "stat", "file", "od", "xxd", "cut", "tr", "sort", "uniq", "column",
+                  "ls", "dir", "git", "basename", "dirname", "realpath", "readlink",
+                  "md5sum", "sha1sum", "sha256sum")
+_CFG_VIEW_CMDLETS = ("get-content", "gc", "get-item", "gi", "get-childitem", "gci",
+                     "select-string", "sls", "test-path", "resolve-path", "split-path",
+                     "measure-object", "select-object", "sort-object", "where-object",
+                     "convertfrom-json", "format-list", "format-table", "out-string",
+                     "compare-object", "get-filehash", "get-command")
 _RE_CFG_READ = re.compile(
-    r"(?i)(^|[\s;&|(])(cat|type|head|tail|more|less|grep|rg|findstr|ls|dir|git)([\s;&|)]|$)|"
-    r"\bget-content\b|\bget-item\b|\bget-childitem\b|\bselect-string\b|\btest-path\b|"
-    r"json\.load\b|\.read\s*\(|\breadlines\s*\(|\bio\.open\b|\bopen\s*\(")
+    r"(?i)(^|[\s;&|(])(" + "|".join(_CFG_VIEW_CMDS) + r")([\s;&|)]|$)"
+    r"|\b(" + "|".join(_CFG_VIEW_CMDLETS) + r")\b"
+    r"|json\.load\b|\.read\s*\(|\breadlines\s*\(|\bio\.open\b|\bopen\s*\("
+    r"|\bread_text\s*\(|\bread_bytes\s*\(")
+
+
+# Вложенный шелл: его кавычки несут КОМАНДУ, а не данные, поэтому маскировать их нельзя
+# (`bash -c "cat x > .claude/settings.json"` обязан остаться записью).
+_NESTED_SHELLS = {"bash", "sh", "zsh", "ksh", "dash", "cmd", "powershell", "pwsh", "wsl"}
+_RE_QUOTED = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"", re.S)
+
+
+def _redirect_text(cmd):
+    """Текст для поиска ПЕРЕНАПРАВЛЕНИЯ: кавычечные строки заменены пробелами.
+
+    Перенаправление шелла ВСЕГДА стоит вне кавычек — а `>` ВНУТРИ них это данные:
+    `print('quiet_harbor =>', v)`, `awk 'NR>10'`, `grep "a > b" .claude/settings.json`. Живой
+    журнал: чтение `~/.claude.json` питоном краснело как «хочу изменить конфиг» из-за строки
+    `'=>'` в печати. Тот же класс — судим по ДЕЙСТВИЮ, а не по подстроке.
+
+    Исключение (fail-safe): сегмент, который сам запускает ВЛОЖЕННЫЙ ШЕЛЛ, остаётся как есть —
+    там в кавычках лежит команда. Длина маски совпадает с длиной строки: позиции не съезжают."""
+    out = []
+    for i, seg in enumerate(_split_segments(cmd or "")):
+        if i % 2:
+            out.append(seg)
+            continue
+        try:
+            toks = shlex.split(seg)
+        except Exception:
+            out.append(seg)                 # кривое квотирование → сегмент как есть (краснее)
+            continue
+        j = _cmd_index(toks)
+        if j is not None and j < len(toks) and _base(toks[j]) in _NESTED_SHELLS:
+            out.append(seg)
+            continue
+        out.append(_RE_QUOTED.sub(lambda m: " " * len(m.group(0)), seg))
+    return "".join(out)
 
 
 def _is_pure_config_read(cmd):
     """True ⇔ команда только СМОТРИТ конфиг: есть признак чтения и НЕТ ни одного признака записи.
-    Оба условия обязательны — `echo '{}' > .claude/settings.json` начинается с безобидного echo,
-    но несёт перенаправление, и остаётся красным."""
+    Оба условия обязательны и порядок именно такой — `echo '{}' > .claude/settings.json`
+    начинается с безобидного echo, но несёт перенаправление, и остаётся красным.
+
+    Fail-safe прежний: команда БЕЗ признака чтения (`Rename-Item …`, `robocopy …`, редактор,
+    незнакомая утилита) — красная, даже если её писателя в перечне нет. Смягчение получает
+    только то, что названо смотрелкой явно.
+
+    Смотрим СЫРУЮ команду, а не скан-текст: скан вырезает аргументы .py-скриптов, текст
+    `git -m` и поисковый шаблон — вырезание может только СПРЯТАТЬ признак записи, а прятать
+    его нельзя. Сюда вообще доходят лишь команды, где путь конфига пережил вырезание.
+    Единственное исключение — перенаправление: `>` внутри кавычек перенаправлением не бывает
+    (`_redirect_text`)."""
     c = cmd or ""
-    if _RE_CFG_WRITE.search(c):
+    if _RE_CFG_REDIR.search(_redirect_text(c)) or _RE_CFG_WRITE.search(c):
         return False
     return bool(_RE_CFG_READ.search(c))
 _RE_OUTSIDE_WRITE = re.compile(r"(?i)(>>?|out-file|set-content|new-item|move-item|copy-item)\s+[\"']?([a-z]:[\\/][^\"'\s]+)")
@@ -1262,7 +1344,7 @@ def _scan_python(cmd, cwd, env_probe=False):
 # существования файла виден и из `git status`, и из любого листинга каталога.
 # Разводим ПО ДЕЙСТВИЮ (свод CLAUDE.md п.5): наличие/метаданные → зелёное, содержимое → красное.
 #
-# Список смотрелок наличия — БЕЛЫЙ и поимённый (как `_RE_CFG_VIEW` выше): «команда выглядит
+# Список смотрелок наличия — БЕЛЫЙ и поимённый (как `_CFG_VIEW_CMDS` выше): «команда выглядит
 # безобидной» общим признаком проверять нельзя. Всё, чего в списке нет, остаётся красным.
 _EXISTS_CMDS = {"test-path", "test", "[", "[[", "ls", "dir", "stat",
                 "get-item", "gi", "get-childitem", "gci", "resolve-path"}
@@ -1416,6 +1498,14 @@ def _decide_bash(cmd, cwd):
             return ("defer", "sqlite_read", sq[1])
     if probe and action == "defer" and not kind:
         return ("defer", "env_probe", "")     # прозрачность лога: пробу наличия видно как пробу
+    cfg = _RE_CLAUDE_CFG_CMD.search(scan)
+    if cfg and _is_pure_config_read(cmd) and (
+            (action == "defer" and not kind) or (action, kind) == ("ask", "unknown")):
+        # Та же доктрина лога, что у `sqlite_read` и `env_probe`: смягчение не должно стоить
+        # прозрачности. Смотрелки вроде `sed -n`/`jq`/`diff` шелловым смотрелкам (`_RE_READONLY_SHELL`)
+        # не известны и падали в безликое `unknown` — в журнале обязано быть видно, что молча прошло
+        # именно ЧТЕНИЕ конфига. Решения это не меняет: `unknown` и так не красный (`_stays_red`).
+        return ("defer", "cfg_read", cfg.group(0))
     return (action, kind, obj)
 
 

@@ -2246,5 +2246,123 @@ class TestSqliteReadIsNotWrite(unittest.TestCase):
             self.assertIsNone(g._RE_SQL_WRITE.search(green), green)
 
 
+class TestConfigReadVsWrite(unittest.TestCase):
+    """ЧТЕНИЕ конфига ≠ его ПРАВКА (четвёртая группа класса «класс по имени файла, а не по
+    действию»; наличие файла, окружение и база разведены раньше).
+
+    Голдены — ДОСЛОВНЫЕ команды из живого журнала гарда за 30.07.2026 (задача 71): обе собрали
+    карточку `edit_claude` «хочу изменить конфиг Claude Code», обе — чистое чтение."""
+
+    CFG = ".claude/settings.json"
+    CFGW = ".claude\\settings.json"
+
+    def _kind(self, cmd, tool="Bash"):
+        return g.decide_for_role({"tool_name": tool, "tool_input": {"command": cmd},
+                                  "cwd": PROJ}, headless=False)[:2]
+
+    # --- ЧТЕНИЕ: карточки нет -------------------------------------------------------------
+    def test_live_task71_commands_are_green(self):
+        """Дословные строки живого провала — счёт строк и печать диапазона."""
+        for cmd in ("wc -l pc_orchestrator.py pretool_guard.py rc_supervisor.py "
+                    "rc_auth_detect.py task_metrics.py session_watch.py selfupdate_gate.py "
+                    "reviewer.py " + self.CFG,
+                    "sed -n '20,32p' " + self.CFG):
+            self.assertEqual(self._kind(cmd), ("defer", "cfg_read"), cmd)
+
+    def test_reading_viewers_are_green(self):
+        for cmd in ("cat " + self.CFG,
+                    "type " + self.CFGW,
+                    "head -20 " + self.CFG,
+                    "tail -5 " + self.CFG,
+                    "wc -c " + self.CFG,
+                    "grep -n effort " + self.CFG,
+                    "sed -n '1,10p' " + self.CFG,
+                    "jq '.permissions.allow' " + self.CFG,
+                    "diff " + self.CFG + " .claude/settings.json.bak",
+                    "awk 'NR>10 && NR<20' " + self.CFG,
+                    "nl " + self.CFG,
+                    "stat " + self.CFG,
+                    "sha256sum " + self.CFG,
+                    "Get-Content " + self.CFGW,
+                    "(Get-FileHash " + self.CFGW + " -Algorithm SHA256).Hash",
+                    "Select-String -Path " + self.CFGW + " -Pattern effort | Measure-Object",
+                    'python -c "import json,io; print(json.load(io.open(\''
+                    + self.CFG + "','r')))\""):
+            self.assertEqual(self._kind(cmd, "PowerShell")[0], "defer", cmd)
+
+    def test_quoted_gt_is_data_not_redirect(self):
+        """`>` ВНУТРИ кавычек — данные. Живой журнал: чтение `~/.claude.json` питоном краснело
+        из-за строки `'=>'` в печати; `awk 'NR>10'` — то же самое."""
+        for cmd in ('python -c "import json; d=json.load(open(\'' + self.CFG
+                    + "')); print('quiet_harbor =>', d.get('permissions'))\"",
+                    'grep "a > b" ' + self.CFG,
+                    "awk 'NR>10' " + self.CFG):
+            self.assertEqual(self._kind(cmd)[0], "defer", cmd)
+
+    # --- ПРАВКА: карточка как была, с именем файла в объекте --------------------------------
+    def test_writing_config_still_asks(self):
+        for cmd in ("echo '{}' > " + self.CFG,
+                    "echo x >> " + self.CFG,
+                    "cp .claude/settings.json.new " + self.CFG,
+                    "copy .claude\\settings.json.new " + self.CFGW,
+                    "mv /tmp/x.json .claude/settings.local.json",
+                    "sed -i 's/xhigh/max/' " + self.CFG,
+                    "sed --in-place 's/xhigh/max/' " + self.CFG,
+                    "notepad " + self.CFGW,
+                    "vim " + self.CFG,
+                    "cat x.json | tee " + self.CFG,
+                    "Set-Content -Path " + self.CFGW + " -Value '{}'",
+                    "Rename-Item .claude/settings.json.new " + self.CFG,
+                    "Clear-Content " + self.CFGW,
+                    "Copy-Item x.json C:\\Users\\mxfill1\\.claude\\hooks\\evil.py",
+                    'python -c "import json; d=json.load(open(\'' + self.CFG
+                    + "')); json.dump(d, open('" + self.CFG + "','w'))\"",
+                    'python -c "import pathlib; p=pathlib.Path(\'' + self.CFG
+                    + "'); p.read_text(); p.write_text('{}')\""):
+            self.assertEqual(self._kind(cmd, "PowerShell"), ("ask", "edit_claude"), cmd)
+
+    def test_nested_shell_quotes_carry_a_command(self):
+        """Кавычки вложенного шелла маскировать нельзя: там лежит команда, а не данные."""
+        for cmd in ('bash -c "cat x > ' + self.CFG + '"',
+                    "sh -c 'echo {} > " + self.CFG + "'",
+                    'powershell -Command "Set-Content ' + self.CFGW + " -Value '{}'\""):
+            self.assertEqual(self._kind(cmd), ("ask", "edit_claude"), cmd)
+
+    def test_card_names_the_file(self):
+        """Объект карточки — ИМЯ ФАЙЛА конфига, а не пересказ команды (требование карточки)."""
+        cmd = "echo '{}' > " + self.CFG
+        action, kind, obj = g.decide_for_role(
+            {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": PROJ}, headless=False)
+        self.assertEqual((action, kind), ("ask", "edit_claude"))
+        self.assertEqual(obj, self.CFG)
+        card = g.card_or_journal(kind, obj, cmd)
+        self.assertIsNotNone(card)
+        self.assertIn(self.CFG, card)
+
+    def test_write_tool_on_config_unchanged(self):
+        """Инструмент Write/Edit по конфигу смягчения НЕ получает ни при каких признаках."""
+        for p in (os.path.join(PROJ, ".claude", "settings.json"),
+                  r"C:\Users\mxfill1\.claude\hooks\evil.py",
+                  r"C:\Users\mxfill1\.claude.json"):
+            self.assertEqual(g.decide_for_role(edit(p), headless=False)[:2],
+                             ("ask", "edit_claude"), p)
+
+    def test_secrets_and_deny_not_weakened(self):
+        """Границы: смягчение конфига НЕ распространяется на секреты и прочее красное."""
+        for cmd, kind in (("cat .env", "env"),
+                          ("wc -l .env", "env"),
+                          ("sed -n '1,5p' .env", "env"),
+                          ("cat bot.session", "env")):
+            self.assertEqual(self._kind(cmd), ("ask", kind), cmd)
+
+    def test_numeric_redirect_target_is_not_the_config(self):
+        """Числовая цель `>` исключена доказуемо: путь конфига числом не бывает."""
+        self.assertIsNone(g._RE_CFG_REDIR.search("awk 'NR>10 && NR<20'"))
+        self.assertIsNotNone(g._RE_CFG_REDIR.search("echo x > .claude/settings.json"))
+        self.assertIsNotNone(g._RE_CFG_REDIR.search("echo x >> .claude/settings.json"))
+        self.assertIsNone(g._RE_CFG_REDIR.search("ls -la .claude/ 2>&1"))
+        self.assertIsNone(g._RE_CFG_REDIR.search("grep x .claude/settings.json 2>/dev/null"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
