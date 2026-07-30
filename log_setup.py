@@ -2,7 +2,7 @@
 """
 log_setup.py — единая ротация логов ПК-контура + РАЗВЕДЕНИЕ тестовых и боевых логов.
 
-ДВЕ БОЛИ, которые лечит модуль (обе — живой факт аудита 22:27):
+ТРИ БОЛИ, которые лечит модуль (первые две — живой факт аудита 22:27, третья — 31.07.2026):
 
 1) РОТАЦИИ НЕ БЫЛО НИГДЕ. Все модули вешали голый `logging.FileHandler` — файл рос вечно:
    pc_agent.log 28.7 МБ, pricing.log 22.2 МБ, pc_orchestrator.log 11.2 МБ. На диске C: при этом
@@ -13,18 +13,37 @@ log_setup.py — единая ротация логов ПК-контура + Р
    настоящих действий владельца, и они попали в разбор «последних 20 Allow» как реальные
    события. Разведение здесь: под тестом ЛЮБОЙ лог уезжает в temp, боевой файл не трогается.
 
+3) ОДИН ФАЙЛ — ТРИ ПРОЦЕССА, И ПЕРЕКАТ НЕ ПРОХОДИЛ НИКОГДА. `pricing.py` — модуль-библиотека:
+   он живёт ВНУТРИ `userbot_listen`, `moderation_bot` и `pc_orchestrator` (все три тянут
+   `suggest`), и каждый вешал СВОЙ `RotatingFileHandler` на ОДИН `pricing.log`. На Windows
+   перекат = `os.rename` боевого файла; файл, открытый другим процессом, не переименовывается
+   (WinError 32), исключение уходит в `Handler.handleError` — у демона без stderr в никуда, —
+   а САМА ЗАПИСЬ ТЕРЯЕТСЯ. Замер 31.07.2026: `pricing.log` замер на 23 302 269 байт со штампом
+   22.07 21:39 — девять суток КАЖДАЯ строка котировки молча выбрасывалась, а «лог не растёт»
+   выглядело как здоровье. Проба тем же днём: `pricing.log` и `delivery.log` заняты другим
+   процессом, `dispatch_notify.log`/`pretool_guard.log` свободны.
+
+   Лечится ЗДЕСЬ, двумя независимыми механизмами:
+   * `handler_path` — файл РАЗВОДИТСЯ ПО ВЛАДЕЛЬЦУ: канонический `pricing.log` принадлежит
+     процессу-хозяину (см. `log_owner`), любой ДРУГОЙ процесс пишет `pricing.<владелец>.log`.
+     Один файл — один держатель, спорить за rename больше некому;
+   * `SafeRotatingFileHandler` — отказ переката больше НЕ проглатывается и не стоит записей.
+
 Признак теста берём ПО ФАКТУ окружения, а не по вежливой договорённости «не забудь выставить»:
 TESTING=1 (общий рубильник репо, ставится `test_isolation`), TURBOBABY_TEST_LOGS=1 (явный
 переключатель только логов) или PYTEST_CURRENT_TEST (взводит сам pytest). Порядок наследования
 env вниз по дереву процессов делает признак верным и для subprocess-тестов (гард запускается
 именно так).
 
-Пороги настраиваются env: LOG_MAX_BYTES (по умолчанию 5 МБ), LOG_BACKUPS (по умолчанию 3).
+Пороги настраиваются env: LOG_MAX_BYTES (по умолчанию 5 МБ), LOG_BACKUPS (по умолчанию 3),
+LOG_ROLLOVER_RETRY_SEC (пауза перед повтором сорвавшегося переката, по умолчанию 300 с).
 Итого потолок на один лог = MAX × (BACKUPS + 1) ≈ 20 МБ.
 """
 
 import os
+import re
 import sys
+import time
 import logging
 import tempfile
 from logging.handlers import RotatingFileHandler
@@ -33,8 +52,24 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_MAX_BYTES = 5 * 1024 * 1024
 DEFAULT_BACKUPS = 3
+DEFAULT_ROLLOVER_RETRY_SEC = 300
 
 TEST_PREFIX = "turbobaby_TESTING_"
+
+# Общий файл-сигнал: сюда уходит КАЖДЫЙ отказ переката, из любого процесса. Смысл — чтобы
+# «ротация не работает» было видно в ОДНОМ месте, а не только внутри распухшего лога, который
+# ровно поэтому никто и не открывает.
+ROTATE_ERROR_LOG = "log_rotation_errors.log"
+
+# Владелец канонического имени лога — там, где имя файла НЕ совпадает с именем входного скрипта.
+# Две живых пары; всё остальное совпадает (pc_agent.py→pc_agent.log и т.д.), и голден
+# TestCanonicalLogNameHasOneOwner держит этот список честным.
+LOG_OWNERS = {
+    "userbot.log": "userbot_listen",
+    "rc_remote_control.log": "rc_supervisor",
+}
+
+_OWNER_SAFE_RE = re.compile(r"[^0-9A-Za-z_-]+")
 
 
 def _int_env(name, default):
@@ -50,6 +85,10 @@ def max_bytes():
 
 def backups():
     return _int_env("LOG_BACKUPS", DEFAULT_BACKUPS)
+
+
+def rollover_retry_sec():
+    return _int_env("LOG_ROLLOVER_RETRY_SEC", DEFAULT_ROLLOVER_RETRY_SEC)
 
 
 def _started_as_test_runner():
@@ -93,19 +132,188 @@ def is_test_context(env=None):
 def log_path(filename, env=None):
     """Куда РЕАЛЬНО писать лог `filename`. Боевой прогон → файл в репо; тест → одноимённый файл
     в temp с префиксом. Абсолютный путь на входе уважаем (берём только имя для тест-ветки)."""
+    filename = os.fspath(filename)
     name = os.path.basename(filename)
     if is_test_context(env):
         return os.path.join(tempfile.gettempdir(), TEST_PREFIX + name)
     return filename if os.path.isabs(filename) else os.path.join(HERE, name)
 
 
-def rotating_handler(filename, fmt="%(asctime)s | %(message)s", level=logging.INFO, env=None):
-    """RotatingFileHandler по разрешённому пути. Падение на открытии файла НЕ роняет вызывающего
-    (лог вторичен): вернём None, и модуль просто останется без файлового хендлера."""
-    path = log_path(filename, env)
+# ─────────────── РАЗВЕДЕНИЕ ФАЙЛА ПО ПРОЦЕССАМ (боль 3) ──────────────────────────────────────
+
+def owner_tag(argv0=None, env=None):
+    """Кличка ПРОЦЕССА — по имени входного скрипта (`userbot_listen`, `moderation_bot`,
+    `pc_orchestrator`). Именно она, а не PID: PID даёт новый файл на каждый рестарт и через
+    неделю каталог не читается, а имя входа стабильно и сразу отвечает «чей это лог».
+    Перекрывается env `TURBOBABY_LOG_OWNER` — для запусков через обёртку/`-c`, где argv[0]
+    ничего не говорит."""
+    e = os.environ if env is None else env
     try:
-        h = RotatingFileHandler(path, maxBytes=max_bytes(), backupCount=backups(),
-                                encoding="utf-8")
+        forced = (e.get("TURBOBABY_LOG_OWNER") or "").strip()
+        raw = forced or os.path.basename(os.fspath(
+            sys.argv[0] if argv0 is None else argv0) or "")
+        if not raw or raw.startswith("-"):          # `python -c …`, интерактив — владельца нет
+            return "misc"
+        stem = os.path.splitext(raw)[0]
+        if stem == "__main__":                      # `python -m unittest` и подобные
+            return "misc"
+        return _OWNER_SAFE_RE.sub("-", stem).strip("-_").lower() or "misc"
+    except Exception:
+        return "misc"
+
+
+def log_owner(name):
+    """Чей КАНОНИЧЕСКОЕ (без суффикса) имя файла. По умолчанию — одноимённый скрипт
+    (`pc_agent.log` → `pc_agent`), исключения объявлены в LOG_OWNERS. Для файла, который никакому
+    входному скрипту не принадлежит (`pricing.log` — модуль-библиотека, процесса `pricing` нет),
+    каноническое имя не занимает НИКТО: все писатели уходят под суффикс, и спорить за rename
+    становится некому."""
+    base = os.path.basename(os.fspath(name))
+    declared = LOG_OWNERS.get(base.lower())
+    if declared:
+        return declared
+    return os.path.splitext(base)[0].lower()
+
+
+def handler_name(name, owner=None):
+    """Имя файла для ДЕРЖАЩЕГО хендлера этого процесса: хозяину — каноническое, всем прочим —
+    `<имя>.<владелец>.log`."""
+    base = os.path.basename(os.fspath(name))
+    who = owner or owner_tag()
+    if who == log_owner(base):
+        return base
+    stem, ext = os.path.splitext(base)
+    return "%s.%s%s" % (stem, who, ext)
+
+
+def handler_path(filename, env=None, owner=None):
+    """Путь для файлового хендлера — `log_path` + разведение по владельцу.
+
+    Разводим ТОЛЬКО здесь, а не в `log_path`, и это не мелочь. Держит файл (и мешает rename)
+    лишь тот, кто ОТКРЫЛ ЕГО НАДОЛГО, — то есть хендлер. Писатели в режиме open→write→close
+    (гард: `_log` → `open(p,'a')`; `dispatch_notify._write_session_metrics` → дозапись в
+    `pc_orchestrator.log`) файл не держат и ротации не мешают, поэтому им НЕЛЬЗЯ менять адрес:
+    иначе единая лента аудита гарда развалилась бы на файл-на-процесс без всякой пользы."""
+    p = os.fspath(filename)
+    head, base = os.path.split(p)
+    split = handler_name(base, owner)
+    return log_path(os.path.join(head, split) if head else split, env)
+
+
+# ─────────────── ОТКАЗ ПЕРЕКАТА НЕ ПРОГЛАТЫВАЕТСЯ ────────────────────────────────────────────
+
+_ROTATE_FAILURES = []            # последние отказы переката этого процесса (для диагностики)
+_ROTATE_FAILURES_MAX = 50
+
+
+def rotation_failures():
+    """Копия списка отказов переката в ЭТОМ процессе. Пусто ⇔ перекат ни разу не срывался."""
+    return list(_ROTATE_FAILURES)
+
+
+def _rotate(path, lim, n):
+    """Сам сдвиг path.N → path.N+1 и path → path.1. Возвращает (сдвинули?, исключение|None) —
+    вызывающий решает, докладывать об отказе или молчать. Не бросает."""
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) <= lim:
+            return False, None
+        oldest = "%s.%d" % (path, n)
+        if os.path.isfile(oldest):
+            os.remove(oldest)
+        for i in range(n - 1, 0, -1):
+            src, dst = "%s.%d" % (path, i), "%s.%d" % (path, i + 1)
+            if os.path.isfile(src):
+                os.replace(src, dst)
+        os.replace(path, path + ".1")
+        return True, None
+    except Exception as exc:
+        return False, exc
+
+
+def _report_rotate_failure(path, exc, extra=""):
+    """Отказ переката ВИДЕН: строка в общий `log_rotation_errors.log`, строка в stderr и запись
+    в памяти процесса (`rotation_failures()`). Прежнее поведение — голый `except: pass` — и
+    сделало девятисуточную немоту `pricing.log` незаметной. Сам никогда не бросает: лечение не
+    имеет права стоить дороже болезни."""
+    msg = "ROTATE-FAIL %s | %s | %s: %s%s" % (
+        time.strftime("%Y-%m-%d %H:%M:%S"), path, exc.__class__.__name__, exc, extra)
+    try:
+        _ROTATE_FAILURES.append(msg)
+        del _ROTATE_FAILURES[:-_ROTATE_FAILURES_MAX]
+    except Exception:
+        pass
+    try:
+        p = log_path(ROTATE_ERROR_LOG)
+        _rotate(p, 512 * 1024, 1)        # молча: докладывать об отказе В файле отказов — петля
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+    try:
+        if sys.stderr is not None:
+            sys.stderr.write(msg + "\n")
+    except Exception:
+        pass
+    return msg
+
+
+class SafeRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler, у которого сорвавшийся перекат ВИДЕН и НЕ СТОИТ ЗАПИСЕЙ.
+
+    Штатный ведёт себя так: `emit` → `doRollover` кидает WinError 32 → `except` → `handleError`
+    → строка потеряна. И так на КАЖДОЙ записи, пока файл держит чужой процесс, то есть вечно.
+    Здесь при отказе: (1) запись всё равно ложится в файл — растущий лог лучше немого;
+    (2) уходит строка ROTATE-FAIL в файл-сигнал, в stderr и в сам лог (первый раз за эпизод);
+    (3) следующая попытка откладывается на `LOG_ROLLOVER_RETRY_SEC` — иначе rename дёргался бы
+    на каждой строке.
+
+    Размен назван вслух: при неустранимом отказе файл будет РАСТИ сверх порога. Это осознанно —
+    тихая потеря диагностики хуже видимого роста, а видимый рост чинится по сигналу."""
+
+    def __init__(self, *args, **kwargs):
+        RotatingFileHandler.__init__(self, *args, **kwargs)
+        self._rollover_retry_after = 0.0
+        self._rollover_failed = False
+
+    def doRollover(self):
+        now = time.time()
+        if now < self._rollover_retry_after:
+            return                        # пауза после отказа: про него уже сказано, не шумим
+        try:
+            RotatingFileHandler.doRollover(self)
+        except Exception as exc:
+            self._rollover_retry_after = now + rollover_retry_sec()
+            first = not self._rollover_failed          # маркер В САМ ЛОГ — раз за эпизод
+            self._rollover_failed = True
+            msg = _report_rotate_failure(
+                self.baseFilename, exc,
+                " | файл держит другой процесс; лог продолжит расти, повтор через %d с"
+                % rollover_retry_sec())
+            if self.stream is None:       # базовый doRollover закрыл поток ДО падения rename
+                try:
+                    self.stream = self._open()
+                except Exception:
+                    self.stream = None
+            if first and self.stream is not None:
+                try:
+                    self.stream.write("!! %s\n" % msg)
+                    self.stream.flush()
+                except Exception:
+                    pass
+        else:
+            self._rollover_failed = False
+            self._rollover_retry_after = 0.0
+
+
+def rotating_handler(filename, fmt="%(asctime)s | %(message)s", level=logging.INFO, env=None,
+                     owner=None):
+    """Ротируемый хендлер по разрешённому пути, РАЗВЕДЁННОМУ по процессу-владельцу. Падение на
+    открытии файла НЕ роняет вызывающего (лог вторичен): вернём None, и модуль просто останется
+    без файлового хендлера."""
+    path = handler_path(filename, env, owner)
+    try:
+        h = SafeRotatingFileHandler(path, maxBytes=max_bytes(), backupCount=backups(),
+                                    encoding="utf-8")
     except Exception:
         return None
     h.setFormatter(logging.Formatter(fmt))
@@ -115,20 +323,12 @@ def rotating_handler(filename, fmt="%(asctime)s | %(message)s", level=logging.IN
 
 def rotate_if_needed(path, limit=None, keep=None):
     """Ротация для писателей БЕЗ модуля logging (гард пишет строку через open(..., 'a')).
-    Сдвигает path.N → path.N+1 и path → path.1, оставляя `keep` бэкапов. Никогда не бросает."""
+    Сдвигает path.N → path.N+1 и path → path.1, оставляя `keep` бэкапов. Никогда не бросает,
+    но и НЕ МОЛЧИТ: отказ уходит в `_report_rotate_failure`. Возврат — «сдвинули ли файл»,
+    контракт прежний (False и «не пора», и «не смогли»), поэтому смотреть надо сигнал."""
     lim = max_bytes() if limit is None else limit
     n = backups() if keep is None else keep
-    try:
-        if not os.path.isfile(path) or os.path.getsize(path) <= lim:
-            return False
-        oldest = "%s.%d" % (path, n)
-        if os.path.isfile(oldest):
-            os.remove(oldest)
-        for i in range(n - 1, 0, -1):
-            src, dst = "%s.%d" % (path, i), "%s.%d" % (path, i + 1)
-            if os.path.isfile(src):
-                os.replace(src, dst)
-        os.replace(path, path + ".1")
-        return True
-    except Exception:
-        return False
+    ok, exc = _rotate(path, lim, n)
+    if exc is not None:
+        _report_rotate_failure(path, exc, " | писатель без logging (append-режим)")
+    return ok
