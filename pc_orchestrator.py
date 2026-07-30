@@ -124,6 +124,24 @@ CLIENT_LOG_STALE = int(os.getenv("PC_CLIENT_LOG_STALE", "120") or "120")        
 CLIENT_BLIND_ALARM = int(os.getenv("PC_CLIENT_BLIND_ALARM", "3") or "3")        # N слепых циклов подряд → NOTE «вотчдог слеп»
 WAKE_GRACE_SEC = int(os.getenv("PC_WAKE_GRACE", "120") or "120")                # после пробуждения ПК — окно без вердиктов
 WAKE_JUMP_MARGIN = int(os.getenv("PC_WAKE_JUMP_MARGIN", "60") or "60")          # скачок wall-clock > POLL+это → «ПК проснулся»
+# ─── СИГНАЛ О ДОЛГОМ СНЕ ПК (инцидент 30.07.2026) ────────────────────────────────────────────
+# Живой факт: 30.07 ПК проспал 8 ч 58 м (S3, 03:43:15→12:41:21) — клиентский бот был недоступен
+# всю ночь; за 7 суток сон съел 12 ч 10 м. Причина НЕ таймаут простоя (standby/hibernate-timeout
+# уже 0 обеими полосами), а ЯВНОЕ усыпление из меню Пуск: Kernel-Power 187
+# ApiCaller=StartMenuExperienceHost.exe, Kernel-Power 42 Reason=4 (Application API). Значит сон
+# может вернуться в любой вечер — и узнавать об этом надо СРАЗУ, а не по жалобе клиента.
+# Прежний детект пробуждения оставлял только строку INFO/WARNING в логе демона, которую никто
+# не читает; здесь добавляем ГРОМКИЙ след: строка в журнал + карточка в тему постановки.
+#
+# ПОРОГ — не «на глаз». Скачок wall-clock сам по себе НЕ равен сну: демон исполняет задачу
+# СИНХРОННО в главном цикле, поэтому ЧЕСТНЫЙ виток растягивается до TASK_TIMEOUT+POLL_SEC.
+# Замер по живому pc_orchestrator.log (369 срабатываний детекта пробуждения за 22–30.07):
+#   • порог 600 с  → 26 срабатываний, из них 24 ЛОЖНЫХ (длинные задачи; максимум ложного 1776 с);
+#   • порог 1800 с → РОВНО 2 срабатывания, и это ровно два настоящих сна (11611 с и 32381 с).
+# Поэтому дефолт = TASK_TIMEOUT+POLL_SEC (2760 с): всё, что дольше, длинной задачей объяснено
+# быть НЕ МОЖЕТ по построению — ложных ноль, оба реальных сна проходят с 4–12-кратным запасом.
+SLEEP_ALARM_SEC = int(os.getenv("PC_SLEEP_ALARM_SEC", "") or (TASK_TIMEOUT + POLL_SEC))
+SLEEP_ALARM_TOPIC = int(os.getenv("PC_SLEEP_TOPIC", "328") or "328")   # тема постановки задач (как детектор немоты)
 RESULT_MAX = 4500
 TIMEOUT_MARK = "⏱"       # маркер таймаут/сирота-диагнозов: думатель самопочинки их НЕ чинит
 MANUAL_MARK = "✋"        # маркер «headless доказанно не может» (снова красное ПОСЛЕ approve) —
@@ -380,6 +398,18 @@ def _notify_critical(text):
                          creationflags=NO_WINDOW)
     except Exception as e:
         log.warning("критический пуш не отправлен: %s", e)
+
+
+def _notify_topic(topic, text):
+    """Сигнал в КОНКРЕТНУЮ тему форума через `dispatch_notify --topic <id>` — тот же канал, что
+    завёл детектор немоты (session_watch, 29.07): тема постановки задач 328, фолбэк инбокс 1160 →
+    личка реализован внутри dispatch_notify. Fire-and-forget: сбой доставки НЕ роняет тик демона."""
+    try:
+        subprocess.Popen([VENV_PY, DNOTIFY, "--topic", str(topic), text], cwd=REPO,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         creationflags=NO_WINDOW)
+    except Exception as e:
+        log.warning("сигнал в тему %s не отправлен: %s", topic, e)
 
 
 def _notify_task(kind, tid, text):
@@ -4134,6 +4164,59 @@ def _woke_from_sleep(now, prev, poll=None, margin=None):
     return prev is not None and (now - prev) > (poll + margin)
 
 
+def fmt_sleep(gap):
+    """Длительность сна по-человечески: «8 ч 58 м» / «29 м 36 с» / «45 с». Чистая (голден)."""
+    gap = max(0, int(gap))
+    h, rem = divmod(gap, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return "%d ч %02d м" % (h, m)
+    if m:
+        return "%d м %02d с" % (m, s)
+    return "%d с" % s
+
+
+def _pc_backlog(getter=None):
+    """Сколько одиночек lane=pc ЖДАЛО исполнения на момент пробуждения: new + approved.
+    Read-only, очередь не мутируем. Мост недоступен → None, а НЕ 0: «ноль задач» и «не смог
+    посчитать» — разные новости, и подменять вторую первой значит врать владельцу в карточке."""
+    getter = bc.get_pending if getter is None else getter
+    total = 0
+    for st in ("new", "approved"):
+        r = getter(st)
+        if not r.get("ok"):
+            return None
+        total += len([it for it in r.get("items", []) if _lane_ok(it)])
+    return total
+
+
+def sleep_alarm_text(gap, backlog, threshold):
+    """Текст карточки «ПК спал» — чистая функция, на неё положен голден."""
+    return (
+        "🛌 ПК СПАЛ %s — весь контур стоял\n"
+        "скачок wall-clock: %sс (порог %sс — длинной задачей не объяснить)\n"
+        "задач lane=pc накопилось в очереди: %s (new+approved)\n"
+        "клиентский бот всё это время был НЕДОСТУПЕН"
+        % (fmt_sleep(gap), int(gap), int(threshold),
+           "не смог посчитать (мост недоступен)" if backlog is None else backlog)
+    )
+
+
+def report_long_sleep(gap, threshold=None, backlog_fn=None, journal=None, notifier=None):
+    """СУЩЕСТВЕННЫЙ сон ПК → РОВНО ОДНА строка в журнал + РОВНО ОДИН сигнал в тему 328.
+    Мелкий скачок (тормоз ПК / длинная синхронная задача) → ТИШИНА, побочек ноль.
+    → текст карточки (str) при сигнале | None при тишине. Всё внешнее (порог, счётчик очереди,
+    журнал, отправка) инъектируется — голден гоняется без сети и без Bridge."""
+    threshold = SLEEP_ALARM_SEC if threshold is None else threshold
+    if int(gap) <= int(threshold):
+        return None
+    backlog = (_pc_backlog if backlog_fn is None else backlog_fn)()
+    text = sleep_alarm_text(gap, backlog, threshold)
+    (journal or _cowork)(" ".join(text.split()))   # журнал — строго ОДНА строка (контракт 28.07)
+    (notifier or _notify_topic)(SLEEP_ALARM_TOPIC, text)
+    return text
+
+
 # ------------------- РЕВИЗОР ДИАЛОГОВ (флаг DIALOG_REVIZOR) --------------------
 # ШАГ 7/7 родителя 262 (2026-07-13): ревизор ВКЛЮЧЁН БОЕВЫМ владельцем — DIALOG_REVIZOR=1
 # в .env ПОСТОЯННО (ручное включение, красное действие одобрено ТЗ шага 7/7). Этот коммит —
@@ -5107,6 +5190,15 @@ def _main_loop():
                 gap = int(now - _loop_prev_wall)
                 log.warning("детект пробуждения ПК: скачок wall-clock %sс (>%s+%s) — grace вотчдога %sс",
                             gap, POLL_SEC, WAKE_JUMP_MARGIN, WAKE_GRACE_SEC)
+                # инцидент 30.07 (сон 8 ч 58 м): существенный сон — не только grace, но и ГРОМКИЙ
+                # след. Строка в журнал + карточка в тему 328 с числом накопившихся задач lane=pc.
+                # Обёрнуто в try: сигнал НИКОГДА не должен ронять тик демона (как _notify_*).
+                try:
+                    if report_long_sleep(gap):
+                        log.warning("ПК спал %sс (>%s) — строка в журнал и сигнал в тему %s отправлены",
+                                    gap, SLEEP_ALARM_SEC, SLEEP_ALARM_TOPIC)
+                except Exception as e:
+                    log.warning("сигнал о долгом сне не отправлен: %s", e)
             _loop_prev_wall = now
             poll_once()
             maybe_client_watchdog()   # часть 3: следим за pc_agent/userbot/moderation_bot (троттлинг 5 мин)
