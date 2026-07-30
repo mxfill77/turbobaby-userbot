@@ -7,6 +7,7 @@ test_rc_supervisor.py — ДВУХРЕЖИМНЫЙ супервизор кана
 """
 
 import os
+import logging
 import tempfile
 import unittest
 
@@ -534,23 +535,23 @@ class TestChurnFixServerLiveness(unittest.TestCase):
         )
         return spawns, kills, slept
 
-    # --- (а) пер-branch порог свежести: сервер шире, именованный как раньше ---
-    def test_server_threshold_wider_named_keeps_1200(self):
-        # ГОЛДЕН пер-branch: ОДИН и тот же возраст лога 1500с (>1200, <3600), 0 соединений →
-        # СЕРВЕР (порог 3600) ещё ЖИВ, ИМЕНОВАННЫЙ (порог 1200) уже МЁРТВ. Порог реально свой.
-        server_alive = rc.probe_alive(rc.SERVER_SPEC, pid=1,
-                                      now=5000.0, getmtime=lambda p: 5000.0 - 1500,
-                                      conns=lambda pid: 0)
-        named_dead = rc.probe_alive(rc.NAMED_SPEC, pid=1,
-                                    now=5000.0, getmtime=lambda p: 5000.0 - 1500,
-                                    conns=lambda pid: 0)
-        self.assertTrue(server_alive)                        # сервер на 3600 — 1500с ещё свеж
-        self.assertFalse(named_dead)                         # named на 1200 — 1500с уже протух
+    # --- (а) пер-branch порог свежести: у КАЖДОЙ ветки он реально СВОЙ ---
+    def test_thresholds_are_per_branch_not_shared(self):
+        # ГОЛДЕН пер-branch: ОДИН и тот же возраст лога 5000с (>3600, <43200), 0 соединений →
+        # СЕРВЕР (порог 3600) уже МЁРТВ, КАНАЛ (порог 43200) ещё ЖИВ. Пороги не общие.
+        server_dead = rc.probe_alive(rc.SERVER_SPEC, pid=1,
+                                     now=50000.0, getmtime=lambda p: 50000.0 - 5000,
+                                     conns=lambda pid: 0)
+        named_alive = rc.probe_alive(rc.NAMED_SPEC, pid=1,
+                                     now=50000.0, getmtime=lambda p: 50000.0 - 5000,
+                                     conns=lambda pid: 0)
+        self.assertFalse(server_dead)                        # сервер на 3600 — 5000с протух
+        self.assertTrue(named_alive)                         # канал на 43200 — 5000с ещё свеж
 
     def test_config_server_wide_named_default_strikes_three(self):
         self.assertEqual(rc.SERVER_SPEC.get("max_age"), rc.SERVER_LIVENESS_MAX_AGE)
         self.assertGreaterEqual(rc.SERVER_LIVENESS_MAX_AGE, 3600)     # серверу — не меньше часа
-        self.assertIsNone(rc.NAMED_SPEC.get("max_age"))              # named — на общем 1200
+        self.assertEqual(rc.NAMED_SPEC.get("max_age"), rc.NAMED_LIVENESS_MAX_AGE)
         self.assertEqual(rc.LIVENESS_STRIKES, 3)
 
     # --- (б) страйки: живой сервер в простое НЕ рестартуется ---
@@ -588,6 +589,153 @@ class TestChurnFixServerLiveness(unittest.TestCase):
         spawns, kills, _ = self._run(rc.NAMED_SPEC, alive=lambda sp, pid: False,
                                      rounds=1, checks=6, strikes_needed=3)
         self.assertEqual(len(kills), 1)                      # реальный зомби именованного — погашен
+
+
+class _Collect(logging.Handler):
+    """Собирает записи rc_supervisor.log — чтобы проверить, что строка сноса НАЗЫВАЕТ ЧИСЛА."""
+
+    def __init__(self):
+        logging.Handler.__init__(self)
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+class TestNamedChannelLivenessThreshold(unittest.TestCase):
+    """ГОЛДЕН зеркального фикса 30.07 (docs/artifacts/2026-07-30-rc-named-liveness.md): класс-фикс
+    24.07 применили ТОЛЬКО серверной ветке, а ветку КАНАЛА оставили на общем 1200с — за сутки она
+    погасила канал 29 раз против 1 у сервера, каждый снос рвал живые сессии владельца.
+
+    Числа ветки КАНАЛА (замер, а не копия серверных): свой --debug-file она пишет РОВНО ОДИН раз
+    за жизнь — всплеск 70 строк за 904 мс на старте, дальше НИ БАЙТА (pid 13464: старт
+    20:41:34.623, последняя запись 20:41:35.814; через 4 мин возраст лога 252.1с при возрасте
+    процесса 253.3с). Второе плечо (established>0) в простое тоже гаснет — это доказано самими
+    гашениями: каждое требует 0 соединений на 3 проверках подряд. Значит при пороге 1200с смерть
+    наступала ДЕТЕРМИНИРОВАННО на 1290-й секунде (1200 + 3×30): реплей боевого журнала
+    (diag_rc_liveness_replay.py) — 333 жизни из 359 длились ровно 1290с. Самый долгий молчок
+    ЖИВОГО канала — 9,23ч (33 245с). Порог 43200с (12ч) кладём над ним с запасом ~30%."""
+
+    SHIM = r"C:\Users\u\.local\bin\claude.exe"
+    IDLE_21_MIN = 1290.0        # ровно тот возраст лога, на котором канал гасили 29 раз за сутки
+    OBSERVED_SILENCE = 33245.0  # 9,23ч — самый долгий молчок ЖИВОГО канала (30.07 03:28:27→12:42:32)
+
+    def _run(self, spec, probe, **kw):
+        spawns, kills = [], []
+
+        def spawner(claude, sp):
+            spawns.append(sp["label"])
+            return _FakeProc(poll_value=None)                # процесс всегда жив по poll
+
+        handler = _Collect()
+        rc.log.addHandler(handler)
+        try:
+            rc.supervise_branch(
+                spec, resolver=lambda: self.SHIM, spawner=spawner,
+                probe=probe, gate=lambda c: (True, "ok"),
+                sleeper=lambda s: None, killer=kills.append,
+                rounds=kw.pop("rounds", 1), checks=kw.pop("checks", 6),
+                grace_checks=kw.pop("grace_checks", 0),
+                strikes_needed=kw.pop("strikes_needed", 3),
+                auth=kw.pop("auth", _Auth()), notifier=lambda t: True,
+            )
+        finally:
+            rc.log.removeHandler(handler)
+        return spawns, kills, handler.lines
+
+    # --- порог обоснован СВОИМИ числами, а не скопирован с серверного ---
+    def test_named_threshold_covers_observed_healthy_silence(self):
+        self.assertGreater(rc.NAMED_LIVENESS_MAX_AGE, self.OBSERVED_SILENCE)
+        self.assertEqual(rc.NAMED_SPEC.get("max_age"), rc.NAMED_LIVENESS_MAX_AGE)
+
+    def test_named_threshold_is_not_a_copy_of_server(self):
+        # у веток РАЗНЫЕ интервалы записи лога → пороги обязаны отличаться, а не быть скопированы
+        self.assertNotEqual(rc.NAMED_LIVENESS_MAX_AGE, rc.SERVER_LIVENESS_MAX_AGE)
+        self.assertGreater(rc.NAMED_LIVENESS_MAX_AGE, rc.SERVER_LIVENESS_MAX_AGE)
+
+    # --- ГОЛДЕН 1: 0-TCP + лог свежее НОВОГО порога → НЕ гасится ---
+    def test_idle_channel_zero_tcp_fresh_log_not_killed(self):
+        # ДОСЛОВНО живой случай: 0 соединений, лог молчит 1290с. Старый порог гасил, новый — нет.
+        self.assertFalse(rc.channel_alive(self.IDLE_21_MIN, 0, max_age=1200))          # было: труп
+        self.assertTrue(rc.channel_alive(self.IDLE_21_MIN, 0,
+                                         max_age=rc.NAMED_LIVENESS_MAX_AGE))           # стало: жив
+        ok = rc.probe_alive(rc.NAMED_SPEC, pid=1, now=100000.0,
+                            getmtime=lambda p: 100000.0 - self.IDLE_21_MIN,
+                            conns=lambda pid: 0)
+        self.assertTrue(ok)
+
+    def test_idle_channel_survives_full_monitor_loop(self):
+        # тот же случай через ВЕСЬ цикл монитора: ни одного гашения за 6 проверок подряд
+        probe = lambda sp, pid: rc.probe_detail(
+            sp, pid, now=100000.0, getmtime=lambda p: 100000.0 - self.IDLE_21_MIN,
+            conns=lambda _p: 0)
+        spawns, kills, lines = self._run(rc.NAMED_SPEC, probe, rounds=1, checks=6)
+        self.assertEqual(len(kills), 0)
+        self.assertEqual(len(spawns), 1)
+        self.assertEqual([l for l in lines if "ЗОМБИ" in l], [])
+
+    # --- ГОЛДЕН 2: 0-TCP + молчок ДОЛЬШЕ нового порога → гасится, и строка называет ЧИСЛА ---
+    def test_really_dead_channel_still_killed_with_numbers(self):
+        dead_age = rc.NAMED_LIVENESS_MAX_AGE + 90.0          # порог + три страйка по 30с
+        probe = lambda sp, pid: rc.probe_detail(
+            sp, pid, now=100000.0, getmtime=lambda p: 100000.0 - dead_age,
+            conns=lambda _p: 0)
+        spawns, kills, lines = self._run(rc.NAMED_SPEC, probe, rounds=1, checks=6)
+        self.assertEqual(len(kills), 1)                      # настоящий труп ПО-ПРЕЖНЕМУ гасится
+        zombie = [l for l in lines if "ЗОМБИ" in l]
+        self.assertEqual(len(zombie), 1)
+        line = zombie[0]
+        self.assertIn("%.0fс" % dead_age, line)              # возраст лога — числом
+        self.assertIn(str(rc.NAMED_LIVENESS_MAX_AGE), line)  # порог ветки — числом
+        self.assertIn("соединений 0", line)                  # соединения — числом
+        self.assertIn("named-channel", line)
+
+    def test_kill_line_names_age_threshold_and_conns(self):
+        # строка сноса обязана содержать ВСЕ три числа + pid: без них ложное гашение неотличимо
+        # от настоящего (ровно так класс 24.07 прожил на второй ветке ещё шесть суток)
+        probe = lambda sp, pid: (False, 43290.0, 0, 43200)
+        _spawns, kills, lines = self._run(rc.NAMED_SPEC, probe, rounds=1, checks=6)
+        self.assertEqual(len(kills), 1)
+        line = [l for l in lines if "ЗОМБИ" in l][0]
+        for token in ("43290с", "43200", "соединений 0", "pid=", "3 проверок подряд"):
+            self.assertIn(token, line)
+
+    def test_missing_log_file_reported_as_such_not_zero(self):
+        # лога нет вовсе → в строке честное «нет файла», а не «0с» (иначе читается как «свежий»)
+        self.assertEqual(rc.fmt_age(None), "нет файла")
+        self.assertEqual(rc.fmt_age(1290.0), "1290с")
+
+    # --- РЕГРЕСС: серверная ветка правкой не задета ---
+    def test_server_branch_untouched(self):
+        self.assertEqual(rc.SERVER_LIVENESS_MAX_AGE, 3600)
+        self.assertEqual(rc.SERVER_SPEC.get("max_age"), 3600)
+        # сервер судится ровно как 24.07: 1500с свеж, 3700с протух
+        self.assertTrue(rc.probe_alive(rc.SERVER_SPEC, pid=1, now=50000.0,
+                                       getmtime=lambda p: 50000.0 - 1500, conns=lambda pid: 0))
+        self.assertFalse(rc.probe_alive(rc.SERVER_SPEC, pid=1, now=50000.0,
+                                        getmtime=lambda p: 50000.0 - 3700, conns=lambda pid: 0))
+
+    def test_server_kill_still_fires_after_three_strikes(self):
+        probe = lambda sp, pid: rc.probe_detail(
+            sp, pid, now=100000.0, getmtime=lambda p: 100000.0 - 4000.0, conns=lambda _p: 0)
+        _spawns, kills, lines = self._run(rc.SERVER_SPEC, probe, rounds=1, checks=6)
+        self.assertEqual(len(kills), 1)
+        self.assertIn("порога 3600с", [l for l in lines if "ЗОМБИ" in l][0])
+
+    # --- ТРЕТЬЕЙ ветки с этим предикатом нет: замок на будущее ---
+    def test_no_branch_rides_the_shared_default(self):
+        # веток ровно две, и у КАЖДОЙ порог задан явно — новая ветка без своего max_age
+        # молча унаследовала бы общий 1200с и повторила бы этот же класс третий раз
+        self.assertEqual(len(rc.BRANCHES), 2)
+        for spec in rc.BRANCHES:
+            self.assertIsNotNone(spec.get("max_age"), spec["label"])
+
+    def test_predicate_itself_unchanged(self):
+        # чинили ТОЛЬКО порог: сам предикат (лог свеж ИЛИ есть соединения) не тронут —
+        # соединение по-прежнему спасает канал при сколь угодно старом логе
+        self.assertTrue(rc.channel_alive(999999, 1, max_age=rc.NAMED_LIVENESS_MAX_AGE))
+        self.assertFalse(rc.channel_alive(999999, 0, max_age=rc.NAMED_LIVENESS_MAX_AGE))
+        self.assertFalse(rc.channel_alive(None, 0, max_age=rc.NAMED_LIVENESS_MAX_AGE))
 
 
 class TestAuthStalenessWiring(unittest.TestCase):

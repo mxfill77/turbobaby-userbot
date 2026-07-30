@@ -30,8 +30,10 @@ rc_supervisor.py — вечный ДВУХРЕЖИМНЫЙ сеанс Claude Cod
 процесс при мёртвом канале». Судить по одному числу TCP НЕЛЬЗЯ — доказано, что и живой канал
 приходит к 0 соединений в простое. Единый предикат channel_alive: канал жив, если процесс
 НЕДАВНО писал в свой --debug-file (свежесть лога) ЛИБО держит установленные соединения; мёртв —
-только когда НЕТ обоих. Порог свежести берём с ЗАПАСОМ над реальными интервалами (лог сервера
-пишется вехами ~раз в 10 мин, соединения именованной сессии тают ~за 15 мин) → дефолт 20 мин.
+только когда НЕТ обоих. Порог свежести — ПЕР-BRANCH (spec["max_age"]), потому что ветки пишут
+лог СОВЕРШЕННО по-разному: сервер — вехами поллинга (разрыв в простое >20 мин, порог 3600с),
+именованный канал — ОДНИМ всплеском на старте и больше никогда (порог 43200с). Общий
+LIVENESS_MAX_AGE=1200с остался лишь дефолтом для ветки без своего ключа.
 
 Синглтон: именованный мьютекс Windows — вторая копия СУПЕРВИЗОРА (ручной запуск поверх задачи)
 молча выходит, чтобы не плодить дубли обеих веток.
@@ -90,9 +92,31 @@ LIVENESS_ENABLED = os.getenv("RC_LIVENESS", "1") != "0"
 # и в простое интервал между вехами разрастается >20 мин (backoff поллинга), а poll-соединение кратко
 # рвётся при реконнекте → общий предикат ложно приговаривал ЖИВОЙ простаивающий сервер и рестартовал
 # его каждые 20–76 мин, плодя новую Environment на КАЖДЫЙ старт (churn мёртвых сред 24.07 — разбор в
-# docs/artifacts/2026-07-24-rc-churn-liveness.md). Час перекрывает разрыв вех с запасом. Именованный
-# канал остаётся на общем LIVENESS_MAX_AGE (его соединения тают ~за 15 мин — 1200с ему достаточно).
+# docs/artifacts/2026-07-24-rc-churn-liveness.md). Час перекрывает разрыв вех с запасом.
 SERVER_LIVENESS_MAX_AGE = int(os.getenv("RC_SERVER_LIVENESS_MAX_LOG_AGE", "3600") or "3600")
+# Порог свежести ДЛЯ ВЕТКИ КАНАЛА. Класс-фикс 24.07 закрыли ТОЛЬКО серверу, а зеркальную ветку
+# оставили на общем 1200с — за последние сутки она погасила канал 29 раз против 1 у сервера
+# (столько же и за календарный день 30.07; 27 владелец насчитал на более раннем срезе окна —
+# за время работы окно сдвинулось на два цикла), и КАЖДЫЙ снос рвал живые сессии. Все числа ниже
+# воспроизводятся `diag_rc_liveness_replay.py`; разбор — docs/artifacts/2026-07-30-rc-named-liveness.md.
+# Порог обоснован ЧИСЛАМИ САМОЙ ВЕТКИ, а не скопирован с серверного:
+#   • канал пишет в свой --debug-file РОВНО ОДИН раз за жизнь — всплеск на старте, и дальше НИ
+#     БАЙТА: в отличие от сервера вех поллинга у него нет вообще (замер pid 13464: старт
+#     20:41:34.623, последняя запись 20:41:35.814 — 70 строк за 904 мс; через 4 мин возраст лога
+#     252.1с при возрасте процесса 253.3с, разница постоянная). То есть «свежесть лога» у этой
+#     ветки — не heartbeat, а ОДНОРАЗОВАЯ отметка старта, и она протухает всегда;
+#   • второе плечо (established>0) в простое тоже гаснет: это доказано самими гашениями — каждое
+#     требует 0 соединений на 3 проверках подряд, и таких 358 за 6,2 суток;
+#   • ⇒ при пороге 1200с смерть НАСТУПАЛА ДЕТЕРМИНИРОВАННО на 1290-й секунде (1200 + 3 страйка ×
+#     30с): 333 жизни из 359 уложились в [1290; 1291) с = 21,5 мин при медиане 1290с, min 1200с;
+#   • самый долгий молчок ЗДОРОВОГО канала: 9,23ч — жизнь 30.07 03:28:27→12:42:32 (33 245с)
+#     пережила сон ПК и была срублена уже на пробуждении; вторая такая — 3,45ч (26.07
+#     09:49:15→13:16:05, 12 410с). Обе без exit-строки, т.е. процесс всё это время был жив.
+# 43200с (12ч) = запас ~30% над самым долгим наблюдённым здоровым молчком (33 245с), перекрывает
+# ночной простой И типовой сон ПК (класс #171), а по-настоящему зависший канал всё равно
+# срубается за 12ч + 90с. Быстрые отказы ловятся не этим порогом: выход процесса — за ≤30с,
+# протухшие креды — детектором rc_auth_detect, непригодный вход — гейтом doctor.
+NAMED_LIVENESS_MAX_AGE = int(os.getenv("RC_NAMED_LIVENESS_MAX_LOG_AGE", "43200") or "43200")
 # Счётчик страйков: ветку гасим как зомби только после STRIKES ПОДРЯД мёртвых проверок, а не одной.
 # Мгновенная просадка соединений при реконнекте (0 conns на один 30-с тик) больше не убивает живой
 # процесс — предикат смерти обязан держаться ~STRIKES*CHECK_INTERVAL с непрерывно. Реальный зомби
@@ -104,7 +128,8 @@ LIVENESS_STRIKES = int(os.getenv("RC_LIVENESS_STRIKES", "3") or "3")
 #   named-channel: ['--remote-control', <имя>]     → именованная интерактивная сессия
 SERVER_SPEC = {"label": "rc-server", "mode": ("rc",), "log": SERVER_LOG,
                "max_age": SERVER_LIVENESS_MAX_AGE, "auth_watch": True}
-NAMED_SPEC = {"label": "named-channel", "mode": ("--remote-control", SESSION_NAME), "log": NAMED_LOG}
+NAMED_SPEC = {"label": "named-channel", "mode": ("--remote-control", SESSION_NAME), "log": NAMED_LOG,
+              "max_age": NAMED_LIVENESS_MAX_AGE}
 BRANCHES = (SERVER_SPEC, NAMED_SPEC)
 
 # Детектор ПРОТУХШЕЙ авторизации (вариант «а» артефакта 2026-07-29-rc-token-staleness-prevention):
@@ -340,15 +365,29 @@ def channel_alive(age_sec, established, max_age=None):
     return bool(log_fresh or (established or 0) > 0)
 
 
-def probe_alive(spec, pid, now=None, getmtime=None, conns=None, max_age=None):
-    """Живость канала ветки: свежесть её --debug-file + установленные соединения pid → предикат
-    channel_alive. Порог свежести берётся ПЕР-BRANCH из spec["max_age"] (у сервера шире — 3600с),
-    когда явный max_age не задан; ключа нет → общий LIVENESS_MAX_AGE (именованный канал = 1200с).
-    Инъекции now/getmtime/conns/max_age — для тестов без файловой системы и netstat."""
+def probe_detail(spec, pid, now=None, getmtime=None, conns=None, max_age=None):
+    """Живость канала ветки С ЧИСЛАМИ, по которым вынесен вердикт → (alive, age_sec, est, max_age).
+    Числа возвращаем, а не только bool, чтобы строка сноса называла ПРИЧИНУ (возраст лога, число
+    соединений, порог) — иначе будущие ложные и настоящие гашения снова неотличимы в логе.
+    Порог берётся ПЕР-BRANCH из spec["max_age"] (сервер 3600с, канал 43200с), когда явный max_age
+    не задан; ключа нет → общий LIVENESS_MAX_AGE. Инъекции now/getmtime/conns/max_age — для
+    тестов без файловой системы и netstat."""
     age = log_age(spec["log"], now=now, getmtime=getmtime)
     est = (conns or established_conns)(pid)
     _max = max_age if max_age is not None else spec.get("max_age")
-    return channel_alive(age, est, max_age=_max)
+    if _max is None:
+        _max = LIVENESS_MAX_AGE
+    return channel_alive(age, est, max_age=_max), age, est, _max
+
+
+def probe_alive(spec, pid, now=None, getmtime=None, conns=None, max_age=None):
+    """Булев вердикт probe_detail (совместимость: вызывающим, кому числа не нужны)."""
+    return probe_detail(spec, pid, now=now, getmtime=getmtime, conns=conns, max_age=max_age)[0]
+
+
+def fmt_age(age_sec):
+    """Возраст лога для строки журнала: None (файла нет) — так и говорим, а не «0с»."""
+    return "нет файла" if age_sec is None else "%.0fс" % age_sec
 
 
 def default_spawn(claude, spec, verbose=None, popen=None):
@@ -407,7 +446,7 @@ def default_gate(claude, ready=None, notifier=None, now=None):
 
 def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
                      sleeper=None, killer=None, rounds=None, checks=None, grace_checks=None,
-                     strikes_needed=None, auth=None, notifier=None):
+                     strikes_needed=None, auth=None, notifier=None, probe=None):
     """Вечный НЕЗАВИСИМЫЙ цикл ОДНОЙ ветки (свой поток): резолв шима → пре-флайт → подъём процесса
     → монитор → пауза → снова. Монитор рестартует по ДВУМ причинам: процесс ВЫШЕЛ сам (poll!=None)
     ЛИБО зомби — процесс жив, но канал мёртв по probe_alive _strikes_needed проверок ПОДРЯД (после
@@ -417,10 +456,18 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
     Грейс её НЕ касается: этот отказ виден с первой же убитой сессии, а ждать 3 минуты значит
     подарить владельцу ещё один труп.
     rounds/checks/grace_checks/strikes_needed — ограничители/инъекции для тестов
-    (None = боевой бесконечный режим); auth/notifier — инъекция детектора кредов. → 0."""
+    (None = боевой бесконечный режим); auth/notifier — инъекция детектора кредов;
+    probe — инъекция пробы С ЧИСЛАМИ (probe_detail), alive — старая булева (числа в строке
+    сноса тогда неизвестны). → 0."""
     _resolve = resolver or resolve_claude
     _spawn = spawner or default_spawn
-    _alive = alive or probe_alive
+    if probe is not None:
+        _probe = probe
+    elif alive is not None:
+        _probe = lambda sp, pid: (alive(sp, pid), None, None,
+                                  sp.get("max_age") or LIVENESS_MAX_AGE)
+    else:
+        _probe = probe_detail
     _gate = gate or default_gate
     _sleep = sleeper or time.sleep
     _kill = killer or default_kill
@@ -486,11 +533,19 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
             # одному тику, а после _strikes_needed ПОДРЯД мёртвых проверок: мгновенная просадка соединений
             # при реконнекте (0 conns на один тик) сбрасывает счётчик и НЕ убивает здоровый простаивающий
             # сервер (класс churn 24.07). Порог свежести лога — пер-branch, из spec (у сервера шире).
-            if LIVENESS_ENABLED and c > _grace and not _alive(spec, proc.pid):
+            dead, age, est, thr = False, None, None, None
+            if LIVENESS_ENABLED and c > _grace:
+                ok_live, age, est, thr = _probe(spec, proc.pid)
+                dead = not ok_live
+            if dead:
                 strikes += 1
                 if strikes >= _strikes_needed:
-                    log.info("[%s] ЗОМБИ: канал мёртв %s проверок подряд (лог протух И 0 соединений)"
-                             " — гашу pid=%s, рестарт", spec["label"], strikes,
+                    # Строка сноса НАЗЫВАЕТ ЧИСЛА, а не только вердикт: возраст лога, порог ветки,
+                    # соединения. Без них ложное гашение неотличимо от настоящего — ровно так класс
+                    # 24.07 и прожил незамеченным на второй ветке ещё шесть суток.
+                    log.info("[%s] ЗОМБИ: канал мёртв %s проверок подряд — возраст лога %s > порога"
+                             " %sс, соединений %s — гашу pid=%s, рестарт",
+                             spec["label"], strikes, fmt_age(age), thr, est,
                              getattr(proc, "pid", "?"))
                     if proc.poll() is None:
                         _kill(proc)
