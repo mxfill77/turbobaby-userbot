@@ -519,7 +519,14 @@ FAIL_REASONS = {                               # код → (человечес�
     FAIL_MODEL_REFUSAL: ("отказ модели", MANUAL_MARK),
     FAIL_EXEC_ERROR: ("ошибка выполнения", ""),
 }
-WORK_DONE_MARK = "РАБОТА ВЫПОЛНЕНА"   # ищется и глазами владельца, и грепом по журналу
+# Формулировка НАМЕРЕННО про ОКНО, а не про авторство. Живая проверка на окне задачи 61 показала:
+# в её 90 минут попали 8 коммитов, из которых её собственный — один (a3f75dd), остальные сделали
+# параллельные RC/Dispatch-сессии этого же ПК. Сказать «РАБОТА ВЫПОЛНЕНА» про чужой коммит — та же
+# ложь, только с другого конца; поэтому итог показывает улики и честно называет их окном.
+WORK_DONE_MARK = "В ОКНЕ ЗАДАЧИ ЕСТЬ РАБОТА"   # ищется и глазами владельца, и грепом по журналу
+# Служебные строки самого демона («NOTE …: Orchestrator: взял задачу #61») в реестре журнала есть,
+# но работой задачи НЕ являются — иначе уликой станет сама отметка о старте.
+_LEDGER_SELF_RE = re.compile(r"^\w+\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+UTC:\s*Orchestrator:")
 FAIL_CODE_RE = re.compile(r"причина=([a-z_]+)")   # разбор кода из готовой строки итога
 
 # Отметка момента CLAIM — НА ДИСКЕ. Задачу часто закрывает УЖЕ ДРУГОЙ процесс демона (само-
@@ -577,8 +584,11 @@ def _task_started_get(tid, path=None):
 
 def _git_commits_between(since, until):
     """Коммиты репо в окне → [(хеш, заголовок)]. Границы отдаём git'у в UTC с явной зоной."""
+    # --reverse: от НАЧАЛА окна. Показываем первые EVIDENCE_MAX_COMMITS, а работа задачи обычно
+    # ложится в начало её окна — при обратном (git-дефолтном) порядке живая проверка задачи 61
+    # выкинула из показа её собственный a3f75dd, оставив пять чужих, более свежих.
     fmt = "%Y-%m-%dT%H:%M:%S%z"
-    out = _git_out(["log", "--no-merges",
+    out = _git_out(["log", "--no-merges", "--reverse",
                     "--since=" + since.astimezone(datetime.timezone.utc).strftime(fmt),
                     "--until=" + until.astimezone(datetime.timezone.utc).strftime(fmt),
                     "--pretty=%h\x1f%s"])
@@ -606,8 +616,9 @@ def _journal_writes_between(since, until, path=None):
                     continue          # битая строка реестра не должна прятать остальные
                 if t.tzinfo is None:
                     t = t.replace(tzinfo=datetime.timezone.utc)
-                if since <= t <= until:
-                    rows.append(str(rec.get("line") or ""))
+                line = str(rec.get("line") or "")
+                if since <= t <= until and not _LEDGER_SELF_RE.match(line):
+                    rows.append(line)     # служебные NOTE самого демона уликой не считаем
     except FileNotFoundError:
         return []
     except Exception as e:
@@ -665,8 +676,9 @@ def fail_result(code, detail, since=None, now=None):
     if journal:
         parts.append("записей журнала %d (%s)" % (len(journal), "; ".join(
             "«%s»" % _clip(x, 90) for x in journal[:EVIDENCE_MAX_JOURNAL])))
-    return ("%sНЕ ЗАКРЫТА, но %s %s: %s. СЛЕДЫ РАБОТЫ в окне %s: %s. Формальное закрытие не "
-            "состоялось — переделывать с нуля НЕ надо: проверь сделанное и закрой руками."
+    return ("%sНЕ ЗАКРЫТА, но %s %s: %s. СЛЕДЫ в окне %s: %s. Формальное закрытие не состоялось — "
+            "НЕ переделывай вслепую: сверь эти следы с заданием и закрой руками. (Окно, а не "
+            "авторство: в него попадают и параллельные сессии ПК.)"
             % (lead, WORK_DONE_MARK, head, detail, win, ", ".join(parts)))[:RESULT_MAX]
 
 
@@ -1182,7 +1194,8 @@ def _human(kind, tid, text):
         # «провалена» ложь, когда работа В ОКНЕ ЗАДАЧИ была: заголовок обязан различать
         # незакрытую-но-сделанную и по-настоящему несделанную (класс 30.07, задачи 54/61).
         if WORK_DONE_MARK in str(text or ""):
-            return f"⚠️ Оркестратор: задача #{tid} — работа выполнена, закрытие не состоялось — {first}"
+            return (f"⚠️ Оркестратор: задача #{tid} — в окне есть работа, закрытие не состоялось "
+                    f"— {first}")
         return f"❌ Оркестратор: задача #{tid} провалена — {first}"
     if kind == "needs_approval":
         return f"🔔 Оркестратор: задача #{tid} ждёт твоего «да» — {first}"

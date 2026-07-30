@@ -3017,8 +3017,30 @@ class TestFailReasonEvidence(Base):
             r = o.fail_result(o.FAIL_HEARTBEAT_TIMEOUT, "сердце молчит", since=iso_dt(600))
         self.assertIn(o.WORK_DONE_MARK, r)
         self.assertIn("a3f75dd", r)                    # улику НАЗЫВАЕМ, а не «работа была»
-        self.assertIn("переделывать с нуля НЕ надо", r)
+        self.assertIn("НЕ переделывай вслепую", r)
         self.assertIn("heartbeat_timeout", r)          # причина не растворилась в улике
+
+    def test_window_is_not_authorship(self):
+        # живая проверка на окне задачи 61: из 8 коммитов окна её собственный ОДИН, остальные —
+        # параллельные сессии ПК. Итог обязан говорить «окно», а не присваивать задаче чужое.
+        with self._ev(self.EV_COMMIT):
+            r = o.fail_result(o.FAIL_HEARTBEAT_TIMEOUT, "сердце молчит", since=iso_dt(600))
+        self.assertIn("В ОКНЕ ЗАДАЧИ", r)
+        self.assertIn("Окно, а не авторство", r)
+        self.assertNotIn("РАБОТА ВЫПОЛНЕНА", r)        # утверждения об авторстве в тексте нет
+
+    def test_own_service_notes_are_not_evidence(self):
+        # «NOTE …: Orchestrator: взял задачу #61» лежит в реестре, но это отметка САМОГО демона:
+        # засчитать её уликой значит объявить работой факт старта задачи
+        path = os.path.join(tempfile.mkdtemp(), "cowork_log.ledger")
+        with open(path, "w", encoding="utf-8") as f:
+            for line in ("NOTE 2026-07-30 12:41 UTC: Orchestrator: взял задачу #61 (in_progress)",
+                         "DONE 2026-07-30 12:45 UTC: ARTIFACT тренажёр-вердикт → docs/artifacts/…"):
+                f.write(json.dumps({"ts": iso_dt(300).isoformat(), "line": line},
+                                   ensure_ascii=False) + "\n")
+        rows = o._journal_writes_between(iso_dt(600), iso_dt(0), path=path)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("ARTIFACT", rows[0])
 
     def test_journal_only_evidence_also_counts(self):
         # задача 61 записала журнал — этого достаточно, коммит не обязателен
@@ -3085,9 +3107,16 @@ class TestFailReasonEvidence(Base):
     # --- сбор улик из живых источников ---------------------------------------
     def test_git_commits_parsed(self):
         out = "a3f75dd\x1fгард PEB\nfa54ce7\x1fгард sqlite"
-        with mock.patch.object(o, "_git_out", lambda args: out):
+        seen = {}
+
+        def fake_git(args):
+            seen["args"] = args
+            return out
+
+        with mock.patch.object(o, "_git_out", fake_git):
             rows = o._git_commits_between(iso_dt(600), iso_dt(0))
         self.assertEqual(rows, [("a3f75dd", "гард PEB"), ("fa54ce7", "гард sqlite")])
+        self.assertIn("--reverse", seen["args"])       # показ от НАЧАЛА окна, а не от свежих чужих
 
     def test_journal_ledger_window_respected(self):
         path = os.path.join(tempfile.mkdtemp(), "cowork_log.ledger")
@@ -3148,7 +3177,7 @@ class TestFailReasonEvidence(Base):
     def test_human_headline_stops_lying(self):
         with self._ev(self.EV_COMMIT):
             txt = o.fail_result(o.FAIL_HEARTBEAT_TIMEOUT, "сердце молчит", since=iso_dt(600))
-        self.assertIn("работа выполнена", o._human("failed", 61, txt))
+        self.assertIn("в окне есть работа", o._human("failed", 61, txt))
         self.assertIn("провалена", o._human("failed", 61, "пустой вывод claude"))
 
 
