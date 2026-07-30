@@ -591,7 +591,8 @@ def _default_git_verify(ref):
     import subprocess
     try:
         p = subprocess.run(["git", "rev-parse", "--verify", "--quiet", str(ref) + "^{commit}"],
-                           cwd=REPO, capture_output=True, text=True, timeout=15)
+                           cwd=REPO, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=15)
         return p.returncode == 0
     except Exception:
         return False

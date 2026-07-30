@@ -49,6 +49,7 @@ from telegram.error import NetworkError, TimedOut
 from telegram.ext import (ApplicationBuilder, MessageHandler, CallbackQueryHandler,
                           filters, ContextTypes)
 
+import io_utf8          # переключатель stdout/stderr в UTF-8 (класс «charmap can't encode 📊»)
 import selfupdate_gate  # гейт самообновления (проверка нового кода перед рестартом)
 
 # Скрытый запуск служебных консольных подпроцессов (powershell/tasklist/taskkill/git/боты):
@@ -139,7 +140,8 @@ def _find_userbot_pids():
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=20, creationflags=NO_WINDOW,
         )
         return [int(x) for x in out.stdout.split() if x.strip().isdigit()]
     except Exception as e:
@@ -152,7 +154,8 @@ def _taskkill(pid):
     try:
         r = subprocess.run(
             ["taskkill", "/PID", str(pid), "/F", "/T"],
-            capture_output=True, text=True, timeout=15, creationflags=NO_WINDOW,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15, creationflags=NO_WINDOW,
         )
         return r.returncode == 0
     except Exception as e:
@@ -261,7 +264,8 @@ class UserbotProcess:
         try:
             pull = subprocess.run(
                 ["git", "-C", str(REPO_DIR), "pull"],
-                capture_output=True, text=True, timeout=120, creationflags=NO_WINDOW,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=120, creationflags=NO_WINDOW,
             )
             pull_out = (pull.stdout + pull.stderr).strip() or "(git pull: пустой вывод)"
         except Exception as e:
@@ -285,7 +289,8 @@ def _find_moderbot_pids():
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=20, creationflags=NO_WINDOW,
         )
         return [int(x) for x in out.stdout.split() if x.strip().isdigit()]
     except Exception as e:
@@ -484,7 +489,8 @@ def _git_pull():
     try:
         r = subprocess.run(
             ["git", "-C", str(REPO_DIR), "pull", "--ff-only"],
-            capture_output=True, text=True, timeout=120, creationflags=NO_WINDOW,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120, creationflags=NO_WINDOW,
         )
         out = (r.stdout + r.stderr).strip() or "(пустой вывод)"
         return (r.returncode == 0), out
@@ -608,7 +614,8 @@ def _chain_cli(action, pid):
     try:
         r = subprocess.run(
             [str(VENV_PY), str(REPO_DIR / "pc_orchestrator.py"), f"--chain-{action}", str(pid)],
-            capture_output=True, text=True, timeout=90, cwd=str(REPO_DIR),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=90, cwd=str(REPO_DIR),
             creationflags=NO_WINDOW,
         )
         out = (r.stdout or "").strip() or (r.stderr or "").strip()
@@ -785,7 +792,8 @@ def _agent_pid_alive(pid: int) -> bool:
     try:
         out = subprocess.run(
             ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-            capture_output=True, text=True, timeout=10, creationflags=NO_WINDOW,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10, creationflags=NO_WINDOW,
         )
         return f'"{pid}"' in out.stdout or f",{pid}," in out.stdout
     except Exception:
@@ -931,6 +939,9 @@ async def _cowork_sync_job(context):
 
 
 def main():
+    # stdout/stderr → UTF-8 ДО всего: логи агента и вывод (в т.ч. traceback) содержат кириллицу
+    # и эмодзи; без этого StreamHandler ронял бы запись на 📊 под cp1251-консолью Планировщика.
+    io_utf8.force_utf8()
     # Singleton-гард — ПЕРВЫМ действием в main, атомарно, ДО всего остального.
     # (Примечание: «второй процесс» с системным python был НЕ от кода, а от venv-
     #  лаунчера — см. fix_venv_launcher.ps1. Гард остаётся как страховка от реального

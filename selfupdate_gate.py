@@ -27,8 +27,8 @@ def code_gate(py_exe, cwd, compile_files, import_smoke, timeout=60):
     try:
         r = subprocess.run(
             [str(py_exe), "-m", "py_compile", *[str(f) for f in compile_files]],
-            cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
-            creationflags=NO_WINDOW,
+            cwd=str(cwd), capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, creationflags=NO_WINDOW,
         )
         if r.returncode != 0:
             return False, "py_compile: " + ((r.stderr or r.stdout).strip()[:500] or "ошибка компиляции")
@@ -38,8 +38,8 @@ def code_gate(py_exe, cwd, compile_files, import_smoke, timeout=60):
     try:
         r = subprocess.run(
             [str(py_exe), "-c", f"import {import_smoke}"],
-            cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
-            creationflags=NO_WINDOW,
+            cwd=str(cwd), capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, creationflags=NO_WINDOW,
         )
         if r.returncode != 0:
             return False, "import-smoke: " + ((r.stderr or r.stdout).strip()[:500] or "ошибка импорта")

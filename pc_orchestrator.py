@@ -42,6 +42,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
+import io_utf8               # переключатель stdout/stderr в UTF-8 (класс «charmap can't encode 📊»)
 import gate_selective         # селективный тест-гейт авто-применения (порт VPS GATE_STEP/SINGLE_SELECTIVE); чистый, без сети
 import task_metrics           # единый формат строки METRICS (обе полосы) + norm_effort/extract_tokens/selfheal_count
 import lesson_router          # обработчик задач-уроков (родитель 292, шаг 3): классификация+маршрут; suggest тянет лениво
@@ -691,7 +692,8 @@ def _count_claude_procs(runner=None, own_pid=None):
     try:
         p = (runner or subprocess.run)(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PROC_SNAPSHOT_PS],
-            capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW)
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=20, creationflags=NO_WINDOW)
     except Exception as e:
         log.warning("бюджет claude: счёт процессов не удался (%s) — fail-open", e)
         return None
@@ -3864,7 +3866,8 @@ def _find_pids_by_script(script_name):
           "| Select-Object -ExpandProperty ProcessId")
     try:
         p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=20, creationflags=NO_WINDOW)
     except Exception as e:
         log.warning("контур-вотчдог: CIM-поиск %s не удался (%s) — исход НЕИЗВЕСТЕН, НЕ считаем мёртвым", script_name, e)
         return None
@@ -4989,7 +4992,8 @@ def _lock_pid_alive(pid):
     """Жив ли процесс по PID (Windows, без psutil). Инъектируется в тестах."""
     try:
         r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-                           capture_output=True, text=True, timeout=10, creationflags=NO_WINDOW)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=10, creationflags=NO_WINDOW)
         return f'"{pid}"' in r.stdout or f",{pid}," in r.stdout
     except Exception:
         return False
@@ -5168,7 +5172,8 @@ def _find_daemon_pids():
           "| Select-Object -ExpandProperty ProcessId")
     try:
         p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=20, creationflags=NO_WINDOW)
     except Exception as e:
         log.warning("watchdog: CIM-поиск демона не удался (%s) — исход НЕИЗВЕСТЕН", e)
         return None
@@ -5287,6 +5292,11 @@ def self_update_ok():
 
 
 if __name__ == "__main__":
+    # ПЕРВОЙ КОМАНДОЙ: stdout/stderr → UTF-8. CLI-ветки ниже печатают статус цепи с эмодзи
+    # (📊/⏹), а pc_agent зовёт нас субпроцессом и ЧИТАЕТ этот вывод. Без явного UTF-8 print с
+    # 📊 в пайп падал `'charmap' codec can't encode '\U0001f4ca'`, и в кнопку «Статус цепи»
+    # уезжал traceback вместо статуса (третий укус класса, 30.07.2026).
+    io_utf8.force_utf8()
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     if arg == "--watchdog":
         print(watchdog())

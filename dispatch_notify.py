@@ -36,6 +36,8 @@ import subprocess
 import urllib.request
 import urllib.error
 
+import io_utf8   # переключатель stdout/stderr в UTF-8 (класс «charmap can't encode 📊»)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(HERE, ".env")
 NOTIFY_LOG = os.path.join(HERE, "dispatch_notify.log")
@@ -501,6 +503,9 @@ def _build(kind, hook):
 
 
 def main():
+    # stdout/stderr → UTF-8: ветки --topic печатают итог в stdout, а текст карточек/пингов несёт
+    # эмодзи (🔔 📊 ⏹) и кириллицу. Пара к reconfigure(stdin) выше — тот же класс кодировки.
+    io_utf8.force_utf8()
     args = list(sys.argv[1:])
     try:
         if args and args[0] == "--critical":

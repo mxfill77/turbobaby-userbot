@@ -12,6 +12,7 @@
 # Оба отказа падают в общий except main(), поэтому строка НЕ теряется, а уходит в спул ровно
 # как при таймауте: защита не смеет превращаться в потерю записи.
 import os, re, sys, json, time, socket, datetime, urllib.request, urllib.parse, urllib.error
+import io_utf8   # переключатель stdout/stderr в UTF-8 (класс «charmap can't encode 📊»)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(HERE, ".env")
@@ -175,6 +176,10 @@ def read_stdin_text(stream=None):
 
 
 def main():
+    # stdout/stderr → UTF-8: строку «OK: записано…» и отчёты об отказе (кириллица) нас часто
+    # спавнят detached-ребёнком в utf-8-приёмник (dispatch_notify._cowork) — без явного UTF-8
+    # cp1251-байты легли бы мохибейком. Пара к read_stdin_text() (тот же класс, входная полоса).
+    io_utf8.force_utf8()
     msg = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else read_stdin_text().strip()
     if not msg:
         sys.stderr.write("ОШИБКА: пустая строка-итог\n"); sys.exit(1)
