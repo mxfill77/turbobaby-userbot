@@ -165,7 +165,8 @@ except Exception:
 if _orch_h is not None:
     logging.basicConfig(level=logging.INFO, handlers=[_orch_h])
 else:
-    logging.basicConfig(filename=LOG_PATH, level=logging.INFO, format=_ORCH_FMT)
+    logging.basicConfig(filename=LOG_PATH, level=logging.INFO, format=_ORCH_FMT,
+                        encoding="utf-8")   # без него фолбэк-лог берёт cp1251 → эмодзи в записи = charmap
 log = logging.getLogger("pc_orchestrator")
 
 # ТЕСТ-ПРОГОН ПРОТИВ БОЕВОГО (порт с VPS 25.07.2026). На ПК разведение УЖЕ своё и остаётся как
@@ -5301,7 +5302,7 @@ if __name__ == "__main__":
     if arg == "--watchdog":
         print(watchdog())
     elif arg == "--stop":
-        open(STOP_FLAG, "w").close()
+        open(STOP_FLAG, "w", encoding="utf-8").close()
         print("рубильник поставлен: pc_orchestrator.stop")
     elif arg == "--start":
         try:

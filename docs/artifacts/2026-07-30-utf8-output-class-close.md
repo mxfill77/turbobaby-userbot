@@ -50,6 +50,32 @@ AST-скан по контуру (7 файлов): (A) каждый вход-п�
 именно `force_utf8()`. Новое место (print-скрипт без force_utf8 / text=True без encoding) валит
 гейт — четвёртого укуса молча не будет. Страж СРАЗУ поймал пропущенный `pc_agent._git_pull:490`.
 
+## Догон 30.07 — полоса C (запись в ФАЙЛ), которую первый шов НЕ закрыл
+Первый шов закрыл ДВЕ полосы (пайп/консоль через `force_utf8`, чтение чужого вывода через
+`encoding=` у subprocess), но ТРЕТИЙ канал того же класса — **запись в ФАЙЛ** — остался без
+стража. `force_utf8()` его не лечит принципиально: reconfigure трогает только `stdout/stderr`,
+а `open(log,'w')`/`log.info` берут кодировку ЛОКАЛИ (здесь cp1251). Воспроизведено на этой машине
+(`getpreferredencoding()==cp1251`): `open(p,'w').write('📊')` без `encoding` падает тем же
+`'charmap' codec can't encode character '\U0001f4ca'`, что и кнопка; с `encoding="utf-8"` 📊
+доходит целым (`'📊 цепь #1: демо'`). Это и был потенциальный ЧЕТВЁРТЫЙ укус.
+
+Живого дефекта на боевом пути не было (все текстовые `open()` контура уже несли `encoding`), но
+два РЕДКИХ места контура текли и страж их не ловил:
+| Файл | Точка | Что текло |
+|---|---|---|
+| `pc_orchestrator.py:168` | фолбэк логгера `basicConfig(filename=…)` (когда `log_setup` не поднялся) | эмодзи в `log.info` → cp1251 → charmap |
+| `pc_orchestrator.py:5304` | `open(STOP_FLAG,"w")` рубильника | текст-режим без `encoding` (нарушение инварианта) |
+
+Оба закрыты `encoding="utf-8"`. Страж расширен ТРЕТЬИМ инвариантом (`TestFileWritesUtf8`):
+- `open_text_without_encoding` — каждый **builtin** `open()` в текст-режиме задаёт `encoding=`
+  (bare `Name('open')`; `os.open`/`opener.open`/бинарный `wb` — корректно пропущены);
+- `logging_file_sink_without_encoding` — каждый `FileHandler`-семейства и `basicConfig(filename=)`
+  задаёт `encoding=` (`StreamHandler` не трогаем — его закрывает `force_utf8`, полоса A).
+Набор `FILE_WRITERS` = 7 модулей стража + `log_setup.py` (центральная фабрика RotatingFileHandler
+обоих логов: оброни там encoding — оба лога разом уедут в cp1251). Проверено, что функции РЕАЛЬНО
+ловят нарушение (синтетика: `open('x','w')`→[1], с encoding→[], `wb`→[], `os.open`→[];
+`FileHandler('a.log')`→[1], `basicConfig(filename=…)`→[1], `basicConfig(handlers=…)`→[]).
+
 ## Границы (НЕ закрыто этой задачей — правка запрещена контуром)
 `userbot_listen.py`, `moderation_bot.py`, `suggest.py` — тот же класс на них остаётся отдельным
 остатком (перечислены в страже списком `OUT_OF_SCOPE`, тест проверяет, что они реально есть).
@@ -62,4 +88,6 @@ text=True), `suggest.py:4917` (уже с encoding). Развилка владе�
 - Реальный путь: `_chain_cli('status'|'stop', 424242)` → чистая кириллица, без падения (read-only).
 - Тосты кнопок: `📊 читаю статус…` / `⏹ останавливаю цепь…` — целы.
 - Round-trip: `📊 цепь #7: в работе, done 3`, rc=0.
-- Гейт полный: **2191 тестов, OK (skipped=10)**.
+- Полоса C (запись в файл, догон 30.07): `open(p,'w').write('📊')` под cp1251 БЕЗ фикса →
+  `'charmap' codec can't encode character '\U0001f4ca'`; С `encoding="utf-8"` → `'📊 цепь #1: демо'` целым.
+- Гейт полный (первый шов): **2191 тестов, OK (skipped=10)**; после полосы C — **2193 теста, OK (skipped=10)**.

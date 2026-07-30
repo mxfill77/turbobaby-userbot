@@ -9,13 +9,18 @@ test_utf8_output_guard.py — СТРАЖ класса кодировки выв�
   • кириллица в UTF-8-приёмник ложится МОХИБЕЙКОМ (093119e: «С‚РёРї РўРЎ» вместо «тип ТС»).
 Чинили ПО ОДНОМУ месту из трёх (журнал → dispatch_notify → кнопки) — класс возвращался.
 
-Страж держит по ФАКТУ ИСХОДНИКА (а не по договорённости «не забудь») два инварианта:
-  A) КАЖДЫЙ вход-процесс контура первой командой зовёт io_utf8.force_utf8() → его stdout/stderr
-     пишут UTF-8, откуда бы Планировщик/терминал/родитель его ни поднял (полоса ЗАПИСИ);
-  B) КАЖДЫЙ subprocess.run/Popen/check_output в текстовом режиме (text=True/universal_newlines)
-     задаёт encoding= явно → чужой вывод декодируется UTF-8, а не локалью (полоса ЧТЕНИЯ).
-Новое место (свежий print-скрипт без force_utf8 либо свежий text=True без encoding) валит гейт —
-класс не вернётся четвёртый раз молча.
+Страж держит по ФАКТУ ИСХОДНИКА (а не по договорённости «не забудь») ТРИ инварианта — по одному
+на КАЖДЫЙ канал, которым текст уходит наружу:
+  A) вывод в ПАЙП/КОНСОЛЬ: КАЖДЫЙ вход-процесс контура первой командой зовёт io_utf8.force_utf8()
+     → его stdout/stderr пишут UTF-8, откуда бы Планировщик/терминал/родитель его ни поднял;
+  B) ЧТЕНИЕ чужого вывода: КАЖДЫЙ subprocess.run/Popen/check_output в текстовом режиме
+     (text=True/universal_newlines) задаёт encoding= явно → декод UTF-8, а не локалью Windows;
+  C) запись в ФАЙЛ: КАЖДЫЙ builtin open() в текст-режиме и КАЖДЫЙ файловый sink logging
+     (FileHandler/basicConfig(filename=)) задаёт encoding= явно. force_utf8() эту полосу НЕ
+     закрывает — он трогает только stdout/stderr; файл берёт локаль (cp1251) → эмодзи 📊 в
+     open(log,'w')/log.info падает 'charmap' ровно как в пайпе (потенциальный ЧЕТВЁРТЫЙ укус).
+Новое место (print-скрипт без force_utf8 / text=True без encoding / open()|FileHandler|
+basicConfig(filename=) без encoding) валит гейт — класс не вернётся молча.
 
 ГРАНИЦЫ задачи: userbot_listen.py, moderation_bot.py и клиентский suggest.py тут НЕ проверяются
 (их правка запрещена контуром) — тот же класс на них остаётся отдельным остатком.
@@ -46,6 +51,15 @@ SUBPROCESS_READERS = ENTRYPOINTS + ("selfupdate_gate.py", "rc_supervisor.py", "l
 OUT_OF_SCOPE = ("userbot_listen.py", "moderation_bot.py", "suggest.py")
 
 _RUNNERS = {"run", "Popen", "check_output"}
+
+# Полоса C — ПИШУЩИЕ В ФАЙЛ модули контура (open()/logging→файл с не-ASCII: кириллица, эмодзи).
+# log_setup.py — центральная фабрика RotatingFileHandler для ОБОИХ логов (pc_agent+pc_orchestrator):
+# оброни там encoding — и оба лога разом уедут в cp1251, потому держим её под стражем в первую очередь.
+FILE_WRITERS = SUBPROCESS_READERS + ("log_setup.py",)
+
+# Файловые sink'и logging: пишут запись в файл кодировкой ЛОКАЛИ, если не задать encoding= (StreamHandler
+# в набор НЕ входит — его stdout/stderr закрывает force_utf8(), полоса A).
+_LOG_FILE_SINKS = {"FileHandler", "RotatingFileHandler", "TimedRotatingFileHandler", "WatchedFileHandler"}
 
 
 def _parse(name):
@@ -85,6 +99,54 @@ def subprocess_text_calls_without_encoding(tree):
     return sorted(bad)
 
 
+def _has_kw(node, name):
+    return any(k.arg == name for k in node.keywords)
+
+
+def _open_is_binary(node):
+    """mode из 2-го позиционного либо mode=; 'b' в нём → бинарный (encoding не нужен и запрещён).
+    mode отсутствует или динамический (не строковая константа) → считаем ТЕКСТОМ (дефолт 'r' текст)."""
+    mode = None
+    kw = {k.arg: k.value for k in node.keywords if k.arg}
+    if "mode" in kw:
+        mode = kw["mode"]
+    elif len(node.args) >= 2:
+        mode = node.args[1]
+    return isinstance(mode, ast.Constant) and isinstance(mode.value, str) and "b" in mode.value
+
+
+def open_text_without_encoding(tree):
+    """→ [lineno] для builtin open(...) в ТЕКСТОВОМ режиме БЕЗ encoding=.
+    Только bare Name('open'): os.open (байтовый fd, encoding не принимает) и .open(...) объектов
+    (opener.open, io.open) — не он; encoding как 4-й позиционный (open(f,mode,buf,enc)) засчитываем."""
+    bad = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "open"):
+            continue
+        if _open_is_binary(node):
+            continue
+        if not (_has_kw(node, "encoding") or len(node.args) >= 4):
+            bad.append(node.lineno)
+    return sorted(bad)
+
+
+def logging_file_sink_without_encoding(tree):
+    """→ [lineno] для FileHandler-семейства и basicConfig(filename=...) БЕЗ encoding=.
+    basicConfig без filename= (handlers=/stream=) — не прямой файловый sink, не трогаем."""
+    bad = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _callee_name(node.func)
+        if name in _LOG_FILE_SINKS:
+            if not _has_kw(node, "encoding"):
+                bad.append(node.lineno)
+        elif name == "basicConfig" and _has_kw(node, "filename") and not _has_kw(node, "encoding"):
+            bad.append(node.lineno)
+    return sorted(bad)
+
+
 def calls_force_utf8(tree):
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and _callee_name(node.func) == "force_utf8":
@@ -116,6 +178,35 @@ class TestSubprocessReadsUtf8(unittest.TestCase):
             offenders, {},
             "subprocess.run(text=True) без encoding= читает чужой вывод локалью Windows (cp1251) "
             "→ мохибейк/падение. Добавь encoding='utf-8', errors='replace'. Строки: %s" % offenders)
+
+
+class TestFileWritesUtf8(unittest.TestCase):
+    """Полоса ЗАПИСИ В ФАЙЛ: builtin open() и файловый sink logging задают encoding='utf-8'.
+    force_utf8() (полоса A) файл НЕ трогает — только stdout/stderr; open(log,'w') без encoding
+    берёт cp1251 и падает 'charmap' на 📊 ровно как print в пайп. Это ЧЕТВЁРТЫЙ канал того же
+    класса — держим его под стражем ДО первого укуса, а не после."""
+
+    def test_open_text_mode_has_encoding(self):
+        offenders = {}
+        for n in FILE_WRITERS:
+            bad = open_text_without_encoding(_parse(n))
+            if bad:
+                offenders[n] = bad
+        self.assertEqual(
+            offenders, {},
+            "builtin open() в текст-режиме без encoding= пишет/читает файл локалью Windows (cp1251) "
+            "→ мохибейк, а на эмодзи — 'charmap'. Добавь encoding='utf-8'. Строки: %s" % offenders)
+
+    def test_logging_file_sink_has_encoding(self):
+        offenders = {}
+        for n in FILE_WRITERS:
+            bad = logging_file_sink_without_encoding(_parse(n))
+            if bad:
+                offenders[n] = bad
+        self.assertEqual(
+            offenders, {},
+            "FileHandler/basicConfig(filename=) без encoding= пишет лог кодировкой локали → эмодзи "
+            "в log.info падает 'charmap'. Добавь encoding='utf-8'. Строки: %s" % offenders)
 
 
 class TestOutOfScopeListedHonestly(unittest.TestCase):
