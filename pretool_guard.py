@@ -57,6 +57,19 @@ headless пишет красную карточку в файл-маркер д�
     карточки НЕТ, вместо неё строка в журнал (свод CLAUDE.md п.5): признак сработал на подстроке,
     а не на действии. Hard-блок (`_HARD_CARD` — сбой разбора самого гарда) спрашивает всегда.
 
+ДВЕ ПРАВКИ 30.07.2026 (оба дефекта — про ЦЕНУ подтверждения, детали у самих функций):
+  • ОДОБРЕНИЕ ВЛАДЕЛЬЦА ТЕПЕРЬ ДОЕЗЖАЕТ ДО ГАРДА. Кнопка «да» меняла только СТАТУС задачи в
+    очереди; новый дочерний claude встречал новый процесс гарда, тот про «да» не знал и краснел
+    на том же шаге → демон закрывал задачу ✋failed. Сгорело 7 «да» из 10. Демон штампует ребёнку
+    `PRETOOL_APPROVED_KINDS` (виды из карточки, на которую сказали «да»), гард уважает их КАК
+    ЗАДАЧУ×КЛАСС: решение `approved` вместо карточки. Другой класс и сбой разбора самого гарда
+    не покрываются — см. `decide_for_role` / `owner_approved_kinds`.
+  • НАЛИЧИЕ ФАЙЛА ≠ ЕГО СОДЕРЖИМОЕ. `Test-Path .env` (в команде дословно «not reading contents»)
+    давал карточку «Хочу обратиться к .env / секретам»: признак `_RE_ENV` бил по УПОМИНАНИЮ пути.
+    Проверка наличия/метаданных (`Test-Path`/`ls`/`stat`/`os.path.exists`) больше не красная,
+    чтение содержимого (`cat`/`Get-Content`/`open().read()`/`grep`) — красное как было, вид `env`
+    остаётся в hard-блоке. См. `_env_probe_only` / `_py_env_probe_only`.
+
 ЛОГ (`pretool_guard.log`, под *.log в .gitignore): пишется КАЖДОЕ решение обеих ролей —
 смягчение не должно стоить прозрачности. Строка: время | роль | инструмент | решение | вид |
 команда (обрезана, значения токенов/паролей замаскированы). Решение `journal` — это подавленная
@@ -735,6 +748,12 @@ _WRAPPERS = {"sudo", "doas", "env", "nohup", "nice", "ionice", "time", "timeout"
 _SEARCH_CMDS = {"grep", "egrep", "fgrep", "zgrep", "rg", "ag", "ack", "sed", "awk", "gawk",
                 "mawk", "select-string", "sls", "findstr"}
 _PATTERN_FLAGS = {"-e", "-E", "-n", "--regexp", "--expression", "-pattern"}
+# Флаги, чьё значение — ФАЙЛ, а не шаблон. Без них PowerShell-форма
+# `Select-String -Path .env -Pattern TOKEN` теряла `.env` из скан-текста: первый позиционный
+# аргумент считался шаблоном и вырезался вместе с путём к секрету — и ЧТЕНИЕ .env проезжало
+# зелёным (проверено на HEAD до этой правки). Докрутка того же правила, что уже записано выше:
+# операнды-файлы не трогаем.
+_PATH_FLAGS = {"-path", "-literalpath", "-lp"}
 _EXEC_IN_PATTERN = re.compile(
     r"\$\(|`|\bsystem\s*\(|\bpopen\s*\(|\|\s*['\"]?\s*(?:sh|bash|zsh|xargs)\b")
 
@@ -862,6 +881,9 @@ def _strip_search_pattern(toks, idx):
     drop, pat_seen, i = set(), False, idx + 1
     while i < len(toks):
         t = toks[i]
+        if t.lower() in _PATH_FLAGS and i + 1 < len(toks):
+            i += 2            # значение -Path/-LiteralPath — ОПЕРАНД-ФАЙЛ: сохраняем скану
+            continue
         if t.lower() in _PATTERN_FLAGS and i + 1 < len(toks):
             drop.add(i + 1)
             pat_seen = True
@@ -965,8 +987,11 @@ def _read_file(path, cwd):
     return None
 
 
-def _scan_python(cmd, cwd):
-    """→ ('defer','','') | ('ask','py_write',detail). Инлайн -c и тела .py-целей, ищем боевую запись."""
+def _scan_python(cmd, cwd, env_probe=False):
+    """→ ('defer','','') | ('ask','py_write',detail). Инлайн -c и тела .py-целей, ищем боевую запись.
+    env_probe — вердикт ШЕЛЛОВОГО разбора («секрет в самой команде упомянут только пробой
+    наличия», см. `_env_probe_only`): он снимает красное ТОЛЬКО с упоминания В КОМАНДЕ, тело
+    скрипта проверяется отдельно и своей проверкой."""
     try:
         toks = shlex.split(cmd)
     except Exception:
@@ -1005,12 +1030,21 @@ def _scan_python(cmd, cwd):
             saw_target = True
         i += 1
     # скан-текст: позиционные аргументы скрипта — данные, не операция (_scan_text, посегментно)
-    blob = _scan_text(cmd) + "\n" + content
-    m = _RE_ENV.search(blob)
-    if m:
-        # объект называем ДОСЛОВНО найденным именем: у карточки .env объект обязан быть, иначе
-        # правило «нет объекта → журнал» проглотило бы её (тело скрипта в команде не видно)
-        return ("ask", "env", m.group(0).strip("'\" "))
+    cmd_scan = _scan_text(cmd)
+    blob = cmd_scan + "\n" + content
+    env_hit = _RE_ENV.search(blob)
+    # Проверка НАЛИЧИЯ секрета — не обращение к секрету (см. `_py_env_probe_only`). Два источника
+    # упоминания судим ПОРОЗНЬ, иначе проба в команде прикрыла бы чтение в теле скрипта:
+    # `Test-Path .env; python evil.py`, где .env читает evil.py, обязан остаться красным.
+    # Признак ПРОБЫ не завершает разбор: остальные красные токены (боевая запись Bridge, живые
+    # таблицы, SQL) проверяются ниже как раньше — послабление касается ТОЛЬКО вида `env`.
+    if env_hit:
+        cmd_ok = (not _RE_ENV.search(cmd_scan)) or env_probe or _py_env_probe_only(cmd_scan)
+        body_ok = (not _RE_ENV.search(content)) or _py_env_probe_only(content)
+        if not (cmd_ok and body_ok):
+            # объект называем ДОСЛОВНО найденным именем: у карточки .env объект обязан быть, иначе
+            # правило «нет объекта → журнал» проглотило бы её (тело скрипта в команде не видно)
+            return ("ask", "env", env_hit.group(0).strip("'\" "))
     for tok in _LIVE_SHEET_TOKENS:
         if tok in blob:
             return ("ask", "live_sheet", tok)
@@ -1021,7 +1055,92 @@ def _scan_python(cmd, cwd):
         return ("ask", "sqlite", _extract_db(blob) or "")
     if not saw_target:
         return ("ask", "py_write", "без внятной цели")
-    return ("defer", "", "")
+    return ("defer", ("env_probe" if env_hit else ""), "")
+
+
+# ---------------- НАЛИЧИЕ ФАЙЛА ≠ ЕГО СОДЕРЖИМОЕ (правка 30.07.2026) -------------------------
+# `_RE_ENV` красит команду по УПОМИНАНИЮ пути секрета и не различает «читаю содержимое» и
+# «проверяю, есть ли файл». Цена — живой факт: задача 55, УЖЕ ОДОБРЕННАЯ владельцем, умерла в
+# 15:09 на `Test-Path "D:\turbobaby-bot\.env"`, где в самой команде стояло «not reading
+# contents». Проверка наличия не выдаёт ни одного байта секрета: секрет — это СОДЕРЖИМОЕ, а факт
+# существования файла виден и из `git status`, и из любого листинга каталога.
+# Разводим ПО ДЕЙСТВИЮ (свод CLAUDE.md п.5): наличие/метаданные → зелёное, содержимое → красное.
+#
+# Список смотрелок наличия — БЕЛЫЙ и поимённый (как `_RE_CFG_VIEW` выше): «команда выглядит
+# безобидной» общим признаком проверять нельзя. Всё, чего в списке нет, остаётся красным.
+_EXISTS_CMDS = {"test-path", "test", "[", "[[", "ls", "dir", "stat",
+                "get-item", "gi", "get-childitem", "gci", "resolve-path"}
+# Команда, которая только ПЕЧАТАЕТ свой аргумент: путь в её тексте — ДАННЫЕ, а не операция (тот
+# же класс, что вырезание текста `git -m` и аргументов .py-скрипта). Живой факт задачи 55: имя
+# секрета попало в карточку из строки `Write-Output "=== .env exists (not reading contents) ==="`,
+# то есть из ПОДПИСИ К ВЫВОДУ. Перенаправление в файл проверяется отдельно и ниже: `echo … > .env`
+# остаётся красным.
+_PRINT_CMDS = {"echo", "printf", "write-output", "write-host", "write-debug", "write-verbose",
+               "write-information", "write-warning"}
+# python-форма того же: проверка наличия/метаданных…
+_RE_PY_EXISTS = re.compile(
+    r"(?i)os\.path\.(?:exists|isfile|isdir|islink|lexists|getsize|getmtime)\s*\(|"
+    r"os\.(?:stat|lstat)\s*\(|\.exists\s*\(\s*\)|\.is_file\s*\(\s*\)|\.is_dir\s*\(\s*\)|"
+    r"\.stat\s*\(\s*\)")
+# …и ЛЮБОЙ признак, что кодом трогают не факт файла, а его содержимое/окружение/саму сущность
+# (чтение, запись, переименование, копирование, dotenv, окружение, вызов шелла). Одно совпадение
+# отменяет послабление целиком — это НЕ список «что красное», а список «доказательства, что это
+# уже не проба наличия».
+_RE_PY_NOT_PROBE = re.compile(
+    r"(?i)\bopen\s*\(|\.read|\.write|readline|readlines|read_text|read_bytes|"
+    r"os\.(?:rename|replace|remove|unlink|truncate|chmod|chown|system|popen)|"
+    r"\bshutil\.|\bdotenv\b|\bload_env\b|os\.environ|\bgetenv\b|\bfileinput\b|\blinecache\b|"
+    r"\bmmap\b|\bsubprocess\b|\bPopen\b|\bexec\s*\(|\beval\s*\(|\b__import__\b")
+
+
+def _py_env_probe_only(code):
+    """True ⇔ в python-коде путь секрета встречается ТОЛЬКО в проверке наличия/метаданных
+    (`os.path.exists`, `os.stat`, `Path(...).exists()`) и НЕТ ни одного признака обращения к
+    содержимому/окружению (`_RE_PY_NOT_PROBE`). Нет ни одной проверки наличия → False: послабление
+    даётся за ДОКАЗАННУЮ пробу, а не за отсутствие улик."""
+    c = code or ""
+    if not _RE_ENV.search(c) or _RE_PY_NOT_PROBE.search(c):
+        return False
+    return bool(_RE_PY_EXISTS.search(c))
+
+
+def _env_probe_only(cmd):
+    """True ⇔ путь секрета в команде встречается ТОЛЬКО в проверке НАЛИЧИЯ/метаданных.
+    Разбор ПОСЕГМЕНТНЫЙ и структурный (`_split_segments` + `_cmd_index`) — по КОМАНДНОЙ позиции,
+    а не по подстроке. Fail-safe: любое сомнение → False, то есть красное как было. Сомнением
+    считаем:
+      • труба ИЗ сегмента с секретом (`Get-Item .env | Get-Content` вернул бы содержимое);
+      • любое перенаправление в этом сегменте (`ls > .env` секрет бы ПЕРЕЗАПИСАЛ);
+      • команда сегмента не из белого списка `_EXISTS_CMDS` (в т.ч. присваивание `$p = ".env"`,
+        после которого содержимое читает уже другой сегмент);
+      • python-сегмент, не прошедший `_py_env_probe_only`;
+      • кривое квотирование (shlex не разобрал)."""
+    if not cmd:
+        return False
+    segs = _split_segments(cmd)
+    seen = False
+    for i in range(0, len(segs), 2):
+        seg = segs[i]
+        if not _RE_ENV.search(seg):
+            continue
+        seen = True
+        if i + 1 < len(segs) and segs[i + 1].strip() == "|":
+            return False
+        if _RE_REDIRECT.search(seg):
+            return False
+        try:
+            toks = shlex.split(seg)
+        except Exception:
+            return False
+        j = _cmd_index(toks)
+        if j is None or j >= len(toks):
+            return False
+        if _base(toks[j]) in _EXISTS_CMDS or _base(toks[j]) in _PRINT_CMDS:
+            continue
+        if _RE_PY.search(seg) and _py_env_probe_only(seg):
+            continue
+        return False
+    return seen
 
 
 # ------------------------------- классификаторы ------------------------------
@@ -1050,13 +1169,24 @@ def _decide_read(ti, cwd):
 
 
 def _decide_bash(cmd, cwd):
+    """Разбор Bash/PowerShell. Тонкая обёртка над `_decide_bash_body`: вычисляет ОДИН РАЗ
+    скан-текст и признак «секрет упомянут только пробой наличия», а по итогу проставляет вид
+    `env_probe` там, где иначе в логе стояло бы безликое `unknown`. Само решение — в body."""
     if not cmd:
         return ("defer", "", "")
+    scan = _scan_text(cmd)
+    probe = bool(_RE_ENV.search(scan)) and _env_probe_only(cmd)
+    action, kind, obj = _decide_bash_body(cmd, cwd, scan, probe)
+    if probe and action == "defer" and not kind:
+        return ("defer", "env_probe", "")     # прозрачность лога: пробу наличия видно как пробу
+    return (action, kind, obj)
+
+
+def _decide_bash_body(cmd, cwd, scan, env_probe=False):
     # Красное ищем в СКАН-ТЕКСТЕ: позиционные аргументы .py-скриптов — ДАННЫЕ, а не операция
     # (класс-фикс, порт с VPS). Сегменты шелла сохранены целиком, подстановки команд и пути к
     # секретам из аргументов НЕ вырезаются. `_RE_OUTSIDE_WRITE` ниже намеренно смотрит СЫРУЮ
     # команду: перенаправление `> C:\…` стоит после имени скрипта и вырезанием пряталось бы.
-    scan = _scan_text(cmd)
     netk, nettarget = _net_scan(scan)
     for rx, kind in _RED_CMD:
         if rx.search(scan):
@@ -1080,7 +1210,11 @@ def _decide_bash(cmd, cwd):
             elif kind == "sqlite":
                 obj = _extract_db(scan) or ""
             return ("ask", kind, obj)
-    if _RE_ENV.search(scan):
+    # Секрет упомянут — но ПРОБА НАЛИЧИЯ секретом не делится (`_env_probe_only`). Признак пробы
+    # НЕ обрывает разбор: команда идёт дальше по всем прочим красным ветвям (конфиг `.claude`,
+    # запись вне репо, python-скан) — иначе `Test-Path .env; python evil.py` перестал бы
+    # сканировать второй сегмент. Послабление касается ТОЛЬКО вида `env`.
+    if not env_probe and _RE_ENV.search(scan):
         return ("ask", "env", "")
     # Конфиг `.claude` защищён для инструментов Write/Edit — значит его надо защитить и от
     # ОБХОДА через шелл. Иначе дыра тривиальна: сессия пишет settings.json.new (внутри репо,
@@ -1102,7 +1236,7 @@ def _decide_bash(cmd, cwd):
     if _RE_PY.search(cmd):
         if _all_py_targets_are_tests(cmd):        # прямой запуск только test_*.py → без контент-скана
             return ("defer", "", "")
-        return _scan_python(cmd, cwd)
+        return _scan_python(cmd, cwd, env_probe)
     m = _RE_UNTIL_WAIT.match(cmd)
     if m:
         cond = (m.group(1) or "").lstrip("! \t")
@@ -1135,6 +1269,95 @@ def decide(data):
 # ------------------------------- роль и доктрина ------------------------------
 
 ASK_MARKER_ENV = "PRETOOL_ASK_MARKER"   # штамп демона на КАЖДОМ headless-ребёнке (pc_orchestrator.run_task)
+
+# ── «ДА» ВЛАДЕЛЬЦА ДОЛЖНО ДОЕЗЖАТЬ ДО ГАРДА (правка 30.07.2026) ──────────────────────────────
+# Живой класс: владелец жмёт «да» в 1160, демон честно перезапускает задачу (status=approved →
+# process_approved → run_task) — и НОВЫЙ дочерний claude встречает НОВЫЙ процесс гарда, который
+# про одобрение не знает ничего. Тот же шаг снова красный → карточка в маркер → демон ставит
+# ✋failed «одобрено, но шаг снова упирается в красное». За историю демона так сгорело 7 «да» из
+# 10 (задачи 281, 338, 362, 363, 364, 48, 55); задача 55 — дословно: `ask | env` в 15:09:05
+# ВНУТРИ одобренного ре-рана 15:05:34→15:20:25.
+#
+# Одобрение теперь едет в ребёнка env-маркером и уважается ПО КЛАССУ ОПЕРАЦИИ:
+#   PRETOOL_APPROVED_KINDS = 'env,delete'  — виды, НАЗВАННЫЕ в карточке, на которую сказали «да»;
+#   PRETOOL_APPROVED_TASK  = '<id>'        — задача (для лога; решение принимают ВИДЫ).
+# Границы послабления, каждая намеренная:
+#   • ПО ЗАДАЧЕ: маркер ставит демон на КОНКРЕТНЫЙ запуск (`_run_task_impl`), он не живёт нигде
+#     ещё — интерактивные сессии владельца и любой другой запуск его не имеют;
+#   • ПО КЛАССУ: пропускается ровно тот вид, что стоял в карточке. Другое красное — как было;
+#   • СБОЙ РАЗБОРА САМОГО ГАРДА не пропускается НИКОГДА: hard-блок из `main()` идёт мимо
+#     `decide_for_role` (except-ветка), значит одобрение его не касается;
+#   • доверие к env — ТО ЖЕ, что уже принято для `PRETOOL_ASK_MARKER`/`PRETOOL_MARKER_TOKEN`:
+#     эти переменные ставит демон своему ребёнку, и канал env для гарда уже авторитетен.
+APPROVED_KINDS_ENV = "PRETOOL_APPROVED_KINDS"
+APPROVED_TASK_ENV = "PRETOOL_APPROVED_TASK"
+# Строка КЛАССА в карточке: гард дописывает её в файл-маркер (в интерактивной карточке ничего не
+# меняется), демон сохраняет карточку в очередь вместе с ней, а после «да» читает класс ОТТУДА ЖЕ.
+# Так одобрение переживает и рестарт демона: никакого локального состояния не нужно.
+KIND_LINE_PREFIX = "Класс операции: "
+_RE_KIND_LINE = re.compile(r"(?im)^\s*Класс операции:\s*([a-z_]+(?:\s*,\s*[a-z_]+)*)\s*$")
+# Маркер класса от САМОЙ МОДЕЛИ: «NEEDS_APPROVAL: op=<класс> | <карточка>» (второй канал красного —
+# ребёнок сам отказался от операции, гард при этом ничего не писал; так умерла задача 48).
+_RE_OP_MARK = re.compile(r"(?i)\bop\s*=\s*([a-z_]+)")
+# Виды, которые вообще могут быть одобрены. Список ЗАКРЫТЫЙ: незнакомое слово в карточке
+# одобрением не становится (`op=other` — честное «класс не назван» → одобрения нет).
+_KIND_VOCAB = ("delete", "kill", "schtasks", "git_force", "sqlite", "clasp", "clasp_push",
+               "clasp_deploy", "clasp_run", "live_sheet", "network", "env", "outside",
+               "write_outside", "py_write", "edit_secret", "read_secret", "edit_claude",
+               "unknown")
+
+
+def owner_approved_kinds(env=None):
+    """Виды, одобренные владельцем для ТЕКУЩЕГО запуска (из env-маркера демона). env — инъекция
+    для тестов.
+
+    Разбор ВСЁ-ИЛИ-НИЧЕГО: демон складывает значение из слов закрытого `_KIND_VOCAB`, поэтому
+    ЛЮБОЕ посторонное слово означает, что маркер писал не он, — тогда одобрения нет вовсе
+    (`env; rm -rf /` не должно читаться как «одобрен env»). Пустое/битое значение → пусто, то
+    есть карточка как была: ошибка здесь может только ДОБАВИТЬ подтверждение."""
+    e = os.environ if env is None else env
+    raw = (e.get(APPROVED_KINDS_ENV) or "").strip()
+    if not raw:
+        return frozenset()
+    words = [t.strip().lower() for t in re.split(r"[,;]+", raw) if t.strip()]
+    if not words or any(w not in _KIND_VOCAB for w in words):
+        return frozenset()
+    return frozenset(words)
+
+
+def _kind_phrase(kind):
+    """Устойчивый ПРЕФИКС человеческой фразы карточки для вида: общая часть `_human(kind, '')` и
+    `_human(kind, '<объект>')`. Считается ИЗ `_human`, а не дублируется литералом, — иначе два
+    списка формулировок разъехались бы при первой же правке карточки."""
+    a, b = _human(kind, ""), _human(kind, "@@")
+    n = 0
+    while n < min(len(a), len(b)) and a[n] == b[n]:
+        n += 1
+    return a[:n]
+
+
+def kinds_from_card(text):
+    """Виды красных операций, НАЗВАННЫЕ в карточке needs_approval → frozenset (может быть пустым).
+    Читает демон ПОСЛЕ «да» владельца, чтобы одобрение вернулось ровно на свой класс. Три слоя,
+    в порядке надёжности:
+      1) строка «Класс операции: <вид>[, <вид>]» — её пишет сам гард в файл-маркер;
+      2) `op=<вид>` — маркер, который печатает модель, когда красное отклонила ОНА;
+      3) фраза карточки (`_human`) — страховка для карточек, выписанных до этой правки.
+    Пусто → у демона прежнее поведение байт-в-байт (одобрение в env не поедет)."""
+    t = str(text or "")
+    if not t.strip():
+        return frozenset()
+    out = set()
+    for m in _RE_KIND_LINE.finditer(t):
+        out.update(k.strip() for k in m.group(1).split(","))
+    for m in _RE_OP_MARK.finditer(t):
+        out.add(m.group(1).strip().lower())
+    if not (out & set(_KIND_VOCAB)):
+        for kind in _KIND_VOCAB:
+            ph = _kind_phrase(kind)
+            if len(ph) >= 12 and ph in t:
+                out.add(kind)
+    return frozenset(k for k in out if k in _KIND_VOCAB)
 
 # Массовое удаление (красное) vs удаление ОДНОГО явного файла (в интерактиве зелёное).
 _RE_DEL_TAIL = re.compile(r"(?i)(?:^|[\s;&|(])(?:del|erase|rmdir|rd|rm|remove-item)\b(.*)$")
@@ -1245,13 +1468,18 @@ def _stays_red(kind, obj, cmd):
     return False                          # unknown и прочее: незнакомое САМО ПО СЕБЕ не красное (доктрина VPS)
 
 
-def decide_for_role(data, headless):
+def decide_for_role(data, headless, env=None):
     """Решение ПО ДОКТРИНЕ (перенос списка с VPS, кейс 314): Allow спрашивает только
     доктринальное (_stays_red) — В ОБЕИХ РОЛЯХ, незнакомая команда сама по себе не красная.
     Раньше headless шёл строгим decide() без послаблений, и чистое чтение (`wc -l` по репо,
     until-grep-ожидание output) роняло задачу демона в NEEDS_APPROVAL. Параметр headless
     решение больше не меняет (оставлен вызывающим: роль нужна логу и каналу ask). Возвращает
-    (action, kind, obj); kind/obj сохраняются и при смягчении — они нужны логу."""
+    (action, kind, obj); kind/obj сохраняются и при смягчении — они нужны логу.
+
+    Третье решение — `approved`: вид ЭТОЙ операции владелец уже подтвердил кнопкой, и демон
+    прокинул его в env запуска (`owner_approved_kinds`). Тогда карточки нет, но и молчания нет:
+    строка в логе стоит с решением `approved` (видно, ЧТО прошло по чужому «да»). Красное
+    ДРУГОГО класса и сбой разбора самого гарда одобрением не покрываются."""
     action, kind, obj = decide(data)
     if action != "ask":
         return action, kind, obj
@@ -1259,6 +1487,8 @@ def decide_for_role(data, headless):
     if (data.get("tool_name") or "") in ("Bash", "PowerShell"):
         cmd = (data.get("tool_input") or {}).get("command") or ""
     if _stays_red(kind, obj, cmd):
+        if kind in owner_approved_kinds(env):
+            return ("approved", kind, obj)
         return action, kind, obj
     return ("defer", kind, obj)
 
@@ -1454,8 +1684,12 @@ MARKER_TOKEN_ENV = "PRETOOL_MARKER_TOKEN"   # токен запуска демо
 MARKER_SEP = "\x1f"                          # чтобы демон принимал только карточки СВОЕГО запуска
 
 
-def _write_marker(mk, card):
+def _write_marker(mk, card, kind=""):
     """Дописать красную карточку в файл-маркер headless-сигнала С ДЕДУПОМ и ШТАМПОМ ТОКЕНА.
+
+    Последней строкой блока идёт КЛАСС операции (`KIND_LINE_PREFIX`) — он нужен демону, чтобы
+    после «да» владельца вернуть одобрение ИМЕННО на этот класс (см. `kinds_from_card`). Строка
+    живёт ТОЛЬКО в headless-канале: текст интерактивной карточки не меняется ни на байт.
     Формат строки: '<run_token>\\x1f<строка карточки>'. Токен из env PRETOOL_MARKER_TOKEN —
     задаёт демон на КАЖДЫЙ запуск; так демон отсеивает чужие/старые карточки (напр. фикстуры
     из subprocess-тестов гарда, унаследовавших боевой маркер). Дедуп: одно красное действие
@@ -1463,6 +1697,8 @@ def _write_marker(mk, card):
     c = (card or "").strip()
     if not c:
         return
+    if kind:
+        c += "\n" + KIND_LINE_PREFIX + kind
     token = os.environ.get(MARKER_TOKEN_ENV, "")
     block = "\n".join(token + MARKER_SEP + ln for ln in c.splitlines())
     try:
@@ -1478,13 +1714,13 @@ def _write_marker(mk, card):
         pass
 
 
-def _emit_ask(card):
+def _emit_ask(card, kind=""):
     # Сигнал headless→демон (pc_orchestrator): в headless карточку не показать интерактивно,
     # поэтому при заданном env пишем красную карточку в файл-маркер — демон детектит и ставит
     # NEEDS_APPROVAL. В интерактивной сессии env не задан → поведение не меняется.
     mk = os.environ.get(ASK_MARKER_ENV)
     if mk:
-        _write_marker(mk, card)
+        _write_marker(mk, card, kind)
     _push(card)
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
@@ -1521,7 +1757,7 @@ def main():
             action = "journal"   # объекта и числа нет → вместо карточки строка в журнал
     _log(role, tool, action, kind, detail)
     if card is not None:
-        _emit_ask(card)
+        _emit_ask(card, kind)
     sys.exit(0)  # defer / journal
 
 

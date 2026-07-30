@@ -20,6 +20,7 @@ os.environ["LESSON_LLM_ROUTE"] = "0"   # боевой .env-рубильник н
                                        # ставим ДО импорта o: load_dotenv(override=False) не перепишет
 
 import pc_orchestrator as o           # noqa: E402
+import pretool_guard                  # noqa: E402  (словарь видов/разбор карточки — смычка с гардом)
 import selfupdate_gate                # noqa: E402  (голден «гейт не спавнит claude»)
 
 
@@ -451,6 +452,137 @@ class TestApproved(Base):
         self.assertEqual(self.fb.tasks[tid]["status"], "failed")
         self.assertEqual(called["n"], 0)             # истёкшую не запускаем
         self.assertIn("истёк", self.fb.tasks[tid]["result"].lower())
+
+
+class TestApprovalReachesExecutor(Base):
+    """ГОЛДЕНЫ 30.07.2026 (дефект «одобрение не доходит»). Живой разбор: 10 нажатий «да» → 3 done
+    и 7 ✋failed «одобрено, но шаг снова упирается в красное» (281, 338, 362, 363, 364, 48, 55).
+    Одобрение доезжало до ре-рана, но терялось ВНУТРИ него: гард в НОВОМ дочернем процессе про
+    «да» не знал (задача 55), а модель по преамбуле снова печатала NEEDS_APPROVAL (задача 48).
+    Теперь класс операции из карточки едет ребёнку ДВУМЯ каналами — env-маркер и абзац промпта."""
+
+    def _spy(self, out="сделал одобренное\nRESULT: готово"):
+        seen = {}
+
+        def fake(prompt, timeout, cwd, env):
+            seen["prompt"] = prompt
+            seen["env"] = dict(env)
+            return (0, out, "")
+        o.run_claude = fake
+        return seen
+
+    def _approved_with_card(self, card, text="почисти указатели мозга"):
+        tid = self.fb.add(status="approved", updated=iso_ago(10), task_text=text)
+        self.fb.tasks[tid]["result"] = card
+        self.fb.tasks[tid]["what"] = card
+        return tid
+
+    # --- канал А: гард в дочернем процессе ---
+
+    def test_env_marker_reaches_child_with_class_from_card(self):
+        card = ("NEEDS_APPROVAL (гард): 🔴 Хочу обратиться к .env / секретам — разрешить?\n"
+                "Объект: .env\nЧисло: —\n" + pretool_guard.KIND_LINE_PREFIX + "env")
+        tid = self._approved_with_card(card)
+        seen = self._spy()
+        o.process_approved()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+        self.assertEqual(seen["env"][o.APPROVED_KINDS_ENV], "env")     # маркер ДОЛЕТЕЛ до ребёнка
+        self.assertEqual(seen["env"][o.APPROVED_TASK_ENV], str(tid))
+        # маркер живёт ТОЛЬКО в этом запуске: у самого демона его нет
+        self.assertNotIn(o.APPROVED_KINDS_ENV, os.environ)
+
+    def test_guard_accepts_that_marker_for_that_class_only(self):
+        """Смычка двух модулей: то, что демон положил в env, гард уважает — и только по классу."""
+        card = pretool_guard.KIND_LINE_PREFIX + "env"
+        tid = self._approved_with_card(card)
+        seen = self._spy()
+        o.process_approved()
+        env = seen["env"]
+        red = {"tool_name": "Bash", "tool_input": {"command": "cat ." + "env"}, "cwd": o.REPO}
+        other = {"tool_name": "Bash", "tool_input": {"command": "del /f /q a.log b.log"}, "cwd": o.REPO}
+        self.assertEqual(pretool_guard.decide_for_role(red, True, env=env)[0], "approved")
+        self.assertEqual(pretool_guard.decide_for_role(other, True, env=env)[0], "ask")
+        self.assertEqual(pretool_guard.decide_for_role(red, True, env={})[0], "ask")
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+
+    # --- канал Б: сама модель ---
+
+    def test_prompt_gets_approval_clause_after_preamble(self):
+        tid = self._approved_with_card("op=schtasks | автозапуск через Планировщик")
+        seen = self._spy()
+        o.process_approved()
+        p = seen["prompt"]
+        self.assertIn("ОДОБРЕНО ЧЕЛОВЕКОМ", p)                       # прежняя нота на месте
+        self.assertIn("ОДОБРЕНИЕ ВЛАДЕЛЬЦА", p)                      # и новый абзац
+        self.assertIn("schtasks", p)
+        self.assertGreater(p.index("ОДОБРЕНИЕ ВЛАДЕЛЬЦА"), p.index("NEEDS_APPROVAL"))  # ПОСЛЕ преамбулы
+        self.assertLess(p.index("ОДОБРЕНИЕ ВЛАДЕЛЬЦА"), p.index("автозапуск")
+                        if "автозапуск" in p else len(p))            # …и ДО текста задачи
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+        self.assertEqual(seen["env"][o.APPROVED_KINDS_ENV], "schtasks")
+
+    def test_preamble_requires_class_in_marker(self):
+        self.assertIn("op=<класс>", o.PREAMBLE)
+        for kind in ("delete", "env", "kill", "schtasks", "other"):
+            self.assertIn(kind, o.PREAMBLE)
+        self.assertIn("RESULT:", o.PREAMBLE)                          # контракт итога не потерян
+
+    # --- границы: без класса — прежнее поведение байт-в-байт ---
+
+    def test_no_class_in_card_keeps_old_behaviour(self):
+        for card in (None, "", "op=other | снова красное", "просто текст"):
+            self.fb.tasks.clear()
+            tid = self.fb.add(status="approved", updated=iso_ago(10))
+            self.fb.tasks[tid]["result"] = card
+            seen = self._spy()
+            o.process_approved()
+            self.assertNotIn(o.APPROVED_KINDS_ENV, seen["env"], repr(card))
+            self.assertNotIn("ОДОБРЕНИЕ ВЛАДЕЛЬЦА", seen["prompt"], repr(card))
+
+    def test_approved_kinds_reader(self):
+        self.assertEqual(o._approved_kinds({"result": pretool_guard.KIND_LINE_PREFIX + "delete"}),
+                         frozenset({"delete"}))
+        self.assertEqual(o._approved_kinds({"what": "op=kill | снять процесс 4242"}),
+                         frozenset({"kill"}))
+        for junk in ({}, {"result": None}, {"result": "op=other | x"}, None):
+            self.assertEqual(o._approved_kinds(junk), frozenset(), repr(junk))
+
+    def test_still_red_after_approve_says_which_class_was_approved(self):
+        """Ре-ран всё равно упёрся в красное → ✋ как было, но диагноз теперь различает
+        «одобрен класс X, уперлись в другое» и «класс не назван»."""
+        tid = self._approved_with_card(pretool_guard.KIND_LINE_PREFIX + "env")
+        self._claude(0, "NEEDS_APPROVAL: op=delete | а теперь удалить")
+        o.process_approved()
+        st = self.fb.tasks[tid]
+        self.assertEqual(st["status"], "failed")
+        self.assertTrue(st["result"].startswith(o.MANUAL_MARK))
+        self.assertIn("вручную", st["result"])
+        self.assertIn("одобрен класс env", st["result"])
+
+        self.fb.tasks.clear()
+        tid2 = self.fb.add(status="approved", updated=iso_ago(10))
+        self.fb.tasks[tid2]["result"] = "op=other | не назвал класс"
+        self._claude(0, "NEEDS_APPROVAL: op=other | снова красное")
+        o.process_approved()
+        self.assertIn("не назван", self.fb.tasks[tid2]["result"])
+
+    def test_expired_approve_never_spawns_child(self):
+        tid = self._approved_with_card(pretool_guard.KIND_LINE_PREFIX + "env")
+        self.fb.tasks[tid]["updated"] = iso_ago(4000)
+        called = {"n": 0}
+        o.run_claude = lambda *a, **k: called.__setitem__("n", called["n"] + 1) or (0, "нет", "")
+        o.process_approved()
+        self.assertEqual(called["n"], 0)                              # истёкшее не запускаем
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+
+    def test_plain_new_task_has_no_approval_marker(self):
+        """Обычная (не одобренная) задача маркера не получает — послабление строго per-task."""
+        self.fb.add(status="new")
+        seen = self._spy()
+        o.process_new()
+        self.assertNotIn(o.APPROVED_KINDS_ENV, seen["env"])
+        self.assertNotIn(o.APPROVED_TASK_ENV, seen["env"])
+        self.assertNotIn("ОДОБРЕНИЕ ВЛАДЕЛЬЦА", seen["prompt"])
 
 
 class TestApprovalTimeout(Base):
@@ -6094,7 +6226,7 @@ class TestMetricsLine(unittest.TestCase):
     def test_run_task_emits_metrics(self):
         seen = []
 
-        def fake_impl(tid, text, note="", _mctx=None):
+        def fake_impl(tid, text, note="", _mctx=None, approved=()):
             if _mctx is not None:
                 _mctx["attempts"] = 2
             return "done", "RESULT: ок"

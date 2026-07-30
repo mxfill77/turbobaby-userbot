@@ -47,6 +47,14 @@ import gate_selective         # селективный тест-гейт авт�
 import task_metrics           # единый формат строки METRICS (обе полосы) + norm_effort/extract_tokens/selfheal_count
 import client_contour         # признак клиентского контура (граф импортов ботов) + реестр оснований пропуска ворот; чистый, без сети
 import lesson_router          # обработчик задач-уроков (родитель 292, шаг 3): классификация+маршрут; suggest тянет лениво
+try:
+    # Словарь ВИДОВ красных операций и разбор карточки — у гарда, и только у него: демону нужно
+    # понять, НА ЧТО именно владелец сказал «да» (`kinds_from_card`), а держать второй список
+    # формулировок значит завести две расходящиеся правды. Модуль чистый (без сети/БД); при импорте
+    # он форсит utf-8 на stdout/stdin — ровно то же делает io_utf8.force_utf8() на старте демона.
+    import pretool_guard
+except Exception:             # демон обязан подниматься даже без модуля гарда (fail-safe)
+    pretool_guard = None
 # ДЕПЛОЙ #334 шаг 6/6 (2026-07-14, одобрен владельцем): LLM-маршрут уроков в бою —
 # LESSON_LLM_ROUTE=1 в .env ПОСТОЯННО; коммит-веха триггерит эстафету демона (новый процесс
 # импортирует свежий lesson_router b088eb1→0b83582 и перечитает .env). Fail-safe в router:
@@ -172,6 +180,8 @@ LOG_PATH = os.path.join(REPO, "pc_orchestrator.log")
 NA_MARKER = "NEEDS_APPROVAL:"
 ASK_MARKER_ENV = "PRETOOL_ASK_MARKER"   # env для pretool_guard: писать красную карточку в этот файл
 MARKER_TOKEN_ENV = "PRETOOL_MARKER_TOKEN"   # env: токен нашего запуска — гард штампует им карточки;
+APPROVED_KINDS_ENV = "PRETOOL_APPROVED_KINDS"   # env: виды, на которые владелец УЖЕ сказал «да»
+APPROVED_TASK_ENV = "PRETOOL_APPROVED_TASK"     # env: id одобренной задачи (для лога гарда)
 MARKER_SEP = "\x1f"                          # демон принимает ТОЛЬКО карточки со своим токеном (fix ghost:
 #   subprocess-тесты гарда наследовали боевой маркер и писали фикстурные карточки — «призрак PID 1»).
 
@@ -211,13 +221,38 @@ PREAMBLE = (
     "(чтение, правки кода в проекте, тесты, git commit/push) делай САМ. НАСТОЯЩЕЕ КРАСНОЕ "
     "(удаление файлов, правка/чтение .env и секретов, taskkill/schtasks, sqlite/запись в БД, "
     "выход за пределы проекта, сеть кроме git/Bridge/Telegram) — НЕ выполняй и НЕ ищи обход: "
-    "выведи РОВНО одну строку «NEEDS_APPROVAL: <карточка: что · зачем · последствия>» и заверши "
-    "работу (исполнит человек после «да»). userbot и moderation_bot НЕ трогай. Первая строка "
+    "выведи РОВНО одну строку «NEEDS_APPROVAL: op=<класс> | <карточка: что · зачем · "
+    "последствия>» и заверши работу (исполнит человек после «да»). <класс> — ОДНО слово из "
+    "списка: delete, env, kill, schtasks, network, sqlite, clasp, outside, py_write, git_force, "
+    "edit_claude, other. Класс обязателен: по нему «да» владельца вернётся ИМЕННО на эту "
+    "операцию, а «other» означает «класс назвать не могу» — тогда повторный запуск снова упрётся "
+    "в то же красное. userbot и moderation_bot НЕ трогай. Первая строка "
     "ответа — краткая сводка (≤400 символов). ПОСЛЕДНЯЯ строка вывода — ОБЯЗАТЕЛЬНО "
     "«RESULT: <краткий итог сделанного>»; без этой строки задача считается НЕ выполненной. ЗАДАЧА:\n"
 )
 
 _RE_RESULT = re.compile(r"(?m)^\s*RESULT:\s*\S")   # признак результата в stdout headless
+
+# ── «ДА» ВЛАДЕЛЬЦА ДОЛЖНО ДОЕЗЖАТЬ ДО ИСПОЛНИТЕЛЯ (правка 30.07.2026) ────────────────────────
+# Разбор живых логов: за историю демона 10 нажатий «да» дали 3 done и 7 ✋failed «одобрено, но шаг
+# снова упирается в красное» (281, 338, 362, 363, 364, 48, 55). Одобрение доезжало до ре-рана
+# ИСПРАВНО (в логе `RUN id=55 15:05:34` через 13 мин после кнопки), а терялось ВНУТРИ ре-рана —
+# ДВУМЯ РАЗНЫМИ каналами, и оба надо чинить:
+#   A) ГАРД в ребёнке про одобрение не знал: PreToolUse-хук — НОВЫЙ процесс на каждый вызов, он
+#      читает только stdin-JSON и env. Живой факт: `ask | env` в 15:09:05 ВНУТРИ одобренного
+#      ре-рана задачи 55 (`Test-Path "…\.env"`). Лечится env-маркером PRETOOL_APPROVED_KINDS.
+#   B) САМА МОДЕЛЬ отказывалась снова: нота «[ОДОБРЕНО ЧЕЛОВЕКОМ]» стояла ПЕРЕД преамбулой, а
+#      преамбула тут же запрещает красное безусловно и требует печатать NEEDS_APPROVAL. Живой
+#      факт: в ре-ране задачи 48 (02:32:43→02:41:48) у гарда НЕТ НИ ОДНОЙ строки `ask` — красное
+#      объявил ребёнок сам. Лечится этим абзацем, который стоит ПОСЛЕ преамбулы (последнее слово).
+# Оба канала строго ПО КЛАССУ операции: имя класса берётся из карточки, на которую нажали «да».
+APPROVED_CLAUSE = (
+    "\nОДОБРЕНИЕ ВЛАДЕЛЬЦА (перебивает запрет выше ТОЛЬКО для названного класса): Филипп уже "
+    "нажал «да» по ЭТОЙ задаче на операции класса: {kinds}. Такую операцию ВЫПОЛНИ САМ — гард "
+    "на этот класс в этом запуске карточку не поставит, и повторный NEEDS_APPROVAL по нему "
+    "ЗАПРЕЩЁН (он закроет задачу как «выполни вручную», то есть сожжёт «да» владельца). Красное "
+    "ЛЮБОГО ДРУГОГО класса — по-прежнему только строкой NEEDS_APPROVAL: op=<класс> | …, и обход "
+    "гарда искать НЕ нужно.\n")
 
 
 def _tail(s, n=500):
@@ -797,7 +832,27 @@ def _claude_budget_gate(counter=None, sleeper=None, notifier=None, wait_sec=None
     return False, detail
 
 
-def _run_task_impl(tid, text, note="", _mctx=None):
+def _approved_kinds(item):
+    """Виды красных операций, ОДОБРЕННЫЕ владельцем для этой задачи → frozenset (может быть пустым).
+
+    Источник — СОХРАНЁННАЯ карточка needs_approval того же ряда очереди (`what`/`result`
+    возвращаются вместе с approved-задачей; на полосе сервера этот же приём — `task.get("result")`
+    в orchestrator_daemon.process_approved). Значит одобрение переживает и рестарт демона: класс
+    едет через очередь, локального состояния не нужно.
+
+    Пусто (карточки нет, класс не назван, `op=other`, модуль гарда не импортировался) → демон
+    работает БАЙТ-В-БАЙТ как раньше: маркер в env не поедет, красное снова даст ✋."""
+    txt = str((item or {}).get("what") or (item or {}).get("result") or "")
+    if not txt.strip() or pretool_guard is None:
+        return frozenset()
+    try:
+        return pretool_guard.kinds_from_card(txt)
+    except Exception as e:                    # разбор карточки НИКОГДА не роняет обработку approve
+        log.warning("класс одобренной карточки не разобран (%s) — прежний путь", e)
+        return frozenset()
+
+
+def _run_task_impl(tid, text, note="", _mctx=None, approved=()):
     """Исполнить задачу через headless claude -p. → (status, result). status ∈ done|failed|needs_approval.
     Контракт результата (фикс ложного done задачи #24): done ТОЛЬКО при непустом stdout со строкой
     «RESULT: <итог>»; пустой stdout → один авто-повтор (транзиент), снова пустой → failed с хвостом
@@ -824,6 +879,15 @@ def _run_task_impl(tid, text, note="", _mctx=None):
     env[ASK_MARKER_ENV] = marker_path            # pretool_guard в headless пишет сюда красную карточку
     env[MARKER_TOKEN_ENV] = run_token            # …штампуя её нашим токеном — чужие карточки отсеем
     prompt = (note + PREAMBLE) if note else PREAMBLE
+    # ОДОБРЕНИЕ — ДВА КАНАЛА (см. APPROVED_CLAUSE): гарду env-маркер, модели абзац ПОСЛЕ преамбулы.
+    # Пустой approved → обе строки не выполняются, поведение прежнее байт-в-байт.
+    kinds = sorted(k for k in (str(x).strip() for x in (approved or ())) if k)
+    if kinds:
+        env[APPROVED_KINDS_ENV] = ",".join(kinds)
+        env[APPROVED_TASK_ENV] = str(tid)
+        prompt += APPROVED_CLAUSE.format(kinds=", ".join(kinds))
+        log.info("id=%s ОДОБРЕНО владельцем, класс(ы)=%s → маркер в env ребёнка + абзац в промпт",
+                 tid, ",".join(kinds))
     prompt += text
     for attempt in (1, 2):
         if _mctx is not None:
@@ -888,7 +952,7 @@ def _run_task_impl(tid, text, note="", _mctx=None):
         return "done", out_s[:RESULT_MAX]
 
 
-def run_task(tid, text, note=""):
+def run_task(tid, text, note="", approved=()):
     """Обёртка-наблюдаемость над _run_task_impl: та же сигнатура/возврат, но по завершении пишет
     ОДНУ структурную строку METRICS в лог демона (модель/усилие/тайминги/исход/попытки/самопочинки/
     канал). tokens_in/out=na — ПК-исполнитель в ТЕКСТ-режиме (claude -p без --output-format json
@@ -896,7 +960,7 @@ def run_task(tid, text, note=""):
     _mctx = {"attempts": 0}   # 0 = ни одной headless-попытки (ранний выход: claude не найден / бюджет)
     _t0 = time.monotonic()
     _start = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-    status, result = _run_task_impl(tid, text, note, _mctx)
+    status, result = _run_task_impl(tid, text, note, _mctx, approved)
     try:
         eff, _ = repo_thinking_settings()
         log.info(task_metrics.metrics_line(
@@ -1659,14 +1723,23 @@ def process_approved():
             _cowork(f"задача #{tid} (approved) → failed · {_clip(msg)}")
             _notify_task("failed", tid, "approve истёк")
             continue
+        # Класс, на который нажали «да» → поедет ребёнку (env-маркер гарду + абзац модели). Раньше
+        # ре-ран шёл БЕЗ этого, и тот же шаг снова краснел: 7 «да» из 10 сгорели именно здесь.
+        appr = _approved_kinds(task)
         status, result = run_task(tid, str(task.get("task_text") or ""),
-                                  note="[ОДОБРЕНО ЧЕЛОВЕКОМ] предыдущий шаг подтверждён. ")
+                                  note="[ОДОБРЕНО ЧЕЛОВЕКОМ] предыдущий шаг подтверждён. ",
+                                  approved=appr)
         if status == "needs_approval":
             # ✋ первым символом (зеркало ручной карты VPS): headless красное ДОКАЗАННО не проходит
             # даже после «да» — для шага локальной цепи это терминальный halt без думателя
             # (гейт _loc_after_fail; ре-аппрув/переформулировка = петля, рвём после ровно 1 круга)
-            msg = (f"{MANUAL_MARK} одобрено, но шаг снова упирается в красное — выполни вручную: "
-                   + result[:400])
+            # Диагноз честный: сказано, ЧТО было одобрено — «класс не назван» и «одобрен класс X, а
+            # уперлись в другой» это РАЗНЫЕ причины, и раньше владелец их не различал.
+            why = ("одобрен класс " + ", ".join(sorted(appr)) + ", но упёрлись в ДРУГОЕ красное"
+                   if appr else "класс операции в карточке не назван (op=other) — одобрение "
+                                "не привязать к операции")
+            msg = (f"{MANUAL_MARK} одобрено, но шаг снова упирается в красное — выполни вручную "
+                   f"[{why}]: " + result[:400])
             bc.complete_task(tid, "failed", msg)
             _cowork(f"задача #{tid} (approved) → failed · {_clip(msg)}")
             _notify_task("failed", tid, "снова красное после approve — вручную")

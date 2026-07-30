@@ -1680,5 +1680,272 @@ class TestLiveSettingsAfterClaspSplit(unittest.TestCase):
         self.assertEqual(live["ask"], self._perms(self.STAGED)["ask"])
 
 
+_DOT_ENV = "." + "env"      # имя секрета собираем из кусков: сам файл теста читает гард
+
+
+class TestEnvExistsVsContent(unittest.TestCase):
+    """ГОЛДЕНЫ 30.07.2026 (дефект «карточка на пустяке»): НАЛИЧИЕ файла ≠ его СОДЕРЖИМОЕ.
+
+    Живой факт: задача 55, УЖЕ ОДОБРЕННАЯ владельцем, умерла в 15:09:05 на
+    `Test-Path "D:\\turbobaby-bot\\.env"` — в самой команде стояло «not reading contents».
+    Проверка наличия секрета не выдаёт ни байта секрета; чтение содержимого — красное как было."""
+
+    def _no_card(self, cmd, tool="PowerShell"):
+        data = {"tool_name": tool, "tool_input": {"command": cmd}, "cwd": PROJ}
+        for headless in (True, False):
+            action, kind, obj = g.decide_for_role(data, headless=headless)
+            self.assertNotEqual(action, "ask", f"{cmd} (headless={headless})")
+            self.assertIsNone(g.card_or_journal(kind, obj, cmd) if action == "ask" else None)
+
+    def _card(self, cmd, tool="Bash", kind="env"):
+        data = {"tool_name": tool, "tool_input": {"command": cmd}, "cwd": PROJ}
+        for headless in (True, False):
+            action, k, obj = g.decide_for_role(data, headless=headless)
+            self.assertEqual((action, k), ("ask", kind), f"{cmd} (headless={headless})")
+            self.assertIsNotNone(g.card_or_journal(k, obj, cmd), cmd)   # hard-блок: карточка ВСЕГДА
+
+    # --- НАЛИЧИЕ: карточки нет ---
+
+    def test_exists_probe_is_not_a_card(self):
+        for cmd in ("Test-Path " + _DOT_ENV,
+                    'Test-Path "D:\\turbobaby-bot\\' + _DOT_ENV + '"',
+                    "Test-Path -PathType Leaf " + _DOT_ENV,
+                    "Get-Item " + _DOT_ENV,
+                    "ls -la " + _DOT_ENV,
+                    "dir " + _DOT_ENV,
+                    "stat " + _DOT_ENV,
+                    "test -f " + _DOT_ENV,
+                    "[ -f " + _DOT_ENV + " ]"):
+            self._no_card(cmd)
+
+    def test_task55_live_command_is_not_a_card(self):
+        """Команда-убийца задачи 55 ДОСЛОВНО (из pretool_guard.log 15:09:05): подпись к выводу
+        (`Write-Output "=== .env exists (not reading contents) ==="`) + проверка наличия."""
+        cmd = ('Write-Output "=== venv python ==="; '
+               'Test-Path "D:\\turbobaby-bot\\venv\\Scripts\\python.exe"; '
+               'Write-Output "=== ' + _DOT_ENV + ' exists (not reading contents) ==="; '
+               'Test-Path "D:\\turbobaby-bot\\' + _DOT_ENV + '"; '
+               'Write-Output "=== prior backups in tmp/ ==="; '
+               'Get-ChildItem "D:\\turbobaby-bot\\tmp" | Select-Object Name')
+        self._no_card(cmd)
+
+    def test_python_exists_probe_is_not_a_card(self):
+        for cmd in ('venv/Scripts/python.exe -c "import os; print(os.path.exists(\'' + _DOT_ENV + '\'))"',
+                    'python -c "import os; print(os.path.isfile(\'' + _DOT_ENV + '\'))"',
+                    'python -c "from pathlib import Path; print(Path(\'' + _DOT_ENV + '\').exists())"',
+                    'python -c "import os; print(os.stat(\'' + _DOT_ENV + '\').st_size)"'):
+            self._no_card(cmd, tool="Bash")
+
+    def test_probe_is_visible_in_log_as_probe(self):
+        """Смягчение не стоит прозрачности: вид `env_probe` виден в логе (не безликий прочерк)."""
+        self.assertEqual(g.decide({"tool_name": "PowerShell", "cwd": PROJ,
+                                   "tool_input": {"command": "Test-Path " + _DOT_ENV}}),
+                         ("defer", "env_probe", ""))
+
+    # --- СОДЕРЖИМОЕ: карточка/hard-блок как были ---
+
+    def test_content_read_still_hard_card(self):
+        for cmd, tool in (("cat " + _DOT_ENV, "Bash"),
+                          ("type " + _DOT_ENV, "Bash"),
+                          ("head -5 " + _DOT_ENV, "Bash"),
+                          ("tail -1 " + _DOT_ENV, "Bash"),
+                          ("Get-Content " + _DOT_ENV, "PowerShell"),
+                          ("gc " + _DOT_ENV, "PowerShell"),
+                          ("grep -n TOKEN " + _DOT_ENV, "Bash"),
+                          ("findstr TOKEN " + _DOT_ENV, "Bash"),
+                          ("Select-String -Path " + _DOT_ENV + " -Pattern TOKEN", "PowerShell"),
+                          ("Select-String -LiteralPath " + _DOT_ENV + " -Pattern T", "PowerShell"),
+                          ("cat bot.session", "Bash")):
+            self._card(cmd, tool=tool)
+
+    def test_python_content_read_still_hard_card(self):
+        for cmd in ('python -c "print(open(\'' + _DOT_ENV + '\').read())"',
+                    'python -c "from pathlib import Path; print(Path(\'' + _DOT_ENV + '\').read_text())"',
+                    'python -c "import dotenv; dotenv.load_dotenv(\'' + _DOT_ENV + '\')"',
+                    "venv/Scripts/python.exe reader.py " + _DOT_ENV,
+                    # проба + чтение в одном коде: одна улика чтения отменяет послабление
+                    'python -c "import os; print(os.path.exists(\'' + _DOT_ENV + '\')); '
+                    'print(open(\'' + _DOT_ENV + '\').read())"'):
+            self._card(cmd, tool="Bash")
+
+    def test_probe_does_not_open_bypasses(self):
+        """Дыры, которые послабление НЕ создало: труба из пробы, перезапись через `>`,
+        путь через переменную, мутация файла рядом с пробой, чужой красный сегмент."""
+        for cmd, tool, kind in (
+                ("Get-Item " + _DOT_ENV + " | Get-Content", "PowerShell", "env"),
+                ("ls " + _DOT_ENV + " | xargs cat", "Bash", "env"),
+                ("ls > " + _DOT_ENV, "Bash", "env"),
+                ("echo TOKEN=1 >> " + _DOT_ENV, "Bash", "env"),
+                ("$p = '" + _DOT_ENV + "'; Get-Content $p", "PowerShell", "env"),
+                ('Test-Path ' + _DOT_ENV + '; python -c "import os; os.rename(\''
+                 + _DOT_ENV + '\',\'x\')"', "PowerShell", "env"),
+                ("until grep -q X " + _DOT_ENV + "; do sleep 5; done", "Bash", "env")):
+            self._card(cmd, tool=tool, kind=kind)
+
+    def test_probe_does_not_swallow_other_red_of_same_command(self):
+        """Признак пробы НЕ обрывает разбор: второй сегмент по-прежнему сканируется."""
+        action, kind, _ = g.decide(bash("Test-Path " + _DOT_ENV
+                                        + "; rm -rf tmp_x tmp_y tmp_z"))
+        self.assertEqual((action, kind), ("ask", "delete"))
+
+    def test_read_edit_tools_on_secret_untouched(self):
+        """Обратная проверка: сами инструменты Read/Edit по секрету — как были."""
+        self.assertEqual(g.decide(read(os.path.join(PROJ, ".env")))[:2], ("ask", "read_secret"))
+        self.assertEqual(g.decide(edit(os.path.join(PROJ, ".env")))[:2], ("ask", "edit_secret"))
+        for headless in (True, False):
+            self.assertEqual(g.decide_for_role(read(os.path.join(PROJ, ".env")), headless)[0], "ask")
+
+
+class TestOwnerApprovalMarker(unittest.TestCase):
+    """ГОЛДЕНЫ 30.07.2026 (дефект «одобрение не доходит»): одобренная задача повторным запуском
+    проходит ТОТ ЖЕ красный шаг, и только его класс. Живой факт: 7 «да» из 10 сгорели ✋failed."""
+
+    RED = ("cat " + _DOT_ENV, "env")
+
+    def _role(self, cmd, env, tool="Bash"):
+        return g.decide_for_role({"tool_name": tool, "tool_input": {"command": cmd}, "cwd": PROJ},
+                                 headless=True, env=env)
+
+    def test_red_step_passes_when_owner_approved_that_kind(self):
+        cmd, kind = self.RED
+        self.assertEqual(self._role(cmd, {})[0], "ask")                      # без «да» — карточка
+        action, k, _ = self._role(cmd, {g.APPROVED_KINDS_ENV: kind})
+        self.assertEqual((action, k), ("approved", kind))                    # с «да» — прошло
+
+    def test_approval_is_per_class_not_a_switch(self):
+        cmd, _ = self.RED
+        for other in ("delete", "kill", "schtasks", "network", ""):
+            self.assertEqual(self._role(cmd, {g.APPROVED_KINDS_ENV: other})[0], "ask", other)
+
+    def test_approval_vocabulary_is_closed(self):
+        """Разбор ВСЁ-ИЛИ-НИЧЕГО: постороннее слово в маркере = маркер писал не демон → одобрения
+        нет вовсе. Иначе `env; rm -rf /` читалось бы как «одобрен env»."""
+        cmd, _ = self.RED
+        for junk in ("*", "all", "any", "env; rm -rf /", "env rm -rf /", "ENV_PROBE", "гурт",
+                     "env,всё", "env_probe"):
+            self.assertEqual(self._role(cmd, {g.APPROVED_KINDS_ENV: junk})[0], "ask", junk)
+        self.assertEqual(g.owner_approved_kinds({g.APPROVED_KINDS_ENV: "env, delete , *"}),
+                         frozenset())
+        self.assertEqual(g.owner_approved_kinds({g.APPROVED_KINDS_ENV: " ENV , delete "}),
+                         frozenset({"env", "delete"}))
+        self.assertEqual(g.owner_approved_kinds({}), frozenset())
+
+    def test_approval_covers_each_doctrinal_kind_but_only_itself(self):
+        cases = (("del /f /q a.log b.log", "delete"),
+                 ("taskkill /PID 4242 /F", "kill"),
+                 ("sqlite3 memory.db \"INSERT INTO t VALUES(1)\"", "sqlite"),
+                 ("curl https://example.com", "network"),
+                 ("cat " + _DOT_ENV, "env"))
+        for cmd, kind in cases:
+            self.assertEqual(self._role(cmd, {})[1], kind, cmd)              # вид определён
+            self.assertEqual(self._role(cmd, {g.APPROVED_KINDS_ENV: kind})[0], "approved", cmd)
+            self.assertEqual(self._role(cmd, {g.APPROVED_KINDS_ENV: "clasp_run"})[0], "ask", cmd)
+
+    def test_interactive_session_has_no_marker_so_nothing_changes(self):
+        """Маркер ставит демон СВОЕМУ ребёнку. В сессии владельца его нет → поведение прежнее."""
+        cmd, _ = self.RED
+        self.assertNotIn(g.APPROVED_KINDS_ENV, os.environ)
+        self.assertEqual(g.decide_for_role(bash(cmd), headless=False)[0], "ask")
+
+    def test_guard_own_failure_is_never_approved(self):
+        """Сбой разбора самого гарда (hard-блок из main) идёт МИМО decide_for_role → карточка
+        всегда, даже под маркером одобрения."""
+        self.assertTrue(g.card_gate("unknown", "", ""))
+        self.assertIn("unknown", g._HARD_CARD)
+        with open(os.path.join(PROJ, "pretool_guard.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('action, kind, obj = ("ask", "unknown", "")', src)   # except-ветка на месте
+
+    # --- карточка → класс → env (полный круг «да» владельца) ---
+
+    def test_kind_line_in_marker_only_not_in_interactive_card(self):
+        card = g._card("env", ".env", "cat " + _DOT_ENV)
+        self.assertNotIn(g.KIND_LINE_PREFIX, card)          # интерактивная карточка не изменилась
+        fd, mk = tempfile.mkstemp(suffix=".marker")
+        os.close(fd)
+        try:
+            g._write_marker(mk, card, "env")
+            with open(mk, encoding="utf-8") as f:
+                body = f.read()
+            self.assertIn(g.KIND_LINE_PREFIX + "env", body)
+            g._write_marker(mk, card, "env")               # дедуп: второй раз не дописывает
+            with open(mk, encoding="utf-8") as f:
+                self.assertEqual(f.read(), body)
+        finally:
+            os.remove(mk)
+
+    def test_kinds_from_card_three_layers(self):
+        # 1) строка класса от гарда
+        self.assertEqual(g.kinds_from_card(g._card("env", ".env", "cat x")
+                                           + "\n" + g.KIND_LINE_PREFIX + "env"),
+                         frozenset({"env"}))
+        # 2) op= от модели (так красное объявляет сам ребёнок — канал задачи 48)
+        self.assertEqual(g.kinds_from_card("NEEDS_APPROVAL (гард): op=schtasks | автозапуск"),
+                         frozenset({"schtasks"}))
+        # 3) фраза карточки (карточки, выписанные ДО этой правки)
+        self.assertEqual(g.kinds_from_card(g._card("delete", "tmp/x", "rm -r tmp/x")),
+                         frozenset({"delete"}))
+        self.assertEqual(g.kinds_from_card(g._card("kill", "PID 42", "taskkill /PID 42")),
+                         frozenset({"kill"}))
+        # честное пусто: класс не назван / карточки нет
+        for txt in ("", None, "op=other | что-то красное", "просто текст без класса"):
+            self.assertEqual(g.kinds_from_card(txt), frozenset(), repr(txt))
+
+    def test_kinds_from_card_multi(self):
+        txt = (g.KIND_LINE_PREFIX + "env\n" + g.KIND_LINE_PREFIX + "delete")
+        self.assertEqual(g.kinds_from_card(txt), frozenset({"env", "delete"}))
+
+
+class TestApprovalEndToEndProcess(unittest.TestCase):
+    """Гард — СВЕЖИЙ ПРОЦЕСС на каждый вызов (hook `python pretool_guard.py`), поэтому маркер
+    одобрения должен работать через env, а не через память. Гоняем именно так, как хук."""
+
+    def _run(self, cmd, extra_env=None, tool="Bash"):
+        fd, mk = tempfile.mkstemp(suffix=".marker")
+        os.close(fd)
+        os.remove(mk)
+        env = dict(os.environ, PRETOOL_NOPUSH="1", PYTHONIOENCODING="utf-8",
+                   PRETOOL_ASK_MARKER=mk, PRETOOL_MARKER_TOKEN="approval-probe",
+                   **(extra_env or {}))
+        data = {"tool_name": tool, "tool_input": {"command": cmd}, "cwd": PROJ}
+        try:
+            p = subprocess.run([sys.executable, os.path.join(PROJ, "pretool_guard.py")],
+                               input=json.dumps(data), capture_output=True, text=True,
+                               encoding="utf-8", env=env, timeout=30)
+            marker = ""
+            if os.path.isfile(mk):
+                with open(mk, encoding="utf-8") as f:
+                    marker = f.read()
+        finally:
+            try:
+                os.remove(mk)
+            except Exception:
+                pass
+        return p, marker
+
+    def test_headless_red_writes_card_with_class_then_approval_lets_it_through(self):
+        cmd = "cat " + _DOT_ENV
+        p, marker = self._run(cmd)                                  # 1) красное без «да»
+        self.assertEqual(json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertIn(g.KIND_LINE_PREFIX + "env", marker)           # класс уехал демону
+        kinds = g.kinds_from_card(marker.replace("approval-probe" + g.MARKER_SEP, ""))
+        self.assertEqual(kinds, frozenset({"env"}))                 # 2) демон разобрал класс
+        p2, marker2 = self._run(cmd, {g.APPROVED_KINDS_ENV: ",".join(sorted(kinds)),
+                                      g.APPROVED_TASK_ENV: "55"})   # 3) ре-ран с одобрением
+        self.assertEqual(p2.returncode, 0)
+        self.assertEqual(p2.stdout.strip(), "")                     # карточки НЕТ — шаг прошёл
+        self.assertEqual(marker2, "")                               # и демону сигнала нет
+
+    def test_approval_of_other_class_still_blocks(self):
+        p, marker = self._run("cat " + _DOT_ENV, {g.APPROVED_KINDS_ENV: "delete"})
+        self.assertEqual(json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertIn("Хочу обратиться", marker)
+
+    def test_probe_of_secret_silent_in_fresh_process(self):
+        p, marker = self._run("Test-Path " + _DOT_ENV, tool="PowerShell")
+        self.assertEqual(p.stdout.strip(), "")
+        self.assertEqual(marker, "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
