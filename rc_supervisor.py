@@ -567,8 +567,16 @@ def main(singleton=None, branch_runner=None, branches=None):
         return 0
     _run = branch_runner or supervise_branch
     _br = branches if branches is not None else BRANCHES
+    # Ветки НАЗЫВАЮТ свой порог свежести ПРЯМО НА СТАРТЕ. Иначе «фикс в силе» доказуем лишь двумя
+    # плохими способами: ждать 22 минуты отсутствия сноса (доказательство молчанием) либо прочесть
+    # строку сноса — то есть узнать порог только в момент ПРОВАЛА. Файл на диске не доказывает
+    # ничего: константы связываются ОДИН раз на импорте, hot-reload в CPython нет — 30.07 супервизор
+    # 20 часов гасил канал каждые 21,5 мин по старому числу, когда на диске уже лежало новое.
+    # Теперь процесс сам сообщает, что держит в ПАМЯТИ, первой же строкой после рестарта.
     log.info("супервизор стартовал (pid=%s, ветки=%s, cwd=%s)",
-             os.getpid(), [b["label"] for b in _br], REPO)
+             os.getpid(),
+             ["%s:порог %sс" % (b["label"], b.get("max_age") or LIVENESS_MAX_AGE) for b in _br],
+             REPO)
     threads = []
     for spec in _br:
         t = threading.Thread(target=_run, args=(spec,), name="rc-%s" % spec["label"], daemon=True)

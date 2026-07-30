@@ -460,6 +460,37 @@ class TestMain(unittest.TestCase):
         rc.main(singleton=lambda: (True, None), branch_runner=lambda spec: launched.append(spec["label"]))
         self.assertEqual(sorted(launched), ["named-channel", "rc-server"])   # обе ветки подняты
 
+    def test_startup_line_names_thresholds_of_both_branches(self):
+        """Стартовая строка НАЗЫВАЕТ порог каждой ветки — это единственное доказательство того,
+        что в ПАМЯТИ процесса новое число, доступное СРАЗУ и не требующее провала. Класс 30.07:
+        порог читается на импорте, супервизор 20 часов работал старым кодом при новом файле на
+        диске, а «фикс в силе» проверялось ожиданием 22 минут тишины."""
+        handler = _Collect()
+        rc.log.addHandler(handler)
+        try:
+            rc.main(singleton=lambda: (True, None), branch_runner=lambda spec: None)
+        finally:
+            rc.log.removeHandler(handler)
+        start = [ln for ln in handler.lines if "супервизор стартовал" in ln]
+        self.assertEqual(len(start), 1)
+        # порог назван ЧИСЛОМ и привязан к имени ветки — обе ветки, оба своих числа
+        self.assertIn("named-channel:порог %sс" % rc.NAMED_LIVENESS_MAX_AGE, start[0])
+        self.assertIn("rc-server:порог %sс" % rc.SERVER_LIVENESS_MAX_AGE, start[0])
+        self.assertIn("pid=%s" % os.getpid(), start[0])
+
+    def test_startup_line_survives_spec_without_max_age(self):
+        """Инъекция ветки без ключа max_age (тестовые спеки такие есть) не смеет уронить старт —
+        падает общий дефолт, а не супервизор."""
+        handler = _Collect()
+        rc.log.addHandler(handler)
+        try:
+            rc.main(singleton=lambda: (True, None), branch_runner=lambda spec: None,
+                    branches=[{"label": "t", "mode": ("rc",), "log": "x.log"}])
+        finally:
+            rc.log.removeHandler(handler)
+        start = [ln for ln in handler.lines if "супервизор стартовал" in ln]
+        self.assertIn("t:порог %sс" % rc.LIVENESS_MAX_AGE, start[0])
+
 
 class TestConfigPaths(unittest.TestCase):
     """Пути и задержки: логи веток и флаг — в репо (под *.log / .gitignore); пауза «не готов» —
