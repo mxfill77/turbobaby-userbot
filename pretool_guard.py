@@ -70,6 +70,14 @@ headless пишет красную карточку в файл-маркер д�
     чтение содержимого (`cat`/`Get-Content`/`open().read()`/`grep`) — красное как было, вид `env`
     остаётся в hard-блоке. См. `_env_probe_only` / `_py_env_probe_only`.
 
+ТРЕТЬЕ УТОЧНЕНИЕ ТОГО ЖЕ КЛАССА (30.07.2026): ЧТЕНИЕ ОКРУЖЕНИЯ ЖИВОГО ПРОЦЕССА ≠ ФАЙЛ .env.
+  `python peb_env.py <pid> THINKER_MODEL …` снимает переменные модели из ПАМЯТИ живого процесса
+  через PEB (`OpenProcess`+`ReadProcessMemory`) и ни одного байта файла `.env` не открывает, но
+  в докстринге скрипта стоит слово «.env» («читаю из PEB, НЕ из файла .env») — и `_scan_python`,
+  читая тело, краснел по этому УПОМИНАНИЮ. Тот же развод по ДЕЙСТВИЮ: чтение окружения процесса —
+  зелёное (`_py_reads_process_env`), чтение/запись файла `.env` (`open().read()`, `Get-Content`,
+  `Select-String -Path .env`, `Set-Content .env`) — красное как было. См. `_py_env_readonly`.
+
 ЛОГ (`pretool_guard.log`, под *.log в .gitignore): пишется КАЖДОЕ решение обеих ролей —
 смягчение не должно стоить прозрачности. Строка: время | роль | инструмент | решение | вид |
 команда (обрезана, значения токенов/паролей замаскированы). Решение `journal` — это подавленная
@@ -1033,14 +1041,16 @@ def _scan_python(cmd, cwd, env_probe=False):
     cmd_scan = _scan_text(cmd)
     blob = cmd_scan + "\n" + content
     env_hit = _RE_ENV.search(blob)
-    # Проверка НАЛИЧИЯ секрета — не обращение к секрету (см. `_py_env_probe_only`). Два источника
-    # упоминания судим ПОРОЗНЬ, иначе проба в команде прикрыла бы чтение в теле скрипта:
+    # `.env` в коде — не всегда обращение к секрету (см. `_py_env_readonly`): проверка НАЛИЧИЯ
+    # (os.path.exists/stat) и чтение ОКРУЖЕНИЯ ЖИВОГО ПРОЦЕССА из PEB (ReadProcessMemory) ни байта
+    # файла не открывают, а имя `.env` в их докстринге — прояснение «НЕ из файла .env». Два
+    # источника упоминания судим ПОРОЗНЬ, иначе проба в команде прикрыла бы чтение в теле скрипта:
     # `Test-Path .env; python evil.py`, где .env читает evil.py, обязан остаться красным.
     # Признак ПРОБЫ не завершает разбор: остальные красные токены (боевая запись Bridge, живые
     # таблицы, SQL) проверяются ниже как раньше — послабление касается ТОЛЬКО вида `env`.
     if env_hit:
-        cmd_ok = (not _RE_ENV.search(cmd_scan)) or env_probe or _py_env_probe_only(cmd_scan)
-        body_ok = (not _RE_ENV.search(content)) or _py_env_probe_only(content)
+        cmd_ok = (not _RE_ENV.search(cmd_scan)) or env_probe or _py_env_readonly(cmd_scan)
+        body_ok = (not _RE_ENV.search(content)) or _py_env_readonly(content)
         if not (cmd_ok and body_ok):
             # объект называем ДОСЛОВНО найденным именем: у карточки .env объект обязан быть, иначе
             # правило «нет объекта → журнал» проглотило бы её (тело скрипта в команде не видно)
@@ -1086,11 +1096,24 @@ _RE_PY_EXISTS = re.compile(
 # (чтение, запись, переименование, копирование, dotenv, окружение, вызов шелла). Одно совпадение
 # отменяет послабление целиком — это НЕ список «что красное», а список «доказательства, что это
 # уже не проба наличия».
+# `\.read\b` (а не голое `\.read`): метод-чтение файла `f.read()`/`.read ` ловим, но `.Read` с
+# продолжением слова НЕ ловим — иначе `ReadProcessMemory` (чтение памяти ЖИВОГО процесса, а не
+# файла .env) ложно считался бы файловым чтением. `.readline/.readlines/.read_text/.read_bytes`
+# перечислены отдельно и остаются красными. `\.write` НЕ сужаем: `WriteProcessMemory` — мутация,
+# ей краснеть правильно.
 _RE_PY_NOT_PROBE = re.compile(
-    r"(?i)\bopen\s*\(|\.read|\.write|readline|readlines|read_text|read_bytes|"
+    r"(?i)\bopen\s*\(|\.read\b|\.write|readline|readlines|read_text|read_bytes|"
     r"os\.(?:rename|replace|remove|unlink|truncate|chmod|chown|system|popen)|"
     r"\bshutil\.|\bdotenv\b|\bload_env\b|os\.environ|\bgetenv\b|\bfileinput\b|\blinecache\b|"
     r"\bmmap\b|\bsubprocess\b|\bPopen\b|\bexec\s*\(|\beval\s*\(|\b__import__\b")
+# ЧТЕНИЕ ОКРУЖЕНИЯ ЖИВОГО ПРОЦЕССА из PEB — это НЕ файл секретов. OpenProcess(QUERY|VM_READ) +
+# NtQueryInformationProcess + ReadProcessMemory снимают переменные окружения из ПАМЯТИ процесса
+# (модель/эффорт живого userbot/демона), ни одного байта файла `.env` при этом не открывая.
+# Позитивный, поимённый маркер (как `_RE_PY_EXISTS` для проверки наличия): доказывает, что
+# упоминание `.env` в докстринге/комментарии такого скрипта — прояснение «читаю из PEB, НЕ из
+# файла .env», а не обращение к секрету.
+_RE_PY_PROC_ENV = re.compile(
+    r"(?i)\bReadProcessMemory\b|\bNtQueryInformationProcess\b|\bPROCESS_VM_READ\b")
 
 
 def _py_env_probe_only(code):
@@ -1102,6 +1125,27 @@ def _py_env_probe_only(code):
     if not _RE_ENV.search(c) or _RE_PY_NOT_PROBE.search(c):
         return False
     return bool(_RE_PY_EXISTS.search(c))
+
+
+def _py_reads_process_env(code):
+    """True ⇔ python-код читает ОКРУЖЕНИЕ ЖИВОГО ПРОЦЕССА из PEB (`ReadProcessMemory` +
+    `NtQueryInformationProcess`/`PROCESS_VM_READ`), а не файл `.env`. Память процесса — не
+    секретный файл: ни одного его байта такое чтение не открывает, поэтому упоминание `.env`
+    в докстринге/комментарии («читаю из PEB, НЕ из файла .env») секретом не является.
+    Любой признак файлового доступа/мутации (`_RE_PY_NOT_PROBE`: open/read-файла/dotenv/
+    os.environ/subprocess/…) → False: одна улика обращения к файлу отменяет послабление целиком."""
+    c = code or ""
+    if not _RE_ENV.search(c) or _RE_PY_NOT_PROBE.search(c):
+        return False
+    return bool(_RE_PY_PROC_ENV.search(c))
+
+
+def _py_env_readonly(code):
+    """True ⇔ `.env` в python-коде — ЧИСТОЕ ЧТЕНИЕ, не выдающее ни байта файла секретов:
+    либо проверка НАЛИЧИЯ/метаданных (`_py_env_probe_only`), либо чтение ОКРУЖЕНИЯ ЖИВОГО
+    ПРОЦЕССА из PEB (`_py_reads_process_env`). Оба — доказанная read-only-операция; обе несут
+    один и тот же fail-safe: любой признак файлового доступа (`_RE_PY_NOT_PROBE`) → False."""
+    return _py_env_probe_only(code) or _py_reads_process_env(code)
 
 
 def _env_probe_only(cmd):
@@ -1137,7 +1181,7 @@ def _env_probe_only(cmd):
             return False
         if _base(toks[j]) in _EXISTS_CMDS or _base(toks[j]) in _PRINT_CMDS:
             continue
-        if _RE_PY.search(seg) and _py_env_probe_only(seg):
+        if _RE_PY.search(seg) and _py_env_readonly(seg):
             continue
         return False
     return seen

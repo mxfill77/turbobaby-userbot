@@ -1947,5 +1947,98 @@ class TestApprovalEndToEndProcess(unittest.TestCase):
         self.assertEqual(marker, "")
 
 
+class TestProcessEnvRead(unittest.TestCase):
+    """ГОЛДЕНЫ 30.07.2026 (третье уточнение класса «упоминание ≠ действие»): ЧТЕНИЕ ОКРУЖЕНИЯ
+    ЖИВОГО ПРОЦЕССА из PEB ≠ файл секретов.
+
+    Живой факт (pretool_guard.log 19:26:06 и 19:52:34): `python peb_env.py <pid> THINKER_MODEL …`
+    снимает переменные модели из ПАМЯТИ процесса через OpenProcess+ReadProcessMemory и файла
+    `.env` не открывает, но в докстринге скрипта стоит слово «.env» (дословно «НЕ из файла .env») —
+    и _scan_python краснел по УПОМИНАНИЮ. Чтение памяти процесса — зелёное; чтение/запись файла
+    `.env` — красное как было (требование владельца: hard-блок не ослаблять)."""
+
+    # Тело реального peb_env.py: докстринг упоминает .env, код только читает PEB.
+    PEB_BODY = ('"""Читает ОКРУЖЕНИЕ живого процесса из PEB (не из файла ' + _DOT_ENV + ').\n'
+                'OpenProcess(QUERY_INFORMATION|VM_READ) + ReadProcessMemory — только чтение."""\n'
+                'import ctypes as C, sys\n'
+                'k32 = C.WinDLL("kernel32"); ntdll = C.WinDLL("ntdll")\n'
+                'def process_environ(pid):\n'
+                '    h = k32.OpenProcess(0x0400 | 0x0010, False, pid)\n'
+                '    st = ntdll.NtQueryInformationProcess(h, 0, None, 0, None)\n'
+                '    raw = k32.ReadProcessMemory(h, 0, None, 0, None)\n'
+                '    return {}\n')
+
+    def _no_card(self, cmd, tool="Bash"):
+        for headless in (True, False):
+            action, kind, obj = g.decide_for_role(
+                {"tool_name": tool, "tool_input": {"command": cmd}, "cwd": PROJ}, headless=headless)
+            self.assertNotEqual(action, "ask", f"{cmd} (headless={headless})")
+
+    def _card_env(self, cmd, tool="Bash"):
+        for headless in (True, False):
+            action, kind, obj = g.decide_for_role(
+                {"tool_name": tool, "tool_input": {"command": cmd}, "cwd": PROJ}, headless=headless)
+            self.assertEqual((action, kind), ("ask", "env"), f"{cmd} (headless={headless})")
+            self.assertIsNotNone(g.card_or_journal(kind, obj, cmd), cmd)  # hard-блок: карточка ВСЕГДА
+
+    # --- чтение окружения процесса: карточки нет ---
+
+    def test_helpers_classify_peb_body_as_process_env_read(self):
+        self.assertTrue(g._py_reads_process_env(self.PEB_BODY))
+        self.assertTrue(g._py_env_readonly(self.PEB_BODY))
+        # .ReadProcessMemory НЕ считается файловым чтением (сужение \.read\b)
+        self.assertFalse(g._RE_PY_NOT_PROBE.search(self.PEB_BODY))
+        # а обычное файловое чтение .read()/read_text — по-прежнему улика
+        self.assertTrue(g._RE_PY_NOT_PROBE.search("f.read()"))
+        self.assertTrue(g._RE_PY_NOT_PROBE.search("Path(x).read_text()"))
+
+    def test_peb_script_file_is_not_a_card(self):
+        """Файл-скрипт во временной зоне: гард читает его тело и сканирует — и всё равно defer."""
+        fd, path = tempfile.mkstemp(suffix=".py", dir=tempfile.gettempdir())
+        os.close(fd)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.PEB_BODY)
+            cmd = 'D:\\turbobaby-bot\\venv\\Scripts\\python.exe "%s" 18096 THINKER_MODEL' % path
+            self._no_card(cmd, tool="PowerShell")
+            self.assertEqual(g.decide({"tool_name": "PowerShell", "cwd": PROJ,
+                                       "tool_input": {"command": cmd}}),
+                             ("defer", "env_probe", ""))          # прозрачность: видно как пробу
+        finally:
+            os.remove(path)
+
+    def test_peb_inline_c_is_not_a_card(self):
+        cmd = ("python -c \"import ctypes; k=ctypes.WinDLL('kernel32'); "
+               "k.ReadProcessMemory()  # PEB, not file " + _DOT_ENV + "\"")
+        self._no_card(cmd, tool="Bash")
+
+    # --- fail-safe: файл секретов краснеет всегда ---
+
+    def test_process_env_read_does_not_open_file_bypass(self):
+        """PEB-маркер как ДЕКОЙ + реальное открытие файла .env → красное: одна улика open( отменяет
+        послабление целиком (иначе ReadProcessMemory стал бы отмычкой к чтению .env)."""
+        cmd = ("python -c \"import ctypes; ctypes.WinDLL('kernel32').ReadProcessMemory(); "
+               "print(open('" + _DOT_ENV + "').read())\"")
+        self._card_env(cmd, tool="Bash")
+
+    def test_env_file_reads_stay_red(self):
+        """Требование владельца №3: чтение файла секретов красное всегда — Select-String -Path
+        и её родня закрыты (дыра, закрытая 30.07, остаётся закрытой)."""
+        for cmd, tool in (("Get-Content " + _DOT_ENV, "PowerShell"),
+                          ("Get-Content " + _DOT_ENV + " | Select-String -Pattern MODEL", "PowerShell"),
+                          ("Select-String -Path " + _DOT_ENV + " -Pattern MODEL", "PowerShell"),
+                          ("Select-String -LiteralPath " + _DOT_ENV + " -Pattern M", "PowerShell"),
+                          ("cat " + _DOT_ENV, "Bash"),
+                          ("grep -n MODEL " + _DOT_ENV, "Bash"),
+                          ('python -c "print(open(\'' + _DOT_ENV + '\').read())"', "Bash")):
+            self._card_env(cmd, tool=tool)
+
+    def test_env_file_write_stays_red(self):
+        """Требование владельца №2: запись/правка файла .env — красное как было."""
+        for cmd, tool in (("Set-Content -Path " + _DOT_ENV + " -Value X", "PowerShell"),
+                          ("echo TOKEN=1 >> " + _DOT_ENV, "Bash")):
+            self._card_env(cmd, tool=tool)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
