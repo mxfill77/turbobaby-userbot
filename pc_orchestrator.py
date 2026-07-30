@@ -182,6 +182,8 @@ ASK_MARKER_ENV = "PRETOOL_ASK_MARKER"   # env для pretool_guard: писать
 MARKER_TOKEN_ENV = "PRETOOL_MARKER_TOKEN"   # env: токен нашего запуска — гард штампует им карточки;
 APPROVED_KINDS_ENV = "PRETOOL_APPROVED_KINDS"   # env: виды, на которые владелец УЖЕ сказал «да»
 APPROVED_TASK_ENV = "PRETOOL_APPROVED_TASK"     # env: id одобренной задачи (для лога гарда)
+APPROVED_OBJECT_ENV = "PRETOOL_APPROVED_OBJECT"  # env: ОБЪЕКТ, названный владельцем в ответе, —
+#   без него гард не пропускает высший вид карточки (необратимое): см. _approved_scope
 MARKER_SEP = "\x1f"                          # демон принимает ТОЛЬКО карточки со своим токеном (fix ghost:
 #   subprocess-тесты гарда наследовали боевой маркер и писали фикстурные карточки — «призрак PID 1»).
 
@@ -1047,7 +1049,79 @@ def _approved_kinds(item):
         return frozenset()
 
 
-def _run_task_impl(tid, text, note="", _mctx=None, approved=()):
+# ── ВЫСШИЙ ВИД КАРТОЧКИ ПОДТВЕРЖДАЕТСЯ ОБЪЕКТОМ, А НЕ «ДА N» (31.07.2026) ─────────────────────
+# Повод: владелец подтвердил три карточки `live_sheet` подряд не читая. Гард теперь печатает у
+# необратимых операций шапку с ОБЪЕКТОМ и ждёт ответ, который этот объект называет
+# (`pretool_guard.approval_covers`). Демону остаётся достать ответ владельца из ряда очереди и
+# прокинуть ребёнку — это и делают `_owner_reply` / `_approved_scope`.
+#
+# ЧЕСТНАЯ ГРАНИЦА, которую важно понимать при чтении: сегодня ряд очереди возвращает КАРТОЧКУ
+# (`what`/`result`), а ТЕКСТ ОТВЕТА владельца в него не кладётся — «да» приезжает сюда только
+# сменой статуса на approved. Поэтому поля ответа перебираются списком кандидатов, и пока ни
+# одно из них не приходит, высший вид НЕ получает авто-пропуск: задача честно закрывается
+# «выполни вручную» с названной причиной. Это FAIL-CLOSED и намеренно: канал, который объект не
+# донёс, обязан закрывать необратимое, а не открывать его. Обычный вид работает как работал.
+_REPLY_FIELDS = ("owner_reply", "reply", "answer", "approval_text", "approved_text",
+                 "decision_text", "comment", "note")
+
+
+def _looks_like_card(raw):
+    """→ True ⇔ это текст САМОЙ карточки, а не ответ на неё. Узнаём ПО СТРУКТУРЕ (строка
+    «Объект: …», строка класса), а не по вхождению подстроки: шапка высшего вида ПОКАЗЫВАЕТ
+    образец ответа («да Зарплаты»), поэтому правильный ответ — всегда подстрока карточки, и
+    отсев «ответ содержится в карточке» вычеркнул бы ровно то, что надо принять.
+    Сбой разбора → True: принять карточку за ответ хуже, чем не принять ответ (fail-closed)."""
+    r = str(raw or "")
+    if not r.strip():
+        return False
+    if pretool_guard is None:
+        return "Объект:" in r
+    try:
+        return bool(pretool_guard.object_from_card(r)) or pretool_guard.KIND_LINE_PREFIX in r
+    except Exception:
+        return True
+
+
+def _owner_reply(item):
+    """ТЕКСТ ОТВЕТА владельца на карточку → str ('' — ответа в ряду очереди нет).
+    Сама карточка ответом НЕ считается: в ней объект напечатан, и приняв её за ответ, мы бы
+    подтверждали карточку ею же самой."""
+    it = item or {}
+    card = " ".join(str(it.get("what") or "").split())
+    out = []
+    for f in _REPLY_FIELDS:
+        raw = it.get(f)
+        v = " ".join(str(raw or "").split())
+        if v and v != card and not _looks_like_card(raw):
+            out.append(v)
+    return " ".join(out)
+
+
+def _approved_scope(item):
+    """→ (виды, объект). Обычный вид — по классу, как с 30.07. ВЫСШИЙ вид проходит ТОЛЬКО тогда,
+    когда владелец НАЗВАЛ в ответе объект из карточки; иначе вид из одобрения вычёркивается, и
+    шаг снова упрётся в красное (то есть операция не исполнится)."""
+    kinds = _approved_kinds(item)
+    if not kinds or pretool_guard is None:
+        return kinds, ""
+    try:
+        top = frozenset(k for k in kinds if pretool_guard.is_top_tier(k))
+        if not top:
+            return kinds, ""
+        card = str((item or {}).get("what") or (item or {}).get("result") or "")
+        obj, reply = pretool_guard.object_from_card(card), _owner_reply(item)
+        if obj and pretool_guard.reply_confirms_object(reply, obj):
+            log.info("одобрение высшего вида: объект «%s» назван владельцем в ответе", obj)
+            return kinds, reply
+        log.info("одобрение высшего вида БЕЗ объекта (карточка: «%s», ответ: «%s») → классы %s "
+                 "вычеркнуты", obj, _clip(reply, 80), ",".join(sorted(top)))
+        return frozenset(kinds - top), ""
+    except Exception as e:                    # разбор НИКОГДА не роняет обработку approve
+        log.warning("объект одобрения не разобран (%s) — высший вид не пропускаем", e)
+        return frozenset(), ""
+
+
+def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=""):
     """Исполнить задачу через headless claude -p. → (status, result). status ∈ done|failed|needs_approval.
     Контракт результата (фикс ложного done задачи #24): done ТОЛЬКО при непустом stdout со строкой
     «RESULT: <итог>»; пустой stdout → один авто-повтор (транзиент), снова пустой → failed с хвостом
@@ -1082,9 +1156,13 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=()):
     if kinds:
         env[APPROVED_KINDS_ENV] = ",".join(kinds)
         env[APPROVED_TASK_ENV] = str(tid)
+        # Объект, НАЗВАННЫЙ владельцем в ответе: без него гард высший вид не пропустит
+        # (`pretool_guard.approval_covers`). Пусто → переменной нет, обычный вид не задет.
+        if approved_object:
+            env[APPROVED_OBJECT_ENV] = approved_object
         prompt += APPROVED_CLAUSE.format(kinds=", ".join(kinds))
-        log.info("id=%s ОДОБРЕНО владельцем, класс(ы)=%s → маркер в env ребёнка + абзац в промпт",
-                 tid, ",".join(kinds))
+        log.info("id=%s ОДОБРЕНО владельцем, класс(ы)=%s объект=%s → маркер в env ребёнка + "
+                 "абзац в промпт", tid, ",".join(kinds), approved_object or "—")
     prompt += text
     for attempt in (1, 2):
         if _mctx is not None:
@@ -1158,7 +1236,7 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=()):
         return "done", out_s[:RESULT_MAX]
 
 
-def run_task(tid, text, note="", approved=()):
+def run_task(tid, text, note="", approved=(), approved_object=""):
     """Обёртка-наблюдаемость над _run_task_impl: та же сигнатура/возврат, но по завершении пишет
     ОДНУ структурную строку METRICS в лог демона (модель/усилие/тайминги/исход/попытки/самопочинки/
     канал). tokens_in/out=na — ПК-исполнитель в ТЕКСТ-режиме (claude -p без --output-format json
@@ -1166,7 +1244,7 @@ def run_task(tid, text, note="", approved=()):
     _mctx = {"attempts": 0}   # 0 = ни одной headless-попытки (ранний выход: claude не найден / бюджет)
     _t0 = time.monotonic()
     _start = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-    status, result = _run_task_impl(tid, text, note, _mctx, approved)
+    status, result = _run_task_impl(tid, text, note, _mctx, approved, approved_object)
     try:
         eff, _ = repo_thinking_settings()
         log.info(task_metrics.metrics_line(
@@ -1941,19 +2019,29 @@ def process_approved():
             continue
         # Класс, на который нажали «да» → поедет ребёнку (env-маркер гарду + абзац модели). Раньше
         # ре-ран шёл БЕЗ этого, и тот же шаг снова краснел: 7 «да» из 10 сгорели именно здесь.
-        appr = _approved_kinds(task)
+        appr, appr_obj = _approved_scope(task)
+        dropped = _approved_kinds(task) - appr          # высший вид без названного объекта
         status, result = run_task(tid, str(task.get("task_text") or ""),
                                   note="[ОДОБРЕНО ЧЕЛОВЕКОМ] предыдущий шаг подтверждён. ",
-                                  approved=appr)
+                                  approved=appr, approved_object=appr_obj)
         if status == "needs_approval":
             # ✋ первым символом (зеркало ручной карты VPS): headless красное ДОКАЗАННО не проходит
             # даже после «да» — для шага локальной цепи это терминальный halt без думателя
             # (гейт _loc_after_fail; ре-аппрув/переформулировка = петля, рвём после ровно 1 круга)
             # Диагноз честный: сказано, ЧТО было одобрено — «класс не назван» и «одобрен класс X, а
             # уперлись в другой» это РАЗНЫЕ причины, и раньше владелец их не различал.
-            why = ("одобрен класс " + ", ".join(sorted(appr)) + ", но упёрлись в ДРУГОЕ красное"
-                   if appr else "класс операции в карточке не назван (op=other) — одобрение "
-                                "не привязать к операции")
+            # Три РАЗНЫЕ причины, и владелец обязан их различать: чужой класс, класс не назван и
+            # (с 31.07) высший вид без объекта в ответе — последняя лечится не повтором «да», а
+            # ответом, который называет объект.
+            if dropped:
+                why = ("необратимая операция (" + ", ".join(sorted(dropped)) + ") подтверждается "
+                       "ТОЛЬКО ответом с объектом — короткое «да» её не открывает; ответь "
+                       "«да <объект из карточки>»")
+            elif appr:
+                why = "одобрен класс " + ", ".join(sorted(appr)) + ", но упёрлись в ДРУГОЕ красное"
+            else:
+                why = ("класс операции в карточке не назван (op=other) — одобрение "
+                       "не привязать к операции")
             msg = fail_result(FAIL_MODEL_REFUSAL,
                               f"одобрено, но шаг снова упирается в красное — выполни вручную "
                               f"[{why}]: " + result[:400], since=_task_started_get(tid))

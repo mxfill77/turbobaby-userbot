@@ -91,6 +91,44 @@ headless пишет красную карточку в файл-маркер д�
   читающие dot-команды) — зелёное, запись (`insert|update|delete|drop|alter|create|…`) — красная
   с ИМЕНЕМ БАЗЫ в объекте, неразобранное — красное и так и подписано. См. `_sqlite_decide`.
 
+ПЯТАЯ ГРУППА ТОГО ЖЕ КЛАССА (31.07.2026) — ТРИ МЕСТА, найденные пробой задачи 73
+(`tmp/probe_fifth_group.py`, артефакт `docs/artifacts/2026-07-30-guard-config-read-vs-write.md` §5):
+  • ЖИВОЙ ЛИСТ — не шум, а ДЫРА, и она была ИНВЕРСНОЙ. Поиск слова
+    `python -c "print('gspread' in open('suggest.py').read())"` давал карточку, а НАСТОЯЩЕЕ
+    обращение `python -c "import gspread; gspread.open('Лист1')"` уходило в журнал МОЛЧА: цикл
+    `_RED_CMD` объект для `live_sheet` не заполнял вовсе, `_card_fields` брал `_extract_host`,
+    которого в питон-форме нет, а `live_sheet` не стоял в `_HARD_CARD` — правило «нет объекта →
+    журнал» карточку проглатывало. Это ДЕНЬГИ И ПАРК: теперь развод по ДЕЙСТВИЮ
+    (`_live_sheet_decide`) + FAIL-CLOSED — обращение к листу даёт карточку ВСЕГДА, объект — ИМЯ
+    ЛИСТА, а если имя не извлеклось, так и написано («лист не определён — fail-closed»).
+  • `py_write` ПО ИМЕНИ ФУНКЦИИ. Боевые токены искались голой подстрокой: `print('create_booking')`
+    краснел, `def create_booking` в читаемом теле — тоже. Теперь красит ВЫЗОВ (`_py_write_call`):
+    `add_transaction(…)`, `bridge.create_booking(…)`, `{"action": "add_transaction"}`; упоминание
+    имени в строке/комментарии/эхо — тихо.
+  • ТЕЛО HEREDOC — ДАННЫЕ (`_strip_heredoc`). Тот же класс, что вырезание текста `git -m`:
+    `git commit -F - <<'EOF' … EOF` краснел на именах, НАЗВАННЫХ в сообщении коммита, а
+    `cat > tmp/probe.py <<'PYEOF' … PYEOF` называл в карточке НЕВЕРНЫЙ объект. Заголовок команды
+    сохраняется (`cat > .claude/settings.json <<'EOF'` — по-прежнему запись в конфиг), терминатор
+    не найден → не вырезаем ничего, а ЖИВОЙ ЛИСТ судится по тексту С ТЕЛОМ (fail-closed).
+
+ДВА ВИДА КАРТОЧКИ ПО ЦЕНЕ ОШИБКИ (31.07.2026) — правка НЕ о классификации, а о ВИДЕ и ПОРЯДКЕ
+ПОДТВЕРЖДЕНИЯ. Повод: владелец подтвердил ТРИ карточки `live_sheet` подряд не читая — они
+пришли в общем потоке и тем же видом, что уборка временного файла. Замер за двое суток:
+из 128 карточек 55 (43%) — необратимые, 73 (57%) — обычные, то есть высший вид тонул в потоке
+не как редкость, а почти как половина (`docs/artifacts/2026-07-31-card-tiers.md`).
+  • ВЫСШИЙ вид (`_TOP_TIER`, список владельца дословно): живые таблицы, деньги, клиентский
+    контур, выкатка прода, удаление вне временных папок, снос процессов. Всё прочее — обычный.
+  • ВИДНО С ПЕРВОГО ВЗГЛЯДА: одна строка-шапка сверху, первый символ ⛔ вместо 🔴 (в списке
+    уведомлений видна именно первая строка). Обычная карточка не выросла ни на байт.
+  • «ДА N» ВЫСШИЙ ВИД НЕ ОТКРЫВАЕТ: нужен ответ, НАЗЫВАЮЩИЙ объект (`approval_covers` +
+    `PRETOOL_APPROVED_OBJECT` от демона). «да»/«да 12» — фиксированная моторная программа,
+    выполнимая ДО чтения карточки; имя объекта заранее не известно и лежит внутри текста, так
+    что руке сначала нужен глаз. Довод целиком — у `TOP_TIER_BANNER`.
+  • БЕЗ НАЗВАННОГО ОБЪЕКТА КАРТОЧКА ВЫСШЕГО ВИДА НЕ ВЫПИСЫВАЕТСЯ ВОВСЕ: `deny` + строка лога
+    вместо подтверждаемой карточки. Утром 31.07 пришла карточка `live_sheet` с объектом «лист
+    не определён» — и её МОЖНО БЫЛО ПОДТВЕРДИТЬ. См. `card_decision` (там же граница: `deny`
+    бьёт только там, где карточка иначе бы родилась; журнальный случай не тронут).
+
 ЛОГ (`pretool_guard.log`, под *.log в .gitignore): пишется КАЖДОЕ решение обеих ролей —
 смягчение не должно стоить прозрачности. Строка: время | роль | инструмент | решение | вид |
 команда (обрезана, значения токенов/паролей замаскированы). Решение `journal` — это подавленная
@@ -784,6 +822,80 @@ def _sqlite_decide(cmd):
     return ("sqlite", (db + " · " if db else "") + "оператор не разобран")
 
 
+# ------- ЖИВОЙ ЛИСТ: развод по ДЕЙСТВИЮ и КАРТОЧКА ВСЕГДА (fail-closed, 31.07.2026) -----------
+# Пятая группа класса «класс по слову, а не по действию» — и единственная его ОПАСНАЯ половина.
+# Проба задачи 73 (`tmp/probe_fifth_group.py`) показала ИНВЕРСИЮ, дословно:
+#   КАРТОЧКА | ask live_sheet | ищем слово gspread по репозиторию
+#            | python -c "print('gspread' in open('suggest.py').read())"
+#   молча    | ask live_sheet | НАСТОЯЩЕЕ обращение к листу
+#            | python -c "import gspread; gspread.open('Лист1')"
+# Молчала не доктрина (`_stays_red` держит `live_sheet` красным безусловно), а КАРТОЧКА — три
+# точки сразу: цикл `_RED_CMD` заполняет объект только для delete/kill/network/sqlite;
+# `_card_fields` брал `_extract_host`, которого в питон-форме нет; `live_sheet` не входил в
+# `_HARD_CARD`, и правило «нет объекта → журнал» карточку глотало. Живой лист — это ДЕНЬГИ И
+# ПАРК (Лист1 / CRM / Календарь / Байки / Зарплаты / зоны), молчать тут нельзя ни при каких
+# условиях, поэтому правило здесь ЖЁСТЧЕ соседей:
+#   ДЕЙСТВИЕ (импорт клиента, обращение к нему, эндпойнт живого контура, Sheets API) → карточка
+#            ВСЕГДА; объект — ИМЯ ЛИСТА, не извлеклось → честная пометка, а НЕ исчезновение;
+#   УПОМИНАНИЕ (слово в строке, в комментарии, в эхо, в теле heredoc, в шаблоне поиска) → тихо.
+# ГРАНИЦА ОСТАЛАСЬ: `set_fleet_*`/`add_transaction`/`create_booking` — это `py_write`, у них своя
+# карточка и свой откат (void_last), и они уже в `_HARD_CARD`: деньги спрашивают всегда.
+_RE_LIVE_SHEET_HINT = re.compile(r"(?i)gspread|sheets\.googleapis\.com|script\.google\.com"
+                                 r"|spreadsheetid|\.\s*spreadsheets\s*\(")
+_RE_LIVE_SHEET_ACT = re.compile(
+    r"(?i)https?://(?:script\.google\.com|sheets\.googleapis\.com)"     # эндпойнт живого контура
+    r"|(?:^|[\s;&|(])import\s+(?:[\w.]+\s*,\s*)*gspread(?![\w])"        # клиент живых таблиц
+    r"|(?:^|[\s;&|(])from\s+gspread(?![\w])"
+    r"|(?:__import__|import_module)\s*\(\s*['\"]gspread"                # тот же импорт, но косвенный
+    r"|getattr\s*\([^)]*['\"]gspread"
+    r"|\bgspread\s*\.\s*\w+"                                            # gspread.open/authorize/…
+    r"|\.\s*spreadsheets\s*\(\s*\)"                                     # Sheets API v4 через клиент
+    r"|\bbuild\s*\(\s*['\"]sheets['\"]"
+    r"|\bspreadsheetId\s*[=:]")
+# Имя листа для объекта карточки: заголовок вкладки, префикс диапазона A1 (`Лист1!A1:B2`), ключ
+# таблицы. Последним — известные живые листы по имени: если владелец назвал лист в самой команде,
+# карточка обязана это показать. Ключ/идентификатор режем хвостом: карточка читается за 3 секунды.
+_RE_SHEET_TITLE = re.compile(
+    r"(?i)\.\s*(?:open|open_by_title|worksheet|add_worksheet|del_worksheet)\s*\(\s*['\"]([^'\"]{1,40})['\"]")
+_RE_SHEET_RANGE = re.compile(r"(?i)\brange\s*[=:]\s*['\"]([^'\"!]{1,40})!")
+_RE_SHEET_KEY = re.compile(
+    r"(?i)(?:open_by_key|open_by_url|spreadsheetId)\s*[=(:]\s*['\"]?[^'\"\s,)]*?([\w-]{20,})")
+_SHEET_NAMES = ("Лист1", "CRM", "Календарь", "Байки", "Зарплаты", "Зоны")
+# Честная пометка вместо пустого объекта. Формулировка называет ПРИЧИНУ («fail-closed»), чтобы
+# владелец видел: карточка не потеряла объект, а не смогла его извлечь и потому спросила.
+LIVE_SHEET_UNKNOWN = "лист не определён — fail-closed"
+
+
+def _extract_sheet(text):
+    """ИМЯ ЛИСТА (или таблицы/хоста) для объекта карточки. '' — извлечь не удалось; карточка
+    всё равно будет, с пометкой `LIVE_SHEET_UNKNOWN` (см. `_card_fields`)."""
+    t = text or ""
+    m = _RE_SHEET_TITLE.search(t) or _RE_SHEET_RANGE.search(t)
+    if m:
+        return m.group(1).strip()
+    m = _RE_SHEET_KEY.search(t)
+    if m:
+        return "таблица …" + m.group(1)[-8:]
+    for name in _SHEET_NAMES:
+        if re.search(r"(?i)(?<![\w])" + re.escape(name) + r"(?![\w])", t):
+            return name
+    return _extract_host(t) or ""
+
+
+def _live_sheet_decide(text):
+    """→ None (живого листа нет либо имя только УПОМЯНУТО) | объект карточки (никогда не пустой).
+
+    Ровно то же разделение, что у clasp (по подкоманде) и sqlite (по оператору), но с обратным
+    знаком по умолчанию: там неразобранное красное, здесь неразобранное красное И с честной
+    пометкой в объекте — потому что цена молчания на живом листе выше цены лишнего вопроса."""
+    t = text or ""
+    if not _RE_LIVE_SHEET_HINT.search(t):
+        return None
+    if not _RE_LIVE_SHEET_ACT.search(t):
+        return None                    # слово в строке/комментарии/эхо/теле heredoc — не операция
+    return _extract_sheet(t) or LIVE_SHEET_UNKNOWN
+
+
 # --- ЗЕЛЁНЫЕ признаки Bash-команды (проверяются ПОСЛЕ красных) ---
 # Доверенные скрипты — зелёные ПО ИМЕНИ модуля, содержимое не сканируется (их тела законно
 # читают конфиг с секретами; гейтуются в репо review+git). brain_writer — ЕДИНСТВЕННЫЙ
@@ -812,9 +924,42 @@ _RED_PY_TOKENS = [
     "os.remove", "os.unlink", "shutil.rmtree", "rmtree(", "os.rmdir",
 ]
 
-# Живые таблицы из python-кода (Лист1/CRM/Календарь напрямую, минуя Bridge). Отдельно от
-# _RED_PY_TOKENS: у них своя карточка, и в _stays_red они красные безусловно.
-_LIVE_SHEET_TOKENS = ["gspread", "sheets.googleapis.com", "script.google.com"]
+# ── БОЕВАЯ ЗАПИСЬ — это ВЫЗОВ, а не ИМЯ В ТЕКСТЕ (правка 31.07.2026, вторая часть пятой группы)
+# Токены выше искались ГОЛОЙ ПОДСТРОКОЙ по команде и телу скрипта (`for tok in _RED_PY_TOKENS:
+# if tok in blob`) — то есть по ИМЕНИ функции, а не по действию. Дословно из пробы задачи 73:
+#   КАРТОЧКА | ask py_write | печатаем ИМЯ функции, не зовём | python -c "print('create_booking')"
+# Цена шире одной строки: `py_write` стоит в `_HARD_CARD` (деньги спрашивают ВСЕГДА), поэтому
+# докстринг, комментарий или `def create_booking` в ЧИТАЕМОМ теле неотслеживаемого скрипта
+# стоили владельцу подтверждения — а `_stays_red` держит вид красным безусловно.
+#
+# Красными остаются ФОРМЫ ВЫЗОВА, и обе — живые:
+#   • прямой и через модуль: `add_transaction(…)`, `bridge.create_booking(…)`, `os.remove(…)`;
+#   • имя операции как ЗНАЧЕНИЕ поля `action` — так Bridge и зовут на самом деле
+#     (`{"action": "write_doc", "token": …}` в pricing/brain_writer/cowork_log_append,
+#     `?action=…` в собранном URL). Без этой формы развод по вызову ОСЛАБИЛ бы гард.
+# ОПРЕДЕЛЕНИЕ функции (`def create_booking(`) вызовом НЕ считается: это чтение чужого кода.
+_RE_DEF_TAIL = re.compile(r"(?i)\bdef\s+$")
+
+
+def _py_write_call(text):
+    """Имя боевой операции, ВЫЗВАННОЙ в тексте → элемент `_RED_PY_TOKENS`, иначе None.
+    None означает ровно «имя упомянуто, вызова нет» — команда идёт дальше по общему разбору."""
+    t = text or ""
+    for tok in _RED_PY_TOKENS:
+        if tok not in t:
+            continue                      # дешёвый предфильтр: без подстроки формы вызова нет
+        esc = re.escape(tok)
+        for m in re.finditer(esc if tok.endswith("(") else esc + r"\s*\(", t):
+            if not _RE_DEF_TAIL.search(t[max(0, m.start() - 12):m.start()]):
+                return tok
+        if re.search(r"(?i)['\"]?\b(?:action|op)['\"]?\s*[=:]\s*['\"]?" + esc + r"(?![\w])", t):
+            return tok
+        # косвенный вызов по ИМЕНИ: `getattr(bridge, 'create_booking')(…)`, `fn['…']()`.
+        # Имя в кавычках, за которым идёт вызов, — это вызов, а не упоминание.
+        if re.search(r"['\"]" + esc + r"['\"]\s*\)?\s*[\]\)]?\s*\(", t) \
+                or re.search(r"getattr\s*\([^)]*['\"]" + esc + r"['\"]", t):
+            return tok
+    return None
 
 
 def _inside_project(path):
@@ -1194,18 +1339,114 @@ def _mask(seg, dropped):
     return out
 
 
-def _scan_text(cmd):
+# ── ТЕЛО HEREDOC — ДАННЫЕ, А НЕ ОПЕРАЦИЯ (31.07.2026, третья часть пятой группы) ──────────────
+# Тот же класс, что вырезание текста `git -m` и позиционных аргументов .py-скрипта: то, что
+# команда ПЕРЕДАЁТ как текст, операцией не является. Живой журнал 30.07 — три карточки на
+# сообщениях коммита, отданных через stdin (`git commit -F - <<'EOF' … EOF`): «хочу обратиться к
+# .env» и «хочу изменить конфиг Claude Code» на строках, где эти имена просто НАЗВАНЫ в тексте
+# сообщения. Плюс группа из пробы задачи 73: `cat > tmp/probe.py <<'PYEOF' … PYEOF` — пишется
+# ЧЕРНОВИК, а путь конфига лежит в ТЕЛЕ скрипта, и карточка называла НЕВЕРНЫЙ объект.
+#
+# ЧТО НЕ ОСЛАБЛЕНО, намеренно и поимённо:
+#   • ЗАГОЛОВОК КОМАНДЫ ОСТАЁТСЯ. `cat > .claude/settings.json <<'EOF'` — это по-прежнему запись
+#     в конфиг: перенаправление стоит ДО тела и вырезанием не прячется;
+#   • ТЕРМИНАТОР НЕ НАЙДЕН → не вырезаем НИЧЕГО (строка журнала, обрезанная 300 символами;
+#     `1 << N` из кода). Непонятное остаётся красным — fail-safe, как везде в гарде;
+#   • ЖИВОЙ ЛИСТ судится по тексту С ТЕЛОМ (см. `_decide_bash_body`): деньги и парк прячутся
+#     даже в черновике;
+#   • ТЕЛО, КОТОРОЕ ИСПОЛНЯЕТСЯ, — НЕ ДАННЫЕ. `bash <<'EOF' … EOF`, `python - <<'PY' … PY`,
+#     `ssh host <<'EOF' … EOF`, `sqlite3 db <<EOF` подают телом КОМАНДЫ, а не текст: там оно
+#     работает ровно как инлайн `-c`. Тот же приём, что уже принят в `_redirect_text` для
+#     вложенных шеллов: строка-заголовок с интерпретатором отменяет вырезание ЦЕЛИКОМ.
+_RE_HEREDOC = re.compile(r"<<-?\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][\w.-]*))")
+_HEREDOC_EXEC = _NESTED_SHELLS | {"python", "python3", "py", "node", "perl", "ruby", "php",
+                                  "sqlite3", "psql", "mysql", "ssh", "docker", "xargs"}
+
+
+def _line_runs_code(line):
+    """True ⇔ в строке-заголовке есть команда, которая ИСПОЛНИТ тело heredoc (интерпретатор,
+    вложенный шелл, ssh). Сбой разбора — тоже True: непонятное не вырезаем (fail-safe)."""
+    for i, seg in enumerate(_split_segments(line or "")):
+        if i % 2:
+            continue
+        try:
+            toks = shlex.split(seg)
+        except Exception:
+            return True
+        j = _cmd_index(toks)
+        if j is not None and j < len(toks) and _base(toks[j]) in _HEREDOC_EXEC:
+            return True
+    return False
+
+
+def _strip_heredoc(cmd):
+    """Команда без ТЕЛ heredoc: заголовок и сам терминатор сохранены, строки между ними убраны."""
+    if not cmd or "<<" not in cmd:
+        return cmd
+    lines = cmd.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        if _RE_HEREDOC.search(line) and _line_runs_code(line):
+            return cmd                    # телом подают КОД — вырезать нечего, всё под сканом
+        for m in _RE_HEREDOC.finditer(line):
+            delim = m.group(1) or m.group(2) or m.group(3)
+            j = i
+            while j < len(lines) and lines[j].strip() != delim:
+                j += 1
+            if j >= len(lines):
+                return cmd                # терминатора нет → не угадываем, отдаём как есть
+            out.append(lines[j])
+            i = j + 1
+    return "\n".join(out)
+
+
+# ПЕЧАТЬ СВОЕГО АРГУМЕНТА — тоже данные. `echo "gspread.open('Лист1')"`, `Write-Output "зову
+# create_booking(1)"` НИЧЕГО не исполняют: текст уходит в stdout. Признак `_PRINT_CMDS` уже
+# принят гардом для секретов (`_env_probe_only`, живой факт задачи 55 — имя `.env` попало в
+# карточку из ПОДПИСИ К ВЫВОДУ); здесь тот же довод распространён на скан-текст целиком.
+# ТРИ ГУАРДА, каждый закрывает свой способ превратить печать в исполнение:
+#   • перенаправление в сегменте (`echo '{}' > .claude/settings.json`) — это ЗАПИСЬ, не печать;
+#   • труба ИЗ сегмента (`echo "import gspread; …" | python`) — текст становится КОДОМ;
+#   • подстановка команды в самом аргументе (`echo "$(rm -rf x)"`) — аргумент исполняется.
+# В любом из трёх случаев сегмент остаётся под сканом ЦЕЛИКОМ.
+def _strip_print_args(seg, nxt=""):
+    """Сегмент-печать без своих аргументов; не печать или любой из трёх гуардов → как есть."""
+    if _RE_REDIRECT.search(seg) or (nxt or "").strip() == "|":
+        return seg
+    try:
+        toks = shlex.split(seg)
+    except Exception:
+        return seg
+    j = _cmd_index(toks)
+    if j is None or j >= len(toks) or _base(toks[j]) not in _PRINT_CMDS:
+        return seg
+    dropped = [t for t in toks[j + 1:]
+               if not t.startswith("-") and not _RE_ARG_EXEC.search(t)]
+    return _mask(seg, dropped)
+
+
+def _scan_text(cmd, keep_heredoc=False):
     """Текст для поиска КРАСНЫХ признаков. Исполняется всегда ИСХОДНАЯ команда — правится только
     то, по чему ищем. Внутри сегмента порядок: текст git -m → аргументы .py-скрипта → поисковый
-    шаблон. Сегменты и разделители сохраняются, чтобы соседний кусок цепи остался под сканом."""
+    шаблон. Сегменты и разделители сохраняются, чтобы соседний кусок цепи остался под сканом.
+
+    `keep_heredoc=True` оставляет тела heredoc на месте — этим текстом судят ЖИВОЙ ЛИСТ
+    (fail-closed: запись в лист краснеет и из черновика)."""
     if not cmd:
         return cmd
+    if not keep_heredoc:
+        cmd = _strip_heredoc(cmd)
     out = []
-    for i, p in enumerate(_split_segments(cmd)):
+    parts = _split_segments(cmd)
+    for i, p in enumerate(parts):
         if i % 2:
             out.append(p)                       # разделитель — дословно
             continue
-        clean = _strip_script_cli_args(_strip_git_msg(p))
+        clean = _strip_print_args(p, parts[i + 1] if i + 1 < len(parts) else "")
+        clean = _strip_script_cli_args(_strip_git_msg(clean))
         try:
             toks = shlex.split(clean)
         except Exception:
@@ -1323,12 +1564,15 @@ def _scan_python(cmd, cwd, env_probe=False):
             # объект называем ДОСЛОВНО найденным именем: у карточки .env объект обязан быть, иначе
             # правило «нет объекта → журнал» проглотило бы её (тело скрипта в команде не видно)
             return ("ask", "env", env_hit.group(0).strip("'\" "))
-    for tok in _LIVE_SHEET_TOKENS:
-        if tok in blob:
-            return ("ask", "live_sheet", tok)
-    for tok in _RED_PY_TOKENS:
-        if tok in blob:
-            return ("ask", "py_write", tok)
+    # Живой лист и боевая запись — оба судятся по ДЕЙСТВИЮ, а не по имени в тексте (пятая
+    # группа, 31.07.2026). Объект листа — его ИМЯ, и он есть ВСЕГДА: `_live_sheet_decide`
+    # пустого не отдаёт, иначе правило «нет объекта → журнал» проглотило бы карточку.
+    sheet = _live_sheet_decide(blob)
+    if sheet is not None:
+        return ("ask", "live_sheet", sheet)
+    tok = _py_write_call(blob)
+    if tok:
+        return ("ask", "py_write", tok)
     if _RE_SQL_WRITE.search(blob) and ".db" in blob.lower() and "memory.db" not in blob.lower():
         return ("ask", "sqlite", _extract_db(blob) or "")
     if not saw_target:
@@ -1498,6 +1742,11 @@ def _decide_bash(cmd, cwd):
             return ("defer", "sqlite_read", sq[1])
     if probe and action == "defer" and not kind:
         return ("defer", "env_probe", "")     # прозрачность лога: пробу наличия видно как пробу
+    if action == "defer" and not kind and _RE_LIVE_SHEET_HINT.search(scan):
+        # Та же доктрина лога, что у `sqlite_read`/`env_probe`/`cfg_read`: смягчение не должно
+        # стоить прозрачности. Слово живого листа прошло молча — в журнале обязано быть видно,
+        # что это было УПОМИНАНИЕ, а не «ничего красного не нашли».
+        return ("defer", "sheet_mention", "")
     cfg = _RE_CLAUDE_CFG_CMD.search(scan)
     if cfg and _is_pure_config_read(cmd) and (
             (action == "defer" and not kind) or (action, kind) == ("ask", "unknown")):
@@ -1516,6 +1765,11 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False):
     # команду: перенаправление `> C:\…` стоит после имени скрипта и вырезанием пряталось бы.
     netk, nettarget = _net_scan(scan)
     sq = _sqlite_decide(scan) if _RE_SQLITE_WORD.search(scan) else None
+    # ЖИВОЙ ЛИСТ судим по тексту С ТЕЛАМИ HEREDOC: для денег и парка черновик — тоже обращение
+    # (fail-closed). Всё прочее красное судится по `scan`, где тело heredoc уже вырезано как
+    # данные. Поисковый шаблон и позиционные аргументы .py вырезаны в обоих текстах: `grep -n
+    # gspread suggest.py` — это поиск, а не лист.
+    sheet = _live_sheet_decide(_scan_text(cmd, keep_heredoc=True))
     for rx, kind in _RED_CMD:
         if rx.search(scan):
             # Сеть: красное — только НАСТОЯЩИЙ выход наружу. Свой ssh-канал и упоминание слова
@@ -1536,6 +1790,12 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False):
                 if sq is None or sq[0] == "sqlite_read":
                     continue
                 return ("ask", "sqlite", sq[1])
+            if kind == "live_sheet":
+                # Развод по ДЕЙСТВИЮ: слово `gspread`/адрес в тексте — не обращение к листу.
+                # Настоящее обращение возвращает объект ВСЕГДА (имя листа либо честная пометка).
+                if sheet is None:
+                    continue
+                return ("ask", "live_sheet", sheet)
             obj = ""
             if kind == "delete":
                 obj = _extract_delete_target(scan) or ""
@@ -1546,6 +1806,10 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False):
             elif kind == "sqlite":
                 obj = _extract_db(scan) or ""
             return ("ask", kind, obj)
+    # ЖИВОЙ ЛИСТ мимо цикла: признак мог не попасть в `scan` (обращение лежит в теле heredoc —
+    # черновике скрипта, который его и запишет). Деньги и парк красим и здесь — fail-closed.
+    if sheet is not None:
+        return ("ask", "live_sheet", sheet)
     # Секрет упомянут — но ПРОБА НАЛИЧИЯ секретом не делится (`_env_probe_only`). Признак пробы
     # НЕ обрывает разбор: команда идёт дальше по всем прочим красным ветвям (конфиг `.claude`,
     # запись вне репо, python-скан) — иначе `Test-Path .env; python evil.py` перестал бы
@@ -1664,6 +1928,102 @@ def owner_approved_kinds(env=None):
     if not words or any(w not in _KIND_VOCAB for w in words):
         return frozenset()
     return frozenset(words)
+
+
+# ══ «ДА N» НЕ ПОДТВЕРЖДАЕТ ВЫСШИЙ ВИД ═══════════════════════════════════════════════════════
+# Второй канал одобрения (первый — `owner_approved_kinds`, виды): ОБЪЕКТ, который владелец
+# НАЗВАЛ в ответе. Демон извлекает его из ответа владельца, сверяет с объектом сохранённой
+# карточки и ставит ребёнку `PRETOOL_APPROVED_OBJECT`. Виды высшего списка проходят ТОЛЬКО с ним
+# (`approval_covers`) — короткое «да»/«да 12» их не открывает.
+#
+# FAIL-CLOSED, и это ГЛАВНОЕ СВОЙСТВО: пустой/чужой объект = одобрения нет = операция не
+# исполняется. Значит канал, который объект НЕ донёс (ответ владельца до демона не доехал,
+# кнопка вместо текста, обрыв Bridge), закрывает высшую цену, а не открывает её. Обычный вид
+# работает как работал, байт-в-байт.
+APPROVED_OBJECT_ENV = "PRETOOL_APPROVED_OBJECT"
+
+# Слово согласия и номер задачи — ровно те два элемента, из которых состоит автоматический
+# ответ. Снимаем их и смотрим, ОСТАЛОСЬ ли что-то: у «да»/«да 12» не остаётся ничего.
+_RE_ASSENT = re.compile(r"(?i)^\W*(?:да|ага|угу|ок|окей|ok|okay|yes|yep|y|approve|апрув|"
+                        r"подтверждаю|разрешаю)\b\W*")
+_RE_LEAD_NUM = re.compile(r"^#?\d{1,6}\b\W*")
+_RE_OBJ_LINE = re.compile(r"(?m)^\s*Объект:\s*(.+?)\s*$")
+
+
+def object_from_card(text):
+    """ОБЪЕКТ из сохранённой карточки (строка «Объект: …») → str ('' — не нашли/прочерк).
+    Читает демон: сверять ответ владельца надо с тем, что было В КАРТОЧКЕ, а не с догадкой."""
+    m = _RE_OBJ_LINE.search(str(text or ""))
+    if not m:
+        return ""
+    o = " ".join(m.group(1).split())
+    return "" if o in ("", "—") else o
+
+
+def _reply_key(obj):
+    """КОРОТКАЯ форма объекта — её гард печатает в шапке высшего вида и её же ждёт в ответе.
+    Длинный путь/id владелец переписывать не должен: берём последний компонент пути и хвост
+    маскированного идентификатора («деплой …Ybv9HhOJ» → Ybv9HhOJ)."""
+    o = " ".join(str(obj or "").split())
+    o = o.split(" — ")[0].strip() or o
+    tail = re.split(r"[\\/]", o)[-1].strip()
+    if len(tail) >= 2:
+        o = tail
+    m = re.search(r"…\s*([\w-]{4,})\s*$", o)
+    return m.group(1) if m else o
+
+
+def _obj_keys(obj):
+    """Строки, ЛЮБАЯ из которых считается «объект назван». Числовой ключ обязан быть от трёх
+    цифр: двузначное совпало бы с номером задачи, то есть с автоматическим «да 12»."""
+    if not _object_named(obj):
+        return ()
+    out = set()
+    for k in (" ".join(str(obj or "").split()), _reply_key(obj)):
+        k = (k or "").strip().casefold()
+        if len(k) >= (3 if k.isdigit() else 2):
+            out.add(k)
+    m = re.search(r"(\d{3,})", str(obj or ""))       # PID внутри «python (PID 1234)»
+    if m:
+        out.add(m.group(1))
+    return tuple(out)
+
+
+def _reply_payload(reply):
+    """Содержательная часть ответа: без слова согласия и (вторым вариантом) без номера задачи.
+    Два кандидата, а не один, — чтобы `да 1234` работало, когда объект и ЕСТЬ этот PID."""
+    t = _RE_ASSENT.sub("", " ".join(str(reply or "").split())).strip()
+    out = [t]
+    t2 = _RE_LEAD_NUM.sub("", t).strip()
+    if t2 and t2 != t:
+        out.append(t2)
+    return [x for x in out if x]
+
+
+def reply_confirms_object(reply, obj):
+    """→ True ⇔ владелец НАЗВАЛ объект в ответе. Пустой ответ, голое «да», «да 12», ответ с
+    ЧУЖИМ объектом → False. Регистр и пунктуация не важны, порядок слов не важен."""
+    keys = _obj_keys(obj)
+    if not keys:
+        return False                       # объект не назван и в самой карточке — сверять не с чем
+    return any(k in p.casefold() for p in _reply_payload(reply) for k in keys)
+
+
+def owner_approved_object(env=None):
+    """Объект, НАЗВАННЫЙ владельцем в ответе (из env-маркера демона). '' — не назван."""
+    e = os.environ if env is None else env
+    return " ".join((e.get(APPROVED_OBJECT_ENV) or "").split())
+
+
+def approval_covers(kind, obj, env=None):
+    """→ True ⇔ «да» владельца покрывает ИМЕННО ЭТУ операцию.
+    Обычный вид — по классу, как с 30.07. ВЫСШИЙ вид — по классу И по объекту: одобрен ровно тот
+    объект, что владелец переписал. Одобрив «Лист1», нельзя молча пройти в «Зарплаты»."""
+    if (kind or "") not in owner_approved_kinds(env):
+        return False
+    if not is_top_tier(kind):
+        return True
+    return reply_confirms_object(owner_approved_object(env), obj)
 
 
 def _kind_phrase(kind):
@@ -1830,7 +2190,7 @@ def decide_for_role(data, headless, env=None):
     if (data.get("tool_name") or "") in ("Bash", "PowerShell"):
         cmd = (data.get("tool_input") or {}).get("command") or ""
     if _stays_red(kind, obj, cmd):
-        if kind in owner_approved_kinds(env):
+        if approval_covers(kind, obj, env):
             return ("approved", kind, obj)
         return action, kind, obj
     return ("defer", kind, obj)
@@ -1907,13 +2267,60 @@ _ROLLBACK = {
 _RE_NUM_VERSION = re.compile(r"(?i)(?:^|\s)-V\s+(\d+)")
 _RE_NUM_PID = re.compile(r"(\d+)")
 
+# ══ ДВА ВИДА КАРТОЧКИ ПО ЦЕНЕ ОШИБКИ (31.07.2026) ═══════════════════════════════════════════
+# ПОВОД. Владелец подтвердил ТРИ карточки `live_sheet` подряд не читая: они пришли в общем
+# потоке и тем же видом, что уборка временного файла. Пока «удалить tmp/x.log» и «запись в лист
+# Зарплаты» выглядят одинаково, поток учит руку отвечать «да N» ДО чтения — и редкая настоящая
+# карточка тонет среди дешёвых. Лечим не классификацию (она верна: обе операции красные), а ВИД
+# и ПОРЯДОК ПОДТВЕРЖДЕНИЯ.
+#
+# СПИСОК — РЕШЕНИЕ ВЛАДЕЛЬЦА, перенесённое ДОСЛОВНО («живые таблицы, деньги, клиентский контур,
+# выкатка прода, удаление вне временных папок, снос процессов»). Держим одним кортежем, чтобы
+# перенос вида между полосами был правкой ОДНОЙ строки, а не охотой по файлу:
+#   живые таблицы ......... live_sheet, clasp_run (функция УЖЕ отработала в живых таблицах)
+#   деньги ................ py_write (боевая запись Bridge: create_booking/add_transaction/…)
+#   клиентский контур ..... clasp (подкоманда не разобрана → проект Apps Script трогаем)
+#   выкатка прода ......... clasp_push, clasp_deploy
+#   удаление вне tmp ...... delete (работа во ВРЕМЕННЫХ каталогах красной не бывает вовсе —
+#                           `_temp_zone`, правка 29.07; значит ЛЮБОЙ дошедший сюда delete
+#                           по построению уже вне временных папок)
+#   снос процессов ........ kill
+# ОСТАЛЬНОЕ — обычный вид, в том числе `env`/`read_secret`/`edit_claude`/`schtasks`/`git_force`/
+# `network`/`outside`/`sqlite`/`unknown`. Это НЕ «они безопасны»: hard-блок и доктрина `_stays_red`
+# их держат ровно как держали. Это значит «цена ошибки ниже необратимой», по списку владельца.
+_TOP_TIER = ("live_sheet", "clasp", "clasp_push", "clasp_deploy", "clasp_run",
+             "py_write", "delete", "kill")
+
+
+def is_top_tier(kind):
+    """ВЫСШИЙ вид ⇔ цена ошибки необратима (список владельца, `_TOP_TIER`)."""
+    return (kind or "").strip() in _TOP_TIER
+
+
+# Объект НАЗВАН ⇔ в карточке стоит то, что владелец может прочитать и повторить. Честные
+# пометки-заглушки объектом НЕ являются: именно такая карточка («лист не определён») пришла
+# 31.07 и была подтверждаема — подтверждать в ней было нечего.
+_UNNAMED_OBJ = (LIVE_SHEET_UNKNOWN, "оператор не разобран", "лист не определён")
+
+
+def _object_named(obj):
+    o = " ".join(str(obj or "").split())
+    if len(o) < 2:
+        return False
+    return not any(o.casefold().startswith(u.casefold()) for u in _UNNAMED_OBJ)
+
+
 # Виды, карточка которых обязательна ДАЖЕ без объекта, — hard-блок:
 #   • `unknown` — сбой разбора самого гарда: на нём молчать нельзя ни при каких условиях;
 #   • `.env` и секреты — прямое требование владельца «.env не трогать»: правило «нет объекта →
 #     журнал» не имеет права его обойти, даже если имя файла осталось внутри тела скрипта;
 #   • `py_write` — БОЕВАЯ ЗАПИСЬ Bridge, то есть ДЕНЬГИ (отмена последней проводки зовётся без
 #     аргументов по своей природе). Зеркало `_ALWAYS_CARD` полосы сервера: деньги спрашивают всегда.
-_HARD_CARD = ("unknown", "env", "edit_secret", "read_secret", "py_write")
+#   • `live_sheet` — ЖИВЫЕ ТАБЛИЦЫ (Лист1 / CRM / Календарь / Байки / Зарплаты / зоны), то есть
+#     деньги и парк. Добавлен 31.07.2026: именно отсутствие вида в этом списке отправляло
+#     НАСТОЯЩЕЕ обращение к листу в журнал МОЛЧА, когда имя листа не извлеклось. Теперь объект
+#     не бывает пустым (`LIVE_SHEET_UNKNOWN`), а вид стоит здесь ВТОРЫМ поясом — fail-closed.
+_HARD_CARD = ("unknown", "env", "edit_secret", "read_secret", "py_write", "live_sheet")
 
 
 def _card_fields(kind, obj="", raw_cmd=""):
@@ -1946,7 +2353,12 @@ def _card_fields(kind, obj="", raw_cmd=""):
         m = _RE_ENV.search(_scan_text(cmd)) if cmd else None
         o = o or (m.group(0).strip("'\" ") if m else "")
     elif kind == "live_sheet":
-        o = o or (_extract_host(cmd) or "")
+        # ДЕНЬГИ И ПАРК — FAIL-CLOSED. Объект обязателен: имя листа (вкладка, префикс диапазона
+        # `Лист1!A1`, ключ таблицы, известное имя, хост живого контура), а если ничего не
+        # извлеклось — карточка говорит об этом ЧЕСТНО и всё равно спрашивает. Раньше здесь был
+        # только `_extract_host`, которого в питон-форме нет: объект оставался пустым, и правило
+        # «нет объекта → журнал» глотало карточку на НАСТОЯЩЕМ обращении к листу.
+        o = o or _extract_sheet(cmd) or LIVE_SHEET_UNKNOWN
     elif kind == "sqlite":
         # ИМЯ БАЗЫ — обязательный объект карточки записи (требование ТЗ 30.07.2026). Базу не
         # назвали в команде (`c.execute(…)` по соединению из переменной, имя в теле скрипта) —
@@ -1971,10 +2383,34 @@ def _rollback(kind, raw_cmd=""):
     return _ROLLBACK.get(kind, "Откат: обратной операцией вручную")
 
 
+# ── ШАПКА ВЫСШЕГО ВИДА: одна строка делает ОБА дела ─────────────────────────────────────────
+# Она и отличает карточку с первого взгляда (первый символ ⛔ вместо 🔴 — глаз ловит его ДО
+# чтения слов, в списке уведомлений видна именно первая строка), и НАЗЫВАЕТ форму ответа.
+# Одна строка, а не шапка+подвал: карточка обязана читаться за 3 секунды, и обычный вид не
+# растёт ни на байт.
+#
+# ПОЧЕМУ РУКА НЕ СРАБОТАЕТ НА АВТОМАТЕ — довод, ради которого выбран именно ОБЪЕКТ В ОТВЕТЕ,
+# а не вторая кнопка и не «ты уверен?»:
+#   1) «да» и «да 12» — ФИКСИРОВАННАЯ моторная программа: одни и те же символы, одна и та же
+#      длина, и её можно выполнить, ещё НЕ ПРОЧИТАВ карточку (номер виден в шапке очереди).
+#      Ровно так сегодня прошли три `live_sheet` подряд. Имя объекта из карточки НЕЛЬЗЯ узнать
+#      заранее: оно разное у каждой операции и лежит ВНУТРИ текста. Чтобы ответить, руке
+#      сначала нужен глаз.
+#   2) Это не второе подтверждение того же рода. «Ты уверен?» дважды подряд рука осваивает за
+#      день (двойное «да» становится одной программой); переписывание объекта — ДРУГОЙ акт:
+#      не согласие, а сверка. Автоматизировать нечего — каждый раз другой текст.
+#   3) Цена промаха — круг, а не запись. Короткое «да» и «да» с ЧУЖИМ объектом одинаково НЕ
+#      исполняют операцию (`approval_covers`): она вернётся владельцу, а не уйдёт в лист.
+#   ГРАНИЦА ЧЕСТНО: объект можно списать из карточки, не вникая в смысл. Но списать его нельзя,
+#   не посмотрев В КАРТОЧКУ и не найдя в ней ту самую строку, — а именно этот шаг и пропускался.
+TOP_TIER_BANNER = "⛔ ВЫСШАЯ ЦЕНА · НЕОБРАТИМО · подтверждение только с объектом: «да %s»"
+
+
 def _card(kind, obj="", raw_cmd=""):
     """Человеческая карточка. Обязательный минимум за 3 секунды: ЧТО меняется (первая строка),
     у какого ОБЪЕКТА, какое ЧИСЛО и одна строка ОТКАТА. Сырая команда — последней и обрезанной:
-    она для прозрачности, а не для чтения."""
+    она для прозрачности, а не для чтения. У ВЫСШЕГО вида сверху добавляется ОДНА строка-шапка
+    (`TOP_TIER_BANNER`): вид виден до чтения, и форма ответа названа тут же."""
     o, n = _card_fields(kind, obj, raw_cmd)
     # ОБЕ подписанные строки стоят ВСЕГДА, пустое значение — честный прочерк (формат общий с
     # полосой сервера). Раньше строка «Число» при пустом значении просто исчезала, и владелец не
@@ -1983,6 +2419,25 @@ def _card(kind, obj="", raw_cmd=""):
              "Объект: " + (o or "—"),
              "Число: " + (n or "—")]
     lines.append(_rollback(kind, raw_cmd))
+    if raw_cmd:
+        c = " ".join(raw_cmd.split())
+        lines.append("Команда: " + (c if len(c) <= 200 else c[:200] + "…"))
+    if is_top_tier(kind) and _object_named(o):
+        lines.insert(0, TOP_TIER_BANNER % _reply_key(o))
+    return "\n".join(lines)
+
+
+def _deny_text(kind, obj="", raw_cmd=""):
+    """Отказ вместо карточки высшего вида без названного объекта. Формулировка ОБУЧАЮЩАЯ: она
+    говорит, что именно сделать, чтобы операция стала подтверждаемой, — иначе отказ читается как
+    поломка гарда и его начинают обходить."""
+    lines = ["⛔ ОТКАЗ: высшая цена, а ОБЪЕКТ НЕ НАЗВАН — " + _human(kind, ""),
+             "Карточка высшего вида без объекта не выписывается: подтверждать в ней нечего, "
+             "а подтвердить её можно (так сегодня прошла карточка «лист не определён»).",
+             "Что делать: назови объект В САМОЙ КОМАНДЕ (имя листа, путь файла, PID, id деплоя) "
+             "и повтори — придёт карточка с объектом. Операция НЕ выполнена."]
+    if obj and str(obj).strip():
+        lines.append("Гард смог сказать только: " + " ".join(str(obj).split()))
     if raw_cmd:
         c = " ".join(raw_cmd.split())
         lines.append("Команда: " + (c if len(c) <= 200 else c[:200] + "…"))
@@ -2006,16 +2461,39 @@ def card_gate(kind, obj, num=""):
     return bool((obj or "").strip()) or kind in _HARD_CARD
 
 
-def card_or_journal(kind, obj="", raw_cmd=""):
-    """→ текст карточки либо None (карточки нет — вместо неё строка в журнал).
-    Само правило — в card_gate(). Любой сбой здесь → карточка (FAIL-SAFE)."""
+def card_decision(kind, obj="", raw_cmd=""):
+    """→ (решение, текст), решение ∈ ask | journal | deny. Единственная точка, где вид карточки
+    превращается в поведение.
+
+        ask     — карточка как была (обычный вид; высший вид — с шапкой);
+        journal — признак сработал на ПОДСТРОКЕ, а не на действии (правило `card_gate`);
+        deny    — ВЫСШИЙ вид, а объект не назван: карточку не выписываем ВОВСЕ.
+
+    Про `deny` отдельно, потому что это единственное место, где гард ЗАПРЕЩАЕТ, а не спрашивает.
+    Позиция «хук только добавляет подтверждения» не нарушена: `deny` строже `ask`, новых
+    разрешений он не выдаёт. Повод буквальный: 31.07 пришла карточка `live_sheet` с объектом
+    «лист не определён» — и её МОЖНО БЫЛО ПОДТВЕРДИТЬ. Подтверждение необратимого вслепую хуже
+    отказа: отказ стоит одного круга, запись в живой лист не стоит ничего вернуть.
+    ГРАНИЦА: `deny` бьёт только там, где карточка ИНАЧЕ БЫ РОДИЛАСЬ (`card_gate` = True, то есть
+    объект пуст лишь у hard-блока). Высший вид, у которого объекта нет и карточки не было бы,
+    как шёл в журнал, так и идёт: там признак поймал подстроку, и запрещать нечего.
+    Любой сбой разбора → ask (FAIL-SAFE, как было)."""
     try:
         o, n = _card_fields(kind, obj, raw_cmd)
         if not card_gate(kind, o, n):
-            return None
+            return ("journal", "")
+        if is_top_tier(kind) and not _object_named(o):
+            return ("deny", _deny_text(kind, o, raw_cmd))
     except Exception:
         pass
-    return _card(kind, obj, raw_cmd)
+    return ("ask", _card(kind, obj, raw_cmd))
+
+
+def card_or_journal(kind, obj="", raw_cmd=""):
+    """→ текст карточки либо None (карточки нет). Тонкая обёртка над `card_decision` — оставлена
+    прежней по сигнатуре: ею пользуются вызывающие, которым нужен только текст карточки."""
+    decision, text = card_decision(kind, obj, raw_cmd)
+    return text if decision == "ask" else None
 
 
 def _push(card):
@@ -2081,6 +2559,19 @@ def _emit_ask(card, kind=""):
     sys.exit(0)
 
 
+def _emit_deny(reason):
+    """Отказ вместо карточки высшего вида без объекта. НИ маркера, НИ пуша: маркер породил бы у
+    демона `needs_approval`, то есть ровно ту подтверждаемую карточку, которой быть не должно, а
+    пуш звал бы владельца решать там, где решать не по чему. След остаётся строкой в логе гарда
+    (решение `deny`) и самим текстом отказа — его видит модель и чинит команду."""
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }}, ensure_ascii=False))
+    sys.exit(0)
+
+
 def main():
     try:
         data = json.load(sys.stdin)
@@ -2101,12 +2592,15 @@ def main():
         # FAIL-SAFE в ЛЮБОЙ роли: ошибку анализа НЕ смягчаем (иначе сбой гарда = тихий пропуск,
         # а permissions.allow здесь широкий — гард единственный красный гейт).
         action, kind, obj = ("ask", "unknown", "")
-    card = None
+    card, deny = None, None
     if action == "ask":
-        card = card_or_journal(kind, obj, detail if tool in ("Bash", "PowerShell") else "")
-        if card is None:
-            action = "journal"   # объекта и числа нет → вместо карточки строка в журнал
+        decision, text = card_decision(kind, obj, detail if tool in ("Bash", "PowerShell") else "")
+        action = decision          # ask → карточка; journal → строка в лог; deny → отказ
+        card = text if decision == "ask" else None
+        deny = text if decision == "deny" else None
     _log(role, tool, action, kind, detail)
+    if deny is not None:
+        _emit_deny(deny)
     if card is not None:
         _emit_ask(card, kind)
     sys.exit(0)  # defer / journal

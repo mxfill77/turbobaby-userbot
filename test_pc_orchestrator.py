@@ -585,6 +585,78 @@ class TestApprovalReachesExecutor(Base):
         o.process_approved()
         self.assertIn("не назван", self.fb.tasks[tid2]["result"])
 
+    # --- ВЫСШИЙ ВИД: «да N» его не открывает (31.07.2026) ------------------------------------
+
+    LIVE_SHEET_CARD = ("NEEDS_APPROVAL (гард): ⛔ ВЫСШАЯ ЦЕНА · НЕОБРАТИМО · подтверждение "
+                       "только с объектом: «да Зарплаты»\n"
+                       "🔴 Хочу обратиться к живым таблицам (Зарплаты) — разрешить?\n"
+                       "Объект: Зарплаты\nЧисло: —\n"
+                       + pretool_guard.KIND_LINE_PREFIX + "live_sheet")
+
+    def test_top_tier_class_alone_does_not_reach_the_child(self):
+        """Повод дословный: три карточки `live_sheet` подряд подтверждены не читая. Ряд очереди
+        текста ответа не несёт → объект не назван → класс высшего вида ВЫЧЁРКНУТ, и ребёнок его
+        авто-пропуска не получает. Fail-closed: канал, не донёсший объект, закрывает необратимое."""
+        tid = self._approved_with_card(self.LIVE_SHEET_CARD)
+        seen = self._spy()
+        o.process_approved()
+        self.assertNotIn(o.APPROVED_KINDS_ENV, seen["env"])
+        self.assertNotIn(o.APPROVED_OBJECT_ENV, seen["env"])
+        self.assertNotIn("ОДОБРЕНИЕ ВЛАДЕЛЬЦА", seen["prompt"])
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")   # сама задача идёт как шла
+
+    def test_named_object_in_reply_opens_top_tier(self):
+        """Обратная половина: ответ НАЗЫВАЕТ объект → класс и объект едут ребёнку, и гард их
+        принимает. Смычка двух модулей на живой паре env."""
+        tid = self._approved_with_card(self.LIVE_SHEET_CARD)
+        self.fb.tasks[tid]["owner_reply"] = "да Зарплаты"
+        seen = self._spy()
+        o.process_approved()
+        self.assertEqual(seen["env"][o.APPROVED_KINDS_ENV], "live_sheet")
+        self.assertIn("Зарплаты", seen["env"][o.APPROVED_OBJECT_ENV])
+        sheet = {"tool_name": "Bash", "cwd": o.REPO, "tool_input": {"command":
+                 'venv/Scripts/python.exe -c "import gsp' + "read; gsp"
+                 + "read.open('Зарплаты').append_row([1])\""}}
+        self.assertEqual(pretool_guard.decide_for_role(sheet, True, env=seen["env"])[0], "approved")
+
+    def test_short_yes_and_foreign_object_do_not_open_top_tier(self):
+        for reply in ("да", "да 12", "ок", "да Лист1"):
+            with self.subTest(reply):
+                self.fb.tasks.clear()
+                tid = self._approved_with_card(self.LIVE_SHEET_CARD)
+                self.fb.tasks[tid]["owner_reply"] = reply
+                seen = self._spy()
+                o.process_approved()
+                self.assertNotIn(o.APPROVED_KINDS_ENV, seen["env"], reply)
+
+    def test_card_itself_is_not_taken_for_a_reply(self):
+        """Карточка НАЗЫВАЕТ объект — принять её за ответ значило бы подтверждать её ею же."""
+        tid = self._approved_with_card(self.LIVE_SHEET_CARD)
+        self.fb.tasks[tid]["comment"] = self.LIVE_SHEET_CARD
+        self.assertEqual(o._owner_reply(self.fb.tasks[tid]), "")
+        self.assertEqual(o._approved_scope(self.fb.tasks[tid]), (frozenset(), ""))
+
+    def test_ordinary_kind_is_untouched_by_the_object_rule(self):
+        """Обычный вид работает как с 30.07: одного класса достаточно, объект не нужен."""
+        tid = self._approved_with_card(pretool_guard.KIND_LINE_PREFIX + "env")
+        seen = self._spy()
+        o.process_approved()
+        self.assertEqual(seen["env"][o.APPROVED_KINDS_ENV], "env")
+        self.assertNotIn(o.APPROVED_OBJECT_ENV, seen["env"])
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+
+    def test_diagnosis_names_the_object_rule_not_a_wrong_class(self):
+        """Третья причина ✋ обязана отличаться от двух прежних: её лечит не повтор «да», а
+        ответ с объектом — иначе владелец жмёт «да» по кругу."""
+        tid = self._approved_with_card(self.LIVE_SHEET_CARD)
+        self._claude(0, "NEEDS_APPROVAL: op=live_sheet | лист Зарплаты")
+        o.process_approved()
+        res = self.fb.tasks[tid]["result"]
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertIn("live_sheet", res)
+        self.assertIn("объект", res)
+        self.assertNotIn("упёрлись в ДРУГОЕ красное", res)
+
     def test_expired_approve_never_spawns_child(self):
         tid = self._approved_with_card(pretool_guard.KIND_LINE_PREFIX + "env")
         self.fb.tasks[tid]["updated"] = iso_ago(4000)
@@ -6479,7 +6551,7 @@ class TestMetricsLine(unittest.TestCase):
     def test_run_task_emits_metrics(self):
         seen = []
 
-        def fake_impl(tid, text, note="", _mctx=None, approved=()):
+        def fake_impl(tid, text, note="", _mctx=None, approved=(), approved_object=""):
             if _mctx is not None:
                 _mctx["attempts"] = 2
             return "done", "RESULT: ок"

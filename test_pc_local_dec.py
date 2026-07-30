@@ -166,7 +166,7 @@ class LocBase(unittest.TestCase):
         # исполнитель шагов (run_task этого же демона)
         self.exec_queue = []
 
-        def fake_run_task(tid, text, note="", approved=()):
+        def fake_run_task(tid, text, note="", approved=(), approved_object=""):
             # approved — виды, одобренные владельцем (правка 30.07.2026): process_approved
             # прокидывает класс из карточки в ре-ран. Мок обязан принимать его, как боевой run_task.
             self.exec_approved = frozenset(approved or ())

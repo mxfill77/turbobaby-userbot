@@ -233,7 +233,9 @@ class TestEndToEndStdin(unittest.TestCase):
         # человеческая карточка: ЧТО + «— разрешить?», не сырая команда первой строкой
         self.assertIn("Хочу снять процесс", reason[1])
         self.assertIn("разрешить?", reason[1])
-        self.assertTrue(reason[1].lstrip().startswith("🔴"))
+        # `kill` — ВЫСШИЙ вид: сверху строка-шапка, 🔴-фраза второй строкой (31.07)
+        self.assertTrue(reason[1].lstrip().startswith("⛔"))
+        self.assertTrue(reason[1].splitlines()[1].startswith("🔴"))
 
     def test_unparseable_stdin_defers(self):
         p = self._run(None, raw="not json")   # тот же изолированный маркер
@@ -244,7 +246,10 @@ class TestEndToEndStdin(unittest.TestCase):
 class TestHumanCards(unittest.TestCase):
     def test_card_is_human_not_raw(self):
         card = g._card("delete", "old.log", "del /f old.log")
-        self.assertTrue(card.lstrip().startswith("🔴 Хочу удалить файл old.log"))
+        # `delete` — ВЫСШИЙ вид (31.07), поэтому первой идёт строка-шапка, а человеческая фраза
+        # второй. Всё остальное в карточке — как было.
+        self.assertTrue(card.lstrip().startswith("⛔"))
+        self.assertEqual(card.splitlines()[1], "🔴 Хочу удалить файл old.log — разрешить?")
         self.assertIn("разрешить?", card)
         self.assertIn("Команда: del /f old.log", card)   # сырая команда — отдельной строкой, не первой
         self.assertLess(card.index("Хочу"), card.index("Команда:"))
@@ -1365,12 +1370,18 @@ class TestCardMinimumAndJournal(unittest.TestCase):
     def test_prod_promotion_card_has_object_number_rollback(self):
         card = g.card_or_journal(_CL + "_deploy", _CL + " deploy · …Ybv9HhOJ", self.PROD)
         self.assertIsNotNone(card)
-        self.assertIn("ПРОД", card.splitlines()[0])
+        # ВЫКАТКА ПРОДА — высший вид: строка-шапка первой, 🔴-фраза второй (правка 31.07).
+        self.assertTrue(card.splitlines()[0].startswith("⛔"))
+        self.assertIn("ПРОД", card.splitlines()[1])
         self.assertIn("Объект: ", card)
         self.assertIn("Число: версия 76", card)
         self.assertIn("Откат: " + _CL + " deploy -i …hXNOqw -V ", card)
         self.assertIn("Команда: ", card)
-        self.assertLessEqual(len(card.splitlines()), 5)      # 3 секунды — это пять строк, не десять
+        # 3 секунды — это пять строк; высшему виду разрешена ОДНА добавочная (шапка), не больше.
+        self.assertLessEqual(len(card.splitlines()), 6)
+        ordinary = g.card_or_journal("env", ".env", "cat .env")
+        self.assertLessEqual(len(ordinary.splitlines()), 5, "обычный вид не вырос ни на строку")
+        self.assertTrue(ordinary.splitlines()[0].startswith("🔴"))
 
     def test_every_red_kind_carries_a_rollback_line(self):
         for kind in ("delete", "kill", "sqlite", "env", "edit_claude", "git_force",
@@ -1845,14 +1856,20 @@ class TestOwnerApprovalMarker(unittest.TestCase):
         self.assertEqual(g.owner_approved_kinds({}), frozenset())
 
     def test_approval_covers_each_doctrinal_kind_but_only_itself(self):
+        """Класс одобрения покрывает СВОЮ операцию и только её. С 31.07 у ВЫСШЕГО вида к классу
+        добавлен ОБЪЕКТ: одного класса ему мало (см. TestTwoTiersOfCards)."""
         cases = (("del /f /q a.log b.log", "delete"),
                  ("taskkill /PID 4242 /F", "kill"),
                  ("sqlite3 memory.db \"INSERT INTO t VALUES(1)\"", "sqlite"),
                  ("curl https://example.com", "network"),
                  ("cat " + _DOT_ENV, "env"))
         for cmd, kind in cases:
+            obj = self._role(cmd, {})[2]
             self.assertEqual(self._role(cmd, {})[1], kind, cmd)              # вид определён
-            self.assertEqual(self._role(cmd, {g.APPROVED_KINDS_ENV: kind})[0], "approved", cmd)
+            env = {g.APPROVED_KINDS_ENV: kind}
+            if g.is_top_tier(kind):                # высшему виду нужен ещё и названный объект
+                env[g.APPROVED_OBJECT_ENV] = obj
+            self.assertEqual(self._role(cmd, env)[0], "approved", cmd)
             self.assertEqual(self._role(cmd, {g.APPROVED_KINDS_ENV: "clasp_run"})[0], "ask", cmd)
 
     def test_interactive_session_has_no_marker_so_nothing_changes(self):
@@ -2362,6 +2379,394 @@ class TestConfigReadVsWrite(unittest.TestCase):
         self.assertIsNotNone(g._RE_CFG_REDIR.search("echo x >> .claude/settings.json"))
         self.assertIsNone(g._RE_CFG_REDIR.search("ls -la .claude/ 2>&1"))
         self.assertIsNone(g._RE_CFG_REDIR.search("grep x .claude/settings.json 2>/dev/null"))
+
+
+# Красные имена — конкатенацией: файл теста не должен краснеть ни на скане, ни в чужих грепах
+# (тот же приём, что у _DOTENV/_CFGJSON выше).
+_GSP = "gsp" + "read"
+_CBK = "create_" + "booking"
+_ATX = "add_" + "transaction"
+_SFO = "set_fleet_" + "oil"
+
+
+class TestFifthGroupActionNotWord(unittest.TestCase):
+    """ПЯТАЯ группа класса «класс по СЛОВУ, а не по ДЕЙСТВИЮ» (31.07.2026, задача 73).
+
+    Голдены — ДОСЛОВНЫЕ строки пробы `tmp/probe_fifth_group.py` и живого журнала 30.07, как
+    требует свод (тесты детекта = реальные фразы, не идеализированные). Три места:
+      • ЖИВОЙ ЛИСТ был ИНВЕРСИЕЙ: поиск слова спрашивал, НАСТОЯЩЕЕ обращение уходило МОЛЧА
+        (объект не заполнялся в цикле `_RED_CMD`, вид не стоял в `_HARD_CARD`);
+      • `py_write` красил ИМЯ функции в тексте, а не её вызов;
+      • ТЕЛО HEREDOC считалось операцией, хотя это данные.
+    """
+
+    def _role(self, cmd, tool="Bash"):
+        return g.decide_for_role({"tool_name": tool, "tool_input": {"command": cmd},
+                                  "cwd": PROJ}, headless=False)
+
+    def _card(self, cmd, tool="Bash"):
+        """→ (текст карточки или None, строка объекта). Точный повтор main()."""
+        action, kind, obj = self._role(cmd, tool)
+        if action != "ask":
+            return None, ""
+        card = g.card_or_journal(kind, obj, cmd)
+        if card is None:
+            return None, ""
+        return card, [ln for ln in card.splitlines() if ln.startswith("Объект: ")][0][8:]
+
+    # --- (1) ЖИВОЙ ЛИСТ: обращение спрашивает ВСЕГДА, объект — имя листа --------------------
+    def test_live_sheet_write_cards_with_sheet_name(self):
+        """Деньги и парк: настоящая ЗАПИСЬ в лист даёт карточку, и лист в ней НАЗВАН."""
+        for cmd, sheet in (
+                ('venv/Scripts/python.exe -c "import ' + _GSP + '; '
+                 + _GSP + ".open('Лист1').append_row(['x'])\"", "Лист1"),
+                ('venv/Scripts/python.exe -c "import ' + _GSP + '; '
+                 + _GSP + ".open('CRM').update('A1', 5)\"", "CRM"),
+                ('venv/Scripts/python.exe -c "s.spreadsheets().values().update('
+                 "spreadsheetId='1AbCdEfGhIjKlMnOpQrStUv', range='Байки!I2', body={})\"", "Байки")):
+            with self.subTest(cmd[:60]):
+                self.assertEqual(self._role(cmd)[:2], ("ask", "live_sheet"), cmd)
+                card, obj = self._card(cmd)
+                self.assertIsNotNone(card, "карточка обязана родиться: " + cmd)
+                self.assertIn(sheet, obj, "имя листа обязано быть в объекте")
+
+    def test_live_sheet_without_name_is_denied_not_confirmable(self):
+        """Имя листа не извлеклось → ОТКАЗ, а не карточка. Правка 31.07 поверх утренней:
+        утром сюда поставили карточку с честной пометкой «лист не определён» — и владелец мог
+        её ПОДТВЕРДИТЬ, не имея что подтверждать. Подтверждение необратимого вслепую хуже
+        отказа, поэтому карточка высшего вида без объекта не выписывается вовсе.
+        Молчания при этом по-прежнему нет: вид остаётся в hard-карте, решение — `deny`."""
+        cmd = 'venv/Scripts/python.exe -c "import ' + _GSP + '"'
+        self.assertEqual(self._role(cmd)[:2], ("ask", "live_sheet"))
+        decision, text = g.card_decision("live_sheet", g.LIVE_SHEET_UNKNOWN, cmd)
+        self.assertEqual(decision, "deny")
+        self.assertIn("ОБЪЕКТ НЕ НАЗВАН", text)
+        self.assertIn("НЕ выполнена", text)
+        self.assertIsNone(self._card(cmd)[0], "подтверждаемой карточки быть не должно")
+        self.assertTrue(g.card_gate("live_sheet", "", ""), "вид обязан быть в hard-карте")
+        self.assertFalse(g._object_named(g.LIVE_SHEET_UNKNOWN))
+
+    def test_live_sheet_mention_is_silent(self):
+        """УПОМИНАНИЕ (поиск слова, grep, эхо, тело heredoc) — не обращение. Первая строка —
+        дословная проба задачи 73, которая раньше давала карточку."""
+        for cmd in ('venv/Scripts/python.exe -c "print(\'' + _GSP
+                    + "' in open('suggest.py').read())\"",
+                    "grep -n " + _GSP + " suggest.py",
+                    'echo "правим Лист1 через ' + _GSP + '.open"',
+                    "git commit -F - <<'EOF'\nчиним резолвер: Лист1 и " + _GSP
+                    + " тут только НАЗВАНЫ\nEOF"):
+            with self.subTest(cmd[:60]):
+                self.assertIsNone(self._card(cmd)[0], "упоминание карточки не рождает: " + cmd)
+
+    def test_live_sheet_read_stays_red_as_doctrine_decided(self):
+        """Обратное цело: ЧТЕНИЕ живого листа — как решала доктрина (`_stays_red`: красное).
+        Развода read/write, как у sqlite и clasp, здесь НЕТ намеренно: цена молчания на деньгах
+        и парке выше цены вопроса."""
+        cmd = ('venv/Scripts/python.exe -c "import ' + _GSP + '; print('
+               + _GSP + ".open('Зарплаты').get_all_records())\"")
+        self.assertEqual(self._role(cmd)[:2], ("ask", "live_sheet"))
+        self.assertTrue(g._stays_red("live_sheet", "Зарплаты", cmd))
+
+    def test_live_sheet_inside_heredoc_body_still_cards(self):
+        """Тело heredoc — данные ДЛЯ ВСЕГО, кроме живого листа: черновик, который пишет в лист,
+        краснеет (fail-closed), хотя красное слово в том же теле команду не красит."""
+        cmd = ("cat > tmp/w.py <<'PYEOF'\nimport " + _GSP + "\n"
+               + _GSP + ".open('Байки').append_row([1])\nPYEOF")
+        card, obj = self._card(cmd)
+        self.assertIsNotNone(card)
+        self.assertIn("Байки", obj)
+
+    def test_live_sheet_endpoint_of_live_contour_unchanged(self):
+        """Живой журнал 30.07 (5 карточек): адрес живого контура в переменной — как было."""
+        cmd = ('BRIDGE_URL="https://script.google.com/macros/s/AKfycbz/exec" '
+               "venv/Scripts/python.exe brain_writer.py --probe-actions")
+        self.assertEqual(self._role(cmd)[:2], ("ask", "live_sheet"))
+        self.assertIn("script.google.com", self._card(cmd)[1])
+
+    # --- (2) py_write: ВЫЗОВ против ИМЕНИ В ТЕКСТЕ -------------------------------------------
+    def test_py_write_name_in_text_is_not_a_call(self):
+        """Дословная проба задачи 73 + формы, за которые владелец платил подтверждением."""
+        for cmd in ('venv/Scripts/python.exe -c "print(\'' + _CBK + '\')"',
+                    'echo "дальше зову ' + _ATX + '(500)"',
+                    'venv/Scripts/python.exe -c "print(\'' + _SFO + '\')"'):
+            with self.subTest(cmd[:60]):
+                self.assertIsNone(self._card(cmd)[0], cmd)
+        self.assertIsNone(g._py_write_call("def " + _CBK + "(client, bike):\n    pass"),
+                          "определение функции вызовом не является")
+        self.assertIsNone(g._py_write_call("# дальше по коду " + _ATX + " и " + _SFO))
+
+    def test_py_write_real_call_cards(self):
+        """Настоящий вызов — красный, в ТРЁХ живых формах (прямой, через модуль, полем action)."""
+        for cmd, tok in (
+                ('venv/Scripts/python.exe -c "import bridge; bridge.' + _CBK + '(1)"', _CBK),
+                ('venv/Scripts/python.exe -c "' + _ATX + '(amount=100)"', _ATX),
+                ('venv/Scripts/python.exe -c "post(URL, {\'action\': \'' + _ATX
+                 + "', 'amount': 500})\"", _ATX),
+                ('venv/Scripts/python.exe -c "import os; os.remove(chr(120))"', "os.remove")):
+            with self.subTest(cmd[:60]):
+                a, k, o = self._role(cmd)
+                self.assertEqual((a, k), ("ask", "py_write"), cmd)
+                self.assertEqual(o, tok)
+                self.assertIsNotNone(self._card(cmd)[0], "деньги спрашивают всегда")
+
+    # --- (3) HEREDOC: тело — данные ----------------------------------------------------------
+    def test_heredoc_body_is_data_not_operation(self):
+        """Живой журнал 30.07: сообщение коммита через stdin краснело на именах, которые в нём
+        просто НАЗВАНЫ. Плюс проба задачи 73: черновик в tmp с путём конфига в теле."""
+        for cmd in ("git commit -F - <<'EOF'\nгард: чтение окружения живого процесса зелёное, "
+                    "файл " + _DOTENV + " красный\nEOF",
+                    "cat > tmp/probe.py <<'PYEOF'\nimport json\nprint(json.load(open(\""
+                    + _CFGJSON + "\")))\nPYEOF"):
+            with self.subTest(cmd[:60]):
+                self.assertIsNone(self._card(cmd)[0], cmd)
+
+    def test_heredoc_header_still_writes(self):
+        """Заголовок команды вырезанием НЕ прячется: запись в конфиг краснеет как раньше."""
+        cmd = "cat > " + _CFGJSON + " <<'EOF'\n{}\nEOF"
+        self.assertEqual(self._role(cmd)[:2], ("ask", "edit_claude"))
+        self.assertIn(_CFGJSON, self._card(cmd)[1])
+
+    def test_heredoc_without_terminator_strips_nothing(self):
+        """FAIL-SAFE: терминатора нет (обрезанная строка журнала, `1 << N` из кода) → не
+        вырезаем ничего, тело остаётся под сканом."""
+        cut = "git commit -F - <<'EOF'\nправил " + _DOTENV + " руками"
+        self.assertEqual(g._strip_heredoc(cut), cut)
+        self.assertEqual(self._role(cut)[:2], ("ask", "env"))
+        self.assertEqual(g._strip_heredoc("x = 1 << N"), "x = 1 << N")
+        whole = "cat > a.txt <<'EOF'\nтело\nEOF\nrm -rf docs"
+        self.assertNotIn("тело", g._strip_heredoc(whole))
+        self.assertIn("rm -rf docs", g._strip_heredoc(whole))
+
+    def test_heredoc_body_that_executes_is_not_data(self):
+        """ГРАНИЦА, без которой послабление было бы дырой: `bash <<EOF`, `ssh host <<EOF`,
+        `sqlite3 db <<EOF` подают телом КОМАНДЫ — там оно работает как инлайн `-c`."""
+        exec_body = "bash <<'EOF'\n" + _RMRF + " D:/turbobaby-bot/docs\nEOF"
+        self.assertEqual(g._strip_heredoc(exec_body), exec_body, "тело-код не вырезаем")
+        self.assertEqual(self._role(exec_body)[:2], ("ask", "delete"))
+        self.assertEqual(self._role("ssh root@5.223.94.179 <<'EOF'\ncat " + _DOTENV
+                                    + "\nEOF")[:2], ("ask", "env"))
+        self.assertEqual(self._role(_SQLITE + " x.db <<'EOF'\nde" + "lete from t;\nEOF")[:2],
+                         ("ask", "sqlite"))
+
+    def test_indirect_call_by_name_is_still_a_call(self):
+        """Косвенные формы вызова не должны стать «упоминанием»: импорт через `__import__`,
+        вызов через `getattr`. Развод по действию не имеет права ослабить деньги и парк."""
+        cmd = 'venv/Scripts/python.exe -c "__import__(\'' + _GSP + "').open('CRM')\""
+        self.assertEqual(self._role(cmd)[:2], ("ask", "live_sheet"))
+        self.assertIn("CRM", self._card(cmd)[1])
+        cmd = 'venv/Scripts/python.exe -c "getattr(bridge, \'' + _CBK + "')(1)\""
+        self.assertEqual(self._role(cmd)[:2], ("ask", "py_write"))
+
+    # --- ГРАНИЦЫ ПОСЛАБЛЕНИЯ: печать остаётся печатью, пока она печать -----------------------
+    def test_print_stops_being_data_when_it_executes_or_writes(self):
+        """Три гуарда `_strip_print_args`: труба в интерпретатор, перенаправление, подстановка."""
+        for cmd in ('echo "import ' + _GSP + "; " + _GSP
+                    + ".open('CRM')\" | venv/Scripts/python.exe",
+                    'echo "' + _GSP + ".open('CRM')\" > tmp/x.py",
+                    'echo "$(' + _GSP + ".open('CRM'))\""):
+            with self.subTest(cmd[:60]):
+                self.assertIsNotNone(self._card(cmd)[0], "печать перестала быть печатью: " + cmd)
+        self.assertEqual(self._role("echo x > " + _CFGJSON)[:2], ("ask", "edit_claude"))
+
+    # --- РЕГРЕСС: красная зона не ослаблена ---------------------------------------------------
+    def test_red_zone_not_weakened(self):
+        for cmd, kind in (("cat " + _DOTENV, "env"),
+                          ("taskkill /PID 1234 /F", "kill"),
+                          (_RMRF + " docs/artifacts", "delete"),
+                          (_CLASP + " deploy -i AKfycbxNC9gCM7xx -V 76", "clasp_deploy"),
+                          (_SQLITE + ' moderation_ipc.db "de' + 'lete from drafts"', "sqlite"),
+                          ("echo '{}' > " + _CFGJSON, "edit_claude"),
+                          ("curl https://example.com/x", "network"),
+                          (_RESET + " HEAD~1", "git_force")):
+            with self.subTest(cmd[:50]):
+                a, k, o = self._role(cmd)
+                self.assertEqual((a, k), ("ask", kind), cmd)
+                self.assertIsNotNone(g.card_or_journal(k, o, cmd), "карточка на месте: " + cmd)
+
+
+class TestTwoTiersOfCards(unittest.TestCase):
+    """ДВА ВИДА КАРТОЧКИ ПО ЦЕНЕ ОШИБКИ (31.07.2026).
+
+    Повод дословный: владелец подтвердил ТРИ карточки `live_sheet` подряд не читая — они пришли
+    в общем потоке и тем же видом, что уборка временного файла. Голдены здесь стерегут три вещи:
+    вид (шапка), порядок подтверждения (объект в ответе) и отказ вместо подтверждаемой карточки
+    без объекта. Классификацию операций эти тесты НЕ трогают — только вид и подтверждение."""
+
+    SHEET = ('venv/Scripts/python.exe -c "import ' + _GSP + '; '
+             + _GSP + ".open('Зарплаты').append_row(['x'])\"")
+
+    def _role(self, cmd, env=None, tool="Bash"):
+        return g.decide_for_role({"tool_name": tool, "tool_input": {"command": cmd}, "cwd": PROJ},
+                                 headless=True, env=(env or {}))
+
+    # --- (1) СПИСОК ВИДОВ = СПИСОК ВЛАДЕЛЬЦА -------------------------------------------------
+    def test_tier_list_is_exactly_the_owners_list(self):
+        """Живые таблицы, деньги, клиентский контур, выкатка прода, удаление вне временных
+        папок, снос процессов — и НИЧЕГО сверх того."""
+        for kind in ("live_sheet", _CL + "_run", "py_write", _CL, _CL + "_push",
+                     _CL + "_deploy", "delete", "kill"):
+            self.assertTrue(g.is_top_tier(kind), kind)
+        for kind in ("env", "edit_secret", "read_secret", "edit_claude", "schtasks",
+                     "git_force", "network", "outside", "write_outside", "sqlite", "unknown"):
+            self.assertFalse(g.is_top_tier(kind), kind)
+        self.assertFalse(g.is_top_tier(""))
+
+    # --- (2) ВИД ВИДНО С ПЕРВОГО ВЗГЛЯДА -----------------------------------------------------
+    def test_top_tier_card_differs_on_the_very_first_line(self):
+        """Первый символ первой строки — единственное, что видно в списке уведомлений ДО чтения."""
+        top = g.card_or_journal("live_sheet", "Зарплаты", self.SHEET)
+        ordinary = g.card_or_journal("env", _DOTENV, "cat " + _DOTENV)
+        self.assertTrue(top.splitlines()[0].startswith("⛔"))
+        self.assertTrue(ordinary.splitlines()[0].startswith("🔴"))
+        self.assertNotIn("⛔", ordinary)
+        self.assertIn("Зарплаты", top.splitlines()[0], "объект назван прямо в шапке")
+
+    def test_ordinary_card_did_not_change_by_a_single_byte(self):
+        """Обычный вид — байт-в-байт прежний: правка платит только за высший."""
+        for kind, obj, cmd in (("env", _DOTENV, "cat " + _DOTENV),
+                               ("edit_claude", "settings.json", "echo x > " + _CFGJSON),
+                               ("network", "example.com", "curl https://example.com"),
+                               ("sqlite", "app.db", _SQLITE + ' app.db "INSERT INTO t VALUES(1)"')):
+            with self.subTest(kind):
+                card = g.card_or_journal(kind, obj, cmd)
+                self.assertEqual(card, g._card(kind, obj, cmd))
+                self.assertTrue(card.splitlines()[0].startswith("🔴"))
+                self.assertLessEqual(len(card.splitlines()), 5)
+
+    def test_top_tier_costs_exactly_one_line(self):
+        for kind, obj, cmd in (("delete", "old.log", "del /f old.log"),
+                               ("kill", "PID 4242", "taskkill /PID 4242 /F"),
+                               ("live_sheet", "CRM", self.SHEET)):
+            with self.subTest(kind):
+                card = g.card_or_journal(kind, obj, cmd)
+                self.assertLessEqual(len(card.splitlines()), 6)
+                self.assertTrue(card.splitlines()[1].startswith("🔴"))
+
+    # --- (3) КОРОТКОЕ «ДА» ВЫСШИЙ ВИД НЕ ОТКРЫВАЕТ -------------------------------------------
+    def test_short_yes_does_not_confirm_top_tier(self):
+        """Ровно тот автоматический ответ, которым сегодня прошли три карточки подряд."""
+        for reply in ("", "да", "Да", "да 12", "да, 12", "ДА!", "ок", "ok", "yes", "+", "#12",
+                      "да 7 ", "апрув"):
+            with self.subTest(reply):
+                self.assertFalse(g.reply_confirms_object(reply, "Зарплаты"), reply)
+
+    def test_named_object_confirms_regardless_of_case_and_punctuation(self):
+        for reply in ("да Зарплаты", "Зарплаты", "да, зарплаты", "ДА — ЗАРПЛАТЫ",
+                      "да 12 Зарплаты", "подтверждаю Зарплаты"):
+            with self.subTest(reply):
+                self.assertTrue(g.reply_confirms_object(reply, "Зарплаты"), reply)
+
+    def test_foreign_object_does_not_confirm(self):
+        """Одобрив один лист, нельзя молча пройти в другой — иначе «да» снова становится общим."""
+        self.assertFalse(g.reply_confirms_object("да Лист1", "Зарплаты"))
+        self.assertFalse(g.reply_confirms_object("да CRM", "Зарплаты"))
+
+    def test_numeric_object_needs_three_digits_so_task_number_cannot_pass(self):
+        """PID подтверждается («да 4242»), а двузначный номер задачи объектом не станет."""
+        self.assertTrue(g.reply_confirms_object("да 4242", "PID 4242"))
+        self.assertFalse(g.reply_confirms_object("да 12", "PID 12"))
+
+    def test_approval_covers_ordinary_by_class_but_top_tier_needs_object(self):
+        cmd = self.SHEET
+        kind, obj = self._role(cmd)[1], self._role(cmd)[2]
+        self.assertEqual(kind, "live_sheet")
+        self.assertEqual(self._role(cmd, {g.APPROVED_KINDS_ENV: kind})[0], "ask",
+                         "класс без объекта высший вид не открывает")
+        self.assertEqual(self._role(cmd, {g.APPROVED_KINDS_ENV: kind,
+                                          g.APPROVED_OBJECT_ENV: "да 12"})[0], "ask")
+        self.assertEqual(self._role(cmd, {g.APPROVED_KINDS_ENV: kind,
+                                          g.APPROVED_OBJECT_ENV: "да Лист1"})[0], "ask",
+                         "чужой объект не открывает")
+        self.assertEqual(self._role(cmd, {g.APPROVED_KINDS_ENV: kind,
+                                          g.APPROVED_OBJECT_ENV: "да " + obj})[0], "approved")
+        # обычный вид — как с 30.07: одного класса достаточно
+        self.assertEqual(self._role("cat " + _DOTENV, {g.APPROVED_KINDS_ENV: "env"})[0], "approved")
+
+    def test_object_travels_from_card_to_confirmation(self):
+        """Круг замкнут: объект, НАПЕЧАТАННЫЙ в карточке, — тот же, что демон ждёт в ответе."""
+        card = g.card_or_journal("live_sheet", "Зарплаты", self.SHEET)
+        obj = g.object_from_card(card)
+        self.assertEqual(obj, "Зарплаты")
+        self.assertTrue(g.reply_confirms_object("да " + obj, "Зарплаты"))
+        self.assertEqual(g.object_from_card("🔴 что-то\nОбъект: —\nЧисло: —"), "")
+        self.assertEqual(g.object_from_card(""), "")
+
+    # --- (4) БЕЗ ОБЪЕКТА КАРТОЧКА ВЫСШЕГО ВИДА НЕ ВЫПИСЫВАЕТСЯ -------------------------------
+    def test_top_tier_without_object_is_denied_not_confirmable(self):
+        cmd = 'venv/Scripts/python.exe -c "import ' + _GSP + '"'
+        decision, text = g.card_decision("live_sheet", g.LIVE_SHEET_UNKNOWN, cmd)
+        self.assertEqual(decision, "deny")
+        self.assertIsNone(g.card_or_journal("live_sheet", g.LIVE_SHEET_UNKNOWN, cmd))
+        self.assertNotIn("разрешить?", text, "отказ не имеет права выглядеть как вопрос")
+
+    def test_deny_boundary_journal_case_is_untouched(self):
+        """ГРАНИЦА: `deny` бьёт только там, где карточка ИНАЧЕ БЫ РОДИЛАСЬ. Высший вид, у
+        которого объекта нет и карточки не было бы, как шёл в журнал, так и идёт — там признак
+        поймал подстроку, запрещать нечего."""
+        self.assertEqual(g.card_decision("delete", "", "")[0], "journal")
+        self.assertEqual(g.card_decision("kill", "", "")[0], "journal")
+        self.assertEqual(g.card_decision("schtasks", "", "")[0], "journal")
+
+    def test_ordinary_hard_block_still_cards_without_object(self):
+        """Обычный вид правило не трогает: сбой разбора и секреты спрашивают как спрашивали."""
+        for kind in ("unknown", "env", "edit_secret", "read_secret"):
+            with self.subTest(kind):
+                self.assertEqual(g.card_decision(kind, "", "")[0], "ask")
+
+    def test_deny_end_to_end_is_a_refusal_and_writes_no_marker(self):
+        """Отказ не должен породить у демона `needs_approval` — иначе вернётся ровно та
+        подтверждаемая карточка, которой быть не должно."""
+        fd, mk = tempfile.mkstemp(suffix=".marker")
+        os.close(fd)
+        os.remove(mk)
+        env = dict(os.environ, PRETOOL_NOPUSH="1", PYTHONIOENCODING="utf-8",
+                   PRETOOL_ASK_MARKER=mk)
+        cmd = 'venv/Scripts/python.exe -c "import ' + _GSP + '"'
+        try:
+            p = subprocess.run([sys.executable, os.path.join(PROJ, "pretool_guard.py")],
+                               input=json.dumps(bash(cmd)), capture_output=True, text=True,
+                               encoding="utf-8", env=env, timeout=30)
+            self.assertEqual(p.returncode, 0)
+            out = json.loads(p.stdout)["hookSpecificOutput"]
+            self.assertEqual(out["permissionDecision"], "deny")
+            self.assertIn("ОБЪЕКТ НЕ НАЗВАН", out["permissionDecisionReason"])
+            self.assertFalse(os.path.isfile(mk), "маркер демону писать нельзя: это не карточка")
+        finally:
+            try:
+                os.remove(mk)
+            except Exception:
+                pass
+
+    def test_named_sheet_end_to_end_still_cards_with_banner(self):
+        """Обратная половина отказа: лист НАЗВАН → карточка есть, и она высшего вида."""
+        a, k, o = self._role(self.SHEET)
+        self.assertEqual((a, k), ("ask", "live_sheet"))
+        card = g.card_or_journal(k, o, self.SHEET)
+        self.assertIsNotNone(card)
+        self.assertTrue(card.splitlines()[0].startswith("⛔"))
+        self.assertIn("Зарплаты", card)
+
+    # --- (5) РЕГРЕСС: КРАСНОЕ НЕ ОСЛАБЛЕНО ---------------------------------------------------
+    def test_no_red_kind_lost_its_card(self):
+        """Правка меняет ВИД и ПОРЯДОК подтверждения, а не список красного."""
+        for cmd, kind in (("cat " + _DOTENV, "env"),
+                          ("taskkill /PID 1234 /F", "kill"),
+                          (_RMRF + " docs/artifacts", "delete"),
+                          (_CL + " deploy -i AKfycbxNC9gCM7xx -V 76", _CL + "_deploy"),
+                          (_SQLITE + ' moderation_ipc.db "de' + 'lete from drafts"', "sqlite"),
+                          ("echo '{}' > " + _CFGJSON, "edit_claude"),
+                          ("curl https://example.com/x", "network"),
+                          (_RESET + " HEAD~1", "git_force")):
+            with self.subTest(cmd[:50]):
+                a, k, o = self._role(cmd)
+                self.assertEqual((a, k), ("ask", kind), cmd)
+                self.assertIsNotNone(g.card_or_journal(k, o, cmd), "карточка на месте: " + cmd)
+                self.assertTrue(g._stays_red(k, o, cmd), "доктрина не тронута: " + cmd)
+
+    def test_green_stays_green(self):
+        for cmd in ("git status", "ls -la", "venv/Scripts/python.exe -m unittest test_delivery"):
+            with self.subTest(cmd):
+                self.assertEqual(self._role(cmd)[0], "defer", cmd)
 
 
 if __name__ == "__main__":
