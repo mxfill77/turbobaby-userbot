@@ -14,9 +14,11 @@ test_log_setup.py — голдены ротации логов и разведе
 
 import ast
 import os
+import shutil
 import logging
 import tempfile
 import unittest
+from logging.handlers import RotatingFileHandler
 
 import log_setup
 
@@ -266,7 +268,13 @@ class TestOwnerSplit(unittest.TestCase):
 
 class TestRolloverFailureIsLoud(unittest.TestCase):
     """БОЛЬ 3, вторая половина: отказ переката НЕ проглатывается и НЕ стоит записей.
-    Прежде `RotatingFileHandler.emit` ловил WinError 32 и терял строку — молча."""
+    Прежде `RotatingFileHandler.emit` ловил WinError 32 и терял строку — молча.
+
+    ВАЖНО ПРО ФИКСТУРУ (правило-класс «мок обязан копировать живой формат»): здесь ломается
+    НЕ ТОЛЬКО `rename`, но и `_copytruncate`. Иначе тест лжёт: сорванный `rename` теперь
+    штатно спасается copytruncate, перекат ПРОХОДИТ, и никакого ROTATE-FAIL быть не должно —
+    это проверяет `TestCopytruncateRescue`. Громкий отказ — случай, когда не прошёл НИ ОДИН
+    способ, и мок обязан изображать именно его."""
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="turbobaby_rfail_")
@@ -274,6 +282,14 @@ class TestRolloverFailureIsLoud(unittest.TestCase):
         del log_setup._ROTATE_FAILURES[:]
         os.environ["LOG_MAX_BYTES"] = "300"
         os.environ["TURBOBABY_TEST_LOGS"] = "1"      # файл-сигнал уедет в temp, не в репо
+        self._break_copytruncate()
+
+    def _break_copytruncate(self):
+        """Вторая ступень переката тоже недоступна — «файл не переложить никак»."""
+        real = log_setup._copytruncate
+        log_setup._copytruncate = lambda path, dest: (
+            False, PermissionError(32, "copytruncate too"))
+        self.addCleanup(setattr, log_setup, "_copytruncate", real)
 
     def tearDown(self):
         for k in ("LOG_MAX_BYTES", "LOG_ROLLOVER_RETRY_SEC", "TURBOBABY_TEST_LOGS"):
@@ -365,6 +381,118 @@ class TestRolloverFailureIsLoud(unittest.TestCase):
         sig = log_setup.log_path(log_setup.ROTATE_ERROR_LOG)
         if os.path.isfile(sig):
             os.remove(sig)
+
+
+class TestCopytruncateRescue(unittest.TestCase):
+    """БОЛЬ 3, ТРЕТЬЯ половина (замер 31.07.2026): сорванный `rename` — ещё НЕ приговор.
+
+    Разведение по владельцу лечит не всех: один и тот же скрипт, запущенный дважды, получает ту
+    же кличку и снова спорит за канон. А боевой `pricing.log` держали три процесса, которые
+    рестартовать нельзя. Проверено живьём в тот день: `os.replace` → WinError 32, а `copy2` +
+    `truncate(0)` — успех (23 302 269 байт уехали в архив). Причина: Python открывает лог с
+    `FILE_SHARE_READ|WRITE`, но БЕЗ `FILE_SHARE_DELETE` — переименование требует права DELETE,
+    чтение и усечение не требуют."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="turbobaby_ctr_")
+        # регистрируем ПЕРВЫМ → по LIFO снос каталога отработает ПОСЛЕДНИМ, уже после
+        # закрытия хендлеров: на Windows открытый файл не удаляется
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.p = os.path.join(self.dir, "boom.log")
+        del log_setup._ROTATE_FAILURES[:]
+        os.environ["LOG_MAX_BYTES"] = "300"
+        os.environ["TURBOBABY_TEST_LOGS"] = "1"
+
+    def tearDown(self):
+        for k in ("LOG_MAX_BYTES", "TURBOBABY_TEST_LOGS"):
+            os.environ.pop(k, None)
+        del log_setup._ROTATE_FAILURES[:]
+        sig = log_setup.log_path(log_setup.ROTATE_ERROR_LOG)
+        if os.path.isfile(sig):
+            os.remove(sig)
+
+    def test_rename_refused_but_rotation_still_happens(self):
+        """ГЛАВНОЕ: порог соблюдён и бэкап на месте, хотя `rename` невозможен. Это НЕ отказ —
+        в `rotation_failures()` пусто, в файле-сигнале ROTATE-NOTE, а не ROTATE-FAIL."""
+        h = log_setup.rotating_handler(self.p, env={}, owner="fixture")
+        self.assertIsNotNone(h)
+        h.rotate = lambda src, dst: (_ for _ in ()).throw(
+            PermissionError(32, "used by another process"))
+        lg = logging.getLogger("turbobaby_test_ctr_1")
+        lg.propagate, lg.handlers = False, [h]
+        lg.setLevel(logging.INFO)
+        for i in range(40):
+            lg.info("строка %d %s", i, "z" * 40)
+        h.close()
+
+        base = h.baseFilename          # НЕ self.p: путь разведён по владельцу (boom.fixture.log)
+        self.assertTrue(os.path.isfile(base + ".1"), "перекат не состоялся: бэкапа нет")
+        self.assertLessEqual(os.path.getsize(base), 4000,
+                             "боевой файл не усечён — порог не соблюдён")
+        with open(base, encoding="utf-8") as f:
+            self.assertIn("строка 39", f.read(), "последняя запись потеряна")
+        self.assertEqual(log_setup.rotation_failures(), [],
+                         "перекат ПРОШЁЛ, а доложено как об отказе")
+        with open(log_setup.log_path(log_setup.ROTATE_ERROR_LOG), encoding="utf-8") as f:
+            sig = f.read()
+        self.assertIn("ROTATE-NOTE", sig, "обходной путь спрятан: в сигнале нет ROTATE-NOTE")
+        self.assertNotIn("ROTATE-FAIL", sig)
+
+    def test_rotate_if_needed_falls_back_to_copytruncate(self):
+        """Писатели БЕЗ logging (гард) — та же вторая ступень."""
+        with open(self.p, "w", encoding="utf-8") as f:
+            f.write("x" * 2000)
+        real = os.replace
+        os.replace = lambda src, dst: (_ for _ in ()).throw(
+            PermissionError(32, "used by another process"))
+        try:
+            self.assertTrue(log_setup.rotate_if_needed(self.p, limit=1000),
+                            "перекат append-писателя не спасён copytruncate")
+        finally:
+            os.replace = real
+        self.assertEqual(os.path.getsize(self.p), 0)
+        self.assertEqual(os.path.getsize(self.p + ".1"), 2000, "архив не совпал с оригиналом")
+        self.assertEqual(log_setup.rotation_failures(), [])
+
+    def test_stuck_neighbour_is_resurrected_without_restart(self):
+        """ЖИВОЙ ИНЦИДЕНТ ЦЕЛИКОМ, на ШТАТНОМ `RotatingFileHandler` — именно он крутился в трёх
+        боевых процессах (они стартовали ДО починки). До усечения строка ТЕРЯЕТСЯ, после —
+        ложится, и перекат больше не запрашивается. То есть застрявшего соседа поднимает
+        внешний copytruncate, БЕЗ рестарта процесса."""
+        with open(self.p, "w", encoding="utf-8") as f:
+            f.write("x" * 6000)                       # сверх порога 300 байт
+
+        holder = open(self.p, "a", encoding="utf-8")  # «файл держит другой процесс»
+        self.addCleanup(holder.close)
+        h = RotatingFileHandler(self.p, maxBytes=300, backupCount=3, encoding="utf-8")
+        self.addCleanup(h.close)
+        lg = logging.getLogger("turbobaby_test_ctr_3")
+        lg.propagate, lg.handlers = False, [h]
+        lg.setLevel(logging.INFO)
+
+        raising = logging.raiseExceptions
+        logging.raiseExceptions = False               # штатный handleError печатает в stderr
+        self.addCleanup(setattr, logging, "raiseExceptions", raising)
+
+        lg.info("quote BEFORE truncate")
+        h.flush()
+        with open(self.p, encoding="utf-8") as f:
+            before = f.read()
+        if "quote BEFORE truncate" in before:
+            self.skipTest("ОС разрешила перекат открытого файла — болезни нет (не Windows)")
+        self.assertNotIn("quote BEFORE truncate", before,
+                         "диагноз не воспроизведён: запись не терялась")
+
+        ok, exc = log_setup._copytruncate(self.p, self.p + ".1")
+        self.assertTrue(ok, "copytruncate не прошёл там, где обязан: %s" % exc)
+
+        lg.info("quote AFTER truncate")
+        h.flush()
+        with open(self.p, encoding="utf-8") as f:
+            after = f.read()
+        self.assertIn("quote AFTER truncate", after,
+                      "сосед не ожил: запись по-прежнему теряется")
+        self.assertEqual(os.path.getsize(self.p + ".1"), 6000, "история не сохранена в архив")
 
 
 # ── статический разбор дерева: КТО ещё болен тем же ──────────────────────────────────────────

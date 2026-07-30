@@ -27,7 +27,13 @@ log_setup.py — единая ротация логов ПК-контура + Р
    * `handler_path` — файл РАЗВОДИТСЯ ПО ВЛАДЕЛЬЦУ: канонический `pricing.log` принадлежит
      процессу-хозяину (см. `log_owner`), любой ДРУГОЙ процесс пишет `pricing.<владелец>.log`.
      Один файл — один держатель, спорить за rename больше некому;
+   * `_copytruncate` — перекат ВСЁ-ТАКИ ПРОХОДИТ там, где `rename` невозможен;
    * `SafeRotatingFileHandler` — отказ переката больше НЕ проглатывается и не стоит записей.
+
+   Разведение по владельцу лечит только тех, кого можно развести. Один и тот же входной скрипт,
+   запущенный ДВАЖДЫ (хуки `dispatch_notify.py` бегут по нескольку разом), получает одну и ту же
+   кличку и снова спорит за канон — имя тут помочь не может в принципе. Для этого случая и живёт
+   вторая ступень: `_copytruncate`.
 
 Признак теста берём ПО ФАКТУ окружения, а не по вежливой договорённости «не забудь выставить»:
 TESTING=1 (общий рубильник репо, ставится `test_isolation`), TURBOBABY_TEST_LOGS=1 (явный
@@ -44,6 +50,7 @@ import os
 import re
 import sys
 import time
+import shutil
 import logging
 import tempfile
 from logging.handlers import RotatingFileHandler
@@ -211,9 +218,41 @@ def rotation_failures():
     return list(_ROTATE_FAILURES)
 
 
+def _copytruncate(path, dest):
+    """ПЕРЕКАТ ТАМ, ГДЕ `rename` НЕВОЗМОЖЕН: архив — копией, боевой файл — усечением на месте.
+
+    Почему это вообще работает, когда `os.replace` падает WinError 32. Python открывает лог
+    через `_wopen`/`_SH_DENYNO`, то есть отдаёт соседям `FILE_SHARE_READ|FILE_SHARE_WRITE`,
+    но НЕ `FILE_SHARE_DELETE`. Переименование требует у файла права DELETE — его нет, отсюда
+    отказ. А чтение и усечение просят ровно то, что соседи разрешили, — и проходят.
+    Замер 31.07.2026 на боевом `pricing.log` (держали три процесса): `os.replace` → WinError 32,
+    `copy2`+`truncate(0)` → успех, 23 302 269 байт уехали в архив.
+
+    Почему это ЛЕЧИТ, а не просто «уменьшает файл». Чужой хендлер держит СВОЙ поток в режиме
+    `"a"`: после усечения его `shouldRollover` меряет `seek(0,2)` → 0 < порога → перекат больше
+    НЕ ЗАПРАШИВАЕТСЯ, и запись ложится в файл. Стенд 31.07: до усечения строка терялась
+    (`handleError`, `Message: 'quote before truncate'`), после — легла. То есть соседей,
+    застрявших в вечном отказе, это поднимает БЕЗ их рестарта.
+
+    РАЗМЕН НАЗВАН ВСЛУХ: между `copy2` и `truncate` есть окно в миллисекунды, и строки, попавшие
+    в него, не попадут ни в архив, ни в новый файл. Это осознанно: терять миллисекунду записей
+    раз в 5 МБ несопоставимо дешевле, чем терять ВСЕ записи вечно, как было девять суток.
+    Возвращает (переложили?, исключение|None). Не бросает."""
+    try:
+        shutil.copy2(path, dest)
+        with open(path, "r+b") as f:
+            f.truncate(0)
+        return True, None
+    except Exception as exc:
+        return False, exc
+
+
 def _rotate(path, lim, n):
     """Сам сдвиг path.N → path.N+1 и path → path.1. Возвращает (сдвинули?, исключение|None) —
-    вызывающий решает, докладывать об отказе или молчать. Не бросает."""
+    вызывающий решает, докладывать об отказе или молчать. Не бросает.
+
+    Если `rename` не проходит (файл держит другой процесс), пробуем `_copytruncate`: перекат
+    важнее способа переката. Наружу в этом случае уходит успех, а не отказ."""
     try:
         if not os.path.isfile(path) or os.path.getsize(path) <= lim:
             return False, None
@@ -224,10 +263,37 @@ def _rotate(path, lim, n):
             src, dst = "%s.%d" % (path, i), "%s.%d" % (path, i + 1)
             if os.path.isfile(src):
                 os.replace(src, dst)
-        os.replace(path, path + ".1")
+        try:
+            os.replace(path, path + ".1")
+        except OSError as exc:
+            ok, exc2 = _copytruncate(path, path + ".1")
+            if not ok:
+                # докладываем ИСХОДНУЮ причину (отказ rename), а не вторичную: она диагностична
+                return False, exc
+            _report_rotate_note(path, "rename отказал (%s), перекат прошёл copytruncate"
+                                      % exc.__class__.__name__)
         return True, None
     except Exception as exc:
         return False, exc
+
+
+def _signal_append(msg):
+    """Дописать строку в общий файл-сигнал. САМ НЕ РОТИРУЕТ — иначе `_rotate` → `_report_*` →
+    `_rotate` замкнулись бы в петлю. Никогда не бросает."""
+    try:
+        with open(log_path(ROTATE_ERROR_LOG), "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+
+def _report_rotate_note(path, what):
+    """Перекат ПРОШЁЛ, но обходным путём. Не отказ — в `rotation_failures()` не кладём и stderr
+    не шумим; но в файл-сигнал строка идёт: у copytruncate есть окно потери в миллисекунды, и
+    знать, что перекат идёт через него, надо. Объём — одна строка на 5 МБ лога."""
+    msg = "ROTATE-NOTE %s | %s | %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), path, what)
+    _signal_append(msg)
+    return msg
 
 
 def _report_rotate_failure(path, exc, extra=""):
@@ -243,12 +309,10 @@ def _report_rotate_failure(path, exc, extra=""):
     except Exception:
         pass
     try:
-        p = log_path(ROTATE_ERROR_LOG)
-        _rotate(p, 512 * 1024, 1)        # молча: докладывать об отказе В файле отказов — петля
-        with open(p, "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
+        _rotate(log_path(ROTATE_ERROR_LOG), 512 * 1024, 1)   # молча: петлю рвёт _signal_append
     except Exception:
         pass
+    _signal_append(msg)
     try:
         if sys.stderr is not None:
             sys.stderr.write(msg + "\n")
@@ -262,18 +326,31 @@ class SafeRotatingFileHandler(RotatingFileHandler):
 
     Штатный ведёт себя так: `emit` → `doRollover` кидает WinError 32 → `except` → `handleError`
     → строка потеряна. И так на КАЖДОЙ записи, пока файл держит чужой процесс, то есть вечно.
-    Здесь при отказе: (1) запись всё равно ложится в файл — растущий лог лучше немого;
-    (2) уходит строка ROTATE-FAIL в файл-сигнал, в stderr и в сам лог (первый раз за эпизод);
-    (3) следующая попытка откладывается на `LOG_ROLLOVER_RETRY_SEC` — иначе rename дёргался бы
-    на каждой строке.
 
-    Размен назван вслух: при неустранимом отказе файл будет РАСТИ сверх порога. Это осознанно —
+    Здесь у переката ДВЕ ступени, и первая почти всегда достаточна:
+    1) `rename` — штатный, дешёвый;
+    2) `_copytruncate` — когда `rename` невозможен (файл держит сосед). Перекат ВСЁ-ТАКИ
+       ПРОХОДИТ: порог соблюдён, бэкап на месте, и застрявшие соседи оживают без рестарта.
+       В файл-сигнал уходит ROTATE-NOTE — обходной путь не прячем.
+
+    Если сорвались ОБЕ: (а) запись всё равно ложится в файл — растущий лог лучше немого;
+    (б) ROTATE-FAIL в файл-сигнал, в stderr и в сам лог (первый раз за эпизод); (в) следующая
+    попытка откладывается на `LOG_ROLLOVER_RETRY_SEC` — иначе перекат дёргался бы на каждой
+    строке. Размен назван вслух: в этом (теперь редком) случае файл РАСТЁТ сверх порога —
     тихая потеря диагностики хуже видимого роста, а видимый рост чинится по сигналу."""
 
     def __init__(self, *args, **kwargs):
         RotatingFileHandler.__init__(self, *args, **kwargs)
         self._rollover_retry_after = 0.0
         self._rollover_failed = False
+
+    def _reopen(self):
+        """Базовый `doRollover` закрывает поток ДО падения `rename` — вернуть его на место."""
+        if self.stream is None:
+            try:
+                self.stream = self._open()
+            except Exception:
+                self.stream = None
 
     def doRollover(self):
         now = time.time()
@@ -282,18 +359,27 @@ class SafeRotatingFileHandler(RotatingFileHandler):
         try:
             RotatingFileHandler.doRollover(self)
         except Exception as exc:
+            # Ступень 2. Базовый уже сдвинул бэкапы и освободил слот `.1` — упал он на самом
+            # переименовании боевого файла, ровно туда и кладём копию.
+            ok = False
+            if self.backupCount > 0:
+                ok, _ = _copytruncate(self.baseFilename, self.baseFilename + ".1")
+            if ok:
+                self._reopen()
+                self._rollover_failed = False
+                self._rollover_retry_after = 0.0
+                _report_rotate_note(self.baseFilename,
+                                    "rename отказал (%s), перекат прошёл copytruncate"
+                                    % exc.__class__.__name__)
+                return
             self._rollover_retry_after = now + rollover_retry_sec()
             first = not self._rollover_failed          # маркер В САМ ЛОГ — раз за эпизод
             self._rollover_failed = True
             msg = _report_rotate_failure(
                 self.baseFilename, exc,
-                " | файл держит другой процесс; лог продолжит расти, повтор через %d с"
+                " | не прошли ни rename, ни copytruncate; лог продолжит расти, повтор через %d с"
                 % rollover_retry_sec())
-            if self.stream is None:       # базовый doRollover закрыл поток ДО падения rename
-                try:
-                    self.stream = self._open()
-                except Exception:
-                    self.stream = None
+            self._reopen()
             if first and self.stream is not None:
                 try:
                     self.stream.write("!! %s\n" % msg)
