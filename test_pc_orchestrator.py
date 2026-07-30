@@ -10,6 +10,7 @@ import re
 import sys
 import json
 import types
+import shutil
 import tempfile
 import datetime
 import unittest
@@ -6716,6 +6717,78 @@ class TestClientContourGate(Base):
         cl, _hits, det = o._revizor_finding_touches_client("почини детект, он врёт")
         self.assertTrue(cl)
         self.assertFalse(det)
+
+    # ── ВТОРОЕ ОСНОВАНИЕ: ЗЕЛЁНЫЙ ПРОГОН ТРЕНАЖЁРА (30.07.2026, заглушка закрыта) ──
+    # Здесь ворота работают ПО-НАСТОЯЩЕМУ: release_reason не замокан, а читает РЕАЛЬНЫЙ файл
+    # вердикта во временном каталоге — тем же кодом, что в бою.
+
+    def _trainer_paths(self):
+        """Реестр решений и вердикт — во временном каталоге; ОБА канала ворот (основание пропуска
+        и причина в карточке) уводим на них, иначе карточка читала бы боевой файл и врала."""
+        d = tempfile.mkdtemp(prefix="ccgate_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        rel, trn = os.path.join(d, "release.json"), os.path.join(d, "trainer.json")
+        save_ts = o.client_contour.trainer_status
+        self.addCleanup(lambda: setattr(o.client_contour, "trainer_status", save_ts))
+        o.client_contour.release_reason = (
+            lambda commit, *a, **k: self._save_rr(commit, path=rel, trainer_path=trn, env={}))
+        o.client_contour.trainer_status = (
+            lambda commit, *a, **k: save_ts(commit, path=trn, env={}))
+        return rel, trn
+
+    def _put_verdict(self, path, **kw):
+        rec = {"commit": "4528917", "result": "green", "checks_passed": 96, "checks_total": 96,
+               "cases": 12, "cases_total": 12, "runs": 2, "clean": True,
+               "corpus": "trainer_cases.json", "corpus_sha": o.client_contour.corpus_sha(),
+               "runner": o.client_contour.TRAINER_RUNNER, "ts": 1.0, "when": "2026-07-30 12:00"}
+        rec.update(kw)
+        box = "green" if rec["result"] == "green" else "red"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({box: {"4528917": rec}}, f)
+
+    def test_zelenyi_verdikt_trenazhera_otkryvaet_vorota(self):
+        """12/12 кейсов, все чеки, 2 прогона, чистое дерево, ТОТ ЖЕ коммит → боты применяют его
+        БЕЗ «да» владельца: ровно то, ради чего заводилось второе основание."""
+        _rel, trn = self._trainer_paths()
+        self._put_verdict(trn)
+        note = self._upd(["suggest.py"])
+        self.assertEqual(sorted(self.restarts), ["moderbot", "userbot"])
+        self.assertIn("обновлён до 4528917", note)
+        self.assertEqual(self.cards, [])
+        self.assertTrue([c for c in self.cows if "«trainer»" in c])
+
+    def test_krasnyi_verdikt_derzhit_kommit_i_nazyvaet_prichinu(self):
+        """Хоть один красный чек — рестарта НЕТ, карточка говорит ЧТО именно красно."""
+        _rel, trn = self._trainer_paths()
+        self._put_verdict(trn, result="red", checks_passed=95, cases=11)
+        note = self._upd(["suggest.py"])
+        self.assertEqual(self.restarts, [])
+        self.assertIn("ОСТАНОВЛЕНО воротами клиентского контура", note)
+        self.assertIn("вердикт КРАСНЫЙ", self.cards[0])
+        self.assertIn(o.client_contour.TRAINER_RUNNER, self.cards[0])   # чем снять — в карточке
+
+    def test_verdikt_na_chuzhom_kommite_ne_zaschityvaetsya(self):
+        """Ключ подставлен под выкатываемый коммит, а прогон снят на ДРУГОМ HEAD → ворота держат."""
+        _rel, trn = self._trainer_paths()
+        self._put_verdict(trn, commit="d14d450")
+        note = self._upd(["suggest.py"])
+        self.assertEqual(self.restarts, [])
+        self.assertIn("ОСТАНОВЛЕНО воротами клиентского контура", note)
+        self.assertIn("на ДРУГОМ коммите", self.cards[0])
+
+    def test_da_vladelca_po_prezhnemu_otkryvaet_bez_verdikta(self):
+        """Первое основание не задето: «да» пропускает и при полном отсутствии прогона."""
+        rel, _trn = self._trainer_paths()
+        o.client_contour.approve("4528917", path=rel)
+        self.assertEqual(sorted(self._upd(["suggest.py"]) and self.restarts),
+                         ["moderbot", "userbot"])
+        self.assertEqual(self.cards, [])
+
+    def test_vnutrennii_kommit_edet_bez_vsyakogo_verdikta(self):
+        """Контроль второй половины: внутренний контур вердикта не спрашивает — как и раньше."""
+        self._trainer_paths()
+        self.assertEqual(self._upd(["pc_orchestrator.py", "gate_selective.py"]), "")
+        self.assertEqual(self.cards, [])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,284 @@
+# -*- coding: utf-8 -*-
+"""
+test_trainer_run.py — ГОЛДЕНЫ безголового прогона тренажёра и ВЕРДИКТА для ворот.
+
+Живого LLM здесь НЕТ (сам прогон корпуса — `trainer_run.py`, минуты и токены): проверяем то, что
+обязано быть детерминированным, — критерий зелёного, формат вердикта, привязку к коммиту и
+НЕРАСХОЖДЕНИЕ пайплайна раннера с боевым `_trainer_generate`.
+"""
+import test_isolation  # noqa: F401 — TESTING=1, боевой IPC заблокирован
+import ast
+import io
+import json
+import os
+import shutil
+import tempfile
+import unittest
+
+import client_contour as cc
+import trainer_run as tr
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+C40 = "1597cbe194e2de181091309eae4008938a48d426"
+OTHER40 = "d14d450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+def _rec(**kw):
+    """Заведомо ЗЕЛЁНАЯ запись вердикта; kw точечно портит одно поле."""
+    base = {"commit": C40, "result": "green", "checks_passed": 96, "checks_total": 96,
+            "cases": 12, "cases_total": 12, "runs": 2, "clean": True,
+            "corpus": "trainer_cases.json", "corpus_sha": cc.corpus_sha(),
+            "runner": "trainer_run.py", "ts": 1.0, "when": "2026-07-30 12:00:00"}
+    base.update(kw)
+    return base
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="trrun_")
+        self.v = os.path.join(self.d, "verdict.json")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+
+    def put(self, rec, key=None, box="green"):
+        with io.open(self.v, "w", encoding="utf-8") as f:
+            json.dump({box: {key or cc.short(rec["commit"]): rec}}, f)
+
+
+# ─────────────────────── 1. КРИТЕРИЙ ЗЕЛЁНОГО (build_verdict) ───────────────────────
+
+class TestKriteriiZelenogo(Base):
+    def mk(self, **kw):
+        a = {"commit": C40, "cases_total": 12, "passed": 12, "checks_ok": 96, "checks_all": 96,
+             "runs": 2, "clean": True, "failed": [], "sha": "abc123", "now": 1.0}
+        a.update(kw)
+        return tr.build_verdict(a["commit"], a["cases_total"], a["passed"], a["checks_ok"],
+                                a["checks_all"], a["runs"], a["clean"], a["failed"], a["sha"],
+                                now=a["now"])
+
+    def test_12_iz_12_dva_progona_chistoe_derevo_zelenyi(self):
+        self.assertEqual(self.mk()["result"], "green")
+
+    def test_odinnadcat_iz_12_krasnyi(self):
+        """Не «почти зелено»: ворота двоичные, частичный зелёный на клиенте недопустим."""
+        self.assertEqual(self.mk(passed=11, checks_ok=88, failed=["7/1 наличие"])["result"], "red")
+
+    def test_odin_progon_krasnyi(self):
+        """Генератор недетерминирован — один прогон ничего не доказывает."""
+        self.assertEqual(self.mk(runs=1)["result"], "red")
+
+    def test_gryaznoe_derevo_krasnyi(self):
+        self.assertEqual(self.mk(clean=False)["result"], "red")
+
+    def test_hot_odin_krasnyi_chek_krasit_verdikt(self):
+        self.assertEqual(self.mk(checks_ok=95, failed=["3/2 доставка = цена зоны"])["result"], "red")
+
+    def test_men_she_12_keisov_krasnyi(self):
+        """Урезанный корпус — не основание, даже если все его кейсы зелёные."""
+        self.assertEqual(self.mk(cases_total=3, passed=3, checks_ok=24, checks_all=24)["result"],
+                         "red")
+
+
+# ─────────────────────── 2. ФОРМАТ ВЕРДИКТА И ЗАПИСЬ НА ДИСК ───────────────────────
+
+class TestFormatVerdikta(Base):
+    def test_polya_kotorye_chitayut_vorota(self):
+        rec = tr.build_verdict(C40, 12, 12, 96, 96, 2, True, [], "sha16", now=1.0)
+        for k in ("commit", "result", "checks_passed", "checks_total", "cases", "cases_total",
+                  "runs", "clean", "corpus", "corpus_sha", "runner", "ts", "when"):
+            self.assertIn(k, rec, f"ворота ждут поле {k}")
+
+    def test_zapis_lozhitsya_pod_klyuch_semerku(self):
+        rec = tr.build_verdict(C40, 12, 12, 96, 96, 2, True, [], cc.corpus_sha(), now=1.0)
+        ok, _p = tr.write_verdict(rec, self.v)
+        self.assertTrue(ok)
+        with io.open(self.v, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertIn(cc.short(C40), d["green"])
+        self.assertTrue(cc.trainer_green(C40, path=self.v, env={}))
+
+    def test_krasnyi_progon_snosit_prezhnyuyu_zelen_togo_zhe_kommita(self):
+        """FAIL-CLOSED: вчерашняя зелень не должна открывать ворота коммиту, который сегодня красен."""
+        tr.write_verdict(tr.build_verdict(C40, 12, 12, 96, 96, 2, True, [], cc.corpus_sha(),
+                                          now=1.0), self.v)
+        self.assertTrue(cc.trainer_green(C40, path=self.v, env={}))
+        tr.write_verdict(tr.build_verdict(C40, 12, 11, 95, 96, 2, True, ["7/1 наличие"],
+                                          cc.corpus_sha(), now=2.0), self.v)
+        self.assertFalse(cc.trainer_green(C40, path=self.v, env={}))
+        with io.open(self.v, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertNotIn(cc.short(C40), d["green"])
+        self.assertIn(cc.short(C40), d["red"])          # красный остаётся — карточке есть что сказать
+
+
+# ─────────────────────── 3. ВОРОТА ЗАСЧИТЫВАЮТ ВЕРДИКТ ───────────────────────
+
+class TestVorotaSchitayutVerdikt(Base):
+    def test_zelenyi_verdikt_osnovanie_trainer(self):
+        self.put(_rec())
+        self.assertEqual(cc.release_reason(C40, trainer_path=self.v, path=os.path.join(self.d, "r.json"),
+                                           env={}), "trainer")
+
+    def test_verdikt_na_drugom_heade_ne_zaschityvaetsya(self):
+        """Ключ-семёрка ЧУЖАЯ: вердикт снят на другом коммите — ворота его не видят вовсе."""
+        self.put(_rec(commit=OTHER40))
+        ok, why = cc.trainer_verdict(C40, path=self.v, env={})
+        self.assertFalse(ok)
+        self.assertIn("вердикта на этот коммит нет", why)
+
+    def test_podlozhennyi_klyuch_s_chuzhim_kommitom_ne_zaschityvaetsya(self):
+        """Ключ подставлен под наш коммит, а поле commit — чужое: ворота сверяют ПОЛЕ, а не ключ."""
+        self.put(_rec(commit=OTHER40), key=cc.short(C40))
+        ok, why = cc.trainer_verdict(C40, path=self.v, env={})
+        self.assertFalse(ok)
+        self.assertIn("на ДРУГОМ коммите", why)
+
+    def test_krasnyi_verdikt_derzhit_i_nazyvaet_prichinu(self):
+        with io.open(self.v, "w", encoding="utf-8") as f:
+            json.dump({"red": {cc.short(C40): _rec(result="red", checks_passed=95, cases=11)}}, f)
+        ok, why = cc.trainer_verdict(C40, path=self.v, env={})
+        self.assertFalse(ok)
+        self.assertIn("КРАСНЫЙ", why)
+        self.assertIsNone(cc.release_reason(C40, trainer_path=self.v,
+                                            path=os.path.join(self.d, "r.json"), env={}))
+
+    def test_nepolnye_cheki_ne_osnovanie(self):
+        self.put(_rec(checks_passed=95))
+        self.assertFalse(cc.trainer_green(C40, path=self.v, env={}))
+
+    def test_odin_progon_ne_osnovanie(self):
+        self.put(_rec(runs=1))
+        self.assertFalse(cc.trainer_green(C40, path=self.v, env={}))
+
+    def test_gryaznoe_derevo_ne_osnovanie(self):
+        self.put(_rec(clean=False))
+        self.assertFalse(cc.trainer_green(C40, path=self.v, env={}))
+
+    def test_chuzhoi_korpus_ne_osnovanie(self):
+        self.put(_rec(corpus_sha="0" * 16))
+        ok, why = cc.trainer_verdict(C40, path=self.v, env={})
+        self.assertFalse(ok)
+        self.assertIn("корпус", why)
+
+    def test_men_she_12_keisov_ne_osnovanie(self):
+        self.put(_rec(cases=3, cases_total=3))
+        self.assertFalse(cc.trainer_green(C40, path=self.v, env={}))
+
+    def test_rubilnik_gasit_osnovanie(self):
+        """Аварийный возврат к «только да владельца» — без правки раннера и корпуса."""
+        self.put(_rec())
+        self.assertTrue(cc.trainer_green(C40, path=self.v, env={}))
+        self.assertFalse(cc.trainer_green(C40, path=self.v, env={cc.TRAINER_GREEN_ENV: "0"}))
+        self.assertFalse(cc.trainer_enabled({cc.TRAINER_GREEN_ENV: "off"}))
+        self.assertTrue(cc.trainer_enabled({}))              # дефолт — основание ВКЛЮЧЕНО
+
+    def test_progona_ne_bylo_kartochka_govorit_chem_snyat(self):
+        """Причина коротка («прогона не было»), а КОМАНДУ, которой вердикт снимают, даёт карточка."""
+        ok, why = cc.trainer_verdict(C40, path=os.path.join(self.d, "net.json"), env={})
+        self.assertFalse(ok)
+        self.assertIn("прогона не было", why)
+        card = cc.card_text(["userbot"], C40, ["suggest.py"], trainer_available=True,
+                            trainer_note=why)
+        self.assertIn("прогона не было", card)
+        self.assertIn(cc.TRAINER_RUNNER, card)
+
+
+# ─────────────────────── 4. ПАЙПЛАЙН НЕ РАЗОШЁЛСЯ С БОЕВЫМ ───────────────────────
+
+def _suggest_calls(path, func):
+    """Имена вызовов `suggest.<name>` внутри функции `func` файла `path`, В ПОРЯДКЕ вызова."""
+    with io.open(os.path.join(REPO, path), encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=path)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func:
+            out = []
+            for n in ast.walk(node):
+                if isinstance(n, ast.Call):
+                    fn = n.func
+                    if (isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name)
+                            and fn.value.id == "suggest"):
+                        out.append((n.lineno, fn.attr))
+                    # asyncio.to_thread(suggest.X, …) — боевой вызов того же самого
+                    elif isinstance(fn, ast.Attribute) and fn.attr == "to_thread":
+                        for a in n.args:
+                            if (isinstance(a, ast.Attribute) and isinstance(a.value, ast.Name)
+                                    and a.value.id == "suggest"):
+                                out.append((n.lineno, a.attr))
+            return [name for _ln, name in sorted(out)]
+    raise AssertionError(f"{path}: функции {func} нет")
+
+
+class TestPipelineNeRazoshelsya(unittest.TestCase):
+    """Честный минус варианта А (артефакт §4): раннер КОПИРУЕТ `_trainer_generate`, и копия может
+    молча разъехаться с боевой. Здесь она разъехаться молча не может."""
+
+    def test_pipeline_ne_razoshelsya(self):
+        live = _suggest_calls("userbot_listen.py", "_trainer_generate")
+        mine = _suggest_calls("trainer_run.py", "generate")
+        self.assertEqual(
+            mine, live,
+            "раннер разошёлся с боевым _trainer_generate: живой %s ≠ раннер %s. Вердикт тренажёра "
+            "перестал удостоверять то, что увидит владелец в группе." % (live, mine))
+
+    def test_raner_ne_v_klientskom_konture(self):
+        """Раннер и корпус НЕ должны попасть в замыкание ботов — иначе он сам упрётся в ворота."""
+        self.assertFalse(cc.is_client("trainer_run.py", REPO))
+        self.assertFalse(cc.is_client("trainer_cases.json", REPO))
+
+    def test_raner_ne_trogaet_zhivoi_userbot(self):
+        """Ни Telethon, ни singleton-лока, ни отправки: прогон не может задеть боевой процесс.
+        Судим по ДЕЙСТВИЮ (импорты и вызовы из AST), а не по подстроке: слова «userbot.lock» и
+        «send_message» законно стоят в шапке модуля — там они ОБЕЩАНИЕ их не трогать (правило 5
+        свода ENV_PLAYBOOK: подстрока — не признак)."""
+        with io.open(os.path.join(REPO, "trainer_run.py"), encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename="trainer_run.py")
+        imports, calls = set(), set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                imports |= {a.name.split(".")[0] for a in n.names}
+            elif isinstance(n, ast.ImportFrom) and n.module:
+                imports.add(n.module.split(".")[0])
+            elif isinstance(n, ast.Call):
+                f_ = n.func
+                calls.add(f_.attr if isinstance(f_, ast.Attribute)
+                          else (f_.id if isinstance(f_, ast.Name) else ""))
+        for bad in ("telethon", "userbot_listen", "trainer_log", "moderation_bot"):
+            self.assertNotIn(bad, imports, f"раннер импортирует боевое: {bad}")
+        for bad in ("acquire_lock", "send_message", "safe_append", "enqueue", "set_transcript",
+                    "bump_seq", "reset"):
+            self.assertNotIn(bad, calls, f"раннер зовёт боевое: {bad}")
+
+
+# ─────────────────────── 5. КОРПУС ───────────────────────
+
+class TestKorpus(unittest.TestCase):
+    def setUp(self):
+        self.cases, self.sha = tr.load_cases()
+
+    def test_dvenadcat_keisov_s_istochnikami(self):
+        self.assertEqual(len(self.cases), cc.TRAINER_MIN_CASES)
+        for c in self.cases:
+            self.assertTrue(str(c.get("source") or "").strip(), f"кейс {c.get('id')} без источника")
+            self.assertTrue(c.get("lines"), f"кейс {c.get('id')} без реплик")
+
+    def test_id_unikalny(self):
+        ids = [c["id"] for c in self.cases]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_snyatye_cheki_nazyvayut_prichinu(self):
+        """Снять чек можно только С ПРИЧИНОЙ в корпусе — иначе зелёный покупается молчанием."""
+        for c in self.cases:
+            for name, why in (c.get("skip") or {}).items():
+                self.assertGreater(len(str(why)), 30, f"кейс {c['id']}: чек «{name}» снят без причины")
+
+    def test_daty_podstavlyayutsya_v_budushchee(self):
+        ph = tr.placeholders()
+        txt = tr.build_transcript(self.cases[0], ph)
+        self.assertNotIn("{when", txt)
+        self.assertTrue(txt.startswith("[клиент]:"))
+
+    def test_sha_korpusa_sovpadaet_s_vorotami(self):
+        self.assertEqual(self.sha, cc.corpus_sha())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

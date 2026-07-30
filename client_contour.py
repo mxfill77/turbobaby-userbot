@@ -54,10 +54,13 @@ FAIL-CLOSED. Не удалось построить граф (нет входн�
     mentions(text)             → (клиентский?, что названо, определимо?) — для ворот ВХОДА (ревизор)
     release_reason(commit)     → 'owner' | 'trainer' | None — основание пропуска ворот
     approve(commit)            → записать «да» владельца
+    trainer_verdict(commit)    → (зачтён?, дословная причина) — ВТОРОЕ основание
+    trainer_status(commit)     → строка причины для карточки владельцу
     card_text(...)             → дословный текст карточки владельцу
 """
 
 import ast
+import hashlib
 import io
 import json
 import os
@@ -289,7 +292,13 @@ def mentions(text, repo=None, cl=None, modules=None):
 
 RELEASE_FILE = os.path.join(REPO, "pc_orchestrator.client_release.json")
 TRAINER_GREEN_FILE = os.path.join(REPO, "pc_orchestrator.client_trainer_green.json")
+TRAINER_CASES_FILE = os.path.join(REPO, "trainer_cases.json")
 TRAINER_GREEN_ENV = "PC_TRAINER_GREEN"
+TRAINER_RUNNER = "trainer_run.py"
+# Порог зелёного (артефакт 2026-07-30-trainer-verdict-recon.md, §5): весь корпус и ДВА прогона.
+# Меньше — не «почти зелено», а «вердикта нет»: ворота двоичные.
+TRAINER_MIN_CASES = 12
+TRAINER_MIN_RUNS = 2
 _KEEP = 50          # сколько последних решений храним
 
 
@@ -339,22 +348,90 @@ def owner_approved(commit, path=None):
     return isinstance(ap, dict) and c in ap
 
 
-def trainer_green(commit, path=None, env=None):
-    """ВТОРОЕ основание — зелёный прогон через тренажёр. СЕЙЧАС ЭТО ЗАГЛУШКА, и вот почему честно:
-    тренажёр «Тренеровка» связан с этим контуром в ОДНУ сторону — НАДЗОР-урок дописывает класс в
-    `docs/revizor_checklist.md` (вход ревизора). Обратной связи «прогон зелёный → можно выкатывать»
-    в коде нет: ни trainer.py, ни trainer_log.py, ни lesson_router.py не пишут никакого реестра
-    прогонов. Поэтому основание ВЫКЛЮЧЕНО по умолчанию: без PC_TRAINER_GREEN=1 всегда False.
-    Интерфейс заложен — когда тренажёр научится отдавать вердикт, он кладёт в TRAINER_GREEN_FILE
-    {"green": {"<commit7>": {...}}}, и ворота откроются без правки ворот."""
-    env = os.environ if env is None else env
-    if str(env.get(TRAINER_GREEN_ENV, "") or "").strip().lower() not in ("1", "true", "yes", "on"):
-        return False
+def corpus_sha(path=None):
+    """Отпечаток корпуса кейсов (sha256, 16 hex) → '' при нечитаемом файле. Вердикт обязан назвать
+    ТОТ корпус, что лежит на диске: зелень, снятая на урезанном наборе кейсов, не основание."""
+    try:
+        with io.open(path or TRAINER_CASES_FILE, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
+def trainer_verdict(commit, path=None, env=None, cases_path=None):
+    """ВТОРОЕ основание — ЗЕЛЁНЫЙ ПРОГОН ЧЕРЕЗ ТРЕНАЖЁР. → (зачтён?, дословная причина).
+
+    Канал ровно тот, что был заложен интерфейсом (a8f8822): безголовый раннер `trainer_run.py`
+    кладёт в TRAINER_GREEN_FILE {"green": {"<commit7>": {…}}}. Ворота файлу НЕ ВЕРЯТ НА СЛОВО —
+    кто может писать этот файл, тот открывает клиентский контур в обход «да» владельца, поэтому
+    запись обязана доказать себя ЦЕЛИКОМ (артефакт 2026-07-30-trainer-verdict-recon.md, §5):
+      • result == 'green' и ВСЕ чеки зелёные (checks_passed == checks_total > 0);
+      • кейсов не меньше TRAINER_MIN_CASES, прогонов не меньше TRAINER_MIN_RUNS;
+      • дерево на прогоне было ЧИСТОЕ (иначе вердикт удостоверяет не коммит, а чей-то WIP);
+      • корпус тот же, что на диске (corpus_sha);
+      • коммит ТОТ ЖЕ: не только ключ-семёрка, но и поле commit — вердикт, снятый на другом HEAD,
+        не засчитывается (полные хеши сверяем целиком, а не по префиксу).
+    Рубильник PC_TRAINER_GREEN=0/off ГАСИТ основание целиком (аварийный возврат к «только да»).
+    Любое «не знаю» (нет файла, битая запись, нечитаемый корпус) → False: fail-closed."""
+    if not trainer_enabled(env):
+        return False, f"выключен рубильником {TRAINER_GREEN_ENV}=0"
     c = short(commit)
     if not c:
-        return False
-    g = _load(path or TRAINER_GREEN_FILE).get("green")
-    return isinstance(g, dict) and c in g
+        return False, f"не похоже на коммит: {commit!r}"
+    d = _load(path or TRAINER_GREEN_FILE)
+    g = d.get("green") if isinstance(d.get("green"), dict) else {}
+    red = d.get("red") if isinstance(d.get("red"), dict) else {}
+    rec = g.get(c)
+    if not isinstance(rec, dict):
+        r = red.get(c)
+        if isinstance(r, dict):
+            return False, ("вердикт КРАСНЫЙ: чеков %s/%s, кейсов %s/%s (прогон %s)"
+                           % (r.get("checks_passed"), r.get("checks_total"), r.get("cases"),
+                              r.get("cases_total"), r.get("when") or "?"))
+        if g:
+            return False, ("вердикта на этот коммит нет (последний зелёный — на %s)"
+                           % ", ".join(sorted(g)[:3]))
+        return False, "прогона не было"
+    if str(rec.get("result") or "") != "green":
+        return False, f"запись не зелёная: result={rec.get('result')!r}"
+    rc = str(rec.get("commit") or "").strip().lower()
+    cc = str(commit or "").strip().lower()
+    if short(rc) != c or (len(rc) == 40 and len(cc) == 40 and rc != cc):
+        return False, f"вердикт снят на ДРУГОМ коммите ({short(rc) or '?'}), а выкатывается {c}"
+    total, ok = rec.get("checks_total"), rec.get("checks_passed")
+    if not isinstance(total, int) or not isinstance(ok, int) or total <= 0 or ok != total:
+        return False, f"чеки не все зелёные: {ok}/{total}"
+    cases, cases_total = rec.get("cases"), rec.get("cases_total")
+    if not isinstance(cases, int) or cases < TRAINER_MIN_CASES or cases != cases_total:
+        return False, f"кейсов {cases}/{cases_total}, нужно {TRAINER_MIN_CASES} из {TRAINER_MIN_CASES}"
+    runs = rec.get("runs")
+    if not isinstance(runs, int) or runs < TRAINER_MIN_RUNS:
+        return False, f"прогонов {runs}, нужно {TRAINER_MIN_RUNS}"
+    if rec.get("clean") is not True:
+        return False, "прогон шёл по ГРЯЗНОМУ дереву — вердикт не о коммите"
+    sha = corpus_sha(cases_path)
+    if not sha or str(rec.get("corpus_sha") or "") != sha:
+        return False, "корпус кейсов не тот, на котором снят вердикт"
+    return True, ("зелёный: кейсов %s/%s, чеков %s/%s, прогонов %s, коммит совпал (%s)"
+                  % (cases, cases_total, ok, total, runs, rec.get("when") or "?"))
+
+
+def trainer_enabled(env=None):
+    """Рубильник ВТОРОГО основания. По умолчанию ВКЛЮЧЕНО: вердикт себя доказывает сам (см.
+    trainer_verdict), и держать его выключенным значило бы оставить владельца единственным ключом.
+    PC_TRAINER_GREEN=0/false/no/off — аварийно погасить основание целиком, не трогая раннер."""
+    env = os.environ if env is None else env
+    return str(env.get(TRAINER_GREEN_ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def trainer_status(commit, path=None, env=None, cases_path=None):
+    """Дословная причина «почему тренажёр (не) открыл ворота» — для карточки владельцу."""
+    return trainer_verdict(commit, path, env, cases_path)[1]
+
+
+def trainer_green(commit, path=None, env=None):
+    """Зелёный прогон тренажёра на ЭТОТ коммит? (двоичный ответ для release_reason)."""
+    return trainer_verdict(commit, path, env)[0]
 
 
 def release_reason(commit, kind=None, path=None, trainer_path=None, env=None):
@@ -370,13 +447,19 @@ def release_reason(commit, kind=None, path=None, trainer_path=None, env=None):
 
 # ------------------------------- карточка владельцу ---------------------------
 
-def card_text(kinds, commit, client_files, subject="", where="", trainer_available=False):
+def card_text(kinds, commit, client_files, subject="", where="", trainer_available=False,
+              trainer_note=""):
     """Дословный текст карточки-ворот. Минимум владельца: ЧТО меняется, КАКИЕ файлы, КАКОЙ коммит,
-    КАК откатить — плюс чем ворота открываются."""
+    КАК откатить — плюс чем ворота открываются. По ВТОРОМУ основанию карточка говорит ПРИЧИНУ
+    (вердикта нет / КРАСНЫЙ / снят на другом коммите) и КОМАНДУ, которой вердикт снимают: иначе
+    владелец видит «тренажёр не открыл» и не знает, что с этим делать."""
     who = ", ".join(kinds) if kinds else "боты"
     subj = f" — {subject}" if str(subject or "").strip() else ""
-    tr = ("зелёный прогон через тренажёр" if trainer_available
-          else "зелёный прогон через тренажёр — СЕЙЧАС НЕДОСТУПЕН (тренажёр вердикта не выдаёт)")
+    if trainer_available:
+        tr = ("зелёный прогон через тренажёр — %s\n   снять вердикт: venv/Scripts/python.exe %s"
+              % (str(trainer_note or "").strip() or f"снять: {TRAINER_RUNNER}", TRAINER_RUNNER))
+    else:
+        tr = f"зелёный прогон через тренажёр — ОСНОВАНИЕ ВЫКЛЮЧЕНО ({TRAINER_GREEN_ENV}=0)"
     return (
         "⛔ Оркестратор: авто-выкатка на КЛИЕНТСКИЙ контур ОСТАНОВЛЕНА — жду твоего «да».\n"
         f"Коммит: {commit}{subj}\n"

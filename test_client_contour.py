@@ -173,20 +173,55 @@ class TestOsnovaniya(unittest.TestCase):
         cc.approve("4528917", path=self.rel)
         self.assertEqual(cc.release_reason("452891745abcdef", path=self.rel, trainer_path=self.tr, env={}), "owner")
 
-    def test_trener_vyklyuchen_po_umolchaniyu(self):
+    def _verdict(self, **kw):
+        """Заведомо ЗЕЛЁНАЯ запись вердикта тренажёра на коммит abc1234; kw портит одно поле."""
+        rec = {"commit": "abc1234", "result": "green", "checks_passed": 96, "checks_total": 96,
+               "cases": 12, "cases_total": 12, "runs": 2, "clean": True,
+               "corpus": "trainer_cases.json", "corpus_sha": cc.corpus_sha(),
+               "runner": cc.TRAINER_RUNNER, "ts": 1.0, "when": "2026-07-30 12:00:00"}
+        rec.update(kw)
+        with open(self.tr, "w", encoding="utf-8") as f:
+            json.dump({"green": {"abc1234": rec}}, f)
+
+    def test_zapis_bez_verdikta_ne_osnovanie(self):
+        """Запись есть, а доказательств нет (старая заглушка `{"ok": true}`) — ворота держат."""
         with open(self.tr, "w", encoding="utf-8") as f:
             json.dump({"green": {"abc1234": {"ok": True}}}, f)
         self.assertIsNone(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr, env={}))
 
-    def test_trener_zelenyi_pri_vklyuchennom_flage(self):
-        with open(self.tr, "w", encoding="utf-8") as f:
-            json.dump({"green": {"abc1234": {"ok": True}}}, f)
+    def test_trener_zelenyi_verdikt_otkryvaet_vorota(self):
+        """ВТОРОЕ основание живое: 12/12 кейсов, все чеки, 2 прогона, чистое дерево, тот же коммит."""
+        self._verdict()
         self.assertEqual(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr,
-                                           env={cc.TRAINER_GREEN_ENV: "1"}), "trainer")
+                                           env={}), "trainer")
 
-    def test_trener_flag_est_no_progona_net(self):
+    def test_trener_progona_net(self):
+        self.assertIsNone(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr, env={}))
+
+    def test_trener_rubilnik_gasit_osnovanie(self):
+        """PC_TRAINER_GREEN=0 — аварийный возврат к «только да владельца»."""
+        self._verdict()
         self.assertIsNone(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr,
-                                            env={cc.TRAINER_GREEN_ENV: "1"}))
+                                            env={cc.TRAINER_GREEN_ENV: "0"}))
+
+    def test_trener_verdikt_na_chuzhom_kommite_ne_zaschityvaetsya(self):
+        """Ключ подставлен под наш коммит, а снят вердикт на другом HEAD — ворота сверяют ПОЛЕ."""
+        self._verdict(commit="d14d450")
+        ok, why = cc.trainer_verdict("abc1234", path=self.tr, env={})
+        self.assertFalse(ok)
+        self.assertIn("на ДРУГОМ коммите", why)
+        self.assertIsNone(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr, env={}))
+
+    def test_trener_krasnyi_verdikt_derzhit(self):
+        self._verdict(result="red", checks_passed=95, cases=11)
+        self.assertIsNone(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr, env={}))
+
+    def test_trener_nepolnyi_progon_ne_osnovanie(self):
+        for bad in ({"runs": 1}, {"clean": False}, {"cases": 3, "cases_total": 3},
+                    {"checks_passed": 95}, {"corpus_sha": "0" * 16}):
+            self._verdict(**bad)
+            self.assertIsNone(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr,
+                                                env={}), f"открылось на {bad}")
 
     def test_ne_hesh_ne_osnovanie(self):
         ok, msg = cc.approve("не-коммит")

@@ -3718,8 +3718,11 @@ def _dirty_block(kind, commit, where, label=None, dirty_fn=None, notifier=None,
 # считается по факту с диска, а не списком имён). Вместо применения — карточка владельцу: что
 # меняется, какие файлы, какой коммит, как откатить. Ворота открывают РОВНО ДВА основания:
 #   • «да» владельца (команда-рычаг «выкати» → client_contour.approve);
-#   • зелёный прогон через тренажёр — интерфейс заложен, но сам прогон тренажёр пока НЕ выдаёт
-#     (обратной связи «тренажёр → выкатка» в коде нет), поэтому основание по умолчанию выключено.
+#   • ЗЕЛЁНЫЙ ПРОГОН ЧЕРЕЗ ТРЕНАЖЁР (30.07.2026 заглушка ЗАКРЫТА): безголовый раннер
+#     `trainer_run.py` гоняет корпус `trainer_cases.json` ВНЕ клиентского контура (боевой userbot и
+#     его singleton не трогает) и кладёт вердикт в pc_orchestrator.client_trainer_green.json.
+#     Ворота засчитывают его, только если 12 кейсов из 12 прошли ВСЕ чеки в ДВУХ прогонах, дерево
+#     было чистым и коммит вердикта РОВНО тот, что выкатывается (client_contour.trainer_verdict).
 # FAIL-CLOSED: признак не смог решить (граф не строится, файл не читается, путь пуст) → файл
 # считается КЛИЕНТСКИМ и применение не идёт.
 # ВНУТРЕННИЙ контур ворот НЕ касается: self-update самого демона и его эстафета работают как
@@ -3787,8 +3790,10 @@ def _client_block(kinds, commit, paths, where, subject=None, notifier=None, cowo
             kinds or ["боты"], commit, held,
             subject=subject if subject is not None else (subject_fn or _commit_subject)(commit),
             where=where,
-            trainer_available=str(os.getenv(client_contour.TRAINER_GREEN_ENV, "")).strip().lower()
-            in ("1", "true", "yes", "on")))
+            # ВТОРОЕ основание живое (trainer_run.py отдаёт вердикт) — карточка обязана сказать,
+            # ПОЧЕМУ оно не сработало на этом коммите: вердикта нет / КРАСНЫЙ / снят на чужом HEAD.
+            trainer_available=client_contour.trainer_enabled(),
+            trainer_note=client_contour.trainer_status(commit)))
     return held
 
 
