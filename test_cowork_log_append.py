@@ -353,6 +353,207 @@ class TestShrinkGuard(unittest.TestCase):
         self.assertEqual(cla.spool_read(), ["DONE прошлая отложенная", self.LINE])
 
 
+# фикстура снята с ЖИВОГО журнала (снимок 31.07, запись-медиана длинного хвоста, 1616 символов):
+# правило-класс CLAUDE.md — голдены пишем на дословных живых строках, а не на «как удобно тесту».
+LIVE_LONG = (
+    "NOTE 2026-07-29 18:25 UTC: Orchestrator: родитель #44 (pcloc-dec) → done: план 6 шагов, "
+    "шаг 1 в очереди · 🧩 Декомпозиция (локальный дирижёр PC): 6 шагов — исполняю ПО ОДНОМУ "
+    "(lane=pc, sequential-релиз: следующий шаг встаёт только после done предыдущего). "
+    "1. В репо D:\\turbobaby-bot найти, где suggest формирует текст ответа и черновиков и где "
+    "доступно окно сообщений клиента: grep по \"suggest\", \"черновик\", \"Здравствуйте\", "
+    "\"greeting\". Выяснить, как в окне помечено автоприветствие Telegram Business "
+    "(роль/флаг/текст). Итог записать в D:\\turbobaby-bot\\artifacts\\greeting-guard-notes.md: "
+    "файлы, функции, формат окна. Проверка: файл создан, пути в нём существуют. "
+    "2. По собранным заметкам добавить в suggest признак автоприветствия и накрыть его юнитом; "
+    "гейт зелёный, коммит с хешем в итоге шага, откат при любом красном."
+)
+
+
+class TestSpillThreshold(unittest.TestCase):
+    """ЖУРНАЛ — ИНДЕКС, А НЕ ХРАНИЛИЩЕ ТЕЛ (31.07.2026).
+
+    Полные отчёты уезжали в cowork_log целиком: по замеру живого журнала 21.8% записей держат
+    74.5% его объёма. Теперь строка длиннее LINE_MAX кладёт ТЕЛО в файл, а в мозг отдаёт итог
+    и путь. Здесь проверяется ровно это — и то, что защита от роста не стала потерей записи."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = os.path.join(self._tmp.name, "journal")
+
+    def _spill(self, line, body=None, **kw):
+        return cla.spill(line, body, spill_dir=self.dir, **kw)
+
+    # --- порог: обоснован ЗАМЕРОМ, а не вкусом ---
+
+    def test_threshold_is_above_longest_compliant_line(self):
+        """Замер 31.07 по 81 живой ARTIFACT-записи (уже правильный вид «итог + путь»):
+        p50=177, p90=218, МАКСИМУМ 588. Порог обязан стоять ВЫШЕ максимума — иначе он резал бы
+        записи, которые формат уже соблюдают, и правило спорило бы само с собой."""
+        self.assertGreater(cla.LINE_MAX, 588)
+        # …и не улетать в бесконечность: замер даёт p90 длинного хвоста 1362 — порог выше него
+        # перестал бы что-либо ловить (при 1500 экономия падает с 68.6% до 50.3%).
+        self.assertLess(cla.LINE_MAX, 1000)
+
+    def test_short_line_untouched_and_no_file_created(self):
+        line = "DONE 2026-07-31 09:00 UTC: ARTIFACT порог журнала → docs/artifacts/x.md: готово"
+        got, path = self._spill(line)
+        self.assertEqual(got, line)
+        self.assertIsNone(path)
+        self.assertFalse(os.path.exists(self.dir))     # пустых папок за собой не оставляем
+
+    def test_boundary_exactly_at_threshold_is_untouched(self):
+        line = "DONE 2026-07-31 09:00 UTC: " + "я" * (cla.LINE_MAX - 27)
+        self.assertEqual(len(line), cla.LINE_MAX)
+        self.assertEqual(self._spill(line), (line, None))
+
+    # --- вынос тела ---
+
+    def test_long_line_becomes_summary_plus_path(self):
+        got, rel = self._spill(LIVE_LONG)
+        self.assertLessEqual(len(got), cla.LINE_MAX)          # в журнал ушёл ИТОГ
+        self.assertTrue(got.startswith("NOTE 2026-07-29 18:25 UTC:"), got)  # контракт цел
+        self.assertIn(rel, got)                               # …и ССЫЛКА на тело
+        self.assertIn("полный текст %d симв." % len(LIVE_LONG), got)
+        self.assertTrue(rel.startswith("docs/artifacts/journal/"), rel)
+
+    def _body(self, rel):
+        with open(os.path.join(self.dir, os.path.basename(rel)), encoding="utf-8") as f:
+            return f.read()
+
+    def test_body_file_holds_the_whole_record(self):
+        got, rel = self._spill(LIVE_LONG)
+        body = self._body(rel)
+        self.assertIn(LIVE_LONG, body)                        # тело ЦЕЛИКОМ, а не обрезок
+        self.assertIn(str(len(LIVE_LONG)), body)              # и длина названа числом
+        self.assertNotIn(got[:60] + "…", body.split("---")[0])
+
+    def test_original_newlines_survive_in_the_file(self):
+        """В журнал уходит одна строка, а в файл — ИСХОДНЫЙ текст: простыня в одну строку
+        нечитаема, а сохранить формат стоит ноль."""
+        raw = "DONE отчёт\n\n1. первый пункт\n2. второй пункт\n" + "хвост " * 200
+        line = " ".join(raw.split())
+        _, rel = self._spill(line, raw)
+        self.assertIn("1. первый пункт\n2. второй пункт", self._body(rel))
+
+    def test_head_is_cut_on_phrase_boundary_not_mid_word(self):
+        got, _ = self._spill(LIVE_LONG)
+        head = got.split(" … → ")[0]
+        self.assertTrue(LIVE_LONG.startswith(head), head)      # голова — дословное начало записи
+        nxt = LIVE_LONG[len(head):len(head) + 1]
+        self.assertIn(nxt, (" ", ".", ",", ";", "·", "—", ""), repr(head[-40:]))
+        self.assertGreater(len(head), cla.LINE_MAX // 2)       # итог остался итогом
+
+    def test_two_spills_in_the_same_second_get_own_files(self):
+        """Писателей двое (демон + SessionEnd-хук) — секунда одна. Коллизия обязана развестись
+        суффиксом, а не тихо затереть чужое тело."""
+        now = datetime.datetime(2026, 7, 31, 9, 0, 0, tzinfo=datetime.timezone.utc)
+        a = self._spill(LIVE_LONG, now=now)[1]
+        b = self._spill(LIVE_LONG.replace("#44", "#45"), now=now)[1]
+        self.assertNotEqual(a, b)
+        self.assertEqual(len(os.listdir(self.dir)), 2)
+
+    def test_type_of_record_lands_in_the_file_name(self):
+        for line, mark in ((LIVE_LONG, "-note"), (LIVE_LONG.replace("NOTE", "ASK ", 1), "-ask")):
+            _, rel = self._spill(line)
+            self.assertIn(mark, rel, rel)
+
+    # --- FAIL-SAFE: защита от роста не смеет стать потерей ---
+
+    def test_unwritable_target_keeps_the_full_line(self):
+        """Файл не записался → строка уходит в журнал КАК БЫЛА. Длинная запись хуже короткой,
+        но потерянная хуже обеих (тот же принцип, что у гарда усыхания)."""
+        with mock.patch.object(cla.os, "makedirs", side_effect=OSError("нет доступа")):
+            got, rel = self._spill(LIVE_LONG)
+        self.assertEqual(got, LIVE_LONG)
+        self.assertIsNone(rel)
+
+    def test_open_failure_also_keeps_the_full_line(self):
+        with mock.patch("builtins.open", side_effect=OSError("диск полон")):
+            got, rel = self._spill(LIVE_LONG)
+        self.assertEqual(got, LIVE_LONG)
+        self.assertIsNone(rel)
+
+    # --- контракт строки после выноса ---
+
+    def test_short_line_is_still_stamped_and_idempotent(self):
+        """Итог обязан оставаться записью по контракту: тип+дата на месте, второй штамп не лепится
+        (иначе досылка из спула родила бы «DONE <дата> UTC: DONE <дата> UTC: …»)."""
+        got, _ = self._spill(LIVE_LONG)
+        self.assertTrue(cla._RE_STAMPED.match(got), got)
+        self.assertEqual(cla.stamp_line(got, "2026-07-31 10:00 UTC"), got)
+
+
+class TestSpillInMain(unittest.TestCase):
+    """Тот же вынос, но по ЖИВОМУ пути запуска: argv → mост / спул."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._saved = (cla.SPOOL_PATH, cla.LEDGER_PATH, cla.SPILL_DIR,
+                       cla.get, cla.post, cla.load_env, sys.argv)
+        cla.SPOOL_PATH = os.path.join(self._tmp.name, "pending.txt")
+        cla.LEDGER_PATH = os.path.join(self._tmp.name, "ledger.jsonl")
+        cla.SPILL_DIR = os.path.join(self._tmp.name, "journal")
+        cla.load_env = lambda p: {"BRIDGE_URL": "https://bridge.test/exec", "BRIDGE_TOKEN": "TOK"}
+        cla.get = lambda url, params: {"ok": True, "name": "cowork_log", "text": "A" * 5000}
+        self.writes = []
+        cla.post = lambda url, payload: (self.writes.append(dict(payload))
+                                         or {"ok": True, "chars": len(payload["text"])})
+        sys.argv = ["cowork_log_append.py", LIVE_LONG]
+
+    def tearDown(self):
+        (cla.SPOOL_PATH, cla.LEDGER_PATH, cla.SPILL_DIR,
+         cla.get, cla.post, cla.load_env, sys.argv) = self._saved
+
+    def _run(self):
+        err, out = io.StringIO(), io.StringIO()
+        exc = None
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            try:
+                cla.main()
+            except SystemExit as e:
+                exc = e
+        return exc, out.getvalue(), err.getvalue()
+
+    def test_bridge_receives_summary_not_the_body(self):
+        exc, out, _ = self._run()
+        self.assertIsNone(exc)
+        head = self.writes[0]["text"].split("  \n")[0]
+        self.assertLessEqual(len(head), cla.LINE_MAX)
+        self.assertIn("docs/artifacts/journal/", head)
+        self.assertNotIn("greeting-guard-notes", head)         # тело в мозг НЕ уехало
+        self.assertIn("тело вынесено в", out)                  # …и об этом сказано в отчёте
+        files = os.listdir(cla.SPILL_DIR)
+        self.assertEqual(len(files), 1)
+        with open(os.path.join(cla.SPILL_DIR, files[0]), encoding="utf-8") as f:
+            self.assertIn("greeting-guard-notes", f.read())
+
+    def test_existing_records_are_untouched(self):
+        """Правило владельца: старые записи НЕ трогаем. Склейка обязана только ДОБАВЛЯТЬ."""
+        self._run()
+        self.assertTrue(self.writes[0]["text"].endswith("A" * 5000))
+
+    def test_failure_spools_the_short_line_not_the_sheet(self):
+        """Мост упал → в спул ложится ИТОГ, а не простыня: иначе отложенная запись доехала бы
+        до журнала следующим успешным вызовом и обошла порог сама."""
+        cla.get = lambda url, params: (_ for _ in ()).throw(_http(500))
+        exc, _, err = self._run()
+        self.assertEqual(exc.code, 1)
+        spooled = cla.spool_read()
+        self.assertEqual(len(spooled), 1)
+        self.assertLessEqual(len(spooled[0]), cla.LINE_MAX)
+        self.assertIn("docs/artifacts/journal/", spooled[0])
+        self.assertIn("Тело записи УЖЕ сохранено", err)        # тело не потеряно и названо
+
+    def test_short_line_leaves_no_files_behind(self):
+        sys.argv = ["cowork_log_append.py", "DONE Dispatch 31.07: короткий итог, всё зелено"]
+        exc, out, _ = self._run()
+        self.assertIsNone(exc)
+        self.assertFalse(os.path.exists(cla.SPILL_DIR))
+        self.assertNotIn("тело вынесено", out)
+
+
 class TestStdinEncoding(unittest.TestCase):
     """29.07.2026: кириллица из пайпа ложилась в мозг мохибейком.
 

@@ -180,6 +180,109 @@ def stamp_line(msg, stamp):
     return "DONE %s: %s" % (stamp, msg)
 
 
+# ───────── ЖУРНАЛ — ИНДЕКС, А НЕ ХРАНИЛИЩЕ ТЕЛ (класс 31.07.2026) ─────────
+# ЗАМЕР по ЖИВОМУ журналу (снимок 31.07: cowork_log 123 283 симв. + cowork_log_archive
+# 763 217 симв., 2058 записей за 19.06–30.07). Замер ВОСПРОИЗВОДИМ: `journal_measure.py`
+# (--refresh снимет свежие снимки через brain_writer, read-only); разбор и выбор порога —
+# docs/artifacts/2026-07-31-journal-index-threshold.md. Единица замера —
+# ЛОГИЧЕСКАЯ ЗАПИСЬ, склеенная в ОДНУ строку ровно так, как её кладёт main() ниже: только это
+# и есть «длина строки журнала» (строгий разбор «тип+дата» на архиве даёт псевдозапись на
+# 395 593 символа — артефакт парсера, а не живая строка; на это легко купиться).
+#   • 78.2% записей ≤ 600 символов — и держат они всего 25.5% объёма журнала;
+#   • оставшиеся 21.8% (448 записей) держат 74.5% объёма — это ОТЧЁТЫ, уехавшие целиком;
+#   • строки УЖЕ правильного вида «итог + путь» (81 живая ARTIFACT-запись): p50=177, p90=218,
+#     МАКСИМУМ 588 символов.
+# Порог = 600 — ближайшее круглое число ВЫШЕ самой длинной живой строки правильного вида (588).
+# То есть он по построению не трогает НИ ОДНОЙ записи, которая уже соблюдает формат
+# «итог + ссылка», и режет только тела. Число получено ЗАМЕРОМ, а не вкусом: менять его —
+# только пересняв замер (порог назначенный от порога измеренного отличается тем, что второй
+# можно оспорить числами).
+LINE_MAX = 600
+# Тела живут ОТДЕЛЬНОЙ папкой, а не вперемешку с решениями владельца: артефактов-решений в
+# docs/artifacts 94 штуки, а вынос по замеру даёт ~140 файлов в неделю — смешать значит утопить
+# решения в теле переписки.
+SPILL_REL_DIR = "docs/artifacts/journal"
+SPILL_DIR = os.path.join(HERE, *SPILL_REL_DIR.split("/"))
+# Границы фразы для реза головы. Порядок не важен — берём самую ПОЗДНЮЮ подходящую.
+_CUT_MARKS = (". ", "! ", "? ", "; ", " — ", " · ", ", ")
+
+
+def _cut_head(text, budget):
+    """Голова записи не длиннее budget, обрезанная по границе ФРАЗЫ (иначе — слова).
+
+    Рез посреди слова запрещён: строку-итог читает человек, а не греп. Слишком ранний рез тоже
+    вреден (итог перестаёт быть итогом), поэтому граница принимается только со второй половины
+    бюджета; не нашлась — режем по последнему пробелу."""
+    if len(text) <= budget:
+        return text
+    head = text[:budget]
+    floor = budget // 2
+    cut = -1
+    for mark in _CUT_MARKS:
+        i = head.rfind(mark)
+        if i >= floor:
+            cut = max(cut, i + (1 if mark[0] in ".!?;" else 0))
+    if cut < floor:
+        cut = head.rfind(" ")
+    if cut < floor:
+        cut = budget
+    return head[:cut].rstrip(" ,;:—·-")
+
+
+def _spill_path(spill_dir, now, kind):
+    """Свободное имя файла тела: <дата>-<ЧЧММСС>-<тип>[-N].md. Секунда одна, писателей может
+    быть двое (демон + хук) — коллизию разводим суффиксом, а не молча затираем чужое тело."""
+    base = now.strftime("%Y-%m-%d-%H%M%S")
+    for n in range(1, 100):
+        name = "%s-%s%s.md" % (base, kind, "" if n == 1 else "-%d" % n)
+        path = os.path.join(spill_dir, name)
+        if not os.path.exists(path):
+            return path
+    return os.path.join(spill_dir, "%s-%s-p%d.md" % (base, kind, os.getpid()))
+
+
+def _spill_text(line, body, now, cap):
+    """Содержимое файла-тела. Тело кладём в ИСХОДНОМ виде (с переносами): схлопнутая в одну
+    строку простыня нечитаема, а сохранить формат стоит ноль — в журнал-то уходит итог."""
+    src = (body if (body or "").strip() else line).rstrip()
+    return ("# Тело записи журнала — %s UTC\n\n"
+            "Вынесено АВТОМАТИЧЕСКИ писателем `cowork_log_append.py`: строка журнала была "
+            "**%d символов** при пороге **%d** (журнал — индекс, а не хранилище тел).\n"
+            "В `cowork_log` ушёл итог и ссылка на этот файл.\n\n"
+            "| поле | значение |\n|---|---|\n"
+            "| записано | %s |\n| символов в строке | %d |\n| порог | %d |\n\n"
+            "---\n\n%s\n"
+            % (now.strftime("%Y-%m-%d %H:%M"), len(line), cap,
+               now.strftime("%Y-%m-%d %H:%M:%S"), len(line), cap, src))
+
+
+def spill(line, body=None, now=None, spill_dir=None, rel_dir=SPILL_REL_DIR, line_max=None):
+    """Строку журнала длиннее порога → («итог + путь», путь тела). Иначе — как была.
+
+    body — ИСХОДНЫЙ текст записи (до схлопывания переносов): он и уходит в файл.
+    FAIL-SAFE: файл не записался → возвращаем строку БЕЗ ИЗМЕНЕНИЙ. Длинная строка в журнале
+    хуже короткой, но ПОТЕРЯННАЯ хуже обеих — защита от роста не смеет становиться потерей
+    (тот же принцип, что у гарда усыхания выше).
+    → (строка для журнала, путь тела относительно репо | None)"""
+    cap = LINE_MAX if line_max is None else line_max
+    if len(line) <= cap:
+        return line, None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    m = _RE_TYPED.match(line)
+    kind = (m.group(1) if m else "log").lower()
+    try:
+        d = spill_dir or SPILL_DIR
+        os.makedirs(d, exist_ok=True)
+        path = _spill_path(d, now, kind)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(_spill_text(line, body, now, cap))
+    except Exception:
+        return line, None
+    rel = rel_dir.rstrip("/") + "/" + os.path.basename(path)
+    tail = " … → %s (полный текст %d симв.)" % (rel, len(line))
+    return _cut_head(line, max(1, cap - len(tail))) + tail, rel
+
+
 def compose(new_line, pending, old):
     """Текст дока после дозаписи: новейшая строка сверху, отложенные следом (от новых к старым),
     ниже — прежний текст целиком. Вынесено отдельной функцией, чтобы гард монотонности можно было
@@ -212,20 +315,27 @@ def main():
     # спавнят detached-ребёнком в utf-8-приёмник (dispatch_notify._cowork) — без явного UTF-8
     # cp1251-байты легли бы мохибейком. Пара к read_stdin_text() (тот же класс, входная полоса).
     io_utf8.force_utf8()
-    msg = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else read_stdin_text().strip()
-    if not msg:
+    raw = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else read_stdin_text().strip()
+    if not raw:
         sys.stderr.write("ОШИБКА: пустая строка-итог\n"); sys.exit(1)
     # ОДНА запись = ОДНА строка: result задачи бывает многострочным, а перенос внутри записи
     # рвёт разбор журнала по заголовкам (и может подсунуть сплиттеру ложный заголовок).
-    msg = " ".join(msg.split())
+    # ИСХОДНЫЙ текст (raw) держим отдельно — он уйдёт в файл-тело, если строка переросла порог.
+    msg = " ".join(raw.split())
     env = load_env(ENV_PATH)
     url = env.get("BRIDGE_URL"); token = env.get("BRIDGE_TOKEN")
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime(STAMP_FMT)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    stamp = now.strftime(STAMP_FMT)
     new_line = stamp_line(msg, stamp)
+    # ЖУРНАЛ — ИНДЕКС: тело длиннее LINE_MAX уезжает файлом, в мозг идёт итог и путь. Стоит
+    # ДО развилки «нет конфига»: в спул тоже должна лечь короткая строка, иначе отложенная
+    # простыня доедет до журнала следующим успешным вызовом и порог обойдёт себя сам.
+    new_line, spilled = spill(new_line, raw, now=now)
     if not url or not token:
         spool_add(new_line)
         sys.stderr.write("ОШИБКА: нет BRIDGE_URL/BRIDGE_TOKEN в .env\nОТЛОЖЕНО в "
-                         + SPOOL_PATH + " (строка не потеряна): " + new_line + "\n")
+                         + SPOOL_PATH + " (строка не потеряна): " + new_line
+                         + (("\nТело записи УЖЕ сохранено: " + spilled) if spilled else "") + "\n")
         sys.exit(1)
     pending = spool_read()      # строки прошлых сбоев — дошлём вместе с новой
     try:
@@ -256,6 +366,8 @@ def main():
         for done_line in [new_line] + list(pending):   # реестр следов: и новая, и досланные
             ledger_add(done_line)
         extra = f" | досланы отложенные: {len(pending)}" if pending else ""
+        # Вынос тела называем В ОТЧЁТЕ: молчаливое усечение неотличимо от «столько и написали».
+        extra += f" | тело вынесено в {spilled}" if spilled else ""
         # w["chars"] — это text.length НА СТОРОНЕ МОСТА, то есть UTF-16 code units: каждый эмодзи
         # вне BMP (📦 🔴 …) считается ЗА ДВА. Python len() того же текста будет МЕНЬШЕ. Живой замер
         # 28.07: мост отрапортовал 759635, кодовых точек в доке 759548, не-BMP символов ровно 87 —
@@ -266,7 +378,8 @@ def main():
         spool_add(new_line)
         head = "ГАРД УСЫХАНИЯ (запись отменена)" if isinstance(e, ShrinkGuard) else "ОШИБКА Bridge"
         sys.stderr.write(head + ": " + str(e) + "\nОТЛОЖЕНО (строка НЕ потеряна, уйдёт "
-                         "следующим успешным вызовом): " + new_line + "\nСпул: " + SPOOL_PATH + "\n")
+                         "следующим успешным вызовом): " + new_line + "\nСпул: " + SPOOL_PATH
+                         + (("\nТело записи УЖЕ сохранено: " + spilled) if spilled else "") + "\n")
         sys.exit(1)
 
 if __name__ == "__main__":
