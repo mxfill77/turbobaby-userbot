@@ -651,18 +651,19 @@ def resolve_claude(retries=1, retry_sleep=2.0):
     return None
 
 
-# --- модель ИСПОЛНИТЕЛЯ headless-задач lane=pc (решение владельца 24.07.2026, тема 328) -------
+# --- модель ИСПОЛНИТЕЛЯ headless-задач lane=pc (решение владельца 24.07.2026, тема 328;
+# 30.07.2026 переведён на claude-opus-5 — «Opus 5 для наших задач лучше») ----------------------
 # Раньше run_claude звал claude -p БЕЗ --model: модель ТИХО бралась из .claude/settings.json
-# (model=claude-fable-5 — он же дефолт интерактивных сессий репо). Env-ручки ORCH_MODEL /
-# EXECUTOR_MODEL / EXECUTOR_EFFORT — имена VPS-полосы, ПК-код их НЕ читает: «запрошен sonnet —
-# берётся fable» ровно отсюда (мёртвая ручка в .env ничего не переключает). Правка
-# .claude/settings.json — красная зона pretool_guard (вектор само-эскалации), поэтому источник
-# правды исполнителя — ЭТА константа: смена модели = правка строки + коммит → self-update сам
-# перезапустит демон штатным потоком. Env сознательно НЕ читаем (детерминизм: застрявший .env /
-# унаследованный os.environ не смеют молча переключить модель — класс #194). SUGGEST_MODEL
-# (клиентский suggest, fable) и THINKER_MODEL (думатель, fable) не задеты — у них свои явные
-# --model. Полный id обязателен: короткий алиас → HTTP 404 у claude -p (класс #194).
-EXECUTOR_MODEL = "claude-opus-4-8"
+# (дефолт интерактивных сессий репо). Env-ручки ORCH_MODEL / EXECUTOR_MODEL / EXECUTOR_EFFORT —
+# имена VPS-полосы, ПК-код их НЕ читает: «запрошен sonnet — берётся чужая модель» ровно отсюда
+# (мёртвая ручка в .env ничего не переключает). Правка .claude/settings.json — красная зона
+# pretool_guard (вектор само-эскалации), поэтому источник правды исполнителя — ЭТА константа:
+# смена модели = правка строки + коммит → self-update сам перезапустит демон штатным потоком.
+# Env сознательно НЕ читаем (детерминизм: застрявший .env / унаследованный os.environ не смеют
+# молча переключить модель — класс #194). SUGGEST_MODEL (клиентский suggest, sonnet) и
+# THINKER_MODEL (думатель, claude-opus-5) не задеты — у них свои явные --model. Полный id
+# обязателен: короткий алиас → HTTP 404 у claude -p (класс #194).
+EXECUTOR_MODEL = "claude-opus-5"
 
 
 def run_claude(prompt, timeout, cwd, env):
@@ -680,7 +681,7 @@ def run_claude(prompt, timeout, cwd, env):
         # перебить (класс rc-effort-override) — передаём явно из ТОГО ЖЕ источника правды
         # (settings.json через repo_thinking_settings, дефолт xhigh). МОДЕЛЬ ТОЖЕ ЯВНО
         # (24.07.2026, тема 328): --model EXECUTOR_MODEL — исполнитель на Opus, settings.json
-        # остаётся про интерактивные сессии (Fable). prompt держим ПОСЛЕДНИМ.
+        # остаётся про интерактивные сессии. prompt держим ПОСЛЕДНИМ.
         eff = task_metrics.norm_effort(repo_thinking_settings()[0])
         argv = [cbin, "-p", "--model", EXECUTOR_MODEL, "--effort", eff, prompt]
         p = subprocess.run(argv, cwd=cwd, capture_output=True,
@@ -2002,20 +2003,26 @@ def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=Non
 # (--allowed-tools '' + нейтральный cwd → без settings.json/pretool_guard), тема 829/инбокс 1160 нетронуты.
 STEP_SELFHEAL_TIMEOUT = int(os.getenv("PC_SELFHEAL_TIMEOUT", "180") or "180")   # думатель — короткий ответ
 # ФИКС-НАВСЕГДА класса «короткий алиас модели → claude -p HTTP 404 → exit=1» (родитель #194,
-# провал 205–208): живой демон мог УНАСЛЕДОВАТЬ короткий THINKER_MODEL=fable-5 /
-# THINKER_FALLBACK=opus-4.8 в os.environ (ancestor стартовал со старым .env; load_dotenv по
-# умолчанию override=False → унаследованное значение НЕ перезаписывается полным id из .env).
-# claude -p --model fable-5 → «model may not exist» 404 → exit=1 → планировщик/думатель молча
-# падает (fail-safe). Нормализуем короткий алиас → ПОЛНЫЙ id ЗДЕСЬ, на старте: иммунно к
-# застрявшему env, переживает наследование через _spawn_daemon и рестарты/перезагрузки ПК.
-_MODEL_ALIAS_FULL = {"fable-5": "claude-fable-5", "fable5": "claude-fable-5",
+# провал 205–208): живой демон мог УНАСЛЕДОВАТЬ короткий THINKER_MODEL / THINKER_FALLBACK=opus-4.8
+# в os.environ (ancestor стартовал со старым .env; load_dotenv по умолчанию override=False →
+# унаследованное значение НЕ перезаписывается полным id из .env). claude -p с коротким алиасом →
+# «model may not exist» 404 → exit=1 → планировщик/думатель молча падает (fail-safe). Нормализуем
+# короткий алиас → ПОЛНЫЙ id ЗДЕСЬ, на старте: иммунно к застрявшему env, переживает наследование
+# через _spawn_daemon и рестарты/перезагрузки ПК.
+# 30.07.2026, решение владельца «убрать снятую голову из работы»: ВСЕ её имена — и короткие, и
+# полное — ведут на claude-opus-5. Слева они живут ТОЛЬКО как ключи снятия: застрявшее в чьём-то
+# окружении старое значение развернётся в Opus 5, а не вернёт снятую модель чёрным ходом мимо
+# .env. Убрать ключи нельзя — тогда старое значение уйдёт в claude -p как есть и даст 404 (#194).
+_MODEL_ALIAS_FULL = {"fable-5": "claude-opus-5", "fable5": "claude-opus-5",
+                     "fable": "claude-opus-5", "claude-fable-5": "claude-opus-5",
                      "opus-4.8": "claude-opus-4-8", "opus-4-8": "claude-opus-4-8"}
 def _norm_model_id(m):
-    """Короткий алиас модели → ПОЛНЫЙ id (claude -p на коротком отвечает 404, #194). Неизвестное
-    значение возвращаем как есть — не ломаем валидные полные id, «sonnet» и будущие модели."""
+    """Короткий алиас модели → ПОЛНЫЙ id (claude -p на коротком отвечает 404, #194); имена снятой
+    головы → claude-opus-5. Неизвестное значение возвращаем как есть — не ломаем валидные полные
+    id, «sonnet» и будущие модели."""
     m = (m or "").strip()
     return _MODEL_ALIAS_FULL.get(m, m)
-THINKER_MODEL = _norm_model_id(os.getenv("THINKER_MODEL", "claude-fable-5")) or "claude-fable-5"  # своя голова думателя (НЕ SUGGEST_MODEL); нормализована в ПОЛНЫЙ id
+THINKER_MODEL = _norm_model_id(os.getenv("THINKER_MODEL", "claude-opus-5")) or "claude-opus-5"  # своя голова думателя (НЕ SUGGEST_MODEL); нормализована в ПОЛНЫЙ id
 THINKER_FALLBACK = _norm_model_id(os.getenv("THINKER_FALLBACK", "claude-opus-4-8"))               # свой фолбэк думателя; нормализован в ПОЛНЫЙ id
 # Маркер перерождения одиночной задачи стоит ПЕРВЫМ в тексте → якорь ^ (страховка от ложного
 # срабатывания на ТЗ, где маркер лишь упомянут в теле). N = id исходной задачи.
@@ -2133,7 +2140,7 @@ def repo_thinking_settings(path=None):
 
 
 def _thinker_exec(prompt, timeout, tag):
-    """Думатель = ПЕРЕИСПОЛЬЗОВАННЫЙ кондуктор Fable5→fallback (--fallback-model одним вызовом CLI),
+    """Думатель = ПЕРЕИСПОЛЬЗОВАННЫЙ кондуктор THINKER_MODEL→фолбэк (--fallback-model одним вызовом CLI),
     но ЧИСТЫЙ генератор: --max-turns 1 (один ответ, без инструментального цикла) + --allowed-tools ''
     + нейтральный cwd (tempdir, НЕ репо) → CLI не читает .claude/settings.json+pretool_guard и НИЧЕГО
     не исполняет (думатель красное не трогает). ANTHROPIC_API_KEY вычищен → подписка Max, не платный
@@ -4509,7 +4516,7 @@ REVIZOR_CHECKLIST_DEFAULT = (
 # статичная РОЛЬ (_PREFIX) + ЖИВОЙ чек-лист классов (_revizor_checklist) + статичный КОНТРАКТ ВЫВОДА
 # (_SUFFIX). Тот же _thinker_exec-паттерн, что и самопочинка (read-only, --max-turns 1, --allowed-tools
 # '', нейтральный cwd → НИЧЕГО не исполняет, файлы не читает — судит строго по данным пакета). Модель
-# THINKER_MODEL=claude-fable-5, фолбэк claude-opus-4-8, таймаут REVIZOR_TIMEOUT=300с. Задача —
+# THINKER_MODEL=claude-opus-5, фолбэк claude-opus-4-8, таймаут REVIZOR_TIMEOUT=300с. Задача —
 # ПОСТ-ФАКТУМ аудит одного клиентского окна (реплики клиента + наши отправленные + черновики) по
 # чек-листу дефектов ответа. Выход — СТРОГО JSON-массив находок (пустой [] = нарушений нет); каждая
 # находка маршрутизируется позднейшими шагами 262 по полю action. Думатель ничего не чинит сам.

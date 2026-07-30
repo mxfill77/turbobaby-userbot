@@ -419,7 +419,7 @@ def _parse_lesson_class_json(text):
 
 
 def _default_lesson_thinker(prompt):
-    """Боевой думатель классификатора = pc_orchestrator._thinker_exec (тот же кондуктор Fable5→fallback,
+    """Боевой думатель классификатора = pc_orchestrator._thinker_exec (тот же кондуктор THINKER_MODEL→фолбэк,
     read-only, ничего не исполняет). Ленивый импорт: тяжёлый pc_orchestrator тянем ТОЛЬКО на реальном
     вызове (и разрываем цикл импорта — pc_orchestrator сам импортит lesson_router). Сбой → None."""
     import pc_orchestrator

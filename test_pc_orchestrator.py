@@ -326,10 +326,11 @@ class TestEncoding(Base):
         self.assertIn("кириллица жива", out)
 
     def test_run_claude_passes_executor_model_and_effort(self):
-        # ГОЛДЕН исполнителя (тема 328, 24.07.2026): модель и усилие в argv ЯВНО — Opus 4.8 /
-        # xhigh, ПОЛНЫЙ id (короткий алиас → HTTP 404, класс #194). Без --model claude -p молча
-        # брал model из .claude/settings.json (claude-fable-5 — дефолт интерактивных сессий),
-        # а env-ручки ORCH_MODEL/EXECUTOR_MODEL (имена VPS-полосы) на ПК не читаются вовсе.
+        # ГОЛДЕН исполнителя (тема 328, 24.07.2026; 30.07.2026 переведён на Opus 5): модель и
+        # усилие в argv ЯВНО — claude-opus-5 / xhigh, ПОЛНЫЙ id (короткий алиас → HTTP 404,
+        # класс #194). Без --model claude -p молча брал model из .claude/settings.json (дефолт
+        # интерактивных сессий), а env-ручки ORCH_MODEL/EXECUTOR_MODEL (имена VPS-полосы) на ПК
+        # не читаются вовсе.
         captured = {}
 
         class _P:
@@ -345,8 +346,8 @@ class TestEncoding(Base):
                 mock.patch.object(o, "resolve_claude", lambda: r"C:\x\claude.exe"):
             o.run_claude("p", 10, o.REPO, {"X": "1"})
         argv = captured["argv"]
-        self.assertEqual(o.EXECUTOR_MODEL, "claude-opus-4-8")               # решение владельца 24.07
-        self.assertEqual(argv[argv.index("--model") + 1], "claude-opus-4-8")
+        self.assertEqual(o.EXECUTOR_MODEL, "claude-opus-5")                 # решение владельца 30.07
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-opus-5")
         self.assertEqual(argv[argv.index("--effort") + 1], "xhigh")
         self.assertEqual(argv[-1], "p")                                     # prompt строго последним
 
@@ -1646,13 +1647,13 @@ class TestTaskSelfheal(Base):
             return _P()
 
         with mock.patch.object(o, "resolve_claude", lambda: sys.executable), \
-                mock.patch.object(o, "THINKER_MODEL", "fable-5"), \
-                mock.patch.object(o, "THINKER_FALLBACK", "opus-4.8"), \
+                mock.patch.object(o, "THINKER_MODEL", "model-main-X"), \
+                mock.patch.object(o, "THINKER_FALLBACK", "model-fb-Y"), \
                 mock.patch.object(o.subprocess, "run", fake_run):
             o._thinker_exec("prompt", 5, "t")
         cmd = captured["cmd"]
-        self.assertEqual(cmd[cmd.index("--model") + 1], "fable-5")            # своя голова
-        self.assertEqual(cmd[cmd.index("--fallback-model") + 1], "opus-4.8")  # свой фолбэк
+        self.assertEqual(cmd[cmd.index("--model") + 1], "model-main-X")       # своя голова
+        self.assertEqual(cmd[cmd.index("--fallback-model") + 1], "model-fb-Y")  # свой фолбэк
         self.assertNotIn("sonnet", cmd)                                       # НЕ SUGGEST_MODEL
 
     def test_thinker_model_defaults_and_no_suggest_coupling(self):
@@ -1661,7 +1662,7 @@ class TestTaskSelfheal(Base):
         # THINKER_MODEL/FALLBACK): гейт self-update наследует env демона, где до рестарта лежит
         # ПРЕЖНИЙ короткий алиас — само это наследование не должно ронять тест (иначе дедлок:
         # гейт не проходит → демон не перечитает .env → в env вечно старый алиас). ПОЛНЫЙ id
-        # обязателен: короткий «fable-5»/«opus-4.8» → claude -p отвечает 404 (родитель #194).
+        # обязателен: любой короткий алиас → claude -p отвечает 404 (родитель #194).
         self.assertFalse(hasattr(o, "THINKER_MODEL_FALLBACK"))               # переименовано → THINKER_FALLBACK
         import subprocess
         env = {k: v for k, v in os.environ.items()
@@ -1677,16 +1678,18 @@ class TestTaskSelfheal(Base):
         diag = (p.stdout or "") + (p.stderr or "")
         self.assertTrue(vals.get("T", "").startswith("claude-"), diag)       # ПОЛНЫЙ id, не короткий алиас
         self.assertTrue(vals.get("F", "").startswith("claude-"), diag)
-        self.assertNotIn(vals.get("T"), ("fable-5", "opus-4.8"))             # не битый алиас #194
+        self.assertNotIn(vals.get("T"), o._MODEL_ALIAS_FULL, diag)           # уже нормализован, не ключ-алиас #194
         self.assertNotEqual(vals.get("T"), vals.get("S"))                    # НЕ завязан на SUGGEST_MODEL
 
     def test_thinker_model_normalizes_stale_short_alias_in_env(self):
         # ГОЛДЕН реального провала 205–208 (не идеализированный clean-env, а ГРЯЗНЫЙ env как у живого
-        # демона): демон УНАСЛЕДОВАЛ короткий THINKER_MODEL=fable-5 / THINKER_FALLBACK=opus-4.8 в
+        # демона): демон УНАСЛЕДОВАЛ короткий THINKER_MODEL / THINKER_FALLBACK=opus-4.8 в
         # os.environ (ancestor стартовал со старым .env; load_dotenv override=False не перезаписал) →
-        # claude -p --model fable-5 → HTTP 404 «model may not exist» → exit=1 → планировщик молча
+        # claude -p с коротким алиасом → HTTP 404 «model may not exist» → exit=1 → планировщик молча
         # падал. Модуль ОБЯЗАН нормализовать короткий алиас → ПОЛНЫЙ id НА СТАРТЕ, иммунно к
         # застрявшему env (иначе self-update не лечит: новый демон наследует тот же короткий env).
+        # 30.07.2026: имена снятой головы ведут на claude-opus-5 — застрявшее окружение НЕ вернёт
+        # её чёрным ходом мимо .env (решение владельца «убрать снятую голову из работы»).
         import subprocess
         env = dict(os.environ)
         env["THINKER_MODEL"] = "fable-5"      # ровно то, что PEB показал в живом PID 1120
@@ -1699,12 +1702,13 @@ class TestTaskSelfheal(Base):
         vals = {ln[0]: ln[2:] for ln in p.stdout.splitlines()
                 if len(ln) > 2 and ln[1] == "=" and ln[0] in "TF"}
         diag = (p.stdout or "") + (p.stderr or "")
-        self.assertEqual(vals.get("T"), "claude-fable-5", diag)              # короткий env → ПОЛНЫЙ id
+        self.assertEqual(vals.get("T"), "claude-opus-5", diag)               # короткий env → ПОЛНЫЙ id снятия
         self.assertEqual(vals.get("F"), "claude-opus-4-8", diag)             # короткий env → ПОЛНЫЙ id
         # направления нормализации (unit)
-        self.assertEqual(o._norm_model_id("fable-5"), "claude-fable-5")
+        self.assertEqual(o._norm_model_id("fable-5"), "claude-opus-5")           # снятая голова → Opus 5
+        self.assertEqual(o._norm_model_id("claude-fable-5"), "claude-opus-5")    # и ПОЛНОЕ имя снятой — тоже
         self.assertEqual(o._norm_model_id("opus-4.8"), "claude-opus-4-8")
-        self.assertEqual(o._norm_model_id("claude-fable-5"), "claude-fable-5")   # полный id — как есть
+        self.assertEqual(o._norm_model_id("claude-opus-5"), "claude-opus-5")     # полный id — как есть
         self.assertEqual(o._norm_model_id("sonnet"), "sonnet")                   # неизвестный алиас — как есть
 
 
@@ -6130,7 +6134,7 @@ class TestMetricsLine(unittest.TestCase):
 
     def test_format_exact(self):
         line = o.task_metrics.metrics_line(
-            task=42, lane="pc", model="claude-fable-5", effort="xhigh",
+            task=42, lane="pc", model="claude-opus-5", effort="xhigh",
             start_iso="2026-07-24T14:00:00+00:00", end_iso="2026-07-24T14:00:37+00:00",
             dur_s=37.4, outcome="done", attempts=2, selfheals=1,
             tokens_in=None, tokens_out=None,
@@ -6139,7 +6143,7 @@ class TestMetricsLine(unittest.TestCase):
         self.assertEqual(
             line,
             "METRICS task=42 lane=pc type=code mode=prod src=pc_orchestrator.py "
-            "model=claude-fable-5 effort=xhigh "
+            "model=claude-opus-5 effort=xhigh "
             "start=2026-07-24T14:00:00+00:00 end=2026-07-24T14:00:37+00:00 dur_s=37.40 "
             "outcome=done attempts=2 selfheals=1 tokens_in=na tokens_out=na")
 
@@ -6225,7 +6229,7 @@ class TestMetricsLine(unittest.TestCase):
         self.assertEqual(
             o.task_metrics.extract_tokens({"usage": {"input_tokens": 12, "output_tokens": 3}}), (12, 3))
         self.assertEqual(
-            o.task_metrics.extract_tokens({"modelUsage": {"claude-fable-5": {"inputTokens": 5, "outputTokens": 7}}}),
+            o.task_metrics.extract_tokens({"modelUsage": {"claude-opus-5": {"inputTokens": 5, "outputTokens": 7}}}),
             (5, 7))
         self.assertEqual(o.task_metrics.extract_tokens("not-json"), (None, None))
         self.assertEqual(o.task_metrics.extract_tokens({}), (None, None))
@@ -6264,7 +6268,7 @@ class TestMetricsLine(unittest.TestCase):
         metrics = [s for s in seen if isinstance(s, str) and s.startswith("METRICS ")]
         self.assertTrue(metrics, "run_task обязан писать строку METRICS в лог")
         self.assertIn("task=77 lane=pc", metrics[-1])
-        self.assertIn("model=claude-opus-4-8", metrics[-1])   # METRICS показывает модель ИЗ КОМАНДЫ (EXECUTOR_MODEL), не settings.json
+        self.assertIn("model=claude-opus-5", metrics[-1])   # METRICS показывает модель ИЗ КОМАНДЫ (EXECUTOR_MODEL), не settings.json
         self.assertIn("effort=xhigh", metrics[-1])
         self.assertIn("outcome=done attempts=2", metrics[-1])
         self.assertIn("tokens_in=na tokens_out=na", metrics[-1])
