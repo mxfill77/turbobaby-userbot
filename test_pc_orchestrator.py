@@ -28,6 +28,11 @@ def iso_ago(sec):
     return (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=sec)).isoformat()
 
 
+def iso_dt(sec):
+    """То же, но объектом datetime: окно следов работы считается по datetime, а не по строке."""
+    return datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=sec)
+
+
 class FakeBridge:
     def __init__(self):
         self.tasks = {}
@@ -92,6 +97,18 @@ class Base(unittest.TestCase):
         self._save_af = o.AUTOFETCH_STATE_FILE    # признак состояния авто-фетча: свежий на КАЖДЫЙ тест
         o.AUTOFETCH_STATE_FILE = os.path.join(tempfile.mkdtemp(), "autofetch.json")  # (prev=None → чистый лист)
         self.addCleanup(lambda: setattr(o, "AUTOFETCH_STATE_FILE", self._save_af))
+        # СЛЕДЫ РАБОТЫ (класс 30.07 «статус врёт»): по умолчанию следов НЕТ и отметки claim пишем
+        # во временный файл. Иначе сбор улик пошёл бы в ЖИВОЙ git репозитория — окна тестов строятся
+        # от «сейчас», и вердикт зависел бы от того, коммитил ли кто-то в последний час (тот же
+        # класс, что боевой state-файл в тестах). Сам сбор проверяет TestFailReasonEvidence.
+        self._save_ev = (o._work_evidence, o.TASK_START_FILE, o.COWORK_LEDGER)
+        o._work_evidence = lambda since, until=None: {"commits": [], "journal": []}
+        _tmp_marks = tempfile.mkdtemp()
+        o.TASK_START_FILE = os.path.join(_tmp_marks, "task_started.json")
+        o.COWORK_LEDGER = os.path.join(_tmp_marks, "cowork_log.ledger")
+        self.addCleanup(lambda: (setattr(o, "_work_evidence", self._save_ev[0]),
+                                 setattr(o, "TASK_START_FILE", self._save_ev[1]),
+                                 setattr(o, "COWORK_LEDGER", self._save_ev[2])))
         # ЗАПРЕТ грязного дерева (класс 28.07): в тестах дерево по умолчанию ЧИСТОЕ — живой git не
         # дёргаем и не зависим от состояния рабочей копии. Сам запрет проверяет
         # TestDirtyTreeBlocksRestart, подменяя это же место своим списком.
@@ -2957,6 +2974,182 @@ class TestStuckSingles(Base):
         with mock.patch.object(o, "_write_heartbeat", lambda: None):
             o.poll_once()
         self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+
+
+class TestFailReasonEvidence(Base):
+    """Класс 30.07.2026 «статус врёт»: причина провала называется КОДОМ, а выполненная работа —
+    словами. Живой повод (замер tmp/measure_status_truth.py за двое суток): из 6 разобранных
+    провалов ПК-полосы ТРИ несли за собой коммит или запись в журнал — 54 (c00bb08+88eec9e и
+    4 записи, потом таймаут подтверждения), 55 (a8f8822), 48 (артефакт+ASK); плюс 61 (коммит
+    a3f75dd) с провалом от ЧУЖОЙ полосы. Голдены ниже — дословные причины этих провалов."""
+
+    EV_COMMIT = {"commits": [("a3f75dd", "гард: чтение окружения живого процесса (PEB)")], "journal": []}
+    EV_JOURNAL = {"commits": [], "journal": ["DONE RC 2026-07-30 20:15: гард PEB закрыт"]}
+
+    def _ev(self, ev):
+        return mock.patch.object(o, "_work_evidence", lambda since, until=None: ev)
+
+    # --- словарь причин -------------------------------------------------------
+    def test_four_named_reasons_are_four_distinct_codes(self):
+        # ровно то, что просил владелец: «сейчас всё сваливается в одно слово»
+        codes = {o.FAIL_APPROVAL_TIMEOUT, o.FAIL_HEARTBEAT_TIMEOUT,
+                 o.FAIL_MODEL_REFUSAL, o.FAIL_EXEC_ERROR}
+        self.assertEqual(len(codes), 4)
+        for c in codes | {o.FAIL_RUN_TIMEOUT}:
+            self.assertIn(c, o.FAIL_REASONS)
+            self.assertTrue(o.FAIL_REASONS[c][0].strip(), c)     # у каждого кода есть имя словами
+
+    def test_marks_stay_first_char(self):
+        # ⏱/✋ первым символом — на них смотрят гейты самопочинки и надзора цепей
+        for code in (o.FAIL_APPROVAL_TIMEOUT, o.FAIL_HEARTBEAT_TIMEOUT, o.FAIL_RUN_TIMEOUT):
+            self.assertTrue(o.fail_result(code, "боль").startswith(o.TIMEOUT_MARK), code)
+        self.assertTrue(o.fail_result(o.FAIL_MODEL_REFUSAL, "боль").startswith(o.MANUAL_MARK))
+        self.assertFalse(o.fail_result(o.FAIL_EXEC_ERROR, "боль").startswith(o.TIMEOUT_MARK))
+
+    def test_reason_code_is_greppable(self):
+        r = o.fail_result(o.FAIL_APPROVAL_TIMEOUT, "боль")
+        self.assertEqual(o.FAIL_CODE_RE.search(r).group(1), o.FAIL_APPROVAL_TIMEOUT)
+        self.assertIn("таймаут подтверждения", r)
+
+    # --- следы работы ---------------------------------------------------------
+    def test_commit_in_window_names_work_done(self):
+        with self._ev(self.EV_COMMIT):
+            r = o.fail_result(o.FAIL_HEARTBEAT_TIMEOUT, "сердце молчит", since=iso_dt(600))
+        self.assertIn(o.WORK_DONE_MARK, r)
+        self.assertIn("a3f75dd", r)                    # улику НАЗЫВАЕМ, а не «работа была»
+        self.assertIn("переделывать с нуля НЕ надо", r)
+        self.assertIn("heartbeat_timeout", r)          # причина не растворилась в улике
+
+    def test_journal_only_evidence_also_counts(self):
+        # задача 61 записала журнал — этого достаточно, коммит не обязателен
+        with self._ev(self.EV_JOURNAL):
+            r = o.fail_result(o.FAIL_APPROVAL_TIMEOUT, "нет «да»", since=iso_dt(600))
+        self.assertIn(o.WORK_DONE_MARK, r)
+        self.assertIn("записей журнала 1", r)
+
+    def test_no_evidence_says_so_explicitly(self):
+        with self._ev({"commits": [], "journal": []}):
+            r = o.fail_result(o.FAIL_EXEC_ERROR, "claude exit=1", since=iso_dt(600))
+        self.assertNotIn(o.WORK_DONE_MARK, r)
+        self.assertIn("Следов работы в окне", r)
+        self.assertIn("коммитов 0, записей журнала 0", r)
+        self.assertIn("claude exit=1", r)              # прежний диагноз на месте
+
+    def test_unknown_window_is_named_not_guessed(self):
+        # нет отметки claim → честно «окно неизвестно», следы НЕ собираем (иначе приписали бы чужое)
+        def boom(*a, **k):
+            raise AssertionError("следы не должны собираться без окна")
+        with mock.patch.object(o, "_work_evidence", boom):
+            r = o.fail_result(o.FAIL_APPROVAL_TIMEOUT, "нет «да»", since=None)
+        self.assertIn("Окно работы неизвестно", r)
+        self.assertNotIn(o.WORK_DONE_MARK, r)
+
+    def test_evidence_failure_never_breaks_closing(self):
+        # сбор улик упал → итог беднее, но строка есть и причина названа (путь провала fail-safe)
+        with mock.patch.object(o, "_git_out", mock.Mock(side_effect=RuntimeError("git умер"))):
+            with mock.patch.object(o, "COWORK_LEDGER", os.path.join(tempfile.mkdtemp(), "нет.ledger")):
+                r = o.fail_result(o.FAIL_RUN_TIMEOUT, "таймаут 2700s", since=iso_dt(600))
+        self.assertIn("run_timeout", r)
+        self.assertIn("таймаут 2700s", r)
+
+    # --- отметка старта (restart-proof окно) ---------------------------------
+    def test_start_mark_survives_process_change(self):
+        # закрывает задачу часто ДРУГОЙ процесс демона — отметка живёт на диске, а не в памяти
+        t0 = iso_dt(1200)
+        o._task_started_mark(7, now=t0)
+        got = o._task_started_get(7)
+        self.assertIsNotNone(got)
+        self.assertLess(abs((got - t0).total_seconds()), 2)
+
+    def test_start_mark_not_overwritten(self):
+        # у одобренной задачи работа шла в ПЕРВОМ прогоне — вторая отметка окно бы обрезала
+        first = iso_dt(3000)
+        o._task_started_mark(8, now=first)
+        o._task_started_mark(8, now=iso_dt(10))
+        self.assertLess(abs((o._task_started_get(8) - first).total_seconds()), 2)
+
+    def test_start_mark_capped(self):
+        for i in range(o.TASK_START_KEEP + 25):
+            o._task_started_mark(1000 + i, now=iso_dt(o.TASK_START_KEEP + 25 - i))
+        self.assertLessEqual(len(o._task_started_read()), o.TASK_START_KEEP)
+
+    def test_missing_mark_is_none_not_crash(self):
+        self.assertIsNone(o._task_started_get(999999))
+
+    def test_claim_writes_start_mark(self):
+        tid = self.fb.add(status="new")
+        self._claude(0, "ок\nRESULT: ок")
+        o.process_new()
+        self.assertIsNotNone(o._task_started_get(tid))   # окно есть с первой секунды задачи
+
+    # --- сбор улик из живых источников ---------------------------------------
+    def test_git_commits_parsed(self):
+        out = "a3f75dd\x1fгард PEB\nfa54ce7\x1fгард sqlite"
+        with mock.patch.object(o, "_git_out", lambda args: out):
+            rows = o._git_commits_between(iso_dt(600), iso_dt(0))
+        self.assertEqual(rows, [("a3f75dd", "гард PEB"), ("fa54ce7", "гард sqlite")])
+
+    def test_journal_ledger_window_respected(self):
+        path = os.path.join(tempfile.mkdtemp(), "cowork_log.ledger")
+        with open(path, "w", encoding="utf-8") as f:
+            for age, line in ((5000, "старая"), (600, "в окне"), (0, "свежая")):
+                f.write(json.dumps({"ts": iso_dt(age).isoformat(), "line": line},
+                                   ensure_ascii=False) + "\n")
+        rows = o._journal_writes_between(iso_dt(1200), iso_dt(300), path=path)
+        self.assertEqual(rows, ["в окне"])
+
+    def test_journal_ledger_missing_is_empty(self):
+        self.assertEqual(o._journal_writes_between(iso_dt(600), iso_dt(0),
+                                                   path=os.path.join(tempfile.mkdtemp(), "нет")), [])
+
+    # --- сквозные: четыре причины на четырёх боевых путях ---------------------
+    def test_approval_timeout_end_to_end(self):
+        # ЖИВОЙ случай задачи 54: работа сделана, коммит есть, а закрытие сорвал таймаут «да»
+        tid = self.fb.add(status="needs_approval", updated=iso_ago(4000))
+        o._task_started_mark(tid, now=iso_dt(4200))
+        with self._ev(self.EV_COMMIT):
+            o.process_approval_timeouts()
+        r = self.fb.tasks[tid]["result"]
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertIn("причина=approval_timeout", r)
+        self.assertIn(o.WORK_DONE_MARK, r)
+        self.assertIn("30 мин", r)                       # прежний диагноз владельцу цел
+
+    def test_stuck_single_reason_is_heartbeat(self):
+        tid = self.fb.add(status="in_progress", updated=iso_ago(o.PC_SINGLE_STALE + 120))
+        with self._ev(self.EV_JOURNAL):
+            o.process_stuck_singles()
+        r = self.fb.tasks[tid]["result"]
+        self.assertIn("причина=heartbeat_timeout", r)
+        self.assertIn("ПК-таймаут", r)                   # прежний признак реапера цел
+        self.assertIn(o.WORK_DONE_MARK, r)
+
+    def test_run_timeout_reason(self):
+        tid = self.fb.add(status="new")
+        self._claude(raise_timeout=True)
+        o.process_new()
+        self.assertIn("причина=run_timeout", self.fb.tasks[tid]["result"])
+
+    def test_exec_error_reason(self):
+        tid = self.fb.add(status="new")
+        self._claude(1, "", "API Error: 529 Overloaded")
+        o.process_new()
+        r = self.fb.tasks[tid]["result"]
+        self.assertIn("причина=exec_error", r)
+        self.assertIn("claude exit=1", r)
+
+    def test_selfheal_gate_untouched_by_new_text(self):
+        # ⏱-гейт: думатель по-прежнему НЕ чинит таймауты — даже когда итог рассказал о работе
+        o._selfheal_on = lambda: True
+        with self._ev(self.EV_COMMIT):
+            txt = o.fail_result(o.FAIL_RUN_TIMEOUT, "таймаут 2700s", since=iso_dt(600))
+        self.assertFalse(o._maybe_selfheal(9, "обычная задача", txt, frm="Filipp-pc"))
+
+    def test_human_headline_stops_lying(self):
+        with self._ev(self.EV_COMMIT):
+            txt = o.fail_result(o.FAIL_HEARTBEAT_TIMEOUT, "сердце молчит", since=iso_dt(600))
+        self.assertIn("работа выполнена", o._human("failed", 61, txt))
+        self.assertIn("провалена", o._human("failed", 61, "пустой вывод claude"))
 
 
 class TestLocalDec(Base):

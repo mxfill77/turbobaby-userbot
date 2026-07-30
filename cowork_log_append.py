@@ -119,6 +119,38 @@ def spool_clear(path=None):
         pass
 
 
+# ───────────── РЕЕСТР УСПЕШНЫХ ЗАПИСЕЙ (класс 30.07.2026: «статус врёт») ─────────────
+# Спул выше хранит ПРОВАЛИВШИЕСЯ строки. Обратной половины не было вовсе: у ПК не оставалось
+# НИКАКОГО местного следа, что запись в журнал прошла. Из-за этого демон, закрывая задачу по
+# таймауту, не мог отличить «работала и записала» от «молчала» — и писал владельцу «провалена»
+# там, где работа была сделана (живой случай: задача 61 — коммит a3f75dd и записи в журнал).
+# Реестр закрывает именно эту дыру: одна строка JSON на каждую УСПЕШНО ушедшую запись.
+LEDGER_PATH = os.path.join(HERE, "cowork_log.ledger")
+LEDGER_KEEP = 500          # кап: окно следов у демона — часы, а не месяцы
+LEDGER_LINE_MAX = 300      # в реестре нужен опознавательный кусок, а не весь текст записи
+
+
+def ledger_add(line, ts=None, path=None, keep=LEDGER_KEEP):
+    """Отметить УСПЕШНО ушедшую строку журнала в локальном реестре. → путь реестра | None.
+    FAIL-SAFE: любой сбой реестра проглатывается — он вспомогательный, а сама запись в мозг
+    к этому моменту УЖЕ состоялась, и рушить её отчёт из-за журнала следов нельзя."""
+    p = path or LEDGER_PATH
+    try:
+        rec = {"ts": (ts or datetime.datetime.now(datetime.timezone.utc)).isoformat(),
+               "line": " ".join(str(line or "").split())[:LEDGER_LINE_MAX]}
+        old = []
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                old = [x.rstrip("\n") for x in f if x.strip()]
+        except FileNotFoundError:
+            pass
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("\n".join((old + [json.dumps(rec, ensure_ascii=False)])[-keep:]) + "\n")
+        return p
+    except Exception:
+        return None
+
+
 # ─────────────────── КОНТРАКТ СТРОКИ ЖУРНАЛА (28.07.2026) ───────────────────
 # «<ТИП> <ГГГГ-ММ-ДД ЧЧ:ММ UTC>: <текст>» — ОДНА запись = ОДНА строка.
 #
@@ -221,6 +253,8 @@ def main():
         if not (isinstance(w, dict) and w.get("ok")):
             raise RuntimeError("write_doc не ok: " + json.dumps(w, ensure_ascii=False)[:300])
         spool_clear()
+        for done_line in [new_line] + list(pending):   # реестр следов: и новая, и досланные
+            ledger_add(done_line)
         extra = f" | досланы отложенные: {len(pending)}" if pending else ""
         # w["chars"] — это text.length НА СТОРОНЕ МОСТА, то есть UTF-16 code units: каждый эмодзи
         # вне BMP (📦 🔴 …) считается ЗА ДВА. Python len() того же текста будет МЕНЬШЕ. Живой замер

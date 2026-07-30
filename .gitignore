@@ -55,6 +55,9 @@ pc_orchestrator.heartbeat
 trainer_log.spool
 # спул недоставленных строк-итогов в cowork_log (runtime, дошлётся следующим успешным вызовом)
 cowork_log.spool
+# реестр УСПЕШНО ушедших строк журнала (runtime: местный след «журнал записан» — по нему демон
+# отличает «работала и записала» от «молчала», закрывая задачу по таймауту)
+cowork_log.ledger
 pc_ask_*.marker
 trainer_rules.json
 tmp/

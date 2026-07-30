@@ -488,6 +488,188 @@ def _age_sec(updated_iso, now=None):
         return None
 
 
+# ───── ЧЕСТНЫЙ ИТОГ ПРОВАЛА: «не закрыта» ≠ «ничего не сделано» (класс 30.07.2026) ──────────────
+# ЗАМЕР за двое суток (tmp/measure_status_truth.py, окно 28.07 13:55 → 30.07 13:55 UTC): из ШЕСТИ
+# разобранных провалов ПК-полосы ТРИ несли за собой реальную работу — задача 54 (коммиты c00bb08 и
+# 88eec9e плюс четыре записи в журнал, и только потом 30-минутный таймаут подтверждения), задача 55
+# (коммит a8f8822), задача 48 (артефакт + ASK владельцу). Плюс задача 61: коммит a3f75dd и записи в
+# журнал есть, а терминальной строки на ПК НЕТ ВОВСЕ — статус ей поставила чужая полоса. Владелец и
+# планировщик читают «failed» как «работа не сделана» и строят следующий шаг на неверной строке; за
+# сутки так вышло дважды.
+#
+# Два правила блока:
+#   1) ПРИЧИНА называется КОДОМ, а не одним словом «failed». Таймаут подтверждения (ждали человека),
+#      таймаут сердцебиения (процесс умер / ПК уснул), таймаут прогона (claude не уложился), отказ
+#      модели (снова красное после «да») и ошибка выполнения — это РАЗНЫЕ следующие шаги: одно
+#      повторить как есть, другое переформулировать, третье чинить руками.
+#   2) Есть КОММИТ или ЗАПИСЬ В ЖУРНАЛ внутри окна задачи → итог обязан это НАЗВАТЬ: работа
+#      выполнена, не состоялось формальное закрытие. Иначе владелец переделывает уже сделанное.
+# Маркер (⏱/✋) остаётся ПЕРВЫМ символом строки: на него смотрят гейт самопочинки (_maybe_selfheal)
+# и гейт надзора цепей (_loc_after_fail) — их поведение эта правка НЕ меняет.
+FAIL_APPROVAL_TIMEOUT = "approval_timeout"     # ждали «да» владельца и не дождались
+FAIL_HEARTBEAT_TIMEOUT = "heartbeat_timeout"   # задача перестала подавать признаки жизни (орфан)
+FAIL_RUN_TIMEOUT = "run_timeout"               # headless не уложился в TASK_TIMEOUT
+FAIL_MODEL_REFUSAL = "model_refusal"           # модель/гард снова объявили красное после одобрения
+FAIL_EXEC_ERROR = "exec_error"                 # сбой исполнения: код возврата, пустой вывод, бюджет
+
+FAIL_REASONS = {                               # код → (человеческое имя, маркер ПЕРВЫМ символом)
+    FAIL_APPROVAL_TIMEOUT: ("таймаут подтверждения", TIMEOUT_MARK),
+    FAIL_HEARTBEAT_TIMEOUT: ("таймаут сердцебиения", TIMEOUT_MARK),
+    FAIL_RUN_TIMEOUT: ("таймаут прогона", TIMEOUT_MARK),
+    FAIL_MODEL_REFUSAL: ("отказ модели", MANUAL_MARK),
+    FAIL_EXEC_ERROR: ("ошибка выполнения", ""),
+}
+WORK_DONE_MARK = "РАБОТА ВЫПОЛНЕНА"   # ищется и глазами владельца, и грепом по журналу
+FAIL_CODE_RE = re.compile(r"причина=([a-z_]+)")   # разбор кода из готовой строки итога
+
+# Отметка момента CLAIM — НА ДИСКЕ. Задачу часто закрывает УЖЕ ДРУГОЙ процесс демона (само-
+# обновление, падение, реапер орфанов), и окно работы из памяти не восстановить: ровно так задача
+# 61 осталась без окна вовсе. Файл маленький и с капом — это не состояние, а метки времени.
+TASK_START_FILE = os.path.join(REPO, "pc_orchestrator.task_started.json")
+TASK_START_KEEP = 200
+# Локальный реестр УСПЕШНЫХ записей в журнал (пишет cowork_log_append). Спул хранит ПРОВАЛЬНЫЕ
+# строки, реестр — прошедшие: другого местного следа «журнал записан» у демона нет, а именно он
+# отличает «задача 61 работала» от «задача 61 молчала».
+COWORK_LEDGER = os.path.join(REPO, "cowork_log.ledger")
+EVIDENCE_MAX_COMMITS = 5      # в итог кладём первые N — остальные видны числом
+EVIDENCE_MAX_JOURNAL = 3
+
+
+def _task_started_read(path=None):
+    try:
+        with open(path or TASK_START_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _task_started_mark(tid, now=None, path=None):
+    """Отметить момент CLAIM задачи на диске. → ISO отметки. ПЕРВАЯ отметка не перезаписывается:
+    у одобренной задачи работа шла в ПЕРВОМ прогоне, а approve только вернул её в очередь."""
+    st = _task_started_read(path)
+    key = str(tid)
+    if key in st:
+        return st[key]
+    st[key] = (now or datetime.datetime.now(datetime.timezone.utc)).isoformat()
+    if len(st) > TASK_START_KEEP:        # кап: отметки давно закрытых задач никому не нужны
+        for k in sorted(st, key=lambda x: str(st[x]))[:len(st) - TASK_START_KEEP]:
+            st.pop(k, None)
+    try:
+        with open(path or TASK_START_FILE, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False)
+    except Exception as e:               # отметка — удобство, а не условие работы демона
+        log.warning("отметка старта задачи %s не записана (%s) — окно работы будет неизвестно", tid, e)
+    return st[key]
+
+
+def _task_started_get(tid, path=None):
+    """datetime старта задачи | None. None = окно неизвестно, и итог так и скажет (не соврёт)."""
+    raw = _task_started_read(path).get(str(tid))
+    if not raw:
+        return None
+    try:
+        t = datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)
+    except Exception:
+        return None
+
+
+def _git_commits_between(since, until):
+    """Коммиты репо в окне → [(хеш, заголовок)]. Границы отдаём git'у в UTC с явной зоной."""
+    fmt = "%Y-%m-%dT%H:%M:%S%z"
+    out = _git_out(["log", "--no-merges",
+                    "--since=" + since.astimezone(datetime.timezone.utc).strftime(fmt),
+                    "--until=" + until.astimezone(datetime.timezone.utc).strftime(fmt),
+                    "--pretty=%h\x1f%s"])
+    rows = []
+    for line in (out or "").splitlines():
+        parts = line.split("\x1f")
+        if len(parts) == 2 and parts[0].strip():
+            rows.append((parts[0].strip(), parts[1].strip()))
+    return rows
+
+
+def _journal_writes_between(since, until, path=None):
+    """Записи, РЕАЛЬНО ушедшие в журнал в окне → [строка]. Источник — реестр cowork_log.ledger."""
+    rows = []
+    try:
+        with open(path or COWORK_LEDGER, encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                    t = datetime.datetime.fromisoformat(str(rec.get("ts") or "").replace("Z", "+00:00"))
+                except Exception:
+                    continue          # битая строка реестра не должна прятать остальные
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=datetime.timezone.utc)
+                if since <= t <= until:
+                    rows.append(str(rec.get("line") or ""))
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log.warning("реестр записей журнала не прочитан (%s) — следы работы будут неполны", e)
+    return rows
+
+
+def _work_evidence(since, until=None):
+    """Следы РАБОТЫ в окне [since, until]: коммиты репо + записи журнала.
+    FAIL-SAFE по построению: любой сбой сбора = пустые следы. Это путь ПРОВАЛА задачи —
+    второй сбой здесь недопустим, закрытие обязано состояться в любом случае."""
+    until = until or datetime.datetime.now(datetime.timezone.utc)
+    try:
+        commits = _git_commits_between(since, until)
+    except Exception as e:               # noqa: BLE001 — сбор следов не роняет закрытие задачи
+        log.warning("следы: коммиты не собраны (%s)", e)
+        commits = []
+    try:
+        journal = _journal_writes_between(since, until)
+    except Exception as e:               # noqa: BLE001 — то же для реестра журнала
+        log.warning("следы: записи журнала не собраны (%s)", e)
+        journal = []
+    return {"commits": commits, "journal": journal, "since": since, "until": until}
+
+
+def fail_result(code, detail, since=None, now=None):
+    """Текст итога ПРОВАЛА: причина КОДОМ + следы работы, если она была.
+
+    Три формы, ровно по трём состояниям знания:
+      • окно известно, следы ЕСТЬ  → «НЕ ЗАКРЫТА, но РАБОТА ВЫПОЛНЕНА …» + перечень улик;
+      • окно известно, следов НЕТ  → «провал …» + прямое «следов в окне нет» (это тоже факт);
+      • окна нет (отметки claim не сохранилось) → так и говорим, следы НЕ проверялись.
+    Маркер причины идёт ПЕРВЫМ символом — гейты самопочинки/цепей смотрят именно на него."""
+    label, mark = FAIL_REASONS.get(code, ("причина не названа", ""))
+    lead = (mark + " ") if mark else ""
+    head = "[причина=%s · %s]" % (code, label)
+    if since is None:
+        log.warning("FAIL причина=%s окно=неизвестно (нет отметки claim)", code)
+        return ("%sпровал %s: %s. Окно работы неизвестно (отметки claim не сохранилось) — следы "
+                "работы НЕ проверялись." % (lead, head, detail))[:RESULT_MAX]
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    ev = _work_evidence(since, now)
+    commits, journal = list(ev.get("commits") or []), list(ev.get("journal") or [])
+    win = "%s–%s UTC" % (since.astimezone(datetime.timezone.utc).strftime("%d.%m %H:%M"),
+                         now.astimezone(datetime.timezone.utc).strftime("%H:%M"))
+    log.warning("FAIL причина=%s окно=%s следы: коммитов=%d, записей журнала=%d",
+                code, win, len(commits), len(journal))
+    if not commits and not journal:
+        return ("%sпровал %s: %s. Следов работы в окне %s нет (коммитов 0, записей журнала 0)."
+                % (lead, head, detail, win))[:RESULT_MAX]
+    parts = []
+    if commits:
+        parts.append("коммитов %d (%s)" % (len(commits), "; ".join(
+            "%s «%s»" % (h, s[:60]) for h, s in commits[:EVIDENCE_MAX_COMMITS])))
+    if journal:
+        parts.append("записей журнала %d (%s)" % (len(journal), "; ".join(
+            "«%s»" % _clip(x, 90) for x in journal[:EVIDENCE_MAX_JOURNAL])))
+    return ("%sНЕ ЗАКРЫТА, но %s %s: %s. СЛЕДЫ РАБОТЫ в окне %s: %s. Формальное закрытие не "
+            "состоялось — переделывать с нуля НЕ надо: проверь сделанное и закрой руками."
+            % (lead, WORK_DONE_MARK, head, detail, win, ", ".join(parts)))[:RESULT_MAX]
+
+
 def _detect_needs_approval(out, marker_content="", run_token=None):
     """Красная зона: файл-маркер гарда (headless-сигнал) ИЛИ маркер в stdout ИЛИ фолбэк-фразы.
     run_token задан → принимаем ТОЛЬКО карточки нашего запуска (строки '<token>\\x1f<текст>');
@@ -866,12 +1048,14 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=()):
                + ", ни в кандидатах (~/.local/bin, LOCALAPPDATA\\Programs, npm). "
                "Проверь установку/автообновление claude-code.")
         log.error("id=%s НЕ НАЙДЕН claude: %s", tid, msg)
-        return "failed", msg
+        return "failed", fail_result(FAIL_EXEC_ERROR, msg, since=_task_started_get(tid))
     ok_budget, budget_detail = _claude_budget_gate()   # бюджет процессов claude ПЕРЕД спавном (1520c68)
     if not ok_budget:
         log.error("id=%s бюджет claude исчерпан: %s — headless НЕ запущен", tid, budget_detail)
-        return "failed", (f"бюджет claude-процессов исчерпан ({budget_detail}) — headless не "
-                          "запущен; задача уйдёт обычным путём ретрая")
+        return "failed", fail_result(FAIL_EXEC_ERROR,
+                                     f"бюджет claude-процессов исчерпан ({budget_detail}) — headless "
+                                     "не запущен; задача уйдёт обычным путём ретрая",
+                                     since=_task_started_get(tid))
     run_token = f"{os.getpid()}-{int(time.time() * 1000)}-{tid}"   # контекст запуска: pid+ts+tid
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)          # headless идёт по ~/.claude (подписка), не платный API
@@ -903,11 +1087,13 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=()):
             rc, out, err = run_claude(prompt, TASK_TIMEOUT, REPO, env)
         except TimeoutError:
             log.warning("id=%s ТАЙМАУТ %ss → failed", tid, TASK_TIMEOUT)
-            return "failed", (f"{TIMEOUT_MARK} таймаут {TASK_TIMEOUT}s — headless прерван, "
-                              "задача не завершилась")
+            return "failed", fail_result(FAIL_RUN_TIMEOUT,
+                                         f"таймаут {TASK_TIMEOUT}s — headless прерван, задача не "
+                                         "завершилась", since=_task_started_get(tid))
         except Exception as e:
             log.error("id=%s ошибка запуска: %s", tid, e)
-            return "failed", f"ошибка запуска claude: {e}"
+            return "failed", fail_result(FAIL_EXEC_ERROR, f"ошибка запуска claude: {e}",
+                                         since=_task_started_get(tid))
         # прочитать маркер ДО удаления (гард пишет туда красную карточку в headless)
         marker_content = ""
         try:
@@ -936,20 +1122,27 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=()):
                                 "pc_orchestrator): claude-процесс задачи штатно погашен в окне "
                                 "управляемого self-update-рестарта — работа к этому моменту сделана "
                                 "(RESULT в логе, коммит в git). Это НЕ сбой.")[:RESULT_MAX]
-            return "failed", (f"claude exit={rc}: " + (out_s or err_tail or "нет вывода"))[:RESULT_MAX]
+            return "failed", fail_result(FAIL_EXEC_ERROR,
+                                         f"claude exit={rc}: " + (out_s or err_tail or "нет вывода"),
+                                         since=_task_started_get(tid))
         if not out_s:
             if attempt == 1:   # один авто-повтор: пустой stdout бывает транзиентом
                 log.warning("id=%s пустой stdout (rc=0) — авто-повтор; stderr: %s",
                             tid, err_tail or "(пуст)")
                 continue
             log.error("id=%s ПУСТОЙ ВЫВОД ×2 → failed; stderr: %s", tid, err_tail or "(пуст)")
-            return "failed", ("пустой вывод claude (2 попытки — работа не выполнялась) | stderr: "
-                              + (err_tail or "(пуст)"))[:RESULT_MAX]
+            # «работа не выполнялась» тут больше НЕ утверждаем от себя: пустой stdout говорит
+            # только о молчании канала, а был ли коммит — скажут следы (класс 30.07).
+            return "failed", fail_result(FAIL_EXEC_ERROR,
+                                         "пустой вывод claude (2 попытки) | stderr: "
+                                         + (err_tail or "(пуст)"), since=_task_started_get(tid))
         if not _RE_RESULT.search(out_s):   # вывод есть, но итог не подтверждён строкой RESULT:
             log.warning("id=%s insufficient_output (нет «RESULT:») → failed", tid)
-            return "failed", ("insufficient_output: нет строки «RESULT: <итог>» — выполнение не "
-                              "подтверждено. stdout(хвост): " + _tail(out_s)
-                              + (" | stderr(хвост): " + err_tail if err_tail else ""))[:RESULT_MAX]
+            return "failed", fail_result(FAIL_EXEC_ERROR,
+                                         "insufficient_output: нет строки «RESULT: <итог>» — "
+                                         "выполнение не подтверждено. stdout(хвост): " + _tail(out_s)
+                                         + (" | stderr(хвост): " + err_tail if err_tail else ""),
+                                         since=_task_started_get(tid))
         return "done", out_s[:RESULT_MAX]
 
 
@@ -986,6 +1179,10 @@ def _human(kind, tid, text):
     if kind == "done":
         return f"✅ Оркестратор: задача #{tid} выполнена — {first}"
     if kind == "failed":
+        # «провалена» ложь, когда работа В ОКНЕ ЗАДАЧИ была: заголовок обязан различать
+        # незакрытую-но-сделанную и по-настоящему несделанную (класс 30.07, задачи 54/61).
+        if WORK_DONE_MARK in str(text or ""):
+            return f"⚠️ Оркестратор: задача #{tid} — работа выполнена, закрытие не состоялось — {first}"
         return f"❌ Оркестратор: задача #{tid} провалена — {first}"
     if kind == "needs_approval":
         return f"🔔 Оркестратор: задача #{tid} ждёт твоего «да» — {first}"
@@ -1632,6 +1829,10 @@ def process_new():
         log.info("claim id=%s не удался (%s) — пропуск", tid, cl.get("error"))
         return
     log.info("CLAIM id=%s in_progress", tid)
+    # Отметка старта НА ДИСКЕ, сразу после claim: закрывать задачу может уже другой процесс демона
+    # (самообновление/падение/реапер), и без этой метки окно работы не построить → итог провала
+    # не сможет назвать коммиты и записи журнала, которые задача успела сделать.
+    _task_started_mark(tid)
     _cowork(f"взял задачу #{tid} (in_progress)")
     if _is_revizor_owner_card(text):
         # осиротевшая owner-карточка ревизора (краш между claim и set_needs_approval): закрыть,
@@ -1719,7 +1920,8 @@ def process_approved():
             log.info("APPROVED id=%s истёк (>%ss) → failed", tid, APPROVAL_TTL)
             # ⏱ первым символом: для шага локальной цепи просрочка approve = halt без думателя
             # (гейт _loc_after_fail; переформулировка не вернёт ушедшего Филиппа)
-            msg = f"{TIMEOUT_MARK} approve истёк (>30 мин) — повтори задачу"
+            msg = fail_result(FAIL_APPROVAL_TIMEOUT, "approve истёк (>30 мин) — повтори задачу",
+                              since=_task_started_get(tid))
             bc.complete_task(tid, "failed", msg)
             _cowork(f"задача #{tid} (approved) → failed · {_clip(msg)}")
             _notify_task("failed", tid, "approve истёк")
@@ -1739,8 +1941,9 @@ def process_approved():
             why = ("одобрен класс " + ", ".join(sorted(appr)) + ", но упёрлись в ДРУГОЕ красное"
                    if appr else "класс операции в карточке не назван (op=other) — одобрение "
                                 "не привязать к операции")
-            msg = (f"{MANUAL_MARK} одобрено, но шаг снова упирается в красное — выполни вручную "
-                   f"[{why}]: " + result[:400])
+            msg = fail_result(FAIL_MODEL_REFUSAL,
+                              f"одобрено, но шаг снова упирается в красное — выполни вручную "
+                              f"[{why}]: " + result[:400], since=_task_started_get(tid))
             bc.complete_task(tid, "failed", msg)
             _cowork(f"задача #{tid} (approved) → failed · {_clip(msg)}")
             _notify_task("failed", tid, "снова красное после approve — вручную")
@@ -1763,7 +1966,9 @@ def process_approval_timeouts():
             continue      # info-карточка ревизора живёт до решения человека — не гасим по таймауту
         if (_age_sec(task.get("updated")) or 0) > APPROVAL_TTL:
             log.info("NEEDS_APPROVAL id=%s таймаут (>%ss) → failed", tid, APPROVAL_TTL)
-            msg = (f"{TIMEOUT_MARK} подтверждение не получено за 30 мин — задача провалена")
+            msg = fail_result(FAIL_APPROVAL_TIMEOUT,
+                              "подтверждение не получено за 30 мин — задача закрыта без «да»",
+                              since=_task_started_get(tid))
             bc.complete_task(tid, "failed", msg)
             _cowork(f"задача #{tid} → failed · {_clip(msg)}")
             _notify_task("failed", tid, "подтверждение не получено за 30 мин")
@@ -1821,9 +2026,12 @@ def process_stuck_singles(now=None):
         age = _age_sec(task.get("updated"), now=now) or 0
         if age <= PC_SINGLE_STALE:
             continue
-        msg = (f"{TIMEOUT_MARK} ПК-таймаут одиночки: задача провисела in_progress {int(age)}с (> {PC_SINGLE_STALE}с) — "
-               "ПК был выключен, либо прогон застрял/оборвался посреди исполнения. Помечена failed "
-               "ПК-ливнессом (не зависает вечно). Повтори при необходимости.")[:RESULT_MAX]
+        # since: отметка claim, а если её нет (задача клеймлена до появления реестра) — по возрасту
+        started = _task_started_get(tid) or (now - datetime.timedelta(seconds=age))
+        msg = fail_result(FAIL_HEARTBEAT_TIMEOUT,
+                          f"ПК-таймаут одиночки: задача провисела in_progress {int(age)}с "
+                          f"(> {PC_SINGLE_STALE}с) без движения — ПК был выключен, либо прогон "
+                          "застрял/оборвался посреди исполнения", since=started, now=now)
         bc.complete_task(tid, "failed", msg)
         log.warning("stuck-single: id=%s in_progress %sс > %sс → failed (ПК-ливнесс одиночки)",
                     tid, int(age), PC_SINGLE_STALE)

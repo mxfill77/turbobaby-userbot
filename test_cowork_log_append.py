@@ -12,10 +12,13 @@ import io
 import os
 import re
 import sys
+import json
+import datetime
 import contextlib
 import tempfile
 import unittest
 import urllib.error
+from unittest import mock
 
 import cowork_log_append as cla
 
@@ -122,6 +125,69 @@ class TestSpool(unittest.TestCase):
         block = "  \n".join(["DONE самая новая"] + list(reversed(pending)))
         self.assertEqual(block.split("  \n"),
                          ["DONE самая новая", "DONE поновее", "DONE старая"])
+
+
+class TestLedger(unittest.TestCase):
+    """Реестр УСПЕШНЫХ записей (класс 30.07 «статус врёт»). Спул хранит провалившиеся строки,
+    реестр — прошедшие: без него у ПК не было НИ ОДНОГО местного следа «журнал записан», и демон,
+    закрывая задачу по таймауту, писал владельцу «провалена» поверх сделанной работы (задача 61:
+    коммит a3f75dd и записи в журнал были). Реестр читает pc_orchestrator._journal_writes_between."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "cowork_log.ledger")
+        self.addCleanup(self._tmp.cleanup)
+
+    def _lines(self):
+        with io.open(self.path, encoding="utf-8") as f:
+            return [json.loads(x) for x in f if x.strip()]
+
+    def test_success_leaves_local_trace(self):
+        cla.ledger_add("DONE 2026-07-30 13:14 UTC: гард PEB закрыт, коммит a3f75dd", path=self.path)
+        rec = self._lines()[0]
+        self.assertIn("a3f75dd", rec["line"])
+        self.assertTrue(rec["ts"])                       # без метки времени окно не построить
+
+    def test_timestamp_is_utc_aware(self):
+        cla.ledger_add("DONE что-то", path=self.path)
+        ts = datetime.datetime.fromisoformat(self._lines()[0]["ts"])
+        self.assertIsNotNone(ts.tzinfo)                  # наивное время дало бы окно мимо на 7 часов
+
+    def test_one_record_per_line(self):
+        cla.ledger_add("DONE строка\nс переносом", path=self.path)
+        with io.open(self.path, encoding="utf-8") as f:
+            self.assertEqual(len([x for x in f if x.strip()]), 1)
+
+    def test_capped(self):
+        for i in range(12):
+            cla.ledger_add("DONE запись %d" % i, path=self.path, keep=5)
+        recs = self._lines()
+        self.assertEqual(len(recs), 5)
+        self.assertIn("запись 11", recs[-1]["line"])     # кап режет СТАРЫЕ, свежие целы
+
+    def test_failure_is_swallowed(self):
+        # реестр вспомогательный: запись в мозг к этому моменту УЖЕ прошла — рушить её отчёт нельзя
+        self.assertIsNone(cla.ledger_add("DONE x", path=os.path.join(self._tmp.name, "нет", "к", "ф")))
+
+    def test_main_writes_ledger_on_success(self):
+        # сквозь main(): успешная запись оставляет след и по НОВОЙ строке, и по досланным из спула
+        spool = os.path.join(self._tmp.name, "pending.txt")
+        saved = (cla.SPOOL_PATH, cla.LEDGER_PATH, sys.argv)
+        cla.SPOOL_PATH, cla.LEDGER_PATH = spool, self.path
+        self.addCleanup(lambda: setattr(cla, "SPOOL_PATH", saved[0]))
+        self.addCleanup(lambda: setattr(cla, "LEDGER_PATH", saved[1]))
+        self.addCleanup(lambda: setattr(sys, "argv", saved[2]))
+        cla.spool_add("DONE 2026-07-30 12:00 UTC: отложенная прошлым сбоем")
+        sys.argv = ["cowork_log_append.py", "DONE итог задачи 61"]
+        with mock.patch.object(cla, "load_env", lambda p: {"BRIDGE_URL": "https://x/exec", "BRIDGE_TOKEN": "t"}), \
+             mock.patch.object(cla, "get", lambda u, p: {"ok": True, "text": "старый журнал"}), \
+             mock.patch.object(cla, "post", lambda u, p: {"ok": True, "chars": 99}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            cla.main()
+        lines = [r["line"] for r in self._lines()]
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(any("итог задачи 61" in x for x in lines))
+        self.assertTrue(any("отложенная прошлым сбоем" in x for x in lines))
 
 
 class TestStampContract(unittest.TestCase):
