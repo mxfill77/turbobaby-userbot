@@ -45,6 +45,7 @@ import urllib.error
 import io_utf8               # переключатель stdout/stderr в UTF-8 (класс «charmap can't encode 📊»)
 import gate_selective         # селективный тест-гейт авто-применения (порт VPS GATE_STEP/SINGLE_SELECTIVE); чистый, без сети
 import task_metrics           # единый формат строки METRICS (обе полосы) + norm_effort/extract_tokens/selfheal_count
+import client_contour         # признак клиентского контура (граф импортов ботов) + реестр оснований пропуска ворот; чистый, без сети
 import lesson_router          # обработчик задач-уроков (родитель 292, шаг 3): классификация+маршрут; suggest тянет лениво
 # ДЕПЛОЙ #334 шаг 6/6 (2026-07-14, одобрен владельцем): LLM-маршрут уроков в бою —
 # LESSON_LLM_ROUTE=1 в .env ПОСТОЯННО; коммит-веха триггерит эстафету демона (новый процесс
@@ -935,14 +936,25 @@ def _human(kind, tid, text):
 _CMD_RESTART_UB = re.compile(r"^\s*(?:рестартни|рестарт|перезапусти|restart)\s+(?:userbot|юзербот)\s*[.!]*\s*$", re.I)
 _CMD_RESTART_MB = re.compile(r"^\s*(?:рестартни|рестарт|перезапусти|restart)\s+(?:модербот|moderbot|moderation[_ ]?bot|модербот)\s*[.!]*\s*$", re.I)
 _CMD_STATUS = re.compile(r"^\s*статус\s+контура\s*[.!?]*\s*$", re.I)
+# «да» воротам клиентского контура: разрешить применить ТЕКУЩИЙ HEAD к живым ботам. Отдельная
+# команда, а не «рестартни userbot»: рычаг рестарта поднимает бота ПРЯМО СЕЙЧАС мимо всех проверок,
+# а «выкати» — это ОСНОВАНИЕ, после которого применение идёт ШТАТНЫМ путём, со всеми прежними
+# гейтами (тесты, анти-флап, запрет грязного дерева). Якорь тот же: совпадает, только когда ВЕСЬ
+# текст задачи и есть команда, — дев-задача «тз: … выкати …» сюда не проваливается.
+_CMD_RELEASE = re.compile(
+    r"^\s*(?:да[,\s]+)?(?:выкат(?:и|ывай)|раскати|примени(?:ть)?)\s*"
+    r"(?:это\s+|коммит\s*|правку\s*|на\s+)?\s*(?:клиент\w*|прод\w*|бот\w*|userbot|модербот)?\s*[.!]*\s*$",
+    re.I)
 
 
 def _match_command(text):
     """Распознать команду-рычаг по якорным паттернам (весь текст = команда). →
-    'restart_userbot'|'restart_moderbot'|'status' | None (не команда → обычный headless-путь)."""
+    'restart_userbot'|'restart_moderbot'|'status'|'release_client' | None (не команда → headless-путь)."""
     t = str(text or "")
     if _CMD_STATUS.match(t):
         return "status"
+    if _CMD_RELEASE.match(t):
+        return "release_client"
     if _CMD_RESTART_UB.match(t):
         return "restart_userbot"
     if _CMD_RESTART_MB.match(t):
@@ -993,11 +1005,31 @@ def _contour_status(finder=None, items=None, revizor_state=None):
     return "\n".join(lines)
 
 
+def _exec_release_client(head_fn=None, approve_fn=None, cowork=None):
+    """«ДА» ВЛАДЕЛЬЦА воротам клиентского контура: записать основание на ТЕКУЩИЙ HEAD.
+    Сам рестарт здесь НЕ делаем — применение пойдёт штатной реконсиляцией детей, со всеми прежними
+    проверками (гейт затронутых тестов, анти-флап, запрет грязного дерева). Так «да» остаётся
+    решением о ПРАВЕ выкатить, а не обходом гейтов. → (status, result)."""
+    commit = (head_fn or _head_commit)()
+    ok, res = (approve_fn or client_contour.approve)(commit)
+    if not ok:
+        return "failed", f"основание не записано: {res}"
+    _CLIENT_HELD_WARNED.clear()      # решение изменилось — следующий отказ снова заслуживает карточки
+    log.info("ворота контура: владелец разрешил применение коммита %s", commit)
+    (cowork or _cowork)(f"ворота клиентского контура: владелец сказал «да» на {commit} — "
+                        f"применение пойдёт штатной реконсиляцией")
+    return "done", (f"✅ Ворота клиентского контура открыты на коммит {commit}. Применю штатно "
+                    f"(реконсиляция детей, ≤{CHILD_RECONCILE_SEC} с): гейт тестов, анти-флап и "
+                    f"запрет грязного дерева остаются на месте.")
+
+
 def _exec_command(cmd, restart_fn=None, status_fn=None):
     """Исполнить команду-рычаг НАПРЯМУЮ (полномочия вотчдога), без headless. → (status, result).
     Рестарт уважает рубильник и штампует анти-флап-реестр (не воюет с авто-применением кода)."""
     if cmd == "status":
         return "done", (status_fn or _contour_status)()
+    if cmd == "release_client":
+        return _exec_release_client()
     kind = "userbot" if cmd == "restart_userbot" else "moderbot"
     if _stopped():
         return "failed", "рубильник pc_orchestrator.stop активен — рестарт не выполняю"
@@ -3302,7 +3334,8 @@ def _classify_changed(paths):
 # Считаем только ОТСЛЕЖИВАЕМЫЕ правки: untracked-файла в коммите не было вовсе, сказать про него
 # «коммит уехал не целиком» нельзя — та же граница, что у авто-фетча ниже.
 _ORCH_RUNTIME = ("pc_orchestrator.py", "gate_selective.py", "task_metrics.py",
-                 "lesson_router.py", "log_setup.py")   # что несёт САМ демон (его верхние импорты)
+                 "lesson_router.py", "log_setup.py",
+                 "client_contour.py")                  # что несёт САМ демон (его верхние импорты)
 _DIRTY_WARNED = {}      # процесс → (коммит, кортеж грязных файлов), о которых уже сказали
 
 
@@ -3365,6 +3398,93 @@ def _dirty_block(kind, commit, where, label=None, dirty_fn=None, notifier=None,
             "Грязные файлы этого процесса (%d): %s\n"
             "Закоммить или откати их — рестарт пойдёт сам." % (name, commit, len(files), ", ".join(files)))
     return files
+
+
+# ───────── ВОРОТА КЛИЕНТСКОГО КОНТУРА (класс 30.07.2026) ─────────
+# Живой инцидент: цепь ревизора id=44 правила suggest.py, и авто-реконсайл САМ выкатил коммит
+# 4528917 на боевые боты (01:48:22 userbot PID 6692 … 01:53:31 userbot PID 7064) за 17 минут ДО
+# того, как владелец успел цепь остановить (02:05:51). За двое суток ревизор поставил ДВЕ такие
+# цепи (id=4 «тип ТС», id=44 «гард приветствий»); текст от клиента удержал только SUGGEST_TEST_MODE
+# — то есть ВТОРОЙ слой, а не ворота. Гейт на пути был, но ТЕСТОВЫЙ: зелёные тесты ≠ решение
+# человека о том, что живой клиент увидит другой текст.
+#
+# Правило: коммит, задевший КЛИЕНТСКИЙ файл, к живым ботам автоматически НЕ применяется. Признак
+# клиентского — client_contour (транзитивное import-замыкание userbot_listen.py/moderation_bot.py,
+# считается по факту с диска, а не списком имён). Вместо применения — карточка владельцу: что
+# меняется, какие файлы, какой коммит, как откатить. Ворота открывают РОВНО ДВА основания:
+#   • «да» владельца (команда-рычаг «выкати» → client_contour.approve);
+#   • зелёный прогон через тренажёр — интерфейс заложен, но сам прогон тренажёр пока НЕ выдаёт
+#     (обратной связи «тренажёр → выкатка» в коде нет), поэтому основание по умолчанию выключено.
+# FAIL-CLOSED: признак не смог решить (граф не строится, файл не читается, путь пуст) → файл
+# считается КЛИЕНТСКИМ и применение не идёт.
+# ВНУТРЕННИЙ контур ворот НЕ касается: self-update самого демона и его эстафета работают как
+# работали — ворота стоят ТОЛЬКО на рестарте детей-ботов. Ирония на месте и она правильная: эта
+# правка живёт в pc_orchestrator.py, файле ВНУТРЕННЕМ, и применится сама.
+# РУЧНОЙ рычаг «рестартни userbot» (_exec_command) под ворота не попадает — там решает человек,
+# ровно как у запрета грязного дерева выше.
+_CLIENT_HELD_WARNED = {}     # «кого держим» → (коммит, кортеж клиентских файлов), о чём уже сказали
+
+
+def _client_paths(paths):
+    """Клиентские пути из списка — ПРИЗНАК (граф импортов) ∪ явная карта рестарта ботов.
+    Объединение, а не «или-или»: карта ловит имя, которого ещё никто не импортит (новый
+    suggest_*.py), граф ловит модуль, которого в карте нет (lesson_router.py — его тянет
+    trainer.py, а карта про него не знает). Признак упал → считаем клиентским (fail-closed)."""
+    out = []
+    for p in (paths or []):
+        try:
+            hit = client_contour.is_client(p, REPO)
+        except Exception as e:                       # noqa: BLE001 — «не знаю» это НЕ «внутренний»
+            log.error("ворота контура: признак упал на «%s» (%s) — считаю КЛИЕНТСКИМ", p, e)
+            hit = True
+        if hit or (_procs_for_file(p) & {"userbot", "moderbot"}):
+            out.append(p)
+    return out
+
+
+def _commit_subject(commit):
+    """Тема коммита для карточки (владельцу нужен смысл правки, а не только хеш). Молчит git → ''."""
+    return _git_out(["log", "-1", "--format=%s", str(commit)]) or ""
+
+
+def _client_block(kinds, commit, paths, where, subject=None, notifier=None, cowork=None,
+                  state=None, reason_fn=None, client_fn=None, subject_fn=None):
+    """ВОРОТА клиентского контура. → список клиентских файлов (применять НЕЛЬЗЯ) | [] (можно).
+
+    Отказ — не молчание: лог + строка в журнал + карточка владельцу с коммитом, поимённым списком
+    и командой отката. Ровно ОДИН раз на пару «коммит + состав клиентских файлов»: реконсиляция
+    приходит каждые 60 с, долбить владельца каждым тиком нельзя, а изменился состав — сказать
+    обязаны заново. Основание пропуска («да» / тренажёр) снимает ворота и чистит память."""
+    held = (client_fn or _client_paths)(paths)
+    st = _CLIENT_HELD_WARNED if state is None else state
+    kk = ",".join(kinds) if kinds else "боты"
+    if not held:
+        st.pop(kk, None)
+        return []
+    reason = (reason_fn or client_contour.release_reason)(commit)
+    if reason:
+        st.pop(kk, None)
+        log.info("ворота контура (%s): основание пропуска «%s» — коммит %s применяем к %s",
+                 where, reason, commit, kk)
+        (cowork or _cowork)(
+            "ворота клиентского контура ОТКРЫТЫ по основанию «%s»: применяю %s к %s (%s)"
+            % (reason, commit, kk, ", ".join(held)))
+        return []
+    key = (str(commit), tuple(held))
+    if st.get(kk) != key:
+        st[kk] = key
+        log.error("ворота контура (%s): применение %s к «%s» ОСТАНОВЛЕНО — клиентские файлы: %s",
+                  where, commit, kk, ", ".join(held))
+        (cowork or _cowork)(
+            "ворота клиентского контура: применение %s к %s ОСТАНОВЛЕНО (%s) — клиентские файлы: "
+            "%s; жду «да» владельца или зелёный тренажёр" % (commit, kk, where, ", ".join(held)))
+        (notifier or _notify)(client_contour.card_text(
+            kinds or ["боты"], commit, held,
+            subject=subject if subject is not None else (subject_fn or _commit_subject)(commit),
+            where=where,
+            trainer_available=str(os.getenv(client_contour.TRAINER_GREEN_ENV, "")).strip().lower()
+            in ("1", "true", "yes", "on")))
+    return held
 
 
 def _affected_test_modules(paths):
@@ -3439,7 +3559,8 @@ def _restart_via_pc_agent(kind, settle=0.5, wait_cycles=20):
 
 
 def maybe_update_bots(tid, text, head_before, changed_fn=None, gate_fn=None,
-                      restart_fn=None, is_dev_fn=None, head_fn=None, dirty_fn=None):
+                      restart_fn=None, is_dev_fn=None, head_fn=None, dirty_fn=None,
+                      client_block_fn=None):
     """После done дев-задачи применить свежий код к боту(ам). → строка-суффикс для карточки/cowork
     ('' если обновлять нечего). Уважает стоп-флаг и ЗАПРЕТ грязного дерева (_dirty_block):
     рестарт идёт только если чисты файлы, которые несёт ЭТОТ бот. Всё внешнее инъектируется."""
@@ -3459,6 +3580,15 @@ def maybe_update_bots(tid, text, head_before, changed_fn=None, gate_fn=None,
     if not (ub_files or mb_files):
         return ""
     commit = (head_fn or _head_commit)()
+    # ВОРОТА КЛИЕНТСКОГО КОНТУРА (30.07): коммит задел файл, доезжающий до ЖИВОГО клиента → не
+    # применяем, владельцу карточка. Смотрим ВЕСЬ дифф задачи (не только выбранное картой) и ДО
+    # гейта: рестарт поднимает состояние диска ЦЕЛИКОМ — «частично выкатить» нельзя, а гонять
+    # тесты ради рестарта, которого не будет, незачем. Ровно та же очерёдность, что у грязного дерева.
+    _kinds = [k for k, f in (("userbot", ub_files), ("moderbot", mb_files)) if f]
+    _held = (client_block_fn or _client_block)(_kinds, commit, changed, "авто-обновление после задачи")
+    if _held:
+        return (" | авто-обновление ОСТАНОВЛЕНО воротами клиентского контура (%s): боты остались на "
+                "прежнем коде, владельцу отправлена карточка" % ", ".join(_held))
     # Селективный гейт (порт VPS): промежуточный шаг цепи / одиночка под флагом → только затронутые
     # тесты; финальный шаг → полный гейт (неубираем); сбой селектора → полный (fail-safe). Флаги
     # off (дефолт) → mode=off → прежний путь _affected_test_modules байт-в-байт.
@@ -3530,7 +3660,8 @@ def _diff_names(old_commit, new_commit):
 
 
 def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_fn=None,
-                                 now=None, cooldown=None, state=None, dirty_fn=None):
+                                 now=None, cooldown=None, state=None, dirty_fn=None,
+                                 client_block_fn=None):
     """После УСПЕШНОГО self-update демона: рестарт затронутых детей по ЯВНОЙ карте на основе диффа
     old..new. → строка-итог для лога/cowork ('' если никого не трогали). Правила:
       • userbot/moderbot → штатный рестарт механикой вотчдога (_restart_via_pc_agent), с уважением
@@ -3562,6 +3693,19 @@ def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_f
         _cowork(f"авто-применил {new_commit}: {msg}")
         _notify(f"ℹ️ Оркестратор: {msg} (self-update {new_commit})")
         notes.append(msg)
+    # ВОРОТА КЛИЕНТСКОГО КОНТУРА (30.07): self-update демона имеет право обновить СЕБЯ, но не имеет
+    # права молча выкатить клиентскую правку, попавшую в тот же диапазон коммитов, — ровно так 28.07
+    # старый suggest.py уехал «прицепом» к чужому self-update. Держим только ДЕТЕЙ-ботов: сам демон
+    # уже обновился и это внутренний контур.
+    _bots = [k for k in ("userbot", "moderbot") if k in procs]
+    if _bots:
+        _held = (client_block_fn or _client_block)(_bots, new_commit, changed,
+                                                   "реконсиляция детей после self-update")
+        if _held:
+            for _k in _bots:
+                procs.pop(_k, None)
+            notes.append("применение к %s ОСТАНОВЛЕНО воротами клиентского контура (%s) — "
+                         "жду «да» владельца" % (", ".join(_bots), ", ".join(_held)))
     for kind, label in (("userbot", "userbot"), ("moderbot", "модербот")):
         if kind not in procs:
             continue
@@ -3781,7 +3925,7 @@ def _full_head():
 
 
 def reconcile_children_tick(head_fn=None, diff_fn=None, gate_fn=None, restart_fn=None,
-                            now=None, cooldown=None, state=None):
+                            now=None, cooldown=None, state=None, client_block_fn=None):
     """Тело реконсиляции детей на новый коммит (без троттлинга — троттлит maybe_reconcile_children).
     → строка-итог для лога ('' если нечего/рубильник). Всё внешнее инъектируется для тестов.
     Метку/rejected хранит в модульных глобалах (переживают тики; рестарт демона сбрасывает —
@@ -3807,6 +3951,19 @@ def reconcile_children_tick(head_fn=None, diff_fn=None, gate_fn=None, restart_fn
     cooldown = APPLY_COOLDOWN_SEC if cooldown is None else cooldown
     state = _apply_restart_at if state is None else state
     short = head[:9]
+    # ВОРОТА КЛИЕНТСКОГО КОНТУРА (30.07) — ГЛАВНАЯ дыра класса: ИМЕННО этот тик 30.07 в 01:53
+    # рестартнул userbot на коммит цепи ревизора 4528917 без чьего-либо решения. Держим ВЕСЬ тик и
+    # метку _last_child_commit НЕ двигаем: придёт «да» — следующий тик применит ЭТОТ ЖЕ коммит.
+    # _child_reconcile_rejected здесь СПЕЦИАЛЬНО не ставим: он глушит повторную проверку этого HEAD
+    # насовсем, а нам ровно наоборот — ждать решения владельца и применить, когда оно будет.
+    # Пометку про pc_agent тоже придержим: коммит удержан целиком, полуприменения не бывает.
+    if ub_files or mb_files:
+        _kinds = [k for k, f in (("userbot", ub_files), ("moderbot", mb_files)) if f]
+        _held = (client_block_fn or _client_block)(_kinds, short, changed,
+                                                   "реконсиляция детей на новый коммит")
+        if _held:
+            return ("ворота клиентского контура: применение %s ОСТАНОВЛЕНО, боты на прежнем коде "
+                    "(%s)" % (short, ", ".join(_held)))
     notes, gate_red = [], False
     if pc_agent_hit:                      # агент себя чужими руками не рестартует — только пометка (ручная карта, как в _selfupdate_restart_children)
         msg = ("pc_agent изменён — ЖДЁТ РУЧНОГО рестарта (Планировщик/сам подхватит), "
@@ -4689,6 +4846,46 @@ def _revizor_demote_deploy_task(f):
     return g
 
 
+# ───── ВОРОТА ВХОДА В КЛИЕНТСКИЙ КОНТУР (30.07.2026) ─────
+# Ревизор чинил живого клиентского бота САМ: находки классов а–ж по замыслу правят suggest.py
+# (промпт SUFFIX прямо велит думателю писать дев-ТЗ на «правку кода/промпта suggest»), и цепи id=4
+# «тип ТС» / id=44 «гард приветствий» ровно это и делали — обе остановлены владельцем руками.
+# Теперь находка, чья правка попадает в КЛИЕНТСКИЙ контур, становится owner-карточкой, а не
+# зелёной задачей дирижёру. По ВНУТРЕННИМ файлам ревизор работает как работал.
+# Точка контроля честно слабая, и мы это признаём вслух: ревизор ставит ТЕКСТ дев-ТЗ, а не список
+# файлов, — судить можно только по именам, НАЗВАННЫМ в тексте (ловим и «suggest.py», и голое
+# «suggest»). Отсюда FAIL-CLOSED: не названо ни одного файла репозитория → контур неопределим →
+# owner-карточка. Практическое следствие говорим прямо, а не прячем: почти все task-находки станут
+# карточками — именно потому, что почти каждая из них по замыслу правит клиентского бота.
+
+
+def _revizor_finding_touches_client(task_text):
+    """Дев-ТЗ находки правит клиентский контур? → (да, названные клиентские файлы, определимо).
+    Признак упал → (True, [], False): «не знаю» — это НЕ «внутренний»."""
+    try:
+        return client_contour.mentions(task_text, REPO)
+    except Exception as e:                    # noqa: BLE001 — сбой признака не пускает задачу в бой
+        log.error("ревизор: признак контура упал на находке (%s) — считаю КЛИЕНТСКОЙ", e)
+        return True, [], False
+
+
+def _revizor_demote_client_task(f, hits, determinate):
+    """Находка action=task, задевающая клиентский контур → owner-карточка (правка живого бота —
+    решение человека). Улику сохраняем: без неё владелец не поймёт, ЧТО именно предлагалось."""
+    g = dict(f)
+    g["action"] = "owner"
+    if hits:
+        why = "клиентские файлы: " + ", ".join(hits)
+    elif not determinate:
+        why = "файлы не названы — контур неопределим, держим по fail-closed"
+    else:
+        why = "клиентский контур"
+    ev = str(f.get("evidence") or "").strip() or str(f.get("task_text") or "").strip()
+    g["evidence"] = f"[клиентский контур, нужна твоя отмашка; {why}] {ev}"[:_REVIZOR_EVIDENCE_MAX]
+    g["task_text"] = ""
+    return g
+
+
 def _revizor_enqueue_tasks(task_findings, items, now):
     """Находки action=task → зелёные родители дирижёру from=Filipp-pcloc-dec. Бюджет
     ≤REVIZOR_DAILY_BUDGET/сутки и дедуп ПО КЛАССУ — оба restart-proof из маркеров очереди (items).
@@ -4713,6 +4910,13 @@ def _revizor_enqueue_tasks(task_findings, items, now):
             skip += 1
             log.warning("ревизор: задача-находка класса '%s' содержит деплой/рестарт-слова в task_text — "
                         "в очередь НЕ ставим (должна была стать owner-карточкой), окно %s", cls, f.get("client_id"))
+            continue
+        _cl, _hits, _det = _revizor_finding_touches_client(tt)   # last-resort ворот входа: клиентская находка НИКОГДА не встаёт зелёной задачей
+        if _cl:
+            skip += 1
+            log.warning("ревизор: задача-находка класса '%s' задевает КЛИЕНТСКИЙ контур (%s) — в очередь "
+                        "НЕ ставим (должна была стать owner-карточкой), окно %s",
+                        cls, ", ".join(_hits) or "файлы не названы", f.get("client_id"))
             continue
         if cls and cls in seen_classes:
             skip += 1
@@ -4980,6 +5184,7 @@ def _revizor_route(packages, now=None):
         return {"windows": 0, "tasks": 0, "owner": 0, "noise": 0, "failed": 0}
     now = time.time() if now is None else now
     task_f, owner_f, noise_n, failed, demoted = [], [], 0, 0, 0
+    demoted_client = 0                      # находки, отданные владельцу воротами входа (клиентский контур)
     # ДЕТЕРМИНИРОВАННЫЕ ПРОХОДЫ — НЕ зависят от LLM-думателя (даже если он упадёт ниже, регрессии
     # поймаем). Их два, и оба текут в ТУ ЖЕ owner-карточку, что классы а–ж, с тем же бюджетом и
     # дедупом; сбой по окну — fail-safe пропуск, прогон не роняется:
@@ -5020,6 +5225,14 @@ def _revizor_route(packages, now=None):
                     demoted += 1
                     log.info("ревизор: находка класса '%s' просит деплой/рестарт в task_text → "
                              "owner-карточка (авто-задача деплой не заказывает), окно %s", f.get("class"), cid)
+                    continue
+                cl_hit, cl_files, cl_det = _revizor_finding_touches_client(f.get("task_text"))
+                if cl_hit:                              # ворота ВХОДА: правка живого бота — решение человека
+                    owner_f.append(_revizor_demote_client_task(f, cl_files, cl_det))
+                    demoted_client += 1
+                    log.info("ревизор: находка класса '%s' правит КЛИЕНТСКИЙ контур (%s) → owner-карточка "
+                             "вместо зелёной задачи, окно %s", f.get("class"),
+                             ", ".join(cl_files) or "файлы не названы (fail-closed)", cid)
                 else:
                     task_f.append(f)
             elif act == "owner":
@@ -5030,6 +5243,9 @@ def _revizor_route(packages, now=None):
         log.info("ревизор: %d находок класса noise (ложные срабатывания) — только лог", noise_n)
     if demoted:
         log.info("ревизор: %d находок с деплой/рестарт-шагами переведены из задач в owner-карточки", demoted)
+    if demoted_client:
+        log.info("ревизор: %d находок по КЛИЕНТСКОМУ контуру переведены из задач в owner-карточки "
+                 "(ворота входа — правку живого бота решает человек)", demoted_client)
     if not task_f and not owner_f:              # окна чисты (или только шум/сбой) → наружу тишина, NOTE в журнал
         if failed >= n:
             _cowork(f"ревизор: думатель не ответил ни по одному из {n} окон — прогон пропущен")
@@ -5054,12 +5270,15 @@ def _revizor_route(packages, now=None):
         parts.append(f"owner-карточка 1160 ({len(owner_f)} цитат)")
     if demoted:
         parts.append(f"{demoted} с деплой-шагом → owner (не задача)")
+    if demoted_client:
+        parts.append(f"{demoted_client} по клиентскому контуру → owner (ворота входа)")
     if failed:
         parts.append(f"{failed} окон без ответа думателя")
     if not parts:                               # находки были, но все отсеяны бюджетом/дедупом
         parts.append(f"находки отсеяны (бюджет/дедуп): task {len(task_f)}, skip {skip}")
     _cowork("ревизор: " + ", ".join(parts))
-    return {"windows": n, "tasks": enq, "owner": len(owner_f), "noise": noise_n, "failed": failed, "demoted": demoted}
+    return {"windows": n, "tasks": enq, "owner": len(owner_f), "noise": noise_n, "failed": failed,
+            "demoted": demoted, "demoted_client": demoted_client}
 
 
 # ------------------- OS-синглтон демона (разбор #128, часть 4) ----------------

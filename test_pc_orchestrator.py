@@ -99,6 +99,17 @@ class Base(unittest.TestCase):
         o._DIRTY_WARNED.clear()
         self.addCleanup(o._DIRTY_WARNED.clear)
         self.addCleanup(lambda: setattr(o, "_dirty_tracked", self._save_dirty))
+        # ВОРОТА КЛИЕНТСКОГО КОНТУРА (класс 30.07): в тестах МЕХАНИКИ применения и маршрутизации
+        # ворота по умолчанию ОТКРЫТЫ — иначе каждый тест рестарта проверял бы не рестарт, а право
+        # на выкатку. Тот же приём, что с грязным деревом выше. Сами ворота стережёт
+        # TestClientContourGate (ниже — восстанавливает боевые функции) и test_client_contour.py.
+        self._save_cb = (o._client_block, o._revizor_finding_touches_client)
+        o._client_block = lambda *a, **k: []
+        o._revizor_finding_touches_client = lambda t: (False, [], True)
+        o._CLIENT_HELD_WARNED.clear()
+        self.addCleanup(o._CLIENT_HELD_WARNED.clear)
+        self.addCleanup(lambda: (setattr(o, "_client_block", self._save_cb[0]),
+                                 setattr(o, "_revizor_finding_touches_client", self._save_cb[1])))
         self.fb = FakeBridge()
         o.bc = self.fb
         o._notify = lambda *a, **k: None
@@ -6234,6 +6245,93 @@ class TestSessionWatchWiring(unittest.TestCase):
 
     def test_interval_is_a_minute_scale(self):
         self.assertLessEqual(o.SESSION_WATCH_SEC, 300)   # обнаружение немоты — минуты, не часы
+
+
+class TestClientContourGate(Base):
+    """ВОРОТА КЛИЕНТСКОГО КОНТУРА (класс 30.07) — здесь ворота ЗАКРЫТЫ обратно (Base их открывает
+    для тестов механики). Класс живёт ИМЕННО в этом модуле намеренно: правка одного
+    pc_orchestrator.py гоняет по карте затронутых только test_pc_orchestrator — без этих голденов
+    ворота можно было бы сломать, не покрасив гейт. Подробные голдены — в test_client_contour.py.
+
+    Живой инцидент: 30.07 01:48–01:53 авто-реконсайл сам выкатил коммит цепи ревизора 4528917 на
+    боевые userbot/moderation_bot за 17 минут до того, как владелец успел цепь остановить."""
+
+    def setUp(self):
+        super().setUp()
+        (o._client_block, o._revizor_finding_touches_client) = self._save_cb   # боевые ворота обратно
+        self.cards, self.cows, self.restarts = [], [], []
+        o._notify = lambda t, *a, **k: self.cards.append(t)
+        o._cowork = lambda t, *a, **k: self.cows.append(t)
+        self._save_subj = o._commit_subject
+        o._commit_subject = lambda c: "тема коммита"
+        self.addCleanup(lambda: setattr(o, "_commit_subject", self._save_subj))
+        self._save_rr = o.client_contour.release_reason
+        o.client_contour.release_reason = lambda *a, **k: None       # оснований пропуска нет
+        self.addCleanup(lambda: setattr(o.client_contour, "release_reason", self._save_rr))
+        o._apply_restart_at.clear()
+
+    def _restart(self, kind):
+        self.restarts.append(kind)
+        return True, [4242], "PID поднят, лог свежий"
+
+    def _upd(self, changed):
+        return o.maybe_update_bots(5, "тз: правка", "old", changed_fn=lambda hb: changed,
+                                   gate_fn=lambda mods: (True, "ok"), restart_fn=self._restart,
+                                   head_fn=lambda: "4528917")
+
+    def test_klientskii_fail_derzhitsya_i_daet_kartochku(self):
+        note = self._upd(["suggest.py"])
+        self.assertEqual(self.restarts, [])                       # НИ ОДНОГО рестарта живого бота
+        self.assertIn("ОСТАНОВЛЕНО воротами клиентского контура", note)
+        self.assertEqual(len(self.cards), 1)
+        self.assertIn("suggest.py", self.cards[0])
+        self.assertIn("git revert --no-edit 4528917", self.cards[0])
+
+    def test_vnutrennii_fail_ne_trogaet_vorota(self):
+        """Внутренний контур не задет: карта на ботов не ведёт → прежний путь, ворота молчат."""
+        self.assertEqual(self._upd(["pc_orchestrator.py", "gate_selective.py"]), "")
+        self.assertEqual(self.cards, [])
+        self.assertEqual(o._client_paths(["pc_orchestrator.py", "gate_selective.py",
+                                          "task_metrics.py", "client_contour.py"]), [])
+
+    def test_fail_closed_priznak_upal(self):
+        with mock.patch.object(o.client_contour, "is_client", side_effect=RuntimeError("нет графа")):
+            self.assertEqual(o._client_paths(["novyi.py"]), ["novyi.py"])
+
+    def test_osnovanie_da_otkryvaet(self):
+        o.client_contour.release_reason = lambda *a, **k: "owner"
+        note = self._upd(["suggest.py"])
+        self.assertEqual(sorted(self.restarts), ["moderbot", "userbot"])
+        self.assertIn("обновлён до 4528917", note)
+        self.assertEqual(self.cards, [])
+
+    def test_rekonsilyaciya_derzhit_i_ne_dvigaet_metku(self):
+        save = (o._last_child_commit, o._child_reconcile_rejected)
+        self.addCleanup(lambda: setattr(o, "_child_reconcile_rejected", save[1]))
+        self.addCleanup(lambda: setattr(o, "_last_child_commit", save[0]))
+        o._last_child_commit, o._child_reconcile_rejected = "a" * 12, None
+        out = o.reconcile_children_tick(head_fn=lambda: "4528917456", diff_fn=lambda a, b: ["suggest.py"],
+                                        gate_fn=lambda m: (True, "ok"), restart_fn=self._restart)
+        self.assertEqual(self.restarts, [])
+        self.assertIn("ОСТАНОВЛЕНО", out)
+        self.assertEqual(o._last_child_commit, "a" * 12)          # метка на месте — «да» применит этот же коммит
+        self.assertIsNone(o._child_reconcile_rejected)
+
+    def test_vorota_vhoda_klientskaya_nahodka_vladelcu(self):
+        cl, hits, det = o._revizor_finding_touches_client("поправь гард приветствий в suggest.py")
+        self.assertTrue(cl)
+        self.assertEqual(o._revizor_demote_client_task({"action": "task", "task_text": "x"}, hits, det)["action"],
+                         "owner")
+
+    def test_vorota_vhoda_vnutrennyaya_nahodka_ostaetsya_zadachei(self):
+        cl, _hits, det = o._revizor_finding_touches_client("в pc_orchestrator.py почини троттлинг тика")
+        self.assertFalse(cl)
+        self.assertTrue(det)
+
+    def test_vorota_vhoda_fail_closed_bez_imen(self):
+        cl, _hits, det = o._revizor_finding_touches_client("почини детект, он врёт")
+        self.assertTrue(cl)
+        self.assertFalse(det)
 
 
 if __name__ == "__main__":
