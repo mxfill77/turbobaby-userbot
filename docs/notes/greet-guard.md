@@ -5,38 +5,55 @@
 Business** (класс «е» ревизора). Код на этом шаге НЕ меняем — только фиксируем
 файлы, функции и точку вставки.
 
+> ## ⚠️ Адреса в этом файле — по ИМЕНАМ, номеров строк здесь больше нет (починка 31.07.2026)
+>
+> Документ был заморожен 14.07; после этого в `suggest.py` прошло 47 коммитов, и **все до одной**
+> ссылки вида `suggest.py:NNNN` уехали на +1900…+3800 строк — худший случай класса «гниль
+> адресов»: адрес существует и ведёт в осмысленный ЧУЖОЙ код (по `suggest.py:3113` сегодня
+> не точка входа `on_client_message`, а начало воронки `next_step` — замер 31.07).
+>
+> Номера сняты не «чтобы аккуратнее», а потому что **их нельзя удержать**: сверка-2 30.07
+> измерила `_REVIZOR_AUTOGREETING_RES` на `pc_orchestrator.py:4915`, сегодня он на `:4918` —
+> три строки за сутки. Живее всех оказались две ссылки этого файла на `revizor_checklist.md:18`
+> и `:27`: их сдвинула **сама починка 31.07**, вставившая в чек-лист блок поправок. Документ
+> о гнили адресов сгнил адресами в тот же день, когда его чинили.
+>
+> Правило: `grep -n "def <имя>" suggest.py`. Имя переживает коммит, номер — нет.
+
 ## Конвейер исходящего ответа (генерация — проактивная сторона)
 
-Файл **`suggest.py`**:
+Файл **`suggest.py`** (искать по имени):
 
-- `on_client_message(client, sender, me_id, ...)` — **точка входа** врезки
-  (`suggest.py:3113`). Собирает `msgs` → `transcript_from` → считает признак
-  первого ответа и запускает генерацию черновика:
-  - `suggest.py:3124`
-    `first = first_contact_from(msgs, me_id) and not greeting_already_sent(transcript)`
+- `on_client_message(client, sender, me_id, ...)` — **точка входа** врезки.
+  Собирает `msgs` → `transcript_from` → считает признак первого ответа и запускает
+  генерацию черновика:
+  - `is_first_bot_reply = first_contact_from(msgs, me_id) and not greeting_already_sent(transcript)`
+    — **переменная называется `is_first_bot_reply`, а не `first`** (см. поправку ниже);
+    итоговый признак = `first = is_first_bot_reply and not has_autogreeting`.
   - `first` пробрасывается как `is_first_contact` в `generate_draft(...)`
-    (`suggest.py:3150`) → далее в `make_system_prompt`.
+    → далее в `make_system_prompt`.
 
-- `first_contact_from(msgs, me_id, hours, now)` (`suggest.py:675`) — «первый
+- `first_contact_from(msgs, me_id, hours, now)` — «первый
   контакт»: нет НАШИХ сообщений (`sender_id == me_id`) за окно `FIRST_CONTACT_HOURS`.
   Автоприветствие Business — это тоже наше сообщение (уходит с этого аккаунта),
   поэтому если оно попало в окно, `first_contact_from` уже вернёт False. НО оно
   летит МИМО бота/модерации мгновенно — в свежем `msgs` его может ещё не быть /
   оно вне окна часов, поэтому опираться только на это ненадёжно.
 
-- `greeting_already_sent(transcript)` (`suggest.py:696`) — **ключевая функция
+- `greeting_already_sent(transcript)` — **ключевая функция
   гарда**: сканирует строки `[менеджер]:` и матчит `_GREETING_RE`. Если хоть одна
   наша строка НАЧИНАЕТСЯ с приветствия → True (не здороваемся повторно).
-  - `_GREETING_RE` (`suggest.py:690`) матчит только «здравствуй* / привет* /
+  - `_GREETING_RE` матчит только «здравствуй* / привет* /
     добрый день|утро|вечер / hello|hi|hey|good morning… / welcome|greetings» в
     НАЧАЛЕ строки.
 
-- `make_system_prompt(faq, lang, is_first_contact, ...)` (`suggest.py:2147`):
-  - `is_first_contact=True` → блок `greet` (`suggest.py:2152`): «Это ПЕРВЫЙ ответ…
+- `make_system_prompt(faq, lang, is_first_contact, ...)`:
+  - `is_first_contact=True` → блок `greet`: «Это ПЕРВЫЙ ответ…
     НАЧНИ ответ с фирменного приветствия («Здравствуйте! …»)».
-  - `is_first_contact=False` → «Это ПРОДОЛЖЕНИЕ… НЕ здоровайся повторно».
+  - `is_first_contact=False` → «Это ПРОДОЛЖЕНИЕ диалога (клиент уже поздоровался/получил
+    автоприветствие)… НЕ здоровайся повторно».
 
-- `transcript_from(msgs, me_id)` (`suggest.py:651`) — рендерит историю окна как
+- `transcript_from(msgs, me_id)` — рендерит историю окна как
   `[менеджер]: …` / `[клиент]: …` (old→new). Наши ручные ответы И автоприветствие
   Business видны как `[менеджер]:` (тот же аккаунт).
 
@@ -45,19 +62,22 @@ Business** (класс «е» ревизора). Код на этом шаге �
 Пост-фактум детект автоприветствия УЖЕ существует — но только на стороне
 **ревизора** (`pc_orchestrator.py`), не в генерации:
 
-- `_REVIZOR_AUTOGREETING_RES` (`pc_orchestrator.py:3003`) — два regex на оба
+- `_REVIZOR_AUTOGREETING_RES` (`pc_orchestrator.py`) — два regex на оба
   поколения текста владельца:
   - старое: `спасибо\W+что\W+выбрали\W+нас`
   - новое:  `уже\W+смотрю\W+ваше\W+сообщени`
-- `_revizor_is_autogreeting(text)` (`pc_orchestrator.py:3010`).
-- `_revizor_greeting_line(sent, transcript)` (`pc_orchestrator.py:3017`) — ищет
+- `_revizor_is_autogreeting(text)`.
+- `_revizor_greeting_line(sent, transcript)` — ищет
   сигнатуру сначала в транскрипте (снимая ярлык роли), затем в `sent`.
 - Пакет окна помечается полем `greeting` в `_revizor_build_package`
-  (`pc_orchestrator.py:3051`) и рендерится блоком «АВТОПРИВЕТСТВИЕ TELEGRAM
-  BUSINESS» в `_revizor_pkg_text` (`pc_orchestrator.py:3074`).
-- Правило в чек-листе: `docs/revizor_checklist.md:18` (абзац «ВАЖНО об
-  АВТОПРИВЕТСТВИИ») и класс «е» — `docs/revizor_checklist.md:27`. Дубль дефолта
-  в `pc_orchestrator.py:2807`+ (держать синхронным).
+  и рендерится блоком «АВТОПРИВЕТСТВИЕ TELEGRAM
+  BUSINESS» в `_revizor_pkg_text`.
+- Правило в чек-листе `docs/revizor_checklist.md` — искать по тексту: абзац
+  **«ВАЖНО об АВТОПРИВЕТСТВИИ»** и пункт **«- [класс е] повтор приветствия/канцелярит»**
+  (номера строк `:18`/`:27` сдвинуты починкой 31.07 и теперь ведут в блок поправок
+  чек-листа, а не в правило). Дубль дефолта в `pc_orchestrator.py` — константа
+  `REVIZOR_CHECKLIST_DEFAULT` (держать синхронной; инвариант гейта —
+  `test_shipped_file_matches_builtin_default`).
 
 ## Разрыв (root cause класса «е» на генерации)
 
@@ -87,22 +107,22 @@ Business** (класс «е» ревизора). Код на этом шаге �
 > ТОЛЬКО тот путь, где рядом стоит `autogreeting_already_sent`.
 > Заодно: переменная `first` переименована в `is_first_bot_reply` — правку «по слову `first`»
 > положат мимо, и грепу не за что зацепиться.
-> И адреса: дубль чек-листа — это `REVIZOR_CHECKLIST_DEFAULT` (не `pc_orchestrator.py:2807`,
-> там код декомпозера); `_REVIZOR_AUTOGREETING_RES` тоже уехал. Искать по именам.
+> И адреса: дубль чек-листа — это `REVIZOR_CHECKLIST_DEFAULT` (а НЕ `pc_orchestrator.py:2807`,
+> где живёт код декомпозера); `_REVIZOR_AUTOGREETING_RES` тоже уехал. Искать по именам.
 
-1. **Основная** — `suggest.py`, `greeting_already_sent` (`suggest.py:696–706`):
+1. **Основная** — `suggest.py`, `greeting_already_sent`:
    расширить, чтобы кроме `_GREETING_RE` она распознавала сигнатуры
    автоприветствия Telegram Business (обе поколения, как в
    `_REVIZOR_AUTOGREETING_RES`). Тогда при наличии автогритинга в транскрипте
-   `first` на `suggest.py:3124` станет False автоматически, без правки вызова.
+   признак первого ответа станет False автоматически, без правки вызова.
    - Альтернатива/дополнение: отдельная функция `autogreeting_already_sent(
-     transcript)` рядом и `first = … and not greeting_already_sent(…) and not
-     autogreeting_already_sent(…)` на `suggest.py:3124`.
-2. **Переиспользование**: сигнатуры автогритинга сейчас живут в
-   `pc_orchestrator.py:3003` (`_REVIZOR_AUTOGREETING_RES`). Чтобы не плодить
-   вторую копию regex, на следующем шаге решить: вынести общий детект в
-   разделяемый модуль/константу, либо продублировать сигнатуры в `suggest.py`
-   (детект детерминированный, без сети) с явной пометкой «держать синхронным».
+     transcript)` рядом и `first = is_first_bot_reply and not autogreeting_already_sent(…)`
+     в `on_client_message`. **Взята именно она** — см. поправку выше.
+2. **Переиспользование**: сигнатуры автогритинга живут в
+   `pc_orchestrator.py` (`_REVIZOR_AUTOGREETING_RES`) и продублированы в
+   `suggest.py` (`_AUTOGREETING_RES`) — **обе копии на месте, держать синхронными**;
+   решение «вынести в общий модуль» так и не принято. В `_AUTOGREETING_RES`
+   сигнатур ровно две: третье поколение текста автоприветствия гард не увидит.
 
 ## Golden-обязательство (правило-класс CLAUDE.md)
 
