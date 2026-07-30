@@ -6736,6 +6736,17 @@ class TestClientContourGate(Base):
             lambda commit, *a, **k: save_ts(commit, path=trn, env={}))
         return rel, trn
 
+    def test_prichina_v_kartochke_iz_togo_zhe_istochnika(self):
+        """Основание и причина в карточке обязаны читать ОДИН источник: инжект `trainer_fn` рядом
+        с `reason_fn`. Иначе владелец видит причину не про тот отказ (живая проба 30.07)."""
+        cards = []
+        held = o._client_block(["userbot"], "4528917", ["suggest.py"], where="тест", subject="s",
+                               notifier=cards.append, cowork=lambda t: None, state={},
+                               reason_fn=lambda c, *a, **k: None,
+                               trainer_fn=lambda c: "вердикт снят на ДРУГОМ коммите (d14d450)")
+        self.assertEqual(held, ["suggest.py"])
+        self.assertIn("на ДРУГОМ коммите", cards[0])
+
     def _put_verdict(self, path, **kw):
         rec = {"commit": "4528917", "result": "green", "checks_passed": 96, "checks_total": 96,
                "cases": 12, "cases_total": 12, "runs": 2, "clean": True,

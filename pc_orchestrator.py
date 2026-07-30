@@ -3756,7 +3756,7 @@ def _commit_subject(commit):
 
 
 def _client_block(kinds, commit, paths, where, subject=None, notifier=None, cowork=None,
-                  state=None, reason_fn=None, client_fn=None, subject_fn=None):
+                  state=None, reason_fn=None, client_fn=None, subject_fn=None, trainer_fn=None):
     """ВОРОТА клиентского контура. → список клиентских файлов (применять НЕЛЬЗЯ) | [] (можно).
 
     Отказ — не молчание: лог + строка в журнал + карточка владельцу с коммитом, поимённым списком
@@ -3792,8 +3792,11 @@ def _client_block(kinds, commit, paths, where, subject=None, notifier=None, cowo
             where=where,
             # ВТОРОЕ основание живое (trainer_run.py отдаёт вердикт) — карточка обязана сказать,
             # ПОЧЕМУ оно не сработало на этом коммите: вердикта нет / КРАСНЫЙ / снят на чужом HEAD.
+            # Причина берётся ТЕМ ЖЕ инжектом, что и основание: если решение читает один источник,
+            # а карточка другой, владельцу приедет причина не про тот отказ (поймано живой пробой
+            # 30.07 — карточка говорила «прогона не было» на подложенный чужой вердикт).
             trainer_available=client_contour.trainer_enabled(),
-            trainer_note=client_contour.trainer_status(commit)))
+            trainer_note=(trainer_fn or client_contour.trainer_status)(commit)))
     return held
 
 
