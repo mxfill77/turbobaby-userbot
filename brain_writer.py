@@ -195,6 +195,111 @@ def create_plain(name, key="", text="", env=None, post=None):
     return r
 
 
+# ------------------------------- реестр (BRAIN_MANIFEST) ---------------------
+
+def list_brain(env=None, get=None):
+    """Манифест Brain ЦЕЛИКОМ (ключ → file id) — GET list_brain. ТОЛЬКО ЧТЕНИЕ.
+
+    Зачем здесь, а не в разовом скрипте: реестр живёт в Script Properties проекта Apps Script
+    (`BRAIN_MANIFEST`) и наружу отдаётся ЕДИНСТВЕННЫМ экшеном моста; читать его скриптом-однодневкой
+    значит читать BRIDGE_TOKEN самому — запрет класса 328. → dict манифеста."""
+    url, token = _config(env)
+    if not url or not token:
+        raise BrainWriterError("нет BRIDGE_URL/BRIDGE_TOKEN в окружении/конфиге", 1)
+    try:
+        r = (get or _get)(url, {"action": "list_brain", "token": token})
+    except Exception as e:
+        raise BrainWriterError("list_brain упал: %s: %s" % (type(e).__name__, e), 2)
+    if not (isinstance(r, dict) and r.get("ok") and isinstance(r.get("manifest"), dict)):
+        raise BrainWriterError("list_brain не ok: %s"
+                               % json.dumps(r, ensure_ascii=False)[:300], 2)
+    return r["manifest"]
+
+
+def register_doc(name, doc_id, overwrite=False, env=None, post=None):
+    """POST register_brain_doc: ключ манифеста `name` → СУЩЕСТВУЮЩИЙ файл `doc_id`.
+
+    Мост сам проверяет: файл существует, лежит В папке Brain (иначе not_in_brain), имя ключа —
+    [a-z0-9_]; доки не создаёт, текст не трогает, прочие ключи мержит, а не затирает.
+    Ответ отдаётся КАК ЕСТЬ, включая ok:false: «not_in_brain»/«exists»/«bad_name» — это ФАКТ
+    для отчёта (и заодно проба места файла), а не авария канала."""
+    url, token = _config(env)
+    if not url or not token:
+        raise BrainWriterError("нет BRIDGE_URL/BRIDGE_TOKEN в окружении/конфиге", 1)
+    name, doc_id = (name or "").strip(), (doc_id or "").strip()
+    if not name or not doc_id:
+        raise BrainWriterError("нужны и ключ (name), и file id", 1)
+    if post is None and _in_test_context():
+        raise BrainWriterError("тестовый контекст (гейт/юнит): живой реестр НЕ трогаем — "
+                               "инжектируй post мок-тестом", 1)
+    payload = {"action": "register_brain_doc", "token": token, "name": name, "id": doc_id}
+    if overwrite:
+        payload["overwrite"] = True
+    try:
+        r = (post or _post)(url, payload)
+    except Exception as e:
+        raise BrainWriterError("register_brain_doc(%s) упал: %s: %s"
+                               % (name, type(e).__name__, e), 4)
+    if not isinstance(r, dict):
+        raise BrainWriterError("register_brain_doc(%s): ответ не JSON-объект" % name, 4)
+    return r
+
+
+def move_into_brain(doc_id, env=None, post=None):
+    """POST move_into_brain: перенести существующий KB_*-файл в КОРЕНЬ папки Brain (наружу→внутрь).
+
+    Штатный `move_brain_file` двигает только то, что УЖЕ в Brain, и только в подпапку — поэтому
+    живой док, созданный штабом вне папки, реестром не виделся. Ответ отдаётся как есть
+    (`not_kb_file`/`already_in_brain` — факты, а не авария)."""
+    return _brain_admin_post("move_into_brain", {"id": (doc_id or "").strip()},
+                             "move_into_brain(%s)" % doc_id, env, post)
+
+
+def unregister_doc(name, env=None, post=None):
+    """POST unregister_brain_doc: СНЯТЬ ключ из BRAIN_MANIFEST. Операция ОДНОСТОРОННЯЯ —
+    вернуть ключ на удалённый файл нельзя (register требует существующий файл), поэтому
+    `confirm` мост требует явно и мы посылаем его явно. `folder_id` мост защищает сам."""
+    return _brain_admin_post("unregister_brain_doc",
+                             {"name": (name or "").strip(), "confirm": True},
+                             "unregister_brain_doc(%s)" % name, env, post)
+
+
+def _brain_admin_post(action, fields, ref, env=None, post=None):
+    """Общий транспорт админ-экшенов реестра: секреты берёт сам писатель, ответ — как есть."""
+    url, token = _config(env)
+    if not url or not token:
+        raise BrainWriterError("нет BRIDGE_URL/BRIDGE_TOKEN в окружении/конфиге", 1)
+    if not all(str(v).strip() for k, v in fields.items() if k != "confirm"):
+        raise BrainWriterError("%s: пустой обязательный аргумент" % ref, 1)
+    if post is None and _in_test_context():
+        raise BrainWriterError("тестовый контекст (гейт/юнит): живой мозг НЕ трогаем — "
+                               "инжектируй post мок-тестом", 1)
+    try:
+        r = (post or _post)(url, dict(fields, action=action, token=token))
+    except Exception as e:
+        raise BrainWriterError("%s упал: %s: %s" % (ref, type(e).__name__, e), 4)
+    if not isinstance(r, dict):
+        raise BrainWriterError("%s: ответ не JSON-объект" % ref, 4)
+    return r
+
+
+def bridge_post_actions(env=None, post=None):
+    """Список POST-экшенов ЖИВОГО прода: мост отдаёт его сам в ответ на неизвестный action.
+    Нужен, чтобы судить о возможностях канала ПО ФАКТУ прода, а не по локальной копии кода
+    (прод закреплён на номере версии, HEAD мог уехать). Ничего не меняет. → list."""
+    url, token = _config(env)
+    if not url or not token:
+        raise BrainWriterError("нет BRIDGE_URL/BRIDGE_TOKEN в окружении/конфиге", 1)
+    try:
+        r = (post or _post)(url, {"action": "__probe_unknown_action__", "token": token})
+    except Exception as e:
+        raise BrainWriterError("проба экшенов упала: %s: %s" % (type(e).__name__, e), 2)
+    if not isinstance(r, dict) or not isinstance(r.get("actions"), list):
+        raise BrainWriterError("проба экшенов: в ответе нет списка actions: %s"
+                               % json.dumps(r, ensure_ascii=False)[:300], 2)
+    return r["actions"]
+
+
 # ------------------------------- запись (движок) -----------------------------
 
 def _backup(old, tag, backup_dir=None):
@@ -355,6 +460,18 @@ def main(argv=None):
     ap.add_argument("--id", dest="doc_id", default="", help="file id дока (Drive)")
     ap.add_argument("--name", default="", help="имя дока в манифесте Bridge (index, cowork_log, …)")
     ap.add_argument("--probe", action="store_true", help="только чтение: длина и голова дока")
+    ap.add_argument("--list-brain", dest="list_brain", action="store_true",
+                    help="только чтение: весь манифест Brain (ключ → id) как JSON")
+    ap.add_argument("--probe-actions", dest="probe_actions", action="store_true",
+                    help="только чтение: список POST-экшенов живого прода")
+    ap.add_argument("--register", default="", metavar="КЛЮЧ=ID",
+                    help="зарегистрировать существующий файл Brain-папки под ключом манифеста")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="с --register: сменить id у уже занятого ключа")
+    ap.add_argument("--move-into-brain", dest="move_into_brain", default="", metavar="ID",
+                    help="перенести KB_*-файл в КОРЕНЬ папки Brain (наружу→внутрь)")
+    ap.add_argument("--unregister", default="", metavar="КЛЮЧ",
+                    help="СНЯТЬ ключ из манифеста (односторонне: вернуть на удалённый файл нельзя)")
     ap.add_argument("--anchor", default=None, help="regex якоря (re.MULTILINE), ровно 1 совпадение")
     ap.add_argument("--place", default=None, choices=("top", "bottom", "before", "after"))
     ap.add_argument("--require-above", dest="require_above", default=None,
@@ -363,6 +480,31 @@ def main(argv=None):
     ap.add_argument("text", nargs="*", help="текст дозаписи; «-» или пусто → из stdin")
     a = ap.parse_args(argv)
     try:
+        if a.list_brain:
+            man = list_brain()
+            _out(json.dumps(man, ensure_ascii=False, indent=2, sort_keys=True))
+            _out("КЛЮЧЕЙ ВСЕГО: %d (включая folder_id — это папка, не док)" % len(man))
+            return 0
+        if a.probe_actions:
+            acts = bridge_post_actions()
+            _out(json.dumps(acts, ensure_ascii=False))
+            _out("POST-экшенов у живого прода: %d" % len(acts))
+            return 0
+        if a.move_into_brain:
+            r = move_into_brain(a.move_into_brain)
+            _out(json.dumps(r, ensure_ascii=False, sort_keys=True))
+            return 0 if r.get("ok") else 4
+        if a.unregister:
+            r = unregister_doc(a.unregister)
+            _out(json.dumps(r, ensure_ascii=False, sort_keys=True))
+            return 0 if r.get("ok") else 4
+        if a.register:
+            if "=" not in a.register:
+                raise BrainWriterError("формат --register КЛЮЧ=ID", 1)
+            key, rid = a.register.split("=", 1)
+            r = register_doc(key.strip(), rid.strip(), overwrite=a.overwrite)
+            _out(json.dumps(r, ensure_ascii=False, sort_keys=True))
+            return 0 if r.get("ok") else 4
         if a.probe:
             t = read_text(doc_id=a.doc_id, name=a.name)
             _out("PROBE ok: %d символов, голова:" % len(t))
