@@ -357,11 +357,14 @@ GREEN_UNDER_DOCTRINE = (
     "rm tmp/scratch/one.txt",                                 # ОДИН явный файл — не «массовое удаление»
     "schtasks /Query /TN TurboBabyRC",                        # /Query — чтение, не контроль задач
     "venv/Scripts/python.exe no_such_script.py",              # py_write «скрипт не прочитан» = неизвестность, не боевая запись
+    'sqlite3 bookings.db "select 1"',                         # ЧТЕНИЕ базы: данные не меняются
 )
 
 # (команда, ожидаемый вид) — красное В ЛЮБОЙ роли по доктрине владельца.
 RED_IN_BOTH_ROLES = (
-    ('sqlite3 bookings.db "select 1"', "sqlite"),
+    # ЗАПИСЬ в базу. Голден переписан 30.07.2026: раньше здесь стоял `select 1`, и красным был
+    # объявлен факт обращения к базе, а не изменение данных.
+    ('sqlite3 bookings.db "DELETE FROM b WHERE id=1"', "sqlite"),
     ("clasp push", "clasp_push"),                             # пин прода не подтверждён → красное
     ("clasp deploy -i AKfycbxNC9gCM7xx -V 76", "clasp_deploy"),   # продвижение прода
     ("taskkill /PID 1234 /F", "kill"),
@@ -665,11 +668,22 @@ class TestRoleEndToEnd(unittest.TestCase):
             except Exception:
                 pass
 
-    def test_interactive_sqlite_still_asks(self):
-        p = self._run(bash('sqlite3 bookings.db "select 1"'))
+    def test_interactive_sqlite_write_still_asks(self):
+        """ЗАПИСЬ в базу спрашивает живым процессом, и имя базы стоит в карточке.
+        Голден переписан 30.07.2026: раньше здесь стоял `select 1` — то есть тест закреплял
+        карточку на ЧТЕНИИ, ровно то, что владелец и попросил снять."""
+        p = self._run(bash('sqlite3 bookings.db "DELETE FROM b WHERE id=1"'))
         out = json.loads(p.stdout)
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
-        self.assertIn("базу данных", out["hookSpecificOutput"]["permissionDecisionReason"])
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("базу данных", reason)
+        self.assertIn("bookings.db", reason)
+
+    def test_interactive_sqlite_read_is_silent(self):
+        """ЧТЕНИЕ базы живым процессом — НОЛЬ Allow (тот же прогон, что у зелёного выше)."""
+        p = self._run(bash('sqlite3 bookings.db "select 1"'))
+        self.assertEqual(p.returncode, 0)
+        self.assertEqual(p.stdout.strip(), "")
 
     def test_interactive_clasp_still_asks(self):
         p = self._run(bash("clasp push"))
@@ -2038,6 +2052,198 @@ class TestProcessEnvRead(unittest.TestCase):
         for cmd, tool in (("Set-Content -Path " + _DOT_ENV + " -Value X", "PowerShell"),
                           ("echo TOKEN=1 >> " + _DOT_ENV, "Bash")):
             self._card_env(cmd, tool=tool)
+
+
+class TestSqliteReadIsNotWrite(unittest.TestCase):
+    """ЧТЕНИЕ базы ≠ ЗАПИСЬ в базу (правка 30.07.2026).
+
+    ЖИВОЙ ПРОВАЛ, ради которого класс заведён: сессия 30.07.2026 собрала ЧЕТЫРЕ карточки подряд —
+    19:38:59, 19:39:17, 19:39:32, 19:39:46 — все на `select` к базе, открытой `mode=ro`. Признак
+    `sqlite3` бил по УПОМИНАНИЮ модуля (`import sqlite3` + перевод строки), а не по операции.
+    Голдены ниже — ДОСЛОВНЫЕ команды из `pretool_guard.log` (свод CLAUDE.md п.8: фикстура
+    повторяет живой формат, а не идеализированный), плюс парафразы и контрпримеры."""
+
+    # Дословно из живого журнала (обрезано по длине строки лога — как гард их и видел).
+    LIVE_READS = (
+        'venv/Scripts/python.exe -c " import sqlite3\n'
+        'con = sqlite3.connect(\'file:moderation_ipc.db?mode=ro\', uri=True)\n'
+        'rows = con.execute(\\"select key, substr(value,1,120) from meta where key like '
+        '\'trainer%\' order by key\\").fetchall()\n'
+        'for k, v in rows: print(f\'{k} = {v!r}\')\n"',
+
+        'venv/Scripts/python.exe -c " import sqlite3\n'
+        'con = sqlite3.connect(\'file:moderation_ipc.db?mode=ro\', uri=True)\n'
+        'print(con.execute(\\"select sql from sqlite_master where name=\'meta\'\\").fetchone()[0])\n"',
+
+        'PYTHONIOENCODING=utf-8 venv/Scripts/python.exe -c " import sqlite3\n'
+        'con = sqlite3.connect(\'file:moderation_ipc.db?mode=ro\', uri=True)\n'
+        'rows = con.execute(\\"select k, length(v), substr(v,1,60) from meta where k like '
+        '\'trainer%\' order by k\\").fetchall()\n"',
+
+        # обрезанная строка журнала: `select` до обрыва не доехал, режим соединения доехал
+        'cd /d/turbobaby-bot; ls -la park_list.md 2>/dev/null | head -8; '
+        'PYTHONUTF8=1 venv/Scripts/python.exe -c " import sqlite3\n'
+        'con=sqlite3.connect(\'file:D:/turbobaby-bot/moderation_ipc.db?mode=ro\',uri=True)\n'
+        'q=lambda s: con.exe',
+    )
+
+    READS = (
+        'sqlite3 bookings.db "select 1"',
+        'sqlite3 moderation_ipc.db "SELECT id, status FROM drafts WHERE id=317"',
+        'sqlite3 moderation_ipc.db ".schema meta"',
+        'sqlite3 moderation_ipc.db ".tables"',
+        'sqlite3 moderation_ipc.db ".dump"',
+        'sqlite3 bookings.db "pragma table_info(drafts)"',
+        'sqlite3 bookings.db "explain query plan select * from drafts"',
+        'sqlite3 bookings.db "with x as (select 1 as a) select a from x"',
+        'sqlite3 -readonly moderation_ipc.db "select count(*) from drafts"',
+        'venv/Scripts/python.exe -c "import sqlite3; '
+        'c=sqlite3.connect(\'moderation_ipc.db\'); print(c.execute(\'select 1\').fetchone())"',
+    )
+
+    WRITES = (
+        ('sqlite3 bookings.db "INSERT INTO b VALUES (1)"', "bookings.db"),
+        ('sqlite3 bookings.db "insert or replace into b values (1)"', "bookings.db"),
+        ('sqlite3 memory.db "UPDATE x SET y=1"', "memory.db"),
+        ('sqlite3 moderation_ipc.db "delete from q"', "moderation_ipc.db"),
+        ('sqlite3 moderation_ipc.db "DROP TABLE drafts"', "moderation_ipc.db"),
+        ('sqlite3 moderation_ipc.db "ALTER TABLE drafts ADD COLUMN x TEXT"', "moderation_ipc.db"),
+        ('sqlite3 moderation_ipc.db "CREATE TABLE t (a int)"', "moderation_ipc.db"),
+        ('sqlite3 moderation_ipc.db "REPLACE INTO meta VALUES (1,2)"', "moderation_ipc.db"),
+        ('sqlite3 moderation_ipc.db "vacuum"', "moderation_ipc.db"),
+        ('sqlite3 moderation_ipc.db "pragma journal_mode=WAL"', "moderation_ipc.db"),
+        ('sqlite3 moderation_ipc.db ".import rows.csv drafts"', "moderation_ipc.db"),
+        ('sqlite3 moderation_ipc.db "with x as (select 1) delete from drafts"', "moderation_ipc.db"),
+        ('venv/Scripts/python.exe -c "import sqlite3; c=sqlite3.connect(\'moderation_ipc.db\'); '
+         'c.execute(\'insert into drafts values(1)\')"', "moderation_ipc.db"),
+    )
+
+    def _role(self, cmd):
+        return g.decide_for_role(bash(cmd), headless=True)
+
+    # --- (1) ЧТЕНИЕ: карточки нет ------------------------------------------------------------
+    def test_four_live_cards_are_gone(self):
+        """Те самые четыре карточки подряд — теперь ноль. Карточку рождает ТОЛЬКО решение `ask`
+        (см. main()), поэтому голден проверяет именно решение."""
+        for cmd in self.LIVE_READS:
+            with self.subTest(cmd[:60]):
+                self.assertEqual(self._role(cmd)[0], "defer", cmd[:160])
+
+    def test_reads_pass_silently_in_both_roles(self):
+        for cmd in self.READS:
+            for headless in (False, True):
+                with self.subTest((cmd, headless)):
+                    self.assertEqual(g.decide_for_role(bash(cmd), headless=headless)[0], "defer")
+
+    def test_read_is_labelled_in_the_log(self):
+        """Смягчение не стоит прозрачности: решение подписано видом, а не пустотой."""
+        self.assertEqual(self._role('sqlite3 bookings.db "select 1"')[1], "sqlite_read")
+        self.assertEqual(self._role(self.LIVE_READS[0])[1], "sqlite_read")
+        self.assertFalse(g._stays_red("sqlite_read", "", ""))
+
+    # --- (2) ЗАПИСЬ: карточка с ИМЕНЕМ БАЗЫ --------------------------------------------------
+    def test_writes_ask_with_db_name_in_object(self):
+        for cmd, db in self.WRITES:
+            for headless in (False, True):
+                with self.subTest((cmd, headless)):
+                    action, kind, obj = g.decide_for_role(bash(cmd), headless=headless)
+                    self.assertEqual((action, kind), ("ask", "sqlite"), cmd)
+                    card = g.card_or_journal(kind, obj, cmd)
+                    self.assertIsNotNone(card, cmd + ": карточка обязана родиться")
+                    self.assertIn(db, card, cmd + ": имя базы обязано быть в карточке")
+
+    def test_live_db_write_always_red(self):
+        """Требование ТЗ №4: живые базы на ЗАПИСЬ краснеют всегда — включая memory.db,
+        которой тело-скан исторически давал поблажку."""
+        for db in ("moderation_ipc.db", "memory.db", "bookings.db", "moderation.db"):
+            for sql in ("insert into t values(1)", "update t set a=1", "delete from t",
+                        "drop table t"):
+                cmd = 'sqlite3 %s "%s"' % (db, sql)
+                with self.subTest(cmd):
+                    self.assertEqual(self._role(cmd)[:2], ("ask", "sqlite"), cmd)
+
+    def test_mixed_read_and_write_is_a_write(self):
+        cmd = 'sqlite3 moderation_ipc.db "select 1; insert into t values(2)"'
+        self.assertEqual(self._role(cmd)[:2], ("ask", "sqlite"))
+
+    # --- (3) ГРАНИЦА РАЗБОРА: неясное краснеет и так и подписано -----------------------------
+    def test_unparsed_query_stays_red_and_says_so(self):
+        for cmd in ("sqlite3 moderation_ipc.db",                       # интерактивный вход
+                    'venv/Scripts/python.exe -c "import sqlite3; '
+                    'c=sqlite3.connect(\'moderation_ipc.db\'); c.execute(q)"'):
+            with self.subTest(cmd):
+                action, kind, obj = self._role(cmd)
+                self.assertEqual((action, kind), ("ask", "sqlite"), cmd)
+                self.assertIn("не разобран", obj, cmd)
+
+    def test_unknown_dot_command_stays_red(self):
+        for sub in (".restore backup.db", ".clone copy.db", ".read script.sql", ".load ext.so"):
+            cmd = 'sqlite3 moderation_ipc.db "%s"' % sub
+            with self.subTest(cmd):
+                self.assertEqual(self._role(cmd)[:2], ("ask", "sqlite"), cmd)
+
+    # --- (4) СЛОВО ≠ ДЕЙСТВИЕ ----------------------------------------------------------------
+    def test_word_without_db_access_is_green(self):
+        for cmd in ("Get-Command sqlite3",
+                    'venv/Scripts/python.exe -c "import sqlite3; print(sqlite3.version)"',
+                    'python cowork_log_append.py "DONE разобрал базу через sqlite3, только чтение"',
+                    'git commit -m "гард: sqlite3 больше не краснеет на чтении"',
+                    'findstr "sqlite3" notes.txt'):
+            with self.subTest(cmd):
+                self.assertEqual(self._role(cmd)[0], "defer", cmd)
+
+    # --- (5) ПОСЛАБЛЕНИЕ НЕ ТЕЧЁТ НА СОСЕДЕЙ -------------------------------------------------
+    def test_read_does_not_whitelist_the_rest_of_the_command(self):
+        """Разбор чтения уходит в `continue`, а не в ранний выход: красное рядом ловится как было."""
+        for cmd, kind in (
+                ('sqlite3 bookings.db "select 1" && rm -rf D:/turbobaby-bot/docs', "delete"),
+                ('sqlite3 bookings.db "select 1"; cat .env', "env"),
+                ('sqlite3 bookings.db "select 1"; curl https://example.com', "network"),
+                ('venv/Scripts/python.exe -c "import sqlite3, os; '
+                 'sqlite3.connect(\'file:x.db?mode=ro\',uri=True).execute(\'select 1\'); '
+                 'os.remove(chr(120))"', "py_write"),
+                ('venv/Scripts/python.exe -c "import sqlite3, gspread; '
+                 'sqlite3.connect(\'file:x.db?mode=ro\',uri=True).execute(\'select 1\')"',
+                 "live_sheet")):
+            with self.subTest(cmd[:70]):
+                self.assertEqual(self._role(cmd)[:2], ("ask", kind), cmd)
+
+    # --- (6) ЧАСТИ РАЗБОРА ПООТДЕЛЬНОСТИ ------------------------------------------------------
+    def test_first_word_rule_is_the_documented_boundary(self):
+        self.assertEqual(g._sql_ops("select 1"), {"read"})
+        self.assertEqual(g._sql_ops("INSERT INTO t VALUES(1)"), {"write"})
+        self.assertEqual(g._sql_ops("select 1; delete from t"), {"read", "write"})
+        self.assertEqual(g._sql_ops("with x as (select 1) select * from x"), {"read"})
+        self.assertEqual(g._sql_ops("with x as (select 1) delete from t"), {"write"})
+        self.assertEqual(g._sql_ops("pragma table_info(t)"), {"read"})
+        self.assertEqual(g._sql_ops("pragma journal_mode=WAL"), {"write"})
+        self.assertEqual(g._sql_ops("=== распределение 362 карточек ==="), set())
+        self.assertEqual(g._sql_ops("file:moderation_ipc.db?mode=ro"), set())
+
+    def test_nested_quotes_are_reached(self):
+        """Внутренний литерал живёт под внешними кавычками `-c "…"` — один проход его не видит."""
+        runs = g._quoted_runs('python -c " c.execute(\\"select 1\\") ; d=\'x.db\' "')
+        self.assertTrue(any(r.strip().startswith("select") for r in runs), runs)
+
+    def test_db_name_is_short_and_survives_uri_form(self):
+        self.assertEqual(g._extract_db("file:D:/turbobaby-bot/moderation_ipc.db?mode=ro"),
+                         "moderation_ipc.db")
+        self.assertEqual(g._extract_db('sqlite3 /var/lib/other/app.db "UPDATE u SET b=1"'),
+                         "app.db")
+        self.assertEqual(g._extract_db("open('data/state.sqlite3')"), "state.sqlite3")
+        self.assertIsNone(g._extract_db("нет тут базы"))
+
+    def test_body_scan_and_command_scan_share_the_verb_list(self):
+        """Класс-фикс на ОБЕ ветки: `ALTER TABLE`/`CREATE TABLE` в ТЕЛЕ скрипта тоже запись.
+        Формы SQL-специфичные (`CREATE TABLE`, а не голое `CREATE`) — иначе обычный питон
+        (`create_booking`, `dropped = []`) краснел бы телом. Голое `UPDATE` намеренно оставлено
+        широким: тело скрипта — не команда, ошибка там может только ДОБАВИТЬ подтверждение."""
+        for sql in ("ALTER TABLE drafts ADD COLUMN x", "CREATE TABLE t (a int)",
+                    "REPLACE INTO meta VALUES (1)", "DROP INDEX idx_wa",
+                    "INSERT OR REPLACE INTO meta VALUES (1)"):
+            self.assertTrue(g._RE_SQL_WRITE.search(sql), sql)
+        for green in ("create_booking(", "dropped = []", "altered = True", "inserted_at"):
+            self.assertIsNone(g._RE_SQL_WRITE.search(green), green)
 
 
 if __name__ == "__main__":

@@ -78,6 +78,19 @@ headless пишет красную карточку в файл-маркер д�
   зелёное (`_py_reads_process_env`), чтение/запись файла `.env` (`open().read()`, `Get-Content`,
   `Select-String -Path .env`, `Set-Content .env`) — красное как было. См. `_py_env_readonly`.
 
+ЧЕТВЁРТОЕ УТОЧНЕНИЕ (30.07.2026): ЧТЕНИЕ БАЗЫ ≠ ЗАПИСЬ В БАЗУ.
+  Слово `sqlite3` красило команду ЦЕЛИКОМ, то есть ловило ИМЯ МОДУЛЯ, а не операцию. Живой счёт
+  19:38:59–19:39:46: ЧЕТЫРЕ карточки подряд в одной сессии, все на
+  `python -c "import sqlite3; con=sqlite3.connect('file:…moderation_ipc.db?mode=ro',uri=True);
+  con.execute('select …')"` — соединение открыто READ-ONLY по URI, запрос один-единственный
+  `select`. Записать такой командой физически нельзя. Карточка приходила потому, что за
+  `import sqlite3` стоит перевод строки, и признак `(^|[\\s;&|(])sqlite3([\\s;&|)]|$)` считал
+  упоминание модуля обращением к базе. Тела скриптов при этом УЖЕ судились по оператору
+  (`_RE_SQL_WRITE` в `_scan_python`) — по слову судился только текст команды.
+  Развели по ДЕЙСТВИЮ, как уже разведены clasp и сеть: чтение (`select`/схема/`mode=ro`/
+  читающие dot-команды) — зелёное, запись (`insert|update|delete|drop|alter|create|…`) — красная
+  с ИМЕНЕМ БАЗЫ в объекте, неразобранное — красное и так и подписано. См. `_sqlite_decide`.
+
 ЛОГ (`pretool_guard.log`, под *.log в .gitignore): пишется КАЖДОЕ решение обеих ролей —
 смягчение не должно стоить прозрачности. Строка: время | роль | инструмент | решение | вид |
 команда (обрезана, значения токенов/паролей замаскированы). Решение `journal` — это подавленная
@@ -140,6 +153,11 @@ try:  # общая ротация + разведение тестового и �
 except Exception:                                        # гард обязан работать даже без модуля
     log_setup = None
 
+# Упоминание `sqlite3` — ЕДИНСТВЕННЫЙ вход в sqlite-разбор (`_sqlite_decide` дороже подстроки,
+# гонять его на каждой команде незачем). Константа названа, потому что нужна дважды: в списке
+# красных признаков и в хвосте `_decide_bash_body`, где решается судьба неразобранной команды.
+_RE_SQLITE_WORD = re.compile(r"(?i)(^|[\s;&|(])sqlite3([\s;&|)]|$)")
+
 # --- КРАСНЫЕ признаки Bash-команды → (regex, kind) ---
 _RED_CMD = [
     (re.compile(r"(?i)(^|[\s;&|(])(del|erase|rmdir|rd|rm)([\s;&|)]|$)"), "delete"),
@@ -153,7 +171,9 @@ _RED_CMD = [
     (re.compile(r"(?i)git\s+push\b.*(--force|(?<![\w-])-f(?![\w]))"), "git_force"),
     (re.compile(r"(?i)git\s+reset\s+--hard"), "git_force"),
     (re.compile(r"(?i)git\s+clean(\s|$)"), "git_force"),
-    (re.compile(r"(?i)(^|[\s;&|(])sqlite3([\s;&|)]|$)"), "sqlite"),
+    # `sqlite3` — ПОВОД РАЗОБРАТЬ, а не приговор: вид определяет `_sqlite_decide` по оператору
+    # запроса (чтение → зелёное и разбор продолжается, запись → красное, неясное → красное).
+    (_RE_SQLITE_WORD, "sqlite"),
     (re.compile(r"(?i)(^|[\s;&|(])clasp([\s;&|)]|$)"), "clasp"),
     # живые таблицы напрямую (не через Bridge): Apps Script / Sheets API / gspread
     (re.compile(r"(?i)script\.google\.com|sheets\.googleapis\.com|(^|[\s;&|(])gspread([\s;&|)]|$)"), "live_sheet"),
@@ -198,9 +218,21 @@ def _extract_host(cmd):
     return m.group(1) if m else None
 
 
+# Файл базы: .db/.db3/.sqlite/.sqlite3 — в любом виде, в каком его пишут живые команды. Кроме
+# голого пути это ещё и URI (`file:D:/turbobaby-bot/moderation_ipc.db?mode=ro`), поэтому знаки
+# `:` и `?` границей имени не считаем — их отрезает уже разбор ниже.
+_RE_DB_FILE = re.compile(r"(?i)([^\s'\"();,=|&]+\.(?:db|db3|sqlite|sqlite3))(?![\w])")
+
+
 def _extract_db(cmd):
-    m = re.search(r"([\w.\-\\/]+\.db)\b", cmd)
-    return m.group(1) if m else None
+    """ИМЯ базы для объекта карточки — КОРОТКОЕ и читаемое: последний компонент пути.
+    Карточку владелец читает за три секунды, и `D:/turbobaby-bot/moderation_ipc.db` в ней
+    занимает строку ради одного значащего слова. Полный путь остаётся в строке «Команда:»."""
+    m = _RE_DB_FILE.search(cmd or "")
+    if not m:
+        return None
+    name = re.split(r"[\\/]", m.group(1))[-1]
+    return name.split(":")[-1] or None      # `file:moderation_ipc.db` → `moderation_ipc.db`
 
 
 def _human(kind, obj=""):
@@ -233,7 +265,14 @@ def _human(kind, obj=""):
     }
     return tpl.get(kind, "Требуется подтверждение операции")
 _RE_ENV = re.compile(r"(?i)(\.env(\b|['\"\s]|$)|\.session\b)")            # .env / *.session в команде
-_RE_SQL_WRITE = re.compile(r"(?i)\b(UPDATE|DELETE\s+FROM|INSERT\s+INTO|DROP\s+TABLE)\b")
+# SQL-ЗАПИСЬ в ТЕЛЕ скрипта (`_scan_python`). Список операторов сведён с `_SQL_WRITE_OPS` —
+# разбором команды и разбором тела обязан править ОДИН перечень, иначе `ALTER TABLE` в теле
+# проезжает молча, а в команде краснеет. Формы намеренно SQL-специфичные (`CREATE TABLE`, а не
+# голое `CREATE`): голый глагол встречается в обычном питоне (`create_booking`, `def update`).
+_RE_SQL_WRITE = re.compile(
+    r"(?i)\b(UPDATE|DELETE\s+FROM|INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|"
+    r"DROP\s+(?:TABLE|INDEX|VIEW|TRIGGER)|ALTER\s+TABLE|"
+    r"CREATE\s+(?:TEMP\s+|TEMPORARY\s+|UNIQUE\s+|VIRTUAL\s+)*(?:TABLE|INDEX|VIEW|TRIGGER))\b")
 # Путь конфига Claude Code, упомянутый В КОМАНДЕ шелла (обход Write/Edit-гейта через cp/mv/>).
 _RE_CLAUDE_CFG_CMD = re.compile(
     r"(?i)\.claude[\\/](settings[\w.-]*\.json|hooks|agents|commands|plugins|skills)|(?<![\w.])\.claude\.json\b")
@@ -515,6 +554,153 @@ def _clasp_decide(cmd, cwd):
     if sub == "run":
         return ("clasp_run", obj)
     return ("clasp", obj)
+
+# ---------------- sqlite: развод по ОПЕРАТОРУ ЗАПРОСА, а не по слову `sqlite3` -----------------
+# `sqlite3` целиком стоял в «спрашивать всегда» — и это ловило не действие, а ИМЯ МОДУЛЯ. За одну
+# сессию 30.07.2026 (19:38:59, 19:39:17, 19:39:32, 19:39:46) это дало ЧЕТЫРЕ карточки подряд на
+# `select` к базе, открытой `mode=ro`: записать таким соединением нельзя в принципе. Признак
+# срабатывал на `import sqlite3`, потому что за словом стоит перевод строки.
+#
+# Тела скриптов ГАРД УЖЕ судил по оператору (`_RE_SQL_WRITE` в `_scan_python`) — по слову судился
+# только ТЕКСТ КОМАНДЫ. Здесь текст команды доводится до того же стандарта:
+#   ЧТЕНИЕ  (select / explain / with-select / читающая pragma / .tables/.schema/.dump / mode=ro)
+#           → зелёное, вид `sqlite_read`, и разбор команды ПРОДОЛЖАЕТСЯ: красное всего
+#           остального (env, .claude, запись вне репо, боевые токены питона) не ослаблено;
+#   ЗАПИСЬ  (insert/update/delete/drop/alter/create/replace/vacuum/attach/пишущая pragma,
+#           .import/.restore/.clone/.read/.load) → красное, ИМЯ БАЗЫ в объекте карточки;
+#   НЕЯСНО  → красное, и в объекте так и написано «оператор не разобран».
+#
+# ЧЕСТНАЯ ГРАНИЦА РАЗБОРА (требование ТЗ: «не выходит надёжно — брать по первому оператору и
+# сказать об этом»). Полного SQL-парсера в хуке нет и не будет. Утверждения режутся по `;` и
+# переводу строки, вид берётся ПО ПЕРВОМУ СЛОВУ-ОПЕРАТОРУ. Доразбирается ровно два случая, где
+# первое слово врёт: `WITH …` (в sqlite CTE умеет нести INSERT/UPDATE/DELETE) и `PRAGMA …=…`
+# (присваивание МЕНЯЕТ настройку базы). Смесь «select + insert» — это ЗАПИСЬ: любой пишущий
+# оператор в любом утверждении красит команду целиком.
+#
+# ЧТО ОСТАЛОСЬ КРАСНЫМ ПО УМОЛЧАНИЮ (доктрина «неизвестное у ЖИВОЙ базы спрашивает»):
+# интерактивный вход `sqlite3 <база>` без запроса (в шелле можно набрать что угодно), SQL,
+# собранный из переменной (`c.execute(q)`), незнакомая dot-команда. Ошибка разбора может
+# ДОБАВИТЬ подтверждение, но не пропустить запись.
+_RE_SQLITE_EXEC = re.compile(r"(?i)\.\s*execute(?:script|many)?\s*\(")
+_RE_SQLITE_CONNECT = re.compile(r"(?i)\bsqlite3?\s*\.\s*connect\s*\(")
+# Соединение, которым ЗАПИСАТЬ НЕЛЬЗЯ: URI-режим `mode=ro` и CLI-флаг `-readonly`.
+_RE_SQLITE_RO = re.compile(r"(?i)mode\s*=\s*ro(?![\w])|(^|[\s\"'])--?readonly(?![\w])")
+
+_SQL_READ_OPS = frozenset(("select", "explain", "values", "pragma", "with"))
+_SQL_WRITE_OPS = frozenset((
+    "insert", "replace", "update", "delete", "drop", "alter", "create", "truncate",
+    "vacuum", "reindex", "attach", "detach", "analyze",
+    # транзакционные слова: сами по себе данных не меняют, но открывают запись — красим их,
+    # потому что рядом всегда стоит то, ради чего транзакцию и начали
+    "begin", "commit", "rollback", "savepoint", "release"))
+# Читающие dot-команды CLI — БЕЛЫЙ и поимённый список (тот же приём, что `_EXISTS_CMDS` и
+# `_CLASP_READ_SUB`). Всё, чего здесь нет, красное: `.import`/`.restore`/`.clone` пишут в базу,
+# `.read`/`.load`/`.shell`/`.system` исполняют, `.output`/`.once`/`.save`/`.backup` пишут файл.
+_SQLITE_READ_DOT = frozenset((
+    ".tables", ".schema", ".fullschema", ".databases", ".dbinfo", ".indexes", ".indices",
+    ".dump", ".show", ".headers", ".mode", ".nullvalue", ".separator", ".width", ".stats",
+    ".changes", ".echo", ".print", ".help", ".quit", ".exit", ".version", ".timeout",
+    ".prompt", ".bail", ".explain"))
+# Первое слово утверждения. Хвост `(?=[\s;]|$)` обязателен: без него `print(` читалось бы как
+# оператор `print`, а `delete(x)`/`update = 5` — как SQL. У настоящего SQL за оператором стоит
+# пробел (`select 1`, `delete from …`) либо конец утверждения (`vacuum`, `commit;`).
+_RE_SQL_FIRST_WORD = re.compile(r"^[\s(\\'\"`\[]*([A-Za-z_]+)(?=[\s;]|$)")
+_RE_CTE_WRITE = re.compile(r"(?i)\b(?:insert|update|delete|replace)\b")
+_RE_SQL_TABLE = re.compile(r"(?i)\b(?:into|from|table|update)\s+[\"'`\[]?([\w.]+)")
+
+
+def _quoted_runs(text):
+    """Команда, разрезанная по кавычкам ОБОИХ типов → список кусков.
+
+    ПОЧЕМУ РЕЖЕМ, А НЕ ИЩЕМ «строки в кавычках». Живая форма — `python -c " … con.execute(\\"select
+    key … from meta\\") … "`, где внешняя кавычка `-c` и внутренние кавычки литерала ЧЕРЕДУЮТСЯ.
+    Пара «открыл-закрыл» на такой строке ловит ПРОМЕЖУТКИ (` con.execute(`), а сам литерал
+    оказывается между закрывающей и следующей открывающей — то есть теряется целиком (проверено:
+    на живой команде 19:38:59 парный разбор `select` не находил). Разрез отдаёт и то, и другое.
+    Экранирование `\\"`/`\\'` снимается заранее — именно в таком виде литерал и приезжает.
+
+    Лишние куски (обычный текст, куски вне кавычек) безвредны: вид утверждения определяет
+    `_sql_ops` по ПЕРВОМУ СЛОВУ-ОПЕРАТОРУ, и проза оператором не становится. Плата за полноту —
+    редкое лишнее подтверждение (`echo "update available"` рядом с обращением к базе), то есть
+    ошибка в безопасную сторону, как и вся доктрина гарда."""
+    s = (text or "").replace('\\"', '"').replace("\\'", "'")
+    out = []
+    for q in ("'", '"'):
+        out.extend(s.split(q))
+    return out
+
+
+def _sql_ops(text):
+    """Виды операторов в тексте → подмножество {'read','write'}. Пусто = SQL не опознан.
+    Разбор ПО ПЕРВОМУ СЛОВУ утверждения (см. «честная граница» выше)."""
+    ops = set()
+    for stmt in re.split(r"[;\n]", text or ""):
+        m = _RE_SQL_FIRST_WORD.match(stmt)
+        if not m:
+            continue
+        w = m.group(1).lower()
+        if w in _SQL_WRITE_OPS:
+            ops.add("write")
+        elif w == "with":
+            ops.add("write" if _RE_CTE_WRITE.search(stmt) else "read")
+        elif w == "pragma":
+            ops.add("write" if "=" in stmt else "read")   # `pragma x=y` меняет настройку базы
+        elif w in _SQL_READ_OPS:
+            ops.add("read")
+    return ops
+
+
+def _sqlite_cli(cmd):
+    """`sqlite3` В КОМАНДНОЙ ПОЗИЦИИ сегмента → список позиционных аргументов (без флагов).
+    None — слова `sqlite3` как команды в строке нет (`import sqlite3`, `Get-Command sqlite3`,
+    имя модуля в тексте): судим по ДЕЙСТВИЮ, а не по подстроке — тот же разбор, что у clasp."""
+    for i, seg in enumerate(_split_segments(cmd or "")):
+        if i % 2:
+            continue
+        try:
+            toks = shlex.split(seg)
+        except Exception:
+            toks = seg.split()
+        j = _cmd_index(toks)
+        if j is None or j >= len(toks):
+            continue
+        if _base(toks[j]) != "sqlite3":
+            continue
+        return [t.strip("'\"") for t in toks[j + 1:] if not t.startswith("-")]
+    return None
+
+
+def _sqlite_decide(cmd):
+    """→ None (обращения к базе в команде нет) | ('sqlite_read', база) | ('sqlite', объект).
+
+    None — это «слово есть, действия нет»: `import sqlite3` без запроса, `Get-Command sqlite3`,
+    имя модуля в строке журнала. Такая команда возвращается в общий разбор нетронутой.
+    Объект красного вида — ИМЯ БАЗЫ; если базу не назвали, берём таблицу из запроса, а если и
+    оператор не разобрался — так и подписываем, чтобы карточка не притворялась точной."""
+    c = cmd or ""
+    args = _sqlite_cli(c)
+    if args is None and not _RE_SQLITE_EXEC.search(c) and not _RE_SQLITE_CONNECT.search(c):
+        return None
+    db = _extract_db(c) or ""
+    ops, dots = set(), []
+    for run in _quoted_runs(c):
+        ops |= _sql_ops(run)
+    for a in args or []:
+        if a.startswith("."):
+            dots.append(a.split()[0].lower())
+        else:
+            ops |= _sql_ops(a)          # незакавыченный запрос/аргумент CLI
+    if any(d not in _SQLITE_READ_DOT for d in dots):
+        return ("sqlite", db or "dot-команда " + dots[0])
+    if "write" in ops:
+        if not db:
+            m = _RE_SQL_TABLE.search(c)
+            db = ("таблица " + m.group(1)) if m else ""
+        return ("sqlite", db)
+    if "read" in ops or dots or _RE_SQLITE_RO.search(c):
+        return ("sqlite_read", db)
+    return ("sqlite", (db + " · " if db else "") + "оператор не разобран")
+
 
 # --- ЗЕЛЁНЫЕ признаки Bash-команды (проверяются ПОСЛЕ красных) ---
 # Доверенные скрипты — зелёные ПО ИМЕНИ модуля, содержимое не сканируется (их тела законно
@@ -1221,6 +1407,13 @@ def _decide_bash(cmd, cwd):
     scan = _scan_text(cmd)
     probe = bool(_RE_ENV.search(scan)) and _env_probe_only(cmd)
     action, kind, obj = _decide_bash_body(cmd, cwd, scan, probe)
+    if action == "defer" and not kind and _RE_SQLITE_WORD.search(scan):
+        # Питон-форма чтения базы доходит сюда через `_scan_python` с пустым видом. Смягчение не
+        # должно стоить прозрачности (доктрина лога): в журнале обязано быть видно, что молча
+        # прошло именно ЧТЕНИЕ базы, а не безымянное «ну ничего красного не нашли».
+        sq = _sqlite_decide(scan)
+        if sq and sq[0] == "sqlite_read":
+            return ("defer", "sqlite_read", sq[1])
     if probe and action == "defer" and not kind:
         return ("defer", "env_probe", "")     # прозрачность лога: пробу наличия видно как пробу
     return (action, kind, obj)
@@ -1232,6 +1425,7 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False):
     # секретам из аргументов НЕ вырезаются. `_RE_OUTSIDE_WRITE` ниже намеренно смотрит СЫРУЮ
     # команду: перенаправление `> C:\…` стоит после имени скрипта и вырезанием пряталось бы.
     netk, nettarget = _net_scan(scan)
+    sq = _sqlite_decide(scan) if _RE_SQLITE_WORD.search(scan) else None
     for rx, kind in _RED_CMD:
         if rx.search(scan):
             # Сеть: красное — только НАСТОЯЩИЙ выход наружу. Свой ssh-канал и упоминание слова
@@ -1244,6 +1438,14 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False):
                 if cl is None:
                     continue                  # `clasp` словом в тексте, а не командой
                 return ("ask", cl[0], cl[1])
+            if kind == "sqlite":
+                # Разводим по оператору запроса. ЧТЕНИЕ (и просто имя модуля) не обрывает разбор:
+                # уходим в `continue`, чтобы остальные красные ветви (env, конфиг `.claude`,
+                # запись вне репо, боевые токены питона) отработали как раньше. Иначе
+                # `python -c "…select…; os.remove(x)"` проехал бы зелёным целиком.
+                if sq is None or sq[0] == "sqlite_read":
+                    continue
+                return ("ask", "sqlite", sq[1])
             obj = ""
             if kind == "delete":
                 obj = _extract_delete_target(scan) or ""
@@ -1289,6 +1491,11 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False):
             return ("defer", "", "")
     if _RE_READONLY_SHELL.search(cmd):
         return ("defer", "", "")
+    # Команда — ЧТЕНИЕ базы и ничего больше (`sqlite3 bookings.db "select 1"`): смотрелки шелла
+    # её не знают, и без этой ветки она упала бы в `unknown`, а `unknown` — hard-блок, карточка
+    # ВСЕГДА. Вид ставим честный: в журнале видно, что решение принято разбором запроса.
+    if sq and sq[0] == "sqlite_read":
+        return ("defer", "sqlite_read", sq[1])
     return ("ask", "unknown", "")
 
 
@@ -1498,8 +1705,10 @@ def _stays_red(kind, obj, cmd):
                 "outside", "write_outside",               # требование п.1: правки ТОЛЬКО внутри репо
                 "edit_claude"):                           # иначе сессия молча расширит собственные права
         return True
-    if kind in ("clasp_read", "clasp_push_pinned"):
-        return False        # чтение проекта и заливка кода при проде НА ВЕРСИИ — прод не двигают
+    if kind in ("clasp_read", "clasp_push_pinned", "sqlite_read"):
+        # чтение проекта Apps Script; заливка кода при проде НА ВЕРСИИ (прод не двигают);
+        # ЧТЕНИЕ базы (`select`/схема/`mode=ro`) — данные не меняются, спрашивать не о чем
+        return False
     if kind == "delete":
         # Временные каталоги из .gitignore (`tmp/`, `%TEMP%\claude\**`) — рабочие черновики самой
         # сессии: в git не едут, прод-контур их не видит, живут один сеанс. Уборка за собой
@@ -1648,6 +1857,14 @@ def _card_fields(kind, obj="", raw_cmd=""):
         o = o or (m.group(0).strip("'\" ") if m else "")
     elif kind == "live_sheet":
         o = o or (_extract_host(cmd) or "")
+    elif kind == "sqlite":
+        # ИМЯ БАЗЫ — обязательный объект карточки записи (требование ТЗ 30.07.2026). Базу не
+        # назвали в команде (`c.execute(…)` по соединению из переменной, имя в теле скрипта) —
+        # берём ТАБЛИЦУ из запроса: это тоже объект, и он честный.
+        o = o or _extract_db(cmd) or ""
+        if not o:
+            m = _RE_SQL_TABLE.search(cmd or "")
+            o = ("таблица " + m.group(1)) if m else ""
     return o.strip(), n.strip()
 
 
