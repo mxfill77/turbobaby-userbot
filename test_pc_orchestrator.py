@@ -575,6 +575,32 @@ class TestApprovalReachesExecutor(Base):
         self.assertEqual(called["n"], 0)                              # истёкшее не запускаем
         self.assertEqual(self.fb.tasks[tid]["status"], "failed")
 
+    def test_orch_runtime_covers_every_top_import_of_daemon(self):
+        """Ворота грязного дерева (класс 28.07) обязаны знать ВСЁ, что демон несёт своими верхними
+        импортами: иначе незакоммиченная правка такого модуля уедет в бой с авто-рестартом. Список
+        сверяем с реальными `import X` файла демона, а не с памятью."""
+        import ast
+        with open(os.path.join(o.REPO, "pc_orchestrator.py"), encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        # МОДУЛЬНЫЙ уровень (в т.ч. внутри try/except — так втянуты log_setup и pretool_guard).
+        # Ленивые импорты внутри функций (`suggest` — тяжёлый клиентский модуль) сюда НЕ относятся:
+        # их грязь стережёт карта клиентского контура, а не список демона.
+        local, stack = set(), list(tree.body)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, ast.Try):
+                stack.extend(node.body + node.orelse + node.finalbody)
+                for h in node.handlers:
+                    stack.extend(h.body)
+                continue
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    if os.path.isfile(os.path.join(o.REPO, a.name + ".py")):
+                        local.add(a.name + ".py")
+        self.assertIn("pretool_guard.py", local)          # смычка с гардом реально в импортах
+        missing = sorted(local - set(o._ORCH_RUNTIME))
+        self.assertEqual(missing, [], f"верхние импорты демона вне _ORCH_RUNTIME: {missing}")
+
     def test_plain_new_task_has_no_approval_marker(self):
         """Обычная (не одобренная) задача маркера не получает — послабление строго per-task."""
         self.fb.add(status="new")
