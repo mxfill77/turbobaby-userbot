@@ -148,3 +148,92 @@ push всему репозиторию**. Та же пара уже стоит �
 
 **Не требуют рестарта:** `userbot_listen`, `moderation_bot` (живут на `SUGGEST_MODEL=sonnet`,
 не меняется), `splinter.service` (свои `SPLINTER_MODEL_*`), RC-сессии.
+
+---
+
+## ЧАСТЬ 3. Что сделано по факту
+
+Решения владельца 30.07.2026: пара **`claude-opus-5` → `claude-opus-4-8`** на обеих полосах;
+нормализатор алиасов обязателен; исполнитель ПК тоже на Opus 5; `suggest.py` не трогать.
+
+### Было → стало
+
+| Полоса | Место | Было | Стало |
+|---|---|---|---|
+| ПК | `.env:19` `THINKER_MODEL` | `claude-fable-5` | `claude-opus-5` |
+| ПК | `pc_orchestrator.py:2020` дефолт `THINKER_MODEL` | `claude-fable-5` ×2 | `claude-opus-5` ×2 |
+| ПК | `pc_orchestrator.py:666` `EXECUTOR_MODEL` | `claude-opus-4-8` | `claude-opus-5` |
+| ПК | `pc_orchestrator.py:2016` нормализатор | имена снятой → `claude-fable-5` | **все** имена снятой → `claude-opus-5` |
+| ПК | `CLAUDE.md`, `.gitignore` | дефолт репо назван снятой моделью | `claude-opus-5` + правило пары |
+| VPS | `.env:15` `ORCH_MODEL_FALLBACK` | `claude-fable-5` | `claude-opus-4-8` |
+| VPS | `orchestrator_daemon.py:173` дефолт `ORCH_MODEL` | `fable` (короткий → 404) | `claude-opus-5` |
+| VPS | `orchestrator_daemon.py:174` дефолт фолбэка | `claude-fable-5` | `claude-opus-4-8` |
+| VPS | `orchestrator_daemon.py:195` `_MODEL_RETIRED` | не было | слой поверх алиасов → `claude-opus-5` |
+
+Зеркальные тесты догнаны В ТОМ ЖЕ заходе на обеих полосах.
+`suggest.py` не тронут (граница клиентского контура). Проверка «основная ≠ фолбэк» не ослаблена.
+
+**Одна проверка уточнена, и это надо знать:** `tests/test_approve_layers.py` стерёг подстроку
+`claude-opus-4-8` как «мёртвую модель» и тем самым запретил бы новый живой фолбэк. Мёртвой была
+`claude-opus-4-8[1m]` (1M-вариант, 404) — страж уточнён до этого литерала. Смысл сохранён.
+
+### Коммиты и гейт
+
+| Полоса | Коммит | Гейт |
+|---|---|---|
+| ПК | `6f556f4` | полный прогон: **2294 теста, OK** (skipped=10) |
+| VPS | `47978e4`, `d81a62d` (комментарии) | `gate.py`: **140 тестов зелёные**, оба раза |
+
+### Проверка: модель ЖИВЫХ процессов (из окружения, не из файла)
+
+ПК — чтение PEB (`OpenProcess` + `ReadProcessMemory`; на Windows запись `os.environ` попадает
+в блок окружения процесса, поэтому PEB показывает ЭФФЕКТИВНОЕ значение):
+
+| Процесс | PID | `THINKER_MODEL` из окружения |
+|---|---|---|
+| `pc_orchestrator.py` (перезапущен, было 18096) | **11976** | **claude-opus-5** |
+| `pc_agent.py` (перезапущен, было 9376) | **6612** | **claude-opus-5** |
+| `moderation_bot.py` (НЕ перезапускали — решение владельца) | 9988 | claude-fable-5 (стухшее, см. ниже) |
+| `userbot_listen.py` (НЕ перезапускали) | 1656 | claude-fable-5 (стухшее, см. ниже) |
+| `rc_supervisor.py` | 11168 | переменной нет вовсе |
+
+**Почему стухшее значение у двух клиентских ботов безопасно.** Они сами думателя не зовут, но
+`moderation_core.py:328` и `trainer.py:593` могут ЛЕНИВО подтянуть `pc_orchestrator` /
+`lesson_router`. Проверено запуском с ровно таким грязным окружением:
+
+```
+THINKER_MODEL=claude-fable-5  → модуль поднялся с THINKER_MODEL=claude-opus-5
+THINKER_MODEL=fable-5         → модуль поднялся с THINKER_MODEL=claude-opus-5
+```
+
+То есть нормализатор закрывает чёрный ход: даже неперезапущенный бот получит Opus 5.
+
+VPS — `/proc/<pid>/environ` по этим именам **пуст**: демон читает `.env` сам (python-dotenv), в
+окружение процесса значения не попадают. Живое значение процесса — его стартовый баннер:
+
+```
+12:47:14  === ДЕМОН СТАРТ … model=claude-opus-5, fallback=claude-fable-5,  executor_model=claude-opus-5 …
+12:51:58  === ДЕМОН СТАРТ … model=claude-opus-5, fallback=claude-opus-4-8, executor_model=claude-opus-5 …
+```
+
+`orchestrator-daemon` перезапущен, `active`, MainPID 216271 → **217816**.
+
+### Проверка: живой вызов
+
+```
+claude -p --model claude-opus-5   → rc=0, ответ 'OK', modelUsage: claude-opus-5
+claude -p --model claude-opus-4-8 → rc=0, ответ 'OK', modelUsage: claude-opus-4-8   (фолбэк ЖИВОЙ, не 404)
+_thinker_exec(...) боевым путём    → вернул 'OK' на THINKER_MODEL=claude-opus-5
+```
+
+### Где имя снятой головы осталось — и почему
+
+- **Ключи снятия** (`pc_orchestrator.py:2016–2017`, `orchestrator_daemon.py:185/195` и тесты на
+  них): убрать нельзя — тогда застрявшее значение уйдёт в `claude -p` как есть и вернёт 404.
+  Слева это ключ, справа везде `claude-opus-5`.
+- **Клиентский контур** (`suggest.py:241–242`, `test_suggest.py`): по прямому указанию владельца
+  не трогаем; дефолт перекрыт `.env` (`SUGGEST_MODEL=sonnet`) и не стреляет.
+- **Моки `modelUsage`** в тестах обеих полос: произвольные строки-ключи, выбор модели не задают.
+- **История**: `docs/`, `docs/artifacts/`, логи, `tmp/write_brain.py`, история коммитов.
+  `docs/revizor_recon.md:129` — датированный снимок разведки, он теперь устарел; переписывать
+  снимок = подделывать запись, поэтому оставлен как есть.
