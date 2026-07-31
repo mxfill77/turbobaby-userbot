@@ -1494,9 +1494,12 @@ class TestOneRuleObjectGatesNumberDoesNot(unittest.TestCase):
 
     FOUR = (
         # (метка, команда, ожидаемый kind, что обязано быть видно в объекте)
+        # ОБНОВЛЕНО 01.08.2026 (задача 137): ждём в объекте не имя функции, а СУЩНОСТЬ, которую
+        # операция трогает. Проверяемое свойство — «операция без числа по природе всё равно
+        # рождает карточку с объектом» — не изменилось.
         ("отмена последней проводки (ДЕНЬГИ)",
          'venv/Scripts/python.exe -c "from bridge import void_last; void_last()"',
-         "py_write", "void_last"),
+         "py_write", "последняя проводка"),
         ("стоп сервиса по имени", "systemctl stop nginx", "kill", "nginx"),
         ("pkill по имени", "pkill ngrok", "kill", "ngrok"),
         ("SQL в чужую БД", 'sqlite3 /var/lib/other/app.db "UPDATE users SET banned=1"',
@@ -2650,18 +2653,25 @@ class TestFifthGroupActionNotWord(unittest.TestCase):
         self.assertIsNone(g._py_write_call("# дальше по коду " + _ATX + " и " + _SFO))
 
     def test_py_write_real_call_cards(self):
-        """Настоящий вызов — красный, в ТРЁХ живых формах (прямой, через модуль, полем action)."""
+        """Настоящий вызов — красный, в ТРЁХ живых формах (прямой, через модуль, полем action).
+
+        ОБНОВЛЕНО 01.08.2026 (задача 137). Файловая форма (`os.remove(chr(120))`) уехала отсюда
+        в `test_py_write_file_destruction_needs_a_path`: разрушение файла — НЕ деньги, Bridge
+        оно не касается, и без названной цели карточка по нему больше не выписывается вовсе.
+        Проверяемое свойство «деньги спрашивают ВСЕГДА» не изменилось — оно осталось ровно на
+        деньгах, а его отдельный пояс (все восемь боевых токенов Bridge) стоит тестом ниже."""
         for cmd, tok in (
                 ('venv/Scripts/python.exe -c "import bridge; bridge.' + _CBK + '(1)"', _CBK),
                 ('venv/Scripts/python.exe -c "' + _ATX + '(amount=100)"', _ATX),
                 ('venv/Scripts/python.exe -c "post(URL, {\'action\': \'' + _ATX
-                 + "', 'amount': 500})\"", _ATX),
-                ('venv/Scripts/python.exe -c "import os; os.remove(chr(120))"', "os.remove")):
+                 + "', 'amount': 500})\"", _ATX)):
             with self.subTest(cmd[:60]):
                 a, k, o = self._role(cmd)
                 self.assertEqual((a, k), ("ask", "py_write"), cmd)
                 self.assertEqual(o, tok)
-                self.assertIsNotNone(self._card(cmd)[0], "деньги спрашивают всегда")
+                card = self._card(cmd)[0]
+                self.assertIsNotNone(card, "деньги спрашивают всегда")
+                self.assertNotIn("Объект: " + tok, card, "объект называет цель, а не операцию")
 
     # --- (3) HEREDOC: тело — данные ----------------------------------------------------------
     def test_heredoc_body_is_data_not_operation(self):
@@ -3052,6 +3062,142 @@ class TestRedRuleLock(unittest.TestCase):
         for name, why in g._ACTION_CHECK.items():
             with self.subTest(name):
                 self.assertTrue(str(why).strip(), "признак %s не назвал проверку" % name)
+
+
+class TestObjectIsTheTargetNotTheAction(unittest.TestCase):
+    """ОБЪЕКТ КАРТОЧКИ — ЦЕЛЬ ОПЕРАЦИИ, А НЕ ЕЁ ИМЯ (правило-класс, 01.08.2026).
+
+    Повод дословный — карточка задачи 136 от 31.07:
+        🔴 Хочу выполнить python с боевой записью (os.remove) — разрешить?
+        Объект: os.remove
+        Откат: боевую запись Bridge снимает только обратная операция (void_last/…)
+    Проверить её владелец не мог: неизвестно, ЧТО именно удаляют, — а вид ВЫСШИЙ, то есть
+    подтверждается ПЕРЕПИСЫВАНИЕМ объекта. Владелец переписывал имя функции: рука работала,
+    глаз не работал. Плюс откат говорил про денежную проводку на уборке файла в `tmp/`.
+
+    Голдены здесь стерегут три свойства: объект называет ЦЕЛЬ; цель не названа — карточки нет
+    вовсе (а решение гарда прежнее); откат относится к ЭТОЙ операции."""
+
+    PY = "venv/Scripts/python.exe"
+    RM = "os." + "remove"
+    RMTREE = "shutil." + "rmtree"
+    ATX = "add_" + "transaction"
+    VL = "void_" + "last"
+
+    def _role(self, cmd, env=None):
+        return g.decide_for_role({"tool_name": "Bash", "tool_input": {"command": cmd},
+                                  "cwd": PROJ}, headless=True, env=(env or {}))
+
+    def _decision(self, cmd):
+        """Точный повтор main(): решение роли → карточка / отказ / журнал."""
+        a, k, o = self._role(cmd)
+        return g.card_decision(k, o, cmd) if a == "ask" else (a, "")
+
+    # --- (1) ЖИВОЙ СЛУЧАЙ КАРТОЧКИ 136 -------------------------------------------------------
+    def test_card_136_names_the_file_not_the_function(self):
+        cmd = self.PY + ' -c "import os; ' + self.RM + "('tmp/tb_x.txt')\""
+        dec, card = self._decision(cmd)
+        self.assertEqual(dec, "ask")
+        self.assertIn("Объект: tmp/tb_x.txt", card)
+        self.assertNotIn("Объект: " + self.RM, card)
+        # ФРАЗА по-прежнему называет ДЕЙСТВИЕ — это её работа; цель называет строка «Объект».
+        self.assertIn("(" + self.RM + ")", card.splitlines()[1])
+        # Шапка высшего вида просит переписать ИМЕННО цель, а не имя функции.
+        self.assertIn("«да tb_x.txt»", card.splitlines()[0])
+
+    # --- (2) ЦЕЛЬ НЕ ИЗВЛЕКЛАСЬ → КАРТОЧКИ НЕТ ВОВСЕ -----------------------------------------
+    def test_py_write_file_destruction_needs_a_path(self):
+        """Разрушение файла — НЕ деньги: без названной цели карточка не выписывается, а
+        решение гарда при этом ПРЕЖНЕЕ (красное, операция не исполняется).
+        Цель обязана быть ЛИТЕРАЛОМ: `p`, `chr(120)`, `os.path.join(a, b)` цели не называют."""
+        for cmd in (self.PY + ' -c "import os, sys; p=sys.argv[1]; ' + self.RM + '(p)"',
+                    self.PY + ' -c "import os; ' + self.RM + '(chr(120))"',
+                    self.PY + ' -c "import shutil, os; ' + self.RMTREE + '(os.path.join(a, b))"'):
+            with self.subTest(cmd[-42:]):
+                a, k, o = self._role(cmd)
+                self.assertEqual((a, k), ("ask", "py_write"), "решение гарда прежнее")
+                self.assertTrue(g._stays_red(k, o, cmd), "вид остался красным")
+                dec, text = g.card_decision(k, o, cmd)
+                self.assertEqual(dec, "deny", "подтверждаемой карточки быть не должно")
+                self.assertIn("ОБЪЕКТ НЕ НАЗВАН", text)
+                self.assertIn(o, text, "отказ обязан назвать, что гард всё-таки знает")
+                self.assertIsNone(g.card_or_journal(k, o, cmd))
+
+    # --- (3) ДЕНЬГИ: КОШЕЛЁК И СУММА ---------------------------------------------------------
+    def test_money_card_carries_the_wallet_and_the_amount(self):
+        cmd = self.PY + ' -c "import bridge; bridge.' + self.ATX + "(wallet='cash', amount=5000)\""
+        dec, card = self._decision(cmd)
+        self.assertEqual(dec, "ask")
+        self.assertIn("Объект: кошелёк cash", card)
+        self.assertIn("Число: сумма 5000", card)
+        self.assertIn("Bridge", [x for x in card.splitlines() if x.startswith("Откат: ")][0])
+
+    def test_every_bridge_token_cards_even_without_a_target(self):
+        """ГРАНИЦА ВЛАДЕЛЬЦА: деньги спрашивают ВСЕГДА (`_HARD_CARD`). Отмена последней проводки
+        зовётся БЕЗ аргументов по своей природе — объектом ей названа СУЩНОСТЬ, которую операция
+        трогает, а не имя функции."""
+        for tok in g._PY_BRIDGE_TOKENS:
+            with self.subTest(tok):
+                cmd = self.PY + ' -c "import bridge; bridge.' + tok + '()"'
+                obj, _n = g._card_fields("py_write", tok, cmd)
+                self.assertTrue(g._object_named(obj), tok + ": объект обязан быть назван")
+                self.assertNotEqual(obj, tok, "объект не имя функции")
+                self.assertEqual(g.card_decision("py_write", tok, cmd)[0], "ask", tok)
+
+    def test_a_variable_is_not_a_target(self):
+        """`wallet=w` кошелька НЕ называет: `w` — имя переменной. Принять его за объект значило
+        бы повторить ту же ошибку в новой форме: карточка выглядит проверяемой, не будучи ею."""
+        cmd = self.PY + ' -c "' + self.ATX + '(wallet=w, amount=n)"'
+        self.assertEqual(g._card_fields("py_write", self.ATX, cmd), ("проводка", ""))
+
+    def test_several_targets_are_counted(self):
+        cmd = (self.PY + ' -c "import os; ' + self.RM + "('tmp/a.txt'); "
+               + self.RM + "('tmp/b.txt')\"")
+        self.assertEqual(g._card_fields("py_write", self.RM, cmd), ("tmp/a.txt", "2 цели"))
+
+    # --- (4) ОТКАТ ОТНОСИТСЯ К ЭТОЙ ЖЕ ОПЕРАЦИИ ----------------------------------------------
+    def test_rollback_belongs_to_the_same_operation(self):
+        fs = g._rollback("py_write", "", self.RM)
+        self.assertIn("git", fs)
+        self.assertNotIn("Bridge", fs, "уборка файла Bridge не касается вовсе")
+        self.assertIn("Bridge", g._rollback("py_write", "", self.ATX))
+        self.assertIn(self.ATX, g._rollback("py_write", "", self.VL))
+        self.assertIn("неизвестен", g._rollback("py_write", "", "скрипт не прочитан"))
+        for kind in ("delete", "kill", "sqlite", "env", "py_write", "unknown"):
+            self.assertTrue(g._rollback(kind, "x").startswith("Откат: "), kind)
+
+    # --- (5) КРУГ ОДОБРЕНИЯ ЗАМКНУТ ----------------------------------------------------------
+    def test_the_approval_circle_survives_the_new_object(self):
+        """Одобрение сверяется с объектом, КОТОРЫЙ ВЛАДЕЛЕЦ ПРОЧИТАЛ. Без этого пояса «да»
+        на `tmp/…` вернулось бы в гард сверкой с `os.remove`, и операция ходила бы по кругу."""
+        cmd = self.PY + ' -c "import os; ' + self.RM + "('tmp/tb_circle.txt')\""
+        a, k, o = self._role(cmd)
+        card = g.card_or_journal(k, o, cmd)
+        obj = g.object_from_card(card)
+        self.assertEqual(obj, "tmp/tb_circle.txt")
+        self.assertEqual(g.card_object(k, o, cmd), obj, "сверяем ровно напечатанное")
+        reply = "да " + g._reply_key(obj)
+        self.assertTrue(g.reply_confirms_object(reply, obj), "демон сверяет ответ с карточкой")
+        self.assertEqual(self._role(cmd, {g.APPROVED_KINDS_ENV: "py_write",
+                                          g.APPROVED_OBJECT_ENV: reply})[0], "approved")
+        self.assertEqual(self._role(cmd, {g.APPROVED_KINDS_ENV: "py_write",
+                                          g.APPROVED_OBJECT_ENV: "да tmp/чужой.txt"})[0], "ask")
+
+    # --- (6) ГРАНИЦА: ПРАВКА ЖИВЁТ ТОЛЬКО У py_write -----------------------------------------
+    def test_other_kinds_keep_their_object(self):
+        """У прочих видов объект карточки и объект, с которым сверяется одобрение, — по-прежнему
+        ОДНО И ТО ЖЕ значение (совпадение, на которое до правки полагались молча)."""
+        for kind, obj, cmd in (("delete", "docs/x.md", _RMRF + " docs/x.md"),
+                               ("kill", "PID 4242", "taskkill /PID 4242 /F"),
+                               ("live_sheet", "Зарплаты", "python -c \"open('Зарплаты')\""),
+                               ("env", _DOTENV, "cat " + _DOTENV),
+                               ("network", "example.com", "curl https://example.com/x"),
+                               ("write_outside", "C:/ProgramData/x.txt", "")):
+            with self.subTest(kind):
+                self.assertEqual(g.card_object(kind, obj, cmd), obj)
+                self.assertIn("Объект: " + obj, g._card(kind, obj, cmd))
+        # деталь `py_write`, не являющаяся именем операции, тоже остаётся как была
+        self.assertEqual(g.card_object("py_write", "-m pip", "python -m pip install x"), "-m pip")
 
 
 if __name__ == "__main__":

@@ -1000,12 +1000,18 @@ _GREEN_MODULES = {"py_compile", "pytest", "unittest", "json.tool"}
 _RE_PY_FILE = re.compile(r"(?i)(?:^|[\s/\\\"'])([^\s/\\\"';|&]+\.py)(?:[\s\"';|&]|$)")
 _RE_PY_FLAG = re.compile(r"(?i)(^|\s)-(c|m)(\s|$)|(^|\s)-(\s|$)")   # -c/-m/stdin → полный скан, не шорткат
 
-# python-скрипт с боевой записью → красное
-_RED_PY_TOKENS = [
-    "create_booking", "activate_booking", "add_transaction", "void_last",
-    "set_fleet_oil", "set_fleet_service", "delete_event", "closing_upsert",
-    "os.remove", "os.unlink", "shutil.rmtree", "rmtree(", "os.rmdir",
-]
+# python-скрипт с боевой записью → красное. Под ОДНИМ видом живут ДВЕ разные природы, и
+# в карточке они расходятся втроём — цель, число, откат:
+#   • запись Bridge — ДЕНЬГИ и парк: цель у неё сущность (кошелёк, бронь, байк), число —
+#     сумма, откат только обратной операцией;
+#   • питон-родное разрушение файлов — Bridge не касается ВОВСЕ: цель у него путь, а откат
+#     «из git или бэкапа». Ровно на этой границе карточка задачи 136 (31.07) врала владельцу
+#     строкой «боевую запись Bridge снимает обратная операция» на уборке файла в `tmp/`.
+# Склейка сохраняет ПРЕЖНИЙ порядок: `_py_write_call` возвращает первый совпавший токен.
+_PY_BRIDGE_TOKENS = ("create_booking", "activate_booking", "add_transaction", "void_last",
+                     "set_fleet_oil", "set_fleet_service", "delete_event", "closing_upsert")
+_PY_FS_TOKENS = ("os.remove", "os.unlink", "shutil.rmtree", "rmtree(", "os.rmdir")
+_RED_PY_TOKENS = list(_PY_BRIDGE_TOKENS) + list(_PY_FS_TOKENS)
 
 # ── БОЕВАЯ ЗАПИСЬ — это ВЫЗОВ, а не ИМЯ В ТЕКСТЕ (правка 31.07.2026, вторая часть пятой группы)
 # Токены выше искались ГОЛОЙ ПОДСТРОКОЙ по команде и телу скрипта (`for tok in _RED_PY_TOKENS:
@@ -1043,6 +1049,130 @@ def _py_write_call(text):
                 or re.search(r"getattr\s*\([^)]*['\"]" + esc + r"['\"]", t):
             return tok
     return None
+
+
+# ══ ОБЪЕКТ КАРТОЧКИ — ЦЕЛЬ ОПЕРАЦИИ, А НЕ ЕЁ ИМЯ (правило-класс, 01.08.2026) ═════════════════
+# ПОВОД дословный, карточка задачи 136 от 31.07:
+#     🔴 Хочу выполнить python с боевой записью (os.remove) — разрешить?
+#     Объект: os.remove
+#     Откат: боевую запись Bridge снимает только обратная операция (void_last/…)
+# Владельцу решать НЕ ПО ЧЕМУ: неизвестно, ЧТО именно удаляют, — а `py_write` вид ВЫСШИЙ, то
+# есть подтверждается переписыванием объекта. Владелец переписывал имя функции: рука работала,
+# глаз не работал. Плюс строка отката говорила про денежную проводку на команде, которая
+# Bridge не касается вовсе (локальная проба в `tmp/`).
+#
+# ПРАВИЛО: в поле «Объект» стоит ЦЕЛЬ — путь, имя сущности, номер, — а не имя функции или
+# модуля. Цель не извлеклась — объекта НЕТ; что из этого следует, решает не эта функция, а
+# общее правило карточек (`card_decision`): у высшего вида карточка не выписывается ВОВСЕ,
+# решение гарда при этом прежнее (красное, операция не исполняется).
+#
+# ЦЕЛЬЮ СЧИТАЕТСЯ ТОЛЬКО ЛИТЕРАЛ. `os.remove(p)`, `rmtree(os.path.join(a, b))`,
+# `add_transaction(wallet=w)` цели НЕ называют: `p`/`w` — имена переменных, а не файл и не
+# кошелёк. Назвать их объектом значило бы повторить ту же ошибку в новой форме — карточка
+# выглядела бы проверяемой, не будучи ею. Литерал (строка или число) — называет.
+_RE_PY_LITERAL = re.compile(r"^[rbuf]{0,2}(['\"])([^'\"]{1,120})\1$")
+_RE_PY_NUMBER = re.compile(r"^-?\d{1,12}$")
+
+
+def _named_literal(text, key):
+    """Значение именованного аргумента `key=<литерал>` (и его словарной формы `"key": …`)."""
+    m = re.search(r"(?i)['\"]?\b" + key + r"['\"]?\s*[=:]\s*(?:'([^']{1,80})'|"
+                  r"\"([^\"]{1,80})\"|(-?\d{1,12}))", text or "")
+    return next((x.strip() for x in (m.groups() if m else ()) if x and x.strip()), "")
+
+
+# Именованный аргумент, называющий СУЩНОСТЬ, и существительное для карточки: владелец читает
+# «кошелёк cash», а не «add_transaction(wallet='cash')». Порядок значим — первый совпавший.
+_PY_ARG_NOUNS = (("wallet", "кошелёк"), ("booking_id", "бронь"), ("booking", "бронь"),
+                 ("bike_id", "байк"), ("bike", "байк"), ("plate", "номер"),
+                 ("client", "клиент"), ("customer", "клиент"), ("phone", "телефон"),
+                 ("event_id", "событие"), ("event", "событие"))
+# То же для файловой семьи: путь говорит сам за себя, существительное к нему не нужно.
+_PY_PATH_ARGS = ("path", "file", "filename", "src", "dst", "target", "name")
+# СУЩНОСТЬ операции Bridge — на случай, когда идентификатор в команде не назван. Здесь это НЕ
+# лазейка «назовём действие по-русски», а граница владельца: `py_write` стоит в `_HARD_CARD`
+# («деньги спрашивают ВСЕГДА»), и отмена последней проводки зовётся БЕЗ аргументов ПО СВОЕЙ
+# ПРИРОДЕ. Целью названа сущность, которую операция трогает, а не операция.
+_PY_ENTITY = {"create_booking": "новая бронь", "activate_booking": "бронь",
+              "add_transaction": "проводка", "void_last": "последняя проводка",
+              "set_fleet_oil": "масло в парке", "set_fleet_service": "сервис в парке",
+              "delete_event": "событие календаря", "closing_upsert": "закрытие смены"}
+
+
+def _py_call_args(text, tok):
+    """Тексты АРГУМЕНТОВ каждого вызова `tok(…)` → список строк. Скобки считаем по глубине:
+    вложенный вызов внутри аргументов разбор не обрывает."""
+    t, out = text or "", []
+    pat = re.escape(tok) if tok.endswith("(") else re.escape(tok) + r"\s*\("
+    for m in re.finditer(pat, t):
+        i, depth = m.end(), 1
+        while i < len(t) and depth:
+            depth += 1 if t[i] == "(" else (-1 if t[i] == ")" else 0)
+            i += 1
+        out.append(t[m.end():i - 1] if depth == 0 else t[m.end():i])
+    return out
+
+
+def _first_arg(args):
+    """ПЕРВЫЙ позиционный аргумент вызова. Запятые внутри кавычек и вложенных скобок
+    разделителями не считаем."""
+    depth, q, cur = 0, "", []
+    for ch in args or "":
+        if q:
+            cur.append(ch)
+            q = "" if ch == q else q
+            continue
+        if ch in "'\"":
+            q = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            break
+        cur.append(ch)
+    return "".join(cur).strip()
+
+
+def _py_literal_target(args):
+    """ЦЕЛЬ из аргументов одного вызова: именованный путь либо первый позиционный литерал."""
+    for key in _PY_PATH_ARGS:
+        v = _named_literal(args, key)
+        if v:
+            return v
+    first = _first_arg(args)
+    m = _RE_PY_LITERAL.match(first)
+    if m:
+        return m.group(2).strip()
+    return first if _RE_PY_NUMBER.match(first) else ""
+
+
+def _py_card_fields(cmd, tok):
+    """→ (объект, число) карточки `py_write`. Объект — ЦЕЛЬ операции, число — сумма (у денег)
+    либо количество целей (у разрушения файлов). Пустой объект = цель не названа."""
+    calls = _py_call_args(cmd, tok)
+    if tok in _PY_FS_TOKENS:
+        seen = [t for t in (_py_literal_target(a) for a in calls) if t]
+        num = ("%d цел%s" % (len(seen), "ь" if len(seen) == 1 else "и")) if len(seen) > 1 else ""
+        return (seen[0] if seen else ""), num
+    # Bridge: сущность + её идентификатор. Форма «имя операции значением поля `action`» вызова
+    # со скобками не имеет — тогда идентификатор ищем по всей команде.
+    scope = calls or [cmd or ""]
+    obj = ""
+    for args in scope:
+        for key, noun in _PY_ARG_NOUNS:
+            v = _named_literal(args, key)
+            if v:
+                obj = (noun + " " + v).strip()
+                break
+        if not obj:
+            v = _py_literal_target(args)
+            if v:
+                obj = (_PY_ENTITY.get(tok, "") + " " + v).strip()
+        if obj:
+            break
+    amount = next((a for a in (_named_literal(s, "amount") for s in scope) if a), "")
+    return (obj or _PY_ENTITY.get(tok, "")), ("сумма " + amount if amount else "")
 
 
 def _inside_project(path):
@@ -2455,7 +2585,10 @@ def decide_for_role(data, headless, env=None):
     if (data.get("tool_name") or "") in ("Bash", "PowerShell"):
         cmd = (data.get("tool_input") or {}).get("command") or ""
     if _stays_red(kind, obj, cmd):
-        if approval_covers(kind, obj, env):
+        # Сверяем «да» владельца с объектом, КОТОРЫЙ ОН ПРОЧИТАЛ В КАРТОЧКЕ (`card_object`), а
+        # не с внутренним значением разбора: у `py_write` они разошлись — разбор называет
+        # операцию, карточка называет цель.
+        if approval_covers(kind, card_object(kind, obj, cmd), env):
             return ("approved", kind, obj)
         return action, kind, obj
     return ("defer", kind, obj)
@@ -2528,6 +2661,17 @@ _ROLLBACK = {
     "py_write": "Откат: боевую запись Bridge снимает только обратная операция (void_last/…)",
     "unknown": "Откат: неизвестен — гард не разобрал команду",
 }
+
+# ОТКАТ ОТНОСИТСЯ К ЭТОЙ ЖЕ ОПЕРАЦИИ. Вид `py_write` держит две разные природы (см. блок у
+# `_PY_BRIDGE_TOKENS`), и одна строка на обе была ВРАНЬЁМ: карточка 136 предлагала снимать
+# уборку файла в `tmp/` «обратной проводкой Bridge». Не подошёл шаблон — честный прочерк лучше:
+# у операции, которую гард не разобрал до конца, откат назван неизвестным, а не выдуман.
+_ROLLBACK_PY = {
+    "void_last": "Откат: снятую проводку возвращают вручную (add_transaction на ту же сумму)",
+    "delete_event": "Откат: событие календаря восстанавливают вручную — записи о нём не остаётся",
+}
+_ROLLBACK_PY_FS = "Откат: удалённое не вернуть — только из git или бэкапа"
+_ROLLBACK_PY_UNKNOWN = "Откат: неизвестен — гард не разобрал, ЧТО именно пишет скрипт"
 
 _RE_NUM_VERSION = re.compile(r"(?i)(?:^|\s)-V\s+(\d+)")
 _RE_NUM_PID = re.compile(r"(\d+)")
@@ -2632,13 +2776,45 @@ def _card_fields(kind, obj="", raw_cmd=""):
         if not o:
             m = _RE_SQL_TABLE.search(cmd or "")
             o = ("таблица " + m.group(1)) if m else ""
+    elif kind == "py_write" and o in _RED_PY_TOKENS:
+        # ОБЪЕКТ ПРИШЁЛ ИМЕНЕМ ОПЕРАЦИИ: `_scan_python` отдаёт сюда токен `_RED_PY_TOKENS` —
+        # это ДЕЙСТВИЕ, а не цель (карточка 136, блок правила у `_py_card_fields`). Меняем на
+        # цель; не назвали цель — объекта нет, и карточку не выписывает `card_decision`.
+        # Условие `o in _RED_PY_TOKENS` — то же, по которому вид держит красное (`_stays_red`):
+        # деталь вроде «скрипт не прочитан» или «-m X» именем операции не является и остаётся
+        # как была.
+        o, n = _py_card_fields(cmd, o)
     return o.strip(), n.strip()
 
 
-def _rollback(kind, raw_cmd=""):
+def card_object(kind, obj="", raw_cmd=""):
+    """ОБЪЕКТ, КОТОРЫЙ НАПЕЧАТАН В КАРТОЧКЕ, — и единственное, с чем сверяется «да» владельца.
+
+    Та же привычка, что чинили 31.07 у класса одобрения: служебное значение читается ОТТУДА,
+    куда его положил гард. Здесь — из того же места, откуда его читает глаз владельца. До этой
+    правки совпадение держалось случайно (разбор и карточка называли объект одинаково), а как
+    только карточка `py_write` стала называть ЦЕЛЬ вместо имени функции, «да» владельца на
+    `tmp/x.txt` вернулось бы в гард сверкой с `os.remove` — то есть НЕ вернулось бы никогда:
+    операция ходила бы по кругу. Fail-closed сохранён: пустой объект ключей не даёт."""
+    try:
+        return _card_fields(kind, obj, raw_cmd)[0]
+    except Exception:
+        return " ".join(str(obj or "").split())
+
+
+def _rollback(kind, raw_cmd="", obj=""):
     """Одна строка отката. Для выкатки Apps Script собирается ПО КОМАНДЕ: тот же деплой, прежняя
     версия — ровно та строка, которой владелец сам откатывался (артефакт 2026-07-29). id деплоя
-    маскируем хвостом: карточка обязана читаться, полный id есть в `clasp deployments`."""
+    маскируем хвостом: карточка обязана читаться, полный id есть в `clasp deployments`.
+    Для `py_write` — ПО САМОЙ ОПЕРАЦИИ (`obj` = токен от `_scan_python`): у разрушения файла и
+    у денежной проводки откат разный, а у неразобранной операции его нет вовсе."""
+    if kind == "py_write":
+        o = " ".join(str(obj or "").split())
+        if o in _PY_FS_TOKENS:
+            return _ROLLBACK_PY_FS
+        if o in _PY_BRIDGE_TOKENS:
+            return _ROLLBACK_PY.get(o) or _ROLLBACK["py_write"]
+        return _ROLLBACK_PY_UNKNOWN
     if kind == "clasp_deploy":
         m = re.search(r"(?i)-i\s+(\S{12,})", raw_cmd or "")
         dep = ("…" + m.group(1)[-6:]) if m else "<deploymentId>"
@@ -2683,7 +2859,7 @@ def _card(kind, obj="", raw_cmd=""):
     lines = ["🔴 " + _human(kind, obj) + " — разрешить?",
              "Объект: " + (o or "—"),
              "Число: " + (n or "—")]
-    lines.append(_rollback(kind, raw_cmd))
+    lines.append(_rollback(kind, raw_cmd, obj))
     if raw_cmd:
         c = " ".join(raw_cmd.split())
         lines.append("Команда: " + (c if len(c) <= 200 else c[:200] + "…"))
@@ -2752,7 +2928,10 @@ def card_decision(kind, obj="", raw_cmd=""):
         if not card_gate(kind, o, n):
             return ("journal", "")
         if is_top_tier(kind) and not _object_named(o):
-            return ("deny", _deny_text(kind, o, raw_cmd))
+            # Подсказка отказа — `o or obj`: у `py_write` цель не извлеклась и `o` пуст, но
+            # ИМЯ операции гард знает. Без него модель не поймёт, что именно назвать в команде,
+            # и обучающий текст перестанет обучать.
+            return ("deny", _deny_text(kind, o or obj, raw_cmd))
     except Exception:
         pass
     return ("ask", _card(kind, obj, raw_cmd))
