@@ -2184,6 +2184,11 @@ ANSWER_TICKET_ENV = "PC_ANSWER_TICKET"    # билет машинного отв
 ANSWER_ORIGIN_ENV = "PC_ANSWER_ORIGIN"    # самообъявление вызывающего: 'agent' принимаем, 'human' — нет
 ANSWER_WHO_ENV = "PC_ANSWER_WHO"          # имя отвечающего (кто именно за пультом)
 DEFAULT_ANSWER_WHO = "Filipp"             # то же имя, что шлёт devbot (`approve_task(qid, "Filipp")`)
+# Машинный ответ ИМЕНЕМ ВЛАДЕЛЬЦА не подписывается. `origin` очередь не хранит (колонки нет),
+# читают там `approved_by` — и до этой правки машинный ответ клал туда "Filipp", то есть ряд
+# очереди прямо утверждал, что одобрил человек. Префикс едет на мост вместе с именем, поэтому
+# признак «отвечала программа» доживает до того, кто смотрит ряд, а не только до местного следа.
+AGENT_WHO_PREFIX = "agent:"
 # Признаки «я ребёнок headless-прогона»: их ставит СВОЕМУ ребёнку сам демон (`_run_task_impl`).
 # Честность признака держится на том, что отвечающая сторона его себе не выдавала и погасить его
 # «забыв флаг» не может: пометка приезжает снаружи, от того, кто запустил.
@@ -2193,11 +2198,22 @@ _AGENT_ENV_MARKS = (ASK_MARKER_ENV, MARKER_TOKEN_ENV, APPROVED_TASK_ENV)
 def _console_attached(stream=None):
     """→ True ⇔ за вызовом ЖИВАЯ консоль (человек печатает руками).
 
-    ВТОРОЙ признак, и он здесь не для красоты. Первый (метки headless-ребёнка в env) машина
-    МОЖЕТ с себя снять: любой процесс волен запустить ребёнка с вычищенным окружением, и тогда
-    «человек» стоил бы одну строку кода. Консоль так не подделать: детям демона stdin/stdout
-    отданы в DEVNULL/пайп по построению (`_run_task_impl`, `_cowork`, `_notify` — всё
-    fire-and-forget), а живой терминал появляется ровно там, где сидит человек.
+    ВТОРОЙ признак. Первый (метки headless-ребёнка в env) машина МОЖЕТ с себя снять: любой
+    процесс волен запустить ребёнка с вычищенным окружением.
+
+    ЧЕСТНО О ПРЕДЕЛЕ (замер 31.07, разбор-оппонент; прежний комментарий здесь утверждал
+    «консоль так не подделать» — ЭТО ОКАЗАЛОСЬ НЕВЕРНО и стоило ложной уверенности).
+    Терминал отсутствует у ребёнка, которого демон запустил САМ (stdin в DEVNULL/пайп), но
+    агент внутри такого ребёнка имеет инструмент оболочки, и у ЕГО оболочки терминал есть.
+    Замерено из этой самой полосы:
+        python - <<EOF            → isatty False  (stdin — пайп heredoc)
+        python -c "…"             → isatty True   (stdin унаследован от оболочки)
+        env -u PRETOOL_ASK_MARKER … python -c "…" → вердикт HUMAN, право (True, '')
+    То есть связка «нет меток + есть tty» автономным процессом достижима ОДНОЙ командой, и
+    признак человек/машина — СИГНАЛ ДЛЯ ДЕЖУРНОГО, А НЕ ГРАНИЦА БЕЗОПАСНОСТИ. Настоящая
+    граница — подтверждение вне этой машины (кнопка владельца в Telegram, как у devbot:
+    owner-gate по uid); локально наблюдаемого признака, недостижимого для агента с оболочкой
+    на том же ПК, не существует в принципе. Не полагаться на него как на замок.
     Сбой проверки → False (то есть «машина»): fail-closed."""
     try:
         s = stream if stream is not None else sys.stdin
@@ -2249,17 +2265,43 @@ def answer_allowed(origin, env=None):
 def _answer_record(rec, path=None):
     """Строка следа в APPROVAL_LEDGER (JSONL, кольцо на APPROVAL_LEDGER_KEEP) → True/False.
     НИКОГДА не бросает: сорванный след не смеет отменить уже поставленный ответ (о срыве
-    останется строка в логе демона — второй канал следа, третий — cowork_log)."""
+    останется строка в логе демона — второй канал следа, третий — cowork_log).
+
+    Две детали ниже — не косметика, обе найдены разбором-оппонентом 31.07 и воспроизведены:
+    • ЧТЕНИЕ через `errors="replace"`. Строгий utf-8 на ОДНОМ рваном байте уводил всю функцию
+      в `except`, и след переставал писаться НАВСЕГДА и молча — а в карточках кириллица и
+      эмодзи, у оборванной записи хвост как раз висячий ведущий байт. Строка с заменённым
+      символом лучше мёртвого реестра.
+    • ЗАПИСЬ через tmp+os.replace (идиома репо, ср. `:4930`, `:5393`). `open(p,"w")` рубит файл
+      ДО записи: обрыв в этом окне уносил не новую строку, а все APPROVAL_LEDGER_KEEP. Окно
+      реальное — `--approve` это ровно та команда, которую человек прерывает с клавиатуры."""
     p = path or APPROVAL_LEDGER
     try:
         try:
-            with open(p, encoding="utf-8") as f:
-                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+            with open(p, encoding="utf-8", errors="replace") as f:
+                raw = [ln for ln in f.read().splitlines() if ln.strip()]
         except FileNotFoundError:
-            lines = []
+            raw = []
+        # `errors="replace"` спасает от вечной смерти следа, но САМ ПО СЕБЕ оставляет огрызок
+        # битой строки в файле навсегда — и тогда любой читатель реестра (дежурный, разбор)
+        # падает на json.loads. Поэтому нечитаемые строки выбрасываем ВСЛУХ: файл обязан
+        # оставаться валидным JSONL, а о потере должен остаться след в логе.
+        lines, dropped = [], 0
+        for ln in raw:
+            try:
+                json.loads(ln)
+            except Exception:
+                dropped += 1
+                continue
+            lines.append(ln)
+        if dropped:
+            log.warning("реестр ответов: выброшено битых строк: %s (файл приведён к валидному JSONL)",
+                        dropped)
         lines.append(json.dumps(rec, ensure_ascii=False))
-        with open(p, "w", encoding="utf-8") as f:
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write("\n".join(lines[-APPROVAL_LEDGER_KEEP:]) + "\n")
+        os.replace(tmp, p)
         return True
     except Exception as ex:
         log.warning("след ответа на карточку не записан (%s) — сам ответ это не отменяет", ex)
@@ -2332,6 +2374,8 @@ def answer_card(tid, yes, reply="", who=None, origin=None, bridge=None, env=None
     b = bridge if bridge is not None else bc
     org = origin or answer_origin(e, console)
     who = str(who or (e.get(ANSWER_WHO_ENV) or "").strip() or DEFAULT_ANSWER_WHO)
+    if org == ORIGIN_AGENT and not who.startswith(AGENT_WHO_PREFIX):
+        who = AGENT_WHO_PREFIX + who      # ряд очереди не смеет утверждать, что одобрил человек
     rec = {"task": tid, "decision": ("approve" if yes else "reject"), "by": who, "origin": org,
            "lane": LANE, "reply": _clip(str(reply or ""), 300), "kinds": [], "top": [],
            "object": "", "card": ""}

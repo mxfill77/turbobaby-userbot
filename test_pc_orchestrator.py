@@ -3380,9 +3380,13 @@ class TestAnswerCardFromPC(Base):
         env = {o.ASK_MARKER_ENV: "pc_ask_9.marker", o.ANSWER_ORIGIN_ENV: "human"}
         live = (lambda: True)
         self.assertEqual(o.answer_origin(env, live), o.ORIGIN_AGENT)  # метка снаружи бьёт самообъявление
+        # ВНИМАНИЕ, ЭТО НЕ ЗАМОК (замер 31.07): связка «нет меток + есть tty» достижима
+        # автономным процессом ОДНОЙ командой — `env -u PRETOOL_ASK_MARKER … python -c …` из
+        # инструмента оболочки даёт isatty True и вердикт HUMAN. Строка ниже фиксирует
+        # ФАКТИЧЕСКОЕ поведение, а не гарантию; настоящая граница — подтверждение вне этой
+        # машины (кнопка владельца), см. докстроку _console_attached.
         self.assertEqual(o.answer_origin({}, live), o.ORIGIN_HUMAN)
-        # вычистить себе окружение машина умеет, а консоль подделать — нет: без терминала это
-        # всё равно машина (ровно эта дыра и делала признак «только по env» бессмысленным)
+        # без терминала это всё равно машина — признак «только по env» был бы бессмысленным
         self.assertEqual(o.answer_origin({}, (lambda: False)), o.ORIGIN_AGENT)
 
     def test_agent_denied_without_switch(self):
@@ -3422,6 +3426,48 @@ class TestAnswerCardFromPC(Base):
         self.assertIn(o.ANSWER_TICKET_ENV, msg)
         self.assertEqual(self.fb.approvals, [])
 
+    # ── 5. находки разбора-оппонента 31.07 (воспроизведены живьём) ────────────────────────
+    def test_torn_byte_does_not_kill_the_ledger_forever(self):
+        # Строгий utf-8 на ОДНОМ рваном байте уводил _answer_record в except, и след переставал
+        # писаться НАВСЕГДА и молча. Карточки кириллические + эмодзи — оборванный хвост это
+        # ровно висячий ведущий байт, то есть случай не выдуманный.
+        with open(self._led, "wb") as f:
+            f.write('{"task": 1, "card": "Проверка"}\n'.encode("utf-8") + b"\xd0")
+        tid = self._waiting()
+        ok, _ = o.answer_card(tid, True, **self.human)
+        self.assertTrue(ok)
+        self.assertEqual(self._trace()[-1]["task"], tid)      # новая строка ЛЕГЛА, реестр жив
+
+    def test_ledger_rewrite_is_atomic(self):
+        # open(p,"w") рубил файл ДО записи: обрыв в этом окне уносил не новую строку, а ВЕСЬ
+        # реестр. `--approve` — ровно та команда, которую человек прерывает с клавиатуры.
+        tid = self._waiting()
+        o.answer_card(tid, True, **self.human)
+        before = self._trace()
+        self.assertTrue(before)
+        self.assertFalse(os.path.exists(self._led + ".tmp"))   # успех хвостов не оставляет
+        with mock.patch.object(o.os, "replace", side_effect=OSError("обрыв на замене")):
+            self.assertFalse(o._answer_record({"task": 777}, self._led))
+        self.assertEqual(self._trace(), before)                # старые строки целы, а не стёрты
+
+    def test_agent_answer_is_not_signed_with_owner_name(self):
+        # `origin` очередь НЕ хранит (колонки нет) — читают там approved_by. До правки машинный
+        # ответ клал туда "Filipp", то есть ряд очереди прямо утверждал, что одобрил человек.
+        tid = self._waiting()
+        ok, _ = o.answer_card(tid, True, env={o.MARKER_TOKEN_ENV: "t",
+                                              o.ANSWER_AGENT_FLAG: "1", o.ANSWER_TICKET_ENV: "TK"})
+        self.assertTrue(ok)
+        who = self.fb.tasks[tid]["approved_by"]
+        self.assertTrue(who.startswith(o.AGENT_WHO_PREFIX))    # признак доезжает до РЯДА, не только следа
+        self.assertNotEqual(who, o.DEFAULT_ANSWER_WHO)
+        self.assertEqual(self._trace()[-1]["by"], who)         # след и ряд говорят одно и то же
+
+    def test_human_answer_keeps_plain_owner_name(self):
+        # регресс к контракту devbot: человеческий ответ формат approved_by НЕ меняет
+        tid = self._waiting()
+        o.answer_card(tid, True, **self.human)
+        self.assertEqual(self.fb.tasks[tid]["approved_by"], o.DEFAULT_ANSWER_WHO)
+
     def test_agent_allowed_with_switch_and_ticket(self):
         tid = self._waiting()
         env = {o.MARKER_TOKEN_ENV: "t", o.ANSWER_AGENT_FLAG: "1", o.ANSWER_TICKET_ENV: "TK",
@@ -3429,9 +3475,12 @@ class TestAnswerCardFromPC(Base):
         ok, _ = o.answer_card(tid, True, env=env)
         self.assertTrue(ok)
         call = self.fb.approvals[-1]
+        # approved_by с 31.07 несёт префикс машины ДАЖЕ при явно названном имени: origin в ряд
+        # очереди не кладётся (колонки нет), и без префикса ряд не отличить от человеческого.
+        # Человеческий формат при этом не тронут (test_human_answer_keeps_plain_owner_name).
         self.assertEqual((call["origin"], call["ticket"], call["approved_by"]),
-                         (o.ORIGIN_AGENT, "TK", "duty-bot"))
-        self.assertEqual(self._trace()[-1]["by"], "duty-bot")
+                         (o.ORIGIN_AGENT, "TK", o.AGENT_WHO_PREFIX + "duty-bot"))
+        self.assertEqual(self._trace()[-1]["by"], o.AGENT_WHO_PREFIX + "duty-bot")
 
     def test_ticket_value_never_lands_in_trace(self):
         # правило свода §6: боевые токены в следах не цитируем
