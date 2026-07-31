@@ -141,6 +141,7 @@ import json
 import shlex
 import subprocess
 import datetime
+import collections
 
 try:  # хук-протокол Claude Code читает stdout как UTF-8; форсим, чтобы 🔴/кириллица не бились
     sys.stdout.reconfigure(encoding="utf-8")
@@ -196,28 +197,99 @@ except Exception:                                        # гард обязан
 # красных признаков и в хвосте `_decide_bash_body`, где решается судьба неразобранной команды.
 _RE_SQLITE_WORD = re.compile(r"(?i)(^|[\s;&|(])sqlite3([\s;&|)]|$)")
 
-# --- КРАСНЫЕ признаки Bash-команды → (regex, kind) ---
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# ЗАМОК КЛАССА «ПРИЗНАК СРАБОТАЛ НА ТЕКСТЕ, А НЕ НА ДЕЙСТВИИ» (31.07.2026)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# За сутки владелец увидел СЕМЬ ложных карточек одного рода: класс присваивался по ФОРМЕ строки
+# (нашлась подстрока), а не по тому, что команда ДЕЛАЕТ. Чинить их по одной бесполезно — восьмая
+# группа родится ровно так же, как родились семь предыдущих: кто-то допишет в таблицу пару
+# `(regex, kind)`, и новая подстрока начнёт красить текст.
+#
+# ПОЭТОМУ ПАРЫ БОЛЬШЕ НЕТ. Правило — запись `_RedRule`, и собрать её можно ТОЛЬКО через `_red()`,
+# который ТРЕБУЕТ назвать, чем подтверждается ДЕЙСТВИЕ. Ровно два законных способа:
+#
+#   verbs={…}  — имя команды. Признак считается сработавшим, только если это имя стоит в
+#                КОМАНДНОЙ ПОЗИЦИИ хотя бы одного сегмента (`_verb_acts` → `_split_segments` +
+#                `_cmd_index`). Слово в тексте записи, в шаблоне поиска, в фикстуре — не команда.
+#   probe="…"  — имя СТРУКТУРНОГО разборщика, который сам смотрит действие и возвращает вид
+#                (`_sqlite_decide` — по оператору запроса, `_clasp_decide` — по подкоманде,
+#                `_net_scan` — по командной позиции, `_live_sheet_decide` — по форме обращения).
+#
+# Правило без того и другого — ValueError ПРИ ИМПОРТЕ: гард падает громко и сразу, у автора
+# нового правила нет ни одной секунды, когда «пока и так сойдёт». Это и есть замок: старый
+# образец физически не набирается. Второй пояс — генеративный тест
+# `test_pretool_guard.test_red_table_*`: он сам строит из `verbs` каждой строки текстовые пробы
+# (эхо, сообщение коммита, шаблон поиска) и требует молчания. Новое правило проверяется тестом,
+# которого для него никто не писал.
+_RedRule = collections.namedtuple("RedRule", "rx kind verbs probe")
+
+
+def _red(rx, kind, verbs=None, probe=None):
+    """Единственный конструктор красного признака. Требует НАЗВАТЬ проверку действия."""
+    if not verbs and not probe:
+        raise ValueError(
+            "правило %r: признак обязан назвать проверку ДЕЙСТВИЯ — verbs={имена команд} "
+            "либо probe='имя структурного разборщика'. Голая пара (regex, kind) запрещена: "
+            "именно так родились семь ложных классов 30–31.07.2026." % (kind,))
+    return _RedRule(rx if hasattr(rx, "search") else re.compile(rx), kind,
+                    frozenset(v.lower() for v in (verbs or ())), probe)
+
+
+# Имена команд удаления — они же verbs правил ниже и они же список для `_delete_scan`.
+# `ri` (алиас Remove-Item в PowerShell) добавлен в ПРИЗНАК 31.07.2026: он стоял только здесь, а
+# регулярка его не знала — то есть `ri файл` не краснел ВООБЩЕ. Нашёл это замок
+# (`test_declared_verbs_actually_trigger_their_own_regex`): объявленное имя обязано быть видно
+# собственному признаку правила, иначе verbs подтверждают то, чего признак не ловит.
+_DEL_CMDS = {"del", "erase", "rmdir", "rd", "rm", "remove-item", "ri"}
+
+# --- КРАСНЫЕ признаки Bash-команды (каждый — с проверкой ДЕЙСТВИЯ) ---
 _RED_CMD = [
-    (re.compile(r"(?i)(^|[\s;&|(])(del|erase|rmdir|rd|rm)([\s;&|)]|$)"), "delete"),
-    (re.compile(r"(?i)remove-item\b"), "delete"),
-    (re.compile(r"(?i)(^|[\s;&|(])(taskkill|killall|kill|pkill)([\s;&|)]|$)"), "kill"),
-    (re.compile(r"(?i)stop-process\b"), "kill"),
+    _red(r"(?i)(^|[\s;&|(])(del|erase|rmdir|rd|rm)([\s;&|)]|$)", "delete",
+         verbs={"del", "erase", "rmdir", "rd", "rm"}),
+    _red(r"(?i)remove-item\b|(^|[\s;&|(])ri([\s;&|)]|$)", "delete", verbs={"remove-item", "ri"}),
+    _red(r"(?i)(^|[\s;&|(])(taskkill|killall|kill|pkill)([\s;&|)]|$)", "kill",
+         verbs={"taskkill", "killall", "kill", "pkill"}),
+    _red(r"(?i)stop-process\b", "kill", verbs={"stop-process"}),
     # Остановка сервиса по ИМЕНИ — тот же класс «снять процесс», числа у неё нет по природе.
     # restart|start красными НЕ делаем: это штатный поток (зеркало _GREEN_VERBS полосы сервера).
-    (re.compile(r"(?i)(^|[\s;&|(])systemctl\s+(?:--?\S+\s+)*(stop|kill|disable|mask)\b"), "kill"),
-    (re.compile(r"(?i)\bschtasks\b"), "schtasks"),
-    (re.compile(r"(?i)git\s+push\b.*(--force|(?<![\w-])-f(?![\w]))"), "git_force"),
-    (re.compile(r"(?i)git\s+reset\s+--hard"), "git_force"),
-    (re.compile(r"(?i)git\s+clean(\s|$)"), "git_force"),
+    _red(r"(?i)(^|[\s;&|(])systemctl\s+(?:--?\S+\s+)*(stop|kill|disable|mask)\b", "kill",
+         verbs={"systemctl"}),
+    _red(r"(?i)\bschtasks\b", "schtasks", verbs={"schtasks"}),
+    _red(r"(?i)git\s+push\b.*(--force|(?<![\w-])-f(?![\w]))", "git_force", verbs={"git"}),
+    _red(r"(?i)git\s+reset\s+--hard", "git_force", verbs={"git"}),
+    _red(r"(?i)git\s+clean(\s|$)", "git_force", verbs={"git"}),
     # `sqlite3` — ПОВОД РАЗОБРАТЬ, а не приговор: вид определяет `_sqlite_decide` по оператору
     # запроса (чтение → зелёное и разбор продолжается, запись → красное, неясное → красное).
-    (_RE_SQLITE_WORD, "sqlite"),
-    (re.compile(r"(?i)(^|[\s;&|(])clasp([\s;&|)]|$)"), "clasp"),
+    _red(_RE_SQLITE_WORD, "sqlite", probe="_sqlite_decide"),
+    _red(r"(?i)(^|[\s;&|(])clasp([\s;&|)]|$)", "clasp", probe="_clasp_decide"),
     # живые таблицы напрямую (не через Bridge): Apps Script / Sheets API / gspread
-    (re.compile(r"(?i)script\.google\.com|sheets\.googleapis\.com|(^|[\s;&|(])gspread([\s;&|)]|$)"), "live_sheet"),
-    (re.compile(r"(?i)(^|[\s;&|(])(curl|wget|iwr|irm)([\s;&|)]|$)|invoke-webrequest|invoke-restmethod"), "network"),
-    (re.compile(r"(?i)(^|[\s;&|(])(ssh|scp|sftp|nc|ncat|telnet)([\s;&|)]|$)"), "network"),
+    _red(r"(?i)script\.google\.com|sheets\.googleapis\.com|(^|[\s;&|(])gspread([\s;&|)]|$)",
+         "live_sheet", probe="_live_sheet_decide"),
+    _red(r"(?i)(^|[\s;&|(])(curl|wget|iwr|irm)([\s;&|)]|$)|invoke-webrequest|invoke-restmethod",
+         "network", probe="_net_scan"),
+    _red(r"(?i)(^|[\s;&|(])(ssh|scp|sftp|nc|ncat|telnet)([\s;&|)]|$)", "network", probe="_net_scan"),
 ]
+
+
+# ── ТЕКСТОВЫЕ ПРИЗНАКИ ВНЕ ТАБЛИЦЫ: тот же замок, тот же список ───────────────────────────────
+# `_decide_bash`/`_decide_bash_body` смотрят и одиночные регулярки. Каждая обязана стоять здесь
+# и назвать свою проверку действия; тест `test_free_signs_declare_action_check` вычитывает
+# ИСХОДНИК обеих функций и падает, если в них появилось имя `_RE_*`, которого тут нет. То есть
+# новый текстовый признак нельзя завести и мимо таблицы.
+_ACTION_CHECK = {
+    "_RE_ENV": "_env_probe_only / _py_env_readonly — наличие и окружение живого процесса ≠ чтение",
+    "_RE_CLAUDE_CFG_CMD": "_is_pure_config_read — смотрелка против писателя, по командной позиции",
+    "_RE_OUTSIDE_WRITE": "_inside_project — цель перенаправления, а не слово в строке",
+    "_RE_SQLITE_WORD": "_sqlite_decide — по оператору запроса (select/pragma ≠ update)",
+    "_RE_LIVE_SHEET_HINT": "_live_sheet_decide — по форме обращения, слово в тексте не считается",
+    # зелёные шорткаты: они карточек не рождают, проверять действие им нечего
+    "_RE_SAFE_SCRIPTS": "зелёный шорткат (карточки не рождает)",
+    "_RE_GIT_SAFE": "зелёный шорткат (карточки не рождает)",
+    "_RE_TESTS": "зелёный шорткат (карточки не рождает)",
+    "_RE_PY": "зелёный шорткат → _scan_python (карточки не рождает сам)",
+    "_RE_UNTIL_WAIT": "зелёный шорткат (карточки не рождает)",
+    "_RE_READONLY_SHELL": "зелёный шорткат (карточки не рождает)",
+}
 
 
 def _extract_delete_target(cmd):
@@ -1168,7 +1240,15 @@ _WRAPPERS = {"sudo", "doas", "env", "nohup", "nice", "ionice", "time", "timeout"
 # на этой машине основной шелл PowerShell, и ищут обычно ими.
 _SEARCH_CMDS = {"grep", "egrep", "fgrep", "zgrep", "rg", "ag", "ack", "sed", "awk", "gawk",
                 "mawk", "select-string", "sls", "findstr"}
-_PATTERN_FLAGS = {"-e", "-E", "-n", "--regexp", "--expression", "-pattern"}
+# Флаги, чьё значение — ШАБЛОН. Здесь ТОЛЬКО те, что значение действительно ЗАБИРАЮТ.
+# Живой случай №7: `grep -n -E "\.env|deny|…" .claude/settings.json`. В прежнем перечне стояли
+# `-n` и `-E`, а они у grep/sed БУЛЕВЫ (номера строк / расширенный синтаксис). Разбор считал
+# значением `-n` следующий токен — то есть сам флаг `-E`, — вырезал ЕГО, а настоящий шаблон
+# оставлял в скан-тексте. Слово `.env` ВНУТРИ ШАБЛОНА ПОИСКА становилось обращением к секрету.
+# Булевы флаги и так пропускаются общей веткой `t.startswith("-")` ниже, а шаблон подхватывается
+# как первый позиционный: убрать их отсюда — значит починить, ничего не ослабив (проверено на
+# `grep -n P f`, `grep -E P f`, `sed -n 'скрипт' f` — вырезается ровно то же, что и раньше).
+_PATTERN_FLAGS = {"-e", "--regexp", "--expression", "-pattern"}
 # Флаги, чьё значение — ФАЙЛ, а не шаблон. Без них PowerShell-форма
 # `Select-String -Path .env -Pattern TOKEN` теряла `.env` из скан-текста: первый позиционный
 # аргумент считался шаблоном и вырезался вместе с путём к секрету — и ЧТЕНИЕ .env проезжало
@@ -1180,8 +1260,17 @@ _EXEC_IN_PATTERN = re.compile(
 
 
 def _base(tok):
-    """Имя команды без пути, кавычек и .exe, нижним регистром (C:\\bin\\grep.exe → grep)."""
-    name = os.path.basename((tok or "").strip("'\"")).lower()
+    """Имя команды без пути, кавычек, СКОБОК и .exe, нижним регистром (C:\\bin\\grep.exe → grep).
+
+    Скобки снимаются из-за живого случая №1: `if (Test-Path "D:\\…\\.env") { … }` — на этом ПК
+    основной шелл PowerShell, и условие пишется В СКОБКАХ. Токен приезжал как `(Test-Path`,
+    в белом списке смотрелок наличия (`_EXISTS_CMDS`) не находился, и ПРОВЕРКА СУЩЕСТВОВАНИЯ
+    файла превращалась в карточку «хочу обратиться к .env». Скобка — синтаксис шелла, а не
+    часть имени команды; путей, начинающихся со скобки, на этой машине не бывает.
+    Если после снятия скобок не остаётся НИЧЕГО — токен и БЫЛ скобкой: это командное имя
+    `[` из POSIX-теста (`[ -f .env ]`), и снимать его нельзя."""
+    raw = (tok or "").strip("'\"")
+    name = os.path.basename(raw.strip("([{)]}") or raw).lower()
     return name[:-4] if name.endswith(".exe") else name
 
 
@@ -1255,6 +1344,68 @@ def _cmd_index(toks):
             i += 1
         hops += 1
     return i if i < len(toks) else None
+
+
+# ── «ЭТО КОМАНДА, А НЕ СЛОВО» — общая проверка действия для всех verbs-правил ────────────────
+# Тот же приём, которым уже разведены сеть (`_net_scan`), удаление (`_delete_scan`) и проба
+# наличия секрета (`_env_probe_only`): имя обязано стоять в КОМАНДНОЙ ПОЗИЦИИ сегмента.
+# Здесь он вынесен в ОДНУ функцию и подключён ко ВСЕМ правилам таблицы разом — иначе каждый
+# новый вид пришлось бы разводить отдельно, а именно так и накопились семь ложных классов.
+#
+# ЧТО НЕ ОСЛАБЛЕНО, поимённо (каждый пункт — сохранённое красное):
+#   • сегмент, чью командную позицию не разобрать (кривое квотирование), считается СРАБОТАВШИМ;
+#   • сегмент, чья команда — ИНТЕРПРЕТАТОР или ВЛОЖЕННЫЙ ШЕЛЛ (`bash -c`, `python -c`, `ssh
+#     host …`, `xargs`), судится ПОДСТРОКОЙ как раньше — там аргумент и есть команда. Тот же
+#     карве-аут уже принят в `_redirect_text` и `_line_runs_code`;
+#   • подстановка команды в сегменте (`$(…)`, `` `…` ``) — тоже исполнение, судим подстрокой.
+#
+# ОТДЕЛЬНО ПРО PYTHON — единственное сужение карве-аута интерпретаторов, и оно доказуемое.
+# У `bash -c "…"`, `ssh host "…"`, `xargs …` аргумент И ЕСТЬ командная строка: там подстрока
+# честна. У `python -c "…"` аргумент — ИСХОДНЫЙ КОД, и строковый литерал в нём командой не
+# становится сам по себе: чтобы имя `Stop-Process` что-то остановило, коду нужен ШЕЛЛОВЫЙ СТОК
+# (`os.system`, `os.popen`, `subprocess`/`Popen`, `os.exec*`) либо подстановка шелла в самом
+# сегменте. Живой случай №7: `python -c "print(g.decide({… 'Stop-Process -Id 11168 -Force'…}))"`
+# — это ПРОГОН САМОГО ГАРДА на фикстуре, и он давал карточку «снять процесс PID 11168».
+# Дыры сужение не открывает: питон-родное разрушение (`os.remove`, `shutil.rmtree`,
+# `create_booking`, SQL-запись) ловится НЕ этой веткой, а `_py_write_call`/`_sqlite_decide`/
+# `_RE_SQL_WRITE` в `_scan_python` — по ФОРМЕ ВЫЗОВА, и они остались как были.
+_RE_SUBST_EXEC = re.compile(r"\$\(|`")
+_PY_INTERP = {"python", "python3", "py"}
+_RE_PY_SHELL_SINK = re.compile(
+    r"(?i)\bos\.system\s*\(|\bos\.popen\s*\(|\bsubprocess\b|\bPopen\b|\bcheck_call\b|"
+    r"\bcheck_output\b|\bos\.exec\w*\s*\(|\bos\.spawn\w*\s*\(|\bpty\.spawn\b|"
+    r"\bcommands\.get\w*\s*\(")
+
+
+def _verb_acts(cmd, verbs, rx):
+    """True ⇔ признак `rx` поймал ДЕЙСТВИЕ, а не слово: имя из `verbs` стоит в командной позиции
+    сегмента — либо сегмент таков, что его текст исполняется (интерпретатор/вложенный шелл/
+    подстановка/неразобранные кавычки), и тогда решает подстрока, как до правки."""
+    if not verbs:
+        return True                      # правило судится своим probe — здесь не мешаем
+    for i, seg in enumerate(_split_segments(cmd or "")):
+        if i % 2:
+            continue
+        try:
+            toks = shlex.split(seg)
+        except Exception:
+            if rx.search(seg):
+                return True              # кавычки не разобраны → fail-safe, красное как было
+            continue
+        j = _cmd_index(toks)
+        if j is None or j >= len(toks):
+            continue
+        name = _base(toks[j])
+        if name in verbs:
+            return True
+        if name in _PY_INTERP and not _RE_SUBST_EXEC.search(seg):
+            # аргумент python — КОД: имя шелловой команды в нём исполнится только через сток
+            if _RE_PY_SHELL_SINK.search(seg) and rx.search(seg):
+                return True
+            continue
+        if (name in _HEREDOC_EXEC or _RE_SUBST_EXEC.search(seg)) and rx.search(seg):
+            return True                  # текст сегмента исполняется — подстрока как раньше
+    return False
 
 
 def _strip_git_msg(seg):
@@ -1332,7 +1483,11 @@ def _mask(seg, dropped):
     Форма не нашлась → текст как есть, то есть краснее."""
     out = seg
     for d in dropped:
-        for form in ('"' + d + '"', "'" + d + "'", d):
+        # Четвёртая форма — шаблон с ЭКРАНИРОВАННЫМИ кавычками внутри. shlex снимает `\"` до `"`,
+        # и вырезание по литералу промахивалось: живой случай №7,
+        # `grep -n -E "\.env|deny|\"model\"|clasp push" .claude/settings.json` — шаблон оставался
+        # в скан-тексте, а вместе с ним и слово `.env`, дававшее карточку «обращение к секретам».
+        for form in ('"' + d + '"', "'" + d + "'", d, '"' + d.replace('"', '\\"') + '"'):
             if d and form in out:
                 out = out.replace(form, " ", 1)
                 break
@@ -1742,6 +1897,14 @@ def _decide_bash(cmd, cwd):
             return ("defer", "sqlite_read", sq[1])
     if probe and action == "defer" and not kind:
         return ("defer", "env_probe", "")     # прозрачность лога: пробу наличия видно как пробу
+    if action == "defer" and not kind:
+        # ДОКТРИНА ЛОГА, та же что у `sqlite_read`/`env_probe`/`cfg_read`: смягчение не должно
+        # стоить прозрачности. Признак поймал СЛОВО, а не команду (`_verb_acts`) — в журнале
+        # обязано быть видно, КАКОЙ именно признак промолчал и почему, иначе строка выглядит как
+        # «ничего красного не нашли», и следующий разбор ложного класса начнётся с нуля.
+        w = _word_only_kind(scan)
+        if w:
+            return ("defer", "word_" + w, "")
     if action == "defer" and not kind and _RE_LIVE_SHEET_HINT.search(scan):
         # Та же доктрина лога, что у `sqlite_read`/`env_probe`/`cfg_read`: смягчение не должно
         # стоить прозрачности. Слово живого листа прошло молча — в журнале обязано быть видно,
@@ -1758,6 +1921,15 @@ def _decide_bash(cmd, cwd):
     return (action, kind, obj)
 
 
+def _word_only_kind(scan):
+    """Вид признака, который НАШЁЛСЯ в тексте, но командой не оказался (`_verb_acts` → False),
+    иначе "". Нужен только логу: решения не меняет, но делает молчание объяснимым."""
+    for rx, kind, verbs, _probe in _RED_CMD:
+        if verbs and rx.search(scan) and not _verb_acts(scan, verbs, rx):
+            return kind
+    return ""
+
+
 def _decide_bash_body(cmd, cwd, scan, env_probe=False):
     # Красное ищем в СКАН-ТЕКСТЕ: позиционные аргументы .py-скриптов — ДАННЫЕ, а не операция
     # (класс-фикс, порт с VPS). Сегменты шелла сохранены целиком, подстановки команд и пути к
@@ -1770,8 +1942,14 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False):
     # данные. Поисковый шаблон и позиционные аргументы .py вырезаны в обоих текстах: `grep -n
     # gspread suggest.py` — это поиск, а не лист.
     sheet = _live_sheet_decide(_scan_text(cmd, keep_heredoc=True))
-    for rx, kind in _RED_CMD:
+    for rx, kind, verbs, _probe in _RED_CMD:
         if rx.search(scan):
+            # ОБЩАЯ ПРОВЕРКА ДЕЙСТВИЯ (замок 31.07.2026): имя-команду признают признаком, только
+            # если она стоит в КОМАНДНОЙ ПОЗИЦИИ. Это снимает разом ложные `kill`/`delete`/
+            # `schtasks`/`git_force` на слове в тексте записи, в шаблоне поиска и в фикстуре
+            # гарда. Правила с `probe` сюда не попадают (verbs пуст) — их судит свой разборщик.
+            if not _verb_acts(scan, verbs, rx):
+                continue
             # Сеть: красное — только НАСТОЯЩИЙ выход наружу. Свой ssh-канал и упоминание слова
             # в тексте карточки не порождают (см. _net_scan).
             if kind == "network" and netk != "open":
@@ -2062,10 +2240,16 @@ def kinds_from_card(text):
 
 # Массовое удаление (красное) vs удаление ОДНОГО явного файла (в интерактиве зелёное).
 _RE_DEL_TAIL = re.compile(r"(?i)(?:^|[\s;&|(])(?:del|erase|rmdir|rd|rm|remove-item)\b(.*)$")
-_RE_DEL_RECURSE = re.compile(r"(?i)(^|\s)(-[a-z]*r[a-z]*|/s|-recurse\w*)(\s|$)")
+# РЕКУРСИЯ — НАЗВАННЫЙ ФЛАГ, А НЕ «БУКВА r ПОСЛЕ МИНУСА» (живой случай №6, 31.07.2026).
+# Прежняя форма `-[a-z]*r[a-z]*` считала рекурсивным ЛЮБОЙ флаг, в котором где-то есть `r`, —
+# и `Remove-Item …\cowork_log.spool -Force` (ОДИН явный файл) проходил как МАССОВОЕ удаление:
+# буква `r` стоит в середине слова Force. Теперь перечислены настоящие формы: слипшийся набор
+# коротких ключей rm (только из его собственного алфавита `rdfiv`, где есть `r`), `--recursive`,
+# cmd-шный `/s` и PowerShell-ский `-Recurse`. `-Force`, `-Confirm`, `-Verbose`, `-ErrorAction`
+# рекурсией больше не считаются — ни один из них целей не добавляет.
+_RE_DEL_RECURSE = re.compile(
+    r"(?i)(^|\s)(-(?=[rdfiv]*r)[rdfiv]+|--recursive|/s|-recurse\w*)(\s|$)")
 _RE_SCHTASKS_QUERY = re.compile(r"(?i)\bschtasks\b[^;&|]*\s/query\b")
-
-_DEL_CMDS = {"del", "erase", "rmdir", "rd", "rm", "remove-item", "ri"}
 _RE_CMDEXE_FLAG = re.compile(r"^/[A-Za-z]{1,2}$")   # /f /s /q cmd.exe — не путь MSYS вида /d/…
 
 

@@ -7,8 +7,10 @@ end-to-end через stdin с PRETOOL_NOPUSH=1 (без реального Teleg
 
 import io
 import os
+import re
 import sys
 import json
+import inspect
 import tempfile
 import subprocess
 import unittest
@@ -1049,8 +1051,17 @@ class TestDataNotOperation(unittest.TestCase):
 
     def test_unquoted_git_msg_tail_is_not_a_message(self):
         """Граница класса: БЕЗ кавычек `-mтекст` несёт ровно одно слово, остальное — обычные
-        аргументы git, и они обязаны остаться под сканом. Вырезаем payload, а не хвост строки."""
-        self.assertEqual(self._kind("git commit -mправка убрал rm -rf D:/x"), "ask")
+        аргументы git, и они обязаны остаться под сканом. Вырезаем payload, а не хвост строки.
+
+        ОБНОВЛЕНО 31.07.2026 (замок «признак = действие»). Хвост под сканом остался — изменился
+        ВЕРДИКТ по нему. `rm` здесь стоит АРГУМЕНТОМ git, а не командой: удалить он не может
+        ничего, git просто получит лишние pathspec'и. Красное на нём было ровно тем классом,
+        который эта правка и закрывает. Граница проверяется НАСТОЯЩИМ вторым сегментом ниже —
+        там `rm` уже команда, и красное на месте."""
+        self.assertIn("rm", g._scan_text("git commit -mправка убрал rm -rf D:/x"))
+        self.assertEqual(self._kind("git commit -mправка убрал rm -rf D:/x"), "defer")
+        self.assertEqual(self._kind("git commit -mправка; rm -rf D:/x"), "ask")
+        self.assertEqual(self._kind('git commit -mправка && rm -rf D:/x'), "ask")
 
     def test_search_pattern_with_red_words_is_green(self):
         for cmd in ('grep -n "Remove-Item" pretool_guard.py',
@@ -1394,11 +1405,16 @@ class TestCardMinimumAndJournal(unittest.TestCase):
         self.assertLessEqual(len(cmdline), 220)
 
     def test_substring_hit_without_object_goes_to_journal(self):
-        """Живой факт суток: `echo \"---SCHTASKS XML---\"` внутри `ls` дал карточку Планировщика."""
+        """Живой факт суток: `echo \"---SCHTASKS XML---\"` внутри `ls` дал карточку Планировщика.
+
+        ОБНОВЛЕНО 31.07.2026: подстрочное срабатывание закрыто на слой раньше (`_verb_acts`),
+        поэтому вида `schtasks` тут больше нет — есть честное `word_schtasks`. Правило «нет
+        объекта → журнал» это НЕ отменяет: оно проверяется прямым вызовом `card_or_journal`
+        строкой ниже и остаётся вторым поясом для видов со своим probe."""
         cmd = 'ls -la *.log* 2>/dev/null | head -40; echo "---SCHTASKS XML---"; ls *.xml 2>/dev/null'
         a, k, o = g.decide_for_role(bash(cmd), headless=False)
-        self.assertEqual((a, k), ("ask", "schtasks"))
-        self.assertIsNone(g.card_or_journal(k, o, cmd))
+        self.assertEqual((a, k), ("defer", "word_schtasks"))
+        self.assertIsNone(g.card_or_journal("schtasks", "", cmd))
 
     def test_real_scheduler_action_still_cards(self):
         cmd = "schtasks /Change /TN TurboBabyRC /DISABLE"
@@ -1413,8 +1429,10 @@ class TestCardMinimumAndJournal(unittest.TestCase):
         self.assertIsNotNone(g.card_or_journal("unknown", "", ""))
 
     def test_journal_line_instead_of_card_end_to_end(self):
-        """Сквозь stdin: подавленная карточка → пустой stdout (действие идёт), но строка в журнале
-        с решением `journal` — след остаётся."""
+        """Сквозь stdin: подавленная карточка → пустой stdout (действие идёт), но СЛЕД В ЖУРНАЛЕ
+        остаётся и НАЗЫВАЕТ причину. ОБНОВЛЕНО 31.07.2026: причина теперь называется на слой
+        раньше — не «карточку снял гейт объекта» (`journal | schtasks`), а «признак поймал слово,
+        а не команду» (`defer | word_schtasks`). Доктрина лога та же: молчание объяснимо."""
         fd, logp = tempfile.mkstemp(suffix=".guardlog")
         os.close(fd)
         try:
@@ -1428,7 +1446,7 @@ class TestCardMinimumAndJournal(unittest.TestCase):
             self.assertEqual(p.returncode, 0)
             self.assertEqual(p.stdout.strip(), "")
             with io.open(logp, encoding="utf-8") as f:
-                self.assertIn("| journal | schtasks |", f.read())
+                self.assertIn("| defer | word_schtasks |", f.read())
         finally:
             os.remove(logp)
 
@@ -1520,11 +1538,18 @@ class TestOneRuleObjectGatesNumberDoesNot(unittest.TestCase):
                 self.assertNotEqual(g.decide_for_role(bash(cmd), headless=False)[1], "kill")
 
     def test_objectless_operation_text_still_silent(self):
-        """Тот случай, что обрывал задачи 12 и 27: об операции говорят, объекта нет."""
+        """Тот случай, что обрывал задачи 12 и 27: об операции говорят, объекта нет.
+
+        ОБНОВЛЕНО 31.07.2026 (замок «признак = действие»). Раньше признак срабатывал, а карточку
+        снимало правило объекта (`card_gate`) — то есть ошибка ловилась ПОЗЖЕ, уже видом
+        `schtasks` в логе. Теперь слово Планировщика вне командной позиции признаком не
+        становится вовсе (`_verb_acts`), и вид в логе честный: `word_schtasks` — «признак нашёл
+        СЛОВО». Итог для владельца тот же (карточки нет), но причина названа на слой раньше.
+        Само правило объекта проверяется отдельно — `TestCardMinimumAndJournal`."""
         cmd = 'ls -la *.log* 2>/dev/null | head -40; echo "---SCHTASKS XML---"; ls *.xml'
         a, k, o = g.decide_for_role(bash(cmd), headless=False)
-        self.assertEqual((a, k), ("ask", "schtasks"))
-        self.assertIsNone(g.card_or_journal(k, o, cmd))
+        self.assertEqual((a, k), ("defer", "word_schtasks"))
+        self.assertIsNone(g.card_or_journal("schtasks", o, cmd))
 
 
 class TestGuardSourcesWriteIsNotExecution(unittest.TestCase):
@@ -2767,6 +2792,104 @@ class TestTwoTiersOfCards(unittest.TestCase):
         for cmd in ("git status", "ls -la", "venv/Scripts/python.exe -m unittest test_delivery"):
             with self.subTest(cmd):
                 self.assertEqual(self._role(cmd)[0], "defer", cmd)
+
+
+class TestRedRuleLock(unittest.TestCase):
+    """ЗАМОК: новое красное правило НЕ МОЖЕТ появиться по старому образцу (31.07.2026).
+
+    Семь ложных классов за сутки родились одинаково: кто-то дописал в таблицу пару
+    `(regex, kind)`, и подстрока начала красить ТЕКСТ. Замок двухпоясный, и оба пояса здесь:
+
+      1) СТРУКТУРНЫЙ — правило собирается только `_red()`, который требует назвать проверку
+         действия (`verbs=` либо `probe=`). Голая пара роняет ИМПОРТ гарда: не «когда-нибудь
+         заметим», а немедленно и у автора правила.
+      2) ГЕНЕРАТИВНЫЙ — тесты ниже СТРОЯТ пробы САМИ, из `verbs` каждой строки таблицы.
+         Правило, добавленное завтра, проверяется тестом, которого для него никто не писал.
+
+    Третий пояс — реестр `_ACTION_CHECK` для одиночных признаков вне таблицы: он сверяется
+    с ИСХОДНИКОМ `_decide_bash`/`_decide_bash_body`, поэтому текстовый признак нельзя завести
+    и в обход таблицы."""
+
+    # Обёртки текста: как слово попадает в команду, НЕ становясь операцией.
+    WRAPS = (
+        'echo "--- %s ---"',
+        'git commit -m "правка: убрал %s из скрипта уборки"',
+        'grep -n "%s" pretool_guard.py',
+        'rg "%s" docs/',
+    )
+
+    def test_bare_pair_is_rejected_at_construction(self):
+        """Старый образец не набирается: без verbs/probe — ValueError, а не молчаливое правило."""
+        with self.assertRaises(ValueError):
+            g._red(r"(?i)\bformat\b", "disk_format")
+        with self.assertRaises(ValueError):
+            g._red(r"(?i)\bshutdown\b", "power", verbs=(), probe=None)
+        # а законные формы собираются
+        self.assertTrue(g._red(r"(?i)\bshutdown\b", "power", verbs={"shutdown"}).verbs)
+        self.assertEqual(g._red(r"(?i)\bfoo\b", "bar", probe="_net_scan").probe, "_net_scan")
+
+    def test_every_rule_declares_action_check(self):
+        """Ни одной строки таблицы без названной проверки действия."""
+        self.assertTrue(g._RED_CMD)
+        for r in g._RED_CMD:
+            with self.subTest(r.kind):
+                self.assertTrue(r.verbs or r.probe,
+                                "правило %s не назвало проверку действия" % r.kind)
+                if r.probe:
+                    self.assertTrue(callable(getattr(g, r.probe, None)),
+                                    "probe %r правила %s не существует" % (r.probe, r.kind))
+
+    def test_declared_verbs_actually_trigger_their_own_regex(self):
+        """Опечатка в `verbs` = ТИХАЯ ДЫРА В ДРУГУЮ СТОРОНУ. Признак и его подтверждение — два
+        условия, соединённые И: имя, которого признак не видит, подтверждать нечего, и правило
+        не сработает НИКОГДА. Требуем, чтобы КАЖДОЕ объявленное имя было видно собственной
+        регулярке правила. Живая находка этого теста: алиас `ri` стоял в `_DEL_CMDS`, а в
+        признаке удаления его не было — `ri файл` не краснел вовсе."""
+        for r in g._RED_CMD:
+            for v in sorted(r.verbs):
+                with self.subTest(kind=r.kind, verb=v):
+                    self.assertIn(v.lower(), r.rx.pattern.lower(),
+                                  "имя %r объявлено в verbs правила %s, но его признак этого "
+                                  "имени не видит — правило мертво" % (v, r.kind))
+        # и обратно: имя, поставленное КОМАНДОЙ, подтверждение проходит
+        for r in g._RED_CMD:
+            if not r.verbs:
+                continue
+            with self.subTest(kind=r.kind, side="acts"):
+                probe = sorted(r.verbs)[0] + " цель"
+                self.assertTrue(g._verb_acts(probe, r.verbs, re.compile(r"(?s).")),
+                                "verbs %s: имя в командной позиции не признано действием"
+                                % sorted(r.verbs))
+
+    def test_generated_text_probes_are_silent(self):
+        """ГЕНЕРАТИВНЫЙ ПОЯС. Каждое объявленное имя, обёрнутое в ТЕКСТ (эхо, сообщение коммита,
+        шаблон поиска), карточки рождать не имеет права. Пробы строятся из таблицы — под новое
+        правило они появятся сами."""
+        for r in g._RED_CMD:
+            for verb in sorted(r.verbs):
+                for wrap in self.WRAPS:
+                    cmd = wrap % verb
+                    with self.subTest(kind=r.kind, cmd=cmd):
+                        a, k, o = g.decide_for_role(bash(cmd), headless=True, env={})
+                        if a == "ask":
+                            a = g.card_decision(k, o, cmd)[0]
+                        self.assertNotIn(a, ("ask", "deny"),
+                                         "имя %s в ТЕКСТЕ дало карточку %s: %s" % (verb, k, cmd))
+
+    def test_free_signs_declare_action_check(self):
+        """Реестр `_ACTION_CHECK` обязан покрывать ВСЕ одиночные `_RE_*`, которые читают
+        `_decide_bash`/`_decide_bash_body`, — и не содержать лишних (иначе реестр протухает)."""
+        src = inspect.getsource(g._decide_bash) + inspect.getsource(g._decide_bash_body)
+        used = set(re.findall(r"\b(_RE_[A-Z0-9_]+)\b", src))
+        self.assertTrue(used)
+        missing = sorted(used - set(g._ACTION_CHECK))
+        self.assertFalse(missing,
+                         "текстовый признак заведён мимо реестра _ACTION_CHECK: %s" % missing)
+        stale = sorted(set(g._ACTION_CHECK) - used)
+        self.assertFalse(stale, "в реестре _ACTION_CHECK протухшие имена: %s" % stale)
+        for name, why in g._ACTION_CHECK.items():
+            with self.subTest(name):
+                self.assertTrue(str(why).strip(), "признак %s не назвал проверку" % name)
 
 
 if __name__ == "__main__":
