@@ -2173,8 +2173,15 @@ def _xmax_is_new_gen(unit_name) -> bool:
 # теле по правилу промпта (GEN_DEFAULT_RULE: «НЕ пиши года выпуска»), а год выпуска клиенту не
 # показываем. Чистим год-в-имени (диапазон «2020-2022» / «2023+» / «2021 года» / одиночный 20xx),
 # но НЕ цену: год-токен перед валютой (฿/бат/THB/baht) — это сумма, его не трогаем.
+# ПРАВАЯ ГРАНИЦА (?!\d) — не косметика: без неё «2000» матчилось ВНУТРИ пятизначной суммы «20000 ฿»
+# (лукахед на валюту не спасал — сразу за «2000» стоит пятая цифра, а не ฿). Цена этого на ОБЕИХ
+# полосах, замер 31.07 (docs/artifacts/2026-07-31-revizor-false-findings-audit.md, §Гипотеза 2):
+#   • проверяльщик #92 «нет годов» — 6 ложных находок ревизора «годы в тексте: 2000» на прайс-блоках,
+#     где депозит мотоцикла 20000 ฿ (CBR 650R, CB 650R, NINJA 400, VULCAN 650S);
+#   • БОЕВОЙ контур — _scrub_gen_year на живой строке J превращал «депозит: 20000 бат» в
+#     «депозит: 0 бат». Мина была заряжена, но по корпусу (376 строк прода) ещё не выстрелила.
 _GEN_YEAR_RE = re.compile(
-    r"\b20\d\d(?:\s*[-–]\s*20\d\d|\s*\+|\s*года?)?(?!\s*(?:฿|бат|thb|baht))",
+    r"\b20\d\d(?:\s*[-–]\s*20\d\d|\s*\+|\s*года?)?(?!\d)(?!\s*(?:฿|бат|thb|baht))",
     re.I)
 
 
@@ -2184,6 +2191,8 @@ def _scrub_gen_year(text: str) -> str:
     («NEW 2023-» → «NEW -») и сдвоенные пробелы схлопываем."""
     s = _GEN_YEAR_RE.sub("", str(text or ""))
     s = re.sub(r"\s+[-–](?=\s|$)", "", s)          # висячий дефис от «2023-»
+    s = re.sub(r"\(\s*\)|\[\s*\]", "", s)          # осиротевшие скобки от «(2020-2022)»/«(2023+)»
+    s = re.sub(r"\s+([,.;:!?])", r"\1", s)         # пробел, оставшийся перед знаком препинания
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s
 
@@ -6020,7 +6029,7 @@ _AV_POS_RE = re.compile(
 # ДЕФИЦИТ/СРОЧНОСТЬ — источника данных НЕТ, клейм запрещён ВСЕГДА.
 _AV_SCARCITY_RE = re.compile(
     r"послед\w+\s+(?:байк\w*|штук\w*|шт\b|один|одна|экземпляр\w*)|остал\w+\s+(?:один|одна|1\b)|"
-    r"осталось\s+\d|мало\s+остал\w+|почти\s+(?:всё|все)\s+разобрал\w*|разбира\w+|успева\w+|"
+    r"осталось\s+\d|мало\s+остал\w+|почти\s+(?:всё|все)\s+разобрал\w*|разбира\w+|успевай\w*|"
     r"успей\w*|спеши\w+|торопи\w+|только\s+сегодня\b|"
     r"last\s+one|only\s+\d+\s+left|almost\s+gone|selling\s+fast|hurry|going\s+fast|only\s+today", re.I)
 # ОСОБЫЕ/ПЕРСОНАЛЬНЫЕ УСЛОВИЯ и спеццены — назначает менеджер, у бота источника НЕТ, запрещено ВСЕГДА.
@@ -6050,6 +6059,14 @@ def availability_claims(draft: str) -> list:
             continue
         claims.append({"kind": "avail_pos", "raw": m.group(0).strip()})
     for m in _AV_SCARCITY_RE.finditer(s):
+        # ОТРИЦАНИЕ снимает срочность так же, как у avail_pos выше: «НЕ разбирают», «НЕ спешите».
+        # Обработки не было, и вместе с чересчур широким токеном «успева\w+» это дало живой ложняк
+        # id=360 (окно 45349667): «раньше ночи НЕ успеваем» — про время подачи, а не про дефицит,
+        # и с отрицанием, то есть обратное срочности. Срочность несут повелительные формы
+        # («успевайте», «успей»), они и остались в паттерне.
+        pre = s[max(0, m.start() - 6):m.start()].lower()
+        if re.search(r"\b(?:не|нет)\s*$", pre):
+            continue
         claims.append({"kind": "scarcity", "raw": m.group(0).strip()})
     for m in _AV_SPECIAL_RE.finditer(s):
         claims.append({"kind": "special", "raw": m.group(0).strip()})
@@ -6166,6 +6183,46 @@ def guard_availability(draft: str, avail=None, model=None, ds=None, de=None, lan
             "violations": last_bad}
 
 
+# ===================== ГАРД ГОДА ВЫПУСКА В КЛИЕНТСКОМ ТЕЛЕ (31.07.2026) =====================
+# Пара к GEN_DEFAULT_RULE промпта («поколение несёт МЕТКА New Gen, года выпуска НЕ пиши») —
+# детерминированная страховка ПЕРЕД карточкой, тем же классом, что enforce_vehicle_word/
+# strip_greeting_for_window. Промпта оказалось мало: живой черновик id=292 (окно 529849022,
+# 14.07, status=posted) назвал год ДВАЖДЫ и своей волей — КОД-блоков в его pricing_note не было:
+#     XMAX 300 (2020-2022) | 5 дней: 2965 бат …
+#     XMAX 300 New Gen (2023+) | 5 дней: 3520 бат …
+# ДОСЛОВНЫЕ БЛОКИ КОДА (quote/сетка/доставка) не трогаем: их печатает КОД из Календаря, год из
+# сырого имени юнита там снят ещё на сборке (_scrub_gen_year, :4358/:4376), а побайтовая сверка
+# «строка J дословно»/«сетка прайса дословно» обязана сойтись — правка блока красила бы её.
+
+def enforce_no_gen_year(draft: str, pricing_note: str = "", window=None) -> str:
+    """Год выпуска поколения из ТЕКСТА МОДЕЛИ вон (поколение несёт метка «New Gen», не год).
+    Дословные блоки КОДА пропускаем байт-в-байт. Года в тексте нет → вход БАЙТ-В-БАЙТ (fail-safe)."""
+    text = draft or ""
+    if not text.strip() or not _GEN_YEAR_RE.search(text):
+        return draft
+    protected = set()
+    for get in (_sheet_block_from_note, _quote_block_from_note, _delivery_block_from_note):
+        try:
+            blk = get(pricing_note or "") or ""
+        except Exception:                       # noqa: BLE001 — гард не имеет права ронять черновик
+            blk = ""
+        if blk.strip() and blk.strip() in text:
+            protected.update(ln.strip() for ln in blk.split("\n") if ln.strip())
+    out, removed = [], []
+    for ln in text.split("\n"):
+        if ln.strip() in protected or not _GEN_YEAR_RE.search(ln):
+            out.append(ln)
+            continue
+        removed += _GEN_YEAR_RE.findall(ln)
+        lead = ln[:len(ln) - len(ln.lstrip())]        # отступ строки сохраняем: _scrub_gen_year strip-ает
+        out.append(lead + _scrub_gen_year(ln))
+    if not removed:
+        return draft
+    log.warning("enforce_no_gen_year окно=%s: год выпуска вырезан из клиентского тела — %s",
+                window, ", ".join(removed))
+    return "\n".join(out)
+
+
 def generate_draft(transcript: str, lang: str, faq: str,
                    is_first_contact: bool = False, pricing_note: str = "", call_llm=None,
                    park_models=None, playbook: str = "", is_partner: bool = False) -> str:
@@ -6223,6 +6280,8 @@ def generate_draft(transcript: str, lang: str, faq: str,
     out = postcheck_money(out, pricing_note, transcript, lang)
     out = _append_collected_note(out, facts, lang, unconfirmed_fields(transcript, facts))
     out = _append_season_note(out, pricing_note)
+    # Год выпуска поколения из текста МОДЕЛИ вон (живой id=292): дословные блоки КОДА не трогаем.
+    out = enforce_no_gen_year(out, pricing_note)
     # Тип ТС ПОСЛЕДНИМ шагом (после дописок КОДА): на 'car'-треде с байком в тексте — ПОМЕТКА
     # модератору, текст черновика не трогаем (слепая замена слова снята 28.07).
     out = enforce_vehicle_word(out, vehicle_type, lang)
@@ -6284,6 +6343,9 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     # зачин детерминированно (belt поверх промпта «не здоровайся повторно»). Первый контакт
     # (в транскрипте нет строки [менеджер]:) → черновик не трогаем, фирменное приветствие цело.
     out = strip_greeting_for_window(out, transcript)
+    # Тот же класс-фикс, что в generate_draft (правило «класс-фикс — сразу на ОБЕ полосы»): год
+    # выпуска поколения из текста МОДЕЛИ вон, дословные блоки КОДА не трогаем.
+    out = enforce_no_gen_year(out, pricing_note)
     # Тип ТС ПОСЛЕДНИМ шагом (тот же класс, что в generate_draft): на 'car'-треде с байком в тексте —
     # ПОМЕТКА модератору, текст черновика не трогаем (слепая замена снята 28.07).
     out = enforce_vehicle_word(out, vehicle_type, lang)
@@ -6418,16 +6480,45 @@ _SMOKE_DEP_PASSPORT_RE = re.compile(
     r"deposit[^.\n]{0,16}passport", re.I)
 
 
+# ВЫБОР предложен — это НОРМА, а не конфликт (KB: депозит = деньги ЛИБО паспорт). Живые формы прода
+# 31.07: «депозит 3000 ฿ — ПАСПОРТОМ МОЖНО», «МОЖНО оставить паспорт ВМЕСТО денег», разделитель «/»
+# из прайс-блока КОДА («Депозит: 3000 ฿ / паспорт»). Слэш ловим ТОЛЬКО вплотную к слову «паспорт»:
+# иначе «337 ฿/день» из соседней фразы молча снимал бы НАСТОЯЩУЮ находку.
+_SMOKE_DEP_CHOICE_RE = re.compile(
+    r"\bили\b|\bлибо\b|\bor\b|вместо\b|instead\b|можн[оа]\b|"
+    r"/\s*(?:загран)?паспорт|(?:загран)?паспорт\w*\s*/", re.I | re.U)
+
+
+def _clause_at(text: str, pos: int) -> str:
+    """Клауза (предложение) вокруг позиции: до ближайших «.!?» или перевода строки. Нужна, чтобы
+    судить о депозите по ТОЙ ЖЕ фразе, а не по соседней (живой ложняк: «…как вы И хотели»)."""
+    s = text or ""
+    left = max(s.rfind(ch, 0, pos) for ch in ".!?\n")
+    rights = [r for r in (s.find(ch, pos) for ch in ".!?\n") if r != -1]
+    return s[left + 1: (min(rights) if rights else len(s))]
+
+
 def _smoke_deposit_conflict(text) -> str:
     """Противоречие депозита → строка-описание, иначе ''. Конфликт: ДВЕ разные суммы депозита ИЛИ
-    сумма депозита и «паспорт» одновременно (KB: деньги ЛИБО паспорт, не оба)."""
+    сумма депозита и «паспорт» ТРЕБУЮТСЯ ОБА (KB: деньги ЛИБО паспорт, не оба).
+
+    Пара «сумма+паспорт» считается конфликтом, только когда обе стоят В ОДНОЙ клаузе и выбор в ней
+    НЕ предложен. Прежняя ветка «есть сумма и где-то есть слово паспорт» давала ложняк на живом
+    ОТПРАВЛЕННОМ клиенту тексте id=213 («депозит 3000 ฿ — паспортом можно, всё верно») и на строке
+    прайс-блока, которую печатает КОД («Депозит: 3000 ฿ / паспорт»), — то есть красила ровно то
+    поведение, которого правило и требует. Ложная находка здесь дороже пропуска: она уходит
+    ревизору и порождает цепь, правящую клиентского бота (разбор 31.07, §Гипотеза «(а)»)."""
     s = text or ""
     deps = sorted({int(m.group(1).replace(" ", "")) for m in _SMOKE_DEP_AMOUNT_RE.finditer(s)})
-    passport = bool(_SMOKE_DEP_PASSPORT_RE.search(s))
     if len(deps) > 1:
         return "разные суммы депозита: " + ", ".join(f"{v} ฿" for v in deps)
-    if deps and passport:
-        return f"и сумма депозита ({deps[0]} ฿), и «паспорт» одновременно"
+    for m in _SMOKE_DEP_PASSPORT_RE.finditer(s):
+        clause = _clause_at(s, m.start())
+        amount = _SMOKE_DEP_AMOUNT_RE.search(clause)
+        if not amount or _SMOKE_DEP_CHOICE_RE.search(clause):
+            continue                          # суммы в этой фразе нет ЛИБО выбор предложен — норма
+        return (f"и сумма депозита ({int(amount.group(1).replace(' ', ''))} ฿), "
+                f"и «паспорт» одновременно")
     return ""
 
 

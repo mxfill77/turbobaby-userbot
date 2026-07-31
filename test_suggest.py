@@ -7133,5 +7133,153 @@ class TestNoDraftWhenParkUnavailable(unittest.TestCase):
         self.assertFalse(any("данные парка недоступны" in str(t[1]) for t in self.client.sent))
 
 
+# ============ КЛАСС-ФИКС ТРЁХ НАХОДОК ПО КЛИЕНТСКИМ ЧЕРНОВИКАМ (31.07.2026) ============
+# Голдены на ДОСЛОВНЫХ текстах прода. Источник каждого — moderation_ipc.db (mode=ro), выписаны
+# в docs/artifacts/2026-07-31-revizor-false-findings-audit.md §1 вместе с id записи и временем.
+# Правило-класс CLAUDE.md: голдены детекта — реальные фразы клиента/бота, а не идеальные образцы.
+
+# окно 529849022, drafts.id=213, final_text (ОТПРАВЛЕНО клиенту), 2026-07-08T02:48:00Z
+LIVE_DEP_213 = ("Спасибо за подробности! 🤝 На ваши даты, 15–20 июля, YAMAHA NMAX 155 на 5 дней — "
+                "1685 ฿ (337 ฿/день), депозит 3000 ฿ — паспортом можно, всё верно. Доставка в "
+                "Раваи — 590 ฿, забор байка в конце аренды бесплатный. Подскажите, пожалуйста, "
+                "на чём вы ездили раньше и как долго — чтобы убедиться, что вариант вам подойдёт "
+                "идеально? 😎")
+# окно 529849022, drafts.id=214 — соседний черновик того же окна
+LIVE_DEP_214 = "депозит 3000 бат — можно оставить паспорт вместо денег, как вы и хотели"
+# строка прайс-блока, которую печатает КОД (sheet из pricing_note), окна 488841305/489092003/…
+LIVE_SHEET_DEP = "• Депозит: 3000 ฿ / паспорт"
+# окно 45349667, drafts.id=360, draft, status=posted, 2026-07-28T09:27:21Z
+LIVE_AVAIL_360 = ("Он может написать сам — так быстрее, пусть скидывает свой запрос напрямую. "
+                  "По доставке сегодня всё подтверждаю: раньше ночи не успеваем. "
+                  "Во сколько и куда удобно подать байк?")
+# окно 529849022, drafts.id=292, draft, status=posted, 2026-07-14T20:13:08Z
+LIVE_YEAR_292 = ("XMAX 300 (2020-2022) | 5 дней: 2965 бат (593 бат/день), депозит 5000 бат.\n"
+                 "XMAX 300 New Gen (2023+) | 5 дней: 3520 бат (704 бат/день), депозит 7000 бат.\n"
+                 "\nПаспорт вместо депозита — без проблем.")
+# живая строка J из pricing_note записи id=199 — на ней боевой скраб съедал сумму депозита
+LIVE_J_199 = ("HONDA CBR 650R | дней: 7, стоимость: 9519 (скидка за срок 11%, 1360 в день), "
+              "депозит: 20000 бат.")
+
+
+class TestDepositChoiceNotConflict(unittest.TestCase):
+    """#92 «депозит без противоречий»: находка — только когда требуются ОБА. Предложенный ВЫБОР
+    (деньги ЛИБО паспорт) — это то, чего правило и требует, и находкой быть не может."""
+
+    def test_live_213_choice_is_not_conflict(self):
+        self.assertEqual(suggest._smoke_deposit_conflict(LIVE_DEP_213), "")
+
+    def test_live_214_instead_of_money_is_not_conflict(self):
+        self.assertEqual(suggest._smoke_deposit_conflict(LIVE_DEP_214), "")
+
+    def test_code_sheet_slash_is_not_conflict(self):
+        # «3000 ฿ / паспорт» печатает КОД из прайса — слэш здесь и есть «ИЛИ»
+        self.assertEqual(suggest._smoke_deposit_conflict(LIVE_SHEET_DEP), "")
+
+    def test_slash_of_price_does_not_mask_real_conflict(self):
+        # «337 ฿/день» рядом — НЕ выбор: слэш засчитываем только вплотную к слову «паспорт»
+        bad = suggest._smoke_deposit_conflict("Аренда 337 ฿/день, депозит 3000 ฿ и паспорт.")
+        self.assertIn("одновременно", bad)
+
+    def test_real_both_requirement_still_flagged(self):
+        self.assertIn("одновременно", suggest._smoke_deposit_conflict("Депозит: 3000 ฿ и паспорт"))
+
+    def test_passport_in_other_clause_not_flagged(self):
+        # деньги в одной фразе, паспорт в другой — про ЭТОТ депозит ничего не сказано
+        self.assertEqual(suggest._smoke_deposit_conflict(
+            "Депозит 3000 ฿. Для брони пришлите фото паспорта."), "")
+
+    def test_two_sums_branch_untouched(self):
+        # вторая ветка чека (разные суммы) этим фиксом не трогалась
+        self.assertIn("разные суммы депозита",
+                      suggest._smoke_deposit_conflict("депозит 3000 ฿ … депозит 5000 ฿"))
+
+
+class TestScarcityNegationAndScope(unittest.TestCase):
+    """Клеймы дефицита: «не успеваем» (про время подачи, да ещё с отрицанием) — не срочность;
+    повелительные формы («успевайте»/«успей») срочность несут и ловятся."""
+
+    def test_live_360_ne_uspevaem_is_not_scarcity(self):
+        self.assertEqual(suggest.availability_claims(LIVE_AVAIL_360), [])
+        self.assertEqual(suggest.availability_violations(LIVE_AVAIL_360, avail=None), [])
+
+    def test_uspevaite_still_scarcity(self):
+        kinds = [c["kind"] for c in suggest.availability_claims("Остался последний байк, успевайте!")]
+        self.assertIn("scarcity", kinds)
+
+    def test_negation_drops_scarcity(self):
+        # отрицание ПЕРЕД клеймом — ровно та обработка, что уже была у avail_pos. Постпозицию
+        # («спешить некуда») этот фикс не разбирает и вида не делает: там клейм остаётся.
+        self.assertEqual(suggest.availability_claims("Байки не разбирают, время есть"), [])
+
+    def test_real_availability_claim_still_caught(self):
+        kinds = [c["kind"] for c in suggest.availability_claims("XMAX 300 сейчас в наличии.")]
+        self.assertIn("avail_pos", kinds)
+
+
+class TestGenYearRightBoundary(unittest.TestCase):
+    """Правая граница _GEN_YEAR_RE: «2000» ВНУТРИ суммы «20000 ฿» — не год. Одна регулярка на две
+    полосы: проверяльщик #92 «нет годов» и боевой _scrub_gen_year на строке цены."""
+
+    def test_20000_is_not_a_year(self):
+        self.assertEqual(suggest._GEN_YEAR_RE.findall("• Депозит: 20000 ฿ / паспорт"), [])
+
+    def test_live_j_line_deposit_survives_scrub(self):
+        # мина класса: до фикса «депозит: 20000 бат» превращался в «депозит: 0 бат»
+        self.assertIn("депозит: 20000 бат", suggest._scrub_gen_year(LIVE_J_199))
+
+    def test_price_2000_baht_still_safe(self):
+        self.assertEqual(suggest._GEN_YEAR_RE.findall("аренда 2000 ฿/день"), [])
+
+    def test_real_generation_year_still_caught(self):
+        self.assertEqual(suggest._GEN_YEAR_RE.findall("XMAX 300 (2020-2022)"), ["2020-2022"])
+        self.assertEqual(suggest._GEN_YEAR_RE.findall("XMAX 300 New Gen (2023+)"), ["2023+"])
+
+    def test_scrub_leaves_no_empty_brackets(self):
+        self.assertEqual(suggest._scrub_gen_year("XMAX 300 (2020-2022) | 5 дней"),
+                         "XMAX 300 | 5 дней")
+
+
+class TestEnforceNoGenYear(unittest.TestCase):
+    """Гард года в клиентском теле: текст МОДЕЛИ чистим, дословные блоки КОДА — байт-в-байт."""
+
+    def test_live_292_year_removed_prices_intact(self):
+        out = suggest.enforce_no_gen_year(LIVE_YEAR_292)
+        self.assertEqual(suggest._GEN_YEAR_RE.findall(out), [])
+        self.assertNotIn("2020-2022", out)
+        self.assertNotIn("2023+", out)
+        for kept in ("XMAX 300 New Gen", "2965 бат", "3520 бат", "депозит 5000 бат",
+                     "депозит 7000 бат", "593 бат/день"):
+            self.assertIn(kept, out)
+
+    def test_clean_draft_byte_identical(self):
+        draft = "Здравствуйте! NMAX 155 на 5 дней — 1685 ฿, депозит 3000 ฿."
+        self.assertIs(suggest.enforce_no_gen_year(draft), draft)
+
+    def test_code_quote_block_not_touched(self):
+        # строка J из pricing_note обязана остаться ПОСИМВОЛЬНО: её сверяет чек «строка J дословно»
+        note = ("ЦЕНА\n" + suggest._QUOTE_OPEN + "\nXMAX 300 New Gen 2023 — 5 дней: 3520 бат.\n"
+                + suggest._QUOTE_CLOSE)
+        block = suggest._quote_block_from_note(note)
+        draft = "Вот расчёт:\n" + block + "\nБайк 2021 года — отличный вариант."
+        out = suggest.enforce_no_gen_year(draft, note)
+        self.assertIn(block, out)                        # блок КОДА цел посимвольно
+        self.assertNotIn("2021 года", out)               # а год из текста модели вырезан
+
+    def test_generate_draft_wires_the_guard(self):
+        # сквозь боевой пайплайн: год, названный моделью, до карточки не доезжает
+        out = suggest.generate_draft(
+            "[клиент]: а какой xmax есть?", "ru", "FAQ",
+            call_llm=lambda s, u: "У нас XMAX 300 (2020-2022) и XMAX 300 New Gen (2023+).")
+        self.assertEqual(suggest._GEN_YEAR_RE.findall(suggest.client_facing_text(out)), [])
+        self.assertIn("New Gen", out)
+
+    def test_regenerate_draft_wires_the_guard(self):
+        # ВТОРАЯ ПОЛОСА того же класс-фикса (strategy-перегенерация уходит клиенту мимо первой)
+        out = suggest.regenerate_draft(
+            "[клиент]: а какой xmax есть?", "ru", "FAQ", False, "", "директива",
+            call_llm=lambda s, u: "У нас XMAX 300 (2020-2022) и XMAX 300 New Gen (2023+).")
+        self.assertEqual(suggest._GEN_YEAR_RE.findall(suggest.client_facing_text(out)), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
