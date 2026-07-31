@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # cowork_log_append.py — прямая запись строки-итога в мозг (cowork_log) через Bridge.
 # Запуск: python cowork_log_append.py "DONE Dispatch <время>: что сделал"
+#         python cowork_log_append.py [-]   ← текст из stdin (кириллица, многострочный блок)
 #
 # ГАРД УСЫХАНИЯ (класс 17.07.2026, образец — VPS cclog.py:200-203). Запись идёт циклом
 # read_doc → склейка → write_doc, то есть документ ПЕРЕЗАПИСЫВАЕТСЯ целиком. Значит любая
@@ -315,7 +316,13 @@ def main():
     # спавнят detached-ребёнком в utf-8-приёмник (dispatch_notify._cowork) — без явного UTF-8
     # cp1251-байты легли бы мохибейком. Пара к read_stdin_text() (тот же класс, входная полоса).
     io_utf8.force_utf8()
-    raw = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else read_stdin_text().strip()
+    # Текст: argv, а «-» — СЕНТИНЕЛ stdin (как у brain_writer). Без сентинела вызов
+    # `cowork_log_append.py - <<EOF …` укладывал в мозг литерал «-», а тело heredoc молча
+    # выбрасывал: запись есть, смысла нет — та самая тихая потеря, только наизнанку (живой
+    # брак 01.08.2026, две пустые строки DONE подряд).
+    raw = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else "-"
+    if raw == "-":
+        raw = read_stdin_text().strip()
     if not raw:
         sys.stderr.write("ОШИБКА: пустая строка-итог\n"); sys.exit(1)
     # ОДНА запись = ОДНА строка: result задачи бывает многострочным, а перенос внутри записи

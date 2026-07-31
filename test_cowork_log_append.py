@@ -591,5 +591,61 @@ class TestStdinEncoding(unittest.TestCase):
         self.assertEqual(cla.read_stdin_text(io.StringIO("DONE уже текст")), "DONE уже текст")
 
 
+class TestArgvStdinSentinel(unittest.TestCase):
+    """«-» в argv — СЕНТИНЕЛ stdin, а не текст записи.
+
+    Живой брак 01.08.2026: вызов `cowork_log_append.py - <<EOF …EOF` (привычка от brain_writer,
+    где «-» сентинел именно так и работает) уложил в мозг литерал «-» ДВАЖДЫ, а тело heredoc
+    выбросил молча. Ни один гард этого не видит: строка непустая, длина растёт, обратное чтение
+    совпадает с записанным — ровно та же слепая зона, что у мохибейка stdin.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._saved = (cla.SPOOL_PATH, cla.get, cla.post, cla.load_env,
+                       cla.read_stdin_text, sys.argv)
+        self.addCleanup(self._restore)
+        cla.SPOOL_PATH = os.path.join(self._tmp.name, "pending.txt")
+        cla.load_env = lambda p: {"BRIDGE_URL": "https://bridge.test/exec", "BRIDGE_TOKEN": "TOK"}
+        cla.get = lambda url, params: {"ok": True, "name": "cowork_log", "id": "FID1",
+                                       "text": "DONE старый журнал целиком"}
+        self.writes = []
+
+        def fake_post(url, payload):
+            self.writes.append(dict(payload))
+            return {"ok": True, "chars": len(payload["text"])}
+
+        cla.post = fake_post
+
+    def _restore(self):
+        (cla.SPOOL_PATH, cla.get, cla.post, cla.load_env,
+         cla.read_stdin_text, sys.argv) = self._saved
+
+    def _run(self, argv, stdin_text):
+        cla.read_stdin_text = lambda stream=None: stdin_text
+        sys.argv = ["cowork_log_append.py"] + argv
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                cla.main()
+            except SystemExit:
+                pass
+        return self.writes[0]["text"].split("\n")[0] if self.writes else ""
+
+    def test_dash_argv_reads_stdin_not_literal(self):
+        first = self._run(["-"], "DONE Dispatch 05:25: итог из heredoc")
+        self.assertIn("итог из heredoc", first)
+        self.assertNotIn("UTC: -", first)          # ← литерал «-» в мозг не лёг
+
+    def test_no_argv_still_reads_stdin(self):
+        self.assertIn("строка из пайпа", self._run([], "NOTE строка из пайпа"))
+
+    def test_real_argv_text_wins_over_stdin(self):
+        """Обычный argv-вызов stdin не трогает: detached-спавн его попросту не имеет."""
+        first = self._run(["DONE строка из argv"], "СТДИН ЧИТАТЬ НЕ ДОЛЖНЫ")
+        self.assertIn("строка из argv", first)
+        self.assertNotIn("ЧИТАТЬ НЕ ДОЛЖНЫ", first)
+
+
 if __name__ == "__main__":
     unittest.main()
