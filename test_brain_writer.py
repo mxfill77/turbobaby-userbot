@@ -8,6 +8,7 @@ test_trainer_log): read_doc ok → {"ok":true,"name":…,"id":…,"text":…}; �
 {"ok":false,"error":"unknown_name",…}; write_doc ok → {"ok":true,"chars":N}; отказ записи →
 {"ok":false,"error":"write_failed","message":"getFileById"}. Адресация и id=, и name=.
 """
+import io
 import os
 import tempfile
 import unittest
@@ -30,6 +31,7 @@ class FakeBridge:
         self.reads, self.writes = [], []
         self.fail_write = False
         self.lie_on_write = None     # Bridge «ок», но в док легло другое (ловля обратным чтением)
+        self.lie_on_create = None    # то же для СОЗДАНИЯ: ok+id вернулся, а в файле не тот текст
 
     def _resolve(self, params):
         if params.get("id"):
@@ -47,11 +49,13 @@ class FakeBridge:
         self.writes.append(dict(payload))
         if payload.get("action") == "create_brain_plain":     # живой формат ReadDocs.createBrainPlain_
             nid = "NEW%d" % (len(self.docs) + 1)
-            self.docs[nid] = payload.get("text", "")
+            text = payload.get("text", "")
+            self.docs[nid] = text if self.lie_on_create is None else self.lie_on_create
             if payload.get("key"):
                 self.names[payload["key"]] = nid
-            return {"ok": True, "id": nid, "name": payload.get("name"),
-                    "key": payload.get("key") or ""}
+            # живой createBrainPlain_ отдаёт ровно эти пять полей (key || null, chars — длина текста)
+            return {"ok": True, "name": payload.get("name"), "key": payload.get("key") or None,
+                    "id": nid, "chars": len(text)}
         if self.fail_write:
             return {"ok": False, "error": "write_failed", "message": "getFileById"}
         did = self._resolve(payload)
@@ -188,9 +192,14 @@ class TestFailSafe(Base):
 class TestCreatePlain(Base):
     """Создание нового Brain-дока: единственный легальный путь с ПК (секреты у писателя, не у скрипта)."""
 
+    def _create(self, name, **kw):
+        kw.setdefault("env", ENV)
+        kw.setdefault("get", self.bridge.get)
+        kw.setdefault("post", self.bridge.post)
+        return bw.create_plain(name, **kw)
+
     def test_create_registers_and_is_addressable_by_name(self):
-        r = bw.create_plain("KB_проба_архив", key="проба_архив", text="история целиком",
-                            env=ENV, post=self.bridge.post)
+        r = self._create("KB_проба_архив", key="проба_архив", text="история целиком")
         self.assertTrue(r["ok"])
         self.assertEqual(self.bridge.docs[r["id"]], "история целиком")
         # зарегистрирован в манифесте → тем же каналом читается по ИМЕНИ
@@ -198,21 +207,86 @@ class TestCreatePlain(Base):
                          "история целиком")
 
     def test_create_without_key_not_in_manifest(self):
-        r = bw.create_plain("KB_безымянный", text="текст", env=ENV, post=self.bridge.post)
+        r = self._create("KB_безымянный", text="текст")
         self.assertTrue(r["ok"])
         self.assertEqual(bw.read_text(doc_id=r["id"], env=ENV, get=self.bridge.get), "текст")
 
     def test_create_needs_name(self):
         with self.assertRaises(bw.BrainWriterError) as cm:
-            bw.create_plain("   ", text="x", env=ENV, post=self.bridge.post)
+            self._create("   ", text="x")
         self.assertEqual(cm.exception.code, 1)
         self.assertEqual(self.bridge.writes, [])
 
     def test_create_blocked_in_test_context_without_mock(self):
         """Под гейтом/юнитами без инжектированного транспорта живой Brain не трогаем."""
+        for kw in ({}, {"post": self.bridge.post}, {"get": self.bridge.get}):
+            with self.assertRaises(bw.BrainWriterError) as cm:
+                bw.create_plain("KB_живой", text="x", env=ENV, **kw)
+            self.assertIn("тестовый контекст", str(cm.exception))
+
+    def test_create_verifies_by_reading_back(self):
+        """«Мост ответил ok» фактом записи не является — сверяем по ЖИВОМУ файлу."""
+        r = self._create("KB_сверка", key="сверка", text="строка один\nстрока два")
+        self.assertTrue(r["verified"])
+        self.assertEqual(r["chars_back"], len("строка один\nстрока два"))
+        self.assertEqual(r["fffd"], 0)
+        self.assertEqual(self.bridge.reads[-1]["id"], r["id"])   # читали именно созданный файл
+
+    def test_create_readback_mismatch_names_created_id(self):
+        """Создание НЕидемпотентно: отказ обязан назвать id — иначе повтор даст ДУБЛЬ в папке."""
+        self.bridge.lie_on_create = "совсем другой текст"
         with self.assertRaises(bw.BrainWriterError) as cm:
-            bw.create_plain("KB_живой", text="x", env=ENV)
-        self.assertIn("тестовый контекст", str(cm.exception))
+            self._create("KB_ложь", key="ложь", text="настоящий текст")
+        self.assertEqual(cm.exception.code, 5)
+        self.assertIn("ДУБЛЬ", str(cm.exception))
+        self.assertEqual(self.bridge.writes[-1]["name"], "KB_ложь")
+        self.assertIn("NEW", str(cm.exception))                  # id созданного файла в тексте отказа
+
+    def test_create_refuses_mojibake_input(self):
+        """Побитый ВХОД обратное чтение не ловит (оно сверит мусор с мусором) — держим на входе."""
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            self._create("KB_мохибейк", key="мохибейк", text="тип Т" + chr(0xFFFD) + "С")
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("U+FFFD", str(cm.exception))
+        self.assertEqual(self.bridge.writes, [])                 # в папку Brain ничего не легло
+
+    def test_create_read_failure_still_names_created_file(self):
+        """Отказ ЧТЕНИЯ после успешного создания — файл уже в папке, о нём обязаны сказать."""
+        self.bridge.lie_on_create = ""            # пустой ответ чтения = отказ чтения (класс 17.07)
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            self._create("KB_нечитаемый", text="текст")
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("УЖЕ СОЗДАН", str(cm.exception))
+
+    def test_create_tolerates_trailing_newline_normalization(self):
+        """Хвостовой перевод строки Drive нормализует — это не «текст не совпал»."""
+        self.bridge.lie_on_create = "тело файла"
+        r = self._create("KB_хвост", text="тело файла\n")
+        self.assertTrue(r["verified"])
+
+
+class TestStdinUtf8(unittest.TestCase):
+    """CLI-вход: многострочный блок приходит по stdin, и декодировать его ЛОКАЛЬЮ нельзя."""
+
+    class _Stdin:
+        def __init__(self, data):
+            self.buffer = io.BytesIO(data)
+
+    def _patch(self, data):
+        old = bw.sys.stdin
+        self.addCleanup(setattr, bw.sys, "stdin", old)
+        bw.sys.stdin = self._Stdin(data)
+
+    def test_utf8_bytes_decoded(self):
+        self._patch("Строка «ёлка»\n".encode("utf-8"))
+        self.assertEqual(bw._stdin_text(), "Строка «ёлка»\n")
+
+    def test_non_utf8_refused_with_clean_error(self):
+        self._patch("Строка".encode("cp1251"))       # локаль Windows — в мозг такое не кладём
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            bw._stdin_text()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("UTF-8", str(cm.exception))
 
 
 class TestShrinkGuard(Base):

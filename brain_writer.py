@@ -15,9 +15,12 @@ cowork_log_append/dispatch_notify.
   движок   brain_writer.apply(mutate, …) — для одноразовых скриптов со СВОЕЙ якорной логикой
            (mutate: старый текст → новый | None=no-op; сам скрипт секретов не касается)
   чтение   brain_writer.read_text(doc_id=… | name=…)
+  создание brain_writer.create_plain(name="KB_имя", key="ключ_манифеста", text=…) — НОВЫЙ док
+           в папке Brain И регистрация в реестре одним вызовом (канал дозаписи доки не создаёт)
   CLI      venv/Scripts/python.exe brain_writer.py (--id FILE_ID | --name ДОК) [ключи] "текст"
-           текст «-» или пустой → читается из stdin (многострочные блоки)
+           текст «-» или пустой → читается из stdin (многострочные блоки, ЯВНО UTF-8)
            --probe → только чтение: длина и голова дока, ничего не пишем
+           --name KB_имя --create ключ → создать док и зарегистрировать («-» = без регистрации)
 
 FAIL-SAFE ВСЕЙ ЗАПИСИ (как у kb_master_append_2307, теперь встроено в канал):
   • адресация: РОВНО один из doc_id/name; Bridge принимает и id=, и name= (проба 23.07,
@@ -56,6 +59,9 @@ HTTP_TIMEOUT = 30
 # перевод строки, поэтому строгое равенство давало бы ложный отказ на ±1 символ. Усечение
 # (ради которого сверка и заведена) на порядки крупнее этого запаса.
 _READBACK_SLACK = 2
+# Символ-замена U+FFFD — след побитой кодировки (кириллица, приехавшая мусором). Задаём КОДОМ, а
+# не литералом: литерал в исходнике сам первый кандидат на перекодировку и в диффе неотличим от мусора.
+_FFFD = chr(0xFFFD)
 
 
 class BrainWriterError(RuntimeError):
@@ -165,22 +171,39 @@ def read_text(doc_id="", name="", env=None, get=None):
     return _read(url, token, addr, ref, get)
 
 
-def create_plain(name, key="", text="", env=None, post=None):
+def _norm_eol(s):
+    """Текст для ДОСЛОВНОЙ сверки: перевод строки к «\\n», хвостовые «\\n» долой. Ровно та же
+    поблажка, ради которой у apply() живёт _READBACK_SLACK, — Drive/Docs нормализуют хвост."""
+    return s.replace("\r\n", "\n").rstrip("\n")
+
+
+def create_plain(name, key="", text="", env=None, post=None, get=None):
     """Создать НОВЫЙ plain-док в папке Brain (Bridge-экшен create_brain_plain) и, если задан key,
     зарегистрировать его в манифесте — после этого док адресуется по имени, как остальные.
 
     Зачем отдельной функцией: канал дозаписи (append/apply) доки СОЗДАВАТЬ не умеет, только
     перезаписывать существующие. А создавать их скриптом-однодневкой нельзя — он читал бы
     BRIDGE_TOKEN сам (запрет класса 328). Значит создание живёт здесь, у доверенного писателя:
-    секреты берёт этот модуль, вызывающий их не видит. → dict ответа Bridge (ok, id, …)."""
+    секреты берёт этот модуль, вызывающий их не видит.
+
+    ОБРАТНОЕ ЧТЕНИЕ обязательно, как у apply(): «мост ответил ok» фактом записи не является.
+    Отличие в ЦЕНЕ ошибки — создание НЕидемпотентно (Drive держит одноимённые файлы спокойно),
+    поэтому каждый отказ ниже НАЗЫВАЕТ id уже созданного файла: слепой повтор дал бы ДУБЛЬ.
+    → dict ответа Bridge (ok, id, …) + verified/chars_back/fffd."""
     url, token = _config(env)
     if not url or not token:
         raise BrainWriterError("нет BRIDGE_URL/BRIDGE_TOKEN в окружении/конфиге", 1)
     if not (name or "").strip():
         raise BrainWriterError("нужно имя нового дока", 1)
-    if post is None and _in_test_context():
+    if (post is None or get is None) and _in_test_context():
         raise BrainWriterError("тестовый контекст (гейт/юнит): живой Brain НЕ трогаем — "
-                               "инжектируй post мок-тестом", 1)
+                               "инжектируй get/post мок-тестом", 1)
+    # ГАРД МОХИБЕЙКА — на ВХОДЕ, а не на выходе: обратное чтение сверяет отправленное с легшим и
+    # честно подтвердит побитый текст, если он приехал побитым УЖЕ к нам (локаль-декод stdin,
+    # класс 29–30.07). Единственное место, где мусор ещё можно не пустить в мозг, — здесь.
+    if _FFFD in text:
+        raise BrainWriterError("в тексте %d символ(ов) U+FFFD: вход уже побит кодировкой — "
+                               "в мозг такое не кладём, перекодируй источник" % text.count(_FFFD), 1)
     payload = {"action": "create_brain_plain", "token": token, "name": name, "text": text}
     if key:
         payload["key"] = key
@@ -192,7 +215,24 @@ def create_plain(name, key="", text="", env=None, post=None):
     if not (isinstance(r, dict) and r.get("ok")):
         raise BrainWriterError("create_brain_plain(%s) не ok: %s"
                                % (name, json.dumps(r, ensure_ascii=False)[:300]), 4)
-    return r
+    new_id = str(r.get("id") or "").strip()
+    if not new_id:
+        raise BrainWriterError("create_brain_plain(%s): ответ ok, но БЕЗ id — что легло в папку "
+                               "Brain, отсюда не видно; повтор создаст ДУБЛЬ" % name, 4)
+    if not text.strip():
+        return dict(r, verified=False)   # пустой док читать назад нечем: пустой ответ = отказ чтения
+    try:
+        back = _read(url, token, {"id": new_id}, "id:" + new_id, get)
+    except BrainWriterError as e:
+        raise BrainWriterError("%s; но файл УЖЕ СОЗДАН (id %s) — проверь его, повтор создаст ДУБЛЬ"
+                               % (e, new_id), e.code)
+    if _norm_eol(back) != _norm_eol(text):
+        raise BrainWriterError("ОБРАТНОЕ ЧТЕНИЕ (id:%s): текст в доке НЕ совпал дословно "
+                               "(отправляли %d символов, в доке %d) — файл создан, повтор даст ДУБЛЬ"
+                               % (new_id, len(text), len(back)), 5)
+    # fffd в ответе — ЗАМЕР по живому файлу (после гарда входа обязан быть 0): отчёт владельцу
+    # держится на числе, а не на «наверное, кодировка не побилась».
+    return dict(r, verified=True, chars_back=len(back), fffd=back.count(_FFFD))
 
 
 # ------------------------------- реестр (BRAIN_MANIFEST) ---------------------
@@ -451,6 +491,20 @@ def _out(s):
     sys.stdout.buffer.write((s + "\n").encode("utf-8"))
 
 
+def _stdin_text():
+    """Текст со stdin ЯВНО как UTF-8. На Windows sys.stdin декодирует ЛОКАЛЬЮ (cp1251), и
+    многострочный кириллический блок приезжал бы в мозг мусором — ровно тем U+FFFD, который
+    обратное чтение потом и ловит. Симметрично _out(), пишущему через sys.stdout.buffer."""
+    raw = getattr(sys.stdin, "buffer", None)
+    if raw is None:                                   # stdin подменён (тест, обёртка) — как есть
+        return sys.stdin.read()
+    try:
+        return raw.read().decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise BrainWriterError("stdin не UTF-8 (%s) — перекодируй вход: класть в мозг битую "
+                               "кириллицу нельзя" % e, 1)
+
+
 def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(
@@ -464,6 +518,9 @@ def main(argv=None):
                     help="только чтение: весь манифест Brain (ключ → id) как JSON")
     ap.add_argument("--probe-actions", dest="probe_actions", action="store_true",
                     help="только чтение: список POST-экшенов живого прода")
+    ap.add_argument("--create", default="", metavar="КЛЮЧ",
+                    help="СОЗДАТЬ новый plain-док в папке Brain с именем --name и зарегистрировать "
+                         "его под ключом КЛЮЧ манифеста ([a-z0-9_]); «-» → создать без регистрации")
     ap.add_argument("--register", default="", metavar="КЛЮЧ=ID",
                     help="зарегистрировать существующий файл Brain-папки под ключом манифеста")
     ap.add_argument("--overwrite", action="store_true",
@@ -505,14 +562,26 @@ def main(argv=None):
             r = register_doc(key.strip(), rid.strip(), overwrite=a.overwrite)
             _out(json.dumps(r, ensure_ascii=False, sort_keys=True))
             return 0 if r.get("ok") else 4
+        if a.create:
+            body = " ".join(a.text).strip()
+            if not body or body == "-":
+                body = _stdin_text()
+            if not body.strip():
+                raise BrainWriterError("пустой текст — создавать пустой док этим ключом не будем", 1)
+            r = create_plain(a.name, key=("" if a.create == "-" else a.create), text=body)
+            _out(json.dumps(r, ensure_ascii=False, sort_keys=True))
+            _out("ОБРАТНОЕ ЧТЕНИЕ OK: отправлено %d символов, в доке %d, U+FFFD: %d"
+                 % (len(body), r.get("chars_back", 0), r.get("fffd", 0)))
+            return 0
         if a.probe:
             t = read_text(doc_id=a.doc_id, name=a.name)
-            _out("PROBE ok: %d символов, голова:" % len(t))
+            _out("PROBE ok: %d символов, строк %d, U+FFFD %d; голова:"
+                 % (len(t), t.count("\n") + 1, t.count(_FFFD)))
             _out(t[:600])
             return 0
         text = " ".join(a.text).strip()
         if not text or text == "-":
-            text = sys.stdin.read()
+            text = _stdin_text()
         res = append(text, doc_id=a.doc_id, name=a.name, anchor=a.anchor, place=a.place,
                      require_above=a.require_above, backup_tag=a.backup_tag)
     except BrainWriterError as e:
