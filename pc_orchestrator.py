@@ -3376,6 +3376,11 @@ def _loc_after_fail(pid, i, n, it, steps):
         _loc_post_card(pid, f"🛑 самопочинка не помогла (попытка 1 исчерпана): шаг {i}/{n} "
                             f"родителя {pid} упал повторно — цепочка остановлена, нужен человек.\n"
                             f"{fail_text[:400]}")
+        # В ЖУРНАЛ (правило «журнал — индекс»): у одиночки такая строка есть с самого порта, а у
+        # шага цепи следа в мозге не было вовсе — только карточка в очередь и строка в лог демона.
+        # Срабатывание автономной починки обязано читаться там же, где ищут всё остальное.
+        _cowork(f"цепь #{pid}: шаг {i}/{n} — самопочинка не помогла (попытка 1 исчерпана), "
+                f"цепь остановлена · {_clip(fail_text)}")
         _loc_post_summary(pid, steps)
         return
     if not _selfheal_on():
@@ -3386,6 +3391,7 @@ def _loc_after_fail(pid, i, n, it, steps):
         reason = (verdict or {}).get("reason") or "(сбой думателя — fail-safe halt)"
         _loc_post_card(pid, f"шаг {i}/{n} упал → думатель: halt, причина: {reason}\n"
                             f"Цепочка остановлена (диагноз думателя выше).")
+        _cowork(f"цепь #{pid}: шаг {i}/{n} → думатель halt, цепь остановлена · {_clip(reason)}")
         _loc_post_summary(pid, steps)
         return
     fixed, reason = verdict["fixed_step"], verdict["reason"] or "(без причины)"
@@ -3401,6 +3407,8 @@ def _loc_after_fail(pid, i, n, it, steps):
                         f"Перерождён задачей id {r.get('id')} (lane=pc; попытка 1 из 1; повторный "
                         f"провал = терминальный halt).\nИсходный провал: {fail_text[:400]}")
     log.info("pcloc-dec: шаг %s/%s родителя %s перерождён задачей %s (retry)", i, n, pid, r.get("id"))
+    _cowork(f"цепь #{pid}: шаг {i}/{n} упал → самопочинка retry, перерождён #{r.get('id')} "
+            f"(попытка 1 из 1) · {_clip(reason)}")
 
 
 # ---------------- ПРИОРИТЕТ pc-полосы: owner (328/829/Dispatch) ⟩ ревизорские цепи ------------

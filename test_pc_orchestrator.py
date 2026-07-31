@@ -4036,6 +4036,32 @@ class TestLocalDecSelfhealAdapt(Base):
         self.assertIn("УПАВШИЙ ШАГ 1/2", p)
         self.assertIn("claude exit=1: боль", p)
 
+    def test_chain_selfheal_leaves_journal_trace(self):
+        """Срабатывание автономной починки обязано читаться в ЖУРНАЛЕ (мозге), а не только в
+        логе демона и карточке очереди: у одиночки строка была с самого порта, у шага цепи —
+        не было вовсе, и владелец искал бы её там, где её нет."""
+        lines = []
+        o._cowork = lines.append
+        o._selfheal_on = lambda: True
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="failed", text="шаг A", result="claude exit=1")
+        with self._thinker('{"verdict":"retry","fixed_step":"шаг A с верным путём","reason":"кривой путь"}'):
+            o.process_local_chains()
+        trace = [ln for ln in lines if "самопочинка retry" in ln]
+        self.assertEqual(len(trace), 1, lines)
+        self.assertIn(f"цепь #{pid}: шаг 1/2", trace[0])
+        self.assertIn("попытка 1 из 1", trace[0])
+
+        lines.clear()                                    # …и терминальный отказ тоже виден
+        self.fb.tasks.clear()
+        o._loc_summarized.clear()
+        pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
+        self._mk_step(pid, 1, 2, status="failed",
+                      text="[самопочинка шага 1, попытка 1] фикс", result="упал снова")
+        with self._boom_thinker():
+            o.process_local_chains()
+        self.assertTrue([ln for ln in lines if "самопочинка не помогла" in ln], lines)
+
     def test_reborn_failed_again_terminal_halt(self):
         o._selfheal_on = lambda: True
         pid = self._mk_parent_done(["1. шаг A", "2. шаг B"])
