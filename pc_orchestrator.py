@@ -1248,6 +1248,14 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)          # headless идёт по ~/.claude (подписка), не платный API
     env.pop("OPENAI_API_KEY", None)
+    # ПРИЗНАК ПРОБЫ НЕ СМЕЕТ ПРОТЕЧЬ В БОЕВОГО РЕБЁНКА (01.08.2026, пара к латчу изоляции в
+    # гарде; зеркало `child_env.pop` серверной полосы, `a739ee9`). Гард ПК читает эти имена как
+    # «идёт проба» и уводит ОБА канала владельца в пробный: застрявшее в окружении демона имя
+    # (сессия, гейт, ручной запуск) означало бы ТИХУЮ ПОТЕРЮ живой красной карточки — а это хуже
+    # лишнего вопроса. Список обязан совпадать с `pretool_guard._TEST_RUN_ENVS` дословно;
+    # равенство закреплено инвариантом `test_probe_isolation.TestDaemonStripsTheSameFlags`.
+    for _test_flag in ("PRETOOL_TEST_RUN", "ORCH_TEST_MODE", "PRETOOL_NOPUSH", "PYTEST_CURRENT_TEST"):
+        env.pop(_test_flag, None)
     env["PYTHONIOENCODING"] = "utf-8"            # ребёнок пишет stdout/stderr в utf-8 → нет кракозябр (пара к encoding в run_claude)
     env[ASK_MARKER_ENV] = marker_path            # pretool_guard в headless пишет сюда красную карточку
     env[MARKER_TOKEN_ENV] = run_token            # …штампуя её нашим токеном — чужие карточки отсеем
@@ -2903,6 +2911,10 @@ def _thinker_exec(prompt, timeout, tag):
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)          # идём по ~/.claude (подписка), не по платному ключу
     env.pop("OPENAI_API_KEY", None)
+    # ТА ЖЕ ЧИСТКА, ЧТО У ИСПОЛНИТЕЛЯ (`_run_task_impl`): думатель тоже спавнит claude, и его
+    # ребёнок несёт свой гард. Один класс — обе ветки спавна, иначе зеркальная течь.
+    for _test_flag in ("PRETOOL_TEST_RUN", "ORCH_TEST_MODE", "PRETOOL_NOPUSH", "PYTEST_CURRENT_TEST"):
+        env.pop(_test_flag, None)
     env["PYTHONIOENCODING"] = "utf-8"
     # Глубина размышления ЯВНО. Нейтральный cwd (tempdir) — сознательное решение выше: он
     # отсекает hooks/pretool_guard репо. Но вместе с ними отсекается и `effortLevel` из

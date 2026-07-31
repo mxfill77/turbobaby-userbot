@@ -243,14 +243,17 @@ class TestEndToEndStdin(unittest.TestCase):
         p = self._run(bash("taskkill /PID 1 /F"))
         self.assertEqual(p.returncode, 0)
         out = json.loads(p.stdout)
-        reason = out["hookSpecificOutput"]["permissionDecision"], out["hookSpecificOutput"]["permissionDecisionReason"]
-        self.assertEqual(reason[0], "ask")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+        # КАРТОЧКУ берём с её канонического места (`card_from_decision`), а не «весь текст
+        # решения»: этот прогон идёт под тест-флагом, то есть он ПРОБА, и решение обёрнуто
+        # перехватом на границе (изоляция проб 01.08.2026). Сама карточка внутри — дословная.
+        card = g.card_from_decision(out["hookSpecificOutput"]["permissionDecisionReason"])
         # человеческая карточка: ЧТО + «— разрешить?», не сырая команда первой строкой
-        self.assertIn("Хочу снять процесс", reason[1])
-        self.assertIn("разрешить?", reason[1])
+        self.assertIn("Хочу снять процесс", card)
+        self.assertIn("разрешить?", card)
         # `kill` — ВЫСШИЙ вид: сверху строка-шапка, 🔴-фраза второй строкой (31.07)
-        self.assertTrue(reason[1].lstrip().startswith("⛔"))
-        self.assertTrue(reason[1].splitlines()[1].startswith("🔴"))
+        self.assertTrue(card.lstrip().startswith("⛔"))
+        self.assertTrue(card.splitlines()[1].startswith("🔴"))
 
     def test_unparseable_stdin_defers(self):
         p = self._run(None, raw="not json")   # тот же изолированный маркер
@@ -294,7 +297,13 @@ class TestHumanCards(unittest.TestCase):
 
 
 class TestMarkerDedup(unittest.TestCase):
-    """PRETOOL_ASK_MARKER: дедуп карточек. claude мог ретраить красное → карточка набегала ×5."""
+    """PRETOOL_ASK_MARKER: дедуп карточек. claude мог ретраить красное → карточка набегала ×5.
+
+    ЧИТАЕМ ЧЕРЕЗ `g.marker_path(mk)`, а не по сырому пути: с 01.08.2026 писатель маркера сам
+    разводит боевой и ПРОБНЫЙ путь (изоляция проб, `test_probe_isolation.py`). В обычном прогоне
+    это тот же файл, а под тест-флагом в окружении (так гоняет дочерний прогон
+    `TestMarkerIsolation`) — соседний, с префиксом. Сырой путь означал бы, что тест зелен только
+    там, где изоляции нет."""
 
     def _tmp_marker(self):
         import tempfile
@@ -309,7 +318,7 @@ class TestMarkerDedup(unittest.TestCase):
             card = "🔴 Хочу удалить файл X — разрешить?\nКоманда: del X"
             for _ in range(5):
                 g._write_marker(mk, card)
-            with open(mk, encoding="utf-8") as f:
+            with open(g.marker_path(mk), encoding="utf-8") as f:
                 content = f.read()
             self.assertEqual(content.count("Хочу удалить файл X"), 1)   # была ×5 → стала ×1
         finally:
@@ -324,7 +333,7 @@ class TestMarkerDedup(unittest.TestCase):
             g._write_marker(mk, "🔴 карточка A — разрешить?")
             g._write_marker(mk, "🔴 карточка B — разрешить?")
             g._write_marker(mk, "🔴 карточка A — разрешить?")   # повтор A не добавляется
-            with open(mk, encoding="utf-8") as f:
+            with open(g.marker_path(mk), encoding="utf-8") as f:
                 content = f.read()
             self.assertEqual(content.count("карточка A"), 1)
             self.assertEqual(content.count("карточка B"), 1)   # разные карточки сохраняются
@@ -531,8 +540,9 @@ class TestCase314HeadlessReadonly(unittest.TestCase):
                                    text=True, encoding="utf-8", env=env, timeout=30)
                 self.assertEqual(p.returncode, 0, cmd)
                 self.assertEqual(p.stdout.strip(), "", cmd)          # ← НОЛЬ Allow
-            self.assertFalse(os.path.isfile(mk),
-                             "красная карточка ушла демону на чистом чтении (кейс 314)")
+            for p in (mk, g.marker_path(mk, env)):     # ни боевым путём, ни пробным
+                self.assertFalse(os.path.isfile(p),
+                                 "красная карточка ушла демону на чистом чтении (кейс 314)")
         finally:
             try:
                 os.remove(mk)
@@ -2103,11 +2113,11 @@ class TestOwnerApprovalMarker(unittest.TestCase):
         os.close(fd)
         try:
             g._write_marker(mk, card, "env")
-            with open(mk, encoding="utf-8") as f:
+            with open(g.marker_path(mk), encoding="utf-8") as f:
                 body = f.read()
             self.assertIn(g.KIND_LINE_PREFIX + "env", body)
             g._write_marker(mk, card, "env")               # дедуп: второй раз не дописывает
-            with open(mk, encoding="utf-8") as f:
+            with open(g.marker_path(mk), encoding="utf-8") as f:
                 self.assertEqual(f.read(), body)
         finally:
             os.remove(mk)
@@ -2168,7 +2178,7 @@ class TestKindStampOrigin(unittest.TestCase):
             os.environ[g.MARKER_TOKEN_ENV] = self.TOKEN
             for card, kind in cards:
                 g._write_marker(mk, card, kind)
-            with open(mk, encoding="utf-8") as f:
+            with open(g.marker_path(mk), encoding="utf-8") as f:   # см. TestMarkerDedup
                 body = f.read()
         finally:
             os.environ.pop(g.MARKER_TOKEN_ENV, None)
@@ -2392,9 +2402,13 @@ class TestApprovalEndToEndProcess(unittest.TestCase):
             p = subprocess.run([sys.executable, os.path.join(PROJ, "pretool_guard.py")],
                                input=json.dumps(data), capture_output=True, text=True,
                                encoding="utf-8", env=env, timeout=30)
-            marker = ""
-            if os.path.isfile(mk):
-                with open(mk, encoding="utf-8") as f:
+            # Маркер читаем ТЕМ ЖЕ разводом, что применил ребёнок: у него в окружении стоит
+            # PRETOOL_NOPUSH=1, то есть с 01.08.2026 это ПРОБА — и маркер лежит в пробном файле
+            # (изоляция проб, `test_probe_isolation.py`). Боевой путь при этом обязан остаться
+            # пустым — это и проверяет `TestMarkerIsolation`.
+            mk_read, marker = g.marker_path(mk, env), ""
+            if os.path.isfile(mk_read):
+                with open(mk_read, encoding="utf-8") as f:
                     marker = f.read()
         finally:
             try:
@@ -3186,7 +3200,8 @@ class TestTwoTiersOfCards(unittest.TestCase):
             out = json.loads(p.stdout)["hookSpecificOutput"]
             self.assertEqual(out["permissionDecision"], "deny")
             self.assertIn("ОБЪЕКТ НЕ НАЗВАН", out["permissionDecisionReason"])
-            self.assertFalse(os.path.isfile(mk), "маркер демону писать нельзя: это не карточка")
+            for p in (mk, g.marker_path(mk, env)):     # ни боевым путём, ни пробным
+                self.assertFalse(os.path.isfile(p), "маркер демону писать нельзя: это не карточка")
         finally:
             try:
                 os.remove(mk)
