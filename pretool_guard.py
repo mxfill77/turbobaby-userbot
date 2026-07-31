@@ -111,6 +111,34 @@ headless пишет красную карточку в файл-маркер д�
     сохраняется (`cat > .claude/settings.json <<'EOF'` — по-прежнему запись в конфиг), терминатор
     не найден → не вырезаем ничего, а ЖИВОЙ ЛИСТ судится по тексту С ТЕЛОМ (fail-closed).
 
+ШЕСТАЯ ГРУППА ТОГО ЖЕ КЛАССА (01.08.2026) — РАЗРЯД «СПРОСИТЬ» У СЕКРЕТОВ: ИМЯ ФАЙЛА, НАЗВАННОЕ
+В ТЕКСТЕ, ОБРАЩЕНИЕМ К СЕКРЕТУ НЕ ЯВЛЯЕТСЯ. Замок «класс по действию» (`_verb_acts`, 31.07)
+накрыл таблицу `_RED_CMD`, но вид `env` живёт ОТДЕЛЬНОЙ веткой по подстроке `_RE_ENV` — и там
+разбора действия не было. Цена — живой факт: задача 87, УЖЕ ОДОБРЕННАЯ владельцем и
+перезапущенная после «да», второй раз умерла в `needs_approval` (`14:39:06` → «да» → ре-ран
+`14:50:21` → `14:59:05`, причина `model_refusal`), а красной её сделала ЗАПИСЬ В ЖУРНАЛ:
+`printf '%s' "…SUGGEST_TEST_MODE=on… (чтение памяти процесса, не .env)…" |
+venv/Scripts/python.exe cowork_log_append.py` (лог гарда `14:56:50 | ask | env`). Та же строка
+со словами «не файла конфига» прошла сразу (`14:57:04 | defer`) — то есть решала ПРОЗА, а не
+операция. Три места, каждое своим разбором:
+  • ТРУБА В ИМЕНОВАННЫЙ СКРИПТ — не «текст становится кодом». Гуард печати снимался на ЛЮБОЙ
+    трубе; но stdin исполняют `python`, `python -`, `python -c`, шелл и `xargs`, а
+    `… | venv/Scripts/python.exe cowork_log_append.py` подаёт скрипту ДАННЫЕ. То же у heredoc.
+    См. `_seg_runs_stdin_as_code` (граница: интерпретатор без именованной цели — исполняет).
+  • ПОДПИСЬ К ВЫВОДУ ЧЕРЕЗ ДЕФИСЫ. Флагом считался любой токен с дефиса, и
+    `echo "--- … .env … ---"` целиком оставался под сканом, тогда как `echo "=== … ==="` — нет.
+    У флага пробелов внутри не бывает: `_is_flag_token`.
+  • ЛИТЕРАЛ В PYTHON-КОДЕ. Строка `'… не .env'` в фикстуре пробы и в теле НЕотслеживаемого .py
+    ничего не открывает: красным делает СТОК файлового доступа (`_RE_PY_NOT_PROBE`), а не имя.
+    Живой факт того же часа: сессия проверяла ЭТОТ ЖЕ класс пробником `python -c "… g.decide(…)"`
+    и получила карточку за собственную фикстуру (`14:57:48 | ask | env`). См.
+    `_py_env_mention_only` — третья нога `_py_env_readonly`.
+ЧТО НЕ ОСЛАБЛЕНО: чтение и запись файла секретов красные как были (`cat`/`Get-Content`/`grep -n
+… .env`/`open().read()`/`dotenv`/`> .env`/`>> .env`/путь через переменную/труба из пробы/имя
+секрета позиционным аргументом скрипта); `read_secret`/`edit_secret` инструментов Read/Edit не
+тронуты; вид `env` остаётся в `_HARD_CARD`. Прозрачность лога РАЗДЕЛЕНА, а не потеряна: проба
+пишется как `env_probe`, чистое упоминание — как `env_mention` (`_env_reach`).
+
 ДВА ВИДА КАРТОЧКИ ПО ЦЕНЕ ОШИБКИ (31.07.2026) — правка НЕ о классификации, а о ВИДЕ и ПОРЯДКЕ
 ПОДТВЕРЖДЕНИЯ. Повод: владелец подтвердил ТРИ карточки `live_sheet` подряд не читая — они
 пришли в общем потоке и тем же видом, что уборка временного файла. Замер за двое суток:
@@ -286,7 +314,7 @@ _RED_CMD = [
 # замком САМА, без правки теста. Зашитый перечень в замке — тот же класс, что зашитая подстрока
 # в признаке: он стареет молча.
 _ACTION_CHECK = {
-    "_RE_ENV": "_env_probe_only / _py_env_readonly — наличие и окружение живого процесса ≠ чтение",
+    "_RE_ENV": "_env_reach / _py_env_readonly — наличие, окружение процесса и УПОМИНАНИЕ ≠ чтение",
     "_RE_CLAUDE_CFG_CMD": "_is_pure_config_read — смотрелка против писателя, по командной позиции",
     "_RE_OUTSIDE_WRITE": "_inside_project — цель перенаправления, а не слово в строке",
     "_RE_SQLITE_WORD": "_sqlite_decide — по оператору запроса (select/pragma ≠ update)",
@@ -1659,18 +1687,52 @@ _HEREDOC_EXEC = _NESTED_SHELLS | {"python", "python3", "py", "node", "perl", "ru
                                   "sqlite3", "psql", "mysql", "ssh", "docker", "xargs"}
 
 
+def _seg_runs_stdin_as_code(seg):
+    """True ⇔ команда сегмента ИСПОЛНИТ то, что придёт ей на stdin (телом heredoc или трубой).
+
+    ОДНА ГРАНИЦА, и она измерена (задача 87, 31.07.2026): `python` в списке стоит по праву —
+    `python`, `python -` и `python -c …` действительно читают stdin как КОД. Но у
+    `venv/Scripts/python.exe cowork_log_append.py` цель ИМЕНОВАНА, и stdin для неё — ДАННЫЕ,
+    которые скрипт сам разбирает. Ровно этой разницы не было: `printf '%s' "…" |
+    venv/Scripts/python.exe cowork_log_append.py` считался «текст становится кодом», текст
+    оставался под сканом целиком, и имя файла секретов, НАЗВАННОЕ в журнальной строке, рождало
+    карточку «хочу обратиться к секретам» на записи в мозг.
+
+    Fail-safe как везде: сегмент не разобрался — считаем, что исполняет; интерпретатор без
+    именованной цели — исполняет; всё, чего нет в `_HEREDOC_EXEC`, stdin не исполняет."""
+    try:
+        toks = shlex.split(seg or "")
+    except Exception:
+        return True                      # кавычки не разобраны → не вырезаем (краснее)
+    j = _cmd_index(toks)
+    if j is None or j >= len(toks):
+        return False
+    # `xargs` (и вообще обёртки) `_cmd_index` проходит НАСКВОЗЬ — ему нужна действующая команда.
+    # Здесь вопрос другой: КТО СЪЕСТ stdin. У `… | xargs cat` его съедает обёртка и подаёт
+    # прочитанное аргументом читалке — то есть текст становится операцией. Пропущенный префикс
+    # обязан проверяться, иначе `echo ".env" | xargs cat` уехал бы зелёным.
+    for t in toks[:j]:
+        if _base(t) in _HEREDOC_EXEC:
+            return True
+    name = _base(toks[j])
+    if name not in _HEREDOC_EXEC:
+        return False
+    if name in _PY_INTERP:
+        rest = toks[j + 1:]
+        if "-" in rest or "-c" in rest:
+            return True                  # `python -` / инлайн-код: stdin и есть программа
+        if "-m" in rest or any(t.lower().endswith(".py") for t in rest):
+            return False                 # цель ИМЕНОВАНА → stdin ей ДАННЫЕ, а не код
+    return True
+
+
 def _line_runs_code(line):
     """True ⇔ в строке-заголовке есть команда, которая ИСПОЛНИТ тело heredoc (интерпретатор,
     вложенный шелл, ssh). Сбой разбора — тоже True: непонятное не вырезаем (fail-safe)."""
     for i, seg in enumerate(_split_segments(line or "")):
         if i % 2:
             continue
-        try:
-            toks = shlex.split(seg)
-        except Exception:
-            return True
-        j = _cmd_index(toks)
-        if j is not None and j < len(toks) and _base(toks[j]) in _HEREDOC_EXEC:
+        if _seg_runs_stdin_as_code(seg):
             return True
     return False
 
@@ -1705,12 +1767,30 @@ def _strip_heredoc(cmd):
 # карточку из ПОДПИСИ К ВЫВОДУ); здесь тот же довод распространён на скан-текст целиком.
 # ТРИ ГУАРДА, каждый закрывает свой способ превратить печать в исполнение:
 #   • перенаправление в сегменте (`echo '{}' > .claude/settings.json`) — это ЗАПИСЬ, не печать;
-#   • труба ИЗ сегмента (`echo "import gspread; …" | python`) — текст становится КОДОМ;
+#   • труба ИЗ сегмента В ТО, ЧТО ИСПОЛНЯЕТ stdin (`echo "import gspread; …" | python`) — текст
+#     становится КОДОМ. Именно «в то, что исполняет»: труба в ИМЕНОВАННЫЙ скрипт
+#     (`… | venv/Scripts/python.exe cowork_log_append.py`) кодом текст не делает, см.
+#     `_seg_runs_stdin_as_code` и шестую группу класса в шапке модуля;
 #   • подстановка команды в самом аргументе (`echo "$(rm -rf x)"`) — аргумент исполняется.
 # В любом из трёх случаев сегмент остаётся под сканом ЦЕЛИКОМ.
-def _strip_print_args(seg, nxt=""):
-    """Сегмент-печать без своих аргументов; не печать или любой из трёх гуардов → как есть."""
-    if _RE_REDIRECT.search(seg) or (nxt or "").strip() == "|":
+def _is_flag_token(tok):
+    """Токен — ФЛАГ печати (`-n`, `-e`, `-NoNewline`), а не её текст.
+
+    Раньше флагом считалось всё, что начинается с дефиса, — и подпись к выводу
+    `echo "--- grep .env in journal bodies ---"` под это правило подпадала ЦЕЛИКОМ: текст
+    оставался в скан-тексте и рождал карточку «хочу обратиться к секретам» (живой случай
+    01.08.2026, пойман на собственной команде сессии). У флага пробелов внутри не бывает —
+    этим и различаем; `echo "---"` без пробелов останется под сканом, и это безопасная сторона."""
+    t = tok or ""
+    return t.startswith("-") and not any(c.isspace() for c in t)
+
+
+def _strip_print_args(seg, nxt="", rcv=""):
+    """Сегмент-печать без своих аргументов; не печать или любой из трёх гуардов → как есть.
+    `rcv` — СЛЕДУЮЩИЙ сегмент (получатель трубы): он и решает, станет ли текст кодом."""
+    if _RE_REDIRECT.search(seg):
+        return seg
+    if (nxt or "").strip() == "|" and _seg_runs_stdin_as_code(rcv):
         return seg
     try:
         toks = shlex.split(seg)
@@ -1720,7 +1800,7 @@ def _strip_print_args(seg, nxt=""):
     if j is None or j >= len(toks) or _base(toks[j]) not in _PRINT_CMDS:
         return seg
     dropped = [t for t in toks[j + 1:]
-               if not t.startswith("-") and not _RE_ARG_EXEC.search(t)]
+               if not _is_flag_token(t) and not _RE_ARG_EXEC.search(t)]
     return _mask(seg, dropped)
 
 
@@ -1741,7 +1821,8 @@ def _scan_text(cmd, keep_heredoc=False):
         if i % 2:
             out.append(p)                       # разделитель — дословно
             continue
-        clean = _strip_print_args(p, parts[i + 1] if i + 1 < len(parts) else "")
+        clean = _strip_print_args(p, parts[i + 1] if i + 1 < len(parts) else "",
+                                  parts[i + 2] if i + 2 < len(parts) else "")
         clean = _strip_script_cli_args(_strip_git_msg(clean))
         try:
             toks = shlex.split(clean)
@@ -1873,7 +1954,11 @@ def _scan_python(cmd, cwd, env_probe=False):
         return ("ask", "sqlite", _extract_db(blob) or "")
     if not saw_target:
         return ("ask", "py_write", "без внятной цели")
-    return ("defer", ("env_probe" if env_hit else ""), "")
+    if not env_hit:
+        return ("defer", "", "")
+    # Прозрачность лога: видно, ЧЕМ смягчено упоминание секрета — пробой или чистым именем.
+    why = _py_env_readonly(content) or _py_env_readonly(cmd_scan)
+    return ("defer", ("env_mention" if why == "mention" else "env_probe"), "")
 
 
 # ---------------- НАЛИЧИЕ ФАЙЛА ≠ ЕГО СОДЕРЖИМОЕ (правка 30.07.2026) -------------------------
@@ -1948,51 +2033,128 @@ def _py_reads_process_env(code):
     return bool(_RE_PY_PROC_ENV.search(c))
 
 
+def _py_env_mention_only(code):
+    """True ⇔ имя файла секретов в python-коде только НАЗВАНО и открыть его этому коду НЕЧЕМ:
+    ни одного стока файлового доступа/исполнения (`_RE_PY_NOT_PROBE` — open/чтение/запись/
+    dotenv/os.environ/subprocess/exec/…) в тексте нет ВООБЩЕ.
+
+    Довод тот же, которым уже разведены сеть, удаление и живой лист: строковый литерал сам по
+    себе ничего не открывает. Живой факт задачи 87 (31.07.2026): сессия ПРОВЕРЯЛА гард —
+    `python -c "import pretool_guard as g; mention='… не .env …'; print(g.decide(…))"` — и
+    получила карточку «хочу обратиться к секретам» за фикстуру в собственной пробе. То же у тела
+    НЕотслеживаемого .py: перечень красных имён внутри пробника — это перечень, а не операция.
+
+    ГРАНИЦА ДОКАЗУЕМАЯ, а не «выглядит безобидно»: одна улика доступа к файлу отменяет
+    послабление целиком, и тогда решает прежний разбор. Косвенность (`p = ".env"; open(p)`)
+    послаблением не прикрыта — `open(` уже сток."""
+    c = code or ""
+    if not _RE_ENV.search(c):
+        return False
+    return not _RE_PY_NOT_PROBE.search(c)
+
+
 def _py_env_readonly(code):
-    """True ⇔ `.env` в python-коде — ЧИСТОЕ ЧТЕНИЕ, не выдающее ни байта файла секретов:
-    либо проверка НАЛИЧИЯ/метаданных (`_py_env_probe_only`), либо чтение ОКРУЖЕНИЯ ЖИВОГО
-    ПРОЦЕССА из PEB (`_py_reads_process_env`). Оба — доказанная read-only-операция; обе несут
-    один и тот же fail-safe: любой признак файлового доступа (`_RE_PY_NOT_PROBE`) → False."""
-    return _py_env_probe_only(code) or _py_reads_process_env(code)
+    """→ ПРИЧИНА, по которой `.env` в python-коде обращением к секрету НЕ является
+    ('probe' | 'proc_env' | 'mention'), либо '' — обращение, красное как было. Строка, а не
+    bool, нужна логу: смягчение не должно стоить прозрачности, и в журнале обязано быть видно,
+    КАКОЙ разбор промолчал.
+
+    Три ноги, каждая доказуемо не выдаёт ни байта файла: проверка НАЛИЧИЯ/метаданных
+    (`_py_env_probe_only`), чтение ОКРУЖЕНИЯ ЖИВОГО ПРОЦЕССА из PEB (`_py_reads_process_env`)
+    и ЧИСТОЕ УПОМЯНАНИЕ имени (`_py_env_mention_only`). Fail-safe у всех трёх один: любой
+    признак файлового доступа (`_RE_PY_NOT_PROBE`) снимает послабление."""
+    if _py_env_probe_only(code):
+        return "probe"
+    if _py_reads_process_env(code):
+        return "proc_env"
+    if _py_env_mention_only(code):
+        return "mention"
+    return ""
 
 
-def _env_probe_only(cmd):
-    """True ⇔ путь секрета в команде встречается ТОЛЬКО в проверке НАЛИЧИЯ/метаданных.
+def _env_outside_py_code(seg):
+    """True ⇔ в python-сегменте имя секрета стоит НЕ внутри инлайн-кода `-c`, а ОПЕРАНДОМ:
+    `venv/Scripts/python.exe reader.py .env` — именно этот путь скрипт и получает, чтобы файл
+    прочитать. Граница нужна ровно послаблению «только упоминание»: у него доказательство
+    ОТРИЦАТЕЛЬНОЕ («стоков доступа нет»), и на командной строке оно ложно — стоки лежат в теле
+    скрипта, которого в сегменте не видно. У проб (`_py_env_probe_only`, `_py_reads_process_env`)
+    доказательство положительное, их эта яма не касается. Сбой разбора → True (краснее).
+
+    Тот же довод, по которому `_looks_like_secret_arg` СОХРАНЯЕТ такой аргумент в скан-тексте."""
+    try:
+        toks = shlex.split(seg or "")
+    except Exception:
+        return True
+    i = 0
+    while i < len(toks):
+        if toks[i] == "-c":
+            i += 2                        # payload `-c` — КОД, его судит `_py_env_readonly`
+            continue
+        if _RE_ENV.search(toks[i]):
+            return True
+        i += 1
+    return False
+
+
+def _env_reach(cmd):
+    """→ ЧЕМ смягчено упоминание секрета в команде, для решения И ДЛЯ ЛОГА:
+      • `'env_probe'` — хоть один сегмент действительно ПРОБОВАЛ (наличие/метаданные файла либо
+        окружение живого процесса из PEB);
+      • `'env_mention'` — имя только НАЗВАНО: подпись к выводу, текст записи, фикстура в
+        python-коде без единого стока файлового доступа;
+      • `None` — смягчения нет (красное как было) либо секрет в команде не упомянут вовсе.
+
     Разбор ПОСЕГМЕНТНЫЙ и структурный (`_split_segments` + `_cmd_index`) — по КОМАНДНОЙ позиции,
-    а не по подстроке. Fail-safe: любое сомнение → False, то есть красное как было. Сомнением
+    а не по подстроке. Fail-safe: любое сомнение → None, то есть красное как было. Сомнением
     считаем:
       • труба ИЗ сегмента с секретом (`Get-Item .env | Get-Content` вернул бы содержимое);
       • любое перенаправление в этом сегменте (`ls > .env` секрет бы ПЕРЕЗАПИСАЛ);
-      • команда сегмента не из белого списка `_EXISTS_CMDS` (в т.ч. присваивание `$p = ".env"`,
-        после которого содержимое читает уже другой сегмент);
-      • python-сегмент, не прошедший `_py_env_probe_only`;
+      • команда сегмента не из белого списка `_EXISTS_CMDS`/`_PRINT_CMDS` (в т.ч. присваивание
+        `$p = ".env"`, после которого содержимое читает уже другой сегмент);
+      • python-сегмент, не прошедший `_py_env_readonly`;
       • кривое квотирование (shlex не разобрал)."""
     if not cmd:
-        return False
+        return None
     segs = _split_segments(cmd)
-    seen = False
+    seen = probed = False
     for i in range(0, len(segs), 2):
         seg = segs[i]
         if not _RE_ENV.search(seg):
             continue
         seen = True
         if i + 1 < len(segs) and segs[i + 1].strip() == "|":
-            return False
+            return None
         if _RE_REDIRECT.search(seg):
-            return False
+            return None
         try:
             toks = shlex.split(seg)
         except Exception:
-            return False
+            return None
         j = _cmd_index(toks)
         if j is None or j >= len(toks):
-            return False
-        if _base(toks[j]) in _EXISTS_CMDS or _base(toks[j]) in _PRINT_CMDS:
+            return None
+        if _base(toks[j]) in _EXISTS_CMDS:
+            probed = True
             continue
-        if _RE_PY.search(seg) and _py_env_readonly(seg):
-            continue
-        return False
-    return seen
+        if _base(toks[j]) in _PRINT_CMDS:
+            continue                      # печать своего аргумента — текст, а не обращение
+        if _RE_PY.search(seg):
+            why = _py_env_readonly(seg)
+            if why == "mention" and _env_outside_py_code(seg):
+                return None           # путь ОПЕРАНДОМ, а не текстом — см. `_env_outside_py_code`
+            if why:
+                probed = probed or (why != "mention")
+                continue
+        return None
+    if not seen:
+        return None
+    return "env_probe" if probed else "env_mention"
+
+
+def _env_probe_only(cmd):
+    """True ⇔ упоминание секрета в команде смягчено разбором ПО ДЕЙСТВИЮ (`_env_reach`).
+    Имя сохранено: под ним признак `_RE_ENV` стоит в замке `_ACTION_CHECK`."""
+    return _env_reach(cmd) is not None
 
 
 # ------------------------------- классификаторы ------------------------------
@@ -2027,7 +2189,8 @@ def _decide_bash(cmd, cwd):
     if not cmd:
         return ("defer", "", "")
     scan = _scan_text(cmd)
-    probe = bool(_RE_ENV.search(scan)) and _env_probe_only(cmd)
+    reach = _env_reach(cmd) if _RE_ENV.search(scan) else None
+    probe = reach is not None
     action, kind, obj = _decide_bash_body(cmd, cwd, scan, probe)
     if action == "defer" and not kind and _RE_SQLITE_WORD.search(scan):
         # Питон-форма чтения базы доходит сюда через `_scan_python` с пустым видом. Смягчение не
@@ -2037,13 +2200,18 @@ def _decide_bash(cmd, cwd):
         if sq and sq[0] == "sqlite_read":
             return ("defer", "sqlite_read", sq[1])
     if probe and action == "defer" and not kind:
-        return ("defer", "env_probe", "")     # прозрачность лога: пробу наличия видно как пробу
+        return ("defer", reach, "")     # прозрачность лога: проба и упоминание — РАЗНЫЕ строки
     if action == "defer" and not kind:
         # ДОКТРИНА ЛОГА, та же что у `sqlite_read`/`env_probe`/`cfg_read`: смягчение не должно
         # стоить прозрачности. Признак поймал СЛОВО, а не команду (`_verb_acts`) — в журнале
         # обязано быть видно, КАКОЙ именно признак промолчал и почему, иначе строка выглядит как
         # «ничего красного не нашли», и следующий разбор ложного класса начнётся с нуля.
-        w = _word_only_kind(scan)
+        # Второй заход по СЫРОЙ команде. Признак мог не дожить до скан-текста вовсе: подпись к
+        # выводу вырезается как данные (`_strip_print_args`), и с 01.08.2026 это касается и формы
+        # `echo "--- SCHTASKS XML ---"` (раньше её спасал от вырезания ведущий дефис). Решения
+        # ветка не меняет — только НАЗЫВАЕТ признак, который промолчал: иначе строка журнала
+        # выглядит как «ничего красного не нашли», и следующий разбор начинается с нуля.
+        w = _word_only_kind(scan) or _word_only_kind(cmd)
         if w:
             return ("defer", "word_" + w, "")
     if action == "defer" and not kind and _RE_LIVE_SHEET_HINT.search(scan):

@@ -1862,6 +1862,172 @@ class TestEnvExistsVsContent(unittest.TestCase):
             self.assertEqual(g.decide_for_role(read(os.path.join(PROJ, ".env")), headless)[0], "ask")
 
 
+# Прозаический хвост записи, УБИВШЕЙ задачу 87. Голова (первые 300 символов команды) взята
+# ДОСЛОВНО из `pretool_guard.log` строки `2026-07-31 14:56:50 | headless | Bash | ask | env`,
+# хвост — из тела вынесенной записи `docs/artifacts/journal/2026-07-31-075704-ask.md`. Разница
+# между убитой и прошедшей строкой ровно одна и записана самой той сессией: «не .env» против
+# «не файла конфига» (память сессии `guard-env-card-on-prose-mention`).
+_ASK87 = (
+    "ASK Dispatch 14:58: подъём ботов — ворота открыты основанием владельца на 14dd3fd "
+    "(release_reason=owner), правило ворот не тронуто ни строкой; дифф замыкания НЕ расширился "
+    "(те же 2 файла, 308/22); черновики #373-375 закрыты владельцем, ждать нечего; moderbot "
+    "PID 10080 и pc_agent 12124 уже на финальном коде — рестарт им не нужен; "
+    "SUGGEST_TEST_MODE=on у 1656 и 10080 (чтение памяти процесса, не %s); ротация 34/34 OK, "
+    "запись в лог цен прошла (139→299 б). ОСТАЛОСЬ: рестарт userbot PID 1656 — класс kill, "
+    "ушёл карточкой. → docs/artifacts/2026-07-31-userbot-lift-gate-open.md")
+_CCLOG = "venv/Scripts/python.exe cowork_log_append.py"
+
+
+class TestEnvMentionIsNotAccess(unittest.TestCase):
+    """ГОЛДЕНЫ 01.08.2026 — ШЕСТАЯ ГРУППА класса «судим по ДЕЙСТВИЮ, а не по подстроке».
+
+    Замок 31.07 (`_verb_acts`) накрыл таблицу `_RED_CMD`, но вид `env` живёт ОТДЕЛЬНОЙ веткой по
+    подстроке `_RE_ENV` — разряда «спросить» там не было. Живой факт: задача 87, УЖЕ ОДОБРЕННАЯ
+    владельцем и перезапущенная после «да», второй раз умерла в `needs_approval`
+    (`pc_orchestrator.log`: 14:39:06 NEEDS_APPROVAL → «да» → ре-ран 14:50:21 → 14:59:05,
+    `FAIL причина=model_refusal`). Красной её сделала ЗАПИСЬ В ЖУРНАЛ — прозой, а не операцией.
+
+    Голдены стерегут ДВЕ стороны сразу: упоминание имени перестало краснеть, а КАЖДОЕ настоящее
+    обращение к файлу секретов краснеет как прежде."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._td = tempfile.TemporaryDirectory(prefix="guard_envmention_")
+        cls.mention = os.path.join(cls._td.name, "mention_tool.py").replace("\\", "/")
+        with open(cls.mention, "w", encoding="utf-8") as f:
+            f.write("# перечень карточек гарда: имя " + _DOT_ENV + " тут НАЗВАНО, и только\n"
+                    "CARD = {'kind': 'env', 'human': 'обращение к " + _DOT_ENV + "'}\n"
+                    "print(CARD['kind'])\n")
+        cls.reader = os.path.join(cls._td.name, "reader_tool.py").replace("\\", "/")
+        with open(cls.reader, "w", encoding="utf-8") as f:
+            f.write("print(open('" + _DOT_ENV + "', encoding='utf-8').read())\n")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def _green(self, cmd, tool="Bash"):
+        data = {"tool_name": tool, "tool_input": {"command": cmd}, "cwd": PROJ}
+        for headless in (True, False):
+            action, kind, obj = g.decide_for_role(data, headless=headless)
+            self.assertEqual(action, "defer", f"{cmd[:90]} (headless={headless})")
+
+    def _red(self, cmd, tool="Bash", kind="env"):
+        data = {"tool_name": tool, "tool_input": {"command": cmd}, "cwd": PROJ}
+        for headless in (True, False):
+            action, k, obj = g.decide_for_role(data, headless=headless)
+            self.assertEqual((action, k), ("ask", kind), f"{cmd[:90]} (headless={headless})")
+            self.assertIsNotNone(g.card_or_journal(k, obj, cmd), cmd[:90])
+
+    # --- ЖИВОЙ ФОРМАТ: команда, убившая задачу 87 -------------------------------------------
+
+    def test_task87_live_command_is_not_a_card(self):
+        """Дословная форма записи в журнал: печать прозы в ИМЕНОВАННЫЙ скрипт. Оба хвоста —
+        и «сырой», и с `2>&1 | tail -3` (так эта сессия писала журнал в 14:56:10)."""
+        for tail in ("", " 2>&1 | tail -3"):
+            self._green("printf '%s' \"" + (_ASK87 % _DOT_ENV) + "\" | " + _CCLOG + tail)
+
+    def test_rephrased_twin_stays_green(self):
+        """Контроль: строка, которая прошла в 14:57:04. Обе обязаны решаться ОДИНАКОВО —
+        иначе решает проза."""
+        self._green("printf '%s' \"" + (_ASK87 % "файла конфига") + "\" | " + _CCLOG)
+
+    def test_heredoc_into_named_script_is_data(self):
+        """Тот же довод для второй формы того же вызова: телом heredoc в ИМЕНОВАННЫЙ скрипт
+        подают ДАННЫЕ. Граница рядом: телом в ШЕЛЛ подают команды — красное как было."""
+        self._green(_CCLOG + " <<'EOF'\nASK: снято из памяти процесса, не " + _DOT_ENV + "\nEOF")
+        self._red("bash <<'EOF'\ncat " + _DOT_ENV + "\nEOF")
+
+    def test_dashed_caption_is_data_like_the_equals_one(self):
+        """Подпись к выводу через дефисы считалась ФЛАГОМ и оставалась под сканом целиком,
+        через равно — нет. Живой случай 01.08: команда сессии, чинившей этот же класс."""
+        dashed = 'echo "--- ищем ' + _DOT_ENV + ' в телах записей ---"; ls docs/'
+        equals = 'echo "=== ищем ' + _DOT_ENV + ' в телах записей ==="; ls docs/'
+        self._green(dashed)
+        self._green(equals)
+        self.assertTrue(g._is_flag_token("-n"))
+        self.assertTrue(g._is_flag_token("-NoNewline"))
+        self.assertFalse(g._is_flag_token("--- заголовок ---"))
+
+    def test_guard_fixture_in_inline_code_is_not_access(self):
+        """Проба гарда 14:57:48 ДОСЛОВНО по форме: сессия проверяла ЭТОТ ЖЕ класс и получила
+        карточку за фикстуру в собственном `-c`. Строковый литерал файла не открывает."""
+        code = ("import pretool_guard as g\n"
+                "mention = 'printf %s \\\"снято из памяти процесса, не " + _DOT_ENV + "\\\"'\n"
+                "print(g.decide({'tool_name': 'Bash', 'tool_input': {'command': mention}}))\n")
+        self._green('venv/Scripts/python.exe -c "' + code + '"')
+
+    def test_untracked_body_mention_without_sinks_is_green(self):
+        """Тело НЕотслеживаемого .py: перечень красных имён внутри пробника — перечень, а не
+        операция. Граница рядом: тело, которое файл ОТКРЫВАЕТ, красное как было."""
+        self._green("venv/Scripts/python.exe " + self.mention)
+        self._red("venv/Scripts/python.exe " + self.reader)
+
+    # --- КРАСНОЕ НЕ ОСЛАБЛЕНО ----------------------------------------------------------------
+
+    def test_every_real_access_still_red(self):
+        for cmd, tool in (("cat " + _DOT_ENV, "Bash"),
+                          ("Get-Content " + _DOT_ENV, "PowerShell"),
+                          ("grep -n TOKEN " + _DOT_ENV, "Bash"),
+                          ("Select-String -Path " + _DOT_ENV + " -Pattern TOKEN", "PowerShell"),
+                          ('python -c "print(open(\'' + _DOT_ENV + '\').read())"', "Bash"),
+                          ('python -c "import dotenv; dotenv.load_dotenv(\'' + _DOT_ENV
+                           + '\')"', "Bash"),
+                          ("ls > " + _DOT_ENV, "Bash"),
+                          ("echo TOKEN=1 >> " + _DOT_ENV, "Bash"),
+                          ("Get-Item " + _DOT_ENV + " | Get-Content", "PowerShell"),
+                          ("$p = '" + _DOT_ENV + "'; Get-Content $p", "PowerShell"),
+                          ("until grep -q X " + _DOT_ENV + "; do sleep 5; done", "Bash")):
+            with self.subTest(cmd[:50]):
+                self._red(cmd, tool=tool)
+
+    def test_secret_path_as_operand_of_a_script_still_red(self):
+        """ЯМА, которую послабление чуть не открыло: у «только упоминания» доказательство
+        ОТРИЦАТЕЛЬНОЕ («стоков нет»), а на командной строке стоки лежат в теле скрипта,
+        которого не видно. Путь секрета ОПЕРАНДОМ — это его чтение (`_env_outside_py_code`)."""
+        self._red("venv/Scripts/python.exe reader.py " + _DOT_ENV)
+        self._red("venv/Scripts/python.exe " + self.mention + " " + _DOT_ENV)
+        self.assertTrue(g._env_outside_py_code("python x.py " + _DOT_ENV))
+        self.assertFalse(g._env_outside_py_code('python -c "s = \'' + _DOT_ENV + '\'"'))
+
+    def test_pipe_into_something_that_runs_stdin_still_red(self):
+        """Гуард печати снят ТОЛЬКО там, где получатель stdin не исполняет. Интерпретатор без
+        именованной цели исполняет — и текст остаётся под сканом целиком."""
+        self._red('echo "print(open(\'' + _DOT_ENV + '\').read())" | venv/Scripts/python.exe')
+        self._red('echo "import ' + ("gsp" + "read") + "; " + ("gsp" + "read")
+                  + ".open('CRM')\" | venv/Scripts/python.exe", kind="live_sheet")
+        # `xargs` — обёртка для `_cmd_index`, но stdin ест ИМЕННО она и подаёт прочитанное
+        # аргументом читалке: `echo ".env" | xargs cat` секрет ВЫДАЁТ.
+        self._red('echo "' + _DOT_ENV + '" | xargs cat')
+        self._red("printf '%s' \"" + _DOT_ENV + "\" | xargs -I{} cat {}")
+        for seg, runs in ((" venv/Scripts/python.exe", True),
+                          ("python -", True),
+                          ('python -c "x"', True),
+                          ("bash", True),
+                          ("xargs cat", True),
+                          (" " + _CCLOG, False),
+                          ("python -m json.tool", False),
+                          ("tail -3", False),
+                          ("grep -n X", False)):
+            with self.subTest(seg):
+                self.assertEqual(g._seg_runs_stdin_as_code(seg), runs, seg)
+
+    def test_probe_and_mention_are_different_lines_in_the_log(self):
+        """Смягчение не стоит прозрачности: проба наличия и чистое упоминание — РАЗНЫЕ виды,
+        иначе журнал перестаёт отличать «пощупали файл» от «назвали имя»."""
+        self.assertEqual(g.decide({"tool_name": "PowerShell", "cwd": PROJ,
+                                   "tool_input": {"command": "Test-Path " + _DOT_ENV}}),
+                         ("defer", "env_probe", ""))
+        self.assertEqual(g.decide(bash("venv/Scripts/python.exe " + self.mention)),
+                         ("defer", "env_mention", ""))
+
+    def test_read_edit_tools_and_hard_card_untouched(self):
+        """Файл секретов спрашивает ВСЕГДА: инструменты Read/Edit и hard-блок не тронуты."""
+        self.assertEqual(g.decide(read(os.path.join(PROJ, ".env")))[:2], ("ask", "read_secret"))
+        self.assertEqual(g.decide(edit(os.path.join(PROJ, ".env")))[:2], ("ask", "edit_secret"))
+        self.assertIn("env", g._HARD_CARD)
+
+
 class TestOwnerApprovalMarker(unittest.TestCase):
     """ГОЛДЕНЫ 30.07.2026 (дефект «одобрение не доходит»): одобренная задача повторным запуском
     проходит ТОТ ЖЕ красный шаг, и только его класс. Живой факт: 7 «да» из 10 сгорели ✋failed."""
