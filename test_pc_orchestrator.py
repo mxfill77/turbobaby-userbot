@@ -20,9 +20,27 @@ from unittest import mock
 os.environ["LESSON_LLM_ROUTE"] = "0"   # боевой .env-рубильник не течёт в тесты (деплой 334);
                                        # ставим ДО импорта o: load_dotenv(override=False) не перепишет
 
+# ТОТ ЖЕ КЛАСС, ЧТО СТРОКА ВЫШЕ: среда ЖИВОЙ сессии не течёт в тесты (31.07.2026). Маркеры «да»
+# владельца демон ставит в окружение ЗАПУСКА, дочерний процесс тестов их наследует, а демон
+# копирует окружение ребёнку — и `test_plain_new_task_has_no_approval_marker` видит маркер,
+# которого сам не ставил. Замер: гейт в сессии под `PRETOOL_APPROVED_TASK=81` падал двумя тестами
+# на неизменённом дереве. Диагноз «демон протёк» здесь born-false.
+for _marker in ("PRETOOL_APPROVED_KINDS", "PRETOOL_APPROVED_OBJECT", "PRETOOL_APPROVED_TASK"):
+    os.environ.pop(_marker, None)
+
 import pc_orchestrator as o           # noqa: E402
 import pretool_guard                  # noqa: E402  (словарь видов/разбор карточки — смычка с гардом)
 import selfupdate_gate                # noqa: E402  (голден «гейт не спавнит claude»)
+
+
+def env_keys(seen):
+    """ИМЕНА переменных, переданных ребёнку, БЕЗ значений.
+
+    `assertNotIn(x, seen["env"])` при падении печатает контейнер ЦЕЛИКОМ, а в окружении демона
+    лежат боевые токены — Bridge, оба бота, хеш API, телефон. Замер 31.07.2026: красный гейт
+    вывалил их в расшифровку сессии открытым текстом. Проверять надо ключ, значение здесь не
+    нужно ни одной проверке, поэтому и в сообщение об ошибке оно попадать не должно."""
+    return set(seen["env"])
 
 
 def iso_ago(sec):
@@ -555,7 +573,7 @@ class TestApprovalReachesExecutor(Base):
             self.fb.tasks[tid]["result"] = card
             seen = self._spy()
             o.process_approved()
-            self.assertNotIn(o.APPROVED_KINDS_ENV, seen["env"], repr(card))
+            self.assertNotIn(o.APPROVED_KINDS_ENV, env_keys(seen), repr(card))
             self.assertNotIn("ОДОБРЕНИЕ ВЛАДЕЛЬЦА", seen["prompt"], repr(card))
 
     def test_approved_kinds_reader(self):
@@ -600,8 +618,8 @@ class TestApprovalReachesExecutor(Base):
         tid = self._approved_with_card(self.LIVE_SHEET_CARD)
         seen = self._spy()
         o.process_approved()
-        self.assertNotIn(o.APPROVED_KINDS_ENV, seen["env"])
-        self.assertNotIn(o.APPROVED_OBJECT_ENV, seen["env"])
+        self.assertNotIn(o.APPROVED_KINDS_ENV, env_keys(seen))
+        self.assertNotIn(o.APPROVED_OBJECT_ENV, env_keys(seen))
         self.assertNotIn("ОДОБРЕНИЕ ВЛАДЕЛЬЦА", seen["prompt"])
         self.assertEqual(self.fb.tasks[tid]["status"], "done")   # сама задача идёт как шла
 
@@ -627,7 +645,7 @@ class TestApprovalReachesExecutor(Base):
                 self.fb.tasks[tid]["owner_reply"] = reply
                 seen = self._spy()
                 o.process_approved()
-                self.assertNotIn(o.APPROVED_KINDS_ENV, seen["env"], reply)
+                self.assertNotIn(o.APPROVED_KINDS_ENV, env_keys(seen), reply)
 
     def test_card_itself_is_not_taken_for_a_reply(self):
         """Карточка НАЗЫВАЕТ объект — принять её за ответ значило бы подтверждать её ею же."""
@@ -642,7 +660,7 @@ class TestApprovalReachesExecutor(Base):
         seen = self._spy()
         o.process_approved()
         self.assertEqual(seen["env"][o.APPROVED_KINDS_ENV], "env")
-        self.assertNotIn(o.APPROVED_OBJECT_ENV, seen["env"])
+        self.assertNotIn(o.APPROVED_OBJECT_ENV, env_keys(seen))
         self.assertEqual(self.fb.tasks[tid]["status"], "done")
 
     def test_diagnosis_names_the_object_rule_not_a_wrong_class(self):
@@ -697,8 +715,8 @@ class TestApprovalReachesExecutor(Base):
         self.fb.add(status="new")
         seen = self._spy()
         o.process_new()
-        self.assertNotIn(o.APPROVED_KINDS_ENV, seen["env"])
-        self.assertNotIn(o.APPROVED_TASK_ENV, seen["env"])
+        self.assertNotIn(o.APPROVED_KINDS_ENV, env_keys(seen))
+        self.assertNotIn(o.APPROVED_TASK_ENV, env_keys(seen))
         self.assertNotIn("ОДОБРЕНИЕ ВЛАДЕЛЬЦА", seen["prompt"])
 
 

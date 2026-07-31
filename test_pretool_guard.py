@@ -8,6 +8,7 @@ end-to-end через stdin с PRETOOL_NOPUSH=1 (без реального Teleg
 import io
 import os
 import re
+import ast
 import sys
 import json
 import inspect
@@ -20,6 +21,18 @@ import unittest
 # ДЕТИ (гард запускается subprocess'ом) наследуют только окружение — без этой строки фикстуры
 # снова осядут в боевом pretool_guard.log, как 21:39.
 os.environ["TURBOBABY_TEST_LOGS"] = "1"
+
+# ГЕЙТ МЕРИТ КОД, А НЕ СРЕДУ СЕССИИ (31.07.2026). Маркер «да» владельца (`PRETOOL_APPROVED_KINDS`
+# / `PRETOOL_APPROVED_OBJECT`) демон ставит в окружение ЗАПУСКА, и дочерний процесс тестов его
+# наследует. Тогда `decide_for_role` честно отдаёт `approved` вместо `ask` — и гейт краснеет
+# ТОЛЬКО потому, что его запустили внутри одобренной сессии: замер 31.07 в сессии с
+# `PRETOOL_APPROVED_KINDS=env` дал 28 failures + 1 error на неизменённом дереве (первым падал
+# `test_hard_blocks_intact_secrets`: `cat .env` → `approved`). Диагноз «гард сломан» здесь
+# born-false, а цена — сессия на поиск несуществующей регрессии.
+# Снимаем маркеры на весь прогон: тесты одобрения инъектируют env сами (`env={...}`), их это не
+# трогает; дети (гард через subprocess) наследуют уже чистое окружение.
+for _marker in ("PRETOOL_APPROVED_KINDS", "PRETOOL_APPROVED_OBJECT", "PRETOOL_APPROVED_TASK"):
+    os.environ.pop(_marker, None)
 
 import pretool_guard as g  # noqa: E402
 
@@ -2876,10 +2889,43 @@ class TestRedRuleLock(unittest.TestCase):
                         self.assertNotIn(a, ("ask", "deny"),
                                          "имя %s в ТЕКСТЕ дало карточку %s: %s" % (verb, k, cmd))
 
+    # `_decide_bash` вида не назначает (только пост-обработка: `word_*`/`env_probe`/`cfg_read`
+    # для прозрачности лога), но признаки читает — поэтому в поле зрения замка стоит явно.
+    EXTRA_DECIDERS = ("_decide_bash",)
+
+    @staticmethod
+    def _deciders():
+        """Функции, НАЗНАЧАЮЩИЕ ВИД → {имя: исходник}. Признак решающей — возврат кортежа
+        `("ask"|"deny", "<вид>", …)`.
+
+        Список ВЫВОДИТСЯ из исходника, а не зашит: зашитая пара `_decide_bash`/`_decide_bash_body`
+        уже однажды оставила дыру — третья решающая функция `_scan_python` (виды env/sqlite/
+        live_sheet/py_write по тексту тела скрипта) в поле зрения замка не попадала, и текстовый
+        признак можно было завести там СТАРЫМ ОБРАЗЦОМ, не задев ни одного пояса."""
+        src = inspect.getsource(g)
+        out = {}
+        for fn in [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef)]:
+            for ret in [n for n in ast.walk(fn) if isinstance(n, ast.Return)]:
+                v = ret.value
+                if not (isinstance(v, ast.Tuple) and len(v.elts) >= 2):
+                    continue
+                act, kind = v.elts[0], v.elts[1]
+                if (isinstance(act, ast.Constant) and act.value in ("ask", "deny")
+                        and isinstance(kind, ast.Constant) and isinstance(kind.value, str)
+                        and kind.value):
+                    out[fn.name] = ast.get_source_segment(src, fn) or ""
+                    break
+        return out
+
     def test_free_signs_declare_action_check(self):
-        """Реестр `_ACTION_CHECK` обязан покрывать ВСЕ одиночные `_RE_*`, которые читают
-        `_decide_bash`/`_decide_bash_body`, — и не содержать лишних (иначе реестр протухает)."""
-        src = inspect.getsource(g._decide_bash) + inspect.getsource(g._decide_bash_body)
+        """Реестр `_ACTION_CHECK` обязан покрывать ВСЕ одиночные `_RE_*`, которые читает ЛЮБАЯ
+        решающая функция, — и не содержать лишних (иначе реестр протухает)."""
+        deciders = self._deciders()
+        # решающие функции, известные на момент правки: пропасть они не имеют права
+        for must in ("_decide_bash_body", "_scan_python", "_decide_write", "_decide_read"):
+            self.assertIn(must, deciders, "решающая функция %s перестала опознаваться" % must)
+        src = "\n".join(list(deciders.values())
+                        + [inspect.getsource(getattr(g, n)) for n in self.EXTRA_DECIDERS])
         used = set(re.findall(r"\b(_RE_[A-Z0-9_]+)\b", src))
         self.assertTrue(used)
         missing = sorted(used - set(g._ACTION_CHECK))
