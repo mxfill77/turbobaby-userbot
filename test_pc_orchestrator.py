@@ -3822,6 +3822,77 @@ class TestLocalDecChain(Base):
         with mock.patch.object(o, "_maybe_task_selfheal", lambda *a, **k: True) as _:
             self.assertTrue(o._maybe_selfheal(9, "обычная задача", "err", frm="Filipp-pc-dev"))
 
+    # --- РИСК Р1 (разбор 31.07): гейт закрывает ВСЕ метки, а не одну ---
+
+    def test_selfheal_gate_covers_all_chain_labels_and_shapes(self):
+        # До правки гейт знал ОДНУ метку (Filipp-pcloc-dec), и шаг ПК-ТЕАТРА (from=Filipp-pc-dec,
+        # дирижёр на VPS, исполнитель — ЭТОТ демон) уходил в ОДИНОЧНУЮ самопочинку: маркер
+        # [шаг i/N родитель pid] терялся, исходный шаг закрывался done → VPS-надзор читал провал
+        # как успех и релизил СЛЕДУЮЩИЙ шаг поверх дыры.
+        # Замок 1 — перечень ВСЕХ дирижёрских меток; замок 2 — ФОРМА маркера при ЛЮБОЙ метке
+        # (перечень стухает с появлением нового дирижёра, форма — часть контракта цепи).
+        o._selfheal_on = lambda: True
+        step = "[шаг 1/2 родитель 5] сделай на ПК"
+        cases = [(frm, step) for frm in o.CHAIN_FROMS]                        # замок 1: метка
+        cases += [(frm, txt)                                                  # замок 2: форма
+                  for frm in ("", "Filipp", "Filipp-дирижёр-которого-ещё-нет")
+                  for txt in (step, "[сводка родитель 5] итог",
+                              "[карточка родитель 5] событие цепи",
+                              "[коррекция плана родитель 5] после шага 1 (K=1)")]
+        boom = mock.Mock(side_effect=AssertionError("одиночная самопочинка не должна зваться"))
+        with mock.patch.object(o, "_maybe_task_selfheal", boom):
+            for frm, txt in cases:
+                with self.subTest(frm=frm, txt=txt[:28]):
+                    self.assertFalse(o._maybe_selfheal(9, txt, "err", frm=frm))
+        boom.assert_not_called()
+
+    def test_selfheal_gate_lets_true_singles_through(self):
+        # обратная сторона: гейт не переусердствовал — настоящая одиночка чинится по-прежнему.
+        # Метка сверяется ТОЧНО (Filipp-pc-decor ≠ Filipp-pc-dec), форма — ЯКОРЕМ (упоминание
+        # «шаг 1/2» в теле ТЗ маркером цепи не является).
+        o._selfheal_on = lambda: True
+        with mock.patch.object(o, "_maybe_task_selfheal", lambda *a, **k: True):
+            for frm in ("", "Filipp", "Filipp-pc-dev", "Filipp-pcloc", "Filipp-pc-decor"):
+                with self.subTest(frm=frm):
+                    self.assertTrue(o._maybe_selfheal(
+                        9, "тз: почини шаг 1/2 разбора", "err", frm=frm))
+
+    def test_pc_theatre_step_failure_stays_plain_failed(self):
+        # СКВОЗНЯК того же риска: провал шага ПК-театра при ВКЛЮЧЁННОЙ самопочинке обязан
+        # остаться голым failed — ни перерождения в очереди, ни done вместо провала.
+        o._selfheal_on = lambda: True
+        tid = self.fb.add(task_text="[шаг 1/2 родитель 55] сделай на ПК")
+        self.fb.tasks[tid]["from"] = o.PC_DEC_FROM
+        self._claude(1, "", "claude exit=1")
+        with mock.patch.object(o, "_thinker_exec",
+                               mock.Mock(side_effect=AssertionError("думатель не должен зваться"))):
+            o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertEqual(self._news(), [])          # перерождения НЕТ
+        self.assertNotIn("самопочинка", str(self.fb.tasks[tid]["result"] or ""))
+
+    # --- ГРАНИЦА: самопочинка не переформулирует решение человека и красное ---
+
+    def test_selfheal_gate_mirrors_chain_halt_prefixes(self):
+        # Гейт шага цепи знал ТРИ префикса, гейт одиночки — только ⏱ (зеркальная дыра, класс №9
+        # свода). Теперь набор один на оба: «нет» человека / ⏱-таймаут / ✋-снова-красное.
+        o._selfheal_on = lambda: True
+        self.assertEqual(o.NO_HEAL_PREFIXES, (o._REJECT_PREFIX, o.TIMEOUT_MARK, o.MANUAL_MARK))
+        boom = mock.Mock(side_effect=AssertionError("одиночная самопочинка не должна зваться"))
+        with mock.patch.object(o, "_maybe_task_selfheal", boom):
+            for pref in o.NO_HEAL_PREFIXES:
+                with self.subTest(pref=pref):
+                    self.assertFalse(o._maybe_selfheal(
+                        9, "обычная задача", f"{pref} — дальше текст", frm="Filipp"))
+        boom.assert_not_called()
+
+    def test_both_selfheal_gates_share_one_prefix_set(self):
+        # один источник правды: правка набора в ОДНОМ месте достаёт ОБА гейта (иначе класс
+        # повторится — «закрыли на одной полосе, забыли на второй»)
+        import inspect
+        for fn in (o._maybe_selfheal, o._loc_after_fail):
+            self.assertIn("NO_HEAL_PREFIXES", inspect.getsource(fn))
+
     # --- осиротевшие synthetic не исполняются headless'ом ---
 
     def test_orphan_synthetic_finalized_not_executed(self):
@@ -6439,6 +6510,19 @@ class TestLessonCommitRetry(Base):
         body = src.split("def _main_loop", 1)[1]
         self.assertIn("maybe_lesson_commit_retry()", body)
         self.assertLess(body.index("maybe_lesson_commit_retry()"), body.index("maybe_git_ff_pull()"))
+
+    def test_banner_names_thinker_flags_from_live_env(self):
+        """Баннер старта называет рубильники думателя — и берёт их из os.environ ЖИВОГО процесса,
+        а не пересказывает .env. До 31.07 факт подхвата флага не читался ниоткуда: доказательства
+        не было вовсе до первого срабатывания (ловушка №2 разбора)."""
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "pc_orchestrator.py"), encoding="utf-8") as f:
+            body = f.read().split("def _main_loop", 1)[1]
+        head = body[:body.index("while not _stopped()")]
+        self.assertIn("ФЛАГИ ДУМАТЕЛЯ", head)
+        for probe in ("int(_selfheal_on())", "int(_plan_adapt_on())", "int(_local_dec_on())",
+                      'os.environ.get("STEP_SELFHEAL")', 'os.environ.get("PLAN_ADAPT")'):
+            self.assertIn(probe, head)
 
 
 class TestMetricsLine(unittest.TestCase):
