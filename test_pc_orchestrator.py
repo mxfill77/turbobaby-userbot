@@ -6525,6 +6525,60 @@ class TestLessonCommitRetry(Base):
             self.assertIn(probe, head)
 
 
+class TestThinkerKillSwitch(unittest.TestCase):
+    """Аварийный стоп-файл рубильников думателя. Зачем он есть: выключение правкой .env имеет
+    ТИХИЙ ОТКАЗ — новый процесс демона рождается из _spawn_daemon с env родителя, а load_dotenv
+    идёт override=False, поэтому унаследованная «1» переживает правку файла на 0. Стоп-файл
+    проверяется на КАЖДОМ вызове, живёт на диске и рестарта не требует."""
+
+    def setUp(self):
+        self._save_repo = o.REPO
+        o.REPO = tempfile.mkdtemp()                       # стоп-файлы кладём в temp, не в рабочее дерево
+        self.addCleanup(lambda: setattr(o, "REPO", self._save_repo))
+
+    def _arm(self, name):
+        p = o._flag_off_file(name)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("off")
+        return p
+
+    def test_env_one_turns_on(self):
+        with mock.patch.dict(os.environ, {"STEP_SELFHEAL": "1"}, clear=False):
+            self.assertTrue(o._flag_on("STEP_SELFHEAL"))
+
+    def test_stop_file_beats_env(self):
+        self.assertEqual(os.path.basename(self._arm("STEP_SELFHEAL")),
+                         "pc_orchestrator.step_selfheal.off")
+        with mock.patch.dict(os.environ, {"STEP_SELFHEAL": "1"}, clear=False):
+            self.assertTrue(o._flag_forced_off("STEP_SELFHEAL"))
+            self.assertFalse(o._flag_on("STEP_SELFHEAL"))
+
+    def test_stop_files_are_per_flag(self):
+        # гасить адаптацию плана, выключая самопочинку, нельзя — у каждого рубильника СВОЙ файл
+        self._arm("STEP_SELFHEAL")
+        with mock.patch.dict(os.environ, {"STEP_SELFHEAL": "1", "PLAN_ADAPT": "1"}, clear=False):
+            self.assertFalse(o._flag_on("STEP_SELFHEAL"))
+            self.assertTrue(o._flag_on("PLAN_ADAPT"))
+
+    def test_unknown_means_off(self):
+        # у аварийного рубильника «не знаю» обязано значить СТОП, а не «работай»
+        with mock.patch.object(os.path, "exists", side_effect=OSError("диск не ответил")):
+            self.assertTrue(o._flag_forced_off("STEP_SELFHEAL"))
+
+    def test_suppression_is_loud(self):
+        # расхождение «в .env единица, а веток нет» обязано читаться из лога, а не искаться вслепую
+        self._arm("STEP_SELFHEAL")
+        with mock.patch.dict(os.environ, {"STEP_SELFHEAL": "1"}, clear=False):
+            with self.assertLogs(o.log, level="WARNING") as cm:
+                o._flag_on("STEP_SELFHEAL")
+        self.assertIn("стоп-файл", "\n".join(cm.output))
+
+    def test_both_readers_go_through_one_gate(self):
+        import inspect
+        for fn in (o._selfheal_on, o._plan_adapt_on):
+            self.assertIn("_flag_on(", inspect.getsource(fn))
+
+
 class TestMetricsLine(unittest.TestCase):
     """Строка METRICS: дословный формат (голден), norm_effort, extract_tokens, selfheal_count,
     и что обёртка run_task РЕАЛЬНО пишет строку METRICS в лог на завершении задачи."""

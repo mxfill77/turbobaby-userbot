@@ -2372,9 +2372,42 @@ TASK_THINKER_PREAMBLE = (
 )
 
 
+def _flag_off_file(name):
+    """Путь аварийного стоп-файла рубильника: pc_orchestrator.step_selfheal.off и т.п."""
+    return os.path.join(REPO, f"pc_orchestrator.{name.lower()}.off")
+
+
+def _flag_forced_off(name):
+    """Стоп-файл рубильника взведён? Он БЬЁТ значение окружения и нужен потому, что выключение
+    правкой .env имеет ТИХИЙ ОТКАЗ: новый процесс демона рождается из _spawn_daemon с env=dict(
+    os.environ) РОДИТЕЛЯ, а load_dotenv по умолчанию override=False — унаследованная «1» НЕ
+    перезаписывается нулём из файла. Тот же класс, ради которого живёт _norm_model_id (#194):
+    включение так проходит (ключа в env не было), а ВЫКЛЮЧЕНИЕ по эстафете self-update — нет.
+    Стоп-файл этим не болеет: проверяется НА КАЖДОМ вызове (действует со следующего тика, без
+    рестарта демона) и живёт на диске, а не в наследуемом окружении.
+    Направление отказа — КОНСЕРВАТИВНОЕ: не смогли ответить → считаем ВЫКЛЮЧЕНО. У аварийного
+    рубильника «не знаю» обязано значить «стоп», а не «работай»; факт видно в баннере старта."""
+    try:
+        return os.path.exists(_flag_off_file(name))
+    except Exception:
+        return True
+
+
+def _flag_on(name):
+    """Рубильник думателя: env == "1" И не взведён стоп-файл. Подавление — строкой в лог, иначе
+    расхождение «в .env единица, а веток нет» пришлось бы искать вслепую."""
+    on = (os.environ.get(name) or "").strip() == "1"
+    if on and _flag_forced_off(name):
+        log.warning("%s=1, но взведён стоп-файл %s — рубильник ВЫКЛЮЧЕН (снять: удалить файл)",
+                    name, os.path.basename(_flag_off_file(name)))
+        return False
+    return on
+
+
 def _selfheal_on():
-    """Флаг STEP_SELFHEAL=1 в .env (демон load_dotenv'ит на старте). 0/нет → прежнее поведение."""
-    return (os.environ.get("STEP_SELFHEAL") or "").strip() == "1"
+    """Флаг STEP_SELFHEAL=1 в .env (демон load_dotenv'ит на старте) + аварийный стоп-файл поверх.
+    0/нет/стоп-файл → прежнее поведение (ветка не зовётся вовсе)."""
+    return _flag_on("STEP_SELFHEAL")
 
 
 def _killed_by_planned_restart(rc, task_text, blob_fn=None):
@@ -2683,9 +2716,11 @@ ADAPT_PREAMBLE = (
 
 
 def _plan_adapt_on():
-    """Флаг PLAN_ADAPT=1 в .env (отдельно от STEP_SELFHEAL, независимый откат). 0/нет → прежнее
-    поведение (после done-шага всегда keep: релиз следующего шага прежнего плана)."""
-    return (os.environ.get("PLAN_ADAPT") or "").strip() == "1"
+    """Флаг PLAN_ADAPT=1 в .env (отдельно от STEP_SELFHEAL, независимый откат) + свой аварийный
+    стоп-файл. 0/нет/стоп-файл → прежнее поведение (после done-шага всегда keep: релиз следующего
+    шага прежнего плана). Стоп-файл СВОЙ у каждого рубильника: гасить адаптацию, выключая
+    самопочинку, — это тот самый «одобренный env не открывает Read секретов» наоборот."""
+    return _flag_on("PLAN_ADAPT")
 
 
 def _parse_adapt_json(text):
@@ -5833,10 +5868,12 @@ def _main_loop():
     # предка значение load_dotenv НЕ перезаписывает (override=False), и файл может врать. Рядом
     # СЫРОЕ значение: «1» с пробелом/«true»/«yes» дают флаг=0 при бодро выглядящем .env.
     log.info("=== ФЛАГИ ДУМАТЕЛЯ: STEP_SELFHEAL=%s PLAN_ADAPT=%s PC_LOCAL_DEC=%s "
-             "(сырое os.environ ЖИВОГО процесса: %r / %r / %r; сравнение строгое == \"1\") ===",
+             "(сырое os.environ ЖИВОГО процесса: %r / %r / %r; сравнение строгое == \"1\"; "
+             "аварийные стоп-файлы взведены: step_selfheal=%s plan_adapt=%s) ===",
              int(_selfheal_on()), int(_plan_adapt_on()), int(_local_dec_on()),
              os.environ.get("STEP_SELFHEAL"), os.environ.get("PLAN_ADAPT"),
-             os.environ.get("PC_LOCAL_DEC"))
+             os.environ.get("PC_LOCAL_DEC"),
+             int(_flag_forced_off("STEP_SELFHEAL")), int(_flag_forced_off("PLAN_ADAPT")))
     # Бюджет headless-claude (зеркало VPS oom2 1520c68, инцидент-каскад 22.07) — в баннер,
     # чтобы действующий лимит читался прямо из лога старта.
     log.info("=== БЮДЖЕТ CLAUDE: MAX_CLAUDE_PROCS=%s (wait=%ss; счёт ПО РОДИТЕЛЮ — только НАШИ headless-потомки, интерактивные RC-сессии не в счёт; 3 отказа подряд → карточка) ===",
