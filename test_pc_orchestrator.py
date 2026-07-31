@@ -5,6 +5,7 @@ test_pc_orchestrator.py — мок-тесты ПК-оркестратора. Б�
 Запуск: D:\\turbobaby-bot\\venv\\Scripts\\python.exe -m unittest test_pc_orchestrator -v
 """
 
+import io
 import os
 import re
 import sys
@@ -57,6 +58,7 @@ class FakeBridge:
         self.tasks = {}
         self._id = 0
         self.hb = {}
+        self.approvals = []      # все вызовы approve_task целиком (проверка контракта полей)
 
     def add(self, status="new", lane="pc", task_text="сделай X", updated=None):
         self._id += 1
@@ -88,6 +90,21 @@ class FakeBridge:
             t["result"] = what
             t["what"] = what
             t["topic"] = topic
+        return {"ok": True}
+
+    def approve_task(self, tid, approved_by, origin="human", ticket=None):
+        """Мок стороны моста: тот же контракт, что у VPS (needs_approval→approved + approved_by),
+        включая коды отказа not_awaiting/not_found, на которые опирается devbot."""
+        self.approvals.append({"id": tid, "approved_by": approved_by, "origin": origin,
+                               "ticket": ticket})
+        t = self.tasks.get(tid)
+        if not t:
+            return {"ok": False, "error": "not_found"}
+        if t["status"] != "needs_approval":
+            return {"ok": False, "error": "not_awaiting", "status": t["status"]}
+        t["status"] = "approved"
+        t["approved_by"] = approved_by
+        t["origin"] = origin
         return {"ok": True}
 
     def task_heartbeat(self, tid):
@@ -3021,6 +3038,241 @@ class TestDirectChannel(Base):
         self._claude(0, "готово\nRESULT: готово")
         o.process_new()
         self.assertEqual(self.fb.tasks[tid]["status"], "done")
+
+
+class TestAnswerCardFromPC(Base):
+    """ОТВЕТ НА КРАСНУЮ КАРТОЧКУ С ПК (31.07.2026). До правки `approve_task` умел только devbot,
+    и полоса ПК видела карточку, но ответить на неё не могла ничем."""
+
+    def setUp(self):
+        super().setUp()
+        self._led = os.path.join(tempfile.mkdtemp(), "approvals.jsonl")   # боевой реестр не трогаем
+        self._save_led = o.APPROVAL_LEDGER
+        o.APPROVAL_LEDGER = self._led
+        self.addCleanup(lambda: setattr(o, "APPROVAL_LEDGER", self._save_led))
+        # ЧЕЛОВЕК ЗА ПУЛЬТОМ: чистое окружение (ни меток демона, ни рубильника) ПЛЮС живая консоль.
+        # Консоль инъектируем: сам гейт гоняется пайпом, и без инъекции эти тесты мерили бы не
+        # право отвечать, а наличие терминала у прогона тестов.
+        self.env = {}
+        self.human = {"env": self.env, "console": (lambda: True)}
+
+    def _card(self, kind="env", obj="D:/turbobaby-bot/.env"):
+        return (f"🔴 Хочу прочитать секрет — разрешить?\nОбъект: {obj}\n"
+                f"{pretool_guard.KIND_LINE_PREFIX}{kind}\n")
+
+    def _waiting(self, kind="env", obj="D:/turbobaby-bot/.env", text="сделай X"):
+        tid = self.fb.add(status="new", task_text=text)
+        self.fb.set_needs_approval(tid, self._card(kind, obj))
+        return tid
+
+    def _trace(self):
+        with open(self._led, encoding="utf-8") as f:
+            return [json.loads(x) for x in f.read().splitlines() if x.strip()]
+
+    # ── 1. контракт поля-в-поле с devbot ──────────────────────────────────────────────────
+    def test_bridge_approve_task_matches_devbot_contract(self):
+        b = o.Bridge(url="https://x", token="t")
+        captured = {}
+
+        def fake_post(action, **fields):
+            captured["action"] = action
+            captured.update(fields)
+            return {"ok": True}
+
+        b._post = fake_post
+        b.approve_task(7, "Filipp")
+        self.assertEqual(captured["action"], "approve_task")   # имя действия — как у bridge_client
+        self.assertEqual(captured["id"], 7)                    # id, а не qid (порядок полей devbot)
+        self.assertEqual(captured["approved_by"], "Filipp")
+        self.assertEqual(captured["origin"], o.ORIGIN_HUMAN)   # дефолт человека — как WRITE_ORIGIN
+        self.assertNotIn("ticket", captured)                   # человеку билет не нужен (замок спит)
+
+    def test_bridge_approve_task_agent_carries_ticket(self):
+        b = o.Bridge(url="https://x", token="t")
+        captured = {}
+        b._post = lambda action, **f: (captured.update(f), {"ok": True})[1]
+        b.approve_task(7, "duty-bot", origin=o.ORIGIN_AGENT, ticket="TK")
+        self.assertEqual(captured["origin"], o.ORIGIN_AGENT)
+        self.assertEqual(captured["ticket"], "TK")             # токен-замок 4.2: машина — с билетом
+
+    def test_other_bridge_actions_unchanged(self):
+        # регресс: origin приклеен ТОЛЬКО к новому действию — формат живых вызовов демона прежний
+        b = o.Bridge(url="https://x", token="t")
+        seen = []
+        b._post = lambda action, **f: (seen.append((action, f)), {"ok": True})[1]
+        b.claim_task(3)
+        b.complete_task(3, "done", "ok")
+        b.task_heartbeat(3)
+        for _, fields in seen:
+            self.assertNotIn("origin", fields)
+
+    # ── 2. ответ доезжает до исполнителя ──────────────────────────────────────────────────
+    def test_approve_from_pc_moves_card_to_approved(self):
+        tid = self._waiting()
+        ok, msg = o.answer_card(tid, True, **self.human)
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.fb.tasks[tid]["status"], "approved")
+        self.assertEqual(self.fb.tasks[tid]["approved_by"], "Filipp")
+        self.assertEqual(self.fb.approvals[-1]["origin"], o.ORIGIN_HUMAN)
+
+    def test_approved_from_pc_reaches_executor(self):
+        # ГЛАВНАЯ проверка: «да» с ПК доезжает до того же обработчика, что и «да» девбота
+        tid = self._waiting()
+        ok, _ = o.answer_card(tid, True, **self.human)
+        self.assertTrue(ok)
+        self._claude(0, "повторил шаг\nRESULT: готово")
+        o.process_approved()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+
+    def test_reject_from_pc_uses_devbot_prefix(self):
+        tid = self._waiting()
+        ok, _ = o.answer_card(tid, False, reply="не сейчас", **self.human)
+        self.assertTrue(ok)
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        res = self.fb.tasks[tid]["result"]
+        self.assertTrue(res.startswith(o._REJECT_PREFIX))          # контракт devbot дословно
+        self.assertTrue(res.lstrip().startswith(o.NO_HEAL_PREFIXES))  # отказ не отдаётся самопочинке
+        self.assertIn("не сейчас", res)
+
+    # ── 3. КАЖДЫЙ ответ оставляет след ────────────────────────────────────────────────────
+    def test_answer_leaves_trace_with_who_when_what(self):
+        tid = self._waiting(kind="env", obj="D:/turbobaby-bot/.env")
+        o.answer_card(tid, True, reply="да, читай", **self.human)
+        rec = self._trace()[-1]
+        self.assertEqual(rec["task"], tid)                 # НА КАКУЮ задачу
+        self.assertEqual(rec["decision"], "approve")
+        self.assertEqual(rec["by"], "Filipp")              # КТО ответил
+        self.assertEqual(rec["origin"], o.ORIGIN_HUMAN)    # человек или машина
+        self.assertTrue(rec["ts"])                         # КОГДА
+        self.assertEqual(rec["kinds"], ["env"])            # ЧТО именно одобрено — класс
+        self.assertIn(".env", rec["object"])               # …и объект
+        self.assertEqual(rec["result"], "ok")
+
+    def test_rejected_answer_also_leaves_trace(self):
+        tid = self._waiting()
+        o.answer_card(tid, False, **self.human)
+        rec = self._trace()[-1]
+        self.assertEqual(rec["decision"], "reject")
+        self.assertTrue(rec["ok"])
+
+    def test_stale_card_not_answered_but_traced(self):
+        tid = self._waiting()
+        self.fb.tasks[tid]["status"] = "done"              # владелец опоздал: карточка отработана
+        ok, msg = o.answer_card(tid, True, **self.human)
+        self.assertFalse(ok)
+        self.assertIn("устарела", msg)
+        self.assertEqual(self.fb.approvals, [])            # мост НЕ дёрнут (стейл-гейт devbot)
+        self.assertEqual(self._trace()[-1]["result"], "stale")
+
+    def test_unknown_task_traced_as_not_found(self):
+        ok, msg = o.answer_card(999, True, **self.human)
+        self.assertFalse(ok)
+        self.assertEqual(self._trace()[-1]["result"], "not_found")
+        self.assertEqual(self.fb.approvals, [])
+
+    def test_foreign_lane_card_not_answerable(self):
+        # изоляция полос: карточку vps с ПК не подтвердить (devbot ищет lane='all', мы — свою)
+        tid = self.fb.add(status="new", lane="vps", task_text="чужое")
+        self.fb.set_needs_approval(tid, self._card())
+        self.fb.tasks[tid]["lane"] = "vps"
+        ok, _ = o.answer_card(tid, True, **self.human)
+        self.assertFalse(ok)
+        self.assertEqual(self.fb.approvals, [])
+
+    def test_trace_survives_broken_ledger(self):
+        o.APPROVAL_LEDGER = os.path.join(self._led, "нет", "такого", "каталога.jsonl")
+        tid = self._waiting()
+        ok, _ = o.answer_card(tid, True, **self.human)
+        self.assertTrue(ok)                                # сорванный след не отменяет ответ
+        self.assertEqual(self.fb.tasks[tid]["status"], "approved")
+
+    # ── 4. право отвечать — не безусловное ────────────────────────────────────────────────
+    def test_headless_child_is_agent_and_cannot_claim_human(self):
+        env = {o.ASK_MARKER_ENV: "pc_ask_9.marker", o.ANSWER_ORIGIN_ENV: "human"}
+        live = (lambda: True)
+        self.assertEqual(o.answer_origin(env, live), o.ORIGIN_AGENT)  # метка снаружи бьёт самообъявление
+        self.assertEqual(o.answer_origin({}, live), o.ORIGIN_HUMAN)
+        # вычистить себе окружение машина умеет, а консоль подделать — нет: без терминала это
+        # всё равно машина (ровно эта дыра и делала признак «только по env» бессмысленным)
+        self.assertEqual(o.answer_origin({}, (lambda: False)), o.ORIGIN_AGENT)
+
+    def test_agent_denied_without_switch(self):
+        tid = self._waiting()
+        env = {o.MARKER_TOKEN_ENV: "tok-1"}                      # ребёнок headless-прогона
+        ok, msg = o.answer_card(tid, True, env=env)
+        self.assertFalse(ok)
+        self.assertIn(o.ANSWER_AGENT_FLAG, msg)
+        self.assertEqual(self.fb.tasks[tid]["status"], "needs_approval")   # ничего не мутировало
+        rec = self._trace()[-1]
+        self.assertEqual((rec["origin"], rec["result"]), (o.ORIGIN_AGENT, "denied"))
+        # дежурному важно ЧТО пыталась подтвердить машина, а не только что попытка была
+        self.assertEqual(rec["kinds"], ["env"])
+        self.assertIn(".env", rec["object"])
+
+    def test_cleared_env_without_console_is_still_agent(self):
+        # дыра, ради которой заведён второй признак: ребёнок с ВЫЧИЩЕННЫМ окружением всё равно
+        # не человек — консоли за ним нет, значит подтвердить красное сам себе он не может
+        tid = self._waiting()
+        ok, _ = o.answer_card(tid, True, env={}, console=(lambda: False))
+        self.assertFalse(ok)
+        self.assertEqual(self.fb.approvals, [])
+        self.assertEqual(self.fb.tasks[tid]["status"], "needs_approval")
+        self.assertEqual(self._trace()[-1]["origin"], o.ORIGIN_AGENT)
+
+    def test_console_probe_fail_closed(self):
+        class _Broken:
+            def isatty(self):
+                raise OSError("нет консоли")
+        self.assertFalse(o._console_attached(_Broken()))     # сбой пробы = «машина», не «человек»
+        self.assertFalse(o._console_attached(io.StringIO()))  # пайп/DEVNULL ребёнка — не консоль
+
+    def test_agent_denied_without_ticket(self):
+        tid = self._waiting()
+        ok, msg = o.answer_card(tid, True, env={o.MARKER_TOKEN_ENV: "t", o.ANSWER_AGENT_FLAG: "1"})
+        self.assertFalse(ok)
+        self.assertIn(o.ANSWER_TICKET_ENV, msg)
+        self.assertEqual(self.fb.approvals, [])
+
+    def test_agent_allowed_with_switch_and_ticket(self):
+        tid = self._waiting()
+        env = {o.MARKER_TOKEN_ENV: "t", o.ANSWER_AGENT_FLAG: "1", o.ANSWER_TICKET_ENV: "TK",
+               o.ANSWER_WHO_ENV: "duty-bot"}
+        ok, _ = o.answer_card(tid, True, env=env)
+        self.assertTrue(ok)
+        call = self.fb.approvals[-1]
+        self.assertEqual((call["origin"], call["ticket"], call["approved_by"]),
+                         (o.ORIGIN_AGENT, "TK", "duty-bot"))
+        self.assertEqual(self._trace()[-1]["by"], "duty-bot")
+
+    def test_ticket_value_never_lands_in_trace(self):
+        # правило свода §6: боевые токены в следах не цитируем
+        tid = self._waiting()
+        o.answer_card(tid, True, env={o.MARKER_TOKEN_ENV: "t", o.ANSWER_AGENT_FLAG: "1",
+                                      o.ANSWER_TICKET_ENV: "SECRET-TICKET"})
+        self.assertNotIn("SECRET-TICKET", json.dumps(self._trace()[-1], ensure_ascii=False))
+
+    # ── 5. высший вид карточки НЕ ослаблен ────────────────────────────────────────────────
+    def test_reply_text_never_reaches_bridge(self):
+        tid = self._waiting(kind="delete", obj="pc_orchestrator.log")
+        o.answer_card(tid, True, reply="да pc_orchestrator.log", **self.human)
+        self.assertNotIn("reply", self.fb.approvals[-1])
+        self.assertNotIn("да pc_orchestrator.log", json.dumps(self.fb.approvals, ensure_ascii=False))
+
+    def test_top_tier_stays_fail_closed_after_pc_approve(self):
+        tid = self._waiting(kind="delete", obj="pc_orchestrator.log")
+        ok, msg = o.answer_card(tid, True, reply="да pc_orchestrator.log", **self.human)
+        self.assertTrue(ok)
+        self.assertIn("высший вид", msg)                   # оператору сказано, что «да» не открыло
+        kinds, _obj = o._approved_scope(self.fb.tasks[tid])
+        self.assertNotIn("delete", kinds)                  # необратимое ребёнку НЕ поехало
+        self.assertEqual(self._trace()[-1]["top"], ["delete"])
+
+    def test_ordinary_kind_still_reaches_child(self):
+        # регресс обратной стороны: обычный вид как работал, так и работает
+        tid = self._waiting(kind="env")
+        o.answer_card(tid, True, **self.human)
+        kinds, _ = o._approved_scope(self.fb.tasks[tid])
+        self.assertIn("env", kinds)
 
 
 class TestStuckSingles(Base):

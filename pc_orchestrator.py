@@ -278,6 +278,19 @@ def _clip(s, n=COWORK_RESULT_MAX):
     return s if len(s) <= n else (s[:n] + " …обрезано")
 
 
+# ── КТО ОТВЕТИЛ НА КАРТОЧКУ: ЧЕЛОВЕК ИЛИ МАШИНА (31.07.2026) ─────────────────────────────────
+# Поле `origin` — НЕ выдумка этой правки, а поле того же контракта, которым отвечает devbot:
+# его клиент ставит его КАЖДОМУ POST (`bridge_client._post` → `body["origin"] = WRITE_ORIGIN.get()`,
+# дефолт 'human'; для 'agent' прикладывается одноразовый билет — токен-замок 4.2). ПК-клиент этого
+# поля не слал ВОВСЕ, поэтому на мосту «ответил Филипп» и «ответила машина» были НЕОТЛИЧИМЫ.
+# Здесь поле едет ТОЛЬКО с новым действием approve_task. Подмешивать origin в уже работающие
+# claim/complete/heartbeat/enqueue демона мы НЕ стали сознательно: их формат сегодня без origin
+# рабочий, а демон по природе 'agent' — молча пометить его вызовы машинными значит подставить их
+# под серверный замок, которого они сегодня не видят. Цена такой ошибки выше пользы поля.
+ORIGIN_HUMAN = "human"      # за пультом человек: замок спит (как у devbot по умолчанию)
+ORIGIN_AGENT = "agent"      # отвечает автономный процесс: нужен билет + рубильник владельца
+
+
 # ------------------------------- Bridge (очередь) ----------------------------
 
 class Bridge:
@@ -317,6 +330,22 @@ class Bridge:
     def set_needs_approval(self, tid, what, topic=NEEDS_APPROVAL_TOPIC):
         # topic → Splinter постит красную карточку в эту тему (по уточнению Филиппа — 829).
         return self._post("set_needs_approval", id=tid, what=(what or "")[:RESULT_MAX], topic=topic)
+
+    def approve_task(self, tid, approved_by, origin=ORIGIN_HUMAN, ticket=None):
+        """Владелец сказал «да N»: needs_approval→approved + approved_by → {ok}.
+
+        КОНТРАКТ ОДИН В ОДИН С VPS и ничего сверх него: `bridge_client.approve_task` шлёт
+        POST `approve_task` с полями `id` и `approved_by` (`devbot._cb_approve` / «да N» зовут
+        его как `approve_task(qid, "Filipp")`). Имена полей не выведены по догадке — списаны
+        с полосы, которая этим действием живёт каждый день.
+
+        Единственная добавка — `origin` (блок выше): у VPS-клиента он едет автоматически с
+        КАЖДЫМ POST, здесь его надо поставить явно, потому что ПК-клиент такого слоя не имеет.
+        Билет прикладывается ТОЛЬКО к машинному ответу — ровно как в токен-замке 4.2."""
+        f = {"id": tid, "approved_by": approved_by, "origin": (origin or ORIGIN_HUMAN)}
+        if f["origin"] == ORIGIN_AGENT and ticket:
+            f["ticket"] = ticket
+        return self._post("approve_task", **f)
 
     def task_heartbeat(self, tid):
         return self._post("task_heartbeat", id=tid)
@@ -2102,6 +2131,244 @@ def enqueue_pc_task(text, frm="Filipp", bridge=None):
     nid = r.get("id")
     log.info("direct-enqueue: одиночка lane=%s поставлена в очередь id=%s (минуя splinter)", LANE, nid)
     return True, nid, None
+
+
+# ═══ ОТВЕТ НА КРАСНУЮ КАРТОЧКУ С ПК (31.07.2026) ═════════════════════════════════════════════
+# ПОВОД (разведка `docs/artifacts/2026-07-31-duty-officer-recon.md`): очередь ПК читает, карточку
+# видит, а ОТВЕТИТЬ на неё не может — `approve_task` умел только devbot на сервере. За двое суток
+# четыре задачи демона умерли не от плохой работы, а от того, что «да» некому было поставить
+# (три сгорания из четырёх — ночью, и по трём демон сам записал, что работа БЫЛА: коммиты и
+# записи журнала). Это и есть главный упор будущего дежурного.
+#
+# ТРИ СВОЙСТВА, каждое — закрытая дыра из той же разведки:
+#   1) ДЕЙСТВИЕ — порт devbot без самодеятельности: стейл-гейт (статус читается ДО мутации),
+#      `approve_task(id, approved_by)` на «да», `complete_task(id, failed, <тот же префикс>)` на
+#      «нет», идемпотентная обработка `not_awaiting`/`not_found`.
+#   2) СЛЕД — КАЖДЫЙ ответ (в том числе отказанный и просроченный) кладёт строку в
+#      `APPROVAL_LEDGER`: кто, когда, на какую задачу, какой класс и какой объект был одобрен,
+#      чем кончился вызов моста. До этой правки след находился у 5 карточек из 127.
+#   3) ПРАВО — не безусловное: машина отвечает только при рубильнике владельца И с билетом,
+#      человек — как раньше. Признак человек/машина едет и на мост (`origin`), и в след.
+#
+# ЧЕГО ЗДЕСЬ СОЗНАТЕЛЬНО НЕТ: текст ответа НЕ уезжает на мост. Высший вид карточки
+# (`pretool_guard.is_top_tier`) подтверждается ТОЛЬКО объектом, названным в ответе, а поля для
+# ответа в ряду очереди сегодня нет (`_owner_reply` перебирает кандидатов и не находит ни одного).
+# Значит «да» с ПК высшую цену НЕ открывает — она остаётся fail-closed ровно как была. Ответ
+# оператора сохраняется в местный след как объяснение решения, а не как ключ от необратимого.
+APPROVAL_LEDGER = os.path.join(REPO, "pc_orchestrator.approvals.jsonl")
+APPROVAL_LEDGER_KEEP = 500                # кольцо: след — реестр последних ответов, а не архив
+ANSWER_AGENT_FLAG = "PC_ANSWER_AGENT"     # рубильник владельца: машине разрешено отвечать (дефолт нет)
+ANSWER_TICKET_ENV = "PC_ANSWER_TICKET"    # билет машинного ответа; ЗНАЧЕНИЕ в след не пишется никогда
+ANSWER_ORIGIN_ENV = "PC_ANSWER_ORIGIN"    # самообъявление вызывающего: 'agent' принимаем, 'human' — нет
+ANSWER_WHO_ENV = "PC_ANSWER_WHO"          # имя отвечающего (кто именно за пультом)
+DEFAULT_ANSWER_WHO = "Filipp"             # то же имя, что шлёт devbot (`approve_task(qid, "Filipp")`)
+# Признаки «я ребёнок headless-прогона»: их ставит СВОЕМУ ребёнку сам демон (`_run_task_impl`).
+# Честность признака держится на том, что отвечающая сторона его себе не выдавала и погасить его
+# «забыв флаг» не может: пометка приезжает снаружи, от того, кто запустил.
+_AGENT_ENV_MARKS = (ASK_MARKER_ENV, MARKER_TOKEN_ENV, APPROVED_TASK_ENV)
+
+
+def _console_attached(stream=None):
+    """→ True ⇔ за вызовом ЖИВАЯ консоль (человек печатает руками).
+
+    ВТОРОЙ признак, и он здесь не для красоты. Первый (метки headless-ребёнка в env) машина
+    МОЖЕТ с себя снять: любой процесс волен запустить ребёнка с вычищенным окружением, и тогда
+    «человек» стоил бы одну строку кода. Консоль так не подделать: детям демона stdin/stdout
+    отданы в DEVNULL/пайп по построению (`_run_task_impl`, `_cowork`, `_notify` — всё
+    fire-and-forget), а живой терминал появляется ровно там, где сидит человек.
+    Сбой проверки → False (то есть «машина»): fail-closed."""
+    try:
+        s = stream if stream is not None else sys.stdin
+        return bool(s is not None and s.isatty())
+    except Exception:
+        return False
+
+
+def answer_origin(env=None, console=None):
+    """Кто отвечает на карточку → ORIGIN_HUMAN | ORIGIN_AGENT.
+
+    FAIL-CLOSED в пользу «машина», и признак человека НЕ ЗАЯВЛЯЕТСЯ, а наблюдается:
+      • метка headless-ребёнка в env (её ставит СНАРУЖИ сам демон) → машина;
+      • самообъявление `agent` → машина (объявить себя человеком нельзя вовсе);
+      • нет живой консоли → машина.
+    Человек — это отсутствие признаков машины ПЛЮС терминал под рукой. Одного env было бы мало:
+    ребёнок, запущенный с чистым окружением, объявил бы себя человеком и подтвердил красное сам
+    себе — ровно тот случай, ради которого право отвечать и делается неравным."""
+    e = os.environ if env is None else env
+    for name in _AGENT_ENV_MARKS:
+        if str(e.get(name) or "").strip():
+            return ORIGIN_AGENT
+    if str(e.get(ANSWER_ORIGIN_ENV) or "").strip().lower() == ORIGIN_AGENT:
+        return ORIGIN_AGENT
+    if not (console or _console_attached)():
+        return ORIGIN_AGENT
+    return ORIGIN_HUMAN
+
+
+def answer_allowed(origin, env=None):
+    """Имеет ли право этот отвечающий ставить ответ → (можно: bool, причина отказа: str).
+
+    Человек — да (он и сегодня отвечает, только руками девбота). Машина — ТОЛЬКО при обоих
+    условиях сразу: рубильник владельца поставлен И билет предъявлен. Дефолт — запрет, поэтому
+    появление этого канала само по себе не даёт автономному процессу права подтверждать
+    красное себе самому."""
+    e = os.environ if env is None else env
+    if (origin or ORIGIN_HUMAN) != ORIGIN_AGENT:
+        return True, ""
+    if str(e.get(ANSWER_AGENT_FLAG) or "").strip() != "1":
+        return False, (f"ответ машины на карточку запрещён: рубильник {ANSWER_AGENT_FLAG}=1 "
+                       "владельцем не поставлен")
+    if not str(e.get(ANSWER_TICKET_ENV) or "").strip():
+        return False, (f"ответ машины на карточку без билета ({ANSWER_TICKET_ENV}) отклонён — "
+                       "тот же замок, что 4.2 на полосе VPS")
+    return True, ""
+
+
+def _answer_record(rec, path=None):
+    """Строка следа в APPROVAL_LEDGER (JSONL, кольцо на APPROVAL_LEDGER_KEEP) → True/False.
+    НИКОГДА не бросает: сорванный след не смеет отменить уже поставленный ответ (о срыве
+    останется строка в логе демона — второй канал следа, третий — cowork_log)."""
+    p = path or APPROVAL_LEDGER
+    try:
+        try:
+            with open(p, encoding="utf-8") as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        except FileNotFoundError:
+            lines = []
+        lines.append(json.dumps(rec, ensure_ascii=False))
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines[-APPROVAL_LEDGER_KEEP:]) + "\n")
+        return True
+    except Exception as ex:
+        log.warning("след ответа на карточку не записан (%s) — сам ответ это не отменяет", ex)
+        return False
+
+
+def _answer_done(ok, msg, rec, result, ledger=None):
+    """Закрыть ответ ТРЕМЯ следами (реестр + лог демона + журнал) и вернуть (ok, msg).
+    Зовётся из ВСЕХ веток answer_card, включая отказные: «право не дали» и «карточка устарела» —
+    это тоже ответы человека на карточку, и раньше от них не оставалось ничего."""
+    rec = dict(rec)
+    rec["ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    rec["ok"] = bool(ok)
+    rec["result"] = result
+    _answer_record(rec, ledger)
+    log.info("ANSWER id=%s decision=%s by=%s origin=%s result=%s kinds=%s obj=%s",
+             rec.get("task"), rec.get("decision"), rec.get("by"), rec.get("origin"), result,
+             ",".join(rec.get("kinds") or []) or "-", rec.get("object") or "-")
+    _cowork(f"ответ на карточку #{rec.get('task')}: {rec.get('decision')} "
+            f"({rec.get('origin')}, {rec.get('by')}) → {result}")
+    return ok, msg
+
+
+def _find_own_task(tid, bridge=None):
+    """Статус и ряд задачи СВОЕЙ полосы по id → (status, item) | (None, None). Только чтение.
+
+    Порт `devbot._find_task` с одним отличием, и оно намеренное: devbot ищет по `lane='all'`
+    (он пульт обеих полос), а ПК отвечает ТОЛЬКО за свою — `get_pending` идёт с дефолтным
+    lane=LANE, и найденный ряд ещё раз просеивается `_lane_ok`. Изоляция полос не ослабляется
+    ради нового канала: чужую карточку с ПК не подтвердить."""
+    b = bridge if bridge is not None else bc
+    for st in ("needs_approval", "approved", "in_progress", "new", "done", "failed"):
+        try:
+            r = b.get_pending(st)
+        except Exception:
+            continue
+        if not r.get("ok"):
+            continue
+        for it in (r.get("items") or []):
+            if str(it.get("id")) == str(tid) and _lane_ok(it):
+                return st, it
+    return None, None
+
+
+def _card_facts(item):
+    """Что именно подтверждают: (классы, объект, текст карточки). Разбор НИКОГДА не роняет ответ —
+    след без класса лучше отсутствующего следа."""
+    card = str((item or {}).get("what") or (item or {}).get("result") or "")
+    try:
+        kinds = sorted(_approved_kinds(item))
+        obj = pretool_guard.object_from_card(card) if pretool_guard is not None else ""
+        top = sorted(k for k in kinds if pretool_guard is not None and pretool_guard.is_top_tier(k))
+    except Exception as ex:
+        log.warning("карточка #%s для следа не разобрана (%s)", (item or {}).get("id"), ex)
+        kinds, obj, top = [], "", []
+    return kinds, obj, top, card
+
+
+def answer_card(tid, yes, reply="", who=None, origin=None, bridge=None, env=None, ledger=None,
+                console=None):
+    """ОТВЕТ НА КАРТОЧКУ С ПК → (ok: bool, сообщение: str). yes=True — «да N», False — «нет N».
+
+    Ровно тот же тракт, которым отвечает devbot, и в том же порядке:
+      1) право отвечать (человек/машина) — новое, ПК-side;
+      2) стейл-гейт: статус читается ДО мутации, не `needs_approval` → ответ НЕ ставится;
+      3) «да» → `approve_task(id, approved_by)`; «нет» → `complete_task(id, failed, <префикс>)`;
+      4) `not_awaiting`/`not_found` от моста — идемпотентно, без повторов и без паники.
+    Любой исход оставляет след (см. `_answer_done`)."""
+    e = os.environ if env is None else env
+    b = bridge if bridge is not None else bc
+    org = origin or answer_origin(e, console)
+    who = str(who or (e.get(ANSWER_WHO_ENV) or "").strip() or DEFAULT_ANSWER_WHO)
+    rec = {"task": tid, "decision": ("approve" if yes else "reject"), "by": who, "origin": org,
+           "lane": LANE, "reply": _clip(str(reply or ""), 300), "kinds": [], "top": [],
+           "object": "", "card": ""}
+
+    # Карточка читается ПЕРВОЙ и ДО всех гейтов — чтение ряда очереди ничего не мутирует, а след
+    # без неё бесполезен там, где он нужнее всего: запись «машина пыталась подтвердить delete на
+    # боевом файле» и «машина пыталась подтвердить что-то» — это разные новости для дежурного.
+    # Порядок САМИХ ГЕЙТОВ перед мутацией прежний, devbot-овский: право → стейл → вызов моста.
+    st, item = _find_own_task(tid, b)
+    if item is not None:
+        kinds, obj, top, card = _card_facts(item)
+        rec.update({"kinds": kinds, "top": top, "object": obj, "card": _clip(card, 400)})
+
+    right, why = answer_allowed(org, e)
+    if not right:
+        return _answer_done(False, f"🚫 ответ на карточку #{tid} НЕ поставлен: {why}", rec, "denied", ledger)
+
+    if st is None:
+        return _answer_done(False, f"🤖 задачи {tid} нет в очереди полосы {LANE} — ответ не поставлен",
+                            rec, "not_found", ledger)
+    if st != "needs_approval":
+        return _answer_done(False, f"⏱ карточка #{tid} устарела (статус: {st}) — ответ не поставлен",
+                            rec, "stale", ledger)
+
+    if yes:
+        ticket = str(e.get(ANSWER_TICKET_ENV) or "").strip() or None
+        r = b.approve_task(tid, who, origin=org, ticket=ticket)
+        if r.get("ok"):
+            hint = ""
+            if rec["top"]:
+                # Честно называем границу прямо в ответе оператору: он нажал «да», а необратимый
+                # класс всё равно не открылся — иначе решит, что открылся, и уйдёт спать.
+                hint = (" · ВНИМАНИЕ: в карточке высший вид (" + ", ".join(rec["top"]) +
+                        ") — он подтверждается только ответом с объектом, и этот канал его "
+                        "на мост не несёт: шаг снова упрётся в красное")
+            return _answer_done(True, f"✅ задача {tid} одобрена ({who}, {org}) — демон повторит шаг{hint}",
+                                rec, "ok", ledger)
+        err = str(r.get("error") or "")
+        if err == "not_awaiting":
+            return _answer_done(False, f"🤖 задача {tid} не ждёт подтверждения (статус {r.get('status')}) "
+                                       "— ничего не сделал", rec, "not_awaiting", ledger)
+        if err == "not_found":
+            return _answer_done(False, f"🤖 задачи {tid} нет в очереди", rec, "not_found", ledger)
+        return _answer_done(False, f"🤖 approve не прошёл: {err or 'мост не ответил ok'}",
+                            rec, f"error:{err or 'unknown'}", ledger)
+
+    # «нет N». Префикс — МАШИННЫЙ маркер контракта (`NO_HEAL_PREFIXES`: отказ владельца самопочинке
+    # не отдаётся), поэтому он дословно тот же, что шлёт devbot. КТО ответил на самом деле, говорит
+    # скобка сразу за ним и строка следа — врать про авторство маркер не должен.
+    txt = _REJECT_PREFIX + f" (ответ с ПК: {who}/{org})"
+    if str(reply or "").strip():
+        txt += ": " + _clip(str(reply), 300)
+    r = b.complete_task(tid, "failed", txt)
+    if r.get("ok"):
+        return _answer_done(True, f"🚫 задача {tid} отклонена ({who}, {org}) — статус failed",
+                            rec, "ok", ledger)
+    err = str(r.get("error") or "")
+    return _answer_done(False, f"🤖 отклонить задачу {tid} не удалось: {err or 'мост не ответил ok'}",
+                        rec, f"error:{err or 'unknown'}", ledger)
 
 
 # ---------------- ПК-side таймаут ОДИНОЧЕК pc (развязка 328-pc, этап 2) --------------------------
@@ -6146,5 +6413,19 @@ if __name__ == "__main__":
         else:
             print(f"FAIL enqueue: {err}")
             sys.exit(1)
+    elif arg in ("--approve", "--reject"):
+        # ОТВЕТ НА КРАСНУЮ КАРТОЧКУ ПРЯМО С ПК (то, чего у полосы не было вовсе — до этой правки
+        # «да N» умел только devbot на сервере). `--approve N` = «да N», `--reject N` = «нет N».
+        # Третий аргумент — текст ответа: он идёт В СЛЕД (объяснение решения), а НЕ на мост, и
+        # высший вид карточки им не открывается (см. блок answer_card).
+        try:
+            tid = int(sys.argv[2])
+        except Exception:
+            print(f"нужен номер задачи: {arg} <id> [текст ответа]")
+            sys.exit(2)
+        reply = sys.argv[3] if len(sys.argv) > 3 else ""
+        ok, msg = answer_card(tid, arg == "--approve", reply=reply)
+        print(msg)
+        sys.exit(0 if ok else 1)
     else:
         main()
