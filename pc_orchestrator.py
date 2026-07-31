@@ -138,6 +138,28 @@ CLIENT_LOG_STALE = int(os.getenv("PC_CLIENT_LOG_STALE", "120") or "120")        
 CLIENT_BLIND_ALARM = int(os.getenv("PC_CLIENT_BLIND_ALARM", "3") or "3")        # N слепых циклов подряд → NOTE «вотчдог слеп»
 WAKE_GRACE_SEC = int(os.getenv("PC_WAKE_GRACE", "120") or "120")                # после пробуждения ПК — окно без вердиктов
 WAKE_JUMP_MARGIN = int(os.getenv("PC_WAKE_JUMP_MARGIN", "60") or "60")          # скачок wall-clock > POLL+это → «ПК проснулся»
+# ─── СИГНАЛ О ПОДЪЁМЕ ПРОЦЕССА СТОРОЖЕМ (инцидент 31.07.2026) ────────────────────────────────
+# Живой факт: pc_agent умер 31.07 в 12:40:19, вернулся в 12:58:42 — 18 минут управление с телефона
+# молчало, и владелец узнал об этом, лишь попробовав команду. Подъём при этом БЫЛ зафиксирован:
+# строка «вотчдог поднял pc_agent (смерть 1/3)» легла в журнал ровно как задумано. Разрыв не в
+# фиксации, а в КАНАЛЕ: журнал — архив, его не читают в реальном времени, а карточки не было ни
+# одной (замер: `поднял` в dispatch_notify.log за всё время его жизни — 0 совпадений). Поэтому
+# КАЖДЫЙ подъём получает карточку в тему постановки (328) — тот же канал, что у детектора немоты
+# сессий и сигнала о долгом сне ПК.
+RAISE_ALARM_TOPIC = int(os.getenv("PC_RAISE_TOPIC", "328") or "328")
+# Пауза перед КОНТРОЛЬНЫМ поиском PID. `schtasks /Run … rc=0` значит «Планировщик принял команду»,
+# а НЕ «процесс живёт»; `ModerbotProcess.start()` возвращает ok=True даже со словами «запустил, но
+# процесс не виден» (pc_agent.py). Ровно этой проверки и не хватило 31.07: помощник рестарта
+# отчитался успехом, процесс не поднялся, и следующие 18 минут никто об этом не знал.
+RAISE_VERIFY_SEC = int(os.getenv("PC_RAISE_VERIFY_SEC", "8") or "8")
+# Чем оборачивается смерть каждого — обязательная строка карточки. Без неё «pc_agent умер»
+# читается как «умер какой-то python»: имя процесса не говорит владельцу, что именно он потерял.
+RAISE_LOSS = {
+    "pc_agent": "УПРАВЛЕНИЕ С ТЕЛЕФОНА (тема 205) было недоступно",
+    "userbot": "клиент писал в пустоту: входящие не читались",
+    "moderation_bot": "модерация стояла: карточки и кнопки не работали",
+    "pc_orchestrator": "ВЕСЬ ПК-контур стоял: задачи не брались, контур-вотчдог не тикал",
+}
 # ─── СИГНАЛ О ДОЛГОМ СНЕ ПК (инцидент 30.07.2026) ────────────────────────────────────────────
 # Живой факт: 30.07 ПК проспал 8 ч 58 м (S3, 03:43:15→12:41:21) — клиентский бот был недоступен
 # всю ночь; за 7 суток сон съел 12 ч 10 м. Причина НЕ таймаут простоя (standby/hibernate-timeout
@@ -4913,8 +4935,56 @@ def _persist_client_watch(state, now, path=None):
         log.warning("контур-вотчдог: снимок надзора не записан (%s): %s", path, e)
 
 
+def _verify_raised(finder, wait=None, sleeper=None):
+    """КОНТРОЛЬНЫЙ поиск PID уже ПОСЛЕ подъёма. → список PID | [] (не поднялся) | None (CIM слеп).
+    Три исхода, как у самого finder'а (#171): «не смог проверить» ≠ «не поднялся» — иначе слепой
+    CIM превратил бы каждый удачный подъём в громкую карточку. Сон и поиск инъектируются: голден
+    гоняется без ожидания и без CIM."""
+    wait = RAISE_VERIFY_SEC if wait is None else wait
+    if wait:
+        (sleeper or time.sleep)(wait)
+    try:
+        return finder()
+    except Exception as e:
+        log.warning("контур-вотчдог: контрольный поиск PID после подъёма упал (%s) — исход НЕИЗВЕСТЕН", e)
+        return None
+
+
+def raise_is_loud(ok, pids, deaths):
+    """ГРОМКИЙ канал (инбокс 1160 → личка) вместо обычной карточки в 328. Три повода, все три —
+    «подъём не сработал так, как задумано»: подниматель отчитался провалом; процесс не появился
+    после команды (тот самый случай 31.07); счётчик смертей подряд растёт — процесс не держится."""
+    return (not ok) or (pids is not None and not pids) or (int(deaths or 0) >= 2)
+
+
+def raise_card_text(name, deaths, max_deaths, down_sec, pids, ok, detail):
+    """Текст карточки «сторож поднял процесс» — чистая функция, на неё положен голден.
+    ЧЕТЫРЕ обязательных факта в порядке важности для владельца: КТО, СКОЛЬКО ЛЕЖАЛ, ЧТО ЭТО
+    СТОИЛО, КАКАЯ ПО СЧЁТУ смерть + НОВЫЙ PID. Пятая строка — чем поднимали (для разбора)."""
+    loss = RAISE_LOSS.get(name, "процесс контура не работал")
+    down = "неизвестно (лога нет)" if down_sec is None else fmt_sleep(down_sec)
+    if pids is None:
+        pid_s = "PID подтвердить не удалось (CIM слеп) — перепроверю следующим тиком"
+    elif pids:
+        pid_s = "новый PID " + ", ".join(str(p) for p in pids)
+    else:
+        pid_s = "PID НЕ ПОЯВИЛСЯ за %sс — подъём НЕ ВЗЯЛСЯ" % RAISE_VERIFY_SEC
+    if not ok:
+        head = "⚠️ СТОРОЖ НЕ СМОГ ПОДНЯТЬ %s — лежит %s" % (name, down)
+    elif pids is not None and not pids:
+        head = "⚠️ ПОДЪЁМ %s НЕ ВЗЯЛСЯ — лежит %s" % (name, down)
+    elif int(deaths or 0) >= 2:
+        head = "⚠️ СТОРОЖ ПОДНЯЛ %s СНОВА (смерть %s подряд) — лежал %s" % (name, deaths, down)
+    else:
+        head = "🔁 СТОРОЖ ПОДНЯЛ %s — лежал %s" % (name, down)
+    return "\n".join([head, loss,
+                      "смерть %s/%s подряд · %s" % (deaths, max_deaths, pid_s),
+                      "подъём: %s" % _tail(str(detail), 160)])
+
+
 def client_watchdog_tick(now=None, specs=None, state=None, cooldown=None, max_deaths=None,
-                         grace_until=None, log_stale=None, blind_alarm=None):
+                         grace_until=None, log_stale=None, blind_alarm=None, verify=None,
+                         notifier=None, critical=None):
     """Один прогон контур-вотчдога. → dict name->action (для тестов/лога). Побочки: raiser()+NOTE.
     Уважает рубильник pc_orchestrator.stop (клиентский контур при намеренной остановке не трогаем).
     Фикс #171: finder РАЗЛИЧАЕТ три исхода (см. _find_pids_by_script); «мёртв» требует ТРЁХ условий
@@ -4962,30 +5032,47 @@ def client_watchdog_tick(now=None, specs=None, state=None, cooldown=None, max_de
             continue
         any_success = True
         alive = bool(pids)
+        down_sec = None       # СКОЛЬКО ЛЕЖАЛ — по молчанию собственного лога процесса
         if not alive:
             # (1) «мёртв» (повод к рестарту) = finder УСПЕШЕН И процесса нет И лог протух > порога.
             # Свежий лог = недавняя активность/возможная гонка CIM → рестарт ВЕТИРУЕМ (строже к рестарту).
-            log_age = _log_age_sec(sp.get("logfile"), now)
-            if log_age is not None and log_age <= log_stale:
+            down_sec = _log_age_sec(sp.get("logfile"), now)
+            if down_sec is not None and down_sec <= log_stale:
                 out[name] = "fresh_log"
                 log.warning("контур-вотчдог: %s без PID, но лог свеж (%sс ≤ %sс) — смерть НЕ доказана, рестарт отложен",
-                            name, int(log_age), log_stale)
+                            name, int(down_sec), log_stale)
                 continue
         action, st = _client_watch_step(name, alive, now, state, cooldown, max_deaths)
         state[name] = st
         out[name] = action
         if action == "raise":
+            # down_sec взят ДО подъёма СОЗНАТЕЛЬНО: поднятый процесс пишет в свой лог сразу, и
+            # прежний замер (после raiser'а) давал «лог 0с назад» — число честное по времени, но
+            # описывающее уже НОВУЮ жизнь процесса, а не простой. Так строка 30.07 про
+            # moderation_bot и сообщила «лог 0с назад» про смерть, длившуюся минуты.
             try:
                 ok, detail = sp["raiser"]()
             except Exception as e:
                 ok, detail = False, f"raiser упал: {e}"
-            log_age = _log_age_sec(sp.get("logfile"), now)
-            log.warning("контур-вотчдог: %s МЁРТВ (смерть %s/%s, лог %s) → подъём ok=%s: %s",
-                        name, st["deaths"], max_deaths,
-                        (f"{int(log_age)}с назад" if log_age is not None else "нет"), ok, _tail(str(detail), 200))
-            _cowork(f"вотчдог поднял {name} (смерть {st['deaths']}/{max_deaths}): {_tail(str(detail), 160)}")
-            if not ok:
-                _notify(f"⚠️ Оркестратор: контур-вотчдог не смог поднять {name}: {_tail(str(detail), 160)}")
+            pids_after = (verify or _verify_raised)(sp["finder"])
+            loud = raise_is_loud(ok, pids_after, st["deaths"])
+            text = raise_card_text(name, st["deaths"], max_deaths, down_sec, pids_after, ok, detail)
+            log.warning("контур-вотчдог: %s МЁРТВ (лежал %s, смерть %s/%s) → подъём ok=%s, PID после=%s: %s",
+                        name, (f"{int(down_sec)}с" if down_sec is not None else "неизвестно"),
+                        st["deaths"], max_deaths, ok, pids_after, _tail(str(detail), 200))
+            _cowork("вотчдог поднял %s (смерть %s/%s, лежал %s, %s): %s"
+                    % (name, st["deaths"], max_deaths,
+                       ("неизвестно" if down_sec is None else fmt_sleep(down_sec)),
+                       ("PID " + ", ".join(str(p) for p in pids_after)) if pids_after
+                       else ("PID не подтверждён" if pids_after is None else "процесс НЕ появился"),
+                       _tail(str(detail), 120)))
+            # КАЖДЫЙ подъём — карточка (иначе он виден только в журнале, а его не читают в
+            # реальном времени: инцидент 31.07, 18 минут без управления). Громкий канал —
+            # когда подъём не сработал с первой попытки или счётчик смертей растёт.
+            if loud:
+                (critical or _notify_critical)(text)
+            else:
+                (notifier or _notify_topic)(RAISE_ALARM_TOPIC, text)
         elif action == "halt_now":
             log.error("контур-вотчдог: %s умер %s раз подряд — СТОП попыток, нужен разбор", name, st["deaths"])
             _cowork(f"вотчдог: {name} умер {st['deaths']} раза подряд — СТОП, нужен разбор")
@@ -6282,8 +6369,44 @@ def _wd_state_write(d, path=None):
         log.warning("watchdog: state-файл не записался (%s) — антиспам деградирует, не критично", e)
 
 
+WD_RAISE_WINDOW = int(os.getenv("PC_WD_RAISE_WINDOW", "86400") or "86400")   # окно счётчика подъёмов, с
+
+
+def _wd_count_raise(tnow, state_path=None, window=None):
+    """Зарегистрировать подъём демона в state-файле → сколько подъёмов за окно (включая этот).
+    Счётчик НЕ «подряд», а «за сутки»: у демона каждый подъём успешен с первой попытки (иначе
+    сработала бы ветка алерта), поэтому «подряд» всегда равнялось бы единице и роста не показало
+    бы никогда. Демон, которого поднимают трижды за сутки, болен — вот это и надо видеть."""
+    window = WD_RAISE_WINDOW if window is None else window
+    st = _wd_state_read(state_path)
+    hist = [float(t) for t in (st.get("raises") or []) if isinstance(t, (int, float))]
+    hist = [t for t in hist if 0 <= tnow - t < window][-50:] + [float(tnow)]
+    st["raises"] = hist
+    _wd_state_write(st, state_path)
+    return len(hist)
+
+
+def daemon_raise_card_text(n_raises, down_sec, pids, rc):
+    """Текст карточки «сторож поднял ДЕМОН» — чистая функция, на неё положен голден.
+    Счётчик у демона не «смерть N подряд» (у него подряд всегда 1: провал подъёма уходит в другую
+    ветку), а «подъём №N за сутки» — рост именно этого числа и значит «демон не держится»."""
+    down = "неизвестно (heartbeat не прочитан)" if down_sec is None else fmt_sleep(down_sec)
+    if pids is None:
+        pid_s = "PID подтвердить не удалось (CIM слеп)"
+    elif pids:
+        pid_s = "новый PID " + ", ".join(str(p) for p in pids)
+    else:
+        pid_s = "PID не виден (поднялся по свежему heartbeat)"
+    head = ("⚠️ ДЕМОН ПОДНЯТ ПОВТОРНО (№%s за сутки) — лежал %s" % (n_raises, down)
+            if int(n_raises or 0) >= 2 else
+            "🔁 СТОРОЖ ПОДНЯЛ ДЕМОН pc_orchestrator — лежал %s" % down)
+    return "\n".join([head, RAISE_LOSS["pc_orchestrator"],
+                      "подъём №%s за сутки · %s" % (n_raises, pid_s),
+                      "подъём: schtasks /Run /TN %s rc=%s" % (TASK_NAME, rc)])
+
+
 def watchdog(now=None, runner=None, verify_sleep=None, finder=None, state_path=None,
-             notify=None, cowork=None, wall_now=None):
+             notify=None, cowork=None, wall_now=None, topic=None):
     """НАДЁЖНЫЙ вотчдог (урок 205 — тихого сбоя быть не должно; класс-фикс 13.07 — и ЛОЖНОГО
     шума быть не должно): живость ПО ФАКТУ — heartbeat свеж ИЛИ процесс демона жив (длинная
     задача, замершая heartbeat, или смена PID после self-update ≠ смерть). ДОКАЗАННО мёртв
@@ -6303,8 +6426,10 @@ def watchdog(now=None, runner=None, verify_sleep=None, finder=None, state_path=N
         if st.get("state") == "down":
             log.info("watchdog: инцидент закрыт — демон снова жив")
             (cowork or _cowork)("watchdog: демон снова жив — инцидент закрыт")
-        _wd_state_write({"state": "alive", "last_alert": float(st.get("last_alert") or 0.0)},
-                        state_path)
+        # raises переносим: _mark_alive зовётся на КАЖДОМ живом тике (раз в 5 мин), и без переноса
+        # история подъёмов стиралась бы через минуты после записи — счётчик за сутки не жил бы.
+        _wd_state_write({"state": "alive", "last_alert": float(st.get("last_alert") or 0.0),
+                         "raises": list(st.get("raises") or [])}, state_path)
 
     if _heartbeat_fresh(now=now):
         _mark_alive()
@@ -6327,6 +6452,10 @@ def watchdog(now=None, runner=None, verify_sleep=None, finder=None, state_path=N
     # ДОКАЗАННО мёртв: heartbeat протух И процессов демона нет → поднимаем.
     log.warning("watchdog: heartbeat протух (>%ss) и процессов демона НЕТ — поднимаю через schtasks",
                 HEARTBEAT_STALE)
+    # СКОЛЬКО ЛЕЖАЛ — снимаем ДО /Run: поднятый демон пишет heartbeat уже через свой первый цикл,
+    # и замер после верификации (verify_sleep=20с) показал бы простой почти в ноль (тот же класс,
+    # что и «лог 0с назад» в контур-вотчдоге).
+    down_sec = _log_age_sec(HEARTBEAT_FILE, tnow)
     rc, out = (runner or _schtasks_run)()
     log.warning("watchdog: schtasks /Run /TN %s → rc=%s | %s", TASK_NAME, rc, out)   # ЛОГ вывода (205)
     if verify_sleep is None:
@@ -6336,6 +6465,20 @@ def watchdog(now=None, runner=None, verify_sleep=None, finder=None, state_path=N
     ver_pids = find()
     if _heartbeat_fresh(now=now) or ver_pids:
         log.info("watchdog: демон поднялся (heartbeat свежий / процесс жив)")
+        # ПОДЪЁМ ДЕМОНА ТОЖЕ ВИДЕН (31.07). Раньше успешный подъём давал ровно одну строку INFO в
+        # лог: ни журнала, ни карточки — строка «инцидент закрыт» пишется ТОЛЬКО если инцидент до
+        # этого объявляли, а объявляют его лишь при ПРОВАЛЕ подъёма. Значит смерть демона, из
+        # которой сторож вытащил с первой попытки, не оставляла владельцу ни одного следа —
+        # а это самая дорогая смерть контура: пока демон лежит, не тикает и контур-вотчдог.
+        n_raises = _wd_count_raise(tnow, state_path)
+        text = daemon_raise_card_text(n_raises, down_sec, ver_pids, rc)
+        (cowork or _cowork)("watchdog: поднял демон через schtasks (лежал %s, подъём №%s за сутки, PID %s)"
+                            % (("неизвестно" if down_sec is None else fmt_sleep(down_sec)), n_raises,
+                               ", ".join(str(p) for p in (ver_pids or [])) or "не подтверждён"))
+        if n_raises >= 2:
+            (notify or _notify_critical)(text)     # подъём не первый за сутки — демон не держится
+        else:
+            (topic or _notify_topic)(RAISE_ALARM_TOPIC, text)
         _mark_alive()
         return "restarted"
     if ver_pids is None:

@@ -760,9 +760,10 @@ class TestWatchdog(Base):
         self._save_hb = o._heartbeat_fresh
         self._tmp = tempfile.TemporaryDirectory()
         self.state = os.path.join(self._tmp.name, "wd_state.json")
-        self.notes, self.pushes = [], []
+        self.notes, self.pushes, self.cards = [], [], []
         self.cow = lambda s: self.notes.append(s)
         self.push = lambda s: self.pushes.append(s)
+        self.card = lambda topic, text: self.cards.append((topic, text))
         self.runs = {"n": 0}
 
     def tearDown(self):
@@ -777,7 +778,7 @@ class TestWatchdog(Base):
     def _wd(self, finder, wall_now=None):
         return o.watchdog(runner=self._runner, verify_sleep=0, finder=finder,
                           state_path=self.state, notify=self.push, cowork=self.cow,
-                          wall_now=wall_now)
+                          wall_now=wall_now, topic=self.card)
 
     # (a) демон жив + heartbeat свеж → ТИШИНА: ни подъёма, ни алертов.
     def test_a_alive_hb_fresh_silence(self):
@@ -848,6 +849,44 @@ class TestWatchdog(Base):
         self.assertEqual(r, "restarted")
         self.assertEqual(self.runs["n"], 1)
         self.assertEqual(self.pushes, [])
+
+    # ─── ПОДЪЁМ ДЕМОНА ВИДЕН (31.07): раньше успешный подъём давал одну строку INFO и всё ───
+    def test_daemon_raise_sends_card_and_note(self):
+        o._heartbeat_fresh = lambda *a, **k: False
+        seq = iter([[], [7777]])
+        self.assertEqual(self._wd(lambda: next(seq), wall_now=1_000_000.0), "restarted")
+        self.assertEqual(len(self.cards), 1)                    # РОВНО одна карточка в тему
+        topic, text = self.cards[0]
+        self.assertEqual(topic, o.RAISE_ALARM_TOPIC)
+        self.assertIn("СТОРОЖ ПОДНЯЛ ДЕМОН", text)
+        self.assertIn("7777", text)                             # новый PID назван
+        self.assertIn("№1 за сутки", text)
+        self.assertEqual(self.pushes, [])                       # первый подъём — не громкий канал
+        self.assertTrue(any("поднял демон через schtasks" in n for n in self.notes))
+
+    # второй подъём за сутки — ГРОМЧЕ (демон не держится), карточка уходит критическим каналом
+    def test_daemon_second_raise_is_loud(self):
+        o._heartbeat_fresh = lambda *a, **k: False
+        for t in (1_000_000.0, 1_000_600.0):
+            seq = iter([[], [7777]])
+            self._wd(lambda: next(seq), wall_now=t)
+        self.assertEqual(len(self.cards), 1)                    # второй ушёл НЕ в обычную тему
+        self.assertEqual(len(self.pushes), 1)
+        self.assertIn("ПОДНЯТ ПОВТОРНО (№2 за сутки)", self.pushes[0])
+
+    # счётчик подъёмов переживает живые тики (_mark_alive не должен стирать историю)
+    def test_daemon_raise_history_survives_alive_ticks(self):
+        o._heartbeat_fresh = lambda *a, **k: False
+        seq = iter([[], [7777]])
+        self._wd(lambda: next(seq), wall_now=1_000_000.0)
+        o._heartbeat_fresh = lambda *a, **k: True
+        for dt in (300.0, 600.0, 900.0):                        # живые тики каждые 5 минут
+            self._wd(lambda: [7777], wall_now=1_000_000.0 + dt)
+        import json as _json
+        with open(self.state, encoding="utf-8") as f:
+            self.assertEqual(len(_json.load(f)["raises"]), 1)   # история на месте, не стёрта
+        # старше суток — выпадает из окна
+        self.assertEqual(o._wd_count_raise(1_000_000.0 + 90_000.0, self.state), 1)
 
     # CIM не смог (#171) → страховочный /Run, БЕЗ алерта (смерть не доказана).
     def test_cim_blind_unknown_no_alert(self):
@@ -1897,15 +1936,21 @@ class TestClientWatchdog(unittest.TestCase):
     подъём + NOTE; анти-флап (кулдаун); 3 смерти подряд → стоп + громкий NOTE; skip; рубильник."""
 
     def setUp(self):
-        self._save = (o._cowork, o._notify, o._notify_critical, o._stopped)
-        self.notes, self.pushes, self.crit = [], [], []
+        self._save = (o._cowork, o._notify, o._notify_critical, o._stopped,
+                      o._notify_topic, o.RAISE_VERIFY_SEC)
+        self.notes, self.pushes, self.crit, self.cards = [], [], [], []
         o._cowork = lambda line: self.notes.append(line)
         o._notify = lambda text: self.pushes.append(text)
         o._notify_critical = lambda text: self.crit.append(text)   # критические инциденты → инбокс 1160
+        # карточка подъёма (31.07) — перехватываем ОБЯЗАТЕЛЬНО: незамоканный _notify_topic шлёт
+        # боевую карточку в тему 328 прямо из прогона тестов (гейт self-update гоняет их сам).
+        o._notify_topic = lambda topic, text: self.cards.append((topic, text))
+        o.RAISE_VERIFY_SEC = 0        # без паузы: контрольный поиск PID в тестах мгновенный
         o._stopped = lambda: False
 
     def tearDown(self):
-        (o._cowork, o._notify, o._notify_critical, o._stopped) = self._save
+        (o._cowork, o._notify, o._notify_critical, o._stopped,
+         o._notify_topic, o.RAISE_VERIFY_SEC) = self._save
 
     def _spec(self, name, alive_seq, raiser_ok=True, skip=False):
         """Спека процесса: alive_seq — очередь ответов finder (True/False по тикам).
@@ -1991,10 +2036,61 @@ class TestClientWatchdog(unittest.TestCase):
         self.assertEqual(out, {"_": "stopped"})
         self.assertEqual(len(sp["_raises"]), 0)        # рубильник → контур не трогаем
 
-    def test_raiser_failure_pushes(self):
+    # провал подъёма — ГРОМКИЙ канал (инбокс 1160 → личка), а не рядовая карточка темы
+    def test_raiser_failure_is_loud(self):
         sp = self._spec("pc_agent", [False], raiser_ok=False)
         o.client_watchdog_tick(now=1, specs=[sp], state={}, cooldown=0, max_deaths=3)
-        self.assertTrue(any("не смог поднять pc_agent" in p for p in self.pushes))
+        self.assertTrue(any("СТОРОЖ НЕ СМОГ ПОДНЯТЬ pc_agent" in c for c in self.crit))
+        self.assertEqual(self.cards, [])              # в обычную тему такое НЕ уходит
+
+    # ─── ЯДРО ЗАДАЧИ 31.07: подъём обязан быть ВИДЕН, а не только записан в журнал ───
+    def test_every_raise_sends_card(self):
+        sp = self._spec("pc_agent", [False, True])    # умер → подняли → PID появился
+        o.client_watchdog_tick(now=1, specs=[sp], state={}, cooldown=0, max_deaths=3)
+        self.assertEqual(len(self.cards), 1)          # РОВНО одна карточка на подъём
+        topic, text = self.cards[0]
+        self.assertEqual(topic, o.RAISE_ALARM_TOPIC)  # тема постановки (328)
+        self.assertIn("СТОРОЖ ПОДНЯЛ pc_agent", text)
+        self.assertIn("УПРАВЛЕНИЕ С ТЕЛЕФОНА", text)  # чем обернулась смерть — названо
+        self.assertIn("смерть 1/3", text)
+        self.assertIn("новый PID 123", text)
+        self.assertEqual(self.crit, [])               # первая смерть с удачным подъёмом — не громко
+
+    def test_raise_card_names_new_pid_from_verify(self):
+        """PID берётся КОНТРОЛЬНЫМ поиском после подъёма, а не из слов поднимателя:
+        `schtasks /Run rc=0` и `ModerbotProcess.start()` рапортуют успех, не проверив процесс."""
+        sp = self._spec("moderation_bot", [False])
+        o.client_watchdog_tick(now=1, specs=[sp], state={}, cooldown=0, max_deaths=3,
+                               verify=lambda finder: [4242])
+        self.assertIn("новый PID 4242", self.cards[0][1])
+
+    def test_raise_that_did_not_take_is_loud(self):
+        """Подниматель отчитался ok, а процесса нет — ровно случай 31.07 (помощник рестарта
+        pc_agent сказал «ок», процесс не поднялся, 18 минут тишины)."""
+        sp = self._spec("pc_agent", [False])
+        o.client_watchdog_tick(now=1, specs=[sp], state={}, cooldown=0, max_deaths=3,
+                               verify=lambda finder: [])
+        self.assertEqual(self.cards, [])
+        self.assertTrue(any("ПОДЪЁМ pc_agent НЕ ВЗЯЛСЯ" in c for c in self.crit))
+
+    def test_growing_death_counter_is_loud(self):
+        st = {}
+        sp = self._spec("userbot", [False, False])
+        o.client_watchdog_tick(now=1, specs=[sp], state=st, cooldown=0, max_deaths=5,
+                               verify=lambda finder: [7])      # подъём удался
+        o.client_watchdog_tick(now=2, specs=[sp], state=st, cooldown=0, max_deaths=5,
+                               verify=lambda finder: [7])      # снова умер → смерть 2
+        self.assertEqual(len(self.cards), 1)                    # первая — обычная
+        self.assertTrue(any("СНОВА (смерть 2 подряд)" in c for c in self.crit))
+
+    def test_blind_verify_is_not_failure(self):
+        """CIM слеп на контрольном поиске — это «не знаю», а не «не поднялся»: карточка обычная."""
+        sp = self._spec("userbot", [False])
+        o.client_watchdog_tick(now=1, specs=[sp], state={}, cooldown=0, max_deaths=3,
+                               verify=lambda finder: None)
+        self.assertEqual(len(self.cards), 1)
+        self.assertIn("CIM слеп", self.cards[0][1])
+        self.assertEqual(self.crit, [])
 
     def test_throttle_maybe_client_watchdog(self):
         o._client_watch_last_run = 0.0
@@ -2009,6 +2105,71 @@ class TestClientWatchdog(unittest.TestCase):
         finally:
             o.client_watchdog_tick = save
             o._client_watch_last_run = 0.0
+
+
+class TestRaiseCardGolden(unittest.TestCase):
+    """Голдены КАРТОЧКИ ПОДЪЁМА (31.07). Функции чистые: ни сети, ни CIM, ни процессов.
+    Четыре обязательных факта карточки — КТО, СКОЛЬКО ЛЕЖАЛ, ЧЕГО ЭТО СТОИЛО, СМЕРТЬ №/PID."""
+
+    def test_normal_card_has_four_facts(self):
+        t = o.raise_card_text("pc_agent", 1, 3, 1103, [15428], True, "schtasks /Run rc=0")
+        self.assertIn("СТОРОЖ ПОДНЯЛ pc_agent", t)          # кто
+        self.assertIn("18 м 23 с", t)                        # сколько лежал (живой замер 31.07)
+        self.assertIn("УПРАВЛЕНИЕ С ТЕЛЕФОНА", t)            # чего это стоило
+        self.assertIn("смерть 1/3 подряд", t)                # какая по счёту
+        self.assertIn("новый PID 15428", t)                  # новый PID
+
+    def test_card_without_log_says_unknown_not_zero(self):
+        """Нет лога → «неизвестно», а НЕ «0 с»: выдуманный ноль хуже честного незнания."""
+        t = o.raise_card_text("userbot", 1, 3, None, [9], True, "d")
+        self.assertIn("неизвестно", t)
+        self.assertNotIn("лежал 0 с", t)
+
+    def test_card_flags_raise_that_did_not_take(self):
+        t = o.raise_card_text("pc_agent", 1, 3, 60, [], True, "d")
+        self.assertIn("НЕ ВЗЯЛСЯ", t)
+        self.assertIn("PID НЕ ПОЯВИЛСЯ", t)
+
+    def test_card_blind_cim_is_not_failure(self):
+        t = o.raise_card_text("userbot", 1, 3, 60, None, True, "d")
+        self.assertIn("CIM слеп", t)
+        self.assertNotIn("НЕ ВЗЯЛСЯ", t)
+
+    def test_loudness_rules(self):
+        self.assertFalse(o.raise_is_loud(True, [1], 1))       # штатный подъём с первой попытки
+        self.assertFalse(o.raise_is_loud(True, None, 1))      # слепой CIM — не повод кричать
+        self.assertTrue(o.raise_is_loud(False, [1], 1))       # подниматель провалился
+        self.assertTrue(o.raise_is_loud(True, [], 1))         # процесс не появился
+        self.assertTrue(o.raise_is_loud(True, [1], 2))        # счётчик смертей растёт
+
+    def test_unknown_process_still_gets_loss_line(self):
+        t = o.raise_card_text("нечто", 1, 3, 10, [1], True, "d")
+        self.assertIn("процесс контура не работал", t)
+
+    def test_daemon_card_counts_raises_per_day(self):
+        t = o.daemon_raise_card_text(1, 240, [17568], 0)
+        self.assertIn("СТОРОЖ ПОДНЯЛ ДЕМОН", t)
+        self.assertIn("4 м 00 с", t)
+        self.assertIn("ВЕСЬ ПК-контур стоял", t)
+        self.assertIn("подъём №1 за сутки", t)
+        self.assertIn("новый PID 17568", t)
+        loud = o.daemon_raise_card_text(2, 240, [17568], 0)
+        self.assertIn("ПОДНЯТ ПОВТОРНО (№2 за сутки)", loud)
+
+    def test_verify_raised_three_outcomes(self):
+        self.assertEqual(o._verify_raised(lambda: [5], wait=0), [5])
+        self.assertEqual(o._verify_raised(lambda: [], wait=0), [])
+        self.assertIsNone(o._verify_raised(lambda: None, wait=0))
+        def boom():
+            raise RuntimeError("CIM упал")
+        self.assertIsNone(o._verify_raised(boom, wait=0))     # исключение = «не знаю», не «мёртв»
+
+    def test_verify_waits_before_looking(self):
+        """Пауза обязана быть ДО поиска: schtasks /Run асинхронен, мгновенный поиск даст пусто."""
+        order = []
+        o._verify_raised(lambda: order.append("look") or [1],
+                         wait=7, sleeper=lambda s: order.append(("sleep", s)))
+        self.assertEqual(order, [("sleep", 7), "look"])
 
 
 class TestClientWatchSnapshot(unittest.TestCase):
@@ -2063,16 +2224,20 @@ class TestWatchdogClassFix(unittest.TestCase):
     NOW = 2_000_000_000   # большой wall-clock: os.utime мтаймов лога считается относительно него
 
     def setUp(self):
-        self._save = (o._cowork, o._notify, o._notify_critical, o._stopped)
-        self.notes, self.pushes, self.crit = [], [], []
+        self._save = (o._cowork, o._notify, o._notify_critical, o._stopped,
+                      o._notify_topic, o.RAISE_VERIFY_SEC)
+        self.notes, self.pushes, self.crit, self.cards = [], [], [], []
         o._cowork = lambda line: self.notes.append(line)
         o._notify = lambda text: self.pushes.append(text)
         o._notify_critical = lambda text: self.crit.append(text)   # критические инциденты → инбокс 1160
+        o._notify_topic = lambda topic, text: self.cards.append((topic, text))   # карточка подъёма (31.07)
+        o.RAISE_VERIFY_SEC = 0
         o._stopped = lambda: False
         self.tmp = tempfile.mkdtemp()
 
     def tearDown(self):
-        (o._cowork, o._notify, o._notify_critical, o._stopped) = self._save
+        (o._cowork, o._notify, o._notify_critical, o._stopped,
+         o._notify_topic, o.RAISE_VERIFY_SEC) = self._save
 
     def _spec(self, name, finder, logfile=None, skip=False):
         raises = []
@@ -2123,6 +2288,30 @@ class TestWatchdogClassFix(unittest.TestCase):
         self.assertEqual(len(sp["_raises"]), 1)
         self.assertEqual(st["userbot"]["deaths"], 1)
         self.assertTrue(any("вотчдог поднял userbot" in n for n in self.notes))
+
+    def test_b_downtime_measured_before_raise(self):
+        """КЛАСС-ФИКС 31.07: «сколько лежал» мерим ДО подъёма. Поднятый процесс пишет в свой лог
+        сразу, и прежний замер (после raiser'а) давал «лог 0с назад» — так строка журнала 30.07
+        про moderation_bot сообщила ноль о смерти, длившейся минуты."""
+        st = {}
+        logf = self._logfile("moderation_bot.log", age_sec=600)   # лежал 10 минут
+        raised = []
+
+        def raiser():
+            os.utime(logf, None)          # «новый процесс пишет в лог» — mtime становится свежим
+            raised.append(1)
+            return True, "moderation_bot запущен (PID 13104)."
+        sp = {"name": "moderation_bot", "finder": lambda: [], "raiser": raiser,
+              "logfile": logf, "skip": lambda: False}
+        o.client_watchdog_tick(now=self.NOW, specs=[sp], state=st, cooldown=0, max_deaths=3,
+                               grace_until=0, log_stale=120, blind_alarm=3,
+                               verify=lambda finder: [13104])
+        self.assertEqual(len(raised), 1)
+        text = (self.cards + self.crit)[0]
+        text = text[1] if isinstance(text, tuple) else text
+        self.assertIn("10 м 00 с", text)                          # честный простой
+        self.assertNotIn("лежал 0 с", text)
+        self.assertTrue(any("лежал 10 м 00 с" in n for n in self.notes))   # и в журнале то же число
 
     def test_b_fresh_log_vetoes_restart(self):
         """Свежий лог + нет PID → смерть НЕ доказана → рестарт отложен (третье условие)."""
