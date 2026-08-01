@@ -461,24 +461,33 @@ class TestReadText(Base):
             bw.read_text(name="нет_такого", env=ENV, get=self.bridge.get)
 
 
-# Ключи — как в ЖИВОМ реестре 01.08.2026 (29 доков + folder_id; `north_star` зарегистрирован
-# этим же заходом): только [a-z0-9_], ни одной заглавной, ни одного префикса KB_. Именно поэтому
-# рамка, зовущая доки титулами (KB_MASTER, KB_INFRA), получала unknown_name — правило-класс
-# «мок копирует живой формат».
+# Ключи — как в ЖИВОМ реестре 01.08.2026, ПОСЛЕ регистрации `master`/`trainer_log` (31 ключ +
+# folder_id, снято `--list-brain`): только [a-z0-9_], ни одной заглавной, ни одного префикса KB_.
+# Именно поэтому рамка, зовущая доки титулами (KB_MASTER, KB_INFRA), получала unknown_name —
+# правило-класс «мок копирует живой формат».
 LIVE_KEYS = ["booking_flow", "business_rules", "cc_log", "cc_log_archive", "cc_userbot_log",
              "collect_booking_spec", "cowork_log", "cowork_log_archive", "cowork_log_test",
              "cowork_log_test_archive", "executors_map", "faq", "index", "infra",
-             "knowledge_base", "north_star", "orchestrator_plan", "orchestrator_safety",
+             "knowledge_base", "master", "north_star", "orchestrator_plan", "orchestrator_safety",
              "park_list", "payments_plan", "project_state", "pulse", "review", "review_archive",
-             "rules", "sessions_log", "sessions_log_archive", "state_model", "turbobaby_faq"]
+             "rules", "sessions_log", "sessions_log_archive", "state_model", "trainer_log",
+             "turbobaby_faq"]
+
+# ДВА КЛЮЧА НА ОДИН ФАЙЛ — живой формат реестра, а не выдумка мока: `faq` и `turbobaby_faq`
+# держат один id с самого начала, `master` и `index` — с 01.08.2026. Мок обязан это повторять,
+# иначе тест «KB_MASTER открывает ТУ ЖЕ карту, что index» проверял бы два разных фейковых дока и
+# был бы зелёным при любом исходе. Отсюда же: 31 ключ ≠ 31 файл — их 29.
+SAME_FILE = {"master": "index", "turbobaby_faq": "faq"}
 
 
 class ResolveBase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.bridge = FakeBridge(docs={k.upper(): "тело " + k for k in LIVE_KEYS},
-                                 names={k: k.upper() for k in LIVE_KEYS})
+        names = {k: SAME_FILE.get(k, k).upper() for k in LIVE_KEYS}
+        self.bridge = FakeBridge(docs={k.upper(): "тело " + k for k in LIVE_KEYS
+                                       if k not in SAME_FILE},
+                                 names=names)
 
     def _res(self, name):
         return bw.resolve_name(name, env=ENV, get=self.bridge.get)
@@ -529,21 +538,49 @@ class TestResolveNames(ResolveBase):
         self.assertEqual(addr, {"name": "north_star"})
         self.assertEqual(self._res("north_star")[0], addr)   # тот же канон — тот же адрес
 
+    def test_title_kb_master_opens_the_same_file_as_index(self):
+        """ТОЧКА ВХОДА НОМЕР ОДИН. Титул карты Штаба — `KB_MASTER`, ключ у неё был `index`: имя и
+        ключ разошлись, и самое частое имя рамки давало `unknown_name`. Лечение — ДАННЫМИ, как у
+        орфана: 01.08.2026 на живом мосту заведён ВТОРОЙ ключ `master` на ТОТ ЖЕ файл (не переезд,
+        `index` цел). С этого момента титул ловится общим каноном (`kb_master` → `master`).
+        Проверяем не «резолвится», а ЧТО ОТКРЫВАЕТСЯ: адрес обязан вести в тот же файл, что
+        `index`, — иначе рамка читала бы карту, а писала мимо неё."""
+        addr, ref, note = self._res("KB_MASTER")
+        self.assertEqual(addr, {"name": "master"})
+        self.assertEqual(self.bridge.names["master"], self.bridge.names["index"])
+        self.assertEqual(bw.read_text(name="KB_MASTER", env=ENV, get=self.bridge.get),
+                         bw.read_text(name="index", env=ENV, get=self.bridge.get))
+
+    def test_sidecar_doc_is_caught_by_the_rule_once_it_has_a_key(self):
+        """`KB_trainer_log` жил по id из боевого сайдкара `trainer_log_doc.json` и в реестре не
+        значился. Ключ `trainer_log` заведён 01.08 тем же способом — строки данных в коде не
+        появилось, имя ловит канон."""
+        self.assertEqual(self._res("KB_trainer_log")[0], {"name": "trainer_log"})
+
+    def test_dead_name_lands_on_its_successor_and_this_is_deliberate(self):
+        """СЛЕДСТВИЕ РЕГИСТРАЦИИ `master`, названное вслух, а не замолчанное. Файл
+        `KB_ROADMAP_MASTER` удалён из Drive 27.06, содержимое перенесено в карту. Имя
+        `roadmap_master` до 01.08 честно отказывало; теперь оно совпадает с ключом `master` ПО
+        ГРАНИЦЕ ТОКЕНА (`roadmap_master`.endswith(`_master`)) и ведёт в карту — то есть ровно в
+        своего преемника. Это не угадывание: цель совпала с той, куда перенесено содержимое.
+        Тест держит следствие ЗАФИКСИРОВАННЫМ — чтобы оно оставалось решением, а не сюрпризом."""
+        self.assertEqual(self._res("roadmap_master")[0], {"name": "master"})
+        self.assertEqual(self.bridge.names["master"], self.bridge.names["index"])
+
     def test_addresses_that_need_data_refuse_honestly(self):
-        """ГРАНИЦА ПРАВИЛА, держится намеренно. Титул ≠ ключ (`KB_MASTER` при ключе `index`),
-        орфан без ключа (`roadmap_v2`), id из сайдкара (`KB_trainer_log`), мёртвое имя
-        (`roadmap_master`) — лексикой не выводятся. Пока данных нет, канал ОТКАЗЫВАЕТ вслух
-        и называет канон, а не угадывает док: словарь в коде разошёлся бы с реестром молча."""
-        for name in ("KB_MASTER", "roadmap_v2", "KB_trainer_log", "roadmap_master"):
-            with self.assertRaises(bw.BrainWriterError) as cm:
-                self._res(name)
-            self.assertIn("НЕ РАЗРЕШЕНО", str(cm.exception), name)
-            self.assertTrue(getattr(cm.exception, "verdict", False), name)
+        """ГРАНИЦА ПРАВИЛА, держится намеренно. Осталось одно имя: `roadmap_v2` — живой файл
+        (8 745 симв., проба 01.08 по id), но лежит ВНЕ папки Brain, в архивной подпапке, и мост
+        отказал регистрации фактом `not_in_brain`. Пока ключа нет, канал ОТКАЗЫВАЕТ вслух и
+        называет канон, а не угадывает док: словарь в коде разошёлся бы с реестром молча."""
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            self._res("roadmap_v2")
+        self.assertIn("НЕ РАЗРЕШЕНО", str(cm.exception))
+        self.assertTrue(getattr(cm.exception, "verdict", False))
 
     def test_refusal_names_the_cure_that_exists(self):
         """Отказ обязан назвать выход, который РАБОТАЕТ: регистрация ключа (проверена живьём)."""
         with self.assertRaises(bw.BrainWriterError) as cm:
-            self._res("KB_MASTER")
+            self._res("roadmap_v2")
         self.assertIn("--register", str(cm.exception))
 
     def test_unresolvable_name_says_what_it_tried(self):
@@ -598,8 +635,10 @@ class TestResolvedAddressIsUsedForWriteToo(ResolveBase):
         self.assertTrue(self.bridge.docs["INFRA"].startswith("НОВАЯ СТРОКА\n"))
 
     def test_unresolvable_name_never_reaches_write(self):
-        """Имя без адреса обязано умереть ДО write_doc: «непонятно куда» пишут в чужой док."""
-        for name in ("KB_MASTER", "roadmap_master", "KB_log"):
+        """Имя без адреса обязано умереть ДО write_doc: «непонятно куда» пишут в чужой док.
+        Три РАЗНЫХ причины отказа: нет ключа (`roadmap_v2`), голая подстрока (`KB_park`),
+        неоднозначность (`KB_log`)."""
+        for name in ("roadmap_v2", "KB_park", "KB_log"):
             with self.assertRaises(bw.BrainWriterError):
                 bw.append("НОВАЯ СТРОКА", name=name, env=ENV, get=self.bridge.get,
                           post=self.bridge.post, backup_dir=self._tmp.name)
