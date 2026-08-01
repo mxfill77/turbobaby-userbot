@@ -38,6 +38,11 @@ FAIL-SAFE ВСЕЙ ЗАПИСИ (как у kb_master_append_2307, теперь �
     это ОТКАЗ ЧТЕНИЯ, а не пустой док (тот же {"ok":true,"text":""} приходит и при сорванном
     чтении), а новый текст короче старого не пишется вовсе; осознанное сокращение объявляется
     явно — apply(…, allow_shrink=True);
+  • ОТВЕТ МОСТА ФАКТОМ ЗАПИСИ НЕ ЯВЛЯЕТСЯ (класс, 01.08.2026): тело POST-а Apps Script отдаёт
+    вторым плечом (`/exec` → 302 → `googleusercontent`), и падение ЭТОГО плеча неотличимо от
+    падения первого — а мутация к тому моменту уже зафиксирована. Живой случай: HTTP 404 при
+    ЛЁГШЕЙ записи. Поэтому отказ моста не обрывает проверку: судит ОБРАТНОЕ ЧТЕНИЕ, а «не
+    записано» говорится ТОЛЬКО когда док прочитан и не изменился (см. BrainWriterError.written);
   • ОБРАТНОЕ ЧТЕНИЕ: после записи док читается заново, текст сверяется ДОСЛОВНО, маркер
     считается (ровно 1), СВЕРЯЕТСЯ ДЛИНА (наличие строки не отличает «легло целиком» от
     «легло вместо дока»), возвращается фрагмент вокруг вставки — FACT, не «наверное»;
@@ -71,10 +76,20 @@ _FFFD = chr(0xFFFD)
 
 class BrainWriterError(RuntimeError):
     """Отказ канала с честной причиной; .code — код выхода CLI (1 конфиг/аргументы,
-    2 чтение, 3 якорь, 4 запись, 5 верификация обратным чтением, 6 гард усыхания)."""
-    def __init__(self, msg, code=1):
+    2 чтение, 3 якорь, 4 запись, 5 верификация обратным чтением, 6 гард усыхания).
+
+    .written — СУДЬБА ЗАПИСИ, а не причина отказа, и врать ей нельзя:
+      False — проверено, что в доке ничего не изменилось (повтор безопасен). Это дефолт,
+              потому что все отказы ДО POST-а (конфиг, адрес, чтение, якорь, гард усыхания)
+              именно таковы;
+      None  — исход НЕ ПОДТВЕРЖДЁН: POST ушёл, а расписка/обратное чтение не дали факта.
+              Слепой повтор здесь запрещён — там, где нет идемпотентности, он даёт дубль.
+    Разделение заведено 01.08.2026: CLI печатал «НЕ ЗАПИСАНО» на любом отказе, в том числе на
+    том, где запись ЛЕГЛА (живой случай — задача 166, HTTP 404 при легшем блоке)."""
+    def __init__(self, msg, code=1, written=False):
         super().__init__(msg)
         self.code = code
+        self.written = written
 
 
 # ------------------------------- конфиг (секреты) ----------------------------
@@ -257,8 +272,14 @@ def create_plain(name, key="", text="", env=None, post=None, get=None):
     try:
         r = (post or _post)(url, payload)
     except Exception as e:
-        raise BrainWriterError("create_brain_plain(%s) упал: %s: %s"
-                               % (name, type(e).__name__, e), 4)
+        # ТОТ ЖЕ КЛАСС, что у apply(): отказ мог прийти со второго плеча Apps Script, когда файл
+        # УЖЕ создан. Прочитать назад нечего — id приходит только с распиской, — поэтому здесь
+        # честный ответ ровно один: «не знаю». Цена ошибки выше, чем у append: создание
+        # НЕидемпотентно, слепой повтор кладёт в папку Brain второй файл тем же именем.
+        raise BrainWriterError("create_brain_plain(%s) — расписка не дошла (%s: %s): ИСХОД "
+                               "НЕИЗВЕСТЕН, файл мог уже лечь в папку Brain. Посмотри папку/реестр; "
+                               "СЛЕПОЙ ПОВТОР ДАСТ ДУБЛЬ" % (name, type(e).__name__, e), 4,
+                               written=None)
     if not (isinstance(r, dict) and r.get("ok")):
         raise BrainWriterError("create_brain_plain(%s) не ok: %s"
                                % (name, json.dumps(r, ensure_ascii=False)[:300]), 4)
@@ -272,11 +293,11 @@ def create_plain(name, key="", text="", env=None, post=None, get=None):
         back = _read(url, token, {"id": new_id}, "id:" + new_id, get, env=env)[0]
     except BrainWriterError as e:
         raise BrainWriterError("%s; но файл УЖЕ СОЗДАН (id %s) — проверь его, повтор создаст ДУБЛЬ"
-                               % (e, new_id), e.code)
+                               % (e, new_id), e.code, written=None)
     if _norm_eol(back) != _norm_eol(text):
         raise BrainWriterError("ОБРАТНОЕ ЧТЕНИЕ (id:%s): текст в доке НЕ совпал дословно "
                                "(отправляли %d символов, в доке %d) — файл создан, повтор даст ДУБЛЬ"
-                               % (new_id, len(text), len(back)), 5)
+                               % (new_id, len(text), len(back)), 5, written=None)
     # fffd в ответе — ЗАМЕР по живому файлу (после гарда входа обязан быть 0): отчёт владельцу
     # держится на числе, а не на «наверное, кодировка не побилась».
     return dict(r, verified=True, chars_back=len(back), fffd=back.count(_FFFD))
@@ -466,7 +487,11 @@ def _brain_admin_post(action, fields, ref, env=None, post=None):
     try:
         r = (post or _post)(url, dict(fields, action=action, token=token))
     except Exception as e:
-        raise BrainWriterError("%s упал: %s: %s" % (ref, type(e).__name__, e), 4)
+        # Тот же класс: реестр мог УЖЕ измениться, а расписка не дойти. Особенно у
+        # unregister_brain_doc — операция односторонняя, «упал» тут читался бы как «ключ на месте».
+        raise BrainWriterError("%s — расписка не дошла (%s: %s): ИСХОД НЕИЗВЕСТЕН, реестр мог уже "
+                               "измениться. Сверься с --list-brain ПЕРЕД повтором"
+                               % (ref, type(e).__name__, e), 4, written=None)
     if not isinstance(r, dict):
         raise BrainWriterError("%s: ответ не JSON-объект" % ref, 4)
     return r
@@ -531,47 +556,82 @@ def apply(mutate, doc_id="", name="", expect=None, marker=None,
         raise BrainWriterError("ЯКОРЬ НЕ ПРОШЁЛ (%s): %s — док НЕ тронут" % (ref, e), 3)
     if new is None or new == old:
         return {"status": "noop", "doc": ref, "backup": None, "back": old,
-                "before_chars": len(old), "after_chars": len(old), "fragment": ""}
+                "before_chars": len(old), "after_chars": len(old), "fragment": "",
+                "receipt": "none", "receipt_error": None}
     # ГАРД УСЫХАНИЯ (класс 17.07, образец cclog.py:200-203): молча укоротить док нельзя.
     if not allow_shrink and len(new) < len(old):
         raise BrainWriterError("ГАРД УСЫХАНИЯ (%s): новый текст короче старого (было %d символов, "
                                "стало бы %d) — НЕ пишу; осознанное сокращение объявляется "
                                "allow_shrink=True" % (ref, len(old), len(new)), 6)
     backup = _backup(old, backup_tag or (name or doc_id), backup_dir)
+    # ОТВЕТ МОСТА — НЕ ФАКТ ЗАПИСИ (класс, живой случай 01.08.2026: задача 166 — HTTP 404, а блок
+    # в KB_MASTER ЛЁГ; дубля не возникло только потому, что append идемпотентен).
+    # МЕХАНИЗМ, не гипотеза. Тело POST-а Apps Script отдаёт ВТОРЫМ ПЛЕЧОМ: `/exec` отвечает 302 на
+    # `script.googleusercontent.com/macros/echo`, urlopen идёт по редиректу внутри себя — и падение
+    # ЭТОГО плеча приходит сюда тем же исключением, что и падение первого. А мутация к тому моменту
+    # уже зафиксирована: writeDoc_ зовёт brainTextWrite_ и лишь ПОТОМ собирает {"ok":true}
+    # (копия прода — tmp/bridge_v75/ReadDocs.js). Значит код ответа описывает доставку РАСПИСКИ,
+    # а не судьбу записи; замер этой флакости — docs/artifacts/2026-07-28-journal-write-fixes.md §1.
+    # ПОЭТОМУ отказ моста больше не короткое замыкание: он ЗАПОМИНАЕТСЯ, а судит ОБРАТНОЕ ЧТЕНИЕ —
+    # оно одно отличает «не легло» (повтор безопасен) от «легло, потерялась расписка» (повтор даст
+    # дубль там, где идемпотентности нет). Сам POST не повторяем по-прежнему никогда.
+    receipt_err = None
     try:
         w = (post or _post)(url, dict(addr, action="write_doc", token=token, text=new))
     except Exception as e:
-        raise BrainWriterError("write_doc(%s) упал: %s: %s (бэкап: %s)"
-                               % (ref, type(e).__name__, e, backup), 4)
-    if not (isinstance(w, dict) and w.get("ok")):
-        raise BrainWriterError("write_doc(%s) не ok: %s (бэкап: %s)"
-                               % (ref, json.dumps(w, ensure_ascii=False)[:300], backup), 4)
+        receipt_err = "%s: %s" % (type(e).__name__, e)
+    else:
+        if not (isinstance(w, dict) and w.get("ok")):
+            receipt_err = json.dumps(w, ensure_ascii=False)[:300]
     # ОБРАТНОЕ ЧТЕНИЕ — верификация по живому доку, не по локальной склейке (адрес уже
     # разрешён выше; повторно разрешать нечего — resolve=False)
-    back = _read(url, token, addr, ref, get, env=env, resolve=False)[0]
+    try:
+        back = _read(url, token, addr, ref, get, env=env, resolve=False)[0]
+    except BrainWriterError as e:
+        # Оба канала факта молчат. Единственный честный ответ — «не знаю», а не «не записано».
+        raise BrainWriterError("%s; расписка моста%s. ИСХОД ЗАПИСИ НЕ ПОДТВЕРЖДЁН: судить по коду "
+                               "ответа нельзя, а чтение не удалось — посмотри док глазами, СЛЕПОЙ "
+                               "ПОВТОР ЗАПРЕЩЁН (бэкап: %s)"
+                               % (e, (" — ОТКАЗ (%s)" % receipt_err) if receipt_err else " была ok",
+                                  backup), e.code, written=None)
+    # «Док не изменился» — единственный признак «запись НЕ ЛЕГЛА», который можно предъявить как
+    # факт. Здесь и только здесь повтор безопасен, поэтому так и говорим.
+    if _norm_eol(back) == _norm_eol(old):
+        if receipt_err is not None:
+            raise BrainWriterError("write_doc(%s) не прошёл (%s); ОБРАТНОЕ ЧТЕНИЕ: док не изменился "
+                                   "(%d символов) — запись НЕ ЛЕГЛА, повтор безопасен (бэкап: %s)"
+                                   % (ref, receipt_err, len(back), backup), 4)
+        raise BrainWriterError("ОБРАТНОЕ ЧТЕНИЕ (%s): мост ответил ok, а док НЕ ИЗМЕНИЛСЯ "
+                               "(%d символов) — запись не легла (бэкап: %s)"
+                               % (ref, len(back), backup), 5)
     # СВЕРКА ДЛИНЫ. Проверка «expect есть в тексте» НЕ отличает «легло целиком» от «легло ВМЕСТО
     # дока»: усечённый док тоже содержит новую строку. Сравниваем с длиной ДО записи и с длиной
     # отправленного (последнее — с запасом _READBACK_SLACK на нормализацию хвоста в Docs).
+    # Ниже док УЖЕ не тот, что был: любой отказ здесь — «записано не то», а не «не записано».
+    # Отсюда written=None: слепой повтор поверх нештатного состояния запрещён.
     if not allow_shrink and len(back) < len(old):
         raise BrainWriterError("ОБРАТНОЕ ЧТЕНИЕ (%s): док УКОРОТИЛСЯ — было %d символов, стало %d "
-                               "(бэкап: %s)" % (ref, len(old), len(back), backup), 5)
+                               "(бэкап: %s)" % (ref, len(old), len(back), backup), 5, written=None)
     if len(back) < len(new) - _READBACK_SLACK:
         raise BrainWriterError("ОБРАТНОЕ ЧТЕНИЕ (%s): отправляли %d символов, в доке %d — запись "
                                "легла НЕ ЦЕЛИКОМ (бэкап: %s)"
-                               % (ref, len(new), len(back), backup), 5)
+                               % (ref, len(new), len(back), backup), 5, written=None)
     if expect is not None and expect not in back:
         raise BrainWriterError("ОБРАТНОЕ ЧТЕНИЕ (%s): текст в доке НЕ найден дословно — "
-                               "разберись перед повтором (бэкап: %s)" % (ref, backup), 5)
+                               "разберись перед повтором (бэкап: %s)" % (ref, backup), 5, written=None)
     if marker is not None and back.count(marker) != 1:
         raise BrainWriterError("ОБРАТНОЕ ЧТЕНИЕ (%s): маркер встречается %d раз, ожидал 1 "
-                               "(бэкап: %s)" % (ref, back.count(marker), backup), 5)
+                               "(бэкап: %s)" % (ref, back.count(marker), backup), 5, written=None)
     probe = marker if marker is not None else expect
     fragment = ""
     if probe:
         i = back.find(probe)
         fragment = back[max(0, i - 200):i + len(expect or probe) + 120]
+    # receipt — судьба РАСПИСКИ, а не записи: «lost» значит «мост ответил отказом, а запись легла и
+    # подтверждена чтением». Отдаём наружу, чтобы отчёт владельцу назвал это словом, а не молчал.
     return {"status": "ok", "doc": ref, "backup": backup, "back": back,
-            "before_chars": len(old), "after_chars": len(back), "fragment": fragment}
+            "before_chars": len(old), "after_chars": len(back), "fragment": fragment,
+            "receipt": "lost" if receipt_err else "ok", "receipt_error": receipt_err}
 
 
 # ------------------------------- дозапись (интерфейс) ------------------------
@@ -633,7 +693,7 @@ def append(text, doc_id="", name="", anchor=None, place=None, require_above=None
         if cnt != 1:
             raise BrainWriterError("ОБРАТНОЕ ЧТЕНИЕ (%s): текст лёг %d раз(а) цельными "
                                    "строками, ожидал 1 (бэкап: %s)"
-                                   % (res["doc"], cnt, res["backup"]), 5)
+                                   % (res["doc"], cnt, res["backup"]), 5, written=None)
     return res
 
 
@@ -743,7 +803,13 @@ def main(argv=None):
         res = append(text, doc_id=a.doc_id, name=a.name, anchor=a.anchor, place=a.place,
                      require_above=a.require_above, backup_tag=a.backup_tag)
     except BrainWriterError as e:
-        sys.stderr.buffer.write(("ОШИБКА: %s\nНЕ ЗАПИСАНО.\n" % e).encode("utf-8"))
+        # «НЕ ЗАПИСАНО» — УТВЕРЖДЕНИЕ О ФАКТЕ, и печатать его можно только там, где факт проверен
+        # чтением (written=False). Раньше строка стояла на любом отказе — и на 404 с легшей
+        # записью тоже; ровно она и толкала исполнителя на повтор.
+        verdict = ("НЕ ЗАПИСАНО (проверено обратным чтением: док не изменился)."
+                   if e.written is False else
+                   "ИСХОД ЗАПИСИ НЕ ПОДТВЕРЖДЁН — проверь док глазами, СЛЕПОЙ ПОВТОР ЗАПРЕЩЁН.")
+        sys.stderr.buffer.write(("ОШИБКА: %s\n%s\n" % (e, verdict)).encode("utf-8"))
         return e.code
     if res["status"] == "noop":
         _out("уже в доке (%s) — no-op, идемпотентность (док %d символов)"
@@ -751,6 +817,9 @@ def main(argv=None):
         return 0
     _out("записано в %s: %d → %d символов; бэкап: %s"
          % (res["doc"], res["before_chars"], res["after_chars"], res["backup"]))
+    if res.get("receipt") == "lost":
+        _out("МОСТ ОТВЕТИЛ ОТКАЗОМ (%s) — но потеряна РАСПИСКА, А НЕ ЗАПИСЬ: обратное чтение "
+             "подтверждает, что текст в доке. Повторять НЕ НУЖНО." % res["receipt_error"])
     _out("ОБРАТНОЕ ЧТЕНИЕ OK: текст дословно на месте (вхождение 1 раз)")
     _out("--- фрагмент вокруг вставки ---")
     _out(res["fragment"])

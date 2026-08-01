@@ -12,6 +12,7 @@ import io
 import os
 import tempfile
 import unittest
+import urllib.error
 
 # Разведение тестового и боевого контекста ДО импорта модуля (идиом test_pretool_guard):
 # заодно включает гард тестового контекста самого brain_writer (живой док не трогаем).
@@ -32,6 +33,17 @@ class FakeBridge:
         self.fail_write = False
         self.lie_on_write = None     # Bridge «ок», но в док легло другое (ловля обратным чтением)
         self.lie_on_create = None    # то же для СОЗДАНИЯ: ok+id вернулся, а в файле не тот текст
+        # ПОТЕРЯ РАСПИСКИ — живой формат отказа, а не выдуманный: Apps Script отдаёт тело POST-а
+        # вторым плечом (`/exec` → 302 → googleusercontent), и 404 ЭТОГО плеча прилетает из
+        # urlopen ровно как HTTPError, когда запись уже легла. Поэтому мок сначала МЕНЯЕТ док и
+        # только потом бросает — иначе он проверял бы не тот разрыв (правило-класс «мок = живой
+        # формат»). None → плечо цело; число → код HTTP.
+        self.lose_receipt = None
+        self.drop_write = False      # запись НЕ доходит вовсе (первое плечо) — док не тронут
+        self.fail_readback = False   # обратное чтение недоступно: исход неизвестен
+
+    def _raise_http(self, code):
+        raise urllib.error.HTTPError("https://bridge.test/exec", code, "Not Found", {}, None)
 
     def _resolve(self, params):
         if params.get("id"):
@@ -42,6 +54,8 @@ class FakeBridge:
         self.reads.append(dict(params))
         if params.get("action") == "list_brain":       # живой формат doGet.list_brain: манифест целиком
             return {"ok": True, "manifest": dict(self.names, folder_id="FOLDER")}
+        if self.fail_readback and self.writes:         # чтение отвалилось ПОСЛЕ записи
+            self._raise_http(503)
         did = self._resolve(params)
         if did is None or did not in self.docs:
             return {"ok": False, "error": "unknown_name", "known": sorted(self.names)}
@@ -60,10 +74,14 @@ class FakeBridge:
                     "id": nid, "chars": len(text)}
         if self.fail_write:
             return {"ok": False, "error": "write_failed", "message": "getFileById"}
+        if self.drop_write:                            # первое плечо: до Apps Script не дошли
+            self._raise_http(404)
         did = self._resolve(payload)
         if did is None:
             return {"ok": False, "error": "unknown_name", "known": sorted(self.names)}
         self.docs[did] = payload["text"] if self.lie_on_write is None else self.lie_on_write
+        if self.lose_receipt is not None:              # мутация зафиксирована, расписка потеряна
+            self._raise_http(self.lose_receipt)
         return {"ok": True, "chars": len(payload["text"])}
 
 
@@ -189,6 +207,88 @@ class TestFailSafe(Base):
         with self.assertRaises(bw.BrainWriterError) as cm:
             bw.apply(lambda old: old + "x", name="cowork_log", env=ENV)
         self.assertIn("тестовый контекст", str(cm.exception))
+
+
+class TestReceiptIsNotTheFact(Base):
+    """ОТВЕТ МОСТА ≠ СУДЬБА ЗАПИСИ (класс, живой случай 01.08.2026: задача 166 — HTTP 404, а блок
+    в KB_MASTER ЛЁГ). Регресс ровно на развилку: легло → успех, не легло → ошибка, неизвестно →
+    так и сказано. Раньше все три случая давали одно «НЕ ЗАПИСАНО» — и толкали на повтор."""
+
+    def test_landed_write_with_lost_receipt_is_reported_as_success(self):
+        self.bridge.lose_receipt = 404          # мутация зафиксирована, 404 пришёл со второго плеча
+        res = self._append("NOTE блок задачи 166", name="cowork_log")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["receipt"], "lost")          # потеряна расписка, а не запись
+        self.assertIn("404", res["receipt_error"])
+        self.assertIn("NOTE блок задачи 166", self.bridge.docs["FID1"])
+
+    def test_lost_receipt_does_not_weaken_idempotency(self):
+        # повтор после потерянной расписки обязан остаться пустой операцией, а не дублем
+        self.bridge.lose_receipt = 404
+        self._append("NOTE блок задачи 166", name="cowork_log")
+        self.bridge.lose_receipt = None
+        res = self._append("NOTE блок задачи 166", name="cowork_log")
+        self.assertEqual(res["status"], "noop")
+        self.assertEqual(self.bridge.docs["FID1"].count("NOTE блок задачи 166"), 1)
+
+    def test_write_that_never_landed_still_errors(self):
+        # второй конец развилки: до Apps Script не дошли вовсе — док не тронут, ошибка обязана быть
+        self.bridge.drop_write = True
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            self._append("НЕДОШЕДШАЯ-166", name="cowork_log")   # текста нет в фикстуре: ищем ЕГО, а не подстроку
+        self.assertEqual(cm.exception.code, 4)
+        self.assertIs(cm.exception.written, False)        # проверено чтением, повтор безопасен
+        self.assertIn("НЕ ЛЕГЛА", str(cm.exception))
+        self.assertNotIn("НЕДОШЕДШАЯ-166", self.bridge.docs["FID1"])
+
+    def test_bridge_ok_but_doc_untouched_is_caught(self):
+        # обратная ложь моста: расписка ok, а док не изменился — по коду ответа неотличимо от успеха
+        self.bridge.lie_on_write = self.bridge.docs["FID1"]
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            self._append("строка", name="cowork_log")
+        self.assertEqual(cm.exception.code, 5)
+        self.assertIn("НЕ ИЗМЕНИЛСЯ", str(cm.exception))
+
+    def test_unknown_outcome_is_named_unknown_not_failure(self):
+        # оба канала факта молчат: расписки нет и дочитаться нельзя. Врать в любую сторону нельзя
+        self.bridge.lose_receipt = 404
+        self.bridge.fail_readback = True
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            self._append("строка", name="cowork_log")
+        self.assertIsNone(cm.exception.written)
+        self.assertIn("НЕ ПОДТВЕРЖДЁН", str(cm.exception))
+        self.assertIn("СЛЕПОЙ ПОВТОР ЗАПРЕЩЁН", str(cm.exception))
+        self.assertIn("бэкап", str(cm.exception))
+
+    def test_cli_claims_not_written_only_when_it_read_the_doc(self):
+        # ровно та строка, что толкала исполнителя на повтор: CLI печатал «НЕ ЗАПИСАНО» на любом отказе
+        import contextlib
+
+        def run(err):
+            buf = io.BytesIO()
+            stub = type("S", (), {"buffer": buf, "write": lambda self, s: None})()
+            with contextlib.redirect_stderr(stub):
+                real, bw.append = bw.append, self._raiser(err)
+                try:
+                    code = bw.main(["--name", "cowork_log", "строка"])
+                finally:
+                    bw.append = real
+            return code, buf.getvalue().decode("utf-8")
+
+        code, out = run(bw.BrainWriterError("док не изменился", 4, written=False))
+        self.assertEqual(code, 4)
+        self.assertIn("НЕ ЗАПИСАНО (проверено обратным чтением", out)
+
+        code, out = run(bw.BrainWriterError("чтение не удалось", 5, written=None))
+        self.assertEqual(code, 5)
+        self.assertNotIn("НЕ ЗАПИСАНО", out)
+        self.assertIn("НЕ ПОДТВЕРЖДЁН", out)
+
+    @staticmethod
+    def _raiser(err):
+        def _f(*a, **kw):
+            raise err
+        return _f
 
 
 class TestCreatePlain(Base):
