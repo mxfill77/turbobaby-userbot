@@ -314,7 +314,7 @@ class TestShrinkGuard(unittest.TestCase):
 
     def test_shorter_result_blocks_write_and_spools(self):
         self._bridge_returns("A" * 5000)
-        cla.compose = lambda new_line, pending, old: "коротышка"   # аномальная сборка
+        cla.compose = lambda new_line, pending, old: ("коротышка", 0)   # аномальная сборка
         exc, err = self._run_main()
         self.assertEqual(exc.code, 1)
         self.assertEqual(self.writes, [])
@@ -331,6 +331,51 @@ class TestShrinkGuard(unittest.TestCase):
         self.assertTrue(sent.startswith(self.LINE))         # новейшее сверху
         self.assertTrue(sent.endswith("A" * 5000))          # прежний текст цел
         self.assertEqual(cla.spool_read(), [])              # спул вычищен
+
+    def test_spooled_line_already_in_doc_is_not_written_twice(self):
+        """КЛАСС «ЛОЖНЫЙ 401» (живой случай 01.08.2026). Мост рапортует отказ ПОСЛЕ того, как
+        строка легла в док; она уходит в спул — и досылка дописывала её ВТОРОЙ раз. Дубль в
+        журнале хуже пропуска: журнал — индекс, по нему считают и ищут."""
+        landed = "DONE 2026-08-01 08:04 UTC: ARTIFACT тема → docs/artifacts/x.md: суть"
+        cla.spool_add(landed)
+        self._bridge_returns(landed + "  \n" + "A" * 5000)   # он УЖЕ в доке
+        exc, _ = self._run_main()
+        self.assertIsNone(exc)
+        sent = self.writes[0]["text"]
+        self.assertEqual(sent.count(landed), 1)             # был один раз — один и остался
+        self.assertTrue(sent.startswith(self.LINE))         # новая строка всё равно легла
+        self.assertEqual(cla.spool_read(), [])
+
+    def test_spooled_line_absent_from_doc_is_still_delivered(self):
+        """Обратная половина: дедуп не смеет съесть строку, которой в доке НЕТ."""
+        lost = "NOTE 2026-08-01 07:00 UTC: строка, до дока НЕ дошедшая"
+        cla.spool_add(lost)
+        self._bridge_returns("A" * 5000)
+        exc, _ = self._run_main()
+        self.assertIsNone(exc)
+        sent = self.writes[0]["text"]
+        self.assertIn(lost, sent)
+        self.assertEqual(cla.spool_read(), [])
+
+    def test_dedup_matches_whole_lines_only(self):
+        """Совпадение — ЦЕЛЬНОЙ строкой. Короткая запись, оказавшаяся подстрокой чужой длинной,
+        дублем не считается — иначе досылка молча теряла бы её."""
+        short = "DONE 2026-08-01 07:30 UTC: коротко"
+        cla.spool_add(short)
+        self._bridge_returns(short + " и ещё хвост чужой строки\n" + "A" * 5000)
+        exc, _ = self._run_main()
+        self.assertIsNone(exc)
+        self.assertIn(short + "  \n", self.writes[0]["text"])   # дослана отдельной строкой
+
+    def test_trailing_spaces_do_not_hide_a_duplicate(self):
+        """Разделитель склейки — два пробела перед переводом строки. Дубль обязан опознаваться
+        и с ними: иначе дедуп не сработал бы ровно на том, что пишет сам этот модуль."""
+        landed = "DONE 2026-08-01 08:04 UTC: строка с хвостом"
+        cla.spool_add(landed)
+        self._bridge_returns(landed + "  \n" + "A" * 5000)
+        exc, _ = self._run_main()
+        self.assertIsNone(exc)
+        self.assertEqual(self.writes[0]["text"].count(landed), 1)
 
     def test_multiline_message_becomes_one_record(self):
         """ОДНА запись = ОДНА строка: многострочный result не смеет рвать разбор по заголовкам."""
