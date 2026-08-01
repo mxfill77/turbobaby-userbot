@@ -297,7 +297,9 @@ class TestHumanCards(unittest.TestCase):
 
 
 class TestMarkerDedup(unittest.TestCase):
-    """PRETOOL_ASK_MARKER: дедуп карточек. claude мог ретраить красное → карточка набегала ×5.
+    """PRETOOL_ASK_MARKER: ЛАТЧ первой красной операции прогона (до 01.08.2026 — дедуп по телу
+    блока; claude мог ретраить красное, и карточка набегала ×5). Латч закрывает и повтор, и
+    вторую РАЗНУЮ операцию — см. `test_write_marker_latches_on_the_first_card`.
 
     ЧИТАЕМ ЧЕРЕЗ `g.marker_path(mk)`, а не по сырому пути: с 01.08.2026 писатель маркера сам
     разводит боевой и ПРОБНЫЙ путь (изоляция проб, `test_probe_isolation.py`). В обычном прогоне
@@ -327,16 +329,26 @@ class TestMarkerDedup(unittest.TestCase):
             except Exception:
                 pass
 
-    def test_write_marker_keeps_distinct_cards(self):
+    def test_write_marker_latches_on_the_first_card(self):
+        """ОДНА КАРТОЧКА — ОДНА ОПЕРАЦИЯ (01.08.2026, корень В). ИНВАРИАНТ ПЕРЕВЁРНУТ.
+
+        Тест назывался `test_write_marker_keeps_distinct_cards` и требовал, чтобы РАЗНЫЕ карточки
+        одного прогона копились в маркере. Дедуп по телу блока при этом ловил повтор, а вторую
+        РАЗНУЮ операцию пропускал — отсюда карточки 144/145, где «да» на лёгкую часть открывало
+        тяжёлую. Теперь латч закрывает оба случая разом: и повтор, и вторую операцию.
+
+        Писатель ОТЧИТЫВАЕТСЯ о решении (True/False) — на этом держится глушение канала 1 в
+        `_emit_ask`: карточка в личку без блока в маркере звала бы владельца решать по тому, чего
+        в подтверждаемой карточке нет."""
         mk = self._tmp_marker()
         try:
-            g._write_marker(mk, "🔴 карточка A — разрешить?")
-            g._write_marker(mk, "🔴 карточка B — разрешить?")
-            g._write_marker(mk, "🔴 карточка A — разрешить?")   # повтор A не добавляется
+            self.assertTrue(g._write_marker(mk, "🔴 карточка A — разрешить?"))
+            self.assertFalse(g._write_marker(mk, "🔴 карточка B — разрешить?"))
+            self.assertFalse(g._write_marker(mk, "🔴 карточка A — разрешить?"))
             with open(g.marker_path(mk), encoding="utf-8") as f:
                 content = f.read()
             self.assertEqual(content.count("карточка A"), 1)
-            self.assertEqual(content.count("карточка B"), 1)   # разные карточки сохраняются
+            self.assertNotIn("карточка B", content)   # вторая операция карточки не выписывает
         finally:
             try:
                 os.remove(mk)
@@ -2068,8 +2080,16 @@ class TestOwnerApprovalMarker(unittest.TestCase):
             self.assertEqual(self._role(cmd, {g.APPROVED_KINDS_ENV: junk})[0], "ask", junk)
         self.assertEqual(g.owner_approved_kinds({g.APPROVED_KINDS_ENV: "env, delete , *"}),
                          frozenset())
+        # ОДИН ОТВЕТ — ОДИН КЛАСС (01.08.2026, корень В). Прежде эта же строка возвращала ОБА
+        # вида: талон на два класса считался законным. Живая цена — карточка 145: «да» на неё
+        # вернуло бы в гард `delete,env`, то есть удаление И доступ к секретам одним нажатием.
+        # Регистр и пробелы по-прежнему не важны — их проверяет однокласовый случай ниже.
         self.assertEqual(g.owner_approved_kinds({g.APPROVED_KINDS_ENV: " ENV , delete "}),
-                         frozenset({"env", "delete"}))
+                         frozenset())
+        self.assertEqual(g.owner_approved_kinds({g.APPROVED_KINDS_ENV: "  ENV  "}),
+                         frozenset({"env"}))
+        self.assertEqual(g.owner_approved_kinds({g.APPROVED_KINDS_ENV: "env,env"}),
+                         frozenset({"env"}))     # повтор одного вида талоном на два не делает
         self.assertEqual(g.owner_approved_kinds({}), frozenset())
 
     def test_approval_covers_each_doctrinal_kind_but_only_itself(self):
@@ -2146,14 +2166,31 @@ class TestOwnerApprovalMarker(unittest.TestCase):
                     "op = read_secret | подсмотреть"):
             self.assertEqual(g.kinds_from_card(txt), frozenset(), repr(txt))
 
-    def test_kinds_from_card_multi(self):
-        """Маркер ПК МНОГОБЛОЧНЫЙ: две настоящие красные операции одного прогона дают два штампа,
-        и оба обязаны прочитаться. Форма — та, что реально складывается в файле-маркере (штамп в
-        хвосте КАЖДОГО блока). Прежняя синтетика «два голых штампа подряд» местом гарда не
-        является и с 31.07.2026 классом не читается — см. `TestKindStampOrigin`."""
+    def test_kinds_from_card_reads_only_the_first_block(self):
+        """ОДНА КАРТОЧКА — ОДНА ОПЕРАЦИЯ (01.08.2026, корень В). ИНВАРИАНТ ПЕРЕВЁРНУТ НАМЕРЕННО.
+
+        До этой правки тест назывался `test_kinds_from_card_multi` и требовал ОБРАТНОГО:
+        «маркер многоблочный, два штампа обязаны прочитаться оба». Свойство было запиннуто, и
+        именно поэтому его снимают тестом, а не молча. Живая цена свойства — карточки 144 и 145
+        вечера 31.07: согласие на лёгкую часть (листинг каталога; уборка черновика, от которой
+        отказались через 5 секунд) становилось согласием на тяжёлую (боевая запись Bridge; доступ
+        к секретам), потому что демон складывал блоки прогона в ОДНУ карточку и брал классы со
+        ВСЕХ. Обе пришлось отклонить, работа обеих задач пропала.
+
+        Теперь маркер несёт один блок по построению (`_write_marker` → латч), а читатель — второй
+        пояс того же правила: класс берётся из ПЕРВОГО блока, то есть той операции, чью голову
+        владелец и прочитал в уведомлении. Склеенная карточка СТАРОГО образца (ниже — дословно
+        такая) читается так же: по своей голове, а не по сумме блоков."""
         txt = (g._card("env", ".env", "cat x") + "\n" + g.KIND_LINE_PREFIX + "env" + "\n"
                + g._card("delete", "tmp/x", "rm -r tmp/x") + "\n" + g.KIND_LINE_PREFIX + "delete")
-        self.assertEqual(g.kinds_from_card(txt), frozenset({"env", "delete"}))
+        self.assertEqual(g.kinds_from_card(txt), frozenset({"env"}))
+        # порядок блоков решает: класс — у ПЕРВОГО, а не «какой найдётся»
+        rev = (g._card("delete", "tmp/x", "rm -r tmp/x") + "\n" + g.KIND_LINE_PREFIX + "delete"
+               + "\n" + g._card("env", ".env", "cat x") + "\n" + g.KIND_LINE_PREFIX + "env")
+        self.assertEqual(g.kinds_from_card(rev), frozenset({"delete"}))
+        # штамп, называющий два вида в ОДНОЙ строке, одобрением не становится вовсе (fail-closed)
+        self.assertEqual(g.kinds_from_card(g._card("env", ".env", "cat x") + "\n"
+                                           + g.KIND_LINE_PREFIX + "env, delete"), frozenset())
 
 
 class TestKindStampOrigin(unittest.TestCase):
@@ -2250,14 +2287,21 @@ class TestKindStampOrigin(unittest.TestCase):
         self.assertLess(len(g._card("write_outside", "C:/ProgramData/x.txt", "")), 400)  # живая
         self.assertEqual(g._fit_body_under_stamp("короткая карточка"), "короткая карточка")
 
-    def test_honest_multi_block_marker_keeps_both_classes(self):
-        """ГРАНИЦА: маркер ПК МНОГОБЛОЧНЫЙ. Две настоящие красные операции одного прогона дают
-        два законных штампа, и правка обязана сохранить ОБА (серверный рецепт «класс только из
-        последней строки» на ПК сломал бы штатный случай)."""
+    def test_second_red_of_the_run_gets_no_card(self):
+        """ГРАНИЦА, ПЕРЕВЁРНУТАЯ 01.08.2026 (корень В). Тест назывался
+        `test_honest_multi_block_marker_keeps_both_classes` и требовал, чтобы две красные операции
+        одного прогона дали ДВА законных штампа. Ровно это и склеивало карточки 144/145.
+
+        Теперь: первая красная операция прогона — последняя. Вторая в маркер не пишется вовсе
+        (писатель возвращает False), значит и класса своего не приносит. Операция при этом НЕ
+        исполняется: её решение — по-прежнему `ask`, просто карточки владельцу у неё нет; она
+        придёт своей карточкой на следующем заходе, с собственным объектом и собственным «да»."""
         body = self._through_marker(
             (g._card("write_outside", "C:/ProgramData/x.txt", ""), "write_outside"),
             (g._card("edit_claude", ".claude/settings.json", ""), "edit_claude"))
-        self.assertEqual(g.kinds_from_card(body), frozenset({"write_outside", "edit_claude"}))
+        self.assertEqual(g.kinds_from_card(body), frozenset({"write_outside"}))
+        self.assertNotIn("edit_claude", body)
+        self.assertEqual(body.count(g.KIND_LINE_PREFIX), 1)
 
 
 class TestObjectFieldOrigin(unittest.TestCase):
@@ -3505,6 +3549,120 @@ class TestObjectIsTheTargetNotTheAction(unittest.TestCase):
                 self.assertIn("Объект: " + obj, g._card(kind, obj, cmd))
         # деталь `py_write`, не являющаяся именем операции, тоже остаётся как была
         self.assertEqual(g.card_object("py_write", "-m pip", "python -m pip install x"), "-m pip")
+
+
+class TestOneCardOneOperation(unittest.TestCase):
+    """КОРЕНЬ В на ЖИВОМ ФОРМАТЕ: одна карточка — одна операция (правка 01.08.2026).
+
+    Команды взяты ДОСЛОВНО из `pretool_guard.log` вечера 31.07 — из двух карточек, которые
+    владельцу пришлось отклонить, потеряв работу обеих задач:
+      • 144 (02:46:27 / 02:55:56): безобидный листинг каталога СКЛЕИЛСЯ с боевой записью Bridge.
+        Голова уведомления — про листинг, тяжёлая часть вторым блоком и в превью не видна;
+      • 145 (03:30:12 / 03:38:05): уборка собственного черновика `tmp/srv-audit`, от которой
+        отказались через 5 секунд, СКЛЕИЛАСЬ с доступом к секретам восемью минутами позже.
+    Замер до правки: одно «да N» на такую карточку открывало ДВА класса. После — ОДИН.
+
+    Второй блок карточки 144 сегодня с диска не воспроизводится (живой `tmp/probe_check.py` был
+    переписан и позеленел в 02:56:24 — это есть в логе), поэтому его ФОРМА восстановлена
+    фикстурой: боевой вызов записи Bridge в теле питон-скрипта. Значения заведомо невозможные."""
+
+    # дословно из pretool_guard.log.1, строки 9731 / 9914 / 10139
+    C144_LS = ('ls -a /d/turbobaby-bot/tmp/srv | grep -iE "^\\.env|^\\.claude" ; '
+               'echo "--- .env present? ---"; '
+               'test -f /d/turbobaby-bot/tmp/srv/.env && echo YES || echo NO')
+    C145_RM = ('rm -rf tmp/srv-audit 2>/dev/null; git clone --depth 50 '
+               'https://github.com/mxfill77/turbobaby-manager-bot.git tmp/srv-audit 2>&1 | '
+               'tail -5; echo "EXIT=$?"; ls tmp/srv-audit | head -40')
+    C145_ENV = ('cd D:/turbobaby-bot && grep -n "AGENT_BOT_TOKEN\\|BRIDGE_TOKEN" .env '
+                '2>/dev/null | sed \'s/=.*/=<REDACTED>/\' | head -20')
+    TOKEN = "one-card-one-op"
+
+    def _run(self, steps):
+        """Прогон целиком, как его видит демон: N красных шагов → тело файла-маркера."""
+        fd, mk = tempfile.mkstemp(suffix=".marker")
+        os.close(fd)
+        try:
+            os.environ[g.MARKER_TOKEN_ENV] = self.TOKEN
+            for kind, obj, cmd in steps:
+                g._write_marker(mk, g._card(kind, obj, cmd), kind)
+            with open(g.marker_path(mk), encoding="utf-8") as f:
+                body = f.read()
+        finally:
+            os.environ.pop(g.MARKER_TOKEN_ENV, None)
+            os.remove(mk)
+        return body.replace(self.TOKEN + g.MARKER_SEP, "")
+
+    def _classes_opened(self, body):
+        """Сколько классов ОТКРЫВАЕТ одно «да N»: путь целиком — карточка → демон → env → гард."""
+        kinds = g.kinds_from_card(body)
+        return g.owner_approved_kinds({g.APPROVED_KINDS_ENV: ",".join(sorted(kinds))})
+
+    def test_card_144_shape_opens_exactly_one_class(self):
+        """Пара «ложное красное + боевая запись Bridge» — одним ответом одна операция."""
+        body = self._run((("env", ".env", self.C144_LS),
+                          ("py_write", "create_booking", "python probe_check.py")))
+        self.assertEqual(len(self._classes_opened(body)), 1)
+        self.assertEqual(self._classes_opened(body), frozenset({"env"}))
+        self.assertNotIn("create_booking", body)     # вторая операция карточки не выписала
+
+    def test_card_145_pair_opens_exactly_one_class(self):
+        """Пара «уборка черновика + доступ к секретам» — одним ответом одна операция."""
+        body = self._run((("delete", "tmp/srv-audit", self.C145_RM),
+                          ("env", ".env", self.C145_ENV)))
+        self.assertEqual(len(self._classes_opened(body)), 1)
+        self.assertNotIn("env", self._classes_opened(body))   # первым стоял `delete`
+
+    def test_honest_single_card_works_as_before(self):
+        """РЕГРЕСС В ДРУГУЮ СТОРОНУ: честная одиночная карточка не задета ни на байт."""
+        cmd = "schtasks /change /tn TurboBabyRC /disable"
+        body = self._run((("schtasks", "TurboBabyRC", cmd),))
+        self.assertEqual(self._classes_opened(body), frozenset({"schtasks"}))
+        self.assertEqual(body.count(g.KIND_LINE_PREFIX), 1)
+        self.assertIn("Объект: TurboBabyRC", body)
+        self.assertEqual(g.object_from_card(body), "TurboBabyRC")
+
+    def test_number_counts_what_is_really_in_the_command(self):
+        """ПОЛЕ «ЧИСЛО» — про команду, а не про сумму намерений разборщика.
+
+        Карточка 145 говорила «Число: 2 цели» при ОДНОМ пути в команде: вторым «путём» шло
+        перенаправление `2>/dev/null`. Цена не косметическая — фантомная цель лежит ВНЕ временной
+        зоны, поэтому уборка собственного черновика в `tmp/` краснела карточкой высшего вида."""
+        targets, recurse, mask = g._delete_scan(self.C145_RM)
+        self.assertEqual(targets, ["tmp/srv-audit"])
+        self.assertTrue(recurse)
+        self.assertFalse(mask)
+        self.assertEqual(g._card_fields("delete", "tmp/srv-audit", self.C145_RM)[1], "1 цель")
+        # и следствие: уборка ЧЕРНОВИКА во временной зоне карточки больше не стоит
+        self.assertTrue(g._delete_targets_all_temp(self.C145_RM))
+        self.assertFalse(g._stays_red("delete", "tmp/srv-audit", self.C145_RM))
+        # формы перенаправления, каждая из которых целью не является
+        for cmd, want in (("rm -f a.log 2>/dev/null", ["a.log"]),
+                          ("rm -f a.log > out.txt", ["a.log"]),
+                          ("rm -f a.log >out.txt 2>&1", ["a.log"]),
+                          ("rm -f a.log < in.txt", ["a.log"]),
+                          ("rm -f a.log b.log 2>/dev/null", ["a.log", "b.log"])):
+            with self.subTest(cmd):
+                self.assertEqual(g._delete_scan(cmd)[0], want)
+        # НЕ ослабили: настоящее массовое удаление вне временной зоны красное как было
+        self.assertTrue(g._stays_red("delete", "docs", "rm -rf docs/ 2>/dev/null"))
+
+    def test_second_operation_of_the_same_line_is_named(self):
+        """Склейка ПО КОМАНДЕ: вторая красная операция ОДНОЙ строки названа прямо в карточке.
+
+        Отказом её не делаем — замер по 5938 живым командам суток: красное в РАЗНЫХ сегментах
+        встретилось 1 раз (0,02%), а «два вида на одно действие» — 30 раз (0,51%), и отказ бил бы
+        по вторым. Но классом одобрения вторая операция не становится: штамп остаётся один."""
+        cmd = 'rm -rf D:/other/x; python -c "bridge.create_booking(1)"'
+        second = g.other_ops_in_command("delete", cmd)
+        self.assertIn("py_write", second)
+        card = g._card("delete", "D:/other/x", cmd)
+        self.assertIn("ЕЩЁ ОДНА КРАСНАЯ ОПЕРАЦИЯ", card)
+        self.assertEqual(g.kinds_from_card(card + "\n" + g.KIND_LINE_PREFIX + "delete"),
+                         frozenset({"delete"}))       # строка-предупреждение классом НЕ стала
+        # одно действие с двумя ярлыками второй операцией НЕ объявляется
+        self.assertEqual(g.other_ops_in_command("schtasks", "schtasks /change /tn X /disable"), ())
+        self.assertNotIn("ЕЩЁ ОДНА КРАСНАЯ ОПЕРАЦИЯ",
+                         g._card("schtasks", "X", "schtasks /change /tn X /disable"))
 
 
 if __name__ == "__main__":
