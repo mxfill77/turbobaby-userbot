@@ -375,18 +375,22 @@ class TestEncoding(Base):
     PYTHONIOENCODING=utf-8 ребёнку. Кириллица в мок-выводе должна доходить читаемой."""
 
     def test_run_claude_reads_utf8_replace(self):
+        # Спавн переехал с subprocess.run на Popen (01.08.2026): бюджет переоценивается ПО ХОДУ
+        # по часам бодрствования (`_wait_awake`), а у run таймаут задаётся один раз и мерится
+        # смещёнными часами (сон машины съедал бюджет). Контракт кодировки — прежний.
         captured = {}
 
         class _P:
             returncode = 0
-            stdout = "готово\nRESULT: кириллица жива"
-            stderr = ""
 
-        def fake_run(cmd, **kw):
+            def communicate(self, timeout=None):
+                return "готово\nRESULT: кириллица жива", ""
+
+        def fake_popen(cmd, **kw):
             captured.update(kw)
             return _P()
 
-        with mock.patch.object(o.subprocess, "run", fake_run), \
+        with mock.patch.object(o.subprocess, "Popen", fake_popen), \
                 mock.patch.object(o, "resolve_claude", lambda: sys.executable):
             rc, out, err = o.run_claude("p", 10, o.REPO, {"X": "1"})
         self.assertEqual(captured.get("encoding"), "utf-8")     # не локаль Windows (cp1251)
@@ -403,14 +407,15 @@ class TestEncoding(Base):
 
         class _P:
             returncode = 0
-            stdout = "RESULT: ок"
-            stderr = ""
 
-        def fake_run(cmd, **kw):
+            def communicate(self, timeout=None):
+                return "RESULT: ок", ""
+
+        def fake_popen(cmd, **kw):
             captured["argv"] = cmd
             return _P()
 
-        with mock.patch.object(o.subprocess, "run", fake_run), \
+        with mock.patch.object(o.subprocess, "Popen", fake_popen), \
                 mock.patch.object(o, "resolve_claude", lambda: r"C:\x\claude.exe"):
             o.run_claude("p", 10, o.REPO, {"X": "1"})
         argv = captured["argv"]

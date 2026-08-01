@@ -37,6 +37,7 @@ import sys
 import glob
 import time
 import json
+import ctypes               # часы бодрствования Windows (QueryUnbiasedInterruptTime), см. awake_monotonic
 import shutil
 import logging
 import hashlib
@@ -964,9 +965,93 @@ def resolve_claude(retries=1, retry_sleep=2.0):
 EXECUTOR_MODEL = "claude-opus-5"
 
 
-def run_claude(prompt, timeout, cwd, env):
+# ─── ЧАСЫ БОДРСТВОВАНИЯ: СОН МАШИНЫ НЕ ТРАТИТ БЮДЖЕТ ЗАДАЧИ (разбор 01.08.2026) ──────────────
+# На Windows `time.monotonic()` — это GetTickCount64, то есть СМЕЩЁННОЕ время: проспанное в нём
+# ЕСТЬ. А бюджет headless мерился именно им (`subprocess.run(timeout=…)` → CPython
+# `Popen._remaining_time` → `_time()` = `time.monotonic`). Значит машина, уснувшая посреди
+# задачи, тратила её 45 минут, не сделав ничего, — и просыпалась к готовому `run_timeout`.
+# ЖИВОЙ ЗАМЕР ЭТОГО ПК (01.08.2026 15:47): GetTickCount64 224673,5 c против
+# QueryUnbiasedInterruptTime 192388,9 c — разница 32284,6 c (8,97 ч) = ровно сон 30.07
+# 03:43→12:41. Не теория: столько бюджета уже могло сгореть на пустом месте.
+# Вторые часы (`QueryUnbiasedInterruptTime`, Win7+) сна не считают. Их разница со смещёнными
+# даёт СОН ЧИСЛОМ — этим же пользуется сигнал о долгом сне ниже (`report_long_sleep`), которому
+# до сих пор приходилось ГАДАТЬ по скачку wall-clock и который на этом гадании трижды за 01.08
+# поднял ложную тревогу на длинные задачи (3988/3103/2845 c — все три работа, а не сон).
+_QUIT_FN = None          # ctypes-указатель на QueryUnbiasedInterruptTime; False = недоступна
+_AWAKE_SLICE = 60.0      # шаг переоценки бюджета (сек): реже незачем, чаще — лишние пробуждения
+
+
+def awake_monotonic():
+    """Монотоника БОДРСТВОВАНИЯ (сек): проспанное в S3/гибернации в неё НЕ идёт.
+
+    Не Windows / вызов не удался → `time.monotonic()`, то есть ПРЕЖНЕЕ поведение: сон снова
+    считается работой, но ничего не ломается (fail-open — часы не смеют остановить демона).
+    Эпоха своя (от загрузки) и с `time.time()` несравнима: годится ТОЛЬКО для разниц."""
+    global _QUIT_FN
+    if _QUIT_FN is None:
+        try:
+            fn = ctypes.windll.kernel32.QueryUnbiasedInterruptTime
+            fn.argtypes = [ctypes.POINTER(ctypes.c_ulonglong)]
+            fn.restype = ctypes.c_int
+            _QUIT_FN = fn
+        except Exception:
+            _QUIT_FN = False
+    if not _QUIT_FN:
+        return time.monotonic()
+    try:
+        v = ctypes.c_ulonglong()
+        if not _QUIT_FN(ctypes.byref(v)):
+            return time.monotonic()
+        return v.value / 1e7                     # 100-нс тики → секунды
+    except Exception:
+        _QUIT_FN = False                         # сорвалось однажды — больше не пробуем
+        return time.monotonic()
+
+
+def awake_clock_available():
+    """Часы бодрствования РЕАЛЬНЫ (а не запасной `time.monotonic`)? → bool.
+    Нужно там, где вывод «сна не было» имеет цену: без настоящих часов такой вывод недопустим."""
+    awake_monotonic()                            # ленивая инициализация указателя
+    return bool(_QUIT_FN)
+
+
+def _wait_awake(proc, timeout, slice_sec=None, wall=None, awake=None):
+    """Ждать `proc`, ТРАТЯ БЮДЖЕТ ТОЛЬКО НА БОДРСТВОВАНИЕ. → (stdout, stderr, потрачено, проспано).
+    Бюджет выбран бодрствованием → TimeoutError (убивать процесс — дело вызывающего).
+
+    Ждём кусками по `slice_sec`: `communicate(timeout=…)` на превышении кидает TimeoutExpired,
+    но вывод НЕ теряет (документированный контракт CPython: «retrying communication will not
+    lose any output») — потому цикл и безопасен. За каждый кусок в бюджет уходит МЕНЬШАЯ из двух
+    дельт: часы равны (запасной путь) → поведение прежнее байт-в-байт; машина спала → сон
+    остаётся за бортом. `min` заодно обезвреживает разовый откат на запасные часы посреди
+    прогона (эпохи разные): худший случай — кусок засчитан целиком, как раньше."""
+    wall = time.monotonic if wall is None else wall
+    awake = awake_monotonic if awake is None else awake
+    slice_sec = _AWAKE_SLICE if slice_sec is None else slice_sec
+    spent = slept = 0.0
+    while True:
+        left = timeout - spent
+        if left <= 0:
+            raise TimeoutError("бюджет бодрствования исчерпан")
+        w0, a0 = wall(), awake()
+        try:
+            out, err = proc.communicate(timeout=min(left, slice_sec))
+        except subprocess.TimeoutExpired:
+            d_wall, d_awake = max(0.0, wall() - w0), max(0.0, awake() - a0)
+            spent += min(d_wall, d_awake)
+            slept += d_wall - min(d_wall, d_awake)
+            continue
+        d_wall, d_awake = max(0.0, wall() - w0), max(0.0, awake() - a0)
+        return out, err, spent + min(d_wall, d_awake), slept + d_wall - min(d_wall, d_awake)
+
+
+def run_claude(prompt, timeout, cwd, env, popen=None, waiter=None):
     """Запуск headless claude -p. Возврат (returncode, stdout, stderr). Таймаут → TimeoutError.
-    Инъектируется в тестах (реальный claude не дёргаем). Путь резолвится версионно-независимо."""
+    Инъектируется в тестах (реальный claude не дёргаем). Путь резолвится версионно-независимо.
+
+    Бюджет `timeout` тратится ТОЛЬКО на бодрствование машины (`_wait_awake`): проспала —
+    счётчик стоит и продолжает с того же места, а не считает сон работой. Зависший БОДРЫЙ
+    прогон рвётся ровно как прежде. `popen`/`waiter` — инъекция для голденов."""
     cbin = resolve_claude()
     if not cbin:
         raise FileNotFoundError("claude CLI не найден (PATH/.env/AppData)")
@@ -982,12 +1067,28 @@ def run_claude(prompt, timeout, cwd, env):
         # остаётся про интерактивные сессии. prompt держим ПОСЛЕДНИМ.
         eff = task_metrics.norm_effort(repo_thinking_settings()[0])
         argv = [cbin, "-p", "--model", EXECUTOR_MODEL, "--effort", eff, prompt]
-        p = subprocess.run(argv, cwd=cwd, capture_output=True,
-                           encoding="utf-8", errors="replace", timeout=timeout, env=env,
-                           creationflags=NO_WINDOW)
-        return p.returncode, (p.stdout or ""), (p.stderr or "")
+        # Popen вместо subprocess.run — не «стиль», а единственный способ переоценивать бюджет
+        # ПО ХОДУ: у run таймаут задаётся один раз на старте и мерится смещёнными часами.
+        # capture_output=True разворачивается в две трубы явно, остальное слово в слово прежнее.
+        p = (popen or subprocess.Popen)(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        encoding="utf-8", errors="replace", env=env,
+                                        creationflags=NO_WINDOW)
     except subprocess.TimeoutExpired:
         raise TimeoutError("claude -p timeout")
+    try:
+        out, err, spent, slept = (waiter or _wait_awake)(p, timeout)
+    except TimeoutError:
+        # Убиваем и РЕАПИМ — ровно то, что subprocess.run делает на Windows внутри себя.
+        try:
+            p.kill()
+            p.communicate(timeout=30)
+        except Exception:
+            pass
+        raise TimeoutError("claude -p timeout")
+    if slept >= 1:
+        log.warning("headless: из бюджета вычтено %.0fс сна машины (бодрствования потрачено "
+                    "%.0fс из %sс) — счётчик продолжил с места остановки", slept, spent, timeout)
+    return p.returncode, (out or ""), (err or "")
 
 
 # --- бюджет процессов claude (зеркало VPS oom2 1520c68; инцидент-каскад 22.07) ---------------
@@ -4933,6 +5034,7 @@ _client_watch_state = {}      # name -> {"last_raise": float, "deaths": int, "ha
 _client_watch_last_run = 0.0  # монотонная метка последнего прогона контура (троттлинг 5 мин)
 _client_grace_until = 0.0     # wall-clock: до этого момента вердикты «мёртв»/рестарты подавлены (ПК проснулся)
 _loop_prev_wall = None        # wall-clock старта прошлой итерации главного цикла (детект скачка = сна)
+_loop_prev_awake = None       # часы БОДРСТВОВАНИЯ того же момента: скачок минус их прирост = сон ЧИСЛОМ
 
 
 def _find_pids_by_script(script_name):
@@ -5306,28 +5408,42 @@ def _pc_backlog(getter=None):
     return total
 
 
-def sleep_alarm_text(gap, backlog, threshold):
-    """Текст карточки «ПК спал» — чистая функция, на неё положен голден."""
+def sleep_alarm_text(gap, backlog, threshold, jump=None):
+    """Текст карточки «ПК спал» — чистая функция, на неё положен голден.
+    gap — сколько ПРОСПАНО; jump — скачок витка, если сон ИЗМЕРЕН часами бодрствования (тогда
+    это два РАЗНЫХ числа, и путать их в карточке нельзя: скачок = работа + сон)."""
+    metric = ("скачок wall-clock: %sс (порог %sс — длинной задачей не объяснить)"
+              % (int(gap), int(threshold)) if jump is None else
+              "проспано (замер по часам бодрствования): %sс из скачка витка %sс (порог %sс)"
+              % (int(gap), int(jump), int(threshold)))
     return (
         "🛌 ПК СПАЛ %s — весь контур стоял\n"
-        "скачок wall-clock: %sс (порог %sс — длинной задачей не объяснить)\n"
+        "%s\n"
         "задач lane=pc накопилось в очереди: %s (new+approved)\n"
         "клиентский бот всё это время был НЕДОСТУПЕН"
-        % (fmt_sleep(gap), int(gap), int(threshold),
+        % (fmt_sleep(gap), metric,
            "не смог посчитать (мост недоступен)" if backlog is None else backlog)
     )
 
 
-def report_long_sleep(gap, threshold=None, backlog_fn=None, journal=None, notifier=None):
+def report_long_sleep(gap, threshold=None, backlog_fn=None, journal=None, notifier=None, slept=None):
     """СУЩЕСТВЕННЫЙ сон ПК → РОВНО ОДНА строка в журнал + РОВНО ОДИН сигнал в тему 328.
     Мелкий скачок (тормоз ПК / длинная синхронная задача) → ТИШИНА, побочек ноль.
     → текст карточки (str) при сигнале | None при тишине. Всё внешнее (порог, счётчик очереди,
-    журнал, отправка) инъектируется — голден гоняется без сети и без Bridge."""
+    журнал, отправка) инъектируется — голден гоняется без сети и без Bridge.
+
+    slept — ИЗМЕРЕННЫЙ сон (скачок минус бодрствование, см. `awake_monotonic`). Дан — судим по
+    нему, а не по скачку: скачок сам по себе сном НЕ является, и допущение «виток = одна задача»,
+    на котором стоял порог, неверно (`poll_once` за виток обслуживает и повтор, и новый claim) —
+    01.08 это дало три ложные карточки подряд (3988/3103/2845 c, все три — работа).
+    slept=None (часы бодрствования недоступны) → ПРЕЖНИЙ разбор по скачку: без замера молчать
+    нельзя, потерянный сигнал о реальном сне хуже ложного."""
     threshold = SLEEP_ALARM_SEC if threshold is None else threshold
-    if int(gap) <= int(threshold):
+    measured = gap if slept is None else slept
+    if int(measured) <= int(threshold):
         return None
     backlog = (_pc_backlog if backlog_fn is None else backlog_fn)()
-    text = sleep_alarm_text(gap, backlog, threshold)
+    text = sleep_alarm_text(measured, backlog, threshold, jump=(None if slept is None else gap))
     (journal or _cowork)(" ".join(text.split()))   # журнал — строго ОДНА строка (контракт 28.07)
     (notifier or _notify_topic)(SLEEP_ALARM_TOPIC, text)
     return text
@@ -6369,28 +6485,36 @@ def _main_loop():
     if _stopped():
         log.info("рубильник pc_orchestrator.stop активен — не стартую поллинг")
         return
-    global _loop_prev_wall, _client_grace_until
+    global _loop_prev_wall, _loop_prev_awake, _client_grace_until
     while not _stopped():
         try:
             # (2) Детект сна/пробуждения ДО вотчдога: если ПК спал, wall-clock скакнёт — взводим grace,
             # чтобы первый пост-пробуждение прогон вотчдога (троттлинг уже истёк) не принял медленный
             # CIM за смерть и не рестартнул зря. Взводим ТОЛЬКО на реальном скачке; норм. виток не трогаем.
             now = time.time()
+            awake_now = awake_monotonic()
             if _woke_from_sleep(now, _loop_prev_wall):
+                # grace вотчдога взводим на ЛЮБОЙ скачок, как раньше: он про медленный CIM после
+                # тяжёлого витка, и лишнее окно тишины безвредно. А вот ГРОМКИЙ сигнал — только
+                # на измеренный сон (ниже), иначе длинная задача снова прочтётся как сон.
                 _client_grace_until = now + WAKE_GRACE_SEC
                 gap = int(now - _loop_prev_wall)
-                log.warning("детект пробуждения ПК: скачок wall-clock %sс (>%s+%s) — grace вотчдога %sс",
-                            gap, POLL_SEC, WAKE_JUMP_MARGIN, WAKE_GRACE_SEC)
+                slept = (max(0, int(gap - (awake_now - _loop_prev_awake)))
+                         if (_loop_prev_awake is not None and awake_clock_available()) else None)
+                log.warning("детект пробуждения ПК: скачок wall-clock %sс (>%s+%s; из них сна %s) "
+                            "— grace вотчдога %sс", gap, POLL_SEC, WAKE_JUMP_MARGIN,
+                            "%sс" % slept if slept is not None else "замерить нечем", WAKE_GRACE_SEC)
                 # инцидент 30.07 (сон 8 ч 58 м): существенный сон — не только grace, но и ГРОМКИЙ
                 # след. Строка в журнал + карточка в тему 328 с числом накопившихся задач lane=pc.
                 # Обёрнуто в try: сигнал НИКОГДА не должен ронять тик демона (как _notify_*).
                 try:
-                    if report_long_sleep(gap):
+                    if report_long_sleep(gap, slept=slept):
                         log.warning("ПК спал %sс (>%s) — строка в журнал и сигнал в тему %s отправлены",
-                                    gap, SLEEP_ALARM_SEC, SLEEP_ALARM_TOPIC)
+                                    gap if slept is None else slept, SLEEP_ALARM_SEC, SLEEP_ALARM_TOPIC)
                 except Exception as e:
                     log.warning("сигнал о долгом сне не отправлен: %s", e)
             _loop_prev_wall = now
+            _loop_prev_awake = awake_now
             poll_once()
             maybe_client_watchdog()   # часть 3: следим за pc_agent/userbot/moderation_bot (троттлинг 5 мин)
             maybe_session_watch()     # инцидент 29.07: немая сессия (жива, но не работает) → карточка в 328
