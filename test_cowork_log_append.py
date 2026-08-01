@@ -179,9 +179,15 @@ class TestLedger(unittest.TestCase):
         self.addCleanup(lambda: setattr(sys, "argv", saved[2]))
         cla.spool_add("DONE 2026-07-30 12:00 UTC: отложенная прошлым сбоем")
         sys.argv = ["cowork_log_append.py", "DONE итог задачи 61"]
+        doc = {"text": "старый журнал"}   # живой мост: write_doc меняет док, read_doc отдаёт новый
+
+        def fake_post(u, p):
+            doc["text"] = p["text"]
+            return {"ok": True, "chars": 99}
+
         with mock.patch.object(cla, "load_env", lambda p: {"BRIDGE_URL": "https://x/exec", "BRIDGE_TOKEN": "t"}), \
-             mock.patch.object(cla, "get", lambda u, p: {"ok": True, "text": "старый журнал"}), \
-             mock.patch.object(cla, "post", lambda u, p: {"ok": True, "chars": 99}), \
+             mock.patch.object(cla, "get", lambda u, p: {"ok": True, "text": doc["text"]}), \
+             mock.patch.object(cla, "post", fake_post), \
              contextlib.redirect_stdout(io.StringIO()):
             cla.main()
         lines = [r["line"] for r in self._lines()]
@@ -274,6 +280,7 @@ class TestShrinkGuard(unittest.TestCase):
 
         def fake_post(url, payload):
             self.writes.append(dict(payload))
+            self.doc = payload["text"]      # живой мост: запись меняет док
             return {"ok": True, "chars": len(payload["text"])}
 
         cla.post = fake_post
@@ -283,7 +290,11 @@ class TestShrinkGuard(unittest.TestCase):
         (cla.SPOOL_PATH, cla.get, cla.post, cla.load_env, cla.compose, sys.argv) = self._saved
 
     def _bridge_returns(self, text):
-        cla.get = lambda url, params: {"ok": True, "name": "cowork_log", "id": "FID1", "text": text}
+        # Док ЖИВОЙ: read_doc отдаёт то, что лежит сейчас, а не снимок момента настройки —
+        # иначе обратное чтение писателя никогда не увидит только что записанную строку.
+        self.doc = text
+        cla.get = lambda url, params: {"ok": True, "name": "cowork_log", "id": "FID1",
+                                       "text": self.doc}
 
     def _run_main(self):
         """main() с перехватом обоих потоков → (SystemExit | None, текст stderr)."""
@@ -541,10 +552,20 @@ class TestSpillInMain(unittest.TestCase):
         cla.LEDGER_PATH = os.path.join(self._tmp.name, "ledger.jsonl")
         cla.SPILL_DIR = os.path.join(self._tmp.name, "journal")
         cla.load_env = lambda p: {"BRIDGE_URL": "https://bridge.test/exec", "BRIDGE_TOKEN": "TOK"}
-        cla.get = lambda url, params: {"ok": True, "name": "cowork_log", "text": "A" * 5000}
+        # ЖИВОЕ поведение моста: успешный write_doc МЕНЯЕТ документ, и следующий read_doc
+        # (обратное чтение писателя) отдаёт УЖЕ НОВЫЙ текст. Неизменный док — мок, который не
+        # умеет представить «прочитать назад после записи»: он прятал бы регресс (правило-класс
+        # CLAUDE.md — формат и ПОВЕДЕНИЕ мока равны источнику).
+        self.doc = "A" * 5000
+        cla.get = lambda url, params: {"ok": True, "name": "cowork_log", "text": self.doc}
         self.writes = []
-        cla.post = lambda url, payload: (self.writes.append(dict(payload))
-                                         or {"ok": True, "chars": len(payload["text"])})
+
+        def fake_post(url, payload):
+            self.writes.append(dict(payload))
+            self.doc = payload["text"]
+            return {"ok": True, "chars": len(payload["text"])}
+
+        cla.post = fake_post
         sys.argv = ["cowork_log_append.py", LIVE_LONG]
 
     def tearDown(self):
@@ -653,12 +674,15 @@ class TestArgvStdinSentinel(unittest.TestCase):
         self.addCleanup(self._restore)
         cla.SPOOL_PATH = os.path.join(self._tmp.name, "pending.txt")
         cla.load_env = lambda p: {"BRIDGE_URL": "https://bridge.test/exec", "BRIDGE_TOKEN": "TOK"}
+        # Мост ведёт себя как живой: запись меняет док, обратное чтение видит новый текст.
+        self.doc = "DONE старый журнал целиком"
         cla.get = lambda url, params: {"ok": True, "name": "cowork_log", "id": "FID1",
-                                       "text": "DONE старый журнал целиком"}
+                                       "text": self.doc}
         self.writes = []
 
         def fake_post(url, payload):
             self.writes.append(dict(payload))
+            self.doc = payload["text"]
             return {"ok": True, "chars": len(payload["text"])}
 
         cla.post = fake_post
@@ -690,6 +714,115 @@ class TestArgvStdinSentinel(unittest.TestCase):
         first = self._run(["DONE строка из argv"], "СТДИН ЧИТАТЬ НЕ ДОЛЖНЫ")
         self.assertIn("строка из argv", first)
         self.assertNotIn("ЧИТАТЬ НЕ ДОЛЖНЫ", first)
+
+
+class TestReceiptIsNotTheFact(unittest.TestCase):
+    """ОТВЕТ МОСТА ≠ СУДЬБА ЗАПИСИ — второй писатель того же класса.
+
+    Живой случай 01.08.2026: `cowork_log_append.py` получил HTTP 404 и заспулил строку с
+    рапортом «ОТЛОЖЕНО, уйдёт следующим вызовом», хотя судить о том, легла запись или нет, по
+    коду ответа НЕЛЬЗЯ (writeDoc_ фиксирует мутацию ДО сборки {ok:true}; тело едет вторым
+    плечом). Цена ошибки — ручной повтор: у него СВОЙ штамп времени, дословный дедуп досылки
+    его не поймает, и в журнал ляжет дубль.
+
+    Регресс ровно на развилку: легло → успех; не легло → ошибка; неизвестно → так и сказано.
+    Сети нет, транспорт инъектируется; ответы копируют ЖИВОЙ формат Bridge (правило-класс)."""
+
+    MSG = "DONE итог задачи про расписку"
+    OLD = "DONE 2026-07-31 10:00 UTC: прежняя строка журнала"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._saved = (cla.SPOOL_PATH, cla.LEDGER_PATH, cla.get, cla.post, cla.load_env, sys.argv)
+        cla.SPOOL_PATH = os.path.join(self._tmp.name, "pending.txt")
+        cla.LEDGER_PATH = os.path.join(self._tmp.name, "ledger.jsonl")
+        cla.load_env = lambda p: {"BRIDGE_URL": "https://bridge.test/exec", "BRIDGE_TOKEN": "TOK"}
+        sys.argv = ["cowork_log_append.py", self.MSG]
+        self.doc = self.OLD          # «живой» док; фейковый write_doc в него и пишет
+        self.reads = 0
+
+    def tearDown(self):
+        (cla.SPOOL_PATH, cla.LEDGER_PATH, cla.get, cla.post, cla.load_env, sys.argv) = self._saved
+
+    def _wire(self, landed, read_back_ok=True, receipt=None):
+        """landed — легла ли запись НА САМОМ ДЕЛЕ; receipt — что вернёт/бросит write_doc."""
+        def fake_get(url, params):
+            self.reads += 1
+            if self.reads > 1 and not read_back_ok:   # обратное чтение сорвалось
+                raise _http(404)
+            return {"ok": True, "name": "cowork_log", "id": "FID1", "text": self.doc}
+
+        def fake_post(url, payload):
+            if landed:                                 # мутация зафиксирована ДО ответа
+                self.doc = payload["text"]
+            if isinstance(receipt, Exception):
+                raise receipt
+            return receipt if receipt is not None else {"ok": True, "chars": len(payload["text"])}
+
+        cla.get, cla.post = fake_get, fake_post
+
+    def _run(self):
+        err, out = io.StringIO(), io.StringIO()
+        exc = None
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            try:
+                cla.main()
+            except SystemExit as e:
+                exc = e
+        return exc, out.getvalue(), err.getvalue()
+
+    def test_landed_write_with_lost_receipt_is_success(self):
+        """404, а строка ЛЕГЛА (живой случай): успех, спул ПУСТ — иначе досылка/повтор дадут дубль."""
+        self._wire(landed=True, receipt=_http(404))
+        exc, out, err = self._run()
+        self.assertIsNone(exc)                       # НЕ отказ: запись состоялась
+        self.assertIn("OK: записано в мозг", out)
+        self.assertIn("РАСПИСКА ПОТЕРЯНА", out)      # класс назван вслух, а не замолчан
+        self.assertEqual(cla.spool_read(), [])       # ← нечего досылать: строка уже в доке
+
+    def test_write_that_never_landed_still_errors(self):
+        """Обратная сторона: не легло — честный отказ и строка в спуле (иначе потеря)."""
+        self._wire(landed=False, receipt=_http(404))
+        exc, out, err = self._run()
+        self.assertEqual(exc.code, 1)
+        self.assertIn("НЕ ЛЕГЛА", err)
+        self.assertIn("повтор безопасен", err)
+        self.assertEqual(len(cla.spool_read()), 1)
+
+    def test_unknown_outcome_is_named_unknown_not_failure(self):
+        """Расписка — отказ, обратное чтение тоже не удалось: «не знаю», а не «не записано»."""
+        self._wire(landed=True, read_back_ok=False, receipt=_http(404))
+        exc, out, err = self._run()
+        self.assertEqual(exc.code, 1)
+        self.assertIn("ИСХОД ЗАПИСИ НЕ ПОДТВЕРЖДЁН", err)
+        self.assertIn("СЛЕПОЙ ПОВТОР ВРУЧНУЮ ЗАПРЕЩЁН", err)
+        self.assertNotIn("НЕ ЛЕГЛА", err)            # ← так говорить права не имеем
+        self.assertEqual(len(cla.spool_read()), 1)   # спул безопасен: досылку дедуп сверит с доком
+
+    def test_bridge_says_ok_but_line_absent_is_caught(self):
+        """Зеркало класса: мост ответил ok, а строки в доке нет — молча «успехом» не считаем."""
+        self._wire(landed=False, receipt={"ok": True, "chars": 999})
+        exc, out, err = self._run()
+        self.assertEqual(exc.code, 1)
+        self.assertIn("ОБРАТНОЕ ЧТЕНИЕ", err)
+        self.assertEqual(len(cla.spool_read()), 1)
+
+    def test_lost_receipt_does_not_duplicate_on_next_call(self):
+        """Идемпотентность досылки НЕ ослаблена: после потерянной расписки следующий вызов
+        не дублирует строку (её нет в спуле, а дедуп сверяет с живым доком)."""
+        self._wire(landed=True, receipt=_http(404))
+        self._run()
+        first_doc = self.doc
+        sys.argv = ["cowork_log_append.py", "DONE следующая строка"]
+        self._wire(landed=True)                      # мост снова здоров
+        exc, out, err = self._run()
+        self.assertIsNone(exc)
+        # Ищем ХВОСТ записи: штамп писатель вставляет ПОСЛЕ типа («DONE <дата> UTC: итог…»),
+        # поэтому исходная строка целиком подстрокой не является — сверяем по опознавательной части.
+        body = "итог задачи про расписку"
+        self.assertEqual(self.doc.count(body), 1)    # ← ровно одно вхождение, дубля нет
+        self.assertIn(first_doc.splitlines()[0].strip(), self.doc)
 
 
 if __name__ == "__main__":

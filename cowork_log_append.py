@@ -29,6 +29,15 @@ RETRY_TRIES = int(os.getenv("BRIDGE_RETRY_TRIES", "2") or "2")
 RETRY_PAUSE_SEC = float(os.getenv("BRIDGE_RETRY_PAUSE", "1") or "1")
 
 
+class UnknownOutcome(RuntimeError):
+    """Исход записи НЕ УСТАНОВЛЕН: расписка моста — отказ, а обратное чтение не удалось.
+
+    Отдельный тип, потому что это НЕ «не записано». Слепой повтор ВРУЧНУЮ здесь запрещён: у
+    новой попытки будет свой штамп времени, а дедуп досылки сверяет строку ДОСЛОВНО — второй
+    штамп он не поймает и в журнал ляжет дубль. Спул при этом безопасен: досылку дедуп сверяет
+    с живым доком (см. compose)."""
+
+
 class ShrinkGuard(RuntimeError):
     """Отказ гарда усыхания: писать НЕ будем, чтобы не укоротить журнал.
 
@@ -312,6 +321,34 @@ def compose(new_line, pending, old):
     return "  \n".join([new_line] + list(reversed(keep))) + "  \n" + old, dropped
 
 
+def readback_landed(url, token, line):
+    """ЛЕГЛА ЛИ строка НА САМОМ ДЕЛЕ — по живому доку, а не по коду ответа.
+
+    ОТВЕТ МОСТА НЕ ЕСТЬ ФАКТ ЗАПИСИ (класс; живые случаи: ложный 401 01.08.2026 и HTTP 404 на
+    задаче 166 — оба раза строка ЛЕГЛА). Механизм, а не гипотеза: Apps Script отдаёт тело POST-а
+    ВТОРЫМ плечом (`/exec` → 302 → script.googleusercontent.com), падение этого плеча приходит
+    тем же исключением, что и падение первого, а мутация к тому моменту уже зафиксирована —
+    `writeDoc_` зовёт `brainTextWrite_(id, text)` и лишь ПОТОМ собирает `{ok:true}`
+    (копия прода: tmp/bridge_v75/ReadDocs.js:352-354). Значит код ответа описывает доставку
+    РАСПИСКИ, а не судьбу записи. Разбор — docs/artifacts/2026-08-01-bridge-receipt-not-fact.md
+
+    → True  — строка в доке (запись легла; отказ моста был потерей расписки);
+      False — док ПРОЧИТАН и строки в нём нет (единственный предъявимый факт «не легло»);
+      None  — прочитать не удалось: исход НЕИЗВЕСТЕН, «не записано» говорить нельзя."""
+    try:
+        r = with_retry(lambda: get(url, {"action": "read_doc", "token": token, "name": DOC_NAME}))
+    except Exception:
+        return None
+    if not (isinstance(r, dict) and r.get("ok")):
+        return None
+    back = get_text(r)
+    # Пустой текст мост отдаёт и при СОРВАННОМ чтении (тот же класс, что ГАРД 1 в main): это
+    # «не знаю», а не «строки нет». Иначе отказ чтения выдал бы себя за факт «не легло».
+    if back is None or not back.strip():
+        return None
+    return line_already_in(back, line)
+
+
 def read_stdin_text(stream=None):
     """stdin как UTF-8 ЯВНО. Живой дефект 29.07.2026: на Windows sys.stdin декодирует ТЕКСТ
     кодировкой консоли (здесь cp1251), а пайп шлёт UTF-8 — и кириллица легла в мозг мохибейком
@@ -387,10 +424,29 @@ def main():
         if len(new_text) < len(old):
             raise ShrinkGuard("новый текст КОРОЧЕ старого (было %d символов, стало бы %d) — "
                               "запись отменена" % (len(old), len(new_text)))
-        w = with_retry(lambda: post(url, {"action": "write_doc", "token": token,
-                                          "name": DOC_NAME, "text": new_text}))
-        if not (isinstance(w, dict) and w.get("ok")):
-            raise RuntimeError("write_doc не ok: " + json.dumps(w, ensure_ascii=False)[:300])
+        # ОТВЕТ МОСТА — НЕ ФАКТ ЗАПИСИ (см. readback_landed). Отказ больше не короткое замыкание:
+        # он ЗАПОМИНАЕТСЯ, а вердикт выносит ОБРАТНОЕ ЧТЕНИЕ — оно одно отличает «не легло»
+        # (повтор безопасен) от «легло, потерялась расписка» (ручной повтор придёт с новым штампом,
+        # дедуп досылки его не поймает — и в журнал ляжет дубль). Сам POST не повторяем.
+        w, receipt_err = None, None
+        try:
+            w = with_retry(lambda: post(url, {"action": "write_doc", "token": token,
+                                              "name": DOC_NAME, "text": new_text}))
+        except Exception as e:
+            receipt_err = "%s: %s" % (type(e).__name__, e)
+        else:
+            if not (isinstance(w, dict) and w.get("ok")):
+                receipt_err = "write_doc не ok: " + json.dumps(w, ensure_ascii=False)[:300]
+        landed = readback_landed(url, token, new_line)
+        if landed is False:
+            # Док прочитан, строки в нём НЕТ — единственный случай, где «не записано» есть факт.
+            raise RuntimeError(("write_doc не прошёл (%s); " % receipt_err if receipt_err
+                                else "мост ответил ok, но ")
+                               + "ОБРАТНОЕ ЧТЕНИЕ: строки в доке НЕТ — запись НЕ ЛЕГЛА, "
+                                 "повтор безопасен")
+        if landed is None and receipt_err is not None:
+            raise UnknownOutcome("расписка моста — отказ (%s), обратное чтение тоже не удалось"
+                                 % receipt_err)
         spool_clear()
         for done_line in [new_line] + list(pending):   # реестр следов: и новая, и досланные
             ledger_add(done_line)
@@ -404,11 +460,24 @@ def main():
         # 28.07: мост отрапортовал 759635, кодовых точек в доке 759548, не-BMP символов ровно 87 —
         # сходится до единицы. Это НЕ усыхание дока: два числа просто в разных единицах, сравнивать
         # их между собой нельзя (я на этом уже споткнулся — гард тут ни при чём).
-        print("OK: записано в мозг, символов:", w.get("chars", "?"), extra)
+        # Судьбу РАСПИСКИ называем словом: «потеряна» = мост ответил отказом, а запись ЛЕГЛА и
+        # подтверждена чтением. Промолчать нельзя — иначе отказ моста неотличим от штатной записи
+        # и класс не виден ни в логах, ни владельцу.
+        if receipt_err:
+            extra += f" | РАСПИСКА ПОТЕРЯНА ({receipt_err}) — запись ПОДТВЕРЖДЕНА обратным чтением"
+        elif landed is None:
+            extra += " | обратное чтение не удалось — исход по расписке моста"
+        print("OK: записано в мозг, символов:", (w or {}).get("chars", "?"), extra)
     except Exception as e:
         spool_add(new_line)
-        head = "ГАРД УСЫХАНИЯ (запись отменена)" if isinstance(e, ShrinkGuard) else "ОШИБКА Bridge"
-        sys.stderr.write(head + ": " + str(e) + "\nОТЛОЖЕНО (строка НЕ потеряна, уйдёт "
+        head = ("ГАРД УСЫХАНИЯ (запись отменена)" if isinstance(e, ShrinkGuard)
+                else "ИСХОД ЗАПИСИ НЕ ПОДТВЕРЖДЁН" if isinstance(e, UnknownOutcome)
+                else "ОШИБКА Bridge")
+        # При неизвестном исходе спул безопасен (досылку дедуп сверит с живым доком), а вот
+        # РУЧНОЙ повтор — нет: у него будет свой штамп, дословный дедуп его не поймает.
+        warn = ("\nСЛЕПОЙ ПОВТОР ВРУЧНУЮ ЗАПРЕЩЁН: строка могла ЛЕЧЬ — посмотри док глазами."
+                if isinstance(e, UnknownOutcome) else "")
+        sys.stderr.write(head + ": " + str(e) + warn + "\nОТЛОЖЕНО (строка НЕ потеряна, уйдёт "
                          "следующим успешным вызовом): " + new_line + "\nСпул: " + SPOOL_PATH
                          + (("\nТело записи УЖЕ сохранено: " + spilled) if spilled else "") + "\n")
         sys.exit(1)
