@@ -15,6 +15,10 @@ cowork_log_append/dispatch_notify.
   движок   brain_writer.apply(mutate, …) — для одноразовых скриптов со СВОЕЙ якорной логикой
            (mutate: старый текст → новый | None=no-op; сам скрипт секретов не касается)
   чтение   brain_writer.read_text(doc_id=… | name=…)
+  адрес    brain_writer.resolve_name("KB_INFRA") → ({"name":"infra"}, …) — ОДНО правило канона
+           (casefold + долой «KB_» + разделители в «_») поверх ЖИВОГО реестра; включается само
+           на промахе имени, поэтому рамка/инструкции/код зовут доки ИХ именами и попадают
+           в живые доки. Разбор механизма — в разделе «разрешение имён» ниже
   создание brain_writer.create_plain(name="KB_имя", key="ключ_манифеста", text=…) — НОВЫЙ док
            в папке Brain И регистрация в реестре одним вызовом (канал дозаписи доки не создаёт)
   CLI      venv/Scripts/python.exe brain_writer.py (--id FILE_ID | --name ДОК) [ключи] "текст"
@@ -47,6 +51,7 @@ import os
 import re
 import sys
 import json
+import time
 import datetime
 import urllib.request
 import urllib.parse
@@ -119,6 +124,27 @@ def _get(url, params):
         return json.loads(resp.read().decode("utf-8"))
 
 
+# Повтор ЧИСТОГО ЧТЕНИЯ (образец cowork_log_append.with_retry). Заведён под разрешение имени:
+# оно добавляет запрос `list_brain` на путь записи, а мост сегодня регулярно таймаутит (замер
+# 01.08.2026: 5 транспортных отказов на 27 проб). Без повтора флап моста превратился бы из
+# «повисло чтение» в «имя не резолвится» — новый режим отказа на ровном месте. Повторяем ТОЛЬКО
+# GET-чтения: они идемпотентны; записи не повторяем никогда.
+_READ_TRIES = 3
+_READ_PAUSE = 1.5
+
+
+def _retry_read(call):
+    last = None
+    for i in range(_READ_TRIES):
+        try:
+            return call()
+        except Exception as e:
+            last = e
+            if i + 1 < _READ_TRIES:
+                time.sleep(_READ_PAUSE * (i + 1))
+    raise last
+
+
 def _post(url, payload):
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
                                  headers={"Content-Type": "application/json"})
@@ -141,11 +167,27 @@ def _ref(doc_id, name):
     return ({"id": doc_id}, "id:" + doc_id) if doc_id else ({"name": name}, "name:" + name)
 
 
-def _read(url, token, addr, ref, get):
+def _read(url, token, addr, ref, get, env=None, resolve=True):
+    """→ (текст, addr, ref). АДРЕС ВОЗВРАЩАЕТСЯ ВМЕСТЕ С ТЕКСТОМ, потому что он мог измениться
+    разрешением имени (ниже). Иначе apply() прочитал бы один док, а write_doc ушёл бы по
+    старому адресу — правка легла бы мимо прочитанного."""
     try:
         r = (get or _get)(url, dict(addr, action="read_doc", token=token))
     except Exception as e:
         raise BrainWriterError("read_doc(%s) упал: %s: %s" % (ref, type(e).__name__, e), 2)
+    # РАЗРЕШЕНИЕ ИМЕНИ — ровно здесь и только на промахе: пока мост имя знает, канал работает
+    # как работал (ни лишнего запроса, ни смены поведения). Промах — единственный момент, когда
+    # правило канона обязано включиться; повтор ровно один (resolve=False), петли нет.
+    if (isinstance(r, dict) and not r.get("ok") and r.get("error") == "unknown_name"
+            and resolve and addr.get("name")):
+        try:
+            addr2, ref2, _note = resolve_name(addr["name"], env=env, get=get)
+        except BrainWriterError as e:
+            if getattr(e, "verdict", False):
+                raise                       # вердикт ПРО ИМЯ (мёртвый адрес / не разрешено) — он и есть ответ
+            addr2 = addr                    # реестр не прочитался — отдаём исходный честный unknown_name
+        if addr2 != addr:
+            return _read(url, token, addr2, ref2, get, env=env, resolve=False)
     if not (isinstance(r, dict) and r.get("ok")):
         raise BrainWriterError("read_doc(%s) не ok: %s"
                                % (ref, json.dumps(r, ensure_ascii=False)[:300]), 2)
@@ -159,16 +201,21 @@ def _read(url, token, addr, ref, get):
         raise BrainWriterError("read_doc(%s) вернул ПУСТОЙ текст (%d символов) — считаю это ОТКАЗОМ "
                                "ЧТЕНИЯ, а не пустым доком: писать поверх значит затереть"
                                % (ref, len(text)), 2)
-    return text
+    return text, addr, ref
 
 
-def read_text(doc_id="", name="", env=None, get=None):
-    """Текст дока (read-only) или BrainWriterError. Секретов не раскрывает."""
+def read_text(doc_id="", name="", env=None, get=None, resolve=True):
+    """Текст дока (read-only) или BrainWriterError. Секретов не раскрывает.
+
+    resolve=False — «как было до переводчика»: имя уходит на мост КАК НАПИСАНО, и промах
+    остаётся промахом. Заведено под замер регресса: обе полосы (сырой канал / с переводчиком)
+    меряются ОДНИМ процессом на одном и том же живом мосту — иначе флап моста достаётся
+    только одной из них, и число, ради которого замер делается, врёт."""
     url, token = _config(env)
     if not url or not token:
         raise BrainWriterError("нет BRIDGE_URL/BRIDGE_TOKEN в окружении/конфиге", 1)
     addr, ref = _ref(doc_id, name)
-    return _read(url, token, addr, ref, get)
+    return _read(url, token, addr, ref, get, env=env, resolve=resolve)[0]
 
 
 def _norm_eol(s):
@@ -222,7 +269,7 @@ def create_plain(name, key="", text="", env=None, post=None, get=None):
     if not text.strip():
         return dict(r, verified=False)   # пустой док читать назад нечем: пустой ответ = отказ чтения
     try:
-        back = _read(url, token, {"id": new_id}, "id:" + new_id, get)
+        back = _read(url, token, {"id": new_id}, "id:" + new_id, get, env=env)[0]
     except BrainWriterError as e:
         raise BrainWriterError("%s; но файл УЖЕ СОЗДАН (id %s) — проверь его, повтор создаст ДУБЛЬ"
                                % (e, new_id), e.code)
@@ -247,13 +294,115 @@ def list_brain(env=None, get=None):
     if not url or not token:
         raise BrainWriterError("нет BRIDGE_URL/BRIDGE_TOKEN в окружении/конфиге", 1)
     try:
-        r = (get or _get)(url, {"action": "list_brain", "token": token})
+        r = _retry_read(lambda: (get or _get)(url, {"action": "list_brain", "token": token}))
     except Exception as e:
-        raise BrainWriterError("list_brain упал: %s: %s" % (type(e).__name__, e), 2)
+        raise BrainWriterError("list_brain упал (%d попытки): %s: %s"
+                               % (_READ_TRIES, type(e).__name__, e), 2)
     if not (isinstance(r, dict) and r.get("ok") and isinstance(r.get("manifest"), dict)):
         raise BrainWriterError("list_brain не ok: %s"
                                % json.dumps(r, ensure_ascii=False)[:300], 2)
     return r["manifest"]
+
+
+# ------------------------------- разрешение имён ------------------------------
+#
+# ПОЧЕМУ ИМЕНА НЕ РЕЗОЛВИЛИСЬ (механизм, снят пробой 01.08.2026, не гипотеза).
+# В системе ДВА словаря имён, и между ними не было ни одного преобразователя:
+#   • КЛЮЧИ РЕЕСТРА — то единственное, что понимает мост: `index`, `infra`, `cc_userbot_log`…
+#     Совпадение ТОЧНОЕ и РЕГИСТРОЗАВИСИМОЕ (проба 01.08: `infra` → OK 6 702 симв.; `INFRA` и
+#     `Infra` → unknown_name). НИ ОДИН ключ живого реестра не содержит ни заглавной буквы, ни
+#     префикса `KB_`, и содержать не может: мост валидирует ключ как [a-z0-9_].
+#   • ИМЕНА ДОКУМЕНТОВ — то, чем их зовут рамка Штаба, инструкции и код: `KB_MASTER`,
+#     `KB_INFRA`, `KB_NORTH_STAR`. Это ТИТУЛЫ файлов Drive, а не ключи.
+# Отсюда замер «13 из 14 unknown_name»: доки живы, спрашивали их в чужом словаре. Ни «мёртвые
+# документы», ни «изменившиеся заголовки», ни «сломанный реестр» тут ни при чём.
+#
+# ПОЧЕМУ ПРАВИЛО ЖИВЁТ НА ПК. Ключ на мосту валидируется как [a-z0-9_] — ключа `KB_MASTER` там
+# не может быть в принципе, никакой алиас в реестре титул Drive не примет. Значит превращать
+# титул в ключ обязан ПК — и делать это в ЕДИНСТВЕННОМ легальном канале к мозгу, через который
+# проходит каждое обращение по имени.
+#
+# ПРАВИЛО ОДНО (канон имени), а не таблица исключений:
+#   имя → casefold → всё не [a-z0-9] в «_» → долой ведущий «kb_» → сопоставить с ключами ЖИВОГО
+#   реестра, приведёнными К ТОМУ ЖЕ канону; совпадение обязано быть РОВНО ОДНО.
+# Добор к правилу — то же сопоставление по ГРАНИЦЕ ТОКЕНА (`userbot_log` ↔ `cc_userbot_log`,
+# `claude_review_archive` ↔ `review_archive`), тоже с требованием единственности.
+#
+# ЧЕГО ЗДЕСЬ СОЗНАТЕЛЬНО НЕТ — словаря «имя → file id». Переименование (титул `KB_MASTER` при
+# ключе `index`) и «файл лежит вне реестра» лексикой не выводятся: это ДАННЫЕ той же природы,
+# что реестр. Их место — РЕЕСТР НА ПРОДЕ, а не второй словарь в коде, который разойдётся с ним
+# молча. Путь туда открыт и проверен: орфан `KB_NORTH_STAR` (жил вне реестра с 03.07)
+# зарегистрирован 01.08.2026 под ключом `north_star` — и с этого момента ловится ТЕМ ЖЕ
+# правилом канона, без единой строки данных здесь. Так же чинятся остальные орфаны.
+#
+# ОСТОРОЖНО, КЛАСС (01.08.2026): список экшенов, который мост отдаёт в ответ на неизвестный
+# action, НЕПОЛОН. `--probe-actions` возвращает 62 имени, и `register_brain_doc` среди них НЕТ —
+# а вызов проходит и реестр правит (живая проба: ok, registered, доков стало 29 + folder_id).
+# Отсюда родился ложный вывод «реестр с этой стороны не правится вообще»
+# (docs/artifacts/2026-08-01-brain-name-resolution-mechanism.md §1.5), из-за которого адреса чуть
+# не переехали в код таблицей. Возможности прода судить ВЫЗОВОМ, а не списком.
+
+# Разделители канона — всё, что не буква и не цифра. Класс задан через \W (юникод-осознанный),
+# а НЕ через [^a-z0-9]: последний стёр бы кириллическое имя в пустую строку, и честный вердикт
+# «такого ключа нет» подменился бы бессмысленным «имя не содержит ни буквы» (поймано юнитом).
+_RE_NOT_CANON = re.compile(r"\W+", re.UNICODE)
+
+
+def canon_name(name):
+    """КАНОН имени дока — единственное правило разрешения имён (разбор механизма см. выше).
+    `KB_INFRA`, `kb-infra`, `KB_Infra` → `infra`. Пустая строка = имя нераспознаваемо."""
+    s = _RE_NOT_CANON.sub("_", (name or "").strip().lower()).strip("_")
+    return s[3:] if s.startswith("kb_") else s
+
+
+def _verdict(msg, code=2):
+    """Отказ ПРО ИМЯ (а не про транспорт/реестр): такой вердикт вызывающий обязан показать
+    как есть, потому что он и есть ответ «что с этим именем». Отказ реестра — не вердикт:
+    на нём канал откатывается к исходному честному `unknown_name` моста."""
+    e = BrainWriterError(msg, code)
+    e.verdict = True
+    return e
+
+
+def _token_tail(a, b):
+    """Совпадение по ГРАНИЦЕ ТОКЕНА в любую сторону: `userbot_log` ↔ `cc_userbot_log`,
+    `claude_review_archive` ↔ `review_archive`. Голая подстрока не считается — иначе `log`
+    «совпал» бы с половиной реестра, а спрос на уникальность потерял бы смысл."""
+    return a.endswith("_" + b) or b.endswith("_" + a)
+
+
+def resolve_name(name, env=None, get=None, manifest=None):
+    """ИМЯ → АДРЕС по правилу канона. → (addr, ref, note): addr — готовая адресация для моста
+    ({"name": ключ реестра}), ref — человекочитаемо, note — чем разрешилось.
+
+    Порядок: точный ключ реестра → канон-совпадение → совпадение по границе токена → честный
+    отказ со списком похожих ключей. ЕДИНСТВЕННЫЙ источник адресов — ЖИВОЙ реестр: имя, которого
+    в нём нет, здесь не выдумывается (см. «чего здесь сознательно нет» выше).
+    Неоднозначность (совпало 2+) — отказ, а не выбор наугад: угадать чужой док хуже, чем встать."""
+    raw = (name or "").strip()
+    canon = canon_name(raw)
+    if not canon:
+        raise _verdict("имя %r не содержит ни буквы, ни цифры — разрешать нечего" % name, 1)
+    man = manifest if manifest is not None else list_brain(env=env, get=get)
+    keys = [k for k in man if k != "folder_id"]
+    if raw in keys:                                  # уже ключ реестра — канал работает как работал
+        return {"name": raw}, "name:" + raw, ""
+    hits = sorted(k for k in keys if canon_name(k) == canon)
+    if not hits:
+        hits = sorted(k for k in keys if _token_tail(canon, canon_name(k)))
+    if len(hits) == 1:
+        return ({"name": hits[0]}, "name:" + hits[0],
+                "имя %s → ключ реестра %s (канон %s)" % (raw, hits[0], canon))
+    if len(hits) > 1:
+        raise _verdict("имя %r (канон %r) подходит СРАЗУ к %d ключам реестра: %s — "
+                       "не угадываю, назови ключ точно или адресуй по file id"
+                       % (raw, canon, len(hits), ", ".join(hits)), 1)
+    near = sorted(k for k in keys if canon[:4] and (canon[:4] in k or canon_name(k)[:4] in canon))
+    raise _verdict("ИМЯ НЕ РАЗРЕШЕНО: %r → канон %r. В живом реестре такого ключа нет "
+                   "(ключей %d). Похожие ключи: %s. Адресуй по file id (--id), назови ключ "
+                   "реестра точно — либо ЗАРЕГИСТРИРУЙ файл под ключом (--register КЛЮЧ=ID), "
+                   "и правило канона подхватит имя само"
+                   % (raw, canon, len(keys), ", ".join(near) or "нет"), 2)
 
 
 def register_doc(name, doc_id, overwrite=False, env=None, post=None):
@@ -373,7 +522,9 @@ def apply(mutate, doc_id="", name="", expect=None, marker=None,
     if (get is None or post is None) and _in_test_context():
         raise BrainWriterError("тестовый контекст (гейт/юнит): живой док %s НЕ трогаем — "
                                "инжектируй get/post мок-тестом" % ref, 1)
-    old = _read(url, token, addr, ref, get)
+    # Адрес берём ТОТ, по которому чтение реально состоялось (имя могло разрешиться в ключ
+    # реестра или в file id) — и записываем потом ровно по нему.
+    old, addr, ref = _read(url, token, addr, ref, get, env=env)
     try:
         new = mutate(old)
     except ValueError as e:
@@ -395,8 +546,9 @@ def apply(mutate, doc_id="", name="", expect=None, marker=None,
     if not (isinstance(w, dict) and w.get("ok")):
         raise BrainWriterError("write_doc(%s) не ok: %s (бэкап: %s)"
                                % (ref, json.dumps(w, ensure_ascii=False)[:300], backup), 4)
-    # ОБРАТНОЕ ЧТЕНИЕ — верификация по живому доку, не по локальной склейке
-    back = _read(url, token, addr, ref, get)
+    # ОБРАТНОЕ ЧТЕНИЕ — верификация по живому доку, не по локальной склейке (адрес уже
+    # разрешён выше; повторно разрешать нечего — resolve=False)
+    back = _read(url, token, addr, ref, get, env=env, resolve=False)[0]
     # СВЕРКА ДЛИНЫ. Проверка «expect есть в тексте» НЕ отличает «легло целиком» от «легло ВМЕСТО
     # дока»: усечённый док тоже содержит новую строку. Сравниваем с длиной ДО записи и с длиной
     # отправленного (последнее — с запасом _READBACK_SLACK на нормализацию хвоста в Docs).
@@ -518,6 +670,8 @@ def main(argv=None):
                     help="только чтение: весь манифест Brain (ключ → id) как JSON")
     ap.add_argument("--probe-actions", dest="probe_actions", action="store_true",
                     help="только чтение: список POST-экшенов живого прода")
+    ap.add_argument("--resolve", default="", metavar="ИМЯ",
+                    help="только чтение: во что разрешается имя (KB_INFRA → ключ infra, …)")
     ap.add_argument("--create", default="", metavar="КЛЮЧ",
                     help="СОЗДАТЬ новый plain-док в папке Brain с именем --name и зарегистрировать "
                          "его под ключом КЛЮЧ манифеста ([a-z0-9_]); «-» → создать без регистрации")
@@ -546,6 +700,10 @@ def main(argv=None):
             acts = bridge_post_actions()
             _out(json.dumps(acts, ensure_ascii=False))
             _out("POST-экшенов у живого прода: %d" % len(acts))
+            return 0
+        if a.resolve:
+            addr, ref, note = resolve_name(a.resolve)
+            _out("%s → %s%s" % (a.resolve, ref, ("  [%s]" % note) if note else "  [ключ реестра]"))
             return 0
         if a.move_into_brain:
             r = move_into_brain(a.move_into_brain)

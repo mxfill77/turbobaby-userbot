@@ -40,6 +40,8 @@ class FakeBridge:
 
     def get(self, url, params):
         self.reads.append(dict(params))
+        if params.get("action") == "list_brain":       # живой формат doGet.list_brain: манифест целиком
+            return {"ok": True, "manifest": dict(self.names, folder_id="FOLDER")}
         did = self._resolve(params)
         if did is None or did not in self.docs:
             return {"ok": False, "error": "unknown_name", "known": sorted(self.names)}
@@ -357,6 +359,160 @@ class TestReadText(Base):
     def test_read_unknown_raises(self):
         with self.assertRaises(bw.BrainWriterError):
             bw.read_text(name="нет_такого", env=ENV, get=self.bridge.get)
+
+
+# Ключи — как в ЖИВОМ реестре 01.08.2026 (29 доков + folder_id; `north_star` зарегистрирован
+# этим же заходом): только [a-z0-9_], ни одной заглавной, ни одного префикса KB_. Именно поэтому
+# рамка, зовущая доки титулами (KB_MASTER, KB_INFRA), получала unknown_name — правило-класс
+# «мок копирует живой формат».
+LIVE_KEYS = ["booking_flow", "business_rules", "cc_log", "cc_log_archive", "cc_userbot_log",
+             "collect_booking_spec", "cowork_log", "cowork_log_archive", "cowork_log_test",
+             "cowork_log_test_archive", "executors_map", "faq", "index", "infra",
+             "knowledge_base", "north_star", "orchestrator_plan", "orchestrator_safety",
+             "park_list", "payments_plan", "project_state", "pulse", "review", "review_archive",
+             "rules", "sessions_log", "sessions_log_archive", "state_model", "turbobaby_faq"]
+
+
+class ResolveBase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.bridge = FakeBridge(docs={k.upper(): "тело " + k for k in LIVE_KEYS},
+                                 names={k: k.upper() for k in LIVE_KEYS})
+
+    def _res(self, name):
+        return bw.resolve_name(name, env=ENV, get=self.bridge.get)
+
+
+class TestResolveNames(ResolveBase):
+    """Разрешение имён: ОДНО правило канона поверх живого реестра, и ничего кроме него."""
+
+    def test_canon_rule_covers_case_prefix_and_separators(self):
+        """Одно правило: регистр, префикс KB_ и разделители — всё это одно и то же имя."""
+        for name in ("KB_INFRA", "kb_infra", "KB_Infra", "kb-infra", "INFRA", " infra "):
+            addr, ref, _ = self._res(name)
+            self.assertEqual(addr, {"name": "infra"}, name)
+            self.assertEqual(ref, "name:infra")
+
+    def test_exact_registry_key_needs_no_resolution(self):
+        """Ключ реестра уходит на мост как раньше: ни лишнего запроса, ни смены поведения."""
+        self.assertEqual(bw.read_text(name="infra", env=ENV, get=self.bridge.get), "тело infra")
+        self.assertEqual([r.get("action") for r in self.bridge.reads], ["read_doc"])
+
+    def test_token_tail_match_both_directions(self):
+        """`KB_userbot_log` ↔ `cc_userbot_log` и `KB_claude_review_archive` ↔ `review_archive`."""
+        self.assertEqual(self._res("KB_userbot_log")[0], {"name": "cc_userbot_log"})
+        self.assertEqual(self._res("KB_claude_review_archive")[0], {"name": "review_archive"})
+
+    def test_substring_alone_is_not_a_match(self):
+        """Совпадение — только по ГРАНИЦЕ ТОКЕНА и только с ХВОСТА. `park` внутри `park_list` не
+        считается; иначе `cc_log` «совпал» бы с `cc_log_archive` и правка ушла бы в архив."""
+        for name in ("KB_park", "KB_nowledge_base", "cc_log_arch"):
+            with self.assertRaises(bw.BrainWriterError) as cm:
+                self._res(name)
+            self.assertIn("НЕ РАЗРЕШЕНО", str(cm.exception), name)
+
+    def test_ambiguity_refuses_instead_of_guessing(self):
+        """Несколько кандидатов — отказ со списком: угадать чужой док хуже, чем встать."""
+        for name, cands in (("KB_log_archive", ("cc_log_archive", "cowork_log_archive")),
+                            ("KB_log", ("cc_log", "cowork_log", "sessions_log"))):
+            with self.assertRaises(bw.BrainWriterError) as cm:
+                self._res(name)
+            for c in cands:
+                self.assertIn(c, str(cm.exception), name)
+
+    def test_registered_orphan_is_caught_by_the_rule_itself(self):
+        """KB_NORTH_STAR жил вне реестра и потому «не существовал» во всех описях. Лечение —
+        РЕГИСТРАЦИЯ (сделана 01.08 на живом мосту), а не строка данных в коде: получив ключ,
+        имя ловится тем же каноном, что KB_INFRA."""
+        addr, ref, note = self._res("KB_NORTH_STAR")
+        self.assertEqual(addr, {"name": "north_star"})
+        self.assertEqual(self._res("north_star")[0], addr)   # тот же канон — тот же адрес
+
+    def test_addresses_that_need_data_refuse_honestly(self):
+        """ГРАНИЦА ПРАВИЛА, держится намеренно. Титул ≠ ключ (`KB_MASTER` при ключе `index`),
+        орфан без ключа (`roadmap_v2`), id из сайдкара (`KB_trainer_log`), мёртвое имя
+        (`roadmap_master`) — лексикой не выводятся. Пока данных нет, канал ОТКАЗЫВАЕТ вслух
+        и называет канон, а не угадывает док: словарь в коде разошёлся бы с реестром молча."""
+        for name in ("KB_MASTER", "roadmap_v2", "KB_trainer_log", "roadmap_master"):
+            with self.assertRaises(bw.BrainWriterError) as cm:
+                self._res(name)
+            self.assertIn("НЕ РАЗРЕШЕНО", str(cm.exception), name)
+            self.assertTrue(getattr(cm.exception, "verdict", False), name)
+
+    def test_refusal_names_the_cure_that_exists(self):
+        """Отказ обязан назвать выход, который РАБОТАЕТ: регистрация ключа (проверена живьём)."""
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            self._res("KB_MASTER")
+        self.assertIn("--register", str(cm.exception))
+
+    def test_unresolvable_name_says_what_it_tried(self):
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            self._res("KB_INFRA_UNIFY_FUTURE")
+        self.assertIn("infra_unify_future", str(cm.exception))       # назван канон, а не «нет»
+
+    def test_folder_id_is_never_a_doc(self):
+        with self.assertRaises(bw.BrainWriterError):
+            self._res("folder_id")
+
+    def test_registry_is_the_only_source_of_addresses(self):
+        """Снимут ключ с прода — имя перестаёт резолвиться ТУТ ЖЕ. Второго словаря нет, значит
+        нечему разойтись с реестром: канал знает ровно то, что знает мост."""
+        self.bridge.names.pop("north_star")
+        with self.assertRaises(bw.BrainWriterError):
+            self._res("KB_NORTH_STAR")
+
+    def test_flaky_registry_read_is_retried_not_a_verdict(self):
+        """Флап моста на ДОБАВОЧНОМ запросе реестра не имеет права стать «имя не резолвится»."""
+        bw._READ_PAUSE = 0
+        self.addCleanup(lambda: setattr(bw, "_READ_PAUSE", 1.5))
+        real, calls = self.bridge.get, []
+
+        def flaky(url, params):
+            if params.get("action") == "list_brain":
+                calls.append(1)
+                if len(calls) < 3:
+                    raise OSError("The read operation timed out")
+            return real(url, params)
+
+        self.assertEqual(bw.resolve_name("KB_INFRA", env=ENV, get=flaky)[0], {"name": "infra"})
+        self.assertEqual(len(calls), 3)
+
+    def test_registry_failure_keeps_the_honest_unknown_name(self):
+        """Реестр не прочитался — не выдумываем вердикт про имя, отдаём ответ моста как есть."""
+        self.bridge.get = lambda url, params: {"ok": False, "error": "unknown_name"}
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            bw.read_text(name="KB_INFRA", env=ENV, get=self.bridge.get)
+        self.assertIn("unknown_name", str(cm.exception))
+
+
+class TestResolvedAddressIsUsedForWriteToo(ResolveBase):
+    """САМОЕ ОПАСНОЕ место правки: прочитать один док, а записать по старому адресу."""
+
+    def test_append_by_title_reads_and_writes_the_same_doc(self):
+        res = bw.append("НОВАЯ СТРОКА", name="KB_INFRA", env=ENV, get=self.bridge.get,
+                        post=self.bridge.post, backup_dir=self._tmp.name)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(len(self.bridge.writes), 1)
+        self.assertEqual(self.bridge.writes[0].get("name"), "infra")   # НЕ «KB_INFRA»
+        self.assertTrue(self.bridge.docs["INFRA"].startswith("НОВАЯ СТРОКА\n"))
+
+    def test_unresolvable_name_never_reaches_write(self):
+        """Имя без адреса обязано умереть ДО write_doc: «непонятно куда» пишут в чужой док."""
+        for name in ("KB_MASTER", "roadmap_master", "KB_log"):
+            with self.assertRaises(bw.BrainWriterError):
+                bw.append("НОВАЯ СТРОКА", name=name, env=ENV, get=self.bridge.get,
+                          post=self.bridge.post, backup_dir=self._tmp.name)
+        self.assertEqual(self.bridge.writes, [])
+
+    def test_raw_lane_keeps_the_pre_translator_behaviour(self):
+        """resolve=False — «как было»: имя уходит на мост как написано, промах остаётся
+        промахом. На этой полосе меряется числитель регресса, поэтому она обязана быть честной."""
+        with self.assertRaises(bw.BrainWriterError) as cm:
+            bw.read_text(name="KB_INFRA", env=ENV, get=self.bridge.get, resolve=False)
+        self.assertIn("unknown_name", str(cm.exception))
+        self.assertEqual(bw.read_text(name="infra", env=ENV, get=self.bridge.get, resolve=False),
+                         "тело infra")
 
 
 if __name__ == "__main__":
