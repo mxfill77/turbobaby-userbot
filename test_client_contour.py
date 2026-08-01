@@ -444,19 +444,19 @@ class TestVorotaVhoda(unittest.TestCase):
         """Даже если находка каким-то путём дошла до enqueue — зелёной задачей она не встанет."""
         calls = []
         with mock.patch.object(o, "enqueue_pc_task", lambda t, frm=None: (calls.append(t), (True, 1, None))[1]):
-            enq, skip = o._revizor_enqueue_tasks(
+            enq, skip, left = o._revizor_enqueue_tasks(
                 [{"class": "б", "task_text": "поправь detectVehicleType в suggest.py", "client_id": 1}],
                 [], 0)
-        self.assertEqual((enq, skip), (0, 1))
+        self.assertEqual((enq, skip, left), (0, 1, []))   # клиентская находка — не в спул: её место в owner-карточке
         self.assertEqual(calls, [])
 
     def test_enqueue_vnutrennyuyu_zadachu_stavit_kak_ranshe(self):
         calls = []
         with mock.patch.object(o, "enqueue_pc_task", lambda t, frm=None: (calls.append(t), (True, 7, None))[1]):
-            enq, skip = o._revizor_enqueue_tasks(
+            enq, skip, left = o._revizor_enqueue_tasks(
                 [{"class": "ж", "task_text": "в pc_orchestrator.py почини троттлинг тика", "client_id": 1}],
                 [], 0)
-        self.assertEqual((enq, skip), (1, 0))
+        self.assertEqual((enq, skip, left), (1, 0, []))
         self.assertEqual(len(calls), 1)
 
 

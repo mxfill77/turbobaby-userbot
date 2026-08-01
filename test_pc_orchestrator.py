@@ -133,6 +133,9 @@ class Base(unittest.TestCase):
         self._save_af = o.AUTOFETCH_STATE_FILE    # признак состояния авто-фетча: свежий на КАЖДЫЙ тест
         o.AUTOFETCH_STATE_FILE = os.path.join(tempfile.mkdtemp(), "autofetch.json")  # (prev=None → чистый лист)
         self.addCleanup(lambda: setattr(o, "AUTOFETCH_STATE_FILE", self._save_af))
+        self._save_sp = o.REVIZOR_SPOOL_FILE      # спул недоставленных находок ревизора: свой файл на тест
+        o.REVIZOR_SPOOL_FILE = os.path.join(tempfile.mkdtemp(), "revizor_spool.json")  # (боевой не читаем и не пишем)
+        self.addCleanup(lambda: setattr(o, "REVIZOR_SPOOL_FILE", self._save_sp))
         # СЛЕДЫ РАБОТЫ (класс 30.07 «статус врёт»): по умолчанию следов НЕТ и отметки claim пишем
         # во временный файл. Иначе сбор улик пошёл бы в ЖИВОЙ git репозитория — окна тестов строятся
         # от «сейчас», и вердикт зависел бы от того, коммитил ли кто-то в последний час (тот же
@@ -5509,6 +5512,64 @@ class TestRevizorState(unittest.TestCase):
         o._revizor_write_state(2_000_000.0, path=self.state)
         self.assertIsNone(o.maybe_revizor(now=2_000_000.0 + 5, state_path=self.state))
 
+    # ---- РЕГРЕСС 01.08.2026: метка не ставится, пока находки не доставлены ----
+    # Инцидент: прогон 13:07 UTC не достучался до очереди, 10 owner-находок «отложены», а метка
+    # прогона встала — следующий прогон те же окна уже не брал. Пометка «отработал» при выброшенной
+    # работе — ложь о результате (класс 7a65fa3). Ниже — обе стороны развилки.
+
+    def _run_with_route(self, route, now2=None):
+        """Прогон после периода с подменённой маршрутизацией → (prev_iso, состояние после)."""
+        o._revizor_write_state(1_000_000.0, path=self.state)
+        prev_iso = o._revizor_read_state(path=self.state)["last_run"]
+        now2 = 1_000_000.0 + o.REVIZOR_SEC + 1 if now2 is None else now2
+        save = o.revizor_tick
+        o._revizor_route = route
+        try:
+            o.revizor_tick = lambda since=None, **k: [{"client_id": 1}]
+            o.maybe_revizor(now=now2, state_path=self.state)
+        finally:
+            o.revizor_tick = save
+        return prev_iso, o._revizor_read_state(path=self.state), now2
+
+    def test_deferred_findings_do_not_advance_mark(self):
+        prev, st, now2 = self._run_with_route(lambda *a, **k: {"deferred": True, "spooled": 3})
+        self.assertEqual(st["last_run"], prev)          # «докуда дошли» НЕ сдвинулось → окна вернутся
+        self.assertEqual(st["ts"], now2)                # но троттлинг честный: не долбим думателем раз в минуту
+        self.assertIn("deferred_at", st)                # и след недоставленного прогона виден
+
+    def test_delivered_findings_advance_mark(self):
+        prev, st, now2 = self._run_with_route(lambda *a, **k: {"tasks": 1, "owner": 2})
+        self.assertNotEqual(st["last_run"], prev)       # доставлено → метка идёт вперёд, как раньше
+        self.assertEqual(st["ts"], now2)
+        self.assertNotIn("deferred_at", st)
+
+    def test_route_crash_does_not_advance_mark(self):
+        def boom(*a, **k):
+            raise RuntimeError("маршрутизация упала")
+        prev, st, _now2 = self._run_with_route(boom)
+        self.assertEqual(st["last_run"], prev)          # находки погибли с кадром → прогон не зачтён
+
+    def test_empty_run_still_calls_route_to_flush_spool(self):
+        """Окон нет — маршрутизацию всё равно зовём: в спуле может лежать недоставленное."""
+        seen = {"n": 0}
+        o._revizor_write_state(1_000_000.0, path=self.state)
+        save = o.revizor_tick
+        o._revizor_route = lambda *a, **k: seen.__setitem__("n", seen["n"] + 1) or {}
+        try:
+            o.revizor_tick = lambda since=None, **k: []           # активных окон нет
+            o.maybe_revizor(now=1_000_000.0 + o.REVIZOR_SEC + 1, state_path=self.state)
+        finally:
+            o.revizor_tick = save
+        self.assertEqual(seen["n"], 1)
+
+    def test_tick_label_tells_about_undelivered_run(self):
+        st = {"last_run": "2026-08-01T07:00:31+00:00", "ts": 1.0,
+              "deferred_at": "2026-08-01T13:02:22+00:00"}
+        lab = o._revizor_tick_label(state=st)
+        self.assertIn("2026-08-01 07:00", lab)                    # зачтённый тик — прежний
+        self.assertIn("2026-08-01 13:02", lab)                    # и прямо сказано про недоставленный прогон
+        self.assertIn("не доставил", lab)
+
 
 # --------------------------- РЕВИЗОР: МАРШРУТИЗАЦИЯ (шаг 4/7, 262) ---------------------------
 
@@ -5643,8 +5704,8 @@ class TestRevizorEnqueueBudget(Base):
         return {"class": cls, "action": "task", "task_text": task, "client_id": cid}
 
     def test_enqueue_puts_dec_parent(self):
-        enq, skip = o._revizor_enqueue_tasks([self._f("а")], [], _REV_NOW)
-        self.assertEqual((enq, skip), (1, 0))
+        enq, skip, left = o._revizor_enqueue_tasks([self._f("а")], [], _REV_NOW)
+        self.assertEqual((enq, skip, left), (1, 0, []))
         news = [t for t in self.fb.tasks.values() if t["status"] == "new"]
         self.assertEqual(len(news), 1)
         self.assertEqual(news[0]["from"], o.PC_LOCAL_DEC_FROM)       # зелёный родитель дирижёру
@@ -5654,27 +5715,30 @@ class TestRevizorEnqueueBudget(Base):
         today = o._revizor_today(_REV_NOW)
         items = [{"task_text": f"[ревизор дата={today} класс=а] уже", "status": "done"},
                  {"task_text": f"[ревизор дата={today} класс=б] уже", "status": "done"}]
-        enq, skip = o._revizor_enqueue_tasks([self._f("в"), self._f("г")], items, _REV_NOW)
+        enq, skip, left = o._revizor_enqueue_tasks([self._f("в"), self._f("г")], items, _REV_NOW)
         self.assertEqual(enq, 0)                                     # бюджет уже исчерпан сегодня
         self.assertEqual(skip, 2)
+        self.assertEqual([f["class"] for f in left], ["в", "г"])      # не выброшены: зовущий кладёт их в спул
         self.assertEqual(len([t for t in self.fb.tasks.values()]), 0)
 
     def test_budget_ignores_other_days(self):
         items = [{"task_text": "[ревизор дата=2020-01-01 класс=а] вчера", "status": "done"},
                  {"task_text": "[ревизор дата=2020-01-02 класс=б] позавчера", "status": "done"}]
-        enq, _skip = o._revizor_enqueue_tasks([self._f("в")], items, _REV_NOW)
+        enq, _skip, _left = o._revizor_enqueue_tasks([self._f("в")], items, _REV_NOW)
         self.assertEqual(enq, 1)                                     # прошлые дни бюджет сегодня не жгут
 
     def test_dedup_by_class(self):
         today = o._revizor_today(_REV_NOW)
         items = [{"task_text": f"[ревизор дата={today} класс=а] уже есть", "status": "new"}]
-        enq, skip = o._revizor_enqueue_tasks([self._f("а"), self._f("б")], items, _REV_NOW)
+        enq, skip, left = o._revizor_enqueue_tasks([self._f("а"), self._f("б")], items, _REV_NOW)
         self.assertEqual((enq, skip), (1, 1))                        # класс «а» дедуп, «б» поставлен
+        self.assertEqual(left, [])                                   # дедуп — это НЕ отсрочка: класс уже в очереди
         self.assertTrue(any("класс=б]" in t["task_text"] for t in self.fb.tasks.values()))
 
     def test_dedup_within_batch(self):
-        enq, skip = o._revizor_enqueue_tasks([self._f("а"), self._f("а")], [], _REV_NOW)
+        enq, skip, left = o._revizor_enqueue_tasks([self._f("а"), self._f("а")], [], _REV_NOW)
         self.assertEqual((enq, skip), (1, 1))                        # второй той же партии — дедуп
+        self.assertEqual(left, [])
 
 
 class TestRevizorOwnerCard(Base):
@@ -5780,6 +5844,144 @@ class TestRevizorRoute(Base):
         self.assertEqual(self.notes, [])                               # окон нет вовсе → даже NOTE не пишем
 
 
+# ---- КЛАСС «НАХОДКИ РЕВИЗОРА ТЕРЯЮТСЯ МОЛЧА» (живой инцидент 01.08.2026 13:07 UTC) ----
+# «0 задач и 10 owner-находок отложены до след. прогона» — а откладывать было НЕКУДА: находки жили
+# только в памяти прогона, метка же ставилась ВСЕГДА, поэтому следующий прогон те же окна в отбор
+# не брал. За всё время таких отсрочек — 4, находок в них — 19 (2 task + 17 owner, замер по живому
+# журналу). Голдены ниже — ровно этот регресс: находка переживает недоступную очередь, доезжает
+# следующим прогоном (даже если окон в нём нет), а метка «докуда дошли» стоит, пока не доставлено.
+
+class TestRevizorSpool(Base):
+    """Спул недоставленных находок: сохранение при отказе очереди, подъём следующим прогоном,
+    дедуп с повторной находкой того же окна, потолок, битый файл."""
+
+    def setUp(self):
+        super().setUp()
+        self._save_c = (o._revizor_consult, o._cowork)
+        self.notes = []
+        o._cowork = lambda line: self.notes.append(line)
+        o._revizor_consult = lambda pkg: []
+        self.addCleanup(lambda: (setattr(o, "_revizor_consult", self._save_c[0]),
+                                 setattr(o, "_cowork", self._save_c[1])))
+
+    def _consult(self, mapping):
+        o._revizor_consult = lambda pkg: mapping.get(pkg.get("client_id"))
+
+    def _owner(self, ev="спорный тариф", cls="г", cid=1):
+        return {"class": cls, "action": "owner", "evidence": ev, "client_id": cid}
+
+    def _task(self, cls="ж", txt="котировать, не анкетировать", cid=1):
+        return {"class": cls, "action": "task", "task_text": txt, "client_id": cid, "evidence": ""}
+
+    def _queue_down(self):
+        save = o._loc_fetch_items
+        o._loc_fetch_items = lambda: None
+        self.addCleanup(lambda: setattr(o, "_loc_fetch_items", save))
+
+    # --- сам спул (чистые функции) ---
+    def test_read_missing_spool_is_empty(self):
+        self.assertEqual(o._revizor_spool_read(), [])
+
+    def test_save_then_read_roundtrip(self):
+        self.assertEqual(o._revizor_spool_save([self._owner("улика A"), self._task()]), 2)
+        got = o._revizor_spool_read()
+        self.assertEqual([f.get("action") for f in got], ["owner", "task"])
+        self.assertEqual(got[0]["evidence"], "улика A")
+
+    def test_read_corrupt_spool_is_empty(self):
+        with io.open(o.REVIZOR_SPOOL_FILE, "w", encoding="utf-8") as f:
+            f.write("{битый json")
+        self.assertEqual(o._revizor_spool_read(), [])                  # fail-safe: не роняем прогон
+
+    def test_save_dedups_by_key(self):
+        self.assertEqual(o._revizor_spool_save([self._owner("одна и та же"),
+                                                self._owner("одна и та же")]), 1)
+
+    def test_overflow_keeps_fresh_and_says_so(self):
+        many = [self._owner(f"улика {i}") for i in range(o._REVIZOR_SPOOL_MAX + 5)]
+        self.assertEqual(o._revizor_spool_save(many), o._REVIZOR_SPOOL_MAX)
+        got = o._revizor_spool_read()
+        self.assertEqual(got[-1]["evidence"], f"улика {o._REVIZOR_SPOOL_MAX + 4}")   # хвост — самые свежие
+        self.assertNotIn("улика 0", [f["evidence"] for f in got])                    # обрезан старый, и это в логе
+
+    # --- РЕГРЕСС: очередь недоступна → находки НЕ пропадают ---
+    def test_queue_unavailable_saves_findings_to_spool(self):
+        self._consult({1: [self._owner("депозит требует оба")]})
+        self._queue_down()
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertTrue(out.get("deferred"))
+        self.assertEqual(out.get("spooled"), 1)
+        spool = o._revizor_spool_read()
+        self.assertEqual(len(spool), 1)                                # находка ПЕРЕЖИЛА прогон
+        self.assertEqual(spool[0]["evidence"], "депозит требует оба")
+        self.assertTrue(any("сохранено в спул: 1" in n for n in self.notes))
+
+    def test_spooled_owner_delivered_next_run_without_windows(self):
+        """Следующий прогон БЕЗ активных окон обязан донести отложенное — иначе спул лежит вечно."""
+        o._revizor_spool_save([self._owner("улика прошлого прогона")])
+        out = o._revizor_route([], now=_REV_NOW)                       # окон нет вовсе
+        cards = [t for t in self.fb.tasks.values() if t["status"] == "needs_approval"]
+        self.assertEqual(len(cards), 1)
+        self.assertIn("улика прошлого прогона", cards[0]["what"])
+        self.assertEqual(out["owner"], 1)
+        self.assertEqual(o._revizor_spool_read(), [])                  # доставлено → спул пуст
+
+    def test_spooled_task_delivered_next_run(self):
+        o._revizor_spool_save([self._task(txt="фикс детекта прайса")])
+        o._revizor_route([], now=_REV_NOW)
+        news = [t for t in self.fb.tasks.values() if t["status"] == "new"]
+        self.assertEqual(len(news), 1)
+        self.assertEqual(news[0]["from"], o.PC_LOCAL_DEC_FROM)
+        self.assertIn("фикс детекта прайса", news[0]["task_text"])
+        self.assertEqual(o._revizor_spool_read(), [])
+
+    def test_spooled_and_fresh_same_finding_is_one_line(self):
+        """Метка не двигалась → окно ревизуется снова и даёт ТУ ЖЕ находку. Дедуп по ключу."""
+        f = self._owner("повтор того же дефекта")
+        o._revizor_spool_save([f])
+        self._consult({1: [dict(f)]})
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual(out["owner"], 1)
+        cards = [t for t in self.fb.tasks.values() if t["status"] == "needs_approval"]
+        self.assertEqual(cards[0]["what"].count("повтор того же дефекта"), 1)
+
+    def test_two_deferrals_accumulate_not_overwrite(self):
+        """Вторая отсрочка подряд не затирает первую — обе находки едут следующим прогоном."""
+        self._queue_down()
+        self._consult({1: [self._owner("первая", cls="а")]})
+        o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self._consult({2: [self._owner("вторая", cls="б", cid=2)]})
+        o._revizor_route([{"client_id": 2}], now=_REV_NOW)
+        evid = [f["evidence"] for f in o._revizor_spool_read()]
+        self.assertEqual(sorted(evid), ["вторая", "первая"])
+
+    def test_delivery_crash_spools_and_defers(self):
+        """Мост отвалился НА ДОСТАВКЕ (не на чтении очереди) — тот же класс: сохранить и отложить."""
+        save = o._revizor_post_owner_card
+        o._revizor_post_owner_card = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("мост лёг"))
+        self.addCleanup(lambda: setattr(o, "_revizor_post_owner_card", save))
+        self._consult({1: [self._owner("улика на падении")]})
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertTrue(out.get("deferred"))
+        self.assertEqual([f["evidence"] for f in o._revizor_spool_read()], ["улика на падении"])
+        self.assertTrue(any("доставка находок сорвалась" in n for n in self.notes))
+
+    def test_budget_leftovers_spooled_but_run_counted(self):
+        """Бюджет суток — отсрочка политикой: находка ложится в спул, но прогон зачтён (окна
+        отревизованы, очередь была жива) — иначе метка замерзала бы на сутки вперёд."""
+        today = o._revizor_today(_REV_NOW)
+        items = [{"task_text": f"[ревизор дата={today} класс=а] уже", "status": "done"},
+                 {"task_text": f"[ревизор дата={today} класс=б] уже", "status": "done"}]
+        save = o._loc_fetch_items
+        o._loc_fetch_items = lambda: items
+        self.addCleanup(lambda: setattr(o, "_loc_fetch_items", save))
+        self._consult({1: [self._task(cls="ж", txt="фикс, который не влез в бюджет")]})
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertFalse(out.get("deferred"))                          # прогон зачтён
+        self.assertEqual([f["task_text"] for f in o._revizor_spool_read()],
+                         ["фикс, который не влез в бюджет"])           # но находка НЕ выброшена
+
+
 # ---- МАНДАТ 14.07: авто-задачи ревизора НЕ заказывают деплой/рестарт прода ----
 # Живой урок: цепи 310/311 из находок ревизора доходили до КРАСНЫХ шагов «деплой+рестарт прод-ботов»
 # (✋ владельцу), хотя применение делает авто-reconcile. Голдены: находка «рестартни бота» → owner-
@@ -5880,8 +6082,9 @@ class TestRevizorDeployRouting(Base):
         # СТРАХОВКА: если деплой-ТЗ дошло до enqueue напрямую — в очередь НЕ ставим (skip), не задача
         f = {"class": "ж", "action": "task", "client_id": 5,
              "task_text": "деплой и рестарт прод-ботов"}
-        enq, skip = o._revizor_enqueue_tasks([f], [], _REV_NOW)
+        enq, skip, left = o._revizor_enqueue_tasks([f], [], _REV_NOW)
         self.assertEqual((enq, skip), (0, 1))
+        self.assertEqual(left, [])                                   # деплой-ТЗ в спул НЕ кладём: оно не доедет никогда
         self.assertEqual([t for t in self.fb.tasks.values() if t["status"] == "new"], [])
 
 

@@ -5616,16 +5616,32 @@ def _revizor_tick_label(state=None):
     last = (st or {}).get("last_run")
     if not last:
         return "надзор: ревизор — тиков ещё не было"
+    dfr = (st or {}).get("deferred_at")      # прогон был, но находки не доставлены → метка не двигалась
+    if dfr:
+        return (f"надзор: ревизор — последний ЗАЧТЁННЫЙ тик {_fmt_tick(last)}; прогон "
+                f"{_fmt_tick(dfr)} находки не доставил (лежат в спуле, те же окна пойдут снова)")
     return f"надзор: ревизор — последний тик {_fmt_tick(last)}"
 
 
-def _revizor_write_state(now, path=None):
+def _revizor_write_state(now, path=None, advance=True):
     """Метка ЭТОГО прогона на диск, атомарно (tmp+os.replace). ts (float wall-clock) — троттлинг
     между прогонами переживает рестарт демона; last_run (iso) — since для отбора окон СЛЕДУЮЩЕГО
-    прогона. Сбой записи НЕ роняет тик — тихий warning (как _persist_client_watch)."""
+    прогона. Сбой записи НЕ роняет тик — тихий warning (как _persist_client_watch).
+
+    advance=False — находки прогона НЕ доставлены (очередь молчит / доставка сорвалась): last_run
+    ОСТАВЛЯЕМ прежним, потому что «докуда дошли» не изменилось — те же окна обязаны попасть в отбор
+    следующего прогона. Пометка «отработал» при выброшенной работе — ложь о результате (класс
+    7a65fa3). ts при этом пишем ВСЕГДА и осознанно: демон поллит раз в 60с, а прогон зовёт думателя
+    по каждому окну (до REVIZOR_TIMEOUT на окно) — без троттлинга лежащая очередь давала бы вызов
+    модели каждую минуту. deferred_at — честный след недоставленного прогона (его читает статус)."""
     path = REVIZOR_STATE_FILE if path is None else path
     iso = datetime.datetime.fromtimestamp(float(now), datetime.timezone.utc).isoformat()
     blob = {"last_run": iso, "ts": float(now)}
+    if not advance:
+        prev = _revizor_read_state(path).get("last_run")
+        if prev:                                  # нет прежней метки (бутстрап) → двигать нечего
+            blob["last_run"] = prev
+            blob["deferred_at"] = iso
     try:
         tmp = str(path) + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -5633,6 +5649,80 @@ def _revizor_write_state(now, path=None):
         os.replace(tmp, path)
     except Exception as e:
         log.warning("ревизор: метка прогона не записана (%s): %s", path, e)
+
+
+# ------------------- РЕВИЗОР: СПУЛ НЕДОСТАВЛЕННЫХ НАХОДОК (01.08.2026) --------
+# Живой инцидент 01.08 13:07 UTC: очередь была недоступна → в журнал легло честное «0 задач и 10
+# owner-находок отложены до след. прогона», НО откладывать было НЕКУДА: находки жили только в
+# памяти прогона, а метка прогона ставилась ВСЕГДА. Следующий прогон брал since=эту метку, те же
+# окна в отбор уже не попадали — работа думателя (10 находок, ~5 минут модели по двум окнам)
+# выброшена молча при рапорте «отложены». Отсрочек к тому дню накопилось 4, находок в них — 19.
+# Тот же класс, что закрыл 7a65fa3: пометка «отработал» при недоставленном результате — ложь.
+# Замок двойной, и оба нужны:
+#   1) СПУЛ на диске — не смогли положить, значит СОХРАНИЛИ; следующий прогон доносит отложенные
+#      ПЕРВЫМИ (дедуп по ключу находки: тот же дефект, поднятый повторно по тому же окну, не
+#      задваивает строку owner-карточки);
+#   2) МЕТКА НЕ ДВИГАЕТСЯ (_revizor_write_state(advance=False)) — те же окна попадут в отбор снова,
+#      даже если спул записать не удалось (диск сорвался). Первый замок хранит ТЕКСТ находки,
+#      второй — саму возможность её пере-вывести.
+REVIZOR_SPOOL_FILE = os.path.join(REPO, "pc_orchestrator.revizor_spool.json")  # недоставленные находки
+_REVIZOR_SPOOL_MAX = 300           # потолок спула (≈неделя полной недоступности очереди при 10/прогон)
+
+
+def _revizor_finding_key(f):
+    """Ключ находки для дедупа: класс+окно+действие+улика+дев-ТЗ. Один и тот же дефект, пришедший
+    и из спула, и из повторной ревизии того же окна, обязан слиться в ОДНУ находку."""
+    d = f or {}
+    return (str(d.get("class") or ""), str(d.get("client_id") or ""), str(d.get("action") or ""),
+            str(d.get("evidence") or ""), str(d.get("task_text") or ""))
+
+
+def _revizor_dedup(findings):
+    """Находки без повторов ПО КЛЮЧУ, порядок сохранён (первое вхождение выигрывает — отложенные
+    прошлых прогонов идут первыми и не теряют очередь на доставку)."""
+    seen, out = set(), []
+    for f in findings or []:
+        k = _revizor_finding_key(f)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(f)
+    return out
+
+
+def _revizor_spool_read(path=None):
+    """Отложенные находки с диска → list[dict]. Файла нет / битый json / не список → [] (fail-safe:
+    спул не обязан существовать, его отсутствие — норма, а не сбой прогона)."""
+    p = REVIZOR_SPOOL_FILE if path is None else path
+    try:
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return []
+    return [x for x in d if isinstance(x, dict)] if isinstance(d, list) else []
+
+
+def _revizor_spool_save(findings, path=None):
+    """Недоставленные находки на диск, атомарно (tmp+os.replace), с дедупом по ключу. Переполнение —
+    держим ХВОСТ (самые свежие) и ГОВОРИМ, сколько отброшено: тихий обрез читался бы как «всё
+    сохранено». → сколько находок записано (0 = не записали, и это видно в логе; страховкой тогда
+    работает второй замок — неподвинутая метка). Пустой список = очистка спула."""
+    p = REVIZOR_SPOOL_FILE if path is None else path
+    keep = _revizor_dedup(findings)
+    if len(keep) > _REVIZOR_SPOOL_MAX:
+        log.warning("ревизор: спул находок переполнен — держим %d свежих, %d самых старых отброшено",
+                    _REVIZOR_SPOOL_MAX, len(keep) - _REVIZOR_SPOOL_MAX)
+        keep = keep[-_REVIZOR_SPOOL_MAX:]
+    try:
+        tmp = str(p) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(keep, f, ensure_ascii=False)
+        os.replace(tmp, p)
+        return len(keep)
+    except Exception as e:
+        log.error("ревизор: спул находок НЕ записан (%s): %s — работу держит только неподвинутая "
+                  "метка прогона (окна попадут в отбор снова)", p, e)
+        return 0
 
 
 def _revizor_db_rows(db_path=None):
@@ -5838,12 +5928,21 @@ def maybe_revizor(now=None, db_path=None, state_path=None):
             pass
     since = st.get("last_run")                       # None на самом первом прогоне → бутстрап (не разгребаем)
     result = revizor_tick(since=since, now=now, db_path=db_path) if since else None
-    if result:
+    delivered = True
+    if since:
+        # Маршрутизацию зовём ДАЖЕ на пустом прогоне (окон нет): в спуле могут лежать находки
+        # прошлого прогона, и донести их — работа этого. Пустой спул + ноль окон → route молча
+        # выходит, ни Bridge, ни журнал не трогает (поведение прежнее).
         try:
-            _revizor_route(result, now=now)          # шаг 4/7 (262): думатель по окну + маршрутизация находок
+            summary = _revizor_route(result or [], now=now) or {}   # шаг 4/7 (262): думатель по окну + маршрутизация
+            delivered = not summary.get("deferred")
         except Exception as e:
-            log.warning("ревизор: маршрутизация находок упала (fail-safe, метку всё равно ставим): %s", e)
-    _revizor_write_state(now, state_path)            # метку ставим ВСЕГДА (вкл. бутстрап) → следующий прогон ограничен
+            delivered = False                        # находки погибли вместе с кадром — прогон штатным не считаем
+            log.warning("ревизор: маршрутизация находок упала (fail-safe; метку прогона НЕ двигаем, "
+                        "те же окна вернутся в следующий отбор): %s", e)
+    # Метку пишем всегда (ts = троттлинг), но «докуда дошли» двигаем ТОЛЬКО при доставленных
+    # находках: иначе «отработал штатно» при выброшенной работе (см. _revizor_write_state).
+    _revizor_write_state(now, state_path, advance=delivered)
     return result
 
 
@@ -5858,7 +5957,8 @@ def maybe_revizor(now=None, db_path=None, state_path=None):
 #   noise → только лог (ложные срабатывания наружу не выносим).
 # Пусто (окна чисты) → тишина + NOTE «ревизор: N окон, чисто». Сбой думателя по окну → fail-safe
 # пропуск окна; все окна без ответа → NOTE о сбое (наружу тишина). Очередь недоступна (бюджет/дедуп
-# не сверить) → находки отложены до следующего прогона (НЕ флудим вслепую) + NOTE.
+# не сверить) → находки отложены до следующего прогона (НЕ флудим вслепую) + NOTE, и «отложены»
+# теперь означает СОХРАНЕНЫ: спул на диске + неподвинутая метка прогона (REVIZOR_SPOOL_FILE).
 REVIZOR_DAILY_BUDGET = int(os.getenv("REVIZOR_DAILY_BUDGET", "2") or "2")   # потолок задач-находок/сутки
 REVIZOR_OWNER_FROM = "Filipp-revizor"      # from синтетической owner-карточки (НЕ дирижёрская цепь pcloc-dec)
 REVIZOR_OWNER_MARK = "[ревизор-находки]"   # маркер сводной owner-карточки в инбоксе 1160 (дедуп/гарды)
@@ -5964,17 +6064,24 @@ def _revizor_demote_client_task(f, hits, determinate):
 def _revizor_enqueue_tasks(task_findings, items, now):
     """Находки action=task → зелёные родители дирижёру from=Filipp-pcloc-dec. Бюджет
     ≤REVIZOR_DAILY_BUDGET/сутки и дедуп ПО КЛАССУ — оба restart-proof из маркеров очереди (items).
-    Дедуп: класс уже среди поставленных ревизором задач → пропуск. → (enqueued:int, skipped:int)."""
+    Дедуп: класс уже среди поставленных ревизором задач → пропуск.
+    → (enqueued:int, skipped:int, left:list) — left это находки, не поставленные ИМЕННО из-за
+    суточного бюджета: их зовущий кладёт в спул (бюджет — отсрочка политикой, а не «выбросили»).
+    Пропуски по дедупу/деплой-словам/клиентскому контуру в left НЕ идут: класс уже в очереди либо
+    находка должна была стать owner-карточкой — их повтор в спуле не доехал бы никогда."""
     today = _revizor_today(now)
     prior = _revizor_task_markers(items)
     today_count = sum(1 for d, _c in prior if d == today)
     seen_classes = {c for _d, c in prior if c}          # дедуп по классу среди всех задач-находок в очереди
     enq = skip = 0
+    left = []
     for idx, f in enumerate(task_findings):
         if today_count >= REVIZOR_DAILY_BUDGET:
             rem = len(task_findings) - idx
             skip += rem
-            log.info("ревизор: суточный бюджет задач (%d) исчерпан — %d находок отложено", REVIZOR_DAILY_BUDGET, rem)
+            left = list(task_findings[idx:])            # НЕ теряем: доносим следующим прогоном (бюджет суток свежий)
+            log.info("ревизор: суточный бюджет задач (%d) исчерпан — %d находок отложено в спул",
+                     REVIZOR_DAILY_BUDGET, rem)
             break
         cls = (f.get("class") or "").strip()
         tt = (f.get("task_text") or "").strip()
@@ -6007,8 +6114,9 @@ def _revizor_enqueue_tasks(task_findings, items, now):
             log.info("ревизор: задача-находка класса '%s' → дирижёр id=%s (окно %s)", cls, nid, f.get("client_id"))
         else:
             skip += 1
-            log.warning("ревизор: enqueue задачи-находки не удался (%s)", err)
-    return enq, skip
+            left.append(f)                              # мост отказал на постановке — находка не доставлена, в спул
+            log.warning("ревизор: enqueue задачи-находки не удался (%s) — в спул", err)
+    return enq, skip, left
 
 
 def _revizor_owner_card_text(owner_findings, prior_lines=()):
@@ -6252,11 +6360,14 @@ def _revizor_route(packages, now=None):
     """Шаг 4/7 (262). Каждое окно → думатель-ревизор (_revizor_consult); находки маршрутизируем по
     action: task → дирижёр (бюджет/дедуп), owner → карточка 1160, noise → лог. Пусто → тишина +
     NOTE «N окон, чисто». Сбой думателя по окну → fail-safe пропуск; все окна без ответа → NOTE о
-    сбое. Ревизор сам НИЧЕГО не правит и клиентам НЕ пишет. → dict-сводка (для теста/лога)."""
+    сбое. Ревизор сам НИЧЕГО не правит и клиентам НЕ пишет. → dict-сводка (для теста/лога).
+
+    НЕДОСТАВЛЕННОЕ НЕ ПРОПАДАЕТ (01.08.2026): очередь молчит / доставка сорвалась / бюджет суток
+    исчерпан → находки уходят в СПУЛ на диск, и прогон возвращает deferred=True — вызывающий по
+    нему НЕ двигает метку «докуда дошли». Спул прошлых прогонов поднимается ЗДЕСЬ ЖЕ и доставляется
+    первым, поэтому пустой прогон (окон нет) всё равно доносит отложенное."""
     pkgs = list(packages or [])
     n = len(pkgs)
-    if not n:
-        return {"windows": 0, "tasks": 0, "owner": 0, "noise": 0, "failed": 0}
     now = time.time() if now is None else now
     task_f, owner_f, noise_n, failed, demoted = [], [], 0, 0, 0
     demoted_client = 0                      # находки, отданные владельцу воротами входа (клиентский контур)
@@ -6321,23 +6432,56 @@ def _revizor_route(packages, now=None):
     if demoted_client:
         log.info("ревизор: %d находок по КЛИЕНТСКОМУ контуру переведены из задач в owner-карточки "
                  "(ворота входа — правку живого бота решает человек)", demoted_client)
+    # ОТЛОЖЕННЫЕ ПРОШЛЫХ ПРОГОНОВ — поднимаем ДО развилки «наружу тишина»: прогон без своих находок
+    # обязан донести чужие (иначе спул лежал бы до первого «грязного» окна). Отложенные встают
+    # ПЕРВЫМИ, дедуп по ключу снимает повтор того же дефекта из повторной ревизии окна.
+    spooled = _revizor_spool_read()
+    if spooled:
+        sp_task = [f for f in spooled if f.get("action") == "task"]
+        sp_owner = [f for f in spooled if f.get("action") != "task"]
+        task_f = _revizor_dedup(sp_task + task_f)
+        owner_f = _revizor_dedup(sp_owner + owner_f)
+        log.info("ревизор: подняты отложенные находки прошлых прогонов: %d (задач %d, owner %d) — "
+                 "идут в доставку первыми", len(spooled), len(sp_task), len(sp_owner))
     if not task_f and not owner_f:              # окна чисты (или только шум/сбой) → наружу тишина, NOTE в журнал
-        if failed >= n:
+        if n and failed >= n:
             _cowork(f"ревизор: думатель не ответил ни по одному из {n} окон — прогон пропущен")
-        else:
+        elif n:
             tail = f" (+{noise_n} шум)" if noise_n else ""
             _cowork(f"ревизор: {n} окон, чисто{tail}")
         return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed}
     items = _loc_fetch_items()                  # снимок очереди (все статусы) — бюджет/дедуп/поиск карточки
     if items is None:                           # частичная картина опаснее ожидания → откладываем, не флудим
-        _cowork(f"ревизор: очередь недоступна — {len(task_f)} задач и {len(owner_f)} owner-находок отложены до след. прогона")
+        kept = _revizor_spool_save(task_f + owner_f)    # СОХРАНЯЕМ: «отложены» без спула = выброшены
+        _cowork(f"ревизор: очередь недоступна — {len(task_f)} задач и {len(owner_f)} owner-находок отложены "
+                f"до след. прогона (сохранено в спул: {kept}; метку прогона не двигаем)")
         return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed,
-                "demoted": demoted, "deferred": True}
+                "demoted": demoted, "deferred": True, "spooled": kept}
     enq = skip = 0
-    if task_f:
-        enq, skip = _revizor_enqueue_tasks(task_f, items, now)
-    if owner_f:
-        _revizor_post_owner_card(owner_f, items)
+    left = []
+    try:
+        if task_f:
+            enq, skip, left = _revizor_enqueue_tasks(task_f, items, now)
+        if owner_f:
+            _revizor_post_owner_card(owner_f, items)
+    except Exception as e:                      # мост отвалился на полудороге → находки в спул, метку не двигаем
+        kept = _revizor_spool_save(task_f + owner_f)
+        log.error("ревизор: доставка находок сорвалась (%s: %s) — отложены (в спуле %d)",
+                  type(e).__name__, e, kept)
+        _cowork(f"ревизор: доставка находок сорвалась ({type(e).__name__}) — {len(task_f)} задач и "
+                f"{len(owner_f)} owner-находок отложены до след. прогона (сохранено в спул: {kept}; "
+                f"метку прогона не двигаем)")
+        return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed,
+                "demoted": demoted, "deferred": True, "spooled": kept}
+    # Бюджет суток/отказ постановки — это ОТСРОЧКА, а не потеря: держим в спуле до следующего
+    # прогона. Метку при этом двигаем (deferred не ставим): очередь была доступна, окна отревизованы,
+    # а текст находки лежит на диске — пере-выводить его повторной ревизией окон незачем. Иначе
+    # метка замерзала бы на сутки вперёд (бюджет 2/сут против 4 прогонов/сут) и думатель гонял бы
+    # одни и те же окна по кругу.
+    if left:
+        _revizor_spool_save(left)
+    elif spooled:
+        _revizor_spool_save([])                 # доставлено — спул пуст (файл остаётся, содержимое []).
     parts = []
     if enq:
         parts.append(f"{enq} задач дирижёру")
@@ -6349,11 +6493,13 @@ def _revizor_route(packages, now=None):
         parts.append(f"{demoted_client} по клиентскому контуру → owner (ворота входа)")
     if failed:
         parts.append(f"{failed} окон без ответа думателя")
+    if left:
+        parts.append(f"{len(left)} задач-находок в спуле до след. прогона (бюджет суток)")
     if not parts:                               # находки были, но все отсеяны бюджетом/дедупом
         parts.append(f"находки отсеяны (бюджет/дедуп): task {len(task_f)}, skip {skip}")
     _cowork("ревизор: " + ", ".join(parts))
     return {"windows": n, "tasks": enq, "owner": len(owner_f), "noise": noise_n, "failed": failed,
-            "demoted": demoted, "demoted_client": demoted_client}
+            "demoted": demoted, "demoted_client": demoted_client, "spooled": len(left)}
 
 
 # ------------------- OS-синглтон демона (разбор #128, часть 4) ----------------
