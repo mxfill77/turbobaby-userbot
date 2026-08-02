@@ -4168,5 +4168,141 @@ class TestChannelRegistry(unittest.TestCase):
                                  "объявленный зелёным канал перестал быть зелёным: " + tool)
 
 
+class TestConfigMentionAndRollbackObject(unittest.TestCase):
+    """ДВА ДЕФЕКТА ОДНОЙ КАРТОЧКИ ЗАДАЧИ 189 (02.08.2026). Оба подтверждены замером до правки
+    (`docs/artifacts/2026-08-02-channel-registry-readonly-audit.md` §4):
+
+      Д-1 объект карточки — `.claude/settings.local.json` (под `.gitignore:8`), а строка отката —
+          статичный литерал про ДРУГОЙ файл, `.claude/settings.json`, да ещё с утверждением
+          «(файл под git)». Выполнивший её буквально откатил бы чужой отслеживаемый файл.
+      Д-2 операция была ЗАПИСЬЮ СТРОКИ В ЖУРНАЛ (`cowork_log_append.py`), а карточка объявила её
+          правкой конфига: разряд `edit_claude` сработал на ИМЕНИ ФАЙЛА В ТЕКСТЕ записи.
+
+    Голдены — ДОСЛОВНАЯ живая форма вызова писателя журнала (сентинел `-` + heredoc), а не
+    идеализированная: ровно на дефисе и ломался фикс 01.08."""
+
+    CFG = ".claude/settings.json"            # отслеживаемый git (git ls-files .claude/ → он один)
+    LOCAL = ".claude/settings.local.json"    # под .gitignore:8 — git его НЕ вернёт
+    JOURNAL = ("venv/Scripts/python.exe cowork_log_append.py - <<'EOF'\n"
+               "DONE Dispatch 18:46: сторож реестра каналов читал один файл прав из двух — "
+               "второй (.claude/settings.local.json) под .gitignore; тест правится, гард нет\n"
+               "EOF")
+
+    # ── Д-2: УПОМИНАНИЕ ПУТИ ОПЕРАЦИЕЙ НЕ ЯВЛЯЕТСЯ ─────────────────────────────────────────
+    def test_live_journal_line_of_task_189_makes_no_card(self):
+        """Дословная команда, на которой задача 189 умерла в needs_approval."""
+        self.assertEqual(g.decide(bash(self.JOURNAL)), ("defer", "", ""))
+        self.assertNotIn(self.LOCAL, g._scan_text(self.JOURNAL),
+                         "тело heredoc осталось под сканом: сентинел `-` снова читается как режим")
+
+    def test_path_in_writer_argument_is_a_mention_and_says_so_in_the_log(self):
+        """Вторая живая форма: путь АРГУМЕНТОМ доверенного писателя. Смягчение не стоит
+        прозрачности — в журнале это `cfg_mention`, а не безликое «ничего красного не нашли»."""
+        cmd = ('venv/Scripts/python.exe cowork_log_append.py - --anchor "правка %s"' % self.LOCAL)
+        self.assertEqual(g.decide(bash(cmd)), ("defer", "cfg_mention", self.LOCAL))
+        self.assertEqual(g.decide(bash('echo "правил %s вчера"' % self.CFG))[0], "defer")
+
+    def test_stdin_sentinel_belongs_to_the_named_script(self):
+        """Цель определяет ПЕРВЫЙ подходящий токен, а не наличие дефиса где-нибудь в строке."""
+        for seg, runs in ((_CCLOG + " -", False),          # `-` — сентинел писателя журнала
+                          (_CCLOG, False),
+                          ("venv/Scripts/python.exe -u cowork_log_append.py -", False),
+                          ("python -m json.tool -", False),
+                          ("python -", True),              # цель — stdin
+                          ("python - cowork_log_append.py", True),   # `-` ПЕРВЫЙ → цель stdin
+                          ('python -c "x"', True),
+                          ("bash", True)):
+            with self.subTest(seg):
+                self.assertEqual(g._seg_runs_stdin_as_code(seg), runs, seg)
+
+    # ── Д-2, ОБРАТНАЯ СТОРОНА: НАСТОЯЩАЯ ПРАВКА КОНФИГА КРАСНАЯ КАК БЫЛА ───────────────────
+    def test_real_config_edit_stays_red(self):
+        for path in (self.CFG, self.LOCAL):
+            for cmd in ("cp new.json " + path,
+                        "mv tmp/s.json " + path,
+                        "echo '{}' > " + path,
+                        "cat x | tee " + path,
+                        "Set-Content " + path + " '{}'",
+                        "notepad " + path,
+                        "python -c \"open('" + path + "','w').write('{}')\""):
+                with self.subTest(cmd):
+                    self.assertEqual(g.decide(bash(cmd))[:2], ("ask", "edit_claude"), cmd)
+        for path in (self.CFG, self.LOCAL):
+            full = os.path.join(PROJ, *path.split("/"))
+            self.assertEqual(g.decide(edit(full))[:2], ("ask", "edit_claude"), full)
+            self.assertEqual(g.decide({"tool_name": "Write", "cwd": PROJ,
+                                       "tool_input": {"file_path": full}})[:2],
+                             ("ask", "edit_claude"), full)
+        self.assertTrue(g._stays_red("edit_claude", self.LOCAL, ""))
+
+    def test_mention_does_not_open_the_writer_channel(self):
+        """Смягчение получает УПОМЯНАНИЕ, обращение — никогда: перенаправление, подстановка
+        команды в аргументе и труба в исполнителя stdin оставляют красное."""
+        for cmd in ("venv/Scripts/python.exe cowork_log_append.py - > " + self.CFG,
+                    'venv/Scripts/python.exe cowork_log_append.py "$(cp x %s)"' % self.CFG,
+                    'echo "cp x %s" | bash' % self.CFG,
+                    "venv/Scripts/python.exe cowork_log_append.py x && cp y " + self.LOCAL):
+            with self.subTest(cmd):
+                self.assertEqual(g.decide(bash(cmd))[:2], ("ask", "edit_claude"), cmd)
+        for cmd in ("cat " + self.CFG, "wc -l " + self.CFG):
+            self.assertEqual(g.decide(bash(cmd))[:2], ("defer", "cfg_read"), cmd)
+
+    # ── Д-1: ОБЪЕКТ И ОТКАТ — ПРО ОДИН ОБЪЕКТ ─────────────────────────────────────────────
+    def test_rollback_of_config_follows_the_object(self):
+        tracked = g._rollback("edit_claude", "", self.CFG)
+        self.assertIn("git checkout -- " + self.CFG, tracked)
+        local = g._rollback("edit_claude", "", self.LOCAL)
+        self.assertIn(self.LOCAL, local)
+        self.assertNotIn(self.CFG + " ", local + " ")   # чужой файл в откате не назван
+        self.assertNotIn("git checkout", local)
+        # Объект инструментов Write/Edit приходит БАЗОВЫМ именем — команда отката обязана
+        # остаться выполнимой, а не превратиться в `git checkout -- settings.json`.
+        self.assertIn("git checkout -- " + self.CFG, g._rollback("edit_claude", "", "settings.json"))
+        self.assertIn(self.LOCAL, g._rollback("edit_claude", "", "settings.local.json"))
+        self.assertTrue(g._rollback("edit_claude", "x").startswith("Откат: "))
+
+    def test_card_object_and_rollback_name_the_same_file(self):
+        """Замок общий, а не только для конфига: ни у одного красного вида откат не смеет
+        называть файл, отличный от объекта карточки."""
+        cases = (("delete", "tmp/x.log"), ("kill", "12345"), ("sqlite", "bookings.db"),
+                 ("env", _DOT_ENV), ("edit_secret", _DOT_ENV), ("read_secret", _DOT_ENV),
+                 ("edit_claude", self.LOCAL), ("edit_claude", self.CFG),
+                 ("edit_claude", "settings.local.json"), ("git_force", "main"),
+                 ("network", "example.com"), ("live_sheet", "Зарплаты"),
+                 ("outside", r"C:\tmp\y.txt"), ("py_write", "tmp/x.txt"),
+                 ("py_write", "void_last"), (_CL + "_deploy", "deploy"), ("unknown", ""))
+        for kind, obj in cases:
+            with self.subTest(kind=kind, obj=obj):
+                card = g._card(kind, obj, "")
+                rb = [ln for ln in card.splitlines() if ln.startswith("Откат: ")][0]
+                shown = [ln for ln in card.splitlines()
+                         if ln.startswith(g.OBJ_LINE_PREFIX)][0][len(g.OBJ_LINE_PREFIX):]
+                self.assertFalse(g._rollback_conflicts(rb, shown),
+                                 "откат называет не тот объект: %r против %r" % (rb, shown))
+
+    def test_foreign_rollback_never_reaches_the_card(self):
+        """Замок стоит У РОЖДЕНИЯ карточки, а не только в таблице: подменяем строку отката на
+        литерал про чужой файл — в карточку он не попадает. Саму карточку при этом НЕ ГЛОТАЕМ:
+        `defer` это пропуск операции, и снятие карточки было бы дырой, а не строгостью."""
+        saved = dict(g._ROLLBACK)
+        try:
+            g._ROLLBACK["delete"] = "Откат: git checkout -- " + self.CFG + " (файл под git)"
+            card = g._card("delete", "tmp/x.log", "rm tmp/x.log")
+            self.assertNotIn("settings.json", card)
+            self.assertIn("Откат: неизвестен", card)
+            self.assertTrue(card.splitlines()[0].startswith(("🔴", "⛔")), "карточка исчезла")
+        finally:
+            g._ROLLBACK.clear()
+            g._ROLLBACK.update(saved)
+
+    def test_named_files_ignores_placeholders_and_globs(self):
+        """Замок узкий сознательно: плейсхолдеры и шаблоны противоречить объекту не могут."""
+        self.assertEqual(g._named_files("Откат: git reflog → git reset --hard <прежний хеш>"), [])
+        self.assertEqual(g._named_files("Откат: " + _DOT_ENV + " вне git — вернуть из "
+                                        + _DOT_ENV + ".bak*"), [])
+        self.assertEqual(g._named_files("Откат: git checkout -- " + self.CFG + " (файл под git)"),
+                         [self.CFG])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

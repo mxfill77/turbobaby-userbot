@@ -156,6 +156,41 @@ venv/Scripts/python.exe cowork_log_append.py` (лог гарда `14:56:50 | ask
 ЗАПИСЬ → красное, объект — база; цель не определилась → красное и так подписано (fail-closed).
 Имя в тексте может ДОБАВИТЬ вопрос, снять — никогда. См. `_sql_write_object`.
 
+ВОСЬМАЯ ГРУППА ТОГО ЖЕ КЛАССА (02.08.2026) — КОНФИГ CLAUDE CODE. Два дефекта ОДНОЙ карточки
+задачи 189, оба подтверждены замером (`docs/artifacts/2026-08-02-channel-registry-readonly-audit.md`
+§4). Задача умерла в `needs_approval` (`dur_s=1155.67`) НА ЗАПИСИ В ЖУРНАЛ — вторая смерть того
+же класса после задачи 87.
+  • ВИД `edit_claude` СУДИЛ ПО ПОДСТРОКЕ, а не по действию. Разделения «упоминание против
+    обращения», которое вид `env` получил 01.08 (`_env_reach`), у конфига не было вовсе, а
+    смягчить могла только смотрелка (`_is_pure_config_read`) — писатель журнала смотрелкой не
+    является. Две ноги, каждая своим разбором:
+      · ТЕЛО HEREDOC НЕ ВЫРЕЗАЛОСЬ ИЗ-ЗА ТОКЕНА `-`. `_seg_runs_stdin_as_code` спрашивал «есть ли
+        где-нибудь `-`» РАНЬШЕ, чем «названа ли `.py`-цель», а `-` в
+        `cowork_log_append.py -` — СЕНТИНЕЛ САМОГО ПИСАТЕЛЯ (его же предписано брать для
+        кириллицы), а не режим интерпретатора. Замер: `True` с `-` против `False` без него на
+        одной команде. Теперь решает ПЕРВЫЙ токен, определяющий цель: у `python -` цель stdin,
+        у `python foo.py -` цель — `foo.py`, а `-` уже её аргумент.
+      · ПУТЬ АРГУМЕНТОМ ДОВЕРЕННОГО ПИСАТЕЛЯ — данные, а не операция (`_cfg_reach`, посегментно
+        и структурно, как `_env_reach`). Доверенных ровно три (`_RE_SAFE_SCRIPTS`), и файлов по
+        аргументу-пути они не пишут.
+  • ОТКАТ НАЗЫВАЛ ДРУГОЙ ФАЙЛ. Объектом карточки стоял `.claude/settings.local.json` (под
+    `.gitignore:8`), а строкой отката — статичный литерал `git checkout -- .claude/settings.json`
+    «(файл под git)». Владелец, выполнивший её буквально, откатил бы ЧУЖОЙ отслеживаемый файл, а
+    названный объект не изменился бы вовсе. Класс закрывали 31.07 (`6250c22`) для `py_write` и
+    `clasp_deploy` — `edit_claude` остался на литерале. Теперь откат собирается ПО ОБЪЕКТУ
+    (`_claude_cfg_tracked`: под git → `git checkout -- <объект>`; под `.gitignore` → честное «git
+    его НЕ вернёт»; файла не нашли → не утверждаем ни того, ни другого), а сверх того у РОЖДЕНИЯ
+    карточки стоит замок `_rollback_conflicts`: строка отката, назвавшая ФАЙЛ, отличный от
+    объекта, в карточку не попадает НИКОГДА — вместо неё честный прочерк и строка лога.
+    Карточку при этом НЕ ГЛОТАЕМ: `defer` — это пропуск операции (`main`), и снятие карточки
+    было бы дырой, а не строгостью.
+ЧТО НЕ ОСЛАБЛЕНО: настоящая правка конфига красная как была (`cp`/`mv`/`>`/`>>`/`tee`/
+`Set-Content`/редактор/`open(...,'w')` — и для `settings.json`, и для `settings.local.json`);
+инструменты Write/Edit по `.claude` не тронуты (`_decide_write`); `edit_claude` остаётся в
+`_HARD_CARD` и `_stays_red`; путь конфига ДО имени скрипта, труба в исполнителя stdin,
+подстановка команды в аргументе и любой признак записи в сегменте оставляют красное.
+Прозрачность лога разделена: чтение — `cfg_read`, чистое упоминание — `cfg_mention`.
+
 ДВА ВИДА КАРТОЧКИ ПО ЦЕНЕ ОШИБКИ (31.07.2026) — правка НЕ о классификации, а о ВИДЕ и ПОРЯДКЕ
 ПОДТВЕРЖДЕНИЯ. Повод: владелец подтвердил ТРИ карточки `live_sheet` подряд не читая — они
 пришли в общем потоке и тем же видом, что уборка временного файла. Замер за двое суток:
@@ -345,7 +380,7 @@ _RED_CMD = [
 # в признаке: он стареет молча.
 _ACTION_CHECK = {
     "_RE_ENV": "_env_reach / _py_env_readonly — наличие, окружение процесса и УПОМИНАНИЕ ≠ чтение",
-    "_RE_CLAUDE_CFG_CMD": "_is_pure_config_read — смотрелка против писателя, по командной позиции",
+    "_RE_CLAUDE_CFG_CMD": "_is_pure_config_read / _cfg_reach — смотрелка и УПОМИНАНИЕ ≠ правка",
     "_RE_OUTSIDE_WRITE": "_inside_project — цель перенаправления, а не слово в строке",
     "_RE_SQLITE_WORD": "_sqlite_decide — по оператору запроса (select/pragma ≠ update)",
     "_RE_LIVE_SHEET_HINT": "_live_sheet_decide — по форме обращения, слово в тексте не считается",
@@ -1909,11 +1944,20 @@ def _seg_runs_stdin_as_code(seg):
     if name not in _HEREDOC_EXEC:
         return False
     if name in _PY_INTERP:
-        rest = toks[j + 1:]
-        if "-" in rest or "-c" in rest:
-            return True                  # `python -` / инлайн-код: stdin и есть программа
-        if "-m" in rest or any(t.lower().endswith(".py") for t in rest):
-            return False                 # цель ИМЕНОВАНА → stdin ей ДАННЫЕ, а не код
+        # РЕШАЕТ ПОРЯДОК ТОКЕНОВ, А НЕ ИХ НАЛИЧИЕ (правка 02.08.2026, восьмая группа класса).
+        # Было: «есть ли где-нибудь `-`» проверялось РАНЬШЕ, чем «названа ли .py-цель», — и
+        # фикс 01.08 работал ровно до тех пор, пока в строке нет дефиса. А `-` в
+        # `venv/Scripts/python.exe cowork_log_append.py -` это СЕНТИНЕЛ САМОГО ПИСАТЕЛЯ
+        # (`cowork_log_append.py` → «Текст: argv, а `-` — СЕНТИНЕЛ stdin»), и именно эту форму
+        # предписано брать для кириллицы, — а не режим интерпретатора. Цена прежнего порядка:
+        # задача 189 умерла в `needs_approval` на записи в журнал, потому что тело heredoc
+        # осталось под сканом и путь, НАЗВАННЫЙ в тексте записи, дал карточку правки конфига.
+        # Граница та же, только читается слева направо: цель определяет ПЕРВЫЙ подходящий токен.
+        for t in toks[j + 1:]:
+            if t in ("-", "-c"):
+                return True              # `python -` / инлайн-код: программу читает сам питон
+            if t == "-m" or t.lower().endswith(".py"):
+                return False             # цель ИМЕНОВАНА → stdin ей ДАННЫЕ, а не код
     return True
 
 
@@ -2357,6 +2401,61 @@ def _env_probe_only(cmd):
     return _env_reach(cmd) is not None
 
 
+def _cfg_reach(cmd):
+    """→ `'cfg_mention'` ⇔ путь конфига Claude Code в команде только НАЗВАН; иначе `None`
+    (красное как было). Тот же разбор ПО ДЕЙСТВИЮ, что `_env_reach` у секретов, и та же граница:
+    смягчение получает УПОМИНАНИЕ, обращение — никогда.
+
+    Упоминанием считаем ровно два вида сегмента:
+      • ПЕЧАТЬ СВОЕГО АРГУМЕНТА (`_PRINT_CMDS`) — подпись к выводу это текст, а не операция;
+      • ПУТЬ В АРГУМЕНТАХ ДОВЕРЕННОГО ПИСАТЕЛЯ (`_RE_SAFE_SCRIPTS`: `cowork_log_append`,
+        `dispatch_notify`, `brain_writer`), запущенного питоном. Для этих трёх путь — ТЕКСТ
+        записи: файлов по аргументу-пути они не пишут, а канал держится зелёным по имени модуля
+        (доктрина `_RE_SAFE_SCRIPTS`). Здесь та же доктрина применена СТРУКТУРНО — по командной
+        позиции, а не подстрокой по всей команде: имя писателя где-то в строке смягчения не даёт.
+
+    Разбор посегментный (`_split_segments` + `_cmd_index`), fail-safe у каждого шага один —
+    сомнение даёт `None`:
+      • труба ИЗ сегмента в то, что ИСПОЛНЯЕТ stdin (`echo <путь> | python`);
+      • перенаправление или любой признак ЗАПИСИ в сегменте (`> …`, `cp`, `mv`, `tee`, `sed -i`);
+      • подстановка команды в любом токене (`… "$(cp x …)"`) — аргумент исполняется;
+      • путь стоит ДО имени писателя (значит он ЦЕЛЬ, а не данные) либо кривое квотирование;
+      • команда сегмента — что угодно ещё (в т.ч. чужой скрипт с путём операндом)."""
+    if not cmd:
+        return None
+    segs = _split_segments(cmd)
+    seen = False
+    for i in range(0, len(segs), 2):
+        seg = segs[i]
+        if not _RE_CLAUDE_CFG_CMD.search(seg):
+            continue
+        seen = True
+        if i + 1 < len(segs) and segs[i + 1].strip() == "|" \
+                and _seg_runs_stdin_as_code(segs[i + 2] if i + 2 < len(segs) else ""):
+            return None
+        if _RE_CFG_REDIR.search(_redirect_text(seg)) or _RE_CFG_WRITE.search(seg):
+            return None
+        try:
+            toks = shlex.split(seg)
+        except Exception:
+            return None
+        if any(_RE_ARG_EXEC.search(t) for t in toks):
+            return None
+        j = _cmd_index(toks)
+        if j is None or j >= len(toks):
+            return None
+        if _base(toks[j]) in _PRINT_CMDS:
+            continue                      # печать своего аргумента — текст, а не обращение
+        if _base(toks[j]) in _PY_INTERP:
+            k = next((x for x in range(j + 1, len(toks)) if _RE_SAFE_SCRIPTS.search(toks[x])), None)
+            # `toks[:k + 1]` — интерпретатор, его флаги и ИМЯ скрипта. Путь конфига среди них
+            # значит, что он ЦЕЛЬ запуска, а не текст записи: смягчения не даём.
+            if k is not None and not any(_RE_CLAUDE_CFG_CMD.search(t) for t in toks[:k + 1]):
+                continue
+        return None
+    return "cfg_mention" if seen else None
+
+
 # ------------------------------- классификаторы ------------------------------
 
 def _decide_write(ti, cwd):
@@ -2427,6 +2526,11 @@ def _decide_bash(cmd, cwd):
         # не известны и падали в безликое `unknown` — в журнале обязано быть видно, что молча прошло
         # именно ЧТЕНИЕ конфига. Решения это не меняет: `unknown` и так не красный (`_stays_red`).
         return ("defer", "cfg_read", cfg.group(0))
+    if cfg and action == "defer" and not kind and _cfg_reach(cmd) == "cfg_mention":
+        # Та же доктрина, что у пары `env_probe`/`env_mention`: смягчение не должно стоить
+        # прозрачности, и «путь конфига НАЗВАЛИ» обязано отличаться в журнале от «его читали»
+        # и от безликого «ничего красного не нашли».
+        return ("defer", "cfg_mention", cfg.group(0))
     return (action, kind, obj)
 
 
@@ -2513,8 +2617,11 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False, skip_kinds=frozenset()):
     # ОБХОДА через шелл. Иначе дыра тривиальна: сессия пишет settings.json.new (внутри репо,
     # зелёное) и копирует его поверх боевого одной командой `cp`, молча расширив свои права.
     # Чтение конфига остаётся зелёным (ветка _RE_READONLY_SHELL ниже — cat/type/Get-Content).
+    # Смягчений ровно два, и оба — ПО ДЕЙСТВИЮ: смотрелка (`_is_pure_config_read`) и чистое
+    # УПОМЯНАНИЕ пути (`_cfg_reach`, восьмая группа класса 02.08.2026). Всё остальное — красное.
     m = _RE_CLAUDE_CFG_CMD.search(scan)
-    if m and "edit_claude" not in skip_kinds and not _is_pure_config_read(cmd):
+    if m and "edit_claude" not in skip_kinds and not _is_pure_config_read(cmd) \
+            and _cfg_reach(cmd) is None:
         return ("ask", "edit_claude", m.group(0))
     m = _RE_OUTSIDE_WRITE.search(cmd)
     if m and "outside" not in skip_kinds and not _inside_project(m.group(2)):
@@ -3304,7 +3411,10 @@ _ROLLBACK = {
     "env": "Откат: .env вне git — вернуть из .env.bak*",
     "edit_secret": "Откат: .env вне git — вернуть из .env.bak*",
     "read_secret": "Откат: не нужен (чтение), но значение окажется в контексте сессии",
-    "edit_claude": "Откат: git checkout -- .claude/settings.json (файл под git)",
+    # Объект не назван — откат собирать не из чего, и утверждать «файл под git» нельзя: под
+    # `.claude/` лежат И отслеживаемый `settings.json`, И локальные файлы под `.gitignore`.
+    # Названный объект уводит разбор в `_rollback` → `_claude_cfg_tracked`.
+    "edit_claude": "Откат: вернуть прежний файл конфига — из git, если он под git; иначе из бэкапа",
     "outside": "Откат: удалить созданное вручную — это вне репозитория",
     "write_outside": "Откат: удалить созданное вручную — это вне репозитория",
     "py_write": "Откат: боевую запись Bridge снимает только обратная операция (void_last/…)",
@@ -3324,6 +3434,80 @@ _ROLLBACK_PY = {
 }
 _ROLLBACK_PY_FS = "Откат: удалённое не вернуть — только из git или бэкапа"
 _ROLLBACK_PY_UNKNOWN = "Откат: неизвестен — гард не разобрал, ЧТО именно пишет скрипт"
+
+# ── ОТКАТ КОНФИГА `.claude` — ПО ОБЪЕКТУ, А НЕ ЛИТЕРАЛОМ (правка 02.08.2026) ─────────────────
+# Живой факт задачи 189: объектом карточки стоял `.claude/settings.local.json`, а откатом —
+# статичный литерал про `.claude/settings.json` «(файл под git)». Владелец, выполнивший строку
+# буквально, откатил бы ЧУЖОЙ отслеживаемый файл, а названный объект не изменился бы вовсе:
+# `git check-ignore -v .claude/settings.local.json` → `.gitignore:8:.claude/*`, а
+# `git ls-files .claude/` знает ровно один файл. Тот же класс, что закрыт 31.07 (`6250c22`) для
+# `py_write` и `clasp_deploy`; `edit_claude` тогда остался на литерале.
+_ROLLBACK_CLAUDE_GIT = "Откат: git checkout -- %s (файл под git)"
+_ROLLBACK_CLAUDE_LOCAL = "Откат: %s под .gitignore — git его НЕ вернёт, только из бэкапа"
+_ROLLBACK_CLAUDE_UNKNOWN = "Откат: вернуть прежний %s — из git, если он под git; иначе из бэкапа"
+
+
+def _claude_cfg_tracked(obj):
+    """(tracked, путь для строки отката) для объекта карточки `edit_claude`.
+
+    `tracked` — True/False/None: `None` значит «файла на диске не нашли» (`~/.claude.json` лежит
+    вне проекта), и тогда карточка не утверждает ни «под git», ни «вне git». Догадка здесь дороже
+    прочерка — ровно она и стоила задаче 189 неверной строки отката.
+
+    Второй элемент — путь, КОТОРЫЙ ПОПАДЁТ В КОМАНДУ ОТКАТА, и он обязан быть выполнимым: объект
+    инструментов Write/Edit приходит БАЗОВЫМ именем (`_decide_write` → `os.path.basename`), а
+    `git checkout -- settings.json` в корне репо не нашёл бы ничего. Нашли файл — называем его
+    путём от корня; не нашли — объектом как есть (выдумывать каталог не из чего)."""
+    o = (obj or "").strip().strip("'\"")
+    if not o:
+        return (None, o)
+    cands = [o] if re.search(r"[\\/]", o) else [os.path.join(".claude", o), o]
+    for cand in cands:
+        try:
+            ap = os.path.abspath(os.path.join(PROJECT, cand))
+        except Exception:
+            continue
+        if os.path.isfile(ap) and _inside_project(ap):
+            rel = os.path.relpath(ap, PROJECT)
+            return (_is_repo_tracked(rel, PROJECT), rel.replace("\\", "/"))
+    return (None, o)
+
+
+# ── ЗАМОК: ОТКАТ НАЗЫВАЕТ ТОТ ЖЕ ФАЙЛ, ЧТО И ОБЪЕКТ ─────────────────────────────────────────
+# Правило владельца: откат в карточке описывает ТУ ЖЕ операцию и ТОТ ЖЕ объект. Не совпадает —
+# карточка неверна, и НЕВЕРНАЯ СТРОКА не выписывается: вместо неё честный прочерк плюс строка
+# лога. Саму карточку при этом НЕ ГЛОТАЕМ — `defer` это ПРОПУСК операции (`main`: ни `_emit_ask`,
+# ни `_emit_deny`, `sys.exit(0)` без вывода), так что «не выписывать карточку» на красном виде
+# было бы дырой, а не строгостью.
+#
+# Замок узкий сознательно: он сравнивает ТОЛЬКО конкретно НАЗВАННЫЕ файлы. Плейсхолдеры
+# (`<прежний хеш>`), шаблоны (`.env.bak*`) и откаты без имени файла («удалённое не вернуть»,
+# «поднять процесс заново») противоречить объекту не могут — и не проверяются.
+_RE_CARD_FILE = re.compile(r"(?<![\w<.\\/-])((?:[\w.$~-]+[\\/])*[\w.$~-]+\.[A-Za-z][\w-]*)(?![\w>*])")
+_ROLLBACK_OBJ_MISMATCH = "Откат: неизвестен — гард не смог назвать откат для %s"
+
+
+def _named_files(text):
+    """Конкретные имена файлов, НАЗВАННЫЕ в строке (плейсхолдеры и шаблоны не в счёт)."""
+    return [m.group(1) for m in _RE_CARD_FILE.finditer(text or "")]
+
+
+def _rollback_conflicts(line, obj):
+    """True ⇔ строка отката называет ФАЙЛ, отличный от объекта карточки.
+
+    Оба условия обязательны: объект называет файл И откат называет файл И они не совпадают.
+    Совпадением считаем и вложение имён (`settings.json` против `.claude/settings.json`) —
+    объект инструментов Write/Edit приходит базовым именем, и это ТОТ ЖЕ файл."""
+    o = (obj or "").strip().strip("'\"")
+    names = _named_files(line)
+    if not names or not _named_files(o):
+        return False
+    key = os.path.normcase(o).replace("\\", "/")
+    for n in names:
+        k = os.path.normcase(n).replace("\\", "/")
+        if k == key or k.endswith("/" + key) or key.endswith("/" + k):
+            return False
+    return True
 
 _RE_NUM_VERSION = re.compile(r"(?i)(?:^|\s)-V\s+(\d+)")
 _RE_NUM_PID = re.compile(r"(\d+)")
@@ -3477,6 +3661,18 @@ def _rollback(kind, raw_cmd="", obj=""):
         if o in _PY_BRIDGE_TOKENS:
             return _ROLLBACK_PY.get(o) or _ROLLBACK["py_write"]
         return _ROLLBACK_PY_UNKNOWN
+    if kind == "edit_claude":
+        # ПО ОБЪЕКТУ, а не литералом: под `.claude/` живут и отслеживаемый файл, и локальные
+        # под `.gitignore`, и откат у них РАЗНЫЙ. Не нашли файла — не утверждаем ничего.
+        o = " ".join(str(obj or "").split())
+        if not o:
+            return _ROLLBACK["edit_claude"]
+        tracked, path = _claude_cfg_tracked(o)
+        if tracked is True:
+            return _ROLLBACK_CLAUDE_GIT % path
+        if tracked is False:
+            return _ROLLBACK_CLAUDE_LOCAL % path
+        return _ROLLBACK_CLAUDE_UNKNOWN % path
     if kind == "clasp_deploy":
         m = re.search(r"(?i)-i\s+(\S{12,})", raw_cmd or "")
         dep = ("…" + m.group(1)[-6:]) if m else "<deploymentId>"
@@ -3523,7 +3719,16 @@ def _card(kind, obj="", raw_cmd=""):
     lines = ["🔴 " + _human(kind, scrub_obj_field(obj)[0]) + " — разрешить?",
              OBJ_LINE_PREFIX + (o or "—"),
              "Число: " + (n or "—")]
-    lines.append(_rollback(kind, raw_cmd, obj))
+    # ЗАМОК «ОДИН ОБЪЕКТ У ОБЪЕКТА И У ОТКАТА» — здесь, у рождения карточки: строка отката это
+    # ЕДИНСТВЕННОЕ место, по которому владелец ДЕЙСТВУЕТ, и назвать в ней чужой файл дороже, чем
+    # не назвать никакого. Сверяем с `o` — тем самым значением, которое печатается и с которым
+    # сверяется «да» владельца (`card_object`), а не с сырым `obj`.
+    rb = _rollback(kind, raw_cmd, obj)
+    if _rollback_conflicts(rb, o):
+        _log("guard", "card", "rollback", kind,
+             "откат называл не тот объект — строка снята (объект: %s)" % (o or "—"))
+        rb = _ROLLBACK_OBJ_MISMATCH % (o or "—")
+    lines.append(rb)
     if raw_cmd:
         c = " ".join(raw_cmd.split())
         lines.append("Команда: " + (c if len(c) <= 200 else c[:200] + "…"))
