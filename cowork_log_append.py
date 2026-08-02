@@ -14,16 +14,20 @@
 # как при таймауте: защита не смеет превращаться в потерю записи.
 import os, re, sys, json, time, socket, datetime, urllib.request, urllib.parse, urllib.error
 import io_utf8   # переключатель stdout/stderr в UTF-8 (класс «charmap can't encode 📊»)
+import bridge_http   # durable-транспорт: ручной обход редиректа моста (класс 02.08.2026)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(HERE, ".env")
 DOC_NAME = "cowork_log"
 SPOOL_PATH = os.path.join(HERE, "cowork_log.spool")   # имя по образцу trainer_log.spool
 
-# Мост — веб-приложение Apps Script: /exec отвечает 302 на googleusercontent, и цель редиректа
+# Мост — веб-приложение Apps Script: /exec отвечает 302 на второе плечо, и цель редиректа
 # ИНОГДА отдаёт 404. 28.07 строка журнала потерялась именно так, хотя живые пробы тем же адресом
 # с этого же ПК отвечали 200 (docs/artifacts/2026-07-28-journal-write-fixes.md §1). Значит 404
 # здесь ВРЕМЕННЫЙ и подлежит повтору; постоянные ошибки (401/403) повторять бессмысленно.
+# С 02.08.2026 первым это плечо повторяет САМ транспорт (`bridge_http._fetch_receipt`) — и там
+# повтор дешевле и безопаснее: он переспрашивает ТОЛЬКО расписку, не переотправляя запись.
+# Здешний повтор остался внешним рубежом на сбой ПЕРВОГО плеча.
 _RETRY_HTTP = (404, 429, 500, 502, 503, 504)
 RETRY_TRIES = int(os.getenv("BRIDGE_RETRY_TRIES", "2") or "2")
 RETRY_PAUSE_SEC = float(os.getenv("BRIDGE_RETRY_PAUSE", "1") or "1")
@@ -60,19 +64,23 @@ def load_env(path):
         pass
     return vals
 
-def get(url, params):
+HTTP_TIMEOUT = 30
+
+# ХОДИМ ЧЕРЕЗ bridge_http, А НЕ ГОЛЫМ urlopen (класс 02.08.2026). Голый `urlopen` идёт по 302
+# моста САМ и переигрывает POST как GET без тела — расписку на запись выдавал `doGet` («Invalid
+# or missing token»), притом что строка ЛОЖИЛАСЬ. Разбор — docs/artifacts/
+# 2026-08-02-bridge-receipt-leg-not-token.md, форма обхода — с VPS (bridge_client._exchange).
+# Контракт функций прежний: разобранный JSON либо ИСКЛЮЧЕНИЕ, поэтому with_retry/transient/спул
+# и обратное чтение ниже работают ровно как работали. opener — точка инъекции тестов.
+
+def get(url, params, opener=None):
     # read_doc живёт в doGet Bridge → шлём GET с параметрами в query-строке
     # (ровно как pc_agent._bridge_read_doc). Токен идёт в query, в логи не печатаем.
-    full = url + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(full, method="GET")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    return bridge_http.request_json(url, "GET", params=params, timeout=HTTP_TIMEOUT, opener=opener)
 
-def post(url, payload):
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def post(url, payload, opener=None):
+    return bridge_http.request_json(url, "POST", payload=payload, timeout=HTTP_TIMEOUT,
+                                    opener=opener)
 
 def get_text(obj):
     for key in ("text", "content", "fileContent", "body"):
@@ -81,7 +89,11 @@ def get_text(obj):
     return None
 
 def transient(e):
-    """Временный ли сбой (стоит повторить). HTTPError проверяем ПЕРВЫМ: он наследник URLError."""
+    """Временный ли сбой (стоит повторить). HTTPError проверяем ПЕРВЫМ: он наследник URLError.
+
+    Отказы нашего транспорта (`bridge_http.BridgeTransportError`, в т.ч. `BridgeReceiptLost`)
+    сюда НЕ попадают намеренно: они наследуют RuntimeError, а не сетевые типы. Повтор там
+    запрещён — исход записи неизвестен, и решает его обратное чтение, а не вторая попытка."""
     if isinstance(e, urllib.error.HTTPError):
         return e.code in _RETRY_HTTP
     return isinstance(e, (urllib.error.URLError, TimeoutError, socket.timeout, OSError))
@@ -326,7 +338,7 @@ def readback_landed(url, token, line):
 
     ОТВЕТ МОСТА НЕ ЕСТЬ ФАКТ ЗАПИСИ (класс; живые случаи: ложный 401 01.08.2026 и HTTP 404 на
     задаче 166 — оба раза строка ЛЕГЛА). Механизм, а не гипотеза: Apps Script отдаёт тело POST-а
-    ВТОРЫМ плечом (`/exec` → 302 → script.googleusercontent.com), падение этого плеча приходит
+    ВТОРЫМ плечом (`/exec` → 302 → echo), падение этого плеча приходит
     тем же исключением, что и падение первого, а мутация к тому моменту уже зафиксирована —
     `writeDoc_` зовёт `brainTextWrite_(id, text)` и лишь ПОТОМ собирает `{ok:true}`
     (копия прода: tmp/bridge_v75/ReadDocs.js:352-354). Значит код ответа описывает доставку

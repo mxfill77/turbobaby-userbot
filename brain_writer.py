@@ -61,6 +61,8 @@ import datetime
 import urllib.request
 import urllib.parse
 
+import bridge_http   # durable-транспорт: ручной обход редиректа моста (класс 02.08.2026)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 BACKUP_DIR = os.path.join(BASE_DIR, "tmp")
@@ -131,12 +133,16 @@ def _in_test_context():
 
 # ------------------------------- транспорт Bridge ----------------------------
 
-def _get(url, params):
+# ХОДИМ ЧЕРЕЗ bridge_http, А НЕ ГОЛЫМ urlopen (класс 02.08.2026, разбор docs/artifacts/
+# 2026-08-02-bridge-receipt-leg-not-token.md). Мост отвечает 302 на второе плечо, а голый
+# `urlopen` идёт по нему сам и переигрывает POST как GET без тела — расписку на запись выдавал
+# `doGet`. Форма ручного обхода взята с VPS (`bridge_client._exchange`). Контракт прежний:
+# разобранный JSON либо исключение, поэтому `_retry_read`, обратное чтение и коды отказов
+# ниже работают как работали. opener — точка инъекции тестов (как get/post-параметры).
+
+def _get(url, params, opener=None):
     # read_doc живёт в doGet Bridge → GET, токен в query, в логи/вывод не попадает
-    full = url + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(full, method="GET")
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    return bridge_http.request_json(url, "GET", params=params, timeout=HTTP_TIMEOUT, opener=opener)
 
 
 # Повтор ЧИСТОГО ЧТЕНИЯ (образец cowork_log_append.with_retry). Заведён под разрешение имени:
@@ -160,11 +166,9 @@ def _retry_read(call):
     raise last
 
 
-def _post(url, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def _post(url, payload, opener=None):
+    return bridge_http.request_json(url, "POST", payload=payload, timeout=HTTP_TIMEOUT,
+                                    opener=opener)
 
 
 def _doc_text(obj):
@@ -581,12 +585,14 @@ def apply(mutate, doc_id="", name="", expect=None, marker=None,
     backup = _backup(old, backup_tag or (name or doc_id), backup_dir)
     # ОТВЕТ МОСТА — НЕ ФАКТ ЗАПИСИ (класс, живой случай 01.08.2026: задача 166 — HTTP 404, а блок
     # в KB_MASTER ЛЁГ; дубля не возникло только потому, что append идемпотентен).
-    # МЕХАНИЗМ, не гипотеза. Тело POST-а Apps Script отдаёт ВТОРЫМ ПЛЕЧОМ: `/exec` отвечает 302 на
-    # `script.googleusercontent.com/macros/echo`, urlopen идёт по редиректу внутри себя — и падение
-    # ЭТОГО плеча приходит сюда тем же исключением, что и падение первого. А мутация к тому моменту
-    # уже зафиксирована: writeDoc_ зовёт brainTextWrite_ и лишь ПОТОМ собирает {"ok":true}
-    # (копия прода — tmp/bridge_v75/ReadDocs.js). Значит код ответа описывает доставку РАСПИСКИ,
-    # а не судьбу записи; замер этой флакости — docs/artifacts/2026-07-28-journal-write-fixes.md §1.
+    # МЕХАНИЗМ, не гипотеза. Тело POST-а Apps Script отдаёт ВТОРЫМ ПЛЕЧОМ (`/exec` → 302 → echo),
+    # и падение ЭТОГО плеча приходит сюда тем же исключением, что и падение первого. А мутация к
+    # тому моменту уже зафиксирована: writeDoc_ зовёт brainTextWrite_ и лишь ПОТОМ собирает
+    # {"ok":true} (копия прода — tmp/bridge_v75/ReadDocs.js). Значит код ответа описывает доставку
+    # РАСПИСКИ, а не судьбу записи; замер флакости — docs/artifacts/2026-07-28-journal-write-fixes.md §1.
+    # С 02.08.2026 второе плечо обходит `bridge_http` (не urlopen): 404/таймаут на нём повторяются,
+    # а голым GET на свой же `/exec` мы больше не ходим — но сама развилка «расписка ≠ факт»
+    # остаётся, потому что плечо может умереть насовсем уже ПОСЛЕ исполнения записи.
     # ПОЭТОМУ отказ моста больше не короткое замыкание: он ЗАПОМИНАЕТСЯ, а судит ОБРАТНОЕ ЧТЕНИЕ —
     # оно одно отличает «не легло» (повтор безопасен) от «легло, потерялась расписка» (повтор даст
     # дубль там, где идемпотентности нет). Сам POST не повторяем по-прежнему никогда.
