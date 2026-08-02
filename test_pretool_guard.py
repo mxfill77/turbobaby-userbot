@@ -3971,5 +3971,152 @@ class TestPyWriteJudgedByParsedCall(unittest.TestCase):
                                  g._py_write_call(text) or g._py_write_call_ast([text]))
 
 
+class TestChannelRegistry(unittest.TestCase):
+    """РЕЕСТР КАНАЛОВ СО СТОРОЖЕМ (02.08.2026). Основание — артефакт
+    `docs/artifacts/2026-08-02-red-is-a-channel-property.md`: «красное» определено над ПАРОЙ
+    (операция, канал), каналов восемь, а определение есть у одного.
+
+    ФАКТ, ИЗ КОТОРОГО СЛЕДУЕТ ВСЁ ОСТАЛЬНОЕ: `defer` — это ПРОПУСК, а не вопрос и не отказ.
+    Дословно, тремя местами кода: `decide` отдавал `("defer","","")` любому имени вне семи
+    (комментарий там же — «Grep/Glob/прочие read-only инструменты»); `main` на `defer` делает
+    `sys.exit(0)` без единой строки вывода (комментарий `# defer / journal`); хук, не
+    напечатавший `permissionDecision`, решения не принимает вовсе — его принимает glob-слой, где
+    в `allow` стоят `Bash`, `Bash(*)`, `PowerShell`, `PowerShell(*)`, `Read`. Модульный докстринг
+    говорит то же прямым текстом: «ЗЕЛЁНОЕ → defer (exit 0, без вывода) → штатные allow-правила
+    решают». То есть незнакомый канал НЕ спрашивал владельца и НЕ блокировался — он проходил.
+
+    КЛАСС УЖЕ СТРЕЛЯЛ И ОПЛАЧЕН. `PowerShell` — отдельный инструмент от `Bash`, и до правки он не
+    попадал ни в matcher хука, ни под классификацию: `PowerShell(Remove-Item …)` шёл мимо красного
+    гейта ЦЕЛИКОМ (комментарий у `decide`). Стеречь повтор было нечем: живой matcher пиннится
+    ОДНИМ литералом `PowerShell`, остальные шесть имён — только в подготовленном образце
+    `docs/artifacts/2026-07-23-settings-tri-layer.json`, и там их пять, не семь.
+
+    ФОРМА СТОРОЖА — та же, что у `_ACTION_CHECK` + `test_free_signs_declare_action_check`: список
+    каналов ВЫВОДИТСЯ из исходника `decide` и из БОЕВОГО конфига, а не зашит перечнем в тесте.
+    Поэтому новый канал накрывается замком САМ — замок не полагается на то, что правящий вспомнит
+    дописать имя. Зашитый перечень в замке — тот же класс, что зашитая подстрока в признаке:
+    он стареет молча."""
+
+    LIVE = os.path.join(PROJ, ".claude", "settings.json")
+
+    @classmethod
+    def _live_matcher_tools(cls):
+        """Имена ЖИВОГО matcher — из боевого `.claude/settings.json`, а не из литерала в тесте.
+        Берём только те блоки `PreToolUse`, которые зовут САМ гард: чужой хук на своём matcher
+        границы гарда не задаёт."""
+        with io.open(cls.LIVE, encoding="utf-8") as f:
+            blocks = json.load(f)["hooks"]["PreToolUse"]
+        out = set()
+        for block in blocks:
+            if "pretool_guard.py" not in json.dumps(block, ensure_ascii=False):
+                continue
+            out |= {t.strip() for t in (block.get("matcher") or "").split("|") if t.strip()}
+        return out
+
+    @staticmethod
+    def _tool_names_decide_distinguishes():
+        """Имена инструментов, которые РАЗЛИЧАЕТ сам `decide`, — через `ast` по его исходнику.
+        Признак: сравнение, слева которого имя `tool`. Новая ветка в `decide` попадает сюда
+        сама, без правки теста."""
+        names = set()
+        for node in ast.walk(ast.parse(inspect.getsource(g.decide))):
+            if not (isinstance(node, ast.Compare)
+                    and isinstance(node.left, ast.Name) and node.left.id == "tool"):
+                continue
+            for cmp_node in node.comparators:
+                elts = (cmp_node.elts if isinstance(cmp_node, (ast.Tuple, ast.List, ast.Set))
+                        else [cmp_node])
+                for e in elts:
+                    if isinstance(e, ast.Constant) and isinstance(e.value, str) and e.value:
+                        names.add(e.value)
+        return names
+
+    @staticmethod
+    def _statuses():
+        return {t: v[0] for t, v in g._TOOL_CHANNELS.items()}
+
+    # ── (1) РЕГРЕСС: канал вне реестра не проходит МОЛЧА ─────────────────────────────────────
+    def test_tool_outside_the_registry_is_not_silent(self):
+        """КРАСНЫЙ ДО ПРАВКИ. Мерим ПОЛНЫМ конвейером, ровно как `main`: `decide` →
+        `decide_for_role` → `card_decision`. Одним `decide` мерить нельзя — тихий проход
+        живёт ещё в двух местах ниже: доктрина `_stays_red` умеет вернуть `defer` даже на `ask`
+        (её последняя строка — «незнакомое САМО ПО СЕБЕ не красное»), а `card_gate` умеет свести
+        карточку в `journal`, что в `main` тоже `sys.exit(0)`. Проверка одного слоя дала бы
+        зелёный тест при живой дыре."""
+        for tool in ("WebFetch", "Task", "SlashCommand", "TodoWrite",
+                     "mcp__claude_ai_Google_Drive__create_file", ""):
+            with self.subTest(tool=tool):
+                data = {"tool_name": tool, "cwd": PROJ,
+                        "tool_input": {"url": "https://example.invalid"}}
+                action, kind, obj = g.decide(data)
+                self.assertEqual(action, "ask",
+                                 "канал вне реестра прошёл молча в decide: " + repr(tool))
+                action, kind, obj = g.decide_for_role(data, headless=True, env={})
+                self.assertEqual(action, "ask",
+                                 "доктрина пропустила канал вне реестра: " + repr(tool))
+                decision, text = g.card_decision(kind, obj, "")
+                self.assertEqual(decision, "ask",
+                                 "карточка канала вне реестра ушла в журнал: " + repr(tool))
+                self.assertTrue(text.strip(), "карточка пуста")
+                # проба протухнет, если имя однажды заведут в реестр законно
+                self.assertNotIn(tool, getattr(g, "_TOOL_CHANNELS", {}))
+
+    def test_unknown_channel_kind_stays_red_on_both_belts(self):
+        """Два пояса — ровно два места, где fail-closed мог бы утечь обратно в тишину:
+        доктрина (`_stays_red`) и правило карточки (`card_gate`/`_HARD_CARD`)."""
+        self.assertTrue(g._stays_red(g.KIND_UNKNOWN_TOOL, "WebFetch", ""))
+        self.assertIn(g.KIND_UNKNOWN_TOOL, g._HARD_CARD)
+        self.assertTrue(g.card_gate(g.KIND_UNKNOWN_TOOL, "", ""),
+                        "канал без имени обязан остаться карточкой, а не журналом")
+
+    # ── (2) СТОРОЖ: реестр и ЖИВОЙ matcher обязаны совпасть, в ОБЕ стороны ───────────────────
+    def test_registry_equals_live_matcher(self):
+        """Появление нового канала ловится ПО ПОСТРОЕНИЮ. Имя, дописанное в боевой matcher мимо
+        реестра, — канал, чей гейт не назван (`decide` отдаст его в fail-closed и владельца
+        зальёт карточками); имя в реестре мимо matcher — реестр, обещающий гард, которого хук
+        никогда не получит. Падают обе стороны: это и есть замена «кто-то вспомнит»."""
+        guarded = {t for t, st in self._statuses().items() if st == g.CHANNEL_GUARD}
+        live = self._live_matcher_tools()
+        self.assertTrue(live, "боевой matcher гарда не найден в .claude/settings.json")
+        self.assertEqual(guarded, live,
+                         "реестр каналов разошёлся с ЖИВЫМ matcher: только в реестре %s, "
+                         "только в matcher %s"
+                         % (sorted(guarded - live), sorted(live - guarded)))
+
+    def test_registry_covers_every_name_decide_distinguishes(self):
+        """Вторая сторона того же замка: имена берутся из ИСХОДНИКА `decide` через `ast`.
+        Новая ветка `if tool == "X"` без записи в реестр падает здесь."""
+        known = self._tool_names_decide_distinguishes()
+        self.assertTrue(known, "разбор `decide` по ast перестал находить имена инструментов")
+        guarded = {t for t, st in self._statuses().items() if st == g.CHANNEL_GUARD}
+        self.assertEqual(known, guarded,
+                         "`decide` различает имя мимо реестра %s / реестр обещает гард имени, "
+                         "которого `decide` не знает %s"
+                         % (sorted(known - guarded), sorted(guarded - known)))
+
+    def test_every_channel_names_its_holder(self):
+        """Форма `_ACTION_CHECK`: пустой держатель — это запись «канал есть, гейта нет»,
+        то есть опись, которая ничего не описывает."""
+        for tool, (status, holder) in g._TOOL_CHANNELS.items():
+            with self.subTest(tool):
+                self.assertIn(status, (g.CHANNEL_GUARD, g.CHANNEL_GREEN))
+                self.assertTrue(str(holder).strip(), "канал %s не назвал держателя" % tool)
+
+    # ── (3) ГРАНИЦА: известные каналы ведут себя КАК ПРЕЖДЕ ─────────────────────────────────
+    def test_known_channels_unchanged(self):
+        """Регресс обратной стороны: fail-closed не имеет права задеть семь гардованных имён
+        и два объявленных зелёными."""
+        self.assertEqual(g.decide(bash("git status"))[0], "defer")
+        self.assertEqual(g.decide(bash("wc -l pretool_guard.py"))[0], "defer")
+        self.assertEqual(g.decide(bash("rm -rf tmp"))[0], "ask")
+        self.assertEqual(g.decide(read(os.path.join(PROJ, "suggest.py")))[0], "defer")
+        self.assertEqual(g.decide(edit(os.path.join(PROJ, "suggest.py")))[0], "defer")
+        for tool in ("Grep", "Glob"):
+            with self.subTest(tool=tool):
+                self.assertEqual(g.decide({"tool_name": tool, "cwd": PROJ,
+                                           "tool_input": {"pattern": "x"}})[0], "defer",
+                                 "объявленный зелёным канал перестал быть зелёным: " + tool)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
