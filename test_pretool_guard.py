@@ -3998,20 +3998,38 @@ class TestChannelRegistry(unittest.TestCase):
     он стареет молча."""
 
     LIVE = os.path.join(PROJ, ".claude", "settings.json")
+    # Права на ПК живут ДВУМЯ файлами, и второй — под `.gitignore`: его не видит ни git-ревью,
+    # ни гейт (артефакт `2026-08-02-red-is-a-channel-property.md` §1.2 — «самая широкая
+    # поверхность прав на ПК невидима ни гейту, ни ревью»). Сторож, читающий только
+    # `settings.json`, остался бы ЗЕЛЁНЫМ в тот день, когда matcher гарда допишут ТУДА, —
+    # то есть ровно «кто-то вспомнит», ради отмены которого реестр и заведён, и появился бы
+    # новый канал именно там, где его не видно. Замер 02.08.2026: блока `PreToolUse` в
+    # локальном файле нет, поэтому объединение сегодня не меняет НИ ОДНОГО имени — это замок
+    # на завтра, а не правка поведения.
+    LOCAL = os.path.join(PROJ, ".claude", "settings.local.json")
 
-    @classmethod
-    def _live_matcher_tools(cls):
-        """Имена ЖИВОГО matcher — из боевого `.claude/settings.json`, а не из литерала в тесте.
-        Берём только те блоки `PreToolUse`, которые зовут САМ гард: чужой хук на своём matcher
-        границы гарда не задаёт."""
-        with io.open(cls.LIVE, encoding="utf-8") as f:
-            blocks = json.load(f)["hooks"]["PreToolUse"]
+    @staticmethod
+    def _matcher_tools_from(path):
+        """Имена matcher из ОДНОГО файла настроек. Берём только те блоки `PreToolUse`, которые
+        зовут САМ гард: чужой хук на своём matcher границы гарда не задаёт. Файла нет или он не
+        про хуки → пустое множество: локальный файл необязателен, и его отсутствие не смеет
+        уронить сторожа (упавший сторож стережёт не лучше слепого)."""
+        try:
+            with io.open(path, encoding="utf-8") as f:
+                blocks = json.load(f)["hooks"]["PreToolUse"]
+        except (IOError, OSError, ValueError, KeyError, TypeError):
+            return set()
         out = set()
         for block in blocks:
             if "pretool_guard.py" not in json.dumps(block, ensure_ascii=False):
                 continue
             out |= {t.strip() for t in (block.get("matcher") or "").split("|") if t.strip()}
         return out
+
+    @classmethod
+    def _live_matcher_tools(cls):
+        """Имена ЖИВОГО matcher — ОБЪЕДИНЕНИЕ обоих боевых файлов прав, а не литерал в тесте."""
+        return cls._matcher_tools_from(cls.LIVE) | cls._matcher_tools_from(cls.LOCAL)
 
     @staticmethod
     def _tool_names_decide_distinguishes():
@@ -4077,11 +4095,43 @@ class TestChannelRegistry(unittest.TestCase):
         никогда не получит. Падают обе стороны: это и есть замена «кто-то вспомнит»."""
         guarded = {t for t, st in self._statuses().items() if st == g.CHANNEL_GUARD}
         live = self._live_matcher_tools()
-        self.assertTrue(live, "боевой matcher гарда не найден в .claude/settings.json")
+        self.assertTrue(live, "боевой matcher гарда не найден ни в одном файле .claude/")
         self.assertEqual(guarded, live,
                          "реестр каналов разошёлся с ЖИВЫМ matcher: только в реестре %s, "
                          "только в matcher %s"
                          % (sorted(guarded - live), sorted(live - guarded)))
+
+    def test_local_settings_are_not_a_blind_spot(self):
+        """Второй файл прав (`settings.local.json`) — под `.gitignore`, и новый канал появился бы
+        там НЕВИДИМО для ревью. Проверяем не «сегодня там пусто» (это не стережёт ничего и
+        протухнет молча), а что читатель такой блок ВИДИТ: подсовываем образец с лишним именем и
+        требуем, чтобы имя попало в живой набор. Образец — файл во ВРЕМЕННОМ каталоге; боевые
+        `.claude/*.json` не читаются на запись и не правятся."""
+        block = {"hooks": {"PreToolUse": [
+            {"matcher": "Bash|WebFetch",
+             "hooks": [{"type": "command", "command": "python pretool_guard.py"}]},
+            {"matcher": "Task",                      # чужой хук — границы гарда не задаёт
+             "hooks": [{"type": "command", "command": "python someone_else.py"}]},
+        ]}}
+        with tempfile.TemporaryDirectory(prefix="chanreg_local_") as d:
+            path = os.path.join(d, "settings.local.json")
+            with io.open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(block, ensure_ascii=False))
+            self.assertEqual(self._matcher_tools_from(path), {"Bash", "WebFetch"},
+                             "читатель настроек не увидел matcher гарда в локальном файле")
+            self.assertEqual(self._matcher_tools_from(os.path.join(d, "нет-такого.json")), set(),
+                             "отсутствие необязательного файла обязано давать пусто, а не отказ")
+            saved = type(self).LOCAL
+            type(self).LOCAL = path
+            try:
+                self.assertIn("WebFetch", self._live_matcher_tools(),
+                              "имя из локального файла прав не попало в ЖИВОЙ набор — "
+                              "канал, дописанный туда, остался бы невидим сторожу")
+            finally:
+                type(self).LOCAL = saved
+        # и после восстановления сторож обязан снова совпадать с реестром
+        self.assertEqual({t for t, st in self._statuses().items() if st == g.CHANNEL_GUARD},
+                         self._live_matcher_tools())
 
     def test_registry_covers_every_name_decide_distinguishes(self):
         """Вторая сторона того же замка: имена берутся из ИСХОДНИКА `decide` через `ast`.
