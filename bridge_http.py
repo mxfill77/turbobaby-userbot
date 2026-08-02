@@ -157,23 +157,33 @@ def _endpoint(url):
     return (p.scheme.lower(), p.netloc.lower(), p.path.rstrip("/").lower())
 
 
-def _bounce_error(method, url):
-    """ВОЗВРАТ НА СВОЙ ЖЕ `/exec` — не плечо расписки, а ловушка (закрыта на ПК 02.08.2026).
+def _leg_error(method, text):
+    """Отказ ПОСЛЕ того, как запрос ушёл, — с разной правдой для чтения и записи.
 
-    Живой отпечаток разбора: на нашу ЗАПИСЬ ответил `doGet`. Механически это может значить
-    только одно — по цепочке мы пришли обратно на `/exec`, но уже голым GET: тела нет, query
-    (а с ней и токена) нет, и читатель честно говорит «Invalid or missing token». Ходить туда
-    НЕЛЬЗЯ ни автоматически, ни руками: ответ будет заведомо ложным отказом.
+    GET идемпотентен: его исход известен («ответа нет»), и переспросить целиком безопасно —
+    поэтому `BridgeTransportError`, который вызывающий вправе повторить. POST — нет: мутация
+    МОГЛА исполниться до того, как умерло плечо расписки, поэтому `BridgeReceiptLost`, и
+    повторять его нельзя ни здесь, ни у вызывающего. Разделение сделано ТИПОМ, а не текстом,
+    чтобы `cowork_log_append.transient` могло опираться на него без разбора строк.
 
-    ФОРМА VPS ЭТОГО НЕ ЛОВИТ — там обход цепочки идёт по любому `Location` (`_exchange`), а
-    отпечаток `doGet` разбирается как обычный `unauthorized` и рождает пересылку запроса. Это
-    точка касания для отдельной задачи VPS-полосы; здесь мы её просто не повторяем."""
-    text = ("второе плечо моста вернуло нас обратно на %s — ключ расписки мёртв. Дальше идти "
-            "нельзя: это голый GET без тела и без токена, ему ответит doGet ложным отказом"
-            % url.split("?")[0])
+    АДРЕСОВ ЗДЕСЬ НЕ ПЕЧАТАЕМ: текст уходит в лог, в спул и в журнал, а полный `/exec` несёт
+    id деплоя. Плечо называем словом, а не ссылкой."""
     if str(method).upper() == "GET":
         return BridgeTransportError(text)
-    return BridgeReceiptLost(text + ". Действие МОГЛО исполниться — судить обязан факт")
+    return BridgeReceiptLost(text + " Действие МОГЛО исполниться — судить обязан ФАКТ, "
+                                    "слепой повтор запрещён.")
+
+
+_BOUNCE_TEXT = ("второе плечо моста (echo) бросает обратно на наш же /exec — ключ расписки мёртв. "
+                "Дальше идти нельзя: туда придёт голый GET без тела и без токена, и doGet ответит "
+                "ложным «Invalid or missing token».")
+# ВОЗВРАТ НА СВОЙ ЖЕ `/exec` — не плечо расписки, а ловушка (закрыта на ПК 02.08.2026).
+# Живой отпечаток разбора: на нашу ЗАПИСЬ ответил `doGet`. Механически это значит одно — по
+# цепочке мы пришли обратно на `/exec`, но уже голым GET. Ветка заведена по фикстуре и в тот же
+# день СРАБОТАЛА ВЖИВУЮ (15:44 UTC, чтение журнала) — то есть петля реальна, а не реконструкция.
+# ФОРМА VPS ЭТОГО НЕ ЛОВИТ: там обход идёт по любому `Location` (`_exchange`), а отпечаток
+# `doGet` разбирается как обычный `unauthorized` и рождает пересылку запроса. Точка касания для
+# отдельной задачи VPS-полосы; здесь мы её просто не повторяем.
 
 
 def _fetch_receipt(url, timeout, opener, sleeper, origin, method, tries=ECHO_TRIES):
@@ -206,7 +216,7 @@ def _fetch_receipt(url, timeout, opener, sleeper, origin, method, tries=ECHO_TRI
         if code in _REDIRECT_CODES and _endpoint(
                 urllib.parse.urljoin(url, _location(resp) or "")) == origin:
             _close(resp)
-            last = _bounce_error(method, url)   # повторяем: ключ расписки мог просто не поспеть
+            last = _leg_error(method, _BOUNCE_TEXT)   # повторяем: ключ мог просто не поспеть
             continue
         return resp        # расписка либо честный следующий хоп — дальше решает внешний цикл
     raise last
@@ -227,15 +237,15 @@ def exchange(url, method, params=None, payload=None, timeout=DEFAULT_TIMEOUT,
         loc = _location(resp)
         _close(resp)
         if not loc:
-            raise BridgeTransportError("мост ответил %s без Location — цепочку расписки не пройти"
-                                       % _status(resp))
+            raise _leg_error(method, "мост ответил %s без Location — цепочку расписки не пройти."
+                                     % _status(resp))
         if hops >= max_hops:
-            raise BridgeTransportError("цепочка редиректов моста длиннее %d хопов — обрываю "
-                                       "(вслепую по ней ходить нельзя: POST станет голым GET)"
-                                       % max_hops)
+            raise _leg_error(method, "цепочка редиректов моста длиннее %d хопов — обрываю "
+                                     "(вслепую по ней ходить нельзя: POST станет голым GET)."
+                                     % max_hops)
         cur = urllib.parse.urljoin(cur, loc)
         if _endpoint(cur) == origin:
-            raise _bounce_error(method, cur)     # первое же плечо ведёт назад — повторять нечего
+            raise _leg_error(method, _BOUNCE_TEXT)   # первое плечо ведёт назад — повторять нечего
         resp = _fetch_receipt(cur, timeout, op, slp, origin, method)
         hops += 1
     return resp
@@ -269,7 +279,7 @@ def request_json(url, method, params=None, payload=None, timeout=DEFAULT_TIMEOUT
         if is_post and _DOGET_FINGERPRINT in raw.lower():
             raise BridgeReceiptLost("на POST ответил читатель моста (не-JSON с отпечатком "
                                     "«Invalid or missing token») — расписка потеряна")
-        raise BridgeTransportError("ответ моста не разобрать как JSON (%d символов)" % len(raw))
+        raise _leg_error(method, "ответ моста не разобрать как JSON (%d символов)." % len(raw))
     if is_post and _doget_refusal(data):
         raise BridgeReceiptLost(
             "на POST ответил doGet («Invalid or missing token») — по дороге запрос стал голым "

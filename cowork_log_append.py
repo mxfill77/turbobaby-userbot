@@ -91,9 +91,17 @@ def get_text(obj):
 def transient(e):
     """Временный ли сбой (стоит повторить). HTTPError проверяем ПЕРВЫМ: он наследник URLError.
 
-    Отказы нашего транспорта (`bridge_http.BridgeTransportError`, в т.ч. `BridgeReceiptLost`)
-    сюда НЕ попадают намеренно: они наследуют RuntimeError, а не сетевые типы. Повтор там
-    запрещён — исход записи неизвестен, и решает его обратное чтение, а не вторая попытка."""
+    `BridgeReceiptLost` — НИКОГДА (проверяем его ПЕРВЫМ, он наследник BridgeTransportError):
+    запрос ушёл, мутация МОГЛА исполниться, и повтор даст вторую запись. Прочие отказы нашего
+    транспорта временные, и это безопасно ПО ПОСТРОЕНИЮ: `bridge_http._leg_error` отдаёт голый
+    `BridgeTransportError` только на GET — идемпотентном по определению. Живой случай, ради
+    которого это заведено (02.08, 15:44 UTC): второе плечо бросило чтение журнала обратно на
+    `/exec`, ключ расписки был мёртв — лечится не повтором мёртвого ключа, а НОВЫМ запросом
+    целиком (форма VPS `retry_full=True` для read-only GET)."""
+    if isinstance(e, bridge_http.BridgeReceiptLost):
+        return False
+    if isinstance(e, bridge_http.BridgeTransportError):
+        return True
     if isinstance(e, urllib.error.HTTPError):
         return e.code in _RETRY_HTTP
     return isinstance(e, (urllib.error.URLError, TimeoutError, socket.timeout, OSError))

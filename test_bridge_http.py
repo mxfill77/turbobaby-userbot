@@ -240,7 +240,25 @@ class ReceiptIsNotRefusal(unittest.TestCase):
         # `with_retry` повторяет ТОЛЬКО временные сбои; слепой повтор write_doc дал бы вторую
         # запись там, где первая уже легла (посылка VPS «unauthorized ⇒ не исполнено» неверна)
         self.assertFalse(cla.transient(bridge_http.BridgeReceiptLost("проба")))
-        self.assertFalse(cla.transient(bridge_http.BridgeTransportError("проба")))
+
+    def test_read_side_failure_is_transient_and_the_write_side_never_is(self):
+        """Живой случай 02.08 15:44 UTC: echo бросило ЧТЕНИЕ журнала обратно на /exec. Мёртвый
+        ключ расписки лечится новым запросом целиком — GET идемпотентен (форма VPS retry_full)."""
+        self.assertTrue(cla.transient(bridge_http._leg_error("GET", "плечо умерло")))
+        self.assertFalse(cla.transient(bridge_http._leg_error("POST", "плечо умерло")))
+
+    def test_post_never_yields_a_bare_transport_error(self):
+        """Тип — единственный признак, по которому вызывающий решает «повторять или нет».
+        Поэтому у POST любой отказ ПОСЛЕ отправки обязан быть `BridgeReceiptLost`."""
+        for text in ("без Location", "хопы кончились", "не JSON"):
+            self.assertIsInstance(bridge_http._leg_error("POST", text),
+                                  bridge_http.BridgeReceiptLost, text)
+
+    def test_leg_error_prints_no_addresses(self):
+        """Текст плечевого отказа едет в лог, спул и журнал — полного /exec с id деплоя в нём
+        быть не должно (граница задания владельца)."""
+        for method in ("GET", "POST"):
+            self.assertNotIn("http", str(bridge_http._leg_error(method, bridge_http._BOUNCE_TEXT)))
 
 
 class AllThreeClients(unittest.TestCase):
