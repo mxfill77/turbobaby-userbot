@@ -1541,17 +1541,28 @@ class TestOneRuleObjectGatesNumberDoesNot(unittest.TestCase):
                 self.assertIn("Объект: ", card, label)
 
     def test_number_without_object_does_not_card(self):
-        """Дыра ПОЛОСЫ ПК: раньше любая цифра в безобъектной команде рождала карточку."""
-        self.assertFalse(g.card_gate("delete", "", "3 цели"))
+        """Дыра ПОЛОСЫ ПК: раньше любая цифра в безобъектной команде рождала карточку.
+
+        ФИКСТУРЫ СМЕНЕНЫ 02.08.2026 (класс A-54): `delete` — вид ВЫСШИЙ, и с этого дня он
+        гейт объекта не проходит вовсе (`card_gate` пропускает его к `card_decision`, где без
+        объекта будет `deny`). Проверяемое свойство «число карточку не гейтит» не изменилось —
+        оно проверяется на ОБЫЧНЫХ видах, для которых и было заведено."""
         self.assertFalse(g.card_gate("schtasks", "", "версия 76"))
+        self.assertFalse(g.card_gate("network", "", "3 цели"))
 
     def test_object_alone_is_enough(self):
         self.assertTrue(g.card_gate("kill", "ngrok", ""))
         self.assertTrue(g.card_gate("sqlite", "app.db", ""))
 
     def test_nothing_at_all_goes_to_journal(self):
+        """ТОЛЬКО ОБЫЧНЫЙ ВИД. Высший (`delete`, `kill`, `clasp*`) с 02.08.2026 в журнал не
+        уходит никогда: цена его ошибки необратима, и пустой объект там означает не «поймали
+        слово» (это отсеивает `_verb_acts` слоем раньше), а «действие разобрано, цель не
+        извлеклась». Обратная половина — `TestTwoTiersOfCards`."""
         self.assertFalse(g.card_gate("schtasks", "", ""))
-        self.assertFalse(g.card_gate("delete", "", ""))
+        self.assertFalse(g.card_gate("network", "", ""))
+        self.assertTrue(g.card_gate("delete", "", ""), "высший вид гейт объекта не проходит")
+        self.assertTrue(g.card_gate("kill", "", ""), "высший вид гейт объекта не проходит")
 
     def test_hard_block_and_money_always_card(self):
         for kind in ("unknown", "env", "edit_secret", "read_secret", "py_write"):
@@ -3338,13 +3349,63 @@ class TestTwoTiersOfCards(unittest.TestCase):
         self.assertIsNone(g.card_or_journal("live_sheet", g.LIVE_SHEET_UNKNOWN, cmd))
         self.assertNotIn("разрешить?", text, "отказ не имеет права выглядеть как вопрос")
 
-    def test_deny_boundary_journal_case_is_untouched(self):
-        """ГРАНИЦА: `deny` бьёт только там, где карточка ИНАЧЕ БЫ РОДИЛАСЬ. Высший вид, у
-        которого объекта нет и карточки не было бы, как шёл в журнал, так и идёт — там признак
-        поймал подстроку, запрещать нечего."""
-        self.assertEqual(g.card_decision("delete", "", "")[0], "journal")
-        self.assertEqual(g.card_decision("kill", "", "")[0], "journal")
+    def test_top_tier_without_object_never_goes_to_journal(self):
+        """ГРАНИЦА ПЕРЕСТАВЛЕНА 02.08.2026 (класс A-54). Было: «`deny` бьёт только там, где
+        карточка ИНАЧЕ БЫ РОДИЛАСЬ», и высший вид без объекта уходил в ЖУРНАЛ — то есть
+        ИСПОЛНЯЛСЯ. Посылка «нет объекта ⇔ признак поймал подстроку» умерла 31.07, когда
+        `_verb_acts` перенёс отсев подстроки на слой раньше. Стало: у высшего вида исключений
+        нет — нет объекта, значит отказ. Обычный вид не тронут."""
+        for kind in ("delete", "kill", "clasp", "clasp_push", "clasp_deploy", "clasp_run",
+                     "py_write", "live_sheet"):
+            with self.subTest(kind):
+                self.assertTrue(g.is_top_tier(kind), kind + ": фикстура обязана быть высшей")
+                self.assertEqual(g.card_decision(kind, "", "")[0], "deny", kind)
+        # обычный вид — правило журнала как было (остаток назван в докстринге card_gate)
         self.assertEqual(g.card_decision("schtasks", "", "")[0], "journal")
+
+    def test_unnamed_kill_target_does_not_execute(self):
+        """РЕГРЕСС A-54 ПОЛНЫМ КОНВЕЙЕРОМ: `decide` → `decide_for_role` → `card_decision`.
+
+        Все четыре фикстуры — НАСТОЯЩИЕ действия остановки процессов (`_verb_acts` подтвердил
+        командную позицию), у которых цель не извлекается. До правки каждая давала
+        `ask|kill|обявкт-пусто` → `journal` → `sys.exit(0)`, то есть ИСПОЛНЯЛАСЬ. Первая сносит
+        ВСЕ python на машине: живых ботов, демона и сам процесс задачи."""
+        for label, cmd in (
+                ("фильтр имени образа", 'taskkill /F /T /FI "IMAGENAME eq python.exe"'),
+                ("конвейер PowerShell", "Get-Process python | Stop-Process -Force"),
+                ("цель в переменной", "Stop-Process -InputObject $p -Force"),
+                ("цель не названа вовсе", "kill -9")):
+            with self.subTest(label):
+                a, k, o = self._role(cmd)
+                self.assertEqual((a, k), ("ask", "kill"), label)
+                self.assertEqual(g._card_fields(k, o, cmd)[0], "",
+                                 label + ": фикстура обязана оставаться БЕЗ объекта")
+                decision, text = g.card_decision(k, o, cmd)
+                self.assertEqual(decision, "deny", label + ": операция НЕ имеет права пройти")
+                self.assertIn("ОБЪЕКТ НЕ НАЗВАН", text, label)
+                self.assertNotIn("разрешить?", text, label + ": отказ не вопрос")
+
+    def test_named_kill_target_passes_exactly_as_before(self):
+        """Вторая половина регресса: РАЗРЕШЁННОЕ проходит как прежде — карточкой с объектом,
+        а не отказом. Иначе fail-closed превратился бы в «ничего не работает»."""
+        for label, cmd, want_obj in (("PID", "taskkill /PID 4242 /F", "PID 4242"),
+                                     ("имя процесса", "pkill ngrok", "ngrok"),
+                                     ("сервис", "systemctl stop nginx", "сервис nginx"),
+                                     ("удаление файла", _RMRF + " suggest.py", "suggest.py")):
+            with self.subTest(label):
+                a, k, o = self._role(cmd)
+                self.assertEqual(a, "ask", label)
+                self.assertEqual(g._card_fields(k, o, cmd)[0], want_obj, label)
+                self.assertEqual(g.card_decision(k, o, cmd)[0], "ask", label)
+
+    def test_word_not_action_still_never_reaches_the_gate(self):
+        """Отсев подстроки стоит СЛОЕМ РАНЬШЕ (`_verb_acts`), и правка его не трогает: слово в
+        тексте до `card_decision` не доходит вовсе. Это и есть довод, по которому журнальная
+        ветка высшего вида осталась без работы."""
+        for label, cmd in (("слово kill в тексте", 'echo "kill the process"; ls'),
+                           ("слово Планировщика", 'ls -la; echo "---SCHTASKS XML---"; ls *.xml')):
+            with self.subTest(label):
+                self.assertEqual(self._role(cmd)[0], "defer", label)
 
     def test_ordinary_hard_block_still_cards_without_object(self):
         """Обычный вид правило не трогает: сбой разбора и секреты спрашивают как спрашивали."""
