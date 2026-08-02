@@ -715,6 +715,44 @@ class TestApprovalReachesExecutor(Base):
         self.assertIn("объект", res)
         self.assertNotIn("упёрлись в ДРУГОЕ красное", res)
 
+    # --- A-36 (02.08.2026): СОВЕТ ВЛАДЕЛЬЦУ ВЫБИРАЕТСЯ ПО РЯДУ, А НЕ ПО ПУСТОТЕ ТЕКСТА -------
+
+    def test_diagnosis_does_not_ask_for_an_answer_the_row_cannot_carry(self):
+        """Ряд очереди поля ответа НЕ несёт (замер 02.08: ни одного из восьми имён нет ни в одном
+        файле обеих полос; devbot на «да» шлёт approve_task(qid, "Filipp") — названный объект
+        сверяется на сервере и выбрасывается). Значит совет «ответь «да <объект>»» отправлял
+        владельца по кругу: он отвечает, ответ до ПК не доезжает, карта приходит та же."""
+        tid = self._approved_with_card(self.LIVE_SHEET_CARD)
+        row = self.fb.tasks[tid]
+        self.assertEqual([f for f in o._REPLY_FIELDS if f in row], [])  # живой ряд — БЕЗ поля ответа
+        self._claude(0, write_marker=True, marker_kind="live_sheet")
+        o.process_approved()
+        res = self.fb.tasks[tid]["result"]
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")       # fail-closed как было
+        self.assertIn("live_sheet", res)
+        self.assertIn("НЕ НЕСЁТ", res)
+        self.assertNotIn("ответь «да <объект из карточки>»", res)
+
+    def test_the_old_advice_survives_where_the_channel_exists(self):
+        """Обратная половина: поле в ряду ЕСТЬ (пусть и пустое) → владелец действительно может
+        назвать объект, и прежний совет остаётся дословно. Разница ровно в данных ряда."""
+        tid = self._approved_with_card(self.LIVE_SHEET_CARD)
+        self.fb.tasks[tid]["owner_reply"] = ""             # канал есть, объект не назван
+        self._claude(0, write_marker=True, marker_kind="live_sheet")
+        o.process_approved()
+        res = self.fb.tasks[tid]["result"]
+        self.assertIn("ответь «да <объект из карточки>»", res)
+        self.assertNotIn("НЕ НЕСЁТ", res)
+
+    def test_reply_channel_reads_presence_not_value(self):
+        """Пустое поле и отсутствие поля — РАЗНЫЕ факты: первое «объект не назвали», второе
+        «назвать нечем». Fail-safe: мусор вместо ряда → канала нет."""
+        self.assertEqual(o._reply_channel({"owner_reply": ""}), ("owner_reply",))
+        self.assertEqual(o._reply_channel({"note": "x", "reply": None}), ("reply", "note"))
+        self.assertEqual(o._reply_channel({"what": "карточка", "result": "…"}), ())
+        for junk in (None, "", 5, [], ()):
+            self.assertEqual(o._reply_channel(junk), (), repr(junk))
+
     def test_expired_approve_never_spawns_child(self):
         tid = self._approved_with_card(pretool_guard.KIND_LINE_PREFIX + "env")
         self.fb.tasks[tid]["updated"] = iso_ago(4000)

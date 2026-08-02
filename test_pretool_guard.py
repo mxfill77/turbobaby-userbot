@@ -3790,5 +3790,125 @@ class TestOneCardOneOperation(unittest.TestCase):
                          g._card("schtasks", "X", "schtasks /change /tn X /disable"))
 
 
+class TestPyWriteJudgedByParsedCall(unittest.TestCase):
+    """ВОСЬМАЯ ГРУППА КЛАССА «СУДИМ ПО ДЕЙСТВИЮ» (02.08.2026, A-30 разведки корня А):
+    БОЕВАЯ ЗАПИСЬ ПОД ПСЕВДОНИМОМ — ЭТО ВЫЗОВ, А НЕ ЕГО НАПИСАНИЕ.
+
+    `_py_write_call` с 31.07 судит уже не по имени в тексте, а по ФОРМЕ вызова — четырьмя
+    написаниями. Разведка 02.08 назвала цену этого способа дословно: «алиас импорта
+    (`from bridge import create_booking as cb; cb(...)`) — мимо». Мимо не в сторону вопроса, а
+    в сторону ТИШИНЫ: подстроки `create_booking(` в тексте нет вовсе, значит боевая запись
+    Bridge из НЕотслеживаемого скрипта ехала без карточки и без красного.
+
+    Теперь на пустоте подстрочного разбора работает КАНОНИЧЕСКИЙ (`ast`): решает узел Call, а
+    псевдоним резолвится по привязке имени. Голдены стерегут обе стороны — дыра закрыта, и ни
+    одно прежнее решение (объект карточки, `def` не вызов, чужой `.remove`) не поехало."""
+
+    ATX = "add_trans" + "action"                 # имена собираем, чтобы не красить сам корпус
+    CBK = "create_" + "booking"
+    RMT = "rm" + "tree"
+
+    @classmethod
+    def setUpClass(cls):
+        cls._td = tempfile.TemporaryDirectory(prefix="guard_pywrite_")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def _script(self, name, body):
+        """Тело НЕотслеживаемого не-теста .py во временной зоне — ровно тот вход, который читает
+        `_scan_python`. Файл только ЛЕЖИТ: ни один тест его не исполняет."""
+        path = os.path.join(self._td.name, name).replace("\\", "/")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("raise SystemExit('проба гарда: исполнять нельзя')\n" + body)
+        return 'venv/Scripts/python.exe "%s"' % path
+
+    def _role(self, cmd):
+        return g.decide_for_role({"tool_name": "Bash", "tool_input": {"command": cmd},
+                                  "cwd": PROJ}, headless=True)
+
+    # --- (1) ДЫРА, РАДИ КОТОРОЙ ПРАВКА: имя связано, вызов идёт под другим именем -------------
+    def test_renamed_bridge_import_is_still_a_write(self):
+        """Дословно формулировка разведки. В тексте скрипта `%s(` нет ни разу."""
+        body = ("from bridge_client import " + self.CBK + " as cb\n"
+                "cb(client='Иван', bike='5580', ds='2026-08-10', de='2026-08-17')\n")
+        cmd = self._script("alias_bridge.py", body)
+        self.assertNotIn(self.CBK + "(", body, "фикстура обязана быть мимо подстрочных форм")
+        self.assertEqual(self._role(cmd)[:2], ("ask", "py_write"), cmd)
+
+    def test_renamed_delete_import_is_still_a_delete(self):
+        """Та же дыра у файловой семьи: `%s(` в тексте нет, `os.remove` — тоже."""
+        for i, (imp, call) in enumerate((
+                ("from shutil import " + self.RMT + " as nuke", "nuke('D:/turbobaby-bot/tmp/x')"),
+                ("from os import remove", "remove('D:/turbobaby-bot/tmp/x.txt')"),
+                ("import os as o", "o.remove('D:/turbobaby-bot/tmp/x.txt')"))):
+            with self.subTest(imp):
+                body = imp + "\n" + call + "\n"
+                cmd = self._script("alias_fs_%d.py" % i, body)
+                self.assertNotIn(self.RMT + "(", body)
+                self.assertNotIn("os.remove", body)
+                self.assertEqual(self._role(cmd)[:2], ("ask", "py_write"), body)
+
+    def test_alias_of_an_alias_resolves(self):
+        """Две привязки подряд: `import shutil as s` + `sh = s`. Разбор идёт по имени, а не по
+        одному шагу."""
+        body = ("import shutil as s\nsh = s\nsh." + self.RMT + "_alias = None\n"
+                "fn = s." + self.RMT + "\nfn('D:/turbobaby-bot/tmp/x')\n")
+        self.assertNotIn(self.RMT + "(", body)
+        self.assertEqual(self._role(self._script("alias_hop.py", body))[:2], ("ask", "py_write"))
+
+    def test_inline_c_alias_call_is_scanned_too(self):
+        """Тот же вход инлайном `-c`: кусок питона разбирается ПОРОЗНЬ, а не склейкой."""
+        cmd = ('venv/Scripts/python.exe -c "from bridge import ' + self.ATX
+               + ' as t; t(wallet=\'cash\', amount=12000)"')
+        self.assertEqual(self._role(cmd)[:2], ("ask", "py_write"), cmd)
+
+    # --- (2) КОНТРОЛЬ: ПРЕЖНИЕ РЕШЕНИЯ БАЙТ-В-БАЙТ -------------------------------------------
+    def test_plain_call_keeps_its_token_and_object(self):
+        """Обычная форма решается подстрочным разбором ПЕРВЫМ → токен и объект прежние
+        (у вызова под псевдонимом объекта нет — это названный предел, не регресс)."""
+        cmd = self._script("plain_call.py",
+                           "import bridge\nbridge." + self.ATX
+                           + "(wallet='cash', amount=12000)\n")
+        action, kind, obj = self._role(cmd)
+        self.assertEqual((action, kind, obj), ("ask", "py_write", self.ATX), cmd)
+
+    def test_definition_is_still_not_a_call(self):
+        """`def <операция>(` — чтение чужого кода, а не запись. В дереве это FunctionDef, то есть
+        правило держится СТРУКТУРОЙ, а не отрицательным регекспом."""
+        cmd = self._script("just_def.py",
+                           "def " + self.CBK + "(client, bike):\n    return None\n")
+        self.assertNotEqual(self._role(cmd)[1], "py_write", cmd)
+
+    def test_foreign_remove_is_not_a_file_delete(self):
+        """Ложного красного новый слой не добавляет: `.remove` у списка/множества — не `os.remove`
+        (имя ни к чему не привязано), `.rmtree`-однофамильца в чужом объекте тоже нет."""
+        for i, body in enumerate(("items = [1, 2]\nitems.remove(2)\n",
+                                  "s = {1}\ns.remove(1)\n",
+                                  "class C:\n    def drop(self):\n        return 1\nC().drop()\n")):
+            with self.subTest(body.strip()[:30]):
+                self.assertEqual(self._role(self._script("no_red_%d.py" % i, body))[0], "defer")
+
+    def test_unparsable_body_falls_back_to_the_old_behaviour(self):
+        """Разбор не удался — прежнее поведение, а не выдумка: обрывок питона без красного
+        остаётся зелёным, обрывок С подстрочной формой красным (подстрочный слой не отменён)."""
+        broken = "def f(:\n    pass\n"
+        self.assertEqual(self._role(self._script("broken_green.py", broken))[0], "defer")
+        self.assertEqual(self._role(self._script("broken_red.py",
+                                                 broken + "bridge." + self.ATX + "(1)\n"))[:2],
+                         ("ask", "py_write"))
+
+    def test_ast_layer_never_removes_a_verdict(self):
+        """Инвариант слоя одной проверкой: он ТОЛЬКО добавляет. Что краснело подстрочно —
+        краснеет и сейчас, тем же токеном."""
+        for text in ("bridge." + self.CBK + "(1)", "os.remove('D:/x')",
+                     "d = {'action': '" + self.ATX + "'}", self.RMT + "('D:/x')"):
+            with self.subTest(text):
+                self.assertIsNotNone(g._py_write_call(text), text)
+                self.assertEqual(g._py_write_call(text),
+                                 g._py_write_call(text) or g._py_write_call_ast([text]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

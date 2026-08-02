@@ -194,6 +194,7 @@ env-префикс в команде, место/имя скрипта), взв�
 import sys
 import os
 import re
+import ast                   # канонический разбор питона: вызов под псевдонимом (_py_write_call_ast)
 import json
 import shlex
 import subprocess
@@ -1153,6 +1154,116 @@ def _py_write_call(text):
     return None
 
 
+# ── ВЫЗОВ ПОД ПСЕВДОНИМОМ: РЕШАЕТ РАЗОБРАННЫЙ ВЫЗОВ, А НЕ БУКВА (02.08.2026, A-30) ────────────
+# `_py_write_call` выше судит уже не по имени в тексте, а по ФОРМЕ вызова — и всё-таки читает
+# ТЕКСТ, который пишет модель. Дыра названа в разведке корня А дословно и она ОТКРЫВАЕТ:
+#     from bridge_client import create_booking as cb
+#     cb(client="Иван", bike="5580", amount=12000)
+# Ни одна из четырёх форм не срабатывает — подстроки `create_booking(` в тексте НЕТ вовсе,
+# поля `action=` нет, кавычек вокруг имени нет. Значит боевая запись Bridge из НЕотслеживаемого
+# скрипта уезжала без карточки и без красного. То же с `import shutil as sh; sh.rmtree(p)` и
+# `from os import remove; remove(p)`.
+# Лечится это не шестым регекспом, а ПРИРОДОЙ данных: тело скрипта — не проза, а формальная
+# грамматика, у неё есть канонический разбор (как SQL у `_RE_SQL_WRITE`). `ast` строит дерево,
+# псевдоним резолвится ПО ПРИВЯЗКЕ (`import … as`, `from … import …`, `x = модуль.операция`),
+# и решение принимает узел Call.
+# ГРАНИЦЫ, каждая сознательная:
+#   • слой ТОЛЬКО ДОБАВЛЯЕТ красное: подстрочный разбор идёт ПЕРВЫМ, его вердикт здесь не
+#     отменяется никогда; разбор не удался (не питон, обрывок, чужой синтаксис) → None, то есть
+#     прежнее поведение байт-в-байт. Асимметрия та же, что у имени базы в A-2: добавить вопрос
+#     можно, снять — нельзя;
+#   • ОПРЕДЕЛЕНИЕ функции вызовом не считается и здесь — `def create_booking(…)` это FunctionDef,
+#     а не Call, то есть правило держится структурой, а не отрицательным регекспом;
+#   • объект карточки прежний: `_py_call_args` ищет вызов ПО ИМЕНИ токена, и у вызова под
+#     псевдонимом текста `create_booking(` нет — объект не извлечётся, карточка высшего вида не
+#     выпишется. РЕШЕНИЕ при этом красное, операция не исполняется: fail-closed, а не тишина.
+_PY_FS_DOTTED = {"os.remove": "os.remove", "os.unlink": "os.unlink", "os.rmdir": "os.rmdir",
+                 "shutil.rmtree": "shutil.rmtree"}
+_AST_ALIAS_HOPS = 3          # `sh = s` поверх `import shutil as s`; больше — цикл, не смысл
+
+
+def _ast_dotted(node):
+    """Точечное имя вызываемого узла → 'os.remove' / 'bridge.create_booking' / 'cb'.
+    Хвост, не упирающийся в имя (`get_bridge().create_booking`), отдаём тем, что известно."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _ast_aliases(tree):
+    """Привязки имён → {локальное имя: настоящее точечное имя}. Ровно три формы связывания,
+    все декларативные: `import X as Y`, `from M import N [as Y]`, `Y = X.N`."""
+    out = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                if a.asname:
+                    out[a.asname] = a.name
+        elif isinstance(n, ast.ImportFrom):
+            for a in n.names:
+                if a.asname:
+                    out[a.asname] = a.name
+                elif n.module:
+                    out[a.name] = n.module + "." + a.name
+        elif isinstance(n, ast.Assign):
+            tgt = n.targets[0] if len(n.targets) == 1 else None
+            if isinstance(tgt, ast.Name) and isinstance(n.value, (ast.Name, ast.Attribute)):
+                d = _ast_dotted(n.value)
+                if d and d != tgt.id:
+                    out[tgt.id] = d
+    return out
+
+
+def _ast_resolve(dotted, aliases):
+    """Псевдоним → настоящее имя (не более `_AST_ALIAS_HOPS` шагов: самоссылка не зациклит)."""
+    for _ in range(_AST_ALIAS_HOPS):
+        head, _sep, tail = dotted.partition(".")
+        base = aliases.get(head)
+        if not base:
+            break
+        nxt = base + ("." + tail if tail else "")
+        if nxt == dotted:
+            break
+        dotted = nxt
+    return dotted
+
+
+def _py_write_call_ast(sources):
+    """Боевая операция, ВЫЗВАННАЯ в разобранном питоне → элемент `_RED_PY_TOKENS`, иначе None.
+    Вход — куски питона ПОРОЗНЬ (тело файла, инлайн `-c`): склейка кусков синтаксисом не является.
+    Порядок ответа тот же, что у `_py_write_call`, — первый токен списка из найденных."""
+    found = set()
+    for src in sources or ():
+        if not (src or "").strip():
+            continue
+        try:
+            tree = ast.parse(src)
+        except Exception:
+            continue                  # не питон / обрывок → прежнее поведение (fail-safe вверх)
+        try:
+            aliases = _ast_aliases(tree)
+            for n in ast.walk(tree):
+                if not isinstance(n, ast.Call):
+                    continue
+                dotted = _ast_resolve(_ast_dotted(n.func), aliases)
+                if not dotted:
+                    continue
+                leaf = dotted.rsplit(".", 1)[-1]
+                if dotted in _PY_FS_DOTTED:
+                    found.add(_PY_FS_DOTTED[dotted])
+                elif leaf == "rmtree":
+                    found.add("rmtree(")
+                elif leaf in _PY_BRIDGE_TOKENS:
+                    found.add(leaf)
+        except Exception:
+            continue
+    return next((t for t in _RED_PY_TOKENS if t in found), None)
+
+
 # ══ ОБЪЕКТ КАРТОЧКИ — ЦЕЛЬ ОПЕРАЦИИ, А НЕ ЕЁ ИМЯ (правило-класс, 01.08.2026) ═════════════════
 # ПОВОД дословный, карточка задачи 136 от 31.07:
 #     🔴 Хочу выполнить python с боевой записью (os.remove) — разрешить?
@@ -1965,12 +2076,15 @@ def _scan_python(cmd, cwd, env_probe=False):
     except Exception:
         return ("ask", "py_write", "кривое квотирование")
     content = ""
+    py_srcs = []          # те же куски ПОРОЗНЬ: разобрать питон можно только целым куском, а не склейкой
     saw_target = False
     i = 0
     while i < len(toks):
         t = toks[i]
         if t == "-c":
-            content += (toks[i + 1] if i + 1 < len(toks) else "")
+            src = toks[i + 1] if i + 1 < len(toks) else ""
+            content += src
+            py_srcs.append(src)
             saw_target = True
             i += 2
             continue
@@ -1995,6 +2109,7 @@ def _scan_python(cmd, cwd, env_probe=False):
             if body is None:
                 return ("ask", "py_write", "скрипт не прочитан")
             content += body
+            py_srcs.append(body)
             saw_target = True
         i += 1
     # скан-текст: позиционные аргументы скрипта — данные, не операция (_scan_text, посегментно)
@@ -2021,7 +2136,9 @@ def _scan_python(cmd, cwd, env_probe=False):
     sheet = _live_sheet_decide(blob)
     if sheet is not None:
         return ("ask", "live_sheet", sheet)
-    tok = _py_write_call(blob)
+    # Подстрочная форма ПЕРВОЙ (порядок токенов и объект карточки прежние), разобранный вызов —
+    # ДОБАВКОЙ на её пустоте: псевдоним импорта мимо всех четырёх форм (A-30, см. _py_write_call_ast).
+    tok = _py_write_call(blob) or _py_write_call_ast(py_srcs)
     if tok:
         return ("ask", "py_write", tok)
     # SQL-ЗАПИСЬ судится ПО ОПЕРАТОРУ и только по нему (седьмая группа класса, 02.08.2026).

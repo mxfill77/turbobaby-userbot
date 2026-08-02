@@ -19,6 +19,8 @@ test_trainer.py — ГРУППА-ТРЕНАЖЁР клиентского бот�
 
 import os
 import json
+import inspect
+import datetime
 import tempfile
 import unittest
 
@@ -853,6 +855,15 @@ class TestTrainerAccumulation(unittest.TestCase):
         self.assertEqual(trainer.get_transcript(get), "[клиент]: привет")
         self.assertEqual(trainer.get_last_pair(get)[0], "привет")
 
+    # «СЕГОДНЯ» У ЭТОГО ГОЛДЕНА ЗАКРЕПЛЕНО (02.08.2026). Реплика клиента называет АБСОЛЮТНУЮ дату,
+    # и 02.08 старт «1 августа» стал прошлым: прошедший старт `collected_facts` собранной датой
+    # СОЗНАТЕЛЬНО не считает (гейт как раз просит его уточнить) — то есть тест краснел от смены
+    # СУТОК, а не от смены кода, и валил весь гейт. Лечим не фразой и не кодом контура: фраза
+    # клиента остаётся ДОСЛОВНОЙ (правило голденов детекта), а закрепляется ВТОРОЙ вход обеих
+    # функций — `today`, он для того и заведён. Проверяемое здесь — КУМУЛЯТИВНОСТЬ окна, к
+    # календарю отношения не имеющая.
+    TODAY = datetime.date(2026, 7, 25)      # любой день ДО старта из реплики; сам он не проверяется
+
     def test_window_is_cumulative_across_events(self):
         # текст (даты) + гео-ПИН разными событиями → collected_facts КУМУЛЯТИВНЫ по окну
         # (а не по одному событию): и даты, и гео видны одновременно → нет переспроса собранного.
@@ -863,11 +874,27 @@ class TestTrainerAccumulation(unittest.TestCase):
                                 trainer.client_body("аренда с 1 по 8 августа на 7 дней"))
         t = trainer.append_turn(t, "client",
                                 trainer.client_body("", geo_marker=suggest.geo_marker(Geo(7.771, 98.327))))
-        f = suggest.collected_facts(t)
+        f = suggest.collected_facts(t, today=self.TODAY)
         self.assertTrue(f["dates"])          # даты из первого события
         self.assertTrue(f["term"])
         self.assertTrue(f["geo"])            # гео из второго — В ТОМ ЖЕ окне
-        self.assertEqual(suggest.extract_booking_hints(t).get("geo_pin"), (7.771, 98.327))
+        self.assertEqual(suggest.extract_booking_hints(t, today=self.TODAY).get("geo_pin"),
+                         (7.771, 98.327))
+
+    def test_why_today_is_pinned_and_that_it_stays_pinned(self):
+        """Страж протухания. Показывает МЕХАНИЗМ: тот же вход при разном `today` даёт РАЗНЫЙ ответ
+        по датам (прошедший старт собранной датой не считается — это правильное поведение контура,
+        трогать его нечего), значит незакреплённый голден мерил календарь машины. И сторожит сам
+        пин: уберут `today=` обратно — тест упадёт СРАЗУ, а не через сутки на чужом гейте."""
+        t = trainer.append_turn("", "client",
+                                trainer.client_body("аренда с 1 по 8 августа на 7 дней"))
+        before = suggest.collected_facts(t, today=datetime.date(2026, 7, 25))
+        after = suggest.collected_facts(t, today=datetime.date(2026, 8, 9))
+        self.assertTrue(before["dates"])
+        self.assertFalse(after["dates"], "прошедший старт собранной датой не считается")
+        self.assertTrue(after["term"], "длительность прошедший старт не отменяет")
+        src = inspect.getsource(TestTrainerAccumulation.test_window_is_cumulative_across_events)
+        self.assertIn("today=self.TODAY", src, "закрепление «сегодня» отвинтили назад")
 
 
 class TestTrainerDebounce(unittest.IsolatedAsyncioTestCase):
