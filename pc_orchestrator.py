@@ -49,6 +49,7 @@ import urllib.parse
 import urllib.error
 
 import io_utf8               # переключатель stdout/stderr в UTF-8 (класс «charmap can't encode 📊»)
+import bridge_http            # durable-транспорт к мосту: ручной обход редиректа (класс 02.08.2026)
 import gate_selective         # селективный тест-гейт авто-применения (порт VPS GATE_STEP/SINGLE_SELECTIVE); чистый, без сети
 import task_metrics           # единый формат строки METRICS (обе полосы) + norm_effort/extract_tokens/selfheal_count
 import client_contour         # признак клиентского контура (граф импортов ботов) + реестр оснований пропуска ворот; чистый, без сети
@@ -344,38 +345,95 @@ ORIGIN_AGENT = "agent"      # отвечает автономный процес
 # ------------------------------- Bridge (очередь) ----------------------------
 
 class Bridge:
-    """Минимальный клиент очереди Bridge (совместим с протоколом VPS). read=GET, мутации=POST."""
-    def __init__(self, url=None, token=None, timeout=90):
+    """Минимальный клиент очереди Bridge (совместим с протоколом VPS). read=GET, мутации=POST.
+
+    ТРАНСПОРТ — `bridge_http`, а не голый urlopen (класс 02.08.2026, разбор
+    docs/artifacts/2026-08-02-bridge-receipt-leg-not-token.md): мост отвечает 302 на второе
+    плечо, а `urlopen` идёт по нему сам и переигрывает POST как GET без тела — расписку на
+    claim/complete выдавал `doGet` («Invalid or missing token») при УЖЕ ЛЁГШЕЙ мутации.
+    `opener` — точка инъекции тестов, боевой путь его не задаёт."""
+
+    # Отказы, которые мост дал ПО СУЩЕСТВУ: запрос дошёл до doPost и разобран, мутации не было.
+    # Перечитывать статус после них незачем (и вредно: лишний запрос в мост на ровном месте).
+    _CLAIM_SEMANTIC = ("not_found", "wrong_lane", "no_id")
+    _COMPLETE_SEMANTIC = ("not_found", "no_id", "bad_status")
+
+    def __init__(self, url=None, token=None, timeout=90, opener=None):
         self.url = url or BRIDGE_URL
         self.token = token or BRIDGE_TOKEN
         self.timeout = timeout
+        self.opener = opener
 
     def _get(self, action, **params):
         q = {"action": action, "token": self.token, **{k: v for k, v in params.items() if v is not None}}
-        full = self.url + "?" + urllib.parse.urlencode(q)
         try:
-            with urllib.request.urlopen(urllib.request.Request(full, method="GET"), timeout=self.timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
+            return bridge_http.request_json(self.url, "GET", params=q, timeout=self.timeout,
+                                            opener=self.opener)
         except Exception as e:
             return {"ok": False, "error": type(e).__name__}
 
     def _post(self, action, **fields):
-        body = json.dumps({"action": action, "token": self.token, **fields}).encode("utf-8")
-        req = urllib.request.Request(self.url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        body = {"action": action, "token": self.token, **fields}
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
+            return bridge_http.request_json(self.url, "POST", payload=body, timeout=self.timeout,
+                                            opener=self.opener)
         except Exception as e:
             return {"ok": False, "error": type(e).__name__}
 
     def get_pending(self, status, lane=LANE):
         return self._get("get_pending", status=status, lane=lane)
 
+    # ── СУДИТЬ ПО ФАКТУ, А НЕ ПО РАСПИСКЕ ────────────────────────────────────────────────
+    # Расписка моста описывает ДОСТАВКУ ОТВЕТА, а не судьбу мутации: второе плечо (echo) падает
+    # уже ПОСЛЕ того, как Apps Script исполнил действие. Живой случай — задача 193 (02.08):
+    # `claim_task` вернул `unauthorized`, демон написал «claim не удался — пропуск», а задача
+    # ЛЕГЛА в `in_progress` и провисела до реапера. Поэтому отказ расписки больше не вердикт:
+    # вердикт выносит перечитанный СТАТУС — ровно как обратное чтение дока у писателя журнала.
+    # Форма списана с VPS `_claim_task_verified` (08.07.2026, тот же класс на своей полосе);
+    # мутацию НЕ переотправляем никогда (claim не идемпотентен, а повторный complete затёр бы
+    # result), только перечитываем факт.
+
+    def _in_status(self, tid, status):
+        """Задача tid СЕЙЧАС в статусе status на МОЕЙ полосе? True | False | None (не прочитали).
+        None и False разведены: «не знаю» не смеет выдавать себя за «не легло»."""
+        r = self._get("get_pending", status=status, lane=LANE)
+        if not (isinstance(r, dict) and r.get("ok")):
+            return None
+        return any(str(it.get("id")) == str(tid)
+                   for it in (r.get("items") or []) if isinstance(it, dict))
+
     def claim_task(self, tid):
-        return self._post("claim_task", id=tid)
+        r = self._post("claim_task", id=tid)
+        if r.get("ok"):
+            return r
+        err = str(r.get("error") or "")
+        if err in self._CLAIM_SEMANTIC:
+            return r
+        # Одно-воркерность полосы = доказательство владения: pc-задачи клеймит ТОЛЬКО этот демон,
+        # а кандидат секунды назад был `new` в этом же цикле. Значит `in_progress` сейчас — наш
+        # долетевший claim. Не прочитали / статус иной → прежний пропуск цикла (fail-safe).
+        if self._in_status(tid, "in_progress") is True:
+            log.warning("CLAIM-VERIFY id=%s: расписка claim — отказ (%s), а задача in_progress на "
+                        "моей полосе → claim ДОЛЕТЕЛ, работаю штатно (сироты нет)", tid, err)
+            return {"ok": True, "verified_by_fact": True, "receipt_error": err,
+                    "task": r.get("task")}
+        return r
 
     def complete_task(self, tid, status, result):
-        return self._post("complete_task", id=tid, status=status, result=(result or "")[:RESULT_MAX])
+        r = self._post("complete_task", id=tid, status=status, result=(result or "")[:RESULT_MAX])
+        if r.get("ok"):
+            return r
+        err = str(r.get("error") or "")
+        if err in self._COMPLETE_SEMANTIC:
+            return r
+        # Спрашиваем ИМЕННО ЗАПРОШЕННЫЙ статус (положительный факт), а не «её больше нет в
+        # in_progress»: complete зовут и для approved/needs_approval — там её в in_progress и
+        # не было, и отрицательная проверка объявила бы успехом любой отказ.
+        if self._in_status(tid, status) is True:
+            log.warning("COMPLETE-VERIFY id=%s: расписка complete — отказ (%s), а задача уже в "
+                        "статусе %s → запись ДОЛЕТЕЛА, отказ был потерей расписки", tid, err, status)
+            return {"ok": True, "verified_by_fact": True, "receipt_error": err}
+        return r
 
     def set_needs_approval(self, tid, what, topic=NEEDS_APPROVAL_TOPIC):
         # topic → Splinter постит красную карточку в эту тему (по уточнению Филиппа — 829).
@@ -4395,6 +4453,9 @@ def _classify_changed(paths):
 _ORCH_RUNTIME = ("pc_orchestrator.py", "gate_selective.py", "task_metrics.py",
                  "lesson_router.py", "log_setup.py",
                  "client_contour.py",
+                 # 02.08.2026: транспорт моста (ручной обход редиректа) — тоже верхний импорт
+                 # демона, его незакоммиченная правка уехала бы в бой вместе с рестартом.
+                 "bridge_http.py",
                  # 30.07.2026: демон импортирует их СВЕРХУ, значит незакоммиченная правка уедет в
                  # бой вместе с рестартом. pretool_guard — новый импорт (словарь видов красного для
                  # разбора одобренной карточки), io_utf8 стоял в импортах и в список не попал.

@@ -7948,5 +7948,89 @@ class TestClientContourGate(Base):
         self.assertEqual(self.cards, [])
 
 
+class SudimPoFaktuANePoRaspiske(unittest.TestCase):
+    """claim/complete при отказе ПЕРЕЧИТЫВАЮТ статус задачи (02.08.2026).
+
+    Живой случай — задача 193: `claim_task` вернул `unauthorized`, демон написал «claim не удался
+    — пропуск», а задача при этом ЛЕГЛА в `in_progress` и осталась висеть до реапера. Причина не
+    в токене: расписка потерялась на втором плече моста (разбор
+    docs/artifacts/2026-08-02-bridge-receipt-leg-not-token.md). Значит отказ расписки больше не
+    вердикт — вердикт выносит ФАКТ, ровно как обратное чтение дока у журнального писателя.
+    Форма списана с VPS `_claim_task_verified` (08.07.2026, тот же класс на своей полосе)."""
+
+    def _bridge(self, post_reply, pending):
+        """Мост, у которого POST отвечает post_reply, а GET показывает pending[status]."""
+        b = o.Bridge(url="https://bridge.test/exec", token="TOK")
+        seen = {"posts": [], "gets": []}
+        b._post = lambda action, **f: (seen["posts"].append((action, f)), post_reply)[1]
+
+        def fake_get(action, **params):
+            seen["gets"].append((action, params))
+            st = params.get("status")
+            if st not in pending:
+                return {"ok": False, "error": "TimeoutError"}
+            return {"ok": True, "items": [{"id": i} for i in pending[st]]}
+
+        b._get = fake_get
+        return b, seen
+
+    # ── claim ────────────────────────────────────────────────────────────────────────────
+    def test_claim_otkaz_no_zadacha_in_progress_znachit_doletel(self):
+        b, seen = self._bridge({"ok": False, "error": "unauthorized"}, {"in_progress": [193]})
+        r = b.claim_task(193)
+        self.assertTrue(r.get("ok"), "claim долетел — задача НА МОЕЙ полосе в in_progress")
+        self.assertEqual(r.get("receipt_error"), "unauthorized")   # причина названа, а не съедена
+        self.assertEqual(len(seen["posts"]), 1, "claim НЕ переотправляем — он не идемпотентен")
+        self.assertEqual(seen["gets"][0][1]["status"], "in_progress")
+
+    def test_claim_otkaz_i_zadachi_net_ostayotsya_otkazom(self):
+        b, _ = self._bridge({"ok": False, "error": "unauthorized"}, {"in_progress": [7]})
+        self.assertFalse(b.claim_task(193).get("ok"), "в in_progress её нет — claim правда не лёг")
+
+    def test_claim_ne_smog_perechitat_ostayotsya_otkazom(self):
+        """fail-safe: verify сам сбоит → прежний пропуск цикла, не хуже прежнего."""
+        b, _ = self._bridge({"ok": False, "error": "TimeoutError"}, {})
+        self.assertFalse(b.claim_task(193).get("ok"))
+
+    def test_semanticheskii_otkaz_claim_ne_dyorgaet_perechityvanie(self):
+        """not_found/wrong_lane/no_id — мост ОТВЕТИЛ ПО СУЩЕСТВУ, читать статус незачем."""
+        for err in ("not_found", "wrong_lane", "no_id"):
+            b, seen = self._bridge({"ok": False, "error": err}, {"in_progress": [193]})
+            self.assertFalse(b.claim_task(193).get("ok"), err)
+            self.assertEqual(seen["gets"], [], err)
+
+    def test_uspeshnyi_claim_lishnego_zaprosa_ne_delaet(self):
+        b, seen = self._bridge({"ok": True, "task": {"id": 193}}, {"in_progress": [193]})
+        self.assertTrue(b.claim_task(193).get("ok"))
+        self.assertEqual(seen["gets"], [])
+
+    # ── complete ─────────────────────────────────────────────────────────────────────────
+    def test_complete_otkaz_no_status_uzhe_terminalnyi_znachit_doletel(self):
+        b, seen = self._bridge({"ok": False, "error": "BridgeReceiptLost"}, {"done": [193]})
+        r = b.complete_task(193, "done", "готово")
+        self.assertTrue(r.get("ok"), "задача уже в done — запись долетела, потерялась расписка")
+        self.assertEqual(r.get("receipt_error"), "BridgeReceiptLost")
+        self.assertEqual(len(seen["posts"]), 1)
+        self.assertEqual(seen["gets"][0][1]["status"], "done")   # спрашиваем ЗАПРОШЕННЫЙ статус
+
+    def test_complete_proveryaet_imenno_zaproshennyi_status(self):
+        """Задача осталась в in_progress → complete НЕ лёг. Проверять «её больше нет в
+        in_progress» нельзя: complete зовут и для approved/needs_approval — там её и не было."""
+        b, _ = self._bridge({"ok": False, "error": "unauthorized"},
+                            {"failed": [], "in_progress": [193]})
+        self.assertFalse(b.complete_task(193, "failed", "провал").get("ok"))
+
+    def test_semanticheskii_otkaz_complete_ne_dyorgaet_perechityvanie(self):
+        for err in ("not_found", "no_id", "bad_status"):
+            b, seen = self._bridge({"ok": False, "error": err}, {"done": [193]})
+            self.assertFalse(b.complete_task(193, "done", "x").get("ok"), err)
+            self.assertEqual(seen["gets"], [], err)
+
+    def test_perechityvanie_idyot_po_svoei_polose(self):
+        b, seen = self._bridge({"ok": False, "error": "unauthorized"}, {"in_progress": [193]})
+        b.claim_task(193)
+        self.assertEqual(seen["gets"][0][1]["lane"], o.LANE)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
