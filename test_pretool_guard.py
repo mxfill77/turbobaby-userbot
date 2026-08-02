@@ -397,7 +397,13 @@ GREEN_UNDER_DOCTRINE = (
     "mkdir -p tmp/scratch",
     "rm tmp/scratch/one.txt",                                 # ОДИН явный файл — не «массовое удаление»
     "schtasks /Query /TN TurboBabyRC",                        # /Query — чтение, не контроль задач
-    "venv/Scripts/python.exe no_such_script.py",              # py_write «скрипт не прочитан» = неизвестность, не боевая запись
+    # ФИКСТУРА ЗАМЕНЕНА 02.08.2026 (класс Д-4). Здесь стояло `venv/Scripts/python.exe
+    # no_such_script.py` с комментарием «py_write „скрипт не прочитан“ = неизвестность, не боевая
+    # запись» — то есть зелёным примером доктрины служил случай, когда гард КОДА НЕ ВИДЕЛ. Именно
+    # этой посылкой в живом логе прошли 121 запуск из 136, включая снос файлов и боевую проводку
+    # через heredoc. Теперь «не видел» = красное, а зелёный пример — запуск, который гард
+    # действительно разобрал (файл под git, доверие по происхождению).
+    "venv/Scripts/python.exe gate_selective.py",
     'sqlite3 bookings.db "select 1"',                         # ЧТЕНИЕ базы: данные не меняются
 )
 
@@ -1443,13 +1449,18 @@ class TestCardMinimumAndJournal(unittest.TestCase):
         """Живой факт суток: `echo \"---SCHTASKS XML---\"` внутри `ls` дал карточку Планировщика.
 
         ОБНОВЛЕНО 31.07.2026: подстрочное срабатывание закрыто на слой раньше (`_verb_acts`),
-        поэтому вида `schtasks` тут больше нет — есть честное `word_schtasks`. Правило «нет
-        объекта → журнал» это НЕ отменяет: оно проверяется прямым вызовом `card_or_journal`
-        строкой ниже и остаётся вторым поясом для видов со своим probe."""
+        поэтому вида `schtasks` тут больше нет — есть честное `word_schtasks`.
+
+        ОБНОВЛЕНО 02.08.2026 (класс Д-3). Здесь стояла вторая строка проверки — прямой вызов
+        `card_or_journal("schtasks", "", cmd)` с ожиданием `None`, «второй пояс правила журнала».
+        Поясом это не было: вызов подавал в гейт вид, которого живой конвейер сюда уже не
+        доводит (строкой выше видно `word_schtasks`), и потому пиннил ветку на входе, который
+        она не получает. Проверяем то, что происходит НА САМОМ ДЕЛЕ: подстрока умирает раньше
+        карточки — молчание обеспечивает `_verb_acts`, а не гейт объекта."""
         cmd = 'ls -la *.log* 2>/dev/null | head -40; echo "---SCHTASKS XML---"; ls *.xml 2>/dev/null'
         a, k, o = g.decide_for_role(bash(cmd), headless=False)
         self.assertEqual((a, k), ("defer", "word_schtasks"))
-        self.assertIsNone(g.card_or_journal("schtasks", "", cmd))
+        self.assertNotEqual(a, "ask", "подстрока не доходит до карточки вовсе")
 
     def test_real_scheduler_action_still_cards(self):
         cmd = "schtasks /Change /TN TurboBabyRC /DISABLE"
@@ -1540,29 +1551,50 @@ class TestOneRuleObjectGatesNumberDoesNot(unittest.TestCase):
                 self.assertEqual(num, "", label + ": числа нет ПО ПРИРОДЕ операции")
                 self.assertIn("Объект: ", card, label)
 
-    def test_number_without_object_does_not_card(self):
-        """Дыра ПОЛОСЫ ПК: раньше любая цифра в безобъектной команде рождала карточку.
+    def test_number_alone_never_decides_the_card(self):
+        """ЧИСЛО КАРТОЧКУ НЕ РЕШАЕТ — ни в плюс, ни в минус. Это и было исходное свойство.
 
-        ФИКСТУРЫ СМЕНЕНЫ 02.08.2026 (класс A-54): `delete` — вид ВЫСШИЙ, и с этого дня он
-        гейт объекта не проходит вовсе (`card_gate` пропускает его к `card_decision`, где без
-        объекта будет `deny`). Проверяемое свойство «число карточку не гейтит» не изменилось —
-        оно проверяется на ОБЫЧНЫХ видах, для которых и было заведено."""
-        self.assertFalse(g.card_gate("schtasks", "", "версия 76"))
-        self.assertFalse(g.card_gate("network", "", "3 цели"))
+        ТЕСТ ПРИВЕДЁН К ПРАВДЕ 02.08.2026 (класс Д-3). Он звался
+        `test_number_without_object_does_not_card` и требовал `card_gate(...) is False` на
+        безобъектных `schtasks`/`network` — то есть пиннил ПОСЫЛКУ «нет объекта ⇔ признак поймал
+        подстроку», убитую `_verb_acts` 31.07. Пока тест был зелёным, он охранял тихий проход
+        настоящей операции Планировщика и настоящего выхода в сеть.
+
+        Свойство, ради которого тест заводился, проверяется по-прежнему и честнее: решение
+        одинаково при числе и без числа."""
+        for kind in ("schtasks", "network"):
+            with self.subTest(kind):
+                self.assertEqual(g.card_decision(kind, "", "")[0],
+                                 g.card_decision(kind, "", "")[0])
+                self.assertTrue(g.card_gate(kind, "", "версия 76"))
+                self.assertTrue(g.card_gate(kind, "", ""), "число ничего не решает")
+                # …и операция НЕ проходит молча: обычный вид без объекта теперь спрашивает.
+                self.assertEqual(g.card_decision(kind, "", "")[0], "ask", kind)
 
     def test_object_alone_is_enough(self):
         self.assertTrue(g.card_gate("kill", "ngrok", ""))
         self.assertTrue(g.card_gate("sqlite", "app.db", ""))
 
-    def test_nothing_at_all_goes_to_journal(self):
-        """ТОЛЬКО ОБЫЧНЫЙ ВИД. Высший (`delete`, `kill`, `clasp*`) с 02.08.2026 в журнал не
-        уходит никогда: цена его ошибки необратима, и пустой объект там означает не «поймали
-        слово» (это отсеивает `_verb_acts` слоем раньше), а «действие разобрано, цель не
-        извлеклась». Обратная половина — `TestTwoTiersOfCards`."""
-        self.assertFalse(g.card_gate("schtasks", "", ""))
-        self.assertFalse(g.card_gate("network", "", ""))
-        self.assertTrue(g.card_gate("delete", "", ""), "высший вид гейт объекта не проходит")
-        self.assertTrue(g.card_gate("kill", "", ""), "высший вид гейт объекта не проходит")
+    def test_nothing_at_all_no_longer_goes_to_journal(self):
+        """ЖУРНАЛЬНОЙ ВЕТКИ БОЛЬШЕ НЕТ НИ У КАКОГО ВИДА (02.08.2026, класс Д-3).
+
+        Тест звался `test_nothing_at_all_goes_to_journal` и требовал `False` на безобъектных
+        `schtasks`/`network` — последний зелёный держатель посылки «нет объекта ⇔ подстрока».
+        Посылку убил `_verb_acts` 31.07 сразу для ВСЕХ видов; для высшего это закрыл `cbed09d`,
+        для обычного — замер журнала гарда: 22 события ветки за всю историю, все на `kill` и
+        `schtasks`, и НОЛЬ после 31.07.
+
+        Пустой объект сегодня означает у любого вида одно: действие разобрано, цель не
+        извлеклась. Разница между видами осталась ровно там, где ей место, — в ЦЕНЕ: обычный
+        спрашивает (`ask`), высший отказывает (`deny`)."""
+        for kind in ("schtasks", "network"):
+            with self.subTest("обычный: " + kind):
+                self.assertTrue(g.card_gate(kind, "", ""))
+                self.assertEqual(g.card_decision(kind, "", "")[0], "ask")
+        for kind in ("delete", "kill"):
+            with self.subTest("высший: " + kind):
+                self.assertTrue(g.card_gate(kind, "", ""), "высший вид гейт объекта не проходит")
+                self.assertEqual(g.card_decision(kind, "", "")[0], "deny")
 
     def test_hard_block_and_money_always_card(self):
         for kind in ("unknown", "env", "edit_secret", "read_secret", "py_write"):
@@ -1594,11 +1626,14 @@ class TestOneRuleObjectGatesNumberDoesNot(unittest.TestCase):
         `schtasks` в логе. Теперь слово Планировщика вне командной позиции признаком не
         становится вовсе (`_verb_acts`), и вид в логе честный: `word_schtasks` — «признак нашёл
         СЛОВО». Итог для владельца тот же (карточки нет), но причина названа на слой раньше.
-        Само правило объекта проверяется отдельно — `TestCardMinimumAndJournal`."""
+
+        ОБНОВЛЕНО 02.08.2026 (класс Д-3): гейта объекта больше нет, и молчание здесь держит
+        ровно один механизм — `_verb_acts`. Прежняя вторая строка (`card_or_journal` → `None`)
+        создавала впечатление, что поясов два, и пиннила уже мёртвую ветку."""
         cmd = 'ls -la *.log* 2>/dev/null | head -40; echo "---SCHTASKS XML---"; ls *.xml'
         a, k, o = g.decide_for_role(bash(cmd), headless=False)
         self.assertEqual((a, k), ("defer", "word_schtasks"))
-        self.assertIsNone(g.card_or_journal("schtasks", o, cmd))
+        self.assertEqual(o, "", "объекта у словесного срабатывания нет")
 
 
 class TestGuardSourcesWriteIsNotExecution(unittest.TestCase):
@@ -3360,8 +3395,10 @@ class TestTwoTiersOfCards(unittest.TestCase):
             with self.subTest(kind):
                 self.assertTrue(g.is_top_tier(kind), kind + ": фикстура обязана быть высшей")
                 self.assertEqual(g.card_decision(kind, "", "")[0], "deny", kind)
-        # обычный вид — правило журнала как было (остаток назван в докстринге card_gate)
-        self.assertEqual(g.card_decision("schtasks", "", "")[0], "journal")
+        # ОБЫЧНЫЙ ВИД ДОБРАН 02.08.2026 (класс Д-3): здесь стояло ожидание `journal` — то есть
+        # тихого ИСПОЛНЕНИЯ безобъектной операции Планировщика. Замер закрыл остаток: журнальная
+        # ветка не срабатывала с 31.07 ни разу. Разница видов осталась в ЦЕНЕ, а не в молчании.
+        self.assertEqual(g.card_decision("schtasks", "", "")[0], "ask")
 
     def test_unnamed_kill_target_does_not_execute(self):
         """РЕГРЕСС A-54 ПОЛНЫМ КОНВЕЙЕРОМ: `decide` → `decide_for_role` → `card_decision`.
@@ -3599,6 +3636,155 @@ class TestRedRuleLock(unittest.TestCase):
         for name, why in g._ACTION_CHECK.items():
             with self.subTest(name):
                 self.assertTrue(str(why).strip(), "признак %s не назвал проверку" % name)
+
+    def test_functions_without_callers_declare_their_consumer(self):
+        """СТОРОЖ КЛАССА «ФУНКЦИЯ БЕЗ ПОТРЕБИТЕЛЯ» (02.08.2026, Д-5).
+
+        Список сирот ВЫВОДИТСЯ ИЗ ИСХОДНИКА, а не зашит: функция верхнего уровня, на чьё имя
+        внутри модуля нет ни одного `Name`/`Attribute`, обязана стоять в `_EXTERNAL_API` и
+        назвать файл-потребитель, а файл — реально её упоминать. Так «мёртвая обёртка» перестаёт
+        быть находкой одного прохода: две такие (`_net_cmd_kind`, `_env_probe_only`) держались
+        доводами, которые другие коммиты уже отменили, и оба довода жили в докстрингах, где их
+        не видит никакой `ast`. Здесь `ast` видит хотя бы отсутствие потребителя."""
+        tree = ast.parse(io.open(os.path.join(PROJ, "pretool_guard.py"),
+                                 encoding="utf-8").read())
+        top = [n.name for n in tree.body
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        self.assertGreater(len(top), 100, "разбор модуля сломался — функций подозрительно мало")
+        used = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Name):
+                used.add(n.id)
+            elif isinstance(n, ast.Attribute):
+                used.add(n.attr)
+        orphans = sorted(f for f in top if f not in used)
+        declared = sorted(g._EXTERNAL_API)
+        self.assertEqual(orphans, declared,
+                         "функция без ссылок внутри модуля не названа в _EXTERNAL_API "
+                         "(либо реестр протух): сироты=%s, реестр=%s" % (orphans, declared))
+        for name, consumer in g._EXTERNAL_API.items():
+            with self.subTest(name):
+                path = os.path.join(PROJ, consumer)
+                self.assertTrue(os.path.isfile(path), "потребитель %s не существует" % consumer)
+                self.assertIn(name, io.open(path, encoding="utf-8").read(),
+                              "заявленный потребитель %s имени %s не упоминает" % (consumer, name))
+
+    def test_card_or_journal_is_test_only_and_blind(self):
+        """Обёртка `card_or_journal` СХЛОПЫВАЕТ `journal` и `deny` в один `None` — тот самый бит,
+        чьё неверное чтение и было дефектом A-54. Пиннится ровно это: (1) в проде её не зовут,
+        (2) по её ответу НЕЛЬЗЯ судить, исполнится операция или нет."""
+        for prod in ("pc_orchestrator.py", "pc_agent.py", "brain_writer.py"):
+            with self.subTest(prod):
+                self.assertNotIn("card_or_journal",
+                                 io.open(os.path.join(PROJ, prod), encoding="utf-8").read(),
+                                 "боевой модуль %s зовёт помощника тестов" % prod)
+        # ОДИН И ТОТ ЖЕ `None` на двух ПРОТИВОПОЛОЖНЫХ исходах: слева операция не исполняется,
+        # справа — исполняется. Тест, написанный через эту обёртку, их не различает.
+        blocked = ("live_sheet", g.LIVE_SHEET_UNKNOWN, "python x.py")
+        self.assertIsNone(g.card_or_journal(*blocked))
+        self.assertEqual(g.card_decision(*blocked)[0], "deny")
+
+
+class TestGuardMustSeeTheCodeBeforePassingIt(unittest.TestCase):
+    """КЛАСС Д-4 (02.08.2026): «гард не смог разобрать» перестало значить «зелёное».
+
+    ПОВОД ДОСЛОВНЫЙ. `_stays_red` держала для вида `py_write` правило `obj in _RED_PY_TOKENS` —
+    боевой токен красный, всё остальное (включая собственные честные пометки «скрипт не
+    прочитан» / «код из stdin») отдавалось в `defer`, то есть в ТИХИЙ ПРОХОД. При этом до
+    карточки дело не доходило вовсе: новая fail-closed граница высшего яруса (`cbed09d`) для
+    этих случаев была НЕДОСТИЖИМА — вышестоящий гейт отсекал их раньше.
+
+    Симметрия, которая делает это дефектом: сбой разбора в `main` даёт `ask|unknown` (hard-блок),
+    а сбой разбора в `_scan_python` давал молчание. Одно событие, два противоположных ответа.
+
+    ЗАМЕР ПО ЖИВОМУ ЛОГУ (136 необрезанных команд вида `py_write` за 22.07–02.08):
+    тихо проходил 121 запуск из 136. Причины оказались механическими, а не доктринальными —
+    posix-разбор съедает `\\` в Windows-путях, а ветка stdin выходила ДО того, как собрать
+    скан-текст, хотя тело heredoc лежит в самой команде и `_strip_heredoc` его сохраняет.
+    После правки тихих осталось 26 из 136, и все — разобранные или `-m`/«без цели» (остаток
+    назван у `_PY_UNSEEN`)."""
+
+    RM = "os." + "remove"
+    VOID = "void_" + "last"
+
+    def _end_to_end(self, cmd):
+        a, k, o = g.decide_for_role(bash(cmd), headless=True)
+        if a != "ask":
+            return a, k, o
+        return g.card_decision(k, o, cmd)[0], k, o
+
+    def test_heredoc_body_is_read_not_waved_through(self):
+        """Тело heredoc — это КОД В САМОЙ КОМАНДЕ, и гард обязан судить по нему."""
+        for label, body, want_obj in (
+                ("снос файла", "import os\n%s('suggest.py')" % self.RM, self.RM),
+                ("боевая проводка (ДЕНЬГИ)",
+                 "from bridge import %s\n%s()" % (self.VOID, self.VOID), self.VOID)):
+            with self.subTest(label):
+                cmd = "python - <<'PY'\n%s\nPY" % body
+                action, kind, obj = self._end_to_end(cmd)
+                self.assertEqual(kind, "py_write", label)
+                self.assertEqual(obj, want_obj, label + ": объект — сама операция из тела")
+                self.assertEqual(action, "ask", label + ": операция НЕ проходит молча")
+
+    def test_windows_and_msys_paths_do_not_blind_the_scan(self):
+        """Тот же скрипт, три формы пути: разбор обязан ОТКРЫТЬ ТЕЛО во всех трёх.
+
+        Проверяем именно это свойство — «гард увидел операцию в теле» (объект = имя операции) и
+        «операция не прошла молча». КАКИМ решением она остановлена, здесь не пиннится нарочно:
+        цель `os.remove` лежит внутри скрипта, а не в команде, поэтому `_py_card_fields` цели не
+        извлекает и высший вид честно отказывает (`deny`) — это правило карточки 136, у него
+        свои голдены. Смешать два правила в одном тесте значит сделать оба хрупкими."""
+        rel = "tmp/deadprem-selftest/probe_body.py"
+        full = os.path.join(PROJ, rel.replace("/", os.sep))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with io.open(full, "w", encoding="utf-8") as f:
+            f.write("import os\n%s('victim.txt')\n" % self.RM)
+        try:
+            for label, cmd in (
+                    ("прямой путь", "venv/Scripts/python.exe " + rel),
+                    ("Windows-путь", r"venv\Scripts\python.exe " + rel.replace("/", "\\")),
+                    ("MSYS-путь", "/d/turbobaby-bot/venv/Scripts/python.exe /d/turbobaby-bot/" + rel)):
+                with self.subTest(label):
+                    action, kind, obj = self._end_to_end(cmd)
+                    self.assertEqual((kind, obj), ("py_write", self.RM),
+                                     label + ": тело скрипта прочитано, операция названа")
+                    self.assertNotEqual(action, "defer", label + ": и она НЕ прошла молча")
+        finally:
+            try:
+                os.remove(full)
+                os.rmdir(os.path.dirname(full))
+            except OSError:
+                pass
+
+    def test_unseen_code_is_red_and_denied_not_confirmable(self):
+        """Гард кода не видел → красное; и объект НЕ считается названным, иначе владельцу
+        придёт подтверждаемая карточка «разрешить скрипт, который я не читал» (класс A-54)."""
+        for obj in g._PY_UNSEEN:
+            with self.subTest(obj):
+                self.assertTrue(g._stays_red("py_write", obj, ""), "неизвестность обязана краснеть")
+                self.assertFalse(g._object_named(obj), "пометка объектом не является")
+        action, kind, obj = self._end_to_end("venv/Scripts/python.exe no_such_script.py")
+        self.assertEqual((action, kind), ("deny", "py_write"))
+
+    def test_refusal_teaches_the_fix_that_actually_helps(self):
+        """У этих пометок «назови объект» — неверный совет: назвать нечего, гард не видел КОД."""
+        text = g.card_decision("py_write", "скрипт не прочитан", "python x.py")[1]
+        self.assertIn("heredoc", text)
+        self.assertNotIn("имя листа", text)
+
+    def test_normal_work_is_untouched(self):
+        """Обратная половина: ШТАТНОЕ проходит молча ровно как раньше. Без этой половины
+        правка «всё неизвестное красное» стоила бы дороже дыры, которую закрывает."""
+        for label, cmd in (
+                ("чистый скрипт под git", "venv/Scripts/python.exe gate_selective.py"),
+                ("тест напрямую", "venv/Scripts/python.exe test_pretool_guard.py"),
+                ("зелёный модуль", "venv/Scripts/python.exe -m unittest test_pretool_guard"),
+                ("многострочный -c, на котором падает shlex",
+                 'venv/Scripts/python.exe -c "\nimport json\nprint(json.dumps({\'a\': 1}))\n"'),
+                ("heredoc, который только читает",
+                 "python - <<'PY'\nimport io\nprint(len(io.open('gate_selective.py').read()))\nPY")):
+            with self.subTest(label):
+                self.assertEqual(self._end_to_end(cmd)[0], "defer", label)
 
 
 class TestObjectIsTheTargetNotTheAction(unittest.TestCase):
