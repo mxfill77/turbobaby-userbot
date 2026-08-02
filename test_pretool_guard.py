@@ -2770,6 +2770,131 @@ class TestSqliteReadIsNotWrite(unittest.TestCase):
             self.assertIsNone(g._RE_SQL_WRITE.search(green), green)
 
 
+class TestSqlWriteJudgedByTargetNotMention(unittest.TestCase):
+    """СЕДЬМАЯ ГРУППА КЛАССА «СУДИМ ПО ДЕЙСТВИЮ» (02.08.2026): ИМЯ БАЗЫ В ТЕКСТЕ НЕ СНИМАЕТ
+    КРАСНОЕ С SQL-ЗАПИСИ.
+
+    Единственное место всего гарда, где совпадение подстроки не ДОБАВЛЯЛО вопрос, а ОТКРЫВАЛО:
+    `_scan_python` краснел на записи только при `".db" in blob` И `"memory.db" not in blob`.
+    Замер до правки (проба `tmp/a2-sqlwrite-probe-0802a`, дословно):
+
+        слово memory.db в КОММЕНТАРИИ + запись → defer / — / карточки нет
+        та же запись без упоминания          → ask / sqlite / moderation_ipc.db
+
+    То есть решала ПРОЗА. Базы с именем `memory.db` ПК-код не открывает ни разу: имя пришло
+    портом доктрины VPS 02.07, а живая локальная база зовётся `moderation_ipc.db`. ТЗ №4 от
+    30.07 («живые базы на ЗАПИСЬ краснеют всегда — включая memory.db») это послабление уже
+    отменило — но только для ТЕКСТА КОМАНДЫ: голден `test_live_db_write_always_red` мерил
+    CLI-форму, и тело скрипта осталось со старой доктриной. Голдены ниже стерегут обе стороны:
+    упоминание красное не снимает, а НАСТОЯЩАЯ запись ведёт себя ровно как прежде."""
+
+    MENTION = "memory" + ".db"                 # имя, которым открывалась дверь
+    LIVE = "moderation_ipc.db"                 # живая локальная база ПК
+    WRITE = "con.execute(\"UPDATE meta SET value='x' WHERE key='y'\")\n"
+
+    @classmethod
+    def setUpClass(cls):
+        cls._td = tempfile.TemporaryDirectory(prefix="guard_sqlwrite_")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def _script(self, name, body):
+        """Тело НЕотслеживаемого не-теста .py во ВРЕМЕННОЙ зоне: ровно тот вход, который читает
+        `_scan_python`. Файл только ЛЕЖИТ — ни один тест его не исполняет."""
+        path = os.path.join(self._td.name, name).replace("\\", "/")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("raise SystemExit('проба гарда: исполнять нельзя')\n" + body)
+        return 'venv/Scripts/python.exe "%s"' % path
+
+    def _role(self, cmd):
+        return g.decide_for_role({"tool_name": "Bash", "tool_input": {"command": cmd},
+                                  "cwd": PROJ}, headless=True)
+
+    # --- (1) ДЫРА, РАДИ КОТОРОЙ ПРАВКА -------------------------------------------------------
+    def test_mention_in_a_comment_does_not_open_the_write(self):
+        """Живой формат: комментарий называет `memory.db`, а пишет скрипт в ЖИВУЮ базу ПК."""
+        cmd = self._script("write_with_mention.py",
+                           "# сверялся с " + self.MENTION + " на сервере\n"
+                           "import sqlite3\n"
+                           "con = sqlite3.connect('" + self.LIVE + "')\n" + self.WRITE)
+        action, kind, obj = self._role(cmd)
+        self.assertEqual((action, kind), ("ask", "sqlite"), cmd)
+        self.assertEqual(obj, self.LIVE, "объект обязан называть базу, В КОТОРУЮ пишут")
+        self.assertIsNotNone(g.card_or_journal(kind, obj, cmd), "карточка обязана родиться")
+
+    def test_word_anywhere_in_the_body_decides_nothing(self):
+        """Три места одного слова — докстринг, строка данных, цитата журнальной строки.
+        Раньше любое из них снимало красное со ВСЕХ записей скрипта разом."""
+        for i, where in enumerate(('"""сверка с ' + self.MENTION + '"""\n',
+                                   "SRC = ['" + self.MENTION + "']\n",
+                                   "LOG = 'DONE разобрал " + self.MENTION + ", только чтение'\n")):
+            with self.subTest(where.strip()[:40]):
+                cmd = self._script("w_%d.py" % i,
+                                   where + "import sqlite3\n"
+                                   "con = sqlite3.connect('" + self.LIVE + "')\n" + self.WRITE)
+                self.assertEqual(self._role(cmd)[:2], ("ask", "sqlite"), where)
+
+    def test_body_write_to_memory_db_itself_is_red(self):
+        """ТЗ №4 доведено до второго текста: та же запись, но цель — САМА `memory.db`.
+        CLI-форма этого требования краснела с 30.07, тело скрипта — нет."""
+        cmd = self._script("write_memory_db.py",
+                           "import sqlite3\n"
+                           "con = sqlite3.connect('" + self.MENTION + "')\n" + self.WRITE)
+        action, kind, obj = self._role(cmd)
+        self.assertEqual((action, kind), ("ask", "sqlite"), cmd)
+        self.assertEqual(obj, self.MENTION)
+
+    # --- (2) КОНТРОЛЬ: НАСТОЯЩАЯ ЗАПИСЬ ВЕДЁТ СЕБЯ КАК ПРЕЖДЕ --------------------------------
+    def test_plain_write_is_unchanged(self):
+        cmd = self._script("write_plain.py",
+                           "import sqlite3\n"
+                           "con = sqlite3.connect('" + self.LIVE + "')\n" + self.WRITE)
+        self.assertEqual(self._role(cmd)[:3], ("ask", "sqlite", self.LIVE), cmd)
+
+    def test_both_forms_are_decided_identically(self):
+        """Суть класса одной проверкой: наличие слова в прозе не меняет НИЧЕГО."""
+        body = ("import sqlite3\ncon = sqlite3.connect('" + self.LIVE + "')\n" + self.WRITE)
+        with_word = self._script("pair_word.py", "# " + self.MENTION + "\n" + body)
+        without = self._script("pair_plain.py", body)
+        self.assertEqual(self._role(with_word)[:2], self._role(without)[:2])
+
+    # --- (3) ПОСЛАБЛЕНИЕ НЕ ПОДМЕНЕНО НОВЫМ: ЧТЕНИЕ ЗЕЛЁНОЕ, КАК БЫЛО ------------------------
+    def test_mention_without_a_write_stays_green(self):
+        """Красим ЗАПИСЬ, а не слово: тот же комментарий над `select` карточки не даёт."""
+        cmd = self._script("read_with_mention.py",
+                           "# сверялся с " + self.MENTION + "\n"
+                           "import sqlite3\n"
+                           "con = sqlite3.connect('file:" + self.LIVE + "?mode=ro', uri=True)\n"
+                           "print(con.execute('select count(*) from meta').fetchone())\n")
+        self.assertEqual(self._role(cmd)[0], "defer", cmd)
+
+    # --- (4) ОБЪЕКТ КАРТОЧКИ: ЦЕЛЬ, А НЕ ПЕРВОЕ ИМЯ В ТЕКСТЕ ---------------------------------
+    def test_object_prefers_the_connect_target_over_a_mention(self):
+        blob = ("# " + self.MENTION + "\nsqlite3.connect('" + self.LIVE + "')\n"
+                "con.execute('update meta set a=1')")
+        self.assertEqual(g._connect_db_literal(blob), self.LIVE)
+        self.assertEqual(g._sql_write_object(blob), self.LIVE)
+
+    def test_object_is_never_empty_so_the_card_is_never_swallowed(self):
+        """`.db` в тексте есть, ИМЕНИ ФАЙЛА базы нет (`x.dbg`): прежний `_extract_db(blob) or ""`
+        отдавал пустоту, а пустой объект по правилу `card_gate` уводит карточку в журнал МОЛЧА —
+        вид `sqlite` в `_HARD_CARD` не стоит. Теперь объект честный и карточка рождается."""
+        blob = "con = sqlite3.connect(path)  # x.dbg\ncon.execute('UPDATE meta SET a=1')"
+        obj = g._sql_write_object(blob)
+        self.assertTrue(obj.strip())
+        self.assertTrue(g.card_gate("sqlite", obj))
+        # ни базы, ни таблицы (у `DROP INDEX` таблицы в запросе нет) — пометка честная, не пустая
+        self.assertEqual(g._sql_write_object("con.execute('DROP INDEX idx_wa')"),
+                         g.SQL_TARGET_UNKNOWN)
+
+    def test_no_sql_write_no_object_call(self):
+        """Граница: решение по-прежнему принимает `_RE_SQL_WRITE`, а не имя базы в тексте."""
+        self.assertIsNone(g._RE_SQL_WRITE.search("# " + self.LIVE + " прочитан целиком"))
+        self.assertIsNone(g._RE_SQL_WRITE.search("dropped = []; updated_at = 1"))
+
+
 class TestConfigReadVsWrite(unittest.TestCase):
     """ЧТЕНИЕ конфига ≠ его ПРАВКА (четвёртая группа класса «класс по имени файла, а не по
     действию»; наличие файла, окружение и база разведены раньше).
