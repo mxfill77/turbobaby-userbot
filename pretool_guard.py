@@ -333,12 +333,16 @@ def _red(rx, kind, verbs=None, probe=None):
 # регулярка его не знала — то есть `ri файл` не краснел ВООБЩЕ. Нашёл это замок
 # (`test_declared_verbs_actually_trigger_their_own_regex`): объявленное имя обязано быть видно
 # собственному признаку правила, иначе verbs подтверждают то, чего признак не ловит.
-_DEL_CMDS = {"del", "erase", "rmdir", "rd", "rm", "remove-item", "ri"}
+#
+# `unlink` и `shred` добавлены 03.08.2026 тем же замером: обоих список НЕ ЗНАЛ, поэтому вид
+# `delete` им не назначался вовсе — команда доезжала до последней строки `_decide_bash_body`
+# видом `unknown`, а `unknown` доктринально не красный (`_stays_red`), то есть проходила МОЛЧА.
+_DEL_CMDS = {"del", "erase", "rmdir", "rd", "rm", "remove-item", "ri", "unlink", "shred"}
 
 # --- КРАСНЫЕ признаки Bash-команды (каждый — с проверкой ДЕЙСТВИЯ) ---
 _RED_CMD = [
-    _red(r"(?i)(^|[\s;&|(])(del|erase|rmdir|rd|rm)([\s;&|)]|$)", "delete",
-         verbs={"del", "erase", "rmdir", "rd", "rm"}),
+    _red(r"(?i)(^|[\s;&|(])(del|erase|rmdir|rd|rm|unlink|shred)([\s;&|)]|$)", "delete",
+         verbs={"del", "erase", "rmdir", "rd", "rm", "unlink", "shred"}),
     _red(r"(?i)remove-item\b|(^|[\s;&|(])ri([\s;&|)]|$)", "delete", verbs={"remove-item", "ri"}),
     _red(r"(?i)(^|[\s;&|(])(taskkill|killall|kill|pkill)([\s;&|)]|$)", "kill",
          verbs={"taskkill", "killall", "kill", "pkill"}),
@@ -2742,7 +2746,10 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False, skip_kinds=frozenset()):
                 return ("ask", "live_sheet", sheet)
             obj = ""
             if kind == "delete":
-                obj = _extract_delete_target(scan) or ""
+                # ОБЪЕКТ БЕРЁМ ИЗ СВОЕГО РАЗБОРА СЫРОЙ КОМАНДЫ, а подстрочный `_extract_delete_target`
+                # оставлен запасным: его регулярка не знает алиаса `ri`, и `ri docs/ENV_PLAYBOOK.md`
+                # доезжал до карточки с ПУСТЫМ объектом (замер 03.08.2026).
+                obj = _delete_reach(cmd) or _extract_delete_target(scan) or ""
             elif kind == "kill":
                 obj = _extract_kill_target(scan) or ""
             elif kind == "network":
@@ -2773,6 +2780,16 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False, skip_kinds=frozenset()):
     m = _RE_OUTSIDE_WRITE.search(cmd)
     if m and "outside" not in skip_kinds and not _inside_project(m.group(2)):
         return ("ask", "outside", m.group(2))
+    # УДАЛЕНИЕ — СВОИМ РАЗБОРОМ ПО СЫРОЙ КОМАНДЕ, и место у него ровно здесь: НИЖЕ всех красных
+    # ветвей (ни одно прежнее красное не перехвачено) и ВЫШЕ зелёных шорткатов. Без этой строки
+    # `git rm suggest.py` умирал в шорткате `_RE_READONLY_SHELL` (в нём стоит имя `git`), а
+    # `unlink`/`shred`/`find … -delete` доезжали до последней строки видом `unknown` — тем самым
+    # тихим `defer`, ради которого правка и делалась. Цикл `_RED_CMD` выше эти формы не ловит по
+    # построению: глагол там не в командной позиции либо имени нет в таблице.
+    if "delete" not in skip_kinds:
+        d = _delete_reach(cmd)
+        if d is not None:
+            return ("ask", "delete", d)
     # зелёное
     if _RE_SAFE_SCRIPTS.search(cmd):
         return ("defer", "", "")
@@ -3316,8 +3333,33 @@ def kinds_from_card(text):
             return frozenset((kind,))
     return frozenset()
 
-# Массовое удаление (красное) vs удаление ОДНОГО явного файла (в интерактиве зелёное).
-_RE_DEL_TAIL = re.compile(r"(?i)(?:^|[\s;&|(])(?:del|erase|rmdir|rd|rm|remove-item)\b(.*)$")
+# ══ УДАЛЕНИЕ СУДИТСЯ ПО ЦЕЛИ, А НЕ ПО ГЛАГОЛУ (03.08.2026, зеркало класса VPS) ═══════════════
+# ЧТО БЫЛО. Красное держалось на признаке «МАССОВОЕ ли удаление» (`_is_mass_delete`: рекурсия,
+# маска или больше одной цели). Удаление ОДНОГО явного файла массовым не считалось и проходило
+# МОЛЧА — где бы файл ни лежал. Замер по живому гарду 03.08 (прогон `decide_for_role` на
+# фикстурах, артефакт `docs/artifacts/2026-08-03-delete-outside-tmp.md`) назвал ДВЕНАДЦАТЬ форм
+# тихого сноса файла репозитория, и они делятся на три причины:
+#   • `rm suggest.py`, `del pc_agent.py`, `Remove-Item -Force …\suggest.py`, `ri docs/…` —
+#     вид `delete` назначался, но `_is_mass_delete` давала False: одна цель;
+#   • `unlink suggest.py`, `shred -u suggest.py`, `find docs -name "*.md" -delete`,
+#     `find . -name "*.pyc" -exec rm {} \;` — вид не назначался ВОВСЕ (`unknown`), а `unknown`
+#     доктринально не красный (`_stays_red`);
+#   • `git rm suggest.py` — глагол не в командной позиции (команда зовётся `git`), поэтому
+#     `_verb_acts` давал `word_delete`, и следом РАННИЙ ЗЕЛЁНЫЙ ШОРТКАТ `_RE_READONLY_SHELL`
+#     (в нём стоит имя `git`) отдавал `defer`. Тот самый «ранний green» из основания задачи.
+#
+# ЧТО СТАЛО. Зелёным остаётся РОВНО ОДНО: КОНКРЕТНЫЙ путь во временной зоне (`tmp/`,
+# `%TEMP%\claude\**`) — уборка сессией собственных черновиков. Всё прочее красное, fail-closed:
+# маска, корень репо, любая цель вне временных зон и НЕНАЗВАННАЯ цель (`find … | xargs rm`,
+# `Get-ChildItem … | Remove-Item` — список файлов неизвестен до исполнения).
+#
+# ПОЧЕМУ РАЗБОР У КЛАССА СВОЙ, А НЕ ОБЩИЙ (находка серверной полосы, проверена здесь). Общий
+# скан-текст режет позиционные аргументы скриптов и поисковые шаблоны — и вместе с ними СЪЕДАЕТ
+# САМО ДЕЙСТВИЕ. Замер 03.08 на этой машине, дословно:
+#     CMD : venv/Scripts/python.exe tools/clean.py --root docs -delete "*.md"
+#     SCAN: venv/Scripts/python.exe tools/clean.py
+# предикат `-delete` и маска исчезают целиком. Поэтому `_delete_walk` идёт по СЫРОЙ команде
+# своим посегментным разбором, а решает `_delete_stays_red` — по его целям, не по скан-тексту.
 # РЕКУРСИЯ — НАЗВАННЫЙ ФЛАГ, А НЕ «БУКВА r ПОСЛЕ МИНУСА» (живой случай №6, 31.07.2026).
 # Прежняя форма `-[a-z]*r[a-z]*` считала рекурсивным ЛЮБОЙ флаг, в котором где-то есть `r`, —
 # и `Remove-Item …\cowork_log.spool -Force` (ОДИН явный файл) проходил как МАССОВОЕ удаление:
@@ -3339,9 +3381,68 @@ _RE_CMDEXE_FLAG = re.compile(r"^/[A-Za-z]{1,2}$")   # /f /s /q cmd.exe — не 
 _RE_DEL_REDIR = re.compile(r"^\d*(?:>>|>|<)")
 _RE_DEL_REDIR_BARE = re.compile(r"^\d*(?:>>|>|<)$")
 
+# ЦЕЛЬ УДАЛЕНИЯ — ФАЙЛ, А НЕ ЛЮБОЙ ЭЛЕМЕНТ PowerShell (замер лога 03.08.2026). `Remove-Item
+# Env:\STEP_SELFHEAL` снимает ПЕРЕМЕННУЮ ОКРУЖЕНИЯ процесса: файла не трогает, отката не требует,
+# в git ничего не меняет. В журнале гарда таких строк ПЯТЬ за неделю, и все — из headless-прогонов
+# тестов (`$env:STEP_SELFHEAL='1'; … ; Remove-Item Env:\STEP_SELFHEAL`). Без этой развилки правка
+# «цель вне временных зон → красное» покрасила бы их все: `Env:\…` временной зоной не является.
+# Это ровно тот же довод, что у всего класса, — судим ЦЕЛЬ: элемент провайдера файлом не является.
+_RE_PS_PROVIDER = re.compile(r"(?i)^(env|variable|function|alias):[\\/]?")
 
-def _delete_scan(cmd):
-    """Разбор удаления ПОСЕГМЕНТНО → (цели, рекурсивно, есть маска).
+# `find` сносит файлы ПРЕДИКАТОМ, а `git` — ПОДКОМАНДОЙ: в командной позиции сегмента стоит имя,
+# которое само по себе ничего не удаляет, поэтому ни один verbs-признак таблицы их не видит.
+_FIND_DEL_PRED = frozenset(("-delete",))
+_FIND_EXEC_PRED = frozenset(("-exec", "-execdir", "-ok", "-okdir"))
+_FIND_MASK_PRED = frozenset(("-name", "-iname", "-path", "-ipath", "-wholename", "-lname",
+                             "-regex", "-iregex"))
+
+
+def _find_deletes(toks):
+    """Аргументы `find` → (сносит ли он файлы, корни обхода, есть ли маска в фильтре).
+
+    Корни — позиционные токены ДО первого предиката; действие — предикат `-delete` либо
+    `-exec`-семейство, чья команда стоит в `_DEL_CMDS`. Ведущие ключи (`find -L docs …`) корней
+    не дают вовсе — и это НЕ послабление: пустой список целей у `_delete_stays_red` красный
+    (цель не названа), то есть непонятная форма `find` остаётся fail-closed."""
+    roots, act, mask, k = [], False, False, 0
+    while k < len(toks):
+        t = toks[k]
+        if t.startswith("-") or t in ("(", ")", "!", ","):
+            break
+        roots.append(t.strip("'\""))
+        k += 1
+    while k < len(toks):
+        t = toks[k].lower()
+        if t in _FIND_DEL_PRED:
+            act = True
+        elif t in _FIND_EXEC_PRED:
+            for nxt in toks[k + 1:]:
+                if nxt.startswith("-"):
+                    continue                    # ключи самой запускаемой команды
+                act = act or _base(nxt) in _DEL_CMDS
+                break
+        elif t in _FIND_MASK_PRED and k + 1 < len(toks):
+            v = toks[k + 1]
+            mask = mask or "*" in v or "?" in v
+        k += 1
+    return act, roots, mask
+
+
+# `acts` и `provider` — РАЗНЫЕ ответы на «файлового удаления не нашли», и их нельзя сливать в один
+# флаг. `provider` означает «разбор ЗНАЕТ, почему не нашёл»: снимали элемент провайдера PowerShell
+# (`Remove-Item Env:\STEP_SELFHEAL`). Отсутствие обоих означает «признак сработал, а разбор не
+# понял ЧТО» — и это красное. Первый заход правки держал одно поле, и живые строки журнала
+# (5 за неделю, headless-прогоны тестов) краснели картой на снятии переменной окружения.
+_DelWalk = collections.namedtuple("DelWalk", "acts targets recurse mask provider")
+
+
+def _delete_walk(cmd):
+    """ЕДИНСТВЕННЫЙ разбор удаления → `_DelWalk`(действие, цели, рекурсия, маска, провайдер).
+
+    Один разборщик на весь класс — намеренно: `_delete_scan`, `_delete_reach`,
+    `_delete_stays_red` и поля карточки (`_card_fields`) читают ЕГО, а не каждый свой.
+    Второй список форм разъехался бы с этим при первой же правке — тот же довод, по которому
+    заведены `skip_kinds` у `red_kinds_bash` и `_kind_phrase` у классов одобрения.
 
     Хвост берётся ТОЛЬКО из своего сегмента. Прежний разбор тянул `.*$` до конца строки, и
     команда `rm -f память/один.md; ls память/один.md 2>&1` выглядела удалением ЧЕТЫРЁХ целей
@@ -3361,12 +3462,24 @@ def _delete_scan(cmd):
         Так родился блок 1 карточки 145 — за операцию, от которой отказались через 5 секунд.
     Что перенаправлением считаем: `2>/dev/null`, `>x`, `>>x`, `2>&1`, `<in`, а также ОТДЕЛЬНО
     стоящий оператор (`> out.txt` шлётся shlex двумя токенами) — тогда пропускаем и операнд."""
-    hint, targets, recurse, mask = "", [], False, False
+    hint, targets, recurse, mask, acts, prov = "", [], False, False, False, False
+
+    def _add(raw):
+        """Цель с приклеенным каталогом предшествующего `cd` (абсолютную не трогаем)."""
+        return raw if (re.match(r"^([A-Za-z]:|[/\\~$%])", raw) or not hint) \
+            else hint.rstrip("/\\") + "/" + raw
+
     for i, seg in enumerate(_split_segments(cmd or "")):
         if i % 2:
             continue
         try:
-            toks = shlex.split(seg)
+            # posix=False СОЗНАТЕЛЬНО, и это не косметика. POSIX-режим считает `\` экранированием
+            # и СЪЕДАЕТ его: `Remove-Item D:\turbobaby-bot\tmp\x -Force` приезжал сюда целью
+            # `D:turbobaby-bottmpx`, а такой путь не совпадает ни с одной зоной — то есть уборка
+            # в `tmp/`, набранная В ОСНОВНОМ ШЕЛЛЕ ЭТОЙ МАШИНЫ (PowerShell, обратные слэши),
+            # считалась бы удалением вне временных каталогов. Кавычки снимает `.strip("'\\"")`
+            # ниже, как и раньше; сбой разбора по-прежнему падает на грубое `seg.split()`.
+            toks = shlex.split(seg, posix=False)
         except Exception:
             toks = seg.split()
         j = _cmd_index(toks)
@@ -3376,10 +3489,22 @@ def _delete_scan(cmd):
         if name == "cd" and j + 1 < len(toks):
             hint = toks[j + 1].strip("'\"")
             continue
-        if name not in _DEL_CMDS:
+        if name == "find":
+            act, roots, m = _find_deletes(toks[j + 1:])
+            if act:
+                acts, recurse, mask = True, True, mask or m   # find обходит дерево целиком
+                targets.extend(_add(r) for r in roots)
             continue
-        skip_next = False
-        for t in toks[j + 1:]:
+        if name in _DEL_CMDS:
+            rest = toks[j + 1:]
+        elif name == "git" and j + 1 < len(toks) and _base(toks[j + 1]) == "rm":
+            # `git rm` сносит файл С ДИСКА (и `--cached` — из индекса, то есть из истории тоже).
+            # Разводить формы не стали СОЗНАТЕЛЬНО: обе необратимы без git, обе редки в потоке.
+            rest = toks[j + 2:]
+        else:
+            continue
+        before, provider, skip_next = len(targets), False, False
+        for t in rest:
             if skip_next:                      # операнд отдельно стоящего `>` / `2>` / `<`
                 skip_next = False
                 continue
@@ -3393,11 +3518,25 @@ def _delete_scan(cmd):
             t = t.strip("'\"")
             if not t:
                 continue
+            if _RE_PS_PROVIDER.match(t):
+                provider = True                # `Env:\X` — переменная окружения, а не файл
+                continue
             if "*" in t or "?" in t:
                 mask = True
-            targets.append(t if (re.match(r"^([A-Za-z]:|[/\\~$%])", t) or not hint)
-                           else hint.rstrip("/\\") + "/" + t)
-    return targets, recurse, mask
+            targets.append(_add(t))
+        if len(targets) == before and provider:
+            prov = True
+            continue                           # снимали элемент провайдера PowerShell — не файл
+        acts = True                            # ДЕЙСТВИЕ было; целей может не быть — это красное
+    return _DelWalk(acts, targets, recurse, mask, prov)
+
+
+def _delete_scan(cmd):
+    """Тройка (цели, рекурсивно, есть маска) — фасад `_delete_walk` для полей карточки.
+    Отдельным именем, потому что вопрос «ЧТО сносим» и вопрос «сносим ЛИ» — разные: первый
+    нужен объекту и числу карточки, второй (`_delete_reach`) — решению."""
+    w = _delete_walk(cmd)
+    return w.targets, w.recurse, w.mask
 
 
 def _delete_targets_all_temp(cmd):
@@ -3416,21 +3555,47 @@ def is_headless(env=None):
     return bool((e.get(ASK_MARKER_ENV) or "").strip())
 
 
-def _is_mass_delete(cmd):
-    """Массовое удаление ⇔ рекурсивный флаг (-r/-rf/-Recurse//s), маска (*/?) или БОЛЬШЕ ОДНОЙ
-    цели. Удаление одного явного файла массовым НЕ считается (доктрина владельца: красное —
-    именно «массовые удаления»). Разбор посегментный (_delete_scan); если сегмент удаления не
-    нашёлся вовсе — падаем на прежний подстрочный разбор, чтобы не ослабить признак."""
-    targets, recurse, mask = _delete_scan(cmd)
-    if targets or recurse or mask:
-        return bool(mask or recurse or len(targets) > 1)
-    m = _RE_DEL_TAIL.search(cmd or "")
-    tail = m.group(1) if m else (cmd or "")
-    if "*" in tail or "?" in tail or _RE_DEL_RECURSE.search(tail):
+DEL_TARGET_UNKNOWN = "цель удаления не названа"
+
+
+def _delete_reach(cmd):
+    """ОБЪЕКТ удаления в СЫРОЙ команде, либо None ⇔ удаления в ней нет.
+
+    Разбор структурный (`_delete_walk`), поэтому УПОМИНАНИЕ глагола объектом не становится:
+    `git commit -m "убрал rm -rf из уборки"` и `python cowork_log_append.py "DONE … rm …"`
+    отдают None — в командной позиции стоят `git commit` и питон, а не удаление.
+
+    Действие есть, а цели нет (`find … | xargs rm`, `Get-ChildItem … | Remove-Item`) → честная
+    пометка, а не пустая строка: она стоит в `_UNNAMED_OBJ`, поэтому высший вид получит в
+    `card_decision` отказ, а не подтверждаемую карточку «удалить неизвестно что»."""
+    w = _delete_walk(cmd)
+    if not w.acts:
+        return None
+    return w.targets[0] if w.targets else DEL_TARGET_UNKNOWN
+
+
+def _delete_stays_red(cmd):
+    """Доктрина удаления одной строкой: ЗЕЛЁНОЕ — только уборка КОНКРЕТНЫХ путей во временных
+    зонах, всё остальное спрашивает. Разбор — свой (`_delete_walk`, по СЫРОЙ команде), потому
+    что общий скан-текст съедает предикат `-delete` вместе с аргументами скрипта.
+
+    Красным делает любое из четырёх (каждое — fail-closed, порядок значения не имеет):
+      • ДЕЙСТВИЕ разобрано, а целей нет — список файлов неизвестен до исполнения;
+      • МАСКА (`*`/`?`) — сколько файлов уйдёт, не знает и сам вызывающий. Маска красна и
+        ВНУТРИ `tmp/`: там лежат бэкапы `brain_writer` (`tmp/brain_backup_*.txt`) — единственная
+        копия прежнего текста Brain-дока, и `rm tmp/*` уносит её вместе с черновиками;
+      • КОРЕНЬ РЕПО — временной зоной он не является (`_is_temp_zone`: relpath `.` ≠ `tmp`),
+        поэтому попадает под общее правило ниже; голден на него стоит в тестах отдельно;
+      • ЦЕЛЬ ВНЕ ВРЕМЕННЫХ ЗОН — хоть одна: послабление не распространяется на смешанный список."""
+    w = _delete_walk(cmd)
+    if not w.acts:
+        # Файлового удаления разбор не нашёл. Зелёное ТОЛЬКО если он ЗНАЕТ почему — снимали
+        # элемент провайдера PowerShell (`Env:\X`), файла там нет. Иначе признак сработал, а
+        # разбор его не понял: молчать о неразобранном гард права не имеет (fail-closed).
+        return not w.provider
+    if not w.targets or w.mask:
         return True
-    rest = [t for t in re.findall(r"[^\s\"';|&]+", tail)
-            if not t.startswith("-") and not t.startswith("/")]
-    return len(rest) > 1
+    return not _delete_targets_all_temp(cmd)
 
 
 def _stays_red(kind, obj, cmd):
@@ -3460,8 +3625,11 @@ def _stays_red(kind, obj, cmd):
     if kind == "delete":
         # Временные каталоги из .gitignore (`tmp/`, `%TEMP%\claude\**`) — рабочие черновики самой
         # сессии: в git не едут, прод-контур их не видит, живут один сеанс. Уборка за собой
-        # подтверждения не стоит. Хоть одна цель вне зоны — красное как было.
-        return _is_mass_delete(cmd) and not _delete_targets_all_temp(cmd)
+        # подтверждения не стоит. Всё прочее — красное; разбор и четыре причины в `_delete_stays_red`.
+        # Здесь стояло `_is_mass_delete(cmd) and not _delete_targets_all_temp(cmd)`, и первая
+        # половина этого «И» была дырой: удаление ОДНОГО явного файла массовым не считалось, то
+        # есть `rm suggest.py` проходил молча (замер 03.08.2026, зеркало класса VPS).
+        return _delete_stays_red(cmd)
     if kind == "schtasks":
         return not _RE_SCHTASKS_QUERY.search(cmd or "")   # /query — чтение, остальное = контроль задач
     if kind == "py_write":
@@ -3713,8 +3881,12 @@ def is_top_tier(kind):
 # другую. Теперь `_PY_UNSEEN` красное — значит эти объекты доходят до карточки, и без этой
 # строки владелец получил бы ПОДТВЕРЖДАЕМУЮ карточку «разрешить скрипт, который гард не читал».
 # Ровно та карточка «лист не определён», ради которой заводился `deny`.
+# ПОПОЛНЕН 03.08.2026 меткой `DEL_TARGET_UNKNOWN`. Удаление — высший вид (`_TOP_TIER`), значит
+# «действие разобрано, а цель не названа» обязано кончаться отказом, а не подтверждаемой
+# карточкой «удалить неизвестно что»: ровно так выглядят `find … | xargs rm` и
+# `Get-ChildItem … | Remove-Item`, где список файлов не существует до исполнения.
 _UNNAMED_OBJ = ((LIVE_SHEET_UNKNOWN, "оператор не разобран", "лист не определён")
-                + _PY_UNSEEN + ("цель записи не определена",))
+                + _PY_UNSEEN + ("цель записи не определена", DEL_TARGET_UNKNOWN))
 
 
 def _object_named(obj):

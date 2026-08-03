@@ -477,12 +477,21 @@ class TestDoctrineRed(unittest.TestCase):
             action, kind, _ = g.decide_for_role(read(os.path.join(PROJ, ".env")), headless=headless)
             self.assertEqual((action, kind), ("ask", "read_secret"))
 
-    def test_mass_delete_vs_single_file(self):
-        self.assertFalse(g._is_mass_delete("rm tmp/one.txt"))
-        self.assertFalse(g._is_mass_delete("del old.log"))
-        for c in ("rm -rf tmp/", "rm -r tmp", "del *.tmp", "rmdir /s tmp",
-                  "Remove-Item -Recurse -Force tmp", "rm a.txt b.txt"):
-            self.assertTrue(g._is_mass_delete(c), c)
+    def test_delete_is_judged_by_target_not_by_scale(self):
+        """ДОКТРИНА ПЕРЕЕХАЛА 03.08.2026: судим ЦЕЛЬ, а не «массовость».
+
+        Было `_is_mass_delete`: красное ⇔ рекурсия, маска или больше одной цели, — и удаление
+        ОДНОГО явного файла проходило молча ГДЕ УГОДНО. Функция снята вместе с этой посылкой,
+        а не переименована: концепт «массовое удаление» решения больше не принимает вовсе."""
+        self.assertFalse(hasattr(g, "_is_mass_delete"),
+                         "снятая посылка вернулась в модуль — доктрина разъехалась с тестом")
+        for c in ("rm tmp/one.txt", "rm -rf tmp/", "rm -r tmp",
+                  "rm tmp/a.json tmp/b.json", "rmdir /s tmp"):
+            self.assertFalse(g._delete_stays_red(c), c)      # уборка своих черновиков
+        for c in ("del old.log", "rm suggest.py", "del *.tmp", "rm docs/*.md",
+                  "Remove-Item -Recurse -Force D:/turbobaby-bot/docs", "rm a.txt b.txt",
+                  "rm tmp/*.log"):
+            self.assertTrue(g._delete_stays_red(c), c)
 
 
 class TestRolesAgree(unittest.TestCase):
@@ -1379,7 +1388,10 @@ class TestTempZonesAreGreen(unittest.TestCase):
         """`rm -f один.md; ls один.md 2>&1` — удаление ОДНОГО файла, а не четырёх целей."""
         targets, _rec, _mask = g._delete_scan("rm -f notes/one.md; ls notes/one.md 2>&1")
         self.assertEqual(targets, ["notes/one.md"])
-        self.assertFalse(g._is_mass_delete("rm -f notes/one.md; ls notes/one.md 2>&1"))
+        # ЧИСЛО в карточке считает то, что в команде: одна цель, а не четыре. Решение с 03.08
+        # от числа не зависит (цель вне временных зон → красное), но поле обязано быть честным.
+        self.assertEqual(g._card_fields("delete", "", "rm -f notes/one.md; ls notes/one.md 2>&1")[1],
+                         "1 цель")
 
 
 class TestOwnChannelScp(unittest.TestCase):

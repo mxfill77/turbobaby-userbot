@@ -63,8 +63,12 @@ FALSE_CASES = [
     ("5 присваивание rm=", "Bash", 'rm_count=0; echo "$rm_count"'),
     ("5 $env: PowerShell", "PowerShell", '$env:RM_DRY="1"; Write-Output $env:RM_DRY'),
     # 6. МИНУС в тексте команды принят за флаг удаления.
-    ("6 -Force не рекурсия", "PowerShell", r'Remove-Item D:\turbobaby-bot\cowork_log.spool -Force'),
-    ("6 -force один файл", "Bash", 'rm -f tmp_guard_cards.json'),
+    #    ДВЕ КОМАНДЫ ЭТОГО СЛУЧАЯ ПЕРЕЕХАЛИ В `TRUE_RED` 03.08.2026, и это не смягчение теста, а
+    #    смена ДОКТРИНЫ: обе сносят файл в КОРНЕ РЕПО (`cowork_log.spool`, `tmp_guard_cards.json`
+    #    — имя начинается на `tmp_`, но в каталоге `tmp/` файл НЕ лежит), а красным теперь делает
+    #    ЦЕЛЬ ВНЕ ВРЕМЕННЫХ ЗОН, а не «массовость». Прежняя посылка «один файл ⇒ карточки нет»
+    #    и была дырой класса. Сама находка случая 6 никуда не делась и проверяется ниже прямо —
+    #    `test_force_is_still_not_recursion`: `-Force`/`-f` рекурсией не считаются.
     # 7. Слово в ТЕКСТЕ (шаблон поиска, сообщение, печать, фикстура) принято за операцию.
     ("7 .env в шаблоне grep", "Bash",
      'grep -n -E "\\.env|deny|\\"model\\"|clasp push" .claude/settings.json | head -30'),
@@ -115,6 +119,20 @@ TRUE_RED = [
     ("настоящий выход в сеть", "Bash", 'curl -s https://example.com/x'),
     ("настоящий clasp push", "Bash", 'clasp push -f'),
     ("настоящая запись вне репо", "Bash", r'echo x > C:\Windows\Temp\evil.txt'),
+    # ЗЕРКАЛО КЛАССА VPS (03.08.2026): удаление вне временных каталогов. Замер живого гарда нашёл
+    # ДВЕНАДЦАТЬ форм, проходивших молча; здесь по одной на каждую причину молчания.
+    ("удаление одного файла репо", "Bash", 'rm suggest.py'),                 # «не массовое»
+    ("удаление одного файла PS", "PowerShell", r'Remove-Item D:\turbobaby-bot\cowork_log.spool -Force'),
+    ("удаление алиасом ri", "Bash", 'rm -f tmp_guard_cards.json'),
+    ("удаление через unlink", "Bash", 'unlink suggest.py'),                  # вид не назначался
+    ("удаление через shred", "Bash", 'shred -u suggest.py'),
+    ("удаление предикатом find", "Bash", 'find docs -name "*.md" -delete'),
+    ("удаление find -exec", "Bash", 'find . -name "*.pyc" -exec rm {} \\;'),
+    ("удаление через git rm", "Bash", 'git rm suggest.py'),                  # ранний зелёный шорткат
+    ("удаление git rm с коммитом", "Bash", 'git rm docs/ENV_PLAYBOOK.md && git commit -m x'),
+    ("удаление корня репо", "Bash", 'rm -rf D:/turbobaby-bot'),
+    ("удаление маской в tmp", "Bash", 'rm tmp/*.log'),                       # там бэкапы brain_writer
+    ("удаление без названной цели", "Bash", 'find . -name "*.pyc" -print0 | xargs -0 rm'),
 ]
 
 
@@ -147,6 +165,88 @@ for _i, (_n, _t, _c) in enumerate(FALSE_CASES):
     setattr(FalseCards, "test_false_%02d" % _i, _mk_false(_n, _t, _c))
 for _i, (_n, _t, _c) in enumerate(TRUE_RED):
     setattr(TrueRed, "test_red_%02d" % _i, _mk_true(_n, _t, _c))
+
+
+class DeleteOutsideTemp(unittest.TestCase):
+    """ЗЕРКАЛО КЛАССА VPS (03.08.2026): удаление вне временных каталогов проходило молча.
+
+    Корпус выше держит ВЕРДИКТ (красное/зелёное), а здесь — три свойства, из-за которых класс
+    и родился: уборка в `tmp/` осталась зелёной, находка случая 6 жива, и разбор у класса СВОЙ."""
+
+    def test_cleanup_in_temp_stays_green(self):
+        """ГРАНИЦА ПРАВКИ: уборка своих черновиков подтверждения по-прежнему не стоит."""
+        for cmd in ('rm -rf tmp/bridge_gs',
+                    'rm -rf D:/turbobaby-bot/tmp/bridge_v75',
+                    'rm tmp/a.json tmp/b.json',
+                    'rm -rf tmp/srv-audit 2>/dev/null',
+                    'cd "$LOCALAPPDATA/Temp/claude/D--turbobaby-bot/29ab/scratchpad" && '
+                    'rm -f token.txt live.txt'):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(is_card("Bash", cmd), "уборка в tmp покраснела: %r" % cmd)
+
+    def test_backslash_paths_survive_the_split(self):
+        """POSIX-режим `shlex` СЪЕДАЛ обратный слэш: `D:\\turbobaby-bot\\tmp\\x` приезжал целью
+        `D:turbobaby-bottmpx`, и такой путь не совпадал ни с одной зоной. На этой машине основной
+        шелл — PowerShell, то есть так набирается БОЛЬШИНСТВО путей, и уборка в `tmp/` из него
+        считалась удалением вне временных каталогов. Обе стороны ниже — одним разбором."""
+        self.assertEqual(G._delete_scan(r'Remove-Item D:\turbobaby-bot\tmp\x -Force')[0],
+                         [r'D:\turbobaby-bot\tmp\x'])
+        for green in (r'Remove-Item D:\turbobaby-bot\tmp\x -Force',
+                      r'Remove-Item D:\turbobaby-bot\tmp\bridge -Recurse -Force',
+                      r'rd /s /q D:\turbobaby-bot\tmp\srv'):
+            with self.subTest(cmd=green):
+                self.assertFalse(is_card("PowerShell", green), green)
+        # …и обход `..` доверия не получает — послабление зоной, а не строкой пути.
+        for red in (r'Remove-Item D:\turbobaby-bot\suggest.py -Force',
+                    r'Remove-Item D:\turbobaby-bot\tmp\..\suggest.py -Force'):
+            with self.subTest(cmd=red):
+                self.assertTrue(is_card("PowerShell", red), red)
+
+    def test_powershell_provider_item_is_not_a_file(self):
+        """ЖИВЫЕ СТРОКИ ЖУРНАЛА (5 за неделю, headless-прогоны тестов): `Remove-Item Env:\\X`
+        снимает ПЕРЕМЕННУЮ ОКРУЖЕНИЯ, файла не трогает. Правка «цель вне временных зон →
+        красное» покрасила бы их все, если бы судила глагол, а не цель."""
+        for cmd in (r'Remove-Item Env:\STEP_SELFHEAL',
+                    r'Remove-Item Env:\PC_MUTE_ENTRYPOINTS',
+                    r'Remove-Item Variable:\tmpvar'):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(is_card("PowerShell", cmd), cmd)
+        # …но файл в той же строке краснеет: послабление касается ТОЛЬКО элемента провайдера.
+        self.assertTrue(is_card("PowerShell", r'Remove-Item Env:\X; rm suggest.py'))
+
+    def test_force_is_still_not_recursion(self):
+        """НАХОДКА СЛУЧАЯ 6 ЖИВА (31.07.2026): `-Force` рекурсией не является — буква `r` стоит
+        в середине слова. Две его команды переехали в `TRUE_RED` по ЦЕЛИ, а не по рекурсии,
+        поэтому свойство проверяется здесь прямо, иначе оно осталось бы без сторожа."""
+        for flag in (" -Force ", " -f ", " -Confirm ", " -Verbose ", " -ErrorAction "):
+            with self.subTest(flag=flag):
+                self.assertFalse(G._RE_DEL_RECURSE.search(flag), flag)
+        for flag in (" -rf ", " -r ", " --recursive ", " /s ", " -Recurse "):
+            with self.subTest(flag=flag):
+                self.assertTrue(G._RE_DEL_RECURSE.search(flag), flag)
+        self.assertEqual(G._delete_scan(r'Remove-Item D:\turbobaby-bot\cowork_log.spool -Force'),
+                         ([r'D:\turbobaby-bot\cowork_log.spool'], False, False))
+
+    def test_class_parses_the_raw_command_not_the_scan_text(self):
+        """ПОЧЕМУ РАЗБОР СВОЙ. Общий скан-текст режет аргументы скрипта вместе с ДЕЙСТВИЕМ:
+        предикат `-delete` и маска из него исчезают целиком. Замер 03.08, дословно."""
+        eaten = 'venv/Scripts/python.exe tools/clean.py --root docs -delete "*.md"'
+        self.assertNotIn("-delete", G._scan_text(eaten))
+        # …поэтому решение читает СЫРУЮ команду: там предикат на месте и цель находится.
+        self.assertEqual(G._delete_reach('find docs -name "*.md" -delete'), "docs")
+        self.assertTrue(G._delete_stays_red('find docs -name "*.md" -delete'))
+        # Упоминание глагола в тексте разбор не обманывает — он структурный, а не подстрочный.
+        self.assertIsNone(G._delete_reach('git commit -m "убрал rm -rf из уборки"'))
+        self.assertIsNone(G._delete_reach('grep -rn "unlink" pretool_guard.py'))
+
+    def test_unnamed_target_is_denied_not_asked(self):
+        """FAIL-CLOSED: список файлов не существует до исполнения — подтверждать нечего."""
+        for cmd in ('find . -name "*.pyc" -print0 | xargs -0 rm',
+                    'Get-ChildItem docs -Filter *.md | Remove-Item -Force'):
+            with self.subTest(cmd=cmd):
+                act, kind, obj = verdict("Bash", cmd)
+                self.assertEqual((act, kind), ("deny", "delete"), cmd)
+                self.assertEqual(obj, G.DEL_TARGET_UNKNOWN)
 
 
 def table():
