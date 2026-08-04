@@ -19,11 +19,11 @@
       "name": "TurboBaby Bridge (Apps Script)",
       "script_id": "12iXPDU_wxcyslItPW6X41ODuoVxx2smmlQBfhSwI6Lt42MTrYbv9HhOJ",
       "prod_deployment_id": "AKfycb…hXNOqw",
-      "pinned_version": 76,
-      "checked_at": "2026-07-29",
-      "checked_by": "clasp deploy -i AKfycb…hXNOqw -V 76 (перевод прода с @75 на @76), подтверждено clasp deployments",
-      "evidence": "docs/artifacts/2026-07-29-cowork-log-rotation.md",
-      "rollback": "clasp deploy -i AKfycb…hXNOqw -V 75"
+      "pinned_version": 78,
+      "checked_at": "2026-08-04",
+      "checked_by": "clasp redeploy AKfycb…hXNOqw (перевод прода с @76 на @78, выкладка edit_event), подтверждено clasp list-deployments и deploy/bridge_prod_recon.py: «прод обслуживает версию 78», HEAD == @78",
+      "evidence": "docs/artifacts/2026-08-04-bridge-prod-deploy-v78.md",
+      "rollback": "clasp redeploy AKfycb…hXNOqw -V 76 (код прежнего прода — /root/_bridge_prod_snapshot_20260804/prod_v76 на VPS, 17 файлов)"
     }
   ]
 }
