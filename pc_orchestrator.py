@@ -54,6 +54,7 @@ import gate_selective         # селективный тест-гейт авт�
 import task_metrics           # единый формат строки METRICS (обе полосы) + norm_effort/extract_tokens/selfheal_count
 import client_contour         # признак клиентского контура (граф импортов ботов) + реестр оснований пропуска ворот; чистый, без сети
 import lesson_router          # обработчик задач-уроков (родитель 292, шаг 3): классификация+маршрут; suggest тянет лениво
+import card_duty              # ДЕЖУРНЫЙ ПО КАРТОЧКАМ: чистое решение без ввода-вывода (см. _maybe_card_duty)
 try:
     # Словарь ВИДОВ красных операций и разбор карточки — у гарда, и только у него: демону нужно
     # понять, НА ЧТО именно владелец сказал «да» (`kinds_from_card`), а держать второй список
@@ -2246,6 +2247,136 @@ def resume_lesson_wait(tid, reply_text, is_approver, path=None, classify=None,
     return dec
 
 
+# ═══════════════ ДЕЖУРНЫЙ ПО КАРТОЧКАМ, ФАЗА 1 — ЗЕРКАЛО ПК (04.08.2026) ═══════════════
+# Решение живёт в `card_duty.py` — ЧИСТОЙ функции без ввода-вывода (там же вся доктрина, граница,
+# чем ПК отличается от сервера и честный предел). Здесь — только РУКИ: собрать факты из очереди,
+# положить вердикт в терминальный путь без кнопки и сказать владельцу заметкой. Разделение не
+# косметическое: у модуля решения нет инструментов ни выдать себе прав, ни отправить что-либо от
+# своего имени, и стережёт это инвариант `CARD_DUTY_PURE` в гейте, а не докстринг.
+#
+# ФОРМА ВЗЯТА С ПОЛОСЫ СЕРВЕРА (`orchestrator_daemon._maybe_card_duty`, 20ebbc1) — вплоть до
+# порядка шагов и того, что заметка уходит ДО закрытия.
+#
+# ОТКАТ: `CARD_DUTY=0` в .env (или убрать строку) + рестарт демона → ветка мертва целиком,
+# карточки уходят владельцу байт-в-байт как раньше. Дефолт — ВЫКЛЮЧЕНО (как у STEP_SELFHEAL):
+# ошибка дежурного гасила бы владельцу видимость красного, а это ровно то направление, где цена
+# ошибки высшая. Сверх серверной формы — аварийный стоп-файл поверх флага (`_flag_on`): на ПК это
+# штатный рубильник, и он снимает ветку без правки .env, то есть без красной операции.
+
+DUTY_LANE = "ПК"                       # чьё имя стоит в заметке владельцу (у сервера — «VPS»)
+# Префикс, которым ЗАМОК ПРОИСХОЖДЕНИЯ метит карточку, рождённую из файла-маркера гарда, и
+# ничем иным (`_detect_needs_approval`). Здесь он КОНСТАНТА-ЧИТАТЕЛЬ: сам замок не трогаем,
+# а связь «то, что печатает замок» ↔ «то, что читает дежурный» закреплена тестом
+# (`test_origin_prefix_matches_live_detector`) — иначе две копии литерала разъехались бы молча.
+DUTY_GUARD_PREFIX = "NEEDS_APPROVAL (гард): "
+_DUTY_NA_PREFIX_RE = re.compile(r"^NEEDS_APPROVAL[^:]*:\s*")
+
+
+def _card_duty_on():
+    """Флаг CARD_DUTY=1 в .env + аварийный стоп-файл поверх (тот же `_flag_on`, что у думателя).
+    0/нет/мусор/стоп-файл → выключено, ветка не зовётся вовсе."""
+    return _flag_on("CARD_DUTY")
+
+
+def _duty_origin(what):
+    """Вердикт замка происхождения ПК для готовой карточки → 'guard' | 'legacy'.
+
+    ЧИТАЕМ С МЕСТА ЗАМКА, А НЕ ДОГАДКОЙ: префикс `DUTY_GUARD_PREFIX` ставит `_detect_needs_approval`
+    и только он, ПОСЛЕ сверки `run_token` каждой строки маркера. Значение `self` («слова
+    исполнителя») здесь не возвращается НИКОГДА и не может: заявку исполнителя замок
+    терминализует раньше и без кнопки (`FAIL_UNBACKED_RED`), до карточки она не доезжает. Это
+    названо прямо, чтобы правило «источник» никто не считал работающим на ПК (см. шапку card_duty).
+    """
+    return "guard" if str(what or "").startswith(DUTY_GUARD_PREFIX) else "legacy"
+
+
+def _duty_fingerprint(what):
+    """Отпечаток карточки = (класс операции, тело без префикса замка и без сжатых пробелов).
+
+    Класс берём ШТАМПОМ ГАРДА (`kinds_from_card`) — тем же местом, откуда его читает демон после
+    «да» владельца, а не поиском по тексту. Префикс замка снимаем: он несёт КОНСТАНТУ и на
+    схлопывание одинаковых по сути карточек влиять не должен.
+
+    Гард не импортировался (демон обязан подниматься и без него) → класс пуст, отпечаток остаётся
+    ТЕЛОМ карточки. Тело различает карточки и само; хуже была бы попытка читать класс своей
+    регуляркой — второй читатель того же места."""
+    body = _DUTY_NA_PREFIX_RE.sub("", str(what or ""))
+    kinds = pretool_guard.kinds_from_card(what or "") if pretool_guard else frozenset()
+    return (",".join(sorted(kinds)), " ".join(body.split()))
+
+
+def _duty_queue_twins(tid, what):
+    """(dup_id, answered_id) — карточка с ТЕМ ЖЕ отпечатком, уже открытая у владельца либо уже
+    одобренная им. Читаем очередь READ-ONLY; свою задачу пропускаем.
+    FAIL-SAFE: мост не ответил / любое исключение → пустые id, то есть эти два условия просто не
+    сработают (дежурный станет строже, не мягче)."""
+    fp = _duty_fingerprint(what)
+    dup_id = answered_id = ""
+    for status, slot in (("needs_approval", "dup"), ("approved", "ans")):
+        try:
+            r = bc.get_pending(status)
+        except Exception:
+            continue
+        if not (isinstance(r, dict) and r.get("ok")):
+            continue
+        for it in (r.get("items") or []):
+            if not isinstance(it, dict) or str(it.get("id")) == str(tid):
+                continue
+            if _duty_fingerprint(it.get("result")) != fp:
+                continue
+            if slot == "dup" and not dup_id:
+                dup_id = str(it.get("id"))
+            elif slot == "ans" and not answered_id:
+                answered_id = str(it.get("id"))
+    return dup_id, answered_id
+
+
+def _duty_note(tid, rule, proof):
+    """Заметка в ТУ ЖЕ ТЕМУ, куда ушла бы карточка (`NEEDS_APPROVAL_TOPIC`): владелец видит
+    закрытие ПОСТФАКТУМ и ничего не отвечает — кнопок, номера и слова «да» в ней нет.
+
+    → 'поставлена' | 'сбой:<причина>'. ИМЕННО «ПОСТАВЛЕНА», А НЕ «ДОСТАВЛЕНА»: `_notify_topic`
+    на ПК fire-and-forget (Popen без ожидания, сбой глушится внутри) — это общий канал всех
+    сигналов демона, и подтверждения доставки у него нет НИ У КОГО. Сказать в журнале «ok» о
+    том, чего мы не знаем, — та же ложь, что судить по расписке вместо факта (класс задачи 193),
+    поэтому и слово другое. Порядок «заметка ДО закрытия» ценность сохраняет: канал получает
+    сообщение раньше, чем мост может уронить `complete_task`.
+    FAIL-SAFE: любой сбой → строка в журнал, закрытие НЕ отменяется."""
+    try:
+        _notify_topic(NEEDS_APPROVAL_TOPIC, card_duty.note(DUTY_LANE, tid, rule, proof))
+        return "поставлена"
+    except Exception as e:
+        log.warning("дежурный: заметка в тему %s не поставлена (%s)", NEEDS_APPROVAL_TOPIC, e)
+        return "сбой:%s" % type(e).__name__
+
+
+def _maybe_card_duty(tid, what):
+    """CARD_DUTY=1 → вердикт дежурного по карточке. True = карточка снята и задача финализирована
+    (владельцу кнопки не будет), False = прежний путь (`set_needs_approval`), байт-в-байт.
+
+    FAIL-SAFE НА КАЖДОМ ШАГЕ: флаг выключен, сбой сбора фактов, сбой самого решения, вердикт
+    HOLD → False. Закрытие требует положительного доказательства; всё остальное — к владельцу."""
+    if not _card_duty_on():
+        return False
+    try:
+        dup_id, answered_id = _duty_queue_twins(tid, what)
+        action, rule, proof = card_duty.decide(
+            what, _duty_origin(what), dup_id=dup_id, answered_id=answered_id)
+    except Exception as e:
+        log.warning("дежурный: решение не собралось id=%s (%s) → карточка идёт владельцу", tid, e)
+        return False
+    if action != card_duty.CLOSE:
+        log.info("дежурный: карточка id=%s остаётся владельцу (%s)", tid, proof)
+        return False
+    # СЛЕД РАНЬШЕ ЗАКРЫТИЯ: заметка уходит ДО complete_task — если мост упадёт на закрытии,
+    # владелец уже знает о снятии, а карточка останется висеть (видимый, а не молчаливый сбой).
+    note = _duty_note(tid, rule, proof)
+    cm = bc.complete_task(tid, "failed", card_duty.close_result(what, rule, proof))
+    log.info("DUTY-CLOSE id=%s условие=%s (%s) заметка=%s bridge_ok=%s",
+             tid, rule, proof, note, cm.get("ok"))
+    return True
+
+
 def process_new():
     """Взять СТАРЕЙШУЮ new-задачу своей полосы, исполнить, записать результат/needs_approval."""
     if _stopped():
@@ -2321,6 +2452,12 @@ def process_new():
                    if _is_dev_task(text) or (_gate_step_selective_on() and gate_selective.parse_step(text)[0])
                    else None)
     status, result = run_task(tid, text)
+    if status == "needs_approval" and _maybe_card_duty(tid, result):
+        # ДЕЖУРНЫЙ ПО КАРТОЧКАМ (CARD_DUTY=1): за карточкой доказанно нет операции, которую «да»
+        # владельца могло бы разрешить → вопрос снят, задача финализирована внутри терминальным
+        # failed БЕЗ кнопки, владельцу ушла заметка. Решение гарда НЕ менялось: команда так и не
+        # прошла. Ветка стоит ПЕРЕД `set_needs_approval` и ничего не добавляет к правам.
+        return
     if status == "needs_approval":
         bc.set_needs_approval(tid, result)
         log.info("NEEDS_APPROVAL id=%s", tid)
@@ -4456,6 +4593,11 @@ _ORCH_RUNTIME = ("pc_orchestrator.py", "gate_selective.py", "task_metrics.py",
                  # 02.08.2026: транспорт моста (ручной обход редиректа) — тоже верхний импорт
                  # демона, его незакоммиченная правка уехала бы в бой вместе с рестартом.
                  "bridge_http.py",
+                 # 04.08.2026: дежурный по карточкам. Верхний импорт, и цена грязи здесь выше
+                 # обычной: незакоммиченная правка card_duty.py меняет НЕ поведение задачи, а то,
+                 # какие вопросы владелец УВИДИТ — то есть его видимость красного. Пропуск поймал
+                 # сам гейт (test_orch_runtime_covers_every_top_import_of_daemon), а не автор.
+                 "card_duty.py",
                  # 30.07.2026: демон импортирует их СВЕРХУ, значит незакоммиченная правка уедет в
                  # бой вместе с рестартом. pretool_guard — новый импорт (словарь видов красного для
                  # разбора одобренной карточки), io_utf8 стоял в импортах и в список не попал.
