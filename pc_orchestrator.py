@@ -241,6 +241,27 @@ try:
 except Exception:                       # log_setup мог не импортироваться (см. блок выше)
     pass
 
+
+def _state(path):
+    """Боевой путь СОСТОЯНИЯ под тестом уводится в одноразовый temp — см. log_setup.state_path.
+
+    Правило стоит ЗДЕСЬ, в самой константе, а не в setUp тестов: замер полного гейта 05.08.2026
+    поймал две живые записи, которых не видно грепом по именам констант, — тест звал живую функцию
+    демона, а та брала путь по умолчанию. `_persist_client_watch(state, now, path=None)` — ровно
+    этот случай: параметр `path` для изоляции есть, но тест его не передал, и снимок надзора
+    контур-вотчдога (его читает ОТДЕЛЬНЫЙ процесс `pc_agent status`) был переписан фикстурой
+    `{"ts": 1301.0, "children": {}}`. Тем же приёмом до этого был уничтожен спул ревизора.
+
+    Фолбэк на боевой путь при отсутствии log_setup сознателен: демон без изоляции работает верно,
+    а вот демон без состояния — нет."""
+    try:
+        return log_setup.state_path(path)
+    except Exception:
+        return path
+
+
+CLIENT_WATCH_FILE = _state(CLIENT_WATCH_FILE)
+
 BRIDGE_URL = os.getenv("BRIDGE_URL", "").strip()
 BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
 
@@ -503,7 +524,7 @@ def _notify(text):
 # исключения финализированных цепей. Класс: «отправлено» — в state-файле по ключу события
 # (родитель + sha1 текста карточки: текст несёт версию плана и номер шага), финализированные
 # цепи (сводка поставлена / помечены вручную) не анонсируются НИКОГДА.
-CHAIN_CARD_STATE = os.path.join(REPO, "pc_orchestrator.chain_cards.json")
+CHAIN_CARD_STATE = _state(os.path.join(REPO, "pc_orchestrator.chain_cards.json"))
 CHAIN_CARD_SENT_MAX = 500          # кап истории ключей (старые события дедупить незачем)
 
 
@@ -682,12 +703,12 @@ FAIL_CODE_RE = re.compile(r"причина=([a-z_]+)")   # разбор кода
 # Отметка момента CLAIM — НА ДИСКЕ. Задачу часто закрывает УЖЕ ДРУГОЙ процесс демона (само-
 # обновление, падение, реапер орфанов), и окно работы из памяти не восстановить: ровно так задача
 # 61 осталась без окна вовсе. Файл маленький и с капом — это не состояние, а метки времени.
-TASK_START_FILE = os.path.join(REPO, "pc_orchestrator.task_started.json")
+TASK_START_FILE = _state(os.path.join(REPO, "pc_orchestrator.task_started.json"))
 TASK_START_KEEP = 200
 # Локальный реестр УСПЕШНЫХ записей в журнал (пишет cowork_log_append). Спул хранит ПРОВАЛЬНЫЕ
 # строки, реестр — прошедшие: другого местного следа «журнал записан» у демона нет, а именно он
 # отличает «задача 61 работала» от «задача 61 молчала».
-COWORK_LEDGER = os.path.join(REPO, "cowork_log.ledger")
+COWORK_LEDGER = _state(os.path.join(REPO, "cowork_log.ledger"))
 EVIDENCE_MAX_COMMITS = 5      # в итог кладём первые N — остальные видны числом
 EVIDENCE_MAX_JOURNAL = 3
 
@@ -1759,7 +1780,7 @@ def _exec_command(cmd, restart_fn=None, status_fn=None):
 # следующим циклом демона: строки НАКЛАДЫВАЮТСЯ на актуальный файл (за это время мог пройти
 # ff-pull — тупая перезапись затёрла бы чужие строки чек-листа), затем штатный add+commit.
 
-LESSON_RETRY_FILE = os.path.join(REPO, "pc_orchestrator.lesson_retry.json")
+LESSON_RETRY_FILE = _state(os.path.join(REPO, "pc_orchestrator.lesson_retry.json"))
 LESSON_RETRY_SEC = int(os.getenv("PC_LESSON_RETRY_SEC", "300") or "300")
 _lesson_retry_last = 0.0
 
@@ -2120,7 +2141,7 @@ def _handle_lesson(tid, text):
 #       карточка владельцу в 1160, ожидание снято. Урок НЕ теряем, но и НЕ висит вечно.
 # resume_lesson_wait — шов возобновления по ответу учителя (голден зовёт напрямую; боевой роутинг
 # ответа из модер-группы делает moderation_bot отдельным шагом — его здесь НЕ трогаем).
-LESSON_WAIT_STATE = os.path.join(REPO, "pc_orchestrator.lesson_waits.json")
+LESSON_WAIT_STATE = _state(os.path.join(REPO, "pc_orchestrator.lesson_waits.json"))
 
 
 def _lesson_waits_read(path=None):
@@ -2619,7 +2640,7 @@ def enqueue_pc_task(text, frm="Filipp", bridge=None):
 # ответа в ряду очереди сегодня нет (`_owner_reply` перебирает кандидатов и не находит ни одного).
 # Значит «да» с ПК высшую цену НЕ открывает — она остаётся fail-closed ровно как была. Ответ
 # оператора сохраняется в местный след как объяснение решения, а не как ключ от необратимого.
-APPROVAL_LEDGER = os.path.join(REPO, "pc_orchestrator.approvals.jsonl")
+APPROVAL_LEDGER = _state(os.path.join(REPO, "pc_orchestrator.approvals.jsonl"))
 APPROVAL_LEDGER_KEEP = 500                # кольцо: след — реестр последних ответов, а не архив
 ANSWER_AGENT_FLAG = "PC_ANSWER_AGENT"     # рубильник владельца: машине разрешено отвечать (дефолт нет)
 ANSWER_TICKET_ENV = "PC_ANSWER_TICKET"    # билет машинного ответа; ЗНАЧЕНИЕ в след не пишется никогда
@@ -5037,7 +5058,7 @@ _git_pull_last_run = 0.0                                             # трот�
 #   НЕ родит (источник истины — файл, а не память процесса). Файл gitignored (pc_orchestrator.*.json)
 #   — сам он грязью для авто-фетча не станет. То же правило накрывает ВСЕ периодические ветки тика
 #   (грязно / fetch не удался / не-ff / pull не удался); ff — событие, пишется всегда.
-AUTOFETCH_STATE_FILE = os.path.join(REPO, "pc_orchestrator.autofetch.json")
+AUTOFETCH_STATE_FILE = _state(os.path.join(REPO, "pc_orchestrator.autofetch.json"))
 _AUTOFETCH_CLEAN_MSG = "авто-фетч: рабочее дерево снова чистое — пропуск снят, фетч/pull штатны"
 
 
@@ -5746,7 +5767,7 @@ def report_long_sleep(gap, threshold=None, backlog_fn=None, journal=None, notifi
 REVIZOR_HOURS = float(os.getenv("REVIZOR_HOURS", "6") or "6")   # период ревизии окон (дефолт 6 ч)
 REVIZOR_SEC = REVIZOR_HOURS * 3600.0
 REVIZOR_DB = os.path.join(REPO, "moderation_ipc.db")            # боевая очередь окон (read-only отбор)
-REVIZOR_STATE_FILE = os.path.join(REPO, "pc_orchestrator.revizor_state.json")  # метка прошлого прогона
+REVIZOR_STATE_FILE = _state(os.path.join(REPO, "pc_orchestrator.revizor_state.json"))  # метка прошлого прогона
 REVIZOR_TIMEOUT = int(os.getenv("REVIZOR_TIMEOUT", "300") or "300")            # думатель-ревизор окна (одно окно, длинный контекст)
 
 # Чек-лист классов ревизора вынесен в ЖИВОЙ файл docs/revizor_checklist.md (механика «урок навсегда»:
@@ -5944,7 +5965,7 @@ def _revizor_write_state(now, path=None, advance=True):
 #   2) МЕТКА НЕ ДВИГАЕТСЯ (_revizor_write_state(advance=False)) — те же окна попадут в отбор снова,
 #      даже если спул записать не удалось (диск сорвался). Первый замок хранит ТЕКСТ находки,
 #      второй — саму возможность её пере-вывести.
-REVIZOR_SPOOL_FILE = os.path.join(REPO, "pc_orchestrator.revizor_spool.json")  # недоставленные находки
+REVIZOR_SPOOL_FILE = _state(os.path.join(REPO, "pc_orchestrator.revizor_spool.json"))  # недоставленные находки
 _REVIZOR_SPOOL_MAX = 300           # потолок спула (≈неделя полной недоступности очереди при 10/прогон)
 
 
@@ -7000,7 +7021,7 @@ def _schtasks_run(task_name=TASK_NAME):
 # client_watchdog — переживает и длинные задачи, и смену PID после self-update); алерт — один
 # на инцидент (переход жив→мёртв), состояние в файле (вотчдог — короткоживущий процесс,
 # память между тиками не живёт).
-WD_STATE_FILE = os.path.join(REPO, "pc_orchestrator.watchdog_state.json")
+WD_STATE_FILE = _state(os.path.join(REPO, "pc_orchestrator.watchdog_state.json"))
 WD_ALERT_COOLDOWN = int(os.getenv("PC_WD_ALERT_COOLDOWN", "900") or "900")   # флап-защита алерта, с
 
 

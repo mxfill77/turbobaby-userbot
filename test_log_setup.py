@@ -632,5 +632,50 @@ class TestCanonicalLogNameHasOneOwner(unittest.TestCase):
             self.assertIn(owner, entries, "%s → %s: такой входной точки нет" % (logname, owner))
 
 
+class TestStatePathIsolation(unittest.TestCase):
+    """ФАЙЛ СОСТОЯНИЯ ПОД ТЕСТОМ (класс 05.08.2026: «полный гейт съел спул ревизора»).
+
+    Голдены написаны от ИНЦИДЕНТА, а не от схемы: гейт уничтожил 12 недоставленных находок
+    владельца, потому что изоляция стояла в `setUp` тестов («по договорённости») и до одного
+    класса не доехала. Грепом это не ловится — тест не называл ни одной константы состояния,
+    боевой файл переписала позванная им живая функция демона. Поэтому проверяем не «есть ли
+    подмена в тесте», а САМУ КОНСТАНТУ: куда она указывает в тест-прогоне."""
+
+    def test_prod_context_keeps_the_repo_path(self):
+        """В бою состояние обязано лежать в репо — иначе демон переживёт рестарт без памяти."""
+        p = log_setup.state_path("pc_orchestrator.revizor_spool.json", env={})
+        self.assertEqual(os.path.normcase(os.path.dirname(p)), os.path.normcase(log_setup.HERE))
+
+    def test_test_context_leaves_the_repo(self):
+        p = log_setup.state_path("pc_orchestrator.revizor_spool.json", env={"TESTING": "1"})
+        self.assertNotEqual(os.path.normcase(os.path.dirname(p)), os.path.normcase(log_setup.HERE))
+        self.assertEqual(os.path.basename(p), "pc_orchestrator.revizor_spool.json")
+
+    def test_one_state_dir_per_process(self):
+        """Разные файлы состояния — один каталог на процесс: снимок прогона должен читаться
+        целиком, а не собираться из десятка временных каталогов."""
+        a = log_setup.state_path("a.json", env={"TESTING": "1"})
+        b = log_setup.state_path("b.json", env={"TESTING": "1"})
+        self.assertEqual(os.path.dirname(a), os.path.dirname(b))
+
+    def test_live_state_constants_do_not_point_into_the_repo(self):
+        """РЕГРЕСС САМОГО ИНЦИДЕНТА. Этот тест сам идёт тест-прогоном, значит боевые константы
+        состояния обязаны уже указывать НЕ в репо. Упади он — и любой тест, позвавший живую
+        функцию демона, снова пишет владельцу в боевой файл."""
+        import pc_orchestrator as o
+        import cowork_log_append as cla
+        repo = os.path.normcase(log_setup.HERE)
+        cases = [("pc_orchestrator.CLIENT_WATCH_FILE", o.CLIENT_WATCH_FILE),
+                 ("pc_orchestrator.REVIZOR_SPOOL_FILE", o.REVIZOR_SPOOL_FILE),
+                 ("pc_orchestrator.REVIZOR_STATE_FILE", o.REVIZOR_STATE_FILE),
+                 ("pc_orchestrator.WD_STATE_FILE", o.WD_STATE_FILE),
+                 ("pc_orchestrator.CHAIN_CARD_STATE", o.CHAIN_CARD_STATE),
+                 ("pc_orchestrator.APPROVAL_LEDGER", o.APPROVAL_LEDGER),
+                 ("cowork_log_append.LEDGER_PATH", cla.LEDGER_PATH)]
+        for name, path in cases:
+            self.assertNotEqual(os.path.normcase(os.path.dirname(os.path.abspath(path))), repo,
+                                "%s под тестом указывает в БОЕВОЙ репозиторий: %s" % (name, path))
+
+
 if __name__ == "__main__":
     unittest.main()
