@@ -7664,6 +7664,28 @@ class TestRevizorIpcChecks(unittest.TestCase):
     YEAR_TEXT = "YAMAHA XMAX 300, 2021 г.в., пробег небольшой"
     CID = 111222333
 
+    def setUp(self):
+        """СПУЛ РЕВИЗОРА — СВОЙ ФАЙЛ НА ТЕСТ. Тот же приём, что в `Base` (строки «боевой не читаем
+        и не пишем»), но этот класс от `Base` НЕ наследуется, и изоляция сюда не доехала.
+
+        Цена пропуска измерена живым инцидентом 05.08.2026, а не предположена. `_revizor_route`
+        поднимает недоставленные находки из спула ПЕРВЫМ делом и, если доставка удалась, сохраняет
+        спул пустым. В тесте `_revizor_post_owner_card` замокан и возвращает True — значит полный
+        гейт ЧИТАЛ БОЕВОЙ `pc_orchestrator.revizor_spool.json`, считал доставку состоявшейся и
+        записывал туда `[]`. Живой прогон: `owner` пришёл 13 вместо 1 (12 боевых находок из спула
+        + 1 своя), боевой спул после прогона — пустой файл, а в логе демона доставки нет вовсе.
+        РЕАЛЬНЫЕ НЕДОСТАВЛЕННЫЕ НАХОДКИ ВЛАДЕЛЬЦА БЫЛИ УНИЧТОЖЕНЫ ТЕСТОМ.
+
+        Дефект был САМОСТИРАЮЩИЙСЯ и потому выглядел «плавающим»: съев спул один раз, тест зеленеет
+        на всех последующих прогонах — в изоляции, парами и в любом подмножестве. Краснеет он
+        ровно тогда, когда демон успел накопить недоставленное, то есть в самый дорогой момент."""
+        self._save_spool = o.REVIZOR_SPOOL_FILE
+        o.REVIZOR_SPOOL_FILE = os.path.join(tempfile.mkdtemp(), "revizor_spool.json")
+        self.addCleanup(lambda: setattr(o, "REVIZOR_SPOOL_FILE", self._save_spool))
+        self._save_rstate = o.REVIZOR_STATE_FILE      # метка прошлого прогона — тем же приёмом
+        o.REVIZOR_STATE_FILE = os.path.join(tempfile.mkdtemp(), "revizor_state.json")
+        self.addCleanup(lambda: setattr(o, "REVIZOR_STATE_FILE", self._save_rstate))
+
     def _pkg(self, *texts, cid=None):
         return {"client_id": self.CID if cid is None else cid, "sent": list(texts), "drafts": []}
 

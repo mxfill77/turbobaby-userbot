@@ -456,6 +456,29 @@ class TestDaemonHands(unittest.TestCase):
             if old is not None:
                 os.environ["CARD_DUTY"] = old
 
+    def test_banner_names_the_switch(self):
+        """СОСТОЯНИЕ РУБИЛЬНИКА ЧИТАЕТСЯ ИЗ ЛОГА СТАРТА, А НЕ ТОЛЬКО ИЗ `.env`.
+
+        Замер третьего захода (05.08.2026) назвал это остатком с ценой: срабатываний дежурного в
+        боевом логе ноль, но ноль срабатываний доказывает, что ВЕТКА НЕ РАБОТАЛА, и НЕ доказывает,
+        что рубильник стоит в нуле. Единственным способом проверить «дежурный выключен» оставалось
+        чтение `.env` — то есть КРАСНАЯ операция ради проверки выключенности. Цена молчания тут
+        выше, чем у флагов думателя: этот рубильник решает, КАКИЕ ВОПРОСЫ ВЛАДЕЛЕЦ УВИДИТ.
+
+        Проверяем по ИСХОДНИКУ и до цикла — там же, где стоит зеркальный тест флагов думателя
+        (`test_pc_orchestrator.test_banner_names_thinker_flags_from_live_env`), и той же меркой:
+        печатается ЖИВОЙ `os.environ` процесса, а не строка файла (их расходит `override=False`
+        у load_dotenv — унаследованное от предка значение файл не перезаписывает)."""
+        with open(os.path.join(REPO, "pc_orchestrator.py"), encoding="utf-8") as f:
+            body = f.read().split("def _main_loop", 1)[1]
+        head = body[:body.index("while not _stopped()")]
+        self.assertIn("CARD_DUTY=%s", head, "баннер старта не называет рубильник дежурного")
+        self.assertIn("int(_card_duty_on())", head, "в баннер идёт не живое значение рубильника")
+        self.assertIn('os.environ.get("CARD_DUTY")', head,
+                      "рядом с флагом обязано стоять СЫРОЕ значение живого окружения")
+        self.assertIn('int(_flag_forced_off("CARD_DUTY"))', head,
+                      "аварийный стоп-файл поверх флага в баннере не назван")
+
     def test_origin_reads_the_lock_stamp(self):
         self.assertEqual(self.PO._duty_origin(live_card("delete", "", "rm x.py")), "guard")
         self.assertEqual(self.PO._duty_origin("op=kill | снять процесс"), "legacy")
