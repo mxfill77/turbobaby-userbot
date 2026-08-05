@@ -3795,6 +3795,25 @@ class TestOrphanNoExecutor(Base):
     def _stale(self, age=None):
         return self.fb.add(status="in_progress", updated=iso_ago(age or self.ORPHAN_AGE))
 
+    @staticmethod
+    def _tasklist(alive_pid=None):
+        """Фейковый `tasklist` В ЖИВОМ ФОРМАТЕ вывода, а не подмена внутреннего имени пробы.
+
+        Так тест держится за ПОВЕДЕНИЕ (что демон делает, увидев такой ответ системы), а не за
+        устройство, и остаётся осмысленным на ЛЮБОМ модуле — в том числе на старом, где имени
+        `_pid_alive_probe` ещё нет. Формат обоих ответов списан с живого замера 05.08: строка CSV
+        на найденный процесс и «задачи не найдены» с rc=0 — на ненайденный."""
+        def run(*a, **k):
+            argv = a[0] if a else []
+            m = re.search(r"PID eq (\d+)", " ".join(str(x) for x in argv))
+            pid = int(m.group(1)) if m else None
+            if alive_pid is not None and pid == alive_pid:
+                return types.SimpleNamespace(
+                    returncode=0, stdout='"claude.exe","%d","Console","1","120 000 КБ"\n' % pid)
+            return types.SimpleNamespace(
+                returncode=0, stdout="INFO: No tasks are running which match the specified criteria.\n")
+        return run
+
     # --- «красное до»: сирота снимается быстро -------------------------------
 
     def test_orphan_never_ran_reaped_fast(self):
@@ -3809,7 +3828,7 @@ class TestOrphanNoExecutor(Base):
         tid = self._stale()
         o._task_started_mark(tid, now=iso_dt(self.ORPHAN_AGE))
         o._task_started_child(tid, 31337)
-        with mock.patch.object(o, "_lock_pid_alive", lambda pid: False):
+        with mock.patch.object(o.subprocess, "run", self._tasklist()):          # ребёнка в списке нет
             o.process_stuck_singles()
         self.assertEqual(self.fb.tasks[tid]["status"], "failed")
 
@@ -3844,9 +3863,44 @@ class TestOrphanNoExecutor(Base):
         tid = self._stale(age=o.PC_SINGLE_STALE - 60)
         o._task_started_mark(tid, now=iso_dt(o.PC_SINGLE_STALE))
         o._task_started_child(tid, 31337)
-        with mock.patch.object(o, "_lock_pid_alive", lambda pid: True):
+        with mock.patch.object(o.subprocess, "run", self._tasklist(31337)):     # ребёнок в списке ЕСТЬ
             o.process_stuck_singles()
         self.assertEqual(self.fb.tasks[tid]["status"], "in_progress")
+
+    def test_probe_silence_is_not_death(self):
+        # КЛАСС #171 НА НОВОЙ ПОЛОСЕ: проба процессов не ответила (таймаут tasklist — ПК проснулся,
+        # список процессов отдаётся не сразу). Прежняя двузначная проба глотала отказ в False, и
+        # реапер читал это как ДОКАЗАННУЮ смерть ребёнка → снимал ЖИВУЮ задачу по короткому порогу.
+        # Молчание пробы обязано быть «не знаю»: судит длинная мерка, работа не теряется.
+        # Ломаем ИМЕННО ТО, что ломается в проде (сам вызов tasklist), а не имя пробы: тест обязан
+        # быть осмысленным и на СТАРОМ модуле, где имени `_pid_alive_probe` ещё нет вовсе.
+        def boom(*a, **k):
+            raise o.subprocess.TimeoutExpired("tasklist", 10)   # ИМЕННО таймаут пробы, класс #171
+        tid = self._stale()
+        o._task_started_mark(tid, now=iso_dt(self.ORPHAN_AGE))
+        o._task_started_child(tid, 31337)
+        with mock.patch.object(o.subprocess, "run", boom):
+            o.process_stuck_singles()
+        self.assertEqual(self.fb.tasks[tid]["status"], "in_progress",
+                         "не ответившая проба — это незнание, а не смерть исполнителя")
+
+    def test_probe_failure_modes_are_unknown_not_dead(self):
+        # Оба отказа САМОЙ пробы (исключение и ненулевой rc) → None. Разделять «мёртв» и «сбой»
+        # обязано СОДЕРЖИМОЕ, а не код возврата: замером 05.08 tasklist на несуществующий PID
+        # отвечает rc=0, поэтому rc!=0 — это сбой пробы, а не отсутствие процесса.
+        def boom(*a, **k):
+            raise OSError("tasklist не ответил")
+        with mock.patch.object(o.subprocess, "run", boom):
+            self.assertIsNone(o._pid_alive_probe(31337))
+            self.assertFalse(o._lock_pid_alive(31337))      # у синглтона контракт прежний, двузначный
+        with mock.patch.object(o.subprocess, "run",
+                               lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="")):
+            self.assertIsNone(o._pid_alive_probe(31337))
+        # а вот честный ответ «задачи не найдены» (rc=0, PID в выводе нет) — это именно СМЕРТЬ
+        with mock.patch.object(o.subprocess, "run",
+                               lambda *a, **k: types.SimpleNamespace(
+                                   returncode=0, stdout="INFO: No tasks are running")):
+            self.assertIs(o._pid_alive_probe(31337), False)
 
     def test_current_task_never_reaped(self):
         # задачу, которую демон ведёт ПРЯМО СЕЙЧАС, не снимает ничто (ПК мог спать в её окне:
@@ -3863,7 +3917,7 @@ class TestOrphanNoExecutor(Base):
         tid = self._stale(age=o.PC_SINGLE_STALE + 120)
         o._task_started_mark(tid, now=iso_dt(o.PC_SINGLE_STALE + 120))
         o._task_started_child(tid, 31337)
-        with mock.patch.object(o, "_lock_pid_alive", lambda pid: True):
+        with mock.patch.object(o.subprocess, "run", self._tasklist(31337)):     # ребёнок в списке ЕСТЬ
             o.process_stuck_singles()
         self.assertEqual(self.fb.tasks[tid]["status"], "failed")
 
@@ -3874,6 +3928,7 @@ class TestOrphanNoExecutor(Base):
         o._task_started_mark(tid, now=iso_dt(o.PC_ORPHAN_STALE + 600))
         st = o._task_started_read()
         st[str(tid)]["pid"] = os.getpid() + 100000        # заведомо не наш процесс
+        st[str(tid)]["proc"] = "чужой-запуск-1"           # ЛИЧНОСТЬ запуска — теперь она, а не PID
         with open(o.TASK_START_FILE, "w", encoding="utf-8") as f:
             json.dump(st, f, ensure_ascii=False)
         o.process_stuck_singles()
@@ -3889,6 +3944,42 @@ class TestOrphanNoExecutor(Base):
         with open(o.TASK_START_FILE, "w", encoding="utf-8") as f:
             f.write("{}")
         tid = self._stale()
+        o.process_stuck_singles()
+        self.assertEqual(self.fb.tasks[tid]["status"], "in_progress")
+
+    def test_registry_reborn_after_loss_does_not_orphan_the_lane(self):
+        # ПОТЕРЯ РЕЕСТРА + ОДИН CLAIM = БЫВШАЯ ПУСТОТА. Ветка «пусто → не знаю» защищает лишь до
+        # первой отметки: демон, потеряв файл, пересоздаёт его С ОДНИМ ключом, и реестр снова
+        # «непустой». Без проверки возраста САМОГО реестра все живые in_progress полосы разом
+        # становятся «сиротами, которые не запускались ни разу» — включая ту, чей headless жив.
+        tid = self._stale(age=o.PC_ORPHAN_STALE + 600)     # задача началась ДО потери реестра
+        with open(o.TASK_START_FILE, "w", encoding="utf-8") as f:
+            f.write("{}")                                  # реестр потерян
+        o._task_started_mark(99123)                        # …и пересоздан свежим claim'ом
+        o.process_stuck_singles()
+        self.assertEqual(self.fb.tasks[tid]["status"], "in_progress",
+                         "реестр, не заставший старт задачи, не может доказать «не запускалась»")
+
+    def test_registry_older_than_task_still_proves_orphan(self):
+        # ОБРАТНАЯ СТОРОНА: живой реестр старше задачи — его молчание ЕСТЬ показание, и случай 305
+        # (claim лёг, прогон не начинался) снимается быстро как прежде. Иначе правка F1 съела бы
+        # весь смысл короткого порога.
+        o._task_started_mark(99124, now=iso_dt(50000))     # реестр помнит времена до задачи
+        tid = self._stale()
+        o.process_stuck_singles()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+
+    def test_pid_reuse_by_another_daemon_is_not_proof(self):
+        # PID — не личность: после рестарта Windows может выдать новому демону номер старого.
+        # Отметка без метки запуска при совпавшем PID обязана читаться как «не знаю», иначе чужая
+        # ЖИВАЯ задача объявляется своей брошенной и снимается за 5 минут.
+        tid = self._stale(age=o.PC_ORPHAN_STALE + 600)
+        o._task_started_mark(tid, now=iso_dt(o.PC_ORPHAN_STALE + 600))
+        st = o._task_started_read()
+        st[str(tid)].pop("proc", None)                           # отметка старого формата…
+        st[str(tid)]["pid"] = os.getpid()                  # …а PID совпал с нашим
+        with open(o.TASK_START_FILE, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False)
         o.process_stuck_singles()
         self.assertEqual(self.fb.tasks[tid]["status"], "in_progress")
 
@@ -3920,11 +4011,19 @@ class TestOrphanNoExecutor(Base):
         self.assertLess(o.PC_ORPHAN_STALE, o.TASK_TIMEOUT)
 
     def test_verdict_tri_state(self):
-        self.assertIs(o._executor_verdict(90404)[0], False)      # отметки нет → сирота
+        now = datetime.datetime.now(datetime.timezone.utc)
+        # `since` обязателен там, где приговор выносит ОТСУТСТВИЕ ключа: реестр (отметка из setUp
+        # сделана 9999с назад) обязан быть старше самой задачи, иначе его молчание — не показание
+        self.assertIs(o._executor_verdict(90404, since=now)[0], False)   # отметки нет → сирота
         o._task_started_mark(777, now=iso_dt(100))
-        self.assertIs(o._executor_verdict(777)[0], False)        # наш процесс, но не текущая
+        self.assertIs(o._executor_verdict(777, since=now)[0], False)     # наш процесс, но не текущая
         o._RUNNING_TID = 777
-        self.assertIs(o._executor_verdict(777)[0], True)         # текущая — жива всегда
+        self.assertIs(o._executor_verdict(777, since=now)[0], True)      # текущая — жива всегда
+
+    def test_verdict_without_since_never_claims_proof(self):
+        # Без `since` проверить свидетеля нечем — значит и «ДОКАЗАННО нет» заявлять не на чем.
+        # Умолчание обязано быть осторожным: незнание дешевле ложного реапа.
+        self.assertIsNone(o._executor_verdict(90404)[0])
 
     def test_verdict_unknown_on_legacy_string_mark(self):
         # старый формат отметки (голая строка ISO) — окно старта читается, исполнитель неизвестен

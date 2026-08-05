@@ -926,6 +926,11 @@ FAIL_CODE_RE = re.compile(r"причина=([a-z_]+)")   # разбор кода
 # 61 осталась без окна вовсе. Файл маленький и с капом — это не состояние, а метки времени.
 TASK_START_FILE = _state(os.path.join(REPO, "pc_orchestrator.task_started.json"))
 TASK_START_KEEP = 200
+# ЛИЧНОСТЬ ЭТОГО ЗАПУСКА демона: PID плюс момент старта. Нужна там, где «эту отметку делал я»
+# решает судьбу задачи: голый PID Windows переиспользует, и одно совпадение номера после рестарта
+# выдало бы чужую живую задачу за свою брошенную. Считается один раз при импорте — как и положено
+# метке запуска, она обязана быть неизменной всю жизнь процесса.
+_PROC_TOKEN = "%d-%d" % (os.getpid(), int(time.time()))
 # Локальный реестр УСПЕШНЫХ записей в журнал (пишет cowork_log_append). Спул хранит ПРОВАЛЬНЫЕ
 # строки, реестр — прошедшие: другого местного следа «журнал записан» у демона нет, а именно он
 # отличает «задача 61 работала» от «задача 61 молчала».
@@ -935,12 +940,43 @@ EVIDENCE_MAX_JOURNAL = 3
 
 
 def _task_started_read(path=None):
+    p = path or TASK_START_FILE
     try:
-        with open(path or TASK_START_FILE, encoding="utf-8") as f:
+        with open(p, encoding="utf-8") as f:
             d = json.load(f)
         return d if isinstance(d, dict) else {}
-    except Exception:
+    except FileNotFoundError:
         return {}
+    except Exception as e:
+        # РЕЕСТР БЫЛ, НО НЕ ПРОЧИТАН — это НЕ «ничего не запускалось», и молчать об этом нельзя:
+        # на отсутствии ключа стои́т приговор «сирота». Запись файла не атомарна (open("w") +
+        # json.dump), так что оборванная запись — ровно тот случай, ради которого реестр и заведён.
+        log.warning("реестр отметок старта не прочитан (%s: %s) — исполнителей по нему не сужу", p, e)
+        return {}
+
+
+def _task_started_covers(st, since):
+    """Мог ли реестр `st` ЗАСТАТЬ отметку задачи, начавшейся в `since`? → True | False.
+
+    Отсутствие ключа доказывает «прогон не начинался» ТОЛЬКО если реестр жил уже тогда. Иначе
+    доказательства нет вовсе: потеряв файл (обрыв записи, крах, антивирус), демон на следующем же
+    claim'е пересоздаёт его С ОДНИМ ключом — и пустой реестр, у которого есть честная ветка «не
+    знаю», мгновенно перестаёт быть пустым. Без этой проверки ОДНА потеря файла делала бы сиротами
+    ВСЕ живые in_progress-задачи полосы разом, включая ту, чей headless жив и коммитит.
+
+    Мерка — самая старая отметка в реестре: она и есть возраст его памяти."""
+    if not st or since is None:
+        return False
+    oldest = min((_started_at_raw(v) for v in st.values() if _started_at_raw(v)), default="")
+    if not oldest:
+        return False
+    try:
+        t = datetime.datetime.fromisoformat(oldest.replace("Z", "+00:00"))
+    except Exception:
+        return False
+    if not t.tzinfo:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return t <= since
 
 
 def _started_at_raw(val):
@@ -976,7 +1012,7 @@ def _task_started_mark(tid, now=None, path=None):
     if key in st:
         return _started_at_raw(st[key])
     st[key] = {"at": (now or datetime.datetime.now(datetime.timezone.utc)).isoformat(),
-               "pid": os.getpid()}
+               "pid": os.getpid(), "proc": _PROC_TOKEN}
     if len(st) > TASK_START_KEEP:        # кап: отметки давно закрытых задач никому не нужны
         for k in sorted(st, key=lambda x: _started_at_raw(st[x]))[:len(st) - TASK_START_KEEP]:
             st.pop(k, None)
@@ -3291,7 +3327,7 @@ NO_EXEC_NOT_MINE = "её вёл ЭТОТ процесс демона и уже �
 NO_EXEC_CHILD_DEAD = "дочерний процесс claude (PID {pid}) мёртв"
 
 
-def _executor_verdict(tid, path=None, pid_alive=None):
+def _executor_verdict(tid, path=None, pid_alive=None, since=None):
     """Есть ли у задачи tid ЖИВОЙ исполнитель? → (True | False | None, причина словами).
 
     True  — есть (или прямо сейчас её ведём мы сами);
@@ -3308,6 +3344,8 @@ def _executor_verdict(tid, path=None, pid_alive=None):
          рождается сирота claim'а: мутация легла на мосту, расписка потерялась, прогон не начался.
       4. В отметке есть PID ребёнка → судим ПО НЕМУ. Переиспользование PID Windows'ом может
          показать чужой процесс живым — это уводит в «жив», то есть в осторожную сторону.
+         А вот проба, НЕ ОТВЕТИВШАЯ вовсе (таймаут `tasklist`, класс #171), — это НЕ ЗНАЮ:
+         её молчание не смеет значить «мёртв», иначе живую задачу снимет чужой таймаут.
       5. Отметку делал ЭТОТ процесс, а исполняем сейчас не её (п.1 не сработал) → ребёнка нет:
          демон одноворкерный и синхронный, его дети живут внутри `run_task` и только там.
       6. Отметку делал ДРУГОЙ процесс демона, PID ребёнка в ней не записан → НЕ ЗНАЮ: тот демон
@@ -3319,15 +3357,36 @@ def _executor_verdict(tid, path=None, pid_alive=None):
         return None, "реестр отметок старта пуст или недоступен"
     rec = st.get(str(tid))
     if rec is None:
+        # Отсутствие ключа — приговор, поэтому спрашиваем и о САМОМ свидетеле: жил ли реестр уже
+        # тогда, когда задача начиналась. Пересозданный после потери файла реестр «непустой», но
+        # ничего о прошлом не помнит, и его молчание — не показание (см. `_task_started_covers`).
+        if not _task_started_covers(st, since):
+            return None, "реестр отметок моложе самой задачи — застать её старт он не мог"
         return False, NO_EXEC_NEVER_RAN
     rec = rec if isinstance(rec, dict) else {"at": str(rec)}
     child = rec.get("child")
     if child:
-        if (pid_alive or _lock_pid_alive)(child):
+        # ПРОБА, КОТОРАЯ НЕ ОТВЕТИЛА, — ЭТО «НЕ ЗНАЮ», А НЕ «МЁРТВ». Прежняя двузначная проба
+        # глотала свой отказ в False, и для реапера это читалось как ДОКАЗАННАЯ смерть ребёнка:
+        # один таймаут `tasklist` (класс #171 — ПК просыпается, список процессов отвечает не сразу)
+        # снимал бы ЖИВУЮ задачу чужого демона по короткому порогу. Цена ошибки асимметрична —
+        # лишнее ожидание стоит времени, ложный реап стоит работы, — поэтому молчание идёт в None.
+        alive = (pid_alive or _pid_alive_probe)(child)
+        if alive is None:
+            return None, f"проба процессов не ответила: жив ли дочерний claude (PID {child}) — неизвестно"
+        if alive:
             return True, f"дочерний процесс claude (PID {child}) жив"
         return False, NO_EXEC_CHILD_DEAD.format(pid=child)
-    if rec.get("pid") == os.getpid():
+    # PID — НЕ ЛИЧНОСТЬ ПРОЦЕССА. Windows переиспользует номера, и на длинной аптайм-полосе с
+    # частыми self-update-рестартами совпадение «его PID = мой PID» вполне достижимо; здесь оно
+    # уводило бы В ОПАСНУЮ сторону (чужую живую задачу объявить своей брошенной). Стандарт этого
+    # же файла — PID + время рождения (`_is_descendant`); сюда он не был перенесён. Метка `proc`
+    # уникальна на запуск процесса, поэтому сравниваем ЕЁ; отметки без метки (сделаны до этой
+    # правки) честно уходят в «не знаю» — длинная мерка, работа цела.
+    if rec.get("proc") and rec.get("proc") == _PROC_TOKEN:
         return False, NO_EXEC_NOT_MINE
+    if rec.get("pid") == os.getpid() and not rec.get("proc"):
+        return None, "отметка без метки процесса, а PID совпал с моим — переиспользование PID неотличимо"
     return None, f"отметку делал другой процесс демона (PID {rec.get('pid') or '?'}), PID ребёнка в ней нет"
 
 
@@ -3386,7 +3445,9 @@ def process_stuck_singles(now=None):
         # ПРИЗНАК СИРОТСТВА — ОТСУТСТВИЕ ИСПОЛНИТЕЛЯ, А НЕ МОЛЧАНИЕ (класс 05.08.2026, задача 305).
         # Вердикт спрашиваем ПОСЛЕ отсечки выше: он может стоить обращения к списку процессов, и
         # платить им за каждую живую задачу на каждом витке незачем.
-        alive, why = _executor_verdict(tid)
+        # `since` — момент, с которого задача молчит: по нему вердикт проверяет, мог ли реестр
+        # вообще застать её старт (иначе «отметки нет» — не показание, а потерянная память).
+        alive, why = _executor_verdict(tid, since=now - datetime.timedelta(seconds=age))
         limit = PC_ORPHAN_STALE if alive is False else PC_SINGLE_STALE
         if age <= limit:
             continue
@@ -7377,15 +7438,38 @@ def _revizor_route(packages, now=None):
 # если лок держит именно этот PID, ЖДЁТ его смерти (старый снимает лок в finally main()) —
 # гарантированно «гасим старого перед стартом нового», перекрытия нет.
 
-def _lock_pid_alive(pid):
-    """Жив ли процесс по PID (Windows, без psutil). Инъектируется в тестах."""
+def _pid_alive_probe(pid):
+    """Жив ли процесс PID → True | False | **None (проба НЕ ОТВЕТИЛА)**. Windows, без psutil.
+
+    Третий ответ здесь не педантизм, а класс #171 своей полосы: проба процессов на пробуждении ПК
+    отвечает не сразу, и её молчание уже однажды выдало себя за смерть (ложная смерть вотчдога,
+    f89da43). Кто читает пробу — обязан решить САМ, как читать её молчание; у синглтона и у реапера
+    ответы на это РАЗНЫЕ, поэтому развилка вынесена сюда, а не зашита в `except`.
+
+    ЗАМЕР (05.08.2026, эта машина): `tasklist` на НЕсуществующий PID отвечает `rc=0` и строкой
+    «задачи не найдены» — значит `rc != 0` это не «мёртв», а сбой самой пробы, и разделять их надо
+    по СОДЕРЖИМОМУ, а не по коду возврата. Иначе ветка «ребёнок мёртв» тихо перестала бы срабатывать."""
     try:
         r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
                            capture_output=True, text=True, encoding="utf-8", errors="replace",
                            timeout=10, creationflags=NO_WINDOW)
-        return f'"{pid}"' in r.stdout or f",{pid}," in r.stdout
-    except Exception:
-        return False
+    except Exception as e:
+        log.warning("проба процессов не ответила по PID=%s (%s) — это НЕ смерть, а незнание", pid, e)
+        return None
+    if r.returncode != 0:
+        log.warning("проба процессов по PID=%s дала rc=%s — это НЕ смерть, а сбой пробы",
+                    pid, r.returncode)
+        return None
+    return f'"{pid}"' in r.stdout or f",{pid}," in r.stdout
+
+
+def _lock_pid_alive(pid):
+    """Жив ли процесс по PID (двузначно). Инъектируется в тестах.
+
+    Контракт СИНГЛТОНА: молчание пробы читаем как «держателя нет» — прежнее поведение, и оно тут
+    осознанно (не поднять второго демона хуже, чем поднять). Реапер тот же ответ читать так НЕ
+    смеет: у него «нет» означает снятие задачи, поэтому он зовёт `_pid_alive_probe` напрямую."""
+    return _pid_alive_probe(pid) is True
 
 
 def _read_lock_pid(path=None):
