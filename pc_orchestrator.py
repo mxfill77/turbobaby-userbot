@@ -114,6 +114,24 @@ APPROVAL_TTL = int(os.getenv("PC_APPROVAL_TTL", "1800") or "1800")     # 30 ми
 # поэтому живой прогон под нож не попадёт — реапится только орфан мёртвого процесса. vps-реапер НЕ
 # дублируем: он про VPS/цепочки, а тут ТОЛЬКО одиночки lane=pc, которых он не видит.
 PC_SINGLE_STALE = int(os.getenv("PC_SINGLE_STALE", "5400") or "5400")  # 90 мин: орфан-одиночка in_progress → failed
+# СИРОТА — ЭТО ОТСУТСТВИЕ ИСПОЛНИТЕЛЯ, А НЕ МОЛЧАНИЕ (класс 05.08.2026, задача 305). Порог выше
+# меряет ВОЗРАСТ `updated`, то есть тишину, и потому обязан быть большим: живой синхронный прогон
+# тоже молчит до 45 мин. Но молчание — не единственный доступный факт. Когда у задачи ДОКАЗАНО нет
+# дочернего процесса (её не запускали на этом ПК ни разу / её вёл ЭТОТ процесс демона и уже не
+# ведёт / записанный PID ребёнка мёртв), ждать 90 минут не за чем: ждать нечего. Такую задачу
+# снимаем по этому, короткому порогу. Он НЕ заменяет PC_SINGLE_STALE — тот остаётся для случаев,
+# где факт неизвестен (чужой процесс демона, потерянный реестр отметок): «не знаю» по-прежнему
+# судится прежней, медленной и осторожной меркой.
+#
+# ЗАМЕР 7 суток (29.07–05.08, docs/artifacts/2026-08-05-reaper-orphans.md): 6 сирот, суммарно
+# 35955с ≈ 10,0 ч висения. Из них 32400с (90%) — САМ ПОРОГ, и лишь 3555с — простой демона.
+# Отказов чтения полосы В МОМЕНТ, когда порог уже истёк, — НОЛЬ у всех шести: реапер молчал не
+# потому, что не видел полосу, а потому, что условие ему велело молчать. Три сироты из шести не
+# запускались на ПК НИ РАЗУ (162, 193, 305), три запускались и остались in_progress после смерти
+# исполнителя (61, 284, 291) — обе группы этот порог ловит, вторую — по PID ребёнка.
+# 300с = 5 витков поллинга (POLL_SEC=60): щедрый запас от гонки claim→старт прогона, и в 18 раз
+# быстрее прежнего. Ручка есть, потому что запас зависит от POLL_SEC.
+PC_ORPHAN_STALE = int(os.getenv("PC_ORPHAN_STALE", "300") or "300")   # 5 мин: ДОКАЗАННАЯ сирота → failed
 # Вотчдог ЗАСТРЯВШЕЙ МЕЖДУ ШАГАМИ локальной цепи (инцидент 15.07, цепь 365: 3/7 c 23:06). Штатный
 # тик релизит следующий шаг СОБЫТИЙНО (в момент done предыдущего). Если это событие ПОТЕРЯНО (спавн
 # упал / ПК уснул посреди consult-думателя / Bridge проглотил enqueue), цепь висит: последний шаг
@@ -925,28 +943,76 @@ def _task_started_read(path=None):
         return {}
 
 
-def _task_started_mark(tid, now=None, path=None):
-    """Отметить момент CLAIM задачи на диске. → ISO отметки. ПЕРВАЯ отметка не перезаписывается:
-    у одобренной задачи работа шла в ПЕРВОМ прогоне, а approve только вернул её в очередь."""
-    st = _task_started_read(path)
-    key = str(tid)
-    if key in st:
-        return st[key]
-    st[key] = (now or datetime.datetime.now(datetime.timezone.utc)).isoformat()
-    if len(st) > TASK_START_KEEP:        # кап: отметки давно закрытых задач никому не нужны
-        for k in sorted(st, key=lambda x: str(st[x]))[:len(st) - TASK_START_KEEP]:
-            st.pop(k, None)
+def _started_at_raw(val):
+    """ISO-строка старта из значения реестра. Значение бывает ДВУХ видов, и оба живые:
+    старое — голая строка ISO; новое — словарь с полями `at` (ISO), `pid` (демон, сделавший
+    отметку) и `child` (PID headless-claude этой задачи). Читатели окна работы про новые поля
+    знать не обязаны — им нужен только момент."""
+    if isinstance(val, dict):
+        return str(val.get("at") or "")
+    return str(val or "")
+
+
+def _task_started_write(st, tid, path=None):
+    """Записать реестр отметок на диск. Отметка — удобство, а не условие работы демона."""
     try:
         with open(path or TASK_START_FILE, "w", encoding="utf-8") as f:
             json.dump(st, f, ensure_ascii=False)
-    except Exception as e:               # отметка — удобство, а не условие работы демона
+        return True
+    except Exception as e:
         log.warning("отметка старта задачи %s не записана (%s) — окно работы будет неизвестно", tid, e)
-    return st[key]
+        return False
+
+
+def _task_started_mark(tid, now=None, path=None):
+    """Отметить момент CLAIM задачи на диске. → ISO отметки. ПЕРВАЯ отметка не перезаписывается:
+    у одобренной задачи работа шла в ПЕРВОМ прогоне, а approve только вернул её в очередь.
+
+    Вместе с моментом пишем PID ЭТОГО процесса демона. Он нужен реаперу: демон одноворкерный и
+    синхронный, поэтому «отметку сделал я, а исполняю сейчас не эту задачу» = у задачи нет живого
+    ребёнка. Без PID тот же вывод пришлось бы изображать молчанием."""
+    st = _task_started_read(path)
+    key = str(tid)
+    if key in st:
+        return _started_at_raw(st[key])
+    st[key] = {"at": (now or datetime.datetime.now(datetime.timezone.utc)).isoformat(),
+               "pid": os.getpid()}
+    if len(st) > TASK_START_KEEP:        # кап: отметки давно закрытых задач никому не нужны
+        for k in sorted(st, key=lambda x: _started_at_raw(st[x]))[:len(st) - TASK_START_KEEP]:
+            st.pop(k, None)
+    _task_started_write(st, tid, path)
+    return _started_at_raw(st[key])
+
+
+def _task_started_rec(tid, path=None):
+    """Отметка задачи как СЛОВАРЬ | None (отметки нет). Старую голую строку поднимаем до словаря
+    БЕЗ `pid`/`child` — «когда стартовала, знаю; кто исполнял, не знаю» это разные незнания."""
+    val = _task_started_read(path).get(str(tid))
+    if val is None:
+        return None
+    return dict(val) if isinstance(val, dict) else {"at": str(val)}
+
+
+def _task_started_child(tid, child_pid, path=None):
+    """Записать PID порождённого headless-claude в отметку задачи. Зовётся ИЗ `run_claude` сразу
+    после спавна: это единственное место, где PID ребёнка вообще известен, и единственный факт,
+    по которому ЧУЖОЙ (уже другой) процесс демона может отличить «ребёнок ещё работает» от
+    «ребёнка нет». Перезапись сознательна: у второй попытки headless свой ребёнок."""
+    if not tid or not child_pid:
+        return
+    st = _task_started_read(path)
+    key = str(tid)
+    rec = st.get(key)
+    rec = dict(rec) if isinstance(rec, dict) else {"at": _started_at_raw(rec)}
+    rec["child"] = int(child_pid)
+    rec.setdefault("pid", os.getpid())
+    st[key] = rec
+    _task_started_write(st, tid, path)
 
 
 def _task_started_get(tid, path=None):
     """datetime старта задачи | None. None = окно неизвестно, и итог так и скажет (не соврёт)."""
-    raw = _task_started_read(path).get(str(tid))
+    raw = _started_at_raw(_task_started_read(path).get(str(tid)))
     if not raw:
         return None
     try:
@@ -1353,6 +1419,11 @@ def _wait_awake(proc, timeout, slice_sec=None, wall=None, awake=None):
         return out, err, spent + min(d_wall, d_awake), slept + d_wall - min(d_wall, d_awake)
 
 
+_RUNNING_TID = None      # tid, который демон исполняет ПРЯМО СЕЙЧАС (None — не исполняет ничего).
+# Ставит и снимает `run_task`. Демон одноворкерный и синхронный: витка, в котором эта переменная
+# была бы неправдой, не существует — `poll_once` не может идти параллельно с прогоном.
+
+
 def run_claude(prompt, timeout, cwd, env, popen=None, waiter=None):
     """Запуск headless claude -p. Возврат (returncode, stdout, stderr). Таймаут → TimeoutError.
     Инъектируется в тестах (реальный claude не дёргаем). Путь резолвится версионно-независимо.
@@ -1383,6 +1454,17 @@ def run_claude(prompt, timeout, cwd, env, popen=None, waiter=None):
                                         creationflags=NO_WINDOW)
     except subprocess.TimeoutExpired:
         raise TimeoutError("claude -p timeout")
+    # PID РЕБЁНКА — НА ДИСК, СРАЗУ ПОСЛЕ СПАВНА. Это единственный момент, когда он известен, и
+    # единственная улика, по которой СЛЕДУЮЩИЙ процесс демона (после падения/self-update) отличит
+    # «headless ещё работает, задача живая» от «исполнителя нет, задача — сирота». Без неё
+    # осиротевшую задачу можно судить только по молчанию, то есть ждать 90 минут. Приписываем её
+    # текущей задаче (`_RUNNING_TID`), а не аргументом: сигнатуру `run_claude` подменяют два
+    # десятка тестовых фикстур, и лишний параметр сломал бы их все, ничего не проверив.
+    try:
+        _task_started_child(_RUNNING_TID, getattr(p, "pid", None))
+    except Exception as e:                  # запись PID — улика, а не условие прогона
+        log.warning("PID ребёнка задачи %s не записан (%s) — сирота будет судиться по молчанию",
+                    _RUNNING_TID, e)
     try:
         out, err, spent, slept = (waiter or _wait_awake)(p, timeout)
     except TimeoutError:
@@ -1889,11 +1971,17 @@ def run_task(tid, text, note="", approved=(), approved_object=""):
     """Обёртка-наблюдаемость над _run_task_impl: та же сигнатура/возврат, но по завершении пишет
     ОДНУ структурную строку METRICS в лог демона (модель/усилие/тайминги/исход/попытки/самопочинки/
     канал). tokens_in/out=na — ПК-исполнитель в ТЕКСТ-режиме (claude -p без --output-format json
-    токены не отдаёт). Замер в try/except — его сбой НИКОГДА не меняет исход задачи."""
-    global _last_work_at
+    токены не отдаёт). Замер в try/except — его сбой НИКОГДА не меняет исход задачи.
+
+    ЗДЕСЬ ЖЕ — ЕДИНСТВЕННАЯ ТОЧКА ПРАВДЫ «что демон исполняет ПРЯМО СЕЙЧАС» (`_RUNNING_TID`).
+    Её читают двое: `run_claude` (кому приписать PID порождённого ребёнка) и реапер сирот (чтобы
+    НИКОГДА не срубить задачу, которую сам же и ведёт). Сбрасываем в finally — провал задачи
+    исполнением быть перестал, и оставленный tid означал бы «вечно живой исполнитель»."""
+    global _last_work_at, _RUNNING_TID
     _mctx = {"attempts": 0}   # 0 = ни одной headless-попытки (ранний выход: claude не найден / бюджет)
     _t0 = time.monotonic()
     _start = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    _RUNNING_TID = tid
     try:
         status, result = _run_task_impl(tid, text, note, _mctx, approved, approved_object)
     finally:
@@ -1901,6 +1989,7 @@ def run_task(tid, text, note="", approved=(), approved_object=""):
         # и растянувшийся виток без неё — разные состояния, и раньше их не различал никто. Ставим
         # в finally: провал задачи работой быть не перестал.
         _last_work_at = time.time()
+        _RUNNING_TID = None
     try:
         eff, _ = repo_thinking_settings()
         log.info(task_metrics.metrics_line(
@@ -3195,6 +3284,53 @@ def answer_card(tid, yes, reply="", who=None, origin=None, bridge=None, env=None
 
 # ---------------- ПК-side таймаут ОДИНОЧЕК pc (развязка 328-pc, этап 2) --------------------------
 
+# ЖИВОЙ ИСПОЛНИТЕЛЬ — ЭТО ПРОЦЕСС, А НЕ ТИШИНА. Три причины, по которым отсутствие исполнителя
+# ДОКАЗАНО; формулировки уходят владельцу в итог задачи, поэтому каждая называет факт, а не вывод.
+NO_EXEC_NEVER_RAN = "прогон на этом ПК не начинался ни разу (отметки старта нет)"
+NO_EXEC_NOT_MINE = "её вёл ЭТОТ процесс демона и уже не ведёт — дочернего claude нет"
+NO_EXEC_CHILD_DEAD = "дочерний процесс claude (PID {pid}) мёртв"
+
+
+def _executor_verdict(tid, path=None, pid_alive=None):
+    """Есть ли у задачи tid ЖИВОЙ исполнитель? → (True | False | None, причина словами).
+
+    True  — есть (или прямо сейчас её ведём мы сами);
+    False — ДОКАЗАНО нет: это сирота, ждать нечего и незачем;
+    None  — НЕ ЗНАЮ, и это отдельный ответ: судить такую задачу будет прежний, медленный порог
+            молчания. «Не знаю» не смеет выдавать себя за «нет» — цена ошибки здесь ассиметрична:
+            лишнее ожидание стоит времени, ложный реап стоит работы.
+
+    Улики, в порядке силы:
+      1. `_RUNNING_TID` — эту задачу демон исполняет ПРЯМО СЕЙЧАС. Самый прямой факт из всех.
+      2. Реестр отметок пуст/нечитаем — отличить «не запускалась» от «реестр потерян» нечем,
+         поэтому пусто = НЕ ЗНАЮ. Иначе один сбой диска обнулил бы разом всю полосу.
+      3. Отметки задачи нет, а реестр есть → её не запускали на этом ПК ни разу. Ровно так
+         рождается сирота claim'а: мутация легла на мосту, расписка потерялась, прогон не начался.
+      4. В отметке есть PID ребёнка → судим ПО НЕМУ. Переиспользование PID Windows'ом может
+         показать чужой процесс живым — это уводит в «жив», то есть в осторожную сторону.
+      5. Отметку делал ЭТОТ процесс, а исполняем сейчас не её (п.1 не сработал) → ребёнка нет:
+         демон одноворкерный и синхронный, его дети живут внутри `run_task` и только там.
+      6. Отметку делал ДРУГОЙ процесс демона, PID ребёнка в ней не записан → НЕ ЗНАЮ: тот демон
+         мог умереть, а его headless — остаться и работать (класс осиротевшего claude.exe)."""
+    if _RUNNING_TID is not None and str(tid) == str(_RUNNING_TID):
+        return True, "исполняем прямо сейчас (эта задача — текущая)"
+    st = _task_started_read(path)
+    if not st:
+        return None, "реестр отметок старта пуст или недоступен"
+    rec = st.get(str(tid))
+    if rec is None:
+        return False, NO_EXEC_NEVER_RAN
+    rec = rec if isinstance(rec, dict) else {"at": str(rec)}
+    child = rec.get("child")
+    if child:
+        if (pid_alive or _lock_pid_alive)(child):
+            return True, f"дочерний процесс claude (PID {child}) жив"
+        return False, NO_EXEC_CHILD_DEAD.format(pid=child)
+    if rec.get("pid") == os.getpid():
+        return False, NO_EXEC_NOT_MINE
+    return None, f"отметку делал другой процесс демона (PID {rec.get('pid') or '?'}), PID ребёнка в ней нет"
+
+
 def process_stuck_singles(now=None):
     """ПК-side ливнесс одиночек lane=pc: задача, застрявшая в in_progress дольше PC_SINGLE_STALE
     (ПК был выключен / процесс умер посреди прогона / гонка self-update), → честный failed с видимой
@@ -3205,7 +3341,17 @@ def process_stuck_singles(now=None):
     идиома `or 0` как в process_approval_timeouts). ИСКЛЮЧЕНИЕ (класс-фикс 354): урок в состоянии
     low-ожидания (_lesson_wait_ids) НЕ орфан — он ЗАКОННО ждёт ответа учителя in_progress; его предел —
     24ч → карточка 1160 (process_lesson_waits), а НЕ 90-мин ливнесс одиночек. Настоящие зависания
-    (не в ожидании) реапер добивает как прежде — регресс цел."""
+    (не в ожидании) реапер добивает как прежде — регресс цел.
+
+    ДВА ПОРОГА, И ВЫБИРАЕТ ИХ ФАКТ (05.08.2026, задача 305). Возраст `updated` — это МОЛЧАНИЕ, а
+    молчит и живой прогон, поэтому мерка молчания обязана быть длинной (90 мин). Но когда
+    `_executor_verdict` ДОКАЗАЛ, что живого исполнителя нет, ждать больше нечего: такая задача
+    снимается по короткому PC_ORPHAN_STALE. «Не знаю» и «есть» судятся прежней длинной меркой —
+    ни одна живая задача от этой правки под нож не попадает, потому что у живой задачи исполнитель
+    ЕСТЬ и вердикт это видит.
+
+    Почему это не косметика: за 7 суток 6 сирот провисели 10,0 ч, и 90% этого времени — сам порог,
+    а не отказы моста (у всех шести отказов чтения полосы после истечения порога — НОЛЬ)."""
     if _stopped():
         return
     if _link.lost():
@@ -3226,8 +3372,23 @@ def process_stuck_singles(now=None):
         tid = task.get("id")
         if tid in waiting:
             continue                      # урок законно ждёт ответа учителя (in_progress); предел — 24ч, не реапер
+        if _RUNNING_TID is not None and str(tid) == str(_RUNNING_TID):
+            # ЭТУ задачу демон ведёт ПРЯМО СЕЙЧАС — её судьбу решает прогон (и его TASK_TIMEOUT),
+            # а не реапер, и никакой возраст этого не меняет. Возраст тут врёт по устройству:
+            # бюджет прогона тратится только на бодрствование (`_wait_awake`), а `updated` растёт
+            # по стенным часам — проспавший ПК делает живую задачу «старой» ни за что. Витка, где
+            # эта ветка сработала бы, сегодня нет (демон одноворкерный и синхронный) — это замок
+            # на будущее, и стои́т он раньше всех порогов сознательно.
+            continue
         age = _age_sec(task.get("updated"), now=now) or 0
-        if age <= PC_SINGLE_STALE:
+        if age <= min(PC_ORPHAN_STALE, PC_SINGLE_STALE):
+            continue                      # моложе самого короткого порога — судить не о чем
+        # ПРИЗНАК СИРОТСТВА — ОТСУТСТВИЕ ИСПОЛНИТЕЛЯ, А НЕ МОЛЧАНИЕ (класс 05.08.2026, задача 305).
+        # Вердикт спрашиваем ПОСЛЕ отсечки выше: он может стоить обращения к списку процессов, и
+        # платить им за каждую живую задачу на каждом витке незачем.
+        alive, why = _executor_verdict(tid)
+        limit = PC_ORPHAN_STALE if alive is False else PC_SINGLE_STALE
+        if age <= limit:
             continue
         # ВОЗРАСТ НЕ РАСТЁТ, ПОКА СВЯЗИ НЕТ — та же дисциплина, что «бюджет тратится только на
         # бодрствование» (`_wait_awake`, класс 01.08). 04.08 полоса молчала 75 м 16 с; без этой
@@ -3235,22 +3396,33 @@ def process_stuck_singles(now=None):
         # в окне закрывается как провал. Окна обрыва живут в памяти процесса: рестарт демона даёт
         # blind=0, то есть ровно прежнее поведение (fail-open).
         blind = int(_link.outage_seconds(now_ts - age, now_ts, now=now_ts))
-        if age - blind <= PC_SINGLE_STALE:
+        if age - blind <= limit:
             log.warning("stuck-single: id=%s провисела %sс, но %sс из них СВЯЗИ НЕ БЫЛО → не сужу "
                         "(возраст без обрыва %sс ≤ %sс)", tid, int(age), blind,
-                        int(age) - blind, PC_SINGLE_STALE)
+                        int(age) - blind, limit)
             continue
         # since: отметка claim, а если её нет (задача клеймлена до появления реестра) — по возрасту
         started = _task_started_get(tid) or (now - datetime.timedelta(seconds=age))
-        msg = fail_result(FAIL_HEARTBEAT_TIMEOUT,
-                          f"ПК-таймаут одиночки: задача провисела in_progress {int(age)}с "
-                          f"(> {PC_SINGLE_STALE}с) без движения — ПК был выключен, либо прогон "
-                          "застрял/оборвался посреди исполнения", since=started, now=now)
+        if alive is False:
+            detail = (f"СИРОТА: живого исполнителя нет — {why}. Задача провисела in_progress "
+                      f"{int(age)}с (порог сироты {PC_ORPHAN_STALE}с). Снята ПО ФАКТУ отсутствия "
+                      f"процесса, а не по молчанию: ждать {PC_SINGLE_STALE}с было нечего и некого")
+        else:
+            detail = (f"ПК-таймаут одиночки: задача провисела in_progress {int(age)}с "
+                      f"(> {PC_SINGLE_STALE}с) без движения — ПК был выключен, либо прогон "
+                      "застрял/оборвался посреди исполнения")
+        msg = fail_result(FAIL_HEARTBEAT_TIMEOUT, detail, since=started, now=now)
         bc.complete_task(tid, "failed", msg)
-        log.warning("stuck-single: id=%s in_progress %sс > %sс → failed (ПК-ливнесс одиночки)",
-                    tid, int(age), PC_SINGLE_STALE)
-        _cowork(f"задача #{tid} (одиночка) → failed по ПК-таймауту ({int(age)}с) · {_clip(msg)}")
-        _notify_task("failed", tid, "ПК-таймаут одиночки (застряла in_progress)")
+        if alive is False:
+            log.warning("stuck-single: id=%s СИРОТА (%s) in_progress %sс > %sс → failed "
+                        "(исполнителя нет — ждать нечего)", tid, why, int(age), PC_ORPHAN_STALE)
+            _cowork(f"задача #{tid} (сирота, исполнителя нет) → failed через {int(age)}с · {_clip(msg)}")
+            _notify_task("failed", tid, f"сирота: живого исполнителя нет ({why})")
+        else:
+            log.warning("stuck-single: id=%s in_progress %sс > %sс → failed (ПК-ливнесс одиночки; "
+                        "исполнитель: %s)", tid, int(age), PC_SINGLE_STALE, why)
+            _cowork(f"задача #{tid} (одиночка) → failed по ПК-таймауту ({int(age)}с) · {_clip(msg)}")
+            _notify_task("failed", tid, "ПК-таймаут одиночки (застряла in_progress)")
 
 
 def poll_once():
