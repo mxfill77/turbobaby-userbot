@@ -207,6 +207,13 @@ async def _suggest_ipc_poller(client):
     except Exception as e:
         log.warning(f"{_now()} | SUGGEST: IPC init: {e}")
     while True:
+        # Связи нет (идёт переподключение, см. serve_forever) — сеть не дёргаем и лог не льём:
+        # отправка всё равно упала бы ConnectionError'ом, а очередь дождётся подъёма. Внутренний
+        # авто-реконнект Telethon сюда НЕ попадает (там _user_connected остаётся True), так что
+        # короткие просадки обрабатываются как раньше — запрос уйдёт после восстановления.
+        if not client.is_connected():
+            await asyncio.sleep(3)
+            continue
         try:
             await suggest.poll_and_send(client)
         except Exception as e:
@@ -454,14 +461,160 @@ async def on_trainer_group(event):
     await _trainer_client_turn(event, body)
 
 
+# ═══════════════ УСТОЙЧИВОСТЬ СОЕДИНЕНИЯ (класс 05.08.2026) ═══════════════════════════════
+# Разрыв внешней сети ПК НЕ ИМЕЕТ ПРАВА ронять процесс. Замер суток 04–05.08: ПЯТЬ смертей
+# userbot, все — один и тот же НЕОБРАБОТАННЫЙ ConnectionError Telethon (`mtprotosender.py:266`
+# после connection_retries), вход — `client.start()` ниже. Ошибки прикладного кода среди них нет
+# ни одной: WinError 121/1236/1231 — коды ЛОКАЛЬНОГО сетевого стека Windows, причина внешняя
+# (переезд ПК между Wi-Fi «Samgold 7» ↔ «Bless_house_2.4GHz», DNS ложился целиком). Один простой
+# длился 370 минут. Разбор: docs/artifacts/2026-08-05-userbot-crashes-and-mute-session-5348.md
+#
+# Форма — ШТАТНАЯ для Telethon, без самодеятельности: ОДИН клиент на процесс и повторный
+# `client.start()` НА ТОМ ЖЕ ОБЪЕКТЕ. Так можно по устройству библиотеки: session-файл после
+# disconnect переоткрывается лениво (`SQLiteSession._cursor`), `connect()` заново поднимает
+# send/recv/update/keepalive-циклы и свежий `_disconnected`-future, а `run_until_disconnected()`
+# заново шлёт GetState (то есть снова просит апдейты). Внутренний авто-реконнект Telethon
+# (`connection_retries=5`, ~30с) остаётся ПЕРВОЙ ступенью и здесь не трогается — этот цикл
+# включается ровно там, где сдался он.
+RECONNECT_DELAY_MIN = 5          # первая пауза после разрыва, с
+RECONNECT_DELAY_MAX = 300        # потолок паузы, с — сеть лежит часами, долбить её незачем
+RECONNECT_ALARM_SEC = 900        # раз в столько секунд простоя — ERROR в лог: тихого цикла нет
+
+# Сетевой класс отказа. ConnectionError, ConnectionAbortedError, ConnectionResetError,
+# TimeoutError и socket.gaierror — ВСЕ потомки OSError, живые коды инцидента приходят ими же.
+# Всё ОСТАЛЬНОЕ (баг кода, отозванная сессия, RPCError) сюда НЕ попадает и роняет процесс как
+# раньше: вечный цикл, глотающий настоящий дефект, хуже падения — контур-вотчдог остаётся
+# вторым слоем ровно для этого. asyncio.CancelledError/KeyboardInterrupt — BaseException,
+# в этот кортеж не входят и остановку не глушат.
+_NET_ERRORS = (OSError, asyncio.TimeoutError)
+
+_startup_done = False       # разовый пост-стартовый блок отработал
+_moderation_hooked = False  # хендлер модерации повешен: второй = ДВОЙНАЯ обработка модерации
+_ipc_poller = None          # задача-исполнитель решений модербота: вторая = ДВОЙНАЯ отправка
+
+
+async def _startup_once(client):
+    """Пост-стартовый блок — РОВНО ОДИН РАЗ за жизнь процесса (вход, реестр, SUGGEST, поллер).
+
+    Зовётся после КАЖДОГО удачного входа, поэтому обязан быть идемпотентным. Два его шага
+    опасны повтором и закрыты СВОИМИ замками: второй `on_moderation` — двойная обработка
+    модерации, второй IPC-поллер — ДВОЙНАЯ ОТПРАВКА клиенту. Общий флаг снимается в самом
+    конце: сорвавшийся на сети блок обязан повториться целиком."""
+    global _ME_ID, _startup_done, _moderation_hooked, _ipc_poller
+    if _startup_done:
+        return
+    me = await client.get_me()
+    _ME_ID = me.id
+    log.info(
+        f"{_now()} | вошёл как @{me.username} (id={me.id}). "
+        f"Слушаю входящие ЛИЧНЫЕ сообщения."
+    )
+    # Premium статус (для голосовой расшифровки в задаче-2) — читаем БЕЗ второго
+    # клиента, из уже поднятого me. Появится в логе после рестарта.
+    log.info(f"{_now()} | Premium аккаунта: {getattr(me, 'premium', None)} "
+             f"(нужно для транскрипции голосовых reply).")
+    # STAFF-РЕЗОЛВ (инцидент 22.07 @extthiwxer=Earth: стейл-username в реестре → фильтр мимо):
+    # карточки ФАКТИЧЕСКИХ профилей внутренних аккаунтов (реестр по id) в лог — владелец
+    # сверяет глазами «Earth = @… id …». Read-only (get_entity), fail-safe.
+    for uid in sorted(suggest.TEAM_REGISTRY.get("user_ids") or []):
+        try:
+            ent = await client.get_entity(uid)
+            uname = f"@{ent.username}" if getattr(ent, "username", None) else "(без username)"
+            name = " ".join(filter(None, [getattr(ent, "first_name", None),
+                                          getattr(ent, "last_name", None)])) or "?"
+            log.info(f"{_now()} | STAFF-РЕЗОЛВ: id={uid} {uname} «{name}» — внутренний контур, "
+                     f"сообщения НЕ обрабатываются (ноль реакций).")
+        except Exception as e:
+            log.warning(f"{_now()} | STAFF-РЕЗОЛВ: id={uid} не разрезолвился: {e}")
+    if suggest.is_enabled():
+        # Резолвим группу модерации (по ID из env или по имени) и вешаем 2-й хендлер.
+        gid = await suggest.resolve_mod_group(client)
+        if gid is not None and not _moderation_hooked:
+            client.add_event_handler(on_moderation, events.NewMessage(chats=gid))
+            _moderation_hooked = True
+            # САМОЛЕЧЕНИЕ протечки 22.07: mod_chat в IPC-meta (куда модербот постит карточки)
+            # оказался отравлен id группы ТРЕНАЖЁРА → боевые карточки уехали в «Тренеровку».
+            # userbot знает НАСТОЯЩИЙ id «Модерации ответов» (резолв по имени) — если meta
+            # пуста или указывает на тренажёр, чиним на резолвленный gid.
+            try:
+                import moderation_ipc
+                v = moderation_ipc.get_meta("mod_chat")
+                cur = int(v) if v and v.lstrip("-").isdigit() else None
+                if cur is None or trainer.is_trainer_chat(cur):
+                    moderation_ipc.set_meta("mod_chat", str(int(gid)))
+                    log.warning(f"{_now()} | mod_chat вылечен: {cur} → {gid} "
+                                f"(боевые карточки снова в «Модерацию ответов»).")
+            except Exception as e:
+                log.warning(f"{_now()} | самолечение mod_chat: {e}")
+        # Исполнитель решений бота-модератора (bot-режим) — только при наличии токена.
+        if suggest.MODERBOT_TOKEN and _ipc_poller is None:
+            _ipc_poller = asyncio.create_task(_suggest_ipc_poller(client))
+        log.info(
+            f"{_now()} | SUGGEST ВКЛЮЧЁН "
+            f"(TEST_MODE={suggest.SUGGEST_TEST_MODE}, mod_group={gid}, "
+            f"bot-режим={'да' if suggest.MODERBOT_TOKEN else 'нет (reply-режим)'}, "
+            f"лимиты {suggest.RATE_PER_HOUR}/ч {suggest.RATE_PER_DAY}/д)."
+        )
+    else:
+        log.info(f"{_now()} | SUGGEST выключен — чистый Stage C, исходящих ноль.")
+    _startup_done = True
+
+
+async def serve_forever(client, sleep=None, clock=None):
+    """Жизнь процесса: вход → слушаем → ОБРЫВ НЕ РОНЯЕТ, ждём и входим снова. Возврат из функции
+    означает ШТАТНУЮ остановку (`run_until_disconnected` вернулся сам: disconnect/Ctrl+C).
+
+    Экземпляр остаётся ОДИН по построению: клиент сюда передан готовым и не пересоздаётся, лок
+    взят вызывающим на всю жизнь процесса, разовая инициализация закрыта своими замками.
+    `sleep`/`clock` — инъекция для тестов (по умолчанию `asyncio.sleep`/`time.monotonic`)."""
+    sleep = asyncio.sleep if sleep is None else sleep
+    clock = time.monotonic if clock is None else clock
+    delay = RECONNECT_DELAY_MIN
+    down_since = None            # None ⇔ связь есть; иначе момент, когда её потеряли
+    alarm_at = None              # когда последний раз кричали в лог о затяжном простое
+    tries = 0
+    while True:
+        try:
+            # start() поднимет существующую сессию turbobaby_session — код подтверждения не спросит.
+            await client.start()
+            await _startup_once(client)
+            if down_since is not None:
+                log.info(f"{_now()} | СВЯЗЬ С TELEGRAM ВОССТАНОВЛЕНА: простой "
+                         f"{int(clock() - down_since)}с, попыток {tries}. Экземпляр тот же "
+                         f"(PID {os.getpid()}), сессия одна, вход не задваивался.")
+                down_since, alarm_at, tries, delay = None, None, 0, RECONNECT_DELAY_MIN
+            # Процесс ЖИВЁТ постоянно — это и есть отличие от разведчиков.
+            await client.run_until_disconnected()
+            return
+        except _NET_ERRORS as e:
+            now = clock()
+            tries += 1
+            if down_since is None:
+                down_since, alarm_at = now, now
+                log.warning(f"{_now()} | СВЯЗЬ С TELEGRAM ПОТЕРЯНА ({type(e).__name__}: {e}) — "
+                            f"процесс ЖИВ, переподключаюсь через {delay}с.")
+            elif now - alarm_at >= RECONNECT_ALARM_SEC:
+                alarm_at = now
+                log.error(f"{_now()} | СВЯЗИ С TELEGRAM НЕТ УЖЕ {int(now - down_since)}с, "
+                          f"попыток {tries}, последняя ошибка {type(e).__name__}: {e}. Продолжаю "
+                          f"раз в {delay}с — смотри сеть ПК (Wi-Fi/DNS), бот сейчас НЕ СЛЫШИТ.")
+            else:
+                log.warning(f"{_now()} | переподключение не удалось ({type(e).__name__}: {e}); "
+                            f"простой {int(now - down_since)}с, попытка {tries + 1} через {delay}с.")
+            await sleep(delay)
+            delay = min(delay * 2, RECONNECT_DELAY_MAX)
+
+
 async def main():
     # Singleton-гард ДО подключения: если живой экземпляр уже есть — выходим,
-    # чтобы не было двух клиентов на одной session.
+    # чтобы не было двух клиентов на одной session. Лок держим ВСЮ жизнь процесса,
+    # включая простои сети: переподключение не имеет права поднять второй экземпляр.
     if not acquire_lock():
         return
 
     # Клиент создаём внутри main (под asyncio.run) — как в fetch_client_chats.py,
-    # чтобы Telethon корректно привязался к event loop.
+    # чтобы Telethon корректно привязался к event loop. РОВНО ОДИН на процесс: переподключение
+    # идёт на этом же объекте (см. serve_forever), иначе была бы вторая сессия.
     client = TelegramClient(SESSION, API_ID, API_HASH)
     client.add_event_handler(on_incoming, events.NewMessage(incoming=True))
     # ГРУППА-ТРЕНАЖЁР: отдельный хендлер только на ГРУППОВЫЕ входящие (func=is_group), чтобы
@@ -469,7 +622,7 @@ async def main():
     client.add_event_handler(
         on_trainer_group, events.NewMessage(incoming=True, func=lambda e: e.is_group))
     # Второй хендлер (модерация) вешаем ПОСЛЕ старта — когда известен id группы
-    # (может резолвиться по имени через iter_dialogs). См. блок после get_me ниже.
+    # (может резолвиться по имени через iter_dialogs). См. _startup_once.
 
     # ГРУППА-ТРЕНАЖЁР хранит сессионное состояние в moderation_ipc.meta (общий канал с модерботом).
     # init_db идемпотентна — гарантируем таблицу meta даже без bot-режима. Не критично для ЛС-пути.
@@ -481,64 +634,7 @@ async def main():
 
     log.info(f"{_now()} | --- userbot_listen ЗАПУСК (ЭТАП C: слушаю, НЕ отвечаю) ---")
     try:
-        # start() поднимет существующую сессию turbobaby_session — код подтверждения не спросит.
-        await client.start()
-        me = await client.get_me()
-        global _ME_ID
-        _ME_ID = me.id
-        log.info(
-            f"{_now()} | вошёл как @{me.username} (id={me.id}). "
-            f"Слушаю входящие ЛИЧНЫЕ сообщения."
-        )
-        # Premium статус (для голосовой расшифровки в задаче-2) — читаем БЕЗ второго
-        # клиента, из уже поднятого me. Появится в логе после рестарта.
-        log.info(f"{_now()} | Premium аккаунта: {getattr(me, 'premium', None)} "
-                 f"(нужно для транскрипции голосовых reply).")
-        # STAFF-РЕЗОЛВ (инцидент 22.07 @extthiwxer=Earth: стейл-username в реестре → фильтр мимо):
-        # карточки ФАКТИЧЕСКИХ профилей внутренних аккаунтов (реестр по id) в лог — владелец
-        # сверяет глазами «Earth = @… id …». Read-only (get_entity), fail-safe.
-        for uid in sorted(suggest.TEAM_REGISTRY.get("user_ids") or []):
-            try:
-                ent = await client.get_entity(uid)
-                uname = f"@{ent.username}" if getattr(ent, "username", None) else "(без username)"
-                name = " ".join(filter(None, [getattr(ent, "first_name", None),
-                                              getattr(ent, "last_name", None)])) or "?"
-                log.info(f"{_now()} | STAFF-РЕЗОЛВ: id={uid} {uname} «{name}» — внутренний контур, "
-                         f"сообщения НЕ обрабатываются (ноль реакций).")
-            except Exception as e:
-                log.warning(f"{_now()} | STAFF-РЕЗОЛВ: id={uid} не разрезолвился: {e}")
-        if suggest.is_enabled():
-            # Резолвим группу модерации (по ID из env или по имени) и вешаем 2-й хендлер.
-            gid = await suggest.resolve_mod_group(client)
-            if gid is not None:
-                client.add_event_handler(on_moderation, events.NewMessage(chats=gid))
-                # САМОЛЕЧЕНИЕ протечки 22.07: mod_chat в IPC-meta (куда модербот постит карточки)
-                # оказался отравлен id группы ТРЕНАЖЁРА → боевые карточки уехали в «Тренеровку».
-                # userbot знает НАСТОЯЩИЙ id «Модерации ответов» (резолв по имени) — если meta
-                # пуста или указывает на тренажёр, чиним на резолвленный gid.
-                try:
-                    import moderation_ipc
-                    v = moderation_ipc.get_meta("mod_chat")
-                    cur = int(v) if v and v.lstrip("-").isdigit() else None
-                    if cur is None or trainer.is_trainer_chat(cur):
-                        moderation_ipc.set_meta("mod_chat", str(int(gid)))
-                        log.warning(f"{_now()} | mod_chat вылечен: {cur} → {gid} "
-                                    f"(боевые карточки снова в «Модерацию ответов»).")
-                except Exception as e:
-                    log.warning(f"{_now()} | самолечение mod_chat: {e}")
-            # Исполнитель решений бота-модератора (bot-режим) — только при наличии токена.
-            if suggest.MODERBOT_TOKEN:
-                asyncio.create_task(_suggest_ipc_poller(client))
-            log.info(
-                f"{_now()} | SUGGEST ВКЛЮЧЁН "
-                f"(TEST_MODE={suggest.SUGGEST_TEST_MODE}, mod_group={gid}, "
-                f"bot-режим={'да' if suggest.MODERBOT_TOKEN else 'нет (reply-режим)'}, "
-                f"лимиты {suggest.RATE_PER_HOUR}/ч {suggest.RATE_PER_DAY}/д)."
-            )
-        else:
-            log.info(f"{_now()} | SUGGEST выключен — чистый Stage C, исходящих ноль.")
-        # Процесс ЖИВЁТ постоянно — это и есть отличие от разведчиков.
-        await client.run_until_disconnected()
+        await serve_forever(client)
     finally:
         await client.disconnect()
         release_lock()  # снимаем lock при любом выходе
