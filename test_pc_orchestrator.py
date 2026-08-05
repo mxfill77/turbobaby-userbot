@@ -4567,9 +4567,12 @@ class TestLocalDecChain(Base):
 
     def test_selfheal_gate_mirrors_chain_halt_prefixes(self):
         # Гейт шага цепи знал ТРИ префикса, гейт одиночки — только ⏱ (зеркальная дыра, класс №9
-        # свода). Теперь набор один на оба: «нет» человека / ⏱-таймаут / ✋-снова-красное.
+        # свода). Теперь набор один на оба: «нет» человека / ⏱-таймаут / ✋-снова-красное /
+        # 📡-внешний обрыв связи (05.08.2026: сеть переформулировкой задачи не чинится, а 04.08
+        # думатель самопочинки сам упал в тот же обрыв — «timed out after 180 seconds»).
         o._selfheal_on = lambda: True
-        self.assertEqual(o.NO_HEAL_PREFIXES, (o._REJECT_PREFIX, o.TIMEOUT_MARK, o.MANUAL_MARK))
+        self.assertEqual(o.NO_HEAL_PREFIXES,
+                         (o._REJECT_PREFIX, o.TIMEOUT_MARK, o.MANUAL_MARK, o.NET_MARK))
         boom = mock.Mock(side_effect=AssertionError("одиночная самопочинка не должна зваться"))
         with mock.patch.object(o, "_maybe_task_selfheal", boom):
             for pref in o.NO_HEAL_PREFIXES:

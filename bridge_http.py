@@ -262,6 +262,69 @@ def _doget_refusal(data):
     return _DOGET_FINGERPRINT in str(data.get("message") or "").lower()
 
 
+# ── ОТКАЗ НАЗЫВАЕТСЯ ПО СУЩЕСТВУ, А НЕ ИМЕНЕМ КЛАССА (класс 05.08.2026) ──────────────────────
+# ЗАМЕР по живому `pc_orchestrator.log` (5211 строк, 22.07→05.08, разбор
+# docs/artifacts/2026-08-05-three-states-one-root.md): слово «сеть» — 0 совпадений, голых имён
+# исключений в строках отказа моста — 89. Обрыв 04.08 18:02–19:18 UTC записан как
+# `get_pending(new) ошибка: URLError` — ИМЕНЕМ КЛАССА, из которого штаб дважды построил ложный
+# диагноз «я сломался» вместо «связи нет».
+#
+# ГЛАВНОЕ РАЗЛИЧЕНИЕ ЗДЕСЬ — НЕ красота текста, а один вопрос: ДОШЛИ ЛИ МЫ ДО МОСТА ВООБЩЕ.
+#   • `HTTPError` — мост/фронт ОТВЕТИЛ кодом. Связь ЖИВА, отказ по существу (401 и 500 — разные
+#     новости, и код больше не теряется);
+#   • `BridgeTransportError`/`BridgeReceiptLost` — ответ пришёл (редирект/тело), обмен не
+#     завершён. Связь ЖИВА. Это НЕ теория: таких в логе 354 за 02–05.08 при полностью живой
+#     сети (включая сегодняшние), и считать их обрывом значило бы 354 ложных «связи нет»;
+#   • `URLError`/`TimeoutError`/`ConnectionError`/прочий `OSError` — до моста не дошли ВОВСЕ.
+#     Ровно эти имена стоят в 37 отказах внутри окна обрыва 04.08.
+KIND_NETWORK = "network"   # связи нет: запрос не доехал до моста
+KIND_HTTP = "http"         # мост ответил кодом — связь есть
+KIND_BRIDGE = "bridge"     # ответ пришёл, обмен не завершён — связь есть
+KIND_OTHER = "other"       # не опознали. Имя «unknown» СОЗНАТЕЛЬНО не берём: у ПК уже есть класс
+                           # ложных диагнозов вокруг `unknown`/`unknown_tool` гарда — не пересекаем
+
+
+def error_kind(exc):
+    """Класс отказа моста ОДНИМ словом (см. блок выше). → KIND_*.
+
+    Порядок проверок — не стиль: `HTTPError` наследует `URLError`, `URLError` — `OSError`,
+    `TimeoutError` — тоже `OSError`. Частное обязано проверяться раньше общего, иначе живой
+    отказ «мост ответил 401» уехал бы в «связи нет»."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return KIND_HTTP
+    if isinstance(exc, BridgeTransportError):        # и наследник BridgeReceiptLost
+        return KIND_BRIDGE
+    if isinstance(exc, (urllib.error.URLError, TimeoutError, socket.timeout,
+                        ConnectionError, OSError)):
+        return KIND_NETWORK
+    return KIND_OTHER
+
+
+def _reason_text(exc):
+    """Причина отказа словами: у `URLError` она лежит в `.reason` (там и сидит `gaierror
+    [Errno 11001] getaddrinfo failed`), у остальных — сам текст исключения."""
+    r = getattr(exc, "reason", None)
+    return (str(r) if r is not None else str(exc)) or type(exc).__name__
+
+
+def explain(exc, timeout=None):
+    """Отказ моста ОДНОЙ строкой по существу: что произошло, дошли ли до моста, что это значит.
+
+    АДРЕСОВ НЕ ПЕЧАТАЕМ (то же правило, что у `_leg_error`): текст уходит в лог, в спул и в
+    журнал, а полный `/exec` несёт id деплоя. Плечо называем словом."""
+    kind, name = error_kind(exc), type(exc).__name__
+    if kind == KIND_HTTP:
+        return ("мост ОТВЕТИЛ HTTP %s (%s) — связь есть, отказ по существу"
+                % (getattr(exc, "code", "?"), str(getattr(exc, "reason", "") or name)[:120]))
+    if kind == KIND_BRIDGE:
+        return "мост ответил, но обмен не завершён (%s): %s — связь есть" % (name, str(exc)[:300])
+    if kind == KIND_NETWORK:
+        lim = "" if timeout is None else ", предел ожидания %sс" % int(timeout)
+        return ("СВЯЗИ НЕТ: до моста не дошли — %s [%s%s]"
+                % (_reason_text(exc)[:200], name, lim))
+    return "отказ не опознан (%s): %s" % (name, str(exc)[:300])
+
+
 def request_json(url, method, params=None, payload=None, timeout=DEFAULT_TIMEOUT,
                  opener=None, sleeper=None):
     """Вызов моста → разобранный JSON. Транспортный сбой — ИСКЛЮЧЕНИЕ (контракт прежних

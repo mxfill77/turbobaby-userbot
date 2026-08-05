@@ -186,6 +186,10 @@ TIMEOUT_MARK = "⏱"       # маркер таймаут/сирота-диагн
 MANUAL_MARK = "✋"        # маркер «headless доказанно не может» (снова красное ПОСЛЕ approve) —
                          # зеркало ручной карты VPS «✋ ТРЕБУЕТСЯ РУЧНОЕ ДЕЙСТВИЕ»: думатель НЕ чинит
                          # (переформулировка родила бы петлю ре-аппрувов), цепь = halt
+NET_MARK = "📡"          # маркер «задачу убил ВНЕШНИЙ ОБРЫВ СВЯЗИ» (класс 05.08.2026). Отдельный
+                         # от ⏱ сознательно: ⏱ читается как «ждали и не дождались», а тут владелец
+                         # обязан с первого символа видеть, что исполнитель НИ ПРИ ЧЁМ. Думатель
+                         # такое не чинит (NO_HEAL_PREFIXES): переформулировка не вернёт сеть
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")   # ФОЛБЭК: явный путь из .env (может протухнуть при автообновлении)
 # Скрытый запуск ВСЕХ служебных консольных подпроцессов (git/powershell/schtasks/tasklist/
 # unittest/claude/дочерние python): без этого флага каждый console-ребёнок демона создавал
@@ -364,6 +368,161 @@ ORIGIN_HUMAN = "human"      # за пультом человек: замок с�
 ORIGIN_AGENT = "agent"      # отвечает автономный процесс: нужен билет + рубильник владельца
 
 
+# ─── «СВЯЗИ НЕТ» — ИЗМЕРЯЕМОЕ СОСТОЯНИЕ, А НЕ ДОГАДКА (класс 05.08.2026) ─────────────────────
+# ПОСЫЛКА (замер, docs/artifacts/2026-08-05-three-states-one-root.md): пробы достижимости в репо
+# не было вовсе, а слово «сеть» в логе демона за 14 суток — 0 раз при 89 голых именах исключений.
+# Поэтому обрыв 04.08 (75 м 16 с) система назвала тремя НЕВЕРНЫМИ именами сразу: «ошибка
+# исполнения» задаче, «пробуждение ПК» витку (18 раз), «умер 3 раза подряд» клиентскому боту.
+#
+# ЧЕМ МЕРИМ — БЕСПЛАТНО, БЕЗ ЕДИНОГО НОВОГО ЗАПРОСА. Свидетели — вызовы, которые контур и так
+# делает каждый цикл: мост (`get_pending`), GitHub (авто-фетч), API модели (её собственный текст
+# в выводе headless). Прямая проба DNS (27,1 мс замерено) НЕ заводится: она не нужна, пока есть
+# бесплатные свидетели, и стоит на два порядка дороже всего остального.
+#
+# ПРАВИЛО ВЕРДИКТА. Подтверждение связи ОДНИМ каналом гасит отказы ВСЕХ (мы доказанно в сети —
+# значит лежит конкретный сервис, а не связь). «Связи нет» объявляем только когда молчат ДВА
+# независимых канала: один молчащий канал — это «связь не подтверждена», и врать про сеть по
+# нему нельзя. Ровно так 04.08 совпали мост + GitHub + API, и ровно так 354 отказа
+# `BridgeTransportError` при живой сети не дают ни одного ложного обрыва (их класс — «мост
+# ответил», см. bridge_http.error_kind).
+LINK_OK = "связь есть"
+LINK_LOST = "связи нет"
+LINK_UNSURE = "связь не подтверждена"
+LINK_CH_BRIDGE = "мост"
+LINK_CH_GIT = "github"
+LINK_CH_API = "api модели"
+LINK_MIN_FAILS = 2       # столько сетевых отказов подряд, чтобы одиночный канал вообще высказался
+LINK_STALE_SEC = int(os.getenv("PC_LINK_STALE_SEC", "3600") or "3600")   # старше — не свидетельство
+LINK_OUTAGE_KEEP = 50    # кап истории окон обрыва (нужны только свежие, для возраста задач)
+LINK_JOURNAL_SEC = 300   # окно короче — только лог: журнал это индекс, а не поток мелочей
+
+
+class LinkWatch:
+    """Свидетели внешней связи и вердикт по ним. Чистая машина состояний: ни сети, ни ввода-вывода,
+    ни логов — событие возвращается вызывающему, а говорит с владельцем он (`net_witness`).
+
+    `ok` у свидетельства ТРОИЧЕН, и это главное в контракте:
+        True  — связь ПОДТВЕРЖДЕНА (ответ получен: хоть ok, хоть HTTP 500, хоть потерянная расписка);
+        False — до адресата НЕ ДОШЛИ (сетевой класс отказа);
+        None  — свидетельства нет (отказ не опознан). «Не измерил» не смеет выдавать себя ни за
+                «связь есть», ни за «связи нет» — это тот же разворот, что `pids is None` у
+                вотчдога (#171) и `_in_status` у моста.
+    ПАМЯТЬ — ТОЛЬКО В ПРОЦЕССЕ: рестарт демона окна обрыва теряет, и поведение откатывается к
+    прежнему (возраст задачи не уменьшается, вердикт «связь есть»). Осознанный fail-open: state-файл
+    ради этого заводить дороже, чем стоит сама поправка."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.fails = {}          # канал → {"since": ts, "last": ts, "n": int, "text": str}
+        self.ok_at = {}          # канал → ts последнего подтверждения связи
+        self.down_since = None   # начало ОТКРЫТОГО окна «связи нет» | None
+        self.outages = []        # закрытые окна [(начало, конец)] — по ним считается возраст задач
+
+    def witness(self, channel, ok, detail="", now=None):
+        """Свидетельство канала. → событие для владельца: 'lost' | 'back' | None."""
+        now = time.time() if now is None else now
+        if ok is None:
+            return self._settle(now)                 # не опознали — состояние не трогаем вовсе
+        if ok:
+            self.ok_at[channel] = now
+            self.fails.clear()                       # связь доказана — молчание прочих объяснено сервисом
+        else:
+            for ch, rec in list(self.fails.items()):  # протухшее свидетельство не копим
+                if now - rec["last"] > LINK_STALE_SEC:
+                    self.fails.pop(ch, None)
+            rec = self.fails.get(channel) or {"since": now, "n": 0, "text": ""}
+            rec["n"] += 1
+            rec["last"] = now
+            rec["text"] = str(detail or "")[:300]
+            self.fails[channel] = rec
+        return self._settle(now)
+
+    def verdict(self, now=None):
+        """→ (имя, [каналы], since|None). Имя — ИЗМЕРЕННОЕ состояние, а не предположение."""
+        now = time.time() if now is None else now
+        fresh = {c: r for c, r in self.fails.items() if now - r["last"] <= LINK_STALE_SEC}
+        if len(fresh) >= 2:
+            return (LINK_LOST, sorted(fresh), min(r["since"] for r in fresh.values()))
+        if len(fresh) == 1:
+            ch, rec = next(iter(fresh.items()))
+            if rec["n"] >= LINK_MIN_FAILS:
+                return (LINK_UNSURE, [ch], rec["since"])
+        return (LINK_OK, [], None)
+
+    def lost(self, now=None):
+        return self.verdict(now)[0] == LINK_LOST
+
+    def _settle(self, now):
+        lost = self.lost(now)
+        if lost and self.down_since is None:
+            self.down_since = self.verdict(now)[2] or now
+            return "lost"
+        if not lost and self.down_since is not None:
+            self.outages = (self.outages + [(self.down_since, now)])[-LINK_OUTAGE_KEEP:]
+            self.down_since = None
+            return "back"
+        return None
+
+    def outage_seconds(self, since_ts, until_ts, now=None):
+        """Сколько секунд окна [since_ts, until_ts] пришлось на ПОДТВЕРЖДЁННОЕ «связи нет».
+        Отсюда берётся возраст задачи, не растущий, пока полоса непроверяема, — та же дисциплина,
+        что «бюджет тратится только на бодрствование» (`_wait_awake`)."""
+        now = time.time() if now is None else now
+        wins = list(self.outages) + ([(self.down_since, now)] if self.down_since is not None else [])
+        return sum(max(0.0, min(until_ts, b) - max(since_ts, a)) for a, b in wins)
+
+
+_link = LinkWatch()
+
+
+def link_ok_by_kind(kind):
+    """Класс отказа (`bridge_http.KIND_*`) → троичное свидетельство о СВЯЗИ.
+    Ответ моста любым кодом/телом доказывает связь; «не опознали» не доказывает НИЧЕГО."""
+    if kind == bridge_http.KIND_NETWORK:
+        return False
+    if kind in (bridge_http.KIND_HTTP, bridge_http.KIND_BRIDGE):
+        return True
+    return None
+
+
+def net_witness(channel, ok, detail="", now=None, watch=None, journal=None, logger=None):
+    """Свидетельство канала + ОДНА строка владельцу на смене состояния (не на каждом отказе).
+    → событие ('lost'|'back'|None). Всё внешнее инъектируется — голдены гоняются без сети."""
+    w = _link if watch is None else watch
+    lg = log if logger is None else logger
+    ev = w.witness(channel, ok, detail=detail, now=now)
+    if ev == "lost":
+        _, chans, since = w.verdict(now)
+        lg.error("СВЯЗИ НЕТ: молчат каналы %s (последнее: %s). Пока связь не подтверждена, ни одна "
+                 "задача не объявляется зависшей и ни один провал — виной исполнителя",
+                 ", ".join(chans), str(detail or "")[:200])
+    elif ev == "back":
+        a, b = w.outages[-1]
+        dur = int(b - a)
+        lg.warning("СВЯЗЬ ВЕРНУЛАСЬ: связи не было %s (%sс) — окно закрыто, полоса снова проверяема",
+                   fmt_sleep(dur), dur)
+        if dur >= LINK_JOURNAL_SEC:
+            # ЖУРНАЛ (§2.3 разбора): разрыв в мозге сегодня неотличим от «ничего не происходило» —
+            # за 02–05.08 таких разрывов 24, и авария среди них ничем не выделялась. Одна строка
+            # на возврат связи делает молчание НАЗВАННЫМ. Порог 300 с — чтобы мелкие блипы
+            # не превращали индекс в поток.
+            (journal or _cowork)("связи не было %s (окно закрыто) — задачи и процессы в этом окне "
+                                 "не судились: непроверяемое не объявляется мёртвым" % fmt_sleep(dur))
+    return ev
+
+
+def link_note(prefix=""):
+    """Состояние связи ОДНОЙ строкой для диагноза («связи нет 12 м 30 с, каналы: мост, github»).
+    Пустая строка, когда связь подтверждена: молчать о норме дешевле, чем шуметь."""
+    name, chans, since = _link.verdict()
+    if name == LINK_OK:
+        return ""
+    age = fmt_sleep(time.time() - since) if since else "?"
+    return "%s%s %s (каналы: %s)" % (prefix, name, age, ", ".join(chans) or "—")
+
+
 # ------------------------------- Bridge (очередь) ----------------------------
 
 class Bridge:
@@ -380,27 +539,42 @@ class Bridge:
     _CLAIM_SEMANTIC = ("not_found", "wrong_lane", "no_id")
     _COMPLETE_SEMANTIC = ("not_found", "no_id", "bad_status")
 
-    def __init__(self, url=None, token=None, timeout=90, opener=None):
+    def __init__(self, url=None, token=None, timeout=90, opener=None, witness=None):
         self.url = url or BRIDGE_URL
         self.token = token or BRIDGE_TOKEN
         self.timeout = timeout
         self.opener = opener
+        self.witness = witness          # точка инъекции свидетеля связи (боевой путь его не задаёт)
+
+    def _call(self, method, params=None, payload=None):
+        """Один обмен с мостом + ДВА бесплатных числа вокруг уже делаемого вызова: класс отказа
+        и потраченные миллисекунды (латентность моста не мерилась вообще — «ответил за 2,3 с» и
+        «залип на 122,6 с» были для системы одним событием).
+
+        КОНТРАКТ ОТВЕТА СОХРАНЁН ДОСЛОВНО: `error` — по-прежнему `type(e).__name__`, на него
+        смотрят семантические наборы (`_CLAIM_SEMANTIC`) и голдены. Поля ДОБАВЛЕНЫ, а не заменены:
+        `error_kind` (сеть/http/мост/иное), `error_text` (разбор по существу), `ms`."""
+        t0 = time.perf_counter()
+        wit = self.witness or net_witness
+        try:
+            data = bridge_http.request_json(self.url, method, params=params, payload=payload,
+                                            timeout=self.timeout, opener=self.opener)
+        except Exception as e:
+            kind = bridge_http.error_kind(e)
+            text = bridge_http.explain(e, self.timeout)
+            wit(LINK_CH_BRIDGE, link_ok_by_kind(kind), detail=text)
+            return {"ok": False, "error": type(e).__name__, "error_kind": kind,
+                    "error_text": text, "ms": int((time.perf_counter() - t0) * 1000)}
+        # Мост ОТВЕТИЛ — связь доказана даже если ответ отрицательный по существу (`ok:false`).
+        wit(LINK_CH_BRIDGE, True)
+        return data
 
     def _get(self, action, **params):
         q = {"action": action, "token": self.token, **{k: v for k, v in params.items() if v is not None}}
-        try:
-            return bridge_http.request_json(self.url, "GET", params=q, timeout=self.timeout,
-                                            opener=self.opener)
-        except Exception as e:
-            return {"ok": False, "error": type(e).__name__}
+        return self._call("GET", params=q)
 
     def _post(self, action, **fields):
-        body = {"action": action, "token": self.token, **fields}
-        try:
-            return bridge_http.request_json(self.url, "POST", payload=body, timeout=self.timeout,
-                                            opener=self.opener)
-        except Exception as e:
-            return {"ok": False, "error": type(e).__name__}
+        return self._call("POST", payload={"action": action, "token": self.token, **fields})
 
     def get_pending(self, status, lane=LANE):
         return self._get("get_pending", status=status, lane=lane)
@@ -678,6 +852,13 @@ FAIL_RUN_TIMEOUT = "run_timeout"               # headless не уложился 
 FAIL_MODEL_REFUSAL = "model_refusal"           # модель/гард снова объявили красное после одобрения
 FAIL_EXEC_ERROR = "exec_error"                 # сбой исполнения: код возврата, пустой вывод, бюджет
 FAIL_UNBACKED_RED = "unbacked_red"             # исполнитель ЗАЯВИЛ красное, а гард карточки не выписывал
+# ВНЕШНИЙ ОБРЫВ СВЯЗИ — НЕ «я сломался» (класс 05.08.2026, разбор
+# docs/artifacts/2026-08-05-three-states-one-root.md). 04.08 сеть ПК лежала 75 м 16 с, и задача
+# 284 получила `причина=exec_error`, «ошибка выполнения: claude exit=1» — то есть собственную
+# поломку. Дословный вывод ребёнка при этом называл причину сам: «API Error: Unable to connect
+# to API (ConnectionRefused)». Отдельный код нужен ровно затем, чтобы штаб читал не «исполнитель
+# сломался», а «связи не было», и не строил на этом следующий шаг.
+FAIL_NETWORK_OUTAGE = "network_outage"         # задачу убил внешний обрыв связи (измерено, не догадка)
 
 FAIL_REASONS = {                               # код → (человеческое имя, маркер ПЕРВЫМ символом)
     FAIL_APPROVAL_TIMEOUT: ("таймаут подтверждения", TIMEOUT_MARK),
@@ -689,6 +870,9 @@ FAIL_REASONS = {                               # код → (человечес�
     # операции он не видел, и подтверждать нечего — переформулировка думателем только сожгла бы
     # круг. Разбирает человек (NO_HEAL_PREFIXES держит самопочинку и надзор цепи).
     FAIL_UNBACKED_RED: ("заявка на красное без карточки гарда", MANUAL_MARK),
+    # 📡 намеренно: чинить нечего и НЕЧЕМ — сеть не лечится переформулировкой задачи. Работа,
+    # которую задача успела сделать до обрыва, остаётся видна тем же перечнем улик ниже.
+    FAIL_NETWORK_OUTAGE: ("связи нет", NET_MARK),
 }
 # Формулировка НАМЕРЕННО про ОКНО, а не про авторство. Живая проверка на окне задачи 61 показала:
 # в её 90 минут попали 8 коммитов, из которых её собственный — один (a3f75dd), остальные сделали
@@ -1470,6 +1654,59 @@ def _approved_scope(item):
         return frozenset(), ""
 
 
+# ── ПРОВАЛ ОТ ОБРЫВА СВЯЗИ ОТЛИЧАЕТСЯ ОТ ПРОВАЛА ИСПОЛНИТЕЛЯ (класс 05.08.2026) ───────────────
+# ФИКСТУРЫ ЖИВЫЕ, а не идеализированные (правило-класс «мок обязан копировать живой формат»).
+# Дословно из окна обрыва 04.08 18:02–19:18 UTC, пять независимых свидетелей:
+#   API модели : «API Error: Unable to connect to API (ConnectionRefused)»   ← этим убило 284
+#   GitHub     : «fatal: unable to access '…': Failed to connect to github.com port 443 after
+#                 21115 ms: Could not connect to server»
+#   Telegram   : «NetworkError: httpx.ConnectError: [Errno 11001] getaddrinfo failed»
+#   мост       : URLError / TimeoutError (37 отказов)
+# Ищем ТОЛЬКО В ХВОСТАХ вывода (последние ~500 символов, те же `_tail`, что идут в диагноз):
+# фатальная строка CLI печатается последней, а совпадение в СЕРЕДИНЕ чужого вывода (задача про
+# сетевой код, лог теста) назвало бы сетью настоящую ошибку — ровно та ложь, только с другого
+# конца. Регистр не важен: живые формы приходят и «ConnectionRefused», и «ECONNREFUSED».
+_RE_NET_TEXT = re.compile(
+    r"(?:unable to connect to api"
+    r"|could not resolve host"
+    r"|failed to connect to \S+ port \d+"
+    r"|could not connect to server"
+    r"|getaddrinfo (?:failed|enotfound)"
+    r"|temporary failure in name resolution"
+    r"|network is unreachable"
+    r"|connection\s*(?:refused|reset|timed out)"
+    r"|connectionrefused|econnrefused|econnreset|enotfound|etimedout|eai_again"
+    r"|proxy connect|socket hang up|fetch failed)", re.I)
+
+
+def _fail_is_network(out_s, err_tail, watch=None, witness=None):
+    """Провал ребёнка объясняется ВНЕШНИМ ОБРЫВОМ СВЯЗИ? → разбор по существу (str) | '' .
+
+    ДВА независимых свидетеля, и каждого ДОСТАТОЧНО:
+      1) ребёнок сказал о связи САМ (его хвост несёт живой сетевой отпечаток) — прямее не бывает:
+         это свидетельство ровно об ЭТОЙ задаче, а не о полосе вообще;
+      2) полоса измерена молчащей (`LinkWatch` ≥2 каналов) — тогда неважно, чем именно ребёнок
+         оправдывался: он работал внутри окна, в котором связи не было.
+    Отпечаток ребёнка СНАЧАЛА кладём свидетельством (канал «api модели»), и только ПОТОМ читаем
+    вердикт полосы: иначе мост+api не сложились бы в те самые два канала."""
+    w = _link if watch is None else watch
+    wit = net_witness if witness is None else witness
+    parts = []
+    hit = _RE_NET_TEXT.search(_tail(out_s) + "\n" + _tail(err_tail))
+    if hit:
+        wit(LINK_CH_API, False, detail="исполнитель: «%s»" % hit.group(0), watch=w)
+        parts.append("исполнитель сказал о связи сам: «%s»" % hit.group(0))
+    name, chans, since = w.verdict()
+    if name == LINK_LOST:
+        parts.append("полоса измерена молчащей: %s %s (каналы: %s)"
+                     % (name, fmt_sleep(time.time() - since) if since else "?", ", ".join(chans)))
+    if not parts:
+        return ""
+    return ("ВНЕШНИЙ ОБРЫВ СВЯЗИ, а не ошибка исполнителя — " + "; ".join(parts)
+            + ". Работа, успевшая лечь в окне задачи, перечислена ниже как есть; повторять "
+              "задачу имеет смысл, когда связь вернётся")
+
+
 def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=""):
     """Исполнить задачу через headless claude -p. → (status, result). status ∈ done|failed|needs_approval.
     Контракт результата (фикс ложного done задачи #24): done ТОЛЬКО при непустом stdout со строкой
@@ -1569,10 +1806,30 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
                                 "pc_orchestrator): claude-процесс задачи штатно погашен в окне "
                                 "управляемого self-update-рестарта — работа к этому моменту сделана "
                                 "(RESULT в логе, коммит в git). Это НЕ сбой.")[:RESULT_MAX]
+            net = _fail_is_network(out_s, err_tail)
+            if net:
+                # ИМЯ ПО ИЗМЕРЕННОЙ ПРИЧИНЕ. 04.08 ровно здесь родилось «я сломался»: внешний
+                # обрыв ушёл в очередь как `exec_error`, и штаб дважды строил на нём следующий шаг.
+                log.warning("id=%s провал ОТ ОБРЫВА СВЯЗИ (claude exit=%s) — не вина исполнителя: %s",
+                            tid, rc, net)
+                return "failed", fail_result(FAIL_NETWORK_OUTAGE,
+                                             f"claude exit={rc}. " + net + ". Дословно: "
+                                             + _clip(out_s or err_tail or "нет вывода", 400),
+                                             since=_task_started_get(tid))
             return "failed", fail_result(FAIL_EXEC_ERROR,
                                          f"claude exit={rc}: " + (out_s or err_tail or "нет вывода"),
                                          since=_task_started_get(tid))
         if not out_s:
+            # Обрыв связи НЕ ЖЖЁТ вторую попытку: авто-повтор заведён под транзиент пустого
+            # stdout, а в молчащей сети он гарантированно повторит тот же провал вторым прогоном.
+            net = _fail_is_network("", err_tail)
+            if net:
+                log.warning("id=%s пустой stdout при ОБРЫВЕ СВЯЗИ (попытка %s/2) — повтор не "
+                            "тратим: %s", tid, attempt, net)
+                return "failed", fail_result(FAIL_NETWORK_OUTAGE,
+                                             "пустой вывод claude. " + net + ". stderr: "
+                                             + (err_tail or "(пуст)"),
+                                             since=_task_started_get(tid))
             if attempt == 1:   # один авто-повтор: пустой stdout бывает транзиентом
                 log.warning("id=%s пустой stdout (rc=0) — авто-повтор; stderr: %s",
                             tid, err_tail or "(пуст)")
@@ -1614,10 +1871,17 @@ def run_task(tid, text, note="", approved=(), approved_object=""):
     ОДНУ структурную строку METRICS в лог демона (модель/усилие/тайминги/исход/попытки/самопочинки/
     канал). tokens_in/out=na — ПК-исполнитель в ТЕКСТ-режиме (claude -p без --output-format json
     токены не отдаёт). Замер в try/except — его сбой НИКОГДА не меняет исход задачи."""
+    global _last_work_at
     _mctx = {"attempts": 0}   # 0 = ни одной headless-попытки (ранний выход: claude не найден / бюджет)
     _t0 = time.monotonic()
     _start = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-    status, result = _run_task_impl(tid, text, note, _mctx, approved, approved_object)
+    try:
+        status, result = _run_task_impl(tid, text, note, _mctx, approved, approved_object)
+    finally:
+        # ОТМЕТКА «в этом отрезке виток РАБОТАЛ» (см. diagnose_gap): растянувшийся виток с работой
+        # и растянувшийся виток без неё — разные состояния, и раньше их не различал никто. Ставим
+        # в finally: провал задачи работой быть не перестал.
+        _last_work_at = time.time()
     try:
         eff, _ = repo_thinking_settings()
         log.info(task_metrics.metrics_line(
@@ -1642,6 +1906,12 @@ def _human(kind, tid, text):
     if kind == "done":
         return f"✅ Оркестратор: задача #{tid} выполнена — {first}"
     if kind == "failed":
+        # «провалена» ложь и тогда, когда задачу убил ВНЕШНИЙ ОБРЫВ СВЯЗИ: заголовок карточки —
+        # первое, что видит владелец, и читать он должен причину, а не вину (класс 05.08).
+        m = FAIL_CODE_RE.search(str(text or ""))
+        if m and m.group(1) == FAIL_NETWORK_OUTAGE:
+            return (f"{NET_MARK} Оркестратор: задача #{tid} — СВЯЗИ НЕ БЫЛО (внешний обрыв, "
+                    f"исполнитель ни при чём) — {first}")
         # «провалена» ложь, когда работа В ОКНЕ ЗАДАЧИ была: заголовок обязан различать
         # незакрытую-но-сделанную и по-настоящему несделанную (класс 30.07, задачи 54/61).
         if WORK_DONE_MARK in str(text or ""):
@@ -2404,7 +2674,11 @@ def process_new():
         return
     r = bc.get_pending("new")
     if not r.get("ok"):
-        log.warning("get_pending(new) ошибка: %s", r.get("error"))
+        # ИМЯ КЛАССА + РАЗБОР ПО СУЩЕСТВУ. Прежде здесь оставалось голое `URLError` — одна из 89
+        # таких строк, из которых «связи нет» не читалось никак (слово «сеть» в логе за 14 суток
+        # — 0 раз). Имя оставляем на месте: по нему уже грепают артефакты.
+        log.warning("get_pending(new) ошибка: %s — %s", r.get("error"),
+                    r.get("error_text") or "разбор недоступен")
         return
     items = [it for it in r.get("items", []) if _lane_ok(it)]
     if not items:
@@ -2915,11 +3189,19 @@ def process_stuck_singles(now=None):
     (не в ожидании) реапер добивает как прежде — регресс цел."""
     if _stopped():
         return
+    if _link.lost():
+        # ПОЛОСА НЕПРОВЕРЯЕМА — и это ГОВОРИТСЯ, а не изображается тишиной. Прежде реапер просто
+        # выходил на отказе моста, и «связи нет» было неотличимо от «всё в порядке».
+        log.warning("реапер одиночек НЕ СУДИТ: %s. Непроверяемое не объявляется зависшим",
+                    link_note())
+        return
     r = bc.get_pending("in_progress")
     if not r.get("ok"):
-        log.warning("get_pending(in_progress) ошибка: %s", r.get("error"))
+        log.warning("get_pending(in_progress) ошибка: %s — %s (реапер молчит: не прочитал полосу — "
+                    "не сужу задачи)", r.get("error"), r.get("error_text") or "разбор недоступен")
         return
     now = now or datetime.datetime.now(datetime.timezone.utc)
+    now_ts = now.timestamp()
     waiting = _lesson_wait_ids()          # законно-ждущие low-уроки (родитель 334): НЕ орфаны — не реапим
     for task in [it for it in r.get("items", []) if _lane_ok(it)]:
         tid = task.get("id")
@@ -2927,6 +3209,17 @@ def process_stuck_singles(now=None):
             continue                      # урок законно ждёт ответа учителя (in_progress); предел — 24ч, не реапер
         age = _age_sec(task.get("updated"), now=now) or 0
         if age <= PC_SINGLE_STALE:
+            continue
+        # ВОЗРАСТ НЕ РАСТЁТ, ПОКА СВЯЗИ НЕТ — та же дисциплина, что «бюджет тратится только на
+        # бодрствование» (`_wait_awake`, класс 01.08). 04.08 полоса молчала 75 м 16 с; без этой
+        # поправки задача, простоявшая аварию, объявляется зависшей за чужой простой, а её работа
+        # в окне закрывается как провал. Окна обрыва живут в памяти процесса: рестарт демона даёт
+        # blind=0, то есть ровно прежнее поведение (fail-open).
+        blind = int(_link.outage_seconds(now_ts - age, now_ts, now=now_ts))
+        if age - blind <= PC_SINGLE_STALE:
+            log.warning("stuck-single: id=%s провисела %sс, но %sс из них СВЯЗИ НЕ БЫЛО → не сужу "
+                        "(возраст без обрыва %sс ≤ %sс)", tid, int(age), blind,
+                        int(age) - blind, PC_SINGLE_STALE)
             continue
         # since: отметка claim, а если её нет (задача клеймлена до появления реестра) — по возрасту
         started = _task_started_get(tid) or (now - datetime.timedelta(seconds=age))
@@ -3480,7 +3773,10 @@ _REJECT_PREFIX = "отклонено Филиппом"     # префикс resu
 # человек сказал НЕТ; ⏱ — таймаут/орфан (переформулировка не ускорит зависший claude); ✋ — после
 # «да» headless СНОВА упёрся в красное, доказано, что автоматом не берётся. Общий знаменатель:
 # самопочинка НЕ переформулирует то, что упало на РЕШЕНИИ ЧЕЛОВЕКА или на КРАСНОМ.
-NO_HEAL_PREFIXES = (_REJECT_PREFIX, TIMEOUT_MARK, MANUAL_MARK)
+# 📡 в наборе с 05.08.2026: обрыв связи думателем не чинится по построению — переформулировка
+# задачи не поднимет сеть, а круг самопочинки сгорит впустую (04.08 он и сгорел: думатель сам
+# упал в тот же обрыв, «timed out after 180 seconds»).
+NO_HEAL_PREFIXES = (_REJECT_PREFIX, TIMEOUT_MARK, MANUAL_MARK, NET_MARK)
 
 
 def _is_chain_artifact(frm, text):
@@ -5136,10 +5432,17 @@ def git_ff_pull_tick(call_fn=None):
     r = call(["fetch", "origin"])
     if not r or r[0] != 0:
         detail = _tail(r[2], 160) if r else "git недоступен"
+        # ВТОРОЙ СВИДЕТЕЛЬ СВЯЗИ — БЕСПЛАТНО, из уже случившегося отказа. Живой формат 04.08:
+        # «fatal: unable to access '…': Failed to connect to github.com port 443 after 21115 ms:
+        # Could not connect to server». Не-сетевой отказ fetch (права, кривой remote) о СВЯЗИ не
+        # свидетельствует ничего → None, состояние не трогаем.
+        net_witness(LINK_CH_GIT, False if _RE_NET_TEXT.search(detail) else None,
+                    detail="git fetch: " + detail)
         if _autofetch_note("fetch_failed",
                            f"авто-фетч: git fetch origin не удался — {detail} (пропуск, повтор позже)"):
             log.warning("авто-фетч: git fetch origin не удался — %s", detail)
         return "fetch не удался"
+    net_witness(LINK_CH_GIT, True)              # дошли до GitHub — связь ПОДТВЕРЖДЕНА (бесплатно)
     # 4. локальный HEAD vs origin/<branch>
     loc = call(["rev-parse", "HEAD"])
     rem = call(["rev-parse", f"origin/{branch}"])
@@ -5335,6 +5638,8 @@ _client_watch_last_run = 0.0  # монотонная метка последне
 _client_grace_until = 0.0     # wall-clock: до этого момента вердикты «мёртв»/рестарты подавлены (ПК проснулся)
 _loop_prev_wall = None        # wall-clock старта прошлой итерации главного цикла (детект скачка = сна)
 _loop_prev_awake = None       # часы БОДРСТВОВАНИЯ того же момента: скачок минус их прирост = сон ЧИСЛОМ
+_last_work_at = 0.0           # wall-clock конца последней РАБОТЫ витка (run_task): растянувшийся
+                              # виток с работой ≠ залипание вызова моста, см. diagnose_gap
 
 
 def _find_pids_by_script(script_name):
@@ -5680,6 +5985,75 @@ def _woke_from_sleep(now, prev, poll=None, margin=None):
     poll = POLL_SEC if poll is None else poll
     margin = WAKE_JUMP_MARGIN if margin is None else margin
     return prev is not None and (now - prev) > (poll + margin)
+
+
+# ── РАСТЯНУВШИЙСЯ ВИТОК НАЗЫВАЕТСЯ ПО ИЗМЕРЕННОЙ ПРИЧИНЕ (класс 05.08.2026) ───────────────────
+# ЗАМЕР ЗА СУТКИ 04→05.08 (docs/artifacts/2026-08-05-three-states-one-root.md §2.1):
+#   строк «детект пробуждения ПК» — 305; из них демон САМ приписал «из них сна 0с» — 303 (99,3 %);
+#   карточек «🛌 ПК СПАЛ» за те же сутки — 0; витков БЕЗ работы в отрезке — 299 (98,0 %);
+#   скачок ≤300 с — 297 (97,4 %); две строки с «сна 1с/2с» — суточная поправка службы времени.
+# То есть число, отличающее сон от сети, демон УЖЕ считал и печатал внутри той же строки — и всё
+# равно судил по скачку. Цена: каждое срабатывание ставило grace вотчдогу, за сутки 71 подавленный
+# тик ≈ 5,9 ч отложенного надзора (24,6 % суток).
+# ПОРОГ СНА 10 с ИЗМЕРЕН, А НЕ НАЗНАЧЕН: 303 строки из 305 несут ровно 0 с, оставшиеся две — 1 с и
+# 2 с (служба времени). 10 с покрывает эту дрожь с запасом и не отнимает имени «сон» ни у одного
+# настоящего засыпания: короче 10 с ПК не спит.
+SLEEP_FLOOR_SEC = int(os.getenv("PC_SLEEP_FLOOR_SEC", "10") or "10")
+GAP_SLEEP = "сон машины"        # МАШИНА СПАЛА — единственное, на что взводится grace и громкая карточка
+GAP_LINK = "связи нет"          # виток стоял на сетевых таймаутах (измерено LinkWatch)
+GAP_WORK = "длинный виток"      # в отрезке шла работа задачи — это норма, а не событие
+GAP_STALL = "залипание вызова моста"   # ни сна, ни связи-нет, ни работы: один вызов висел
+# Скачок ниже этого порога и БЕЗ сна — тишина: 297 строк из 305 за сутки именно такие.
+LOOP_GAP_NOTE_SEC = int(os.getenv("PC_LOOP_GAP_NOTE_SEC", "300") or "300")
+
+
+def diagnose_gap(gap, slept, link_lost=False, worked=False, floor=None, alarm=None):
+    """Растянувшийся виток → (ИМЯ ПРИЧИНЫ, число). Чистая функция, голден.
+
+    Порядок ветвей — это и есть правило «состояние называется по ИЗМЕРЕННОЙ причине»:
+      1) сон ИЗМЕРЕН часами бодрствования и он реален → «сон машины» (число — сам сон);
+      2) сна нет, а полоса измерена молчащей → «связи нет» (число — скачок);
+      3) сна нет и связь есть, но в отрезке шла работа → «длинный виток»;
+      4) ничего из перечисленного → «залипание вызова моста» (верхняя граница одного
+         `request_json` — 6 хопов × 3 попытки эха, до ≈28 мин синхронной блокировки).
+    slept=None — часов бодрствования нет, сон НЕ ИЗМЕРЕН: возвращаем прежнее «сон машины»
+    (fail-open, потерянный сигнал о реальном сне хуже ложного). Исключение — подтверждённое
+    «связи нет» при скачке меньше порога громкой карточки: там измеренное свидетельство есть,
+    и врать про сон, имея его, незачем."""
+    floor = SLEEP_FLOOR_SEC if floor is None else floor
+    alarm = SLEEP_ALARM_SEC if alarm is None else alarm
+    if slept is None:
+        return (GAP_LINK, gap) if (link_lost and gap <= alarm) else (GAP_SLEEP, gap)
+    if slept > floor:
+        return (GAP_SLEEP, slept)
+    if link_lost:
+        return (GAP_LINK, gap)
+    return (GAP_WORK, gap) if worked else (GAP_STALL, gap)
+
+
+def loop_gap_report(gap, slept, link_lost=False, worked=False, logger=None, note_sec=None):
+    """Одна строка о растянувшемся витке — ИМЕНЕМ причины. → (имя, число).
+
+    Молчим там, где сказать нечего: сна не было, связь есть, скачок мелкий — это 297 строк из
+    305 за сутки, ровно тот шум, который владелец просил убрать. Слова «детект пробуждения ПК»
+    остаются ТОЛЬКО за исходом «сон машины»: по ним ищут сон, и находить ими сеть нельзя."""
+    lg = log if logger is None else logger
+    note_sec = LOOP_GAP_NOTE_SEC if note_sec is None else note_sec
+    name, num = diagnose_gap(gap, slept, link_lost=link_lost, worked=worked)
+    measured = "сна %sс" % slept if slept is not None else "замерить нечем"
+    if name == GAP_SLEEP:
+        lg.warning("детект пробуждения ПК: скачок wall-clock %sс (>%s+%s; из них %s) — grace "
+                   "вотчдога %sс", gap, POLL_SEC, WAKE_JUMP_MARGIN, measured, WAKE_GRACE_SEC)
+    elif name == GAP_LINK:
+        # СЛОВА «пробуждение»/«сон» здесь нет НАМЕРЕННО, и это не стилистика: 18 строк окна 04.08
+        # искали именно грепом по нему, и любое его появление снова смешало бы сеть со сном.
+        lg.warning("виток растянулся на %sс: СВЯЗИ НЕТ (%s, машина не спала) — цикл стоял на "
+                   "сетевых таймаутах%s", gap, measured,
+                   (" — " + link_note()) if link_note() else "")
+    elif gap >= note_sec:
+        lg.info("виток растянулся на %sс: %s (%s, связь есть) — событием не считаем",
+                gap, name, measured)
+    return name, num
 
 
 def fmt_sleep(gap):
@@ -6949,25 +7323,30 @@ def _main_loop():
             now = time.time()
             awake_now = awake_monotonic()
             if _woke_from_sleep(now, _loop_prev_wall):
-                # grace вотчдога взводим на ЛЮБОЙ скачок, как раньше: он про медленный CIM после
-                # тяжёлого витка, и лишнее окно тишины безвредно. А вот ГРОМКИЙ сигнал — только
-                # на измеренный сон (ниже), иначе длинная задача снова прочтётся как сон.
-                _client_grace_until = now + WAKE_GRACE_SEC
                 gap = int(now - _loop_prev_wall)
                 slept = (max(0, int(gap - (awake_now - _loop_prev_awake)))
                          if (_loop_prev_awake is not None and awake_clock_available()) else None)
-                log.warning("детект пробуждения ПК: скачок wall-clock %sс (>%s+%s; из них сна %s) "
-                            "— grace вотчдога %sс", gap, POLL_SEC, WAKE_JUMP_MARGIN,
-                            "%sс" % slept if slept is not None else "замерить нечем", WAKE_GRACE_SEC)
+                # ИМЯ — У ИЗМЕРЕННОЙ ПРИЧИНЫ, а не у скачка (прежде скачок называл сном и сеть, и
+                # работу, и залипание моста: 305 строк за сутки, 303 с собственной пометкой «сна 0с»).
+                name, _num = loop_gap_report(gap, slept, link_lost=_link.lost(now),
+                                             worked=(_last_work_at > (_loop_prev_wall or 0)))
+                # GRACE — только там, где вердикты вотчдога и правда ненадёжны: после сна (медленный
+                # CIM на просыпающемся ПК, класс #171) и в молчащей сети (клиентские боты падают от
+                # чужих таймаутов — 04.08 так набрался латч «умер 3 раза подряд»). На работе витка и
+                # залипании моста CIM здоров, а прежнее «взводим на любой скачок» стоило 71
+                # подавленного тика в сутки ≈ 5,9 ч отложенного надзора.
+                if name in (GAP_SLEEP, GAP_LINK):
+                    _client_grace_until = now + WAKE_GRACE_SEC
                 # инцидент 30.07 (сон 8 ч 58 м): существенный сон — не только grace, но и ГРОМКИЙ
                 # след. Строка в журнал + карточка в тему 328 с числом накопившихся задач lane=pc.
                 # Обёрнуто в try: сигнал НИКОГДА не должен ронять тик демона (как _notify_*).
-                try:
-                    if report_long_sleep(gap, slept=slept):
-                        log.warning("ПК спал %sс (>%s) — строка в журнал и сигнал в тему %s отправлены",
-                                    gap if slept is None else slept, SLEEP_ALARM_SEC, SLEEP_ALARM_TOPIC)
-                except Exception as e:
-                    log.warning("сигнал о долгом сне не отправлен: %s", e)
+                if name == GAP_SLEEP:
+                    try:
+                        if report_long_sleep(gap, slept=slept):
+                            log.warning("ПК спал %sс (>%s) — строка в журнал и сигнал в тему %s отправлены",
+                                        gap if slept is None else slept, SLEEP_ALARM_SEC, SLEEP_ALARM_TOPIC)
+                    except Exception as e:
+                        log.warning("сигнал о долгом сне не отправлен: %s", e)
             _loop_prev_wall = now
             _loop_prev_awake = awake_now
             poll_once()
