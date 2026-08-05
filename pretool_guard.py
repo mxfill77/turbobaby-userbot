@@ -1667,6 +1667,40 @@ def _is_temp_zone(path):
     return bool(rel) and rel[0] == "tmp"
 
 
+# СИСТЕМНЫЕ ВРЕМЕННЫЕ КОРНИ POSIX — зеркало правила серверной полосы (`53ce1a9`, `_DEL_TMP_ROOTS`
+# + `_is_tmp_target`). Заводится ОТДЕЛЬНЫМ именем, а не строкой в `_is_temp_zone`, сознательно:
+# `_is_temp_zone` питает ещё `_sanctioned_outside` (запись Write/Edit вне репо) и `is_probe`
+# (изоляция проб), а расширять их эта правка права не имеет — граница задачи.
+#
+# ПОСЫЛКА ПРАВИЛА СВЕРЕНА ЗДЕСЬ, А НЕ ВЗЯТА С ЧУЖОЙ ПОЛОСЫ (правило зеркала, CLAUDE.md). На VPS
+# оно стои́т на факте «`/tmp` — системный временный каталог, в git не едет, живёт до перезагрузки».
+# На ПК тот же факт жив ДВАЖДЫ: команды уходят на сервер по ssh (там `/tmp` — тот самый), а Git
+# Bash отдаёт свой MSYS-`/tmp`. И класс здесь НЕ закрыт ничем другим: `_is_temp_zone` требует
+# `_inside_project`, поэтому любой `/tmp/...` у неё False. Замер: карточка ВЫСШЕГО вида
+# «⛔ ВЫСШАЯ ЦЕНА · НЕОБРАТИМО · да _win.txt» на `/tmp/_win.txt` (05.08.2026 10:25, скриншот
+# владельца) и такая же на `/tmp/autofetch_measure.py` (29.07 16:21) — обе на уборку за собой.
+_POSIX_TMP_ROOTS = ("/tmp/", "/var/tmp/", "/dev/shm/")
+
+
+def _is_posix_tmp_target(p):
+    """True ⇔ КОНКРЕТНЫЙ путь под системным временным каталогом POSIX.
+
+    Красным остаётся ровно то же, что и на сервере, и каждое условие — своё:
+      • МАСКА (`*`/`?`) — сколько файлов уйдёт, не знает и сам вызывающий;
+      • САМ КОРЕНЬ (`/tmp`, `/tmp/`) — под ним лежат черновики не только этой сессии;
+      • `..` в хвосте — `/tmp/../etc/passwd` временным не является.
+    Разбор ЛЕКСИЧЕСКИЙ (как `_is_tmp_target` на VPS): диск не трогаем — путь может жить на
+    ДРУГОЙ машине (сегмент ssh), и `os.path` про неё ничего не знает."""
+    s = (p or "").strip().strip("'\"").strip().replace("\\", "/")
+    if not s or "*" in s or "?" in s:
+        return False
+    for root in _POSIX_TMP_ROOTS:
+        if s.startswith(root):
+            tail = s[len(root):].strip("/")
+            return bool(tail) and ".." not in tail.split("/")
+    return False
+
+
 def _is_memory_store(path):
     """Хранилище памяти агента: `.claude/projects/<репо>/memory/**`. Это СОБСТВЕННЫЕ заметки
     сессии, а не чужой код и не конфиг — правило «только внутри репо» защищает от правок чужого,
@@ -2463,6 +2497,44 @@ _EXISTS_CMDS = {"test-path", "test", "[", "[[", "ls", "dir", "stat",
 # остаётся красным.
 _PRINT_CMDS = {"echo", "printf", "write-output", "write-host", "write-debug", "write-verbose",
                "write-information", "write-warning"}
+# ── СМОТРЕЛКА НАЛИЧИЯ, ЧЕЙ ВЫВОД — ТЕКСТ (правка 05.08.2026) ────────────────────────────────
+# Подмножество `_EXISTS_CMDS`: команды, отдающие в stdout ЛИСТИНГ/строку/булево, а не файловый
+# ОБЪЕКТ. Разница решает судьбу трубы: `ls -l x.session | head` несёт по трубе строку листинга
+# (права, размер, время) — ни одного байта файла в ней нет, а `Get-Item .env | Get-Content`
+# несёт объект файла, и следующее звено ВЫДАЁТ СОДЕРЖИМОЕ. Поэтому объектные командлеты
+# PowerShell (`get-item`, `gi`, `get-childitem`, `gci`, `resolve-path`) сюда НЕ входят, и `dir`
+# тоже: в PowerShell это алиас `Get-ChildItem`, то есть объект, а не текст.
+_EXISTS_TEXT_CMDS = {"ls", "stat", "test", "[", "[[", "test-path"}
+# ЧЕМ ЗАКАНЧИВАЕТСЯ ТРУБА. Одного текстового вывода МАЛО: `ls <секрет> | xargs cat` тоже несёт
+# по трубе листинг — но следующее звено читает названные в нём ФАЙЛЫ и выдаёт содержимое. Эту
+# дыру поймал собственный голден `test_probe_does_not_open_bypasses`, а не рассуждение, поэтому
+# приёмник — БЕЛЫЙ поимённый список фильтров текста: они листинг РЕЖУТ и СЧИТАЮТ, но открыть по
+# нему файл не могут. Всё, чего в списке нет (`xargs`, шелл, интерпретатор, `tee`), — красное.
+_TEXT_SINK_CMDS = {"head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "findstr",
+                   "awk", "gawk", "sed", "sort", "uniq", "cut", "tr", "nl", "column",
+                   "more", "less", "select-string", "sls", "measure-object", "select-object"}
+
+
+def _seg_head(seg):
+    """Имя команды в КОМАНДНОЙ позиции сегмента, либо "" (сбой разбора → "", то есть краснее)."""
+    try:
+        toks = shlex.split(seg or "")
+    except Exception:
+        return ""
+    j = _cmd_index(toks)
+    if j is None or j >= len(toks):
+        return ""
+    return _base(toks[j])
+
+
+def _probe_pipe_stays_text(segs, i):
+    """True ⇔ сегмент `segs[i]` — смотрелка наличия/метаданных с ТЕКСТОВЫМ выводом, И приёмник
+    трубы этот текст только фильтрует. Оба условия обязательны: первое отсекает объектные
+    командлеты PowerShell (`Get-Item <секрет> | Get-Content` вернул бы СОДЕРЖИМОЕ), второе —
+    исполнителей (`ls <секрет> | xargs cat` открыл бы файл по его же листингу)."""
+    if _seg_head(segs[i]) not in _EXISTS_TEXT_CMDS:
+        return False
+    return i + 2 < len(segs) and _seg_head(segs[i + 2]) in _TEXT_SINK_CMDS
 # python-форма того же: проверка наличия/метаданных…
 _RE_PY_EXISTS = re.compile(
     r"(?i)os\.path\.(?:exists|isfile|isdir|islink|lexists|getsize|getmtime)\s*\(|"
@@ -2579,7 +2651,19 @@ def _env_outside_py_code(seg):
     return False
 
 
-def _env_reach(cmd):
+# ── КОМАНДА-НОСИТЕЛЬ: её аргумент — не путь, а ЕЩЁ ОДНА КОМАНДА (правка 05.08.2026) ──────────
+# `ssh host "…"`, `bash -c "…"`, `wsl "…"` несут в одном токене ЦЕЛУЮ команду для другой машины
+# или другого шелла. Для `_env_outside_py_code` такой токен неотличим от пути-операнда, и любое
+# упоминание секрета внутри него краснело по СЛОВУ — ровно тот класс, который `f4c3cff` закрыл
+# для инлайн-кода. Живой факт 05.08.2026 10:27 (задача 302): `ssh … "python3 - <<'PY' … PY"`,
+# считающий окна по датам, дал карточку «хочу обратиться к секретам» с пустым числом.
+# Судим полезную нагрузку ТЕМ ЖЕ разбором на уровень глубже — тогда `ssh … "cat <секрет>"` и
+# `ssh … "python3 reader.py <секрет>"` остаются красными по ДЕЙСТВИЮ, а не по наличию имени.
+_ENV_CARRIER_CMDS = {"ssh"} | _NESTED_SHELLS
+_ENV_REACH_MAX_DEPTH = 3
+
+
+def _env_reach(cmd, depth=0):
     """→ ЧЕМ смягчено упоминание секрета в команде, для решения И ДЛЯ ЛОГА:
       • `'env_probe'` — хоть один сегмент действительно ПРОБОВАЛ (наличие/метаданные файла либо
         окружение живого процесса из PEB);
@@ -2590,8 +2674,17 @@ def _env_reach(cmd):
     Разбор ПОСЕГМЕНТНЫЙ и структурный (`_split_segments` + `_cmd_index`) — по КОМАНДНОЙ позиции,
     а не по подстроке. Fail-safe: любое сомнение → None, то есть красное как было. Сомнением
     считаем:
-      • труба ИЗ сегмента с секретом (`Get-Item .env | Get-Content` вернул бы содержимое);
-      • любое перенаправление в этом сегменте (`ls > .env` секрет бы ПЕРЕЗАПИСАЛ);
+      • труба ИЗ сегмента с секретом — КРОМЕ случая `_probe_pipe_stays_text` (смотрелка с
+        текстовым выводом И приёмник-фильтр). `Get-Item .env | Get-Content` вернул бы
+        СОДЕРЖИМОЕ, `ls .env | xargs cat` открыл бы файл по собственному листингу — оба
+        остаются красными; `ls -l x.session | head` несёт строку листинга, байтов файла в ней
+        нет вовсе;
+      • перенаправление В ФАЙЛ в этом сегменте (`ls > .env` секрет бы ПЕРЕЗАПИСАЛ). Мерим
+        `_RE_CFG_REDIR` по `_redirect_text` — тем же прибором, что и полоса конфига (`2c8ded0`):
+        грубое `>>?` считало перенаправлением и `2>&1`, и `> /dev/null`, и `>` внутри кавычек,
+        то есть глушило послабление на формах, которые к секрету не прикасаются. Живой факт
+        05.08.2026 11:00: `ls -l --time-style=… userbot.log turbobaby_session.session 2>&1 |
+        head -20` дал карточку «хочу обратиться к секретам» (задача 297) — за `2>&1` и трубу;
       • команда сегмента не из белого списка `_EXISTS_CMDS`/`_PRINT_CMDS` (в т.ч. присваивание
         `$p = ".env"`, после которого содержимое читает уже другой сегмент);
       • python-сегмент, не прошедший `_py_env_readonly`;
@@ -2605,9 +2698,10 @@ def _env_reach(cmd):
         if not _RE_ENV.search(seg):
             continue
         seen = True
-        if i + 1 < len(segs) and segs[i + 1].strip() == "|":
+        if i + 1 < len(segs) and segs[i + 1].strip() == "|" \
+                and not _probe_pipe_stays_text(segs, i):
             return None
-        if _RE_REDIRECT.search(seg):
+        if _RE_CFG_REDIR.search(_redirect_text(seg)):
             return None
         try:
             toks = shlex.split(seg)
@@ -2621,6 +2715,16 @@ def _env_reach(cmd):
             continue
         if _base(toks[j]) in _PRINT_CMDS:
             continue                      # печать своего аргумента — текст, а не обращение
+        if _base(toks[j]) in _ENV_CARRIER_CMDS and depth < _ENV_REACH_MAX_DEPTH:
+            # Аргумент-НОСИТЕЛЬ (блок правила у `_ENV_CARRIER_CMDS`): разбираем его как команду.
+            # Смягчение даёт только ПОЛНЫЙ разбор всех несущих секрет токенов: хоть один
+            # неразобранный — красное целиком (fail-closed, как и везде в этой функции).
+            inner = [t for t in toks[j + 1:] if _RE_ENV.search(t)]
+            verdicts = [_env_reach(t, depth + 1) for t in inner]
+            if inner and all(v is not None for v in verdicts):
+                probed = probed or any(v == "env_probe" for v in verdicts)
+                continue
+            return None
         if _RE_PY.search(seg):
             why = _py_env_readonly(seg)
             if why == "mention" and _env_outside_py_code(seg):
@@ -2632,6 +2736,31 @@ def _env_reach(cmd):
     if not seen:
         return None
     return "env_probe" if probed else "env_mention"
+
+
+# ── ОБЪЕКТ КАРТОЧКИ СЕКРЕТА — ПУТЬ ФАЙЛА, А НЕ РАСШИРЕНИЕ (правка 05.08.2026) ────────────────
+# Живой брак задач 297 и 302: в карточке стояло «Объект: .session». `.session` — это СУФФИКС,
+# а не объект: подтвердить «да .session» нельзя (файлов с таким именем не бывает), и владелец
+# не видит, о КАКОМ файле речь. Пришло оно из `_RE_ENV`, у которой вторая альтернатива —
+# ровно `\.session\b`, и `m.group(0)` отдавал одно расширение.
+#
+# Цена не только косметическая: `card_object` — единственное, с чем сверяется «да» владельца
+# (блок правила у `card_object`), а `_rollback` теперь строит откат ПО ЭТОМУ ЖЕ значению. Пока
+# объектом было расширение, откат назвать ту же операцию не мог по построению.
+def _env_object(cmd):
+    """ПУТЬ секрета, названный в команде (`turbobaby_session.session`, `D:/…/.env`), либо "".
+
+    От совпадения `_RE_ENV` идём ВЛЕВО по символам пути, пока они не кончатся: имя файла стоит
+    слева от расширения, и границей служит то же, что и в шелле, — пробел, кавычка, `=`, `(`.
+    Голое `.env` (в `cat .env`) так и остаётся `.env`: слева от него уже пробел."""
+    s = _scan_text(cmd or "")
+    m = _RE_ENV.search(s)
+    if not m:
+        return ""
+    i = m.start()
+    while i > 0 and (s[i - 1].isalnum() or s[i - 1] in "._$~-/\\:"):
+        i -= 1
+    return s[i:m.end()].strip("'\" ")
 
 
 # СНЯТА 02.08.2026 (класс Д-5): здесь стояла обёртка-однострочник над `_env_reach` (возвращала
@@ -3634,10 +3763,14 @@ def _delete_scan(cmd):
 
 
 def _delete_targets_all_temp(cmd):
-    """True ⇔ удаление ЦЕЛИКОМ живёт во временных зонах из .gitignore (`tmp/`, `%TEMP%\\claude\\**`).
-    Пустой список целей или хоть одна цель вне зоны → False: послабление не распространяется."""
+    """True ⇔ удаление ЦЕЛИКОМ живёт во временных каталогах: зоны из .gitignore (`tmp/`,
+    `%TEMP%\\claude\\**` — `_is_temp_zone`) ЛИБО системные временные корни POSIX (`/tmp/`,
+    `/var/tmp/`, `/dev/shm/` — `_is_posix_tmp_target`, зеркало VPS `53ce1a9`).
+    Пустой список целей или хоть одна цель вне зоны → False: послабление не распространяется —
+    смешанный список `rm -f /tmp/a.txt suggest.py` остаётся красным целиком."""
     targets, _rec, _mask = _delete_scan(cmd)
-    return bool(targets) and all(_is_temp_zone(t) for t in targets)
+    return bool(targets) and all(
+        _is_temp_zone(t) or _is_posix_tmp_target(t) for t in targets)
 
 
 def is_headless(env=None):
@@ -3679,7 +3812,9 @@ def _delete_stays_red(cmd):
         ВНУТРИ `tmp/`: там лежат бэкапы `brain_writer` (`tmp/brain_backup_*.txt`) — единственная
         копия прежнего текста Brain-дока, и `rm tmp/*` уносит её вместе с черновиками;
       • КОРЕНЬ РЕПО — временной зоной он не является (`_is_temp_zone`: relpath `.` ≠ `tmp`),
-        поэтому попадает под общее правило ниже; голден на него стоит в тестах отдельно;
+        поэтому попадает под общее правило ниже; голден на него стоит в тестах отдельно.
+        То же у корней POSIX: `rm -rf /tmp` и `rm -rf /tmp/` красны — под ними живёт не только
+        эта сессия (`_is_posix_tmp_target` требует НЕПУСТОЙ хвост после корня);
       • ЦЕЛЬ ВНЕ ВРЕМЕННЫХ ЗОН — хоть одна: послабление не распространяется на смешанный список."""
     w = _delete_walk(cmd)
     if not w.acts:
@@ -3717,9 +3852,11 @@ def _stays_red(kind, obj, cmd):
         # ЧТЕНИЕ базы (`select`/схема/`mode=ro`) — данные не меняются, спрашивать не о чем
         return False
     if kind == "delete":
-        # Временные каталоги из .gitignore (`tmp/`, `%TEMP%\claude\**`) — рабочие черновики самой
-        # сессии: в git не едут, прод-контур их не видит, живут один сеанс. Уборка за собой
-        # подтверждения не стоит. Всё прочее — красное; разбор и четыре причины в `_delete_stays_red`.
+        # Временные каталоги — рабочие черновики самой сессии: в git не едут, прод-контур их не
+        # видит, живут один сеанс. Уборка за собой подтверждения не стоит. Их два семейства:
+        # зоны .gitignore (`tmp/`, `%TEMP%\claude\**`) и системные корни POSIX (`/tmp/`,
+        # `/var/tmp/`, `/dev/shm/` — зеркало VPS `53ce1a9`, посылка сверена на своей полосе у
+        # `_is_posix_tmp_target`). Всё прочее — красное; четыре причины в `_delete_stays_red`.
         # Здесь стояло `_is_mass_delete(cmd) and not _delete_targets_all_temp(cmd)`, и первая
         # половина этого «И» была дырой: удаление ОДНОГО явного файла массовым не считалось, то
         # есть `rm suggest.py` проходил молча (замер 03.08.2026, зеркало класса VPS).
@@ -3865,6 +4002,42 @@ _ROLLBACK_PY_UNKNOWN = "Откат: неизвестен — гард не ра�
 # `git check-ignore -v .claude/settings.local.json` → `.gitignore:8:.claude/*`, а
 # `git ls-files .claude/` знает ровно один файл. Тот же класс, что закрыт 31.07 (`6250c22`) для
 # `py_write` и `clasp_deploy`; `edit_claude` тогда остался на литерале.
+# ── ОТКАТ СЕКРЕТА — ПО ОБЪЕКТУ, А НЕ ЛИТЕРАЛОМ ПРО `.env` (правка 05.08.2026) ────────────────
+# Тот же класс, что закрыт для `edit_claude` коммитом `2c8ded0`, и та же форма лечения. Живой
+# факт задач 297 и 302: объектом карточки стоял `.session` (файл сессии Telethon), а откатом —
+# статичный литерал «`.env` вне git — вернуть из `.env.bak*`». Объект и откат про РАЗНОЕ:
+# владелец, выполнивший строку буквально, восстановил бы ЧУЖОЙ файл, а названный объект не
+# изменился бы вовсе. Замок `_rollback_conflicts` этого не ловил и не мог: `_RE_CARD_FILE`
+# сознательно узко требует имя ПЕРЕД точкой, поэтому ни `.env`, ни `.session` названными
+# файлами для него не являются, и сравнивать ему было нечего (пусто ≠ конфликт).
+# Чиним ПРИЧИНУ (откат строится из объекта), а узкий замок не трогаем — он страхует прочие виды.
+_ROLLBACK_ENV_SESSION = ("Откат: %s — файл сессии Telethon, вне git; вернуть можно только "
+                         "повторной авторизацией аккаунта")
+_ROLLBACK_ENV_PATH = "Откат: %s вне git — вернуть только из бэкапа, git его НЕ вернёт"
+_ROLLBACK_READ_SECRET = "Откат: не нужен (чтение), но содержимое %s окажется в контексте сессии"
+
+
+def _env_rollback(kind, obj):
+    """Одна строка отката для видов секретов — ПО ОБЪЕКТУ карточки.
+
+    Природы три, и откат у них разный: у `.env` есть свои бэкапы (`.env.bak*`), у файла сессии
+    Telethon бэкапа нет вовсе — его «откат» это повторная авторизация аккаунта, а у прочего
+    секрета (`*.key`, `*.pem`) честно называется только бэкап. ЧТЕНИЕ не меняет файла ни в
+    одном из случаев — там откат не нужен, но назвать объект строка обязана: правило владельца
+    «объект и откат про одну операцию» держится именно на этом."""
+    o = " ".join(str(obj or "").split()).strip("'\"")
+    if kind == "read_secret":
+        return _ROLLBACK_READ_SECRET % (o or "секрета")
+    if not o:
+        return _ROLLBACK["env"]              # объекта нет — выдумывать имя не из чего
+    b = os.path.basename(o.replace("\\", "/")).lower()
+    if b.endswith(".session"):
+        return _ROLLBACK_ENV_SESSION % o
+    if b.startswith(".env"):
+        return _ROLLBACK["env"]              # у него бэкапы и правда зовутся `.env.bak*`
+    return _ROLLBACK_ENV_PATH % o
+
+
 _ROLLBACK_CLAUDE_GIT = "Откат: git checkout -- %s (файл под git)"
 _ROLLBACK_CLAUDE_LOCAL = "Откат: %s под .gitignore — git его НЕ вернёт, только из бэкапа"
 _ROLLBACK_CLAUDE_UNKNOWN = "Откат: вернуть прежний %s — из git, если он под git; иначе из бэкапа"
@@ -4044,8 +4217,9 @@ def _card_fields(kind, obj="", raw_cmd=""):
         o = o or ((m.group(1) + (" " + m.group(2).strip() if m.group(2).strip() else "")).strip()
                   if m else "")
     elif kind == "env":
-        m = _RE_ENV.search(_scan_text(cmd)) if cmd else None
-        o = o or (m.group(0).strip("'\" ") if m else "")
+        # ПУТЬ, а не расширение (блок правила у `_env_object`): «Объект: .session» подтвердить
+        # было нечем, и откат по такому объекту назвать ту же операцию не мог.
+        o = o or _env_object(cmd)
     elif kind == "live_sheet":
         # ДЕНЬГИ И ПАРК — FAIL-CLOSED. Объект обязателен: имя листа (вкладка, префикс диапазона
         # `Лист1!A1`, ключ таблицы, известное имя, хост живого контура), а если ничего не
@@ -4104,6 +4278,13 @@ def _rollback(kind, raw_cmd="", obj=""):
         if o in _PY_BRIDGE_TOKENS:
             return _ROLLBACK_PY.get(o) or _ROLLBACK["py_write"]
         return _ROLLBACK_PY_UNKNOWN
+    if kind in ("env", "edit_secret", "read_secret"):
+        # ПО ОБЪЕКТУ, а не литералом про `.env` (блок правила у `_env_rollback`). Объект берём
+        # ИЗ ТОГО ЖЕ МЕСТА, откуда его берёт `_card_fields`: у шелловой формы `obj` приходит
+        # пустым (`_decide_bash_body` → `("ask", "env", "")`), и назвать файл может только
+        # разбор команды. Один источник на печатаемый объект и на откат — иначе они снова
+        # разъедутся, как в задачах 297/302.
+        return _env_rollback(kind, " ".join(str(obj or "").split()) or _env_object(raw_cmd))
     if kind == "edit_claude":
         # ПО ОБЪЕКТУ, а не литералом: под `.claude/` живут и отслеживаемый файл, и локальные
         # под `.gitignore`, и откат у них РАЗНЫЙ. Не нашли файла — не утверждаем ничего.

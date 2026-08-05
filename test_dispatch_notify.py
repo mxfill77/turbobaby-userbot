@@ -342,6 +342,59 @@ class TestNotificationPing(unittest.TestCase):
         self.assertIn("Команда: Bash: git status", self.calls[0]["text"])
 
 
+class TestStopHookDoesNotReachTheDm(unittest.TestCase):
+    """ЛИЧКА — ТОЛЬКО ТО, ЧЕГО НЕТ В ИНБОКСЕ И ЧТО ТРЕБУЕТ ОТВЕТА (правило владельца 05.08.2026).
+
+    «✅ Dispatch: задача завершена.» ответа не требует и содержания не несёт, а тот же факт
+    через секунду уходит в инбокс 1160 хуком session_end — уже со сводкой. Замер за 7 суток
+    (dispatch_notify.log, 29.07–05.08): 392 сообщения в личку, 178 из них — эта строка."""
+
+    def setUp(self):
+        # `_cowork` и `_write_session_metrics` МОКАЕМ ОБЯЗАТЕЛЬНО: живой `_cowork` спавнит
+        # `cowork_log_append.py` и пишет НАСТОЯЩУЮ строку в мозг. Проверено ценой одной такой
+        # строки 05.08.2026 13:07 — тест без этого мока боевой канал не трогать не может.
+        self._save = (dn._api, dn.TOKEN, dn._cowork, dn._write_session_metrics)
+        self.calls, self.cows = [], []
+        dn.TOKEN = "test-token"
+        dn._cowork = lambda t: self.cows.append(t)
+        dn._write_session_metrics = lambda m: False
+
+        def api(method, payload):
+            self.calls.append(payload)
+            return True, {"ok": True}
+        dn._api = api
+
+    def tearDown(self):
+        (dn._api, dn.TOKEN, dn._cowork, dn._write_session_metrics) = self._save
+
+    def _run(self, argv, payload):
+        saved_argv, saved_stdin = sys.argv, sys.stdin
+        try:
+            sys.argv = argv
+            sys.stdin = io.StringIO(json.dumps(payload))
+            with self.assertRaises(SystemExit):
+                dn.main()
+        finally:
+            sys.argv, sys.stdin = saved_argv, saved_stdin
+
+    def test_stop_hook_sends_nothing(self):
+        self._run(["dispatch_notify.py", "--hook", "stop"], {})
+        self.assertEqual(self.calls, [], "хук stop снова пишет в личку")
+
+    def test_stop_text_is_kept_for_the_log(self):
+        """Текст не выброшен: он остаётся в строке лога, чтобы пропажа читалась как решение."""
+        self.assertIn("задача завершена", dn._build("stop", {}))
+
+    def test_session_end_still_goes_to_inbox_1160(self):
+        """Событие не потеряно: канал со СВОДКОЙ не тронут."""
+        self._run(["dispatch_notify.py", "--hook", "session_end"],
+                  {"transcript_path": FIX_TRANSCRIPT})
+        self.assertTrue(self.calls, "session_end перестал доставляться")
+        self.assertEqual(self.calls[0]["chat_id"], dn.HQ_CHAT_ID)
+        self.assertEqual(self.calls[0]["message_thread_id"], dn.INBOX_THREAD_ID)   # 1160
+        self.assertEqual(len(self.cows), 1, "второй канал (cowork_log) замокан и позван ровно раз")
+
+
 class TestStdinBom(unittest.TestCase):
     """BOM перед JSON-нагрузкой хука не должен обнулять её (живой прокол: сводка выродилась
     в «без текстового итога», потому что strip() не срезает ﻿)."""

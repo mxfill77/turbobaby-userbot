@@ -6416,7 +6416,7 @@ class TestRevizorDefaultOff(unittest.TestCase):
 class TestNotifyHygiene(unittest.TestCase):
     """Гигиена уведомлений пульта (задача #: гигиена pc_agent):
       • done/failed задач в личку НЕ дублируются (видны в темах постановки 328/829);
-      • needs_approval — call-to-action, пуш в личку остаётся;
+      • needs_approval — тоже НЕ дублируется (05.08.2026, см. TestTaskLifecycleNeverDuplicatesTheDm);
       • критические инциденты идут через _notify_critical (маршрут инбокс 1160 → личка-фолбэк)."""
 
     def setUp(self):
@@ -6436,10 +6436,20 @@ class TestNotifyHygiene(unittest.TestCase):
         o._notify_task("failed", 42, "провал")
         self.assertEqual(self.dm, [])                 # failed-дубль в личку НЕ шлётся
 
-    def test_needs_approval_still_pushed(self):
+    def test_needs_approval_not_pushed_to_dm(self):
+        """ПРАВИЛО ПЕРЕВЁРНУТО 05.08.2026 — и вот чем.
+
+        Здесь стояло `assertEqual(len(self.dm), 1)` с доводом «call-to-action — оставляем пуш».
+        Довод оказался верным про КАРТОЧКУ и неверным про ЭТУ строку: карточку владелец к
+        этому моменту уже получил дважды — полной в личку (пуш гарда) и с кнопками ✅/❌ в тему
+        829. Третьим шло обрезанное эхо первой строки той же карточки: нажать не на чем,
+        нового факта нет. Замер за 7 суток: 26 таких дублей."""
         o._notify_task("needs_approval", 42, "нужно да")
-        self.assertEqual(len(self.dm), 1)             # call-to-action — оставляем пуш
-        self.assertIn("#42", self.dm[0])
+        self.assertEqual(self.dm, [])
+
+    def test_the_answerable_copy_still_goes_to_topic_829(self):
+        """Канал, на котором можно НАЖАТЬ, не тронут: тема красного осталась той же."""
+        self.assertEqual(o.NEEDS_APPROVAL_TOPIC, 829)
 
     def test_notify_critical_spawns_dispatch_with_flag(self):
         """_notify_critical зовёт dispatch_notify с флагом --critical (маршрут форум→личка)."""
@@ -8055,6 +8065,44 @@ class SudimPoFaktuANePoRaspiske(unittest.TestCase):
         b, seen = self._bridge({"ok": False, "error": "unauthorized"}, {"in_progress": [193]})
         b.claim_task(193)
         self.assertEqual(seen["gets"][0][1]["lane"], o.LANE)
+
+
+class TestTaskLifecycleNeverDuplicatesTheDm(unittest.TestCase):
+    """А. ЛИЧКА НЕ ДУБЛИРУЕТ КАРТОЧКУ ГАРДА (правило владельца 05.08.2026).
+
+    Порядок доставки одного красного, замеренный по логам 05.08:
+      1. `pretool_guard._emit_ask` → пуш → ЛИЧКА: полная карточка (что · объект · число · откат);
+      2. `bc.set_needs_approval(…, topic=NEEDS_APPROVAL_TOPIC)` → тема 829: та же карточка
+         С КНОПКАМИ ✅/❌ — единственная, на которой можно нажать;
+      3. `_notify_task` → ЛИЧКА ЕЩЁ РАЗ: обрезанная первая строка той же карточки.
+    Третье беднее первого и слабее второго. За 7 суток таких дублей 26."""
+
+    def setUp(self):
+        self._save = o._notify
+        self.dm = []
+        o._notify = lambda text: self.dm.append(text)
+
+    def tearDown(self):
+        o._notify = self._save
+
+    def test_needs_approval_no_longer_pushes_to_the_dm(self):
+        o._notify_task("needs_approval", 302, "NEEDS_APPROVAL (гард): 🔴 Хочу обратиться к …")
+        self.assertEqual(self.dm, [])
+
+    def test_done_and_failed_still_do_not_push(self):
+        """Прежнее правило не тронуто (снято раньше — темы постановки уже показали карточку)."""
+        for kind in ("done", "failed"):
+            o._notify_task(kind, 1, "итог")
+        self.assertEqual(self.dm, [])
+
+    def test_suppression_is_named_in_the_log_not_silent(self):
+        """Доктрина лога полосы: смягчение не должно стоить прозрачности."""
+        with self.assertLogs(o.log, level="INFO") as cm:
+            o._notify_task("needs_approval", 302, "🔴 Хочу удалить файл /tmp/x — разрешить?")
+        line = "\n".join(cm.output)
+        self.assertIn("302", line)
+        self.assertIn(str(o.NEEDS_APPROVAL_TOPIC), line)
+        self.assertIn("не дублируется", line)
 
 
 if __name__ == "__main__":

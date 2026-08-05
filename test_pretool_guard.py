@@ -4502,5 +4502,195 @@ class TestConfigMentionAndRollbackObject(unittest.TestCase):
                          [self.CFG])
 
 
+_E = "." + "env"                  # имена секретов из кусков: сам файл теста читает гард
+_SESS = "turbobaby_session" + ".session"
+
+
+class TestCleanupInTempIsNotTopPrice(unittest.TestCase):
+    """Б. УБОРКА ВО ВРЕМЕННОМ КАТАЛОГЕ КАРТОЧКИ НЕ РОЖДАЕТ (05.08.2026).
+
+    Живой факт-повод: карточка ВЫСШЕГО вида «⛔ ВЫСШАЯ ЦЕНА · НЕОБРАТИМО · да _win.txt» на
+    `/tmp/_win.txt` (скриншот владельца 05.08 10:25) и такая же на `/tmp/autofetch_measure.py`
+    (29.07 16:21). Форма лечения — с полосы сервера (`53ce1a9`): временным считается КОНКРЕТНЫЙ
+    путь под системным корнем, а маска, сам корень и `..` остаются красными.
+    """
+
+    TMP_OK = ["/tmp/_win.txt", "/tmp/autofetch_measure.py", "/var/tmp/dump_0805.txt",
+              "/dev/shm/lock_0805", "/tmp/probe-2026/out/report.json"]
+    STILL_RED = ["suggest.py", "/root/turbobaby-manager-bot/bot.py", "docs/ENV_PLAYBOOK.md",
+                 "/tmp/*", "/tmp", "/tmp/", "/tmp/?.json", "/tmp/../etc/passwd",
+                 "tmp/brain_backup_*.txt", "/etc/passwd"]
+
+    def _act(self, cmd):
+        return g.decide_for_role(bash(cmd), headless=False)[0]
+
+    def test_predicate_names_only_concrete_paths_under_the_roots(self):
+        for p in self.TMP_OK:
+            self.assertTrue(g._is_posix_tmp_target(p), p)
+        for p in ["/tmp/*", "/tmp", "/tmp/", "/tmp//", "/tmp/?.json", "/tmp/../etc/passwd",
+                  "", "tmp/x.txt", "/tmpfoo/x", "/var/log/x", "$TMPDIR/x"]:
+            self.assertFalse(g._is_posix_tmp_target(p), p)
+
+    def test_cleanup_under_posix_tmp_makes_no_card(self):
+        """ЖИВОЙ красный до правки: каждая из этих строк давала высший ярус."""
+        for p in self.TMP_OK:
+            for cmd in ("rm -f " + p, "rm -rf " + p, "unlink " + p):
+                self.assertEqual(g.decide_for_role(bash(cmd), headless=False),
+                                 ("defer", "delete", p), cmd)
+
+    def test_repo_temp_zones_unchanged(self):
+        """Прежнее послабление не тронуто: зоны .gitignore зелены как были."""
+        self.assertEqual(self._act("rm -f tmp/x.txt"), "defer")
+        self.assertEqual(self._act("rm -rf tmp/probe-0805"), "defer")
+
+    def test_delete_outside_temp_still_red(self):
+        for p in self.STILL_RED:
+            self.assertEqual(self._act("rm -rf " + p), "ask", p)
+
+    def test_mixed_list_is_red_as_a_whole(self):
+        """Хоть одна цель вне временных — послабление не распространяется на список."""
+        self.assertEqual(self._act("rm -f /tmp/a.txt suggest.py"), "ask")
+
+    def test_unnamed_target_stays_fail_closed(self):
+        for cmd in ("find . -name '*.py' | xargs rm -f", "rm -rf", "rm -f $TARGET"):
+            self.assertEqual(self._act(cmd), "ask", cmd)
+
+    def test_verb_in_text_is_still_not_a_deletion(self):
+        """Замок происхождения не ослаблен: глагол в ТЕКСТЕ действием не становится."""
+        self.assertIsNone(g._delete_reach('git commit -m "убрал rm -rf /tmp/x из уборки"'))
+
+
+class TestSecretsJudgedByActionNotBySubstring(unittest.TestCase):
+    """В. РАЗРЯД СЕКРЕТОВ СУДИТ ПО ДЕЙСТВИЮ; ОБЪЕКТ И ОТКАТ — ПРО ОДНУ ОПЕРАЦИЮ (05.08.2026).
+
+    Три живых брака одного дня: (1) `ls -l … turbobaby_session.session 2>&1 | head` дал карточку
+    «хочу обратиться к секретам» — задача 297; (2) `ssh … "python3 …"`, считающий окна по датам,
+    дал её же с пустым числом — задача 302; (3) в обеих объектом стояло РАСШИРЕНИЕ `.session`,
+    а откатом — литерал про `.env`/`.env.bak`, то есть про ДРУГОЙ файл.
+    """
+
+    LISTING = ("ls -l --time-style=+%H:%M:%S userbot.log userbot.lock " + _SESS
+               + " moderation_ipc.db 2>&1 | head -20")
+    SSH = "ssh -o ConnectTimeout=10 -o BatchMode=yes -i ~/.ssh/turbobaby_vps root@5.223.94.179 "
+
+    def _dec(self, cmd):
+        return g.decide_for_role(bash(cmd), headless=False)
+
+    # ── по ДЕЙСТВИЮ ────────────────────────────────────────────────────────────
+    def test_live_card_297_metadata_listing_is_not_access(self):
+        self.assertEqual(self._dec(self.LISTING), ("defer", "env_probe", ""))
+
+    def test_stderr_redirect_is_not_a_write_to_the_secret(self):
+        """`2>&1`/`2>/dev/null` в файл секрета не пишут — грубое `>>?` считало их записью.
+
+        ОСТАТОК, СОЗНАТЕЛЬНО НЕ ЗАКРЫТЫЙ ЗДЕСЬ: форма с ПРОБЕЛОМ (`> /dev/null`) остаётся
+        красной. Дыра в общем `_REDIR_TO_FILE` (`\\s*` отступает, и отрицательный просмотр
+        проверяет пробел вместо `/dev/null`), общем с полосой конфига, — правка там задела бы
+        `edit_claude`, а он в границы этой задачи не входит."""
+        for cmd in ("ls -l " + _E + " 2>&1", "ls -l " + _E + " 2>/dev/null",
+                    "stat " + _SESS + " 2>&1 | head -3"):
+            self.assertEqual(self._dec(cmd)[0], "defer", cmd)
+
+    def test_redirect_into_the_secret_is_still_red(self):
+        for cmd in ('echo "X=1" >> ' + _E, "ls -l > " + _E, "printf x > " + _SESS):
+            self.assertEqual(self._dec(cmd)[:2], ("ask", "env"), cmd)
+
+    def test_pipe_out_of_an_object_cmdlet_is_still_red(self):
+        """`Get-Item` отдаёт ОБЪЕКТ файла — следующее звено выдаёт содержимое."""
+        for cmd in ("Get-Item " + _E + " | Get-Content", "gci " + _E + " | gc"):
+            self.assertEqual(self._dec(cmd)[0], "ask", cmd)
+
+    def test_pipe_into_an_executor_is_still_red(self):
+        """ТЕКСТОВОГО вывода мало: приёмник обязан текст ФИЛЬТРОВАТЬ, а не открывать по нему файл.
+
+        Дыру нашёл собственный голден `test_probe_does_not_open_bypasses`, а не рассуждение
+        автора: первая редакция послабления пускала `ls <секрет> | xargs cat` — листинг уходил
+        в `xargs`, и тот выдавал СОДЕРЖИМОЕ названного файла."""
+        for cmd in ("ls " + _E + " | xargs cat", "ls " + _SESS + " | xargs -I{} cat {}",
+                    "ls " + _E + " | bash", "ls " + _E + " | python3 -",
+                    "ls " + _E + " | tee copy.txt"):
+            self.assertEqual(self._dec(cmd)[0], "ask", cmd)
+
+    def test_pipe_into_a_text_filter_is_green(self):
+        for cmd in ("ls -l " + _SESS + " | head -3", "ls -l " + _E + " | wc -l",
+                    "stat " + _SESS + " | grep Modify"):
+            self.assertEqual(self._dec(cmd)[0], "defer", cmd)
+
+    def test_carrier_payload_is_judged_as_a_command(self):
+        """Аргумент ssh/bash — команда, а не путь: смягчает только РАЗБОР, не отсутствие улик."""
+        self.assertEqual(g._env_reach(
+            self.SSH + "\"python3 -c 'lo=1; print(lo)  # " + _E + " не читаем'\""), "env_mention")
+        for cmd in (self.SSH + '"cat ' + _E + '"',
+                    self.SSH + '"python3 reader.py ' + _E + '"',
+                    'bash -c "cat ' + _E + '"'):
+            self.assertIsNone(g._env_reach(cmd), cmd)
+            self.assertEqual(self._dec(cmd)[:2], ("ask", "env"), cmd)
+
+    def test_carrier_recursion_is_bounded(self):
+        """Глубина ограничена (`_ENV_REACH_MAX_DEPTH`): вложенность не уводит разбор в петлю."""
+        deep = self.SSH + '"bash -c \'bash -c "bash -c \\"cat ' + _E + '\\""\'"'
+        self.assertIsNone(g._env_reach(deep))
+
+    def test_real_reads_of_secrets_stay_red(self):
+        for cmd in ("cat " + _E, "cat " + _SESS, "type " + _E, "Get-Content " + _E):
+            self.assertEqual(self._dec(cmd)[:2], ("ask", "env"), cmd)
+        self.assertEqual(g.decide_for_role(read(PROJ + "\\" + _E), headless=False)[:2],
+                         ("ask", "read_secret"))
+        self.assertEqual(g.decide_for_role(read(PROJ + "\\" + _SESS), headless=False)[:2],
+                         ("ask", "read_secret"))
+
+    # ── ОБЪЕКТ и ОТКАТ ────────────────────────────────────────────────────────
+    def test_card_object_is_the_path_not_the_extension(self):
+        """Живой брак 297/302: «Объект: .session». Подтвердить «да .session» было нечем."""
+        self.assertEqual(g.card_object("env", "", "cat " + _SESS), _SESS)
+        self.assertEqual(g.card_object("env", "", "cat " + _E), _E)
+        self.assertEqual(g.card_object("env", "", "cat D:/turbobaby-bot/" + _E),
+                         "D:/turbobaby-bot/" + _E)
+
+    def test_rollback_describes_the_same_operation_as_the_object(self):
+        """Правило владельца: объект и откат — ВСЕГДА про одну операцию."""
+        for cmd, obj in (("cat " + _SESS, _SESS), ("cat " + _E, _E),
+                         ("cat D:/turbobaby-bot/" + _E, "D:/turbobaby-bot/" + _E)):
+            card = g._card("env", "", cmd)
+            shown = g.card_object("env", "", cmd)
+            self.assertEqual(shown, obj, cmd)
+            rb = [l for l in card.splitlines() if l.startswith("Откат:")][0]
+            # Имя файла — по базовому: `_rollback_conflicts` тем же правилом считает вложение
+            # имён совпадением (объект Write/Edit приходит базовым именем).
+            self.assertIn(os.path.basename(obj), rb, cmd)
+            self.assertFalse(g._rollback_conflicts(rb, shown), cmd)
+
+    def test_session_file_rollback_never_talks_about_env(self):
+        """Живой брак: объект `.session`, а откат — «`.env` вне git, вернуть из `.env.bak*`»."""
+        rb = g._rollback("env", "cat " + _SESS, "")
+        self.assertIn(_SESS, rb)
+        self.assertNotIn(_E + " вне git", rb)
+        self.assertNotIn(_E + ".bak", rb)
+
+    def test_read_secret_rollback_names_the_same_file(self):
+        rb = g._rollback("read_secret", "", _SESS)
+        self.assertIn(_SESS, rb)
+        self.assertIn("чтение", rb)
+
+    def test_every_secret_kind_still_carries_a_rollback_line(self):
+        for kind in ("env", "edit_secret", "read_secret"):
+            for obj in ("", _E, _SESS, "x.pem", "client.key"):
+                rb = g._rollback(kind, "", obj)
+                self.assertTrue(rb.startswith("Откат:"), (kind, obj))
+
+    def test_write_to_a_key_file_rolls_back_by_its_own_name(self):
+        """`*.key`/`*.pem` приходят видом `edit_secret` от Write/Edit — откат называет ИХ."""
+        for obj in ("client.key", "server.pem"):
+            rb = g._rollback("edit_secret", "", obj)
+            self.assertIn(obj, rb)
+            self.assertNotIn(_E + ".bak", rb)
+
+    def test_mention_leg_of_f4c3cff_untouched(self):
+        """Прежнее послабление «имя только названо» не тронуто."""
+        self.assertEqual(g.decide(bash(
+            "python3 -c \"lo=1; print(lo)  # окна, " + _E + " не читаем\"")),
+            ("defer", "env_mention", ""))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
