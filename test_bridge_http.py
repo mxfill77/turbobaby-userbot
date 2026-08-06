@@ -25,6 +25,7 @@ import io
 import json
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 import urllib.response
 
@@ -66,13 +67,45 @@ class FakeBridgeHost(urllib.request.HTTPSHandler):
     echo_bounces — echo отправляет обратно на `/exec` (реконструкция петли, съедавшей токен).
     """
 
-    def __init__(self, receipt=None, echo_404=0, echo_bounces=False, exec_get=None):
+    def __init__(self, receipt=None, echo_404=0, echo_bounces=False, exec_get=None,
+                 echo_bounce_n=0):
         super().__init__()
         self.receipt = receipt if receipt is not None else WRITE_RECEIPT
         self.echo_404 = echo_404
         self.echo_bounces = echo_bounces
+        # echo_bounce_n — у СКОЛЬКИХ ПЕРВЫХ КЛЮЧЕЙ расписки отскок, дальше ключи живые.
+        #
+        # СЧЁТ ИМЕННО ПО КЛЮЧАМ, А НЕ ПО ОБРАЩЕНИЯМ, — и это не стиль. `user_content_key` мост
+        # выдаёт первым плечом, он одноразовый, и мёртвый ключ мёртв НАВСЕГДА: сколько раз ни
+        # переспроси тот же адрес echo, ответом будет тот же отскок. Первая редакция фикстуры
+        # считала отскоки глобально — и «лечилась» повтором того же ключа, то есть показывала
+        # исправным ровно тот путь, который лежит вживую (правило-класс «мок обязан копировать
+        # живой формат»: подогнанный мок хуже отсутствующего).
+        #
+        # Живой замер 07.08.2026: в серии из 40 одиночных чтений отскоки шли ПАЧКАМИ (#5–#7,
+        # #35–#38), а не поодиночке — пачку обязан переживать НОВЫЙ запрос целиком.
+        # Отдельным параметром от `echo_bounces` (вечный отскок) — чтобы не трогать регрессы
+        # записи, стоящие на нём.
+        self.echo_bounce_n = echo_bounce_n
         self.exec_get = exec_get if exec_get is not None else DOGET_REFUSAL
         self.legs = []          # (метод, адрес без query, было ли тело)
+        self._issued = 0        # сколько ключей расписки выдало первое плечо
+        self._minted = {}       # ключ → адрес /exec, который его выдал (цель отскока)
+
+    def _mint(self, exec_url):
+        """Первое плечо выдало НОВЫЙ одноразовый ключ расписки. → адрес второго плеча."""
+        key = self._issued
+        self._issued += 1
+        # Цель отскока запоминаем ПОКЛЮЧЕВО. Живой замер 07.08: на ЧТЕНИИ отскок несёт ПОЛНЫЙ
+        # исходный query (токен в нём цел), а у ЗАПИСИ его нет и быть не может — в POST query
+        # не было. Значит запрет «не ходить по отскоку» обязан держаться на АДРЕСЕ, а не на
+        # пустоте query, и фикстура проверяет именно это.
+        self._minted[key] = exec_url
+        return ECHO_URL + "&fix_key=%d" % key
+
+    def _key_of(self, echo_url):
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(echo_url).query)
+        return int(q.get("fix_key", ["-1"])[0])
 
     def https_open(self, req):
         url = req.full_url
@@ -81,7 +114,7 @@ class FakeBridgeHost(urllib.request.HTTPSHandler):
         if url.split("?")[0] == EXEC_URL:
             if method == "POST":
                 return _response(url, 302,
-                                 {"Location": ECHO_URL,
+                                 {"Location": self._mint(EXEC_URL),
                                   "Content-Type": "text/html; charset=UTF-8",
                                   "Server": "GSE",
                                   "Cache-Control": "no-cache, no-store, max-age=0, must-revalidate"})
@@ -89,8 +122,8 @@ class FakeBridgeHost(urllib.request.HTTPSHandler):
             # дословный отказ doGet, тот самый, что пришёл на ЗАПИСЬ 02.08.
             if "token=" in url:
                 return _response(url, 302,
-                                 {"Location": ECHO_URL, "Content-Type": "text/html; charset=UTF-8",
-                                  "Server": "GSE"})
+                                 {"Location": self._mint(url),
+                                  "Content-Type": "text/html; charset=UTF-8", "Server": "GSE"})
             return _response(url, 200, {"Content-Type": "application/json"},
                              json.dumps(self.exec_get).encode("utf-8"))
         if url.split("?")[0].startswith("https://echo.bridge.test/"):
@@ -100,6 +133,14 @@ class FakeBridgeHost(urllib.request.HTTPSHandler):
             if self.echo_bounces:
                 return _response(url, 302, {"Location": EXEC_URL,
                                             "Content-Type": "text/html; charset=UTF-8"})
+            key = self._key_of(url)
+            if 0 <= key < self.echo_bounce_n:
+                # Ключ МЁРТВ — и остаётся мёртвым при любом числе повторов по тому же адресу.
+                # Заголовки с живой пробы 07.08: `Content-Type: application/binary`,
+                # `Server: ESF`, тело пустое.
+                return _response(url, 302, {"Location": self._minted.get(key, EXEC_URL),
+                                            "Content-Type": "application/binary",
+                                            "Server": "ESF"})
             return _response(url, 200, {"Content-Type": "application/json"},
                              json.dumps(self.receipt).encode("utf-8"))
         raise AssertionError("фикстура не знает адреса: " + url)
@@ -306,6 +347,125 @@ class AllThreeClients(unittest.TestCase):
         r = b._post("claim_task", id=7)
         self.assertFalse(r.get("ok"))
         self.assertEqual(r.get("error"), "BridgeReceiptLost")
+
+
+class ReadSurvivesSecondLeg(unittest.TestCase):
+    """Регресс класса 07.08.2026: ЧТЕНИЕ очереди обязано переживать отказ второго плеча.
+
+    ЖИВОЙ ПОВОД. С 02:46 до 06:18 07.08 в `pc_orchestrator.log` — 43 отказа подряд вида
+    `get_pending(new|in_progress) ошибка: BridgeTransportError … второе плечо моста (echo)
+    бросает обратно на наш же /exec`. Мост при этом ИСПРАВЕН: проба того же адреса тем же
+    токеном в 06:40 дала 30 успехов на 40 одиночных чтений (7 отскоков + 3 ответа 404).
+
+    ПОЧЕМУ ЗАПИСЬ ПЕРЕЖИЛА, А ЧТЕНИЕ НЕТ — при ОДНОМ И ТОМ ЖЕ плече и одной и той же правке
+    `ab5106d`: лекарство «переспросить ЦЕЛИКОМ» легло тогда в личные обёртки писателей
+    (`cowork_log_append.with_retry`, `brain_writer._retry_read`), а сверх них у записи есть ещё
+    спул. У читателя очереди (`pc_orchestrator.Bridge._call`) обёртки нет ВООБЩЕ и спула быть не
+    может — один отскок ослеплял виток демона целиком. Поэтому повтор чтения переезжает в САМ
+    транспорт, где им пользуются все три клиента, а не двое из трёх.
+
+    Паузы обнуляем: цена сна не должна попадать в гейт."""
+
+    READ_Q = {"action": "get_pending", "token": "TOK", "status": "new", "lane": "pc"}
+    QUEUE = {"ok": True, "items": [{"id": "777", "lane": "pc", "task": "проба"}]}
+
+    def setUp(self):
+        for name in ("ECHO_PAUSE", "READ_PAUSE"):
+            old = getattr(bridge_http, name)
+            setattr(bridge_http, name, 0)
+            self.addCleanup(setattr, bridge_http, name, old)
+
+    def _exec_legs(self, host):
+        return [leg for leg in host.legs if leg[1] == EXEC_URL]
+
+    # ── (а) чтение проходит ПРИ ОТКАЗЕ второго плеча ────────────────────────────────────────
+    def test_read_survives_a_burst_of_echo_bounces(self):
+        host = FakeBridgeHost(receipt=READ_RECEIPT, echo_bounce_n=2)
+        data = bridge_http.request_json(EXEC_URL, "GET", params=self.READ_Q,
+                                        opener=_opener(host), sleeper=lambda s: None)
+        self.assertEqual(data.get("text"), READ_RECEIPT["text"])
+        self.assertEqual(len(self._exec_legs(host)), 3,
+                         "мёртвый ключ лечит НОВЫЙ запрос целиком, а не повтор того же echo")
+
+    def test_read_survives_an_echo_that_is_404_for_a_whole_attempt(self):
+        # ECHO_TRIES=3 попыток по тому же ключу — все 404, значит спасает только новый запрос
+        host = FakeBridgeHost(receipt=READ_RECEIPT, echo_404=bridge_http.ECHO_TRIES)
+        data = bridge_http.request_json(EXEC_URL, "GET", params=self.READ_Q,
+                                        opener=_opener(host), sleeper=lambda s: None)
+        self.assertEqual(data.get("text"), READ_RECEIPT["text"])
+        self.assertEqual(len(self._exec_legs(host)), 2)
+
+    def test_queue_read_of_the_orchestrator_survives_the_bounce(self):
+        """Тот самый вызов, который лежал: `Bridge.get_pending` через живой класс дирижёра."""
+        host = FakeBridgeHost(receipt=self.QUEUE, echo_bounce_n=2)
+        b = o.Bridge(url=EXEC_URL, token="TOK", opener=_opener(host))
+        r = b.get_pending("new")
+        self.assertTrue(r.get("ok"), r)
+        self.assertEqual([it["id"] for it in r["items"]], ["777"])
+
+    def test_bounce_no_longer_burns_tries_on_the_dead_key(self):
+        """Отскок = ключ МЁРТВ. Переспрашивать его на чтении нельзя — это просто трата секунд."""
+        host = FakeBridgeHost(receipt=READ_RECEIPT, echo_bounce_n=1)
+        bridge_http.request_json(EXEC_URL, "GET", params=self.READ_Q,
+                                 opener=_opener(host), sleeper=lambda s: None)
+        echo = [leg for leg in host.legs if leg[1] != EXEC_URL]
+        self.assertEqual(len(echo), 2, "по одному обращению к echo на каждый полный запрос")
+
+    def test_read_gives_up_honestly_when_the_second_leg_is_dead_for_good(self):
+        host = FakeBridgeHost(receipt=READ_RECEIPT, echo_bounce_n=99)
+        with self.assertRaises(bridge_http.BridgeTransportError):
+            bridge_http.request_json(EXEC_URL, "GET", params=self.READ_Q,
+                                     opener=_opener(host), sleeper=lambda s: None)
+        self.assertEqual(len(self._exec_legs(host)), bridge_http.READ_TRIES,
+                         "повтор ограничен: вечного цикла в витке демона быть не должно")
+
+    # ── (б) НОРМАЛЬНОЕ чтение работает как прежде ───────────────────────────────────────────
+    def test_happy_read_still_costs_exactly_two_legs(self):
+        host = FakeBridgeHost(receipt=READ_RECEIPT)
+        data = bridge_http.request_json(EXEC_URL, "GET", params=self.READ_Q,
+                                        opener=_opener(host), sleeper=lambda s: None)
+        self.assertEqual(data.get("text"), READ_RECEIPT["text"])
+        self.assertEqual([m for m, _, _ in host.legs], ["GET", "GET"],
+                         "на исправном мосту повтор не смеет добавить ни одного запроса")
+
+    def test_a_refusal_on_the_merits_is_not_retried(self):
+        """`ok:false` от самого моста — ОТВЕТ, а не сбой плеча: переспрашивать его нельзя."""
+        host = FakeBridgeHost(receipt=DOGET_REFUSAL)
+        data = bridge_http.request_json(EXEC_URL, "GET", params=self.READ_Q,
+                                        opener=_opener(host), sleeper=lambda s: None)
+        self.assertEqual(data.get("error"), "unauthorized")
+        self.assertEqual(len(self._exec_legs(host)), 1)
+
+    def test_a_dead_first_leg_reaches_the_caller_at_once(self):
+        """«Связи нет» обязано доходить немедленно: повтор первого плеча — не наше дело, и
+        `error_kind` не смеет узнать об обрыве на 3 паузы позже."""
+        class DeadFirstLeg(FakeBridgeHost):
+            def https_open(self, req):
+                self.legs.append((req.get_method(), req.full_url.split("?")[0], bool(req.data)))
+                raise urllib.error.URLError("[Errno 11001] getaddrinfo failed")
+        host = DeadFirstLeg()
+        with self.assertRaises(urllib.error.URLError):
+            bridge_http.request_json(EXEC_URL, "GET", params=self.READ_Q,
+                                     opener=_opener(host), sleeper=lambda s: None)
+        self.assertEqual(len(host.legs), 1)
+
+    def test_tries_is_an_injection_point_not_a_hidden_default(self):
+        host = FakeBridgeHost(receipt=READ_RECEIPT, echo_bounce_n=99)
+        with self.assertRaises(bridge_http.BridgeTransportError):
+            bridge_http.request_json(EXEC_URL, "GET", params=self.READ_Q, tries=1,
+                                     opener=_opener(host), sleeper=lambda s: None)
+        self.assertEqual(len(self._exec_legs(host)), 1)
+
+    # ── граница: у ЗАПИСИ повтора целиком нет и не появилось ────────────────────────────────
+    def test_a_write_is_never_repeated_whole_no_matter_the_leg(self):
+        """Инвариант `ab5106d`: мутация уходит РОВНО один раз. Повтор чтения не смеет его сдвинуть."""
+        for kwargs in ({"echo_bounces": True}, {"echo_bounce_n": 99}, {"echo_404": 99}):
+            host = FakeBridgeHost(**kwargs)
+            with self.assertRaises(Exception):
+                bridge_http.request_json(EXEC_URL, "POST", payload=_post_body(),
+                                         opener=_opener(host), sleeper=lambda s: None)
+            self.assertEqual(len(host.posts()), 1, kwargs)
+            self.assertEqual(len(self._exec_legs(host)), 1, kwargs)
 
 
 if __name__ == "__main__":

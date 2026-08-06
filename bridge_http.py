@@ -32,6 +32,10 @@ POST мост уже исполнил, этот GET лишь забирает г
 тоже незачем: у обоих читателей свой слой повторов (`cowork_log_append.with_retry`,
 `brain_writer._retry_read`). Поправка самой VPS-полосы — отдельная задача, здесь VPS не трогаем.
 
+ЧТЕНИЕ ДЕРЖИТ ОТКАЗ ВТОРОГО ПЛЕЧА САМО (правка 07.08.2026). Ключ расписки одноразовый, поэтому
+переспрашивать его бесполезно — идемпотентный GET переспрашивается ЦЕЛИКОМ, здесь, в транспорте,
+а не в личной обёртке каждого клиента. Подробности и замер — у `READ_TRIES`.
+
 КОНТРАКТ. `request_json` отдаёт разобранный JSON, а транспортный сбой ПОДНИМАЕТ ИСКЛЮЧЕНИЕМ —
 ровно как прежние `_get`/`_post` на голом urlopen. Поэтому вызывающие (спул журнала, обратное
 чтение, `{"ok": False, "error": …}` дирижёра) работают как работали.
@@ -53,6 +57,28 @@ _REDIRECT_CODES = (301, 302, 303, 307, 308)
 # и это не догадка: 28.07 строка журнала потерялась именно на нём, а живые пробы тем же адресом
 # отвечали 200. Постоянные (401/403) не повторяем — повтор их не вылечит.
 _ECHO_RETRY_CODES = (404, 429, 500, 502, 503, 504)
+# ── ЧТЕНИЕ ОБЯЗАНО ПЕРЕЖИВАТЬ ОТКАЗ ВТОРОГО ПЛЕЧА (класс 07.08.2026) ─────────────────────────
+# ЧЕМ ЛЕЧИТСЯ МЁРТВЫЙ КЛЮЧ РАСПИСКИ. `user_content_key` одноразовый и выдаётся ПЕРВЫМ плечом.
+# Значит повтор ПО ТОМУ ЖЕ адресу echo (`_fetch_receipt`) мёртвый ключ не воскрешает — воскрешает
+# только НОВЫЙ запрос ЦЕЛИКОМ: у него новый 302 и новый ключ. Для POST этого делать нельзя
+# (вторая запись), для GET — можно и нужно: он идемпотентен по определению.
+#
+# ЭТО НЕ ТЕОРИЯ, А ЗАМЕР 07.08.2026 (проба на 40 одиночных чтений `get_pending`, лог
+# `docs/artifacts/2026-08-07-queue-read-second-leg.md`): 30 OK, **7 отскоков** второго плеча
+# обратно на `/exec` и **3 ответа 404** — четверть чтений падала, причём ПАЧКАМИ (#5–#7, #35–#38),
+# а не поодиночке. Повтор целиком с паузой пачку переживает, повтор мёртвого ключа — нет.
+#
+# ПОЧЕМУ ЭТОГО НЕ БЫЛО С 02.08. Форма `ab5106d` писалась по инциденту ЗАПИСИ, и лекарство
+# «новый запрос целиком» легло не сюда, а в личные обёртки писателей (`cowork_log_append.
+# with_retry`, `brain_writer._retry_read`). У читателя очереди (`pc_orchestrator.Bridge._call`)
+# своей обёртки нет ВООБЩЕ — один отскок ослеплял виток демона целиком. За 02:46–06:18 07.08
+# это дало 43 отказа `get_pending` подряд в живом логе.
+#
+# ПЕРВОЕ ПЛЕЧО ЗДЕСЬ НЕ ПОВТОРЯЕМ СОЗНАТЕЛЬНО: его отказ — это «связи нет» либо отказ моста по
+# существу (401/403), и он обязан дойти до вызывающего немедленно, чтобы `error_kind` назвал его
+# правильно. Внешние рубежи писателей как раз про первое плечо и остаются на месте.
+READ_TRIES = 3            # попыток ЦЕЛИКОМ НОВОГО запроса для идемпотентного GET
+READ_PAUSE = 1.2          # база экспоненциальной паузы между ними, сек
 # Отпечаток отказа ЧИТАТЕЛЯ моста (Bridge.js → doGet, строки 27-32). Держим строкой в нижнем
 # регистре: сравниваем нечувствительно к регистру, чтобы правка текста на стороне моста не
 # превратила «расписка потеряна» в «отказ записи» молча.
@@ -216,24 +242,31 @@ def _fetch_receipt(url, timeout, opener, sleeper, origin, method, tries=ECHO_TRI
         if code in _REDIRECT_CODES and _endpoint(
                 urllib.parse.urljoin(url, _location(resp) or "")) == origin:
             _close(resp)
-            last = _leg_error(method, _BOUNCE_TEXT)   # повторяем: ключ мог просто не поспеть
+            # ОТСКОК = ключ расписки МЁРТВ, а не «не поспел»: он одноразовый и выдан первым
+            # плечом. Для GET переспрашивать его бессмысленно — лечит только новый запрос
+            # целиком (внешний цикл `exchange`), поэтому отдаём отказ СРАЗУ и не жжём 1,8 с
+            # пауз на заведомо мёртвом адресе. Для POST внешнего повтора нет и не будет
+            # (вторая запись), так что там прежнее поведение — переспросить всё же стоит.
+            err = _leg_error(method, _BOUNCE_TEXT)
+            if str(method).upper() == "GET":
+                raise err
+            last = err
             continue
         return resp        # расписка либо честный следующий хоп — дальше решает внешний цикл
     raise last
 
 
-def exchange(url, method, params=None, payload=None, timeout=DEFAULT_TIMEOUT,
-             opener=None, sleeper=None, max_hops=MAX_HOPS):
-    """Один обмен с мостом с РУЧНЫМ обходом цепочки. → финальный ответ (его читает вызывающий).
+def _walk(url, method, params, payload, timeout, op, slp, max_hops, answered):
+    """Один проход цепочки. → финальный ответ.
 
-    opener/sleeper — точки инъекции для тестов (тот же приём, что get/post у brain_writer):
-    сеть в проверках не задевается ни разу."""
-    op = opener or _default_opener()
-    slp = sleeper or time.sleep
+    `answered` — список-флаг: как только первое плечо ответило редиректом, сюда падает отметка.
+    По ней внешний цикл отличает «до моста не дошли» (повторять не наше дело) от «отказало ВТОРОЕ
+    плечо» (для GET лечится новым запросом целиком)."""
     origin = _endpoint(url)
     resp = op.open(_request(url, method, params, payload), timeout=timeout)
     cur, hops = url, 0
     while _status(resp) in _REDIRECT_CODES:
+        answered.append(True)
         loc = _location(resp)
         _close(resp)
         if not loc:
@@ -249,6 +282,44 @@ def exchange(url, method, params=None, payload=None, timeout=DEFAULT_TIMEOUT,
         resp = _fetch_receipt(cur, timeout, op, slp, origin, method)
         hops += 1
     return resp
+
+
+def _read_retryable(exc):
+    """Стоит ли переспрашивать ЦЕЛИКОМ идемпотентное чтение после отказа второго плеча.
+
+    `BridgeReceiptLost` — никогда и ни при каких условиях (у GET он и не рождается, но проверка
+    стоит первой: он наследник `BridgeTransportError`, и молчаливое расширение типов не смеет
+    открыть повтор мутации). `HTTPError` проверяется раньше `URLError`/`OSError` — он их
+    наследник; постоянные коды второго плеча (401/403) повторять по-прежнему незачем."""
+    if isinstance(exc, BridgeReceiptLost):
+        return False
+    if isinstance(exc, urllib.error.HTTPError):
+        return _echo_retryable(exc.code)
+    return isinstance(exc, (BridgeTransportError, urllib.error.URLError,
+                            TimeoutError, socket.timeout, OSError))
+
+
+def exchange(url, method, params=None, payload=None, timeout=DEFAULT_TIMEOUT,
+             opener=None, sleeper=None, max_hops=MAX_HOPS, tries=None):
+    """Один обмен с мостом с РУЧНЫМ обходом цепочки. → финальный ответ (его читает вызывающий).
+
+    ЧТЕНИЕ ПЕРЕЖИВАЕТ ОТКАЗ ВТОРОГО ПЛЕЧА: `GET` переспрашивается ЦЕЛИКОМ (`READ_TRIES`) — новый
+    запрос получает новый одноразовый ключ расписки, см. блок у `READ_TRIES`. Мутация не
+    переспрашивается НИКОГДА: `n` для не-GET жёстко равно 1, и это не настройка.
+
+    opener/sleeper/tries — точки инъекции для тестов (тот же приём, что get/post у brain_writer):
+    сеть в проверках не задевается ни разу."""
+    op = opener or _default_opener()
+    slp = sleeper or time.sleep
+    n = 1 if str(method).upper() != "GET" else max(1, READ_TRIES if tries is None else tries)
+    for attempt in range(n):
+        answered = []
+        try:
+            return _walk(url, method, params, payload, timeout, op, slp, max_hops, answered)
+        except Exception as e:
+            if attempt + 1 >= n or not answered or not _read_retryable(e):
+                raise
+            slp(READ_PAUSE * (2 ** attempt))
 
 
 def _doget_refusal(data):
@@ -326,11 +397,11 @@ def explain(exc, timeout=None):
 
 
 def request_json(url, method, params=None, payload=None, timeout=DEFAULT_TIMEOUT,
-                 opener=None, sleeper=None):
+                 opener=None, sleeper=None, tries=None):
     """Вызов моста → разобранный JSON. Транспортный сбой — ИСКЛЮЧЕНИЕ (контракт прежних
     `_get`/`_post` на голом urlopen сохранён дословно)."""
     resp = exchange(url, method, params=params, payload=payload, timeout=timeout,
-                    opener=opener, sleeper=sleeper)
+                    opener=opener, sleeper=sleeper, tries=tries)
     try:
         raw = resp.read().decode("utf-8", "replace")
     finally:
