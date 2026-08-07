@@ -8409,5 +8409,257 @@ class TestTaskLifecycleNeverDuplicatesTheDm(unittest.TestCase):
         self.assertIn("не дублируется", line)
 
 
+class FakeGit:
+    """Мини-git, отвечающий в ЖИВОМ формате на ОБА способа спросить версию кода:
+      • `rev-parse HEAD:<путь>`      — как спрашивал self-update ДО фикса (один файл);
+      • `ls-tree -r HEAD -- <пути>`  — как спрашивает ПОСЛЕ (всё import-замыкание).
+    Оба вида нужны в одном моке СПЕЦИАЛЬНО: тогда один и тот же тест исполним и на старом коде
+    (и там красный), и на новом (зелёный) — красноту доказывает поведение, а не `AttributeError`.
+    Формат строки ls-tree снят с живого git этого репозитория:
+        `100644 blob 70aa937b22e1e0a1cd6402c76eceecda81bf2240\tbridge_http.py`
+    (голден на него — test_ls_tree_fixture_matches_live_git ниже)."""
+
+    def __init__(self, blobs):
+        self.blobs = dict(blobs)
+        self.asked = []
+
+    def __call__(self, args, **kw):
+        args = list(args)
+        self.asked.append(args)
+        if args[:1] == ["rev-parse"] and len(args) == 2 and args[1].startswith("HEAD:"):
+            return self.blobs.get(args[1][len("HEAD:"):])
+        if args[:1] == ["ls-tree"] and "--" in args:
+            paths = args[args.index("--") + 1:]
+            return "\n".join("100644 blob %s\t%s" % (self.blobs[p], p)
+                             for p in paths if p in self.blobs)
+        return ""
+
+
+class TestSelfUpdateDepClosure(Base):
+    """КЛАСС «слежу за одним файлом вместо всех зависимостей» (07.08.2026).
+
+    Живой факт: d72fe26 починил чтение очереди в bridge_http.py, а self-update сверял блоб ОДНОГО
+    pc_orchestrator.py — правка в бой сама не входила. Здесь проверяется ровно развилка задания:
+    правка ЗАВИСИМОГО модуля рождает self-update, правка ПОСТОРОННЕГО файла — нет."""
+
+    ALL_PY = None      # блоб-карта «весь репозиторий» — обе реализации найдут в ней что спросят
+
+    def setUp(self):
+        super().setUp()
+        self._git = o._git_out
+        self.tmp = tempfile.mkdtemp()
+        self.blobs = {n: "blob-" + n for n in os.listdir(o.REPO) if n.endswith(".py")}
+
+    def tearDown(self):
+        o._git_out = self._git
+        super().tearDown()
+
+    def _version(self, blobs):
+        """«Версия кода демона» глазами self-update при таком состоянии HEAD."""
+        o._git_out = FakeGit(blobs)
+        return o._blob_hash()
+
+    # ---------- главная развилка задания ----------
+
+    def test_dependency_change_moves_daemon_version(self):
+        """КРАСНЫЙ ДО ФИКСА: правка bridge_http.py (тот самый d72fe26) обязана менять версию."""
+        before = self._version(self.blobs)
+        after_blobs = dict(self.blobs, **{"bridge_http.py": "blob-fixed-d72fe26"})
+        self.assertNotEqual(before, self._version(after_blobs))
+
+    def test_transitive_and_lazy_dependency_change_moves_version(self):
+        """Не только верхние импорты: moderation_ipc тянется ТРАНЗИТИВНО (через suggest), а
+        selfupdate_gate/pc_agent — ЛЕНИВО, изнутри функций. Демон несёт их все."""
+        base = self._version(self.blobs)
+        for dep in ("moderation_ipc.py", "selfupdate_gate.py", "pc_agent.py", "pretool_guard.py",
+                    "task_metrics.py", "card_duty.py"):
+            with self.subTest(dep=dep):
+                self.assertNotEqual(base, self._version(dict(self.blobs, **{dep: "blob-new"})))
+
+    def test_foreign_file_change_keeps_version(self):
+        """ЗЕРКАЛО развилки: посторонний файл рестарт НЕ рождает. Чаще перезапускаться нельзя —
+        именно эта половина стережёт условие «порог прежний»."""
+        base = self._version(self.blobs)
+        for foreign in ("test_pc_orchestrator.py", "userbot_listen.py", "moderation_bot.py",
+                        "trainer_run.py", "cowork_log_append.py", "brain_writer.py"):
+            with self.subTest(foreign=foreign):
+                self.assertEqual(base, self._version(dict(self.blobs, **{foreign: "blob-new"})))
+
+    def test_self_update_fires_on_dependency_only_commit(self):
+        """Сквозь maybe_self_update: коммит, тронувший ТОЛЬКО зависимость, доезжает до демона."""
+        save = (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB, o._selfupdate_restart_children)
+        o._selfupdate_restart_children = lambda *a, **k: ""
+        o.RUNNING_BLOB, o._SU_REJECTED_BLOB = self._version(self.blobs), None
+        o.RUNNING_COMMIT = "old1111"
+        try:
+            after = dict(self.blobs, **{"bridge_http.py": "blob-fixed"})
+            fired = o.maybe_self_update(
+                blob_fn=lambda: self._version(after), head_fn=lambda: "new2222",
+                code_gate=lambda: (True, "ok"), tests_gate=lambda: (True, "ok"),
+                spawner=lambda: True, dirty_fn=lambda: [], deps_fn=lambda: ["bridge_http.py"])
+            self.assertTrue(fired)
+            same = o.maybe_self_update(                       # посторонний файл — эстафеты нет
+                blob_fn=lambda: self._version(dict(self.blobs, **{"trainer.py": "blob-new"})),
+                head_fn=lambda: "new3333", code_gate=lambda: (True, "ok"),
+                tests_gate=lambda: (True, "ok"), spawner=lambda: True, dirty_fn=lambda: [])
+            self.assertFalse(same)
+        finally:
+            (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB,
+             o._selfupdate_restart_children) = save
+
+    def test_changed_dependency_named_in_log_and_journal(self):
+        """Отчёт обязан назвать ЧТО приехало: «self-update» без имени файла нечитаем для разбора."""
+        save = (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB,
+                o._selfupdate_restart_children, o._cowork)
+        lines = []
+        o._cowork, o._selfupdate_restart_children = lines.append, (lambda *a, **k: "")
+        o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB = "v-old", "old1111", None
+        try:
+            with self.assertLogs(o.log, level="INFO") as cm:
+                o.maybe_self_update(blob_fn=lambda: "v-new", head_fn=lambda: "new2222",
+                                    code_gate=lambda: (True, "ok"), tests_gate=lambda: (True, "ok"),
+                                    spawner=lambda: True, dirty_fn=lambda: [],
+                                    deps_fn=lambda: ["bridge_http.py"])
+            self.assertIn("bridge_http.py", "\n".join(cm.output))
+            self.assertTrue(any("bridge_http.py" in s for s in lines))
+        finally:
+            (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB,
+             o._selfupdate_restart_children, o._cowork) = save
+
+    # ---------- как строится список зависимостей ----------
+
+    def test_dep_list_is_computed_not_written_by_hand(self):
+        """Список — транзитивное import-замыкание С ДИСКА, поэтому не отстаёт от кода."""
+        deps = set(o._dep_files())
+        self.assertIn("pc_orchestrator.py", deps)              # сама входная точка
+        self.assertLessEqual({"bridge_http.py", "task_metrics.py", "client_contour.py",
+                              "card_duty.py", "pretool_guard.py", "io_utf8.py"}, deps)   # верхние
+        self.assertLessEqual({"suggest.py", "reviewer.py", "pc_agent.py",
+                              "selfupdate_gate.py"}, deps)                                # ленивые
+        self.assertIn("moderation_ipc.py", deps)                                          # транзитивные
+        for stranger in ("userbot_listen.py", "moderation_bot.py", "trainer_run.py",
+                         "test_pc_orchestrator.py", "cowork_log_append.py"):
+            self.assertNotIn(stranger, deps)                   # чужого в замыкании нет
+
+    def test_dep_list_grows_with_a_new_import(self):
+        """Проверка ИМЕННО механизма «по факту, а не руками»: подкладываем модуль, который демон
+        импортирует, во временный репозиторий-двойник — он обязан появиться в списке сам."""
+        d = Path(self.tmp) / "repo_twin"
+        d.mkdir()
+        (d / "pc_orchestrator.py").write_text("import brand_new_dep\n", encoding="utf-8")
+        (d / "brand_new_dep.py").write_text("X = 1\n", encoding="utf-8")
+        (d / "not_imported.py").write_text("Y = 2\n", encoding="utf-8")
+        import client_contour
+        deps = sorted(client_contour.closure(str(d), entries=("pc_orchestrator.py",), cut=()).files)
+        self.assertEqual(deps, ["brand_new_dep.py", "pc_orchestrator.py"])
+
+    def test_data_files_are_not_dependencies(self):
+        """Промпты/json демон читает С ДИСКА в рантайме — рестарт им не нужен. Их присутствие в
+        отпечатке было бы учащением рестартов, которого делать нельзя."""
+        self.assertFalse([f for f in o._dep_files() if not f.endswith(".py")])
+
+    def test_broken_graph_falls_back_to_old_behavior(self):
+        """FAIL-SAFE: граф не построился → следим за одним файлом, как раньше (не слепнем и не
+        рестартуем вслепую)."""
+        broken = types.SimpleNamespace(files=frozenset(), data=frozenset(), ok=False,
+                                       reason="битый синтаксис")
+        o._DEP_FALLBACK_WARNED = False
+        self.assertEqual(o._dep_files(closure_fn=lambda *a, **k: broken), ["pc_orchestrator.py"])
+
+    # ---------- сверка мока с живым git ----------
+
+    def test_ls_tree_fixture_matches_live_git(self):
+        """Правило репозитория: мок обязан копировать ЖИВОЙ формат. Снимаем ls-tree с настоящего
+        git этого дерева и парсим ТЕМ ЖЕ разбором, что и в бою."""
+        blobs = o._dep_blobs()
+        if blobs is None:
+            self.skipTest("git недоступен")
+        self.assertIn("pc_orchestrator.py", blobs)
+        self.assertRegex(blobs["pc_orchestrator.py"], r"^[0-9a-f]{40}$")
+        self.assertTrue(set(blobs) <= set(o._dep_files()))
+
+    def test_git_silence_is_not_a_change(self):
+        """git молчит → None, и self-update не трогает процесс (контракт не менялся)."""
+        self.assertIsNone(o._dep_blobs(git_fn=lambda *a, **k: None))
+        self.assertIsNone(o._blob_hash(git_fn=lambda *a, **k: None))
+        self.assertIsNone(o._blob_hash(git_fn=lambda *a, **k: ""))   # входной точки в HEAD нет
+
+    def test_every_dependency_is_asked_about_in_one_git_call(self):
+        """19 подпроцессов на тик поллинга — не «мелочь», а цена в бою: спрашиваем ОДНИМ вызовом."""
+        g = FakeGit(self.blobs)
+        o._git_out = g
+        o._blob_hash()
+        self.assertEqual(len(g.asked), 1)
+        asked = set(g.asked[0][g.asked[0].index("--") + 1:])
+        self.assertEqual(asked, set(o._dep_files()))
+
+    # ---------- смычки, которые фикс обязан был подтянуть ----------
+
+    def test_dirty_gate_watches_exactly_what_start_loads_unconditionally(self):
+        """РАЗВИЛКА, решённая замером: ворота грязного дерева (класс 28.07) НЕ расширены до всего
+        замыкания self-update — у них другой вопрос, «что рестарт унесёт в бой незакоммиченным»,
+        то есть что грузится БЕЗУСЛОВНО. Здесь это считается транзитивно (сильнее, чем
+        test_orch_runtime_covers_every_top_import_of_daemon: тот смотрит только прямые импорты
+        демона) и обязано совпасть с ручным кортежем файл-в-файл. Разъедется — красный здесь."""
+        import ast
+
+        def top_imports(path):
+            with io.open(path, encoding="utf-8") as f:
+                tree = ast.parse(f.read(), filename=path)
+            names, stack = set(), list(tree.body)
+            while stack:
+                node = stack.pop()
+                if isinstance(node, ast.Try):
+                    stack.extend(node.body + node.orelse + node.finalbody)
+                    for h in node.handlers:
+                        stack.extend(h.body)
+                elif isinstance(node, ast.If):
+                    stack.extend(node.body + node.orelse)
+                elif isinstance(node, ast.Import):
+                    names |= {a.name.split(".")[0] for a in node.names}
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    names.add(node.module.split(".")[0])
+            return names
+
+        unconditional, queue = set(), ["pc_orchestrator.py"]
+        while queue:
+            name = queue.pop()
+            if name in unconditional:
+                continue
+            unconditional.add(name)
+            for mod in top_imports(os.path.join(o.REPO, name)):
+                if os.path.isfile(os.path.join(o.REPO, mod + ".py")):
+                    queue.append(mod + ".py")
+        self.assertEqual(unconditional, set(o._ORCH_RUNTIME))
+
+    def test_lazy_dependencies_are_a_named_remainder_not_a_silent_gap(self):
+        """Ленивые зависимости триггерят self-update, но воротами грязного дерева НЕ покрыты —
+        осознанно (WIP в suggest.py глушил бы доставку). Остаток обязан быть НАЗВАН и совпадать с
+        фактом: молчаливая дыра и записанный остаток — разные вещи."""
+        lazy = set(o._dep_files()) - set(o._ORCH_RUNTIME)
+        self.assertEqual(lazy, set(o._ORCH_LAZY_UNCOVERED))
+        self.assertEqual(o._dirty_for_proc("orchestrator", dirty_fn=lambda: sorted(lazy)), [])
+
+    def test_code_gate_compiles_every_dependency(self):
+        """Ленивые импорты (selfupdate_gate/pc_agent/suggest) import-smoke не касается — их
+        синтаксис обязан проверить py_compile, иначе рестарт уедет в битый ленивый модуль."""
+        seen = {}
+        with mock.patch.object(selfupdate_gate, "code_gate",
+                               lambda py, cwd, files, smoke, **kw: seen.update(
+                                   files=list(files), smoke=smoke) or (True, "ok")):
+            self.assertEqual(o.self_update_ok(), (True, "ok"))
+        self.assertEqual(set(seen["files"]), set(o._dep_files()))
+        self.assertEqual(seen["smoke"], "pc_orchestrator")
+
+    def test_whole_closure_compiles_right_now(self):
+        """Живая проверка: замыкание, которое теперь гейтится целиком, компилируется сегодня —
+        фикс не приносит с собой красный гейт на ровном месте."""
+        import py_compile
+        for f in o._dep_files():
+            with self.subTest(f=f):
+                py_compile.compile(os.path.join(o.REPO, f), cfile=os.path.join(self.tmp, f + "c"),
+                                   doraise=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

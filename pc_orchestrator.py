@@ -3501,14 +3501,35 @@ def poll_once():
 
 
 # ------------------------------- self-update ---------------------------------
-# Порт VPS-паттерна: задача изменила pc_orchestrator.py (блоб HEAD != запущенной версии) →
+# Порт VPS-паттерна: КОД ДЕМОНА изменился (отпечаток HEAD != запущенной версии) →
 # гейт (code_gate + unittest своих тестов) → управляемый рестарт: spawn нового процесса →
 # лог/cowork «self-update: <старый коммит>→<новый>» → старый выходит. Watchdog — страховка:
 # если новый упадёт на ходу, heartbeat протухнет и schtasks /Run поднимет демон.
+#
+# КЛАСС «СЛЕЖУ ЗА ОДНИМ ФАЙЛОМ ВМЕСТО ВСЕХ ЗАВИСИМОСТЕЙ» (закрыт 07.08.2026). До фикса «версией
+# демона» был блоб ОДНОГО файла — pc_orchestrator.py. Но python грузит с диска ВСЁ import-замыкание,
+# и демон де-факто несёт ещё 18 модулей: правка любого из них в бой сама не входила и ждала, пока
+# кто-нибудь не тронет pc_orchestrator.py — тогда уезжала «прицепом», незаявленной. Живой факт,
+# с которого фикс заведён: d72fe26 починил чтение очереди в bridge_http.py и НЕ ДОЕХАЛ вовсе.
+# ЗАМЕР за 7 суток (docs/artifacts/2026-08-07-selfupdate-dep-closure.md): из 98 коммитов старое
+# правило доставляло 14, новое доставит 29 — ПЯТНАДЦАТЬ правок кода демона доставку теряли и ждали
+# чужого коммита «прицепом»: медиана 2ч39м, максимум 44ч45м, сумма 110ч45м, а d72fe26 не доехала
+# вовсе. Остальные 69 коммитов (доки/тесты/боты) рестарта не рождают ни там ни здесь — порог и
+# условия не тронуты, изменилось ТОЛЬКО то, что считается изменением.
+#
+# СПИСОК ЗАВИСИМОСТЕЙ НЕ ПИШЕТСЯ РУКАМИ (и потому не отстаёт). Он считается по ФАКТУ импортов с
+# диска — тем же обходом ast, что держит ворота клиентского контура (client_contour.closure),
+# только от входной точки демона и БЕЗ среза на чужих процессах. Новый импорт становится
+# зависимостью в тот же момент, когда его пишут; ручной список отстал бы через месяц — ровно это
+# уже случилось рядом, с `_ORCH_RUNTIME` (см. _orch_runtime_files ниже).
 
-RUNNING_BLOB = None       # git-блоб pc_orchestrator.py на момент старта («запущенная версия»)
+DEP_ENTRY = "pc_orchestrator.py"      # входная точка процесса демона (корень его import-замыкания)
+
+RUNNING_BLOB = None       # ОТПЕЧАТОК замыкания демона на момент старта («запущенная версия»)
+RUNNING_DEP_BLOBS = None  # {путь: блоб} того же замыкания — чтобы назвать ПОИМЁННО, что изменилось
 RUNNING_COMMIT = "?"      # короткий коммит на момент старта (для строки self-update в логе)
-_SU_REJECTED_BLOB = None  # блоб, уже проваливший гейт — не гоняем гейт каждый цикл, ждём нового коммита
+_SU_REJECTED_BLOB = None  # отпечаток, уже проваливший гейт — не гоняем гейт каждый цикл, ждём нового коммита
+_DEP_FALLBACK_WARNED = False   # о срыве графа говорим один раз на процесс, а не каждый тик
 
 
 def _git_out(args):
@@ -3534,9 +3555,78 @@ def _git_call(args, timeout=90):
         return None
 
 
-def _blob_hash():
-    """Хеш содержимого pc_orchestrator.py в HEAD — «версия» кода демона (дифф против запущенной)."""
-    return _git_out(["rev-parse", "HEAD:pc_orchestrator.py"])
+def _dep_files(entry=DEP_ENTRY, closure_fn=None):
+    """ОТ ЧЕГО ЗАВИСИТ ДЕМОН — транзитивное import-замыкание его входной точки, посчитанное ПО
+    ФАКТУ импортов с диска (ast, включая ленивые импорты внутри функций), а не списком руками.
+    → отсортированный список путей репозитория, ПЕРВЫМ делом включающий сам DEP_ENTRY.
+
+    Срез на чужих процессах (client_contour.FOREIGN_ENTRIES) здесь СНЯТ (cut=()): он отвечает на
+    вопрос «увидит ли это клиент», а нам нужен другой — «что грузит в память ЭТОТ процесс».
+    pc_agent.py демон импортирует лениво (рестарт детей) — стухшая копия так же реальна.
+
+    Данные замыкания (cl.data — промпты/json-правила) СПЕЦИАЛЬНО не берём: их демон читает с диска
+    в рантайме, рестарта они не требуют, а рестарты на каждую правку json были бы ровно тем
+    учащением, которого делать нельзя.
+
+    Граф не построился (нет входной точки, битый синтаксис, каталог не читается) → откат к
+    [DEP_ENTRY], то есть к ПРЕЖНЕМУ поведению: «не знаю зависимостей» — это не повод ослепнуть
+    совсем и не повод рестартовать вслепую."""
+    global _DEP_FALLBACK_WARNED
+    try:
+        cl = (closure_fn or client_contour.closure)(REPO, entries=(entry,), cut=())
+        if cl.ok and entry in cl.files:
+            return sorted(cl.files)
+        reason = cl.reason
+    except Exception as e:
+        reason = f"{type(e).__name__}: {e}"
+    if not _DEP_FALLBACK_WARNED:
+        _DEP_FALLBACK_WARNED = True
+        log.warning("self-update: граф зависимостей демона не построен (%s) — слежу только за %s "
+                    "(прежнее поведение)", reason, entry)
+    return [entry]
+
+
+def _dep_blobs(files=None, git_fn=None):
+    """{путь: блоб в HEAD} для файлов замыкания — ОДНИМ вызовом git (ls-tree принимает список
+    путей; звать rev-parse по файлу значило бы 19 подпроцессов на каждый тик поллинга).
+    → dict | None, если git молчит ИЛИ в HEAD нет самой входной точки: «не знаю» ≠ «не менялось».
+    Файл замыкания, которого в HEAD нет (новый untracked модуль), просто не попадает в отпечаток —
+    его правки и коммитом не приезжали, судить о них нечем."""
+    files = list(files if files is not None else _dep_files())
+    out = (git_fn or _git_out)(["ls-tree", "-r", "HEAD", "--"] + files)
+    if out is None:
+        return None
+    blobs = {}
+    for ln in out.splitlines():
+        meta, _, path = ln.partition("\t")
+        cols = meta.split()
+        if path.strip() and len(cols) >= 3:
+            blobs[path.strip()] = cols[2]
+    return blobs if DEP_ENTRY in blobs else None
+
+
+def _blob_hash(files=None, git_fn=None):
+    """ВЕРСИЯ КОДА ДЕМОНА — отпечаток блобов ВСЕГО его import-замыкания в HEAD (не одного файла).
+    Меняется от правки любой зависимости и не меняется от правки постороннего файла.
+    → hex-строка | None (git молчит — как и раньше, тогда self-update просто не трогает процесс)."""
+    blobs = _dep_blobs(files, git_fn)
+    if not blobs:
+        return None
+    body = "\n".join(f"{p} {blobs[p]}" for p in sorted(blobs))
+    return hashlib.sha1(body.encode("utf-8")).hexdigest()
+
+
+def _changed_deps(before=None, files=None, git_fn=None):
+    """Поимённо: какие файлы замыкания разошлись с запущенной версией. → список (пустой, если
+    сказать нечего). Нужен ТОЛЬКО для честной строки в логе/журнале — решение принимает отпечаток.
+    Отсюда мягкость: не знаем — молчим, а не блокируем обновление."""
+    before = RUNNING_DEP_BLOBS if before is None else before
+    if not before:
+        return []
+    now = _dep_blobs(files, git_fn)
+    if not now:
+        return []
+    return sorted(p for p in set(before) | set(now) if before.get(p) != now.get(p))
 
 
 def _head_commit():
@@ -3544,9 +3634,13 @@ def _head_commit():
 
 
 def _init_running_version():
-    global RUNNING_BLOB, RUNNING_COMMIT
+    global RUNNING_BLOB, RUNNING_DEP_BLOBS, RUNNING_COMMIT
+    RUNNING_DEP_BLOBS = _dep_blobs()
     RUNNING_BLOB = _blob_hash()
     RUNNING_COMMIT = _head_commit()
+    deps = sorted(RUNNING_DEP_BLOBS or {})
+    log.info("=== ЗАВИСИМОСТИ ДЕМОНА (self-update следит за ВСЕМИ, %d): %s ===",
+             len(deps), ", ".join(deps) or "не определены")
 
 
 def _gate_unittests():
@@ -3586,7 +3680,7 @@ def _spawn_daemon():
 
 
 def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=None, head_fn=None,
-                      children_fn=None, dirty_fn=None):
+                      children_fn=None, dirty_fn=None, deps_fn=None):
     """→ True = гейт пройден, новый процесс запущен, ТЕКУЩИЙ должен выйти (эстафета передана).
     False = обновляться нечему/нельзя (нет диффа, рубильник, ГРЯЗНОЕ ДЕРЕВО, гейт провален, spawn
     не удался) — продолжаем на старом коде. Провал гейта запоминается по блобу (без перегона
@@ -3607,7 +3701,12 @@ def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=Non
                          label="демон (self-update)", dirty_fn=dirty_fn)
     if dirty:
         return False              # блоб НЕ помечаем отвергнутым: чистое дерево обязано разблокировать
-    log.info("self-update: pc_orchestrator.py изменился (%s→%s) — гоняю гейт", RUNNING_COMMIT, new_commit)
+    try:                          # имена — только для честной строки; их отсутствие обновление не держит
+        changed = (deps_fn or _changed_deps)()
+    except Exception:
+        changed = []
+    what = ", ".join(changed) if changed else "код демона"
+    log.info("self-update: изменилось %s (%s→%s) — гоняю гейт", what, RUNNING_COMMIT, new_commit)
     ok, msg = (code_gate or self_update_ok)()
     if not ok:
         _SU_REJECTED_BLOB = new_blob
@@ -3636,7 +3735,8 @@ def maybe_self_update(blob_fn=None, code_gate=None, tests_gate=None, spawner=Non
                   "(упаду — watchdog поднимет через schtasks)")
         return False
     log.info("self-update: %s→%s — гейт пройден, новый процесс запущен, передаю управление", RUNNING_COMMIT, new_commit)
-    _cowork(f"self-update: {RUNNING_COMMIT}→{new_commit} (гейт пройден, управляемый рестарт демона)")
+    _cowork(f"self-update: {RUNNING_COMMIT}→{new_commit} — {what} "
+            "(гейт пройден, управляемый рестарт демона)")
     return True
 
 
@@ -3762,7 +3862,7 @@ def _killed_by_planned_restart(rc, task_text, blob_fn=None):
     (задача правила pc_orchestrator.py). РОВНО 4 обязательных признака, нужны ВСЕ (любое сомнение
     → False → прежний честный failed, fail-safe):
       1) rc != 0 — claude оборвался ненормально (логический no-RESULT при rc==0 сюда НЕ попадает);
-      2) self-update РЕАЛЬНО назрел: HEAD-блоб pc_orchestrator.py != запущенной версии RUNNING_BLOB
+      2) self-update РЕАЛЬНО назрел: отпечаток замыкания демона в HEAD != запущенного RUNNING_BLOB
          (единственная причина планового рестарта — задача закоммитила правку самого демона);
       3) текст задачи — про сам демон (pc_orchestrator / самомодификация);
       4) взведён рубильник pc_orchestrator.stop — демон в окне намеренной остановки/рестарта.
@@ -5173,6 +5273,23 @@ _ORCH_RUNTIME = ("pc_orchestrator.py", "gate_selective.py", "task_metrics.py",
                  "pretool_guard.py", "io_utf8.py")     # что несёт САМ демон (его верхние импорты)
 _DIRTY_WARNED = {}      # процесс → (коммит, кортеж грязных файлов), о которых уже сказали
 
+# ПОЧЕМУ ЭТОТ СПИСОК НЕ РАСШИРЕН ЗАМЫКАНИЕМ SELF-UPDATE (развилка 07.08.2026, решена ЗАМЕРОМ).
+# Соблазн очевиден: раз self-update теперь следит за всеми 19 файлами замыкания, пусть и ворота
+# грязного дерева смотрят те же 19. Попробовали — и отказались, потому что вопросы РАЗНЫЕ:
+#   • self-update спрашивает «изменился ли код, который я исполняю» — тут нужны ВСЕ зависимости;
+#   • эти ворота спрашивают «что рестарт унесёт в бой НЕЗАКОММИЧЕННЫМ» — а это ровно то, что
+#     грузится БЕЗУСЛОВНО при старте процесса.
+# Замер (tmp-пробник probe_toplevel, артефакт §4): безусловное транзитивное замыкание демона —
+# РОВНО 10 файлов и РОВНО совпадает с кортежем выше, ни лишнего, ни упущенного. Остальные 9
+# (suggest, reviewer, pc_agent, moderation_ipc, pricing, delivery, dispatch_notify, session_watch,
+# selfupdate_gate) импортируются ЛЕНИВО. Внести их сюда значило бы: WIP в suggest.py — самом
+# правимом файле репозитория — ГЛУШИТ доставку правок демону и шлёт владельцу карточку отказа,
+# то есть чинимую сейчас потерю доставки мы бы вернули с другой стороны. Условие оставлено прежним
+# сознательно; ленивая зависимость с незакоммиченной правкой — честный ОСТАТОК, он был и до фикса.
+_ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_ipc.py",
+                        "pricing.py", "delivery.py", "dispatch_notify.py", "session_watch.py",
+                        "selfupdate_gate.py")   # остаток: ленивые импорты вне ворот грязного дерева
+
 
 def _dirty_tracked(runner=None):
     """Отслеживаемые файлы с незакоммиченными правками (индекс + рабочее дерево против HEAD).
@@ -5193,7 +5310,8 @@ def _dirty_tracked(runner=None):
 
 def _dirty_for_proc(kind, dirty_fn=None):
     """Грязные файлы, которые несёт процесс kind. Для ботов — по той же карте, что решает рестарт;
-    для демона — его собственный модуль и верхние импорты. → список | None (состояние неизвестно)."""
+    для демона — то, что он грузит БЕЗУСЛОВНО (_ORCH_RUNTIME; почему не всё замыкание self-update —
+    в комментарии над кортежем). → список | None (состояние неизвестно)."""
     dirty = (dirty_fn or _dirty_tracked)()
     if dirty is None:
         return None
@@ -7856,10 +7974,17 @@ def watchdog(now=None, runner=None, verify_sleep=None, finder=None, state_path=N
 
 
 def self_update_ok():
-    """Гейт самообновления (если демон обновляется): py_compile+import-smoke нового кода. Битый → False."""
+    """Гейт самообновления (если демон обновляется): py_compile+import-smoke нового кода. Битый → False.
+
+    py_compile идёт по ВСЕМУ замыканию, а не по одному файлу демона (07.08.2026). Раньше это было
+    неважно: рестарт рождала только правка pc_orchestrator.py, а его верхние импорты всё равно
+    проверял import-smoke. Теперь рестарт рождает правка ЛЮБОЙ зависимости — включая ЛЕНИВО
+    импортируемые (selfupdate_gate, pc_agent, suggest, reviewer), которых import-smoke не касается
+    вовсе. Без этого расширения гейт пропустил бы битый ленивый модуль, и демон перезапустился бы
+    в код, падающий при первом же обращении к нему. Гейт не ужесточён — он покрыл новый вход."""
     try:
         import selfupdate_gate
-        return selfupdate_gate.code_gate(VENV_PY, REPO, ["pc_orchestrator.py"], "pc_orchestrator")
+        return selfupdate_gate.code_gate(VENV_PY, REPO, _dep_files(), "pc_orchestrator")
     except Exception as e:
         return False, f"гейт не запустился: {e}"
 

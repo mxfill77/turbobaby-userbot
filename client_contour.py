@@ -24,8 +24,9 @@ userbot и moderation_bot на коммит 4528917 за 17 минут ДО то
 Замыкание дополнено ДАННЫМИ: не-.py файлы репозитория, чьи имена лежат строковыми литералами
 в модулях замыкания (промпты, json-правила). Они меняют поведение клиента вообще без рестарта.
 
-СРЕЗ НА ЧУЖИХ ПРОЦЕССАХ (единственное исключение, и оно принципиальное). Обход НЕ идёт сквозь
-входные точки ДРУГИХ живых процессов — `pc_orchestrator.py` (демон) и `pc_agent.py` (агент): сами
+СРЕЗ НА ЧУЖИХ ПРОЦЕССАХ (единственное исключение, и оно принципиальное; ПАРАМЕТР `cut`, дефолт —
+`FOREIGN_ENTRIES`). Обход НЕ идёт сквозь входные точки ДРУГИХ живых процессов —
+`pc_orchestrator.py` (демон) и `pc_agent.py` (агент): сами
 они внутренние, и всё, что висит ТОЛЬКО под ними, внутреннее тоже. Без среза граф схлопывается:
 `moderation_core._default_lesson_enqueue` ЛЕНИВО импортирует `pc_orchestrator`, чтобы положить
 строку в очередь (`lesson_router._default_lesson_thinker` — так же, ради думателя), и через это
@@ -35,6 +36,13 @@ userbot и moderation_bot на коммит 4528917 за 17 минут ДО то
 новый заводят осознанно, файлы же появляются каждую неделю — их считает граф.
 ОСТАТОК ЧЕСТНО: код, который клиент увидит ЧЕРЕЗ демона (`_thinker_exec` классификатора уроков),
 срезом не покрыт. Появится клиентский текст внутри `pc_orchestrator.py` — признак его не поймает.
+
+Срез — ПАРАМЕТР, а не свойство обхода (07.08.2026). У обхода появился второй заказчик: self-update
+демона спрашивает «от каких файлов я завишу» (`pc_orchestrator._dep_files`) и зовёт `closure` с
+`entries=('pc_orchestrator.py',), cut=()`. Ему срез не нужен и ВРЕДЕН — `pc_agent.py` демон
+импортирует лениво, и стухшая копия этого модуля в памяти демона так же реальна, как любая другая.
+Срез отвечает на вопрос «что увидит КЛИЕНТ», а не «что импортируется»: это разные вопросы, поэтому
+он переехал из тела обхода в аргумент. Дефолт сохранён байт-в-байт — ворота контура не тронуты.
 
 FAIL-CLOSED. Не удалось построить граф (нет входной точки, файл не читается, синтаксис не
 парсится, каталог недоступен) → `is_client()` отвечает True на ВСЁ. «Не знаю» — это НЕ «внутренний».
@@ -48,7 +56,7 @@ FAIL-CLOSED. Не удалось построить граф (нет входн�
   • данные ищутся по литералам: имя файла, собранное из кусков в рантайме, не найдётся.
 
 Интерфейс:
-    closure(repo)              → Closure(files, data, ok, reason)  — замыкание с кэшем по mtime
+    closure(repo, entries, cut) → Closure(files, data, ok, reason)  — замыкание с кэшем по mtime
     is_client(path)            → bool (fail-closed True при ok=False)
     split(paths)               → (клиентские, внутренние)
     mentions(text)             → (клиентский?, что названо, определимо?) — для ворот ВХОДА (ревизор)
@@ -171,9 +179,11 @@ def _data_of(tree, repo):
     return out
 
 
-def _build(repo, entries):
+def _build(repo, entries, cut=FOREIGN_ENTRIES):
     """Обход в ширину от входных точек. → Closure. Любой сбой чтения/парса ФАЙЛА ЗАМЫКАНИЯ делает
-    результат недостоверным (ok=False) — тогда ворота считают клиентским всё."""
+    результат недостоверным (ok=False) — тогда ворота считают клиентским всё.
+    `cut` — входные точки чужих процессов, сквозь которые обход НЕ идёт (см. шапку); `cut=()` даёт
+    ЧИСТОЕ import-замыкание, без вопроса «увидит ли это клиент»."""
     files, data, queue, seen = set(), set(), [], set()
     for e in entries:
         p = os.path.join(repo, e)
@@ -197,24 +207,28 @@ def _build(repo, entries):
         data |= _data_of(tree, repo)
         for name in _imports_of(tree):
             nxt = _module_file(repo, name)
-            if nxt and os.path.basename(nxt).lower() not in FOREIGN_ENTRIES:
+            if nxt and os.path.basename(nxt).lower() not in cut:
                 queue.append(nxt)          # срез: в чужой процесс (демон/агент) не заходим
     return Closure(frozenset(files), frozenset(data), True, "ok")
 
 
-def closure(repo=None, entries=None):
-    """Транзитивное import-замыкание клиентских процессов (с кэшем по отпечатку каталога). →
-    Closure. Кэш нужен потому, что реконсиляция детей спрашивает признак каждые 60 с."""
+def closure(repo=None, entries=None, cut=None):
+    """Транзитивное import-замыкание входных точек (с кэшем по отпечатку каталога). → Closure.
+    Кэш нужен потому, что спрашивают часто: реконсиляция детей — каждые 60 с, self-update демона —
+    каждый тик поллинга. Ключ кэша включает и `entries`, и `cut`: у двух заказчиков РАЗНЫЕ
+    замыкания одного каталога, и путать их нельзя.
+    `cut=None` → дефолт `FOREIGN_ENTRIES` (ворота клиентского контура, поведение не менялось)."""
     repo = repo or REPO
     entries = tuple(entries or CLIENT_ENTRIES)
+    cut = FOREIGN_ENTRIES if cut is None else tuple(cut)
     sig = _signature(repo)
     if sig is None:
         return Closure(frozenset(), frozenset(), False, f"каталог {repo} не читается")
-    ck = (os.path.normcase(os.path.abspath(repo)), entries)
+    ck = (os.path.normcase(os.path.abspath(repo)), entries, cut)
     hit = _cache.get(ck)
     if hit and hit[0] == sig:
         return hit[1]
-    val = _build(repo, entries)
+    val = _build(repo, entries, cut)
     _cache[ck] = (sig, val)
     return val
 
