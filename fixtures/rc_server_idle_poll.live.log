@@ -1,0 +1,18 @@
+# ФИКСТУРА: живой rc_server_debug.log в ПРОСТОЕ (ветка rc-server жива, работы нет).
+# Происхождение названо честно (правило-класс «мок обязан копировать живой формат»): строки
+# скопированы ДОСЛОВНО из пробы 5 переписи docs/artifacts/2026-08-08-zero-by-nonparse-pc-recon.md,
+# снятой с живого файла 08.08.2026 в 14:30 (в логе тогда было 292 строки; здесь — первые четыре
+# и последние четыре, как их привёл замер, обрезка строк — та же, что в замере: 150 символов).
+# ЧЕМ ВАЖНА: на этих 292 строках НЕ встретился НИ ОДИН из четырёх маркеров детектора
+# (REVOKED_PHRASE, status=failed, duration=Ns, session_/cse_<id>) — 0 совпадений, — а наверх
+# уходило failures=0, неотличимое от «авторизация цела». Форма же строки (метка времени + уровень
+# в скобках) совпадала у 292 из 292: именно она отвечает на вопрос «я понимаю, что читаю».
+# Время в логе — UTC. Строки-комментарии (#) — часть фикстуры, а не лога: тест их отбрасывает.
+2026-08-06T12:38:45.776Z [DEBUG] MDM settings load completed in 33ms
+2026-08-06T12:38:45.812Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Program Files\ClaudeCode\managed-settings.js
+2026-08-06T12:38:45.861Z [DEBUG] Error log sink initialized
+2026-08-06T12:38:45.865Z [DEBUG] Error log sink initialized
+2026-08-08T07:03:09.910Z [DEBUG] [bridge:api] GET .../work/poll -> 200 (no work, 27100 consecutive empty polls)
+2026-08-08T07:12:26.934Z [DEBUG] [bridge:api] GET .../work/poll -> 200 (no work, 27200 consecutive empty polls)
+2026-08-08T07:21:42.401Z [DEBUG] [bridge:api] GET .../work/poll -> 200 (no work, 27300 consecutive empty polls)
+2026-08-08T07:30:59.342Z [DEBUG] [bridge:api] GET .../work/poll -> 200 (no work, 27400 consecutive empty polls)

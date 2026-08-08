@@ -15,10 +15,13 @@ import io
 import os
 import unittest
 
+import parse_outcome
 import rc_auth_detect as ad
 
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "fixtures", "rc_server_auth_revoked.live.log")
+IDLE_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "fixtures", "rc_server_idle_poll.live.log")
 
 # Дословные строки живого лога (в фикстуре — они же).
 LINE_REVOKED = ("2026-07-29T05:03:43.827Z [DEBUG] [code-session] Get "
@@ -34,6 +37,12 @@ LINE_JSON_NOISE = ("2026-07-29T05:03:23.401Z [DEBUG] [auto-mode] context compari
 def fixture_lines():
     with io.open(FIXTURE, encoding="utf-8") as f:
         return f.read().splitlines()
+
+
+def idle_lines():
+    """Живой лог ветки В ПРОСТОЕ без строк-комментариев фикстуры (в настоящем логе их нет)."""
+    with io.open(IDLE_FIXTURE, encoding="utf-8") as f:
+        return [ln for ln in f.read().splitlines() if not ln.startswith("#")]
 
 
 class TestFixtureIsReal(unittest.TestCase):
@@ -183,6 +192,95 @@ class TestOffsetAndTruncation(unittest.TestCase):
         self._set(LINE_REVOKED + "\n" + LINE_EXIT_FAST + "\n")
         st = ad.scan("x", st, opener=self._opener, sizer=self._sizer)
         self.assertEqual(st["failures"], 1)
+
+
+class TestReadingContract(unittest.TestCase):
+    """КОНТРАКТ ЧИТАТЕЛЯ (parse_outcome): наверх идёт ПАРА «осмотрено/опознано» и исход.
+
+    Класс, который тут заперт: 08.08 на 292 живых строках не встретился НИ ОДИН из четырёх
+    маркеров, а наверх ушло `failures = 0` — то же самое, что говорит здоровый канал. Молчание
+    источника и слепота читателя были неразличимы ничем."""
+
+    def test_idle_live_log_is_recognized_not_blind(self):
+        """Живой лог ПРОСТОЯ: 0 маркеров — но форма опознана в КАЖДОЙ строке. Это честный ноль,
+        а не слепота, и контракт обязан сказать именно так."""
+        lines = idle_lines()
+        st = ad.feed(lines, ad.new_state())
+        self.assertEqual(st["seen"], len(lines))
+        self.assertEqual(st["parsed"], len(lines))          # форма живого лога совпала на всех
+        self.assertEqual(st["marks"], 0)                    # и ни одного из четырёх маркеров
+        self.assertEqual(ad.reading(st).outcome, parse_outcome.PARSED)
+        self.assertFalse(ad.is_blind(st))
+        self.assertFalse(ad.should_restart(st))
+
+    def test_unknown_format_is_the_third_outcome(self):
+        """Формат уехал (метки времени нет ни у одной строки) → НЕРАЗБОР, а не «отказов нет»."""
+        alien = ["[08/08/26 07:30] bridge poll ok, no work"] * 292
+        st = ad.feed(alien, ad.new_state())
+        r = ad.reading(st)
+        self.assertEqual((r.seen, r.parsed, r.outcome), (292, 0, parse_outcome.NONPARSE))
+        self.assertTrue(ad.is_blind(st))
+        self.assertFalse(ad.should_restart(st), "слепой читатель не смеет рестартовать ветку")
+
+    def test_third_outcome_is_spoken_aloud_with_numbers(self):
+        """Третий исход обязан ПРОИЗНОСИТЬСЯ: числа + прямо названное последствие."""
+        st = ad.feed(["строка чужого формата"] * 5, ad.new_state())
+        note = ad.blind_note(st)
+        self.assertIn("НЕ ОПОЗНАЛ формат", note)
+        self.assertIn("осмотрено 5", note)
+        self.assertIn("НЕ значит «авторизация цела»", note)
+
+    def test_empty_tail_is_not_blindness(self):
+        """Хвост пуст (сервер молчит) — это ПЕРВЫЙ исход, а не отказ читателя."""
+        st = ad.feed([], ad.new_state())
+        self.assertEqual(ad.reading(st).outcome, parse_outcome.EMPTY)
+        self.assertFalse(ad.is_blind(st))
+
+    def test_unread_log_is_not_an_empty_tail(self):
+        """«Не прочитал» ≠ «прочитал пусто»: у read_new это None, и оно считается отдельно."""
+        lines, off, trunc = ad.read_new("Z:\\нет\\такого.log", 0)
+        self.assertIsNone(lines, "нечитаемый лог обязан отдавать «не знаю», а не пустой список")
+        self.assertEqual((off, trunc), (0, False))
+        st = ad.scan("Z:\\нет\\такого.log", ad.new_state())
+        self.assertEqual((st["unread"], st["seen"]), (1, 0))
+        self.assertFalse(ad.is_blind(st))
+
+    def test_describe_names_reading_numbers(self):
+        """Причина в логе/карточке несёт ЧИСЛА чтения, а не один счётчик отказов."""
+        st = ad.feed(fixture_lines(), ad.new_state())
+        text = ad.describe(st)
+        self.assertIn("осмотрено %d строк" % st["seen"], text)
+        self.assertIn("маркеров", text)
+
+    def test_missing_state_is_not_zero_seen(self):
+        """«Не смотрел» НЕ приводится к «осмотрено 0»: это и есть схлопывание, от которого лечим."""
+        with self.assertRaises(ValueError):
+            ad.reading(None)
+        self.assertFalse(ad.is_blind(None))
+        self.assertIn("не заводился", ad.blind_note(None))
+
+    def test_describe_of_missing_state_does_not_claim_zero_failures(self):
+        """Состояния нет (детектор не заводился) — это НЕ «отказов ноль»."""
+        text = ad.describe(None)
+        self.assertIn("не заводился", text)
+        self.assertFalse(ad.should_restart(None))
+
+    def test_truncation_resets_the_reading_too(self):
+        """Усечение = новая жизнь процесса: пара контракта считает ТЕКУЩУЮ жизнь ветки."""
+        st = ad.feed(idle_lines(), ad.new_state())
+        self.assertGreater(st["seen"], 0)
+        st["offset"] = 10 ** 6
+        body = ["2026-08-08T08:00:00.000Z [DEBUG] [bridge:api] новая жизнь"]
+        text = "\n".join(body) + "\n"
+        st = ad.scan("x", st, opener=lambda p: io.StringIO(text), sizer=lambda p: len(text))
+        self.assertEqual((st["seen"], st["parsed"]), (1, 1))
+
+    def test_shape_matches_the_revoked_fixture_too(self):
+        """Форма — общая для лога: строки инцидента 29.07 тоже опознаются (иначе признак врёт)."""
+        real = [ln for ln in fixture_lines() if not ln.startswith("#") and len(ln.strip()) > 0]
+        st = ad.feed(real, ad.new_state())
+        self.assertEqual(st["parsed"], len(real))
+        self.assertGreater(st["marks"], 0)
 
 
 if __name__ == "__main__":

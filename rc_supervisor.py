@@ -502,6 +502,7 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
         # Состояние детектора кредов заводим НА ЖИЗНЬ ПРОЦЕССА: default_spawn только что усёк
         # лог ветки, значит смещение 0 — честная точка отсчёта, старые улики не в счёт.
         auth_state = _auth.new_state() if _auth_on else None
+        auth_blind_said = False        # третий исход читателя говорим ОДИН раз на жизнь процесса
         while checks is None or c < checks:
             c += 1
             _sleep(CHECK_INTERVAL)
@@ -524,6 +525,15 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
                         if proc.poll() is None:
                             _kill(proc)
                         break
+                    # ТРЕТИЙ ИСХОД читателя (parse_outcome.NONPARSE): хвост лога непуст, а формат
+                    # не опознан НИ В ОДНОЙ строке. Молчать здесь нельзя: ноль отказов от слепого
+                    # детектора неотличим от «авторизация цела» — ровно тот класс, из-за которого
+                    # 08.08 наверх уходил ноль при 292 живых строках и 0 из 4 маркеров. Говорим
+                    # ОДИН раз на жизнь процесса (лог сторожа пишется каждый круг — иначе шум).
+                    blind = getattr(_auth, "is_blind", None)
+                    if blind is not None and not auth_blind_said and blind(auth_state):
+                        auth_blind_said = True
+                        log.warning("[%s] %s", spec["label"], _auth.blind_note(auth_state))
                 except Exception as e:      # детектор не смеет уронить сторож
                     log.warning("[%s] детектор кредов сорвался (%s)", spec["label"],
                                 type(e).__name__)
