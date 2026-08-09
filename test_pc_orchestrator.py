@@ -136,6 +136,9 @@ class Base(unittest.TestCase):
         self._save_sp = o.REVIZOR_SPOOL_FILE      # спул недоставленных находок ревизора: свой файл на тест
         o.REVIZOR_SPOOL_FILE = os.path.join(tempfile.mkdtemp(), "revizor_spool.json")  # (боевой не читаем и не пишем)
         self.addCleanup(lambda: setattr(o, "REVIZOR_SPOOL_FILE", self._save_sp))
+        self._save_vd = o.REVIZOR_VERDICT_FILE    # реестр вердиктов по находкам: свой файл на тест
+        o.REVIZOR_VERDICT_FILE = os.path.join(tempfile.mkdtemp(), "revizor_verdicts.json")  # (боевой не трогаем)
+        self.addCleanup(lambda: setattr(o, "REVIZOR_VERDICT_FILE", self._save_vd))
         # СЛЕДЫ РАБОТЫ (класс 30.07 «статус врёт»): по умолчанию следов НЕТ и отметки claim пишем
         # во временный файл. Иначе сбор улик пошёл бы в ЖИВОЙ git репозитория — окна тестов строятся
         # от «сейчас», и вердикт зависел бы от того, коммитил ли кто-то в последний час (тот же
@@ -6378,6 +6381,255 @@ class TestRevizorSpool(Base):
         self.assertFalse(out.get("deferred"))                          # прогон зачтён
         self.assertEqual([f["task_text"] for f in o._revizor_spool_read()],
                          ["фикс, который не влез в бюджет"])           # но находка НЕ выброшена
+
+
+# ---- КЛАСС «РАЗОБРАННАЯ НАХОДКА ВОЗВРАЩАЕТСЯ КАК НОВАЯ» (живой повтор 08→09.08.2026) ----
+# Находка #92 по окну 1126977519 («разные суммы депозита: 3000…25000 ฿») легла владельцу в карточку
+# tid=401 08.08 19:54. Разбор 411 в тот же день доказал: она ЛОЖНАЯ — чек сравнивает суммы ПО ВСЕМУ
+# тексту, не привязывая их к объекту (suggest.py `_smoke_deposit_conflict`, ветка «две суммы» на
+# строке целиком), а шесть сумм — дословно полный набор депозитных ступеней прайса (suggest.py:280-285,
+# 20 моделей). 09.08 19:58 та же находка пришла владельцу ВТОРОЙ раз, тем же окном и теми же суммами:
+# карточку 401 к тому времени отвечали, из needs_approval она вышла, родилась tid=416 — и мердж строк
+# живой карточки (единственная «память» ревизора, память о ДОСТАВКЕ, а не о РЕШЕНИИ) её уже не видел.
+# Голдены ниже: вердикт «ложная» гасит повтор; ЗАМОК — изменившееся существо гасить не смеет.
+
+_DEP_EV_6 = ("чек «депозит без противоречий»: разные суммы депозита: 3000 ฿, 5000 ฿, 7000 ฿, "
+             "15000 ฿, 20000 ฿, 25000 ฿")
+_DEP_EV_7 = ("чек «депозит без противоречий»: разные суммы депозита: 2000 ฿, 3000 ฿, 5000 ฿, "
+             "7000 ฿, 15000 ฿, 20000 ฿, 25000 ฿")
+
+
+def _dep_f(evidence=_DEP_EV_6, cid=1126977519):
+    """Находка ровно в том виде, в каком её рождает _revizor_postrelease_findings (живой формат
+    прода: класс #92, action=owner, имя чека полем check, task_text пустой)."""
+    return {"class": "#92", "client_id": cid, "action": "owner",
+            "check": "депозит без противоречий", "evidence": evidence, "task_text": ""}
+
+
+class TestRevizorVerdictStore(unittest.TestCase):
+    """Реестр вердиктов: ключ повторяемости, отпечаток существа, запись/чтение, fail-open."""
+
+    def setUp(self):
+        self.p = os.path.join(tempfile.mkdtemp(), "revizor_verdicts.json")   # боевой реестр не трогаем
+
+    def test_key_is_class_window_subject(self):
+        self.assertEqual(o._revizor_verdict_key(_dep_f()), "#92|1126977519|депозит без противоречий")
+
+    def test_key_of_thinker_finding_has_empty_subject(self):
+        # У находок думателя (классы а–ж) чека нет — предмет пуст, повторяемость держит класс+окно.
+        self.assertEqual(o._revizor_verdict_key({"class": "д", "client_id": 555}), "д|555|")
+
+    def test_gist_normalizes_space_and_case(self):
+        a = o._revizor_finding_gist({"evidence": "Разные   суммы\nдепозита: 3000 ฿"})
+        b = o._revizor_finding_gist({"evidence": "разные суммы депозита: 3000 ฿"})
+        self.assertEqual(a, b)
+
+    def test_gist_keeps_digits(self):
+        # Цифры — это и есть существо: шесть сумм и семь сумм обязаны дать РАЗНЫЙ отпечаток.
+        self.assertNotEqual(o._revizor_finding_gist(_dep_f()), o._revizor_finding_gist(_dep_f(_DEP_EV_7)))
+
+    def test_gist_falls_back_to_task_text(self):
+        self.assertEqual(o._revizor_finding_gist({"evidence": "", "task_text": "Фикс Детекта"}),
+                         "фикс детекта")
+
+    def test_set_and_read_roundtrip(self):
+        ok, key, _msg = o.revizor_set_verdict(_dep_f(), o.REVIZOR_VERDICT_FALSE,
+                                              why="разбор 411", now=_REV_NOW, path=self.p)
+        self.assertTrue(ok)
+        rec = o._revizor_verdicts_read(self.p)[key]
+        self.assertEqual(rec["verdict"], "ложная")
+        self.assertEqual(rec["gist"], o._revizor_finding_gist(_dep_f()))
+        self.assertEqual(rec["why"], "разбор 411")
+        self.assertEqual(rec["hits"], 0)
+
+    def test_set_by_bare_key_and_gist(self):
+        ok, key, _m = o.revizor_set_verdict("#92|1126977519|депозит без противоречий",
+                                            o.REVIZOR_VERDICT_FALSE, gist=_DEP_EV_6, path=self.p)
+        self.assertTrue(ok)
+        self.assertTrue(o._revizor_verdict_of(_dep_f(), o._revizor_verdicts_read(self.p))[1])
+        self.assertEqual(key, "#92|1126977519|депозит без противоречий")
+
+    def test_unknown_verdict_rejected(self):
+        ok, _k, msg = o.revizor_set_verdict(_dep_f(), "почти ложная", path=self.p)
+        self.assertFalse(ok)
+        self.assertIn("не опознан", msg)
+        self.assertEqual(o._revizor_verdicts_read(self.p), {})
+
+    def test_false_without_gist_rejected(self):
+        # «Ложная» без существа глушила бы ВСЁ по ключу — ровно та слепота, от которой замок.
+        ok, _k, msg = o.revizor_set_verdict("#92|1|чек", o.REVIZOR_VERDICT_FALSE, gist="", path=self.p)
+        self.assertFalse(ok)
+        self.assertIn("существа", msg)
+
+    def test_broken_registry_reads_empty_fail_open(self):
+        with open(self.p, "w", encoding="utf-8") as f:
+            f.write("{это не json")
+        self.assertEqual(o._revizor_verdicts_read(self.p), {})
+        kept, muted = o._revizor_apply_verdicts([_dep_f()], path=self.p)   # глушим НИЧЕГО
+        self.assertEqual((len(kept), len(muted)), (1, 0))
+
+    def test_missing_registry_reads_empty(self):
+        self.assertEqual(o._revizor_verdicts_read(os.path.join(tempfile.gettempdir(), "нет-реестра-zzz.json")), {})
+
+    def test_hits_survive_reverdict(self):
+        o.revizor_set_verdict(_dep_f(), o.REVIZOR_VERDICT_FALSE, why="разбор 411", path=self.p)
+        o._revizor_apply_verdicts([_dep_f()], path=self.p)
+        o.revizor_set_verdict(_dep_f(), o.REVIZOR_VERDICT_REAL, why="передумали", path=self.p)
+        rec = o._revizor_verdicts_read(self.p)["#92|1126977519|депозит без противоречий"]
+        self.assertEqual((rec["verdict"], rec["hits"]), ("законная", 1))   # счёт про историю, а не про решение
+
+
+class TestRevizorVerdictFilter(unittest.TestCase):
+    """Отсев по вердикту перед доставкой: «ложная» — в ленту и в счёт, «законная»/«не разобрана» —
+    владельцу как прежде. ЗАМОК: изменившееся существо вердикт «ложная» НЕ гасит."""
+
+    def setUp(self):
+        self.p = os.path.join(tempfile.mkdtemp(), "revizor_verdicts.json")
+
+    def _false(self, f=None, why="разбор 411: чек сравнивает суммы по всему тексту"):
+        o.revizor_set_verdict(f or _dep_f(), o.REVIZOR_VERDICT_FALSE, why=why, now=_REV_NOW, path=self.p)
+
+    def test_false_verdict_mutes_finding(self):
+        self._false()
+        kept, muted = o._revizor_apply_verdicts([_dep_f()], now=_REV_NOW, path=self.p)
+        self.assertEqual(kept, [])
+        self.assertEqual([f["evidence"] for f in muted], [_DEP_EV_6])
+
+    def test_muted_stays_visible_in_ledger(self):
+        # «Владельцу не выписана» ≠ «исчезла»: счёт глушений живёт в реестре и печатается CLI.
+        self._false()
+        o._revizor_apply_verdicts([_dep_f()], now=_REV_NOW, path=self.p)
+        o._revizor_apply_verdicts([_dep_f()], now=_REV_NOW, path=self.p)
+        rec = o._revizor_verdicts_read(self.p)["#92|1126977519|депозит без противоречий"]
+        self.assertEqual(rec["hits"], 2)
+        self.assertTrue(rec["last_hit"])
+        txt = o._revizor_verdict_ledger_text(path=self.p)
+        self.assertIn("глушений 2", txt)
+        self.assertIn("находок не выписано владельцу 2", txt)
+
+    def test_changed_substance_comes_as_new(self):
+        """ЗАМОК: вердикт «ложная» стоит по ключу, но существо другое (седьмая сумма) → находка
+        едет владельцу как НОВАЯ, и счёт глушений не растёт. Молчание не смеет стать слепотой."""
+        self._false()
+        kept, muted = o._revizor_apply_verdicts([_dep_f(_DEP_EV_7)], now=_REV_NOW, path=self.p)
+        self.assertEqual([f["evidence"] for f in kept], [_DEP_EV_7])
+        self.assertEqual(muted, [])
+        rec = o._revizor_verdicts_read(self.p)["#92|1126977519|депозит без противоречий"]
+        self.assertEqual(rec["hits"], 0)
+
+    def test_changed_substance_reported_by_verdict_of(self):
+        self._false()
+        v, applied, why = o._revizor_verdict_of(_dep_f(_DEP_EV_7), o._revizor_verdicts_read(self.p))
+        self.assertEqual((v, applied), ("ложная", False))
+        self.assertIn("существо находки изменилось", why)
+
+    def test_real_verdict_still_delivered(self):
+        o.revizor_set_verdict(_dep_f(), o.REVIZOR_VERDICT_REAL, why="настоящий дефект", path=self.p)
+        kept, muted = o._revizor_apply_verdicts([_dep_f()], path=self.p)
+        self.assertEqual((len(kept), len(muted)), (1, 0))
+
+    def test_open_verdict_still_delivered(self):
+        o.revizor_set_verdict(_dep_f(), o.REVIZOR_VERDICT_OPEN, gist=_DEP_EV_6, path=self.p)
+        kept, muted = o._revizor_apply_verdicts([_dep_f()], path=self.p)
+        self.assertEqual((len(kept), len(muted)), (1, 0))
+
+    def test_unknown_finding_is_open_and_delivered(self):
+        v, applied, why = o._revizor_verdict_of(_dep_f(), {})
+        self.assertEqual((v, applied, why), ("не разобрана", False, ""))
+
+    def test_other_window_not_muted(self):
+        # Ключ включает ОКНО: вердикт по одному окну не глушит тот же чек в другом.
+        self._false()
+        kept, muted = o._revizor_apply_verdicts([_dep_f(cid=8725114073)], path=self.p)
+        self.assertEqual((len(kept), len(muted)), (1, 0))
+
+    def test_unreadable_verdict_value_treated_as_open(self):
+        o._revizor_verdicts_save({"#92|1126977519|депозит без противоречий":
+                                  {"verdict": "мусор", "gist": o._revizor_finding_gist(_dep_f())}}, self.p)
+        kept, muted = o._revizor_apply_verdicts([_dep_f()], path=self.p)
+        self.assertEqual((len(kept), len(muted)), (1, 0))
+
+    def test_empty_ledger_says_so(self):
+        self.assertIn("пуст", o._revizor_verdict_ledger_text(path=self.p))
+
+
+class TestRevizorVerdictRoute(Base):
+    """Вердикт в живом маршруте _revizor_route: разобранная-ложная не рождает owner-карточку,
+    уходит заметкой в ленту (журнал) и снимается со спула; изменившаяся — доезжает как новая."""
+
+    def setUp(self):
+        super().setUp()
+        self._save_c = (o._revizor_consult, o._cowork, o._revizor_postrelease_findings)
+        self.notes = []
+        o._cowork = lambda line: self.notes.append(line)
+        o._revizor_consult = lambda pkg: []
+        o._revizor_postrelease_findings = lambda pkg, **k: []
+        self.addCleanup(lambda: (setattr(o, "_revizor_consult", self._save_c[0]),
+                                 setattr(o, "_cowork", self._save_c[1]),
+                                 setattr(o, "_revizor_postrelease_findings", self._save_c[2])))
+
+    def _postrelease(self, findings):
+        o._revizor_postrelease_findings = lambda pkg, **k: [dict(f) for f in findings]
+
+    def _cards(self):
+        return [t for t in self.fb.tasks.values() if t["status"] == "needs_approval"]
+
+    def _false_verdict(self):
+        o.revizor_set_verdict(_dep_f(), o.REVIZOR_VERDICT_FALSE, why="разбор 411", now=_REV_NOW)
+
+    def test_muted_finding_makes_no_card(self):
+        self._false_verdict()
+        self._postrelease([_dep_f()])
+        out = o._revizor_route([{"client_id": 1126977519}], now=_REV_NOW)
+        self.assertEqual((out["owner"], out["muted"]), (0, 1))
+        self.assertEqual(self._cards(), [])                            # владельцу карточки нет
+        self.assertTrue(any("разобраны ранее как ложные" in n for n in self.notes))   # но в ленте есть
+
+    def test_muted_finding_counted_in_registry(self):
+        self._false_verdict()
+        self._postrelease([_dep_f()])
+        o._revizor_route([{"client_id": 1126977519}], now=_REV_NOW)
+        self.assertEqual(o._revizor_verdicts_read()["#92|1126977519|депозит без противоречий"]["hits"], 1)
+
+    def test_changed_substance_makes_card(self):
+        """ЗАМОК сквозь весь маршрут: существо изменилось → карточка владельцу создаётся."""
+        self._false_verdict()
+        self._postrelease([_dep_f(_DEP_EV_7)])
+        out = o._revizor_route([{"client_id": 1126977519}], now=_REV_NOW)
+        self.assertEqual((out["owner"], out["muted"]), (1, 0))
+        self.assertIn("2000 ฿", self._cards()[0]["what"])
+
+    def test_legit_finding_still_makes_card(self):
+        self._postrelease([_dep_f(cid=8725114073)])                    # вердикта по этому окну нет
+        out = o._revizor_route([{"client_id": 8725114073}], now=_REV_NOW)
+        self.assertEqual(out["owner"], 1)
+        self.assertEqual(len(self._cards()), 1)
+
+    def test_muted_spooled_finding_leaves_spool(self):
+        """Отложенная находка, разобранная как ложная, снимается со спула — иначе лежала бы вечно
+        и каждый прогон снова просилась бы владельцу."""
+        o._revizor_spool_save([_dep_f()])
+        self._false_verdict()
+        out = o._revizor_route([], now=_REV_NOW)
+        self.assertEqual((out["owner"], out["muted"]), (0, 1))
+        self.assertEqual(o._revizor_spool_read(), [])
+        self.assertEqual(self._cards(), [])
+
+    def test_muted_task_finding_not_enqueued(self):
+        # Вердикт «ложная» гасит и зелёную задачу: ложная находка не смеет родить дев-ТЗ.
+        f = {"class": "ж", "client_id": 1, "action": "task",
+             "task_text": "котировать, не анкетировать", "evidence": ""}
+        o.revizor_set_verdict(f, o.REVIZOR_VERDICT_FALSE, why="разобрано вручную", now=_REV_NOW)
+        o._revizor_consult = lambda pkg: [dict(f)]
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual((out["tasks"], out["muted"]), (0, 1))
+        self.assertEqual([t for t in self.fb.tasks.values()], [])
+
+    def test_clean_run_note_unchanged(self):
+        # Регресс: без вердиктов прогон говорит ровно то же, что говорил (никаких новых слов).
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual(out["muted"], 0)
+        self.assertTrue(any(n == "ревизор: 1 окон, чисто" for n in self.notes))
 
 
 # ---- МАНДАТ 14.07: авто-задачи ревизора НЕ заказывают деплой/рестарт прода ----
