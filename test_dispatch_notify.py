@@ -170,8 +170,9 @@ class TestChainCard(unittest.TestCase):
 
 class TestSessionEndCard(unittest.TestCase):
     """ЗАВЕРШЕНИЕ Code-сессии (в т.ч. Remote Control с телефона) = ДВА КАНАЛА ритуала:
-    карточка «✅ Code-сессия завершена: <сводка>» в тему Инбокс 1160 (личка — фолбэк) И строка
-    в cowork_log. Сводку берём из ЖИВОГО формата transcript-а Claude Code — фикстура
+    карточка «✅ Code-сессия завершена: <сводка>» в тему постановки задач 328 (10.08.2026: ответа
+    она не ждёт, инбокс/личка остались фолбэками) И строка в cowork_log.
+    Сводку берём из ЖИВОГО формата transcript-а Claude Code — фикстура
     fixtures/session_end_transcript.live.jsonl снята с реального .jsonl (правило-класс
     «мок обязан копировать живой формат»): блоки text | thinking | tool_use, сайдчейны субагентов."""
 
@@ -206,16 +207,18 @@ class TestSessionEndCard(unittest.TestCase):
         text = dn._build("session_end", {"transcript_path": "нет", "reason": "clear"})
         self.assertIn("причина: clear", text)
 
-    def test_route_inbox_1160_first_and_cowork(self):
+    def test_route_tasks_topic_first_and_cowork(self):
+        """АДРЕС СМЕНИЛСЯ 10.08.2026: карточка финала ответа не ждёт → тема постановки 328,
+        а не инбокс 1160. Второй канал ритуала (cowork_log) не тронут."""
         def api(method, payload):
             self.calls.append(payload)
             return True, {"ok": True}
         dn._api = api
         text = dn._build("session_end", {"transcript_path": FIX_TRANSCRIPT})
-        channel, ok = dn.send_critical(text)
+        channel, ok = dn.deliver(text)
         dn._cowork(text)
-        self.assertEqual((channel, ok), ("inbox", True))
-        self.assertEqual(self.calls[0]["message_thread_id"], dn.INBOX_THREAD_ID)   # 1160
+        self.assertEqual((channel, ok), ("topic:328", True))
+        self.assertEqual(self.calls[0]["message_thread_id"], dn.TASKS_THREAD_ID)   # 328
         self.assertEqual(self.cows, [text])                                        # второй канал
 
     def test_route_falls_back_to_dm(self):
@@ -346,8 +349,9 @@ class TestStopHookDoesNotReachTheDm(unittest.TestCase):
     """ЛИЧКА — ТОЛЬКО ТО, ЧЕГО НЕТ В ИНБОКСЕ И ЧТО ТРЕБУЕТ ОТВЕТА (правило владельца 05.08.2026).
 
     «✅ Dispatch: задача завершена.» ответа не требует и содержания не несёт, а тот же факт
-    через секунду уходит в инбокс 1160 хуком session_end — уже со сводкой. Замер за 7 суток
-    (dispatch_notify.log, 29.07–05.08): 392 сообщения в личку, 178 из них — эта строка."""
+    через секунду уходит хуком session_end — уже со сводкой (с 10.08.2026 в тему постановки
+    задач 328). Замер за 7 суток (dispatch_notify.log, 29.07–05.08): 392 сообщения в личку,
+    178 из них — эта строка."""
 
     def setUp(self):
         # `_cowork` и `_write_session_metrics` МОКАЕМ ОБЯЗАТЕЛЬНО: живой `_cowork` спавнит
@@ -385,14 +389,175 @@ class TestStopHookDoesNotReachTheDm(unittest.TestCase):
         """Текст не выброшен: он остаётся в строке лога, чтобы пропажа читалась как решение."""
         self.assertIn("задача завершена", dn._build("stop", {}))
 
-    def test_session_end_still_goes_to_inbox_1160(self):
-        """Событие не потеряно: канал со СВОДКОЙ не тронут."""
+    def test_session_end_still_delivered_now_to_tasks_topic(self):
+        """Событие не потеряно: канал со СВОДКОЙ жив, сменился только адрес (1160 → 328)."""
         self._run(["dispatch_notify.py", "--hook", "session_end"],
                   {"transcript_path": FIX_TRANSCRIPT})
         self.assertTrue(self.calls, "session_end перестал доставляться")
         self.assertEqual(self.calls[0]["chat_id"], dn.HQ_CHAT_ID)
-        self.assertEqual(self.calls[0]["message_thread_id"], dn.INBOX_THREAD_ID)   # 1160
+        self.assertEqual(self.calls[0]["message_thread_id"], dn.TASKS_THREAD_ID)   # 328
         self.assertEqual(len(self.cows), 1, "второй канал (cowork_log) замокан и позван ровно раз")
+
+
+class TestRouteAwaitsReply(unittest.TestCase):
+    """ОДИН ПРИЗНАК МАРШРУТА (правило владельца 10.08.2026): в инбокс 1160 попадает ТОЛЬКО то,
+    что ждёт ОТВЕТА владельца; всё прочее — в тему постановки задач 328.
+
+    Голдены — ДОСЛОВНЫЕ фразы из живого dispatch_notify.log (2179 отправок, 03.07–10.08), а не
+    придуманные образцы: правило-класс «golden = реальная фраза». Замер, на котором стои́т правка:
+    в 1160 ушло 184 сообщения, ответа ждали 9 — остальные 175 были «✅ Code-сессия завершена».
+    Реальный Bot API не дёргаем: подменяем _api."""
+
+    # ЖДУТ ОТВЕТА (дословно из лога) → инбокс 1160
+    ASKS = [
+        "🔴 Хочу снять процесс (taskkill/kill) — разрешить?\nЧто: снятие процесса",
+        "🔴 Требуется подтверждение: команда не распознана как безопасная — разрешить?",
+        "🔴 Хочу выйти в сеть к root@5.223.94.179 — разрешить?",
+        "🔴 КРАСНОЕ — нужно твоё «да»",
+        "🔔 Оркестратор: задача #19 ждёт твоего «да» — NEEDS_APPROVAL (гард)",
+        "🔔 Dispatch ждёт твоего разрешения/ввода: Claude needs your permission to use Bash",
+        "🤔 Неясный урок — нужна расшифровка (не угадываю)",
+        "⚠️ Оркестратор: userbot умер 3 раза подряд — контур-вотчдог остановлен, нужен разбор",
+        "ℹ️ Оркестратор: pc_agent изменён — ЖДЁТ РУЧНОГО рестарта (демон его не перезапускает)",
+    ]
+    # ОТВЕТА НЕ ЖДУТ (дословно из лога) → тема постановки 328
+    SILENT = [
+        "✅ Dispatch: задача завершена.",
+        "✅ Code-сессия завершена: Контур жив: userbot и moderbot отвечают, демон держит heartbeat.",
+        "✅ Code-сессия завершена: без текстового итога (причина: other)",
+        "✅ Оркестратор: задача #277 выполнена — Готово: ревизор распознаёт автогритинг",
+        "❌ Оркестратор: задача #19 провалена — claude exit=1: Credit balance is too low",
+        "🔁 СТОРОЖ ПОДНЯЛ userbot — лежал 5 м 31 с",
+        "🛌 ПК СПАЛ 1 ч 06 м — весь контур стоял",
+    ]
+
+    def setUp(self):
+        self._save = (dn._api, dn.TOKEN, dn.awaits_reply, dn._cowork, dn._write_session_metrics)
+        self.calls, self.cows = [], []
+        dn.TOKEN = "test-token"
+        dn._cowork = lambda t, **k: self.cows.append(t) or True
+        dn._write_session_metrics = lambda m: False
+
+        def api(method, payload):
+            self.calls.append(payload)
+            return True, {"ok": True}
+        dn._api = api
+
+    def tearDown(self):
+        (dn._api, dn.TOKEN, dn.awaits_reply, dn._cowork, dn._write_session_metrics) = self._save
+
+    def _run(self, argv, payload=None):
+        saved_argv, saved_stdin = sys.argv, sys.stdin
+        try:
+            sys.argv = argv
+            sys.stdin = io.StringIO(json.dumps(payload or {}))
+            with self.assertRaises(SystemExit):
+                dn.main()
+        finally:
+            sys.argv, sys.stdin = saved_argv, saved_stdin
+
+    # ── признак сам по себе ────────────────────────────────────────────────────────────────
+    def test_asking_phrases_await_reply(self):
+        for t in self.ASKS:
+            self.assertTrue(dn.awaits_reply(t), t.split("\n")[0])
+
+    def test_silent_phrases_do_not_await_reply(self):
+        for t in self.SILENT:
+            self.assertFalse(dn.awaits_reply(t), t.split("\n")[0])
+
+    def test_unknown_form_counts_as_awaiting(self):
+        """Ни вопроса, ни закрытого исхода → считаем, что ждёт: незакрытое состояние не тишина.
+        Живой случай — «watchdog не смог поднять демон» (48 раз за наблюдение)."""
+        self.assertTrue(dn.awaits_reply(
+            "⚠️ Оркестратор: watchdog не смог поднять демон через schtasks"))
+        self.assertTrue(dn.awaits_reply("🔔 проверка связи Dispatch→Telegram"))
+
+    # ── ОБА НАПРАВЛЕНИЯ ЧЕРЕЗ ЖИВУЮ ПРОВОДКУ main() ───────────────────────────────────────
+    def test_silent_session_end_is_not_in_the_inbox(self):
+        """МОЛЧАЛИВОЕ НЕ В ИНБОКСЕ: карточка финала сессии уезжает в 328, инбокса не касается."""
+        self._run(["dispatch_notify.py", "--hook", "session_end"],
+                  {"transcript_path": FIX_TRANSCRIPT})
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0]["message_thread_id"], dn.TASKS_THREAD_ID)
+        self.assertNotEqual(self.calls[0]["message_thread_id"], dn.INBOX_THREAD_ID)
+
+    def test_asking_notification_is_in_the_inbox(self):
+        """СПРАШИВАЮЩЕЕ — В ИНБОКСЕ: пинг «жду разрешения» первым каналом идёт в 1160."""
+        self._run(["dispatch_notify.py", "--hook", "notification"],
+                  {"message": "Claude needs your permission to use Bash",
+                   "transcript_path": FIX_TRANSCRIPT})
+        self.assertEqual(self.calls[0]["message_thread_id"], dn.INBOX_THREAD_ID)
+
+    def test_guard_card_from_plain_arg_is_in_the_inbox(self):
+        """Карточка гарда приходит ПРЯМЫМ аргументом (pretool_guard._push) — и она спрашивает."""
+        self._run(["dispatch_notify.py", "🔴 Хочу снять процесс (taskkill/kill) — разрешить?"])
+        self.assertEqual(self.calls[0]["message_thread_id"], dn.INBOX_THREAD_ID)
+
+    def test_task_report_from_plain_arg_goes_to_tasks_topic(self):
+        self._run(["dispatch_notify.py", "✅ Оркестратор: задача #277 выполнена — Готово"])
+        self.assertEqual(self.calls[0]["message_thread_id"], dn.TASKS_THREAD_ID)
+
+    # ── ЗАМОК: мимо инбокса не уедет ничто, ждущее ответа ─────────────────────────────────
+    def test_lock_button_card_reaches_inbox_even_if_predicate_says_no(self):
+        """Кнопка = место для ответа. Замок стои́т ПЕРЕД признаком: сломанный признак карточку
+        с кнопкой из инбокса не выведет."""
+        dn.awaits_reply = lambda *a, **k: False          # признак «сломан»
+        channel, ok = dn.deliver("▶️ Цепь #101: шаг 1/3 в очереди.", dn._chain_markup(101))
+        self.assertEqual((channel, ok), ("inbox", True))
+        self.assertEqual(self.calls[0]["message_thread_id"], dn.INBOX_THREAD_ID)
+        self.assertEqual(self.calls[0]["reply_markup"], dn._chain_markup(101))
+
+    def test_lock_top_tier_card_reaches_inbox_even_with_closed_words(self):
+        """Высшая карточка §7 (⛔ ВЫСШАЯ ЦЕНА · НЕОБРАТИМО) — в инбокс ВСЕГДА, даже если её текст
+        несёт слова закрытого исхода, на которых обычное сообщение уехало бы в 328."""
+        dn.awaits_reply = lambda *a, **k: False
+        top = "⛔ ВЫСШАЯ ЦЕНА · НЕОБРАТИМО · подтверждение только с объектом: «да _win.txt»\n" \
+              "задача завершена, откат выполнен"
+        self.assertTrue(dn.locked_to_inbox(top))
+        channel, ok = dn.deliver(top)
+        self.assertEqual((channel, ok), ("inbox", True))
+        self.assertEqual(self.calls[0]["message_thread_id"], dn.INBOX_THREAD_ID)
+
+    def test_broken_predicate_sends_to_inbox_not_to_the_topic(self):
+        """Признак упал с исключением → сомнение решается в пользу инбокса (карточка дороже)."""
+        def boom(*a, **k):
+            raise RuntimeError("признак сломан")
+        dn.awaits_reply = boom
+        channel, ok = dn.deliver("✅ Оркестратор: задача #277 выполнена")
+        self.assertEqual((channel, ok), ("inbox", True))
+
+    def test_buttons_ride_the_fallback_channel_too(self):
+        """Форум лёг → карточка с кнопками уходит в личку ВМЕСТЕ с кнопками: смена канала не
+        смеет отнять у владельца место для ответа."""
+        def api(method, payload):
+            self.calls.append(payload)
+            ok = "message_thread_id" not in payload
+            return ok, {"ok": ok, "error_code": 403}
+        dn._api = api
+        channel, ok = dn.deliver("▶️ Цепь #101: шаг 1/3 в очереди.", dn._chain_markup(101))
+        self.assertEqual((channel, ok), ("DM", True))
+        self.assertEqual(self.calls[-1]["chat_id"], dn.DM_CHAT_ID)
+        self.assertEqual(self.calls[-1]["reply_markup"], dn._chain_markup(101))
+
+    # ── границы: явный адрес и заявление отправителя ──────────────────────────────────────
+    def test_explicit_topic_address_is_not_rerouted(self):
+        """`--topic <id>` — АДРЕС, а не маршрут: признак не спрашивают, даже если текст просит
+        ответа. Так сигнал про немую сессию остаётся рядом с самим заданием."""
+        self._run(["dispatch_notify.py", "--topic", "328",
+                   "🔇 НЕМАЯ сессия: запущена, но не начала работать"])
+        self.assertEqual(self.calls[0]["message_thread_id"], 328)
+
+    def test_critical_flag_is_a_declaration_of_the_same_sign(self):
+        """`--critical` — заявление отправителя по ТОМУ ЖЕ признаку («сам не рассосётся»),
+        а не отдельный маршрут: адрес всё равно выбирает deliver."""
+        self._run(["dispatch_notify.py", "--critical",
+                   "⚠️ Канал Remote Control на ПК не поднимается: Not signed in"])
+        self.assertEqual(self.calls[0]["message_thread_id"], dn.INBOX_THREAD_ID)
+
+    def test_chain_card_cli_goes_through_deliver(self):
+        self._run(["dispatch_notify.py", "--card", "101", "▶️ Цепь #101: шаг 1/3 в очереди."])
+        self.assertEqual(self.calls[0]["message_thread_id"], dn.INBOX_THREAD_ID)
+        self.assertEqual(self.calls[0]["reply_markup"], dn._chain_markup("101"))
 
 
 class TestStdinBom(unittest.TestCase):
