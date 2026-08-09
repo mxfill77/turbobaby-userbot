@@ -6795,6 +6795,7 @@ REVIZOR_VERDICT_FALSE = "ложная"          # разобрана и приз
 REVIZOR_VERDICT_REAL = "законная"         # разобрана и признана настоящей → доставляется как прежде
 REVIZOR_VERDICT_OPEN = "не разобрана"     # исхода нет (дефолт всего, чего нет в реестре)
 REVIZOR_VERDICTS = (REVIZOR_VERDICT_FALSE, REVIZOR_VERDICT_REAL, REVIZOR_VERDICT_OPEN)
+_REVIZOR_CHECKS_SECTION = "checks"        # второй раздел того же файла — счёт находок выбывших проверок
 
 
 def _revizor_text(v):
@@ -6848,37 +6849,68 @@ def _revizor_finding_gist(f):
     return " ".join(src.split()).casefold()
 
 
-def _revizor_verdicts_read(path=None):
-    """Реестр вердиктов с диска → dict {ключ: запись}. Файла НЕТ — это норма (реестр не обязан
-    существовать, глушить нечего); файл есть, но не читается/битый — реестр всё равно пустой, НО
-    сказанный ВСЛУХ: тихий отказ здесь читался бы как «вердиктов нет», а это разные вещи.
-    FAIL-OPEN сознателен — тишина владельцу смеет родиться только из его решения, а не из сбоя."""
+def _revizor_registry_read(path=None):
+    """Файл реестра ЦЕЛИКОМ → (вердикты по находкам, счёт находок выбывших проверок). Оба раздела
+    снимаются ОДНИМ чтением намеренно: они живут в одном файле и пишутся одной записью, а
+    раздельное чтение дало бы половину правды, отставшую от другой половины.
+
+    Файла НЕТ — это норма (реестр не обязан существовать, глушить нечего); файл есть, но не
+    читается/битый — реестр всё равно пустой, НО сказанный ВСЛУХ: тихий отказ здесь читался бы как
+    «вердиктов нет», а это разные вещи. FAIL-OPEN сознателен — тишина владельцу смеет родиться
+    только из его решения, а не из сбоя. Старый файл БЕЗ раздела счёта читается штатно (счёт пуст):
+    формат добавлен разделом, а не сломан."""
     p = REVIZOR_VERDICT_FILE if path is None else path
     if not os.path.exists(p):
-        return {}
+        return {}, {}
     try:
         with open(p, encoding="utf-8") as f:
             d = json.load(f)
     except Exception as e:
         log.warning("ревизор: реестр вердиктов (%s) НЕ прочитан — глушим НИЧЕГО, все находки идут "
                     "владельцу: %s", p, e)
-        return {}
+        return {}, {}
     v = d.get("verdicts") if isinstance(d, dict) else None
     if not isinstance(v, dict):
         log.warning("ревизор: реестр вердиктов (%s) не того вида — глушим НИЧЕГО", p)
-        return {}
-    return {str(k): dict(r) for k, r in v.items() if isinstance(r, dict)}
+        return {}, {}
+    c = d.get(_REVIZOR_CHECKS_SECTION)
+    checks = {}
+    if isinstance(c, dict):
+        checks = {str(k): dict(r) for k, r in c.items() if isinstance(r, dict)}
+    return {str(k): dict(r) for k, r in v.items() if isinstance(r, dict)}, checks
 
 
-def _revizor_verdicts_save(reg, path=None):
+def _revizor_verdicts_read(path=None):
+    """Вердикты по находкам с диска → dict {ключ: запись} (первый раздел реестра, см.
+    _revizor_registry_read: тот же fail-open, тот же голос при битом файле)."""
+    return _revizor_registry_read(path)[0]
+
+
+def _revizor_checks_read(path=None):
+    """Счёт находок ВЫБЫВШИХ проверок с диска → dict {проверка: запись} (второй раздел реестра).
+    Пустой счёт значит «мимо владельца не выведено ничего», и это верно и для отсутствующего
+    файла, и для нечитаемого: направление отказа то же самое — ничего не глушим."""
+    return _revizor_registry_read(path)[1]
+
+
+def _revizor_verdicts_save(reg, path=None, checks=None):
     """Реестр на диск атомарно (tmp+os.replace), как спул и метка прогона. → True/False.
     Сбой записи тик НЕ роняет (тихий warning): потерянный счёт глушений хуже тишины, но хуже
-    обоих — упавший прогон ревизии."""
+    обоих — упавший прогон ревизии.
+
+    checks=None → раздел счёта выбывших проверок берём С ДИСКА и кладём обратно НЕТРОНУТЫМ: запись
+    вердикта не смеет стереть счёт находок выбывшей проверки — он и есть замок «выбывшая не
+    исчезла из виду»."""
     p = REVIZOR_VERDICT_FILE if path is None else path
     keep = {}
     if isinstance(reg, dict):
         keep = {str(k): dict(v) for k, v in reg.items() if isinstance(v, dict)}
-    blob = {"version": 1, "verdicts": keep}
+    if checks is None:
+        checks = _revizor_checks_read(p)
+    keep_checks = {}
+    if isinstance(checks, dict):
+        keep_checks = {str(k): dict(v) for k, v in checks.items() if isinstance(v, dict)}
+    blob = {"version": 1, "verdicts": keep, _REVIZOR_CHECKS_SECTION: keep_checks}
     try:
         tmp = str(p) + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -6973,6 +7005,216 @@ def _revizor_apply_verdicts(findings, reg=None, now=None, path=None, save=True):
     if touched and save:
         _revizor_verdicts_save(reg, path)
     return kept, muted
+
+
+# ------------------- РЕВИЗОР: ПОРОГ ДОКАЗАННОЙ ПОЛЬЗЫ ПРОВЕРКИ (10.08.2026) ---
+# КЛАСС: проверка, ни разу не давшая законной находки, пишет владельцу вечно. Вердикт по находке
+# (блок выше) гасит ОДНУ находку по ОДНОМУ окну — ключ включает окно, поэтому новое окно рождает
+# новый ключ, и та же бесполезная проверка приходит снова. Замер класса #92 (разборы 411/419/420,
+# `docs/artifacts/2026-08-09-class92-43-unresolved.md`): за наблюдение 45 находок, законных 0,
+# настоящего противоречия «один клиент, один байк, разные суммы» не найдено ни одного.
+#
+# РЕШЕНИЕ: у КАЖДОЙ проверки есть счёт полезности — сколько её находок владелец признал
+# законными, сколько ложными, сколько оставил неразобранными. Проверка, которая на ДОСТАТОЧНОЙ
+# разобранной выборке (≥REVIZOR_BENCH_MIN_DECIDED) не дала НИ ОДНОЙ законной, выбывает из потока к
+# владельцу: её находки идут заметкой в ленту и остаются в счёте. Сам чек при этом продолжает
+# работать — выбывание меняет АДРЕС находки, а не её рождение.
+#
+# ЗНАМЕНАТЕЛЬ — ТОЛЬКО РАЗОБРАННОЕ (законные + ложные). «Не разобрана» в него не входит: иначе
+# молодая проверка глохла бы от НЕЗНАНИЯ владельца, а не от своего вреда, и порог наказывал бы
+# длину очереди разбора.
+#
+# СЧИТАЕМ РАЗЛИЧНЫЕ НАХОДКИ (записи реестра), а НЕ повторы. Повтор той же находки (hits) в
+# знаменатель не идёт сознательно: одна ложная находка, выведенная двадцатью тиками, — это ОДНА
+# ошибка проверки, а не двадцать; считай мы повторы, проверку выбивал бы единственный разбор.
+#
+# ЗАМОК (выбывшая не смеет исчезнуть из виду) — два условия, оба под голденом:
+#   1) находки выбывшей проверки ПРОДОЛЖАЮТ СЧИТАТЬСЯ — счёт лежит в том же реестре разделом
+#      `checks` (сколько выведено мимо владельца и когда в последний раз), а дословная улика
+#      уходит в лог демона поимённо: иначе порог превратился бы в слепоту, и вернуть проверку в
+#      поток было бы нечем;
+#   2) появление ПЕРВОЙ ЗАКОННОЙ находки ВОЗВРАЩАЕТ проверку в поток. Статус не хранится флагом, а
+#      ВЫЧИСЛЯЕТСЯ из счёта на каждом прогоне — поэтому возврат мгновенный и не зависит от того,
+#      помнит ли кто-то, что проверка выбывала.
+REVIZOR_BENCH_MIN_DECIDED = 20            # разобранных находок проверки, ниже которых порог молчит
+
+
+def _revizor_check_id(f):
+    """Имя ПРОВЕРКИ находки: «класс|предмет». Окна в нём НЕТ — полезность меряется у проверки, а не
+    у окна (в этом всё отличие от ключа вердикта). У находок думателя (классы а–ж) предмета нет,
+    проверкой работает сам класс."""
+    return "|".join((_revizor_field(f, "class"), _revizor_field(f, "check")))
+
+
+def _revizor_check_of_key(key):
+    """Ключ реестра «класс|окно|предмет» → имя проверки «класс|предмет» | **None (ключ не того
+    вида)**. Третье состояние здесь честное: ключ можно набрать руками через CLI, и запись с
+    ключом из двух частей не принадлежит никакой проверке достоверно. Такая запись в счёт
+    полезности НЕ идёт вовсе, и направление отказа безопасное — незачтённая запись может только НЕ
+    дать проверке выбыть, но не может выбить её молча."""
+    parts = _revizor_text(key).split("|")
+    if len(parts) < 3:
+        return None
+    return "|".join((parts[0].strip(), "|".join(parts[2:]).strip()))
+
+
+def _revizor_tally_num(row, name):
+    """Число из строки счёта. Поля нет / оно не целое → 0. Строку счёта собираем здесь же сами,
+    третьего состояния у неё по устройству нет (как у _revizor_hits)."""
+    if not isinstance(row, dict):
+        return 0
+    v = row.get(name)
+    if isinstance(v, bool) or not isinstance(v, int):
+        return 0
+    return v
+
+
+def _revizor_check_tally(reg=None, path=None):
+    """СЧЁТ ПОЛЕЗНОСТИ по каждой проверке из реестра вердиктов → dict имя → dict:
+      real   — различных находок, признанных законными;
+      false  — различных находок, признанных ложными;
+      open   — различных находок без исхода («не разобрана» и нечитаемый вердикт — оба «исхода
+               нет»); в знаменатель порога НЕ идут;
+      decided = real + false — ЗНАМЕНАТЕЛЬ порога;
+      muted  — повторов, снятых вердиктом «ложная» (история глушений; в знаменатель не идёт).
+    Записи с ключом не того вида в счёт не берём (см. _revizor_check_of_key)."""
+    reg = _revizor_verdicts_read(path) if reg is None else reg
+    tally = {}
+    if not isinstance(reg, dict):
+        return tally
+    for key, rec in reg.items():
+        name = _revizor_check_of_key(key)
+        if name is None:
+            continue
+        row = tally.setdefault(name, {"real": 0, "false": 0, "open": 0, "decided": 0, "muted": 0})
+        v = _revizor_field(rec, "verdict")
+        if v == REVIZOR_VERDICT_REAL:
+            row["real"] += 1
+            row["decided"] += 1
+        elif v == REVIZOR_VERDICT_FALSE:
+            row["false"] += 1
+            row["decided"] += 1
+            row["muted"] += _revizor_hits(rec)
+        else:
+            row["open"] += 1
+    return tally
+
+
+def _revizor_check_benched(name, tally):
+    """Выбыла ли проверка из потока к владельцу → (bool, словами почему). Порог: разобранных
+    ≥REVIZOR_BENCH_MIN_DECIDED И законных РОВНО НОЛЬ.
+
+    ЗАМОК ВОЗВРАТА: первая же законная находка даёт real≥1 и снимает выбывание В ТОТ ЖЕ прогон —
+    статус тут вычисляется, а не хранится, поэтому «вернуть проверку» не требует отдельного
+    действия человека и не может забыться."""
+    row = tally.get(name) if isinstance(tally, dict) else None
+    decided, real = _revizor_tally_num(row, "decided"), _revizor_tally_num(row, "real")
+    if real:
+        return False, ""
+    if decided < REVIZOR_BENCH_MIN_DECIDED:
+        return False, ""
+    return True, (f"разобрано находок {decided} (порог {REVIZOR_BENCH_MIN_DECIDED}), законных ноль")
+
+
+def _revizor_bench_evidence(f):
+    """Дословная улика находки для лога выбывшей проверки: улика (пусто → дев-ТЗ, пусто → честное
+    «улика пуста»). Это ЕДИНСТВЕННОЕ место, где существо не доставленной владельцу находки
+    остаётся на нашей полосе, — молчать здесь нельзя."""
+    ev = _revizor_field(f, "evidence")
+    if not ev:
+        ev = _revizor_field(f, "task_text")
+    if not ev:
+        ev = "улика пуста"
+    return ev
+
+
+def _revizor_apply_bench(findings, tally, counters, now=None):
+    """Отсев находок ВЫБЫВШИХ проверок перед доставкой владельцу → (kept, benched). Каждую
+    выведенную мимо владельца находку считаем в counters (раздел реестра `checks`) и называем
+    вслух в лог вместе с уликой — замок «выбывшая не исчезла из виду». counters правится НА МЕСТЕ,
+    пишет его вызывающий одной записью вместе с вердиктами."""
+    kept, benched = [], []
+    if findings is None:
+        findings = ()
+    stamp = datetime.datetime.fromtimestamp(
+        float(now if now is not None else time.time()), datetime.timezone.utc).isoformat()
+    for f in findings:
+        name = _revizor_check_id(f)
+        off, why = _revizor_check_benched(name, tally)
+        if not off:
+            kept.append(f)
+            continue
+        prev = counters.get(name) if isinstance(counters, dict) else None
+        rec = dict(prev) if isinstance(prev, dict) else {}
+        rec["hits"] = _revizor_tally_num(rec, "hits") + 1
+        rec["last_hit"] = stamp
+        if not _revizor_text(rec.get("since")):
+            rec["since"] = stamp
+        rec["why"] = why
+        counters[name] = rec
+        benched.append(f)
+        log.info("ревизор: проверка «%s» выбыла из потока к владельцу (%s) — находка %s владельцу "
+                 "не выписана, заметка в ленту; улика: %s; выведено мимо владельца по этой "
+                 "проверке: %d", name, why, _revizor_verdict_key(f), _revizor_bench_evidence(f),
+                 rec["hits"])
+    return kept, benched
+
+
+def _revizor_bench_note(benched):
+    """Фраза о находках выбывших проверок для ЛЕНТЫ (журнал прогона): сколько и КАКИХ проверок.
+    Имя проверки стои́т в ленте, а не только в логе демона, сознательно: оно — единственное, чем
+    владелец может вернуть проверку в поток (поставить законную по её находке). Пусто → ''."""
+    if benched is None:
+        benched = ()
+    names = []
+    for f in benched:
+        name = _revizor_check_id(f)
+        if name not in names:
+            names.append(name)
+    if not names:
+        return ""
+    return (f"{len(benched)} находок проверок, выбывших по порогу пользы (законных 0 при "
+            f"разобранных ≥{REVIZOR_BENCH_MIN_DECIDED}): {', '.join(names)} — заметкой в ленту, "
+            "владельцу не выписаны")
+
+
+def _revizor_check_ledger_text(reg=None, checks=None, path=None):
+    """СЧЁТ ПОЛЬЗЫ ПРОВЕРОК человеку (CLI --revizor-verdicts): по каждой проверке — законных,
+    ложных, неразобранных, выбыла ли она из потока и сколько находок выведено мимо владельца.
+    Пустой счёт → честная строка «пуст»: у проверки без единого разбора полезность НЕ «ноль», она
+    НЕИЗВЕСТНА, и порог по ней не судит."""
+    if reg is None or checks is None:
+        disk_reg, disk_checks = _revizor_registry_read(path)
+        reg = disk_reg if reg is None else reg
+        checks = disk_checks if checks is None else checks
+    tally = _revizor_check_tally(reg)
+    if not tally:
+        return ("📊 Счёт полезности проверок ревизора пуст — ни одной разобранной находки, "
+                f"порог (разобранных ≥{REVIZOR_BENCH_MIN_DECIDED}, законных 0) не судит никого.")
+    lines = [f"📊 Счёт полезности проверок ревизора (порог: разобранных ≥{REVIZOR_BENCH_MIN_DECIDED} "
+             "И законных 0 → проверка выбывает из потока к владельцу):"]
+    off_n = 0
+    for name in sorted(tally):
+        row = tally[name]
+        off, why = _revizor_check_benched(name, tally)
+        rec = checks.get(name) if isinstance(checks, dict) else None
+        bench_hits = _revizor_tally_num(rec, "hits")
+        mark = "В ПОТОКЕ"
+        if off:
+            off_n += 1
+            mark = f"ВЫБЫЛА ({why})"
+        tail = ""
+        if bench_hits:
+            tail = f"; мимо владельца выведено {bench_hits}"
+            last = _revizor_field(rec, "last_hit")
+            if last:
+                tail += f", последняя {_fmt_tick(last)}"
+        lines.append(f"  • {name} — законных {_revizor_tally_num(row, 'real')}, "
+                     f"ложных {_revizor_tally_num(row, 'false')}, "
+                     f"не разобрано {_revizor_tally_num(row, 'open')}; "
+                     f"разобрано {_revizor_tally_num(row, 'decided')} → {mark}{tail}")
+    lines.append(f"итого: проверок в счёте {len(tally)}, выбывших {off_n}")
+    return "\n".join(lines)
 
 
 def _revizor_verdict_ledger_text(reg=None, path=None):
@@ -7717,33 +7959,47 @@ def _revizor_route(packages, now=None):
     # ВЕРДИКТ ПО НАХОДКЕ (09.08.2026) — ПОСЛЕДНИЙ фильтр перед доставкой, и стоит он именно здесь,
     # после подъёма спула: разобранное-ложное не должно доехать НИ свежей ревизией окна, НИ
     # отложенным прошлого прогона. Реестр читаем один раз на прогон, пишем один раз (счёт глушений).
-    reg = _revizor_verdicts_read()
+    # ПОРОГ ДОКАЗАННОЙ ПОЛЬЗЫ (10.08.2026) стои́т СРАЗУ ЗА вердиктами и до доставки: сначала явное
+    # решение человека по КОНКРЕТНОЙ находке, потом статистика по ПРОВЕРКЕ. Порядок именно такой,
+    # потому что вердикт — знание, а порог — вывод из знания; вывод не смеет опережать источник.
+    # Реестр читаем один раз на прогон и пишем один раз — обоими разделами сразу.
+    reg, chk = _revizor_registry_read()
     task_f, muted_t = _revizor_apply_verdicts(task_f, reg=reg, now=now, save=False)
     owner_f, muted_o = _revizor_apply_verdicts(owner_f, reg=reg, now=now, save=False)
     muted = muted_t + muted_o
-    if muted:
-        _revizor_verdicts_save(reg)
+    tally = _revizor_check_tally(reg)
+    task_f, benched_t = _revizor_apply_bench(task_f, tally, chk, now=now)
+    owner_f, benched_o = _revizor_apply_bench(owner_f, tally, chk, now=now)
+    benched = benched_t + benched_o
+    if muted or benched:
+        _revizor_verdicts_save(reg, checks=chk)
+    bench_note = _revizor_bench_note(benched)
     if not task_f and not owner_f:              # окна чисты (или только шум/сбой/разобранное) → наружу тишина
         if spooled:
             _revizor_spool_save([])             # отложенное снято вердиктом — иначе лежало бы в спуле вечно
         if n and failed >= n:
             _cowork(f"ревизор: думатель не ответил ни по одному из {n} окон — прогон пропущен"
-                    + (f" ({len(muted)} находок разобраны ранее как ложные — в ленту)" if muted else ""))
+                    + (f" ({len(muted)} находок разобраны ранее как ложные — в ленту)" if muted else "")
+                    + (f"; {bench_note}" if bench_note else ""))
         elif muted:
             _cowork(f"ревизор: {n} окон; {len(muted)} находок разобраны ранее как ложные — заметкой в "
-                    f"ленту, владельцу не выписаны" + (f" (+{noise_n} шум)" if noise_n else ""))
+                    f"ленту, владельцу не выписаны" + (f"; {bench_note}" if bench_note else "")
+                    + (f" (+{noise_n} шум)" if noise_n else ""))
+        elif bench_note:
+            _cowork(f"ревизор: {n} окон; {bench_note}" + (f" (+{noise_n} шум)" if noise_n else ""))
         elif n:
             tail = f" (+{noise_n} шум)" if noise_n else ""
             _cowork(f"ревизор: {n} окон, чисто{tail}")
         return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed,
-                "muted": len(muted)}
+                "muted": len(muted), "benched": len(benched)}
     items = _loc_fetch_items()                  # снимок очереди (все статусы) — бюджет/дедуп/поиск карточки
     if items is None:                           # частичная картина опаснее ожидания → откладываем, не флудим
         kept = _revizor_spool_save(task_f + owner_f)    # СОХРАНЯЕМ: «отложены» без спула = выброшены
         _cowork(f"ревизор: очередь недоступна — {len(task_f)} задач и {len(owner_f)} owner-находок отложены "
                 f"до след. прогона (сохранено в спул: {kept}; метку прогона не двигаем)")
         return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed,
-                "demoted": demoted, "deferred": True, "spooled": kept, "muted": len(muted)}
+                "demoted": demoted, "deferred": True, "spooled": kept, "muted": len(muted),
+                "benched": len(benched)}
     enq = skip = 0
     left = []
     try:
@@ -7759,7 +8015,8 @@ def _revizor_route(packages, now=None):
                 f"{len(owner_f)} owner-находок отложены до след. прогона (сохранено в спул: {kept}; "
                 f"метку прогона не двигаем)")
         return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed,
-                "demoted": demoted, "deferred": True, "spooled": kept, "muted": len(muted)}
+                "demoted": demoted, "deferred": True, "spooled": kept, "muted": len(muted),
+                "benched": len(benched)}
     # Бюджет суток/отказ постановки — это ОТСРОЧКА, а не потеря: держим в спуле до следующего
     # прогона. Метку при этом двигаем (deferred не ставим): очередь была доступна, окна отревизованы,
     # а текст находки лежит на диске — пере-выводить его повторной ревизией окон незачем. Иначе
@@ -7784,12 +8041,14 @@ def _revizor_route(packages, now=None):
         parts.append(f"{len(left)} задач-находок в спуле до след. прогона (бюджет суток)")
     if muted:
         parts.append(f"{len(muted)} разобранных ранее как ложные — в ленту, владельцу не выписаны")
+    if bench_note:
+        parts.append(bench_note)
     if not parts:                               # находки были, но все отсеяны бюджетом/дедупом
         parts.append(f"находки отсеяны (бюджет/дедуп): task {len(task_f)}, skip {skip}")
     _cowork("ревизор: " + ", ".join(parts))
     return {"windows": n, "tasks": enq, "owner": len(owner_f), "noise": noise_n, "failed": failed,
             "demoted": demoted, "demoted_client": demoted_client, "spooled": len(left),
-            "muted": len(muted)}
+            "muted": len(muted), "benched": len(benched)}
 
 
 # ------------------- OS-синглтон демона (разбор #128, часть 4) ----------------
@@ -8283,8 +8542,11 @@ if __name__ == "__main__":
             sys.exit(1)
     elif arg == "--revizor-verdicts":
         # СЧЁТ глушений: что разобрано, каким вердиктом, сколько находок это сняло с карточки.
-        # Read-only: тишина по вердикту обязана быть видимой, иначе её нечем проверить.
+        # Read-only: тишина по вердикту обязана быть видимой, иначе её нечем проверить. Вторым
+        # блоком — СЧЁТ ПОЛЬЗЫ ПРОВЕРОК: кто выбыл из потока по порогу и сколько находок выведено
+        # мимо владельца (та же причина: молчание без счёта проверить нечем).
         print(_revizor_verdict_ledger_text())
+        print(_revizor_check_ledger_text())
     elif arg == "--revizor-verdict":
         # ВЕРДИКТ ПО НАХОДКЕ: --revizor-verdict "<класс|окно|предмет>" "<вердикт>" "<существо>" ["основание"]
         # Существо — дословная улика находки (для «ложной» обязательно): вердикт глушит ТОЛЬКО её,

@@ -6632,6 +6632,255 @@ class TestRevizorVerdictRoute(Base):
         self.assertTrue(any(n == "ревизор: 1 окон, чисто" for n in self.notes))
 
 
+# ---- ПОРОГ ДОКАЗАННОЙ ПОЛЬЗЫ ПРОВЕРКИ (10.08.2026) ----
+# ОСНОВАНИЕ (замер, не ощущение): чек #92 «депозит без противоречий» за наблюдение 23.07–09.08 дал
+# 45 находок, законных из них НОЛЬ, настоящего противоречия «один клиент, один байк, разные суммы»
+# не найдено ни одного (разборы 411/419/420, docs/artifacts/2026-08-09-class92-43-unresolved.md).
+# Вердикт по находке такую проверку не останавливает: ключ включает ОКНО, и следующее окно рождает
+# новый ключ. Голдены ниже стерегут сам порог и ОБА условия замка — счёт выбывшей продолжается,
+# первая законная возвращает её в поток.
+
+def _tally_reg(false_n=0, real_n=0, open_n=0, check="депозит без противоречий", cls="#92", hits=0):
+    """Реестр вердиктов с заданным счётом по ОДНОЙ проверке. Разные окна = разные ключи — ровно как
+    в бою: ключ вердикта включает окно, и одна проверка копит разбор по многим окнам."""
+    reg, cid = {}, 0
+    for verdict, n in ((o.REVIZOR_VERDICT_FALSE, false_n), (o.REVIZOR_VERDICT_REAL, real_n),
+                       (o.REVIZOR_VERDICT_OPEN, open_n)):
+        for _ in range(n):
+            cid += 1
+            reg[f"{cls}|{cid}|{check}"] = {"verdict": verdict, "gist": f"улика окна {cid}",
+                                           "why": "", "hits": hits, "last_hit": None}
+    return reg
+
+
+_DEP_CHECK = "#92|депозит без противоречий"
+
+
+class TestRevizorCheckTally(unittest.TestCase):
+    """Счёт полезности проверки: законных / ложных / не разобрано, и что из этого — знаменатель."""
+
+    def test_check_id_drops_window(self):
+        # Полезность меряется у ПРОВЕРКИ, а не у окна: два окна одного чека — одна проверка.
+        self.assertEqual(o._revizor_check_id(_dep_f()), _DEP_CHECK)
+        self.assertEqual(o._revizor_check_id(_dep_f(cid=8725114073)), _DEP_CHECK)
+
+    def test_check_id_of_thinker_finding_is_class(self):
+        self.assertEqual(o._revizor_check_id({"class": "ж", "client_id": 5}), "ж|")
+
+    def test_key_round_trip(self):
+        self.assertEqual(o._revizor_check_of_key(o._revizor_verdict_key(_dep_f())), _DEP_CHECK)
+
+    def test_malformed_key_is_none_not_empty(self):
+        # «Не знаю, чья это запись» ≠ «запись проверки с пустым именем»: набранный руками ключ в
+        # счёт не идёт вовсе, и это может только НЕ дать проверке выбыть.
+        self.assertIsNone(o._revizor_check_of_key("#92|1126977519"))
+        self.assertIsNone(o._revizor_check_of_key(""))
+
+    def test_malformed_key_not_in_tally(self):
+        reg = _tally_reg(false_n=2)
+        reg["ключ-набранный-руками"] = {"verdict": o.REVIZOR_VERDICT_FALSE, "gist": "x"}
+        tally = o._revizor_check_tally(reg)
+        self.assertEqual(list(tally), [_DEP_CHECK])
+        self.assertEqual(tally[_DEP_CHECK]["decided"], 2)
+
+    def test_tally_counts_three_outcomes(self):
+        tally = o._revizor_check_tally(_tally_reg(false_n=3, real_n=2, open_n=4))
+        self.assertEqual(tally[_DEP_CHECK],
+                         {"real": 2, "false": 3, "open": 4, "decided": 5, "muted": 0})
+
+    def test_open_stays_out_of_denominator(self):
+        """«Не берусь» в знаменатель НЕ входит: иначе молодая проверка глохла бы от незнания
+        владельца, а не от своего вреда."""
+        tally = o._revizor_check_tally(_tally_reg(open_n=40))
+        self.assertEqual(tally[_DEP_CHECK]["decided"], 0)
+        self.assertFalse(o._revizor_check_benched(_DEP_CHECK, tally)[0])
+
+    def test_unreadable_verdict_counted_as_open(self):
+        reg = {"#92|1|депозит без противоречий": {"verdict": "мусор", "gist": "x"}}
+        self.assertEqual(o._revizor_check_tally(reg)[_DEP_CHECK]["decided"], 0)
+
+    def test_repeats_are_not_sample_size(self):
+        """Повторы (hits) в знаменатель не идут: ОДНА ложная находка, выведенная двадцатью тиками,
+        — одна ошибка проверки, а не двадцать. Иначе порог выбивал бы проверку с одним разбором."""
+        tally = o._revizor_check_tally(_tally_reg(false_n=1, hits=19))
+        self.assertEqual((tally[_DEP_CHECK]["decided"], tally[_DEP_CHECK]["muted"]), (1, 19))
+        self.assertFalse(o._revizor_check_benched(_DEP_CHECK, tally)[0])
+
+    def test_empty_tally_says_unknown_not_zero(self):
+        txt = o._revizor_check_ledger_text(reg={}, checks={})
+        self.assertIn("пуст", txt)
+
+
+class TestRevizorBenchThreshold(unittest.TestCase):
+    """Порог: разобранных ≥20 И законных ноль → проверка выбывает из потока к владельцу."""
+
+    MIN = None
+
+    def setUp(self):
+        self.MIN = o.REVIZOR_BENCH_MIN_DECIDED
+        self.chk = {}
+
+    def _bench(self, findings, reg):
+        return o._revizor_apply_bench(findings, o._revizor_check_tally(reg), self.chk, now=_REV_NOW)
+
+    def test_one_below_threshold_stays_in_flow(self):
+        kept, benched = self._bench([_dep_f()], _tally_reg(false_n=self.MIN - 1))
+        self.assertEqual((len(kept), len(benched)), (1, 0))
+        self.assertEqual(self.chk, {})
+
+    def test_at_threshold_check_benched(self):
+        reg = _tally_reg(false_n=self.MIN)
+        off, why = o._revizor_check_benched(_DEP_CHECK, o._revizor_check_tally(reg))
+        self.assertTrue(off)
+        self.assertIn(f"разобрано находок {self.MIN}", why)
+        kept, benched = self._bench([_dep_f()], reg)
+        self.assertEqual((len(kept), len(benched)), (0, 1))
+
+    def test_first_legit_finding_returns_check_to_flow(self):
+        """ЗАМОК: появление ПЕРВОЙ законной возвращает проверку в поток — в тот же прогон, без
+        отдельного действия человека (статус вычисляется из счёта, а не хранится флагом)."""
+        reg = _tally_reg(false_n=self.MIN, real_n=1)
+        self.assertFalse(o._revizor_check_benched(_DEP_CHECK, o._revizor_check_tally(reg))[0])
+        kept, benched = self._bench([_dep_f()], reg)
+        self.assertEqual((len(kept), len(benched)), (1, 0))
+
+    def test_benched_finding_keeps_being_counted(self):
+        """ЗАМОК: выбывшая не исчезает из виду — её находки продолжают считаться."""
+        reg = _tally_reg(false_n=self.MIN)
+        self._bench([_dep_f()], reg)
+        self._bench([_dep_f(cid=8725114073)], reg)
+        self.assertEqual(self.chk[_DEP_CHECK]["hits"], 2)
+        self.assertTrue(self.chk[_DEP_CHECK]["last_hit"])
+        self.assertTrue(self.chk[_DEP_CHECK]["since"])
+        txt = o._revizor_check_ledger_text(reg=reg, checks=self.chk)
+        self.assertIn("ВЫБЫЛА", txt)
+        self.assertIn("мимо владельца выведено 2", txt)
+
+    def test_bench_note_names_the_check(self):
+        # Имя проверки — единственное, чем владелец может вернуть её в поток: оно обязано быть
+        # в ленте, а не только в логе демона.
+        _kept, benched = self._bench([_dep_f()], _tally_reg(false_n=self.MIN))
+        self.assertIn(_DEP_CHECK, o._revizor_bench_note(benched))
+        self.assertEqual(o._revizor_bench_note([]), "")
+
+    def test_other_check_untouched(self):
+        # Выбывает ПРОВЕРКА, а не класс: соседний чек того же класса #92 идёт владельцу как прежде.
+        reg = _tally_reg(false_n=self.MIN)
+        other = dict(_dep_f(), check="нет годов")
+        kept, benched = self._bench([other], reg)
+        self.assertEqual((len(kept), len(benched)), (1, 0))
+
+    def test_ledger_shows_in_flow_check(self):
+        txt = o._revizor_check_ledger_text(reg=_tally_reg(false_n=3, real_n=1, open_n=2), checks={})
+        self.assertIn("законных 1, ложных 3, не разобрано 2", txt)
+        self.assertIn("В ПОТОКЕ", txt)
+
+
+class TestRevizorBenchStore(unittest.TestCase):
+    """Счёт выбывших живёт в том же файле, что вердикты, и переживает запись вердикта."""
+
+    def setUp(self):
+        self.p = os.path.join(tempfile.mkdtemp(), "revizor_verdicts.json")
+
+    def test_checks_section_round_trip(self):
+        o._revizor_verdicts_save(_tally_reg(false_n=1), self.p,
+                                 checks={_DEP_CHECK: {"hits": 3, "last_hit": "2026-08-10T00:00:00+00:00"}})
+        reg, chk = o._revizor_registry_read(self.p)
+        self.assertEqual(len(reg), 1)
+        self.assertEqual(chk[_DEP_CHECK]["hits"], 3)
+
+    def test_verdict_write_does_not_wipe_bench_count(self):
+        """Счёт находок выбывшей проверки — сам замок «не исчезла из виду»: запись вердикта не
+        смеет его стереть."""
+        o._revizor_verdicts_save({}, self.p, checks={_DEP_CHECK: {"hits": 5}})
+        o.revizor_set_verdict(_dep_f(), o.REVIZOR_VERDICT_FALSE, why="разбор 411", path=self.p)
+        self.assertEqual(o._revizor_checks_read(self.p)[_DEP_CHECK]["hits"], 5)
+
+    def test_old_file_without_section_reads_empty_count(self):
+        with open(self.p, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "verdicts": _tally_reg(false_n=1)}, f, ensure_ascii=False)
+        reg, chk = o._revizor_registry_read(self.p)
+        self.assertEqual((len(reg), chk), (1, {}))
+
+    def test_broken_file_reads_empty_both(self):
+        with open(self.p, "w", encoding="utf-8") as f:
+            f.write("{это не json")
+        self.assertEqual(o._revizor_registry_read(self.p), ({}, {}))
+
+
+class TestRevizorBenchRoute(Base):
+    """Порог в живом маршруте: находка выбывшей проверки не рождает карточку владельцу, уходит
+    заметкой в ленту и остаётся в счёте; первая законная возвращает проверку в поток."""
+
+    def setUp(self):
+        super().setUp()
+        self._save_c = (o._revizor_consult, o._cowork, o._revizor_postrelease_findings)
+        self.notes = []
+        o._cowork = lambda line: self.notes.append(line)
+        o._revizor_consult = lambda pkg: []
+        o._revizor_postrelease_findings = lambda pkg, **k: []
+        self.addCleanup(lambda: (setattr(o, "_revizor_consult", self._save_c[0]),
+                                 setattr(o, "_cowork", self._save_c[1]),
+                                 setattr(o, "_revizor_postrelease_findings", self._save_c[2])))
+
+    def _cards(self):
+        return [t for t in self.fb.tasks.values() if t["status"] == "needs_approval"]
+
+    def _seed(self, **kw):
+        o._revizor_verdicts_save(_tally_reg(**kw))
+
+    def test_benched_finding_makes_no_card(self):
+        self._seed(false_n=o.REVIZOR_BENCH_MIN_DECIDED)
+        o._revizor_postrelease_findings = lambda pkg, **k: [_dep_f()]
+        out = o._revizor_route([{"client_id": 1126977519}], now=_REV_NOW)
+        self.assertEqual((out["owner"], out["benched"]), (0, 1))
+        self.assertEqual(self._cards(), [])                             # владельцу карточки нет
+        self.assertTrue(any(_DEP_CHECK in n and "выбывших по порогу" in n for n in self.notes))
+
+    def test_benched_finding_counted_on_disk(self):
+        """ЗАМОК сквозь маршрут: находки выбывшей проверки продолжают считаться."""
+        self._seed(false_n=o.REVIZOR_BENCH_MIN_DECIDED)
+        o._revizor_postrelease_findings = lambda pkg, **k: [_dep_f()]
+        o._revizor_route([{"client_id": 1126977519}], now=_REV_NOW)
+        o._revizor_route([{"client_id": 1126977519}], now=_REV_NOW)
+        self.assertEqual(o._revizor_checks_read()[_DEP_CHECK]["hits"], 2)
+        self.assertEqual(len(o._revizor_verdicts_read()), o.REVIZOR_BENCH_MIN_DECIDED)   # вердикты целы
+
+    def test_first_legit_verdict_brings_card_back(self):
+        """ЗАМОК сквозь маршрут: одна законная — и та же находка снова доезжает владельцу."""
+        self._seed(false_n=o.REVIZOR_BENCH_MIN_DECIDED, real_n=1)
+        o._revizor_postrelease_findings = lambda pkg, **k: [_dep_f()]
+        out = o._revizor_route([{"client_id": 1126977519}], now=_REV_NOW)
+        self.assertEqual((out["owner"], out["benched"]), (1, 0))
+        self.assertEqual(len(self._cards()), 1)
+
+    def test_benched_task_finding_not_enqueued(self):
+        # Порог снимает и зелёную задачу: бесполезная проверка не смеет заказывать работу.
+        f = {"class": "ж", "client_id": 1, "action": "task", "check": "",
+             "task_text": "котировать, не анкетировать", "evidence": ""}
+        self._seed(false_n=o.REVIZOR_BENCH_MIN_DECIDED, check="", cls="ж")
+        o._revizor_consult = lambda pkg: [dict(f)]
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual((out["tasks"], out["benched"]), (0, 1))
+        self.assertEqual([t for t in self.fb.tasks.values()], [])
+
+    def test_benched_spooled_finding_leaves_spool(self):
+        # Отложенная находка выбывшей проверки снимается со спула — иначе лежала бы вечно.
+        o._revizor_spool_save([_dep_f()])
+        self._seed(false_n=o.REVIZOR_BENCH_MIN_DECIDED)
+        out = o._revizor_route([], now=_REV_NOW)
+        self.assertEqual((out["owner"], out["benched"]), (0, 1))
+        self.assertEqual(o._revizor_spool_read(), [])
+
+    def test_check_in_flow_still_makes_card(self):
+        # Регресс: проверка ниже порога работает ровно как работала.
+        self._seed(false_n=o.REVIZOR_BENCH_MIN_DECIDED - 1)
+        o._revizor_postrelease_findings = lambda pkg, **k: [_dep_f()]
+        out = o._revizor_route([{"client_id": 1126977519}], now=_REV_NOW)
+        self.assertEqual((out["owner"], out["benched"]), (1, 0))
+        self.assertEqual(len(self._cards()), 1)
+
+
 # ---- МАНДАТ 14.07: авто-задачи ревизора НЕ заказывают деплой/рестарт прода ----
 # Живой урок: цепи 310/311 из находок ревизора доходили до КРАСНЫХ шагов «деплой+рестарт прод-ботов»
 # (✋ владельцу), хотя применение делает авто-reconcile. Голдены: находка «рестартни бота» → owner-
