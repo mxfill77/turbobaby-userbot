@@ -830,12 +830,104 @@ class TestApprovalTimeout(Base):
         tid = self.fb.add(status="needs_approval", updated=iso_ago(4000))
         o.process_approval_timeouts()
         self.assertEqual(self.fb.tasks[tid]["status"], "failed")
-        self.assertIn("30 мин", self.fb.tasks[tid]["result"])
+        # срок из константы, а не литералом: после фикса 497 он выводится из TASK_TIMEOUT
+        self.assertIn(f"{o.APPROVAL_TTL // 60} мин", self.fb.tasks[tid]["result"])
 
     def test_na_recent_kept(self):
         tid = self.fb.add(status="needs_approval", updated=iso_ago(60))
         o.process_approval_timeouts()
         self.assertEqual(self.fb.tasks[tid]["status"], "needs_approval")   # ждём ещё
+
+
+class TestApprovalTtlFloor(unittest.TestCase):
+    """ЗАМОК КЛАССА 497: СРОК КАРТОЧКИ НЕ МОЖЕТ БЫТЬ КОРОЧЕ ПРОГОНА, ВНУТРИ КОТОРОГО ОН ТИКАЕТ.
+
+    Краснеет, если соотношение снова разъедется — хоть правкой константы, хоть ручкой в среде.
+    Проверяет не совпадение двух чисел (совпадение назавтра разъедется молча), а ВЫВОДИМОСТЬ:
+    срок считается ИЗ таймаута, поэтому держится сам. Пороговые числа тут литералами намеренно —
+    считать их из тех же констант значило бы проверять тождество."""
+
+    def test_live_constants_card_outlives_run(self):
+        # боевые значения модуля: срок СТРОГО больше жёсткого таймаута прогона
+        self.assertGreater(o.APPROVAL_TTL, o.TASK_TIMEOUT,
+                           "срок карточки короче таймаута прогона — вернулся класс 497 "
+                           "(74 и 78: «да» пришло вовремя и сгорело за занятость исполнителя)")
+        # и покрывает ещё виток, которым демон ответ замечает
+        self.assertGreaterEqual(o.APPROVAL_TTL, o.TASK_TIMEOUT + o.POLL_SEC)
+
+    def test_env_cannot_lower_below_floor(self):
+        # ручка может срок ПОДНЯТЬ, но не опустить: соотношение держится само, а не договорённостью
+        for asked in (0, 1, 60, 1800, 2699, 2760):
+            self.assertEqual(o.approval_ttl_effective(asked, 2700, 60), max(asked, 2760),
+                             f"ручка просила {asked}с")
+
+    def test_env_can_raise(self):
+        self.assertEqual(o.approval_ttl_effective(7200, 2700, 60), 7200)
+
+    def test_floor_follows_timeout(self):
+        # ГЛАВНОЕ: пол ВЫЧИСЛЯЕТСЯ из таймаута, а не совпадает с ним числом сегодня. Подняли
+        # таймаут — срок обязан уехать за ним, даже если ручку никто не трогал.
+        for tt in (600, 2700, 5400, 9000):
+            self.assertGreater(o.approval_ttl_effective(1800, tt, 60), tt, f"taskimeout={tt}")
+
+    def test_floor_is_minimal_not_generous(self):
+        # «НЕ УДЛИНЯТЬ БЕСКОНЕЧНО»: пол ровно на ОДИН виток выше таймаута, а не «с запасом».
+        # Забор Честертона (срок стережёт открытую цепь и свежесть разрешения) отодвинут за спину
+        # исполнителя, а не снят: лишний час жизни карточки этим тестом запрещён.
+        self.assertEqual(o.approval_ttl_effective(0, 2700, 60) - 2700, 60)
+
+    def test_garbage_env_falls_to_floor(self):
+        # мусор в ручке НЕ роняет импорт демона (прежняя строка `int(...)` падала бы) и НЕ даёт
+        # срока короче пола: «не разобрал» читается как «не задано»
+        for junk in ("", "   ", "abc", None, "-1", "1800с", []):
+            self.assertEqual(o.approval_ttl_effective(junk, 2700, 60), 2760, repr(junk))
+
+    def test_clamp_is_not_silent(self):
+        # клемма ручки обязана быть ВИДНА в баннере старта — молчаливая клемма уводит диагностику
+        # по стухшему .env ровно как `claude=` до фикса 22.07
+        for raw, clamped in (("", False), ("   ", False),
+                             (str(o.APPROVAL_TTL_FLOOR - 1), True), ("мусор", True),
+                             (str(o.APPROVAL_TTL_FLOOR), False),
+                             (str(o.APPROVAL_TTL_FLOOR + 600), False)):
+            with mock.patch.object(o, "APPROVAL_TTL_ASKED", raw):
+                self.assertEqual(o.approval_ttl_clamped(), clamped, repr(raw))
+
+
+class TestApprovalTtlLiveIncident(Base):
+    """ГОЛДЕН ЖИВОГО СЛУЧАЯ (карточки 74 и 78, ночь 31.07, разбор 2026-08-11-approve-ttl-seven).
+    «Да» пришло на 3.2 и 24.7 минуте, а демон был занят ЧУЖИМ синхронным прогоном 29.5 и 52.5
+    минуты. На первом свободном витке одобренному ряду было ровно 1800с — и прежний срок (тоже
+    1800) убивал его ПЕРЕД запуском. Числа здесь живые, не круглые: это фикстура прода."""
+
+    def test_answer_survives_daemon_busy_1800s(self):
+        tid = self.fb.add(status="approved", updated=iso_ago(1800))   # возраст 74 и 78 в миг смерти
+        self._claude(0, "доделал после одобрения\nRESULT: доделал")
+        o.process_approved()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")        # исполнена, а не сожжена
+
+    def test_answer_survives_max_observed_run(self):
+        # max синхронного прогона за 184 замеренных — 45.2 мин: ответ, пришедший в его начале,
+        # обязан пережить ВСЮ занятость исполнителя, иначе счёт снова выставлен ответу
+        tid = self.fb.add(status="approved", updated=iso_ago(int(45.2 * 60)))
+        self._claude(0, "доделал\nRESULT: доделал")
+        o.process_approved()
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+
+    def test_fence_still_standing(self):
+        # забор ЦЕЛ: карточка не живёт вечно. Ряд старше срока по-прежнему закрывается и claude
+        # ради него не спавнится — «полечить» класс снятием срока этот тест запрещает.
+        tid = self.fb.add(status="approved", updated=iso_ago(o.APPROVAL_TTL + 60))
+        called = {"n": 0}
+        o.run_claude = lambda *a, **k: (called.__setitem__("n", called["n"] + 1), (0, ""))[1]
+        o.process_approved()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertEqual(called["n"], 0)
+
+    def test_diagnosis_names_the_real_ttl(self):
+        # диагноз владельцу называет ДЕЙСТВУЮЩИЙ срок, а не литерал «30 мин» из прошлой жизни
+        tid = self.fb.add(status="needs_approval", updated=iso_ago(o.APPROVAL_TTL + 60))
+        o.process_approval_timeouts()
+        self.assertIn(f"{o.APPROVAL_TTL // 60} мин", self.fb.tasks[tid]["result"])
 
 
 class TestWatchdog(Base):
@@ -4232,7 +4324,7 @@ class TestFailReasonEvidence(Base):
         self.assertEqual(self.fb.tasks[tid]["status"], "failed")
         self.assertIn("причина=approval_timeout", r)
         self.assertIn(o.WORK_DONE_MARK, r)
-        self.assertIn("30 мин", r)                       # прежний диагноз владельцу цел
+        self.assertIn(f"{o.APPROVAL_TTL // 60} мин", r)  # прежний диагноз владельцу цел
 
     def test_stuck_single_reason_is_heartbeat(self):
         tid = self.fb.add(status="in_progress", updated=iso_ago(o.PC_SINGLE_STALE + 120))
