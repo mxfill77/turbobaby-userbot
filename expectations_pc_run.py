@@ -10,11 +10,20 @@ TTL подтверждения `process_approval_timeouts`, сторож зас�
 живут ВНУТРИ `poll_once`, то есть внутри того самого оборота, чьё отсутствие и есть предмет О2.
 Демон, переставший крутиться, не судит себя ни одной из этих веток; наблюдатель обязан быть вне.
 
-ЧЕТЫРЕ ИСТОЧНИКА ФАКТОВ, КАЖДЫЙ ПЕРЕЖИВАЕТ СМЕРТЬ СВОЕГО ПРЕДМЕТА:
+ПЯТЬ ИСТОЧНИКОВ ФАКТОВ, КАЖДЫЙ ПЕРЕЖИВАЕТ СМЕРТЬ СВОЕГО ПРЕДМЕТА:
   очередь   — GET моста (`get_pending` по открытым статусам, полоса pc). ТОЛЬКО чтение;
   оборот    — файл `pc_orchestrator.heartbeat`, который демон пишет ПОСЛЕДНЕЙ строкой poll_once;
   занятость — `pc_orchestrator.task_started.json`: отметка CLAIM на диске (объявленный заход);
+  модербот  — mtime `moderation_ipc.db` (ПРОДУКТ его пятисекундного тика) плюс проба процесса по
+              `moderation_bot.lock`. База НЕ ОТКРЫВАЕТСЯ: `os.stat`, ни sqlite, ни запроса —
+              наблюдатель не смеет соперничать с боевым писателем за замок файла;
   часы      — QueryUnbiasedInterruptTime: время БОДРСТВОВАНИЯ машины (сон в него не идёт).
+
+ГДЕ СТОИТ САМ НАБЛЮДАТЕЛЬ И ПОЧЕМУ ЭТО ВАЖНО ДЛЯ О3. Задача Планировщика `TurboBabyExpectPC`,
+каждые 10 минут, под SYSTEM, отдельным процессом — то есть ВНЕ всех трёх наблюдаемых. Модербот
+падает — наблюдатель тикает; демон встаёт — наблюдатель тикает. Живой случай, ради которого это
+не формальность: 05.08 09:51:48 → 06.08 19:44:10 модербот лежал 33.9 часа, и контур-вотчдог
+демона (единственный, кто за ним следит) молчал всё это время ровно потому, что стоял сам демон.
 Демон отсюда НЕ импортируется ради логики — только ради боевого клиента моста (секреты берёт сам
 импортируемый модуль, здесь их нет и они не читаются). Импорт идёт с `TURBOBABY_TEST_LOGS=1`,
 иначе наблюдатель повесил бы свой хендлер на БОЕВОЙ журнал демона — известный класс «тесты сорят
@@ -31,7 +40,8 @@ FAIL-SAFE: любой сбой сбора → факта нет → вердик
 помечен, скажем на следующем прогоне.
 
 ОТКАТ: порог соответствующей ветки = 0 в окружении (EXPECT_PC_NEW_MIN / EXPECT_PC_RUN_MIN /
-EXPECT_PC_TURN_MIN) — ветка мертва целиком; полностью — снять задачу Планировщика наблюдателя.
+EXPECT_PC_TURN_MIN / EXPECT_PC_MOD_MIN) — ветка мертва целиком; полностью — снять задачу
+Планировщика наблюдателя.
 
 ЗАПУСК:
     venv\\Scripts\\python.exe expectations_pc_run.py            # боевой прогон (заметки уходят)
@@ -52,6 +62,8 @@ import expectations_pc as ex                                          # noqa: E4
 LANE_LABEL = "ПК"
 HEARTBEAT_FILE = os.path.join(REPO, "pc_orchestrator.heartbeat")
 TASK_START_FILE = os.path.join(REPO, "pc_orchestrator.task_started.json")
+MOD_IPC_FILE = os.path.join(REPO, "moderation_ipc.db")        # О3: ПРОДУКТ тика, читаем только stat
+MOD_LOCK_FILE = os.path.join(REPO, "moderation_bot.lock")     # О3: чей это продукт (номер процесса)
 STATE_DIR = os.path.join(REPO, "tmp", "expect_pc")     # СВОЙ каталог: файлы демона не трогаем
 STATE_FILE = "state.json"
 STATE_KEEP = 32
@@ -110,6 +122,89 @@ def heartbeat_facts(path=None):
     if not raw:
         return {"ok": False, "raw": "", "err": "файл heartbeat пуст"}
     return {"ok": True, "raw": raw, "err": ""}
+
+
+# ═══════════════════ ПРОБА ПРОЦЕССА: ПРАВО СПРОСИТЬ, А НЕ ТРОНУТЬ ══════════════════════════
+_PROC_QUERY_LIMITED = 0x1000            # PROCESS_QUERY_LIMITED_INFORMATION
+_ERR_INVALID_PARAMETER = 87             # такого номера в системе нет
+_ERR_ACCESS_DENIED = 5                  # процесс ЕСТЬ, но чужой — «нет» это не значит
+_FILETIME_EPOCH = 11644473600.0         # 1601-01-01 → 1970-01-01, секунды
+
+
+def process_probe(pid):
+    """→ (есть ли процесс с этим номером | None, когда запущен | None). Ни одного права ЧТО-ТО
+    ему сделать: открываем PROCESS_QUERY_LIMITED_INFORMATION — «спросить», не «тронуть».
+
+    `os.kill(pid, 0)` здесь ЗАПРЕЩЁН НАМЕРЕННО, и это не стилистика: на Windows он не пингует, а
+    зовёт TerminateProcess — наблюдатель убил бы наблюдаемого одной строкой, ровно нарушив главный
+    запрет этого захода. Отказ доступа честно отличается от отсутствия: чужой процесс существует.
+    Возраст запуска нужен решению против переиспользования номеров (`ex.moderbot_writer`)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None, None
+    if pid <= 0:
+        return None, None
+    try:
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(_PROC_QUERY_LIMITED, False, pid)
+    except Exception:                                                 # noqa: BLE001
+        return None, None                          # не Windows / вызов не состоялся → «неизвестно»
+    if not h:
+        try:
+            err = k32.GetLastError()
+        except Exception:                                             # noqa: BLE001
+            return None, None
+        if err == _ERR_INVALID_PARAMETER:
+            return False, None                     # ДОКАЗАННОЕ отсутствие — единственный False
+        if err == _ERR_ACCESS_DENIED:
+            return True, None                      # есть, но возраст не добыть → авторство «не знаю»
+        return None, None
+    started = None
+    try:
+        cre, ext, ker, usr = (ctypes.c_ulonglong() for _ in range(4))
+        if k32.GetProcessTimes(h, ctypes.byref(cre), ctypes.byref(ext),
+                               ctypes.byref(ker), ctypes.byref(usr)) and cre.value:
+            started = cre.value / 1e7 - _FILETIME_EPOCH
+    except Exception:                                                 # noqa: BLE001
+        started = None
+    finally:
+        try:
+            k32.CloseHandle(h)
+        except Exception:                                             # noqa: BLE001
+            pass
+    return True, started
+
+
+def moderbot_facts(ipc=None, lock=None):
+    """ПРОДУКТ модербота и авторство → {"ok","mtime","pid","opened","started","lock_mtime","err"}.
+
+    ПРОДУКТ, А НЕ ЖИЗНЬ: `job_heartbeat` каждые 5с коммитит запись в `moderation_ipc`, соединение
+    закрывается на каждом вызове (WAL-чекпойнт), поэтому mtime основного файла двигается на каждый
+    тик — измерено живой пробой 11.08 (73 шага, max 5.02с). Базу НЕ ОТКРЫВАЕМ: `os.stat` не
+    трогает ни одной страницы и не соперничает с боевым писателем за замок.
+
+    Лока нет / номер не разобран → авторство остаётся неподтверждённым (None), а не выдумывается:
+    в решении это даёт «неизвестно», и ни одна дорога отсюда не ведёт к «работает»."""
+    out = {"ok": False, "mtime": None, "pid": None, "opened": None, "started": None,
+           "lock_mtime": None, "err": ""}
+    try:
+        out["mtime"] = os.stat(ipc or MOD_IPC_FILE).st_mtime
+        out["ok"] = True
+    except OSError as e:
+        out["err"] = "%s: %s" % (type(e).__name__, str(e)[:80])
+        return out
+    lp = lock or MOD_LOCK_FILE
+    try:
+        with open(lp, encoding="utf-8") as f:
+            raw = f.read().strip()
+        out["lock_mtime"] = os.stat(lp).st_mtime
+        out["pid"] = int(raw)
+    except (OSError, ValueError) as e:
+        out["err"] = "лок модербота не прочитан: %s" % str(e)[:60]
+        return out
+    out["opened"], out["started"] = process_probe(out["pid"])
+    return out
 
 
 def busy_facts(path=None):
@@ -252,6 +347,54 @@ def update_silence(state, hb, awake, now):
     return {"measured": True, "awake": silent, "why": ""}
 
 
+def update_mod_silence(state, mod, awake, now):
+    """Накопить тишину СОБСТВЕННОГО тика модербота в часах бодрствования →
+    {"measured","awake","since","why"}. Устройство то же, что у `update_silence`; отличие ровно
+    одно, и оно — вторая половина замка против ложного зелёного.
+
+    СЧЁТЧИК ОБНУЛЯЕТ ТОЛЬКО СВОЯ ЗАПИСЬ: mtime сменился И автор не опровергнут. Файл общий (в него
+    пишут userbot черновиком и тренажёр сессией), поэтому «файл шевельнулся» обнулением быть не
+    может: мёртвый модербот при живом клиентском трафике обнулялся бы вечно и выглядел здоровым
+    ровно столько, сколько идёт трафик. Опровергнут — значит проба процесса ДОКАЗАЛА отсутствие
+    (`who is False`); «не смогли проверить» обнуляет, потому что fail-safe этого слоя — молчание,
+    а не заметка на пустом месте.
+
+    ТРИ ЧЕСТНЫХ «НЕ ИЗМЕРЕНО», каждое ведёт к «неизвестно»: часов бодрствования нет · продукт не
+    прочитан · прошлого наблюдения нет либо часы пошли назад (машина перезагрузилась)."""
+    prev = state.get("mod") if isinstance(state.get("mod"), dict) else {}
+    mtime = (mod or {}).get("mtime")
+    who = ex.moderbot_writer({"moderbot": mod})
+    cur = {"mtime": mtime, "awake": awake, "wall": now}
+    since = prev.get("since") or now
+    if awake is None:
+        state["mod"] = dict(cur, silent=None, since=since)
+        return {"measured": False, "awake": None, "since": since,
+                "why": "часов бодрствования на этой машине нет — сон от молчания не отличить"}
+    if not (mod or {}).get("ok"):
+        state["mod"] = dict(prev, awake=awake, wall=now)
+        return {"measured": False, "awake": None, "since": since,
+                "why": "продукт модербота не прочитан"}
+    prev_awake = prev.get("awake")
+    try:
+        prev_awake = None if prev_awake is None else float(prev_awake)
+    except (TypeError, ValueError):
+        prev_awake = None
+    own_write = prev.get("mtime") != mtime and who is not False
+    if own_write or prev_awake is None or awake < prev_awake:
+        why = ("своя запись в IPC — тишина обнулена" if own_write else
+               "прошлого наблюдения нет" if prev_awake is None else
+               "часы бодрствования пошли назад — машина перезагрузилась")
+        state["mod"] = dict(cur, silent=0.0, since=now)
+        return {"measured": False, "awake": 0.0, "since": now, "why": why}
+    try:
+        silent = float(prev.get("silent") or 0.0)
+    except (TypeError, ValueError):
+        silent = 0.0
+    silent += max(0.0, min(awake - prev_awake, STEP_CAP_SEC))
+    state["mod"] = dict(cur, silent=silent, since=since)
+    return {"measured": True, "awake": silent, "since": since, "why": ""}
+
+
 def update_waits(state, facts, now):
     """Накопить ЧИСТОЕ ОЖИДАНИЕ каждой ждущей строки полосы ПК — время, простоянное ИМЕННО ПРИ
     СВОБОДНОЙ полосе. Именно по нему О1 берёт порог (обоснование — шапка expectations_pc).
@@ -292,6 +435,7 @@ def snapshot(state, now=None, getter=None):
     """ФАКТЫ и ни одного решения. Порогов здесь нет — их применяет expectations_pc.verdict()."""
     now = time.time() if now is None else float(now)
     hb = heartbeat_facts()
+    mod = moderbot_facts()
     awake = awake_seconds()
     return {
         "now": now,
@@ -299,6 +443,8 @@ def snapshot(state, now=None, getter=None):
         "heartbeat": hb,
         "silence": update_silence(state, hb, awake, now),
         "busy": busy_facts(),
+        "moderbot": mod,
+        "mod_silence": update_mod_silence(state, mod, awake, now),
     }
 
 
@@ -326,8 +472,12 @@ def run(dry=False, now=None, getter=None, notifier=None):
     open_eps = dict(st.get("open") or {})
     qstate = ex.queue_state(facts, cfg, now)[0]
     tstate, tinfo = ex.turn_state(facts, cfg, now)
+    mstate, minfo = ex.moderbot_state(facts, cfg, now)
     out = {"verdicts": len(verdicts), "notes": [], "closed": [], "dry": bool(dry),
            "queue": qstate, "turn": tstate, "why": tinfo.get("why", ""),
+           # У модербота состояние ходит ПАРОЙ со своей причиной: «неизвестно» без причины
+           # читается как «плохо», а это разные новости.
+           "moderbot": mstate, "mod_why": minfo.get("why", ""),
            # Чем именно объяснено молчание оборота, если объяснено: заход id=N. Владелец, читающий
            # статус, обязан видеть ПРИЧИНУ зелёного, а не только его цвет.
            "busy": (tinfo.get("busy") or {}).get("task")}
@@ -372,6 +522,8 @@ def main():
                              if out.get("busy") else "")
         print("очередь ПК: %s · оборот демона: %s%s"
               % (out["queue"], out["turn"], (" (%s)" % why) if why else ""))
+        print("модербот (работа, не жизнь): %s%s"
+              % (out["moderbot"], (" (%s)" % out["mod_why"]) if out["mod_why"] else ""))
         print("нарушений: %d %s" % (out["verdicts"], out["notes"]))
         return 0
     print(json.dumps(out, ensure_ascii=False))

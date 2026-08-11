@@ -468,6 +468,253 @@ class TestLiveFormat(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
+#  О3 — МОДЕРБОТ: «ЖИВ» И «ДЕЛАЕТ РАБОТУ» РАЗВЕДЕНЫ, И ОБА НАПРАВЛЕНИЯ ПОКРЫТЫ
+# ══════════════════════════════════════════════════════════════════════════════════════════
+MOD_PID = 11968                          # живой номер из moderation_bot.lock (замер 11.08.2026)
+MOD_START = NOW - 400000.0               # процесс запущен задолго до наблюдения (06.08 19:43:59)
+MOD_LOCK_SKEW = 1.4                      # ЖИВОЕ расхождение «старт процесса → запись лока», с
+
+
+def modf(age=3.0, pid=MOD_PID, opened=True, started=MOD_START, skew=MOD_LOCK_SKEW,
+         ok=True, err="", now=NOW):
+    """Факт о модерботе ровно того вида, что отдают руки (`moderbot_facts`): mtime продукта,
+    номер из лока, проба процесса и возраст запуска. Идеализированной схемы здесь нет."""
+    return {"ok": ok, "mtime": (now - age) if ok else None, "pid": pid, "opened": opened,
+            "started": started, "lock_mtime": None if started is None else started + skew,
+            "err": err}
+
+
+def silent_for(seconds, since=NOW - 1800.0):
+    return {"measured": True, "awake": float(seconds), "since": since, "why": ""}
+
+
+def mfacts(mod=None, silence=None, now=NOW):
+    """Факты с наполненной веткой О3. Остальные ветки — как в базовой фикстуре."""
+    f = facts(now=now)
+    f["moderbot"] = modf(now=now) if mod is None else mod
+    f["mod_silence"] = ({"measured": False, "awake": 0.0, "since": now,
+                         "why": "своя запись в IPC — тишина обнулена"}
+                        if silence is None else silence)
+    return f
+
+
+class TestO3Moderbot(unittest.TestCase):
+    """Предмет О3 — ПРОДУКТ пятисекундного тика, а не существование процесса."""
+
+    def setUp(self):
+        self.cfg = ex.config({})
+
+    def test_fresh_own_product_is_work(self):
+        st, info = ex.moderbot_state(mfacts(), self.cfg, NOW)
+        self.assertEqual(st, ex.MOD_OK)
+        self.assertEqual(ex.verdict(mfacts(), self.cfg), [])
+        self.assertLess(info["wall"], self.cfg["mod"])
+
+    def test_live_pid_without_product_is_a_violation(self):
+        """ГЛАВНЫЙ КЕЙС ЗАКОНА: процесс жив, номер на месте, продукта нет → это НЕ «жив»."""
+        f = mfacts(mod=modf(age=1800.0), silence=silent_for(1500.0))
+        st, info = ex.moderbot_state(f, self.cfg, NOW)
+        self.assertEqual(st, ex.MOD_IDLE)
+        v = [x for x in ex.verdict(f, self.cfg) if x["kind"] == "o3_pc_moderbot"]
+        self.assertEqual(len(v), 1)
+        note = ex.render(v[0])
+        self.assertIn("не делает свою работу", note)
+        self.assertIn("PID %d жив" % MOD_PID, note)
+        self.assertIn("живой PID работающим сервисом не является", note)
+        self.assertTrue(info["who"])
+
+    def test_fresh_product_of_a_foreign_writer_is_never_work(self):
+        """ЗАМОК ПРОТИВ ЛОЖНОГО ЗЕЛЁНОГО: файл общий. Свежий mtime при отсутствующем процессе
+        значит «писал кто-то другой» (userbot черновиком, тренажёр сессией), а не «бот работает»."""
+        f = mfacts(mod=modf(age=2.0, opened=False))
+        st, info = ex.moderbot_state(f, self.cfg, NOW)
+        self.assertEqual(st, ex.MOD_UNKNOWN)
+        self.assertNotEqual(st, ex.MOD_OK)
+        self.assertIn("писал не модербот", info["why"])
+        self.assertEqual(ex.verdict(f, self.cfg), [], "незнание не приговор")
+
+    def test_foreign_writer_becomes_a_violation_once_silence_accumulates(self):
+        """Вторая половина того же замка: молчание не вечно. Чужая запись счётчик не обнуляет,
+        поэтому через два наблюдения выходит честное нарушение — с названным состоянием процесса."""
+        f = mfacts(mod=modf(age=2.0, opened=False), silence=silent_for(1200.0))
+        self.assertEqual(ex.moderbot_state(f, self.cfg, NOW)[0], ex.MOD_IDLE)
+        note = ex.render(ex.verdict(f, self.cfg)[0])
+        self.assertIn("из лока в системе нет", note)
+        self.assertIn("делал кто-то другой", note)
+
+    def test_reused_pid_is_not_an_author(self):
+        """Номер переиспользован Windows'ом: процесс есть, но запущен не тогда, когда написан лок."""
+        f = mfacts(mod=modf(age=2.0, started=NOW - 30.0, skew=-400000.0))
+        self.assertIs(ex.moderbot_writer(f), False)
+        self.assertEqual(ex.moderbot_state(f, self.cfg, NOW)[0], ex.MOD_UNKNOWN)
+        # А ЖИВАЯ пара «старт → лок» (расхождение 1.4с) автором быть обязана.
+        self.assertIs(ex.moderbot_writer(mfacts()), True)
+
+    def test_sleep_is_not_silence(self):
+        """Возраст по стенным часам больше порога, но бодрствования накопилось мало: машина спала.
+        Контрфакт корпуса — стенные часы дали бы здесь 2 ложные заметки (сны 11611с и 32381с)."""
+        f = mfacts(mod=modf(age=32381.0), silence=silent_for(300.0))
+        st, info = ex.moderbot_state(f, self.cfg, NOW)
+        self.assertEqual(st, ex.MOD_OK)
+        self.assertGreater(info["slept"], 30000.0)
+        self.assertEqual(ex.verdict(f, self.cfg), [])
+
+    def test_unknown_never_says_work(self):
+        """Каждая дырка в фактах — отдельным кейсом. Ни одна не ведёт к «делает работу»."""
+        holes = [
+            ("факта о модерботе нет вовсе", dict(mfacts(), moderbot=None)),
+            ("stat не удался", mfacts(mod=modf(ok=False, err="FileNotFoundError: …"))),
+            ("время записи не разобрано", mfacts(mod=dict(modf(), mtime="не время"))),
+            ("лока нет — автор не подтверждён", mfacts(mod=modf(pid=None))),
+            ("проба процесса не состоялась", mfacts(mod=modf(opened=None))),
+            ("возраст запуска не добыт (отказ доступа)", mfacts(mod=modf(started=None))),
+            ("продукт стар, а чем набран возраст — не измерено",
+             mfacts(mod=modf(age=4000.0),
+                    silence={"measured": False, "awake": None, "since": NOW,
+                             "why": "прошлого наблюдения нет"})),
+            ("часов бодрствования нет",
+             mfacts(mod=modf(age=4000.0),
+                    silence={"measured": False, "awake": None, "since": NOW,
+                             "why": "часов бодрствования на этой машине нет"})),
+        ]
+        for name, f in holes:
+            st, info = ex.moderbot_state(f, self.cfg, NOW)
+            self.assertEqual(st, ex.MOD_UNKNOWN, "«%s» обязано быть НЕИЗВЕСТНО" % name)
+            self.assertNotEqual(st, ex.MOD_OK, "«%s» не смеет читаться как работа" % name)
+            self.assertTrue(info.get("why"), "у незнания обязана быть названа причина: %s" % name)
+            self.assertEqual([x for x in ex.verdict(f, self.cfg)
+                              if x["kind"] == "o3_pc_moderbot"], [], name)
+
+    def test_the_same_branch_speaks_when_the_fact_is_whole(self):
+        """Вторая половина замка: молчание обязано кончаться там, где факт появился."""
+        self.assertEqual(ex.moderbot_state(mfacts(), self.cfg, NOW)[0], ex.MOD_OK)
+        self.assertEqual(ex.moderbot_state(mfacts(mod=modf(age=1800.0),
+                                                  silence=silent_for(1500.0)),
+                                           self.cfg, NOW)[0], ex.MOD_IDLE)
+
+    def test_threshold_zero_kills_the_branch(self):
+        """Объявленный откат: порог 0 — ветка мертва ДО чтения фактов."""
+        cfg = ex.config({"EXPECT_PC_MOD_MIN": "0"})
+        self.assertEqual(cfg["mod"], 0.0)
+        f = mfacts(mod=modf(age=99999.0), silence=silent_for(99999.0))
+        st, info = ex.moderbot_state(f, cfg, NOW)
+        self.assertEqual(st, ex.MOD_UNKNOWN)
+        self.assertIn("выключена порогом", info["why"])
+        self.assertEqual(ex.verdict(f, cfg), [])
+
+    def test_threshold_is_fifteen_minutes_and_lives_above_one_observer_period(self):
+        """Порог снят с СОБСТВЕННЫХ пауз модербота (max законной 5.02с) и намеренно больше одного
+        периода наблюдателя (600с): заметка требует ДВУХ плохих наблюдений — замок против окна
+        рестарта, которого нет ни в одном корпусе."""
+        self.assertEqual(ex.config({})["mod"], 900.0)
+        self.assertGreater(ex.config({})["mod"], run_mod.STEP_CAP_SEC / 2)
+        self.assertEqual(ex.moderbot_state(mfacts(mod=modf(age=899.0),
+                                                  silence=silent_for(899.0)),
+                                           self.cfg, NOW)[0], ex.MOD_OK)
+        self.assertEqual(ex.moderbot_state(mfacts(mod=modf(age=901.0),
+                                                  silence=silent_for(901.0)),
+                                           self.cfg, NOW)[0], ex.MOD_IDLE)
+
+    def test_one_episode_one_note_even_when_the_file_keeps_moving(self):
+        """Ключ эпизода — НАЧАЛО тишины, а не последняя запись: иначе в самом дорогом случае
+        (бот мёртв, файл двигает чужой) владелец получал бы заметку каждые десять минут."""
+        a = mfacts(mod=modf(age=2.0, opened=False), silence=silent_for(1200.0, since=NOW - 1200))
+        b = mfacts(mod=modf(age=1.0, opened=False), silence=silent_for(1800.0, since=NOW - 1200))
+        self.assertEqual(ex.verdict(a, self.cfg)[0]["key"], ex.verdict(b, self.cfg)[0]["key"])
+
+    def test_episode_closes_only_on_proven_work(self):
+        key = ex.verdict(mfacts(mod=modf(age=1800.0), silence=silent_for(1500.0)),
+                         self.cfg)[0]["key"]
+        blind = mfacts(mod=modf(ok=False, err="PermissionError"))
+        self.assertEqual(ex.closures(blind, self.cfg, [key]), [],
+                         "перестать видеть модербота не значит дождаться выздоровления")
+        self.assertEqual(ex.closures(mfacts(mod=modf(age=2.0, opened=False)), self.cfg, [key]), [],
+                         "чужая свежая запись эпизод не закрывает")
+        self.assertEqual(ex.closures(mfacts(), self.cfg, [key]), [key])
+        self.assertIn("снова делает свою работу", ex.render_close(key))
+
+
+class TestO3Hands(unittest.TestCase):
+    """Руки О3: счётчик тишины и проба процесса. Живой формат, а не идеализированный."""
+
+    def test_own_write_resets_and_foreign_write_does_not(self):
+        st = {}
+        m1 = modf(age=2.0, now=1000.0)
+        self.assertFalse(run_mod.update_mod_silence(st, m1, 100.0, 1000.0)["measured"])
+        m2 = modf(age=2.0, now=1600.0)                       # mtime сдвинулся, автор подтверждён
+        r = run_mod.update_mod_silence(st, m2, 700.0, 1600.0)
+        self.assertFalse(r["measured"])
+        self.assertIn("своя запись", r["why"])
+        m3 = modf(age=2.0, now=2200.0, opened=False)         # mtime сдвинулся, но автор ОПРОВЕРГНУТ
+        r = run_mod.update_mod_silence(st, m3, 1300.0, 2200.0)
+        self.assertTrue(r["measured"])
+        self.assertEqual(r["awake"], 600.0, "чужая запись счётчик обнулять не смеет")
+        m4 = modf(age=2.0, now=2800.0, opened=False)
+        self.assertEqual(run_mod.update_mod_silence(st, m4, 1900.0, 2800.0)["awake"], 1200.0)
+
+    def test_silence_needs_a_waking_clock_and_a_previous_look(self):
+        st = {}
+        r = run_mod.update_mod_silence(st, modf(), None, NOW)
+        self.assertFalse(r["measured"])
+        self.assertIn("часов бодрствования", r["why"])
+        st2 = {"mod": {"mtime": 1.0, "awake": 900.0, "silent": 300.0, "since": NOW - 900}}
+        r = run_mod.update_mod_silence(st2, modf(ok=False), 1000.0, NOW)
+        self.assertFalse(r["measured"], "продукт не прочитан — копить нечего и обнулять нечего")
+        r = run_mod.update_mod_silence({"mod": {"mtime": 1.0, "awake": 5000.0, "silent": 300.0}},
+                                       modf(), 10.0, NOW)
+        self.assertFalse(r["measured"], "часы пошли назад — машина перезагрузилась")
+
+    def test_step_is_capped_by_one_observation(self):
+        st = {"mod": {"mtime": 7.0, "awake": 0.0, "silent": 0.0, "since": NOW - 99999}}
+        r = run_mod.update_mod_silence(st, dict(modf(), mtime=7.0), 99999.0, NOW)
+        self.assertEqual(r["awake"], run_mod.STEP_CAP_SEC,
+                         "наблюдатель мог не работать сутки — выдумывать за них молчание нельзя")
+
+    def test_process_probe_asks_and_does_not_touch(self):
+        """Проба на СЕБЕ: процесс есть и возраст запуска правдоподобен. И ни одного права тронуть —
+        `os.kill(pid, 0)` на Windows зовёт TerminateProcess, поэтому его здесь нет вовсе."""
+        opened, started = run_mod.process_probe(os.getpid())
+        self.assertTrue(opened)
+        self.assertIsNotNone(started)
+        self.assertLess(abs(started - __import__("time").time()), 86400.0)
+        # Номер, которого в системе быть не может (PID Windows кратны 4): «жив» отсюда не выйдет.
+        self.assertNotEqual(run_mod.process_probe(999983)[0], True)
+        self.assertEqual(run_mod.process_probe("не число"), (None, None))
+        # Ищем ВЫЗОВ, а не подстроку: имя запрещённой операции в докстринге — это объявленный
+        # запрет, а не его нарушение (то же правило исполняющей позиции, что в гарде).
+        with open(RUN_SRC, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        self.assertEqual([n.lineno for n in ast.walk(tree)
+                          if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                          and n.func.attr == "kill"], [])
+
+    def test_moderbot_facts_read_the_live_files(self):
+        """Живой формат: mtime продукта берётся stat'ом (база НЕ открывается), номер — из лока."""
+        d = tempfile.mkdtemp(prefix="expect_pc_mod_")
+        ipc, lock = os.path.join(d, "moderation_ipc.db"), os.path.join(d, "moderation_bot.lock")
+        with open(ipc, "wb") as f:
+            f.write(b"SQLite format 3\x00")
+        with open(lock, "w", encoding="utf-8") as f:
+            f.write("%d\n" % os.getpid())            # живой вид лока: номер и перевод строки
+        m = run_mod.moderbot_facts(ipc, lock)
+        self.assertTrue(m["ok"])
+        self.assertEqual(m["pid"], os.getpid())
+        self.assertTrue(m["opened"])
+        self.assertIsNotNone(m["mtime"])
+        self.assertIs(ex.moderbot_writer({"moderbot": m}), True)
+        self.assertFalse(run_mod.moderbot_facts(ipc + ".нет", lock)["ok"])
+        # Лока нет → продукт прочитан, но автор НЕ подтверждён: «неизвестно», не «работает».
+        no_lock = run_mod.moderbot_facts(ipc, lock + ".нет")
+        self.assertTrue(no_lock["ok"])
+        self.assertIsNone(ex.moderbot_writer({"moderbot": no_lock}))
+        # База не открывается ни одной веткой наблюдателя: инструмента для этого нет вовсе.
+        with open(RUN_SRC, encoding="utf-8") as f:
+            names = [a.name for n in ast.walk(ast.parse(f.read()))
+                     if isinstance(n, ast.Import) for a in n.names]
+        self.assertNotIn("sqlite3", names)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
 #  ИНВАРИАНТ EXPECT_PC_PURE — граница держится отсутствием инструментов, а не докстрингом
 #  (зеркало CARD_DUTY_PURE этой полосы и EXPECTATIONS_PURE серверной)
 # ══════════════════════════════════════════════════════════════════════════════════════════
