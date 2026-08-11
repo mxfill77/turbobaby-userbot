@@ -9025,6 +9025,60 @@ class SudimPoFaktuANePoRaspiske(unittest.TestCase):
         b.claim_task(193)
         self.assertEqual(seen["gets"][0][1]["lane"], o.LANE)
 
+    # ── обрезка результата обязана НАЗЫВАТЬ СЕБЯ (класс 11.08.2026) ───────────────────────
+    def test_dlinnyi_result_v_ochered_edet_s_pometkoi_i_telom(self):
+        """Клиент моста — вторая точка реза (была голым `[:RESULT_MAX]`, 45 обрезок из 45 молча).
+        Тело пишем во ВРЕМЕННЫЙ каталог теста: боевой docs/artifacts/reports не трогаем."""
+        b, seen = self._bridge({"ok": True}, {})
+        long_txt = ("Сделано: правка, гейт зелёный, коммит на месте. " * 200)
+        d = tempfile.mkdtemp(prefix="rs_wire_")
+        self.addCleanup(shutil.rmtree, d, True)
+        with mock.patch.object(o.result_spill, "REPORTS_DIR", d):
+            b.complete_task(193, "done", long_txt)
+        sent = seen["posts"][0][1]["result"]
+        self.assertLessEqual(len(sent), o.RESULT_MAX, "потолок очереди НЕ поднят")
+        self.assertIn(o.result_spill.TRUNC_HEAD, sent, "обрезка обязана называть себя")
+        self.assertIn("полная длина %d симв" % len(long_txt), sent)
+        self.assertEqual(len(os.listdir(d)), 1, "полный текст лёг файлом ДО обрезки")
+
+    def test_korotkii_result_edet_bait_v_bait(self):
+        b, seen = self._bridge({"ok": True}, {})
+        b.complete_task(193, "done", "готово, гейт зелёный")
+        self.assertEqual(seen["posts"][0][1]["result"], "готово, гейт зелёный")
+
+
+class TestResultCapNamesItself(unittest.TestCase):
+    """ГЛАВНАЯ точка потери — выход `_run_task_impl`: полный stdout исполнителя живёт только в
+    памяти демона. Проверяем ОБА исхода `_cap_result`, которым он теперь режет."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="rs_cap_")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def test_dlinnyi_otchyot_khvost_na_diske_pometka_v_ocheredi(self):
+        src = ("Разобрано, гейт зелёный, коммит на месте. " * 200) + "\nRESULT: закрыто"
+        with mock.patch.object(o.result_spill, "REPORTS_DIR", self.dir):
+            got = o._cap_result(src, 473)
+        self.assertLessEqual(len(got), o.RESULT_MAX)
+        self.assertIn(o.result_spill.TRUNC_HEAD, got)
+        self.assertIn("RESULT: закрыто", got, "строка итога спасена из срезанного хвоста")
+        self.assertIn(o.result_spill.UNVERIFIED_MARK, got, "блока FACT нет → не проверено")
+        files = os.listdir(self.dir)
+        self.assertEqual(len(files), 1)
+        with open(os.path.join(self.dir, files[0]), encoding="utf-8") as f:
+            self.assertIn(src, f.read(), "на диске ИСХОДНЫЙ текст целиком")
+
+    def test_korotkii_otchyot_kak_ranshe(self):
+        with mock.patch.object(o.result_spill, "REPORTS_DIR", self.dir):
+            self.assertEqual(o._cap_result("готово", 1), "готово")
+        self.assertEqual(os.listdir(self.dir), [], "коротким телам файлов не заводим")
+
+    def test_preambula_prosit_blok_verifikacii(self):
+        """Вход для замка: без просьбы блок не появлялся НИ РАЗУ (0 строк из 156 полосы ПК),
+        и пометка unverified стояла бы по построению, а не по факту."""
+        self.assertIn("FACT:", o.PREAMBLE)
+        self.assertIn("read-only", o.PREAMBLE)
+
 
 class TestTaskLifecycleNeverDuplicatesTheDm(unittest.TestCase):
     """А. ЛИЧКА НЕ ДУБЛИРУЕТ КАРТОЧКУ ГАРДА (правило владельца 05.08.2026).
