@@ -5972,6 +5972,160 @@ class TestRevizorState(unittest.TestCase):
         self.assertIn("не доставил", lab)
 
 
+# ---- НАДЗОР ЗА ТИКОМ РЕВИЗОРА: ТРИ ИСХОДА НА ДОСЛОВНОМ ЖИВОМ ИСТОЧНИКЕ (11.08.2026) ----------
+# Правило репо «проверка повторяет живой формат»: вход этих тестов — БАЙТЫ боевой метки, снятые
+# копией файла (`fixtures/revizor_state.live.json` = `pc_orchestrator.revizor_state.json` байт в
+# байт, 74 байта, без BOM и без перевода строки). Прежние тесты читателя были зелёными на
+# ВЫДУМАННОМ входе — питоновском словаре, поданном в `state=` мимо файла и json'а, — и ровно
+# поэтому не видели, что шесть материальных состояний источника дают владельцу ОДНУ фразу
+# «тиков ещё не было» (замер 11.08: 7 состояний → 2 фразы; после правки → 3, разбор в
+# docs/artifacts/2026-08-11-revizor-tick-reader-contract.md).
+LIVE_REVIZOR_STATE = ('{"last_run": "2026-08-11T01:04:09.494408+00:00", '
+                      '"ts": 1786410249.4944077}')
+REVIZOR_STATE_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "fixtures", "revizor_state.live.json")
+
+
+def _revizor_read_state_before_1108(path):
+    """ГОЛДЕН ПРЕЖНЕГО ПОВЕДЕНИЯ: дословная копия `_revizor_read_state` ДО правки 11.08. Ею
+    проверяется запрет задания — сам ревизор не тронут: его словарь состояния (троттлинг `ts`,
+    `since` из `last_run`) обязан совпадать с прежним на КАЖДОМ входе."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+class TestRevizorTickReaderContract(unittest.TestCase):
+    """Читатель надзора за тиком ревизора — якорный случай класса «нуль по неразбору».
+    Три исхода (`parse_outcome`) обязаны звучать по-разному и не сворачиваться друг в друга."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        with open(REVIZOR_STATE_FIXTURE, "rb") as f:
+            self.live = f.read()
+
+    def _w(self, name, data):
+        p = os.path.join(self.tmp, name)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def _states(self):
+        """Семь материальных состояний ОДНОГО источника — все производные от живых байт."""
+        return [("метки нет вовсе", os.path.join(self.tmp, "нет-такого.json")),
+                ("метка пуста (0 байт)", self._w("empty.json", b"")),
+                ("запись оборвалась (битый json)", self._w("cut.json", self.live[:40])),
+                ("json не объект (список)", self._w("list.json", b'["2026-08-11T01:04:09+00:00"]')),
+                ("объект без last_run", self._w("nokey.json", b'{"ts": 1786410249.4944077}')),
+                ("last_run не время", self._w("junk.json", '{"last_run": "нет"}'.encode("utf-8"))),
+                ("источник недоступен (каталог)", self.tmp)]
+
+    # --- дословность фикстуры: без неё все прочие проверки говорят про выдуманный вход ---
+
+    def test_fixture_is_the_verbatim_live_bytes(self):
+        self.assertEqual(self.live.decode("utf-8"), LIVE_REVIZOR_STATE)
+        self.assertEqual(len(self.live), 74)                       # байт в байт с боевым файлом
+        self.assertFalse(self.live.startswith(b"\xef\xbb\xbf"))    # BOM нет — как у писателя метки
+        self.assertEqual(len([l for l in self.live.decode("utf-8").splitlines() if l.strip()]), 1)
+
+    # --- исход 1: разобрано (сегодняшний живой источник) ---
+
+    def test_live_mark_is_parsed_and_counted(self):
+        st, rd = o._revizor_state_reading(REVIZOR_STATE_FIXTURE)
+        self.assertEqual((rd.seen, rd.parsed, rd.outcome), (1, 1, o.parse_outcome.PARSED))
+        self.assertFalse(rd.blind)
+        self.assertEqual(st["last_run"], "2026-08-11T01:04:09.494408+00:00")
+        self.assertEqual(o._revizor_tick_label(path=REVIZOR_STATE_FIXTURE),
+                         "надзор: ревизор — последний тик 2026-08-11 01:04 UTC")
+
+    # --- исход 2: событий не было (и ТОЛЬКО оно) ---
+
+    def test_missing_mark_says_no_ticks_yet(self):
+        p = os.path.join(self.tmp, "нет-такого.json")
+        st, rd = o._revizor_state_reading(p)
+        self.assertEqual((st, rd.seen, rd.parsed, rd.outcome), ({}, 0, 0, o.parse_outcome.EMPTY))
+        self.assertEqual(o._revizor_tick_label(path=p), "надзор: ревизор — тиков ещё не было")
+
+    def test_empty_mark_says_no_ticks_yet(self):
+        p = self._w("empty.json", b"")
+        _st, rd = o._revizor_state_reading(p)
+        self.assertEqual(rd.outcome, o.parse_outcome.EMPTY)
+        self.assertEqual(o._revizor_tick_label(path=p), "надзор: ревизор — тиков ещё не было")
+
+    # --- исход 3: строки есть, разобрать не смог (НЕРАЗБОР) ---
+
+    def test_cut_write_is_nonparse_not_silence(self):
+        """Обрыв записи на живой строке: до 11.08 владелец читал это как «тиков ещё не было»."""
+        p = self._w("cut.json", self.live[:40])
+        _st, rd = o._revizor_state_reading(p)
+        self.assertEqual((rd.seen, rd.parsed, rd.outcome), (1, 0, o.parse_outcome.NONPARSE))
+        self.assertTrue(rd.blind)
+        lab = o._revizor_tick_label(path=p)
+        self.assertIn("НЕ РАЗОБРАНА", lab)
+        self.assertIn("осмотрено 1", lab)
+        self.assertIn("разобрано 0", lab)
+        self.assertNotIn("тиков ещё не было", lab)      # слепота читателя ≠ молчание источника
+        self.assertNotRegex(lab, r"\d{4}-\d{2}-\d{2}")  # и времени, которого нет, не выдумываем
+
+    def test_object_without_last_run_is_nonparse(self):
+        p = self._w("nokey.json", b'{"ts": 1786410249.4944077}')
+        _st, rd = o._revizor_state_reading(p)
+        self.assertEqual((rd.seen, rd.parsed, rd.outcome), (1, 0, o.parse_outcome.NONPARSE))
+        self.assertNotIn("тиков ещё не было", o._revizor_tick_label(path=p))
+
+    def test_json_not_an_object_is_nonparse(self):
+        p = self._w("list.json", b'["2026-08-11T01:04:09+00:00"]')
+        _st, rd = o._revizor_state_reading(p)
+        self.assertEqual(rd.outcome, o.parse_outcome.NONPARSE)
+        self.assertNotIn("тиков ещё не было", o._revizor_tick_label(path=p))
+
+    def test_unparsable_time_is_nonparse_not_a_fake_tick(self):
+        """До правки доска печатала мусор как время: «надзор: ревизор — последний тик нет»."""
+        p = self._w("junk.json", '{"last_run": "нет"}'.encode("utf-8"))
+        lab = o._revizor_tick_label(path=p)
+        self.assertNotIn("последний тик нет", lab)      # дословный вывод прежнего читателя
+        self.assertIn("НЕ РАЗОБРАНА", lab)
+
+    # --- «не знаю»: источник не прочитан. Не пустота и не неразбор ---
+
+    def test_unreadable_source_is_unknown(self):
+        st, rd = o._revizor_state_reading(self.tmp)      # каталог вместо файла = отказ доступа
+        self.assertEqual(st, {})
+        self.assertIsNone(rd)                            # третьего значения нет — есть «не знаю»
+        lab = o._revizor_tick_label(path=self.tmp)
+        self.assertIn("ПРОЧИТАТЬ НЕ СМОГ", lab)
+        self.assertNotIn("тиков ещё не было", lab)
+        self.assertNotIn("НЕ РАЗОБРАНА", lab)
+
+    # --- замок: ни один исход не сворачивается в другой ---
+
+    def test_three_outcomes_never_collapse(self):
+        said = {}
+        for name, p in self._states():
+            said.setdefault(o._revizor_tick_label(path=p), []).append(name)
+        self.assertEqual(len(said), 3, "семь состояний обязаны звучать тремя разными фразами")
+        no_ticks = [v for k, v in said.items() if k == "надзор: ревизор — тиков ещё не было"]
+        self.assertEqual(len(no_ticks), 1)
+        self.assertEqual(sorted(no_ticks[0]), ["метка пуста (0 байт)", "метки нет вовсе"])
+
+    def test_injected_state_keeps_the_same_three_outcomes(self):
+        """Инъекция статуса/тестов (`state=`) судится тем же контрактом, что и файл."""
+        self.assertEqual(o._revizor_tick_label({}), "надзор: ревизор — тиков ещё не было")
+        self.assertIn("НЕ РАЗОБРАНА", o._revizor_tick_label({"ts": 1.0}))
+        self.assertIn("последний тик 2026-08-11 01:04",
+                      o._revizor_tick_label(json.loads(LIVE_REVIZOR_STATE)))
+
+    # --- запрет задания: сам ревизор не тронут ---
+
+    def test_revizor_reads_state_exactly_as_before(self):
+        for name, p in [("живая метка", REVIZOR_STATE_FIXTURE)] + self._states():
+            self.assertEqual(o._revizor_read_state(path=p), _revizor_read_state_before_1108(p),
+                             f"словарь состояния ревизора изменился на входе «{name}»")
+
+
 # --------------------------- РЕВИЗОР: МАРШРУТИЗАЦИЯ (шаг 4/7, 262) ---------------------------
 
 _REV_NOW = 1_752_400_000.0   # фикс. wall-clock для стабильной даты бюджета (Date.now не дёргаем)
