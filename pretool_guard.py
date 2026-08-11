@@ -413,6 +413,9 @@ _RED_CMD = [
 # в признаке: он стареет молча.
 _ACTION_CHECK = {
     "_RE_ENV": "_env_reach / _py_env_readonly — наличие, окружение процесса и УПОМИНАНИЕ ≠ чтение",
+    "_RE_SECRET_ASSIGN": "_secret_value_leak — ЗНАЧЕНИЕ секрета, а не его имя: голое имя без "
+                         "присваивания и ритуальная заглушка (`<masked>`/`***`/`$VAR`) остаются "
+                         "упоминанием, красит только длинное смешанное значение",
     "_RE_CLAUDE_CFG_CMD": "_is_pure_config_read / _cfg_reach — смотрелка и УПОМИНАНИЕ ≠ правка",
     "_RE_OUTSIDE_WRITE": "_inside_project — цель перенаправления, а не слово в строке",
     "_RE_SQLITE_WORD": "_sqlite_decide — по оператору запроса (select/pragma ≠ update)",
@@ -2084,7 +2087,63 @@ _HEREDOC_EXEC = _NESTED_SHELLS | {"python", "python3", "py", "node", "perl", "ru
                                   "sqlite3", "psql", "mysql", "ssh", "docker", "xargs"}
 
 
-def _seg_runs_stdin_as_code(seg):
+# ── SSH — НОСИТЕЛЬ, А НЕ ИСПОЛНИТЕЛЬ (правка 11.08.2026) ──────────────────────────────────────
+# `ssh` не исполняет свой stdin: он ПЕРЕДАЁТ его удалённой команде. Значит «код или данные»
+# решает УДАЛЁННАЯ команда, а не имя `ssh`. Граница ровно та же, что уже измерена для питона
+# ниже: `ssh host 'bash -s'` тело ИСПОЛНЯЕТ, `ssh host 'cat > файл'` тело ПИШЕТ.
+# Опции ssh пропускаем структурно; вариант с аргументом (`-o X`, `-i X`, `-p X`) съедает
+# следующий токен, слитная форма (`-p22`, `-oBatchMode=yes`) — нет.
+_SSH_ARG_OPTS = set("bcDEeFIiJLlmOopQRSWw")
+_RE_SSH_HOST = re.compile(r"^(?!\d+$)[A-Za-z0-9._@-]+$")   # хост, но не номер порта
+_RE_REDIR_TOK = re.compile(r"^\d*(<<-?|<|>>|>|&>)")        # токен перенаправления местного шелла
+
+
+def _ssh_remote_cmd(toks):
+    """Токены УДАЛЁННОЙ команды из argv ssh (без самого `ssh`), либо None — разобрать не вышло.
+
+    None означает «не знаем» и наверху читается как КОД (fail-closed): интерактивный ssh без
+    команды, неузнанный хост (`-tp 22` — слитный флаг с чужим аргументом) и любая другая
+    неясность обязаны оставлять тело под сканом целиком."""
+    i = 0
+    while i < len(toks) and toks[i].startswith("-") and toks[i] != "-":
+        t = toks[i]
+        i += 2 if (len(t) == 2 and t[1] in _SSH_ARG_OPTS) else 1
+    if i >= len(toks) or not _RE_SSH_HOST.match(toks[i]):
+        return None                      # хост не опознан → не гадаем
+    # Перенаправления принадлежат МЕСТНОМУ шеллу, а не argv ssh: режем по первому из них.
+    # Пустой остаток — это `ssh host <<EOF`, то есть команды НЕТ и тело достаётся ЛОГИН-ШЕЛЛУ
+    # удалённой машины, который его ИСПОЛНИТ. Отдаём None (=код): без этой отсечки токен
+    # `<<EOF` сам сходил бы за удалённую команду и тело уехало бы данными.
+    rest = []
+    for t in toks[i + 1:]:
+        if _RE_REDIR_TOK.match(t):
+            break
+        rest.append(t)
+    return rest or None
+
+
+def _toks_or_repair(seg):
+    """Токены сегмента; при ОБОРВАННОЙ кавычке — токены починенного сегмента, иначе None.
+
+    Заголовок heredoc внутри аргумента ssh кавычку ОТКРЫВАЕТ, а закрывает её только строка
+    терминатора: `ssh host 'cat > f <<"EOF"` сам по себе не разбирается ничем. Дописав
+    недостающую кавычку, получаем ровно то, что увидит удалённый шелл, — заголовок его
+    команды. Починка живёт ТОЛЬКО здесь, в вопросе «код или данные»: красный скан по-прежнему
+    получает кривой сегмент дословно и целиком (`_scan_text`), то есть краснее.
+
+    ПРО ТРЕТИЙ ИСХОД (храповик «нуля по неразбору»): `except` здесь глушит НЕ источник данных, а
+    попытку подбора, и провал обеих попыток возвращает `None` — отдельное «не разобрал», которое
+    вызывающий обязан прочитать как КРАСНОЕ (`return True`). Пустого списка, неотличимого от
+    «команд нет», функция не отдаёт ни одной веткой."""
+    for close in ("'", '"'):
+        try:
+            return shlex.split(seg + close)
+        except Exception:
+            continue
+    return None
+
+
+def _seg_runs_stdin_as_code(seg, depth=0):
     """True ⇔ команда сегмента ИСПОЛНИТ то, что придёт ей на stdin (телом heredoc или трубой).
 
     ОДНА ГРАНИЦА, и она измерена (задача 87, 31.07.2026): `python` в списке стоит по праву —
@@ -2100,7 +2159,12 @@ def _seg_runs_stdin_as_code(seg):
     try:
         toks = shlex.split(seg or "")
     except Exception:
-        return True                      # кавычки не разобраны → не вырезаем (краснее)
+        # Кавычка оборвана. Единственный случай, когда это НОРМА, — заголовок heredoc внутри
+        # аргумента ssh (см. `_toks_or_repair`); всё прочее по-прежнему считаем исполняющим.
+        # Сюда попадаем только с НЕПУСТОЙ строкой: `shlex.split("")` не падает вовсе.
+        toks = _toks_or_repair(seg)
+        if toks is None:
+            return True                  # кавычки не разобраны → не вырезаем (краснее)
     j = _cmd_index(toks)
     if j is None or j >= len(toks):
         return False
@@ -2114,6 +2178,16 @@ def _seg_runs_stdin_as_code(seg):
     name = _base(toks[j])
     if name not in _HEREDOC_EXEC:
         return False
+    if name == "ssh" and depth < _STDIN_CODE_MAX_DEPTH:
+        # Судим ЦЕЛЬ, а не носителя (блок правила у `_ssh_remote_cmd`). Живой случай 11.08.2026
+        # 12:04:45: `ssh … 'cat > docs/artifacts/2026-08-11-curator-….md <<"MDEOF"' <ТЗ>` дал
+        # карточку «хочу обратиться к .env» за слово `.env` в БЛОКЕ ЗАПРЕТОВ записываемого ТЗ —
+        # то есть за имя ПОД ОТРИЦАНИЕМ в данных. Секретов операция не касалась: удалённая
+        # команда — `cat > <артефакт>.md`.
+        remote = _ssh_remote_cmd(toks[j + 1:])
+        if remote is None:
+            return True                  # хоста/команды не видно → как раньше (краснее)
+        return _line_runs_code(" ".join(remote), depth + 1)
     if name in _PY_INTERP:
         # РЕШАЕТ ПОРЯДОК ТОКЕНОВ, А НЕ ИХ НАЛИЧИЕ (правка 02.08.2026, восьмая группа класса).
         # Было: «есть ли где-нибудь `-`» проверялось РАНЬШЕ, чем «названа ли .py-цель», — и
@@ -2132,39 +2206,110 @@ def _seg_runs_stdin_as_code(seg):
     return True
 
 
-def _line_runs_code(line):
+_STDIN_CODE_MAX_DEPTH = 3          # `ssh a "ssh b '…'"` разбираем вглубь, но не бесконечно
+
+
+def _line_runs_code(line, depth=0):
     """True ⇔ в строке-заголовке есть команда, которая ИСПОЛНИТ тело heredoc (интерпретатор,
-    вложенный шелл, ssh). Сбой разбора — тоже True: непонятное не вырезаем (fail-safe)."""
+    вложенный шелл, ssh с исполняющей УДАЛЁННОЙ командой). Сбой разбора — тоже True:
+    непонятное не вырезаем (fail-safe)."""
     for i, seg in enumerate(_split_segments(line or "")):
         if i % 2:
             continue
-        if _seg_runs_stdin_as_code(seg):
+        if _seg_runs_stdin_as_code(seg, depth):
             return True
     return False
 
 
-def _strip_heredoc(cmd):
-    """Команда без ТЕЛ heredoc: заголовок и сам терминатор сохранены, строки между ними убраны."""
+def _is_heredoc_end(line, delim):
+    """Строка — терминатор heredoc `delim`.
+
+    Хвостовые кавычки снимаем: когда heredoc живёт ВНУТРИ закавыченного аргумента ssh
+    (`ssh host 'cat > f <<"MDEOF" … MDEOF'`), закрывающая кавычка аргумента едет на строке
+    терминатора, и дословное сравнение его не узнаёт. Удалённый шелл видит там ровно `MDEOF`.
+    Ошибиться в эту сторону безопасно: терминатор, найденный РАНЬШЕ настоящего, оставляет под
+    сканом БОЛЬШЕ текста, а не меньше."""
+    return line.strip().rstrip("'\"") == delim
+
+
+def _split_heredoc(cmd):
+    """(команда без ТЕЛ heredoc, [вырезанные тела]). Заголовок и терминатор сохранены.
+
+    Список тел нужен `_secret_value_leak_bodies`: текст, переставший быть под сканом,
+    обязан получить ЗАМЕНУ признака — иначе послабление стало бы слепым пятном."""
     if not cmd or "<<" not in cmd:
-        return cmd
+        return cmd, []
     lines = cmd.split("\n")
-    out, i = [], 0
+    out, bodies, i = [], [], 0
     while i < len(lines):
         line = lines[i]
         out.append(line)
         i += 1
         if _RE_HEREDOC.search(line) and _line_runs_code(line):
-            return cmd                    # телом подают КОД — вырезать нечего, всё под сканом
+            return cmd, []                # телом подают КОД — вырезать нечего, всё под сканом
         for m in _RE_HEREDOC.finditer(line):
             delim = m.group(1) or m.group(2) or m.group(3)
             j = i
-            while j < len(lines) and lines[j].strip() != delim:
+            while j < len(lines) and not _is_heredoc_end(lines[j], delim):
                 j += 1
             if j >= len(lines):
-                return cmd                # терминатора нет → не угадываем, отдаём как есть
+                return cmd, []            # терминатора нет → не угадываем, отдаём как есть
+            bodies.append("\n".join(lines[i:j]))
             out.append(lines[j])
             i = j + 1
-    return "\n".join(out)
+    return "\n".join(out), bodies
+
+
+def _strip_heredoc(cmd):
+    """Команда без ТЕЛ heredoc: заголовок и сам терминатор сохранены, строки между ними убраны."""
+    return _split_heredoc(cmd)[0]
+
+
+# ── ЗАМЕНА ПРИЗНАКА: ИМЯ СЕКРЕТА — НЕ СОБЫТИЕ, ЕГО ЗНАЧЕНИЕ — СОБЫТИЕ (11.08.2026) ────────────
+# Тело heredoc из-под скана уходит как ДАННЫЕ, и это правильно: слово `.env` в блоке запретов
+# ТЗ операцией не является. Но ровно там же может уехать НАСТОЯЩЕЕ ЗНАЧЕНИЕ из окружения — а
+# это утечка секрета в репозиторий, и она обязана звучать. Признак сменён с УПОМИНАНИЯ ИМЕНИ на
+# ПРИСВОЕНИЕ ЗНАЧЕНИЯ; до этой правки значения в теле heredoc не проверял НИКТО (`_RE_ENV` знает
+# только литералы `.env`/`.session`), так что послабление идёт вместе с усилением, а не вместо.
+_RE_SECRET_ASSIGN = re.compile(
+    r"(?i)\b([A-Za-z0-9_]*(?:token|api_?key|secret|password|passwd|pwd)[A-Za-z0-9_]*)"
+    r"\s*[=:]\s*[\"']?([^\s\"',;]{16,})")
+# Заглушка на месте значения — это по-прежнему УПОМИНАНИЕ: `<masked>`, `***`, `xxx`, `$VAR`,
+# `os.getenv(…)`, `ВАШ_ТОКЕН`. Такие формы и предписаны ритуалом («токены НАЗЫВАТЬ словами»).
+_RE_SECRET_PLACEHOLDER = re.compile(
+    r"(?i)^([<{$%(]|\*+$|x+$|\.{2,}|-+$|_+$|masked|redacted|hidden|none|null|null$|example|"
+    r"placeholder|your[_-]|dummy|sample|fake|test[_-]?token|скрыт|редакт|маск|ваш)")
+
+
+def _secret_value_leak(text):
+    """Имя переменной, рядом с которой стоит НАСТОЯЩЕЕ ЗНАЧЕНИЕ секрета, иначе "".
+
+    Отличаем УПОМИНАНИЕ ИМЕНИ от ЗНАЧЕНИЯ тремя мерками сразу — одного имени не хватает,
+    иначе вернулся бы ровно тот шум, ради которого правка и делалась:
+      • есть присваивание (`=`/`:`) — голое `BRIDGE_TOKEN` в прозе им не является;
+      • значение длиной от 16 символов и СМЕШАННОЕ (буквы + цифры) либо от 32 — так выглядят
+        боевые токены и ключи, и так НЕ выглядят ни `os.getenv(X)`, ни английская фраза;
+      • значение не заглушка (`_RE_SECRET_PLACEHOLDER`).
+    Кириллическое «Токен: …» под правило не подпадает вовсе: имя обязано быть латинским."""
+    for m in _RE_SECRET_ASSIGN.finditer(text):
+        val = m.group(2)
+        if _RE_SECRET_PLACEHOLDER.search(val):
+            continue
+        if len(val) < 32 and not (any(c.isdigit() for c in val)
+                                  and any(c.isalpha() for c in val)):
+            continue
+        return m.group(1)
+    return ""
+
+
+def _secret_value_leak_bodies(cmd):
+    """Имя секрета, ЗНАЧЕНИЕ которого уезжает телом heredoc (то есть текстом, снятым со скана),
+    иначе "". Тела, оставшиеся под сканом, здесь не судим — их проверяют признаки как раньше."""
+    for body in _split_heredoc(cmd)[1]:
+        hit = _secret_value_leak(body)
+        if hit:
+            return hit
+    return ""
 
 
 # ПЕЧАТЬ СВОЕГО АРГУМЕНТА — тоже данные. `echo "gspread.open('Лист1')"`, `Write-Output "зову
@@ -2865,6 +3010,16 @@ def _decide_bash(cmd, cwd):
     reach = _env_reach(cmd) if _RE_ENV.search(scan) else None
     probe = reach is not None
     action, kind, obj = _decide_bash_body(cmd, cwd, scan, probe)
+    if not _stays_red(kind, obj, cmd):
+        # ЗАМЕНА ПРИЗНАКА (блок правила у `_RE_SECRET_ASSIGN`): тело heredoc ушло из-под скана
+        # как данные — значит ЗНАЧЕНИЕ секрета в нём обязано звучать отдельно.
+        # МЕРИМ `_stays_red`, А НЕ `action == "defer"`: у вида `unknown` действие тоже `ask`,
+        # но красным он не остаётся (`_stays_red` → False, и `decide_for_role` отдаёт `defer`).
+        # На проверке по `action` утечка телом ssh-heredoc уезжала бы молча — ровно тем путём,
+        # которым ходит вся серверная работа. Своего КРАСНОГО вида ветка не заслоняет.
+        leak = _secret_value_leak_bodies(cmd)
+        if leak:
+            return ("ask", "env", leak)
     if action == "defer" and not kind and _RE_SQLITE_WORD.search(scan):
         # Питон-форма чтения базы доходит сюда через `_scan_python` с пустым видом. Смягчение не
         # должно стоить прозрачности (доктрина лога): в журнале обязано быть видно, что молча

@@ -4692,5 +4692,143 @@ class TestSecretsJudgedByActionNotBySubstring(unittest.TestCase):
             ("defer", "env_mention", ""))
 
 
+_SSH = ("ssh -o ConnectTimeout=10 -o BatchMode=yes -i ~/.ssh/turbobaby_vps "
+        "root@5.223.94.179 ")
+# Тело ТЗ: имя секрета стоит ПОД ОТРИЦАНИЕМ, в блоке запретов. Ровно этот текст ехал в живом
+# случае 11.08.2026 12:04:45 и рождал карточку «хочу обратиться к секретам».
+_TZ_BODY = ("# Кураторские цели с повторными заходами\n\n"
+            "ЗАПРЕТЫ: границы гарда не расширять; " + _E + " не открывать;\n"
+            "клиентского контура не касаться.\n")
+
+
+def _owner_sees(cmd):
+    """Действие, которое дойдёт ДО ВЛАДЕЛЬЦА: `ask` — карточка, `defer` — молча.
+
+    Мерим `decide_for_role`, а не `decide`: вид `unknown` приходит с action `ask`, но красным
+    не остаётся (`_stays_red` → False) и карточкой не становится. Проверять «молча» по сырому
+    `decide` значило бы мерить не то, что видит человек."""
+    return g.decide_for_role(bash(cmd), True, {})[0]
+
+
+class TestSshCarrierJudgedByTarget(unittest.TestCase):
+    """ЦЕЛЬ КОМАНДЫ, А НЕ СЛОВО В ЕЁ ТЕЛЕ (живой случай 11.08.2026 12:04:45).
+
+    `ssh … 'cat > docs/artifacts/….md <<"MDEOF"' <ТЗ>` получил `ask|env` за имя файла секретов
+    в БЛОКЕ ЗАПРЕТОВ записываемого текста. Причин было две, и обе про носителя, а не про цель:
+    `ssh` стоял в `_HEREDOC_EXEC` безусловно (хотя stdin он ПЕРЕДАЁТ удалённой команде, а не
+    исполняет), и строка терминатора несла закрывающую кавычку аргумента ssh (`MDEOF'`), из-за
+    чего тело не опознавалось телом. Замок держит ОБЕ стороны: упоминание молчит, обращение
+    к самому файлу секретов — звучит."""
+
+    # ── сторона 1: имя в ТЕЛЕ данных карточки не даёт ────────────────────────────────────
+    def test_ssh_writes_artifact_with_secret_name_in_body_is_silent(self):
+        """ЖИВОЙ СЛУЧАЙ. Удалённая команда — `cat > <артефакт>.md`; секретов не касается."""
+        cmd = (_SSH + "'cat > /root/turbobaby-manager-bot/docs/artifacts/"
+               "2026-08-11-curator-goal-repeats-duplicates.md <<\"MDEOF\"\n"
+               + _TZ_BODY + "MDEOF'")
+        self.assertEqual(_owner_sees(cmd), "defer")
+
+    def test_same_body_without_ssh_was_already_silent(self):
+        """КОНТРОЛЬ: без носителя тот же текст молчал и до правки — значит красил именно ssh."""
+        cmd = "cat > docs/artifacts/x.md <<'MDEOF'\n" + _TZ_BODY + "MDEOF"
+        self.assertEqual(_owner_sees(cmd), "defer")
+
+    def test_ssh_tee_artifact_with_secret_name_in_body_is_silent(self):
+        """Приёмник — не только `cat`: `tee <файл>` тоже ПИШЕТ данные, а не исполняет их."""
+        cmd = _SSH + "'tee /root/x/report.md' <<'MDEOF'\n" + _TZ_BODY + "MDEOF"
+        self.assertEqual(_owner_sees(cmd), "defer")
+
+    def test_ritual_placeholder_for_a_token_is_still_a_mention(self):
+        """Ритуал предписывает токены НАЗЫВАТЬ, а не цитировать: заглушка — упоминание."""
+        cmd = (_SSH + "'cat > /root/x/r.md <<\"E\"\nBRIDGE_TOKEN=<masked>, брать из "
+               + _E + "\nE'")
+        self.assertEqual(_owner_sees(cmd), "defer")
+
+    # ── сторона 2: обращение к САМОМУ файлу секретов карточку выписывает ─────────────────
+    def test_ssh_bash_s_reading_secret_stays_red(self):
+        """Тело подано ИСПОЛНИТЕЛЮ (`bash -s`) — это КОД, и он читает секрет."""
+        cmd = _SSH + "'bash -s' <<'EOS'\ncat /root/turbobaby-manager-bot/" + _E + "\nEOS"
+        self.assertEqual(g.decide(bash(cmd))[:2], ("ask", "env"))
+
+    def test_ssh_python_stdin_reading_secret_stays_red(self):
+        cmd = (_SSH + "'python3 -' <<'PY'\nprint(open(\"" + _E + "\").read())\nPY")
+        self.assertEqual(g.decide(bash(cmd))[:2], ("ask", "env"))
+
+    def test_ssh_cat_of_the_secret_file_stays_red(self):
+        cmd = _SSH + "'cat /root/turbobaby-manager-bot/" + _E + "'"
+        self.assertEqual(g.decide(bash(cmd))[:2], ("ask", "env"))
+
+    def test_ssh_writing_INTO_the_secret_file_stays_red(self):
+        """Цель записи — САМ файл секретов: заголовок heredoc остаётся под сканом."""
+        cmd = _SSH + "'cat > /root/turbobaby-manager-bot/" + _E + " <<\"E\"\nA=1\nE'"
+        self.assertEqual(g.decide(bash(cmd))[:2], ("ask", "env"))
+
+    def test_local_read_of_the_secret_file_stays_red(self):
+        self.assertEqual(g.decide(bash("grep -n TOPIC " + _E))[:2], ("ask", "env"))
+
+    def test_unparseable_ssh_target_is_fail_closed(self):
+        """Fail-closed: хост не опознан (`-tp 22` — слитный флаг с чужим аргументом), значит
+        удалённую команду не гадаем и тело ОСТАЁТСЯ под сканом. Карточка при этом приходит
+        видом `network`, а не `env`: нераспознанная форма ssh краснеет раньше и по своему
+        поводу. Проверяем ОБА следствия — и молчания нет, и текст со скана не ушёл."""
+        cmd = "ssh -tp 22 'cat > /root/x.md <<\"E\"\n" + _TZ_BODY + "E'"
+        self.assertIsNone(g._ssh_remote_cmd(["-tp", "22", "cat > /root/x.md"]))
+        self.assertIn(_E, g._scan_text(cmd))         # тело не вырезано
+        self.assertEqual(_owner_sees(cmd), "ask")    # молчания нет
+
+
+class TestSecretValueLeakIsTheReplacement(unittest.TestCase):
+    """ЗАМЕНА ПРИЗНАКА: имя секрета — не событие, его ЗНАЧЕНИЕ — событие.
+
+    Тело heredoc уходит из-под скана как данные, и вместе с ним ушло бы НАСТОЯЩЕЕ значение из
+    окружения — то есть утечка секрета в репозиторий. До 11.08.2026 значения в теле не проверял
+    никто (`_RE_ENV` знает только литералы), так что послабление идёт ВМЕСТЕ с усилением."""
+
+    _REAL = "8x2Kd91mQpZ4vLr7Ts3Nb6Yw"          # вид боевого токена: длинный, буквы+цифры
+
+    def test_real_token_value_in_an_artifact_body_sounds(self):
+        cmd = (_SSH + "'cat > /root/x/r.md <<\"E\"\nотчёт\nBRIDGE_TOKEN=" + self._REAL + "\nE'")
+        self.assertEqual(g.decide(bash(cmd))[:2], ("ask", "env"))
+
+    def test_real_key_value_written_locally_sounds(self):
+        cmd = "cat > docs/artifacts/x.md <<'E'\napi_key: sk-ant-a03-9Zq4Lm2Xv8Tb1Rn6\nE"
+        self.assertEqual(g.decide(bash(cmd))[:2], ("ask", "env"))
+
+    def test_card_names_the_variable_so_the_owner_sees_WHAT_leaked(self):
+        cmd = (_SSH + "'cat > /root/x/r.md <<\"E\"\nMODERBOT_TOKEN=" + self._REAL + "\nE'")
+        self.assertEqual(g.decide(bash(cmd))[2], "MODERBOT_TOKEN")
+
+    def test_placeholders_are_mentions_not_values(self):
+        """Формы, предписанные ритуалом, обязаны молчать — иначе вернулся бы прежний шум."""
+        for val in ("<masked>", "***", "xxxxxxxxxxxxxxxxxx", "$BRIDGE_TOKEN",
+                    "os.getenv(\"BRIDGE_TOKEN\")", "ВАШ_ТОКЕН_СЮДА", "...", "redacted"):
+            self.assertEqual(g._secret_value_leak("BRIDGE_TOKEN=" + val), "", val)
+
+    def test_bare_name_without_a_value_is_a_mention(self):
+        self.assertEqual(g._secret_value_leak("берётся BRIDGE_TOKEN из " + _E), "")
+
+    def test_cyrillic_word_token_is_not_a_variable(self):
+        self.assertEqual(g._secret_value_leak("Токен: длинная строка про мост 12345678"), "")
+
+    def test_leak_never_masks_a_stronger_verdict(self):
+        """Признак стои́т ТОЛЬКО на `defer`: своего красного вида он не заслоняет."""
+        cmd = ("rm -rf /d/turbobaby-bot/docs && cat > x.md <<'E'\nBRIDGE_TOKEN="
+               + self._REAL + "\nE")
+        self.assertNotEqual(g.decide(bash(cmd))[1], "env")
+
+    def test_repo_own_artifacts_do_not_trip_the_value_check(self):
+        """ЗАМЕР, а не вера: собственные артефакты репо — тот самый текст, что ездит телом."""
+        noisy = []
+        base = os.path.join(PROJ, "docs", "artifacts")
+        for name in sorted(os.listdir(base))[:400]:
+            if not name.endswith(".md"):
+                continue
+            with io.open(os.path.join(base, name), encoding="utf-8", errors="replace") as fh:
+                hit = g._secret_value_leak(fh.read())
+            if hit:
+                noisy.append((name, hit))
+        self.assertEqual(noisy, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
