@@ -8542,6 +8542,20 @@ def _wd_state_write(d, path=None):
         log.warning("watchdog: state-файл не записался (%s) — антиспам деградирует, не критично", e)
 
 
+def _wd_state_merge(fields, path=None):
+    """Дописать поля в состояние, НЕ ТРОГАЯ чужие ключи. → новое состояние.
+
+    Писателей у файла стало трое (антиспам, счётчик подъёмов, накопитель тишины), и каждый знает
+    только свои ключи. Полная перезапись здесь уже стоила бы памяти накопителя ровно так же, как
+    когда-то стирала историю подъёмов (см. `_mark_alive`): вотчдог — короткоживущий процесс, между
+    тиками у него нет ничего, кроме этого файла."""
+    st = _wd_state_read(path)
+    if fields:
+        st.update(fields)
+    _wd_state_write(st, path)
+    return st
+
+
 WD_RAISE_WINDOW = int(os.getenv("PC_WD_RAISE_WINDOW", "86400") or "86400")   # окно счётчика подъёмов, с
 
 
@@ -8557,6 +8571,185 @@ def _wd_count_raise(tnow, state_path=None, window=None):
     st["raises"] = hist
     _wd_state_write(st, state_path)
     return len(hist)
+
+
+# ── ЧЕМ СТОРОЖ СУДИТ ДЕМОНА: ПРОДУКТОМ, А НЕ ЖИВЫМ PID (класс 493, 12.08.2026) ───────────────
+# Прежний критерий — «heartbeat свеж ИЛИ процесс жив» — стоял на ИЛИ, и второе плечо ПЕРЕКРЫВАЛО
+# первое: пока в системе есть процесс с нужной командной строкой, протухший продукт не давал
+# вердикта НИКОГДА и ни при какой длительности. Замер журнала 22.07–12.08: 862 строки сторожа, из
+# них 853 — «процесс демона жив, не трогаю»; в семи окнах зависаний переписи 467 все 75 тиков
+# сказали «жив», подъёмов 0 (docs/artifacts/2026-08-11-hang-with-watchdog-eight.md).
+# Предмет теперь — ПРОДУКТ: ОБОРОТ `poll_once`, последняя строка которого и есть
+# `_write_heartbeat()` (:3608). Живой PID сам по себе основанием «работает» больше не является;
+# он решает только, ЧТО ДЕЛАТЬ с доказанным отсутствием продукта (поднимать мёртвого или звать
+# владельца к живому).
+#
+# ПОРОГ ТИШИНЫ ПРОДУКТА = 30 МИН, ИЗМЕРЕН НА СВОЕЙ ПОЛОСЕ (не взят у соседа):
+#   корпус — 1005 пауз витка, измеренных САМИМ демоном (строки «виток растянулся …» и «скачок
+#   wall-clock …»), у которых сон ИЗМЕРЕН и не больше SLEEP_FLOOR_SEC, а в отрезке НЕ шёл прогон:
+#   медиана 173с · p95 314с · p99 461с · MAX 605с (07.08 22:54, «залипание вызова моста»).
+#   1800с — это 2.98× худшей ЗАКОННОЙ паузы и, что важнее, ВЫШЕ потолка ОДНОГО вызова моста:
+#   `request_json` держит виток синхронно до ≈28 мин (bridge_http: MAX_HOPS=6 × ECHO_TRIES=3 ×
+#   timeout 30с плюс паузы). Порог ниже этого потолка (900с, 1200с) на корпусе тоже дал бы ноль
+#   ложных, но первый же честно залипший вызов моста стал бы «зависанием демона».
+#   Ложных заметок на корпусе за 20 суток при 1800с: 0.
+WD_PRODUCT_SILENT = int(os.getenv("PC_WD_PRODUCT_SILENT", "1800") or "1800")
+# ТИШИНА ПРИ ОБЪЯВЛЕННОМ ЗАХОДЕ. Одна попытка не вправе жить дольше своего жёсткого потолка
+# (`TASK_TIMEOUT`; замер — 193 окна RUN→терминал за 20 суток, MAX ровно 2700с), а несущий её виток
+# всё ещё должен свои вызовы моста — то есть те же 1800с. Отметка обновляется НА КАЖДОМ спавне
+# headless (`_task_started_child`, :1597), поэтому вторая попытка начинает срок заново, а не
+# удваивает его. Запас над худшим ЗАМЕРЕННЫМ витком с работой (2827с, 05.08) — 1.59×.
+WD_BUSY_ALLOW = int(os.getenv("PC_WD_BUSY_ALLOW", "") or (TASK_TIMEOUT + WD_PRODUCT_SILENT))
+
+PROD_OK, PROD_SILENT, PROD_UNKNOWN = "оборот есть", "оборота нет", "неизвестно"
+
+
+def daemon_product_verdict(wall_age, silence, busy_age, limit=None, allow=None, fresh=None):
+    """ФАКТЫ О ПРОДУКТЕ ДЕМОНА → (исход, словами почему). Чистая функция, голден.
+
+    На входе НЕТ ни одного признака жизни — ни PID, ни списка процессов: судим произведённое.
+      wall_age — возраст последнего оборота по стенным часам (None — продукт не прочитан);
+      silence  — НАКОПЛЕННАЯ тишина продукта в часах бодрствования (None — не измерена);
+      busy_age — возраст ОБЪЯВЛЕННОГО захода, начатого позже последнего оборота (None — такого нет).
+
+    ТРИ ИСХОДА, и третий обязателен: «неизвестно» возвращается на каждую дырку в фактах (продукт
+    не прочитан · тишина не измерена · накопителя ещё нет). Ни одна из этих дорог не ведёт к
+    «работает» — иначе незнание красилось бы в зелёный, а это ровно тот ложный зелёный, ради
+    которого весь заход и делается.
+
+    ПОЧЕМУ ТИШИНА НЕ СТЕННАЯ. ПК спит, и стенной возраст продукта после сна равен сну; заметка
+    «демон встал» была бы ложью о предмете. Стенной возраст годится только на быстрый ответ «оборот
+    только что был» (порог `HEARTBEAT_STALE`), дальше решает накопленная тишина бодрствования.
+
+    ПОРЯДОК ВЕТВЕЙ. Объявленный заход спрашивается ДО измеренной тишины: «демон синхронно исполняет
+    заход, начатый N минут назад» — это положительный факт с потолком, а не отсутствие факта (тот
+    же порядок, что у О2 в `expectations_pc.turn_state`)."""
+    limit = WD_PRODUCT_SILENT if limit is None else limit
+    allow = WD_BUSY_ALLOW if allow is None else allow
+    fresh = HEARTBEAT_STALE if fresh is None else fresh
+    if wall_age is None:
+        return PROD_UNKNOWN, "продукт не прочитан (heartbeat недоступен или не разобран)"
+    if limit <= 0:
+        return PROD_UNKNOWN, "ветка продукта выключена порогом"          # откат одной ручкой
+    if wall_age <= fresh:
+        return PROD_OK, "оборот %.0fс назад" % wall_age
+    if busy_age is not None and 0 <= busy_age <= allow:
+        return PROD_OK, "идёт объявленный заход (%.0fс из %.0fс)" % (busy_age, allow)
+    if silence is None:
+        return PROD_UNKNOWN, ("продукту %.0fс, но чем набран возраст — молчанием демона или сном "
+                              "машины — не измерено" % wall_age)
+    if silence <= limit:
+        return PROD_OK, "тишина продукта %.0fс из %.0fс" % (silence, limit)
+    return PROD_SILENT, "оборота нет %.0fс бодрствования (порог %.0fс)" % (silence, limit)
+
+
+def _wd_product(now=None):
+    """ПРОДУКТ демона с диска → (сырая строка | None, момент epoch | None, возраст | None).
+
+    Продукт — не файл и не процесс, а ОБОРОТ `poll_once`: его последняя строка пишет сюда момент
+    завершения витка (:3608). Сырую строку отдаём наверх намеренно — накопитель тишины сравнивает
+    именно её (сменилась строка ⇒ виток был), и это единственное сравнение, которому не мешают ни
+    сон машины, ни часовые пояса."""
+    try:
+        raw = open(HEARTBEAT_FILE, encoding="utf-8").read().strip()
+    except Exception as e:
+        log.warning("watchdog: продукт демона не прочитан (%s) — исход НЕИЗВЕСТЕН", e)
+        return None, None, None
+    age = _age_sec(raw, now=now)
+    if age is None:
+        log.warning("watchdog: время в продукте не разобрано (%.60s) — исход НЕИЗВЕСТЕН", raw)
+        return raw, None, None
+    try:
+        ts = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        ts = None
+    return raw, ts, age
+
+
+def _wd_busy_age(product_ts, now, path=None):
+    """Возраст ОБЪЯВЛЕННОГО синхронного захода → сек | None (объявленного захода нет).
+
+    Факт — mtime реестра отметок старта (`os.stat`, файл не открываем: тот же приём, что у О3 с
+    `moderation_ipc`). Реестр пишут ровно две руки, и обе объявляют работу: `_task_started_mark`
+    на CLAIM (:2948) и `_task_started_child` сразу после спавна headless (:1597).
+
+    Оправданием отметка считается ТОЛЬКО если она сделана ПОЗЖЕ последнего оборота. Без этого
+    условия след давно закрытой задачи (реестр хранит до TASK_START_KEEP записей и на завершении
+    НЕ чистится) вечно выдавал бы стоящий демон за работающий — та же ошибка предмета, что и
+    живой PID, только на файле."""
+    try:
+        mt = float(os.stat(path or TASK_START_FILE).st_mtime)
+    except Exception:
+        return None
+    if product_ts is not None and mt <= float(product_ts):
+        return None
+    age = float(now) - mt
+    return age if age >= 0 else None
+
+
+def _wd_sec(val, default=0.0):
+    """Число секунд из факта | default. Отдельной функцией, а не идиомой `val or 0`: та стирает
+    разницу «факта нет» и «в факте ноль», а у сторожа на этой разнице стои́т и антиспам, и текст
+    карточки (класс «нуль по неразбору», см. `nonparse_scan`)."""
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return float(default)
+    return float(val)
+
+
+def _wd_awake():
+    """Часы бодрствования для накопителя → сек | None. None = НАСТОЯЩИХ часов нет (не Windows,
+    вызов не удался) — тишину мерить нечем, и вердикт честно уйдёт в «неизвестно»."""
+    return awake_monotonic() if awake_clock_available() else None
+
+
+def _wd_silence(raw, state, awake_now):
+    """Накопленная тишина продукта в ЧАСАХ БОДРСТВОВАНИЯ → (сек | None, поля накопителя).
+
+    Вотчдог живёт 5 минут и между тиками помнит только state-файл, поэтому тишина копится
+    НАБЛЮДЕНИЕ ЗА НАБЛЮДЕНИЕМ: храним саму строку продукта и показание часов бодрствования на
+    момент, когда эту строку увидели ВПЕРВЫЕ. Строка сменилась — оборот был, отсчёт с нуля.
+
+    Пять дорог в «не измерено», и каждая обязана вести туда, а не в «работает»: продукта нет ·
+    часов бодрствования нет · накопителя ещё нет (первый тик после выкатки, потеря state) ·
+    в накопителе не число · часы ушли назад (перезагрузка обнуляет QueryUnbiasedInterruptTime).
+    Недооценка тишины здесь встроена и сознательна: отсчёт начинается с НАБЛЮДЕНИЯ, а не с
+    момента записи продукта, — сторож скорее промолчит лишний тик, чем соврёт о длительности."""
+    acc = {"prod": raw, "prod_awake": awake_now}
+    if raw is None or awake_now is None:
+        return None, acc
+    prev = prev_awake = None
+    if isinstance(state, dict):
+        prev, prev_awake = state.get("prod"), state.get("prod_awake")
+    if prev is None or prev != raw:
+        return (None if prev is None else 0.0), acc
+    if not isinstance(prev_awake, (int, float)) or isinstance(prev_awake, bool):
+        return None, acc
+    if awake_now < float(prev_awake):
+        return None, acc                       # часы от загрузки ушли назад — машину перезагрузили
+    return awake_now - float(prev_awake), {"prod": raw, "prod_awake": float(prev_awake)}
+
+
+def daemon_hung_card_text(silence, busy_age, pids, limit=None, allow=None):
+    """Текст карточки «демон ЖИВ ПРОЦЕССОМ, но продукта не даёт» — чистая функция, голден.
+
+    Карточка НЕ рапортует о подъёме, потому что подъёма не было и быть не должно: снять живой
+    процесс и поднять его заново — операционное решение владельца (и красная операция: taskkill
+    плюс schtasks), а не самодеятельность сторожа. Поэтому здесь названы ровно те факты, по
+    которым владелец решает сам."""
+    limit = WD_PRODUCT_SILENT if limit is None else limit
+    allow = WD_BUSY_ALLOW if allow is None else allow
+    pid_s = ", ".join(str(p) for p in pids) if pids else "не назван"
+    busy = ("объявленного захода нет — отметка старта не обновлялась после последнего оборота"
+            if busy_age is None else
+            "объявленный заход идёт %s — дольше потолка %s" % (fmt_sleep(busy_age), fmt_sleep(allow)))
+    return "\n".join([
+        "⛔ ДЕМОН ЖИВ ПРОЦЕССОМ, НО НЕ РАБОТАЕТ — оборота poll_once нет %s (порог %s)"
+        % (fmt_sleep(_wd_sec(silence)), fmt_sleep(limit)),
+        RAISE_LOSS["pc_orchestrator"],
+        "процесс: PID %s — жив; сторож его НЕ трогает" % pid_s,
+        busy,
+        "решение за владельцем: снять процесс и поднять задачей Планировщика (%s) — операция "
+        "красная (taskkill/schtasks), сторож её не делает" % TASK_NAME])
 
 
 def daemon_raise_card_text(n_raises, down_sec, pids, rc):
@@ -8579,15 +8772,21 @@ def daemon_raise_card_text(n_raises, down_sec, pids, rc):
 
 
 def watchdog(now=None, runner=None, verify_sleep=None, finder=None, state_path=None,
-             notify=None, cowork=None, wall_now=None, topic=None):
-    """НАДЁЖНЫЙ вотчдог (урок 205 — тихого сбоя быть не должно; класс-фикс 13.07 — и ЛОЖНОГО
-    шума быть не должно): живость ПО ФАКТУ — heartbeat свеж ИЛИ процесс демона жив (длинная
-    задача, замершая heartbeat, или смена PID после self-update ≠ смерть). ДОКАЗАННО мёртв
-    (heartbeat протух И процессов нет) → schtasks /Run + верификация (heartbeat ИЛИ процесс);
-    не поднялся → РОВНО один алерт на инцидент (переход жив→мёртв, кулдаун WD_ALERT_COOLDOWN,
-    состояние в файле) + NOTE в cowork. CIM не смог → страховочный /Run БЕЗ алерта (смерть не
-    доказана; второй экземпляр штатно гасит singleton).
-    → 'stopped'|'alive'|'restarted'|'failed_to_start'|'unknown'."""
+             notify=None, cowork=None, wall_now=None, topic=None, product=None, awake=None,
+             busy=None):
+    """НАДЁЖНЫЙ вотчдог (урок 205 — тихого сбоя быть не должно; класс-фикс 13.07 — и ЛОЖНОГО шума
+    быть не должно; класс 493 — и ЛОЖНОГО ЗЕЛЁНОГО быть не должно): судит ПРОДУКТ демона (оборот
+    `poll_once`, см. `daemon_product_verdict`), а не признак его жизни.
+
+    Живой PID больше не вердикт. Он решает, что делать с ДОКАЗАННЫМ отсутствием продукта:
+      · продукта нет, процессов НЕТ  → доказанная смерть → schtasks /Run + верификация; не
+        поднялся → РОВНО один алерт на инцидент (кулдаун WD_ALERT_COOLDOWN, состояние в файле);
+      · продукта нет, процесс ЖИВ    → 'hung': карточка владельцу, подъёма НЕТ. Снять живой
+        процесс — операционное решение и красная операция, сторожу его не отдавали;
+      · продукта нет, CIM не смог    → страховочный /Run БЕЗ алерта (смерть не доказана, второй
+        экземпляр штатно гасит singleton);
+      · продукт проверить нечем      → 'unknown': ни подъёма, ни карточки, ни слова «жив».
+    → 'stopped'|'alive'|'restarted'|'failed_to_start'|'hung'|'unknown'."""
     if _stopped():
         log.info("watchdog: рубильник активен — демон намеренно не поднимается")
         return "stopped"
@@ -8596,35 +8795,61 @@ def watchdog(now=None, runner=None, verify_sleep=None, finder=None, state_path=N
 
     def _mark_alive():
         st = _wd_state_read(state_path)
-        if st.get("state") == "down":
-            log.info("watchdog: инцидент закрыт — демон снова жив")
-            (cowork or _cowork)("watchdog: демон снова жив — инцидент закрыт")
-        # raises переносим: _mark_alive зовётся на КАЖДОМ живом тике (раз в 5 мин), и без переноса
-        # история подъёмов стиралась бы через минуты после записи — счётчик за сутки не жил бы.
-        _wd_state_write({"state": "alive", "last_alert": float(st.get("last_alert") or 0.0),
-                         "raises": list(st.get("raises") or [])}, state_path)
+        if st.get("state") in ("down", "hung"):
+            log.info("watchdog: инцидент закрыт — демон снова даёт оборот")
+            (cowork or _cowork)("watchdog: демон снова даёт оборот — инцидент закрыт")
+        # state пишем СЛИЯНИЕМ: raises и накопитель тишины — чужие ключи, а _mark_alive зовётся на
+        # КАЖДОМ живом тике (раз в 5 мин). Полная перезапись стирала бы их через минуты.
+        _wd_state_merge({"state": "alive"}, state_path)
 
-    if _heartbeat_fresh(now=now):
-        _mark_alive()
+    raw, prod_ts, wall_age = (product or _wd_product)(now=now)
+    silence, acc = _wd_silence(raw, _wd_state_read(state_path), (awake or _wd_awake)())
+    _wd_state_merge(acc, state_path)         # накопитель сохраняем ВСЕГДА и ДО любых вердиктов
+    busy_age = (busy or _wd_busy_age)(prod_ts, tnow)
+    verdict, why = daemon_product_verdict(wall_age, silence, busy_age)
+    if wall_age is not None and wall_age <= HEARTBEAT_STALE:
+        _mark_alive()                        # оборот только что был — CIM даже не дёргаем
         return "alive"
+    # ПОРЯДОК ВАЖЕН: сначала процессы, потом оправдания. Оправдать («идёт заход», «тишина ещё
+    # короткая») можно только того, кто существует: демон, умерший ПОСРЕДИ задачи, оставляет
+    # свежую отметку старта, и оправдай мы её раньше проверки процессов — подъём после смерти
+    # опоздал бы на 75 минут против прежнего критерия. Ровно этот вид смерти и случился 30.07 в
+    # окне задачи 61 (`docs/artifacts/2026-08-11-hang-with-watchdog-eight.md`).
     pids = find()
     if pids:
-        # heartbeat замер, но демон ЖИВ по процессу: длинная задача держит poll_once (корень
-        # ложняка 13.07) либо только что был self-update (новый PID). НЕ поднимаем, НЕ шумим.
-        log.info("watchdog: heartbeat старше %sс, но процесс демона жив (PID %s) — "
-                 "длинная задача/рестарт, не трогаю", HEARTBEAT_STALE, pids)
-        _mark_alive()
-        return "alive"
+        # ПРОЦЕСС ЕСТЬ, ПРОДУКТА НЕТ — и вот здесь прежний критерий говорил «жив, не трогаю» 853
+        # раза из 862. Живой PID доказывает существование, а не работу: в семи окнах зависаний
+        # переписи 467 он был правдой все 75 тиков подряд, пока строка очереди стояла.
+        if verdict == PROD_OK:
+            log.info("watchdog: продукту %.0fс, но %s — демон работает, не трогаю", wall_age or 0, why)
+            _mark_alive()
+            return "alive"
+        if verdict == PROD_UNKNOWN:
+            log.warning("watchdog: процесс демона жив (PID %s), но %s — исход НЕИЗВЕСТЕН, "
+                        "ни подъёма, ни карточки", pids, why)
+            return "unknown"
+        log.error("watchdog: ДЕМОН ЖИВ ПРОЦЕССОМ (PID %s), НО НЕ РАБОТАЕТ — %s. Подъём НЕ делаю: "
+                  "снять живой процесс — решение владельца", pids, why)
+        st = _wd_state_read(state_path)
+        if st.get("state") != "hung" and (tnow - _wd_sec(st.get("last_alert"))) >= WD_ALERT_COOLDOWN:
+            (notify or _notify_critical)(daemon_hung_card_text(silence, busy_age, pids))
+            (cowork or _cowork)("watchdog: демон жив процессом, но оборота нет %s — подъёма НЕ "
+                                "делал, нужно решение владельца" % fmt_sleep(_wd_sec(silence)))
+            _wd_state_merge({"state": "hung", "last_alert": tnow}, state_path)
+        else:                     # инцидент уже заявлен (или флап внутри кулдауна) — только state
+            _wd_state_merge({"state": "hung"}, state_path)
+        return "hung"
     if pids is None:
         # Смерть НЕ доказана (#171: «не смог проверить» ≠ «мёртв») → страховочный /Run
         # (живому не повредит: второй экземпляр гасит singleton), алерт НЕ шлём.
         rc, out = (runner or _schtasks_run)()
-        log.warning("watchdog: heartbeat протух, CIM неясен — страховочный schtasks /Run rc=%s | %s "
-                    "(без алерта: смерть не доказана)", rc, _tail(out, 120))
+        log.warning("watchdog: продукта нет (%s), CIM неясен — страховочный schtasks /Run rc=%s | %s "
+                    "(без алерта: смерть не доказана)", why, rc, _tail(out, 120))
         return "unknown"
-    # ДОКАЗАННО мёртв: heartbeat протух И процессов демона нет → поднимаем.
-    log.warning("watchdog: heartbeat протух (>%ss) и процессов демона НЕТ — поднимаю через schtasks",
-                HEARTBEAT_STALE)
+    # ДОКАЗАННО мёртв: продукта нет И процессов демона нет → поднимаем. Порог тишины здесь НЕ ждём
+    # намеренно: производить оборот некому, а не «медленно» — иначе подъём после смерти опоздал бы
+    # на полчаса против прежнего (три настоящих подъёма корпуса: 24.07, 30.07, 06.08).
+    log.warning("watchdog: продукта нет (%s) и процессов демона НЕТ — поднимаю через schtasks", why)
     # СКОЛЬКО ЛЕЖАЛ — снимаем ДО /Run: поднятый демон пишет heartbeat уже через свой первый цикл,
     # и замер после верификации (verify_sleep=20с) показал бы простой почти в ноль (тот же класс,
     # что и «лог 0с назад» в контур-вотчдоге).

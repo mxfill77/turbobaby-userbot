@@ -931,20 +931,31 @@ class TestApprovalTtlLiveIncident(Base):
 
 
 class TestWatchdog(Base):
-    """Внешний вотчдог: живость ПО ФАКТУ (heartbeat ИЛИ процесс) + антиспам алерта.
-    Класс-голдены ложняка 13.07: живой демон на длинной задаче (heartbeat замер) и self-update
-    смена PID НЕ считаются смертью; алерт — ровно один на инцидент."""
+    """Внешний вотчдог: судит ПРОДУКТ демона (оборот poll_once), а не живой PID (класс 493).
+
+    Голдены трёх классов сразу: ложняк 13.07 (длинная задача — работа, а не смерть) держится
+    теперь ОБЪЯВЛЕННЫМ заходом, а не PID; ложный зелёный 493 (процесс жив, продукта нет) даёт
+    карточку БЕЗ подъёма; «проверить нечем» → «неизвестно» и молчание.
+
+    ФОРМАТ ФАКТОВ — ЖИВОЙ: продукт отдаётся строкой ровно того вида, что пишет `_write_heartbeat`
+    (`datetime.now(utc).isoformat()`), отметка занятости — настоящим файлом реестра, а числа
+    порогов сверяются с ДОСЛОВНЫМИ строками журнала (`fixtures/pc_orchestrator_watchdog.live.log`)."""
+
+    HB_RAW = "2026-08-11T15:23:19.173425+00:00"      # ровно то, что кладёт на диск _write_heartbeat
 
     def setUp(self):
         super().setUp()
         self._save_hb = o._heartbeat_fresh
         self._tmp = tempfile.TemporaryDirectory()
         self.state = os.path.join(self._tmp.name, "wd_state.json")
+        self.stamp = os.path.join(self._tmp.name, "task_started.json")
         self.notes, self.pushes, self.cards = [], [], []
         self.cow = lambda s: self.notes.append(s)
         self.push = lambda s: self.pushes.append(s)
         self.card = lambda topic, text: self.cards.append((topic, text))
         self.runs = {"n": 0}
+        self.prod = (self.HB_RAW, 1_000_000.0, 12.0)      # (сырая строка, epoch, возраст) — свежий
+        self.awake = 500.0                                # часы бодрствования этого «тика»
 
     def tearDown(self):
         o._heartbeat_fresh = self._save_hb
@@ -955,14 +966,21 @@ class TestWatchdog(Base):
         self.runs["n"] += 1
         return (0, "SUCCESS: task run")
 
-    def _wd(self, finder, wall_now=None):
+    def _turn(self, age, raw=None, ts=1_000_000.0):
+        """Продукт: оборот был `age` секунд назад (raw — сырая строка heartbeat, она же метка витка)."""
+        self.prod = (raw or self.HB_RAW, ts, float(age))
+
+    def _wd(self, finder, wall_now=None, busy=None):
         return o.watchdog(runner=self._runner, verify_sleep=0, finder=finder,
                           state_path=self.state, notify=self.push, cowork=self.cow,
-                          wall_now=wall_now, topic=self.card)
+                          wall_now=wall_now, topic=self.card,
+                          product=lambda now=None: self.prod,
+                          awake=lambda: self.awake,          # None = настоящих часов нет
+                          busy=busy or (lambda ts, now: None))
 
-    # (a) демон жив + heartbeat свеж → ТИШИНА: ни подъёма, ни алертов.
-    def test_a_alive_hb_fresh_silence(self):
-        o._heartbeat_fresh = lambda *a, **k: True
+    # (a) оборот только что был → ТИШИНА: ни подъёма, ни алертов, ни обращения к CIM.
+    def test_a_alive_turn_fresh_silence(self):
+        self._turn(12)
         finder_calls = {"n": 0}
         def finder():
             finder_calls["n"] += 1
@@ -972,25 +990,26 @@ class TestWatchdog(Base):
         self.assertEqual(self.runs["n"], 0)
         self.assertEqual(self.pushes, [])
         self.assertEqual(self.notes, [])
-        self.assertEqual(finder_calls["n"], 0)       # свежий heartbeat — CIM даже не дёргаем
+        self.assertEqual(finder_calls["n"], 0)       # свежий оборот — CIM даже не дёргаем
 
-    # КОРЕНЬ ложняка 13.07: heartbeat замер на длинной задаче, но процесс демона ЖИВ → тишина.
-    def test_long_task_hb_stale_process_alive_no_alert(self):
-        o._heartbeat_fresh = lambda *a, **k: False
-        r = self._wd(lambda: [2096])                 # живой PID демона (как 13.07 на задачах 256-260)
+    # КОРЕНЬ ложняка 13.07 в НОВОМ критерии: heartbeat замер на длинной задаче — тишину оправдывает
+    # ОБЪЯВЛЕННЫЙ заход (отметка старта свежее оборота), а не живой PID.
+    def test_long_task_declared_run_keeps_silence_legit(self):
+        self._turn(2000)
+        r = self._wd(lambda: [2096], busy=lambda ts, now: 1900.0)   # заход идёт 31 мин из 75
         self.assertEqual(r, "alive")
         self.assertEqual(self.runs["n"], 0)          # НЕ поднимаем второй экземпляр
         self.assertEqual(self.pushes, [])            # НЕ спамим
         self.assertEqual(self.notes, [])
 
-    # (c) self-update: PID сменился, heartbeat свеж → БЕЗ алерта (прежний PID никого не волнует).
-    def test_c_selfupdate_new_pid_hb_fresh_no_alert(self):
-        o._heartbeat_fresh = lambda *a, **k: True
+    # (c) self-update: PID сменился, оборот свеж → БЕЗ алерта (прежний PID никого не волнует).
+    def test_c_selfupdate_new_pid_turn_fresh_no_alert(self):
+        self._turn(20)
         r = self._wd(lambda: [55555])                # новый PID после эстафеты
         self.assertEqual(r, "alive")
         self.assertEqual(self.pushes, [])
-        # и вариант: heartbeat на миг рестарта протух, но НОВЫЙ процесс уже жив → тоже тишина
-        o._heartbeat_fresh = lambda *a, **k: False
+        # и вариант: оборот на миг рестарта отстал, но НОВЫЙ процесс уже дал свой виток → тишина
+        self._turn(200, raw=self.HB_RAW.replace("15:23:19", "15:26:41"))
         r = self._wd(lambda: [55556])
         self.assertEqual(r, "alive")
         self.assertEqual(self.pushes, [])
@@ -998,8 +1017,9 @@ class TestWatchdog(Base):
 
     # (b) ДОКАЗАННО мёртв → подъём + РОВНО один алерт + NOTE; инцидент длится → без повторов.
     def test_b_dead_exactly_one_alert_and_note(self):
-        o._heartbeat_fresh = lambda *a, **k: False
+        self._turn(400)
         dead = lambda: []                            # CIM честно: процессов нет (и после /Run)
+        o._heartbeat_fresh = lambda *a, **k: False
         r = self._wd(dead, wall_now=1_000_000.0)
         self.assertEqual(r, "failed_to_start")
         self.assertEqual(self.runs["n"], 1)          # попытка подъёма была
@@ -1014,6 +1034,7 @@ class TestWatchdog(Base):
 
     # мёртв → schtasks поднял (процесс появился) → restarted, БЕЗ алерта.
     def test_restart_success_by_process(self):
+        self._turn(400)
         o._heartbeat_fresh = lambda *a, **k: False
         seq = iter([[], [7777]])                     # до /Run пусто → после /Run процесс жив
         r = self._wd(lambda: next(seq))
@@ -1021,10 +1042,10 @@ class TestWatchdog(Base):
         self.assertEqual(self.runs["n"], 1)
         self.assertEqual(self.pushes, [])
 
-    # регресс прежнего пути: подъём подтверждён свежим heartbeat.
+    # регресс прежнего пути: подъём ПОДТВЕРЖДЁН свежим heartbeat (продукт поднятого демона).
     def test_restart_success_by_heartbeat(self):
-        hb = iter([False, True])
-        o._heartbeat_fresh = lambda *a, **k: next(hb)
+        self._turn(400)
+        o._heartbeat_fresh = lambda *a, **k: True
         r = self._wd(lambda: [])
         self.assertEqual(r, "restarted")
         self.assertEqual(self.runs["n"], 1)
@@ -1032,6 +1053,7 @@ class TestWatchdog(Base):
 
     # ─── ПОДЪЁМ ДЕМОНА ВИДЕН (31.07): раньше успешный подъём давал одну строку INFO и всё ───
     def test_daemon_raise_sends_card_and_note(self):
+        self._turn(400)
         o._heartbeat_fresh = lambda *a, **k: False
         seq = iter([[], [7777]])
         self.assertEqual(self._wd(lambda: next(seq), wall_now=1_000_000.0), "restarted")
@@ -1046,6 +1068,7 @@ class TestWatchdog(Base):
 
     # второй подъём за сутки — ГРОМЧЕ (демон не держится), карточка уходит критическим каналом
     def test_daemon_second_raise_is_loud(self):
+        self._turn(400)
         o._heartbeat_fresh = lambda *a, **k: False
         for t in (1_000_000.0, 1_000_600.0):
             seq = iter([[], [7777]])
@@ -1056,10 +1079,11 @@ class TestWatchdog(Base):
 
     # счётчик подъёмов переживает живые тики (_mark_alive не должен стирать историю)
     def test_daemon_raise_history_survives_alive_ticks(self):
+        self._turn(400)
         o._heartbeat_fresh = lambda *a, **k: False
         seq = iter([[], [7777]])
         self._wd(lambda: next(seq), wall_now=1_000_000.0)
-        o._heartbeat_fresh = lambda *a, **k: True
+        self._turn(12)
         for dt in (300.0, 600.0, 900.0):                        # живые тики каждые 5 минут
             self._wd(lambda: [7777], wall_now=1_000_000.0 + dt)
         import json as _json
@@ -1070,7 +1094,7 @@ class TestWatchdog(Base):
 
     # CIM не смог (#171) → страховочный /Run, БЕЗ алерта (смерть не доказана).
     def test_cim_blind_unknown_no_alert(self):
-        o._heartbeat_fresh = lambda *a, **k: False
+        self._turn(400)
         r = self._wd(lambda: None)
         self.assertEqual(r, "unknown")
         self.assertEqual(self.runs["n"], 1)          # подстраховались (singleton защитит живого)
@@ -1079,24 +1103,161 @@ class TestWatchdog(Base):
     # восстановление после инцидента: NOTE «инцидент закрыт» один раз; новый инцидент после
     # кулдауна → НОВЫЙ алерт (переход жив→мёртв), внутри кулдауна → тишина (флап-защита).
     def test_recovery_note_and_next_incident(self):
+        self._turn(400)
         o._heartbeat_fresh = lambda *a, **k: False
         dead = lambda: []
         self._wd(dead, wall_now=1_000_000.0)                       # инцидент №1: алерт
         self.assertEqual(len(self.pushes), 1)
-        o._heartbeat_fresh = lambda *a, **k: True
-        self.assertEqual(self._wd(dead, wall_now=1_000_100.0), "alive")   # ожил
-        self.assertTrue(any("снова жив" in s for s in self.notes))        # NOTE о закрытии
+        self._turn(12)
+        self.assertEqual(self._wd(dead, wall_now=1_000_100.0), "alive")   # оборот снова есть
+        self.assertTrue(any("снова даёт оборот" in s for s in self.notes))   # NOTE о закрытии
         n_notes = len(self.notes)
         self._wd(dead, wall_now=1_000_160.0)                       # всё ещё жив — без дублей NOTE
         self.assertEqual(len(self.notes), n_notes)
-        o._heartbeat_fresh = lambda *a, **k: False
+        self._turn(400)
         self._wd(dead, wall_now=1_000_200.0)                       # инцидент №2 ВНУТРИ кулдауна
         self.assertEqual(len(self.pushes), 1)                      # флап-защита: алерта нет
-        o._heartbeat_fresh = lambda *a, **k: True
+        self._turn(12)
         self._wd(dead, wall_now=1_000_300.0)                       # снова ожил
-        o._heartbeat_fresh = lambda *a, **k: False
+        self._turn(400)
         self._wd(dead, wall_now=1_001_000.0)                       # инцидент №3 ПОСЛЕ кулдауна
         self.assertEqual(len(self.pushes), 2)                      # новый переход → новый алерт
+
+    # ─── КЛАСС 493: процесс ЖИВ, продукта НЕТ. Раньше это была ветка «жив, не трогаю» ─────────
+    def test_hung_process_alive_without_product_cards_and_never_raises(self):
+        self._turn(2400)                                   # оборота нет 40 мин по стенным часам
+        self._wd(lambda: [13828], wall_now=1_000_000.0)    # тик 1: накопитель заводится
+        self.awake = 500.0 + o.WD_PRODUCT_SILENT + 1       # тик 2: тишина бодрствования > порога
+        r = self._wd(lambda: [13828], wall_now=1_000_300.0)
+        self.assertEqual(r, "hung")
+        self.assertEqual(self.runs["n"], 0)                # ЖИВОЙ процесс сторож НЕ поднимает
+        self.assertEqual(len(self.pushes), 1)              # ровно одна карточка владельцу
+        text = self.pushes[0]
+        self.assertIn("ЖИВ ПРОЦЕССОМ", text)
+        self.assertIn("13828", text)                       # PID назван — владельцу с ним работать
+        self.assertIn("решение за владельцем", text)
+        self.assertTrue(any("подъёма НЕ делал" in n for n in self.notes))
+
+    def test_hung_alert_once_per_incident_and_closes_on_turn(self):
+        self._turn(2400)
+        self._wd(lambda: [13828], wall_now=1_000_000.0)
+        for i, dt in enumerate((300.0, 600.0, 900.0)):     # инцидент длится — карточка НЕ повторяется
+            self.awake = 500.0 + o.WD_PRODUCT_SILENT + 1 + dt
+            self.assertEqual(self._wd(lambda: [13828], wall_now=1_000_000.0 + dt), "hung")
+        self.assertEqual(len(self.pushes), 1)
+        self._turn(15, raw=self.HB_RAW.replace("15:23:19", "16:02:44"))    # виток пошёл
+        self.assertEqual(self._wd(lambda: [13828], wall_now=1_002_000.0), "alive")
+        self.assertTrue(any("инцидент закрыт" in n for n in self.notes))
+
+    # ЗАМОК ПРОТИВ ЛОЖНОГО ЗЕЛЁНОГО: тишину измерить нечем → «неизвестно», а не «жив».
+    def test_unknown_when_silence_not_measured(self):
+        self._turn(2400)
+        r = self._wd(lambda: [13828], wall_now=1_000_000.0)   # первый тик: накопителя ещё нет
+        self.assertEqual(r, "unknown")
+        self.assertEqual(self.pushes, [])
+        self.assertEqual(self.runs["n"], 0)
+        # часов бодрствования на машине нет вовсе — тот же честный исход и на всех следующих тиках
+        self.awake = None
+        self.assertEqual(self._wd(lambda: [13828], wall_now=1_000_300.0), "unknown")
+        self.assertEqual(self.pushes, [])
+
+    def test_unknown_when_product_unreadable(self):
+        self.prod = (None, None, None)                       # heartbeat не прочитан
+        self.assertEqual(self._wd(lambda: [13828], wall_now=1_000_000.0), "unknown")
+        self.assertEqual(self.runs["n"], 0)
+        self.assertEqual(self.pushes, [])
+
+    # СМЕРТЬ ПОСРЕДИ ЗАДАЧИ: отметка старта свежая, но процессов НЕТ → подъём СРАЗУ, а не через
+    # потолок занятости (иначе класс 61 от 30.07 лечился бы на 75 минут позже прежнего).
+    def test_dead_mid_task_raised_despite_fresh_stamp(self):
+        self._turn(400)
+        o._heartbeat_fresh = lambda *a, **k: False
+        seq = iter([[], [7777]])
+        r = self._wd(lambda: next(seq), wall_now=1_000_000.0, busy=lambda ts, now: 60.0)
+        self.assertEqual(r, "restarted")
+        self.assertEqual(self.runs["n"], 1)
+
+    # СОН МАШИНЫ ≠ ЗАВИСАНИЕ: стенной возраст продукта после сна равен сну, а тишина
+    # бодрствования — нет. Прежде эту ложь глушил живой PID; теперь глушит измерение.
+    def test_sleep_is_not_a_hang(self):
+        self._turn(32_384)                                   # 8.99 ч — ровно сон 30.07 из журнала
+        self._wd(lambda: [13828], wall_now=1_000_000.0)
+        self.awake = 500.0 + 300.0                           # бодрствования между тиками — 5 мин
+        r = self._wd(lambda: [13828], wall_now=1_032_700.0)
+        self.assertEqual(r, "alive")
+        self.assertEqual(self.pushes, [])
+        self.assertEqual(self.runs["n"], 0)
+
+    # накопитель: тишина растёт от наблюдения к наблюдению и обнуляется СМЕНОЙ СТРОКИ продукта
+    def test_silence_accumulator_counts_and_resets(self):
+        st = {}
+        s, acc = o._wd_silence(self.HB_RAW, st, 1000.0)
+        self.assertIsNone(s)                                  # накопителя не было — «не знаю»
+        s, acc = o._wd_silence(self.HB_RAW, acc, 1300.0)
+        self.assertEqual(s, 300.0)
+        s, acc2 = o._wd_silence(self.HB_RAW, acc, 1900.0)
+        self.assertEqual(s, 900.0)                            # отсчёт НЕ сдвигается на каждом тике
+        s, _ = o._wd_silence("2026-08-11T16:02:44.010101+00:00", acc2, 1960.0)
+        self.assertEqual(s, 0.0)                              # строка сменилась → виток был
+        self.assertIsNone(o._wd_silence(self.HB_RAW, acc, 12.0)[0])      # часы назад = перезагрузка
+        self.assertIsNone(o._wd_silence(self.HB_RAW, acc, None)[0])      # часов нет вовсе
+
+    # отметка занятости: ЖИВОЙ формат файла реестра; след ЗАКРЫТОЙ задачи оправданием не является
+    def test_busy_age_only_from_stamp_newer_than_turn(self):
+        rec = {"505": {"at": "2026-08-11T15:06:35.402293+00:00", "pid": 13828,
+                       "proc": "13828-1786000000"}}           # ровно то, что пишет _task_started_mark
+        with open(self.stamp, "w", encoding="utf-8") as f:
+            json.dump(rec, f, ensure_ascii=False)
+        os.utime(self.stamp, (1_000_500.0, 1_000_500.0))
+        self.assertEqual(o._wd_busy_age(1_000_000.0, 1_000_800.0, path=self.stamp), 300.0)
+        self.assertIsNone(o._wd_busy_age(1_000_900.0, 1_001_000.0, path=self.stamp))   # старше оборота
+        self.assertIsNone(o._wd_busy_age(None, 1_000_800.0, path=self.stamp + ".нет"))
+
+    # ─── ГОЛДЕН КРИТЕРИЯ НА ДОСЛОВНЫХ СТРОКАХ ЖУРНАЛА ────────────────────────────────────────
+    def test_thresholds_against_live_log_lines(self):
+        """Пороги проверяем по ЖИВЫМ строкам pc_orchestrator.log, а не по круглым числам."""
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
+                               "pc_orchestrator_watchdog.live.log"), encoding="utf-8") as f:
+            raw = f.read()
+        stalls = [int(m) for m in re.findall(r"виток растянулся на (\d+)с: залипание вызова моста", raw)]
+        works = [int(m) for m in re.findall(r"виток растянулся на (\d+)с: длинный виток", raw)]
+        jumps = [int(m) for m in re.findall(r"скачок wall-clock (\d+)с", raw)]
+        runs = [int(m) for m in re.findall(r"RUN id=\d+ \(timeout=(\d+)s", raw)]
+        self.assertTrue(stalls and works and jumps and runs)          # формат живой, не выдуманный
+        # (1) ЗАКОННАЯ пауза без работы (максимум корпуса — 605с) обязана оставаться «работает»
+        for sec in stalls:
+            self.assertEqual(o.daemon_product_verdict(sec, sec, None)[0], o.PROD_OK, sec)
+        # (2) виток С РАБОТОЙ длиннее порога держится ОБЪЯВЛЕННЫМ заходом — и падает без него
+        for sec in works + jumps:
+            self.assertEqual(o.daemon_product_verdict(sec, sec, sec)[0], o.PROD_OK, sec)
+            self.assertEqual(o.daemon_product_verdict(sec, sec, None)[0], o.PROD_SILENT, sec)
+        # (3) потолок занятости выше жёсткого таймаута прогона из той же строки журнала
+        self.assertGreater(o.WD_BUSY_ALLOW, max(runs))
+        # (4) та самая строка «heartbeat старше 180с, но процесс демона жив» — на тех же фактах
+        #     новый критерий вердикта «работает» больше НЕ даёт
+        self.assertIn("процесс демона жив", raw)
+        self.assertEqual(o.daemon_product_verdict(o.WD_PRODUCT_SILENT + 1, o.WD_PRODUCT_SILENT + 1,
+                                                  None)[0], o.PROD_SILENT)
+
+    def test_product_verdict_three_outcomes(self):
+        # чистая функция: ни одного признака жизни на входе, три исхода на выходе
+        self.assertEqual(o.daemon_product_verdict(12.0, None, None)[0], o.PROD_OK)      # свежий оборот
+        self.assertEqual(o.daemon_product_verdict(None, None, None)[0], o.PROD_UNKNOWN)  # не прочитан
+        self.assertEqual(o.daemon_product_verdict(9000.0, None, None)[0], o.PROD_UNKNOWN)  # не измерено
+        self.assertEqual(o.daemon_product_verdict(9000.0, 60.0, None)[0], o.PROD_OK)     # тишина мала
+        self.assertEqual(o.daemon_product_verdict(9000.0, 9000.0, 60.0)[0], o.PROD_OK)   # заход идёт
+        self.assertEqual(o.daemon_product_verdict(9000.0, 9000.0, 99_000.0)[0], o.PROD_SILENT)  # пережил
+        self.assertEqual(o.daemon_product_verdict(9000.0, 9000.0, None)[0], o.PROD_SILENT)
+        self.assertEqual(o.daemon_product_verdict(9000.0, 9000.0, None, limit=0)[0], o.PROD_UNKNOWN)
+
+    def test_hung_card_text_golden(self):
+        t = o.daemon_hung_card_text(2400.0, None, [13828])
+        self.assertIn("40 м 00 с", t)
+        self.assertIn("ВЕСЬ ПК-контур стоял", t)                       # цена простоя названа
+        self.assertIn("объявленного захода нет", t)
+        self.assertIn("taskkill/schtasks", t)                          # и что операция красная
+        t2 = o.daemon_hung_card_text(5000.0, 4800.0, [13828])
+        self.assertIn("объявленный заход идёт", t2)
 
     def test_stopped_switch(self):
         o._stopped = lambda: True
