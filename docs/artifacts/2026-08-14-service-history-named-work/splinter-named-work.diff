@@ -1,0 +1,57 @@
+--- before/splinter.py	2026-08-14 23:26:49.195081400 +0700
++++ splinter.py	2026-08-14 23:25:35.619850700 +0700
+@@ -6022,6 +6022,24 @@
+     return seg or rest
+ 
+ 
++def _sp_event_note(kind, works, km):
++    """Текст строки истории обслуживания: НАЗВАННАЯ работа, а не ярлык (14.08.2026).
++
++    Ярлык `_SP_KIND_LABEL` НЕ снимается и снят быть не может — на нём стои́т РАСЧЁТ: ключ `kind`
++    адресует регистр (oil→кол.I, gear→J, abs→K, airfilter→L и интервалы `service_upsert`), он же
++    несёт идемпотентность (`msg_id=sp:…:{kind}:{km}`) и обе половины квитанции/карточку отмены.
++    Здесь меняется РОВНО одно — человекочитаемый текст строки: механик работу НАЗВАЛ → в историю
++    идут его слова (как давно делает соседняя ветка `_write_info_works`); не назвал → ярлык, и по
++    ярлыку видно, что названия не было. Живой случай: байк 9548, 14.08 — «замена аккумулятора»
++    легла в историю как «прочие работы».
++
++    Слова сопоставляем с регистром ТЕМ ЖЕ классификатором, что построил `done` (`_service_kind`),
++    иначе в строку попало бы чужое название. Длину режем как `_write_info_works` — 200."""
++    named = [w for w in (works or []) if _service_kind(w) == kind]
++    what = "; ".join(named) if named else _SP_KIND_LABEL.get(kind, (kind, kind))[1]
++    return (f"{what} — {km} км" if km else f"{what}")[:200]
++
++
+ def _rental_expired(status, end_date):
+     """Z3: True если Лист1 статус 'В аренде', но дата конца аренды (формат DD.MM.YYYY[...]) уже в прошлом."""
+     if not str(status or "").strip().lower().startswith("в аренд"):
+@@ -6453,6 +6471,7 @@
+             return [], [("odo", odo_ceiling.ERR)]
+     written, failed = [], []
+     undo_pos, undo_blind = [], 0     # позиции отмены и сколько их осталось БЕЗ названного объекта
++    sp_works = None                  # слова механика (WORKS:{…} из note заявки) — читаем ЛЕНИВО
+     for k in done:
+         try:
+             if k in _SP_COL_KINDS:
+@@ -6510,11 +6529,18 @@
+                     failed.append((k, r.get("error") if fact is None
+                                    else f"{r.get('error')}/{fact.state}"))
+             else:
+-                # фильтр/колодки/цепь/прочее — регистра нет → событие с одометром (фаза2 scope)
+-                lbl = _SP_KIND_LABEL.get(k, (k, k))[1]
++                # фильтр/колодки/цепь/прочее — регистра нет → событие с одометром (фаза2 scope).
++                # В ИСТОРИЮ ИДЁТ НАЗВАННАЯ РАБОТА, А НЕ ЯРЛЫК (14.08.2026): слова механика лежат
++                # в note заявки (Z4, `WORKS:{…}`) и до сих пор сюда не доезжали. Читаем их ЛЕНИВО
++                # и ОДИН раз на заход — колоночная запись за них обращением к мосту не платит.
++                # Чтение best-effort: не удалось → `_sp_event_note` отдаст прежний ярлык (fail-safe).
++                if sp_works is None:
++                    sp_works = _sp_works_from_note(
++                        (_sp_open(bridge, chat_id, topic_id, bike) or {}).get("note"))
+                 bridge.add_event(group="обслуживание" + (f" / тема {topic_id}" if topic_id else ""),
+                                  bike=bike, event_type="repair", mileage=str(odo_int),
+-                                 notes=f"{lbl} — {odo_int} км", sender=str(confirmed_by or ""),
++                                 notes=_sp_event_note(k, sp_works, odo_int),
++                                 sender=str(confirmed_by or ""),
+                                  msg_id=f"sp:{chat_id}:{topic_id}:{k}:{odo_int}")
+                 written.append(k)
+         except Exception:
