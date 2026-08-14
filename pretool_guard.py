@@ -2312,6 +2312,196 @@ def _secret_value_leak_bodies(cmd):
     return ""
 
 
+# ══ ВЫНОС ЗНАЧЕНИЯ НАРУЖУ: КАРТОЧКУ РОЖДАЕТ ПАРА «УЛИКА + КАНАЛ» (зеркало VPS 96928c9) ═══════
+# ЧТЕНИЕ ОКРУЖЕНИЯ НЕ ЗАПРЕЩЕНО — на нём работает всё, что ходит к мосту: `brain_writer`,
+# `cowork_log_append`, `bridge_http`. Признак «в тексте назван секрет» уже отменён на этой полосе
+# один раз (класс `guard-env-card-on-prose-mention`, снят 01.08.2026 коммитом f4c3cff) — и
+# воскрешать его нельзя. Событием является ВЫНОС ЗНАЧЕНИЯ, а он требует ДВУХ фактов сразу:
+#
+#   УЛИКА  — (1) специфичное ЗНАЧЕНИЕ из окружения стоит в тексте дословно, либо (2) имя такой
+#            переменной стоит в ПОЗИЦИИ ЧТЕНИЯ (`os.environ[...]`, `$env:X`, `%X%`, `$X`), либо
+#            (3) снимается ОКРУЖЕНИЕ ЦЕЛИКОМ (`printenv`, `Get-ChildItem Env:`, `dict(os.environ)`);
+#   КАНАЛ  — файл ВНЕ временных каталогов, журнал/сообщение владельцу, сеть, сообщение коммита.
+#
+# Ни одна из улик БЕЗ канала карточки не рождает: `python -c "import os; print(os.environ['X'])"`
+# печатает в stdout сессии, а это тот же контекст, в котором вызывающий уже находится. И ни один
+# канал БЕЗ улики: запись файла и строка в журнал зелены как были.
+#
+# ПОРОГ СПЕЦИФИЧНОСТИ СНЯТ ЗАМЕРОМ СВОЕГО ОКРУЖЕНИЯ (14.08.2026), чужой не скопирован. Меряется
+# НЕ длина значения: по длине ≥14 проходят 47 переменных из 92 (пути, фразы, `PATH`) — правило
+# на ней ловило бы что угодно. Меряется ДЛИНА НЕПРЕРЫВНОГО буквенно-цифрового куска у значения,
+# которое является ОДНИМ СЛОВОМ (без пробелов и разделителей пути — путь и фраза выбывают сразу).
+# Распределение по 92 переменным (53 одно-словных) дало пустые промежутки 8–11, 13–18, 19–29;
+# порог взят В СЕРЕДИНЕ промежутка 13→18, как на полосе сервера порог 14 взят в середине 12→16.
+# По обе стороны промежутка: 13 — `PRETOOL_MARKER_TOKEN` (штамп самого гарда, он в текстах гарда
+# живёт законно), 18 — первый из проходящих. Порог 16 совпал с полом соседнего правила
+# `_RE_SECRET_ASSIGN` в этом же файле, и это не совпадение: обе меряют «так выглядит боевой ключ».
+#
+# ЗАЩИТА ОТ ЛОЖНЫХ БЛОКОВ — ЧИСЛОМ, А НЕ ОЩУЩЕНИЕМ. Порог проходят 5 переменных из 92 (замер
+# 14.08). Иглой служит не всё значение, а его буквенно-цифровой кусок ≥16 — случайное совпадение
+# такой строки с текстом невозможно практически. Соседние пороги для сравнения: 6 → 22 переменные
+# (вошли бы `THINKER_MODEL`, `SUGGEST_MODEL` — имена моделей стоят в КАЖДОМ файле репозитория,
+# правило встало бы намертво), 12 → 7 (вошёл бы `CLAUDE_CODE_SESSION_ID`, а он стоит в путях
+# транскриптов). 13→18 — первый промежуток, ВЫШЕ которого не осталось ни одной переменной,
+# чьё значение живёт в текстах репозитория.
+ENV_VALUE_MIN_RUN = 16          # порог специфичности: длина непрерывного алфанум-куска значения
+_RE_ALNUM_RUN = re.compile(r"[A-Za-z0-9]+")
+_RE_VALUE_NOT_WORD = re.compile(r"[\s\\/]")     # пробел/разделитель пути → значение не одно слово
+_ENV_SPECIFIC_CACHE = None
+ENV_SNAPSHOT_NAME = "окружение целиком"
+
+
+def _env_specific(env=None):
+    """Пары (ИМЯ, ИГЛА) для переменных окружения, чьё значение специфично настолько, что дословное
+    совпадение с текстом случайным быть не может. Игла — самый длинный буквенно-цифровой кусок
+    значения; она, а не всё значение, и ищется в тексте: частичный вынос — тоже вынос.
+
+    ЗНАЧЕНИЙ ФУНКЦИЯ НЕ ОТДАЁТ НИКУДА, КРОМЕ СРАВНЕНИЯ: наружу (в карточку, в лог, в отчёт) идёт
+    только ИМЯ. Гард, печатающий секрет в собственный лог, — тот же вынос, только своими руками."""
+    global _ENV_SPECIFIC_CACHE
+    if env is None and _ENV_SPECIFIC_CACHE is not None:
+        return _ENV_SPECIFIC_CACHE
+    src = os.environ if env is None else env
+    out = []
+    for name, val in src.items():
+        if not val or _RE_VALUE_NOT_WORD.search(val):
+            continue                       # путь, список путей, фраза — специфичными не считаем
+        runs = [m.group(0) for m in _RE_ALNUM_RUN.finditer(val)
+                if len(m.group(0)) >= ENV_VALUE_MIN_RUN]
+        if runs:
+            out.append((name, max(runs, key=len)))
+    out.sort(key=lambda p: (-len(p[1]), p[0]))
+    res = tuple(out)
+    if env is None:
+        _ENV_SPECIFIC_CACHE = res
+    return res
+
+
+def _env_value_in_text(text, env=None):
+    """Имя переменной, чьё специфичное значение стоит в тексте ДОСЛОВНО, иначе ""."""
+    if not text:
+        return ""
+    for name, needle in _env_specific(env):
+        if needle in text:
+            return name
+    return ""
+
+
+_RE_ENV_READ_CACHE = {}
+
+
+def _env_read_rx(name):
+    """Регулярка «имя стоит в ПОЗИЦИИ ЧТЕНИЯ окружения». Голое имя в прозе сюда НЕ входит —
+    ровно тот класс (`env`-карточка на упоминание), что снят на этой полосе 01.08.2026."""
+    rx = _RE_ENV_READ_CACHE.get(name)
+    if rx is None:
+        n = re.escape(name)
+        rx = re.compile(
+            r"(?i)os\.environ\s*(?:\.get\s*\(|\[)\s*[\"']" + n + r"[\"']|"
+            r"\bos\.getenv\s*\(\s*[\"']" + n + r"[\"']|"
+            r"\bgetenv\s*\(\s*[\"']" + n + r"[\"']|"
+            r"\$\{?env:" + n + r"\}?|\bEnv:\\?" + n + r"(?![\w])|"
+            r"%" + n + r"%|\$\{" + n + r"\}|\$" + n + r"(?![\w])")
+        _RE_ENV_READ_CACHE[name] = rx
+    return rx
+
+
+def _env_name_read(text, env=None):
+    """Имя специфичной переменной, стоящее в тексте в позиции ЧТЕНИЯ окружения, иначе "".
+    Нужна отдельной ногой, потому что значение в такой команде НЕ ВИДНО: оно появится в момент
+    исполнения. `... $env:BRIDGE_TOKEN | Out-File x.txt` дословной улики не содержит вовсе."""
+    if not text:
+        return ""
+    for name, _needle in _env_specific(env):
+        if _env_read_rx(name).search(text):
+            return name
+    return ""
+
+
+# СНИМОК ОКРУЖЕНИЯ ЦЕЛИКОМ — улика без имени: какая переменная уедет, заранее не знает и сам
+# вызывающий. Формы ПОИМЁННЫЕ и узкие: голое слово `env` сюда НЕ входит намеренно — под него
+# подпадает `grep env docs/x.md`, и правило рождало бы карточку на поиск по слову.
+_RE_ENV_SNAPSHOT = re.compile(
+    r"(?i)(?:^|[\s;&|(])printenv(?![\w-])|"
+    r"\b(?:get-childitem|gci|ls|dir|get-item|gi)\s+env:|"
+    r"\bdict\s*\(\s*os\.environ\s*\)|\bos\.environ\s*\.\s*(?:items|copy|keys|values)\s*\(")
+
+
+# ── КАНАЛ: КУДА текст уезжает из этой сессии ──────────────────────────────────────────────────
+_RE_LEAK_FILE_CMDLET = re.compile(
+    r"(?i)(?:^|[\s;&|(])(out-file|set-content|add-content|tee-object|tee|export-csv|"
+    r"export-clixml|sc|ac)(?![\w-])")
+# Питон-форма записи файла. Режим обязан содержать `w`/`a`/`x` — `open(p)` и `open(p,'rb')`
+# это ЧТЕНИЕ, каналом оно не является. Путь захватывается ТОЛЬКО литералом: он нужен, чтобы
+# черновик во временной зоне остался зелёным наравне с `> tmp/x.txt`. Пути нет (переменная,
+# f-строка, склейка) → канал засчитывается, fail-closed: доказать временную зону нечем.
+_RE_LEAK_PY_WRITE = re.compile(
+    r"(?i)\bopen\s*\(\s*(?:[\"']([^\"']{1,300})[\"'])?[^)]*?,\s*[\"'][^\"']*[wax][^\"']*[\"']|"
+    r"\.write_text\s*\(|\.write_bytes\s*\(")
+_RE_LEAK_GIT_MSG = re.compile(r"(?i)(?:^|[\s;&|(])git\s+commit\b[^\n]*?(?:^|\s)-(?:m|F)(?:\s|$)")
+_RE_LEAK_REDIR = re.compile(r">>?\s*[\"']?([^\s\"'|;&<>]+)")
+_RE_LEAK_NULL = re.compile(r"(?i)^(?:/dev/null|\$null|nul|&\d+|\d+)$")
+
+
+def _leak_channel(cmd):
+    """Как называется КАНАЛ, которым текст уходит из сессии, иначе "".
+
+    ВРЕМЕННЫЕ КАТАЛОГИ КАНАЛОМ НЕ ЯВЛЯЮТСЯ (`tmp/`, `%TEMP%\\claude\\**`, POSIX-`/tmp`) — черновик
+    сессии живёт в том же контексте, что и сама сессия, и переживает её не дольше. Печать в stdout
+    каналом тоже не является: её уже видит вызывающий. `2>&1` и `>/dev/null` файлов не создают."""
+    if not cmd:
+        return ""
+    c = cmd
+    if _RE_SAFE_SCRIPTS.search(c):
+        return "журнал/сообщение владельцу"
+    if _RE_LEAK_GIT_MSG.search(c):
+        return "сообщение коммита"
+    if _net_scan(c)[0] == "open":
+        # Без `try`: `_net_scan` зовут без него и в `_decide_bash_body` (строка выше по разбору).
+        # Свой обработчик здесь означал бы, что сбой сети видит ОДНА ветка из двух — а храповик
+        # неразбора («нуль по неразбору») такое молчание считает слепым читателем, и правильно.
+        return "сеть"
+    for m in _RE_LEAK_REDIR.finditer(c):
+        tgt = m.group(1)
+        if _RE_LEAK_NULL.match(tgt) or _tmp_literal(tgt):
+            continue
+        return "файл"
+    if _RE_LEAK_FILE_CMDLET.search(c):
+        return "файл"
+    m = _RE_LEAK_PY_WRITE.search(c)
+    if m and not _tmp_literal(m.group(1)):
+        return "файл"
+    return ""
+
+
+def _tmp_literal(path):
+    """True ⇔ путь НАЗВАН литералом И лежит во временной зоне. Пустой путь → False: не названа
+    цель — доказательства временной зоны нет, и послабление не даётся (fail-closed)."""
+    if not path:
+        return False
+    return _is_temp_zone(path) or _is_posix_tmp_target(path)
+
+
+def _env_value_out(cmd, env=None):
+    """«ИМЯ → канал» ⇔ команда выносит значение из окружения НАРУЖУ, иначе "".
+
+    Порядок намеренный: сперва КАНАЛ (его нет — разбирать улики незачем и дорого), потом улики
+    от самой доказательной к самой общей. Наружу отдаётся ТОЛЬКО имя переменной и слово канала."""
+    if not cmd:
+        return ""
+    channel = _leak_channel(cmd)
+    if not channel:
+        return ""
+    name = _env_value_in_text(cmd, env)
+    if not name:
+        name = _env_name_read(cmd, env)
+    if not name and _RE_ENV_SNAPSHOT.search(cmd):
+        name = ENV_SNAPSHOT_NAME
+    if not name:
+        return ""
+    return name + " → " + channel
+
+
 # ПЕЧАТЬ СВОЕГО АРГУМЕНТА — тоже данные. `echo "gspread.open('Лист1')"`, `Write-Output "зову
 # create_booking(1)"` НИЧЕГО не исполняют: текст уходит в stdout. Признак `_PRINT_CMDS` уже
 # принят гардом для секретов (`_env_reach`, живой факт задачи 55 — имя `.env` попало в
@@ -2977,12 +3167,40 @@ def _cfg_reach(cmd):
 
 # ------------------------------- классификаторы ------------------------------
 
+def _write_payload(ti):
+    """Текст, который инструмент Write/Edit/MultiEdit/NotebookEdit КЛАДЁТ В ФАЙЛ. Только новое
+    тело: `old_string` — то, что в файле уже лежит, выносом его появление не является."""
+    parts = []
+    fields = ("content", "new_string", "new_source")
+    for key in fields:
+        val = ti.get(key)
+        if isinstance(val, str) and val:
+            parts.append(val)
+    edits = ti.get("edits")
+    if isinstance(edits, list):
+        for ed in edits:
+            if not isinstance(ed, dict):
+                continue
+            for key in fields:
+                val = ed.get(key)
+                if isinstance(val, str) and val:
+                    parts.append(val)
+    return "\n".join(parts)
+
+
 def _decide_write(ti, cwd):
     path = ti.get("file_path") or ti.get("notebook_path") or ""
     if _is_secret_path(path):
         return ("ask", "edit_secret", os.path.basename(path))
     if _is_claude_path(path):
         return ("ask", "edit_claude", os.path.basename(path))
+    # ВЫНОС ЗНАЧЕНИЯ В ФАЙЛ инструментом (не шеллом). Улика здесь ровно одна — ДОСЛОВНОЕ значение
+    # в теле записи: `os.environ[...]` в тексте файла ничего не исполняет, его судит уже разбор
+    # запуска. Временная зона каналом не является — там живут черновики самой сессии.
+    if not _is_temp_zone(path):
+        hit = _env_value_in_text(_write_payload(ti))
+        if hit:
+            return ("ask", "env", hit + " → файл")
     # Исходники самого гарда — запись инструментом, она НИЧЕГО НЕ ИСПОЛНЯЕТ. Стоит СТРОГО ПОСЛЕ
     # секретов и конфига `.claude` (те спрашивают всегда, карве-аут их не обходит) и ДО проверки
     # «вне проекта» — иначе два файла гарда в клоне сервера так и остались бы `write_outside`.
@@ -3020,6 +3238,13 @@ def _decide_bash(cmd, cwd):
         leak = _secret_value_leak_bodies(cmd)
         if leak:
             return ("ask", "env", leak)
+        # ВЫНОС ЗНАЧЕНИЯ НАРУЖУ (пара «улика + канал»). Стои́т ЗДЕСЬ ЖЕ, под тем же замком
+        # `_stays_red`: своего красного вида ветка не заслоняет, а команда, уже красная по другой
+        # причине, второй карточки не заслуживает. Судим СЫРУЮ команду — тела heredoc и подписи
+        # к выводу из скан-текста вырезаны как данные, а вынос ходит ровно ими.
+        out = _env_value_out(cmd)
+        if out:
+            return ("ask", "env", out)
     if action == "defer" and not kind and _RE_SQLITE_WORD.search(scan):
         # Питон-форма чтения базы доходит сюда через `_scan_python` с пустым видом. Смягчение не
         # должно стоить прозрачности (доктрина лога): в журнале обязано быть видно, что молча
