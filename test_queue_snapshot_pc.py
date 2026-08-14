@@ -296,11 +296,102 @@ class TestSnapshotBody(Base):
         self.assertIn("по наблюдению писателя", text)
 
 
+# ══════════════════════ 3-бис. ОТКАЗ ВЛАДЕЛЬЦА — ОТДЕЛЬНЫЙ ИСХОД ═══════════════════════════
+# Живой формат отказа снят read-only пробой 15.08.2026 (lane=pc): статуса `rejected` в очереди
+# НЕТ (`get_pending("rejected")` → ok=True, items=0), отказ лежит в `failed`, а отличает его
+# ровно префикс `result` — «отклонено Филиппом (кнопка)» / «отклонено Филиппом (ответ с ПК: …)».
+# 23 строки из 55 живых `failed` — именно такие. Идеализированного «status: rejected» здесь нет.
+def rejected_row(tid, updated, why="(кнопка)", goal="ЦЕЛЬ: снять слой ожиданий"):
+    return row(tid, "failed", updated, text="ultrathink\n\n" + goal,
+               result=(q.REJECT_MARK + " " + why).strip())
+
+
+class TestOwnerRejection(Base):
+    def test_маркер_отказа_ДОСЛОВНО_тот_что_пишет_демон(self):
+        """Слепок читает НЕ статус, а маркер, поэтому расхождение с демоном сделало бы ветку
+        вечно пустой ПРИ ЖИВОМ КЛАССЕ — молча. Читаем исходник, а не импортируем: импорт демона
+        вешает хендлер на боевой лог (закрытый класс «тесты сорят в боевой лог»)."""
+        import re
+        with open(os.path.join(os.path.dirname(os.path.abspath(q.__file__)),
+                               "pc_orchestrator.py"), encoding="utf-8") as f:
+            src = f.read()
+        got = re.search(r'^_REJECT_PREFIX\s*=\s*"([^"]+)"', src, re.M)
+        self.assertIsNotNone(got, "литерал отказа исчез из демона — слепок обязан упасть, а не врать")
+        self.assertEqual(q.REJECT_MARK, got.group(1))
+
+    def test_отказ_владельца_назван_отдельно_а_не_упало(self):
+        w = Writer()
+        self.tick(Bridge([], [rejected_row(555, "2026-08-14T16:40:00.000Z")]), w, T0)
+        text = w.texts[0]
+        self.assertIn("ОТКЛОНЕНО ВЛАДЕЛЬЦЕМ", text)
+        self.assertIn("#555", text)
+        self.assertIn("отклонено владельцем 1", text)
+        self.assertIn("упало 0", text, "решение человека не смеет считаться сбоем")
+        self.assertNotIn("  упало:", text)
+
+    def test_переотправка_запрещена_словами_а_не_подразумевается(self):
+        """Штаб читает мозг САМ: разница «сбой ↔ решение» обязана быть В ТЕКСТЕ, не в голове."""
+        text = q.render_body([], {"555": {"id": "555", "at": T0, "goal": "ЦЕЛЬ: X",
+                                          "outcome": "rejected", "why": q.REJECT_MARK}}, T0, T0)
+        self.assertIn("переотправке не подлежит", text)
+
+    def test_настоящее_падение_отказом_НЕ_называется(self):
+        self.assertEqual(q.outcome_of("⏱ таймаут 45 мин"), "failed")
+        self.assertEqual(q.outcome_of("подтверждение не получено за 46 мин"), "failed",
+                         "владелец не ответил — это НЕ отказ владельца")
+        self.assertEqual(q.outcome_of(""), "failed")
+        self.assertEqual(q.outcome_of(None), "failed")
+        self.assertEqual(q.outcome_of(q.REJECT_MARK + " (кнопка)"), "rejected")
+        self.assertEqual(q.outcome_of("  " + q.REJECT_MARK), "rejected", "пробелы решают исход?")
+
+    def test_пояснение_отказа_видно_а_маркер_не_повторяется(self):
+        self.assertEqual(q.reject_words(q.REJECT_MARK + " (ответ с ПК: Filipp/console): не нужно"),
+                         "(ответ с ПК: Filipp/console): не нужно")
+        self.assertEqual(q.reject_words(q.REJECT_MARK), "пояснения не оставлено")
+
+    def test_отказ_мимо_наблюдения_всё_равно_виден(self):
+        """Демон стоял, владелец нажал «нет» — строка не была открытой ни на одном обороте."""
+        w = Writer()
+        self.tick(Bridge([], [rejected_row(416, "2026-08-14T16:00:00.000Z")]), w, T0)
+        self.assertIn("#416", w.texts[0])
+        self.assertIn("отклонено владельцем 1", w.texts[0])
+
+    def test_разделение_исхода_НЕ_добавляет_записей_в_сутки(self):
+        """Цена разреза числом: исход поменял ИМЯ, а не количество смен. Отказ и падение дают
+        по одной записи на закрытие — сколько давали до разреза."""
+        counts = {}
+        for kind, closing in (("отказ", rejected_row(555, "2026-08-14T16:40:00.000Z")),
+                              ("падение", row(555, "failed", "2026-08-14T16:40:00.000Z",
+                                              result="⏱ таймаут"))):
+            self.fresh_state()
+            w = Writer()
+            live = row(555, "in_progress", "2026-08-14T15:31:36.719Z")
+            self.tick(Bridge([live]), w, T0)                       # взял
+            self.tick(Bridge([live]), w, T0 + 60)                  # тот же виток — записи нет
+            self.tick(Bridge([], [closing]), w, T0 + 120)          # закрыл
+            self.tick(Bridge([], [closing]), w, T0 + 180)          # снова тот же — записи нет
+            counts[kind] = len(w.texts)
+        self.assertEqual(counts["отказ"], counts["падение"])
+        self.assertEqual(counts["отказ"], 2, "две смены — две записи, не больше")
+
+    def test_отказ_и_падение_в_одних_сутках_не_смешиваются(self):
+        w = Writer()
+        self.tick(Bridge([], [rejected_row(555, "2026-08-14T16:40:00.000Z"),
+                              row(505, "failed", "2026-08-14T16:00:00.000Z",
+                                  text="ultrathink\n\nЦЕЛЬ: сторож судит ПРОДУКТ",
+                                  result="⏱ НЕ ЗАКРЫТА [причина=approval_timeout]")]), w, T0)
+        text = w.texts[0]
+        self.assertIn("отклонено владельцем 1", text)
+        self.assertIn("упало 1", text)
+        self.assertIn("approval_timeout", text)
+        self.assertLess(text.index("  упало:"), text.index("ОТКЛОНЕНО ВЛАДЕЛЬЦЕМ"))
+
+
 # ══════════════════════ 4. ИНВАРИАНТ QSNAP_PC_PURE ═════════════════════════════════════════
 # Граница держится отсутствием инструментов, а не докстрингом (зеркало EXPECT_PC_PURE полосы).
 _PURE = ("one_line", "goal_line", "fmt_ts", "age_min", "as_float", "_age_words", "_section",
          "render_body", "_row_key", "_closed_key", "render", "signature", "merge_closed",
-         "apply_failed")
+         "apply_failed", "outcome_of", "reject_words")
 _FORBIDDEN_CALLS = frozenset(("open", "exec", "eval", "compile", "__import__", "input", "print"))
 _FORBIDDEN_ROOTS = frozenset(("os", "sys", "subprocess", "socket", "urllib", "time", "shutil",
                               "pathlib", "tempfile", "sqlite3", "brain_writer", "pc_orchestrator",

@@ -43,6 +43,10 @@
 Между уходом строки и ближайшим чтением упавших исход называется «не сверен» — третий исход, а не
 молчаливое «сдано».
 
+ЧЕТВЁРТЫЙ ИСХОД — ОТКАЗ ВЛАДЕЛЬЦА (15.08.2026). Он приходит тем же дешёвым чтением `failed`, но
+называется отдельно: см. `REJECT_MARK` ниже — там замер, почему это маркер, а не статус, и почему
+слияние с «упало» было не мелочью, а приглашением переотправить отказанное.
+
 ЧЕГО ЭТОТ МОДУЛЬ НЕ УМЕЕТ ПО УСТРОЙСТВУ: мутировать очередь (ни claim, ни complete, ни enqueue,
 ни heartbeat — ни одного такого имени в файле нет), ставить задачи, писать владельцу, трогать
 серверный ключ `queue_state`, доску владельца и рабочие таблицы. Только GET очереди и замена
@@ -74,6 +78,23 @@ WHY_MAX = 110
 # Слова состояния — в одном месте: они едут и в файл, и в подпись.
 WORD = {"new": "стои́т в очереди", "in_progress": "в работе",
         "needs_approval": "ждёт владельца", "approved": "одобрено, ждёт исполнения"}
+
+# ОТКАЗ ВЛАДЕЛЬЦА — НЕ СТАТУС ОЧЕРЕДИ, А МАРКЕР В `result` (замер своей полосы 15.08.2026).
+#
+# Посылку зеркала проверили ЗДЕСЬ, а не приняли по форме: read-only проба живого моста, lane=pc —
+# `get_pending("rejected")` → `ok=True items=0`, статуса такого в очереди нет вовсе. Отказ владельца
+# кладётся в `failed`, а отличает его РОВНО префикс `result`: так пишет и devbot, и ПК-канал ответа
+# (`pc_orchestrator.answer_card` на «нет N» закрывает строку статусом `failed` с этим префиксом).
+# Поэтому здесь читается маркер, а не статус — иначе ветка была бы вечно пустой при живом классе.
+#
+# Класс не теоретический: в тех же 55 строках `failed` полосы 23 несут этот маркер (41.8%), за
+# последние сутки — 1 из 1. То есть КАЖДАЯ ВТОРАЯ «упавшая» строка слепка на самом деле была
+# РЕШЕНИЕМ ЧЕЛОВЕКА, а Штаб читал её как сбой и мог переотправить отказанное.
+#
+# Тот же контракт демон уже держит внутри себя: `NO_HEAL_PREFIXES` начинается с этого префикса —
+# самопочинка НЕ переформулирует то, что упало на решении человека. Слепок его лишь ВЫНОСИТ НАРУЖУ.
+# Дословность маркера сторожит тест (сверяет с литералом в `pc_orchestrator.py`), а не эта строка.
+REJECT_MARK = "отклонено Филиппом"
 
 
 def _int_from(mapping, name, default):
@@ -205,17 +226,21 @@ def render_body(rows, closed, failed_at, now):
                       "очередь пуста"),
              ""]
 
-    done_ids, failed_rows, unsure_ids = [], [], []
+    done_ids, failed_rows, rejected_rows, unsure_ids = [], [], [], []
     for tid, item in sorted(closed.items(), key=_closed_key):
         outcome = item.get("outcome")
         if outcome == "failed":
             failed_rows.append(item)
+        elif outcome == "rejected":
+            rejected_rows.append(item)
         elif outcome == "done":
             done_ids.append(tid)
         else:
             unsure_ids.append(tid)
-    parts.append("ЗАКРЫТО ЗА СУТКИ — на момент снятия (%d: сдано %d, упало %d, исход не сверен %d):"
-                 % (len(closed), len(done_ids), len(failed_rows), len(unsure_ids)))
+    parts.append("ЗАКРЫТО ЗА СУТКИ — на момент снятия "
+                 "(%d: сдано %d, упало %d, отклонено владельцем %d, исход не сверен %d):"
+                 % (len(closed), len(done_ids), len(failed_rows), len(rejected_rows),
+                    len(unsure_ids)))
     if done_ids:
         parts.append("  сдано: " + " ".join("#" + str(t) for t in done_ids))
     if failed_rows:
@@ -224,11 +249,21 @@ def render_body(rows, closed, failed_at, now):
             parts.append("    #%s · %s · причина: %s"
                          % (item.get("id"), one_line(item.get("goal"), GOAL_MAX),
                             one_line(item.get("why"), WHY_MAX) or "причина не названа очередью"))
+    if rejected_rows:
+        # ОТДЕЛЬНОЙ СТРОКОЙ, А НЕ СРЕДИ УПАВШИХ: «упало» зовёт переотправить, «отклонено» —
+        # запрещает. В очереди обе половины лежат под одним статусом `failed`, и без этого
+        # разреза решение владельца читалось бы как сбой (замер: 23 строки из 55 — ровно оно).
+        parts.append("  ОТКЛОНЕНО ВЛАДЕЛЬЦЕМ — это РЕШЕНИЕ, а не сбой; переотправке не подлежит:")
+        for item in rejected_rows:
+            parts.append("    #%s · %s · отказ: %s"
+                         % (item.get("id"), one_line(item.get("goal"), GOAL_MAX),
+                            reject_words(item.get("why"))))
     if unsure_ids:
         parts.append("  исход не сверен: " + " ".join("#" + str(t) for t in unsure_ids))
     if not closed:
         parts.append("  за сутки не закрылось ничего")
-    parts.append("  (упавшие сверены с очередью %s — эта половина за сутки ПОЛНА;" % fmt_ts(failed_at))
+    parts.append("  (упавшие и отклонённые сверены с очередью %s — эта половина за сутки ПОЛНА;"
+                 % fmt_ts(failed_at))
     parts.append("   половина «сдано» — по наблюдению писателя, полна настолько, сколько он работал)")
     return "\n".join(parts)
 
@@ -256,6 +291,9 @@ FOOT = """ЧТО ЭТО ЗА ФАЙЛ. Слепок состояния очер�
 момент claim, то есть «в работе» появляется здесь ДО того, как демон встанет на синхронный заход.
 Обратная сторона названа прямо: демон замер — замер и слепок. Судить по нему о ЖИЗНИ полосы
 нельзя, для этого есть О2/О4; здесь только состояние очереди на названное время.
+ОТКЛОНЁННОЕ ВЛАДЕЛЬЦЕМ СТОИТ ОТДЕЛЬНО ОТ УПАВШЕГО. В самой очереди обе половины лежат под одним
+статусом `failed` (статуса «отклонено» там нет вовсе), и различает их только маркер в причине —
+поэтому без этого разреза решение человека читается как сбой и зовёт переотправить отказанное.
 ПЕРЕД ОТПРАВКОЙ ЗАДАЧИ: сверься с временем снятия в шапке. Оно старше 15 минут — считай
 состояние неизвестным и спроси очередь напрямую, а не по этому файлу."""
 
@@ -314,9 +352,23 @@ def merge_closed(prev_open, now_open, prev_closed, now, window):
     return closed
 
 
+def outcome_of(result):
+    """Исход упавшей строки: `rejected` (владелец сказал НЕТ) или `failed` (сбой). Разница не
+    косметическая — сбой переотправляют, решение человека переотправлять НЕЛЬЗЯ."""
+    return "rejected" if one_line(result, WHY_MAX).startswith(REJECT_MARK) else "failed"
+
+
+def reject_words(result):
+    """Что владелец сказал СВЕРХ самого отказа (кнопка · кто ответил · пояснение). Маркер из
+    строки убираем: он машинный и в разрезе «отклонено» не новость."""
+    head = one_line(result, WHY_MAX)
+    tail = head[len(REJECT_MARK):].strip(" :·—-") if head.startswith(REJECT_MARK) else head
+    return tail or "пояснения не оставлено"
+
+
 def apply_failed(closed, failed_items, read_at, window):
-    """Итог чтения упавших → в реестр. Строка есть среди упавших — «упало» с причиной; ушла
-    ДО этого чтения и там не найдена — «сдано»; ушла ПОСЛЕ — исход остаётся не сверенным."""
+    """Итог чтения упавших → в реестр. Строка есть среди упавших — «упало»/«отклонено» с причиной;
+    ушла ДО этого чтения и там не найдена — «сдано»; ушла ПОСЛЕ — исход остаётся не сверенным."""
     out = {str(t): dict(i) for t, i in closed.items()}
     seen = set()
     for it in failed_items:
@@ -330,7 +382,7 @@ def apply_failed(closed, failed_items, read_at, window):
         if read_at - at > window:
             continue
         out[tid] = {"id": it.get("id"), "at": at, "goal": it.get("goal"),
-                    "outcome": "failed", "why": it.get("result")}
+                    "outcome": outcome_of(it.get("result")), "why": it.get("result")}
     for tid, item in out.items():
         at = as_float(item.get("at"))
         if item.get("outcome") is None and tid not in seen and at is not None and at <= read_at:
