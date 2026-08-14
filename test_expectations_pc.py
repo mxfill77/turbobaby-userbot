@@ -715,6 +715,175 @@ class TestO3Hands(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
+#  О4 — СЛЕД ЖИЗНИ НАРУЖУ. ТЕСТ В ОБЕ СТОРОНЫ: ЖИВ БЕЗ ЗАДАЧ → МОЛЧАНИЕ; НЕ ДАЁТ ОБОРОТА → ЗВУЧИТ
+# ══════════════════════════════════════════════════════════════════════════════════════════
+LEDGER_LIVE = ('{"ts": "2026-08-13T13:26:15.579101+00:00", "line": "NOTE 2026-08-13 13:26 UTC: '
+               'Orchestrator: ревизор: 1 окон, чисто"}')      # ДОСЛОВНО из cowork_log.ledger
+
+
+def lfacts(trace_age=7 * 3600.0, hb_age=354.0, trace_ok=True, attempt=None, busy=None,
+           silence=None, now=NOW):
+    """Факты с наполненной веткой О4: возраст ПОСЛЕДНЕГО следа наружу + всё, чем доказывают оборот."""
+    f = facts(hb=hb_at(hb_age, now), busy=busy, silence=silence, now=now)
+    f["trace"] = {"ok": trace_ok, "ts": (now - trace_age) if trace_ok else None,
+                  "line": "NOTE Orchestrator: ревизор: 1 окон, чисто", "attempt": attempt,
+                  "err": "" if trace_ok else "FileNotFoundError: реестра следов нет"}
+    return f
+
+
+class TestO4LifeTrace(unittest.TestCase):
+    """Предмет О4 — ПРОДУКТ ЖИЗНИ, а не наличие работы. Тишина по бездействию обязана отличаться
+    от тишины по отказу, и различает их ровно пульс."""
+
+    def setUp(self):
+        self.cfg = ex.config({})
+
+    def test_threshold_is_the_measured_six_hours(self):
+        self.assertEqual((self.cfg["life"], self.cfg["life_retry"]), (21600.0, 1800.0))
+        # Замок выбора: ДВА полных окна пульса обязаны уместиться в измеренные 16 ч серверного О4.
+        self.assertLessEqual(2 * self.cfg["life"], 16 * 3600.0)
+
+    def test_alive_without_tasks_leaves_a_trace(self):
+        """ПЕРВАЯ СТОРОНА: ПК жив, задач нет 7 часов → пульс уходит, и серверное О4 молчит."""
+        f = lfacts()
+        self.assertEqual(ex.life_state(f, self.cfg, NOW)[0], ex.LIFE_PROVEN)
+        due, info = ex.pulse_due(f, self.cfg, NOW)
+        self.assertTrue(due)
+        line = ex.render_pulse(info)
+        self.assertTrue(line.startswith("NOTE "), "тип не опознан → писатель сделает из пульса DONE")
+        self.assertIn("контур жив", line)
+        self.assertIn("след ЖИЗНИ, а не отчёт о работе", line)
+        self.assertLessEqual(len(line), 600, "длиннее LINE_MAX — писатель вынесет тело файлом")
+        # И при этом О4 не завела ни одного НОВОГО нарушения: вердикт остался про О1–О3.
+        self.assertEqual(ex.verdict(f, self.cfg), [])
+        self.assertEqual(ex.KINDS, ("o1_pc_new", "o1_pc_run", "o2_pc_turn", "o3_pc_moderbot"))
+
+    def test_dead_contour_stays_silent_so_the_server_can_speak(self):
+        """ВТОРАЯ СТОРОНА: оборота нет (демон встал) → пульса НЕТ, и серверное О4 звучит честно.
+        Это главный кейс: пульс «на всякий случай» отнял бы у него зубы."""
+        f = lfacts(hb_age=99999.0, silence={"measured": True, "awake": 99999.0, "why": ""})
+        self.assertEqual(ex.life_state(f, self.cfg, NOW)[0], ex.LIFE_UNKNOWN)
+        due, info = ex.pulse_due(f, self.cfg, NOW)
+        self.assertFalse(due)
+        self.assertIn("наружу говорить нечего", info["why"])
+        # А О2 при этом говорит по существу — молчание О4 не отнимает заметку у владельца.
+        self.assertEqual([v["kind"] for v in ex.verdict(f, self.cfg)], ["o2_pc_turn"])
+
+    def test_declared_pass_is_work_for_o2_but_not_a_proof_for_o4(self):
+        """Ветка «оправдано объявленным заходом» законна для О2 и ЗАПРЕЩЕНА для О4: штамп
+        доказывает, что демон объявил заход, а не что он замкнул виток."""
+        busy = {"task": "507", "since": NOW - 600.0, "limit": ex.TASK_TIMEOUT_SEC}
+        f = lfacts(hb_age=1800.0, busy=busy,
+                   silence={"measured": True, "awake": 1800.0, "why": ""})
+        self.assertEqual(ex.turn_state(f, self.cfg, NOW)[0], ex.TURN_OK)      # О2 — работа
+        self.assertEqual(ex.life_state(f, self.cfg, NOW)[0], ex.LIFE_UNKNOWN)  # О4 — не доказано
+        self.assertFalse(ex.pulse_due(f, self.cfg, NOW)[0])
+
+    def test_every_hole_in_the_facts_is_unknown_and_never_a_pulse(self):
+        """ЗАМОК ПРОТИВ ЛОЖНОГО ЗЕЛЁНОГО: ни одна дырка не даёт пульса, и у каждой своя причина."""
+        holes = [
+            ("heartbeat не прочитан", facts(hb_ok=True, hb="")),
+            ("время в heartbeat не разобрано", facts(hb="мусор")),
+            ("тишина не измерена", facts(hb=hb_at(99999.0),
+                                         silence={"measured": False, "why": "часов нет"})),
+        ]
+        for name, base in holes:
+            base["trace"] = {"ok": True, "ts": NOW - 7 * 3600.0, "attempt": None, "err": ""}
+            if not base["heartbeat"]["raw"]:
+                base["heartbeat"]["ok"] = False
+            with self.subTest(name):
+                self.assertEqual(ex.life_state(base, self.cfg, NOW)[0], ex.LIFE_UNKNOWN)
+                self.assertFalse(ex.pulse_due(base, self.cfg, NOW)[0])
+        # Реестр следов не прочитан — тоже молчание: не зная возраста следа, пульс пришлось бы
+        # слать каждый тик. Причина названа, а не схлопнута в «следов нет».
+        f = lfacts(trace_ok=False)
+        due, info = ex.pulse_due(f, self.cfg, NOW)
+        self.assertFalse(due)
+        self.assertIn("реестр следов не прочитан", info["why"])
+
+    def test_fresh_trace_needs_no_pulse(self):
+        """Работа уже оставила след — дублировать его пульсом значит делать из журнала кардиограмму."""
+        due, info = ex.pulse_due(lfacts(trace_age=600.0), self.cfg, NOW)
+        self.assertFalse(due)
+        self.assertIn("след свежий", info["why"])
+
+    def test_retry_floor_holds_the_channel(self):
+        """Пол повтора: попытка 5 минут назад молчит, 40 минут назад — говорит."""
+        self.assertFalse(ex.pulse_due(lfacts(attempt=NOW - 300.0), self.cfg, NOW)[0])
+        self.assertTrue(ex.pulse_due(lfacts(attempt=NOW - 2400.0), self.cfg, NOW)[0])
+
+    def test_sleep_of_the_machine_is_named_in_the_pulse(self):
+        """Машина спала: оборот стар по стенным часам, но свеж по бодрствованию. Пульс уходит и
+        НАЗЫВАЕТ сон — иначе «оборот 9 ч назад» читалось бы как поломка."""
+        f = lfacts(hb_age=32381.0, silence={"measured": True, "awake": 300.0, "why": ""})
+        due, info = ex.pulse_due(f, self.cfg, NOW)
+        self.assertTrue(due)
+        self.assertIn("сон машины", ex.render_pulse(info))
+
+    def test_zero_kills_the_branch_before_any_fact_is_read(self):
+        cfg0 = ex.config({"EXPECT_PC_LIFE_MIN": "0"})
+        self.assertEqual(ex.life_state(lfacts(), cfg0, NOW)[0], ex.LIFE_UNKNOWN)
+        self.assertFalse(ex.pulse_due(lfacts(), cfg0, NOW)[0])
+        # А выключенное О2 забирает у О4 ДОКАЗАТЕЛЬСТВО — и это тоже молчание, а не «жив».
+        cfg_turn0 = ex.config({"EXPECT_PC_TURN_MIN": "0"})
+        self.assertEqual(ex.life_state(lfacts(), cfg_turn0, NOW)[0], ex.LIFE_UNKNOWN)
+
+
+class TestO4Hands(unittest.TestCase):
+    """Руки О4: живой формат реестра, отметка попытки, сухой прогон канала не трогает."""
+
+    def setUp(self):
+        self.cfg = ex.config({})
+        self.dir = tempfile.mkdtemp(prefix="expect_pc_led_")
+
+    def _ledger(self, *raw):
+        p = os.path.join(self.dir, "cowork_log.ledger")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("\n".join(raw) + "\n")
+        return p
+
+    def test_reads_the_live_ledger_line(self):
+        """Формат снят с прода дословно: последняя разобранная отметка — и есть последний след."""
+        t = run_mod.trace_facts(self._ledger('{"ts": "2026-08-01T00:00:00+00:00", "line": "старая"}',
+                                             LEDGER_LIVE))
+        self.assertTrue(t["ok"])
+        self.assertEqual(t["ts"], ex.parse_iso("2026-08-13T13:26:15.579101+00:00"))
+
+    def test_zero_by_nonparse_is_never_silent(self):
+        """НУЛЬ ПО НЕРАЗБОРУ: файл есть, но ни одной отметки времени — это ok=False с причиной,
+        а не «следов нет» (последнее означало бы «пора пульсовать» и врало бы наружу каждый тик)."""
+        t = run_mod.trace_facts(self._ledger("не json", '{"line": "без ts"}'))
+        self.assertFalse(t["ok"])
+        self.assertIn("ни одной разобранной отметки", t["err"])
+        self.assertFalse(run_mod.trace_facts(os.path.join(self.dir, "нет.ledger"))["ok"])
+
+    def test_attempt_is_marked_even_when_the_write_failed(self):
+        """Отличие от заметки: провальная попытка ПОМЕЧАЕТСЯ. Иначе лежащий мост получал бы пульс
+        каждые 10 минут, а в журнал сыпался бы мусор."""
+        st, sent = {}, []
+        got, _ = run_mod.maybe_pulse(st, lfacts(), self.cfg, NOW,
+                                     lambda line: sent.append(line) or False)
+        self.assertEqual((got, len(sent)), ("не ушёл", 1))
+        self.assertEqual(st["life"]["attempt"], NOW)
+        self.assertFalse(st["life"]["ok"])
+        # И следующий прогон в пределах пола повтора канал уже не трогает.
+        got2, why = run_mod.maybe_pulse(st, lfacts(attempt=st["life"]["attempt"], now=NOW + 300.0),
+                                        self.cfg, NOW + 300.0, lambda line: sent.append(line))
+        self.assertIsNone(got2)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("пол повтора", why)
+
+    def test_dry_run_never_touches_the_channel(self):
+        """Сухой прогон: решение считается, канал молчит — то же правило, что у заметок."""
+        sent = []
+        out = run_mod.run(dry=True, now=NOW, getter=lambda st: {"ok": True, "items": []},
+                          notifier=lambda t: sent.append(t),
+                          pulser=lambda line: sent.append(line))
+        self.assertEqual(sent, [])
+        self.assertIn("life", out)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
 #  ИНВАРИАНТ EXPECT_PC_PURE — граница держится отсутствием инструментов, а не докстрингом
 #  (зеркало CARD_DUTY_PURE этой полосы и EXPECTATIONS_PURE серверной)
 # ══════════════════════════════════════════════════════════════════════════════════════════

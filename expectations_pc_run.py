@@ -10,14 +10,21 @@ TTL подтверждения `process_approval_timeouts`, сторож зас�
 живут ВНУТРИ `poll_once`, то есть внутри того самого оборота, чьё отсутствие и есть предмет О2.
 Демон, переставший крутиться, не судит себя ни одной из этих веток; наблюдатель обязан быть вне.
 
-ПЯТЬ ИСТОЧНИКОВ ФАКТОВ, КАЖДЫЙ ПЕРЕЖИВАЕТ СМЕРТЬ СВОЕГО ПРЕДМЕТА:
+ШЕСТЬ ИСТОЧНИКОВ ФАКТОВ, КАЖДЫЙ ПЕРЕЖИВАЕТ СМЕРТЬ СВОЕГО ПРЕДМЕТА:
   очередь   — GET моста (`get_pending` по открытым статусам, полоса pc). ТОЛЬКО чтение;
   оборот    — файл `pc_orchestrator.heartbeat`, который демон пишет ПОСЛЕДНЕЙ строкой poll_once;
   занятость — `pc_orchestrator.task_started.json`: отметка CLAIM на диске (объявленный заход);
   модербот  — mtime `moderation_ipc.db` (ПРОДУКТ его пятисекундного тика) плюс проба процесса по
               `moderation_bot.lock`. База НЕ ОТКРЫВАЕТСЯ: `os.stat`, ни sqlite, ни запроса —
               наблюдатель не смеет соперничать с боевым писателем за замок файла;
-  часы      — QueryUnbiasedInterruptTime: время БОДРСТВОВАНИЯ машины (сон в него не идёт).
+  часы      — QueryUnbiasedInterruptTime: время БОДРСТВОВАНИЯ машины (сон в него не идёт);
+  след      — О4: реестр `cowork_log.ledger` (отметка КАЖДОЙ строки, дошедшей до мозга) — тот
+              самый поток, чей возраст меряет серверное О4. Только чтение хвоста файла.
+
+ГРАНИЦА О4 ОТДЕЛЬНОЙ СТРОКОЙ: у этой ветки есть КАНАЛ (пульс в журнал), но нет ЗУБОВ. Она ничего
+не перезапускает, очередь не трогает и владельцу не пишет вовсе — молчание пульса адресовано
+наблюдателю ВНЕ машины. Пульс уходит ТОЛЬКО при доказанном обороте: «неизвестно» его не пишет
+никогда, иначе пульс отнял бы у серверного О4 зубы ровно там, где нужнее всего правда.
 
 ГДЕ СТОИТ САМ НАБЛЮДАТЕЛЬ И ПОЧЕМУ ЭТО ВАЖНО ДЛЯ О3. Задача Планировщика `TurboBabyExpectPC`,
 каждые 10 минут, под SYSTEM, отдельным процессом — то есть ВНЕ всех трёх наблюдаемых. Модербот
@@ -40,8 +47,9 @@ FAIL-SAFE: любой сбой сбора → факта нет → вердик
 помечен, скажем на следующем прогоне.
 
 ОТКАТ: порог соответствующей ветки = 0 в окружении (EXPECT_PC_NEW_MIN / EXPECT_PC_RUN_MIN /
-EXPECT_PC_TURN_MIN / EXPECT_PC_MOD_MIN) — ветка мертва целиком; полностью — снять задачу
-Планировщика наблюдателя.
+EXPECT_PC_TURN_MIN / EXPECT_PC_MOD_MIN / EXPECT_PC_LIFE_MIN) — ветка мертва целиком; полностью —
+снять задачу Планировщика наблюдателя. У О4 откат стоит ЛИШНЕЙ строки в мозге раз в 6 часов и
+возвращает серверное О4 к прежнему признаку «след работы», то есть к 4 ложным эпизодам за 11 суток.
 
 ЗАПУСК:
     venv\\Scripts\\python.exe expectations_pc_run.py            # боевой прогон (заметки уходят)
@@ -64,6 +72,10 @@ HEARTBEAT_FILE = os.path.join(REPO, "pc_orchestrator.heartbeat")
 TASK_START_FILE = os.path.join(REPO, "pc_orchestrator.task_started.json")
 MOD_IPC_FILE = os.path.join(REPO, "moderation_ipc.db")        # О3: ПРОДУКТ тика, читаем только stat
 MOD_LOCK_FILE = os.path.join(REPO, "moderation_bot.lock")     # О3: чей это продукт (номер процесса)
+# О4: реестр УСПЕШНО ушедших строк журнала (`cowork_log_append.ledger_add`) — ровно то, что
+# серверное О4 видит как «след с ПК». Читаем ХВОСТ файла: кольцо на 500 строк, а нужна последняя.
+LEDGER_FILE = os.path.join(REPO, "cowork_log.ledger")
+LEDGER_TAIL_BYTES = 65536
 STATE_DIR = os.path.join(REPO, "tmp", "expect_pc")     # СВОЙ каталог: файлы демона не трогаем
 STATE_FILE = "state.json"
 STATE_KEEP = 32
@@ -122,6 +134,54 @@ def heartbeat_facts(path=None):
     if not raw:
         return {"ok": False, "raw": "", "err": "файл heartbeat пуст"}
     return {"ok": True, "raw": raw, "err": ""}
+
+
+def trace_facts(path=None, attempt=None):
+    """ПОСЛЕДНИЙ след полосы наружу → {"ok","ts","line","attempt","err"} (факт О4).
+
+    ИСТОЧНИК ВЫБРАН НЕ ПО УДОБСТВУ: реестр `cowork_log.ledger` — это отметка каждой строки,
+    которая ДОШЛА до мозга (пишет её сам `cowork_log_append` после успеха), то есть ровно тот
+    поток, чей возраст меряет серверное О4. Спул провалившихся сюда не входит намеренно: строка,
+    не дошедшая до мозга, следом снаружи не является.
+
+    Пульс, ушедший отсюда, попадает в тот же реестр (его пишет процесс писателя), поэтому
+    отдельного счётчика «когда пульсовали» не нужно — успех виден тем же фактом, что и работа.
+
+    НУЛЬ ПО НЕРАЗБОРУ ЗДЕСЬ ЗАПРЕЩЁН: «файла нет», «ни одна строка не разобрана» и «последний
+    след стар» — три разные новости, и первые две отдают ok=False с названной причиной, а не
+    молчаливое «следов нет» (оно означало бы «пора пульсовать» и врало бы наружу каждый тик)."""
+    p = path or LEDGER_FILE
+    try:
+        with open(p, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - LEDGER_TAIL_BYTES))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError as e:
+        return {"ok": False, "ts": None, "line": "", "attempt": attempt,
+                "err": "%s: %s" % (type(e).__name__, str(e)[:80])}
+    lines = [x for x in tail.splitlines() if x.strip()]
+    if size > LEDGER_TAIL_BYTES and lines:
+        lines = lines[1:]                       # первая строка хвоста обрезана серединой — не наша
+    bad = 0
+    for raw in reversed(lines):
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            bad += 1                            # битая строка реестра — считаем и идём дальше
+            continue
+        if not isinstance(rec, dict):
+            bad += 1
+            continue
+        ts = ex.parse_iso(rec.get("ts"))
+        if ts:
+            note = rec.get("line")
+            return {"ok": True, "ts": ts, "attempt": attempt, "err": "",
+                    "line": note[:120] if isinstance(note, str) else ""}
+        bad += 1
+    return {"ok": False, "ts": None, "line": "", "attempt": attempt,
+            "err": "реестр следов есть (%d строк в хвосте), но ни одной разобранной отметки "
+                   "времени в нём нет (не разобрано %d)" % (len(lines), bad)}
 
 
 # ═══════════════════ ПРОБА ПРОЦЕССА: ПРАВО СПРОСИТЬ, А НЕ ТРОНУТЬ ══════════════════════════
@@ -437,6 +497,7 @@ def snapshot(state, now=None, getter=None):
     hb = heartbeat_facts()
     mod = moderbot_facts()
     awake = awake_seconds()
+    life = state.get("life") if isinstance(state.get("life"), dict) else {}
     return {
         "now": now,
         "queue": queue_facts(getter),
@@ -445,6 +506,10 @@ def snapshot(state, now=None, getter=None):
         "busy": busy_facts(),
         "moderbot": mod,
         "mod_silence": update_mod_silence(state, mod, awake, now),
+        # О4: когда полоса в последний раз оставила след наружу и когда МЫ в последний раз пытались
+        # его оставить. Вторая половина — пол повтора: спавн писателя докладывает о старте, а не
+        # об успехе, и без неё провал моста стучался бы в него каждые десять минут.
+        "trace": trace_facts(attempt=life.get("attempt")),
     }
 
 
@@ -460,7 +525,44 @@ def send_note(text):
         return False
 
 
-def run(dry=False, now=None, getter=None, notifier=None):
+def send_pulse(line):
+    """След жизни — строкой в журнал, ЕДИНСТВЕННОЙ легальной дорогой записи с ПК.
+
+    Канал взят готовый (`dispatch_notify._cowork`) и по трём причинам, каждая — закрытый класс:
+    секреты берёт САМ процесс писателя (наблюдатель их не видит и не читает); спавн отделённый и
+    без окна (класс «мигающие чёрные окна» 22.07); строка проходит через `cowork_log_append`, то
+    есть получает штамп, разбор типа и вынос длинного тела по `LINE_MAX`.
+
+    → True = процесс записи ЗАПУЩЕН, а не «запись подтверждена». Подтверждает её следующий прогон
+    тем же фактом, которым меряет тишину: отметкой в реестре следов. Поэтому ответ False здесь не
+    трагедия — попытка записана, пол повтора соблюдён, а до серверного порога ещё 10 часов."""
+    try:
+        import dispatch_notify
+        return bool(dispatch_notify._cowork(line))
+    except Exception as e:                                            # noqa: BLE001
+        print("пульс не ушёл (%s)" % e, file=sys.stderr)
+        return False
+
+
+def maybe_pulse(state, facts, cfg, now, pulser=None):
+    """О4, руки: оставить наружу след жизни, если он ДОЛЖЕН быть оставлен. → (что вышло, почему).
+
+    ОТЛИЧИЕ ОТ ЗАМЕТКИ, И ОНО СОЗНАТЕЛЬНОЕ. Незашедшая заметка НЕ помечается — эпизод остаётся
+    открытым и на следующем прогоне повторяется. Здесь наоборот: попытка помечается ВСЕГДА, даже
+    провальная. Причина — цена ошибки в другую сторону: заметка повторится через 10 минут и это
+    правильно, а пульс, повторяемый каждые 10 минут при лежащем мосте, — долбёжка канала и мусор
+    в журнале. Пол повтора в 30 минут оставляет до серверного порога ещё два десятка попыток."""
+    due, info = ex.pulse_due(facts, cfg, now)
+    if not due:
+        return None, info.get("why", "")
+    line = ex.render_pulse(info, LANE_LABEL)
+    ok = bool((pulser or send_pulse)(line))
+    state["life"] = {"attempt": now, "ok": ok, "silence": info.get("silence"),
+                     "line": line[:160]}
+    return ("ушёл" if ok else "не ушёл"), info.get("why", "")
+
+
+def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
     """Один прогон яруса 2. → словарь итога (для теста, лога и ручной проверки)."""
     now = time.time() if now is None else float(now)
     cfg = ex.config(os.environ)
@@ -503,6 +605,25 @@ def run(dry=False, now=None, getter=None, notifier=None):
         open_eps[key] = {"first": now, "kind": v.get("kind")}
         out["notes"].append(key)
 
+    # 3. О4 — СЛЕД ЖИЗНИ НАРУЖУ. Не заметка и не вердикт: строка журнала для наблюдателя ВНЕ
+    #    машины. Сухой прогон её не пишет — как и всё прочее, что уходит в канал.
+    #    Сбой этой ветки гасится в НЕЁ САМУ и НАЗЫВАЕТСЯ: О4 заведена позже трёх остальных и не
+    #    вправе стоить владельцу ни заметки О1–О3 (они уже ушли выше), ни сохранения счётчиков
+    #    тишины (оно ниже). Молчаливого `pass` здесь нет — причина едет в итог прогона.
+    out["life"], out["pulse"], out["pulse_why"] = ex.LIFE_UNKNOWN, None, ""
+    try:
+        lstate, linfo = ex.life_state(facts, cfg, now)
+        out["life"] = lstate
+        out["life_why"] = linfo.get("why", "")
+        if dry:
+            due, pinfo = ex.pulse_due(facts, cfg, now)
+            out["pulse"] = "нужен (сухой прогон — не пишем)" if due else None
+            out["pulse_why"] = pinfo.get("why", "")
+        else:
+            out["pulse"], out["pulse_why"] = maybe_pulse(st, facts, cfg, now, pulser)
+    except Exception as e:                                            # noqa: BLE001
+        out["pulse_why"] = "ветка О4 сорвалась (%s: %.60s)" % (type(e).__name__, e)
+
     if not dry:
         st["open"] = dict(list(open_eps.items())[-STATE_KEEP:])
         save_state(st)
@@ -524,6 +645,11 @@ def main():
               % (out["queue"], out["turn"], (" (%s)" % why) if why else ""))
         print("модербот (работа, не жизнь): %s%s"
               % (out["moderbot"], (" (%s)" % out["mod_why"]) if out["mod_why"] else ""))
+        # След жизни печатается ПАРОЙ «оборот доказан / что с пульсом»: без второй половины
+        # «доказан» читалось бы как «наружу сказано», а это разные вещи.
+        print("след жизни наружу (О4): %s · пульс: %s%s"
+              % (out.get("life"), out.get("pulse") or "не нужен",
+                 (" (%s)" % out.get("pulse_why")) if out.get("pulse_why") else ""))
         print("нарушений: %d %s" % (out["verdicts"], out["notes"]))
         return 0
     print(json.dumps(out, ensure_ascii=False))
