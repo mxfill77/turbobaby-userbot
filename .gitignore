@@ -69,6 +69,8 @@ fetch_delivery.py
 # состояние детектора немоты сессий (runtime: какие сессии уже отсигналены — session_watch.py)
 pc_session_watch.state.json
 pc_session_watch.state.json.tmp
+queue_snapshot_pc.state.json
+queue_snapshot_pc.state.json.tmp
 
 # ...то же для голден-фикстур ЛОГОВ: *.log выше игнорится целиком, но фикстура обязана ехать
 # в репозиторий вместе с тестом (правило-класс «мок обязан копировать живой формат»)
