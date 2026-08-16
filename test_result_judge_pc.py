@@ -723,5 +723,215 @@ class TestJudgeShape(_Fixture):
             self.assertTrue(got[rj.DETAIL], "молчаливое «не знаю»: %s" % ref)
 
 
+# ═════════════════════════ ТЕНЬ ЦЕПОЧКИ: ЧЕТЫРЕ ЗАМКА ЗАХОДА ═════════════════════════════════
+# Порядок тот же, что и у судьи шага: отрицательный тест ПЕРВЫМ, различающая сила второй,
+# «тень не влияет на ход» третьим, форма записи последней.
+
+class _Chain(_Fixture):
+    """Утварь для цепочек: ряды очереди собираются В ЖИВОМ ФОРМАТЕ МОСТА (снят пробой 14.08,
+    `test_queue_snapshot_pc`), адрес едет КАНОНОМ в `task_text` — тем же маркером, каким его
+    пишет `_loc_release`. Идеализированной схемы «как удобно тесту» здесь нет."""
+
+    def _row(self, tid, text="дело", ref="", status="done"):
+        body = (rr.prefix(ref) + text) if ref else text
+        return {"id": str(tid), "created": "2026-08-14T15:30:22.664Z", "from": "Filipp-pcloc-dec",
+                "task_text": body, "status": status, "result": "итог", "approved_by": "",
+                "updated": "2026-08-14T15:41:02.010Z", "lane": "pc"}
+
+    def _step(self, tid, i, n, pid, ref="", status="done"):
+        return self._row(tid, "[шаг %d/%d родитель %d] дело" % (i, n, pid), ref, status)
+
+
+class TestChainShadowNegativeFirst(_Chain):
+    """ГЛАВНЫЙ замок захода, прогнан первым. Цепочка, чей КОРНЕВОЙ АДРЕС УКАЗЫВАЕТ В ПУСТОТУ,
+    обязана дать теневое НЕ ДОКАЗАН — ПРИ ЖИВОМ ЗЕЛЁНОМ НАСТОЯЩЕМ. Позеленела хоть одна —
+    правило выродилось, и это видно числом, а не рассуждением."""
+
+    def _void_cases(self):
+        """Корневой адрес НАЗВАН и ведёт в пустоту. Настоящий исход у всех — ЗЕЛЁНЫЙ."""
+        self._db()
+        self._file("пусто.md", "")
+        return [
+            ("файла по адресу нет", "file нет-такого-файла.md"),
+            ("файл есть, но ПУСТ", "file пусто.md"),
+            ("строки по условию нет", "row fixture.db:drafts:9999"),
+            ("хеша нет в origin/main", "commit " + ABSENT_HASH),
+        ]
+
+    def test_root_pointing_into_the_void_is_disproven_while_the_real_is_green(self):
+        green = 0
+        wrong = []
+        for name, ref in self._void_cases():
+            ctx = self._ctx(run_git=self._git_says({
+                ("rev-parse", "--verify", "--quiet", ABSENT_HASH + "^{commit}"): (1, ""),
+            }))
+            got = rj.chain_shadow(self._row(4, ref=ref),
+                                  [self._step(7, 1, 2, 4), self._step(8, 2, 2, 4)], ctx)
+            if got["verdict"] == rj.PROVEN:
+                green += 1
+            if got["verdict"] != rj.DISPROVEN:
+                wrong.append("%s → %s" % (name, got["verdict"]))
+            # настоящий ЖИВОЙ ЗЕЛЁНЫЙ: тень обязана назвать разрыв, а не подпеть
+            self.assertEqual(rj.shadow_diff(True, got["verdict"]), rj.STRICTER, name)
+        self.assertEqual(green, 0, "ПОЗЕЛЕНЕЛО пустых корней: %d — правило выродилось" % green)
+        self.assertEqual(wrong, [], "не НЕ ДОКАЗАН: %s" % "; ".join(wrong))
+
+    def test_the_void_set_is_enumerable(self):
+        """Числа замка уходят в артефакт и журнал — набор обязан быть перечислимым."""
+        self.assertEqual(len(self._void_cases()), 4)
+
+    def test_root_without_an_address_is_unknown_for_the_whole_chain(self):
+        """Корень молчит → НЕИЗВЕСТНО про всю цепочку. Это НЕ «в порядке» и НЕ «не доказан»."""
+        got = rj.chain_shadow(self._row(4), [self._step(7, 1, 1, 4)], self._ctx())
+        self.assertEqual(got["verdict"], rj.UNKNOWN)
+        self.assertIn("адрес не назван", got["detail"])
+
+
+class TestChainShadowDiscriminatingPower(_Chain):
+    """РАЗЛИЧАЮЩАЯ СИЛА: порча ОДНОГО ЗНАКА в КОРНЕВОМ адресе переворачивает вердикт всей
+    цепочки. Тень, у которой доказанное остаётся доказанным при испорченном корне, не читает
+    назад, а поддакивает."""
+
+    def _green_chain(self, ref):
+        return rj.chain_shadow(self._row(4, ref=ref),
+                               [self._step(7, 1, 2, 4), self._step(8, 2, 2, 4)], self._ctx())
+
+    def test_one_char_in_the_root_pointer_flips_the_whole_chain(self):
+        self._file("есть.md", "тело")
+        self.assertEqual(self._green_chain("file есть.md")["verdict"], rj.PROVEN)
+        self.assertEqual(self._green_chain("file ecть.md")["verdict"], rj.DISPROVEN)
+
+    def test_one_char_in_a_row_condition_flips_the_whole_chain(self):
+        self._db()
+        self.assertEqual(self._green_chain("row fixture.db:drafts:1278")["verdict"], rj.PROVEN)
+        self.assertEqual(self._green_chain("row fixture.db:drafts:1279")["verdict"], rj.DISPROVEN)
+
+    def test_the_live_windows_path_of_this_lane_is_read_as_the_root(self):
+        """Виндовый путь СВОЕЙ полосы — обязательный случай канона (05e54aa), и у корня тоже."""
+        got = rj.chain_shadow(self._row(4, ref=rr.make("file", WIN_SELF)), (), rj.Ctx(repo=REPO))
+        self.assertEqual(got["verdict"], rj.PROVEN)
+
+    @unittest.skipUnless(HAS_GIT, "origin/main не прочитан — живой коммит недоступен")
+    def test_one_char_in_a_live_commit_flips_the_whole_chain(self):
+        good = rj.chain_shadow(self._row(4, ref="commit " + ORIGIN_MAIN[:12]), (),
+                               rj.Ctx(repo=REPO))
+        self.assertEqual(good["verdict"], rj.PROVEN)
+        spoiled = ORIGIN_MAIN[:11] + ("0" if ORIGIN_MAIN[11] != "0" else "1")
+        bad = rj.chain_shadow(self._row(4, ref="commit " + spoiled), (), rj.Ctx(repo=REPO))
+        self.assertEqual(bad["verdict"], rj.DISPROVEN)
+
+
+class TestStepWithoutAddressDoesNotBreakTheChain(_Chain):
+    """ПРАВИЛО 2 — УСТРОЙСТВОМ, А НЕ ОГОВОРКОЙ. Безадресный шаг в бюллетень не кладётся вовсе;
+    если бы клался, он давал бы НЕИЗВЕСТНО, а НЕИЗВЕСТНО сильнее ДОКАЗАНного — и цепочка с
+    молчащим шагом садилась бы в НЕИЗВЕСТНО навсегда. Контрфакт считается прямо здесь."""
+
+    def test_five_silent_steps_do_not_move_the_chain_off_proven(self):
+        self._file("есть.md", "тело")
+        steps = [self._step(10 + k, k + 1, 5, 4) for k in range(5)]
+        got = rj.chain_shadow(self._row(4, ref="file есть.md"), steps, self._ctx())
+        self.assertEqual(got["verdict"], rj.PROVEN)
+        self.assertEqual(got[rj.MUTED], 5, "молчание обязано быть ВИДНО числом")
+        self.assertEqual(got[rj.VOTED], 1, "в бюллетене только корень")
+        # КОНТРФАКТ: судись молчащие шаги — было бы НЕИЗВЕСТНО, то есть правило выродилось бы
+        self.assertEqual(rj.combine([rj.PROVEN] + [rj.UNKNOWN] * 5), rj.UNKNOWN)
+
+    def test_a_step_with_its_own_address_is_judged_additionally(self):
+        self._file("есть.md", "тело")
+        root = self._row(4, ref="file есть.md")
+        loud = self._step(7, 1, 2, 4, ref="file нет-такого.md")
+        got = rj.chain_shadow(root, [loud, self._step(8, 2, 2, 4)], self._ctx())
+        self.assertEqual(got["verdict"], rj.DISPROVEN, "НЕ ДОКАЗАН шага обязан оборвать цепочку")
+        self.assertEqual(got[rj.VOTED], 2)
+        self.assertEqual(got[rj.MUTED], 1)
+
+    def test_an_unreadable_step_sits_the_chain_in_unknown_not_in_green(self):
+        self._file("есть.md", "тело")
+        got = rj.chain_shadow(self._row(4, ref="file есть.md"),
+                              [self._step(7, 1, 1, 4, ref="brain queue_state_pc §полоса ПК")],
+                              self._ctx())
+        self.assertEqual(got["verdict"], rj.UNKNOWN)
+
+    def test_a_chain_without_steps_at_all_is_judged_by_its_root(self):
+        """Корень БЕЗ шагов — тоже цепочка (единица полосы), и судится своим адресом."""
+        self._file("есть.md", "тело")
+        self.assertEqual(rj.chain_shadow(self._row(4, ref="file есть.md"), (),
+                                         self._ctx())["verdict"], rj.PROVEN)
+        self.assertEqual(rj.chain_shadow(self._row(4, ref="file нет.md"), (),
+                                         self._ctx())["verdict"], rj.DISPROVEN)
+
+
+class TestShadowDoesNotTouchTheRun(_Chain):
+    """ТЕНЬ НЕ ВЛИЯЕТ НА ХОД. Три замка: рядов не мутирует, писателя не имеет, настоящий исход
+    не выводит сам."""
+
+    def test_the_rows_come_out_byte_for_byte_as_they_went_in(self):
+        self._file("есть.md", "тело")
+        root = self._row(4, ref="file есть.md")
+        steps = [self._step(7, 1, 2, 4), self._step(8, 2, 2, 4, ref="file есть.md")]
+        before = repr(root) + "|" + repr(steps)
+        rj.chain_shadow(root, steps, self._ctx())
+        self.assertEqual(repr(root) + "|" + repr(steps), before, "тень поправила ряд очереди")
+
+    def test_a_chain_with_an_unknown_shadow_is_told_nothing_about_moving(self):
+        """Теневое НЕИЗВЕСТНО — это СЛОВО, а не команда: в ответе нет ни статуса очереди, ни
+        имени действия, которым цепь двигают."""
+        got = rj.chain_shadow(self._row(4), [self._step(7, 1, 1, 4)], self._ctx())
+        self.assertEqual(got["verdict"], rj.UNKNOWN)
+        flat = repr(got)
+        for word in ("claim", "complete", "enqueue", "release", "in_progress", "failed"):
+            self.assertNotIn(word, flat, "тень заговорила ходом цепи: %s" % word)
+
+    def test_the_shadow_has_a_named_place_and_no_writer(self):
+        """Место названо одно, а писателя нет: имени `open` в судье не может быть вовсе."""
+        self.assertTrue(rj.SHADOW_LOG.endswith("result_shadow_chain_pc.jsonl"))
+        self.assertEqual(os.path.dirname(rj.SHADOW_LOG), REPO)
+        with open(SRC, encoding="utf-8") as handle:
+            names = [n.id for n in ast.walk(ast.parse(handle.read())) if isinstance(n, ast.Name)]
+        self.assertNotIn("open", names, "у тени завёлся писатель — «только чтение» сломано")
+        self.assertNotIn(rj.SHADOW_LOG, [getattr(rj, n, None) for n in dir(rj)
+                                         if n != "SHADOW_LOG"], "место тени названо дважды")
+
+    def test_the_real_outcome_is_given_from_outside_not_guessed(self):
+        """Судья не знает статусов очереди ни одним литералом — иначе тень толкует чужой слой."""
+        with open(SRC, encoding="utf-8") as handle:
+            src = handle.read()
+        for word in ('"done"', '"failed"', '"in_progress"', '"needs_approval"'):
+            self.assertNotIn(word, src, "статус очереди просочился в судью: %s" % word)
+
+
+class TestShadowRecordShape(_Chain):
+    """ФОРМА ЗАПИСИ: теневой вердикт РЯДОМ с настоящим и разница между ними — в одной строке."""
+
+    def test_all_four_directions_of_the_difference_are_reachable(self):
+        self.assertEqual(rj.shadow_diff(True, rj.PROVEN), rj.SAME)
+        self.assertEqual(rj.shadow_diff(True, rj.UNKNOWN), rj.STRICTER)
+        self.assertEqual(rj.shadow_diff(True, rj.DISPROVEN), rj.STRICTER)
+        self.assertEqual(rj.shadow_diff(False, rj.PROVEN), rj.SOFTER)
+        self.assertEqual(rj.shadow_diff(False, rj.DISPROVEN), rj.SAME)
+        self.assertEqual(rj.shadow_diff(None, rj.PROVEN), rj.NOT_CLOSED)
+
+    def test_the_record_carries_both_verdicts_and_the_difference(self):
+        self._file("есть.md", "тело")
+        shadow = rj.chain_shadow(self._row(4, ref="file есть.md"),
+                                 [self._step(7, 1, 1, 4)], self._ctx())
+        rec = rj.shadow_record(4, True, shadow)
+        self.assertEqual(sorted(rec), ["chain", "detail", "diff", "kind", "muted", "pointer",
+                                       "real", "shadow", "voted"])
+        self.assertEqual(rec[rj.SHADOW], rj.PROVEN)
+        self.assertEqual(rec[rj.REAL], rj.REAL_GREEN)
+        self.assertEqual(rec[rj.DIFF], rj.SAME)
+        self.assertEqual(rec["kind"], "file")
+        self.assertEqual(rec[rj.MUTED], 1)
+        self.assertTrue(rec[rj.DETAIL], "запись обязана ГОВОРИТЬ, чем вердикт получен")
+
+    def test_the_record_says_the_real_word_for_every_tristate(self):
+        shadow = rj.chain_shadow(self._row(4), (), self._ctx())
+        self.assertEqual(rj.shadow_record(4, True, shadow)[rj.REAL], rj.REAL_GREEN)
+        self.assertEqual(rj.shadow_record(4, False, shadow)[rj.REAL], rj.REAL_RED)
+        self.assertEqual(rj.shadow_record(4, None, shadow)[rj.REAL], rj.REAL_OPEN)
+        self.assertEqual(rj.shadow_record(4, None, shadow)[rj.DIFF], rj.NOT_CLOSED)
+
+
 if __name__ == "__main__":
     unittest.main()
