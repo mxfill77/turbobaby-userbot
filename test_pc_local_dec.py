@@ -14,6 +14,7 @@ process_approved/process_approval_timeouts/process_stuck_singles. Без сет�
 Запуск: venv\\Scripts\\python.exe -m unittest test_pc_local_dec -v
 """
 
+import ast
 import datetime
 import os
 import tempfile
@@ -22,7 +23,11 @@ import unittest
 os.environ["LESSON_LLM_ROUTE"] = "0"   # боевой .env-рубильник не течёт в тесты (деплой 334);
                                        # ставим ДО импорта o: load_dotenv(override=False) не перепишет
 
+import gate_selective                 # noqa: E402 — второй читатель маркера шага (селективный гейт)
 import pc_orchestrator as o           # noqa: E402
+import result_ref as rr               # noqa: E402 — ПОЛЕ АДРЕСА РЕЗУЛЬТАТА (заход 16.08.2026)
+
+REPO = os.path.dirname(os.path.abspath(__file__))
 
 
 def now_iso(ago_sec=0):
@@ -124,6 +129,13 @@ class LocBase(unittest.TestCase):
         self._save_lw = o.LESSON_WAIT_STATE
         o.LESSON_WAIT_STATE = os.path.join(tempfile.mkdtemp(), "lesson_waits.json")
         self.addCleanup(lambda: setattr(o, "LESSON_WAIT_STATE", self._save_lw))
+        # ТОТ ЖЕ КЛАСС, ЧТО СПАМ-ЛУП _notify_chain_card, вторым местом (замечен 16.08.2026 по
+        # ResourceWarning «subprocess … is still running»): process_new на КАЖДЫЙ claim спавнит
+        # реальный queue_snapshot_pc.py --tick, а тот идёт в БОЕВОЙ мост и пишет в мозг. Тесты
+        # наружу не стреляют никогда — слепок в тестах замокан (боевого поведения это не меняет).
+        self._save_qs = o._queue_snapshot
+        o._queue_snapshot = lambda why="": None
+        self.addCleanup(lambda: setattr(o, "_queue_snapshot", self._save_qs))
         self.fb = FakeBridge()
         o.bc = self.fb
         o._notify = lambda *a, **k: None
@@ -864,6 +876,188 @@ class TestPriorityOwnerOverRevizor(LocBase):
         news = self.fb.chain_news()
         self.assertEqual(len(news), 1)
         self.assertTrue(news[0]["task_text"].startswith(f"[шаг 2/2 родитель {pid}]"))
+
+
+
+# ═══════ (Ж) ПОЛЕ АДРЕСА РЕЗУЛЬТАТА `result_ref` — ЗАВЕДЕНО ИНЕРТНЫМ (заход 16.08.2026) ═══════
+# ЗАМОК ЗАХОДА, три проверки; красная любая из них означает ОТКАТ, а не подгонку теста:
+#   A. СТАРЫЙ ПУТЬ ЖИВ  — шаг БЕЗ адреса собирается БАЙТ-В-БАЙТ прежней строкой, и цепь
+#      создание→взятие→закрытие идёт как до правки;
+#   B. ПОЛЕ ЖИВЁТ       — записанный адрес читается НАЗАД ИЗ ОЧЕРЕДИ дословно (через
+#      get_pending, а НЕ по возврату функции, которая его писала);
+#   C. ПОЛЕ ИНЕРТНО     — цепь с заведомо ЛОЖНЫМ адресом (по нему НИЧЕГО нет) даёт ТОТ ЖЕ
+#      исход, что цепь без адреса. Исход разошёлся → связь с вердиктом протянута раньше
+#      времени, и правильный ответ — откат.
+
+# Адреса, по которым заведомо ничего нет: нулевой коммит, несуществующий файл в каталоге
+# захода, чужая база, выдуманный узел мозга, несуществующий сервис.
+BOGUS_REFS = (
+    "commit:0000000000000000000000000000000000000000",
+    "file:_scratch_resultref_pc_0816/НЕТ-ТАКОГО-ФАЙЛА.txt",
+    "row:НЕТ-ТАКОЙ-БАЗЫ:0",
+    "brain:узел-которого-нет",
+    "service:НЕТ-ТАКОГО-СЕРВИСА PID 0",
+)
+
+
+class TestResultRefField(LocBase):
+
+    def setUp(self):
+        super().setUp()
+        # Записываем ТЕКСТ, доехавший до исполнителя: без этого отрицательный тест доказывал бы
+        # лишь то, что адрес никуда не записался, — а надо доказать, что он ДОЕХАЛ и не подействовал.
+        self.exec_texts = []
+        inner = o.run_task
+
+        def rec(tid, text, note="", approved=(), approved_object=""):
+            self.exec_texts.append(text)
+            return inner(tid, text, note=note, approved=approved, approved_object=approved_object)
+        o.run_task = rec
+
+    def _last_row(self):
+        return self.fb.rows[max(self.fb.rows)]
+
+    # ---------------------------------- A: старый путь жив ----------------------------------
+
+    def test_A_step_without_address_is_byte_identical_to_the_old_composition(self):
+        """20 сборок (4 набора × 5 способов «адрес не назван») — разница с прежней строкой 0 байт."""
+        pid, checked = 431, 0
+        combos = ((1, 3, "первый шаг", 0), (2, 3, "второй шаг", 0),
+                  (3, 3, "третий шаг", 2), (1, 1, "одиночный шаг цепи", 0))
+        for j, n, txt, k in combos:
+            mark = f"[коррекция плана {k}] " if k else ""
+            was = f"[шаг {j}/{n} родитель {pid}] {mark}{txt}"       # композиция ДО правки, дословно
+            for ref in (rr.EMPTY, "", None, "   ", "__DEFAULT__"):
+                if ref == "__DEFAULT__":
+                    ok = o._loc_release(pid, j, n, txt, k=k)        # вызов вообще без ref
+                else:
+                    ok = o._loc_release(pid, j, n, txt, k=k, ref=ref)
+                self.assertTrue(ok)
+                self.assertEqual(self._last_row()["task_text"], was,
+                                 f"строка шага разошлась с прежней при ref={ref!r}")
+                self.assertEqual(o._loc_step_ref(self._last_row()), rr.EMPTY)
+                checked += 1
+        self.assertEqual(checked, 20)
+
+    def test_A_full_chain_without_addresses_walks_the_old_road(self):
+        """Создание → взятие → закрытие → сводка: 3 шага done, сводка 3/3, адрес не назван нигде."""
+        fp, texts = self._run_chain(None)
+        steps, summ, cards = fp
+        self.assertEqual([(i, n, st) for i, n, st, _r in steps],
+                         [(1, 3, "done"), (2, 3, "done"), (3, 3, "done")])
+        self.assertEqual(len(summ), 1)
+        self.assertIn("3/3 шагов done", summ[0][1])
+        self.assertTrue(all("[result_ref" not in t for t in texts))
+        self.assertEqual(cards, [])
+
+    # ------------------------------- B: поле живёт (чтение назад) ---------------------------
+
+    def test_B_written_address_reads_back_from_the_queue_verbatim(self):
+        """Все ПЯТЬ видов: записали при создании шага — перечитали ряд ИЗ ОЧЕРЕДИ — совпало дословно."""
+        pid = 512
+        cases = (("commit", "a545ad2"),
+                 ("file", "docs/artifacts/2026-08-16-result-ref-pc.md"),
+                 ("row", "moderation_ipc.db:drafts:1278"),
+                 ("brain", "queue_state_pc §полоса ПК"),
+                 ("service", "pc_orchestrator PID 12345 старше HEAD a545ad2"))
+        total = len(cases)
+        for j, (kind, pointer) in enumerate(cases, start=1):
+            val = rr.make(kind, pointer)
+            self.assertTrue(o._loc_release(pid, j, total, f"шаг {j} цепи", ref=val))
+            head = f"[шаг {j}/{total} родитель {pid}]"
+            rows = [it for it in self.fb.get_pending("new")["items"]         # ← ЧТЕНИЕ НАЗАД
+                    if str(it.get("task_text")).startswith(head)]
+            self.assertEqual(len(rows), 1, f"ряд шага {j} в очереди не найден")
+            row = rows[0]
+            self.assertEqual(o._loc_step_ref(row), val, "адрес прочитался назад не дословно")
+            self.assertEqual(rr.parse(o._loc_step_ref(row)), (kind, pointer))
+            # ряд остался разбираемым для ВСЕХ живых читателей маркера шага
+            m = o._STEP_RE.match(row["task_text"])
+            self.assertEqual((int(m.group(1)), int(m.group(2)), int(m.group(3))), (j, total, pid))
+            self.assertEqual(gate_selective.parse_step(row["task_text"]), (True, j, total))
+            self.assertIn(pid, o._loc_group_chains(self.fb.get_pending("new")["items"]))
+            self.assertTrue(row["task_text"].endswith(f"шаг {j} цепи"), "адрес откусил хвост ТЗ")
+
+    def test_B_address_survives_the_correction_marker(self):
+        pid = 513
+        val = rr.make("brain", "orchestrator_plan")
+        self.assertTrue(o._loc_release(pid, 2, 4, "шаг из коррекции", k=1, ref=val))
+        row = self._last_row()
+        self.assertEqual(row["task_text"],
+                         f"[шаг 2/4 родитель {pid}] [коррекция плана 1] [result_ref {val}] шаг из коррекции")
+        self.assertEqual(o._loc_step_ref(row), val)
+
+    # ------------------------------ C: отрицательный тест (инертность) ----------------------
+
+    def _fingerprint(self, pid):
+        """ИСХОД цепи без id и без pid: шаги (номер, всего, статус, result) + сводка + карточки."""
+        steps = []
+        for r in self.fb.steps(pid):
+            m = o._STEP_RE.match(str(r["task_text"]))
+            steps.append((int(m.group(1)), int(m.group(2)), r["status"], str(r["result"])))
+        norm = lambda s: str(s).replace(str(pid), "<pid>")                          # noqa: E731
+        summ = [(r["status"], norm(r["result"])) for r in self.fb.summaries(pid)]
+        cards = [(r["status"], norm(r["result"])) for r in self.fb.cards(pid)]
+        return steps, summ, cards
+
+    def _run_chain(self, refs):
+        """Цепь 1→3 до сводки. refs=None → шаги без адреса; иначе адрес вешается на КАЖДЫЙ шаг
+        (планировщик адресов пока не называет — подменяем ровно точку записи).
+        → (отпечаток исхода, тексты шагов с обезличенным pid)."""
+        orig = o._loc_release
+        if refs is not None:
+            def with_ref(pid, j, total, text, k=0, ref=rr.EMPTY):
+                return orig(pid, j, total, text, k=k, ref=refs[(j - 1) % len(refs)])
+            o._loc_release = with_ref
+        try:
+            pid = self.plan_parent("1. первый\n2. второй\n3. третий")
+            for j in (1, 2, 3):
+                self.exec_step("done", f"RESULT: шаг {j} готов")
+                o.process_local_chains()
+        finally:
+            o._loc_release = orig
+        texts = [str(r["task_text"]).replace(str(pid), "<pid>") for r in self.fb.steps(pid)]
+        return self._fingerprint(pid), texts
+
+    def test_C_a_false_address_changes_nothing_in_the_outcome(self):
+        """ЗАВЕДОМО ЛОЖНЫЙ адрес на каждом шаге — исход цепи совпадает с прогоном без адресов."""
+        plain_fp, plain_texts = self._run_chain(None)
+        marked_fp, marked_texts = self._run_chain(BOGUS_REFS)
+        self.assertEqual(marked_fp, plain_fp,
+                         "ложный адрес изменил ИСХОД шага — связь протянута раньше времени, откатывать")
+        # адрес ДОЕХАЛ до исполнителя (иначе тест доказывал бы лишь, что поле не записалось)
+        with_mark = [t for t in self.exec_texts if "[result_ref " in t]
+        self.assertEqual(len(with_mark), 3, "адрес не доехал до исполнителя ни на одном шаге")
+        # единственная разница строк — сам маркер, байт в байт
+        self.assertEqual(len(marked_texts), len(plain_texts))
+        for j, (was, now) in enumerate(zip(plain_texts, marked_texts), start=1):
+            self.assertEqual(now.replace(rr.prefix(BOGUS_REFS[(j - 1) % len(BOGUS_REFS)]), "", 1),
+                             was, f"шаг {j}: разница строк не сводится к маркеру адреса")
+
+    def test_C_unparsable_address_never_breaks_the_step(self):
+        """Мусор вместо адреса: шаг встаёт в очередь БЕЗ маркера (fail-safe), исход не тронут."""
+        pid = 777
+        for junk in ("мусор без вида", "sheet:строка 7", "commit:", 17):
+            self.assertTrue(o._loc_release(pid, 1, 2, "шаг с мусорным адресом", ref=junk))
+            row = self._last_row()
+            self.assertEqual(row["task_text"], f"[шаг 1/2 родитель {pid}] шаг с мусорным адресом")
+            self.assertEqual(o._loc_step_ref(row), rr.EMPTY)
+
+    def test_C_the_field_is_inert_by_construction_not_by_promise(self):
+        """Инертность держится УСТРОЙСТВОМ: читатель заведён и НЕ ЗВАН ни одной веткой демона,
+        а сам модуль поля используется ровно двумя вызовами — запись (prefix) и чтение (read_item).
+        Красный тест = поле подключили к решению; это отдельное решение владельца, не побочный эффект."""
+        with open(os.path.join(REPO, "pc_orchestrator.py"), encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        called = [n.lineno for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                  and n.func.id == "_loc_step_ref"]
+        self.assertEqual(called, [], "читатель адреса вызван в демоне — поле перестало быть инертным")
+        used = sorted(n.func.attr for n in ast.walk(tree)
+                      if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                      and isinstance(n.func.value, ast.Name) and n.func.value.id == "result_ref")
+        self.assertEqual(used, ["prefix", "read_item"],
+                         "модуль поля зовут не только на запись и чтение")
 
 
 if __name__ == "__main__":
