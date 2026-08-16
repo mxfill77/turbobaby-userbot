@@ -889,14 +889,15 @@ class TestPriorityOwnerOverRevizor(LocBase):
 #      исход, что цепь без адреса. Исход разошёлся → связь с вердиктом протянута раньше
 #      времени, и правильный ответ — откат.
 
-# Адреса, по которым заведомо ничего нет: нулевой коммит, несуществующий файл в каталоге
-# захода, чужая база, выдуманный узел мозга, несуществующий сервис.
+# Адреса, по которым заведомо ничего нет: нулевой коммит, несуществующий файл (ВИНДОВЫМ
+# АБСОЛЮТНЫМ путём — двоеточие диска едет через всю цепь), чужая база, выдуманный узел мозга,
+# несуществующий сервис. Форма — КАНОН Штаба «<вид> <указатель>» (16.08.2026).
 BOGUS_REFS = (
-    "commit:0000000000000000000000000000000000000000",
-    "file:_scratch_resultref_pc_0816/НЕТ-ТАКОГО-ФАЙЛА.txt",
-    "row:НЕТ-ТАКОЙ-БАЗЫ:0",
-    "brain:узел-которого-нет",
-    "service:НЕТ-ТАКОГО-СЕРВИСА PID 0",
+    "commit 0000000000000000000000000000000000000000",
+    "file D:\\turbobaby-bot\\_scratch_refcanon_pc_0816\\НЕТ-ТАКОГО-ФАЙЛА.txt",
+    "row НЕТ-ТАКОЙ-БАЗЫ:0",
+    "brain узел-которого-нет",
+    "service_start НЕТ-ТАКОГО-СЕРВИСА PID 0",
 )
 
 
@@ -953,13 +954,15 @@ class TestResultRefField(LocBase):
     # ------------------------------- B: поле живёт (чтение назад) ---------------------------
 
     def test_B_written_address_reads_back_from_the_queue_verbatim(self):
-        """Все ПЯТЬ видов: записали при создании шага — перечитали ряд ИЗ ОЧЕРЕДИ — совпало дословно."""
+        """Все ПЯТЬ видов канона: записали при создании шага — перечитали ряд ИЗ ОЧЕРЕДИ —
+        совпало дословно. ВИНДОВЫЙ ПУТЬ (двоеточие диска) — обязательный случай захода."""
         pid = 512
         cases = (("commit", "a545ad2"),
-                 ("file", "docs/artifacts/2026-08-16-result-ref-pc.md"),
+                 ("file", r"D:\turbobaby-bot\docs\artifacts\2026-08-16-ref-canon-pc.md"),
+                 ("file", "docs/artifacts/2026-08-16-ref-canon-pc.md"),
                  ("row", "moderation_ipc.db:drafts:1278"),
                  ("brain", "queue_state_pc §полоса ПК"),
-                 ("service", "pc_orchestrator PID 12345 старше HEAD a545ad2"))
+                 ("service_start", "pc_orchestrator PID 12345 старше HEAD a545ad2"))
         total = len(cases)
         for j, (kind, pointer) in enumerate(cases, start=1):
             val = rr.make(kind, pointer)
@@ -984,7 +987,7 @@ class TestResultRefField(LocBase):
         self.assertTrue(o._loc_release(pid, 2, 4, "шаг из коррекции", k=1, ref=val))
         row = self._last_row()
         self.assertEqual(row["task_text"],
-                         f"[шаг 2/4 родитель {pid}] [коррекция плана 1] [result_ref {val}] шаг из коррекции")
+                         f"[шаг 2/4 родитель {pid}] [коррекция плана 1] [result_ref: {val}] шаг из коррекции")
         self.assertEqual(o._loc_step_ref(row), val)
 
     # ------------------------------ C: отрицательный тест (инертность) ----------------------
@@ -1026,7 +1029,7 @@ class TestResultRefField(LocBase):
         self.assertEqual(marked_fp, plain_fp,
                          "ложный адрес изменил ИСХОД шага — связь протянута раньше времени, откатывать")
         # адрес ДОЕХАЛ до исполнителя (иначе тест доказывал бы лишь, что поле не записалось)
-        with_mark = [t for t in self.exec_texts if "[result_ref " in t]
+        with_mark = [t for t in self.exec_texts if "[result_ref: " in t]
         self.assertEqual(len(with_mark), 3, "адрес не доехал до исполнителя ни на одном шаге")
         # единственная разница строк — сам маркер, байт в байт
         self.assertEqual(len(marked_texts), len(plain_texts))
@@ -1035,9 +1038,13 @@ class TestResultRefField(LocBase):
                              was, f"шаг {j}: разница строк не сводится к маркеру адреса")
 
     def test_C_unparsable_address_never_breaks_the_step(self):
-        """Мусор вместо адреса: шаг встаёт в очередь БЕЗ маркера (fail-safe), исход не тронут."""
+        """Мусор вместо адреса: шаг встаёт в очередь БЕЗ маркера (fail-safe), исход не тронут.
+        СНЯТАЯ ФОРМА («<вид>:<указатель>», вид `service`) — здесь же: совместимости с ней нет
+        по замеру (0 писавших вызовов, 0 строк очереди), и отказ обязан быть безобидным."""
         pid = 777
-        for junk in ("мусор без вида", "sheet:строка 7", "commit:", 17):
+        for junk in ("мусор без вида", "sheet строка 7", "commit", 17,
+                     "commit:a545ad2", "service:demon PID 1",
+                     "file:D:\\turbobaby-bot\\result_ref.py"):
             self.assertTrue(o._loc_release(pid, 1, 2, "шаг с мусорным адресом", ref=junk))
             row = self._last_row()
             self.assertEqual(row["task_text"], f"[шаг 1/2 родитель {pid}] шаг с мусорным адресом")
