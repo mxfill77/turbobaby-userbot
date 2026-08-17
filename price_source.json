@@ -49,6 +49,355 @@
     "read_on": "2026-08-17",
     "why_two_classes": "отдельной ручки «надбавка высокого сезона» в системе НЕ СУЩЕСТВУЕТ: это та же глобальная скидка листа с минусом, а полка у скутеров глубже. XADV 750 идёт СКУТЕРОМ — так его ценит лист."
   },
+  "low_season_caps": {
+    "verdict_one_line": "МЕСЯЧНЫЙ ПОТОЛОК СУММЫ. Не потолок цены суток, не предел скидки и не минимальная цена: число сравнивается с СУММОЙ ЗА ВЕСЬ ПЕРИОД и, если сумма его переросла, подменяет ФРАЗУ цены на «аренда от <кап> ฿/мес». Ни лист, ни мост цену им не режут.",
+    "unit": "฿ за месяц (30 суток) за одну единицу техники",
+    "address": "«Календарь бронирования»!Z3:AB15 — шапка Z3 «Модель | Кап ฿/мес | Активен», данные Z4:AB15 (до 12 строк, чтение до первой пустой «Модели»). Блок унесён вправо от рабочего вида 05.07.2026: раньше стоял K3:M15 и мешал менеджеру.",
+    "read_via": "quote_price — единственная дверь моста к листу цен; наружу поля cap_price / cap_active (колонку «Модель» и сам диапазон дверь не отдаёт)",
+    "who_applies": "НИ ЛИСТ, НИ МОСТ. quote_price отдаёт кап ДАННЫМИ — в коде прямо сказано «ЛОГИКИ ПОДМЕНЫ ЦЕНЫ ЗДЕСЬ НЕТ» (QuotePrice.js §КАПЫ-АКЦИИ). Подмену делает клиентский suggest.py → _client_price. Формула этого файла кап НЕ СОДЕРЖИТ: base×season×term остаётся как была, кап — отдельный потолок ПОВЕРХ неё.",
+    "trigger_rule": "cap_active И total(сумма за весь период) > cap_price → вместо дословной J-цены звучит «аренда от <кап> ฿/мес — предложение низкого сезона» (+депозит, +наличие)",
+    "unit_mix_mine": "СРАВНИВАЮТСЯ РАЗНЫЕ ЕДИНИЦЫ: сумма за период против МЕСЯЧНОГО капа. Поэтому фраза начинает звучать раньше месяца — на корпусе низкого сезона условие верно у 42 броней из 180, минимальный срок среди них 18 суток, и у 10 из 42 срок КОРОЧЕ месяца.",
+    "switch": {
+      "where": "колонка AB «Активен» — отдельная ручка у КАЖДОЙ строки",
+      "reads_as_on": "«да» / «yes» / «true» / «1»; пустой или нечисловой кап гасит признак сам",
+      "state_now": "ВКЛЮЧЕНЫ ВСЕ 13 капа из 13 строк (замер 2026-08-17)",
+      "tied_to_period": "НЕТ, НИ ОДНИМ БИТОМ — ИЗМЕРЕНО: тот же запрос на датах ПИКА (10.01.2027-09.02.2027) вернул те же cap_price и cap_active, что запрос низкого сезона, у всех 14 байков (и ту же цену суток — оси месяца у листа нет). Слова владельца «в низкий сезон кепки работают, в высокий снимаются» описывают РАСПИСАНИЕ РУКИ, а не поведение листа или кода.",
+      "history": "НЕ ХРАНИТСЯ. Ни истории, ни журнала правок, ни копии: ручка хранит только «сейчас» (docs/artifacts/2026-08-15-calendar-switches.md §2.4). Каким был признак в июле — узнать нельзя ничем, кроме уже взятых денег.",
+      "toggled_by": "рукой владельца/менеджера: запись — только POST set_caps / toggle_cap моста с confirmed-гейтом. Вызывающих из питона НОЛЬ (греп по репо), автоматики по календарю нет ни одной строкой.",
+      "born": "2026-07-05 — дата появления блока в коде моста (QuotePrice.js)"
+    },
+    "money_check": {
+      "question": "если кепка ограничивает — в низкий сезон обязаны найтись брони, где цена упёрлась в предел и выше не пошла",
+      "corpus": "завершённые брони с 2024-01-01, старт в P1/P2 (низкий сезон) — 194; из них месячных (срок ≥ 28 сут) с активным капом — 41",
+      "verdict": "ДА, ПРЕДЕЛ ВИДЕН В ДЕНЬГАХ — но он не жёсткий",
+      "exact_at_cap": "16 броней из 41 платят РОВНО кап (до бата): NMAX 155 — 12 из 15 по 5000 ฿/мес на сроках 30…120 суток, CB 300 — 9900, XMAX 300 NEW — 9900 (2), XMAX 300 OLD — 8900",
+      "pressed_within_2pct": "21 из 41",
+      "below_cap": "10 из 41 (дешевле предела — предел не мешает)",
+      "above_cap": "10 из 41 (предел НЕ УДЕРЖАЛ: от +4.5% у MT-03 300 до +85.4% у XMAX 300 OLD) — значит кепка не режущее правило, а объявленная цена акции, которую рука соблюдает примерно в половине случаев",
+      "time_border_honest": "ВСЕ прижатые брони СТАРШЕ блока: блок заведён 05.07.2026, а броней низкого сезона со стартом после этой даты в корпусе 3, месячных среди них 0. Значит блок ЗАПИСАЛ уже существовавшую практику месячной цены, а не создал её; приписывать прижатие блоку было бы подгонкой.",
+      "miss_effect": {
+        "low_season_all": "медиана промаха -0.0% → -0.0% (кап меняет цену лишь у 32 из 178)",
+        "low_season_monthly_28d_plus": "-5.2% → -1.1% (n=41): промах уменьшился в 4.7 раза",
+        "how_measured": "к предсказанию файла применено ПРАВИЛО БОТА (pred×дни > кап → цена суток = кап/30). Числа капов при этом НЕ ПОДГОНЯЛИСЬ: взяты с листа как есть."
+      }
+    },
+    "for_consumers_if_ever_connected": "КАП НЕЛЬЗЯ ПРИМЕНЯТЬ ПО КАЛЕНДАРЮ. Он не привязан к периоду и не имеет истории: его положение надо ЧИТАТЬ живым quote_price на момент расчёта. Прошитый «кап в низкий сезон» соврёт в первый же день, когда владелец снимет ручку рукой.",
+    "origin": "СНЯТО ЗАМЕРОМ",
+    "origin_detail": "живое чтение листа через quote_price 2026-08-17 (только GET, 42 запроса, ни одной записи); повод — слова владельца 17.08.2026 «у цен есть кепки низкого сезона, их надо учитывать»",
+    "read_on": "2026-08-17",
+    "completeness": "все 13 моделей живого парка перечислены: с числом — 13 строк (12 моделей, XMAX 300 двумя поколениями), помечено «КЕПКИ НЕТ» — 1. Молчаливых пропусков нет.",
+    "models": [
+      {
+        "model": "XSR 155",
+        "class": "мото",
+        "cap_thb_per_month": 7490,
+        "active": true,
+        "sheet_model": "YAMAHA XSR 155",
+        "cap_row_key": "xsr155",
+        "implied_thb_per_day": 249.7,
+        "day_price_30d_low_season": 276,
+        "cap_vs_computed_30d_pct": -9.5,
+        "money_check": {
+          "n_monthly_low_season": 4,
+          "median_thb_per_month": 6200.0,
+          "min_thb_per_month": 5700.0,
+          "max_thb_per_month": 6700.0,
+          "exact_at_cap": 0,
+          "within_2pct_of_cap": 0,
+          "below_cap_over_2pct": 4,
+          "above_cap_over_2pct": 0
+        },
+        "origin": "СНЯТО ЗАМЕРОМ",
+        "origin_detail": "живое чтение блока «Календарь бронирования»!Z3:AB15 через quote_price (GET); значение и признак «Активен» — как отдал мост",
+        "read_on": "2026-08-17"
+      },
+      {
+        "model": "CB 300",
+        "class": "мото",
+        "cap_thb_per_month": 9900,
+        "active": true,
+        "sheet_model": "HONDA CB 300R",
+        "cap_row_key": "cb300r",
+        "implied_thb_per_day": 330.0,
+        "day_price_30d_low_season": 416,
+        "cap_vs_computed_30d_pct": -20.7,
+        "money_check": {
+          "n_monthly_low_season": 1,
+          "median_thb_per_month": 9900.0,
+          "min_thb_per_month": 9900.0,
+          "max_thb_per_month": 9900.0,
+          "exact_at_cap": 1,
+          "within_2pct_of_cap": 1,
+          "below_cap_over_2pct": 0,
+          "above_cap_over_2pct": 0
+        },
+        "origin": "СНЯТО ЗАМЕРОМ",
+        "origin_detail": "живое чтение блока «Календарь бронирования»!Z3:AB15 через quote_price (GET); значение и признак «Активен» — как отдал мост",
+        "read_on": "2026-08-17"
+      },
+      {
+        "model": "MT-03 300",
+        "class": "мото",
+        "cap_thb_per_month": 10990,
+        "active": true,
+        "sheet_model": "YAMAHA MT-03 300",
+        "cap_row_key": "mt-03",
+        "implied_thb_per_day": 366.3,
+        "day_price_30d_low_season": 510,
+        "cap_vs_computed_30d_pct": -28.2,
+        "money_check": {
+          "n_monthly_low_season": 3,
+          "median_thb_per_month": 12700.0,
+          "min_thb_per_month": 11490.0,
+          "max_thb_per_month": 12900.0,
+          "exact_at_cap": 0,
+          "within_2pct_of_cap": 0,
+          "below_cap_over_2pct": 0,
+          "above_cap_over_2pct": 3
+        },
+        "origin": "СНЯТО ЗАМЕРОМ",
+        "origin_detail": "живое чтение блока «Календарь бронирования»!Z3:AB15 через quote_price (GET); значение и признак «Активен» — как отдал мост",
+        "read_on": "2026-08-17"
+      },
+      {
+        "model": "NINJA 400",
+        "class": "мото",
+        "cap_thb_per_month": 11900,
+        "active": true,
+        "sheet_model": "KAWASAKI NINJA 400",
+        "cap_row_key": "ninja400",
+        "implied_thb_per_day": 396.7,
+        "day_price_30d_low_season": 554,
+        "cap_vs_computed_30d_pct": -28.4,
+        "money_check": {
+          "n_monthly_low_season": 2,
+          "median_thb_per_month": 16500.0,
+          "min_thb_per_month": 12000.0,
+          "max_thb_per_month": 21000.0,
+          "exact_at_cap": 0,
+          "within_2pct_of_cap": 1,
+          "below_cap_over_2pct": 0,
+          "above_cap_over_2pct": 1
+        },
+        "origin": "СНЯТО ЗАМЕРОМ",
+        "origin_detail": "живое чтение блока «Календарь бронирования»!Z3:AB15 через quote_price (GET); значение и признак «Активен» — как отдал мост",
+        "read_on": "2026-08-17"
+      },
+      {
+        "model": "VULCAN 650",
+        "class": "мото",
+        "cap_thb_per_month": 18900,
+        "active": true,
+        "sheet_model": "KAWA VULCAN 650S",
+        "cap_row_key": "vulcan",
+        "implied_thb_per_day": 630.0,
+        "day_price_30d_low_season": 764,
+        "cap_vs_computed_30d_pct": -17.5,
+        "money_check": {
+          "n_monthly_low_season": 0,
+          "note": "месячных броней низкого сезона по этой модели в корпусе нет"
+        },
+        "origin": "СНЯТО ЗАМЕРОМ",
+        "origin_detail": "живое чтение блока «Календарь бронирования»!Z3:AB15 через quote_price (GET); значение и признак «Активен» — как отдал мост",
+        "read_on": "2026-08-17"
+      },
+      {
+        "model": "CBR 650R",
+        "class": "мото",
+        "cap_thb_per_month": 18900,
+        "active": true,
+        "sheet_model": "HONDA CBR 650R",
+        "cap_row_key": "cb650r/cbr650r",
+        "implied_thb_per_day": 630.0,
+        "day_price_30d_low_season": 764,
+        "cap_vs_computed_30d_pct": -17.5,
+        "money_check": {
+          "n_monthly_low_season": 0,
+          "note": "месячных броней низкого сезона по этой модели в корпусе нет"
+        },
+        "origin": "СНЯТО ЗАМЕРОМ",
+        "origin_detail": "живое чтение блока «Календарь бронирования»!Z3:AB15 через quote_price (GET); значение и признак «Активен» — как отдал мост",
+        "read_on": "2026-08-17"
+      },
+      {
+        "model": "CB 650R",
+        "class": "мото",
+        "cap_thb_per_month": 18900,
+        "active": true,
+        "sheet_model": "HONDA CB 650R",
+        "cap_row_key": "cb650r/cbr650r",
+        "implied_thb_per_day": 630.0,
+        "day_price_30d_low_season": 764,
+        "cap_vs_computed_30d_pct": -17.5,
+        "money_check": {
+          "n_monthly_low_season": 0,
+          "note": "месячных броней низкого сезона по этой модели в корпусе нет"
+        },
+        "origin": "СНЯТО ЗАМЕРОМ",
+        "origin_detail": "живое чтение блока «Календарь бронирования»!Z3:AB15 через quote_price (GET); значение и признак «Активен» — как отдал мост",
+        "read_on": "2026-08-17"
+      },
+      {
+        "model": "NMAX 155",
+        "class": "скутер",
+        "cap_thb_per_month": 5000,
+        "active": true,
+        "sheet_model": "YAMAHA NMAX 155",
+        "cap_row_key": "nmax",
+        "implied_thb_per_day": 166.7,
+        "day_price_30d_low_season": 219,
+        "cap_vs_computed_30d_pct": -23.9,
+        "money_check": {
+          "n_monthly_low_season": 15,
+          "median_thb_per_month": 5000.0,
+          "min_thb_per_month": 4000.0,
+          "max_thb_per_month": 5900.0,
+          "exact_at_cap": 12,
+          "within_2pct_of_cap": 12,
+          "below_cap_over_2pct": 2,
+          "above_cap_over_2pct": 1
+        },
+        "origin": "СНЯТО ЗАМЕРОМ",
+        "origin_detail": "живое чтение блока «Календарь бронирования»!Z3:AB15 через quote_price (GET); значение и признак «Активен» — как отдал мост",
+        "read_on": "2026-08-17"
+      },
+      {
+        "model": "FORZA 300",
+        "class": "скутер",
+        "cap_thb_per_month": 7900,
+        "active": true,
+        "sheet_model": "HONDA FORZA 300",
+        "cap_row_key": "forza300",
+        "implied_thb_per_day": 263.3,
+        "day_price_30d_low_season": 337,
+        "cap_vs_computed_30d_pct": -21.9,
+        "money_check": {
+          "n_monthly_low_season": 0,
+          "note": "месячных броней низкого сезона по этой модели в корпусе нет"
+        },
+        "origin": "СНЯТО ЗАМЕРОМ",
+        "origin_detail": "живое чтение блока «Календарь бронирования»!Z3:AB15 через quote_price (GET); значение и признак «Активен» — как отдал мост",
+        "read_on": "2026-08-17"
+      },
+      {
+        "model": "XMAX 300",
+        "class": "скутер",
+        "generation": "2020-2022",
+        "generation_note": "в price_source.json XMAX 300 — ОДНА модель, а в блоке капов ДВЕ строки по поколениям; поколение брони различается словом NEW в имени байка",
+        "cap_thb_per_month": 8900,
+        "active": true,
+        "sheet_model": "YAMAHA XMAX300 2020-2022",
+        "cap_row_key": "xmax old",
+        "implied_thb_per_day": 296.7,
+        "day_price_30d_low_season": 385,
+        "cap_vs_computed_30d_pct": -22.9,
+        "money_check": {
+          "n_monthly_low_season": 5,
+          "median_thb_per_month": 9000.0,
+          "min_thb_per_month": 8000.0,
+          "max_thb_per_month": 16500.0,
+          "exact_at_cap": 1,
+          "within_2pct_of_cap": 3,
+          "below_cap_over_2pct": 1,
+          "above_cap_over_2pct": 1
+        },
+        "origin": "СНЯТО ЗАМЕРОМ",
+        "origin_detail": "живое чтение блока «Календарь бронирования»!Z3:AB15 через quote_price (GET); значение и признак «Активен» — как отдал мост",
+        "read_on": "2026-08-17"
+      },
+      {
+        "model": "XMAX 300",
+        "class": "скутер",
+        "generation": "2023-",
+        "generation_note": "в price_source.json XMAX 300 — ОДНА модель, а в блоке капов ДВЕ строки по поколениям; поколение брони различается словом NEW в имени байка",
+        "cap_thb_per_month": 9900,
+        "active": true,
+        "sheet_model": "YAMAHA XMAX 300 NEW 2023-",
+        "cap_row_key": "xmax new",
+        "implied_thb_per_day": 330.0,
+        "day_price_30d_low_season": 458,
+        "cap_vs_computed_30d_pct": -27.9,
+        "money_check": {
+          "n_monthly_low_season": 7,
+          "median_thb_per_month": 9900.0,
+          "min_thb_per_month": 9000.0,
+          "max_thb_per_month": 15210.0,
+          "exact_at_cap": 2,
+          "within_2pct_of_cap": 3,
+          "below_cap_over_2pct": 2,
+          "above_cap_over_2pct": 2
+        },
+        "origin": "СНЯТО ЗАМЕРОМ",
+        "origin_detail": "живое чтение блока «Календарь бронирования»!Z3:AB15 через quote_price (GET); значение и признак «Активен» — как отдал мост",
+        "read_on": "2026-08-17"
+      },
+      {
+        "model": "ADV 350",
+        "class": "скутер",
+        "cap_thb_per_month": 10900,
+        "active": true,
+        "sheet_model": "HONDA ADV 350",
+        "cap_row_key": "adv350",
+        "implied_thb_per_day": 363.3,
+        "day_price_30d_low_season": 487,
+        "cap_vs_computed_30d_pct": -25.4,
+        "money_check": {
+          "n_monthly_low_season": 3,
+          "median_thb_per_month": 12000.0,
+          "min_thb_per_month": 11000.0,
+          "max_thb_per_month": 12580.6,
+          "exact_at_cap": 0,
+          "within_2pct_of_cap": 1,
+          "below_cap_over_2pct": 0,
+          "above_cap_over_2pct": 2
+        },
+        "origin": "СНЯТО ЗАМЕРОМ",
+        "origin_detail": "живое чтение блока «Календарь бронирования»!Z3:AB15 через quote_price (GET); значение и признак «Активен» — как отдал мост",
+        "read_on": "2026-08-17"
+      },
+      {
+        "model": "XADV 750",
+        "class": "скутер",
+        "cap_thb_per_month": 33900,
+        "active": true,
+        "sheet_model": "HONDA XADV 750",
+        "cap_row_key": "xadv750",
+        "implied_thb_per_day": 1130.0,
+        "day_price_30d_low_season": 1359,
+        "cap_vs_computed_30d_pct": -16.9,
+        "money_check": {
+          "n_monthly_low_season": 1,
+          "median_thb_per_month": 26129.0,
+          "min_thb_per_month": 26129.0,
+          "max_thb_per_month": 26129.0,
+          "exact_at_cap": 0,
+          "within_2pct_of_cap": 0,
+          "below_cap_over_2pct": 1,
+          "above_cap_over_2pct": 0
+        },
+        "origin": "СНЯТО ЗАМЕРОМ",
+        "origin_detail": "живое чтение блока «Календарь бронирования»!Z3:AB15 через quote_price (GET); значение и признак «Активен» — как отдал мост",
+        "read_on": "2026-08-17"
+      },
+      {
+        "model": "CLICK 125",
+        "class": "скутер",
+        "cap_thb_per_month": null,
+        "active": false,
+        "verdict": "КЕПКИ НЕТ",
+        "why": "модель НЕ ПОДКЛЮЧЕНА к блоку капов в коде моста (QuotePrice.js → QUOTE_MODELS: cap = null) — дверь в блок за ней не смотрит вовсе, и мост всегда отдаёт cap_price=null / cap_active=false. Что стои́т в самой строке листа (и есть ли она) — через единственную дверь НЕ СУДИМО.",
+        "money_check": {
+          "n_monthly_low_season": 1,
+          "median_thb_per_month": 3000.0,
+          "min_thb_per_month": 3000.0,
+          "max_thb_per_month": 3000.0
+        },
+        "origin": "СНЯТО ЗАМЕРОМ",
+        "origin_detail": "живая проба quote_price 2026-08-17: cap_price=null, cap_active=false",
+        "read_on": "2026-08-17"
+      }
+    ]
+  },
   "base": {
     "unit": "฿ в сутки",
     "bucket": "приведено к опорной корзине 7-13 суток",
@@ -531,7 +880,15 @@
       "docs/artifacts/2026-08-16-price-table-periods.md (7986594) — периоды и множители",
       "docs/artifacts/2026-08-16-price-table.md (6dd7f42) — поденная кривая сезона",
       "docs/artifacts/2026-08-17-bot-price-source.md (69a6c9f) — повод: бот слеп к сезону",
-      "docs/artifacts/2026-08-17-price-source-file.md — сборка этого файла и четыре замка"
-    ]
+      "docs/artifacts/2026-08-17-price-source-file.md — сборка этого файла и четыре замка",
+      "docs/artifacts/2026-08-17-price-caps.md — кепки низкого сезона: что ограничивают, когда действуют, проверка деньгами"
+    ],
+    "caps_block": {
+      "read_on": "2026-08-17",
+      "door": "quote_price (GET), поля cap_price/cap_active",
+      "requests": 42,
+      "writes": 0,
+      "note": "блок капов достроен ВТОРЫМ заходом того же дня: при сборке файла его не было ни одной строкой, хотя разведка листа 15.08 его видела — пропуск Штаба, названный владельцем 17.08"
+    }
   }
 }
