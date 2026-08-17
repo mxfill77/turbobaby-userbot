@@ -5589,7 +5589,8 @@ _DIRTY_WARNED = {}      # процесс → (коммит, кортеж гря�
 # то есть чинимую сейчас потерю доставки мы бы вернули с другой стороны. Условие оставлено прежним
 # сознательно; ленивая зависимость с незакоммиченной правкой — честный ОСТАТОК, он был и до фикса.
 _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_ipc.py",
-                        "pricing.py", "delivery.py", "dispatch_notify.py", "session_watch.py",
+                        "pricing.py", "price_source.py", "delivery.py", "dispatch_notify.py",
+                        "session_watch.py",
                         "selfupdate_gate.py")   # остаток: ленивые импорты вне ворот грязного дерева
 
 

@@ -32,6 +32,7 @@ import tempfile
 import subprocess
 
 import pricing  # каркас получения точной цены из Календаря (Bridge); пусто → фолбэк
+import price_source  # сезонный множитель цены из price_source.json; БЕЗ флага — ветка мертва
 import delivery  # резолвер зоны/цены доставки по maps-ссылке клиента (Bridge); пусто → [уточнить]
 
 log = logging.getLogger("suggest")
@@ -3206,14 +3207,36 @@ def _iso_plus(iso_date, n_days):
 
 def _safe_quote_for_model(model, ds, de, getter=None, name_filter=None):
     """pricing.quote_for_model без падений → всегда dict {status, quote}. name_filter сужает юниты
-    (напр. поколение XMAX); getter инъектируется в тестах (боевой путь — None, живой Bridge)."""
+    (напр. поколение XMAX); getter инъектируется в тестах (боевой путь — None, живой Bridge).
+
+    ЕДИНСТВЕННАЯ ТОЧКА ТОЧЕЧНОЙ КОТИРОВКИ — через неё идут обе ветки `_resolve_model_price`
+    (штатная и «минимальный срок»), поэтому сезонная поправка врезается ровно здесь и ровно один
+    раз. Прайс-сетка по всему парку (`price_sheet`) сюда НЕ ходит — она зовёт `pricing.quote`
+    напрямую и остаётся прежней: у неё нет дат клиента (якорь — завтра), а сезон файл приписывает
+    по дате НАЧАЛА АРЕНДЫ.
+
+    ЗАНЯТОСТЬ судит по-прежнему живая дверь: `available` и выбор конкретного юнита приходят из
+    `quote_for_model` и правкой не затрагиваются — файл её не заменяет и заменить не может.
+    Флаг снят → `reprice` отдаёт тот же объект, поведение побайтно прежнее."""
     try:
         res = pricing.quote_for_model(model, ds, de, _get=getter, name_filter=name_filter)
     except Exception:
         res = None
     if not isinstance(res, dict):
         return {"status": "error", "quote": None}
-    return res
+    try:
+        on = price_source.enabled()
+    except Exception:                          # флаг не прочитался → это СНЯТЫЙ флаг
+        on = False
+    if not on:
+        return res                             # ветка не исполняется вовсе — путь прежний
+    try:
+        return price_source.reprice(res, model, ds, de, _bike_key)
+    except Exception as e:
+        # Источник цены НЕ смеет ронять путь ответа. И НЕ смеет молча вернуть слепое к сезону
+        # число: при поднятом флаге цена бывает только из файла, сбой ветки = молчание.
+        log.info(f"price_source: ветка упала ({type(e).__name__}) — цену гасим")
+        return {"status": "error", "quote": None}
 
 
 def _client_price(q: dict) -> str:
