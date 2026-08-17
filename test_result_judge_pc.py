@@ -30,13 +30,29 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 
-import result_judge_pc as rj
-import result_ref as rr
+# ДО ПЕРВОГО ЧТЕНИЯ ПРИЗНАКА (идиома `test_probe_isolation`). С 17.08.2026 у судьи ЕСТЬ руки по
+# умолчанию, и они живые: без этой строки прямой запуск файла (`python test_result_judge_pc.py`,
+# не `-m unittest`) не взвёл бы признак тест-прогона — и набор ушёл бы на живой мост. Замок
+# «под тест-прогоном наружу не ходим» живёт в руках; здесь мы лишь честно называем себя тестом.
+os.environ["TURBOBABY_TEST_LOGS"] = "1"
+
+import brain_probe_pc as bp     # noqa: E402 — ЖИВЫЕ РУКИ полосы, набор зовёт именно их
+import result_judge_pc as rj    # noqa: E402
+import result_ref as rr         # noqa: E402
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(REPO, "result_judge_pc.py")
+
+# УЗЕЛ ДЛЯ ЖИВЫХ ПРОБ — ФИКСТУРА САМОПРОВЕРКИ полосы, а не боевой док: `cowork_log_test` заведён
+# ровно под пробы канала, и читаем мы его ТОЛЬКО НА ЧТЕНИЕ. Замер 17.08.2026: 39 символов, одна
+# строка, 4.9 c за чтение (плечо Apps Script, а не размер).
+LIVE_NODE = "cowork_log_test"
+
+# Подстрока, которой в живом узле нет и быть не может, — для ОТРИЦАТЕЛЬНОГО живого теста.
+ABSENT_NEEDLE = "ЭТОЙ ПОДСТРОКИ В УЗЛЕ НЕТ 0f0f0f-нет-нет"
 
 # Живой виндовый путь этой полосы — тот же, что в наборе поля (`test_result_ref.WIN_PATH`).
 WIN_SELF = os.path.join(REPO, "result_judge_pc.py")
@@ -61,6 +77,44 @@ def _origin_main():
 
 ORIGIN_MAIN = _origin_main()
 HAS_GIT = ORIGIN_MAIN is not None
+
+
+def _live_brain():
+    """(текст живого узла | None, почему не вышло, сколько секунд ушло).
+
+    ОДНА проба на импорт набора — тем же приёмом, каким берётся `ORIGIN_MAIN`: живой источник
+    опрашивается один раз, а не в каждом тесте. Мост флапает (замер 17.08: сосед ответил
+    таймаутом), поэтому недоступность — ЧЕСТНЫЙ SKIP живых тестов, а не красный гейт: «источник
+    не ответил» дефектом нашего кода не является. Waiver замка назван вслух: живым рукам здесь
+    РАЗРЕШЕНО выйти наружу из-под тест-прогона, ради этого набор и существует."""
+    started = time.monotonic()
+    try:
+        return bp.read_doc(LIVE_NODE, allow_test_context=True), "", time.monotonic() - started
+    except Exception as exc:                                          # noqa: BLE001
+        return None, "%s: %s" % (type(exc).__name__, exc), time.monotonic() - started
+
+
+LIVE_TEXT, LIVE_WHY, LIVE_SECONDS = _live_brain()
+HAS_BRAIN = LIVE_TEXT is not None
+NO_BRAIN_WHY = "живой узел «%s» не прочитан (%s) — живые пробы пропускаем" % (LIVE_NODE, LIVE_WHY)
+
+
+def _needle_from(text):
+    """Живой текст → ПОДСТРОКА ИЗ НЕГО САМОГО, годная в указатель адреса.
+
+    Берём непрерывный кусок первой непустой строки: любой срез строки остаётся подстрокой тела,
+    а литерал из вчерашнего дня протух бы вместе с узлом. Символы, ломающие маркер
+    (`result_ref.BAD_CHARS`), обрезают кусок — не заменяются: замена перестала бы быть
+    подстрокой, и тест доказывал бы не то."""
+    lines = [one for one in text.splitlines() if len(one.strip()) > 0]
+    if len(lines) == 0:
+        return ""
+    line = lines[0]
+    for ch in rr.BAD_CHARS:
+        cut = line.find(ch)
+        if cut >= 0:
+            line = line[:cut]
+    return line[:80].strip()
 
 
 def _iso(unix_ts, hours=0):
@@ -120,6 +174,16 @@ class _Fixture(unittest.TestCase):
         over.setdefault("repo", self.root)
         return rj.Ctx(**over)
 
+    def _no_hands(self):
+        """Ctx с СОРВАННЫМИ руками чтения узла.
+
+        До 17.08.2026 это было состояние ПО УМОЛЧАНИЮ («читателя не дали» — и вид `brain` не нёс
+        ни одного бита). Теперь дефолт — живые руки, поэтому «рук нет» приходится СОЗДАВАТЬ
+        явно, и ветка отказа остаётся проверяемой."""
+        box = self._ctx()
+        box.read_doc = None
+        return box
+
     def _git_says(self, table):
         """Подставной git: словарь «первый аргумент+хвост → (код, stdout)»; None = не запустился."""
         def run(args):
@@ -159,10 +223,9 @@ class TestNegativeFirst(_Fixture):
              "file " + os.path.basename(empty_file), self._ctx()),
             ("row · строки по условию нет",
              "row " + os.path.basename(missing_db) + ":drafts:9999", self._ctx()),
-            ("brain · названного в узле нет",
+            ("brain · подстроки в теле узла НЕТ",
              "brain queue_state_pc §полоса ПК",
-             self._ctx(read_doc=lambda _doc: "узел живой, но про полосу тут ни слова",
-                       brain_baseline=1)),
+             self._ctx(read_doc=lambda _doc: "узел живой, но про полосу тут ни слова")),
             ("service_start · процесса нет",
              "service_start pc_orchestrator PID 424242 старше HEAD abcdef1",
              self._ctx(proc_start=lambda _pid: (False, None),
@@ -202,14 +265,14 @@ class TestNegativeFirst(_Fixture):
              "row fixture.db:drafts:где-то там", self._ctx()),
             ("row · таблица не опознана",
              "row fixture.db:drafts;DROP:1", self._ctx()),
-            ("brain · читателя не дали",
-             "brain queue_state_pc §полоса ПК", self._ctx()),
+            ("brain · руки СНЯТЫ подстановкой (дефолт судьи — живые)",
+             "brain queue_state_pc §полоса ПК", self._no_hands()),
             ("brain · читатель сорвался",
-             "brain queue_state_pc §полоса ПК",
-             self._ctx(read_doc=_raiser, brain_baseline=1)),
-            ("brain · нашлось, но роста не с чем сравнить",
-             "brain queue_state_pc §полоса ПК",
-             self._ctx(read_doc=lambda _doc: "полоса ПК: сдано #553")),
+             "brain queue_state_pc §полоса ПК", self._ctx(read_doc=_raiser)),
+            ("brain · адрес назвал узел, но НЕ назвал подстроку",
+             "brain queue_state_pc", self._ctx(read_doc=lambda _doc: "тело узла")),
+            ("brain · ЖИВЫЕ руки судьи под тест-прогоном наружу не идут",
+             "brain " + LIVE_NODE + " §что угодно", self._ctx()),
             ("service_start · про PID ответа нет",
              "service_start демон PID 4242 старше HEAD abcdef1",
              self._ctx(proc_start=lambda _pid: (None, None),
@@ -265,7 +328,7 @@ class TestNegativeFirst(_Fixture):
     def test_every_case_of_the_negative_set_is_actually_named(self):
         """Набор обязан быть ПЕРЕЧИСЛИМЫМ: числа замка A уходят в артефакт и журнал."""
         self.assertEqual(len(self._empty_cases()), 8)
-        self.assertEqual(len(self._unreadable_cases()), 14)
+        self.assertEqual(len(self._unreadable_cases()), 15)
 
 
 def _raiser(_doc):
@@ -293,7 +356,9 @@ class TestDiscriminatingPower(_Fixture):
         self.assertEqual(bad["verdict"], rj.DISPROVEN, bad["detail"])
 
     def test_one_char_in_a_brain_needle_flips_proven_to_disproven(self):
-        ctx = self._ctx(read_doc=lambda _doc: "полоса ПК: сдано #553", brain_baseline=1)
+        """Опорной линии здесь НЕТ СОЗНАТЕЛЬНО: с 17.08.2026 вердикт вида `brain` стои́т на одной
+        подстроке, и различающая сила обязана быть у неё, а не у размера."""
+        ctx = self._ctx(read_doc=lambda _doc: "полоса ПК: сдано #553")
         good = rj.judge("brain queue_state_pc §сдано #553", ctx)
         bad = rj.judge("brain queue_state_pc §сдано #554", ctx)
         self.assertEqual(good["verdict"], rj.PROVEN, good["detail"])
@@ -710,15 +775,21 @@ class TestJudgeOnlyReads(unittest.TestCase):
         for one in starts:
             self.assertIn(one, rj.GIT_READ_ONLY, "подкоманда git вне читающих: %s" % one)
 
-    def test_no_network_and_no_queue_names_in_the_module(self):
-        banned_roots = {"bridge_http", "urllib", "socket", "requests", "http", "brain_writer",
-                        "cowork_log_append", "pc_orchestrator"}
+    def _imported_roots(self):
         seen = []
         for node in ast.walk(self._tree()):
             if isinstance(node, ast.Import):
                 seen.extend(a.name.split(".")[0] for a in node.names)
             if isinstance(node, ast.ImportFrom):
                 seen.append((node.module or "").split(".")[0])
+        return seen
+
+    def test_no_network_and_no_queue_names_in_the_module(self):
+        """ПРЯМЫХ сетевых имён у судьи нет и после того, как вид `brain` научился читать: наружу
+        он ходит ЧЕРЕЗ НАЗВАННУЮ ДВЕРЬ (следующий тест), а не своим `urlopen`."""
+        banned_roots = {"bridge_http", "urllib", "socket", "requests", "http", "brain_writer",
+                        "cowork_log_append", "pc_orchestrator"}
+        seen = self._imported_roots()
         self.assertEqual(banned_roots.intersection(seen), set(), "судья пошёл наружу: %s" % seen)
         names = [n.attr for n in ast.walk(self._tree()) if isinstance(n, ast.Attribute)]
         for one in ("claim_task", "complete_task", "enqueue_task", "approve_task", "write_doc",
@@ -733,6 +804,27 @@ class TestJudgeOnlyReads(unittest.TestCase):
     def test_file_probe_never_reads_content(self):
         names = [n.id for n in ast.walk(self._tree()) if isinstance(n, ast.Name)]
         self.assertNotIn("open", names, "судья открыл файл — виду `file` хватает stat")
+
+    def test_the_door_outward_is_exactly_one_and_it_is_named(self):
+        """ЗАБОР НЕ СНЯТ — У НЕГО ПОЯВИЛСЯ ИМЕНОВАННЫЙ ПРОХОД, И ОН ОДИН.
+
+        До 17.08.2026 судья не ходил наружу ни одной веткой, и вид `brain` за это платил
+        КОНСТАНТОЙ: `НЕИЗВЕСТНО` одинаково на легшем и на непоставленном разделе. Дверь открыта
+        осознанно — но безымянная прослойка была бы хуже отсутствия замка: инвариант остался бы
+        зелёным, а охраняемое им свойство умерло бы молча. Поэтому дверь ОДНА, названа
+        константой `BRAIN_HANDS` и стои́т РОВНО В ОДНОМ месте модуля."""
+        allowed = {"os", "re", "sqlite3", "subprocess", "ctypes", "result_ref", rj.BRAIN_HANDS}
+        self.assertEqual(set(self._imported_roots()) - allowed, set(),
+                         "у судьи появился незаявленный импорт: %s" % self._imported_roots())
+        doors = [n.lineno for n in ast.walk(self._tree()) if isinstance(n, ast.Import)
+                 and any(a.name == rj.BRAIN_HANDS for a in n.names)]
+        self.assertEqual(len(doors), 1, "дверь наружу обязана быть ОДНА, найдено: %s" % doors)
+
+    def test_the_hands_module_does_not_wire_the_judge_back(self):
+        """Руки судью не знают: иначе инвариант `RESULT_JUDGE_UNWIRED` поймал бы подключение —
+        и был бы прав, потому что взаимный импорт и есть подключение."""
+        with open(os.path.join(REPO, rj.BRAIN_HANDS + ".py"), encoding="utf-8") as handle:
+            self.assertEqual(wiring_findings(handle.read(), rj.BRAIN_HANDS), [])
 
 
 # ═════════════════════════ СКВОЗНОЕ ПОВЕДЕНИЕ ════════════════════════════════════════════════
@@ -770,6 +862,163 @@ class TestJudgeShape(_Fixture):
             got = rj.read_back(ref, self._ctx())
             self.assertIsNone(got[rj.ANSWER], ref)
             self.assertTrue(got[rj.DETAIL], "молчаливое «не знаю»: %s" % ref)
+
+
+# ═════════════════════════ ВИД `brain`: ДОКАЗАТЕЛЬСТВО — НАЙДЕННАЯ ПОДСТРОКА ═════════════════
+# Заход 17.08.2026. Порядок тот же, что и у всего набора: сначала различение отказов (чтобы
+# «поломка рук» не пряталась за «источник недоступен»), потом ЖИВЫЕ руки, и ОТРИЦАТЕЛЬНЫЙ живой
+# тест — последним и главным.
+
+class TestBrainBlameIsNamed(_Fixture):
+    """ЧЕТЫРЕ ОТКАЗА — ЧЕТЫРЕ РАЗНЫХ СЛОВА. Все они дают НЕИЗВЕСТНО (иначе сбой инструмента
+    превратился бы в «нет адреса — нет зелёного» боковой дверью), но текст обязан различать их:
+    диагност, читающий «источник недоступен» вместо «руки сломаны», чинит мост вместо модуля."""
+
+    def _blamed(self, blame):
+        """Ctx, чьи руки падают отказом С НАЗВАННОЙ ВИНОЙ — ровно как живые."""
+        def raiser(_doc):
+            raise {bp.BLAME_HANDS: bp.HandsBroken, bp.BLAME_SOURCE: bp.SourceDown,
+                   bp.BLAME_NODE: bp.UnknownNode, bp.BLAME_TESTRUN: bp.LiveForbidden}[blame]("так вышло")
+        return self._ctx(read_doc=raiser)
+
+    def test_the_words_of_blame_are_the_very_literals_of_the_hands(self):
+        """Литерал вины живёт в ДВУХ модулях — совпадение сторожим дословно, а не подразумеваем
+        (идиома полосы: маркер отказа сверяется с литералом чужого модуля)."""
+        self.assertEqual(rj.BLAME_HANDS, bp.BLAME_HANDS)
+        self.assertEqual(rj.BLAME_SOURCE, bp.BLAME_SOURCE)
+        self.assertEqual(rj.BLAME_NODE, bp.BLAME_NODE)
+        self.assertEqual(rj.BLAME_TESTRUN, bp.BLAME_TESTRUN)
+        self.assertEqual(sorted(rj.BLAME_WORDS), sorted(bp.BLAMES))
+
+    def test_broken_hands_never_look_like_an_unreachable_source(self):
+        hands = rj.judge("brain узел §что-то", self._blamed(bp.BLAME_HANDS))
+        source = rj.judge("brain узел §что-то", self._blamed(bp.BLAME_SOURCE))
+        self.assertEqual(hands["verdict"], rj.UNKNOWN, hands["detail"])
+        self.assertEqual(source["verdict"], rj.UNKNOWN, source["detail"])
+        self.assertNotEqual(hands["detail"], source["detail"])
+        self.assertIn(rj.BLAME_WORDS[rj.BLAME_HANDS], hands["detail"])
+        self.assertNotIn(rj.BLAME_WORDS[rj.BLAME_SOURCE], hands["detail"])
+
+    def test_all_four_blames_say_four_different_things(self):
+        words = [rj.judge("brain узел §что-то", self._blamed(one))["detail"] for one in bp.BLAMES]
+        self.assertEqual(len(set(words)), len(bp.BLAMES), "вины слиплись: %s" % words)
+
+    def test_an_unnamed_blame_is_not_pinned_on_the_source(self):
+        """Вину, которую назвать не смогли, НЕ приписываем мосту: врать про источник дороже,
+        чем сказать «вина не названа»."""
+        got = rj.judge("brain узел §что-то", self._ctx(read_doc=_raiser))
+        self.assertEqual(got["verdict"], rj.UNKNOWN)
+        self.assertIn(rj.BLAME_UNNAMED, got["detail"])
+        self.assertNotIn(rj.BLAME_WORDS[rj.BLAME_SOURCE], got["detail"])
+
+
+class TestBrainNeedleIsTheProof(_Fixture):
+    """ЧТО СЧИТАЕТСЯ ДОКАЗАТЕЛЬСТВОМ. Подстрока найдена → ДОКАЗАН; не найдена → НЕ ДОКАЗАН;
+    подстроки в адресе нет → НЕИЗВЕСТНО (и это НЕ зелёное)."""
+
+    def _reads(self, text):
+        return self._ctx(read_doc=lambda _doc: text)
+
+    def test_found_substring_alone_is_enough_for_proven(self):
+        got = rj.judge("brain index §сдано #553", self._reads("полоса ПК: сдано #553"))
+        self.assertEqual(got["verdict"], rj.PROVEN, got["detail"])
+        self.assertIn("ПРОЧИТАН", got["detail"], "вердикт обязан сказать, что узел ЧИТАЛСЯ")
+
+    def test_address_without_a_needle_is_unknown_never_green(self):
+        for pointer in ("index", "  index  "):
+            got = rj.judge("brain " + pointer, self._reads("в теле есть всё на свете"))
+            self.assertEqual(got["verdict"], rj.UNKNOWN, got["detail"])
+            self.assertNotEqual(got["verdict"], rj.PROVEN)
+
+    def test_a_needleless_address_does_not_even_read(self):
+        """Отказ выдаётся ДО чтения: живое чтение стои́т секунды, а доказывать всё равно нечем."""
+        touched = []
+        rj.judge("brain index", self._ctx(read_doc=lambda doc: touched.append(doc) or "тело"))
+        self.assertEqual(touched, [], "судья сходил на мост ради адреса, который недоказуем")
+
+    def test_the_baseline_is_optional_but_still_strengthens(self):
+        """ЗАБОР ЧЕСТЕРТОНА, СНЯТЫЙ ЯВНО: опорное состояние больше НЕ ОБЯЗАТЕЛЬНО (без него
+        вердикт стои́т на подстроке), но заданное — по-прежнему СНИМАЕТ зелёное. Защита от
+        подлога «текст лежал в узле и до шага» доступна тому, кто знает размер «до»."""
+        text = "полоса ПК: сдано #553"
+        self.assertEqual(rj.judge("brain index §сдано #553", self._reads(text))["verdict"],
+                         rj.PROVEN)
+        small = self._ctx(read_doc=lambda _doc: text, brain_baseline=len(text))
+        got = rj.judge("brain index §сдано #553", small)
+        self.assertEqual(got["verdict"], rj.DISPROVEN, got["detail"])
+
+    def test_the_verdict_is_no_longer_a_constant(self):
+        """ГЛАВНОЕ ЧИСЛО ЗАХОДА: до правки вид `brain` отвечал ОДНО И ТО ЖЕ на сделанное и на
+        несделанное. Теперь три исхода достижимы на одном виде."""
+        seen = {
+            rj.judge("brain index §сдано #553", self._reads("полоса ПК: сдано #553"))["verdict"],
+            rj.judge("brain index §сдано #554", self._reads("полоса ПК: сдано #553"))["verdict"],
+            rj.judge("brain index §сдано #553", self._ctx(read_doc=_raiser))["verdict"],
+        }
+        self.assertEqual(seen, {rj.PROVEN, rj.DISPROVEN, rj.UNKNOWN})
+
+
+class TestBrainLiveHands(unittest.TestCase):
+    """ЖИВЫЕ РУКИ, А НЕ РУКОТВОРНЫЙ ФАКТ. Здесь нет ни одной подставной функции: адрес едет
+    каноном, судья берёт `brain_probe_pc`, тот — доверенного `brain_writer.read_text`, тот —
+    живой мост. Проверяется ровно то, что будет работать в бою.
+
+    Узел взят ФИКСТУРНЫЙ (`cowork_log_test`), чтение — только на чтение, записей нет ни одной.
+    Источник недоступен → SKIP с названной причиной: флап моста дефектом судьи не является."""
+
+    def _live_ctx(self):
+        return rj.Ctx(repo=REPO, read_doc=bp.reader(allow_test_context=True))
+
+    def _judge_live(self, ref):
+        """Живой суд + ЧЕСТНЫЙ ПРОПУСК НА НЕДОСТУПНОМ ИСТОЧНИКЕ.
+
+        Мост флапает — это замер, а не опасение: 17.08.2026 из четырёх живых проб подряд две
+        ответили `TimeoutError` (бюджет одного чтения 30 с). Красный гейт от ЧУЖОГО таймаута был
+        бы ложным обвинением судьи, поэтому пропуск разрешён РОВНО ПО ОДНОЙ ВИНЕ — «источник».
+        Поломка рук, запрет тест-прогона и безымянная вина остаются ПРОВАЛОМ: ради этого
+        различения вина и называется словом."""
+        got = rj.judge(ref, self._live_ctx())
+        if got["verdict"] == rj.UNKNOWN and rj.BLAME_WORDS[rj.BLAME_SOURCE] in got["detail"]:
+            self.skipTest("мост не ответил — судью это не обвиняет: %s" % got["detail"])
+        return got
+
+    @unittest.skipUnless(HAS_BRAIN, NO_BRAIN_WHY)
+    def test_a_substring_of_the_live_node_is_proven_by_real_hands(self):
+        needle = _needle_from(LIVE_TEXT)
+        self.assertTrue(needle, "живой узел пуст — подстроку взять неоткуда")
+        self.assertIn(needle, LIVE_TEXT)
+        ref = rr.make(rr.KIND_BRAIN, LIVE_NODE + "§" + needle)
+        got = self._judge_live(ref)
+        self.assertEqual(got["verdict"], rj.PROVEN, got["detail"])
+        self.assertEqual(got["kind"], rr.KIND_BRAIN)
+
+    @unittest.skipUnless(HAS_BRAIN, NO_BRAIN_WHY)
+    def test_an_absent_substring_of_the_live_node_is_refused(self):
+        """ОТРИЦАТЕЛЬНЫЙ ЖИВОЙ ТЕСТ — ГЛАВНЫЙ ЗАМОК ЗАХОДА. Ключ живого узла назван верно,
+        подстроки в теле НЕТ: прибор обязан ОТКАЗАТЬ, а не позеленеть и не уйти в «неизвестно»
+        (последнее означало бы, что он опять ничего не читает)."""
+        self.assertNotIn(ABSENT_NEEDLE, LIVE_TEXT, "фикстура протухла: подстрока в узле ЕСТЬ")
+        ref = rr.make(rr.KIND_BRAIN, LIVE_NODE + "§" + ABSENT_NEEDLE)
+        got = self._judge_live(ref)
+        self.assertEqual(got["verdict"], rj.DISPROVEN, got["detail"])
+        self.assertIn("ПРОЧИТАН", got["detail"], "отказ обязан стоять на СОСТОЯВШЕМСЯ чтении")
+
+    @unittest.skipUnless(HAS_BRAIN, NO_BRAIN_WHY)
+    def test_an_unknown_node_key_is_unknown_not_a_refusal(self):
+        """Ключа нет в живом реестре → НЕИЗВЕСТНО со своим словом: чтение НЕ СОСТОЯЛОСЬ, а
+        `НЕ ДОКАЗАН` выдаётся только после удавшегося чтения."""
+        got = self._judge_live("brain нет-такого-узла-полосы §что угодно")
+        self.assertEqual(got["verdict"], rj.UNKNOWN, got["detail"])
+        self.assertIn(rj.BLAME_WORDS[rj.BLAME_NODE], got["detail"])
+
+    def test_the_default_hands_of_the_judge_are_live_and_refuse_under_a_test_run(self):
+        """Ветка «читателя не дали» больше не обрывает разбор ДО чтения: руки есть ПО УМОЛЧАНИЮ.
+        Под тест-прогоном они отказывают СВОИМ словом (запрет), а не «источник недоступен», и
+        наружу при этом не идут — иначе гейт ходил бы на мост каждым `Ctx()`."""
+        self.assertIs(rj.Ctx().read_doc, rj._live_read_doc)
+        got = rj.judge("brain " + LIVE_NODE + " §что угодно", rj.Ctx(repo=REPO))
+        self.assertEqual(got["verdict"], rj.UNKNOWN, got["detail"])
+        self.assertIn(rj.BLAME_WORDS[rj.BLAME_TESTRUN], got["detail"])
 
 
 # ═════════════════════════ ТЕНЬ ЦЕПОЧКИ: ЧЕТЫРЕ ЗАМКА ЗАХОДА ═════════════════════════════════
