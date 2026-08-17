@@ -749,11 +749,26 @@ class TestRoleEndToEnd(unittest.TestCase):
         self.assertIn("Apps Script", out["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_internal_error_is_not_softened(self):
-        """FAIL-SAFE: сбой анализа → ask В ЛЮБОЙ роли (гард — единственный красный гейт при
-        широком permissions.allow, тихий пропуск на ошибке недопустим)."""
+        """FAIL-SAFE: сбой анализа НЕ СМЯГЧАЕТСЯ В ЛЮБОЙ роли (гард — единственный красный гейт
+        при широком permissions.allow, тихий пропуск на ошибке недопустим).
+
+        ИСХОД УЖЕСТОЧЁН 17.08.2026, и это САМОЕ ЗАМЕТНОЕ СЛЕДСТВИЕ распространения замка пустого
+        объекта на все 20 видов — назвать его надо прямо, а не спрятать в правке ожидания.
+        Было `ask`: сбой разбора шёл владельцу карточкой. Стало `deny`: `main` на исключении
+        собирает `("ask", "unknown", "")` — объект ПУСТ по построению, а вид `unknown` входит в
+        `_KIND_VOCAB`, поэтому замок бьёт и здесь. Направление то же, что у всего захода, —
+        fail-CLOSED: операция не исполняется. Цена размена названа честно: собственная ошибка
+        гарда теперь роняет задачу, а не спрашивает владельца, — но подтверждать вслепую
+        операцию, о которой гард не смог сказать НИЧЕГО, и было тем дефектом, ради снятия
+        которого замок заводился.
+
+        Свойство, ради которого тест существует, проверяем прямо: смягчения нет ни в какую
+        сторону — ни `allow`, ни отсутствие решения."""
         p = self._run({"tool_name": "Bash", "tool_input": "кривой вход", "cwd": PROJ})
         out = json.loads(p.stdout)
-        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertNotEqual(out["hookSpecificOutput"]["permissionDecision"], "allow",
+                            "сбой гарда не имеет права стать разрешением")
 
 
 class TestShkvalClassification(unittest.TestCase):
@@ -1482,9 +1497,21 @@ class TestCardMinimumAndJournal(unittest.TestCase):
         self.assertIsNotNone(card)
         self.assertIn("TurboBabyRC", card)
 
-    def test_hard_block_cards_even_without_object(self):
-        """Сбой разбора самого гарда молчать не имеет права ни при каких условиях."""
-        self.assertIsNotNone(g.card_or_journal("unknown", "", ""))
+    def test_hard_block_is_never_silent_without_object(self):
+        """Сбой разбора самого гарда молчать не имеет права ни при каких условиях.
+
+        ПЕРЕИМЕНОВАН И ПРИВЕДЁН К ПРАВДЕ 17.08.2026 (замок пустого объекта — на все 20 видов).
+        Тест звался `test_hard_block_cards_even_without_object` и требовал КАРТОЧКИ. Требование
+        протухло вместе с правилом: без названного объекта карточки не выписывается ни одному
+        виду, потому что подтверждать в ней нечего. Охраняемое свойство при этом НЕ ослаблено, а
+        усилено — проверяем его прямо и поимённо: не молчание (`journal`), не проход (`defer`),
+        а `deny`. Мерить обёрткой `card_or_journal` здесь НЕЛЬЗЯ: она схлопывает `journal` и
+        `deny` в один `None` (`test_card_or_journal_is_test_only_and_blind`), то есть слепа
+        ровно к тому биту, ради которого тест существует."""
+        decision, text = g.card_decision("unknown", "", "")
+        self.assertEqual(decision, "deny", "сбой разбора гарда не проходит и не молчит")
+        self.assertNotIn(decision, ("journal", "defer"), "молчания у hard-блока нет")
+        self.assertIn("ОБЪЕКТ НЕ НАЗВАН", text)
 
     def test_journal_line_instead_of_card_end_to_end(self):
         """Сквозь stdin: подавленная карточка → пустой stdout (действие идёт), но СЛЕД В ЖУРНАЛЕ
@@ -1580,8 +1607,11 @@ class TestOneRuleObjectGatesNumberDoesNot(unittest.TestCase):
                                  g.card_decision(kind, "", "")[0])
                 self.assertTrue(g.card_gate(kind, "", "версия 76"))
                 self.assertTrue(g.card_gate(kind, "", ""), "число ничего не решает")
-                # …и операция НЕ проходит молча: обычный вид без объекта теперь спрашивает.
-                self.assertEqual(g.card_decision(kind, "", "")[0], "ask", kind)
+                # …и операция НЕ проходит молча. ПОПРАВЛЕНО 17.08.2026: здесь стояло `ask`
+                # («обычный вид без объекта спрашивает»). С распространением замка на все 20
+                # видов безобъектная операция кончается ОТКАЗОМ у любого вида — свойство теста
+                # (число ничего не решает) от этого не пострадало, оно проверено строкой выше.
+                self.assertEqual(g.card_decision(kind, "", "")[0], "deny", kind)
 
     def test_object_alone_is_enough(self):
         self.assertTrue(g.card_gate("kill", "ngrok", ""))
@@ -1597,16 +1627,24 @@ class TestOneRuleObjectGatesNumberDoesNot(unittest.TestCase):
         `schtasks`, и НОЛЬ после 31.07.
 
         Пустой объект сегодня означает у любого вида одно: действие разобрано, цель не
-        извлеклась. Разница между видами осталась ровно там, где ей место, — в ЦЕНЕ: обычный
-        спрашивает (`ask`), высший отказывает (`deny`)."""
-        for kind in ("schtasks", "network"):
-            with self.subTest("обычный: " + kind):
-                self.assertTrue(g.card_gate(kind, "", ""))
-                self.assertEqual(g.card_decision(kind, "", "")[0], "ask")
-        for kind in ("delete", "kill"):
-            with self.subTest("высший: " + kind):
-                self.assertTrue(g.card_gate(kind, "", ""), "высший вид гейт объекта не проходит")
-                self.assertEqual(g.card_decision(kind, "", "")[0], "deny")
+        извлеклась.
+
+        ПОПРАВЛЕНО 17.08.2026 (замок пустого объекта распространён на все 20 видов). Здесь
+        стояло «разница между видами осталась в ЦЕНЕ: обычный спрашивает (`ask`), высший
+        отказывает (`deny`)». Разницы в СУДЬБЕ больше нет и быть не должно: подтверждать
+        карточку без объекта нечем независимо от цены, поэтому безобъектная операция кончается
+        отказом у обоих. Цена продолжает различать их там, где ей место, — в ТЕКСТЕ отказа
+        (`_deny_text` несёт «высшая цена» только высшему виду), и это проверено ниже.
+        Свойство, ради которого тест заведён (журнальной ветки нет ни у какого вида), проверено
+        строже прежнего: `deny` — не молчание."""
+        for kind in ("schtasks", "network", "delete", "kill"):
+            with self.subTest(kind):
+                self.assertTrue(g.card_gate(kind, "", ""), "гейт объекта карточку не гасит")
+                self.assertEqual(g.card_decision(kind, "", "")[0], "deny", kind)
+        # ЦЕНА РАЗЛИЧАЕТСЯ ТЕКСТОМ, А НЕ СУДЬБОЙ: врать про необратимость нельзя ни в ту, ни в
+        # другую сторону, иначе отказ обычного вида читается как отказ высшего и наоборот.
+        self.assertIn("высшая цена", g.card_decision("kill", "", "")[1])
+        self.assertNotIn("высшая цена", g.card_decision("schtasks", "", "")[1])
 
     def test_hard_block_and_money_always_card(self):
         for kind in ("unknown", "env", "edit_secret", "read_secret", "py_write"):
@@ -3409,8 +3447,11 @@ class TestTwoTiersOfCards(unittest.TestCase):
                 self.assertEqual(g.card_decision(kind, "", "")[0], "deny", kind)
         # ОБЫЧНЫЙ ВИД ДОБРАН 02.08.2026 (класс Д-3): здесь стояло ожидание `journal` — то есть
         # тихого ИСПОЛНЕНИЯ безобъектной операции Планировщика. Замер закрыл остаток: журнальная
-        # ветка не срабатывала с 31.07 ни разу. Разница видов осталась в ЦЕНЕ, а не в молчании.
-        self.assertEqual(g.card_decision("schtasks", "", "")[0], "ask")
+        # ветка не срабатывала с 31.07 ни разу.
+        # 17.08.2026 добран и остаток судьбы: было `ask` («обычный вид спрашивает»), стало
+        # `deny` — замок пустого объекта распространён с 8 видов на все 20. Планировщик без
+        # `/tn` подтверждать нечем ровно так же, как лист без имени.
+        self.assertEqual(g.card_decision("schtasks", "", "")[0], "deny")
 
     def test_unnamed_kill_target_does_not_execute(self):
         """РЕГРЕСС A-54 ПОЛНЫМ КОНВЕЙЕРОМ: `decide` → `decide_for_role` → `card_decision`.
@@ -3456,11 +3497,81 @@ class TestTwoTiersOfCards(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(self._role(cmd)[0], "defer", label)
 
-    def test_ordinary_hard_block_still_cards_without_object(self):
-        """Обычный вид правило не трогает: сбой разбора и секреты спрашивают как спрашивали."""
+    def test_ordinary_hard_block_is_refused_without_object(self):
+        """ГРАНИЦА ПЕРЕСТАВЛЕНА ВТОРОЙ РАЗ 17.08.2026 — теперь на ВСЕ 20 видов `_KIND_VOCAB`.
+
+        Тест звался `test_ordinary_hard_block_still_cards_without_object` и утверждал «обычный
+        вид правило не трогает: сбой разбора и секреты спрашивают как спрашивали». Это и был
+        дефект, названный цензом 16.08 (§3.3): замок «пустой объект → отказ» существовал, но
+        накрывал 8 видов `_TOP_TIER` из 20, и `env`/`sqlite`/`unknown` в восьмёрку не входили —
+        поэтому карточка `sqlite` 15.08 с объектом «цель записи не определена» ушла владельцу
+        ПОДТВЕРЖДАЕМОЙ, хотя `_UNNAMED_OBJ` эту пометку опознаёт как незаполненную. Механизм
+        знал, что объекта нет, и всё равно спрашивал.
+
+        `_HARD_CARD` этим НЕ ослаблен, и путать здесь легко: список требует, чтобы вид не
+        МОЛЧАЛ, а не чтобы он непременно СПРАШИВАЛ. `deny` требование удовлетворяет строже —
+        операция не исполняется вовсе. С НАЗВАННЫМ объектом эти же виды спрашивают как
+        спрашивали (`test_named_object_still_cards_for_every_kind`)."""
         for kind in ("unknown", "env", "edit_secret", "read_secret"):
             with self.subTest(kind):
-                self.assertEqual(g.card_decision(kind, "", "")[0], "ask")
+                decision, text = g.card_decision(kind, "", "")
+                self.assertEqual(decision, "deny", kind)
+                self.assertNotIn("разрешить?", text, kind + ": отказ не вопрос")
+                self.assertIn(kind, g._HARD_CARD, kind + ": фикстура обязана быть hard-блоком")
+
+    # ══ ЗАМОК 17.08.2026: пустой объект — ОТКАЗ У ВСЕХ 20 ВИДОВ, и это НЕ ослабление ══════
+    NAMED_OBJ = "D:/turbobaby-bot/tmp/named-target.txt"   # объект НАЗВАН: не пометка-заглушка
+
+    def test_empty_object_is_refused_for_every_kind_in_vocab(self):
+        """РАСПРОСТРАНЕНИЕ ЗАМКА, поимённо по закрытому словарю видов.
+
+        До 17.08.2026 условие звучало `is_top_tier(kind) and not _object_named(o)` и накрывало
+        8 видов из 20. Тест держит границу на СЛОВАРЕ, а не на списке из восьми: любой новый вид
+        приезжает под замок сам, и забыть его нельзя — иначе повторится ровно census-дефект
+        «замок есть, входа в него у этого вида нет»."""
+        self.assertEqual(len(g._KIND_VOCAB), 20, "словарь видов изменился — замок пересчитать")
+        denied = [k for k in g._KIND_VOCAB if g.card_decision(k, "", "")[0] == "deny"]
+        self.assertEqual(sorted(denied), sorted(g._KIND_VOCAB),
+                         "без объекта отказ обязан быть у КАЖДОГО вида, а не у высших")
+        # Поимённо — те, что в восьмёрку НЕ входили и ради которых заход делался.
+        for kind in ("env", "sqlite", "schtasks", "network", "outside", "write_outside",
+                     "git_force", "edit_secret", "read_secret", "edit_claude", "unknown",
+                     g.KIND_UNKNOWN_TOOL):
+            with self.subTest(kind):
+                self.assertFalse(g.is_top_tier(kind), kind + ": фикстура обязана быть ОБЫЧНОЙ")
+                self.assertEqual(g.card_decision(kind, "", "")[0], "deny", kind)
+
+    def test_named_object_still_cards_for_every_kind(self):
+        """ВТОРАЯ ПОЛОВИНА ЗАМКА, без которой первая была бы «ничего не работает»: с НАЗВАННЫМ
+        объектом карточка рождается у всех 20 видов ровно как рождалась. Отказ бьёт по
+        отсутствию объекта, а не по виду операции."""
+        for kind in g._KIND_VOCAB:
+            with self.subTest(kind):
+                self.assertEqual(g.card_decision(kind, self.NAMED_OBJ, "")[0], "ask", kind)
+
+    def test_the_refusal_hands_out_no_new_permission(self):
+        """ЗАМОК НАПРАВЛЕНИЯ: правка судьбы не имеет права ДОБАВИТЬ проход. У любого вида и
+        любого объекта решение остаётся в паре «спросить | отказать» — `journal` (тихое
+        ИСПОЛНЕНИЕ) не возвращается ни при каких входах."""
+        for kind in g._KIND_VOCAB:
+            for label, obj in (("пусто", ""), ("названо", self.NAMED_OBJ),
+                               ("пометка-заглушка", g.LIVE_SHEET_UNKNOWN),
+                               ("короче двух символов", "x")):
+                with self.subTest(kind + "/" + label):
+                    self.assertIn(g.card_decision(kind, obj, "")[0], ("ask", "deny"),
+                                  kind + "/" + label + ": прохода тут быть не может")
+
+    def test_detection_survives_the_new_refusal(self):
+        """ЗАМОК «ОБНАРУЖЕНИЯ ЦЕЛЫ»: правка живёт ПОСЛЕ обнаружения и слой обнаружения не
+        трогает. Те же четыре фикстуры остановки процессов, у которых сменилась СУДЬБА, обязаны
+        по-прежнему ОБНАРУЖИВАТЬСЯ — `decide_for_role` даёт `ask|kill` как давал. Если признак
+        когда-нибудь снимут «заодно с отказом», красным станет этот тест, а не только счёт."""
+        for label, cmd in (("фильтр имени образа", 'taskkill /F /T /FI "IMAGENAME eq python.exe"'),
+                           ("конвейер PowerShell", "Get-Process python | Stop-Process -Force"),
+                           ("цель в переменной", "Stop-Process -InputObject $p -Force"),
+                           ("цель не названа вовсе", "kill -9")):
+            with self.subTest(label):
+                self.assertEqual(self._role(cmd)[:2], ("ask", "kill"), label)
 
     def test_deny_end_to_end_is_a_refusal_and_writes_no_marker(self):
         """Отказ не должен породить у демона `needs_approval` — иначе вернётся ровно та
