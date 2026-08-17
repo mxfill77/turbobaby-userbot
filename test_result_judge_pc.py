@@ -571,10 +571,38 @@ def prod_sources(repo):
     return out
 
 
+def docstring_nodes(tree):
+    """Узлы-ДОКСТРИНГИ (модуля, класса, функции) — их текст ПРОЗА, а не код.
+
+    Нужны, чтобы инвариант судил ДЕЙСТВИЕ, а не подстроку (`CLAUDE.md`, свод §5). Без этого
+    множества замок ловил СЕБЯ: живой случай 17.08.2026 — `card_terminal_log.py` в докстринге
+    объясняет, что канонический близнец замка времени живёт в судье и «ИМПОРТА оттуда здесь нет
+    намеренно», и ровно за эту честную фразу инвариант падал (1 находка, красный на `main`).
+    Всегда красный замок не сигнализирует ни о чём: следующее НАСТОЯЩЕЕ подключение утонуло бы
+    в том же красном. Проза освобождена, код — нет: строка-имя в живом коде (динамический импорт
+    `__import__('…')`, таблица имён, `importlib`) остаётся находкой, и это проверено обоими
+    направлениями в `test_the_invariant_catches_an_injected_wiring`."""
+    out = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = node.body
+        if len(body) == 0 or not isinstance(body[0], ast.Expr):
+            continue
+        first = body[0].value
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            out.add(id(first))
+    return out
+
+
 def wiring_findings(src, where="<строка>"):
     """→ список мест, где боевой код зовёт судью. Пустой = судья не подключён."""
     out = []
-    for node in ast.walk(ast.parse(src)):
+    tree = ast.parse(src)
+    prose = docstring_nodes(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and id(node) in prose:
+            continue
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.split(".")[0] == MODULE:
@@ -615,6 +643,27 @@ class TestJudgeIsUnwired(unittest.TestCase):
             self.assertTrue(wiring_findings(src), "подлог «%s» инвариант не поймал" % name)
         self.assertEqual(wiring_findings("import result_ref as rr\nX = rr.FIELD\n"), [],
                          "законный код инвариант флагать не должен")
+
+    def test_prose_is_not_wiring_but_a_live_string_still_is(self):
+        """ГРАНИЦА ПРОЗЫ И ДЕЙСТВИЯ — В ОБЕ СТОРОНЫ, иначе освобождение прозы стало бы дырой.
+
+        Слева — три вида докстринга (модуль, функция, класс), где имя судьи ОБЪЯСНЯЕТСЯ; такой
+        файл подключённым не является. Справа — тот же текст, но В ЖИВОМ КОДЕ: строка-значение,
+        элемент списка имён, аргумент `importlib`. Всё справа обязано остаться находкой."""
+        prose = [
+            ("докстринг модуля", '"""про result_judge_pc и его замок"""\nX = 1\n'),
+            ("докстринг функции", 'def f():\n    """идиома result_judge_pc"""\n    return 1\n'),
+            ("докстринг класса", 'class C:\n    """близнец result_judge_pc"""\n    pass\n'),
+        ]
+        for name, src in prose:
+            self.assertEqual(wiring_findings(src), [], "проза «%s» помечена подключением" % name)
+        action = [
+            ("строка-значение", 'WHO = "result_judge_pc"\n'),
+            ("элемент списка", 'DEPS = ["io_utf8", "result_judge_pc"]\n'),
+            ("importlib строкой", 'import importlib\nm = importlib.import_module("result_judge_pc")\n'),
+        ]
+        for name, src in action:
+            self.assertTrue(wiring_findings(src), "действие «%s» инвариант пропустил" % name)
 
     def test_the_daemon_does_not_carry_the_judge_in_its_runtime_list(self):
         """Демон не знает о судье и на уровне списка модулей самообновления."""
