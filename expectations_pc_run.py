@@ -10,7 +10,7 @@ TTL подтверждения `process_approval_timeouts`, сторож зас�
 живут ВНУТРИ `poll_once`, то есть внутри того самого оборота, чьё отсутствие и есть предмет О2.
 Демон, переставший крутиться, не судит себя ни одной из этих веток; наблюдатель обязан быть вне.
 
-ШЕСТЬ ИСТОЧНИКОВ ФАКТОВ, КАЖДЫЙ ПЕРЕЖИВАЕТ СМЕРТЬ СВОЕГО ПРЕДМЕТА:
+СЕМЬ ИСТОЧНИКОВ ФАКТОВ, КАЖДЫЙ ПЕРЕЖИВАЕТ СМЕРТЬ СВОЕГО ПРЕДМЕТА:
   очередь   — GET моста (`get_pending` по открытым статусам, полоса pc). ТОЛЬКО чтение;
   оборот    — файл `pc_orchestrator.heartbeat`, который демон пишет ПОСЛЕДНЕЙ строкой poll_once;
   занятость — `pc_orchestrator.task_started.json`: отметка CLAIM на диске (объявленный заход);
@@ -19,7 +19,11 @@ TTL подтверждения `process_approval_timeouts`, сторож зас�
               наблюдатель не смеет соперничать с боевым писателем за замок файла;
   часы      — QueryUnbiasedInterruptTime: время БОДРСТВОВАНИЯ машины (сон в него не идёт);
   след      — О4: реестр `cowork_log.ledger` (отметка КАЖДОЙ строки, дошедшей до мозга) — тот
-              самый поток, чей возраст меряет серверное О4. Только чтение хвоста файла.
+              самый поток, чей возраст меряет серверное О4. Только чтение хвоста файла;
+  клиенты   — О5: ЧИСЛО ОТПРАВЛЕННЫХ клиенту из боевой `moderation_ipc.db` плюс реестр попыток
+              `suggest_pairs.jsonl` (второй свидетель: reply-режим в базу не пишет вовсе). Базу
+              ОТКРЫВАЕТ — но ТОЛЬКО режимом `mode=ro`, и не отсюда, а из `client_silence_pc`:
+              `sqlite3` в этом файле запрещён инвариантом, и запрет цел (см. шапку глаза).
 
 ГРАНИЦА О4 ОТДЕЛЬНОЙ СТРОКОЙ: у этой ветки есть КАНАЛ (пульс в журнал), но нет ЗУБОВ. Она ничего
 не перезапускает, очередь не трогает и владельцу не пишет вовсе — молчание пульса адресовано
@@ -47,7 +51,8 @@ FAIL-SAFE: любой сбой сбора → факта нет → вердик
 помечен, скажем на следующем прогоне.
 
 ОТКАТ: порог соответствующей ветки = 0 в окружении (EXPECT_PC_NEW_MIN / EXPECT_PC_RUN_MIN /
-EXPECT_PC_TURN_MIN / EXPECT_PC_MOD_MIN / EXPECT_PC_LIFE_MIN) — ветка мертва целиком; полностью —
+EXPECT_PC_TURN_MIN / EXPECT_PC_MOD_MIN / EXPECT_PC_LIFE_MIN / EXPECT_PC_CLIENT_MIN) — ветка мертва
+целиком (у О5 умирают ОБА исхода: и «ушло», и «ослеп»); полностью —
 снять задачу Планировщика наблюдателя. У О4 откат стоит ЛИШНЕЙ строки в мозге раз в 6 часов и
 возвращает серверное О4 к прежнему признаку «след работы», то есть к 4 ложным эпизодам за 11 суток.
 
@@ -66,6 +71,10 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO)
 
 import expectations_pc as ex                                          # noqa: E402
+# ГЛАЗ О5 — ЕДИНСТВЕННЫЙ файл слоя, которому позволен `sqlite3`, и позволен он под своим
+# инвариантом (только `mode=ro`, ни одного глагола записи в SQL). Здесь `sqlite3` по-прежнему НЕ
+# импортируется — прежний замок рук цел байт в байт, см. шапку `client_silence_pc`.
+import client_silence_pc as eye                                       # noqa: E402
 
 LANE_LABEL = "ПК"
 HEARTBEAT_FILE = os.path.join(REPO, "pc_orchestrator.heartbeat")
@@ -88,6 +97,22 @@ STEP_CAP_SEC = 1200.0
 def _dir():
     """Каталог состояния наблюдателя. CC_EXPECT_PC_DIR — явная подмена (тест не пишет в боевой)."""
     return (os.environ.get("CC_EXPECT_PC_DIR") or "").strip() or STATE_DIR
+
+
+def _client_source():
+    """Пути ОБОИХ свидетелей О5 → (база, реестр). Подмена только явная и только через окружение
+    (`CC_EXPECT_PC_CLIENT_DB` / `CC_EXPECT_PC_CLIENT_PAIRS`) — тем же приёмом, что `CC_EXPECT_PC_DIR`:
+    отрицательный тест обязан уметь показать прибору ТЕСТОВУЮ сущность, не касаясь боевой базы."""
+    db = os.environ.get("CC_EXPECT_PC_CLIENT_DB", "").strip()
+    pairs = os.environ.get("CC_EXPECT_PC_CLIENT_PAIRS", "").strip()
+    return (eye.PROD_DB if db == "" else db), (eye.PROD_PAIRS if pairs == "" else pairs)
+
+
+def client_facts():
+    """ФАКТ О5: числа обоих свидетелей. Чтение и ничего кроме — база открывается режимом `mode=ro`
+    внутри глаза, и ни одна ветка отсюда не умеет писать в неё даже теоретически."""
+    db, pairs = _client_source()
+    return eye.client_facts(db, pairs)
 
 
 # ═══════════════════════════ ЧАСЫ БОДРСТВОВАНИЯ ════════════════════════════════════════════
@@ -455,6 +480,53 @@ def update_mod_silence(state, mod, awake, now):
     return {"measured": True, "awake": silent, "since": since, "why": ""}
 
 
+def update_client_unknown(state, client, awake, now):
+    """Накопить НЕЗНАНИЕ О5 — время, в течение которого источник истины НЕ ЧИТАЕТСЯ →
+    {"measured","awake","since","why"}. Устройство то же, что у `update_silence`/`update_mod_silence`,
+    но копится ОБРАТНОЕ: там тишина ПРИ читаемом факте, здесь — отсутствие самого факта.
+
+    ЗАЧЕМ СЧЁТЧИК, А НЕ ОДНО НАБЛЮДЕНИЕ. Единственный промах (база занята, машина просыпается,
+    диск занят) заметки не стои́т, а шесть подряд — стоят. И почему часы БОДРСТВОВАНИЯ: ПК спит, и
+    стенной возраст первого неудачного чтения после сна равен сну — заметка «прибор ослеп на 9
+    часов» была бы ложной ровно на длину сна.
+
+    ЧИТАЕМЫЙ ИСТОЧНИК ОБНУЛЯЕТ СЧЁТЧИК БЕЗУСЛОВНО и безразлично к тому, ЧТО он показал: предмет
+    этой функции — слепота прибора, а не поведение бота. Прочитанная отправка слепотой не является
+    и судится другой ветвью."""
+    prev = state.get("client") if isinstance(state.get("client"), dict) else {}
+    readable = client.get("ok") is True if isinstance(client, dict) else False
+    since = prev.get("since")
+    if since is None:
+        since = now
+    cur = {"awake": awake, "wall": now}
+    if readable:
+        state["client"] = dict(cur, silent=0.0, since=None)
+        return {"measured": True, "awake": 0.0, "since": None,
+                "why": "источник истины прочитан — незнания нет"}
+    if awake is None:
+        state["client"] = dict(cur, silent=None, since=since)
+        return {"measured": False, "awake": None, "since": since,
+                "why": "часов бодрствования на этой машине нет — сон от слепоты не отличить"}
+    prev_awake = prev.get("awake")
+    try:
+        prev_awake = None if prev_awake is None else float(prev_awake)
+    except (TypeError, ValueError):
+        prev_awake = None
+    if prev_awake is None or awake < prev_awake:
+        why = ("прошлого наблюдения нет" if prev_awake is None else
+               "часы бодрствования пошли назад — машина перезагрузилась")
+        state["client"] = dict(cur, silent=0.0, since=now)
+        return {"measured": False, "awake": 0.0, "since": now, "why": why}
+    prev_silent = prev.get("silent")
+    try:
+        silent = 0.0 if prev_silent is None else float(prev_silent)
+    except (TypeError, ValueError):
+        silent = 0.0
+    silent += max(0.0, min(awake - prev_awake, STEP_CAP_SEC))
+    state["client"] = dict(cur, silent=silent, since=since)
+    return {"measured": True, "awake": silent, "since": since, "why": ""}
+
+
 def update_waits(state, facts, now):
     """Накопить ЧИСТОЕ ОЖИДАНИЕ каждой ждущей строки полосы ПК — время, простоянное ИМЕННО ПРИ
     СВОБОДНОЙ полосе. Именно по нему О1 берёт порог (обоснование — шапка expectations_pc).
@@ -498,6 +570,7 @@ def snapshot(state, now=None, getter=None):
     mod = moderbot_facts()
     awake = awake_seconds()
     life = state.get("life") if isinstance(state.get("life"), dict) else {}
+    client = client_facts()
     return {
         "now": now,
         "queue": queue_facts(getter),
@@ -510,6 +583,10 @@ def snapshot(state, now=None, getter=None):
         # его оставить. Вторая половина — пол повтора: спавн писателя докладывает о старте, а не
         # об успехе, и без неё провал моста стучался бы в него каждые десять минут.
         "trace": trace_facts(attempt=life.get("attempt")),
+        # О5: числа обоих свидетелей и накопленное НЕЗНАНИЕ. Порядок важен — счётчик слепоты
+        # обновляется ПОСЛЕ чтения, тем же наблюдением, а не задним числом.
+        "client": client,
+        "client_unknown": update_client_unknown(state, client, awake, now),
     }
 
 
@@ -575,6 +652,7 @@ def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
     qstate = ex.queue_state(facts, cfg, now)[0]
     tstate, tinfo = ex.turn_state(facts, cfg, now)
     mstate, minfo = ex.moderbot_state(facts, cfg, now)
+    cstate, cinfo = ex.client_state(facts, cfg, now)
     out = {"verdicts": len(verdicts), "notes": [], "closed": [], "dry": bool(dry),
            "queue": qstate, "turn": tstate, "why": tinfo.get("why", ""),
            # У модербота состояние ходит ПАРОЙ со своей причиной: «неизвестно» без причины
@@ -582,7 +660,11 @@ def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
            "moderbot": mstate, "mod_why": minfo.get("why", ""),
            # Чем именно объяснено молчание оборота, если объяснено: заход id=N. Владелец, читающий
            # статус, обязан видеть ПРИЧИНУ зелёного, а не только его цвет.
-           "busy": (tinfo.get("busy") or {}).get("task")}
+           "busy": (tinfo.get("busy") or {}).get("task"),
+           # О5 ходит ТРОЙКОЙ «исход + сколько ушло + чем объяснено»: у ветки, чей ожидаемый
+           # результат ноль, слово без числа неотличимо от слепоты.
+           "client": cstate, "client_sent": ex.client_spoken(cinfo),
+           "client_why": cinfo.get("why", "")}
 
     # 1. ЗАКРЫТИЕ ЭПИЗОДОВ — первым: владелец обязан узнать, что кончилось, даже если сейчас
     #    открылось что-то новое.
@@ -650,6 +732,11 @@ def main():
         print("след жизни наружу (О4): %s · пульс: %s%s"
               % (out.get("life"), out.get("pulse") or "не нужен",
                  (" (%s)" % out.get("pulse_why")) if out.get("pulse_why") else ""))
+        # О5 печатается ЧИСЛОМ, а не одним словом: «тихо» без счётчика — это вера, а не замер.
+        print("клиентам ушло (О5): %s — отправлено %s%s"
+              % (out["client"],
+                 "не прочитано" if out["client_sent"] is None else out["client_sent"],
+                 (" (%s)" % out["client_why"]) if out["client_why"] else ""))
         print("нарушений: %d %s" % (out["verdicts"], out["notes"]))
         return 0
     print(json.dumps(out, ensure_ascii=False))

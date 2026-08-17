@@ -756,7 +756,11 @@ class TestO4LifeTrace(unittest.TestCase):
         self.assertLessEqual(len(line), 600, "длиннее LINE_MAX — писатель вынесет тело файлом")
         # И при этом О4 не завела ни одного НОВОГО нарушения: вердикт остался про О1–О3.
         self.assertEqual(ex.verdict(f, self.cfg), [])
-        self.assertEqual(ex.KINDS, ("o1_pc_new", "o1_pc_run", "o2_pc_turn", "o3_pc_moderbot"))
+        # У О4 нет СВОЕГО вида нарушения вовсе: она ПРОИЗВОДИТ пульс, а не судит. Проверяем именно
+        # это, а не длину списка видов: приколоченный кортеж краснел бы на каждом новом ожидании,
+        # обвиняя его в поломке О4 (так и вышло при заведении О5 — видов стало шесть).
+        self.assertEqual([k for k in ex.KINDS if k.startswith("o4")], [])
+        self.assertIn("o3_pc_moderbot", ex.KINDS)
 
     def test_dead_contour_stays_silent_so_the_server_can_speak(self):
         """ВТОРАЯ СТОРОНА: оборота нет (демон встал) → пульса НЕТ, и серверное О4 звучит честно.
@@ -881,6 +885,463 @@ class TestO4Hands(unittest.TestCase):
                           pulser=lambda line: sent.append(line))
         self.assertEqual(sent, [])
         self.assertIn("life", out)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  О5 — КЛИЕНТАМ НЕ УХОДИТ НИЧЕГО. Судится РЕЗУЛЬТАТ (число отправленных), а не флаг.
+#  Здесь же ОТРИЦАТЕЛЬНЫЙ КОНТРОЛЬ: прибор, не умеющий сказать «УШЛО», негоден целиком.
+# ══════════════════════════════════════════════════════════════════════════════════════════
+import sqlite3                                                        # noqa: E402
+import client_silence_pc as eye                                       # noqa: E402
+
+EYE_SRC = os.path.join(REPO, "client_silence_pc.py")
+# Глаголы, которыми в SQL МЕНЯЮТ мир. Ищутся по границе слова, а не подстрокой: в живом запросе
+# прибора стои́т колонка `updated_ts`, и наивный `"UPDATE" in sql` объявил бы её записью.
+_SQL_WRITE_VERBS = ("INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "REPLACE", "ALTER",
+                    "ATTACH", "VACUUM", "COMMIT", "PRAGMA")
+# Поля, которых у прибора не должно быть НИ ОДНОГО: тело сообщения и опознание клиента.
+_BODY_FIELDS = ("draft", "final_text", "incoming", "client_id", "client_ref", "transcript",
+                "text", "directive", "client_name")
+
+
+def cf(sent=0, ok=True, err="", pairs_sent=0, pairs_ok=True, pairs_err="", pairs_last=None,
+       last=None, armed=0, attempted=0, total=470, now=NOW, blind=None):
+    """Факт О5 в том виде, в каком его кладут руки (`client_silence_pc.client_facts`). Форма
+    сверяется с ЖИВЫМ читателем отдельным тестом, а не обещанием (`test_fixture_is_the_live_shape`)."""
+    f = {"now": now,
+         "client": {"ok": ok, "err": err, "db": "тест.db", "sent": sent, "attempted": attempted,
+                    "armed": armed, "total": total, "statuses": {"posted": 434}, "last_sent": last,
+                    "pairs": {"ok": pairs_ok, "err": pairs_err, "path": "тест.jsonl",
+                              "sent": pairs_sent, "last": pairs_last, "lines": 7}}}
+    if blind is not None:
+        f["client_unknown"] = blind
+    return f
+
+
+def blind_for(seconds, measured=True, since=NOW - 9999.0, why="источник истины не прочитан"):
+    """Накопленное НЕЗНАНИЕ в том виде, в каком его копят руки (`update_client_unknown`)."""
+    return {"measured": measured, "awake": seconds, "since": since, "why": why}
+
+
+class TestO5Config(unittest.TestCase):
+    def test_default_is_the_named_hour(self):
+        """Порог НАЗНАЧЕН заданием (60 мин), а не измерен, — и назван так прямо в шапке модуля."""
+        self.assertEqual(ex.config({})["client"], 3600.0)
+        self.assertEqual(ex.config({"EXPECT_PC_CLIENT_MIN": "10"})["client"], 600.0)
+        self.assertEqual(ex.config({"EXPECT_PC_CLIENT_MIN": "мусор"})["client"], 3600.0)
+
+    def test_zero_kills_both_outcomes_of_the_branch(self):
+        """Откат объявленный: ноль убивает ветку ЦЕЛИКОМ — и «ушло», и «ослеп»."""
+        cfg0 = ex.config({"EXPECT_PC_CLIENT_MIN": "0"})
+        self.assertEqual(ex._o5(cf(sent=5), cfg0, NOW), [])
+        self.assertEqual(ex._o5(cf(ok=False, blind=blind_for(99999.0)), cfg0, NOW), [])
+        self.assertEqual(ex.client_state(cf(sent=5), cfg0, NOW)[0], ex.CLIENT_UNKNOWN)
+        # И с дефолтом та же фактура вердикт ДАЁТ — иначе тест ноля ничего не доказывает.
+        self.assertEqual(len(ex._o5(cf(sent=5), ex.config({}), NOW)), 1)
+
+
+class TestO5Decision(unittest.TestCase):
+    """ТРИ ИСХОДА, и каждая дырка покрыта В ОБЕ СТОРОНЫ: рядом с «молчит» стои́т «говорит»."""
+
+    def setUp(self):
+        self.cfg = ex.config({})
+
+    def test_read_zero_is_quiet(self):
+        st, info = ex.client_state(cf(sent=0), self.cfg, NOW)
+        self.assertEqual((st, info["sent"], ex.client_spoken(info)), (ex.CLIENT_SILENT, 0, 0))
+        self.assertEqual(ex._o5(cf(sent=0), self.cfg, NOW), [])
+
+    def test_read_nonzero_is_a_refusal_with_a_number(self):
+        st, info = ex.client_state(cf(sent=3, last="2026-08-17T19:00:00Z"), self.cfg, NOW)
+        self.assertEqual(st, ex.CLIENT_SPOKE)
+        self.assertEqual(ex.client_spoken(info), 3)
+        v = ex._o5(cf(sent=3, last="2026-08-17T19:00:00Z"), self.cfg, NOW)
+        self.assertEqual((len(v), v[0]["kind"], v[0]["spoken"]), (1, "o5_pc_client_sent", 3))
+        self.assertEqual(v[0]["last"], "2026-08-17T19:00:00Z")
+
+    def test_unreadable_source_is_unknown_and_never_quiet(self):
+        """САМАЯ ДОРОГАЯ ошибка ветки: у ожидания, чей результат — ноль, слепота выглядит как
+        благополучие. «Не смог прочитать» обязано быть НЕИЗВЕСТНО, и ни одна дорога отсюда к
+        «тихо» не ведёт."""
+        st, info = ex.client_state(cf(ok=False, err="база занята"), self.cfg, NOW)
+        self.assertEqual(st, ex.CLIENT_UNKNOWN)
+        self.assertIn("база занята", info["why"])
+        self.assertIsNone(info["sent"])
+        for hole in (cf(ok=False), {"now": NOW}, {"now": NOW, "client": "не словарь"}):
+            self.assertEqual(ex.client_state(hole, self.cfg, NOW)[0], ex.CLIENT_UNKNOWN)
+        # И вторая половина замка: при ЦЕЛОМ факте та же ветка говорит по существу.
+        self.assertEqual(ex.client_state(cf(sent=0), self.cfg, NOW)[0], ex.CLIENT_SILENT)
+
+    def test_unparsed_counter_is_unknown_not_zero(self):
+        st, info = ex.client_state(cf(sent="не число"), self.cfg, NOW)
+        self.assertEqual(st, ex.CLIENT_UNKNOWN)
+        self.assertIn("не разобран", info["why"])
+
+    def test_second_witness_can_only_get_louder(self):
+        """ОДНОСТОРОННЯЯ ГРОМКОСТЬ. Reply-режим в очередь не пишет вовсе, поэтому реестр вправе
+        ДОБАВИТЬ нарушение даже при непрочитанной очереди — и не вправе ничего снять."""
+        st, info = ex.client_state(cf(ok=False, pairs_sent=1), self.cfg, NOW)
+        self.assertEqual(st, ex.CLIENT_SPOKE)              # база молчит, реестр говорит → ОТКАЗ
+        self.assertIsNone(info["sent"])
+        self.assertEqual(info["second"], 1)
+        # Очередь показала ноль, реестр — отправку: это тоже ОТКАЗ (тот самый живой сценарий).
+        self.assertEqual(ex.client_state(cf(sent=0, pairs_sent=1), self.cfg, NOW)[0], ex.CLIENT_SPOKE)
+        # А НЕПРОЧИТАННЫЙ реестр вердикт очереди НЕ отменяет и в «неизвестно» не превращает —
+        # но и молчать о себе не смеет: причина названа в фактах.
+        st2, info2 = ex.client_state(cf(sent=0, pairs_ok=False, pairs_err="реестр не прочитан"),
+                                     self.cfg, NOW)
+        self.assertEqual(st2, ex.CLIENT_SILENT)
+        self.assertIsNone(info2["second"])
+        self.assertIn("не прочитан", info2["pairs_err"])
+
+    def test_spoken_is_a_floor_not_a_sum(self):
+        """Свидетели НЕ независимы: bot-режим пишет и в очередь, и в реестр. Сумма удвоила бы одну
+        отправку, поэтому наружу идёт МАКСИМУМ — честный пол «не меньше этого»."""
+        self.assertEqual(ex.client_spoken({"sent": 2, "second": 2}), 2)
+        self.assertEqual(ex.client_spoken({"sent": 0, "second": 1}), 1)
+        self.assertEqual(ex.client_spoken({"sent": None, "second": 4}), 4)
+        self.assertIsNone(ex.client_spoken({"sent": None, "second": None}))
+
+    def test_the_flag_is_not_the_subject(self):
+        """СПОСОБ: судится ЧИСЛО. В фактах О5 нет ни флага, ни процесса, ни строки кода — и
+        вердикт «ушло» рождается ОДНИМ числом, без всякого участия замков."""
+        f = cf(sent=1)
+        self.assertEqual(sorted(f["client"].keys()),
+                         ["armed", "attempted", "db", "err", "last_sent", "ok", "pairs",
+                          "sent", "statuses", "total"])
+        self.assertEqual(ex.client_state(f, self.cfg, NOW)[0], ex.CLIENT_SPOKE)
+
+
+class TestO5Notes(unittest.TestCase):
+    """Форма заметки: число, время и НАЗВАННЫЙ маршрут. Плюс асимметрия закрытия эпизодов."""
+
+    def setUp(self):
+        self.cfg = ex.config({})
+        self.v = ex._o5(cf(sent=2, last="2026-08-17T19:00:00Z", pairs_sent=2,
+                           pairs_last="2026-08-17T19:00:01Z"), self.cfg, NOW)[0]
+
+    def test_note_carries_the_number_and_the_time(self):
+        note = ex.render(self.v)
+        self.assertTrue(note.startswith("🚨"))
+        self.assertIn("ОТПРАВЛЕНО КЛИЕНТУ: 2", note)
+        self.assertIn("2026-08-17T19:00:00Z", note)
+        self.assertIn("2026-08-17T19:00:01Z", note)
+        self.assertIn(ex.TAIL, note)
+
+    def test_route_of_the_red_news_is_named_by_the_text(self):
+        """Адрес красной новости не должен зависеть от ДЕФОЛТА признака маршрута: он назван самим
+        сообщением. Проверяется ЖИВЫМ признаком (`dispatch_notify.awaits_reply`), а не догадкой."""
+        import dispatch_notify
+        self.assertTrue(dispatch_notify.awaits_reply(ex.render(self.v)))
+        blind = ex._o5(cf(ok=False, blind=blind_for(9999.0)), self.cfg, NOW)[0]
+        self.assertTrue(dispatch_notify.awaits_reply(ex.render(blind)))
+
+    def test_unknown_note_never_reads_as_wellbeing(self):
+        note = ex.render(ex._o5(cf(ok=False, err="база занята", blind=blind_for(9999.0)),
+                                self.cfg, NOW)[0])
+        self.assertIn("НЕ ПРОВЕРЕНО", note)
+        self.assertIn("слепота", note)
+        self.assertIn("база занята", note)
+
+    def test_sent_episode_never_closes_but_blindness_does(self):
+        """Отправленное клиенту не отменяется — у «ушло» закрытия нет ВОВСЕ. У слепоты есть, и
+        закрывает её ПРОЧИТАННЫЙ источник (безразлично, что он показал)."""
+        healthy = cf(sent=0)
+        self.assertEqual(ex.closures(healthy, self.cfg, [self.v["key"]]), [])
+        blind = ex._o5(cf(ok=False, blind=blind_for(9999.0)), self.cfg, NOW)[0]
+        self.assertEqual(ex.closures(healthy, self.cfg, [blind["key"]]), [blind["key"]])
+        # А пока источник не читается — эпизод слепоты НЕ закрывается: молчание не выздоровление.
+        still = cf(ok=False, blind=blind_for(9999.0))
+        self.assertEqual(ex.closures(still, self.cfg, [blind["key"]]), [])
+        self.assertIn("снова читается", ex.render_close(blind["key"]))
+
+    def test_a_new_send_is_a_new_episode(self):
+        """Одна заметка на эпизод — но НОВАЯ отправка обязана дать новую: ключ несёт числа."""
+        one = ex._o5(cf(sent=1), self.cfg, NOW)[0]["key"]
+        two = ex._o5(cf(sent=2), self.cfg, NOW)[0]["key"]
+        same = ex._o5(cf(sent=1), self.cfg, NOW + 99999.0)[0]["key"]
+        self.assertNotEqual(one, two)
+        self.assertEqual(one, same)
+
+
+class TestO5Blindness(unittest.TestCase):
+    """Вторая ветка О5: прибор обязан кричать о СВОЕЙ слепоте, иначе «тихо» становится вечным."""
+
+    def setUp(self):
+        self.cfg = ex.config({})
+
+    def test_blindness_shorter_than_the_threshold_is_silent(self):
+        self.assertEqual(ex._o5(cf(ok=False, blind=blind_for(3599.0)), self.cfg, NOW), [])
+
+    def test_blindness_longer_than_the_threshold_speaks(self):
+        v = ex._o5(cf(ok=False, blind=blind_for(3601.0)), self.cfg, NOW)
+        self.assertEqual((len(v), v[0]["kind"]), (1, "o5_pc_client_unknown"))
+        self.assertEqual(v[0]["awake"], 3601.0)
+
+    def test_unmeasured_blindness_never_speaks(self):
+        """Три честных «не измерено» — и ни одно не превращается ни в заметку, ни в «тихо»."""
+        for blind in (None, blind_for(99999.0, measured=False), blind_for(None), {"measured": True}):
+            f = cf(ok=False, blind=blind)
+            self.assertEqual(ex._o5(f, self.cfg, NOW), [], "слепота %r заговорила" % blind)
+            self.assertEqual(ex.client_state(f, self.cfg, NOW)[0], ex.CLIENT_UNKNOWN)
+
+    def test_hands_count_blindness_by_the_waking_clock(self):
+        """Сон машины слепотой не является: копится разница часов БОДРСТВОВАНИЯ, шаг ограничен
+        одним наблюдением, а прочитанный источник обнуляет счётчик безусловно."""
+        st = {}
+        bad = {"ok": False, "err": "занято"}
+        first = run_mod.update_client_unknown(st, bad, 1000.0, NOW)
+        self.assertEqual((first["measured"], first["awake"]), (False, 0.0))   # прошлого нет
+        second = run_mod.update_client_unknown(st, bad, 1600.0, NOW + 600.0)
+        self.assertEqual((second["measured"], second["awake"]), (True, 600.0))
+        # Сон: стенные часы ушли на сутки, часы бодрствования — на 10 минут.
+        third = run_mod.update_client_unknown(st, bad, 2200.0, NOW + 87000.0)
+        self.assertEqual(third["awake"], 1200.0)
+        # Шаг ограничен: наблюдателя не было час — в слепоту идёт не больше одного шага.
+        fourth = run_mod.update_client_unknown(st, bad, 99999.0, NOW + 90000.0)
+        self.assertEqual(fourth["awake"], 1200.0 + run_mod.STEP_CAP_SEC)
+        # Прочитанный источник обнуляет — и «неизвестно» после этого не копится.
+        good = run_mod.update_client_unknown(st, {"ok": True}, 99999.0, NOW + 90600.0)
+        self.assertEqual((good["awake"], good["since"]), (0.0, None))
+
+    def test_no_waking_clock_is_unknown_and_never_a_note(self):
+        st = {}
+        got = run_mod.update_client_unknown(st, {"ok": False}, None, NOW)
+        self.assertFalse(got["measured"])
+        self.assertIsNone(got["awake"])
+        self.assertIn("сон от слепоты не отличить", got["why"])
+        self.assertEqual(ex._o5(cf(ok=False, blind=got), ex.config({}), NOW), [])
+
+    def test_clock_going_backwards_restarts_the_count(self):
+        st = {"client": {"awake": 5000.0, "silent": 4000.0, "since": NOW - 4000.0}}
+        got = run_mod.update_client_unknown(st, {"ok": False}, 12.0, NOW)
+        self.assertEqual((got["measured"], got["awake"]), (False, 0.0))
+        self.assertIn("назад", got["why"])
+
+
+class TestO5NegativeControl(unittest.TestCase):
+    """ОТРИЦАТЕЛЬНЫЙ ТЕСТ ПЕРВИЧНОГО СВИДЕТЕЛЯ. Прибор, который не умеет сказать «УШЛО», негоден:
+    его «тихо» не значит ничего, и дальше идти нельзя.
+
+    СХЕМА НЕ СОЧИНЕНА: тестовая база создаётся ЖИВЫМ создателем схемы (`moderation_ipc.init_db`) на
+    временном пути — то есть колонка в колонку та же, что в боевой очереди. Идеализированного
+    «как удобно тесту» здесь нет ни одного поля (правило полосы «мок копирует живой формат»).
+    БОЕВАЯ база не открывается ни на чтение, ни на запись: путь только временный."""
+
+    def setUp(self):
+        self.cfg = ex.config({})
+        self.dir = tempfile.mkdtemp(prefix="expect_pc_o5_")
+        self.db = os.path.join(self.dir, "НЕ_БОЕВАЯ_negative.db")
+        import moderation_ipc
+        moderation_ipc.init_db(self.db)
+        self.assertNotEqual(os.path.abspath(self.db), os.path.abspath(eye.PROD_DB))
+
+    def _insert(self, status, updated="2026-08-17T19:00:00Z"):
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute("INSERT INTO drafts (client_id, client_ref, status, created_ts, updated_ts)"
+                        " VALUES (?,?,?,?,?)",
+                        (0, "ТЕСТОВАЯ-СУЩНОСТЬ-О5", status, "2026-08-17T18:00:00Z", updated))
+            con.commit()
+        finally:
+            con.close()
+
+    def test_the_same_base_without_a_sent_row_is_quiet(self):
+        """Первая половина: на законном фоне прибор МОЛЧИТ — иначе «отказ» ничего не доказывает."""
+        self._insert("test_held")
+        self._insert("posted")
+        f = {"now": NOW, "client": eye.client_facts(self.db, os.path.join(self.dir, "нет.jsonl"))}
+        st, info = ex.client_state(f, self.cfg, NOW)
+        self.assertEqual((st, info["sent"], info["total"]), (ex.CLIENT_SILENT, 0, 2))
+        self.assertEqual(ex._o5(f, self.cfg, NOW), [])
+
+    def test_a_sent_row_on_a_test_entity_gives_a_refusal(self):
+        """ВТОРАЯ половина и главная: состояние «отправленное клиенту есть» → прибор даёт ОТКАЗ,
+        называет ЧИСЛО и ВРЕМЯ. Промолчал бы — прибор негоден."""
+        self._insert("test_held")
+        self._insert("sent")
+        f = {"now": NOW, "client": eye.client_facts(self.db, os.path.join(self.dir, "нет.jsonl"))}
+        st, info = ex.client_state(f, self.cfg, NOW)
+        self.assertEqual(st, ex.CLIENT_SPOKE)
+        self.assertEqual(info["sent"], 1)
+        self.assertEqual(info["last"], "2026-08-17T19:00:00Z")
+        v = ex._o5(f, self.cfg, NOW)
+        self.assertEqual((len(v), v[0]["kind"], v[0]["spoken"]), (1, "o5_pc_client_sent", 1))
+        self.assertIn("ОТПРАВЛЕНО КЛИЕНТУ: 1", ex.render(v[0]))
+        # Вторая отправка — новый эпизод и новая заметка (число в ключе).
+        self._insert("sent", updated="2026-08-17T20:00:00Z")
+        f2 = {"now": NOW, "client": eye.client_facts(self.db, os.path.join(self.dir, "нет.jsonl"))}
+        v2 = ex._o5(f2, self.cfg, NOW)
+        self.assertEqual(v2[0]["spoken"], 2)
+        self.assertNotEqual(v2[0]["key"], v[0]["key"])
+
+    def test_armed_and_failed_are_reported_but_are_not_a_send(self):
+        """Границу называем числом: `ready`/`failed` означают «замки поехали», но ОТПРАВКОЙ не
+        являются — вердикт рождает только счётчик отправленных."""
+        self._insert("ready")
+        self._insert("failed")
+        f = {"now": NOW, "client": eye.client_facts(self.db, os.path.join(self.dir, "нет.jsonl"))}
+        st, info = ex.client_state(f, self.cfg, NOW)
+        self.assertEqual((st, info["armed"], info["attempted"]), (ex.CLIENT_SILENT, 1, 1))
+        self.assertEqual(ex._o5(f, self.cfg, NOW), [])
+
+    def test_fixture_is_the_live_shape(self):
+        """Форма фикстуры этого файла = форма ЖИВОГО читателя, ключ в ключ. Иначе регресс зелен на
+        схеме «как удобно тесту», а прод отдаёт другое."""
+        live = eye.client_facts(self.db, os.path.join(self.dir, "нет.jsonl"))
+        self.assertEqual(sorted(live.keys()), sorted(cf()["client"].keys()))
+        self.assertEqual(sorted(live["pairs"].keys()), sorted(cf()["client"]["pairs"].keys()))
+
+    def test_the_second_witness_reads_the_live_line_format(self):
+        """Реестр попыток: маркер снят с ЖИВОГО писателя (`json.dumps(..., ensure_ascii=False)`),
+        а не набран руками — идеализированное «"sent":true» прибор бы не увидел."""
+        p = os.path.join(self.dir, "pairs.jsonl")
+        live_line = json.dumps({"ts": "2026-08-17T19:00:00Z", "client": "тест",
+                                "sent": True, "reason": None}, ensure_ascii=False)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(live_line + "\n")
+            f.write(json.dumps({"ts": "2026-08-17T18:00:00Z", "sent": False},
+                               ensure_ascii=False) + "\n")
+            f.write("не json вовсе\n")
+        got = eye.pairs_counts(p)
+        self.assertEqual((got["ok"], got["sent"], got["lines"]), (True, 1, 3))
+        self.assertEqual(got["last"], "2026-08-17T19:00:00Z")
+        self.assertIn(eye.PAIRS_SENT_MARK, live_line)
+
+    def test_a_missing_register_is_a_positive_fact_but_a_broken_one_is_not(self):
+        """Файла нет = «ни одной попытки не записано» (писатель зовётся на КАЖДУЮ попытку). А вот
+        нечитаемый реестр — дырка, и она называется, а не молчит."""
+        absent = eye.pairs_counts(os.path.join(self.dir, "нет.jsonl"))
+        self.assertEqual((absent["ok"], absent["sent"]), (True, 0))
+        self.assertIn("ни одной попытки", absent["err"])
+        self.assertFalse(eye.pairs_counts(self.dir)["ok"])          # каталог вместо файла
+
+
+class TestO5EyeIsReadOnly(unittest.TestCase):
+    """ЗАМОК ИСТОЧНИКА: глаз О5 — единственный файл слоя с `sqlite3`, и за это у него отобрано всё
+    остальное. Держится УСТРОЙСТВОМ (ast + живой отказ), а не докстрингом."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="expect_pc_ro_")
+        with open(EYE_SRC, encoding="utf-8") as f:
+            self.src = f.read()
+        self.tree = ast.parse(self.src)
+
+    def test_every_connection_is_opened_read_only(self):
+        """Каждое соединение строится ТОЛЬКО через `ro_uri` и ТОЛЬКО с `uri=True`. Голая строка
+        пути (то есть режим чтения-записи) не пройдёт этот тест ни в одной ветке."""
+        found = 0
+        for node in ast.walk(self.tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr != "connect":
+                continue
+            found += 1
+            where = "строка %d" % node.lineno
+            self.assertTrue(node.args, "%s: connect без аргументов" % where)
+            first = node.args[0]
+            self.assertTrue(isinstance(first, ast.Call) and isinstance(first.func, ast.Name)
+                            and first.func.id == "ro_uri",
+                            "%s: путь подан не через ro_uri — это соединение на запись" % where)
+            self.assertEqual([k.arg for k in node.keywords if k.arg == "uri"], ["uri"],
+                             "%s: без uri=True режим mode=ro просто не читается" % where)
+        self.assertEqual(found, 1, "соединений в глазу ровно одно — и оно read-only")
+
+    def test_the_recipe_really_forbids_writing_live(self):
+        """Живой отказ, а не вера в буквы: через рецепт `ro_uri` SQLite ЗАПИСЬ НЕ ПУСКАЕТ."""
+        p = os.path.join(self.dir, "проба.db")
+        con = sqlite3.connect(p)
+        con.execute("CREATE TABLE t (x INTEGER)")
+        con.commit()
+        con.close()
+        self.assertIn("mode=ro", eye.ro_uri(p))
+        ro = sqlite3.connect(eye.ro_uri(p), uri=True)
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as ctx:
+                ro.execute("INSERT INTO t (x) VALUES (1)")
+            self.assertIn("readonly", str(ctx.exception).lower())
+            self.assertEqual(ro.execute("SELECT COUNT(*) FROM t").fetchone()[0], 0)
+        finally:
+            ro.close()
+
+    def test_no_write_verb_in_any_sql_of_the_eye(self):
+        """Ни одного глагола записи в SQL. По ГРАНИЦЕ СЛОВА: в живом запросе стои́т `updated_ts`,
+        и подстрочный поиск объявил бы колонку записью — ложный замок хуже отсутствующего."""
+        import re as _re
+        sqls = []
+        for node in ast.walk(self.tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr not in ("execute", "executemany", "executescript"):
+                continue
+            self.assertTrue(node.args, "строка %d: execute без SQL" % node.lineno)
+            parts = [s.value for s in ast.walk(node.args[0])
+                     if isinstance(s, ast.Constant) and isinstance(s.value, str)]
+            self.assertTrue(parts, "строка %d: SQL собран не из литералов — прочитать нельзя"
+                            % node.lineno)
+            sqls.append((node.lineno, " ".join(parts)))
+        self.assertTrue(sqls)
+        rx = _re.compile(r"\b(%s)\b" % "|".join(_SQL_WRITE_VERBS))
+        for lineno, sql in sqls:
+            self.assertIsNone(rx.search(sql.upper()),
+                              "строка %d: глагол записи в SQL глаза: %s" % (lineno, sql))
+        # Контроль замка: он ОБЯЗАН ловить внесённое нарушение, иначе это молчание, а не замок.
+        self.assertTrue(rx.search("INSERT INTO drafts (status) VALUES ('sent')"))
+        self.assertIsNone(rx.search("SELECT status, MAX(UPDATED_TS) FROM DRAFTS"))
+
+    def test_hands_still_do_not_import_sqlite3(self):
+        """ПРЕЖНИЙ ЗАМОК ЦЕЛ: разрешение получено сужением, а не ослаблением. `sqlite3` живёт в
+        ОДНОМ файле слоя, и это не руки и не решение."""
+        with open(RUN_SRC, encoding="utf-8") as f:
+            run_src = f.read()
+        with open(EX_SRC, encoding="utf-8") as f:
+            ex_src = f.read()
+        for src, name in ((run_src, "руки"), (ex_src, "решение")):
+            names = [a.name for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Import)
+                     for a in n.names]
+            self.assertNotIn("sqlite3", names, "%s обзавелись sqlite3" % name)
+        self.assertIn("import sqlite3", self.src)
+
+    def test_the_eye_never_hands_out_a_message_body(self):
+        """НАРУЖУ — ТОЛЬКО ЧИСЛА И ВРЕМЕНА. Ни тела сообщения, ни опознания клиента: у прибора для
+        них нет ни поля в ответе, ни колонки в SQL."""
+        # Имя файла НАМЕРЕННО не содержит искомых слов: путь уезжает в ответ прибора, и «тело.db»
+        # провалило бы собственную проверку своим же именем.
+        p = os.path.join(self.dir, "probe.db")
+        con = sqlite3.connect(p)
+        con.execute("CREATE TABLE drafts (id INTEGER PRIMARY KEY, client_id INTEGER, "
+                    "client_ref TEXT, draft TEXT, final_text TEXT, status TEXT, updated_ts TEXT)")
+        con.execute("INSERT INTO drafts (client_id, client_ref, draft, final_text, status, "
+                    "updated_ts) VALUES (77, 'секрет', 'тело', 'тело', 'sent', '2026-08-17T19:00:00Z')")
+        con.commit()
+        con.close()
+        got = eye.client_facts(p, os.path.join(self.dir, "нет.jsonl"))
+        flat = json.dumps(got, ensure_ascii=False)
+        self.assertEqual(got["sent"], 1)
+        for bad in ("тело", "секрет", "77"):
+            self.assertNotIn(bad, flat, "прибор вынес наружу «%s»" % bad)
+        for field in _BODY_FIELDS:
+            self.assertNotIn(field, got)
+
+    def test_prod_is_unreadable_under_testing(self):
+        """Зеркало тривайра `moderation_ipc._conn`: под TESTING=1 боевая база не читается — но НЕ
+        падением, а честным «не прочитан», который даёт исход НЕИЗВЕСТНО. Тихого зелёного тут нет
+        ни на одной дороге."""
+        was = os.environ.get("TESTING")
+        try:
+            os.environ["TESTING"] = "1"
+            got = eye.db_counts(eye.PROD_DB)
+            self.assertFalse(got["ok"])
+            self.assertIn("изоляция тестов", got["err"])
+            self.assertEqual(ex.client_state({"now": NOW, "client": eye.client_facts(eye.PROD_DB)},
+                                             ex.config({}), NOW)[0], ex.CLIENT_UNKNOWN)
+            # А чужой (временный) путь запрет НЕ трогает — иначе тест не смог бы ничего проверить.
+            self.assertIsNone(eye.isolation_block(os.path.join(self.dir, "чужая.db")))
+        finally:
+            if was is None:
+                os.environ.pop("TESTING", None)
+            else:
+                os.environ["TESTING"] = was
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
