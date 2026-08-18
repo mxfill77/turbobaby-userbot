@@ -85,8 +85,19 @@ import client_silence_pc as eye                                       # noqa: E4
 LANE_LABEL = "ПК"
 HEARTBEAT_FILE = os.path.join(REPO, "pc_orchestrator.heartbeat")
 TASK_START_FILE = os.path.join(REPO, "pc_orchestrator.task_started.json")
-MOD_IPC_FILE = os.path.join(REPO, "moderation_ipc.db")        # О3: ПРОДУКТ тика, читаем только stat
+# О3: ОБЩИЙ канал (сведение) и лок. Сам ПРОДУКТ модербота живёт КЛЮЧОМ внутри базы — см.
+# `moderbot_facts`: mtime этого файла двигают трое, и зелёного он не даёт никому (правка 18.08).
+MOD_IPC_FILE = os.path.join(REPO, "moderation_ipc.db")
 MOD_LOCK_FILE = os.path.join(REPO, "moderation_bot.lock")     # О3: чей это продукт (номер процесса)
+# СОБСТВЕННЫЙ ПРОДУКТ ДВУХ ОСТАЛЬНЫХ ДЕТЕЙ (18.08.2026). У каждого — СВОЙ файл и СВОЙ лок; общего
+# источника на всех больше нет ни у кого. Периоды и обоснование пределов — `expectations_pc.KID_SIGNS`.
+KID_FILES = {
+    # Тик `_cowork_sync_job` каждые 30 с; файл личный, писать в него больше некому.
+    "pc_agent": (os.path.join(REPO, "pc_agent.log"), os.path.join(REPO, "pc_agent.lock")),
+    # Keepalive Telethon раз в 60 с → `session.save()`. Продукт БИБЛИОТЕКИ, и это сказано вслух:
+    # своих периодических строк у userbot нет вовсе.
+    "userbot": (os.path.join(REPO, "turbobaby_session.session"), os.path.join(REPO, "userbot.lock")),
+}
 # О4: реестр УСПЕШНО ушедших строк журнала (`cowork_log_append.ledger_add`) — ровно то, что
 # серверное О4 видит как «след с ПК». Читаем ХВОСТ файла: кольцо на 500 строк, а нужна последняя.
 LEDGER_FILE = os.path.join(REPO, "cowork_log.ledger")
@@ -267,35 +278,92 @@ def process_probe(pid):
     return True, started
 
 
-def moderbot_facts(ipc=None, lock=None):
-    """ПРОДУКТ модербота и авторство → {"ok","mtime","pid","opened","started","lock_mtime","err"}.
-
-    ПРОДУКТ, А НЕ ЖИЗНЬ: `job_heartbeat` каждые 5с коммитит запись в `moderation_ipc`, соединение
-    закрывается на каждом вызове (WAL-чекпойнт), поэтому mtime основного файла двигается на каждый
-    тик — измерено живой пробой 11.08 (73 шага, max 5.02с). Базу НЕ ОТКРЫВАЕМ: `os.stat` не
-    трогает ни одной страницы и не соперничает с боевым писателем за замок.
-
-    Лока нет / номер не разобран → авторство остаётся неподтверждённым (None), а не выдумывается:
-    в решении это даёт «неизвестно», и ни одна дорога отсюда не ведёт к «работает»."""
-    out = {"ok": False, "mtime": None, "pid": None, "opened": None, "started": None,
-           "lock_mtime": None, "err": ""}
+def _read_lock(out, lock_path, whose):
+    """Дописать в факт номер из лока, время его правки и пробу процесса. Общий кусок всех троих:
+    лок у каждого свой, а устройство одно — синглтон пишет туда СВОЙ PID и отбирает устаревший."""
     try:
-        out["mtime"] = os.stat(ipc or MOD_IPC_FILE).st_mtime
-        out["ok"] = True
-    except OSError as e:
-        out["err"] = "%s: %s" % (type(e).__name__, str(e)[:80])
-        return out
-    lp = lock or MOD_LOCK_FILE
-    try:
-        with open(lp, encoding="utf-8") as f:
+        with open(lock_path, encoding="utf-8") as f:
             raw = f.read().strip()
-        out["lock_mtime"] = os.stat(lp).st_mtime
+        out["lock_mtime"] = os.stat(lock_path).st_mtime
         out["pid"] = int(raw)
     except (OSError, ValueError) as e:
-        out["err"] = "лок модербота не прочитан: %s" % str(e)[:60]
+        out["err"] = ("%s; " % out["err"] if out["err"] else "") + \
+                     "лок %s не прочитан: %s" % (whose, str(e)[:60])
         return out
     out["opened"], out["started"] = process_probe(out["pid"])
     return out
+
+
+def own_facts(product, lock, whose):
+    """СОБСТВЕННЫЙ ПРОДУКТ ребёнка-файла → {"ok","own","pid","opened","started","lock_mtime",
+    "err","channel"}.
+
+    `own` — время последней правки ЕГО СОБСТВЕННОГО файла (`os.stat`, файл не открываем). Имя поля
+    не `mtime` НАМЕРЕННО: у модербота в этом же поле лежит время из КЛЮЧА, а не из файловой
+    системы, и одно имя для двух разных величин рано или поздно родит ложный диагноз.
+
+    `channel` здесь всегда None: общего канала у этих двоих нет вовсе — их признак личный, и
+    `sha_same` тоже None — контрольную сумму снимает только тот, кто ОТКРЫВАЕТ базу."""
+    out = {"ok": False, "own": None, "pid": None, "opened": None, "started": None,
+           "lock_mtime": None, "err": "", "channel": None, "raw": None, "sha_same": None}
+    try:
+        out["own"] = os.stat(product).st_mtime
+        out["ok"] = True
+    except OSError as e:
+        out["err"] = "%s: %s" % (type(e).__name__, str(e)[:80])
+        return _read_lock(out, lock, whose)      # продукта нет — но проба процесса всё ещё нужна
+    return _read_lock(out, lock, whose)
+
+
+def moderbot_facts(ipc=None, lock=None):
+    """ПРОДУКТ модербота и проба процесса → {"ok","own","pid","opened","started","lock_mtime",
+    "err","channel","raw"}.
+
+    ЧТО ЗДЕСЬ ИЗМЕНИЛОСЬ 18.08.2026 И ПОЧЕМУ. Прежде продуктом считался mtime ОБЩЕГО файла
+    `moderation_ipc.db`, и это было главной слепотой полосы: писателей у файла трое (модербот
+    тиком 5 с, userbot поллером черновиков 3 с, тренажёр сессией), поэтому «файл шевельнулся»
+    означает «кто-то писал». В живом случае 18.08 свежую запись оставил САМ ПОКОЙНИК перед
+    смертью — прибор увидел свежесть и сказал «неизвестно» о заведомо мёртвом ребёнке.
+
+    Теперь продукт — КЛЮЧ `meta['heartbeat']`, который пишет ровно одна строка кода
+    (`moderation_ipc.heartbeat` ← `moderation_bot.job_heartbeat`), то есть подпись автора. Читает
+    его ГЛАЗ (`client_silence_pc.moderbot_heartbeat`): единственный файл слоя с `sqlite3`, режим
+    `mode=ro`, контрольная сумма до и после. Прежний запрет рукам импортировать `sqlite3` цел
+    байт в байт — разрешение получено сужением замка, а не его ослаблением.
+
+    mtime общего файла едет рядом полем `channel` — СВЕДЕНИЕМ. Ни одна ветка решения его не
+    читает: зелёного он не даёт никому.
+
+    Ключ не прочитан (базы нет, занята, ключа нет, время не разобрано) → `ok=False` с названной
+    причиной, то есть «НЕИЗВЕСТНО» у решения, а не «работы нет»."""
+    out = {"ok": False, "own": None, "pid": None, "opened": None, "started": None,
+           "lock_mtime": None, "err": "", "channel": None, "raw": None, "sha_same": None}
+    hb = eye.moderbot_heartbeat(ipc or MOD_IPC_FILE)
+    out["channel"] = hb.get("channel")
+    out["raw"] = hb.get("raw")
+    out["sha_same"] = hb.get("sha_same")
+    if hb.get("ok"):
+        # Разбор ISO живёт в РЕШЕНИИ (`ex.parse_iso`) — он там уже есть, знает оба живых формата
+        # («…Z» и «…+00:00») и уже проверен регрессом. Глаз отдаёт строку, руки её переводят.
+        out["own"] = ex.parse_iso(hb.get("raw"))
+        if out["own"] is None:
+            out["err"] = "время ключа heartbeat не разобрано: %.40s" % (hb.get("raw") or "")
+        else:
+            out["ok"] = True
+    else:
+        out["err"] = hb.get("err") or "ключ heartbeat не прочитан"
+    return _read_lock(out, lock or MOD_LOCK_FILE, "модербота")
+
+
+def kid_facts(name):
+    """Факт о СОБСТВЕННОМ продукте любого ребёнка по имени. Модербот ходит своей дорогой (ключ в
+    базе), двое остальных — общей (mtime личного файла); имени в таблице нет → факта нет вовсе."""
+    if name == ex.KIDS_JUDGED:
+        return moderbot_facts()
+    pair = KID_FILES.get(name)
+    if pair is None:
+        return None
+    return own_facts(pair[0], pair[1], name)
 
 
 def busy_facts(path=None):
@@ -445,52 +513,67 @@ def update_silence(state, hb, awake, now):
     return {"measured": True, "awake": silent, "why": ""}
 
 
-def update_mod_silence(state, mod, awake, now):
-    """Накопить тишину СОБСТВЕННОГО тика модербота в часах бодрствования →
-    {"measured","awake","since","why"}. Устройство то же, что у `update_silence`; отличие ровно
-    одно, и оно — вторая половина замка против ложного зелёного.
+def kid_slot(name):
+    """Имя ячейки состояния, в которой копится тишина ребёнка. У модербота она называется `mod`
+    с 11.08 и переименованию не подлежит: переименовать значит потерять накопленное на первом же
+    прогоне и обнулить открытый эпизод О3."""
+    return "mod" if name == ex.KIDS_JUDGED else "kid_%s" % name
 
-    СЧЁТЧИК ОБНУЛЯЕТ ТОЛЬКО СВОЯ ЗАПИСЬ: mtime сменился И автор не опровергнут. Файл общий (в него
-    пишут userbot черновиком и тренажёр сессией), поэтому «файл шевельнулся» обнулением быть не
-    может: мёртвый модербот при живом клиентском трафике обнулялся бы вечно и выглядел здоровым
-    ровно столько, сколько идёт трафик. Опровергнут — значит проба процесса ДОКАЗАЛА отсутствие
-    (`who is False`); «не смогли проверить» обнуляет, потому что fail-safe этого слоя — молчание,
-    а не заметка на пустом месте.
+
+def update_kid_silence(state, name, fact, awake, now):
+    """Накопить тишину СОБСТВЕННОГО продукта ребёнка в часах бодрствования →
+    {"measured","awake","since","why"}. Устройство то же, что у `update_silence`; отличий два.
+
+    ПЕРВОЕ: СЧЁТЧИК ОБНУЛЯЕТ ТОЛЬКО СВОЯ ЗАПИСЬ — штамп сменился И процесс из лока не опровергнут.
+    Опровергнут значит проба ДОКАЗАЛА отсутствие (`who is False`); «не смогли проверить» обнуляет,
+    потому что fail-safe этого слоя — молчание, а не заметка на пустом месте.
+
+    ВТОРОЕ (18.08.2026): ШТАМП ТЕПЕРЬ У КАЖДОГО СВОЙ. У модербота это время из ключа
+    `meta['heartbeat']`, у pc_agent и userbot — mtime их ЛИЧНЫХ файлов. Прежде здесь стоял mtime
+    ОБЩЕЙ базы, и «файл шевельнулся» обнуляло тишину модербота при живом клиентском трафике —
+    мёртвый бот выглядел здоровым ровно столько, сколько шёл трафик соседа.
 
     ТРИ ЧЕСТНЫХ «НЕ ИЗМЕРЕНО», каждое ведёт к «неизвестно»: часов бодрствования нет · продукт не
     прочитан · прошлого наблюдения нет либо часы пошли назад (машина перезагрузилась)."""
-    prev = state.get("mod") if isinstance(state.get("mod"), dict) else {}
-    mtime = (mod or {}).get("mtime")
-    who = ex.moderbot_writer({"moderbot": mod})
-    cur = {"mtime": mtime, "awake": awake, "wall": now}
+    slot = kid_slot(name)
+    prev = state.get(slot) if isinstance(state.get(slot), dict) else {}
+    stamp = (fact or {}).get("own")
+    who = ex.kid_writer(fact)
+    cur = {"own": stamp, "awake": awake, "wall": now}
     since = prev.get("since") or now
     if awake is None:
-        state["mod"] = dict(cur, silent=None, since=since)
+        state[slot] = dict(cur, silent=None, since=since)
         return {"measured": False, "awake": None, "since": since,
                 "why": "часов бодрствования на этой машине нет — сон от молчания не отличить"}
-    if not (mod or {}).get("ok"):
-        state["mod"] = dict(prev, awake=awake, wall=now)
+    if not (fact or {}).get("ok"):
+        state[slot] = dict(prev, awake=awake, wall=now)
         return {"measured": False, "awake": None, "since": since,
-                "why": "продукт модербота не прочитан"}
+                "why": "продукт %s не прочитан" % name}
     prev_awake = prev.get("awake")
     try:
         prev_awake = None if prev_awake is None else float(prev_awake)
     except (TypeError, ValueError):
         prev_awake = None
-    own_write = prev.get("mtime") != mtime and who is not False
+    own_write = prev.get("own") != stamp and who is not False
     if own_write or prev_awake is None or awake < prev_awake:
-        why = ("своя запись в IPC — тишина обнулена" if own_write else
+        why = ("своя запись — тишина обнулена" if own_write else
                "прошлого наблюдения нет" if prev_awake is None else
                "часы бодрствования пошли назад — машина перезагрузилась")
-        state["mod"] = dict(cur, silent=0.0, since=now)
+        state[slot] = dict(cur, silent=0.0, since=now)
         return {"measured": False, "awake": 0.0, "since": now, "why": why}
     try:
         silent = float(prev.get("silent") or 0.0)
     except (TypeError, ValueError):
         silent = 0.0
     silent += max(0.0, min(awake - prev_awake, STEP_CAP_SEC))
-    state["mod"] = dict(cur, silent=silent, since=since)
+    state[slot] = dict(cur, silent=silent, since=since)
     return {"measured": True, "awake": silent, "since": since, "why": ""}
+
+
+def update_mod_silence(state, mod, awake, now):
+    """Тишина модербота — тот же накопитель по имени. Имя оставлено прежним: под ним ветка О3
+    живёт с 11.08 и на него смотрит регресс."""
+    return update_kid_silence(state, ex.KIDS_JUDGED, mod, awake, now)
 
 
 def update_client_unknown(state, client, awake, now):
@@ -585,6 +668,16 @@ def snapshot(state, now=None, getter=None):
     life = state.get("life") if isinstance(state.get("life"), dict) else {}
     life_kids = state.get("kids") if isinstance(state.get("kids"), dict) else {}
     client = client_facts()
+    mod_silence = update_mod_silence(state, mod, awake, now)
+    # КАЖДЫЙ РЕБЁНОК — СО СВОИМ ИСТОЧНИКОМ И СВОИМ СЧЁТЧИКОМ ТИШИНЫ (18.08.2026). Модербот кладётся
+    # сюда ТЕМИ ЖЕ объектами, что и в свои прежние ключи, — не копией: один ребёнок обязан иметь
+    # один вердикт, и заметка О3 со строкой журнала не смеют разойтись в словах ни на одном тике.
+    kids = {ex.KIDS_JUDGED: {"fact": mod, "silence": mod_silence}}
+    for name in ex.KIDS:
+        if name in kids:
+            continue
+        fact = kid_facts(name)
+        kids[name] = {"fact": fact, "silence": update_kid_silence(state, name, fact, awake, now)}
     return {
         "now": now,
         "queue": queue_facts(getter),
@@ -592,7 +685,8 @@ def snapshot(state, now=None, getter=None):
         "silence": update_silence(state, hb, awake, now),
         "busy": busy_facts(),
         "moderbot": mod,
-        "mod_silence": update_mod_silence(state, mod, awake, now),
+        "mod_silence": mod_silence,
+        "kids": kids,
         # О4: когда полоса в последний раз оставила след наружу и когда МЫ в последний раз пытались
         # его оставить. Вторая половина — пол повтора: спавн писателя докладывает о старте, а не
         # об успехе, и без неё провал моста стучался бы в него каждые десять минут.
@@ -755,7 +849,10 @@ def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
     #    итог прогона словами — молчаливого `pass` здесь нет.
     out["kids"], out["kids_pulse"], out["kids_why"], out["kids_line"] = [], None, "", ""
     try:
-        out["kids"] = [{"name": k["name"], "state": k["state"], "why": k.get("why", "")}
+        out["kids"] = [{"name": k["name"], "state": k["state"], "why": k.get("why", ""),
+                        # ИСТОЧНИК ЕДЕТ РЯДОМ С ВЕРДИКТОМ: «работы нет» без имени признака
+                        # проверить нечем, а с ним владелец видит, ЧТО именно замерло.
+                        "src": k.get("src"), "channel_age": k.get("channel_age")}
                        for k in ex.kids_state(facts, cfg, now)]
         if dry:
             kdue, kinfo = ex.kids_pulse_due(facts, cfg, now)
@@ -801,11 +898,14 @@ def main():
               % (out["client"],
                  "не прочитано" if out["client_sent"] is None else out["client_sent"],
                  (" (%s)" % out["client_why"]) if out["client_why"] else ""))
-        # Дети печатаются ПОИМЁННО и КАЖДЫЙ — включая тех, о ком прибора нет: пустая графа здесь
-        # и есть новость («двух детей из трёх не судит никто»), а не недосмотр отчёта.
-        print("дети контура (публикация): %s"
-              % (" · ".join("%s — %s" % (k["name"], k["state"]) for k in out.get("kids") or [])
-                 or "не собрано"))
+        # Дети печатаются ПОИМЁННО, КАЖДЫЙ СО СВОИМ ИСТОЧНИКОМ и своей причиной: с 18.08.2026
+        # общего признака на всех нет вовсе, и отчёт обязан показывать, ЧЕМ судится каждый.
+        print("дети контура (публикация; у каждого СВОЙ признак и СВОЙ предел):")
+        for k in out.get("kids") or []:
+            print("  %-15s %-14s %-32s %s"
+                  % (k["name"], k["state"], k.get("src") or "источника нет", k.get("why") or ""))
+        if not out.get("kids"):
+            print("  не собрано")
         print("строка о детях: %s%s"
               % (out.get("kids_pulse") or "не нужна",
                  (" (%s)" % out.get("kids_why")) if out.get("kids_why") else ""))

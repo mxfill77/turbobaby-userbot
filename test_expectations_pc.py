@@ -19,6 +19,7 @@
     venv\\Scripts\\python.exe -m unittest test_expectations_pc
 """
 import ast
+import datetime
 import json
 import os
 import tempfile
@@ -620,12 +621,16 @@ MOD_LOCK_SKEW = 1.4                      # ЖИВОЕ расхождение «�
 
 
 def modf(age=3.0, pid=MOD_PID, opened=True, started=MOD_START, skew=MOD_LOCK_SKEW,
-         ok=True, err="", now=NOW):
-    """Факт о модерботе ровно того вида, что отдают руки (`moderbot_facts`): mtime продукта,
-    номер из лока, проба процесса и возраст запуска. Идеализированной схемы здесь нет."""
-    return {"ok": ok, "mtime": (now - age) if ok else None, "pid": pid, "opened": opened,
+         ok=True, err="", now=NOW, channel=2.0):
+    """Факт о модерботе ровно того вида, что отдают руки (`moderbot_facts`): время СВОЕГО продукта
+    (ключ `meta['heartbeat']`, а не mtime общего файла — правка 18.08.2026), номер из лока, проба
+    процесса, возраст запуска и ОТДЕЛЬНО возраст ОБЩЕГО канала.
+
+    `channel` по умолчанию свеж НАМЕРЕННО: в проде общий файл двигается каждые ~5 с (замер 18.08 —
+    38 сдвигов за 190 с, пишут трое), и фикстура, в которой он стар, прятала бы главный класс."""
+    return {"ok": ok, "own": (now - age) if ok else None, "pid": pid, "opened": opened,
             "started": started, "lock_mtime": None if started is None else started + skew,
-            "err": err}
+            "err": err, "channel": None if channel is None else now - channel, "raw": None}
 
 
 def silent_for(seconds, since=NOW - 1800.0):
@@ -667,17 +672,40 @@ class TestO3Moderbot(unittest.TestCase):
         self.assertIn("живой PID работающим сервисом не является", note)
         self.assertTrue(info["who"])
 
-    def test_fresh_product_of_a_foreign_writer_is_never_work(self):
-        """ЗАМОК ПРОТИВ ЛОЖНОГО ЗЕЛЁНОГО: файл общий. Свежий mtime при отсутствующем процессе
-        значит «писал кто-то другой» (userbot черновиком, тренажёр сессией), а не «бот работает»."""
-        f = mfacts(mod=modf(age=2.0, opened=False))
+    def test_dead_kid_with_a_fresh_record_is_death_and_not_unknown(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ ЖИВОГО СЛУЧАЯ 18.08.2026, чистая половина. Модербота унесло
+        перезагрузкой (процесса с номером из лока в системе НЕТ), а запись возрастом 400 с ещё
+        свежа — и по общему каналу, и по его собственному ключу. ПРЕЖДЕ здесь стояло «неизвестно»
+        (замер: вердикт 20:27 местного), то есть заведомо мёртвый ребёнок объявлялся непроверяемым.
+        Теперь приговор выносит проба процесса: «работы нет», и ни «неизвестно», ни «делает работу»
+        отсюда не выходит ни одной ветвью."""
+        f = mfacts(mod=modf(age=400.0, opened=False, channel=1.0))
         st, info = ex.moderbot_state(f, self.cfg, NOW)
-        self.assertEqual(st, ex.MOD_UNKNOWN)
+        self.assertEqual(st, ex.MOD_IDLE)
+        self.assertNotEqual(st, ex.MOD_UNKNOWN)
         self.assertNotEqual(st, ex.MOD_OK)
-        self.assertIn("писал не модербот", info["why"])
-        self.assertEqual(ex.verdict(f, self.cfg), [], "незнание не приговор")
+        self.assertTrue(info["dead"])
+        self.assertIn("из лока в системе нет", info["why"])
+        self.assertLess(info["wall"], self.cfg["mod"], "продукт МОЛОЖЕ порога — как 18.08")
+        self.assertLess(info["channel_age"], 5.0, "общий канал свеж — как 18.08")
+        # И это НАРУШЕНИЕ, а не молчание: владелец узнаёт о смерти сразу, а не через 15 минут.
+        self.assertEqual([x["kind"] for x in ex.verdict(f, self.cfg)], ["o3_pc_moderbot"])
 
-    def test_foreign_writer_becomes_a_violation_once_silence_accumulates(self):
+    def test_the_common_channel_is_information_and_never_a_green(self):
+        """ОБЩАЯ ЗАПИСЬ В КАНАЛ БОЛЬШЕ НЕ ДОКАЗЫВАЕТ ЖИВОСТЬ НИКОМУ. Свежий общий файл при
+        молчащем СВОЁМ ключе — это «работы нет», а не «работает»: писателей у файла трое."""
+        f = mfacts(mod=modf(age=1800.0, channel=1.0), silence=silent_for(1500.0))
+        st, info = ex.moderbot_state(f, self.cfg, NOW)
+        self.assertEqual(st, ex.MOD_IDLE)
+        self.assertLess(info["channel_age"], 5.0)
+        note = ex.render(ex.verdict(f, self.cfg)[0])
+        self.assertIn("делал кто-то другой", note)
+        self.assertIn("СВЕДЕНИЕ", note)
+        # Обратная сторона: убери общий канал вовсе — вердикт не изменится ни на букву.
+        blind = mfacts(mod=modf(age=1800.0, channel=None), silence=silent_for(1500.0))
+        self.assertEqual(ex.moderbot_state(blind, self.cfg, NOW)[0], ex.MOD_IDLE)
+
+    def test_silence_becomes_a_violation_even_while_the_common_file_keeps_moving(self):
         """Вторая половина того же замка: молчание не вечно. Чужая запись счётчик не обнуляет,
         поэтому через два наблюдения выходит честное нарушение — с названным состоянием процесса."""
         f = mfacts(mod=modf(age=2.0, opened=False), silence=silent_for(1200.0))
@@ -686,11 +714,12 @@ class TestO3Moderbot(unittest.TestCase):
         self.assertIn("из лока в системе нет", note)
         self.assertIn("делал кто-то другой", note)
 
-    def test_reused_pid_is_not_an_author(self):
-        """Номер переиспользован Windows'ом: процесс есть, но запущен не тогда, когда написан лок."""
+    def test_reused_pid_is_a_death_too(self):
+        """Номер переиспользован Windows'ом: процесс есть, но запущен не тогда, когда написан лок.
+        Значит прежний владелец номера НЕ РАБОТАЕТ — и это тот же приговор, что «номера нет»."""
         f = mfacts(mod=modf(age=2.0, started=NOW - 30.0, skew=-400000.0))
         self.assertIs(ex.moderbot_writer(f), False)
-        self.assertEqual(ex.moderbot_state(f, self.cfg, NOW)[0], ex.MOD_UNKNOWN)
+        self.assertEqual(ex.moderbot_state(f, self.cfg, NOW)[0], ex.MOD_IDLE)
         # А ЖИВАЯ пара «старт → лок» (расхождение 1.4с) автором быть обязана.
         self.assertIs(ex.moderbot_writer(mfacts()), True)
 
@@ -708,7 +737,7 @@ class TestO3Moderbot(unittest.TestCase):
         holes = [
             ("факта о модерботе нет вовсе", dict(mfacts(), moderbot=None)),
             ("stat не удался", mfacts(mod=modf(ok=False, err="FileNotFoundError: …"))),
-            ("время записи не разобрано", mfacts(mod=dict(modf(), mtime="не время"))),
+            ("время записи не разобрано", mfacts(mod=dict(modf(), own="не время"))),
             ("лока нет — автор не подтверждён", mfacts(mod=modf(pid=None))),
             ("проба процесса не состоялась", mfacts(mod=modf(opened=None))),
             ("возраст запуска не добыт (отказ доступа)", mfacts(mod=modf(started=None))),
@@ -801,16 +830,16 @@ class TestO3Hands(unittest.TestCase):
         r = run_mod.update_mod_silence(st, modf(), None, NOW)
         self.assertFalse(r["measured"])
         self.assertIn("часов бодрствования", r["why"])
-        st2 = {"mod": {"mtime": 1.0, "awake": 900.0, "silent": 300.0, "since": NOW - 900}}
+        st2 = {"mod": {"own": 1.0, "awake": 900.0, "silent": 300.0, "since": NOW - 900}}
         r = run_mod.update_mod_silence(st2, modf(ok=False), 1000.0, NOW)
         self.assertFalse(r["measured"], "продукт не прочитан — копить нечего и обнулять нечего")
-        r = run_mod.update_mod_silence({"mod": {"mtime": 1.0, "awake": 5000.0, "silent": 300.0}},
+        r = run_mod.update_mod_silence({"mod": {"own": 1.0, "awake": 5000.0, "silent": 300.0}},
                                        modf(), 10.0, NOW)
         self.assertFalse(r["measured"], "часы пошли назад — машина перезагрузилась")
 
     def test_step_is_capped_by_one_observation(self):
-        st = {"mod": {"mtime": 7.0, "awake": 0.0, "silent": 0.0, "since": NOW - 99999}}
-        r = run_mod.update_mod_silence(st, dict(modf(), mtime=7.0), 99999.0, NOW)
+        st = {"mod": {"own": 7.0, "awake": 0.0, "silent": 0.0, "since": NOW - 99999}}
+        r = run_mod.update_mod_silence(st, dict(modf(), own=7.0), 99999.0, NOW)
         self.assertEqual(r["awake"], run_mod.STEP_CAP_SEC,
                          "наблюдатель мог не работать сутки — выдумывать за них молчание нельзя")
 
@@ -833,29 +862,82 @@ class TestO3Hands(unittest.TestCase):
                           and n.func.attr == "kill"], [])
 
     def test_moderbot_facts_read_the_live_files(self):
-        """Живой формат: mtime продукта берётся stat'ом (база НЕ открывается), номер — из лока."""
+        """ЖИВОЙ ФОРМАТ, А НЕ ИДЕАЛИЗИРОВАННЫЙ: настоящая база SQLite с настоящей таблицей `meta`
+        и значением ровно того вида, что пишет `moderation_ipc._now_iso()`. Прежняя фикстура была
+        файлом из шестнадцати байт заголовка — на ней ключ прочитать нельзя было бы никогда."""
         d = tempfile.mkdtemp(prefix="expect_pc_mod_")
         ipc, lock = os.path.join(d, "moderation_ipc.db"), os.path.join(d, "moderation_bot.lock")
-        with open(ipc, "wb") as f:
-            f.write(b"SQLite format 3\x00")
+        con = sqlite3.connect(ipc)
+        con.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
+        con.execute("INSERT INTO meta (k, v) VALUES ('heartbeat', ?)",
+                    (datetime.datetime.fromtimestamp(NOW - 3.0, datetime.timezone.utc)
+                     .isoformat(),))
+        con.commit()
+        con.close()
         with open(lock, "w", encoding="utf-8") as f:
             f.write("%d\n" % os.getpid())            # живой вид лока: номер и перевод строки
         m = run_mod.moderbot_facts(ipc, lock)
-        self.assertTrue(m["ok"])
+        self.assertTrue(m["ok"], m["err"])
         self.assertEqual(m["pid"], os.getpid())
         self.assertTrue(m["opened"])
-        self.assertIsNotNone(m["mtime"])
+        self.assertAlmostEqual(m["own"], NOW - 3.0, places=3)
         self.assertIs(ex.moderbot_writer({"moderbot": m}), True)
+        # ОБЩИЙ КАНАЛ ПРОЧИТАН ОТДЕЛЬНЫМ ПОЛЕМ И ОСТАЛСЯ СВЕДЕНИЕМ: он есть, но вердикта не даёт.
+        self.assertIsNotNone(m["channel"])
+        self.assertNotEqual(m["channel"], m["own"])
+        # ЧТЕНИЕ НИЧЕГО НЕ ТРОНУЛО — доказано контрольной суммой до и после, снятой самим глазом.
+        self.assertIs(m["sha_same"], True)
         self.assertFalse(run_mod.moderbot_facts(ipc + ".нет", lock)["ok"])
-        # Лока нет → продукт прочитан, но автор НЕ подтверждён: «неизвестно», не «работает».
+        # Лока нет → продукт прочитан, но процесс НЕ подтверждён: «неизвестно», не «работает».
         no_lock = run_mod.moderbot_facts(ipc, lock + ".нет")
         self.assertTrue(no_lock["ok"])
         self.assertIsNone(ex.moderbot_writer({"moderbot": no_lock}))
-        # База не открывается ни одной веткой наблюдателя: инструмента для этого нет вовсе.
+        # База не открывается ни РУКАМИ, ни РЕШЕНИЕМ: инструмента для этого нет ни там, ни там —
+        # `sqlite3` живёт в ОДНОМ файле слоя (глаз), и разрешение получено сужением замка.
         with open(RUN_SRC, encoding="utf-8") as f:
             names = [a.name for n in ast.walk(ast.parse(f.read()))
                      if isinstance(n, ast.Import) for a in n.names]
         self.assertNotIn("sqlite3", names)
+
+    def test_the_key_of_the_own_product_is_the_one_the_writer_writes(self):
+        """FAIL-CLOSED ПРОТИВ ПЕРЕИМЕНОВАНИЯ: имя ключа держится у наблюдателя КОПИЕЙ, и если
+        писатель когда-нибудь назовёт его иначе, обязано покраснеть здесь — а не молча
+        превратиться в вечное «неизвестно» о живом ребёнке. Читаем ИСХОДНИК писателя, а не импорт:
+        наблюдатель не поднимает наблюдаемого ради строки."""
+        with open(os.path.join(REPO, "moderation_ipc.py"), encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        fn = [n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "heartbeat"]
+        self.assertEqual(len(fn), 1, "писатель heartbeat не найден")
+        sql = " ".join(n.value for n in ast.walk(fn[0])
+                       if isinstance(n, ast.Constant) and isinstance(n.value, str))
+        self.assertIn("'%s'" % eye.MOD_HB_KEY, sql,
+                      "имя ключа у наблюдателя разошлось с писателем")
+        # И пишет его РОВНО ОДНА строка кода — на этом стои́т всё авторство: ключ подписан.
+        self.assertEqual(sql.count("INSERT INTO meta"), 1)
+
+    def test_kid_facts_give_each_child_its_own_source(self):
+        """У каждого ребёнка своя пара «продукт + лок», и ни один из них не общий."""
+        for name in ex.KIDS:
+            sign = ex.KID_SIGNS[name]
+            if name == ex.KIDS_JUDGED:
+                continue
+            product, lock = run_mod.KID_FILES[name]
+            self.assertTrue(product.endswith(sign["src"].replace("/", os.sep)),
+                            "источник %s разошёлся с таблицей признаков" % name)
+            self.assertTrue(lock.endswith("%s.lock" % ("userbot" if name == "userbot" else name)))
+        products = {p for p, _ in run_mod.KID_FILES.values()}
+        self.assertEqual(len(products), len(run_mod.KID_FILES), "продукт у детей общий")
+        self.assertNotIn(run_mod.MOD_IPC_FILE, products, "общий канал попал в личные признаки")
+        # Продукта нет, а лок есть → проба всё равно делается: смерть доказывается ею, а не файлом.
+        d = tempfile.mkdtemp(prefix="expect_pc_own_")
+        lock = os.path.join(d, "userbot.lock")
+        with open(lock, "w", encoding="utf-8") as f:
+            f.write("999999")
+        got = run_mod.own_facts(os.path.join(d, "нет.session"), lock, "userbot")
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["pid"], 999999)
+        self.assertIs(ex.kid_writer(got), False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
@@ -1467,6 +1549,58 @@ class TestO5EyeIsReadOnly(unittest.TestCase):
         for field in _BODY_FIELDS:
             self.assertNotIn(field, got)
 
+    def test_the_key_is_read_only_and_the_checksum_is_taken_before_and_after(self):
+        """ВТОРОЙ ПРЕДМЕТ ГЛАЗА — СВОЙ КЛЮЧ МОДЕРБОТА, и читается он ровно теми же правилами:
+        `mode=ro` и контрольная сумма ДО и ПОСЛЕ. Проверяется тремя способами сразу, потому что
+        ни один по отдельности не полон:
+          1. сумма файла ДО чтения и ПОСЛЕ совпала И совпала с посчитанной снаружи — значит наше
+             чтение не тронуло ни байта;
+          2. соединение по тому же рецепту ЖИВЬЁМ отбивает запись (это и есть доказательство,
+             когда сумма разойдётся: у боевого файла свой писатель с тиком 5 с);
+          3. наружу уехали только время и число — ни одного тела сообщения."""
+        p = os.path.join(self.dir, "ipc.db")
+        con = sqlite3.connect(p)
+        con.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
+        con.execute("CREATE TABLE drafts (id INTEGER PRIMARY KEY, draft TEXT, status TEXT, "
+                    "updated_ts TEXT)")
+        con.execute("INSERT INTO meta (k, v) VALUES ('heartbeat', '2026-08-18T15:09:38.981963+00:00')")
+        con.execute("INSERT INTO drafts (draft, status, updated_ts) "
+                    "VALUES ('тело клиента', 'ready', '2026-08-18T15:00:00Z')")
+        con.commit()
+        con.close()
+        before = eye.sha256_file(p)
+        got = eye.moderbot_heartbeat(p)
+        after = eye.sha256_file(p)
+        self.assertTrue(got["ok"], got["err"])
+        self.assertEqual(got["raw"], "2026-08-18T15:09:38.981963+00:00")
+        self.assertEqual((got["sha_before"], got["sha_after"]), (before, after))
+        self.assertIs(got["sha_same"], True, "чтение ключа тронуло файл")
+        self.assertEqual(before, after)
+        # Общий канал прочитан, но он ОТДЕЛЬНОЕ поле: решение обязано различать предмет и сведение.
+        self.assertIsNotNone(got["channel"])
+        self.assertNotIn("тело клиента", json.dumps(got, ensure_ascii=False))
+        # Живой отказ на запись по тому же рецепту — на той же самой базе.
+        ro = sqlite3.connect(eye.ro_uri(p), uri=True)
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as ctx:
+                ro.execute("UPDATE meta SET v = 'подделка' WHERE k = 'heartbeat'")
+            self.assertIn("readonly", str(ctx.exception).lower())
+        finally:
+            ro.close()
+        self.assertEqual(eye.sha256_file(p), before, "отбитая запись всё же изменила файл")
+        # ТРИ ДЫРКИ — ТРИ ЧЕСТНЫХ ОТКАЗА, и ни один не притворяется прочитанным ключом.
+        empty = os.path.join(self.dir, "пустая.db")
+        con = sqlite3.connect(empty)
+        con.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
+        con.commit()
+        con.close()
+        self.assertFalse(eye.moderbot_heartbeat(empty)["ok"])
+        self.assertIn("meta", eye.moderbot_heartbeat(empty)["err"])
+        self.assertFalse(eye.moderbot_heartbeat(os.path.join(self.dir, "нет.db"))["ok"])
+        no_table = os.path.join(self.dir, "безmeta.db")
+        sqlite3.connect(no_table).close()
+        self.assertFalse(eye.moderbot_heartbeat(no_table)["ok"])
+
     def test_prod_is_unreadable_under_testing(self):
         """Зеркало тривайра `moderation_ipc._conn`: под TESTING=1 боевая база не читается — но НЕ
         падением, а честным «не прочитан», который даёт исход НЕИЗВЕСТНО. Тихого зелёного тут нет
@@ -1479,6 +1613,12 @@ class TestO5EyeIsReadOnly(unittest.TestCase):
             self.assertIn("изоляция тестов", got["err"])
             self.assertEqual(ex.client_state({"now": NOW, "client": eye.client_facts(eye.PROD_DB)},
                                              ex.config({}), NOW)[0], ex.CLIENT_UNKNOWN)
+            # И ключ модербота — тем же запретом и с тем же исходом: под гейтом боевая база не
+            # читается, а «не прочитан» даёт НЕИЗВЕСТНО, а не «работы нет».
+            hb = eye.moderbot_heartbeat(eye.PROD_DB)
+            self.assertFalse(hb["ok"])
+            self.assertIn("изоляция тестов", hb["err"])
+            self.assertIsNone(hb["sha_before"], "под изоляцией боевой файл даже не хешируется")
             # А чужой (временный) путь запрет НЕ трогает — иначе тест не смог бы ничего проверить.
             self.assertIsNone(eye.isolation_block(os.path.join(self.dir, "чужая.db")))
         finally:
@@ -1533,15 +1673,61 @@ class TestKidsRoster(unittest.TestCase):
         self.assertEqual(list(ex.KIDS), kids)
         self.assertIn(ex.KIDS_JUDGED, ex.KIDS)
 
-    def test_only_one_kid_of_three_has_an_instrument_and_this_is_said_aloud(self):
-        """Двух детей из трёх здесь не судит НИКТО, и это сама новость, а не пустая графа."""
-        rows = ex.kids_state(kfacts(), ex.config({}), NOW)
-        judged = [k for k in rows if k["why"] != ex.KIDS_NO_INSTRUMENT]
-        self.assertEqual([k["name"] for k in judged], [ex.KIDS_JUDGED])
-        for k in rows:
-            if k["name"] != ex.KIDS_JUDGED:
-                self.assertEqual(k["state"], ex.MOD_UNKNOWN)
-                self.assertNotEqual(k["state"], ex.MOD_IDLE, "третье состояние слито со вторым")
+    def test_every_kid_has_its_own_source_and_its_own_limit(self):
+        """ГЛАВНАЯ ПРАВКА 18.08.2026 ОДНОЙ ПРОВЕРКОЙ: общего признака на всех больше нет. У каждого
+        ребёнка СВОЙ источник и СВОЙ предел свежести, КРАТНЫЙ ЕГО СОБСТВЕННОМУ периоду, — и числа
+        эти замерены (`docs/artifacts/2026-08-18-children-product-recon.md` + живая проба 18.08),
+        а не назначены."""
+        cfg = ex.config({})
+        self.assertEqual(sorted(ex.KID_SIGNS), sorted(ex.KIDS), "признак заведён не всем детям")
+        seen = {}
+        for name in ex.KIDS:
+            sign = ex.KID_SIGNS[name]
+            limit = ex.kid_limit(name, cfg)
+            self.assertGreater(limit, 0.0, "%s остался без предела" % name)
+            self.assertEqual(limit, sign["tick"] * sign["ticks"],
+                             "предел %s не кратен его собственному периоду" % name)
+            seen[name] = (sign["src"], sign["tick"], limit)
+        self.assertEqual(len({s for s, _, _ in seen.values()}), len(ex.KIDS),
+                         "источник у детей общий — ровно этого и не должно быть")
+        # Числа названы поимённо: 10 периодов по 30 с · 5 по 60 с · 180 по 5 с (порог О3).
+        self.assertEqual(seen["pc_agent"], ("pc_agent.log", 30.0, 300.0))
+        self.assertEqual(seen["userbot"], ("turbobaby_session.session", 60.0, 300.0))
+        self.assertEqual(seen["moderation_bot"][1:], (5.0, 900.0))
+        self.assertEqual(ex.kid_limit(ex.KIDS_JUDGED, cfg), cfg["mod"],
+                         "у модербота завелось ВТОРОЕ число о том же ребёнке")
+
+    def test_a_sign_that_moves_only_under_load_is_never_liveness(self):
+        """ПРАВИЛО, А НЕ ПОЖЕЛАНИЕ: признак, который двигается под нагрузкой и замирает в простое,
+        живостью не является — он меряет клиента, а не ребёнка, и врёт ровно в тихую ночь. Такой
+        признак обязан давать «проверить не удалось» И НИКОГДА «работы нет»: звать мёртвым того,
+        чей признак просто не обязан шевелиться, слой права не имеет.
+
+        Проверяется ВНЕСЁННЫМ нарушением, а не верой в таблицу: подменяем признак живого ребёнка
+        на нагрузочный и требуем третьего исхода при заведомо свежем продукте."""
+        was = dict(ex.KID_SIGNS["pc_agent"])
+        try:
+            ex.KID_SIGNS["pc_agent"] = dict(was, src="userbot.log", idle_proof=False)
+            f = kfacts()
+            f["kids"] = {"pc_agent": {"fact": modf(age=1.0), "silence": silent_for(0.0)}}
+            st, info = ex.kid_state("pc_agent", f, ex.config({}), NOW)
+            self.assertEqual(st, ex.MOD_UNKNOWN)
+            self.assertNotEqual(st, ex.MOD_IDLE, "нагрузочный признак вынес приговор")
+            self.assertIn("замирает в простое", info["why"])
+        finally:
+            ex.KID_SIGNS["pc_agent"] = was
+
+    def test_the_rejected_signs_are_named_in_code_and_none_of_them_is_used(self):
+        """Отвергнутые признаки перечислены В КОДЕ, а не в докладе, и ни один не пробрался в
+        источники: запретить «на словах» значит не запретить."""
+        used = {s["src"] for s in ex.KID_SIGNS.values()}
+        for bad in ex.KID_REJECTED:
+            self.assertNotIn(bad, used, "отвергнутый признак %s всё-таки используется" % bad)
+            self.assertTrue(ex.KID_REJECTED[bad].strip(), "у отказа не названа причина: %s" % bad)
+        # Общий канал назван отвергнутым ПОИМЁННО — с него и началась слепота 18.08.
+        self.assertIn("moderation_ipc.db", ex.KID_REJECTED)
+        self.assertIn("userbot.log", ex.KID_REJECTED)
+        self.assertIn("moderation_bot.log", ex.KID_REJECTED)
 
 
 class TestKidsPublication(unittest.TestCase):
@@ -1595,14 +1781,16 @@ class TestKidsPublication(unittest.TestCase):
         self.assertEqual([v["kind"] for v in ex.verdict(f, self.cfg)], ["o3_pc_moderbot"])
 
     def test_third_outcome_survives_into_the_line_as_itself(self):
-        """«Проверить не удалось» доезжает до строки третьим словом, а не вторым: свежая чужая
-        запись в общем файле — это НЕ «работы нет» и НЕ «работает»."""
-        f = kfacts(mod=modf(age=2.0, opened=False))
+        """«Проверить не удалось» доезжает до строки третьим словом, а не вторым. Живой случай
+        третьего исхода: продукт свеж, но пробу процесса сделать НЕ УДАЛОСЬ — значит отличить
+        «работает» от «умер мгновение назад» нечем, и это ни «работы нет», ни «работает»."""
+        f = kfacts(mod=modf(age=2.0, opened=None))
         rows = {k["name"]: k["state"] for k in ex.kids_state(f, self.cfg, NOW)}
         self.assertEqual(rows["moderation_bot"], ex.MOD_UNKNOWN)
+        self.assertNotEqual(rows["moderation_bot"], ex.MOD_IDLE, "третий исход слит со вторым")
         line = ex.render_kids(ex.kids_pulse_due(f, self.cfg, NOW)[1])
         self.assertIn("moderation_bot — %s" % ex.MOD_UNKNOWN, line)
-        self.assertIn("писал не модербот", line)
+        self.assertIn("не подтверждено", line)
         self.assertIn("«проверить не удалось»", line)
 
     def test_line_takes_the_existing_pulse_form_and_not_a_new_one(self):
@@ -1699,9 +1887,14 @@ class TestKidsHands(unittest.TestCase):
         # Все руки, ходящие на диск и в мост, подменяются НА ВРЕМЯ теста: тест, читающий боевые
         # файлы, зелен или красен от того, что сейчас делает демон.
         for name in ("heartbeat_facts", "busy_facts", "trace_facts", "moderbot_facts",
-                     "client_facts", "awake_seconds"):
+                     "client_facts", "awake_seconds", "kid_facts"):
             self.addCleanup(setattr, run_mod, name, getattr(run_mod, name))
         self.real_mod_facts = run_mod.moderbot_facts       # НАСТОЯЩЕЕ чтение файлов, не заглушка
+        self.real_own_facts = run_mod.own_facts
+        # ДВОЕ ОСТАЛЬНЫХ ДЕТЕЙ ПО УМОЛЧАНИЮ БЕЗ ФАКТА: тест, читающий ЖИВЫЕ `pc_agent.log` и
+        # `turbobaby_session.session`, был бы зелен или красен от того, что прямо сейчас делает
+        # боевой контур. Свои проверочные сущности им даёт `_kid_entity` там, где они и нужны.
+        run_mod.kid_facts = lambda name: None
         run_mod.busy_facts = lambda path=None: {"ok": True, "since": None,
                                                 "limit": ex.TASK_TIMEOUT_SEC, "err": ""}
         run_mod.trace_facts = lambda path=None, attempt=None: {
@@ -1710,28 +1903,51 @@ class TestKidsHands(unittest.TestCase):
                                         "total": 0, "last_sent": None,
                                         "pairs": {"ok": True, "sent": 0, "err": "", "last": None}}
 
-    def _entity(self, age, author=False):
-        """ПРОВЕРОЧНАЯ СУЩНОСТЬ — настоящие файлы, читаемые настоящими руками: продукт со своим
-        mtime и лок со своим номером. Боевые `moderation_ipc.db` и `moderation_bot.lock` не
-        тронуты, боевой модербот не поднят и не погашен.
-
-        `author=True` — локом становится НАШ СОБСТВЕННЫЙ процесс (номер + его настоящее время
-        запуска): только так проба авторства отвечает True по-честному, живым ядром, а не моком.
-        `author=False` — номер, которого в системе нет: Windows не раздаёт номера, не кратные
-        четырём."""
-        db = os.path.join(self.dir, "moderation_ipc.db")
-        lock = os.path.join(self.dir, "moderation_bot.lock")
-        with open(db, "w", encoding="utf-8") as f:
-            f.write("проверочная сущность, не боевая база")
-        os.utime(db, (NOW - age, NOW - age))
+    def _lock(self, path, author, age):
+        """Лок проверочной сущности. `author=True` — НАШ СОБСТВЕННЫЙ процесс (номер + его
+        настоящее время запуска): только так проба отвечает True по-честному, живым ядром, а не
+        моком. `author=False` — номер, которого в системе нет (Windows не раздаёт номера, не
+        кратные четырём), то есть ДОКАЗАННАЯ смерть."""
         pid = os.getpid() if author else 999999
-        with open(lock, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(str(pid))
         born = run_mod.process_probe(pid)[1] if author else (NOW - age)
         if born:
-            os.utime(lock, (born, born))
+            os.utime(path, (born, born))
+        return pid
+
+    def _entity(self, age, author=False, channel=1.0):
+        """ПРОВЕРОЧНАЯ СУЩНОСТЬ МОДЕРБОТА — настоящая база SQLite с настоящей таблицей `meta`,
+        читаемая настоящими руками через настоящий `mode=ro`. Боевые `moderation_ipc.db` и
+        `moderation_bot.lock` не тронуты, боевой модербот не поднят и не погашен.
+
+        `age` — возраст ЕГО СОБСТВЕННОГО ключа; `channel` — возраст ОБЩЕГО файла. Они РАЗНЫЕ
+        намеренно: ровно их расхождение и есть класс 18.08 («канал свеж, а его продукта нет»)."""
+        db = os.path.join(self.dir, "moderation_ipc.db")
+        lock = os.path.join(self.dir, "moderation_bot.lock")
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+        con.execute("INSERT INTO meta (k, v) VALUES ('heartbeat', ?) "
+                    "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                    (datetime.datetime.fromtimestamp(NOW - age, datetime.timezone.utc)
+                     .isoformat(),))
+        con.commit()
+        con.close()
+        os.utime(db, (NOW - channel, NOW - channel))
+        self._lock(lock, author, age)
         real = self.real_mod_facts
         return lambda ipc=None, lock_=None, _r=real, _d=db, _l=lock: _r(_d, _l)
+
+    def _kid_entity(self, name, age, author=False):
+        """ПРОВЕРОЧНАЯ СУЩНОСТЬ ребёнка-файла: его личный продукт со своим mtime и его личный лок.
+        Живые `pc_agent.log` и `turbobaby_session.session` не читаются и не пишутся."""
+        product = os.path.join(self.dir, "%s.продукт" % name)
+        lock = os.path.join(self.dir, "%s.lock" % name)
+        with open(product, "w", encoding="utf-8") as f:
+            f.write("проверочная сущность %s" % name)
+        os.utime(product, (NOW - age, NOW - age))
+        self._lock(lock, author, age)
+        return product, lock
 
     def _run(self, awake, now):
         run_mod.heartbeat_facts = lambda path=None: {"ok": True, "raw": hb_at(300.0, now),
@@ -1742,14 +1958,21 @@ class TestKidsHands(unittest.TestCase):
                            pulser=lambda t: (self.pulsed.append(t), True)[1])
 
     def test_dead_kid_on_a_real_entity_is_published_and_not_dropped(self):
-        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ ЦЕЛИКОМ, от файла до строки. Продукт проверочной сущности не
-        двигался 50 минут, номер из лока в системе отсутствует — два наблюдения копят тишину,
-        и периодическая строка обязана НАЗВАТЬ ребёнка неработающим, а не пропасть."""
-        run_mod.moderbot_facts = self._entity(age=3000.0)
-        self._run(awake=100000.0, now=NOW)                    # первое наблюдение: счётчик заведён
-        out = self._run(awake=102000.0, now=NOW + 2000.0)     # второе: тишины накоплено 2000с
-        self.assertEqual(dict((k["name"], k["state"]) for k in out["kids"])["moderation_bot"],
-                         ex.MOD_IDLE)
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ ЦЕЛИКОМ, от файла до строки, И ЭТО ЖИВОЙ СЛУЧАЙ 18.08.2026: свой
+        ключ ребёнка молчит 50 минут, ОБЩИЙ файл при этом свежий (1 с — его двигает сосед), а
+        номера из лока в системе нет. Строка обязана НАЗВАТЬ ребёнка неработающим, а не пропасть
+        вместе с ним и не спрятаться в «неизвестно».
+
+        И приговор выносится ПЕРВЫМ наблюдением: проба процесса накопления тишины не требует —
+        до 18.08 здесь нужны были два наблюдения, а в живом случае второго не случилось бы вовсе
+        (модербота подняли через 6 мин 18 с)."""
+        run_mod.moderbot_facts = self._entity(age=3000.0, author=False, channel=1.0)
+        out = self._run(awake=100000.0, now=NOW)              # ПЕРВОЕ наблюдение — и уже приговор
+        rows = dict((k["name"], k) for k in out["kids"])
+        self.assertEqual(rows["moderation_bot"]["state"], ex.MOD_IDLE)
+        self.assertNotEqual(rows["moderation_bot"]["state"], ex.MOD_UNKNOWN)
+        self.assertLess(rows["moderation_bot"]["channel_age"], 5.0,
+                        "общий файл обязан быть свежим — иначе это не тот класс")
         self.assertEqual(out["kids_pulse"], "ушла")
         line = self.pulsed[-1]
         self.assertIn("moderation_bot — %s" % ex.MOD_IDLE, line)
@@ -1760,6 +1983,45 @@ class TestKidsHands(unittest.TestCase):
         # попала ни разу — периодическая запись тревогой не является.
         self.assertTrue(any("не делает свою работу" in n for n in self.noted))
         self.assertEqual([n for n in self.noted if n.startswith(ex.PULSE_HEAD)], [])
+        # Второе наблюдение состояния не меняет и ВТОРОЙ строки не рождает: период не вышел.
+        out2 = self._run(awake=102000.0, now=NOW + 2000.0)
+        self.assertEqual(dict((k["name"], k["state"]) for k in out2["kids"])["moderation_bot"],
+                         ex.MOD_IDLE)
+        self.assertIsNone(out2["kids_pulse"])
+        self.assertEqual(len(self.pulsed), 1)
+
+    def test_each_kid_is_judged_by_its_own_sign_end_to_end(self):
+        """ЦЕЛЬ ЗАХОДА ЦЕЛИКОМ, ОТ ФАЙЛА ДО СТРОКИ: три ребёнка, три РАЗНЫХ источника и три РАЗНЫХ
+        исхода в ОДНОЙ строке — «одно слово на всех» больше не бывает.
+
+          pc_agent       свой продукт свеж, процесс жив           → делает работу
+          userbot        процесса из лока в системе НЕТ           → работы нет (и сразу, не через порог)
+          moderation_bot своего ключа не прочитать, лока нет      → неизвестно
+
+        Боевых процессов не поднято и не погашено ни одного: всё это файлы во временном каталоге."""
+        made = {"pc_agent": self._kid_entity("pc_agent", age=1.0, author=True),
+                "userbot": self._kid_entity("userbot", age=1.0, author=False)}
+        real_own = self.real_own_facts
+        run_mod.kid_facts = lambda name, _m=made, _r=real_own: (
+            None if _m.get(name) is None else _r(_m[name][0], _m[name][1], name))
+        gone = os.path.join(self.dir, "нет")
+        run_mod.moderbot_facts = (lambda ipc=None, lock=None, _r=self.real_mod_facts, _g=gone:
+                                  _r(_g + ".db", _g + ".lock"))
+        out = self._run(awake=100000.0, now=NOW)
+        rows = {k["name"]: k for k in out["kids"]}
+        self.assertEqual(rows["pc_agent"]["state"], ex.MOD_OK)
+        self.assertEqual(rows["userbot"]["state"], ex.MOD_IDLE)
+        self.assertEqual(rows["moderation_bot"]["state"], ex.MOD_UNKNOWN)
+        self.assertEqual(len({k["state"] for k in out["kids"]}), 3,
+                         "три ребёнка — три состояния, а не одно слово на всех")
+        line = self.pulsed[-1]
+        self.assertIn("pc_agent — %s" % ex.MOD_OK, line)
+        self.assertIn("userbot — %s (процесса из лока в системе нет)" % ex.MOD_IDLE, line)
+        self.assertIn("moderation_bot — %s" % ex.MOD_UNKNOWN, line)
+        self.assertLessEqual(len(line), ex.KIDS_LINE_MAX)
+        # У каждого в отчёте назван СВОЙ источник — «работы нет» без имени признака непроверяемо.
+        self.assertEqual(rows["pc_agent"]["src"], "pc_agent.log")
+        self.assertEqual(rows["userbot"]["src"], "turbobaby_session.session")
 
     def test_a_working_kid_is_published_too_and_the_attempt_is_remembered(self):
         """Вторая сторона: ребёнок РАБОТАЕТ — строка всё равно выходит (иначе молчание живого

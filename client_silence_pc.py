@@ -46,7 +46,26 @@
 ИЗОЛЯЦИЯ: под `TESTING=1` боевая база НЕ ЧИТАЕТСЯ (зеркало тривайра `moderation_ipc._conn`).
 Отличие сознательное — здесь это НЕ исключение, а честный отказ `ok=False` с причиной: у слоя
 ожиданий непрочитанный источник даёт исход «НЕИЗВЕСТНО», и он громче тихого падения.
+
+ВТОРОЙ ПРЕДМЕТ ЭТОГО ГЛАЗА (18.08.2026) — СОБСТВЕННЫЙ ПРОДУКТ МОДЕРБОТА, ключ `meta['heartbeat']`.
+Он живёт здесь не по родству тем, а по замку: файл слоя с `sqlite3` ровно один, и второй заводить
+значило бы ослабить инвариант вместо того, чтобы им пользоваться. Соединение по-прежнему ОДНО на
+весь модуль (`_ro_conn`) — это проверяется `ast`-ом, а не обещанием.
+
+ЗАЧЕМ КЛЮЧ, ЕСЛИ ЕСТЬ mtime ФАЙЛА. Затем, что файл ОБЩИЙ: в `moderation_ipc.db` пишут трое —
+модербот тиком (5 с), userbot поллером черновиков (3 с) и тренажёр сессией. «Файл шевельнулся»
+означает «кто-то писал», и на этом наблюдение за модерботом 18.08 и сломалось. Ключ пишет РОВНО
+ОДНА строка кода (`moderation_ipc.heartbeat` ← `moderation_bot.job_heartbeat`), поэтому его
+значение — подпись автора, а не след соседа. Значение уезжает наружу СЫРОЙ СТРОКОЙ: разбор времени
+живёт в решении (`expectations_pc.parse_iso`), у которого он уже есть и уже проверен.
+
+КОНТРОЛЬНАЯ СУММА ДО И ПОСЛЕ — свидетель, а НЕ доказательство, и разница названа честно. У файла
+живой писатель с тиком 5 с, поэтому расхождение хешей не различает «подвинули мы» и «подвинул он»:
+совпали — доказано, что за наше окно файл не менялся вовсе; разошлись — `sha_same=False`, и
+доказательством чтения-только служит НЕ хеш, а режим `mode=ro`, которым SQLite отбивает любой
+глагол записи на уровне ОС (живой отказ — в тесте `TestO5EyeIsReadOnly`).
 """
+import hashlib
 import json
 import os
 import sqlite3
@@ -69,6 +88,11 @@ READ_TIMEOUT_SEC = 2.0
 # нет намеренно — фикстура обязана копировать прод, а не схему.
 PAIRS_SENT_MARK = '"sent": true'
 PAIRS_MAX_BYTES = 8 * 1024 * 1024   # потолок чтения реестра: выше — «не опрошен», а не полчаса I/O
+# Имя ключа СОБСТВЕННОГО продукта модербота. Держится копией (наблюдатель не импортирует
+# наблюдаемого) и закреплён тестом, читающим `moderation_ipc.heartbeat` исходником: переименуют
+# ключ — обязано ПОКРАСНЕТЬ здесь, а не молча превратиться в вечное «неизвестно».
+MOD_HB_KEY = "heartbeat"
+SHA_CHUNK = 1024 * 1024
 
 
 def ro_uri(path):
@@ -93,6 +117,28 @@ def isolation_block(path):
     return "изоляция тестов (TESTING=1): боевая moderation_ipc.db не читается"
 
 
+def _ro_conn(path):
+    """ЕДИНСТВЕННОЕ место всего слоя, где база вообще открывается. Отдельной функцией — не ради
+    краткости: тест считает вызовы `connect` `ast`-ом и требует, чтобы он был ровно один. Второй
+    предмет глаза (ключ модербота) обязан ходить ТОЙ ЖЕ дорогой, а не завести себе свою."""
+    return sqlite3.connect(ro_uri(path), uri=True, timeout=READ_TIMEOUT_SEC)
+
+
+def sha256_file(path):
+    """Контрольная сумма файла | None. Кусками: база боевая и полтора мегабайта весит."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(SHA_CHUNK)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
 def db_counts(db=None):
     """ИСТОЧНИК ИСТИНЫ → числа. {"ok","err","db","total","sent","attempted","armed","statuses",
     "last_sent"}.
@@ -113,7 +159,7 @@ def db_counts(db=None):
         return out
     con = None
     try:
-        con = sqlite3.connect(ro_uri(path), uri=True, timeout=READ_TIMEOUT_SEC)
+        con = _ro_conn(path)
         rows = con.execute("SELECT status, COUNT(*), MAX(updated_ts) "
                            "FROM drafts GROUP BY status").fetchall()
     except sqlite3.Error as e:
@@ -199,6 +245,70 @@ def pairs_counts(pairs=None):
     return out
 
 
+# ═══════ СОБСТВЕННЫЙ ПРОДУКТ МОДЕРБОТА: КЛЮЧ В ОБЩЕЙ БАЗЕ, ЧИТАЕМЫЙ ТОЛЬКО НА ЧТЕНИЕ ═══════
+def moderbot_heartbeat(db=None):
+    """Ключ `meta['heartbeat']` → {"ok","err","db","raw","channel","sha_before","sha_after",
+    "sha_same"}.
+
+    ЧТО ЗДЕСЬ ПРЕДМЕТ, А ЧТО СВЕДЕНИЕ, И ЭТО ГЛАВНОЕ РАЗЛИЧЕНИЕ ФУНКЦИИ:
+      · `raw` — ПРЕДМЕТ: подпись модербота собственным временем. Пишет её ровно одна строка кода,
+        поэтому свежесть значения — его продукт, а не чей-то;
+      · `channel` — mtime ОБЩЕГО файла. Это СВЕДЕНИЕ и только: писателей у файла трое, и ни одна
+        ветка решения не имеет права построить на нём зелёное. Отдаём его, чтобы владелец видел
+        обе величины разом (18.08: канал свеж 400 с, а модербота в системе уже нет).
+
+    ВРЕМЯ ЗДЕСЬ НЕ РАЗБИРАЕТСЯ НАМЕРЕННО: разбор ISO живёт в решении (`expectations_pc.parse_iso`),
+    у которого он уже есть, уже знает оба живых формата и уже проверен. Глаз отдаёт строку.
+
+    ЧТЕНИЕ И НИЧЕГО КРОМЕ: `mode=ro` (запись отбивает SQLite), контрольная сумма снимается ДО и
+    ПОСЛЕ. `sha_same=True` — доказано, что файл за наше окно не менялся вовсе; `False` — за окно
+    его подвинули, и это не различает нас и боевого писателя (тик 5 с), поэтому доказательством
+    служит режим, а не хеш; `None` — сумму снять не удалось.
+
+    Каждая дырка (изоляция · файла нет · sqlite отказал · таблицы `meta` нет · ключа нет) даёт
+    `ok=False` с НАЗВАННОЙ причиной, то есть исход «неизвестно» у решения, а не «работы нет».
+    """
+    path = PROD_DB if db is None else db
+    out = {"ok": False, "err": "", "db": path, "raw": None, "channel": None,
+           "sha_before": None, "sha_after": None, "sha_same": None}
+    blocked = isolation_block(path)
+    if blocked is not None:
+        out["err"] = blocked
+        return out
+    if not os.path.isfile(path):
+        out["err"] = "файла источника нет: %s" % os.path.basename(path)
+        return out
+    try:
+        out["channel"] = os.stat(path).st_mtime
+    except OSError as e:
+        out["err"] = "mtime общего канала не снят: %s" % str(e)[:60]      # сведение, не предмет
+    out["sha_before"] = sha256_file(path)
+    con, row, err = None, None, ""
+    try:
+        con = _ro_conn(path)
+        row = con.execute("SELECT v FROM meta WHERE k = ?", (MOD_HB_KEY,)).fetchone()
+    except sqlite3.Error as e:
+        err = "%s: %s" % (type(e).__name__, str(e)[:120])
+    finally:
+        if con is not None:
+            con.close()
+    out["sha_after"] = sha256_file(path)
+    if out["sha_before"] is not None and out["sha_after"] is not None:
+        out["sha_same"] = out["sha_before"] == out["sha_after"]
+    if err:
+        out["err"] = err
+        return out
+    if row is None:
+        out["err"] = "ключа «%s» в meta нет" % MOD_HB_KEY
+        return out
+    out["raw"] = "" if row[0] is None else str(row[0])
+    if not out["raw"]:
+        out["err"] = "ключ «%s» пуст" % MOD_HB_KEY
+        return out
+    out["ok"] = True
+    return out
+
+
 def client_facts(db=None, pairs=None):
     """ФАКТ О5 для слоя ожиданий: числа обоих свидетелей в одном словаре. Решения здесь нет —
     его выносит `expectations_pc.client_state` (чистая функция), как и у всех прочих ожиданий."""
@@ -223,6 +333,15 @@ def main():
     print("второй свидетель (%s): прочитан=%s строк=%d, отправок=%d, последняя=%s%s"
           % (os.path.basename(p["path"]), "да" if p["ok"] else "НЕТ", p["lines"], p["sent"],
              p["last"], "" if p["err"] == "" else " (%s)" % p["err"]))
+    hb = moderbot_heartbeat()
+    print("СВОЙ продукт модербота (meta['%s']): %s%s"
+          % (MOD_HB_KEY, hb["raw"] if hb["ok"] else "НЕ ПРОЧИТАН",
+             "" if hb["err"] == "" else " (%s)" % hb["err"]))
+    print("контрольная сумма файла до и после чтения: %s (общий канал — сведение, mtime %s)"
+          % ({True: "СОВПАЛА — файл не тронут", False: "разошлась — файл подвинул боевой писатель "
+              "(тик 5 с); чтение-только доказывает mode=ro, а не хеш"}.get(hb["sha_same"],
+                                                                           "снять не удалось"),
+             hb["channel"]))
     return 0
 
 
