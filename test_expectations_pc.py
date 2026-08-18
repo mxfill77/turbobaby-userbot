@@ -1489,6 +1489,321 @@ class TestO5EyeIsReadOnly(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
+#  ПУБЛИКАЦИЯ ВЕРДИКТА О ДЕТЯХ (18.08.2026). ГЛАВНЫЙ КЕЙС — ОТРИЦАТЕЛЬНЫЙ: РЕБЁНОК МЁРТВ →
+#  ПЕРИОДИЧЕСКАЯ СТРОКА ОБЯЗАНА СКАЗАТЬ «РАБОТЫ НЕТ», А НЕ ПРОПАСТЬ ВМЕСТЕ С НИМ
+# ══════════════════════════════════════════════════════════════════════════════════════════
+def kfacts(mod=None, mod_silence=None, last=None, trace_age=600.0, hb_age=354.0, now=NOW):
+    """Факты со ВСЕМ, что нужно публикации: ветка О3 (кого судим), ветка О4 (чем доказан оборот)
+    и память о прошлой строке (когда говорили наружу и ЧТО сказали)."""
+    f = lfacts(trace_age=trace_age, hb_age=hb_age, now=now)
+    f["moderbot"] = modf(now=now) if mod is None else mod
+    f["mod_silence"] = ({"measured": False, "awake": 0.0, "since": now,
+                         "why": "своя запись в IPC — тишина обнулена"}
+                        if mod_silence is None else mod_silence)
+    f["kids_last"] = {"attempt": None, "sig": None} if last is None else last
+    return f
+
+
+def _watchdog_kids():
+    """Имена детей ИЗ ИСХОДНИКА демона — `ast`, а не импорт: наблюдатель не импортирует
+    наблюдаемого, и тест не смеет поднимать боевой модуль ради списка строк."""
+    with open(os.path.join(REPO, "pc_orchestrator.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_client_watch_specs":
+            out = []
+            for d in ast.walk(node):
+                if isinstance(d, ast.Dict):
+                    for k, v in zip(d.keys, d.values):
+                        if isinstance(k, ast.Constant) and k.value == "name" \
+                                and isinstance(v, ast.Constant):
+                            out.append(v.value)
+            return out
+    return []
+
+
+class TestKidsRoster(unittest.TestCase):
+    """Перечень детей — не литература: он обязан совпасть с тем, кого демон реально поднимает."""
+
+    def test_roster_is_exactly_the_daemon_watchdog_list(self):
+        """FAIL-CLOSED: новый ребёнок у контур-вотчдога обязан ПОКРАСНЕТЬ здесь, а не молча
+        выпасть из публикации. Список читается из живого исходника демона, а не из фикстуры."""
+        kids = _watchdog_kids()
+        self.assertTrue(kids, "имена детей в pc_orchestrator._client_watch_specs не найдены")
+        self.assertEqual(list(ex.KIDS), kids)
+        self.assertIn(ex.KIDS_JUDGED, ex.KIDS)
+
+    def test_only_one_kid_of_three_has_an_instrument_and_this_is_said_aloud(self):
+        """Двух детей из трёх здесь не судит НИКТО, и это сама новость, а не пустая графа."""
+        rows = ex.kids_state(kfacts(), ex.config({}), NOW)
+        judged = [k for k in rows if k["why"] != ex.KIDS_NO_INSTRUMENT]
+        self.assertEqual([k["name"] for k in judged], [ex.KIDS_JUDGED])
+        for k in rows:
+            if k["name"] != ex.KIDS_JUDGED:
+                self.assertEqual(k["state"], ex.MOD_UNKNOWN)
+                self.assertNotEqual(k["state"], ex.MOD_IDLE, "третье состояние слито со вторым")
+
+
+class TestKidsPublication(unittest.TestCase):
+    """Периодическая строка о детях: что в ней сказано, когда она выходит и когда молчит."""
+
+    def setUp(self):
+        self.cfg = ex.config({})
+
+    def test_period_is_the_six_hours_borrowed_from_o4_with_its_lock(self):
+        self.assertEqual((self.cfg["kids"], self.cfg["kids_retry"]), (21600.0, 1800.0))
+        # Тот же замок выбора, что у О4: ДВА полных окна обязаны уместиться в измеренные 16 ч
+        # серверного О4 — одна потерянная строка не стоит соседу ложной тревоги.
+        self.assertLessEqual(2 * self.cfg["kids"], 16 * 3600.0)
+
+    def test_the_instrument_itself_is_untouched(self):
+        """ЦЕЛЬ ЗАХОДА — ГОЛОС, А НЕ ПРИБОР: порог О3 прежний, вид нарушения прежний, и своего
+        вида нарушения у публикации нет вовсе — она ПРОИЗВОДИТ строку, а не судит."""
+        self.assertEqual(self.cfg["mod"], 900.0)
+        self.assertIn("o3_pc_moderbot", ex.KINDS)
+        self.assertEqual([k for k in ex.KINDS if "kid" in k], [])
+
+    def test_every_kid_is_named_with_its_own_state(self):
+        due, info = ex.kids_pulse_due(kfacts(), self.cfg, NOW)
+        self.assertTrue(due)
+        line = ex.render_kids(info)
+        for name in ex.KIDS:
+            self.assertIn(name, line, "ребёнок %s в строке не назван" % name)
+        self.assertIn("moderation_bot — %s" % ex.MOD_OK, line)
+
+    def test_the_word_alive_is_never_said_about_a_kid(self):
+        """Закон полосы: «жив» и «работает» — разные слова, и первого этот слой не говорит.
+        Три состояния задания живут здесь словами О3, а не переводом в «жив/не жив»."""
+        rows = ex.kids_state(kfacts(), self.cfg, NOW)
+        self.assertEqual(sorted({k["state"] for k in rows}), sorted({ex.MOD_OK, ex.MOD_UNKNOWN}))
+        line = ex.render_kids(ex.kids_pulse_due(kfacts(), self.cfg, NOW)[1])
+        self.assertNotIn("— жив", line)
+        self.assertNotIn("не жив", line)
+
+    def test_dead_kid_is_named_dead_and_never_dropped(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ, чистая половина: продукта нет 25 минут при живом PID → строка
+        обязана СКАЗАТЬ «работы нет», а не исчезнуть вместе с ребёнком."""
+        f = kfacts(mod=modf(age=1800.0), mod_silence=silent_for(1500.0))
+        rows = {k["name"]: k["state"] for k in ex.kids_state(f, self.cfg, NOW)}
+        self.assertEqual(rows["moderation_bot"], ex.MOD_IDLE)
+        due, info = ex.kids_pulse_due(f, self.cfg, NOW)
+        self.assertTrue(due, "мёртвый ребёнок отменил периодическую строку")
+        line = ex.render_kids(info)
+        self.assertIn("moderation_bot — %s" % ex.MOD_IDLE, line)
+        self.assertIn("своего продукта нет", line)
+        # И громкость при этом ОТДЕЛЬНАЯ: заметка владельцу — своя ветка и свой канал.
+        self.assertEqual([v["kind"] for v in ex.verdict(f, self.cfg)], ["o3_pc_moderbot"])
+
+    def test_third_outcome_survives_into_the_line_as_itself(self):
+        """«Проверить не удалось» доезжает до строки третьим словом, а не вторым: свежая чужая
+        запись в общем файле — это НЕ «работы нет» и НЕ «работает»."""
+        f = kfacts(mod=modf(age=2.0, opened=False))
+        rows = {k["name"]: k["state"] for k in ex.kids_state(f, self.cfg, NOW)}
+        self.assertEqual(rows["moderation_bot"], ex.MOD_UNKNOWN)
+        line = ex.render_kids(ex.kids_pulse_due(f, self.cfg, NOW)[1])
+        self.assertIn("moderation_bot — %s" % ex.MOD_UNKNOWN, line)
+        self.assertIn("писал не модербот", line)
+        self.assertIn("«проверить не удалось»", line)
+
+    def test_line_takes_the_existing_pulse_form_and_not_a_new_one(self):
+        """Форма не изобретена: тип `NOTE` первым словом (иначе писатель молча сделает `DONE`),
+        та же голова, та же полоса, тот же разделитель и ДОСЛОВНО тот же сегмент об обороте,
+        по которому сосед разбирает пульс демона."""
+        info = ex.kids_pulse_due(kfacts(), self.cfg, NOW)[1]
+        line = ex.render_kids(info)
+        self.assertTrue(line.startswith(ex.PULSE_HEAD + " · ПК · "))
+        self.assertIn("контур жив: оборот poll_once", line)
+        self.assertIn("контур жив: оборот poll_once", ex.render_pulse(info))
+        self.assertNotIn("🔔", line, "строка не тревога — значка заметки в ней быть не может")
+        # Число детей на разбор влиять не должно: сегментов всегда пять, дети — внутри своего.
+        self.assertEqual(len(line.split(" · ")), 5)
+
+    def test_the_line_fits_the_writer_even_when_every_reason_is_huge(self):
+        """Замок длины: строка длиннее 600 уедет ТЕЛОМ В ФАЙЛ, и сосед перестанет видеть детей
+        ровно тогда, когда о них есть что сказать. Имена и состояния не режутся никогда."""
+        info = {"limit": 21600.0, "turn": {"wall": 300.0},
+                "kids": [{"name": n, "state": ex.MOD_UNKNOWN, "why": "п" * 400}
+                         for n in ex.KIDS]}
+        line = ex.render_kids(info)
+        self.assertLessEqual(len(line), ex.KIDS_LINE_MAX)
+        for name in ex.KIDS:
+            self.assertIn("%s — %s" % (name, ex.MOD_UNKNOWN), line)
+
+    def test_it_speaks_because_time_passed_not_because_something_happened(self):
+        """СМЫСЛ ЗАХОДА ОДНОЙ ПРОВЕРКОЙ: состояние НЕ менялось, событий нет — строка всё равно
+        выходит, как только истёк период. Именно этого не хватало соседу, чтобы поднять ожидание."""
+        sig = ex.kids_signature(ex.kids_state(kfacts(), self.cfg, NOW))
+        fresh = kfacts(last={"attempt": NOW - 3600.0, "sig": sig})
+        due, info = ex.kids_pulse_due(fresh, self.cfg, NOW)
+        self.assertFalse(due)
+        self.assertIn("строка о детях свежая", info["why"])
+        old = kfacts(last={"attempt": NOW - 7 * 3600.0, "sig": sig})
+        due, info = ex.kids_pulse_due(old, self.cfg, NOW)
+        self.assertTrue(due)
+        self.assertEqual(info["why"], "период вышел")
+
+    def test_a_change_of_state_speaks_before_the_period_but_not_below_the_floor(self):
+        """Упавший ребёнок не ждёт шести часов; мигающий — не долбит канал каждые десять минут."""
+        was = ex.kids_signature(ex.kids_state(kfacts(), self.cfg, NOW))
+        dead = dict(mod=modf(age=1800.0), mod_silence=silent_for(1500.0))
+        f = kfacts(last={"attempt": NOW - 3600.0, "sig": was}, **dead)
+        due, info = ex.kids_pulse_due(f, self.cfg, NOW)
+        self.assertTrue(due)
+        self.assertEqual(info["why"], "состояние детей сменилось")
+        soon = kfacts(last={"attempt": NOW - 300.0, "sig": was}, **dead)
+        due, info = ex.kids_pulse_due(soon, self.cfg, NOW)
+        self.assertFalse(due)
+        self.assertIn("пол повтора", info["why"])
+
+    def test_no_turn_means_no_line_so_the_neighbour_keeps_its_fangs(self):
+        """ГЛАВНЫЙ ЗАМОК: серверное О4 считает следом ЛЮБУЮ строку ПК. Периодическая строка,
+        уходящая при вставшем демоне, отняла бы у соседа зубы — поэтому оборот не доказан значит
+        молчание, и это молчание само по себе новость."""
+        f = kfacts(hb_age=99999.0)
+        f["silence"] = {"measured": True, "awake": 99999.0, "why": ""}
+        due, info = ex.kids_pulse_due(f, self.cfg, NOW)
+        self.assertFalse(due)
+        self.assertIn("наружу говорить нечего", info["why"])
+        # Штамп объявленного захода для О2 — работа, а для публикации доказательством НЕ является
+        # (тот же запрет, что у О4: заход объявлен ≠ виток замкнут).
+        busy = kfacts(hb_age=1800.0)
+        busy["busy"] = stamp(600.0)
+        busy["silence"] = {"measured": True, "awake": 1800.0, "why": ""}
+        self.assertEqual(ex.turn_state(busy, self.cfg, NOW)[0], ex.TURN_OK)
+        self.assertFalse(ex.kids_pulse_due(busy, self.cfg, NOW)[0])
+
+    def test_zero_kills_the_branch_before_any_fact_is_read(self):
+        cfg0 = ex.config({"EXPECT_PC_KIDS_MIN": "0"})
+        due, info = ex.kids_pulse_due(kfacts(), cfg0, NOW)
+        self.assertFalse(due)
+        self.assertIn("выключена порогом", info["why"])
+        # А выключенное О3 не уносит строку с собой: она честно скажет «неизвестно» обо всех.
+        cfg_mod0 = ex.config({"EXPECT_PC_MOD_MIN": "0"})
+        rows = ex.kids_state(kfacts(), cfg_mod0, NOW)
+        self.assertEqual({k["state"] for k in rows}, {ex.MOD_UNKNOWN})
+        self.assertTrue(ex.kids_pulse_due(kfacts(), cfg_mod0, NOW)[0])
+
+
+class TestKidsHands(unittest.TestCase):
+    """Руки публикации: ЖИВОЙ файл проверочной сущности, свой счётчик попыток, свой канал.
+
+    Боевые процессы здесь не поднимаются и не гасятся ни одной строкой: «мёртвый ребёнок» — это
+    отдельный файл в своём временном каталоге, а не убитый модербот."""
+
+    def setUp(self):
+        self.cfg = ex.config({})
+        self.dir = tempfile.mkdtemp(prefix="expect_pc_kids_")
+        os.environ["CC_EXPECT_PC_DIR"] = self.dir
+        self.addCleanup(os.environ.pop, "CC_EXPECT_PC_DIR", None)
+        self.pulsed, self.noted = [], []
+        # Все руки, ходящие на диск и в мост, подменяются НА ВРЕМЯ теста: тест, читающий боевые
+        # файлы, зелен или красен от того, что сейчас делает демон.
+        for name in ("heartbeat_facts", "busy_facts", "trace_facts", "moderbot_facts",
+                     "client_facts", "awake_seconds"):
+            self.addCleanup(setattr, run_mod, name, getattr(run_mod, name))
+        self.real_mod_facts = run_mod.moderbot_facts       # НАСТОЯЩЕЕ чтение файлов, не заглушка
+        run_mod.busy_facts = lambda path=None: {"ok": True, "since": None,
+                                                "limit": ex.TASK_TIMEOUT_SEC, "err": ""}
+        run_mod.trace_facts = lambda path=None, attempt=None: {
+            "ok": True, "ts": NOW - 600.0, "line": "", "attempt": attempt, "err": ""}
+        run_mod.client_facts = lambda: {"ok": True, "sent": 0, "armed": 0, "attempted": 0,
+                                        "total": 0, "last_sent": None,
+                                        "pairs": {"ok": True, "sent": 0, "err": "", "last": None}}
+
+    def _entity(self, age, author=False):
+        """ПРОВЕРОЧНАЯ СУЩНОСТЬ — настоящие файлы, читаемые настоящими руками: продукт со своим
+        mtime и лок со своим номером. Боевые `moderation_ipc.db` и `moderation_bot.lock` не
+        тронуты, боевой модербот не поднят и не погашен.
+
+        `author=True` — локом становится НАШ СОБСТВЕННЫЙ процесс (номер + его настоящее время
+        запуска): только так проба авторства отвечает True по-честному, живым ядром, а не моком.
+        `author=False` — номер, которого в системе нет: Windows не раздаёт номера, не кратные
+        четырём."""
+        db = os.path.join(self.dir, "moderation_ipc.db")
+        lock = os.path.join(self.dir, "moderation_bot.lock")
+        with open(db, "w", encoding="utf-8") as f:
+            f.write("проверочная сущность, не боевая база")
+        os.utime(db, (NOW - age, NOW - age))
+        pid = os.getpid() if author else 999999
+        with open(lock, "w", encoding="utf-8") as f:
+            f.write(str(pid))
+        born = run_mod.process_probe(pid)[1] if author else (NOW - age)
+        if born:
+            os.utime(lock, (born, born))
+        real = self.real_mod_facts
+        return lambda ipc=None, lock_=None, _r=real, _d=db, _l=lock: _r(_d, _l)
+
+    def _run(self, awake, now):
+        run_mod.heartbeat_facts = lambda path=None: {"ok": True, "raw": hb_at(300.0, now),
+                                                     "err": ""}
+        run_mod.awake_seconds = lambda: awake
+        return run_mod.run(dry=False, now=now, getter=lambda status: {"ok": True, "items": []},
+                           notifier=lambda t: (self.noted.append(t), True)[1],
+                           pulser=lambda t: (self.pulsed.append(t), True)[1])
+
+    def test_dead_kid_on_a_real_entity_is_published_and_not_dropped(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ ЦЕЛИКОМ, от файла до строки. Продукт проверочной сущности не
+        двигался 50 минут, номер из лока в системе отсутствует — два наблюдения копят тишину,
+        и периодическая строка обязана НАЗВАТЬ ребёнка неработающим, а не пропасть."""
+        run_mod.moderbot_facts = self._entity(age=3000.0)
+        self._run(awake=100000.0, now=NOW)                    # первое наблюдение: счётчик заведён
+        out = self._run(awake=102000.0, now=NOW + 2000.0)     # второе: тишины накоплено 2000с
+        self.assertEqual(dict((k["name"], k["state"]) for k in out["kids"])["moderation_bot"],
+                         ex.MOD_IDLE)
+        self.assertEqual(out["kids_pulse"], "ушла")
+        line = self.pulsed[-1]
+        self.assertIn("moderation_bot — %s" % ex.MOD_IDLE, line)
+        self.assertTrue(line.startswith(ex.PULSE_HEAD))
+        for name in ex.KIDS:
+            self.assertIn(name, line)
+        # ГРОМКОСТЬ ОТДЕЛЬНО: заметка владельцу ушла своим каналом, а строка журнала в него не
+        # попала ни разу — периодическая запись тревогой не является.
+        self.assertTrue(any("не делает свою работу" in n for n in self.noted))
+        self.assertEqual([n for n in self.noted if n.startswith(ex.PULSE_HEAD)], [])
+
+    def test_a_working_kid_is_published_too_and_the_attempt_is_remembered(self):
+        """Вторая сторона: ребёнок РАБОТАЕТ — строка всё равно выходит (иначе молчание живого
+        ребёнка не отличить от молчания журнала), а повтор держится собственным счётчиком."""
+        run_mod.moderbot_facts = self._entity(age=1.0, author=True)
+        out = self._run(awake=100000.0, now=NOW)
+        self.assertEqual(out["kids_pulse"], "ушла")
+        self.assertIn("moderation_bot — %s" % ex.MOD_OK, self.pulsed[-1])
+        self.assertEqual(len(self.pulsed), 1)
+        st = run_mod.load_state()
+        self.assertEqual(st["kids"]["sig"],
+                         "pc_agent=%s|userbot=%s|moderation_bot=%s"
+                         % (ex.MOD_UNKNOWN, ex.MOD_UNKNOWN, ex.MOD_OK))
+        # Через десять минут — молчим: период не вышел, состояние прежнее.
+        out2 = self._run(awake=100600.0, now=NOW + 600.0)
+        self.assertIsNone(out2["kids_pulse"])
+        self.assertIn("строка о детях свежая", out2["kids_why"])
+        self.assertEqual(len(self.pulsed), 1)
+
+    def test_dry_run_touches_no_channel_at_all(self):
+        run_mod.moderbot_facts = self._entity(age=1.0, author=True)
+        run_mod.heartbeat_facts = lambda path=None: {"ok": True, "raw": hb_at(300.0, NOW), "err": ""}
+        run_mod.awake_seconds = lambda: 100000.0
+        out = run_mod.run(dry=True, now=NOW, getter=lambda status: {"ok": True, "items": []},
+                          notifier=lambda t: (self.noted.append(t), True)[1],
+                          pulser=lambda t: (self.pulsed.append(t), True)[1])
+        self.assertEqual((self.pulsed, self.noted), ([], []))
+        self.assertEqual(out["kids_pulse"], "нужна (сухой прогон — не пишем)")
+        self.assertIn("дети контура", out["kids_line"])
+
+    def test_the_channel_is_the_journal_and_never_the_owner_card(self):
+        """Замок канала читается из КОДА, а не из докстринга: руки публикации зовут писателя
+        журнала и не зовут доставку карточек."""
+        with open(RUN_SRC, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        fn = [n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "maybe_kids_pulse"]
+        self.assertEqual(len(fn), 1)
+        names = {n.id for n in ast.walk(fn[0]) if isinstance(n, ast.Name)}
+        self.assertIn("send_pulse", names)
+        self.assertNotIn("send_note", names)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
 #  ИНВАРИАНТ EXPECT_PC_PURE — граница держится отсутствием инструментов, а не докстрингом
 #  (зеркало CARD_DUTY_PURE этой полосы и EXPECTATIONS_PURE серверной)
 # ══════════════════════════════════════════════════════════════════════════════════════════

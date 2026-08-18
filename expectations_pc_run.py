@@ -50,8 +50,14 @@ TTL подтверждения `process_approval_timeouts`, сторож зас�
 FAIL-SAFE: любой сбой сбора → факта нет → вердикта нет (молчание). Заметка не ушла → эпизод НЕ
 помечен, скажем на следующем прогоне.
 
+ПУБЛИКАЦИЯ ВЕРДИКТА О ДЕТЯХ (18.08.2026) НОВЫХ ФАКТОВ НЕ СОБИРАЕТ НИ ОДНОГО: она берёт готовый
+вердикт О3 и кладёт его наружу ПЕРИОДИЧЕСКОЙ строкой журнала (`maybe_kids_pulse`), тем же каналом
+и в той же форме, что пульс О4. Тревогой не является: карточки не рождает, владельцу сама по себе
+не показывается — громкость про детей по-прежнему целиком за заметкой О3.
+
 ОТКАТ: порог соответствующей ветки = 0 в окружении (EXPECT_PC_NEW_MIN / EXPECT_PC_RUN_MIN /
-EXPECT_PC_TURN_MIN / EXPECT_PC_MOD_MIN / EXPECT_PC_LIFE_MIN / EXPECT_PC_CLIENT_MIN) — ветка мертва
+EXPECT_PC_TURN_MIN / EXPECT_PC_MOD_MIN / EXPECT_PC_LIFE_MIN / EXPECT_PC_CLIENT_MIN /
+EXPECT_PC_KIDS_MIN) — ветка мертва
 целиком (у О5 умирают ОБА исхода: и «ушло», и «ослеп»); полностью —
 снять задачу Планировщика наблюдателя. У О4 откат стоит ЛИШНЕЙ строки в мозге раз в 6 часов и
 возвращает серверное О4 к прежнему признаку «след работы», то есть к 4 ложным эпизодам за 11 суток.
@@ -577,6 +583,7 @@ def snapshot(state, now=None, getter=None):
     mod = moderbot_facts()
     awake = awake_seconds()
     life = state.get("life") if isinstance(state.get("life"), dict) else {}
+    life_kids = state.get("kids") if isinstance(state.get("kids"), dict) else {}
     client = client_facts()
     return {
         "now": now,
@@ -594,6 +601,11 @@ def snapshot(state, now=None, getter=None):
         # обновляется ПОСЛЕ чтения, тем же наблюдением, а не задним числом.
         "client": client,
         "client_unknown": update_client_unknown(state, client, awake, now),
+        # ПУБЛИКАЦИЯ О ДЕТЯХ: когда мы в последний раз говорили о них наружу и ЧТО именно сказали.
+        # Подпись нужна не для красоты — она отличает «ждём периода» от «состояние сменилось».
+        # В отличие от О4 своего следа в реестре у этой строки не опознать: там она неотличима от
+        # любой другой, поэтому счётчик свой.
+        "kids_last": {"attempt": life_kids.get("attempt"), "sig": life_kids.get("sig")},
     }
 
 
@@ -644,6 +656,29 @@ def maybe_pulse(state, facts, cfg, now, pulser=None):
     state["life"] = {"attempt": now, "ok": ok, "silence": info.get("silence"),
                      "line": line[:160]}
     return ("ушёл" if ok else "не ушёл"), info.get("why", "")
+
+
+def maybe_kids_pulse(state, facts, cfg, now, pulser=None):
+    """ПУБЛИКАЦИЯ ВЕРДИКТА О ДЕТЯХ, руки: положить наружу строку о каждом ребёнке ПОИМЁННО, если
+    ей пора. → (что вышло, почему).
+
+    ГРОМКОСТЬ ОТДЕЛЕНА ОТ ВЕРДИКТА, И ЭТО ГЛАВНОЕ В ВЫБОРЕ КАНАЛА. Строка идёт тем же путём, что
+    пульс О4 (`send_pulse` → `dispatch_notify._cowork`), то есть в ЖУРНАЛ и только в журнал:
+    карточки она не рождает, владельцу сама по себе не показывается и адресована наблюдателю ВНЕ
+    машины. Громкость про детей живёт отдельно и давно: нарушение О3 уходит ЗАМЕТКОЙ
+    (`send_note`, тема 328) через 15 минут — эта ветка её не заменяет, не дублирует и не глушит.
+
+    Попытка помечается ВСЕГДА, даже провальная, — по той же причине, что у О4: строка,
+    повторяемая каждые десять минут при лежащем мосте, есть долбёжка канала, а не настойчивость.
+    Подпись состояния запоминается вместе с попыткой: по ней следующий прогон отличит «ничего не
+    изменилось, ждём периода» от «ребёнок сменил состояние, говорим сейчас»."""
+    due, info = ex.kids_pulse_due(facts, cfg, now)
+    if not due:
+        return None, info.get("why", "")
+    line = ex.render_kids(info, LANE_LABEL)
+    ok = bool((pulser or send_pulse)(line))
+    state["kids"] = {"attempt": now, "ok": ok, "sig": info.get("sig"), "line": line[:160]}
+    return ("ушла" if ok else "не ушла"), info.get("why", "")
 
 
 def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
@@ -714,6 +749,27 @@ def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
     except Exception as e:                                            # noqa: BLE001
         out["pulse_why"] = "ветка О4 сорвалась (%s: %.60s)" % (type(e).__name__, e)
 
+    # 4. ПУБЛИКАЦИЯ ВЕРДИКТА О ДЕТЯХ — периодическая строка журнала, а не тревога и не вердикт.
+    #    Стои́т ПОСЛЕДНЕЙ и гасится в СЕБЯ по той же причине, что О4: заведена позже всех и не
+    #    вправе стоить владельцу ни одной заметки О1–О5, уже ушедшей выше. Причина срыва едет в
+    #    итог прогона словами — молчаливого `pass` здесь нет.
+    out["kids"], out["kids_pulse"], out["kids_why"], out["kids_line"] = [], None, "", ""
+    try:
+        out["kids"] = [{"name": k["name"], "state": k["state"], "why": k.get("why", "")}
+                       for k in ex.kids_state(facts, cfg, now)]
+        if dry:
+            kdue, kinfo = ex.kids_pulse_due(facts, cfg, now)
+            out["kids_pulse"] = "нужна (сухой прогон — не пишем)" if kdue else None
+            out["kids_why"] = kinfo.get("why", "")
+            # Строку показываем в сухом прогоне ТОЛЬКО когда она и правда пора: её форму
+            # проверяют глазами до первой боевой записи, но нарисованная «на всякий случай» она
+            # соврала бы сегментом «контур жив» ровно тогда, когда оборот НЕ доказан.
+            out["kids_line"] = ex.render_kids(kinfo, LANE_LABEL) if kdue else ""
+        else:
+            out["kids_pulse"], out["kids_why"] = maybe_kids_pulse(st, facts, cfg, now, pulser)
+    except Exception as e:                                            # noqa: BLE001
+        out["kids_why"] = "публикация о детях сорвалась (%s: %.60s)" % (type(e).__name__, e)
+
     if not dry:
         st["open"] = dict(list(open_eps.items())[-STATE_KEEP:])
         save_state(st)
@@ -745,6 +801,14 @@ def main():
               % (out["client"],
                  "не прочитано" if out["client_sent"] is None else out["client_sent"],
                  (" (%s)" % out["client_why"]) if out["client_why"] else ""))
+        # Дети печатаются ПОИМЁННО и КАЖДЫЙ — включая тех, о ком прибора нет: пустая графа здесь
+        # и есть новость («двух детей из трёх не судит никто»), а не недосмотр отчёта.
+        print("дети контура (публикация): %s"
+              % (" · ".join("%s — %s" % (k["name"], k["state"]) for k in out.get("kids") or [])
+                 or "не собрано"))
+        print("строка о детях: %s%s"
+              % (out.get("kids_pulse") or "не нужна",
+                 (" (%s)" % out.get("kids_why")) if out.get("kids_why") else ""))
         print("нарушений: %d %s" % (out["verdicts"], out["notes"]))
         return 0
     print(json.dumps(out, ensure_ascii=False))
