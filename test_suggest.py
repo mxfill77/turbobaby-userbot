@@ -4009,6 +4009,89 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
         self.assertEqual(suggest._sheet_q_month({"total": 13000, "cap_active": False}), 13000)
 
 
+class TestMonthlyCapIsMonthly(unittest.TestCase):
+    """ЗАМОК СРОКА У МЕСЯЧНОГО ПОТОЛКА (решение владельца 18.08.2026).
+
+    Кепка — МЕСЯЧНЫЙ потолок суммы («฿ за месяц (30 суток)», price_source.json →
+    low_season_caps.unit). Правило цен v2 п.1 сравнивало сумму ЗА ПЕРИОД с МЕСЯЧНЫМ капом и
+    срока не спрашивало вовсе, поэтому «аренда от 9 900 ฿/мес» звучала клиенту, спросившему
+    про ДЕСЯТЬ суток. Замер 18.08 на корпусе 1243 броней (артефакт
+    docs/artifacts/2026-08-17-price-accuracy-working-range.md §2.5): рабочий диапазон 7-14 —
+    ±15 % 62.7 → 52.5 и +62.6 % денег ошибки; корзина 15-29 — ±15 % 49.2 → 19.4.
+
+    ОТРИЦАТЕЛЬНЫЙ ТЕСТ ГРАНИЦЫ обязателен и стои́т первым: ровно 30 суток — потолок
+    применяется, 29 суток — НЕ применяется. Одна сторона без другой ничего не доказывает:
+    замок, который только запрещает, снимается вместе с самой веткой кепки и этого не видно.
+    """
+
+    @staticmethod
+    def _q(days, total=12491, cap=9900):
+        # XMAX 300: кап 9 900 ฿/мес — модель, на которой замер 18.08 намерил 41 из 63 срабатываний.
+        return {"cap_active": True, "cap_price": cap, "total": total, "days": days,
+                "deposit": 5000, "available": True,
+                "text": f"{total} ฿ (Скидка за срок 14%, {int(total / days)} ฿ в день)"}
+
+    def test_boundary_30_applies_29_does_not(self):
+        # ГРАНИЦА, обе стороны. 30 суток — кепка есть; 29 суток — кепки нет.
+        self.assertTrue(suggest._cap_applies(self._q(30)), "ровно 30 суток — потолок ОБЯЗАН применяться")
+        self.assertFalse(suggest._cap_applies(self._q(29)), "29 суток — потолок применяться НЕ ДОЛЖЕН")
+        # и то же самое ФРАЗОЙ клиенту, а не только предикатом
+        self.assertIn("аренда от 9900 ฿/мес", suggest._client_price(self._q(30)))
+        self.assertNotIn("฿/мес", suggest._client_price(self._q(29)))
+
+    def test_working_range_10_days_gets_literal_price(self):
+        # Живой случай замера: «сколько стоит XMAX на 10 дней» больше НЕ получает месячную кепку.
+        phrase = suggest._client_price(self._q(10, total=12491))
+        self.assertNotIn("аренда от", phrase)
+        self.assertIn("12491 ฿", phrase)        # звучит дословная J-цена, а не потолок
+
+    def test_long_term_still_capped(self):
+        # Соседняя посылка НЕ сломана: на месячных и длинных сроках кепка работает как работала.
+        for days in (30, 45, 60, 156):
+            self.assertTrue(suggest._cap_applies(self._q(days, total=int(700 * days))), days)
+        self.assertIn("аренда от 9900 ฿/мес", suggest._client_price(self._q(60, total=42000)))
+
+    def test_cap_still_needs_total_above_cap(self):
+        # Срочный замок НЕ отменяет исходного условия: сумма не переросла потолок — кепки нет.
+        self.assertFalse(suggest._cap_applies(self._q(60, total=9900)))     # ровно кап — не выше
+        self.assertFalse(suggest._cap_applies(self._q(60, total=5000)))
+        q = self._q(60); q["cap_active"] = False
+        self.assertFalse(suggest._cap_applies(q))
+        q = self._q(60); q["cap_price"] = None
+        self.assertFalse(suggest._cap_applies(q))
+        q = self._q(60); q["total"] = None
+        self.assertFalse(suggest._cap_applies(q))
+
+    def test_month_column_of_price_sheet_keeps_cap(self):
+        # Месячная колонка сетки квотируется РОВНО на 30 суток (_SHEET_TERMS) — она остаётся под
+        # кепкой. Это та соседняя посылка, ради которой замок сделан «>= 30», а не «> 30».
+        self.assertEqual(dict(suggest._SHEET_TERMS)[30], "month")   # 30 суток — та самая колонка
+        q = self._q(30, total=23700, cap=8900)
+        self.assertEqual(suggest._sheet_q_month(q), 8900)
+        self.assertEqual(suggest._sheet_month_cell(q), "от 8900 ฿")
+        self.assertEqual(suggest._sheet_month_cell(q, lang="en"), "from 8900 ฿")
+
+    def test_unknown_term_keeps_prior_behaviour(self):
+        # Срок неизвестен → судим ПО-СТАРОМУ. На клиентском пути этой ветки не бывает:
+        # pricing.sanity_days_ok режет котировку без валидного days РАНЬШЕ (см. ниже отдельной
+        # проверкой), а месячная колонка сетки месячная по построению.
+        self.assertTrue(suggest._cap_applies({"cap_active": True, "cap_price": 8900, "total": 23700}))
+        self.assertTrue(suggest._cap_applies({"cap_active": True, "cap_price": 8900,
+                                              "total": 23700, "days": None}))
+        self.assertFalse(suggest.pricing.sanity_days_ok(None, None))     # клиентский путь закрыт раньше
+        self.assertFalse(suggest.pricing.sanity_days_ok("мусор", None))
+
+    def test_j_tail_mirrors_client_phrase(self):
+        # Инвариант хвоста: кап-переопределение доезжает в служебный quote-блок ТЕМ ЖЕ предикатом.
+        long_q = self._q(60, total=42000)
+        phrase = suggest._client_price(long_q)
+        self.assertEqual(suggest._quote_j_line(long_q, phrase), phrase)   # кепка есть → фраза целиком
+        short_q = self._q(10, total=12491)
+        j = suggest._quote_j_line(short_q, suggest._client_price(short_q))
+        self.assertIn("Скидка за срок", j)          # кепки нет → дословный столбец J
+        self.assertNotIn("аренда от", j)
+
+
 class TestPriceSheetManyVariantsRobust(unittest.TestCase):
     """Класс-голден живого регресса 20:59 (после 551987e): реальный парк = МНОГО юнитов на модель
     (~сотня живых quote на сетку). Требования класса: (1) битый юнит (quote кидает/молчит) НЕ валит

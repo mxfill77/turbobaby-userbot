@@ -3239,14 +3239,56 @@ def _safe_quote_for_model(model, ds, de, getter=None, name_filter=None):
         return {"status": "error", "quote": None}
 
 
+_CAP_MIN_DAYS = 30      # потолок МЕСЯЧНЫЙ: единица кепки — «฿ за месяц (30 суток)» (price_source.json
+                        # → low_season_caps.unit). Откат ветки: поставить 1 — вернётся правило до 18.08.
+
+
+def _cap_applies(q) -> bool:
+    """ЕДИНСТВЕННОЕ место, решающее, звучит ли «аренда от <cap> ฿/мес» вместо дословной цены.
+
+    Правило цен v2 п.1 (94ed7ad, 05.07.2026) писалось так: `cap_active И сумма_за_период >
+    cap_price`. ЗАЧЕМ — кепка есть АКЦИЯ НИЗКОГО СЕЗОНА: как только расчёт перерастает
+    объявленный потолок, клиенту называют потолок, а не формулу. Посылка у него была одна и
+    невысказанная — что котировка, которую судят, МЕСЯЧНАЯ.
+
+    Мина: сравниваются РАЗНЫЕ ЕДИНИЦЫ — сумма за период против МЕСЯЧНОГО капа (названо самим
+    источником, `low_season_caps.unit_mix_mine`). Срока условие не спрашивало вовсе, поэтому
+    фраза «от 9 900 ฿/мес» звучала клиенту, спросившему про ДЕСЯТЬ суток. Замер 18.08 на корпусе
+    1243 броней (docs/artifacts/2026-08-17-price-accuracy-working-range.md §2.5, развилка №1):
+    на рабочем диапазоне 7-14 суток кепка била у 63 броней из 381 и роняла попадание в ±15 %
+    с 62.7 до 52.5 при росте денег ошибки на 62.6 %; на корзине 15-29 суток — у 101 из 124,
+    ±15 % с 49.2 до 19.4.
+
+    Решение владельца 18.08: потолок МЕСЯЧНЫЙ, к сроку короче 30 суток он не относится.
+
+    ЧТО ЭТОТ ЗАМОК НЕ ЛОМАЕТ (соседняя посылка, проверена числом). Месячная колонка прайса
+    (`_sheet_q_month`/`_sheet_month_cell`) квотируется ровно на 30 суток (`_SHEET_TERMS`), то
+    есть остаётся под кепкой; корзина 30-179 суток, где сидит 42 % всех денег, не меняется
+    НИ ОДНОЙ броней — её минимальный срок и есть 30 суток (замер: срабатываний 210 до и 210
+    после, все показатели побайтно те же).
+
+    Срок неизвестен → судим ПО-СТАРОМУ (кепка применяется): на клиентском пути этой ветки не
+    бывает — `pricing.sanity_days_ok` режет котировку без валидного `days` РАНЬШЕ, чем сюда
+    доходит дело (_resolve_model_price), а месячная колонка сетки месячная по построению.
+    """
+    if not isinstance(q, dict):
+        return False
+    total, cap_price = q.get("total"), q.get("cap_price")
+    if not q.get("cap_active") or cap_price is None or total is None or total <= cap_price:
+        return False
+    try:
+        return int(q.get("days")) >= _CAP_MIN_DAYS
+    except (TypeError, ValueError):
+        return True
+
+
 def _client_price(q: dict) -> str:
     """Фраза ЦЕНЫ клиенту из quote. Правила цен v2, п.1 и п.5:
-    кап (низкий сезон, total>cap_price) → «аренда от <cap> ฿/мес …» вместо J-цены (+депозит/наличие);
+    кап (низкий сезон, срок от месяца, total>cap_price) → «аренда от <cap> ฿/мес …» вместо J-цены
+    (+депозит/наличие) — предикат один на все четыре точки, см. _cap_applies;
     иначе — поле text из quote ДОСЛОВНО (цена J); иначе — сборка из day_price/total/deposit."""
-    cap_active = q.get("cap_active")
     cap_price = q.get("cap_price")
-    total = q.get("total")
-    if cap_active and cap_price is not None and total is not None and total > cap_price:
+    if _cap_applies(q):
         parts = [f"аренда от {cap_price} ฿/мес — предложение низкого сезона"]
         if q.get("deposit") is not None:
             parts.append(f"депозит {q['deposit']} ฿")
@@ -3283,12 +3325,11 @@ def _quote_j_line(q, phrase, passport_dep=False) -> str:
     in phrase` не даёт задвоить депозит, когда J его уже несёт словами. ИНВАРИАНТЫ клиентской фразы,
     обязанные доехать в хвост целиком, оставляют phrase (полную сборку клиентского пути):
       • выбор паспорта как депозита (#22 шаг4: хвост без суммы) — passport_dep;
-      • кап низкого сезона (J-текст переопределён на «аренда от cap ฿/мес») — total > cap_price.
+      • кап низкого сезона (J-текст переопределён на «аренда от cap ฿/мес») — _cap_applies.
     Нет J-текста (сборка из day/total/deposit) → phrase (прежний путь)."""
     if passport_dep or not isinstance(q, dict):
         return phrase
-    total, cap_price = q.get("total"), q.get("cap_price")
-    if q.get("cap_active") and cap_price is not None and total is not None and total > cap_price:
+    if _cap_applies(q):                        # ТОТ ЖЕ предикат, что у клиентской фразы
         return phrase                          # кап-переопределение J-текста доезжает в хвост
     txt = q.get("text")
     if isinstance(txt, str) and txt.strip():
@@ -3428,14 +3469,13 @@ def _sheet_q_total(q):
 
 def _sheet_q_month(q):
     """Числовая величина МЕСЯЧНОЙ колонки квоты — РОВНО как показывает _sheet_month_cell: кап-«от»
-    имеет приоритет (cap_active и total>cap_price → cap_price), иначе сумма месяца. → число|None."""
+    имеет приоритет (_cap_applies → cap_price), иначе сумма месяца. → число|None.
+    Колонка квотируется на 30 суток (_SHEET_TERMS), то есть срочный замок кепки её пропускает."""
     if not isinstance(q, dict):
         return None
-    total = q.get("total")
-    cap_active, cap_price = q.get("cap_active"), q.get("cap_price")
-    if cap_active and cap_price is not None and total is not None and total > cap_price:
-        return cap_price
-    return total
+    if _cap_applies(q):
+        return q.get("cap_price")
+    return q.get("total")
 
 
 def _sheet_min_variant(quotes, value_fn):
@@ -3565,14 +3605,14 @@ def _sheet_total_cell(q):
 
 
 def _sheet_month_cell(q, lang="ru"):
-    """Месячная ячейка с КАПОМ низкого сезона — предикат РОВНО как в _client_price (total>cap_price
-    при cap_active → «от <cap> ฿»); иначе сумма месяца."""
+    """Месячная ячейка с КАПОМ низкого сезона — предикат РОВНО как в _client_price (общий
+    _cap_applies → «от <cap> ฿»); иначе сумма месяца."""
     if not isinstance(q, dict):
         return None
-    total = q.get("total")
-    cap_active, cap_price = q.get("cap_active"), q.get("cap_price")
-    if cap_active and cap_price is not None and total is not None and total > cap_price:
+    if _cap_applies(q):
+        cap_price = q.get("cap_price")
         return (f"from {cap_price} ฿" if lang == "en" else f"от {cap_price} ฿")
+    total = q.get("total")
     return f"{total} ฿" if total is not None else None
 
 
