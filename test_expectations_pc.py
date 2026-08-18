@@ -43,13 +43,23 @@ def row(tid, status, since, lane="pc", frm="Filipp-328-dev", text="", free=None)
     return r
 
 
+def stamp(declared_ago=None, now=NOW, ok=True, err=""):
+    """Факт штампа занятости в ЖИВОМ виде, который кладут руки (`busy_facts`): ВРЕМЯ ПРАВКИ
+    реестра отметок, а не поле внутри него. `declared_ago=None` = реестр прочитан, объявлять
+    нечего; `ok=False` = реестр не прочитан (третий исход)."""
+    return {"ok": ok, "since": None if declared_ago is None else now - declared_ago,
+            "limit": ex.TASK_TIMEOUT_SEC, "err": err}
+
+
 def facts(rows=None, ok=True, hb=HB_LIVE, hb_ok=True, silence=None, busy=None, now=NOW, err=""):
     return {
         "now": now,
         "queue": {"ok": ok, "rows": list(rows or []), "dt": 1.0, "err": err},
         "heartbeat": {"ok": hb_ok, "raw": hb, "err": err},
         "silence": silence if silence is not None else {"measured": True, "awake": 0.0, "why": ""},
-        "busy": busy,
+        # По умолчанию — ПРОЧИТАННЫЙ пустой реестр, а не отсутствие факта: в проде руки кладут
+        # сюда словарь ВСЕГДА, и `None` означает «факта нет вовсе» (отдельный, третий исход).
+        "busy": stamp(now=now) if busy is None else busy,
     }
 
 
@@ -155,7 +165,7 @@ class TestO2Turn(unittest.TestCase):
         """Урок сервера, воспроизведённый здесь: идущий ОБЪЯВЛЕННЫЙ заход тишину оправдывает.
         Контрфакт своей полосы — без этого замка порог 20 мин даёт 25 ложных заметок за 20 суток."""
         f = facts(hb=hb_at(2000), silence={"measured": True, "awake": 2000.0, "why": ""},
-                  busy={"task": "469", "since": NOW - 1900, "limit": 2700.0})
+                  busy=stamp(1900))
         self.assertEqual(ex.turn_state(f, ex.config({}), NOW)[0], ex.TURN_OK)
         self.assertEqual(ex.verdict(f), [])
 
@@ -166,10 +176,10 @@ class TestO2Turn(unittest.TestCase):
         прятать известное."""
         f = facts(hb=hb_at(1800), silence={"measured": False, "awake": None,
                                            "why": "прошлого наблюдения нет"},
-                  busy={"task": "469", "since": NOW - 1700, "limit": 2700.0})
+                  busy=stamp(1700))
         st, info = ex.turn_state(f, ex.config({}), NOW)
         self.assertEqual(st, ex.TURN_OK)
-        self.assertEqual(info["busy"]["task"], "469")
+        self.assertEqual(info["busy"]["age"], 1700.0)
         self.assertEqual(ex.verdict(f), [])
         # А тот же прогон БЕЗ штампа обязан честно сказать «неизвестно».
         self.assertEqual(ex.turn_state(dict(f, busy=None), ex.config({}), NOW)[0], ex.TURN_UNKNOWN)
@@ -177,17 +187,20 @@ class TestO2Turn(unittest.TestCase):
     def test_pass_that_outlived_its_declared_budget_still_speaks(self):
         """ЗУБЫ ЦЕЛЫ: слепота ограничена сверху объявленным сроком + хвост оборота (55 мин)."""
         f = facts(hb=hb_at(4000), silence={"measured": True, "awake": 4000.0, "why": ""},
-                  busy={"task": "469", "since": NOW - 3400, "limit": 2700.0})
+                  busy=stamp(3400))
         st, info = ex.turn_state(f, ex.config({}), NOW)
         self.assertEqual(st, ex.TURN_SILENT)
-        self.assertEqual(info["overdue"]["task"], "469")
-        self.assertIn("свой kill не сработал", ex.render(ex.verdict(f)[0]))
+        self.assertEqual(info["overdue"]["age"], 3400.0)
+        line = ex.render(ex.verdict(f)[0])
+        self.assertIn("свой kill не сработал", line)
+        # И ни одного «id=» в этой фразе: предмет отметки — время, а не имя строки очереди.
+        self.assertNotIn("id=", line)
 
     def test_dead_instance_stamp_blinds_no_longer_than_its_ceiling(self):
         """Штамп умершего экземпляра не оправдывает НИЧЕГО дольше 55 минут — иначе смерть посреди
         задачи выглядела бы работой вечно."""
         f = facts(hb=hb_at(99999), silence={"measured": True, "awake": 99999.0, "why": ""},
-                  busy={"task": "353", "since": NOW - 86400, "limit": 2700.0})
+                  busy=stamp(86400))
         self.assertEqual(ex.turn_state(f, ex.config({}), NOW)[0], ex.TURN_SILENT)
 
     def test_sleep_of_the_machine_is_not_a_standstill(self):
@@ -196,6 +209,106 @@ class TestO2Turn(unittest.TestCase):
         st, info = ex.turn_state(f, ex.config({}), NOW)
         self.assertEqual(st, ex.TURN_OK)
         self.assertGreater(info["slept"], 30000)
+
+
+# ДОСЛОВНО из боевого `pc_orchestrator.task_started.json` (снято 18.08.2026). Ключевое здесь —
+# ПЕРЕВЁРНУТЫЙ порядок: у ИДУЩЕЙ задачи 40 поле `at` от 15.08, потому что её номер уже лежал в
+# реестре и `_task_started_mark` ушёл в ранний возврат; свежайшая ОТМЕТКА принадлежит задаче 34,
+# закрытой тремя часами раньше (`dur_s=475.70 outcome=done`, её headless 15580 в системе нет).
+REG_LIVE_1708 = {
+    "34": {"at": "2026-08-17T16:24:16.926550+00:00", "pid": 5540,
+           "proc": "5540-1786975731", "child": 15580},
+    "40": {"at": "2026-08-15T17:27:44.115170+00:00", "pid": 21216,
+           "proc": "21216-1786723500", "child": 22100},
+}
+
+
+class TestFalseAlarmOfTheSeventeenth(unittest.TestCase):
+    """ОБА ОТРИЦАТЕЛЬНЫХ ТЕСТА — НА ЖИВОМ ФАЙЛЕ И ЖИВОЙ ХРОНОЛОГИИ, а не на похожей выдумке.
+
+    Разбор [`docs/artifacts/2026-08-17-false-alarm-turn.md`]: 17.08 в 19:15 UTC О2 крикнула «демон
+    ПК не даёт оборота» ровно в ту минуту, когда демон СИНХРОННО исполнял задачу 40 (взята
+    18:58:01, сдана 19:37:26 — 2365 с при потолке 2700, `outcome=done`). Реестр отметок был тронут
+    спавном headless за 17 минут до тика, но самой свежей ОТМЕТКОЙ `at` осталась закрытая задача
+    34. Сторож самого демона на ТОМ ЖЕ файле в ту же минуту писал «демон работает, не трогаю».
+    Ложных тревог по этой причине — 4 из 4 за всю жизнь наблюдателя, верных — ноль."""
+
+    HB_1 = "2026-08-17T18:55:01+00:00"              # последний оборот poll_once до тика
+    MT_1 = "2026-08-17T18:58:02.402896+00:00"       # RUN id=40: спавн headless → правка реестра
+    TICK_1 = "2026-08-17T19:15:16.926550+00:00"     # окно тика по пересечению двух улик (probe2)
+    # Пятая тревога — та, что была ПРЕДСКАЗАНА за девять минут до события и сбылась в ту же секунду
+    # тем же ключом эпизода `o2t|1786997057` (§9 разбора), уже во время самой разведки.
+    HB_2 = "2026-08-17T20:04:17.037191+00:00"
+    MT_2 = "2026-08-17T20:06:02.402896+00:00"       # RUN id=41
+    TICK_2 = "2026-08-17T20:24:29.445954+00:00"     # `first` из tmp/expect_pc/state.json
+
+    def _registry(self, mtime_iso, records=None):
+        """Живой реестр на диске с назначенным временем ПРАВКИ → путь."""
+        p = os.path.join(tempfile.mkdtemp(prefix="expect_pc_1708_"), "task_started.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(REG_LIVE_1708 if records is None else records, f, ensure_ascii=False)
+        mt = ex.parse_iso(mtime_iso)
+        os.utime(p, (mt, mt))
+        return p
+
+    def _facts(self, hb_iso, mt_iso, tick_iso):
+        """Факты тика ЦЕЛИКОМ через боевые руки: штамп занятости снимает сам `busy_facts`."""
+        now = ex.parse_iso(tick_iso)
+        wall = now - ex.parse_iso(hb_iso)
+        return facts(hb=hb_iso, now=now,
+                     # сна машины в этом эпизоде не было — тишина бодрствования равна стенной
+                     silence={"measured": True, "awake": wall, "why": ""},
+                     busy=run_mod.busy_facts(self._registry(mt_iso))), now
+
+    def test_the_fixture_is_poisoned_by_the_old_subject(self):
+        """ЗАМОК ФИКСТУРЫ: по ПРЕЖНЕМУ предмету (поле `at`) она обязана давать тревогу. Без этой
+        проверки отрицательный тест ниже мог бы зеленеть по недоразумению, а не по починке."""
+        newest = max(ex.parse_iso(v["at"]) for v in REG_LIVE_1708.values())
+        for tick, gap in ((self.TICK_1, 10260.0), (self.TICK_2, 14412.5)):
+            age = ex.parse_iso(tick) - newest
+            self.assertAlmostEqual(age, gap, delta=1.0)          # дословно из probe2 / probe4
+            self.assertGreater(age, ex.TASK_TIMEOUT_SEC + ex.BUSY_GRACE_SEC,
+                               "самая свежая ОТМЕТКА старше потолка доверия — это и была тревога")
+
+    def test_long_legal_work_raises_no_alarm(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ 1: идёт долгая ЗАКОННАЯ работа дольше порога → тревоги НЕТ.
+        Ровно тот случай, на котором прибор соврал 17.08, и оба его окна."""
+        cfg = ex.config({})
+        for hb, mt, tick, age in ((self.HB_1, self.MT_1, self.TICK_1, 1034.5),
+                                  (self.HB_2, self.MT_2, self.TICK_2, 1107.0)):
+            f, now = self._facts(hb, mt, tick)
+            st, info = ex.turn_state(f, cfg, now)
+            self.assertGreater(info["wall"], cfg["turn"], "тишина ЧЕСТНО перешла порог — %s" % tick)
+            self.assertEqual(st, ex.TURN_OK, "идущая работа остановкой не является — %s" % tick)
+            self.assertAlmostEqual(info["busy"]["age"], age, delta=1.0)
+            self.assertEqual(ex.verdict(f, cfg), [], "владельцу не уходит ничего — %s" % tick)
+
+    def test_no_work_and_no_turn_does_raise_the_alarm(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ 2: работы нет и оборота нет дольше порога → тревога ЕСТЬ.
+        Зубы целы: тот же файл, но объявление работы НЕ ПОЗЖЕ последнего оборота — значит тот
+        заход этим оборотом уже замкнут, и молчание ПОСЛЕ него он не оправдывает."""
+        cfg = ex.config({})
+        f, now = self._facts(self.HB_1, "2026-08-17T18:40:00+00:00", self.TICK_1)
+        st, info = ex.turn_state(f, cfg, now)
+        self.assertEqual(st, ex.TURN_SILENT)
+        v = ex.verdict(f, cfg)
+        self.assertEqual([x["kind"] for x in v], ["o2_pc_turn"])
+        line = ex.render(v[0])
+        self.assertIn("демон ПК не даёт оборота", line)
+        # Захода не объявлено вовсе → фразы про несработавший kill в карточке быть не должно.
+        self.assertIsNone(info.get("overdue"))
+        self.assertNotIn("свой kill не сработал", line)
+
+    def test_the_third_state_is_a_fresh_turn_without_any_work(self):
+        """ТРЕТЬЕ СОСТОЯНИЕ ИЗ ТРЁХ: работы нет, но оборот СВЕЖИЙ — это тоже молчание, и приходит
+        оно другой дорогой (порог тишины), а не через штамп."""
+        cfg = ex.config({})
+        f, now = self._facts("2026-08-17T19:10:00+00:00", "2026-08-17T18:40:00+00:00", self.TICK_1)
+        st, info = ex.turn_state(f, cfg, now)
+        self.assertEqual(st, ex.TURN_OK)
+        self.assertLess(info["wall"], cfg["turn"])
+        self.assertIsNone(info.get("busy"), "свежий оборот штампа не спрашивает вовсе")
+        self.assertEqual(ex.verdict(f, cfg), [])
 
 
 class TestThirdOutcome(unittest.TestCase):
@@ -214,6 +327,14 @@ class TestThirdOutcome(unittest.TestCase):
             ("часов бодрствования нет",
              facts(hb=hb_at(4000), silence={"measured": False, "awake": None,
                                             "why": "часов бодрствования на этой машине нет"})),
+            # ТРЕТИЙ ИСХОД ШТАМПА ЗАНЯТОСТИ. Реестр отметок не прочитан — значит отличить идущую
+            # работу от остановки нечем, и это «неизвестно», а не приговор и не «в порядке».
+            ("реестр отметок не прочитан",
+             facts(hb=hb_at(4000), silence={"measured": True, "awake": 3900.0, "why": ""},
+                   busy=stamp(ok=False, err="PermissionError: [Errno 13] Permission denied"))),
+            ("факта о штампе занятости нет вовсе",
+             dict(facts(hb=hb_at(4000), silence={"measured": True, "awake": 3900.0, "why": ""}),
+                  busy=None)),
         ]
         for name, f in holes:
             st, info = ex.turn_state(f, cfg, NOW)
@@ -358,7 +479,10 @@ class TestRunHands(unittest.TestCase):
         # Реестр отметок старта тоже инъектируем: тест, читающий БОЕВОЙ файл, зелен или красен от
         # того, что сейчас делает демон, — ровно тот класс «тест ≠ формат», который здесь и чиним.
         self.addCleanup(setattr, run_mod, "busy_facts", run_mod.busy_facts)
-        run_mod.busy_facts = lambda path=None: None
+        # Подмена отдаёт ПРОЧИТАННЫЙ пустой реестр, а не `None`: «объявлять нечего» и «прочитать
+        # не удалось» — разные исходы, и вторым руки уводило бы каждый кейс в «неизвестно».
+        run_mod.busy_facts = lambda path=None: {"ok": True, "since": None,
+                                                "limit": ex.TASK_TIMEOUT_SEC, "err": ""}
 
     def _note(self, text):
         """Канал теста. Возвращает True — как боевой: «заметка ушла» и «не ушла» руки различают
@@ -438,6 +562,7 @@ class TestLiveFormat(unittest.TestCase):
         self.assertIsNone(ex.parse_iso(""))
 
     def test_busy_stamp_reads_the_live_registry_shape(self):
+        """Предмет штампа — ВРЕМЯ ПРАВКИ реестра, и содержимое на него не влияет ничем."""
         d = {"467": {"at": "2026-08-10T20:59:34.763818+00:00", "pid": 2624,
                      "proc": "2624-1786299364", "child": 7368},
              "469": {"at": "2026-08-10T21:44:16.763480+00:00", "pid": 2624,
@@ -446,10 +571,29 @@ class TestLiveFormat(unittest.TestCase):
         p = os.path.join(tempfile.mkdtemp(prefix="expect_pc_reg_"), "task_started.json")
         with open(p, "w", encoding="utf-8") as f:
             json.dump(d, f)
+        os.utime(p, (NOW - 500.0, NOW - 500.0))
         b = run_mod.busy_facts(p)
-        self.assertEqual(b["task"], "469")
-        self.assertEqual(b["limit"], ex.TASK_TIMEOUT_SEC)
-        self.assertIsNone(run_mod.busy_facts(p + ".нет"))
+        self.assertEqual((b["ok"], b["limit"]), (True, ex.TASK_TIMEOUT_SEC))
+        self.assertAlmostEqual(b["since"], NOW - 500.0, delta=0.01)
+        # ПРИЗНАК НАСТОЯЩЕЙ ПОЧИНКИ (предсмертный взгляд разведки 18.08): вердикт не меняется,
+        # если из реестра выкинуть ВСЕ поля `at` — предметом стал факт «файл тронут», а не поле.
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({k: {"pid": 2624} for k in d}, f)
+        os.utime(p, (NOW - 500.0, NOW - 500.0))
+        self.assertAlmostEqual(run_mod.busy_facts(p)["since"], NOW - 500.0, delta=0.01)
+
+    def test_missing_registry_is_read_but_unreadable_one_is_unknown(self):
+        """ТРИ ИСХОДА У РУК. Реестра нет → ПРОЧИТАНО, объявлять нечего. Реестр есть, но не
+        читается → `ok=False`, и решение обязано сказать «неизвестно», а не «в порядке».
+        Развилка дословно повторяет `pc_orchestrator._task_started_read`."""
+        p = os.path.join(tempfile.mkdtemp(prefix="expect_pc_reg2_"), "task_started.json")
+        gone = run_mod.busy_facts(p)
+        self.assertEqual((gone["ok"], gone["since"], gone["err"]), (True, None, ""))
+        self.assertEqual(ex.busy_state(facts(busy=gone), NOW), (ex.BUSY_IDLE, None))
+        # «Реестр БЫЛ, но не прочитан» — отдельный исход, и он НЕ становится «объявлять нечего».
+        bad = {"ok": False, "since": None, "limit": ex.TASK_TIMEOUT_SEC,
+               "err": "PermissionError: [Errno 13] Permission denied"}
+        self.assertEqual(ex.busy_state(facts(busy=bad), NOW), (ex.BUSY_UNKNOWN, None))
 
     def test_queue_rows_come_from_bridge_fields(self):
         rows = [{"id": 469, "status": "in_progress", "lane": "pc", "from": "Filipp-328-dev",
@@ -776,7 +920,7 @@ class TestO4LifeTrace(unittest.TestCase):
     def test_declared_pass_is_work_for_o2_but_not_a_proof_for_o4(self):
         """Ветка «оправдано объявленным заходом» законна для О2 и ЗАПРЕЩЕНА для О4: штамп
         доказывает, что демон объявил заход, а не что он замкнул виток."""
-        busy = {"task": "507", "since": NOW - 600.0, "limit": ex.TASK_TIMEOUT_SEC}
+        busy = stamp(600.0)
         f = lfacts(hb_age=1800.0, busy=busy,
                    silence={"measured": True, "awake": 1800.0, "why": ""})
         self.assertEqual(ex.turn_state(f, self.cfg, NOW)[0], ex.TURN_OK)      # О2 — работа

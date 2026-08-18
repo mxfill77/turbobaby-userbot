@@ -293,30 +293,37 @@ def moderbot_facts(ipc=None, lock=None):
 
 
 def busy_facts(path=None):
-    """Объявленный заход демона → {"task","since","limit"} | None.
+    """Когда полоса в последний раз ОБЪЯВИЛА работу → {"ok","since","limit","err"}.
 
-    Читаем реестр отметок CLAIM (`pc_orchestrator.task_started.json`) и берём САМУЮ СВЕЖУЮ.
-    Реестр отметок не чистится по завершении задачи — поэтому доверие к штампу ограничено сверху
-    самим решением (`expectations_pc.busy_state`): дольше «объявленный срок + хвост» он не
-    оправдывает ничего, и штамп умершего экземпляра слепит наблюдателя не дольше 55 минут."""
+    ПРЕДМЕТ — ВРЕМЯ ПРАВКИ реестра отметок (`os.stat().st_mtime`), а НЕ поле внутри него. Тем же
+    одним `os.stat` и на том же файле меряет занятость сторож самого демона
+    (`pc_orchestrator._wd_busy_age`): два читателя ОДНОГО файла обязаны давать ОДИН ответ.
+
+    ПОЧЕМУ НЕ ПОЛЕ `at` (живой провал 17.08.2026, четыре ложные тревоги подряд). Id строк очереди
+    на этой полосе ПЕРЕИСПОЛЬЗУЮТСЯ, а `_task_started_mark` на уже знакомом ключе уходит в ранний
+    возврат и `at` не обновляет вовсе. У идущей задачи в реестре поэтому лежит `at` её ПРОШЛОГО
+    воплощения (замер: старше на 20–51 час), самой свежей отметкой остаётся давно закрытая задача,
+    и прибор звал её «идущим заходом». Файл при этом ТРОНУТ: `_task_started_child` пишет PID
+    ребёнка сразу после спавна headless. Разрыв двух прочтений одного файла — 3.70 ч на момент
+    разбора и 14.83 ч сутки спустя.
+
+    ЧТО ТЕРЯЕМ, СКАЗАНО ПРЯМО: имени задачи в этом факте нет и быть не может — mtime несёт время,
+    а не номер строки. Прежний `task` брался из ключа реестра и на повторно выданном id называл
+    ЧУЖУЮ задачу; лучше не называть никого, чем называть закрытую три часа назад.
+
+    ТРИ ИСХОДА, не два. Реестра нет вовсе → `ok=True, since=None`: «объявлять нечего» это
+    ПРОЧИТАННЫЙ факт, а не провал. Ошибка чтения → `ok=False`, и решение обязано сказать
+    «неизвестно». Развилка ровно та же, что у `pc_orchestrator._task_started_read`:
+    FileNotFoundError → пусто, любая другая ошибка → «реестр БЫЛ, но не прочитан»."""
+    out = {"ok": False, "since": None, "limit": ex.TASK_TIMEOUT_SEC, "err": ""}
     try:
-        with open(path or TASK_START_FILE, encoding="utf-8") as f:
-            d = json.load(f)
-    except Exception:
-        return None
-    if not isinstance(d, dict):
-        return None
-    best, best_id = None, None
-    for tid, val in d.items():
-        raw = val.get("at") if isinstance(val, dict) else val
-        ts = ex.parse_iso(raw)
-        if ts is None:
-            continue
-        if best is None or ts > best:
-            best, best_id = ts, tid
-    if best is None:
-        return None
-    return {"task": best_id, "since": best, "limit": ex.TASK_TIMEOUT_SEC}
+        out["since"] = float(os.stat(path or TASK_START_FILE).st_mtime)
+        out["ok"] = True
+    except FileNotFoundError:
+        out["ok"] = True            # реестра нет — объявлять нечего, и это прочитано, а не провал
+    except (OSError, ValueError, TypeError) as e:
+        out["err"] = "%s: %s" % (type(e).__name__, str(e)[:80])
+    return out
 
 
 def _bridge():
@@ -658,9 +665,10 @@ def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
            # У модербота состояние ходит ПАРОЙ со своей причиной: «неизвестно» без причины
            # читается как «плохо», а это разные новости.
            "moderbot": mstate, "mod_why": minfo.get("why", ""),
-           # Чем именно объяснено молчание оборота, если объяснено: заход id=N. Владелец, читающий
-           # статус, обязан видеть ПРИЧИНУ зелёного, а не только его цвет.
-           "busy": (tinfo.get("busy") or {}).get("task"),
+           # Чем именно объяснено молчание оборота, если объяснено: КОГДА полоса объявила работу.
+           # Владелец, читающий статус, обязан видеть ПРИЧИНУ зелёного, а не только его цвет.
+           # Номера задачи здесь нет: предмет штампа — время правки реестра, а не имя строки.
+           "busy": (tinfo.get("busy") or {}).get("age"),
            # О5 ходит ТРОЙКОЙ «исход + сколько ушло + чем объяснено»: у ветки, чей ожидаемый
            # результат ноль, слово без числа неотличимо от слепоты.
            "client": cstate, "client_sent": ex.client_spoken(cinfo),
@@ -721,8 +729,8 @@ def main():
         print("прогон не удался (%s) — вердикта нет" % e, file=sys.stderr)
         return 0                                       # молчание не считается сбоем наблюдателя
     if "--status" in argv:
-        why = out["why"] or (("молчание оправдано объявленным заходом id=%s" % out["busy"])
-                             if out.get("busy") else "")
+        why = out["why"] or (("молчание оправдано работой, объявленной %s назад"
+                              % ex.human_age(out["busy"])) if out.get("busy") is not None else "")
         print("очередь ПК: %s · оборот демона: %s%s"
               % (out["queue"], out["turn"], (" (%s)" % why) if why else ""))
         print("модербот (работа, не жизнь): %s%s"

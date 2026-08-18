@@ -1213,6 +1213,43 @@ class TestWatchdog(Base):
         self.assertIsNone(o._wd_busy_age(1_000_900.0, 1_001_000.0, path=self.stamp))   # старше оборота
         self.assertIsNone(o._wd_busy_age(None, 1_000_800.0, path=self.stamp + ".нет"))
 
+    # ДВА ЧИТАТЕЛЯ ОДНОГО ФАЙЛА ОБЯЗАНЫ ДАВАТЬ ОДИН ОТВЕТ. Занятость по этому реестру спрашивают
+    # двое: сторож самого демона (`_wd_busy_age`, здесь) и прибор ожиданий полосы (О2,
+    # `expectations_pc_run.busy_facts` → `expectations_pc.busy_state`). До 18.08.2026 они читали
+    # РАЗНОЕ — сторож время правки файла, прибор поле `at` внутри него, — и на повторно выданном
+    # id очереди расходились на 3.70 ч, отчего О2 четырежды кричала на здоровой работе. Тест
+    # держит их вместе: расходятся ответы — красное, а не молчаливое возвращение класса.
+    def test_both_readers_of_the_stamp_agree(self):
+        import expectations_pc as ex_pc                        # noqa: PLC0415 — только ради сверки
+        import expectations_pc_run as ex_run                    # noqa: PLC0415
+
+        # ЯДОВИТЫЙ реестр 17.08 дословно: свежайшее поле `at` принадлежит ЗАКРЫТОЙ задаче 34, а
+        # файл тронут спавном headless идущей задачи 40 — расхождение предметов в чистом виде.
+        rec = {"34": {"at": "2026-08-17T16:24:16.926550+00:00", "pid": 5540,
+                      "proc": "5540-1786975731", "child": 15580},
+               "40": {"at": "2026-08-15T17:27:44.115170+00:00", "pid": 21216,
+                      "proc": "21216-1786723500", "child": 22100}}
+        with open(self.stamp, "w", encoding="utf-8") as f:
+            json.dump(rec, f, ensure_ascii=False)
+        # Сверяем ФАКТ — «объявлена ли работа и когда». Потолок доверия у двоих СВОЙ (сторож
+        # 4500с, О2 «свой срок + хвост» 3300с), и сверять его здесь было бы подгонкой.
+        for mt, turn, now, age in ((1_000_500.0, 1_000_000.0, 1_000_800.0, 300.0),   # после оборота
+                                   (1_000_500.0, 1_000_900.0, 1_001_000.0, None),    # старше оборота
+                                   (1_000_500.0, 1_000_000.0, 1_010_000.0, 9500.0)):  # пережила срок
+            os.utime(self.stamp, (mt, mt))
+            his = o._wd_busy_age(turn, now, path=self.stamp)
+            state, info = ex_pc.busy_state({"busy": ex_run.busy_facts(self.stamp)}, now,
+                                           turn_ts=turn)
+            ours = info["age"] if isinstance(info, dict) else None
+            self.assertEqual((his, ours), (age, age),
+                             "два читателя одного файла разошлись на mt=%s turn=%s" % (mt, turn))
+            self.assertEqual(state, ex_pc.BUSY_RUN if age == 300.0 else ex_pc.BUSY_IDLE)
+        # Реестра нет: сторож говорит «захода нет», прибор — «объявлять нечего». Ни один из двоих
+        # не зовёт это работой, и ни один не выдумывает возраст.
+        self.assertIsNone(o._wd_busy_age(None, 1_000_800.0, path=self.stamp + ".нет"))
+        self.assertEqual(ex_pc.busy_state({"busy": ex_run.busy_facts(self.stamp + ".нет")},
+                                          1_000_800.0), (ex_pc.BUSY_IDLE, None))
+
     # ─── ГОЛДЕН КРИТЕРИЯ НА ДОСЛОВНЫХ СТРОКАХ ЖУРНАЛА ────────────────────────────────────────
     def test_thresholds_against_live_log_lines(self):
         """Пороги проверяем по ЖИВЫМ строкам pc_orchestrator.log, а не по круглым числам."""
