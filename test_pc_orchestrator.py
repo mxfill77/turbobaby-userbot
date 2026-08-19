@@ -3630,6 +3630,80 @@ class TestContourStatusChains(unittest.TestCase):
         self.assertIn("очередь недоступна", txt)
         self.assertNotIn("🟢 ТИХО", txt)
 
+    # ---- «ТИХО» = ТРИ ИСХОДА, а не два (класс «пусто, когда не пусто», 19.08.2026) ----
+    # Окно между шагами: все строки цепи терминальны, работа НЕ кончена. Забор призраков
+    # (1403fa2) при этом обязан устоять — его пять родителей остаются невидимы.
+
+    def _summary(self, pid):
+        return {"id": 800 + pid, "from": self.F, "status": "new",
+                "task_text": f"[сводка родитель {pid}] итог цепи"}
+
+    def test_between_steps_chain_is_seen(self):
+        # шаг 2/5 сдан, 3/5 ещё не релизнут: открытых строк НЕТ, но цепь жива.
+        items = [self._parent(300, "done"),
+                 self._step(300, 1, 5, "done"), self._step(300, 2, 5, "done")]
+        self.assertEqual(o._loc_between_steps(items),
+                         [{"pid": 300, "step": 2, "total": 5}])
+
+    def test_between_steps_plan_exhausted_silent(self):
+        # ЗАБОР: план исчерпан (2/2 done) → финал/сводка, работы за цепью нет.
+        items = [self._parent(200, "done"),
+                 self._step(200, 1, 2, "done"), self._step(200, 2, 2, "done")]
+        self.assertEqual(o._loc_between_steps(items), [])
+
+    def test_between_steps_last_failed_silent(self):
+        # ЗАБОР: последний шаг УПАЛ → епархия _loc_after_fail (halt/самопочинка), не тишина.
+        items = [self._parent(194, "failed"),
+                 self._step(194, 1, 3, "done"), self._step(194, 2, 3, "failed")]
+        self.assertEqual(o._loc_between_steps(items), [])
+
+    def test_between_steps_summarized_silent(self):
+        # ЗАБОР: цепь закрыта сводкой → не «между шагами», а завершена.
+        items = [self._parent(300, "done"), self._step(300, 1, 5, "done"), self._summary(300)]
+        self.assertEqual(o._loc_between_steps(items), [])
+
+    def test_between_steps_open_step_not_duplicated(self):
+        # цепь с открытым шагом уже показана _loc_active_chains → второй строкой не дублируется.
+        items = [self._parent(300, "done"),
+                 self._step(300, 1, 5, "done"), self._step(300, 2, 5, "in_progress")]
+        self.assertEqual(o._loc_between_steps(items), [])
+
+    def test_between_steps_original_ghosts_stay_hidden(self):
+        # ЗАБОР целиком: все пять призраков фикса 1403fa2 остаются невидимы.
+        items = []
+        for pid in (194, 206, 207, 208):
+            items += [self._parent(pid, "failed"), self._step(pid, 1, 2, "failed")]
+        items += [self._parent(200, "done"), self._step(200, 1, 1, "done")]
+        self.assertEqual(o._loc_between_steps(items), [])
+
+    def test_outcome_a_truly_empty_says_tiho(self):
+        # (а) очередь пуста И незакрытых целей нет → «ТИХО» ГОВОРИТ (в т.ч. при одних призраках).
+        items = [self._parent(194, "failed"), self._step(194, 1, 2, "failed"),
+                 self._parent(200, "done"), self._step(200, 1, 1, "done")]
+        txt = o._contour_status(finder=self._find, items=items, revizor_state={})
+        self.assertIn("🟢 ТИХО", txt)
+        self.assertNotIn("работа продолжается", txt)
+
+    def test_outcome_b_open_goal_forbids_tiho(self):
+        # (б) очередь пуста, но цель открыта → «ТИХО» НЕ ГОВОРИТ и НАЗЫВАЕТ НОМЕР цели.
+        items = [self._parent(300, "done"),
+                 self._step(300, 1, 5, "done"), self._step(300, 2, 5, "done")]
+        txt = o._contour_status(finder=self._find, items=items, revizor_state={})
+        self.assertNotIn("🟢 ТИХО", txt)
+        self.assertIn("цепь 300", txt)
+        self.assertIn("шаг 2/5 сдан", txt)
+        self.assertIn("работа продолжается", txt)
+
+    def test_outcome_c_unreadable_says_neither(self):
+        # (в) снимок целей недоступен → НЕ «пусто» и НЕ «работа идёт»: «не проверено».
+        save = o._loc_fetch_items
+        self.addCleanup(lambda: setattr(o, "_loc_fetch_items", save))
+        o._loc_fetch_items = lambda: None
+        txt = o._contour_status(finder=self._find, revizor_state={})
+        self.assertNotIn("🟢 ТИХО", txt)
+        self.assertNotIn("работа продолжается", txt)
+        self.assertIn("очередь недоступна", txt)
+
     # ---- revizor tick: _revizor_tick_label ----
 
     def test_revizor_tick_from_mark(self):

@@ -2257,16 +2257,22 @@ def _contour_status(finder=None, items=None, revizor_state=None):
              _proc_line("pc_agent", ag),
              _proc_line("pc_orchestrator", orch, f"heartbeat {hb_txt}"),
              "🔧 В работе:"]
-    # Снимок очереди берём сами (если не подан). None = Bridge молчит: НЕ выдаём «ТИХО» (это было бы
-    # ложью «работы нет»), честно говорим «очередь недоступна». Пустой снимок/нет живых цепей → 🟢 ТИХО.
+    # Снимок очереди берём сами (если не подан). ТРИ ИСХОДА, а не два (19.08.2026):
+    #   • снимка нет (Bridge молчит) → «очередь недоступна». НЕ «ТИХО»: молчание источника
+    #     пустотой не является, и сказать «работы нет» здесь значило бы соврать угадав;
+    #   • открытых строк нет, но цепь между шагами → говорим ПРЯМО, что работа продолжается и
+    #     следующий шаг ещё не поставлен, с номером цепи (_loc_between_steps, тот же снимок);
+    #   • ни живых цепей, ни цепей между шагами → 🟢 ТИХО, и только тогда.
     snap = items if items is not None else _loc_fetch_items()
     if snap is None:
         lines.append("  очередь недоступна (Bridge молчит)")
     else:
         active = _loc_active_chains(snap)
-        if active:
-            lines += [f"  • цепь {ch['pid']}: {ch['label']}" for ch in active]
-        else:
+        waiting = _loc_between_steps(snap)
+        lines += [f"  • цепь {ch['pid']}: {ch['label']}" for ch in active]
+        lines += [f"  ⏳ цепь {ch['pid']}: шаг {ch['step']}/{ch['total']} сдан, следующий ещё НЕ "
+                  f"ПОСТАВЛЕН — работа продолжается" for ch in waiting]
+        if not active and not waiting:
             lines.append("  🟢 ТИХО")
     lines.append(_revizor_tick_label(revizor_state))
     return "\n".join(lines)
@@ -4777,6 +4783,48 @@ def _loc_active_chains(items):
         if pid not in active and st in ("new", "in_progress"):
             active[pid] = "план строится"
     return [{"pid": pid, "label": active[pid]} for pid in sorted(active)]
+
+
+def _loc_between_steps(items):
+    """Цепи, у которых в очереди НЕТ НИ ОДНОЙ открытой строки, а работа НЕ КОНЧЕНА — окно между
+    «шаг i сдан» и «шаг i+1 релизнут». → [{"pid", "step", "total"}], сорт. по pid.
+
+    ЗАЧЕМ (класс «пусто, когда не пусто», 19.08.2026). `_loc_active_chains` зовёт цепь живой
+    ТОЛЬКО по ОТКРЫТОЙ строке очереди, поэтому это окно она видит пустым, и статус отвечает
+    «🟢 ТИХО» при живой цели. Окно не гипотеза: ровно ради него написан вотчдог
+    `_loc_watchdog_tick` (инцидент 15.07, цепь 365 — 3/7 с 23:06), и он опознаёт его ТЕМИ ЖЕ
+    признаками из ТОГО ЖЕ снимка.
+
+    ЗАБОР ПРИЗРАКОВ (1403fa2) ЦЕЛ — снят не он, а лишь его пересечение с живой целью. Молчим
+    по-прежнему, если: цепь уже закрыта сводкой; последний шаг УПАЛ (там епархия
+    `_loc_after_fail` — halt/самопочинка, а не тихое продолжение); план ИСЧЕРПАН (i ≥ N);
+    цепь и так показана `_loc_active_chains`. Все пять призраков того фикса (194/200/206–208)
+    попадают под эти оговорки и остаются невидимы.
+
+    ЦЕНА — НОЛЬ обращений к мосту: `_loc_fetch_items()` уже везёт done/failed. N берётся из
+    МАРКЕРА последнего шага, а не из плана: план восстанавливает `_loc_current_plan` СВОИМ
+    чтением `done`, и ради строки статуса такой цены не берём. Расхождение возможно после
+    коррекции плана — тогда N занижен, но вывод «работа не кончена» от этого только честнее."""
+    summarized = set()
+    for it in items:
+        text = it.get("task_text")
+        m = _SUM_RE.match(text) if isinstance(text, str) else None      # None ≠ пустота (храповик)
+        if m:
+            summarized.add(int(m.group(1)))
+    shown = {c["pid"] for c in _loc_active_chains(items)}
+    out = []
+    for pid, steps in _loc_group_chains(items).items():
+        if pid in shown or pid in summarized:
+            continue
+        top = max(s[0] for s in steps)                  # сюда доходят цепи БЕЗ открытых строк:
+        at_top = [s for s in steps if s[0] == top]      # все шаги терминальны, важен последний номер
+        if not any(str(s[2].get("status")) == "done" for s in at_top):
+            continue                                    # последний шаг УПАЛ → _loc_after_fail, не тишина
+        total = max(s[1] for s in at_top)
+        if top >= total:
+            continue                                    # план исчерпан → финал/сводка, работы нет
+        out.append({"pid": pid, "step": top, "total": total})
+    return sorted(out, key=lambda c: c["pid"])
 
 
 def _loc_summary_exists(pid):
