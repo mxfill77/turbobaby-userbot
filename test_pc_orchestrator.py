@@ -3076,6 +3076,30 @@ class TestDowntimeLife(unittest.TestCase):
         self.assertEqual(out["userbot"], "raise")
         self.assertEqual(calls, [])
 
+    def test_card_route_survives_every_outcome_of_the_new_measure(self):
+        """ТРЕТИЙ ЗАБОР ЧЕСТЕРТОНА, найден повторной проверкой 19.08: маршрут карточки вотчдога
+        зависит от ЕЁ ТЕКСТА. `dispatch_notify.awaits_reply` относит её к закрытому исходу (тема
+        328, а не инбокс 1160) регуляркой `сторож\\s+подн[яё]л` (`_RE_CLOSED`), и фикс переписал
+        ровно ХВОСТ этой строки: «лежал 5 ч 54 м» → «не дольше …» / «неизвестно (…)».
+
+        Почему точку проглядели при первом заходе — готовый ложный диагноз: греп по ДОСЛОВНОЙ
+        «СТОРОЖ ПОДНЯЛ» регулярку не находит (в исходнике она строчными, с `\\s+` вместо пробела
+        и `[яё]` классом), и «нашлось 0» прочиталось как «зависимостей нет». Замок держим кодом,
+        а не прозой: любой будущий редактор шапки увидит падение здесь."""
+        import dispatch_notify as dn
+        for src, down in (("перезагрузка", 3600.0), ("наблюдение", 300.0),
+                          ("жизни процесса не наблюдали", None),
+                          ("в дыре наблюдений момент исчезновения не локализуется", None)):
+            for deaths in (1, 2):
+                text = o.raise_card_text("moderation_bot", deaths, 3, down, [777], True,
+                                         "schtasks /Run", src)
+                # успешный подъём = закрытый исход: владельцу отвечать не на что → тема 328
+                self.assertTrue(dn._RE_CLOSED.search(text), "маршрут поехал: %r" % text[:90])
+                self.assertFalse(dn.awaits_reply(text), "ушло бы в инбокс: %r" % text[:90])
+            # а несработавший подъём как был, так и остаётся вопросом к владельцу (инбокс)
+            bad = o.raise_card_text("moderation_bot", 1, 3, down, None, False, "rc=1", src)
+            self.assertTrue(dn.awaits_reply(bad), "провал подъёма обязан идти в инбокс")
+
 
 class TestSingletonLock(unittest.TestCase):
     """OS-синглтон демона (разбор #128, часть 4): lock_path/pid_alive инъектируются, tasklist
