@@ -225,6 +225,7 @@ CLIENT_MAX_DEATHS = int(os.getenv("PC_CLIENT_MAX_DEATHS", "3") or "3")          
 # на слепоту вместо рестартов. Пороги — только СТРОЖЕ к рестарту, не слабее.
 CLIENT_LOG_STALE = int(os.getenv("PC_CLIENT_LOG_STALE", "120") or "120")        # свежий лог (≤ этого) ВЕТИРУЕТ рестарт
 CLIENT_BLIND_ALARM = int(os.getenv("PC_CLIENT_BLIND_ALARM", "3") or "3")        # N слепых циклов подряд → NOTE «вотчдог слеп»
+CLIENT_DOWN_WINDOW = int(os.getenv("PC_CLIENT_DOWN_WINDOW", "600") or "600")    # окно наблюдения, шире которого «лежал» НЕ называем
 WAKE_GRACE_SEC = int(os.getenv("PC_WAKE_GRACE", "120") or "120")                # после пробуждения ПК — окно без вердиктов
 WAKE_JUMP_MARGIN = int(os.getenv("PC_WAKE_JUMP_MARGIN", "60") or "60")          # скачок wall-clock > POLL+это → «ПК проснулся»
 # ─── СИГНАЛ О ПОДЪЁМЕ ПРОЦЕССА СТОРОЖЕМ (инцидент 31.07.2026) ────────────────────────────────
@@ -6367,6 +6368,10 @@ def maybe_reconcile_children(now=None):
 
 _client_watch_state = {}      # name -> {"last_raise": float, "deaths": int, "halted": bool}
                               # спец-ключ "__blind__" -> счётчик подряд СЛЕПЫХ циклов (finder не смог)
+_client_last_alive = {}       # name -> wall-clock ПОСЛЕДНЕГО тика, на котором PID процесса БЫЛ НАЙДЕН.
+                              # Отдельный от _client_watch_state журнал НАБЛЮДЕНИЙ: он питает только
+                              # ЗАМЕР простоя (absence_since) и не касается счётчика смертей — иначе
+                              # правка прибора молча меняла бы логику подъёма.
 _client_watch_last_run = 0.0  # монотонная метка последнего прогона контура (троттлинг 5 мин)
 _client_grace_until = 0.0     # wall-clock: до этого момента вердикты «мёртв»/рестарты подавлены (ПК проснулся)
 _loop_prev_wall = None        # wall-clock старта прошлой итерации главного цикла (детект скачка = сна)
@@ -6454,6 +6459,103 @@ def _log_age_sec(path, now):
         return None
 
 
+# ───── СКОЛЬКО ЛЕЖАЛ: по ЖИЗНИ ПРОЦЕССА, а не по возрасту файла (фикс 19.08.2026) ─────────────
+# ЗАБОР ЧЕСТЕРТОНА (зачем вообще брали время файла). Возраст лога — ЕДИНСТВЕННЫЙ след процесса,
+# переживающий смерть демона: своей памяти о детях у вотчдога нет, состояние живёт в ОЗУ. Но у
+# файла и у процесса РАЗНЫЕ времена: mtime доказывает «в этот миг процесс БЫЛ ЖИВ», то есть даёт
+# НИЖНЮЮ границу момента смерти, а печаталось `now - mtime` — ВЕРХНЯЯ граница простоя вместо
+# ответа. На разреженном логе разрыв огромен: `moderation_bot.log` принимает только исключения
+# (10 строк за двое суток), и 18.08 сторож сказал «лежал 5 ч 54 м» о простое 6 м 32 с (×53) и
+# «12 ч 10 м» о 10 ч 37 м. Разбор: docs/artifacts/2026-08-18-moderbot-deaths-1.md §«Корень».
+# ЧТО ЕЩЁ СТОИ́Т НА ВОЗРАСТЕ ФАЙЛА И НАМЕРЕННО НЕ ТРОГАЕТСЯ:
+#   • ВЕТО рестарта «лог свеж ≤ CLIENT_LOG_STALE → смерть НЕ доказана» — там возраст файла на
+#     своём месте: он не называет длительность, а ЗАПРЕЩАЕТ подъём, и верхняя граница для этого
+#     как раз и годится (строже к рестарту — цель фикса #171);
+#   • сторож ДЕМОНА (`watchdog_tick` → `_log_age_sec(HEARTBEAT_FILE)`) — там файл ПЛОТНЫЙ:
+#     `_write_heartbeat()` зовётся ровно один раз и последней строкой каждого `poll_once`, значит
+#     его возраст И ЕСТЬ длительность молчания демона. Это другой предмет, он верен.
+# Здесь чинится только контур-вотчдог, где лог разрежен, а предмет — жизнь процесса.
+_boot_ts_cache = None
+
+
+def _boot_time_sec():
+    """wall-clock момента загрузки ПК (сек эпохи) | None. Кэш на процесс: перезагрузку демон не
+    переживает, значит внутри одного процесса ответ постоянен, и CIM зовётся не чаще раза.
+    CIM `Win32_OperatingSystem.LastBootUpTime` — точный ответ; `GetTickCount64` — мгновенный
+    фолбэк на слепой CIM (замер 19.08: оба дали 2026-08-18 20:27:36, секунда в секунду). Если
+    ПК спал, а счётчик тиков окажется несмещённым, фолбэк даст загрузку ПОЗЖЕ настоящей — то
+    есть мы НЕДОсчитаем простой; завысить он не может, и это сознательно безопасная сторона."""
+    global _boot_ts_cache
+    if _boot_ts_cache:
+        return _boot_ts_cache
+    try:
+        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                            "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime"
+                            ".ToString('yyyy-MM-dd HH:mm:ss')"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=20, creationflags=NO_WINDOW)
+        s = (p.stdout or "").strip()
+        if p.returncode == 0 and s:
+            _boot_ts_cache = time.mktime(time.strptime(s, "%Y-%m-%d %H:%M:%S"))
+            return _boot_ts_cache
+        log.warning("контур-вотчдог: CIM не отдал момент загрузки (rc=%s, out=%r) — беру счётчик аптайма",
+                    p.returncode, _tail(s, 80))
+    except Exception as e:
+        log.warning("контур-вотчдог: CIM момента загрузки не дал (%s) — беру счётчик аптайма", e)
+    try:
+        k = ctypes.WinDLL("kernel32")
+        k.GetTickCount64.restype = ctypes.c_ulonglong
+        return time.time() - k.GetTickCount64() / 1000.0
+    except Exception as e:
+        log.warning("контур-вотчдог: момент загрузки снять нечем (%s) — простой будет НЕИЗВЕСТЕН", e)
+        return None
+
+
+def absence_since(now, last_alive_ts=None, log_mtime=None, boot_ts=None, window=None):
+    """С КАКОГО МОМЕНТА процесс ДОКАЗАННО отсутствует. → (ts | None, источник). Чистая (голден).
+
+    СВИДЕТЕЛИ ЖИЗНИ — моменты, в которые процесс доказанно БЫЛ:
+      • last_alive_ts — наш собственный CIM-замер «PID есть» на прошлом тике (сильнейший);
+      • log_mtime     — запись в собственный лог процесса. Годится свидетелем потому, что
+        КАЖДЫЙ из троих детей первым делом пишет строку «… ЗАПУСК …» (pc_agent.py:959,
+        userbot_listen.py:635, moderation_bot.py:653): «в логе нет записей после загрузки»
+        поэтому означает «после загрузки экземпляр не стартовал», а не «лог молчит».
+    ТРИ ИСХОДА:
+      • «перезагрузка» — ПК загрузился ПОЗЖЕ последнего свидетеля жизни. Процессов, переживших
+        перезагрузку, не бывает, а новых не заводилось (иначе в логе был бы ЗАПУСК) → отсутствие
+        непрерывно с момента загрузки. Число точное и НИКОГДА не завышено: загрузка позже
+        выключения на секунды-минуты, значит мы скорее НЕДОсчитаем (безопасная сторона).
+      • «наблюдение» — перезагрузки не было, но живым видели недавно (≤ window). Смерть внутри
+        окна наблюдения; отвечаем ВЕРХНЕЙ границей и честно называем её словом «не дольше».
+      • None — момент исчезновения не локализуется: жизни не видели вовсе, либо между последним
+        свидетелем и «сейчас» слепая дыра без перезагрузки. Тогда НЕИЗВЕСТНО. Выдуманное число
+        хуже пустоты: на «лежал 5 ч 54 м» 18.08 был построен неверный вывод.
+    ВОЗРАСТ ЛОГА САМ ПО СЕБЕ ЧИСЛА НЕ ДАЁТ НИ НА ОДНОЙ ДОРОГЕ — только свидетельствует о жизни.
+    Причина незнания НАМЕРЕННО без числа: «неизвестно (лог молчит 5 ч 54 м)» вернуло бы ту же
+    ложную величину владельцу в скобках, и он снова прочёл бы её как простой. Сырые секунды
+    остаются в логе демона, где подписаны своим именем («лог молчит»), а не «лежал»."""
+    window = CLIENT_DOWN_WINDOW if window is None else window
+    seen = max([t for t in (last_alive_ts, log_mtime) if t], default=None)
+    if seen is None:
+        return None, "жизни процесса не наблюдали"
+    if boot_ts and seen < boot_ts <= now:
+        return float(boot_ts), "перезагрузка"
+    if now - seen <= window:
+        return float(seen), "наблюдение"
+    return None, "в дыре наблюдений момент исчезновения не локализуется"
+
+
+def fmt_downtime(down_sec, src=None):
+    """«Сколько лежал» словами, С ЧЕСТНОСТЬЮ ИСТОЧНИКА. Чистая (голден). Верхнюю границу
+    называем верхней границей, незнание — незнанием; число без оговорки бывает только там,
+    где момент исчезновения ДОКАЗАН (перезагрузка)."""
+    if down_sec is None:
+        return "неизвестно (%s)" % (src or "нечем измерить")
+    if src == "наблюдение":
+        return "не дольше " + fmt_sleep(down_sec)
+    return fmt_sleep(down_sec)
+
+
 def _client_watch_step(name, alive, now, state, cooldown, max_deaths):
     """Чистое решение по ОДНОМУ процессу. → (action, new_state_entry). Побочек нет — подъём делает
     вызывающий. action ∈ 'alive'|'raise'|'cooldown'|'halted'|'halt_now'."""
@@ -6518,12 +6620,14 @@ def raise_is_loud(ok, pids, deaths):
     return (not ok) or (pids is not None and not pids) or (int(deaths or 0) >= 2)
 
 
-def raise_card_text(name, deaths, max_deaths, down_sec, pids, ok, detail):
+def raise_card_text(name, deaths, max_deaths, down_sec, pids, ok, detail, down_src=None):
     """Текст карточки «сторож поднял процесс» — чистая функция, на неё положен голден.
     ЧЕТЫРЕ обязательных факта в порядке важности для владельца: КТО, СКОЛЬКО ЛЕЖАЛ, ЧТО ЭТО
-    СТОИЛО, КАКАЯ ПО СЧЁТУ смерть + НОВЫЙ PID. Пятая строка — чем поднимали (для разбора)."""
+    СТОИЛО, КАКАЯ ПО СЧЁТУ смерть + НОВЫЙ PID. Пятая строка — чем поднимали (для разбора).
+    down_src — ЧЕМ измерен простой (см. absence_since): владельцу уходит либо доказанное число,
+    либо верхняя граница со словом «не дольше», либо «неизвестно» с причиной."""
     loss = RAISE_LOSS.get(name, "процесс контура не работал")
-    down = "неизвестно (лога нет)" if down_sec is None else fmt_sleep(down_sec)
+    down = fmt_downtime(down_sec, down_src)
     if pids is None:
         pid_s = "PID подтвердить не удалось (CIM слеп) — перепроверю следующим тиком"
     elif pids:
@@ -6545,7 +6649,8 @@ def raise_card_text(name, deaths, max_deaths, down_sec, pids, ok, detail):
 
 def client_watchdog_tick(now=None, specs=None, state=None, cooldown=None, max_deaths=None,
                          grace_until=None, log_stale=None, blind_alarm=None, verify=None,
-                         notifier=None, critical=None):
+                         notifier=None, critical=None, seen_alive=None, boot_probe=None,
+                         down_window=None):
     """Один прогон контур-вотчдога. → dict name->action (для тестов/лога). Побочки: raiser()+NOTE.
     Уважает рубильник pc_orchestrator.stop (клиентский контур при намеренной остановке не трогаем).
     Фикс #171: finder РАЗЛИЧАЕТ три исхода (см. _find_pids_by_script); «мёртв» требует ТРЁХ условий
@@ -6558,6 +6663,14 @@ def client_watchdog_tick(now=None, specs=None, state=None, cooldown=None, max_de
     grace_until = _client_grace_until if grace_until is None else grace_until
     log_stale = CLIENT_LOG_STALE if log_stale is None else log_stale
     blind_alarm = CLIENT_BLIND_ALARM if blind_alarm is None else blind_alarm
+    seen_alive = _client_last_alive if seen_alive is None else seen_alive
+    down_window = CLIENT_DOWN_WINDOW if down_window is None else down_window
+    boot_seen = []                # ленивый кэш загрузки НА ЭТОТ ТИК: снимаем только при отсутствии
+
+    def _boot():
+        if not boot_seen:
+            boot_seen.append((boot_probe or _boot_time_sec)())
+        return boot_seen[0]
     if _stopped():
         return {"_": "stopped"}
     # (2) GRACE после пробуждения ПК: в окне WAKE_GRACE_SEC никаких вердиктов «мёртв»/рестартов —
@@ -6593,16 +6706,27 @@ def client_watchdog_tick(now=None, specs=None, state=None, cooldown=None, max_de
             continue
         any_success = True
         alive = bool(pids)
-        down_sec = None       # СКОЛЬКО ЛЕЖАЛ — по молчанию собственного лога процесса
-        if not alive:
+        down_sec, down_src, log_age = None, None, None   # СКОЛЬКО ЛЕЖАЛ — по ЖИЗНИ ПРОЦЕССА (absence_since)
+        if alive:
+            seen_alive[name] = now         # СВИДЕТЕЛЬСТВО ЖИЗНИ: PID был найден в эту секунду
+        else:
             # (1) «мёртв» (повод к рестарту) = finder УСПЕШЕН И процесса нет И лог протух > порога.
             # Свежий лог = недавняя активность/возможная гонка CIM → рестарт ВЕТИРУЕМ (строже к рестарту).
-            down_sec = _log_age_sec(sp.get("logfile"), now)
-            if down_sec is not None and down_sec <= log_stale:
+            # ЛОГИКА ПОДЪЁМА ЗДЕСЬ ПРЕЖНЯЯ: возраст лога по-прежнему ВЕТИРУЕТ, но длительности
+            # больше не называет — её считает absence_since по жизни процесса (фикс 19.08).
+            log_age = _log_age_sec(sp.get("logfile"), now)
+            if log_age is not None and log_age <= log_stale:
                 out[name] = "fresh_log"
                 log.warning("контур-вотчдог: %s без PID, но лог свеж (%sс ≤ %sс) — смерть НЕ доказана, рестарт отложен",
-                            name, int(down_sec), log_stale)
+                            name, int(log_age), log_stale)
                 continue
+            witness = seen_alive.get(name)
+            log_ts = None if log_age is None else now - log_age
+            since, down_src = absence_since(
+                now, witness, log_ts,
+                _boot() if (witness or log_ts) else None,   # не с чем сравнивать → CIM не тратим
+                down_window)
+            down_sec = None if since is None else max(0.0, now - since)
         action, st = _client_watch_step(name, alive, now, state, cooldown, max_deaths)
         state[name] = st
         out[name] = action
@@ -6617,13 +6741,18 @@ def client_watchdog_tick(now=None, specs=None, state=None, cooldown=None, max_de
                 ok, detail = False, f"raiser упал: {e}"
             pids_after = (verify or _verify_raised)(sp["finder"])
             loud = raise_is_loud(ok, pids_after, st["deaths"])
-            text = raise_card_text(name, st["deaths"], max_deaths, down_sec, pids_after, ok, detail)
-            log.warning("контур-вотчдог: %s МЁРТВ (лежал %s, смерть %s/%s) → подъём ok=%s, PID после=%s: %s",
-                        name, (f"{int(down_sec)}с" if down_sec is not None else "неизвестно"),
+            text = raise_card_text(name, st["deaths"], max_deaths, down_sec, pids_after, ok,
+                                   detail, down_src)
+            # СЫРЫЕ секунды молчания лога остаются здесь, в логе демона, и подписаны своим именем:
+            # это диагностика («давно ли было исключение»), а НЕ длительность простоя.
+            log.warning("контур-вотчдог: %s МЁРТВ (лежал %s [%s], лог молчит %s, смерть %s/%s) → "
+                        "подъём ok=%s, PID после=%s: %s",
+                        name, fmt_downtime(down_sec, down_src), down_src or "нечем измерить",
+                        ("%sс" % int(log_age)) if log_age is not None else "лога нет",
                         st["deaths"], max_deaths, ok, pids_after, _tail(str(detail), 200))
             _cowork("вотчдог поднял %s (смерть %s/%s, лежал %s, %s): %s"
                     % (name, st["deaths"], max_deaths,
-                       ("неизвестно" if down_sec is None else fmt_sleep(down_sec)),
+                       fmt_downtime(down_sec, down_src),
                        ("PID " + ", ".join(str(p) for p in pids_after)) if pids_after
                        else ("PID не подтверждён" if pids_after is None else "процесс НЕ появился"),
                        _tail(str(detail), 120)))

@@ -2413,6 +2413,7 @@ class TestClientWatchdog(unittest.TestCase):
         o._notify_topic = lambda topic, text: self.cards.append((topic, text))
         o.RAISE_VERIFY_SEC = 0        # без паузы: контрольный поиск PID в тестах мгновенный
         o._stopped = lambda: False
+        o._client_last_alive = {}     # журнал наблюдений — свой на каждый тест (не течём между ними)
 
     def tearDown(self):
         (o._cowork, o._notify, o._notify_critical, o._stopped,
@@ -2699,6 +2700,7 @@ class TestWatchdogClassFix(unittest.TestCase):
         o._notify_topic = lambda topic, text: self.cards.append((topic, text))   # карточка подъёма (31.07)
         o.RAISE_VERIFY_SEC = 0
         o._stopped = lambda: False
+        o._client_last_alive = {}   # журнал наблюдений — свой на каждый тест (не течём между ними)
         self.tmp = tempfile.mkdtemp()
 
     def tearDown(self):
@@ -2758,7 +2760,9 @@ class TestWatchdogClassFix(unittest.TestCase):
     def test_b_downtime_measured_before_raise(self):
         """КЛАСС-ФИКС 31.07: «сколько лежал» мерим ДО подъёма. Поднятый процесс пишет в свой лог
         сразу, и прежний замер (после raiser'а) давал «лог 0с назад» — так строка журнала 30.07
-        про moderation_bot сообщила ноль о смерти, длившейся минуты."""
+        про moderation_bot сообщила ноль о смерти, длившейся минуты.
+        ПОПРАВКА 19.08: свидетель простоя теперь НАБЛЮДЕНИЕ (живым видели 10 мин назад), а не
+        возраст файла; число та же десятка, но названо верхней границей — см. TestDowntimeLife."""
         st = {}
         logf = self._logfile("moderation_bot.log", age_sec=600)   # лежал 10 минут
         raised = []
@@ -2771,13 +2775,14 @@ class TestWatchdogClassFix(unittest.TestCase):
               "logfile": logf, "skip": lambda: False}
         o.client_watchdog_tick(now=self.NOW, specs=[sp], state=st, cooldown=0, max_deaths=3,
                                grace_until=0, log_stale=120, blind_alarm=3,
-                               verify=lambda finder: [13104])
+                               verify=lambda finder: [13104],
+                               seen_alive={"moderation_bot": self.NOW - 600}, boot_probe=lambda: None)
         self.assertEqual(len(raised), 1)
         text = (self.cards + self.crit)[0]
         text = text[1] if isinstance(text, tuple) else text
         self.assertIn("10 м 00 с", text)                          # честный простой
         self.assertNotIn("лежал 0 с", text)
-        self.assertTrue(any("лежал 10 м 00 с" in n for n in self.notes))   # и в журнале то же число
+        self.assertTrue(any("лежал не дольше 10 м 00 с" in n for n in self.notes))  # и в журнале то же число
 
     def test_b_fresh_log_vetoes_restart(self):
         """Свежий лог + нет PID → смерть НЕ доказана → рестарт отложен (третье условие)."""
@@ -2850,6 +2855,226 @@ class TestWatchdogClassFix(unittest.TestCase):
             self.assertIsNone(o._find_pids_by_script("userbot_listen.py"))             # скрытый сбой → None
             run.side_effect = o.subprocess.TimeoutExpired(cmd="powershell", timeout=20)
             self.assertIsNone(o._find_pids_by_script("userbot_listen.py"))             # таймаут → None
+
+
+class TestDowntimeLife(unittest.TestCase):
+    """ЧИСЛА ВОТЧДОГА: «сколько лежал» = ЖИЗНЬ ПРОЦЕССА, а не возраст файла (фикс 19.08.2026).
+
+    Живой провал 18.08 (docs/artifacts/2026-08-18-moderbot-deaths-1.md): сторож взял mtime
+    разреженного `moderation_bot.log` и отчитался «лежал 12 ч 10 м» / «лежал 5 ч 54 м», тогда как
+    настоящее отсутствие — 10 ч 37 м и 6 м 32 с (второе завышено в 53 раза). Возраст файла даёт
+    ВЕРХНЮЮ границу момента смерти, а печатался как ответ.
+
+    Все времена — секунды от общего якоря, поэтому арифметика TZ-инвариантна; часы взяты из
+    системного журнала Windows и из логов дословно."""
+
+    D = 1_787_000_000                       # якорь-полночь; само значение роли не играет
+
+    @classmethod
+    def t(cls, h, m, s):
+        return cls.D + h * 3600 + m * 60 + s
+
+    def setUp(self):
+        # Перехватываем ОБА канала наружу обязательно: незамоканный _notify_topic шлёт боевую
+        # карточку в тему 328 прямо из прогона тестов, а _cowork — строку в мозг.
+        self._save = (o._cowork, o._notify, o._notify_critical, o._notify_topic,
+                      o._stopped, o.RAISE_VERIFY_SEC)
+        self.notes, self.cards = [], []
+        o._cowork = lambda line: self.notes.append(line)
+        o._notify = lambda text: self.cards.append(text)
+        o._notify_critical = lambda text: self.cards.append(text)
+        o._notify_topic = lambda topic, text: self.cards.append(text)
+        o._stopped = lambda: False
+        o.RAISE_VERIFY_SEC = 0
+        o._client_last_alive = {}
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        (o._cowork, o._notify, o._notify_critical, o._notify_topic,
+         o._stopped, o.RAISE_VERIFY_SEC) = self._save
+
+    def _log_at(self, name, ts):
+        """Лог процесса с mtime = ts (свидетель жизни)."""
+        p = os.path.join(self.tmp, name)
+        open(p, "w").close()
+        os.utime(p, (ts, ts))
+        return p
+
+    def _tick(self, spec, now, boot, seen=None, verify_pids=(777,)):
+        return o.client_watchdog_tick(now=now, specs=[spec], state={}, cooldown=0, max_deaths=3,
+                                      grace_until=0, log_stale=120, blind_alarm=3,
+                                      verify=lambda finder: list(verify_pids),
+                                      seen_alive=({} if seen is None else seen),
+                                      boot_probe=(lambda: boot))
+
+    # --- живые числа 18.08.2026 (локальное время ПК, UTC+7) ---------------------------------
+    #  №1: Windows Update погасил ПК 04:01:04, загрузка 04:02:10; последняя строка лога 02:28:38
+    #      (процесс жил ещё 1 ч 32 м после неё); замер сторожа 14:38:50.
+    #  №2: владелец перезагрузил ПК 20:27:21, загрузка 20:27:34; последняя строка лога 14:38:56
+    #      (это БАННЕР ЗАПУСКА покойника — он жил ещё 5 ч 48 м); замер сторожа 20:33:48.
+
+    def case1(self):
+        return dict(now=self.t(14, 38, 50), log=self.t(2, 28, 38),
+                    boot=self.t(4, 2, 10), death=self.t(4, 1, 4))
+
+    def case2(self):
+        return dict(now=self.t(20, 33, 48), log=self.t(14, 38, 56),
+                    boot=self.t(20, 27, 34), death=self.t(20, 27, 21))
+
+    # ---------------------- ОТРИЦАТЕЛЬНЫЙ ТЕСТ (а) ------------------------------------------
+    def test_a_known_absence_gives_the_true_number(self):
+        """(а) Процесс отсутствовал ИЗВЕСТНОЕ время → число совпадает с настоящим.
+        Момент известен, когда его убила перезагрузка: переживших её процессов не бывает, а
+        нового экземпляра не заводилось (иначе в логе была бы строка ЗАПУСКА)."""
+        boot = self.t(3, 0, 0)
+        now = boot + 3600                                  # ровно час без процесса
+        since, src = o.absence_since(now, last_alive_ts=None, log_mtime=self.t(2, 0, 0),
+                                     boot_ts=boot)
+        self.assertEqual(src, "перезагрузка")
+        self.assertEqual(now - since, 3600)                # ровно, без «примерно»
+        self.assertEqual(o.fmt_downtime(now - since, src), "1 ч 00 м")   # и без оговорок
+
+    def test_a_true_number_through_the_whole_tick(self):
+        """(а) То же, но целиком через тик вотчдога: карточка владельцу несёт истинное число."""
+        boot = self.t(3, 0, 0)
+        now = boot + 3600
+        sp = {"name": "moderation_bot", "finder": lambda: [], "skip": lambda: False,
+              "logfile": self._log_at("moderation_bot.log", self.t(2, 0, 0)),   # жизнь ДО загрузки
+              "raiser": lambda: (True, "moderation_bot запущен (PID 777).")}
+        out = self._tick(sp, now, boot)
+        self.assertEqual(out["moderation_bot"], "raise")
+        self.assertTrue(any("лежал 1 ч 00 м" in n for n in self.notes))    # журнал
+        self.assertIn("лежал 1 ч 00 м", self.cards[0])                     # карточка владельцу
+        self.assertNotIn("не дольше", self.cards[0])                       # число ДОКАЗАНО, без оговорки
+
+    # ---------------------- ОТРИЦАТЕЛЬНЫЙ ТЕСТ (б) ------------------------------------------
+    def test_b_unlocatable_moment_says_unknown(self):
+        """(б) Момент исчезновения определить нельзя → НЕИЗВЕСТНО, числа НЕ выдумываем."""
+        now = self.t(20, 0, 0)
+        # жизни процесса не видели вовсе: ни лога, ни наблюдения
+        since, src = o.absence_since(now, None, None, boot_ts=self.t(4, 0, 0))
+        self.assertIsNone(since)
+        self.assertIn("не наблюдали", src)
+        # свидетель жизни есть, но между ним и «сейчас» слепая дыра БЕЗ перезагрузки
+        since2, src2 = o.absence_since(now, None, self.t(14, 0, 0), boot_ts=self.t(4, 0, 0))
+        self.assertIsNone(since2)
+        self.assertEqual(o.fmt_downtime(since2, src2)[:10], "неизвестно")
+
+    def test_b_yesterdays_false_number_is_no_longer_produced(self):
+        """(б), сильная форма: ТОТ ЖЕ вход, что дал 18.08 «лежал 5 ч 54 м», без знания о
+        загрузке даёт НЕИЗВЕСТНО. Ложное число не воспроизводится ни на одной дороге."""
+        c = self.case2()
+        old_false = c["now"] - c["log"]                     # ровно то, что печаталось раньше
+        self.assertEqual(o.fmt_sleep(old_false), "5 ч 54 м")
+        since, src = o.absence_since(c["now"], None, c["log"], boot_ts=None)
+        self.assertIsNone(since)                            # нечем локализовать → молчим
+        self.assertNotIn("5 ч 54 м", o.fmt_downtime(since, src))
+
+    def test_b_unknown_reaches_the_owner_as_unknown(self):
+        """(б) через весь тик: в карточке владельцу «неизвестно», а не число из файла. Вход —
+        дословно вход 18.08 №2, момент загрузки снять не удалось."""
+        c = self.case2()
+        sp = {"name": "moderation_bot", "finder": lambda: [], "skip": lambda: False,
+              "logfile": self._log_at("moderation_bot.log", c["log"]),
+              "raiser": lambda: (True, "поднят")}
+        out = self._tick(sp, c["now"], None, verify_pids=(10948,))     # загрузка не снялась
+        self.assertEqual(out["moderation_bot"], "raise")               # ПОДЪЁМ КАК БЫЛ
+        self.assertIn("неизвестно", self.cards[0])
+        self.assertNotIn("5 ч 54 м", self.cards[0])                    # ложное число не всплыло
+        self.assertNotIn("5 ч 54 м", " ".join(self.notes))             # и в журнал не ушло
+
+    # ---------------------- ПРОВЕРКА НА ИСТОРИИ ---------------------------------------------
+    def test_history_case1_windows_update_reboot(self):
+        """№1: было «12 ч 10 м», правда 10 ч 37 м 46 с (на миг замера). Новый способ — 10 ч 36 м 40 с."""
+        c = self.case1()
+        self.assertEqual(o.fmt_sleep(c["now"] - c["log"]), "12 ч 10 м")     # прежняя ложь
+        since, src = o.absence_since(c["now"], None, c["log"], boot_ts=c["boot"])
+        self.assertEqual(src, "перезагрузка")
+        got, truth = c["now"] - since, c["now"] - c["death"]
+        self.assertEqual(got, 38200)                                        # 10 ч 36 м 40 с
+        self.assertEqual(truth, 38266)                                      # 10 ч 37 м 46 с
+        self.assertLessEqual(got, truth)                                    # НИКОГДА не завышаем
+        self.assertLessEqual(truth - got, 70)      # весь остаток = загрузка позже выключения (66с)
+
+    def test_history_case2_manual_reboot(self):
+        """№2: было «5 ч 54 м» при настоящих 6 м 27 с (×53). Новый способ — 6 м 14 с."""
+        c = self.case2()
+        self.assertEqual(o.fmt_sleep(c["now"] - c["log"]), "5 ч 54 м")      # прежняя ложь
+        since, src = o.absence_since(c["now"], None, c["log"], boot_ts=c["boot"])
+        self.assertEqual(src, "перезагрузка")
+        got, truth = c["now"] - since, c["now"] - c["death"]
+        self.assertEqual(got, 374)                                          # 6 м 14 с
+        self.assertEqual(truth, 387)                                        # 6 м 27 с
+        self.assertLessEqual(got, truth)
+        self.assertLessEqual(truth - got, 20)      # остаток = загрузка позже выключения (13с)
+        self.assertLess(got, (c["now"] - c["log"]) / 50)   # прежнее число было ×53 от правды
+
+    # ---------------------- ЧТО ИМЕННО ЧИНИЛИ ------------------------------------------------
+    def test_log_age_alone_never_yields_a_number(self):
+        """Корень класса: ВОЗРАСТ ФАЙЛА САМ ПО СЕБЕ числа не даёт. Он свидетель жизни, и только
+        рядом с перезагрузкой (или свежим наблюдением) превращается в длительность."""
+        now = self.t(20, 0, 0)
+        for age in (300, 3600, 43812, 86400):
+            since, _ = o.absence_since(now, None, now - age, boot_ts=None,
+                                       window=o.CLIENT_DOWN_WINDOW)
+            if age <= o.CLIENT_DOWN_WINDOW:
+                self.assertEqual(since, now - age)      # внутри окна наблюдения — верхняя граница
+            else:
+                self.assertIsNone(since)                # шире окна — незнание
+
+    def test_observation_is_an_upper_bound_and_says_so(self):
+        """Свежее наблюдение локализует смерть лишь в окно между тиками → говорим «не дольше»."""
+        now = self.t(20, 0, 0)
+        since, src = o.absence_since(now, last_alive_ts=now - 300, log_mtime=now - 9999,
+                                     boot_ts=self.t(4, 0, 0))
+        self.assertEqual(src, "наблюдение")
+        self.assertEqual(o.fmt_downtime(now - since, src), "не дольше 5 м 00 с")
+
+    def test_alive_tick_records_the_witness(self):
+        """Наблюдение жизни копится на живых тиках — иначе локализовать смерть будет нечем."""
+        seen = {}
+        sp = {"name": "userbot", "finder": lambda: [42], "raiser": lambda: (True, ""),
+              "logfile": os.path.join(self.tmp, "нет.log"), "skip": lambda: False}
+        out = self._tick(sp, self.t(10, 0, 0), None, seen=seen)
+        self.assertEqual(out["userbot"], "alive")
+        self.assertEqual(seen["userbot"], self.t(10, 0, 0))
+
+    def test_raise_decisions_untouched_by_the_new_measure(self):
+        """ЗАМОК на объём правки: кого и когда поднимаем — не зависит от того, чем меряем.
+        Один и тот же вход при ТРЁХ разных знаниях о загрузке даёт один и тот же исход."""
+        c = self.case2()
+        acts, raises = [], []
+        for i, boot in enumerate((None, c["boot"], c["log"] - 1)):
+            sp = {"name": "moderation_bot", "finder": lambda: [], "skip": lambda: False,
+                  "logfile": self._log_at("m%s.log" % i, c["log"]),
+                  "raiser": lambda: (raises.append(1) or (True, "поднят"))}
+            acts.append(self._tick(sp, c["now"], boot)["moderation_bot"])
+        self.assertEqual(acts, ["raise", "raise", "raise"])
+        self.assertEqual(len(raises), 3)
+
+    def test_fresh_log_veto_still_reads_the_file(self):
+        """Второй забор Честертона: возраст файла ОСТАЁТСЯ вето рестарта. Свежий лог по-прежнему
+        отменяет подъём — даже когда наблюдение уверенно говорит «мёртв дольше порога»."""
+        now, raises = self.t(20, 0, 0), []
+        sp = {"name": "userbot", "finder": lambda: [], "skip": lambda: False,
+              "logfile": self._log_at("userbot.log", now - 10),     # лог свеж (10с ≤ 120)
+              "raiser": lambda: (raises.append(1) or (True, ""))}
+        out = self._tick(sp, now, None, seen={"userbot": now - 900})
+        self.assertEqual(out["userbot"], "fresh_log")
+        self.assertEqual(raises, [])
+
+    def test_boot_probe_is_not_spent_without_a_witness(self):
+        """Свидетеля жизни нет → сравнивать с загрузкой нечего, CIM не тратим (лишний
+        PowerShell на каждом тике — это цена, а ответа он не даёт)."""
+        calls = []
+        sp = {"name": "userbot", "finder": lambda: [], "raiser": lambda: (True, ""),
+              "logfile": os.path.join(self.tmp, "нет.log"), "skip": lambda: False}
+        out = o.client_watchdog_tick(now=self.t(10, 0, 0), specs=[sp], state={}, cooldown=0,
+                                     max_deaths=3, grace_until=0, log_stale=120, blind_alarm=3,
+                                     verify=lambda finder: [5], seen_alive={},
+                                     boot_probe=lambda: calls.append(1))
+        self.assertEqual(out["userbot"], "raise")
+        self.assertEqual(calls, [])
 
 
 class TestSingletonLock(unittest.TestCase):
