@@ -246,7 +246,9 @@ class TestCoworkDetached(unittest.TestCase):
             seen["cmd"], seen["kw"] = cmd, kw
             return _Fake()
 
-        self.assertTrue(dn._cowork("DONE тест", spawner=spawner))
+        # `env={}` = «полоса ЖИВАЯ»: без него нас глушит замок тест-прогона (класс 19.08.2026), и
+        # этот тест проверял бы отказ вместо спавна. Здесь предмет — именно ЖИВАЯ ветка.
+        self.assertTrue(dn._cowork("DONE тест", spawner=spawner, env={}))
         self.assertIn("cowork_log_append.py", " ".join(seen["cmd"]))
         self.assertEqual(seen["cmd"][-1], "DONE тест")
         self.assertNotIn("timeout", seen["kw"])          # НЕ ждём завершения
@@ -256,7 +258,33 @@ class TestCoworkDetached(unittest.TestCase):
     def test_spawn_failure_is_swallowed(self):
         def boom(*a, **k):
             raise OSError("нет python")
-        self.assertFalse(dn._cowork("DONE тест", spawner=boom))   # НЕ роняем сессию
+        self.assertFalse(dn._cowork("DONE тест", spawner=boom, env={}))   # НЕ роняем сессию
+
+    def test_test_run_does_not_write_to_the_owners_journal(self):
+        """ЗАМОК 19.08.2026: строка, порождённая ПРОГОНОМ ТЕСТОВ, в журнал владельца не идёт.
+
+        Тест сам себе фикстура: он ИДЁТ прогоном тестов, поэтому `env` не передаём — предмет
+        проверки в том, что дискриминатор узнаёт нас БЕЗ подсказки. Спавнер обязан остаться
+        нетронутым: отказ наступает ДО него, а не «спавн случился, но записал в temp»."""
+        touched = []
+
+        def spawner(*a, **k):
+            touched.append(a)
+            raise AssertionError("спавн записи в журнал случился в тест-прогоне")
+
+        self.assertFalse(dn._cowork("DONE строка из теста", spawner=spawner))
+        self.assertEqual(touched, [])
+
+    def test_live_lane_still_writes(self):
+        """ВТОРАЯ ПОЛОВИНА ЗАМКА, и она важнее первой: заглушка не имеет права заткнуть ЖИВОЙ
+        канал. Один и тот же вызов с `env={}` (полоса живая) обязан дойти до спавна."""
+        spawned = []
+        self.assertTrue(dn._cowork("ПУЛЬС · ПК · контур жив",
+                                   spawner=lambda *a, **k: spawned.append(a) or type(
+                                       "P", (), {"pid": 7})(),
+                                   env={}))
+        self.assertEqual(len(spawned), 1)
+        self.assertIn("cowork_log_append.py", " ".join(spawned[0][0]))
 
 
 class TestNotificationPing(unittest.TestCase):

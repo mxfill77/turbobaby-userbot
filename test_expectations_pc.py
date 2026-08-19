@@ -484,6 +484,15 @@ class TestRunHands(unittest.TestCase):
         # не удалось» — разные исходы, и вторым руки уводило бы каждый кейс в «неизвестно».
         run_mod.busy_facts = lambda path=None: {"ok": True, "since": None,
                                                 "limit": ex.TASK_TIMEOUT_SEC, "err": ""}
+        # ПУЛЬСОВЫЙ КАНАЛ ГЛУШИМ НА ВЕСЬ КЛАСС, а не аргументом в каждом вызове: сайтов `run()`
+        # здесь семь, и восьмой, дописанный завтра, снова ушёл бы в ЖИВОЙ журнал владельца — так и
+        # родился класс 19.08.2026 (21 строка из 26 за сутки — тест-происхождения). Подменяем
+        # МОДУЛЬНОЕ ИМЯ: руки берут его поздним поиском (`(pulser or send_pulse)`), поэтому замена
+        # накрывает и будущие вызовы. Замок канала стои́т отдельно и ниже — здесь гигиена класса,
+        # писавшегося до появления пульсовой ветки и о ней не знавшего.
+        self.pulsed = []
+        self.addCleanup(setattr, run_mod, "send_pulse", run_mod.send_pulse)
+        run_mod.send_pulse = lambda line: (self.pulsed.append(line), True)[1]
 
     def _note(self, text):
         """Канал теста. Возвращает True — как боевой: «заметка ушла» и «не ушла» руки различают
@@ -547,6 +556,46 @@ class TestRunHands(unittest.TestCase):
         run_mod.run(now=NOW, getter=self._getter([]), notifier=self._note)
         self.assertTrue(os.path.exists(os.path.join(self.dir, "state.json")))
         self.assertEqual(run_mod._dir(), self.dir)
+
+
+class TestPulseChannelMutedInTestRun(unittest.TestCase):
+    """СКВОЗНОЙ ЗАМОК 19.08.2026: боевые руки наблюдателя, позванные ИЗ прогона тестов, не рождают
+    ни одной записи в ЖУРНАЛЕ ВЛАДЕЛЬЦА.
+
+    Форма вызова здесь РОВНО ТА, что текла: `run()` БЕЗ `pulser=`, канал по умолчанию боевой
+    (`send_pulse` → `dispatch_notify._cowork`). Поэтому класс НЕ глушит `send_pulse`, в отличие от
+    соседа выше: предмет проверки — сам замок канала, а заглушённый канал проверял бы заглушку.
+
+    Наблюдаем ПОСЛЕДНЮЮ дверь наружу — спавн процесса записи. Тревога РЕГИСТРИРУЕТСЯ, а не
+    бросается: `_cowork` и ветка публикации ловят исключения себе в живот, и брошенный
+    AssertionError был бы съеден вместе с дефектом."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="expect_pc_mute_")
+        os.environ["CC_EXPECT_PC_DIR"] = self.dir
+        self.addCleanup(os.environ.pop, "CC_EXPECT_PC_DIR", None)
+        for name in ("heartbeat_facts", "busy_facts"):
+            self.addCleanup(setattr, run_mod, name, getattr(run_mod, name))
+        run_mod.busy_facts = lambda path=None: {"ok": True, "since": None,
+                                                "limit": ex.TASK_TIMEOUT_SEC, "err": ""}
+        run_mod.heartbeat_facts = lambda path=None: {"ok": True, "raw": hb_at(60), "err": ""}
+
+    def test_live_hands_from_a_test_run_spawn_no_journal_writer(self):
+        import dispatch_notify                                       # noqa: PLC0415
+        seen = []
+        sub = dispatch_notify.subprocess
+        self.addCleanup(setattr, sub, "Popen", sub.Popen)
+        sub.Popen = lambda *a, **k: (seen.append(a), type("P", (), {"pid": 0})())[1]
+
+        out = run_mod.run(now=NOW, getter=lambda status: {"ok": True, "items": []},
+                          notifier=lambda t: True)
+
+        # НЕ ВАКУУМ: ветка публикации обязана СРАБОТАТЬ и упереться в замок канала. Без этой
+        # строки тест был бы зелен и от того, что предмет перестал задеваться вовсе («мок,
+        # переставший задевать ветку, хуже отсутствующего»): состояние здесь пустое, значит
+        # строке о детях ПОРА безусловно, а «не ушла» = канал ответил отказом.
+        self.assertEqual(out["kids_pulse"], "не ушла")
+        self.assertEqual(seen, [], "прогон тестов родил запись в ЖУРНАЛЕ ВЛАДЕЛЬЦА")
 
 
 class TestLiveFormat(unittest.TestCase):
