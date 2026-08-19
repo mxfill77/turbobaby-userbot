@@ -9132,6 +9132,53 @@ class TestClientContourGate(Base):
         self.assertEqual(o._last_child_commit, "a" * 12)          # метка на месте — «да» применит этот же коммит
         self.assertIsNone(o._child_reconcile_rejected)
 
+    # ── ДЕДУП КАРТОЧКИ: обе стороны ключа приводятся к ОДНОЙ длине (19.08.2026) ──
+    # Два боевых входа стоят подряд в ОДНОМ обороте main_loop (реконсиляция детей → self-update) и
+    # подают ОДИН И ТОТ ЖЕ коммит РАЗНОЙ длиной: head[:9] против `git rev-parse --short` (7).
+    # Подпись сверяла их сырыми — и владелец получал вторую карточку про тот же отказ, 6 пар из 6
+    # за 20.2 суток (docs/artifacts/2026-08-19-gate-double-card.md). Голдены гоняют ОБА ЖИВЫХ входа
+    # против ОДНОЙ памяти ворот: подмена «_client_block дважды с разными строками» не доказала бы
+    # ничего про то, что на этих дорогах длины действительно расходятся.
+
+    _HEAD40 = "538bbbd18a7b723661b920cdcbb160962712a2c2"   # 40 hex, ровно как отдаёт _full_head()
+
+    def _dve_dorogi(self, head40, short7):
+        """Путь A (реконсиляция, head[:9]) и следом путь B (self-update, --short) — один оборот."""
+        save = (o._last_child_commit, o._child_reconcile_rejected)
+        self.addCleanup(lambda: setattr(o, "_child_reconcile_rejected", save[1]))
+        self.addCleanup(lambda: setattr(o, "_last_child_commit", save[0]))
+        o._last_child_commit, o._child_reconcile_rejected = "e" * 40, None
+        o.reconcile_children_tick(head_fn=lambda: head40, diff_fn=lambda a, b: ["suggest.py"],
+                                  gate_fn=lambda m: (True, "ok"), restart_fn=self._restart)
+        o._selfupdate_restart_children("e" * 7, short7, diff_fn=lambda a, b: ["suggest.py"],
+                                       restart_fn=self._restart)
+
+    def test_dedup_odin_kommit_dvumya_dorogami_odna_kartochka(self):
+        """(а) Оба входа на ОДИН коммит в одном тике → карточка ОДНА, хотя длины 9 и 7."""
+        self._dve_dorogi(self._HEAD40, self._HEAD40[:7])
+        self.assertEqual(self.restarts, [])                      # ворота держат ОБЕ дороги
+        self.assertEqual(len(self.cards), 1, self.cards)
+        self.assertIn(self._HEAD40[:9], self.cards[0])           # текст карточки длину не потерял
+
+    def test_dedup_raznye_kommity_ne_skleivayutsya(self):
+        """(б) Входы на РАЗНЫЕ коммиты → карточки ДВЕ. Этот голден важнее первого: нормализация не
+        имеет права склеить разные операции — молчание о втором коммите хуже лишней карточки."""
+        self._dve_dorogi(self._HEAD40, "1c0ffee")
+        self.assertEqual(self.restarts, [])
+        self.assertEqual(len(self.cards), 2, self.cards)
+        self.assertIn(self._HEAD40[:9], self.cards[0])
+        self.assertIn("1c0ffee", self.cards[1])
+
+    def test_dedup_ne_hesh_ostaetsya_soboi(self):
+        """Фолбэк: не-хеш short() отдаёт пустой строкой — сырая метка обязана остаться ключом,
+        иначе ДВЕ разные нехешевые метки схлопнулись бы в одну пустую."""
+        st, cards = {}, []
+        for c in ("staraya-metka", "novaya-metka"):
+            o._client_block(["userbot"], c, ["suggest.py"], where="тест", subject="s",
+                            notifier=cards.append, cowork=lambda t: None, state=st,
+                            reason_fn=lambda x, *a, **k: None, trainer_fn=lambda x: "нет прогона")
+        self.assertEqual(len(cards), 2, cards)
+
     def test_vorota_vhoda_klientskaya_nahodka_vladelcu(self):
         cl, hits, det = o._revizor_finding_touches_client("поправь гард приветствий в suggest.py")
         self.assertTrue(cl)
