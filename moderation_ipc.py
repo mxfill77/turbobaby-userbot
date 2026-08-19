@@ -246,6 +246,43 @@ def set_decision(draft_id, status, final_text=None, decided_by=None, reason=None
         )
 
 
+# ---------- ЗАХВАТ РЕШЕНИЯ ПЕРВЫМ ОТВЕТИВШИМ (карточка модерации, 19.08.2026) ----------
+# Почему отдельная функция, а НЕ set_decision: у set_decision нет предусловия по статусу — он
+# переводит строку в 'ready' из ЛЮБОГО состояния, включая уже отправленное 'sent'. Отсюда живой
+# путь ВТОРОГО сообщения одному клиенту: карточка остаётся с кнопками и после отправки, второй
+# тап ✅ снова ставит 'ready', а отправитель (suggest.poll_and_send → fetch_ready → send → mark)
+# дедупа не имеет ни одной строкой. Захват закрывает это ПО ПОСТРОЕНИЮ: предусловие проверяет
+# САМА СУБД внутри одного UPDATE, поэтому решение принимает РОВНО ОДИН нажавший при любой гонке
+# (двух процессов, двух модераторов, повторного тапа). Приём в этом файле не новый — им же
+# защищена очередь заявок: confirm_intake, "WHERE id=? AND status='draft'".
+DECISION_STATUSES = ("ready", "test_held", "rejected")
+# Из каких статусов захват законен. 'ready'/'test_held'/'rejected'/'sent'/'failed' СЮДА НЕ ВХОДЯТ:
+# решение по строке принимают один раз, и «переоткрыть» отправленное нельзя ни одной кнопкой.
+CLAIMABLE_FROM = ("new", "posted", "pending_confirm")
+
+
+def claim_decision(draft_id, status, final_text=None, decided_by=None, reason=None,
+                   allowed_from=None, path=None):
+    """Атомарно закрыть карточку решением ПЕРВОГО ответившего. → (взял?: bool, строка: dict|None).
+
+    status ∈ ready | test_held | rejected (те же, что у set_decision).
+    Не взял (карточку уже закрыли, либо строки нет) → (False, строка КАК ЕСТЬ | None): по ней
+    вызывающий показывает опоздавшему, что уже решено и КЕМ (decided_by/status), а не молчит.
+    Второго 'ready' по одной строке не бывает ни при какой гонке."""
+    assert status in DECISION_STATUSES
+    froms = CLAIMABLE_FROM if allowed_from is None else tuple(allowed_from)
+    marks = ",".join("?" for _f in froms)
+    with _conn(path) as c:
+        cur = c.execute(
+            "UPDATE drafts SET status=?, final_text=?, decided_by=?, reason=?, updated_ts=? "
+            "WHERE id=? AND status IN (" + marks + ")",
+            (status, final_text, decided_by, reason, _now_iso(), draft_id) + froms,
+        )
+        won = cur.rowcount > 0
+        row = _row(c.execute("SELECT * FROM drafts WHERE id=?", (draft_id,)).fetchone())
+    return won, row
+
+
 def mark(draft_id, status, reason=None, path=None):
     """Пометить итог отправки: sent | failed | test_held."""
     with _conn(path) as c:
