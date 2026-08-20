@@ -32,7 +32,8 @@ import tempfile
 import subprocess
 
 import pricing  # каркас получения точной цены из Календаря (Bridge); пусто → фолбэк
-import price_source  # сезонный множитель цены из price_source.json; БЕЗ флага — ветка мертва
+import price_source  # ИСТОЧНИК ЦЕНЫ: записанное правило price_source.json (переключено 20.08)
+import price_gate  # сторож свежести записанного правила: устарело → цену не называем
 import delivery  # резолвер зоны/цены доставки по maps-ссылке клиента (Bridge); пусто → [уточнить]
 
 log = logging.getLogger("suggest")
@@ -3284,7 +3285,14 @@ def _safe_quote_for_model(model, ds, de, getter=None, name_filter=None):
 
     ЗАНЯТОСТЬ судит по-прежнему живая дверь: `available` и выбор конкретного юнита приходят из
     `quote_for_model` и правкой не затрагиваются — файл её не заменяет и заменить не может.
-    Флаг снят → `reprice` отдаёт тот же объект, поведение побайтно прежнее."""
+    Ручка откинута в лист → `reprice` отдаёт тот же объект, поведение побайтно прежнее.
+
+    СТОРОЖ СВЕЖЕСТИ СТОИТ ЗДЕСЬ ЖЕ и включён ВМЕСТЕ с переключением источника — так велит
+    сам узел бизнес-правил, назвавший его «ОБЯЗАТЕЛЬНЫМ УСЛОВИЕМ ПЕРЕХОДА». Порядок веток
+    не косметический: сторож спрашивается ПОСЛЕ живой котировки (её `status` решает про
+    занятость и без цены) и ДО счёта по файлу — считать цену, которую запрещено называть,
+    незачем. Несвежее правило и непроверяемое правило ведут себя ОДИНАКОВО: цена гасится
+    в молчание, владелец позван. Вчерашнее число клиенту не уходит ни одной дорогой."""
     try:
         res = pricing.quote_for_model(model, ds, de, _get=getter, name_filter=name_filter)
     except Exception:
@@ -3293,10 +3301,18 @@ def _safe_quote_for_model(model, ds, de, getter=None, name_filter=None):
         return {"status": "error", "quote": None}
     try:
         on = price_source.enabled()
-    except Exception:                          # флаг не прочитался → это СНЯТЫЙ флаг
-        on = False
+    except Exception:                          # ручка не прочиталась → это НЕ откат к листу
+        on = True
     if not on:
-        return res                             # ветка не исполняется вовсе — путь прежний
+        return res                             # объявленный откат к листу — путь прежний
+    try:
+        may, card = price_gate.allow()
+    except Exception as e:                     # сторож не отработал → это НЕ разрешение
+        may, card = False, ("ЦЕНА НЕ НАЗВАНА: сторож свежести не отработал (%s)."
+                            % type(e).__name__)
+    if not may:
+        log.warning("price_gate: %s (модель %s)", card, model)
+        return {"status": "error", "quote": None}
     try:
         return price_source.reprice(res, model, ds, de, _bike_key)
     except Exception as e:

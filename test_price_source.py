@@ -2,8 +2,10 @@
 """Юниты сезонного множителя из `price_source.json` (модуль `price_source` + врезка в suggest).
 
 ТРИ ВЕЩИ, КОТОРЫЕ ЗДЕСЬ ДОКАЗЫВАЮТСЯ, А НЕ ДЕКЛАРИРУЮТСЯ:
-  1. СНЯТЫЙ ФЛАГ = ПРЕЖНЕЕ ПОВЕДЕНИЕ. Не «похожее», а тот же объект котировки и та же строка
-     клиенту (`test_flag_off_*`). Мусор и пустое значение — это снятый флаг.
+  1. ОБЪЯВЛЕННЫЙ ОТКАТ = ПРЕЖНЕЕ ПОВЕДЕНИЕ. Не «похожее», а тот же объект котировки и та же
+     строка клиенту. Переключение 20.08 перевернуло знак ручки: источник по умолчанию —
+     ЗАПИСАННОЕ ПРАВИЛО, а к живому листу возвращает ровно опознанное слово из `_FALSE`;
+     мусор и пустое значение — это ВКЛЮЧЕНО (`TestFlag`).
   2. БЕЗ ФАЙЛА — БЕЗ ЧИСЛА. Пропавший/пустой/битый/чужой схемы файл гасит цену в честный
      фолбэк «НЕ называй никакого числа», а не откатывается к слепому к сезону числу листа и не
      выдумывает своё (`test_negative_*`).
@@ -29,6 +31,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import price_gate
 import price_source
 import pricing
 import suggest
@@ -62,52 +65,62 @@ def live_quote(day_price=317, total=2217, deposit=3000, available=True, days=7,
 class FlagBase(unittest.TestCase):
     def setUp(self):
         self._flag = os.environ.get(FLAG)
+        self._ttl = os.environ.get(price_gate.TTL_ENV)
+        # ВРЕЗКА СТОРОЖА ГЛУШИТСЯ ОБЪЯВЛЕННЫМ ОТКАТОМ, а не моком. Иначе юнит источника цены
+        # полез бы девятью GET в ЖИВОЙ мост: 20.08 такие пробы шли по 306с и 599с, а один раз
+        # не вернулись вовсе. Предмет этих тестов — счёт по файлу; свежесть судит test_price_gate.
+        os.environ[price_gate.TTL_ENV] = "0"
+        price_gate.reset()
         self._path = price_source.PATH
         price_source._cache.update(key=None, doc=None)
 
     def tearDown(self):
         price_source.PATH = self._path
         price_source._cache.update(key=None, doc=None)
-        if self._flag is None:
-            os.environ.pop(FLAG, None)
-        else:
-            os.environ[FLAG] = self._flag
+        price_gate.reset()
+        for name, saved in ((FLAG, self._flag), (price_gate.TTL_ENV, self._ttl)):
+            if saved is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = saved
 
     def on(self):
-        os.environ[FLAG] = "1"
+        """Источник — ЗАПИСАННОЕ ПРАВИЛО. Это дефолт, поэтому ручку СНИМАЕМ, а не ставим."""
+        os.environ.pop(FLAG, None)
 
-    def off(self, value=None):
-        if value is None:
-            os.environ.pop(FLAG, None)
-        else:
-            os.environ[FLAG] = value
+    def off(self, value="0"):
+        """Объявленный откат к живому листу — ровно опознанным словом."""
+        os.environ[FLAG] = value
 
 
-# ───────────────────────────── 1. флаг: безопасный дефолт ─────────────────────────────
+# ──────────────── 1. ручка: дефолт — ПРАВИЛО, выключает опознанное слово ────────────────
 
 class TestFlag(FlagBase):
-    def test_flag_absent_is_off(self):
-        self.off()
-        self.assertFalse(price_source.enabled())
+    def test_no_handle_means_the_recorded_rule(self):
+        # Переключение 20.08: отсутствие ручки — это ВКЛЮЧЕНО, а не выключено.
+        os.environ.pop(FLAG, None)
+        self.assertTrue(price_source.enabled())
 
-    def test_flag_empty_and_garbage_is_off(self):
-        for v in ("", "   ", "0", "нет", "off", "false", "мусор", "PRICE", "2"):
+    def test_only_named_words_roll_back_to_the_sheet(self):
+        for v in ("0", "нет", "off", "OFF", " false ", "no", "выкл"):
             self.off(v)
             self.assertFalse(price_source.enabled(), v)
 
-    def test_flag_words_that_turn_it_on(self):
-        for v in ("1", "true", "TRUE", " yes ", "on", "да"):
+    def test_garbage_stays_on_the_rule_not_on_the_sheet(self):
+        # Неразбор падает на сторону ПРАВИЛА: цена ошибки «ушли на лист» названа деньгами
+        # (занижение пика 27.7–31.7 %), цена ошибки «остались на правиле» прикрыта сторожем.
+        for v in ("", "   ", "мусор", "PRICE", "2", "оff"):
             self.off(v)
             self.assertTrue(price_source.enabled(), v)
 
-    def test_flag_off_returns_the_very_same_object(self):
-        # Не «равный», а ТОТ ЖЕ: при снятом флаге ветка не исполняется вовсе.
+    def test_rolled_back_returns_the_very_same_object(self):
+        # Не «равный», а ТОТ ЖЕ: при откате ветка не исполняется вовсе.
         self.off()
         res = {"status": "ok", "quote": live_quote()}
         self.assertIs(price_source.reprice(res, "NMAX 155", "2026-01-29", "2026-02-05",
                                            suggest._bike_key), res)
 
-    def test_flag_read_on_every_call_not_on_import(self):
+    def test_handle_read_on_every_call_not_on_import(self):
         res = {"status": "ok", "quote": live_quote()}
         self.off()
         self.assertIs(price_source.reprice(res, "NMAX 155", "2026-01-29", "2026-02-05",
