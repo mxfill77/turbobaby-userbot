@@ -220,12 +220,34 @@ def _norm_alnum(s):
     return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
 
 
+def _norm_nocc(s):
+    """Нормализация имени БЕЗ токена рабочего объёма: «CB 300CC R 9011» → «cb300r9011».
+    Тот же приём, что у suggest._bike_key. Кириллическое «СС» снимать не нужно: его уже выбросил
+    _norm_alnum (он оставляет только a-z0-9), а собственного чтения аргумента здесь нет — оно
+    остаётся ровно одно, в _norm_alnum."""
+    return re.sub("cc", "", _norm_alnum(s))
+
+
 def _candidates(model, bikes):
-    """Байки, у кого нормализованная модель входит в нормализованное имя."""
+    """Байки, у кого нормализованная модель входит в нормализованное имя.
+
+    ВТОРОЙ ЗАХОД БЕЗ «CC» — страховка, а не замена: строгое сравнение остаётся первым и решает,
+    как решало (побайтно прежнее поведение везде, где оно вообще что-то находило). Пустой результат
+    строгого сравнения раньше был ТУПИКОМ на живых именах Лист1: «CB 300R» не сходится с «CB 300CC R
+    9011», потому что CC стои́т ВНУТРИ модели-токена. Прайс-сетка обходила это своим матчером
+    (suggest._sheet_variants на _bike_key), а точечная котировка молча отвечала no_candidates — и
+    целый класс мотоциклов был для неё непроцитируем. Ловушка живого класса: пустой список здесь
+    неотличим от «модели нет в парке»."""
     m = _norm_alnum(model)
     if not m:
         return []
-    return [b for b in bikes if m in _norm_alnum(b.get("name"))]
+    strict = [b for b in bikes if m in _norm_alnum(b.get("name"))]
+    if strict:
+        return strict
+    mk = _norm_nocc(model)
+    if not mk:
+        return []
+    return [b for b in bikes if mk in _norm_nocc(b.get("name"))]
 
 
 def quote_for_model(model, date_start, date_end, _get=None, _fleet=None, name_filter=None):

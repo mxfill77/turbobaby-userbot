@@ -7533,5 +7533,230 @@ class TestEnforceNoGenYear(unittest.TestCase):
         self.assertEqual(suggest._GEN_YEAR_RE.findall(suggest.client_facing_text(out)), [])
 
 
+class TestClassSuggestOffer(unittest.TestCase):
+    """ПОДБОР ПО КЛАССУ (правила владельца «подбор по классу 20.08», узел business_rules).
+
+    Что здесь охраняется, по пунктам правила:
+      1. запрошенная модель — ОСНОВНОЙ вариант, следом ВСЕ свободные того же класса ИЛИ ВЫШЕ;
+      2. классом НИЖЕ бот сам не предлагает НИКОГДА (только по просьбе «дешевле/проще»);
+      3. занятая модель — НЕ отказ, а замена тем же классом или выше (карты замен нет: её роль
+         исполняет класс);
+      4. тяжёлый класс — только если клиент САМ сказал про мощность/размер/опыт;
+      6. список не влез — число не влезших уходит клиенту, молчаливой обрезки нет.
+
+    Парк мока — живой срез по классам из узла бизнес-правил (снимок 20.08): NMAX 155 (обычный
+    скутер), XMAX 300 New Gen и ADV 350 (макси), XADV 750 (тяжёлый), CB 650R (мотоцикл). Формат
+    ответа quote_price повторяет живой дословно (day_price/total/deposit/available/days/cap_*/text)."""
+
+    NMAX = "NMAX 155CC BLACK PHUKET 4255"
+    XMAX = "XMAX 300CC NEW GEN PHUKET 5001"
+    ADV = "ADV 350CC WHITE PHUKET 5801"
+    XADV = "XADV 750CC BLACK PHUKET 7701"           # тяжёлый класс
+    CB = "CB 650CC R PHUKET 6501"                   # мотоцикл (верх лестницы)
+    FLEET_NAMES = [NMAX, XMAX, ADV, XADV, CB]
+    PRICE = {NMAX: 450, XMAX: 939, ADV: 749, XADV: 1945, CB: 1290}
+
+    DS, DE = "2026-07-15", "2026-07-20"
+    TODAY = datetime.date(2026, 7, 11)
+
+    def setUp(self):
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN, suggest._CLASS_OFFER_OFF)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+        suggest._CLASS_OFFER_OFF = False            # ветка ОН по умолчанию (ручка отката снята)
+
+    def tearDown(self):
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN, suggest._CLASS_OFFER_OFF) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+
+    def _getter(self, busy=()):
+        """Мок двери quote_price: busy — юниты, у которых available=False (заняты на период)."""
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET_NAMES]}}
+            bike = params.get("bike", "")
+            per = self.PRICE.get(bike)
+            if per is None:
+                return {"ok": False}
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            total = per * days
+            return {"ok": True, "data": {
+                "day_price": per, "total": total, "deposit": 5000, "days": days,
+                "available": bike not in busy, "cap_active": False, "cap_price": None,
+                "text": f"{total} ฿ за {days} дней ({per} ฿ в день)"}}
+        return fake
+
+    def _hints(self, **extra):
+        h = {"has_dates": True, "iso_start": self.DS, "iso_end": self.DE,
+             "model": "NMAX 155", "hint_days": 5}
+        h.update(extra)
+        return h
+
+    def _note(self, busy=(), **extra):
+        return suggest.build_pricing_note(self._hints(**extra), lang="ru",
+                                          getter=self._getter(busy), today=self.TODAY)
+
+    def _block(self, note):
+        """Клиентский блок из служебных скобок (то, что КОД вставит на место [QUOTE])."""
+        return suggest._quote_block_from_note(note) or ""
+
+    # ---------- (а) спрошенная СВОБОДНА: она первая, следом только тот же класс и выше ----------
+    def test_a_asked_model_is_first_then_same_class_and_above(self):
+        note = self._note()
+        block = self._block(note)
+        lines = [ln for ln in block.split("\n") if ln.strip()]
+        self.assertTrue(lines[0].startswith("NMAX 155"), f"основной вариант не первый: {lines}")
+        names = [ln.split(" — ")[0] for ln in lines]
+        # тот же класс и выше — есть; ниже спрошенного в парке нет никого, выше есть все три
+        self.assertIn("XMAX 300 New Gen", names)     # макси-скутеры (выше обычного скутера)
+        self.assertIn("ADV 350", names)              # макси-скутеры
+        self.assertIn("CB 650R", names)              # мотоциклы (верх лестницы)
+        self.assertIn("ПОСЧИТАНА по НЕСКОЛЬКИМ моделям", note)
+        # запрет называть другие модели СНЯТ: прежней формулы в инструкции больше нет
+        self.assertNotIn("ДРУГИХ моделей в этом ответе НЕ приводи", note)
+        # цифры LLM по-прежнему НЕ видит (маркерный режим цел на каждой строке списка)
+        self.assertNotIn(str(self.PRICE[self.ADV] * 5), suggest.make_system_prompt("FAQ", "ru",
+                                                                                   pricing_note=note))
+
+    # ---------- (б) спрошенная ЗАНЯТА: есть замены того же класса, отказа НЕТ ----------
+    def test_b_busy_asked_model_gets_replacements_not_refusal(self):
+        note = self._note(busy=(self.NMAX,))
+        block = self._block(note)
+        names = [ln.split(" — ")[0] for ln in block.split("\n") if ln.strip()]
+        self.assertNotIn("NMAX 155", names)          # цену занятой не называем ни строкой
+        self.assertIn("XMAX 300 New Gen", names)     # замена того же класса или выше
+        self.assertIn("ADV 350", names)
+        self.assertIn("ЗАПРОШЕННАЯ МОДЕЛЬ ЗАНЯТА", note)
+        # прежний отказ («уточню наличие и цену на эти даты и вернусь») ушёл
+        self.assertNotIn("уточню наличие и цену на эти даты и вернусь", note)
+        self.assertNotIn("все подходящие байки заняты", note)
+
+    # ---------- (в) свободных того же класса и выше НЕТ: вниз классом бот НЕ идёт ----------
+    def test_c_never_falls_below_class_when_nothing_free_above(self):
+        # спрошен XMAX 300 (макси). Всё, что того же класса и выше, ЗАНЯТО; свободен только NMAX —
+        # он классом НИЖЕ, и предлагать его боту нельзя (правило 2).
+        busy = (self.XMAX, self.ADV, self.XADV, self.CB)
+        note = self._note(busy=busy, model="XMAX 300")
+        self.assertNotIn("NMAX", note)               # ни строкой, ни числом — вниз не скатились
+        self.assertNotIn(str(self.PRICE[self.NMAX] * 5), note)
+        self.assertNotIn("ПОСЧИТАНА по НЕСКОЛЬКИМ моделям", note)
+        # честный прежний ответ занятости цел (подбор не подменяет собой отказ)
+        self.assertIn("заняты", note)
+
+        # тот же запрет, когда спрошенная СВОБОДНА, а выше свободных нет: список не появляется
+        note2 = self._note(busy=(self.ADV, self.XADV, self.CB), model="XMAX 300")
+        self.assertNotIn("NMAX", note2)
+        self.assertIsNotNone(suggest._quote_block_from_note(note2))   # своя цена у клиента есть
+        self.assertNotIn("ADV 350", self._block(note2))
+
+    # ---------- (г) про мощность клиент не говорил → тяжёлого класса в ответе НЕТ ----------
+    def test_d_heavy_class_only_when_client_named_power_size_experience(self):
+        block = self._block(self._note())
+        self.assertNotIn("XADV", block.upper())      # тяжёлый сам собой не поднимается
+        self.assertNotIn(str(self.PRICE[self.XADV] * 5), block)
+        # а сказал про мощность/опыт — тяжёлый законен
+        block2 = self._block(self._note(heavy_ok=True))
+        self.assertIn("XADV 750", block2)
+
+    # ---------- правило 6: список не влез → число не влезших уходит клиенту ----------
+    def test_message_cap_never_truncates_silently(self):
+        alts = [f"МОДЕЛЬ {i:02d} — 1000 ฿ за 5 дней; депозит 3000 ฿." for i in range(1, 13)]
+        block, more = suggest._class_offer_block("NMAX 155 — 2250 ฿.", alts, msg_max=400)
+        self.assertGreater(more, 0)                          # часть не влезла
+        self.assertLessEqual(len(block), 400)                # потолок соблюдён
+        self.assertIn(f"Свободно ещё {more}", block)         # число названо, а не проглочено
+        self.assertIn("какой класс интересует", block)       # и предложено назвать класс
+        self.assertTrue(block.startswith("NMAX 155 —"))      # основной вариант не выброшен никогда
+        # всё влезает → хвоста нет вовсе (правило «предела по числу моделей нет»)
+        block2, more2 = suggest._class_offer_block("NMAX 155 — 2250 ฿.", alts, msg_max=4096)
+        self.assertEqual(more2, 0)
+        self.assertNotIn("Свободно ещё", block2)
+
+    # ---------- лестница классов и её правила (чистые функции, без сети) ----------
+    def test_class_ladder_matches_owner_rule(self):
+        self.assertEqual(suggest._CLASS_LADDER,
+                         ("обычные скутеры", "макси-скутеры", "тяжёлые", "мотоциклы"))
+        self.assertEqual(suggest.park_class("NMAX 155"), "обычные скутеры")
+        self.assertEqual(suggest.park_class("XMAX 300 New Gen"), "макси-скутеры")
+        self.assertEqual(suggest.park_class("XADV 750"), "тяжёлые")
+        self.assertEqual(suggest.park_class("VULCAN 650S"), "мотоциклы")
+        self.assertIsNone(suggest.park_class("CLICK 125"))   # в аренду не сдаётся — класса нет
+        self.assertIsNone(suggest.park_class("СамокатХ"))    # неизвестной модели ранга нет
+
+    def test_scope_rules_are_the_owner_rules(self):
+        # ниже классом — никогда; тяжёлый — только по сигналу клиента
+        self.assertEqual(suggest.class_offer_scope("XMAX 300"),
+                         {"макси-скутеры", "мотоциклы"})
+        self.assertEqual(suggest.class_offer_scope("XMAX 300", heavy_ok=True),
+                         {"макси-скутеры", "тяжёлые", "мотоциклы"})
+        # «дешевле/проще» от клиента — единственный ключ к классу ниже; тяжёлый им НЕ открывается
+        self.assertEqual(suggest.class_offer_scope("XMAX 300", cheaper_ok=True),
+                         {"обычные скутеры", "макси-скутеры", "мотоциклы"})
+        self.assertIsNone(suggest.class_offer_scope("PCX 160"))   # класса нет → подбора нет
+
+    def test_cheaper_request_opens_the_class_below(self):
+        park = ["NMAX 155", "XMAX 300", "ADV 350", "XADV 750", "CB 650R", "CLICK 125"]
+        self.assertNotIn("NMAX 155", suggest.class_candidates("XMAX 300", park))
+        self.assertIn("NMAX 155", suggest.class_candidates("XMAX 300", park, cheaper_ok=True))
+        # несдаваемая модель не попадает НИКОГДА, даже открытым классом ниже
+        self.assertNotIn("CLICK 125", suggest.class_candidates("XMAX 300", park, cheaper_ok=True))
+
+    def test_heavy_signal_detector_and_its_safety_lock(self):
+        self.assertTrue(suggest._asks_heavy_class_ok("Хочу что-то мощное, около 650 кубов", ""))
+        self.assertTrue(suggest._asks_heavy_class_ok("Опыт большой, катал 5 лет", ""))
+        self.assertTrue(suggest._asks_heavy_class_ok("Нужен большой байк", ""))
+        self.assertFalse(suggest._asks_heavy_class_ok("nmax с 8 по 14 марта, какая цена?", ""))
+        # ЗАМОК БЕЗОПАСНОСТИ: «опыта нет» — это тоже разговор про опыт, но тяжёлый класс закрыт
+        self.assertFalse(suggest._asks_heavy_class_ok("Опыта нет вообще, первый раз", ""))
+        self.assertFalse(suggest._asks_heavy_class_ok("Я новичок, но хочу помощнее", ""))
+
+    def test_cheaper_detector(self):
+        self.assertTrue(suggest._asks_cheaper_or_simpler("а есть что подешевле?", ""))
+        self.assertTrue(suggest._asks_cheaper_or_simpler("нужен вариант попроще", ""))
+        self.assertFalse(suggest._asks_cheaper_or_simpler("nmax на 5 дней, сколько?", ""))
+
+    def test_hints_carry_both_handles(self):
+        h = suggest.extract_booking_hints("[клиент]: nmax с 15 по 20 июля", today=self.TODAY)
+        self.assertFalse(h["heavy_ok"])
+        self.assertFalse(h["cheaper_ok"])
+        h2 = suggest.extract_booking_hints("[клиент]: хочу помощнее, опыт большой",
+                                           today=self.TODAY)
+        self.assertTrue(h2["heavy_ok"])
+
+    # ---------- рамки правки: чего подбор НЕ делает ----------
+    def test_rollback_handle_restores_previous_path(self):
+        suggest._CLASS_OFFER_OFF = True
+        note = self._note()
+        self.assertNotIn("ПОСЧИТАНА по НЕСКОЛЬКИМ моделям", note)
+        self.assertNotIn("ADV 350", note)            # список не строится вовсе — путь прежний
+
+    def test_percent_question_keeps_single_model_path(self):
+        # «сколько будет 30%» разбирает ОДНУ котировку — список моделей там не к месту
+        note = self._note(percent_q=30)
+        self.assertNotIn("ПОСЧИТАНА по НЕСКОЛЬКИМ моделям", note)
+        self.assertIn("30%", note)
+
+    def test_fewshot_no_longer_teaches_to_defer_availability(self):
+        # пробел подбора №5: пример учил «сейчас уточним по наличию и вернёмся». Заменён на
+        # ЦЕЛЕВУЮ ФОРМУ (пример 3 узла бизнес-правил) — дословно, вместе с подводкой.
+        pairs = dict(suggest.STYLE_FEWSHOT_PAIRS)
+        self.assertNotIn("Nmax на эти даты есть в наличии?", pairs)
+        self.assertNotIn("Is the NMAX available for these dates?", pairs)
+        target = pairs["Добрый день, что есть с 08.10. На 8 дней из скутеров"]
+        self.assertIn("Вот что можем предложить:", target)
+        self.assertIn("NMAX 155CC | дней: 8 стоимость: 2 507 (Скидка за срок 7%, 313 в день), "
+                      "депозит: 3 000 бат", target)
+        self.assertIn("XADV 750CC | дней: 8 стоимость: 15 557", target)
+        for pair in suggest.STYLE_FEWSHOT_PAIRS:
+            self.assertNotIn("уточним по наличию", pair[1])
+            self.assertNotIn("check availability", pair[1])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

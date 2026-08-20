@@ -448,8 +448,18 @@ STYLE_FEWSHOT_PAIRS = [
      "пожалуйста, модель и даты."),
     ("Сколько доставка на Найхарн?",
      "Найхарн — 590 бат доставка, забор байка в конце аренды бесплатный."),
-    ("Nmax на эти даты есть в наличии?",
-     "Сейчас уточним по наличию на ваши даты и вернёмся ☺️"),
+    # ЦЕЛЕВАЯ ФОРМА (правило владельца «подбор по классу 20.08»). До 20.08 здесь стояла пара
+    # «Nmax на эти даты есть в наличии?» → «Сейчас уточним по наличию и вернёмся ☺️» — она учила
+    # ОТКЛАДЫВАТЬ ответ о наличии и была названа пробелом подбора №5 в узле бизнес-правил. Замена
+    # взята ОТТУДА ЖЕ дословно (раздел о форме первого ответа, пример 3: «ЦЕЛЕВАЯ ФОРМА: четыре
+    # модели, у каждой полная цена»), а не сочинена здесь.
+    ("Добрый день, что есть с 08.10. На 8 дней из скутеров",
+     "Здравствуйте, пару минут\n"
+     "Вот что можем предложить:\n"
+     "NMAX 155CC | дней: 8 стоимость: 2 507 (Скидка за срок 7%, 313 в день), депозит: 3 000 бат\n"
+     "FORZA 300CC | дней: 8 стоимость: 3 854 (Скидка за срок 7%, 482 в день), депозит: 5 000 бат\n"
+     "XMAX 300CC НОВОЕ ПОКОЛЕНИЕ | дней: 8 стоимость: 5 238 (Скидка за срок 7%, 655 в день), депозит: 5 000 бат\n"
+     "XADV 750CC | дней: 8 стоимость: 15 557 (Скидка за срок 7%, 1 945 в день), депозит: 20 000 бат"),
     ("Можно на 2 дня?",
      "Скутеры у нас от 5 дней, мотоциклы от 3. На какие даты рассматриваете?"),
     ("А если брать на подольше, скидка будет?",
@@ -469,8 +479,15 @@ STYLE_FEWSHOT_PAIRS = [
      "Hi! Which model and what dates — from when to when? I'll calculate the exact price for those days."),
     ("What about the deposit?",
      "Deposit is either cash or your passport — your choice, not both. Cash in Thai baht or a transfer works."),
-    ("Is the NMAX available for these dates?",
-     "Let me check availability for your dates and I'll get back to you ☺️"),
+    # EN-БЛИЗНЕЦ той же пары учил ТОМУ ЖЕ откладыванию («I'll get back to you»). Образца для него
+    # в узле бизнес-правил нет — корпус примеров русский, — поэтому перенесена ФОРМА примера 3, а
+    # текст переведён; числа — та же иллюстрация формата, что и в русской паре.
+    ("What do you have from Oct 8th, for 8 days? Scooters",
+     "Hi! One moment\n"
+     "Here is what we can offer:\n"
+     "NMAX 155CC | days: 8 total: 2 507 (Term discount 7%, 313 per day), deposit: 3 000 baht\n"
+     "FORZA 300CC | days: 8 total: 3 854 (Term discount 7%, 482 per day), deposit: 5 000 baht\n"
+     "XMAX 300CC NEW GEN | days: 8 total: 5 238 (Term discount 7%, 655 per day), deposit: 5 000 baht"),
 ]
 
 
@@ -2237,6 +2254,52 @@ def _asks_old_gen(newest: str, recent: str) -> bool:
     return bool(_OLD_GEN_RE.search(f"{newest or ''}\n{recent or ''}"))
 
 
+# --- ДВЕ РУЧКИ ПОДБОРА ПО КЛАССУ (правило владельца «подбор по классу 20.08») -------------------
+# Обе открывает ТОЛЬКО клиент своими словами; сам бот ни одну не включает.
+#
+# ТЯЖЁЛЫЙ КЛАСС (X-ADV 750) — «только если клиент САМ сказал про мощность, размер или опыт».
+# Слово «опыт» здесь двусмысленно, и разводить его обязательно: «опыта нет» — это тоже разговор про
+# опыт, но поднимать новичка в тяжёлый класс на этом основании было бы прямым нарушением
+# EXPERIENCE_SAFETY_RULE. Поэтому отрицание опыта ЗАКРЫВАЕТ ручку, а не открывает.
+_HEAVY_OK_RE = re.compile(
+    r"мощн\w*|помощнее|мощ[её]й"                                  # мощность
+    r"|кубат\w*|\d{3}\s*(?:куб\w*|cc|сс|см3)|куб\w+"              # кубатура словами клиента
+    r"|крупн\w*|побольше|поболь\w*|тяж[её]л\w*|большой\s+байк\w*|большие\s+байк\w*"   # размер
+    r"|\bопыт\w*|стаж\w*|ездил\w*|катал\w*|управлял\w*|права\s+категор\w*"            # опыт
+    r"|powerful|more\s+power|bigger|big\s+bike|heavy\s+bike"
+    r"|experienc\w*|been\s+riding|have\s+ridden|ride[dn]?\s+for\s+\d",
+    re.I)
+# Отрицание опыта/новичок — ручка тяжёлого класса ЗАКРЫТА, чем бы её ни открывали выше.
+_HEAVY_BLOCK_RE = re.compile(
+    r"без\s+опыт\w*|не\s*т\s+опыт\w*|нет\s+опыт\w*|опыта\s+нет|не\s+было\s+опыт\w*"
+    r"|новичок|новичк\w*|нович[её]к|впервые|первый\s+раз|никогда\s+не\s+ездил\w*"
+    r"|no\s+experience|never\s+ridden|never\s+rode|beginner|first\s+time|newbie",
+    re.I)
+# КЛАСС НИЖЕ — только по прямой просьбе клиента «дешевле / проще». Формы перечислены явно, чтобы не
+# ловить «проще говоря» и «дешевле, чем у соседей» (второе — торг о цене, а не просьба другого класса).
+_CHEAPER_RE = re.compile(
+    r"подешевл\w*|дешевл\w+\s+(?:есть|вариант\w*|что|чего|модел\w*|байк\w*)|"
+    r"есть\s+(?:что[- ])?(?:нибудь\s+)?(?:подешевле|дешевле|попроще|проще)|"
+    r"попроще|что[- ]нибудь\s+проще|поменьше\s+(?:кубат\w*|байк\w*)|"
+    r"бюджетн\w*|эконом(?:ич\w*|н\w*|)\b|"
+    r"cheaper|cheapest|budget\s+option|something\s+simpler|simpler\s+one|less\s+powerful|smaller\s+bike",
+    re.I)
+
+
+def _asks_heavy_class_ok(newest: str, recent: str) -> bool:
+    """Клиент САМ заговорил про мощность/размер/опыт → тяжёлый класс предлагать МОЖНО.
+    Отрицание опыта («без опыта», «новичок») закрывает ручку целиком — правило безопасности выше."""
+    text = f"{newest or ''}\n{recent or ''}"
+    if _HEAVY_BLOCK_RE.search(text):
+        return False
+    return bool(_HEAVY_OK_RE.search(text))
+
+
+def _asks_cheaper_or_simpler(newest: str, recent: str) -> bool:
+    """Клиент САМ попросил дешевле/проще → и только тогда бот вправе спуститься классом НИЖЕ."""
+    return bool(_CHEAPER_RE.search(f"{newest or ''}\n{recent or ''}"))
+
+
 def _asks_deposit_reduction_multi(newest: str, recent: str, models) -> bool:
     """Явный вопрос клиента про уменьшение депозита при нескольких байках (правила цен v2, п.4).
     newest — последняя реплика клиента, recent — склейка последних реплик, models — найденные модели."""
@@ -2737,6 +2800,9 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
     percent_q = _asks_percent_amount(newest, recent)   # «сколько будет N%» → процент от суммы расчёта
     units_count = _units_count(newest, models)         # «пара/два юнита одной модели» → цена «за каждый»
     old_gen_q = _asks_old_gen(newest, recent)          # «а старый xmax есть?» → прежнее поколение по запросу
+    # Две ручки подбора по классу (правило владельца 20.08): обе открывает ТОЛЬКО клиент словами.
+    heavy_ok = _asks_heavy_class_ok(newest, recent)    # мощность/размер/опыт → тяжёлый класс можно
+    cheaper_ok = _asks_cheaper_or_simpler(newest, recent)   # «дешевле/проще» → можно классом НИЖЕ
     deposit_passport_q = _deposit_passport_chosen(window)   # «паспорт в залог» → депозит без суммы
 
     # Гео для ДОСТАВКИ (шаг 5/7 #12): первая maps-ссылка в репликах клиента (новейшая первой). Ловим
@@ -2774,6 +2840,7 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
             "sheet_filter": sheet_filter, "requested_models": requested_models,
             "percent_q": percent_q, "units_count": units_count,
             "old_gen_q": old_gen_q, "deposit_passport_q": deposit_passport_q,
+            "heavy_ok": heavy_ok, "cheaper_ok": cheaper_ok,
             "maps_link": maps_link, "geo_pin": geo_pin}
 
 
@@ -3380,12 +3447,20 @@ def _resolve_model_price(model, ds, de, hint_days, monthly, getter=None, name_fi
 
 
 def _wrap_single(kind: str, phrase: str) -> str:
+    """Инструкция ЦЕНА для ОДНОЙ посчитанной модели.
+
+    ЗАПРЕТ СУЖЕН 20.08.2026 (правило владельца «подбор по классу 20.08»): раньше здесь стояло
+    «цены/депозиты ДРУГИХ моделей в этом ответе НЕ приводи», и оно запрещало называть другие модели
+    ВООБЩЕ. Охранял этот запрет не молчание о парке, а НЕПОСЧИТАННЫЕ ЧИСЛА — посчитана была ровно
+    одна модель, и цифра по соседней могла прийти только из головы LLM или из FAQ. Теперь запрет
+    назван своей посылкой: не называть цен по моделям, которых в расчёте НЕТ. Разбор забора —
+    в секции «ПОДБОР ПО КЛАССУ» ниже."""
     if kind == "ok":
         return ("ЦЕНА из Календаря бронирования (использовать ДОСЛОВНО, не пересчитывать, не "
                 "округлять и НЕ переформатировать — приведи строку как есть и НЕ опускай её часть "
-                "про скидку за срок «(Скидка за срок N%, … в день)», если она в строке; это "
-                "ЕДИНСТВЕННАЯ запрошенная модель — цены/депозиты ДРУГИХ моделей в этом ответе НЕ "
-                "приводи): " + phrase + ".")
+                "про скидку за срок «(Скидка за срок N%, … в день)», если она в строке; посчитана "
+                "ТОЛЬКО эта модель — цены и депозиты моделей, которых в расчёте нет, НЕ называй и "
+                "НЕ выдумывай): " + phrase + ".")
     return "ЦЕНА: " + phrase + "."
 
 
@@ -3396,8 +3471,8 @@ def _quote_marker_note() -> str:
     «строка J дословно» выполняется ПО ПОСТРОЕНИЮ (живой смоук 23.07: sonnet-5 переносил цифры
     парафразом, дедуп #365 склейку пропускал — канонической строки у клиента не было).
     Префикс «ЦЕНА из Календаря бронирования» сохранён: якорь _PRICE_OK_MARKS и тестов."""
-    return ("ЦЕНА из Календаря бронирования ПОСЧИТАНА (это ЕДИНСТВЕННАЯ запрошенная модель — "
-            "цены/депозиты ДРУГИХ моделей в этом ответе НЕ приводи). Каноническую строку цены "
+    return ("ЦЕНА из Календаря бронирования ПОСЧИТАНА (посчитана ТОЛЬКО эта модель — цены и "
+            "депозиты моделей, которых в расчёте нет, НЕ называй и НЕ выдумывай). Каноническую строку цены "
             "вставит КОД ДОСЛОВНО на место метки [QUOTE]: выведи метку [QUOTE] ОТДЕЛЬНОЙ строкой "
             "там, где в ответе должна звучать цена; сам НИКАКИЕ числа цены/итога/депозита НЕ "
             "называй, НЕ пересказывай и НЕ выдумывай (ни из FAQ, ни ориентиров) — цифры уже "
@@ -3686,6 +3761,290 @@ def price_sheet(ds, getter=None, _now=None, _fleet=None):
     здесь неотличим от «все заняты»). Новый код обязан звать price_sheet_status()."""
     rows, _skipped = price_sheet_status(ds, getter=getter, _now=_now, _fleet=_fleet)
     return rows
+
+
+# ================= ПОДБОР ПО КЛАССУ (правила владельца 20.08.2026, узел business_rules) =================
+# Метка правила в мозге: «подбор по классу 20.08». Взято ПО ИМЕНИ из живого реестра моста, не из
+# пересказа. Лестница классов названа владельцем и задаёт слово «выше»; разнос парка — снимок 20.08
+# (37 сдаваемых единиц из 38; CLICK 125 в аренду не сдаётся никогда).
+#
+# ЗАБОР ЧЕСТЕРТОНА — зачем вообще стоял запрет «цены/депозиты ДРУГИХ моделей в этом ответе НЕ приводи»
+# (жил в _wrap_single и _quote_marker_note до 20.08). Точечная котировка идёт МАРКЕРНЫМ режимом: LLM
+# цифр не видит вовсе, каноническую строку столбца J вставляет КОД. Посчитана была РОВНО ОДНА модель,
+# значит любое число по соседней могло прийти только из головы модели или из FAQ — то есть быть
+# выдуманным, а инвариант «без котировки нет числа» рухнул бы молча. Запрет охранял НЕПОСЧИТАННЫЕ
+# ЧИСЛА, а «называть модели» запрещал заодно — просто потому, что других посчитанных моделей на этом
+# пути до сегодня не бывало.
+#
+# ЧТО ТЕРЯЕМ, СНИМАЯ. Из охраняемого — ничего: запрет не снят, а СУЖЕН до собственной посылки («числа
+# по моделям, которых нет в блоке, не называй»), и блок теперь несёт НЕСКОЛЬКО посчитанных моделей.
+# Платим двумя вещами, обе названы: (1) ЛАТЕНТНОСТЬ — живые quote по остальным моделям класса (пул +
+# дедлайн _CLASS_OFFER_DEADLINE, просрочка = модель просто не попала в подбор, ответ не срывается);
+# (2) ДЛИНА ответа — против неё стоит правило потолка сообщения (не обрезаем молча, см.
+# _class_offer_block). Откат целиком — ручкой PRICE_CLASS_OFFER_OFF=1, без коммита.
+_CLASS_SCOOTER, _CLASS_MAXI, _CLASS_HEAVY, _CLASS_MOTO = (
+    "обычные скутеры", "макси-скутеры", "тяжёлые", "мотоциклы")
+# Лестница СНИЗУ ВВЕРХ: индекс = ранг, «выше» = больший индекс. Порядок назван владельцем дословно.
+_CLASS_LADDER = (_CLASS_SCOOTER, _CLASS_MAXI, _CLASS_HEAVY, _CLASS_MOTO)
+# Разнос живого парка по классам (снимок 20.08.2026; ключи — _bike_key, тот же, что у allowlist).
+# Моделей «отнести некуда» в снимке ноль. CLICK 125 сюда НЕ входит осознанно: класс у неё есть
+# (обычный скутер), но аренды нет — её режет _NON_RENTABLE_KEYS раньше классов.
+_PARK_CLASS = {
+    "nmax155": _CLASS_SCOOTER,
+    "adv350": _CLASS_MAXI, "xmax300": _CLASS_MAXI, "forza300": _CLASS_MAXI,
+    "xadv750": _CLASS_HEAVY,
+    "cbr650r": _CLASS_MOTO, "cb650r": _CLASS_MOTO, "cb300r": _CLASS_MOTO,
+    "xsr155": _CLASS_MOTO, "ninja400": _CLASS_MOTO, "mt03": _CLASS_MOTO,
+    "vulcan650s": _CLASS_MOTO,
+}
+# Длинные ключи первыми: «xmax300» обязан выиграть у более короткого совпадения, если такое заведут.
+_PARK_CLASS_KEYS = tuple(sorted(_PARK_CLASS, key=len, reverse=True))
+
+_CLASS_OFFER_OFF = (os.getenv("PRICE_CLASS_OFFER_OFF", "").strip() not in ("", "0"))
+_CLASS_OFFER_WORKERS = int(os.getenv("PRICE_CLASS_OFFER_WORKERS", "8") or "8")
+_CLASS_OFFER_DEADLINE = int(os.getenv("PRICE_CLASS_OFFER_DEADLINE_SEC", "60") or "60")
+# Потолок сообщения Telegram. ЭТО ТЕХНИЧЕСКОЕ ОГРАНИЧЕНИЕ, А НЕ ПРАВИЛО ВЛАДЕЛЬЦА — правило прямо
+# говорит, что предела по числу моделей нет, а не влезшее НЕ пропадает молча (см. _class_offer_block).
+_CLASS_OFFER_MSG_MAX = 4096
+
+
+def park_class(model):
+    """Модель → класс лестницы владельца | None (класса нет в снимке 20.08).
+
+    None — честный третий исход, а не «скутер по умолчанию»: неизвестной модели мы не знаем ни
+    ранга, ни того, что считать «выше», и подбор по классу на ней НЕ строится вовсе (прежний путь)."""
+    mk = _bike_key(model)
+    if not mk:
+        return None
+    for k in _PARK_CLASS_KEYS:
+        if k in mk:
+            return _PARK_CLASS[k]
+    return None
+
+
+def _class_rank(model):
+    """Ранг класса модели (0 — обычные скутеры … 3 — мотоциклы) | None."""
+    c = park_class(model)
+    return _CLASS_LADDER.index(c) if c in _CLASS_LADDER else None
+
+
+def class_offer_scope(asked, heavy_ok=False, cheaper_ok=False):
+    """Классы, которые бот вправе предложить САМ, дополнительно к спрошенной модели. → set | None
+    (класс спрошенного неизвестен — подбора не строим).
+
+    Два правила владельца сидят ровно здесь и больше нигде:
+      • НИЖЕ КЛАССОМ БОТ САМ НЕ ПРЕДЛАГАЕТ НИКОГДА — пол списка равен рангу спрошенного; опускает
+        пол только явная просьба клиента «дешевле/проще» (cheaper_ok);
+      • ТЯЖЁЛЫЙ КЛАСС — только если клиент САМ сказал про мощность, размер или опыт (heavy_ok). Это
+        исключение из «того же класса или выше»: сам бот в тяжёлый класс не поднимает никогда."""
+    r = _class_rank(asked)
+    if r is None:
+        return None
+    lo = 0 if cheaper_ok else r
+    out = {c for i, c in enumerate(_CLASS_LADDER) if i >= lo}
+    if not heavy_ok:
+        out.discard(_CLASS_HEAVY)
+    return out
+
+
+def class_candidates(asked, allow, heavy_ok=False, cheaper_ok=False):
+    """Модели парка, которые ПО КЛАССУ вправе идти дополнительно к спрошенной. → list[str] (порядок
+    детерминирован: сначала свой класс, потом выше; внутри класса — порядок allowlist).
+
+    Сама спрошенная модель отсюда исключена: она ОСНОВНОЙ вариант, а не «дополнительно». Несдаваемые
+    (CLICK 125) отсекаются раньше классов — у них нет аренды, а не класса."""
+    scope = class_offer_scope(asked, heavy_ok=heavy_ok, cheaper_ok=cheaper_ok)
+    if scope is None:
+        return []
+    ak = _bike_key(asked)
+    out = []
+    for i, m in enumerate(allow or []):
+        mk = _bike_key(m)
+        if not mk or mk in _NON_RENTABLE_KEYS:
+            continue
+        if ak and (ak in mk or mk in ak):
+            continue
+        c = park_class(m)
+        if c in scope:
+            out.append((_CLASS_LADDER.index(c), i, m))
+    return [m for _r, _i, m in sorted(out)]
+
+
+def class_offer_status(asked, ds, de, hint_days=None, monthly=None, getter=None,
+                       heavy_ok=False, cheaper_ok=False, want_old_gen=False, allow=None):
+    """Свободные на ds..de модели того же класса или выше. → (free, skipped):
+    free — list[(метка, фраза_цены, quote)]; skipped — list[{model, reason}], reason ∈
+    {none (все юниты заняты), min (срок короче минимального), sanity, error}.
+
+    Занятость судит та же живая дверь, что и точечная котировка (`_resolve_model_price` →
+    `quote_for_model`: перебор юнитов, первый свободный → ok, иначе none_available) — двух мерок у
+    одного признака быть не должно. В подбор идёт ТОЛЬКО исход `ok`: «не проверено»/«срок короче
+    минимума»/«сбой» — это не свободная модель, и цену за них не называем.
+
+    Квотируем ПАРАЛЛЕЛЬНО пулом с общим дедлайном: не успевшая модель просто не попала в подбор
+    (ответ клиенту не срывается) — тот же класс страховки, что у прайс-сетки."""
+    if allow is None:
+        try:
+            allow = park_allowlist(getter)
+        except Exception:                          # парк недоступен → подбора нет (прежний путь)
+            allow = None
+    cands = class_candidates(asked, allow, heavy_ok=heavy_ok, cheaper_ok=cheaper_ok)
+    products = [(label, m, nf) for m in cands
+                for label, nf in _model_products_for_quote(m, want_old_gen=want_old_gen)]
+    if not products:
+        return [], []
+    import concurrent.futures as _cf
+    t0 = time.time()
+    ex = _cf.ThreadPoolExecutor(max_workers=max(1, _CLASS_OFFER_WORKERS))
+    res = {}
+    try:
+        futs = {i: ex.submit(_resolve_model_price, m, ds, de, hint_days, monthly, getter, nf)
+                for i, (_label, m, nf) in enumerate(products)}
+        deadline = t0 + _CLASS_OFFER_DEADLINE
+        for i, fut in futs.items():
+            try:
+                res[i] = fut.result(timeout=max(0.0, deadline - time.time()))
+            except Exception:
+                res[i] = None
+                log.info(f"CLASS-OFFER: {products[i][0]} не уложилась в дедлайн "
+                         f"{_CLASS_OFFER_DEADLINE}с или упала — в подбор не идёт")
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    free, skipped = [], []
+    for i, (label, _m, _nf) in enumerate(products):
+        got = res.get(i)
+        if not isinstance(got, tuple):
+            skipped.append({"model": label, "reason": "error"})
+            continue
+        kind, phrase, q = got
+        if kind == "ok":
+            free.append((label, phrase, q))
+        else:
+            skipped.append({"model": label, "reason": kind})
+    log.info(f"CLASS-OFFER: спрошено «{asked}» → кандидатов {len(products)}, свободных {len(free)}, "
+             f"отсеяно {len(skipped)} за {time.time() - t0:.1f}с")
+    return free, skipped
+
+
+def _ru_models_word(n) -> str:
+    """«модель / модели / моделей» по числу (11-14 — исключение из правила единиц)."""
+    n = abs(int(n))
+    if n % 100 in (11, 12, 13, 14):
+        return "моделей"
+    last = n % 10
+    if last == 1:
+        return "модель"
+    if last in (2, 3, 4):
+        return "модели"
+    return "моделей"
+
+
+def _class_offer_tail(n, lang="ru") -> str:
+    """Хвост «список не влез»: сколько ещё свободно + просьба назвать класс. Правило владельца —
+    молча потерянная модель хуже длинного списка, поэтому обрезка ВСЕГДА объявлена числом."""
+    if lang == "en":
+        return (f"{n} more models are free for these dates — tell me which class you are interested "
+                f"in (scooters, maxi-scooters, motorcycles) and I will send their prices.")
+    return (f"Свободно ещё {n} {_ru_models_word(n)} на эти даты — скажите, какой класс интересует "
+            f"(скутеры, макси-скутеры, мотоциклы), и пришлю по ним цены.")
+
+
+def _class_offer_block(primary, alt_lines, lang="ru", msg_max=None):
+    """Клиентский блок подбора с потолком сообщения. → (текст, сколько НЕ влезло).
+
+    ОСНОВНОЙ вариант не выбрасывается никогда (даже если один он перерастает потолок — иначе клиент
+    остался бы без ответа на свой же вопрос). Не влезшие дополнительные НЕ пропадают молча: их число
+    уезжает в хвост вместе с предложением назвать класс. Потолок — техническое ограничение, а не
+    правило: правило говорит «предела по числу моделей нет»."""
+    cap = int(msg_max or _CLASS_OFFER_MSG_MAX)
+    head = [primary] if primary else []
+    base = sum(len(x) + 1 for x in head)
+
+    def _fit(reserve):
+        used, kept = base, []
+        for line in alt_lines:
+            if used + len(line) + 1 + reserve > cap:
+                break
+            kept.append(line)
+            used += len(line) + 1
+        return kept
+
+    kept = _fit(0)
+    if len(kept) < len(alt_lines):                  # что-то не влезло → бронируем место под хвост
+        kept = _fit(len(_class_offer_tail(len(alt_lines), lang)) + 1)
+    more = len(alt_lines) - len(kept)
+    lines = head + kept + ([_class_offer_tail(more, lang)] if more else [])
+    return "\n".join(lines), more
+
+
+def _class_offer_note(busy_primary: bool, lang: str = "ru") -> str:
+    """Инструкция ЦЕНА для подбора по классу. Как и точечный quote — МАРКЕРНЫЙ режим: LLM цифр не
+    видит вовсе, строки вставляет КОД на место [QUOTE], значит инвариант #92 «строка J дословно»
+    держится по построению на КАЖДОЙ строке списка, а не только на основной."""
+    common = ("Каноничные строки цен вставит КОД ДОСЛОВНО на место метки [QUOTE]: выведи метку "
+              "[QUOTE] ОТДЕЛЬНОЙ строкой там, где в ответе должны стоять варианты. Сам НИКАКИЕ "
+              "числа цены/итога/депозита НЕ называй, НЕ пересказывай и НЕ выдумывай (ни из FAQ, ни "
+              "ориентиров) — они уже посчитаны и придут кодом. Моделей, которых в блоке НЕТ, не "
+              "предлагай и цен по ним не называй. Классом НИЖЕ спрошенного сам ничего не предлагай "
+              "— только если клиент сам попросит дешевле или проще.")
+    if busy_primary:
+        return ("ЦЕНА из Календаря бронирования: ЗАПРОШЕННАЯ МОДЕЛЬ ЗАНЯТА на эти даты (Календарь "
+                "вернул «свободных юнитов нет»). Это НЕ отказ и НЕ повод отписаться: скажи коротко "
+                "и прямо, что именно её на эти даты предложить не можем, и СРАЗУ дай замену — "
+                "модели того же класса или выше, свободные на эти даты, уже посчитаны. " + common +
+                " Занятость этой модели ПОСЧИТАНА Календарём, поэтому сказать «на эти даты её нет» "
+                "здесь законно: правило наличия запрещает утверждать наличие БЕЗ данных, а данные "
+                "тут есть. «Уточню наличие и вернусь» НЕ пиши — замена уже готова.")
+    return ("ЦЕНА из Календаря бронирования ПОСЧИТАНА по НЕСКОЛЬКИМ моделям: первой в блоке идёт "
+            "та, что спросил клиент — она ОСНОВНОЙ вариант; следом ДОПОЛНИТЕЛЬНО идут модели того "
+            "же класса или выше, которые Календарь отдал свободными на эти даты. Перед меткой дай "
+            "короткую подводку в духе «Вот что можем предложить на эти даты:». " + common +
+            " «Уточню цену и вернусь» НЕ пиши: расчёт уже есть.")
+
+
+def _class_offer_full_note(label, kind, phrase, q, ds, de, hints, lang="ru", getter=None,
+                           passport_dep=False, skip=False):
+    """ГОТОВАЯ инструкция ЦЕНА с подбором по классу | None (подбора нет — вызывающий идёт прежним
+    путём БАЙТ-В-БАЙТ).
+
+    None возвращается по пяти названным причинам, и каждая — сознательная рамка правки:
+      • `skip` — процент от суммы («сколько будет 30 %») и «N юнитов одной модели»: у обоих СВОЙ
+        разбор одной котировки, список моделей там не к месту;
+      • ручка отката `PRICE_CLASS_OFFER_OFF=1`;
+      • исход котировки не `ok`/`none` — «срок короче минимума», sanity-гард и сбой источника
+        остаются прежними ответами (подбор не лечит несходящийся расчёт);
+      • класса спрошенной модели нет в снимке парка — «выше» тогда не определено;
+      • свободных того же класса или выше НЕТ ВОВСЕ. Тогда бот НЕ скатывается классом ниже сам:
+        занятая модель честно уходит в прежний отказ, а свободная остаётся одна собой."""
+    if skip or _CLASS_OFFER_OFF:
+        return None
+    if kind not in ("ok", "none"):
+        return None
+    if _class_rank(label) is None:
+        return None
+    free, skipped = class_offer_status(
+        label, ds, de, hint_days=hints.get("hint_days"), monthly=hints.get("monthly"),
+        getter=getter, heavy_ok=bool(hints.get("heavy_ok")),
+        cheaper_ok=bool(hints.get("cheaper_ok")), want_old_gen=bool(hints.get("old_gen_q")))
+    if not free:
+        log.info(f"CLASS-OFFER: «{label}» — свободных того же класса или выше нет "
+                 f"(отсеяно {len(skipped)}); классом НИЖЕ сами не предлагаем — путь прежний")
+        return None
+    alt_lines = []
+    for alt_label, alt_phrase, alt_q in free:
+        if passport_dep:
+            alt_phrase = _deposit_as_passport(alt_phrase, lang)
+        alt_lines.append(f"{alt_label} — {_scrub_gen_year(_quote_j_line(alt_q, alt_phrase, passport_dep))}.")
+    primary = None
+    if kind == "ok":
+        qphrase = _scrub_gen_year(_quote_j_line(q, phrase, passport_dep))
+        primary = (f"{label} — {qphrase}." if label else qphrase.rstrip(".") + ".")
+    block, more = _class_offer_block(primary, alt_lines, lang)
+    if more:
+        log.info(f"CLASS-OFFER: в сообщение не влезло {more} модел. — их число ушло клиенту "
+                 f"строкой с предложением назвать класс (молча НЕ обрезаем)")
+    return (_class_offer_note(primary is None, lang)
+            + "\n" + _QUOTE_OPEN + "\n" + block + "\n" + _QUOTE_CLOSE)
 
 
 def _sheet_total_cell(q):
@@ -4505,6 +4864,15 @@ def _build_pricing_note_core(hints: dict, lang: str = "ru", getter=None, today=N
         # живут в служебных скобках и в финал попадают ТОЛЬКО КОДОМ (compose_quote_draft). LLM
         # цифры не видит → не перефразирует; строка J у клиента ДОСЛОВНА по построению (#92).
         marker_mode = (kind == "ok" and not pct)
+        # ПОДБОР ПО КЛАССУ (правило владельца 20.08): спрошенная модель идёт ОСНОВНЫМ вариантом,
+        # следом — все свободные на эти даты модели того же класса или выше. Занята спрошенная —
+        # это больше не отказ, а замена теми же классами. Отдельной карты замен НЕТ и не заводится:
+        # её роль исполняет класс. Ветка возвращает готовую note ЦЕЛИКОМ либо None (прежний путь).
+        offer = _class_offer_full_note(label, kind, phrase, q, ds, de, hints, lang,
+                                       getter=getter, passport_dep=passport_dep,
+                                       skip=bool(pct or units))
+        if offer is not None:
+            return offer + dep + pickup
         note = _quote_marker_note() if marker_mode else _wrap_single(kind, phrase)
         if pct:
             note += _percent_line(pct, q if kind in ("ok", "min") else None)

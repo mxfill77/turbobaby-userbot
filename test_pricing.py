@@ -768,7 +768,19 @@ class TestClass0ModelResolveAndTerm(unittest.TestCase):
         # пустой/чужой canon → unknown (fail-safe, исходную строку вызывающий оставит как есть)
         self.assertEqual(suggest.resolve_park_model("", getter=self.getter)[0], "unknown")
 
-    # --- ДОСЛОВНЫЙ живой провал: XSR 155 + «с 20 на 2 недели» → XSR155-цена, БЕЗ MT-03 ---------
+    # --- ДОСЛОВНЫЙ живой провал: XSR 155 + «с 20 на 2 недели» → XSR155-цена, БЕЗ ПОДМЕНЫ --------
+    # ПОПРАВКА 20.08.2026 (правило владельца «подбор по классу»): предмет голдена сузился с «MT-03
+    # в ответе быть НЕ ДОЛЖНО» до «MT-03 не смеет стоять в КАРТОЧКЕ XSR». Причина названа: MT-03 —
+    # тот же класс (мотоциклы), и владелец прямо велел называть свободные модели того же класса
+    # дополнительно. Живой провал, ради которого голден заводился, был про ПОДМЕНУ (цена чужого
+    # юнита выдавалась за цену спрошенного), и именно она здесь и проверяется — построчно.
+    # Даром это не досталось: NMAX 155 и ADV 350 в том же парке свободны и в ответ НЕ попали —
+    # они классом НИЖЕ, и это второй замок правила, проверяемый тем же голденом.
+    def _quote_lines(self, note):
+        """Строки клиентского блока (то, что КОД вставит на место [QUOTE]); [] — блока нет."""
+        block = suggest._quote_block_from_note(note) or ""
+        return [ln for ln in block.split("\n") if ln.strip()]
+
     def test_live_xsr155_bare_day_gives_xsr_price_not_mt03(self):
         phrases = [
             "Здравствуйте! Интересует XSR 155, можно с 20 на 2 недели?",   # дословная фраза провала
@@ -779,20 +791,30 @@ class TestClass0ModelResolveAndTerm(unittest.TestCase):
         ]
         for ph in phrases:
             note = self._note(ph)
-            low = note.lower()
-            self.assertNotIn("mt-03", low, f"чужая карточка MT-03 в ответе на: {ph}\n{note}")
-            self.assertNotIn("927", note, f"чужая цена MT-03 в ответе на: {ph}\n{note}")
-            # у фраз с распознаваемой моделью+сроком должна быть КОНКРЕТНАЯ цена XSR155 (472)
-            if "xsr" in low or "иксэс" in low:
-                if "472" in note:
-                    self.assertIn("472", note, ph)
+            lines = self._quote_lines(note)
+            if not lines:
+                # расчёта нет вовсе → чужой карточке взяться неоткуда (прежняя проверка целиком)
+                self.assertNotIn("mt-03", note.lower(), f"чужая карточка MT-03 в ответе на: {ph}\n{note}")
+                self.assertNotIn("927", note, f"чужая цена MT-03 в ответе на: {ph}\n{note}")
+                continue
+            self.assertTrue(lines[0].upper().startswith("XSR"),
+                            f"спрошенная модель не первая на: {ph}\n{note}")
+            self.assertIn("472", lines[0], ph)                  # цена XSR155 — своя
+            self.assertNotIn("927", lines[0], f"чужой тариф MT-03 в карточке XSR на: {ph}")
+            for ln in lines[1:]:                                # дополнительные — только тот же класс
+                self.assertTrue(ln.upper().startswith("MT-03"), f"чужой класс в подборе: {ln}")
+                self.assertNotIn("472", ln, "цена XSR подставлена в карточку MT-03")
+            self.assertNotIn("NMAX", note.upper(), "модель классом НИЖЕ предложена сама собой")
+            self.assertNotIn("ADV", note.upper(), "модель классом НИЖЕ предложена сама собой")
 
     def test_live_xsr155_resolved_quote_present(self):
         # ядро: дословная фраза даёт ДЕТЕРМИНИРОВАННУЮ цену XSR155 из Календаря (не вакуум-фолбэк)
         note = self._note("Здравствуйте! Интересует XSR 155, можно с 20 на 2 недели?")
         self.assertIn("472", note)
         self.assertNotIn("не удалось", note.lower())    # не свалились в «уточни модель/даты»
-        self.assertNotIn("mt-03", note.lower())
+        lines = self._quote_lines(note)
+        self.assertIn("472", lines[0])                  # своя цена в СВОЕЙ карточке (первой)
+        self.assertNotIn("927", lines[0])               # подмены чужой карточкой нет
 
     def test_ambiguous_series_note_asks_not_substitutes(self):
         # в парке XSR155 и XSR900 → на голый «XSR» просим уточнить, число и чужую модель НЕ даём
@@ -847,13 +869,19 @@ class TestStep2ModelTermQuoteDepositPercent(unittest.TestCase):
 
     # --- ГОЛДЕН: модель+срок → quote XSR155 на 14 дней + ЕЁ депозит ---------------------------
     def test_golden_xsr155_two_weeks_quote_with_deposit(self):
+        # ПОПРАВКА 20.08.2026 (правило владельца «подбор по классу»): «чужих чисел в НОТЕ нет»
+        # сузилось до «чужих чисел нет В КАРТОЧКЕ XSR». MT-03 — тот же класс (мотоциклы) и идёт
+        # ДОПОЛНИТЕЛЬНО, со своими цифрами и своим депозитом; подмена по-прежнему запрещена.
         note = self._note("[клиент]: XSR 155 с 20 июля на 2 недели")
         self.assertIn("472", note)                       # суточный тариф XSR155 из Календаря
         self.assertIn("6608", note)                      # итог за 14 дней = 472*14 (live-quote)
         self.assertIn("депозит 7000 ฿", note)            # ЕЁ депозит дописан КОДОМ (в text его нет)
-        self.assertNotIn("927", note)                    # чужой тариф MT-03 не подставлен
-        self.assertNotIn("15000", note)                  # чужой депозит MT-03 не подставлен
+        line = (suggest._quote_block_from_note(note) or "").split("\n")[0]
+        self.assertTrue(line.upper().startswith("XSR"))  # спрошенная модель — ОСНОВНОЙ вариант, первая
+        self.assertNotIn("927", line)                    # чужой тариф MT-03 не подставлен в её карточку
+        self.assertNotIn("15000", line)                  # чужой депозит MT-03 не подставлен
         self.assertNotIn("не удалось", note.lower())     # не свалились в «уточни модель/даты»
+        self.assertNotIn("NMAX", note.upper())           # классом НИЖЕ сами не предлагаем
 
     def test_golden_paraphrases_model_term_carry_deposit(self):
         # дословная фраза + парафразы «модель + срок» → в каждом ответе живой quote XSR155 + депозит
@@ -906,8 +934,16 @@ class TestStep2ModelTermQuoteDepositPercent(unittest.TestCase):
         self.assertIn("10%", note)                       # вопрос отражён, но без числа
 
     # --- ГОЛДЕН: карточка чужой модели блокируется пост-чеком чисел ----------------------------
+    # Голден оставлен ДОСЛОВНЫМ и приколот к прежнему пути (ручка отката PRICE_CLASS_OFFER_OFF):
+    # его посылка — «числа MT-03 никем не посчитаны, значит выдуманы» — с 20.08 верна ровно там,
+    # где подбор по классу выключен. Живой класс он держит: без расчёта чужие цифры режутся.
     def test_foreign_model_card_blocked_by_postcheck(self):
-        note = self._note("[клиент]: XSR 155 с 20 июля на 2 недели")   # белый список = числа XSR155
+        save = suggest._CLASS_OFFER_OFF
+        suggest._CLASS_OFFER_OFF = True
+        try:
+            note = self._note("[клиент]: XSR 155 с 20 июля на 2 недели")   # белый список = числа XSR155
+        finally:
+            suggest._CLASS_OFFER_OFF = save
         draft = ("XSR 155 — 6608 ฿ за 14 дней, депозит 7000 ฿. "
                  "А MT-03 — 12978 ฿ за 14 дней, депозит 15000 ฿.")
         out = suggest.postcheck_draft(draft, "ru", pricing_note=note)
@@ -917,6 +953,23 @@ class TestStep2ModelTermQuoteDepositPercent(unittest.TestCase):
         self.assertNotIn("12978", client)                # чужая сумма MT-03 вырезана
         self.assertNotIn("15000", client)                # чужой депозит MT-03 вырезан
         self.assertIn("уточню у команды", out.lower())
+
+    def test_class_offer_whitelists_only_computed_numbers(self):
+        # ТОТ ЖЕ пост-чек при ВКЛЮЧЁННОМ подборе по классу (поведение по умолчанию с 20.08):
+        # MT-03 того же класса реально ПОСЧИТАНА, её цифры законны и остаются; а число, которого
+        # источник не считал, режется по-прежнему — граница «посчитано/выдумано» не сдвинулась.
+        note = self._note("[клиент]: XSR 155 с 20 июля на 2 недели")
+        self.assertIn("12978", note)                     # MT-03 посчитана КОДОМ (та же дверь quote)
+        # NMAX 155 классом НИЖЕ — в подбор не идёт, значит НЕ посчитана, значит её цифры выдуманы.
+        draft = ("XSR 155 — 6608 ฿ за 14 дней, депозит 7000 ฿. "
+                 "А MT-03 — 12978 ฿ за 14 дней, депозит 15000 ฿. "
+                 "А NMAX 155 — 44444 ฿ за 14 дней, депозит 3000 ฿.")
+        out = suggest.postcheck_draft(draft, "ru", pricing_note=note)
+        client = out.split("[уточнить", 1)[0]
+        self.assertIn("6608", client)                    # своя сумма цела
+        self.assertIn("12978", client)                   # посчитанная сумма соседа по классу цела
+        self.assertNotIn("44444", client)                # НЕ посчитанное источником по-прежнему режется
+        self.assertNotIn("3000", client)                 # и выдуманный депозит вместе с ним
 
     def test_own_deposit_and_total_kept_by_postcheck(self):
         # весь черновик из чисел quote XSR155 → пост-чек не трогает (fail-safe, регресс)
