@@ -181,7 +181,11 @@ class TestWhyBlock(LiveNoteBase):
         self.assertEqual(card["facts"]["kind"], mc.KIND_QUOTE)
         line = card["facts"]["line"]
         self.assertIn("฿", line)
-        self.assertIn("2250 ฿ за 5 дней", line)          # число из Календаря, а не из воздуха
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026 (источник цены — ЗАПИСАННОЕ ПРАВИЛО, 45a38cf):
+        # NMAX 155 = база 298 x сезон 1.0 (P1 ИЮНЬ-СЕНТЯБРЬ, старт 2026-09-01) x ступень 1.03
+        # (корзина 4-6, срок 5 сут) = 307 ฿/день; итого 307 x 5 = 1535 ฿. Соседний тест
+        # test_why_names_season_and_term уже проверяет ровно этот P1 и этот срок.
+        self.assertIn("итого 1535 ฿", line)              # число посчитано правилом, а не из воздуха
         self.assertIn("• цена: " + line, card["text"])    # в карточке — ДОСЛОВНО
         self.assertIn("Календарь бронирования", card["text"])
 

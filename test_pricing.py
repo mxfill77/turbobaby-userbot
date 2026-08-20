@@ -157,8 +157,13 @@ class TestHintsAndNote(unittest.TestCase):
                                                   "deposit": 7000, "available": True, "days": 7}})
         note = suggest.build_pricing_note(dict(self._HINTS), today=self._TODAY)
         self.assertIn("Календаря", note)
-        self.assertIn("900", note)
-        self.assertIn("6300", note)
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026 (источник цены — ЗАПИСАННОЕ ПРАВИЛО, 45a38cf): числа живой
+        # котировки (900/6300) заменяет счёт по price_source.json. NMAX 155: база 298 x сезон 1.0
+        # (P1 ИЮНЬ-СЕНТЯБРЬ, старт 2026-07-10) x ступень 1.0 (корзина 7-13, срок 7 сут) = 298 ฿/день;
+        # итого 298 x 7 = 2086 ฿. Мок оставлен прежним НАРОЧНО — он доказывает, что число листа
+        # действительно вытеснено правилом, а не совпало с ним.
+        self.assertIn("298", note)
+        self.assertIn("2086", note)
 
     def test_note_error_is_fallback_no_faq_number(self):
         self._with_qfm({"status": "error", "quote": None})
@@ -581,7 +586,10 @@ class TestPriceRulesV2(unittest.TestCase):
             "available": True, "days": 7}})
         note = suggest.build_pricing_note(self._h("NMAX 10.07-17.07"))
         self.assertNotIn("низкого сезона", note)
-        self.assertIn("6300 ฿", note)
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026: NMAX 155 = 298 x 1.0 (P1, старт 2026-07-10) x 1.0 (7-13,
+        # 7 сут) = 298 ฿/день; итого 2086 ฿. Посылка теста ЦЕЛА: кепка файла для NMAX 155 = 5000 ฿,
+        # итог 2086 < 5000 — «кап активен, но сумма ниже потолка» проверяется по-прежнему.
+        self.assertIn("2086 ฿", note)
 
     # --- (2) минимальный срок ------------------------------------------------
     def test_bike_class_min_days(self):
@@ -600,14 +608,19 @@ class TestPriceRulesV2(unittest.TestCase):
             "text": "4500 ฿ за 5 дней", "total": 4500, "available": True, "days": 5}})
         note = suggest.build_pricing_note(self._h("NMAX завтра на 3 дня"))
         self.assertIn("скутеры сдаём от 5 дней", note)
-        self.assertIn("4500 ฿ за 5 дней", note)
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026: цена на МИНИМАЛЬНЫЙ срок считается правилом —
+        # NMAX 155 = 298 x 1.0 (P1, старт 2026-07-06) x 1.03 (корзина 4-6, срок 5 сут) = 307 ฿/день;
+        # итого 307 x 5 = 1535 ฿. Предмет теста прежний: минимум назван И оценён.
+        self.assertIn("за 5 дн: 307 ฿/день; итого 1535 ฿", note)
 
     def test_moto_below_min_offers_3_days(self):
         self._with_qfm(lambda m, ds, de, *a, **k: {"status": "ok", "quote": {
             "text": "3000 ฿ за 3 дня", "total": 3000, "available": True, "days": 3}})
         note = suggest.build_pricing_note(self._h("CB300 завтра на 2 дня"))
         self.assertIn("мотоциклы сдаём от 3 дней", note)
-        self.assertIn("3000 ฿ за 3 дня", note)
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026: CB 300 = 637 x 1.0 (P1, старт 2026-07-06) x 0.97
+        # (корзина 1-3, срок 3 сут) = 618 ฿/день; итого 618 x 3 = 1854 ฿.
+        self.assertIn("за 3 дн: 618 ฿/день; итого 1854 ฿", note)
 
     def test_xsr155_below_min_offers_5_days(self):
         self._with_qfm(lambda m, ds, de, *a, **k: {"status": "ok", "quote": {
@@ -621,7 +634,9 @@ class TestPriceRulesV2(unittest.TestCase):
             "text": "4500 ฿", "total": 4500, "available": True, "days": 5}})
         note = suggest.build_pricing_note(self._h("NMAX с 5 по 10 июля"))
         self.assertNotIn("сдаём от", note)
-        self.assertIn("4500 ฿", note)
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026: NMAX 155 = 298 x 1.0 (P1, старт 2026-07-05) x 1.03
+        # (корзина 4-6, срок 5 сут) = 307 ฿/день; итого 307 x 5 = 1535 ฿.
+        self.assertIn("1535 ฿", note)
 
     # --- (3) несколько моделей ----------------------------------------------
     def test_detect_multiple_models(self):
@@ -680,8 +695,10 @@ class TestPriceRulesV2(unittest.TestCase):
         self._with_qfm(lambda *a, **k: {"status": "ok", "quote": {
             "day_price": 900, "total": 6300, "deposit": 7000, "available": True, "days": 7}})
         note = suggest.build_pricing_note(self._h("NMAX 10.07-17.07"))
-        self.assertIn("900", note)
-        self.assertIn("6300", note)
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026: сборка из чисел цела, но числа теперь ПРАВИЛА —
+        # NMAX 155 = 298 x 1.0 (P1, старт 2026-07-10) x 1.0 (7-13, 7 сут) = 298 ฿/день; итого 2086 ฿.
+        self.assertIn("298", note)
+        self.assertIn("2086", note)
 
 
 class TestClass0ModelResolveAndTerm(unittest.TestCase):
@@ -795,26 +812,33 @@ class TestClass0ModelResolveAndTerm(unittest.TestCase):
             if not lines:
                 # расчёта нет вовсе → чужой карточке взяться неоткуда (прежняя проверка целиком)
                 self.assertNotIn("mt-03", note.lower(), f"чужая карточка MT-03 в ответе на: {ph}\n{note}")
-                self.assertNotIn("927", note, f"чужая цена MT-03 в ответе на: {ph}\n{note}")
+                self.assertNotIn("593", note, f"чужая цена MT-03 в ответе на: {ph}\n{note}")
                 continue
             self.assertTrue(lines[0].upper().startswith("XSR"),
                             f"спрошенная модель не первая на: {ph}\n{note}")
-            self.assertIn("472", lines[0], ph)                  # цена XSR155 — своя
-            self.assertNotIn("927", lines[0], f"чужой тариф MT-03 в карточке XSR на: {ph}")
+            # ГОЛДЕНЫ ПЕРЕСЧИТАНЫ 21.08.2026 по ЗАПИСАННОМУ ПРАВИЛУ (источник цены с 45a38cf):
+            #   XSR 155   = 444 x 1.0 (P1, старт 2026-07-20) x 0.82 (корзина 14-29, 14 сут) = 364 ฿/день;
+            #   MT-03 300 = 723 x 1.0 x 0.82 = 593 ฿/день.
+            # Мок Bridge (472/927) НЕ трогали: он и есть «цена листа», которую правило вытесняет.
+            # Число соседа обновлено ВМЕСТЕ со своим — иначе проверка подмены стала бы холостой
+            # (927 не может появиться нигде, и тест перестал бы ловить свой класс).
+            self.assertIn("364", lines[0], ph)                  # цена XSR155 — своя
+            self.assertNotIn("593", lines[0], f"чужой тариф MT-03 в карточке XSR на: {ph}")
             for ln in lines[1:]:                                # дополнительные — только тот же класс
                 self.assertTrue(ln.upper().startswith("MT-03"), f"чужой класс в подборе: {ln}")
-                self.assertNotIn("472", ln, "цена XSR подставлена в карточку MT-03")
+                self.assertNotIn("364", ln, "цена XSR подставлена в карточку MT-03")
             self.assertNotIn("NMAX", note.upper(), "модель классом НИЖЕ предложена сама собой")
             self.assertNotIn("ADV", note.upper(), "модель классом НИЖЕ предложена сама собой")
 
     def test_live_xsr155_resolved_quote_present(self):
         # ядро: дословная фраза даёт ДЕТЕРМИНИРОВАННУЮ цену XSR155 из Календаря (не вакуум-фолбэк)
         note = self._note("Здравствуйте! Интересует XSR 155, можно с 20 на 2 недели?")
-        self.assertIn("472", note)
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026: 444 x 1.0 (P1) x 0.82 (14-29) = 364 ฿/день (см. соседний тест).
+        self.assertIn("364", note)
         self.assertNotIn("не удалось", note.lower())    # не свалились в «уточни модель/даты»
         lines = self._quote_lines(note)
-        self.assertIn("472", lines[0])                  # своя цена в СВОЕЙ карточке (первой)
-        self.assertNotIn("927", lines[0])               # подмены чужой карточкой нет
+        self.assertIn("364", lines[0])                  # своя цена в СВОЕЙ карточке (первой)
+        self.assertNotIn("593", lines[0])               # подмены чужой карточкой нет
 
     def test_ambiguous_series_note_asks_not_substitutes(self):
         # в парке XSR155 и XSR900 → на голый «XSR» просим уточнить, число и чужую модель НЕ даём
@@ -824,8 +848,9 @@ class TestClass0ModelResolveAndTerm(unittest.TestCase):
         self.assertIn("уточни", low)
         self.assertIn("xsr 155", low)
         self.assertIn("xsr 900", low)
-        self.assertNotIn("472", note)                   # никакого числа при неоднозначности
-        self.assertNotIn("927", note)
+        # числа правила (а не мока листа) — иначе проверка «числа нет» стала бы холостой
+        self.assertNotIn("364", note)                   # никакого числа при неоднозначности
+        self.assertNotIn("593", note)
 
 
 class TestStep2ModelTermQuoteDepositPercent(unittest.TestCase):
@@ -873,12 +898,15 @@ class TestStep2ModelTermQuoteDepositPercent(unittest.TestCase):
         # сузилось до «чужих чисел нет В КАРТОЧКЕ XSR». MT-03 — тот же класс (мотоциклы) и идёт
         # ДОПОЛНИТЕЛЬНО, со своими цифрами и своим депозитом; подмена по-прежнему запрещена.
         note = self._note("[клиент]: XSR 155 с 20 июля на 2 недели")
-        self.assertIn("472", note)                       # суточный тариф XSR155 из Календаря
-        self.assertIn("6608", note)                      # итог за 14 дней = 472*14 (live-quote)
+        # ГОЛДЕНЫ ПЕРЕСЧИТАНЫ 21.08.2026 по правилу: XSR 155 = 444 x 1.0 (P1, старт 2026-07-20)
+        # x 0.82 (корзина 14-29, 14 сут) = 364 ฿/день, итого 364 x 14 = 5096 ฿. Депозит правилом
+        # НЕ подменяется — он приходит живой котировкой, поэтому 7000 остаётся как было.
+        self.assertIn("364", note)                       # суточный тариф XSR155
+        self.assertIn("5096", note)                      # итог за 14 дней = 364*14
         self.assertIn("депозит 7000 ฿", note)            # ЕЁ депозит дописан КОДОМ (в text его нет)
         line = (suggest._quote_block_from_note(note) or "").split("\n")[0]
         self.assertTrue(line.upper().startswith("XSR"))  # спрошенная модель — ОСНОВНОЙ вариант, первая
-        self.assertNotIn("927", line)                    # чужой тариф MT-03 не подставлен в её карточку
+        self.assertNotIn("593", line)                    # чужой тариф MT-03 не подставлен в её карточку
         self.assertNotIn("15000", line)                  # чужой депозит MT-03 не подставлен
         self.assertNotIn("не удалось", note.lower())     # не свалились в «уточни модель/даты»
         self.assertNotIn("NMAX", note.upper())           # классом НИЖЕ сами не предлагаем
@@ -891,8 +919,9 @@ class TestStep2ModelTermQuoteDepositPercent(unittest.TestCase):
                    "XSR 155, аренда с 20 июля на 2 недели",
                    "беру XSR 155 с 20 на 2 недели"):
             note = self._note("[клиент]: " + ph)
-            self.assertIn("472", note, ph)
-            self.assertIn("6608", note, ph)
+            # ГОЛДЕНЫ ПЕРЕСЧИТАНЫ 21.08.2026: 444 x 1.0 (P1) x 0.82 (14-29) = 364 ฿/день, итого 5096 ฿.
+            self.assertIn("364", note, ph)
+            self.assertIn("5096", note, ph)
             self.assertIn("депозит 7000 ฿", note, ph)
 
     # --- ГОЛДЕН: «10% это какая сумма» → 10% от суммы ЭТОГО расчёта -----------------------------
@@ -902,8 +931,10 @@ class TestStep2ModelTermQuoteDepositPercent(unittest.TestCase):
               "[менеджер]: секунду\n"
               "[клиент]: 10% это какая сумма")
         note = self._note(tr)
-        self.assertIn("6608", note)                      # база расчёта — итог XSR155 на 14 дней
-        self.assertIn("661 ฿", note)                     # 10% от 6608 = 660.8 → 661 (КОД посчитал)
+        # ГОЛДЕНЫ ПЕРЕСЧИТАНЫ 21.08.2026: база расчёта = итог правила 5096 ฿ (364 x 14),
+        # значит и процент считается от него: 5096 x 0.10 = 509.6 → 510 ฿.
+        self.assertIn("5096", note)                      # база расчёта — итог XSR155 на 14 дней
+        self.assertIn("510 ฿", note)                     # 10% от 5096 = 509.6 → 510 (КОД посчитал)
         self.assertIn("10%", note)
 
     def test_golden_percent_paraphrases(self):
@@ -914,7 +945,7 @@ class TestStep2ModelTermQuoteDepositPercent(unittest.TestCase):
                    "what's 10% of that?"):
             tr = f"[клиент]: XSR 155 с 20 июля на 2 недели\n[клиент]: {ph}"
             note = self._note(tr)
-            self.assertIn("661 ฿", note, ph)
+            self.assertIn("510 ฿", note, ph)      # 10% от итога правила 5096 ฿ (пересчёт 21.08.2026)
 
     def test_percent_detector_positive_negative(self):
         for pos in ("10% это какая сумма", "сколько будет 10%", "10 процентов это сколько",
@@ -930,7 +961,7 @@ class TestStep2ModelTermQuoteDepositPercent(unittest.TestCase):
         h = suggest.extract_booking_hints(
             "[клиент]: XSR 155 с 20 июля на 2 недели\n[клиент]: 10% это какая сумма", today=self.TODAY)
         note = suggest.build_pricing_note(h, lang="ru", getter=empty, today=self.TODAY)
-        self.assertNotIn("661", note)
+        self.assertNotIn("510", note)                    # число правила (пересчёт 21.08.2026)
         self.assertIn("10%", note)                       # вопрос отражён, но без числа
 
     # --- ГОЛДЕН: карточка чужой модели блокируется пост-чеком чисел ----------------------------
@@ -944,13 +975,16 @@ class TestStep2ModelTermQuoteDepositPercent(unittest.TestCase):
             note = self._note("[клиент]: XSR 155 с 20 июля на 2 недели")   # белый список = числа XSR155
         finally:
             suggest._CLASS_OFFER_OFF = save
-        draft = ("XSR 155 — 6608 ฿ за 14 дней, депозит 7000 ฿. "
-                 "А MT-03 — 12978 ฿ за 14 дней, депозит 15000 ฿.")
+        # ЧИСЛА ПЕРЕСЧИТАНЫ 21.08.2026 по правилу: своя сумма XSR155 = 364 x 14 = 5096 ฿;
+        # «чужая» сумма MT-03 на тех же датах = 593 x 14 = 8302 ฿ (её белый список НЕ содержит,
+        # потому что при выключенном подборе по классу MT-03 никто не считал).
+        draft = ("XSR 155 — 5096 ฿ за 14 дней, депозит 7000 ฿. "
+                 "А MT-03 — 8302 ฿ за 14 дней, депозит 15000 ฿.")
         out = suggest.postcheck_draft(draft, "ru", pricing_note=note)
         client = out.split("[уточнить", 1)[0]
-        self.assertIn("6608", client)                    # своя сумма (из quote) цела
+        self.assertIn("5096", client)                    # своя сумма (из quote) цела
         self.assertIn("7000", client)                    # свой депозит цел
-        self.assertNotIn("12978", client)                # чужая сумма MT-03 вырезана
+        self.assertNotIn("8302", client)                 # чужая сумма MT-03 вырезана
         self.assertNotIn("15000", client)                # чужой депозит MT-03 вырезан
         self.assertIn("уточню у команды", out.lower())
 
@@ -959,22 +993,25 @@ class TestStep2ModelTermQuoteDepositPercent(unittest.TestCase):
         # MT-03 того же класса реально ПОСЧИТАНА, её цифры законны и остаются; а число, которого
         # источник не считал, режется по-прежнему — граница «посчитано/выдумано» не сдвинулась.
         note = self._note("[клиент]: XSR 155 с 20 июля на 2 недели")
-        self.assertIn("12978", note)                     # MT-03 посчитана КОДОМ (та же дверь quote)
+        # ЧИСЛА ПЕРЕСЧИТАНЫ 21.08.2026 по правилу: XSR 155 = 364 x 14 = 5096 ฿,
+        # MT-03 300 = 723 x 1.0 (P1) x 0.82 (14-29) = 593 ฿/день → 593 x 14 = 8302 ฿.
+        self.assertIn("8302", note)                      # MT-03 посчитана КОДОМ (та же дверь quote)
         # NMAX 155 классом НИЖЕ — в подбор не идёт, значит НЕ посчитана, значит её цифры выдуманы.
-        draft = ("XSR 155 — 6608 ฿ за 14 дней, депозит 7000 ฿. "
-                 "А MT-03 — 12978 ฿ за 14 дней, депозит 15000 ฿. "
+        draft = ("XSR 155 — 5096 ฿ за 14 дней, депозит 7000 ฿. "
+                 "А MT-03 — 8302 ฿ за 14 дней, депозит 15000 ฿. "
                  "А NMAX 155 — 44444 ฿ за 14 дней, депозит 3000 ฿.")
         out = suggest.postcheck_draft(draft, "ru", pricing_note=note)
         client = out.split("[уточнить", 1)[0]
-        self.assertIn("6608", client)                    # своя сумма цела
-        self.assertIn("12978", client)                   # посчитанная сумма соседа по классу цела
+        self.assertIn("5096", client)                    # своя сумма цела
+        self.assertIn("8302", client)                    # посчитанная сумма соседа по классу цела
         self.assertNotIn("44444", client)                # НЕ посчитанное источником по-прежнему режется
         self.assertNotIn("3000", client)                 # и выдуманный депозит вместе с ним
 
     def test_own_deposit_and_total_kept_by_postcheck(self):
         # весь черновик из чисел quote XSR155 → пост-чек не трогает (fail-safe, регресс)
         note = self._note("[клиент]: XSR 155 с 20 июля на 2 недели")
-        draft = "XSR 155: 6608 ฿ за 14 дней, депозит 7000 ฿."
+        # 5096 ฿ = итог правила (364 x 14), пересчёт 21.08.2026
+        draft = "XSR 155: 5096 ฿ за 14 дней, депозит 7000 ฿."
         self.assertEqual(suggest.postcheck_draft(draft, "ru", pricing_note=note), draft)
 
 

@@ -3869,8 +3869,12 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
             self.assertIn("New Gen", note, phrase)                  # актуальное поколение в ответе
             self.assertNotIn("- XMAX 300:", note, phrase)           # строки старого поколения НЕТ
             self.assertNotIn("4700", note, phrase)                  # цифра старого поколения не течёт
-            # квотирован ТОЛЬКО новый юнит (New Gen) — цена актуального поколения (5600 за неделю / 939 сут)
-            self.assertTrue("5600" in note or "939" in note, phrase)
+            # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026 (источник цены — ЗАПИСАННОЕ ПРАВИЛО, 45a38cf): цену
+            # даёт price_source.json — XMAX 300 = база 623 x сезон 1.0 (P1, старт 2026-07-15)
+            # x ступень срока: 1.0 (корзина 7-13, «на неделю» = 7 сут) → 623 ฿/день, либо
+            # 1.03 (корзина 4-6, «на 5 дней») → 642 ฿/день. Две ветки — потому что фразы набора
+            # несут РАЗНЫЙ срок; ИМЕННО поэтому проверка осталась дизъюнкцией, как и была.
+            self.assertTrue("623" in note or "642" in note, phrase)
 
     def test_pointwise_xmax_explicit_old_gen_shows_both(self):
         # ГОЛДЕН (кейс @cryptopeppa): ЯВНЫЙ запрос «а старый xmax есть?» (репликой ПОЗЖЕ дат первичной
@@ -3925,18 +3929,23 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
             self.assertIn("New Gen", note, phrase)               # только актуальное поколение
             self.assertNotIn("- XMAX 300:", note, phrase)        # строки старого поколения НЕТ
             self.assertNotIn("790", note, phrase)                # цена старого поколения не течёт
-            self.assertIn("939", note, phrase)                   # цена нового поколения из Bridge
+            # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026: XMAX 300 = 623 x 1.0 (P1, старт 2026-07-16) x 1.0
+            # (корзина 7-13, срок 8 сут) = 623 ฿/день. ОГОВОРКА ЧЕСТНО: в price_source.json у
+            # XMAX 300 ОДНА строка базы на оба поколения, поэтому число «нового» и «старого»
+            # теперь совпадает, и строка assertNotIn("790") выше стала холостой — поколения
+            # различает только МЕТКА (New Gen), а не цена. Правилом этого не исправить.
+            self.assertIn("623", note, phrase)                   # цена нового поколения (счёт правила)
             self.assertIn("7000", note, phrase)                  # депозит нового из Bridge
             # ВЫДУМАННОГО общего итога за 2 шт. в блоке НЕТ (код не суммирует и не умножает):
-            self.assertNotIn("1878", note, phrase)               # 2×939 не выдумано
+            self.assertNotIn("1246", note, phrase)               # 2×623 не выдумано
             self.assertNotIn("14000", note, phrase)              # 2×7000 (депозит) не выдумано
             # #365 родитель4 шаг3/6: живая цена New Gen едет в служебный quote-блок → strategy-путь
             # донесёт её КОДОМ; пометка «за каждый» и в блоке, итог за 2 шт. по-прежнему не выдуман.
             block = suggest._quote_block_from_note(note)
             self.assertIsNotNone(block, phrase)
-            self.assertIn("939", block, phrase)                  # новое поколение — своя цена
+            self.assertIn("623", block, phrase)                  # новое поколение — цена правила
             self.assertIn("ЗА КАЖДЫЙ", block, phrase)            # цена/депозит за каждый юнит
-            self.assertNotIn("1878", block, phrase)              # итог за 2 шт. не выдуман и в блоке
+            self.assertNotIn("1246", block, phrase)              # итог за 2 шт. не выдуман и в блоке
 
     def test_pointwise_quote_tail_scrubs_gen_year(self):
         # ГОЛДЕН (родитель 22, шаг 3/7): J-текст Bridge несёт СЫРОЕ имя юнита с годом поколения
@@ -3955,7 +3964,8 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
             block = suggest._quote_block_from_note(note)
             self.assertIsNotNone(block, phrase)                   # quote-блок собран
             self.assertIn("New Gen", block, phrase)               # поколение несёт метка (New Gen)
-            self.assertIn("939", block, phrase)                   # живая цена Bridge цела
+            # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026: XMAX 300 = 623 x 1.0 (P1) x 1.0 (7-13, 8 сут) = 623 ฿/день.
+            self.assertIn("623", block, phrase)                   # цена правила цела
             for yr in ("2020", "2021", "2022", "2023", "2024"):   # ГОД поколения в хвост НЕ утёк
                 self.assertNotIn(yr, block, f"{phrase}: год {yr} утёк в quote-хвост:\n{block}")
 
@@ -4648,7 +4658,11 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         note = self._note()
         block = suggest._quote_block_from_note(note)
         self.assertIsNotNone(block)                          # блок собран
-        self.assertIn("1685", block)                         # итог за срок из Bridge
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026 (источник цены — ЗАПИСАННОЕ ПРАВИЛО, 45a38cf):
+        # NMAX 155 = база 298 x сезон 1.0 (P1 ИЮНЬ-СЕНТЯБРЬ, старт 2026-07-15) x ступень 1.03
+        # (корзина 4-6, срок 5 сут) = 307 ฿/день; итого 307 x 5 = 1535 ฿. Депозит правило НЕ
+        # трогает — 3000 приходит живой котировкой и остаётся прежним.
+        self.assertIn("1535", block)                         # итог за срок (счёт по правилу)
         self.assertIn("3000", block)                         # депозит из Bridge
         self.assertIn("ЦЕНА из Календаря", note)             # инструкция LLM (прежний путь) цела
 
@@ -4660,7 +4674,7 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         self.assertNotIn("<<<END_QUOTE>>>", sysp)
         self.assertIn("ЦЕНА из Календаря", sysp)             # инструкция ЦЕНА на месте
         self.assertIn("[QUOTE]", sysp)                       # точка вставки канона для кода
-        self.assertNotIn("1685", sysp)                       # итог в промпт НЕ утёк (нет парафраза)
+        self.assertNotIn("1535", sysp)                       # итог в промпт НЕ утёк (нет парафраза)
 
     def test_deposit_sum_default_no_passport(self):
         # РЕЖИМ «сумма из Bridge» (паспорт НЕ выбран): и инструкция LLM, и quote-хвост несут число
@@ -4679,7 +4693,7 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         self.assertIsNotNone(block)
         self.assertIn("депозит: паспорт", block)             # паспорт без суммы в хвосте
         self.assertNotIn("3000", block)                      # сумма депозита Bridge подавлена
-        self.assertIn("1685", block)                         # цена/итог за срок цел
+        self.assertIn("1535", block)                         # цена/итог за срок цел (счёт правила)
         # тело ответа (инструкция LLM) тоже несёт паспорт, а НЕ число — противоречия нет
         self.assertNotIn("3000", note)
         self.assertIn("паспорт", note)
@@ -4690,11 +4704,12 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         note_units = self._note(units_count=2)
         block = suggest._quote_block_from_note(note_units)
         self.assertIsNotNone(block)                          # блок собран (страт-путь несёт цену)
-        self.assertIn("1685", block)                         # цена за КАЖДЫЙ юнит из Bridge
+        self.assertIn("1535", block)                         # цена за КАЖДЫЙ юнит (счёт правила)
         self.assertIn("3000", block)                         # депозит за КАЖДЫЙ юнит из Bridge
         self.assertIn("ЗА КАЖДЫЙ", block)                    # пометка «за каждый» в самом блоке
         self.assertIn("ЗА КАЖДЫЙ", note_units)               # и в инструкции LLM
-        self.assertNotIn("3370", block)                      # 2×1685 итог НЕ выдуман
+        # удвоение пересчитано ВМЕСТЕ с итогом: 2×1535 = 3070 (иначе проверка стала бы холостой)
+        self.assertNotIn("3070", block)                      # 2×1535 итог НЕ выдуман
         self.assertNotIn("6000", block)                      # 2×3000 депозит НЕ выдуман
 
     def test_percent_skips_block(self):
@@ -4738,7 +4753,7 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
             return "Готов помочь с NMAX — уточню детали и вернусь."   # LLM цену потерял
         out = suggest.regenerate_draft("[клиент]: nmax на 5 дней с 15 июля, сколько?", "ru", "FAQ",
                                        False, note, "дожимай на бронь", call_llm=drop_price)
-        self.assertIn("1685", out)                           # итог из Bridge дошёл КОДОМ
+        self.assertIn("1535", out)                           # итог (счёт правила) дошёл КОДОМ
         self.assertIn("3000", out)                           # депозит из Bridge дошёл КОДОМ
         self.assertIn("дожимай на бронь", seen["system"])    # директива стратегии в промпте
         self.assertNotIn("<<<QUOTE>>>", seen["system"])      # сырой блок в промпт не утёк
@@ -4751,10 +4766,10 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
             return "Отличный выбор — уточню детали и вернусь."     # LLM цену потерял
         out = suggest.regenerate_draft("[клиент]: пару nmax на 5 дней с 15 июля, сколько?", "ru",
                                        "FAQ", False, note, "дожимай", call_llm=drop_price)
-        self.assertIn("1685", out)                           # цена за каждый юнит дошла КОДОМ
+        self.assertIn("1535", out)                           # цена за каждый юнит дошла КОДОМ
         self.assertIn("3000", out)                           # депозит за каждый юнит дошёл КОДОМ
         self.assertIn("ЗА КАЖДЫЙ", out)                      # пометка «за каждый» у клиента
-        self.assertNotIn("3370", out)                        # 2×1685 итог не выдуман
+        self.assertNotIn("3070", out)                        # 2×1535 итог не выдуман
 
     def test_strategy_regen_marker_inserts_canon_once(self):
         # ЖИВОЙ путь варианта Б #274: LLM цифр НЕ видит и ставит метку [QUOTE] → строку цены
@@ -4766,7 +4781,7 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         out = suggest.regenerate_draft("[клиент]: nmax на 5 дней с 15 июля, сколько?", "ru", "FAQ",
                                        False, note, "дожимай", call_llm=marker)
         client = suggest.client_facing_text(out)
-        self.assertEqual(client.count("1685"), 1)            # цифра у клиента ровно один раз (КОДОМ)
+        self.assertEqual(client.count("1535"), 1)            # цифра у клиента ровно один раз (КОДОМ)
         self.assertEqual(client.count("3000"), 1)
         self.assertNotIn("[QUOTE]", client)                  # метка заменена строкой, не утекла
 
@@ -4861,7 +4876,9 @@ class TestDeliveryCodeBlock(unittest.TestCase):
         self.assertIsNotNone(dblock)                         # блок доставки собран
         self.assertIn("815", dblock)                         # цена зоны из резолвера
         self.assertIsNotNone(suggest._quote_block_from_note(note))   # quote-блок аренды НЕ сломан
-        self.assertIn("1685", note)                          # цена аренды на месте
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026: NMAX 155 = 298 x 1.0 (P1, старт 2026-07-15) x 1.03
+        # (корзина 4-6, 5 сут) = 307 ฿/день; итого 1535 ฿. Доставка (815) правилом не считается.
+        self.assertIn("1535", note)                          # цена аренды на месте
 
     def test_build_note_uncertain_no_delivery_block(self):
         self._stub_delivery(self.UNCERTAIN)
@@ -4920,9 +4937,9 @@ class TestDeliveryCodeBlock(unittest.TestCase):
             "[клиент]: nmax на 5 дней с 15 июля, вот локация https://www.google.com/maps?q=7.88,98.33",
             "ru", "FAQ", False, note, "дожимай", call_llm=drop)
         self.assertIn("815", out)                            # доставка дошла КОДОМ
-        self.assertEqual(suggest.client_facing_text(out).count("1685"), 1)   # аренда ровно один раз
+        self.assertEqual(suggest.client_facing_text(out).count("1535"), 1)   # аренда ровно один раз
         self.assertNotIn("815", seen["system"])              # LLM цену доставки не видел
-        self.assertNotIn("1685", seen["system"])             # и цену аренды тоже (вариант Б)
+        self.assertNotIn("1535", seen["system"])             # и цену аренды тоже (вариант Б)
 
     # ---------------------- extract_booking_hints (гео) ----------------------
 
@@ -6593,7 +6610,10 @@ class TestPastStartDateGate(unittest.TestCase):
     def test_golden_start_today_quotes_and_asks_pickup_time(self):
         hints, note = self._note("[клиент]: Хочу nmax с 22 по 27 июля, сколько будет?")
         self.assertEqual(hints["date_status"], "today")
-        self.assertIn("1685", note)                                # штатная котировка на месте
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026 (источник цены — ЗАПИСАННОЕ ПРАВИЛО, 45a38cf):
+        # NMAX 155 = 298 x 1.0 (P1 ИЮНЬ-СЕНТЯБРЬ, старт 2026-07-22) x 1.03 (корзина 4-6, 5 сут)
+        # = 307 ฿/день; итого 307 x 5 = 1535 ฿. Мок Bridge (337/1685) не трогали.
+        self.assertIn("1535", note)                                # штатная котировка на месте
         self.assertIn("ЦЕНА из Календаря", note)
         self.assertIn("ВРЕМЯ ПОДАЧИ", note)                        # + уточнение времени подачи
         self.assertIn("СЕГОДНЯ", note)
@@ -6602,13 +6622,13 @@ class TestPastStartDateGate(unittest.TestCase):
     def test_golden_start_tomorrow_quotes_and_asks_pickup_time(self):
         hints, note = self._note("[клиент]: Хочу nmax с 23 по 28 июля, сколько будет?")
         self.assertEqual(hints["date_status"], "tomorrow")
-        self.assertIn("1685", note)
+        self.assertIn("1535", note)          # 298 x 1.0 (P1, старт 2026-07-23) x 1.03 (4-6) x 5 сут
         self.assertIn("ВРЕМЯ ПОДАЧИ", note)
         self.assertIn("ЗАВТРА", note)
 
     def test_golden_pickup_note_en(self):
         _h, note = self._note("[клиент]: nmax 23.07-28.07, how much?", lang="en")
-        self.assertIn("1685", note)
+        self.assertIn("1535", note)          # тот же расчёт правила, что и в RU-голдене выше
         self.assertIn("PICK-UP TIME", note)
         self.assertIn("tomorrow", note)
 
@@ -6616,8 +6636,10 @@ class TestPastStartDateGate(unittest.TestCase):
     def test_golden_future_dates_unchanged(self):
         hints, note = self._note("[клиент]: Хочу nmax с 28 июля по 5 августа, сколько будет?")
         self.assertEqual(hints["date_status"], "future")
-        self.assertIn("1685", note)
-        self.assertIn("337", note)
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026: срок ДРУГОЙ — 28.07→05.08 это 8 сут, значит корзина 7-13
+        # (ступень 1.0), а не 4-6: 298 x 1.0 (P1) x 1.0 = 298 ฿/день; итого 298 x 8 = 2384 ฿.
+        self.assertIn("2384", note)
+        self.assertIn("298", note)
         self.assertNotIn("УЖЕ ПРОШЁЛ", note)
         self.assertNotIn("ВРЕМЯ ПОДАЧИ", note)                     # подача не при чём — старт не скоро
         self.assertIsNotNone(suggest._quote_block_from_note(note))  # quote-блок цел (транспорт #92)
@@ -6640,7 +6662,11 @@ class TestPastStartDateGate(unittest.TestCase):
         self.assertEqual((hints["iso_start"], hints["iso_end"]), ("2026-01-05", "2026-01-10"))
         self.assertEqual(hints["date_status"], "future")
         self.assertEqual(hints["start_seen"], "2026-01-05")
-        self.assertIn("1685", note)                                # цена названа
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026: старт 2026-01-05 попадает в P5 ПИК (15.12-05.02, период
+        # через новый год) → сезон скутера 1.467, а не 1.0. 298 x 1.467 x 1.03 (корзина 4-6, 5 сут)
+        # = 450.28 → 450 ฿/день; итого 450 x 5 = 2250 ฿. Именно этой оси у листа не было вовсе.
+        self.assertIn("2250", note)                                # цена названа
+        self.assertIn("450", note)                                 # и она ПИКОВАЯ, а не низкого сезона
         self.assertNotIn("УЖЕ ПРОШЁЛ", note)
 
     def test_golden_year_roll_dec_to_jan_range_is_future(self):
@@ -6649,7 +6675,9 @@ class TestPastStartDateGate(unittest.TestCase):
         hints, note = self._note("[клиент]: nmax с 28 декабря по 3 января", today=dec)
         self.assertEqual((hints["iso_start"], hints["iso_end"]), ("2025-12-28", "2026-01-03"))
         self.assertEqual(hints["date_status"], "future")
-        self.assertIn("1685", note)
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026: старт 2025-12-28 — тоже P5 ПИК; 6 сут → корзина 4-6.
+        # 298 x 1.467 x 1.03 = 450 ฿/день; итого 450 x 6 = 2700 ฿.
+        self.assertIn("2700", note)
 
     def test_nearest_occurrence_rule_both_directions(self):
         # Правило «ближайшее вхождение» посимвольно: −2 дня → прошлое, −351 день → следующий год.
@@ -6679,7 +6707,7 @@ class TestPastStartDateGate(unittest.TestCase):
         utc_now = datetime.datetime(2026, 7, 21, 18, 30, tzinfo=datetime.timezone.utc)
         text = "[клиент]: nmax с 21 по 26 июля, сколько?"
         _h_utc, note_utc = self._note(text, today=utc_now.date())                  # КАК БЫЛО БЫ по UTC
-        self.assertIn("1685", note_utc)                                            # по UTC — котировка
+        self.assertIn("1535", note_utc)     # по UTC — котировка (298 x 1.0 x 1.03 x 5 сут, пересчёт)
         hints, note = self._note(text, today=suggest.today_phuket(utc_now))        # как ДОЛЖНО быть
         self.assertEqual(hints["date_status"], "past")
         self.assertIn("УЖЕ ПРОШЁЛ", note)
