@@ -3211,7 +3211,7 @@ def _safe_quote_for_model(model, ds, de, getter=None, name_filter=None):
 
     ЕДИНСТВЕННАЯ ТОЧКА ТОЧЕЧНОЙ КОТИРОВКИ — через неё идут обе ветки `_resolve_model_price`
     (штатная и «минимальный срок»), поэтому сезонная поправка врезается ровно здесь и ровно один
-    раз. Прайс-сетка по всему парку (`price_sheet`) сюда НЕ ходит — она зовёт `pricing.quote`
+    раз. Прайс-сетка парка (`price_sheet`) сюда НЕ ходит — она зовёт `pricing.quote`
     напрямую и остаётся прежней: у неё нет дат клиента (якорь — завтра), а сезон файл приписывает
     по дате НАЧАЛА АРЕНДЫ.
 
@@ -3431,6 +3431,19 @@ def _percent_line(pct, q) -> str:
 # «пришлю позже». Источник — ТОЛЬКО живой Bridge (та же точка правды, что quote_price): по каждой
 # модели allowlist три quote() на 1/7/30 дней от даты-якоря. Цифры рендерит КОД детерминированно
 # (инвариант как у кап-подстановки) — LLM их не сочиняет и не переформатирует.
+#
+# ЗАБОР ЧЕСТЕРТОНА (почему сетка изначально шла по ВСЕМУ парку — и что это держало). Сетка отвечает
+# на КАТАЛОГ-вопрос («какие модели есть и почём»), а не на бронь: дат клиента у неё в 37 % случаев
+# нет вовсе (172 черновика из 470, замер 17.08) — тогда якорь = ЗАВТРА, а «сроки» 1/7/30 суток
+# синтетические. Прайс-лист в этой рамке — витрина тарифов, и занятость ему была не нужна: сказать
+# «свободен» бот всё равно не имеет права (AVAILABILITY_INVARIANT_RULE), значит цифра читалась как
+# тариф, а не как предложение конкретного юнита. Что на этом стояло, проверено поимённо: цену
+# модели, которой сейчас нет, показывал ИМЕННО этот путь — и точечная котировка тут ни при чём, у
+# неё своя дверь (_resolve_model_price → quote_for_model, ветка none_available). Опираются на
+# полноту сетки ещё трое, и все трое переживают отсев: filter_sheet_rows / filter_rows_by_requested
+# при пустом пересечении падают на ПОЛНУЮ сетку (владельческий анти-луп), а model_claim_mismatch
+# бракует черновик, где заявлена одна модель, а карточки чужие, — теперь он может сработать на
+# ЗАНЯТОЙ модели, названной клиентом, и это верное поведение: цены занятого мы не называем.
 _SHEET_TERMS = ((1, "day"), (7, "week"), (30, "month"))     # дни аренды от даты-якоря → ключ ячейки
 _SHEET_TTL = int(os.getenv("PRICE_SHEET_TTL_SEC", "180") or "180")   # кэш прайса, минуты (не сутки)
 # Параллельность живых quote при построении сетки (класс-фикс регресса 20:59 после 551987e:
@@ -3441,7 +3454,7 @@ _SHEET_WORKERS = int(os.getenv("PRICE_SHEET_WORKERS", "8") or "8")
 # Дедлайн построения целиком: юнит, не успевший к дедлайну (висящий HTTP и т.п.), пропускается
 # С ЛОГОМ — сетка выходит из живых остальных, один битый юнит НЕ валит прайс целиком.
 _SHEET_DEADLINE = int(os.getenv("PRICE_SHEET_DEADLINE_SEC", "120") or "120")
-_sheet_cache = {"key": None, "ts": 0.0, "rows": None}
+_sheet_cache = {"key": None, "ts": 0.0, "rows": None, "skipped": None}
 
 
 def _sheet_variants(model, bikes):
@@ -3515,22 +3528,79 @@ def _sheet_min_deposit(term_quotes):
     return min(deps) if deps else None
 
 
-def price_sheet(ds, getter=None, _now=None, _fleet=None):
-    """Прайс по всему СДАВАЕМОМУ парку на дату-якорь ds (iso). По каждой модели allowlist (кроме
-    несдаваемых) — три quote() (1/7/30 дней) ЖИВЫМ Bridge. → list[{model,class,bike,cells}] или []
-    (нет источника). Кэш _SHEET_TTL сек по ds (только для боевого пути; при инъекции getter — без кэша).
+# --- ЗАНЯТОСТЬ В СЕТКЕ (20.08.2026) --------------------------------------------------------------
+# ДО этой правки сетка квотировала ВЕСЬ парк и называла цену забронированного байка не поморщившись:
+# разведка 17.08 (docs/artifacts/2026-08-17-fleet-availability.md §4, «Остатки») мерила это дословно
+# — «прайс-лист парка занятость игнорирует полностью, слова available в ветке нет вовсе», точка
+# касания названа там же: _sheet_q_total/_sheet_min_variant. Признак при этом ПРИХОДИТ по КАЖДОМУ
+# юниту тем же полем `available` двери quote_price, которым уже живёт точечная котировка
+# (pricing.quote_for_model: перебор юнитов, первый available → ok, иначе none_available).
+#
+# ТРИ состояния, а не два. Молчание источника занятостью НЕ является: признака нет → «не проверено»,
+# и такая модель в подбор тоже не идёт, но по ДРУГОЙ причине. Слить их в одно значило бы называть
+# «занято» там, где просто не удалось прочитать, — ровно та ложь, которой этот слой должен мешать.
+_SHEET_FREE, _SHEET_BUSY, _SHEET_UNCHECKED = "free", "busy", "unchecked"
+_SHEET_SKIP_WORD = {_SHEET_BUSY: "все юниты ЗАНЯТЫ на эти даты",
+                    _SHEET_UNCHECKED: "занятость НЕ ПРОВЕРЕНА (признака нет в ответе)"}
+# Откат ветки одной ручкой, без коммита: сетка снова строится по всему парку, побайтно как до 20.08.
+_SHEET_AVAIL_OFF = (os.getenv("PRICE_SHEET_AVAIL_OFF", "").strip() not in ("", "0"))
+
+
+def _sheet_unit_free(q):
+    """Свободен ли ЮНИТ на период своей котировки. → True (свободен) / False (занят) / None
+    (признака нет — «не проверено»).
+
+    Истинность поля читаем ТЕМ ЖЕ правилом, что боевой точечный путь (`pricing.quote_for_model` →
+    `if q.get("available")`): одна дверь не должна судиться двумя мерками. Отличие ровно одно и оно
+    намеренное — ОТСУТСТВУЮЩЕЕ поле (или null) там неотличимо от «занят», а здесь становится
+    третьим исходом. Живой формат поля — JSON-bool (мост считает его пересечением запрошенного
+    периода со строками вкладки «клиенты», QuotePrice.js), поэтому bool() достаточно, и догадок про
+    строки «FALSE»/числа здесь НЕ заводим: их живой ответ не присылает."""
+    if not isinstance(q, dict) or q.get("available") is None:
+        return None
+    return bool(q["available"])
+
+
+def _sheet_free_quotes(quotes):
+    """Только котировки СВОБОДНЫХ юнитов. «Занят» и «не проверено» одинаково не годятся в колонку:
+    цену называем лишь за то, что клиент реально может забрать."""
+    return [q for q in quotes if _sheet_unit_free(q) is True]
+
+
+def _sheet_availability(term_quotes):
+    """Вердикт по МОДЕЛИ из котировок всех её юнитов на всех сроках. → free | busy | unchecked.
+    Хоть один свободный юнит → модель в подборе (цель правки; у NMAX их десять, у FORZA один).
+    Свободных нет, но занятые ПРОЧТЕНЫ → busy. Ни одного прочитанного признака → unchecked."""
+    states = [_sheet_unit_free(q) for qs in term_quotes.values() for q in qs]
+    if any(s is True for s in states):
+        return _SHEET_FREE
+    if any(s is False for s in states):
+        return _SHEET_BUSY
+    return _SHEET_UNCHECKED
+
+
+def price_sheet_status(ds, getter=None, _now=None, _fleet=None):
+    """Прайс по СВОБОДНОМУ парку на дату-якорь ds (iso) + ЧЕСТНЫЙ разрез отсеянного.
+    → (rows, skipped): rows — как у price_sheet; skipped — list[{model, reason}], reason ∈
+    {busy, unchecked}. Пустой rows при непустом skipped читается «свободных нет / не проверено»,
+    а не «источника нет», — те два случая до 20.08 были неразличимы (тот же класс, что
+    pricing.fleet → fleet_status).
+
+    По каждой модели allowlist (кроме несдаваемых) — три quote() (1/7/30 дней) ЖИВЫМ Bridge по
+    КАЖДОМУ юниту; в колонки идут ТОЛЬКО свободные юниты, модель без единого свободного в сетку не
+    попадает вовсе. Кэш _SHEET_TTL сек по ds (только боевой путь; при инъекции getter — без кэша).
     getter/_now/_fleet инъектируются в тестах (боевой Bridge не дёргаем)."""
     now = _now() if _now else time.time()
     c = _sheet_cache
     if getter is None and _fleet is None and c["key"] == ds and c["rows"] is not None \
             and (now - c["ts"]) < _SHEET_TTL:
-        return c["rows"]
+        return c["rows"], (c.get("skipped") or [])
     try:
         allow = park_allowlist(getter)
     except Exception:
         allow = None
     if not allow:
-        return []
+        return [], []
     models = [m for m in allow if _bike_key(m) not in _NON_RENTABLE_KEYS]
     bikes = _fleet if _fleet is not None else pricing.fleet(_get=getter)
     # Колонка какой ячейки чем минимизируется: сутки/неделя — по сумме, месяц — по кап-«от» величине.
@@ -3580,19 +3650,41 @@ def price_sheet(ds, getter=None, _now=None, _fleet=None):
         # НЕ ждём зависшие HTTP: невзятые в работу отменяем, взятые дотекут в фоне (демон-длинножитель).
         ex.shutdown(wait=False, cancel_futures=True)
 
-    rows = []
+    rows, skipped = [], []
     for label, variants, per_term in plan:
         # Порядок квот = порядок вариантов парка (детерминизм при равенстве колонок); None — выпал.
-        term_quotes = {key: [q for q in (results.get(bd) for bd in pairs) if q is not None]
-                       for key, pairs in per_term.items()}
+        got = {key: [q for q in (results.get(bd) for bd in pairs) if q is not None]
+               for key, pairs in per_term.items()}
+        if _SHEET_AVAIL_OFF:                   # ручка отката: ветка не исполняется, путь прежний
+            term_quotes = got
+        else:
+            verdict = _sheet_availability(got)
+            if verdict != _SHEET_FREE:
+                # Занятая (и непроверенная) модель в подбор НЕ идёт: цену за неё не называем вовсе.
+                # Чем заменить занятую — ОТДЕЛЬНОЕ решение владельца, карты замен здесь нет.
+                skipped.append({"model": label, "reason": verdict})
+                log.info(f"SHEET: модель {label} в сетку НЕ вошла — {_SHEET_SKIP_WORD[verdict]}")
+                continue
+            # В колонки идут только свободные юниты: минимум-по-вариантам не смеет взять цену
+            # занятого (у него она бывает НИЖЕ — старый дешёвый юнит как раз и разобран первым).
+            term_quotes = {key: _sheet_free_quotes(qs) for key, qs in got.items()}
         cells = {key: _sheet_min_variant(term_quotes[key], value_fn[key]) for _, key in _SHEET_TERMS}
         rows.append({"model": label, "class": bike_class(label), "bike": variants[0], "cells": cells,
                      "deposit": _sheet_min_deposit(term_quotes)})
     n_ok = sum(1 for v in results.values() if v is not None)
+    n_busy = sum(1 for s in skipped if s["reason"] == _SHEET_BUSY)
     log.info(f"SHEET: сетка построена за {time.time() - t0:.1f}с — {len(rows)} моделей, "
-             f"{len(futs)} quote ({len(futs) - n_ok} пропущено), пул {_SHEET_WORKERS}")
+             f"{len(futs)} quote ({len(futs) - n_ok} пропущено), пул {_SHEET_WORKERS}; "
+             f"отсеяно по занятости {n_busy}, по непроверенности {len(skipped) - n_busy}")
     if getter is None and _fleet is None:
-        c.update(key=ds, ts=now, rows=rows)
+        c.update(key=ds, ts=now, rows=rows, skipped=skipped)
+    return rows, skipped
+
+
+def price_sheet(ds, getter=None, _now=None, _fleet=None):
+    """Строки прайс-сетки (СОВМЕСТИМОСТЬ: только rows, без разреза отсеянного — сбой источника
+    здесь неотличим от «все заняты»). Новый код обязан звать price_sheet_status()."""
+    rows, _skipped = price_sheet_status(ds, getter=getter, _now=_now, _fleet=_fleet)
     return rows
 
 

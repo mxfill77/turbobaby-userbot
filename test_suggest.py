@@ -4194,6 +4194,175 @@ class TestPriceSheetManyVariantsRobust(unittest.TestCase):
         self.assertNotIn("ADV 350\n• Сутки: 749 ฿", block)  # висящий юнит не дождались — без цифр
 
 
+class TestPriceSheetAvailability(unittest.TestCase):
+    """ЗАНЯТОСТЬ НА МНОГОМОДЕЛЬНОМ ПУТИ (20.08.2026). До правки сетка квотировала ВЕСЬ парк и
+    называла цену забронированного байка (разведка 17.08, docs/artifacts/2026-08-17-fleet-
+    availability.md §4). Класс держит ТРИ исхода, и третий — главный: молчание источника занятостью
+    НЕ является, «не проверено» обязано быть отличимо от «занято».
+
+    Парк мока — живой срез 15.08 из той же разведки: NMAX 155 многоюнитная (часть в аренде),
+    FORZA 300 и MT-03 300 — одиночки, обе «В аренде» (0/1), ADV 350 свободна. Формат ответа
+    quote_price повторяет живой дословно (day_price/total/deposit/available/days/cap_*/text)."""
+
+    # Имена юнитов — как в Лист1 (с CC, цветом и номером): _bike_key их и нормализует.
+    NMAX_FREE = "NMAX 155CC BLACK PHUKET 4255"
+    NMAX_BUSY = "NMAX 155CC RED PHUKET 4256"
+    ADV_FREE = "ADV 350CC WHITE PHUKET 5801"
+    FORZA_BUSY = "FORZA 300CC GREY PHUKET 6011"     # одиночка, занята → в подбор НЕ идёт
+    MT_UNKNOWN = "MT-03 300CC BLUE PHUKET 7011"     # одиночка, признак НЕ пришёл → «не проверено»
+    NO_FIELD = "CB 300CC R PHUKET 9011"             # поля available НЕТ вовсе (не null, а отсутствует)
+    FLEET_NAMES = [NMAX_FREE, NMAX_BUSY, ADV_FREE, FORZA_BUSY, MT_UNKNOWN, NO_FIELD]
+
+    # Занятый юнит НАМЕРЕННО дешевле свободного: если отсев не сработает, минимум-по-вариантам
+    # возьмёт цену занятого и голден это увидит числом, а не только составом строк.
+    PRICE = {NMAX_FREE: 450, NMAX_BUSY: 390, ADV_FREE: 749,
+             FORZA_BUSY: 700, MT_UNKNOWN: 927, NO_FIELD: 610}
+    AVAIL = {NMAX_FREE: True, NMAX_BUSY: False, ADV_FREE: True,
+             FORZA_BUSY: False, MT_UNKNOWN: None}   # NO_FIELD — ключа нет вовсе, см. _getter
+
+    def setUp(self):
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None, skipped=None)
+
+    def tearDown(self):
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None, skipped=None)
+
+    def _getter(self):
+        """Мок двери quote_price в ЖИВОМ формате: поле available — JSON-bool на байк-и-период
+        (мост считает его пересечением периода со строками вкладки «клиенты»). У MT-03 оно
+        приходит null, у CB 300R ключа нет вовсе — оба случая читаются как «не проверено»."""
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET_NAMES]}}
+            bike = params.get("bike", "")
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            per = self.PRICE.get(bike)
+            if per is None:
+                return {"ok": False}
+            total = per * days
+            data = {"day_price": per, "total": total, "deposit": 5000, "days": days,
+                    "cap_active": False, "cap_price": None, "text": f"{bike} {days}d {total}"}
+            if bike != self.NO_FIELD:                 # NO_FIELD — ключ ОТСУТСТВУЕТ в ответе
+                data["available"] = self.AVAIL[bike]
+            return {"ok": True, "data": data}
+        return fake
+
+    def _by_model(self, rows):
+        return {r["model"]: r for r in rows}
+
+    # ---- (а) модель ЗАНЯТА на запрошенные даты → её в подборе НЕТ ----
+    def test_busy_model_is_not_in_the_sheet(self):
+        rows, skipped = suggest.price_sheet_status("2026-07-15", getter=self._getter())
+        models = self._by_model(rows)
+        self.assertNotIn("FORZA 300", models)         # одиночка занята → строки нет вовсе
+        block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
+        self.assertNotIn("FORZA", block)              # и в клиентский блок не попала
+        self.assertNotIn("700 ฿", block)              # её цену не назвали ни одной ячейкой
+        self.assertIn({"model": "FORZA 300", "reason": "busy"}, skipped)
+
+    def test_busy_unit_price_never_wins_the_column(self):
+        # Многоюнитная модель: занятый юнит ДЕШЕВЛЕ свободного — минимум обязан взять СВОБОДНЫЙ.
+        rows, _sk = suggest.price_sheet_status("2026-07-15", getter=self._getter())
+        nmax = self._by_model(rows)["NMAX 155"]
+        self.assertEqual(nmax["cells"]["day"]["total"], 450)   # свободный, а не 390 занятого
+        self.assertEqual(nmax["cells"]["day"]["bike"] or self.NMAX_FREE, self.NMAX_FREE)
+        block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
+        self.assertIn("NMAX 155\n• Сутки: 450 ฿", block)
+        self.assertNotIn("390 ฿", block)
+
+    # ---- (б) модель СВОБОДНА → она в подборе есть, с ценой ----
+    def test_free_model_is_in_the_sheet_with_price(self):
+        rows, skipped = suggest.price_sheet_status("2026-07-15", getter=self._getter())
+        adv = self._by_model(rows)["ADV 350"]
+        self.assertEqual(adv["cells"]["day"]["total"], 749)
+        self.assertEqual(adv["cells"]["week"]["total"], 749 * 7)
+        self.assertEqual(adv["cells"]["month"]["total"], 749 * 30)
+        block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
+        self.assertIn("ADV 350\n• Сутки: 749 ฿\n• Неделя (7 дней): 5243 ฿\n"
+                      "• Месяц: 22470 ฿\n• Депозит: 5000 ฿ / паспорт", block)
+        self.assertNotIn("ADV 350", [s["model"] for s in skipped])
+
+    # ---- (в) занятость ПРОЧИТАТЬ НЕ УДАЛОСЬ → в подбор НЕ идёт, и это «не проверено» ----
+    def test_unreadable_availability_is_unchecked_not_busy(self):
+        """ГЛАВНЫЙ из трёх: молчание источника занятостью не является. Модель из сетки уходит
+        (цену за непроверенное не называем), но причина обязана быть ОТДЕЛЬНОЙ — иначе бот зовёт
+        «занятым» то, что просто не смог прочитать."""
+        rows, skipped = suggest.price_sheet_status("2026-07-15", getter=self._getter())
+        models = self._by_model(rows)
+        reasons = {s["model"]: s["reason"] for s in skipped}
+        for name in ("MT-03", "CB 300R"):             # null и отсутствующий ключ — один исход
+            self.assertNotIn(name, models, f"{name} попала в сетку без прочитанной занятости")
+            self.assertEqual(reasons.get(name), "unchecked",
+                             f"{name} отсеяна как {reasons.get(name)!r}, а не «не проверено»")
+        self.assertNotEqual(reasons.get("MT-03"), "busy")     # ЯВНО: не «занято»
+        self.assertNotEqual(reasons.get("CB 300R"), "busy")
+        block = suggest.render_price_sheet(rows, "2026-07-15", "ru")
+        self.assertNotIn("927 ฿", block)              # цену непроверенного не назвали
+        self.assertNotIn("610 ฿", block)
+
+    def test_three_states_are_distinguishable_at_the_unit_level(self):
+        # Чистая функция-предикат: True / False / None, и None НЕ равно False.
+        self.assertIs(suggest._sheet_unit_free({"available": True, "total": 1}), True)
+        self.assertIs(suggest._sheet_unit_free({"available": False, "total": 1}), False)
+        self.assertIsNone(suggest._sheet_unit_free({"available": None, "total": 1}))
+        self.assertIsNone(suggest._sheet_unit_free({"total": 1}))       # ключа нет
+        self.assertIsNone(suggest._sheet_unit_free(None))               # квоты нет вовсе
+        self.assertEqual(suggest._sheet_availability({"day": [{"available": False}]}), "busy")
+        self.assertEqual(suggest._sheet_availability({"day": [{"available": None}]}), "unchecked")
+        self.assertEqual(suggest._sheet_availability({"day": []}), "unchecked")
+        # хоть один свободный юнит перевешивает любое число занятых — цель правки
+        self.assertEqual(suggest._sheet_availability(
+            {"day": [{"available": False}, {"available": True}]}), "free")
+
+    # ---- рамки правки ----
+    def test_empty_pick_keeps_old_behaviour(self):
+        """Свободных нет ВОВСЕ — этим заходом не решаем: путь прежний, честный фолбэк БЕЗ чисел.
+        Замены занятой модели похожей здесь нет и быть не должно."""
+        def all_busy(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET_NAMES]}}
+            bike = params.get("bike", "")
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            return {"ok": True, "data": {"day_price": 500, "total": 500 * days, "deposit": 5000,
+                                         "available": False, "days": days, "cap_active": False,
+                                         "cap_price": None, "text": f"{bike} {days}d"}}
+        rows, skipped = suggest.price_sheet_status("2026-07-15", getter=all_busy)
+        self.assertEqual(rows, [])
+        self.assertTrue(skipped and all(s["reason"] == "busy" for s in skipped))
+        note = suggest.build_price_sheet_note(
+            {"price_sheet_q": True, "iso_start": "2026-07-15", "has_dates": True},
+            lang="ru", getter=all_busy, today=datetime.date(2026, 7, 11))
+        self.assertEqual(note, suggest._PRICE_SHEET_UNAVAILABLE)   # прежний фолбэк, дословно
+        self.assertNotIn("500", note)                              # ни одного числа занятого
+
+    def test_compat_wrapper_returns_rows_only(self):
+        # price_sheet остаётся однозначной (rows), её зовёт build_price_sheet_note и моки тестов.
+        rows = suggest.price_sheet("2026-07-15", getter=self._getter())
+        self.assertIsInstance(rows, list)
+        self.assertEqual([r["model"] for r in rows], ["NMAX 155", "ADV 350"])
+
+    def test_off_switch_restores_whole_park(self):
+        # Ручка отката: ветка не исполняется — в сетке снова ВСЕ модели, включая занятую FORZA.
+        with mock.patch.object(suggest, "_SHEET_AVAIL_OFF", True):
+            rows, skipped = suggest.price_sheet_status("2026-07-15", getter=self._getter())
+        models = [r["model"] for r in rows]
+        self.assertIn("FORZA 300", models)
+        self.assertIn("MT-03", models)
+        self.assertEqual(skipped, [])
+        self.assertEqual(self._by_model(rows)["NMAX 155"]["cells"]["day"]["total"], 390)  # как до 20.08
+
+
 class TestSheetAwarePricePolicy(unittest.TestCase):
     """Класс-голден второй ноги живого регресса 20:59 (черновик #275): сетка ДОШЛА до промпта, но
     ценовая политика («Дат нет — сперва спроси даты», цена только из блока «ЦЕНА из Календаря»)
