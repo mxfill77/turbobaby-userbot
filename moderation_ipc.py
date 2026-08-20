@@ -283,6 +283,63 @@ def claim_decision(draft_id, status, final_text=None, decided_by=None, reason=No
     return won, row
 
 
+# ---------- РАЗГОВОР КАК ЕДИНИЦА: гашение УСТАРЕВШИХ предложений (20.08.2026) ----------
+# Единица модерации сменилась с сообщения на РАЗГОВОР (замер 710 диалогов: до запроса данных на
+# бронь не доходит ни один диалог быстрее 4 ходов, медиана 12). Отсюда новый живой случай:
+# клиент дописывает, ПОКА карточка ждёт нажатия. Бот пересобирает предложение под новое
+# сообщение, а прежнее НЕПРИНЯТОЕ обязано стать неотправляемым — иначе человек нажмёт по
+# устаревшему тексту и клиент получит ответ на позавчерашний вопрос.
+#
+# Замок — ТОТ ЖЕ приём, что у claim_decision, и по той же причине: предусловие проверяет САМА
+# СУБД внутри одного UPDATE. Питоновская проверка «а не устарело ли» здесь не годится — между
+# проверкой и захватом существует окно, а гашение и нажатие идут из РАЗНЫХ процессов
+# (userbot принимает сообщение, moderation_bot жмёт кнопку).
+#
+# 'superseded' СОЗНАТЕЛЬНО не входит ни в CLAIMABLE_FROM, ни в DECISION_STATUSES: устаревшую
+# строку нельзя ни отправить, ни «переоткрыть» — она выпадает из захвата по построению.
+STATUS_SUPERSEDED = "superseded"
+
+
+def dialog_rows(client_id, path=None):
+    """Все строки очереди ОДНОГО разговора (по client_id), порядок по id (старые→новые).
+    Это и есть материал карточки разговора: единица — диалог, а не строка."""
+    with _conn(path) as c:
+        return [_row(r) for r in c.execute(
+            "SELECT * FROM drafts WHERE client_id=? ORDER BY id", (client_id,))]
+
+
+def open_rows(client_id, path=None):
+    """Строки разговора с НЕПРИНЯТЫМ предложением (статусы CLAIMABLE_FROM), порядок по id."""
+    marks = ",".join("?" for _f in CLAIMABLE_FROM)
+    with _conn(path) as c:
+        return [_row(r) for r in c.execute(
+            "SELECT * FROM drafts WHERE client_id=? AND status IN (" + marks + ") ORDER BY id",
+            (client_id,) + CLAIMABLE_FROM)]
+
+
+def supersede_open(client_id, keep_id=None, reason=None, path=None):
+    """Клиент написал снова: НЕПРИНЯТЫЕ предложения этого разговора становятся УСТАРЕВШИМИ.
+    → сколько строк погашено ЭТИМ вызовом (0 — гасить было нечего).
+
+    keep_id — строку с этим id не трогаем (когда новая уже стои́т в очереди).
+    Строку, по которой человек УЖЕ принял решение, гашение не задевает: она вышла из
+    CLAIMABLE_FROM раньше, и её решение остаётся в силе — устаревает только непринятое.
+
+    client_id обязателен: `WHERE client_id=NULL` в SQL не совпадает НИ С ЧЕМ, и молчаливый
+    ноль здесь означал бы «гасить нечего» там, где на самом деле «не знаю, чей это разговор»."""
+    if client_id is None:
+        raise ValueError("supersede_open: client_id обязателен — без него разговор не опознать")
+    marks = ",".join("?" for _f in CLAIMABLE_FROM)
+    sql = ("UPDATE drafts SET status=?, reason=?, updated_ts=? "
+           "WHERE client_id=? AND status IN (" + marks + ")")
+    args = (STATUS_SUPERSEDED, reason, _now_iso(), client_id) + CLAIMABLE_FROM
+    if keep_id is not None:
+        sql += " AND id<>?"
+        args += (keep_id,)
+    with _conn(path) as c:
+        return c.execute(sql, args).rowcount
+
+
 def mark(draft_id, status, reason=None, path=None):
     """Пометить итог отправки: sent | failed | test_held."""
     with _conn(path) as c:
