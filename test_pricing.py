@@ -559,25 +559,46 @@ class TestPriceRulesV2(unittest.TestCase):
 
     # --- (1) кап низкого сезона ---------------------------------------------
     def test_cap_active_replaces_j_price_with_low_season(self):
-        # total (за месяц) > cap_price → «аренда от <cap> ฿/мес — предложение низкого сезона»
+        # total (за месяц) > cap_price → «аренда от <cap> ฿/мес — предложение низкого сезона».
+        #
+        # ФИКСТУРА ПЕРЕВЕДЕНА С NMAX 155 НА NINJA 400 21.08.2026 — и это починка ПРЕДМЕТА, а не
+        # числа. У NMAX счёт правила за месяц = 298 x 1.0 (P1) x 0.53 (30+) = 158 ฿/день;
+        # 158 x 30 = 4740 ฿, а кепка файла у NMAX 155 = 5000 ฿. Предикат кепки СТРОГИЙ
+        # (total > cap_price), 4740 < 5000 ⇒ ветка не исполняется вовсе, и тест на NMAX проверял
+        # бы ОТСУТСТВИЕ кепки. «Кап активен, но сумма ниже потолка» уже стережёт сосед снизу
+        # (test_cap_active_but_total_below_cap_no_low_season) — дубля не заводим.
+        # NINJA 400: база 1145 x 1.0 (P1, старт 2026-07-05) x 0.53 (корзина 30+, срок 30 сут)
+        # = 606.85 -> 607 ฿/день; 607 x 30 = 18210 ฿ > кепки файла 11900 ฿ (KAWASAKI NINJA 400,
+        # active=true). Строка кепки у неё ОДНА (поколений нет), поэтому cap_for берёт её сразу,
+        # без сверки с живым cap_price. Запас над потолком +53.0 % — ветка срабатывает с большим
+        # отрывом, а не на границе.
         self._with_qfm(lambda *a, **k: {"status": "ok", "quote": {
-            "text": "30000 ฿ за месяц", "total": 30000, "cap_active": True, "cap_price": 15000,
+            "text": "30000 ฿ за месяц", "total": 30000, "cap_active": True, "cap_price": 11900,
             "deposit": 7000, "available": True, "days": 30}})
-        note = suggest.build_pricing_note(self._h("NMAX на месяц с 5 июля"))
-        self.assertIn("аренда от 15000 ฿/мес", note)
+        note = suggest.build_pricing_note(self._h("Ninja 400 на месяц с 5 июля"))
+        self.assertIn("аренда от 11900 ฿/мес", note)
         self.assertIn("низкого сезона", note)
         self.assertIn("депозит 7000", note)     # депозит/наличие как обычно
         self.assertIn("свободен", note)
         self.assertNotIn("30000", note)          # J-цена НЕ уходит клиенту
 
     def test_cap_inactive_uses_j_text(self):
-        # cap_active=False → обычная J-цена (поле text) дословно, не кап-фраза
+        # cap_active=False → кап-фразы НЕТ, звучит обычная цена. ИМЯ ИСТОРИЧЕСКОЕ («uses_j_text»):
+        # предмет теста — отсутствие кап-фразы, а не канал J.
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026 (источник цены — ЗАПИСАННОЕ ПРАВИЛО, 45a38cf): дословный
+        # текст столбца J каналом БОЛЬШЕ НЕ ЯВЛЯЕТСЯ — price_source.reprice снимает поле text
+        # (price_source.py:319 `out.pop("text", None)`) с записанной причиной: чужие числа листа
+        # рядом с новой ценой соврали бы клиенту двумя цифрами сразу. Фразу собирает _client_price
+        # из чисел правила: NMAX 155 = 298 x 1.0 (P1, старт 2026-07-10) x 1.0 (корзина 7-13,
+        # срок 7 сут) = 298 ฿/день; итого 298 x 7 = 2086 ฿.
         self._with_qfm(lambda *a, **k: {"status": "ok", "quote": {
             "text": "6300 ฿ за 7 дней, депозит 7000 ฿", "total": 6300, "cap_active": False,
             "cap_price": 15000, "available": True, "days": 7}})
         note = suggest.build_pricing_note(self._h("NMAX 10.07-17.07"))
-        self.assertIn("6300 ฿ за 7 дней", note)
-        self.assertNotIn("низкого сезона", note)
+        self.assertIn("298 ฿/день", note)
+        self.assertIn("итого 2086 ฿", note)
+        self.assertNotIn("низкого сезона", note)   # предмет теста: кап неактивен ⇒ кап-фразы нет
+        self.assertNotIn("6300", note)             # чужое число листа рядом с новой ценой не звучит
 
     def test_cap_active_but_total_below_cap_no_low_season(self):
         # кап активен, но total < cap_price → берём J-цену, без кап-фразы
@@ -657,10 +678,21 @@ class TestPriceRulesV2(unittest.TestCase):
         h = self._h("NMAX и PCX на 10.07-17.07")
         self.assertEqual(len(h["models"]), 2)
         note = suggest.build_pricing_note(h)
-        self.assertIn("6300 ฿ NMAX", note)
-        self.assertIn("5600 ฿ PCX", note)
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026. Предмет теста ЦЕЛ и проверяется ниже прежними строками:
+        # КАЖДАЯ модель — отдельной строкой, не смешаны и не просуммированы. Изменились числа и
+        # судьба PCX.
+        # NMAX 155 = 298 x 1.0 (P1, старт 2026-07-10) x 1.0 (7-13, 7 сут) = 298 ฿/день; 298 x 7 = 2086 ฿.
+        # PCX: в price_source.json такой модели НЕТ ВОВСЕ (base.scope — ТОЛЬКО модели живого парка,
+        # снят 2026-08-16; PCX нет ни в базе, ни в кепках), поэтому правило по ней МОЛЧИТ, и код
+        # честно отвечает «уточню», а не называет цену байка, которого в парке нет. Старый голден
+        # требовал «5600 ฿ PCX» — это была не устаревшая цена, а выдумка мока.
         self.assertIn("- NMAX:", note)
+        self.assertIn("298 ฿/день", note)
+        self.assertIn("итого 2086 ฿", note)
         self.assertIn("- PCX:", note)
+        self.assertIn("недоступна", note)      # модель вне парка — цена не называется
+        self.assertNotIn("5600", note)         # выдуманная цена PCX не звучит
+        self.assertNotIn("6300", note)         # чужое число листа по NMAX не звучит
         self.assertIn("отдельной строкой", note)
 
     # --- (4) депозит при нескольких байках -----------------------------------
@@ -681,13 +713,24 @@ class TestPriceRulesV2(unittest.TestCase):
 
     # --- (5) J-текст дословно ------------------------------------------------
     def test_ok_uses_quote_text_verbatim(self):
-        # поле text из quote уходит клиенту дословно; day_price игнорируется
+        # ГОЛДЕН ПЕРЕВЁРНУТ 21.08.2026 вместе с источником цены (45a38cf). ИМЯ ИСТОРИЧЕСКОЕ.
+        # Прежний предмет — «поле text уходит клиенту ДОСЛОВНО» — упразднён ПО ПОСТРОЕНИЮ:
+        # price_source.reprice делает out.pop("text", None) (price_source.py:319) с записанной
+        # причиной — «дословная строка столбца J с ЧУЖИМИ числами рядом с новой ценой значило бы
+        # соврать клиенту двумя цифрами сразу». Пересчитать такой голден нельзя: канала нет.
+        # Поэтому тест стережёт ОБРАТНОЕ, и это СИЛЬНЕЕ прежнего — ни текст листа, ни его числа
+        # не текут, звучит счёт правила:
+        # NMAX 155 = 298 x 1.0 (P1, старт 2026-07-10) x 1.0 (7-13, 7 сут) = 298 ฿/день; 298 x 7 = 2086 ฿.
+        # Строка про day_price=111 сохранена дословно: чужой день из котировки не подмешан и теперь.
         self._with_qfm(lambda *a, **k: {"status": "ok", "quote": {
             "text": "Ровно так: 900 ฿/день, 6300 ฿ за неделю", "day_price": 111, "total": 6300,
             "available": True, "days": 7}})
         note = suggest.build_pricing_note(self._h("NMAX 10.07-17.07"))
-        self.assertIn("Ровно так: 900 ฿/день, 6300 ฿ за неделю", note)
-        self.assertIn("ДОСЛОВНО", note)
+        self.assertNotIn("Ровно так", note)      # дословный J-текст листа снят
+        self.assertNotIn("900 ฿/день", note)     # чужая цена листа не звучит
+        self.assertNotIn("6300", note)           # чужой итог листа не звучит
+        self.assertIn("298 ฿/день", note)        # звучит счёт правила
+        self.assertIn("итого 2086 ฿", note)
         self.assertNotIn("111", note)            # day_price не подмешан
 
     def test_ok_without_text_falls_back_to_assembly(self):
