@@ -6308,21 +6308,163 @@ def _full_head():
     return _git_out(["rev-parse", "HEAD"])
 
 
+# ───── ВТОРОЙ, НЕЗАВИСИМЫЙ ПРИЗНАК БАЗЫ: ЖИВОЙ ПРОЦЕСС ДЕТЕЙ (22.08.2026) ──────────────────────
+# ЗАБОР ЧЕСТЕРТОНА — что сброс метки чинил и почему он ОСТАЁТСЯ. Метка живёт ТОЛЬКО в ОЗУ демона,
+# и на старте процесса другого источника базы нет вовсе. Строка «первый прогон → метка = HEAD» это
+# не сброс ради сброса, а ЕДИНСТВЕННАЯ доступная тогда посылка: «детей поднимаю я, из того же
+# дерева, значит они уже на моём HEAD». В июле (6d8a3b1, 11.07) посылка была ВЕРНА — детей
+# действительно поднимал контур-вотчдог из текущего дерева, а self-update сам рестартил затронутых
+# в той же эстафете. Что она защищает: без базы первый тик КАЖДОГО старта демона диффил бы широкий
+# диапазон и рестартил ЖИВЫХ КЛИЕНТСКИХ БОТОВ, а стартов у демона несколько в сутки. Забор заморожен
+# тестом test_first_tick_adopts_head_no_restart (первый тик → рестартов ноль). Сброс НЕ УБИРАЕМ.
+#
+# ЧТО СЛОМАЛО ПОСЫЛКУ (замер 22.08.2026). Ворота клиентского контура (30.07) и заморозка (21.08)
+# ввели состояние, которого в июле не существовало: демон обновляется, а дети ОСТАЮТСЯ ПОЗАДИ —
+# ворота их держат. С этого мига «дети стартовали со мной» ложно ровно тогда, когда долг и есть.
+# Живой случай: self-update 22.08 01:08:21 местного (=21.08 18:08 UTC) 57166ab→b1c8106 поднял новый
+# процесс демона, и тот первым тиком принял b1c8106 за применённое, — а ЖИВЫЕ дети (userbot PID
+# 13736 старт 18.08 20:27:55, moderbot PID 10948 старт 18.08 20:33:52) стояли на 538bbbd: 97
+# коммитов и 78.5 часа позади. Долг исчез целиком — последний отказ ворот в логе 01:05:20, дальше
+# тишина при пяти клиентских файлах в диффе.
+#
+# ПРИЗНАК — ЖИВОЙ ПРОЦЕСС, А НЕ ЗАПИСЬ. Спрашиваем не файл-реестр (запись переживает то, чего уже
+# нет) и не коммит демона (это ЕГО код, а не детский), а сам процесс: CIM отдаёт время старта, git
+# отвечает, что было вершиной в тот момент. Источник независим от метки по построению — ни одна
+# дорога, двигающая метку, времени старта чужого процесса не касается.
+#
+# ЗАМОК «ТОЛЬКО НАЗАД». Живая база принимается, лишь когда она СТРОГИЙ ПРЕДОК нынешней (на
+# инициализации — вершины). Признак умеет ТОЛЬКО раскрывать долг и никогда не прятать: ошибка пробы
+# даёт лишний ОТКАЗ ворот (fail-closed, дёшево), а не лишнюю выкатку на живого клиента. Поэтому же у
+# времени старта НЕТ запаса назад: штатная выкатка — коммит в T0, рестарт ребёнка в T1>T0, и любой
+# запас назвал бы долгом только что применённый коммит.
+#
+# ОСТАТОК ЧЕСТНО: CIM не ответил или git не назвал коммит → база НЕ ДОКАЗАНА, и мы падаем в прежнее
+# поведение (метка = HEAD) с громкой строкой в лог. Это ровно сегодняшний исход, новых он не вносит;
+# «не знаю» здесь не превращается ни в «долга нет», ни в остановку реконсиляции.
+_CHILD_SCRIPTS = (("userbot", "userbot_listen.py"), ("moderbot", "moderation_bot.py"))
+_RE_PROC_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")   # формат CIM-штампа старта
+_RE_COMMIT_HEX = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def _proc_started_at(script_name):
+    """Время старта ЖИВОГО python-процесса <script_name> — локальное 'ГГГГ-ММ-ДД ЧЧ:ММ:СС'.
+    ТРИ исхода, та же идиома, что у _find_pids_by_script (#171):
+      • строка — процесс найден (живых несколько → САМЫЙ РАННИЙ старт: fail-closed, больше долга);
+      • ''     — CIM отработал, процесса НЕТ (честная пустота);
+      • None   — CIM упал/таймаут/скрытый сбой — исход НЕИЗВЕСТЕН.
+    script_name — литерал из _CHILD_SCRIPTS (не пользовательский ввод)."""
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" "
+          "| Where-Object { $_.CommandLine -like '*" + script_name + "*' } "
+          "| ForEach-Object { $_.CreationDate.ToString('yyyy-MM-dd HH:mm:ss') }")
+    try:
+        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=20, creationflags=NO_WINDOW)
+    except Exception as e:                            # noqa: BLE001 — «не смог» ≠ «его нет»
+        log.warning("живая база детей: CIM-старт %s не снят (%s) — исход НЕИЗВЕСТЕН", script_name, e)
+        return None
+    stamps = sorted(ln.strip() for ln in (p.stdout or "").splitlines()
+                    if _RE_PROC_STAMP.match(ln.strip()))
+    if stamps:
+        return stamps[0]                              # самый ранний старт = самый старый код
+    if p.returncode != 0 or (p.stderr or "").strip():
+        log.warning("живая база детей: CIM-старт %s пуст, но rc=%s / stderr=%r — НЕИЗВЕСТНО",
+                    script_name, p.returncode, _tail((p.stderr or "").strip(), 120))
+        return None
+    return ""
+
+
+def _commit_at_time(when, out_fn=None):
+    """Какой коммит был вершиной в момент `when` (локальное время, формат _RE_PROC_STAMP).
+    → полный хеш | None (git молчит / момент раньше первого коммита)."""
+    if not _RE_PROC_STAMP.match(str(when or "").strip()):
+        return None
+    out = (out_fn or _git_out)(["rev-list", "-1", "--before=" + str(when).strip(), "HEAD"])
+    first = ((out or "").strip().splitlines() or [""])[0].strip().lower()
+    return first if _RE_COMMIT_HEX.match(first) else None
+
+
+def _is_ancestor(a, b, call_fn=None):
+    """a — предок b? → True | False | None (git не смог: «не знаю» это НЕ «да»)."""
+    if not a or not b or a == b:
+        return False
+    r = (call_fn or _git_call)(["merge-base", "--is-ancestor", str(a), str(b)])
+    if not r:
+        return None
+    return True if r[0] == 0 else (False if r[0] == 1 else None)
+
+
+def live_child_base(started_fn=None, commit_at_fn=None):
+    """База реконсиляции по ЖИВОМУ ПРОЦЕССУ детей. → (commit|None, status, дословно).
+    status: 'ok' (коммит доказан процессом) | 'none' (живых детей нет — стале-коду взяться неоткуда)
+            | 'unknown' (CIM/git не ответили — база НЕ доказана).
+    Детей несколько → берём САМОГО СТАРОГО из доказанных (fail-closed: больше долга, не меньше)."""
+    started = started_fn or _proc_started_at
+    commit_at = commit_at_fn or _commit_at_time
+    proven, unknown, absent = [], [], []
+    for kind, script in _CHILD_SCRIPTS:
+        when = started(script)
+        if when is None:
+            unknown.append(kind)
+            continue
+        if not when:
+            absent.append(kind)
+            continue
+        commit = commit_at(when)
+        if not commit:
+            unknown.append("%s (старт %s, коммит не назван)" % (kind, when))
+            continue
+        proven.append((when, kind, commit))
+    if proven:
+        when, kind, commit = min(proven)              # самый ранний старт → самый старый код
+        note = "%s жив с %s → %s" % (kind, when, commit[:9])
+        if unknown:
+            note += "; НЕ доказаны: %s" % ", ".join(unknown)
+        return commit, "ok", note
+    if unknown:
+        return None, "unknown", "база НЕ доказана: %s" % ", ".join(unknown)
+    return None, "none", "живых детей нет (%s)" % (", ".join(absent) or "ни одного")
+
+
+def _adopt_live_child_base(head, live_fn=None):
+    """Свести метку с ЖИВЫМ процессом детей. Метку двигает ТОЛЬКО НАЗАД (раскрыть долг) и только
+    при доказанном предке. → дословная строка для лога ('' — метку не трогали)."""
+    global _last_child_commit, _child_reconcile_rejected
+    commit, status, why = (live_fn or live_child_base)()
+    ref = _last_child_commit if _last_child_commit is not None else head
+    if status == "ok" and _is_ancestor(commit, ref) is True:
+        _last_child_commit = commit                   # ← долг снова виден
+        _child_reconcile_rejected = None              # база другая ⇒ прежний красный гейт был о другом диффе
+        return ("живая база детей: метка отведена назад %s → %s (%s) — долг детей снова виден"
+                % (str(ref)[:9], commit[:9], why))
+    if _last_child_commit is None:                    # прежний путь байт-в-байт (забор на месте)
+        _last_child_commit = head
+        if status == "unknown":
+            log.warning("живая база детей: %s — беру вершину %s как применённое (прежнее поведение); "
+                        "если дети позади, долг остаётся НЕВИДИМЫМ", why, str(head)[:9])
+        return ""
+    return ""
+
+
 def reconcile_children_tick(head_fn=None, diff_fn=None, gate_fn=None, restart_fn=None,
-                            now=None, cooldown=None, state=None, client_block_fn=None):
+                            now=None, cooldown=None, state=None, client_block_fn=None,
+                            live_base_fn=None):
     """Тело реконсиляции детей на новый коммит (без троттлинга — троттлит maybe_reconcile_children).
     → строка-итог для лога ('' если нечего/рубильник). Всё внешнее инъектируется для тестов.
-    Метку/rejected хранит в модульных глобалах (переживают тики; рестарт демона сбрасывает —
-    первый прогон просто примет текущий HEAD как применённый, т.к. дети стартовали с ним)."""
+    Метку/rejected хранит в модульных глобалах (переживают тики; рестарт демона их сбрасывает — и
+    ИМЕННО на этом сбросе стои́т второй признак: базу называет ЖИВОЙ ПРОЦЕСС детей, а не запись и не
+    коммит демона; не доказал — прежний путь «принять текущий HEAD»). См. блок над _CHILD_SCRIPTS."""
     global _last_child_commit, _child_reconcile_rejected
     if _stopped():
         return ""
     head = (head_fn or _full_head)()
     if not head:
         return ""
-    if _last_child_commit is None:        # первый прогон: дети стартовали с текущим HEAD → он уже «применён»
-        _last_child_commit = head
-        return ""
+    if _last_child_commit is None:        # первый прогон: базу называет живой процесс, иначе — HEAD
+        adopted = _adopt_live_child_base(head, live_base_fn)
+        if not adopted:
+            return ""
+        log.warning("реконсиляция детей: %s", adopted)
     if head == _last_child_commit or head == _child_reconcile_rejected:
         return ""                         # нет нового коммита ИЛИ этот HEAD уже провалил гейт — ждём новый
     changed = (diff_fn or _diff_names)(_last_child_commit, head)

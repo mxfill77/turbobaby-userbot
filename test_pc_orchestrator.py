@@ -3377,13 +3377,83 @@ class TestReconcileChildren(Base):
         (o._last_child_commit, o._child_reconcile_rejected, o._child_reconcile_last_run) = self._save_rc
         super().tearDown()
 
+    # Живую базу детей (CIM-проба процессов + git) в юнитах НЕ спрашиваем: по умолчанию отвечаем
+    # 'none' («живых детей нет») — при нём ветка инициализации идёт ПРЕЖНИМ путём байт-в-байт, и
+    # все голдены ниже проверяют ровно то, что проверяли. Живой путь — в TestLiveChildBase.
+    _LIVE_NONE = staticmethod(lambda: (None, "none", "юнит: живых детей не спрашиваем"))
+
     def _run(self, head, changed, **kw):
         return o.reconcile_children_tick(
             head_fn=lambda: head,
             diff_fn=lambda a, b: changed,
             gate_fn=kw.get("gate_fn", (lambda mods: (True, "ok"))),
             restart_fn=kw.get("restart_fn"),
-            now=kw.get("now", 1000), cooldown=kw.get("cooldown", 120), state=kw.get("state"))
+            now=kw.get("now", 1000), cooldown=kw.get("cooldown", 120), state=kw.get("state"),
+            live_base_fn=kw.get("live_base_fn", self._LIVE_NONE))
+
+    # ───── ЖИВАЯ БАЗА ДЕТЕЙ: сам признак, без тика (22.08.2026) ─────
+    def test_live_base_beret_SAMOGO_STAROGO_rebenka(self):
+        """Детей двое, стартовали в разное время → база = код САМОГО СТАРОГО (fail-closed)."""
+        starts = {"userbot_listen.py": "2026-08-18 20:27:55", "moderation_bot.py": "2026-08-21 10:00:00"}
+        commit, status, why = o.live_child_base(
+            started_fn=starts.get,
+            commit_at_fn=lambda w: {"2026-08-18 20:27:55": "538bbbd18a7b",
+                                    "2026-08-21 10:00:00": "ab16dcd0000"}[w])
+        self.assertEqual((commit, status), ("538bbbd18a7b", "ok"))
+        self.assertIn("userbot", why)
+
+    def test_live_base_tri_ishoda(self):
+        """'ok' | 'none' (честная пустота) | 'unknown' (CIM/git не ответили) — и они РАЗНЫЕ."""
+        self.assertEqual(o.live_child_base(lambda s: "", lambda w: None)[1], "none")
+        self.assertEqual(o.live_child_base(lambda s: None, lambda w: None)[1], "unknown")
+        # процесс жив, но git не назвал коммит — это НЕ 'none', это 'unknown'
+        self.assertEqual(o.live_child_base(lambda s: "2026-08-18 20:27:55", lambda w: None)[1], "unknown")
+        self.assertEqual(o.live_child_base(lambda s: "2026-08-18 20:27:55", lambda w: "abc1234")[1], "ok")
+
+    def test_live_base_odin_zhiv_vtoroi_net(self):
+        """Один ребёнок жив, второго нет → база по живому, исход 'ok' (а не 'unknown')."""
+        commit, status, _ = o.live_child_base(
+            lambda s: "2026-08-18 20:27:55" if s == "userbot_listen.py" else "",
+            lambda w: "538bbbd18a7b")
+        self.assertEqual((commit, status), ("538bbbd18a7b", "ok"))
+
+    def test_commit_at_time_format_i_musor(self):
+        """Штамп обязан быть формата CIM; мусор от git коммитом не считаем."""
+        self.assertEqual(o._commit_at_time("2026-08-18 20:27:55", out_fn=lambda a: "538BBBD18A7B"),
+                         "538bbbd18a7b")
+        self.assertIsNone(o._commit_at_time("18.08.2026 20:27", out_fn=lambda a: "538bbbd"))
+        self.assertIsNone(o._commit_at_time("", out_fn=lambda a: "538bbbd"))
+        self.assertIsNone(o._commit_at_time("2026-08-18 20:27:55", out_fn=lambda a: "fatal: bad revision"))
+        self.assertIsNone(o._commit_at_time("2026-08-18 20:27:55", out_fn=lambda a: None))
+        # аргумент git — именно --before с этим штампом (запаса назад НЕТ: он назвал бы долгом
+        # только что применённый коммит, см. блок над _CHILD_SCRIPTS)
+        seen = []
+        o._commit_at_time("2026-08-18 20:27:55", out_fn=lambda a: seen.append(a) or "abc1234")
+        self.assertIn("--before=2026-08-18 20:27:55", seen[0])
+
+    def test_is_ancestor_tri_ishoda(self):
+        """0 → True, 1 → False, прочий код/молчание git → None («не знаю» ≠ «да»)."""
+        self.assertIs(o._is_ancestor("a", "b", call_fn=lambda args: (0, "", "")), True)
+        self.assertIs(o._is_ancestor("a", "b", call_fn=lambda args: (1, "", "")), False)
+        self.assertIsNone(o._is_ancestor("a", "b", call_fn=lambda args: (128, "", "fatal")))
+        self.assertIsNone(o._is_ancestor("a", "b", call_fn=lambda args: None))
+        self.assertIs(o._is_ancestor("a", "a", call_fn=lambda args: (0, "", "")), False)   # сам себе не предок
+        self.assertIs(o._is_ancestor("", "b", call_fn=lambda args: (0, "", "")), False)
+
+    def test_proc_started_at_tri_ishoda(self):
+        """CIM-проба старта: самый ранний штамп | '' (честная пустота) | None (сбой)."""
+        def run(out, rc=0, err=""):
+            res = types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
+            with mock.patch.object(o.subprocess, "run", lambda *a, **k: res):
+                return o._proc_started_at("userbot_listen.py")
+
+        self.assertEqual(run("2026-08-21 10:00:00\n2026-08-18 20:27:55\n"), "2026-08-18 20:27:55")
+        self.assertEqual(run(""), "")                       # честная пустота
+        self.assertIsNone(run("", rc=1))                    # скрытый сбой CIM
+        self.assertIsNone(run("", err="Access denied"))
+        self.assertEqual(run("мусор не по формату\n"), "")  # ни одного штампа → пустота, не «жив»
+        with mock.patch.object(o.subprocess, "run", side_effect=OSError("powershell пропал")):
+            self.assertIsNone(o._proc_started_at("userbot_listen.py"))
 
     def test_first_tick_adopts_head_no_restart(self):
         # первый прогон (метка None): текущий HEAD принят как применённый (дети стартовали с ним).

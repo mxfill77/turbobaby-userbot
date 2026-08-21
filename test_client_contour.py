@@ -237,6 +237,24 @@ class GateBase(unittest.TestCase):
     def setUp(self):
         self.cards, self.cowork, self.restarts = [], [], []
         o._CLIENT_HELD_WARNED.clear()
+        # ЗЕРКАЛО ИЗОЛЯЦИИ ЗАМОРОЗКИ (22.08.2026, правило «класс-фикс — сразу на ОБЕ полосы»).
+        # Течь нашли и закрыли в test_pc_orchestrator.Base, а ЭТА половина осталась открытой — и
+        # текла в обе стороны ровно так же:
+        #   • ЧТЕНИЕ: владелец заморозил контур 21.08 19:36 → голдены ворот здесь покраснели, не
+        #     изменившись ни строкой (test_klientskii_kommit_ne_primenyaetsya_i_daet_kartochku ждёт
+        #     карточку, а под заморозкой повтор формы уходит в ленту). Вердикт голдена не смеет
+        #     зависеть от того, заморожен ли контур в эту минуту;
+        #   • ЗАПИСЬ: `gate_route` дописывал БОЕВОЙ реестр форм, а записанная форма гасит владельцу
+        #     ПЕРВУЮ настоящую карточку по ней. Замер 22.08 00:36 — n=160 по «moderbot,userbot|
+        #     suggest.py»; счётчик нарастили прогоны тестов, демон на 57166ab туда писать не мог.
+        # Заморозку ПО СУЩЕСТВУ проверяет test_pc_orchestrator.TestZamorozkaKontura своим флагом.
+        _frz = tempfile.mkdtemp(prefix="frz_cc_")
+        self.addCleanup(shutil.rmtree, _frz, ignore_errors=True)
+        for _a, _v in (("FREEZE_FLAG", os.path.join(_frz, "pc_orchestrator.contour_frozen")),
+                       ("GATE_SEEN_FILE", os.path.join(_frz, "gate_seen.json"))):
+            _s = getattr(cc, _a)
+            setattr(cc, _a, _v)
+            self.addCleanup(lambda a=_a, v=_s: setattr(cc, a, v))
         self.p_notify = mock.patch.object(o, "_notify", lambda t: self.cards.append(t))
         self.p_cowork = mock.patch.object(o, "_cowork", lambda t: self.cowork.append(t))
         self.p_subj = mock.patch.object(o, "_commit_subject", lambda c: "тема коммита")
@@ -362,6 +380,63 @@ class TestVorotaVyhoda(GateBase):
                                       diff_fn=lambda a, b: ["suggest.py"],
                                       gate_fn=self.gate_green, restart_fn=self.restart)
         self.assertEqual(len(self.cards), 1)
+
+    # ─────── ВИДИМОСТЬ ДОЛГА ДЕТЕЙ ПОСЛЕ РЕСТАРТА ДЕМОНА (22.08.2026) ───────
+    # ОТРИЦАТЕЛЬНЫЙ ТЕСТ КЛАССА. Живой случай: self-update 22.08 01:08:21 (=21.08 18:08 UTC)
+    # поднял новый процесс демона; метка родилась заново и приняла вершину за применённое, а
+    # ЖИВЫЕ дети стояли на 538bbbd — 97 коммитов позади. Ворота замолчали: последний отказ в
+    # логе 01:05:20, дальше тишина при пяти клиентских файлах в диффе.
+    # Прибор обязан отказать РОВНО в состоянии «метка выглядит правильной, дети старые» и
+    # обязан ПОГАСНУТЬ, когда дети на вершине. Оба исхода — здесь, на одной обвязке.
+
+    _OLD, _TIP = "538bbbd18a7b", "d860a9ad143f"
+
+    def _svezhii_demon(self, live, ancestor=True, changed=("suggest.py",)):
+        """Тик РОДИВШЕГОСЯ ЗАНОВО демона (метка None — ровно как после self-update)."""
+        o._last_child_commit, o._child_reconcile_rejected = None, None
+        with mock.patch.object(o, "_is_ancestor", lambda a, b, **k: ancestor):
+            return o.reconcile_children_tick(
+                head_fn=lambda: self._TIP, diff_fn=lambda a, b: list(changed),
+                gate_fn=self.gate_green, restart_fn=self.restart, live_base_fn=lambda: live)
+
+    def test_metka_vyglyadit_pravilnoi_a_deti_starye_pribor_OTKAZYVAET(self):
+        """«Метка = вершина, дети позади» → ворота ОБЯЗАНЫ отказать, а не молчать."""
+        out = self._svezhii_demon((self._OLD, "ok", "userbot жив с 2026-08-18 20:27:55"))
+        self.assertEqual(self.restarts, [])                      # живых детей не тронули
+        self.assertIn("ОСТАНОВЛЕНО", out)                        # ПРИБОР ПОКАЗАЛ ОТКАЗ
+        self.assertEqual(o._last_child_commit, self._OLD)        # метка отведена НАЗАД, к живому факту
+        self.assertEqual(len(self.cards), 1)
+        self.assertIn("suggest.py", self.cards[0])
+
+    def test_deti_na_vershine_metka_GASNET(self):
+        """Обратное: живые дети уже на вершине → отказа нет, карточек нет, метка = вершина."""
+        out = self._svezhii_demon((self._TIP, "ok", "userbot жив с сегодня"), ancestor=False)
+        self.assertEqual((out, self.restarts, self.cards), ("", [], []))
+        self.assertEqual(o._last_child_commit, self._TIP)        # метка погасла — долга нет
+
+    def test_zamok_tolko_nazad_ne_predok_ne_prinimaetsya(self):
+        """Признак умеет ТОЛЬКО раскрывать долг: база НЕ предок вершины → берём вершину."""
+        out = self._svezhii_demon(("ffffffffffff", "ok", "чужой хеш"), ancestor=False)
+        self.assertEqual((out, self.restarts, self.cards), ("", [], []))
+        self.assertEqual(o._last_child_commit, self._TIP)        # чужой хеш метку НЕ занял
+
+    def test_zamok_ne_znayu_ne_znachit_da(self):
+        """git не смог ответить про предка (None) → база не принята, прежний путь."""
+        out = self._svezhii_demon((self._OLD, "ok", "предок не доказан"), ancestor=None)
+        self.assertEqual((out, self.restarts, self.cards), ("", [], []))
+        self.assertEqual(o._last_child_commit, self._TIP)
+
+    def test_baza_ne_dokazana_prezhnee_povedenie_bait_v_bait(self):
+        """CIM/git не ответили → забор на месте: метка = вершина, рестартов ноль, карточек ноль."""
+        out = self._svezhii_demon((None, "unknown", "CIM не ответил"), ancestor=None)
+        self.assertEqual((out, self.restarts, self.cards), ("", [], []))
+        self.assertEqual(o._last_child_commit, self._TIP)
+
+    def test_zhivyh_detei_net_metka_beret_vershinu(self):
+        """Честная пустота (детей нет вовсе) — стале-коду взяться неоткуда, прежний путь."""
+        out = self._svezhii_demon((None, "none", "живых детей нет"))
+        self.assertEqual((out, self.restarts, self.cards), ("", [], []))
+        self.assertEqual(o._last_child_commit, self._TIP)
 
     def test_ruchnoi_rychag_vladelca_vorota_ne_trogayut(self):
         """«рестартни userbot» — решение человека, ворота туда не лезут (как и запрет грязного дерева)."""
