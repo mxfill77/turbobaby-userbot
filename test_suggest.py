@@ -4373,6 +4373,184 @@ class TestPriceSheetAvailability(unittest.TestCase):
         self.assertEqual(self._by_model(rows)["NMAX 155"]["cells"]["day"]["total"], 390)  # как до 20.08
 
 
+class TestPriceSheetRuleSource(unittest.TestCase):
+    """ОДИН ИСТОЧНИК ЦЕНЫ НА ОБА ПУТИ (21.08.2026). До этой правки точечная котировка считалась
+    ЗАПИСАННЫМ ПРАВИЛОМ, а сетка парка — живым листом: в одном сообщении клиенту спрошенная модель
+    звучала по сезону, а список альтернатив — по слепому к сезону листу (замер `ab16dcd`, случаи
+    4 и 7, docs/artifacts/2026-08-21-exam-rerun.md).
+
+    Три ОТРИЦАТЕЛЬНЫХ теста, каждый обязан устоять сам по себе:
+      (а) одна модель поштучно и она же в списке — цена ОДНА И ТА ЖЕ до бата;
+      (б) список на январе и на сентябре — цены РАЗНЫЕ, январские ВЫШЕ;
+      (в) сторож погасил — список цен не выдаётся ВОВСЕ (не половина списка).
+
+    Мок моста повторяет ЖИВОЙ формат `quote_price` (те же поля, что у фикстур сетки выше) и НАРОЧНО
+    отдаёт слепые к сезону числа: если бы правка не сработала, они бы и оказались в сетке."""
+
+    # Живой лист: одно число на любую дату (он к сезону слеп по построению) — ровно то, что
+    # экзамен 20.08 и 21.08 видел в сетке. Числа сделаны НЕ равными правилу, чтобы подмена
+    # источника была видна глазом: NMAX по правилу 298x0.97=289 за сутки, а лист говорит 390.
+    TAR = {                          # модель → (сутки, неделя, месяц, депозит, cap_active, cap)
+        "NMAX 155": (390, 2730, 9000, 5000, True, 8500),
+        "ADV 350": (749, 4928, 14606, 7000, True, 10900),
+        "CB 300R": (757, 4716, 12491, 15000, True, 9900),
+        "FORZA 300": (487, 3408, 12000, 5000, True, 9900),   # правило её НЕ СУДИТ (judged=false)
+    }
+    FLEET_NAMES = ["NMAX 155CC BLACK PHUKET 4255", "ADV 350CC BLACK PHUKET 5849",
+                   "CB 300CC R 9011", "FORZA 300CC WHITE PHUKET 7788"]
+
+    OK_GATE = staticmethod(lambda: (True, None))
+    NO_GATE = staticmethod(lambda: (False, "ЦЕНА НЕ НАЗВАНА: правило устарело, позовите владельца."))
+
+    def setUp(self):
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None, skipped=None)
+
+    def tearDown(self):
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None, skipped=None)
+
+    def _getter(self):
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET_NAMES]}}
+            bike = params.get("bike", "")
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            bk = suggest._bike_key(bike)
+            key = next((k for k in self.TAR if suggest._bike_key(k) in bk), None)
+            if key is None:
+                return {"ok": False}
+            d1, d7, d30, dep, ca, cp = self.TAR[key]
+            total = {1: d1, 7: d7, 30: d30}.get(days, d7)
+            return {"ok": True, "data": {"day_price": round(total / max(days, 1)), "total": total,
+                    "deposit": dep, "available": True, "days": days, "bike": bike,
+                    "season": "низкий сезон", "cap_active": ca, "cap_price": cp,
+                    "text": f"{bike} {days}d {total}"}}
+        return fake
+
+    def _rows(self, ds, gate=None):
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None, skipped=None)
+        return suggest.price_sheet_status(ds, getter=self._getter(),
+                                          _gate=gate or self.OK_GATE)
+
+    @staticmethod
+    def _by_model(rows):
+        return {r["model"]: r for r in rows}
+
+    # ---- (а) ОДНА цена на оба пути ------------------------------------------------------------
+    def test_a_pointwise_and_sheet_agree_to_the_baht(self):
+        """Одна модель, спрошенная поштучно, и она же в списке — цена совпадает ДО БАТА."""
+        ds, de = "2026-09-05", "2026-09-12"          # ровно 7 суток = опорная корзина
+        getter = self._getter()
+        with mock.patch.object(suggest.price_gate, "allow", lambda *a, **k: (True, None)):
+            point = suggest._safe_quote_for_model("NMAX 155", ds, de, getter=getter)
+        self.assertEqual(point["status"], "ok")
+        rows, _sk = self._rows(ds)
+        week = self._by_model(rows)["NMAX 155"]["cells"]["week"]
+        self.assertEqual(week["day_price"], point["quote"]["day_price"])
+        self.assertEqual(week["total"], point["quote"]["total"])
+        # И это НЕ число живого листа: подмена источника действительно состоялась.
+        self.assertNotEqual(week["total"], self.TAR["NMAX 155"][1])
+
+    def test_a_sheet_price_equals_rule_formula(self):
+        """Та же цена, посчитанная ФОРМУЛОЙ правила независимо от кода сетки (NMAX 155, сентябрь)."""
+        rows, _sk = self._rows("2026-09-05")
+        doc = suggest.price_source.load()
+        day, info = suggest.price_source.day_price(
+            doc, "NMAX 155", datetime.date(2026, 9, 5), 7, suggest._bike_key)
+        self.assertEqual(self._by_model(rows)["NMAX 155"]["cells"]["week"]["day_price"], day)
+        self.assertEqual(info["season"], 1.0)        # P1 — дно сезона, множитель ровно 1.000
+
+    # ---- (б) сезон ДОЕХАЛ до списка -----------------------------------------------------------
+    def test_b_january_sheet_is_dearer_than_september(self):
+        """Список на январе и на сентябре — цены РАЗНЫЕ, январские ВЫШЕ (P5 пик против P1 дна)."""
+        sep = self._by_model(self._rows("2026-09-05")[0])
+        jan = self._by_model(self._rows("2027-01-10")[0])
+        self.assertTrue(sep and jan)
+        for model in ("NMAX 155", "ADV 350", "CB 300R"):
+            for key in ("day", "week", "month"):
+                s, j = sep[model]["cells"][key], jan[model]["cells"][key]
+                self.assertIsNotNone(s, (model, key))
+                self.assertIsNotNone(j, (model, key))
+                self.assertGreater(j["total"], s["total"], f"{model}/{key}: январь обязан быть выше")
+
+    def test_b_old_source_gave_one_price_for_both_dates(self):
+        """КОНТРФАКТ: без правки (ручка отката) обе даты дают ОДНО число — тот самый дефект."""
+        with mock.patch.object(suggest, "_SHEET_RULE_OFF", True):
+            sep = self._by_model(self._rows("2026-09-05")[0])
+            jan = self._by_model(self._rows("2027-01-10")[0])
+        self.assertEqual(sep["NMAX 155"]["cells"]["week"]["total"],
+                         jan["NMAX 155"]["cells"]["week"]["total"])
+        self.assertEqual(sep["NMAX 155"]["cells"]["week"]["total"], self.TAR["NMAX 155"][1])
+
+    def test_b_season_note_does_not_claim_low_season_at_peak(self):
+        """Служебная пометка модератору не смеет утверждать низкий сезон рядом с пиковой ценой."""
+        self.assertIsNone(suggest._sheet_season_note(self._rows("2027-01-10")[0]))
+        self.assertIsNotNone(suggest._sheet_season_note(self._rows("2026-09-05")[0]))
+
+    # ---- (в) сторож погасил — молчит ВЕСЬ список ------------------------------------------------
+    def test_c_stale_rule_silences_the_whole_list(self):
+        """Сторож погасил → ни одной цены и ни одной модели: не половина списка, а весь целиком."""
+        rows, skipped = self._rows("2026-09-05", gate=self.NO_GATE)
+        self.assertEqual(rows, [])
+        self.assertEqual(skipped, [])
+        note = suggest.build_price_sheet_note(
+            {"price_sheet_q": True, "iso_start": "2026-09-05"}, lang="ru",
+            getter=self._getter(), today=datetime.date(2026, 8, 21), _gate=self.NO_GATE)
+        self.assertEqual(note, suggest._PRICE_SHEET_UNAVAILABLE)
+        # Тот же вход при РАЗРЕШИВШЕМ стороже прайс отдаёт — значит молчание пришло от сторожа,
+        # а не от сломанной фикстуры (мок, переставший задевать ветку, хуже отсутствующего).
+        ok_note = suggest.build_price_sheet_note(
+            {"price_sheet_q": True, "iso_start": "2026-09-05"}, lang="ru",
+            getter=self._getter(), today=datetime.date(2026, 8, 21), _gate=self.OK_GATE)
+        self.assertNotEqual(ok_note, suggest._PRICE_SHEET_UNAVAILABLE)
+        self.assertIn("289", ok_note)                # цена правила (298 x 0.97, корзина 1-3) есть
+
+    def test_c_broken_gate_is_not_permission(self):
+        """Сторож БРОСИЛ — это тоже молчание, а не разрешение назвать цену."""
+        def boom():
+            raise RuntimeError("дверь не поднялась")
+        rows, _sk = self._rows("2026-09-05", gate=boom)
+        self.assertEqual(rows, [])
+
+    def test_c_refusal_is_not_served_from_sheet_cache(self):
+        """Отказ сторожа НЕ обслуживается вчерашними числами из кэша сетки."""
+        suggest._sheet_cache.update(key="2026-09-05", ts=time.time(),
+                                    rows=[{"model": "NMAX 155", "cells": {}}], skipped=[])
+        rows, _sk = suggest.price_sheet_status("2026-09-05", _gate=self.NO_GATE)
+        self.assertEqual(rows, [])
+
+    # ---- модель, которую правило не судит ------------------------------------------------------
+    def test_unjudged_model_leaves_the_sheet_entirely(self):
+        """FORZA 300 правилом НЕ СУДИТСЯ → её нет в сетке вовсе, а причина названа словом."""
+        rows, skipped = self._rows("2026-09-05")
+        self.assertNotIn("FORZA 300", [r["model"] for r in rows])
+        self.assertIn({"model": "FORZA 300", "reason": suggest._SHEET_NORULE}, skipped)
+        # Прочие модели при этом на месте: одна несудимая не гасит список.
+        self.assertEqual(sorted(r["model"] for r in rows), ["ADV 350", "CB 300R", "NMAX 155"])
+
+    def test_deposit_and_availability_stay_the_word_of_the_live_door(self):
+        """Депозит и занятость правило не подменяет — они остаются словом живой двери."""
+        rows, _sk = self._rows("2026-09-05")
+        self.assertEqual(self._by_model(rows)["NMAX 155"]["deposit"], 5000)
+        self.assertEqual(self._by_model(rows)["CB 300R"]["deposit"], 15000)
+
+    def test_injected_door_without_gate_keeps_the_old_path(self):
+        """Инъекция двери БЕЗ _gate — путь прежний (иначе три десятка голденов сетки поехали бы)."""
+        rows, _sk = suggest.price_sheet_status("2026-09-05", getter=self._getter())
+        self.assertEqual(self._by_model(rows)["NMAX 155"]["cells"]["week"]["total"],
+                         self.TAR["NMAX 155"][1])
+
+
 class TestSheetAwarePricePolicy(unittest.TestCase):
     """Класс-голден второй ноги живого регресса 20:59 (черновик #275): сетка ДОШЛА до промпта, но
     ценовая политика («Дат нет — сперва спроси даты», цена только из блока «ЦЕНА из Календаря»)
