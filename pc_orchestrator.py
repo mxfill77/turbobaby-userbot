@@ -5756,7 +5756,8 @@ def _commit_subject(commit):
 
 
 def _client_block(kinds, commit, paths, where, subject=None, notifier=None, cowork=None,
-                  state=None, reason_fn=None, client_fn=None, subject_fn=None, trainer_fn=None):
+                  state=None, reason_fn=None, client_fn=None, subject_fn=None, trainer_fn=None,
+                  route_fn=None):
     """ВОРОТА клиентского контура. → список клиентских файлов (применять НЕЛЬЗЯ) | [] (можно).
 
     Отказ — не молчание: лог + строка в журнал + карточка владельцу с коммитом, поимённым списком
@@ -5795,9 +5796,20 @@ def _client_block(kinds, commit, paths, where, subject=None, notifier=None, cowo
         st[kk] = key
         log.error("ворота контура (%s): применение %s к «%s» ОСТАНОВЛЕНО — клиентские файлы: %s",
                   where, commit, kk, ", ".join(held))
+        # АДРЕС отказа (21.08.2026): карточка владельцу или строка в ленту. Ворота этим решением НЕ
+        # тронуты — они уже отказали выше и вернут `held` в обоих исходах; заморозка глушит ВОПРОС
+        # («можно выкатить?»), которого под заморозкой всё равно никто не задаёт, и только его
+        # ПОВТОР той же формы. Отказ формы, которой в эту заморозку не было, остаётся карточкой.
+        route, why = (route_fn or client_contour.gate_route)(kinds or ["боты"], held)
+        muted = route == client_contour.ROUTE_FEED
         (cowork or _cowork)(
             "ворота клиентского контура: применение %s к %s ОСТАНОВЛЕНО (%s) — клиентские файлы: "
-            "%s; жду «да» владельца или зелёный тренажёр" % (commit, kk, where, ", ".join(held)))
+            "%s; жду «да» владельца или зелёный тренажёр%s"
+            % (commit, kk, where, ", ".join(held),
+               ("; карточка владельцу НЕ отправлена — " + why) if muted else ""))
+        if muted:
+            log.info("ворота контура (%s): карточка владельцу НЕ отправлена — %s", where, why)
+            return held
         (notifier or _notify)(client_contour.card_text(
             kinds or ["боты"], commit, held,
             subject=subject if subject is not None else (subject_fn or _commit_subject)(commit),
@@ -5810,6 +5822,28 @@ def _client_block(kinds, commit, paths, where, subject=None, notifier=None, cowo
             trainer_available=client_contour.trainer_enabled(),
             trainer_note=(trainer_fn or client_contour.trainer_status)(commit)))
     return held
+
+
+def _notify_deploy_happened(kind, commit, pids, where, notifier=None, frozen_fn=None):
+    """ПОД ЗАМОРОЗКОЙ факт СОСТОЯВШЕЙСЯ выкатки — ГРОМКИЙ, мимо ленты. → True = сказали.
+
+    Заморозка глушит ВОПРОС («можно выкатить?»), но не имеет права глушить НОВОСТЬ («выкатили»):
+    под заморозкой владелец не ждёт ни одной выкатки на живых ботов, поэтому состоявшаяся — ровно
+    то единственное, о чём он обязан узнать пушем, а не чтением ленты. Ворота этим не тронуты:
+    сюда доходят ТОЛЬКО применения, которым основание («да» владельца / зелёный тренажёр) уже
+    открыло дорогу, — заморозка ворот не открывает ни одной веткой.
+
+    Заморозки нет → молчим, как молчали: прежнее поведение байт-в-байт (об этом применении владелец
+    и раньше узнавал из карточки задачи и ленты). Честный остаток: без заморозки состоявшаяся
+    выкатка по-прежнему только в ленте — это не наша тишина, а прежняя."""
+    if not (frozen_fn or client_contour.frozen)():
+        return False
+    (notifier or _notify)(
+        "🚀 Оркестратор: ВЫКАТКА СОСТОЯЛАСЬ при ЗАМОРОЖЕННОМ контуре — %s поднят на %s (PID %s; %s). "
+        "Ворота открыло ОСНОВАНИЕ («да» владельца или зелёный тренажёр), а не заморозка: она глушит "
+        "только ПОВТОР отказа и выкатку не разрешает ничем."
+        % (kind, commit, ", ".join(sorted(client_contour._names(pids))) or "?", where))
+    return True
 
 
 def _affected_test_modules(paths):
@@ -5944,6 +5978,7 @@ def maybe_update_bots(tid, text, head_before, changed_fn=None, gate_fn=None,
         if rok and pids:
             _stamp_apply_restart(kind)          # реестр анти-флапа: реконсиляция self-update не дёрнет повторно
             log.info("авто-обновление %s: обновлён до %s, PID %s", kind, commit, pids)
+            _notify_deploy_happened(kind, commit, pids, "авто-обновление после задачи")
             notes.append(f"{label} обновлён до {commit}, PID {', '.join(map(str, pids))}")
         elif rok:                               # рестарт не требовался (напр. модербот без токена)
             log.info("авто-обновление %s: %s", kind, detail)
@@ -6052,6 +6087,7 @@ def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_f
         _stamp_apply_restart(kind, now, state)
         if ok and pids:
             log.info("self-update дети: %s рестартнут до %s, PID %s", kind, new_commit, pids)
+            _notify_deploy_happened(kind, new_commit, pids, "реконсиляция детей после self-update")
             _cowork(f"авто-применил {new_commit}: рестарт {kind} (PID {', '.join(map(str, pids))})")
             notes.append(f"{label} рестартнут (PID {', '.join(map(str, pids))})")
         elif ok:                                    # рестарт не требовался (напр. модербот без токена)
@@ -6326,6 +6362,7 @@ def reconcile_children_tick(head_fn=None, diff_fn=None, gate_fn=None, restart_fn
         _stamp_apply_restart(kind, now, state)
         if rok and pids:
             log.info("реконсиляция детей: %s рестартнут до %s, PID %s", kind, short, pids)
+            _notify_deploy_happened(kind, short, pids, "реконсиляция детей на новый коммит")
             _cowork(f"авто-применил {short}: рестарт {kind} (PID {', '.join(map(str, pids))})")
             notes.append(f"{label} рестартнут (PID {', '.join(map(str, pids))})")
         elif rok:                                          # рестарт не требовался (напр. модербот без токена)

@@ -9602,6 +9602,142 @@ class TestClientContourGate(Base):
         self.assertEqual(self.cards, [])
 
 
+class TestZamorozkaKontura(TestClientContourGate):
+    """ЗАМОРОЗКА КОНТУРА (21.08.2026): пока клиентский контур заморожен, ПОВТОР отказа ворот уходит
+    В ЛЕНТУ, а не карточкой владельцу. Ворота при этом держат ровно как держали.
+
+    Живой факт: за 21.08 владелец получил 14 карточек ворот (замер по pc_orchestrator.log), все 14 —
+    про одну форму «userbot,moderbot | price_gate.py, price_source.py, suggest.py», и все 14
+    коммитов трогали ТОЛЬКО docs/. Здесь — три ОТРИЦАТЕЛЬНЫХ теста задания на боевых функциях:
+      (а) обычная (повторная) остановка при заморозке — карточки НЕТ, запись в ленте ЕСТЬ;
+      (б) выкатка ВСЁ-ТАКИ произошла — сообщение владельцу ЕСТЬ;
+      (в) ручка выключена — карточки приходят как прежде.
+    Плюс замки: ворота под заморозкой НЕ пускают, отказ НОВОЙ формы остаётся громким, провал
+    самообновления демона по гейту остаётся громким."""
+
+    def setUp(self):
+        super().setUp()
+        d = tempfile.mkdtemp(prefix="frz_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        # Боевые пути ручки и реестра форм уводим во временный каталог: тест не смеет ни включить
+        # заморозку живому демону, ни записать ему реестр (правило «тесты не сорят в боевое»).
+        self.flag = os.path.join(d, "pc_orchestrator.contour_frozen")
+        for attr, val in (("FREEZE_FLAG", self.flag),
+                          ("GATE_SEEN_FILE", os.path.join(d, "gate_seen.json"))):
+            save = getattr(o.client_contour, attr)
+            setattr(o.client_contour, attr, val)
+            self.addCleanup(lambda a=attr, v=save: setattr(o.client_contour, a, v))
+
+    def _freeze(self):
+        with open(self.flag, "w", encoding="utf-8") as f:
+            f.write("контур заморожен (тест)\n")
+
+    def _upd_c(self, commit, changed):
+        """Дев-задача с ЯВНЫМ коммитом: 14 живых отказов различались ровно коммитом, и повтор
+        обязан различаться им же, иначе сработал бы прежний in-memory дедуп, а не заморозка."""
+        return o.maybe_update_bots(5, "тз: правка", "old", changed_fn=lambda hb: changed,
+                                   gate_fn=lambda mods: (True, "ok"), restart_fn=self._restart,
+                                   head_fn=lambda: commit)
+
+    # ── (а) обычная остановка при заморозке: карточки НЕТ, лента ЕСТЬ ──
+    def test_a_obychnaya_ostanovka_pod_zamorozkoi_bez_kartochki(self):
+        self._freeze()
+        self._upd_c("3b85c06", ["suggest.py"])          # первый отказ формы — ещё громкий
+        self.assertEqual(len(self.cards), 1, self.cards)
+        cards_after_first, cows_after_first = len(self.cards), len(self.cows)
+        note = self._upd_c("ce464ee", ["suggest.py"])   # ОБЫЧНАЯ остановка: та же форма, новый коммит
+        self.assertEqual(len(self.cards), cards_after_first, "карточки быть НЕ должно")
+        self.assertGreater(len(self.cows), cows_after_first, "запись в ленте быть ОБЯЗАНА")
+        feed = self.cows[-1]
+        self.assertIn("ОСТАНОВЛЕНО", feed)
+        self.assertIn("ce464ee", feed)
+        self.assertIn("suggest.py", feed)
+        self.assertIn("карточка владельцу НЕ отправлена", feed)
+        self.assertIn("ОСТАНОВЛЕНО воротами клиентского контура", note)
+        self.assertEqual(self.restarts, [], "ворота держат: ни одного рестарта живого бота")
+
+    def test_a2_vorota_pod_zamorozkoi_vse_ravno_derzhat(self):
+        """Замок задания: заморозка глушит ВОПРОС, а не ворота. Держим и молча."""
+        self._freeze()
+        for c in ("3b85c06", "ce464ee", "c8b0d09", "e081ba4"):
+            self._upd_c(c, ["suggest.py"])
+        self.assertEqual(self.restarts, [])
+        self.assertEqual(len(self.cards), 1, "громким остаётся первый отказ формы, остальные — лента")
+
+    def test_a3_otkaz_novoi_formy_ostaetsya_gromkim(self):
+        """«Отказ по причине, которой раньше не было» задание велело сохранить громким."""
+        self._freeze()
+        self._upd_c("3b85c06", ["suggest.py"])
+        self._upd_c("ce464ee", ["suggest.py"])                     # повтор → тихо
+        self.assertEqual(len(self.cards), 1)
+        self._upd_c("c8b0d09", ["suggest.py", "pricing.py"])       # состав ИНОЙ → снова карточка
+        self.assertEqual(len(self.cards), 2, self.cards)
+        self.assertIn("pricing.py", self.cards[-1])
+
+    # ── (б) выкатка ВСЁ-ТАКИ произошла: сообщение владельцу ЕСТЬ ──
+    def test_b_sostoyavshayasya_vykatka_gromkaya(self):
+        self._freeze()
+        o.client_contour.release_reason = lambda *a, **k: "owner"   # основание есть → ворота открыты
+        note = self._upd_c("4528917", ["suggest.py"])
+        self.assertEqual(sorted(self.restarts), ["moderbot", "userbot"])
+        self.assertIn("обновлён до 4528917", note)
+        self.assertTrue(self.cards, "о СОСТОЯВШЕЙСЯ выкатке владелец обязан узнать пушем")
+        self.assertTrue(all("ВЫКАТКА СОСТОЯЛАСЬ" in c for c in self.cards), self.cards)
+        self.assertIn("4528917", self.cards[0])
+
+    def test_b2_vykatka_rekonsilyaciei_tozhe_gromkaya(self):
+        """Вторая живая дорога применения — реконсиляция детей на новый коммит."""
+        self._freeze()
+        o.client_contour.release_reason = lambda *a, **k: "owner"
+        save = (o._last_child_commit, o._child_reconcile_rejected)
+        self.addCleanup(lambda: setattr(o, "_child_reconcile_rejected", save[1]))
+        self.addCleanup(lambda: setattr(o, "_last_child_commit", save[0]))
+        o._last_child_commit, o._child_reconcile_rejected = "a" * 12, None
+        o.reconcile_children_tick(head_fn=lambda: "4528917456", diff_fn=lambda a, b: ["suggest.py"],
+                                  gate_fn=lambda m: (True, "ok"), restart_fn=self._restart)
+        self.assertTrue(self.restarts)
+        self.assertTrue(any("ВЫКАТКА СОСТОЯЛАСЬ" in c for c in self.cards), self.cards)
+
+    # ── (в) ручка выключена: карточки приходят как прежде ──
+    def test_v_bez_ruchki_kartochki_kak_prezhde(self):
+        for c in ("3b85c06", "ce464ee", "c8b0d09", "e081ba4"):
+            self._upd_c(c, ["suggest.py"])
+        self.assertEqual(len(self.cards), 4, self.cards)
+        self.assertTrue(all("авто-выкатка на КЛИЕНТСКИЙ контур ОСТАНОВЛЕНА" in c for c in self.cards))
+        self.assertEqual(self.restarts, [])
+        self.assertFalse(any("карточка владельцу НЕ отправлена" in s for s in self.cows))
+
+    def test_v2_bez_ruchki_sostoyavshayasya_vykatka_molchit_kak_ranshe(self):
+        """Прежнее поведение байт-в-байт: без заморозки применение карточек не рождает."""
+        o.client_contour.release_reason = lambda *a, **k: "owner"
+        self._upd_c("4528917", ["suggest.py"])
+        self.assertEqual(sorted(self.restarts), ["moderbot", "userbot"])
+        self.assertEqual(self.cards, [])
+
+    # ── замок: провал самообновления демона по гейту остаётся ГРОМКИМ ──
+    def test_proval_selfupdate_po_geitu_gromkii_i_pod_zamorozkoi(self):
+        self._freeze()
+        save = (o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB, o._selfupdate_restart_children)
+        self.addCleanup(lambda: setattr(o, "_selfupdate_restart_children", save[3]))
+        self.addCleanup(lambda: setattr(o, "_SU_REJECTED_BLOB", save[2]))
+        self.addCleanup(lambda: setattr(o, "RUNNING_COMMIT", save[1]))
+        self.addCleanup(lambda: setattr(o, "RUNNING_BLOB", save[0]))
+        o.RUNNING_BLOB, o.RUNNING_COMMIT, o._SU_REJECTED_BLOB = "blob-old", "aaa1111", None
+        o._selfupdate_restart_children = lambda *a, **k: ""
+        self.assertFalse(o.maybe_self_update(
+            blob_fn=lambda: "blob-new", head_fn=lambda: "bbb2222",
+            code_gate=lambda: (False, "битый импорт"), spawner=lambda: True,
+            dirty_fn=lambda *a, **k: [], deps_fn=lambda: []))
+        self.assertTrue(any("провалил гейт кода" in c for c in self.cards), self.cards)
+        o._SU_REJECTED_BLOB = None
+        self.cards[:] = []
+        self.assertFalse(o.maybe_self_update(
+            blob_fn=lambda: "blob-new", head_fn=lambda: "bbb2222",
+            code_gate=lambda: (True, "ok"), tests_gate=lambda: (False, "красные"),
+            spawner=lambda: True, dirty_fn=lambda *a, **k: [], deps_fn=lambda: []))
+        self.assertTrue(any("провалил unittest-гейт" in c for c in self.cards), self.cards)
+
+
 class SudimPoFaktuANePoRaspiske(unittest.TestCase):
     """claim/complete при отказе ПЕРЕЧИТЫВАЮТ статус задачи (02.08.2026).
 
