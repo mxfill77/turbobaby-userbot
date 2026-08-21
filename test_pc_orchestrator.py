@@ -139,6 +139,9 @@ class Base(unittest.TestCase):
         self._save_vd = o.REVIZOR_VERDICT_FILE    # реестр вердиктов по находкам: свой файл на тест
         o.REVIZOR_VERDICT_FILE = os.path.join(tempfile.mkdtemp(), "revizor_verdicts.json")  # (боевой не трогаем)
         self.addCleanup(lambda: setattr(o, "REVIZOR_VERDICT_FILE", self._save_vd))
+        self._save_cd = o.REVIZOR_CARDS_FILE      # расписка «карточка → ключи находок»: свой файл на тест
+        o.REVIZOR_CARDS_FILE = os.path.join(tempfile.mkdtemp(), "revizor_cards.json")  # (боевую не трогаем)
+        self.addCleanup(lambda: setattr(o, "REVIZOR_CARDS_FILE", self._save_cd))
         # СЛЕДЫ РАБОТЫ (класс 30.07 «статус врёт»): по умолчанию следов НЕТ и отметки claim пишем
         # во временный файл. Иначе сбор улик пошёл бы в ЖИВОЙ git репозитория — окна тестов строятся
         # от «сейчас», и вердикт зависел бы от того, коммитил ли кто-то в последний час (тот же
@@ -7399,6 +7402,215 @@ class TestRevizorVerdictRoute(Base):
         self.assertTrue(any(n == "ревизор: 1 окон, чисто" for n in self.notes))
 
 
+# ---- ОТКАЗ ВЛАДЕЛЬЦА СТАНОВИТСЯ ВЕРДИКТОМ САМ (21.08.2026) ----
+# ОСНОВАНИЕ (замер, не ощущение): за 11 суток жизни реестра глушение не сработало НИ РАЗУ — 6
+# записей, hits=0 у всех, файл не менялся с 10.08 00:32, а «нет» владельца по карточке 58 (20.08) не
+# помешало той же находке приехать карточкой 4 (21.08). Замок был построен и заряжался только рукой.
+# Голдены ниже стерегут ОБА направления: отказ гасит ровно то, что было в карточке, и НЕ гасит
+# ничего сверх этого — ни другую находку, ни ту же с изменившимся существом.
+_REJ_TXT = o._REJECT_PREFIX + " (ответ с ПК: Filipp/console): это ступени прайса, не противоречие"
+
+
+class TestRevizorCardReceipt(unittest.TestCase):
+    """Расписка «карточка → ключи находок»: что она запоминает и чего не обещает."""
+
+    def setUp(self):
+        self.p = os.path.join(tempfile.mkdtemp(), "revizor_cards.json")   # боевую расписку не трогаем
+
+    def test_receipt_keeps_key_and_gist_of_delivered_finding(self):
+        n = o._revizor_card_keys_add(58, [_dep_f()], now=_REV_NOW, path=self.p)
+        rec = o._revizor_cards_read(self.p)["58"]
+        self.assertEqual(n, 1)
+        self.assertEqual(rec["keys"], [{"key": o._revizor_verdict_key(_dep_f()),
+                                        "gist": o._revizor_finding_gist(_dep_f())}])
+
+    def test_receipt_gist_matches_the_filter_byte_for_byte(self):
+        """Существо в расписке обязано совпасть с тем, что посчитает фильтр на следующем прогоне:
+        разойдутся — вердикт ляжет мимо и «нет» владельца пропадёт молча."""
+        o._revizor_card_keys_add(58, [_dep_f()], now=_REV_NOW, path=self.p)
+        k = o._revizor_cards_read(self.p)["58"]["keys"][0]
+        reg = {k["key"]: {"verdict": o.REVIZOR_VERDICT_FALSE, "gist": k["gist"]}}
+        self.assertEqual(o._revizor_verdict_of(_dep_f(), reg)[1], True)
+
+    def test_finding_without_evidence_is_not_promised(self):
+        # Строки без улики в текст карточки не идут (_revizor_owner_card_text) — значит и расписка
+        # не смеет обещать её погасить: владелец её не видел.
+        n = o._revizor_card_keys_add(58, [_dep_f(evidence="")], now=_REV_NOW, path=self.p)
+        self.assertEqual((n, o._revizor_cards_read(self.p)), (0, {}))
+
+    def test_receipt_accumulates_across_runs(self):
+        # Карточка ОДНА и живёт до ответа, прогоны дописывают в неё строки → «нет» отвечает и за
+        # находки прошлых прогонов. Повтор той же строки расписку не растит.
+        o._revizor_card_keys_add(58, [_dep_f()], now=_REV_NOW, path=self.p)
+        o._revizor_card_keys_add(58, [_dep_f()], now=_REV_NOW + 60, path=self.p)
+        n = o._revizor_card_keys_add(58, [_dep_f(cid=999)], now=_REV_NOW + 120, path=self.p)
+        self.assertEqual(n, 2)
+
+    def test_broken_receipt_reads_empty_fail_open(self):
+        with open(self.p, "w", encoding="utf-8") as f:
+            f.write("{это не json")
+        self.assertEqual(o._revizor_cards_read(self.p), {})
+
+    def test_reject_words_strip_machine_marker(self):
+        self.assertEqual(o._revizor_reject_words(_REJ_TXT),
+                         "(ответ с ПК: Filipp/console): это ступени прайса, не противоречие")
+        self.assertEqual(o._revizor_reject_words(o._REJECT_PREFIX), "пояснения не оставлено")
+
+
+class TestRevizorRejectBecomesVerdict(unittest.TestCase):
+    """Жатва ответов: «нет» → вердикт «ложная»; всё остальное — не решение владельца."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.cp = os.path.join(d, "revizor_cards.json")      # боевые файлы не трогаем
+        self.vp = os.path.join(d, "revizor_verdicts.json")
+        o._revizor_card_keys_add(58, [_dep_f()], now=_REV_NOW, path=self.cp)
+
+    def _harvest(self, row, now=_REV_NOW + 3600):
+        return o._revizor_harvest_card_answers([row] if row else [], now=now,
+                                               path=self.cp, reg_path=self.vp)
+
+    def _row(self, status="failed", result=_REJ_TXT, tid=58):
+        return {"id": tid, "status": status, "result": result}
+
+    def test_reject_writes_false_verdict_with_source_key_and_date(self):
+        out = self._harvest(self._row())
+        self.assertEqual((out["rejected"], out["verdicts"]), (1, 1))
+        rec = o._revizor_verdicts_read(self.vp)["#92|1126977519|депозит без противоречий"]
+        self.assertEqual(rec["verdict"], "ложная")
+        self.assertEqual(rec["gist"], o._revizor_finding_gist(_dep_f()))      # ключ находки
+        self.assertEqual(rec["source"], o.REVIZOR_SRC_OWNER)                  # источник
+        self.assertIn("карточке #58", rec["why"])
+        self.assertIn("не противоречие", rec["why"])                          # слова владельца сохранены
+        self.assertTrue(rec["at"].startswith("2025-07-13"))                   # дата решения
+        self.assertEqual(o._revizor_cards_read(self.cp), {})                  # расписка погашена
+
+    def test_one_button_answers_for_every_line_of_the_card(self):
+        """Честная граница, а не умолчание: карточка сводная, кнопка одна — «нет» гасит ВСЕ её
+        строки. Разделить ответ по строкам сегодня нечем, и голден это фиксирует вслух."""
+        o._revizor_card_keys_add(58, [_dep_f(cid=8725114073)], now=_REV_NOW, path=self.cp)
+        out = self._harvest(self._row())
+        self.assertEqual(out["verdicts"], 2)
+        self.assertEqual(len(o._revizor_verdicts_read(self.vp)), 2)
+
+    def test_approved_card_writes_no_verdict(self):
+        # «Да» — это НЕ «находка ложная». Расписку снимаем, реестр не трогаем.
+        out = self._harvest(self._row(status="approved", result=""))
+        self.assertEqual((out["closed"], out["verdicts"]), (1, 0))
+        self.assertEqual(o._revizor_verdicts_read(self.vp), {})
+        self.assertEqual(o._revizor_cards_read(self.cp), {})
+
+    def test_approval_timeout_is_not_a_rejection(self):
+        # Истёкший TTL значит «владелец не решал НИЧЕГО» — молчать за него мы не смеем.
+        out = self._harvest(self._row(result=o.card_terminal_log.TIMEOUT_MARK + " — карточка закрыта"))
+        self.assertEqual((out["closed"], out["verdicts"]), (1, 0))
+        self.assertEqual(o._revizor_verdicts_read(self.vp), {})
+
+    def test_missing_row_keeps_receipt_open(self):
+        # ТРЕТИЙ ИСХОД: ряда в снимке нет (мост промолчал / карточка ещё висит) → эпизод открыт.
+        out = self._harvest(None)
+        self.assertEqual((out["open"], out["verdicts"]), (1, 0))
+        self.assertEqual(list(o._revizor_cards_read(self.cp)), ["58"])
+
+    def test_card_still_awaiting_keeps_receipt_open(self):
+        out = self._harvest(self._row(status="needs_approval", result="🔍 Ревизор: находки"))
+        self.assertEqual((out["open"], out["verdicts"]), (1, 0))
+
+    def test_stale_receipt_dropped_by_horizon(self):
+        out = self._harvest(None, now=_REV_NOW + (o.REVIZOR_CARD_DAYS + 1) * 86400)
+        self.assertEqual((out["dropped"], out["open"]), (1, 0))
+        self.assertEqual(o._revizor_cards_read(self.cp), {})
+
+    def test_empty_receipt_touches_nothing(self):
+        self.assertEqual(o._revizor_harvest_card_answers([], path=os.path.join(
+            tempfile.gettempdir(), "нет-расписки-zzz.json"), reg_path=self.vp)["cards"], 0)
+
+
+class TestRevizorRejectEndToEnd(Base):
+    """ОТРИЦАТЕЛЬНЫЙ ТЕСТ сквозь живой маршрут: отказ → повторный прогон → находка не доехала и
+    счёт глушений вырос; находка ДРУГОГО содержания сквозь фильтр по-прежнему проходит."""
+
+    def setUp(self):
+        super().setUp()
+        self._save_c = (o._revizor_consult, o._cowork, o._revizor_postrelease_findings)
+        self.notes = []
+        o._cowork = lambda line: self.notes.append(line)
+        o._revizor_consult = lambda pkg: []
+        o._revizor_postrelease_findings = lambda pkg, **k: []
+        self.addCleanup(lambda: (setattr(o, "_revizor_consult", self._save_c[0]),
+                                 setattr(o, "_cowork", self._save_c[1]),
+                                 setattr(o, "_revizor_postrelease_findings", self._save_c[2])))
+
+    def _postrelease(self, findings):
+        o._revizor_postrelease_findings = lambda pkg, **k: [dict(f) for f in findings]
+
+    def _cards(self):
+        return [t for t in self.fb.tasks.values() if t["status"] == "needs_approval"]
+
+    def _run(self, finding, now=_REV_NOW):
+        self._postrelease([finding])
+        return o._revizor_route([{"client_id": finding["client_id"]}], now=now)
+
+    def _reject(self, tid, text=_REJ_TXT):
+        """Отказ владельца ровно так, как его ставит devbot/answer_card: failed + машинный префикс."""
+        self.fb.complete_task(tid, "failed", text)
+
+    def test_rejected_finding_never_reaches_owner_again(self):
+        out1 = self._run(_dep_f())
+        tid = self._cards()[0]["id"]
+        self.assertEqual(out1["owner"], 1)
+        self._reject(tid)
+
+        out2 = self._run(_dep_f(), now=_REV_NOW + 86400)          # ровно та же находка через сутки
+        self.assertEqual((out2["owner"], out2["muted"]), (0, 1))   # владельцу НЕ доехала
+        self.assertEqual(self._cards(), [])                        # новой карточки нет
+        rec = o._revizor_verdicts_read()["#92|1126977519|депозит без противоречий"]
+        self.assertEqual((rec["verdict"], rec["hits"], rec["source"]),
+                         ("ложная", 1, o.REVIZOR_SRC_OWNER))       # счёт срабатываний вырос
+        self.assertTrue(any("разобраны ранее как ложные" in n for n in self.notes))
+
+    def test_hits_keep_growing_on_every_repeat(self):
+        self._reject(self._run(_dep_f()) and self._cards()[0]["id"])
+        self._run(_dep_f(), now=_REV_NOW + 86400)
+        self._run(_dep_f(), now=_REV_NOW + 172800)
+        self.assertEqual(o._revizor_verdicts_read()["#92|1126977519|депозит без противоречий"]["hits"], 2)
+
+    def test_other_finding_still_passes_the_filter(self):
+        """ГЛУШЕНИЕ НЕ СТАЛО ГЛУШЕНИЕМ ВСЕГО: отказ по одной находке не закрывает дорогу ни находке
+        другого окна, ни тому же ключу с ИЗМЕНИВШИМСЯ существом."""
+        self._reject(self._run(_dep_f()) and self._cards()[0]["id"])
+
+        out_other = self._run(_dep_f(cid=8725114073), now=_REV_NOW + 86400)   # другое окно
+        self.assertEqual((out_other["owner"], out_other["muted"]), (1, 0))
+        self.assertEqual(len(self._cards()), 1)
+        self._reject(self._cards()[0]["id"], text="закрыто")                  # убираем карточку из needs_approval
+
+        out_chg = self._run(_dep_f(_DEP_EV_7), now=_REV_NOW + 172800)         # тот же ключ, седьмая сумма
+        self.assertEqual((out_chg["owner"], out_chg["muted"]), (1, 0))
+        self.assertIn("2000 ฿", self._cards()[0]["what"])
+
+    def test_key_of_the_same_finding_is_stable_across_days(self):
+        # Устойчивость ключа — условие всего провода: в нём нет ни даты, ни времени, ни счётчика.
+        self.assertEqual(o._revizor_verdict_key(_dep_f()), o._revizor_verdict_key(_dep_f()))
+        self.assertNotIn("2025", o._revizor_verdict_key(_dep_f()))
+
+    def test_accepted_card_leaves_finding_open(self):
+        # «Да» вердикта не пишет: находка остаётся неразобранной и в следующий раз доедет снова.
+        tid = self._run(_dep_f()) and self._cards()[0]["id"]
+        self.fb.tasks[tid]["status"] = "approved"
+        out2 = self._run(_dep_f(), now=_REV_NOW + 86400)
+        self.assertEqual((out2["owner"], out2["muted"]), (1, 0))
+        self.assertEqual(o._revizor_verdicts_read(), {})
+
+    def test_clean_run_asks_bridge_for_nothing(self):
+        # Регресс цены: прогон без находок по-прежнему НЕ ходит в очередь (жатва ленива).
+        seen = []
+        self.fb.get_pending = lambda status, lane="pc": (seen.append(status),
+                                                         {"ok": True, "items": []})[1]
+        o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual(seen, [])
+
+
 # ---- ПОРОГ ДОКАЗАННОЙ ПОЛЬЗЫ ПРОВЕРКИ (10.08.2026) ----
 # ОСНОВАНИЕ (замер, не ощущение): чек #92 «депозит без противоречий» за наблюдение 23.07–09.08 дал
 # 45 находок, законных из них НОЛЬ, настоящего противоречия «один клиент, один байк, разные суммы»
@@ -9330,7 +9542,7 @@ class TestRevizorIpcChecks(unittest.TestCase):
         остальными, с тем же снимком очереди (бюджет/дедуп) — своего канала у неё нет."""
         posted = {}
 
-        def fake_post(owner_findings, items):
+        def fake_post(owner_findings, items, now=None):    # подпись живая: с 21.08 доставка берёт now (расписка карточки)
             posted["findings"] = list(owner_findings)
             return True
 

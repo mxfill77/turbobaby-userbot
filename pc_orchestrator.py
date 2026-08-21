@@ -7522,12 +7522,18 @@ def _revizor_verdicts_save(reg, path=None, checks=None):
         return False
 
 
-def revizor_set_verdict(finding, verdict, gist=None, why="", now=None, path=None):
+def revizor_set_verdict(finding, verdict, gist=None, why="", now=None, path=None, source=""):
     """Записать вердикт по находке в реестр. finding — сама находка (ключ и отпечаток существа
     берём из неё) ЛИБО готовый ключ строкой (тогда gist обязателен: без существа вердикт «ложная»
     глушил бы ВСЁ по ключу, включая изменившуюся находку — ровно ту слепоту, от которой замок).
     Счёт глушений (hits) при перезаписи вердикта СОХРАНЯЕМ — он про историю, а не про решение.
-    → (ok, key, msg)."""
+    → (ok, key, msg).
+
+    `source` — ЧЕЙ рукой запись легла (REVIZOR_SRC_HAND / REVIZOR_SRC_OWNER). Поле добавлено
+    21.08.2026 вместе с проводом «отказ → вердикт» и служит ровно одному вопросу: отличить решение,
+    внесённое человеком по разбору, от решения, снятого автоматом с кнопки. Записи БЕЗ поля —
+    ручные, доавтоматные (все шесть живых от 09.08): читатели берут его через .get, старый файл
+    читается штатно."""
     v = _revizor_text(verdict)
     if v not in REVIZOR_VERDICTS:
         return False, "", f"вердикт «{verdict}» не опознан (можно: {', '.join(REVIZOR_VERDICTS)})"
@@ -7547,11 +7553,12 @@ def revizor_set_verdict(finding, verdict, gist=None, why="", now=None, path=None
     stamp = float(now if now is not None else time.time())
     reg[key] = {"verdict": v, "gist": g, "why": _revizor_text(why),
                 "at": datetime.datetime.fromtimestamp(stamp, datetime.timezone.utc).isoformat(),
-                "hits": _revizor_hits(prev), "last_hit": last_hit}
+                "hits": _revizor_hits(prev), "last_hit": last_hit,
+                "source": _revizor_text(source)}
     if not _revizor_verdicts_save(reg, path):
         return False, key, "реестр не записан (см. лог)"
-    log.info("ревизор: вердикт «%s» по ключу %s записан (основание: %s)", v, key,
-             _revizor_text(why) or "не указано")
+    log.info("ревизор: вердикт «%s» по ключу %s записан (источник: %s; основание: %s)", v, key,
+             _revizor_text(source) or "не назван", _revizor_text(why) or "не указано")
     return True, key, f"вердикт «{v}» по ключу {key} записан"
 
 
@@ -7605,6 +7612,235 @@ def _revizor_apply_verdicts(findings, reg=None, now=None, path=None, save=True):
     if touched and save:
         _revizor_verdicts_save(reg, path)
     return kept, muted
+
+
+# ---------- РЕВИЗОР: ОТКАЗ ВЛАДЕЛЬЦА СТАНОВИТСЯ ВЕРДИКТОМ САМ (21.08.2026) ----------
+# КЛАСС: замок выше построен, исправен и читается КАЖДЫМ прогоном — но ЗАРЯЖАТЬ его оставили
+# человеку. Единственная запись в реестр шла из CLI `--revizor-verdict`; ни одна строка кода не
+# превращала «нет» владельца в вердикт. Цена, замер 21.08 (docs/artifacts/2026-08-21-auditor-false-
+# repeat.md): за 11 суток жизни реестра глушение не сработало НИ РАЗУ — 6 записей, у всех hits=0,
+# файл не менялся с 10.08 00:32; находка «нет утверждений о наличии» по окну 1791810538 приехала
+# владельцу ДВАЖДЫ (карточка 58 20.08, карточка 4 21.08), и между ними он ответил на 58 отказом.
+# Отказ уходил в `failed` с префиксом _REJECT_PREFIX и читался тремя потребителями — ревизора среди
+# них не было.
+#
+# РЕШЕНИЕ — ДВА ФАЙЛА, А НЕ ОДИН. Реестру вердиктов нужен КЛЮЧ находки, а карточка несёт только
+# ЦИТАТЫ; разбирать её текст обратно в ключи нечестно (имя чека в строке не стои́т, улика режется по
+# _REVIZOR_EVIDENCE_MAX, а весь текст — ещё и по RESULT_MAX, и обрезанная улика дала бы ДРУГОЙ
+# отпечаток существа, то есть вердикт, который никогда не применится). Поэтому соответствие
+# «карточка tid → ключи+существа» пишется В МОМЕНТ ДОСТАВКИ, тем же составом находок, из которого
+# карточка собрана. Второй файл, а не третий раздел реестра: реестр — ЗНАНИЕ (живёт вечно), карта
+# карточек — РАСПИСКА (живёт до ответа), и мешать их сроки жизни в одном файле нельзя.
+#
+# ЧЕСТНАЯ ГРАНИЦА, КОТОРУЮ НЕ ПРЯЧЕМ: карточка СВОДНАЯ, кнопка у неё ОДНА. «Нет» по карточке — это
+# «нет» ВСЕМ её строкам, и провод ровно так и поступает, а в лог кладёт каждый погашенный ключ
+# поимённо: тишина, которую нельзя перечислить, проверке не поддаётся. Разделить ответ по строкам
+# сегодня нечем — у кнопки нет адреса строки (см. остатки в артефакте).
+#
+# ТРИ ИСХОДА, как у надзора за карточками: ряд карточки в снимке очереди есть и это ОТКАЗ → пишем
+# вердикты; есть, но исход другой (принято / истёк TTL / закрыто) → расписку снимаем МОЛЧА, вердикта
+# нет (approval-TTL отказом не является — владелец ничего не решал); ряда в снимке НЕТ → эпизод
+# остаётся открытым, потому что молчание источника решением не является. Предикат исхода берём
+# готовый и уже проверенный — card_terminal_log.classify (его REJECT_MARK сверен с _REJECT_PREFIX
+# тестом test_card_terminal_log.py:352), чтобы у полосы не завелось второго мнения о том, что такое
+# «владелец сказал нет».
+REVIZOR_CARDS_FILE = _state(os.path.join(REPO, "pc_orchestrator.revizor_cards.json"))  # расписка «карточка → ключи находок»
+REVIZOR_CARD_KEYS_MAX = 60           # ключей под одной карточкой (карточка режется RESULT_MAX задолго до этого)
+REVIZOR_CARDS_MAX = 20               # карточек в расписке; лишние — самые старые — вытесняются
+REVIZOR_CARD_DAYS = 30               # горизонт ожидания ответа (тот же, что у надзора card_terminal_log)
+REVIZOR_SRC_OWNER = "отказ владельца"  # источник вердикта: снят автоматом с ответа по карточке
+REVIZOR_SRC_HAND = "рука (CLI)"        # источник вердикта: внесён человеком через --revizor-verdict
+
+
+def _revizor_reject_words(result):
+    """Что владелец сказал СВЕРХ машинного маркера отказа. Маркер из строки убираем — он контракт,
+    а не новость; пусто → так и говорим (пустое основание вердикта хуже честной строки)."""
+    s = " ".join(_revizor_text(result).split())
+    if s.startswith(_REJECT_PREFIX):
+        s = s[len(_REJECT_PREFIX):].strip(" :·—-")
+    return s[:200] or "пояснения не оставлено"
+
+
+def _revizor_card_rows(rec):
+    """Строки расписки одной карточки → list[dict]. Поля нет / оно не список → ПУСТО, и пустота
+    здесь честная: расписка без строк не обещает погасить ничего. Пишем разбором, а не `or []`, —
+    храповик неразбора считает вторую форму слепой, и по делу: она стирает «поля нет» о «поле пусто»."""
+    if not isinstance(rec, dict):
+        return []
+    rows = rec.get("keys")
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _revizor_card_at(rec, default=0.0):
+    """Время выписки карточки из расписки числом. Поля нет / оно мусор → default, названный
+    вызывающим: у расписки без времени возраст считать не от чего, и врать нулём эпохи нельзя."""
+    if isinstance(rec, dict):
+        try:
+            return float(rec.get("at"))
+        except (TypeError, ValueError):
+            return float(default)
+    return float(default)
+
+
+def _revizor_cards_read(path=None):
+    """Расписка «карточка → ключи находок» с диска → {tid: {at, keys:[{key,gist}]}}.
+    Файла нет / битый → ПУСТО (fail-open в ту же сторону, что реестр: потерянная расписка означает
+    «отказ не превратится в вердикт», то есть находка вернётся владельцем — шум, а не слепота)."""
+    p = REVIZOR_CARDS_FILE if path is None else path
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception as e:
+        log.warning("ревизор: расписка карточек (%s) НЕ прочитана — ответы владельца в вердикты не "
+                    "превратятся, находки вернутся как новые: %s", p, e)
+        return {}
+    c = d.get("cards") if isinstance(d, dict) else None
+    if not isinstance(c, dict):
+        log.warning("ревизор: расписка карточек (%s) не того вида — ответы владельца не читаем", p)
+        return {}
+    out = {}
+    for tid, rec in c.items():
+        if not isinstance(rec, dict):
+            continue
+        keys = [{"key": _revizor_text(k.get("key")), "gist": _revizor_text(k.get("gist"))}
+                for k in _revizor_card_rows(rec) if _revizor_text(k.get("key"))]
+        out[str(tid)] = {"at": rec.get("at"), "keys": keys[:REVIZOR_CARD_KEYS_MAX]}
+    return out
+
+
+def _revizor_cards_save(cards, path=None):
+    """Расписка на диск атомарно (tmp+os.replace), как реестр и спул. → True/False.
+    Держим последние REVIZOR_CARDS_MAX по времени выписки: расписка — не архив, а ожидание ответа."""
+    p = REVIZOR_CARDS_FILE if path is None else path
+    keep = {}
+    if isinstance(cards, dict):
+        pairs = sorted(((str(t), dict(r)) for t, r in cards.items() if isinstance(r, dict)),
+                       key=lambda kv: _revizor_card_at(kv[1]))
+        keep = dict(pairs[-REVIZOR_CARDS_MAX:])
+    try:
+        tmp = str(p) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "cards": keep}, f, ensure_ascii=False, indent=1, sort_keys=True)
+        os.replace(tmp, p)
+        return True
+    except Exception as e:
+        log.warning("ревизор: расписка карточек не записана (%s): %s", p, e)
+        return False
+
+
+def _revizor_card_keys_add(tid, findings, now=None, path=None):
+    """Запомнить, КАКИЕ находки уехали в owner-карточку tid. → сколько ключей под ней всего.
+
+    Зовётся СРАЗУ ПОСЛЕ удавшейся доставки и НАКАПЛИВАЕТ: карточка одна и живёт до ответа, а
+    прогоны дописывают в неё строки — значит «нет» по ней отвечает и за находки прошлых прогонов.
+    Дедуп по паре (ключ, существо): та же строка второй раз расписку не растит.
+
+    Берём ровно те находки, что попали в ТЕКСТ карточки (evidence непустой) — иначе расписка
+    обещала бы погасить строку, которой владелец не видел. Отпечаток существа считаем ТЕМ ЖЕ
+    _revizor_finding_gist, что применит фильтр на следующем прогоне: расписка обязана совпасть с
+    ним побайтово, иначе вердикт ляжет мимо."""
+    keys = []
+    for f in (findings if isinstance(findings, (list, tuple)) else ()):
+        if not _revizor_field(f, "evidence"):
+            continue
+        k = _revizor_verdict_key(f)
+        g = _revizor_finding_gist(f)
+        if k and g:
+            keys.append({"key": k, "gist": g})
+    if not keys:
+        return 0
+    cards = _revizor_cards_read(path)
+    rec = cards.get(str(tid))
+    if not isinstance(rec, dict):
+        rec = {"at": float(now if now is not None else time.time()), "keys": []}
+    rec["keys"] = _revizor_card_rows(rec)
+    seen = {(k.get("key"), k.get("gist")) for k in rec["keys"]}
+    for k in keys:
+        if (k["key"], k["gist"]) not in seen:
+            seen.add((k["key"], k["gist"]))
+            rec["keys"].append(k)
+    rec["keys"] = rec["keys"][:REVIZOR_CARD_KEYS_MAX]
+    cards[str(tid)] = rec
+    _revizor_cards_save(cards, path)
+    return len(rec["keys"])
+
+
+def _revizor_harvest_card_answers(items, now=None, path=None, reg_path=None):
+    """ОТВЕТ ВЛАДЕЛЬЦА по прошлой owner-карточке → вердикты в реестре. → dict-сводка (для теста/лога).
+
+    items — снимок очереди ВСЕХ статусов (_loc_fetch_items). None/пусто снимком не считается: без
+    рядов судить не по чему, и все расписки остаются открытыми. Ничего не выписывает и не мутирует
+    в очереди — только читает ряды и пишет знание в реестр."""
+    cards = _revizor_cards_read(path)
+    out = {"cards": len(cards), "rejected": 0, "verdicts": 0, "closed": 0, "open": 0, "dropped": 0}
+    if not cards:
+        return out
+    now = time.time() if now is None else now
+    index = {}
+    for it in (items if isinstance(items, (list, tuple)) else ()):
+        if isinstance(it, dict) and it.get("id") is not None:
+            index[str(it.get("id"))] = it
+    keep, touched = {}, False
+    for tid in sorted(cards):
+        rec = cards[tid]
+        rows = _revizor_card_rows(rec)
+        row = index.get(tid)
+        outcome = card_terminal_log.classify(row) if row is not None else None
+        if outcome is None:
+            # ТРЕТИЙ ИСХОД: ряда не видно (мост промолчал / карточка ещё висит) — эпизод открыт.
+            # Снятие по горизонту идёт со строкой в лог, а не молча: расписка, которая протухла, —
+            # это потерянный ответ владельца, и знать об этом надо.
+            age = (float(now) - _revizor_card_at(rec, default=now)) / 86400.0
+            if age > REVIZOR_CARD_DAYS:
+                out["dropped"] += 1
+                touched = True
+                log.warning("ревизор: расписка по карточке #%s снята по горизонту (%d сут): ответа "
+                            "владельца не наблюдали, вердиктов не пишем — %d находок вернутся как "
+                            "новые", tid, REVIZOR_CARD_DAYS, len(rows))
+                continue
+            keep[tid] = rec
+            out["open"] += 1
+            continue
+        if outcome != card_terminal_log.OUT_REJECTED:
+            # Принято / истёк TTL / закрыто — вердикта НЕТ. Особо про TTL: «подтверждение не
+            # получено» значит, что владелец не решал НИЧЕГО, и молчать за него мы не смеем.
+            out["closed"] += 1
+            touched = True
+            log.info("ревизор: карточка #%s закрыта исходом «%s» — вердиктов не пишем (решением "
+                     "владельца это не является), расписку на %d находок снимаем",
+                     tid, outcome, len(rows))
+            continue
+        words = _revizor_reject_words(row.get("result"))
+        wrote, failed = [], 0
+        for k in rows:
+            key, gist = _revizor_text(k.get("key")), _revizor_text(k.get("gist"))
+            if not key or not gist:
+                failed += 1
+                continue
+            ok, _k, msg = revizor_set_verdict(
+                key, REVIZOR_VERDICT_FALSE, gist=gist, now=now, path=reg_path,
+                source=REVIZOR_SRC_OWNER, why=f"отказ владельца по карточке #{tid}: {words}")
+            if ok:
+                wrote.append(key)
+            else:
+                failed += 1
+                log.warning("ревизор: отказ по карточке #%s не лёг вердиктом на ключ %s (%s) — "
+                            "находка вернётся владельцем как новая", tid, key, msg)
+        out["rejected"] += 1
+        out["verdicts"] += len(wrote)
+        touched = True
+        # Одна кнопка ответила за N строк — перечисляем их ПОИМЁННО: глушение, которое нельзя
+        # перечислить, проверить нечем, а снять вердикт человек может только зная ключ.
+        log.info("ревизор: «нет» владельца по карточке #%s (%s) → вердикт «ложная» на %d находок: "
+                 "%s%s", tid, words, len(wrote), "; ".join(wrote) or "ни одной",
+                 f" (не записано: {failed})" if failed else "")
+    if touched:
+        _revizor_cards_save(keep, path)
+    return out
 
 
 # ------------------- РЕВИЗОР: ПОРОГ ДОКАЗАННОЙ ПОЛЬЗЫ ПРОВЕРКИ (10.08.2026) ---
@@ -7831,8 +8067,12 @@ def _revizor_verdict_ledger_text(reg=None, path=None):
         total += hits
         verdict = _revizor_text(rec.get("verdict")) or "вердикт не читается"
         last, why = _revizor_text(rec.get("last_hit")), _revizor_text(rec.get("why"))
+        # Источник называем словами: записи БЕЗ поля — доавтоматные, внесённые рукой (21.08 таких
+        # шесть). «Не назван» честнее пустоты — по нему видно, что запись старше провода.
+        src = _revizor_text(rec.get("source")) or "источник не назван (запись доавтоматная)"
         lines.append(f"  • {key} — {verdict}, глушений {hits}"
                      + (f", последнее {_fmt_tick(last)}" if last else "")
+                     + f"; {src}"
                      + (f"; основание: {why}" if why else ""))
     lines.append(f"итого: ключей {len(reg)}, находок не выписано владельцу {total}")
     return "\n".join(lines)
@@ -8272,10 +8512,14 @@ def _revizor_find_owner_card(items):
     return None
 
 
-def _revizor_post_owner_card(owner_findings, items):
+def _revizor_post_owner_card(owner_findings, items, now=None):
     """ОДНА сводная owner-карточка в инбокс 1160 (NEEDS_APPROVAL_TOPIC): редактируем СУЩЕСТВУЮЩУЮ
     (тот же tid, маркер) либо создаём (enqueue → claim → set_needs_approval, синхронно — в 'new' не
-    задерживается; гард process_new подстрахует краш). Всё через Bridge; ревизор клиентам не пишет."""
+    задерживается; гард process_new подстрахует краш). Всё через Bridge; ревизор клиентам не пишет.
+
+    Доставив, пишем РАСПИСКУ (_revizor_card_keys_add): чем карточка нагружена — тем и отвечает её
+    единственная кнопка. Без расписки «нет» владельца остаётся строкой в чужом статусе, а находка
+    приезжает второй раз (класс 21.08)."""
     prior = _revizor_find_owner_card(items)
     prior_lines = _revizor_prior_lines(prior) if prior is not None else ()
     what = _revizor_owner_card_text(owner_findings, prior_lines)
@@ -8284,6 +8528,7 @@ def _revizor_post_owner_card(owner_findings, items):
     if prior is not None:
         tid = prior.get("id")
         bc.set_needs_approval(tid, what, topic=NEEDS_APPROVAL_TOPIC)      # редактируем существующую карточку
+        _revizor_card_keys_add(tid, owner_findings, now=now)              # расписка: за что отвечает «нет» по этой карточке
         log.info("ревизор: owner-карточка обновлена (tid=%s, инбокс %s)", tid, NEEDS_APPROVAL_TOPIC)
         return
     ok, tid, err = enqueue_pc_task(REVIZOR_OWNER_MARK + " сводная карточка находок ревизора", frm=REVIZOR_OWNER_FROM)
@@ -8292,6 +8537,7 @@ def _revizor_post_owner_card(owner_findings, items):
         return
     bc.claim_task(tid)                          # new → in_progress → needs_approval (штатный красный путь)
     bc.set_needs_approval(tid, what, topic=NEEDS_APPROVAL_TOPIC)
+    _revizor_card_keys_add(tid, owner_findings, now=now)                  # расписка пишется ПОСЛЕ доставки: обещать погашение недоставленного нельзя
     log.info("ревизор: owner-карточка создана (tid=%s, инбокс %s)", tid, NEEDS_APPROVAL_TOPIC)
 
 
@@ -8563,6 +8809,17 @@ def _revizor_route(packages, now=None):
     # решение человека по КОНКРЕТНОЙ находке, потом статистика по ПРОВЕРКЕ. Порядок именно такой,
     # потому что вердикт — знание, а порог — вывод из знания; вывод не смеет опережать источник.
     # Реестр читаем один раз на прогон и пишем один раз — обоими разделами сразу.
+    # ЖАТВА ОТВЕТОВ (21.08.2026) идёт ПЕРЕД чтением реестра — иначе свежее «нет» владельца не успело
+    # бы стать вердиктом к этому же прогону, и находка доехала бы к нему второй раз (тот самый класс).
+    # Снимок очереди берём ЗДЕСЬ, а не ниже: он всё равно нужен доставке (бюджет/дедуп/поиск
+    # карточки), и лишнего вызова моста не появляется — на прогоне без единой находки его по-прежнему
+    # нет вовсе. items=None (мост дал частичную картину) — жатву пропускаем: расписки остаются
+    # открытыми, судить по неполному снимку нельзя.
+    items = None
+    if task_f or owner_f:
+        items = _loc_fetch_items()
+        if items is not None:
+            _revizor_harvest_card_answers(items, now=now)
     reg, chk = _revizor_registry_read()
     task_f, muted_t = _revizor_apply_verdicts(task_f, reg=reg, now=now, save=False)
     owner_f, muted_o = _revizor_apply_verdicts(owner_f, reg=reg, now=now, save=False)
@@ -8592,7 +8849,7 @@ def _revizor_route(packages, now=None):
             _cowork(f"ревизор: {n} окон, чисто{tail}")
         return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed,
                 "muted": len(muted), "benched": len(benched)}
-    items = _loc_fetch_items()                  # снимок очереди (все статусы) — бюджет/дедуп/поиск карточки
+    # снимок очереди (все статусы) — бюджет/дедуп/поиск карточки — уже снят выше, вместе с жатвой
     if items is None:                           # частичная картина опаснее ожидания → откладываем, не флудим
         kept = _revizor_spool_save(task_f + owner_f)    # СОХРАНЯЕМ: «отложены» без спула = выброшены
         _cowork(f"ревизор: очередь недоступна — {len(task_f)} задач и {len(owner_f)} owner-находок отложены "
@@ -8606,7 +8863,7 @@ def _revizor_route(packages, now=None):
         if task_f:
             enq, skip, left = _revizor_enqueue_tasks(task_f, items, now)
         if owner_f:
-            _revizor_post_owner_card(owner_f, items)
+            _revizor_post_owner_card(owner_f, items, now=now)
     except Exception as e:                      # мост отвалился на полудороге → находки в спул, метку не двигаем
         kept = _revizor_spool_save(task_f + owner_f)
         log.error("ревизор: доставка находок сорвалась (%s: %s) — отложены (в спуле %d)",
@@ -9390,7 +9647,7 @@ if __name__ == "__main__":
             print('нужно: --revizor-verdict "<класс|окно|предмет>" "<вердикт>" "<существо>" ["основание"]\n'
                   f"вердикты: {', '.join(REVIZOR_VERDICTS)}")
             sys.exit(2)
-        ok, _k, msg = revizor_set_verdict(key, verdict, gist=gist, why=why)
+        ok, _k, msg = revizor_set_verdict(key, verdict, gist=gist, why=why, source=REVIZOR_SRC_HAND)
         print(msg)
         sys.exit(0 if ok else 1)
     elif arg in ("--approve", "--reject"):
