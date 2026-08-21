@@ -7992,9 +7992,14 @@ class TestLongRentSilence(_SheetFixture, unittest.TestCase):
 
     ЧТО ИМЕННО ЛОМАЛОСЬ (забор Честертона): _parse_term НЕ ЗНАЕТ слова «полгода» вовсе, поэтому
     у случая 7 в живом прогоне стояло term_days=None/hint_days=None — длинный срок доезжал до
-    цены НЕОТЛИЧИМЫМ от недельного. Порог берётся не на глаз: границы числом в правиле НЕТ,
-    взята записанная в suggest.py равнозначность _PAST_ROLL_MAX_DAYS = 182 («граница ровно
-    посередине — полгода»). Всё короче полугода не задето — это и проверяет тест (в).
+    цены НЕОТЛИЧИМЫМ от недельного.
+
+    ГРАНИЦА — 180 СУТОК, РЕШЕНИЕ ВЛАДЕЛЬЦА 21.08.2026 (узел business_rules, раздел «ГРАНИЦА
+    ДЛИННОЙ АРЕНДЫ ЧИСЛОМ», строки 427-444, прочитан из живого реестра): «граница длинной
+    аренды 180 суток»; «С 180 СУТОК И ДОЛЬШЕ бот цену НЕ называет»; «КОРОЧЕ 180 СУТОК бот
+    считает сам, как прежде». Прежние 182 были рабочей отсечкой захода 1459f96 при ОТСУТСТВИИ
+    числа в правиле — не решением; теперь число есть. Всё короче 180 не задето — это проверяют
+    тесты (в) и точка 179 в тесте четырёх точек.
 
     Стенд — общий _SheetFixture: getter ОТДАЁТ живые числа, значит молчание в тестах ниже
     добыто ЗАМКОМ, а не отсутствием данных."""
@@ -8090,8 +8095,8 @@ class TestLongRentSilence(_SheetFixture, unittest.TestCase):
         та самая длина, которую узел называет обсуждаемой отдельно. Сутки НЕДОБОРА до границы
         считаются по-прежнему — так поведение на границе названо с обеих сторон, а не подразумевается."""
         start = datetime.date(2026, 9, 1)
-        border = start + datetime.timedelta(days=suggest._LONG_TERM_MIN_DAYS)      # ровно 182
-        under = start + datetime.timedelta(days=suggest._LONG_TERM_MIN_DAYS - 1)   # 181
+        border = start + datetime.timedelta(days=suggest._LONG_TERM_MIN_DAYS)      # ровно граница
+        under = start + datetime.timedelta(days=suggest._LONG_TERM_MIN_DAYS - 1)   # сутки недобора
         h_b = suggest.extract_booking_hints(
             f"[клиент]: Нужен NMAX с {start:%d.%m.%Y} по {border:%d.%m.%Y}, сколько?",
             today=self.TODAY)
@@ -8106,6 +8111,83 @@ class TestLongRentSilence(_SheetFixture, unittest.TestCase):
             today=self.TODAY)
         self.assertEqual(h_u["hint_days"], suggest._LONG_TERM_MIN_DAYS - 1)
         self.assertFalse(h_u["long_term"], "сутки НЕ доходя до границы — прежний расчёт")
+
+    # ---------- (б2) ЧЕТЫРЕ ТОЧКИ ВОКРУГ ЧЕРТЫ ВЛАДЕЛЬЦА: 179 / 180 / 181 / 182 ----------
+    def test_b_four_points_179_180_181_182_around_the_owners_border(self):
+        """ЧИСЛО ЧЕРТЫ ПРИБИТО К РЕШЕНИЮ ВЛАДЕЛЬЦА, а не к соседней константе файла. Сутки взяты
+        ЛИТЕРАЛАМИ намеренно: тест выше ходит от _LONG_TERM_MIN_DAYS и потому переедет вместе с
+        любой правкой константы, ничего не заметив, — этот не переедет.
+
+        Точек четыре, и каждая нужна:
+          179 — последний считаемый день («КОРОЧЕ 180 СУТОК бот считает сам, как прежде»);
+          180 — сама черта, ВКЛЮЧАЮЩАЯ («С 180 СУТОК И ДОЛЬШЕ бот цену НЕ называет»);
+          181 — первые сутки за чертой;
+          182 — ПРЕЖНИЙ порог. Без него правка «182 → 180» была бы неотличима от «182 остался на
+                месте»: расходятся эти два варианта ровно на 180 и 181, и только эти двое суток
+                заход и переносит. Замер до/после это подтвердил: срезы 179 и 182 совпали
+                ПОБАЙТНО, сдвинулись 180 и 181.
+
+        Веток тоже две, и это не украшение. Цену на длинном сроке бот называл СПИСКОМ — прайсом
+        по всему парку (замер 21.08: 21 число в белом списке пост-чека на 180 сутках). Поштучная
+        котировка на таком сроке и так молчала, но по ДРУГОЙ причине — sanity-гард
+        pricing.sanity_days_ok режет всё длиннее 45 суток без месячного запроса. Проверять надо
+        обе: замок правила обязан гасить цену САМ, а не полагаться на чужой гард, который завтра
+        подвинут."""
+        self.assertEqual(suggest._LONG_TERM_MIN_DAYS, 180,
+                         "черта названа владельцем 21.08.2026 числом: 180 суток")
+        start = datetime.date(2026, 9, 1)
+
+        def notes(days):
+            end = start + datetime.timedelta(days=days)
+            point = (f"[клиент]: Нужен NMAX с {start:%d.%m.%Y} по {end:%d.%m.%Y}, сколько выйдет?")
+            sheet = (f"[клиент]: Здравствуйте! Какие есть скутеры и какие цены "
+                     f"с {start:%d.%m.%Y} по {end:%d.%m.%Y}?")
+            return [(h, suggest.build_pricing_note(h, getter=self._getter(), today=self.TODAY))
+                    for h in (suggest.extract_booking_hints(t, today=self.TODAY)
+                              for t in (point, sheet))]
+
+        # --- 180, 181, 182: цены нет НИ ПОШТУЧНО, НИ СПИСКОМ; человек позван на ОБЕИХ ветках ---
+        for days in (180, 181, 182):
+            for branch, (h, note) in zip(("поштучно", "списком"), notes(days)):
+                with self.subTest(days=days, branch=branch):
+                    self.assertTrue(h["long_term"], f"{days} сут обязаны быть длинным сроком")
+                    self.assertEqual(h["long_term_days"], days)
+                    self._assert_no_price(note)
+                    self._assert_calls_human(note)
+
+        # --- 179: черта НЕ сработала, прежний расчёт цел ДО БАТА ---
+        (h_p, note_p), (h_s, note_s) = notes(179)
+        for h in (h_p, h_s):
+            self.assertFalse(h["long_term"], "179 суток — по эту сторону черты")
+            self.assertIsNone(h["long_term_days"])
+            self.assertEqual(h["hint_days"], 179)
+        for note in (note_p, note_s):
+            self.assertNotIn("ДЛИННАЯ АРЕНДА", note)
+        # Сетка на 179 сутках жива и несёт ВСЕ тарифы стенда — модель за моделью, до бата.
+        self.assertIn(suggest._SHEET_OPEN, note_s)
+        for name, tar in self.TAR.items():
+            if name in ("CB 300R", "MT-03"):
+                continue                     # мотоциклы: спрошены СКУТЕРЫ, их в сетке нет по замыслу
+            day, week, month, dep, cap_active, cap_price = tar
+            with self.subTest(model=name):
+                self.assertIn(f"{day} ฿", note_s)                     # сутки
+                self.assertIn(f"{week} ฿", note_s)                    # неделя
+                self.assertIn(f"{dep} ฿", note_s)                     # депозит
+                self.assertIn(f"от {cap_price} ฿" if cap_active       # месяц: кепка или итог
+                              else f"{month} ฿", note_s)
+
+    def test_b_past_roll_constant_is_not_dragged_along(self):
+        """ДВА РАЗНЫХ 182 РАЗВЕДЕНЫ НАВСЕГДА — замок против правки по грепу.
+
+        До 21.08 черта длинной аренды СТОЯЛА на _PAST_ROLL_MAX_DAYS: числа в правиле не было, и
+        порог одолжили у соседа, прямо это назвав. Связь была подпоркой, а выглядит она в файле
+        как родство — поэтому следующий, кто пойдёт «доводить границу до 180» гре́пом по «182»,
+        с высокой вероятностью подвинет и соседа. Двигать его НЕЛЬЗЯ: он про то, как далеко
+        назад укатывать ПРОШЕДШУЮ дату без явного года («с 5 марта» в августе), к длине аренды
+        отношения не имеет и решением владельца 21.08 не затронут ни словом."""
+        self.assertEqual(suggest._PAST_ROLL_MAX_DAYS, 182, "прошедший ролл владелец не трогал")
+        self.assertNotEqual(suggest._LONG_TERM_MIN_DAYS, suggest._PAST_ROLL_MAX_DAYS,
+                            "две константы разведены: длина аренды и ролл прошедших дат")
 
     # ---------- (в) СРОК ЗАВЕДОМО КОРОЧЕ: цена называется как прежде, ДО БАТА ----------
     def test_v_short_term_case1_untouched_to_the_baht(self):
