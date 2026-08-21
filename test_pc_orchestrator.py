@@ -173,6 +173,28 @@ class Base(unittest.TestCase):
         self.addCleanup(o._CLIENT_HELD_WARNED.clear)
         self.addCleanup(lambda: (setattr(o, "_client_block", self._save_cb[0]),
                                  setattr(o, "_revizor_finding_touches_client", self._save_cb[1])))
+        # ЗАМОРОЗКА КОНТУРА (ручка 21.08, изоляция заведена 22.08): и ФЛАГ, и реестр форм — ЖИВОЕ
+        # СОСТОЯНИЕ МИРА в корне репо, а не конфигурация. Тот же класс, что грязное дерево и
+        # боевые state-файлы выше, только этот тёк В ОБЕ СТОРОНЫ и обе течи были живыми:
+        #   • ЧТЕНИЕ: пока флага не было, голдены ворот были зелёными; владелец заморозил контур
+        #     21.08 19:36 — и те же 15 голденов покраснели, НЕ изменившись ни строкой. Красное
+        #     держало ступень самообновления демона, то есть решение владельца о ТИШИНЕ карточек
+        #     останавливало ДОСТАВКУ КОДА — связи между ними нет никакой.
+        #   • ЗАПИСЬ: `gate_route` пишет реестр форм, и прогон тестов дописывал его БОЕВОЙ экземпляр.
+        #     Замер 22.08 00:36: живой `pc_orchestrator.gate_seen.json` держал n=160 и n=60 по формам
+        #     «moderbot,userbot|suggest.py» и «userbot|suggest.py» — при 14 отказах ворот за 21.08 и
+        #     при демоне, который крутится на 57166ab, то есть на коде СТАРШЕ самой ручки и записать
+        #     туда не мог ни строки. Счётчики нарастили ПРОГОНЫ ТЕСТОВ, а цена этому — боевая:
+        #     записанная форма гасит владельцу ПЕРВУЮ настоящую карточку по ней.
+        # Отсюда место изоляции — Base, а не отдельный класс: голден, чей вердикт зависит от того,
+        # заморожен ли контур в эту минуту, — не голден. Заморозку ПО СУЩЕСТВУ проверяет
+        # TestZamorozkaKontura, поднимая флаг в СВОЁМ временном каталоге.
+        _tmp_frz = tempfile.mkdtemp(prefix="frz_base_")
+        for _attr, _val in (("FREEZE_FLAG", os.path.join(_tmp_frz, "pc_orchestrator.contour_frozen")),
+                            ("GATE_SEEN_FILE", os.path.join(_tmp_frz, "gate_seen.json"))):
+            _save_frz = getattr(o.client_contour, _attr)
+            setattr(o.client_contour, _attr, _val)
+            self.addCleanup(lambda a=_attr, v=_save_frz: setattr(o.client_contour, a, v))
         self.fb = FakeBridge()
         o.bc = self.fb
         o._notify = lambda *a, **k: None
@@ -9814,6 +9836,46 @@ class TestClientContourGate(Base):
         self.assertEqual(self.cards, [])
 
 
+class TestZhivayaRuchkaMiraNevidnaGoldenam(Base):
+    """ЗАМОК (22.08.2026): ни один голден этого модуля не смеет видеть ЖИВУЮ ручку заморозки.
+
+    Класс, который замок закрывает, уже стоил суток доставки: ручка заморозки — ФАЙЛ в корне репо,
+    и 21.08 19:36 владелец её включил. Пятнадцать голденов покраснели, не изменившись ни строкой,
+    ступень самообновления встала, и демон 25.9 часа сидел на 57166ab. Решение о ТИШИНЕ КАРТОЧЕК
+    остановило ДОСТАВКУ КОДА — притом что изоляция в репозитории БЫЛА, просто стояла в дочернем
+    классе (TestZamorozkaKontura), а не в Base.
+
+    Здесь проверяется само свойство, а не поведение: пути ручки и реестра форм во время теста ведут
+    ВНЕ репозитория. Тогда вердикт голденов не зависит ни от решения владельца, ни от того, что
+    прогон дописал в боевой реестр."""
+
+    def test_puti_ruchki_vedut_vne_repozitoriya(self):
+        for attr in ("FREEZE_FLAG", "GATE_SEEN_FILE"):
+            with self.subTest(attr=attr):
+                p = os.path.abspath(getattr(o.client_contour, attr))
+                self.assertNotEqual(os.path.dirname(p), os.path.abspath(o.REPO),
+                                    "%s смотрит в боевой корень: голдены снова зависят от живой "
+                                    "ручки, а прогон снова пишет боевой реестр" % attr)
+
+    def test_pod_izolyaciei_kontur_ne_zamorozhen(self):
+        """Умолчание — «заморозки нет»: ровно тот мир, для которого написаны унаследованные
+        голдены ворот. Заморозку ПО СУЩЕСТВУ проверяет TestZamorozkaKontura своим флагом."""
+        self.assertFalse(o.client_contour.frozen())
+        self.assertEqual(o.client_contour.gate_route(["userbot"], ["suggest.py"])[0],
+                         o.client_contour.ROUTE_CARD)
+
+    def test_progon_ne_sozdal_boevoi_reestr_form(self):
+        """Вторая течь была НА ЗАПИСЬ: `gate_route` пишет реестр форм, и прогон дописывал боевой.
+        Считаем не «файла нет» (он живой), а «в него не попала форма ЭТОГО теста»."""
+        shape = o.client_contour.refusal_shape(["zamok_22_08"], ["nesuschestvuyuschiy.py"])
+        o.client_contour.gate_route(["zamok_22_08"], ["nesuschestvuyuschiy.py"])
+        live = os.path.join(o.REPO, "pc_orchestrator.gate_seen.json")
+        if not os.path.exists(live):
+            return                       # боевого реестра нет вовсе — пачкать нечего
+        with io.open(live, encoding="utf-8") as f:
+            self.assertNotIn(shape, f.read(), "прогон дописал БОЕВОЙ реестр форм")
+
+
 class TestZamorozkaKontura(TestClientContourGate):
     """ЗАМОРОЗКА КОНТУРА (21.08.2026): пока клиентский контур заморожен, ПОВТОР отказа ворот уходит
     В ЛЕНТУ, а не карточкой владельцу. Ворота при этом держат ровно как держали.
@@ -10189,7 +10251,13 @@ class TestSelfUpdateDepClosure(Base):
         selfupdate_gate/pc_agent — ЛЕНИВО, изнутри функций. Демон несёт их все."""
         base = self._version(self.blobs)
         for dep in ("moderation_ipc.py", "selfupdate_gate.py", "pc_agent.py", "pretool_guard.py",
-                    "task_metrics.py", "card_duty.py"):
+                    "task_metrics.py", "card_duty.py",
+                    # 22.08.2026: ПЕРЕЕХАЛ СЮДА ИЗ «посторонних». brain_writer.py числился
+                    # посторонним с 07.08 и был им ЧЕСТНО — пока 45a38cf не внёс `import price_gate`
+                    # в suggest.py: теперь цепь suggest → price_gate → queue_snapshot_pc →
+                    # brain_writer тянет его в память демона, и его правка обязана доезжать
+                    # рестартом. Голден переехал вслед за фактом, а не наоборот.
+                    "brain_writer.py", "price_gate.py", "queue_snapshot_pc.py"):
             with self.subTest(dep=dep):
                 self.assertNotEqual(base, self._version(dict(self.blobs, **{dep: "blob-new"})))
 
@@ -10198,7 +10266,7 @@ class TestSelfUpdateDepClosure(Base):
         именно эта половина стережёт условие «порог прежний»."""
         base = self._version(self.blobs)
         for foreign in ("test_pc_orchestrator.py", "userbot_listen.py", "moderation_bot.py",
-                        "trainer_run.py", "cowork_log_append.py", "brain_writer.py"):
+                        "trainer_run.py", "cowork_log_append.py"):   # brain_writer.py уехал в зависимости 22.08
             with self.subTest(foreign=foreign):
                 self.assertEqual(base, self._version(dict(self.blobs, **{foreign: "blob-new"})))
 
