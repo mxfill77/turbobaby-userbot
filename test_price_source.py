@@ -31,6 +31,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import test_isolation  # noqa: F401  ДО suggest: офлайн-дверь сторожа свежести (§5 обвязки)
 import price_gate
 import price_source
 import pricing

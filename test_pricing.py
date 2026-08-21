@@ -11,6 +11,7 @@ import datetime
 import tempfile
 import unittest
 
+import test_isolation  # noqa: F401  ДО suggest: офлайн-дверь сторожа свежести (§5 обвязки)
 import suggest
 import pricing
 

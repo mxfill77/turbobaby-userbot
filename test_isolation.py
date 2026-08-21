@@ -85,3 +85,99 @@ def outbound_prod_attempts():
     Единственный канал, которым фикстура может достичь реальной группы, — боевая очередь;
     ноль обращений к ней = ноль сообщений наружу."""
     return moderation_ipc.prod_ipc_open_attempts
+
+
+# ─────────────────── 5) ДВЕРЬ СТОРОЖА СВЕЖЕСТИ — ОФЛАЙН (21.08.2026) ────────────────────
+# ЗАЧЕМ. Путь ответа спрашивает сторожа свежести БЕЗУСЛОВНО: `suggest._safe_quote_for_model`
+# зовёт `price_gate.allow()` без инъекции, и та одалживает у демона живой клиент моста
+# (`price_gate._bridge_caller`) — девять GET `quote_price` по 40–43с в норме и до 180с по
+# бюджету (`price_gate.PROBE_DEFAULT`). Ни один голден цены этой двери не подменял, поэтому
+# КАЖДЫЙ тест, чьи hints несут модель+даты, ходил в ЖИВОЙ мост и краснел по его скорости, а не
+# по своему предмету: три прогона одной командой без единой правки дали 16, 62 и 61 красный
+# (`docs/artifacts/2026-08-21-remaining-reds.md` §0). Кэш вердикта (TTL 30 мин) платил эту цену
+# не раз за прогон: `price_gate.reset()` в соседних наборах взводит её заново.
+#
+# ЧТО ИМЕННО ПОДМЕНЕНО — РОВНО ДВЕРЬ, А НЕ ВЕРДИКТ. Сторож работает ЦЕЛИКОМ: читает настоящий
+# `price_source.json`, обходит те же девять проб `price_freshness_run.PROBES`, судит
+# `price_freshness.judge`. Подменён единственный шаг, которого нет без сети, — ОТВЕТ ЛИСТА.
+# Это тот же приём, которым владелец мерил бюджет проб 20.08 («подменялась ровно одна вещь —
+# сама дверь источника»), и та же форма, что у `test_price_gate.py:158`.
+#
+# ПОЧЕМУ НЕ ОБЪЯВЛЕННЫЙ ОТКАТ `PRICE_GATE_TTL_MIN=0` (образец `test_price_source.py:72`). Он
+# дешевле, но отдаёт `(True, None)` НЕ СПРАШИВАЯ сторожа — то есть заглушка МОЛЧА возвращает
+# успех, и ветка гейта в пути ответа перестаёт исполняться вовсе. Соседний набор вправе так
+# делать: его предмет — счёт по файлу. Общая обвязка — не вправе.
+#
+# ЗАГЛУШКА НЕ ОБЯЗАНА ВЕРНУТЬ «ДА» И НЕ ВСЕГДА ЕГО ВОЗВРАЩАЕТ:
+#   • правило не прочитано / без слепка ручек → дверь БРОСАЕТ, `live_handles` зовёт это отказом
+#     двери, вердикт `НЕИЗВЕСТНО`, цена НЕ называется (проверено `test_price_gate.py`);
+#   • слепок старше `PRICE_FRESH_MAX_AGE_DAYS` → `УСТАРЕЛО` и цена гаснет ровно как в бою:
+#     возраст судится по дате слепка, а не по ответу листа, и офлайн его не смягчает;
+#   • адрес, которого фикстура не знает → AssertionError-тривайр (образец `test_bridge_http.py`),
+#     чтобы новый живой вызов не спрятался под заглушкой молча.
+# ТЕСТЫ, ЧЕЙ ПРЕДМЕТ — ОТКАЗ МОСТА, сюда не заходят вовсе: они подают свой `get=`, а
+# `price_gate.verdict` при инъекции идёт мимо `_bridge_caller` и мимо кэша.
+#
+# ЧТО ТЕРЯЕМ (забор Честертона). Полный прогон был ПОБОЧНОЙ живой канарейкой: он раз в прогон
+# сверял живые H3/I3/J3 со слепком и краснел бы на повёрнутой ручке. Канарейка была случайной
+# (никто её так не звал) и недетерминированной, но она была. Закрывается НАЗВАННЫМ прогоном
+# `venv\Scripts\python.exe price_freshness_run.py` — те же девять проб живой дверью, вердикт
+# на экран; и самим боем: сторож стои́т в пути ответа и судит живой лист раз в 30 минут.
+
+import price_freshness_run as _pfr      # noqa: E402
+import price_gate as _pgate             # noqa: E402
+
+_CELL_OF_BIKE = {bike: cell for cell, bikes in _pfr.PROBES for bike in bikes}
+
+
+def _recorded_handles():
+    """Ручки ЗАПИСАННОГО правила тем же читателем, которым их читает сторож. None — «не
+    прочитано»: подменять отказ пустым словарём нельзя, пустой слепок сторож принял бы за
+    «сверять нечего» с ЛОЖНОЙ причиной в карточке владельцу."""
+    snap, _why = _pfr.read_rule()
+    if not isinstance(snap, dict):
+        return None
+    handles = snap.get("handles")
+    return handles if isinstance(handles, dict) and handles else None
+
+
+def offline_bridge_door(action, **kw):
+    """Ответ листа БЕЗ СЕТИ, в живом формате двери `quote_price`.
+
+    Живой формат снят с потребителя: `price_freshness_run.live_handles` читает у ответа
+    `answer["season"]["global_discount"]` и требует `ok is True` (см. его тело). Отдаём
+    положение ручки, ЗАПИСАННОЕ в правиле, — то есть проигрываем ровно один сценарий: «лист
+    с момента снимка не двигали». Повёрнутую ручку, мёртвую дверь, голодный бюджет и старый
+    слепок судит `test_price_gate.py` своими фикстурами; здесь их подделывать нечем.
+    """
+    if action != "quote_price":
+        raise AssertionError("офлайн-дверь сторожа не знает адреса: %r" % (action,))
+    bike = kw.get("bike")
+    cell = _CELL_OF_BIKE.get(bike)
+    if cell is None:
+        raise AssertionError("офлайн-дверь сторожа не знает юнита: %r" % (bike,))
+    handles = _recorded_handles()
+    if handles is None:
+        raise RuntimeError("записанное правило не прочитано — дверь отказала")
+    value = handles.get(cell)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise RuntimeError("в слепке нет ручки %s — дверь отказала" % cell)
+    return {"ok": True, "bike": bike, "days": 1,
+            "date_start": kw.get("date_start"), "date_end": kw.get("date_end"),
+            "season": {"global_discount": float(value)}}
+
+
+_pgate._bridge_caller = lambda: offline_bridge_door
+
+_real_live_handles = _pfr.live_handles
+
+
+def _live_handles_offline(get=None):
+    """Второй вход к той же двери. `live_handles(get=None)` одалживает клиент демона САМ,
+    минуя `_bridge_caller`, — без этой обёртки заглушка была бы дырявой ровно на один вызов.
+    Инъекция вызывающего проходит НАСКВОЗЬ: подача `get=` ничего здесь не встречает."""
+    return _real_live_handles(get=offline_bridge_door if get is None else get)
+
+
+_pfr.live_handles = _live_handles_offline
+_pgate.reset()                          # вердикт живого моста не переживает установку двери
