@@ -4813,10 +4813,22 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         # ГОЛДЕН #92 шаг 2/6: лист с ценой И скидкой за срок → строка столбца J едет в служебный
         # quote-блок ПОСИМВОЛЬНО, включая процент «(Скидка за срок 15%, … в день)». Код не
         # переформатирует и не опускает скидку (транспорт шага 1/6 #92, коммит 1db63e7).
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026. ИМЯ ИСТОРИЧЕСКОЕ («column_j_verbatim»): предмет теста —
+        # ТРАНСПОРТ (строка цены едет в служебный quote-блок и собрана КОДОМ, не LLM), и он ЦЕЛ.
+        # Изменился ИСТОЧНИК строки: дословный текст столбца J снят price_source.reprice
+        # (price_source.py:319 `out.pop("text", None)`) — чужие числа листа рядом с новой ценой
+        # соврали бы клиенту двумя цифрами сразу, — и фразу собирает _client_price из чисел правила.
+        # NMAX 155 = 298 x 1.0 (P1 ИЮНЬ-СЕНТЯБРЬ, старт 2026-07-15) x 1.03 (корзина 4-6, срок
+        # 5 сут) = 306.94 -> 307 ฿/день; итого 307 x 5 = 1535 ฿. Депозит 3000 ฿ правило НЕ трогает —
+        # он приходит живой котировкой и остаётся прежним.
         block = suggest._quote_block_from_note(self._note_j())
         self.assertIsNotNone(block)                          # блок собран
-        self.assertIn(self.J_LINE, block)                    # строка J посимвольно (со скидкой за срок)
-        self.assertIn("(Скидка за срок 15%, 480 ฿ в день)", block)   # процент срока цел дословно
+        self.assertIn("307 ฿/день", block)                   # цена суток — счёт правила
+        self.assertIn("итого 1535 ฿", block)                 # итог за срок — счёт правила
+        self.assertIn("3000", block)                         # депозит из Bridge цел
+        self.assertNotIn(self.J_LINE, block)                 # дословная строка листа снята
+        self.assertNotIn("2400", block)                      # чужой итог листа не звучит
+        self.assertNotIn("480", block)                       # чужая цена дня листа не звучит
 
     def test_golden_draft_carries_column_j_verbatim(self):
         # ГОЛДЕН #92 шаг 2/6: тот же J-текст доходит до ЧЕРНОВИКА клиента дословно — LLM цену/скидку
@@ -4827,8 +4839,14 @@ class TestPointQuoteCodeBlock(unittest.TestCase):
         out = suggest.regenerate_draft("[клиент]: nmax на 5 дней с 15 июля, сколько?", "ru", "FAQ",
                                        False, note, "дожимай на бронь", call_llm=drop_price)
         client = suggest.client_facing_text(out)
-        self.assertIn(self.J_LINE, client)                   # строка столбца J дословно у клиента
-        self.assertIn("Скидка за срок 15%", client)          # процент срока не потерян и не переформатирован
+        # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026. ИМЯ ИСТОРИЧЕСКОЕ. Предмет теста — FAIL-SAFE: LLM цену
+        # потерял, а строка цены всё равно пришла клиенту КОДОМ (compose/regenerate). Он ЦЕЛ.
+        # Источник строки — счёт правила, а не столбец J (разбор — в соседнем тесте выше):
+        # NMAX 155 = 298 x 1.0 (P1, старт 2026-07-15) x 1.03 (4-6, 5 сут) = 307 ฿/день; 307 x 5 = 1535 ฿.
+        self.assertIn("307 ฿/день", client)                  # цена дошла до клиента КОДОМ
+        self.assertIn("итого 1535 ฿", client)                # итог за срок — тоже кодом
+        self.assertNotIn(self.J_LINE, client)                # дословная строка листа снята
+        self.assertNotIn("2400", client)                     # чужой итог листа не звучит
         self.assertNotIn("<<<QUOTE>>>", out)                 # сырые служебные скобки не утекли клиенту
 
     def test_build_note_carries_quote_block(self):
