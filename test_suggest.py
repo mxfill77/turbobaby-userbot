@@ -7964,5 +7964,195 @@ class TestClassSuggestOffer(unittest.TestCase):
             self.assertNotIn("check availability", pair[1])
 
 
+class TestLongRentSilence(_SheetFixture, unittest.TestCase):
+    """ЖИВОЙ ПРОМАХ ЭКЗАМЕНА (набор 20.08, повтор 21.08 — случай 7, единственный настоящий):
+    «Хочу взять скутер на полгода, с 1 сентября» → бот выдал прайс по всему парку скутеров
+    (47 чисел) и вдобавок ПООБЕЩАЛ СКИДКУ словами. Правило владельца (узел business_rules,
+    раздел «РЕАЛЬНЫЕ СРОКИ АРЕНДЫ», читан из живого реестра 21.08): «ДЛИНА В ПОЛГОДА: сдаём,
+    но полгода обсуждается отдельно — цена такой аренды не берётся из расчёта, её согласует
+    человек»; «Величина скидки… в расчёт не идёт, бот её не называет».
+
+    ЧТО ИМЕННО ЛОМАЛОСЬ (забор Честертона): _parse_term НЕ ЗНАЕТ слова «полгода» вовсе, поэтому
+    у случая 7 в живом прогоне стояло term_days=None/hint_days=None — длинный срок доезжал до
+    цены НЕОТЛИЧИМЫМ от недельного. Порог берётся не на глаз: границы числом в правиле НЕТ,
+    взята записанная в suggest.py равнозначность _PAST_ROLL_MAX_DAYS = 182 («граница ровно
+    посередине — полгода»). Всё короче полугода не задето — это и проверяет тест (в).
+
+    Стенд — общий _SheetFixture: getter ОТДАЁТ живые числа, значит молчание в тестах ниже
+    добыто ЗАМКОМ, а не отсутствием данных."""
+
+    TODAY = datetime.date(2026, 8, 21)          # день повтора экзамена
+
+    def _note(self, text, today=None, lang="ru"):
+        today = today or self.TODAY
+        hints = suggest.extract_booking_hints(text, today=today)
+        return hints, suggest.build_pricing_note(hints, lang=lang, getter=self._getter(),
+                                                 today=today)
+
+    def _assert_no_price(self, note):
+        """Ни одной суммы и ни одного числа ЦЕНОВОГО порядка: белый список пост-чека пуст, значит
+        ЛЮБОЙ итог, сочинённый LLM, будет заклеймлён postcheck_draft."""
+        self.assertIsNone(re.search(r"\d[\d\s.,]*\s*(?:฿|бат|baht|thb)", note, re.I),
+                          f"в записке появилась сумма: {note}")
+        big = {n for n in suggest._pc_wl_price_numbers(note) if n >= 100}
+        self.assertEqual(big, set(), f"в белый список пост-чека попало число цены: {note}")
+        self.assertNotIn(suggest._SHEET_OPEN, note)     # сетку парка КОД не вставит
+        self.assertNotIn(suggest._QUOTE_OPEN, note)     # строку J КОД не вставит
+        for tar in self.TAR.values():                   # ни одно число стенда не просочилось
+            for n in tar[:4]:
+                self.assertNotIn(str(n), note)
+
+    def _assert_calls_human(self, note):
+        """Третий исход назван ЯВНО: и «считается отдельно», и «человек» — молчание запрещено."""
+        self.assertIn("ОТДЕЛЬНО", note)
+        self.assertIn("менеджер", note)
+        self.assertIn("МОЛЧАТЬ ТОЖЕ НЕЛЬЗЯ", note)
+        self.assertIn("скидк", note)                    # размер скидки обсуждается человеком…
+        self.assertIn("НЕ называй", note)               # …но ботом НЕ называется
+
+    # ---------- (а) СРОК ЗА ГРАНИЦЕЙ: цены нет ни в котировке, ни в списке ----------
+    def test_a_case7_verbatim_no_price_calls_human(self):
+        # ДОСЛОВНАЯ фраза экзаменационного случая 7 (правило-класс: голден детекта = реальное
+        # сообщение клиента). Это одновременно и sheet-путь: price_sheet_q=True.
+        hints, note = self._note(
+            "[клиент]: Здравствуйте! Хочу взять скутер на полгода, с 1 сентября. Сколько выйдет?")
+        self.assertTrue(hints["long_term"])
+        self.assertIsNone(hints["long_term_days"])      # конца аренды клиент не назвал
+        self.assertTrue(hints["price_sheet_q"])         # прайс-интент ЖИВ — погашен именно замком
+        self._assert_no_price(note)
+        self._assert_calls_human(note)
+
+    def test_a_point_quote_long_range_no_price(self):
+        # ТОЧЕЧНАЯ котировка (одна модель, полные даты) — вторая из трёх ценовых веток.
+        hints, note = self._note("[клиент]: Нужен NMAX с 01.09.2026 по 01.04.2027, сколько выйдет?")
+        self.assertTrue(hints["long_term"])
+        self.assertGreaterEqual(hints["long_term_days"], suggest._LONG_TERM_MIN_DAYS)
+        self._assert_no_price(note)
+        self._assert_calls_human(note)
+
+    def test_a_paraphrases_ru_en(self):
+        # Парафразы того же живого смысла: замок на СРОКЕ, а не на формулировке.
+        for text in ("[клиент]: Хочу скутер на 6 месяцев с 1 сентября, сколько?",
+                     "[клиент]: Интересует аренда nmax на год. Какая цена?",
+                     "[клиент]: Нужен байк на 8 месяцев, посчитайте стоимость",
+                     "[клиент]: I want a scooter for half a year from September 1, how much?",
+                     "[клиент]: scooter rental for 7 months, price?"):
+            with self.subTest(text=text):
+                hints, note = self._note(text)
+                self.assertTrue(hints["long_term"], text)
+                self._assert_no_price(note)
+
+    def test_a_en_note_calls_human(self):
+        _h, note = self._note("[клиент]: I need a scooter for half a year from September 1, "
+                              "how much?", lang="en")
+        self.assertIn("SEPARATELY", note)
+        self.assertIn("manager", note)
+        self.assertIn("STAYING SILENT IS ALSO FORBIDDEN", note)
+        self._assert_no_price(note)
+
+    def test_a_draft_with_invented_total_is_branded(self):
+        """СКВОЗЬ ЧЕРНОВИК: LLM всё же сочинил ИТОГ за срок → пост-чек клеймит его (белый список
+        записки пуст, котировки не было) и цена клиенту не уезжает.
+
+        ЧЕСТНАЯ ГРАНИЦА ЭТОЙ СТРАХОВКИ, замерена 21.08: `_pc_classify` клеймит total/deposit, а
+        ГОЛЫЙ ТАРИФ («337 ฿/день» сам по себе) — нет. Свойство пост-чека прежнее, замком длинной
+        аренды не внесённое и им не чинимое: на прошедшем старте (случай 10) страховка ровно та
+        же. Первичный механизм здесь — сама записка, пост-чек ловит остаток."""
+        _h, note = self._note(
+            "[клиент]: Здравствуйте! Хочу взять скутер на полгода, с 1 сентября. Сколько выйдет?")
+        self.assertEqual(suggest._pc_wl_price_numbers(note), set())   # разрешено НОЛЬ чисел
+        draft = suggest.postcheck_draft("Аренда NMAX на полгода — 60000 ฿ за 180 дней.",
+                                        "ru", pricing_note=note)
+        self.assertIn("[уточнить:", draft)
+        self.assertNotIn("60000", suggest.client_facing_text(draft))
+
+    # ---------- (б) СРОК РОВНО НА ГРАНИЦЕ: поведение названо ЯВНО ----------
+    def test_b_exactly_at_border_is_long(self):
+        """ГРАНИЦА ВКЛЮЧАЮЩАЯ: ровно полгода — это и есть «ДЛИНА В ПОЛГОДА» из правила, то есть
+        та самая длина, которую узел называет обсуждаемой отдельно. Сутки НЕДОБОРА до границы
+        считаются по-прежнему — так поведение на границе названо с обеих сторон, а не подразумевается."""
+        start = datetime.date(2026, 9, 1)
+        border = start + datetime.timedelta(days=suggest._LONG_TERM_MIN_DAYS)      # ровно 182
+        under = start + datetime.timedelta(days=suggest._LONG_TERM_MIN_DAYS - 1)   # 181
+        h_b = suggest.extract_booking_hints(
+            f"[клиент]: Нужен NMAX с {start:%d.%m.%Y} по {border:%d.%m.%Y}, сколько?",
+            today=self.TODAY)
+        self.assertEqual(h_b["long_term_days"], suggest._LONG_TERM_MIN_DAYS)
+        self.assertTrue(h_b["long_term"], "ровно на границе обязан быть ДЛИННЫМ")
+        note_b = suggest.build_pricing_note(h_b, getter=self._getter(), today=self.TODAY)
+        self._assert_no_price(note_b)
+        self._assert_calls_human(note_b)
+
+        h_u = suggest.extract_booking_hints(
+            f"[клиент]: Нужен NMAX с {start:%d.%m.%Y} по {under:%d.%m.%Y}, сколько?",
+            today=self.TODAY)
+        self.assertEqual(h_u["hint_days"], suggest._LONG_TERM_MIN_DAYS - 1)
+        self.assertFalse(h_u["long_term"], "сутки НЕ доходя до границы — прежний расчёт")
+
+    # ---------- (в) СРОК ЗАВЕДОМО КОРОЧЕ: цена называется как прежде, ДО БАТА ----------
+    def test_v_short_term_case1_untouched_to_the_baht(self):
+        # Экзаменационный случай 1 ДОСЛОВНО: 10 суток. Числа стенда обязаны доехать без изменений.
+        hints, note = self._note("[клиент]: Здравствуйте! Хочу взять NMAX с 5 по 15 сентября, "
+                                 "на 10 суток. Сколько будет стоить?")
+        self.assertFalse(hints["long_term"])
+        self.assertIsNone(hints["long_term_days"])
+        self.assertNotIn("ДЛИННАЯ АРЕНДА", note)
+        self.assertIn(suggest._QUOTE_OPEN, note)        # точечная котировка на месте
+        # ЧИСЛА ДО БАТА — те же, что бот назвал в живом повторе экзамена 21.08 на этой фразе
+        # (298 ฿/день, итого 2980 ฿): цену точечного пути даёт ЗАПИСАННОЕ ПРАВИЛО, а не стенд,
+        # поэтому сверяем с живым ответом, а не с тарифом фикстуры.
+        self.assertIn("298 ฿/день", note)
+        self.assertIn("2980 ฿", note)
+
+    def test_v_monthly_and_two_months_untouched(self):
+        # Помесячная аренда правилом названа ОБЫЧНОЙ («Помесячные бывают»), а двухмесячный пик —
+        # экзаменационный случай 4. Оба КОРОЧЕ полугода → замок их не трогает.
+        for text in ("[клиент]: Хочу NMAX на месяц с 1 сентября, сколько?",
+                     "[клиент]: Здравствуйте! Хочу арендовать байк с 20 декабря по 10 февраля. "
+                     "Сколько это будет стоить?",
+                     "[клиент]: Нужен скутер на 3 месяца с 1 сентября, цена?"):
+            with self.subTest(text=text):
+                hints, note = self._note(text)
+                self.assertFalse(hints["long_term"], text)
+                self.assertNotIn("ДЛИННАЯ АРЕНДА", note)
+
+    def test_v_half_year_ago_is_not_a_term(self):
+        # КОНТРПРИМЕР: «полгода назад» — история клиента, а не срок аренды. Живой класс: из-за
+        # байка, взятого полгода назад, треды уезжали в 'mixed'.
+        hints, note = self._note("[клиент]: Брал у вас NMAX полгода назад. Хочу снова с 5 по "
+                                 "15 сентября, сколько?")
+        self.assertFalse(hints["long_term"])
+        self.assertNotIn("ДЛИННАЯ АРЕНДА", note)
+
+    # ---------- (г) ДЛИННЫЙ СРОК В СПИСКЕ МОДЕЛЕЙ: молчат ВСЕ строки ----------
+    def test_g_model_list_all_rows_silent(self):
+        """Не «часть строк без цены», а НИ ОДНОЙ строки с ценой: замок стои́т ДО сборки сетки,
+        поэтому в записке нет ни блока сетки, ни единого тарифа ЛЮБОЙ модели парка."""
+        hints, note = self._note("[клиент]: Пришлите прайс по всем моделям, беру на полгода "
+                                 "с 1 сентября")
+        self.assertTrue(hints["price_sheet_q"])
+        self.assertTrue(hints["long_term"])
+        self._assert_no_price(note)
+        self._assert_calls_human(note)
+        # Контроль стенда: БЕЗ длинного срока тот же запрос даёт сетку со ВСЕМИ моделями —
+        # значит молчание выше добыто замком, а не пустым парком.
+        h_s, note_s = self._note("[клиент]: Пришлите прайс по всем моделям с 1 сентября на неделю")
+        self.assertTrue(h_s["price_sheet_q"])
+        self.assertFalse(h_s["long_term"])
+        self.assertIn(suggest._SHEET_OPEN, note_s)
+        for name in self.ALL:
+            self.assertIn(name.split()[0], note_s, f"контроль стенда: {name} пропала из сетки")
+
+    def test_g_class_offer_branch_silent_too(self):
+        # Третья ценовая ветка — подбор по классу (одна модель + свободные того же класса и выше).
+        # Замок стои́т РАНЬШЕ неё, значит ни основной строки, ни строк подбора.
+        hints, note = self._note("[клиент]: Нужен NMAX на полгода с 1 сентября, что посоветуете "
+                                 "и сколько выйдет?")
+        self.assertTrue(hints["long_term"])
+        self._assert_no_price(note)
+        for name in self.ALL:
+            self.assertNotIn(name, note, f"строка подбора {name} прорвалась в записку")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

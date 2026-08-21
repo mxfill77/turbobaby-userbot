@@ -1970,6 +1970,56 @@ def _parse_term(t):
     return None
 
 
+# ---------- ДЛИННАЯ АРЕНДА: срок, цену на который согласует ЧЕЛОВЕК, а не расчёт ----------
+# ПРАВИЛО ВЛАДЕЛЬЦА. Узел `business_rules`, раздел «РЕАЛЬНЫЕ СРОКИ АРЕНДЫ» — прочитан из ЖИВОГО
+# реестра моста по имени 21.08.2026 (строки 391-396 узла), ДОСЛОВНО:
+#   «ДЛИНА В ПОЛГОДА: сдаём, но полгода обсуждается отдельно — цена такой аренды не берётся
+#    из расчёта, её согласует человек. В этом разговоре обсуждаются две вещи: сам период
+#    и размер скидки.»
+#   «Величина скидки не фиксирована и правилом НЕ становится: в расчёт не идёт, бот её не
+#    называет.»
+#
+# ГРАНИЦЫ ЧИСЛОМ В ПРАВИЛЕ НЕТ — и это сказано прямо, а не обойдено: узел называет ровно ОДНУ
+# длину, «полгода», порога вида «длиннее N суток» в нём не записано ни одной строкой. Поэтому
+# здесь НЕ назначается новый порог, а берётся уже записанная В ЭТОМ ЖЕ ФАЙЛЕ равнозначность:
+# _PAST_ROLL_MAX_DAYS = 182 стоит с комментарием «Граница ровно посередине — полгода».
+# Всё, что КОРОЧЕ полугода, считается ПО-ПРЕЖНЕМУ — включая помесячную аренду, которую тот же
+# раздел правила прямо называет обычной («Помесячные бывают, но основой не являются»), и
+# двухмесячный пик экзаменационного случая 4. Где между двумя неделями и полугодом лежит
+# НАСТОЯЩАЯ граница — РЕШЕНИЕ ВЛАДЕЛЬЦА; здесь оно не додумывается.
+_LONG_TERM_MIN_DAYS = 182
+
+# Словесные формы срока НЕ КОРОЧЕ полугода. _parse_term их не знает ВОВСЕ (он умеет «месяц»,
+# «N недель», «N дней», «N months») — ровно поэтому «скутер на полгода» доезжал до цены
+# с term_days=None и считался наравне с недельной арендой (экзамен, случай 7).
+_LONG_TERM_WORD_RE = re.compile(
+    r"пол\s*-?\s*года"                              # полгода / пол года / пол-года
+    r"|полугод\w*"                                  # полугодие / полугода
+    r"|half\s+a\s+year"
+    r"|(?:6|шесть|six)\s*(?:мес|month)\w*"          # 6 месяцев / six months
+    r"|(?:[7-9]|1[0-9]|2[0-4])\s*(?:мес|month)\w*"  # 7-24 месяца
+    r"|на\s+год(?!\w)|for\s+a\s+year"
+    r"|на\s+\d+\s*(?:год|года|лет)(?!\w)|for\s+\d+\s*years?(?!\w)",
+    re.I)
+# «взял байк полгода НАЗАД» — это история клиента, а не срок аренды: живой класс, из-за которого
+# треды уезжали в 'mixed' (см. комментарий у режима треда выше). Смотрим ТОЛЬКО хвост сразу за
+# совпадением, а не всё сообщение: слово «назад» в другом месте фразы срок не отменяет.
+_LONG_TERM_PAST_RE = re.compile(r"^(?:назад|тому\s+назад|ago)\b", re.I)
+
+
+def _long_term_words(text) -> bool:
+    """Клиент СЛОВАМИ назвал срок не короче полугода? → True/False.
+    Длину в сутках отсюда НЕ возвращаем: на исход влияет сам факт, а число в ценовую записку
+    класть нельзя — белый список пост-чека (_pc_wl_price_numbers) берёт ЛЮБЫЕ цифры записки,
+    и «182» стало бы разрешённой ценой."""
+    t = text or ""
+    for m in _LONG_TERM_WORD_RE.finditer(t):
+        if _LONG_TERM_PAST_RE.match(t[m.end():].lstrip()):
+            continue                      # «…полгода назад» — прошлая аренда, не эта
+        return True
+    return False
+
+
 def _anchor_date(t, today):
     """Дата начала для срочных фраз («завтра на 3 дня», «на неделю с 5 июля»)."""
     if "послезавтра" in t:
@@ -2769,6 +2819,13 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
             hint_days = None
     if hint_days is None:
         hint_days = term_days
+    # ДЛИННАЯ АРЕНДА (правило владельца, раздел «РЕАЛЬНЫЕ СРОКИ АРЕНДЫ»): срок от полугода
+    # получает цену не от расчёта, а от человека. Признак собираем ДВУМЯ независимыми входами,
+    # потому что по отдельности не хватает ни одного: даты дают длину только когда разобрался
+    # ВЕСЬ диапазон (у «на полгода с 1 сентября» конца нет вовсе — hint_days=None), а слова —
+    # только когда клиент назвал срок словом (у «с 1 сентября по 1 марта» слова нет).
+    long_term_days = hint_days if (hint_days and hint_days >= _LONG_TERM_MIN_DAYS) else None
+    long_term = bool(long_term_days) or _long_term_words(newest) or _long_term_words(recent)
     has_dates = bool(iso_start or term_days) or _has_date_signal(newest)
     has_start = bool(iso_start) or _has_start_signal(newest)   # конкретный старт, НЕ просто длительность
 
@@ -2835,6 +2892,8 @@ def extract_booking_hints(transcript: str, today=None) -> dict:
             "iso_start": iso_start, "iso_end": iso_end, "term_days": term_days,
             "hint_days": hint_days, "monthly": monthly, "has_dates": has_dates,
             "has_start": has_start,
+            "long_term": long_term,                                       # срок от полугода
+            "long_term_days": long_term_days,                             # длина, если ИЗМЕРЕНА датами
             "date_status": date_status,                                   # past|today|tomorrow|future|None
             "start_seen": _seen.isoformat() if _seen else None,           # дата в прочтении клиента
             "deposit_multi_q": deposit_multi_q, "price_sheet_q": price_sheet_q,
@@ -4776,6 +4835,40 @@ _PRICE_SHEET_UNAVAILABLE = (
     "даты и вернёшься в ближайшее время.")
 
 
+# ------------------- ДЛИННАЯ АРЕНДА: третий исход «зову человека» (правило владельца) -------------------
+# ТРЕТИЙ ИСХОД, А НЕ МОЛЧАНИЕ. Правило запрещает и число, и немоту одинаково, поэтому записка
+# требует ПРОИЗНЕСТИ вслух: срок сдаём, но считается отдельно, цену согласует человек. Ни одной
+# ЦИФРЫ в тексте нет намеренно: белый список пост-чека строится из ЛЮБЫХ чисел ценовой записки
+# (_pc_wl_price_numbers), и календарный «182» стал бы разрешённой к произнесению ценой.
+_LONG_TERM_NOTE_RU = (
+    "ДЛИННАЯ АРЕНДА: клиент просит срок от полугода. Цену НЕ называй ВООБЩЕ — ни за сутки, ни за "
+    "неделю, ни за месяц, ни за весь срок, ни по одной модели, ни списком/прайсом по парку, ни "
+    "«от … ฿», ни диапазоном, ни ориентиром, ни из FAQ. Величину скидки тоже НЕ называй: ни в "
+    "процентах, ни в батах, ни словами вроде «отличная скидка выйдет» — её размер не фиксирован "
+    "и правилом не является. МОЛЧАТЬ ТОЖЕ НЕЛЬЗЯ, ответ обязан прозвучать: скажи прямо, что такой "
+    "срок мы сдаём, но считается он ОТДЕЛЬНО и цену на него согласует менеджер; скажи, что "
+    "обсудить нужно две вещи — сам период и размер скидки; скажи, что передаёшь вопрос коллеге "
+    "и он вернётся с условиями. Модель, даты и пожелания уточнить можно — цену нет. Отдельной "
+    "строкой в конце поставь пометку менеджеру: «[уточнить: цена на длинный срок — согласует "
+    "человек]».")
+_LONG_TERM_NOTE_EN = (
+    "LONG RENTAL: the client asks for six months or more. Do NOT quote ANY price — no daily rate, "
+    "no weekly, no monthly, no total, no per-model figure, no fleet price list, no «from …», no "
+    "range, no ballpark, nothing from the FAQ. Do NOT name the size of the discount either: "
+    "neither in percent nor in baht, nor as «a great discount» — its size is not fixed and is not "
+    "a rule. STAYING SILENT IS ALSO FORBIDDEN, you must answer: say plainly that we do rent for "
+    "such a term, but it is priced SEPARATELY and a manager agrees the price; say the two things "
+    "to discuss are the period itself and the size of the discount; say you are passing the "
+    "question to a colleague who will come back with the terms. You may clarify the model, the "
+    "dates and the client's wishes — but not the price. On a separate final line add the note for "
+    "the manager: «[to check: long-term price — agreed by a human]».")
+
+
+def _long_term_note(lang="ru") -> str:
+    """Ценовая записка для срока от полугода: НИ ОДНОГО числа + прямое требование позвать человека."""
+    return _LONG_TERM_NOTE_EN if lang == "en" else _LONG_TERM_NOTE_RU
+
+
 # ------------------- ГЕЙТ ДАТ В ЦЕНОВОМ ПУТИ (прошедший старт / сегодня-завтра) -------------------
 # Инструкции LLM БЕЗ ЕДИНОГО ЧИСЛА ЦЕНЫ: на прошедшем старте цену не называем вообще (пост-чек
 # черновика строит белый список цен из pricing_note — здесь он пуст, значит ЛЮБОЕ число из ответа
@@ -4939,6 +5032,16 @@ def _build_pricing_note_core(hints: dict, lang: str = "ru", getter=None, today=N
     # «N юнитов одной модели» (пара XMAX): цена/депозит Bridge = ЗА КАЖДЫЙ, общий итог не выдумываем.
     _uc = hints.get("units_count")
     units = _units_count_note(_uc, lang) if (_uc and _uc >= 2) else ""
+    # ДЛИННАЯ АРЕНДА — ПЕРВОЙ ВЕТКОЙ, РАНЬШЕ ВСЕХ ЦЕНОВЫХ. Стои́т здесь, а не внутри одной из них,
+    # ровно потому, что ценовых веток ТРИ (сетка парка, точечная котировка, подбор по классу) и
+    # правило обязано погасить ВСЕ ТРИ ОДИНАКОВО: замок в одной оставил бы две говорящими, и
+    # «молчат все строки списка» превратилось бы в «молчит часть». Возврат ДО
+    # build_price_sheet_note снимает и маркер [PRICE_SHEET], и маркер [QUOTE] — значит КОД не
+    # вставит ни сетку, ни строку J, а ensure_price_figure не найдёт что дописать
+    # (computed_price_figures на записке без цифр пуст). Молчания при этом не наступает: записка
+    # ТРЕБУЕТ сказать вслух, что срок считается отдельно, и позвать человека.
+    if hints.get("long_term"):
+        return _long_term_note(lang) + dep
     sheet = build_price_sheet_note(hints, lang=lang, getter=getter, today=today)
     if sheet is not None:
         return sheet + dep
