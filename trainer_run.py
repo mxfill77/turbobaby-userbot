@@ -34,6 +34,9 @@ Bridge — ЖИВОЙ (read-only GET прайса/зон/FAQ): ожидания 
   • ДВА прогона из двух (генератор недетерминирован — один прогон ничего не доказывает);
   • дерево ЧИСТОЕ и `git rev-parse HEAD` не сдвинулся за время прогона (демон коммитит сам —
     вердикт, снятый на плывущем HEAD, удостоверял бы другой код);
+  • НИ ОДНОГО исхода «неизвестно» (22.08.2026): голова, не давшая текста, зелёного не даёт ни
+    одному кейсу — см. узел «МОЛЧАЩАЯ ГОЛОВА = НЕИЗВЕСТНО» ниже. Третье значение `result`
+    — `'unknown'`: для ворот это «не зелёный», но красным прибор называет только то, что уличил.
 Любой провал → зелёная запись НЕ пишется, а прежняя зелёная запись этого коммита СНОСИТСЯ
 (fail-closed, как везде в воротах). Красная запись остаётся для карточки владельцу.
 
@@ -373,31 +376,123 @@ def case_checks(case, draft, exp):
     return out
 
 
+# ────────────────────── МОЛЧАЩАЯ ГОЛОВА = НЕИЗВЕСТНО, а не зелёное ───────────────────────────
+# ЗАМЕР 22.08.2026 (docs/artifacts/2026-08-22-honest-trainer-checks.md), из-за которого этот узел
+# заведён: при МОЛЧАЩЕЙ голове набор оставался зелёным у 7 кейсов из 12 — 66 живых чеков из 112
+# (58.9%). Зелень давал не бот, а КОД: `compose_quote_draft`, `ensure_price_figure`,
+# `ensure_closing_question`, `_append_collected_note` дописывают в черновик текст, по которому и
+# проходят «строка J дословно», «цена цифрой», «сетка прайса дословно», «язык ответа». Чек,
+# проходящий на пустом ответе, проверкой не является — молчащий бот набирал почти шестьдесят
+# процентов набора.
+#
+# ПРАВИЛО. Голова не дала текста → исход кейса НЕИЗВЕСТНО. Не зелёный (доказывать нечем) и не
+# красный (кода мы не уличили — молчала ГРАНИЦА, а не продукт). «Неизвестно» сильнее «доказано»:
+# оно не закрывается ни одним зелёным чеком, в зачёт чеков не идёт и зелёного вердикта не даёт
+# ни одной веткой. Тем же правилом закрыт промах ЗАМЕРА: измерительная обвязка, проигрывающая
+# снимок границы, на промахе отдаёт продукту пустую строку — и до 22.08 это давало ЗЕЛЁНОЕ МОЛЧА
+# (правка промпта EN-ветки → те же «12 из 12»). Теперь промах снимка = «неизвестно».
+#
+# Почему «любой пустой заход», а не «все»: замерено на живом наборе — в здоровом прогоне ПУСТЫХ
+# ответов нет ни одного (13 заходов, минимальный 48 симв., у кейса 2 их два). Значит пустой заход
+# не бывает штатным, и мягкое условие «хоть один ответил» лишь пропускало бы промах пост-чека.
+#
+# Про пин этот узел НИЧЕГО НЕ ЗНАЕТ (замок `trainer_pin`: раннер его не импортирует): признак
+# общий — «ответа головы не существует», и он одинаково ловит и живой таймаут CLI, и промах снимка.
+
+class _HeadWatch(object):
+    """Наблюдатель ответов головы на время ОДНОГО черновика.
+
+    Оборачивает ОБЕ точки входа (`suggest._cli_llm`, `suggest._default_llm`) поверх того, что
+    стои́т в модуле СЕЙЧАС: измерительная обвязка снаружи остаётся ПОД наблюдением, а не мимо
+    него. Оригиналы возвращаются на место в `__exit__` при любом исходе."""
+
+    ATTRS = ("_cli_llm", "_default_llm")
+
+    def __init__(self):
+        self.answers = []            # длины ответов головы, по заходам
+        self.points = 0              # сколько точек входа удалось накрыть (считаем НА ВХОДЕ:
+        self._orig = []              # `_orig` пустеет в `__exit__`, а судим мы уже после него)
+
+    def _wrap(self, real):
+        def wrapped(system, user):
+            out = real(system, user)
+            self.answers.append(len(out or ""))
+            return out
+        return wrapped
+
+    def __enter__(self):
+        for attr in self.ATTRS:
+            real = getattr(suggest, attr, None)
+            if real is None:
+                continue
+            self._orig.append((attr, real))
+            self.points += 1
+            setattr(suggest, attr, self._wrap(real))
+        return self
+
+    def __exit__(self, *exc):
+        for attr, real in reversed(self._orig):
+            setattr(suggest, attr, real)
+        self._orig = []
+        return False
+
+    def silence(self):
+        """Причина «судить нечего» ДОСЛОВНО | None — голова дала текст во всех заходах."""
+        if not self.points:
+            return "точек входа головы в suggest не нашлось — наблюдать нечего"
+        if not self.answers:
+            return "голову не спросили ни разу — ответа продукта не существует"
+        empty = [i + 1 for i, n in enumerate(self.answers) if n <= 0]
+        if empty:
+            return ("голова промолчала: пустых ответов %d из %d (заходы %s, длины %s)"
+                    % (len(empty), len(self.answers), empty, self.answers))
+        return None
+
+
 # ─────────────────────────────────────── прогон ──────────────────────────────────────────────
 
 def run_case(case, ph, log=print):
-    """Один прогон одного кейса → dict(id, name, ok, checks, draft, note)."""
+    """Один прогон одного кейса → dict(id, name, ok, unknown, checks, draft, note).
+
+    `unknown` — дословная причина «судить нечего» либо None. При непустом `unknown` кейс НЕ ЗАЧТЁН
+    (`ok=False`) и его чеки помечены `unknown=True`: они посчитаны и видны в отчёте, но зачёту не
+    подлежат — зелёный чек над текстом, который дописал код, ничего не доказывает."""
     isolate_ipc()                      # боевая мета/очередь недоступны по построению
     tr = build_transcript(case, ph)
     case = dict(case, _transcript=tr)
     first = not trainer.has_manager_turn(tr)
-    draft, note, hints = generate(tr, first)
+    with _HeadWatch() as hw:
+        draft, note, hints = generate(tr, first)
+    silence = hw.silence()             # СНАЧАЛА «неизвестно», и только потом красное: пустой
+    if silence:                        # черновик при молчащей голове — вина границы, не кода
+        checks = (case_checks(case, draft, expectations(case, tr, note, hints))
+                  if (draft or "").strip() else [])
+        for c in checks:
+            c["unknown"] = True
+        return {"id": case.get("id"), "name": case.get("name"), "ok": False, "unknown": silence,
+                "checks": checks, "draft": draft, "note": note}
     if not (draft or "").strip():
-        return {"id": case.get("id"), "name": case.get("name"), "ok": False, "draft": "",
-                "note": note, "checks": [_chk("черновик получен", False,
-                                              "непустой черновик от боевого пайплайна",
-                                              "пустой ответ CLI (таймаут/ошибка головы)")]}
+        return {"id": case.get("id"), "name": case.get("name"), "ok": False, "unknown": None,
+                "draft": "", "note": note,
+                "checks": [_chk("черновик получен", False,
+                                "непустой черновик от боевого пайплайна",
+                                "голова ответила, но черновик пуст — оборвался пайплайн")]}
     checks = case_checks(case, draft, expectations(case, tr, note, hints))
-    return {"id": case.get("id"), "name": case.get("name"),
+    return {"id": case.get("id"), "name": case.get("name"), "unknown": None,
             "ok": all(c["ok"] for c in checks if not c.get("skipped")),
             "checks": checks, "draft": draft, "note": note}
 
 
 def run_corpus(cases, runs=2, ph=None, log=print):
-    """Корпус × runs прогонов → (результаты, passed_cases, checks_passed, checks_total, failed).
-    Кейс зачтён, только если ВСЕ его чеки зелёные в КАЖДОМ прогоне (flake-контроль артефакта)."""
+    """Корпус × runs прогонов → (результаты, passed_cases, checks_passed, checks_total, failed,
+    unknown). Кейс зачтён, только если ВСЕ его чеки зелёные в КАЖДОМ прогоне (flake-контроль
+    артефакта) и НИ В ОДНОМ прогоне исход не был «неизвестно».
+
+    Чеки кейса с исходом НЕИЗВЕСТНО не идут НИ в `checks_passed`, НИ в `checks_total`, НИ в
+    `failed`: они не зелёные (доказывать нечем) и не красные (продукт не уличён). Иначе вышло бы
+    одно из двух вранья — либо зелень над текстом кода, либо обвинение кода в молчании границы."""
     ph = ph or placeholders()
-    results, failed = [], []
+    results, failed, unknown = [], [], []
     passed = checks_ok = checks_all = 0
     for case in cases:
         cid = case.get("id")
@@ -408,36 +503,51 @@ def run_corpus(cases, runs=2, ph=None, log=print):
             res["run"] = r
             res["sec"] = round(time.time() - t0, 1)
             results.append(res)
-            for c in res["checks"]:
-                if c.get("skipped"):
-                    continue                       # снят с причиной — в счёт не идёт (виден в отчёте)
-                checks_all += 1
-                checks_ok += 1 if c["ok"] else 0
-                if not c["ok"]:
-                    failed.append(f"{cid}/{r} {c['name']}")
-            case_ok = case_ok and res["ok"]
+            unk = res.get("unknown")
+            if unk:
+                unknown.append(f"{cid}/{r} {unk}")
+            else:
+                for c in res["checks"]:
+                    if c.get("skipped"):
+                        continue                   # снят с причиной — в счёт не идёт (виден в отчёте)
+                    checks_all += 1
+                    checks_ok += 1 if c["ok"] else 0
+                    if not c["ok"]:
+                        failed.append(f"{cid}/{r} {c['name']}")
+            case_ok = case_ok and res["ok"] and not unk
             skipped = [c["name"] for c in res["checks"] if c.get("skipped")]
             log("  [%s] кейс %s «%s» прогон %d/%d — %s (%.0fс)%s"
-                % ("OK " if res["ok"] else "RED", cid, case.get("name"), r, runs,
-                   "все чеки зелёные" if res["ok"] else
-                   "провалено: " + ", ".join(c["name"] for c in res["checks"]
-                                             if not c["ok"] and not c.get("skipped")),
+                % ("UNK" if unk else ("OK " if res["ok"] else "RED"), cid, case.get("name"), r, runs,
+                   ("НЕИЗВЕСТНО: " + str(unk)) if unk else
+                   ("все чеки зелёные" if res["ok"] else
+                    "провалено: " + ", ".join(c["name"] for c in res["checks"]
+                                              if not c["ok"] and not c.get("skipped"))),
                    res["sec"], (" [снято: " + ", ".join(skipped) + "]") if skipped else ""))
         passed += 1 if case_ok else 0
-    return results, passed, checks_ok, checks_all, failed
+    return results, passed, checks_ok, checks_all, failed, unknown
 
 
 # ─────────────────────────────────────── вердикт ─────────────────────────────────────────────
 
 def build_verdict(commit, cases_total, passed, checks_ok, checks_all, runs, clean, failed,
-                  sha, now=None):
-    """Запись вердикта РОВНО в том виде, который читают ворота (client_contour.trainer_verdict)."""
+                  sha, now=None, unknown=None):
+    """Запись вердикта РОВНО в том виде, который читают ворота (client_contour.trainer_verdict).
+
+    `unknown` — список исходов «судить нечего» (молчащая голова). Он ГАСИТ зелёное, но красным
+    прогон не называет: `result` получает третье значение `'unknown'`. Для ворот это то же самое
+    «не зелёный» (они сверяют `result == 'green'`, а `write_verdict` кладёт всё не-зелёное в
+    fail-closed ящик), но владельцу в карточке больше не врут словом «КРАСНЫЙ» про то, чего
+    прибор не измерил."""
     now = time.time() if now is None else now
-    green = (passed == cases_total >= client_contour.TRAINER_MIN_CASES
+    unknown = list(unknown or [])
+    green = (not unknown
+             and passed == cases_total >= client_contour.TRAINER_MIN_CASES
              and checks_all > 0 and checks_ok == checks_all
              and runs >= client_contour.TRAINER_MIN_RUNS and clean and not failed)
     return {
-        "commit": commit, "result": "green" if green else "red",
+        "commit": commit,
+        "result": "green" if green else ("red" if failed or not unknown else "unknown"),
+        "unknown": len(unknown), "unknown_why": unknown[:40],
         "checks_passed": checks_ok, "checks_total": checks_all,
         "cases": passed, "cases_total": cases_total, "runs": runs, "clean": bool(clean),
         "corpus": os.path.basename(CASES_FILE), "corpus_sha": sha,
@@ -492,17 +602,22 @@ def report_md(rec, results, commit, runs):
              f"{'чистое' if rec['clean'] else 'ГРЯЗНОЕ'} · **корпус:** {rec['corpus']} "
              f"(`{rec['corpus_sha']}`)", "",
              f"**Кейсы:** {rec['cases']}/{rec['cases_total']} · "
-             f"**чеки:** {rec['checks_passed']}/{rec['checks_total']}", "",
+             f"**чеки:** {rec['checks_passed']}/{rec['checks_total']}"
+             + (f" · **неизвестно:** {rec.get('unknown')} кейсо-прогонов"
+                if rec.get("unknown") else ""), "",
              "| # | кейс | прогон | итог | чеки | провалено |", "|---|---|---|---|---|---|"]
     for r in results:
         live = [c for c in r["checks"] if not c.get("skipped")]
         bad = [c["name"] for c in live if not c["ok"]]
         skipped = ["%s (%s)" % (c["name"], c["skipped"]) for c in r["checks"] if c.get("skipped")]
-        lines.append("| %s | %s | %s | %s | %d/%d | %s |"
-                     % (r["id"], r["name"], r["run"], "🟢" if r["ok"] else "🔴",
-                        sum(1 for c in live if c["ok"]), len(live),
-                        ", ".join(bad) or ("снято: " + "; ".join(skipped) if skipped else "—")))
-    bad_rows = [r for r in results if not r["ok"]]
+        lines.append("| %s | %s | %s | %s | %s | %s |"
+                     % (r["id"], r["name"], r["run"],
+                        "🟡" if r.get("unknown") else ("🟢" if r["ok"] else "🔴"),
+                        "—" if r.get("unknown") else "%d/%d" % (sum(1 for c in live if c["ok"]),
+                                                                len(live)),
+                        str(r["unknown"]) if r.get("unknown") else
+                        (", ".join(bad) or ("снято: " + "; ".join(skipped) if skipped else "—"))))
+    bad_rows = [r for r in results if not r["ok"] and not r.get("unknown")]
     if bad_rows:
         lines += ["", "## Провалы — ОЖИДАНИЕ / ФАКТ", ""]
         for r in bad_rows:
@@ -553,7 +668,7 @@ def main(argv=None):
     print(f"ПРОГОН ТРЕНАЖЁРА: коммит {commit[:7]}, кейсов {len(cases)} из {total}, "
           f"прогонов {a.runs}, дерево {'чистое' if clean else 'ГРЯЗНОЕ: ' + ', '.join(dirty or ['?'])}")
     ph = placeholders()
-    results, passed, ok, allc, failed = run_corpus(cases, runs=a.runs, ph=ph)
+    results, passed, ok, allc, failed, unknown = run_corpus(cases, runs=a.runs, ph=ph)
 
     head_after = head_commit()
     if head_after != commit:
@@ -561,10 +676,14 @@ def main(argv=None):
               f"{head_after[:7] or '?'}) — вердикт удостоверял бы другой код")
         return 2
 
-    rec = build_verdict(commit, total, passed, ok, allc, a.runs, clean, failed, sha)
-    print("\nИТОГ: %s — кейсов %d/%d, чеков %d/%d, прогонов %d, дерево %s"
+    rec = build_verdict(commit, total, passed, ok, allc, a.runs, clean, failed, sha,
+                        unknown=unknown)
+    print("\nИТОГ: %s — кейсов %d/%d, чеков %d/%d, прогонов %d, дерево %s%s"
           % (rec["result"].upper(), rec["cases"], rec["cases_total"], rec["checks_passed"],
-             rec["checks_total"], rec["runs"], "чистое" if clean else "ГРЯЗНОЕ"))
+             rec["checks_total"], rec["runs"], "чистое" if clean else "ГРЯЗНОЕ",
+             (", НЕИЗВЕСТНО %d кейсо-прогонов" % len(unknown)) if unknown else ""))
+    if unknown:
+        print("неизвестно (судить нечего): " + "; ".join(unknown[:12]))
     if failed:
         print("провалено: " + "; ".join(failed[:20]))
     if a.drafts:

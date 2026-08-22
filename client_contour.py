@@ -402,8 +402,12 @@ def trainer_verdict(commit, path=None, env=None, cases_path=None):
     if not isinstance(rec, dict):
         r = red.get(c)
         if isinstance(r, dict):
-            return False, ("вердикт КРАСНЫЙ: чеков %s/%s, кейсов %s/%s (прогон %s)"
-                           % (r.get("checks_passed"), r.get("checks_total"), r.get("cases"),
+            # Ящик один (fail-closed), но СЛОВО берём из самой записи: с 22.08.2026 прогон умеет
+            # третий исход — «неизвестно» (молчащая голова, судить нечего). Назвать его КРАСНЫМ
+            # значило бы обвинить код в том, чего прибор не измерил.
+            return False, ("вердикт %s: чеков %s/%s, кейсов %s/%s (прогон %s)"
+                           % ({"unknown": "НЕИЗВЕСТНО"}.get(str(r.get("result") or ""), "КРАСНЫЙ"),
+                              r.get("checks_passed"), r.get("checks_total"), r.get("cases"),
                               r.get("cases_total"), r.get("when") or "?"))
         if g:
             return False, ("вердикта на этот коммит нет (последний зелёный — на %s)"

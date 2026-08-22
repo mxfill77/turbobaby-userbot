@@ -16,6 +16,7 @@ import tempfile
 import unittest
 
 import client_contour as cc
+import suggest
 import trainer_run as tr
 
 REPO = os.path.dirname(os.path.abspath(__file__))
@@ -278,6 +279,105 @@ class TestKorpus(unittest.TestCase):
 
     def test_sha_korpusa_sovpadaet_s_vorotami(self):
         self.assertEqual(self.sha, cc.corpus_sha())
+
+
+# ─────────────────── 6. МОЛЧАЩАЯ ГОЛОВА = НЕИЗВЕСТНО (22.08.2026) ───────────────────
+# Замер, из-за которого узел заведён (docs/artifacts/2026-08-22-honest-trainer-checks.md):
+# 66 живых чеков из 112 были ЗЕЛЕНЫ при МОЛЧАЩЕЙ голове — их закрывал текст, который дописывает
+# КОД (compose_quote_draft / ensure_price_figure / ensure_closing_question). Молчащий бот набирал
+# 58.9% набора, а промах снимка границы давал «12 из 12» МОЛЧА.
+
+class TestMolchashchayaGolova(unittest.TestCase):
+    def setUp(self):
+        self.orig = {a: getattr(suggest, a) for a in tr._HeadWatch.ATTRS}
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for a, f in self.orig.items():
+            setattr(suggest, a, f)
+
+    def test_nablyudatel_vozvrashchaet_originaly(self):
+        """Наблюдатель обязан быть беспоследственным: боевые точки входа возвращаются на место."""
+        with tr._HeadWatch():
+            self.assertIsNot(suggest._cli_llm, self.orig["_cli_llm"])
+        for a, f in self.orig.items():
+            self.assertIs(getattr(suggest, a), f, f"наблюдатель не вернул {a} на место")
+
+    def test_golova_otvetila_sudit_mozhno(self):
+        suggest._cli_llm = lambda s, u: "ответ головы"
+        with tr._HeadWatch() as hw:
+            suggest._cli_llm("s", "u")
+        self.assertIsNone(hw.silence(), "живой ответ не должен объявляться неизвестностью")
+
+    def test_pustoi_otvet_eto_neizvestno(self):
+        suggest._cli_llm = lambda s, u: ""
+        with tr._HeadWatch() as hw:
+            suggest._cli_llm("s", "u")
+        self.assertIn("промолчала", hw.silence() or "")
+
+    def test_hot_odin_pustoi_zahod_eto_neizvestno(self):
+        """У кейса 2 заходов ДВА (черновик + пост-чек). Пустой ЛЮБОЙ — судить нечего: в здоровом
+        прогоне пустых ответов нет ни одного (замер 22.08: 13 заходов, минимальный 48 симв.),
+        значит пустой заход штатным не бывает."""
+        suggest._cli_llm = lambda s, u: ("текст" if u == "1" else "")
+        with tr._HeadWatch() as hw:
+            suggest._cli_llm("s", "1")
+            suggest._cli_llm("s", "2")
+        self.assertIn("промолчала", hw.silence() or "")
+
+    def test_golovu_ne_sprosili_tozhe_neizvestno(self):
+        """Ни одного захода — это тоже «ответа продукта не существует», а не «всё хорошо»."""
+        with tr._HeadWatch() as hw:
+            pass
+        self.assertIn("не спросили", hw.silence() or "")
+
+    def test_neizvestno_gasit_zelenyi_verdikt(self):
+        """Все чеки зелёные, все кейсы зачтены — и всё равно НЕ зелёный: «неизвестно» сильнее."""
+        rec = tr.build_verdict(C40, 12, 12, 96, 96, 2, True, [], cc.corpus_sha(), now=1.0,
+                               unknown=["8/1 голова промолчала"])
+        self.assertEqual(rec["result"], "unknown")
+        self.assertEqual(rec["unknown"], 1)
+
+    def test_neizvestno_ne_otkryvaet_vorota_i_ne_zovetsya_krasnym(self):
+        """Ворота держат (fail-closed), но владельцу не врут словом «КРАСНЫЙ» про неизмеренное."""
+        d = tempfile.mkdtemp(prefix="trrun_unk_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        v = os.path.join(d, "verdict.json")
+        rec = tr.build_verdict(C40, 12, 12, 96, 96, 2, True, [], cc.corpus_sha(), now=1.0,
+                               unknown=["8/1 голова промолчала"])
+        ok, _p = tr.write_verdict(rec, v)
+        self.assertTrue(ok)
+        self.assertFalse(cc.trainer_green(C40, path=v, env={}))
+        why = cc.trainer_status(C40, path=v, env={})
+        self.assertIn("НЕИЗВЕСТНО", why)
+        self.assertNotIn("КРАСНЫЙ", why)
+
+    def test_cheki_neizvestnogo_keisa_ne_idut_ni_v_zachet_ni_v_provaly(self):
+        """Зелёный чек над текстом, который дописал КОД, не доказывает ничего — но и продукт в
+        молчании границы не виноват: такие чеки не считаются НИ зелёными, НИ красными."""
+        saved = tr.run_case
+        self.addCleanup(setattr, tr, "run_case", saved)
+        tr.run_case = lambda case, ph, log=print: {
+            "id": case["id"], "name": "тест", "ok": False, "unknown": "голова промолчала",
+            "checks": [{"name": "нет годов", "ok": True, "unknown": True}], "draft": "d", "note": ""}
+        res, passed, ok, allc, failed, unknown = tr.run_corpus(
+            [{"id": 1}], runs=1, ph={}, log=lambda *a, **k: None)
+        self.assertEqual((passed, ok, allc, failed), (0, 0, 0, []))
+        self.assertEqual(len(unknown), 1)
+        self.assertIn("голова промолчала", unknown[0])
+        self.assertEqual(len(res), 1)
+
+    def test_run_case_zovet_nablyudatelya(self):
+        """Структурный замок: правило можно снять только ЯВНО, а не тем, что кто-то однажды
+        вынесет наблюдателя из `run_case` и не заметит возврата 66 зелёных на пустой голове."""
+        with io.open(os.path.join(REPO, "trainer_run.py"), encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename="trainer_run.py")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "run_case":
+                names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+                self.assertIn("_HeadWatch", names, "run_case перестал наблюдать голову")
+                return
+        raise AssertionError("функции run_case нет")
 
 
 if __name__ == "__main__":
