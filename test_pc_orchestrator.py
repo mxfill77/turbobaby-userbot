@@ -10516,5 +10516,220 @@ class TestSelfUpdateDepClosure(Base):
                                    doraise=True)
 
 
+# ═══ ДОКЛАД НА ИСХОДЕ БЮДЖЕТА (класс 22.08.2026) ═══════════════════════════════════════════════
+# Ночь 21→22.08, две задачи, один почерк: работа сдана, а владелец не получил ни слова.
+#   id=21 — потолок 2700с выбран полностью, последний вызов инструмента на −63с. К этой секунде
+#          артефакт лежал на диске (−1083с), коммит и пуш прошли (−514/−508с), строки ARTIFACT и
+#          DONE легли в журнал (−170с и −63с). Убит НА ВЫДАЧЕ ОТЧЁТА.
+#   id=81 — то же место, 21.08: убит через 19.9с после коммита артефакта.
+# Причина не в длине доклада: хвост «последний вызов → отчёт в руках» по 41 закрытой задаче
+# 20–22.08 — медиана 57с · p90 88с · max 143с (2.1% и 5.3% потолка). Причина в том, что доклад
+# НЕДЕЛИМ и стои́т последним: `run_claude` на таймауте выбрасывает буфер ребёнка целиком, и отчёт,
+# готовый на 99%, стоит ноль. Лечим не потолком, а вторым каналом — файлом на диске.
+class TestReportDraftReachesOwner(Base):
+    """ОТРИЦАТЕЛЬНЫЙ ТЕСТ пункта 6: заход упирается в потолок — доклад обязан доехать."""
+
+    DRAFT = ("## СДЕЛАНО\n- правка легла, гейт зелёный, коммит 0be1ea6\nFACT: commit 0be1ea6\n\n"
+             "## НЕ СДЕЛАНО\n- раздел в узел карты не записан\n\n"
+             "## НЕИЗВЕСТНО\n- успеет ли доклад: бюджет на исходе\n")
+
+    def setUp(self):
+        super(TestReportDraftReachesOwner, self).setUp()
+        self.repo = tempfile.mkdtemp(prefix="rdraft_repo_")
+        self.addCleanup(shutil.rmtree, self.repo, True)
+        self._repo_patch = mock.patch.object(o, "REPO", self.repo)
+        self._repo_patch.start()
+        self.addCleanup(self._repo_patch.stop)
+
+    def _run_and_die(self, tid, draft=DRAFT, token_shift="", raise_timeout=True, rc=0, out=""):
+        """Фикстура ЖИВОГО обрыва: заход успел положить черновик — и упёрся в потолок.
+
+        Черновик пишет САМ фейковый claude, как это делает живой заход: иначе тест проверял бы
+        файл, положенный тестом, а не канал, которым заход пользуется."""
+        def fake(prompt, timeout, cwd, env):
+            self.prompt = prompt
+            tok = env.get(o.MARKER_TOKEN_ENV, "") + token_shift
+            if draft is not None:
+                p = o.report_draft.draft_path(tid, tok, o.REPO)
+                o.report_draft.ensure_dir(p)
+                with io.open(p, "w", encoding="utf-8") as fh:
+                    fh.write(draft)
+            if raise_timeout:
+                raise TimeoutError("timeout")
+            return (rc, out, "")
+        o.run_claude = fake
+
+    # ── ГЛАВНЫЙ ЗАМОК ────────────────────────────────────────────────────────────────────────
+    def test_potolok_vremeni_a_doklad_vsyo_ravno_doekhal(self):
+        tid = self.fb.add(status="new")
+        self._run_and_die(tid)
+        o.process_new()
+        t = self.fb.tasks[tid]
+        self.assertEqual(t["status"], "failed", "исход прогона не подменяем")
+        res = t["result"]
+        for head in o.report_draft.HEADS:      # что сделано, что не сделано, что неизвестно
+            self.assertIn(head, res, "раздел «%s» до владельца не доехал" % head)
+        self.assertIn("0be1ea6", res, "живой факт захода потерян")
+        self.assertIn("бюджет на исходе", res)
+
+    def test_slova_zakhoda_stoyat_PERED_prichinoi_i_ulikami(self):
+        """Обрезка `_cap_result` ест ХВОСТ. Улики по git восстановимы задним числом всегда,
+        слова захода — ничем; значит они обязаны стоять первыми, а не последними."""
+        tid = self.fb.add(status="new")
+        self._run_and_die(tid)
+        o.process_new()
+        res = self.fb.tasks[tid]["result"]
+        self.assertLess(res.index(o.report_draft.HEAD_DONE), res.index("причина="),
+                        "черновик обязан стоять ДО причины провала")
+
+    def test_marker_prichiny_ostalsya_pervym_simvolom(self):
+        """Гейты самопочинки и цепей смотрят на ПЕРВЫЙ символ итога — черновик его не смещает."""
+        tid = self.fb.add(status="new")
+        self._run_and_die(tid)
+        o.process_new()
+        self.assertTrue(self.fb.tasks[tid]["result"].startswith(o.TIMEOUT_MARK),
+                        self.fb.tasks[tid]["result"][:80])
+
+    def test_zakhod_promolchal_i_ob_etom_skazano_pryamo(self):
+        """Третий исход: «заход ничего не сказал» ≠ «демон не смотрел». Без этой строки владелец
+        двух новостей не различит — тот же контракт, что у `parse_outcome`."""
+        tid = self.fb.add(status="new")
+        self._run_and_die(tid, draft=None)
+        o.process_new()
+        res = self.fb.tasks[tid]["result"]
+        self.assertIn("черновика доклада заход не оставил", res)
+        self.assertTrue(res.startswith(o.TIMEOUT_MARK))
+
+    def test_chernovik_chuzhogo_progona_ne_chitaetsya(self):
+        """Номера задач очередь ПЕРЕИСПОЛЬЗУЕТ. Токен в имени файла — замок по построению."""
+        tid = self.fb.add(status="new")
+        self._run_and_die(tid, token_shift="-CHUZHOI")
+        o.process_new()
+        res = self.fb.tasks[tid]["result"]
+        self.assertNotIn("0be1ea6", res, "прочитан черновик ЧУЖОГО прогона")
+        self.assertIn("не оставил", res)
+
+    def test_abzats_pro_chernovik_doekhal_do_ispolnitelya(self):
+        tid = self.fb.add(status="new")
+        self._run_and_die(tid)
+        o.process_new()
+        self.assertIn(o.report_draft.DRAFT_REL_DIR, self.prompt)
+        self.assertIn("task%d-" % tid, self.prompt)
+        for head in o.report_draft.HEADS:
+            self.assertIn(head, self.prompt)
+
+    def test_pustoi_stdout_tozhe_otdayot_chernovik(self):
+        """Пустой stdout — вторая ветка, где своих слов у захода не остаётся вовсе."""
+        tid = self.fb.add(status="new")
+        self._run_and_die(tid, raise_timeout=False, rc=0, out="")
+        o.process_new()
+        res = self.fb.tasks[tid]["result"]
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertIn("0be1ea6", res)
+
+    def test_net_stroki_RESULT_tozhe_otdayot_chernovik(self):
+        tid = self.fb.add(status="new")
+        self._run_and_die(tid, raise_timeout=False, rc=0, out="я работал и молчу про итог")
+        o.process_new()
+        res = self.fb.tasks[tid]["result"]
+        self.assertIn("insufficient_output", res)
+        self.assertIn(o.report_draft.HEAD_NOT_DONE, res)
+
+    def test_uspeshnyi_zakhod_chernovikom_ne_zasoryayetsya(self):
+        """Доехал отчёт — черновик в итог НЕ лезет: иначе владелец читает одно и то же дважды."""
+        tid = self.fb.add(status="new")
+        self._run_and_die(tid, raise_timeout=False, rc=0, out="всё сделал\nRESULT: сделал")
+        o.process_new()
+        t = self.fb.tasks[tid]
+        self.assertEqual(t["status"], "done")
+        self.assertNotIn(o.report_draft.BLOCK_HEAD, t["result"])
+
+    def test_taimaut_podtverzhdeniya_otdayot_slova_zakhoda(self):
+        """Живой случай id=23 (22.08): работа сдана и закоммичена, а `complete_task` записал
+        поверх «подтверждение не получено за 46 мин». Черновик лежит на диске, а не в поле ряда,
+        поэтому переживает перезапись."""
+        tid = self.fb.add(status="new")
+        self._run_and_die(tid, raise_timeout=False, rc=0, out="")
+        self._save_run = o.run_claude
+        base = o.run_claude
+
+        def fake(prompt, timeout, cwd, env):     # заход упёрся в КРАСНОЕ, положив черновик
+            base(prompt, timeout, cwd, env)
+            tok = env.get(o.MARKER_TOKEN_ENV, "")
+            with open(env[o.ASK_MARKER_ENV], "a", encoding="utf-8") as f:
+                f.write(tok + o.MARKER_SEP + "🔴 Хочу обратиться к .env — разрешить?\n")
+            return (0, "", "")
+        o.run_claude = fake
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "needs_approval")
+        self.fb.tasks[tid]["updated"] = iso_ago(o.APPROVAL_TTL + 60)
+        o.process_approval_timeouts()
+        t = self.fb.tasks[tid]
+        self.assertEqual(t["status"], "failed")
+        self.assertIn("подтверждение не получено", t["result"])
+        self.assertIn("0be1ea6", t["result"], "слова захода стёрты закрытием карточки")
+        self.assertIn(o.report_draft.HEAD_UNKNOWN, t["result"])
+
+    def test_chernovik_ne_ronyaet_zakrytie_zadachi(self):
+        """Fail-safe: сломанный черновик обязан стоить ноль, а не задачу."""
+        tid = self.fb.add(status="new")
+        self._run_and_die(tid)
+        with mock.patch.object(o.report_draft, "render",
+                               side_effect=RuntimeError("черновик сломан")):
+            o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertIn("причина=run_timeout", self.fb.tasks[tid]["result"])
+
+
+class TestTaskStartMarkRecycled(unittest.TestCase):
+    """ОКНО УЛИК ОБЯЗАНО БЫТЬ ОКНОМ ЭТОЙ ЗАДАЧИ. Живой замер 22.08: у id=21 отметка старта была
+    от 15.08 (окно 6.4 суток, 185 коммитов), у id=23 — от 16.08 (5.2 суток, 162 коммита). Фраза
+    «в окне задачи есть работа» при таком окне не значит ничего."""
+
+    def setUp(self):
+        self.p = os.path.join(tempfile.mkdtemp(prefix="marks_"), "task_started.json")
+
+    def test_porog_vyveden_a_ne_naznachen(self):
+        """Прогон + жизнь карточки + виток: дольше ОДИН ряд ждать второго прогона не может."""
+        self.assertEqual(o.TASK_START_RECLAIM, o.TASK_TIMEOUT + o.APPROVAL_TTL + o.POLL_SEC)
+        self.assertGreater(o.TASK_START_RECLAIM, o.TASK_TIMEOUT + o.APPROVAL_TTL,
+                           "виток, которым демон замечает ответ, обязан входить в порог")
+
+    def test_svezhaya_otmetka_ne_perezapisyvaetsya(self):
+        """Прежнее поведение цело: у одобренной задачи работа шла в ПЕРВОМ прогоне."""
+        first = o._task_started_mark(7, now=iso_dt(o.TASK_START_RECLAIM - 60), path=self.p)
+        again = o._task_started_mark(7, path=self.p)
+        self.assertEqual(first, again)
+
+    def test_staraya_otmetka_eto_drugaya_zadacha_s_tem_zhe_nomerom(self):
+        old = o._task_started_mark(7, now=iso_dt(o.TASK_START_RECLAIM + 60), path=self.p)
+        new = o._task_started_mark(7, path=self.p)
+        self.assertNotEqual(old, new)
+        self.assertLess((datetime.datetime.now(datetime.timezone.utc)
+                         - o._task_started_get(7, path=self.p)).total_seconds(), 60)
+
+    def test_zhivoi_sluchai_id21_okno_bylo_6_sutok(self):
+        """Дословные числа из pc_orchestrator.log: claim 21.08 19:57 UTC, отметка от 15.08 10:29."""
+        mark = datetime.datetime(2026, 8, 15, 10, 29, 56, tzinfo=datetime.timezone.utc)
+        claim = datetime.datetime(2026, 8, 21, 19, 57, 15, tzinfo=datetime.timezone.utc)
+        self.assertGreater((claim - mark).total_seconds(), 6 * 86400)
+        self.assertTrue(o._mark_is_recycled({"at": mark.isoformat()}, claim))
+
+    def test_bituyu_otmetku_ne_trogaem(self):
+        """«Возраст не разобрать» обязано означать ОСТОРОЖНОСТЬ, а не бодрое затирание."""
+        for bad in ({"at": "не-дата"}, {}, {"at": ""}, None, {"at": None}):
+            with self.subTest(bad=bad):
+                self.assertFalse(o._mark_is_recycled(
+                    bad, datetime.datetime.now(datetime.timezone.utc)))
+
+    def test_adres_chernovika_lozhitsya_v_otmetku_i_perezapisyvaetsya(self):
+        o._task_started_mark(7, path=self.p)
+        o._task_started_draft(7, "tmp/pc_report/task7-a.md", path=self.p)
+        self.assertEqual(o._task_started_rec(7, path=self.p)["draft"], "tmp/pc_report/task7-a.md")
+        o._task_started_draft(7, "tmp/pc_report/task7-b.md", path=self.p)
+        self.assertEqual(o._task_started_rec(7, path=self.p)["draft"], "tmp/pc_report/task7-b.md",
+                         "у второй попытки headless свой токен, значит и свой черновик")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

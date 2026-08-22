@@ -59,6 +59,7 @@ import card_terminal_log      # ТЕРМИНАЛ карточки → строк
 import parse_outcome          # КОНТРАКТ читателя живого текста: осмотрено/разобрано + третий исход «неразбор»
 import result_spill           # обрезка отчёта, которая НАЗЫВАЕТ СЕБЯ + тело на диск ДО реза; чистая, без сети
 import result_ref             # АДРЕС РЕЗУЛЬТАТА шага (вид+указатель): место, куда его класть; чистый, НИЧЕГО не проверяет
+import report_draft           # ЧЕРНОВИК ДОКЛАДА захода: его слова, уцелевшие при обрыве; чистый, ничего не удаляет
 try:
     # Словарь ВИДОВ красных операций и разбор карточки — у гарда, и только у него: демону нужно
     # понять, НА ЧТО именно владелец сказал «да» (`kinds_from_card`), а держать второй список
@@ -1050,6 +1051,18 @@ FAIL_CODE_RE = re.compile(r"причина=([a-z_]+)")   # разбор кода
 # 61 осталась без окна вовсе. Файл маленький и с капом — это не состояние, а метки времени.
 TASK_START_FILE = _state(os.path.join(REPO, "pc_orchestrator.task_started.json"))
 TASK_START_KEEP = 200
+# ── НОМЕР ЗАДАЧИ ОЧЕРЕДЬ ПЕРЕИСПОЛЬЗУЕТ, И ОТМЕТКА ЭТОГО НЕ ЗНАЛА (класс 22.08.2026) ──────────
+# `_task_started_mark` не перезаписывает ПЕРВУЮ отметку — и правильно делает: у одобренной задачи
+# работа шла в первом прогоне, approve лишь вернул ряд в очередь. Но нумерация очереди начинается
+# заново, и тот же id приходит НОВОЙ задачей через дни. Живой замер ночи 21→22.08:
+#   id=21 взята 21.08 19:57 UTC, отметка в файле — 15.08 10:29 → окно улик 6.4 суток, 185 коммитов;
+#   id=23 взята 21.08 21:13 UTC, отметка — 16.08 16:49 → окно 5.2 суток, 162 коммита.
+# Владелец читал «в окне задачи есть работа» про чужие шесть суток — то есть про ничто.
+# ПОРОГ НЕ НАЗНАЧЕН, А ВЫВЕДЕН: дольше «прогон + жизнь карточки + виток» один и тот же ряд ждать
+# своего ВТОРОГО прогона не может по построению — `run_claude` режет по TASK_TIMEOUT жёстко,
+# карточка старше APPROVAL_TTL умирает сама (`process_approved` :3190), а виток нужен демону,
+# чтобы ответ заметить. Всё, что старше, — ДРУГАЯ задача с тем же номером.
+TASK_START_RECLAIM = TASK_TIMEOUT + APPROVAL_TTL + POLL_SEC   # 5520с = 92 мин
 # ЛИЧНОСТЬ ЭТОГО ЗАПУСКА демона: PID плюс момент старта. Нужна там, где «эту отметку делал я»
 # решает судьбу задачи: голый PID Windows переиспользует, и одно совпадение номера после рестарта
 # выдало бы чужую живую задачу за свою брошенную. Считается один раз при импорте — как и положено
@@ -1124,18 +1137,43 @@ def _task_started_write(st, tid, path=None):
         return False
 
 
+def _mark_is_recycled(rec, now, reclaim=None):
+    """Отметка принадлежит ДРУГОЙ задаче с тем же номером? → True | False. Чистая функция.
+
+    Возраст неизвестен (отметка битая, времени не разобрать) → False: «не знаю» здесь обязано
+    означать ОСТОРОЖНОСТЬ, то есть прежнее поведение, а не бодрое затирание чужой отметки."""
+    raw = _started_at_raw(rec)
+    if not raw:
+        return False
+    try:
+        t = datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception as e:      # noqa: BLE001 — молчать тут нельзя: отметку мы читать не смогли
+        log.warning("отметка старта не разобрана (%r → %s) — считаю её СВОЕЙ и не трогаю", raw, e)
+        return False
+    if not t.tzinfo:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return (now - t).total_seconds() > (TASK_START_RECLAIM if reclaim is None else reclaim)
+
+
 def _task_started_mark(tid, now=None, path=None):
     """Отметить момент CLAIM задачи на диске. → ISO отметки. ПЕРВАЯ отметка не перезаписывается:
     у одобренной задачи работа шла в ПЕРВОМ прогоне, а approve только вернул её в очередь.
+    ИСКЛЮЧЕНИЕ ровно одно — отметка старше `TASK_START_RECLAIM`: столько ОДИН ряд ждать своего
+    второго прогона не может, значит номер переиспользован очередью и отметка чужая (см. разбор
+    у самой константы: у id=21 и id=23 окна улик были 6.4 и 5.2 суток).
 
     Вместе с моментом пишем PID ЭТОГО процесса демона. Он нужен реаперу: демон одноворкерный и
     синхронный, поэтому «отметку сделал я, а исполняю сейчас не эту задачу» = у задачи нет живого
     ребёнка. Без PID тот же вывод пришлось бы изображать молчанием."""
     st = _task_started_read(path)
     key = str(tid)
-    if key in st:
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if key in st and not _mark_is_recycled(st[key], now):
         return _started_at_raw(st[key])
-    st[key] = {"at": (now or datetime.datetime.now(datetime.timezone.utc)).isoformat(),
+    if key in st:      # тот же номер, но ДРУГАЯ задача: окно улик берём от НАСТОЯЩЕГО claim
+        log.info("отметка старта id=%s старше %sс (%s) — номер переиспользован очередью, "
+                 "отметку ставлю заново", tid, TASK_START_RECLAIM, _started_at_raw(st[key]))
+    st[key] = {"at": now.isoformat(),
                "pid": os.getpid(), "proc": _PROC_TOKEN}
     if len(st) > TASK_START_KEEP:        # кап: отметки давно закрытых задач никому не нужны
         for k in sorted(st, key=lambda x: _started_at_raw(st[x]))[:len(st) - TASK_START_KEEP]:
@@ -1168,6 +1206,48 @@ def _task_started_child(tid, child_pid, path=None):
     rec.setdefault("pid", os.getpid())
     st[key] = rec
     _task_started_write(st, tid, path)
+
+
+def _task_started_draft(tid, rel, path=None):
+    """Записать АДРЕС черновика доклада в отметку задачи. Перезапись сознательна — ровно как у
+    `child`: у второй попытки headless свой токен запуска, а значит и свой файл черновика.
+
+    Зачем в отметке, а не поиском по номеру: ветки таймаута подтверждения (`process_approved`,
+    `process_approval_timeouts`) живут ВНЕ прогона, токена не видят, и «взять свежий файл по id»
+    подняло бы черновик прошлой жизни этого номера — тот же класс, что чинит TASK_START_RECLAIM."""
+    if not tid or not rel:
+        return
+    st = _task_started_read(path)
+    key = str(tid)
+    rec = st.get(key)
+    rec = dict(rec) if isinstance(rec, dict) else {"at": _started_at_raw(rec)}
+    rec["draft"] = str(rel)
+    rec.setdefault("pid", os.getpid())
+    st[key] = rec
+    _task_started_write(st, tid, path)
+
+
+def _draft_block(tid, rel=None, path=None):
+    """Блок черновика доклада для итога задачи | "" (адреса не знаем). Читает ТОЛЬКО тот файл,
+    что записан отметкой этого прогона: «свежайший по номеру» здесь запрещён по построению.
+
+    Молчание захода в блок ПОПАДАЕТ («черновика не оставил»), и это не многословие: без такой
+    строки владелец не отличит «заход ничего не сказал» от «демон не смотрел» — ровно тот третий
+    исход, ради которого в репозитории заведён контракт `parse_outcome`."""
+    if rel is None:
+        rec = _task_started_rec(tid, path)
+        rel = rec.get("draft") if isinstance(rec, dict) else None
+    if not rel:
+        return ""
+    try:
+        full = os.path.join(REPO, *str(rel).split("/"))
+        text, why = report_draft.read(full)
+        outcome, block = report_draft.render(text, path_rel=str(rel), why=why)
+        log.info("черновик доклада id=%s: %s (%s)", tid, outcome, rel)
+        return block
+    except Exception as e:          # noqa: BLE001 — черновик НИКОГДА не смеет уронить закрытие
+        log.warning("черновик доклада id=%s не прочитан (%s)", tid, e)
+        return ""
 
 
 def _task_started_get(tid, path=None):
@@ -1244,16 +1324,29 @@ def _work_evidence(since, until=None):
     return {"commits": commits, "journal": journal, "since": since, "until": until}
 
 
-def fail_result(code, detail, since=None, now=None):
-    """Текст итога ПРОВАЛА: причина КОДОМ + следы работы, если она была.
+def fail_result(code, detail, since=None, now=None, draft=None):
+    """Текст итога ПРОВАЛА: СЛОВА САМОГО ЗАХОДА + причина КОДОМ + следы работы, если она была.
 
     Три формы, ровно по трём состояниям знания:
       • окно известно, следы ЕСТЬ  → «НЕ ЗАКРЫТА, но РАБОТА ВЫПОЛНЕНА …» + перечень улик;
       • окно известно, следов НЕТ  → «провал …» + прямое «следов в окне нет» (это тоже факт);
       • окна нет (отметки claim не сохранилось) → так и говорим, следы НЕ проверялись.
-    Маркер причины идёт ПЕРВЫМ символом — гейты самопочинки/цепей смотрят именно на него."""
+    Маркер причины идёт ПЕРВЫМ символом — гейты самопочинки/цепей смотрят именно на него.
+
+    `draft` — готовый блок черновика доклада (`report_draft.render`). Он встаёт СРАЗУ за маркером,
+    ПЕРЕД причиной и уликами, и это не вкусовщина: обрезка `_cap_result` ест ХВОСТ, а из всего
+    итога слова захода — единственное, чего нельзя восстановить ничем другим. Улики по git и
+    журналу восстановимы задним числом всегда, черновик — только здесь.
+
+    ПОЧЕМУ БЕЗ НЕГО ИТОГ БЫЛ ПОЧТИ ПУСТ (замер 22.08.2026): окно улик берётся из отметки claim, а
+    очередь ПЕРЕИСПОЛЬЗУЕТ номера задач — у id=21 отметка была от 15.08, у id=23 от 16.08, и
+    «следы в окне» насчитали 185 и 162 коммита за шесть и пять суток соответственно. Фраза «в
+    окне задачи есть работа» при таком окне не значит ничего. Отметку чиним отдельно
+    (`_task_started_mark`), но даже с честным окном улика по git отвечает на вопрос «шевелилось
+    ли что-то», а владельцу нужен ответ на «что сделано, что нет и что неизвестно»."""
     label, mark = FAIL_REASONS.get(code, ("причина не названа", ""))
     lead = (mark + " ") if mark else ""
+    lead += (str(draft).strip() + " ") if (draft and str(draft).strip()) else ""
     head = "[причина=%s · %s]" % (code, label)
     if since is None:
         log.warning("FAIL причина=%s окно=неизвестно (нет отметки claim)", code)
@@ -1990,6 +2083,18 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
                                      "не запущен; задача уйдёт обычным путём ретрая",
                                      since=_task_started_get(tid))
     run_token = f"{os.getpid()}-{int(time.time() * 1000)}-{tid}"   # контекст запуска: pid+ts+tid
+    # ── ВТОРОЙ, ДЕШЁВЫЙ КАНАЛ ДОКЛАДА (класс 22.08.2026) ────────────────────────────────────
+    # Итоговый отчёт живёт ТОЛЬКО в stdout ребёнка, и на таймауте `run_claude` его буфер
+    # выбрасывает (:1634 `p.communicate` — возврат не используется). Отчёт, готовый на 99%,
+    # стоит ноль: id=21 убита через 63с после последнего вызова инструмента, когда ВСЯ работа
+    # уже сдана; id=81 — через 19.9с после коммита артефакта. Черновик на диске переживает
+    # убийство ребёнка, потому что диск ребёнку не принадлежит.
+    draft_rel = report_draft.draft_rel(tid, run_token)
+    draft_file = report_draft.draft_path(tid, run_token, REPO)
+    _why_dir = report_draft.ensure_dir(draft_file)   # каталог создаём МЫ: у ребёнка может не хватить хода
+    if _why_dir:
+        log.warning("каталог черновика доклада id=%s не создан (%s) — заход попробует сам", tid, _why_dir)
+    _task_started_draft(tid, draft_rel)     # адрес черновика — в отметку задачи: её читают ветки TTL
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)          # headless идёт по ~/.claude (подписка), не платный API
     env.pop("OPENAI_API_KEY", None)
@@ -2018,6 +2123,7 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
         prompt += APPROVED_CLAUSE.format(kinds=", ".join(kinds))
         log.info("id=%s ОДОБРЕНО владельцем, класс(ы)=%s объект=%s → маркер в env ребёнка + "
                  "абзац в промпт", tid, ",".join(kinds), approved_object or "—")
+    prompt += report_draft.clause(draft_rel)
     prompt += text
     for attempt in (1, 2):
         if _mctx is not None:
@@ -2032,13 +2138,17 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
             rc, out, err = run_claude(prompt, TASK_TIMEOUT, REPO, env)
         except TimeoutError:
             log.warning("id=%s ТАЙМАУТ %ss → failed", tid, TASK_TIMEOUT)
+            # РОВНО ТА ВЕТКА, РАДИ КОТОРОЙ ЗАВЕДЁН ЧЕРНОВИК: stdout ребёнка здесь уже выброшен,
+            # и без файла на диске владельцу нечего было бы прочитать, кроме улик по git.
             return "failed", fail_result(FAIL_RUN_TIMEOUT,
                                          f"таймаут {TASK_TIMEOUT}s — headless прерван, задача не "
-                                         "завершилась", since=_task_started_get(tid))
+                                         "завершилась", since=_task_started_get(tid),
+                                         draft=_draft_block(tid, draft_rel))
         except Exception as e:
             log.error("id=%s ошибка запуска: %s", tid, e)
             return "failed", fail_result(FAIL_EXEC_ERROR, f"ошибка запуска claude: {e}",
-                                         since=_task_started_get(tid))
+                                         since=_task_started_get(tid),
+                                         draft=_draft_block(tid, draft_rel))
         # прочитать маркер ДО удаления (гард пишет туда красную карточку в headless)
         marker_content = ""
         try:
@@ -2100,7 +2210,8 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
             # только о молчании канала, а был ли коммит — скажут следы (класс 30.07).
             return "failed", fail_result(FAIL_EXEC_ERROR,
                                          "пустой вывод claude (2 попытки) | stderr: "
-                                         + (err_tail or "(пуст)"), since=_task_started_get(tid))
+                                         + (err_tail or "(пуст)"), since=_task_started_get(tid),
+                                         draft=_draft_block(tid, draft_rel))
         # ЗАЯВКА ИСПОЛНИТЕЛЯ НА КРАСНОЕ, КОТОРУЮ ГАРД НЕ ПОДТВЕРДИЛ КАРТОЧКОЙ. Сюда попадаем
         # только когда маркера гарда НЕТ (карточка вернулась бы выше), то есть красной операции
         # гард не видел. Кнопку не выписываем — честный ✋failed с текстом заявки в диагнозе.
@@ -2123,7 +2234,8 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
                                          "insufficient_output: нет строки «RESULT: <итог>» — "
                                          "выполнение не подтверждено. stdout(хвост): " + _tail(out_s)
                                          + (" | stderr(хвост): " + err_tail if err_tail else ""),
-                                         since=_task_started_get(tid))
+                                         since=_task_started_get(tid),
+                                         draft=_draft_block(tid, draft_rel))
         # ГЛАВНАЯ ТОЧКА ПОТЕРИ: полный stdout исполнителя живёт только здесь, в памяти демона —
         # ни одна ветка выше его не сохраняла, и голый срез стирал хвост НАВСЕГДА (у задачи 473 —
         # посреди слова, вместе со строкой RESULT: и следом верификации). Теперь тело уходит файлом
@@ -3195,7 +3307,7 @@ def process_approved():
             # проверить не может (литерал «30 мин» пережил бы любую правку порога и врал бы молча)
             msg = fail_result(FAIL_APPROVAL_TIMEOUT,
                               f"approve истёк (>{APPROVAL_TTL // 60} мин) — повтори задачу",
-                              since=_task_started_get(tid))
+                              since=_task_started_get(tid), draft=_draft_block(tid))
             bc.complete_task(tid, "failed", msg)
             _cowork(f"задача #{tid} (approved) → failed · {_clip(msg)}")
             _notify_task("failed", tid, "approve истёк")
@@ -3260,9 +3372,14 @@ def process_approval_timeouts():
             continue      # info-карточка ревизора живёт до решения человека — не гасим по таймауту
         if (_age_sec(task.get("updated")) or 0) > APPROVAL_TTL:
             log.info("NEEDS_APPROVAL id=%s таймаут (>%ss) → failed", tid, APPROVAL_TTL)
+            # id=23 (22.08) прожила ровно этот путь: работа сдана, артефакт закоммичен, строка
+            # DONE в журнале — и всё это стёрто одной фразой «подтверждение не получено», потому
+            # что `complete_task` пишет `result` ПОВЕРХ текста карточки. Черновик доклада —
+            # единственное, что тут вообще способно уцелеть: он на диске, а не в поле ряда.
             msg = fail_result(FAIL_APPROVAL_TIMEOUT,
                               f"подтверждение не получено за {APPROVAL_TTL // 60} мин — задача "
-                              "закрыта без «да»", since=_task_started_get(tid))
+                              "закрыта без «да»", since=_task_started_get(tid),
+                              draft=_draft_block(tid))
             bc.complete_task(tid, "failed", msg)
             _cowork(f"задача #{tid} → failed · {_clip(msg)}")
             _notify_task("failed", tid,
@@ -5616,6 +5733,11 @@ _ORCH_RUNTIME = ("pc_orchestrator.py", "gate_selective.py", "task_metrics.py",
                  # задачи, а то, что штаб ПРОЧТЁТ о судьбе карточки — то есть его картину занятости
                  # полосы. Модуль чистый (json/os/re/sqlite3), замыкание не растит.
                  "card_terminal_log.py",
+                 # 22.08.2026: черновик доклада захода. Верхний импорт, и цена грязи здесь своя и
+                 # высшая в этом списке: незакоммиченная правка `report_draft.py` меняет ЕДИНСТВЕННЫЙ
+                 # канал, которым оборванный заход вообще способен что-то сказать. Модуль чистый
+                 # (io/os/re), замыкание не растит.
+                 "report_draft.py",
                  # 30.07.2026: демон импортирует их СВЕРХУ, значит незакоммиченная правка уедет в
                  # бой вместе с рестартом. pretool_guard — новый импорт (словарь видов красного для
                  # разбора одобренной карточки), io_utf8 стоял в импортах и в список не попал.
