@@ -7513,8 +7513,9 @@ class TestRevizorCardReceipt(unittest.TestCase):
         n = o._revizor_card_keys_add(58, [_dep_f()], now=_REV_NOW, path=self.p)
         rec = o._revizor_cards_read(self.p)["58"]
         self.assertEqual(n, 1)
+        # `gate` — чьи ворота отдали строку владельцу (22.08); у находки #92 ворот входа нет → пусто
         self.assertEqual(rec["keys"], [{"key": o._revizor_verdict_key(_dep_f()),
-                                        "gist": o._revizor_finding_gist(_dep_f())}])
+                                        "gist": o._revizor_finding_gist(_dep_f()), "gate": ""}])
 
     def test_receipt_gist_matches_the_filter_byte_for_byte(self):
         """Существо в расписке обязано совпасть с тем, что посчитает фильтр на следующем прогоне:
@@ -8258,6 +8259,223 @@ class TestRevizorContour(Base):
         self.assertIsNone(out)
         self.assertEqual(self.audited, [])                     # думатель не дёрнут — контур не тикал
         self.assertEqual(o._revizor_read_state(path=self.state)["ts"], _REV_NOW)  # метку не двигаем
+
+
+# ---- КЛАСС «КАРТОЧКА РОЖДАЕТСЯ, ХОТЯ РЕШАТЬ НЕЧЕГО» (живой счёт 21–22.08.2026) ----
+# Четыре карточки ревизора подряд — tid=4 (21.08 10:21 UTC), 16 (16:26), 27 (22:27), 42 (22.08
+# 10:30) — принесли 15 цитат и КУПИЛИ НОЛЬ: все четыре закрыты владельцем «отклонено Филиппом»
+# (живой снимок очереди 22.08). Двенадцать цитат из пятнадцати родились в `_revizor_demote_client_task`
+# — «нужна твоя отмашка» на правку клиентского контура, — а контур с 21.08 19:36 ЗАМОРОЖЕН, и «да»
+# на такую находку не применяет ничего. Про заморозку знали только ворота ВЫКАТКИ (`gate_route`),
+# ворота ВХОДА ревизора — ни строкой. Голдены ниже: карточка не рождается при нуле решаемых пунктов;
+# ЗАМОК — решаемое доезжает как доезжало, и недоставленная карточка КРИЧИТ, а не молчит.
+
+class TestRevizorKartochkaRozhdenie(Base):
+    """Условие рождения карточки: заморозка глушит только НЕРЕШАЕМОЕ, доставка судится распиской."""
+
+    def setUp(self):
+        super().setUp()
+        self._save_c = (o._revizor_consult,)
+        self.notes = []
+        o._cowork = lambda line: self.notes.append(line)
+        # СВОЙ флаг заморозки во ВРЕМЕННОМ каталоге: боевой Base уже увёл, здесь только поднимаем.
+        self.frz = os.path.join(tempfile.mkdtemp(prefix="frz_born_"), "pc_orchestrator.contour_frozen")
+        o.client_contour.FREEZE_FLAG = self.frz
+        self.cards_path = o.REVIZOR_CARDS_FILE          # изолирован Base'ом
+
+    def tearDown(self):
+        (o._revizor_consult,) = self._save_c
+        super().tearDown()
+
+    def _freeze(self):
+        with open(self.frz, "w", encoding="utf-8") as f:
+            f.write("заморозка контура (тест)")
+
+    def _consult(self, mapping):
+        o._revizor_consult = lambda pkg: mapping.get(pkg.get("client_id"))
+
+    def _client_task(self, cls="д", txt="поправь детект в suggest.py"):
+        """Находка action=task, чей дев-ТЗ правит КЛИЕНТСКИЙ контур — ровно то, что живой ревизор
+        приносил все четыре раза (лог: «находка класса 'д' правит КЛИЕНТСКИЙ контур (suggest.py)»)."""
+        return {"class": cls, "action": "task", "task_text": txt}
+
+    def _client_gate_on(self):
+        """Ворота входа отвечают «клиентская» — Base по умолчанию держит их открытыми."""
+        o._revizor_finding_touches_client = lambda t: (True, ["suggest.py"], True)
+
+    def _cards(self):
+        return [t for t in self.fb.tasks.values() if t["status"] == "needs_approval"]
+
+    # ---------- условие рождения ----------
+
+    def test_frozen_client_findings_no_card_born(self):
+        """Всё нерешаемо → карточки НЕТ, очередь не тронута, в ленте честное «решать нечего»."""
+        self._freeze()
+        self._client_gate_on()
+        self._consult({1: [self._client_task("д"), self._client_task("в", "правь suggest.py")]})
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual(out["owner"], 0)
+        self.assertEqual(out["frozen_held"], 2)
+        self.assertEqual(self._cards(), [])                            # карточка НЕ родилась
+        self.assertTrue(any("решать нечего" in n for n in self.notes))
+        self.assertTrue(any("ЗАМОРОЖЕННОМУ клиентскому контуру" in n for n in self.notes))
+        self.assertEqual(o._revizor_spool_read(), [])                  # и в спул не прячем: находка в ленте
+
+    def test_without_freeze_card_born_as_before(self):
+        """Ручки нет → поведение прежнее байт-в-байт: те же находки дают карточку владельцу."""
+        self._client_gate_on()
+        self._consult({1: [self._client_task("д"), self._client_task("в", "правь suggest.py")]})
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual(out["owner"], 2)
+        self.assertEqual(out.get("frozen_held"), 0)
+        self.assertEqual(len(self._cards()), 1)
+        self.assertIn("клиентский контур", self._cards()[0]["what"])
+
+    def test_frozen_probe_failure_does_not_mute(self):
+        """Признак заморозки упал → глушения НЕТ (fail-loud): молчать по незнанию не имеем права."""
+        def boom():
+            raise OSError("флаг не читается")
+        keep, held = o._revizor_undecidable(
+            [{"class": "д", "action": "owner", "gate": o.REVIZOR_GATE_CLIENT, "evidence": "e"}],
+            frozen_fn=boom)
+        self.assertEqual((len(keep), len(held)), (1, 0))
+
+    def test_receipt_carries_gate_of_each_line(self):
+        """Расписка помнит ЧЬИ ворота отдали строку — иначе карточку нельзя судить «решать нечего»."""
+        f = {"class": "д", "client_id": 7, "action": "owner", "evidence": "улика",
+             "gate": o.REVIZOR_GATE_CLIENT}
+        o._revizor_card_keys_add(99, [f], now=_REV_NOW, path=self.cards_path)
+        self.assertEqual(o._revizor_cards_read(self.cards_path)["99"]["keys"][0]["gate"],
+                         o.REVIZOR_GATE_CLIENT)
+
+    # ---------- ОТРИЦАТЕЛЬНЫЙ ТЕСТ 1: глушение не стало глушением всего ----------
+
+    def test_negative_decidable_finding_still_reaches_owner(self):
+        """ПОД ЗАМОРОЗКОЙ находка, требующая решения (спорный тариф, action=owner — ворота входа её
+        не касались), обязана дойти до владельца. Клиентская из той же партии уходит в ленту."""
+        self._freeze()
+        self._client_gate_on()
+        self._consult({1: [{"class": "г", "action": "owner", "evidence": "спорный тариф на месяц"},
+                           self._client_task("д")]})
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual(out["owner"], 1)                              # решаемая — доехала
+        self.assertEqual(out["frozen_held"], 1)                        # нерешаемая — в ленту
+        cards = self._cards()
+        self.assertEqual(len(cards), 1)
+        self.assertIn("спорный тариф на месяц", cards[0]["what"])
+        self.assertNotIn("клиентский контур", cards[0]["what"])        # глушёная строка в карточку не попала
+        self.assertTrue(any("ЗАМОРОЖЕННОМУ клиентскому контуру" in n for n in self.notes))
+
+    def test_negative_deterministic_checks_survive_freeze(self):
+        """Тот же замок для ДЕТЕРМИНИРОВАННЫХ находок #92/#93: они не про выкатку и не глушатся."""
+        self._freeze()
+        self._client_gate_on()
+        self._consult({1: [self._client_task("д")]})
+        save = o._revizor_ipc_findings
+        o._revizor_ipc_findings = lambda pkg, checks_fn=None: [
+            {"class": "#93", "client_id": pkg.get("client_id"), "action": "owner",
+             "check": "depcheck", "evidence": "чек «depcheck»: депозит требует ОБА", "task_text": ""}]
+        self.addCleanup(lambda: setattr(o, "_revizor_ipc_findings", save))
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual((out["owner"], out["frozen_held"]), (1, 1))
+        self.assertIn("depcheck", self._cards()[0]["what"])
+
+    # ---------- ОТРИЦАТЕЛЬНЫЙ ТЕСТ 2: недоставленная карточка КРИЧИТ ----------
+
+    def test_negative_undelivered_card_screams_not_waits(self):
+        """Мост не дал расписки о доставке → это ОТКАЗ ПРИБОРА: находки в спул, метку не двигаем,
+        в ленте крик, расписки под карточкой НЕТ (иначе «нет» владельца погасило бы неувиденное)."""
+        self._consult({1: [{"class": "г", "action": "owner", "evidence": "спорный тариф"}]})
+        self.fb.set_needs_approval = lambda tid, what, topic=None: {
+            "ok": False, "error": "BridgeTransportError", "error_text": "второе плечо моста мертво"}
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertTrue(out.get("deferred"))                           # метку прогона НЕ двигаем
+        self.assertIs(out.get("card_delivered"), False)
+        self.assertEqual(out["owner"], 0)                              # доставленных цитат ноль
+        self.assertEqual([f["evidence"] for f in o._revizor_spool_read()], ["спорный тариф"])
+        self.assertTrue(any("ОТКАЗ ПРИБОРА" in n for n in self.notes))
+        self.assertTrue(any("НЕ доставлена" in n for n in self.notes))
+        self.assertEqual(o._revizor_cards_read(self.cards_path), {})   # расписка не выписана
+
+    def test_delivered_card_is_not_a_scream(self):
+        """Замок к предыдущему: удавшаяся доставка молчит про отказ и пишет расписку."""
+        self._consult({1: [{"class": "г", "action": "owner", "evidence": "спорный тариф"}]})
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertIs(out.get("card_delivered"), True)
+        self.assertFalse(out.get("deferred"))
+        self.assertFalse(any("ОТКАЗ ПРИБОРА" in n for n in self.notes))
+        self.assertEqual(len(o._revizor_cards_read(self.cards_path)), 1)
+
+    def test_main_path_card_without_receipt_is_a_scream_too(self):
+        """ТОТ ЖЕ класс на ГЛАВНОЙ дороге: карточка обычной задачи без расписки — отказ прибора,
+        а не «жду „да“». Строка «жду „да“» обязана исчезнуть, крик — появиться."""
+        tid = self.fb.add(status="new")
+        self._claude(0, "сделал", write_marker=True)         # живой формат красного — файл-маркер гарда
+        self.fb.set_needs_approval = lambda t, what, topic=None: {
+            "ok": False, "error": "BridgeReceiptLost", "error_text": "расписка потеряна"}
+        o.process_new()
+        self.assertTrue(any("ОТКАЗ ПРИБОРА" in n and str(tid) in n for n in self.notes), self.notes)
+        self.assertFalse(any("needs_approval (красное, жду «да»)" in n for n in self.notes),
+                         self.notes)          # прежняя строка «честного ожидания» исчезла
+
+    def test_main_path_card_with_receipt_says_waiting_as_before(self):
+        """Замок: расписка есть → прежняя строка «жду „да“» и ни слова про отказ прибора."""
+        tid = self.fb.add(status="new")
+        self._claude(0, "сделал", write_marker=True)
+        o.process_new()
+        self.assertEqual(self.fb.tasks[tid]["status"], "needs_approval")
+        self.assertTrue(any("needs_approval (красное, жду «да»)" in n for n in self.notes), self.notes)
+        self.assertFalse(any("ОТКАЗ ПРИБОРА" in n for n in self.notes))
+
+    def test_delivery_receipt_reads_ok_field_not_status(self):
+        """«Ждёт владельца» стои́т на РАСПИСКЕ, а не на статусе ряда: ряд помечен, расписки нет →
+        доставкой это не считается (иначе поза выдаёт себя за ожидание)."""
+        self.assertEqual(o._card_delivery_receipt({"ok": True})[0], True)
+        self.assertEqual(o._card_delivery_receipt({"ok": False, "error": "X"})[0], False)
+        self.assertEqual(o._card_delivery_receipt(None)[0], False)
+        self.assertIn("мост не ответил", o._card_delivery_receipt({})[1])
+
+    # ---------- задача закрывается сама ----------
+
+    def test_open_card_of_undecidable_items_closes_itself(self):
+        """Открытая карточка, ВСЕ пункты которой нерешаемы, закрывается САМИМ ревизором с честной
+        записью «решать нечего»; расписка по ней снимается."""
+        self._freeze()
+        self._client_gate_on()
+        tid = self.fb.add(status="needs_approval", task_text=o.REVIZOR_OWNER_MARK + " карточка")
+        self.fb.tasks[tid]["what"] = "🔍 Ревизор: находки\n• [класс д] окно 1: старое"
+        o._revizor_card_keys_add(tid, [{"class": "д", "client_id": 1, "action": "owner",
+                                        "evidence": "старое", "gate": o.REVIZOR_GATE_CLIENT}],
+                                 now=_REV_NOW, path=self.cards_path)
+        self._consult({1: [self._client_task("д")]})
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertEqual(out["card_closed"], tid)
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+        self.assertIn("РЕШАТЬ НЕЧЕГО", self.fb.tasks[tid]["result"])
+        self.assertEqual(o._revizor_cards_read(self.cards_path), {})   # расписка снята вместе с карточкой
+        self.assertTrue(any(f"карточка #{tid} закрыта сама" in n for n in self.notes))
+
+    def test_open_card_with_decidable_item_is_not_closed(self):
+        """ЗАМОК: есть пункт, который владелец решить МОЖЕТ → карточку не трогаем."""
+        self._freeze()
+        self._client_gate_on()
+        tid = self.fb.add(status="needs_approval", task_text=o.REVIZOR_OWNER_MARK + " карточка")
+        o._revizor_card_keys_add(tid, [
+            {"class": "д", "client_id": 1, "action": "owner", "evidence": "клиентская",
+             "gate": o.REVIZOR_GATE_CLIENT},
+            {"class": "#92", "client_id": 1, "action": "owner", "evidence": "чек «депозит»: ..."},
+        ], now=_REV_NOW, path=self.cards_path)
+        self._consult({1: [self._client_task("д")]})
+        out = o._revizor_route([{"client_id": 1}], now=_REV_NOW)
+        self.assertIsNone(out["card_closed"])
+        self.assertEqual(self.fb.tasks[tid]["status"], "needs_approval")
+
+    def test_old_receipt_without_gate_is_not_judged(self):
+        """Расписка старого формата (поля `gate` нет) — «не знаю», и задним числом мы её не судим."""
+        o._revizor_cards_save({"77": {"at": _REV_NOW, "keys": [{"key": "д|1|", "gist": "g"}]}},
+                              self.cards_path)
+        self.assertIsNone(o._revizor_card_all_undecidable(77, self.cards_path))
+        self.assertIsNone(o._revizor_card_all_undecidable(12345, self.cards_path))   # расписки нет вовсе
 
 
 class TestRevizorDefaultOff(unittest.TestCase):
@@ -9636,7 +9854,7 @@ class TestRevizorIpcChecks(unittest.TestCase):
 
         def fake_post(owner_findings, items, now=None):    # подпись живая: с 21.08 доставка берёт now (расписка карточки)
             posted["findings"] = list(owner_findings)
-            return True
+            return True, 1, ""                             # с 22.08 живой возврат — (доставлено?, tid, причина)
 
         with mock.patch.object(o, "_revizor_postrelease_findings", return_value=[]), \
              mock.patch.object(o, "_revizor_consult", return_value=[]), \

@@ -3148,9 +3148,20 @@ def process_new():
         # прошла. Ветка стоит ПЕРЕД `set_needs_approval` и ничего не добавляет к правам.
         return
     if status == "needs_approval":
-        bc.set_needs_approval(tid, result)
+        # «ЖДУ „ДА“» СТОИ́Т НА РАСПИСКЕ (22.08.2026, класс общий с owner-карточкой ревизора). До этой
+        # правки расписка не читалась вовсе: отказ моста давал ту же строку «жду „да“» и ту же запись
+        # под надзор — при том, что карточки у владельца могло не быть ни одной. Ошибка молчалива по
+        # устройству, потому и заводится замок: недоставка обязана быть ВИДНА, а не выглядеть
+        # ожиданием. Ряд не трогаем (реапер разберёт) — меняется только громкость.
+        ok, why = _card_delivery_receipt(bc.set_needs_approval(tid, result))
         log.info("NEEDS_APPROVAL id=%s", tid)
-        _cowork(f"задача #{tid} → needs_approval (красное, жду «да»)")
+        if ok:
+            _cowork(f"задача #{tid} → needs_approval (красное, жду «да»)")
+        else:
+            log.error("NEEDS_APPROVAL id=%s: расписки о доставке НЕТ (%s) — карточки у владельца "
+                      "может не быть вовсе; это ОТКАЗ ПРИБОРА, а не ожидание решения", tid, why)
+            _cowork(f"⚠️ ОТКАЗ ПРИБОРА: карточка задачи #{tid} НЕ подтверждена доставкой ({why}) — "
+                    f"«жду «да»» здесь не факт, а поза; ряд остаётся до реапера")
         _card_watch_add(tid, result)   # взять карточку под надзор → её ТЕРМИНАЛ попадёт в журнал
         _notify_task("needs_approval", tid, result)
     else:
@@ -7986,7 +7997,8 @@ def _revizor_cards_read(path=None):
     for tid, rec in c.items():
         if not isinstance(rec, dict):
             continue
-        keys = [{"key": _revizor_text(k.get("key")), "gist": _revizor_text(k.get("gist"))}
+        keys = [{"key": _revizor_text(k.get("key")), "gist": _revizor_text(k.get("gist")),
+                 "gate": _revizor_text(k.get("gate"))}
                 for k in _revizor_card_rows(rec) if _revizor_text(k.get("key"))]
         out[str(tid)] = {"at": rec.get("at"), "keys": keys[:REVIZOR_CARD_KEYS_MAX]}
     return out
@@ -8030,7 +8042,11 @@ def _revizor_card_keys_add(tid, findings, now=None, path=None):
         k = _revizor_verdict_key(f)
         g = _revizor_finding_gist(f)
         if k and g:
-            keys.append({"key": k, "gist": g})
+            # `gate` — ЧЬИМИ воротами находка стала карточкой (см. REVIZOR_GATE_CLIENT). Пишем в
+            # расписку, потому что закрывать карточку «решать нечего» можно только зная состав её
+            # пунктов, а сама карточка к тому моменту уже текст, а не находки. Пусто = «ворота не
+            # названы» (строки старого формата) — такую карточку не судим.
+            keys.append({"key": k, "gist": g, "gate": _revizor_field(f, "gate")})
     if not keys:
         return 0
     cards = _revizor_cards_read(path)
@@ -8691,7 +8707,127 @@ def _revizor_demote_client_task(f, hits, determinate):
     ev = str(f.get("evidence") or "").strip() or str(f.get("task_text") or "").strip()
     g["evidence"] = f"[клиентский контур, нужна твоя отмашка; {why}] {ev}"[:_REVIZOR_EVIDENCE_MAX]
     g["task_text"] = ""
+    # ЧЬИ ворота отдали находку владельцу — ОТДЕЛЬНЫМ ПОЛЕМ, а не подстрокой улики. Ниже по потоку
+    # (заморозка контура) решение принимается по нему: судить «клиентская ли это находка» по тексту
+    # «[клиентский контур…]» значило бы судить по подстроке — правило 5 свода среды прямо запрещает.
+    g["gate"] = REVIZOR_GATE_CLIENT
     return g
+
+
+# ───── УСЛОВИЕ РОЖДЕНИЯ КАРТОЧКИ: РЕШАТЬ ЕСТЬ ЧТО? (22.08.2026) ─────
+# ПОВОД — ЖИВОЙ СЧЁТ, не рассуждение. Четыре карточки ревизора подряд (tid=4, 16, 27, 42; 21.08
+# 10:21 UTC → 22.08 10:30 UTC) принесли 15 цитат и купили НОЛЬ: все четыре закрыты владельцем
+# «отклонено Филиппом». Двенадцать из пятнадцати цитат — находки, которых ворота ВХОДА
+# (`_revizor_demote_client_task`) отдали владельцу со словами «нужна твоя отмашка» на правку
+# клиентского контура. А контур с 21.08 19:36 ЗАМОРОЖЕН (`pc_orchestrator.contour_frozen`): ни
+# один коммит на живых ботов не едет, и «да» на такую находку не применяет НИЧЕГО.
+#
+# ПРОТИВОРЕЧИЕ, которое здесь и снимается: заморозку до сих пор знали ТОЛЬКО ворота ВЫКАТКИ
+# (`client_contour.gate_route` ← `_client_block`). Ворота ВХОДА ревизора о ней не знали ни строкой,
+# поэтому под заморозкой продолжали спрашивать ровно то, на что ответ уже дан целиком.
+#
+# ЧТО ИМЕННО ГЛУШИТСЯ — ТОЛЬКО НЕРЕШАЕМОЕ. Нерешаемая находка — та, чей ЕДИНСТВЕННЫЙ вопрос
+# владельцу «разреши правку клиентского контура», при том что контур заморожен. Всё остальное
+# (спорный тариф, политика, неоднозначный кейс, детерминированные чеки #92/#93, деплой-демоушен)
+# идёт владельцу КАК ШЛО: глушение по признаку ворот, а не по факту заморозки, — иначе тишина
+# накрыла бы находки, которые владелец решить может и обязан.
+#
+# ЗАБОР ЧЕСТЕРТОНА (зачем карточка выписывалась по ФАКТУ прогона). Ворота входа завели 30.07 после
+# живого случая: цепи ревизора id=4 «тип ТС» и id=44 «гард приветствий» правили `suggest.py` и
+# уехали на боевых ботов АВТОМАТИЧЕСКИ — авто-реконсайл рестартнул userbot и moderation_bot за 17
+# минут ДО того, как владелец успел цепь остановить. Карточка была ЕДИНСТВЕННЫМ местом, где
+# остановленная правка становилась видимой НЕМЕДЛЕННО. Ловила она именно это: молчаливый выезд
+# правки в живого клиента. Под заморозкой ловить нечего — выезда нет ни у одной находки, — но цена
+# названа вслух: пока флаг лежит, владелец узнаёт о предложении ревизора не пушем, а чтением
+# ленты. Снимается это одним движением, ТЕМ ЖЕ, что и у ворот выкатки: удалить файл заморозки.
+REVIZOR_GATE_CLIENT = "client_contour"     # ворота ВХОДА: находка стала карточкой ради отмашки на клиентский контур
+
+
+def _revizor_undecidable(findings, frozen_fn=None):
+    """owner-находки → (РЕШАЕМЫЕ, нерешаемые под заморозкой контура).
+
+    Нерешаемая = `gate == REVIZOR_GATE_CLIENT` И контур заморожен. Заморозки нет → нерешаемых нет
+    и список возвращается тем же составом (прежнее поведение байт-в-байт). Признак заморозки упал →
+    считаем решаемыми ВСЕ (fail-loud: молчание по недосмотру хуже лишней карточки — та же доктрина,
+    что у `client_contour.gate_route`, где нечитаемый реестр форм делает отказ снова громким)."""
+    live = list(findings) if isinstance(findings, (list, tuple)) else []
+    try:
+        if not (frozen_fn or client_contour.frozen)():
+            return live, []
+    except Exception as e:                    # noqa: BLE001 — сбой признака не смеет ГЛУШИТЬ
+        log.warning("ревизор: признак заморозки контура упал (%s) — считаю все находки решаемыми "
+                    "(глушить по незнанию не имею права)", e)
+        return live, []
+    keep, held = [], []
+    for f in live:
+        (held if _revizor_field(f, "gate") == REVIZOR_GATE_CLIENT else keep).append(f)
+    return keep, held
+
+
+def _revizor_frozen_note(held):
+    """Строка в ленту про нерешаемое под заморозкой (классы + окна). Пусто → ''."""
+    if not held:
+        return ""
+    cls = sorted({_revizor_field(f, "class") or "?" for f in held})
+    wins = sorted({_revizor_field(f, "client_id") for f in held if _revizor_field(f, "client_id")})
+    return (f"{len(held)} находок по ЗАМОРОЖЕННОМУ клиентскому контуру (классы: {', '.join(cls)}; "
+            f"окна: {', '.join(wins) or '—'}) — заметкой в ленту, владельцу не выписаны: решать "
+            f"нечего, пока лежит {os.path.basename(client_contour.FREEZE_FLAG)}")
+
+
+def _revizor_card_all_undecidable(tid, path=None):
+    """Все пункты расписки карточки tid — нерешаемые (ворота входа)? → True | False | None.
+
+    None — «не знаю»: расписки нет вовсе, либо хоть у одного пункта ворота НЕ НАЗВАНЫ (строки,
+    легшие до 22.08, поля `gate` не имеют). Задним числом такие карточки не судим: закрыть чужой
+    вопрос по догадке хуже, чем оставить его владельцу."""
+    rows = _revizor_card_rows(_revizor_cards_read(path).get(str(tid)))
+    if not rows:
+        return None
+    seen_unknown = False
+    for r in rows:
+        g = _revizor_text(r.get("gate"))
+        if not g:
+            seen_unknown = True
+        elif g != REVIZOR_GATE_CLIENT:
+            return False                       # есть пункт, который владелец решить МОЖЕТ
+    return None if seen_unknown else True
+
+
+def _revizor_close_undecidable_card(items, now=None, path=None):
+    """Открытая карточка ревизора, ВСЕ пункты которой нерешаемы под заморозкой → закрыть САМИМ
+    ревизором с честной записью «решать нечего». → (tid, сколько пунктов) | (None, 0).
+
+    Почему закрываем, а не оставляем висеть: `needs_approval` означает «ждёт владельца», а ждать
+    здесь нечего — ответа, который что-то изменит, у владельца нет. Висящая карточка выдавала бы
+    отсутствие вопроса за честное ожидание. Расписку по закрытой карточке снимаем: обещать
+    погашение находок ответом, которого не будет, нельзя."""
+    prior = _revizor_find_owner_card(items)
+    if prior is None:
+        return None, 0
+    tid = prior.get("id")
+    verdict = _revizor_card_all_undecidable(tid, path)
+    if verdict is not True:
+        log.info("ревизор: открытая карточка #%s под заморозкой НЕ закрыта — %s", tid,
+                 "состав пунктов не назван (расписка старого формата)" if verdict is None
+                 else "среди пунктов есть решаемые владельцем")
+        return None, 0
+    n = len(_revizor_card_rows(_revizor_cards_read(path).get(str(tid))))
+    ok, why = _card_delivery_receipt(bc.complete_task(
+        tid, "done",
+        f"🔍 ревизор: РЕШАТЬ НЕЧЕГО — все {n} пунктов карточки просят отмашку на "
+        f"КЛИЕНТСКИЙ контур, а он заморожен ({os.path.basename(client_contour.FREEZE_FLAG)}): "
+        "«да» не применит ничего. Пункты ушли заметкой в ленту (не потеряны, но и "
+        "НЕ отложены в спул) — карточкой вернутся, когда окно попадёт в ревизию "
+        "снова после разморозки."))
+    if not ok:
+        log.warning("ревизор: карточку #%s закрыть не удалось (%s) — остаётся владельцу", tid, why)
+        return None, 0
+    cards = _revizor_cards_read(path)
+    if cards.pop(str(tid), None) is not None:
+        _revizor_cards_save(cards, path)
+    log.info("ревизор: карточка #%s закрыта САМИМ ревизором — решать нечего (%d пунктов)", tid, n)
+    return tid, n
 
 
 def _revizor_enqueue_tasks(task_findings, items, now):
@@ -8792,33 +8928,54 @@ def _revizor_find_owner_card(items):
     return None
 
 
+def _card_delivery_receipt(r):
+    """Расписка моста о мутации карточки (доставка ИЛИ закрытие) → (легло?, дословная причина).
+
+    «ЖДЁТ ВЛАДЕЛЬЦА» ОБЯЗАНО СТОЯТЬ НА ФАКТЕ ДОСТАВКИ (22.08.2026). До этой правки расписка
+    `set_needs_approval` не читалась вовсе: отказ моста оставлял задачу в чужом статусе БЕЗ
+    карточки в инбоксе — и снаружи это выглядело честным ожиданием решения, которого никто не
+    просил. Статус доставкой НЕ считаем СОЗНАТЕЛЬНО: `needs_approval` в очереди говорит, что ряд
+    помечен, а не что владелец увидел карточку, — и именно это различение здесь и заводится."""
+    if isinstance(r, dict) and r.get("ok"):
+        return True, ""
+    d = r if isinstance(r, dict) else {}
+    return False, (str(d.get("error_text") or d.get("error") or "мост не ответил распиской"))[:200]
+
+
 def _revizor_post_owner_card(owner_findings, items, now=None):
     """ОДНА сводная owner-карточка в инбокс 1160 (NEEDS_APPROVAL_TOPIC): редактируем СУЩЕСТВУЮЩУЮ
     (тот же tid, маркер) либо создаём (enqueue → claim → set_needs_approval, синхронно — в 'new' не
     задерживается; гард process_new подстрахует краш). Всё через Bridge; ревизор клиентам не пишет.
+    → (доставлено?, tid|None, причина отказа) — исход ЧИТАЕТСЯ зовущим (см. _card_delivery_receipt).
 
     Доставив, пишем РАСПИСКУ (_revizor_card_keys_add): чем карточка нагружена — тем и отвечает её
     единственная кнопка. Без расписки «нет» владельца остаётся строкой в чужом статусе, а находка
-    приезжает второй раз (класс 21.08)."""
+    приезжает второй раз (класс 21.08). Расписка пишется ТОЛЬКО после подтверждённой доставки."""
     prior = _revizor_find_owner_card(items)
     prior_lines = _revizor_prior_lines(prior) if prior is not None else ()
     what = _revizor_owner_card_text(owner_findings, prior_lines)
     if not what:
-        return
+        return True, None, ""                   # нечего доставлять — это не отказ прибора
     if prior is not None:
         tid = prior.get("id")
-        bc.set_needs_approval(tid, what, topic=NEEDS_APPROVAL_TOPIC)      # редактируем существующую карточку
+        ok, why = _card_delivery_receipt(     # редактируем существующую карточку
+            bc.set_needs_approval(tid, what, topic=NEEDS_APPROVAL_TOPIC))
+        if not ok:
+            return False, tid, why
         _revizor_card_keys_add(tid, owner_findings, now=now)              # расписка: за что отвечает «нет» по этой карточке
         log.info("ревизор: owner-карточка обновлена (tid=%s, инбокс %s)", tid, NEEDS_APPROVAL_TOPIC)
-        return
+        return True, tid, ""
     ok, tid, err = enqueue_pc_task(REVIZOR_OWNER_MARK + " сводная карточка находок ревизора", frm=REVIZOR_OWNER_FROM)
     if not ok:
         log.warning("ревизор: owner-карточка не встала в очередь (%s)", err)
-        return
+        return False, None, str(err or "enqueue отклонён")
     bc.claim_task(tid)                          # new → in_progress → needs_approval (штатный красный путь)
-    bc.set_needs_approval(tid, what, topic=NEEDS_APPROVAL_TOPIC)
+    ok, why = _card_delivery_receipt(bc.set_needs_approval(tid, what, topic=NEEDS_APPROVAL_TOPIC))
+    if not ok:
+        return False, tid, why
     _revizor_card_keys_add(tid, owner_findings, now=now)                  # расписка пишется ПОСЛЕ доставки: обещать погашение недоставленного нельзя
     log.info("ревизор: owner-карточка создана (tid=%s, инбокс %s)", tid, NEEDS_APPROVAL_TOPIC)
+    return True, tid, ""
 
 
 # ---------- РЕВИЗОР: ПОСТ-РЕЛИЗНАЯ СВЕРКА ЖИВЫХ ЧЕРНОВИКОВ (шаг 5/6 родителя 92) ----------
@@ -9111,9 +9268,34 @@ def _revizor_route(packages, now=None):
     if muted or benched:
         _revizor_verdicts_save(reg, checks=chk)
     bench_note = _revizor_bench_note(benched)
-    if not task_f and not owner_f:              # окна чисты (или только шум/сбой/разобранное) → наружу тишина
+    # УСЛОВИЕ РОЖДЕНИЯ КАРТОЧКИ (22.08.2026) — ПОСЛЕДНИЙ фильтр, СТРОГО за вердиктом и порогом.
+    # Порядок такой же и по той же причине: вердикт — решение человека по конкретной находке, порог —
+    # статистика по проверке, заморозка — состояние МИРА. Состояние мира не смеет опережать ни то,
+    # ни другое: находка, уже разобранная как ложная, обязана считаться заглушённой вердиктом, а не
+    # заморозкой, иначе счёт полезности проверок начнёт врать. Задачи (`task_f`) фильтр НЕ трогает:
+    # клиентская находка зелёной задачей не встаёт ни при какой заморозке (ворота входа выше).
+    owner_f, frozen_held = _revizor_undecidable(owner_f)
+    frozen_note = _revizor_frozen_note(frozen_held)
+    if frozen_held:
+        log.info("ревизор: %d находок нерешаемы под заморозкой контура — в ленту, карточка по ним "
+                 "НЕ рождается (классы: %s)", len(frozen_held),
+                 ", ".join(sorted({_revizor_field(f, "class") or "?" for f in frozen_held})))
+    if not task_f and not owner_f:              # окна чисты (или только шум/сбой/разобранное/нерешаемое) → наружу тишина
         if spooled:
             _revizor_spool_save([])             # отложенное снято вердиктом — иначе лежало бы в спуле вечно
+        if frozen_held:
+            # РЕШАТЬ НЕЧЕГО. Карточка не рождается; уже открытая — закрывается САМИМ ревизором,
+            # если все её пункты того же рода: `needs_approval` без вопроса это не ожидание, а поза.
+            closed_tid, closed_n = _revizor_close_undecidable_card(items, now=now)
+            _cowork(f"ревизор: {n} окон; {frozen_note}; карточка владельцу НЕ выписана — решать нечего"
+                    + (f"; открытая карточка #{closed_tid} закрыта сама ({closed_n} пунктов)"
+                       if closed_tid else "")
+                    + (f"; {bench_note}" if bench_note else "")
+                    + (f"; {len(muted)} разобраны ранее как ложные" if muted else "")
+                    + (f" (+{noise_n} шум)" if noise_n else ""))
+            return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed,
+                    "muted": len(muted), "benched": len(benched), "frozen_held": len(frozen_held),
+                    "card_closed": closed_tid}
         if n and failed >= n:
             _cowork(f"ревизор: думатель не ответил ни по одному из {n} окон — прогон пропущен"
                     + (f" ({len(muted)} находок разобраны ранее как ложные — в ленту)" if muted else "")
@@ -9133,17 +9315,21 @@ def _revizor_route(packages, now=None):
     if items is None:                           # частичная картина опаснее ожидания → откладываем, не флудим
         kept = _revizor_spool_save(task_f + owner_f)    # СОХРАНЯЕМ: «отложены» без спула = выброшены
         _cowork(f"ревизор: очередь недоступна — {len(task_f)} задач и {len(owner_f)} owner-находок отложены "
-                f"до след. прогона (сохранено в спул: {kept}; метку прогона не двигаем)")
+                f"до след. прогона (сохранено в спул: {kept}; метку прогона не двигаем)"
+                + (f"; {frozen_note}" if frozen_note else ""))
         return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed,
                 "demoted": demoted, "deferred": True, "spooled": kept, "muted": len(muted),
-                "benched": len(benched)}
+                "benched": len(benched), "frozen_held": len(frozen_held)}
     enq = skip = 0
     left = []
+    card_ok, card_tid, card_err = True, None, ""
     try:
         if task_f:
             enq, skip, left = _revizor_enqueue_tasks(task_f, items, now)
         if owner_f:
-            _revizor_post_owner_card(owner_f, items, now=now)
+            card_ok, card_tid, card_err = _revizor_post_owner_card(owner_f, items, now=now)
+            if not card_ok:
+                left = list(left) + list(owner_f)   # недоставленное едет в спул ТОЙ ЖЕ дорогой, что отложенное бюджетом
     except Exception as e:                      # мост отвалился на полудороге → находки в спул, метку не двигаем
         kept = _revizor_spool_save(task_f + owner_f)
         log.error("ревизор: доставка находок сорвалась (%s: %s) — отложены (в спуле %d)",
@@ -9163,6 +9349,21 @@ def _revizor_route(packages, now=None):
         _revizor_spool_save(left)
     elif spooled:
         _revizor_spool_save([])                 # доставлено — спул пуст (файл остаётся, содержимое []).
+    if not card_ok:
+        # ОТКАЗ ПРИБОРА, А НЕ ОЖИДАНИЕ. Мост не дал расписки о доставке — значит карточки владелец
+        # НЕ ВИДЕЛ, а ряд очереди мог остаться помеченным. Молчать здесь нельзя ни одной веткой:
+        # ровно так «ждёт владельца» и превращается в позу. Метку прогона НЕ двигаем (deferred),
+        # находки лежат в спуле — следующий прогон донесёт их первыми.
+        log.error("ревизор: owner-карточка НЕ ДОСТАВЛЕНА (tid=%s): %s — %d находок в спуле, метку "
+                  "прогона не двигаем; если ряд остался в needs_approval, это НЕ ожидание решения, "
+                  "а недоставленная карточка", card_tid, card_err, len(owner_f))
+        _cowork(f"ревизор: ⚠️ ОТКАЗ ПРИБОРА — owner-карточка НЕ доставлена владельцу "
+                f"(tid={card_tid or '?'}, причина: {card_err}); {len(owner_f)} находок отложены в "
+                f"спул, метку прогона не двигаем. «Ждёт владельца» без доставки — не ожидание.")
+        return {"windows": n, "tasks": enq, "owner": 0, "noise": noise_n, "failed": failed,
+                "demoted": demoted, "demoted_client": demoted_client, "deferred": True,
+                "spooled": len(left), "muted": len(muted), "benched": len(benched),
+                "card_delivered": False, "frozen_held": len(frozen_held)}
     parts = []
     if enq:
         parts.append(f"{enq} задач дирижёру")
@@ -9178,6 +9379,8 @@ def _revizor_route(packages, now=None):
         parts.append(f"{len(left)} задач-находок в спуле до след. прогона (бюджет суток)")
     if muted:
         parts.append(f"{len(muted)} разобранных ранее как ложные — в ленту, владельцу не выписаны")
+    if frozen_note:
+        parts.append(frozen_note)
     if bench_note:
         parts.append(bench_note)
     if not parts:                               # находки были, но все отсеяны бюджетом/дедупом
@@ -9185,7 +9388,8 @@ def _revizor_route(packages, now=None):
     _cowork("ревизор: " + ", ".join(parts))
     return {"windows": n, "tasks": enq, "owner": len(owner_f), "noise": noise_n, "failed": failed,
             "demoted": demoted, "demoted_client": demoted_client, "spooled": len(left),
-            "muted": len(muted), "benched": len(benched)}
+            "muted": len(muted), "benched": len(benched), "frozen_held": len(frozen_held),
+            "card_delivered": True}
 
 
 # ------------------- OS-синглтон демона (разбор #128, часть 4) ----------------
