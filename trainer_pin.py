@@ -31,6 +31,9 @@ trainer_pin.py — ПИН ВНЕШНЕЙ ГРАНИЦЫ прогона трен�
   price_gate._bridge_caller()              СТОРОЖ СВЕЖЕСТИ ЦЕНЫ — девять   action + params БЕЗ
     (шестая дверь, `GatePin`, 23.08)       GET к Календарю мимо первых     токена
                                            пяти границ
+  suggest.now_phuket / price_freshness     КАЛЕНДАРЬ — живая дата, из      (не ключуется: это
+    .judge (седьмая дверь, `Clock`, 23.08) которой продукт САМ строит      ИСТОЧНИК ключей, а
+                                           ключи к первым шести            не потребитель)
 
 ПОЧЕМУ ЭТО НЕ ПОДДЕЛКА ПРОВЕРКИ — четыре свойства, каждое проверяемо:
  1. Снимок СНЯТ ЖИВЬЁМ и ВСЛЕПУЮ: один проход, до того как известен хоть один вердикт, без
@@ -51,13 +54,16 @@ trainer_pin.py — ПИН ВНЕШНЕЙ ГРАНИЦЫ прогона трен�
 ключом к воротам (`client_contour` ждёт «зелёный прогон через тренажёр» ЖИВОГО продукта) оно
 служить НЕ МОЖЕТ.
 
-ЧТО ИЗМЕНИЛОСЬ 23.08.2026 — ровно две вещи, и обе против этой оговорки, а не в обход неё:
+ЧТО ИЗМЕНИЛОСЬ 23.08.2026 — три вещи, и все против этой оговорки, а не в обход неё:
   · `GatePin` (внизу файла) закрывает ШЕСТУЮ живую дверь — сторожа свежести цены. До неё «пин»
     держал пять границ, а замер всё равно стоял на живой сети: 100% времени набора и один
     сетевой вердикт на восемь кейсов;
   · `Pin(..., pin_head=False)` — ВНЕШНИЕ двери из снимка, ГОЛОВА ЖИВАЯ. Это и есть режим
     «честного живого числа»: из замера убрана сеть, но не модель. Оговорка выше снимается
-    ТОЛЬКО в этом режиме и ТОЛЬКО для головы; на `pin_head=True` она в силе дословно.
+    ТОЛЬКО в этом режиме и ТОЛЬКО для головы; на `pin_head=True` она в силе дословно;
+  · `Clock` (внизу файла) закрывает СЕДЬМУЮ дверь — КАЛЕНДАРЬ, из-за которой снимок жил ровно
+    сутки: 111 ключей моста из 125 несут ЖИВУЮ дату. Без неё «воспроизводимый замер» кончался
+    в полночь.
 
 ЗАМОК ОТ ЗЛОУПОТРЕБЛЕНИЯ. `trainer_run.py` этот модуль НЕ ИМПОРТИРУЕТ и знать о нём не должен:
 пин ставится только СНАРУЖИ, в измерительном раннере. Поэтому вердикт для ворот
@@ -69,6 +75,7 @@ trainer_pin.py — ПИН ВНЕШНЕЙ ГРАНИЦЫ прогона трен�
 """
 
 import copy
+import datetime
 import hashlib
 import io
 import json
@@ -78,6 +85,15 @@ import time
 SNAPSHOT_VERSION = 2
 GATE_SNAPSHOT_VERSION = 1
 _SECRET_KEYS = ("token", "key", "secret", "password", "auth")
+
+# Момент НАЧАЛА съёмки, aware-UTC, в мету снимка. Пишется САМИМ снимком, а не вызывающим:
+# «часы замера» — свойство снимка, и забыть их снять не должно быть возможно (`Clock` без них
+# не заводится, а старые снимки читает по `снят`, см. `Clock.from_meta`).
+MOMENT_KEY = "момент"
+
+
+def _now_utc():
+    return datetime.datetime.now(datetime.timezone.utc)
 
 
 class PinMiss(Exception):
@@ -122,6 +138,7 @@ class Pin(object):
         if mode not in ("record", "replay"):
             raise ValueError("режим только 'record' или 'replay'")
         self.path, self.mode, self.pin_head = path, mode, bool(pin_head)
+        self.moment = _now_utc() if mode == "record" else None
         self.data = {"version": SNAPSHOT_VERSION, "bridge": {}, "read_doc": {},
                      "head": {}, "playbook": None, "meta": {}}
         self.misses = {"bridge": 0, "read_doc": 0, "head": 0}
@@ -256,7 +273,10 @@ class Pin(object):
         self._orig = []
 
     def save(self, meta=None):
-        self.data["meta"] = dict(self.data.get("meta") or {}, **(meta or {}))
+        m = dict(meta or {})
+        if self.moment is not None:
+            m.setdefault(MOMENT_KEY, self.moment.isoformat())
+        self.data["meta"] = dict(self.data.get("meta") or {}, **m)
         tmp = self.path + ".tmp"
         with io.open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.data, f, ensure_ascii=False, indent=1)
@@ -326,6 +346,7 @@ class GatePin(object):
         if mode not in ("record", "replay"):
             raise ValueError("режим только 'record' или 'replay'")
         self.path, self.mode = path, mode
+        self.moment = _now_utc() if mode == "record" else None
         self.data = {"version": GATE_SNAPSHOT_VERSION, "gate": {}, "meta": {}}
         self.calls = self.misses = self.asks = 0
         self.seconds = 0.0
@@ -422,7 +443,10 @@ class GatePin(object):
         price_gate.reset()                # замороженный вердикт не смеет пережить замер
 
     def save(self, meta=None):
-        self.data["meta"] = dict(self.data.get("meta") or {}, **(meta or {}))
+        m = dict(meta or {})
+        if self.moment is not None:
+            m.setdefault(MOMENT_KEY, self.moment.isoformat())
+        self.data["meta"] = dict(self.data.get("meta") or {}, **m)
         tmp = self.path + ".tmp"
         with io.open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.data, f, ensure_ascii=False, indent=1)
@@ -435,6 +459,187 @@ class GatePin(object):
                 "спросов_сторожа": self.asks, "секунд_у_двери": round(self.seconds, 2),
                 "пятно": self.tainted, "неизвестно": sorted(self.unknown),
                 "спросов_по_кейсам": dict(self.asks_by_case)}
+
+    def __enter__(self):
+        return self.install()
+
+    def __exit__(self, *exc):
+        self.uninstall()
+        return False
+
+
+# ═══════════════════ СЕДЬМАЯ ДВЕРЬ: КАЛЕНДАРЬ (23.08.2026) ════════════════════════════════════
+
+class Clock(object):
+    """Замер идёт по ЧАСАМ СНИМКА, а не по сегодняшним. Лекарство от «снимок живёт сутки».
+
+    ═══ ОТКУДА БЕРЁТСЯ СУТОЧНЫЙ СРОК — ДОСЛОВНО, И ЧТО ОН ЗАЩИЩАЕТ (вопрос забора) ═══
+
+    Срока как НАСТРОЙКИ нет: ни `expires`, ни `ttl`, ни `max_age` в снимке не лежит, и ни одна
+    строка `Pin`/`GatePin` возраст не проверяет. Сутки берутся из ПРОДУКТА — из одной строки
+    (`suggest.py`, `build_price_sheet_note`):
+
+        base = today or today_phuket()
+        ...
+        ds = (base + datetime.timedelta(days=1)).isoformat()      # ← якорь «ЗАВТРА»
+
+    Эта дата уходит в `params` вызова `quote_price`, а `params` — и есть КЛЮЧ снимка
+    (`_pkey`). Значит ключ несёт живую дату, и назавтра продукт спрашивает ДРУГОЙ вопрос.
+    Замер 23.08 на снимке 22.08, кейс 2: **111 промахов из 112 вызовов моста** (3 окна × 37
+    моделей) плюс промах головы 1 из 1 — ключ головы `sha(system)+sha(user)` тоже несёт даты,
+    потому что в промпт вшит рассчитанный прайс-блок.
+
+    ЧТО ЭТОТ ЗАБОР ЗАЩИЩАЕТ — и почему его нельзя убрать. Дата в ключе отличает ВОПРОСЫ друг от
+    друга: «цена XSR с 24 по 25» и «цена XSR с 24 по 23 сентября» — это сутки против месяца, и
+    ответы у них разные в разы. Выкинь дату из ключа (или огрубляй её до «какая-нибудь») — и
+    снимок начнёт отвечать замороженной ценой на ВОПРОС, КОТОРОГО НЕ СЛЫШАЛ. Вот это и была бы
+    подделка: не «снимок протух», а «снимок врёт». Поэтому забор стои́т, и `Clock` его НЕ ТРОГАЕТ:
+    ключ остаётся дословным, с датой, во всю точность.
+
+    ═══ РЕШЕНИЕ: не ослабить ключ, а вернуть продукту тот день, в который снимок снят ═══
+
+    Ключ = f(вопрос, ДЕНЬ). Ломается не ключ, ломается ДЕНЬ. Значит чинить надо день:
+    в `replay` продукт получает НЕ сегодняшнюю дату, а момент съёмки снимка — и САМ, своим
+    же кодом, строит ровно те даты, что записаны. Совпадение ключей становится свойством
+    ПОСТРОЕНИЯ, а не удачи.
+
+    Замер того же кейса 2 на том же снимке 22.08, тем же кодом, в тот же час:
+
+        без Clock:  мост 112 вызовов / 111 промахов, голова 1/1, черновик 0 симв. (кейс мёртв)
+        с Clock:    мост 112 вызовов /   0 промахов, голова 2/0, черновик 1701 симв. (кейс ok)
+
+    Снимок, объявленный вчера протухшим, ожил ЦЕЛИКОМ — и при этом не был ни переснят, ни
+    открыт на запись, ни изменён на байт.
+
+    ПОЧЕМУ ЭТО НЕ «УВЕЛИЧИТЬ СРОК ЖИЗНИ». Срок не тронут вовсе — его и не было. Снимок не стал
+    жить дольше: он стал воспроизводимым НЕЗАВИСИМО от календаря, потому что календарь убран из
+    ЗАМЕРА тем же приёмом, что сеть и голова. «Неделя вместо суток» лечила бы симптом до
+    следующего понедельника; здесь суток нет ни одной ни в одну сторону.
+
+    ПОЧЕМУ ЭТО НЕ ПОДДЕЛКА — четыре свойства `Pin` целы, и добавляются два своих:
+     1. снимок снят живьём и вслепую, перезапись по-прежнему запрещена (`FileExistsError`):
+        `Clock` НЕ пишет в снимок ни одной веткой и физически не может стать способом
+        «переснять, пока не позеленеет» — он умеет только читать мету;
+     2. ни один чек не снят и ни один порог не сдвинут: `Clock` не знает ни про `expect`, ни про
+        `TRAINER_MIN_*`, ни про корпус;
+     3. промах по-прежнему НЕ прощается: если день угадан неверно (или съёмка шла через полночь)
+        — ключи не совпадут и промахи вырастут. Ошибка заморозки ГРОМКАЯ, а не молчаливая, и
+        видна тем же счётчиком, что и все прочие промахи;
+     4. правило «промах снимка = НЕИЗВЕСТНО» и правило «молчащая голова = НЕИЗВЕСТНО» не
+        затронуты ни одной строкой;
+     5. **день выбирает СНИМОК, а не оператор.** Штатная дорога одна — `Clock.from_snapshot(путь)`:
+        момент берётся из меты того самого файла, который снят вслепую. «Подобрать удачный день»
+        нельзя, не переснимая снимок, а переснимать запрещено;
+     6. над замороженным днём работает ВЕСЬ код дат продукта: `today_phuket`, гейт прошедшего
+        старта, якорь прайса, возрастная ветка сторожа свежести. Ни одна из них не выключена —
+        им лишь сказано, КОТОРЫЙ ЧАС.
+
+    ЧЕСТНАЯ ЦЕНА, которую нельзя замолчать (ровно того же вида, что цена пина головы): замер по
+    замороженным часам больше НЕ ловит поломки, зависящие от НАСТОЯЩЕГО календаря — переход
+    месяца и года, пересечение слепком цен порога возраста `PRICE_FRESH_MAX_AGE_DAYS`, «старт
+    клиента уже прошёл». Этих классов на пине не видно ни в какой день. Лекарство от цены —
+    СВЕЖИЙ снимок: снять его в новый файл слепым проходом можно всегда, и тогда замороженный
+    день — новый.
+
+    ═══ ЧТО ИМЕННО ЗАМОРАЖИВАЕТСЯ (две живые точки, обе найдены грепом, а не догадкой) ═══
+
+        suggest.now_phuket(now=None)      ЕДИНАЯ точка правды дат клиентского контура; через неё
+                                          идёт `today_phuket` и все 9 его вызовов в suggest
+        price_freshness.judge(now=None)   вторые часы: при `now is None` берёт
+                                          `datetime.date.today()` (price_freshness.py:174) —
+                                          ЛОКАЛЬНУЮ дату машины, мимо Пхукета
+
+    Каждой точке момент подаётся в ЕЁ семантике: `now_phuket` получает сам момент (aware-UTC,
+    зону он переведёт сам), `judge` — ЛОКАЛЬНУЮ дату этого момента, то есть дословно то, что
+    вернул бы `date.today()` в ту секунду. Так заморозка воспроизводит прошлое, а не подменяет
+    одни часы другими.
+    """
+
+    def __init__(self, moment, why=""):
+        if not isinstance(moment, datetime.datetime):
+            raise ValueError("момент обязан быть datetime, получено %r" % type(moment).__name__)
+        if moment.tzinfo is None:
+            raise ValueError("момент обязан быть с зоной: наивный трактовался бы по локали ПК")
+        self.moment = moment
+        self.why = why
+        # ЛОКАЛЬНАЯ дата момента — ровно то, что вернул бы `datetime.date.today()` в ту секунду.
+        self.local_day = moment.astimezone().date()
+        self.reads = {"now_phuket": 0, "judge": 0}
+        self._orig = []
+
+    # ── штатная дорога: день берётся ИЗ СНИМКА ───────────────────────────────────────────────
+    @classmethod
+    def from_meta(cls, meta, where=""):
+        """Мета снимка → `Clock`. Новые снимки несут `момент` (aware ISO, пишет сам `save`);
+        снятые до 23.08 — только `снят` (локальное «ГГГГ-ММ-ДД ЧЧ:ММ:СС» от `time.strftime`),
+        и он читается как ЛОКАЛЬНОЕ время машины, потому что им и записан. Нет ни того ни
+        другого — отказ, а не «возьмём сегодня»: молча замерить не тот день хуже, чем не
+        замерить вовсе."""
+        if not isinstance(meta, dict):
+            # Слепого `meta or {}` здесь быть не должно: он превратил бы «меты нет вовсе» в
+            # «меты нет часов» — разные болезни с одинаковым текстом отказа.
+            raise ValueError("мета снимка не словарь (%s): часы замера взять неоткуда — %s"
+                             % (type(meta).__name__, where or "?"))
+        raw = meta.get(MOMENT_KEY)
+        if raw:
+            m = datetime.datetime.fromisoformat(str(raw))
+            if m.tzinfo is None:
+                m = m.replace(tzinfo=datetime.timezone.utc)
+            return cls(m, why="%s: мета «%s»" % (where or "снимок", MOMENT_KEY))
+        raw = meta.get("снят")
+        if not raw:
+            raise ValueError("в мете снимка нет ни «%s», ни «снят» — часы замера неизвестны: %s"
+                             % (MOMENT_KEY, where or "?"))
+        m = datetime.datetime.strptime(str(raw), "%Y-%m-%d %H:%M:%S").astimezone()
+        return cls(m, why="%s: мета «снят» (локальное время)" % (where or "снимок"))
+
+    @classmethod
+    def from_snapshot(cls, path):
+        with io.open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return cls.from_meta(data.get("meta"), where=os.path.basename(path))
+
+    # ── установка/снятие ─────────────────────────────────────────────────────────────────────
+    def install(self):
+        import price_freshness
+        import suggest
+        moment, day, reads = self.moment, self.local_day, self.reads
+
+        real_now = suggest.now_phuket
+        self._orig.append((suggest, "now_phuket", real_now))
+
+        def now_phuket(now=None):
+            # Инъекция вызывающего сильнее заморозки: тест, назвавший свой момент, обязан его и
+            # получить — иначе `Clock` втихую переписывал бы чужие голдены.
+            reads["now_phuket"] += 1
+            return real_now(moment if now is None else now)
+        suggest.now_phuket = now_phuket
+
+        real_judge = price_freshness.judge
+        self._orig.append((price_freshness, "judge", real_judge))
+
+        def judge(snapshot, live, now=None, max_age=None):
+            reads["judge"] += 1
+            return real_judge(snapshot, live, now=(day if now is None else now), max_age=max_age)
+        price_freshness.judge = judge
+        return self
+
+    def uninstall(self):
+        for mod, attr, real in reversed(self._orig):
+            setattr(mod, attr, real)
+        self._orig = []
+
+    def stats(self):
+        return {"момент": self.moment.isoformat(), "день_Пхукет": self.day().isoformat(),
+                "день_локальный": self.local_day.isoformat(), "откуда": self.why,
+                "чтений_часов": dict(self.reads)}
+
+    def day(self):
+        """Тот «сегодня», которым живёт клиентский контур на замороженных часах. Считается
+        переводом зоны НАПРЯМУЮ, мимо `now_phuket`: иначе справка о часах сама накручивала бы
+        счётчик чтений, который служит уликой в отчёте."""
+        import suggest
+        return self.moment.astimezone(suggest.PHUKET_TZ).date()
 
     def __enter__(self):
         return self.install()

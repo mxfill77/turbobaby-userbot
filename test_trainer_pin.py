@@ -18,6 +18,7 @@
 
 Секретов тест не читает и не видит: дверь в replay — это словарь на диске.
 """
+import datetime
 import io
 import json
 import os
@@ -30,6 +31,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import test_isolation  # noqa: F401  ДО suggest: офлайн-дверь сторожа свежести
+import price_freshness
 import price_freshness_run
 import price_gate
 import suggest
@@ -189,6 +191,105 @@ class PinHeadFlagTest(unittest.TestCase):
                                          pin_head=False).stats()["голова"], "ЖИВАЯ")
         self.assertEqual(trainer_pin.Pin(self._empty_five(), "replay").stats()["голова"],
                          "из снимка")
+
+
+class ClockTest(unittest.TestCase):
+    """СЕДЬМАЯ ДВЕРЬ — КАЛЕНДАРЬ. Из-за него снимок жил ровно сутки: 111 ключей моста из 125
+    несут ЖИВУЮ дату (`build_price_sheet_note`: якорь = ЗАВТРА), и назавтра продукт спрашивает
+    мост ДРУГОЕ. Здесь доказывается, что `Clock` чинит ДЕНЬ, а не ослабляет КЛЮЧ."""
+
+    MOMENT = datetime.datetime(2026, 8, 22, 20, 52, 37,
+                               tzinfo=datetime.timezone(datetime.timedelta(hours=7)))
+
+    def test_frozen_day_is_what_the_product_sees(self):
+        real = suggest.today_phuket()
+        clock = trainer_pin.Clock(self.MOMENT)
+        with clock:
+            self.assertEqual(suggest.today_phuket(), datetime.date(2026, 8, 22))
+        self.assertEqual(suggest.today_phuket(), real, "часы обязаны вернуться живыми")
+
+    def test_the_recorded_key_is_reproduced_not_relaxed(self):
+        """Главное свойство: ключ остаётся ДОСЛОВНЫМ, с датой — совпадает он потому, что продукт
+        считает его от ЗАМОРОЖЕННОГО дня. Якорь прайс-сетки = «завтра» (suggest.py:5001)."""
+        with trainer_pin.Clock(self.MOMENT):
+            anchor = (suggest.today_phuket() + datetime.timedelta(days=1)).isoformat()
+        self.assertEqual(anchor, "2026-08-23",
+                         "якорь обязан быть завтрашним ОТ ДНЯ СНИМКА, а не от сегодняшнего")
+
+    def test_explicit_now_beats_the_freeze(self):
+        """Инъекция вызывающего сильнее заморозки — иначе `Clock` втихую переписывал бы голдены,
+        которые называют свой момент сами."""
+        other = datetime.datetime(2026, 1, 15, 20, 0, tzinfo=datetime.timezone.utc)
+        with trainer_pin.Clock(self.MOMENT):
+            self.assertEqual(suggest.today_phuket(other), datetime.date(2026, 1, 16))
+
+    def test_second_clock_of_the_product_is_frozen_too(self):
+        """`price_freshness.judge` при `now=None` берёт `datetime.date.today()` (локаль машины),
+        мимо Пхукета. Не заморозить его — и возраст слепка поехал бы каждые сутки."""
+        snap = {"handles": {"H3": -7.0}, "taken": datetime.date(2026, 8, 2), "sheet": "тест"}
+        live = {"ok": False, "handles": None, "error": "лист не опрашивался (юнит)"}
+        with trainer_pin.Clock(self.MOMENT):
+            v = price_freshness.judge(snap, live, max_age=14.0)
+        self.assertEqual(v["age_days"], 20.0, "возраст обязан считаться от дня СНИМКА")
+
+    def test_uninstall_returns_both_clocks(self):
+        before = (suggest.now_phuket, price_freshness.judge)
+        with trainer_pin.Clock(self.MOMENT):
+            self.assertIsNot(suggest.now_phuket, before[0])
+            self.assertIsNot(price_freshness.judge, before[1])
+        self.assertIs(suggest.now_phuket, before[0])
+        self.assertIs(price_freshness.judge, before[1])
+
+    def test_naive_moment_refused(self):
+        with self.assertRaises(ValueError):
+            trainer_pin.Clock(datetime.datetime(2026, 8, 22, 20, 52, 37))
+        with self.assertRaises(ValueError):
+            trainer_pin.Clock("2026-08-22")
+
+    def test_from_meta_prefers_the_stamped_moment(self):
+        clock = trainer_pin.Clock.from_meta({trainer_pin.MOMENT_KEY: "2026-08-22T13:52:37+00:00",
+                                             "снят": "2020-01-01 00:00:00"})
+        self.assertEqual(clock.day(), datetime.date(2026, 8, 22))
+        self.assertIn(trainer_pin.MOMENT_KEY, clock.why)
+
+    def test_from_meta_reads_old_snapshot_by_snyat(self):
+        """Снимки до 23.08 несут только `снят` — локальное время `time.strftime`. Читать его
+        как UTC значило бы сдвинуть день на семь часов и промахнуться в ночных снимках."""
+        clock = trainer_pin.Clock.from_meta({"снят": "2026-08-22 20:52:37"})
+        self.assertEqual(clock.local_day, datetime.date(2026, 8, 22))
+
+    def test_from_meta_without_any_clock_refuses(self):
+        """Молча замерить НЕ ТОТ день хуже, чем не замерить: подстановки «возьмём сегодня» нет.
+        «Меты нет вовсе» и «в мете нет часов» — РАЗНЫЕ отказы: слепой `meta or {}` слил бы их."""
+        with self.assertRaises(ValueError):
+            trainer_pin.Clock.from_meta({"head": "abc"})
+        with self.assertRaises(ValueError):
+            trainer_pin.Clock.from_meta(None, where="снимок без меты")
+
+    def test_from_snapshot_opens_the_file_read_only(self):
+        """`Clock` не пишет в снимок ни одной веткой — иначе он стал бы дорогой «переснять»."""
+        path = _write(_tmp("pin.json"), {"version": trainer_pin.SNAPSHOT_VERSION, "bridge": {},
+                                         "read_doc": {}, "head": {}, "playbook": "",
+                                         "meta": {"снят": "2026-08-22 20:52:37"}})
+        with io.open(path, "rb") as f:
+            before = f.read()
+        trainer_pin.Clock.from_snapshot(path).install().uninstall()
+        with io.open(path, "rb") as f:
+            self.assertEqual(f.read(), before, "снимок обязан остаться байт в байт прежним")
+        self.assertFalse(hasattr(trainer_pin.Clock, "save"))
+
+    def test_record_stamps_the_moment_into_meta(self):
+        """Часы замера — свойство СНИМКА: их пишет сам `save`, забыть их нельзя."""
+        for cls, path in ((trainer_pin.Pin, _tmp("pin.json")),
+                          (trainer_pin.GatePin, _tmp("gate.json"))):
+            obj = cls(path, "record")
+            obj.save(meta={"как": "юнит"})
+            with io.open(path, encoding="utf-8") as f:
+                meta = json.load(f)["meta"]
+            self.assertIn(trainer_pin.MOMENT_KEY, meta)
+            clock = trainer_pin.Clock.from_meta(meta, where=cls.__name__)
+            self.assertEqual(clock.day(), suggest.today_phuket(),
+                             "штамп обязан назвать тот же день, в который снимок снят")
 
 
 if __name__ == "__main__":
