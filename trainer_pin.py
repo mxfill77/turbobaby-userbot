@@ -28,6 +28,9 @@ trainer_pin.py — ПИН ВНЕШНЕЙ ГРАНИЦЫ прогона трен�
   suggest.load_playbook()                  книга правил — ЛОКАЛЬНЫЙ файл, sha снимка
                                            который переписывает боевой
                                            suggest.append_playbook_rule
+  price_gate._bridge_caller()              СТОРОЖ СВЕЖЕСТИ ЦЕНЫ — девять   action + params БЕЗ
+    (шестая дверь, `GatePin`, 23.08)       GET к Календарю мимо первых     токена
+                                           пяти границ
 
 ПОЧЕМУ ЭТО НЕ ПОДДЕЛКА ПРОВЕРКИ — четыре свойства, каждое проверяемо:
  1. Снимок СНЯТ ЖИВЬЁМ и ВСЛЕПУЮ: один проход, до того как известен хоть один вердикт, без
@@ -48,6 +51,14 @@ trainer_pin.py — ПИН ВНЕШНЕЙ ГРАНИЦЫ прогона трен�
 ключом к воротам (`client_contour` ждёт «зелёный прогон через тренажёр» ЖИВОГО продукта) оно
 служить НЕ МОЖЕТ.
 
+ЧТО ИЗМЕНИЛОСЬ 23.08.2026 — ровно две вещи, и обе против этой оговорки, а не в обход неё:
+  · `GatePin` (внизу файла) закрывает ШЕСТУЮ живую дверь — сторожа свежести цены. До неё «пин»
+    держал пять границ, а замер всё равно стоял на живой сети: 100% времени набора и один
+    сетевой вердикт на восемь кейсов;
+  · `Pin(..., pin_head=False)` — ВНЕШНИЕ двери из снимка, ГОЛОВА ЖИВАЯ. Это и есть режим
+    «честного живого числа»: из замера убрана сеть, но не модель. Оговорка выше снимается
+    ТОЛЬКО в этом режиме и ТОЛЬКО для головы; на `pin_head=True` она в силе дословно.
+
 ЗАМОК ОТ ЗЛОУПОТРЕБЛЕНИЯ. `trainer_run.py` этот модуль НЕ ИМПОРТИРУЕТ и знать о нём не должен:
 пин ставится только СНАРУЖИ, в измерительном раннере. Поэтому вердикт для ворот
 (`trainer_run.write_verdict`) физически не может быть снят на пине — там, где пин, там нет
@@ -62,8 +73,10 @@ import hashlib
 import io
 import json
 import os
+import time
 
 SNAPSHOT_VERSION = 2
+GATE_SNAPSHOT_VERSION = 1
 _SECRET_KEYS = ("token", "key", "secret", "password", "auth")
 
 
@@ -96,10 +109,19 @@ class Pin(object):
 
     TARGETS = (("pricing", "_default_get"), ("delivery", "_default_get"))
 
-    def __init__(self, path, mode):
+    def __init__(self, path, mode, pin_head=True):
+        """`pin_head=False` — ВНЕШНИЕ двери из снимка, а ГОЛОВА ЖИВАЯ.
+
+        Заведено 23.08.2026 ради честного живого числа: пин головы убирает из замера саму модель
+        (`trainer_pin` строки 46-49 это и говорят — число с пина ключом к воротам быть не может).
+        Снимок при этом НЕ ТРОГАЕТСЯ ни на байт: его секция `head` просто не читается, и промахов
+        головы в таком прогоне не бывает по построению (`misses['head']` остаётся 0 — считать
+        нечего, живая голова отвечает сама). Ослаблением проверки это не является: молчащую
+        голову ловит `trainer_run._HeadWatch` (правило «МОЛЧАЩАЯ ГОЛОВА = НЕИЗВЕСТНО», 22.08),
+        и оно не зависит от того, кто дал ответ — снимок или CLI."""
         if mode not in ("record", "replay"):
             raise ValueError("режим только 'record' или 'replay'")
-        self.path, self.mode = path, mode
+        self.path, self.mode, self.pin_head = path, mode, bool(pin_head)
         self.data = {"version": SNAPSHOT_VERSION, "bridge": {}, "read_doc": {},
                      "head": {}, "playbook": None, "meta": {}}
         self.misses = {"bridge": 0, "read_doc": 0, "head": 0}
@@ -212,10 +234,11 @@ class Pin(object):
 
         self._orig.append((suggest, "_bridge_read_doc", suggest._bridge_read_doc))
         suggest._bridge_read_doc = self._wrap_read_doc(suggest._bridge_read_doc)
-        for attr in ("_cli_llm", "_default_llm"):
-            real = getattr(suggest, attr)
-            self._orig.append((suggest, attr, real))
-            setattr(suggest, attr, self._wrap_head(real))
+        if self.pin_head:
+            for attr in ("_cli_llm", "_default_llm"):
+                real = getattr(suggest, attr)
+                self._orig.append((suggest, attr, real))
+                setattr(suggest, attr, self._wrap_head(real))
 
         # playbook — ЛОКАЛЬНЫЙ файл, в который пишет боевой suggest.append_playbook_rule.
         # Замер обязан видеть один и тот же текст, а не тот, что успел дописать живой процесс.
@@ -241,11 +264,177 @@ class Pin(object):
         return self.path
 
     def stats(self):
-        return {"режим": self.mode, "вызовов": dict(self.calls), "промахов": dict(self.misses),
+        return {"режим": self.mode, "голова": "из снимка" if self.pin_head else "ЖИВАЯ",
+                "вызовов": dict(self.calls), "промахов": dict(self.misses),
                 "ключей": {"мост": len(self.data["bridge"]), "доков": len(self.data["read_doc"]),
                            "головы": len(self.data["head"])},
                 "playbook_sha": _sha(self.data.get("playbook") or ""),
                 "по_кейсам": self.per_case}
+
+    def __enter__(self):
+        return self.install()
+
+    def __exit__(self, *exc):
+        self.uninstall()
+        return False
+
+
+# ═══════════════════ ШЕСТАЯ ДВЕРЬ: СТОРОЖ СВЕЖЕСТИ ЦЕНЫ (23.08.2026) ═══════════════════════════
+
+class GatePin(object):
+    """Пин ШЕСТОЙ живой двери — `price_gate` → девять GET к Календарю.
+
+    ЗАЧЕМ ОТДЕЛЬНЫМ КЛАССОМ И ОТДЕЛЬНЫМ ФАЙЛОМ. Замер 22.08
+    (`docs/artifacts/2026-08-22-pin-degeneracy-check.md`, `_scratch_pindegen_0822/res_gate.json`):
+    прогон «на пине» всё равно ходил в живую сеть — 17 спросов сторожа, **42.80с из 42.89с
+    времени набора (100%)**, 8 кейсов из 12. Сторож берёт клиент моста, одолженный у демона
+    (`price_gate._bridge_caller` → `queue_snapshot_pc._daemon.bc._get`), и идёт мимо ВСЕХ пяти
+    границ `Pin` — промахи `Pin` при этом нули, потому что `Pin` про эту дверь не знает.
+    Отдельный файл снимка — не прихоть: секции `Pin` версионированы (`SNAPSHOT_VERSION`), и
+    подмешивание шестой двери туда обесценило бы снимок 22.08 (версия 2), то есть заставило бы
+    ПЕРЕСНЯТЬ уже снятое. Пересъёмка запрещена, поэтому дверь живёт своим снимком.
+
+    ПОЧЕМУ ЭТО НЕ ПОДДЕЛКА — те же четыре свойства, что у `Pin`:
+     1. снимок снят ЖИВЬЁМ и ВСЛЕПУЮ, одним проходом; `record` отказывается писать поверх
+        (`FileExistsError`), поэтому «переигрывать, пока не позеленеет» технически невозможно;
+     2. ни один чек не снят и ни один порог не сдвинут — корпус и `expect` класс не читает;
+     3. промах двери НЕ ПРОЩАЕТСЯ и НЕ КРАСИТ, а даёт **НЕИЗВЕСТНО** — см. ниже;
+     4. над замороженным вердиктом работает ВЕСЬ код продукта: `price_gate.verdict`, кэш,
+        `price_freshness.judge`, `bot_action` и обе ветки `suggest`, которые сторожа спрашивают.
+
+    ПРОМАХ = НЕИЗВЕСТНО, А НЕ КРАСНОЕ — и это главное отличие от наивного пина. Отказ двери
+    продукт обязан толковать как «цену не называем» (правило владельца 17.08), поэтому пустой
+    снимок дал бы КРАСНЫЙ набор — то есть прибор обвинил бы КОД в том, что промолчала ГРАНИЦА
+    ЗАМЕРА. Это ровно та ложь, от которой 22.08 заведено правило «МОЛЧАЩАЯ ГОЛОВА = НЕИЗВЕСТНО»
+    (`trainer_run`, узел того же имени); здесь оно зеркалится на шестую дверь. Кейс, спросивший
+    сторожа при промахнувшемся снимке, получает исход НЕИЗВЕСТНО: не зелёный (доказывать нечем)
+    и не красный (кода не уличили).
+
+    ПЯТНО ЛИПКОЕ, И ЭТО НЕ НЕБРЕЖНОСТЬ. Вердикт сторожа КЭШИРУЕТСЯ на `PRICE_GATE_TTL_MIN`
+    (дефолт 30 мин) — за набор дверь дёргается ОДИН раз, а обслуживает восемь кейсов. Считай мы
+    «неизвестно» только по свежим промахам, семь кейсов из восьми получили бы вердикт, рождённый
+    промахом, и назывались бы измеренными. Поэтому `tainted` держится до `new_run()`, который
+    сбрасывает и кэш продукта (`price_gate.reset()`), и само пятно — так каждый прогон честно
+    переигрывает дверь заново.
+
+    Секреты: клиент моста поднимается ТОЛЬКО в режиме `record` и ТОЛЬКО самим `price_gate`
+    (запрет класса 328 цел — здесь их не читают и не видят); `params` чистятся `_scrub` до
+    хеширования и до записи.
+    """
+
+    def __init__(self, path, mode):
+        if mode not in ("record", "replay"):
+            raise ValueError("режим только 'record' или 'replay'")
+        self.path, self.mode = path, mode
+        self.data = {"version": GATE_SNAPSHOT_VERSION, "gate": {}, "meta": {}}
+        self.calls = self.misses = self.asks = 0
+        self.seconds = 0.0
+        self.tainted = False              # вердикт в игре рождён промахом снимка
+        self.unknown = set()              # кейсы, спросившие сторожа при таком вердикте
+        self.asks_by_case = {}
+        self._case = None
+        self._orig = []
+        if mode == "replay":
+            with io.open(path, encoding="utf-8") as f:
+                self.data = json.load(f)
+            if self.data.get("version") != GATE_SNAPSHOT_VERSION:
+                raise ValueError("снимок двери другой версии: %r" % self.data.get("version"))
+        elif os.path.exists(path):
+            raise FileExistsError("снимок двери уже существует, перезапись запрещена: %s" % path)
+
+    # ── учёт ─────────────────────────────────────────────────────────────────────────────────
+    def case(self, cid):
+        self._case = cid
+        self.asks_by_case.setdefault(cid, 0)
+
+    def new_run(self):
+        """Начать прогон с ЧИСТОЙ двери: кэш вердикта продукта сброшен, пятно снято.
+
+        Без этого прогоны 2 и 3 переиспользовали бы вердикт, снятый в прогоне 1 (окно 30 мин), —
+        именно так 22.08 совпадение трёх прогонов частично объяснялось КЭШЕМ, а не пином."""
+        import price_gate
+        price_gate.reset()
+        self.tainted = False
+        self.unknown = set()
+        self.asks_by_case = {}
+        self._case = None
+
+    # ── сама дверь ───────────────────────────────────────────────────────────────────────────
+    def _key(self, action, kw):
+        return json.dumps({"action": str(action), "params": _scrub(kw)},
+                          ensure_ascii=False, sort_keys=True)
+
+    def _wrap_factory(self, real):
+        """`price_gate._bridge_caller()` отдаёт функцию `caller(action, **kw)`. В replay живой
+        клиент моста не поднимается ВОВСЕ: `real` не зовётся ни разу."""
+        def factory():
+            inner = real() if self.mode == "record" else None
+
+            def caller(action, **kw):
+                t0 = time.time()
+                self.calls += 1
+                k = self._key(action, kw)
+                try:
+                    if self.mode == "record":
+                        v = inner(action, **kw)
+                        self.data["gate"][k] = {"action": str(action), "params": _scrub(kw),
+                                                "value": copy.deepcopy(v)}
+                        return v
+                    hit = self.data["gate"].get(k)
+                    if hit is None:
+                        self.misses += 1
+                        self.tainted = True
+                        raise PinMiss("двери сторожа нет в снимке: %s" % k[:160])
+                    return copy.deepcopy(hit["value"])
+                finally:
+                    self.seconds += time.time() - t0
+            return caller
+        return factory
+
+    def _wrap_allow(self, real):
+        """Наблюдатель СПРОСА. Считает, кто спрашивал сторожа, и метит кейс «неизвестно», если
+        вердикт, которым его обслужили, рождён промахом снимка — свежим или лежащим в кэше."""
+        def wrapped(*a, **kw):
+            self.asks += 1
+            if self._case is not None:
+                self.asks_by_case[self._case] = self.asks_by_case.get(self._case, 0) + 1
+            out = real(*a, **kw)
+            if self.tainted and self._case is not None:
+                self.unknown.add(self._case)
+            return out
+        return wrapped
+
+    # ── установка/снятие ─────────────────────────────────────────────────────────────────────
+    def install(self):
+        import price_gate
+        self._orig.append((price_gate, "_bridge_caller", price_gate._bridge_caller))
+        price_gate._bridge_caller = self._wrap_factory(price_gate._bridge_caller)
+        self._orig.append((price_gate, "allow", price_gate.allow))
+        price_gate.allow = self._wrap_allow(price_gate.allow)
+        price_gate.reset()                # кэш в памяти процесса: иначе дверь не дёрнется ни разу
+        return self
+
+    def uninstall(self):
+        import price_gate
+        for mod, attr, real in reversed(self._orig):
+            setattr(mod, attr, real)
+        self._orig = []
+        price_gate.reset()                # замороженный вердикт не смеет пережить замер
+
+    def save(self, meta=None):
+        self.data["meta"] = dict(self.data.get("meta") or {}, **(meta or {}))
+        tmp = self.path + ".tmp"
+        with io.open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, self.path)
+        return self.path
+
+    def stats(self):
+        return {"режим": self.mode, "ключей": len(self.data.get("gate") or {}),
+                "вызовов_двери": self.calls, "промахов": self.misses,
+                "спросов_сторожа": self.asks, "секунд_у_двери": round(self.seconds, 2),
+                "пятно": self.tainted, "неизвестно": sorted(self.unknown),
+                "спросов_по_кейсам": dict(self.asks_by_case)}
 
     def __enter__(self):
         return self.install()
