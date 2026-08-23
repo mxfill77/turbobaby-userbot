@@ -158,10 +158,22 @@ def _default_regen(draft, faq, directive):
         pb = suggest.load_playbook()
     except Exception:
         pb = ""
-    return suggest.regenerate_draft(
-        draft.get("transcript") or "", draft.get("lang") or "ru", faq,
-        bool(draft.get("first_contact")), draft.get("pricing_note") or "", directive,
-        park_models=allow, playbook=pb)
+    transcript = draft.get("transcript") or ""
+    lang = draft.get("lang") or "ru"
+    note = draft.get("pricing_note") or ""
+    first = bool(draft.get("first_contact"))
+
+    def _make(d):
+        return suggest.regenerate_draft(transcript, lang, faq, first, note, d,
+                                        park_models=allow, playbook=pb)
+
+    # ГАРД НАЛИЧИЯ ПЕРЕД ОТПРАВКОЙ (включён 23.08.2026) — ровно та сборка, которую держит сквозной
+    # голден TestEndToEndMax2stix: regenerate_draft (цена КОДОМ) → guard_availability. До этой даты
+    # гард в продукте не звался ни одной строкой; здесь он закрывает ВТОРУЮ дверь — путь
+    # модераторской перегенерации, который generate_draft не проходит.
+    return suggest.guard_availability(
+        _make(directive), avail=suggest.availability_from_note(note), lang=lang,
+        regenerate=lambda hard: _make(directive + "\n" + hard))["text"]
 
 
 # ----------- кумулятивные директивы окна диалога (client_windows, #365 шаг 3) -----------

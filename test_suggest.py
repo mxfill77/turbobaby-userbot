@@ -3302,6 +3302,153 @@ class TestGuardAvailability(unittest.TestCase):
         self.assertTrue(any(b["kind"] == "special" for b in bad))
 
 
+class TestAvailBeltHoles0823(unittest.TestCase):
+    """ТРИ ДЫРЫ БОЕВОГО ПОЯСА НАЛИЧИЯ, закрытые 23.08.2026. Голдены — ДОСЛОВНЫЕ живые формы
+    (правило-класс CLAUDE.md), а не идеализация:
+      • порядок слов — живой черновик кейса 10 прогона 3 сказал «депозит 3 000 ฿ — НА ЭТИ ДАТЫ
+        СВОБОДЕН», а пояс требовал связки «свободен на» и пропустил клейм насквозь;
+      • беглая гласная — стем «свободн\\w*» не содержит слова «свободен» (свобод-Е-н), поэтому
+        запасной LLM-тайбрейк не запускался на самой частой форме (99 вхождений на 84 черновика);
+      • гард guard_availability, написанный 15.07 вместе с юнитами, в продукте НЕ ВЫЗЫВАЛСЯ ни
+        одной строкой — не «отключён», а не подключён (ни один коммит истории вызова не удалял).
+    Слова отрицательного теста взяты ЗАМЕРОМ живого корпуса переписок (client_chats.anon.jsonl,
+    710 записей): «безналичный/безналичной…» ×15 держат корень «налич», «освободится…» ×31 —
+    «свобод», «недоступен…» ×20 — «доступ»."""
+
+    # ценовая записка БЕЗ носителя наличия (мост наличия не подтверждал) и С ним
+    NOTE_NO_DATA = "ЦЕНА: NMAX 155, 5 дн: 307 ฿/день; итого 1535 ฿; депозит 3000 ฿."
+    NOTE_FREE = ("ЦЕНА: NMAX 155, 5 дн: 307 ฿/день; итого 1535 ฿; депозит 3000 ฿; "
+                 "свободен на эти даты.")
+
+    FORMS = (
+        ("прямой порядок",
+         "NMAX 155 на 5 дней: 1535 ฿ (307 ฿/день), депозит 3000 ฿ — свободен на эти даты."),
+        ("обратный порядок",                     # ДОСЛОВНО живой промах 23.08
+         "NMAX 155 на 5 дней: 1535 ฿ (307 ฿/день), депозит 3000 ฿ — на эти даты свободен."),
+        ("беглая гласная без предлога",
+         "NMAX 155 свободен, бронируем на 5 дней?"),
+    )
+
+    def test_all_three_forms_caught_when_unit_busy(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ 1: юнит ЗАНЯТ (носителя в записке нет) — пояс обязан поймать ВСЕ ТРИ
+        формы обоими слоями: мягким пост-чеком (переписывает сегмент) и гардом (клейм = нарушение)."""
+        for name, draft in self.FORMS:
+            with self.subTest(форма=name):
+                hits = suggest._pc_classify(draft, set())
+                self.assertIn("avail", [k for k, _ in hits], f"мягкий пояс проспал: {name}")
+                out = suggest.postcheck_draft(draft, "ru", pricing_note=self.NOTE_NO_DATA)
+                self.assertNotEqual(out, draft, f"сегмент не переписан: {name}")
+                self.assertIn("Уточню у команды и вернусь", out)
+                self.assertIn("[уточнить: наличие", out)
+                bad = suggest.availability_violations(
+                    draft, avail=suggest.availability_from_note(self.NOTE_NO_DATA))
+                self.assertTrue(any(b["kind"] == "avail_pos" for b in bad),
+                                f"гард проспал: {name}")
+
+    def test_honest_claim_passes_when_unit_free(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ 2: юнит СВОБОДЕН (носитель в записке есть) — честный ответ обязан
+        пройти БАЙТ-В-БАЙТ во всех трёх формах. Ужесточение не смеет стать запретом говорить о
+        наличии вообще."""
+        for name, draft in self.FORMS:
+            with self.subTest(форма=name):
+                g = suggest.guard_availability(
+                    draft, avail=suggest.availability_from_note(self.NOTE_FREE), lang="ru")
+                self.assertTrue(g["ok"], name)
+                self.assertEqual(g["source"], "draft", name)
+                self.assertEqual(g["text"], draft, f"честный ответ переписан: {name}")
+                self.assertEqual(g["violations"], [], name)
+
+    def test_root_inside_other_word_not_a_claim(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ 3: корень ВНУТРИ чужого слова клеймом не является — то же правило
+        слова, что у word_hit («безопасным» не ловится на «опасн»). Слова живые, не выдуманные."""
+        for name, text in (
+            ("безналичным ⊃ налич", "Оплата возможна безналичным переводом или картой."),
+            ("в безналичной ⊃ налич", "Оплата принимается в безналичной форме."),
+            ("освободится ⊃ свобод", "Скажу точнее, когда график освободится."),
+        ):
+            with self.subTest(слово=name):
+                self.assertEqual(suggest.availability_claims(text), [], name)
+                self.assertEqual(suggest._pc_classify(text, set()), [], name)
+                self.assertEqual(suggest.postcheck_draft(text, "ru", pricing_note=""), text, name)
+
+    def test_negation_is_not_a_positive_claim(self):
+        """«недоступен» (20 живых вхождений) — ОТРИЦАНИЕ наличия, а не утверждение: без левой
+        границы кусок строки «доступен» читался бы как avail_pos на отрицательной фразе."""
+        kinds = [c["kind"] for c in suggest.availability_claims("Этот вариант сейчас недоступен.")]
+        self.assertIn("avail_neg", kinds)
+        self.assertNotIn("avail_pos", kinds)
+
+    def test_code_phrase_is_the_one_code_prints(self):
+        """ЗАМОК ПЕЧАТЬ↔ЧТЕНИЕ: литерал, по которому гард узнаёт подтверждённое наличие, обязан
+        совпадать с тем, что печатает _client_price под `if q.get("available")`. Разойдутся —
+        гард начнёт звать правду выдумкой (ровно дефект кейса 10 от 23.08)."""
+        free = suggest._client_price({"day_price": 307, "total": 1535, "deposit": 3000,
+                                      "available": True})
+        self.assertIn(suggest._AVAIL_CODE_PHRASE, free)
+        busy = suggest._client_price({"day_price": 307, "total": 1535, "deposit": 3000,
+                                      "available": False})
+        self.assertNotIn(suggest._AVAIL_CODE_PHRASE, busy)
+
+    def test_availability_from_note_is_fail_closed(self):
+        """Носитель читается ТОЛЬКО дословно и fail-closed: нет фразы → None (данных нет), а не
+        False и не True. Занятость запиской не переносится вовсе — кода, который писал бы «занят»,
+        в ценовой записке нет."""
+        self.assertIs(suggest.availability_from_note(self.NOTE_FREE), True)
+        self.assertIsNone(suggest.availability_from_note(self.NOTE_NO_DATA))
+        self.assertIsNone(suggest.availability_from_note(""))
+        self.assertIsNone(suggest.availability_from_note(None))
+
+    def test_guard_is_wired_into_production(self):
+        """ЗАМОК ВЫЗОВА: гард обязан ВЫЗЫВАТЬСЯ в боевой сборке черновика, а не просто быть
+        написанным. Именно отсутствие этой строки держало дыру с 15.07 по 23.08."""
+        import inspect
+        src = inspect.getsource(suggest.generate_draft)
+        self.assertIn("guard_availability(", src)
+        self.assertIn("availability_from_note(", src)
+        self.assertIn("regenerate=", src)          # фолбэк не «слепая замена»: сперва перегенерация
+
+    SCARCITY = "Остался последний NMAX 155, успевайте забронировать!"
+
+    def test_generate_draft_guard_catches_what_soft_belt_never_saw(self):
+        """ВКЛАД ВКЛЮЧЕНИЯ, названный числом: мягкий пост-чек ДЕФИЦИТ не ловит вовсе (в его словаре
+        таких форм нет), поэтому до 23.08 «остался последний, успевайте» уходило клиенту насквозь.
+        Включённый гард ловит: перегенерация не помогла → безопасный фолбэк вместо выдумки."""
+        self.assertEqual(suggest._pc_classify(self.SCARCITY, set()), [],
+                         "мягкий пояс вдруг стал ловить дефицит — вклад гарда надо перемерить")
+        said = []
+
+        def llm(system, user):
+            said.append(system)
+            return self.SCARCITY
+
+        out = suggest.generate_draft("[клиент]: NMAX 155 с 6 по 11 сентября", "ru", "FAQ",
+                                     pricing_note=self.NOTE_FREE, call_llm=llm)
+        self.assertEqual(suggest.availability_claims(out), [], out)
+        self.assertIn("уточню наличие", out.lower())
+        self.assertNotIn("последний", out.lower())
+        self.assertGreater(len(said), 1)           # перегенерация БЫЛА попробована, а не пропущена
+
+    def test_code_printed_truth_survives_the_guard(self):
+        """СТОЛКНОВЕНИЕ 21.08, снятое носителем: каноническую строку цены печатает КОД, и она сама
+        утверждает наличие. Гард, читающий носитель из записки, пропускает её байт-в-байт; тот же
+        гард с ПУСТЫМ значением звал бы правду выдумкой — это и был дефект «пустого значения»."""
+        note = ("ЦЕНА: NMAX 155 на 5 дней.\n" + suggest._QUOTE_OPEN
+                + "\nNMAX 155 — 307 ฿/день; итого 1535 ฿; депозит 3000 ฿; свободен на эти даты.\n"
+                + suggest._QUOTE_CLOSE)
+
+        def llm(system, user):
+            return "Здравствуйте! Посчитал по вашим датам. [QUOTE] Бронируем?"
+
+        out = suggest.generate_draft("[клиент]: NMAX 155 с 6 по 11 сентября", "ru", "FAQ",
+                                     pricing_note=note, call_llm=llm)
+        self.assertIn("свободен на эти даты", out)          # правда кода доехала до клиента
+        self.assertNotIn("Уточню наличие", out)             # фолбэка не было
+        # и тот же текст С ПУСТЫМ значением был бы объявлен нарушением — цена носителя, числом:
+        self.assertTrue(suggest.availability_violations(out, avail=None))
+        self.assertEqual(suggest.availability_violations(
+            out, avail=suggest.availability_from_note(note)), [])
+
+
 class TestExtractMoneyFigures(unittest.TestCase):
     """extract_money_figures (шаг 2/5 #310): разбор денежных чисел из ТЕКСТА ответа бота с
     классификацией rate/total/deposit/amount. Голдены — ДОСЛОВНЫЕ живые ответы бота (правило-класс
