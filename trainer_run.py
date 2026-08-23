@@ -46,9 +46,17 @@ Bridge — ЖИВОЙ (read-only GET прайса/зон/FAQ): ожидания 
     {"green": {"<commit7>": {"commit": "<40 hex>", "result": "green",
                              "checks_passed": N, "checks_total": N,
                              "cases": 12, "cases_total": 12, "runs": 2, "clean": true,
+                             "head_moved": "", "head_after": "<40 hex>",
+                             "tree_dirty": false, "tree_known": true, "dirty_paths": [],
                              "corpus": "trainer_cases.json", "corpus_sha": "<16 hex sha256>",
                              "runner": "trainer_run.py", "ts": <unix>, "when": "<ISO>"}},
      "red":   {"<commit7>": {... "result": "red", "failed": ["3/1 доставка = цена зоны", ...]}}}
+
+ПРИВЯЗКА ЗАМЕРА К КОММИТУ (23.08.2026). Коммит ФИКСИРУЕТСЯ ОДИН раз на ВХОДЕ (`bind_head`) и
+ложится в результат вместе с числом; на выходе вершина СВЕРЯЕТСЯ (`verify_head`), и сдвиг
+называется пометкой `head_moved: <старый7>→<новый7>` В САМОЙ ЗАПИСИ, а не только в stdout. Грязь
+дерева на момент фиксации видна полями `tree_dirty`/`dirty_paths` (судит её по-прежнему `clean` —
+поля показывают, а не решают). Зачем — см. блок «ПРИВЯЗКА ЗАМЕРА К КОММИТУ» ниже по файлу.
 
 Запуск:
     venv/Scripts/python.exe trainer_run.py                 # 12 кейсов × 2 прогона, вердикт на диск
@@ -156,6 +164,53 @@ def dirty_tracked():
     if rc != 0:
         return None
     return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+# ─────────────────── ПРИВЯЗКА ЗАМЕРА К КОММИТУ: фиксация на входе + сверка на выходе ─────────
+# ЗАЧЕМ (живой случай 23.08.2026). Шесть живых прогонов набора легли на ТРИ РАЗНЫХ коммита
+# (`_scratch_livenum_0823/live_run1[1-6].json`: 59edfdb×3, 9f14c1a, 4d5691f×2) — вершину двигала
+# ЧУЖАЯ сессия, а прогон этого не заметил. Материальная причина: привязка жила ТОЛЬКО в `main()`
+# (снятие HEAD в начале + сверка в конце), а НАРУЖУ модуль отдавал единственную ручку
+# `head_commit()` — «какая вершина СЕЙЧАС». Каждый вызывающий импровизировал: живой раннер замера
+# снимал HEAD ОДИН раз на процесс (`probe_livenum.py:114`) и штамповал его во ВСЕ свои прогоны, а
+# сверки на выходе не делал вовсе — потому что её в модуле НЕ БЫЛО. Отсюда «чистый прогон», чей
+# коммит назначен тем, что стояло за 12 минут до его конца.
+#
+# Устройство: коммит ФИКСИРУЕТСЯ ровно один раз (`bind_head`), а на выходе вершина сверяется
+# (`verify_head`) — не совпало, значит замер НЕ принадлежит ни старому коммиту (код мог измениться
+# под ногами), ни новому (его не мерили). Привязка НЕ переписывает `commit` новой вершиной ни
+# одной веткой: сдвиг НАЗЫВАЕТСЯ пометкой `head_moved`, а не поглощается молча.
+
+def bind_head():
+    """ФИКСАЦИЯ коммита — ОДИН раз, на ВХОДЕ прогона. → привязка (dict), которую дальше носят
+    с собой ВСЕ прогоны замера и которая целиком ложится в результат (`build_verdict(bind=…)`).
+
+    Поля: `commit` (40 hex | '' — git молчит), `clean`/`dirty_paths` — состояние дерева НА МОМЕНТ
+    ФИКСАЦИИ, `tree_known` — третий исход («git не ответил про diff» ≠ «чисто»: `clean` при этом
+    fail-closed False, но врать «дерево грязное» тоже нельзя, поэтому незнание названо отдельно),
+    `head_after`/`head_moved` — пустые до `verify_head`."""
+    commit = head_commit()
+    dirty = dirty_tracked()
+    return {"commit": commit,
+            "clean": dirty == [],
+            "dirty_paths": list(dirty or []),
+            "tree_known": dirty is not None,
+            "head_after": "",
+            "head_moved": ""}
+
+
+def verify_head(bind):
+    """СВЕРКА вершины на ВЫХОДЕ прогона против зафиксированной. → та же привязка (мутируется).
+
+    Не совпало → `head_moved` = '<старый7>→<новый7>'. Молчание git на выходе (`head_commit()` →
+    '') СЧИТАЕТСЯ СДВИГОМ и называется '<старый7>→?': доказать, что вершина стояла, мы не смогли,
+    а «не смог проверить» зелёного не даёт (правило третьего исхода). Ровно это и делала прежняя
+    ветка `main()` — здесь она вынесена в модуль, чтобы её видел КАЖДЫЙ вызывающий, а не CLI."""
+    after = head_commit()
+    bind["head_after"] = after
+    bind["head_moved"] = ("" if after and after == bind.get("commit")
+                          else "%s→%s" % (str(bind.get("commit") or "?")[:7], after[:7] or "?"))
+    return bind
 
 
 # ───────────────────────────────── корпус и подстановки ──────────────────────────────────────
@@ -536,26 +591,43 @@ def run_corpus(cases, runs=2, ph=None, log=print):
 # ─────────────────────────────────────── вердикт ─────────────────────────────────────────────
 
 def build_verdict(commit, cases_total, passed, checks_ok, checks_all, runs, clean, failed,
-                  sha, now=None, unknown=None):
+                  sha, now=None, unknown=None, bind=None):
     """Запись вердикта РОВНО в том виде, который читают ворота (client_contour.trainer_verdict).
 
     `unknown` — список исходов «судить нечего» (молчащая голова). Он ГАСИТ зелёное, но красным
     прогон не называет: `result` получает третье значение `'unknown'`. Для ворот это то же самое
     «не зелёный» (они сверяют `result == 'green'`, а `write_verdict` кладёт всё не-зелёное в
     fail-closed ящик), но владельцу в карточке больше не врут словом «КРАСНЫЙ» про то, чего
-    прибор не измерил."""
+    прибор не измерил.
+
+    `bind` — ПРИВЯЗКА замера (`bind_head` → `verify_head`). Из неё в результат ложатся четыре
+    поля, которых до 23.08.2026 не было ни одного (23.08): `head_moved` — сдвинулась ли вершина ЗА
+    ВРЕМЯ прогона и куда, `head_after` — что стояло на выходе, `tree_dirty`/`dirty_paths` — было
+    ли дерево грязным В МОМЕНТ ФИКСАЦИИ коммита и чем именно. `tree_dirty` — ЗЕРКАЛО `clean`
+    (одно поле, один факт: два независимых источника разъехались бы), поэтому вердикта оно не
+    меняет — оно его ПОКАЗЫВАЕТ, а судить грязь остаётся прежнему условию `clean`.
+    Условие зелёного НЕ РАСШИРЕНО: «HEAD не сдвинулся» стои́т в критерии с самого начала (шапка
+    модуля, §ЗЕЛЁНЫЙ ВЕРДИКТ) — оно жило веткой `main()`, которая на сдвиге просто не доходила до
+    записи. Теперь то же самое условие живёт в самой записи, и зелёная запись со сдвинутой
+    вершиной физически не собирается — ни из CLI, ни из чужого раннера замера."""
     now = time.time() if now is None else now
     unknown = list(unknown or [])
+    bind = bind or {}
+    head_moved = str(bind.get("head_moved") or "")
     green = (not unknown
              and passed == cases_total >= client_contour.TRAINER_MIN_CASES
              and checks_all > 0 and checks_ok == checks_all
-             and runs >= client_contour.TRAINER_MIN_RUNS and clean and not failed)
+             and runs >= client_contour.TRAINER_MIN_RUNS and clean and not failed
+             and not head_moved)
     return {
         "commit": commit,
         "result": "green" if green else ("red" if failed or not unknown else "unknown"),
         "unknown": len(unknown), "unknown_why": unknown[:40],
         "checks_passed": checks_ok, "checks_total": checks_all,
         "cases": passed, "cases_total": cases_total, "runs": runs, "clean": bool(clean),
+        "head_moved": head_moved, "head_after": str(bind.get("head_after") or ""),
+        "tree_dirty": not bool(clean), "tree_known": bool(bind.get("tree_known", True)),
+        "dirty_paths": list(bind.get("dirty_paths") or [])[:40],
         "corpus": os.path.basename(CASES_FILE), "corpus_sha": sha,
         "runner": os.path.basename(__file__), "ts": now,
         "when": datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
@@ -604,9 +676,13 @@ def write_verdict(rec, path=None):
 def report_md(rec, results, commit, runs):
     """Отчёт прогона таблицей (для docs/artifacts) — по кейсам и провалившимся чекам."""
     lines = [f"# Прогон тренажёра — вердикт {rec['result'].upper()}", "",
-             f"**Коммит:** `{commit}` · **прогонов:** {runs} · **дерево:** "
-             f"{'чистое' if rec['clean'] else 'ГРЯЗНОЕ'} · **корпус:** {rec['corpus']} "
-             f"(`{rec['corpus_sha']}`)", "",
+             f"**Коммит:** `{commit}` (зафиксирован на входе) · **вершина за время прогона:** "
+             + (f"**УЕХАЛА — head_moved: {rec['head_moved']}**" if rec.get("head_moved")
+                else "неподвижна")
+             + f" · **прогонов:** {runs} · **дерево:** "
+             + ("чистое (tree_dirty: false)" if rec["clean"] else
+                "ГРЯЗНОЕ (tree_dirty: true): " + ", ".join(rec.get("dirty_paths") or ["?"]))
+             + f" · **корпус:** {rec['corpus']} (`{rec['corpus_sha']}`)", "",
              f"**Кейсы:** {rec['cases']}/{rec['cases_total']} · "
              f"**чеки:** {rec['checks_passed']}/{rec['checks_total']}"
              + (f" · **неизвестно:** {rec.get('unknown')} кейсо-прогонов"
@@ -655,12 +731,13 @@ def main(argv=None):
     except Exception:                                        # noqa: BLE001 — старый поток
         pass
 
-    commit = head_commit()
+    bind = bind_head()                       # коммит фиксируется ОДИН раз и ЗДЕСЬ, до всякой работы
+    commit = bind["commit"]
     if not commit:
         print("ПРОГОН НЕ СОСТОЯЛСЯ: git не назвал HEAD — вердикт не имеет смысла")
         return 2
-    dirty = dirty_tracked()
-    clean = dirty == []
+    dirty = bind["dirty_paths"]
+    clean = bind["clean"]
     try:
         cases, sha = load_cases(a.cases)
     except Exception as e:                                   # noqa: BLE001
@@ -671,23 +748,26 @@ def main(argv=None):
         want = {s.strip() for s in a.only.split(",") if s.strip()}
         cases = [c for c in cases if str(c.get("id")) in want]
 
-    print(f"ПРОГОН ТРЕНАЖЁРА: коммит {commit[:7]}, кейсов {len(cases)} из {total}, "
-          f"прогонов {a.runs}, дерево {'чистое' if clean else 'ГРЯЗНОЕ: ' + ', '.join(dirty or ['?'])}")
+    print(f"ПРОГОН ТРЕНАЖЁРА: коммит {commit[:7]} ЗАФИКСИРОВАН на входе, кейсов {len(cases)} из "
+          f"{total}, прогонов {a.runs}, дерево "
+          f"{'чистое' if clean else 'ГРЯЗНОЕ: ' + ', '.join(dirty or ['? git не ответил'])}")
     ph = placeholders()
     results, passed, ok, allc, failed, unknown = run_corpus(cases, runs=a.runs, ph=ph)
 
-    head_after = head_commit()
-    if head_after != commit:
-        print(f"ПРОГОН НЕ ЗАСЧИТАН: HEAD уехал за время прогона ({commit[:7]} → "
-              f"{head_after[:7] or '?'}) — вердикт удостоверял бы другой код")
-        return 2
-
+    verify_head(bind)                        # вершина на выходе: сдвиг НАЗЫВАЕТСЯ, а не глотается
     rec = build_verdict(commit, total, passed, ok, allc, a.runs, clean, failed, sha,
-                        unknown=unknown)
+                        unknown=unknown, bind=bind)
     print("\nИТОГ: %s — кейсов %d/%d, чеков %d/%d, прогонов %d, дерево %s%s"
           % (rec["result"].upper(), rec["cases"], rec["cases_total"], rec["checks_passed"],
-             rec["checks_total"], rec["runs"], "чистое" if clean else "ГРЯЗНОЕ",
+             rec["checks_total"], rec["runs"],
+             "чистое" if clean else "ГРЯЗНОЕ (tree_dirty: true)",
              (", НЕИЗВЕСТНО %d кейсо-прогонов" % len(unknown)) if unknown else ""))
+    if rec["head_moved"]:
+        # Замер принадлежит ЗАФИКСИРОВАННОМУ коммиту и НИКОМУ больше: новой вершине его не
+        # приписываем (её не мерили), старой не удостоверяем (код мог уехать под ногами).
+        print("ПРОГОН НЕ ЗАСЧИТАН: HEAD уехал за время прогона (head_moved: %s) — вердикт "
+              "удостоверял бы другой код; число выше принадлежит коммиту %s, вердикт НЕ пишется"
+              % (rec["head_moved"], commit[:7]))
     if unknown:
         print("неизвестно (судить нечего): " + "; ".join(unknown[:12]))
     if failed:
@@ -695,6 +775,8 @@ def main(argv=None):
     if a.drafts:
         for r in results:
             print(f"\n───── кейс {r['id']} «{r['name']}» прогон {r['run']} ─────\n{r['draft']}")
+    if rec["head_moved"]:
+        return 2                             # состав красных показан, но вердикта у этого прогона нет
     if a.report:
         with io.open(a.report, "w", encoding="utf-8") as f:
             f.write(report_md(rec, results, commit, a.runs))
