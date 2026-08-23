@@ -6853,6 +6853,129 @@ class TestRunLiveSmoke(unittest.TestCase):
         self.assertEqual(sent, [])                               # в окно ничего не ушло
 
 
+class TestMinQuoteAvailCarrier(unittest.TestCase):
+    """ВЕТКА МИНИМАЛЬНОЙ КОТИРОВКИ: проверяющий получает НАСТОЯЩЕЕ значение (правка 23.08.2026,
+    третий и последний случай класса «проверяющий получает пустое значение»).
+
+    ЖИВОЙ ПРОВАЛ. Кейс 10 тренажёра (прогон 3, 23.08): клиент просит скутер на СУТКИ, минимум 5
+    дней → расчёт уходит в ветку `min`, она печатает цену пятидневки И фразу кода «свободен на эти
+    даты» (мост подтвердил свободный юнит), но служебного quote-блока НЕ выпускает
+    (`marker_mode = (kind == "ok" and not pct)`). Читатель ожиданий брал наличие ровно из блока —
+    и получал пустоту при ЖИВОМ носителе, поэтому ПРАВДИВОЕ утверждение звалось выдумкой.
+
+    ЗАБОР: значение не убирали — его тут не было НИКОГДА. `git log -L` по строке проверяющего даёт
+    два коммита за всю историю: рождение чека (строка родилась как `avail=None` ЛИТЕРАЛОМ) и
+    22.08 (литерал заменён чтением quote-блока — носителем, которого на ветке `min` не существует).
+
+    Предмет тестов — ПРОВЕРЯЮЩИЙ, а не текст бота: черновик подаётся фиксированный.
+    Шим моста — дословно как у TestRunLiveSmoke (правило-класс «мок = живой формат прода»)."""
+
+    FLEET = ["NMAX 155CC BLACK PHUKET 4255"]
+    TODAY = datetime.date(2026, 9, 1)
+    MAPS = "https://www.google.com/maps/place/Rawai+Beach/@7.771,98.327,15z"
+    # черновик повторяет фразу КОДА — ровно то, что делает голова в живом кейсе 10
+    DRAFT = ("Здравствуйте! NMAX 155 — 307 ฿/день; итого 1535 ฿; депозит 3000 ฿; "
+             "свободен на эти даты.\nДоставка в Раваи — 590 ฿. Бронируем?")
+    CHECK = "нет утверждений о наличии"
+
+    def setUp(self):
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+
+    def tearDown(self):
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest._sheet_cache.update(key=None, ts=0.0, rows=None)
+
+    def _getter(self, available):
+        """Живой формат конверта моста; ЗАНЯТЫЙ юнит приходит С ЦИФРАМИ и available=false —
+        иначе это был бы сбой транспорта, а не занятость (_normalize вернул бы None)."""
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET]}}
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            return {"ok": True, "data": {"day_price": 307, "total": 307 * days, "deposit": 3000,
+                    "available": bool(available), "days": days,
+                    "cap_active": False, "cap_price": 0}}
+        return fake
+
+    def _resolve(self):
+        with open(os.path.join(suggest.BASE_DIR, "fixtures",
+                               "delivery_zones_get.live.json"), encoding="utf-8") as f:
+            zones = json.load(f)["zones"]
+        return lambda text: suggest.delivery.resolve_delivery(7.771, 98.327, zones)
+
+    def _probe(self, days):
+        ds = datetime.date(2026, 10, 6)
+        return {"model": "NMAX 155", "iso_start": ds.isoformat(),
+                "iso_end": (ds + datetime.timedelta(days=days)).isoformat(),
+                "maps_link": self.MAPS, "lang": "ru", "zone": "Раваи", "zone_price": 590}
+
+    def _exp(self, days, available):
+        p = self._probe(days)
+        transcript = "\n".join("[клиент]: " + ln for ln in suggest._smoke_client_lines(p))
+        return suggest._smoke_expectations(transcript, p, self._getter(available),
+                                           self._resolve(), self.TODAY)
+
+    def _avail_check(self, days, available, draft=None):
+        checks = suggest._smoke_checks(draft if draft is not None else self.DRAFT,
+                                       self._exp(days, available))
+        return [c for c in checks if c["name"] == self.CHECK][0]
+
+    def test_branch_premise_min_has_no_quote_block(self):
+        """ПОСЫЛКА тестов, замком: на ветке `min` служебного quote-блока НЕТ, на `ok` он ЕСТЬ.
+        Начнёт ветка `min` его выпускать — этот замок покраснеет, и посылку надо будет перемерить."""
+        self.assertIsNone(self._exp(1, True)["j_line"])          # сутки → блока нет
+        self.assertIsNotNone(self._exp(5, True)["j_line"])       # пять дней → блок есть
+
+    def test_carrier_is_the_note_not_the_block(self):
+        """Носитель — ЗАПИСКА (туда печатает КОД), а не блок: на ветке `min` наличие True при
+        отсутствующем блоке. Fail-closed: юнит занят → фразы в записке нет → None."""
+        self.assertIs(self._exp(1, True)["avail"], True)         # min + свободен → ПРАВДА
+        self.assertIs(self._exp(5, True)["avail"], True)         # ok  + свободен → правда
+        self.assertIsNone(self._exp(1, False)["avail"])          # min + занят → данных нет
+        self.assertIsNone(self._exp(5, False)["avail"])          # ok  + занят → данных нет
+
+    def test_busy_unit_min_branch_is_red(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ 1: юнит ЗАНЯТ, ветка минимальной котировки — фраза о свободных датах
+        обязана КРАСНИТЬ. Это замок на то, что правка не стала подкруткой ради зелёного."""
+        c = self._avail_check(1, False)
+        self.assertFalse(c["ok"], c)
+        self.assertIn("свободен", c["fact"])
+
+    def test_free_unit_honest_answer_passes(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ 2: юнит СВОБОДЕН — честный ответ обязан проходить на ОБЕИХ ветках.
+        До правки ветка `min` была здесь красной."""
+        for days in (1, 5):
+            with self.subTest(дней=days):
+                self.assertTrue(self._avail_check(days, True)["ok"])
+
+    def test_one_day_and_five_days_agree(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ 3: срок СУТКИ и срок ПЯТЬ ДНЕЙ обязаны вести себя ОДИНАКОВО — до
+        правки они расходились (сутки красный, пять дней зелёный) при одном и том же складе."""
+        for available in (True, False):
+            with self.subTest(свободен=available):
+                self.assertEqual(self._avail_check(1, available)["ok"],
+                                 self._avail_check(5, available)["ok"])
+
+    def test_scarcity_still_red_regardless_of_carrier(self):
+        """Носитель судит ТОЛЬКО наличие: дефицит источника данных не имеет и краснит при любом
+        значении — правка ослаблением чека не является."""
+        draft = "Остался последний NMAX 155, успевайте забронировать!"
+        for days in (1, 5):
+            for available in (True, False):
+                with self.subTest(дней=days, свободен=available):
+                    self.assertFalse(self._avail_check(days, available, draft)["ok"])
+
+
 class TestPastStartDateGate(unittest.TestCase):
     """ЖИВОЙ ДЕФЕКТ (тренажёр ТЕСТ-7, 22.07): клиент «с 20 по 25 июля», сегодня 22 июля → бот МОЛЧА
     посчитал котировку (parse_date_range заролил старт на 2027-07-20 — год-ролл _mk сработал как
