@@ -8586,5 +8586,168 @@ class WordHitRule(unittest.TestCase):
         self.assertTrue(chk_ok["доставка = цена зоны"]["ok"], "верная цена зоны перестала засчитываться")
 
 
+class TestGuardExperienceMention(unittest.TestCase):
+    """ПОЯС ОБЯЗАТЕЛЬНОГО УПОМИНАНИЯ (23.08.2026) — зеркало пояса наличия: тот ловит СКАЗАННОЕ
+    лишнее, этот НЕСКАЗАННОЕ обязательное. Голдены — ДОСЛОВНЫЕ живые черновики 14 прогонов
+    тренажёра (кейсы 5 и 6), а не идеализированные формулировки: правило-класс «golden-тесты
+    детекта = РЕАЛЬНЫЕ фразы»."""
+
+    # Диалог кейса 5 живого корпуса, дословно: клиент САМ сказал, что опыта нет.
+    TR_NOVICE = ("[клиент]: Здравствуйте! Вообще никогда не ездил на мотоцикле, "
+                 "но хочу арендовать мощный Honda CB650R на неделю. Оформим?")
+    TR_NO_TALK = "[клиент]: Здравствуйте! Хочу взять что-нибудь на неделю покататься по острову."
+    TR_MODEL = "[клиент]: Здравствуйте! Сколько стоит NMAX 155 на неделю?"
+
+    # ЖИВЫЕ черновики, где голова правило ВЫПОЛНИЛА (прогоны 21-27, кейсы 5 и 6) — все формулировки
+    # из переписи п.2: «опыт+менеджер», «менеджер», «по опыту», «пару слов про опыт».
+    OK_DRAFTS = [
+        "Спасибо, что выбрали нас 🤝 Раз опыта вождения мотоцикла пока не было — давайте я уточню "
+        "детали с менеджером, чтобы подобрать вариант, который вам точно подойдёт, и вернусь с ответом.",
+        "Спасибо, что выбрали нас 🤝 Раз опыта на мотоцикле пока не было, давайте подберём вариант "
+        "вместе с менеджером, чтобы вам было комфортно и безопасно — уточню детали и вернусь с предложением.",
+        "Так вместе с менеджером подберём вариант, который точно подойдёт.",
+        "Спасибо, что выбрали нас 🤝 Раз опыта пока не было, давайте я уточню детали у менеджера и "
+        "вместе с ним подберём подходящий вариант — так безопаснее и надёжнее.",
+        "Понял насчёт CB650R — по опыту у нас пока по нулям, так что подберём подходящий вариант "
+        "вместе с командой, чуть позже вернусь с предложением.",
+        "И пару слов про опыт вождения — на чём и как долго катались, так проще подобрать вариант 😎",
+        "Спасибо, что выбрали нас 🤝\n\nПонял по опыту — на мотоциклах пока не ездили.\n"
+        "Давайте вместе подберём подходящий вариант, чуть уточню детали у менеджера и вернусь с предложением.",
+    ]
+
+    # Черновики БЕЗ обязательного упоминания. Первый — ДОСЛОВНО тот, что покраснел в живом прогоне
+    # 28 (кейс 5); остальные повторяют те же формулировки, но носитель подменён «командой»/
+    # «ребятами»/пустотой — ровно тот способ, которым голова и промахивается.
+    BAD_DRAFTS = [
+        "Здравствуйте! Уточню детали у команды и подберём вариант вместе, а по датам подскажите — "
+        "с какого числа планируете и на сколько дней?",
+        "Спасибо, что выбрали нас 🤝 Давайте подберём подходящий вариант вместе с командой — "
+        "вернусь с предложением.",
+        "Спасибо, что выбрали нас 🤝 Подберём вариант, который вам точно подойдёт, и вернусь с ответом.",
+        "Понял по CB650R — подберём подходящий вариант вместе со специалистами, чуть позже вернусь "
+        "с предложением.",
+        "Здравствуйте! Подскажите, с какого числа планируете и на сколько дней.",
+        "Спасибо, что выбрали нас 🤝 Уточню детали и вернусь с рекомендацией по модели.",
+        "Раз мотоцикл для вас в новинку — подберём вариант вместе с ребятами и вернёмся.",
+    ]
+
+    # ── применимость правила ────────────────────────────────────────────────────────────────
+    def test_pravilo_primenimo_tolko_pri_yavnom_otsutstvii_opyta(self):
+        self.assertTrue(suggest.experience_rule_applies(self.TR_NOVICE))
+        # клиент про опыт не говорил вовсе / назвал модель — ЖЁСТКОЕ правило не применимо
+        self.assertFalse(suggest.experience_rule_applies(self.TR_NO_TALK))
+        self.assertFalse(suggest.experience_rule_applies(self.TR_MODEL))
+        self.assertFalse(suggest.experience_rule_applies(""))
+        self.assertFalse(suggest.experience_rule_applies(None))
+
+    def test_formy_otritsaniya_opyta_iz_zhivogo_detektora(self):
+        for line in ("Я новичок, прав категории A нет.", "Опыта нет совсем.",
+                     "Впервые беру байк.", "Hi! I'm a beginner, never ridden before."):
+            self.assertTrue(suggest.experience_rule_applies("[клиент]: " + line), line)
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ ПЕРВЫЙ: черновик БЕЗ упоминания обязан быть ПОЙМАН ────────────────
+    def test_negativ_1_chernovik_bez_upominaniya_poyman_vo_vseh_formulirovkah(self):
+        """Ни одна из семи формулировок промаха не проходит мимо пояса."""
+        for draft in self.BAD_DRAFTS:
+            self.assertEqual(suggest.mention_hits(draft), [], f"носитель найден там, где его нет: {draft!r}")
+            self.assertTrue(suggest.mention_violation(draft, applies=True), draft)
+            r = suggest.guard_experience_mention(draft, applies=True)
+            self.assertTrue(r["missing"], draft)
+            self.assertEqual(r["source"], "fallback", draft)
+            self.assertTrue(r["ok"], draft)
+            self.assertTrue(suggest.mention_hits(r["text"]), f"пояс не вылечил: {r['text']!r}")
+
+    def test_negativ_1_komanda_ne_zamenyaet_menedzhera(self):
+        """«Команда» носителем НЕ является — именно ею прогон 28 подменил обязательное упоминание."""
+        self.assertEqual(suggest.mention_hits("Уточню детали у команды и подберём вариант вместе."), [])
+        self.assertTrue(suggest.mention_hits("Уточню детали у менеджера и подберём вариант вместе."))
+
+    def test_negativ_1_sluzhebnaya_pometka_ne_zachityvaetsya(self):
+        """Слово «менеджер» ТОЛЬКО в пометке модератору клиент не видит → упоминания нет."""
+        draft = ("Здравствуйте! Подберём вариант и вернусь с предложением.\n"
+                 "[уточнить у менеджера: клиент без опыта просит CB650R]")
+        self.assertEqual(suggest.mention_hits(draft), [])
+        self.assertTrue(suggest.mention_violation(draft, applies=True))
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ ВТОРОЙ: черновик С упоминанием проходит НЕТРОНУТЫМ ────────────────
+    def test_negativ_2_chernovik_s_upominaniem_prohodit_netronutym(self):
+        """Ни одного символа не добавлено — сверка ПОБАЙТОВАЯ, а не «примерно тот же текст»."""
+        for draft in self.OK_DRAFTS:
+            self.assertTrue(suggest.mention_hits(draft), f"носитель не найден: {draft!r}")
+            self.assertFalse(suggest.mention_violation(draft, applies=True), draft)
+            r = suggest.guard_experience_mention(draft, applies=True)
+            self.assertEqual(r["source"], "draft", draft)
+            self.assertFalse(r["missing"], draft)
+            self.assertIs(r["text"], draft, "черновик подменён объектом, а не пропущен как есть")
+            self.assertEqual(len(r["text"]), len(draft), draft)
+
+    def test_negativ_2_pravilo_neprimenimo_chernovik_bayt_v_bayt(self):
+        """Правило не применимо → пояс молчит даже при полном отсутствии упоминания."""
+        for draft in self.BAD_DRAFTS:
+            r = suggest.guard_experience_mention(draft, applies=False)
+            self.assertEqual(r["source"], "clean")
+            self.assertIs(r["text"], draft)
+            self.assertFalse(r["missing"])
+
+    # ── перегенерация первой, дописка второй ────────────────────────────────────────────────
+    def test_regeneratsiya_pervoy(self):
+        bad = self.BAD_DRAFTS[0]
+        good = "Спасибо! Раз опыта пока не было, подберём вариант вместе с менеджером."
+        seen = []
+
+        def regen(directive):
+            seen.append(directive)
+            return good
+
+        r = suggest.guard_experience_mention(bad, applies=True, regenerate=regen)
+        self.assertEqual(r["source"], "regen")
+        self.assertEqual(r["text"], good)
+        self.assertEqual(r["attempts"], 1)
+        self.assertIn("менеджер", seen[0].lower())
+
+    def test_dopiska_tolko_posle_neudachnyh_popytok(self):
+        bad = self.BAD_DRAFTS[0]
+        calls = []
+
+        def regen(directive):
+            calls.append(1)
+            return "Подберём вариант вместе с командой."      # упорно без носителя
+
+        r = suggest.guard_experience_mention(bad, applies=True, regenerate=regen, max_retries=2)
+        self.assertEqual(len(calls), 2, "перегенерацию не попробовали дважды")
+        self.assertEqual(r["source"], "fallback")
+        self.assertTrue(suggest.mention_hits(r["text"]))
+
+    def test_upavshaya_golova_ne_lomaet_poyas(self):
+        def regen(directive):
+            raise RuntimeError("голова недоступна")
+
+        r = suggest.guard_experience_mention(self.BAD_DRAFTS[0], applies=True, regenerate=regen)
+        self.assertEqual(r["source"], "fallback")
+        self.assertTrue(suggest.mention_hits(r["text"]))
+
+    # ── дописка читается фразой, а не швом ──────────────────────────────────────────────────
+    def test_dopiska_vstaet_pered_sluzhebnymi_pometkami(self):
+        draft = ("Здравствуйте! Подберём вариант и вернусь с предложением.\n"
+                 "[собрано: модель ✅ срок ✅]")
+        r = suggest.guard_experience_mention(draft, applies=True)
+        lines = r["text"].splitlines()
+        self.assertTrue(lines[-1].startswith("[собрано"), "пометка модератору перестала быть последней")
+        self.assertIn("менеджер", suggest.client_facing_text(r["text"]).lower())
+        self.assertIn("[собрано: модель ✅ срок ✅]", r["text"])
+
+    def test_dopiska_odnim_predlozheniem_bez_otsenki_bezopasnosti(self):
+        """Фраза-страховка сама не нарушает EXPERIENCE_SAFETY_RULE (никаких «опасно/не советую»)."""
+        fb = suggest.mention_fallback("ru")
+        for forbidden in ("опасн", "небезопас", "не совет", "лучше не", "рискован", "не рекоменд"):
+            self.assertFalse(suggest.word_hit(forbidden, fb.lower()), forbidden)
+        self.assertTrue(suggest.mention_hits(fb))
+        self.assertTrue(suggest.mention_hits(suggest.mention_fallback("en")))
+
+    def test_pustoy_chernovik_bayt_v_bayt(self):
+        for draft in ("", "   ", None):
+            self.assertEqual(suggest._append_to_client_body(draft, "фраза"), draft)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
