@@ -295,6 +295,14 @@ def expectations(case, transcript, note, hints):
     """Ожидания кейса из ТОГО ЖЕ pricing_note, что питает черновик (точка правды — живой Bridge)."""
     return {
         "j_line": suggest._quote_block_from_note(note),
+        # НАЛИЧИЕ — из ТОГО ЖЕ источника, куда его печатает КОД: фразу «свободен на эти даты»
+        # `_client_price` пишет в ЗАПИСКУ ровно под `if q.get("available")`. Ключ обязан быть здесь
+        # ТОЖЕ: производителей ожиданий ДВА (этот и `suggest._smoke_expectations`), а читатель один
+        # (`suggest._smoke_checks`). 23.08.2026 ключ завели только у второго — и живой прогон 21 дал
+        # 6 из 12: на ЗДОРОВЫХ кейсах ветки `ok` правдивая строка КОДА звалась выдумкой, потому что
+        # читатель получал пустоту. Замок на эту пару — `test_trainer_run` (оба словаря обязаны
+        # нести ключ и одинаковое значение на одной записке).
+        "avail": suggest.availability_from_note(note),
         "delivery_line": suggest._delivery_block_from_note(note),
         "sheet_line": suggest._sheet_block_from_note(note),
         "zone": case.get("zone"),

@@ -679,5 +679,80 @@ class PrivyazkaZameraKKommitu(unittest.TestCase):
         raise AssertionError("функции main нет")
 
 
+class DvaProizvoditelyaOzhidaniy(unittest.TestCase):
+    """ЗАМОК НА ПАРУ ПРОИЗВОДИТЕЛЕЙ ОЖИДАНИЙ (заведён 23.08.2026 живым провалом).
+
+    Словарь ожиданий строят ДВЕ функции — `trainer_run.expectations` (тренажёр) и
+    `suggest._smoke_expectations` (e2e-смоук), — а читает его ОДНА (`suggest._smoke_checks`).
+    Ключ наличия завели сперва только у второй, и гейт этого НЕ ПОЙМАЛ: живой прогон дал
+    6 из 12, где все шесть красных — один и тот же чек «нет утверждений о наличии» на ЗДОРОВЫХ
+    кейсах ветки `ok`; читатель получал `None` и звал выдумкой строку, которую напечатал сам КОД.
+
+    Замок стои́т на СВОЙСТВЕ, а не на списке: всё, что читатель берёт из `exp`, обязан класть
+    КАЖДЫЙ производитель. Появится третий производитель или уедет имя ключа — покраснеет здесь,
+    а не на живом прогоне через полчаса."""
+
+    NOTE_FREE = ("ЦЕНА: NMAX 155, 5 дн.\n<<<QUOTE>>>\nNMAX — 307 ฿/день; итого 1535 ฿; "
+                 "депозит 3000 ฿; свободен на эти даты.\n<<<END_QUOTE>>>")
+    NOTE_MIN_FREE = ("ЦЕНА: скутеры сдаём от 5 дней (короче срок не оформляем); цена за 5 дн: "
+                     "307 ฿/день; итого 1535 ฿; депозит 3000 ฿; свободен на эти даты.")
+    NOTE_BUSY = "ЦЕНА: на эти даты все подходящие байки заняты — НЕ называй числа."
+    DRAFT = ("Здравствуйте! NMAX — 307 ฿/день; итого 1535 ฿; депозит 3000 ฿; "
+             "свободен на эти даты. Бронируем?")
+    CHECK = "нет утверждений о наличии"
+
+    def _exp(self, note):
+        return tr.expectations({"id": 1}, "[клиент]: NMAX 155 с 6 по 11 сентября", note,
+                               {"model": "NMAX 155", "has_dates": True})
+
+    def _avail_check(self, note, draft=None):
+        by = {c["name"]: c for c in suggest._smoke_checks(draft if draft is not None else self.DRAFT,
+                                                          self._exp(note))}
+        self.assertIn(self.CHECK, by, "чека наличия в наборе нет вовсе")
+        return by[self.CHECK]
+
+    def test_klyuch_nalichiya_est_u_oboikh_proizvoditeley(self):
+        """Ключ наличия обязан быть у ОБОИХ — и нести ОДНО значение на одной и той же записке."""
+        self.assertIn("avail", self._exp(self.NOTE_FREE))
+        self.assertIs(self._exp(self.NOTE_FREE)["avail"], True)
+        self.assertIs(self._exp(self.NOTE_MIN_FREE)["avail"], True)   # ветка минимальной котировки
+        self.assertIsNone(self._exp(self.NOTE_BUSY)["avail"])          # fail-closed
+        # оба производителя читают ОДИН источник — значение обязано совпасть
+        for note in (self.NOTE_FREE, self.NOTE_MIN_FREE, self.NOTE_BUSY):
+            self.assertEqual(self._exp(note)["avail"], suggest.availability_from_note(note), note[:40])
+
+    def test_chitatel_ne_beret_iz_exp_nichego_mimo_proizvoditeley(self):
+        """СВОЙСТВО, а не список: КАЖДЫЙ ключ, который читатель достаёт из `exp`, обязан класть
+        производитель тренажёра. Ровно этой проверки не было — и ключ разъехался молча."""
+        with io.open(os.path.abspath(suggest.__file__), encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename="suggest.py")
+        used = set()
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.FunctionDef) and node.name == "_smoke_checks"):
+                continue
+            for n in ast.walk(node):
+                if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                        and n.func.attr == "get" and isinstance(n.func.value, ast.Name)
+                        and n.func.value.id == "exp" and n.args
+                        and isinstance(n.args[0], ast.Constant)):
+                    used.add(n.args[0].value)
+                if (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name)
+                        and n.value.id == "exp" and isinstance(n.slice, ast.Constant)):
+                    used.add(n.slice.value)
+        self.assertTrue(used, "не нашёл ни одного обращения к exp — замок ослеп")
+        have = set(self._exp(self.NOTE_FREE))
+        self.assertEqual(used - have, set(),
+                         "читатель берёт из exp ключи, которых производитель тренажёра не кладёт")
+
+    def test_pravda_koda_prokhodit_a_vydumka_krasnit(self):
+        """Сквозь ПАРУ: правдивая строка КОДА проходит на обеих ветках, выдумка краснит."""
+        self.assertTrue(self._avail_check(self.NOTE_FREE)["ok"])       # ветка ok
+        self.assertTrue(self._avail_check(self.NOTE_MIN_FREE)["ok"])   # ветка min
+        self.assertFalse(self._avail_check(self.NOTE_BUSY)["ok"])      # данных нет → выдумка
+        # дефицит краснит при любом носителе — ослаблением чека правка не является
+        self.assertFalse(self._avail_check(self.NOTE_FREE,
+                                           "Остался последний, успевайте!")["ok"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
