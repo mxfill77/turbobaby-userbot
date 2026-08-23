@@ -8,6 +8,7 @@ test_trainer_run.py — ГОЛДЕНЫ безголового прогона т�
 """
 import test_isolation  # noqa: F401 — TESTING=1, боевой IPC заблокирован
 import ast
+import contextlib
 import io
 import json
 import os
@@ -482,6 +483,200 @@ class SravnenieSlovomVKhekakh(unittest.TestCase):
                                         "case_checks зовёт правило по слову меньше трёх раз")
                 return
         raise AssertionError("функции case_checks нет")
+
+
+# ─────────────── 7. ПРИВЯЗКА ЗАМЕРА К КОММИТУ (bind_head → verify_head → запись) ─────────────
+
+class PrivyazkaZameraKKommitu(unittest.TestCase):
+    """ЗАМЕР ПРИНАДЛЕЖИТ НАЗВАННОМУ КОММИТУ, а не вершине дерева (23.08.2026).
+
+    Живой повод, числом: шесть живых прогонов набора 23.08 легли на ТРИ РАЗНЫХ коммита
+    (`_scratch_livenum_0823/live_run1[1-6].json` — 59edfdb×3, 9f14c1a, 4d5691f×2), причём ВСЕ ТРИ
+    прогона с чистым числом 12 из 12 (п3, п4, п6) — на трёх разных. Вершину двигала чужая сессия.
+
+    Живую вершину здесь НЕ ТРОГАЕМ ни одной веткой: `head_commit`/`dirty_tracked`/`run_corpus`
+    подменяются в модуле на время теста, git не зовётся вовсе (правило-класс «мок копирует ЖИВОЙ
+    формат»: подменённая ручка отдаёт ровно то, что отдаёт живая, — 40 hex либо '')."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="trbind_")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        self.v = os.path.join(self.d, "verdict.json")
+        self.cases = os.path.join(self.d, "cases.json")
+        with io.open(self.cases, "w", encoding="utf-8") as f:
+            json.dump({"cases": [{"id": i, "name": "к%d" % i} for i in range(1, 13)]}, f)
+        keep = (tr.head_commit, tr.dirty_tracked, tr.run_corpus)
+
+        def _restore():
+            tr.head_commit, tr.dirty_tracked, tr.run_corpus = keep
+        self.addCleanup(_restore)
+        self.clean_tree()
+
+    # ── обвязка: живая вершина не трогается, git не зовётся ──────────────────────────────────
+    def fake_heads(self, seq):
+        """HEAD по списку ответов В ПОРЯДКЕ ВЫЗОВА: [до, после]. → счётчик вызовов."""
+        box = {"n": 0}
+
+        def _h():
+            i = min(box["n"], len(seq) - 1)
+            box["n"] += 1
+            return seq[i]
+        tr.head_commit = _h
+        return box
+
+    def clean_tree(self, paths=()):
+        tr.dirty_tracked = lambda: (None if paths is None else list(paths))
+
+    def fake_run(self, passed=11, ok=95, allc=96, failed=("10/1 нет утверждений о наличии",)):
+        """Корпус НЕ гоняем (живая голова — минуты и токены): числа замера здесь не предмет."""
+        tr.run_corpus = lambda cases, runs=2, ph=None: ([], passed, ok, allc, list(failed), [])
+
+    def run_main(self, extra=()):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = tr.main(["--cases", self.cases, "--out", self.v, "--runs", "2", *extra])
+        return rc, out.getvalue()
+
+    def last_rec(self):
+        with io.open(self.v, encoding="utf-8") as f:
+            return json.load(f)["last"]
+
+    # ── п.2: КОММИТ ФИКСИРУЕТСЯ ОДИН РАЗ, НА ВХОДЕ ───────────────────────────────────────────
+    def test_kommit_snimaetsya_rovno_odin_raz_na_vhode(self):
+        box = self.fake_heads([C40, OTHER40])
+        b = tr.bind_head()
+        self.assertEqual(box["n"], 1, "фиксация спросила вершину не один раз")
+        self.assertEqual(b["commit"], C40)
+        self.assertEqual(b["head_moved"], "", "до сверки сдвига быть не может")
+
+    def test_kommit_lozhitsya_v_rezultat_vmeste_s_chislom(self):
+        self.fake_heads([C40])
+        self.fake_run()
+        rc, _txt = self.run_main()
+        self.assertEqual(rc, 1)                       # красный: мок отдал 11 из 12
+        rec = self.last_rec()
+        self.assertEqual(rec["commit"], C40)          # коммит — в той же записи, что и число
+        self.assertEqual((rec["cases"], rec["cases_total"]), (11, 12))
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ ПЕРВЫЙ: сдвиг вершины ВО ВРЕМЯ прогона замечен и НАЗВАН ───────────
+    def test_otr1_sdvig_vershiny_zamechen_i_nazvan_v_privyazke(self):
+        self.fake_heads([C40, OTHER40])
+        b = tr.verify_head(tr.bind_head())
+        self.assertEqual(b["head_moved"], "1597cbe→d14d450", "сдвиг не назван")
+        self.assertEqual(b["head_after"], OTHER40)
+        self.assertEqual(b["commit"], C40,
+                         "привязка переписала себя НОВОЙ вершиной — ровно то, что чинится")
+
+    def test_otr1_pometka_dohodit_do_zapisi_i_gasit_zelenoe(self):
+        """Запись обязана СКАЗАТЬ про сдвиг, а не молча приписать замер новому коммиту."""
+        b = {"commit": C40, "head_after": OTHER40, "head_moved": "1597cbe→d14d450",
+             "dirty_paths": [], "tree_known": True}
+        rec = tr.build_verdict(C40, 12, 12, 96, 96, 2, True, [], cc.corpus_sha(), now=1.0, bind=b)
+        self.assertEqual(rec["head_moved"], "1597cbe→d14d450")
+        self.assertEqual(rec["head_after"], OTHER40)
+        self.assertEqual(rec["commit"], C40)
+        self.assertNotEqual(rec["result"], "green", "12 из 12 на уехавшей вершине названы зелёными")
+
+    def test_otr1_progon_celikom_nazyvaet_sdvig_i_ne_pishet_verdikt(self):
+        self.fake_heads([C40, OTHER40])
+        self.fake_run(passed=12, ok=96, allc=96, failed=())
+        rc, txt = self.run_main()
+        self.assertEqual(rc, 2, "прогон на уехавшей вершине засчитан")
+        self.assertIn("head_moved: 1597cbe→d14d450", txt, "прогон промолчал о сдвиге")
+        self.assertIn("ПРОГОН НЕ ЗАСЧИТАН", txt)
+        self.assertIn("1597cbe", txt)                 # замер назван принадлежащим ФИКСИРОВАННОМУ
+        self.assertFalse(os.path.exists(self.v), "вердикт на уехавшей вершине всё-таки записан")
+
+    def test_otr1_molchanie_git_na_vyhode_tozhe_schitaetsya_sdvigom(self):
+        """Третий исход: «не смог проверить» ≠ «вершина стояла». Fail-closed и НАЗВАНО."""
+        self.fake_heads([C40, ""])
+        self.fake_run(passed=12, ok=96, allc=96, failed=())
+        rc, txt = self.run_main()
+        self.assertEqual(rc, 2)
+        self.assertIn("1597cbe→?", txt)
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ ВТОРОЙ: неподвижная вершина → ОДИН коммит в обоих прогонах ────────
+    def test_otr2_dva_progona_na_nepodvizhnoi_vershine_dayut_odin_kommit(self):
+        self.fake_heads([C40])                        # вершина не двигается ни разу
+        self.fake_run()
+        got, moved = [], []
+        for _ in range(2):
+            rc, _txt = self.run_main()
+            self.assertEqual(rc, 1)
+            rec = self.last_rec()
+            got.append(rec["commit"])
+            moved.append(rec["head_moved"])
+        self.assertEqual(got, [C40, C40], "два прогона на одной вершине разошлись по коммитам")
+        self.assertEqual(len(set(got)), 1)
+        self.assertEqual(moved, ["", ""], "на неподвижной вершине придуман сдвиг")
+
+    # ── п.5: ГРЯЗЬ ДЕРЕВА ВИДНА В РЕЗУЛЬТАТЕ (показывает, но не судит) ───────────────────────
+    def test_gryaznoe_derevo_vidno_v_zapisi_i_nazyvaet_faily(self):
+        self.fake_heads([C40])
+        self.clean_tree(["suggest.py", "trainer_run.py"])
+        self.fake_run()
+        rc, txt = self.run_main()
+        self.assertEqual(rc, 1)
+        rec = self.last_rec()
+        self.assertIs(rec["tree_dirty"], True)
+        self.assertEqual(rec["dirty_paths"], ["suggest.py", "trainer_run.py"])
+        self.assertIs(rec["clean"], False)
+        self.assertIn("tree_dirty: true", txt)
+
+    def test_chistoe_derevo_tozhe_nazvano_yavno(self):
+        self.fake_heads([C40])
+        self.fake_run()
+        self.run_main()
+        rec = self.last_rec()
+        self.assertIs(rec["tree_dirty"], False)
+        self.assertEqual(rec["dirty_paths"], [])
+        self.assertIs(rec["tree_known"], True)
+
+    def test_git_ne_otvetil_pro_diff_tretii_ishod_nazvan(self):
+        """`tree_known: false` — незнание названо отдельно от грязи (fail-closed остаётся)."""
+        self.fake_heads([C40])
+        self.clean_tree(None)
+        self.fake_run()
+        self.run_main()
+        rec = self.last_rec()
+        self.assertIs(rec["tree_known"], False)
+        self.assertIs(rec["clean"], False)            # fail-closed, как и было
+
+    def test_tree_dirty_zerkalo_clean_a_ne_vtoroi_istochnik_pravdy(self):
+        """Два независимых поля про один факт разъехались бы. Здесь одно ведёт другое."""
+        for clean in (True, False):
+            rec = tr.build_verdict(C40, 12, 12, 96, 96, 2, clean, [], "sha16", now=1.0,
+                                   bind={"dirty_paths": ["x.py"]})
+            self.assertIs(rec["tree_dirty"], not clean)
+            self.assertIs(rec["clean"], clean)
+
+    # ── ЗАМКИ: условие не тронуто, старые вызывающие не сломаны, вершину не переснимают ──────
+    def test_staryi_vyzov_bez_privyazki_ne_slomalsya(self):
+        """Вызов без `bind` (как звали до 23.08) обязан дать ТОТ ЖЕ вердикт: новые поля не судят."""
+        rec = tr.build_verdict(C40, 12, 12, 96, 96, 2, True, [], cc.corpus_sha(), now=1.0)
+        self.assertEqual(rec["result"], "green")
+        self.assertEqual(rec["head_moved"], "")
+        self.assertIs(rec["tree_dirty"], False)
+
+    def test_zamok_main_fiksiruet_odin_raz_i_ne_perespashivaet_vershinu(self):
+        """Структурный замок: в `main` ровно одна фиксация, ровно одна сверка и НИ ОДНОГО
+        прямого `head_commit()` — иначе коммит снова начнёт браться «какой сейчас».
+
+        Читаем ФАЙЛ САМОГО МОДУЛЯ (`tr.__file__`), а не путь от корня: иначе замок судил бы файл
+        в дереве, даже когда под тестом лежит другой — и отрицательный контроль на дофиксовой
+        копии проходил бы ложно (проверено 23.08: ровно так он и прошёл на первой попытке)."""
+        with io.open(os.path.abspath(tr.__file__), encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename="trainer_run.py")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "main":
+                names = [n.func.id for n in ast.walk(node)
+                         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+                self.assertEqual(names.count("bind_head"), 1, "фиксация коммита не одна")
+                self.assertEqual(names.count("verify_head"), 1, "сверка вершины не одна")
+                self.assertEqual(names.count("head_commit"), 0,
+                                 "main снова спрашивает «какая вершина сейчас» мимо привязки")
+                return
+        raise AssertionError("функции main нет")
 
 
 if __name__ == "__main__":
