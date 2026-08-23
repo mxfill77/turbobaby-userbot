@@ -380,5 +380,109 @@ class TestMolchashchayaGolova(unittest.TestCase):
         raise AssertionError("функции run_case нет")
 
 
+class SravnenieSlovomVKhekakh(unittest.TestCase):
+    """ЧЕКИ ТРЕНАЖЁРА судят ПО СЛОВУ, а не по куску строки (правило `suggest.word_hit`, 23.08.2026).
+
+    Живой повод: чек «без «опасн»» покраснел на слове «безопасным» — то есть уличил бота ровно в
+    том, чего голден A.3 и добивается (3 живых прогона из 7, артефакт 2026-08-23-trainer-live-gap).
+    Оба отрицательных теста здесь: настоящее слово ОБЯЗАНО краснить, кусок внутри чужого — НЕТ.
+    """
+    EXP = {"j_line": "", "delivery_line": "", "sheet_line": "",
+           "zone": None, "zone_price": None, "full_data": False}
+
+    def _chk(self, case, draft, name):
+        by = {c["name"]: c for c in tr.case_checks(case, draft, dict(self.EXP))}
+        self.assertIn(name, by, f"чека «{name}» в наборе нет вовсе")
+        return by[name]
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ ПЕРВЫЙ: ради чего чек написан — по-прежнему краснит ──────────────
+    def test_forbid_nastoyashchee_slovo_krasnit(self):
+        case = {"id": 5, "forbid": ["опасн", "небезопас", "лучше не", "не рекоменд"]}
+        for word, draft in (("опасн", "CB650R — опасный выбор для новичка."),
+                            ("опасн", "Брать его новичку опасно."),
+                            ("небезопас", "Для первого раза это небезопасно."),
+                            ("лучше не", "Лучше не брать эту модель сразу."),
+                            ("не рекоменд", "Я не рекомендую этот байк новичку.")):
+            c = self._chk(case, draft, f"без «{word}»")
+            self.assertFalse(c["ok"], f"«{word}» перестал краснить на «{draft}»")
+            self.assertEqual(c["fact"], f"есть: «{word}»")
+
+    def test_require_any_nastoyashchee_slovo_zachityvaetsya(self):
+        case = {"id": 6, "require_any": ["опыт", "ездил", "на чём", "как долго", "водил"]}
+        for draft in ("Подскажите, есть ли опыт вождения?",
+                      "На чём ездили раньше?",
+                      "Как долго уже катаетесь?",
+                      "Водили ли вы мотоцикл прежде?"):
+            c = self._chk(case, draft, "обязательное упоминание")
+            self.assertTrue(c["ok"], f"обязательное упоминание перестало засчитываться на «{draft}»")
+
+    def test_tsena_tsifroy_nastoyashchee_chislo_zachityvaetsya(self):
+        case = {"id": 10, "expect": {"price_figure": True}}
+        exp = dict(self.EXP, j_line="стоимость: 1535 (307 в день)")
+        by = {c["name"]: c for c in tr.case_checks(case, "NMAX 155 на 5 дней: 1535 ฿ (307 ฿/день)", exp)}
+        self.assertTrue(by["цена цифрой"]["ok"])
+        self.assertIn("1535", by["цена цифрой"]["fact"])
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ ВТОРОЙ: кусок внутри чужого слова больше не судит ───────────────
+    def test_forbid_kusok_vnutri_slova_bolshe_ne_krasnit(self):
+        case = {"id": 5, "forbid": ["опасн", "лучше не", "рискован"]}
+        # дословная фраза живого красного прогона 81/п5 — из-за неё и заведено правило
+        live = ("CB650R — довольно мощный мотоцикл, и для него важно понимание по опыту вождения: "
+                "чтобы подобрать вариант, который будет комфортным и безопасным именно для вас, "
+                "я уточню детали с менеджером и вернусь с рекомендацией.")
+        c = self._chk(case, live, "без «опасн»")
+        self.assertTrue(c["ok"], "«безопасным» всё ещё краснит чек «без «опасн»»")
+        self.assertEqual(c["fact"], "нет")
+        for word, draft in (("опасн", "Мы заботимся о вашей безопасности и дадим шлем."),
+                            ("опасн", "Дадим шлем для безопасной поездки."),
+                            ("рискован", "Это нерискованный вариант.")):
+            self.assertTrue(self._chk(case, draft, f"без «{word}»")["ok"],
+                            f"«{word}» всё ещё краснит на «{draft}»")
+
+    def test_chestnaya_granitsa_pravila_frazovyy_tokon_ono_ne_lechit(self):
+        """ЧЕСТНАЯ ГРАНИЦА, записанная тестом: «лучше не бывает» правилом НЕ лечится и краснит
+        по-прежнему. Здесь «не» — целое слово с начала слова, кусок внутри чужого слова ни при чём;
+        это ДРУГОЙ класс (фразовый токен без глагола), и лечится он словарём кейса, а не границей.
+        Тест стои́т, чтобы никто не приписал правилу эффекта, которого у него нет."""
+        case = {"id": 5, "forbid": ["лучше не"]}
+        self.assertFalse(self._chk(case, "Условия — лучше не бывает.", "без «лучше не»")["ok"])
+
+    def test_require_any_kusok_vnutri_slova_bolshe_ne_zachityvaetsya(self):
+        case = {"id": 6, "require_any": ["опыт", "ездил", "на чём", "как долго", "водил"]}
+        for draft in ("Менеджер проводил осмотр перед выдачей.",
+                      "Байк заводился с пол-оборота, всё исправно."):
+            c = self._chk(case, draft, "обязательное упоминание")
+            self.assertFalse(c["ok"], f"кусок внутри чужого слова засчитал кейс на «{draft}»")
+            self.assertEqual(c["fact"], "нет ни одного")
+
+    def test_require_any_chislo_vnutri_chisla_bolshe_ne_zachityvaetsya(self):
+        case = {"id": 10, "require_any": ["от 5 дней", "5 дней", "от 3"]}
+        for draft in ("Скидка действует от 15 дней аренды.",
+                      "Депозит от 3000 ฿ наличными."):
+            c = self._chk(case, draft, "обязательное упоминание")
+            self.assertFalse(c["ok"], f"число внутри числа засчитало кейс на «{draft}»")
+        self.assertTrue(self._chk(case, "Скутеры сдаём от 5 дней.", "обязательное упоминание")["ok"])
+
+    def test_tsena_tsifroy_chislo_vnutri_chisla_bolshe_ne_zachityvaetsya(self):
+        case = {"id": 10, "expect": {"price_figure": True}}
+        exp = dict(self.EXP, j_line="стоимость: 590 (118 в день)")
+        by = {c["name"]: c for c in tr.case_checks(case, "Доставка обойдётся в 5900 ฿ за 1180 км", exp)}
+        self.assertFalse(by["цена цифрой"]["ok"], "число внутри числа зачло чек «цена цифрой»")
+
+    def test_zamok_vse_leksicheskie_cheki_zovut_odno_pravilo(self):
+        """Структурный замок: правило одно на все три места, и вернуть подстроку молча нельзя."""
+        with io.open(os.path.join(REPO, "trainer_run.py"), encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename="trainer_run.py")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "case_checks":
+                calls = [n for n in ast.walk(node)
+                         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                         and n.func.attr == "word_hit"]
+                self.assertGreaterEqual(len(calls), 3,
+                                        "case_checks зовёт правило по слову меньше трёх раз")
+                return
+        raise AssertionError("функции case_checks нет")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

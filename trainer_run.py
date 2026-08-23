@@ -324,7 +324,8 @@ def case_checks(case, draft, exp):
     # день)» — БЕЗ знака валюты, и требование «฿ рядом» краснило бы верный ответ (поймано 30.07).
     if want.get("price_figure"):
         nums = re.findall(r"\d{3,}", (exp.get("j_line") or "") + " " + (exp.get("sheet_line") or ""))
-        hit = [n for n in nums if n in client]
+        # ЧИСЛО ЦЕЛИКОМ, а не кусок: «590» внутри «5900» — другая цена (правило suggest.word_hit)
+        hit = [n for n in nums if suggest.word_hit(n, client)]
         has = bool(hit) if nums else bool(re.search(r"\d[\d\s]{2,}\s*(?:฿|бат|thb|baht)", client, re.I))
         out.append(_chk("цена цифрой", has,
                         "посчитанная цена (числа из quote/сетки) звучит клиенту",
@@ -358,15 +359,20 @@ def case_checks(case, draft, exp):
         out.append(_chk(f"трекер: {key}", bool(facts.get(key)),
                         f"собранное «{key}» засчитано трекером",
                         "засчитано" if facts.get(key) else "НЕ засчитано (будет переспрос)"))
-    # 14–15. лексика кейса: запрещённое / обязательное (голдены на дословных фразах)
+    # 14–15. лексика кейса: запрещённое / обязательное (голдены на дословных фразах).
+    # СРАВНЕНИЕ ПО СЛОВУ, а не по куску строки (`suggest.word_hit`, 23.08.2026): токен корпуса —
+    # это КОРЕНЬ, и он обязан начинаться с начала слова. Иначе «опасн» краснило внутри
+    # «безопасным» (ложный КРАСНЫЙ, 3 живых прогона из 7), а «водил»/«5 дней»/«от 3» зеленели
+    # внутри «проводил»/«15 дней»/«от 300 ฿» (ложный ЗЕЛЁНЫЙ, ключ к воротам).
     low = client.lower()
     for word in (case.get("forbid") or []):
-        out.append(_chk(f"без «{word}»", word.lower() not in low,
-                        f"формулировки «{word}» в ответе нет", "нет" if word.lower() not in low
-                        else f"есть: «{word}»"))
+        found = suggest.word_hit(word.lower(), low)
+        out.append(_chk(f"без «{word}»", not found,
+                        f"формулировки «{word}» в ответе нет",
+                        f"есть: «{word}»" if found else "нет"))
     req = case.get("require_any") or []
     if req:
-        hit = [w for w in req if w.lower() in low]
+        hit = [w for w in req if suggest.word_hit(w.lower(), low)]
         out.append(_chk("обязательное упоминание", bool(hit),
                         "в ответе есть одно из: " + ", ".join(req),
                         ("есть: " + ", ".join(hit)) if hit else "нет ни одного"))
