@@ -7078,31 +7078,108 @@ _MENTION_EXPERIENCE = ("опыт", "ездил", "ездит", "катал", "в
 _MENTION_HUMAN = ("менеджер", "коллег", "manager", "colleague")
 
 
-def experience_rule_applies(transcript: str) -> bool:
-    """Наставление ТРЕБУЕТ обязательного упоминания в этом диалоге? → bool.
+def experience_rule_applies(transcript: str, is_first_contact=None, facts: dict = None,
+                            sheet_mode: bool = False) -> str:
+    """Наставление ТРЕБУЕТ обязательного упоминания в этом диалоге? → '' | 'a3' | 'a2'.
 
-    Носитель — КЛИЕНТСКИЙ текст окна и уже существующий детектор `_HEAVY_BLOCK_RE`: клиент сам
-    сказал, что опыта нет («без опыта», «новичок», «впервые», «никогда не ездил», beginner,
-    never ridden). Fail-safe: пустой транскрипт → False, пояс молчит."""
-    return bool(_HEAVY_BLOCK_RE.search(_client_text(transcript or "")))
+    Строка, а не bool, СОЗНАТЕЛЬНО: половин у правила две, и им нужны РАЗНЫЕ слова (см.
+    `mention_fallback`). Пустая строка ложна, поэтому все прежние вызывающие `if applies:` и
+    `assertFalse` работают как работали.
+
+    'a3' — ЖЁСТКОЕ правило безопасности `EXPERIENCE_SAFETY_RULE`: клиент САМ сказал, что опыта нет
+        («без опыта», «новичок», «впервые», «никогда не ездил», beginner, never ridden) — детектор
+        `_HEAVY_BLOCK_RE`, уже стоявший в коде. Ветка не тронута ни на символ.
+
+    'a2' — ФОРМА ПЕРВОГО ОТВЕТА. До 25.08.2026 она была СТИЛЕВОЙ (первая пара
+        `STYLE_FEWSHOT_PAIRS`, взятая из живой базы переписок), и пояс её не держал. РЕШЕНИЕ
+        ВЛАДЕЛЬЦА 25.08.2026: спросить про опыт в первом ответе — требование БЕЗОПАСНОСТИ, а не
+        стиль, поэтому половина поднята до жёсткой. Живой повод: 25.08 первый же прогон через
+        штатный канал ворот стал КРАСНЫМ ровно на ней (кейс 6, чек «обязательное упоминание»,
+        11 кейсов из 12) — голова спросила даты и срок и не спросила про опыт.
+
+    ГРАНИЦА 'a2' — САМАЯ УЗКАЯ ИЗ ПОСЧИТАННЫХ, которая закрывает этот случай (замер по 96
+    сохранённым живым черновикам, `docs/artifacts/2026-08-25-a2-experience-rule-fork.md` §5):
+      • широкая «первый контакт + про опыт не говорили» — 80 черновиков под веткой, дописала бы
+        72: спорит и с «вопрос об опыте НЕ заменяет выдачу прайса», и с «не вываливать лишнего»;
+      • средняя «+ модель не названа и прайс не просят» — 16 под веткой, дописала бы 8, и ВСЕ 8
+        садятся на кейс 4 «Требуется ли депозит?», чья суть — не вываливать лишнего;
+      • ВЗЯТАЯ «+ клиент НАЗВАЛ СРОК» — включается ровно на кейсе 6 из двенадцати, 8 черновиков
+        под веткой, дописок в корпусе 0. Срок без модели и без просьбы прайса — это и есть
+        «подбери мне что-нибудь», а подбирать, не зная опыта, наставление запрещает.
+    Каждое условие ниже отсекает СВОЁ правило, и снять любое значит нарушить именно его:
+      • «про опыт не говорили» держит «не вываливать лишнего» — переспрашивать того, кто уже
+        назвал опыт, запрещено (то же, что `ANTI_LOOP_NOTE`: «уже названный опыт — бери оттуда»);
+      • «прайс не просят» держит «вопрос об опыте НЕ заменяет выдачу прайса»;
+      • «модель не названа» + «срок назван» отделяют просьбу ПОДОБРАТЬ от узкого вопроса.
+
+    `is_first_contact` — если не передан, выводится из транскрипта отсутствием строк `[менеджер]:`
+    (та же посылка, что у `trainer.has_manager_turn`). Fail-safe: пустой вход → '' , пояс молчит.
+    """
+    tr = transcript or ""
+    client = _client_text(tr)
+    if _HEAVY_BLOCK_RE.search(client):
+        return "a3"
+    if is_first_contact is None:
+        is_first_contact = not any(ln.startswith("[менеджер]:") for ln in tr.splitlines())
+    if not is_first_contact:
+        return ""
+    if _HEAVY_OK_RE.search(client):
+        return ""                                  # клиент САМ заговорил про опыт — не переспрашиваем
+    f = facts if facts is not None else collected_facts(tr)
+    if f.get("model"):
+        return ""                                  # модель названа — это не просьба подобрать
+    if sheet_mode or _asks_price_sheet(client, client):
+        return ""                                  # просит прайс — опыт его не заменяет
+    return "a2" if f.get("term") else ""            # срок назван → «подбери что-нибудь на срок»
 
 
-def mention_hits(draft: str) -> list:
+def _branch(applies) -> str:
+    """Вердикт `experience_rule_applies` → имя половины. bool принимается как 'a3' (совместимость
+    с вызывающими, заведёнными 23.08, когда половина была одна)."""
+    s = str(applies or "") if not isinstance(applies, bool) else ("a3" if applies else "")
+    return s if s in ("a2", "a3") else ("a3" if applies else "")
+
+
+def mention_hits(draft: str, branch: str = "a3") -> list:
     """Носители обязательного упоминания, найденные в КЛИЕНТСКОМ теле черновика → список токенов.
     Служебные пометки модератору ([уточнить: …]/[собрано: …]) в счёт НЕ идут: клиент их не видит,
-    и зачесть их значило бы отчитаться работой, которой клиент не получил."""
+    и зачесть их значило бы отчитаться работой, которой клиент не получил.
+
+    ПОЛОВИНЫ ПРАВИЛА СЧИТАЮТ РАЗНОЕ, и это не придирка (25.08.2026): у 'a3' носителей два —
+    разговор про ОПЫТ ЛИБО передача МЕНЕДЖЕРУ (так и говорит жёсткое правило: «уточни опыт И/ИЛИ
+    скажи, что подберёшь вместе с менеджером»), а у 'a2' носитель ОДИН — только про ОПЫТ. Проверено
+    дословно: фраза «Подберём подходящий вариант вместе с менеджером» удовлетворяет кейс 5 и НЕ
+    удовлетворяет кейс 6, у которого в `require_any` нет слова «менеджер» вовсе. Считать их
+    одинаково значило бы отчитаться работой, которой клиент не получил."""
     low = client_facing_text(draft or "").lower()
-    return [t for t in (_MENTION_EXPERIENCE + _MENTION_HUMAN) if word_hit(t, low)]
+    toks = _MENTION_EXPERIENCE if str(branch or "") == "a2" else (_MENTION_EXPERIENCE + _MENTION_HUMAN)
+    return [t for t in toks if word_hit(t, low)]
 
 
-def mention_violation(draft: str, applies: bool) -> bool:
-    """Правило применимо, а обязательного упоминания в клиентском теле НЕТ → True."""
-    return bool(applies) and not mention_hits(draft)
+def mention_violation(draft: str, applies) -> bool:
+    """Правило применимо, а обязательного упоминания в клиентском теле НЕТ → True.
+    `applies` — вердикт `experience_rule_applies` ('' | 'a3' | 'a2'); bool принимается как 'a3'."""
+    return bool(applies) and not mention_hits(draft, _branch(applies))
 
 
-def _mention_hard_directive(lang: str = "ru") -> str:
+def _mention_hard_directive(lang: str = "ru", branch: str = "a3") -> str:
     """Директива-верхнего-уровня для перегенерации: обязательное упоминание должно ПРОЗВУЧАТЬ
-    клиенту, и по-прежнему БЕЗ собственной оценки безопасности (EXPERIENCE_SAFETY_RULE в силе)."""
+    клиенту, и по-прежнему БЕЗ собственной оценки безопасности (EXPERIENCE_SAFETY_RULE в силе).
+
+    У половины 'a2' директива ДРУГАЯ и она обязана назвать оба ограничения сразу: спросить про
+    опыт, но НЕ ценой прайса («вопрос об опыте НЕ заменяет выдачу прайса») и НЕ вторым вопросом
+    («на один вопрос — один ответ»)."""
+    if str(branch or "") == "a2":
+        if lang == "en":
+            return ("This is the first reply and the client has not said anything about their "
+                    "riding experience. In your reply you MUST ask about it — what they rode and "
+                    "for how long — in the SAME sentence flow as the rest, not as a second "
+                    "separate question. Keep everything else you were going to say, including any "
+                    "price figures: asking about experience does NOT replace giving the price.")
+        return ("Это ПЕРВЫЙ ответ, и клиент ничего не сказал про свой опыт вождения. В ответе "
+                "ОБЯЗАТЕЛЬНО спроси про него — на чём и как долго ездил — В ТОМ ЖЕ потоке фразы, "
+                "а НЕ вторым отдельным вопросом. Всё остальное, что собирался сказать, оставь, "
+                "включая цифры цены: вопрос об опыте НЕ заменяет выдачу прайса.")
     if lang == "en":
         return ("The client has said they have no riding experience. In your reply you MUST either "
                 "gently ask about their experience (what they rode and for how long) or say you "
@@ -7116,10 +7193,26 @@ def _mention_hard_directive(lang: str = "ru") -> str:
             "отговаривай и не подтверждай пригодность.")
 
 
-def mention_fallback(lang: str = "ru") -> str:
+def mention_fallback(lang: str = "ru", branch: str = "a3") -> str:
     """Детерминированная дописка ОДНИМ предложением, если перегенерация не смогла. Формулировка
-    взята из САМОГО наставления (EXPERIENCE_SAFETY_RULE + строка стиля про опыт), поэтому читается
-    как обычная фраза менеджера, а не как шов. Сама оценок безопасности не содержит."""
+    взята из САМОГО наставления, поэтому читается как обычная фраза менеджера, а не как шов.
+    Сама оценок безопасности не содержит.
+
+    У половин РАЗНЫЕ фразы, потому что у них разные носители (см. `mention_hits`):
+      • 'a3' — передача человеку (жёсткое правило: «подберёшь вариант вместе с менеджером»);
+      • 'a2' — вопрос про ОПЫТ, дословно из первой пары `STYLE_FEWSHOT_PAIRS` (образец взят из
+        живой базы переписок с клиентами): «И пару слов про опыт вождения — на чём и как долго
+        ездили, так проще подобрать вариант».
+    ФРАЗА 'a2' НАМЕРЕННО НЕ ВОПРОС (в ней нет «?»): правило стиля «на один вопрос — один ответ»
+    держится кодом `ensure_closing_question`, который дописывает завершающий вопрос ТОЛЬКО когда
+    его нет. Второй вопрос нарушил бы это правило, а просьба «и пару слов про…» — нет, и ровно так
+    оба требования стоят рядом в самом образце наставления."""
+    if str(branch or "") == "a2":
+        if lang == "en":
+            return ("And a couple of words about your riding experience — what you rode and for "
+                    "how long, so it is easier to pick the right option.")
+        return ("И пару слов про опыт вождения — на чём и как долго ездили, так проще подобрать "
+                "вариант.")
     if lang == "en":
         return "Let me pick a suitable option together with our manager and I'll get back to you."
     return "Подберём подходящий вариант вместе с менеджером — вернусь с предложением."
@@ -7158,15 +7251,21 @@ def guard_experience_mention(draft: str, applies: bool = False, lang: str = "ru"
     черновик; здесь грех — НЕСКАЗАННОЕ, и заменять весь ответ значило бы выбросить правильную часть
     (цену, даты, расчёт). Поэтому фолбэк ДОПИСЫВАЕТ, а не заменяет.
 
-    Возвращает dict(text, ok, source∈{clean,draft,regen,fallback}, attempts, missing)."""
-    if not applies:
-        return {"text": draft, "ok": True, "source": "clean", "attempts": 0, "missing": False}
-    if mention_hits(draft):
-        return {"text": draft, "ok": True, "source": "draft", "attempts": 0, "missing": False}
+    `applies` — вердикт `experience_rule_applies` ('' | 'a3' | 'a2'); bool принимается как 'a3'.
+    Половина ведёт ВСЁ: и что считать носителем, и чем перегенерировать, и что дописать.
 
-    log.warning("guard_experience_mention VIOLATION [initial] окно=%s | обязательного упоминания "
-                "нет | draft=%r", window, (draft or "")[:200])
-    directive = _mention_hard_directive(lang)
+    Возвращает dict(text, ok, source∈{clean,draft,regen,fallback}, attempts, missing, branch)."""
+    branch = _branch(applies)
+    if not branch:
+        return {"text": draft, "ok": True, "source": "clean", "attempts": 0, "missing": False,
+                "branch": ""}
+    if mention_hits(draft, branch):
+        return {"text": draft, "ok": True, "source": "draft", "attempts": 0, "missing": False,
+                "branch": branch}
+
+    log.warning("guard_experience_mention VIOLATION [initial/%s] окно=%s | обязательного упоминания "
+                "нет | draft=%r", branch, window, (draft or "")[:200])
+    directive = _mention_hard_directive(lang, branch)
     attempts = 0
     if callable(regenerate):
         for _ in range(max(0, int(max_retries))):
@@ -7177,17 +7276,17 @@ def guard_experience_mention(draft: str, applies: bool = False, lang: str = "ru"
                 log.warning("guard_experience_mention: перегенерация упала (окно=%s), попытка %s",
                             window, attempts)
                 break
-            if mention_hits(cand):
+            if mention_hits(cand, branch):
                 return {"text": cand, "ok": True, "source": "regen", "attempts": attempts,
-                        "missing": True}
-            log.warning("guard_experience_mention VIOLATION [regen#%s] окно=%s | draft=%r",
-                        attempts, window, (cand or "")[:200])
+                        "missing": True, "branch": branch}
+            log.warning("guard_experience_mention VIOLATION [regen#%s/%s] окно=%s | draft=%r",
+                        attempts, branch, window, (cand or "")[:200])
 
-    out = _append_to_client_body(draft, mention_fallback(lang))
-    log.warning("guard_experience_mention: после %s попыток → дописка одним предложением (окно=%s)",
-                attempts, window)
-    return {"text": out, "ok": bool(mention_hits(out)), "source": "fallback", "attempts": attempts,
-            "missing": True}
+    out = _append_to_client_body(draft, mention_fallback(lang, branch))
+    log.warning("guard_experience_mention: после %s попыток → дописка одним предложением (%s, "
+                "окно=%s)", attempts, branch, window)
+    return {"text": out, "ok": bool(mention_hits(out, branch)), "source": "fallback",
+            "attempts": attempts, "missing": True, "branch": branch}
 
 
 # ===================== ГАРД ГОДА ВЫПУСКА В КЛИЕНТСКОМ ТЕЛЕ (31.07.2026) =====================
@@ -7317,8 +7416,15 @@ def generate_draft(transcript: str, lang: str, faq: str,
     # его проверку. Цена порядка названа честно: если гард наличия уйдёт в свой безопасный фолбэк,
     # он ЗАМЕНИТ черновик целиком и упоминание пропадёт вместе с ним. Живая частота этого пути за
     # 8 прогонов × 12 кейсов — 0 (единственное срабатывание гарда наличия, прогон 27, ушло в regen).
-    out = guard_experience_mention(out, applies=experience_rule_applies(transcript), lang=lang,
-                                   regenerate=_regen_without_claim)["text"]
+    # 25.08.2026 — половин у правила ДВЕ, и вторая ('a2', форма первого ответа) поднята решением
+    # владельца из стилевой в ЖЁСТКУЮ. Признаки ей нужны те, что уже посчитаны ВЫШЕ по этой же
+    # функции — `is_first_contact`, `facts`, `sheet_mode`: второй раз их не считаем и второго
+    # детектора не заводим, иначе они разъедутся с тем, чем живёт остальной ответ.
+    out = guard_experience_mention(
+        out,
+        applies=experience_rule_applies(transcript, is_first_contact=is_first_contact,
+                                        facts=facts, sheet_mode=sheet_mode),
+        lang=lang, regenerate=_regen_without_claim)["text"]
     return guard_availability(out, avail=availability_from_note(pricing_note), lang=lang,
                               regenerate=_regen_without_claim)["text"]
 

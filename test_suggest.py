@@ -8632,13 +8632,139 @@ class TestGuardExperienceMention(unittest.TestCase):
     ]
 
     # ── применимость правила ────────────────────────────────────────────────────────────────
-    def test_pravilo_primenimo_tolko_pri_yavnom_otsutstvii_opyta(self):
-        self.assertTrue(suggest.experience_rule_applies(self.TR_NOVICE))
-        # клиент про опыт не говорил вовсе / назвал модель — ЖЁСТКОЕ правило не применимо
-        self.assertFalse(suggest.experience_rule_applies(self.TR_NO_TALK))
+    def test_pravilo_primenimo_obeimi_polovinami(self):
+        """25.08.2026 — РЕШЕНИЕ ВЛАДЕЛЬЦА: половина A.2 (форма первого ответа) поднята из стилевой
+        в ЖЁСТКУЮ. До этого дня тест утверждал обратное — `assertFalse` на TR_NO_TALK, — и это
+        было верно ровно для прежней области правила. Чек тренажёра «обязательное упоминание» при
+        этом НЕ тронут и НЕ ослаблен: меняется область ПОЯСА, а не мерка."""
+        self.assertEqual(suggest.experience_rule_applies(self.TR_NOVICE), "a3")
+        # клиент просит ПОДОБРАТЬ на срок, про опыт не говорил, модель не назвал → вторая половина
+        self.assertEqual(suggest.experience_rule_applies(self.TR_NO_TALK), "a2")
+        # модель названа — это не просьба подобрать, правило не применимо
+        self.assertEqual(suggest.experience_rule_applies(self.TR_MODEL), "")
+        self.assertEqual(suggest.experience_rule_applies(""), "")
+        self.assertEqual(suggest.experience_rule_applies(None), "")
+        # пустая строка ЛОЖНА — прежние вызывающие `if applies:` работают как работали
         self.assertFalse(suggest.experience_rule_applies(self.TR_MODEL))
-        self.assertFalse(suggest.experience_rule_applies(""))
-        self.assertFalse(suggest.experience_rule_applies(None))
+        self.assertTrue(suggest.experience_rule_applies(self.TR_NOVICE))
+
+    # ── ГРАНИЦА ВТОРОЙ ПОЛОВИНЫ: каждое условие отсекает СВОЁ правило ───────────────────────
+    def test_granica_a2_uzkaya_kazhdoe_uslovie_derzhit_svoyo_pravilo(self):
+        base = "[клиент]: Здравствуйте! Хочу взять что-нибудь на неделю покататься по острову."
+        self.assertEqual(suggest.experience_rule_applies(base), "a2")
+        # 1) «не вываливать лишнего»: срок НЕ назван — узкий вопрос, ветка молчит
+        self.assertEqual(suggest.experience_rule_applies("[клиент]: Требуется ли депозит?"), "")
+        # 2) «опыт не заменяет прайс»: клиент просит прайс — ветка молчит
+        self.assertEqual(suggest.experience_rule_applies(
+            "[клиент]: Какие марки и модели байков вы предлагаете? Какие цены на аренду на неделю?"), "")
+        # 3) модель названа — не просьба подобрать
+        self.assertEqual(suggest.experience_rule_applies(
+            "[клиент]: Хочу NMAX 155 на неделю."), "")
+        # 4) НЕ первый контакт — форма первого ответа не при чём
+        self.assertEqual(suggest.experience_rule_applies(
+            "[менеджер]: Здравствуйте!\n[клиент]: Хочу что-нибудь на неделю."), "")
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ ПЕРВЫЙ (A.2): черновик БЕЗ упоминания обязан быть ПОЙМАН ─────────
+    def test_negativ_a2_chernovik_bez_upominaniya_poyman(self):
+        """Голден — ДОСЛОВНЫЙ черновик живого КРАСНОГО прогона 25.08 (кейс 6) плюс парафразы."""
+        drafts = [
+            # дословно из прогона 25.08, из-за которого вердикт стал красным
+            "Здравствуйте! Отлично, подскажите, пожалуйста, с какого числа планируете начать и на "
+            "какой срок — уточню стоимость под ваши даты. Подскажите даты — с какого числа и на "
+            "какой срок?\n[собрано: срок ✅]",
+            # дословно из раннего живого прогона 11 (23.08), тот же промах
+            "Здравствуйте! Спасибо, что выбрали нас 🤝 Неделю на острове — отлично, учли срок. "
+            "Подскажите, что бы хотели арендовать — скутер или мотоцикл, и есть ли предпочтения "
+            "по модели?\n[собрано: срок ✅]",
+            "Здравствуйте! Неделю — отлично. Подскажите, что рассматриваете: скутер или мотоцикл?",
+            "Здравствуйте! Подберём вариант на неделю, уточните только даты.",
+            # «менеджер» есть, а про ОПЫТ ни слова: для A.2 это НЕ носитель
+            "Здравствуйте! Уточню детали у менеджера и вернусь с вариантами на неделю.",
+        ]
+        for d in drafts:
+            self.assertEqual(suggest.mention_hits(d, "a2"), [], f"носитель найден там, где его нет: {d!r}")
+            self.assertTrue(suggest.mention_violation(d, "a2"), d)
+            r = suggest.guard_experience_mention(d, applies="a2")
+            self.assertEqual(r["source"], "fallback", d)
+            self.assertEqual(r["branch"], "a2")
+            self.assertTrue(r["ok"], d)
+            self.assertTrue(suggest.mention_hits(r["text"], "a2"), f"пояс не вылечил: {r['text']!r}")
+            # и чек тренажёра кейса 6 после пояса проходит — теми же словами, что он ждёт
+            client = suggest.client_facing_text(r["text"]).lower()
+            self.assertTrue([w for w in ("опыт", "ездил", "на чём", "как долго", "водил")
+                             if suggest.word_hit(w, client)], r["text"])
+
+    def test_negativ_a2_menedzher_ne_zachityvaetsya(self):
+        """У A.2 носитель ОДИН — про опыт. «Менеджер» половину A.3 закрывает, A.2 — нет."""
+        d = "Здравствуйте! Подберём вариант вместе с менеджером и вернёмся."
+        self.assertTrue(suggest.mention_hits(d, "a3"))
+        self.assertEqual(suggest.mention_hits(d, "a2"), [])
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ ВТОРОЙ (A.2): с упоминанием — НЕТРОНУТЫМ, побайтово ──────────────
+    def test_negativ_a2_chernovik_s_upominaniem_prohodit_netronutym(self):
+        """ЖИВЫЕ черновики кейса 6 прогонов 21-27: пояс обязан пройти мимо, ни символа не добавив."""
+        drafts = [
+            "Здравствуйте! Спасибо, что выбрали нас 🤝 Подскажите, пожалуйста, с какого числа "
+            "планируете начать (срок в неделю уже поняли), и пару слов про опыт вождения — на чём "
+            "и как долго уже ездили, чтобы подобрать подходящий вариант.\n[собрано: срок ✅]",
+            "Здравствуйте! Спасибо, что выбрали нас 🤝 Неделю на острове — отлично, учли срок. "
+            "Подскажите, что именно хотели бы взять — скутер или мотоцикл, и есть модель на "
+            "примете? А заодно пару слов про опыт вождения — на чём и как долго ездили 😎",
+            "И пару слов про опыт вождения — на чём и как долго катались, так проще подобрать вариант 😎",
+            "Подскажите, что именно хотели бы взять — скутер или мотоцикл, и пару слов про опыт "
+            "вождения: на чём и как долго уже ездили?",
+            "Здравствуйте! Неделю учли. На чём ездили раньше и как долго?",
+        ]
+        for d in drafts:
+            self.assertTrue(suggest.mention_hits(d, "a2"), f"носитель не найден: {d!r}")
+            self.assertFalse(suggest.mention_violation(d, "a2"), d)
+            r = suggest.guard_experience_mention(d, applies="a2")
+            self.assertEqual(r["source"], "draft", d)
+            self.assertFalse(r["missing"], d)
+            self.assertIs(r["text"], d, "черновик подменён объектом, а не пропущен как есть")
+            self.assertEqual(len(r["text"]), len(d), d)
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ ТРЕТИЙ: клиент назвал СВОЙ опыт — переспроса быть не должно ──────
+    def test_negativ_a2_klient_nazval_opyt_pereprosa_net(self):
+        """«Не вываливать лишнего» + ANTI_LOOP_NOTE: уже названный опыт НЕ переспрашиваем."""
+        said = [
+            "Здравствуйте! Хочу взять что-нибудь на неделю, катал раньше PCX два года.",
+            "Здравствуйте! Ездил 5 лет на мотоцикле, хочу что-нибудь на неделю покататься.",
+            "Опыт есть — брал скутер в прошлом году. Нужен какой-нибудь байк на неделю.",
+            "Здравствуйте! Управлял Форзой в прошлый приезд, хочу что-нибудь на неделю.",
+            "Здравствуйте, права категории А есть, стаж 7 лет. Что-нибудь на неделю?",
+            "Hi! I have been riding for 5 years, I want something for a week.",
+            "Hello! I'm an experienced rider, need anything for a week.",
+        ]
+        for line in said:
+            self.assertEqual(suggest.experience_rule_applies("[клиент]: " + line), "",
+                             f"переспрос у клиента, который САМ назвал опыт: {line!r}")
+        # контроль: тот же запрос БЕЗ упоминания опыта — ветка обязана включиться
+        self.assertEqual(suggest.experience_rule_applies(
+            "[клиент]: Здравствуйте! Хочу взять что-нибудь на неделю покататься по острову."), "a2")
+
+    def test_dopiska_a2_ne_vtoroy_vopros_i_iz_nastavleniya(self):
+        """Фраза-страховка A.2 взята из образца наставления и НЕ является вторым вопросом."""
+        fb = suggest.mention_fallback("ru", "a2")
+        self.assertNotIn("?", fb, "дописка стала вторым вопросом — правило «один вопрос» нарушено")
+        self.assertIn("пару слов про опыт вождения", fb)
+        self.assertTrue(suggest.mention_hits(fb, "a2"))
+        self.assertTrue(suggest.mention_hits(suggest.mention_fallback("en", "a2"), "a2"))
+        for forbidden in ("опасн", "небезопас", "не совет", "лучше не", "рискован", "не рекоменд"):
+            self.assertFalse(suggest.word_hit(forbidden, fb.lower()), forbidden)
+
+    def test_dopiska_a2_ne_udalyaet_tsenu(self):
+        """«Вопрос об опыте НЕ заменяет выдачу прайса»: дописка только ДОБАВЛЯЕТ, цифры целы."""
+        d = ("Здравствуйте! NMAX 155 — 307 ฿/день; итого 1535 ฿; депозит 3000 ฿.\n"
+             "[собрано: срок ✅]")
+        r = suggest.guard_experience_mention(d, applies="a2")
+        self.assertEqual(r["source"], "fallback")
+        for num in ("307", "1535", "3000"):
+            self.assertTrue(suggest.word_hit(num, r["text"]), f"цена {num} пропала")
+        self.assertTrue(r["text"].startswith("Здравствуйте! NMAX 155 — 307 ฿/день"))
+        self.assertIn("[собрано: срок ✅]", r["text"])
+        self.assertTrue(r["text"].rstrip().endswith("[собрано: срок ✅]"),
+                        "дописка встала ПОСЛЕ служебной пометки — это шов")
 
     def test_formy_otritsaniya_opyta_iz_zhivogo_detektora(self):
         for line in ("Я новичок, прав категории A нет.", "Опыта нет совсем.",
