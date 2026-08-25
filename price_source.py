@@ -41,6 +41,7 @@ import io
 import json
 import logging
 import os
+import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -161,6 +162,80 @@ def _caps(doc, key_fn):
     return out
 
 
+def _gen_family(cands, key_fn):
+    """Кандидаты — это ПОКОЛЕНИЯ ОДНОЙ модели? → тот же список или [] (разводить нечего/нельзя).
+
+    Строгость намеренная: разводим ТОЛЬКО когда у всех кандидатов ОДИН ключ модели И у каждого
+    названо поколение. Строки РАЗНЫХ моделей («CB» подходит трём) этой веткой не разводятся
+    никогда — там остаётся прежнее «не угадываем»."""
+    if len(cands) < 2:
+        return []
+    if len({key_fn(c.get("model")) for c in cands}) != 1:
+        return []
+    if not all(c.get("generation") for c in cands):
+        return []
+    return cands
+
+
+def _pick_generation(cands, q, key_fn, src):
+    """Из строк-поколений ОДНОЙ модели выбрать нужную → (row, чем опознали) | (None, None).
+
+    ЗАЧЕМ (живой класс 26.08.2026, деньги и видимая клиенту нелепица). У XMAX 300 лист держит ДВА
+    продукта отдельными строками: «YAMAHA XMAX300 2020-2022» (557 ฿/сут, депозит 5000, кап 8900) и
+    «YAMAHA XMAX 300 NEW 2023-» (662 ฿/сут, депозит 7000, кап 9900). База в файле была ОДНА (623 ฿
+    на оба), депозит же приходил живой дверью и оставался РАЗНЫМ — клиент получал две строки с
+    ОДНОЙ ценой и РАЗНЫМИ депозитами («плати на 2000 ฿ больше залога за то же самое»), а наценка
+    нового поколения (+18.85 % по листу) пропадала целиком.
+
+    РАЗВОДИТ ИХ НЕ НАША ДОГАДКА, А САМ ЛИСТ — тремя способами по убыванию силы:
+      1) ИМЯ СТРОКИ ЛИСТА. Живая дверь возвращает его полем `model` (`pricing._normalize`), а в
+         файле оно записано полем `sheet_model` — ТЕМИ ЖЕ словами, что уже стоят в блоке
+         `low_season_caps`. Совпадение ТОЧНОЕ: это ответ самого листа на вопрос «какая строка».
+      2) МЕТКА В ИМЕНИ ЮНИТА. Лист помечает НОВОЕ поколение отдельным словом `NEW`
+         («XMAX 300CC NEW BLACK PHUKET 8969»). Тот же признак и той же формой (`\\bnew\\b`) уже
+         разводит поколения продукт (`suggest._xmax_is_new_gen` → `_XMAX_PRODUCTS`); второго
+         механизма здесь НЕ заводится, метка берётся из поля `unit_marker` файла.
+      3) ОТСУТСТВИЕ МЕТКИ в том же имени → строка БЕЗ метки. Это не догадка, а та же асимметрия
+         листа: помечено НОВОЕ, старое живёт без метки.
+    МЕТКА ИЩЕТСЯ В ТОМ ЖЕ ИМЕНИ, которое сейчас разбирает `resolve_row` (`src`), а не только в
+    имени юнита — и вот почему это НЕ мелочь. Третий источник резолвера — МЕТКА ПРОДУКТА
+    («XMAX 300 New Gen»), которую кладёт сам бот (`suggest._XMAX_PRODUCTS`), и по обеим клиентским
+    дорогам — точечной и сеточной — она приходит ВСЕГДА, даже когда дверь не назвала юнит.
+    Первая редакция этой функции смотрела только `q["bike"]`, и на котировке без имени юнита
+    молча отдавала строку СТАРОГО поколения — то есть называла клиенту цену старого байка за
+    новый. Поймано гейтом в тот же заход (мок `TestPriceSheetMinAcrossVariants` имени юнита не
+    несёт), исправлено здесь.
+    """
+    rows = _gen_family(cands, key_fn)
+    if not rows:
+        return None, None
+    sheet = key_fn((q or {}).get("model"))
+    if sheet:
+        exact = [r for r in rows if key_fn(r.get("sheet_model")) == sheet]
+        if len(exact) == 1:
+            return exact[0], ("поколение %s названо строкой листа «%s»"
+                              % (exact[0].get("generation"), (q or {}).get("model")))
+    name = str(src or "")
+    if not name:
+        return None, None
+    marked = [r for r in rows if r.get("unit_marker")
+              and re.search(r"(?i)\b%s\b" % re.escape(str(r["unit_marker"])), name)]
+    if len(marked) == 1:
+        return marked[0], ("поколение %s по метке «%s» в имени «%s»"
+                           % (marked[0].get("generation"), marked[0]["unit_marker"], name))
+    # Имя ЕСТЬ и метки в нём нет. Строку БЕЗ метки берём ТОЛЬКО когда имя пришло от живой двери
+    # (юнит или строка листа) — там отсутствие метки и есть способ листа назвать старое поколение.
+    # Обрывок речи клиента («XMAX») так судить НЕЛЬЗЯ: в нём метки не бывает НИКОГДА, и молчаливый
+    # выбор старой строки назвал бы клиенту цену старого байка за новый. Это ровно тот дефект,
+    # который заход и чинит, поэтому здесь fail-closed: не знаем поколения — цены не даём.
+    named_by_door = bool((q or {}).get("bike")) or bool((q or {}).get("model"))
+    plain = [r for r in rows if not r.get("unit_marker")]
+    if not marked and named_by_door and len(plain) == 1:
+        return plain[0], ("поколение %s: метки поколения в имени «%s» нет"
+                          % (plain[0].get("generation"), name))
+    return None, None
+
+
 def resolve_row(doc, model, key_fn, quote=None):
     """Строка файла для ЭТОЙ котировки → (row, чем опознали) | (None, почему нет).
 
@@ -188,9 +263,17 @@ def resolve_row(doc, model, key_fn, quote=None):
         hit = [m for k, m in keyed if k in nk]                 # «nmax155» внутри «yamahanmax155»
         if len(hit) == 1:
             return hit[0], "%s «%s»" % (how, src)
+        # 26.08.2026: НЕСКОЛЬКО строк ОДНОЙ модели — это ПОКОЛЕНИЯ, и разводит их сам лист
+        # (см. _pick_generation). Строки РАЗНЫХ моделей сюда не попадают — там «не угадываем».
+        row, gen = _pick_generation(hit, q, key_fn, src)
+        if row is not None:
+            return row, "%s «%s» (%s)" % (how, src, gen)
         fam = [m for k, m in keyed if k == nk or k.startswith(nk)]   # «nmax» → «NMAX 155»
         if len(fam) == 1:
             return fam[0], "%s «%s» (семейство)" % (how, src)
+        row, gen = _pick_generation(fam, q, key_fn, src)
+        if row is not None:
+            return row, "%s «%s» (семейство; %s)" % (how, src, gen)
         if len(hit) > 1 or len(fam) > 1:
             return None, "«%s» подходит нескольким строкам файла — не угадываем" % src
     return None, "модели нет в файле"
