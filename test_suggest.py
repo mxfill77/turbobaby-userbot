@@ -4015,13 +4015,16 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
                                               today=datetime.date(2026, 7, 11))
             self.assertIn("New Gen", note, phrase)                  # актуальное поколение в ответе
             self.assertNotIn("- XMAX 300:", note, phrase)           # строки старого поколения НЕТ
-            self.assertNotIn("4700", note, phrase)                  # цифра старого поколения не течёт
-            # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026 (источник цены — ЗАПИСАННОЕ ПРАВИЛО, 45a38cf): цену
-            # даёт price_source.json — XMAX 300 = база 623 x сезон 1.0 (P1, старт 2026-07-15)
-            # x ступень срока: 1.0 (корзина 7-13, «на неделю» = 7 сут) → 623 ฿/день, либо
-            # 1.03 (корзина 4-6, «на 5 дней») → 642 ฿/день. Две ветки — потому что фразы набора
-            # несут РАЗНЫЙ срок; ИМЕННО поэтому проверка осталась дизъюнкцией, как и была.
-            self.assertTrue("623" in note or "642" in note, phrase)
+            self.assertNotIn("557", note, phrase)                   # цифра старого поколения не течёт
+            # ГОЛДЕН ПЕРЕСЧИТАН 26.08.2026 (поколения разведены, 2d66cf0). Числа взяты ПЕРЕСЧЁТОМ
+            # ИЗ ЛИСТА, а не из вывода бота: New Gen = 662 — клетка «7 суток» строки листа
+            # «YAMAHA XMAX 300 NEW 2023-» (живой замер дверью quote_price 26.08) — x сезон 1.0
+            # (P1, старт 2026-07-15) x ступень срока: 1.0 (корзина 7-13, «на неделю» = 7 сут)
+            # → 662 ฿/день, либо 1.03 (корзина 4-6, «на 5 дней») → 682 ฿/день. Две ветки — потому
+            # что фразы набора несут РАЗНЫЙ срок; ИМЕННО поэтому проверка осталась дизъюнкцией.
+            # Прежние 623/642 стояли на СЛИТОЙ базе обоих поколений, снятой 26.08; заодно ожила
+            # страховка «старое не течёт»: при слитой базе она была ХОЛОСТОЙ (числа совпадали).
+            self.assertTrue("662" in note or "682" in note, phrase)
 
     def test_pointwise_xmax_explicit_old_gen_shows_both(self):
         # ГОЛДЕН (кейс @cryptopeppa): ЯВНЫЙ запрос «а старый xmax есть?» (репликой ПОЗЖЕ дат первичной
@@ -4038,8 +4041,16 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
                                               today=datetime.date(2026, 7, 11))
             self.assertIn("- XMAX 300: ", note, older)             # строка старого поколения
             self.assertIn("- XMAX 300 New Gen: ", note, older)     # строка нового поколения
-            self.assertIn("7d 4700", note, older)                  # неделя старого — своя цифра
-            self.assertIn("7d 5600", note, older)                  # неделя нового — РАЗНАЯ цифра
+            # ГОЛДЕН ПЕРЕСЧИТАН 26.08.2026. Прежние «7d 4700» / «7d 5600» приезжали ПОЛЕМ text
+            # мока (синтетическая строка столбца J), а канал text снят на переключении источника
+            # цены (price_source.reprice → out.pop("text")) — то есть ожидание спрашивало клетку
+            # «7 суток, старт 2026-07-15», а ждало число закрытого канала, посчитанное от колонки
+            # B листа. Числа ПЕРЕСЧИТАНЫ ИЗ ЛИСТА: 557 и 662 — клетки «7 суток» двух строк листа
+            # (замер дверью quote_price 26.08) x P1 1.0 x корзина 7-13 1.0; итог = цена суток x 7.
+            self.assertIn("557 ฿/день", note, older)               # цена старого — своя цифра
+            self.assertIn("итого 3899 ฿", note, older)             # его итог за неделю
+            self.assertIn("662 ฿/день", note, older)               # цена нового — РАЗНАЯ цифра
+            self.assertIn("итого 4634 ฿", note, older)             # и его итог за неделю
             # старую строку квотировал ТОЛЬКО старый юнит, новую — ТОЛЬКО новый (поколения не смешаны)
             old_line = next(l for l in note.splitlines() if l.startswith("- XMAX 300:"))
             new_line = next(l for l in note.splitlines() if l.startswith("- XMAX 300 New Gen:"))
@@ -4075,24 +4086,25 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
             self.assertIn("ЗА КАЖДЫЙ", note, phrase)              # цена/депозит помечены «за каждый»
             self.assertIn("New Gen", note, phrase)               # только актуальное поколение
             self.assertNotIn("- XMAX 300:", note, phrase)        # строки старого поколения НЕТ
-            self.assertNotIn("790", note, phrase)                # цена старого поколения не течёт
-            # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026: XMAX 300 = 623 x 1.0 (P1, старт 2026-07-16) x 1.0
-            # (корзина 7-13, срок 8 сут) = 623 ฿/день. ОГОВОРКА ЧЕСТНО: в price_source.json у
-            # XMAX 300 ОДНА строка базы на оба поколения, поэтому число «нового» и «старого»
-            # теперь совпадает, и строка assertNotIn("790") выше стала холостой — поколения
-            # различает только МЕТКА (New Gen), а не цена. Правилом этого не исправить.
-            self.assertIn("623", note, phrase)                   # цена нового поколения (счёт правила)
+            self.assertNotIn("557", note, phrase)                # цена старого поколения не течёт
+            # ГОЛДЕН ПЕРЕСЧИТАН 26.08.2026 (поколения разведены, 2d66cf0). Число ПЕРЕСЧИТАНО ИЗ
+            # ЛИСТА: New Gen = 662 — клетка «7 суток» строки листа «YAMAHA XMAX 300 NEW 2023-»
+            # (замер дверью quote_price 26.08) — x 1.0 (P1, старт 2026-07-16) x 1.0 (корзина
+            # 7-13, срок 8 сут) = 662 ฿/день. Прежние 623/1246 стояли на СЛИТОЙ базе обоих
+            # поколений; ОГОВОРКА ПРЕЖНЕЙ РЕДАКЦИИ СНЯТА: страховка «цена старого не течёт» была
+            # ХОЛОСТОЙ, пока числа совпадали, — теперь у поколений разные числа, и она работает.
+            self.assertIn("662", note, phrase)                   # цена нового поколения (счёт правила)
             self.assertIn("7000", note, phrase)                  # депозит нового из Bridge
             # ВЫДУМАННОГО общего итога за 2 шт. в блоке НЕТ (код не суммирует и не умножает):
-            self.assertNotIn("1246", note, phrase)               # 2×623 не выдумано
+            self.assertNotIn("1324", note, phrase)               # 2×662 не выдумано
             self.assertNotIn("14000", note, phrase)              # 2×7000 (депозит) не выдумано
             # #365 родитель4 шаг3/6: живая цена New Gen едет в служебный quote-блок → strategy-путь
             # донесёт её КОДОМ; пометка «за каждый» и в блоке, итог за 2 шт. по-прежнему не выдуман.
             block = suggest._quote_block_from_note(note)
             self.assertIsNotNone(block, phrase)
-            self.assertIn("623", block, phrase)                  # новое поколение — цена правила
+            self.assertIn("662", block, phrase)                  # новое поколение — цена правила
             self.assertIn("ЗА КАЖДЫЙ", block, phrase)            # цена/депозит за каждый юнит
-            self.assertNotIn("1246", block, phrase)              # итог за 2 шт. не выдуман и в блоке
+            self.assertNotIn("1324", block, phrase)              # итог за 2 шт. не выдуман и в блоке
 
     def test_pointwise_quote_tail_scrubs_gen_year(self):
         # ГОЛДЕН (родитель 22, шаг 3/7): J-текст Bridge несёт СЫРОЕ имя юнита с годом поколения
@@ -4111,8 +4123,10 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
             block = suggest._quote_block_from_note(note)
             self.assertIsNotNone(block, phrase)                   # quote-блок собран
             self.assertIn("New Gen", block, phrase)               # поколение несёт метка (New Gen)
-            # ГОЛДЕН ПЕРЕСЧИТАН 21.08.2026: XMAX 300 = 623 x 1.0 (P1) x 1.0 (7-13, 8 сут) = 623 ฿/день.
-            self.assertIn("623", block, phrase)                   # цена правила цела
+            # ГОЛДЕН ПЕРЕСЧИТАН 26.08.2026, число ПЕРЕСЧИТАНО ИЗ ЛИСТА: New Gen = 662 (клетка
+            # «7 суток» строки листа «YAMAHA XMAX 300 NEW 2023-», замер 26.08) x 1.0 (P1) x 1.0
+            # (корзина 7-13, срок 8 сут) = 662 ฿/день. Прежнее 623 — слитая база двух поколений.
+            self.assertIn("662", block, phrase)                   # цена правила цела
             for yr in ("2020", "2021", "2022", "2023", "2024"):   # ГОД поколения в хвост НЕ утёк
                 self.assertNotIn(yr, block, f"{phrase}: год {yr} утёк в quote-хвост:\n{block}")
 
@@ -4129,11 +4143,17 @@ class TestPriceSheetMinAcrossVariants(unittest.TestCase):
                                           today=datetime.date(2026, 7, 11))
         self.assertIn("- XMAX 300: ", note)                      # оба поколения — раздельными строками
         self.assertIn("- XMAX 300 New Gen: ", note)
-        self.assertIn("790", note)                               # старое поколение — своя цена
-        self.assertIn("939", note)                               # новое поколение — своя цена
+        # ГОЛДЕН ПЕРЕСЧИТАН 26.08.2026. Прежние 790/939 — это КОЛОНКА B листа (база, стоящая ДО
+        # ручки категории и ДО скидки за срок), а тест спрашивает клетку «8 суток, старт
+        # 2026-07-16»: 790 x 0.75 (ручка скутеров, `цены альт`!B19) x 0.94 (скидка за срок 6 % на
+        # опорной корзине) = 557, и 939 тем же счётом = 662. Разбор сетки и тождества —
+        # docs/artifacts/2026-08-26-xmax-term-season-grid.md. Числа взяты ПЕРЕСЧЁТОМ ИЗ ЛИСТА:
+        # клетки «7 суток» двух строк листа (замер 26.08) x P1 1.0 x корзина 7-13 1.0.
+        self.assertIn("557 ฿/день", note)                        # старое поколение — своя цена
+        self.assertIn("662 ฿/день", note)                        # новое поколение — своя цена
         self.assertIn("ЗА КАЖДЫЙ", note)
-        self.assertNotIn("1580", note)                           # 2×790 не выдумано
-        self.assertNotIn("1878", note)                           # 2×939 не выдумано
+        self.assertNotIn("1114", note)                           # 2×557 не выдумано
+        self.assertNotIn("1324", note)                           # 2×662 не выдумано
 
     def test_units_count_detect_real_phrases(self):
         # Правило-класс CLAUDE.md: детект на РЕАЛЬНОЙ фразе клиента + парафразы RU/EN + негативы.

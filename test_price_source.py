@@ -192,8 +192,12 @@ class TestGoldenLiveCases(FlagBase):
             {"status": "ok", "quote": live_quote(577, 8082, 7000, True, 14, True, 9900, J120,
                                     bike="YAMAHA XMAX 300 NEW 2023-")},
             "XMAX 300", "2025-12-12", "2025-12-26", suggest._bike_key)
-        self.assertEqual(res["quote"]["day_price"], 710)   # 623 x 1.389 (P4) x 0.82
-        self.assertEqual(res["quote"]["total"], 9940)
+        # ГОЛДЕН ПЕРЕСЧИТАН 26.08.2026 (поколения разведены, 2d66cf0): живая котировка приходит
+        # по юниту НОВОГО поколения («YAMAHA XMAX 300 NEW 2023-»), и база у него теперь своя.
+        # Число ПЕРЕСЧИТАНО ИЗ ЛИСТА: 662 — клетка «7 суток» строки листа этого поколения (замер
+        # дверью quote_price 26.08). Прежние 710/9940 стояли на СЛИТОЙ базе 623, снятой 26.08.
+        self.assertEqual(res["quote"]["day_price"], 754)   # 662 x 1.389 (P4) x 0.82
+        self.assertEqual(res["quote"]["total"], 10556)
 
     def test_both_live_cases_moved_towards_what_client_paid(self):
         # Смысл всей ветки одной проверкой: 317→437 при уплаченных 464, 577→710 при 798.
@@ -267,7 +271,8 @@ class TestModelResolution(FlagBase):
         q["bike"] = "YAMAHA XMAX 300 NEW 2023-"
         b = price_source.reprice({"status": "ok", "quote": q},
                                  "XMAX", "2025-12-12", "2025-12-26", suggest._bike_key)
-        self.assertEqual(b["quote"]["day_price"], 710)
+        # ПЕРЕСЧИТАНО 26.08.2026 из листа, как и в TestGoldenLiveCases: 662 x 1.389 (P4) x 0.82.
+        self.assertEqual(b["quote"]["day_price"], 754)
 
 
 # ───────────────────────────── 4. отрицательные замки ─────────────────────────────
