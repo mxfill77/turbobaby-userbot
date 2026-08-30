@@ -29,10 +29,16 @@ class TestPriceSnapshotPublisherB11(unittest.TestCase):
             "freshness": {
                 "snapshot_on": "2026-08-18", "built_on": "2026-08-17",
                 "max_age_days_default": 14, "max_age_env": "PRICE_FRESH_MAX_AGE_DAYS",
+                # УНАСЛЕДОВАННОЕ окно и УНАСЛЕДОВАННОЕ наблюдение ручек — ровно то, что живой
+                # кандидат B1.2 протащил в себя молча. Числа нарочно отличаются от fixture.
+                "window": {"date_start": "15.09.2026", "date_end": "16.09.2026"},
                 "handles": [
-                    {"cell": "H3", "category": "мото-1", "global_discount": 0.15},
-                    {"cell": "I3", "category": "мото-2", "global_discount": 0.15},
-                    {"cell": "J3", "category": "скутеры", "global_discount": 0.25},
+                    {"cell": "H3", "category": "мото-1", "global_discount": 0.15,
+                     "units_agreed": 3, "taken_from": ["старое H3"]},
+                    {"cell": "I3", "category": "мото-2", "global_discount": 0.15,
+                     "units_agreed": 3, "taken_from": ["старое I3"]},
+                    {"cell": "J3", "category": "скутеры", "global_discount": 0.25,
+                     "units_agreed": 3, "taken_from": ["старое J3"]},
                 ],
             },
         }
@@ -46,9 +52,13 @@ class TestPriceSnapshotPublisherB11(unittest.TestCase):
             "source_window": {"date_start": "2026-09-07", "date_end": "2026-09-14", "days": 7},
             "evidence_ref": "docs/artifacts/b1-dry-run.json",
             "handles": [
-                {"cell": "H3", "global_discount": 0.15},
-                {"cell": "I3", "global_discount": 0.15},
-                {"cell": "J3", "global_discount": 0.20},
+                {"cell": "H3", "global_discount": 0.15, "units_agreed": 4,
+                 "taken_from": ["CB 300/", "MT-03 300/", "NINJA 400/", "XSR 155/"]},
+                {"cell": "I3", "global_discount": 0.15, "units_agreed": 3,
+                 "taken_from": ["CB 650R/", "CBR 650R/", "VULCAN 650/"]},
+                {"cell": "J3", "global_discount": 0.20, "units_agreed": 7,
+                 "taken_from": ["ADV 350/", "CLICK 125/", "FORZA 300/", "NMAX 155/",
+                                "XADV 750/", "XMAX 300/2020-2022", "XMAX 300/2023-"]},
             ],
             "products": [
                 {"model": "NMAX 155", "handle_cell": "J3",
@@ -76,6 +86,81 @@ class TestPriceSnapshotPublisherB11(unittest.TestCase):
         self.assertEqual(candidate["freshness"]["snapshot_on"], "2026-08-31")
         handles = {r["cell"]: r["global_discount"] for r in candidate["freshness"]["handles"]}
         self.assertEqual(handles, {"H3": 0.15, "I3": 0.15, "J3": 0.20})
+
+    def resealed(self, candidate):
+        """Кандидата помяли — пересчитали ЕГО ЖЕ hash. Так негативный замок доказывает именно
+        сверку метаданных, а не то, что заодно съехала контрольная сумма."""
+        candidate["publication"]["content_sha256"] = pub.content_sha256(candidate)
+        return candidate
+
+    # --- B1.2a: метаданные кандидата обязаны совпадать с его собственной уликой ---
+
+    def test_freshness_window_is_the_fixture_window_not_the_inherited_one(self):
+        fixture = self.fixture()
+        candidate = pub.build_candidate(self.source(), fixture)
+        self.assertEqual(candidate["freshness"]["window"], fixture["source_window"])
+        self.assertEqual(candidate["publication"]["source_window"], fixture["source_window"])
+        self.assertNotEqual(candidate["freshness"]["window"],
+                            self.source()["freshness"]["window"])
+
+    def test_observed_handle_fields_come_from_fixture_and_category_survives(self):
+        candidate = pub.build_candidate(self.source(), self.fixture())
+        rows = {r["cell"]: r for r in candidate["freshness"]["handles"]}
+        self.assertEqual({cell: row["units_agreed"] for cell, row in rows.items()},
+                         {"H3": 4, "I3": 3, "J3": 7})
+        self.assertEqual(rows["I3"]["taken_from"], ["CB 650R/", "CBR 650R/", "VULCAN 650/"])
+        # Описательное поле ячейки листа переживает заход, наблюдённое — нет.
+        self.assertEqual({cell: row["category"] for cell, row in rows.items()},
+                         {"H3": "мото-1", "I3": "мото-2", "J3": "скутеры"})
+        for row in rows.values():
+            self.assertNotIn("старое", " ".join(row["taken_from"]))
+
+    def test_publication_handles_are_a_deep_copy_of_freshness_handles(self):
+        candidate = pub.build_candidate(self.source(), self.fixture())
+        self.assertEqual(candidate["publication"]["handles"], candidate["freshness"]["handles"])
+        candidate["freshness"]["handles"][0]["units_agreed"] = 99
+        self.assertEqual(candidate["publication"]["handles"][0]["units_agreed"], 4)
+
+    def test_window_disagreement_is_fail_closed(self):
+        candidate = pub.build_candidate(self.source(), self.fixture())
+        candidate["freshness"]["window"] = {"date_start": "15.09.2026", "date_end": "16.09.2026"}
+        with self.assertRaisesRegex(pub.CandidateError, "source_window"):
+            pub.verify_candidate(self.resealed(candidate))
+
+    def test_empty_window_is_not_agreement(self):
+        candidate = pub.build_candidate(self.source(), self.fixture())
+        candidate["freshness"]["window"] = {}
+        candidate["publication"]["source_window"] = {}
+        with self.assertRaisesRegex(pub.CandidateError, "freshness.window отсутствует"):
+            pub.verify_candidate(self.resealed(candidate))
+
+    def test_handle_block_disagreement_is_fail_closed(self):
+        candidate = pub.build_candidate(self.source(), self.fixture())
+        candidate["publication"]["handles"][2]["units_agreed"] = 3
+        with self.assertRaisesRegex(pub.CandidateError, "publication.handles"):
+            pub.verify_candidate(self.resealed(candidate))
+
+    def test_missing_observed_handle_field_is_fail_closed_on_verify(self):
+        for field in pub.OBSERVED_HANDLE_FIELDS:
+            candidate = pub.build_candidate(self.source(), self.fixture())
+            for row in (candidate["freshness"]["handles"][0],
+                        candidate["publication"]["handles"][0]):
+                row.pop(field)
+            with self.assertRaisesRegex(pub.CandidateError, field):
+                pub.verify_candidate(self.resealed(candidate))
+
+    def test_missing_observed_handle_field_is_fail_closed_on_build(self):
+        for field in pub.OBSERVED_HANDLE_FIELDS:
+            fixture = self.fixture()
+            fixture["handles"][1].pop(field)
+            with self.assertRaisesRegex(pub.CandidateError, field):
+                pub.build_candidate(self.source(), fixture)
+
+    def test_fixture_without_source_window_is_fail_closed(self):
+        fixture = self.fixture()
+        fixture.pop("source_window")
+        with self.assertRaisesRegex(pub.CandidateError, "source_window"):
+            pub.build_candidate(self.source(), fixture)
 
     def test_missing_handle_is_fail_closed(self):
         fixture = self.fixture()

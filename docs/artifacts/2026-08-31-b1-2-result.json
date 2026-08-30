@@ -1,0 +1,50 @@
+{
+  "schema": "turbobaby/result_packet/v1",
+  "task_id": "b1-2-live-read-dry-run",
+  "status": "reported_done",
+  "changed_files": [
+    "price_snapshot_collect.py",
+    "test_price_snapshot_collect.py",
+    "docs/artifacts/2026-08-31-b1-2-result.json"
+  ],
+  "tests": [
+    {
+      "command": "venv\\Scripts\\python.exe -W error::ResourceWarning -m unittest -v test_price_snapshot_collect test_price_snapshot_publish",
+      "ran": 37,
+      "failures": 0,
+      "known_failures": []
+    },
+    {
+      "command": "venv\\Scripts\\python.exe -m unittest -q test_price_snapshot_collect test_price_snapshot_publish test_price_source test_price_gate test_price_freshness test_pricing test_suggest test_moderation test_moderation_card",
+      "ran": 955,
+      "failures": 5,
+      "known_failures": [
+        "test_suggest.TestRunLiveSmoke.test_green_full_data_passes",
+        "test_suggest.TestRunLiveSmoke.test_green_paraphrase_with_correct_numbers_now_passes",
+        "test_suggest.TestRunLiveSmoke.test_red_delivery_missing_fails",
+        "test_suggest.TestRunLiveSmoke.test_red_j_line_not_verbatim_fails",
+        "test_suggest.TestRunLiveSmoke.test_red_violations_flagged_with_diff_card"
+      ]
+    }
+  ],
+  "source_blob_before": "b3c3ed213aec8bb9a21b410c4f4c1d60ce028ada",
+  "source_blob_after": "b3c3ed213aec8bb9a21b410c4f4c1d60ce028ada",
+  "bridge_actions_observed": [
+    {"method": "GET", "action": "fleet", "calls": 1},
+    {"method": "GET", "action": "quote_price", "calls": 38}
+  ],
+  "candidate_path": "_scratch_b1_2/live_candidate.json",
+  "candidate_sha256": "22936bec16dbb29b3b74a35063768f2dc046332946eead41ab378d25053c2292",
+  "report_path": "_scratch_b1_2/live_report.json",
+  "unknowns": [
+    "Ячейка ручки для CB 300 (H3 против I3) сегодня НЕ ПРОВЕРЯЕМА числом: живой лист держит H3 и I3 на одном угле 0.15, поэтому ошибка ярлыка была бы численно невидимой. Карта категорий взята из уже записанного перечня price_freshness_run.PROBES и его комментария; девять из четырнадцати продуктов сверены с этим перечнем тестом, CB 300 в перечне проб отсутствует и опирается на текст перечня категорий.",
+    "Лист не хранит истории: снятые углы (H3 0.15, I3 0.15, J3 0.25) и цены — состояние на 2026-08-31 ~23:02 UTC, и совпадение со слепком price_source.json не доказывает, что между 18.08 и сегодня ручку не крутили.",
+    "Правомерность самой замены базы для ДЕСЯТИ строк, чья база снята медианой уплаченного, а не листом, — решение владельца, а не измеримый здесь факт. Дифф показан, вывод не сделан.",
+    "Наличие, депозит и кепка сняты как улики и в фикстуру попали отдельным блоком evidence; в базу низкого сезона они не входят ни одним битом, но их влияние на клиентскую фразу этим заходом не проверялось."
+  ],
+  "approval_needed": [
+    "Публикация кандидата в price_source.json — НЕ выполнялась и требует отдельного решения владельца: 10 строк из 14 меняют базу (от -21.75% у NINJA 400 до +27.34% у VULCAN 650).",
+    "Коммит/пуш созданных файлов — запрещён этим пакетом, поэтому price_snapshot_collect.py, test_price_snapshot_collect.py и этот отчёт лежат в дереве НЕЗАКОММИЧЕННЫМИ."
+  ],
+  "summary": "Заведён тонкий read-only адаптер price_snapshot_collect.py: живой парк и живые котировки → явная фикстура схемы turbobaby/price_publish_fixture, дальше нетронутые чистые build_candidate/verify_candidate из B1.1. Наружу ушли ровно два действия, оба GET: fleet ×1 и quote_price ×38 (каждый запрос проходит через guard_actions, незнакомое действие — исключение). Окно ровно 7 суток (2026-09-07..2026-09-14) и названо в самой фикстуре. Поколения XMAX 300 разведены существующим price_source.resolve_row по sheet_model/unit_marker и имени живого юнита, не догадкой. Живой заход: 38 юнитов парка, 38 прокотировано, 38 засчитано, пропущенных ноль; сняты все три ручки H3=0.15 I3=0.15 J3=0.25 — ровно те, что стоят в слепке price_source.json. Кандидат собран и прошёл verify (content_sha256 22936bec…), НЕ опубликован. Самопроверка деньгами: четыре строки, чья база уже была взята из листа (CLICK 125, FORZA 300, XMAX 300 обоих поколений), воспроизвелись до бата с дельтой 0.00%; остальные десять, чья база — медиана уплаченного, разошлись с листом. git hash-object price_source.json до и после совпал: b3c3ed213aec8bb9a21b410c4f4c1d60ce028ada. Тесты: 37/0 на паре модулей, 955/5 на полном наборе — все пять падений известные NMAX TestRunLiveSmoke, новых нет. Улики живого захода лежат в _scratch_b1_2/ (untracked, в git не вносились); рабочий журнал прогона — tmp/b12_gate.log. Пакет — доклад исполнителя, не верификация."
+}

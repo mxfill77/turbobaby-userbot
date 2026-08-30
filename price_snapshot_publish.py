@@ -20,6 +20,11 @@ import tempfile
 SOURCE_SCHEMA = "turbobaby/price_source"
 FIXTURE_SCHEMA = "turbobaby/price_publish_fixture"
 REQUIRED_HANDLES = ("H3", "I3", "J3")
+# Поля ручки, которые СНИМАЕТ проба, а не описывают её словами. Унаследованное значение такого
+# поля — не «старое наблюдение», а отсутствие наблюдения: угол/число согласных юнитов/поимённый
+# список обязаны прийти из fixture этого захода. Всё прочее (например `category`) — описание
+# ячейки листа, оно переживает заход и наследуется от прошлого снимка.
+OBSERVED_HANDLE_FIELDS = ("global_discount", "units_agreed", "taken_from")
 GENERATOR_VERSION = "b1.1-fixture-only"
 
 
@@ -95,28 +100,60 @@ def _base_index(doc):
     return index
 
 
-def _handle_map(fixture):
-    rows = fixture.get("handles") if isinstance(fixture, dict) else None
+def _handle_rows(block):
+    """Блок ручек (fixture ИЛИ freshness кандидата) → {ячейка: наблюдённые поля}.
+
+    Одна функция на оба входа сознательно: candidate проверяется ровно той меркой, которой
+    принимался fixture, и «ручка без units_agreed/taken_from» не проезжает ни на одном входе.
+    """
+    rows = block.get("handles") if isinstance(block, dict) else None
     if not isinstance(rows, list):
-        raise CandidateError("fixture.handles должен быть списком")
+        raise CandidateError("handles должен быть списком")
     result = {}
     for row in rows:
         if not isinstance(row, dict):
-            raise CandidateError("fixture.handles содержит не объект")
-        cell, value = row.get("cell"), row.get("global_discount")
+            raise CandidateError("handles содержит не объект")
+        cell = row.get("cell")
         if not isinstance(cell, str) or cell not in REQUIRED_HANDLES:
             raise CandidateError("неизвестная ручка %r" % cell)
         if cell in result:
             raise CandidateError("ручка %s продублирована" % cell)
+        absent = [name for name in OBSERVED_HANDLE_FIELDS if name not in row]
+        if absent:
+            raise CandidateError("ручка %s без наблюдённых полей: %s" % (cell, ", ".join(absent)))
+        value = row["global_discount"]
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise CandidateError("ручка %s не является числом" % cell)
         if value >= 1:
             raise CandidateError("ручка %s делает знаменатель неположительным" % cell)
-        result[cell] = float(value)
+        agreed = row["units_agreed"]
+        if isinstance(agreed, bool) or not isinstance(agreed, int) or agreed < 1:
+            raise CandidateError("ручка %s без положительного units_agreed" % cell)
+        taken = row["taken_from"]
+        if not isinstance(taken, list) or not taken or not all(
+                isinstance(item, str) and item.strip() for item in taken):
+            raise CandidateError("ручка %s без непустого taken_from" % cell)
+        observed = {name: copy.deepcopy(row[name]) for name in OBSERVED_HANDLE_FIELDS}
+        observed["global_discount"] = float(value)
+        result[cell] = observed
     if set(result) != set(REQUIRED_HANDLES):
         missing = sorted(set(REQUIRED_HANDLES) - set(result))
         raise CandidateError("не сняты обязательные ручки: %s" % ", ".join(missing))
     return result
+
+
+def _handle_map(block):
+    """Только углы — то, чем считается нормализация базы."""
+    return {cell: row["global_discount"] for cell, row in _handle_rows(block).items()}
+
+
+def _source_window(fixture):
+    """Окно наблюдения fixture. Пустое окно запрещено: иначе `freshness.window` и
+    `publication.source_window` «сходятся» на None, и сверка становится пустой формальностью."""
+    window = fixture.get("source_window") if isinstance(fixture, dict) else None
+    if not isinstance(window, dict) or not window:
+        raise CandidateError("fixture.source_window отсутствует")
+    return copy.deepcopy(window)
 
 
 def _product_key(product, source_index):
@@ -171,7 +208,9 @@ def build_candidate(source, fixture):
     generated_at = _iso_utc(fixture.get("generated_at"), "generated_at")
     effective_at = _iso_utc(fixture.get("effective_at"), "effective_at")
     generated_date = generated_at[:10]
-    handles = _handle_map(fixture)
+    observed_handles = _handle_rows(fixture)
+    handles = {cell: row["global_discount"] for cell, row in observed_handles.items()}
+    source_window = _source_window(fixture)
     source_index = _base_index(source)
     products = fixture.get("products")
     if not isinstance(products, list) or not products:
@@ -236,10 +275,17 @@ def build_candidate(source, fixture):
     handle_rows = []
     for cell in REQUIRED_HANDLES:
         row = copy.deepcopy(previous_by_cell.get(cell, {}))
-        row.update(cell=cell, global_discount=handles[cell])
+        # Сначала СНИМАЕМ унаследованное наблюдение и только потом кладём своё: иначе поле,
+        # которого нет в этом заходе, молча доедет из прошлого снимка как будто оно снято.
+        for name in OBSERVED_HANDLE_FIELDS:
+            row.pop(name, None)
+        row["cell"] = cell
+        row.update(copy.deepcopy(observed_handles[cell]))
         handle_rows.append(row)
     freshness = copy.deepcopy(previous_freshness) if isinstance(previous_freshness, dict) else {}
-    freshness.update(snapshot_on=generated_date, built_on=generated_date, handles=handle_rows)
+    freshness.update(snapshot_on=generated_date, built_on=generated_date,
+                     window=copy.deepcopy(source_window),
+                     handles=copy.deepcopy(handle_rows))
     candidate["freshness"] = freshness
     candidate["built_on"] = generated_date
     candidate["status"] = {
@@ -256,7 +302,7 @@ def build_candidate(source, fixture):
         "publisher": "pending-owner-approval",
         "approval_ref": fixture.get("approval_ref"),
         "source": "explicit-fixture-only",
-        "source_window": copy.deepcopy(fixture.get("source_window")),
+        "source_window": copy.deepcopy(source_window),
         "handles": copy.deepcopy(handle_rows),
         "generator_version": fixture.get("generator_version") or GENERATOR_VERSION,
         "previous_content_sha256": content_sha256(source),
@@ -271,10 +317,14 @@ def verify_candidate(candidate):
     """Структурная и hash-проверка candidate без сети и без исходной fixture."""
     _base_index(candidate)
     freshness = candidate.get("freshness")
-    handles = freshness.get("handles") if isinstance(freshness, dict) else None
-    _handle_map({"handles": handles})
+    if not isinstance(freshness, dict):
+        raise CandidateError("candidate не содержит freshness")
+    _handle_rows(freshness)
     if not isinstance(freshness.get("snapshot_on"), str) or freshness.get("snapshot_on") != candidate.get("built_on"):
         raise CandidateError("freshness.snapshot_on и built_on должны обновляться вместе")
+    window = freshness.get("window")
+    if not isinstance(window, dict) or not window:
+        raise CandidateError("freshness.window отсутствует")
     publication = candidate.get("publication")
     required = (
         "status", "revision", "snapshot_id", "generated_at", "effective_at", "publisher",
@@ -286,6 +336,13 @@ def verify_candidate(candidate):
     missing = [name for name in required if name not in publication]
     if missing:
         raise CandidateError("publication не содержит: %s" % ", ".join(missing))
+    # Кандидат, у которого метаданные спорят с собственной уликой, не «почти готов»: он врёт
+    # про то, ЧТО именно наблюдали. Обе сверки стоя́т ДО hash — hash подтверждает целостность
+    # уже согласованного документа, а не заменяет согласованность.
+    if window != publication.get("source_window"):
+        raise CandidateError("freshness.window разошлась с publication.source_window")
+    if publication.get("handles") != freshness.get("handles"):
+        raise CandidateError("publication.handles разошлись с freshness.handles")
     expected = content_sha256(candidate)
     if publication.get("content_sha256") != expected:
         raise CandidateError("content_sha256 не совпадает с canonical candidate")

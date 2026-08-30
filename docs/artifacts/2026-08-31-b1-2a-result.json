@@ -1,0 +1,83 @@
+{
+  "schema": "turbobaby/result_packet/v1",
+  "task_id": "b1-2a-candidate-metadata-coherence",
+  "status": "reported_done",
+  "changed_files": [
+    "price_snapshot_publish.py",
+    "test_price_snapshot_publish.py",
+    "test_price_snapshot_collect.py",
+    "docs/artifacts/2026-08-31-b1-2a-result.json"
+  ],
+  "tests": [
+    {
+      "command": "venv\\Scripts\\python.exe -W error::ResourceWarning -m unittest -v test_price_snapshot_publish test_price_snapshot_collect",
+      "ran": 50,
+      "failures": 0,
+      "known_failures": [],
+      "was_before_task": {"ran": 37, "failures": 0}
+    },
+    {
+      "command": "venv\\Scripts\\python.exe -m unittest -q test_price_snapshot_collect test_price_snapshot_publish test_price_source test_price_gate test_price_freshness test_pricing test_suggest test_moderation test_moderation_card",
+      "ran": 968,
+      "failures": 5,
+      "known_failures": [
+        "test_suggest.TestRunLiveSmoke.test_green_full_data_passes",
+        "test_suggest.TestRunLiveSmoke.test_green_paraphrase_with_correct_numbers_now_passes",
+        "test_suggest.TestRunLiveSmoke.test_red_delivery_missing_fails",
+        "test_suggest.TestRunLiveSmoke.test_red_j_line_not_verbatim_fails",
+        "test_suggest.TestRunLiveSmoke.test_red_violations_flagged_with_diff_card"
+      ],
+      "was_before_task": {"ran": 955, "failures": 5},
+      "note": "красных 5, список ИМЁН совпадает с базой пакета B1.2 посимвольно; новых красных ноль"
+    }
+  ],
+  "source_blob_before": "b3c3ed213aec8bb9a21b410c4f4c1d60ce028ada",
+  "source_blob_after": "b3c3ed213aec8bb9a21b410c4f4c1d60ce028ada",
+  "source_blob_command": "git hash-object price_source.json",
+  "old_candidate_path": "_scratch_b1_2/live_candidate.json",
+  "old_candidate_sha256": "22936bec16dbb29b3b74a35063768f2dc046332946eead41ab378d25053c2292",
+  "old_candidate_now_verifies": false,
+  "old_candidate_verify_error": "ручка H3 без наблюдённых полей: taken_from",
+  "candidate_path": "_scratch_b1_2/live_candidate_b1_2a.json",
+  "candidate_sha256": "3326995bd3ef09bbf21eacecffd7bb4dcc961c1c84eea6871bc72f0e65300bb5",
+  "report_path": "_scratch_b1_2/live_report_b1_2a.json",
+  "fixture_path": "_scratch_b1_2/live_fixture.json",
+  "bridge_actions_observed": [],
+  "corrections": [
+    {
+      "field": "freshness.window",
+      "was": {"date_start": "15.09.2026", "date_end": "16.09.2026"},
+      "now": {"date_start": "2026-09-07", "date_end": "2026-09-14", "days": 7, "bucket": "7-13"},
+      "proof": "freshness.window == publication.source_window == fixture.source_window (сверено дословно, включая поля days/bucket/why)"
+    },
+    {
+      "field": "freshness.handles[].units_agreed",
+      "was": {"H3": 3, "I3": 3, "J3": 3},
+      "now": {"H3": 4, "I3": 3, "J3": 7},
+      "proof": "равно наблюдению fixture; publication.handles — точная копия freshness.handles"
+    },
+    {
+      "field": "freshness.handles[].taken_from",
+      "was": "отсутствовало (унаследованный блок ручек его не содержал)",
+      "now": "поимённые списки продуктов из fixture, H3=[CB 300/, MT-03 300/, NINJA 400/, XSR 155/]",
+      "proof": "описательное поле category ('мото-1'/'мото-2'/'скутеры') при этом пережило заход"
+    }
+  ],
+  "invariants_held": [
+    "базы base.models исправленного кандидата ПОБАЙТНО те же 14 строк, что у старого кандидата — расчёт цены не тронут",
+    "canonical_bytes/content_sha256 не менялись как алгоритм; hash сменился только потому, что метаданные теперь верны",
+    "runtime price_source.json не открывался на запись: blob до и после совпал",
+    "verify_candidate ставит обе новые сверки ДО hash-проверки, поэтому негативные замки доказывают сверку, а не съехавшую сумму"
+  ],
+  "unknowns": [
+    "исправленный кандидат пересобран ИЗ СОХРАНЁННОЙ фикстуры 2026-08-30T23:02:33Z; живой лист сегодня не читался — стоят ли ручки H3/I3/J3 всё ещё на 0.15/0.15/0.25, неизвестно",
+    "пять красных test_suggest.TestRunLiveSmoke — доставшаяся база, их причина в этой задаче не исследовалась и кодом не затрагивалась",
+    "требование units_agreed/taken_from сделано ОБЯЗАТЕЛЬНЫМ для любой фикстуры; единственный производитель фикстур в репо (price_snapshot_collect.py) их даёт всегда, но рукописная фикстура старого образца теперь не соберётся — это сознательный fail-closed, а не проверенное отсутствие других производителей",
+    "запрет пустого freshness.window (иначе None == None прошло бы за согласие) добавлен исполнителем сверх дословного перечня пакета"
+  ],
+  "approval_needed": [
+    "коммит и пуш трёх изменённых файлов: пакет запретил commit/push, правки лежат в рабочем дереве незакоммиченными",
+    "любая публикация исправленного кандидата в price_source.json — B1.2a её не делает и не готовит"
+  ],
+  "summary": "Оба заявленных расхождения кандидата B1.2 закрыты в build_candidate и заперты в verify_candidate. freshness.window теперь берётся из fixture.source_window; наблюдённые поля ручки (global_discount, units_agreed, taken_from) снимаются с унаследованной строки ПЕРЕД наследованием и кладутся из фикстуры, описательные (category) выживают; publication.handles — точная глубокая копия freshness.handles. verify_candidate падает закрытым на расхождении окна, расхождении блоков ручек, отсутствии любого наблюдённого поля и на пустом окне; обе сверки стоят до hash. Старый кандидат 22936bec… теперь честно не проходит --verify. Исправленный кандидат 3326995b… собран из той же фикстуры, окна и ручки 4/3/7 сошлись, 14 строк базы не изменились. price_source.json не тронут (blob b3c3ed21 до и после). Тесты: 50/0 и 968/5, красные — ровно те же пять известных NMAX TestRunLiveSmoke."
+}
