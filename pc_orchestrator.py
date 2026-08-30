@@ -60,6 +60,7 @@ import parse_outcome          # КОНТРАКТ читателя живого �
 import result_spill           # обрезка отчёта, которая НАЗЫВАЕТ СЕБЯ + тело на диск ДО реза; чистая, без сети
 import result_ref             # АДРЕС РЕЗУЛЬТАТА шага (вид+указатель): место, куда его класть; чистый, НИЧЕГО не проверяет
 import report_draft           # ЧЕРНОВИК ДОКЛАДА захода: его слова, уцелевшие при обрыве; чистый, ничего не удаляет
+import proc_identity          # ЛИЧНОСТЬ ПРОЦЕССА (номер + имя запуска + момент старта): одно правило на полосу
 try:
     # Словарь ВИДОВ красных операций и разбор карточки — у гарда, и только у него: демону нужно
     # понять, НА ЧТО именно владелец сказал «да» (`kinds_from_card`), а держать второй список
@@ -1203,6 +1204,16 @@ def _task_started_child(tid, child_pid, path=None):
     rec = st.get(key)
     rec = dict(rec) if isinstance(rec, dict) else {"at": _started_at_raw(rec)}
     rec["child"] = int(child_pid)
+    # ЛИЧНОСТЬ РЕБЁНКА, А НЕ ТОЛЬКО ЕГО НОМЕР (30.08.2026). Голый номер жил здесь с оговоркой в
+    # `_executor_verdict`: «переиспользование PID может показать чужой процесс живым — это уводит
+    # в осторожную сторону». Осторожная сторона — не бесплатная: чужой процесс, подобравший номер,
+    # держит задачу в in_progress до длинного порога молчания. Момент рождения снимается тем же
+    # прибором, что и у локов, и стои́т ровно один системный вызов. Улика, а не условие: не
+    # добыли — пишем без неё, и приговор честно откатывается на прежнюю, длинную мерку.
+    try:
+        rec["child_started"] = proc_identity.process_probe(int(child_pid)).started
+    except Exception:                       # noqa: BLE001 — проба не смеет ронять запись отметки
+        rec.pop("child_started", None)
     rec.setdefault("pid", os.getpid())
     st[key] = rec
     _task_started_write(st, tid, path)
@@ -3760,6 +3771,18 @@ def _executor_verdict(tid, path=None, pid_alive=None, since=None):
         if alive is None:
             return None, f"проба процессов не ответила: жив ли дочерний claude (PID {child}) — неизвестно"
         if alive:
+            # НОМЕР ЖИВ — НО ТОТ ЛИ ЭТО ЗАПУСК. Если при спавне мы записали момент рождения ребёнка
+            # (`child_started`), сверяем его: несовпадение — ПОЛОЖИТЕЛЬНОЕ доказательство того, что
+            # номер достался другому процессу, а наш headless мёртв. Отметки без этого поля (сделаны
+            # до 30.08.2026) и инъекция пробы в тестах идут прежней, осторожной дорогой.
+            born = rec.get("child_started")
+            if pid_alive is None and born:
+                p = proc_identity.process_probe(child)
+                if p.started is not None and abs(p.started - float(born)) > proc_identity.TOL_SAME:
+                    log.warning("задача %s: номер дочернего claude %s занят ДРУГИМ запуском "
+                                "(старт %.0f против записанного %.0f) — ребёнка нет",
+                                tid, child, p.started, float(born))
+                    return False, NO_EXEC_CHILD_DEAD.format(pid=child)
             return True, f"дочерний процесс claude (PID {child}) жив"
         return False, NO_EXEC_CHILD_DEAD.format(pid=child)
     # PID — НЕ ЛИЧНОСТЬ ПРОЦЕССА. Windows переиспользует номера, и на длинной аптайм-полосе с
@@ -9437,11 +9460,36 @@ def _lock_pid_alive(pid):
 
 
 def _read_lock_pid(path=None):
-    try:
-        with open(path or LOCK_FILE, encoding="utf-8") as f:   # закрываем сразу: на Windows
-            return int(f.read().strip() or "0")                # висящий хэндл блокирует os.remove
-    except Exception:
-        return 0
+    """Номер владельца из лока — ПЕРВОЙ строкой (вторая, у лока нового формата, несёт личность:
+    имя запуска и момент старта). Файл закрываем сразу: на Windows висящий хэндл блокирует
+    os.remove."""
+    rec = proc_identity.read_lock(path or LOCK_FILE)
+    return int(rec["pid"]) if rec else 0
+
+
+def _holder_verdict(rec, pid_alive=None):
+    """Приговор о держателе лока → (вердикт `proc_identity`, причина словами).
+
+    ЛИЧНОСТЬ ДЕРЖАТЕЛЯ ТЕПЕРЬ СВЕРЯЕТСЯ ПО ДВУМ ПРИМЕТАМ (имя запуска + момент старта) общим
+    правилом полосы: голый номер уникален только среди живых, и после ребута он достаётся кому
+    попало — на этом полоса потеряла агента 23.08 и модербота 26–30.08.
+
+    А ВОТ ЧТЕНИЕ МОЛЧАНИЯ ПРОБЫ У СИНГЛТОНА ДЕМОНА ОСТАВЛЕНО ПРЕЖНИМ, И ЭТО НЕ НЕДОСМОТР.
+    Контракт записан словами в докстринге `_lock_pid_alive`: «не поднять демона хуже, чем
+    поднять второго» — у демона есть эстафета self-update, а у полосы нет никого, кто поднял бы
+    его вместо него. У трёх ботов цена обратная (два поллера на одном токене = Conflict, а у
+    userbot ещё и риск бана на одной session), поэтому там молчание пробы старта НЕ даёт.
+    Чужое осознанное решение мы не переигрываем — чиним ровно ту половину, где номер выдавал
+    себя за личность."""
+    if rec is None or not rec.get("pid"):
+        return proc_identity.STALE, "в локе нет номера"
+    if pid_alive is not None:                  # инъекция тестов: прежний двузначный контракт
+        return ((proc_identity.OURS_ALIVE, "проба (инъекция) — держатель жив") if pid_alive(rec["pid"])
+                else (proc_identity.STALE, "проба (инъекция) — держателя нет"))
+    verdict, why = proc_identity.judge(rec, proc_identity.process_probe(rec["pid"]))
+    if verdict == proc_identity.UNKNOWN:
+        return proc_identity.STALE, why + " — контракт синглтона демона: молчание пробы читаем как «держателя нет»"
+    return verdict, why
 
 
 def acquire_singleton(lock_path=None, pid_alive=None, supersede_wait=30.0, sleep=0.5):
@@ -9449,7 +9497,6 @@ def acquire_singleton(lock_path=None, pid_alive=None, supersede_wait=30.0, sleep
     Мёртвый холдер → забираем лок. Холдер == наш supersede-PID (self-update) → ждём его смерти до
     supersede_wait, затем забираем (эстафета). pid_alive/lock_path инъектируются в тестах."""
     lock_path = lock_path or LOCK_FILE
-    pid_alive = pid_alive or _lock_pid_alive
     sup = os.getenv(SUPERSEDE_ENV, "").strip()
     sup = int(sup) if sup.lstrip("-").isdigit() else 0
     deadline = time.time() + supersede_wait
@@ -9457,20 +9504,26 @@ def acquire_singleton(lock_path=None, pid_alive=None, supersede_wait=30.0, sleep
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             try:
-                os.write(fd, str(os.getpid()).encode("utf-8"))
+                os.write(fd, proc_identity.lock_text(script=os.path.basename(__file__)).encode("utf-8"))
             finally:
                 os.close(fd)
             return True
         except FileExistsError:
-            holder = _read_lock_pid(lock_path)
-            if holder == os.getpid():          # уже наш (перезабор) — считаем успехом
-                return True
-            if holder == 0 or not pid_alive(holder):
-                log.warning("singleton: устаревший лок (PID %s мёртв) — забираю", holder or "?")
-                try:
-                    os.remove(lock_path)
-                except FileNotFoundError:
-                    pass
+            rec = proc_identity.read_lock(lock_path)
+            holder = rec["pid"] if rec else 0
+            if holder == os.getpid() and proc_identity.is_me(rec, proc_identity.process_probe):
+                return True                    # уже наш (перезабор ТЕМ ЖЕ запуском) — считаем успехом
+            verdict, why = _holder_verdict(rec, pid_alive)
+            if verdict == proc_identity.STALE:
+                log.warning("singleton: устаревший лок (PID %s) — забираю: %s", holder or "?", why)
+                moved = proc_identity.retire(lock_path, rec) if rec else None
+                if moved:
+                    log.info("singleton: улика стухшего лока → %s", moved)
+                elif os.path.exists(lock_path):
+                    try:
+                        os.remove(lock_path)
+                    except FileNotFoundError:
+                        pass
                 continue                        # заберём на следующем витке
             if holder == sup and time.time() < deadline:
                 time.sleep(sleep)               # self-update: ждём смерти сменяемого старого демона
@@ -9482,20 +9535,19 @@ def acquire_singleton(lock_path=None, pid_alive=None, supersede_wait=30.0, sleep
                 except FileNotFoundError:
                     pass
                 continue
-            log.warning("singleton: pc_orchestrator уже запущен (живой PID %s) — второй НЕ стартую", holder)
+            log.warning("singleton: pc_orchestrator уже запущен [%s] — второй НЕ стартую: %s", verdict, why)
             return False
     log.error("singleton: не смог получить лок за 200 итераций — НЕ стартую (страховка)")
     return False
 
 
 def release_singleton(lock_path=None):
-    """Снять лок ТОЛЬКО если он наш (чужой/successor'ский лок не трогаем)."""
+    """Снять лок ТОЛЬКО если он наш (чужой/successor'ский лок не трогаем) — и «наш» здесь по
+    номеру И моменту старта: после рестарта номер может носить чужой процесс, и снятие его лока
+    открыло бы дорогу второму демону."""
     lock_path = lock_path or LOCK_FILE
     try:
-        if _read_lock_pid(lock_path) == os.getpid():
-            os.remove(lock_path)
-    except FileNotFoundError:
-        pass
+        proc_identity.release(lock_path)
     except Exception as e:
         log.warning("singleton: не смог снять лок: %s", e)
 

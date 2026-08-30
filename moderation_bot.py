@@ -23,7 +23,6 @@ userbot.send_to_client. Голос: пока не расшифровываем (
 import os
 import sys
 import logging
-import subprocess
 
 from dotenv import load_dotenv
 
@@ -35,6 +34,7 @@ import moderation_ipc     # noqa: E402
 import booking_draft      # noqa: E402  (O3 кусок 1 «Кнопка Бронь»: экстракция заявки, read-only)
 import trainer            # noqa: E402  (ГРУППА-ТРЕНАЖЁР: панель кнопок под ответом userbot)
 import trainer_log        # noqa: E402  (ЛОГ ТРЕНАЖЁРА в мозг: нажатия кнопок и уроки; fail-safe)
+import proc_identity      # noqa: E402  (ЛИЧНОСТЬ ПРОЦЕССА: номер + имя запуска + момент старта)
 
 try:
     import log_setup                       # ротация + тестовый лог в temp (см. log_setup)
@@ -576,54 +576,43 @@ async def on_error(update, context):
 # ------------------------- singleton-гард (разбор #128) ----------------------
 # Двух moderation_bot на одном MODERBOT_TOKEN быть не должно: два поллера → Telegram отдаёт
 # Conflict, один из процессов умирает. Раньше защиты не было — pc_agent-старт и контур-вотчдог
-# оркестратора могли на миг поднять второй экземпляр. Атомарный lock-файл с PID (как в pc_agent).
+# оркестратора могли на миг поднять второй экземпляр. Атомарный lock-файл (как в pc_agent).
+#
+# 30.08.2026 — ГАРД НЕ СНЯТ И НЕ ОСЛАБЛЕН, А УСИЛЕН ВТОРОЙ ПРИМЕТОЙ. Прежде живость владельца
+# решалась ОДНИМ номером (`tasklist /FI "PID eq N"`), а номер уникален только СРЕДИ ЖИВЫХ:
+# после ребута 26.08 номер 18200 из лока достался `PinWin.exe` (создан на 70 с позже загрузки),
+# и гард честно докладывал «уже запущен» ТРОЕ СУТОК, пока модербот лежал. Теперь личность
+# владельца — номер + имя запуска + момент старта, одним общим правилом полосы
+# (`proc_identity`). Заодно закрыт второй, тихий вход в ту же беду: прежний `_pid_alive`
+# глотал СВОЙ отказ в False, то есть таймаут `tasklist` на просыпающемся ПК читался как
+# «владелец мёртв» и уводил в КРАЖУ лока — ровно в двойной запуск, от которого гард и стои́т.
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moderation_bot.lock")
 
 
-def _pid_alive(pid):
-    try:
-        r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-                           capture_output=True, text=True, timeout=10)
-        return f'"{pid}"' in r.stdout or f",{pid}," in r.stdout
-    except Exception:
-        return False
-
-
 def acquire_lock():
-    """True — лок наш; False — другой живой moderation_bot уже держит его (выходим)."""
-    for _ in range(3):
-        try:
-            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            try:
-                os.write(fd, str(os.getpid()).encode("utf-8"))
-            finally:
-                os.close(fd)
-            return True
-        except FileExistsError:
-            try:
-                with open(LOCK_FILE, encoding="utf-8") as f:
-                    old = int(f.read().strip() or "0")
-            except Exception:
-                old = 0
-            if old and _pid_alive(old):
-                log.warning(f"moderation_bot уже запущен (PID {old}) — второй не поднимаю, выхожу.")
-                return False
-            log.info(f"устаревший moderation_bot.lock (PID {old or '?'} мёртв) — забираю.")
-            try:
-                os.remove(LOCK_FILE)
-            except FileNotFoundError:
-                pass
+    """True — лок наш; False — другой живой moderation_bot уже держит его (выходим).
+
+    Стухший лок опознаёт и снимает САМА программа при старте — руками делать ничего не надо;
+    снятый лок уезжает уликой в `tmp/stale_locks/`, потому что каждый такой файл — живой случай
+    переиспользования номера. «Занят» и «не смог проверить» разведены и ОБА не дают старта."""
+    ok, verdict, why = proc_identity.acquire(
+        LOCK_FILE, script=os.path.basename(__file__),
+        log=lambda m: log.info(f"moderation_bot.lock: {m}"))
+    if ok:
+        return True
+    if verdict == proc_identity.OURS_ALIVE:
+        log.warning(f"moderation_bot уже запущен — второй не поднимаю, выхожу. {why}")
+    else:
+        log.warning(f"moderation_bot НЕ стартую [{verdict}]: {why}")
     return False
 
 
 def release_lock():
+    """Снять лок, только если он наш — по номеру И моменту старта. Голого номера тут мало по
+    той же причине, что и при заборе: после рестарта чужой процесс может носить наш прежний
+    номер, и снятие его лока открыло бы дорогу второму экземпляру."""
     try:
-        with open(LOCK_FILE, encoding="utf-8") as f:
-            mine = int(f.read().strip() or "0") == os.getpid()
-        if mine:
-            os.remove(LOCK_FILE)
-    except FileNotFoundError:
-        pass
+        proc_identity.release(LOCK_FILE)
     except Exception:
         pass
 

@@ -51,6 +51,7 @@ from telegram.ext import (ApplicationBuilder, MessageHandler, CallbackQueryHandl
 
 import io_utf8          # переключатель stdout/stderr в UTF-8 (класс «charmap can't encode 📊»)
 import selfupdate_gate  # гейт самообновления (проверка нового кода перед рестартом)
+import proc_identity    # ЛИЧНОСТЬ ПРОЦЕССА: номер + имя запуска + момент старта (лок и taskkill)
 
 # Скрытый запуск служебных консольных подпроцессов (powershell/tasklist/taskkill/git/боты):
 # без флага каждый console-ребёнок создавал новое окно → «мигающие чёрные окна» (инцидент-каскад
@@ -149,8 +150,21 @@ def _find_userbot_pids():
         return []
 
 
-def _taskkill(pid):
-    """Жёстко снять внешний (ручной) процесс по PID. PID — наш int из _find_userbot_pids."""
+def _taskkill(pid, seen_at):
+    """Жёстко снять внешний (ручной) процесс по PID — ТОЛЬКО ПОСЛЕ ОПОЗНАНИЯ.
+
+    `seen_at` обязателен (позиционный, без значения по умолчанию) СОЗНАТЕЛЬНО: это момент, когда
+    мы этот номер ВИДЕЛИ в CIM-поиске по имени скрипта. Между поиском и ударом лежит окно —
+    секунды в `stop()`, до 20 с в цикле добивания `_wait_until_clear`. Умри владелец в этом окне
+    — Windows отдаёт номер следующему, и удар достаётся ЧУЖОМУ живому процессу. Тот же класс,
+    что и «лок с чужим номером», только цена выше: там мы себя не пускаем, здесь мы бьём соседа.
+
+    Опознаём общим правилом полосы (`proc_identity.kill_ok`): образ обязан быть python, а
+    рождение — не позже момента наблюдения. Не опознали — НЕ БЬЁМ и говорим об этом вслух."""
+    ok, why = proc_identity.kill_ok(pid, seen_at)
+    if not ok:
+        alog.warning(f"taskkill {pid} ОТМЕНЁН — процесс не опознан как наш: {why}")
+        return False
     try:
         r = subprocess.run(
             ["taskkill", "/PID", str(pid), "/F", "/T"],
@@ -200,10 +214,11 @@ class UserbotProcess:
         #    оставляем один, лишние убиваем. (singleton-гард в userbot_listen.py
         #    обычно сам отсеет дубль, это второй рубеж.)
         time.sleep(2.5)
+        seen_at = time.time()               # момент НАБЛЮДЕНИЯ номеров — им и опознаём перед ударом
         pids = _find_userbot_pids()
         if len(pids) > 1:
             keep = self.proc.pid if self.proc.pid in pids else pids[0]
-            killed = [pid for pid in pids if pid != keep and _taskkill(pid)]
+            killed = [pid for pid in pids if pid != keep and _taskkill(pid, seen_at)]
             alog.warning(f"обнаружен дубль userbot {pids}, оставил PID {keep}, убил {killed}")
             return (
                 f"обнаружил дубль, оставил PID {keep}"
@@ -218,11 +233,12 @@ class UserbotProcess:
         """Дождаться, пока НИ ОДНОГО userbot_listen не останется (добивая по пути). True — чисто."""
         start_t = time.monotonic()
         while time.monotonic() - start_t < timeout:
-            pids = _find_userbot_pids()
+            seen_at = time.time()           # свежий момент наблюдения НА КАЖДЫЙ виток добивания:
+            pids = _find_userbot_pids()     # цикл живёт до 20 с, и старая метка тут врала бы
             if not pids:
                 return True
             for pid in pids:
-                _taskkill(pid)
+                _taskkill(pid, seen_at)
             time.sleep(0.7)
         return not _find_userbot_pids()
 
@@ -243,8 +259,9 @@ class UserbotProcess:
             stopped.append(pid)
             self.proc = None
         # 2) добиваем внешние (ручные) экземпляры, если остались
+        seen_at = time.time()
         for pid in _find_userbot_pids():
-            if _taskkill(pid):
+            if _taskkill(pid, seen_at):
                 stopped.append(pid)
         if stopped:
             alog.info(f"userbot остановлен, PID {stopped}")
@@ -345,8 +362,9 @@ class ModerbotProcess:
                 self.proc.kill()
             stopped.append(pid)
             self.proc = None
+        seen_at = time.time()
         for pid in _find_moderbot_pids():
-            if _taskkill(pid):
+            if _taskkill(pid, seen_at):
                 stopped.append(pid)
         if stopped:
             alog.info(f"moderation_bot остановлен, PID {stopped}")
@@ -787,59 +805,43 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # токене → Telegram отдаёт "Conflict: terminated by other getUpdates" + путаница
 # в управлении. Lock-файл pc_agent.lock с PID, атомарный O_CREAT|O_EXCL.
 
-def _agent_pid_alive(pid: int) -> bool:
-    """Жив ли процесс по PID (Windows, без psutil). НЕ os.kill (он бы убил процесс)."""
-    try:
-        out = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=10, creationflags=NO_WINDOW,
-        )
-        return f'"{pid}"' in out.stdout or f",{pid}," in out.stdout
-    except Exception:
-        return False
-
-
 def _read_agent_lock_pid() -> int:
-    try:
-        return int(AGENT_LOCK.read_text(encoding="utf-8").strip() or "0")
-    except Exception:
-        return 0
+    """Номер из лока — ПЕРВОЙ строкой (во второй, у лока нового формата, лежит личность)."""
+    rec = proc_identity.read_lock(str(AGENT_LOCK))
+    return int(rec["pid"]) if rec else 0
 
 
 def acquire_agent_lock() -> bool:
-    """True — лок наш, работаем; False — другой агент уже жив, выходим."""
-    for _ in range(3):
-        try:
-            fd = os.open(str(AGENT_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            try:
-                os.write(fd, str(os.getpid()).encode("utf-8"))
-            finally:
-                os.close(fd)
-            return True
-        except FileExistsError:
-            old = _read_agent_lock_pid()
-            if old == 0:
-                time.sleep(0.3)
-                old = _read_agent_lock_pid()
-            if old and _agent_pid_alive(old):
-                alog.warning(f"pc_agent уже запущен (PID {old}) — выхожу, второй экземпляр не поднимаю.")
-                return False
-            alog.info(f"устаревший pc_agent.lock (PID {old or '?'} мёртв) — забираю лок.")
-            try:
-                AGENT_LOCK.unlink()
-            except FileNotFoundError:
-                pass
-    alog.warning("не смог получить pc_agent.lock — НЕ стартую (защита от двойного агента).")
+    """True — лок наш, работаем; False — другой агент уже жив, выходим.
+
+    ЖИВОЙ СЛУЧАЙ, РАДИ КОТОРОГО ЭТО ПЕРЕПИСАНО (23.08.2026). BSOD 0x7F в 05:14 —
+    `release_agent_lock()` не позвался, в локе остался номер 8960. После загрузки 8960 достался
+    `wlanext.exe`, а прежняя проба спрашивала у `tasklist` ровно одно: «есть ли процесс с таким
+    номером». Есть. Агент выходил с «pc_agent уже запущен (PID 8960)» НАВСЕГДА, полоса стояла
+    без агента 05:14 → 06:16, а контур-вотчдог честно рапортовал «подъём ok, процесса нет» и
+    через три попытки вставал в стоп. Класс был назван в тот же день; правки не случилось, и
+    через три дня он повторился на модерботе ценой 3 суток 15 часов простоя.
+
+    Теперь личность владельца — номер + имя запуска + момент старта (`proc_identity`), стухший
+    лок программа опознаёт и снимает САМА (файл уезжает уликой в `tmp/stale_locks/`), а молчание
+    пробы больше не читается как «мёртв»: прежний `_agent_pid_alive` глотал свой отказ в False
+    и уводил в кражу лока — то есть в двойного агента, от которого гард и стои́т."""
+    ok, verdict, why = proc_identity.acquire(
+        str(AGENT_LOCK), script=os.path.basename(__file__),
+        log=lambda m: alog.info(f"pc_agent.lock: {m}"))
+    if ok:
+        return True
+    if verdict == proc_identity.OURS_ALIVE:
+        alog.warning(f"pc_agent уже запущен — выхожу, второй экземпляр не поднимаю. {why}")
+    else:
+        alog.warning(f"НЕ стартую [{verdict}] (защита от двойного агента): {why}")
     return False
 
 
 def release_agent_lock() -> None:
+    """Снять лок, только если он наш — по номеру И моменту старта."""
     try:
-        if _read_agent_lock_pid() == os.getpid():
-            AGENT_LOCK.unlink()
-    except FileNotFoundError:
-        pass
+        proc_identity.release(str(AGENT_LOCK))
     except Exception as e:
         alog.warning(f"не смог снять pc_agent.lock: {e}")
 

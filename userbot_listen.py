@@ -29,7 +29,6 @@ import os
 import time
 import asyncio
 import logging
-import subprocess
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -44,6 +43,7 @@ import suggest  # noqa: E402
 import trainer  # noqa: E402  ГРУППА-ТРЕНАЖЁР (изолированный путь; боевой поток не задет)
 import trainer_log  # noqa: E402  ЛОГ ТРЕНАЖЁРА в мозг (KB_trainer_log; fail-safe, ничего не блокирует)
 import booking_draft  # noqa: E402  (текст-команда «до crm» в тренажёре — мост 2.1, read-only)
+import proc_identity  # noqa: E402  ЛИЧНОСТЬ ПРОЦЕССА: номер + имя запуска + момент старта
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -83,74 +83,46 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _pid_alive(pid: int) -> bool:
-    """Жив ли процесс с данным PID (Windows, без psutil).
-
-    НЕ используем os.kill(pid, 0): на Windows это ВЫЗЫВАЕТ TerminateProcess —
-    то есть убило бы процесс. Спрашиваем tasklist (фиксированный запрос).
-    """
-    try:
-        out = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-            capture_output=True, text=True, timeout=10,
-        )
-        return f'"{pid}"' in out.stdout or f",{pid}," in out.stdout
-    except Exception:
-        # Не смогли проверить — считаем мёртвым, чтобы не заклинить legit-старт.
-        return False
-
-
 def _read_lock_pid() -> int:
-    try:
-        with open(LOCK_FILE, encoding="utf-8") as f:
-            return int(f.read().strip() or "0")
-    except Exception:
-        return 0
+    """Номер из лока — ПЕРВОЙ строкой (в локе нового формата второй строкой идёт личность).
+    Оставлен ради читающих снаружи: сам гард судит не по номеру, а по личности."""
+    rec = proc_identity.read_lock(LOCK_FILE)
+    return int(rec["pid"]) if rec else 0
 
 
 def acquire_lock() -> bool:
     """Гарантия одного экземпляра. True — лок наш, работаем; False — уже кто-то живой.
 
-    Создаём lock атомарно (O_CREAT|O_EXCL). Если файл уже есть — проверяем, жив ли
-    владелец по PID: жив → выходим (второй экземпляр не поднимаем), мёртв → снимаем
-    устаревший лок и пробуем снова.
-    """
-    for _ in range(3):
-        try:
-            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            try:
-                os.write(fd, str(os.getpid()).encode("utf-8"))
-            finally:
-                os.close(fd)
-            return True
-        except FileExistsError:
-            old = _read_lock_pid()
-            if old == 0:
-                # Владелец, возможно, ещё дописывает PID — подождём и перечитаем.
-                time.sleep(0.3)
-                old = _read_lock_pid()
-            if old and _pid_alive(old):
-                log.info(
-                    f"{_now()} | userbot уже запущен (PID {old}), выхожу — "
-                    f"второй экземпляр на session не поднимаю."
-                )
-                return False
-            log.info(f"{_now()} | устаревший userbot.lock (PID {old or '?'} мёртв) — забираю лок.")
-            try:
-                os.remove(LOCK_FILE)
-            except FileNotFoundError:
-                pass
-    log.warning(f"{_now()} | не смог получить lock — на всякий случай НЕ стартую (защита от дубля).")
+    30.08.2026 — ГАРД УСИЛЕН, А НЕ СНЯТ. Прежде владелец опознавался ОДНИМ номером через
+    `tasklist`, а номер уникален только среди живых: после ребута он достаётся чужому процессу,
+    и гард держит старт НАВСЕГДА (живой случай модербота 26–30.08, простой 3 суток 15 часов;
+    до него — агент полосы 23.08 после BSOD, номер 8960 = `wlanext.exe`). Теперь личность —
+    номер + имя запуска + момент старта, общим правилом полосы (`proc_identity`).
+
+    ВТОРАЯ ПРАВКА, И ОНА ВАЖНЕЕ ПЕРВОЙ ДЛЯ ЭТОГО ФАЙЛА: прежняя проба глотала свой отказ в
+    False с доводом «чтобы не заклинить legit-старт» — то есть таймаут `tasklist` на
+    просыпающемся ПК читался как «владелец мёртв», лок забирался и поднимался ВТОРОЙ клиент на
+    одной session. Цена этой ошибки здесь названа в шапке файла: «двойной клиент = риск бана»,
+    и она несопоставима с ценой лишних 15 минут ожидания следующего тика сторожа. Поэтому
+    молчание пробы больше не даёт старта."""
+    ok, verdict, why = proc_identity.acquire(
+        LOCK_FILE, script=os.path.basename(__file__),
+        log=lambda m: log.info(f"{_now()} | userbot.lock: {m}"))
+    if ok:
+        return True
+    if verdict == proc_identity.OURS_ALIVE:
+        log.info(f"{_now()} | userbot уже запущен, выхожу — второй экземпляр на session "
+                 f"не поднимаю. {why}")
+    else:
+        log.warning(f"{_now()} | НЕ стартую [{verdict}]: {why}")
     return False
 
 
 def release_lock() -> None:
-    """Снять lock — только если он наш (наш PID внутри)."""
+    """Снять lock — только если он наш, по номеру И моменту старта (голого номера мало: после
+    рестарта его может носить чужой процесс, и мы сняли бы ЧУЖОЙ живой лок)."""
     try:
-        if _read_lock_pid() == os.getpid():
-            os.remove(LOCK_FILE)
-    except FileNotFoundError:
-        pass
+        proc_identity.release(LOCK_FILE)
     except Exception as e:
         log.warning(f"{_now()} | не смог снять lock-файл: {e}")
 

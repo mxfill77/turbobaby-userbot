@@ -285,8 +285,13 @@ def _read_lock(out, lock_path, whose):
         with open(lock_path, encoding="utf-8") as f:
             raw = f.read().strip()
         out["lock_mtime"] = os.stat(lock_path).st_mtime
-        out["pid"] = int(raw)
-    except (OSError, ValueError) as e:
+        # НОМЕР — ПЕРВОЙ СТРОКОЙ. С 30.08.2026 синглтоны полосы кладут в лок ещё и личность
+        # владельца (имя запуска и момент старта) — второй строкой, JSON'ом. Наблюдателю она не
+        # нужна: авторство он и так сверяет ДВУМЯ приметами (`kid_writer`) и был здесь образцом.
+        # Но `int()` по ВСЕМУ файлу на таком локе бросил бы ValueError, и О3 ослеп бы молча —
+        # поэтому берём ровно первую строку, ради чего первая строка голым номером и оставлена.
+        out["pid"] = int(raw.splitlines()[0].strip())
+    except (OSError, ValueError, IndexError) as e:   # IndexError — пустой лок: строк ноль
         out["err"] = ("%s; " % out["err"] if out["err"] else "") + \
                      "лок %s не прочитан: %s" % (whose, str(e)[:60])
         return out

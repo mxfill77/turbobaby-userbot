@@ -3144,7 +3144,7 @@ class TestSingletonLock(unittest.TestCase):
 
     def test_acquire_free(self):
         self.assertTrue(o.acquire_singleton(lock_path=self.lock, pid_alive=lambda p: False))
-        self.assertEqual(Path(self.lock).read_text().strip(), str(os.getpid()))
+        self.assertEqual(Path(self.lock).read_text().splitlines()[0].strip(), str(os.getpid()))  # номер — ПЕРВОЙ строкой: во второй личность запуска
 
     def test_live_other_refused(self):
         with open(self.lock, "w") as f:
@@ -3155,7 +3155,7 @@ class TestSingletonLock(unittest.TestCase):
         with open(self.lock, "w") as f:
             f.write("99999")
         self.assertTrue(o.acquire_singleton(lock_path=self.lock, pid_alive=lambda p: False))
-        self.assertEqual(Path(self.lock).read_text().strip(), str(os.getpid()))
+        self.assertEqual(Path(self.lock).read_text().splitlines()[0].strip(), str(os.getpid()))  # номер — ПЕРВОЙ строкой: во второй личность запуска
 
     def test_supersede_waits_then_takes(self):
         os.environ[o.SUPERSEDE_ENV] = "77777"
@@ -3168,7 +3168,7 @@ class TestSingletonLock(unittest.TestCase):
             return seq["n"] < 2
         ok = o.acquire_singleton(lock_path=self.lock, pid_alive=alive, supersede_wait=5, sleep=0)
         self.assertTrue(ok)
-        self.assertEqual(Path(self.lock).read_text().strip(), str(os.getpid()))
+        self.assertEqual(Path(self.lock).read_text().splitlines()[0].strip(), str(os.getpid()))  # номер — ПЕРВОЙ строкой: во второй личность запуска
 
     def test_release_only_own(self):
         with open(self.lock, "w") as f:
