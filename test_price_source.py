@@ -239,11 +239,16 @@ class TestModelResolution(FlagBase):
 
     def test_client_speech_shorthand_resolves_by_family(self):
         doc = price_source.load()
-        for short, want in (("NMAX", "NMAX 155"), ("XMAX", "XMAX 300"), ("ADV", "ADV 350"),
+        for short, want in (("NMAX", "NMAX 155"), ("ADV", "ADV 350"),
                             ("XADV", "XADV 750"), ("NINJA", "NINJA 400"), ("XSR", "XSR 155")):
             row, how = price_source.resolve_row(doc, short, suggest._bike_key)
             self.assertIsNotNone(row, "%s → %s" % (short, how))
             self.assertEqual(row["model"], want, short)
+        # После разведения поколений голое XMAX неоднозначно и не угадывается. Живой путь передаёт
+        # имя прокотированного юнита и проверяется соседним test_live_unit_name_wins_over_shorthand.
+        row, how = price_source.resolve_row(doc, "XMAX", suggest._bike_key)
+        self.assertIsNone(row)
+        self.assertIn("не угадываем", how)
 
     def test_ambiguous_shorthand_is_not_guessed(self):
         doc = price_source.load()
@@ -327,12 +332,12 @@ class TestNegative(FlagBase):
                                         "NMAX 155", "2026-01-29", "2026-02-05", suggest._bike_key))
 
     def test_model_not_judged_kills_the_price(self):
-        # CLICK 125 и FORZA 300 — «НЕ СУДИМО» (n=2 при пороге 3). Молчание, а не выдумка.
+        # CLICK 125 и FORZA 300 получили опубликованные базы из листа 30.08. Неизвестная модель
+        # по-прежнему обязана гасить цену целиком: молчание, а не выдумка.
         self.on()
         # Юнит в котировке — ТОТ ЖЕ, что запрошен: живая дверь квотирует конкретный байк
         # и называет его, котировки «NMAX под именем CLICK» в проде не бывает.
-        for model, unit in (("CLICK 125", "HONDA CLICK 125"), ("FORZA 300", "HONDA FORZA 300"),
-                            ("SUZUKI НЕТ ТАКОЙ", "SUZUKI НЕТ ТАКОЙ 1")):
+        for model, unit in (("SUZUKI НЕТ ТАКОЙ", "SUZUKI НЕТ ТАКОЙ 1"),):
             self._dead(price_source.reprice({"status": "ok", "quote": live_quote(bike=unit)},
                                             model, "2026-01-29", "2026-02-05", suggest._bike_key))
 

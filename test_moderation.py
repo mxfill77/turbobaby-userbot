@@ -342,9 +342,10 @@ class TestEndToEndMax2stix(unittest.TestCase):
             out = suggest.regenerate_draft(draft.get("transcript"), draft.get("lang", "ru"), faq,
                                            draft.get("first_contact", False), note, directive,
                                            call_llm=_llm_capture)
-            g = suggest.guard_availability(out, avail=self._getter()({"action": "quote_price",
-                                           "bike": "XMAX 300", "date_start": "2026-07-16",
-                                           "date_end": "2026-07-24"}), model="XMAX 300")
+            # Повторяем production-проводку moderation_core._default_regen: лицензия наличия
+            # читается из ценовой записки, куда её добавляет код после подтверждённой котировки.
+            g = suggest.guard_availability(
+                out, avail=suggest.availability_from_note(note), model="XMAX 300")
             self.assertIn(g["source"], ("clean", "draft"), g)   # чистый черновик — гард не сфолбэчил
             return g["text"]
         return regen
@@ -352,10 +353,10 @@ class TestEndToEndMax2stix(unittest.TestCase):
     def _assert_compliant(self, out, ctx=""):
         low = suggest.client_facing_text(out).lower()
         # (1) цена И депозит ЗА КАЖДЫЙ юнит доехали клиенту КОДОМ (LLM их потерял). БЕЗ запроса про
-        # поколение — ТОЛЬКО актуальное (New Gen 939/7000); прежнее поколение (790/5000) не предлагаем.
-        for num in ("939", "7000"):
+        # поколение — ТОЛЬКО актуальное (New Gen 662/7000); прежнее поколение (557/5000) не предлагаем.
+        for num in ("662", "7000"):
             self.assertIn(num, out, f"{ctx}: нет цены/депозита {num} за каждый юнит:\n{out}")
-        for old_num in ("790", "5000"):
+        for old_num in ("557", "5000"):
             self.assertNotIn(old_num, out, f"{ctx}: прежнее поколение {old_num} утекло без запроса:\n{out}")
         self.assertIn("ЗА КАЖДЫЙ", out, f"{ctx}: пометка «за каждый» потеряна:\n{out}")
         self.assertIn("New Gen", out, f"{ctx}: поколение помечено не New Gen:\n{out}")
@@ -420,6 +421,24 @@ class TestEndToEndMax2stix(unittest.TestCase):
         self.assertIn(d1, r2["directive"]); self.assertIn(d2, r2["directive"])
         # финал второй перегенерации по-прежнему compliant
         self._assert_compliant(r2["final_text"], "e2e (2)")
+
+    def test_pair_xmax_missing_code_availability_license_falls_back(self):
+        """Без фразы-лицензии в ценовой записке утверждение наличия остаётся fail-closed."""
+        note = self._pricing_note("пару скутеров xmax 16-24 июля")
+        phrase = suggest._AVAIL_CODE_PHRASE
+        self.assertIn(phrase, note)
+        note_without_license = note.replace(phrase, "")
+        self.assertIsNone(suggest.availability_from_note(note_without_license))
+
+        guarded = suggest.guard_availability(
+            f"XMAX 300 New Gen — 662 ฿/день; {phrase}.",
+            avail=suggest.availability_from_note(note_without_license),
+            model="XMAX 300",
+            max_retries=0,
+        )
+        self.assertEqual(guarded["source"], "fallback", guarded)
+        self.assertIn("Уточню наличие XMAX 300", guarded["text"])
+        self.assertNotIn(phrase, guarded["text"])
 
 
 class TestRememberRule(unittest.TestCase):

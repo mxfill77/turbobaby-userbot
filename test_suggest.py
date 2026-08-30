@@ -4561,7 +4561,7 @@ class TestPriceSheetRuleSource(unittest.TestCase):
         "NMAX 155": (390, 2730, 9000, 5000, True, 8500),
         "ADV 350": (749, 4928, 14606, 7000, True, 10900),
         "CB 300R": (757, 4716, 12491, 15000, True, 9900),
-        "FORZA 300": (487, 3408, 12000, 5000, True, 9900),   # правило её НЕ СУДИТ (judged=false)
+        "FORZA 300": (487, 3408, 12000, 5000, True, 9900),   # база опубликована 30.08 из листа
     }
     FLEET_NAMES = ["NMAX 155CC BLACK PHUKET 4255", "ADV 350CC BLACK PHUKET 5849",
                    "CB 300CC R 9011", "FORZA 300CC WHITE PHUKET 7788"]
@@ -4696,14 +4696,15 @@ class TestPriceSheetRuleSource(unittest.TestCase):
         rows, _sk = suggest.price_sheet_status("2026-09-05", _gate=self.NO_GATE)
         self.assertEqual(rows, [])
 
-    # ---- модель, которую правило не судит ------------------------------------------------------
-    def test_unjudged_model_leaves_the_sheet_entirely(self):
-        """FORZA 300 правилом НЕ СУДИТСЯ → её нет в сетке вовсе, а причина названа словом."""
+    # ---- новая опубликованная база дошла до сетки -----------------------------------------------
+    def test_newly_judged_forza_enters_the_sheet(self):
+        """FORZA 300 после публикации базы 30.08 присутствует в сетке и не помечена norule."""
         rows, skipped = self._rows("2026-09-05")
-        self.assertNotIn("FORZA 300", [r["model"] for r in rows])
-        self.assertIn({"model": "FORZA 300", "reason": suggest._SHEET_NORULE}, skipped)
-        # Прочие модели при этом на месте: одна несудимая не гасит список.
-        self.assertEqual(sorted(r["model"] for r in rows), ["ADV 350", "CB 300R", "NMAX 155"])
+        self.assertIn("FORZA 300", [r["model"] for r in rows])
+        self.assertNotIn({"model": "FORZA 300", "reason": suggest._SHEET_NORULE}, skipped)
+        self.assertIsNotNone(self._by_model(rows)["FORZA 300"]["cells"]["week"])
+        self.assertEqual(sorted(r["model"] for r in rows),
+                         ["ADV 350", "CB 300R", "FORZA 300", "NMAX 155"])
 
     def test_deposit_and_availability_stay_the_word_of_the_live_door(self):
         """Депозит и занятость правило не подменяет — они остаются словом живой двери."""
