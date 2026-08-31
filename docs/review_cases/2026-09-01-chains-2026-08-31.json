@@ -1,0 +1,133 @@
+{
+  "kind": "digest",
+  "case_id": "chains-2026-08-31",
+  "task_class": "code_green",
+  "subject_date": "2026-08-31",
+  "build_date": "2026-09-01",
+  "active_objective": "Получить второе мнение по суточному дайджесту закрытых цепочек ПК за 31.08.2026: что из сделанного упрощаемо, что не стоило делать вовсе, где переусложнено.",
+  "summary": [
+    "Пакет-образец собран: суточный дайджест закрытых цепочек полосы ПК за 31.08.2026.",
+    "В дайджест вошли ЧЕТЫРЕ цепочки с операционным изменением: b1.2 (сборщик снимка цен, только чтение), b1.2a (согласованность метаданных кандидата), c0 (починка ценового советника, fixture-only), h1 (сборщик HQ context pack).",
+    "Пятая закрытая цепочка дня (s1, локализация ключа провайдера в suggest) в пакет ВОЙТИ НЕ МОЖЕТ: её расписка лежит по пути со словом secret, а сборщик контекста запрещает такие имена по сегменту пути. См. раздел ИСКЛЮЧЕНО — это не пропуск, а названное ограничение.",
+    "Все статусы ниже — ЗАЯВЛЕННЫЕ исполнителями (reported_*), независимой приёмки ни одна из четырёх цепочек в пакете не имеет; c0 сам это оговаривает полем not_independently_verified.",
+    "Числа в пакете взяты не из пересказа, а из выдержек с построчными границами; у каждого числа стоит sha256 файла-источника и sha256 самой выдержки.",
+    "Наружу ничего не отправлено: ступень 1 контура — только сборка пакета в лоток docs/review_outbox."
+  ],
+  "result_packets": [
+    {
+      "task_id": "b1-2-live-read-dry-run",
+      "path": "docs/artifacts/2026-08-31-b1-2-result.json",
+      "reported_status": "reported_done"
+    },
+    {
+      "task_id": "b1-2a-candidate-metadata-coherence",
+      "path": "docs/artifacts/2026-08-31-b1-2a-result.json",
+      "reported_status": "reported_done"
+    },
+    {
+      "task_id": "c0-pricing-advisor-repair-2026-08-31",
+      "path": "docs/artifacts/2026-08-31-c0-pricing-advisor-result.json",
+      "reported_status": "reported_done"
+    },
+    {
+      "task_id": "h1-hq-context-pack-code-green",
+      "path": "docs/artifacts/2026-08-31-h1-hq-context-pack-result.json",
+      "reported_status": "reported_done"
+    }
+  ],
+  "numbers": [
+    {
+      "name": "b1.2 · тестов в целевом наборе",
+      "value": 37,
+      "source": "docs/artifacts/2026-08-31-b1-2-result.json"
+    },
+    {
+      "name": "b1.2 · тестов в широком прогоне",
+      "value": 955,
+      "source": "docs/artifacts/2026-08-31-b1-2-result.json"
+    },
+    {
+      "name": "b1.2 · красных в широком прогоне (известные, чужие)",
+      "value": 5,
+      "source": "docs/artifacts/2026-08-31-b1-2-result.json"
+    },
+    {
+      "name": "b1.2 · вызовов quote_price к мосту за прогон",
+      "value": 38,
+      "source": "docs/artifacts/2026-08-31-b1-2-result.json"
+    },
+    {
+      "name": "b1.2a · тестов после правки",
+      "value": 50,
+      "source": "docs/artifacts/2026-08-31-b1-2a-result.json"
+    },
+    {
+      "name": "b1.2a · тестов было до задачи",
+      "value": 37,
+      "source": "docs/artifacts/2026-08-31-b1-2a-result.json"
+    },
+    {
+      "name": "h1 · тестов в наборе сборщика контекста",
+      "value": 31,
+      "source": "docs/artifacts/2026-08-31-h1-hq-context-pack-result.json"
+    }
+  ],
+  "coverage_plan": ["pc", "hq"],
+  "route": {"target": "hq"},
+  "sources": [
+    {
+      "path": "docs/artifacts/2026-08-31-b1-2-result.json",
+      "role": "evidence",
+      "lane": "pc",
+      "evidence_status": "reported",
+      "required": true,
+      "start_line": 1,
+      "end_line": 34
+    },
+    {
+      "path": "docs/artifacts/2026-08-31-b1-2a-result.json",
+      "role": "evidence",
+      "lane": "pc",
+      "evidence_status": "reported",
+      "required": true,
+      "start_line": 1,
+      "end_line": 22
+    },
+    {
+      "path": "docs/artifacts/2026-08-31-c0-pricing-advisor-result.json",
+      "role": "evidence",
+      "lane": "pc",
+      "evidence_status": "reported",
+      "required": true,
+      "start_line": 1,
+      "end_line": 10
+    },
+    {
+      "path": "docs/artifacts/2026-08-31-h1-hq-context-pack-result.json",
+      "role": "evidence",
+      "lane": "pc",
+      "evidence_status": "reported",
+      "required": true,
+      "start_line": 1,
+      "end_line": 16
+    },
+    {
+      "path": "docs/tasks/h1-hq-context-pack-code-green.md",
+      "role": "constraint",
+      "lane": "hq",
+      "evidence_status": "reported",
+      "required": false,
+      "start_line": 1,
+      "end_line": 12
+    },
+    {
+      "path": "docs/artifacts/2026-08-31-s1-suggest-secret-containment-result.json",
+      "role": "reference",
+      "lane": "pc",
+      "evidence_status": "reported",
+      "required": false,
+      "start_line": 1,
+      "end_line": 6
+    }
+  ]
+}
