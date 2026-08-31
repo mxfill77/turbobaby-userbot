@@ -8912,6 +8912,27 @@ class TestSuggestCredentialContainment(unittest.TestCase):
         finally:
             suggest.ANTHROPIC_API_KEY = old_key
 
+    # ---- второе доказательство ТЗ S1 §3.4 (в коммите 768729b его не было) ----
+    # Первый тест класса сверяет ЗНАЧЕНИЕ в рантайме и потому проходит даже у кода вида
+    # `os.getenv(...) or "<литерал>"`: при заполненном окружении обе ветки дают одно и то же.
+    # Поэтому «литерала нет» и «источник только окружение» проверяем ПО ТЕКСТУ файла — это
+    # инвариант, а не разовый греп. Детектор собран из кусков (ТЗ S1 §3.5): непрерывного
+    # образца, похожего на секрет, в тексте самого теста не появляется.
+    _SECRET_RE = re.compile("s" + "k" + "-" + "[a-z]{2,6}" + "-" + r"[A-Za-z0-9_\-]{16,}")
+    _KEY_BIND_RE = re.compile(r"^ANTHROPIC_API_KEY\s*=.*$", re.M)
+
+    def _suggest_source(self):
+        with open(suggest.__file__, encoding="utf-8") as f:
+            return f.read()
+
+    def test_suggest_source_holds_no_secret_like_literal(self):
+        hits = self._SECRET_RE.findall(self._suggest_source())
+        self.assertEqual(hits, [], "в suggest.py появился литерал, похожий на секрет")
+
+    def test_key_binding_in_source_is_environment_only(self):
+        binds = self._KEY_BIND_RE.findall(self._suggest_source())
+        self.assertEqual(binds, ['ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()'])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
