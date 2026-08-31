@@ -598,6 +598,98 @@ class TestPulseChannelMutedInTestRun(unittest.TestCase):
         self.assertEqual(seen, [], "прогон тестов родил запись в ЖУРНАЛЕ ВЛАДЕЛЬЦА")
 
 
+class TestBridgeDoesNotLeakTestFlag(unittest.TestCase):
+    """ВТОРАЯ ПОЛОВИНА ЗАМКА 19.08.2026, которой не было 12 суток: боевая форма вызова НЕ метит
+    процесс тест-флагом, и канал журнала после неё НЕ заглушён.
+
+    Сосед выше проверяет «из-под тестов наружу не течёт» — и он зелен. Мёртвым же был обратный
+    склон: `_bridge()` ставил `TURBOBABY_TEST_LOGS=1` НАВСЕГДА (`setdefault`, возврата нет), а
+    боевой `run(getter=None)` зовёт его ПЕРВЫМ, до всякой публикации. К моменту `send_pulse`
+    наблюдатель выглядел тест-прогоном для `dispatch_notify._cowork` и получал глухой отказ без
+    спула. Двенадцать суток немоты, диагноз — `docs/artifacts/2026-09-01-pulse-silence-diagnosis.md`.
+
+    ПОЧЕМУ ПРЕДМЕТ — ОКРУЖЕНИЕ, А НЕ СПАВН ПИСАТЕЛЯ. Спавна отсюда не увидеть НИКОГДА и по
+    честной причине: мы сами исполняемся тест-раннером, и `log_setup._started_as_test_runner()`
+    глушит канал по `argv[0]` независимо от флага. Утверждать «в бою запись пойдёт» изнутри
+    прогона — это подгонять голден под удобство. Проверяем ровно ту переменную, которую портил
+    дефект: после боевой формы окружение НЕ содержит следа флага и САМО ПО СЕБЕ канал не глушит
+    (`is_test_context` с явным env, минуя признак способа запуска).
+
+    Демон подменён: живой импорт `pc_orchestrator` в юните — это чужой боевой лог, боевые
+    секреты и сеть к мосту. Подмена стои́т на `_daemon`, то есть цепочка `run → queue_facts →
+    _bridge → _guard_test_logs` проходится ЦЕЛИКОМ и настоящая."""
+
+    def setUp(self):
+        import log_setup                                              # noqa: PLC0415
+        self.log_setup = log_setup
+        self.dir = tempfile.mkdtemp(prefix="expect_pc_leak_")
+        os.environ["CC_EXPECT_PC_DIR"] = self.dir
+        self.addCleanup(os.environ.pop, "CC_EXPECT_PC_DIR", None)
+        # Флаг мог быть выставлен раннером-соседом по гейту (`test_brain_writer` ставит его на
+        # импорте модуля). Снимаем на время класса и возвращаем КАК БЫЛО: иначе предмет проверки
+        # зависел бы от порядка файлов в прогоне.
+        key = "TURBOBABY_TEST_LOGS"
+        had, prev = key in os.environ, os.environ.get(key)
+        self.addCleanup(lambda: os.environ.__setitem__(key, prev) if had
+                        else os.environ.pop(key, None))
+        os.environ.pop(key, None)
+        for name in ("heartbeat_facts", "busy_facts", "_daemon"):
+            self.addCleanup(setattr, run_mod, name, getattr(run_mod, name))
+        run_mod.busy_facts = lambda path=None: {"ok": True, "since": None,
+                                                "limit": ex.TASK_TIMEOUT_SEC, "err": ""}
+        run_mod.heartbeat_facts = lambda path=None: {"ok": True, "raw": hb_at(60), "err": ""}
+        self.pulsed = []
+        self.addCleanup(setattr, run_mod, "send_pulse", run_mod.send_pulse)
+        run_mod.send_pulse = lambda line: (self.pulsed.append(line), True)[1]
+
+    def _fake_daemon(self):
+        """Демон-подмена, ЗАПОМИНАЮЩАЯ значение флага на момент импорта. Без этой отметки тест
+        зеленел бы и от «флаг не ставится вовсе» — а он обязан стоять на импорте."""
+        self.seen_flag = os.environ.get("TURBOBABY_TEST_LOGS")
+
+        class _BC:
+            get_pending = staticmethod(lambda status: {"ok": True, "items": []})
+        return type("D", (), {"bc": _BC})
+
+    def test_live_form_leaves_no_test_flag_behind(self):
+        run_mod._daemon = self._fake_daemon
+        out = run_mod.run(now=NOW, getter=None, notifier=lambda t: True)
+
+        self.assertEqual(self.seen_flag, "1", "импорт демона пошёл БЕЗ увода логов в temp")
+        # ПРЕДМЕТ — ЗНАЧЕНИЕ КЛЮЧА, А НЕ ЧЛЕНСТВО В `os.environ`. Разница не стилистическая:
+        # `assertNotIn(key, os.environ)` печатает при провале ВЕСЬ словарь окружения, а в нём
+        # живут боевые токены моста и трёх ботов. Замок, чей отказ вываливает секреты в лог
+        # гейта, дороже дефекта, который он ловит (свод §6: токены называть, а не цитировать).
+        self.assertIsNone(os.environ.get("TURBOBABY_TEST_LOGS"),
+                          "боевая форма пометила процесс тест-флагом — пульс снова глохнет на себе")
+        # СВОЁ отделено от ЧУЖОГО: `TESTING`/`PYTEST_CURRENT_TEST` заявляет о себе САМ прогон
+        # (`test_isolation`, соседи по гейту), и оставь мы их в снимке — замок был бы вечно красен
+        # по причине, к дефекту не относящейся. Предмет здесь ровно один: не глушит ли журнал ТО,
+        # что оставил после себя наблюдатель. Явный env к тому же минует признак способа запуска.
+        left = {k: v for k, v in os.environ.items()
+                if k not in ("TESTING", "PYTEST_CURRENT_TEST")}
+        self.assertFalse(self.log_setup.is_test_context(left),
+                         "окружение после боевой формы САМО глушит журнал владельца")
+        # НЕ ВАКУУМ: ветка публикации обязана быть ЗАДЕТА, иначе замок сторожит пустоту.
+        self.assertEqual(out["kids_pulse"], "ушла")
+
+    def test_flag_returns_even_if_the_import_explodes(self):
+        """Падение импорта не смеет оставить флаг стоять: иначе один сбой демона глушит пульс
+        до конца жизни процесса — ровно та же немота, только с другого входа."""
+        def boom():
+            raise ImportError("демон не импортировался")
+        with self.assertRaises(ImportError):
+            run_mod._guard_test_logs(boom)
+        self.assertIsNone(os.environ.get("TURBOBABY_TEST_LOGS"))   # значение, а не членство
+
+    def test_flag_value_that_was_there_is_returned_as_it_was(self):
+        """Возврат КАК БЫЛО, а не удаление: заявленный вызывающим флаг — его решение, и стирать
+        чужое заявление мы не вправе."""
+        os.environ["TURBOBABY_TEST_LOGS"] = "0"
+        inside = run_mod._guard_test_logs(lambda: os.environ.get("TURBOBABY_TEST_LOGS"))
+        self.assertEqual((inside, os.environ.get("TURBOBABY_TEST_LOGS")), ("1", "0"))
+
+
 class TestLiveFormat(unittest.TestCase):
     """Формат фактов снят с прода, а не идеализирован."""
 
