@@ -5497,6 +5497,11 @@ def default_llm_caller():
 
 
 def _default_llm(system: str, user: str) -> str:
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not configured; set it in the process environment "
+            "or enable SUGGEST_LLM_VIA_CLI=1."
+        )
     import anthropic
     c = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     resp = c.messages.create(

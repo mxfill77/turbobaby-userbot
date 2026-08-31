@@ -8896,5 +8896,22 @@ class TestGuardExperienceMention(unittest.TestCase):
             self.assertEqual(suggest._append_to_client_body(draft, "фраза"), draft)
 
 
+class TestSuggestCredentialContainment(unittest.TestCase):
+    def test_anthropic_key_is_read_only_from_environment(self):
+        self.assertEqual(
+            suggest.ANTHROPIC_API_KEY,
+            os.getenv("ANTHROPIC_API_KEY", "").strip(),
+        )
+
+    def test_api_path_fails_before_provider_import_when_key_missing(self):
+        old_key = suggest.ANTHROPIC_API_KEY
+        try:
+            suggest.ANTHROPIC_API_KEY = ""
+            with self.assertRaisesRegex(RuntimeError, "ANTHROPIC_API_KEY is not configured"):
+                suggest._default_llm("system", "user")
+        finally:
+            suggest.ANTHROPIC_API_KEY = old_key
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
