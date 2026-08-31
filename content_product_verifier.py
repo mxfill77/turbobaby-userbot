@@ -4,6 +4,11 @@ This module intentionally has no CLI and no integration point.  It consumes one
 explicit, bounded evidence bundle and returns a deterministic three-state
 verdict.  It never executes candidate code or tests, and never discovers files
 outside the manifest supplied by the caller.
+
+Freshness is proven by identity, never by time: ``PROVEN`` requires the evidence
+itself to name the run being verified (``V0_RUN_BINDING``).  No clock, mtime or
+"looks recent" reasoning exists here, because an artifact left by an earlier run
+is as recent as the file system says and still proves nothing about this one.
 """
 
 from __future__ import annotations
@@ -38,6 +43,13 @@ ALLOWED_GATE_TYPES = (
     "text_absent",
     "python_import_allowlist",
 )
+RUN_ID_FIELD = "run_id"
+# A run identity is a bounded token, long enough not to match by accident and
+# compared whole: "job-1" must never bind evidence that names "job-12".
+_RUN_ID_BODY = r"[0-9A-Za-z][0-9A-Za-z_.-]{3,%d}" % (MAX_IDENTIFIER_CHARS - 1)
+_RUN_ID_RE = re.compile(_RUN_ID_BODY)
+_RUN_DECLARATION_RE = re.compile(
+    r"(?<![0-9A-Za-z_])[\"']?%s[\"']?\s*[:=]\s*[\"']?(%s)" % (RUN_ID_FIELD, _RUN_ID_BODY))
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _SENSITIVE_RE = re.compile(
@@ -330,6 +342,30 @@ def _task_gate_specs(task):
         raise VerificationInputError("invalid_task_content_gates") from exc
 
 
+def _valid_run_id(value):
+    return isinstance(value, str) and bool(_RUN_ID_RE.fullmatch(value))
+
+
+def _task_run_id(task):
+    """The task, not the executor bundle, names which run is being proven."""
+    value = _parse_json(task).get(RUN_ID_FIELD)
+    if not _valid_run_id(value):
+        raise VerificationInputError("task_run_id_missing")
+    return value
+
+
+def _declared_run_ids(evidence):
+    """Run ids the artifact itself carries.  File times are never consulted."""
+    if evidence["content_type"] == "json":
+        try:
+            body = _parse_json(evidence)
+        except VerificationInputError:
+            return []
+        exists, actual = _nested_field(body, RUN_ID_FIELD)
+        return [actual] if exists and _valid_run_id(actual) else []
+    return _RUN_DECLARATION_RE.findall(evidence["text"])
+
+
 def _stdout_evidence(root, spec):
     """Read and parse the saved test receipt; bundle claims are not evidence."""
     if not isinstance(spec, dict):
@@ -475,6 +511,34 @@ def verify_case(bundle):
         return _output(case_id, UNKNOWN, "missing_test_stdout", reported_claim, gates + [_gate("V0_TEST_EVIDENCE", "UNKNOWN", "missing_test_stdout")], [{"reason_code": "missing_test_stdout", "evidence_ref": ""}], (), refs)
     except VerificationInputError as exc:
         return _output(case_id, UNKNOWN, str(exc), reported_claim, gates + [_gate("V0_TEST_EVIDENCE", "UNKNOWN", str(exc))], [{"reason_code": str(exc), "evidence_ref": ""}], (), refs)
+
+    # Freshness: every required artifact must name THIS run.  A product left by
+    # an earlier run passes every gate above — it is whole, parsable and says
+    # "green" — so without this the verdict answers "is the address occupied?"
+    # instead of "did this run produce it?".
+    try:
+        run_id = _task_run_id(task)
+        declared = bundle.get("run_id")
+        if not _valid_run_id(declared):
+            raise VerificationInputError("bundle_run_id_missing")
+        if declared != run_id:
+            return _output(case_id, DISPROVEN, "run_binding_mismatch", reported_claim, gates + [_gate("V0_RUN_BINDING", "FAIL", "run_binding_mismatch", (task["path"],))], (), (), refs)
+        stale, unbound = [], []
+        for artifact_id in sorted(artifacts):
+            carried = _declared_run_ids(artifacts[artifact_id])
+            if run_id in carried:
+                continue
+            # Naming another run is a contradiction; naming none is ignorance.
+            (stale if carried else unbound).append(artifact_id)
+        if stale:
+            return _output(case_id, DISPROVEN, "stale_run_evidence", reported_claim, gates + [_gate("V0_RUN_BINDING", "FAIL", "stale_run_evidence", stale)], (), (), refs)
+        if unbound or not artifacts:
+            reason = "unbound_run_evidence" if unbound else "no_run_bound_evidence"
+            return _output(case_id, UNKNOWN, reason, reported_claim, gates + [_gate("V0_RUN_BINDING", "UNKNOWN", reason, unbound)], [{"reason_code": reason, "evidence_ref": ref} for ref in (unbound or [""])], (), refs)
+        gates.append(_gate("V0_RUN_BINDING", "PASS", "evidence_names_this_run", tuple(sorted(artifacts))))
+        refs["run_id"] = run_id
+    except VerificationInputError as exc:
+        return _output(case_id, UNKNOWN, str(exc), reported_claim, gates + [_gate("V0_RUN_BINDING", "UNKNOWN", str(exc))], [{"reason_code": str(exc), "evidence_ref": ""}], (), refs)
 
     stale_unknowns = result_body.get("unknowns", [])
     if reported_claim == "reported_done" and stale_unknowns:

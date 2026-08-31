@@ -11,6 +11,11 @@ import unittest
 import content_product_verifier as cpv
 
 
+RUN_ID = "fixture-run-2"
+PRIOR_RUN_ID = "fixture-run-1"
+PREFIX_RUN_ID = "fixture-run-20"  # shares a prefix with RUN_ID and must not bind
+
+
 def _sha(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -30,13 +35,13 @@ class _Bundle(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="content_product_verifier_")
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
-        task = ('{"schema_version":"v0.1","required_content_gates":['
+        task = ('{"schema_version":"v0.1","run_id":"%s","required_content_gates":['
                 '{"gate_id":"state","artifact_id":"product","type":"json_field_equals",'
-                '"params":{"field":"state","equals":"green"}}]}')
+                '"params":{"field":"state","equals":"green"}}]}' % RUN_ID)
         result = '{"reported_claim":"reported_done","unknowns":[]}'
         candidate = 'value = "green"\n'
         stdout = '{"test_id":"fixture","exit_code":0,"passed":1,"failed":0,"errors":0}'
-        artifact = '{"state":"green","nested":{"ok":true}}'
+        artifact = '{"state":"green","run_id":"%s","nested":{"ok":true}}' % RUN_ID
         self.hashes = {
             "task": _write(self.root, "task.json", task),
             "result": _write(self.root, "result.json", result),
@@ -49,6 +54,7 @@ class _Bundle(unittest.TestCase):
         return {
             "schema_version": "v0.1",
             "case_id": "fixture-green",
+            "run_id": RUN_ID,
             "workspace_root": self.root,
             "task_packet": {"path": "task.json", "sha256": self.hashes["task"], "content_type": "json"},
             "result_packet": {"path": "result.json", "sha256": self.hashes["result"], "content_type": "json"},
@@ -77,7 +83,7 @@ class TestVerdicts(_Bundle):
     def test_missing_required_content_is_disproven(self):
         bundle = self.bundle()
         bundle["content_gates"][0]["params"]["equals"] = "red"
-        task = {"schema_version": "v0.1", "required_content_gates": bundle["content_gates"]}
+        task = {"schema_version": "v0.1", "run_id": RUN_ID, "required_content_gates": bundle["content_gates"]}
         self.hashes["task"] = _write(self.root, "task.json", json.dumps(task, separators=(",", ":")))
         bundle["task_packet"]["sha256"] = self.hashes["task"]
         got = cpv.verify_case(bundle)
@@ -168,6 +174,94 @@ class TestVerdicts(_Bundle):
         self.assertEqual(cpv.verify_case(bundle)["verdict"], cpv.DISPROVEN)
 
 
+class TestRunBinding(_Bundle):
+    """A product left by an earlier run is whole, parsable and green — and proves nothing."""
+
+    def _artifact(self, text):
+        self.hashes["artifact"] = _write(self.root, "artifact.json", text)
+
+    def _task(self, **body):
+        payload = {"schema_version": "v0.1", "run_id": RUN_ID,
+                   "required_content_gates": [{"gate_id": "state", "artifact_id": "product",
+                                               "type": "json_field_equals",
+                                               "params": {"field": "state", "equals": "green"}}]}
+        payload.update(body)
+        payload = {key: value for key, value in payload.items() if value is not None}
+        self.hashes["task"] = _write(self.root, "task.json", json.dumps(payload, separators=(",", ":")))
+
+    def test_proven_report_names_the_run_it_verified(self):
+        got = cpv.verify_case(self.bundle())
+        binding = [gate for gate in got["gates"] if gate["gate_id"] == "V0_RUN_BINDING"]
+        self.assertEqual(got["verdict"], cpv.PROVEN)
+        self.assertEqual([gate["status"] for gate in binding], ["PASS"])
+        self.assertEqual(got["input_refs"]["run_id"], RUN_ID)
+
+    def test_previous_run_product_claimed_new_is_not_proven(self):
+        self._artifact('{"state":"green","run_id":"%s"}' % PRIOR_RUN_ID)
+        got = cpv.verify_case(self.bundle())
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.DISPROVEN, "stale_run_evidence"))
+
+    def test_previous_run_product_with_nothing_changed_is_not_proven(self):
+        self._artifact('{"state":"green","run_id":"%s"}' % PRIOR_RUN_ID)
+        bundle = self.bundle()
+        bundle["allowed_changed_paths"] = []
+        bundle["baseline_manifest"] = [{"path": "candidate.py", "sha256": self.hashes["candidate"]}]
+        got = cpv.verify_case(bundle)
+        self.assertNotEqual(got["verdict"], cpv.PROVEN)
+
+    def test_recent_file_time_is_not_a_binding(self):
+        """The corpse is rewritten last, so it is the newest file on disk."""
+        stale = '{"state":"green","run_id":"%s"}' % PRIOR_RUN_ID
+        self._artifact(stale)
+        newest = max(os.path.getmtime(os.path.join(self.root, name))
+                     for name in os.listdir(self.root))
+        self.assertEqual(os.path.getmtime(os.path.join(self.root, "artifact.json")), newest)
+        self.assertEqual(cpv.verify_case(self.bundle())["reason_code"], "stale_run_evidence")
+
+    def test_run_id_prefix_does_not_bind(self):
+        self._artifact('{"state":"green","run_id":"%s"}' % PREFIX_RUN_ID)
+        got = cpv.verify_case(self.bundle())
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.DISPROVEN, "stale_run_evidence"))
+
+    def test_artifact_naming_no_run_is_unknown(self):
+        self._artifact('{"state":"green"}')
+        got = cpv.verify_case(self.bundle())
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.UNKNOWN, "unbound_run_evidence"))
+
+    def test_bundle_must_name_the_run_the_task_names(self):
+        bundle = self.bundle()
+        bundle["run_id"] = PRIOR_RUN_ID
+        got = cpv.verify_case(bundle)
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.DISPROVEN, "run_binding_mismatch"))
+
+    def test_bundle_without_run_id_cannot_prove(self):
+        bundle = self.bundle()
+        del bundle["run_id"]
+        got = cpv.verify_case(bundle)
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.UNKNOWN, "bundle_run_id_missing"))
+
+    def test_task_without_run_id_cannot_prove(self):
+        self._task(run_id=None)
+        got = cpv.verify_case(self.bundle())
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.UNKNOWN, "task_run_id_missing"))
+
+    def test_text_artifact_binds_by_its_own_declaration(self):
+        gates = [{"gate_id": "state", "artifact_id": "product", "type": "text_contains",
+                  "params": {"text": "state: green"}}]
+        self._task(required_content_gates=gates)
+        bundle = self.bundle()
+        bundle["content_gates"] = gates
+        for text, expected in (("run_id: %s\nstate: green\n" % RUN_ID, cpv.PROVEN),
+                               ("run_id: %s\nstate: green\n" % PRIOR_RUN_ID, cpv.DISPROVEN),
+                               ("state: green\n", cpv.UNKNOWN),
+                               # a neighbouring key that merely ends in run_id
+                               ("myrun_id: %s\nstate: green\n" % RUN_ID, cpv.UNKNOWN)):
+            self.hashes["artifact"] = _write(self.root, "notes.txt", text)
+            bundle["required_artifacts"][0].update(
+                {"path": "notes.txt", "content_type": "text", "sha256": self.hashes["artifact"]})
+            self.assertEqual(cpv.verify_case(bundle)["verdict"], expected, text)
+
+
 class TestNoSideEffects(unittest.TestCase):
     def test_module_has_no_network_process_environment_or_write_calls(self):
         with open(os.path.join(os.path.dirname(__file__), "content_product_verifier.py"), encoding="utf-8") as handle:
@@ -179,6 +273,16 @@ class TestNoSideEffects(unittest.TestCase):
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "open":
                 self.assertTrue(len(node.args) < 2 or node.args[1].value == "rb")
+
+    def test_freshness_is_identity_and_never_a_clock(self):
+        """Coincidence in time is not a binding, so no clock may exist to consult."""
+        with open(os.path.join(os.path.dirname(__file__), "content_product_verifier.py"), encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        imports = {node.names[0].name.split(".")[0] for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom)) and node.names}
+        self.assertFalse(imports.intersection({"time", "datetime", "calendar"}))
+        for forbidden in ("st_mtime", "getmtime", "getctime", "utcnow", "monotonic", "perf_counter"):
+            self.assertNotIn(forbidden, source)
 
     def test_output_is_bounded_and_contains_no_absolute_root(self):
         payload = {"x": "y"}
