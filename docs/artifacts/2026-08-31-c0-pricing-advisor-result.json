@@ -1,0 +1,349 @@
+{
+  "schema": "turbobaby/result_packet/v1",
+  "task_id": "c0-pricing-advisor-repair-2026-08-31",
+  "status": "reported_done",
+  "mode": "code_green_fixture_only",
+  "disclaimers": {
+    "not_independently_verified": "Это ДОКЛАД ИСПОЛНИТЕЛЯ, а не верификация. Все числа ниже сняты тем же заходом, который делал правку; независимой пробы исполнитель не проводил и не заявляет. Проверку выполняет Manus отдельно.",
+    "not_committed": "git commit НЕ выполнялся. Все четыре файла лежат в дереве untracked (`??` в git status).",
+    "not_pushed": "git push НЕ выполнялся."
+  },
+  "supersedes": {
+    "note": "Файл по этому пути УЖЕ СУЩЕСТВОВАЛ и содержал отчёт ПЕРВОЙ сборки C0 (task_id c0-pricing-advisor-fixture-only). Он не в git, поэтому перезапись означала бы безвозвратную потерю. Прежний отчёт сохранён целиком ниже, в previous_packet, а не затёрт. Разрешённых файлов было четыре, завести пятый под архив пакет не позволял.",
+    "previous_task_id": "c0-pricing-advisor-fixture-only",
+    "previous_packet": {
+      "schema": "turbobaby/result_packet/v1",
+      "task_id": "c0-pricing-advisor-fixture-only",
+      "status": "reported_done",
+      "mode": "code_green_fixture_only",
+      "changed_files": [
+        "pricing_advisor.py",
+        "test_pricing_advisor.py",
+        "docs/artifacts/2026-08-31-c0-pricing-advisor-result.json"
+      ],
+      "blobs": {
+        "pricing_advisor.py": "58b516cd1a70a7319d156c404e8888fd8f716489",
+        "test_pricing_advisor.py": "75c159f55f5388a32ffe05a1036234f0581344cd"
+      },
+      "public_contract": {
+        "entry": "recommend_price(quote_facts, dialog_facts, history_stats, owner_policy, *, as_of)",
+        "helper": "to_json(packet)",
+        "schema": "turbobaby/price_recommendation/v1",
+        "mode": "shadow",
+        "as_of": "обязательный именованный аргумент; вызов без него — TypeError (тест держит)",
+        "result_keys": [
+          "schema", "status", "mode", "as_of", "facts", "history", "dialog",
+          "recommendation", "confidence", "reason_codes", "unknowns", "evidence_refs",
+          "approval_required"
+        ],
+        "actions": ["offer_list", "offer_alternative", "manager_review", "ask_missing_fact"],
+        "statuses": ["ok", "unknown", "blocked"],
+        "approval_required": "константа true на всех ветках"
+      },
+      "core_invariant": {
+        "rule": "target is None or target == quote_facts['list_day_price']",
+        "words": "C0 не называет НИ ОДНОГО числа, кроме переданной ему цены листа: новой коммерческой цены он не считает и не выводит.",
+        "proved_by": "TestInvariantsAcrossCorpus — 18 сценариев корпуса, включая красные, а не один счастливый случай"
+      },
+      "status_boundary": {
+        "blocked": "факт ЕСТЬ и он дисквалифицирующий (валюта не THB, юнит доказанно занят, слепок протух/из будущего, политика владельца несогласована, чужой или чувствительный ключ на входе)",
+        "unknown": "факта НЕТ или он неразрешим (нет модели, поколение не разведено, нет дат/срока/цены/улик, наличие не подтверждено)",
+        "both": "target = null; ветки «не смог проверить → значит хорошо» нет ни одной"
+      },
+      "policy_v1": {
+        "offer_list": "полный свежий случай; target = переданная list_day_price в THB",
+        "offer_alternative": "cheaper_requested без объявленной владельцем скидки; бюджет ниже листа. Цель НЕ снижается",
+        "budget": "бюджет выше листа цель НЕ поднимает (проверено отдельным тестом); ниже — только повод предложить альтернативу",
+        "manager_review": "срок >= 180 суток, несколько юнитов, скидка/пакет/агент, объявленная скидка владельца, существенное расхождение с историей, цена листа вне границ владельца",
+        "history": "только улика (used_as=evidence_only): цену листа не перебивает ни при каком расхождении; тонкая/кривая статистика статус НЕ меняет, уходит пометкой в reason_codes",
+        "owner_bounds": "floor/ceiling ненулевые ТОЛЬКО из явной и согласованной owner_policy; своих лимитов C0 не изобретает. Цена вне границ → unknown + manager_review + target=null, подгонки нет"
+      },
+      "numbers_copied_not_invented": {
+        "availability_statuses": "ok | none_available | no_candidates | error — дословно исходы pricing.quote_for_model; проверенным считается ровно ok",
+        "generation": "fail-closed зеркало price_source._pick_generation через generation_status (resolved|not_applicable|ambiguous); цена ошибки названа деньгами в самом price_source.py — 557 против 662 ฿/сут у двух поколений XMAX 300",
+        "snapshot_max_age_days": "14.0 — копия price_freshness.MAX_AGE_DEFAULT вместе с обоснованием (самый длинный объявленный владельцем круг пересмотра цен)",
+        "days_tolerance": "±1 сутки между сроком котировки и сроком из слов клиента — копия pricing.sanity_days_ok",
+        "days_vs_window": "days обязан равняться разности дат — той же меркой, что G3=ABS(F3-F2) в «Календаре бронирования»",
+        "history_conflict_pct": "15.0 — НАШ порог, а не лимит владельца: спусковой крючок показа человеку. Обоснован живыми ручками сезона листа 0.15/0.15/0.25 (price_source.json → freshness.handles): расхождение меньше одной типовой ручки объясняется её поворотом. Переопределяется owner_policy.history_conflict_pct",
+        "long_term_days": "180 — из постановки задачи; переопределяется owner_policy.long_term_days"
+      },
+      "privacy_by_construction": {
+        "rule": "у dialog_facts НЕ БЫВАЕТ строковых значений вовсе — разрешены bool, число, None",
+        "effect": "класс «сырой текст клиента протёк в пакет» закрыт устройством, а не списком слов: строке просто некуда лечь",
+        "keys": "белый список из 7 ключей; незнакомый ключ классифицируется на 10 чувствительных категорий (raw_text, identity, contact, document, nationality, language, address, payment, device, wealth) и отвергает заход",
+        "echo": "наружу уходит ТОЛЬКО имя нашей категории — никогда сам ключ и никогда значение; опасное по форме имя ключа заменяется меткой <redacted>",
+        "token_parsing": "категория ищется по ТОКЕНАМ ключа, а не по подстроке: иначе units_requested ловился бы на unit и врал бы каждый заход",
+        "grep_note": "слова telegram/whatsapp/passport/card в pricing_advisor.py есть — все до единого внутри SENSITIVE_TOKENS, то есть в СЛОВАРЕ ОТКАЗА. Ни импорта, ни вызова, ни адреса за ними нет; проверять надо импорты и вызовы, а не подстроку"
+      },
+      "no_side_effects": {
+        "imports_top_and_nested": ["json", "re"],
+        "checked_by": "разбор дерева исходника (ast.walk по Import/ImportFrom — закрытый список; Call/Attribute — чёрный список open/eval/exec/__import__/print/system/popen/urlopen/connect/execute/send/environ/getenv/now/today/utcnow/write/remove/unlink), плюс подстрочный скан поверхностей",
+        "module_level_mutable_state": "нет ни одного list/set на уровне модуля — кэшу и накопителю негде завестись",
+        "inputs_mutated": false,
+        "network_fs_env_db_clock_random": "нет ни одного обращения; собственных часов не существует — момент только инъектированный as_of, посчитанный чистой арифметикой суток (алгоритм Хиннанта) вместо календарной библиотеки",
+        "price_source_json_before": "b3c3ed213aec8bb9a21b410c4f4c1d60ce028ada",
+        "price_source_json_after": "b3c3ed213aec8bb9a21b410c4f4c1d60ce028ada"
+      },
+      "tests": [
+        {
+          "command": "venv\\Scripts\\python.exe -W error::ResourceWarning -m unittest -v test_pricing_advisor",
+          "ran": 69,
+          "failures": 0,
+          "known_failures": [],
+          "resource_warnings": 0
+        },
+        {
+          "command": "venv\\Scripts\\python.exe -m unittest -q test_pricing_advisor test_price_source test_price_gate test_price_freshness test_pricing test_price_snapshot_collect test_price_snapshot_publish test_suggest test_moderation test_moderation_card",
+          "ran": 1037,
+          "failures": 5,
+          "known_failures": [
+            "test_suggest.TestRunLiveSmoke.test_green_full_data_passes",
+            "test_suggest.TestRunLiveSmoke.test_green_paraphrase_with_correct_numbers_now_passes",
+            "test_suggest.TestRunLiveSmoke.test_red_delivery_missing_fails",
+            "test_suggest.TestRunLiveSmoke.test_red_j_line_not_verbatim_fails",
+            "test_suggest.TestRunLiveSmoke.test_red_violations_flagged_with_diff_card"
+          ],
+          "new_failures": 0,
+          "baseline_source": "docs/artifacts/2026-08-31-b1-2-result.json — тот же перечень из пяти имён, слово в слово"
+        }
+      ],
+      "unknowns": [
+        "Порог существенности расхождения с историей (15%) обоснован живыми ручками сезона листа, но НЕ измерен на корпусе прошлых сделок.",
+        "Порог 45 суток из pricing.sanity_days_ok здесь СОЗНАТЕЛЬНО не зеркалится.",
+        "Список чувствительных категорий (10) собран из формулировки задачи, а не из живой переписки.",
+        "Живого потребителя у модуля нет ни одного: он не импортирован никем.",
+        "Соответствие C0 общей формуле листа (base x season x term) не проверялось: C0 цену не считает, он её ПРИНИМАЕТ."
+      ],
+      "summary": "Заведён C0 pricing_advisor.py — чистая функция recommend_price(...) → пакет схемы turbobaby/price_recommendation/v1, mode=shadow, approval_required=true. Инвариант: единственное число, которое советник вправе назвать целью, — переданная ему list_day_price. Тесты: 69/69 зелёных, широкий прогон 1037/5 (все пять — известные NMAX TestRunLiveSmoke). Пакет — доклад исполнителя, не верификация."
+    }
+  },
+  "changed_files": [
+    "pricing_advisor.py",
+    "test_pricing_advisor.py",
+    "todo.md",
+    "docs/artifacts/2026-08-31-c0-pricing-advisor-result.json"
+  ],
+  "scope_check": {
+    "command": "git status --short -- pricing_advisor.py test_pricing_advisor.py todo.md docs/artifacts/2026-08-31-c0-pricing-advisor-result.json",
+    "result": "все четыре файла в состоянии `??` (untracked). Файлов вне разрешённого списка правка не касалась.",
+    "runtime_untouched_proof": "git hash-object price_source.json = b3c3ed213aec8bb9a21b410c4f4c1d60ce028ada — побайтово то же значение, что записал прежний отчёт до правки.",
+    "no_live_consumer": "греп по *.py: имя pricing_advisor встречается только в самом модуле, в его юните и в двух пробных скриптах _scratch_*. Ни runtime, ни Bridge, ни CRM, ни Telegram, ни Sheets, ни модерация, ни очередь его не импортируют.",
+    "disclosed_side_artifact": "В дереве появился НЕРАЗРЕШЁННЫЙ пакетом путь `_scratch_c0repair_0831/probe_before.py` — пробный скрипт, снявший поведение ДО правки. Он untracked, ничего не импортирует из боевого кода и на прогон не влияет. Снять его не удалось: команда удаления была отклонена в этой сессии. Раскрыто здесь сознательно, а не умолчано."
+  },
+  "hashes": {
+    "note": "«before» — блобы из прежнего отчёта (состояние до этой правки), «after» — замер после неё.",
+    "pricing_advisor.py": {
+      "blob_before": "58b516cd1a70a7319d156c404e8888fd8f716489",
+      "blob_after": "0363091ca76b2015d73eb67e2dced503e3df6537",
+      "sha256_after": "d5b0f0477730ef80de25b02487793bc05b6e09df95cedb41f89027462a83afd2",
+      "bytes_after": 50330
+    },
+    "test_pricing_advisor.py": {
+      "blob_before": "75c159f55f5388a32ffe05a1036234f0581344cd",
+      "blob_after": "59604bdde4b70c50ac88a06906de5d3d0cabf70a",
+      "sha256_after": "419aa56a9145c852bb2ddae216d31fd5486635d43637b4433144af0ac113e94d",
+      "bytes_after": 53983
+    }
+  },
+  "defects_fixed": [
+    {
+      "id": 1,
+      "claim": "list_day_price = NaN/Inf проходит как status=ok, становится recommendation.target и ломает строгую JSON-сериализацию",
+      "reproduced_before_fix": "ДА. Замер до правки: status=ok, target=nan, confidence=medium, json.dumps(allow_nan=False) → ValueError. То же для +Inf.",
+      "root_cause": "Сито было `_is_number` (isinstance int/float, не bool) — NaN и Inf ему удовлетворяют. Дальше отсев шёл сравнением `price <= 0`, а у NaN ЛОЖНО любое сравнение, поэтому он проходил как образцовая положительная цена.",
+      "fix": "Заведено отдельное сито `_is_finite` (NaN ловится тем, что не равен себе; бесконечности — прямым сравнением с ±float('inf')). Цена листа теперь проверяется им: NaN/±Inf → unknown + list_price_invalid, target=null.",
+      "tests": [
+        "TestNonFiniteNumbers.test_nan_and_inf_list_price_never_become_the_target",
+        "TestNonFiniteNumbers.test_is_finite_helper_tells_numbers_from_their_impostors"
+      ]
+    },
+    {
+      "id": 2,
+      "claim": "median_day_price_thb = NaN ошибочно считается corroborating history и поднимает confidence до high",
+      "reproduced_before_fix": "ДА. Замер до правки: corroborates=True, delta_pct=nan, confidence=high.",
+      "root_cause": "Тот же корень, что и у дефекта 1, но опаснее по последствиям: медиана-NaN проходила `median <= 0`, затем delta выходила NaN, и проверка конфликта `abs(delta) > порог` тоже была ЛОЖНА — то есть заход попадал в ветку else «расхождения нет», которая и означает ПОДТВЕРЖДЕНИЕ. Один NaN превращался в улику в пользу цены.",
+      "fix": "Медиана проверяется `_is_finite` → notes history_invalid:median_day_price_thb, в блок истории не попадает, delta_pct остаётся null, corroborates=false. Дополнительно проверяется конечность САМОЙ delta: два конечных входа могут дать переполнение при делении, и такое число тоже наружу не уходит.",
+      "tests": [
+        "TestNonFiniteNumbers.test_nan_median_is_not_corroboration_and_does_not_lift_confidence",
+        "TestNonFiniteNumbers.test_inf_median_is_rejected_too",
+        "TestNonFiniteNumbers.test_finite_inputs_whose_ratio_overflows_do_not_leak_inf"
+      ]
+    },
+    {
+      "id": 3,
+      "claim": "owner_policy.snapshot_max_age_days = NaN отключает проверку stale snapshot",
+      "reproduced_before_fix": "ДА. Замер до правки: слепок от 2020-01-01 при пороге NaN → status=ok, target=662, snapshot_stale в кодах отсутствует.",
+      "root_cause": "Двойной промах из одного корня: приёмка ручки шла через `value < 0` (для NaN ложно → ручка принята), а применение — через `порог > 0 and age > порог` (для NaN ложно → ветка протухания не выполнялась вовсе). Кривая ручка не просто принималась, она ГЛУШИЛА проверку, которой служит.",
+      "fix": "Помощник positive() проверяет конечность ПЕРВОЙ, до знаковых сравнений → owner_policy_incoherent:snapshot_max_age_days (blocked), а порог остаётся дефолтным 14.0, поэтому проверка протухания продолжает работать.",
+      "tests": [
+        "TestNonFiniteNumbers.test_nan_snapshot_threshold_does_not_switch_off_the_staleness_check",
+        "TestNonFiniteNumbers.test_every_numeric_policy_knob_refuses_non_finite"
+      ]
+    },
+    {
+      "id": 4,
+      "claim": "Окно аренды, уже начавшееся до as_of, проходит как ok",
+      "reproduced_before_fix": "ДА. Замер до правки: окно 2026-08-01..2026-09-10 при as_of=2026-08-31 → status=ok, target=662.",
+      "root_cause": "Проверка окна была ровно одна — `end_day < as_of_day` (окно ЗАКОНЧИЛОСЬ). Случай «окно ещё идёт, но началось в прошлом» не рассматривался ни одной веткой.",
+      "fix": "Добавлена ветка `elif start_day < as_of_day` → unknown + quote_window_already_started, target=null. Классификация по СУЩЕСТВУЮЩЕЙ границе (факт неразрешим → unknown), новых статусов не заведено.",
+      "agreed_semantics_preserved": "Полностью прошедшее окно по-прежнему даёт РОВНО quote_window_expired: ветки соединены elif, поэтому второй код к нему не приклеивается. Держится отдельным тестом.",
+      "boundary": "Начало РОВНО в as_of прошлым не считается (сравнение строгое) — тоже под тестом.",
+      "tests": [
+        "TestQuoteWindowAgainstAsOf.test_window_started_before_as_of_gets_no_target",
+        "TestQuoteWindowAgainstAsOf.test_window_starting_exactly_on_as_of_is_still_a_full_case",
+        "TestQuoteWindowAgainstAsOf.test_fully_past_window_keeps_its_agreed_code",
+        "TestQuoteWindowAgainstAsOf.test_future_window_is_untouched"
+      ]
+    },
+    {
+      "id": 5,
+      "claim": "confidence.level = none не входит в утверждённую схему high|medium|low|blocked",
+      "reproduced_before_fix": "ДА. Замер до правки: любой отказной заход давал level='none'.",
+      "root_cause": "Ветка `else: level = 'none'` покрывала разом blocked и unknown словом, которого схема не объявляла.",
+      "fix": "Заведён белый список CONFIDENCE_LEVELS = (high, medium, low, blocked). status=blocked → 'blocked'; status=unknown → 'low' (отдельной approved-семантики строже для unknown в документации нет); status=ok → high при подтверждённой истории на offer_list, иначе medium, а на прочих действиях low. Слова 'none' в выдаче не осталось ни на одной ветке.",
+      "tests": [
+        "TestConfidenceSchema.test_whitelist_is_exactly_the_approved_four_words",
+        "TestConfidenceSchema.test_blocked_status_says_blocked",
+        "TestConfidenceSchema.test_unknown_status_says_low",
+        "TestConfidenceSchema.test_the_word_none_is_gone_from_every_branch",
+        "TestInvariantsAcrossCorpus.test_shape_of_every_packet (проверка по белому списку на всём корпусе)"
+      ]
+    },
+    {
+      "id": 6,
+      "claim": "history_stats.fresh_as_of отвергается как неизвестный ключ; история должна иметь проверяемую свежесть и не повышать confidence, если stale/invalid",
+      "reproduced_before_fix": "ДА. Замер до правки: history_unknown_key:fresh_as_of → status=blocked.",
+      "root_cause": "Ключа не было в белом списке HISTORY_KEYS, а механизма проверки свежести истории не существовало вовсе.",
+      "fix": "fresh_as_of принят в HISTORY_KEYS, разбирается тем же _parse_day (настоящая дата, не подстрока), отражается в блоке истории вместе с посчитанным fresh_age_days. Право ПОДТВЕРЖДАТЬ выдаётся только доказанной свежести: кривой формат, дата из будущего, возраст сверх порога и невозможность сверить (as_of кривой) — каждый снимает corroborates и не даёт подняться до high.",
+      "asymmetry_by_design": "Асимметрия односторонняя: сомнительная улика НЕ подтверждает, но руку поднять вправе — расхождение сверх порога остаётся конфликтом и уводит заход к человеку. Обе ветки ведут в сторону лишней проверки человеком, ни одна — в сторону машинной уверенности.",
+      "history_stays_evidence_only": "used_as=evidence_only не менялся: ни при какой свежести история не трогает target. Держится тестом на пяти значениях fresh_as_of.",
+      "no_own_clock": "Момент сверки — ТОЛЬКО инъектированный as_of. Своих часов не заведено; при неразобранном as_of исход честный «свежесть не подтверждена», а не «свежо».",
+      "new_threshold": {
+        "knob": "owner_policy.history_max_age_days",
+        "default": 14.0,
+        "why_this_number": "Не выдумано: это тот же круг пересмотра цен, что и у слепка (копия price_freshness.MAX_AGE_DEFAULT). Сделка старше одного полного круга могла быть закрыта по цене, которую владелец с тех пор уже поменял, — подтверждать ею сегодняшний лист нечестно.",
+        "why_a_separate_knob": "Ручка своя, а не общая со слепком, сознательно: владелец, отключивший проверку возраста слепка (0), не должен этим МОЛЧА отключить и проверку возраста истории. Держится отдельным тестом."
+      },
+      "tests": [
+        "TestHistoryFreshness.test_fresh_as_of_is_accepted_and_echoed",
+        "TestHistoryFreshness.test_stale_history_does_not_corroborate_and_does_not_lift_confidence",
+        "TestHistoryFreshness.test_history_from_the_future_does_not_corroborate",
+        "TestHistoryFreshness.test_malformed_fresh_as_of_does_not_corroborate_and_is_not_echoed",
+        "TestHistoryFreshness.test_freshness_without_an_injected_moment_is_unverified_not_fresh",
+        "TestHistoryFreshness.test_stale_history_still_raises_its_hand_on_a_conflict",
+        "TestHistoryFreshness.test_history_never_moves_the_target_however_fresh_it_is",
+        "TestHistoryFreshness.test_owner_may_move_the_history_freshness_bound_explicitly",
+        "TestHistoryFreshness.test_history_freshness_bound_is_independent_of_the_snapshot_bound",
+        "TestHistoryFreshness.test_a_foreign_history_key_is_still_rejected"
+      ]
+    }
+  ],
+  "mandatory_fix_finiteness": {
+    "rule": "Ни при каких входах C0 не выдаёт NaN или Inf; json.dumps(packet, allow_nan=False) проходит и для валидного, и для fail-closed результата.",
+    "why_one_helper_for_all": "Дефекты 1, 2 и 3 — не три ошибки, а ТРИ ПРОЯВЛЕНИЯ ОДНОГО КОРНЯ. NaN опасен не тем, что он «плохое число», а тем, что он ложен В ЛЮБОМ СРАВНЕНИИ: и `x <= 0`, и `x > порог`, и `abs(x) > порог` разом неверны, поэтому проверка «не меньше нуля и не больше порога» пропускает его как ОБРАЗЦОВОЕ значение. Поэтому закрыто ситом на каждом числовом входе, а не заплаткой на цене.",
+    "covered_inputs": [
+      "quote_facts.list_day_price (деньги, единственный кандидат в target)",
+      "dialog_facts.stated_budget_thb_per_day (деньги; уходит в эхо и сравнивается с целью)",
+      "owner_policy.floor_thb_per_day, ceiling_thb_per_day (деньги, попадают в recommendation)",
+      "owner_policy.snapshot_max_age_days, history_max_age_days (возрасты-пороги)",
+      "owner_policy.history_conflict_pct, discount_max_pct (проценты)",
+      "history_stats.median_day_price_thb (деньги-медиана)",
+      "производная delta_pct (два конечных входа могут дать переполнение при делении)"
+    ],
+    "integer_fields_note": "days, units_requested, term_days, deals_count, window_days, long_term_days, history_min_deals проверяются как int (не bool) — целые нечисловыми не бывают, отдельное сито им не нужно.",
+    "backstop": "to_json печатает со allow_nan=False. Это ЗАМОК, а не украшение: по умолчанию json печатает NaN и Infinity словами, которых в JSON нет, и такой текст падает уже у потребителя, вдали от причины. Теперь промах сита выше по коду обрывает работу на месте — пакет с нечисловым числом просто не получает текста.",
+    "tests": [
+      "TestStrictJsonSerialization.test_hostile_numeric_inputs_still_produce_strict_json (12 враждебных входов)",
+      "TestStrictJsonSerialization.test_hostile_numbers_never_lift_confidence_to_high",
+      "TestStrictJsonSerialization.test_canonical_writer_is_strict_too",
+      "TestStrictJsonSerialization.test_the_canonical_writer_refuses_rather_than_prints_a_broken_number",
+      "TestInvariantsAcrossCorpus.test_every_packet_is_strict_json_on_the_whole_corpus",
+      "TestInvariantsAcrossCorpus.test_no_packet_carries_a_number_that_is_not_a_number (рекурсивный обход пакета целиком: конечность у КАЖДОГО float, а не у названных полей)"
+    ]
+  },
+  "invariants_preserved": {
+    "public_entry": "recommend_price(quote_facts, dialog_facts, history_stats, owner_policy, *, as_of) — подпись не менялась; as_of остался keyword-only (тест держит TypeError).",
+    "mode": "shadow — константа, не менялась.",
+    "approval_required": "true на всех ветках — не менялось.",
+    "target_rule": "target is None or target == quote_facts['list_day_price'] — проверяется на корпусе, выросшем с 18 до 27 сценариев (добавлены девять форм независимой пробы).",
+    "no_side_effects": "Список импортов по-прежнему закрыт ровно двумя именами (json, re) — держится разбором дерева исходника; собственных часов, сети, файлов, окружения, БД и случайных чисел не заведено. float('inf') — вызов встроенного float, поверхностью не является.",
+    "determinism": "Тесты побайтового совпадения и независимости от порядка ключей входа сохранены и зелёные.",
+    "inputs_not_mutated": "Тест сохранён и зелёный."
+  },
+  "commands": [
+    {
+      "command": "venv\\Scripts\\python.exe -W error::ResourceWarning -m unittest -v test_pricing_advisor",
+      "ran": 101,
+      "failures": 0,
+      "errors": 0,
+      "resource_warnings": 0,
+      "verdict": "OK",
+      "delta": "было 69 до правки, стало 101 (+32 теста регресса)"
+    },
+    {
+      "command": "venv\\Scripts\\python.exe -m unittest -q test_pricing_advisor test_price_source test_price_gate test_price_freshness test_pricing test_price_snapshot_collect test_price_snapshot_publish test_suggest test_moderation test_moderation_card",
+      "ran": 1069,
+      "failures": 5,
+      "errors": 0,
+      "verdict": "FAILED (failures=5) — ровно пять известных, новых ноль"
+    },
+    {
+      "command": "venv\\Scripts\\python.exe _scratch_manus_c0_checks.py",
+      "note": "ПРЕЖДЕ СУЩЕСТВОВАВШИЙ в дереве пробный скрипт Manus (не создан и не изменён этим заходом), тот самый, что дал шесть находок. Прогнан после правки.",
+      "result": {
+        "list_price_nan": {"status": "unknown", "target_is_finite": true, "strict_json": true},
+        "list_price_inf": {"status": "unknown", "target_is_finite": true, "strict_json": true},
+        "history_nan": {"status": "ok", "confidence": "medium", "corroborates": false},
+        "stale_with_nan_policy": {"status": "blocked", "target": null},
+        "past_start": {"status": "unknown", "target": null, "unknowns": ["quote_window_already_started"]},
+        "blocked_confidence": "blocked",
+        "history_freshness_field": {"status": "ok", "reason_codes": ["history_corroborates", "list_price_used"]}
+      },
+      "verdict": "все шесть проверок показывают исправленное поведение"
+    }
+  ],
+  "baseline_comparison": {
+    "test_count_before": 1037,
+    "test_count_after": 1069,
+    "arithmetic": "1037 + 32 новых теста = 1069 — сходится, ни один прежний тест не удалён.",
+    "failures_before": 5,
+    "failures_after": 5,
+    "new_failures": 0,
+    "known_failures_identical": [
+      "test_suggest.TestRunLiveSmoke.test_green_full_data_passes",
+      "test_suggest.TestRunLiveSmoke.test_green_paraphrase_with_correct_numbers_now_passes",
+      "test_suggest.TestRunLiveSmoke.test_red_delivery_missing_fails",
+      "test_suggest.TestRunLiveSmoke.test_red_j_line_not_verbatim_fails",
+      "test_suggest.TestRunLiveSmoke.test_red_violations_flagged_with_diff_card"
+    ],
+    "not_fixed_not_masked": "Пять известных NMAX-падений не чинились и не маскировались: ни одной строки в test_suggest.py, suggest.py и смежных файлах правка не касается. Все пять — по-прежнему живые падения по дословности строки J и зоне доставки.",
+    "why_they_cannot_be_caused_by_this_change": "Греп по *.py: имя pricing_advisor не встречается ни в одном боевом модуле — только в самом модуле, его юните и двух пробных скриптах. test_suggest его не импортирует."
+  },
+  "existing_tests_preserved": {
+    "removed": 0,
+    "modified": 1,
+    "modified_detail": "TestBlockedAndUnknown.assertNoTarget — вспомогательное утверждение, требовавшее confidence='none'. Оно ПРЯМО ПРОТИВОРЕЧИТ обязательному исправлению 5, поэтому приведено к схеме: 'blocked' при status=blocked, 'low' при status=unknown. Проверяющая сила не ослаблена — утверждение осталось точным равенством, а не 'in'.",
+    "added": 32,
+    "corpus_grown": "CORPUS 18 → 27 сценариев: добавлены цена NaN, цена Inf, медиана NaN, бюджет NaN, порог возраста NaN, окно уже началось, история протухла, история из будущего, свежесть истории кривая. Все инварианты корпуса метут и их тоже."
+  },
+  "self_correction_during_work": {
+    "what": "Первая редакция TestStrictJsonSerialization требовала target=null на ВСЕХ враждебных входах — и упала на случае «медиана NaN».",
+    "why_the_test_was_wrong_not_the_code": "NaN в медиане прошлых сделок — это негодная УЛИКА, а не пропавший факт котировки. Ронять из-за неё готовую рекомендацию значило бы дать истории власть, которой у неё в C0 нет; ровно это запрещает docstring _read_history и держит прежний тест test_thin_history_is_a_note_and_not_an_unknown.",
+    "fix": "Утверждение приведено к настоящему инварианту (target is None or == LIST_PRICE), плюс заведён отдельный тест на то, что враждебные числа не поднимают confidence до high. Код не трогался."
+  },
+  "remaining_unknowns": [
+    "НЕЗАВИСИМОЙ ПРОВЕРКИ НЕТ. Все замеры выше сняты тем же заходом, который делал правку. Пробный скрипт Manus прогнан, но прогнан ИСПОЛНИТЕЛЕМ; это не независимая верификация.",
+    "Порог history_max_age_days = 14.0 обоснован ПО АНАЛОГИИ (тот же круг пересмотра цен, что у слепка), а не измерен на корпусе закрытых сделок: корпуса с ценами и датами этому заходу не давали, а читать его самому пакет запрещает. Число — наша страховка в сторону лишнего показа человеку, а не измеренная граница. Кандидат в решение владельца.",
+    "Решение «status=unknown → confidence=low» взято из формулировки задачи («если отдельная документация не задаёт более строгую approved-семантику»). Такой отдельной документации исполнителю не предъявляли и в репозитории он её не искал специально — если она существует и требует иного, ветка меняется одной строкой.",
+    "Семантика quote_window_already_started выбрана unknown, а не blocked, по объявленной в модуле границе (факт неразрешим). Если владелец считает начавшееся окно ДИСКВАЛИФИЦИРУЮЩИМ фактом, это перенос одной строки из unknown в blocked — но это решение человека, а не измеримый здесь факт.",
+    "Прежний порог history_conflict_pct = 15.0 как был не измерен на корпусе сделок, так и остался: этот заход его не трогал.",
+    "Живого потребителя у модуля по-прежнему нет ни одного: он не импортирован никем, в очередь и в suggest не подключён.",
+    "Пять известных NMAX-падений остаются живыми и нечиненными — по пакету их чинить запрещено."
+  ],
+  "explicit_statements": {
+    "not_independently_verified": true,
+    "not_committed": true,
+    "not_pushed": true
+  },
+  "summary": "Исправлены все шесть подтверждённых дефектов C0, каждый сперва ВОСПРОИЗВЕДЁН замером до правки. Дефекты 1–3 оказались одним корнем: NaN ложен в ЛЮБОМ сравнении, поэтому одно значение проходило три разные заставы подряд — становилось целью (`NaN <= 0` ложно), засчитывалось подтверждением истории (`abs(NaN) > порог` ложно) и глушило проверку протухания слепка (`порог > 0` ложно). Закрыто ситом конечности `_is_finite` на КАЖДОМ числовом входе, способном попасть в пакет или в сравнение с порогом (деньги, проценты, возрасты, медианы, бюджет клиента, производная delta), плюс замок `allow_nan=False` в to_json. Дефект 4: заведена ветка quote_window_already_started (unknown, target=null) для окна, начавшегося до as_of; согласованная семантика полностью прошедшего окна не тронута — elif гарантирует прежний одиночный код quote_window_expired, это под тестом. Дефект 5: confidence приведён к белому списку схемы high|medium|low|blocked, слова none не осталось ни на одной ветке. Дефект 6: fresh_as_of принят, разбирается настоящей датой и отражается в блоке истории; право подтверждать выдаётся только доказанной свежести (кривая, будущая, протухшая и непроверяемая — не подтверждают), при этом история осталась evidence_only и target не двигает ни при какой свежести, а своих часов не завела — момент только инъектированный as_of. Инварианты сохранены: подпись публичной точки входа, mode=shadow, approval_required=true, target либо null либо побитово list_day_price, закрытый список импортов (json, re), отсутствие сети/файлов/окружения/часов/записи, детерминированность. Тесты: 101/101 зелёных под -W error::ResourceWarning (было 69, +32 регресса), широкий прогон 1069/5 — ровно те же пять известных NMAX TestRunLiveSmoke, слово в слово, новых падений ноль; арифметика 1037+32=1069 сходится, ни один прежний тест не удалён (изменено одно вспомогательное утверждение, прямо противоречившее исправлению 5). Пробный скрипт Manus, лежавший в дереве, прогнан после правки: все шесть проверок показывают исправленное поведение. Боевой price_source.json побайтово не тронут. НЕ верифицировано независимо, НЕ закоммичено, НЕ запушено."
+}
