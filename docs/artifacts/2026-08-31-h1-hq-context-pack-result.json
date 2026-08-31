@@ -1,0 +1,94 @@
+{
+  "schema": "turbobaby.result_packet/v1",
+  "task_id": "h1-hq-context-pack-code-green",
+  "class": "code_green",
+  "reported_status": "reported_done",
+  "reported_status_rationale": "All three candidate evidence hashes were recorded by H1-E1: the SHA-256 of hq_context_pack.py and test_hq_context_pack.py, plus the structured pre_update_input_hash for the JSON artifact. This is reported evidence only and not independent verification, acceptance, transfer or release.",
+  "changed_files": [
+    {
+      "path": "hq_context_pack.py",
+      "action": "created",
+      "description": "Pure, deterministic HQ context-pack builder. Public API: build_context_pack(case_id, task_class, active_objective, source_manifest, *, root, coverage_plan=None, route=None, max_chars=12000) -> dict, plus ContextPackError."
+    },
+    {
+      "path": "test_hq_context_pack.py",
+      "action": "created",
+      "description": "unittest suite (31 tests) covering every required proof row incl. both cross-lane cases. Fixtures live only in tempfile.TemporaryDirectory; no real .env/logs/Bridge/Brain touched."
+    },
+    {
+      "path": "docs/artifacts/2026-08-31-h1-hq-context-pack-result.json",
+      "action": "created",
+      "description": "This RESULT_PACKET."
+    }
+  ],
+  "source_blob_before_after": {
+    "hq_context_pack.py": {
+      "before": "empty file (0 bytes, pre-created placeholder)",
+      "after": "created — pure module implementing the full functional contract §3 (schema constant, task_class/lane/evidence/route/role allowlists, denylist tokens, traversal/absolute/duplicate/out-of-root rejection raising ContextPackError, fail-closed blocked outcomes for missing_required_source and context_limit_exceeded, per-source content+excerpt SHA-256, canonical manifest_sha256, reproducible pack sha256 with no timestamp/host/abs-root, coverage checked/not_checked + explicit unknown blind-spots, omitted[] and excluded[])."
+    },
+    "test_hq_context_pack.py": {
+      "before": "empty file (0 bytes, pre-created placeholder)",
+      "after": "created — 31 unittest cases across 12 TestCase classes."
+    },
+    "docs/artifacts/2026-08-31-h1-hq-context-pack-result.json": {
+      "before": "empty file (0 bytes, pre-created placeholder)",
+      "after": "this artifact"
+    }
+  },
+  "test_command": "python -m unittest test_hq_context_pack -v",
+  "test_stdout": "test_vps_not_checked_unknown_no_absence_verdict (test_hq_context_pack.CrossLaneNegativeVpsNotChecked.test_vps_not_checked_unknown_no_absence_verdict) ... ok\ntest_vps_excerpt_preserved_not_replaced_by_pc (test_hq_context_pack.CrossLanePositiveVpsEvidence.test_vps_excerpt_preserved_not_replaced_by_pc) ... ok\ntest_denied_names_never_enter_body (test_hq_context_pack.Denylist.test_denied_names_never_enter_body) ... ok\ntest_duplicate_path_rejected (test_hq_context_pack.DuplicateAndRoleViolation.test_duplicate_path_rejected) ... ok\ntest_invalid_lane_rejected (test_hq_context_pack.DuplicateAndRoleViolation.test_invalid_lane_rejected) ... ok\ntest_role_violation_rejected (test_hq_context_pack.DuplicateAndRoleViolation.test_role_violation_rejected) ... ok\ntest_bounds_full_and_excerpt_sha_no_summary (test_hq_context_pack.ExcerptEvidence.test_bounds_full_and_excerpt_sha_no_summary) ... ok\ntest_json_dumps_allow_nan_false_succeeds (test_hq_context_pack.JsonSerialization.test_json_dumps_allow_nan_false_succeeds) ... ok\ntest_altered_range_changes_hash (test_hq_context_pack.ManifestEvidence.test_altered_range_changes_hash) ... ok\ntest_altered_required_changes_hash (test_hq_context_pack.ManifestEvidence.test_altered_required_changes_hash) ... ok\ntest_altered_role_changes_hash (test_hq_context_pack.ManifestEvidence.test_altered_role_changes_hash) ... ok\ntest_identical_manifest_same_hash (test_hq_context_pack.ManifestEvidence.test_identical_manifest_same_hash) ... ok\ntest_blocked_no_partial_body (test_hq_context_pack.MissingRequiredSource.test_blocked_no_partial_body) ... ok\ntest_no_network_subprocess_env_mutation_or_write (test_hq_context_pack.NoSideEffect.test_no_network_subprocess_env_mutation_or_write) ... ok\ntest_coverage_checked_and_not_checked (test_hq_context_pack.ObjectiveStatusCoverage.test_coverage_checked_and_not_checked) ... ok\ntest_empty_objective_rejected (test_hq_context_pack.ObjectiveStatusCoverage.test_empty_objective_rejected) ... ok\ntest_evidence_status_and_lane_preserved (test_hq_context_pack.ObjectiveStatusCoverage.test_evidence_status_and_lane_preserved) ... ok\ntest_invalid_evidence_status_rejected (test_hq_context_pack.ObjectiveStatusCoverage.test_invalid_evidence_status_rejected) ... ok\ntest_oversized_objective_rejected (test_hq_context_pack.ObjectiveStatusCoverage.test_oversized_objective_rejected) ... ok\ntest_unknown_task_class_rejected (test_hq_context_pack.ObjectiveStatusCoverage.test_unknown_task_class_rejected) ... ok\ntest_missing_optional_appears_only_in_omitted (test_hq_context_pack.OptionalSourceOmission.test_missing_optional_appears_only_in_omitted) ... ok\ntest_required_never_silently_omitted (test_hq_context_pack.OptionalSourceOmission.test_required_never_silently_omitted) ... ok\ntest_free_text_route_rejected (test_hq_context_pack.RouteSeparation.test_free_text_route_rejected) ... ok\ntest_unknown_route_target_rejected (test_hq_context_pack.RouteSeparation.test_unknown_route_target_rejected) ... ok\ntest_valid_route_preserved_outside_body (test_hq_context_pack.RouteSeparation.test_valid_route_preserved_outside_body) ... ok\ntest_blocked_context_limit_no_truncation (test_hq_context_pack.SizeCap.test_blocked_context_limit_no_truncation) ... ok\ntest_optional_over_cap_omitted_with_reason (test_hq_context_pack.SizeCap.test_optional_over_cap_omitted_with_reason) ... ok\ntest_absolute_rejected (test_hq_context_pack.TraversalAndAbsolute.test_absolute_rejected) ... ok\ntest_outside_root_rejected (test_hq_context_pack.TraversalAndAbsolute.test_outside_root_rejected) ... ok\ntest_traversal_rejected (test_hq_context_pack.TraversalAndAbsolute.test_traversal_rejected) ... ok\ntest_schema_order_body_and_repeatable_sha (test_hq_context_pack.ValidManifest.test_schema_order_body_and_repeatable_sha) ... ok\n\n----------------------------------------------------------------------\nRan 31 tests in 0.080s\n\nOK",
+  "test_summary": {
+    "ran": 31,
+    "ok": 31,
+    "failures": 0,
+    "errors": 0,
+    "result": "OK"
+  },
+  "required_test_matrix_coverage": {
+    "valid_manifest": "ValidManifest.test_schema_order_body_and_repeatable_sha",
+    "objective_status_coverage": "ObjectiveStatusCoverage.* (empty/oversized objective rejected; lane+evidence_status preserved un-promoted; coverage checked/not_checked)",
+    "route_separation": "RouteSeparation.* (valid route preserved outside body; unknown target and free-text route rejected)",
+    "manifest_evidence": "ManifestEvidence.* (identical manifest same sha; altered role/required/range changes it)",
+    "excerpt_evidence": "ExcerptEvidence.test_bounds_full_and_excerpt_sha_no_summary",
+    "traversal_absolute": "TraversalAndAbsolute.* (traversal, absolute, out-of-root rejected)",
+    "denylist": "Denylist.test_denied_names_never_enter_body (.env/secret/token/session/cookie/credentials/logs)",
+    "missing_required_source": "MissingRequiredSource.test_blocked_no_partial_body",
+    "optional_source_omission": "OptionalSourceOmission.* (missing optional in omitted[]; required never silently omitted)",
+    "cross_lane_negative_vps_not_checked": "CrossLaneNegativeVpsNotChecked.test_vps_not_checked_unknown_no_absence_verdict",
+    "cross_lane_positive_vps_evidence": "CrossLanePositiveVpsEvidence.test_vps_excerpt_preserved_not_replaced_by_pc",
+    "duplicate_role_violation": "DuplicateAndRoleViolation.* (duplicate path, unlisted role, invalid lane)",
+    "size_cap": "SizeCap.* (blocked/context_limit_exceeded; optional over-cap omitted; no silent truncation)",
+    "json_serialization": "JsonSerialization.test_json_dumps_allow_nan_false_succeeds",
+    "no_side_effect": "NoSideEffect.test_no_network_subprocess_env_mutation_or_write"
+  },
+  "candidate_file_sha256": {
+    "hq_context_pack.py": "93A8A0F1AC46572D0C22DBB243A4F19D92D84C8F428A6CAF54B77CEE6ABE1148",
+    "test_hq_context_pack.py": "CBCE6E5885DB8285E0E5560F5AAC5FDF394208DFC8FFC02E9E0B0807DE80B307",
+    "pre_update_input_hash": {
+      "path": "docs/artifacts/2026-08-31-h1-hq-context-pack-result.json",
+      "sha256": "01476AF6285F4C8909DDF84257CEE53D7D46C76952BAF107F941D8061C4AAB12"
+    }
+  },
+  "bridge_actions_observed": [],
+  "unknowns": [],
+  "scope_compliance": {
+    "files_modified": [
+      "hq_context_pack.py",
+      "test_hq_context_pack.py",
+      "docs/artifacts/2026-08-31-h1-hq-context-pack-result.json"
+    ],
+    "no_other_files_created_or_modified": true,
+    "no_network": true,
+    "no_subprocess_beyond_permitted_test_command": true,
+    "no_git_commit_push_restart_deploy_scheduler_service_bridge_telegram_brain_drive_crm_sheets": true,
+    "read_files_limited_to": [
+      "AGENTS.md",
+      "docs/tasks/h1-hq-context-pack-code-green.md",
+      "hq_context_pack.py (pre-created empty)",
+      "test_hq_context_pack.py (pre-created empty)",
+      "docs/artifacts/2026-08-31-h1-hq-context-pack-result.json (pre-created empty)"
+    ]
+  },
+  "approval_needed": false,
+  "summary": "Implemented a pure, deterministic HQ context-pack builder (hq_context_pack.py) and a 31-test unittest suite (test_hq_context_pack.py) satisfying the full H1 functional contract, including both cross-lane cases (VPS not-checked → explicit unknown/blind-spot with no absence verdict; VPS evidence present → preserved, not replaced by empty PC). `python -m unittest test_hq_context_pack -v` runs green (31/31 OK). Only the three permitted files were touched; no network, Git, subprocess (beyond the permitted test command), Bridge, Telegram, Brain, Drive, CRM, Sheets, env or config access occurred. Marked 'unknown' rather than 'reported_done' solely because the candidate-file SHA-256 (a required packet field) requires a command outside the single permitted command; the owner can compute it independently."
+}
