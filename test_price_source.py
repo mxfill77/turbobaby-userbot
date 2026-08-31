@@ -280,6 +280,115 @@ class TestModelResolution(FlagBase):
         self.assertEqual(b["quote"]["day_price"], 754)
 
 
+# ──────────── 3б. разведение поколений XMAX: ЦЕНОЙ, а не только именем строки ────────────
+
+class TestGenerationSplit(FlagBase):
+    """ЗАМОК РАЗВЕДЕНИЯ ПОКОЛЕНИЙ XMAX 300 (решение владельца 26.08.2026, ПОДТВЕРЖДЕНО 01.09.2026
+    поимённо: «XMAX: точно разделить поколения»).
+
+    ЗАЧЕМ ОТДЕЛЬНЫЙ КЛАСС, а не строка в соседнем. До 01.09 разведение не стерёг НИ ОДИН тест
+    уровня правила, хотя жило оно с 26.08 (2d66cf0): соседний
+    `test_every_live_unit_name_resolves_to_exactly_one_file_row` сверяет у ОБЕИХ строк листа
+    только `model == 'XMAX 300'` — и остался бы ЗЕЛЁНЫМ, слейся поколения обратно в одну строку.
+    Разведение держалось словом артефакта и разовым прибором из scratch-каталога, которого гейт
+    не гоняет (остаток №6 артефакта `2026-08-26-xmax-generations-split.md`). Цена молчаливого
+    отката названа деньгами там же, §8: одна цена на два товара с разницей залога 2000 ฿ —
+    завышение старого поколения на 66 ฿/сут и недобор 39 ฿/сут по новому, а новых юнитов в парке
+    7 из 10.
+
+    ЧИСЕЛ ЦЕНЫ В ЭТОМ КЛАССЕ НЕТ НИ ОДНОГО, и это не опрятность. Ожидания считаются ИЗ САМОГО
+    ФАЙЛА: пересъёмка клеток листа (она законна и уже была у соседних строк CLICK 125 и FORZA 300)
+    красила бы замок, который стережёт не число, а РАЗЛИЧИЕ. Голдены на конкретные 557/662 живут
+    выше — `TestGoldenLiveCases` и `test_shorthand_from_the_live_run_gives_the_published_numbers`.
+    """
+
+    # Живые имена юнитов парка: старое поколение лист метки не даёт, новому даёт слово NEW.
+    OLD_UNIT = "XMAX 300CC BLUE PHUKET 5773"
+    NEW_UNIT = "XMAX 300CC NEW BLACK PHUKET 8969"
+    ANCHOR = datetime.date(2026, 9, 7)      # низкий сезон, опорная корзина 7-13 суток
+
+    def _rows(self):
+        doc = price_source.load()
+        self.assertIsNotNone(doc, "файл правила не прочитан")
+        rows = [m for m in doc["base"]["models"] if m.get("model") == "XMAX 300"]
+        return doc, rows
+
+    def _split(self, rows):
+        """(строка без метки, строка с меткой) — само устройство листа, а не наша догадка."""
+        plain = [r for r in rows if not r.get("unit_marker")]
+        marked = [r for r in rows if r.get("unit_marker")]
+        self.assertEqual((len(plain), len(marked)), (1, 1))
+        return plain[0], marked[0]
+
+    def test_file_holds_two_generation_rows_with_different_bases(self):
+        # Слияние обратно в одну строку — КРАСНОЕ. И различие требуется ЦЕНОЙ: две строки с одной
+        # базой были бы тем же дефектом, только с более приличным видом.
+        _, rows = self._rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len({r.get("generation") for r in rows}), 2)
+        self.assertEqual(len({r.get("sheet_model") for r in rows}), 2)
+        old, new = self._split(rows)
+        self.assertNotEqual(old["base_thb_per_day"], new["base_thb_per_day"])
+        self.assertLess(old["base_thb_per_day"], new["base_thb_per_day"])   # наценка нового
+
+    def test_owner_decision_is_recorded_on_both_generation_rows(self):
+        # Решение владельца живёт В ФАЙЛЕ ПРАВИЛА, а не только в артефакте: следующая пересборка
+        # базы обязана видеть, что разведение — РЕШЕНИЕ, а не догадка сборщика.
+        _, rows = self._rows()
+        for r in rows:
+            self.assertIn("XMAX: точно разделить поколения", r.get("owner_decision") or "",
+                          r.get("generation"))
+
+    def test_live_unit_names_resolve_each_to_its_own_generation(self):
+        doc, rows = self._rows()
+        old, new = self._split(rows)
+        for unit, want in ((self.OLD_UNIT, old), (self.NEW_UNIT, new)):
+            row, how = price_source.resolve_row(doc, "XMAX", suggest._bike_key, {"bike": unit})
+            self.assertIsNotNone(row, "%s → %s" % (unit, how))
+            self.assertEqual(row.get("generation"), want.get("generation"), unit)
+
+    def test_two_generations_cost_different_money_on_the_same_window(self):
+        # ДЕНЬГАМИ, а не строкой файла. Окно одно, сезон один, корзина срока одна — значит цена
+        # суток обязана разойтись РОВНО отношением баз: сезон и срок поколения не различают.
+        doc, rows = self._rows()
+        old, new = self._split(rows)
+        got = {}
+        for unit in (self.OLD_UNIT, self.NEW_UNIT):
+            day, info = price_source.day_price(doc, "XMAX", self.ANCHOR, 7,
+                                               suggest._bike_key, quote={"bike": unit})
+            self.assertIsNotNone(day, "%s → %s" % (unit, info))
+            got[unit] = day
+        self.assertNotEqual(got[self.OLD_UNIT], got[self.NEW_UNIT])
+        self.assertLess(got[self.OLD_UNIT], got[self.NEW_UNIT])
+        expected_new = got[self.OLD_UNIT] * (float(new["base_thb_per_day"])
+                                             / float(old["base_thb_per_day"]))
+        self.assertLessEqual(abs(got[self.NEW_UNIT] - expected_new), 1.5,
+                             "%s против %s" % (got, expected_new))
+
+    def test_file_marker_and_product_splitter_call_the_same_units_new(self):
+        # ДВА механизма, одна правда. Метку поколения держит файл правила (`unit_marker`), а
+        # продуктовую строку клиенту — `suggest._xmax_is_new_gen`. Разъедутся молча — клиент
+        # увидит строку «XMAX 300 New Gen» с ценой СТАРОГО поколения, и наоборот.
+        doc, rows = self._rows()
+        _, new = self._split(rows)
+        for unit, want_new in ((self.OLD_UNIT, False), (self.NEW_UNIT, True)):
+            row, how = price_source.resolve_row(doc, "XMAX", suggest._bike_key, {"bike": unit})
+            self.assertIsNotNone(row, "%s → %s" % (unit, how))
+            self.assertEqual(row.get("generation") == new.get("generation"), want_new, unit)
+            self.assertEqual(bool(suggest._xmax_is_new_gen(unit)), want_new, unit)
+
+    def test_speech_without_a_marker_gets_no_generation_and_no_price(self):
+        # FAIL-CLOSED. В обрывке речи клиента («XMAX») метки не бывает НИКОГДА, и молчаливый выбор
+        # строки без метки назвал бы цену старого байка за новый — ровно тот дефект, который заход
+        # 26.08 и чинил (артефакт §10, поймано гейтом). Молчание дешевле чужой карточки.
+        doc, _ = self._rows()
+        row, how = price_source.resolve_row(doc, "XMAX", suggest._bike_key)
+        self.assertIsNone(row)
+        self.assertIn("не угадываем", how)
+        day, info = price_source.day_price(doc, "XMAX", self.ANCHOR, 7, suggest._bike_key)
+        self.assertIsNone(day, info)
+
+
 # ───────────────────────────── 4. отрицательные замки ─────────────────────────────
 
 class TestNegative(FlagBase):
