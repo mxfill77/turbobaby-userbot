@@ -30,10 +30,12 @@ class _Bundle(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="content_product_verifier_")
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
-        task = '{"task":"fixture only"}'
+        task = ('{"schema_version":"v0.1","required_content_gates":['
+                '{"gate_id":"state","artifact_id":"product","type":"json_field_equals",'
+                '"params":{"field":"state","equals":"green"}}]}')
         result = '{"reported_claim":"reported_done","unknowns":[]}'
         candidate = 'value = "green"\n'
-        stdout = "1 passed\n"
+        stdout = '{"test_id":"fixture","exit_code":0,"passed":1,"failed":0,"errors":0}'
         artifact = '{"state":"green","nested":{"ok":true}}'
         self.hashes = {
             "task": _write(self.root, "task.json", task),
@@ -75,9 +77,18 @@ class TestVerdicts(_Bundle):
     def test_missing_required_content_is_disproven(self):
         bundle = self.bundle()
         bundle["content_gates"][0]["params"]["equals"] = "red"
+        task = {"schema_version": "v0.1", "required_content_gates": bundle["content_gates"]}
+        self.hashes["task"] = _write(self.root, "task.json", json.dumps(task, separators=(",", ":")))
+        bundle["task_packet"]["sha256"] = self.hashes["task"]
         got = cpv.verify_case(bundle)
         self.assertEqual(got["verdict"], cpv.DISPROVEN)
         self.assertEqual(got["reason_code"], "field_not_equal")
+
+    def test_executor_cannot_replace_task_declared_gates(self):
+        bundle = self.bundle()
+        bundle["content_gates"] = []
+        got = cpv.verify_case(bundle)
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.DISPROVEN, "task_gate_binding_mismatch"))
 
     def test_hash_mismatch_is_disproven(self):
         bundle = self.bundle()
@@ -93,6 +104,12 @@ class TestVerdicts(_Bundle):
         bundle = self.bundle()
         bundle["test_evidence"][0]["stdout_path"] = "missing.txt"
         self.assertEqual(cpv.verify_case(bundle)["verdict"], cpv.UNKNOWN)
+
+    def test_stdout_receipt_not_bundle_summary_is_test_evidence(self):
+        text = '{"test_id":"fixture","exit_code":0,"passed":0,"failed":0,"errors":0}'
+        self.hashes["stdout"] = _write(self.root, "tests.txt", text)
+        got = cpv.verify_case(self.bundle())
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.DISPROVEN, "test_summary_mismatch"))
 
     def test_extra_changed_path_is_disproven(self):
         bundle = self.bundle()
@@ -136,6 +153,20 @@ class TestVerdicts(_Bundle):
         bundle["allowed_changed_paths"] = ["candidate.py", "candidate.py"]
         self.assertEqual(cpv.verify_case(bundle)["verdict"], cpv.UNKNOWN)
 
+    def test_parent_symlink_is_disproven_before_reading_leaf(self):
+        outside = tempfile.mkdtemp(prefix="content_product_outside_")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        _write(outside, "escape.json", '{"task":"outside"}')
+        linked = os.path.join(self.root, "linked")
+        try:
+            os.symlink(outside, linked, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable on this Windows account")
+        bundle = self.bundle()
+        bundle["task_packet"]["path"] = "linked/escape.json"
+        bundle["task_packet"]["sha256"] = _sha('{"task":"outside"}')
+        self.assertEqual(cpv.verify_case(bundle)["verdict"], cpv.DISPROVEN)
+
 
 class TestNoSideEffects(unittest.TestCase):
     def test_module_has_no_network_process_environment_or_write_calls(self):
@@ -152,6 +183,9 @@ class TestNoSideEffects(unittest.TestCase):
     def test_output_is_bounded_and_contains_no_absolute_root(self):
         payload = {"x": "y"}
         self.assertLessEqual(len(cpv.canonical_result_bytes(payload)), cpv.MAX_OUTPUT_BYTES)
+        huge = cpv._output("x" * (cpv.MAX_OUTPUT_BYTES * 2), cpv.UNKNOWN, "x", "unknown", [])
+        self.assertLessEqual(len(cpv.canonical_result_bytes(huge)), cpv.MAX_OUTPUT_BYTES)
+        self.assertEqual(huge["case_id"], "")
 
 
 if __name__ == "__main__":

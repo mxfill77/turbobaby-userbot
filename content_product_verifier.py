@@ -23,6 +23,13 @@ VERDICTS = (PROVEN, DISPROVEN, UNKNOWN)
 
 MAX_OUTPUT_BYTES = 32_000
 DEFAULT_MAX_BYTES = 200_000
+MAX_CASE_ID_CHARS = 128
+MAX_PATH_CHARS = 240
+MAX_IDENTIFIER_CHARS = 80
+MAX_MANIFEST_RECORDS = 64
+MAX_ARTIFACTS = 32
+MAX_TEST_EVIDENCE = 32
+MAX_CONTENT_GATES = 32
 ALLOWED_CONTENT_TYPES = ("json", "text", "python")
 ALLOWED_GATE_TYPES = (
     "json_field_equals",
@@ -66,6 +73,8 @@ def _valid_sha256(value, nullable=False):
 def _normalise_rel(path):
     if not isinstance(path, str) or not path.strip():
         raise UnsafeEvidenceError("empty_path")
+    if len(path) > MAX_PATH_CHARS:
+        raise UnsafeEvidenceError("path_too_long")
     if os.path.isabs(path) or _DRIVE_RE.match(path) or path.startswith(("//", "\\\\")):
         raise UnsafeEvidenceError("absolute_path")
     parts = []
@@ -84,6 +93,8 @@ def _root_path(root, rel):
     if not isinstance(root, str) or not os.path.isabs(root):
         raise VerificationInputError("invalid_workspace_root")
     root_abs = os.path.abspath(root)
+    if os.path.islink(root_abs):
+        raise UnsafeEvidenceError("workspace_root_symlink")
     full = os.path.abspath(os.path.join(root_abs, rel.replace("/", os.sep)))
     try:
         inside = os.path.commonpath((root_abs, full)) == root_abs
@@ -91,6 +102,21 @@ def _root_path(root, rel):
         inside = False
     if not inside:
         raise UnsafeEvidenceError("outside_workspace_root")
+    current = root_abs
+    for part in rel.split("/"):
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            raise UnsafeEvidenceError("symlink")
+    # ``commonpath`` above is lexical.  This second check catches a platform
+    # junction/symlink that resolves outside root even when the named leaf is
+    # not itself a symlink.
+    root_real = os.path.realpath(root_abs)
+    full_real = os.path.realpath(full)
+    try:
+        if os.path.commonpath((root_real, full_real)) != root_real:
+            raise UnsafeEvidenceError("resolved_outside_workspace_root")
+    except ValueError as exc:
+        raise UnsafeEvidenceError("resolved_outside_workspace_root") from exc
     return full
 
 
@@ -153,6 +179,16 @@ def _gate(gate_id, status, reason_code, evidence_refs=()):
     }
 
 
+def _identifier(value, label):
+    if not isinstance(value, str) or not value or len(value) > MAX_IDENTIFIER_CHARS:
+        raise VerificationInputError("invalid_%s" % label)
+    return value
+
+
+def _safe_case_id(value):
+    return value if isinstance(value, str) and 0 < len(value) <= MAX_CASE_ID_CHARS else ""
+
+
 def _unsafe_verdict(reason):
     """Unreadable or secret-like evidence is uncertainty, not a contradiction."""
     return UNKNOWN if reason in ("binary_or_non_utf8", "sensitive_content") else DISPROVEN
@@ -161,7 +197,7 @@ def _unsafe_verdict(reason):
 def _output(case_id, verdict, reason_code, reported_claim, gates, unknowns=(), verified_scope=(), refs=None):
     result = {
         "schema_version": SCHEMA,
-        "case_id": case_id if isinstance(case_id, str) else "",
+        "case_id": _safe_case_id(case_id),
         "verdict": verdict,
         "reason_code": reason_code,
         "reported_claim": reported_claim,
@@ -174,13 +210,21 @@ def _output(case_id, verdict, reason_code, reported_claim, gates, unknowns=(), v
     }
     encoded = _canonical(result).encode("utf-8")
     if len(encoded) > MAX_OUTPUT_BYTES:
-        # This has no caller-controlled excerpt, so the fallback remains bounded.
-        result["verdict"] = UNKNOWN
-        result["reason_code"] = "output_too_large"
-        result["gates"] = [_gate("V0_OUTPUT_BOUND", "UNKNOWN", "output_too_large")]
-        result["unknowns"] = [{"reason_code": "output_too_large", "evidence_ref": ""}]
-        result["verified_scope"] = []
-        result["next_action"] = "owner_review"
+        # Rebuild rather than mutate: no caller-controlled gate, path or id may
+        # survive this fallback and bypass the stated output bound.
+        result = {
+            "schema_version": SCHEMA,
+            "case_id": _safe_case_id(case_id),
+            "verdict": UNKNOWN,
+            "reason_code": "output_too_large",
+            "reported_claim": "unknown",
+            "verified_scope": [],
+            "input_refs": {},
+            "gates": [_gate("V0_OUTPUT_BOUND", "UNKNOWN", "output_too_large")],
+            "unknowns": [{"reason_code": "output_too_large", "evidence_ref": ""}],
+            "forbidden_actions_observed": [],
+            "next_action": "owner_review",
+        }
     return result
 
 
@@ -191,7 +235,7 @@ def _stop(case_id, reported_claim, gate_id, verdict, reason_code, refs=None, sco
 
 
 def _manifest(root, raw, name):
-    if not isinstance(raw, list) or not raw:
+    if not isinstance(raw, list) or not raw or len(raw) > MAX_MANIFEST_RECORDS:
         raise VerificationInputError("invalid_%s_manifest" % name)
     records = []
     seen = set()
@@ -226,11 +270,11 @@ def _nested_field(value, field):
 def _content_gate(spec, artifacts):
     if not isinstance(spec, dict):
         raise VerificationInputError("invalid_content_gate")
-    gate_id = spec.get("gate_id")
-    artifact_id = spec.get("artifact_id")
+    gate_id = _identifier(spec.get("gate_id"), "gate_id")
+    artifact_id = _identifier(spec.get("artifact_id"), "artifact_id")
     kind = spec.get("type")
     params = spec.get("params")
-    if not isinstance(gate_id, str) or not gate_id or artifact_id not in artifacts or kind not in ALLOWED_GATE_TYPES or not isinstance(params, dict):
+    if artifact_id not in artifacts or kind not in ALLOWED_GATE_TYPES or not isinstance(params, dict):
         raise VerificationInputError("invalid_content_gate")
     evidence = artifacts[artifact_id]
     if kind.startswith("json_"):
@@ -270,6 +314,55 @@ def _content_gate(spec, artifacts):
     return _gate(gate_id, "PASS" if not disallowed else "FAIL", "ok" if not disallowed else "forbidden_import", (artifact_id,))
 
 
+def _task_gate_specs(task):
+    """The task, not the executor bundle, names the checks that prove it."""
+    body = _parse_json(task)
+    if body.get("schema_version") != "v0.1":
+        raise VerificationInputError("invalid_task_packet_schema")
+    gates = body.get("required_content_gates")
+    if not isinstance(gates, list) or not gates or len(gates) > MAX_CONTENT_GATES:
+        raise VerificationInputError("invalid_task_content_gates")
+    # A canonical deep copy rejects non-JSON values and makes the later equality
+    # comparison independent of dict formatting or key order.
+    try:
+        return json.loads(_canonical(gates))
+    except (TypeError, ValueError) as exc:
+        raise VerificationInputError("invalid_task_content_gates") from exc
+
+
+def _stdout_evidence(root, spec):
+    """Read and parse the saved test receipt; bundle claims are not evidence."""
+    if not isinstance(spec, dict):
+        raise VerificationInputError("invalid_test_evidence")
+    test_id = _identifier(spec.get("test_id"), "test_id")
+    _identifier(spec.get("declared_command_id"), "declared_command_id")
+    stdout = _read_declared(
+        root,
+        {
+            "path": spec.get("stdout_path"),
+            "sha256": spec.get("stdout_sha256"),
+            "max_bytes": spec.get("max_bytes", DEFAULT_MAX_BYTES),
+            "content_type": "json",
+        },
+        expected_types=("json",),
+    )
+    receipt = _parse_json(stdout)
+    summary = spec.get("expected_summary")
+    if not isinstance(summary, dict) or any(
+        not isinstance(summary.get(key), int) or isinstance(summary.get(key), bool) or summary[key] < 0
+        for key in ("passed", "failed", "errors")
+    ):
+        raise VerificationInputError("invalid_test_summary")
+    if receipt.get("test_id") != test_id or receipt.get("exit_code") != spec.get("exit_code"):
+        raise UnsafeEvidenceError("test_receipt_mismatch")
+    actual_summary = {key: receipt.get(key) for key in ("passed", "failed", "errors")}
+    if actual_summary != summary:
+        raise UnsafeEvidenceError("test_summary_mismatch")
+    if receipt["exit_code"] != 0 or actual_summary["failed"] or actual_summary["errors"]:
+        raise UnsafeEvidenceError("test_evidence_failed")
+    return stdout
+
+
 def verify_case(bundle):
     """Verify one explicitly declared local evidence bundle.
 
@@ -283,10 +376,11 @@ def verify_case(bundle):
     try:
         if not isinstance(bundle, dict) or bundle.get("schema_version") != "v0.1":
             raise VerificationInputError("unsupported_schema")
-        if not isinstance(case_id, str) or not case_id:
+        if not isinstance(case_id, str) or not case_id or len(case_id) > MAX_CASE_ID_CHARS:
             raise VerificationInputError("invalid_case_id")
         root = bundle.get("workspace_root")
-        task = _read_declared(root, bundle.get("task_packet"), expected_types=("text", "json"))
+        task = _read_declared(root, bundle.get("task_packet"), expected_types=("json",))
+        task_gates = _task_gate_specs(task)
         result = _read_declared(root, bundle.get("result_packet"), expected_types=("json",))
         result_body = _parse_json(result)
         reported_claim = result_body.get("reported_claim", "unknown")
@@ -339,19 +433,23 @@ def verify_case(bundle):
     artifacts = {}
     try:
         required = bundle.get("required_artifacts")
-        if not isinstance(required, list):
+        if not isinstance(required, list) or len(required) > MAX_ARTIFACTS:
             raise VerificationInputError("invalid_required_artifacts")
         for record in required:
-            if not isinstance(record, dict) or not isinstance(record.get("artifact_id"), str) or not record["artifact_id"]:
+            if not isinstance(record, dict):
                 raise VerificationInputError("invalid_artifact_id")
-            if record["artifact_id"] in artifacts:
+            artifact_id = _identifier(record.get("artifact_id"), "artifact_id")
+            if artifact_id in artifacts:
                 raise VerificationInputError("duplicate_artifact_id")
             if record.get("required") is not True:
                 raise VerificationInputError("artifact_not_required")
-            artifacts[record["artifact_id"]] = _read_declared(root, record, expected_types=ALLOWED_CONTENT_TYPES)
+            artifacts[artifact_id] = _read_declared(root, record, expected_types=ALLOWED_CONTENT_TYPES)
         content_gates = bundle.get("content_gates")
-        if not isinstance(content_gates, list):
+        if not isinstance(content_gates, list) or len(content_gates) > MAX_CONTENT_GATES:
             raise VerificationInputError("invalid_content_gates")
+        if _canonical(content_gates) != _canonical(task_gates):
+            return _output(case_id, DISPROVEN, "task_gate_binding_mismatch", reported_claim, gates + [_gate("V0_TASK_BINDING", "FAIL", "task_gate_binding_mismatch", (task["path"],))], (), (), refs)
+        gates.append(_gate("V0_TASK_BINDING", "PASS", "task_declares_content_gates", (task["path"],)))
         content_results = [_content_gate(spec, artifacts) for spec in content_gates]
         failed = next((gate for gate in content_results if gate["status"] == "FAIL"), None)
         if failed:
@@ -366,17 +464,10 @@ def verify_case(bundle):
 
     try:
         evidence_specs = bundle.get("test_evidence")
-        if not isinstance(evidence_specs, list):
+        if not isinstance(evidence_specs, list) or len(evidence_specs) > MAX_TEST_EVIDENCE:
             raise VerificationInputError("invalid_test_evidence")
         for spec in evidence_specs:
-            if not isinstance(spec, dict) or not isinstance(spec.get("test_id"), str) or not isinstance(spec.get("declared_command_id"), str):
-                raise VerificationInputError("invalid_test_evidence")
-            stdout = _read_declared(root, {"path": spec.get("stdout_path"), "sha256": spec.get("stdout_sha256"), "max_bytes": spec.get("max_bytes", DEFAULT_MAX_BYTES), "content_type": "text"}, expected_types=("text",))
-            summary = spec.get("expected_summary")
-            if not isinstance(summary, dict) or any(not isinstance(summary.get(key), int) or isinstance(summary.get(key), bool) or summary[key] < 0 for key in ("passed", "failed", "errors")):
-                raise VerificationInputError("invalid_test_summary")
-            if spec.get("exit_code") != 0 or summary["failed"] or summary["errors"]:
-                return _output(case_id, DISPROVEN, "test_evidence_failed", reported_claim, gates + [_gate("V0_TEST_EVIDENCE", "FAIL", "test_evidence_failed", (stdout["path"],))], (), (), refs)
+            _stdout_evidence(root, spec)
         gates.append(_gate("V0_TEST_EVIDENCE", "PASS", "ok"))
     except UnsafeEvidenceError as exc:
         return _output(case_id, DISPROVEN, str(exc), reported_claim, gates + [_gate("V0_TEST_EVIDENCE", "FAIL", str(exc))], (), (), refs)
