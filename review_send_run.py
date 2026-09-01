@@ -16,6 +16,11 @@ HTTP, чтение пакета, запись ответа в `docs/review_inbox
 публичного HTTPS-адреса, куда Manus сам шлёт POST и проверяет доступность
 пробным запросом, — у ПК-полосы такого адреса нет, наружу она только ходит.
 
+И у канала ДВА предела, а не один: жёсткие 5000 estimated tokens (код 400) и
+МОЛЧАЛИВЫЙ срез сообщения около 2400 знаков — принятое кодом 200 длинное
+сообщение канал прячет во вложение, а ревьюер вложений не открывает. Поэтому
+длинное исходящее едет ЧАСТЯМИ по одной задаче (`taskId`), см. :func:`send_manus`.
+
 Коды возврата: 0 — все запрошенные каналы ответили; 3 — хотя бы один отказал
 (в сухом прогоне — страж задержал исходящее); 4 — отказов нет, но есть
 «неизвестно»; 2 — вход недействителен (пакета нет, имя канала не то), файлов не
@@ -73,6 +78,17 @@ DEFAULT_MANUS_TASK_PATH = "/v1/tasks/{task_id}"
 # Терминальны два последних; всё прочее (включая незнакомое слово) — «ещё идёт».
 _MANUS_DONE = "completed"
 _MANUS_FAILED = "failed"
+# `running` — это «агент РАБОТАЕТ ПРЯМО СЕЙЧАС», и короткое молчание в этом
+# состоянии затишьем считать нельзя. Живая проба 01.09: ревьюер бросил
+# промежуточную реплику «Проверяю пакет по трём вопросам.» и задумался на 48 с
+# при `status=running` — правило затишья сочло это ответом и выдало 32 знака
+# вместо разбора, а задача спокойно доработала до `completed` сама. Но и ГЛУХОЙ
+# запрет тут неверен: соседняя задача просидела в нетерминальном состоянии
+# полчаса с готовым ответом. Поэтому не запрет, а ЦЕНА: при объявленной работе
+# затишье обязано быть вчетверо длиннее (при шаге 8 с это ~3.2 мин полной
+# тишины против 48 с, на которых правило и споткнулось).
+_MANUS_RUNNING = "running"
+MANUS_RUNNING_QUIET_FACTOR = 4
 _NA_STATE = "—"
 
 DEFAULT_TIMEOUT = 900
@@ -95,6 +111,45 @@ DEFAULT_MANUS_POLL = 10
 # признак — ЗАТИШЬЕ: `updated_at`, число сообщений и последнее сообщение не
 # менялись 6 опросов подряд (60 с при шаге 10 с).
 MANUS_SETTLE_POLLS = 6
+
+# Сколько знаков канал держит ВСТРОЕННЫМ ТЕКСТОМ в одном сообщении. Порог 400 —
+# не единственный: ПОД ним канал молча срезает длинное сообщение и укладывает
+# остаток ВЛОЖЕНИЕМ, оставляя ревьюеру ~1100 знаков и строку
+# «...(message too long, full content saved as attachment "…txt")». Ревьюер
+# вложение не открывает (правило №1 нашего же конверта), то есть судит по
+# заголовку — и честно об этом говорит. Замеры 01.09.2026, маркерными пробами
+# (маркеры по всей длине, ревьюер перечисляет видимые):
+#
+#   2169 знаков / 3938 байт — вложений 0, видны ВСЕ 4 маркера;
+#   2400 знаков / 4373 байта — вложений 0, виден и последний маркер на 2389;
+#   4790 знаков / 8727 байт — вложение 1, видно 1100 знаков, виден 1 маркер из 6.
+#
+# Значит граница лежит в (2400, 4790] знаков; берём проверенные 2400 как потолок
+# СООБЩЕНИЯ и режем с запасом. Порог 5000 estimated tokens тут ни при чём — он
+# срабатывает выше и кодом 400, а этот срез молчалив.
+MANUS_INLINE_MAX = 2400
+# Место под рамку части (кто говорит, какая это часть из скольких и что делать).
+# Считается из потолка, а не сверх него: рамка едет в ТОМ ЖЕ сообщении.
+MANUS_PART_OVERHEAD = 420
+MANUS_CHUNK_CHARS = MANUS_INLINE_MAX
+
+# Рамка части. Метка ОБЯЗАНА стоять в начале сообщения: канал показывает голову
+# сообщения, и по этой же метке отправщик потом находит, откуда в переписке
+# начинается ОТВЕТ на последнюю часть.
+_PART_MARK = "[ЧАСТЬ %d/%d]"
+_PART_FIRST = (
+    "ПАКЕТ ПРИДЁТ %(n)d ЧАСТЯМИ ОДНИМ ПОТОКОМ: канал не принимает его целиком —\n"
+    "длинное сообщение он срезает и прячет остаток во вложение, а вложения тебе\n"
+    "открывать нельзя. Части — это ОДИН разрезанный текст, а не разные задачи.\n"
+    "На части 1..%(prev)d отвечай РОВНО одним словом: ПРИНЯТО. Ничего не разбирай:\n"
+    "правила ответа и три вопроса придут в части %(n)d/%(n)d.\n\n"
+    "%(mark)s\n"
+)
+_PART_NEXT = "%(mark)s — продолжение того же текста. Ответь одним словом: ПРИНЯТО.\n"
+_PART_LAST = (
+    "%(mark)s — ПОСЛЕДНЯЯ. Склей части 1..%(n)d подряд в один текст и отвечай\n"
+    "по правилам и трём вопросам из него. Ответ — текстом.\n"
+)
 # Сокет одного опроса: короткий сознательно — опрос дешёвый и повторяемый, а
 # долгий сокет съел бы весь бюджет ожидания одним висящим соединением.
 MANUS_POLL_HTTP_TIMEOUT = 60
@@ -347,7 +402,7 @@ def _msg_text(msg):
     return parts
 
 
-def manus_output_text(body, roles=("assistant",)):
+def manus_output_text(body, roles=("assistant",), after_marker=None):
     """Состояние задачи и её текст из тела `GET /v1/tasks/{id}`. → (state|None, text, note).
 
     Форма снята с доки v1 (`get-task`) и подтверждена живым телом 01.09: результат
@@ -370,6 +425,20 @@ def manus_output_text(body, roles=("assistant",)):
     raw_state = obj.get("status")
     state = raw_state.strip().lower() if isinstance(raw_state, str) else None
     messages = _manus_messages(body)
+    # Отсечка по метке последней части. Нужна ровно потому, что при досылке
+    # частями в переписке лежат наши же «ПРИНЯТО»-ответы, а между ними канал
+    # умеет вставлять СВОЁ служебное `continue` с ролью `user` (видели живьём).
+    # Брать «хвост подряд идущих ассистентов» из-за этого нельзя: чужой
+    # `continue` посреди ответа отрезал бы его первую половину. Берём всё, что
+    # сказано ПОСЛЕ нашей последней части; метки нет — берём всё, и это честно.
+    dropped_before = 0
+    if after_marker:
+        for i, msg in enumerate(messages):
+            role = msg.get("role")
+            role = role.strip().lower() if isinstance(role, str) else None
+            if role == "user" and any(after_marker in part for part in _msg_text(msg)):
+                dropped_before = i + 1
+        messages = messages[dropped_before:]
     wanted = {role.lower() for role in (roles or ())}
     roles_present = any(isinstance(msg.get("role"), str) and msg.get("role").strip() for msg in messages)
     parts = []
@@ -385,8 +454,8 @@ def manus_output_text(body, roles=("assistant",)):
     return (
         state,
         text,
-        "состояние %s, сообщений %d (чужих ролей пропущено %d), текстовых кусков %d"
-        % (state or _NA_STATE, len(messages), skipped, len(parts)),
+        "состояние %s, сообщений %d (до метки отброшено %d, чужих ролей пропущено %d), текстовых кусков %d"
+        % (state or _NA_STATE, len(messages), dropped_before, skipped, len(parts)),
     )
 
 
@@ -447,6 +516,194 @@ def fetch_manus_task(task_id, *, key, base=DEFAULT_MANUS_BASE, task_path=DEFAULT
     return manus_http(url, key=key, method="GET", timeout=timeout)
 
 
+def manus_chunks(text, limit):
+    """Разрезать текст на куски не длиннее предела. → list[str].
+
+    Режем ПО ГРАНИЦАМ СТРОК, пока это возможно: пакет второго мнения —
+    размеченный текст, и разрыв посреди строки таблицы, хеша или пути делает
+    кусок нечитаемым ровно там, где ревьюер должен что-то сверить. Строку
+    длиннее предела режем жёстко: одна длинная строка иначе сорвала бы заход.
+    Склейка кусков подряд обязана давать ИСХОДНЫЙ текст знак в знак — на этом
+    стоит вся честность досылки, поэтому переносы строк остаются внутри кусков
+    (``splitlines(True)``), а не выбрасываются.
+    """
+    limit = max(200, int(limit))
+    out, cur, cur_len = [], [], 0
+    for line in text.splitlines(True):
+        while len(line) > limit:
+            if cur:
+                out.append("".join(cur))
+                cur, cur_len = [], 0
+            out.append(line[:limit])
+            line = line[limit:]
+        if cur and cur_len + len(line) > limit:
+            out.append("".join(cur))
+            cur, cur_len = [], 0
+        cur.append(line)
+        cur_len += len(line)
+    if cur:
+        out.append("".join(cur))
+    return out or [""]
+
+
+def manus_parts(prompt, limit=MANUS_CHUNK_CHARS, overhead=MANUS_PART_OVERHEAD):
+    """Готовые СООБЩЕНИЯ канала (кусок текста плюс рамка части). → list[str].
+
+    Умещается целиком — одно сообщение и никакой рамки: лишняя обёртка на
+    коротком пакете только мешала бы ревьюеру. Не умещается — рамка обязательна,
+    иначе части выглядят как отдельные задачи и ревьюер отвечает на каждую.
+    """
+    if not limit or len(prompt) <= limit:
+        return [prompt]
+    bodies = manus_chunks(prompt, max(200, limit - overhead))
+    total = len(bodies)
+    out = []
+    for index, body in enumerate(bodies, 1):
+        mark = _PART_MARK % (index, total)
+        if index == 1:
+            head = _PART_FIRST % {"n": total, "prev": total - 1, "mark": mark}
+        elif index == total:
+            head = _PART_LAST % {"n": total, "mark": mark}
+        else:
+            head = _PART_NEXT % {"mark": mark}
+        out.append(head + body)
+    return out
+
+
+def _wait_settled(facts, *, key, base, task_path, poll, settle_polls, deadline, started, clock, sleep, tag=""):
+    """Опрашивать задачу, пока она не замрёт. → "ready" | "timeout" | "http" | "failed".
+
+    Обновляет ``facts`` на месте. НИ ОДНА ветка не превращает «не дождались» в
+    «готово»: истёкший предел выходит исходом ``timeout`` и оставляет в фактах
+    обрыв ПОСЛЕ отправки, который классификатор зовёт «неизвестно».
+    """
+    facts["last_signature"] = None
+    facts["settled_polls"] = 0
+    while True:
+        facts["waited_sec"] = int(clock() - started)
+        if clock() >= deadline:
+            facts["request_sent"] = True
+            facts["transport_error"] = (
+                "poll_timeout: задача %s не дошла до готовности%s за %d с "
+                "(опросов %d, последнее состояние %s%s)"
+                % (
+                    facts.get("task_id"),
+                    tag,
+                    facts["waited_sec"],
+                    facts["polls"],
+                    facts["last_state"] or _NA_STATE,
+                    "; последний обрыв опроса: %s" % facts["last_poll_error"] if facts["last_poll_error"] else "",
+                )
+            )
+            return "timeout"
+
+        sleep(poll)
+        got = fetch_manus_task(facts["task_id"], key=key, base=base, task_path=task_path)
+        facts["polls"] += 1
+        facts["waited_sec"] = int(clock() - started)
+
+        if got["transport_error"]:
+            # Обрыв ОДНОГО опроса приговором не является: работа уже принята и
+            # идёт на той стороне. Повторяем до предела, но последний обрыв
+            # помним — он попадёт в отчёт, если предел истечёт.
+            facts["last_poll_error"] = got["transport_error"]
+            continue
+
+        facts["status"] = got["status"]
+        facts["body"] = got["body"]
+        facts["poll_target"] = got["target"]
+        if got["status"] is None or int(got["status"]) >= 400:
+            return "http"  # 401/404/429 на заборе — отказ с дословным телом
+
+        state, _text, note = manus_output_text(got["body"])
+        facts["last_state"] = state
+        facts["poll_note"] = note
+
+        if state == _MANUS_FAILED:
+            facts["request_sent"] = True
+            facts["transport_error"] = "task_failed: задача %s кончилась состоянием failed (%s)" % (
+                facts.get("task_id"),
+                manus_error_text(got["body"]) or "текста ошибки канал не дал",
+            )
+            return "failed"
+
+        signature = manus_settled_signature(got["body"])
+        if signature and signature == facts["last_signature"]:
+            facts["settled_polls"] += 1
+        else:
+            facts["last_signature"] = signature
+            facts["settled_polls"] = 0
+
+        if state == _MANUS_DONE:
+            facts["ready_by"] = "status=completed"
+            return "ready"
+        needed = settle_polls * (MANUS_RUNNING_QUIET_FACTOR if state == _MANUS_RUNNING else 1)
+        if signature and facts["settled_polls"] >= needed:
+            facts["ready_by"] = "затишье %d опросов подряд (нужно было %d) при status=%s" % (
+                facts["settled_polls"],
+                needed,
+                state or _NA_STATE,
+            )
+            return "ready"
+
+
+def _wait_reply(facts, *, marker, key, base, task_path, poll, deadline, started, clock, sleep, tag=""):
+    """Дождаться ОТВЕТА канала на конкретную часть. → "ready" | "timeout" | "http" | "failed".
+
+    Между частями ждать «затишья» нельзя и не нужно. Нельзя — потому что
+    `status` живой задачи неделями сидит в `running`/`pending` и о готовности
+    ничего не сообщает (обе живые пробы 01.09). Не нужно — потому что здесь есть
+    ПОЛОЖИТЕЛЬНЫЙ признак, а не догадка: после нашей части появилось сообщение
+    ассистента с текстом, значит часть принята и можно слать следующую.
+    """
+    while True:
+        facts["waited_sec"] = int(clock() - started)
+        if clock() >= deadline:
+            facts["request_sent"] = True
+            facts["transport_error"] = (
+                "poll_timeout: задача %s не ответила%s за %d с (опросов %d, последнее состояние %s%s)"
+                % (
+                    facts.get("task_id"),
+                    tag,
+                    facts["waited_sec"],
+                    facts["polls"],
+                    facts["last_state"] or _NA_STATE,
+                    "; последний обрыв опроса: %s" % facts["last_poll_error"] if facts["last_poll_error"] else "",
+                )
+            )
+            return "timeout"
+
+        sleep(poll)
+        got = fetch_manus_task(facts["task_id"], key=key, base=base, task_path=task_path)
+        facts["polls"] += 1
+        facts["waited_sec"] = int(clock() - started)
+
+        if got["transport_error"]:
+            facts["last_poll_error"] = got["transport_error"]
+            continue
+
+        facts["status"] = got["status"]
+        facts["body"] = got["body"]
+        facts["poll_target"] = got["target"]
+        if got["status"] is None or int(got["status"]) >= 400:
+            return "http"
+
+        state, text, note = manus_output_text(got["body"], after_marker=marker)
+        facts["last_state"] = state
+        facts["poll_note"] = note
+
+        if state == _MANUS_FAILED:
+            facts["request_sent"] = True
+            facts["transport_error"] = "task_failed: задача %s кончилась состоянием failed (%s)" % (
+                facts.get("task_id"),
+                manus_error_text(got["body"]) or "текста ошибки канал не дал",
+            )
+            return "failed"
+
+        if text.strip():
+            return "ready"
+
+
 def send_manus(
     prompt,
     *,
@@ -458,40 +715,61 @@ def send_manus(
     wait=DEFAULT_MANUS_WAIT,
     poll=DEFAULT_MANUS_POLL,
     settle_polls=MANUS_SETTLE_POLLS,
+    chunk_chars=MANUS_CHUNK_CHARS,
     profile=None,
     notice=None,
     sleep=time.sleep,
     clock=time.monotonic,
 ):
-    """Создать задачу в Manus и ДОЖДАТЬСЯ результата. → dict фактов (без суждений).
+    """Довести текст до ревьюера в Manus и дождаться ответа. → dict фактов (без суждений).
 
-    Канал АСИНХРОНЕН, и это не мелочь реализации, а его контракт: `POST /v1/tasks`
-    отдаёт код 200 и `task_id` — приём работы, а не ответ. Ровно на этом
-    отправщик и стоял до сегодня: 200 без текста уезжал наверх как
-    «принято, ответа нет» (`accepted_no_answer`) и выглядел исправной отправкой
-    с вечно пустым лотком.
+    Канал ставит отправщику ДВА разных предела, и путать их нельзя:
 
-    Ни одна ветка НЕ превращает «не дождались» в «готово». Истёкшее ожидание
-    уезжает наверх ОБРЫВОМ ПОСЛЕ ОТПРАВКИ (``transport_error`` при
-    ``request_sent=True``) — а такой факт классификатор зовёт «неизвестно» и
-    только им; текст обрыва начинается словом ``poll_timeout`` и несёт
-    идентификатор задачи, число опросов и последнее увиденное состояние, чтобы
-    заход можно было добрать руками (`--manus-task <id>`).
+    * **5000 estimated tokens** — жёсткий: отвечает кодом 400 и телом
+      ``message content must be at most 5000 estimated tokens``. Виден сразу.
+    * **~2400 знаков на сообщение** — МОЛЧАЛИВЫЙ: длинное сообщение принимается
+      кодом 200, но канал срезает его и прячет остаток вложением, оставляя
+      ревьюеру ~1100 знаков. Вложение ревьюер не открывает (правило №1 нашего же
+      конверта) и честно отвечает «пакет обрезан». Именно этот предел делал
+      заход бессмысленным при честном коде 200.
 
-    `wait=0` выключает опрос целиком — тогда поведение ровно прежнее.
+    Поэтому исходящее едет ЧАСТЯМИ по ОДНОЙ задаче (`taskId` доки v1 — «for
+    continuing existing tasks (multi-turn)»): часть 1 создаёт задачу, остальные
+    досылаются в неё же, и между частями отправщик ДОЖИДАЕТСЯ ответа канала.
+    Склейка частей подряд равна исходному тексту знак в знак: рамка добавляется
+    поверх куска, а не вместо него.
+
+    Ни одна ветка НЕ превращает «не дождались» в «готово», и ни одна не выдаёт
+    оборванную досылку за целую: не ушедшая часть возвращается наверх фактом
+    отказа, а не тишиной.
+
+    ``wait=0`` выключает опрос, ``chunk_chars=0`` — деление на части.
     """
     url = base.rstrip("/") + "/" + path.lstrip("/")
-    # Тело приёма. Поля `mode` нет ни в v1, ни в v2 — оно уехало: доке v1 нужен
-    # `prompt` (и `agentProfile`, который канал по факту подставляет сам). Ключ
-    # `--manus-profile` оставлен пустым сознательно: слать литерал, который на
-    # этой полосе не проверен живым заходом, значит менять модель канала вслепую.
-    payload = {"prompt": prompt}
-    if profile:
-        payload["agentProfile"] = profile
+    parts = manus_parts(prompt, chunk_chars)
+    poll = max(1, int(poll))
+    started = clock()
+    deadline = started + max(0, wait)
 
-    facts = manus_http(
-        url, key=key, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), method="POST", timeout=timeout
-    )
+    def post(text, task_id=None):
+        # Поля `mode` нет ни в v1, ни в v2 — доке v1 нужен `prompt` (и
+        # `agentProfile`, который канал по факту подставляет сам). Ключ
+        # `--manus-profile` пуст сознательно: слать литерал, не проверенный
+        # живым заходом, значит менять модель канала вслепую.
+        payload = {"prompt": text}
+        if profile:
+            payload["agentProfile"] = profile
+        if task_id:
+            payload["taskId"] = task_id
+        return manus_http(
+            url,
+            key=key,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            timeout=timeout,
+        )
+
+    facts = post(parts[0])
     facts["create_status"] = facts["status"]
     facts["create_body"] = facts["body"]
     facts["task_id"] = None
@@ -503,95 +781,87 @@ def send_manus(
     facts["last_signature"] = None
     facts["settled_polls"] = 0
     facts["ready_by"] = None
+    facts["parts"] = len(parts)
+    facts["parts_sent"] = 1
+    facts["part_chars"] = [len(part) for part in parts]
+    facts["part_error"] = None
 
     # Приём не состоялся (обрыв, 4xx, 5xx) — тело ошибки уезжает наверх ДОСЛОВНО
-    # и судится там же, где судился раньше. Опрашивать нечего.
+    # и судится там же, где судилось раньше. Опрашивать нечего.
     if facts["transport_error"] or facts["status"] is None or int(facts["status"]) >= 400:
         return facts
 
     facts["task_id"], facts["task_url"] = manus_task_id(facts["body"])
     # Сказать вслух, что работа ПРИНЯТА, ДО начала ожидания. Без этого
-    # идентификатор задачи живёт только в памяти процесса до самого конца
-    # захода — и оборванное ожидание (или убитый процесс) уносит с собой
-    # единственный ключ, которым заход можно добрать: `--manus-task <id>`.
+    # идентификатор задачи живёт только в памяти процесса до конца захода — и
+    # оборванное ожидание уносит единственный ключ, которым его можно добрать.
     if facts["task_id"] and notice:
         notice(facts, wait)
     if not facts["task_id"] or wait <= 0:
         return facts
 
-    poll = max(1, int(poll))
-    task_id = facts["task_id"]
-    started = clock()
-    while True:
-        if clock() - started >= wait:
-            facts["waited_sec"] = int(clock() - started)
+    # Между частями ждём ОТВЕТА на предыдущую часть, а не затишья: у ответа есть
+    # положительный признак (сообщение ассистента после нашей метки), а затишье
+    # здесь и медленнее, и врёт — `status` о готовности не сообщает.
+    for index in range(1, len(parts)):
+        outcome = _wait_reply(
+            facts,
+            marker=_PART_MARK % (index, len(parts)),
+            key=key,
+            base=base,
+            task_path=task_path,
+            poll=poll,
+            deadline=deadline,
+            started=started,
+            clock=clock,
+            sleep=sleep,
+            tag=" на часть %d/%d" % (index, len(parts)),
+        )
+        if outcome != "ready":
+            return facts
+
+        got = post(parts[index], task_id=facts["task_id"])
+        facts["parts_sent"] = index + 1
+        if got["transport_error"] or got["status"] is None or int(got["status"]) >= 400:
+            # Досылка сорвалась — у ревьюера ОБРЕЗОК, и звать это ответом нельзя.
+            facts["status"] = got["status"]
+            facts["body"] = got["body"]
+            facts["transport_error"] = got["transport_error"] or facts["transport_error"]
             facts["request_sent"] = True
-            facts["transport_error"] = (
-                "poll_timeout: задача %s не дошла до терминального состояния за %d с "
-                "(опросов %d, последнее состояние %s%s)"
-                % (
-                    task_id,
-                    facts["waited_sec"],
-                    facts["polls"],
-                    facts["last_state"] or _NA_STATE,
-                    "; последний обрыв опроса: %s" % facts["last_poll_error"] if facts["last_poll_error"] else "",
-                )
+            facts["part_error"] = "часть %d/%d не ушла (код %s)" % (
+                index + 1,
+                len(parts),
+                got["status"] if got["status"] is not None else _NA_STATE,
             )
             return facts
 
-        sleep(poll)
-        got = fetch_manus_task(task_id, key=key, base=base, task_path=task_path)
-        facts["polls"] += 1
-        facts["waited_sec"] = int(clock() - started)
+    outcome = _wait_settled(
+        facts,
+        key=key,
+        base=base,
+        task_path=task_path,
+        poll=poll,
+        settle_polls=settle_polls,
+        deadline=deadline,
+        started=started,
+        clock=clock,
+        sleep=sleep,
+        tag=" после последней части" if len(parts) > 1 else "",
+    )
+    if outcome != "ready":
+        return facts
 
-        if got["transport_error"]:
-            # Обрыв ОДНОГО опроса приговором не является: работа уже принята и
-            # идёт на той стороне. Повторяем до предела ожидания, но последний
-            # обрыв помним — он попадёт в отчёт, если предел истечёт.
-            facts["last_poll_error"] = got["transport_error"]
-            continue
-
-        facts["status"] = got["status"]
-        facts["body"] = got["body"]
-        facts["poll_target"] = got["target"]
-        if got["status"] is None or int(got["status"]) >= 400:
-            return facts  # 401/404/429 на заборе — отказ с дословным телом
-
-        state, text, note = manus_output_text(got["body"])
-        facts["last_state"] = state
-        facts["poll_note"] = note
-
-        if state == _MANUS_FAILED:
-            facts["request_sent"] = True
-            facts["transport_error"] = "task_failed: задача %s кончилась состоянием failed (%s)" % (
-                task_id,
-                manus_error_text(got["body"]) or "текста ошибки канал не дал",
-            )
-            return facts
-
-        signature = manus_settled_signature(got["body"])
-        if signature and signature == facts["last_signature"]:
-            facts["settled_polls"] += 1
-        else:
-            facts["last_signature"] = signature
-            facts["settled_polls"] = 0
-
-        ready_by = None
-        if state == _MANUS_DONE:
-            ready_by = "status=completed"
-        elif signature and facts["settled_polls"] >= settle_polls:
-            ready_by = "затишье %d опросов подряд при status=%s" % (facts["settled_polls"], state or _NA_STATE)
-
-        if ready_by:
-            # Наверх уезжает СОБРАННЫЙ текст ассистента: он и есть ответ канала,
-            # и он ляжет в лоток дословно. Пустой разбор телом не подменяем —
-            # пусть классификатор увидит сырой конверт и назовёт это «принято,
-            # ответа нет», а не «готово».
-            facts["ready_by"] = ready_by
-            facts["answer_from_output"] = bool(text.strip())
-            if text.strip():
-                facts["body"] = text
-            return facts
+    marker = _PART_MARK % (len(parts), len(parts)) if len(parts) > 1 else None
+    state, text, note = manus_output_text(facts["body"], after_marker=marker)
+    facts["last_state"] = state
+    facts["poll_note"] = note
+    # Наверх уезжает СОБРАННЫЙ текст ассистента: он и есть ответ канала, и он
+    # ляжет в лоток дословно. Пустой разбор телом не подменяем — пусть
+    # классификатор увидит сырой конверт и назовёт это «принято, ответа нет».
+    facts["answer_from_output"] = bool(text.strip())
+    if text.strip():
+        facts["body"] = text
+    return facts
 
 
 # ───────────────────────────── заход ─────────────────────────────
@@ -666,6 +936,7 @@ def run_channel(channel, prompt, ctx, args):
         wait=getattr(args, "manus_wait", DEFAULT_MANUS_WAIT),
         poll=getattr(args, "manus_poll", DEFAULT_MANUS_POLL),
         settle_polls=getattr(args, "manus_settle", MANUS_SETTLE_POLLS),
+        chunk_chars=getattr(args, "manus_chunk", MANUS_CHUNK_CHARS),
         profile=getattr(args, "manus_profile", None),
         notice=_announce_manus_task,
     )
@@ -770,6 +1041,12 @@ def main(argv=None):
         type=int,
         default=MANUS_SETTLE_POLLS,
         help="сколько опросов подряд задача должна не меняться, чтобы считаться сдавшей работу",
+    )
+    parser.add_argument(
+        "--manus-chunk",
+        type=int,
+        default=MANUS_CHUNK_CHARS,
+        help="потолок ОДНОГО сообщения в знаках; длиннее — досылка частями (0 — не делить)",
     )
     parser.add_argument("--manus-profile", default=None, help="agentProfile канала (по умолчанию не слать вовсе)")
     parser.add_argument(
