@@ -271,6 +271,14 @@ RAISE_LOSS = {
 # быть НЕ МОЖЕТ по построению — ложных ноль, оба реальных сна проходят с 4–12-кратным запасом.
 SLEEP_ALARM_SEC = int(os.getenv("PC_SLEEP_ALARM_SEC", "") or (TASK_TIMEOUT + POLL_SEC))
 SLEEP_ALARM_TOPIC = int(os.getenv("PC_SLEEP_TOPIC", "328") or "328")   # тема постановки задач (как детектор немоты)
+# ─── ТЕМА АУДИТ: показ находок ВНЕШНЕГО ревью-контура (ступень D, 01.09.2026) ─────────────────
+# Единственная тема полосы БЕЗ дефолтного номера, и это не недоделка. У соседей выше дефолт
+# осмыслен: 328/829/1160 — темы, которые есть всегда, и промах адреса стоит одной строки не там.
+# Здесь везёт ЧУЖОЙ ТЕКСТ (мнение внешнего ревьюера), и промах адреса стоит другого: находка,
+# севшая в тему постановки задач или в инбокс ответа владельца, читается как ЗАДАНИЕ. Поэтому
+# ненастроенная ручка означает «показ выключен целиком», а не «пишем куда-нибудь»; фолбэков у
+# ступени D нет ни одного (`dispatch_notify.send_topic_strict`, без каскада send_topic).
+AUDIT_TOPIC = int(os.getenv("PC_AUDIT_TOPIC", "0") or "0")
 RESULT_MAX = 4500
 TIMEOUT_MARK = "⏱"       # маркер таймаут/сирота-диагнозов: думатель самопочинки их НЕ чинит
 MANUAL_MARK = "✋"        # маркер «headless доказанно не может» (снова красное ПОСЛЕ approve) —
@@ -5937,7 +5945,14 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         # `maybe_review_intake`. Свои зависимости у него те же (review_pack,
                         # review_send) плюс `queue_snapshot_pc`, у которого он одалживает замок
                         # флага при импорте демона; оба уже в остатке выше.
-                        "review_intake_run.py", "review_intake.py")
+                        "review_intake_run.py", "review_intake.py",
+                        # 01.09.2026: ступень D — куст за ленивым `import review_audit_run` в
+                        # `maybe_review_audit`. Своих новых листьев у него ровно два: сам
+                        # `review_audit` и `review_audit_run`; всё остальное (review_intake_run,
+                        # review_pack, review_send, dispatch_notify, queue_snapshot_pc) уже в
+                        # остатке выше — ступень D переиспользует разбор ступени B и дверь
+                        # отправки, а не заводит свои.
+                        "review_audit_run.py", "review_audit.py")
 # остаток: ленивые импорты вне ворот грязного дерева
 
 
@@ -9007,6 +9022,123 @@ def maybe_review_intake(now=None, tick_path=None, state_path=None, runner=None):
     return report
 
 
+# ------------------- СТУПЕНЬ D РЕВЬЮ-КОНТУРА (флаг REVIEW_AUDIT) --------------
+# ЗАЧЕМ. Ступени A и B довели находку внешнего канала до файла в лотке и до ряда-заявки в
+# очереди. Обе кончаются там, куда владелец должен ПРИЙТИ САМ. Замер 01.09: 42 находки в 32
+# заявках за одни сутки — прочитать их по файлу глазами значит не прочитать никогда, и контур
+# оказывается мёртвым при полностью живом коде. Ступень D добавляет ровно одно звено: находка
+# ПРИХОДИТ К ВЛАДЕЛЬЦУ САМА, в тему Аудит.
+#
+# СВОДКОЙ, А НЕ ПОТОКОМ — это и есть предмет ступени, а не пожелание к тону. Тема, в которую
+# сыплется всё подряд, перестаёт читаться на второй день. Поэтому каналов показа ДВА:
+#   • немедленно — ТОЛЬКО находки высокой важности, и не больше REVIEW_AUDIT_BUDGET в сутки;
+#   • раз в сутки — СВОДКА за ЗАКОНЧЕННЫЙ день (пакетов ушло, ответов получено, заявок заведено,
+#     три самых весомых находки). Не показанное немедленно названо в ней числом, а полный текст
+#     каждой находки лежит файлом в лотке и назван путём — потерянных нет.
+# «Высокая важность» НЕ вычитывается из текста находки (это завело бы здесь второго ревьюера,
+# говорящего чужим голосом), а складывается из полей, посчитанных ступенью B: вид находки, исход
+# премисы и число источников. Замер живого корпуса: 32 заявки → 17 с живой премисой → 10 высоких.
+#
+# АДРЕС. Ручка AUDIT_TOPIC (env PC_AUDIT_TOPIC) — единственная тема полосы БЕЗ дефолтного номера,
+# и это выбор, а не пропуск: здесь везёт ЧУЖОЙ ТЕКСТ, а находка, севшая в тему постановки задач
+# или в инбокс ответа владельца, читается как ЗАДАНИЕ. Не настроена → ступень не шлёт НИЧЕГО и
+# говорит об этом словом; каскада фолбэков у неё нет ни одного.
+#
+# ЧЕГО СТУПЕНЬ НЕ ДЕЛАЕТ: не ставит задач, не правит код, очередь только ЧИТАЕТ (ради числа
+# заявок в сводке). Операционного состояния она не меняет ни одной веткой.
+#
+# ОТКАТ: стоп-файл `pc_orchestrator.review_audit.off` (со следующего тика, без рестарта и без
+# правки `.env`), либо `REVIEW_AUDIT=0`, либо пустая ручка PC_AUDIT_TOPIC.
+REVIEW_AUDIT_MIN_SEC = float(os.getenv("REVIEW_AUDIT_MIN_SEC", "600") or "600")  # пол паузы, с
+REVIEW_AUDIT_BUDGET = int(os.getenv("REVIEW_AUDIT_BUDGET", "3") or "3")          # немедленных показов в сутки
+REVIEW_AUDIT_DIGEST_HOUR = int(os.getenv("REVIEW_AUDIT_DIGEST_HOUR", "1") or "1")  # час UTC суточной сводки
+REVIEW_AUDIT_TICK_FILE = _state(os.path.join(REPO, "pc_orchestrator.review_audit_tick.json"))
+# И состояние, и корень записи — через `_state`: тот же класс, что ступень A поймала живьём
+# (ветка включена по умолчанию, и тест, зовущий живую функцию демона, писал бы в БОЕВОЙ реестр).
+REVIEW_AUDIT_STATE_FILE = _state(os.path.join(REPO, "review_audit_state.json"))
+
+
+def _review_audit_root():
+    """Корень, в котором ступень D держит реестр показанного. Под тестом — temp, в бою — REPO."""
+    return os.path.dirname(REVIEW_AUDIT_STATE_FILE) or REPO
+
+
+def _review_audit_on():
+    """Ступень D включена? Дефолт — ВКЛЮЧЕНО; рубильники те же два, что у ступеней A и B."""
+    if (os.environ.get("REVIEW_AUDIT") or "").strip() == "0":
+        return False
+    if _flag_forced_off("REVIEW_AUDIT"):
+        log.warning("ступень D ревью-контура ВЫКЛЮЧЕНА стоп-файлом %s (снять: удалить файл)",
+                    os.path.basename(_flag_off_file("REVIEW_AUDIT")))
+        return False
+    return True
+
+
+def _review_audit_read_tick(path=None):
+    try:
+        with open(path or REVIEW_AUDIT_TICK_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _review_audit_write_tick(now, path=None):
+    p = path or REVIEW_AUDIT_TICK_FILE
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"ts": float(now)}, f)
+    except Exception as e:
+        log.warning("ревью-контур D: метка оборота не записана: %s", e)
+
+
+def maybe_review_audit(now=None, tick_path=None, state_path=None, runner=None):
+    """Один оборот ступени D за тик, с троттлингом по МЕТКЕ НА ДИСКЕ. → отчёт | None.
+
+    None — ветка выключена или пол паузы не прошёл. Метку пишем ВСЕГДА, даже когда показывать
+    нечего: иначе «высоких находок нет» стоило бы полного прохода по дереву каждые 60 секунд.
+
+    НЕНАСТРОЕННАЯ ТЕМА — не ошибка и не тишина: оборот честно вернёт отчёт с причиной, и она
+    ляжет в лог ОДНОЙ строкой уровня info (не warning каждые десять минут: ручка либо задана,
+    либо владелец сознательно оставил показ выключенным).
+    """
+    if not _review_audit_on():
+        return None
+    now = time.time() if now is None else now
+    st = _review_audit_read_tick(tick_path)
+    prev = st.get("ts")
+    if prev is not None:
+        try:
+            if (now - float(prev)) < REVIEW_AUDIT_MIN_SEC:
+                return None
+        except Exception:
+            pass
+    _review_audit_write_tick(now, tick_path)
+    try:
+        import review_audit_run
+        report = (runner or review_audit_run.tick)(
+            root=_review_audit_root(), state_path=state_path or REVIEW_AUDIT_STATE_FILE,
+            send=True, budget=REVIEW_AUDIT_BUDGET, digest_hour=REVIEW_AUDIT_DIGEST_HOUR,
+            write_journal=True,
+        )
+    except Exception as e:
+        log.warning("ревью-контур D: оборот упал (fail-safe, метка уже сдвинута — следующая "
+                    "попытка через паузу): %s", e)
+        return None
+    if not report.get("topic"):
+        log.info("ревью-контур D: %s", report.get("topic_why") or "тема Аудит не настроена")
+        return report
+    if not report.get("acted"):
+        log.debug("ревью-контур D: %s", report.get("why") or "показывать нечего")
+        return report
+    log.info("ревью-контур D: в тему %s показано находок %d, сводка %s, не ушло %d",
+             report.get("topic"), len(report.get("sent") or []),
+             "ушла" if (report.get("digest") or {}).get("sent") else "не слалась",
+             len(report.get("failed") or []))
+    _cowork(review_audit_run.line(report) or "ревью-контур D: оборот без строки исхода")
+    return report
+
+
 # ------------------- РЕВИЗОР: МАРШРУТИЗАЦИЯ НАХОДОК (шаг 4/7 родителя 262) -----
 # revizor_tick собрал пакеты активных окон (шаг 2), _revizor_consult судит окно думателем (шаг 3).
 # Здесь — РАЗВОДКА находок по каналам (сам ревизор НИЧЕГО не правит и клиентам НЕ пишет):
@@ -10041,6 +10173,7 @@ def _main_loop():
             maybe_revizor()           # шаг 2/7 (262): ревизор диалогов за DIALOG_REVIZOR (троттлинг REVIZOR_HOURS)
             maybe_review_auto()       # ступень A: пакет второго мнения за REVIEW_AUTO (троттлинг REVIEW_AUTO_MIN_SEC)
             maybe_review_intake()     # ступень B: находки ответа → ЗАЯВКИ очереди (троттлинг REVIEW_INTAKE_MIN_SEC)
+            maybe_review_audit()      # ступень D: высокие находки + суточная сводка → тема Аудит (AUDIT_TOPIC)
             maybe_lesson_commit_retry()  # пакет «полнота лога» п.6: докоммитить урок из спула (провал коммита ≠ вечная грязь)
             maybe_git_ff_pull()       # родитель #221: подтянуть origin/main ff-only ДО реконсиляции/self-update (тот же тик применит)
             maybe_reconcile_children()  # класс-фикс c6d8a30: применить свежий код детей на ЛЮБОЙ новый коммит

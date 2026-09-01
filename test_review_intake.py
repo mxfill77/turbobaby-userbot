@@ -41,14 +41,27 @@ INBOX = os.path.join(HERE, "docs", "review_inbox")
 # Живые файлы лотка за 01.09 — на них стоит весь корпусный регресс.
 LIVE_DIGEST = "2026-09-01-2026-09-01-digest-2026-09-01-codex.md"
 LIVE_CHAINS = "2026-09-01-2026-09-01-chains-2026-08-31-codex.md"
-LIVE_REFUSED = "2026-09-01-2026-09-01-chain-pc-2026-09-01-72-codex.md"
+
+# ГОЛДЕН ОТКАЗА ЖИВЁТ ФИКСТУРОЙ, А НЕ ЛОТКОМ (класс пойман живьём 01.09.2026).
+# Раньше здесь стоял файл лотка `…-chain-pc-2026-09-01-72-codex.md`. Лоток — каталог,
+# в который ПИШЕТ ЖИВОЙ ДЕМОН: ступень A переотправила пакет 72 после починки стражи,
+# канал ответил, и файл ПЕРЕПИСАЛСЯ с `refused/outbound_guard` на `answered/ok`. Тест
+# покраснел на main, ничего не сломавшись, а красный гейт значит «self-update не едет».
+# Правило полосы («снимай живой ответ прода ФИКСТУРОЙ») сюда и относится: голден стоит
+# на снимке, снимок неизменен, а лоток остаётся живым каталогом.
+FIXTURES = os.path.join(HERE, "fixtures")
+LIVE_REFUSED = "review_answer_refused_guard.live.md"    # снимок отказа стражи, 01.09
 
 # Дословный кусок находки №2 дайджеста (тот самый дубль, что приехал двумя пакетами).
 LIVE_DUP_MARK = "не заявлять «ничего не опущено»"
 
 
 def _live(name):
-    with io.open(os.path.join(INBOX, name), encoding="utf-8") as fh:
+    """Живой файл лотка ИЛИ замороженная фикстура — по месту, где он лежит."""
+    path = os.path.join(INBOX, name)
+    if not os.path.exists(path):
+        path = os.path.join(FIXTURES, name)
+    with io.open(path, encoding="utf-8") as fh:
         return fh.read()
 
 
