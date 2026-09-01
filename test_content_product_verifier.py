@@ -262,6 +262,140 @@ class TestRunBinding(_Bundle):
             self.assertEqual(cpv.verify_case(bundle)["verdict"], expected, text)
 
 
+class _Retask(_Bundle):
+    """Перезапись пакета ЗАДАЧИ: только она вправе называть гейты и способ привязки прогона."""
+
+    def _task(self, **body):
+        payload = {"schema_version": "v0.1", "run_id": RUN_ID,
+                   "required_content_gates": [{"gate_id": "state", "artifact_id": "product",
+                                               "type": "json_field_equals",
+                                               "params": {"field": "state", "equals": "green"}}]}
+        payload.update(body)
+        payload = {key: value for key, value in payload.items() if value is not None}
+        self.hashes["task"] = _write(self.root, "task.json",
+                                     json.dumps(payload, separators=(",", ":")))
+
+
+class TestCaseFoldedGate(_Retask):
+    """Case is not evidence: a phrase that opens a heading is the same phrase."""
+
+    def _text_gate(self, kind, needle):
+        gates = [{"gate_id": "words", "artifact_id": "product", "type": kind,
+                  "params": {"text": needle}}]
+        self._task(required_content_gates=gates)
+        bundle = self.bundle()
+        bundle["content_gates"] = gates
+        self.hashes["artifact"] = _write(self.root, "notes.txt",
+                                         "# Ступень C V0 судит done\nrun_id: %s\n" % RUN_ID)
+        bundle["required_artifacts"][0].update(
+            {"path": "notes.txt", "content_type": "text", "sha256": self.hashes["artifact"]})
+        return cpv.verify_case(bundle)
+
+    def test_exact_gate_still_reads_case(self):
+        got = self._text_gate("text_contains", "ступень C V0 судит done")
+        self.assertEqual((got["verdict"], got["reason_code"]),
+                         (cpv.DISPROVEN, "text_condition_failed"))
+
+    def test_folded_gate_reads_the_phrase(self):
+        self.assertEqual(self._text_gate("text_contains_ci", "ступень C V0 судит done")["verdict"],
+                         cpv.PROVEN)
+
+    def test_folded_gate_still_refuses_an_absent_phrase(self):
+        got = self._text_gate("text_contains_ci", "совсем другая фраза")
+        self.assertEqual((got["verdict"], got["reason_code"]),
+                         (cpv.DISPROVEN, "text_condition_failed"))
+
+    def test_a_file_may_answer_its_address_by_its_name(self):
+        """Живая форма полосы: 3 адреса из 4 за 01.09 отвечены ИМЕНЕМ файла, а не телом."""
+        self.assertTrue(cpv.address_hit("docs/artifacts/2026-09-01-сверка-двух-баз-цены-на-парах.md",
+                                        "# Сверка двух баз цены на ЭКЗАМЕНАЦИОННЫХ парах\n",
+                                        "сверка двух баз цены на парах"))
+        self.assertTrue(cpv.address_hit("docs/artifacts/2026-09-01-abs-root-class-in-tests.md",
+                                        "# Класс абсолютного корня в тестах\n",
+                                        "класс абсолютного корня в тестах"))
+        self.assertFalse(cpv.address_hit("docs/artifacts/2026-09-01-чужое.md", "# Про другое\n",
+                                         "класс абсолютного корня в тестах"))
+
+    def test_path_gate_refuses_when_neither_side_answers(self):
+        got = self._text_gate("path_or_text_contains_ci", "ни в имени, ни в теле")
+        self.assertEqual((got["verdict"], got["reason_code"]),
+                         (cpv.DISPROVEN, "text_condition_failed"))
+
+    def test_path_gate_reads_the_name(self):
+        self.assertEqual(self._text_gate("path_or_text_contains_ci", "notes txt")["verdict"],
+                         cpv.PROVEN)
+
+
+class TestMeasuredRunBinding(_Retask):
+    """A measured change binds evidence to the run; only the TASK may choose that mode."""
+
+    def _unbound_artifact(self):
+        """Артефакт БЕЗ `run_id` — то есть живой артефакт полосы, а не фикстура."""
+        bundle = self.bundle()
+        self.hashes["artifact"] = _write(self.root, "candidate.py", 'value = "green"\n# продукт\n')
+        bundle["candidate_manifest"][0]["sha256"] = self.hashes["artifact"]
+        bundle["required_artifacts"][0].update(
+            {"path": "candidate.py", "content_type": "text", "sha256": self.hashes["artifact"]})
+        gates = [{"gate_id": "words", "artifact_id": "product", "type": "text_contains",
+                  "params": {"text": "продукт"}}]
+        bundle["content_gates"] = gates
+        return bundle, gates
+
+    def test_declared_mode_refuses_evidence_that_names_no_run(self):
+        bundle, gates = self._unbound_artifact()
+        self._task(required_content_gates=gates)
+        bundle["task_packet"]["sha256"] = self.hashes["task"]
+        got = cpv.verify_case(bundle)
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.UNKNOWN, "unbound_run_evidence"))
+
+    def test_measured_mode_binds_evidence_inside_the_changed_scope(self):
+        bundle, gates = self._unbound_artifact()
+        self._task(required_content_gates=gates, run_binding=cpv.RUN_BINDING_MEASURED)
+        bundle["task_packet"]["sha256"] = self.hashes["task"]
+        got = cpv.verify_case(bundle)
+        self.assertEqual(got["verdict"], cpv.PROVEN)
+        self.assertEqual(got["gates"][-3]["reason_code"], "measured_change_names_this_run")
+        self.assertEqual(got["input_refs"][cpv.RUN_BINDING_FIELD], cpv.RUN_BINDING_MEASURED)
+
+    def test_measured_mode_is_not_a_blanket_pass_outside_the_scope(self):
+        """Улика ВНЕ измеренной области доказывается по-прежнему только своим именем прогона."""
+        bundle, gates = self._unbound_artifact()
+        outside = _write(self.root, "outside.txt", "продукт без имени прогона\n")
+        bundle["required_artifacts"].append(
+            {"artifact_id": "outside", "path": "outside.txt", "required": True,
+             "sha256": outside, "content_type": "text", "max_bytes": 1000})
+        self._task(required_content_gates=gates, run_binding=cpv.RUN_BINDING_MEASURED)
+        bundle["task_packet"]["sha256"] = self.hashes["task"]
+        got = cpv.verify_case(bundle)
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.UNKNOWN, "unbound_run_evidence"))
+
+    def test_the_executor_bundle_cannot_choose_the_binding_mode(self):
+        bundle, gates = self._unbound_artifact()
+        self._task(required_content_gates=gates)
+        bundle["task_packet"]["sha256"] = self.hashes["task"]
+        bundle[cpv.RUN_BINDING_FIELD] = cpv.RUN_BINDING_MEASURED     # слово исполнителя
+        got = cpv.verify_case(bundle)
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.UNKNOWN, "unbound_run_evidence"))
+
+    def test_unknown_binding_mode_fails_closed(self):
+        bundle, gates = self._unbound_artifact()
+        self._task(required_content_gates=gates, run_binding="как-нибудь")
+        bundle["task_packet"]["sha256"] = self.hashes["task"]
+        got = cpv.verify_case(bundle)
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.UNKNOWN, "invalid_run_binding"))
+
+    def test_measured_mode_leaves_the_stale_fixture_disproven(self):
+        """C2a отрицательного теста: опорная линия равна кандидату → область пуста, и режим
+        `measured` этого НЕ спасает — гейт области стои́т раньше привязки."""
+        bundle, gates = self._unbound_artifact()
+        self._task(required_content_gates=gates, run_binding=cpv.RUN_BINDING_MEASURED)
+        bundle["task_packet"]["sha256"] = self.hashes["task"]
+        bundle["baseline_manifest"] = [{"path": "candidate.py", "sha256": self.hashes["artifact"]}]
+        got = cpv.verify_case(bundle)
+        self.assertEqual((got["verdict"], got["reason_code"]),
+                         (cpv.DISPROVEN, "changed_scope_mismatch"))
+
+
 class TestNoSideEffects(unittest.TestCase):
     def test_module_has_no_network_process_environment_or_write_calls(self):
         with open(os.path.join(os.path.dirname(__file__), "content_product_verifier.py"), encoding="utf-8") as handle:

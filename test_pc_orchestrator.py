@@ -11152,5 +11152,70 @@ class TestReviewClaimIsNeverATask(unittest.TestCase):
                             "под тестом реестр обязан уезжать в temp")
 
 
+class TestStageCJudgeWiring(unittest.TestCase):
+    """СТУПЕНЬ C: врезка судьи закрытия. Предмет здесь — РЕШЕНИЕ врезки (что делать с вердиктом),
+    а не сам вердикт: его считает `done_judge_pc` и проверяет `test_done_judge_pc` (24 теста).
+
+    Вердикт подменён нарочно. Тест, гоняющий живой прибор по живому дереву, мерил бы состояние
+    репозитория на момент прогона и врал бы зелёным ровно тогда, когда врёт дерево."""
+
+    TID = 987654321                                   # номера в живой отметке заведомо нет
+
+    def setUp(self):
+        self.saved = o.done_judge_pc.judge
+        self.addCleanup(setattr, o.done_judge_pc, "judge", self.saved)
+
+    def stub(self, verdict):
+        o.done_judge_pc.judge = lambda *args, **kwargs: verdict
+
+    def run_mode(self, mode, verdict, result="RESULT: ок"):
+        self.stub(verdict)
+        with mock.patch.dict(os.environ, {"DONE_JUDGE_PC": mode}, clear=False):
+            return o._judge_done(self.TID, "текст задачи", "done", result, {})
+
+    def test_addressless_close_keeps_the_report_byte_for_byte(self):
+        blind = {"verdict": o.done_judge_pc.UNKNOWN, "reason": "адрес не назван", "address": None}
+        self.assertEqual(self.run_mode("addr", blind), ("done", "RESULT: ок"))
+
+    def test_addressed_and_unproven_is_not_done(self):
+        bad = {"verdict": o.done_judge_pc.UNKNOWN, "reason": "по адресу ПУСТО",
+               "address": {"words": "x"}}
+        status, text = self.run_mode("addr", bad)
+        self.assertEqual(status, "failed")
+        self.assertTrue(text.startswith(o.done_judge_pc.UNKNOWN_PREFIX))
+        self.assertIn("RESULT: ок", text, "отчёт исполнителя не выбрасывается, а съезжает вниз")
+
+    def test_proven_stays_done_and_says_so_at_the_head(self):
+        good = {"verdict": o.done_judge_pc.DONE, "reason": "V0: PROVEN / all_gates_passed",
+                "address": {"words": "x"}}
+        status, text = self.run_mode("addr", good)
+        self.assertEqual(status, "done")
+        self.assertTrue(text.startswith("[V0 судит done: сделано"), text[:60])
+
+    def test_mode_all_refuses_an_addressless_close(self):
+        blind = {"verdict": o.done_judge_pc.UNKNOWN, "reason": "адрес не назван", "address": None}
+        self.assertEqual(self.run_mode("all", blind)[0], "failed")
+
+    def test_mode_off_never_touches_the_status(self):
+        bad = {"verdict": o.done_judge_pc.UNKNOWN, "reason": "по адресу ПУСТО",
+               "address": {"words": "x"}}
+        status, text = self.run_mode("off", bad)
+        self.assertEqual(status, "done")
+        self.assertIn("неизвестно", text, "режим off молчать не смеет — он только не судит")
+
+    def test_a_judge_that_says_nothing_changes_nothing(self):
+        self.assertEqual(self.run_mode("all", None), ("done", "RESULT: ок"))
+
+    def test_the_baseline_is_taken_before_the_run_not_after(self):
+        """Замок порядка: снимок «до» обязан стоять РАНЬШЕ `run_task`. Позже он был бы словом
+        проверяемого — ровно развилка 2 отрицательного теста V0."""
+        with io.open(os.path.join(o.REPO, "pc_orchestrator.py"), encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertLess(body.index("done_base = done_judge_pc.baseline(text)"),
+                        body.index("status, result = run_task(tid, text)"))
+        self.assertEqual(body.count("done_judge_pc.judge("), 1,
+                         "судья зовётся РОВНО из одного места полосы")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,14 +1,30 @@
-"""Fixture-only V0 shadow content-product verifier.
+"""V0 content-product verifier: the bounded evidence bundle, not the report, decides.
 
-This module intentionally has no CLI and no integration point.  It consumes one
-explicit, bounded evidence bundle and returns a deterministic three-state
-verdict.  It never executes candidate code or tests, and never discovers files
-outside the manifest supplied by the caller.
+This module has no CLI.  It consumes one explicit, bounded evidence bundle and
+returns a deterministic three-state verdict.  It never executes candidate code
+or tests, and never discovers files outside the manifest supplied by the caller.
 
 Freshness is proven by identity, never by time: ``PROVEN`` requires the evidence
 itself to name the run being verified (``V0_RUN_BINDING``).  No clock, mtime or
 "looks recent" reasoning exists here, because an artifact left by an earlier run
 is as recent as the file system says and still proves nothing about this one.
+
+01.09.2026 -- two additive changes, made so the PC lane could put V0 on the one
+place that closes a task (``done_judge_pc``).  Neither relaxes an existing rule
+and both are opt-in, so every bundle written before today verifies to the same
+bytes:
+
+* ``text_contains_ci`` -- a case-folded sibling of ``text_contains``.  A named
+  phrase that opens a heading is the same phrase; the exact gate answered a
+  question about letter case and it was being read as an answer about the
+  product.
+* ``run_binding: measured`` in the TASK packet -- evidence inside the exact
+  changed set counts as bound to this run without declaring ``run_id`` itself.
+  It is chosen by the task and never by the executor bundle, because it is worth
+  precisely as much as the party that measured the baseline.  Where the baseline
+  is the executor's word (the standing asymmetry named in
+  ``docs/artifacts/2026-09-01-v0-negative-test.md``) it is worth nothing, and the
+  default stays ``declared``.
 """
 
 from __future__ import annotations
@@ -40,10 +56,23 @@ ALLOWED_GATE_TYPES = (
     "json_field_equals",
     "json_field_present",
     "text_contains",
+    "text_contains_ci",
+    "path_or_text_contains_ci",
     "text_absent",
     "python_import_allowlist",
 )
 RUN_ID_FIELD = "run_id"
+# How the run is bound to its evidence.  ``declared`` is the default and the
+# only self-contained mode: the artifact must name the run itself.  ``measured``
+# says the caller compared the address before and after the run with its OWN
+# baseline, so a path inside the exact changed set belongs to this run by
+# construction.  Weaker in one named way and stronger in another: it cannot be
+# faked by text, and it is exactly as trustworthy as whoever measured the
+# baseline -- which is why only the TASK may select it, never the bundle.
+RUN_BINDING_FIELD = "run_binding"
+RUN_BINDING_DECLARED = "declared"
+RUN_BINDING_MEASURED = "measured"
+RUN_BINDINGS = (RUN_BINDING_DECLARED, RUN_BINDING_MEASURED)
 # A run identity is a bounded token, long enough not to match by accident and
 # compared whole: "job-1" must never bind evidence that names "job-12".
 _RUN_ID_BODY = r"[0-9A-Za-z][0-9A-Za-z_.-]{3,%d}" % (MAX_IDENTIFIER_CHARS - 1)
@@ -182,6 +211,21 @@ def _parse_json(evidence):
     return value
 
 
+_SEPARATOR_RE = re.compile(r"[-_/.\\]+")
+
+
+def address_hit(path, text, needle):
+    """Does this artifact answer a named address -- by its body or by its NAME?
+
+    A named address ("a file ... with the words X") is answered either way, and a
+    check that reads only one side reports a fact about naming style and lets it
+    pass for a fact about the product.  Separators in the path are read as spaces,
+    because ``x-y-z.md`` is how a file is named ``x y z``.
+    """
+    folded = needle.casefold()
+    return folded in text.casefold() or folded in _SEPARATOR_RE.sub(" ", path).casefold()
+
+
 def _gate(gate_id, status, reason_code, evidence_refs=()):
     return {
         "gate_id": gate_id,
@@ -300,12 +344,20 @@ def _content_gate(spec, artifacts):
             raise VerificationInputError("missing_gate_equals")
         ok = exists and actual == params["equals"]
         return _gate(gate_id, "PASS" if ok else "FAIL", "ok" if ok else "field_not_equal", (artifact_id,))
-    if kind in ("text_contains", "text_absent"):
+    if kind in ("text_contains", "text_contains_ci", "path_or_text_contains_ci", "text_absent"):
         needle = params.get("text")
         if not isinstance(needle, str) or not needle:
             raise VerificationInputError("invalid_gate_text")
-        present = needle in evidence["text"]
-        ok = present if kind == "text_contains" else not present
+        # Case is not evidence.  A named phrase that opens a heading is the same
+        # phrase; a gate that reads it as absent reports a fact about letter case
+        # and calls it a fact about the product.
+        if kind == "path_or_text_contains_ci":
+            present = address_hit(evidence["path"], evidence["text"], needle)
+        elif kind == "text_contains_ci":
+            present = needle.casefold() in evidence["text"].casefold()
+        else:
+            present = needle in evidence["text"]
+        ok = present if kind != "text_absent" else not present
         return _gate(gate_id, "PASS" if ok else "FAIL", "ok" if ok else "text_condition_failed", (artifact_id,))
     if evidence["content_type"] != "python":
         return _gate(gate_id, "FAIL", "content_type_mismatch", (artifact_id,))
@@ -351,6 +403,14 @@ def _task_run_id(task):
     value = _parse_json(task).get(RUN_ID_FIELD)
     if not _valid_run_id(value):
         raise VerificationInputError("task_run_id_missing")
+    return value
+
+
+def _task_run_binding(task):
+    """The task, not the executor bundle, names HOW the run is bound to evidence."""
+    value = _parse_json(task).get(RUN_BINDING_FIELD, RUN_BINDING_DECLARED)
+    if value not in RUN_BINDINGS:
+        raise VerificationInputError("invalid_run_binding")
     return value
 
 
@@ -518,13 +578,21 @@ def verify_case(bundle):
     # instead of "did this run produce it?".
     try:
         run_id = _task_run_id(task)
+        binding = _task_run_binding(task)
         declared = bundle.get("run_id")
         if not _valid_run_id(declared):
             raise VerificationInputError("bundle_run_id_missing")
         if declared != run_id:
             return _output(case_id, DISPROVEN, "run_binding_mismatch", reported_claim, gates + [_gate("V0_RUN_BINDING", "FAIL", "run_binding_mismatch", (task["path"],))], (), (), refs)
+        # ``changed`` is this verifier's OWN arithmetic over the two manifests, and
+        # ``V0_SCOPE_EXACT`` above already proved it equals the declared scope.  In
+        # measured mode a path inside it is bound to the run without the artifact
+        # having to say so; outside it, the declared rule applies unchanged.
+        measured = set(changed) if binding == RUN_BINDING_MEASURED else set()
         stale, unbound = [], []
         for artifact_id in sorted(artifacts):
+            if artifacts[artifact_id]["path"] in measured:
+                continue
             carried = _declared_run_ids(artifacts[artifact_id])
             if run_id in carried:
                 continue
@@ -535,8 +603,12 @@ def verify_case(bundle):
         if unbound or not artifacts:
             reason = "unbound_run_evidence" if unbound else "no_run_bound_evidence"
             return _output(case_id, UNKNOWN, reason, reported_claim, gates + [_gate("V0_RUN_BINDING", "UNKNOWN", reason, unbound)], [{"reason_code": reason, "evidence_ref": ref} for ref in (unbound or [""])], (), refs)
-        gates.append(_gate("V0_RUN_BINDING", "PASS", "evidence_names_this_run", tuple(sorted(artifacts))))
+        reason = "evidence_names_this_run" if binding == RUN_BINDING_DECLARED else "measured_change_names_this_run"
+        gates.append(_gate("V0_RUN_BINDING", "PASS", reason, tuple(sorted(artifacts))))
         refs["run_id"] = run_id
+        # Written only in measured mode: a declared-mode report keeps its bytes.
+        if binding != RUN_BINDING_DECLARED:
+            refs[RUN_BINDING_FIELD] = binding
     except VerificationInputError as exc:
         return _output(case_id, UNKNOWN, str(exc), reported_claim, gates + [_gate("V0_RUN_BINDING", "UNKNOWN", str(exc))], [{"reason_code": str(exc), "evidence_ref": ""}], (), refs)
 

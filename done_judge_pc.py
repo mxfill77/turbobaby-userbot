@@ -1,0 +1,359 @@
+# -*- coding: utf-8 -*-
+"""
+done_judge_pc.py — СТУПЕНЬ C: закрытие задачи полосы ПК судит V0, а не слово исполнителя.
+
+ПОВОД (своя полоса, проверяемо здесь). Перепись 15.08.2026 (`a545ad2`): 87 мест судят исход, 62 —
+по ОТЧЁТУ исполнителя, и НИ ОДНО из 25 «чтений назад» не читает продукт задачи. С тех пор полоса
+получила МЕСТО для адреса (`result_ref.py`) и СУДЬЮ адреса (`result_judge_pc.py`), но судья
+намеренно не подключён и подключён быть не может: инвариант `RESULT_JUDGE_UNWIRED` роняет гейт на
+первом же упоминании его имени в боевом коде. Поэтому судьёй здесь стои́т V0
+(`content_product_verifier.py`) — у него такого замка нет, а отрицательный тест и независимая
+приёмка за 01.09 у него есть.
+
+ЧТО ЭТОТ МОДУЛЬ ДЕЛАЕТ, ОДНОЙ СТРОКОЙ: переводит факты полосы в БАНДЛ V0 и отдаёт V0 вердикт.
+Своего суждения о «сделано» у него нет ни одной веткой, КРОМЕ одного честно названного случая —
+читать нечего вовсе (§«ГДЕ СУДИТ АДАПТЕР»).
+
+═══ ПРАВИЛО ═════════════════════════════════════════════════════════════════════════════════
+
+    Задача становится `done`, только если продукт ПРОЧИТАН ПО НАЗВАННОМУ АДРЕСУ и прочитанное
+    отвечает адресу. Нет адреса · по адресу пусто · по адресу лежит результат ПРЕЖНЕГО
+    прогона — исход «неизвестно», а НЕ «сделано».
+
+«Неизвестно» здесь — не «в порядке». Тот же закон, что у слоя ожиданий полосы (`CLAUDE.md`,
+§О1–О4, п. 3) и у судьи адреса: «проверить невозможно» не закрывает эпизод.
+
+═══ ПОЧЕМУ ОПОРНАЯ ЛИНИЯ СНИМАЕТСЯ ДЕМОНОМ, А НЕ ПРИНИМАЕТСЯ ОТ ИСПОЛНИТЕЛЯ ═════════════════
+
+Отрицательный тест V0 (01.09, `docs/artifacts/2026-09-01-v0-negative-test.md`) назвал ДВЕ дыры.
+Первую — «след покойника» — закрыла привязка к личности прогона (`V0_RUN_BINDING`). Вторая,
+развилка 2, осталась открытой дословно: «пока „что было до“ приходит от исполнителя, C2b
+неустраним в принципе; честный вариант — снимать baseline тем же прибором ДО захода».
+
+Здесь она и закрывается: `baseline()` зовётся ДО `run_task`, руками демона, и меряет sha256 того,
+что лежит по адресу. Исполнитель до этого снимка не касается ничем — он в это время ещё не
+запущен. Поэтому «результат прежнего прогона» ловится ИЗМЕРЕНИЕМ, а не заявлением, и ловится он
+не здесь, а гейтом `V0_SCOPE_EXACT`: адрес назван в `allowed_changed_paths`, а изменений по нему
+ноль → `changed_scope_mismatch`, вердикт `DISPROVEN`.
+
+СВЕЖЕСТЬ НИГДЕ НЕ МЕРИТСЯ ВРЕМЕНЕМ. Ни `mtime`, ни «моложе заявки»: свежий чужой файл доказывает
+продукт захода ровно так же, как чужая запись доказывает авторство тика модербота (класс О3 этой
+полосы). Меряется РАЗНИЦА ДВУХ СНИМКОВ, снятых одними руками.
+
+═══ ГДЕ СУДИТ АДАПТЕР, А НЕ V0 (граница названа, а не спрятана) ══════════════════════════════
+
+V0 судит ТОЛЬКО когда есть что читать. Три случая до него:
+
+    адрес не назван         → «неизвестно» (адаптер): бандла нет, судить нечего;
+    опорный снимок не снят  → «неизвестно» (адаптер): без «до» любая новизна недоказуема;
+    по адресу пусто вовсе   → «неизвестно» (адаптер): нечего класть в манифест кандидата.
+
+Во ВСЕХ остальных случаях вердикт — дословный ответ V0, и адаптер только переводит его в два
+слова полосы: `PROVEN` → «сделано», всё прочее → «неизвестно».
+
+═══ ЧЕГО ЭТОТ ПРИБОР НЕ ДЕЛАЕТ ══════════════════════════════════════════════════════════════
+
+  • НЕ судит `failed` и `needs_approval`: предмет — только переход в `done`;
+  • НЕ читает содержимого задачи дальше адреса и НЕ оценивает КАЧЕСТВО артефакта: «слова адреса
+    найдены» — это адрес, а не рецензия;
+  • НЕ ходит в сеть, к процессам и в базу (инвариант в тесте: ни `subprocess`, ни `socket`,
+    ни `sqlite3`, ни `urllib`, ни часов);
+  • пишет РОВНО в одну явно названную папку — `tmp/done_judge_pc/` (пакеты задачи и заявки,
+    которых V0 требует файлами). Артефакта, дерева и очереди не касается ничем.
+
+ОТКАТ: `DONE_JUDGE_PC=off` — вердикт считается и печатается, статус не меняется НИКОГДА.
+"""
+
+import hashlib
+import json
+import os
+import re
+
+import content_product_verifier as v0
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+
+# ═════════════════════════ ДВА СЛОВА ПОЛОСЫ ══════════════════════════════════════════════════
+# Их два, а не три, сознательно: закрытие задачи отвечает на ОДИН вопрос — «класть ли `done`».
+# Три исхода V0 при этом не теряются: они целиком лежат в `v0` и `reason` вердикта.
+DONE = "сделано"
+UNKNOWN = "неизвестно"
+
+# Маркер адреса в тексте задачи. Живая форма полосы (замер 01.09: 5 задач из 5 за сутки).
+MARK = "АДРЕС РЕЗУЛЬТАТА"
+
+PACKET_DIR = "tmp/done_judge_pc"
+GATE_ID = "ADDRESS_WORDS"
+ARTIFACT_ID = "result"
+# Потолок прибора, не наш: `content_product_verifier._max_bytes` отвергает всё крупнее.
+MAX_ARTIFACT_BYTES = v0.DEFAULT_MAX_BYTES
+
+# Режимы врезки. `addr` — дефолт: судим там, где адрес НАЗВАН. `all` — полное правило владельца
+# (нет адреса → тоже не «сделано»); почему не дефолт — в разборе ступени C, числом.
+MODE_OFF, MODE_ADDR, MODE_ALL = "off", "addr", "all"
+MODES = (MODE_OFF, MODE_ADDR, MODE_ALL)
+MODE_ENV = "DONE_JUDGE_PC"
+
+# «файл в <папке> за <дд.мм[.гггг]> со словами <слова>» — живая форма адреса на этой полосе.
+_RE_ADDR_PROSE = re.compile(
+    MARK + r"\s*:?\s*файл\s+в\s+(?P<folder>[0-9A-Za-z_][0-9A-Za-z_./-]*)"
+    r"\s+за\s+(?P<day>\d{1,2})\.(?P<month>\d{1,2})(?:\.(?P<year>\d{4}))?"
+    r"\s+со\s+словами\s+(?P<words>[^\r\n]+)", re.IGNORECASE)
+# «файл <путь>[ со словами <слова>]» — прямой указатель (канон `result_ref`, вид `file`).
+_RE_ADDR_PATH = re.compile(
+    MARK + r"\s*:?\s*файл\s+(?P<path>[0-9A-Za-z_][0-9A-Za-z_./-]*\.[0-9A-Za-z]+)"
+    r"(?:\s+со\s+словами\s+(?P<words>[^\r\n]+))?", re.IGNORECASE)
+
+
+def enforce_mode(env=None):
+    """Режим врезки из окружения. Незнакомое значение → дефолт, а не тишина и не падение."""
+    raw = (env if env is not None else os.environ).get(MODE_ENV)
+    raw = str(raw).strip().lower() if raw is not None else ""
+    if raw in ("0", "no", "false", MODE_OFF):
+        return MODE_OFF
+    if raw in ("1", "yes", "true", "on", MODE_ALL):
+        return MODE_ALL
+    return MODE_ADDR
+
+
+def _rel(path):
+    """Путь → относительный с прямыми слэшами | None (наружу дерева, пустой, `..`)."""
+    if not isinstance(path, str) or not path.strip():
+        return None
+    if os.path.isabs(path) or re.match(r"^[A-Za-z]:", path) or path.startswith(("//", "\\\\")):
+        return None
+    parts = [p for p in re.split(r"[\\/]", path) if p not in ("", ".")]
+    if not parts or ".." in parts:
+        return None
+    return "/".join(parts)
+
+
+def read_address(text):
+    """Текст ЗАДАЧИ → адрес результата | None («адрес не назван»).
+
+    Адрес берётся из ЗАДАЧИ, а не из отчёта: у V0 это уже принятая асимметрия — «The task, not
+    the executor bundle, names the checks that prove it». Исполнитель, называющий адрес сам,
+    доказывал бы себя своим же словом."""
+    s = "" if text is None else str(text)
+    match = _RE_ADDR_PROSE.search(s)
+    if match:
+        folder = _rel(match.group("folder"))
+        words = (match.group("words") or "").strip()
+        if not folder or not words:
+            return None
+        return {"folder": folder, "day": int(match.group("day")), "month": int(match.group("month")),
+                "year": int(match.group("year")) if match.group("year") else None,
+                "words": words, "path": None}
+    match = _RE_ADDR_PATH.search(s)
+    if match:
+        path = _rel(match.group("path"))
+        words = (match.group("words") or "").strip()
+        if not path:
+            return None
+        return {"folder": path.rsplit("/", 1)[0] if "/" in path else "", "day": None, "month": None,
+                "year": None, "words": words, "path": path}
+    return None
+
+
+def _name_matches(name, addr):
+    """Имя файла отвечает ДАТЕ адреса? Год НЕ подставляется часами — он берётся из имени.
+
+    Разбор года по календарю сессии был бы часами боковой дверью; вместо этого дата читается
+    как `<любой год>-ММ-ДД`, а «прежний год» отсекается не датой, а измеренной новизной."""
+    if addr.get("year"):
+        head = "%04d-%02d-%02d" % (addr["year"], addr["month"], addr["day"])
+        return name.startswith(head) and len(name) > len(head) and name[len(head)] in "-."
+    return bool(re.match(r"^\d{4}-%02d-%02d[-.]" % (addr["month"], addr["day"]), name))
+
+
+def _sha256_file(full, cap):
+    """sha256 файла | None (не файл, ссылка, крупнее потолка прибора, не прочитан)."""
+    try:
+        if os.path.islink(full) or not os.path.isfile(full) or os.path.getsize(full) > cap:
+            return None
+        with open(full, "rb") as handle:
+            return hashlib.sha256(handle.read(cap + 1)).hexdigest()
+    except OSError:
+        return None
+
+
+def scan(addr, root=REPO, cap=MAX_ARTIFACT_BYTES):
+    """Снимок по адресу: {относительный путь: sha256}. Ошибка чтения папки → None («не снят»).
+
+    Пустой словарь и None — РАЗНЫЕ ответы: «по адресу ничего нет» против «посмотреть не смог»."""
+    if not addr:
+        return None
+    if addr.get("path"):
+        digest = _sha256_file(os.path.join(root, addr["path"].replace("/", os.sep)), cap)
+        return {addr["path"]: digest} if digest else {}
+    folder = os.path.join(root, addr["folder"].replace("/", os.sep))
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return None
+    out = {}
+    for name in names:
+        if not _name_matches(name, addr):
+            continue
+        digest = _sha256_file(os.path.join(folder, name), cap)
+        if digest:
+            out["%s/%s" % (addr["folder"], name)] = digest
+    return out
+
+
+def baseline(text, root=REPO):
+    """ОПОРНЫЙ СНИМОК, снятый ДО захода РУКАМИ ДЕМОНА. Зовётся перед `run_task`, не позже.
+
+    Именно этот вызов отнимает у исполнителя право говорить, «что было до»: снимок сделан
+    тогда, когда исполнителя ещё нет."""
+    addr = read_address(text)
+    files = scan(addr, root) if addr else None
+    return {"address": addr, "files": files, "ok": addr is not None and files is not None}
+
+
+def _read_text(full, cap):
+    try:
+        with open(full, "rb") as handle:
+            return handle.read(cap + 1).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _verdict(verdict, reason, addr=None, chosen=None, result=None, run_id=None, extra=None):
+    out = {"verdict": verdict, "reason": reason, "address": addr, "chosen": chosen,
+           "v0": result, "run_id": run_id}
+    if extra:
+        out.update(extra)
+    return out
+
+
+def run_token(tid, draft_rel=None):
+    """ЛИЧНОСТЬ ПРОГОНА для бандла: токен черновика доклада, иначе номер задачи.
+
+    Токен рождает демон при заходе (`report_draft`), исполнитель его не выбирает. При режиме
+    `measured` привязка стои́т не на нём, а на измеренной новизне, поэтому запасной вариант
+    (номер задачи) вердикта не подменяет — он только заполняет обязательное поле схемы."""
+    name = os.path.basename(str(draft_rel or ""))
+    match = re.search(r"task\d+-(?P<token>[0-9A-Za-z][0-9A-Za-z_.-]{3,79})\.md$", name)
+    if match:
+        return match.group("token")
+    return "pc-task-%s" % (tid if tid not in (None, "") else "unknown")
+
+
+def _packets(case_id, run_id, addr, gates, status, root):
+    """Пакет задачи и пакет заявки — файлами, как требует V0. Пишет ДЕМОН, не исполнитель."""
+    rel_dir = "%s/%s" % (PACKET_DIR, case_id)
+    full_dir = os.path.join(root, rel_dir.replace("/", os.sep))
+    os.makedirs(full_dir, exist_ok=True)
+    task = {"schema_version": "v0.1", "case_id": case_id, "run_id": run_id,
+            v0.RUN_BINDING_FIELD: v0.RUN_BINDING_MEASURED,
+            "address": {"folder": addr["folder"], "path": addr.get("path"), "words": addr["words"]},
+            "required_content_gates": gates}
+    claim = {"schema_version": "v0.1", "case_id": case_id, "reported_claim": "reported_done",
+             "reported_status": str(status), "unknowns": []}
+    out = {}
+    for key, obj in (("task_packet", task), ("result_packet", claim)):
+        data = json.dumps(obj, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":")).encode("utf-8")
+        with open(os.path.join(full_dir, key + ".json"), "wb") as handle:
+            handle.write(data)
+        out[key] = {"path": "%s/%s.json" % (rel_dir, key),
+                    "sha256": hashlib.sha256(data).hexdigest(), "content_type": "json"}
+    return out
+
+
+def judge(tid, text, status, base, run_id=None, root=REPO):
+    """ВЕРДИКТ ЗАКРЫТИЯ: «сделано» | «неизвестно». `None` — задача не про `done`, судить нечего.
+
+    Не поднимает исключений НИ ОДНОЙ веткой: сбой самого судьи — это «неизвестно» с названной
+    виной, а не проход мимо. Судья, падающий на своей задаче, закрыл бы её как зелёную."""
+    if str(status) != "done":
+        return None
+    try:
+        addr = (base or {}).get("address") or read_address(text)
+        if not addr:
+            return _verdict(UNKNOWN, "адрес результата не назван задачей — доказывать нечем")
+        if not addr.get("words"):
+            return _verdict(UNKNOWN, "адрес без слов: доказывать таким адресом нечего", addr)
+        if not (base or {}).get("ok") or (base or {}).get("files") is None:
+            return _verdict(UNKNOWN, "опорный снимок по адресу НЕ СНЯТ до захода — новизна "
+                                     "продукта недоказуема", addr)
+        before = dict(base["files"])
+        now = scan(addr, root)
+        if now is None:
+            return _verdict(UNKNOWN, "чтение по адресу сорвалось (папка недоступна)", addr)
+        changed = sorted(p for p in set(before) | set(now) if before.get(p) != now.get(p))
+        words = addr["words"]
+        # ОДНА реализация правила «отвечает адресу» на два вызова: здесь она ВЫБИРАЕТ файл,
+        # у V0 она СУДИТ. Разъедься они — адаптер подавал бы прибору не тот файл.
+        hits = [p for p in sorted(now)
+                if v0.address_hit(p, _read_text(os.path.join(root, p.replace("/", os.sep)),
+                                                MAX_ARTIFACT_BYTES), words)]
+        chosen = (next((p for p in changed if p in hits), None)
+                  or next((p for p in changed if p in now), None)
+                  or (hits[0] if hits else None)
+                  or (sorted(now)[0] if now else None))
+        if chosen is None:
+            # Два разных «пусто», и путать их нельзя: «не появилось» — это молчание захода,
+            # «ИСЧЕЗЛО» — его действие. Исход один, диагноз разный.
+            gone = ("ИСЧЕЗЛО за заход (до захода лежало %d)" % len(before) if before
+                    else "нет ни одного файла")
+            return _verdict(UNKNOWN, "по адресу ПУСТО: за названную дату в «%s» %s"
+                            % (addr["folder"], gone), addr)
+        run_id = run_id or run_token(tid)
+        case_id = "pc-done-%s" % (tid if tid not in (None, "") else "unknown")
+        gates = [{"gate_id": GATE_ID, "artifact_id": ARTIFACT_ID, "type": "path_or_text_contains_ci",
+                  "params": {"text": words}}]
+        packets = _packets(case_id, run_id, addr, gates, status, root)
+        bundle = {
+            "schema_version": "v0.1", "case_id": case_id, "workspace_root": root, "run_id": run_id,
+            "task_packet": packets["task_packet"], "result_packet": packets["result_packet"],
+            # Опорная линия — НАШ замер до захода; кандидат — НАШ замер после. Слова исполнителя
+            # в манифестах нет ни одного.
+            "baseline_manifest": [{"path": chosen, "sha256": before.get(chosen)}],
+            "candidate_manifest": [{"path": chosen, "sha256": now[chosen],
+                                    "max_bytes": MAX_ARTIFACT_BYTES}],
+            # Адрес назвал ОДИН продукт — его и требуем. Ноль изменений по нему = результат
+            # прежнего прогона, и это `changed_scope_mismatch` у V0, а не суждение адаптера.
+            "allowed_changed_paths": [chosen],
+            "required_artifacts": [{"artifact_id": ARTIFACT_ID, "path": chosen, "required": True,
+                                    "sha256": now[chosen], "content_type": "text",
+                                    "max_bytes": MAX_ARTIFACT_BYTES}],
+            "content_gates": gates, "test_evidence": [],
+        }
+        result = v0.verify_case(bundle)
+        proven = result.get("verdict") == v0.PROVEN
+        return _verdict(DONE if proven else UNKNOWN,
+                        "V0: %s / %s по адресу «%s»" % (result.get("verdict"),
+                                                        result.get("reason_code"), chosen),
+                        addr, chosen, result, run_id,
+                        {"changed": changed, "candidates": sorted(now)})
+    except Exception as exc:                                   # noqa: BLE001 — см. докстринг
+        return _verdict(UNKNOWN, "СБОЙ СУДЬИ (%s: %s) — это не «сделано»"
+                        % (type(exc).__name__, str(exc)[:120]))
+
+
+# Маркер исхода в тексте отчёта. Своего СТАТУСА у «неизвестно» в очереди нет — статусов ровно
+# шесть, — поэтому исход живёт маркером в причине, ровно как «отклонено Филиппом» у отказа
+# владельца (`queue_snapshot_pc`, класс 15.08). Искать по нему, а не по статусу.
+UNKNOWN_PREFIX = "НЕИЗВЕСТНО (V0): результат по названному адресу НЕ ПРОЧИТАН"
+
+
+def line(verdict):
+    """Одна строка в отчёт задачи. Ставится В НАЧАЛО: обрезка отчёта режет с хвоста."""
+    if not verdict:
+        return ""
+    return "[V0 судит done: %s · %s]" % (verdict["verdict"], verdict["reason"])
+
+
+def fail_result(verdict, result):
+    """Текст закрытия, когда «сделано» не доказано. Отчёт исполнителя НЕ выбрасывается — он
+    съезжает под вердикт: он остаётся сведениями и перестаёт быть доказательством."""
+    return "%s — %s\n\n%s" % (UNKNOWN_PREFIX, (verdict or {}).get("reason", ""), result or "")
+
+
+def enforces(verdict, mode):
+    """Меняет ли этот вердикт статус задачи при этом режиме."""
+    if not verdict or verdict.get("verdict") == DONE or mode == MODE_OFF:
+        return False
+    return mode == MODE_ALL or bool(verdict.get("address"))
