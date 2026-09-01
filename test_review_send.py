@@ -211,6 +211,19 @@ class CodexVerdicts(_Base):
         self.assertEqual((verdict["cost_unit"], verdict["cost_value"]), ("tokens", 24118))
         self.assertEqual(answer, LONG_ANSWER)
 
+    def test_cost_is_found_in_stderr_where_the_channel_actually_prints_it(self):
+        # Замер живого канала 01.09: при stdout-трубе Codex отдаёт в stdout
+        # ТОЛЬКО ответ, а свой протокол со строкой цены — в stderr. Разбор
+        # одного stdout молча объявлял бы цену неизвестной при напечатанной.
+        verdict, _ = classify_codex(
+            returncode=0,
+            stdout=LONG_ANSWER,
+            stderr="OpenAI Codex v0.151.0\n--------\ncodex\n…\ntokens used\n16 086\n",
+            last_message=LONG_ANSWER,
+            **_common()
+        )
+        self.assertEqual((verdict["outcome"], verdict["cost_value"]), ("answered", 16086))
+
     def test_token_counter_survives_the_separators_the_channel_actually_prints(self):
         # Канал печатает разряды ПРОБЕЛОМ (в живой пробе — «11 706»). Наивный
         # \\d+ прочитал бы 11 и занизил цену канала в тысячу раз.
