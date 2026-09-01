@@ -170,6 +170,15 @@ def send_codex(prompt, *, root, workdir, binary=None, model=None, cd=None, timeo
     facts["returncode"] = done.returncode
     facts["stdout"] = done.stdout.decode("utf-8", "replace")
     facts["stderr"] = done.stderr.decode("utf-8", "replace")
+    # Цену захода канал печатает В STDOUT и больше нигде: с концом процесса она
+    # исчезает, а бюджет массовой отправки считается именно по ней. Кладём сырой
+    # вывод рядом с ответом — в рабочий каталог (tmp/, вне git), не в лоток:
+    # лоток хранит ОТВЕТ, а это протокол канала.
+    try:
+        write_text(os.path.join(workdir, "codex_stdout.txt"), facts["stdout"])
+        write_text(os.path.join(workdir, "codex_stderr.txt"), facts["stderr"])
+    except OSError:
+        pass  # протокол — удобство, а не доказательство: его потеря вердикта не меняет
     if os.path.exists(out_path):
         try:
             facts["last_message"] = read_text(out_path)

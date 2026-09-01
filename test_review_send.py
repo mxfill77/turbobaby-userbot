@@ -217,6 +217,11 @@ class CodexVerdicts(_Base):
         self.assertEqual(parse_codex_tokens("tokens used\n11 706\n"), 11706)
         self.assertEqual(parse_codex_tokens("tokens used\n11\u00a0706"), 11706)
         self.assertEqual(parse_codex_tokens("tokens used: 1,234,567"), 1234567)
+        # Вторая форма новых версий CLI: пробел здесь разделяет ПОЛЯ, а не
+        # разряды, и жадный разбор слепил бы 27393+25171 в одно число.
+        self.assertEqual(
+            parse_codex_tokens("Token usage: total=27,393 input=25,171 (+ 0 cached) output=2,222"), 27393
+        )
         self.assertIsNone(parse_codex_tokens("ничего про цену"))
         self.assertIsNone(parse_codex_tokens(None))
 

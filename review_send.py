@@ -265,7 +265,14 @@ def _answer_shape(answer, min_chars):
     return None
 
 
+# \u0414\u0412\u0415 \u0444\u043e\u0440\u043c\u044b, \u0438 \u0440\u0430\u0437\u0431\u0438\u0440\u0430\u044e\u0442\u0441\u044f \u043e\u043d\u0438 \u041f\u041e\u0420\u041e\u0417\u041d\u042c, \u043f\u043e\u0442\u043e\u043c\u0443 \u0447\u0442\u043e \u043f\u0440\u043e\u0431\u0435\u043b \u0432 \u043d\u0438\u0445 \u0437\u043d\u0430\u0447\u0438\u0442 \u0440\u0430\u0437\u043d\u043e\u0435.
+# \u00abtokens used\n11 706\u00bb (\u0436\u0438\u0432\u0430\u044f \u043f\u0440\u043e\u0431\u0430 \u043a\u0430\u043d\u0430\u043b\u0430 31.08) \u2014 \u043f\u0440\u043e\u0431\u0435\u043b \u0420\u0410\u0417\u0414\u0415\u041b\u042f\u0415\u0422 \u0420\u0410\u0417\u0420\u042f\u0414\u042b
+# \u043e\u0434\u043d\u043e\u0433\u043e \u0447\u0438\u0441\u043b\u0430. \u00abToken usage: total=27,393 input=25,171 \u2026\u00bb \u2014 \u043f\u0440\u043e\u0431\u0435\u043b \u0420\u0410\u0417\u0414\u0415\u041b\u042f\u0415\u0422
+# \u041f\u041e\u041b\u042f, \u0438 \u0436\u0430\u0434\u043d\u0430\u044f \u0441\u043a\u043b\u0435\u0439\u043a\u0430 \u043f\u043e \u043f\u0440\u043e\u0431\u0435\u043b\u0443 \u0441\u043b\u0435\u043f\u0438\u043b\u0430 \u0431\u044b \u0438\u0437 \u0434\u0432\u0443\u0445 \u0447\u0438\u0441\u0435\u043b \u043e\u0434\u043d\u043e \u0447\u0443\u0434\u043e\u0432\u0438\u0449\u0435:
+# \u0446\u0435\u043d\u0430 \u043a\u0430\u043d\u0430\u043b\u0430 \u0437\u0430\u0432\u044b\u0441\u0438\u043b\u0430\u0441\u044c \u0431\u044b \u043d\u0430 \u043f\u043e\u0440\u044f\u0434\u043a\u0438 \u0432 \u0442\u043e\u043c \u0441\u0430\u043c\u043e\u043c \u043e\u0442\u0447\u0451\u0442\u0435, \u0440\u0430\u0434\u0438 \u043a\u043e\u0442\u043e\u0440\u043e\u0433\u043e \u0435\u0451 \u0438
+# \u043c\u0435\u0440\u044f\u044e\u0442.
 _RE_TOKENS = re.compile(r"tokens?\s+used[^0-9]{0,20}([0-9][0-9\s\u00a0\u202f,._]*)", re.IGNORECASE)
+_RE_TOKEN_USAGE = re.compile(r"token\s*usage[^0-9]{0,40}?total\s*[=:]\s*([0-9][0-9,_.]*)", re.IGNORECASE)
 
 
 def parse_codex_tokens(stdout):
@@ -278,13 +285,16 @@ def parse_codex_tokens(stdout):
     """
     if not isinstance(stdout, str):
         return None
-    match = _RE_TOKENS.search(stdout)
-    if not match:
-        return None
-    digits = re.sub(r"[^0-9]", "", match.group(1))
-    if not digits:
-        return None
-    return int(digits)
+    for rx in (_RE_TOKENS, _RE_TOKEN_USAGE):
+        match = rx.search(stdout)
+        if not match:
+            continue
+        digits = re.sub(r"[^0-9]", "", match.group(1))
+        if digits:
+            return int(digits)
+    # Ни одной формы — честное «неизвестно», а не ноль: ноль читался бы как
+    # «заход бесплатный», и на нём построили бы бюджет массовой отправки.
+    return None
 
 
 def classify_codex(
