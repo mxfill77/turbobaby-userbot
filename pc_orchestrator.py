@@ -5996,7 +5996,16 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         # шапок лотка и дверь в тему Аудит, review_intake_run — путь лотка,
                         # review_send_run — ЖИВОЙ формат повтора) уже в остатке выше: ступень F
                         # переиспользует чужие разборы и чужую отправку, а не заводит свои.
-                        "review_outbox_queue_run.py", "review_outbox_queue.py")
+                        "review_outbox_queue_run.py", "review_outbox_queue.py",
+                        # 02.09.2026: СВОДКА КОНТУРА — куст за ленивым `import contour_digest_run`
+                        # в `maybe_contour_digest`. Своих новых листьев ровно три: сама сводка, её
+                        # руки и `series_pc` — у него берётся ПРИЗНАК СЛУЖЕБНОГО КОРНЯ, который
+                        # литералом набирать нельзя (два экземпляра одной регулярки расходятся
+                        # молча, и счёт серии поехал бы не на тот вид строк). Всё прочее
+                        # (review_audit/review_audit_run — адрес темы сводок и дверь без каскада,
+                        # review_intake, recon_auto — МЕТКИ читающих строк) уже в остатке выше:
+                        # сводка читает чужие измерения и шлёт чужой дверью, своих не заводит.
+                        "contour_digest_run.py", "contour_digest.py", "series_pc.py")
 # остаток: ленивые импорты вне ворот грязного дерева
 
 
@@ -9419,6 +9428,79 @@ def maybe_review_outbox(now=None, tick_path=None, state_path=None, runner=None):
     return report
 
 
+# ------------------- СВОДКА КОНТУРА: СОСТОЯНИЕ ПОЛОСЫ (флаг CONTOUR_DIGEST) ---
+# ЗАЧЕМ ВТОРОЙ ВИД СООБЩЕНИЯ. Ступени A–F показывают владельцу СОБЫТИЕ: находку
+# ревьюера (D) и молчание канала (F). Оба вида молчат, когда событий нет, и ни
+# один не отвечает на вопрос «что с контуром сейчас» — за ответом надо прийти
+# самому в очередь, в файл ожиданий и в git. Здесь — СОСТОЯНИЕ: раз в названный
+# интервал демон сам кладёт в тему сводок то, что уже измерено другими.
+#
+# ЧИТАТЬ, НЕ РЕШАТЬ. Сводка НИЧЕГО не исполняет, задач не ставит, кнопок не несёт
+# и в темы постановки задач не пишет: адрес один — тема сводок (AUDIT_TOPIC), и
+# дверь та же, что у ступени D, без каскада фолбэков. Запись на диск ровно одна —
+# собственная метка окна; операционного состояния ветка не меняет ни одной строкой
+# (инвариант CONTOUR_DIGEST_READS_ONLY обходом AST в test_contour_digest).
+#
+# ИНТЕРВАЛ — ЧИСЛОМ, 4 ч, и он ПЕЧАТАЕТСЯ В САМОМ СООБЩЕНИИ: «закрылось 3» без
+# окна не значит ничего. Шесть сводок в сутки против одной суточной у ступени D:
+# суточная отвечает «что было», эта — «что сейчас», и стареет за часы.
+#
+# ИСТОЧНИКИ — ФАЙЛЫ, КОТОРЫЕ ПИШЕТ НЕ ЭТА ВЕТКА: слепок очереди (пишет демон
+# витком), состояние слоя ожиданий, реестр исходящих ступени F, git log. Мост
+# здесь НЕ ЗОВЁТСЯ намеренно: get_pending("done") замерен в 26.8 с, а всё внутри
+# витка исполняется синхронно — шесть таких заходов в сутки ели бы порог О2.
+#
+# ТРЕТИЙ ИСХОД ОБЯЗАТЕЛЕН: источник не прочитался → строка ВСЁ РАВНО есть и
+# говорит «неизвестно» с причиной; слепок старше СВОЕГО предела — тоже
+# «неизвестно», а не факт. Молча пропущенная строка читается как «там хорошо».
+#
+# ОТКАТ: стоп-файл `pc_orchestrator.contour_digest.off` (со следующего тика, без
+# рестарта) либо `CONTOUR_DIGEST=0`. Ненастроенная тема сводок = показ выключен.
+CONTOUR_DIGEST_SEC = float(os.getenv("CONTOUR_DIGEST_SEC", "14400") or "14400")   # 4 ч
+CONTOUR_DIGEST_STATE_FILE = _state(os.path.join(REPO, "contour_digest_state.json"))
+
+
+def _contour_digest_on():
+    """Сводка контура включена? Дефолт — ВКЛЮЧЕНО; рубильники как у соседних ступеней."""
+    if (os.environ.get("CONTOUR_DIGEST") or "").strip() == "0":
+        return False
+    if _flag_forced_off("CONTOUR_DIGEST"):
+        log.warning("сводка контура ВЫКЛЮЧЕНА стоп-файлом %s (снять: удалить файл)",
+                    os.path.basename(_flag_off_file("CONTOUR_DIGEST")))
+        return False
+    return True
+
+
+def maybe_contour_digest(now=None, state_path=None, runner=None):
+    """Один оборот сводки состояния контура. → отчёт | None.
+
+    Троттлинг живёт ВНУТРИ `contour_digest_run.tick` и стои́т на метке ОКНА, а не
+    на отдельной метке оборота: окно сводки и её период — одно и то же число, и
+    две метки разошлись бы на первом же сорванном отправлении. Сорванная отправка
+    окно НЕ двигает — период не проглатывается молча.
+    """
+    if not _contour_digest_on():
+        return None
+    try:
+        import contour_digest_run
+
+        report = (runner or contour_digest_run.tick)(
+            root=os.path.dirname(CONTOUR_DIGEST_STATE_FILE) or REPO,
+            state=state_path or CONTOUR_DIGEST_STATE_FILE,
+            now=now, interval=CONTOUR_DIGEST_SEC, send=True, write_journal=True,
+        )
+    except Exception as e:
+        log.warning("сводка контура: оборот упал (fail-safe, следующая попытка через тик): %s", e)
+        return None
+    if report.get("skipped"):
+        log.debug("сводка контура: %s", report["skipped"])
+        return report
+    log.info("сводка контура: %s", "ушла в тему %s (message_id=%s)"
+             % (report.get("topic"), report.get("message_id")) if report.get("sent")
+             else "НЕ ушла: %s" % report.get("send_why"))
+    return report
+
+
 # ------------------- РЕВИЗОР: МАРШРУТИЗАЦИЯ НАХОДОК (шаг 4/7 родителя 262) -----
 # revizor_tick собрал пакеты активных окон (шаг 2), _revizor_consult судит окно думателем (шаг 3).
 # Здесь — РАЗВОДКА находок по каналам (сам ревизор НИЧЕГО не правит и клиентам НЕ пишет):
@@ -10456,6 +10538,7 @@ def _main_loop():
             maybe_review_audit()      # ступень D: высокие находки + суточная сводка → тема Аудит (AUDIT_TOPIC)
             maybe_recon_auto()        # ступень E: поводы полосы → разведочные автозадачи (троттлинг RECON_AUTO_MIN_SEC)
             maybe_review_outbox()     # ступень F: не доехавший пакет → очередь исходящих с повтором (REVIEW_OUTBOX_MIN_SEC)
+            maybe_contour_digest()    # сводка контура: СОСТОЯНИЕ полосы в тему сводок раз в CONTOUR_DIGEST_SEC (4 ч)
             maybe_lesson_commit_retry()  # пакет «полнота лога» п.6: докоммитить урок из спула (провал коммита ≠ вечная грязь)
             maybe_git_ff_pull()       # родитель #221: подтянуть origin/main ff-only ДО реконсиляции/self-update (тот же тик применит)
             maybe_reconcile_children()  # класс-фикс c6d8a30: применить свежий код детей на ЛЮБОЙ новый коммит
