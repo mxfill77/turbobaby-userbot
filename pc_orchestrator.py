@@ -3175,6 +3175,18 @@ def process_new():
                          "оборотом ступени B, если находка ещё в лотке")
         _cowork(f"ступень B: осиротевшая заявка #{tid} закрыта (не исполняем)")
         return
+    if _is_recon_ask(text):
+        # ЗАЯВКА СТУПЕНИ E, осиротевшая на том же обрыве. Гнать её headless нельзя по причине,
+        # ОБРАТНОЙ заявке ступени B: там текст чужой, здесь свой — но он написан как ВОПРОС
+        # владельцу о поводе, который полоса разведывать НЕ ВПРАВЕ (живой ребёнок, клиентский
+        # контур, операционное действие). Исполнить его значило бы обойти собственный запрет
+        # ступени по недосмотру. Вернётся следующим оборотом, если повод ещё жив.
+        bc.complete_task(tid, "done",
+                         "✋ осиротевшая заявка ступени E закрыта: она НЕ исполняется (её предмет "
+                         "требует операционного действия, а разведка меняет только информационное "
+                         "состояние). Вернётся следующим оборотом, если повод ещё жив")
+        _cowork(f"ступень E: осиротевшая заявка #{tid} закрыта (не исполняем)")
+        return
     cmd = _match_command(text)                 # команда-рычаг? исполняем САМИ, без headless claude
     if cmd:
         status, result = _exec_command(cmd)
@@ -3405,6 +3417,16 @@ def process_approved():
             _cowork(f"ступень B: заявка #{tid} принята к сведению (задачей НЕ стала)")
             log.info("APPROVED id=%s заявка-ревью → принято к сведению (без прогона)", tid)
             continue
+        if _is_recon_ask(task.get("task_text")):
+            # «Да» на заявке ступени E — тоже «ПРИНЯТО К СВЕДЕНИЮ». Предмет такой заявки —
+            # операционное действие (рестарт, живой ребёнок, клиентский контур), и превращать
+            # одобрение вопроса в разрешение действовать нельзя: одобрен ВОПРОС, а не операция.
+            bc.complete_task(tid, "done",
+                             "✋ заявка ступени E ПРИНЯТА К СВЕДЕНИЮ. Задачей она не стала: её "
+                             "предмет — операционное действие, и решение по нему остаётся твоим")
+            _cowork(f"ступень E: заявка #{tid} принята к сведению (задачей НЕ стала)")
+            log.info("APPROVED id=%s заявка-разведки → принято к сведению (без прогона)", tid)
+            continue
         if (_age_sec(task.get("updated")) or 0) > APPROVAL_TTL:
             log.info("APPROVED id=%s истёк (>%ss) → failed", tid, APPROVAL_TTL)
             # ⏱ первым символом: для шага локальной цепи просрочка approve = halt без думателя
@@ -3482,6 +3504,8 @@ def process_approval_timeouts():
             # никто и не обещал в 30 минут: у заявки нет исполнителя, который ждёт «да», — ждёт
             # только сам вопрос.
             continue
+        if _is_recon_ask(task.get("task_text")):
+            continue      # заявка ступени E ждёт человека столько же и по той же причине
         if (_age_sec(task.get("updated")) or 0) > APPROVAL_TTL:
             log.info("NEEDS_APPROVAL id=%s таймаут (>%ss) → failed", tid, APPROVAL_TTL)
             # id=23 (22.08) прожила ровно этот путь: работа сдана, артефакт закоммичен, строка
@@ -5478,6 +5502,12 @@ def _is_owner_work(it, revizor_pids):
         # внеси её сюда — ревизорские цепи уступали бы ей вечно: заявка живёт в needs_approval
         # до решения человека, то есть «незакрытая owner-работа» не кончалась бы никогда.
         return False
+    if frm == RECON_ASK_FROM:
+        # Заявка ступени E — тот же жанр и та же цена ошибки. И вторая, СВОЯ причина: замок
+        # «не ставим автозадач, пока есть работа владельца» спрашивает ровно эту функцию.
+        # Числись заявка работой — одна заявка, повисшая в needs_approval, глушила бы разведку
+        # НАВСЕГДА, то есть ступень E выключала бы сама себя первым же своим вопросом.
+        return False
     if frm != PC_LOCAL_DEC_FROM:
         return True                                    # одиночка/дев-ТЗ/урок владельца на полосе pc
     if _is_revizor_parent_text(txt):
@@ -5946,6 +5976,13 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         # review_send) плюс `queue_snapshot_pc`, у которого он одалживает замок
                         # флага при импорте демона; оба уже в остатке выше.
                         "review_intake_run.py", "review_intake.py",
+                        # 01.09.2026: ступень E — куст за ленивым `import recon_auto_run` в
+                        # `maybe_recon_auto`. Своих новых листьев ровно три: сами `recon_auto`,
+                        # `recon_auto_run` и `expectations_pc` (у него берутся ВИДЫ и ЗАГОЛОВКИ
+                        # ожиданий — литералом их набирать нельзя, разойдутся на первой правке
+                        # наблюдателя). Всё прочее (review_intake, review_intake_run, client_contour)
+                        # уже покрыто: первые два — остатком выше, третий — верхним импортом демона.
+                        "recon_auto_run.py", "recon_auto.py", "expectations_pc.py",
                         # 01.09.2026: ступень D — куст за ленивым `import review_audit_run` в
                         # `maybe_review_audit`. Своих новых листьев у него ровно два: сам
                         # `review_audit` и `review_audit_run`; всё остальное (review_intake_run,
@@ -9139,6 +9176,134 @@ def maybe_review_audit(now=None, tick_path=None, state_path=None, runner=None):
     return report
 
 
+# ------------------- СТУПЕНЬ E: РАЗВЕДОЧНЫЕ АВТОЗАДАЧИ (флаг RECON_AUTO) ------
+# ЗАЧЕМ. Ступени A/B/C/D кончаются ЗНАНИЕМ: пакет ушёл, находка стала заявкой, закрытие судит
+# прибор, сводка пришла владельцу. Дальше знание ЛЕЖИТ и ждёт человека — а сработавшее ожидание,
+# у которого никто не спросил «почему», не отличается от несработавшего. Ступень E добавляет одно
+# звено: у повода появляется РАЗБОР, задача, которую полоса ставит СЕБЕ САМА.
+#
+# ГРАНИЦА — В САМОМ СЛОВЕ «РАЗВЕДОЧНАЯ». Автозадача меняет ТОЛЬКО информационное состояние:
+# читает, считает, пишет артефакт. Операционного не трогает ни одной веткой — ни процессов, ни
+# живых таблиц, ни денег, ни детей контура, ни выкаток, ни удалений. Повод, чей предмет требует
+# ДЕЙСТВИЯ, автозадачи не рождает вовсе: он идёт ЗАЯВКОЙ владельцу (`recon_auto.route`), и решает
+# человек. Признак маршрута СТРУКТУРНЫЙ (вид ожидания, признак клиентского контура), а не
+# подстрока — правило 5 свода среды.
+#
+# ЧЕТЫРЕ ЧАСТИ ИЛИ НИЧЕГО. Задача несёт цель, стандартный блок запретов, признак сделанности и
+# АДРЕС РЕЗУЛЬТАТА; нет любой — не ставится вовсе. Задача без адреса закрывается словом
+# исполнителя, а это право ступень C у полосы отняла — вернуть его с другой стороны нельзя.
+#
+# ДВА ПОТОЛКА, ОБА RESTART-PROOF ИЗ ОЧЕРЕДИ (а не из памяти процесса, которую съедает self-update):
+# не больше RECON_AUTO_BUDGET автозадач в сутки и НИ ОДНОЙ, пока в очереди есть незакрытая работа
+# владельца (`_is_owner_work` — та же функция, которой уступают ревизорские цепи). Заявка владельцу
+# вторым потолком не связана СОЗНАТЕЛЬНО: она ничего не исполняет и времени полосы не занимает, а
+# глушить её вместе с задачами значило бы молчать там, где молчать опаснее всего.
+#
+# ЦЕНА ОБОРОТА НАЗВАНА ЗАМЕРОМ (01.09): сборка целиком 33–38 с, из них 34 с — четыре чтения очереди
+# по мосту, 1.8 с — пересборка лотка ступени B, 0.4 с — граф импортов для признака контура. В
+# плохую минуту моста (BridgeTransportError с повторами) замерено 115 с. Поэтому пол паузы здесь
+# 1800 с — вшестеро больше, чем у ступени A: разведочный повод за полчаса не портится, а виток
+# демона эта ветка держать не вправе.
+#
+# ОТКАТ: стоп-файл `pc_orchestrator.recon_auto.off` (со следующего тика, без рестарта и без правки
+# `.env`), либо `RECON_AUTO=0`, либо `RECON_AUTO_BUDGET=0` (ветка жива, но не ставит ничего).
+RECON_AUTO_MIN_SEC = float(os.getenv("RECON_AUTO_MIN_SEC", "1800") or "1800")  # пол паузы, с
+RECON_AUTO_BUDGET = int(os.getenv("RECON_AUTO_BUDGET", "2") or "2")            # автозадач в сутки
+RECON_AUTO_LIMIT = int(os.getenv("RECON_AUTO_LIMIT", "1") or "1")              # автозадач за оборот
+RECON_AUTO_TICK_FILE = _state(os.path.join(REPO, "pc_orchestrator.recon_auto_tick.json"))
+# И состояние, и корень записи — через `_state`: тот же класс, что ступень A поймала живьём
+# (ветка включена по умолчанию, и тест, зовущий живую функцию демона, писал бы в БОЕВОЙ реестр).
+RECON_AUTO_STATE_FILE = _state(os.path.join(REPO, "recon_auto_state.json"))
+RECON_ASK_MARK = "[разведка-заявка"      # маркер ЗАЯВКИ ступени E (три гарда опознают её по нему)
+RECON_ASK_FROM = "Filipp-recon-ask"      # from заявки: НЕ работа полосы (см. `_is_owner_work`)
+
+
+def _is_recon_ask(text):
+    """task_text — ЗАЯВКА ступени E (не задача)? Маркер-гейт трёх гардов очереди.
+
+    Маркер АВТОЗАДАЧИ (`[разведка `) сюда НЕ попадает намеренно: автозадача — обычная зелёная
+    работа полосы, её и должен подобрать `process_new`. Гарды держат от исполнения ровно заявку.
+    """
+    return str(text or "").startswith(RECON_ASK_MARK)
+
+
+def _recon_auto_root():
+    """Корень, в котором ступень E держит реестр поставленного. Под тестом — temp, в бою — REPO."""
+    return os.path.dirname(RECON_AUTO_STATE_FILE) or REPO
+
+
+def _recon_auto_on():
+    """Ступень E включена? Дефолт — ВКЛЮЧЕНО; рубильники те же два, что у ступеней A, B и D."""
+    if (os.environ.get("RECON_AUTO") or "").strip() == "0":
+        return False
+    if _flag_forced_off("RECON_AUTO"):
+        log.warning("ступень E ВЫКЛЮЧЕНА стоп-файлом %s (снять: удалить файл)",
+                    os.path.basename(_flag_off_file("RECON_AUTO")))
+        return False
+    return True
+
+
+def _recon_auto_read_tick(path=None):
+    try:
+        with open(path or RECON_AUTO_TICK_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _recon_auto_write_tick(now, path=None):
+    p = path or RECON_AUTO_TICK_FILE
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"ts": float(now)}, f)
+    except Exception as e:
+        log.warning("ступень E: метка оборота не записана: %s", e)
+
+
+def maybe_recon_auto(now=None, tick_path=None, state_path=None, runner=None):
+    """Один оборот ступени E за тик, с троттлингом по МЕТКЕ НА ДИСКЕ. → отчёт | None.
+
+    None — ветка выключена или пол паузы не прошёл. Метку пишем ВСЕГДА, даже когда поводов нет:
+    иначе «поводов нет» стоило бы четырёх чтений очереди каждые POLL_SEC.
+
+    «Ничего не поставили» — НЕ тишина: причина едет в лог строкой (замок владельца, бюджет суток,
+    поводов нет, очередь недоступна — это четыре РАЗНЫЕ новости, и различать их владелец должен
+    без чтения кода).
+    """
+    if not _recon_auto_on():
+        return None
+    now = time.time() if now is None else now
+    st = _recon_auto_read_tick(tick_path)
+    prev = st.get("ts")
+    if prev is not None:
+        try:
+            if (now - float(prev)) < RECON_AUTO_MIN_SEC:
+                return None
+        except Exception:
+            pass
+    _recon_auto_write_tick(now, tick_path)
+    try:
+        import recon_auto_run
+        report = (runner or recon_auto_run.tick)(
+            root=_recon_auto_root(), state_path=state_path or RECON_AUTO_STATE_FILE,
+            place=True, limit=RECON_AUTO_LIMIT, budget=RECON_AUTO_BUDGET, write_journal=True,
+        )
+    except Exception as e:
+        log.warning("ступень E: оборот упал (fail-safe, метка уже сдвинута — следующая попытка "
+                    "через паузу): %s", e)
+        return None
+    if not report.get("acted"):
+        log.info("ступень E: %s", report.get("why") or "ставить нечего")
+        return report
+    log.info("ступень E: поставлено %d (%s), не встало %d",
+             len(report.get("placed") or []),
+             ", ".join("#%s %s" % (r.get("id"), r.get("way")) for r in report.get("placed") or []),
+             len(report.get("failed") or []))
+    _cowork(recon_auto_run._line(report) or "ступень E: оборот без строки исхода")
+    return report
+
+
 # ------------------- РЕВИЗОР: МАРШРУТИЗАЦИЯ НАХОДОК (шаг 4/7 родителя 262) -----
 # revizor_tick собрал пакеты активных окон (шаг 2), _revizor_consult судит окно думателем (шаг 3).
 # Здесь — РАЗВОДКА находок по каналам (сам ревизор НИЧЕГО не правит и клиентам НЕ пишет):
@@ -10174,6 +10339,7 @@ def _main_loop():
             maybe_review_auto()       # ступень A: пакет второго мнения за REVIEW_AUTO (троттлинг REVIEW_AUTO_MIN_SEC)
             maybe_review_intake()     # ступень B: находки ответа → ЗАЯВКИ очереди (троттлинг REVIEW_INTAKE_MIN_SEC)
             maybe_review_audit()      # ступень D: высокие находки + суточная сводка → тема Аудит (AUDIT_TOPIC)
+            maybe_recon_auto()        # ступень E: поводы полосы → разведочные автозадачи (троттлинг RECON_AUTO_MIN_SEC)
             maybe_lesson_commit_retry()  # пакет «полнота лога» п.6: докоммитить урок из спула (провал коммита ≠ вечная грязь)
             maybe_git_ff_pull()       # родитель #221: подтянуть origin/main ff-only ДО реконсиляции/self-update (тот же тик применит)
             maybe_reconcile_children()  # класс-фикс c6d8a30: применить свежий код детей на ЛЮБОЙ новый коммит
