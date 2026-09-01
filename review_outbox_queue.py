@@ -476,14 +476,28 @@ def journal_line(report):
     Пустая строка при пустом обороте — не пропуск, а правило журнала-индекса:
     «повторять было нечего» это не новость, а 1440 таких новостей в сутки — шум,
     в котором утонет настоящая.
+
+    У этого правила РОВНО ОДНО исключение — ``state_why``, порча реестра. Замер
+    02.09 показал, чем оно оплачено: с битым файлом и ПУСТЫМ лотком очередь
+    уходила с 14 записей на 0 и отдавала пустую строку, то есть начинала с нуля
+    молча — ровно то, чего слой не вправе делать. Порча это единственная новость,
+    которая обязана прозвучать в обороте, где не случилось больше НИЧЕГО:
+    молчание здесь неотличимо от исправности.
     """
     added = len(report.get("added") or [])
     retried = len(report.get("retried") or [])
     ex = len(report.get("exhausted") or [])
     closed = len(report.get("closed") or [])
+    state_why = (report.get("state_why") or "").strip()
     if not (added or retried or ex or closed):
+        if state_why:
+            return "ревью-контур F (очередь исходящих): %s; собрано из лотка записей %d" % (
+                state_why, int(report.get("queued") or 0),
+            )
         return ""
     parts = []
+    if state_why:
+        parts.append(state_why)
     if added:
         parts.append("взято в очередь %d" % added)
     if retried:

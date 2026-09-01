@@ -90,27 +90,58 @@ def state_default():
     return {"schema": Q.SCHEMA, "bootstrap_at": "", "packs": {}, "announced": {}, "day": {}}
 
 
-def read_state(path):
-    """Реестр с диска. → dict. Битый файл = пустой реестр, а не падение.
+def read_state_why(path):
+    """Реестр с диска и НАЗВАННАЯ причина, если прочитать его не удалось.
+    → (state, why). Пустой ``why`` = прочитано штатно.
 
-    Потеря реестра НЕ теряет пакетов: они лежат в лотке, и следующий оборот
-    соберёт очередь заново. Она теряет ровно счётчик попыток и отметку показа —
-    то есть в худшем случае повторит показ, а не выкинет пакет.
+    Битый файл по-прежнему даёт пустой реестр, а не падение: потеря реестра НЕ
+    теряет пакетов — они лежат в лотке, и следующий оборот соберёт очередь
+    заново, потеряв ровно счётчик попыток и отметку показа.
+
+    ПОЧЕМУ ПРИЧИНА ВОЗВРАЩАЕТСЯ ОТДЕЛЬНЫМ ЗНАЧЕНИЕМ, А НЕ КЛЮЧОМ РЕЕСТРА. Реестр
+    целиком уезжает на диск :func:`write_state`; «почему прошлый файл не читался»
+    — новость ОБ ОБОРОТЕ, а не состояние очереди, и в файле она превратилась бы в
+    вечную запись о давно починенном.
+
+    ОТСУТСТВИЕ ФАЙЛА ПОВРЕЖДЕНИЕМ НЕ СЧИТАЕТСЯ, и это не поблажка. Первый оборот
+    на любой полосе видит ровно эту картину, и назвать её бедой значило бы
+    объявлять беду каждому новому развёртыванию — шум, в котором утонет
+    настоящая. Отличить «файла ещё не было» от «файл унесли» этому слою нечем;
+    видимый признак у обоих один и уже есть — ``bootstrap`` в отчёте.
     """
     try:
         with io.open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-    except (OSError, ValueError):
-        return state_default()
+    except FileNotFoundError:
+        return state_default(), ""
+    except OSError as exc:
+        return state_default(), "реестр очереди НЕ ПРОЧИТАН (%s) — счётчик попыток начат заново" % exc
+    except ValueError as exc:
+        return state_default(), "реестр очереди ПОВРЕЖДЁН (JSON не разобран: %s) — счётчик попыток начат заново" % exc
     if not isinstance(data, dict):
-        return state_default()
+        return state_default(), (
+            "реестр очереди ПОВРЕЖДЁН (в файле %s, а не запись очереди) — счётчик попыток начат заново"
+            % type(data).__name__
+        )
     out = state_default()
+    lost = []
     for k in ("packs", "announced", "day"):
         if isinstance(data.get(k), dict):
             out[k] = data[k]
+        elif k in data:
+            lost.append(k)
     if isinstance(data.get("bootstrap_at"), str):
         out["bootstrap_at"] = data["bootstrap_at"]
-    return out
+    elif "bootstrap_at" in data:
+        lost.append("bootstrap_at")
+    if lost:
+        return out, "реестр очереди ПОВРЕЖДЁН ЧАСТИЧНО (не разобраны разделы: %s)" % ", ".join(sorted(lost))
+    return out, ""
+
+
+def read_state(path):
+    """Реестр с диска. → dict. Дверь для тех, кому причина не нужна."""
+    return read_state_why(path)[0]
 
 
 def write_state(state, path):
@@ -393,7 +424,7 @@ def tick(root=HERE, state_path=None, inbox=DEFAULT_INBOX, send=False, clock=None
     """
     now = now_utc(clock)
     state_path = state_path or os.path.join(root, DEFAULT_STATE)
-    state = read_state(state_path)
+    state, state_why = read_state_why(state_path)
     first = not state.get("bootstrap_at")
 
     synced = sync(state, root=root, inbox=inbox, files=files, now=now, headers=headers)
@@ -421,6 +452,11 @@ def tick(root=HERE, state_path=None, inbox=DEFAULT_INBOX, send=False, clock=None
         "at": Q.iso(now),
         "bootstrap": first,
         "state_path": state_path,
+        # Порча реестра обязана быть НАЗВАНА, а не выглядеть первым оборотом:
+        # замер 02.09 показал, что битый файл до этой ветки давал ровно ту же
+        # картину, что честный бутстрап, и на пустом лотке очередь уходила в ноль
+        # без единого слова (`docs/artifacts/2026-09-02-...`).
+        "state_why": state_why,
         "topic": topic,
         "topic_why": topic_why,
         "added": synced["added"],
@@ -452,6 +488,8 @@ def _render(report):
     out = []
     out.append("ОЧЕРЕДЬ ИСХОДЯЩИХ (ступень F) · %s%s" % (report["at"], " · БУТСТРАП" if report["bootstrap"] else ""))
     out.append("реестр: %s" % report["state_path"])
+    if report.get("state_why"):
+        out.append("ВНИМАНИЕ: %s" % report["state_why"])
     out.append("тема Аудит: %s%s" % (report["topic"] or "не настроена", (" (%s)" % report["topic_why"]) if report.get("topic_why") else ""))
     out.append("взято в очередь: %d · продвинуто: %d · закрыто ответом: %d · пропущено файлов: %d"
                % (len(report["added"]), len(report["advanced"]), len(report["closed"]), len(report["skipped"])))

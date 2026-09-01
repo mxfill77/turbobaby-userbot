@@ -713,6 +713,112 @@ class TestAnnounceBudgetAndAddress(unittest.TestCase):
         self.assertNotIn("manus|l.md", st["announced"], "неудачный показ не смеет считаться показанным")
 
 
+class TestCorruptRegistryIsNamed(unittest.TestCase):
+    """Реестр ПОВРЕЖДЁН — очередь обязана СКАЗАТЬ, а не начать с нуля молча.
+
+    Замер 02.09 (проба детерминизма с отодвинутым боевым состоянием) поймал ровно
+    этот разрыв: битый файл давал ту же картину, что честный первый оборот —
+    ``bootstrap=True``, счётчик попыток с единицы, — и слова «повреждён» не было
+    нигде. При живом лотке это стоило только счётчика (записи собирались заново,
+    14 → 14), а при ПУСТОМ лотке очередь уходила с 14 записей на 0 и отдавала
+    ПУСТУЮ строку-индекс. Здесь проверяется, что она теперь говорит.
+
+    Порча берётся ТРЕХ ВИДОВ, потому что живой диск ломает по-разному: обрыв
+    файла посередине, валидный JSON не того вида, и разобранный словарь с
+    испорченным разделом. Один вид проверял бы одну ветку из трёх.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="outbox_corrupt_")
+        self.state = os.path.join(self.tmp, "state.json")
+        self.heads = [_head("docs/review_outbox/m%d.md" % i, "manus", "refused", "http_400",
+                            "docs/review_inbox/m%d-manus.md" % i) for i in range(3)]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _tick(self, heads, **kw):
+        kw.setdefault("clock", lambda: at(12))
+        return R.tick(root=self.tmp, state_path=self.state, headers=heads, retry=False, **kw)
+
+    def _break(self, text):
+        with io.open(self.state, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_missing_file_is_not_damage_and_stays_silent(self):
+        """Файла НЕТ — это первый оборот, а не беда: молчание остаётся молчанием.
+
+        Замок от шума: назвать бедой отсутствие реестра значило бы кричать на
+        каждом новом развёртывании, и настоящая порча утонула бы в этом крике.
+        """
+        state, why = R.read_state_why(self.state)
+        self.assertEqual(why, "")
+        self.assertEqual(state["packs"], {})
+        self.assertEqual(self._tick([])["line"], "", "пустой оборот без реестра — не новость")
+
+    def test_truncated_json_is_named_in_report_and_index(self):
+        self._tick(self.heads)
+        with io.open(self.state, "rb") as fh:
+            raw = fh.read()
+        with io.open(self.state, "wb") as fh:
+            fh.write(raw[: len(raw) // 2])
+        rep = self._tick(self.heads, clock=lambda: at(13))
+        self.assertIn("ПОВРЕЖДЁН", rep["state_why"])
+        self.assertIn("ПОВРЕЖДЁН", rep["line"], "порча обязана доехать до журнала, а не остаться в stdout")
+
+    def test_damage_on_an_empty_lotok_still_speaks(self):
+        """ГЛАВНЫЙ случай: восстанавливать неоткуда — и молчать тем более нельзя.
+
+        Именно здесь до правки очередь уходила в ноль без единого слова: лоток
+        пуст, значит ни одной записи не добавится, а строка-индекс пустого
+        оборота по правилу журнала-индекса пуста.
+        """
+        self._tick(self.heads)
+        self._break("{ это не json")
+        rep = self._tick([], clock=lambda: at(13))
+        self.assertEqual(rep["queued"], 0)
+        self.assertEqual(len(rep["exhausted"]), 0, "лоток пуст — собирать не из чего")
+        self.assertTrue(rep["line"], "очередь ушла с записей на ноль и промолчала — это и есть дефект")
+        self.assertIn("ПОВРЕЖДЁН", rep["line"])
+
+    def test_valid_json_of_the_wrong_shape_is_damage_too(self):
+        self._break("[1, 2, 3]\n")
+        state, why = R.read_state_why(self.state)
+        self.assertIn("ПОВРЕЖДЁН", why)
+        self.assertIn("list", why, "вид найденного назван — иначе чинить нечего")
+        self.assertEqual(state["packs"], {})
+
+    def test_partial_damage_keeps_what_survived(self):
+        """Раздел испорчен — уцелевшие разделы НЕ выбрасываются вместе с ним."""
+        self._tick(self.heads)
+        with io.open(self.state, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["day"] = "не словарь"
+        with io.open(self.state, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        state, why = R.read_state_why(self.state)
+        self.assertIn("ЧАСТИЧНО", why)
+        self.assertIn("day", why)
+        self.assertEqual(len(state["packs"]), 3, "испорченный раздел не смеет унести целые")
+
+    def test_packs_survive_damage_while_the_lotok_lives(self):
+        """Порча стоит счётчика попыток, а НЕ пакетов: лоток пересобирает очередь."""
+        before = self._tick(self.heads)
+        self.assertEqual(len(before["exhausted"]), 3)
+        self._break("{ это не json")
+        after = self._tick(self.heads, clock=lambda: at(13))
+        self.assertEqual(len(after["exhausted"]), 3, "пакет не теряется вместе с реестром")
+
+    def test_damage_never_turns_into_done(self):
+        """Ни на одной дороге порча не рождает «готово»: исход только «неизвестно»."""
+        self._tick(self.heads)
+        self._break("{ это не json")
+        rep = self._tick(self.heads, clock=lambda: at(13))
+        outs = {Q.outcome(r)[0] for r in rep["exhausted"]}
+        self.assertEqual(outs, {"unknown"})
+        self.assertNotIn("answered", outs)
+
+
 # ═════════════════════════ 7. живой корпус 01.09 ═════════════════════════
 
 
