@@ -1,0 +1,17 @@
+гард второй полосы: D:\turbobaby-bot\tmp\guard68\srv_after\pretool_guard.py
+строк: 2906
+----------------------------------------------------------------------------------------------------
+S1  git rm --cached docs/artifacts/x.md                  ожидание=molchit  факт=molchit  kind=green      hit=-              OK
+      снятие с ИНДЕКСА: файл на диске цел, обратно одним git add
+S2  git rm --cached docs/artifacts/x.md && git add docs/ ожидание=molchit  факт=molchit  kind=green      hit=-              OK
+      живой образец карточки 65: следом идёт git add
+S3  git rm -r --cached docs/artifacts                    ожидание=molchit  факт=molchit  kind=green      hit=-              OK
+      та же форма с рекурсией — тоже только индекс
+S4  git rm docs/artifacts/x.md                           ожидание=krasnoe  факт=krasnoe  kind=red        hit=delete_file    OK
+      ЗАЩИТА: настоящее удаление из рабочего дерева
+S5  rm -rf docs/artifacts                                ожидание=krasnoe  факт=krasnoe  kind=red        hit=delete_file    OK
+      ЗАЩИТА: доктринальное красное, класс не наш
+S6  git rm --cached                                      ожидание=krasnoe  факт=krasnoe  kind=red        hit=delete_file    OK
+      ЗАЩИТА: форма без операндов — цель не названа, fail-closed
+----------------------------------------------------------------------------------------------------
+ИТОГО: случаев 6, расхождений с ожиданием 0
