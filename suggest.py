@@ -31,6 +31,9 @@ import datetime
 import tempfile
 import subprocess
 
+import model_name  # ПРАВИЛО разрешения имени модели из речи клиента (границы токена, кириллица,
+# гомоглифы, разрыв, кубатура, развилка «зову человека»). Чистый модуль без сети и без обратного
+# импорта — см. его шапку и замер docs/artifacts/2026-09-01-разрешение-имени-модели-замер.md.
 import pricing  # каркас получения точной цены из Календаря (Bridge); пусто → фолбэк
 import price_source  # ИСТОЧНИК ЦЕНЫ: записанное правило price_source.json (переключено 20.08)
 import price_gate  # сторож свежести записанного правила: устарело → цену не называем
@@ -2192,21 +2195,24 @@ def _client_messages(transcript: str):
 
 
 def _detect_model(text: str):
-    for tok in _MODEL_TOKENS:
-        if tok in text:
-            return tok.upper().replace(" ", "")
-    return None
+    """ПЕРВАЯ модель, названная клиентом, — по ПОРЯДКУ В ТЕКСТЕ (`model_name.find_mentions`).
+
+    Прежняя версия шла по порядку СЛОВАРЯ `_MODEL_TOKENS` и матчила подстрокой без границ. Две
+    цены этого измерены 01.09 (артефакт замера, §3): «X-ADV-750» читалось как ADV 350, потому что
+    «adv» стои́т в словаре раньше «xadv» (−1969 ฿/сут, −64%), а на рекламном списке из 16 моделей
+    выбором клиента объявлялся NMAX 155 — первый по словарю, а не первый по тексту."""
+    ms = model_name.find_mentions(text)
+    return model_name.canon_for(ms[0]) if ms else None
 
 
 def _detect_models(text: str):
     """ВСЕ модели, упомянутые в тексте (для запроса нескольких байков сразу). Порядок
     появления, без дублей; «ADV» отбрасываем, если есть более точная «ADV350» и т.п."""
     found = []
-    for tok in _MODEL_TOKENS:
-        if tok in text:
-            canon = tok.upper().replace(" ", "")
-            if canon not in found:
-                found.append(canon)
+    for m in model_name.find_mentions(text):
+        canon = model_name.canon_for(m)
+        if canon not in found:
+            found.append(canon)
     # снять префиксы, поглощённые более длинной моделью (ADV ⊂ ADV350, CBR ⊂ CBR650)
     return [c for c in found if not any(o != c and o.startswith(c) for o in found)]
 
@@ -2721,18 +2727,13 @@ def extract_requested_models(text):
     if not t.strip():
         return None
     pos = {}                                            # canon → позиция ПЕРВОГО упоминания
-    for tok in _MODEL_TOKENS:
-        i = t.find(tok)
-        if i >= 0:
-            canon = tok.upper().replace(" ", "")
-            if i < pos.get(canon, len(t) + 1):
-                pos[canon] = i
-    for rx, tok in _MODEL_SYNONYM_RES:
-        m = rx.search(t)
-        if m:
-            canon = tok.upper().replace(" ", "")
-            if m.start() < pos.get(canon, len(t) + 1):
-                pos[canon] = m.start()
+    # Имена ищет ПРАВИЛО (`model_name`): границы токена, кириллица со склонением, гомоглифы,
+    # написание с разрывом. Режим `compat` — сознательный: это путь СЕТКИ, он ФИЛЬТРУЕТ строки, и
+    # словарь canon'ов здесь остаётся прежним (сузить сетку хуже, чем показать строку лишней).
+    for m in model_name.find_mentions(t):
+        canon = model_name.canon_for(m, compat=True)
+        if m["start"] < pos.get(canon, len(t) + 1):
+            pos[canon] = m["start"]
     # снять префикс, поглощённый более длинной моделью (ADV ⊂ ADV160) — как в _detect_models
     items = [(i, {"type": "model", "canon": c}) for c, i in pos.items()
              if not any(o != c and o.startswith(c) for o in pos)]
