@@ -3192,6 +3192,10 @@ def process_new():
         # полный текст RESULT (done) / причины failed → штаб читает итог из cowork_log без скринов
         _cowork(f"задача #{tid} → {status} · {_clip(result)}")
         _notify_task(status, tid, result)
+        # …и ЗАКРЫТАЯ ЦЕПОЧКА → расписка ступени A (повод внешнего ревью). Стоит ПОСЛЕ всех
+        # штатных каналов сознательно: ревью-контур — потребитель события, а не его участник,
+        # и его сбой не смеет задеть ни закрытие ряда, ни журнал, ни карточку владельцу.
+        _review_auto_note(tid, text, status, result)
 
 
 # ═══ ТЕРМИНАЛ КАРТОЧКИ → ЖУРНАЛ ПОЛОСЫ (16.08.2026 UTC) ══════════════════════════════════════
@@ -5823,7 +5827,23 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         "price_gate.py", "price_freshness.py", "price_freshness_run.py",
                         "queue_snapshot_pc.py",
                         # …и писатель мозга, которым queue_snapshot_pc кладёт слепок очереди
-                        "brain_writer.py")   # остаток: ленивые импорты вне ворот грязного дерева
+                        "brain_writer.py",
+                        # 01.09.2026: правило разрешения имени модели (298a387) внесло `import
+                        # model_name` в suggest.py — тот же вход в куст, что и у price_gate.
+                        # Реестр молчал о нём 1 коммит, и ровно это держало self-update красным:
+                        # с 298a387 гейт падал на этом тесте каждым тиком (замер по
+                        # pc_orchestrator.log 01.09 — «FAILED (failures=1) — остаюсь на старом коде»).
+                        "model_name.py",
+                        # 01.09.2026: ступень A ревью-контура — куст за ленивым `import
+                        # review_auto_run` в `_review_auto_note`/`maybe_review_auto`:
+                        #   review_auto_run → review_auto → {review_pack → hq_context_pack, review_send}
+                        #                   → review_send_run
+                        # В ворота грязного дерева НЕ вносим по той же причине, что и остальной
+                        # остаток: ветка живёт за флагом REVIEW_AUTO и не должна уметь глушить
+                        # доставку правок демону своим незакоммиченным WIP.
+                        "review_auto_run.py", "review_auto.py", "review_pack.py",
+                        "review_send.py", "review_send_run.py", "hq_context_pack.py")
+# остаток: ленивые импорты вне ворот грязного дерева
 
 
 def _dirty_tracked(runner=None):
@@ -8629,6 +8649,139 @@ def maybe_revizor(now=None, db_path=None, state_path=None):
     return result
 
 
+# ------------------- СТУПЕНЬ A РЕВЬЮ-КОНТУРА (флаг REVIEW_AUTO) ---------------
+# ЗАЧЕМ. Ступени 1 и 2 (01.09.2026) умеют собрать пакет второго мнения и отдать его в канал, но
+# между ними стоял ЧЕЛОВЕК: он решал, что отдать и когда. Ступень A убирает ровно это звено.
+# Поводов два и оба — события СВОЕЙ полосы: закрытая цепочка, изменившая операционное состояние
+# (объявила коммит, и коммит ЖИВОЙ в дереве), и суточный дайджест. Логика повода, спецификация
+# случая и учёт заходов живут чистым `review_auto`; руки (диск, git, каналы) — `review_auto_run`.
+#
+# МЕХАНИЗМ — ТОТ ЖЕ, ЧТО У РЕВИЗОРА, и это не подражание формы: флаг окружения гасит ветку
+# целиком, а метка на диске делает троттлинг RESTART-PROOF (период мерим от прошлого оборота, а
+# не от старта процесса — иначе рестарт демона либо гонит заход заново, либо теряет «докуда дошли»).
+#
+# ЦЕНА, НАЗВАННАЯ ВСЛУХ: заход в канал СИНХРОНЕН внутри `poll_once`, и виток стои́т ровно столько,
+# сколько отвечает канал — потолок `REVIEW_AUTO_TIMEOUT` (300с, столько же, сколько думателю-
+# ревизору на одно окно). Это НЕ безобидно: О2 зовёт демона вставшим после 20 минут тишины
+# heartbeat, и три подряд упёршихся в потолок захода уложились бы в 15 — впритык. Поэтому оборот
+# берёт РОВНО ОДИН повод за тик, а не разгребает очередь поводов.
+#
+# ПОЧЕМУ ОТПРАВКА НЕ АСИНХРОННА (развилка решена, а не пропущена). Отдельным процессом было бы
+# дешевле по времени витка, но исход захода надо записать в ТО ЖЕ состояние, из которого заход
+# начат: иначе «повтор не чаще одного раза» перестаёт держаться на рестарте — второй процесс не
+# знает, что первый уже платил. Выбрано дорогое по времени и честное по учёту.
+#
+# ОТКАТ: `REVIEW_AUTO` не равен «1» → ветка не зовётся вовсе, поведение демона байт-в-байт прежнее.
+REVIEW_AUTO_MIN_SEC = float(os.getenv("REVIEW_AUTO_MIN_SEC", "300") or "300")   # пол паузы между оборотами
+REVIEW_AUTO_TIMEOUT = int(os.getenv("REVIEW_AUTO_TIMEOUT", "300") or "300")     # бюджет одного канала, с
+REVIEW_AUTO_DIGEST_HOUR = int(os.getenv("REVIEW_AUTO_DIGEST_HOUR", "1") or "1")  # час UTC суточного дайджеста
+REVIEW_AUTO_TICK_FILE = _state(os.path.join(REPO, "pc_orchestrator.review_auto_tick.json"))
+
+
+def _review_auto_on():
+    """Ступень A включена? Дефолт — ВКЛЮЧЕНО, и это решение названо вслух, а не умолчано.
+
+    Почему не «выключено до правки .env», как у ревизора. Ступень A заказана владельцем целиком
+    («демон сам собирает пакет и шлёт в каналы»), а включение через `.env` — красная операция,
+    которую эта полоса выполнить не может: контур уехал бы в дерево мёртвой веткой и ждал бы
+    отдельного захода владельца. Второе, и оно важнее: выключение правкой `.env` имеет ТИХИЙ ОТКАЗ
+    (разобран в `_flag_forced_off`) — новый процесс демона рождается с env родителя, а
+    `load_dotenv(override=False)` унаследованное значение не перезаписывает. То есть `.env` здесь
+    и так не был бы надёжным рубильником.
+
+    Рубильников поэтому два, и оба действуют БЕЗ рестарта и БЕЗ правки `.env`:
+      • стоп-файл `pc_orchestrator.review_auto.off` — проверяется на каждом вызове;
+      • `REVIEW_AUTO=0` в окружении — для тех, кто правит `.env` всё равно.
+    Направление отказа консервативное: не смогли ответить про стоп-файл → считаем ВЫКЛЮЧЕНО.
+    """
+    if (os.environ.get("REVIEW_AUTO") or "").strip() == "0":
+        return False
+    if _flag_forced_off("REVIEW_AUTO"):
+        log.warning("ступень A ревью-контура ВЫКЛЮЧЕНА стоп-файлом %s (снять: удалить файл)",
+                    os.path.basename(_flag_off_file("REVIEW_AUTO")))
+        return False
+    return True
+
+
+def _review_auto_note(tid, text, status, result):
+    """Задача закрылась → РАСПИСКА цепочки в спул ступени A. Fire-safe, ничего не отправляет.
+
+    Зовётся в момент закрытия задачи, а не отдельным чтением очереди: `get_pending("done")`
+    стои́т 26.8с на 120 строк (замер 14.08), и платить это каждый оборот ради новости, которая
+    у демона уже в руках, — цена без выигрыша. Сбой здесь НИКОГДА не роняет тик: расписка —
+    вход ревью-контура, а не часть закрытия задачи.
+    """
+    if not _review_auto_on():
+        return None
+    try:
+        import review_auto_run
+        rec = review_auto_run.note_closed(int(tid), text, status, result, root=REPO)
+    except Exception as e:
+        log.warning("ревью-контур A: расписка задачи %s не записана (fail-safe): %s", tid, e)
+        return None
+    if rec is not None:
+        log.info("ревью-контур A: расписка %s (%s, операционное изменение: %s/%s)",
+                 rec["task_id"], rec["reported_status"],
+                 "да" if rec["operational_change"] else "нет", rec["change_reason"])
+    return rec
+
+
+def _review_auto_read_tick(path=None):
+    try:
+        with open(path or REVIEW_AUTO_TICK_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _review_auto_write_tick(now, path=None):
+    p = path or REVIEW_AUTO_TICK_FILE
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"ts": float(now)}, f)
+    except Exception as e:
+        log.warning("ревью-контур A: метка оборота не записана: %s", e)
+
+
+def maybe_review_auto(now=None, tick_path=None, state_path=None, runner=None):
+    """Один оборот ступени A за тик, с троттлингом по МЕТКЕ НА ДИСКЕ. → отчёт | None.
+
+    None — ветка выключена флагом или пол паузы не прошёл. Метку пишем ВСЕГДА, даже когда оборот
+    ничего не сделал: иначе «повода нет» стоило бы полного разбора каждые 60 секунд.
+    """
+    if not _review_auto_on():
+        return None
+    now = time.time() if now is None else now
+    st = _review_auto_read_tick(tick_path)
+    prev = st.get("ts")
+    if prev is not None:
+        try:
+            if (now - float(prev)) < REVIEW_AUTO_MIN_SEC:
+                return None
+        except Exception:
+            pass
+    _review_auto_write_tick(now, tick_path)
+    try:
+        import review_auto_run
+        report = (runner or review_auto_run.tick)(
+            root=REPO, state_path=state_path, digest_hour=REVIEW_AUTO_DIGEST_HOUR,
+            timeout=REVIEW_AUTO_TIMEOUT, write_journal=True,
+        )
+    except Exception as e:
+        log.warning("ревью-контур A: оборот упал (fail-safe, метка уже сдвинута — "
+                    "следующая попытка через паузу): %s", e)
+        return None
+    if not report.get("acted"):
+        log.debug("ревью-контур A: %s", report.get("why") or "повода нет")
+        return report
+    log.info("ревью-контур A: повод %s → пакет %s (%s, %s знаков), исходы %s",
+             report.get("trigger"), report.get("pack"), report.get("pack_status"),
+             report.get("pack_chars"), ", ".join(report.get("outcomes") or []) or "—")
+    _cowork(report.get("line") or "ревью-контур A: оборот без строки исхода")
+    return report
+
+
 # ------------------- РЕВИЗОР: МАРШРУТИЗАЦИЯ НАХОДОК (шаг 4/7 родителя 262) -----
 # revizor_tick собрал пакеты активных окон (шаг 2), _revizor_consult судит окно думателем (шаг 3).
 # Здесь — РАЗВОДКА находок по каналам (сам ревизор НИЧЕГО не правит и клиентам НЕ пишет):
@@ -9661,6 +9814,7 @@ def _main_loop():
             maybe_client_watchdog()   # часть 3: следим за pc_agent/userbot/moderation_bot (троттлинг 5 мин)
             maybe_session_watch()     # инцидент 29.07: немая сессия (жива, но не работает) → карточка в 328
             maybe_revizor()           # шаг 2/7 (262): ревизор диалогов за DIALOG_REVIZOR (троттлинг REVIZOR_HOURS)
+            maybe_review_auto()       # ступень A: пакет второго мнения за REVIEW_AUTO (троттлинг REVIEW_AUTO_MIN_SEC)
             maybe_lesson_commit_retry()  # пакет «полнота лога» п.6: докоммитить урок из спула (провал коммита ≠ вечная грязь)
             maybe_git_ff_pull()       # родитель #221: подтянуть origin/main ff-only ДО реконсиляции/self-update (тот же тик применит)
             maybe_reconcile_children()  # класс-фикс c6d8a30: применить свежий код детей на ЛЮБОЙ новый коммит

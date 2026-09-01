@@ -66,6 +66,22 @@ SUMMARY_LINE_MAX = 400
 SUMMARY_LINES_MAX = 20
 NUMBERS_MAX = 60
 
+# ГИПОТЕЗА ШТАБА — текст ПОСТАНОВКИ, если она была. Живёт ОТДЕЛЬНЫМ полем и
+# отдельным разделом, а не строкой сводки, ровно по одной причине: постановка —
+# это то, чего от работы ХОТЕЛИ, а сводка и числа — то, что вышло. Слепив их,
+# ревьюер получает гипотезу под видом факта и начинает судить работу её же
+# меркой; разделив — может сказать «сделано не то, что просили» или «просили
+# лишнего», а это ровно те два ответа, ради которых контур существует.
+#
+# Поле НЕОБЯЗАТЕЛЬНОЕ и различает три состояния, а не два:
+#   ключа в случае нет  → раздела нет вовсе (пакеты ступени 1 рендерятся байт в
+#                         байт как прежде — их sha256 не сдвинулся ни на бит);
+#   ключ есть, пусто    → раздел ЕСТЬ и говорит «постановки не было» (молчание
+#                         объявленное, а не молчание по недосмотру);
+#   ключ есть, записи   → раздел с записями.
+HYPOTHESIS_TEXT_MAX = 2000
+HYPOTHESIS_RECORDS_MAX = 20
+
 _RE_CASE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,79}$")
 _RE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -200,6 +216,36 @@ def _validate_numbers(numbers, manifest_index):
     return out
 
 
+def _validate_hypothesis(value):
+    """Гипотеза Штаба → нормализованный список записей. Неявное «не было» → [].
+
+    Записи — пары «чья постановка» + «её текст». Список, а не строка, потому что
+    у дайджеста постановок столько же, сколько цепочек, и слепить их в один
+    абзац значило бы потерять, какая гипотеза к какой работе.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise ReviewPackError("invalid_hypothesis", "hypothesis must be a list of records or null")
+    if len(value) > HYPOTHESIS_RECORDS_MAX:
+        raise ReviewPackError(
+            "invalid_hypothesis", "hypothesis has %d records, max %d" % (len(value), HYPOTHESIS_RECORDS_MAX)
+        )
+    out = []
+    for i, rec in enumerate(value):
+        if not isinstance(rec, dict):
+            raise ReviewPackError("invalid_hypothesis", "hypothesis[%d] must be a dict" % i)
+        source = _require_str(rec.get("source"), "invalid_hypothesis", "hypothesis[%d].source must be a non-empty str" % i)
+        text = _require_str(rec.get("text"), "invalid_hypothesis", "hypothesis[%d].text must be a non-empty str" % i)
+        if len(text) > HYPOTHESIS_TEXT_MAX:
+            raise ReviewPackError(
+                "oversized_hypothesis",
+                "hypothesis[%d].text length %d exceeds %d" % (i, len(text), HYPOTHESIS_TEXT_MAX),
+            )
+        out.append({"source": source, "text": text})
+    return out
+
+
 def _index_manifest(sources):
     if not isinstance(sources, (list, tuple)) or not sources:
         raise ReviewPackError("invalid_sources", "case.sources must be a non-empty list")
@@ -249,7 +295,7 @@ def _validate_case(case):
     result_packets = _validate_result_packets(kind, case.get("result_packets"), manifest_index)
     numbers = _validate_numbers(case.get("numbers"), manifest_index)
 
-    return {
+    spec = {
         "kind": kind,
         "case_id": case_id,
         "task_class": task_class,
@@ -262,7 +308,11 @@ def _validate_case(case):
         "sources": list(case["sources"]),
         "coverage_plan": case.get("coverage_plan"),
         "route": case.get("route"),
+        "hypothesis_declared": "hypothesis" in case,
     }
+    if spec["hypothesis_declared"]:
+        spec["hypothesis"] = _validate_hypothesis(case.get("hypothesis"))
+    return spec
 
 
 # ───────────────────────────── сборка ─────────────────────────────
@@ -316,6 +366,8 @@ def _blocked_core(spec, reason, detail, extra=None):
         "body_chars": 0,
         "max_chars": spec["max_chars"],
     }
+    if spec.get("hypothesis_declared"):
+        core["hypothesis"] = spec["hypothesis"]
     if extra:
         core.update(extra)
     return core
@@ -408,6 +460,8 @@ def _core_from_inner(spec, inner, omitted):
         "excluded": inner["excluded"],
         "unknowns": unknowns,
     }
+    if spec.get("hypothesis_declared"):
+        core["hypothesis"] = spec["hypothesis"]
     if "coverage" in inner:
         core["coverage"] = inner["coverage"]
     return core
@@ -614,6 +668,22 @@ def render_review_pack(pack):
     lines.append("")
     lines.append(p["active_objective"])
     lines.append("")
+
+    # ГИПОТЕЗА идёт СРАЗУ за целью и ДО фактов — и с оговоркой прямо в заголовке.
+    # Ниже неё всё проверяемо хешами, она — нет; ревьюер обязан видеть границу
+    # раньше, чем начнёт читать числа.
+    if "hypothesis" in p:
+        lines.append("## ГИПОТЕЗА ШТАБА (постановка задачи — НЕ факт и НЕ доказательство)")
+        lines.append("")
+        if p["hypothesis"]:
+            lines.append("Ниже — то, что от работы ХОТЕЛИ. Совпадение постановки с итогом ничем")
+            lines.append("не гарантировано: расхождение — законный ответ ревьюера, а не ошибка пакета.")
+            lines.append("")
+            for rec in p["hypothesis"]:
+                lines.append("- **%s**: %s" % (rec["source"], rec["text"]))
+        else:
+            lines.append("%s постановки не было: работа заведена без текста задания." % _NA)
+        lines.append("")
 
     lines.append("## СВОДКА")
     lines.append("")

@@ -10949,5 +10949,73 @@ class TestTaskStartMarkRecycled(unittest.TestCase):
                          "у второй попытки headless свой токен, значит и свой черновик")
 
 
+# ─────────── СТУПЕНЬ A РЕВЬЮ-КОНТУРА: рубильник, троттлинг, врезка в виток ───────────
+class TestReviewAutoWiring(unittest.TestCase):
+    """Ветка ступени A: как включается, как молчит и как НЕ роняет тик."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="reviewauto_wire_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.mark = os.path.join(self.tmp, "tick.json")
+        for key in ("REVIEW_AUTO",):
+            self._prev = os.environ.pop(key, None)
+            if self._prev is not None:
+                self.addCleanup(os.environ.__setitem__, key, self._prev)
+
+    def test_default_is_on_because_the_stage_was_commissioned(self):
+        with mock.patch.object(o, "_flag_forced_off", lambda name: False):
+            self.assertTrue(o._review_auto_on())
+
+    def test_stop_file_beats_everything_and_needs_no_env_edit(self):
+        with mock.patch.object(o, "_flag_forced_off", lambda name: True):
+            self.assertFalse(o._review_auto_on())
+
+    def test_explicit_zero_switches_it_off(self):
+        os.environ["REVIEW_AUTO"] = "0"
+        self.addCleanup(os.environ.pop, "REVIEW_AUTO", None)
+        self.assertFalse(o._review_auto_on())
+
+    def test_throttle_is_restart_proof_because_the_mark_lives_on_disk(self):
+        calls = []
+        with mock.patch.object(o, "_flag_forced_off", lambda name: False):
+            o.maybe_review_auto(now=1_000_000.0, tick_path=self.mark,
+                                runner=lambda **kw: calls.append(kw) or {"acted": False, "why": "нет"})
+            self.assertEqual(len(calls), 1)
+            # тот же тик через минуту — пол паузы не прошёл, оборота нет
+            self.assertIsNone(o.maybe_review_auto(now=1_000_060.0, tick_path=self.mark,
+                                                  runner=lambda **kw: calls.append(kw)))
+            self.assertEqual(len(calls), 1)
+            o.maybe_review_auto(now=1_000_000.0 + o.REVIEW_AUTO_MIN_SEC + 1, tick_path=self.mark,
+                                runner=lambda **kw: calls.append(kw) or {"acted": False, "why": "нет"})
+            self.assertEqual(len(calls), 2)
+
+    def test_a_crashing_turn_never_takes_the_tick_down(self):
+        def boom(**kw):
+            raise RuntimeError("оборот взорвался")
+
+        with mock.patch.object(o, "_flag_forced_off", lambda name: False):
+            self.assertIsNone(o.maybe_review_auto(now=1_000_000.0, tick_path=self.mark, runner=boom))
+        self.assertTrue(os.path.exists(self.mark), "метка обязана сдвинуться ДО оборота")
+
+    def test_switched_off_branch_is_never_called_at_all(self):
+        with mock.patch.object(o, "_flag_forced_off", lambda name: True):
+            self.assertIsNone(o.maybe_review_auto(
+                now=1_000_000.0, tick_path=self.mark,
+                runner=lambda **kw: self.fail("выключенная ветка сходила в оборот")))
+        self.assertFalse(os.path.exists(self.mark))
+
+    def test_receipt_hook_is_fail_safe_and_silent_when_off(self):
+        with mock.patch.object(o, "_flag_forced_off", lambda name: True):
+            self.assertIsNone(o._review_auto_note(1, "тз", "done", "FACT: commit abc1234"))
+
+    def test_the_turn_is_wired_into_the_loop_next_to_the_revizor(self):
+        """Врезка проверяется по ИСХОДНИКУ витка: ветка, которую никто не зовёт, — мёртвая."""
+        with io.open(os.path.join(o.REPO, "pc_orchestrator.py"), encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn("maybe_review_auto()", body)
+        self.assertLess(body.index("maybe_revizor()  "), body.index("maybe_review_auto()  "))
+        self.assertIn("_review_auto_note(tid, text, status, result)", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
