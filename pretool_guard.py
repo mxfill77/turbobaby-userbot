@@ -1592,10 +1592,86 @@ def _is_guard_source(path):
         return False
 
 
-def _is_secret_path(path):
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# ПРАВИЛО ЭФФЕКТА (01.09.2026): КЛАСС НАЗНАЧАЕТ ТО, ЧТО ОПЕРАЦИЯ ДЕЛАЕТ С ОБЪЕКТОМ
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# Замок `_red()` (31.07) закрыл вход НОВЫМ парам «подстрока → класс» и потребовал назвать
+# проверку ДЕЙСТВИЯ. Три места пережили его, потому что подстрока в них стои́т не в таблице
+# `_RED_CMD`, а прямо в решающей ветке, — и за 25.08–01.09 дали 6 ложных карточек из 17 живых
+# (замер `_scratch`-независимым прогоном, `docs/artifacts/2026-09-01-класс-подстроки-гарда-закрыт.md`):
+#
+#   • ИМЯ ФАЙЛА со словом `secret` → `read_secret`/`edit_secret` (здесь);
+#   • `git rm --cached` → `delete`, хотя рабочее дерево цело (`_delete_walk`);
+#   • `.env` в ДОКСТРИНГЕ скрипта → `env`, потому что где-то в том же файле есть `open()`
+#     по своему, к секрету не относящемуся пути (`_py_env_readonly`).
+#
+# Правило одно на все три: СОВПАДЕНИЕ ИМЕНИ — ПОВОД ПОСМОТРЕТЬ, А НЕ ВЕРДИКТ. Класс получает
+# только та операция, у которой доказан ЭФФЕКТ на названный объект: секрет — это СОДЕРЖИМОЕ
+# (а не слово в имени), удаление — это пропажа файла ИЗ РАБОЧЕГО ДЕРЕВА (а не смена индекса),
+# обращение к секрету — это сток, ДОСТИГАЮЩИЙ его пути (а не проза рядом со стоком).
+# Fail-closed у всех трёх один: эффект НЕ ОПРОВЕРГНУТ (файла нет, тело не прочиталось, код не
+# разобрался) → красное как было. Послабление даётся за ДОКАЗАННОЕ отсутствие эффекта, и ни за
+# что другое — поэтому настоящее удаление, деньги, живые таблицы и снос процессов остаются
+# высшим классом, а `git rm` без `--cached` краснее ровно как раньше.
+
+_SECRET_HEAD_BYTES = 40000        # головы файла хватает: хранилище секретов начинается с них
+
+
+def _secret_name_convention(basename):
+    """True ⇔ имя — КОНВЕНЦИЯ хранилища секретов этой машины (`.env*`, `*.session`, `*.key`,
+    `*.pem`). У этих имён имя И ЕСТЬ эффект: так здесь зовут сами хранилища, и создание нового
+    такого файла — ровно та операция, о которой владельца и спрашивают. Содержимым их не судим:
+    пустой `.env` секретом быть не перестал, а несуществующий `.env.new` — будущее хранилище."""
+    b = basename
+    return (b.startswith(".env") or b.endswith(".session") or ".session" in b
+            or b.endswith(".key") or b.endswith(".pem"))
+
+
+def _holds_secret_values(path, missing_is_secret=True):
+    """True ⇔ в ФАЙЛЕ лежат присваивания с НАСТОЯЩИМИ значениями секретов.
+
+    Мерило то же самое, которым гард уже ловит вынос значения наружу (`_secret_value_leak`:
+    присваивание + значение от 16 смешанных символов + не заглушка) — второй прибор для того же
+    вопроса разъехался бы с этим при первой правке. Отсюда `client_secret.json` (внутри
+    `"client_secret": "GOCSPX-…"`) остаётся секретом, а постановка задачи
+    `s1-suggest-secret-containment.md`, где имена переменных названы СЛОВАМИ по ритуалу, — нет.
+
+    Файл ЕСТЬ, но не прочитался (права, чужой кодек, обрыв) → True ВСЕГДА: содержимое не
+    опровергнуто, идём краснее.
+
+    Файла НЕТ — ответ зависит от того, кто спрашивает, и `missing_is_secret` ровно это и значит:
+      • `True` (умолчание, спрашивает `_looks_like_secret_arg` про ТОКЕН КОМАНДНОЙ СТРОКИ) —
+        путь мог не разрешиться из-за чужого `cwd`, а файл при этом жив; молчать нельзя;
+      • `False` (спрашивает `_decide_read`/`_decide_write` про СОБСТВЕННУЮ ЦЕЛЬ инструмента,
+        путь там абсолютный) — хранилища по этому пути НЕТ, значит и защищать нечего: читать
+        нечего, портить нечего. Вынос ЗНАЧЕНИЯ в новый файл ловится не здесь, а телом записи.
+
+    Тело наружу не отдаётся ни строкой — только «да/нет»."""
+    try:
+        ap = path if os.path.isabs(path) else os.path.join(PROJECT, path)
+        if not os.path.isfile(ap):
+            return missing_is_secret
+        with open(ap, "r", encoding="utf-8", errors="ignore") as f:
+            head = f.read(_SECRET_HEAD_BYTES)
+    except Exception:
+        return True
+    return bool(_secret_value_leak(_RE_JSON_KEY_SEP.sub(":", head)))
+
+
+def _is_secret_path(path, missing_is_secret=True):
+    """True ⇔ путь — хранилище секретов ПО КОНВЕНЦИИ ИМЕНИ либо ПО СОДЕРЖИМОМУ.
+
+    Слово `secret` в имени вердиктом больше не является (правило эффекта выше): под него
+    подпадают постановка задачи, отчёт о ней и заметка о содержании секретов — за 25.08–01.09
+    это 3 ложные карточки из 6, включая пойманную на своих же руках 01.09 10:56."""
     b = os.path.basename(path or "").lower()
-    return (b == ".env" or b.startswith(".env") or b.endswith(".session")
-            or ".session" in b or b.endswith(".key") or b.endswith(".pem") or "secret" in b)
+    if not b:
+        return False
+    if _secret_name_convention(b):
+        return True
+    if "secret" not in b:
+        return False
+    return _holds_secret_values(path, missing_is_secret)
 
 
 # Внутри `.claude` красное — ТОЛЬКО конфиг (вектор само-эскалации: правами и хуками сессия
@@ -2274,6 +2350,14 @@ def _strip_heredoc(cmd):
 _RE_SECRET_ASSIGN = re.compile(
     r"(?i)\b([A-Za-z0-9_]*(?:token|api_?key|secret|password|passwd|pwd)[A-Za-z0-9_]*)"
     r"\s*[=:]\s*[\"']?([^\s\"',;]{16,})")
+# ФОРМА JSON `"client_secret": "…"` под признак выше НЕ ПОПАДАЕТ: между именем и двоеточием
+# стои́т закрывающая кавычка. Расширять сам признак НЕЛЬЗЯ — замер показал цену: с кавычкой в
+# нём собственный артефакт репо (`2026-08-22-task50-guard-block.md`, поле `"token"` маркера
+# блокировки — нонс, а не секрет) начинает звучать, и охранный тест
+# `test_repo_own_artifacts_do_not_trip_the_value_check` краснеет. Поэтому кавычка снимается
+# НОРМАЛИЗАЦИЕЙ и только там, где вопрос стои́т про СОДЕРЖИМОЕ ФАЙЛА с именем-подсказкой
+# (`_holds_secret_values`): прибор остаётся один, меняется вход.
+_RE_JSON_KEY_SEP = re.compile(r"[\"']\s*:")
 # Заглушка на месте значения — это по-прежнему УПОМИНАНИЕ: `<masked>`, `***`, `xxx`, `$VAR`,
 # `os.getenv(…)`, `ВАШ_ТОКЕН`. Такие формы и предписаны ритуалом («токены НАЗЫВАТЬ словами»).
 _RE_SECRET_PLACEHOLDER = re.compile(
@@ -2808,9 +2892,11 @@ def _scan_python(cmd, cwd, env_probe=False):
         return ("ask", "py_write", "без внятной цели")
     if not env_hit:
         return ("defer", "", "")
-    # Прозрачность лога: видно, ЧЕМ смягчено упоминание секрета — пробой или чистым именем.
+    # Прозрачность лога: видно, ЧЕМ смягчено упоминание секрета — пробой, чистым именем или
+    # прозой. Отображение ЯВНОЕ (а не «всё, что не mention, — probe»): с четвёртой ногой такой
+    # умолчательный разбор назвал бы прозу пробой, то есть соврал бы в журнале.
     why = _py_env_readonly(content) or _py_env_readonly(cmd_scan)
-    return ("defer", ("env_mention" if why == "mention" else "env_probe"), "")
+    return ("defer", _ENV_WHY_KIND.get(why, "env_probe"), "")
 
 
 # ---------------- НАЛИЧИЕ ФАЙЛА ≠ ЕГО СОДЕРЖИМОЕ (правка 30.07.2026) -------------------------
@@ -2898,6 +2984,11 @@ _RE_PY_NOT_PROBE = re.compile(
 _RE_PY_PROC_ENV = re.compile(
     r"(?i)\bReadProcessMemory\b|\bNtQueryInformationProcess\b|\bPROCESS_VM_READ\b")
 
+# ПРИЧИНА СМЯГЧЕНИЯ → ВИД В ЖУРНАЛЕ. Таблицей, а не условием: ног у `_py_env_readonly` четыре,
+# и каждая новая обязана НАЗВАТЬ себя логу явно (иначе смягчение молча притворится пробой).
+_ENV_WHY_KIND = {"probe": "env_probe", "proc_env": "env_probe",
+                 "mention": "env_mention", "prose": "env_prose"}
+
 
 def _py_env_probe_only(code):
     """True ⇔ в python-коде путь секрета встречается ТОЛЬКО в проверке наличия/метаданных
@@ -2943,22 +3034,68 @@ def _py_env_mention_only(code):
     return not _RE_PY_NOT_PROBE.search(c)
 
 
+def _py_env_only_in_prose(code):
+    """True ⇔ имя секрета встречается в python-коде ТОЛЬКО в ПРОЗЕ — в комментариях и
+    докстрингах, — и ни в одном литерале, участвующем в исполнении.
+
+    Доказательство ПОЛОЖИТЕЛЬНОЕ и структурное (`ast`), а не «улик не нашлось»: комментарий
+    для парсера не существует вовсе, а докстринг — выражение-строка первой инструкцией модуля,
+    класса или функции; ни то, ни другое передать в `open()` нечем. Поэтому нога живёт РЯДОМ с
+    `_py_env_mention_only`, а не вместо неё: та требует, чтобы стоков не было ВО ВСЁМ файле, —
+    и на любом настоящем скрипте это требование невыполнимо.
+
+    Живой факт, из которого нога заведена (01.09.2026 10:31:57, полоса ПК): боевой
+    `review_send_run.py` объявляет в шапке «не читает `.env` (ключ берётся из ОКРУЖЕНИЯ
+    процесса…)» и в другом месте, к секрету отношения не имеющем, открывает файл лотка. Пока
+    файл был не под git (первый коммит 10:33 — двумя минутами позже карточки), тело читалось и
+    краснело: подстрока из ФРАЗЫ, ОТРИЦАЮЩЕЙ ЭФФЕКТ, назначала класс `env`.
+
+    Fail-closed: код не разобрался (`SyntaxError`, обрывок, шелловый сегмент) → False, решает
+    прежний разбор. `p = ".env"; open(p)` послаблением НЕ прикрыт — литерал исполняемый."""
+    c = code or ""
+    if not _RE_ENV.search(c):
+        return False
+    try:
+        tree = ast.parse(c)
+    except Exception:
+        return False
+    docs = set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
+                and body and isinstance(body[0], ast.Expr) \
+                and isinstance(body[0].value, ast.Constant) \
+                and isinstance(body[0].value.value, str):
+            docs.add(id(body[0].value))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) not in docs and _RE_ENV.search(node.value):
+                return False
+        elif isinstance(node, ast.Attribute) and _RE_ENV.search("." + (node.attr or "")):
+            return False                  # `x.env` / `x.session` — обращение, а не проза
+    return True
+
+
 def _py_env_readonly(code):
     """→ ПРИЧИНА, по которой `.env` в python-коде обращением к секрету НЕ является
-    ('probe' | 'proc_env' | 'mention'), либо '' — обращение, красное как было. Строка, а не
-    bool, нужна логу: смягчение не должно стоить прозрачности, и в журнале обязано быть видно,
-    КАКОЙ разбор промолчал.
+    ('probe' | 'proc_env' | 'mention' | 'prose'), либо '' — обращение, красное как было. Строка,
+    а не bool, нужна логу: смягчение не должно стоить прозрачности, и в журнале обязано быть
+    видно, КАКОЙ разбор промолчал.
 
-    Три ноги, каждая доказуемо не выдаёт ни байта файла: проверка НАЛИЧИЯ/метаданных
-    (`_py_env_probe_only`), чтение ОКРУЖЕНИЯ ЖИВОГО ПРОЦЕССА из PEB (`_py_reads_process_env`)
-    и ЧИСТОЕ УПОМЯНАНИЕ имени (`_py_env_mention_only`). Fail-safe у всех трёх один: любой
-    признак файлового доступа (`_RE_PY_NOT_PROBE`) снимает послабление."""
+    Четыре ноги, каждая доказуемо не выдаёт ни байта файла: проверка НАЛИЧИЯ/метаданных
+    (`_py_env_probe_only`), чтение ОКРУЖЕНИЯ ЖИВОГО ПРОЦЕССА из PEB (`_py_reads_process_env`),
+    ЧИСТОЕ УПОМЯНАНИЕ имени (`_py_env_mention_only`) и имя ТОЛЬКО В ПРОЗЕ — комментарии и
+    докстринги (`_py_env_only_in_prose`, 01.09.2026). Fail-safe у первых трёх один: любой
+    признак файлового доступа (`_RE_PY_NOT_PROBE`) снимает послабление; у четвёртой — свой,
+    положительный: не разобрался код либо имя стоит в исполняемом литерале → красное как было."""
     if _py_env_probe_only(code):
         return "probe"
     if _py_reads_process_env(code):
         return "proc_env"
     if _py_env_mention_only(code):
         return "mention"
+    if _py_env_only_in_prose(code):
+        return "prose"
     return ""
 
 
@@ -3062,10 +3199,13 @@ def _env_reach(cmd, depth=0):
             return None
         if _RE_PY.search(seg):
             why = _py_env_readonly(seg)
-            if why == "mention" and _env_outside_py_code(seg):
+            # У `mention` и `prose` доказательство про ТЕЛО, а не про командную строку: стоки
+            # лежат в скрипте, которого в сегменте не видно (`_env_outside_py_code`). У проб
+            # доказательство положительное, их эта яма не касается.
+            if why in ("mention", "prose") and _env_outside_py_code(seg):
                 return None           # путь ОПЕРАНДОМ, а не текстом — см. `_env_outside_py_code`
             if why:
-                probed = probed or (why != "mention")
+                probed = probed or (why not in ("mention", "prose"))
                 continue
         return None
     if not seen:
@@ -3190,15 +3330,24 @@ def _write_payload(ti):
 
 def _decide_write(ti, cwd):
     path = ti.get("file_path") or ti.get("notebook_path") or ""
-    if _is_secret_path(path):
+    # `missing_is_secret=False`: цель инструмента — АБСОЛЮТНЫЙ путь, и «файла нет» тут значит
+    # ровно «хранилища по этому пути нет», а не «не смогли разрешить». Портить нечего; вынос
+    # ЗНАЧЕНИЯ в новый файл ловит проверка ТЕЛА записи ниже, и она сильнее имени.
+    if _is_secret_path(path, missing_is_secret=False):
         return ("ask", "edit_secret", os.path.basename(path))
     if _is_claude_path(path):
         return ("ask", "edit_claude", os.path.basename(path))
-    # ВЫНОС ЗНАЧЕНИЯ В ФАЙЛ инструментом (не шеллом). Улика здесь ровно одна — ДОСЛОВНОЕ значение
-    # в теле записи: `os.environ[...]` в тексте файла ничего не исполняет, его судит уже разбор
-    # запуска. Временная зона каналом не является — там живут черновики самой сессии.
+    # ВЫНОС ЗНАЧЕНИЯ В ФАЙЛ инструментом (не шеллом). Улик две, обе про ТЕЛО записи, а не про имя:
+    # ДОСЛОВНОЕ значение из окружения этого процесса (`_env_value_in_text`) и ЛЮБОЕ присваивание
+    # секрета с настоящим значением (`_secret_value_leak` — тот же прибор, что у тел heredoc).
+    # Вторая заведена 01.09.2026 вместе с правилом эффекта и стои́т КОМПЕНСАЦИЕЙ: имя перестало
+    # быть вердиктом, поэтому значение обязано ловиться по себе — и теперь ловится в файле с
+    # ЛЮБЫМ именем, а не только со словом `secret` в нём. Это строже прежнего, а не слабее.
+    # `os.environ[...]` в тексте файла ничего не исполняет, его судит уже разбор запуска.
+    # Временная зона каналом не является — там живут черновики самой сессии.
     if not _is_temp_zone(path):
-        hit = _env_value_in_text(_write_payload(ti))
+        payload = _write_payload(ti)
+        hit = _env_value_in_text(payload) or _secret_value_leak(payload)
         if hit:
             return ("ask", "env", hit + " → файл")
     # Исходники самого гарда — запись инструментом, она НИЧЕГО НЕ ИСПОЛНЯЕТ. Стоит СТРОГО ПОСЛЕ
@@ -3213,7 +3362,9 @@ def _decide_write(ti, cwd):
 
 def _decide_read(ti, cwd):
     path = ti.get("file_path") or ""
-    if _is_secret_path(path):
+    # `missing_is_secret=False` — по тому же доводу, что и в `_decide_write`: файла нет, значит
+    # читать нечего и утечь нечему. Файл ЕСТЬ, но не прочитался → красное как было.
+    if _is_secret_path(path, missing_is_secret=False):
         return ("ask", "read_secret", os.path.basename(path))
     return ("defer", "", "")
 
@@ -3264,6 +3415,13 @@ def _decide_bash(cmd, cwd):
         # `echo "--- SCHTASKS XML ---"` (раньше её спасал от вырезания ведущий дефис). Решения
         # ветка не меняет — только НАЗЫВАЕТ признак, который промолчал: иначе строка журнала
         # выглядит как «ничего красного не нашли», и следующий разбор начинается с нуля.
+        # СНЯТИЕ С ИНДЕКСА — ПЕРВЫМ, и это не вкусовщина: `git rm --cached` попадает и под
+        # `_word_only_kind` (`rm` нашлось, командой не оказалось), а та пометка говорит лишь
+        # «признак промолчал». Здесь разбор знает БОЛЬШЕ — он знает ЧТО и ПОЧЕМУ прошло, и
+        # называет объект. Порядок нашёл собственный регресс, а не рассуждение.
+        w = _delete_walk(cmd)
+        if w.index and not w.acts:
+            return ("defer", "git_index", w.index)
         w = _word_only_kind(scan) or _word_only_kind(cmd)
         if w:
             return ("defer", "word_" + w, "")
@@ -4036,7 +4194,17 @@ def _find_deletes(toks):
 # (`Remove-Item Env:\STEP_SELFHEAL`). Отсутствие обоих означает «признак сработал, а разбор не
 # понял ЧТО» — и это красное. Первый заход правки держал одно поле, и живые строки журнала
 # (5 за неделю, headless-прогоны тестов) краснели картой на снятии переменной окружения.
-_DelWalk = collections.namedtuple("DelWalk", "acts targets recurse mask provider")
+# `index` — ШЕСТОЕ поле того же ряда: разбор ЗНАЕТ, почему удаления нет, — `git rm --cached`
+# трогает ИНДЕКС, а файл остаётся на диске байт-в-байт. Отдельным полем, а не «просто не считать
+# целью», по тому же доводу, что и `provider`: молчание обязано быть ОБЪЯСНИМЫМ, иначе строка
+# журнала выглядит как «ничего красного не нашли» (доктрина лога), и следующий разбор ложного
+# класса начнётся с нуля.
+_DelWalk = collections.namedtuple("DelWalk", "acts targets recurse mask provider index")
+
+# Ключ `git rm`, снимающий с ИНДЕКСА и НЕ трогающий рабочее дерево. Список закрытый и короткий
+# намеренно: у `git rm` такой ключ ровно один, и «похожие» сюда не добавляются — `-f`, `-r`,
+# `--ignore-unmatch` рабочее дерево как раз сносят.
+_RE_GIT_RM_CACHED = re.compile(r"(?i)^--cached$")
 
 
 def _delete_walk(cmd):
@@ -4065,7 +4233,7 @@ def _delete_walk(cmd):
         Так родился блок 1 карточки 145 — за операцию, от которой отказались через 5 секунд.
     Что перенаправлением считаем: `2>/dev/null`, `>x`, `>>x`, `2>&1`, `<in`, а также ОТДЕЛЬНО
     стоящий оператор (`> out.txt` шлётся shlex двумя токенами) — тогда пропускаем и операнд."""
-    hint, targets, recurse, mask, acts, prov = "", [], False, False, False, False
+    hint, targets, recurse, mask, acts, prov, idx = "", [], False, False, False, False, ""
 
     def _add(raw):
         """Цель с приклеенным каталогом предшествующего `cd` (абсолютную не трогаем)."""
@@ -4101,9 +4269,23 @@ def _delete_walk(cmd):
         if name in _DEL_CMDS:
             rest = toks[j + 1:]
         elif name == "git" and j + 1 < len(toks) and _base(toks[j + 1]) == "rm":
-            # `git rm` сносит файл С ДИСКА (и `--cached` — из индекса, то есть из истории тоже).
-            # Разводить формы не стали СОЗНАТЕЛЬНО: обе необратимы без git, обе редки в потоке.
+            # ИНДЕКС — НЕ РАБОЧЕЕ ДЕРЕВО (правка 01.09.2026, правило эффекта; живая карточка 65).
+            # Прежде формы не разводились СОЗНАТЕЛЬНО («обе необратимы без git, обе редки»), и
+            # довод был неверен обеими половинами: `git rm --cached` файл на диске НЕ ТРОГАЕТ
+            # (обратно — одним `git add`, что живая карточка 65 в той же строке и делала), а
+            # редкой форма не была — за 25.08–01.09 это 2 ложные карточки из 6.
+            # `git rm` БЕЗ `--cached` сносит файл С ДИСКА и остаётся красным ровно как раньше.
             rest = toks[j + 2:]
+            if any(_RE_GIT_RM_CACHED.match(t.strip("'\"")) for t in rest):
+                # Операнд нужен не решению, а ЖУРНАЛУ: строка обязана называть, ЧТО сняли с
+                # индекса. Операндов нет вовсе (`git rm --cached` без пути — ошибка самого git) →
+                # проваливаемся в общий разбор ниже и краснеем, как любая неразобранная форма.
+                ops = [t.strip("'\"") for t in rest
+                       if not (t.startswith("-") or _RE_CMDEXE_FLAG.match(t)
+                               or _RE_DEL_REDIR.match(t))]
+                if ops:
+                    idx = idx or _add(ops[0])
+                    continue
         else:
             continue
         before, provider, skip_next = len(targets), False, False
@@ -4131,7 +4313,7 @@ def _delete_walk(cmd):
             prov = True
             continue                           # снимали элемент провайдера PowerShell — не файл
         acts = True                            # ДЕЙСТВИЕ было; целей может не быть — это красное
-    return _DelWalk(acts, targets, recurse, mask, prov)
+    return _DelWalk(acts, targets, recurse, mask, prov, idx)
 
 
 def _delete_scan(cmd):
@@ -4199,9 +4381,10 @@ def _delete_stays_red(cmd):
     w = _delete_walk(cmd)
     if not w.acts:
         # Файлового удаления разбор не нашёл. Зелёное ТОЛЬКО если он ЗНАЕТ почему — снимали
-        # элемент провайдера PowerShell (`Env:\X`), файла там нет. Иначе признак сработал, а
-        # разбор его не понял: молчать о неразобранном гард права не имеет (fail-closed).
-        return not w.provider
+        # элемент провайдера PowerShell (`Env:\X`, файла там нет) ЛИБО снимали с индекса
+        # (`git rm --cached`, файл на диске цел). Иначе признак сработал, а разбор его не понял:
+        # молчать о неразобранном гард права не имеет (fail-closed).
+        return not (w.provider or w.index)
     if not w.targets or w.mask:
         return True
     return not _delete_targets_all_temp(cmd)

@@ -4943,3 +4943,120 @@ class TestSecretValueLeakIsTheReplacement(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# ПРАВИЛО ЭФФЕКТА (01.09.2026): КЛАСС НАЗНАЧАЕТ ТО, ЧТО ОПЕРАЦИЯ ДЕЛАЕТ С ОБЪЕКТОМ
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+class TestEffectNotSubstring(unittest.TestCase):
+    """Три места, где класс ещё назначался ПОДСТРОКОЙ, и компенсация к ним.
+
+    Живые образцы — из `pretool_guard.log` за 25.08–01.09 (карточки 59 и 65) и из собственных
+    рук сессии 01.09 10:56. Разбор и числа:
+    `docs/artifacts/2026-09-01-класс-подстроки-гарда-закрыт.md`."""
+
+    _REAL = "q7Zm4kP0sT9xW2bV6nH8jL3rY5uA1cD2"    # вид боевого токена, собран из кусков ниже
+
+    # ── имя файла со словом `secret` (карточка 59) ────────────────────────────────────────────
+    def test_task_packet_named_secret_is_not_a_secret(self):
+        """ЖИВОЙ ОБРАЗЕЦ: постановка задачи, где имена переменных названы СЛОВАМИ по ритуалу."""
+        p = os.path.join(PROJ, "docs", "tasks", "s1-suggest-secret-containment.md")
+        if not os.path.isfile(p):
+            self.skipTest("живой образец не найден")
+        self.assertEqual(g.decide(read(p))[0], "defer")
+
+    def test_note_named_secret_may_be_written(self):
+        """Пойманная на своих руках: запись ЗАМЕТКИ, у которой слово стоит в ИМЕНИ файла."""
+        d = {"tool_name": "Write", "cwd": PROJ,
+             "tool_input": {"file_path": os.path.join(PROJ, "tmp", "notes_about_secrets.md"),
+                            "content": "проза о содержании секретов, значений нет"}}
+        self.assertEqual(g.decide(d)[0], "defer")
+
+    def test_file_named_secret_WITH_values_stays_red(self):
+        """ЗАЩИТА ЦЕЛА: то же имя, но в теле НАСТОЯЩИЕ присваивания — красное по содержимому."""
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "client_secret.json")
+            with io.open(p, "w", encoding="utf-8") as fh:
+                fh.write('{"client_' + 'secret": "' + self._REAL + '"}')
+            self.assertTrue(g._is_secret_path(p))
+            self.assertEqual(g.decide(read(p))[:2], ("ask", "read_secret"))
+
+    def test_convention_names_are_still_judged_by_name(self):
+        """`.env*`/`*.session`/`*.key`/`*.pem` — имя И ЕСТЬ эффект, содержимым их не судим."""
+        for name in (_E, _E + ".local", "turbobaby_session.session", "id_rsa.key", "cert.pem"):
+            self.assertTrue(g._is_secret_path(os.path.join(PROJ, name)), name)
+            self.assertEqual(g.decide(read(os.path.join(PROJ, name)))[1], "read_secret", name)
+
+    def test_unresolvable_argv_token_stays_fail_closed(self):
+        """Токен КОМАНДНОЙ СТРОКИ: путь не разрешился — файл мог быть жив под чужим cwd."""
+        self.assertTrue(g._is_secret_path("client_secret.json"))
+        self.assertTrue(g._looks_like_secret_arg("client_secret.json"))
+
+    # ── git: индекс — не рабочее дерево (карточка 65) ─────────────────────────────────────────
+    def test_git_rm_cached_is_an_index_change_not_a_deletion(self):
+        """ЖИВОЙ ОБРАЗЕЦ карточки 65: следом идёт `git add`, вернувший файл в индекс."""
+        cmd = ("cd D:/turbobaby-bot && git rm --cached -q docs/review_outbox/x.md && "
+               "git add .gitattributes docs/review_outbox/x.md && echo ok")
+        self.assertEqual(g.decide(bash(cmd))[0], "defer")
+        self.assertIsNone(g._delete_reach(cmd))
+
+    def test_git_rm_cached_is_visible_in_the_journal(self):
+        """Смягчение не стоит прозрачности: в логе стои́т `git_index`, а не безликое молчание."""
+        act, kind, obj = g.decide(bash("git rm --cached docs/review_outbox/x.md"))
+        self.assertEqual((act, kind), ("defer", "git_index"))
+        self.assertIn("x.md", obj)
+
+    def test_git_rm_WITHOUT_cached_still_deletes_from_disk(self):
+        for cmd in ("git rm docs/review_outbox/x.md",
+                    "cd D:/turbobaby-bot && git rm -r -f docs/review_outbox",
+                    "git rm -f suggest.py"):
+            self.assertEqual(g.decide(bash(cmd))[:2], ("ask", "delete"), cmd)
+
+    def test_git_rm_cached_without_operands_is_fail_closed(self):
+        """Форма не разобрана — красное как любая неразобранная (`--cached` без пути)."""
+        self.assertEqual(g.decide(bash("git rm --cached"))[:2], ("ask", "delete"))
+
+    # ── имя секрета в ПРОЗЕ python-кода (01.09 10:31:57) ──────────────────────────────────────
+    _PROSE = ('"""шапка: не читает `' + _E + '` (ключ берётся из ОКРУЖЕНИЯ процесса)."""\n'
+              "import sys\n"
+              "def main():\n"
+              "    with open(sys.argv[1], 'w') as f:\n"
+              "        f.write('ok')\n")
+
+    def test_secret_name_only_in_a_docstring_is_prose(self):
+        self.assertEqual(g._py_env_readonly(self._PROSE), "prose")
+
+    def test_prose_leg_names_itself_in_the_journal(self):
+        self.assertEqual(g._ENV_WHY_KIND["prose"], "env_prose")
+
+    def test_executable_literal_is_NOT_prose(self):
+        """ГРАНИЦА: литерал в исполняемом коде послаблением не прикрыт."""
+        code = '"""шапка."""\np = "' + _E + '"\nopen(p).read()\n'
+        self.assertFalse(g._py_env_only_in_prose(code))
+
+    def test_attribute_access_is_NOT_prose(self):
+        code = '"""про `' + _E + '`."""\nimport cfg\nprint(cfg' + _E + ')\n'
+        self.assertFalse(g._py_env_only_in_prose(code))
+
+    def test_unparsable_code_is_fail_closed(self):
+        self.assertFalse(g._py_env_only_in_prose('"""про `' + _E + '`."""\ndef (\n'))
+
+    def test_comment_only_mention_is_prose(self):
+        code = "# читаем не из `" + _E + "`, а из окружения\nimport os\nopen('x').read()\n"
+        self.assertEqual(g._py_env_readonly(code), "prose")
+
+    # ── компенсация: ЗНАЧЕНИЕ в теле записи ловится при ЛЮБОМ имени файла ─────────────────────
+    def test_secret_value_in_a_write_payload_sounds_under_any_name(self):
+        """Имя перестало быть вердиктом — значит значение обязано ловиться по себе."""
+        d = {"tool_name": "Write", "cwd": PROJ,
+             "tool_input": {"file_path": os.path.join(PROJ, "docs", "artifacts", "x.md"),
+                            "content": "итог\nBRIDGE_" + "TOKEN=" + self._REAL + "\n"}}
+        act, kind, obj = g.decide(d)
+        self.assertEqual((act, kind), ("ask", "env"))
+        self.assertIn("BRIDGE_TOKEN", obj)
+
+    def test_ordinary_payload_stays_silent(self):
+        d = {"tool_name": "Write", "cwd": PROJ,
+             "tool_input": {"file_path": os.path.join(PROJ, "docs", "artifacts", "x.md"),
+                            "content": "обычный отчёт про мост и BRIDGE_TOKEN словами"}}
+        self.assertEqual(g.decide(d)[0], "defer")
