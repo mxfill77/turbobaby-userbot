@@ -329,12 +329,16 @@ def tick(root=HERE, state_path=None, inbox=DEFAULT_INBOX, send=False, clock=None
 
     # ─── немедленный показ ───
     shown = review_audit.shown_keys(state.get("shown"))
+    # Остаток бутстрапа СПРАШИВАЕТСЯ, а не только пишется: без этого молчание длилось бы ровно
+    # один оборот, а со второго backlog тёк бы в тему по три в сутки — тот же вывал, растянутый
+    # на неделю. Явный `--force` его по-прежнему берёт: реестр здесь замок, а не могила.
+    held_over = set() if force else review_audit.shown_keys(state.get("held"))
     left = max(0, int(budget) - review_audit.shown_count(state.get("shown"), today))
     if bootstrap and not force:
         take, held = [], [(i, "бутстрап: лоток старше ступени D — не показывали") for i in items]
     else:
         take, held = review_audit.select_immediate(
-            items, posted=set() if force else shown,
+            items, posted=set() if force else shown, held_over=held_over,
             budget=len(items) if force else left, limit=limit)
     ids_by_key, _ids_why = ({}, "") if not take else queue_ids_by_key(daemon)
     for item in take:

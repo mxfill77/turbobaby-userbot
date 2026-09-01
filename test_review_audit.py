@@ -453,6 +453,42 @@ class TestNegative(unittest.TestCase):
         for row in state["held"].values():
             self.assertIn("не показывали", row["why"])
 
+    def test_bootstrap_holds_the_backlog_on_the_NEXT_turns_too(self):
+        """Бутстрап молчит НЕ ОДИН оборот: остаток спрашивается, а не только пишется.
+
+        Класс, пойманный живой отправкой 01.09: реестр ``held`` писался, но никем не
+        читался, и со ВТОРОГО оборота backlog снова становился годным к показу — то
+        есть вывал никуда не девался, а растягивался по три в сутки, пока лоток не
+        кончится. Проба гоняет ровно два оборота подряд: первый бутстрапный (молчит
+        по флагу), второй — уже обычный, и он обязан молчать по РЕЕСТРУ.
+        """
+        sender = FakeSender()
+        run.tick(HERE, state_path=self.state, send=True, digest=False,
+                 daemon=FakeDaemon(), sender=sender, built=self.built)
+        second = run.tick(HERE, state_path=self.state, send=True, digest=False,
+                          daemon=FakeDaemon(), sender=sender, built=self.built)
+        self.assertFalse(second["bootstrap"], "второй оборот обязан быть уже НЕ бутстрапным")
+        self.assertEqual(second["sent"], [], "backlog потёк в тему со второго оборота")
+        self.assertEqual(sender.sent, [], "наружу ушло то, что бутстрап отложил")
+        whys = [why for _k, why in second["held"]]
+        self.assertTrue(any("бутстрап" in why for why in whys),
+                        "остаток бутстрапа не назван своим словом на втором обороте")
+
+    def test_force_still_takes_what_bootstrap_held(self):
+        """Реестр остатка — ЗАМОК, а не могила: явный --force берёт отложенное.
+
+        Иначе лечение оказалось бы хуже болезни: находки, попавшие в лоток до
+        рождения ступени, стали бы непоказуемыми навсегда, и владельцу пришлось бы
+        читать их файлами — ровно та работа, которую ступень D и убирает.
+        """
+        sender = FakeSender()
+        run.tick(HERE, state_path=self.state, send=True, digest=False,
+                 daemon=FakeDaemon(), sender=sender, built=self.built)
+        forced = run.tick(HERE, state_path=self.state, send=True, force=True, limit=1,
+                          digest=False, daemon=FakeDaemon(), sender=sender, built=self.built)
+        self.assertEqual(len(forced["sent"]), 1, "--force не поднял отложенное бутстрапом")
+        self.assertEqual(len(sender.sent), 1)
+
     def test_shown_once_is_not_shown_twice(self):
         """Реестр держит дедуп ПО НАБОРУ ключей — и после «рестарта» тоже."""
         sender = FakeSender()
