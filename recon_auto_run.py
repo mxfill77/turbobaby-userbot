@@ -22,6 +22,15 @@
    (``review_intake.parse_answer`` → ``outcome``/``reason``, поля структурные) и
    маркер вердикта V0 в закрытых рядах очереди (``done_judge_pc.UNKNOWN_PREFIX``).
 
+СУТОЧНЫЙ ПОТОЛОК СЧИТАЕТСЯ ПО СУТКАМ, А НЕ ПО ОДНОВРЕМЕННОСТИ (поправка 02.09).
+Маркер поставленной разведки живёт в её ряду, а ряд после закрытия уходит в
+``done`` — и до 02.09 счёт шёл по одним ОТКРЫТЫМ рядам, то есть мерил «сколько
+сейчас в работе». Обе цифры совпадают ровно до первого закрытия: в ночь 01.09
+полоса поставила себе ПЯТЬ разведок за одни сутки при потолке 2, потому что
+каждая закрывалась за 8–20 минут и освобождала место следующей. Теперь маркеры
+считаются по открытым рядам, ``failed`` и ``done`` вместе; непрочитанная половина
+корпуса делает день ИСЧЕРПАННЫМ, а не пустым (третий исход, ``budget_left``).
+
 БУТСТРАПА ЗДЕСЬ НЕТ, И ЭТО РЕШЕНИЕ, А НЕ ПРОПУСК. У ступеней B и D первый оборот
 не разгребает backlog, потому что там backlog измеряется десятками сообщений и
 карточек. Здесь потолок — ДВЕ автозадачи в сутки, а замок владельца пропускает не
@@ -74,6 +83,22 @@ OPEN_STATUSES = ("new", "in_progress", "needs_approval", "approved")
 # ложится `failed` с маркером. Искать такие исходы по статусу бесполезно — ровно
 # как отказы владельца (класс `queue_snapshot_pc`, 15.08).
 CLOSED_STATUSES = ("failed",)
+# СЧЁТНЫЙ КОРПУС СУТОЧНОГО ПОТОЛКА — третий, и заведён он отдельно НЕ ради
+# красоты. Маркер поставленной разведки живёт в её ряду, а ряд после закрытия
+# уходит в `done`: считая маркеры по одним открытым рядам, полоса меряла не
+# сутки, а одновременность, и в ночь 01.09.2026 поставила пять разведок при
+# потолке 2 (#93 15:53, #94 16:25, #97 17:42, #98 18:13, #99 18:45 UTC — каждая
+# закрывалась за 8–20 минут и освобождала место следующей).
+#
+# ПОЧЕМУ ОТДЕЛЬНОЙ КОНСТАНТОЙ, А НЕ ДОПИСАН В `CLOSED_STATUSES`: у этих чтений
+# РАЗНАЯ ЦЕНА и разная нужность. `get_pending("failed")` — 54 строки за 2.9с и
+# нужен СИГНАЛАМ повтора (то есть самим поводам), поэтому читается всегда;
+# `get_pending("done")` — 120 строк за **26.8с** (замер `queue_snapshot_pc`,
+# 14.08) и нужен ТОЛЬКО потолку, поэтому читается лишь когда есть что ставить.
+# На обороте «поводов нет» (5 из 5 последних тиков живого лога) он не читается
+# вовсе, и цена оборота остаётся прежней. Оба корпуса, слитые в один список,
+# заставили бы платить 27 секунд витка демона за ответ, который никому не нужен.
+BUDGET_STATUSES = ("done",)
 
 
 def now_iso(clock=None):
@@ -343,7 +368,8 @@ def build(root=HERE, queue=None, clock=None, prober=None):
     today = review_intake.today_utc(stamp)
     out = {"stamp": stamp, "today": today, "causes": [], "why": [], "queue_ok": False,
            "owner_busy": None, "owner_rows": [], "task_marks": [], "ask_marks": [],
-           "routes": {}, "signals": [], "expect_why": "", "rows": 0}
+           "routes": {}, "signals": [], "expect_why": "", "rows": 0,
+           "closed_ok": False, "budget_ok": False, "budget_why": "", "marks_ok": False}
 
     eps, why = expect_open(root)
     out["expect_why"] = why
@@ -376,8 +402,6 @@ def build(root=HERE, queue=None, clock=None, prober=None):
     if ok:
         busy, ids = q.owner_busy(live_rows)
         out["owner_busy"], out["owner_rows"] = busy, ids
-        out["task_marks"] = recon_auto.markers(live_rows, "task")
-        out["ask_marks"] = recon_auto.markers(live_rows, "ask")
 
     causes = list(recon_auto.expect_causes(eps))
 
@@ -397,6 +421,35 @@ def build(root=HERE, queue=None, clock=None, prober=None):
     causes = [c for c in causes if str(c.get("key")) not in done]
     out["analysed"] = sorted(done)
     out["causes"] = recon_auto.order(causes)
+
+    # МАРКЕРЫ СУТОК — ПО ОБЕИМ ПОЛОВИНАМ ОЧЕРЕДИ, и дорогая половина читается
+    # ЗДЕСЬ, после отбора поводов: нет поводов — нечего ставить, и 27 секунд за
+    # ответ, который никто не спросит, полоса не платит. Когда поводы есть,
+    # читается всё: открытые ряды + `failed` + `done`.
+    budget_rows, budget_ok, budget_why = ([], False, "закрытые done не спрашивали")
+    if q is None or not ok:
+        budget_why = "очередь не прочитана — маркеров суток нет ни одного"
+    elif not out["causes"]:
+        # ЧЕСТНОЕ ИМЯ ТРЕТЬЕГО СОСТОЯНИЯ: это НЕ отказ прибора и НЕ прочитанный
+        # ноль, а «не спрашивали, потому что незачем». Путать его с отказом
+        # нельзя — иначе каждый пустой оборот кричал бы о поломке моста.
+        budget_why = "поводов нет — дорогое чтение done не понадобилось"
+    else:
+        budget_rows, budget_ok, budget_why = q.rows(BUDGET_STATUSES)
+        if not budget_ok:
+            out["why"].append("закрытые ряды (done) не прочитаны (%s) — суточный потолок "
+                              "сверить нечем, день считаем ИСЧЕРПАННЫМ" % budget_why)
+    out["budget_ok"], out["budget_why"] = budget_ok, budget_why
+    # Полнота корпуса — И открытые, И `failed`, И `done`. Любая непрочитанная
+    # половина делает счёт неполным, а неполный счёт по правилу третьего исхода
+    # значит «день исчерпан», а не «день пуст» (`recon_auto.budget_left`).
+    out["marks_ok"] = bool(ok and closed_ok and budget_ok)
+    if ok:
+        all_rows = list(live_rows) + list(closed_rows) + list(budget_rows)
+        out["rows"] = len(all_rows)
+        out["task_marks"] = recon_auto.markers(all_rows, "task")
+        out["ask_marks"] = recon_auto.markers(all_rows, "ask")
+
     lens = client_lens(root) if (out["causes"] and prober is None) else None
     for cause in out["causes"]:
         out["routes"][str(cause["key"])] = recon_auto.route(
@@ -425,13 +478,14 @@ def tick(root=HERE, state_path=None, place=False, limit=TICK_LIMIT,
               "causes": len(data["causes"]), "placed": [], "failed": [], "held": [],
               "owner_busy": data["owner_busy"], "owner_rows": data["owner_rows"],
               "queue_ok": data["queue_ok"], "signals": data["signals"],
+              "marks_ok": data.get("marks_ok"), "budget_why": data.get("budget_why", ""),
               "routes": data["routes"], "texts": {}, "line": ""}
 
     take, held = recon_auto.select(
         data["causes"], placed=set(state.get("placed") or {}),
         task_marks=data["task_marks"], ask_marks=data["ask_marks"], today=today,
         budget=budget, ask_budget=ask_budget, owner_busy=bool(data["owner_busy"]),
-        routes=data["routes"], limit=limit)
+        routes=data["routes"], limit=limit, marks_ok=bool(data.get("marks_ok")))
     report["held"] = [(c["key"], why) for c, why in held]
 
     for cause, way, why in take:
@@ -497,6 +551,13 @@ def _why(report, data):
         return "поводов нет (проверено: ожидания, заявки, повторы)"
     if report["placed"]:
         return "поставлено %d, отложено %d" % (len(report["placed"]), len(report["held"]))
+    if not data.get("marks_ok"):
+        # ОТКАЗ ПРИБОРА, А НЕ ИСЧЕРПАННЫЙ ДЕНЬ, и сказано это должно быть РАЗНЫМИ
+        # словами: «бюджет кончился» владелец читает как норму и не идёт смотреть,
+        # а «сверить нечем» — как поломку моста, которая сама не пройдёт.
+        return ("закрытые ряды очереди не прочитаны (%s) — сколько разведок уже поставлено "
+                "сегодня, НЕИЗВЕСТНО; день считаем исчерпанным и не ставим ничего"
+                % (data.get("budget_why") or "причина не названа"))
     if data["owner_busy"]:
         return ("в очереди задача владельца (%s) — автозадач не ставим ни одной"
                 % ", ".join("#%s" % i for i in data["owner_rows"]))
@@ -529,6 +590,13 @@ def _render(report=None, data=None):
                      % ("прочитана" if data["queue_ok"] else "НЕДОСТУПНА", data["rows"],
                         (", работа владельца: %s" % (", ".join("#%s" % i for i in data["owner_rows"])
                                                      or "нет")) if data["queue_ok"] else ""))
+        lines.append("маркеры суток: %s (закрытые failed: %s; закрытые done: %s)"
+                     % ("корпус полон" if data.get("marks_ok") else "КОРПУС НЕПОЛОН — день исчерпан",
+                        "прочитаны" if data.get("closed_ok") else "НЕТ",
+                        data.get("budget_why") or "прочитаны"))
+        lines.append("маркеров задач сегодня: %d, заявок: %d"
+                     % (sum(1 for d, _k in data["task_marks"] if d == data["today"]),
+                        sum(1 for d, _k in data["ask_marks"] if d == data["today"])))
         if data["expect_why"]:
             lines.append("наблюдатель ожиданий: %s" % data["expect_why"])
         lines.append("сигналы повтора: %d" % len(data["signals"]))

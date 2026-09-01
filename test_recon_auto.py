@@ -91,15 +91,23 @@ def _ok_probe(hit=False, files=(), determinate=True):
 class FakeQueue(object):
     """Очередь-заглушка: помнит, ЧТО и КАКОЙ дорогой у неё просили поставить."""
 
-    def __init__(self, rows=(), closed=(), ok=True, busy=False, busy_ids=()):
-        self._rows, self._closed = list(rows), list(closed)
+    def __init__(self, rows=(), closed=(), ok=True, busy=False, busy_ids=(),
+                 done=(), done_ok=True):
+        self._rows, self._closed, self._done = list(rows), list(closed), list(done)
         self._ok, self._busy, self._busy_ids = ok, busy, list(busy_ids)
+        self._done_ok = done_ok
         self.tasks, self.asks = [], []
+        self.asked = []          # какие корпуса у очереди СПРАШИВАЛИ (и сколько раз)
         self.next_id = 500
 
     def rows(self, statuses=run.OPEN_STATUSES):
+        self.asked.append(tuple(statuses))
         if not self._ok:
             return [], False, "мост не ответил"
+        if tuple(statuses) == run.BUDGET_STATUSES:
+            if not self._done_ok:
+                return [], False, "мост не ответил на done"
+            return list(self._done), True, ""
         src = self._closed if tuple(statuses) == run.CLOSED_STATUSES else self._rows
         return list(src), True, ""
 
@@ -381,6 +389,74 @@ class TestCeiling(unittest.TestCase):
         self.assertEqual(ra.markers(rows, "task"), [])
         self.assertEqual(ra.markers(rows, "ask"), [(TODAY, "cccccccccccc")])
 
+    # ── потолок считается по СУТКАМ, а не по одновременности (класс 01.09) ──
+
+    def _mark(self, day, key, mark=None):
+        return {"task_text": "%s дата=%s ключ=%s]\nтело" % (mark or ra.TASK_MARK, day, key)}
+
+    def test_two_closed_recons_of_today_leave_no_room_though_none_is_open(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ ЖИВОГО КЛАССА 01.09.2026. За ночь полоса поставила
+        себе ПЯТЬ разведок при потолке 2 (#93 15:53, #94 16:25, #97 17:42,
+        #98 18:13, #99 18:45 UTC): каждая закрывалась за 8–20 минут, маркер уходил
+        из открытых рядов, и следующая видела ПУСТОЙ день. Здесь ровно та
+        расстановка — два ЗАКРЫТЫХ ряда сегодняшним числом и НОЛЬ открытых."""
+        closed = [self._mark(TODAY, "aaaaaaaaaaaa"), self._mark(TODAY, "bbbbbbbbbbbb")]
+        marks = ra.markers(closed, "task")          # открытых рядов ноль
+        self.assertEqual(len(marks), 2)
+        self.assertEqual(ra.budget_left(marks, TODAY, ra.DAILY_BUDGET), 0)
+        causes = self._causes(1)
+        take, held = ra.select(causes, today=TODAY, routes=self._routes(causes),
+                               task_marks=marks, owner_busy=False, limit=None)
+        self.assertEqual(take, [], "закрывшаяся разведка снова освободила место")
+        self.assertTrue(any("бюджет суток" in why for _c, why in held))
+
+    def test_unread_closed_rows_exhaust_the_day_they_do_not_empty_it(self):
+        """ТРЕТИЙ ИСХОД. Пустой список маркеров при УПАВШЕМ чтении неотличим от
+        пустого при честном нуле — различает их отдельный признак, а не длина."""
+        causes = self._causes(1)
+        take, held = ra.select(causes, today=TODAY, routes=self._routes(causes),
+                               task_marks=(), owner_busy=False, limit=None, marks_ok=False)
+        self.assertEqual(take, [])
+        self.assertTrue(any("НЕИЗВЕСТНО" in why for _c, why in held))
+        self.assertTrue(any("закрытые ряды" in why for _c, why in held))
+        self.assertEqual(ra.budget_left((), TODAY, ra.DAILY_BUDGET, False), 0)
+        self.assertEqual(ra.budget_left((), TODAY, ra.DAILY_BUDGET, True), 2)
+
+    def test_unread_closed_rows_stop_the_owner_claim_too(self):
+        """Потолок ЗАЯВОК устроен так же и течёт тем же местом: заявка свободна от
+        замка «работа владельца», но не от суточного счёта."""
+        causes = self._causes(1)
+        take, held = ra.select(causes, today=TODAY,
+                               routes=self._routes(causes, ra.ROUTE_OWNER),
+                               ask_marks=(), owner_busy=False, marks_ok=False)
+        self.assertEqual(take, [])
+        self.assertTrue(any("закрытые ряды" in why for _c, why in held))
+
+    def test_closed_asks_of_today_eat_the_ask_budget(self):
+        closed = [self._mark(TODAY, "cccccccccccc", ra.ASK_MARK),
+                  self._mark(TODAY, "dddddddddddd", ra.ASK_MARK)]
+        marks = ra.markers(closed, "ask")
+        causes = self._causes(1)
+        take, held = ra.select(causes, today=TODAY,
+                               routes=self._routes(causes, ra.ROUTE_OWNER),
+                               ask_marks=marks, owner_busy=False)
+        self.assertEqual(take, [])
+        self.assertTrue(any("заявок владельцу" in why for _c, why in held))
+
+    def test_yesterdays_closed_rows_are_not_counted_at_all(self):
+        """Положительный контроль рядом с отрицательным: правило, глушащее ВСЁ,
+        прошло бы оба теста выше и было бы бесполезно. Вчерашние закрытые ряды
+        сегодняшнего дня не съедают — иначе потолок стал бы вечным."""
+        closed = [self._mark("2026-08-31", "eeeeeeeeeeee"),
+                  self._mark("2026-08-31", "ffffffffffff")]
+        marks = ra.markers(closed, "task")
+        self.assertEqual(len(marks), 2)
+        self.assertEqual(ra.budget_left(marks, TODAY, ra.DAILY_BUDGET), 2)
+        causes = self._causes(2)
+        take, _held = ra.select(causes, today=TODAY, routes=self._routes(causes),
+                                task_marks=marks, owner_busy=False, limit=None)
+        self.assertEqual(len(take), 2)
+
     def test_already_placed_cause_is_not_placed_twice(self):
         causes = self._causes(1)
         take, held = ra.select(causes, placed={causes[0]["key"]}, today=TODAY,
@@ -587,6 +663,77 @@ class TestHands(unittest.TestCase):
         self.assertEqual(q.tasks, [], "повод клиентского контура стал ЗАДАЧЕЙ")
         self.assertEqual(len(q.asks), 1)
         self.assertTrue(q.asks[0][1].startswith(ra.ASK_MARK))
+
+    # ── тот же класс на ЖИВОМ пути рук (поддельные ряды, боевой очереди нет) ──
+
+    def _clock(self, hour=18):
+        """Часы теста: 01.09.2026 18:45 UTC — минута пятой ночной постановки."""
+        import datetime
+
+        return lambda tz: datetime.datetime(2026, 9, 1, hour, 45, tzinfo=tz)
+
+    def _closed_recon(self, key, day=TODAY):
+        return {"id": 90, "status": "done", "result": "готово",
+                "task_text": "%s дата=%s ключ=%s]\nтело" % (ra.TASK_MARK, day, key)}
+
+    def _kw(self, q):
+        return dict(place=True, queue=q, clock=self._clock(),
+                    journal_fn=lambda *a, **k: (0, ""),
+                    prober=lambda t, r, l=None: (False, [], True))
+
+    def test_the_counted_corpus_names_done_or_the_whole_fix_is_a_no_op(self):
+        """Разведка закрывается в `done` (лог 01.09: «V0-DONE id=93 … COMPLETE
+        id=93 status=done»), а не в `failed`. Не спроси мы `done` — счёт «по
+        закрытым рядам» не увидел бы НИ ОДНОЙ из пяти ночных постановок, и правка
+        была бы зелёной пустышкой."""
+        self.assertIn("done", run.BUDGET_STATUSES)
+        self.assertIn("failed", run.CLOSED_STATUSES)
+        self.assertNotIn("done", run.OPEN_STATUSES)
+
+    def test_closed_recons_of_today_block_the_next_one_on_the_live_path(self):
+        """Руки обязаны СПРОСИТЬ закрытые ряды и посчитать по ним. Ряды подделаны:
+        боевой очереди тест не касается ни одной веткой."""
+        root = self._root()
+        self._observer(root, {"o2t|1": {"first": 1.0, "kind": "o2_pc_turn"}})
+        q = FakeQueue(done=[self._closed_recon("aaaaaaaaaaaa"),
+                            self._closed_recon("bbbbbbbbbbbb")])
+        report = run.tick(root, **self._kw(q))
+        self.assertEqual(q.tasks, [], "закрытые разведки не съели бюджет дня")
+        self.assertTrue(any("бюджет суток" in why for _k, why in report["held"]))
+        self.assertIn(run.BUDGET_STATUSES, q.asked, "корпус `done` не спрашивали вовсе")
+
+    def test_unread_closed_rows_place_nothing_and_the_reason_reaches_the_log(self):
+        """Третий исход на живом пути: `done` не отдался → ставить нельзя, и
+        причина едет СЛОВАМИ в ту самую строку, которую демон пишет в лог."""
+        root = self._root()
+        self._observer(root, {"o2t|1": {"first": 1.0, "kind": "o2_pc_turn"}})
+        q = FakeQueue(done_ok=False)
+        report = run.tick(root, **self._kw(q))
+        self.assertEqual(q.tasks, [])
+        self.assertEqual(q.asks, [])
+        self.assertIn("закрытые ряды", report["why"])
+        self.assertIn("НЕИЗВЕСТНО", report["why"])
+        self.assertFalse(report["marks_ok"])
+
+    def test_yesterdays_closed_recons_do_not_block_today_on_the_live_path(self):
+        """Положительный контроль: правило, глушащее всё, прошло бы оба теста выше."""
+        root = self._root()
+        self._observer(root, {"o2t|1": {"first": 1.0, "kind": "o2_pc_turn"}})
+        q = FakeQueue(done=[self._closed_recon("aaaaaaaaaaaa", "2026-08-31"),
+                            self._closed_recon("bbbbbbbbbbbb", "2026-08-31")])
+        run.tick(root, **self._kw(q))
+        self.assertEqual(len(q.tasks), 1, "вчерашние закрытые съели сегодняшний день")
+
+    def test_the_expensive_corpus_is_not_read_when_there_is_nothing_to_place(self):
+        """`get_pending("done")` — 120 строк за 26.8с. Оборот «поводов нет» (5 из 5
+        последних тиков живого лога) платить их не обязан."""
+        root = self._root()
+        self._observer(root, {})                      # ни одного открытого эпизода
+        q = FakeQueue()
+        report = run.tick(root, **self._kw(q))
+        self.assertEqual(report["causes"], 0)
+        self.assertNotIn(run.BUDGET_STATUSES, q.asked)
+        self.assertIn("поводов нет", report["why"])
 
     def test_owner_busy_live_path_places_nothing_and_says_why(self):
         root = self._root()
