@@ -8676,6 +8676,19 @@ REVIEW_AUTO_MIN_SEC = float(os.getenv("REVIEW_AUTO_MIN_SEC", "300") or "300")   
 REVIEW_AUTO_TIMEOUT = int(os.getenv("REVIEW_AUTO_TIMEOUT", "300") or "300")     # бюджет одного канала, с
 REVIEW_AUTO_DIGEST_HOUR = int(os.getenv("REVIEW_AUTO_DIGEST_HOUR", "1") or "1")  # час UTC суточного дайджеста
 REVIEW_AUTO_TICK_FILE = _state(os.path.join(REPO, "pc_orchestrator.review_auto_tick.json"))
+# И СОСТОЯНИЕ, И КОРЕНЬ ЗАПИСИ — через `_state`, а не константой REPO. Класс пойман ЖИВЬЁМ на
+# первом же прогоне (01.09): ветка по умолчанию включена, `_review_auto_note` брал `root=REPO`, и
+# гейт `test_pc_orchestrator` (мокнутая очередь) написал в БОЕВОЙ спул 12 фикстурных расписок с
+# несуществующими номерами задач. Ровно тот случай, который описан в докстринге `_state`: «тест
+# звал живую функцию демона, а та брала путь по умолчанию» — там же названы две прошлые жертвы,
+# снимок контур-вотчдога и спул ревизора. Корень записи выводим ИЗ пути состояния: под тестом он
+# уезжает в одноразовый temp вместе с ним, в бою равен REPO.
+REVIEW_AUTO_STATE_FILE = _state(os.path.join(REPO, "review_auto_state.json"))
+
+
+def _review_auto_root():
+    """Корень, в который ступень A пишет расписки. Под тестом — temp, в бою — REPO."""
+    return os.path.dirname(REVIEW_AUTO_STATE_FILE) or REPO
 
 
 def _review_auto_on():
@@ -8715,7 +8728,8 @@ def _review_auto_note(tid, text, status, result):
         return None
     try:
         import review_auto_run
-        rec = review_auto_run.note_closed(int(tid), text, status, result, root=REPO)
+        rec = review_auto_run.note_closed(int(tid), text, status, result,
+                                          root=_review_auto_root(), state_path=REVIEW_AUTO_STATE_FILE)
     except Exception as e:
         log.warning("ревью-контур A: расписка задачи %s не записана (fail-safe): %s", tid, e)
         return None
@@ -8765,8 +8779,8 @@ def maybe_review_auto(now=None, tick_path=None, state_path=None, runner=None):
     try:
         import review_auto_run
         report = (runner or review_auto_run.tick)(
-            root=REPO, state_path=state_path, digest_hour=REVIEW_AUTO_DIGEST_HOUR,
-            timeout=REVIEW_AUTO_TIMEOUT, write_journal=True,
+            root=_review_auto_root(), state_path=state_path or REVIEW_AUTO_STATE_FILE,
+            digest_hour=REVIEW_AUTO_DIGEST_HOUR, timeout=REVIEW_AUTO_TIMEOUT, write_journal=True,
         )
     except Exception as e:
         log.warning("ревью-контур A: оборот упал (fail-safe, метка уже сдвинута — "

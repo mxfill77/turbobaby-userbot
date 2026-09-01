@@ -300,6 +300,30 @@ class TestCaseBuilding(unittest.TestCase):
         self.assertIn("## ВОПРОСЫ РЕВЬЮЕРУ", text)
         self.assertEqual(review_send.outbound_violations(review_send.build_prompt(text)), [])
 
+    def test_artifact_with_absolute_paths_is_held_and_named_in_the_pack(self):
+        """Найдено ЖИВЬЁМ 01.09: первый же повод приложил артефакт ПРО абсолютные корни, и
+        страж задержал ВЕСЬ пакет. Артефакт не едет, но его имя и причина едут."""
+        rec = _receipt()
+        self._write_receipt(rec)
+        dirty = "docs/artifacts/2026-09-01-грязный.md"
+        review_auto_run.write_text(os.path.join(self.root, *dirty.split("/")),
+                                   "тут литерал корня r\"D:\\turbobaby-bot\" в тексте\n")
+        clean = "docs/artifacts/2026-09-01-чистый.md"
+        review_auto_run.write_text(os.path.join(self.root, *clean.split("/")),
+                                   "тут только относительные пути: docs/artifacts/x.md\n")
+        kept, held = review_auto_run.screen_artifacts(self.root, [dirty, clean])
+        self.assertEqual(kept, [clean])
+        self.assertEqual(held[0]["path"], dirty)
+        case = review_auto.case_for_chain(rec, "2026-09-01",
+                                          line_counts=review_auto_run.line_counts(
+                                              self.root, [review_auto.receipt_rel(rec), clean]),
+                                          artifact_sources=kept, held_artifacts=held)
+        pack = review_pack.build_review_pack(case, root=self.root)
+        text = review_pack.render_review_pack(pack)
+        self.assertIn("НЕ ПРИЛОЖЕНО стражей исходящего", text)
+        self.assertIn(dirty, text)
+        self.assertEqual(review_send.outbound_violations(review_send.build_prompt(text)), [])
+
     def test_chain_without_operational_change_cannot_become_a_case(self):
         with self.assertRaises(review_auto.ReviewAutoError):
             review_auto.case_for_chain(_receipt(changed=False), "2026-09-01")
@@ -322,6 +346,28 @@ class TestCaseBuilding(unittest.TestCase):
         text = review_pack.render_review_pack(pack)
         for rec in recs:
             self.assertIn(rec["task_id"], text)
+
+    def test_digest_drops_receipts_until_it_fits_instead_of_blocking(self):
+        """ЗАМЕР 01.09: четыре живые расписки дали 16046 знаков при потолке 15000 и `blocked`.
+        Число приложенных обязано МЕРИТЬСЯ сборкой, иначе дайджест ломается ровно в те дни,
+        когда отчёты подробнее обычного."""
+        fat = "я" * 850
+        recs = [_receipt(i, closed="2026-09-01T0%d:00:00Z" % i, text="ц" * 2000,
+                         result="commit abc123%d\n%s" % (i, fat))
+                for i in range(1, 5)]
+        for rec in recs:
+            self._write_receipt(rec)
+        day = "2026-09-01"
+        review_auto_run.write_text(os.path.join(self.root, *review_auto.digest_index_rel(day).split("/")),
+                                   review_auto.digest_index_text(recs, day, day))
+        counts = review_auto_run.line_counts(
+            self.root, [review_auto.digest_index_rel(day)] + [review_auto.receipt_rel(r) for r in recs])
+        case, pack = review_auto_run._fit_digest(
+            {"receipts": recs, "day": day}, day, counts, self.root, review_pack.REVIEW_MAX_CHARS)
+        self.assertEqual(pack["status"], "ok")
+        self.assertLess(len(case["result_packets"]), len(recs), "ни одной расписки не отброшено")
+        self.assertIn("расписок приложено %d из %d" % (len(case["result_packets"]), len(recs)),
+                      "\n".join(case["summary"]))
 
     def test_digest_index_names_every_chain_including_the_read_only_ones(self):
         text = review_auto.digest_index_text([_receipt(1), _receipt(2, changed=False)],

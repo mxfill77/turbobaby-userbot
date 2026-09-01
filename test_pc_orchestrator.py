@@ -11008,6 +11008,19 @@ class TestReviewAutoWiring(unittest.TestCase):
         with mock.patch.object(o, "_flag_forced_off", lambda name: True):
             self.assertIsNone(o._review_auto_note(1, "тз", "done", "FACT: commit abc1234"))
 
+    def test_receipts_never_land_in_the_live_tree_under_test(self):
+        """Класс `_state` третьим случаем: ветка по умолчанию ВКЛЮЧЕНА, и без изоляции гейт с
+        мокнутой очередью писал 12 фикстурных расписок в БОЕВОЙ спул (поймано живьём 01.09)."""
+        with mock.patch.object(o, "REVIEW_AUTO_STATE_FILE", os.path.join(self.tmp, "state.json")), \
+             mock.patch.object(o, "_flag_forced_off", lambda name: False):
+            rec = o._review_auto_note(4242, "тз", "done", "FACT: commit abc1234")
+        self.assertIsNotNone(rec)
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "docs", "review_receipts",
+                                                    rec["task_id"] + ".json")))
+        self.assertFalse(os.path.exists(os.path.join(o.REPO, "docs", "review_receipts",
+                                                     rec["task_id"] + ".json")),
+                         "расписка теста уехала в боевое дерево")
+
     def test_the_turn_is_wired_into_the_loop_next_to_the_revizor(self):
         """Врезка проверяется по ИСХОДНИКУ витка: ветка, которую никто не зовёт, — мёртвая."""
         with io.open(os.path.join(o.REPO, "pc_orchestrator.py"), encoding="utf-8") as fh:

@@ -210,20 +210,76 @@ def line_counts(root, paths):
     return out
 
 
+def screen_artifacts(root, paths, head_lines=review_auto.ARTIFACT_HEAD_LINES):
+    """Отсеять артефакты, чья ГОЛОВА спотыкается о стражу исходящего. → (принятые, задержанные).
+
+    ЗАЧЕМ, и это найдено ЖИВЬЁМ на первом же боевом обороте 01.09. Постановку контур
+    санитайзит сам, расписку тоже — а артефакт репозитория читается ДОСЛОВНО, и в нём
+    абсолютных путей полно (первый же повод приложил артефакт ПРО абсолютные корни в
+    тестах). Итог: страж честно задержал пакет целиком, оба канала получили
+    ``outbound_guard``, и так было бы КАЖДЫЙ раз — автоматический контур, который всегда
+    задержан, бесполезен.
+
+    Санитайзить артефакт нельзя: пакет печатает sha256 файла-источника, а санитайзенный
+    текст этому хешу больше не соответствует — доказательство превратилось бы в подделку.
+    Поэтому спотыкающийся артефакт НЕ ЕДЕТ, и его имя названо в сводке пакета.
+    """
+    kept, held = [], []
+    for rel in paths:
+        try:
+            with open(_path(root, rel), "r", encoding="utf-8") as fh:
+                head = "".join([line for _, line in zip(range(head_lines), fh)])
+        except OSError:
+            continue                                   # нет файла — сборщик назовёт причину сам
+        found = review_send.outbound_violations(head)
+        if found:
+            held.append({"path": rel, "kinds": sorted({v["kind"] for v in found})})
+        else:
+            kept.append(rel)
+    return kept, held
+
+
+def _fit_digest(trigger, build_date, counts, root, max_chars):
+    """Дайджест с ИЗМЕРЕННЫМ числом приложенных расписок. → (case, pack).
+
+    Фиксированное число здесь не работает, и это ЗАМЕР, а не опасение: первый живой
+    дайджест 01.09 с четырьмя расписками занял 16046 знаков при потолке 15000 и ушёл
+    ``required_pack_exceeds_budget``. Размер расписки не постоянен (голова результата плюс
+    постановка — от 200 до 2100 знаков), поэтому любое назначенное число блокировало бы
+    пакет ровно в те дни, когда отчёты подробнее обычного.
+
+    Считаем сверху вниз и останавливаемся на первом влезшем; не влезло даже с одной —
+    отдаём ``blocked`` как есть: отказ с причиной честнее молча урезанного пакета.
+    """
+    top = min(len(trigger["receipts"]), review_auto.DIGEST_RECEIPTS_MAX)
+    case = pack = None
+    for n in range(top, 0, -1):
+        case = review_auto.case_for_digest(trigger["receipts"], trigger["day"], build_date,
+                                           line_counts=counts, receipts_in_pack=n)
+        pack = review_pack.build_review_pack(case, root=root, max_chars=max_chars)
+        if pack["status"] == "ok":
+            return case, pack
+    if case is None:                       # расписок нет вовсе — сюда доходит только пустой день
+        case = review_auto.case_for_digest([], trigger["day"], build_date, line_counts=counts)
+        pack = review_pack.build_review_pack(case, root=root, max_chars=max_chars)
+    return case, pack
+
+
 def _build_pack(trigger, root, build_date, max_chars):
     """Повод → (case, pack, text, rel-путь пакета). Пишет индекс дня для дайджеста."""
     if trigger["kind"] == "chain":
         rec = trigger["receipt"]
-        artifacts = list(rec.get("artifacts") or [])
+        artifacts, held = screen_artifacts(root, list(rec.get("artifacts") or []))
         counts = line_counts(root, [review_auto.receipt_rel(rec)] + artifacts)
-        case = review_auto.case_for_chain(rec, build_date, line_counts=counts, artifact_sources=artifacts)
+        case = review_auto.case_for_chain(rec, build_date, line_counts=counts,
+                                          artifact_sources=artifacts, held_artifacts=held)
+        pack = review_pack.build_review_pack(case, root=root, max_chars=max_chars)
     else:
         index_rel = review_auto.digest_index_rel(trigger["day"])
         write_text(_path(root, index_rel),
                    review_auto.digest_index_text(trigger["receipts"], trigger["day"], build_date))
         counts = line_counts(root, [index_rel] + [review_auto.receipt_rel(r) for r in trigger["receipts"]])
-        case = review_auto.case_for_digest(trigger["receipts"], trigger["day"], build_date, line_counts=counts)
-    pack = review_pack.build_review_pack(case, root=root, max_chars=max_chars)
+        case, pack = _fit_digest(trigger, build_date, counts, root, max_chars)
     text = review_pack.render_review_pack(pack)
     rel = "%s/%s" % (DEFAULT_OUTBOX, review_pack.pack_filename(pack))
     write_text(_path(root, rel), text)
@@ -234,7 +290,7 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
          channels=None, timeout=DEFAULT_TIMEOUT, key_env=review_send_run.DEFAULT_KEY_ENV,
          dry=False, write_journal=True, max_chars=review_pack.REVIEW_MAX_CHARS,
          codex_bin=None, codex_model=None, codex_cd=None, manus_base=None,
-         inbox=None, workdir=None, journal_fn=None, clock=None):
+         inbox=None, workdir=None, journal_fn=None, clock=None, only=None):
     """Один оборот ступени A. → dict-отчёт (никогда не бросает наружу исключений канала).
 
     Отчёт всегда несёт ``acted`` и ``why``: «повода не было» — это ИСХОД, а не
@@ -244,7 +300,16 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
     path = state_path or _path(root, DEFAULT_STATE)
     state = read_state(path)
 
-    trigger = review_auto.next_trigger(state, stamp, digest_hour)
+    # `only` — не боевая ручка, а СПОСОБ ПРОВЕРИТЬ дайджест руками. Без неё он недостижим:
+    # цепочка всегда идёт первой, и пока спул не пуст, дайджест не собрать даже сухим прогоном.
+    if only == "chain":
+        trigger = review_auto.chain_trigger(state, stamp)
+    elif only == "digest":
+        trigger = review_auto.digest_trigger(state, stamp, digest_hour)
+    elif only is None:
+        trigger = review_auto.next_trigger(state, stamp, digest_hour)
+    else:
+        raise review_auto.ReviewAutoError("invalid_only", "only=%r not in ('chain','digest')" % (only,))
     if trigger is None:
         return {"acted": False, "why": "повода нет", "trigger": None}
 
@@ -394,6 +459,8 @@ def main(argv=None):
     parser.add_argument("--codex-model", default=None)
     parser.add_argument("--codex-cd", default=None)
     parser.add_argument("--manus-base", default=None, help="адрес канала Manus (для отрицательной пробы)")
+    parser.add_argument("--only", choices=("chain", "digest"), default=None,
+                        help="рассматривать только этот повод (проверка руками, не боевая ручка)")
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--journal", action="store_true", help="дописать строку-индекс в журнал")
     args = parser.parse_args(argv)
@@ -431,7 +498,7 @@ def main(argv=None):
         root=args.root, state_path=state_path, now=stamp, digest_hour=args.digest_hour,
         channels=args.channel, timeout=args.timeout, key_env=args.key_env, dry=args.dry,
         write_journal=bool(args.journal), codex_bin=args.codex_bin, codex_model=args.codex_model,
-        codex_cd=args.codex_cd, manus_base=args.manus_base,
+        codex_cd=args.codex_cd, manus_base=args.manus_base, only=args.only,
     )
     sys.stdout.write(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
     if not report.get("acted"):

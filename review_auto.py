@@ -489,7 +489,7 @@ def _commit_words(rec):
     return "коммита не объявлено — работа только на чтение"
 
 
-def case_for_chain(rec, build_date, *, line_counts=None, artifact_sources=()):
+def case_for_chain(rec, build_date, *, line_counts=None, artifact_sources=(), held_artifacts=()):
     """Расписка закрытой цепочки → спецификация случая для :mod:`review_pack`.
 
     ``task_class`` = ``code_green`` не по умолчанию, а по определению повода:
@@ -514,6 +514,14 @@ def case_for_chain(rec, build_date, *, line_counts=None, artifact_sources=()):
         "Пакет собран и отправлен АВТОМАТИЧЕСКИ витком демона; ответ ревьюера не исполняется "
         "ни одной веткой контура и адресован человеку.",
     ]
+    # Задержанный артефакт называется в САМОМ пакете, а не только в логе: ревьюеру важно
+    # знать, что контекст неполон, и ПОЧЕМУ он неполон. «Просто не приложили» и
+    # «приложить нельзя, там абсолютные пути» — разные новости.
+    for held in held_artifacts or ():
+        summary.append(
+            "НЕ ПРИЛОЖЕНО стражей исходящего: %s (%s) — файл остаётся в дереве, наружу не уехал."
+            % (held.get("path"), ", ".join(held.get("kinds") or []))
+        )
     numbers = [
         {"name": "цепочка · подтверждённых коммитов", "value": len(rec["verified_commits"]), "source": rel},
         {"name": "цепочка · объявленных коммитов", "value": len(rec["claimed_commits"]), "source": rel},
@@ -542,9 +550,13 @@ def case_for_chain(rec, build_date, *, line_counts=None, artifact_sources=()):
 
 
 DIGEST_HYPOTHESIS_MAX = 300     # постановка в дайджесте — головой: их там столько же, сколько цепочек
+# ПОТОЛОК приложенных расписок, а не их число: сколько влезет на самом деле, меряет
+# `review_auto_run._fit_digest` сборкой. Четыре — это верхняя граница попытки, и она уже
+# однажды не влезла (16046 при 15000, живой дайджест 01.09).
+DIGEST_RECEIPTS_MAX = 4
 
 
-def case_for_digest(receipts, day, build_date, *, line_counts=None, receipts_in_pack=4):
+def case_for_digest(receipts, day, build_date, *, line_counts=None, receipts_in_pack=DIGEST_RECEIPTS_MAX):
     """Цепочки суток → спецификация случая дайджеста.
 
     ПОЛНОТУ СПИСКА держит ИНДЕКС дня, а не расписки, и это развилка, решённая
