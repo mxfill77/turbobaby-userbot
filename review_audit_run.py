@@ -130,6 +130,12 @@ def answer_headers(root=HERE, inbox=DEFAULT_INBOX, files=None):
             skipped.append((rel, "не файл ответа (%s)" % exc.reason))
             continue
         out.append({"rel": rel, "pack": header.get("pack") or "",
+                    # ПУТЬ пакета, а не только его имя. Добавлено 02.09 ступенью F:
+                    # ей пакет нужно ОТКРЫТЬ (повторить отправку) и НАЗВАТЬ владельцу
+                    # исполнимой командой, а имя без каталога не годится ни для того,
+                    # ни для другого. Поймано живым сухим прогоном: повтор по имени
+                    # упирался бы в `pack_missing` на каждом пакете.
+                    "pack_path": header.get("pack_path") or "",
                     "channel": header.get("channel") or "",
                     "send_date": header.get("send_date") or "",
                     "outcome": header.get("outcome") or "",

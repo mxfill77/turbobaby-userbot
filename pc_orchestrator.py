@@ -5989,7 +5989,14 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         # review_pack, review_send, dispatch_notify, queue_snapshot_pc) уже в
                         # остатке выше — ступень D переиспользует разбор ступени B и дверь
                         # отправки, а не заводит свои.
-                        "review_audit_run.py", "review_audit.py")
+                        "review_audit_run.py", "review_audit.py",
+                        # 02.09.2026: ступень F — куст за ленивым `import review_outbox_queue_run`
+                        # в `maybe_review_outbox`. Своих новых листьев ровно два: сам
+                        # `review_outbox_queue` и его руки. Всё прочее (review_audit_run — разбор
+                        # шапок лотка и дверь в тему Аудит, review_intake_run — путь лотка,
+                        # review_send_run — ЖИВОЙ формат повтора) уже в остатке выше: ступень F
+                        # переиспользует чужие разборы и чужую отправку, а не заводит свои.
+                        "review_outbox_queue_run.py", "review_outbox_queue.py")
 # остаток: ленивые импорты вне ворот грязного дерева
 
 
@@ -9304,6 +9311,114 @@ def maybe_recon_auto(now=None, tick_path=None, state_path=None, runner=None):
     return report
 
 
+# ------------------- СТУПЕНЬ F: ОЧЕРЕДЬ ИСХОДЯЩИХ (флаг REVIEW_OUTBOX) --------
+# ЗАЧЕМ. Ступени A–E предполагают, что внешний канал ОТВЕТИЛ. Замер 01.09 говорит обратное: из
+# 16 заходов в Manus ответом кончились 2. До ступени F такой заход умирал на месте — вердикт
+# ложился файлом в лоток, пакет оставался в docs/review_outbox, и БОЛЬШЕ НЕ ПРОИСХОДИЛО НИЧЕГО.
+# Повтор существовал только на слое поводов (review_auto: 2 захода, час паузы) и о ПРИЧИНЕ отказа
+# не знал вовсе: свой дефект формата и чужой пятисотый тратили один и тот же заход.
+#
+# ОДНО ЗВЕНО: у не доехавшего пакета появляется очередь — счётчик попыток, время следующей и
+# названный исход, когда попытки кончились. Развилка стои́т на ПРОИСХОЖДЕНИИ отказа и на деньгах:
+# 5xx/408/429/обрыв/таймаут — их, повторяем ОТПРАВКОЙ; оплаченный заход без ответа — повторяем
+# только ЗАБОРОМ по идентификатору задачи (новых заходов ноль); 4xx по формату, отсутствие ключа
+# и стража исходящего — НАШЕ, повтору не подлежит ни одной веткой.
+#
+# ЧИСЛА И ПОЧЕМУ ОНИ ТАКИЕ. Предел 3 попытки (одна отправка + два повтора); паузы отправки 300 и
+# 900 с, забора — 600 и 1800 с. Окно забора шире, потому что перекрывает замеренные полчаса
+# нетерминального состояния задачи Manus (76b4447). Оба окна обязаны уместиться ВНУТРИ часа
+# review_auto.RETRY_AFTER_SEC: 3000 и 2400 против 3600. Иначе повтор слоя поводов начнётся раньше,
+# чем кончится наш, и один пакет уедет дважды.
+#
+# ИСЧЕРПАНИЕ — ЭТО «НЕИЗВЕСТНО», А НЕ «ГОТОВО», и молчание канала обязано быть ВИДНО: строка
+# «канал лежал, пакет не доехал» уезжает в ту же тему Аудит, что и находки ступени D. Без неё
+# лёгший канал и молчаливый ревьюер выглядят для владельца ОДИНАКОВО — пустой темой.
+#
+# ЧЕГО СТУПЕНЬ НЕ ДЕЛАЕТ: не ставит задач, очередь ПК не трогает ВОВСЕ (ни чтением, ни записью),
+# не удаляет ни пакетов, ни файлов лотка, секретов не читает (ключ берёт сам отправщик в своём
+# процессе). Операционного состояния не меняет ни одной веткой.
+#
+# ОТКАТ: стоп-файл `pc_orchestrator.review_outbox.off` (со следующего тика, без рестарта), либо
+# `REVIEW_OUTBOX=0`. Повторы отдельно: `REVIEW_OUTBOX_RETRY=0` оставляет очередь и показ, но не
+# делает ни одного захода наружу.
+REVIEW_OUTBOX_MIN_SEC = float(os.getenv("REVIEW_OUTBOX_MIN_SEC", "600") or "600")  # пол паузы, с
+REVIEW_OUTBOX_TICK_FILE = _state(os.path.join(REPO, "pc_orchestrator.review_outbox_tick.json"))
+REVIEW_OUTBOX_STATE_FILE = _state(os.path.join(REPO, "review_outbox_queue_state.json"))
+
+
+def _review_outbox_root():
+    """Корень очереди исходящих. Под тестом — temp, в бою — REPO (тот же класс `_state`)."""
+    return os.path.dirname(REVIEW_OUTBOX_STATE_FILE) or REPO
+
+
+def _review_outbox_on():
+    """Ступень F включена? Дефолт — ВКЛЮЧЕНО; рубильники те же два, что у соседних ступеней."""
+    if (os.environ.get("REVIEW_OUTBOX") or "").strip() == "0":
+        return False
+    if _flag_forced_off("REVIEW_OUTBOX"):
+        log.warning("ступень F ревью-контура ВЫКЛЮЧЕНА стоп-файлом %s (снять: удалить файл)",
+                    os.path.basename(_flag_off_file("REVIEW_OUTBOX")))
+        return False
+    return True
+
+
+def _review_outbox_read_tick(path=None):
+    try:
+        with open(path or REVIEW_OUTBOX_TICK_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _review_outbox_write_tick(now, path=None):
+    p = path or REVIEW_OUTBOX_TICK_FILE
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"ts": float(now)}, f)
+    except Exception as e:
+        log.warning("ступень F: метка оборота не записана: %s", e)
+
+
+def maybe_review_outbox(now=None, tick_path=None, state_path=None, runner=None):
+    """Один оборот очереди исходящих за тик, с троттлингом по МЕТКЕ НА ДИСКЕ. → отчёт | None.
+
+    Повтор за оборот РОВНО ОДИН: демон исполняет всё синхронно внутри витка, и три подряд
+    упёршихся в бюджет захода съели бы порог тишины О2 (20 минут) целиком.
+    """
+    if not _review_outbox_on():
+        return None
+    now = time.time() if now is None else now
+    st = _review_outbox_read_tick(tick_path)
+    prev = st.get("ts")
+    if prev is not None:
+        try:
+            if (now - float(prev)) < REVIEW_OUTBOX_MIN_SEC:
+                return None
+        except Exception:
+            pass
+    _review_outbox_write_tick(now, tick_path)
+    try:
+        import review_outbox_queue_run
+        report = (runner or review_outbox_queue_run.tick)(
+            root=_review_outbox_root(), state_path=state_path or REVIEW_OUTBOX_STATE_FILE,
+            send=True, retry=(os.environ.get("REVIEW_OUTBOX_RETRY") or "").strip() != "0",
+            write_journal=True,
+        )
+    except Exception as e:
+        log.warning("ступень F: оборот упал (fail-safe, метка уже сдвинута — следующая попытка "
+                    "через паузу): %s", e)
+        return None
+    if not report.get("line"):
+        log.debug("ступень F: %s", "оборот без новостей")
+        return report
+    log.info("ступень F: взято %d, повторено %d, исчерпано %d, в очереди %d",
+             len(report.get("added") or []), len(report.get("retried") or []),
+             len(report.get("exhausted") or []), int(report.get("queued") or 0))
+    _cowork(review_outbox_queue_run.line(report) or "ступень F: оборот без строки исхода")
+    return report
+
+
 # ------------------- РЕВИЗОР: МАРШРУТИЗАЦИЯ НАХОДОК (шаг 4/7 родителя 262) -----
 # revizor_tick собрал пакеты активных окон (шаг 2), _revizor_consult судит окно думателем (шаг 3).
 # Здесь — РАЗВОДКА находок по каналам (сам ревизор НИЧЕГО не правит и клиентам НЕ пишет):
@@ -10340,6 +10455,7 @@ def _main_loop():
             maybe_review_intake()     # ступень B: находки ответа → ЗАЯВКИ очереди (троттлинг REVIEW_INTAKE_MIN_SEC)
             maybe_review_audit()      # ступень D: высокие находки + суточная сводка → тема Аудит (AUDIT_TOPIC)
             maybe_recon_auto()        # ступень E: поводы полосы → разведочные автозадачи (троттлинг RECON_AUTO_MIN_SEC)
+            maybe_review_outbox()     # ступень F: не доехавший пакет → очередь исходящих с повтором (REVIEW_OUTBOX_MIN_SEC)
             maybe_lesson_commit_retry()  # пакет «полнота лога» п.6: докоммитить урок из спула (провал коммита ≠ вечная грязь)
             maybe_git_ff_pull()       # родитель #221: подтянуть origin/main ff-only ДО реконсиляции/self-update (тот же тик применит)
             maybe_reconcile_children()  # класс-фикс c6d8a30: применить свежий код детей на ЛЮБОЙ новый коммит

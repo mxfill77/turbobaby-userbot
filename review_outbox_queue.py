@@ -1,0 +1,505 @@
+# -*- coding: utf-8 -*-
+"""Очередь исходящих ревью-контура: пакет переживает отказ внешнего канала.
+
+ЗАЧЕМ. Ступени 1–2 довели пакет до канала, A — до автоматической отправки,
+B/C/D/E — до заявки, судьи, показа и разбора. Все они предполагают, что канал
+ОТВЕТИЛ. Живой замер 01.09 показывает, что это не так: из 16 заходов в Manus
+ответом кончились 2, отказом 13, «неизвестно» 3 (один пакет успел и то и
+другое). До этой ступени такой заход умирал на месте: вердикт ложился файлом в
+лоток, пакет оставался в ``docs/review_outbox`` — и БОЛЬШЕ НЕ ПРОИСХОДИЛО
+НИЧЕГО. Повтор существовал только на слое поводов (``review_auto``,
+``MAX_ATTEMPTS=2``, ``RETRY_AFTER_SEC=3600``) и о ПРИЧИНЕ отказа не знал вовсе:
+свой дефект формата и чужой пятисотый тратили один и тот же из двух заходов.
+
+Эта ступень добавляет ровно одно звено и ни одного звена больше: у не доехавшего
+пакета появляется ОЧЕРЕДЬ ИСХОДЯЩИХ — счётчик попыток, время следующей и
+названный исход, когда попытки кончились.
+
+ГЛАВНОЕ РАЗЛИЧЕНИЕ — ПРОИСХОЖДЕНИЕ ОТКАЗА (:func:`origin`). Оно не украшение
+отчёта, а развилка поведения, и стоит на деньгах:
+
+* ``external`` — канал лёг: обрыв ДО приёма, таймаут, 5xx, 408, 429. Наружу либо
+  не ушло ничего, либо ушло и было отвергнуто самим каналом. Повтор ОТПРАВКОЙ
+  безопасен и осмыслен: второй заход не покупает второй ответ, он покупает
+  первый.
+* ``spent`` — заход СОСТОЯЛСЯ и ОПЛАЧЕН, а ответа мы не видим: обрыв ПОСЛЕ
+  отправки, код без текста, принятая задача без ответа. Повторная ОТПРАВКА здесь
+  запрещена — она купила бы вторую работу за те же вопросы. Законный повтор один:
+  ЗАБОР по идентификатору задачи (``review_send_run --manus-task``), и он стоит
+  ноль новых заходов. Идентификатора нет — повтора нет вовсе, исход «неизвестно».
+  Это дословно правило «расписка ≠ судьба» ступени 2, доведённое до действия.
+* ``ours`` — наш дефект: 4xx по формату (в живом корпусе 01.09 их 10 из 14 —
+  пакет длиннее потолка канала), нет ключа, стража исходящего, наш диск. Повтор
+  не подлежит НИ ОДНОЙ веткой: он воспроизвёл бы ту же ошибку с той же ценой.
+  Чинить надо пакет, а не канал.
+* ``channel_answered`` — канал ответил, но ответ негоден (пуст, короче пола, сам
+  объявлен обрезанным). Это предмет ступени 2 и человека, читающего лоток, а не
+  транспорта. Повтора нет.
+
+Незнакомая причина попадает в ``ours``, то есть в «повтора нет». Направление
+выбрано сознательно: неизвестный отказ, повторённый три раза, — это три оплаты
+вслепую, а неизвестный отказ, названный вслух, — одна строка владельцу.
+
+ЧИСЛА (их спрашивает задание, и они не назначены, а выведены из соседей).
+
+* Повтор ОТПРАВКОЙ: паузы 300 и 900 с, предел 3 попытки (одна отправка и два
+  повтора). Окно пауз 1200 с; худший заход упирается в сокет-таймаут отправщика
+  ``DEFAULT_TIMEOUT=900`` дважды, итого 3000 с.
+* Повтор ЗАБОРОМ: паузы 600 и 1800 с, тот же предел 3. Окно 2400 с. Оно шире,
+  потому что мерит другое: живой замер 01.09 (коммит 76b4447) поймал задачу
+  Manus, просидевшую в нетерминальном состоянии ПОЛЧАСА с уже готовым ответом.
+  Окно короче 30 минут объявляло бы такой ответ потерянным.
+* Оба окна обязаны уместиться ВНУТРИ часа ``review_auto.RETRY_AFTER_SEC=3600``:
+  иначе повтор слоя поводов начнётся раньше, чем кончится наш, и один пакет уедет
+  дважды. 3000 < 3600 и 2400 < 3600 — запас 600 и 1200 с. Это не совпадение, а
+  условие, которому подчинены сами паузы.
+
+ЧЕГО ЭТОТ МОДУЛЬ НЕ ДЕЛАЕТ. Ни одна ветка не превращает исчерпанные попытки в
+«готово»: исход исчерпания — РОВНО ``unknown`` с названной причиной. Ни одна
+ветка не удаляет пакет из лотка. Ни одна не ставит задач и не трогает
+операционного состояния. Модуль ЧИСТЫЙ: часов не читает, диска не касается,
+сети не знает — всё это работа рук (``review_outbox_queue_run.py``).
+"""
+
+from __future__ import annotations
+
+import datetime
+import hashlib
+import json
+import re
+
+SCHEMA = "turbobaby.review_outbox_queue/v1"
+
+# ───────────────────────────── числа ─────────────────────────────
+
+# Паузы ПЕРЕД повтором отправки, секунды. Предел попыток выводится ИЗ длины
+# кортежа и отдельной константой не живёт: две ручки, которые обязаны совпадать,
+# рано или поздно расходятся, и расхождение молчаливо.
+RESEND_PAUSES_SEC = (300, 900)
+# Паузы перед повтором ЗАБОРА: шире, потому что перекрывают замеренные полчаса
+# нетерминального состояния задачи Manus.
+REFETCH_PAUSES_SEC = (600, 1800)
+
+MAX_ATTEMPTS = len(RESEND_PAUSES_SEC) + 1          # 3 = одна отправка + два повтора
+
+# Потолок слоя поводов, внутрь которого обязаны уместиться наши окна. Литерал, а
+# не импорт: ``review_auto`` тянет за собой лоток и разбор ответов, а этому
+# модулю нужно одно число. Сверку литерала с живой константой держит регресс
+# (``test_windows_fit_inside_review_auto_hour``) — расхождение уронит тест, а не
+# прод.
+REVIEW_AUTO_RETRY_AFTER_SEC = 3600
+# Сокет-таймаут отправщика: столько может стоить ОДИН заход, упёршийся в мёртвый
+# сокет. Тот же литерал и тот же замок (``review_send_run.DEFAULT_TIMEOUT``).
+SEND_TIMEOUT_SEC = 900
+
+ORIGINS = ("external", "spent", "ours", "channel_answered")
+KINDS = ("resend", "refetch", "none")
+STATES = ("queued", "exhausted", "closed")
+
+# ───────────────────────────── происхождение отказа ─────────────────────────────
+
+# Обрыв ДО приёма и снятие по времени: наружу либо не ушло, либо канал не
+# ответил вовсе. Повтор отправкой безопасен.
+_EXTERNAL = {
+    "channel_unreachable": "адрес канала недоступен — наружу не ушло ничего",
+    "timeout": "канал не уложился в бюджет времени и был снят",
+    "channel_error": "канал упал у себя (код возврата ≠ 0)",
+}
+# Заход состоялся и оплачен, ответа не видно.
+_SPENT = {
+    "answer_lost": "запрос ушёл, ответ не дошёл",
+    "no_status": "код ответа не известен",
+    "no_returncode": "код возврата не известен",
+    "accepted_no_answer": "канал принял задачу, ответа в теле нет",
+    "empty_body": "код успеха без текста и без идентификатора задачи",
+}
+# Наш дефект: чинить пакет/настройку, а не канал.
+_OURS = {
+    "no_credentials": "ключ канала не задан в окружении",
+    "outbound_guard": "страж исходящего задержал пакет",
+    "answer_unreadable": "файл ответа не прочитан у нас",
+    "no_last_message": "код 0, но файла ответа канал не оставил",
+}
+# Канал ответил, ответ негоден по форме.
+_ANSWERED = {
+    "empty_answer": "канал вернул пустой ответ",
+    "answer_too_short": "ответ короче пола осмысленности",
+    "truncated_answer": "канал сам объявил обрыв ответа",
+}
+
+# Коды 4xx, которые НЕ про формат запроса, а про состояние канала: перегрузка и
+# его собственный таймаут. Всё остальное 4xx — наша вина по построению.
+_EXTERNAL_4XX = (408, 425, 429)
+
+_RE_HTTP = re.compile(r"^http_(\d{3})$")
+
+
+class ReviewOutboxError(ValueError):
+    """Вход недействителен. Причина — первым полем, ради разбора вызывающим."""
+
+    def __init__(self, reason, detail=""):
+        super().__init__("%s: %s" % (reason, detail) if detail else reason)
+        self.reason = reason
+        self.detail = detail
+
+
+def origin(reason):
+    """Причина отказа → происхождение и человеческое «почему». → (origin, why).
+
+    Единственная развилка поведения всей ступени. Незнакомая причина уезжает в
+    ``ours`` — то есть в «повтора нет»: fail-closed здесь означает не «потеряем
+    ответ», а «не купим вслепую второй заход».
+    """
+    reason = (reason or "").strip()
+    if not reason:
+        return "ours", "причина отказа не названа вовсе — повторять вслепую нельзя"
+    if reason == "ok":
+        raise ReviewOutboxError("not_a_failure", "reason=ok — это ответ, а не отказ")
+    if reason in _EXTERNAL:
+        return "external", _EXTERNAL[reason]
+    if reason in _SPENT:
+        return "spent", _SPENT[reason]
+    if reason in _OURS:
+        return "ours", _OURS[reason]
+    if reason in _ANSWERED:
+        return "channel_answered", _ANSWERED[reason]
+    m = _RE_HTTP.match(reason)
+    if m:
+        code = int(m.group(1))
+        if code >= 500:
+            return "external", "канал ответил кодом %d — сбой на его стороне" % code
+        if code in _EXTERNAL_4XX:
+            return "external", "канал ответил кодом %d — перегрузка либо его таймаут" % code
+        if code >= 400:
+            return "ours", (
+                "канал ответил кодом %d — запрос не по формату (размер, ключ, адрес); "
+                "повтор воспроизвёл бы ту же ошибку" % code
+            )
+    return "ours", "причина %r этому слою не знакома — повтор запрещён fail-closed" % reason
+
+
+def retry_kind(org, task_id=None):
+    """Происхождение (+ идентификатор задачи) → чем повторять. → (kind, why).
+
+    ``spent`` без идентификатора — единственное место, где «повтора нет» стоит НЕ
+    на нашем выборе, а на нехватке факта: работа оплачена, добрать её нечем.
+    """
+    if org not in ORIGINS:
+        raise ReviewOutboxError("invalid_origin", "origin=%r not in %r" % (org, list(ORIGINS)))
+    if org == "external":
+        return "resend", "канал лёг — повторяем ОТПРАВКОЙ"
+    if org == "spent":
+        if task_id:
+            return "refetch", "заход оплачен — повторяем ЗАБОРОМ задачи %s, новых заходов ноль" % task_id
+        return "none", (
+            "заход оплачен, а идентификатора задачи нет — забрать нечем, "
+            "а повторная отправка купила бы вторую работу"
+        )
+    if org == "ours":
+        return "none", "дефект наш — повтор воспроизвёл бы его"
+    return "none", "канал ответил — предмет разбора, а не транспорта"
+
+
+def pauses_for(kind):
+    """Кортеж пауз для вида повтора. → tuple[int]."""
+    if kind == "resend":
+        return RESEND_PAUSES_SEC
+    if kind == "refetch":
+        return REFETCH_PAUSES_SEC
+    if kind == "none":
+        return ()
+    raise ReviewOutboxError("invalid_kind", "kind=%r not in %r" % (kind, list(KINDS)))
+
+
+def pause_sec(kind, next_attempt):
+    """Пауза перед попыткой номер ``next_attempt`` (2..MAX). → int секунд | None.
+
+    ``None`` — попытки этого вида кончились. Отдельного «нуля» здесь нет
+    сознательно: ноль читался бы как «повторяй немедленно».
+    """
+    ps = pauses_for(kind)
+    idx = int(next_attempt) - 2
+    if idx < 0:
+        raise ReviewOutboxError("invalid_attempt", "next_attempt=%r < 2" % (next_attempt,))
+    if idx >= len(ps):
+        return None
+    return int(ps[idx])
+
+
+# ───────────────────────────── время ─────────────────────────────
+
+
+def _utc(dt):
+    if not isinstance(dt, datetime.datetime):
+        raise ReviewOutboxError("invalid_time", "нужен datetime, получено %r" % type(dt).__name__)
+    if dt.tzinfo is None:
+        raise ReviewOutboxError("naive_time", "время без часового пояса этому слою не годится")
+    return dt.astimezone(datetime.timezone.utc)
+
+
+def iso(dt):
+    """datetime → ISO-8601 в UTC. Единственная форма времени в записи."""
+    return _utc(dt).isoformat()
+
+
+def parse_iso(text):
+    """ISO-8601 → datetime UTC. → datetime | None (None = штампа нет или он битый)."""
+    if not text or not isinstance(text, str):
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(datetime.timezone.utc)
+
+
+# ───────────────────────────── запись очереди ─────────────────────────────
+
+
+def key(pack, channel):
+    """Ключ записи: ПАКЕТ и КАНАЛ вместе. → str.
+
+    Не пакет один: один пакет уезжает в оба канала, и Codex, ответивший на него,
+    ничего не говорит про молчащий Manus. Не канал один: тогда второй не доехавший
+    пакет затёр бы первый.
+    """
+    pack = (pack or "").strip()
+    channel = (channel or "").strip()
+    if not pack or not channel:
+        raise ReviewOutboxError("invalid_key", "нужны и пакет, и канал (pack=%r channel=%r)" % (pack, channel))
+    return "%s|%s" % (channel, pack.rsplit("/", 1)[-1])
+
+
+def _digest(rec):
+    body = {k: v for k, v in rec.items() if k != "sha256"}
+    return hashlib.sha256(
+        json.dumps(body, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
+
+
+def new_record(*, pack, channel, send_date, reason, at, task_id=None, pack_sha256=None, answer_rel=None):
+    """Первый неудачный заход → запись очереди исходящих. → dict.
+
+    ``attempts`` здесь уже ЕДИНИЦА: первая отправка состоялась, и звать её нулём
+    значило бы дать пакету на повтор одну лишнюю жизнь. Это тот же инвариант, что
+    у ступени A («заход считается ДО сети»), только считаем мы уже случившееся.
+    """
+    org, why = origin(reason)
+    kind, kind_why = retry_kind(org, task_id)
+    at = _utc(at)
+    rec = {
+        "schema": SCHEMA,
+        "key": key(pack, channel),
+        "pack": pack,
+        "pack_sha256": pack_sha256,
+        "channel": channel,
+        "send_date": send_date,
+        "task_id": task_id or None,
+        "answer_rel": answer_rel,
+        "attempts": 1,
+        "max_attempts": MAX_ATTEMPTS,
+        "origin": org,
+        "origin_why": why,
+        "kind": kind,
+        "kind_why": kind_why,
+        "reason": reason,
+        "first_at": iso(at),
+        "last_at": iso(at),
+        "next_at": None,
+        "state": "queued",
+        "history": [{"at": iso(at), "reason": reason, "origin": org}],
+    }
+    _schedule(rec, at)
+    rec["sha256"] = _digest(rec)
+    return rec
+
+
+def _schedule(rec, at):
+    """Проставить время следующей попытки либо закрыть запись исчерпанием."""
+    nxt = int(rec["attempts"]) + 1
+    pause = None
+    if rec["kind"] != "none" and nxt <= MAX_ATTEMPTS:
+        pause = pause_sec(rec["kind"], nxt)
+    if pause is None:
+        rec["next_at"] = None
+        rec["state"] = "exhausted"
+    else:
+        rec["next_at"] = iso(at + datetime.timedelta(seconds=pause))
+        rec["state"] = "queued"
+    return rec
+
+
+def advance(rec, *, reason, at, task_id=None):
+    """Ещё один неудачный заход по уже стоящей записи. → новая запись (копия).
+
+    Запись НЕ переписывается на месте: вызывающий кладёт возвращённое в реестр
+    сам, и промежуточное состояние на диске не появляется ни на миг.
+
+    Происхождение пересматривается КАЖДЫЙ раз: канал, отвечавший 503, может на
+    втором заходе ответить 400 — и тогда повтор обязан прекратиться немедленно,
+    а не досидеть до предела на устаревшем вердикте.
+    """
+    at = _utc(at)
+    out = dict(rec)
+    out["history"] = list(rec.get("history") or [])
+    org, why = origin(reason)
+    tid = task_id or rec.get("task_id")
+    kind, kind_why = retry_kind(org, tid)
+    out["attempts"] = int(rec.get("attempts") or 0) + 1
+    out["task_id"] = tid or None
+    out["origin"], out["origin_why"] = org, why
+    out["kind"], out["kind_why"] = kind, kind_why
+    out["reason"] = reason
+    out["last_at"] = iso(at)
+    out["history"].append({"at": iso(at), "reason": reason, "origin": org})
+    out.pop("sha256", None)
+    _schedule(out, at)
+    out["sha256"] = _digest(out)
+    return out
+
+
+def close(rec, *, at, why="канал ответил"):
+    """Заход удался — запись уходит из очереди закрытой. → новая запись."""
+    out = dict(rec)
+    out["history"] = list(rec.get("history") or [])
+    out["state"] = "closed"
+    out["next_at"] = None
+    out["closed_at"] = iso(at)
+    out["closed_why"] = why
+    out.pop("sha256", None)
+    out["sha256"] = _digest(out)
+    return out
+
+
+def due(rec, now):
+    """Запись дозрела до повтора? → (bool, why).
+
+    Часов модуль не знает — момент называет вызывающий. Битый штамп времени даёт
+    «не дозрела» с названной причиной, а не немедленный повтор: неразобранное
+    время не повод тратить заход.
+    """
+    now = _utc(now)
+    if rec.get("state") != "queued":
+        return False, "запись в состоянии %r — повторов у неё больше нет" % rec.get("state")
+    if rec.get("kind") == "none":
+        return False, "повтор этой записи запрещён: %s" % (rec.get("kind_why") or "причина не названа")
+    if int(rec.get("attempts") or 0) >= MAX_ATTEMPTS:
+        return False, "попытки исчерпаны (%d из %d)" % (int(rec.get("attempts") or 0), MAX_ATTEMPTS)
+    nxt = parse_iso(rec.get("next_at"))
+    if nxt is None:
+        return False, "время следующей попытки не разобрано (%r)" % rec.get("next_at")
+    if now < nxt:
+        return False, "рано: до попытки %d ещё %d с" % (int(rec["attempts"]) + 1, int((nxt - now).total_seconds()))
+    return True, "попытка %d из %d, вид %s" % (int(rec["attempts"]) + 1, MAX_ATTEMPTS, rec.get("kind"))
+
+
+def outcome(rec):
+    """Исход записи для отчёта. → (outcome, title, why).
+
+    ИСЧЕРПАНИЕ ЭТО «НЕИЗВЕСТНО», И НИ ОДНА ВЕТКА НЕ ПИШЕТ ЗДЕСЬ «ГОТОВО». Пакет
+    цел, ответа нет, а сказать про ненаписанный ответ, что его не будет, слой не
+    вправе: канал мог принять работу и не отдать её.
+    """
+    state = rec.get("state")
+    if state == "closed":
+        return "answered", "ОТВЕТ ПОЛУЧЕН", rec.get("closed_why") or "канал ответил"
+    if state == "exhausted":
+        return "unknown", "НЕИЗВЕСТНО", (
+            "попыток %d из %d, последняя причина `%s` (%s); ответа нет, и «готово» здесь не пишется"
+            % (int(rec.get("attempts") or 0), MAX_ATTEMPTS, rec.get("reason"), rec.get("origin_why") or "—")
+        )
+    return "unknown", "НЕИЗВЕСТНО", "запись ещё в очереди: попытка %d из %d, следующая %s" % (
+        int(rec.get("attempts") or 0), MAX_ATTEMPTS, rec.get("next_at") or "—",
+    )
+
+
+# ───────────────────────────── строка в тему Аудит ─────────────────────────────
+
+# Заголовок сообщения. Он НЕ «НЕ ИСПОЛНЯТЬ: мнение внешнего канала» — чужого
+# текста здесь нет ни строки, это факт о нашей полосе. И он не задание: слово
+# «состояние» выбрано, чтобы сообщение не читалось как постановка.
+_HEAD_EXTERNAL = "СОСТОЯНИЕ КАНАЛА (не находка и не задание): КАНАЛ ЛЕЖАЛ, ПАКЕТ НЕ ДОЕХАЛ"
+_HEAD_OURS = "СОСТОЯНИЕ КАНАЛА (не находка и не задание): ПАКЕТ НЕ ДОЕХАЛ ПО НАШЕЙ ВИНЕ"
+
+_TAIL = (
+    "Молчание этой темы по такому пакету НЕ значит «ревьюер ничего не нашёл» — "
+    "значит «спросить не удалось»."
+)
+
+
+def audit_text(rec, *, queued_left=None):
+    """Исчерпанная запись → сообщение в тему Аудит. → str.
+
+    Ради чего ступень вообще нужна владельцу: без этой строки лёгший канал и
+    молчаливый ревьюер выглядят ОДИНАКОВО — пустой темой. Поэтому здесь названы
+    все три вещи, которых нет в пустой теме: что пакет цел, сколько было попыток
+    и чем именно кончилось.
+
+    Команду ручного повтора печатаем ДОСЛОВНО: сообщение обязано быть исполнимым
+    без нас — читающему не придётся вспоминать ключи отправщика.
+    """
+    org = rec.get("origin")
+    head = _HEAD_EXTERNAL if org in ("external", "spent") else _HEAD_OURS
+    _out, _title, why = outcome(rec)
+    lines = [
+        head,
+        "",
+        "канал: %s" % rec.get("channel"),
+        "пакет: %s" % rec.get("pack"),
+        "пакет ЦЕЛ и лежит в лотке — из очереди исходящих он не удаляется ни одной веткой",
+        "попыток: %d из %d, первая %s, последняя %s"
+        % (int(rec.get("attempts") or 0), MAX_ATTEMPTS, rec.get("first_at") or "—", rec.get("last_at") or "—"),
+        "причина: `%s` — %s (%s)" % (rec.get("reason"), rec.get("origin_why") or "—", org),
+        "повтор: %s" % (rec.get("kind_why") or "—"),
+        "исход: НЕИЗВЕСТНО — %s" % why,
+    ]
+    if rec.get("task_id"):
+        lines.append("задача канала: %s" % rec["task_id"])
+    if queued_left is not None:
+        lines.append("в очереди исходящих осталось записей: %d" % int(queued_left))
+    lines += [
+        "",
+        "повторить рукой:",
+        "  venv/Scripts/python.exe review_send_run.py --pack %s --channel %s"
+        % (rec.get("pack"), rec.get("channel")),
+        "",
+        _TAIL,
+    ]
+    return "\n".join(lines)
+
+
+def journal_line(report):
+    """Оборот очереди → строка-индекс в журнал. → str (пусто = писать нечего).
+
+    Пустая строка при пустом обороте — не пропуск, а правило журнала-индекса:
+    «повторять было нечего» это не новость, а 1440 таких новостей в сутки — шум,
+    в котором утонет настоящая.
+    """
+    added = len(report.get("added") or [])
+    retried = len(report.get("retried") or [])
+    ex = len(report.get("exhausted") or [])
+    closed = len(report.get("closed") or [])
+    if not (added or retried or ex or closed):
+        return ""
+    parts = []
+    if added:
+        parts.append("взято в очередь %d" % added)
+    if retried:
+        parts.append("повторено %d" % retried)
+    if closed:
+        parts.append("закрыто ответом %d" % closed)
+    if ex:
+        names = ", ".join(sorted({str(r.get("channel")) for r in report["exhausted"]}))
+        parts.append("исчерпано %d (каналы: %s) → НЕИЗВЕСТНО" % (ex, names or "—"))
+    tail = ""
+    if report.get("announced"):
+        tail = "; в тему Аудит ушло сообщений %d" % len(report["announced"])
+    elif ex and report.get("announce_why"):
+        tail = "; в тему Аудит НЕ ушло: %s" % report["announce_why"]
+    return "ревью-контур F (очередь исходящих): %s; в очереди %d%s" % (
+        ", ".join(parts),
+        int(report.get("queued") or 0),
+        tail,
+    )
