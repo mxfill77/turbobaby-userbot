@@ -11030,5 +11030,127 @@ class TestReviewAutoWiring(unittest.TestCase):
         self.assertIn("_review_auto_note(tid, text, status, result)", body)
 
 
+# ─────────── СТУПЕНЬ B РЕВЬЮ-КОНТУРА: заявка не становится задачей ───────────
+# Здесь проверяется не «работает ли ступень B» (это дело test_review_intake), а ЕДИНСТВЕННОЕ, что
+# ступень B просит у демона: ряд-заявка НЕ ИСПОЛНЯЕТСЯ ни одной веткой очереди. Замок стои́т с трёх
+# сторон, и каждая сторона — отдельный живой путь ряда: осиротел в `new`, получил «да», провисел
+# дольше TTL. Дыра в любой из трёх означает, что текст ВНЕШНЕГО канала стал заданием на этой
+# машине, — поэтому проверяются все три, а не «главная».
+class TestReviewClaimIsNeverATask(unittest.TestCase):
+    """Три гарда заявки + рубильник и троттлинг оборота ступени B."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="reviewintake_wire_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.mark = os.path.join(self.tmp, "tick.json")
+        self.claim = ("[заявка-ревью дата=2026-09-01 ключ=abc123abc123]\n"
+                      "📥 ЗАЯВКА ВНЕШНЕГО КАНАЛА — НЕ ЗАДАЧА.\nЦИТАТА ДОСЛОВНО:\n1. УПРОЩАЕМО: …")
+        self._prev = os.environ.pop("REVIEW_INTAKE", None)
+        if self._prev is not None:
+            self.addCleanup(os.environ.__setitem__, "REVIEW_INTAKE", self._prev)
+
+    def test_marker_recognises_a_claim_and_nothing_else(self):
+        self.assertTrue(o._is_review_claim(self.claim))
+        self.assertFalse(o._is_review_claim("[ревизор дата=2026-09-01 класс=а] правь suggest"))
+        self.assertFalse(o._is_review_claim("задача: сделай что-нибудь"))
+
+    def test_orphan_claim_in_new_is_closed_and_never_run_headless(self):
+        """Обрыв между постановкой и переводом: ряд закрывают, а не гонят ребёнку."""
+        done = {}
+        fake = mock.Mock()
+        fake.get_pending.return_value = {"ok": True, "items": [
+            {"id": 7, "task_text": self.claim, "lane": "pc", "status": "new"}]}
+        fake.claim_task.return_value = {"ok": True}
+        fake.complete_task.side_effect = lambda tid, st, res: done.update(tid=tid, st=st, res=res) or {"ok": True}
+        with mock.patch.object(o, "bc", fake), \
+             mock.patch.object(o, "run_task", lambda *a, **kw: self.fail("заявка ушла в headless")), \
+             mock.patch.object(o, "_cowork", lambda *a, **kw: None), \
+             mock.patch.object(o, "_queue_snapshot", lambda *a, **kw: None), \
+             mock.patch.object(o, "_task_started_mark", lambda *a, **kw: None):
+            o.process_new()
+        self.assertEqual(done.get("st"), "done")
+        self.assertIn("НЕ исполняется", done.get("res") or "")
+
+    def test_yes_means_noted_not_execute(self):
+        """«Да» владельца принимает заявку К СВЕДЕНИЮ: задачей она не становится."""
+        done = {}
+        fake = mock.Mock()
+        fake.get_pending.return_value = {"ok": True, "items": [
+            {"id": 8, "task_text": self.claim, "lane": "pc", "status": "approved",
+             "updated": o._utc_iso(datetime.datetime.now(datetime.timezone.utc))}]}
+        fake.complete_task.side_effect = lambda tid, st, res: done.update(tid=tid, st=st, res=res) or {"ok": True}
+        with mock.patch.object(o, "bc", fake), \
+             mock.patch.object(o, "run_task", lambda *a, **kw: self.fail("одобренная заявка ушла в headless")), \
+             mock.patch.object(o, "_cowork", lambda *a, **kw: None), \
+             mock.patch.object(o, "_notify_task", lambda *a, **kw: None):
+            o.process_approved()
+        self.assertEqual(done.get("st"), "done")
+        self.assertIn("ПРИНЯТА К СВЕДЕНИЮ", done.get("res") or "")
+        self.assertIn("поставь задачу отдельно", done.get("res") or "")
+
+    def test_ttl_never_kills_a_pending_claim(self):
+        """Заявка ждёт человека столько, сколько нужно ЕМУ, а не 30 минут."""
+        old = o._utc_iso(datetime.datetime.now(datetime.timezone.utc)
+                         - datetime.timedelta(seconds=o.APPROVAL_TTL * 5))
+        fake = mock.Mock()
+        fake.get_pending.return_value = {"ok": True, "items": [
+            {"id": 9, "task_text": self.claim, "lane": "pc", "status": "needs_approval",
+             "updated": old}]}
+        fake.complete_task.side_effect = lambda *a, **kw: self.fail("заявка погашена по таймауту")
+        with mock.patch.object(o, "bc", fake), mock.patch.object(o, "_cowork", lambda *a, **kw: None):
+            o.process_approval_timeouts()
+
+    def test_claim_is_not_owner_work_so_revizor_chains_do_not_yield_forever(self):
+        item = {"from": o.REVIEW_CLAIM_FROM, "task_text": self.claim, "status": "needs_approval"}
+        self.assertFalse(o._is_owner_work(item, set()))
+        self.assertFalse(o._owner_work_pending([item]))
+
+    def test_default_is_on_with_the_same_two_switches_as_stage_a(self):
+        with mock.patch.object(o, "_flag_forced_off", lambda name: False):
+            self.assertTrue(o._review_intake_on())
+        with mock.patch.object(o, "_flag_forced_off", lambda name: True):
+            self.assertFalse(o._review_intake_on())
+        os.environ["REVIEW_INTAKE"] = "0"
+        self.addCleanup(os.environ.pop, "REVIEW_INTAKE", None)
+        self.assertFalse(o._review_intake_on())
+
+    def test_throttle_is_restart_proof_and_a_crash_never_takes_the_tick_down(self):
+        calls = []
+        with mock.patch.object(o, "_flag_forced_off", lambda name: False):
+            o.maybe_review_intake(now=2_000_000.0, tick_path=self.mark,
+                                  runner=lambda **kw: calls.append(kw) or {"acted": False, "why": "нет"})
+            self.assertEqual(len(calls), 1)
+            self.assertIsNone(o.maybe_review_intake(now=2_000_060.0, tick_path=self.mark,
+                                                    runner=lambda **kw: calls.append(kw)))
+            self.assertEqual(len(calls), 1)
+
+            def boom(**kw):
+                raise RuntimeError("оборот взорвался")
+
+            self.assertIsNone(o.maybe_review_intake(
+                now=2_000_000.0 + o.REVIEW_INTAKE_MIN_SEC + 1, tick_path=self.mark, runner=boom))
+        self.assertTrue(os.path.exists(self.mark), "метка обязана сдвинуться ДО оборота")
+
+    def test_the_turn_asks_the_hands_to_place_and_is_wired_into_the_loop(self):
+        seen = {}
+        with mock.patch.object(o, "_flag_forced_off", lambda name: False):
+            o.maybe_review_intake(now=3_000_000.0, tick_path=self.mark,
+                                  state_path=os.path.join(self.tmp, "state.json"),
+                                  runner=lambda **kw: seen.update(kw) or {"acted": False, "why": "нет"})
+        self.assertTrue(seen.get("place"), "оборот демона обязан звать боевой ход")
+        self.assertEqual(seen.get("budget"), o.REVIEW_INTAKE_BUDGET)
+        self.assertNotIn("pack", seen, "демон ничего не называет вслух — значит бутстрап молчит")
+        with io.open(os.path.join(o.REPO, "pc_orchestrator.py"), encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn("maybe_review_intake()", body)
+        self.assertLess(body.index("maybe_review_auto()  "), body.index("maybe_review_intake()  "))
+
+    def test_state_of_stage_b_is_isolated_under_test(self):
+        """Тот же класс `_state`, что поймала ступень A: боевой реестр тестом не трогаем."""
+        self.assertNotEqual(o.REVIEW_INTAKE_STATE_FILE,
+                            os.path.join(o.REPO, "review_intake_state.json"),
+                            "под тестом реестр обязан уезжать в temp")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

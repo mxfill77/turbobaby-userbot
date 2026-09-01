@@ -3114,6 +3114,17 @@ def process_new():
         bc.complete_task(tid, "done", "🔍 ревизор: осиротевшая owner-карточка закрыта")
         _cowork(f"ревизор: осиротевшая owner-карточка #{tid} закрыта")
         return
+    if _is_review_claim(text):
+        # ЗАЯВКА внешнего канала (ступень B), осиротевшая на обрыве между постановкой и переводом
+        # в needs_approval. Закрываем — и НИКОГДА не гоним headless: текст заявки написан ВНЕШНИМ
+        # каналом, и отдать его ребёнку как задание значило бы исполнять чужие команды на этой
+        # машине. Штатно сюда не попадаем: ступень B ставит и переводит ряд синхронно.
+        bc.complete_task(tid, "done",
+                         "📥 осиротевшая заявка внешнего канала закрыта: заявка НЕ исполняется "
+                         "(её текст — чужое мнение, а не задание). Вернётся карточкой следующим "
+                         "оборотом ступени B, если находка ещё в лотке")
+        _cowork(f"ступень B: осиротевшая заявка #{tid} закрыта (не исполняем)")
+        return
     cmd = _match_command(text)                 # команда-рычаг? исполняем САМИ, без headless claude
     if cmd:
         status, result = _exec_command(cmd)
@@ -3325,6 +3336,18 @@ def process_approved():
             _cowork(f"ревизор: owner-карточка #{tid} принята (approve)")
             log.info("APPROVED id=%s ревизор-owner-карточка → принято", tid)
             continue
+        if _is_review_claim(task.get("task_text")):
+            # «Да» на ЗАЯВКЕ означает «ПРИНЯТО К СВЕДЕНИЮ», а не «выполняй». Заявка задачей не
+            # становится ни здесь, ни где-либо ещё: задачу по ней ставит человек ОТДЕЛЬНОЙ
+            # постановкой, своими словами. Автопревращение чужого текста в задание — ровно тот
+            # канал исполнения извне, ради закрытия которого ступень B и построена так.
+            bc.complete_task(tid, "done",
+                             "📥 заявка внешнего канала ПРИНЯТА К СВЕДЕНИЮ. Задачей она не стала "
+                             "и не станет: если находку надо исполнить — поставь задачу отдельно, "
+                             "своими словами")
+            _cowork(f"ступень B: заявка #{tid} принята к сведению (задачей НЕ стала)")
+            log.info("APPROVED id=%s заявка-ревью → принято к сведению (без прогона)", tid)
+            continue
         if (_age_sec(task.get("updated")) or 0) > APPROVAL_TTL:
             log.info("APPROVED id=%s истёк (>%ss) → failed", tid, APPROVAL_TTL)
             # ⏱ первым символом: для шага локальной цепи просрочка approve = halt без думателя
@@ -3396,6 +3419,12 @@ def process_approval_timeouts():
         tid = task.get("id")
         if _is_revizor_owner_card(task.get("task_text")):
             continue      # info-карточка ревизора живёт до решения человека — не гасим по таймауту
+        if _is_review_claim(task.get("task_text")):
+            # Заявка ступени B ждёт решения СТОЛЬКО, СКОЛЬКО НУЖНО ЧЕЛОВЕКУ. Погасить её по
+            # таймауту значило бы назвать «подтверждение не получено» отсутствие решения, которого
+            # никто и не обещал в 30 минут: у заявки нет исполнителя, который ждёт «да», — ждёт
+            # только сам вопрос.
+            continue
         if (_age_sec(task.get("updated")) or 0) > APPROVAL_TTL:
             log.info("NEEDS_APPROVAL id=%s таймаут (>%ss) → failed", tid, APPROVAL_TTL)
             # id=23 (22.08) прожила ровно этот путь: работа сдана, артефакт закоммичен, строка
@@ -5387,6 +5416,11 @@ def _is_owner_work(it, revizor_pids):
     txt = str(it.get("task_text") or "")
     if frm == REVIZOR_OWNER_FROM:
         return False                                   # info-карточка ревизора живёт до решения — не работа
+    if frm == REVIEW_CLAIM_FROM:
+        # Заявка внешнего канала (ступень B) — тоже не работа полосы, а ВОПРОС владельцу. Не
+        # внеси её сюда — ревизорские цепи уступали бы ей вечно: заявка живёт в needs_approval
+        # до решения человека, то есть «незакрытая owner-работа» не кончалась бы никогда.
+        return False
     if frm != PC_LOCAL_DEC_FROM:
         return True                                    # одиночка/дев-ТЗ/урок владельца на полосе pc
     if _is_revizor_parent_text(txt):
@@ -5842,7 +5876,12 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         # остаток: ветка живёт за флагом REVIEW_AUTO и не должна уметь глушить
                         # доставку правок демону своим незакоммиченным WIP.
                         "review_auto_run.py", "review_auto.py", "review_pack.py",
-                        "review_send.py", "review_send_run.py", "hq_context_pack.py")
+                        "review_send.py", "review_send_run.py", "hq_context_pack.py",
+                        # 01.09.2026: ступень B — куст за ленивым `import review_intake_run` в
+                        # `maybe_review_intake`. Свои зависимости у него те же (review_pack,
+                        # review_send) плюс `queue_snapshot_pc`, у которого он одалживает замок
+                        # флага при импорте демона; оба уже в остатке выше.
+                        "review_intake_run.py", "review_intake.py")
 # остаток: ленивые импорты вне ворот грязного дерева
 
 
@@ -8796,6 +8835,122 @@ def maybe_review_auto(now=None, tick_path=None, state_path=None, runner=None):
     return report
 
 
+# ------------------- СТУПЕНЬ B РЕВЬЮ-КОНТУРА (флаг REVIEW_INTAKE) -------------
+# ЗАЧЕМ. Ступень A довозит пакет до канала и кладёт ОТВЕТ файлом в лоток
+# `docs/review_inbox`. Дальше контур обрывался: находки внешнего ревьюера жили текстом, и
+# единственным способом что-то с ними сделать было прочитать файл глазами. Ступень B добавляет
+# ровно одно звено — находка становится ЗАЯВКОЙ в очереди — и НИ ОДНОГО звена больше.
+#
+# ЗАЯВКА — НЕ ЗАДАЧА, И ЭТО ДЕРЖИТСЯ КОДОМ, А НЕ ОБЕЩАНИЕМ. Ряд встаёт тем же механизмом, каким
+# ревизор ставит свою owner-карточку (`enqueue_pc_task` → `claim` → `set_needs_approval`), и с
+# первого мгновения ЖДЁТ ЧЕЛОВЕКА. Три гарда ниже держат его от исполнения с трёх сторон:
+#   • `process_new`   — осиротевшую заявку (обрыв между постановкой и переводом) ЗАКРЫВАЕТ,
+#                       а не гонит headless (иначе чужой текст стал бы заданием ребёнку);
+#   • `process_approved` — «да» владельца означает «ПРИНЯТО К СВЕДЕНИЮ», без прогона;
+#   • `process_approval_timeouts` — по таймауту НЕ гасим: заявка ждёт решения столько, сколько
+#                       нужно человеку (та же ветка, что у info-карточки ревизора).
+# Причина замка не в осторожности вообще: ответ канала приходит СВОБОДНЫМ ТЕКСТОМ ИЗВНЕ, и путь
+# «чужой текст → зелёная задача дирижёру» был бы каналом исполнения чужих команд на этой машине.
+#
+# ЦЕНА ОБОРОТА. Во внешние каналы заход НЕ ходит вовсе (ответ уже лежит файлом); самое дорогое —
+# один проход по отслеживаемому дереву ради проверки премис (697 файлов, замер 01.09) и два
+# чтения очереди ради дедупа. Поэтому пол паузы здесь вдвое больше, чем у ступени A.
+#
+# БУТСТРАП. Первый оборот backlog НЕ разгребает (тот же приём, что у `maybe_revizor`): на момент
+# рождения контура в лотке уже лежат ответы прошлых суток, и разложить их пачкой карточек значило
+# бы будить владельца за работу, давно им закрытую. Ключи корпуса при этом ложатся в реестр
+# СЛОВОМ «не ставили» — остаток назван, а не потерян.
+#
+# ОТКАТ: стоп-файл `pc_orchestrator.review_intake.off` (со следующего тика, без рестарта и без
+# правки `.env`) либо `REVIEW_INTAKE=0`.
+REVIEW_INTAKE_MIN_SEC = float(os.getenv("REVIEW_INTAKE_MIN_SEC", "600") or "600")   # пол паузы, с
+REVIEW_INTAKE_BUDGET = int(os.getenv("REVIEW_INTAKE_BUDGET", "3") or "3")           # заявок в сутки
+REVIEW_INTAKE_TICK_FILE = _state(os.path.join(REPO, "pc_orchestrator.review_intake_tick.json"))
+# И состояние, и корень записи — через `_state` (тот же класс, что поймала ступень A живьём:
+# ветка по умолчанию включена, и тест, зовущий живую функцию демона, писал бы в БОЕВОЙ реестр).
+REVIEW_INTAKE_STATE_FILE = _state(os.path.join(REPO, "review_intake_state.json"))
+REVIEW_CLAIM_MARK = "[заявка-ревью"          # маркер ряда-заявки (гарды опознают её ПО НЕМУ)
+REVIEW_CLAIM_FROM = "Filipp-review-claim"    # from ряда-заявки (НЕ дирижёрская цепь, НЕ ревизор)
+
+
+def _is_review_claim(text):
+    """task_text — ЗАЯВКА внешнего канала (не задача)? Маркер-гейт трёх гардов очереди."""
+    return str(text or "").startswith(REVIEW_CLAIM_MARK)
+
+
+def _review_intake_root():
+    """Корень, в котором ступень B держит реестр заявок. Под тестом — temp, в бою — REPO."""
+    return os.path.dirname(REVIEW_INTAKE_STATE_FILE) or REPO
+
+
+def _review_intake_on():
+    """Ступень B включена? Дефолт — ВКЛЮЧЕНО; рубильники те же два, что у ступени A, и по тем же
+    причинам (разбор — в `_review_auto_on` и `_flag_forced_off`)."""
+    if (os.environ.get("REVIEW_INTAKE") or "").strip() == "0":
+        return False
+    if _flag_forced_off("REVIEW_INTAKE"):
+        log.warning("ступень B ревью-контура ВЫКЛЮЧЕНА стоп-файлом %s (снять: удалить файл)",
+                    os.path.basename(_flag_off_file("REVIEW_INTAKE")))
+        return False
+    return True
+
+
+def _review_intake_read_tick(path=None):
+    try:
+        with open(path or REVIEW_INTAKE_TICK_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _review_intake_write_tick(now, path=None):
+    p = path or REVIEW_INTAKE_TICK_FILE
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"ts": float(now)}, f)
+    except Exception as e:
+        log.warning("ревью-контур B: метка оборота не записана: %s", e)
+
+
+def maybe_review_intake(now=None, tick_path=None, state_path=None, runner=None):
+    """Один оборот ступени B за тик, с троттлингом по МЕТКЕ НА ДИСКЕ. → отчёт | None.
+
+    None — ветка выключена или пол паузы не прошёл. Метку пишем ВСЕГДА, даже когда оборот ничего
+    не поставил: иначе «заявок нет» стоило бы полного прохода по дереву каждые 60 секунд.
+    """
+    if not _review_intake_on():
+        return None
+    now = time.time() if now is None else now
+    st = _review_intake_read_tick(tick_path)
+    prev = st.get("ts")
+    if prev is not None:
+        try:
+            if (now - float(prev)) < REVIEW_INTAKE_MIN_SEC:
+                return None
+        except Exception:
+            pass
+    _review_intake_write_tick(now, tick_path)
+    try:
+        import review_intake_run
+        report = (runner or review_intake_run.tick)(
+            root=_review_intake_root(), state_path=state_path or REVIEW_INTAKE_STATE_FILE,
+            budget=REVIEW_INTAKE_BUDGET, place=True, write_journal=True,
+        )
+    except Exception as e:
+        log.warning("ревью-контур B: оборот упал (fail-safe, метка уже сдвинута — следующая "
+                    "попытка через паузу): %s", e)
+        return None
+    if not report.get("acted"):
+        log.debug("ревью-контур B: %s", report.get("why") or "заявок нет")
+        return report
+    log.info("ревью-контур B: заявок поставлено %d, не встало %d, отложено %d",
+             len(report.get("placed") or []), len(report.get("failed") or []),
+             len(report.get("held") or []))
+    _cowork(report.get("line") or "ревью-контур B: оборот без строки исхода")
+    return report
+
+
 # ------------------- РЕВИЗОР: МАРШРУТИЗАЦИЯ НАХОДОК (шаг 4/7 родителя 262) -----
 # revizor_tick собрал пакеты активных окон (шаг 2), _revizor_consult судит окно думателем (шаг 3).
 # Здесь — РАЗВОДКА находок по каналам (сам ревизор НИЧЕГО не правит и клиентам НЕ пишет):
@@ -9829,6 +9984,7 @@ def _main_loop():
             maybe_session_watch()     # инцидент 29.07: немая сессия (жива, но не работает) → карточка в 328
             maybe_revizor()           # шаг 2/7 (262): ревизор диалогов за DIALOG_REVIZOR (троттлинг REVIZOR_HOURS)
             maybe_review_auto()       # ступень A: пакет второго мнения за REVIEW_AUTO (троттлинг REVIEW_AUTO_MIN_SEC)
+            maybe_review_intake()     # ступень B: находки ответа → ЗАЯВКИ очереди (троттлинг REVIEW_INTAKE_MIN_SEC)
             maybe_lesson_commit_retry()  # пакет «полнота лога» п.6: докоммитить урок из спула (провал коммита ≠ вечная грязь)
             maybe_git_ff_pull()       # родитель #221: подтянуть origin/main ff-only ДО реконсиляции/self-update (тот же тик применит)
             maybe_reconcile_children()  # класс-фикс c6d8a30: применить свежий код детей на ЛЮБОЙ новый коммит
