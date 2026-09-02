@@ -33,6 +33,12 @@
 
 - [x] Preserve existing project TODO history if a prior TODO file is present.
       → На момент начала repair прежнего `todo.md` в рабочем дереве не было; файл создан как новая acceptance-история.
+- [ ] Independently accept one H1→V0 fixture-only shadow-run by reading exactly the owner-allowlisted staging evidence and candidate files.
+- [ ] Verify declared paths/hashes, V0 `PROVEN/all_gates_passed`, no forbidden actions, and absence of H1 candidate/test execution without executing code.
+- [ ] Read only the registry-named canonical PC/VPS state sources, pulse and necessary latest journal records for a two-lane freshness check.
+- [ ] Stop at the first unreadable, stale or unconfirmed source; do not access queues, services, processes, schedules, secrets, Git, client data or live tables.
+- [ ] Read only the most recent accessible GPT chat and compare its proposed work with the current TurboBaby architecture and evidence gates.
+- [ ] Return an independent read-only assessment; do not send, retry, modify or authorize any GPT-side action.
 
 ---
 
@@ -185,12 +191,51 @@ Source: owner request to minimize Manus execution while retaining architecture a
 - [x] Copy exactly verified `hq_context_pack.py`, `test_hq_context_pack.py`, and `docs/artifacts/2026-08-31-h1-hq-context-pack-result.json` from disposable staging to `D:\turbobaby-bot` under owner approval.
 - [x] Verify source and destination SHA-256 equality, H1 unittest success in the working repository and absence of unintended changed product files.
       → Three destination hashes match staging; `python -m unittest test_hq_context_pack -v` returns 31 tests OK; git scope contains the three intended untracked H1 paths only.
-- [ ] Keep H1 as local verified code only after transfer; do not commit, push, restart, release or attach it to any live source without separate approval.
+- [x] Keep H1 as local verified code only after transfer; do not commit, push, restart, release or attach it to any live source without separate approval.
+      → Local commit completed under separate owner approval; no push/restart/release/live-source attachment performed.
 
 # H1 Approved Local Commit
 
-- [ ] Create exactly one local commit under owner approval with only `hq_context_pack.py`, `test_hq_context_pack.py`, `docs/artifacts/2026-08-31-h1-hq-context-pack-result.json`, and `todo.md`.
-- [ ] Verify the index contains no other tracked or untracked path before committing; no push, restart, release or external action is authorized.
+- [x] Create exactly one local commit under owner approval with only `hq_context_pack.py`, `test_hq_context_pack.py`, `docs/artifacts/2026-08-31-h1-hq-context-pack-result.json`, and `todo.md`.
+      → `6cbdd1553603fa89fbf8acb29e738bd1598a93b7` — `feat(hq): add verified fixture-only context pack`.
+- [x] Verify the index contains no other tracked or untracked path before committing; no push, restart, release or external action is authorized.
+      → Cached index was empty after commit; no active git/ssh remote command was found. This todo status update is intentionally uncommitted and needs a separate owner decision later.
+
+# Economic Build Mode — Post-H1 Route
+
+- [x] Perform a Git safety/private remote preflight and secret-surface review in read-only mode; request a separate owner decision before any remote creation, configuration or push.
+      → Redacted path-only scan completed; six tracked paths match secret-like patterns, values suppressed. Privacy and historical classification remain `UNKNOWN`; see `GIT_SAFETY_PRIVATE_REMOTE_PREFLIGHT_2026-08-31.md`.
+- [ ] Prepare V0 shadow content-product verifier as a separate code-green packet; it must preserve `reported → verified → released` and cannot change queue, runtime or external systems.
+- [ ] Run one H1-backed Claude HQ shadow case with existing safe artifacts and measure context size, unknowns, manual touches and next-prompt usefulness; no live source or client flow.
+- [ ] Define a minimal owner interaction loop: one goal/priority entry, exception/red-zone approvals and a concise evidence/status card; routine evidence handling remains deterministic.
+- [ ] Keep Claude HQ as planning/checking hub, Claude Code as primary builder, Manus as rare architect/independent verifier and ChatGPT/Codex as manual external reviewer only.
+- [ ] Do not start Telegram automation, V0 implementation or any client-contour change before the preceding gate is independently verified and separately approved.
+
+# Delegated-Autonomy Operating Mode
+
+- [ ] Perform low-risk read-only inspection, deterministic local evidence checks, documentation and bounded staging verification autonomously after a second self-check.
+- [ ] Request owner approval before secrets or session reads, access/connector changes, private remote creation/configuration/push, service restart, external sends, red-zone action, irreversible operation, scope expansion or any `UNKNOWN` that cannot be resolved read-only.
+- [ ] Group routine progress internally and return only material evidence, decision gates and exceptions to the owner; do not request confirmation for each ordinary read-only step.
+
+# Approved Git Historical Classification
+
+- [ ] Classify only the six owner-approved tracked paths and their reachable Git history using redacted metadata; never display, copy or persist complete credential values.
+- [ ] Stop immediately on any `real-secret`, `unknown`, path outside scope, read error or redaction failure; do not create, alter or query any remote after a stop.
+- [ ] Produce only a redacted evidence packet and ordered plan through V0; do not execute V0, private remote setup, Git config, commit, push, release, runtime or integration work.
+
+# Secret-like Literal Containment — suggest.py
+
+- [ ] Remove the potential hard-coded credential literal from tracked `suggest.py`; no value may be copied into a prompt, test, artifact or project document.
+- [ ] Resolve the key only through the existing runtime environment convention, falling back only to the variable name `OPENAI_API_KEY`; fail fast with a value-free error when absent.
+- [ ] Add or update a regression test that rejects hard-coded secret-like literals and covers absent-key fail-fast without using a real key.
+- [ ] Run only relevant local tests; do not call the provider, validate the key, rotate/revoke it, rewrite history, touch remote or push.
+- [ ] Independently verify the redacted diff, absence of the literal, runtime-only access, failure message and test evidence before any commit decision.
+
+# V0 Independent Read-only Acceptance
+
+- [ ] Inspect only local commit `93b0ed2` and the two declared V0 files: `content_product_verifier.py` and `test_content_product_verifier.py`.
+- [ ] Evaluate the V0 contract and static no-side-effect boundary without running code, reading other paths, secrets, history, remote or external systems.
+- [ ] Return only `ACCEPT|REJECT` with critical defects and evidence-boundary verdict; make no repository or runtime change.
 
 # GPT/Codex Shadow Pilot / C1
 
