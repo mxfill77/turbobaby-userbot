@@ -400,7 +400,7 @@ def part_goal(shtab, counted, today=""):
     return out
 
 
-def part_nums(counted, taken, day, external, awaiting):
+def part_nums(counted, taken, day, external, awaiting, box_stop=""):
     """ЧИСЛА: серия с ОПОРОЙ · ящик Штаба · внешний контур · карточки в ожидании.
 
     Серия едет ВМЕСТЕ С ОПОРОЙ намеренно: «серия 18» без «доказал судья 5» — ровно
@@ -420,6 +420,17 @@ def part_nums(counted, taken, day, external, awaiting):
     out.append("ящик Штаба за %s: взято %s из %d за сутки"
                % (day or "?", number(taken, "слепок очереди не прочитан"),
                   shtab_box.DAILY_BUDGET))
+    # СИГНАЛЬНАЯ ОСТАНОВКА ЯЩИКА — СТРОКОЙ, А НЕ ЧИСЛОМ. Она приходит готовой
+    # фразой из метки оборота демона (`vitrina_pc_run.read_box_stop`); витрина её
+    # НЕ СЧИТАЕТ и НЕ СОКРАЩАЕТ до слова «остановлен»: вся ценность здесь в том,
+    # ЧТО сработало, НА ЧЁМ стои́т числом и КАКУЮ строку владельцу вставить в узел,
+    # чтобы снять. Урезанная до статуса, она стала бы неотличима от «ящик пуст».
+    #
+    # МОЛЧИТ — ЗНАЧИТ МОЛЧИТ, и «остановки нет» витрина не утверждает: метки
+    # может не быть вовсе (демон не делал ни одного оборота ящика), а пустоту
+    # выдавать за здоровье — ровно тот класс, от которого весь этот модуль.
+    if str(box_stop or "").strip():
+        out.append(one_line(box_stop, TEXT_MAX))
     if external is None:
         out.append("внешний контур за сутки: %s" % number(None, "лоток не прочитан"))
     else:
@@ -466,7 +477,8 @@ def body(facts):
         "stuck": part_stuck(shtab, got.get("expects"), got.get("failed"), today),
         "goal": part_goal(shtab, got.get("series"), today),
         "nums": part_nums(got.get("series"), got.get("shtab_taken"), today,
-                          got.get("external"), got.get("awaiting")),
+                          got.get("external"), got.get("awaiting"),
+                          box_stop=got.get("box_stop") or ""),
         "axes": part_axes(got.get("axes"), got.get("closed_day"), got.get("axes_why") or ""),
         "owner": part_owner(got.get("waiting")),
     }

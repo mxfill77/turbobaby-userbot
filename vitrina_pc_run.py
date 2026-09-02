@@ -56,6 +56,9 @@ import vitrina_pc as vp
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_STATE = "vitrina_pc_state.json"
 CLAIM_FILE = "pc_orchestrator.task_started.json"
+# Метка оборота ящика Штаба: в ней же с 02.09 лежит ФРАЗА ЕГО ОСТАНОВКИ. Имя
+# зеркалит `pc_orchestrator.SHTAB_BOX_TICK_FILE`; равенство сторожит тест.
+BOX_TICK_FILE = "pc_orchestrator.shtab_box_tick.json"
 
 # Узел ПУЛЬСА в мозге: тот же текст витрины, чтобы Штаб видел состояние полосы, не
 # заходя в Telegram. Ключ свой; в чужие узлы витрина не пишет ни одной веткой.
@@ -141,6 +144,30 @@ def read_claims(root=HERE, named=None):
         if at is not None:
             out[str(tid)] = at
     return out
+
+
+def read_box_stop(root=HERE, named=None):
+    """Остановка ящика Штаба из МЕТКИ ОБОРОТА демона → фраза словами. → str.
+
+    ЧИТАЕМ ЧУЖОЙ ФАЙЛ, А НЕ СЧИТАЕМ ЗАНОВО, и это не лень, а цена. Сигналы А и Б
+    стоя́т на ЗАКРЫТЫХ рядах очереди, а чтение ``done`` — 26.8 с (замер
+    `queue_snapshot_pc`, 14.08). Витрина ходит каждые 10 минут; пересчитывай она
+    сигналы сама, это стоило бы полминуты на оборот и завело бы ВТОРОЕ мнение о
+    том, остановлен ли ящик, — расходящееся с первым молча.
+
+    Файла нет / поле не строка → ПУСТО, и пустота здесь честная: витрина не
+    утверждает «остановки нет», она просто не показывает строки. Судить о жизни
+    ящика по молчанию его метки нельзя ровно так же, как о жизни полосы — по
+    молчанию витрины (об этом её собственный подвал).
+    """
+    path = cdr._path(root, named or BOX_TICK_FILE)
+    try:
+        with io.open(path, encoding="utf-8") as fh:
+            got = json.load(fh)
+    except Exception:                              # noqa: BLE001 — метки нет = показывать нечего
+        return ""
+    stop = got.get("stop") if isinstance(got, dict) else None
+    return str(stop) if isinstance(stop, str) else ""
 
 
 def running_rows(snapshot, claims, now):
@@ -277,6 +304,7 @@ def collect(root=HERE, now=None, runner=None, inbox=None, day=None, shtab=None):
         "failed": failed_rows(snapshot, since),
         "series": counted,
         "shtab_taken": cd.shtab_taken(cdr.all_rows(snapshot), the_day),
+        "box_stop": read_box_stop(root),
         "external": external,
         "awaiting": None if waiting is None else len(waiting),
         "waiting": waiting,

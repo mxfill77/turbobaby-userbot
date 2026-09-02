@@ -6026,7 +6026,13 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         # то есть защищены строже остатка, а не слабее. (`result_ref` стои́т там
                         # же и по той же причине; ящик его больше не зовёт, канон адреса шага он
                         # держать не перестал.)
-                        "shtab_box_run.py", "shtab_box.py",
+                        #
+                        # 02.09.2026, СИГНАЛЬНАЯ ОСТАНОВКА: третий лист — `shtab_box_signals`.
+                        # Своих листьев он не приносит НИ ОДНОГО: `contour_digest` (слово судьи о
+                        # закрытии) стои́т строкой выше, `recon_auto` (ключ метки снятия) и
+                        # `shtab_box` — в остатке. Не внеси его сюда — self-update выкатил бы руки
+                        # ящика, зовущие модуль, которого на диске демона нет.
+                        "shtab_box_run.py", "shtab_box.py", "shtab_box_signals.py",
                         # 02.09.2026: ЖИВАЯ ВИТРИНА — куст за ленивым `import vitrina_pc_run` в
                         # `maybe_vitrina`. Своих новых листьев ровно ДВА: сама витрина и её руки.
                         # Всё прочее уже в остатке выше и повторять его здесь НЕЛЬЗЯ (список
@@ -9378,13 +9384,24 @@ def maybe_recon_auto(now=None, tick_path=None, state_path=None, runner=None):
 # одни сутки при потолке 2, потому что счёт шёл по одним открытым рядам и мерил одновременность).
 # Реестра на диске у ящика нет вовсе: его съел бы первый self-update, а их тут десятки в день.
 #
+# СИГНАЛЬНАЯ ОСТАНОВКА (02.09.2026, `shtab_box_signals`): СВЕРХ пяти замков, а не вместо них.
+# Ящик перестаёт брать не по счёту, а по исходу прошлых заданий — две подряд недоказанные ·
+# третий раз одна причина · карточка ждёт ответа владельца (+ суточный потолок показом). Первые
+# два снимаются ТОЛЬКО словом владельца: он кладёт в ТОТ ЖЕ узел-ящик строку
+# `[[ЯЩИК СНЯТЬ метка=<метка>]]`, которую фраза остановки печатает целиком — одно действие, без
+# правки кода, без рестарта и без захода на машину. Метка ИМЕННАЯ (считается от улики случая),
+# поэтому выключить сигнал навсегда одной строкой нельзя.
+#
 # ОТКАТ: стоп-файл `pc_orchestrator.shtab_box.off` (гасит ЦЕЛИКОМ со следующего тика, без
 # рестарта и без правки кода), либо `SHTAB_BOX=0`, либо `SHTAB_BOX_BUDGET=0` (ветка жива, но не
-# берёт ничего).
+# берёт ничего). ОТКАТ ОДНОЙ СИГНАЛЬНОЙ ВЕТКИ — слово владельца в узле; отката «сигналы вон, а
+# ящик работает» нарочно нет: остановка, которую гасит переменная среды, — это остановка,
+# которую однажды погасит застрявший `.env` (класс #194).
 SHTAB_BOX_MIN_SEC = float(os.getenv("SHTAB_BOX_MIN_SEC", "1800") or "1800")   # пол паузы, с
 SHTAB_BOX_BUDGET = int(os.getenv("SHTAB_BOX_BUDGET", "3") or "3")             # заданий в сутки
 SHTAB_BOX_LIMIT = int(os.getenv("SHTAB_BOX_LIMIT", "1") or "1")               # заданий за виток
 SHTAB_BOX_TICK_FILE = _state(os.path.join(REPO, "pc_orchestrator.shtab_box_tick.json"))
+SHTAB_BOX_MARKS_KEEP = 20          # меток остановки в метке оборота: индекс, а не архив
 
 
 def _shtab_box_root():
@@ -9412,13 +9429,65 @@ def _shtab_box_read_tick(path=None):
         return {}
 
 
-def _shtab_box_write_tick(now, path=None):
+def _shtab_box_write_tick(now, path=None, stop="", marks=(), said=()):
+    """Метка оборота ящика + ЕГО ОСТАНОВКА, в тот же файл и без второго реестра.
+
+    Полей стало четыре, и три новых нужны РАЗНЫМ читателям, а не одному:
+      • `stop`  — фраза остановки СЛОВАМИ; её показывает витрина, чтобы владелец
+        видел причину между оборотами ящика (он ходит раз в 30 минут);
+      • `marks` — метки сработавших сигналов, по ним витрина и отличает случай;
+      • `said`  — о чём УЖЕ доложено в журнал. Без неё одна остановка писала бы
+        строку каждые полчаса и превратила бы журнал в ленту.
+
+    ФАЙЛ ТОТ ЖЕ, И ЭТО ВАЖНО: у ящика нет и не будет своего реестра на диске (его
+    съел бы первый self-update). Потеря этой метки стоит ОДНОЙ повторной строки в
+    журнале — то есть шум, а не потерянный замок; дедуп задач по-прежнему живёт в
+    очереди, а не здесь.
+    """
     p = path or SHTAB_BOX_TICK_FILE
     try:
         with open(p, "w", encoding="utf-8") as f:
-            json.dump({"ts": float(now)}, f)
+            json.dump({"ts": float(now), "stop": str(stop or ""),
+                       "marks": [str(m) for m in (marks or ())][:SHTAB_BOX_MARKS_KEEP],
+                       "said": [str(m) for m in (said or ())][-SHTAB_BOX_MARKS_KEEP:]}, f,
+                      ensure_ascii=False)
     except Exception as e:
         log.warning("ящик Штаба: метка оборота не записана: %s", e)
+
+
+def _shtab_box_said(st):
+    """Метки, о которых уже доложено. Поле не список → ПУСТО, а не падение."""
+    got = (st or {}).get("said")
+    return [str(m) for m in got if isinstance(m, str)] if isinstance(got, list) else []
+
+
+def _shtab_box_announce(report, said_before, journal=None):
+    """Новая остановка → ОДНА строка в журнал; та же самая → молчим. → список меток.
+
+    ДОКЛАД ИДЁТ ПО МЕТКЕ СЛУЧАЯ, А НЕ ПО ФАКТУ ОСТАНОВКИ. Остановка живёт, пока
+    владелец не ответил (сигнал В) или не снял её словом (А и Б), — это часы и
+    сутки, а виток ящика 30 минут. Докладывай мы факт, одна карточка дала бы под
+    полсотни строк за ночь; докладываем СМЕНУ: новая метка — новая строка.
+
+    СНЯТАЯ ОСТАНОВКА ОЧИЩАЕТ ПАМЯТЬ ДОКЛАДА (пустой ответ): если тот же случай
+    повторится завтра, о нём обязаны сказать заново. Молчание про повторившуюся
+    поломку — это и есть та молчащая остановка, которую задание запрещает.
+    """
+    stop = str((report or {}).get("stop") or "")
+    if not stop:
+        return []
+    marks = [str(m) for m in ((report or {}).get("stop_marks") or ())]
+    fresh = [m for m in marks if m not in set(said_before or ())]
+    if fresh:
+        line = (report or {}).get("signal_journal") or ("ASK ЯЩИК ШТАБА: %s" % stop)
+        log.warning("ящик Штаба ОСТАНОВЛЕН СИГНАЛОМ: %s", stop)
+        try:
+            import shtab_box_run
+
+            (journal or shtab_box_run._journal)(line, repo=_shtab_box_root())
+        except Exception as e:                     # noqa: BLE001 — журнал не роняет контур
+            log.warning("ящик Штаба: строка остановки в журнал не ушла: %s", e)
+    return list(said_before or []) + fresh
 
 
 def maybe_shtab_box(now=None, tick_path=None, runner=None):
@@ -9435,6 +9504,7 @@ def maybe_shtab_box(now=None, tick_path=None, runner=None):
         return None
     now = time.time() if now is None else now
     st = _shtab_box_read_tick(tick_path)
+    said_before = _shtab_box_said(st)
     prev = st.get("ts")
     if prev is not None:
         try:
@@ -9442,7 +9512,11 @@ def maybe_shtab_box(now=None, tick_path=None, runner=None):
                 return None
         except Exception:
             pass
-    _shtab_box_write_tick(now, tick_path)
+    # Метку двигаем ДО оборота (прежнее поведение), но прежнюю остановку и память
+    # доклада сохраняем: упади оборот — витрина продолжит показывать последнее
+    # ИЗВЕСТНОЕ состояние, а не пустоту, которая читается как «остановки нет».
+    _shtab_box_write_tick(now, tick_path, stop=str(st.get("stop") or ""),
+                          marks=st.get("marks") or (), said=said_before)
     try:
         import shtab_box_run
         report = (runner or shtab_box_run.tick)(
@@ -9453,6 +9527,9 @@ def maybe_shtab_box(now=None, tick_path=None, runner=None):
         log.warning("ящик Штаба: оборот упал (fail-safe, метка уже сдвинута — следующая попытка "
                     "через паузу): %s", e)
         return None
+    said_now = _shtab_box_announce(report, said_before)
+    _shtab_box_write_tick(now, tick_path, stop=report.get("stop") or "",
+                          marks=report.get("stop_marks") or (), said=said_now)
     if not report.get("acted"):
         log.info("ящик Штаба: %s", report.get("why") or "брать нечего")
         return report

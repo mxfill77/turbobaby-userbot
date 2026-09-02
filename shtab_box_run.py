@@ -29,6 +29,15 @@
     ``process_new``, что и задача, присланная владельцем руками.
   • НЕ УДАЛЯЕТ И НЕ ТРОГАЕТ ПРОЦЕССОВ.
 
+СИГНАЛЬНАЯ ОСТАНОВКА (02.09.2026) СЧИТАЕТСЯ ЗДЕСЬ, А РЕШАЕТСЯ В :mod:`shtab_box_signals`.
+Руки приносят четыре корпуса фактов и ни одного вердикта: закрытые ряды очереди с
+маркером ящика (сигналы А и Б), открытые ряды в ``needs_approval`` (сигнал В),
+реестр вердиктов судьи закрытия (:func:`read_ledger`) и МЕТКИ СНЯТИЯ, вычитанные
+из того же узла-ящика. Ни одного нового чтения ветка не завела: закрытые ряды
+ящик уже читал ради суточного потолка, открытые — ради замка владельца, узел —
+ради самих заданий. Своё здесь ровно одно — реестр вердиктов, и это локальный
+JSON, а не поход в мост.
+
 СТОП-СЛОВО — ФАЙЛ, А НЕ ПЕРЕМЕННАЯ, и живёт оно здесь, потому что это диск:
 
     pc_orchestrator.shtab_box.off        (в корне репозитория)
@@ -52,6 +61,7 @@ import sys
 import recon_auto_run
 import review_intake
 import shtab_box
+import shtab_box_signals as sig
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -108,6 +118,37 @@ def stopped(root=HERE):
 
 
 # ───────────────────────────── узел-ящик ─────────────────────────────
+
+
+def read_ledger(root=HERE):
+    """Реестр вердиктов судьи закрытия → (записи, ok, причина).
+
+    ТРЕТИЙ ИСХОД НАЗВАН ОТДЕЛЬНЫМ ПРИЗНАКОМ, а не пустотой словаря, и это здесь
+    обязательно. :func:`done_judge_pc.read_ledger` на любой отказ отдаёт ``{}`` —
+    и сам об этом честно предупреждает: «пустой ответ НЕ означает „всё хорошо“,
+    он означает отсутствие доказательств». Пустой реестр у полосы, которая ещё
+    ничего не судила, и нечитаемый реестр — разные новости, а по длине словаря
+    они одинаковы. Различаем их ПОВТОРНЫМ вопросом к диску: файла нет вовсе —
+    честный ноль; файл есть, а записей нет — прибор отказал.
+
+    Своего разбора JSON здесь нет ни строки: реестр читает его владелец.
+    """
+    try:
+        import done_judge_pc
+
+        path = done_judge_pc.ledger_path(root)
+        rows = done_judge_pc.read_ledger(root)
+    except Exception as exc:                            # noqa: BLE001 — любой отказ = «неизвестно»
+        return {}, False, "реестр вердиктов не прочитан: %s" % str(exc)[:160]
+    if rows:
+        return rows, True, ""
+    try:
+        if not os.path.exists(path):
+            return {}, True, "реестра вердиктов ещё нет — судья не судил ни одной"
+    except Exception as exc:                            # noqa: BLE001
+        return {}, False, "реестр вердиктов не прочитан: %s" % str(exc)[:160]
+    return {}, False, ("файл реестра вердиктов есть, а записей в нём ноль — считаем это "
+                       "отказом чтения, а не честным нулём")
 
 
 def read_node(name=None, reader=None):
@@ -168,7 +209,8 @@ class Queue(recon_auto_run.Queue):
 # ───────────────────────────── сборка ─────────────────────────────
 
 
-def build(root=HERE, queue=None, clock=None, reader=None, node=None):
+def build(root=HERE, queue=None, clock=None, reader=None, node=None,
+          budget=shtab_box.DAILY_BUDGET, ledger=None):
     """Всё, что нужно для решения: ящик + очередь + маркеры. → dict.
 
     Ничего не ставит и никуда не пишет — этой же функцией живут ``--status`` и
@@ -193,7 +235,11 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None):
            "queue_ok": False, "queue_asked": False, "queue_why": "",
            "owner_busy": None, "owner_rows": [],
            "marks_ok": False, "marks_asked": False, "marks_why": "", "task_marks": [],
-           "rows": 0, "taken_today": None}
+           "rows": 0, "taken_today": None,
+           # СИГНАЛЬНАЯ ОСТАНОВКА: три состояния, как у маркеров суток, — посчитана ·
+           # не посчитана, потому что до неё не дошло · посчитана и говорит «не знаю».
+           "signals": [], "signals_asked": False, "signals_why": "", "released": [],
+           "judged_ok": False, "judged_why": "", "stop": ""}
 
     out["off"], out["off_why"] = stopped(root)
     if out["off"]:
@@ -242,6 +288,35 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None):
         out["task_marks"] = shtab_box.markers(all_rows)
         if out["marks_ok"]:
             out["taken_today"] = shtab_box.taken_today(all_rows, today)
+
+    # ── СИГНАЛЬНАЯ ОСТАНОВКА ──────────────────────────────────────────────────
+    # СЧИТАЕТСЯ РОВНО ТОГДА, КОГДА СПРАШИВАЛИ ЗАКРЫТЫЕ РЯДЫ, и это не экономия
+    # ради экономии, а тот же третий исход, что у маркеров суток. Не дошли до
+    # дорогого чтения `done` — значит либо очередь не прочитана, либо в ней
+    # работа владельца, либо принятых блоков нет вовсе; во всех трёх случаях
+    # ящик и так не возьмёт ничего, а рапорт «сигналы говорят НЕ ЗНАЮ» повесил
+    # бы на них чужую вину и приучил владельца не верить остановке.
+    #
+    # ДЫРЫ ЗДЕСЬ НЕТ, и это проверяемо: единственная ветка, которая СТАВИТ ряд,
+    # требует `queue_ok` и живого кандидата — то есть ровно тех условий, при
+    # которых `marks_asked` истинно. Сигналы не могут промолчать над задачей,
+    # которую взяли.
+    if not out["marks_asked"]:
+        out["signals_why"] = ("сигналы не считались — до них не дошло (%s)"
+                              % (closed_why or "дорогое чтение done не понадобилось"))
+    else:
+        out["signals_asked"] = True
+        judged, judged_ok, judged_why = (ledger or read_ledger)(root)
+        out["judged_ok"], out["judged_why"] = judged_ok, judged_why
+        out["released"] = sorted(sig.release_marks(text))
+        left = shtab_box.budget_left(out["task_marks"], today, budget, out["marks_ok"])
+        out["signals"] = sig.evaluate(
+            closed=sig.box_rows(closed_rows), open_rows=live_rows, judged=judged,
+            day=today, left=left, budget=budget, released=out["released"],
+            rows_ok=bool(closed_ok), open_ok=bool(ok), judged_ok=bool(judged_ok),
+            marks_ok=bool(out["marks_ok"]))
+        out["stop"] = sig.stop_words(out["signals"], node=out["node"])
+        out["signals_why"] = out["stop"] or "все сигналы молчат"
     out["queue"] = q
     return out
 
@@ -251,7 +326,7 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None):
 
 def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
          budget=shtab_box.DAILY_BUDGET, write_journal=False, clock=None, queue=None,
-         journal_fn=None, reader=None, node=None):
+         journal_fn=None, reader=None, node=None, ledger=None):
     """Один оборот ящика. → dict отчёта.
 
     ``place=False`` — сухой ход: узел прочитан, блоки разобраны, ворота посчитаны,
@@ -261,7 +336,8 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
     этой полосе десятки в день), а дедуп обязан пережить всё. Источник истины
     один — ЖИВАЯ ОЧЕРЕДЬ.
     """
-    data = build(root, queue=queue, clock=clock, reader=reader, node=node)
+    data = build(root, queue=queue, clock=clock, reader=reader, node=node, budget=budget,
+                 ledger=ledger)
     today = data["today"]
     report = {"acted": False, "why": "", "today": today, "stamp": data["stamp"],
               "node": data["node"], "blocks": len(data["blocks"]), "bad": data["bad"],
@@ -269,7 +345,11 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
               "off": data["off"], "node_ok": data["node_ok"],
               "queue_ok": data["queue_ok"], "marks_ok": data["marks_ok"],
               "owner_busy": data["owner_busy"], "owner_rows": data["owner_rows"],
-              "taken_today": data["taken_today"], "line": ""}
+              "taken_today": data["taken_today"], "line": "",
+              "stop": data["stop"], "signals": data["signals"],
+              "signals_asked": data["signals_asked"],
+              "stop_marks": sig.marks(data["signals"]),
+              "signal_journal": sig.journal_line(data["signals"], today)}
 
     if data["off"]:
         report["why"] = data["off_why"]
@@ -279,7 +359,8 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
     take, held = shtab_box.select(
         data["blocks"], task_marks=data["task_marks"], today=today, budget=budget,
         owner_busy=bool(data["owner_busy"]), limit=limit,
-        marks_ok=bool(data["marks_ok"]), node_ok=bool(data["node_ok"]))
+        marks_ok=bool(data["marks_ok"]), node_ok=bool(data["node_ok"]),
+        stop_words=data["stop"])
     report["held"] = [(k, why) for k, why in held]
     # Отказы РАЗБОРА докладываются наравне с отказами ворот: битый блок, о котором
     # не сказали, — это задание, молча пропавшее по дороге.
@@ -331,6 +412,19 @@ def _why(report, data):
     if data["owner_busy"]:
         return ("в очереди задача владельца (%s) — заданий Штаба не берём ни одного"
                 % ", ".join("#%s" % i for i in data["owner_rows"]))
+    # СИГНАЛЬНАЯ ОСТАНОВКА ГОВОРИТ РАНЬШЕ «ящик пуст» и раньше отказов ворот: она
+    # объясняет, почему ящик не возьмёт НИЧЕГО, даже когда брать есть что, — а
+    # причина «блоков 0» на остановленном ящике была бы правдой и обманом сразу.
+    #
+    # НО ПРЕЖНЮЮ НОВОСТЬ ОНА НЕ ВЫТЕСНЯЕТ, и это поймал набор ящика, а не глаз:
+    # непрочитанный корпус закрытых рядов даёт СРАЗУ ДВЕ новости — «день считаем
+    # исчерпанным» (прежний замок) и «определить сигнал нельзя» (новый). Скажи мы
+    # одну, владелец пошёл бы чинить не то. Порядок внутри строки — прежняя
+    # первой: она старше и её ищут глазами.
+    if data["stop"]:
+        if data["marks_asked"] and not data["marks_ok"]:
+            return "%s · %s" % (_marks_unread(data), data["stop"])
+        return data["stop"]
     if not data["blocks"]:
         return ("ящик пуст: блоков в узле %s нет%s"
                 % (data["node"], (", не разобрано %d" % len(data["bad"])) if data["bad"] else ""))
@@ -346,9 +440,19 @@ def _why(report, data):
     # Ровно тот класс, который ступень E назвала третьим состоянием: «не
     # спрашивали, потому что незачем».
     if data["marks_asked"] and not data["marks_ok"]:
-        return ("закрытые ряды очереди не прочитаны (%s) — сколько заданий Штаба взято сегодня, "
-                "НЕИЗВЕСТНО; день считаем исчерпанным и не берём ничего" % data["marks_why"])
+        return _marks_unread(data)
     return "блоков %d, взято 0, отложено %d" % (len(data["blocks"]), len(report["held"]))
+
+
+def _marks_unread(data):
+    """Прежняя новость о непрочитанном корпусе — ОДНОЙ строкой в одном месте.
+
+    Вынесена из :func:`_why` не для красоты: она нужна в ДВУХ ветках (одна сама по
+    себе, вторая рядом с фразой остановки), а два её экземпляра разъехались бы
+    молча — тот же класс, которым живёт весь этот куст.
+    """
+    return ("закрытые ряды очереди не прочитаны (%s) — сколько заданий Штаба взято сегодня, "
+            "НЕИЗВЕСТНО; день считаем исчерпанным и не берём ничего" % data["marks_why"])
 
 
 def _line(report):
@@ -405,6 +509,19 @@ def _render(report=None, data=None):
                         data["marks_why"] or "прочитаны"))
         lines.append(shtab_box.digest_line(data["taken_today"] or 0, data["today"],
                                            ok=data["marks_ok"], why=data["marks_why"]))
+        # ВСЕ ЧЕТЫРЕ СИГНАЛА В ОДНОМ МЕСТЕ, включая молчащие: перечень, из которого
+        # молчащие вычеркнуты, читается как «других сторожей нет».
+        if not data["signals_asked"]:
+            lines.append(data["signals_why"] or "сигналы: не считались")
+        else:
+            lines.append("сигналы (реестр вердиктов: %s%s):"
+                         % ("прочитан" if data["judged_ok"] else "НЕ ПРОЧИТАН",
+                            (", %s" % data["judged_why"]) if data["judged_why"] else ""))
+            for row in sig.all_words(data["signals"], data["today"]):
+                lines.append("  · %s" % row)
+            if data["released"]:
+                lines.append("  снято словом владельца: %s" % ", ".join(data["released"]))
+            lines.append("ОСТАНОВКА: %s" % (data["stop"] or "нет — ящик берёт как обычно"))
     if report is not None:
         lines.append("исход: %s" % (report.get("why") or "—"))
         for row in report.get("placed") or []:
@@ -451,7 +568,7 @@ def main(argv=None):
         print("блока с ключом %s в ящике сейчас нет" % args.show)
         return 0
     if args.status or not (args.dry or args.place):
-        data = build(HERE)
+        data = build(HERE, budget=args.budget)
         data.pop("queue", None)
         print(json.dumps(data, ensure_ascii=False, indent=2, default=str) if args.json
               else _render(None, data))
