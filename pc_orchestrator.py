@@ -6005,7 +6005,18 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         # (review_audit/review_audit_run — адрес темы сводок и дверь без каскада,
                         # review_intake, recon_auto — МЕТКИ читающих строк) уже в остатке выше:
                         # сводка читает чужие измерения и шлёт чужой дверью, своих не заводит.
-                        "contour_digest_run.py", "contour_digest.py", "series_pc.py")
+                        "contour_digest_run.py", "contour_digest.py", "series_pc.py",
+                        # 02.09.2026: ЯЩИК ЗАДАНИЙ ШТАБА — куст за ленивым `import shtab_box_run`
+                        # в `maybe_shtab_box`. Своих новых листьев ровно ДВА: сам `shtab_box` и
+                        # его руки. Всё прочее уже покрыто и повторять его здесь НЕЛЬЗЯ (список
+                        # сверяется с замыканием МНОЖЕСТВАМИ, лишний элемент роняет гейт):
+                        # `recon_auto`/`recon_auto_run` — счёт суток и класс очереди, оба в
+                        # остатке выше; `brain_writer` — ЧТЕНИЕ узла, там же; `review_intake` и
+                        # `review_intake_run` — календарный день и писатель журнала, там же;
+                        # `result_ref` — КАНОН АДРЕСА РЕЗУЛЬТАТА (вторые ворота приёма) — накрыт
+                        # ВОРОТАМИ грязного дерева как верхний импорт демона (`_ORCH_RUNTIME`),
+                        # то есть защищён строже остатка, а не слабее.
+                        "shtab_box_run.py", "shtab_box.py")
 # остаток: ленивые импорты вне ворот грязного дерева
 
 
@@ -9320,6 +9331,121 @@ def maybe_recon_auto(now=None, tick_path=None, state_path=None, runner=None):
     return report
 
 
+# ------------------- ЯЩИК ЗАДАНИЙ ШТАБА (флаг SHTAB_BOX) ----------------------
+# ЗАЧЕМ. Задание попадало на полосу ровно одним путём: владелец брал готовый текст и ПЕРЕСЫЛАЛ
+# его сам. Штаб при этом уже пишет в мозг, демон уже читает мозг — не было только ЯЩИКА: места,
+# куда Штаб кладёт готовый блок, и правила, по которому демон берёт оттуда НЕ БОЛЬШЕ ОДНОЙ за
+# виток. Владелец уходит из пути ОТПРАВКИ; из пути РЕШЕНИЯ он не уходит никуда.
+#
+# ЭТО ИСТОЧНИК ЗАДАЧ, А НЕ ПРАВО ИХ ИСПОЛНЯТЬ. Взятый блок встаёт обычным зелёным рядом `new` и
+# идёт через тот же `process_new`, тот же гард, те же карточки и те же ворота, что и задача,
+# присланная владельцем руками. Ни одна из трёх защит этой веткой не тронута — ни строкой.
+#
+# ГРАНИЦА ДОВЕРИЯ ПРОХОДИТ ПО УЗЛУ, и это главное здесь. Ступень E держит инвариант «ни одного
+# символа чужого текста», потому что её повод приходит из ВНЕШНЕГО канала. Здесь текст И ЕСТЬ
+# предмет — но источник не внешний, а ШТАБ: читается РОВНО ОДИН назначенный узел мозга
+# (`shtab_box.NODE_NAME`), в который пишет только он. Полоса в этот узел НЕ ПИШЕТ ни одной веткой
+# (инвариант `SHTAB_BOX_READS_ONLY` обходом AST) — ящик, в который мы умеем писать, был бы
+# машиной, ставящей себе задачи собственными словами.
+#
+# ДВОЕ ВОРОТ ПРИЁМА, оба обязательны и оба говорят причину СЛОВАМИ в лог: блок без стандартного
+# блока ЗАПРЕТОВ и блок без АДРЕСА РЕЗУЛЬТАТА (канон `result_ref`) не берутся вовсе. Второе —
+# прямое следствие ступени C: задача без адреса закрывается словом исполнителя, и это право у
+# полосы отнято; вернуть его с другой стороны нельзя.
+#
+# ПОТОЛОК И ДЕДУП — ЧУЖИМ УСТРОЙСТВОМ, restart-proof из ОЧЕРЕДИ. Маркер `[от Штаба дата=… ключ=…]`
+# живёт в task_text ряда и считается по открытым рядам ПЛЮС `failed` ПЛЮС `done` — тем же
+# `recon_auto.markers`/`budget_left`, что у ступени E, и по её же уроку (01.09: пять разведок за
+# одни сутки при потолке 2, потому что счёт шёл по одним открытым рядам и мерил одновременность).
+# Реестра на диске у ящика нет вовсе: его съел бы первый self-update, а их тут десятки в день.
+#
+# ОТКАТ: стоп-файл `pc_orchestrator.shtab_box.off` (гасит ЦЕЛИКОМ со следующего тика, без
+# рестарта и без правки кода), либо `SHTAB_BOX=0`, либо `SHTAB_BOX_BUDGET=0` (ветка жива, но не
+# берёт ничего).
+SHTAB_BOX_MIN_SEC = float(os.getenv("SHTAB_BOX_MIN_SEC", "1800") or "1800")   # пол паузы, с
+SHTAB_BOX_BUDGET = int(os.getenv("SHTAB_BOX_BUDGET", "3") or "3")             # заданий в сутки
+SHTAB_BOX_LIMIT = int(os.getenv("SHTAB_BOX_LIMIT", "1") or "1")               # заданий за виток
+SHTAB_BOX_TICK_FILE = _state(os.path.join(REPO, "pc_orchestrator.shtab_box_tick.json"))
+
+
+def _shtab_box_root():
+    """Корень, в котором ящик ищет стоп-файл. Под тестом — temp, в бою — REPO."""
+    return os.path.dirname(SHTAB_BOX_TICK_FILE) or REPO
+
+
+def _shtab_box_on():
+    """Ящик включён? Дефолт — ВКЛЮЧЕНО; рубильники те же два, что у ступеней A, B, D, E."""
+    if (os.environ.get("SHTAB_BOX") or "").strip() == "0":
+        return False
+    if _flag_forced_off("SHTAB_BOX"):
+        log.warning("ящик Штаба ВЫКЛЮЧЕН стоп-файлом %s (снять: удалить файл)",
+                    os.path.basename(_flag_off_file("SHTAB_BOX")))
+        return False
+    return True
+
+
+def _shtab_box_read_tick(path=None):
+    try:
+        with open(path or SHTAB_BOX_TICK_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _shtab_box_write_tick(now, path=None):
+    p = path or SHTAB_BOX_TICK_FILE
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"ts": float(now)}, f)
+    except Exception as e:
+        log.warning("ящик Штаба: метка оборота не записана: %s", e)
+
+
+def maybe_shtab_box(now=None, tick_path=None, runner=None):
+    """Один оборот ящика за тик, с троттлингом по МЕТКЕ НА ДИСКЕ. → отчёт | None.
+
+    None — ветка выключена или пол паузы не прошёл. Метку пишем ВСЕГДА, даже когда ящик пуст:
+    иначе «пусто» стоило бы чтения мозга и чтения очереди каждые POLL_SEC.
+
+    «Ничего не взяли» — НЕ тишина: причина едет в лог строкой. Выключено стоп-файлом · узел не
+    прочитан (НЕИЗВЕСТНО, а не «пусто») · ящик пуст · работа владельца · блок не принят воротами
+    · потолок суток — это ШЕСТЬ РАЗНЫХ новостей, и различать их владелец обязан без чтения кода.
+    """
+    if not _shtab_box_on():
+        return None
+    now = time.time() if now is None else now
+    st = _shtab_box_read_tick(tick_path)
+    prev = st.get("ts")
+    if prev is not None:
+        try:
+            if (now - float(prev)) < SHTAB_BOX_MIN_SEC:
+                return None
+        except Exception:
+            pass
+    _shtab_box_write_tick(now, tick_path)
+    try:
+        import shtab_box_run
+        report = (runner or shtab_box_run.tick)(
+            root=_shtab_box_root(), place=True, limit=SHTAB_BOX_LIMIT,
+            budget=SHTAB_BOX_BUDGET, write_journal=True,
+        )
+    except Exception as e:
+        log.warning("ящик Штаба: оборот упал (fail-safe, метка уже сдвинута — следующая попытка "
+                    "через паузу): %s", e)
+        return None
+    if not report.get("acted"):
+        log.info("ящик Штаба: %s", report.get("why") or "брать нечего")
+        return report
+    log.info("ящик Штаба: взято %d (%s), не встало %d",
+             len(report.get("placed") or []),
+             ", ".join("#%s ключ=%s" % (r.get("id"), r.get("key"))
+                       for r in report.get("placed") or []),
+             len(report.get("failed") or []))
+    _cowork(shtab_box_run._line(report) or "ящик Штаба: оборот без строки исхода")
+    return report
+
+
 # ------------------- СТУПЕНЬ F: ОЧЕРЕДЬ ИСХОДЯЩИХ (флаг REVIEW_OUTBOX) --------
 # ЗАЧЕМ. Ступени A–E предполагают, что внешний канал ОТВЕТИЛ. Замер 01.09 говорит обратное: из
 # 16 заходов в Manus ответом кончились 2. До ступени F такой заход умирал на месте — вердикт
@@ -10538,6 +10664,7 @@ def _main_loop():
             maybe_review_intake()     # ступень B: находки ответа → ЗАЯВКИ очереди (троттлинг REVIEW_INTAKE_MIN_SEC)
             maybe_review_audit()      # ступень D: высокие находки + суточная сводка → тема Аудит (AUDIT_TOPIC)
             maybe_recon_auto()        # ступень E: поводы полосы → разведочные автозадачи (троттлинг RECON_AUTO_MIN_SEC)
+            maybe_shtab_box()         # ящик Штаба: узел мозга → задача полосы, НЕ БОЛЬШЕ ОДНОЙ за виток (SHTAB_BOX_MIN_SEC)
             maybe_review_outbox()     # ступень F: не доехавший пакет → очередь исходящих с повтором (REVIEW_OUTBOX_MIN_SEC)
             maybe_contour_digest()    # сводка контура: СОСТОЯНИЕ полосы в тему сводок раз в CONTOUR_DIGEST_SEC (4 ч)
             maybe_lesson_commit_retry()  # пакет «полнота лога» п.6: докоммитить урок из спула (провал коммита ≠ вечная грязь)

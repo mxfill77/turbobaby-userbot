@@ -91,6 +91,7 @@ from __future__ import annotations
 import recon_auto
 import review_intake
 import series_pc
+import shtab_box
 
 SCHEMA = "turbobaby.contour_digest/v1"
 
@@ -471,6 +472,48 @@ def series(rows, target=SERIES_TARGET):
             "window": len(window), "service": service, "seen": len(taken)}
 
 
+def shtab_taken(rows, day):
+    """Задания Штаба, взятые полосой за названные сутки. → int | None.
+
+    ``rows`` — строки слепка очереди (открытые + закрытые), у каждой поле
+    ``goal``: первая значащая строка ``task_text``, обрезанная по 90 символов
+    (:func:`queue_snapshot_pc.goal_line`). Маркер ящика стои́т ПЕРВОЙ строкой и в
+    90 символов помещается целиком — иначе счёт молча поехал бы вниз.
+
+    Счёт ведёт САМ ЯЩИК (:func:`shtab_box.taken_today`), а не своя регулярка: у
+    замка полосы и у сводки обязан быть ОДИН источник числа. Разойдись они — и
+    владелец читал бы в сводке одно, а полоса держала бы другое, причём молча.
+
+    ``None`` — слепок не прочитан. Ноль вместо незнания не ставится: «взято 0»
+    читается как «Штаб ничего не клал», а это утверждение, которого при мёртвом
+    источнике мы делать не вправе (закон 3).
+    """
+    if rows is None:
+        return None
+    return shtab_box.taken_today([{"task_text": (r or {}).get("goal")} for r in rows], day)
+
+
+def shtab_line(taken, day, rd=None):
+    """Отдельный счёт «задач от Штаба взято N» — ОТДЕЛЬНОЙ строкой и всегда одной.
+
+    Отдельной, потому что ящик — НОВЫЙ путь задачи на полосу: до него всё, что
+    исполнялось, присылал человек. Число, растворённое в общем счёте закрытого,
+    отвечало бы на вопрос «сколько работала полоса», а спрошено другое — «сколько
+    она взяла себе САМА, минуя владельца». Источник умер → строка говорит
+    «неизвестно» и не пропадает.
+    """
+    if rd is not None and rd.get("kind") in (UNKNOWN, HYPO):
+        return line_text(rd)
+    ok = taken is not None
+    words = shtab_box.digest_line(taken or 0, day, ok=ok,
+                                  why="слепок очереди не прочитан")
+    if rd is None:
+        return "• %s" % words
+    shown = dict(rd)
+    shown["words"] = words
+    return line_text(shown)
+
+
 def series_line(counted, rd=None):
     """Строка серии — ОТДЕЛЬНАЯ и всегда одна. → str.
 
@@ -552,6 +595,14 @@ def render(report):
                 out.append("• …и ещё %d — по адресам выше" % (len(rows) - LIST_MAX))
     out += ["", "СЕРИЯ ЦЕПОЧЕК: %s"
             % series_line(report.get("series"), (readings.get("series") or [None])[0]).lstrip("• ")]
+    # ЯЩИК ШТАБА — ВСЕГДА И ОТДЕЛЬНОЙ СТРОКОЙ, в том числе в спокойной сводке и в
+    # том числе нулём. Ноль здесь — не пустота, а ответ: «полоса сегодня не брала
+    # себе ничего сама». Паспорт источника берётся у строки серии — источник у них
+    # ОДИН (слепок очереди), и заводить ему второй возраст значило бы обещать
+    # чтение, которого нет.
+    out += ["ЯЩИК ШТАБА: %s"
+            % shtab_line(report.get("shtab_taken"), report.get("day"),
+                         (readings.get("series") or [None])[0]).lstrip("• ")]
     out += ["", sources_line(), FOOT]
     return "\n".join(out)
 
@@ -565,11 +616,15 @@ def journal_line(report):
               for rd in (report.get("readings") or {}).get(k, []) if rd.get("kind") == UNKNOWN)
     waits = sum(1 for k in TOPIC_KEYS
                 for rd in (report.get("readings") or {}).get(k, []) if rd.get("kind") == WAIT)
+    taken = report.get("shtab_taken")
     return ("NOTE СВОДКА КОНТУРА · ПК · интервал %s: закрылось %s · красного %d · неизвестного %d "
-            "· ждёт решения %d · серия %d/%d (меняли состояние %d) · %s"
+            "· ждёт решения %d · серия %d/%d (меняли состояние %d) · задач от Штаба взято %s · %s"
             % (interval_words(report.get("interval", INTERVAL_SEC)),
                report.get("closed_count") if isinstance(report.get("closed_count"), int) else "?",
                reds, unk, waits, counted.get("streak", 0), counted.get("target", SERIES_TARGET),
                counted.get("moved", 0),
+               # «?» вместо нуля при мёртвом источнике: журнал — индекс, и ноль в
+               # нём читается как измеренный факт, а не как «спросить не смогли».
+               taken if isinstance(taken, int) else "?",
                ("отправлено" if report.get("sent") else "не отправлено: %s"
                 % one_line(report.get("send_why") or "причина не названа", 90))))

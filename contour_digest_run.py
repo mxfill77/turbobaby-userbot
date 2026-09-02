@@ -198,6 +198,27 @@ def all_closed(snapshot):
     return closed_since(snapshot, None)
 
 
+def all_rows(snapshot):
+    """ОБЕ половины слепка очереди — открытые и закрытые. → list[dict] | None.
+
+    Заведено для счёта ящика Штаба, и корпус здесь ШИРЕ, чем у серии, по той же
+    причине, по которой ступень E считает свой потолок и по закрытым рядам: маркер
+    взятого задания уходит из открытых вместе с закрывшейся строкой, и счёт по
+    одним открытым мерил бы «сколько сейчас в работе», а спрошено «сколько взято
+    за сутки». Обе цифры совпадают ровно до первого закрытия.
+
+    ``None`` — слепка нет: отличать «не прочитали» от «пусто» обязан вызывающий,
+    и пустой список этой разницы не несёт.
+    """
+    if snapshot is None:
+        return None
+    rows = []
+    for tid, item in ((snapshot.get("open") or {}) if snapshot else {}).items():
+        if isinstance(item, dict):
+            rows.append({"id": item.get("id") or tid, "goal": item.get("goal") or ""})
+    return rows + all_closed(snapshot)
+
+
 def git_moves(root, since_ts, paths, runner=None):
     """Коммиты за окно, задевшие названные пути. → (list[str], причина).
 
@@ -418,6 +439,18 @@ def build(root=HERE, now=None, since=None, interval=cd.INTERVAL_SEC, runner=None
     # таком случае наружу НЕ ЕДУТ: сосчитанное по протухшему слепку выглядит фактом.
     if series_rows and series_rows[0].get("kind") in (cd.UNKNOWN, cd.HYPO):
         counted = None
+    # СЧЁТ ЯЩИКА — ЗА КАЛЕНДАРНЫЕ СУТКИ UTC, а не за окно сводки, и это не описка.
+    # Потолок ящика назван В СУТКАХ и считается по маркеру с датой; покажи сводка
+    # число за своё четырёхчасовое окно — владелец сверял бы с потолком две разные
+    # величины и всякий раз получал бы «недобор». Тот же день UTC, что у ящика
+    # (`review_intake.today_utc`) и у внешних ответов.
+    the_day = day or day_utc(now)
+    rows = all_rows(snapshot)
+    taken = cd.shtab_taken(rows, the_day)
+    # Протухший слепок → числа наружу НЕ ЕДУТ, ровно как у серии: сосчитанное по
+    # старому слепку выглядит фактом и им не является.
+    if series_rows and series_rows[0].get("kind") in (cd.UNKNOWN, cd.HYPO):
+        taken = None
     return {
         "schema": cd.SCHEMA,
         "interval": float(interval),
@@ -425,6 +458,8 @@ def build(root=HERE, now=None, since=None, interval=cd.INTERVAL_SEC, runner=None
         "since_words": stamp_words(since),
         "now": now,
         "now_words": stamp_words(now),
+        "day": the_day,
+        "shtab_taken": taken,
         "closed_count": closed_count,
         "series": counted,
         "readings": {
@@ -522,6 +557,8 @@ def main(argv=None):
                 print(cd.line_text(rd))
         print("\nСЕРИЯ: %s" % cd.series_line(rep.get("series"),
                                              (rep["readings"].get("series") or [None])[0]))
+        print("ЯЩИК ШТАБА: %s" % cd.shtab_line(rep.get("shtab_taken"), rep.get("day"),
+                                               (rep["readings"].get("series") or [None])[0]))
         return 0
     rep = tick(send=bool(args.send), write_journal=bool(args.journal), interval=args.interval,
                force=bool(args.force) or bool(args.dry))
