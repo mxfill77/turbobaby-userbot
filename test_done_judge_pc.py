@@ -18,6 +18,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import content_product_verifier as v0
 import done_judge_pc as dj
@@ -206,6 +207,104 @@ class TestEnforcement(unittest.TestCase):
         self.assertEqual(dj.run_token(90, "tmp/pc_report/task90-11480-1788265605336-90.md"),
                          "11480-1788265605336-90")
         self.assertEqual(dj.run_token(90, None), "pc-task-90")
+
+
+class TestLedger(unittest.TestCase):
+    """РЕЕСТР ВЕРДИКТОВ (02.09.2026): след суда обязан пережить заход.
+
+    Предмет — не вердикт, а ПАМЯТЬ о нём: в режиме `addr` безадресное закрытие не
+    меняет статуса и не приписывается к отчёту, а слепок очереди у сданной строки
+    причины не несёт вовсе. Значит без реестра счёт серии не отличал бы доказанное
+    закрытие от закрытого без проверки — замер 02.09: серия 18, доказано 5.
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="done_judge_ledger_")
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def test_an_empty_ledger_reads_as_the_judge_said_nothing(self):
+        self.assertEqual(dj.read_ledger(self.root), {})
+
+    def test_a_proven_verdict_lands_as_proven(self):
+        dj.note(11, {"verdict": dj.DONE, "reason": "V0: PROVEN", "address": {"words": "x"}},
+                root=self.root)
+        got = dj.read_ledger(self.root)["11"]
+        self.assertTrue(got[dj.F_PROVED])
+        self.assertTrue(got[dj.F_ADDRESSED])
+
+    def test_an_addressless_verdict_lands_and_says_it_had_no_address(self):
+        """Тот самый исход, который до 02.09 не оставлял следа НИГДЕ, кроме лога."""
+        dj.note(12, {"verdict": dj.UNKNOWN, "reason": "адрес результата не назван задачей",
+                     "address": None}, root=self.root)
+        got = dj.read_ledger(self.root)["12"]
+        self.assertFalse(got[dj.F_PROVED])
+        self.assertFalse(got[dj.F_ADDRESSED], "«без адреса» обязано быть отличимо от «не доказал»")
+        self.assertIn("не назван", got[dj.F_REASON])
+
+    def test_an_addressed_but_unproven_verdict_is_a_third_answer(self):
+        dj.note(13, {"verdict": dj.UNKNOWN, "reason": "по адресу ПУСТО",
+                     "address": {"words": "x"}}, root=self.root)
+        got = dj.read_ledger(self.root)["13"]
+        self.assertFalse(got[dj.F_PROVED])
+        self.assertTrue(got[dj.F_ADDRESSED])
+
+    def test_order_is_kept_by_a_counter_because_the_module_has_no_clock(self):
+        for tid in (21, 22, 23):
+            dj.note(tid, {"verdict": dj.DONE, "address": {"words": "x"}}, root=self.root)
+        rows = dj.read_ledger(self.root)
+        self.assertEqual([rows[str(t)][dj.F_SEQ] for t in (21, 22, 23)], [1, 2, 3])
+
+    def test_the_tail_is_trimmed_by_the_counter_not_by_time(self):
+        """Хвост назван числом (см. шапку): старое уходит, свежее остаётся."""
+        for tid in range(dj.LEDGER_MAX + 5):
+            dj.note(tid, {"verdict": dj.DONE, "address": {"words": "x"}}, root=self.root)
+        rows = dj.read_ledger(self.root)
+        self.assertEqual(len(rows), dj.LEDGER_MAX)
+        self.assertIn(str(dj.LEDGER_MAX + 4), rows, "свежая запись вытеснена")
+        self.assertNotIn("0", rows, "старая запись не вытеснена")
+
+    def test_a_rewritten_row_keeps_one_entry_not_two(self):
+        dj.note(31, {"verdict": dj.UNKNOWN, "address": None}, root=self.root)
+        dj.note(31, {"verdict": dj.DONE, "address": {"words": "x"}}, root=self.root)
+        rows = dj.read_ledger(self.root)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows["31"][dj.F_PROVED], "переотправленная задача обязана обновить исход")
+
+    def test_a_broken_ledger_reads_as_silence_not_as_a_crash(self):
+        path = dj.ledger_path(self.root)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write("{ это не json".encode("utf-8"))
+        self.assertEqual(dj.read_ledger(self.root), {})
+
+    def test_writing_never_raises_and_a_failure_is_silent(self):
+        """Судья, падающий на своём реестре, закрыл бы задачу хуже, чем судья без реестра."""
+        self.assertIsNone(dj.note(41, None, root=self.root))
+        blocked = os.path.join(self.root, "занято.txt")
+        with open(blocked, "wb") as handle:
+            handle.write(b"x")
+        # путь через ФАЙЛ как через каталог — makedirs откажет, и это не должно ронять заход
+        self.assertIsNone(dj.note(42, {"verdict": dj.DONE, "address": {"words": "x"}},
+                                  root=os.path.join(blocked, "внутрь")))
+
+    def test_the_ledger_lives_in_the_one_named_folder(self):
+        self.assertTrue(dj.LEDGER.startswith(dj.PACKET_DIR + "/"),
+                        "второй адрес записи модулю не заводится")
+
+    def test_the_env_switch_moves_the_ledger_aside(self):
+        aside = os.path.join(self.root, "в-сторону.json")
+        with mock.patch.dict(os.environ, {dj.LEDGER_ENV: aside}, clear=False):
+            dj.note(51, {"verdict": dj.DONE, "address": {"words": "x"}}, root=self.root)
+            self.assertEqual(dj.ledger_path(self.root), aside)
+            self.assertIn("51", dj.read_ledger(self.root))
+        self.assertTrue(os.path.exists(aside))
+        self.assertEqual(dj.read_ledger(self.root), {}, "боевой путь остался нетронутым")
+
+    def test_the_default_path_is_test_aware(self):
+        """Крюк изоляции: без явного корня путь идёт через `log_setup` и под тестом уезжает."""
+        self.assertNotEqual(dj.ledger_path(None),
+                            os.path.join(dj.REPO, dj.LEDGER.replace("/", os.sep)),
+                            "регресс писал бы в БОЕВОЙ реестр полосы")
 
 
 class TestPurity(unittest.TestCase):

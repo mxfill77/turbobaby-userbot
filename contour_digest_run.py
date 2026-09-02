@@ -11,6 +11,9 @@
     queue_snapshot_pc.state.json   слепок очереди: демон пишет каждым витком
     tmp/expect_pc/state.json       слой ожиданий: наблюдатель тикает раз в 10 мин
     review_outbox_queue_state.json реестр исходящих ступени F
+    tmp/done_judge_pc/judged.json  вердикты судьи закрытия (ступень C) — чем цепочка
+                                   ДОКАЗАНА; без него счёт серии зачитывал бы любое
+                                   `done`, в том числе закрытое без адреса
     git log                        движение осей за окно
 
 Очередь через мост здесь НЕ ЧИТАЕТСЯ намеренно, и это не экономия: `get_pending`
@@ -37,6 +40,7 @@ import subprocess
 import sys
 
 import contour_digest as cd
+import done_judge_pc
 import review_audit
 import review_audit_run
 import review_intake_run
@@ -412,13 +416,32 @@ def section_axis(root, since, now, runner=None):
     return out
 
 
-def section_series(snapshot, read_at, why, now):
+def read_judged(root=HERE):
+    """Реестр вердиктов судьи закрытия → dict. Отказ чтения → `{}`.
+
+    ЧИТАЕМ ЧУЖИМ ЖЕ КОДОМ (:func:`done_judge_pc.read_ledger`), а не своим разбором
+    JSON: путь и форма записи принадлежат судье, и второй их экземпляр разошёлся бы
+    молча — тот же довод, по которому счёт ящика Штаба ведёт сам ящик.
+
+    Пустой ответ ВТОРОЙ СТРОКОЙ НЕ ОБЪЯСНЯЕТСЯ и «неизвестным» источником не
+    становится СОЗНАТЕЛЬНО: у отсутствия доказательства и у отсутствия реестра
+    последствие ОДНО — цепочка не доказана. Заводить сюда третий исход значило бы
+    дать пустому реестру право сохранять серию, а это ровно тот класс, который
+    поправка 02.09 закрывает.
+    """
+    try:
+        return done_judge_pc.read_ledger(root)
+    except Exception:                              # noqa: BLE001 — судья молчит = не доказано
+        return {}
+
+
+def section_series(snapshot, read_at, why, now, judged=None):
     """Серия цепочек: паспорт источника отдельно от чисел — числа считает чистая логика."""
     if snapshot is None:
         return [cd.dead_source("series", "queue", why)], None
     rows = all_closed(snapshot)
     return ([cd.reading("series", "", src="queue", read_at=read_at, now=now, kind=cd.OK)],
-            cd.series(rows))
+            cd.series(rows, judged=judged))
 
 
 # ───────────────────────────── оборот ─────────────────────────────
@@ -434,7 +457,7 @@ def build(root=HERE, now=None, since=None, interval=cd.INTERVAL_SEC, runner=None
     outbox, o_at, o_why = read_json(root, cd.source("outbox")["addr"])
     heads, records, i_why = read_inbox(root, inbox)
     closed_rows, closed_count = section_closed(snapshot, q_at, q_why, since, now)
-    series_rows, counted = section_series(snapshot, q_at, q_why, now)
+    series_rows, counted = section_series(snapshot, q_at, q_why, now, judged=read_judged(root))
     # Слепок старше предела → чистая логика уже сказала «неизвестно». Числа серии в
     # таком случае наружу НЕ ЕДУТ: сосчитанное по протухшему слепку выглядит фактом.
     if series_rows and series_rows[0].get("kind") in (cd.UNKNOWN, cd.HYPO):

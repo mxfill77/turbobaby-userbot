@@ -236,6 +236,16 @@ class TestNegative(unittest.TestCase):
             self.assertIn("НЕИЗВЕСТНО", cd.render(rep))
 
 
+def _proved(*ids):
+    """Реестр вердиктов: названные строки ДОКАЗАНЫ судьёй закрытия."""
+    return {str(i): {cd.F_PROVED: True, cd.F_ADDRESSED: True} for i in ids}
+
+
+def _blind(*ids):
+    """Реестр вердиктов: названные строки закрыты БЕЗ АДРЕСА (судить было нечем)."""
+    return {str(i): {cd.F_PROVED: False, cd.F_ADDRESSED: False} for i in ids}
+
+
 class TestSeries(unittest.TestCase):
     """Счёт серии цепочек — отдельной строкой и с названными определениями."""
 
@@ -243,18 +253,19 @@ class TestSeries(unittest.TestCase):
         rows = [{"id": 1, "outcome": "done", "goal": "работа"},
                 {"id": 2, "outcome": None, "goal": "работа"},
                 {"id": 3, "outcome": "done", "goal": "работа"}]
-        self.assertEqual(cd.series(rows)["streak"], 1, "«не сверен» обязан обрывать серию")
+        self.assertEqual(cd.series(rows, judged=_proved(1, 3))["streak"], 1,
+                         "«не сверен» обязан обрывать серию")
 
     def test_failed_breaks_the_streak(self):
         rows = [{"id": 1, "outcome": "done", "goal": "работа"},
                 {"id": 2, "outcome": "failed", "goal": "работа"}]
-        self.assertEqual(cd.series(rows)["streak"], 0)
+        self.assertEqual(cd.series(rows, judged=_proved(1, 2))["streak"], 0)
 
     def test_service_roots_are_out_of_the_count(self):
         """Признак служебного корня ВЗЯТ у счётчика полосы, а не выдуман здесь."""
         rows = [{"id": 1, "outcome": "done", "goal": "[ревизор-находки] сводка"},
                 {"id": 2, "outcome": "done", "goal": "работа"}]
-        got = cd.series(rows)
+        got = cd.series(rows, judged=_proved(1, 2))
         self.assertEqual(got["service"], 1)
         self.assertEqual(got["seen"], 1)
         self.assertTrue(series_pc.is_service("[ревизор-находки] сводка"))
@@ -272,14 +283,14 @@ class TestSeries(unittest.TestCase):
                 {"id": 2, "outcome": "failed", "goal": "ЦЕЛЬ: правка"},
                 {"id": 3, "outcome": "done", "goal": "ЦЕЛЬ: правка"},
                 {"id": 4, "outcome": "done", "goal": review_intake.CLAIM_MARK + " x]"}]
-        got = cd.series(rows)
+        got = cd.series(rows, judged=_proved(1, 3, 4))
         self.assertEqual(got["streak"], 2)
         self.assertEqual(got["moved"], 1, "заявка ревью операционного состояния не меняет")
 
     def test_window_is_thirty(self):
         self.assertEqual(cd.SERIES_TARGET, 30)
         rows = [{"id": i, "outcome": "done", "goal": "ЦЕЛЬ: правка"} for i in range(50)]
-        got = cd.series(rows)
+        got = cd.series(rows, judged=_proved(*range(50)))
         self.assertEqual(got["window"], 30)
         self.assertEqual(got["streak"], 30)
 
@@ -288,10 +299,170 @@ class TestSeries(unittest.TestCase):
         self.assertIn("НЕИЗВЕСТНО", line)
         self.assertNotIn("подряд из 30", line, "нуль вместо счёта — это утверждение, а не молчание")
 
+
+class TestSeriesCountsOnlyTheProven(unittest.TestCase):
+    """ПОПРАВКА 02.09.2026 — серия зачитывает ТОЛЬКО ДОКАЗАННОЕ судьёй закрытие.
+
+    Повод измерен на живом слепке полосы: серия 18 подряд, из них судья доказал 5,
+    а 13 закрылись БЕЗ АДРЕСА (журнал демона, `V0-DONE` по задачам 104, 105,
+    109–116). Отрицательный и положительный ходят ПАРОЙ: прибор, который не
+    двигает серию никогда, проходит любой отрицательный тест и бесполезен.
+    """
+
+    ROWS = [{"id": 7, "outcome": "done", "goal": "ЦЕЛЬ: правка"},
+            {"id": 8, "outcome": "done", "goal": "ЦЕЛЬ: правка"}]
+
+    def test_a_done_row_without_an_address_does_not_move_the_series(self):
+        """ОТРИЦАТЕЛЬНЫЙ. Поддельный ряд `done`, у судьи «адрес не назван» — серия стои́т."""
+        got = cd.series(self.ROWS, judged=_blind(7, 8))
+        self.assertEqual(got["streak"], 0, "закрытие без проверки зачтено в серию")
+        self.assertEqual(got["blind"], 2)
+        self.assertEqual(got["proved"], 0)
+
+    def test_a_proven_row_does_move_the_series(self):
+        """ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ. Тот же ряд с доказанным адресом серию двигает."""
+        got = cd.series(self.ROWS, judged=_proved(7, 8))
+        self.assertEqual(got["streak"], 2)
+        self.assertEqual(got["proved"], 2)
+        self.assertEqual(got["blind"], 0)
+
+    def test_a_blind_row_at_the_tail_breaks_a_proven_streak(self):
+        """Одно безадресное закрытие в хвосте обрывает серию доказанных — как «упало»."""
+        rows = self.ROWS + [{"id": 9, "outcome": "done", "goal": "ЦЕЛЬ: правка"}]
+        judged = dict(_proved(7, 8))
+        judged.update(_blind(9))
+        got = cd.series(rows, judged=judged)
+        self.assertEqual(got["streak"], 0)
+        self.assertEqual((got["proved"], got["blind"]), (2, 1))
+
+    def test_silence_of_the_judge_is_not_a_clean_chain(self):
+        """Реестра нет вовсе → «не доказан сильнее неизвестно»: серия ноль, и это видно числом."""
+        for judged in (None, {}, {"нет": "того"}):
+            got = cd.series(self.ROWS, judged=judged)
+            self.assertEqual(got["streak"], 0, repr(judged))
+            self.assertEqual(got["unjudged"], 2, repr(judged))
+            self.assertEqual(got["proved"], 0, repr(judged))
+
+    def test_judged_but_unproven_is_its_own_answer(self):
+        """Четвёртый исход назван отдельно: судья смотрел и НЕ доказал ≠ он не смотрел."""
+        judged = {"7": {cd.F_PROVED: False, cd.F_ADDRESSED: True},
+                  "8": {cd.F_PROVED: False, cd.F_ADDRESSED: True}}
+        got = cd.series(self.ROWS, judged=judged)
+        self.assertEqual((got["unproved"], got["blind"], got["unjudged"]), (2, 0, 0))
+        self.assertEqual(got["streak"], 0)
+
+    def test_the_four_answers_sum_to_the_closed_rows_of_the_window(self):
+        """Замок полноты: сумма разбора равна числу сданных строк окна — дыры быть не может."""
+        rows = [{"id": i, "outcome": "done", "goal": "ЦЕЛЬ: правка"} for i in range(6)]
+        rows.append({"id": 99, "outcome": "failed", "goal": "ЦЕЛЬ: правка"})
+        judged = dict(_proved(0, 1))
+        judged.update(_blind(2, 3))
+        judged["4"] = {cd.F_PROVED: False, cd.F_ADDRESSED: True}
+        got = cd.series(rows, judged=judged)
+        self.assertEqual(got["proved"] + got["blind"] + got["unproved"] + got["unjudged"], 6)
+
+    def test_the_line_carries_both_numbers_the_owner_needs(self):
+        """Владелец видит, НА ЧЁМ стои́т серия, не открывая код (пункт 3 задания)."""
+        line = cd.series_line(cd.series(self.ROWS, judged=_blind(7, 8)))
+        self.assertIn("судья доказал 0", line)
+        self.assertIn("закрыто без адреса 2", line)
+        self.assertIn("0 чистых подряд из 30", line)
+
+    def test_zero_is_printed_and_not_folded_away(self):
+        """Исход, спрятанный при нуле, читается как «такого не бывает». Печатаются все четыре."""
+        line = cd.series_line(cd.series(self.ROWS, judged=_proved(7, 8)))
+        for words in ("судья доказал 2", "закрыто без адреса 0", "не доказано 0",
+                      "судья не судил 0"):
+            self.assertIn(words, line)
+
+    def test_the_journal_index_carries_the_support_of_the_number(self):
+        """Строка журнала несёт серию ВМЕСТЕ с опорой: одна цифра врала бы молча."""
+        rep = {"interval": cd.INTERVAL_SEC, "closed_count": 2, "shtab_taken": 0,
+               "series": cd.series(self.ROWS, judged=_blind(7, 8)),
+               "readings": {k: [] for k in cd.TOPIC_KEYS}}
+        line = cd.journal_line(rep)
+        self.assertIn("доказал судья 0", line)
+        self.assertIn("без адреса 2", line)
+
+    def test_field_names_mirror_the_judge_and_do_not_drift(self):
+        """Имена полей реестра ЗАИМСТВОВАНЫ у судьи: два экземпляра разошлись бы молча."""
+        import done_judge_pc
+
+        self.assertEqual(cd.F_PROVED, done_judge_pc.F_PROVED)
+        self.assertEqual(cd.F_ADDRESSED, done_judge_pc.F_ADDRESSED)
+
+    def test_the_pure_layer_does_not_import_the_judge(self):
+        """Чистый слой судью НЕ тянет: реестр подают руки параметром."""
+        with io.open(os.path.join(HERE, "contour_digest.py"), encoding="utf-8") as fh:
+            body = fh.read()
+        tree = ast.parse(body, filename="contour_digest.py")
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in getattr(node, "names", []) or []:
+                    name = (getattr(node, "module", None) or alias.name).split(".")[0]
+                    self.assertNotIn(name, ("done_judge_pc", "content_product_verifier"))
+
     def test_series_line_is_always_present_in_the_message(self):
         rep = run.build(root=tempfile.gettempdir(), now=NOW, since=NOW - 10,
                         runner=lambda *a, **k: (_ for _ in ()).throw(OSError("нет")))
         self.assertIn("СЕРИЯ ЦЕПОЧЕК:", cd.render(rep))
+
+
+class TestSeriesEndToEnd(unittest.TestCase):
+    """ТОТ ЖЕ ОТРИЦАТЕЛЬНЫЙ, НО ЧЕРЕЗ ВЕСЬ ХОД — слепок на диске → руки → строка сообщения.
+
+    Чистая функция может быть права, а сводка всё равно врать: между ними лежит
+    чтение реестра (:func:`contour_digest_run.read_judged`), и молча отвалиться
+    может именно оно. Поэтому ряды здесь ПОДДЕЛЬНЫЕ и лежат файлами на своём
+    корне — боевой очереди и боевого реестра тест не касается ни одной веткой.
+    """
+
+    def _root(self, judged):
+        root = tempfile.mkdtemp(prefix="digest_series_")
+        closed = dict([_closed(7, NOW - 300, "done", "ЦЕЛЬ: поддельный ряд один"),
+                       _closed(8, NOW - 200, "done", "ЦЕЛЬ: поддельный ряд два")])
+        with io.open(os.path.join(root, cd.source("queue")["addr"]), "w", encoding="utf-8") as fh:
+            json.dump(_snapshot(closed_rows=closed), fh)
+        if judged is not None:
+            path = os.path.join(root, "tmp", "done_judge_pc")
+            os.makedirs(path)
+            with io.open(os.path.join(path, "judged.json"), "w", encoding="utf-8") as fh:
+                json.dump({"schema_version": "v1", "rows": judged}, fh)
+        return root
+
+    def _line(self, judged):
+        root = self._root(judged)
+        rep = run.build(root=root, now=NOW, since=NOW - 600,
+                        runner=lambda *a, **k: (_ for _ in ()).throw(OSError("нет git")))
+        return rep, cd.render(rep)
+
+    def test_addressless_rows_do_not_move_the_series_and_are_visible(self):
+        """ОТРИЦАТЕЛЬНЫЙ (пункт 5 задания): ряд `done` без адреса серию не двигает и ВИДЕН."""
+        rep, text = self._line(_blind(7, 8))
+        self.assertEqual(rep["series"]["streak"], 0)
+        self.assertEqual(rep["series"]["blind"], 2)
+        self.assertIn("закрыто без адреса 2", text)
+
+    def test_proven_rows_do_move_the_series(self):
+        """ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ на том же ходу: доказанный адрес серию двигает."""
+        rep, text = self._line(_proved(7, 8))
+        self.assertEqual(rep["series"]["streak"], 2)
+        self.assertIn("судья доказал 2", text)
+
+    def test_a_missing_ledger_is_not_a_clean_series(self):
+        """Реестра на диске нет — серия ноль, и молчание названо словом «не судил»."""
+        rep, text = self._line(None)
+        self.assertEqual(rep["series"]["streak"], 0)
+        self.assertEqual(rep["series"]["unjudged"], 2)
+        self.assertIn("судья не судил 2", text)
+
+    def test_the_hands_read_the_ledger_with_the_judges_own_code(self):
+        """Путь и форма записи принадлежат судье: свой разбор разошёлся бы молча."""
+        import done_judge_pc
+
+        root = self._root(_proved(7))
+        self.assertEqual(run.read_judged(root), done_judge_pc.read_ledger(root))
+        self.assertIn("7", run.read_judged(root))
 
 
 class TestCalm(unittest.TestCase):

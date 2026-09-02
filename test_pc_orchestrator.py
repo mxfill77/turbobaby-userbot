@@ -11177,6 +11177,31 @@ class TestStageCJudgeWiring(unittest.TestCase):
         blind = {"verdict": o.done_judge_pc.UNKNOWN, "reason": "адрес не назван", "address": None}
         self.assertEqual(self.run_mode("addr", blind), ("done", "RESULT: ок"))
 
+    def test_every_verdict_leaves_a_trace_in_the_ledger_whatever_the_mode(self):
+        """ПОПРАВКА 02.09: отчёт остаётся прежним, но СЛЕД суда обязан лечь ВСЕГДА.
+
+        До неё безадресное закрытие не оставляло следа нигде, кроме лога демона, а
+        счёт серии читает слепок очереди — и зачитывал такое закрытие как чистое.
+        Режим распоряжается СТАТУСОМ, а не памятью о суде: реестр пишется во всех
+        трёх режимах, в том числе в `off`."""
+        seen = []
+        saved = o.done_judge_pc.note
+        self.addCleanup(setattr, o.done_judge_pc, "note", saved)
+        o.done_judge_pc.note = lambda tid, verdict, **kw: seen.append((tid, verdict))
+        blind = {"verdict": o.done_judge_pc.UNKNOWN, "reason": "адрес не назван", "address": None}
+        for mode in ("addr", "all", "off"):
+            self.run_mode(mode, blind)
+        self.assertEqual([t for t, _v in seen], [self.TID] * 3, "след суда потерян в каком-то режиме")
+        self.assertTrue(all(v["address"] is None for _t, v in seen))
+
+    def test_the_ledger_is_written_before_the_mode_fork(self):
+        """Замок порядка: запись следа стои́т ВЫШЕ развилки режима, иначе `addr` её проглотит."""
+        with io.open(os.path.join(o.REPO, "pc_orchestrator.py"), encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertEqual(body.count("done_judge_pc.note("), 1, "след пишется РОВНО из одного места")
+        self.assertLess(body.index("done_judge_pc.note("),
+                        body.index("if not done_judge_pc.enforces(verdict, mode):"))
+
     def test_addressed_and_unproven_is_not_done(self):
         bad = {"verdict": o.done_judge_pc.UNKNOWN, "reason": "по адресу ПУСТО",
                "address": {"words": "x"}}
