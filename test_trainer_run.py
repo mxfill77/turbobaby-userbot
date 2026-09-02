@@ -257,7 +257,12 @@ class TestKorpus(unittest.TestCase):
         self.cases, self.sha = tr.load_cases()
 
     def test_dvenadcat_keisov_s_istochnikami(self):
-        self.assertEqual(len(self.cases), cc.TRAINER_MIN_CASES)
+        # ПОЛ, а не точное равенство (02.09.2026, заведение EN-зеркал 13–16). Предмет замка —
+        # УРЕЗАНИЕ корпуса: `TRAINER_MIN_CASES` и по имени, и по смыслу МИНИМУМ, и ворота сверяют
+        # `cases == cases_total` (client_contour.py:426), а не число 12 — то есть рост корпуса они
+        # переживают, а вот `assertEqual` не переживал: он краснел на КАЖДОМ добавленном кейсе и
+        # тем запрещал корпусу расти вовсе. Урезание ниже пола по-прежнему красное.
+        self.assertGreaterEqual(len(self.cases), cc.TRAINER_MIN_CASES)
         for c in self.cases:
             self.assertTrue(str(c.get("source") or "").strip(), f"кейс {c.get('id')} без источника")
             self.assertTrue(c.get("lines"), f"кейс {c.get('id')} без реплик")
