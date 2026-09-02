@@ -63,6 +63,43 @@ def live_row(tid=3, status="needs_approval", claim=None, premise=None):
     return {"id": tid, "lane": "pc", "status": status, "task_text": text}
 
 
+# ───────────────────────── голдены отбора (03.09.2026) ─────────────────────────
+# ПРАВИЛО ПОЛОСЫ: голдены детекта — ДОСЛОВНЫЕ фразы живого провала, а не
+# придуманные под детектор. Эта снята с разбора языкового провала EN-набора
+# (цепь #17, 02.09): англоязычный клиент получает русское приветствие. Ровно та
+# тема, которую Штаб назвал единственным клиентским дефектом ночи.
+DEFECT_KEY = "d1efec70c11e"
+DEFECT_QUOTE = (
+    "2. НЕ ДЕЛАТЬ ВОВСЕ: ветка первого контакта в `suggest.py` не проверяет язык "
+    "клиента — англоязычный клиент получает русское приветствие, потому что правило "
+    "первого контакта конфликтует с английской инструкцией."
+)
+DEFECT_CLAIM = {
+    "schema": ri.SCHEMA,
+    "key": DEFECT_KEY,
+    "kind": "НЕ ДЕЛАТЬ ВОВСЕ",
+    "quote": DEFECT_QUOTE,
+    "sources": [{
+        "channel": "codex", "send_date": "2026-09-02", "pack": "chain-pc-2026-09-02-17",
+        "pack_sha256": "fedcba9876543210" * 4,
+        "answer": "docs/review_inbox/2026-09-02-2026-09-02-chain-pc-2026-09-02-17-codex.md",
+        "quote": DEFECT_QUOTE, "kind": "НЕ ДЕЛАТЬ ВОВСЕ",
+    }],
+    "channels": ["codex"],
+    "packs": ["chain-pc-2026-09-02-17"],
+}
+# Посылка ЖИВА и адрес НАЗВАН — оба условия отбора, и оба берутся из настоящего
+# рендера ступени B, а не подставляются в digest руками.
+DEFECT_PREMISE = {"outcome": ri.PREMISE_ALIVE,
+                  "why": "`RULE-1` найден по адресу suggest.py"}
+
+
+def defect_row(tid=42, status="needs_approval", premise=None):
+    """Ряд-заявка, несущая КЛИЕНТСКИЙ ДЕФЕКТ (единственный вид, который карточится)."""
+    text = ri.claim_text(DEFECT_CLAIM, premise or DEFECT_PREMISE, "2026-09-02")
+    return {"id": tid, "lane": "pc", "status": status, "task_text": text}
+
+
 class TestPurity(unittest.TestCase):
     """ZAYAVKI_PC_PURE — чистая логика остаётся чистой."""
 
@@ -346,32 +383,43 @@ class TestTick(unittest.TestCase):
         self.sent.append((text, markup))
         return ("inbox", True)
 
-    def test_three_live_zayavki_are_delivered_once(self):
+    # ВНИМАНИЕ НА ФИКСТУРУ (правка 03.09.2026). До отбора эти три пробы гоняли
+    # `live_row` — обычную находку про наш конвейер. С 03.09 карточку получает
+    # ТОЛЬКО клиентский дефект, и на прежней фикстуре пробы мерили бы уже не
+    # «доставка работает», а «отбор не пропустил», то есть молча сменили бы
+    # предмет. Механику доставки меряем на `defect_row` — единственном ряде,
+    # который до доставки вообще доезжает; что прочее уходит в сводку, проверяет
+    # `TestOtborCardOrDigest`.
+    def test_client_defect_is_delivered_once(self):
+        q = _FakeQueue(rows=[defect_row(42)])
         rep = run.tick(root=self.dir, state_path=self.state, send=True,
-                       clock=lambda: 1788400000.0, queue=_FakeQueue(), sender=self._sender)
-        self.assertEqual(rep["zayavki"], 3)
-        self.assertEqual(len(rep["sent"]), 3)
-        self.assertEqual(len(self.sent), 3)
-        for _text, markup in self.sent:
-            self.assertIn("inline_keyboard", markup)   # ответ в ОДИН тап, а не набором текста
+                       clock=lambda: 1788400000.0, queue=q, sender=self._sender)
+        self.assertEqual(rep["zayavki"], 1)
+        self.assertEqual(len(rep["sent"]), 1)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("inline_keyboard", self.sent[0][1])  # ответ в ОДИН тап
         again = run.tick(root=self.dir, state_path=self.state, send=True,
-                         clock=lambda: 1788400060.0, queue=_FakeQueue(), sender=self._sender)
+                         clock=lambda: 1788400060.0, queue=_FakeQueue(rows=[defect_row(42)]),
+                         sender=self._sender)
         self.assertEqual(len(again["sent"]), 0)        # повторной отправки НЕТ
-        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(len(self.sent), 1)
 
     def test_reminder_after_a_day_is_a_single_message(self):
+        rows = [defect_row(42), defect_row(43)]
         run.tick(root=self.dir, state_path=self.state, send=True, clock=lambda: 1788400000.0,
-                 queue=_FakeQueue(), sender=self._sender)
+                 queue=_FakeQueue(rows=rows), sender=self._sender)
         self.sent.clear()
         rep = run.tick(root=self.dir, state_path=self.state, send=True,
                        clock=lambda: 1788400000.0 + z.REMIND_MIN_SEC,
-                       queue=_FakeQueue(), sender=self._sender)
-        self.assertEqual(len(rep["reminded"]), 3)
-        self.assertEqual(len(self.sent), 1)            # ОДНА строка на всех, а не три карточки
+                       queue=_FakeQueue(rows=rows), sender=self._sender)
+        self.assertTrue(rep["reminded"])
+        self.assertEqual(len(self.sent), 1)            # ОДНА строка на всех, а не карточки
         self.assertIsNone(self.sent[0][1])             # у напоминания кнопок нет
 
     def test_claim_without_visible_consequence_is_held_with_a_reason(self):
-        q = _FakeQueue(rows=[live_row(1, status="done")])
+        # Ряд уже НЕ ждёт решения — и это придержка ПОСЛЕ отбора: заявка обязана
+        # быть клиентским дефектом, иначе до `consequences` дело не дойдёт вовсе.
+        q = _FakeQueue(rows=[defect_row(42, status="done")])
         rep = run.tick(root=self.dir, state_path=self.state, send=True,
                        clock=lambda: 1788400000.0, queue=q, sender=self._sender)
         self.assertEqual(self.sent, [])
@@ -389,10 +437,143 @@ class TestTick(unittest.TestCase):
 
     def test_dry_run_touches_nothing(self):
         rep = run.tick(root=self.dir, state_path=self.state, send=False,
-                       clock=lambda: 1788400000.0, queue=_FakeQueue(), sender=self._sender)
+                       clock=lambda: 1788400000.0, queue=_FakeQueue(rows=[defect_row(42)]),
+                       sender=self._sender)
         self.assertEqual(self.sent, [])
         self.assertFalse(os.path.exists(self.state))
-        self.assertEqual(len(rep["sent"]), 3)          # собрано, но не отправлено
+        self.assertEqual(len(rep["sent"]), 1)          # собрано, но не отправлено
+
+
+class TestOtborCardOrDigest(unittest.TestCase):
+    """ОТБОР 03.09.2026: карточкой — только клиентский дефект, прочее — строкой сводки.
+
+    Четыре отрицательные пробы задания стоят здесь вместе с голденом непорочности:
+    без последнего «ноль карточек» ничего не доказывает — ровно так первая версия
+    фильтра и была вырожденной (вето по цене срабатывало на ярлыке вида, который
+    есть в КАЖДОЙ находке, и 0 из 122 читался как «дефектов нет»).
+    """
+
+    def _digest(self, row):
+        return z.digest(row)
+
+    def _sig(self, row):
+        return z.defect_signals(row.get("task_text"))
+
+    # ── голден непорочности: фильтр УМЕЕТ сказать «да» ────────────────────
+    def test_filter_not_degenerate(self):
+        row = defect_row(42)
+        got, sig = self._digest(row), self._sig(row)
+        self.assertTrue(sig["client"], "живая фраза дефекта не дала слов поверхности")
+        self.assertTrue(sig["defect"], "живая фраза дефекта не дала слов дефекта")
+        self.assertFalse(sig["cost"], "ярлык вида «НЕ ДЕЛАТЬ ВОВСЕ» снова считается ценой — "
+                                      "фильтр выродился, как 03.09 до правки")
+        verdict = z.client_defect(got, sig, ["suggest.py"])
+        self.assertTrue(verdict["is"], verdict["why"])
+        steps = z.route([got], {DEFECT_KEY: sig}, {DEFECT_KEY: ["suggest.py"]}, sent_today=0)
+        self.assertEqual(steps[0]["action"], "card")
+
+    def test_kind_label_alone_is_not_a_cost_claim(self):
+        # Прямая защита от вырождения: голая шапка вида НЕ обязана давать слов цены.
+        for label in ("УПРОЩАЕМО", "НЕ ДЕЛАТЬ ВОВСЕ", "ПЕРЕУСЛОЖНЕНО"):
+            self.assertFalse(z.defect_signals("1. %s: " % label)["cost"], label)
+
+    # ── 1. находка БЕЗ АДРЕСА карточкой не идёт ──────────────────────────
+    def test_finding_without_an_address_gets_no_card(self):
+        # Адреса нет → ступень B честно ставит премису НЕИЗВЕСТНО (её собственная
+        # ветка «адрес не назван»), и отбор обязан отказать НА ПЕРВОМ условии.
+        nameless = ri.premise([])
+        self.assertEqual(nameless["outcome"], ri.PREMISE_UNKNOWN)
+        row = defect_row(42, premise=nameless)
+        got, sig = self._digest(row), self._sig(row)
+        verdict = z.client_defect(got, sig, ["suggest.py"])
+        self.assertFalse(verdict["is"])
+        self.assertIn("посылка не жива", verdict["why"])
+        steps = z.route([got], {DEFECT_KEY: sig}, {DEFECT_KEY: ["suggest.py"]}, sent_today=0)
+        self.assertEqual(steps[0]["action"], "digest")
+
+    # ── 2. находка с ПРОТУХШЕЙ посылкой карточкой не идёт ────────────────
+    def test_stale_premise_gets_no_card(self):
+        stale = ri.premise([{"anchor": "RULE-1", "address": "", "found": False}])
+        self.assertEqual(stale["outcome"], ri.PREMISE_STALE)
+        row = defect_row(42, premise=stale)
+        got, sig = self._digest(row), self._sig(row)
+        verdict = z.client_defect(got, sig, ["suggest.py"])
+        self.assertFalse(verdict["is"])
+        self.assertIn("посылка не жива", verdict["why"])
+        self.assertEqual(z.route([got], {DEFECT_KEY: sig},
+                                 {DEFECT_KEY: ["suggest.py"]})[0]["action"], "digest")
+
+    # ── 3. клиентский дефект едет СВЕРХ ПОТОЛКА ──────────────────────────
+    def test_client_defect_passes_even_over_the_cap(self):
+        row = defect_row(42)
+        got, sig = self._digest(row), self._sig(row)
+        steps = z.route([got], {DEFECT_KEY: sig}, {DEFECT_KEY: ["suggest.py"]},
+                        sent_today=z.CARD_CAP)          # потолок исчерпан ПОЛНОСТЬЮ
+        self.assertEqual(steps[0]["action"], "card_over")
+        self.assertIn("потолок", steps[0]["why"])
+        text = z.message(got, defect_why=steps[0]["why"], over_cap=True)
+        self.assertIn(z.OVER_CAP_MARK, text)
+        self.assertTrue(text.startswith(z.OVER_CAP_MARK), "пометка обязана идти ПЕРВОЙ строкой")
+        # и в сводке это ОТЛОЖЕНО ПОТОЛКОМ, а не отброшено
+        self.assertIn(z.OVER_CAP_MARK, z.summary(steps))
+
+    def test_cap_never_turns_a_finding_into_silence(self):
+        # Сколько бы ни было сверх потолка — на каждую находку остаётся след.
+        rows = [defect_row(40 + i) for i in range(5)]
+        items = [self._digest(r) for r in rows]
+        sig = {DEFECT_KEY: self._sig(rows[0])}
+        steps = z.route(items, sig, {DEFECT_KEY: ["suggest.py"]}, sent_today=0)
+        self.assertEqual(len(steps), 5)
+        self.assertTrue(all(s["action"] in ("card", "card_over") for s in steps))
+        self.assertEqual(sum(1 for s in steps if s["action"] == "card"), z.CARD_CAP)
+
+    # ── 4. лоток недоступен → НЕИЗВЕСТНО, а не ноль ──────────────────────
+    def test_unreadable_inbox_says_unknown_not_zero(self):
+        text = z.summary([], inbox_ok=False, inbox_why="мост не ответил")
+        self.assertIn("НЕИЗВЕСТНО", text)
+        self.assertIn("мост не ответил", text)
+        self.assertNotIn("пришло 0", text)
+        self.assertIn("отсутствием находок не является", text)
+
+    def test_tick_reports_unknown_when_the_queue_is_silent(self):
+        d = tempfile.mkdtemp(prefix="zayavki_unk_")
+        rep = run.tick(root=d, state_path=os.path.join(d, "s.json"), send=True,
+                       clock=lambda: 1788400000.0,
+                       queue=_FakeQueue(ok=False, why="мост не ответил"), sender=lambda *a: None)
+        self.assertIn("НЕИЗВЕСТНО", rep["summary"])
+
+    # ── обычная находка (не про клиента) уходит строкой в сводку ─────────
+    def test_ordinary_finding_goes_to_the_digest_line(self):
+        row = live_row(3)
+        got, sig = self._digest(row), self._sig(row)
+        steps = z.route([got], {LIVE_KEY: sig}, {LIVE_KEY: []}, sent_today=0)
+        self.assertEqual(steps[0]["action"], "digest")
+        text = z.summary(steps, found=1)
+        self.assertIn("пришло 1", text)
+        self.assertIn("карточкой отобрано 0", text)
+        self.assertIn(z.INBOX_DIR, text)               # указатель на лоток обязателен
+
+    def test_digest_carries_no_foreign_text(self):
+        # Прямой запрет задания: чужой текст канала в сводку телом не переносится.
+        row = live_row(3)
+        got = self._digest(row)
+        steps = z.route([got], {LIVE_KEY: self._sig(row)}, {LIVE_KEY: []})
+        text = z.summary(steps, found=1)
+        self.assertNotIn(LIVE_CLAIM["quote"], text)
+        self.assertNotIn(z.QUOTE_HEAD, text)
+
+    def test_signals_return_only_our_own_vocabulary(self):
+        # Устройством, а не аккуратностью: наружу уходят слова ИЗ НАШИХ СПИСКОВ.
+        sig = z.defect_signals(defect_row(42)["task_text"])
+        for bucket, words in (("client", z.CLIENT_WORDS), ("defect", z.DEFECT_WORDS),
+                              ("cost", z.COST_WORDS)):
+            for word in sig[bucket]:
+                self.assertIn(word, words, "в возврате слово не из нашего списка: %r" % word)
+
+    def test_cap_is_below_stage_b_daily_budget(self):
+        # Поставить заявку и ПЕРЕБИТЬ ею работу владельца — разные по цене действия.
+        import review_intake_run
+        self.assertLess(z.CARD_CAP, review_intake_run.DEFAULT_BUDGET)
 
 
 class TestButtonContract(unittest.TestCase):
