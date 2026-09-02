@@ -23,6 +23,17 @@
 ОДИН оборот, а дефект живёт со второго. Поэтому здесь ``held`` читается в
 :func:`announce_due` (ветка ``held``), и регресс гоняет ДВА оборота подряд.
 
+СРОК ГОДНОСТИ И АРХИВ (02.09.2026). Запись старше суток в повтор не идёт и
+уходит в ``archived`` с причиной и датой (:func:`archive_stale`). «Закрыть» здесь
+значит ПОМЕТИТЬ: ни запись, ни история, ни пакет не трогаются — меняется одно
+поле состояния, и вместе с ним ответ на вопрос «числить ли её живой». До этой
+ветки 14 записей стояли ``exhausted`` бессрочно и печатали в журнал одну и ту же
+строку каждым оборотом (``exhausted`` считается по ВСЕМУ реестру, а не дельтой
+оборота: замер 02.09 — 8 дословно одинаковых записей за 1 ч 49 мин, потолок 144
+в сутки). Откат — ОДНО ЧИСЛО, ``review_outbox_queue.EXPIRE_AFTER_SEC``: обе
+ветки, и запрет повтора, и архив, читают его одного, и большое значение убивает
+их разом.
+
 ЧТО ЭТОТ МОДУЛЬ НЕ ДЕЛАЕТ. Не удаляет ни пакетов, ни файлов лотка. Не ставит
 задач и очередь ПК не трогает вовсе — ни чтением, ни записью. Не читает ``.env``:
 ключ канала берёт сам отправщик в своём процессе. Не превращает исчерпание в
@@ -340,6 +351,79 @@ def retry_due(state, *, root=HERE, inbox=DEFAULT_INBOX, now=None, budget=RETRY_B
     return out
 
 
+# ───────────────────────────── срок и архив ─────────────────────────────
+
+
+def archive_reason(rec, marks, now):
+    """Запись пора закрыть? → (bool, why). ДВА названных признака, не один.
+
+    **Признак 1 — СРОК.** Запись старше суток: посылка, о которой она судит,
+    прожила дольше кода, которым её слали (:func:`review_outbox_queue.expired`).
+
+    **Признак 2 — ПОКАЗ ПО НЕЙ ЗАКОНЧЕН.** Запись исчерпана И отметка показа у
+    неё уже стои́т. Дальше очередь по ней не скажет НИЧЕГО: повтора нет по
+    состоянию, показа нет по отметке. Отметок ровно две, и обе означают конец:
+    штамп времени — «уже показали», слово ``bootstrap`` — «показывать не будем
+    никогда» (``announce_due`` держит бутстрап вечно, а демон зовёт оборот без
+    ``--force``: замер 02.09 — владелец получил 1 сообщение из 14 и получил бы
+    ещё 0). Без этого признака ровно эти 13 записей числились бы живыми
+    бессрочно, ничего при этом не ожидая.
+
+    Два признака, а не один общий, потому что они отвечают на РАЗНЫЕ вопросы:
+    срок — «есть ли ещё смысл повторять», показ — «есть ли ещё что сказать». И
+    причина в записи пишется та, которая сработала, а не общее слово.
+    """
+    if rec.get("state") == "exhausted":
+        mark = (marks or {}).get(rec.get("key") or "")
+        if mark == "bootstrap":
+            return True, ("показ по записи закончен: заход старше первого оборота очереди, "
+                          "в тему он не уедет ни одним оборотом, а повтора у неё нет")
+        if mark:
+            return True, "показ по записи закончен: в тему уже показана (%s), повтора у неё нет" % mark
+    return Q.expired(rec, now)
+
+
+def archive_stale(state, *, now=None, skip=()):
+    """Отжившие записи → архив. → список заархивированного (новые записи).
+
+    НИЧЕГО НЕ УДАЛЯЕТ. Запись остаётся в реестре целиком, история не трогается,
+    файл лотка и пакет лежат на месте — меняется одно поле состояния. Смысл
+    ветки в том, чтобы очередь перестала числить ЖИВЫМ то, что не ждёт уже
+    ничего: до неё 14 записей стояли ``exhausted`` бессрочно и печатали в журнал
+    одну и ту же строку каждый оборот (замер 02.09 — 8 одинаковых записей за
+    1 ч 49 мин при потолке 144 в сутки).
+
+    Берутся ОБА открытых состояния, ``queued`` и ``exhausted``: просроченная
+    ждущая запись — это обещание повтора, которого :func:`review_outbox_queue.due`
+    уже не даст, и оставить её в очереди значило бы врать числом «в очереди N».
+
+    Исчерпанная запись БЕЗ отметки показа не трогается ни одной веткой: она ждёт
+    своей очереди в тему (потолок показов 3 в сутки), и закрыть её здесь значило
+    бы съесть показ, ради которого ступень и заведена.
+
+    ``skip`` — ключи записей, РОЖДЁННЫХ этим оборотом. Они не закрываются, даже
+    если признак сработал: новая запись это НОВОСТЬ, и она обязана прозвучать в
+    отчёте и в журнале хотя бы раз («взято в очередь 1, исчерпано 1»). Закрытая
+    в тот же оборот, она родилась бы и умерла молча — ровно тот молчаливый
+    пропуск, от которого ступень и защищается.
+    """
+    now = now or now_utc()
+    marks = state.get("announced") or {}
+    fresh = set(skip or ())
+    out = []
+    for k, rec in sorted(state.get("packs", {}).items()):
+        if not isinstance(rec, dict) or rec.get("state") not in ("queued", "exhausted"):
+            continue
+        if k in fresh:
+            continue
+        close, why = archive_reason(rec, marks, now)
+        if not close:
+            continue
+        state["packs"][k] = Q.archive(rec, at=now, why=why)
+        out.append(state["packs"][k])
+    return out
+
+
 # ───────────────────────────── показ молчания ─────────────────────────────
 
 
@@ -350,6 +434,11 @@ def announce_due(state, *, now=None, topic=0, budget=ANNOUNCE_BUDGET, send=False
     ``held``-ветка ЧИТАЕТ отметку бутстрапа, а не только пишет её: ровно на этом
     ступень D поймала свой декоративный бутстрап. Отметка снимается только
     ``--force``.
+
+    АРХИВ ПОКАЗА НЕ ОТНИМАЕТ, и это проверено тестом. Закрытая по сроку запись
+    остаётся видимой этой ветке: «архив» отвечает на вопрос «числить ли её
+    живой», а не «можно ли о ней спросить». Иначе закрытие backlog'а молча
+    отняло бы у владельца единственную дорогу к нему — ``--force``.
     """
     now = now or now_utc()
     day = now.date().isoformat()
@@ -357,7 +446,7 @@ def announce_due(state, *, now=None, topic=0, budget=ANNOUNCE_BUDGET, send=False
     rep = {"announced": [], "held": [], "failed": [], "texts": [], "budget_left": max(0, budget - used)}
     left = len([r for r in state["packs"].values() if r.get("state") == "queued"])
     for k, rec in sorted(state["packs"].items()):
-        if rec.get("state") != "exhausted":
+        if rec.get("state") not in ("exhausted", "archived"):
             continue
         mark = (state.get("announced") or {}).get(k)
         if mark == "bootstrap" and not force:
@@ -439,6 +528,13 @@ def tick(root=HERE, state_path=None, inbox=DEFAULT_INBOX, send=False, clock=None
         for k in ("added", "closed", "advanced", "skipped"):
             synced[k] = list(synced[k]) + list(synced2[k])
 
+    # СРОК — ПОСЛЕ повтора и ДО показа. После повтора: удавшийся заход закрывает
+    # запись ответом, и архивировать её было бы враньём об исходе. До показа:
+    # заархивированное в тему не уезжает вовсе (``announce_due`` смотрит только
+    # ``exhausted``) — молчание про пакет, о котором нечего сказать нового.
+    archived = archive_stale(state, now=now,
+                             skip={r.get("key") for r in synced["added"] if isinstance(r, dict)})
+
     topic, topic_why = review_audit_run.audit_topic(daemon=daemon) if send else (0, "сухой ход: адрес не спрашивали")
     announced = announce_due(state, now=now, topic=topic, budget=budget, send=bool(send and topic),
                              sender=sender, force=force)
@@ -466,6 +562,9 @@ def tick(root=HERE, state_path=None, inbox=DEFAULT_INBOX, send=False, clock=None
         "retried": retried["retried"],
         "retry_skipped": retried["skipped"],
         "exhausted": exhausted,
+        "archived": archived,
+        "archived_total": sum(1 for r in state["packs"].values()
+                              if isinstance(r, dict) and r.get("state") == "archived"),
         "queued": len(queued),
         "queued_recs": queued,
         "announced": announced["announced"],
@@ -493,8 +592,13 @@ def _render(report):
     out.append("тема Аудит: %s%s" % (report["topic"] or "не настроена", (" (%s)" % report["topic_why"]) if report.get("topic_why") else ""))
     out.append("взято в очередь: %d · продвинуто: %d · закрыто ответом: %d · пропущено файлов: %d"
                % (len(report["added"]), len(report["advanced"]), len(report["closed"]), len(report["skipped"])))
-    out.append("повторов: %d · в очереди ждут: %d · исчерпано: %d"
-               % (len(report["retried"]), report["queued"], len(report["exhausted"])))
+    out.append("повторов: %d · в очереди ждут: %d · исчерпано: %d · закрыто просроченных этим оборотом: %d "
+               "(в архиве всего: %d)"
+               % (len(report["retried"]), report["queued"], len(report["exhausted"]),
+                  len(report.get("archived") or []), int(report.get("archived_total") or 0)))
+    for rec in sorted(report.get("archived") or [], key=lambda r: r.get("key") or ""):
+        outcome, title, why = Q.outcome(rec)
+        out.append("  ЗАКРЫТО ПРОСРОЧЕННЫМ %s · %s · %s" % (rec["key"], title, why))
     for rec in sorted(report["queued_recs"], key=lambda r: r.get("next_at") or ""):
         out.append("  ЖДЁТ %s · попытка %d/%d · вид %s · следующая %s · причина `%s` (%s)"
                    % (rec["key"], rec["attempts"], Q.MAX_ATTEMPTS, rec["kind"], rec["next_at"],

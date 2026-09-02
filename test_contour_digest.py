@@ -485,5 +485,122 @@ class TestLiveTree(unittest.TestCase):
         self.assertLess(len(line), 600, "строка журнала обязана быть индексом, а не телом")
 
 
+class TestExternalAnswersLine(unittest.TestCase):
+    """ВНЕШНИЕ ОТВЕТЫ ЗА СУТКИ — дайджест, а не поток.
+
+    Проверяется по существу: числа задания стои́т в строке ВСЕ ТРИ, чужого текста
+    в ней нет ни знака, а молчание канала названо СЛОВОМ, а не нулём.
+    """
+
+    DAY = "2026-09-01"
+
+    def heads(self):
+        """Живой разрез 01.09 в форме, которую отдаёт ``answer_headers``."""
+        rows = []
+        for n in range(6):
+            rows.append({"channel": "codex", "send_date": self.DAY, "outcome": "answered",
+                         "reason": "", "answered": True, "rel": "docs/review_inbox/a%d.md" % n})
+        for n in range(10):
+            rows.append({"channel": "manus", "send_date": self.DAY, "outcome": "refused",
+                         "reason": "http_400", "answered": False, "rel": "docs/review_inbox/m%d.md" % n})
+        for n in range(3):
+            rows.append({"channel": "manus", "send_date": self.DAY, "outcome": "refused",
+                         "reason": "accepted_no_answer", "answered": False,
+                         "rel": "docs/review_inbox/s%d.md" % n})
+        # Чужой день в корпусе есть намеренно: он обязан выпасть из счёта.
+        rows.append({"channel": "codex", "send_date": "2026-08-31", "outcome": "answered",
+                     "reason": "", "answered": True, "rel": "docs/review_inbox/old.md"})
+        return rows
+
+    def records(self):
+        out = [{"send_date": self.DAY, "kind": "дефект", "quote": "СЕКРЕТНЫЙ ЧУЖОЙ ТЕКСТ ревьюера"}
+               for _ in range(4)]
+        out += [{"send_date": self.DAY, "kind": "переусложнено", "quote": "ещё чужой текст"}]
+        out += [{"send_date": "2026-08-31", "kind": "иное", "quote": "вчерашнее"}]
+        return out
+
+    def test_all_three_numbers_of_the_task_are_in_the_line(self):
+        got = cd.external_stats(self.heads(), self.records(), self.DAY)
+        self.assertEqual(got["answers"], 6)
+        self.assertEqual(got["channels_answered"], 1)
+        self.assertEqual(got["refused"], 13)
+        words = cd.external_words(got)
+        self.assertIn("пришло 6", words)
+        self.assertIn("каналов ответило 1 из 2", words)
+        self.assertIn("отказов канала 13", words)
+
+    def test_the_day_is_a_calendar_day_and_the_neighbour_day_is_out(self):
+        """Окно — КАЛЕНДАРНЫЙ день: скользящих суток в источнике нет вовсе."""
+        got = cd.external_stats(self.heads(), self.records(), self.DAY)
+        self.assertEqual(got["attempts"], 19, "заход соседнего дня попал в счёт")
+        self.assertEqual(got["findings"], 5, "находка соседнего дня попала в счёт")
+        self.assertIn(self.DAY, cd.external_words(got), "день обязан быть НАЗВАН в строке")
+
+    def test_a_silent_channel_is_called_down_not_zero(self):
+        """«Канал лежал» — отдельное слово: ноль читался бы как «нечего сказать»."""
+        got = cd.external_stats(self.heads(), self.records(), self.DAY)
+        self.assertEqual(got["down"], ["manus"])
+        words = cd.external_words(got)
+        self.assertIn("КАНАЛ ЛЕЖАЛ: manus", words)
+        self.assertEqual(cd.external_verdict(got), cd.RED,
+                         "лежащий канал — это красное, а не спокойствие")
+
+    def test_a_living_channel_is_not_red(self):
+        alive = [h for h in self.heads() if h["answered"]]
+        got = cd.external_stats(alive, self.records(), self.DAY)
+        self.assertEqual(got["down"], [])
+        self.assertEqual(cd.external_verdict(got), cd.OK)
+
+    def test_no_foreign_text_ever_reaches_the_line(self):
+        """САМОЕ ДОРОГОЕ здесь: дайджест, а не поток — счёт и темы, не тела."""
+        words = cd.external_words(cd.external_stats(self.heads(), self.records(), self.DAY))
+        self.assertNotIn("СЕКРЕТНЫЙ", words)
+        self.assertNotIn("чужой текст", words)
+        self.assertIn("темы находок (5)", words)
+        self.assertIn("дефект ×4", words)
+        self.assertIn("тексты не пересылаем", words)
+        # Указатель на лоток обязан быть в ГОТОВОЙ строке — его ставит адрес
+        # источника, а не второй литерал внутри слов.
+        rd = cd.reading("external", words, src="inbox", read_at=NOW, now=NOW, kind=cd.OK)
+        self.assertIn(cd.INBOX_POINTER, cd.line_text(rd))
+        self.assertEqual(cd.line_text(rd).count(cd.INBOX_POINTER), 1,
+                         "адрес лотка напечатан дважды — два экземпляра разойдутся молча")
+
+    def test_the_pointer_is_the_source_address_not_a_second_literal(self):
+        """Два экземпляра одного адреса расходятся молча — класс полосы."""
+        self.assertEqual(cd.INBOX_POINTER, cd.source("inbox")["addr"])
+        self.assertIsNone(cd.limit_of("inbox"), "лоток читается живьём — возраста не имеет")
+
+    def test_an_empty_day_says_so_instead_of_pretending_calm(self):
+        got = cd.external_stats([], [], self.DAY)
+        words = cd.external_words(got)
+        self.assertIn("заходов в каналы не было", words)
+        self.assertEqual(cd.external_verdict(got), cd.OK)
+
+    def test_a_missing_tray_is_unknown_not_an_empty_day(self):
+        """Отсутствующий лоток и пустой — РАЗНЫЕ новости, и различает их код."""
+        with tempfile.TemporaryDirectory() as tmp:
+            heads, records, why = run.read_inbox(tmp)
+            self.assertIsNone(heads)
+            self.assertIsNone(records)
+            self.assertIn("лоток не найден", why)
+            rows = run.section_external(heads, records, why, self.DAY, NOW)
+            self.assertEqual(rows[0]["kind"], cd.UNKNOWN)
+            self.assertNotIn(tmp, cd.line_text(rows[0]),
+                             "абсолютный путь в строке задержал бы сообщение стражем")
+
+    def test_the_day_of_the_window_is_utc(self):
+        """Местный день сдвинул бы разрез на семь часов — известная мина полосы."""
+        # 2026-09-01 23:30 UTC: местное время полосы уже 02.09, день обязан быть 01.
+        self.assertEqual(run.day_utc(1788305400.0), "2026-09-01")
+
+    def test_the_topic_is_in_the_message_on_the_live_repo(self):
+        rep = run.build(root=HERE)
+        self.assertTrue(rep["readings"].get("external"))
+        text = cd.render(rep) if not cd.is_calm(rep) else ""
+        if text:
+            self.assertIn("ВНЕШНИЕ ОТВЕТЫ ЗА СУТКИ", text)
+
+
 if __name__ == "__main__":            # pragma: no cover
     unittest.main(verbosity=2)

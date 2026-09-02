@@ -39,6 +39,7 @@ import sys
 import contour_digest as cd
 import review_audit
 import review_audit_run
+import review_intake_run
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_STATE = "contour_digest_state.json"
@@ -322,6 +323,56 @@ def section_await(snapshot, read_at, why, now):
                        read_at=read_at, now=now, kind=cd.WAIT)]
 
 
+def day_utc(ts):
+    """Календарный день UTC для окна внешних ответов. → 'YYYY-MM-DD'.
+
+    Именно UTC, а не местное: ``отправлено:`` в файле ответа пишет отправщик по
+    UTC, и местный день сдвинул бы разрез на семь часов — та же мина, на которой
+    ``git log --since=`` уже показывал 11 коммитов вместо 3.
+    """
+    try:
+        return datetime.datetime.fromtimestamp(float(ts), datetime.timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def read_inbox(root, inbox=None):
+    """Лоток → (шапки заходов, записи находок, причина отказа).
+
+    Оба разбора — ЧУЖИМ кодом: шапки читает ступень D
+    (:func:`review_audit_run.answer_headers`), находки — ступень B
+    (:func:`review_intake_run.read_records`). Свой третий разборщик означал бы,
+    что сводка и суточный дайджест могут разойтись в том, что вообще считается
+    ответом канала.
+
+    Мост здесь по-прежнему НЕ ЗОВЁТСЯ, и заявки не строятся: премиса находок
+    требует ``git ls-files`` и проб по дереву, а сводке нужны только вид находки
+    и счёт. Читаются ФАЙЛЫ ЛОТКА и ничего больше.
+    """
+    inbox = inbox or review_intake_run.DEFAULT_INBOX
+    # ПУСТОЙ ЛОТОК И ОТСУТСТВУЮЩИЙ — РАЗНЫЕ НОВОСТИ, и различить их обязаны мы:
+    # обход каталога, которого нет, отдаёт пустой список молча, и строка сказала
+    # бы «заходов не было» там, где правда «спросить не у кого». Третий исход
+    # ставится ЗДЕСЬ, потому что ниже его уже нечем отличить.
+    if not os.path.isdir(_path(root, inbox)):
+        return None, None, "лоток не найден по адресу %s" % inbox
+    try:
+        headers, _hskip = review_audit_run.answer_headers(root=root, inbox=inbox)
+        records, _rskip = review_intake_run.read_records(root, inbox)
+    except Exception as exc:                       # noqa: BLE001 — источник не роняет сводку
+        return None, None, _cause(exc)
+    return headers, records, ""
+
+
+def section_external(headers, records, why, day, now):
+    """«Внешние ответы за сутки» — одна строка, дайджестом, без чужих текстов."""
+    if headers is None or records is None:
+        return [cd.dead_source("external", "inbox", why)]
+    stats = cd.external_stats(headers, records, day)
+    return [cd.reading("external", cd.external_words(stats), src="inbox",
+                       read_at=now, now=now, kind=cd.external_verdict(stats))]
+
+
 def section_axis(root, since, now, runner=None):
     """«Двигался ли этап 3 и двигался ли бизнес» — по путям коммитов за окно."""
     out = []
@@ -351,7 +402,8 @@ def section_series(snapshot, read_at, why, now):
 
 # ───────────────────────────── оборот ─────────────────────────────
 
-def build(root=HERE, now=None, since=None, interval=cd.INTERVAL_SEC, runner=None):
+def build(root=HERE, now=None, since=None, interval=cd.INTERVAL_SEC, runner=None, inbox=None,
+          day=None):
     """Все источники → отчёт. Ни одной ветки записи, кроме метки оборота у tick."""
     now = now_ts(now)
     if since is None:
@@ -359,6 +411,7 @@ def build(root=HERE, now=None, since=None, interval=cd.INTERVAL_SEC, runner=None
     snapshot, q_at, q_why = read_json(root, cd.source("queue")["addr"])
     expect, e_at, e_why = read_json(root, cd.source("expect")["addr"])
     outbox, o_at, o_why = read_json(root, cd.source("outbox")["addr"])
+    heads, records, i_why = read_inbox(root, inbox)
     closed_rows, closed_count = section_closed(snapshot, q_at, q_why, since, now)
     series_rows, counted = section_series(snapshot, q_at, q_why, now)
     # Слепок старше предела → чистая логика уже сказала «неизвестно». Числа серии в
@@ -379,6 +432,7 @@ def build(root=HERE, now=None, since=None, interval=cd.INTERVAL_SEC, runner=None
             "red": section_red(snapshot, q_at, q_why, expect, e_at, e_why,
                                outbox, o_at, o_why, since, now),
             "await": section_await(snapshot, q_at, q_why, now),
+            "external": section_external(heads, records, i_why, day or day_utc(now), now),
             "axis": section_axis(root, since, now, runner=runner),
             "series": series_rows,
         },

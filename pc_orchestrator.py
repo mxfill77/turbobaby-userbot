@@ -9421,9 +9421,10 @@ def maybe_review_outbox(now=None, tick_path=None, state_path=None, runner=None):
     if not report.get("line"):
         log.debug("ступень F: %s", "оборот без новостей")
         return report
-    log.info("ступень F: взято %d, повторено %d, исчерпано %d, в очереди %d",
+    log.info("ступень F: взято %d, повторено %d, исчерпано %d, закрыто просроченных %d, в очереди %d",
              len(report.get("added") or []), len(report.get("retried") or []),
-             len(report.get("exhausted") or []), int(report.get("queued") or 0))
+             len(report.get("exhausted") or []), len(report.get("archived") or []),
+             int(report.get("queued") or 0))
     _cowork(review_outbox_queue_run.line(report) or "ступень F: оборот без строки исхода")
     return report
 

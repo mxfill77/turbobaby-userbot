@@ -284,7 +284,14 @@ class TestRecord(unittest.TestCase):
         self.assertEqual(rec["state"], "closed")
 
     def test_no_state_ever_yields_done(self):
-        """Перебор ВСЕХ состояний: «готово» есть ровно у одного — у ответа."""
+        """Перебор ВСЕХ состояний: «готово» есть ровно у одного — у ответа.
+
+        ``archived`` добавлено 02.09 вместе со сроком годности записи, и оно
+        обязано попадать в этот перебор: терминальное состояние, придуманное
+        мимо теста, — ровно тот способ, которым «готово» и появляется на новой
+        дороге. Архив отвечает «отказ канала», а на оплаченном заходе —
+        «неизвестно» (см. следующий тест), и ни на одной ветке не «ответ».
+        """
         seen = {}
         rec = self.rec()
         for state in Q.STATES:
@@ -293,7 +300,9 @@ class TestRecord(unittest.TestCase):
             if state == "closed":
                 probe["closed_why"] = "канал ответил"
             seen[state] = Q.outcome(probe)[0]
-        self.assertEqual(seen, {"queued": "unknown", "exhausted": "unknown", "closed": "answered"})
+        self.assertEqual(seen, {"queued": "unknown", "exhausted": "unknown",
+                                "closed": "answered", "archived": "refused"})
+        self.assertEqual([s for s, o in seen.items() if o == "answered"], ["closed"])
 
     def test_naive_time_is_refused(self):
         with self.assertRaises(Q.ReviewOutboxError):
@@ -975,6 +984,271 @@ class TestStageFWiring(unittest.TestCase):
         body = self.src[idx:idx + 2600]
         for bad in ("os.remove", "shutil.rmtree", "BRIDGE_TOKEN", "MANUS_API_KEY", "enqueue_pc_task"):
             self.assertNotIn(bad, body)
+
+
+class TestExpiryRule(unittest.TestCase):
+    """СРОК ГОДНОСТИ ЗАПИСИ: пакет старше суток в повтор не идёт.
+
+    Отрицательная проба здесь — ГЛАВНАЯ, и она стои́т на МИНУТЕ по обе стороны
+    границы: правило «старше суток» проверяется не «через неделю не повторяет»
+    (это подтвердил бы и сломанный порог), а тем, что сутки−минута ЕЩЁ
+    повторяются, а сутки+минута УЖЕ нет.
+    """
+
+    def rec(self, reason="http_503", moment=None):
+        return Q.new_record(pack="docs/review_outbox/p.md", channel="manus",
+                            send_date="2026-09-01", reason=reason, at=moment or at(12))
+
+    def ripe(self, rec, now):
+        """Запись, дозревшую по ПАУЗЕ, — чтобы срок судил один, а не пауза за него."""
+        out = dict(rec)
+        out["next_at"] = Q.iso(now - datetime.timedelta(seconds=1))
+        return out
+
+    def test_a_minute_short_of_a_day_still_retries(self):
+        born = at(12)
+        rec = self.ripe(self.rec(moment=born), born)
+        now = born + datetime.timedelta(seconds=Q.EXPIRE_AFTER_SEC - 60)
+        old, why = Q.expired(rec, now)
+        self.assertFalse(old, why)
+        ok, due_why = Q.due(rec, now)
+        self.assertTrue(ok, "сутки минус минута обязаны повторяться: %s" % due_why)
+
+    def test_a_minute_past_a_day_never_retries(self):
+        born = at(12)
+        rec = self.ripe(self.rec(moment=born), born)
+        now = born + datetime.timedelta(seconds=Q.EXPIRE_AFTER_SEC + 60)
+        old, why = Q.expired(rec, now)
+        self.assertTrue(old, "сутки плюс минута обязаны быть просрочены")
+        self.assertIn("просрочен по возрасту", why)
+        ok, due_why = Q.due(rec, now)
+        self.assertFalse(ok, "просроченная запись повтора не получает")
+        self.assertIn("просрочен по возрасту", due_why,
+                      "причина отказа обязана называть ВОЗРАСТ, а не паузу")
+
+    def test_the_border_itself_is_not_expired(self):
+        """Ровно сутки — ещё НЕ просрочен: граница принадлежит живой стороне."""
+        born = at(12)
+        now = born + datetime.timedelta(seconds=Q.EXPIRE_AFTER_SEC)
+        self.assertFalse(Q.expired(self.rec(moment=born), now)[0])
+
+    def test_age_is_measured_from_the_first_attempt_not_the_last(self):
+        """От ``last_at`` срок не наступил бы никогда: его двигает наш же оборот."""
+        born = at(12)
+        rec = self.rec(moment=born)
+        rec["last_at"] = Q.iso(born + datetime.timedelta(days=3))
+        now = born + datetime.timedelta(days=3, seconds=1)
+        self.assertTrue(Q.expired(rec, now)[0],
+                        "свежий last_at не смеет продлевать жизнь записи")
+
+    def test_the_rollback_is_one_number_for_both_branches(self):
+        """Запрет повтора и архив читают ОДНО число: две ручки разошлись бы молча."""
+        src = io.open(os.path.join(HERE, "review_outbox_queue.py"), encoding="utf-8").read()
+        self.assertEqual(src.count("EXPIRE_AFTER_SEC"), src.count("EXPIRE_AFTER_SEC"))
+        born = at(12)
+        rec = self.ripe(self.rec(moment=born), born)
+        far = born + datetime.timedelta(seconds=Q.EXPIRE_AFTER_SEC * 3)
+        self.assertFalse(Q.due(rec, far)[0])
+        state = R.state_default()
+        state["packs"][rec["key"]] = rec
+        self.assertEqual(len(R.archive_stale(state, now=far)), 1)
+        # Одно и то же число решает обе судьбы — граница у них общая.
+        near = born + datetime.timedelta(seconds=Q.EXPIRE_AFTER_SEC - 60)
+        state2 = R.state_default()
+        state2["packs"][rec["key"]] = rec
+        self.assertTrue(Q.due(rec, near)[0])
+        self.assertEqual(R.archive_stale(state2, now=near), [])
+
+    def test_unreadable_stamp_does_not_expire_anything(self):
+        """Fail-closed здесь значит «не трогай», а не «архивируй»."""
+        rec = self.rec()
+        rec["first_at"] = "позавчера"
+        old, why = Q.expired(rec, at(12, day=9))
+        self.assertFalse(old)
+        self.assertIn("не сверить", why)
+
+
+class TestArchiveIsAMarkNotAnErasure(unittest.TestCase):
+    """АРХИВ: пометить, а не стереть. И два разных исхода, а не один."""
+
+    def rec(self, reason, task_id=None):
+        return Q.new_record(pack="docs/review_outbox/p-%s.md" % reason, channel="manus",
+                            send_date="2026-09-01", reason=reason, at=at(3), task_id=task_id)
+
+    def test_archive_keeps_the_whole_record_and_adds_reason_and_date(self):
+        rec = self.rec("http_400")
+        arch = Q.archive(rec, at=at(12, day=3), why="просрочен по возрасту: 33.0 ч")
+        for field in ("pack", "channel", "send_date", "reason", "origin", "first_at", "attempts"):
+            self.assertEqual(arch[field], rec[field], field)
+        self.assertEqual(arch["state"], "archived")
+        self.assertIn("archived_at", arch)
+        self.assertTrue(arch["archived_at"].startswith("2026-09-03"), arch["archived_at"])
+        self.assertIn("просрочен по возрасту", arch["archived_why"])
+        self.assertEqual(len(arch["history"]), len(rec["history"]) + 1,
+                         "история ДОПИСЫВАЕТСЯ, а не переписывается")
+        self.assertEqual(rec["state"], "queued" if rec["kind"] != "none" else "exhausted",
+                         "исходная запись не трогается на месте")
+
+    def test_our_defect_is_a_refusal(self):
+        arch = Q.archive(self.rec("http_400"), at=at(12, day=3))
+        self.assertEqual(arch["archive_outcome"], "refused")
+        self.assertEqual(Q.outcome(arch)[1], "ОТКАЗ КАНАЛА")
+
+    def test_a_paid_attempt_is_unknown_not_a_refusal(self):
+        """Три оплаченных пакета обязаны получить ИНОЙ исход, чем десять отказов.
+
+        Разница не косметическая: ``spent`` значит «канал принял задачу и работу
+        оплатили», и ответ мог быть написан НА ЕГО СТОРОНЕ. Назвать это отказом
+        значило бы утверждать, что ответа нет.
+        """
+        arch = Q.archive(self.rec("accepted_no_answer"), at=at(12, day=3))
+        self.assertEqual(arch["archive_outcome"], "unknown")
+        outc, title, why = Q.outcome(arch)
+        self.assertEqual((outc, title), ("unknown", "НЕИЗВЕСТНО"))
+        self.assertIn("на его стороне", why)
+        # Слово «готово» здесь есть ровно один раз и ровно в ОТРИЦАНИИ — тот же
+        # замок, что у исчерпания: архив не смеет читаться как «сделано».
+        self.assertIn("«готово» здесь не пишется", why)
+        self.assertEqual(why.lower().count("готово"), 1)
+
+    def test_a_new_real_attempt_reopens_the_record_and_drops_the_archive_marks(self):
+        """Архив закрывает ПРОШЛОЕ: настоящий новый заход открывает запись заново."""
+        arch = Q.archive(self.rec("http_503"), at=at(12, day=3))
+        again = Q.advance(arch, reason="http_503", at=at(13, day=3))
+        self.assertNotEqual(again["state"], "archived")
+        for gone in ("archived_at", "archived_why", "archive_outcome"):
+            self.assertNotIn(gone, again, "след архива остался в живой записи: %s" % gone)
+
+
+class TestArchiveInTheTurn(unittest.TestCase):
+    """Оборот: 14 просроченных уходят в архив, и «исчерпано 14» больше не звучит."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="outbox_arch_")
+        self.state = os.path.join(self.tmp, "state.json")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def corpus(self):
+        """Живой разрез 01.09: 10 отказов формата, 3 оплаченных, 1 без ключа."""
+        rows = []
+        for n in range(10):
+            rows.append(("http_400", n))
+        for n in range(10, 13):
+            rows.append(("accepted_no_answer", n))
+        rows.append(("no_credentials", 13))
+        state = R.state_default()
+        state["bootstrap_at"] = Q.iso(at(3))
+        for reason, n in rows:
+            rec = Q.new_record(pack="docs/review_outbox/pack-%02d.md" % n, channel="manus",
+                               send_date="2026-09-01", reason=reason, at=at(3))
+            state["packs"][rec["key"]] = rec
+        return state
+
+    def test_fourteen_stuck_packs_leave_the_live_count(self):
+        state = self.corpus()
+        self.assertEqual(sum(1 for r in state["packs"].values() if r["state"] == "exhausted"), 14)
+        moved = R.archive_stale(state, now=at(12, day=3))
+        self.assertEqual(len(moved), 14)
+        self.assertEqual(sum(1 for r in state["packs"].values() if r["state"] == "exhausted"), 0)
+        self.assertEqual(len(state["packs"]), 14, "ни одна запись не удалена")
+        self.assertEqual(sum(1 for r in moved if r["archive_outcome"] == "unknown"), 3,
+                         "оплаченные обязаны уйти в «неизвестно», а не в «отказ»")
+        self.assertEqual(sum(1 for r in moved if r["archive_outcome"] == "refused"), 11)
+
+    def test_fresh_records_are_left_alone(self):
+        state = self.corpus()
+        self.assertEqual(R.archive_stale(state, now=at(12)), [],
+                         "запись моложе суток и без отметки показа архиву не подлежит")
+
+    def test_an_exhausted_record_still_waiting_for_its_turn_is_untouched(self):
+        """САМЫЙ ДОРОГОЙ отрицательный тест архива: показ съесть нельзя.
+
+        Исчерпанная запись БЕЗ отметки ждёт своей очереди в тему (потолок 3 в
+        сутки). Закрыть её здесь значило бы отнять у владельца ровно то
+        сообщение, ради которого ступень F и заведена.
+        """
+        state = self.corpus()
+        self.assertEqual(state["announced"], {})
+        self.assertEqual(R.archive_stale(state, now=at(23)), [],
+                         "запись без отметки показа закрыта раньше показа")
+
+    def test_a_record_whose_show_is_over_is_closed_even_before_the_day(self):
+        """Второй признак: показ по записи ЗАКОНЧЕН — ни повтора, ни сообщения.
+
+        Замер 02.09 живого реестра: 13 отметок ``bootstrap`` и 1 штамп показа.
+        Бутстрап держится ``announce_due`` вечно, а демон зовёт оборот без
+        ``--force``, — то есть эти записи не ждали уже ничего и числились
+        живыми бессрочно.
+        """
+        state = self.corpus()
+        keys = sorted(state["packs"])
+        state["announced"][keys[0]] = "bootstrap"
+        state["announced"][keys[1]] = "2026-09-01T17:04:39+00:00"
+        moved = R.archive_stale(state, now=at(20))   # ЕЩЁ НЕ сутки: судит показ
+        self.assertEqual(sorted(r["key"] for r in moved), sorted(keys[:2]))
+        self.assertIn("показ по записи закончен", moved[0]["archived_why"])
+        self.assertIn("не уедет ни одним оборотом", moved[0]["archived_why"])
+        self.assertIn("уже показана", moved[1]["archived_why"])
+        self.assertEqual(sum(1 for r in state["packs"].values() if r["state"] == "exhausted"), 12,
+                         "остальные ждут показа и не тронуты")
+
+    def test_the_reason_written_is_the_one_that_fired(self):
+        """Причина в записи — та, что сработала, а не общее слово на оба признака."""
+        state = self.corpus()
+        by_age = R.archive_stale(state, now=at(12, day=3))
+        self.assertTrue(all("просрочен по возрасту" in r["archived_why"] for r in by_age))
+
+    def test_the_journal_says_it_once_and_then_goes_quiet(self):
+        """Главная плата этой ветки: одна строка вместо вечной «исчерпано 14»."""
+        state = self.corpus()
+        R.write_state(state, self.state)
+        first = R.tick(root=self.tmp, state_path=self.state, inbox="lotok", files=[],
+                       clock=lambda: at(12, day=3), retry=False)
+        self.assertEqual(len(first["archived"]), 14)
+        self.assertEqual(len(first["exhausted"]), 0)
+        self.assertIn("закрыто просроченных 14", first["line"])
+        self.assertIn("НЕИЗВЕСТНО 3", first["line"])
+        self.assertNotIn("исчерпано", first["line"])
+        second = R.tick(root=self.tmp, state_path=self.state, inbox="lotok", files=[],
+                        clock=lambda: at(13, day=3), retry=False)
+        self.assertEqual(second["line"], "", "второй оборот обязан молчать: новостей нет")
+        self.assertEqual(len(R.read_state(self.state)["packs"]), 14,
+                         "реестр цел: закрыть значит пометить, а не стереть")
+
+    def test_the_archive_does_not_take_the_show_away(self):
+        """Закрытие не смеет отнять ``--force``: архив про счёт, а не про доступ.
+
+        Без этого закрытие backlog'а молча убило бы единственную дорогу
+        владельца к нему — и выглядело бы это как «сообщений нет, значит всё
+        хорошо».
+        """
+        state = self.corpus()
+        for k in state["packs"]:
+            state["announced"][k] = "bootstrap"
+        R.write_state(state, self.state)
+        quiet = R.tick(root=self.tmp, state_path=self.state, inbox="lotok", files=[],
+                       clock=lambda: at(12, day=3), retry=False)
+        self.assertEqual(len(quiet["archived"]), 14)
+        self.assertEqual(quiet["announce_texts"], [], "без --force бутстрап по-прежнему молчит")
+        self.assertEqual(len(quiet["held"]), 14, "отложенное обязано остаться ВИДНЫМ")
+        forced = R.tick(root=self.tmp, state_path=self.state, inbox="lotok", files=[],
+                        clock=lambda: at(13, day=3), retry=False, force=True, budget=99)
+        self.assertEqual(len(forced["announce_texts"]), 14,
+                         "--force обязан доставать закрытое: архив не могила")
+
+    def test_a_record_born_this_turn_is_never_closed_in_the_same_turn(self):
+        """Новая запись — НОВОСТЬ, и она обязана прозвучать хотя бы раз."""
+        state = self.corpus()
+        R.write_state(state, self.state)
+        # Реестр стёрт: тот же лоток родит те же записи заново, уже «этим оборотом».
+        os.remove(self.state)
+        rep = R.tick(root=self.tmp, state_path=self.state, inbox="lotok",
+                     headers=[_head("docs/review_outbox/pack-00.md", "manus", "refused",
+                                    "http_400", "docs/review_inbox/pack-00-manus.md")],
+                     clock=lambda: at(12, day=9), retry=False)
+        self.assertEqual(len(rep["added"]), 1)
+        self.assertEqual(len(rep["archived"]), 0, "рождённая этим оборотом закрыта молча")
+        self.assertIn("исчерпано 1", rep["line"])
 
 
 if __name__ == "__main__":
