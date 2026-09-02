@@ -139,6 +139,89 @@ class TestMandatoryNegatives(JudgeCase):
         self.assertEqual(out["verdict"], dj.UNKNOWN)
 
 
+class TestForeignFileAtTheAddress(JudgeCase):
+    """ЧУЖОЙ ФАЙЛ ПО АДРЕСУ (03.09.2026): доказательством он быть не смеет.
+
+    Замер повода назвал два места, где различитель молчал, и оба лежат в АДАПТЕРЕ, а не в
+    словах адреса: молчаливый выбор при нескольких ответах и копия прежнего, засчитанная за
+    продукт. Гипотеза «слова слишком свободные» тем же замером опровергнута (10 000 пар слов и
+    файлов, чужих совпадений 0), поэтому здесь же стои́т замок на ОБРАТНОЕ ужесточение: 11 из 20
+    живых адресов отвечают одним ИМЕНЕМ файла, и правило «слова обязаны быть в теле» перекрасило
+    бы 11 честных закрытий.
+    """
+
+    def test_a_foreign_file_with_a_partial_word_match_is_not_evidence(self):
+        """ОТРИЦАТЕЛЬНЫЙ: чужой файл ловит ЧАСТЬ слов адреса — этого мало."""
+        base = self.base()
+        _write(self.root, FOLDER + "/2026-09-01-ступень-C-про-другое.md",
+               "# Ступень C — совсем другая работа\n\nтут нет полной фразы адреса\n")
+        out = self.judge(base)
+        self.assertEqual(out["verdict"], dj.UNKNOWN, out["reason"])
+        self.assertEqual(out["v0"]["reason_code"], "text_condition_failed")
+
+    def test_own_file_answering_the_address_is_proven(self):
+        """ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ рядом с отрицательными: прибор, глухой ко всему, бесполезен."""
+        base = self.base()
+        _write(self.root, REL, BODY)
+        out = self.judge(base)
+        self.assertEqual(out["verdict"], dj.DONE, out["reason"])
+        self.assertEqual(out["chosen"], REL)
+
+    def test_the_address_words_may_live_in_the_name_alone(self):
+        """Замок от обратного ужесточения: 11 из 20 живых адресов отвечают ИМЕНЕМ файла."""
+        base = self.base()
+        _write(self.root, FOLDER + "/2026-09-01-ступень-C-V0-судит-done.md",
+               "# Разбор\n\nтело про то же самое, дословной фразы адреса в нём нет\n")
+        out = self.judge(base)
+        self.assertEqual(out["verdict"], dj.DONE, out["reason"])
+
+    def test_a_file_that_appeared_but_is_older_than_the_run_is_not_evidence(self):
+        """ОТРИЦАТЕЛЬНЫЙ: файл ПОЯВИЛСЯ по адресу, но содержимое лежало тут ДО захода.
+
+        Копия (переименование, `git checkout`, перенос из соседнего дня) даёт по адресу ровно
+        такое же изменение sha, как рождённый продукт, — в режиме `measured` V0 не отличает их
+        ничем. Часы тут не при чём: «старше начала захода» доказано тем, что это содержимое
+        лежало в папке до захода, а не сравнением времён."""
+        old = FOLDER + "/2026-08-30-чужая-работа.md"
+        _write(self.root, old, BODY)                       # лежит ДО захода, дата не адресная
+        base = self.base()
+        _write(self.root, REL, BODY)                       # заход «принёс» её под адресным именем
+        out = self.judge(base)
+        self.assertEqual(out["verdict"], dj.UNKNOWN, out["reason"])
+        self.assertIn("ЛЕЖАЛО тут до захода", out["reason"])
+        self.assertIn("2026-08-30-чужая-работа.md", out["reason"])
+        self.assertIsNone(out["v0"], "до прибора такой кандидат не доходит")
+
+    def test_two_answering_files_changed_in_one_run_is_unknown_not_a_pick(self):
+        """ОТРИЦАТЕЛЬНЫЙ: два отвечающих файла изменились за заход — судья не выбирает.
+
+        До правки брался ПЕРВЫЙ ПО АЛФАВИТУ, и чужой файл, который заход тоже тронул, уходил
+        в бандл вместо продукта. V0 такое не ловит ничем: ему подают один путь."""
+        base = self.base()
+        _write(self.root, FOLDER + "/2026-09-01-a-ступень-C-V0-судит-done.md", "# чужой\n")
+        _write(self.root, REL, BODY)
+        out = self.judge(base)
+        self.assertEqual(out["verdict"], dj.UNKNOWN, out["reason"])
+        self.assertIn("который из них продукт", out["reason"])
+        self.assertIsNone(out["v0"])
+
+    def test_a_hand_made_baseline_without_the_folder_snapshot_is_unknown(self):
+        """Снимка папки нет → «отличить нечем», а не «сделано». Третий исход обязателен."""
+        _write(self.root, REL, BODY)
+        base = self.base()
+        _write(self.root, REL, BODY + "ещё\n")
+        base.pop(dj.F_PRIOR)
+        out = self.judge(base)
+        self.assertEqual(out["verdict"], dj.UNKNOWN)
+        self.assertIn("не снят", out["reason"])
+
+    def test_the_wide_snapshot_is_taken_by_the_daemon_before_the_run(self):
+        _write(self.root, FOLDER + "/2026-08-30-чужая-работа.md", BODY)
+        base = self.base()
+        self.assertIsInstance(base[dj.F_PRIOR], dict)
+        self.assertIn(FOLDER + "/2026-08-30-чужая-работа.md", base[dj.F_PRIOR].values())
+
+
 class TestOtherRefusals(JudgeCase):
     def test_product_without_the_named_words_is_not_proven(self):
         base = self.base()
