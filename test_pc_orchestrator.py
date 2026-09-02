@@ -3191,6 +3191,96 @@ class TestSingletonLock(unittest.TestCase):
         self.assertEqual(captured["env"][o.SUPERSEDE_ENV], str(os.getpid()))
 
 
+class TestAgentHitByClosure(unittest.TestCase):
+    """ПРИЗНАК АГЕНТА СЧИТАЕТСЯ ЗАМЫКАНИЕМ ИМПОРТОВ, А НЕ РУКОПИСНОЙ КАРТОЙ (02.09.2026).
+
+    Четвёртый случай класса «карта отстала»: настоящее замыкание `pc_agent.py` — ПЯТЬ файлов, а
+    карта знает ДВА. Отрицательные тесты покрывают ровно то, что раньше молчало."""
+
+    def setUp(self):
+        o._agent_gap_said.clear()
+        # КАНАЛЫ ГЛУШАТСЯ НА ВЕСЬ КЛАСС, а не в отдельном кейсе. Ветка пометки агента зовёт
+        # `_cowork` и `_notify`, а те СПАВНЯТ процессы (запись в журнал мозга, карточка владельцу).
+        # Замер этой же сессии: незаглушённый кейс поднял два таких процесса — тест обязан быть
+        # немым для боевых каналов, и «я не забуду в следующем кейсе» замком не является.
+        self._ch = (o._cowork, o._notify)
+        self.said = []
+        o._cowork = lambda s: self.said.append("cowork:%s" % s)
+        o._notify = lambda s, **k: self.said.append("notify:%s" % s)
+
+    def tearDown(self):
+        o._agent_gap_said.clear()
+        o._cowork, o._notify = self._ch
+
+    def test_the_real_closure_is_wider_than_the_map(self):
+        """Не обещание докстринга, а ЖИВОЙ замер по коду: карта знает 2 имени из 5."""
+        closure, why = o._agent_closure()
+        self.assertIsNotNone(closure, "замыкание агента не построилось: %s" % why)
+        by_map = {f for f in closure if "pc_agent" in o._procs_for_file(f)}
+        self.assertEqual(sorted(by_map), ["log_setup.py", "pc_agent.py"])
+        self.assertGreater(len(closure), len(by_map),
+                           "если карта догнала замыкание — этот тест обязан покраснеть, а не молчать")
+        self.assertIn("io_utf8.py", closure)          # именно на таких коммитах карта и молчала
+
+    def test_a_commit_into_a_module_the_map_does_not_know_marks_the_agent(self):
+        """ГЛАВНЫЙ отрицательный тест задания: файл ЕСТЬ в замыкании, НЕТ в карте → пометка."""
+        for name in ("io_utf8.py", "proc_identity.py", "selfupdate_gate.py"):
+            self.assertEqual(o._procs_for_file(name), set(),
+                             "%s внезапно попал в карту — тест потерял предмет" % name)
+            self.assertTrue(o._agent_hit([name]), "правка %s обязана пометить агента" % name)
+
+    def test_a_file_outside_the_closure_marks_nobody(self):
+        """Обратная половина: расширение признака не превратилось в «помечать всегда»."""
+        self.assertFalse(o._agent_hit(["README.md"]))
+        self.assertFalse(o._agent_hit(["docs/artifacts/2026-09-02-x.md", "test_trainer.py"]))
+        self.assertFalse(o._agent_hit([]))
+
+    def test_the_map_is_still_the_fallback_when_the_graph_fails(self):
+        """Карта НЕ снята: граф не построился → решает она, то есть прежнее поведение."""
+        broken = lambda *a, **k: o.client_contour.Closure(
+            frozenset(), frozenset(), False, "нет входной точки")
+        self.assertTrue(o._agent_hit(["pc_agent.py"], closure_fn=broken),
+                        "по карте pc_agent.py помечает агента — запасная дорога обязана работать")
+        self.assertFalse(o._agent_hit(["io_utf8.py"], closure_fn=broken),
+                         "без графа честно остаётся прежнее (неполное) знание карты")
+
+    def test_the_divergence_of_map_and_computation_is_said_in_the_log(self):
+        """Расхождение — САМО ПО СЕБЕ УЛИКА, и оно обязано быть названо строкой, а не молча учтено."""
+        said = []
+        real_info = o.log.info
+        try:
+            o.log.info = lambda fmt, *a: said.append(fmt % a if a else fmt)
+            o._agent_hit(["io_utf8.py"])
+        finally:
+            o.log.info = real_info
+        self.assertTrue([s for s in said if "io_utf8.py" in s and "карта" in s],
+                        "строки про расхождение карты и вычисления нет: %s" % said)
+
+    def test_selfupdate_marks_the_agent_on_a_file_the_map_never_knew(self):
+        """Сквозь весь путь: коммит ТОЛЬКО в io_utf8.py — прежде `procs` был пуст и функция
+        выходила первым же `return ''`, то есть агент не помечался НИКОГДА."""
+        kinds = []
+        note = o._selfupdate_restart_children(
+            "aaa1111", "bbb2222", diff_fn=lambda a, b: ["io_utf8.py"],
+            restart_fn=lambda kind: kinds.append(kind) or (True, [1], "ok"),
+            state={}, dirty_fn=lambda: [])
+        self.assertEqual(kinds, [], "рестартить этим заходом не должны были НИКОГО")
+        self.assertIn("ЖДЁТ РУЧНОГО рестарта", note)
+        self.assertTrue([s for s in self.said if s.startswith("cowork:")],
+                        "пометка обязана доехать до журнала строкой")
+
+    def test_the_restart_route_of_the_bots_is_untouched(self):
+        """Границу правки называем тестом: замыкание сменило ПРИЗНАК агента, а не маршрут ботов.
+        Замыкание бота — 63 файла; поедь маршрут по нему, `io_utf8.py` рестартил бы живого бота."""
+        kinds = []
+        o._selfupdate_restart_children(
+            "aaa1111", "bbb2222", diff_fn=lambda a, b: ["io_utf8.py"],
+            restart_fn=lambda kind: kinds.append(kind) or (True, [1], "ok"),
+            state={}, dirty_fn=lambda: [], client_block_fn=lambda *a, **k: [])
+        self.assertEqual(kinds, [], "ни один бот не смеет рестартоваться от правки инфраструктуры")
+        self.assertEqual(o._classify_changed(["io_utf8.py"]), ([], []))
+
+
 class TestFileProcessMap(unittest.TestCase):
     """ЯВНАЯ карта файл→процесс (не эвристика) + распознавание команд-рычагов по якорям."""
 

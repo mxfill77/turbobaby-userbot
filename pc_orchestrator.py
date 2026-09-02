@@ -5806,6 +5806,82 @@ def _procs_for_file(path):
     return procs
 
 
+# ═══ ПРИЗНАК «ПОРА ПЕРЕЗАПУСТИТЬСЯ» СЧИТАЕТСЯ ЗАМЫКАНИЕМ, А НЕ КАРТОЙ (02.09.2026) ═══════════
+#
+# ЧЕТВЁРТЫЙ СЛУЧАЙ ОДНОГО КЛАССА, и первые три чинились ДОБАВЛЕНИЕМ ИМЕНИ в карту выше
+# (`delivery.py` dae330a, `trainer.py`, `trainer_log.py` — каждое после живого «бот часами на
+# старом коде»). Четвёртый — у агента, и замер 02.09 называет его числом: настоящее import-
+# замыкание `pc_agent.py` это ПЯТЬ файлов (`io_utf8`, `log_setup`, `pc_agent`, `proc_identity`,
+# `selfupdate_gate`), а карта знает ДВА. Коммит, тронувший только `io_utf8.py`, не пометит агента
+# НИКОГДА: `_procs_for_file` вернёт пустое множество, и обе ветки пометки уйдут в ранний возврат.
+#
+# ИСТОЧНИК ИСТИНЫ ПОМЕНЯЛСЯ ТОЛЬКО ДЛЯ ПРИЗНАКА. Демон уже следит за СОБОЙ вычислением
+# (`_dep_files` → `client_contour.closure`, 59 файлов); здесь тем же обходом считается замыкание
+# АГЕНТА. Маршрут РЕСТАРТА детей (`_classify_changed` → userbot/moderbot) не тронут ни одной
+# строкой и по-прежнему идёт по карте: замыкание бота — 63 файла, и рестартить живого бота на
+# каждый коммит в инфраструктуру никто не просил. Меняется ПРИЗНАК, а не поведение перезапуска.
+#
+# КАРТА ОСТАЛАСЬ ЗАПАСНОЙ, А НЕ СНЯТА: граф не построился (нет входной точки, битый синтаксис,
+# каталог не читается) → решение принимает она, то есть прежнее поведение байт-в-байт.
+# РАСХОЖДЕНИЕ КАРТЫ И ВЫЧИСЛЕНИЯ — САМО ПО СЕБЕ УЛИКА, и оно называется строкой лога: не «пометил»
+# и не «не пометил», а поимённо, какие файлы вычисление видит, а карта нет.
+_AGENT_ENTRY = "pc_agent.py"
+_agent_gap_said = set()      # об одном и том же расхождении говорим один раз на запуск демона
+
+
+def _agent_closure(entry=_AGENT_ENTRY, closure_fn=None):
+    """Транзитивное import-замыкание АГЕНТА (basename, lower) → (множество | None, причина).
+
+    Тот же обход, что у `_dep_files` для самого демона и у ворот клиентского контура, и с тем же
+    снятым срезом (`cut=()`): вопрос здесь «что грузит в память ЭТОТ процесс», а не «увидит ли это
+    клиент». None — честное «не знаю», и оно уводит решение на запасную карту, а не в молчание."""
+    try:
+        cl = (closure_fn or client_contour.closure)(REPO, entries=(entry,), cut=())
+    except Exception as e:                                             # noqa: BLE001
+        return None, "%s: %s" % (type(e).__name__, str(e)[:80])
+    if not cl.ok:
+        return None, str(cl.reason or "причина не названа")
+    if entry not in cl.files:
+        return None, "в замыкании нет самой входной точки %s" % entry
+    return set(cl.files), ""
+
+
+def _agent_hit(changed, closure_fn=None, said=None):
+    """Правка из этих файлов доедет до АГЕНТА? → bool.
+
+    Решение — по ВЫЧИСЛЕННОМУ замыканию; рукописная карта звучит только когда графа нет. Всякое
+    расхождение двух ответов называется строкой лога: карта, промолчавшая там, где вычисление
+    сказало «да», — это ровно тот дефект, из-за которого 02.09 живой агент двое суток нёс образ
+    файла позапрошлой правки."""
+    said = _agent_gap_said if said is None else said
+    files = [str(p) for p in (changed or [])]
+    by_map = {p for p in files if "pc_agent" in _procs_for_file(p)}
+    closure, why = _agent_closure(closure_fn=closure_fn)
+    if closure is None:
+        if "нет графа" not in said:
+            said.add("нет графа")
+            log.warning("признак агента: замыкание не посчитано (%s) — решаю ЗАПАСНОЙ картой "
+                        "(прежнее поведение)", why)
+        return bool(by_map)
+    by_closure = {p for p in files if os.path.basename(p).lower() in closure}
+    gap = sorted(by_closure - by_map)
+    if gap:
+        key = "|".join(gap)
+        if key not in said:
+            said.add(key)
+            log.info("признак агента: ВЫЧИСЛЕНИЕ видит %d файл(ов), которых карта не относит к "
+                     "агенту: %s (замыкание %d файлов, карта знает 2) — прежним правилом эта "
+                     "правка не пометила бы его никогда", len(gap), ", ".join(gap), len(closure))
+    extra = sorted(by_map - by_closure)
+    if extra:
+        key = "карта шире:" + "|".join(extra)
+        if key not in said:
+            said.add(key)
+            log.info("признак агента: карта относит к агенту %s, а замыкание — нет; решаю "
+                     "вычислением", ", ".join(extra))
+    return bool(by_closure)
+
+
 def _is_dev_task(text):
     """Дев-задача («тз:…») — только после таких обновляем боты (обычные задачи не трогают рантайм)."""
     return bool(_RE_DEV_TASK.match(str(text or "")))
@@ -6438,8 +6514,12 @@ def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_f
     """После УСПЕШНОГО self-update демона: рестарт затронутых детей по ЯВНОЙ карте на основе диффа
     old..new. → строка-итог для лога/cowork ('' если никого не трогали). Правила:
       • userbot/moderbot → штатный рестарт механикой вотчдога (_restart_via_pc_agent), с уважением
-        анти-флапа (недавно рестартили → пропуск);
-      • pc_agent → НЕ трогаем чужими руками, только пометка «ждёт ручного рестарта»;
+        анти-флапа (недавно рестартили → пропуск). Маршрут РЕСТАРТА по-прежнему по карте: их
+        замыкания — 63 и 64 файла, и рестарт живого бота на каждый коммит в инфраструктуру никто
+        не заказывал;
+      • pc_agent → НЕ трогаем чужими руками, только пометка «ждёт ручного рестарта». ПРИЗНАК этой
+        пометки с 02.09.2026 считается ВЫЧИСЛЕННЫМ замыканием (`_agent_hit`), а не картой: карта
+        знает у агента 2 имени из 5, и коммит в остальные три не помечал его никогда;
       • дифф пуст / тронуты только не-код-файлы (README/*.md/тесты) → никого не рестартим.
     На каждое применение — NOTE в cowork «авто-применил <коммит>: рестарт <кто>». Всё внешнее
     (дифф/рестарт/время/реестр) инъектируется — в тестах боевое не дёргаем."""
@@ -6455,6 +6535,12 @@ def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_f
     for p in changed:
         for name in _procs_for_file(p):
             procs.setdefault(name, []).append(p)
+    # ПРИЗНАК АГЕНТА — ПО ВЫЧИСЛЕНИЮ (02.09.2026), маршрут рестарта детей ниже не тронут. Карта
+    # выше знает у агента ДВА имени из ПЯТИ, и коммит в остальные три не помечал его никогда.
+    if _agent_hit(changed):
+        procs.setdefault("pc_agent", [p for p in changed
+                                      if os.path.basename(p).lower()
+                                      in (_agent_closure()[0] or set())] or list(changed))
     if not procs:
         return ""                                  # тронуты только не-код-файлы — никого не рестартим
     notes = []
@@ -6866,7 +6952,7 @@ def reconcile_children_tick(head_fn=None, diff_fn=None, gate_fn=None, restart_fn
         return ""                         # нет нового коммита ИЛИ этот HEAD уже провалил гейт — ждём новый
     changed = (diff_fn or _diff_names)(_last_child_commit, head)
     ub_files, mb_files = _classify_changed(changed)
-    pc_agent_hit = any("pc_agent" in _procs_for_file(p) for p in changed)   # pc_agent.py в диффе → та же ручная карта, что в self-update
+    pc_agent_hit = _agent_hit(changed)   # ВЫЧИСЛЕННОЕ замыкание агента, карта — запасная (02.09.2026)
     if not (ub_files or mb_files or pc_agent_hit):
         _last_child_commit = head         # тронуты только не-код-файлы детей (pc_orchestrator/доки/тесты) — двигаем метку
         return ""
@@ -6888,7 +6974,7 @@ def reconcile_children_tick(head_fn=None, diff_fn=None, gate_fn=None, restart_fn
             return ("ворота клиентского контура: применение %s ОСТАНОВЛЕНО, боты на прежнем коде "
                     "(%s)" % (short, ", ".join(_held)))
     notes, gate_red = [], False
-    if pc_agent_hit:                      # агент себя чужими руками не рестартует — только пометка (ручная карта, как в _selfupdate_restart_children)
+    if pc_agent_hit:                      # агент себя чужими руками не рестартует — только пометка (признак по замыканию, как в _selfupdate_restart_children)
         msg = ("pc_agent изменён — ЖДЁТ РУЧНОГО рестарта (Планировщик/сам подхватит), "
                "чужими руками не трогаю")
         log.info("реконсиляция детей: %s", msg)

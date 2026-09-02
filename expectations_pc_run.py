@@ -83,6 +83,11 @@ import expectations_pc as ex                                          # noqa: E4
 # инвариантом (только `mode=ro`, ни одного глагола записи в SQL). Здесь `sqlite3` по-прежнему НЕ
 # импортируется — прежний замок рук цел байт в байт, см. шапку `client_silence_pc`.
 import client_silence_pc as eye                                       # noqa: E402
+# ГЛАЗ О6 — ТОТ ЖЕ ОБХОД, ЧТО ДЕРЖИТ ВОРОТА КЛИЕНТСКОГО КОНТУРА, и это НЕ совпадение, а требование:
+# «замыкание считается тем же способом, каким оно считается сегодня для клиентского контура».
+# Модуль чистый (ни git, ни subprocess, ни сети — только файлы репозитория), и наблюдателю он даёт
+# ровно то, чего рукописная карта дать не может: список зависимостей, который не отстаёт.
+import client_contour as contour                                      # noqa: E402
 
 LANE_LABEL = "ПК"
 HEARTBEAT_FILE = os.path.join(REPO, "pc_orchestrator.heartbeat")
@@ -104,6 +109,22 @@ KID_FILES = {
 # серверное О4 видит как «след с ПК». Читаем ХВОСТ файла: кольцо на 500 строк, а нужна последняя.
 LEDGER_FILE = os.path.join(REPO, "cowork_log.ledger")
 LEDGER_TAIL_BYTES = 65536
+# О6 (02.09.2026): ЧЕЙ ЛОК несёт номер процесса и момент его запуска. Локов на полосе ровно
+# четыре, и они же — граница прибора: `rc_supervisor` лока не пишет вовсе, поэтому О6 его не судит
+# (сказано в шапке решения). Три из четырёх уже читаются здесь для О3 и детей — новых файлов
+# заведено НОЛЬ, добавлен только лок демона.
+CODE_LOCKS = {
+    "pc_orchestrator": os.path.join(REPO, "pc_orchestrator.lock"),
+    "pc_agent": os.path.join(REPO, "pc_agent.lock"),
+    "userbot": os.path.join(REPO, "userbot.lock"),
+    "moderation_bot": MOD_LOCK_FILE,
+}
+# КАК ЭТОТ ЖЕ ПРОЦЕСС ЗОВЁТСЯ В РУКОПИСНОЙ КАРТЕ ДЕМОНА (`_FILE_PROCESS_RULES`). Нужно ТОЛЬКО ради
+# улики «карта знает N из M» — решение принимается вычислением и от этого словаря не зависит ни
+# одной веткой. У демона имени в карте нет вовсе (`None`): он следит за собой сам, замыканием, и
+# приписывать ему «карта знает 0» значило бы обвинять карту в том, чего она и не обязана уметь.
+CODE_MAP_NAME = {"pc_orchestrator": None, "pc_agent": "pc_agent",
+                 "userbot": "userbot", "moderation_bot": "moderbot"}
 STATE_DIR = os.path.join(REPO, "tmp", "expect_pc")     # СВОЙ каталог: файлы демона не трогаем
 STATE_FILE = "state.json"
 STATE_KEEP = 32
@@ -371,6 +392,93 @@ def kid_facts(name):
     if pair is None:
         return None
     return own_facts(pair[0], pair[1], name)
+
+
+# ════ О6: ЧТО ПРОЦЕСС ГРУЗИТ С ДИСКА — СЧИТАЕТСЯ ГРАФОМ, А НЕ БЕРЁТСЯ ИЗ СПИСКА ══════════════
+def _map_targets():
+    """Рукописная карта демона `_procs_for_file` → функция | None (взять не удалось).
+
+    Берётся ТОЛЬКО РАДИ УЛИКИ: число «карта знает N файлов из M» едет в заметку, чтобы отставание
+    карты было ВИДНО владельцу тем же сообщением. Ни одна ветка решения её не читает — не смогли
+    получить, и вердикт не меняется ни на букву.
+
+    Импорт демона тут не новый и не лишний: он уже происходит КАЖДЫЙ прогон ради боевого клиента
+    моста (`_bridge`), модуль после первого раза лежит в кэше, и флаг `TURBOBABY_TEST_LOGS` живёт
+    ровно один вызов — тот же замок, что у `_bridge`."""
+    try:
+        return _guard_test_logs(_daemon)._procs_for_file
+    except Exception:                                                 # noqa: BLE001
+        return None
+
+
+def code_facts(closure_fn=None, stat_fn=None, lock_fn=None, map_fn=None, entries=None):
+    """ФАКТ О6 по КАЖДОМУ наблюдаемому процессу → {имя: {...}}. Ни одного решения: пороги
+    применяет `expectations_pc.code_state`.
+
+    ДВА ЧИСЛА НА ПРОЦЕСС, и оба сняты ПО ФАКТУ, а не по списку имён:
+      `newest`  — самая свежая mtime среди файлов ТРАНЗИТИВНОГО import-замыкания входной точки.
+                  Замыкание считает `client_contour.closure(..., cut=())` — тот же обход ast, что
+                  держит ворота клиентского контура, и тот же, которым демон следит за собой
+                  (`pc_orchestrator._dep_files`). Срез на чужих процессах СНЯТ намеренно: он
+                  отвечает на вопрос «увидит ли это клиент», а нам нужен другой — «что грузит в
+                  память ЭТОТ процесс»;
+      `started` — момент запуска процесса, снятый пробой ОС по номеру из лока (`_read_lock` →
+                  `process_probe`, право СПРОСИТЬ, а не тронуть).
+
+    FAIL-CLOSED ВЕЗДЕ И В СТОРОНУ ПОМЕТКИ, а не молчания (в этом ветка отличается от О1–О5, и это
+    названо в шапке решения): граф не построился · файл замыкания не стат`уется · лока нет · проба
+    не удалась → `ok=False` с ПРИЧИНОЙ, то есть «неизвестно» у решения, то есть пометка стои́т.
+    Данные замыкания (`cl.data` — промпты и json-правила) не берём НАМЕРЕННО: их процесс читает с
+    диска в рантайме, рестарта они не требуют, и считать их протуханием значило бы звать старым
+    код, который на самом деле свежий."""
+    out = {}
+    getmap = map_fn if map_fn is not None else _map_targets()
+    for name, entry in (entries if entries is not None else ex.CODE_ENTRIES):
+        rec = {"ok": False, "entry": entry, "files": None, "newest": None, "newest_file": None,
+               "reason": "", "gap": None, "mapped": None, "pid": None, "opened": None,
+               "started": None, "lock_mtime": None, "err": ""}
+        try:
+            cl = (closure_fn or contour.closure)(REPO, entries=(entry,), cut=())
+        except Exception as e:                                        # noqa: BLE001
+            cl = None
+            rec["reason"] = "обход сорвался: %s: %s" % (type(e).__name__, str(e)[:80])
+        if cl is not None and not cl.ok:
+            rec["reason"] = str(cl.reason or "причина не названа")
+        elif cl is not None:
+            files = sorted(cl.files)
+            rec["files"] = len(files)
+            newest, newest_file, missed = None, None, None
+            for base in files:
+                try:
+                    m = float((stat_fn or os.stat)(os.path.join(REPO, base)).st_mtime)
+                except (OSError, ValueError, TypeError) as e:
+                    missed = "%s: %s" % (base, str(e)[:60])
+                    break                     # один нестатуемый файл делает ответ недостоверным
+                if newest is None or m > newest:
+                    newest, newest_file = m, base
+            if missed:
+                rec["reason"] = "файл замыкания не прочитан (%s)" % missed
+            elif newest is None:
+                rec["reason"] = "замыкание пустое — считать нечего"
+            else:
+                rec["ok"] = True
+                rec["newest"], rec["newest_file"] = newest, newest_file
+            # УЛИКА (не довод): сколько файлов замыкания рукописная карта относит к ЭТОМУ процессу.
+            mapname = CODE_MAP_NAME.get(name)
+            if getmap is not None and mapname:
+                try:
+                    known = sorted(f for f in files if mapname in getmap(f))
+                    rec["mapped"] = len(known)
+                    rec["gap"] = sorted(set(files) - set(known))
+                except Exception:                                     # noqa: BLE001
+                    pass
+        lock = CODE_LOCKS.get(name)
+        if not lock:
+            rec["err"] = "лока у «%s» нет — момент запуска брать неоткуда" % name
+        else:
+            (lock_fn or _read_lock)(rec, lock, name)
+        out[name] = rec
+    return out
 
 
 def busy_facts(path=None):
@@ -741,6 +849,10 @@ def snapshot(state, now=None, getter=None):
         # В отличие от О4 своего следа в реестре у этой строки не опознать: там она неотличима от
         # любой другой, поэтому счётчик свой.
         "kids_last": {"attempt": life_kids.get("attempt"), "sig": life_kids.get("sig")},
+        # О6: ЧТО КАЖДЫЙ ПРОЦЕСС ГРУЗИТ С ДИСКА и когда он запущен. Счётчика тишины здесь НЕТ и
+        # быть не должно: расхождение «диск новее памяти» — это МГНОВЕННОЕ состояние двух чисел, а
+        # не накопленное молчание, и сон машины его не искажает (обе величины — стенные метки).
+        "code": code_facts(),
     }
 
 
@@ -908,6 +1020,25 @@ def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
     except Exception as e:                                            # noqa: BLE001
         out["kids_why"] = "публикация о детях сорвалась (%s: %.60s)" % (type(e).__name__, e)
 
+    # 5. О6 — ГОВОРИТСЯ КАЖДЫЙ ВИТОК, А НЕ ОДИН РАЗ В МОМЕНТ ПРАВКИ. Это не украшение отчёта, а
+    #    сам предмет ветки: прежняя пометка «pc_agent изменён» рождалась СОБЫТИЕМ внутри
+    #    self-update и после хендовера не повторялась НИКОГДА (живой случай 02.09 — владелец
+    #    трижды тапал кнопку, которой процесс не понимал). Здесь вердикт пересчитывается из фактов
+    #    каждым прогоном, едет в итог, печатается `--status` и ЛОЖИТСЯ В СОСТОЯНИЕ на диск —
+    #    то есть не умеет замолчать, пока расхождение живо. Заметка при этом одна на воплощение
+    #    процесса: повтор каждые десять минут был бы шумом, а молчание — тем самым дефектом.
+    #    Гасится в СЕБЯ (ветка заведена последней и не вправе стоить владельцу заметок О1–О5).
+    out["code"] = []
+    try:
+        out["code"] = ex.code_states(facts, cfg, now)
+        st["code"] = {"at": now,
+                      "rows": [{"name": r.get("name"), "state": r.get("state"),
+                                "behind": r.get("behind"), "files": r.get("files"),
+                                "mapped": r.get("mapped"), "why": (r.get("why") or "")[:120]}
+                               for r in out["code"]]}
+    except Exception as e:                                            # noqa: BLE001
+        out["code_why"] = "ветка О6 сорвалась (%s: %.60s)" % (type(e).__name__, e)
+
     if not dry:
         st["open"] = dict(list(open_eps.items())[-STATE_KEEP:])
         save_state(st)
@@ -950,6 +1081,19 @@ def main():
         print("строка о детях: %s%s"
               % (out.get("kids_pulse") or "не нужна",
                  (" (%s)" % out.get("kids_why")) if out.get("kids_why") else ""))
+        # О6 печатается КАЖДЫЙ раз и ПОИМЁННО, с двумя числами на строку: на сколько процесс
+        # отстал от своего замыкания и сколько файлов в этом замыкании против того, что знает
+        # рукописная карта. Второе число и есть улика — «карта знает 2 из 5» видно глазами.
+        print("код процессов (О6; замыкание импортов, не список имён):")
+        for c in out.get("code") or []:
+            print("  %-16s %-14s отстал %-12s замыкание %s, карта знает %s%s"
+                  % (c.get("name"), c.get("state"),
+                     ex._age_short(c.get("behind")) if c.get("behind") is not None else "—",
+                     "?" if c.get("files") is None else c.get("files"),
+                     "—" if c.get("mapped") is None else c.get("mapped"),
+                     (" · %s" % c.get("why")) if c.get("why") else ""))
+        if not out.get("code"):
+            print("  не собрано%s" % ((" (%s)" % out.get("code_why")) if out.get("code_why") else ""))
         print("нарушений: %d %s" % (out["verdicts"], out["notes"]))
         return 0
     print(json.dumps(out, ensure_ascii=False))

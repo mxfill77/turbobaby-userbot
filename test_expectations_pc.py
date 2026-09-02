@@ -493,6 +493,17 @@ class TestRunHands(unittest.TestCase):
         self.pulsed = []
         self.addCleanup(setattr, run_mod, "send_pulse", run_mod.send_pulse)
         run_mod.send_pulse = lambda line: (self.pulsed.append(line), True)[1]
+        # ФАКТ О6 ИНЪЕКТИРУЕМ ПО ТОЙ ЖЕ ПРИЧИНЕ, ЧТО И РЕЕСТР ОТМЕТОК ВЫШЕ (02.09.2026): он
+        # читает ЖИВЫЕ процессы этой машины, и кейсы про О1/О2 краснели бы от того, давно ли
+        # владелец рестартил бота. Подмена отдаёт ПРОЧИТАННЫЙ факт «процесс моложе правки» —
+        # то есть настоящее «свежо», а не отсутствие раздела: отсутствие раздела эту ветку
+        # выключает целиком, и кейсы проверяли бы молчание вместо вердикта.
+        self.addCleanup(setattr, run_mod, "code_facts", run_mod.code_facts)
+        run_mod.code_facts = lambda *a, **k: {
+            n: {"ok": True, "entry": e, "files": 5, "newest": NOW - 7200.0,
+                "newest_file": "io_utf8.py", "reason": "", "gap": [], "mapped": 2, "pid": 100,
+                "opened": True, "started": NOW - 60.0, "lock_mtime": NOW - 60.0, "err": ""}
+            for n, e in ex.CODE_ENTRIES}
 
     def _note(self, text):
         """Канал теста. Возвращает True — как боевой: «заметка ушла» и «не ушла» руки различают
@@ -2326,6 +2337,227 @@ class TestHandsHaveNoTeeth(unittest.TestCase):
         calls = [n.func.attr for n in ast.walk(tree)
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
         self.assertEqual([c for c in calls if "enqueue" in c or "task" == c], [])
+
+
+    # ═══════════ О6: ДОСТАВКА ПРАВОК СЧИТАЕТСЯ ЗАМЫКАНИЕМ ИМПОРТОВ (02.09.2026) ═════════════
+
+
+def code_fact(now=NOW, files=5, newest_ago=None, started_ago=None, ok=True, reason="",
+              opened=True, pid=7092, mapped=2, gap=("io_utf8.py",), newest_file="io_utf8.py",
+              entry="pc_agent.py", err=""):
+    """Факт О6 в том виде, в каком его кладут руки (`code_facts`). Оба времени — СТЕННЫЕ метки
+    (mtime файла и момент запуска процесса), потому что расхождение «диск новее памяти» есть
+    разность двух абсолютных величин, а не накопленное молчание."""
+    return {"ok": ok, "entry": entry, "files": files, "reason": reason,
+            "newest": None if newest_ago is None else now - newest_ago,
+            "newest_file": newest_file, "gap": list(gap) if gap else None, "mapped": mapped,
+            "pid": pid, "opened": opened,
+            "started": None if started_ago is None else now - started_ago,
+            "lock_mtime": None if started_ago is None else now - started_ago, "err": err}
+
+
+def code_facts_of(now=NOW, **per_process):
+    """Факты по ВСЕМ наблюдаемым: не названные явно считаются свежими (процесс моложе правки),
+    чтобы кейс говорил ровно об одном процессе, а не обо всех сразу."""
+    fresh = code_fact(now=now, newest_ago=7200.0, started_ago=60.0)
+    code = {n: dict(fresh) for n in ex.CODE_WATCHED}
+    code.update(per_process)
+    return {"now": now, "code": code}
+
+
+class TestO6ClosureIsTheSourceOfTruth(unittest.TestCase):
+    """ЧЕТЫРЕ ОТРИЦАТЕЛЬНЫХ ТЕСТА ЗАДАНИЯ, дословно и по одному на кейс."""
+
+    def setUp(self):
+        self.cfg = ex.config({})
+
+    # 1. коммит в модуль, которого нет в карте, но который входит в замыкание → пометка
+    def test_a_commit_into_a_module_the_map_does_not_know_marks_the_process(self):
+        f = code_facts_of(pc_agent=code_fact(newest_ago=60.0, started_ago=7200.0,
+                                             newest_file="io_utf8.py", mapped=2, files=5))
+        state, info = ex.code_state("pc_agent", f, self.cfg, NOW)
+        self.assertEqual(state, ex.CODE_STALE)
+        self.assertAlmostEqual(info["behind"], 7140.0, places=3)
+        keys = [v["key"] for v in ex.verdict(f, self.cfg) if v["kind"] == "o6_pc_code_stale"]
+        self.assertEqual(keys, ["o6c|pc_agent|%d" % int(NOW - 7200.0)])
+        text = ex.render([v for v in ex.verdict(f, self.cfg)
+                          if v["kind"] == "o6_pc_code_stale"][0])
+        self.assertIn("io_utf8.py", text)             # имя файла — не «какой-то модуль»
+        self.assertIn("знает 2", text)                # улика: карта знает 2 из 5
+
+    # 2. процесс МОЛОЖЕ коммита → не помечается
+    def test_a_process_younger_than_the_edit_is_not_marked(self):
+        f = code_facts_of(pc_agent=code_fact(newest_ago=7200.0, started_ago=60.0))
+        self.assertEqual(ex.code_state("pc_agent", f, self.cfg, NOW)[0], ex.CODE_FRESH)
+        self.assertEqual([v for v in ex.verdict(f, self.cfg) if str(v["kind"]).startswith("o6")], [])
+
+    def test_a_gap_smaller_than_the_threshold_is_not_yet_news(self):
+        """Доставка законно занимает время (у демона измеренные 28 с) — порог не украшение."""
+        f = code_facts_of(pc_agent=code_fact(newest_ago=3540.0, started_ago=3600.0))   # отстал 60 с
+        self.assertEqual(ex.code_state("pc_agent", f, self.cfg, NOW)[0], ex.CODE_FRESH)
+        f2 = code_facts_of(pc_agent=code_fact(newest_ago=1740.0, started_ago=3600.0))  # отстал 31 мин
+        self.assertEqual(ex.code_state("pc_agent", f2, self.cfg, NOW)[0], ex.CODE_STALE)
+
+    # 3. замыкание посчитать не удалось → НЕИЗВЕСТНО, и пометка СТАВИТСЯ, а не снимается
+    def test_an_uncomputable_closure_is_unknown_and_the_mark_is_set_not_dropped(self):
+        f = code_facts_of(pc_agent=code_fact(ok=False, reason="pc_agent.py: SyntaxError",
+                                             newest_ago=None, started_ago=600.0))
+        state, info = ex.code_state("pc_agent", f, self.cfg, NOW)
+        self.assertEqual(state, ex.CODE_UNKNOWN)
+        self.assertIn("SyntaxError", info["why"])
+        kinds = [v["kind"] for v in ex.verdict(f, self.cfg)]
+        self.assertIn("o6_pc_code_unknown", kinds,
+                      "«не смог посчитать» обязано СТАВИТЬ пометку — молчание здесь и есть дефект")
+        self.assertEqual(ex.closures(f, self.cfg, ["o6u|pc_agent"]), [],
+                         "незнание не смеет ЗАКРЫТЬ уже открытую пометку")
+
+    def test_every_hole_in_the_facts_leads_to_the_mark_and_never_to_silence(self):
+        """Каждая дырка проверена отдельно: направление fail-safe у О6 обратное остальным веткам."""
+        holes = {
+            "факта нет вовсе": {},
+            "граф не построился": code_fact(ok=False, reason="каталог не читается"),
+            "самой свежей правки нет": code_fact(newest_ago=None, started_ago=600.0),
+            "процесса по локу нет": code_fact(newest_ago=60.0, started_ago=600.0, opened=False),
+            "момент запуска не добыт": code_fact(newest_ago=60.0, started_ago=None, opened=True),
+        }
+        for why, fact in holes.items():
+            f = code_facts_of()
+            f["code"]["pc_agent"] = fact if fact else None
+            if not fact:
+                f["code"].pop("pc_agent")
+            self.assertEqual(ex.code_state("pc_agent", f, self.cfg, NOW)[0], ex.CODE_UNKNOWN, why)
+            self.assertIn("o6_pc_code_unknown", [v["kind"] for v in ex.verdict(f, self.cfg)], why)
+
+    # 4. процесс жив и отвечает, но старше коммита → расхождение ВИДНО
+    def test_a_live_answering_process_older_than_the_edit_shows_the_gap(self):
+        """Живой PID свежим кодом не является — ровно тот же закон, что у О3 про «жив ≠ работает»."""
+        f = code_facts_of(pc_agent=code_fact(newest_ago=1200.0, started_ago=186000.0,
+                                             opened=True, pid=7092))
+        state, info = ex.code_state("pc_agent", f, self.cfg, NOW)
+        self.assertEqual(state, ex.CODE_STALE)
+        self.assertAlmostEqual(info["behind"], 184800.0, places=3)
+        text = ex.render([v for v in ex.verdict(f, self.cfg)
+                          if v["kind"] == "o6_pc_code_stale"][0])
+        self.assertIn("2 сут", text)                        # «на сколько» названо числом
+        self.assertIn("7092", text)                         # и о ком именно речь
+        for word in ("упал", "умер", "не работает"):
+            self.assertNotIn(word, text, "О6 судит ПАМЯТЬ процесса, а не его здоровье")
+
+    def test_the_verdict_is_recomputed_every_run_and_never_goes_silent(self):
+        """ГЛАВНОЕ ОТЛИЧИЕ ОТ ПРЕЖНЕЙ ПОМЕТКИ: она была СОБЫТИЕМ и звучала один раз. Здесь —
+        состояние: тот же факт даёт тот же вердикт на каждом из десяти подряд прогонов."""
+        seen = set()
+        # Факт НЕПОДВИЖЕН (процесс не перезапускался, файл не правился), а «сейчас» едет вперёд —
+        # ровно так выглядят десять подряд прогонов наблюдателя над одним и тем же расхождением.
+        fixed = code_fact(now=NOW, newest_ago=1200.0, started_ago=186000.0)
+        for i in range(10):
+            now = NOW + i * 600.0
+            f = code_facts_of(now=now, pc_agent=dict(fixed))
+            v = [x for x in ex.verdict(f, self.cfg) if x["kind"] == "o6_pc_code_stale"]
+            self.assertEqual(len(v), 1, "виток %d промолчал при живом расхождении" % i)
+            seen.add(v[0]["key"])
+        self.assertEqual(len(seen), 1,
+                         "ключ эпизода обязан быть ОДИН на воплощение процесса, иначе заметка "
+                         "повторялась бы каждые десять минут: %s" % sorted(seen))
+
+    def test_the_episode_closes_only_on_proven_freshness(self):
+        stale = code_facts_of(pc_agent=code_fact(newest_ago=60.0, started_ago=7200.0))
+        key = "o6c|pc_agent|%d" % int(NOW - 7200.0)
+        self.assertEqual(ex.closures(stale, self.cfg, [key]), [], "расхождение живо — не закрываем")
+        blind = code_facts_of(pc_agent=code_fact(ok=False, reason="каталог не читается"))
+        self.assertEqual(ex.closures(blind, self.cfg, [key]), [], "слепота выздоровлением не является")
+        restarted = code_facts_of(pc_agent=code_fact(newest_ago=7200.0, started_ago=60.0))
+        self.assertEqual(ex.closures(restarted, self.cfg, [key]), [key],
+                         "процесс перезапущен и доказанно свеж — эпизод обязан закрыться")
+
+    def test_zero_kills_the_branch_before_any_fact_is_read(self):
+        off = ex.config({ex.CODE_MIN_ENV: "0"})
+        self.assertEqual(off["code"], 0.0)
+        f = code_facts_of(pc_agent=code_fact(newest_ago=60.0, started_ago=186000.0))
+        self.assertEqual([v for v in ex.verdict(f, off) if str(v["kind"]).startswith("o6")], [])
+        self.assertEqual(ex.code_state("pc_agent", f, off, NOW)[0], ex.CODE_UNKNOWN)
+
+    def test_the_watched_list_is_processes_and_names_match_the_kids(self):
+        """Перечень — ПРОЦЕССЫ, а не файлы, и имена детей ОДНИ И ТЕ ЖЕ во всех строках слоя."""
+        self.assertEqual(set(ex.KIDS) - set(ex.CODE_WATCHED), set(),
+                         "ребёнок, о котором говорит О3, обязан судиться и О6")
+        self.assertIn("pc_orchestrator", ex.CODE_WATCHED)
+        for name, entry in ex.CODE_ENTRIES:
+            self.assertTrue(os.path.isfile(os.path.join(REPO, entry)),
+                            "входной точки «%s» процесса «%s» на диске нет" % (entry, name))
+
+
+class TestO6Hands(unittest.TestCase):
+    """РУКИ О6: замыкание СЧИТАЕТСЯ тем же обходом, что держит ворота, а не берётся списком."""
+
+    def test_hands_call_the_same_closure_the_client_gate_uses(self):
+        seen = []
+
+        def fake_closure(repo, entries=None, cut=None):
+            seen.append((entries, cut))
+            import client_contour as cc
+            return cc.Closure(frozenset({entries[0], "io_utf8.py"}), frozenset(), True, "ok")
+
+        out = run_mod.code_facts(closure_fn=fake_closure,
+                                 stat_fn=lambda p: type("S", (), {"st_mtime": 100.0})(),
+                                 lock_fn=lambda rec, lock, whose: rec,
+                                 map_fn=lambda p: set())
+        self.assertEqual(sorted(out), sorted(ex.CODE_WATCHED))
+        self.assertEqual([c for _e, c in seen], [()] * len(ex.CODE_WATCHED),
+                         "срез на чужих процессах обязан быть СНЯТ: вопрос «что грузит ЭТОТ "
+                         "процесс», а не «увидит ли это клиент»")
+        self.assertEqual(out["pc_agent"]["files"], 2)
+        self.assertTrue(out["pc_agent"]["ok"])
+
+    def test_an_unstattable_closure_file_makes_the_answer_untrustworthy(self):
+        def boom(path):
+            raise OSError("файла нет")
+
+        out = run_mod.code_facts(
+            closure_fn=lambda r, entries=None, cut=None: __import__("client_contour").Closure(
+                frozenset({entries[0]}), frozenset(), True, "ok"),
+            stat_fn=boom, lock_fn=lambda rec, lock, whose: rec, map_fn=lambda p: set())
+        self.assertFalse(out["pc_agent"]["ok"])
+        self.assertIn("не прочитан", out["pc_agent"]["reason"])
+
+    def test_the_map_gap_rides_along_as_evidence_and_never_as_an_argument(self):
+        """Улика едет рядом с вердиктом: «карта знает N из M» — то самое отставание в числах."""
+        out = run_mod.code_facts(
+            closure_fn=lambda r, entries=None, cut=None: __import__("client_contour").Closure(
+                frozenset({entries[0], "io_utf8.py", "log_setup.py"}), frozenset(), True, "ok"),
+            stat_fn=lambda p: type("S", (), {"st_mtime": 100.0})(),
+            lock_fn=lambda rec, lock, whose: rec,
+            map_fn=lambda p: {"pc_agent"} if os.path.basename(p) in
+            ("pc_agent.py", "log_setup.py") else set())
+        self.assertEqual(out["pc_agent"]["mapped"], 2)
+        self.assertEqual(out["pc_agent"]["gap"], ["io_utf8.py"])
+        # У демона имени в карте нет ВОВСЕ — и это не ноль, а отсутствие вопроса.
+        self.assertIsNone(out["pc_orchestrator"]["mapped"])
+
+    def test_the_live_closure_of_the_agent_is_wider_than_the_map_right_now(self):
+        """ЖИВОЙ замер по коду репозитория, а не по фикстуре: если карта догонит замыкание —
+        тест обязан покраснеть и заставить пересчитать числа, а не молча протухнуть."""
+        import client_contour as cc
+        cl = cc.closure(REPO, entries=("pc_agent.py",), cut=())
+        self.assertTrue(cl.ok, cl.reason)
+        self.assertEqual(sorted(cl.files),
+                         ["io_utf8.py", "log_setup.py", "pc_agent.py", "proc_identity.py",
+                          "selfupdate_gate.py"])
+
+    def test_the_run_says_it_every_single_pass(self):
+        """п.3 задания: расхождение говорится КАЖДЫЙ виток, пока живо, — и попадает в состояние
+        на диск, а не только в stdout, который у задачи Планировщика уходит в никуда."""
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["CC_EXPECT_PC_DIR"] = d
+            try:
+                for _ in range(2):
+                    out = run_mod.run(dry=True, getter=lambda st: {"ok": False, "items": []})
+                    self.assertEqual([r["name"] for r in out["code"]], list(ex.CODE_WATCHED))
+                    for r in out["code"]:
+                        self.assertIn(r["state"],
+                                      (ex.CODE_FRESH, ex.CODE_STALE, ex.CODE_UNKNOWN))
+            finally:
+                os.environ.pop("CC_EXPECT_PC_DIR", None)
 
 
 if __name__ == "__main__":
