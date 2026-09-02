@@ -25,6 +25,8 @@
 import ast
 import io
 import os
+import shutil
+import tempfile
 import unittest
 
 import srv_delivery as sd
@@ -36,6 +38,29 @@ SRC = os.path.join(REPO, "srv_delivery.py")
 HUB = "e646f1f12c6f55b1d26e541e2170ca36b62c0ac8"     # общий main от 30.08.2026 13:31 UTC
 SRV = "f1375cbeb9d8f5d84e56594586bb1a2365eef701"     # вершина сервера, 02.09.2026 20:09 UTC
 OLD = "70d755383863f988dee46fcf8c7255fc1408a204"     # первый из двух застрявших
+
+# ── КАРТА ВЕТОК, снятая живым `ls-remote --heads` 03.09.2026 в 23:37 UTC. Фикстура обязана
+# повторять живой формат: имена веток здесь настоящие, включая длинное `wip-works-buffer-…`,
+# на котором ломается всякий разбор, привыкший к коротким именам.
+SRV_HEADS = {
+    "backup-24-07":                    "4a17cf319c0525f0559bf66c546a5fe08b0e2026",
+    "backup-main-2507":                "6a6d7fcd348d31ba76b56c0b21de7a91da6f77bb",
+    "main":                            "3e3ac8d26887414afc90baf8435167b279d9e218",
+    "rebuild-main":                    "a5598b0645e6208376a7cc16294986a3293702fc",
+    "wip-229-230":                     "40ffd7a046d935959a0a11020e67aaa63713bf1e",
+    "wip-works-buffer-50-56-20260822": "ed674cd65fd8525f5bed74c9247f2cd2c3438a69",
+}
+HUB_HEADS = {
+    "main":         "78ced2b48858e707b99fd1f6118428dacba8a9e6",
+    "rebuild-main": "26d2c6de72ec81d1a8c35cb1238829896f2c4bb1",
+}
+# Родство, снятое `merge-base --is-ancestor` тем же замером: обе общие ветки — предки серверных.
+LIVE_ANCESTRY = {
+    (HUB_HEADS["main"], SRV_HEADS["main"]): True,
+    (SRV_HEADS["main"], HUB_HEADS["main"]): False,
+    (HUB_HEADS["rebuild-main"], SRV_HEADS["rebuild-main"]): True,
+    (SRV_HEADS["rebuild-main"], HUB_HEADS["rebuild-main"]): False,
+}
 
 
 def ls_line(sha, branch="main"):
@@ -113,6 +138,51 @@ class AncestryGit(FakeGit):
             self.calls.append(argv)
             return 0, "\n".join(self.revlist) + "\n"
         return FakeGit.__call__(self, argv, cwd=cwd, timeout=timeout)
+
+
+class MultiGit(FakeGit):
+    """Многоветочная дверь: отвечает КАРТОЙ веток на `ls-remote --heads` и картой родства на
+    `merge-base`. Ровно то, что видит модуль в проде, — включая ветки, которых у общего
+    репозитория нет вовсе."""
+
+    def __init__(self, srv=None, hub=None, ancestry=None, revlist=None, push=(0, "To github\n"),
+                 diff=(0, "")):
+        srv = SRV_HEADS if srv is None else srv
+        hub = HUB_HEADS if hub is None else hub
+        plan = {
+            "init": (0, ""), "remote": (0, ""),
+            "ls-remote:srv": (0, "".join(ls_line(s, n) for n, s in sorted(srv.items()))),
+            "ls-remote:hub": (0, "".join(ls_line(s, n) for n, s in sorted(hub.items()))),
+            "fetch:srv": (0, ""), "fetch:hub": (0, ""), "push:hub": push,
+            "diff": diff, "show": (0, u"тело артефакта\n"),
+        }
+        FakeGit.__init__(self, plan)
+        self.ancestry = LIVE_ANCESTRY if ancestry is None else ancestry
+        self.revlist = [OLD] if revlist is None else revlist
+
+    def __call__(self, argv, cwd=None, timeout=None):
+        argv = list(argv)
+        if argv[:2] == ["merge-base", "--is-ancestor"]:
+            self.calls.append(argv)
+            return (0 if self.ancestry.get((argv[2], argv[3])) else 1), ""
+        if argv[:2] == ["rev-list", "--count"]:
+            self.calls.append(argv)
+            return 0, "%d\n" % len(self.revlist)
+        if argv[:2] == ["rev-list", "--reverse"]:
+            self.calls.append(argv)
+            return 0, "\n".join(self.revlist) + "\n"
+        return FakeGit.__call__(self, argv, cwd=cwd, timeout=timeout)
+
+
+def pushed_branches(git):
+    """Имена веток, которые дверь реально увидела в `push`. Предмет проверки — то, что послано,
+    а не то, что решено: между решением и проводом живёт ровно тот класс ошибок, ради которого
+    дверь и подменяется."""
+    out = []
+    for c in git.calls:
+        if c and c[0] == "push":
+            out.append(c[-1].split(":refs/heads/")[-1])
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
@@ -326,9 +396,211 @@ class TestTick(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
+#  ВСЕ ВЕТКИ, А НЕ ОДНА (этап 3). Числа и имена — с живого замера 03.09.2026 23:37 UTC
+# ══════════════════════════════════════════════════════════════════════════════════════════
+class TestAllBranches(unittest.TestCase):
+
+    def run_tick(self, git, prev=None, **kw):
+        said = []
+        res = sd.tick(run=git, now=kw.pop("now", 10000.0),
+                      say=lambda line: (said.append(line), True)[1],
+                      state=prev if prev is not None else {}, force=True, **kw)
+        res["said_lines"] = said
+        return res
+
+    def test_branch_absent_from_the_hub_is_delivered_not_called_a_silence(self):
+        """Ветки, которой в общем репозитории НЕТ, `hub_head is None` описывает так же, как
+        молчание всего репозитория. Слить их значило бы не завезти четыре живые ветки."""
+        kind, why = sd.decide({"srv_head": SRV_HEADS["wip-229-230"], "hub_head": None,
+                               "hub_absent": True, "count": 2})
+        self.assertEqual(sd.DELIVER, kind)
+        self.assertIn("2", why)
+        # …а без признака `hub_absent` тот же факт по-прежнему НЕИЗВЕСТНО.
+        self.assertEqual(sd.UNKNOWN, sd.decide({"srv_head": SRV, "hub_head": None})[0])
+
+    def test_live_map_delivers_all_six_branches_and_names_them(self):
+        git = MultiGit()
+        res = self.run_tick(git)
+        self.assertEqual(sd.DELIVER, res["kind"])
+        self.assertEqual(sorted(SRV_HEADS), sorted(pushed_branches(git)))
+        self.assertEqual(6, len(pushed_branches(git)))
+        self.assertEqual(sorted(SRV_HEADS), sorted(res["branches"]))
+
+    def test_every_push_of_every_branch_is_plain_and_never_forced(self):
+        git = MultiGit()
+        self.run_tick(git)
+        for c in [c for c in git.calls if c and c[0] == "push"]:
+            self.assertEqual("hub", c[1], u"push смотрит не в общий репозиторий: %s" % c)
+            self.assertNotIn("--force", c)
+            self.assertNotIn("--force-with-lease", c)
+            self.assertNotIn("--mirror", c)
+            self.assertFalse(c[-1].startswith("+"), u"форсный refspec: %s" % c[-1])
+            self.assertNotIn(":refs/heads/", c[-1].split(":refs/heads/")[0])
+
+    def test_a_branch_only_the_hub_has_is_never_touched_and_never_deleted(self):
+        """Чужая работа в общем репозитории — не предмет доставки. Ни push по её имени, ни
+        удаляющего refspec `:refs/heads/<имя>` в проводе быть не может."""
+        hub = dict(HUB_HEADS)
+        hub["someone-elses-work"] = "1111111111111111111111111111111111111111"
+        git = MultiGit(hub=hub)
+        self.run_tick(git)
+        self.assertNotIn("someone-elses-work", pushed_branches(git))
+        for c in git.calls:
+            self.assertFalse(c and c[0] == "push" and c[-1].startswith(":"),
+                             u"удаляющий refspec: %s" % c)
+
+    def test_one_torn_branch_stops_the_whole_delivery_not_just_itself(self):
+        """Частичная доставка мимо конфликта — это «остановиться и промолчать». Задание требует
+        обратного, и предмет проверки — ПУСТОЙ список push, а не текст вердикта."""
+        torn = dict(LIVE_ANCESTRY)
+        torn[(HUB_HEADS["main"], SRV_HEADS["main"])] = False
+        git = MultiGit(ancestry=torn)
+        res = self.run_tick(git)
+        self.assertEqual(sd.CONFLICT, res["kind"])
+        self.assertIn("main", res["why"])
+        self.assertEqual([], pushed_branches(git))
+        self.assertNotIn("push", git.verbs())
+        self.assertEqual(1, len(res["said_lines"]))       # человек обязан узнать
+
+    def test_unmeasured_ancestry_on_one_branch_stops_everything_too(self):
+        git = MultiGit()
+        # `merge-base` отвечает кодом, которого мы не понимаем → третий исход, а не «не предок».
+        real = git.__call__
+
+        def flaky(argv, cwd=None, timeout=None):
+            if list(argv)[:2] == ["merge-base", "--is-ancestor"]:
+                git.calls.append(list(argv))
+                return 129, "fatal: bad object\n"
+            return real(argv, cwd=cwd, timeout=timeout)
+        res = self.run_tick(flaky)
+        self.assertEqual(sd.UNKNOWN, res["kind"])
+        self.assertEqual([], pushed_branches(git))
+
+    def test_nothing_to_take_across_all_branches_is_nothing_not_error(self):
+        git = MultiGit(srv=dict(HUB_HEADS), hub=dict(HUB_HEADS))
+        res = self.run_tick(git)
+        self.assertEqual(sd.NOTHING, res["kind"])
+        self.assertNotIn("push", git.verbs())
+        self.assertNotIn("fetch", git.verbs())            # равные вершины — за объектами не ходим
+        self.assertEqual([], res["said_lines"])
+
+    def test_hub_holding_extra_branches_does_not_look_like_work_to_deliver(self):
+        """Лишняя ветка НА СТОРОНЕ ХАБА не обязана гнать нас за объектами: серверные вершины все
+        на месте, забирать нечего."""
+        hub = dict(HUB_HEADS)
+        hub["extra"] = "2222222222222222222222222222222222222222"
+        git = MultiGit(srv={"main": HUB_HEADS["main"], "rebuild-main": HUB_HEADS["rebuild-main"]},
+                       hub=hub)
+        res = self.run_tick(git)
+        self.assertEqual(sd.NOTHING, res["kind"])
+        self.assertNotIn("fetch", git.verbs())
+
+    def test_server_silent_still_pushes_nothing_with_the_branch_map(self):
+        git = MultiGit()
+        git.plan["ls-remote:srv"] = (128, "ssh: connect timed out\n")
+        res = self.run_tick(git)
+        self.assertEqual(sd.UNKNOWN, res["kind"])
+        self.assertEqual([], pushed_branches(git))
+        self.assertNotIn("fetch", git.verbs())
+        self.assertEqual(["srv"], res["facts"]["asked"])
+
+    def test_fetch_asks_for_all_heads_not_a_single_branch(self):
+        git = MultiGit()
+        self.run_tick(git)
+        fetches = [c for c in git.calls if c and c[0] == "fetch"]
+        self.assertEqual(2, len(fetches))
+        for c in fetches:
+            self.assertTrue(c[-1].startswith("+refs/heads/*:"), u"тянем не все ветки: %s" % c)
+
+    def test_signature_moves_when_any_branch_moves_not_only_main(self):
+        """Подпись, слепая ко всему кроме main, доставила бы движение пяти веток МОЛЧА."""
+        base = {"branches": {n: {"srv_head": s, "hub_head": s} for n, s in SRV_HEADS.items()}}
+        moved = {"branches": dict(base["branches"])}
+        moved["branches"]["wip-229-230"] = {"srv_head": OLD,
+                                            "hub_head": SRV_HEADS["wip-229-230"]}
+        self.assertNotEqual(sd.signature(sd.DELIVER, base), sd.signature(sd.DELIVER, moved))
+        self.assertTrue(sd.should_say({"sig": sd.signature(sd.NOTHING, base), "kind": sd.NOTHING},
+                                      sd.signature(sd.DELIVER, moved), sd.DELIVER, 10.0))
+
+    def test_plan_never_names_a_branch_that_is_not_being_delivered(self):
+        facts = {"branches": {
+            "main": {"srv_head": SRV_HEADS["main"], "hub_head": HUB_HEADS["main"],
+                     "hub_in_srv": True, "srv_in_hub": False},
+            "quiet": {"srv_head": OLD, "hub_head": OLD},
+            "behind": {"srv_head": OLD, "hub_head": SRV, "hub_in_srv": False, "srv_in_hub": True},
+        }}
+        self.assertEqual(["main"], [n for n, _s, _h in sd.plan_pushes(facts)])
+
+    def test_new_branch_counts_against_everything_the_hub_already_has(self):
+        """У ветки-новичка нет своей точки отсчёта. Считать её «с нуля» значило бы обещать
+        владельцу сотни новых коммитов там, где объекты общие с main."""
+        git = MultiGit()
+        self.run_tick(git)
+        counts = [c for c in git.calls if c[:2] == ["rev-list", "--count"]]
+        news = [c for c in counts if "--remotes=hub" in c]
+        self.assertEqual(4, len(news), u"новых веток на живой карте ровно четыре")
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  ЧИТАЕМОСТЬ: артефакт обязан лечь туда, где человек его ищет
+# ══════════════════════════════════════════════════════════════════════════════════════════
+class TestArtifactsAreReadable(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="srvart_")
+        self.dest = os.path.join(self.tmp, "visible")
+        self.legacy = os.path.join(self.tmp, "legacy")
+        os.makedirs(self.legacy)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_visible_dir_is_the_common_artifacts_folder_not_the_delivery_tmp(self):
+        """Дефект выкладки 03.09 назван устройством: адрес по умолчанию больше не под `tmp/`."""
+        visible = sd.ART_DIR.replace("\\", "/")
+        self.assertTrue(visible.endswith("docs/artifacts/srv"), visible)
+        self.assertNotIn("/tmp/", visible)
+        self.assertTrue(sd.TMP_ART_DIR.replace("\\", "/").endswith("tmp/srv_delivery/artifacts"))
+
+    def test_extracted_artifact_lands_in_the_visible_folder(self):
+        git = MultiGit(diff=(0, "docs/artifacts/2026-09-03-server-contour-code-drift-recon.md\n"))
+        facts = sd.probe(git)
+        written = sd.extract_artifacts(git, facts, dest=self.dest)
+        self.assertTrue(written)
+        for path in written:
+            self.assertTrue(os.path.isfile(path))
+            self.assertTrue(path.startswith(self.dest))
+
+    def test_a_brand_new_branch_does_not_dump_its_whole_tree_into_the_folder(self):
+        git = MultiGit(diff=(0, "docs/artifacts/x.md\n"))
+        facts = sd.probe(git)
+        sd.extract_artifacts(git, facts, dest=self.dest)
+        diffs = [c for c in git.calls if c and c[0] == "diff"]
+        self.assertEqual(2, len(diffs), u"разрез берётся только у веток с точкой отсчёта")
+
+    def test_backfill_copies_and_never_deletes_or_overwrites(self):
+        src = os.path.join(self.legacy, "2026-09-03-server-stuck-and-splinter-day.md")
+        with io.open(src, "w", encoding="utf-8") as f:
+            f.write(u"серверный день\n")
+        filled = sd.backfill_legacy(src_dir=self.legacy, dest=self.dest)
+        self.assertEqual(1, len(filled))
+        self.assertTrue(os.path.isfile(src), u"исходник обязан остаться на месте")
+        # Повтор ничего не делает и НЕ портит уже лежащее — добор идёмпотентен.
+        with io.open(filled[0], "w", encoding="utf-8") as f:
+            f.write(u"правка человека\n")
+        self.assertEqual([], sd.backfill_legacy(src_dir=self.legacy, dest=self.dest))
+        with io.open(filled[0], encoding="utf-8") as f:
+            self.assertEqual(u"правка человека\n", f.read())
+
+    def test_backfill_without_a_legacy_folder_is_empty_not_an_error(self):
+        self.assertEqual([], sd.backfill_legacy(src_dir=os.path.join(self.tmp, "нет"),
+                                                dest=self.dest))
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
 #  ИНВАРИАНТ SRV_DELIVERY_PURE — граница держится отсутствием инструментов, а не докстрингом
 # ══════════════════════════════════════════════════════════════════════════════════════════
-PURE_FUNCS = ("decide", "should_say", "due", "signature")
+PURE_FUNCS = ("decide", "decide_all", "plan_pushes", "should_say", "due", "signature")
 _FORBIDDEN_CALLS = frozenset(("open", "exec", "eval", "compile", "__import__", "input"))
 _FORBIDDEN_ROOTS = frozenset(("os", "sys", "subprocess", "shutil", "socket", "urllib", "time",
                               "requests", "pathlib", "tempfile", "sqlite3"))

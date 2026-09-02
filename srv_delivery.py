@@ -13,15 +13,35 @@ UTC, и оба несут ОДИН файл — `docs/artifacts/2026-09-03-serve
 прочитанное наружу. Направление выбрано не по вкусу: чтение сервера (`git-upload-pack`) не меняет
 на нём ни одного байта, а значит доставка не может испортить полосу, которую обслуживает.
 
+ВСЕ ВЕТКИ, А НЕ ОДНА (этап 3, 03.09.2026). Первая редакция таскала ровно `main`, и это оставляло
+работу в ЕДИНСТВЕННОЙ копии молча: замер 03.09 — на сервере 6 веток, в общем репозитории 2, и
+**17 уникальных коммитов** не имели копии нигде, кроме диска VPS. Четыре ветки
+(`backup-24-07`, `backup-main-2507`, `wip-229-230`, `wip-works-buffer-50-56-20260822`) не
+существовали в общем репозитории вовсе — их не «отставание» описывало, а отсутствие. Теперь
+`ls-remote --heads` снимает КАРТУ веток обеих сторон, и каждая серверная ветка судится отдельно.
+
 ЧЕГО ЭТОТ МОДУЛЬ НЕ УМЕЕТ ПО УСТРОЙСТВУ (проверяется тестом `test_srv_delivery`):
   • писать на сервер — ни `push`, ни `receive-pack`, ни удалённой команды; наружу к серверу уходят
     ровно `ls-remote` и `fetch`, обе read-only;
-  • перезаписывать чужую работу — в общий репозиторий уходит ТОЛЬКО перемотка вперёд, и это
-    заперто ДВАЖДЫ: своей проверкой родства (`merge-base --is-ancestor`) и обычным, НЕ форсным
-    push'ем, который сам GitHub отобьёт при расхождении. Слов `--force`/`+refs` в сторону `hub`
-    в файле нет;
-  • разруливать конфликт истории — расхождение ОСТАНАВЛИВАЕТ доставку и зовёт человека;
+  • перезаписывать чужую работу — в общий репозиторий уходит ТОЛЬКО перемотка вперёд (и создание
+    ветки, которой там нет вовсе), и это заперто ДВАЖДЫ: своей проверкой родства
+    (`merge-base --is-ancestor`) и обычным, НЕ форсным push'ем, который сам GitHub отобьёт при
+    расхождении. Слов `--force`/`+refs` в сторону `hub` в файле нет;
+  • удалять ветки — ветка, живущая в общем репозитории и отсутствующая на сервере, не предмет
+    доставки ни одной строкой: её имя не попадает даже в план отправки;
+  • разруливать конфликт истории — расхождение ХОТЬ НА ОДНОЙ ветке останавливает доставку
+    ЦЕЛИКОМ и зовёт человека. Частичная доставка мимо конфликта была бы «остановиться и
+    промолчать», а не «остановиться и доложить»;
   • трогать рабочее дерево этого репозитория — всё живёт в голом зеркале под `tmp/`.
+
+ГДЕ ЛОЖАТСЯ ПРИЕХАВШИЕ АРТЕФАКТЫ (поправка 03.09.2026). Первая редакция клала их в
+`tmp/srv_delivery/artifacts` — временный каталог доставки. Файл, которого человек не находит там,
+где он ищет артефакты, доставленным НЕ ЯВЛЯЕТСЯ: замер 03.09 — серверная разведка
+`2026-09-03-server-contour-code-drift-recon.md` лежала на ПК с 03.09 и не читалась из
+`docs/artifacts` ни одной дорогой (489 файлов в общей папке, серверных среди них 0). Теперь
+выкладка идёт в `docs/artifacts/srv/`, а `backfill_legacy()` добирает туда всё, что прошлые
+обороты успели положить только во временный каталог. Ничего при этом не удаляется и не
+перезаписывается.
 
 ТРИ ИСХОДА, А НЕ ДВА. «Сервер не ответил» — это НЕИЗВЕСТНО, а не «нечего забирать» и не «ошибка».
 Молчание источника доставкой не является: `unknown` не двигает состояние вперёд, ничего не пишет
@@ -51,6 +71,7 @@ UTC, и оба несут ОДИН файл — `docs/artifacts/2026-09-03-serve
     venv\\Scripts\\python.exe srv_delivery.py --dry      # сходить и посмотреть, но не доставлять
     venv\\Scripts\\python.exe srv_delivery.py --tick     # боевой оборот (с учётом своего штампа)
     venv\\Scripts\\python.exe srv_delivery.py --now      # боевой оборот, штамп частоты игнорируем
+    venv\\Scripts\\python.exe srv_delivery.py --backfill # добрать артефакты в видимую папку, без сети
 """
 import json
 import os
@@ -78,7 +99,11 @@ SSH_OPTS = ("-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
 WORK = os.path.join(REPO, "tmp", "srv_delivery")
 MIRROR = os.path.join(WORK, "manager-bot.git")
 STATE_FILE = os.path.join(WORK, "state.json")
-ART_DIR = os.path.join(WORK, "artifacts")
+
+# Куда ложатся приехавшие артефакты. ВИДИМАЯ папка, а не временная: см. шапку. Ручка окружения
+# нужна тесту — иначе регресс писал бы в общую папку репозитория живыми файлами.
+ART_DIR = os.environ.get("SRV_DELIVERY_ART_DIR", os.path.join(REPO, "docs", "artifacts", "srv"))
+TMP_ART_DIR = os.path.join(WORK, "artifacts")   # где их держала выкладка 03.09 — оттуда добираем
 
 EVERY_MIN = int(os.environ.get("SRV_DELIVERY_EVERY_MIN", "30"))
 REPEAT_H = int(os.environ.get("SRV_DELIVERY_REPEAT_H", "6"))
@@ -98,16 +123,26 @@ LOUD = (UNKNOWN, CONFLICT, BLOCKED)
 # EXPECT_PC_PURE у слоя ожиданий: судья, умеющий ходить наружу, однажды соврёт молча.
 
 def decide(facts):
-    """→ (исход, слова). `facts` — то, что удалось СНЯТЬ, вместе с признанием, чего снять не вышло.
+    """→ (исход, слова) ПО ОДНОЙ ветке. `facts` — то, что удалось СНЯТЬ, вместе с признанием,
+    чего снять не вышло.
 
     Ключи: `srv_head`, `hub_head` (None = сторона не ответила), `hub_in_srv`, `srv_in_hub`
-    (None = родство не сверено). Порядок веток не косметика: неизвестность старше всего
-    остального, иначе «сервер молчит» превратилось бы в «нечего забирать»."""
+    (None = родство не сверено), `hub_absent` (сторона ОТВЕТИЛА, но этой ветки у неё нет).
+    Порядок веток не косметика: неизвестность старше всего остального, иначе «сервер молчит»
+    превратилось бы в «нечего забирать».
+
+    `hub_absent` отделён от `hub_head is None` СОЗНАТЕЛЬНО и стои́т между ними: «репозиторий
+    промолчал» и «репозиторий ответил, а ветки в нём нет» чинятся разными руками, и слить их
+    значило бы либо не завезти четыре живые ветки, либо объявить молчание поводом писать."""
     srv = facts.get("srv_head")
     hub = facts.get("hub_head")
 
     if not srv:
-        return UNKNOWN, u"сервер не ответил — что у него в main, неизвестно; ничего не трогаем"
+        return UNKNOWN, u"сервер не ответил — что у него в ветке, неизвестно; ничего не трогаем"
+    if facts.get("hub_absent"):
+        n = facts.get("count")
+        return DELIVER, u"ветки нет в общем репозитории вовсе — кладём её целиком (%s коммит(ов))" % (
+            n if n is not None else u"?")
     if not hub:
         return UNKNOWN, u"общий репозиторий не ответил — сверять не с чем; ничего не трогаем"
     if srv == hub:
@@ -130,9 +165,79 @@ def decide(facts):
                       u"нужен человек" % (hub[:7], srv[:7]))
 
 
+def decide_all(facts):
+    """→ (исход, слова) ПО ВСЕМ веткам сразу. Старшинство исходов не косметика.
+
+    Конфликт и неизвестность ОСТАНАВЛИВАЮТ доставку целиком, а не пропускают её мимо себя по
+    соседней ветке: «доставили пять из шести, а про шестую промолчали» — ровно тот исход, ради
+    запрета которого в задании стои́т слово «остановиться». Ветки, которая есть в общем
+    репозитории и которой нет на сервере, здесь нет ни в одном разрезе: доставка её не судит и
+    не трогает."""
+    branches = facts.get("branches")
+    if not branches:
+        return decide(facts)        # одиночная форма — ровно как была до этапа 3
+
+    per = {}
+    for name in sorted(branches):
+        per[name] = decide(branches[name])[0]
+
+    torn = sorted([n for n in per if per[n] == CONFLICT])
+    if torn:
+        return CONFLICT, (u"истории разошлись на ветке(ах) %s — доставка ОСТАНОВЛЕНА ЦЕЛИКОМ, "
+                          u"нужен человек" % u", ".join(torn))
+    dark = sorted([n for n in per if per[n] == UNKNOWN])
+    if dark:
+        return UNKNOWN, u"по ветке(ам) %s факты не сняты — доставку не начинаем" % u", ".join(dark)
+
+    give = sorted([n for n in per if per[n] == DELIVER])
+    if not give:
+        return NOTHING, u"забирать нечего: все %d веток сервера уже в общем репозитории" % len(per)
+
+    total, fresh = 0, []
+    for n in give:
+        c = branches[n].get("count")
+        if c:
+            total += c
+        if branches[n].get("hub_absent"):
+            fresh.append(n)
+    tail = u"" if not fresh else u"; новых веток %d (%s)" % (len(fresh), u", ".join(fresh))
+    # «Суммой по веткам, с перекрытием» — не оговорка, а признание метода: один коммит, лежащий
+    # в двух ветках, посчитан дважды. Назвать это число уникальным значило бы обещать владельцу
+    # больше работы, чем едет (живой замер 03.09: сумма 26, уникальных 17).
+    return DELIVER, u"вперёд по %d ветке(ам): %s; коммитов суммой по веткам (с перекрытием) %d%s" % (
+        len(give), u", ".join(give), total, tail)
+
+
+def plan_pushes(facts):
+    """→ [(ветка, серверный хеш, хеш общего репозитория или None)], по именам.
+
+    Чистая СОЗНАТЕЛЬНО: список того, что БУДЕТ послано наружу, обязан быть предсказуем без сети —
+    иначе «мы не трогаем чужие ветки» проверялось бы рассказом, а не разбором плана."""
+    branches = facts.get("branches")
+    if not branches:
+        return [(BRANCH, facts.get("srv_head"), facts.get("hub_head"))]
+    out = []
+    for name in sorted(branches):
+        b = branches[name]
+        if decide(b)[0] == DELIVER:
+            out.append((name, b.get("srv_head"), b.get("hub_head")))
+    return out
+
+
 def signature(kind, facts):
     """Подпись состояния для журнала «по смене». Возрастов и штампов в ней нет СОЗНАТЕЛЬНО:
-    иначе запись уходила бы каждый оборот и индекс превратился бы в шум."""
+    иначе запись уходила бы каждый оборот и индекс превратился бы в шум.
+
+    С этапа 3 подпись держит ВСЕ ветки: без этого движение любой ветки, кроме `main`, было бы
+    доставлено молча — тот же класс «сделано и не видно», из-за которого завели этот модуль."""
+    branches = facts.get("branches")
+    if branches:
+        parts = []
+        for name in sorted(branches):
+            b = branches[name]
+            parts.append(u"%s=%s/%s" % (name, (b.get("srv_head") or "-")[:8],
+                                        (b.get("hub_head") or "-")[:8]))
+        return u"%s|%s" % (kind, u",".join(parts))
     return u"%s|%s|%s" % (kind, (facts.get("srv_head") or "-")[:12],
                           (facts.get("hub_head") or "-")[:12])
 
@@ -247,106 +352,199 @@ def ensure_mirror(run):
     return True, ""
 
 
-def _head_of(run, remote):
-    rc, out = run(["ls-remote", remote, "refs/heads/" + BRANCH], cwd=MIRROR)
+def _heads_of(run, remote):
+    """→ (карта {ветка: хеш} или None, вывод). None — сторона НЕ ОТВЕТИЛА; пустая карта — ответила,
+    но веток у неё нет. Разные вещи: первое неизвестность, второе факт."""
+    rc, out = run(["ls-remote", "--heads", remote], cwd=MIRROR)
     if rc != 0:
         return None, out
+    heads = {}
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) >= 2 and parts[1] == "refs/heads/" + BRANCH:
-            return parts[0], out
-    return None, out
+        if len(parts) >= 2 and parts[1].startswith("refs/heads/"):
+            heads[parts[1][len("refs/heads/"):]] = parts[0]
+    return heads, out
+
+
+def _lead_head(heads):
+    """Вершина «главной» ветки — ею подписан верхний уровень фактов, на котором стоя́т одиночная
+    форма `decide` и старые состояния. Нет `main` — берём первую по имени: у верхнего уровня не
+    должно быть права соврать «сервер не ответил» только потому, что ветка названа иначе."""
+    if BRANCH in heads:
+        return heads[BRANCH]
+    names = sorted(heads)
+    if names:
+        return heads[names[0]]
+    return None
 
 
 def probe(run):
-    """Снять факты. Дешёвый путь первым: пока вершины равны, за объектами не ходим вовсе."""
+    """Снять факты по ВСЕМ веткам сервера. Дешёвый путь первым: пока каждая серверная вершина уже
+    стои́т в общем репозитории, за объектами не ходим вовсе."""
     # `asked` — не украшение отчёта: без него сторона, которую мы не успели спросить, выглядит
     # в выводе «не ответившей». Молчание и невопрос — разные вещи, и путать их нельзя даже в печати.
     facts = {"srv_head": None, "hub_head": None, "hub_in_srv": None, "srv_in_hub": None,
-             "count": None, "note": "", "asked": []}
+             "count": None, "note": "", "asked": [], "branches": {},
+             "srv_heads": {}, "hub_heads": {}}
     ok, out = ensure_mirror(run)
     if not ok:
         facts["note"] = u"зеркало не поднялось: " + out.strip()[-300:]
         return facts
 
     facts["asked"].append("srv")
-    srv, srv_out = _head_of(run, "srv")
-    facts["srv_head"] = srv
-    if not srv:
+    srv_heads, srv_out = _heads_of(run, "srv")
+    if srv_heads is None:
         facts["note"] = srv_out.strip()[-300:]
         return facts
+    if not srv_heads:
+        facts["note"] = u"сервер ответил, но веток у него нет — сверять нечего"
+        return facts
+    facts["srv_heads"] = srv_heads
+    facts["srv_head"] = _lead_head(srv_heads)
 
     facts["asked"].append("hub")
-    hub, hub_out = _head_of(run, "hub")
-    facts["hub_head"] = hub
-    if not hub:
+    hub_heads, hub_out = _heads_of(run, "hub")
+    if hub_heads is None:
         facts["note"] = hub_out.strip()[-300:]
         return facts
-    if srv == hub:
+    facts["hub_heads"] = hub_heads
+    facts["hub_head"] = _lead_head(hub_heads)
+
+    # Каждая серверная ветка уже стои́т в общем репозитории той же вершиной — за объектами не идём.
+    # Лишние ветки НА СТОРОНЕ ХАБА равенству не мешают: они не наш предмет.
+    behind = [n for n in srv_heads if hub_heads.get(n) != srv_heads[n]]
+    if not behind:
         return facts
 
-    # Вершины разные — теперь нужны объекты, чтобы судить о РОДСТВЕ, а не о равенстве строк.
+    # Вершины разошлись — теперь нужны объекты, чтобы судить о РОДСТВЕ, а не о равенстве строк.
     # Обе выкачки read-only; в сторону сервера уходит `fetch`, и ничего кроме.
-    rc, out = run(["fetch", "--quiet", "srv", "+refs/heads/%s:refs/remotes/srv/%s" % (BRANCH, BRANCH)],
-                  cwd=MIRROR)
+    rc, out = run(["fetch", "--quiet", "srv", "+refs/heads/*:refs/remotes/srv/*"], cwd=MIRROR)
     if rc != 0:
         facts["srv_head"] = None
         facts["note"] = u"fetch с сервера не удался: " + out.strip()[-300:]
         return facts
-    rc, out = run(["fetch", "--quiet", "hub", "+refs/heads/%s:refs/remotes/hub/%s" % (BRANCH, BRANCH)],
-                  cwd=MIRROR)
+    rc, out = run(["fetch", "--quiet", "hub", "+refs/heads/*:refs/remotes/hub/*"], cwd=MIRROR)
     if rc != 0:
         facts["hub_head"] = None
         facts["note"] = u"fetch из общего репозитория не удался: " + out.strip()[-300:]
         return facts
 
-    rc_a, _ = run(["merge-base", "--is-ancestor", hub, srv], cwd=MIRROR)
-    rc_b, _ = run(["merge-base", "--is-ancestor", srv, hub], cwd=MIRROR)
-    # 0 = предок, 1 = не предок, прочее = не смогли ответить (третий исход, а не «нет»).
-    facts["hub_in_srv"] = True if rc_a == 0 else (False if rc_a == 1 else None)
-    facts["srv_in_hub"] = True if rc_b == 0 else (False if rc_b == 1 else None)
-    if facts["hub_in_srv"]:
-        rc, out = run(["rev-list", "--count", "%s..%s" % (hub, srv)], cwd=MIRROR)
-        if rc == 0 and out.strip().isdigit():
-            facts["count"] = int(out.strip())
+    branches = {}
+    for name in sorted(srv_heads):
+        srv_sha = srv_heads[name]
+        hub_sha = hub_heads.get(name)
+        b = {"srv_head": srv_sha, "hub_head": hub_sha, "hub_in_srv": None, "srv_in_hub": None,
+             "count": None, "hub_absent": hub_sha is None}
+        if hub_sha is None:
+            # Ветки в общем репозитории нет вовсе. «Сколько нового» считаем ОТ ВСЕГО, что там уже
+            # лежит: у ветки-новичка нет своей точки отсчёта, а объекты могут быть общими с main.
+            rc, out = run(["rev-list", "--count", srv_sha, "--not", "--remotes=hub"], cwd=MIRROR)
+            if rc == 0 and out.strip().isdigit():
+                b["count"] = int(out.strip())
+        elif hub_sha != srv_sha:
+            rc_a, _ = run(["merge-base", "--is-ancestor", hub_sha, srv_sha], cwd=MIRROR)
+            rc_b, _ = run(["merge-base", "--is-ancestor", srv_sha, hub_sha], cwd=MIRROR)
+            # 0 = предок, 1 = не предок, прочее = не смогли ответить (третий исход, а не «нет»).
+            b["hub_in_srv"] = True if rc_a == 0 else (False if rc_a == 1 else None)
+            b["srv_in_hub"] = True if rc_b == 0 else (False if rc_b == 1 else None)
+            if b["hub_in_srv"]:
+                rc, out = run(["rev-list", "--count", "%s..%s" % (hub_sha, srv_sha)], cwd=MIRROR)
+                if rc == 0 and out.strip().isdigit():
+                    b["count"] = int(out.strip())
+        branches[name] = b
+    facts["branches"] = branches
+
+    # Совместимость: верхний уровень описывает главную ветку — на нём стоя́т подпись прежних
+    # состояний и одиночная форма решения.
+    lead = branches.get(BRANCH)
+    if lead:
+        facts["hub_in_srv"] = lead["hub_in_srv"]
+        facts["srv_in_hub"] = lead["srv_in_hub"]
+        facts["count"] = lead["count"]
     return facts
 
 
 def hand_over(run, facts):
-    """Положить серверные коммиты в общий репозиторий. Только перемотка вперёд, только НЕ форсно.
+    """Положить серверные коммиты в общий репозиторий. Только перемотка вперёд и только создание
+    веток, которых там нет; только НЕ форсно.
 
-    → (ok, слова, список хешей). Вызывается ТОЛЬКО при исходе `deliver`."""
-    hub, srv = facts["hub_head"], facts["srv_head"]
-    rc, out = run(["rev-list", "--reverse", "%s..%s" % (hub, srv)], cwd=MIRROR)
-    shas = out.split() if rc == 0 else []
-    # `<sha>:refs/heads/main` без `+` и без `--force`: даже если наша проверка родства ошибётся,
-    # приёмная сторона отобьёт не-перемотку сама. Два замка на одну дверь — сознательно.
-    rc, out = run(["push", "hub", "%s:refs/heads/%s" % (srv, BRANCH)], cwd=MIRROR)
-    if rc != 0:
-        return False, out.strip()[-400:], shas
-    return True, out.strip()[-200:], shas
+    → (ok, слова, список хешей, список веток). Вызывается ТОЛЬКО при исходе `deliver`.
+    Отправляем ПО ВЕТКЕ ЗА РАЗ, а не одной командой с пачкой refspec'ов, СОЗНАТЕЛЬНО: одна
+    отбитая ветка не имеет права утащить в отказ остальные, а отчёт обязан назвать, какая именно."""
+    shas, done, fail = [], [], []
+    for name, srv_sha, hub_sha in plan_pushes(facts):
+        if hub_sha:
+            rc, out = run(["rev-list", "--reverse", "%s..%s" % (hub_sha, srv_sha)], cwd=MIRROR)
+        else:
+            rc, out = run(["rev-list", "--reverse", srv_sha, "--not", "--remotes=hub"], cwd=MIRROR)
+        mine = out.split() if rc == 0 else []
+        # `<sha>:refs/heads/<ветка>` без `+` и без `--force`: даже если наша проверка родства
+        # ошибётся, приёмная сторона отобьёт не-перемотку сама. Два замка на одну дверь.
+        rc, out = run(["push", "hub", "%s:refs/heads/%s" % (srv_sha, name)], cwd=MIRROR)
+        if rc != 0:
+            fail.append(u"%s: %s" % (name, out.strip()[-200:]))
+            continue
+        done.append(name)
+        for sha in mine:
+            if sha not in shas:
+                shas.append(sha)
+    if fail:
+        return False, u"; ".join(fail), shas, done
+    return True, u"ветки: %s" % u", ".join(done), shas, done
 
 
 def extract_artifacts(run, facts, dest=None):
     """Выложить на диск ПК файлы `docs/artifacts/`, приехавшие с сервера, — чтобы серверная работа
-    была ЧИТАЕМА здесь, а не только лежала объектами в зеркале. → список путей."""
+    была ЧИТАЕМА человеком, а не только лежала объектами в зеркале. → список путей.
+
+    Новых веток это не касается СОЗНАТЕЛЬНО: у ветки, которой в общем репозитории нет вовсе, нет
+    и точки отсчёта — «что в ней нового» неопределено, а вываливать её дерево целиком значит
+    засыпать общую папку июльскими копиями. Сохранность их содержимого держит push, а не выкладка."""
     dest = dest or ART_DIR
-    hub, srv = facts["hub_head"], facts["srv_head"]
-    rc, out = run(["diff", "--name-only", "--diff-filter=ACMR", hub, srv, "--", "docs/artifacts"],
-                  cwd=MIRROR)
-    if rc != 0:
-        return []
     written = []
-    os.makedirs(dest, exist_ok=True)
-    for path in [p.strip() for p in out.splitlines() if p.strip()]:
-        rc, blob = run(["show", "%s:%s" % (srv, path)], cwd=MIRROR)
+    for name, srv_sha, hub_sha in plan_pushes(facts):
+        if not hub_sha:
+            continue
+        rc, out = run(["diff", "--name-only", "--diff-filter=ACMR", hub_sha, srv_sha,
+                       "--", "docs/artifacts"], cwd=MIRROR)
         if rc != 0:
             continue
-        target = os.path.join(dest, os.path.basename(path))
-        with open(target, "w", encoding="utf-8", newline="") as f:
-            f.write(blob)
-        written.append(target)
+        for path in [p.strip() for p in out.splitlines() if p.strip()]:
+            rc, blob = run(["show", "%s:%s" % (srv_sha, path)], cwd=MIRROR)
+            if rc != 0:
+                continue
+            os.makedirs(dest, exist_ok=True)
+            target = os.path.join(dest, os.path.basename(path))
+            with open(target, "w", encoding="utf-8", newline="") as f:
+                f.write(blob)
+            written.append(target)
     return written
+
+
+def backfill_legacy(src_dir=None, dest=None):
+    """Добор: файлы, которые ПРОШЛЫЕ обороты положили только во временный каталог доставки,
+    копируются в видимую папку. → список путей.
+
+    Копия, а не перенос, и только то, чего в видимой папке ещё нет: удалять и перезаписывать
+    доставке нечем и незачем. Идемпотентно, поэтому живёт в обороте, а не в разовом скрипте, —
+    разовый скрипт починил бы сегодняшний случай и промолчал бы о завтрашнем."""
+    src_dir = src_dir if src_dir else TMP_ART_DIR
+    dest = dest if dest else ART_DIR
+    filled = []
+    if not os.path.isdir(src_dir):
+        return filled
+    for name in sorted(os.listdir(src_dir)):
+        src = os.path.join(src_dir, name)
+        dst = os.path.join(dest, name)
+        if not os.path.isfile(src) or os.path.exists(dst):
+            continue
+        with open(src, "r", encoding="utf-8", errors="replace") as f:
+            body = f.read()
+        os.makedirs(dest, exist_ok=True)
+        with open(dst, "w", encoding="utf-8", newline="") as f:
+            f.write(body)
+        filled.append(dst)
+    return filled
 
 
 # ───────────────────────────── оборот ─────────────────────────────
@@ -370,14 +568,14 @@ def tick(run=None, now=None, say=None, state=None, force=False, dry=False):
                 "facts": {}, "said": False, "state": prev, "shas": []}
 
     facts = probe(run)
-    kind, why = decide(facts)
-    shas, arts = [], []
+    kind, why = decide_all(facts)
+    shas, arts, moved = [], [], []
 
     if kind == DELIVER and not dry:
-        ok, out, shas = hand_over(run, facts)
+        ok, out, shas, moved = hand_over(run, facts)
         if ok:
             arts = extract_artifacts(run, facts)
-            why = why + u"; легло, файлов артефактов на ПК: %d" % len(arts)
+            why = why + u"; легло (%s), файлов артефактов на ПК: %d" % (out, len(arts))
         else:
             kind = BLOCKED
             why = u"коммиты сервера есть, а положить их в общий репозиторий не вышло: " + out
@@ -392,12 +590,15 @@ def tick(run=None, now=None, say=None, state=None, force=False, dry=False):
     new_state = dict(prev)
     if not dry:
         new_state.update({"probed_at": now, "kind": kind, "sig": sig,
-                          "srv_head": facts.get("srv_head"), "hub_head": facts.get("hub_head")})
+                          "srv_head": facts.get("srv_head"), "hub_head": facts.get("hub_head"),
+                          "srv_heads": facts.get("srv_heads"),
+                          "hub_heads": facts.get("hub_heads")})
         if said:
             new_state["said_at"] = now
         if kind == DELIVER:
             new_state["last_deliver_at"] = now
             new_state["last_deliver"] = shas
+            new_state["last_branches"] = moved
         if state is None:
             try:
                 write_state(new_state)
@@ -405,7 +606,7 @@ def tick(run=None, now=None, say=None, state=None, force=False, dry=False):
                 pass
 
     return {"kind": kind, "why": why, "facts": facts, "said": said, "line": line,
-            "state": new_state, "shas": shas, "artifacts": arts}
+            "state": new_state, "shas": shas, "artifacts": arts, "branches": moved}
 
 
 def main(argv=None):
@@ -416,6 +617,13 @@ def main(argv=None):
     if os.environ.get("TURBOBABY_TEST_LOGS"):
         print(u"исход: off — TURBOBABY_TEST_LOGS: наружу не ходим")
         return 0
+    if mode == "--backfill":
+        # Отдельный вход: добрать в видимую папку то, что прошлые обороты положили только во
+        # временную. Наружу не ходит ни одной командой.
+        for path in backfill_legacy():
+            print(u"добрано в общую папку: %s" % path)
+        return 0
+
     res = tick(force=mode in ("--now", "--dry", "--status"),
                dry=mode in ("--dry", "--status"))
     if mode in ("--status", "--dry"):
@@ -426,13 +634,24 @@ def main(argv=None):
             return f.get(key) or (u"НЕ ОТВЕТИЛ" if who in asked else u"НЕ СПРАШИВАЛИ")
         print(u"сервер:  %s" % _side("srv_head", "srv"))
         print(u"общий:   %s" % _side("hub_head", "hub"))
-        print(u"родство: hub_in_srv=%s srv_in_hub=%s count=%s" % (
-            f.get("hub_in_srv"), f.get("srv_in_hub"), f.get("count")))
+        branches = f.get("branches")
+        if branches:
+            for name in sorted(branches):
+                b = branches[name]
+                print(u"  ветка %-34s srv=%s hub=%s → %s" % (
+                    name, (b.get("srv_head") or "-")[:7],
+                    (b.get("hub_head") or u"НЕТ")[:7], decide(b)[0]))
+        else:
+            print(u"родство: hub_in_srv=%s srv_in_hub=%s count=%s" % (
+                f.get("hub_in_srv"), f.get("srv_in_hub"), f.get("count")))
         if f.get("note"):
             print(u"замечание: %s" % f["note"])
     print(u"исход: %s — %s" % (res["kind"], res["why"]))
     if res.get("shas"):
         print(u"легли хеши: %s" % " ".join(s[:7] for s in res["shas"]))
+    if not (mode in ("--status", "--dry")):
+        for path in backfill_legacy():
+            print(u"добрано в общую папку: %s" % path)
     for a in res.get("artifacts") or []:
         print(u"артефакт на ПК: %s" % a)
     # Код возврата: 0 — сходили и ничего плохого; 1 — нужен человек (конфликт/право записи);
