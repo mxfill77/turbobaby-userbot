@@ -6026,7 +6026,16 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         # то есть защищены строже остатка, а не слабее. (`result_ref` стои́т там
                         # же и по той же причине; ящик его больше не зовёт, канон адреса шага он
                         # держать не перестал.)
-                        "shtab_box_run.py", "shtab_box.py")
+                        "shtab_box_run.py", "shtab_box.py",
+                        # 02.09.2026: ЖИВАЯ ВИТРИНА — куст за ленивым `import vitrina_pc_run` в
+                        # `maybe_vitrina`. Своих новых листьев ровно ДВА: сама витрина и её руки.
+                        # Всё прочее уже в остатке выше и повторять его здесь НЕЛЬЗЯ (список
+                        # сверяется множествами): `contour_digest`/`contour_digest_run` — ЧУЖИЕ
+                        # измерения и списки путей осей; `review_audit`/`review_audit_run` — страж
+                        # исходящего и адрес темы; `dispatch_notify` — дверь ПРАВКИ; `shtab_box` —
+                        # суточный потолок ящика; `brain_writer` — чтение узла Штаба и запись
+                        # пульса. Витрина не завела ни одного своего замера и ни одной своей двери.
+                        "vitrina_pc_run.py", "vitrina_pc.py")
 # остаток: ленивые импорты вне ворот грязного дерева
 
 
@@ -9638,6 +9647,84 @@ def maybe_contour_digest(now=None, state_path=None, runner=None):
     return report
 
 
+# ------------------- ЖИВАЯ ВИТРИНА СОСТОЯНИЯ (флаг VITRINA_PC) ----------------
+# ЧЕМ ОТЛИЧАЕТСЯ ОТ СВОДКИ ВЫШЕ, И ПОЧЕМУ ОБЕ. Сводка кладёт в тему НОВОЕ сообщение
+# каждые 4 ч — и права: у СОБЫТИЯ есть история, её листают назад. Но у СОСТОЯНИЯ
+# истории нет, и шесть сообщений в сутки превращают вопрос «что сейчас» в ленту.
+# Витрина живёт ОДНИМ сообщением, которое демон ПРАВИТ на месте (editMessageText,
+# дверь `dispatch_notify.edit_topic_strict`): владелец заходит в тему и видит
+# текущее, не листая. Сводку витрина не заменяет и не отменяет — стои́т рядом.
+#
+# НОВОГО СООБЩЕНИЯ ЗА ОБОРОТ НЕТ НИ ОДНОЙ ВЕТКОЙ. Сорванная правка = «сказать в лог
+# и ждать следующего оборота»; новое шлётся ровно тогда, когда САМ Telegram сказал,
+# что старого больше нет (`vitrina_pc.edit_lost` — признак в чистом слое, узкий
+# намеренно). Замок держит тест `test_second_turn_makes_no_second_message`.
+#
+# ЧАСТОТА — ПО СМЕНЕ ЧИСЕЛ, А НЕ ПО ЧАСАМ. Ветка заглядывает раз в VITRINA_PC_SEC,
+# но трогает тему ТОЛЬКО когда поменялась подпись тела (`vitrina_pc.signature`).
+# Числа стоя́т сутки → правок за сутки ноль, и это правильный ответ.
+#
+# ЧЕЛОВЕЧЕСКИЕ ЧАСТИ НЕ СОЧИНЯЮТСЯ КОДОМ: «сейчас делаем», «застряло» и «куда идём»
+# читаются из узла мозга `shtab_vitrina`, который пишет ШТАБ. Узла нет → части
+# говорят «Штаб не обновил» с причиной, а витрина живёт (третий отрицательный тест).
+#
+# ЗАПИСЕЙ РОВНО ДВЕ И ОБЕ СВОИ: файл состояния витрины (id сообщения + подпись) и
+# узел пульса `pulse_pc`. Очереди ветка не касается ни строкой (инвариант
+# VITRINA_PC_READS_ONLY обходом AST), кнопок не несёт, клиентского контура не знает.
+#
+# ОТКАТ: стоп-файл `pc_orchestrator.vitrina.off` (со следующего тика, без рестарта)
+# либо `VITRINA_PC=0`. Ненастроенная тема сводок = витрина выключена целиком.
+VITRINA_PC_SEC = float(os.getenv("VITRINA_PC_SEC", "600") or "600")     # как часто ЗАГЛЯДЫВАТЬ
+VITRINA_PC_STATE_FILE = _state(os.path.join(REPO, "vitrina_pc_state.json"))
+VITRINA_PC_TICK_FILE = _state(os.path.join(REPO, "pc_orchestrator.vitrina_tick.json"))
+_VITRINA_LAST = [0.0]           # метка загляда В ПАМЯТИ: рестарт демона = свежий взгляд, не потеря
+
+
+def _vitrina_on():
+    """Витрина включена? Дефолт — ВКЛЮЧЕНО; рубильники как у соседних ступеней."""
+    if (os.environ.get("VITRINA_PC") or "").strip() == "0":
+        return False
+    if _flag_forced_off("VITRINA"):
+        log.warning("витрина ВЫКЛЮЧЕНА стоп-файлом %s (снять: удалить файл)",
+                    os.path.basename(_flag_off_file("VITRINA")))
+        return False
+    return True
+
+
+def maybe_vitrina(now=None, state_path=None, runner=None):
+    """Один загляд витрины. → отчёт | None.
+
+    Троттлинг здесь ДВОЙНОЙ и это не избыточность. Внешний (VITRINA_PC_SEC) бережёт
+    виток от лишнего чтения диска и git; внутренний (подпись чисел) бережёт ТЕМУ от
+    лишней правки. Убери внешний — и каждый виток тратил бы три вызова git ради
+    ответа «ничего не изменилось»; убери внутренний — и витрина правила бы себя раз
+    в десять минут, то есть стала бы мигалкой.
+    """
+    if not _vitrina_on():
+        return None
+    now = float(now if now is not None else time.time())
+    if _VITRINA_LAST[0] and (now - _VITRINA_LAST[0]) < VITRINA_PC_SEC:
+        return None
+    _VITRINA_LAST[0] = now
+    try:
+        import vitrina_pc_run
+
+        report = (runner or vitrina_pc_run.tick)(
+            root=os.path.dirname(VITRINA_PC_STATE_FILE) or REPO,
+            state=state_path or VITRINA_PC_STATE_FILE,
+            now=now, send=True, pulse=True,
+        )
+    except Exception as e:
+        log.warning("витрина: загляд упал (fail-safe, следующая попытка через тик): %s", e)
+        return None
+    if report.get("skipped"):
+        log.debug("витрина: %s", report["skipped"])
+        return report
+    log.info("витрина: %s (сообщение %s)%s", report.get("how"), report.get("message_id"),
+             "" if report.get("ok") else " · НЕ вышло: %s" % report.get("why"))
+    return report
+
+
 # ------------------- РЕВИЗОР: МАРШРУТИЗАЦИЯ НАХОДОК (шаг 4/7 родителя 262) -----
 # revizor_tick собрал пакеты активных окон (шаг 2), _revizor_consult судит окно думателем (шаг 3).
 # Здесь — РАЗВОДКА находок по каналам (сам ревизор НИЧЕГО не правит и клиентам НЕ пишет):
@@ -10677,6 +10764,7 @@ def _main_loop():
             maybe_shtab_box()         # ящик Штаба: узел мозга → задача полосы, НЕ БОЛЬШЕ ОДНОЙ за виток (SHTAB_BOX_MIN_SEC)
             maybe_review_outbox()     # ступень F: не доехавший пакет → очередь исходящих с повтором (REVIEW_OUTBOX_MIN_SEC)
             maybe_contour_digest()    # сводка контура: СОСТОЯНИЕ полосы в тему сводок раз в CONTOUR_DIGEST_SEC (4 ч)
+            maybe_vitrina()           # живая витрина: ОДНО сообщение темы правится на месте при СМЕНЕ ЧИСЕЛ (VITRINA_PC_SEC)
             maybe_lesson_commit_retry()  # пакет «полнота лога» п.6: докоммитить урок из спула (провал коммита ≠ вечная грязь)
             maybe_git_ff_pull()       # родитель #221: подтянуть origin/main ff-only ДО реконсиляции/self-update (тот же тик применит)
             maybe_reconcile_children()  # класс-фикс c6d8a30: применить свежий код детей на ЛЮБОЙ новый коммит
