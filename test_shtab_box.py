@@ -24,7 +24,10 @@
   стороны стирает её целиком.
 * :class:`TestParse` — формат блоков и отказы разбора (незакрытый блок, разъезд
   ключей, двойники).
-* :class:`TestGates` — ворота приёма: ЗАПРЕТЫ и АДРЕС РЕЗУЛЬТАТА.
+* :class:`TestGates` — ворота приёма: ЗАПРЕТЫ и АДРЕС РЕЗУЛЬТАТА. С 02.09.2026
+  форма адреса ОДНА на ящик и на судью закрытия, и проверяются ОБЕ половины
+  сведения: чужая форма (канон ``result_ref``) воротами не берётся, а принятая —
+  не только берётся, но и СУДИТСЯ живым ``done_judge_pc`` до вердикта «сделано».
 * :class:`TestCeiling` — суточный потолок и лимит витка; оба restart-proof, оба
   считаются по маркерам ЖИВОЙ очереди чужим устройством (ступень E).
 * :class:`TestHands` — руки: сухой ход очередь не трогает, дорогое чтение `done`
@@ -41,6 +44,7 @@ import unittest
 
 import contour_digest as cd
 import contour_digest_run as cdr
+import done_judge_pc as dj
 import recon_auto
 import result_ref
 import shtab_box as sb
@@ -60,17 +64,28 @@ def _src(name):
 # вычитаются части в отрицательных тестах, чтобы отказ был вызван ОДНОЙ
 # нехваткой, а не тем, что образец был мусором с самого начала.
 
+#
+# АДРЕС РЕЗУЛЬТАТА стои́т здесь В ФОРМЕ СУДЬИ ЗАКРЫТИЯ (правка 02.09.2026): ворота
+# ящика и судья читают ОДНУ форму, и образец набора обязан быть той же формы —
+# иначе набор зеленел бы на блоке, который живой судья закрыть не сможет.
+ADDR_LINE = ("АДРЕС РЕЗУЛЬТАТА: файл в docs/artifacts за 02.09 "
+             "со словами доля неизвестного за август")
+
+# Прежняя, СНЯТАЯ форма ворот — канон Штаба `result_ref`. Живёт в наборе ровно как
+# ОТРИЦАТЕЛЬНЫЙ образец: судья её не читает, значит ворота её не берут.
+FOREIGN_ADDR = result_ref.marker(result_ref.make("file",
+                                                 "docs/artifacts/2026-09-02-dolya.md"))
+
 GOOD_BODY = (
     "ЦЕЛЬ: пересчитать, сколько строк очереди полосы закрылось вердиктом «неизвестно» за август,\n"
     "и назвать долю числом.\n\n"
     + sb.PROHIBITIONS + "\n\n"
     "ПРИЗНАК СДЕЛАННОСТИ: в артефакте стои́т число и команда, которой оно получено.\n\n"
-    "[result_ref: file docs/artifacts/2026-09-02-dolya-neizvestno.md]"
+    + ADDR_LINE
 )
 
 # Тело БЕЗ адреса результата — вырезана ровно последняя строка.
-NO_ADDR_BODY = GOOD_BODY.replace(
-    "[result_ref: file docs/artifacts/2026-09-02-dolya-neizvestno.md]", "").strip()
+NO_ADDR_BODY = GOOD_BODY.replace(ADDR_LINE, "").strip()
 
 # Тело БЕЗ блока запретов — вырезан ровно он.
 NO_PROHIB_BODY = GOOD_BODY.replace(sb.PROHIBITIONS, "").strip()
@@ -179,6 +194,22 @@ class TestPurity(unittest.TestCase):
         body = _src("shtab_box.py")
         for forbidden in ("get_pending", "enqueue_pc_task", "D:\\", "__file__"):
             self.assertNotIn(forbidden, body, "в чистом модуле не место %s" % forbidden)
+
+    def test_the_box_borrows_only_the_address_reader_from_the_judge(self):
+        """У судьи закрытия ящик берёт РОВНО читатель адреса — и ничего с руками.
+
+        `done_judge_pc` умеет писать на диск (пакеты V0 и реестр вердиктов), и с
+        02.09 чистый модуль его импортирует. Список разрешённого держит эти руки
+        снаружи: без него одна опечатка (`note`, `_packets`) завела бы ящику диск,
+        а инвариант чистоты смотрит на ИМЕНА МОДУЛЕЙ и такую правку пропустил бы.
+        """
+        allowed = {"read_address"}
+        seen = set()
+        for node in ast.walk(ast.parse(_src("shtab_box.py"))):
+            if isinstance(node, ast.Attribute) and getattr(node.value, "id", "") == "done_judge_pc":
+                seen.add(node.attr)
+        self.assertTrue(seen, "ящик перестал спрашивать судью — формы разъедутся снова")
+        self.assertEqual(seen - allowed, set(), "ящик берёт у судьи лишнее: %s" % (seen - allowed))
 
 
 # ═══════════════════════════ только чтение ═════════════════════════════
@@ -326,25 +357,105 @@ class TestGates(unittest.TestCase):
             self.assertFalse(ok, "тема %r ничего не требует" % name)
             self.assertIn(name, missing)
 
-    def test_the_address_gate_uses_the_lane_canon_not_its_own_regex(self):
-        """Адрес судит ``result_ref`` — канон полосы, а не наша регулярка.
+    def test_the_address_gate_asks_the_closing_judge_itself(self):
+        """ФОРМА АДРЕСА ОДНА, и живёт она у СУДЬИ: ворота зовут его читатель.
 
-        Разойдись два экземпляра канона, и ящик принимал бы блоки, которые судья
-        ступени C адресом не считает: задача уехала бы в работу и не закрылась бы
-        никогда.
+        До 02.09 форм было две — ворота судили каноном ``result_ref``, судья читал
+        свою прозу, и пересечение их было ПУСТО: принятая ящиком задача не могла
+        закрыться доказанной ни при каком исполнении. Своя копия чужого правила
+        разошлась бы снова и разошлась бы МОЛЧА, поэтому пин стои́т на чужую
+        функцию, а не на форму строки.
         """
-        self.assertIn("result_ref", _src("shtab_box.py"))
-        for kind in result_ref.KINDS:
-            body = NO_ADDR_BODY + "\n[result_ref: %s указатель]" % kind
+        self.assertIn("done_judge_pc.read_address", _src("shtab_box.py"))
+        for form in (ADDR_LINE,
+                     "АДРЕС РЕЗУЛЬТАТА: файл в docs/artifacts за 02.09.2026 со словами доля",
+                     "АДРЕС РЕЗУЛЬТАТА: файл docs/artifacts/x.md со словами доля"):
+            body = NO_ADDR_BODY + "\n" + form
+            self.assertIsNotNone(dj.read_address(body), "предпосылка теста протухла: %s" % form)
             ok, reason, _why = sb.check({"key": "kk1", "body": body})
-            self.assertTrue(ok, "вид %s каноном принят, а воротами нет (%s)" % (kind, reason))
+            self.assertTrue(ok, "судья читает, а ворота не берут (%s): %s" % (reason, form))
 
-    def test_the_dead_form_of_the_address_is_not_an_address(self):
-        """Снятая форма ``[result_ref file:путь]`` адресом НЕ является — по канону."""
-        body = NO_ADDR_BODY + "\n[result_ref file:docs/artifacts/x.md]"
+    def test_the_shipped_sample_of_the_address_passes_its_own_gate(self):
+        """Образец адреса, как и образец запретов, обязан проходить НАШИ ЖЕ ворота.
+
+        Иначе документация звала бы Штаб писать адрес, на котором ящик отказывает,
+        — а увидели бы мы это только на живом задании.
+        """
+        body = "ЦЕЛЬ: проверить образец.\n\n" + sb.PROHIBITIONS + "\n\n" + sb.ADDRESS
+        ok, reason, why = sb.check({"key": "kk1", "body": body})
+        self.assertTrue(ok, "образец адреса не проходит собственные ворота: %s %s" % (reason, why))
+        self.assertIsNotNone(dj.read_address(sb.ADDRESS), "образец не читается судьёй")
+
+    def test_NEGATIVE_the_foreign_form_of_the_address_is_not_taken(self):
+        """ОТРИЦАТЕЛЬНАЯ ПОЛОВИНА СВЕДЕНИЯ: чужая форма воротами НЕ берётся.
+
+        Чужая здесь — прежняя своя: КАНОН ШТАБА ``result_ref``. Он собран не
+        литералом, а самим каноном (``result_ref.make``), чтобы тест доказывал
+        отказ НАСТОЯЩЕЙ форме, а не выдуманной строке.
+        """
+        body = NO_ADDR_BODY + "\n" + FOREIGN_ADDR
+        self.assertTrue(result_ref.is_named(result_ref.read(body)),
+                        "образец обязан быть настоящим каноном result_ref")
+        self.assertIsNone(dj.read_address(body),
+                          "предпосылка протухла: судья научился читать канон — сведи формы заново")
+        ok, reason, why = sb.check({"key": "kk1", "body": body})
+        self.assertFalse(ok, "ворота берут форму, на которой судья слеп")
+        self.assertEqual(reason, "no_address")
+        self.assertIn("судья", why)
+        self.assertIn(sb.ADDRESS_FORM, why, "отказ обязан НАЗЫВАТЬ единственную форму")
+
+    def test_an_address_without_the_proving_words_is_not_taken_either(self):
+        """Адрес без слов судья отвергает дословно — ворота обязаны отвергнуть его тут.
+
+        Иначе блок брался бы ради закрытия, которое заведомо не состоится: слова и
+        есть то, чем судья доказывает продукт.
+        """
+        body = NO_ADDR_BODY + "\nАДРЕС РЕЗУЛЬТАТА: файл docs/artifacts/x.md"
+        addr = dj.read_address(body)
+        self.assertIsNotNone(addr)
+        self.assertEqual(addr["words"], "")
+        ok, reason, why = sb.check({"key": "kk1", "body": body})
+        self.assertFalse(ok)
+        self.assertEqual(reason, "no_address")
+        self.assertIn("без слов", why)
+
+    def test_POSITIVE_a_taken_block_is_actually_judged_by_the_closing_judge(self):
+        """ПОЛОЖИТЕЛЬНАЯ ПОЛОВИНА: принятый блок судья не только ЧИТАЕТ, но и СУДИТ.
+
+        Проверять одну половину мало: расхождение форм убивало задачу не на
+        воротах (их она проходила), а в СУДЕ — «адрес результата не назван». Здесь
+        прогоняется весь путь ступени C на поддельном корне: опорный снимок ДО,
+        артефакт по адресу, вердикт ПОСЛЕ. Имя артефакта — КИРИЛЛИЧЕСКОЕ, как у
+        71% наших сентябрьских файлов.
+        """
+        root = tempfile.mkdtemp(prefix="shtabjudge_")
+        os.makedirs(os.path.join(root, "docs", "artifacts"))
+        text = sb.task_text({"key": "kk1", "body": GOOD_BODY}, TODAY)
+        self.assertIsNotNone(text)
+        base = dj.baseline(text, root=root)
+        self.assertTrue(base["ok"], "судья не снял опорный снимок по адресу из ящика")
+        with io.open(os.path.join(root, "docs", "artifacts", "2026-09-02-доля-неизвестного.md"),
+                     "w", encoding="utf-8") as fh:
+            fh.write("# доля неизвестного за август\n\n13 из 18 закрытий — без адреса.\n")
+        verdict = dj.judge("119", text, "done", base, root=root)
+        self.assertEqual(verdict["verdict"], dj.DONE, verdict["reason"])
+
+    def test_a_cyrillic_artifact_name_survives_the_chosen_form(self):
+        """Кириллица в имени артефакта — не редкость, а НОРМА полосы (37 из 52 за сентябрь).
+
+        Форма с ПРЯМЫМ ПУТЁМ на ней слепа: набор символов пути у судьи латинский.
+        Значит ворота такой блок не берут — расхождение обязано стоить отказа на
+        входе, а не недоказуемого закрытия на выходе. Форма «папка + дата + слова»
+        имени файла не разбирает вовсе и потому переживает кириллицу.
+        """
+        body = (NO_ADDR_BODY
+                + "\nАДРЕС РЕЗУЛЬТАТА: файл docs/artifacts/2026-09-02-доля.md со словами доля")
+        self.assertIsNone(dj.read_address(body))
         ok, reason, _why = sb.check({"key": "kk1", "body": body})
         self.assertFalse(ok)
         self.assertEqual(reason, "no_address")
+        ok, reason, _why = sb.check({"key": "kk1", "body": GOOD_BODY})
+        self.assertTrue(ok, reason)
 
     def test_empty_and_oversized_bodies_are_refused_with_their_own_reasons(self):
         ok, reason, _ = sb.check({"key": "kk1", "body": "   "})
