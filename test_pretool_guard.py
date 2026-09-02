@@ -1456,10 +1456,17 @@ class TestCardMinimumAndJournal(unittest.TestCase):
         self.assertIn("Число: версия 76", card)
         self.assertIn("Откат: " + _CL + " deploy -i …hXNOqw -V ", card)
         self.assertIn("Команда: ", card)
-        # 3 секунды — это пять строк; высшему виду разрешена ОДНА добавочная (шапка), не больше.
-        self.assertLessEqual(len(card.splitlines()), 6)
+        # ПОТОЛОК ПОДНЯТ НА ОДНУ СТРОКУ 03.09.2026 вместе с новым содержанием карточки: к
+        # «ЧТО/ОБЪЕКТ/ЧИСЛО/ОТКАТ» прибавилось ПОСЛЕДСТВИЕ «да» (`CONSEQ_LINE_PREFIX`) — та самая
+        # строка, ради которой владелец иначе шёл поднимать код. Обычный вид — шесть строк,
+        # высшему по-прежнему разрешена РОВНО ОДНА добавочная (шапка), не больше.
+        self.assertLessEqual(len(card.splitlines()), 7)
         ordinary = g.card_or_journal("env", ".env", "cat .env")
-        self.assertLessEqual(len(ordinary.splitlines()), 5, "обычный вид не вырос ни на строку")
+        # У видов, чьи данные уезжают наружу (`_PROTECTED_KINDS`), стои́т ещё строка справки о
+        # защитах — седьмая. Её цена названа здесь, а не спрятана в общем потолке.
+        self.assertLessEqual(len(ordinary.splitlines()), 7, "обычный вид вырос больше, чем на две")
+        self.assertEqual(sum(1 for ln in ordinary.splitlines()
+                             if ln.startswith(("Защита: ", g.CONSEQ_LINE_PREFIX))), 2)
         self.assertTrue(ordinary.splitlines()[0].startswith("🔴"))
 
     def test_every_red_kind_carries_a_rollback_line(self):
@@ -3357,7 +3364,10 @@ class TestTwoTiersOfCards(unittest.TestCase):
         self.assertIn("Зарплаты", top.splitlines()[0], "объект назван прямо в шапке")
 
     def test_ordinary_card_did_not_change_by_a_single_byte(self):
-        """Обычный вид — байт-в-байт прежний: правка платит только за высший."""
+        """Обычный вид шапки высшего вида НЕ несёт: правка 31.07 платит только за высший.
+        ПОТОЛОК СТРОК ПЕРЕСЧИТАН 03.09.2026 (последствие «да» + справка о защитах); свойство,
+        ради которого тест заведён, не тронуто — первая строка обычной карточки `🔴`, `⛔` в ней
+        нет, и `card_or_journal` отдаёт ровно то же, что `_card`."""
         for kind, obj, cmd in (("env", _DOTENV, "cat " + _DOTENV),
                                ("edit_claude", "settings.json", "echo x > " + _CFGJSON),
                                ("network", "example.com", "curl https://example.com"),
@@ -3366,16 +3376,28 @@ class TestTwoTiersOfCards(unittest.TestCase):
                 card = g.card_or_journal(kind, obj, cmd)
                 self.assertEqual(card, g._card(kind, obj, cmd))
                 self.assertTrue(card.splitlines()[0].startswith("🔴"))
-                self.assertLessEqual(len(card.splitlines()), 5)
+                self.assertNotIn("⛔", card)
+                self.assertLessEqual(len(card.splitlines()), 7)
 
     def test_top_tier_costs_exactly_one_line(self):
+        """Ровно одна добавочная строка у ВЫСШЕГО вида — считаем разницей с тем же видом без
+        шапки, а не абсолютным числом строк: абсолютное число зависит от содержания карточки и
+        стареет при первой же правке (так оно и устарело 03.09)."""
         for kind, obj, cmd in (("delete", "old.log", "del /f old.log"),
                                ("kill", "PID 4242", "taskkill /PID 4242 /F"),
                                ("live_sheet", "CRM", self.SHEET)):
             with self.subTest(kind):
                 card = g.card_or_journal(kind, obj, cmd)
-                self.assertLessEqual(len(card.splitlines()), 6)
+                self.assertTrue(card.splitlines()[0].startswith("⛔"))
                 self.assertTrue(card.splitlines()[1].startswith("🔴"))
+                saved = g._TOP_TIER
+                try:                              # тот же вид, но БЕЗ высшего яруса
+                    g._TOP_TIER = tuple(k for k in saved if k != kind)
+                    plain = g.card_or_journal(kind, obj, cmd)
+                finally:
+                    g._TOP_TIER = saved
+                self.assertEqual(card.splitlines()[1:], plain.splitlines(),
+                                 "высший вид изменил не только шапку")
 
     # --- (3) КОРОТКОЕ «ДА» ВЫСШИЙ ВИД НЕ ОТКРЫВАЕТ -------------------------------------------
     def test_short_yes_does_not_confirm_top_tier(self):
@@ -4591,8 +4613,14 @@ class TestConfigMentionAndRollbackObject(unittest.TestCase):
 
     def test_foreign_rollback_never_reaches_the_card(self):
         """Замок стоит У РОЖДЕНИЯ карточки, а не только в таблице: подменяем строку отката на
-        литерал про чужой файл — в карточку он не попадает. Саму карточку при этом НЕ ГЛОТАЕМ:
-        `defer` это пропуск операции, и снятие карточки было бы дырой, а не строгостью."""
+        литерал про чужой файл — в карточку он не попадает.
+
+        ЧТО ЗДЕСЬ ПИННИТСЯ С 03.09.2026 — ВТОРОЙ ПОЯС, а не решение. Решение про такой случай
+        принимает `card_decision`: карточка не выписывается вовсе (`deny`, свой голден
+        `test_rollback_about_another_object_is_a_refusal`). Прежний довод «снятие карточки было
+        бы дырой» верен для СВОЕГО времени: тогда «не выписать» означало `defer`, то есть тихое
+        исполнение; с появлением `deny` (17.08) отказ строже карточки. Прямой вызов `_card`
+        остаётся страховкой на случай будущего вызывающего мимо `card_decision`."""
         saved = dict(g._ROLLBACK)
         try:
             g._ROLLBACK["delete"] = "Откат: git checkout -- " + self.CFG + " (файл под git)"
@@ -4801,6 +4829,214 @@ class TestSecretsJudgedByActionNotBySubstring(unittest.TestCase):
         self.assertEqual(g.decide(bash(
             "python3 -c \"lo=1; print(lo)  # окна, " + _E + " не читаем\"")),
             ("defer", "env_mention", ""))
+
+
+_EXT = _SESS[len("turbobaby_session"):]      # голое расширение, из того же куска — без нового литерала
+
+
+class TestCardCarriesObjectConsequenceProtections(unittest.TestCase):
+    """Г. КАРТОЧКА НЕСЁТ НАСТОЯЩИЙ ОБЪЕКТ, ПОСЛЕДСТВИЕ «ДА» И СПРАВКУ О ЗАЩИТАХ (03.09.2026).
+
+    ЖИВОЙ ПОВОД, ЗАМЕРЕН 03.09 (задача 20, лог гарда 02:58:18 `headless|PowerShell|ask|env`).
+    Карточка на `venv\\Scripts\\python.exe _scratch_contracts_0903\\read_contracts.py` называла
+    объектом РАСШИРЕНИЕ вместо файла, а операция открывала КОПИЮ сессии во временной папке.
+    Строка отката при этом описывала ОРИГИНАЛ («вернуть только повторной авторизацией»), к
+    которому операция не прикасается. И нигде в карточке не было сказано, что у полосы уже
+    стои́т страж исходящего, ловящий ник, почту и телефон.
+
+    ФИКСТУРА ПОВТОРЯЕТ ФОРМУ ЖИВОГО СЛУЧАЯ, А НЕ ССЫЛАЕТСЯ НА НЕГО: скрипт-повод лежит вне git
+    (`_scratch_…`), и тест, стоящий на неотслеживаемом файле, зеленел бы по его отсутствию.
+    Пиннится ИМЕННО ФОРМА: имя оригинала стои́т в ПРОЗЕ (докстринг), а исполняемые литералы
+    несут только хвост расширения — по ним файла не назвать.
+    """
+
+    PY = "venv/Scripts/python.exe "
+
+    @classmethod
+    def setUpClass(cls):
+        cls._td = tempfile.TemporaryDirectory(prefix="guard_cardobj_")
+        # (1) ФОРМА ЖИВОГО СЛУЧАЯ: оригинал назван в прозе, имя собирается в коде.
+        cls.copyish = os.path.join(cls._td.name, "read_by_copy.py").replace("\\", "/")
+        with io.open(cls.copyish, "w", encoding="utf-8") as f:
+            f.write('"""Читает КОПИЮ: оригинал ' + _SESS + ' держит живой userbot."""\n'
+                    "import os\n"
+                    "NAME = os.environ.get('TELETHON_SESSION_NAME', 'turbobaby_session')\n"
+                    "SRC = os.path.join('D:/turbobaby-bot', NAME + '" + _EXT + "')\n"
+                    "DST = os.path.join('/tmp/copy', 'read_copy' + '" + _EXT + "')\n"
+                    "print(open(SRC).read()[:1], DST)\n")
+        # (2) ЧЕСТНО НАЗВАННАЯ ЦЕЛЬ: путь стои́т исполняемым литералом — объект есть.
+        cls.named = os.path.join(cls._td.name, "read_named.py").replace("\\", "/")
+        with io.open(cls.named, "w", encoding="utf-8") as f:
+            f.write("print(open('/tmp/copy/read_copy" + _EXT + "').read()[:1])\n")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def _role(self, cmd):
+        return g.decide_for_role(bash(cmd), headless=True, env={})
+
+    # ── (1) НАСТОЯЩИЙ ОБЪЕКТ ──────────────────────────────────────────────────────────────
+    def test_prose_never_becomes_the_object(self):
+        """Левый проход по ТЕКСТУ вернул бы оригинал из докстринга — и карточка врала бы
+        убедительно. Имя берётся только из ИСПОЛНЯЕМЫХ литералов."""
+        body = io.open(self.copyish, encoding="utf-8").read()
+        lits = g._py_secret_literals([body])
+        self.assertTrue(lits, "литералы не разобрались — фикстура сломана")
+        self.assertNotIn(_SESS, lits, "имя из докстринга уехало в объект")
+        self.assertEqual(sorted(set(lits)), [_EXT])
+
+    def test_copy_in_temp_does_not_name_the_original(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ §6.1: операция по копии не называет объектом оригинал."""
+        action, kind, obj = self._role(self.PY + self.copyish)
+        self.assertEqual((action, kind), ("ask", "env"))
+        shown = g.card_object(kind, obj, self.PY + self.copyish)
+        self.assertNotIn(_SESS, shown)
+        self.assertNotEqual(shown, _EXT, "объектом снова стоит расширение")
+        self.assertTrue(shown.startswith(g.ENV_OBJ_UNSET), shown)
+
+    def test_unset_object_is_a_refusal_not_a_confirmable_card(self):
+        """«Отличить нельзя» — повод для ОТКАЗА, а не место для догадки. И отказ строже
+        карточки: операция не исполняется и не подтверждается."""
+        cmd = self.PY + self.copyish
+        _a, kind, obj = self._role(cmd)
+        decision, text = g.card_decision(kind, obj, cmd)
+        self.assertEqual(decision, "deny")
+        self.assertIn("КОПИЯ", text, "отказ не учит тому, что здесь поможет")
+        self.assertIsNone(g.card_or_journal(kind, obj, cmd))
+
+    def test_named_target_still_gets_a_card_with_that_object(self):
+        """Правка не глотает работу: цель, названная литералом, даёт карточку с этой целью."""
+        cmd = self.PY + self.named
+        action, kind, obj = self._role(cmd)
+        self.assertEqual((action, kind), ("ask", "env"))
+        decision, text = g.card_decision(kind, obj, cmd)
+        self.assertEqual(decision, "ask")
+        self.assertIn("read_copy" + _EXT, text)
+        rb = [ln for ln in text.splitlines() if ln.startswith("Откат: ")][0]
+        self.assertIn("read_copy" + _EXT, rb, "откат не про тот объект")
+
+    def test_bare_extension_from_the_command_is_not_an_object(self):
+        """Та же граница на шелловой дороге: `cat .session` подтверждать нечем, `cat bot.session`
+        — есть чем."""
+        self.assertTrue(g.card_object("env", "", "cat " + _EXT).startswith(g.ENV_OBJ_UNSET))
+        self.assertEqual(g.card_decision("env", "", "cat " + _EXT)[0], "deny")
+        self.assertEqual(g.card_object("env", "", "cat bot" + _EXT), "bot" + _EXT)
+        self.assertEqual(g.card_decision("env", "", "cat bot" + _EXT)[0], "ask")
+
+    def test_leak_of_a_value_into_a_file_keeps_its_card(self):
+        """У вида `env` ДВЕ природы. Требование «имя перед точкой» относится к ФАЙЛУ секрета;
+        вынос ЗНАЧЕНИЯ в файл объектом файла не называет и карточку терять не должен."""
+        obj = "ANTHROPIC_API_KEY=sk-…" + g.ENV_LEAK_MARK
+        decision, text = g.card_decision("env", obj, "")
+        self.assertEqual(decision, "ask")
+        self.assertIn("ляжет файлом на диск", text)
+
+    # ── (2) ПОСЛЕДСТВИЕ «ДА» ─────────────────────────────────────────────────────────────
+    def test_every_kind_has_a_consequence(self):
+        """Сторож от протухания: новый вид без фразы роняет набор, а не теряет карточку молча."""
+        self.assertEqual(sorted(g._CONSEQ), sorted(g._KIND_VOCAB))
+        for kind in g._KIND_VOCAB:
+            with self.subTest(kind):
+                phrase = g._consequence(kind, "цель-" + kind)
+                self.assertTrue(phrase, kind)
+                self.assertIn("цель-" + kind, phrase, "объект не вклеен во фразу")
+
+    def test_consequence_is_built_from_the_class_not_from_one_template(self):
+        """Фраза собирается из КЛАССА операции: у 20 видов 20 разных фраз, а не один шаблон.
+        Объект берём ОДИН на все виды — тогда вся разница фраз и есть вклад класса."""
+        phrases = {g._consequence(k, "цель") for k in g._KIND_VOCAB}
+        self.assertNotIn("", phrases)
+        self.assertEqual(len(phrases), len(g._KIND_VOCAB))
+
+    def test_consequence_line_stands_in_the_card_under_the_object(self):
+        card = g._card("delete", "old.log", "del /f old.log")
+        lines = card.splitlines()
+        i = [n for n, ln in enumerate(lines) if ln.startswith(g.OBJ_LINE_PREFIX)][0]
+        self.assertTrue(lines[i + 1].startswith(g.CONSEQ_LINE_PREFIX), lines)
+        self.assertIn("old.log", lines[i + 1])
+
+    def test_card_without_a_consequence_is_not_issued(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ §6.3: последствие не собралось — карточки нет вовсе, причина
+        названа. И это ОТКАЗ, а не тихий пропуск."""
+        saved = dict(g._CONSEQ)
+        try:
+            del g._CONSEQ["delete"]
+            decision, text = g.card_decision("delete", "tmp/x.log", "rm tmp/x.log")
+            self.assertEqual(decision, "deny")
+            self.assertIn("последствие", text)
+            self.assertNotIn("🔴", text)
+        finally:
+            g._CONSEQ.clear()
+            g._CONSEQ.update(saved)
+
+    # ── (3) ОТКАТ ПРО ТОТ ЖЕ ОБЪЕКТ ──────────────────────────────────────────────────────
+    def test_rollback_about_another_object_is_a_refusal(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ §6.2: откат назвал чужой файл — карточка не выписывается.
+        До 03.09 строка подменялась прочерком, а карточка выписывалась: тогда «не выписать»
+        означало `defer`, то есть ТИХОЕ исполнение. С появлением `deny` довод отменён."""
+        saved = dict(g._ROLLBACK)
+        try:
+            g._ROLLBACK["delete"] = "Откат: git checkout -- .claude/settings.json (файл под git)"
+            decision, text = g.card_decision("delete", "tmp/x.log", "rm tmp/x.log")
+            self.assertEqual(decision, "deny")
+            self.assertIn("откат", text.lower())
+            self.assertNotIn("settings.json (файл под git)", text.splitlines()[0])
+        finally:
+            g._ROLLBACK.clear()
+            g._ROLLBACK.update(saved)
+
+    # ── (4) СПРАВКА О ЗАЩИТАХ ────────────────────────────────────────────────────────────
+    def test_protection_kinds_come_from_the_sender_not_from_a_literal(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ §6.4: справка разошлась с кодом стража — тест падает.
+
+        Пиннится ровно то, что печатает карточка: ЧИСЛО видов и РАЗРЕЗ контактов, и оба берутся
+        у самого стража (перечень — из его правил, разрез — живой пробой). Ни одного имени вида
+        литералом здесь нет: разойтись нечему."""
+        import review_send
+        live = tuple(k for k, _rx in review_send._OUTBOUND_RULES)
+        self.assertEqual(g.outbound_guard_kinds(), live)
+        contacts = tuple(sorted({h["kind"] for h in
+                                 review_send.outbound_violations(g.PROTECT_PROBE_CONTACTS)}))
+        self.assertTrue(contacts, "образец контактов страж не опознал — образец протух")
+        card = g._card("env", _E, "cat " + _E)
+        prot = [ln for ln in card.splitlines() if ln.startswith("Защита: ")]
+        self.assertEqual(len(prot), 1, card)
+        self.assertIn(str(len(live)), prot[0])
+        for kind in contacts:
+            self.assertIn(kind, prot[0], kind)
+
+    def test_protection_names_what_the_sender_does_not_catch(self):
+        card = g._card("network", "example.com", "curl https://example.com")
+        prot = [ln for ln in card.splitlines() if ln.startswith("Защита: ")][0]
+        self.assertIn(g.PROTECT_MISS, prot)
+
+    def test_sender_really_lets_a_plain_name_through(self):
+        """Утверждение карточки держится ЖИВОЙ ПРОБОЙ стража, а не верой в его комментарий."""
+        import review_send
+        self.assertEqual(review_send.outbound_violations("Иван Петров, Мария Ли"), [])
+        for text in ("@ivanpetrov", "ivan@example.com", "+79991234567"):
+            self.assertTrue(review_send.outbound_violations(text), text)
+
+    def test_protection_line_only_where_data_leaves(self):
+        """Обычная карточка от справки не растёт ни на байт."""
+        for kind, obj, cmd in (("delete", "old.log", "del /f old.log"),
+                               ("sqlite", "app.db", "sqlite3 app.db 'INSERT INTO t VALUES(1)'"),
+                               ("edit_claude", "settings.json", "echo x > .claude/settings.json")):
+            with self.subTest(kind):
+                self.assertNotIn("Защита: ", g._card(kind, obj, cmd))
+        for kind in g._PROTECTED_KINDS:
+            with self.subTest(kind):
+                self.assertIn("Защита: ", g._card(kind, "цель", "echo x"))
+
+    def test_protection_says_unknown_when_the_sender_cannot_be_asked(self):
+        """Третий исход: справку не собрали — так и написано, а не молчание."""
+        saved = g.outbound_guard_kinds
+        try:
+            g.outbound_guard_kinds = lambda: ()
+            self.assertEqual(g._protection_line("env"), g.PROTECT_UNKNOWN)
+        finally:
+            g.outbound_guard_kinds = saved
 
 
 _SSH = ("ssh -o ConnectTimeout=10 -o BatchMode=yes -i ~/.ssh/turbobaby_vps "
