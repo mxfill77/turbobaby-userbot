@@ -612,11 +612,50 @@ HELP = unknown_command_reply("")
 
 CHAIN_CB_RE = re.compile(r"^chain:(stop|status):(\d+)$")
 
+# ── КНОПКИ ЗАЯВОК ВНЕШНИХ КАНАЛОВ (ступень G, 02.09.2026) ────────────────────────────────
+# Заявка ступени B — ряд очереди needs_approval, который ЖДЁТ РЕШЕНИЯ ЧЕЛОВЕКА. До 02.09 у
+# решения не было двери: Мост на set_needs_approval пишет строку таблицы и в Telegram не шлёт
+# НИЧЕГО, а полоса ПК не отправляла по трём накопленным заявкам ни одного сообщения (замер:
+# dispatch_notify.log, 9732 строки, совпадений ноль). Теперь заявка приезжает сообщением с двумя
+# кнопками, и ловятся они ЗДЕСЬ — тем же токеном, тем же обработчиком, что кнопки цепей.
+#
+# ЧТО ДЕЛАЕТ ТАП, И ЧЕГО ОН НЕ ДЕЛАЕТ НИ ПРИ КАКОМ ОТВЕТЕ: «да» помечает заявку принятой к
+# сведению, «нет» закрывает её — и ОБА исхода задач не рождают. Агент здесь только роутит и
+# гейтит владельца; действие исполняет zayavki_pc_run своим каналом к Мосту.
+ZAYAVKA_CB_RE = re.compile(r"^zayavka:(yes|no):(\d+)$")
+
 
 def _chain_cb_parse(data):
     """callback_data → (action, pid) | None (не наш callback)."""
     m = CHAIN_CB_RE.match(str(data or ""))
     return (m.group(1), m.group(2)) if m else None
+
+
+def _zayavka_cb_parse(data):
+    """callback_data кнопки заявки → (action, id) | None (не наш callback)."""
+    m = ZAYAVKA_CB_RE.match(str(data or ""))
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _zayavka_cli(action, tid):
+    """Ответ на заявку через zayavki_pc_run (свой канал к Мосту) → текст ответа.
+
+    Субпроцессом и той же механикой, что `_chain_cli`, по той же причине: агент не
+    держит ни клиента Моста, ни его секретов — он роутит тап и показывает результат.
+    """
+    if not VENV_PY.exists():
+        return f"заявка #{tid}: не нашёл python venv ({VENV_PY})."
+    try:
+        r = subprocess.run(
+            [str(VENV_PY), str(REPO_DIR / "zayavki_pc_run.py"), "--answer", action, "--id", str(tid)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=90, cwd=str(REPO_DIR),
+            creationflags=NO_WINDOW,
+        )
+        out = (r.stdout or "").strip() or (r.stderr or "").strip()
+        return out or f"заявка #{tid}: пустой ответ ступени G ({action})."
+    except Exception as e:
+        return f"заявка #{tid}: ошибка ответа ({type(e).__name__}: {e})."
 
 
 def _chain_cb_authorized(uid):
@@ -660,19 +699,28 @@ def _chain_cb_route(data, uid):
       note:   str|None      — пояснение в чат (для отказа/устаревшей); None → шлём вывод демона
     """
     parsed = _chain_cb_parse(data)
+    zayavka = _zayavka_cb_parse(data)
     if not _chain_cb_authorized(uid):
         # owner-gate раньше разбора: чужому не подсказываем формат кнопок.
-        return {"ok": False, "action": None, "pid": None,
+        return {"ok": False, "kind": None, "action": None, "pid": None,
                 "answer": "⛔ нет прав", "alert": True, "note": None}
+    if zayavka is not None:
+        # Кнопка ЗАЯВКИ внешнего канала. Тост говорит про «принято к сведению», а не про
+        # «выполняю»: ни один ответ здесь задачи не ставит, и владелец обязан видеть это
+        # раньше, чем отпустит палец.
+        action, tid = zayavka
+        return {"ok": True, "kind": "zayavka", "action": action, "pid": tid,
+                "answer": ("✅ принимаю к сведению…" if action == "yes" else "❌ закрываю заявку…"),
+                "alert": False, "note": None}
     if parsed is None:
-        # Наш бот (AGENT_BOT_TOKEN) шлёт ТОЛЬКО карточки цепи → неразобранный callback = старый
-        # формат / протухшая карточка. Честно говорим это, а не молчим.
-        return {"ok": False, "action": None, "pid": None,
+        # Наш бот (AGENT_BOT_TOKEN) шлёт ТОЛЬКО карточки цепи и заявок → неразобранный callback =
+        # старый формат / протухшая карточка. Честно говорим это, а не молчим.
+        return {"ok": False, "kind": None, "action": None, "pid": None,
                 "answer": "карточка устарела", "alert": True,
                 "note": "⚠️ Не разберу кнопку этой карточки (устаревший/битый формат). "
                         "Пришли «статус» — дам актуальную картинку."}
     action, pid = parsed
-    return {"ok": True, "action": action, "pid": pid,
+    return {"ok": True, "kind": "chain", "action": action, "pid": pid,
             "answer": ("⏹ останавливаю цепь…" if action == "stop" else "📊 читаю статус…"),
             "alert": False, "note": None}
 
@@ -713,8 +761,11 @@ async def on_chain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if route["note"]:
             await _chain_reply(context, q, route["note"])
         return
-    # 3) действие исполняет демон (свой канал к Bridge), результат — сообщением в чат карточки
-    reply = await asyncio.to_thread(_chain_cli, route["action"], route["pid"])
+    # 3) действие исполняет демон / ступень G (свой канал к Bridge), результат — сообщением
+    #    в чат карточки. Роутим ПО ВИДУ кнопки: у цепи и у заявки разные исполнители и разные
+    #    последствия, и складывать их в один вызов значило бы звать «стоп цепи» на заявке.
+    runner = _zayavka_cli if route.get("kind") == "zayavka" else _chain_cli
+    reply = await asyncio.to_thread(runner, route["action"], route["pid"])
     await _chain_reply(context, q, reply)
 
 

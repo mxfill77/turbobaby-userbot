@@ -52,6 +52,7 @@ import sys
 import contour_digest as cd
 import contour_digest_run as cdr
 import vitrina_pc as vp
+import zayavki_pc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_STATE = "vitrina_pc_state.json"
@@ -204,12 +205,37 @@ def quote(text, limit=vp.GOAL_MAX):
 
 
 def waiting_rows(snapshot):
-    """Открытые решения владельца (`needs_approval`). → list | None."""
+    """Открытые решения владельца (`needs_approval`), РАЗВЕДЁННЫЕ по видам. → list | None.
+
+    Вид опознаётся маркером ступени B (:func:`zayavki_pc.is_zayavka`) — тем же
+    самым, которым заявку отличают три гарда демона. Второго определения здесь не
+    заводится: разойдись они, витрина начала бы звать заявку карточкой ровно в тот
+    день, когда маркер поменяют.
+    """
     if snapshot is None:
         return None
-    return [{"id": tid, "goal": quote(item.get("goal"))}
-            for tid, item in sorted((snapshot.get("open") or {}).items())
-            if isinstance(item, dict) and item.get("status") == "needs_approval"]
+    out = []
+    for tid, item in sorted((snapshot.get("open") or {}).items()):
+        if not isinstance(item, dict) or item.get("status") != "needs_approval":
+            continue
+        goal = item.get("goal")
+        mark = zayavki_pc.parse_marker(str(goal or ""))
+        out.append({"id": tid, "goal": quote(goal),
+                    "zayavka": zayavki_pc.is_zayavka(goal),
+                    "key": mark[1] if mark else ""})
+    return out
+
+
+def awaiting_counts(waiting):
+    """Ждущие решения → два ЧИСЛА разными именами. → dict | None.
+
+    `None` держится насквозь: слепок не прочитан — обе строки витрины скажут
+    «НЕИЗВЕСТНО», и ни одна не подставит ноль.
+    """
+    if waiting is None:
+        return None
+    return {"zayavki": sum(1 for w in waiting if w.get("zayavka")),
+            "cards": sum(1 for w in waiting if not w.get("zayavka"))}
 
 
 def failed_rows(snapshot, since):
@@ -306,7 +332,7 @@ def collect(root=HERE, now=None, runner=None, inbox=None, day=None, shtab=None):
         "shtab_taken": cd.shtab_taken(cdr.all_rows(snapshot), the_day),
         "box_stop": read_box_stop(root),
         "external": external,
-        "awaiting": None if waiting is None else len(waiting),
+        "awaiting": awaiting_counts(waiting),
         "waiting": waiting,
         "axes": tally,
         "axes_why": axes_why,

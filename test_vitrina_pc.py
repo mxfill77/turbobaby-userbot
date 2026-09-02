@@ -51,13 +51,18 @@ def _live_facts(day=DAY):
     return {"day": day, "shtab": vp.parse_shtab("дата=%s\n[[СЕЙЧАС]]\nстроим витрину\n"
                                                 "[[ЗАСТРЯЛО]]\nничего\n[[КУДА ИДЁМ]]\nк 30" % day),
             "running": [{"id": "5", "goal": "витрина", "age": 600.0}],
-            "expects": [], "failed": [], "awaiting": 2,
+            "expects": [], "failed": [], "awaiting": {"cards": 1, "zayavki": 1},
             "series": {"streak": 5, "target": 30, "proved": 5, "blind": 13, "unproved": 0,
                        "unjudged": 0, "moved": 2},
             "shtab_taken": 1,
             "external": {"day": day, "attempts": 3, "answers": 2, "channels_answered": 1,
                          "channels_tried": 2, "findings": 4, "down": []},
-            "waiting": [{"id": "3", "goal": "заявка"}, {"id": "2", "goal": "заявка"}],
+            # Две РАЗНЫЕ вещи в одном списке `needs_approval` — ровно то, что до 02.09
+            # витрина звала одним словом: заявка внешнего канала и карточка гарда.
+            "waiting": [{"id": "3", "goal": "[заявка-ревью дата=%s ключ=47b3131c052c]" % day,
+                         "zayavka": True, "key": "47b3131c052c"},
+                        {"id": "2", "goal": "удаление файла — разрешить?", "zayavka": False,
+                         "key": ""}],
             "axes": {vp.AXIS_MAIN: 4, vp.AXIS_BIZ: 1, vp.AXIS_SERVICE: 22},
             "axes_why": "", "closed_day": 18}
 
@@ -174,7 +179,8 @@ class TestNoZeroForUnknown(unittest.TestCase):
                                 "мёртвые источники не назвались неизвестными")
         for title in (t for _k, t in vp.PARTS):
             self.assertIn(title, text, "часть %s пропала при мёртвых источниках" % title)
-        for zero in ("взято 0 из", "карточки в ожидании: 0", "ось (этап 3) 0"):
+        for zero in ("взято 0 из", "карточки гарда в ожидании: 0",
+                     "заявки внешних каналов ждут решения: 0", "ось (этап 3) 0"):
             self.assertNotIn(zero, text, "незнание подменено нулём: %s" % zero)
 
     def test_dead_source_lines_carry_the_reason(self):
@@ -424,7 +430,7 @@ class TestSignature(unittest.TestCase):
 
     def test_changed_number_changes_signature(self):
         other = _live_facts()
-        other["awaiting"] = 3
+        other["awaiting"] = {"cards": 1, "zayavki": 2}
         self.assertNotEqual(vp.signature(_live_facts()), vp.signature(other))
 
     def test_signature_has_no_timestamp_in_it(self):
@@ -504,6 +510,46 @@ class TestLiveTree(unittest.TestCase):
                                "status": "in_progress"}}, "closed": {}}
         rows = run.running_rows(snap, {}, NOW)
         self.assertNotIn("C:\\Users", rows[0]["goal"])
+
+
+class TestZayavkiAreNotCards(unittest.TestCase):
+    """Пункт 5 задания: слово «карточки» остаётся ТОЛЬКО за карточками гарда.
+
+    Повод замерен 02.09.2026: в очереди три ряда `needs_approval`, все три —
+    заявки внешних каналов, а витрина печатала «карточки в ожидании: 3». Одно
+    слово на две новости с разной срочностью — неверное число, а не стиль.
+    """
+
+    SNAP = {"open": {
+        "1": {"goal": "[заявка-ревью дата=2026-09-02 ключ=fb36e990a3b5]", "status": "needs_approval"},
+        "2": {"goal": "[заявка-ревью дата=2026-09-02 ключ=98c2c8bf1be6]", "status": "needs_approval"},
+        "3": {"goal": "[заявка-ревью дата=2026-09-02 ключ=47b3131c052c]", "status": "needs_approval"},
+        "9": {"goal": "удаление tmp/x — разрешить?", "status": "needs_approval"},
+        "10": {"goal": "работа", "status": "in_progress"},
+    }, "closed": {}}
+
+    def test_live_snapshot_counts_them_apart(self):
+        rows = run.waiting_rows(self.SNAP)
+        self.assertEqual(run.awaiting_counts(rows), {"zayavki": 3, "cards": 1})
+
+    def test_unknown_survives_as_unknown(self):
+        self.assertIsNone(run.waiting_rows(None))
+        self.assertIsNone(run.awaiting_counts(None))
+
+    def test_numbers_name_two_things_by_two_names(self):
+        lines = vp.part_nums(None, None, DAY, None, run.awaiting_counts(run.waiting_rows(self.SNAP)))
+        text = "\n".join(lines)
+        self.assertIn("карточки гарда в ожидании: 1", text)
+        self.assertIn("заявки внешних каналов ждут решения: 3", text)
+        self.assertNotIn("карточки в ожидании:", text)   # прежнего общего слова больше нет
+
+    def test_owner_list_shows_a_zayavka_by_its_own_name_not_by_marker(self):
+        rows = vp.part_owner(run.waiting_rows(self.SNAP))
+        text = "\n".join(rows)
+        self.assertIn("ЗАЯВКА внешнего канала (ключ 47b3131c052c)", text)
+        self.assertIn("задачей не станет", text)
+        self.assertNotIn("[заявка-ревью", text)          # машинный маркер владельцу не показываем
+        self.assertIn("#9 удаление tmp/x — разрешить?", text)   # карточка гарда — как была
 
 
 if __name__ == "__main__":            # pragma: no cover
