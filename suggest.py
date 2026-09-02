@@ -5238,7 +5238,18 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
                        collected=None, ready: bool = False, just=None, vehicle_type: str = "bike",
                        is_partner: bool = False) -> str:
     lang_name = "русском" if lang == "ru" else "английском"
-    if is_first_contact:
+    # Правило языка ЖЁСТКОЕ и в один ряд с остальными (правка 03.09.2026, вариант A). RU-путь — байт-в-байт.
+    lang_rule = ("\n\nREPLY LANGUAGE (STRICT — ranks with the rules above): the client writes in ENGLISH, "
+                 "so the WHOLE reply is in English — greeting, body, closing; not a single Russian sentence "
+                 "of your own. Russian lines inserted by the code (price/delivery canon) are data: keep them "
+                 "as they are, do not translate them, and do not switch to Russian because of them.") if lang == "en" else ""
+    if is_first_contact and lang == "en":
+        greet = (
+            "\n\nThis is the FIRST reply in this dialog — open with the company's signature greeting IN "
+            "ENGLISH: use the English greeting from the FAQ if the FAQ has one, otherwise greet in English "
+            "in your own words. Do NOT open with «Здравствуйте» or any other Russian wording, then go to the point."
+        )
+    elif is_first_contact:
         greet = (
             "\n\nЭто ПЕРВЫЙ ответ в этом диалоге — НАЧНИ ответ с фирменного приветствия из "
             "FAQ («Здравствуйте! …»), затем переходи к сути."
@@ -5483,7 +5494,7 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         + directive_block + park_block + collected_block + greet + policy + scenario
         + next_step_block + ANTI_LOOP_NOTE + price_block + "\n\n"
         + CRITICAL_FACTS + EXPERIENCE_SAFETY_RULE + APPROVAL_WHITELIST_RULE
-        + AVAILABILITY_INVARIANT_RULE + GENERATION_DEFAULT_RULE + PICKUP_RULE + RECEIPT_LEXICON_RULE
+        + AVAILABILITY_INVARIANT_RULE + GENERATION_DEFAULT_RULE + PICKUP_RULE + RECEIPT_LEXICON_RULE + lang_rule
         + playbook_block
         + "\n\nFAQ и эталонные формулировки:\n" + (faq or "(FAQ недоступен — опирайся на критичные факты выше)")
         + STYLE_FEWSHOT
