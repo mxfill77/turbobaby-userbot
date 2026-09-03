@@ -90,8 +90,17 @@ DEFECT_CLAIM = {
 }
 # Посылка ЖИВА и адрес НАЗВАН — оба условия отбора, и оба берутся из настоящего
 # рендера ступени B, а не подставляются в digest руками.
+#
+# АДРЕС НЕСЁТ НОМЕР СТРОКИ, И ЭТО ПОПРАВКА 03.09.2026 ПО ЖИВОМУ ПРОВАЛУ. Прежний
+# голден писал голое `suggest.py`, а живая ступень B пишет `%s:%d`
+# (`review_intake_run.py:263`) — и на этом расхождении отбор был СЛЕП: замер прямой
+# пробой дал `is_client("model_name.py") = True` при `is_client("model_name.py:30")
+# = False`, то есть условие 2 не срабатывало НИ НА ОДНОМ адресе, найденном в коде.
+# Живой ряд #32 (`227d09eb0b52`, тот самый, который артефакт 03.09 назвал
+# клиентским дефектом) из-за этого уезжал в сводку. Голден переведён на живой
+# формат — тот самый урок `CLAUDE.md` про мок, разошедшийся с продом.
 DEFECT_PREMISE = {"outcome": ri.PREMISE_ALIVE,
-                  "why": "`RULE-1` найден по адресу suggest.py"}
+                  "why": "`RULE-1` найден по адресу suggest.py:30"}
 
 
 def defect_row(tid=42, status="needs_approval", premise=None):
@@ -320,10 +329,12 @@ class TestPlan(unittest.TestCase):
 class _FakeQueue:
     """Очередь-протокол: считает ВСЕ обращения, чтобы отсутствие `enqueue` было доказуемо."""
 
-    def __init__(self, rows=None, ok=True, why=""):
+    def __init__(self, rows=None, ok=True, why="", close_ok=True):
         self._rows = rows if rows is not None else [live_row(1), live_row(2), live_row(3)]
         self._ok, self._why = ok, why
+        self._close_ok = close_ok
         self.calls = []
+        self.closed_texts = []
 
     def awaiting(self):
         self.calls.append(("awaiting",))
@@ -336,6 +347,11 @@ class _FakeQueue:
     def reject(self, tid):
         self.calls.append(("reject", str(tid)))
         return True, ""
+
+    def close_by_sift(self, tid, text):
+        self.calls.append(("close_by_sift", str(tid)))
+        self.closed_texts.append(text)
+        return self._close_ok, ("" if self._close_ok else "мост отказал")
 
     def enqueue(self, *a, **k):                     # ловушка: не должна звонить НИКОГДА
         self.calls.append(("enqueue",))
@@ -607,6 +623,301 @@ class TestButtonContract(unittest.TestCase):
         self.assertIsNone(rx.match("chain:stop:3"))
         self.assertIsNone(rx.match("zayavka:maybe:3"))
         self.assertIsNone(rx.match("zayavka:yes:abc"))
+
+
+# ═══════════ СУДЬБА РЯДА БЕЗ КАРТОЧКИ — ОТРИЦАТЕЛЬНЫЕ ТЕСТЫ (03.09.2026) ═══════════
+
+
+class TestPremiseAddressWithLineNumber(unittest.TestCase):
+    """РЕГРЕСС НАЙДЕННОЙ СЛЕПОТЫ: адрес живой премисы несёт номер строки.
+
+    Без нормализации `client_contour` не узнаёт НИ ОДИН адрес, найденный в коде, —
+    условие 2 отбора становится недостижимым, и клиентский дефект уезжает в сводку.
+    Замер 03.09 живым рядом #32. Тест меряет ОБЕ формы одним корпусом: разойдись
+    они снова — красное здесь, а не молчаливая слепота в проде.
+    """
+
+    def test_line_suffix_is_stripped_only_for_the_graph_question(self):
+        self.assertEqual(run._file_of("model_name.py:30"), "model_name.py")
+        self.assertEqual(run._file_of("suggest.py"), "suggest.py")
+        # каталоги и точки не трогаем, режется ТОЛЬКО хвост «:цифры»
+        self.assertEqual(run._file_of("docs/review_inbox/a.md:12"), "docs/review_inbox/a.md")
+        self.assertEqual(run._file_of("model_name.py:30:7"), "model_name.py:30")
+
+    def test_address_is_returned_verbatim_with_its_line(self):
+        # Наружу адрес идёт ДОСЛОВНО: без номера строки владелец не найдёт место.
+        got = z.digest(defect_row(42))
+        self.assertEqual(run.premise_addresses(got), ["suggest.py:30"])
+
+    def test_the_graph_sees_a_live_address_that_carries_a_line(self):
+        try:
+            import client_contour
+            cl = client_contour.closure(HERE)
+        except Exception as exc:                       # pragma: no cover
+            self.skipTest("client_contour недоступен: %r" % exc)
+        if not getattr(cl, "ok", False):
+            self.skipTest("граф контура не построился")
+        got = z.digest(defect_row(42))
+        hits, determined = run.client_files_of(got, repo=HERE, closure=cl)
+        self.assertTrue(determined)
+        self.assertEqual(hits, ["suggest.py:30"],
+                         "адрес с номером строки снова невидим графу — отбор ослеп")
+
+
+class TestSiftClosesRowsWithoutACard(unittest.TestCase):
+    """Ряд, которому отбор не дал карточку, НЕ ВИСИТ «ждёт владельца»."""
+
+    def _digest(self, row):
+        return z.digest(row)
+
+    def _sig(self, row):
+        return z.defect_signals(row["task_text"])
+
+    def _routed(self, row, key, files):
+        return z.route([self._digest(row)], {key: self._sig(row)}, {key: files})[0]
+
+    # ── ряд БЕЗ карточки закрывается, и автор решения ВИДЕН ───────────────
+    def test_row_without_a_card_is_closed_and_names_its_author(self):
+        row = self._routed(live_row(37), LIVE_KEY, [])
+        self.assertEqual(row["action"], "digest")
+        close, why = z.closable(row, determined=True, carded=False)
+        self.assertTrue(close)
+        self.assertIn("отбор не дал карточку", why)
+
+        verdicts = z.closures([row], determined={LIVE_KEY: True})
+        self.assertEqual([v["close"] for v in verdicts], [True])
+        self.assertEqual(verdicts[0]["outcome"], z.SIFT_OUTCOME)
+
+        text = z.sift_result(verdicts[0], pointer_text="лоток docs/review_inbox и ряд #37")
+        self.assertIn(z.SIFT_MARK, text)
+        self.assertIn("ОТБОР", text)                     # кто решил
+        self.assertIn("не человек", text)
+        self.assertIn("НЕ ВИДЕЛ", text)
+        self.assertIn("согласием", text)                 # и что это НЕ согласие
+
+    def test_the_outcome_is_neither_accepted_nor_rejected(self):
+        # Прямое условие задания: третий исход, не равный ни одному из двух прежних.
+        text = z.sift_result({"id": 37, "why": "предмет клиенту не виден"})
+        self.assertNotEqual(z.SIFT_OUTCOME, "принято к сведению")
+        self.assertNotEqual(z.SIFT_OUTCOME, "отклонено")
+        self.assertIn("НЕ «принято к сведению»", text)
+        self.assertIn("НЕ «отклонено»", text)
+        # и разрез в очереди НЕ пересекается с отказом владельца
+        import pc_orchestrator
+        self.assertNotIn(pc_orchestrator._REJECT_PREFIX, text)
+        self.assertEqual(z.SIFT_STATUS, "done")          # закономерное закрытие, не сбой
+
+    # ── 1. ряд с КЛИЕНТСКИМ ДЕФЕКТОМ отбором НЕ закрывается ──────────────
+    def test_a_client_defect_row_is_never_closed(self):
+        row = self._routed(defect_row(42), DEFECT_KEY, ["suggest.py:30"])
+        self.assertEqual(row["action"], "card")
+        close, why = z.closable(row, determined=True, carded=False)
+        self.assertFalse(close)
+        self.assertIn("ждёт живого решения", why)
+        self.assertEqual([v["close"] for v in z.closures([row], determined={DEFECT_KEY: True})],
+                         [False])
+
+    def test_a_client_defect_over_the_cap_is_not_closed_either(self):
+        # Сверх потолка исход другой (`card_over`), а запрет тот же.
+        got = z.digest(defect_row(42))
+        row = z.route([got], {DEFECT_KEY: self._sig(defect_row(42))},
+                      {DEFECT_KEY: ["suggest.py:30"]}, sent_today=z.CARD_CAP)[0]
+        self.assertEqual(row["action"], "card_over")
+        self.assertFalse(z.closable(row, determined=True)[0])
+
+    # ── 2. карточка отправлена, ответа нет → ряд ПРОДОЛЖАЕТ ждать ────────
+    def test_a_carded_row_keeps_waiting_for_the_answer(self):
+        row = self._routed(live_row(37), LIVE_KEY, [])
+        close, why = z.closable(row, determined=True, carded=True)
+        self.assertFalse(close)
+        self.assertIn("ждём ОТВЕТА", why)
+        self.assertIn("молчание", why)
+        verdicts = z.closures([row], determined={LIVE_KEY: True}, carded=[LIVE_KEY])
+        self.assertEqual([v["close"] for v in verdicts], [False])
+
+    # ── 3. отбор НЕДОСТУПЕН → ряд остаётся ОТКРЫТЫМ ─────────────────────
+    def test_an_undecidable_sift_keeps_the_row_open(self):
+        row = self._routed(live_row(37), LIVE_KEY, [])
+        for determined, word in ((False, "не построился"), (None, "не спрошен")):
+            close, why = z.closable(row, determined=determined)
+            self.assertFalse(close, determined)
+            self.assertIn("остаётся", why)
+            self.assertIn(word, why)
+        # и через `closures`: ключа в карте нет вовсе — тот же исход
+        self.assertEqual([v["close"] for v in z.closures([row], determined={})], [False])
+        self.assertEqual([v["close"] for v in z.closures([row])], [False])
+
+    def test_a_row_without_a_number_is_not_closed(self):
+        row = dict(self._routed(live_row(None), LIVE_KEY, []), id=None)
+        close, why = z.closable(row, determined=True)
+        self.assertFalse(close)
+        self.assertIn("нет номера", why)
+
+    # ── журнал: автор решения назван СЛОВОМ ─────────────────────────────
+    def test_journal_line_says_the_sift_decided_not_the_owner(self):
+        line = z.index_line({"closed": [{"id": 37, "why": "отбор не дал карточку: предмет "
+                                                          "клиенту не виден"}]})
+        self.assertIn(z.SIFT_OUTCOME.upper(), line)
+        self.assertIn("решил ОТБОР, не владелец", line)
+        self.assertIn("согласием это не является", line)
+        self.assertIn("#37", line)
+
+    # ── сводка несёт ОБА числа врозь ────────────────────────────────────
+    def test_summary_carries_both_numbers_apart(self):
+        row = self._routed(live_row(37), LIVE_KEY, [])
+        text = z.summary([row], found=1, awaiting_owner=4, closed_today=6)
+        self.assertIn("ЖДЁТ ТВОЕГО РЕШЕНИЯ: 4", text)
+        self.assertIn("ЗАКРЫТО ОТБОРОМ за сутки: 6", text)
+        self.assertIn("складывать их нельзя", text)
+        self.assertNotIn("10", text.split("ЖДЁТ ТВОЕГО РЕШЕНИЯ")[1])   # суммы нет нигде
+        # не названы — «неизвестно», а не ноль
+        blind = z.summary([row], found=1)
+        self.assertIn("ЖДЁТ ТВОЕГО РЕШЕНИЯ: %s" % z.UNKNOWN, blind)
+        self.assertIn("ЗАКРЫТО ОТБОРОМ за сутки: %s" % z.UNKNOWN, blind)
+
+    def test_summary_no_longer_claims_every_row_stayed_open(self):
+        # Строка «каждая заявка осталась ОТКРЫТОЙ» с 03.09 была бы враньём.
+        text = z.summary([self._routed(live_row(37), LIVE_KEY, [])], found=1,
+                         awaiting_owner=0, closed_today=1)
+        self.assertNotIn("осталась ОТКРЫТОЙ", text)
+
+
+class TestReconAsksAreJudgedByAnotherSift(unittest.TestCase):
+    """Заявки ступени E под НАШ отбор не попадают — и это устройство."""
+
+    def test_marker_is_the_same_literal_as_stage_e(self):
+        import recon_auto
+        self.assertEqual(z.RECON_MARK, recon_auto.ASK_MARK)
+
+    def test_a_recon_ask_is_not_our_zayavka(self):
+        import recon_auto
+        text = recon_auto.ask_text(
+            {"key": "d5bb46caa17f", "src": "expect", "title": "модербот молчит",
+             "evidence": ["tmp/expect_pc/state.json"]},
+            "2026-09-03", "предмет требует операционного действия")
+        self.assertTrue(z.is_recon_ask(text))
+        self.assertFalse(z.is_zayavka(text))
+
+    def test_recon_asks_land_in_their_own_bucket_not_among_guard_cards(self):
+        import recon_auto
+        ask = recon_auto.ask_text({"key": "d5bb46caa17f", "src": "expect", "title": "t"},
+                                  "2026-09-03", "почему")
+        rows = [live_row(37), {"id": 40, "task_text": ask},
+                {"id": 9, "task_text": "🔴 гард: red-операция ждёт «да»"}]
+        got = z.split_awaiting(rows)
+        self.assertEqual([r["id"] for r in got["zayavki"]], [37])
+        self.assertEqual([r["id"] for r in got["foreign"]], [40])
+        self.assertEqual([r["id"] for r in got["cards"]], [9])
+
+    def test_a_recon_ask_never_reaches_the_closer(self):
+        # Сквозной замок: ряд ступени E не доезжает даже до `route`, а значит и до
+        # закрытия. Проверяем ЖИВЫМ оборотом, а не рассуждением.
+        import recon_auto
+        ask = recon_auto.ask_text({"key": "d5bb46caa17f", "src": "expect", "title": "t"},
+                                  "2026-09-03", "почему")
+        d = tempfile.mkdtemp(prefix="zayavki_recon_")
+        q = _FakeQueue(rows=[{"id": 40, "lane": "pc", "status": "needs_approval",
+                              "task_text": ask}])
+        rep = run.tick(root=HERE, state_path=os.path.join(d, "s.json"), send=True,
+                       clock=lambda: 1788400000.0, queue=q, sender=lambda *a: None)
+        self.assertEqual(rep["foreign"], 1)
+        self.assertEqual(rep["zayavki"], 0)
+        self.assertEqual(rep["closed"], [])
+        self.assertNotIn("close_by_sift", [c[0] for c in q.calls])
+        self.assertIn("ступени E", rep["summary"])
+
+
+class TestTickClosesAndCounts(unittest.TestCase):
+    """Оборот целиком: закрытие идёт в очередь, в реестр и в оба числа."""
+
+    NOW = 1788400000.0
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="zayavki_close_")
+        self.state = os.path.join(self.dir, "s.json")
+
+    def _tick(self, q, send=True, **kw):
+        return run.tick(root=HERE, state_path=self.state, send=send,
+                        clock=lambda: self.NOW, queue=q, sender=lambda *a: ("тест", True), **kw)
+
+    def test_row_without_a_card_is_closed_in_the_queue(self):
+        q = _FakeQueue(rows=[live_row(37)])
+        rep = self._tick(q)
+        self.assertEqual([r["id"] for r in rep["closed"]], [37])
+        self.assertIn(("close_by_sift", "37"), q.calls)
+        self.assertNotIn("accept", [c[0] for c in q.calls])
+        self.assertNotIn("reject", [c[0] for c in q.calls])
+        text = q.closed_texts[0]
+        self.assertIn(z.SIFT_MARK, text)
+        self.assertIn("ОТБОР", text)
+        self.assertIn(z.INBOX_DIR, text)                  # находка не потеряна
+        self.assertNotIn(z.QUOTE_HEAD, text)              # чужого текста нет
+        self.assertNotIn(LIVE_CLAIM["quote"], text)
+
+    def test_closure_is_recorded_and_counted_for_a_sliding_day(self):
+        self._tick(_FakeQueue(rows=[live_row(37)]))
+        state = run.read_state(self.state)
+        self.assertEqual(len(state["closed"]), 1)
+        rec = list(state["closed"].values())[0]
+        self.assertEqual(rec["outcome"], z.SIFT_OUTCOME)
+        self.assertEqual(rec["queue_id"], 37)
+        self.assertEqual(run.closed_today_count(state, self.NOW), 1)
+        # сутки прошли — из счёта уходит
+        self.assertEqual(run.closed_today_count(state, self.NOW + 86401), 0)
+
+    def test_both_numbers_are_reported_apart(self):
+        rep = self._tick(_FakeQueue(rows=[live_row(37), defect_row(42)]))
+        self.assertEqual(rep["awaiting_owner"], 1)        # только клиентский дефект
+        self.assertEqual(rep["closed_today"], 1)
+        self.assertIn("ЖДЁТ ТВОЕГО РЕШЕНИЯ: 1", rep["summary"])
+        self.assertIn("ЗАКРЫТО ОТБОРОМ за сутки: 1", rep["summary"])
+
+    def test_a_carded_row_is_kept_open_on_the_next_turn(self):
+        # Отправили карточку по дефекту; на следующем обороте отбор его НЕ закрывает,
+        # даже если бы счёл строкой сводки.
+        q = _FakeQueue(rows=[defect_row(42)])
+        self._tick(q)
+        state = run.read_state(self.state)
+        self.assertIn(DEFECT_KEY, state["sent"])
+        q2 = _FakeQueue(rows=[defect_row(42)])
+        rep = self._tick(q2)
+        self.assertEqual(rep["closed"], [])
+        self.assertNotIn("close_by_sift", [c[0] for c in q2.calls])
+
+    def test_dry_run_closes_nothing_in_the_queue(self):
+        q = _FakeQueue(rows=[live_row(37)])
+        rep = self._tick(q, send=False)
+        self.assertEqual([r["id"] for r in rep["closed"]], [37])
+        self.assertNotIn("close_by_sift", [c[0] for c in q.calls])
+        self.assertFalse(os.path.exists(self.state))
+        self.assertEqual(rep["closed_today"], 1)          # сухой ход всё равно считает
+
+    def test_bridge_refusal_leaves_the_row_open(self):
+        # Мост отказал — ряд НЕ считается закрытым ни в одном числе.
+        q = _FakeQueue(rows=[live_row(37)], close_ok=False)
+        rep = self._tick(q)
+        self.assertEqual(rep["closed"], [])
+        self.assertEqual([r["id"] for r in rep["failed"]], [37])
+        self.assertIn("закрытие отбором не прошло", rep["failed"][0]["why"])
+        self.assertEqual(rep["awaiting_owner"], 1)
+        self.assertEqual(rep["closed_today"], 0)
+        self.assertEqual(run.read_state(self.state)["closed"], {})
+
+    def test_the_off_switch_keeps_rows_open(self):
+        os.environ[run.NO_CLOSE_FLAG] = "1"
+        try:
+            q = _FakeQueue(rows=[live_row(37)])
+            rep = self._tick(q)
+            self.assertEqual(rep["closed"], [])
+            self.assertNotIn("close_by_sift", [c[0] for c in q.calls])
+            self.assertIn("закрытие выключено", rep["kept"][0]["why"])
+            self.assertEqual(rep["awaiting_owner"], 1)
+        finally:
+            os.environ.pop(run.NO_CLOSE_FLAG, None)
+
+    def test_the_journal_line_carries_the_author(self):
+        rep = self._tick(_FakeQueue(rows=[live_row(37)]))
+        self.assertIn("решил ОТБОР, не владелец", rep["line"])
 
 
 if __name__ == "__main__":

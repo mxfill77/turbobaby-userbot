@@ -24,6 +24,18 @@
   (:data:`pc_orchestrator._REJECT_PREFIX`) — тем же, которым живут все прочие
   отказы полосы, чтобы слепок очереди узнавал их одним разрезом.
 
+ТРЕТЬЕ ДЕЙСТВИЕ МОСТА, ЗАВЕДЕНО 03.09.2026 — ``close_by_sift``. Ряд, которому
+отбор карточки не дал, закрывается САМ: ``complete_task(done)`` с меткой
+:data:`zayavki_pc.SIFT_MARK`. Повод замерен в тот же день: в очереди десять рядов
+`needs_approval`, шесть из них заявки-ревью, и карточки не уходило НИ ПО ОДНОЙ —
+шесть рядов числились «ждёт владельца», а нажать было нечего и не будет.
+
+ЧЕГО ЭТО ДЕЙСТВИЕ НЕ ДЕЛАЕТ: не говорит за владельца ни «да», ни «нет» (у него
+свой третий исход и свой разрез, не пересекающийся с ``_REJECT_PREFIX``); не
+трогает ряд, по которому карточка уходила; не трогает клиентский дефект ни одной
+веткой; молчит, если отбор недостоверен, — тогда ряд остаётся ОТКРЫТЫМ. Откат
+одной переменной: :data:`NO_CLOSE_FLAG`.
+
 ЗАДАЧУ НЕ СТАВИТ НИ ОДНА ВЕТКА ЭТОГО МОДУЛЯ: ``enqueue`` здесь не зовётся вовсе.
 
 ЧЕГО ЕЩЁ НЕТ НИ ОДНОЙ ВЕТКОЙ: не правит код, не удаляет файлов, не трогает
@@ -55,6 +67,12 @@ ANSWERED_BY = "Filipp"
 # ВКЛЮЧЕНО, откат в одну переменную без правки кода.
 OFF_FLAG = "ZAYAVKI_PC_OFF"
 
+# Рубильник ОДНОЙ ветки — закрытия рядов отбором (03.09.2026). Заведён отдельно от
+# `ZAYAVKI_PC_OFF` намеренно: выключать доставку заявок ради отката закрытия
+# значило бы менять одну беду на другую. Поднят — ряды снова висят открытыми, всё
+# остальное работает байт-в-байт как до правки.
+NO_CLOSE_FLAG = "ZAYAVKI_PC_NO_CLOSE"
+
 
 def now_ts(clock=None):
     """Эпоха секундами. Единственная точка, где ступень смотрит на часы."""
@@ -75,11 +93,16 @@ def enabled():
     return str(os.getenv(OFF_FLAG) or "").strip().lower() not in ("1", "true", "yes", "on")
 
 
+def closing_enabled():
+    """Закрытие рядов отбором включено? Дефолт — да."""
+    return str(os.getenv(NO_CLOSE_FLAG) or "").strip().lower() not in ("1", "true", "yes", "on")
+
+
 # ───────────────────────────── реестр отправленного ─────────────────────────────
 
 
 def state_default():
-    return {"schema": zayavki_pc.SCHEMA, "sent": {}}
+    return {"schema": zayavki_pc.SCHEMA, "sent": {}, "closed": {}}
 
 
 def read_state(path):
@@ -91,6 +114,11 @@ def read_state(path):
     out = state_default()
     if isinstance(data, dict) and isinstance(data.get("sent"), dict):
         out["sent"] = dict(data["sent"])
+    # Реестр закрытых отбором заведён 03.09.2026 и в старом файле отсутствует —
+    # это не поломка, а первый день: пустой реестр честно означает «за сутки
+    # отбор не закрыл ничего», а не «мы не знаем».
+    if isinstance(data, dict) and isinstance(data.get("closed"), dict):
+        out["closed"] = dict(data["closed"])
     return out
 
 
@@ -162,6 +190,18 @@ class Queue:
         ok = bool(isinstance(res, dict) and res.get("ok"))
         return ok, ("" if ok else str((res or {}).get("error") or "мост не ответил распиской"))
 
+    def close_by_sift(self, tid, text):
+        """ОТБОР закрывает ряд сам — третьим исходом. → (ok, why).
+
+        Статус ``done`` и НЕ ``_REJECT_PREFIX``: префикс отказа значит «отклонено
+        Филиппом», а Филипп этой заявки не видел. Своя метка
+        (:data:`zayavki_pc.SIFT_MARK`) даёт слепку очереди отдельный разрез, не
+        пересекающийся ни с решениями владельца, ни со сбоями.
+        """
+        res = self._d.bc.complete_task(tid, zayavki_pc.SIFT_STATUS, text)
+        ok = bool(isinstance(res, dict) and res.get("ok"))
+        return ok, ("" if ok else str((res or {}).get("error") or "мост не ответил распиской"))
+
 
 # ─────────────────── клиентский контур и тело ряда (руки отбора) ───────────────────
 
@@ -176,6 +216,10 @@ def _row_text(row):
 
 
 _RE_PREMISE_ADDR = re.compile(r"найден по адресу\s+(\S+)")
+# Хвост «:НОМЕР СТРОКИ» живого адреса. Ступень B пишет адрес якоря КОДА именно так
+# (`review_intake_run.py:263` → ``address="%s:%d" % (rel, line)``), и это не
+# украшение: без номера строки владелец не найдёт место.
+_RE_ADDR_LINE = re.compile(r":\d+$")
 
 
 def premise_addresses(got):
@@ -184,9 +228,36 @@ def premise_addresses(got):
     Берём адрес из причины премисы, а НЕ имена, упомянутые находкой: подтвердился
     тот файл, в котором проба РЕАЛЬНО нашла якорь. Упомянуть можно что угодно;
     найдено — ровно одно место, и только оно говорит о том, что живёт в дереве.
+
+    Возвращается адрес ДОСЛОВНО, вместе с номером строки: это то, что ступень B
+    написала, и врать о нём здесь нельзя. Нормализует для графа :func:`_file_of`.
     """
     why = str((got or {}).get("premise_why") or "")
     return [m.group(1).rstrip(".,;") for m in _RE_PREMISE_ADDR.finditer(why)]
+
+
+def _file_of(address):
+    """Адрес премисы → ИМЯ ФАЙЛА для вопроса графу. → str.
+
+    ЗАКРЫТАЯ СЛЕПОТА ОТБОРА (найдена замером 03.09.2026, живой ряд #32). Живой
+    адрес ступени B несёт номер строки — ``model_name.py:30``, — а
+    `client_contour._norm` берёт `basename` и номер не срезает: замер прямой пробой
+    дал ``is_client("model_name.py") = True`` и ``is_client("model_name.py:30") =
+    False``. То есть условие 2 отбора («предмет виден клиенту») было слепо к КАЖДОМУ
+    адресу, найденному в коде, — а другого формата у живой ЖИВОЙ премисы и нет.
+
+    Почему это не заметили раньше: реплей 03.09 строил ``premise_why`` СВОИМИ
+    пробами, где адрес шёл голым именем файла, а голден `DEFECT_PREMISE` был
+    написан так же. Мок разошёлся с живым форматом и зеленел молча — тот самый
+    класс, о котором предупреждает `CLAUDE.md` («голдены детекта — дословные фразы
+    живого провала»). Голден переведён на живой формат тем же коммитом.
+
+    ПОРОГ ОТБОРА ЭТИМ НЕ ТРОНУТ: три условия :func:`zayavki_pc.client_defect`
+    остались дословно теми же. Починен РАЗБОР АДРЕСА, который скармливался
+    второму условию, и направление правки — в сторону БОЛЬШЕГО числа карточек и
+    МЕНЬШЕГО числа закрытий, то есть в осторожную.
+    """
+    return _RE_ADDR_LINE.sub("", str(address or "").strip())
 
 
 def client_files_of(got, repo=HERE, closure=None):
@@ -217,9 +288,10 @@ def client_files_of(got, repo=HERE, closure=None):
         return [], False
     hits = []
     for addr in premise_addresses(got):
+        name = _file_of(addr)          # номер строки графу не задаём: он о файлах
         try:
-            if client_contour.is_client(addr, cl=cl):
-                hits.append(addr)
+            if client_contour.is_client(name, cl=cl):
+                hits.append(addr)      # наружу — адрес ДОСЛОВНО, со строкой
         except Exception:
             continue
     return hits, True
@@ -232,10 +304,23 @@ def sent_today_count(state, now):
     полночь UTC не является границей внимания владельца, и пачка в 23:50 плюс
     пачка в 00:10 — это одна ночь, а не два дня по потолку.
     """
+    return _within_day((state or {}).get("sent") or {}, now, "first_at")
+
+
+def closed_today_count(state, now):
+    """Сколько рядов ОТБОР закрыл сам за последние сутки. → int.
+
+    Число задания (пункт 5) и второе из двух, которые сводка обязана нести ВРОЗЬ.
+    Окно то же скользящее, что у карточек: сутки владельца — не календарный день.
+    """
+    return _within_day((state or {}).get("closed") or {}, now, "at")
+
+
+def _within_day(records, now, field):
     n = 0
-    for rec in ((state or {}).get("sent") or {}).values():
+    for rec in (records or {}).values():
         try:
-            if float(now) - float((rec or {}).get("first_at")) < 86400.0:
+            if float(now) - float((rec or {}).get(field)) < 86400.0:
                 n += 1
         except (TypeError, ValueError):
             continue
@@ -301,13 +386,16 @@ def tick(root=HERE, state_path=None, send=False, clock=None, queue=None,
     """
     state_path = state_path or _path(root, DEFAULT_STATE)
     now = now_ts(clock)
-    report = {"acted": False, "why": "", "awaiting": 0, "zayavki": 0, "cards": 0,
+    report = {"acted": False, "why": "", "awaiting": 0, "zayavki": 0, "cards": 0, "foreign": 0,
               "sent": [], "held": [], "reminded": [], "skipped": [], "failed": [], "line": "",
-              "routed": [], "digested": [], "summary": "", "graph_ok": True}
+              "routed": [], "digested": [], "summary": "", "graph_ok": True,
+              "closed": [], "kept": [], "awaiting_owner": 0, "closed_today": 0}
     if not enabled():
         report["why"] = "ступень выключена (%s)" % OFF_FLAG
         return report
-    rows, ok, why = (queue or Queue()).awaiting() if queue is not False else ([], True, "")
+    # Клиент очереди строится ОДИН раз: второй `Queue()` — второй импорт демона.
+    q = None if queue is False else (queue or Queue())
+    rows, ok, why = q.awaiting() if q is not None else ([], True, "")
     if not ok:
         # ТРЕТИЙ ИСХОД, А НЕ НОЛЬ. Источник молчит — значит сколько находок пришло
         # за сутки, НЕИЗВЕСТНО. Сводка «0 находок» в этот день была бы неотличима
@@ -319,6 +407,7 @@ def tick(root=HERE, state_path=None, send=False, clock=None, queue=None,
     report["awaiting"] = len(rows)
     report["zayavki"] = len(split["zayavki"])
     report["cards"] = len(split["cards"])
+    report["foreign"] = len(split.get("foreign") or [])
     items = [zayavki_pc.digest(row) for row in split["zayavki"]]
     state = read_state(state_path)
 
@@ -326,13 +415,14 @@ def tick(root=HERE, state_path=None, send=False, clock=None, queue=None,
     # Признаки собираются ЗДЕСЬ, потому что оба требуют диска: тело ряда для слов
     # и граф импортов для клиентского контура. Решение по ним принимает чистый
     # слой (`zayavki_pc.route`) — как и у всех прочих ступеней полосы.
-    signals, client_files = {}, {}
+    signals, client_files, determined_by = {}, {}, {}
     graph_ok = True
     for row, got in zip(split["zayavki"], items):
         key = got.get("key") or ""
         signals[key] = zayavki_pc.defect_signals(_row_text(row))
         hits, determined = client_files_of(got, repo=root)
         client_files[key] = hits
+        determined_by[key] = determined
         if not determined:
             graph_ok = False
     routed = zayavki_pc.route(items, signals, client_files,
@@ -342,7 +432,54 @@ def tick(root=HERE, state_path=None, send=False, clock=None, queue=None,
     by_action = {r.get("key"): r for r in routed}
     to_card = {r.get("key") for r in routed if r.get("action") in ("card", "card_over")}
     report["digested"] = [r for r in routed if r.get("action") == "digest"]
-    report["summary"] = zayavki_pc.summary(routed, found=len(items))
+
+    # ── СУДЬБА РЯДА БЕЗ КАРТОЧКИ: закрывается сам, третьим исходом (03.09.2026) ──
+    # Решает чистый слой; здесь только ввод-вывод. Ключи, по которым карточка уже
+    # уходила, приезжают ИЗ РЕЕСТРА: такой ряд ждёт ОТВЕТА, и закрывать его нельзя.
+    by_key_all = {d.get("key"): d for d in items}
+    verdicts = zayavki_pc.closures(routed, determined=determined_by,
+                                   carded=set((state.get("sent") or {}).keys()))
+    for v in verdicts:
+        if not v.get("close"):
+            report["kept"].append(v)
+            continue
+        if not closing_enabled():
+            v = dict(v, why="%s; но закрытие выключено (%s) — ряд оставлен ОТКРЫТЫМ"
+                            % (v.get("why"), NO_CLOSE_FLAG))
+            report["kept"].append(v)
+            continue
+        text = zayavki_pc.sift_result(v, pointer_text=zayavki_pc.pointer(
+            by_key_all.get(v.get("key")) or {"id": v.get("id")}))
+        if not send or q is None:
+            report["closed"].append(dict(v, channel="сухой ход"))
+            continue
+        ok_close, why_close = q.close_by_sift(v.get("id"), text)
+        if not ok_close:
+            # Мост отказал — ряд ОСТАЁТСЯ ОТКРЫТЫМ. Считать его закрытым по нашей
+            # записи значило бы потерять его из обоих чисел разом.
+            report["failed"].append({"id": v.get("id"), "key": v.get("key"),
+                                     "why": "закрытие отбором не прошло: %s" % why_close})
+            report["kept"].append(dict(v, why="закрытие не прошло — ряд открыт"))
+            continue
+        report["closed"].append(v)
+        state.setdefault("closed", {})[v.get("key") or str(v.get("id"))] = {
+            "at": now, "at_iso": now_iso(), "queue_id": v.get("id"),
+            "kind": v.get("kind"), "outcome": zayavki_pc.SIFT_OUTCOME, "why": v.get("why"),
+        }
+
+    # ДВА ЧИСЛА ВРОЗЬ (пункт 5). «Ждёт владельца» — ряды, по которым решение
+    # ДЕЙСТВИТЕЛЬНО за человеком. Считаем ВЫЧИТАНИЕМ, а не сложением кучек:
+    # `to_card` и `kept` ПЕРЕСЕКАЮТСЯ (ряд с дефектом лежит в обеих), и сумма
+    # давала бы 2 там, где ряд один — замерено красным тестом при сборке.
+    # Открыто = всё наше минус то, что отбор закрыл.
+    report["awaiting_owner"] = len(routed) - len(report["closed"])
+    # В боевом ходе закрытия этого захода УЖЕ лежат в реестре; в сухом их там нет
+    # и никогда не будет — считаем их отдельно, иначе сухой ход печатал бы «0».
+    report["closed_today"] = (closed_today_count(state, now)
+                              + (0 if send else len(report["closed"])))
+    report["summary"] = zayavki_pc.summary(
+        routed, found=len(items), awaiting_owner=report["awaiting_owner"],
+        closed_today=report["closed_today"], foreign_waiting=report["foreign"])
 
     # В `plan` едут ТОЛЬКО отобранные карточкой. Отложенные остаются открытыми
     # заявками в очереди и живут строкой сводки — реестр отправок их не помнит,
@@ -403,14 +540,17 @@ def tick(root=HERE, state_path=None, send=False, clock=None, queue=None,
                 report["failed"].append({"id": None, "key": "напоминание", "why": sent_why})
     if send:
         write_state(state_path, state)
-    report["acted"] = bool(report["sent"] or report["reminded"] or report["failed"])
+    report["acted"] = bool(report["sent"] or report["reminded"] or report["failed"]
+                           or report["closed"])
     report["line"] = zayavki_pc.index_line(report)
     if not report["why"]:
         report["why"] = ("заявок %d: карточкой %d, строкой в сводке %d, доставлено %d, "
-                         "напомнено %d, придержано %d, молчим о %d"
+                         "напомнено %d, придержано %d, молчим о %d; ЖДЁТ ВЛАДЕЛЬЦА %d, "
+                         "ЗАКРЫТО ОТБОРОМ за сутки %d (числа разные, не складывать)"
                          % (report["zayavki"], len(to_card), len(report["digested"]),
                             len(report["sent"]), len(report["reminded"]),
-                            len(report["held"]), len(report["skipped"])))
+                            len(report["held"]), len(report["skipped"]),
+                            report["awaiting_owner"], report["closed_today"]))
         if not graph_ok:
             report["why"] += ("; граф клиентского контура НЕДОСТОВЕРЕН — предмет судился "
                               "только по словам находки")
@@ -443,8 +583,12 @@ def answer(tid, yes, queue=None):
 
 
 def _render(report):
-    lines = ["ждут решения всего: %d (заявок %d, карточек гарда %d)"
-             % (report.get("awaiting", 0), report.get("zayavki", 0), report.get("cards", 0)),
+    lines = ["рядов в needs_approval: %d (заявок-ревью %d, карточек гарда %d, "
+             "заявок ступени E %d — чужой отбор)"
+             % (report.get("awaiting", 0), report.get("zayavki", 0), report.get("cards", 0),
+                report.get("foreign", 0)),
+             "ЖДЁТ ВЛАДЕЛЬЦА: %d · ЗАКРЫТО ОТБОРОМ за сутки: %d (числа разные)"
+             % (report.get("awaiting_owner", 0), report.get("closed_today", 0)),
              "исход: %s" % report.get("why")]
     for row in report.get("sent") or []:
         lines.append("  → доставлена #%s (%s) каналом %s"
@@ -462,6 +606,11 @@ def _render(report):
     for row in report.get("digested") or []:
         lines.append("  📊 в сводку #%s (%s): %s"
                      % (row.get("id"), row.get("kind"), row.get("why")))
+    for row in report.get("closed") or []:
+        lines.append("  🔒 %s #%s (решил ОТБОР, не владелец): %s"
+                     % (zayavki_pc.SIFT_OUTCOME, row.get("id"), row.get("why")))
+    for row in report.get("kept") or []:
+        lines.append("  ⏳ ждёт владельца #%s: %s" % (row.get("id"), row.get("why")))
     if report.get("summary"):
         lines.append("")
         lines.append("СВОДКА: " + report["summary"])
