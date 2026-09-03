@@ -41,6 +41,18 @@
     ``process_new``, что и задача, присланная владельцем руками.
   • НЕ УДАЛЯЕТ И НЕ ТРОГАЕТ ПРОЦЕССОВ.
 
+ПОЛОСУ НАЗЫВАЕТ ШТАБ (03.09.2026), СТРОКОЙ В ТЕЛЕ ДОКУМЕНТА. До этого дня ящик
+ставил ТОЛЬКО полосой ПК (``enqueue_pc_task`` шлёт ``lane='pc'`` жёстко), и замер
+очереди назвал цену: за 03.09 полоса ПК закрыла **47** рядов, полоса VPS — **0**.
+Три исхода вместо двух: полоса названа и опознана · не названа (тогда ПК, и это
+СКАЗАНО строкой) · названа непонятно (тогда задание не берётся вовсе).
+
+ДОРОГА ПОЛОСЫ ПК НЕ ТРОНУТА: она идёт прежним ``enqueue_pc_task``. Чужая полоса —
+отдельная ветка тем же экшеном моста, с проверкой имени по набору. А корпус рядов
+очереди читается теперь по ОБЕИМ полосам (``lane='all'``, один вызов на статус,
+проверено живьём): иначе маркер задания, уехавшего на сервер, стал бы невидим и
+ящик ставил бы его заново каждые полчаса — МОЛЧА.
+
 СИГНАЛЬНАЯ ОСТАНОВКА (02.09.2026) СЧИТАЕТСЯ ЗДЕСЬ, А РЕШАЕТСЯ В :mod:`shtab_box_signals`.
 Руки приносят четыре корпуса фактов и ни одного вердикта: закрытые ряды очереди с
 маркером ящика (сигналы А и Б), открытые ряды в ``needs_approval`` (сигнал В),
@@ -90,6 +102,14 @@ STOP_FILE = "pc_orchestrator.shtab_box.off"
 # одни сутки при потолке 2).
 OPEN_STATUSES = recon_auto_run.OPEN_STATUSES
 CLOSED_STATUSES = ("failed", "done")
+
+# ОБЕ ПОЛОСЫ ОДНИМ ВЫЗОВОМ. Значение — не догадка: живая проба 03.09.2026
+# (`_scratch_box_lanes/probe_lanes2.py`, только чтение) на статусе `done`
+# вернула pc=61, vps=4, all=65 — то есть `all` действительно объединение, а не
+# синоним своей полосы и не пустой ответ. Цена та же, что была: ОДИН вызов на
+# статус, а не два, — иначе виток ящика подорожал бы вдвое ровно там, где мы
+# просим его учащать.
+LANE_ALL = "all"
 
 FROM = "Filipp-shtab"          # from ряда: видно в очереди, откуда взялась задача
 
@@ -276,24 +296,78 @@ class Queue(recon_auto_run.Queue):
     """Очередь ящика: тот же клиент моста и тот же механизм, что у ступеней B и E.
 
     Наследуемся, а не переписываем: постановка ряда, чтение статусов и признак
-    «в очереди есть работа владельца» — один механизм на полосу. Отличие ровно
-    одно — метка ``from``, по которой в очереди видно происхождение задачи.
+    «в очереди есть работа владельца» — один механизм на полосу. Отличий с
+    03.09.2026 два — метка ``from`` и ДВЕ ПОЛОСЫ вместо одной.
 
     ЗАЯВОК ВЛАДЕЛЬЦУ ЯЩИК НЕ СТАВИТ НИ ОДНОЙ, и ``place_ask`` здесь не зовётся
     нигде: у ящика нет собственного мнения, о котором стоило бы спрашивать. Он
     либо берёт готовый блок, либо не берёт и говорит почему.
     """
 
-    def place_task(self, text):
-        """Задание Штаба — зелёный ряд ``new``. → (ok, id|None, причина).
+    def rows(self, statuses=OPEN_STATUSES):
+        """Ряды ОБЕИХ полос в названных статусах. → (list, ok, why).
+
+        ═══ ПОЧЕМУ ЧУЖУЮ ПОЛОСУ ЧИТАТЬ ОБЯЗАТЕЛЬНО ═══════════════════════════
+
+        Наследованный ``rows`` читал ``get_pending(status)`` с дефолтным
+        ``lane='pc'`` и вдобавок отбрасывал чужие ряды сам. Пока ящик ставил
+        только своей полосой, это было верно. С маршрутом 03.09 то же чтение
+        стало БЕСШУМНОЙ МАШИНОЙ ДУБЛЕЙ: дедуп ящика живёт в маркере ряда живой
+        очереди, ряд ушёл на ``lane=vps`` — и маркер невидим. Ящик брал бы одно и
+        то же задание КАЖДЫЙ ВИТОК, а суточный потолок, считаемый теми же
+        маркерами, не остановил бы его ни разу: и «взято 0», и «не вижу взятых»
+        выглядят одинаково. Это ровно класс 539, из-за которого на полосе VPS
+        родились четыре дубля за трое суток.
+
+        ОДИН ВЫЗОВ, А НЕ ДВА: ``lane='all'`` проверен живой пробой 03.09 (`done`:
+        pc 61 + vps 4 = all 65). Два вызова на статус удвоили бы цену витка ровно
+        там, где задание просит его учащать.
+
+        ЧУЖИЕ РЯДЫ НЕ ОТБРАСЫВАЮТСЯ, а ПОМЕЧАЮТСЯ ПОЛОСОЙ: разделение по полосам
+        делает вызывающий (:func:`build`), потому что разным замкам нужны разные
+        корпуса — дедупу обе полосы, замку владельца только своя.
+        """
+        out = []
+        for status in statuses:
+            res = self._d.bc.get_pending(status, lane=LANE_ALL)
+            if not res.get("ok"):
+                return [], False, str(res.get("error") or "мост не ответил")
+            for it in (res.get("items") or []):
+                item = dict(it)
+                item.setdefault("status", status)
+                item["lane"] = shtab_box.row_lane(it)
+                out.append(item)
+        return out, True, ""
+
+    def place_task(self, text, lane=None):
+        """Задание Штаба — зелёный ряд ``new`` НА НАЗВАННОЙ ПОЛОСЕ. → (ok, id|None, причина).
 
         Ни ``claim``, ни ``set_needs_approval``: ряд подберёт штатный
-        ``process_new`` и исполнит headless-ребёнком под обычным гардом. Это и
-        есть «демон сам берёт задачу из ящика» — не имитация ряда, а обычная
-        работа полосы.
+        ``process_new`` СВОЕЙ полосы и исполнит headless-ребёнком под обычным
+        гардом. Это и есть «демон сам берёт задачу из ящика» — не имитация ряда, а
+        обычная работа полосы.
+
+        ДОРОГА ПОЛОСЫ ПК НЕ ТРОНУТА НИ СИМВОЛОМ: она по-прежнему идёт через
+        ``enqueue_pc_task``, у которого ``lane`` зашит жёстко («чужие полосы не
+        создаём») и который пишет свою строку в лог демона. Чужая полоса —
+        ОТДЕЛЬНАЯ ветка тем же экшеном моста, и она проверяет имя полосы по
+        НАБОРУ (:data:`shtab_box.LANES`), а не доверяет вызывающему: полосы,
+        которой нет, ряд достаться не может даже по опечатке.
         """
-        ok, tid, err = self._d.enqueue_pc_task(text, frm=FROM)
-        return (bool(ok), tid, "" if ok else str(err or "enqueue отклонён"))
+        ln = str(lane or shtab_box.LANE_DEFAULT)
+        if ln == shtab_box.LANE_PC:
+            ok, tid, err = self._d.enqueue_pc_task(text, frm=FROM)
+            return (bool(ok), tid, "" if ok else str(err or "enqueue отклонён"))
+        if ln not in shtab_box.LANES:
+            return False, None, ("полоса %r не из набора %s — ряд не ставим вовсе"
+                                 % (ln, list(shtab_box.LANES)))
+        body = str(text or "").strip()
+        if not body:
+            return False, None, "пустой текст задачи"
+        res = self._d.bc.enqueue_task(FROM, body, lane=ln)
+        if not (isinstance(res, dict) and res.get("ok")):
+            return False, None, str((res or {}).get("error") or "enqueue отклонён Bridge")
+        return True, res.get("id"), ""
 
 
 # ───────────────────────────── сборка ─────────────────────────────
@@ -343,6 +417,10 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
            "queue_ok": False, "queue_asked": False, "queue_why": "",
            "owner_busy": None, "owner_rows": [],
            "marks_ok": False, "marks_asked": False, "marks_why": "", "task_marks": [],
+           # МАРКЕРЫ В ДВУХ РАЗРЕЗАХ: общий (дедуп по обеим полосам) и по полосам
+           # (суточный потолок у каждой свой). Одного корпуса тут мало не потому, что
+           # так удобнее, а потому что вопросы разные — см. :func:`shtab_box.marks_by_lane`.
+           "lane_marks": {}, "taken_by_lane": {},
            "rows": 0, "taken_today": None,
            # СИГНАЛЬНАЯ ОСТАНОВКА: три состояния, как у маркеров суток, — посчитана ·
            # не посчитана, потому что до неё не дошло · посчитана и говорит «не знаю».
@@ -377,8 +455,14 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
         live_rows, ok, qwhy = q.rows(OPEN_STATUSES)
         out["queue_asked"] = True
     out["queue_ok"], out["queue_why"] = ok, qwhy
+    # ЗАМКИ, СУЩЕСТВОВАВШИЕ ДО МАРШРУТА, СУДЯТ РОВНО ТОТ ЖЕ КОРПУС, ЧТО И ВЧЕРА —
+    # ряды СВОЕЙ полосы. Это не осторожность: `_is_owner_work` и сигнал В — правила,
+    # измеренные НА ЭТОЙ полосе (правило зеркала: посылку меряют здесь). Накорми мы
+    # их чужими рядами, карточка, ждущая владельца на сервере, глушила бы ящик ПК —
+    # поведение, которого никто не мерил и которое никем не заказано.
+    live_pc = shtab_box.rows_by_lane(live_rows)[shtab_box.LANE_PC] if ok else []
     if ok:
-        busy, ids = q.owner_busy(live_rows)
+        busy, ids = q.owner_busy(live_pc)
         out["owner_busy"], out["owner_rows"] = busy, ids
 
     closed_rows, closed_ok, closed_why = ([], False, "закрытые ряды не спрашивали")
@@ -403,9 +487,15 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
     if ok:
         all_rows = list(live_rows) + list(closed_rows)
         out["rows"] = len(all_rows)
+        # ДВА РАЗНЫХ СЧЁТА ИЗ ОДНОГО КОРПУСА: дедуп — по ОБЕИМ полосам (ключ есть имя
+        # задачи, и «уже взято» не перестаёт быть правдой от смены машины), потолок —
+        # у КАЖДОЙ свой (мощности две, и друг у друга они ничего не отнимают).
         out["task_marks"] = shtab_box.markers(all_rows)
+        out["lane_marks"] = shtab_box.marks_by_lane(all_rows)
         if out["marks_ok"]:
             out["taken_today"] = shtab_box.taken_today(all_rows, today)
+            out["taken_by_lane"] = {ln: sum(1 for d, _k in marks if d == today)
+                                    for ln, marks in out["lane_marks"].items()}
 
     # ── ТЕЛА ДОКУМЕНТОВ ───────────────────────────────────────────────────────
     # ПОСЛЕДНЕЕ ЧТЕНИЕ И САМОЕ ИЗБИРАТЕЛЬНОЕ: каждое тело — свой поход в мост.
@@ -439,6 +529,12 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
         # иначе ящик выглядит сломанным ровно тогда, когда он честно отказывает.
         gate_ok, reason, why = shtab_box.check(doc)
         out["gates"][doc["key"]] = {"ok": gate_ok, "reason": reason, "why": why}
+        # ПОЛОСА ЧИТАЕТСЯ У КАЖДОГО ПРОЧИТАННОГО, А НЕ ТОЛЬКО У ВЗЯТОГО, и по той же
+        # причине, что и ворота: владелец обязан видеть в `--status`, КУДА уедет
+        # лежащее в ящике задание, ДО того как оно уехало. Дефолт «полоса не названа
+        # → ПК» тем более обязан быть виден: он и есть то, что чаще всего надо
+        # поправить одной строкой в документе.
+        doc["lane_read"] = shtab_box.read_lane(doc["body"])
 
     # ── СИГНАЛЬНАЯ ОСТАНОВКА ──────────────────────────────────────────────────
     # СЧИТАЕТСЯ РОВНО ТОГДА, КОГДА СПРАШИВАЛИ ЗАКРЫТЫЕ РЯДЫ, и это не экономия
@@ -465,9 +561,25 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
         # слабее, и потому не требует третьего исхода — «не знаю, снят ли сигнал»
         # и «сигнал не снят» ведут ящик к одному и тому же поступку.
         out["released"] = sorted(sig.release_marks(text)) if node_ok else []
-        left = shtab_box.budget_left(out["task_marks"], today, budget, out["marks_ok"])
+        # ОСТАТОК ДНЯ ДЛЯ СИГНАЛА Г — МЕНЬШИЙ ИЗ ДВУХ, и выбор назван вслух, потому
+        # что при раздельных потолках «остаток» перестал быть одним числом. Сигнал Г
+        # ПОКАЗЫВАЕТ, а не держит (`enforced=False`), и первая новость показа —
+        # «день кончился ХОТЬ У КОГО-ТО»: именно она объясняет Штабу, почему его
+        # задание ждёт. У КОГО именно — говорят строка сводки (разрез по полосам) и
+        # причина отказа в отчёте, где полоса названа прямо.
+        # СУММА (6 при потолке 3) соврала бы вверх, а счёт по ОБЩИМ маркерам — вниз:
+        # он записал бы серверные постановки в съеденный бюджет ПК, то есть вернул
+        # бы общий потолок через чёрный ход.
+        left = min(shtab_box.budget_left(out["lane_marks"].get(ln, ()), today, budget,
+                                         out["marks_ok"])
+                   for ln in shtab_box.LANES)
         out["signals"] = sig.evaluate(
-            closed=sig.box_rows(closed_rows), open_rows=live_rows, judged=judged,
+            # ЗАКРЫТЫЕ РЯДЫ — ОБЕИХ ПОЛОС: `box_rows` отбирает по МАРКЕРУ ящика, то
+            # есть видит только собственные задания. Провалившееся задание ящика не
+            # перестаёт быть его провалом оттого, что исполнялось на сервере, — и
+            # сигналы А/Б обязаны его сосчитать. Сегодня это ничего не меняет (рядов
+            # ящика на чужой полосе ноль), а завтра закрывает дыру.
+            closed=sig.box_rows(closed_rows), open_rows=live_pc, judged=judged,
             day=today, left=left, budget=budget, released=out["released"],
             rows_ok=bool(closed_ok), open_ok=bool(ok), judged_ok=bool(judged_ok),
             marks_ok=bool(out["marks_ok"]))
@@ -516,7 +628,8 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
         return report
 
     take, held = shtab_box.select(
-        data["docs"], task_marks=data["task_marks"], today=today, budget=budget,
+        data["docs"], task_marks=data["task_marks"], lane_marks=data["lane_marks"],
+        today=today, budget=budget,
         owner_busy=bool(data["owner_busy"]), limit=limit,
         marks_ok=bool(data["marks_ok"]), source_ok=bool(data["folder_ok"]),
         stop_words=data["stop"])
@@ -536,17 +649,24 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
 
     for blk, text in take:
         report["texts"][blk["key"]] = text
+        # ПОЛОСА НАЗЫВАЕТСЯ В КАЖДОЙ СТРОКЕ ИСХОДА, включая сухой ход и отказ: «куда
+        # это уедет» — первый вопрос владельца к автоматической постановке, и
+        # отвечать на него чтением кода он не обязан.
+        lane = str(blk.get("lane") or shtab_box.LANE_DEFAULT)
+        words = shtab_box.lane_words({"lane": lane, "named": bool(blk.get("lane_named"))})
         if not place:
-            report["held"].append((blk["key"], "сухой ход: текст собран, очередь не тронута"))
+            report["held"].append((blk["key"],
+                                   "сухой ход: текст собран, очередь не тронута (%s)" % words))
             continue
         if not (data["queue_ok"] and data.get("queue") is not None):
             report["held"].append((blk["key"], "очередь недоступна — не ставим вслепую"))
             continue
-        ok, tid, err = data["queue"].place_task(text)
+        ok, tid, err = data["queue"].place_task(text, lane=lane)
         if not ok:
-            report["failed"].append({"key": blk["key"], "why": err, "id": tid})
+            report["failed"].append({"key": blk["key"], "why": err, "id": tid, "lane": lane})
             continue
-        report["placed"].append({"key": blk["key"], "id": tid})
+        report["placed"].append({"key": blk["key"], "id": tid, "lane": lane,
+                                 "lane_named": bool(blk.get("lane_named")), "lane_words": words})
         if write_journal:
             (journal_fn or _journal)(shtab_box.index_line(blk, tid, today), repo=root)
 
@@ -603,7 +723,12 @@ def _why(report, data):
                     (", не разобрано %d" % len(data["bad"])) if data["bad"] else ""))
         return "%s · %s" % (empty, data["old_door"]) if data["old_door"] else empty
     if report["placed"]:
-        return "взято %d, отложено %d" % (len(report["placed"]), len(report["held"]))
+        return ("взято %d (%s), отложено %d"
+                % (len(report["placed"]),
+                   ", ".join("#%s %s" % (r.get("id"),
+                                         shtab_box.LANE_HUMAN.get(r.get("lane"), r.get("lane")))
+                             for r in report["placed"]),
+                   len(report["held"])))
     refused = [w for _k, w in report["held"] if w.startswith("НЕ ПРИНЯТ")]
     if refused and len(refused) == len(report["held"]):
         return "документов %d, принят 0 — %s" % (len(data["docs"]), "; ".join(refused[:2]))
@@ -636,7 +761,14 @@ def _line(report):
         return ""
     parts = ["ящик Штаба: взято %d" % len(placed)]
     for row in placed:
-        parts.append("#%s (ключ %s)" % (row["id"], row["key"]))
+        # ПОЛОСА — В СТРОКЕ ИСХОДА, а не только в журнальном индексе. Эту строку
+        # демон кладёт в `cowork_log` и в свой лог; по ней же владелец узнаёт о
+        # постановке. «Взято #123» без полосы на двух полосах — половина новости.
+        parts.append("#%s (ключ %s, %s)"
+                     % (row["id"], row["key"],
+                        row.get("lane_words")
+                        or shtab_box.lane_words({"lane": row.get("lane"),
+                                                 "named": bool(row.get("lane_named"))})))
     if report.get("failed"):
         parts.append("не встало %d" % len(report["failed"]))
     return "; ".join(parts)
@@ -679,7 +811,15 @@ def _render(report=None, data=None):
                 state = "НЕ ПРИНЯТО (%s): %s" % (gate.get("reason"), gate.get("why"))
             else:
                 state = "состояние не определялось"
-            lines.append("  • %s (ключ=%s) — %s" % (doc["name"], doc["key"], state))
+            # ПОЛОСА ПОКАЗЫВАЕТСЯ У ПРОЧИТАННОГО ДОКУМЕНТА ВСЕГДА — и когда названа,
+            # и когда взята по умолчанию. Второе важнее первого: молчащий дефолт
+            # правится одной строкой в документе, но только если его ВИДНО.
+            ln = doc.get("lane_read")
+            lines.append("  • %s (ключ=%s) — %s%s"
+                         % (doc["name"], doc["key"], state,
+                            (" · %s" % (shtab_box.lane_words(ln) if ln.get("ok")
+                                        else "ПОЛОСА НЕ ОПОЗНАНА: %s" % ln.get("why")))
+                            if isinstance(ln, dict) else ""))
         # ТРИ СОСТОЯНИЯ ОЧЕРЕДИ, А НЕ ДВА. «Не спрашивали» — это не «недоступна»:
         # ящик, не прочитавший узел, до очереди не доходит вовсе, и рапорт
         # «НЕДОСТУПНА» повесил бы на мост чужую вину. Та же поправка, что у
@@ -697,7 +837,8 @@ def _render(report=None, data=None):
                               else "не спрашивали, потому что незачем"),
                         data["marks_why"] or "прочитаны"))
         lines.append(shtab_box.digest_line(data["taken_today"] or 0, data["today"],
-                                           ok=data["marks_ok"], why=data["marks_why"]))
+                                           ok=data["marks_ok"], why=data["marks_why"],
+                                           by_lane=data.get("taken_by_lane")))
         # ВСЕ ЧЕТЫРЕ СИГНАЛА В ОДНОМ МЕСТЕ, включая молчащие: перечень, из которого
         # молчащие вычеркнуты, читается как «других сторожей нет».
         if not data["signals_asked"]:
@@ -714,9 +855,14 @@ def _render(report=None, data=None):
     if report is not None:
         lines.append("исход: %s" % (report.get("why") or "—"))
         for row in report.get("placed") or []:
-            lines.append("  ВЗЯТО #%s ключ=%s" % (row["id"], row["key"]))
+            lines.append("  ВЗЯТО #%s ключ=%s — %s"
+                         % (row["id"], row["key"],
+                            row.get("lane_words")
+                            or shtab_box.lane_words({"lane": row.get("lane"),
+                                                     "named": bool(row.get("lane_named"))})))
         for row in report.get("failed") or []:
-            lines.append("  НЕ ВСТАЛО ключ=%s: %s" % (row["key"], row["why"]))
+            lines.append("  НЕ ВСТАЛО ключ=%s (полоса %s): %s"
+                         % (row["key"], row.get("lane") or "?", row["why"]))
         for key, why in report.get("held") or []:
             lines.append("  отложено ключ=%s: %s" % (key or "—", why))
     return "\n".join(lines)
@@ -750,6 +896,7 @@ def main(argv=None):
                 continue
             text = shtab_box.task_text(doc, data["today"])
             if text:
+                print("# %s" % shtab_box.lane_words(shtab_box.lane_of(doc)))
                 print(text)
             elif doc.get("revoked"):
                 print("ЗАДАНИЕ ОТОЗВАНО ШТАБОМ: документ %s" % doc["name"])

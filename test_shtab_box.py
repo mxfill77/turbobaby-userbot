@@ -218,6 +218,7 @@ class FakeQueue(object):
         self._ok, self._closed_ok = ok, closed_ok
         self._busy, self._busy_ids = busy, list(busy_ids)
         self.tasks = []
+        self.lanes = []
         self.asked = []
         self.next_id = 700
 
@@ -234,9 +235,12 @@ class FakeQueue(object):
     def owner_busy(self, rows):
         return self._busy, list(self._busy_ids)
 
-    def place_task(self, text):
+    def place_task(self, text, lane=None):
+        """Постановка-заглушка. ПОЛОСА ЗАПОМИНАЕТСЯ, а не проглатывается: с
+        03.09.2026 «куда поставили» — предмет проверки наравне с «поставили ли»."""
         self.next_id += 1
         self.tasks.append((self.next_id, text))
+        self.lanes.append(str(lane or ""))
         return True, self.next_id, ""
 
 
@@ -1298,6 +1302,389 @@ class TestWiring(unittest.TestCase):
                                  "outcome": "done"}}}
         self.assertEqual(cd.shtab_taken(cdr.all_rows(snap), TODAY), 2)
         self.assertIsNone(cdr.all_rows(None))
+
+
+# ═══════════════════════ ПОЛОСА ИСПОЛНЕНИЯ (03.09.2026) ═══════════════════════
+
+
+def _lane_body(word, body=None):
+    """Тело задания с назначенной полосой. Строку собирает ОДНО место — тест не
+    смеет знать форму лучше кода: набери мы её здесь литералом, правка формы в
+    :mod:`shtab_box` осталась бы зелёной у себя и красной в бою."""
+    base = GOOD_BODY if body is None else body
+    return base + "\n\nПОЛОСА: %s" % word
+
+
+class FakeBridge(object):
+    """Клиент моста-заглушка: помнит ПОЛОСУ каждого вопроса и каждой постановки."""
+
+    def __init__(self, items=None, ok=True):
+        self._items, self._ok = dict(items or {}), ok
+        self.asked, self.placed = [], []
+        self.next_id = 500
+
+    def get_pending(self, status, lane="pc"):
+        self.asked.append((status, lane))
+        if not self._ok:
+            return {"ok": False, "error": "мост не ответил"}
+        return {"ok": True, "items": list(self._items.get(status) or [])}
+
+    def enqueue_task(self, frm, text, lane="pc"):
+        self.next_id += 1
+        self.placed.append({"from": frm, "lane": lane, "text": text})
+        return {"ok": True, "id": self.next_id}
+
+
+class FakeDaemon(object):
+    """Демон-заглушка для рук: только то, что руки у него действительно берут."""
+
+    def __init__(self, bridge=None):
+        self.bc = bridge or FakeBridge()
+        self.pc_calls = []
+
+    def enqueue_pc_task(self, text, frm="Filipp"):
+        self.pc_calls.append((frm, text))
+        r = self.bc.enqueue_task(frm, text, lane=sb.LANE_PC)
+        return True, r.get("id"), None
+
+    def _revizor_chain_pids(self, rows):
+        return set()
+
+    def _is_owner_work(self, item, pids):
+        return str(item.get("from") or "").startswith("Filipp")
+
+
+class TestLaneForm(unittest.TestCase):
+    """ФОРМА УКАЗАНИЯ ПОЛОСЫ: одна, в теле, с тремя исходами."""
+
+    def test_the_form_lives_in_exactly_one_place(self):
+        """Второй экземпляр формы — второе мнение о том, куда ехать заданию."""
+        self.assertEqual(("pc", "vps"), sb.LANES)
+        self.assertEqual("pc", sb.LANE_DEFAULT)
+        hands = _src("shtab_box_run.py")
+        self.assertNotIn("ПОЛОСА:", hands, "форма набрана в руках литералом")
+        self.assertNotIn('"vps"', hands, "имя чужой полосы набрано в руках литералом")
+        self.assertIn("shtab_box.LANE", hands, "руки обязаны брать полосу у чистого модуля")
+
+    def test_the_lane_is_read_from_the_BODY_and_never_from_the_name(self):
+        """ИМЯ НЕСЁТ КЛЮЧ, и смешивать роли нельзя.
+
+        Живой документ 03.09 назван `shtab_task_srv-delivery-check.0903` — «srv», про
+        сервер, — а исполняется ПОЛОСОЙ ПК (тянет с сервера по ssh и правит общий
+        репозиторий отсюда). Читай мы полосу из имени, он уехал бы не туда МОЛЧА.
+        """
+        doc = {"key": "srv-delivery-check.0903", "name": "shtab_task_srv-delivery-check.0903",
+               "body": GOOD_BODY}
+        self.assertEqual(sb.LANE_PC, sb.lane_of(doc)["lane"])
+        self.assertFalse(sb.lane_of(doc)["named"])
+
+    def test_an_unnamed_lane_is_PC_and_the_default_is_SAID_not_implied(self):
+        got = sb.read_lane(GOOD_BODY)
+        self.assertTrue(got["ok"])
+        self.assertFalse(got["named"])
+        self.assertEqual(sb.LANE_PC, got["lane"])
+        self.assertIn("не названа", got["why"])
+        self.assertIn("по умолчанию", sb.lane_words(got))
+
+    def test_a_named_lane_is_taken_in_all_its_spellings(self):
+        for word, lane in (("пк", sb.LANE_PC), ("PC", sb.LANE_PC), ("ПК", sb.LANE_PC),
+                           ("сервер", sb.LANE_VPS), ("VPS", sb.LANE_VPS),
+                           ("vps", sb.LANE_VPS), ("Server", sb.LANE_VPS)):
+            got = sb.read_lane(_lane_body(word))
+            self.assertTrue(got["ok"], word)
+            self.assertTrue(got["named"], word)
+            self.assertEqual(lane, got["lane"], word)
+
+    def test_the_tolerances_are_the_measured_ones_and_not_wishful(self):
+        """Маркер списка, знак «=», хвостовая точка и регистр слова ПОЛОСА.
+
+        Каждая мелочь куплена НЕСИММЕТРИЧНОЙ ценой ошибки: непонятая строка = МОЛЧА
+        на ПК, лишняя терпимость = громкий отказ. Штаб пишет списками (живой блок
+        запретов — четыре пункта с «•»), поэтому «• ПОЛОСА: сервер» обязано читаться.
+        """
+        for line in ("• ПОЛОСА: сервер", "- полоса: сервер", "  ПОЛОСА = сервер",
+                     "ПОЛОСА: сервер.", "Полоса: СЕРВЕР"):
+            got = sb.read_lane(GOOD_BODY + "\n" + line)
+            self.assertEqual(sb.LANE_VPS, got["lane"], line)
+
+    def test_an_UNKNOWN_lane_name_refuses_the_task_ENTIRELY(self):
+        """Требование задания дословно: неизвестная полоса — задание НЕ БЕРЁТСЯ вовсе."""
+        got = sb.read_lane(_lane_body("марс"))
+        self.assertFalse(got["ok"])
+        self.assertIn("НЕИЗВЕСТНО", got["why"])
+        ok, reason, why = sb.check({"key": "kk1", "body": _lane_body("марс")})
+        self.assertFalse(ok)
+        self.assertEqual("bad_lane", reason)
+        self.assertIn("марс", why)
+        self.assertIn(sb.LANE_FORM, why)
+
+    def test_a_LONG_lane_line_is_refused_LOUDLY_and_not_defaulted_SILENTLY(self):
+        """Мина захвата: короткий захват сделал бы длинную строку НЕСОВПАВШЕЙ,
+        то есть явное указание Штаба ушло бы в дефолт молча."""
+        got = sb.read_lane(_lane_body("сервер, потому что доставка живёт именно там"))
+        self.assertFalse(got["ok"])
+        self.assertTrue(got["named"])
+
+    def test_two_DIFFERENT_lane_lines_refuse_both_the_citation_trap(self):
+        """Канон запрещает цитировать форму маркера в прозе — здесь тот же класс.
+
+        «Первое побеждает» дало бы ТИХИЙ промах на задании ПРО полосы (вроде этого):
+        поехали бы по цитате. Несогласие двух имён даёт громкий отказ.
+        """
+        body = _lane_body("сервер") + "\nПОЛОСА: пк"
+        got = sb.read_lane(body)
+        self.assertFalse(got["ok"])
+        self.assertIn("цитировать", got["why"])
+        # А ДВА ОДИНАКОВЫХ указания — не противоречие: цитата, совпавшая с делом,
+        # ничего не ломает, и отказывать на ней значило бы штрафовать за повтор.
+        self.assertTrue(sb.read_lane(_lane_body("сервер") + "\nПОЛОСА: vps")["ok"])
+
+    def test_the_row_text_names_the_lane_and_WHO_chose_it(self):
+        named = sb.task_text({"key": "kk1", "name": "shtab_task_kk1", "id": "f1",
+                              "body": _lane_body("сервер")}, TODAY)
+        self.assertIn("VPS", named)
+        self.assertIn("названа заданием", named)
+        default = sb.task_text({"key": "kk1", "name": "shtab_task_kk1", "id": "f1",
+                                "body": GOOD_BODY}, TODAY)
+        self.assertIn("по умолчанию", default)
+        # МАРКЕР ПЕРВОЙ СТРОКИ НЕ ТРОНУТ НИ СИМВОЛОМ: его читают дедуп, суточный счёт
+        # и сводка контура. Смени мы его — вчерашние задания взялись бы заново, молча.
+        for text in (named, default):
+            self.assertTrue(sb.MARK_RE.match(text.splitlines()[0]))
+
+
+class TestLaneRoute(unittest.TestCase):
+    """МАРШРУТ: куда именно уезжает ряд и что при этом видно в логе."""
+
+    def test_an_unnamed_lane_goes_to_PC_and_it_is_VISIBLE_IN_THE_LOG(self):
+        q = FakeQueue()
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True)
+        self.assertEqual([sb.LANE_PC], q.lanes)
+        self.assertEqual(1, len(rep["placed"]))
+        self.assertEqual(sb.LANE_PC, rep["placed"][0]["lane"])
+        # ТРИ МЕСТА, ГДЕ ДЕФОЛТ ОБЯЗАН ПРОЗВУЧАТЬ СЛОВАМИ, а не подразумеваться:
+        # строка-индекс журнала, строка исхода оборота и отчёт.
+        line = sb.index_line(rep["build"]["docs"][0], rep["placed"][0]["id"], TODAY)
+        self.assertIn("по умолчанию", line)
+        self.assertIn("по умолчанию", run._line(rep))
+        self.assertIn("ПК", rep["why"])
+
+    def test_a_NAMED_vps_lane_really_goes_to_the_other_lane(self):
+        """Положительный контроль к дефолту: без него правило «всё на ПК» проходит
+        отрицательные проверки идеально и стои́т ноль."""
+        q = FakeQueue()
+        rep = _tick(_box(("kk1", _lane_body("сервер"))), queue=q, place=True)
+        self.assertEqual([sb.LANE_VPS], q.lanes)
+        self.assertEqual(sb.LANE_VPS, rep["placed"][0]["lane"])
+        self.assertIn("названа заданием", run._line(rep))
+
+    def test_an_unknown_lane_is_NOT_PLACED_ANYWHERE_and_says_why(self):
+        q = FakeQueue()
+        rep = _tick(_box(("kk1", _lane_body("марс"))), queue=q, place=True)
+        self.assertEqual([], rep["placed"])
+        self.assertEqual([], q.tasks)
+        self.assertEqual([], q.lanes)
+        why = " ".join(w for _k, w in rep["held"])
+        self.assertIn("bad_lane", why)
+        self.assertIn("марс", why)
+
+    def test_the_PC_road_still_goes_through_the_daemons_own_placer(self):
+        """Дорога полосы ПК не тронута: она идёт прежним постановщиком демона (у
+        которого lane зашит) и его строкой в логе, а не сырым экшеном моста."""
+        d = FakeDaemon()
+        ok, tid, err = run.Queue(daemon=d).place_task("текст", lane=sb.LANE_PC)
+        self.assertTrue(ok, err)
+        self.assertEqual(1, len(d.pc_calls))
+        self.assertEqual(run.FROM, d.pc_calls[0][0])
+        self.assertEqual(sb.LANE_PC, d.bc.placed[0]["lane"])
+
+    def test_the_foreign_lane_goes_by_the_bridge_action_with_the_lane_named(self):
+        d = FakeDaemon()
+        ok, tid, err = run.Queue(daemon=d).place_task("текст", lane=sb.LANE_VPS)
+        self.assertTrue(ok, err)
+        self.assertEqual([], d.pc_calls, "чужая полоса не смеет ехать дорогой полосы ПК")
+        self.assertEqual(sb.LANE_VPS, d.bc.placed[0]["lane"])
+        self.assertEqual(run.FROM, d.bc.placed[0]["from"])
+
+    def test_a_lane_OUTSIDE_the_set_is_refused_by_the_hands_themselves(self):
+        """Замок на случай опечатки вызывающего: полосы, которой нет, ряд не достаётся."""
+        d = FakeDaemon()
+        ok, tid, why = run.Queue(daemon=d).place_task("текст", lane="марс")
+        self.assertFalse(ok)
+        self.assertIsNone(tid)
+        self.assertEqual([], d.bc.placed)
+        self.assertIn("не из набора", why)
+
+
+class TestLaneCeilings(unittest.TestCase):
+    """ПОТОЛКИ РАЗДЕЛЬНЫЕ — и это проверяется, а не обещается."""
+
+    def _vps_row(self, key, day=TODAY):
+        row = _row(key, day)
+        row["lane"] = sb.LANE_VPS
+        return row
+
+    def test_a_VPS_task_does_NOT_eat_the_PC_ceiling(self):
+        """Прямое требование задания. Три ЧУЖИХ постановки за сегодня не смеют
+        закрыть день полосе ПК: она на них не потратила ни одного оборота."""
+        closed = [self._vps_row("v%02d" % i) for i in range(sb.DAILY_BUDGET)]
+        q = FakeQueue(closed=closed)
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True, budget=sb.DAILY_BUDGET)
+        self.assertEqual(1, len(rep["placed"]), rep["held"])
+        self.assertEqual(sb.LANE_PC, rep["placed"][0]["lane"])
+
+    def test_and_the_PC_ceiling_still_stops_the_PC_lane_positive_control(self):
+        """Контроль к предыдущему: те же три ряда СВОЕЙ полосы день закрывают."""
+        closed = [_row("p%02d" % i) for i in range(sb.DAILY_BUDGET)]
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=FakeQueue(closed=closed), place=True,
+                    budget=sb.DAILY_BUDGET)
+        self.assertEqual([], rep["placed"])
+        self.assertIn("суточный потолок исчерпан",
+                      " ".join(w for _k, w in rep["held"]))
+
+    def test_the_vps_ceiling_stops_the_vps_lane_by_its_OWN_count(self):
+        closed = [self._vps_row("v%02d" % i) for i in range(sb.DAILY_BUDGET)]
+        rep = _tick(_box(("kk1", _lane_body("сервер"))), queue=FakeQueue(closed=closed),
+                    place=True, budget=sb.DAILY_BUDGET)
+        self.assertEqual([], rep["placed"])
+        self.assertIn("на полосу VPS", " ".join(w for _k, w in rep["held"]))
+
+    def test_the_TICK_limit_stays_COMMON_to_both_lanes(self):
+        """Замок «не больше одной за виток» маршрутом НЕ ослаблен: две полосы не
+        дают права поставить две задачи за оборот."""
+        rep = _tick(_box(("aa1", GOOD_BODY), ("bb1", _lane_body("сервер"))),
+                    queue=FakeQueue(), place=True)
+        self.assertEqual(1, len(rep["placed"]))
+        self.assertIn("не больше 1 за виток", " ".join(w for _k, w in rep["held"]))
+
+
+class TestLaneDedup(unittest.TestCase):
+    """ГЛАВНАЯ МИНА МАРШРУТА: дедуп обязан видеть ОБЕ полосы."""
+
+    def test_a_task_taken_on_the_VPS_lane_is_NEVER_taken_again(self):
+        """Без этого ящик ставил бы одно и то же задание КАЖДЫЙ ВИТОК — молча.
+
+        Наследованное чтение очереди спрашивало только свою полосу. Ряд уехал на
+        чужую → маркер невидим → и дедуп, и суточный потолок (они считают ОДНИ И ТЕ
+        ЖЕ маркеры) промахнулись бы разом. Ровно класс 539, давший на полосе VPS
+        четыре дубля за трое суток.
+        """
+        row = _row("kk1")
+        row["lane"] = sb.LANE_VPS
+        q = FakeQueue(closed=[row])
+        rep = _tick(_box(("kk1", _lane_body("сервер"))), queue=q, place=True)
+        self.assertEqual([], rep["placed"])
+        self.assertEqual([], q.tasks)
+        self.assertIn("уже брали", " ".join(w for _k, w in rep["held"]))
+
+    def _end_to_end(self, bridge, docs):
+        """Оборот НА НАСТОЯЩЕЙ очереди, с заглушкой на границе МОСТА, а не выше её.
+
+        Это не педантизм: мина маршрута жила ИМЕННО в чтении очереди
+        (наследованный `rows` спрашивал одну полосу), и проверка на очереди-заглушке
+        зеленела бы у обоих кодов — и у чинёного, и у дырявого. Заглушку опускаем до
+        клиента моста, чтобы в проверку попал сам вопрос «а какую полосу спросили».
+        """
+        files, bodies = _files(docs)
+        return run.tick(root=tempfile.mkdtemp(prefix="shtablane_"), place=True,
+                        queue=run.Queue(daemon=FakeDaemon(bridge)),
+                        lister=_lister(files), doc_reader=_doc_reader(bodies),
+                        reader=_reader(HEAD_TEXT),
+                        ledger=lambda root: ({}, True, ""),
+                        clock=lambda tz: __import__("datetime").datetime(2026, 9, 2, 12, 0,
+                                                                         tzinfo=tz))
+
+    def test_END_TO_END_the_vps_marker_is_seen_through_the_real_queue(self):
+        """Тот же дедуп, но через НАСТОЯЩЕЕ чтение очереди. Спрашивай ящик одну
+        полосу — маркер был бы невидим, и задание уехало бы ВТОРОЙ раз."""
+        row = dict(_row("kk1"), lane=sb.LANE_VPS, status="done")
+        bridge = FakeBridge({"done": [row]})
+        rep = self._end_to_end(bridge, _box(("kk1", _lane_body("сервер"))))
+        self.assertEqual([], rep["placed"], rep["why"])
+        self.assertEqual([], bridge.placed)
+        self.assertIn("уже брали", " ".join(w for _k, w in rep["held"]))
+
+    def test_END_TO_END_positive_control_the_same_task_without_the_marker_goes(self):
+        """Без положительного контроля предыдущий тест проходит и у ящика, который
+        не ставит НИЧЕГО НИКОГДА."""
+        bridge = FakeBridge({})
+        rep = self._end_to_end(bridge, _box(("kk1", _lane_body("сервер"))))
+        self.assertEqual(1, len(rep["placed"]), rep["why"])
+        self.assertEqual(sb.LANE_VPS, bridge.placed[0]["lane"])
+        self.assertIn(sb.HEAD_WORDS, bridge.placed[0]["text"])
+
+    def test_the_queue_is_asked_for_BOTH_lanes_in_ONE_call_per_status(self):
+        """Один вызов на статус, а не два: цена витка не смеет удвоиться там, где
+        задание просит его учащать. `lane='all'` проверен живой пробой 03.09."""
+        d = FakeDaemon()
+        rows, ok, why = run.Queue(daemon=d).rows(("new", "done"))
+        self.assertTrue(ok, why)
+        self.assertEqual([("new", run.LANE_ALL), ("done", run.LANE_ALL)], d.bc.asked)
+
+    def test_rows_carry_their_OWN_lane_and_the_empty_field_reads_as_PC(self):
+        """Пустое поле = ПК — то же правило, что у ступеней B и E. Третий исход
+        здесь завёл бы второе мнение о том, чей это ряд."""
+        d = FakeDaemon(FakeBridge({"new": [{"id": 1}, {"id": 2, "lane": "vps"}]}))
+        rows, ok, _why = run.Queue(daemon=d).rows(("new",))
+        self.assertEqual([sb.LANE_PC, sb.LANE_VPS], [r["lane"] for r in rows])
+        split = sb.rows_by_lane(rows)
+        self.assertEqual([1], [r["id"] for r in split[sb.LANE_PC]])
+        self.assertEqual([2], [r["id"] for r in split[sb.LANE_VPS]])
+
+    def test_the_owner_lock_still_judges_ONLY_our_own_lane(self):
+        """Правило зеркала: посылку меряют ЗДЕСЬ. Карточка владельца на сервере не
+        смеет глушить ящик полосы ПК — этого никто не мерил и никто не заказывал."""
+        foreign = {"id": 77, "from": "Filipp-328-dev", "status": "new", "lane": sb.LANE_VPS,
+                   "task_text": "чужая работа владельца"}
+        d = FakeDaemon(FakeBridge({"new": [foreign]}))
+        q = run.Queue(daemon=d)
+        rows, _ok, _why = q.rows(("new",))
+        busy, ids = q.owner_busy(sb.rows_by_lane(rows)[sb.LANE_PC])
+        self.assertFalse(busy)
+        self.assertEqual([], ids)
+        # Положительный контроль: тот же ряд СВОЕЙ полосы замок видит.
+        own = dict(foreign, lane=sb.LANE_PC)
+        busy2, ids2 = q.owner_busy([own])
+        self.assertTrue(busy2)
+        self.assertEqual([77], ids2)
+
+
+class TestLaneCost(unittest.TestCase):
+    """ЦЕНА ВЗГЛЯДА: перечисление за виток РОВНО ОДНО, и пауза названа числом."""
+
+    def test_exactly_ONE_folder_listing_per_tick(self):
+        """Прямой запрет задания. Перечисление — самый дешёвый из вызовов витка
+        (2.42–2.66 с замером 03.09), но второе означало бы, что источник читается
+        дважды и может разойтись сам с собой внутри одного оборота."""
+        files, bodies = _files(_box(("kk1", GOOD_BODY)))
+        lister = _lister(files)
+        _tick(_box(("kk1", GOOD_BODY)), lister=lister, doc_reader=_doc_reader(bodies),
+              queue=FakeQueue(), place=True)
+        self.assertEqual(1, len(lister.seen), "перечислений за виток больше одного")
+
+    def test_the_pause_is_measured_and_not_inherited(self):
+        """1800 с были СПИСАНЫ со ступени E, а не измерены для ящика. Новое число
+        обосновано ценой взгляда (19.6 и 33.7 с живым замером) и худшим
+        застрявшим вызовом моста (84.3 с из 18 вызовов двух проб 03.09)."""
+        import pc_orchestrator as o
+
+        self.assertEqual(600.0, o.SHTAB_BOX_MIN_SEC)
+        # Запас к худшему ИЗМЕРЕННОМУ взгляду — не меньше семикратного: виток ящика
+        # синхронен внутри poll_once, и его пауза судится О2.
+        self.assertGreaterEqual(o.SHTAB_BOX_MIN_SEC / 84.3, 7.0)
+
+    def test_an_unreachable_listing_places_nothing_on_EITHER_lane(self):
+        """Отрицательный тест задания, проверенный ЗАНОВО на двух полосах: не зная
+        источника, ящик не ставит ничего и никуда — и очередь даже не спрашивает."""
+        q = FakeQueue()
+        rep = _tick(_box(("kk1", _lane_body("сервер"))),
+                    lister=_lister([], ok=False, why="мост не ответил"), queue=q, place=True)
+        self.assertEqual([], rep["placed"])
+        self.assertEqual([], q.tasks)
+        self.assertEqual([], q.lanes)
+        self.assertEqual([], q.asked)
+        self.assertIn("НЕИЗВЕСТНО", rep["why"])
+        self.assertNotIn("пуст", rep["why"])
 
 
 if __name__ == "__main__":            # pragma: no cover
