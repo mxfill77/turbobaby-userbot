@@ -46,7 +46,8 @@ import done_judge_pc as dj
 import shtab_box as sb
 import shtab_box_run as run
 import shtab_box_signals as sig
-from test_shtab_box import FakeQueue, GOOD_BODY, TODAY, _node, _reader
+from test_shtab_box import (FakeQueue, GOOD_BODY, HEAD_TEXT, TODAY, _box, _doc_reader,
+                            _files, _lister, _node, _reader, _ready)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KEY = "signal-probe-0902"
@@ -79,13 +80,26 @@ def _ledger(*pairs):
     return lambda root: (rows, True, "")
 
 
+def _folder(docs=None):
+    """Заглушки источника: (перечислитель папки, читатель тел). Кандидат — :data:`KEY`."""
+    files, bodies = _files(docs if docs is not None else _box((KEY, GOOD_BODY)))
+    return _lister(files), _doc_reader(bodies)
+
+
 def _tick(node_text=None, closed=(), rows=(), ledger=None, place=False, budget=50,
-          queue=None, **kw):
-    """Оборот ящика на заглушках, с ЖИВЫМ кандидатом в узле.
+          queue=None, docs=None, **kw):
+    """Оборот ящика на заглушках, с ЖИВЫМ кандидатом В ПАПКЕ.
 
     Кандидат нужен по построению: закрытые ряды (а с ними и сигналы) ящик
-    спрашивает ТОЛЬКО при принятом блоке — иначе платил бы 27 с витка за пустой
+    спрашивает ТОЛЬКО при живом задании — иначе платил бы 27 с витка за пустой
     ящик. Набор обязан повторять живой порядок, а не удобный.
+
+    ПЕРЕЕЗД 03.09.2026 РАЗВЁЛ ДВА ИСТОЧНИКА, и здесь это видно лучше всего:
+    ЗАДАНИЯ приезжают из ПАПКИ (``docs``), а МЕТКИ СНЯТИЯ сигналов — по-прежнему из
+    ШАПКИ (``node_text``). Шапка задач больше не несёт, поэтому по умолчанию она
+    пуста: положи мы в неё блок «для живости», ящик честно доложил бы о закрытой
+    двери, и половина проверок сигналов зеленела бы рядом с предупреждением о
+    задании, которое никто не возьмёт.
 
     ПОТОЛОК ПОДНЯТ НАМЕРЕННО (``budget=50``): закрытые ряды набора несут маркер
     ящика и потому ТРАТЯТ суточный потолок. Оставь мы боевые три — половина
@@ -95,10 +109,12 @@ def _tick(node_text=None, closed=(), rows=(), ledger=None, place=False, budget=5
     import datetime
     import tempfile
 
-    text = node_text if node_text is not None else _node((KEY, GOOD_BODY))
+    text = node_text if node_text is not None else HEAD_TEXT
+    lister, doc_reader = _folder(docs)
     q = queue if queue is not None else FakeQueue(rows=list(rows), closed=list(closed))
     return run.tick(root=tempfile.mkdtemp(prefix="shtabsig_"), place=place, queue=q,
                     budget=budget, reader=_reader(text),
+                    lister=kw.pop("lister", lister), doc_reader=kw.pop("doc_reader", doc_reader),
                     ledger=ledger or (lambda root: ({}, True, "")),
                     clock=lambda tz: datetime.datetime(2026, 9, 2, 12, 0, tzinfo=tz), **kw)
 
@@ -335,7 +351,7 @@ class TestNegative(unittest.TestCase):
     def test_signal_a_released_by_the_owner_word_lets_the_box_take(self):
         """СИГНАЛ СНЯТ → БЕРЁМ. Метка приходит из узла, кода никто не правил."""
         mark = sig.mark_of(sig.SIG_A, "11|12")
-        node = _node((KEY, GOOD_BODY)) + "\n" + (sig.RELEASE_FORM % mark) + "\n"
+        node = HEAD_TEXT + (sig.RELEASE_FORM % mark) + "\n"
         rep = _tick(node_text=node,
                     closed=[_closed(11, "failed", "[причина=exec_error · ошибка]"),
                             _closed(12, "failed", "[причина=run_timeout · таймаут]")],
@@ -348,7 +364,7 @@ class TestNegative(unittest.TestCase):
 
     def test_a_foreign_mark_does_not_release_this_case(self):
         """Метка ИМЕННАЯ: чужая строка снятия остановку не трогает."""
-        node = _node((KEY, GOOD_BODY)) + "\n" + (
+        node = HEAD_TEXT + (
             sig.RELEASE_FORM % sig.mark_of(sig.SIG_A, "77|78")) + "\n"
         rep = _tick(node_text=node,
                     closed=[_closed(11, "failed", "[причина=exec_error · ошибка]"),
@@ -411,7 +427,7 @@ class TestNegative(unittest.TestCase):
         same = "[причина=exec_error · ошибка выполнения]"
         cls, _how = sig.reason_class(same)
         mark = sig.mark_of(sig.SIG_B, "%s|%s" % (TODAY, cls))
-        node = _node((KEY, GOOD_BODY)) + "\n" + (sig.RELEASE_FORM % mark) + "\n"
+        node = HEAD_TEXT + (sig.RELEASE_FORM % mark) + "\n"
         rep = _tick(node_text=node,
                     closed=[_closed(21, "failed", same), _closed(22, "failed", same),
                             _closed(23, "failed", same)], place=True)
@@ -485,7 +501,7 @@ class TestNegative(unittest.TestCase):
     def test_undeterminate_signal_is_released_by_the_owner_word_too(self):
         """Иначе молчащий прибор держал бы ящик до правки кода — а её условие запрещает."""
         mark = sig.mark_of(sig.SIG_A, "неизвестно|реестр|%s" % TODAY)
-        node = _node((KEY, GOOD_BODY)) + "\n" + (sig.RELEASE_FORM % mark) + "\n"
+        node = HEAD_TEXT + (sig.RELEASE_FORM % mark) + "\n"
         rep = _tick(node_text=node,
                     closed=[_closed(41, "done", "сдано"), _closed(42, "done", "сдано")],
                     ledger=lambda root: ({}, False, "файл реестра битый"), place=True)
@@ -498,7 +514,7 @@ class TestNegative(unittest.TestCase):
 
         queue = FakeQueue(rows=[], closed=[], closed_ok=False)
         rep = run.tick(root=tempfile.mkdtemp(prefix="shtabsig_"), place=True, queue=queue,
-                       reader=_reader(_node((KEY, GOOD_BODY))),
+                       reader=_reader(HEAD_TEXT), lister=_folder()[0], doc_reader=_folder()[1],
                        ledger=lambda root: ({}, True, ""),
                        clock=lambda tz: datetime.datetime(2026, 9, 2, 12, 0, tzinfo=tz))
         self.assertEqual([], rep["placed"])
@@ -545,7 +561,7 @@ class TestVisible(unittest.TestCase):
 
         data = run.build(tempfile.mkdtemp(prefix="shtabsig_"),
                          queue=FakeQueue(rows=[], closed=[_closed(11, "failed", "x")]),
-                         reader=_reader(_node((KEY, GOOD_BODY))),
+                         reader=_reader(HEAD_TEXT), lister=_folder()[0], doc_reader=_folder()[1],
                          ledger=lambda root: ({}, True, ""),
                          clock=lambda tz: datetime.datetime(2026, 9, 2, 12, 0, tzinfo=tz))
         data.pop("queue", None)
@@ -572,18 +588,18 @@ class TestNotWeakened(unittest.TestCase):
     """Сигналы добавлены СВЕРХ замков, а не вместо них."""
 
     def test_empty_stop_words_keep_select_exactly_as_before(self):
-        blocks, _bad = sb.parse_node(_node((KEY, GOOD_BODY)))
-        base = sb.select(blocks, today=TODAY, marks_ok=True, node_ok=True)
-        same = sb.select(blocks, today=TODAY, marks_ok=True, node_ok=True, stop_words="")
+        blocks = _ready((KEY, GOOD_BODY))
+        base = sb.select(blocks, today=TODAY, marks_ok=True, source_ok=True)
+        same = sb.select(blocks, today=TODAY, marks_ok=True, source_ok=True, stop_words="")
         self.assertEqual(base, same)
         self.assertEqual(1, len(base[0]))
 
     def test_stop_words_can_only_refuse_never_permit(self):
         """Фраза остановки не открывает НИ ОДНОГО прежнего замка."""
-        blocks, _bad = sb.parse_node(_node((KEY, GOOD_BODY)))
-        for kw in ({"node_ok": False}, {"owner_busy": True}, {"marks_ok": False},
+        blocks = _ready((KEY, GOOD_BODY))
+        for kw in ({"source_ok": False}, {"owner_busy": True}, {"marks_ok": False},
                    {"budget": 0}, {"limit": 0}):
-            args = dict(today=TODAY, marks_ok=True, node_ok=True)
+            args = dict(today=TODAY, marks_ok=True, source_ok=True)
             args.update(kw)
             take, _held = sb.select(blocks, stop_words="", **args)
             self.assertEqual([], take, kw)
@@ -591,7 +607,7 @@ class TestNotWeakened(unittest.TestCase):
             self.assertEqual([], take2, kw)
 
     def test_stop_reports_the_reason_for_every_block(self):
-        blocks, _bad = sb.parse_node(_node((KEY, GOOD_BODY), ("second-key-0902", GOOD_BODY)))
+        blocks = _ready((KEY, GOOD_BODY), ("second-key-0902", GOOD_BODY))
         take, held = sb.select(blocks, today=TODAY, stop_words="СТОП: проба")
         self.assertEqual([], take)
         self.assertEqual(2, len(held))
@@ -600,7 +616,7 @@ class TestNotWeakened(unittest.TestCase):
     def test_signals_do_not_touch_the_gates(self):
         """Ворота приёма ветка не трогала: блок без адреса как не брался, так и не берётся."""
         body = GOOD_BODY.replace("АДРЕС РЕЗУЛЬТАТА", "адрес где-то там")
-        rep = _tick(node_text=_node((KEY, body)), place=True)
+        rep = _tick(docs=_box((KEY, body)), place=True)
         self.assertEqual([], rep["placed"])
         self.assertTrue(any("no_address" in why for _k, why in rep["held"]), rep["held"])
 
@@ -613,7 +629,7 @@ class TestNotWeakened(unittest.TestCase):
         with io.open(os.path.join(root, run.STOP_FILE), "w", encoding="utf-8") as fh:
             fh.write("off")
         rep = run.tick(root=root, place=True, queue=FakeQueue(),
-                       reader=_reader(_node((KEY, GOOD_BODY))),
+                       reader=_reader(HEAD_TEXT), lister=_folder()[0], doc_reader=_folder()[1],
                        clock=lambda tz: datetime.datetime(2026, 9, 2, 12, 0, tzinfo=tz))
         self.assertTrue(rep["off"])
         self.assertEqual([], rep["placed"])

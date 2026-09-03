@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""shtab_box_run.py — РУКИ ящика заданий Штаба: узел мозга → ряд очереди полосы ПК.
+"""shtab_box_run.py — РУКИ ящика заданий Штаба: папка мозга → ряд очереди полосы ПК.
 
 Разделение то же, что у ступеней A/B/D/E и слоя ожиданий: всё, что РЕШАЕТ, живёт
 чистым :mod:`shtab_box`; здесь только ввод-вывод — мозг, очередь, диск, журнал.
@@ -7,13 +7,22 @@
     venv/Scripts/python.exe shtab_box_run.py --status   # что лежит в ящике и что мешает
     venv/Scripts/python.exe shtab_box_run.py --dry      # что УШЛО БЫ в очередь, дословно
     venv/Scripts/python.exe shtab_box_run.py --place    # боевая постановка
-    venv/Scripts/python.exe shtab_box_run.py --show KEY # дословный текст ряда по ключу блока
+    venv/Scripts/python.exe shtab_box_run.py --show KEY # дословный текст ряда по ключу задания
 
-ЧТЕНИЕ УЗЛА — ТОЛЬКО ЧЕРЕЗ ДОВЕРЕННОГО ПИСАТЕЛЯ (:mod:`brain_writer`), и только
-его функцией ЧТЕНИЯ. Причина не в вежливости: секреты моста берёт САМ процесс
-писателя, а скрипт, читающий конфигурацию ради похода в мозг, — красный канал по
-гарду (класс 328). Здесь нет ни одной ветки, которая смотрит в окружение за
-ключами: их не видит и не может увидеть этот файл.
+ИСТОЧНИК ЗАДАНИЙ С 03.09.2026 — ОТДЕЛЬНЫЕ ДОКУМЕНТЫ ПАПКИ МОЗГА с префиксом
+:data:`shtab_box.TASK_PREFIX` в имени. Раньше задание было блоком внутри узла
+:data:`shtab_box.NODE_NAME`; узел остаётся ЧЕЛОВЕЧЕСКОЙ ШАПКОЙ и держит метки
+снятия сигналов, а источником задач быть перестал — и об этом говорится вслух
+(:func:`shtab_box.old_door_line`), потому что молча закрытая дверь выглядит
+поломкой.
+
+ЧТЕНИЕ — ТОЛЬКО ЧЕРЕЗ ДОВЕРЕННОГО ПИСАТЕЛЯ (:mod:`brain_writer`), и только его
+функциями ЧТЕНИЯ: :func:`brain_writer.list_folder` (перечисление папки) и
+:func:`brain_writer.read_text` (тело документа по file id). Причина не в
+вежливости: секреты моста берёт САМ процесс писателя, а скрипт, читающий
+конфигурацию ради похода в мозг, — красный канал по гарду (класс 328). Здесь нет
+ни одной ветки, которая смотрит в окружение за ключами: их не видит и не может
+увидеть этот файл.
 
 ЧЕГО ЭТОТ МОДУЛЬ НЕ ДЕЛАЕТ НИ ОДНОЙ ВЕТКОЙ — и это держит тест
 ``SHTAB_BOX_READS_ONLY`` обходом AST, а не обещание здесь:
@@ -21,9 +30,12 @@
   • НЕ ПИШЕТ В МОЗГ. Ни ``append``, ни ``apply``, ни ``write_doc``, ни
     ``create_plain``. Ящик, в который полоса умеет писать, — это машина, ставящая
     себе задачи собственными словами; вся граница доверия ящика проходит по тому,
-    ЧЕЙ это узел, и запись с нашей стороны стирает её целиком.
-  • НЕ ЧИТАЕТ ЧУЖИХ УЗЛОВ. Имя ровно одно (:data:`shtab_box.NODE_NAME`), взято из
-    чистого модуля, литералом здесь не набрано.
+    ЧЬЯ это папка, и запись с нашей стороны стирает её целиком. Переезд 03.09
+    границу не двинул: папка та же, писатель тот же, инвариант тот же.
+  • НЕ ХОДИТ ЗА ПРЕДЕЛЫ ПАПКИ. Признак задания ровно один
+    (:data:`shtab_box.TASK_PREFIX`), имя шапки ровно одно
+    (:data:`shtab_box.NODE_NAME`); оба взяты из чистого модуля, литералом здесь не
+    набраны.
   • НЕ ПРАВИТ ГАРДА, КАРТОЧЕК И ВОРОТ. Ящик добавляет ИСТОЧНИК задач, а не право
     их исполнять: взятый блок встаёт обычным зелёным рядом ``new`` и идёт тем же
     ``process_new``, что и задача, присланная владельцем руками.
@@ -179,6 +191,84 @@ def read_node(name=None, reader=None):
     return text, True, ""
 
 
+def read_folder(prefix=None, lister=None):
+    """Дети папки мозга с префиксом заданий → (файлы, ok, причина).
+
+    ИСТОЧНИК ЗАДАНИЙ С 03.09.2026. Отбор передаётся мосту (он умеет отбирать сам и
+    экономит нам список из полусотни имён), но РЕШАЕТ, что считать заданием,
+    :func:`shtab_box.parse_folder` — здесь только доставка.
+
+    ═══ УСЕЧЕНИЕ = ОТКАЗ, А НЕ КОРОТКИЙ СПИСОК ═══════════════════════════════
+
+    Это главная ветка функции, и она не осторожничает, а лечит ИЗМЕРЕННЫЙ обман.
+    Мост перебирает детей папки в порядке Drive (произвольном), обрывается по
+    лимиту и сортирует по имени УЖЕ ОБРЕЗАННЫЙ кусок. Замер 03.09 на живой папке
+    из 49 файлов, ``limit=3``: вернулись ``KB_QUEUE_STATE``, ``KB_cowork_log``,
+    ``KB_queue_state_pc`` — отсортированные, выглядящие началом и началом НЕ
+    ЯВЛЯЮЩИЕСЯ (первые три по алфавиту начинаются с ``BACKUP…``).
+
+    Порядок разбора у нас назначен ПО ИМЕНИ, то есть «первым берём первый по
+    имени». На усечённом списке это правило дало бы уверенный и НЕВЕРНЫЙ ответ:
+    взяли бы «первый» из произвольного куска. Поэтому усечение — это ``ok=False``,
+    то есть НЕИЗВЕСТНО и ноль постановок, а не «взяли что видно».
+
+    Пустой список при ``ok=True`` — честный ноль (замер 03.09:
+    ``prefix='shtab_task_'`` → ``ok=True, count=0``), и это НЕ отказ.
+    """
+    pref = shtab_box.TASK_PREFIX if prefix is None else str(prefix)
+    if lister is None:
+        def lister(p):
+            import brain_writer
+
+            return brain_writer.list_folder(prefix=p)
+    try:
+        r = lister(pref)
+    except Exception as exc:                            # noqa: BLE001 — любой отказ = «неизвестно»
+        return [], False, ("перечисление папки мозга не удалось: %s: %s"
+                           % (type(exc).__name__, str(exc)[:180]))
+    if not isinstance(r, dict) or not r.get("ok"):
+        return [], False, ("перечисление папки мозга ответило НЕ ok: %s"
+                           % json.dumps(r, ensure_ascii=False, default=str)[:200])
+    files = r.get("files")
+    if not isinstance(files, list):
+        return [], False, "в ответе перечисления нет списка файлов — читать нечего"
+    if r.get("truncated"):
+        return [], False, ("перечисление УСЕЧЕНО (отдано %s из папки, упёрлись в потолок) — "
+                           "вернувшийся список не начало папки, а произвольный её кусок, "
+                           "отсортированный так, что выглядит началом; порядок разбора по нему "
+                           "дал бы уверенно неверный «первый»" % (r.get("count"),))
+    return files, True, ""
+
+
+def read_doc_text(doc_id, reader=None):
+    """Тело задания ПО file id → (текст, ok, причина).
+
+    ПО ID, А НЕ ПО ИМЕНИ, и выбора здесь нет: документ, созданный прямо в папке, в
+    реестре моста ключа не имеет, и на имя мост отвечает дословно «unknown_name …
+    в живом реестре такого ключа нет» (живая проба 03.09 на ``shtab_box_probe``).
+    Вторая дорога к такому документу не закрыта нами — её не существует.
+
+    Пустой текст доверенный писатель сам считает отказом чтения, а не пустым доком,
+    и это ровно то поведение, которое ящику нужно.
+    """
+    ident = str(doc_id or "").strip()
+    if not ident:
+        return "", False, "у документа нет file id — читать его нечем"
+    if reader is None:
+        def reader(fid):
+            import brain_writer
+
+            return brain_writer.read_text(doc_id=fid)
+    try:
+        text = reader(ident)
+    except Exception as exc:                            # noqa: BLE001 — любой отказ = «неизвестно»
+        return "", False, ("тело документа не прочитано (id %s): %s: %s"
+                           % (ident[:12], type(exc).__name__, str(exc)[:160]))
+    if not isinstance(text, str) or not text.strip():
+        return "", False, "документ (id %s) отдал пустой текст — считаем это отказом чтения" % ident[:12]
+    return text, True, ""
+
+
 # ───────────────────────────── очередь ─────────────────────────────
 
 
@@ -210,27 +300,45 @@ class Queue(recon_auto_run.Queue):
 
 
 def build(root=HERE, queue=None, clock=None, reader=None, node=None,
-          budget=shtab_box.DAILY_BUDGET, ledger=None):
+          budget=shtab_box.DAILY_BUDGET, ledger=None, lister=None, doc_reader=None,
+          prefix=None, read_max=shtab_box.READ_MAX):
     """Всё, что нужно для решения: ящик + очередь + маркеры. → dict.
 
     Ничего не ставит и никуда не пишет — этой же функцией живут ``--status`` и
     ``--dry``.
 
-    ПОРЯДОК ЧТЕНИЙ — ЭТО ПОРЯДОК ИХ ЦЕНЫ, и он выбран, а не случаен. Сначала
-    стоп-файл (стои́т диска), потом УЗЕЛ (одно чтение моста), потом открытые ряды,
-    и только при живом кандидате — ЗАКРЫТЫЕ. Замер полосы: ``get_pending("done")``
-    — 120 строк за **26.8 с** против 2.9 с у ``failed`` (`queue_snapshot_pc`,
-    14.08.2026), а виток демона исполняется синхронно. Пустой ящик — обычное
-    состояние (Штаб кладёт задание не каждые полчаса), и платить за него
-    полминуты витка полоса не станет: третье состояние названо честно и в отчёте
-    — «не спрашивали, потому что незачем», это НЕ отказ прибора и НЕ прочитанный
-    ноль.
+    ПОРЯДОК ЧТЕНИЙ — ЭТО ПОРЯДОК ИХ ЦЕНЫ, и он выбран, а не случаен:
+
+    1. **стоп-файл** — стои́т диска;
+    2. **ПЕРЕЧИСЛЕНИЕ ПАПКИ** — один вызов моста, отдаёт имена и file id всех
+       заданий разом. Пустой ящик закрывается ЗДЕСЬ, не тронув ни очереди, ни
+       единого тела;
+    3. **ШАПКА** :data:`shtab_box.NODE_NAME` — второе чтение моста, и оно
+       БЕЗУСЛОВНОЕ. Соблазн прочитать её только при живом кандидате велик и
+       неверен: шапка несёт метки снятия сигналов И блоки СТАРОЙ ФОРМЫ, а старый
+       блок опаснее всего ровно тогда, когда папка пуста — Штаб положил задание по
+       прежней памяти, и «ящик пуст» было бы про пустую папку правдой, а про
+       положенное задание враньём;
+    4. **открытые ряды** — замок владельца;
+    5. **закрытые ряды** — только при живом кандидате. Замер полосы:
+       ``get_pending("done")`` — 120 строк за **26.8 с** против 2.9 с у ``failed``
+       (`queue_snapshot_pc`, 14.08.2026), а виток демона исполняется синхронно;
+    6. **ТЕЛА ДОКУМЕНТОВ** — последними и не все. Тело стои́т отдельного похода в
+       мост, поэтому не читается у того, кого всё равно не возьмут: у снятого
+       Штабом и у уже взятого (ключ в маркерах). Оставшиеся читаются по порядку
+       имён, не больше :data:`shtab_box.READ_MAX` за виток, и КАЖДЫЙ непрочитанный
+       получает свою строку — тихого обрезания здесь нет.
+
+    Третье состояние названо честно везде: «не спрашивали, потому что незачем» —
+    это НЕ отказ прибора и НЕ прочитанный ноль.
     """
     stamp = now_iso(clock)
     today = review_intake.today_utc(stamp)
     out = {"schema": shtab_box.SCHEMA, "stamp": stamp, "today": today,
            "node": node or shtab_box.NODE_NAME, "node_ok": False, "node_why": "",
-           "blocks": [], "bad": [], "gates": {},
+           "prefix": shtab_box.TASK_PREFIX if prefix is None else str(prefix),
+           "folder_ok": False, "folder_why": "", "files": 0,
+           "docs": [], "bad": [], "gates": {}, "read": 0, "old_door": "",
            "off": False, "off_why": "",
            "queue_ok": False, "queue_asked": False, "queue_why": "",
            "owner_busy": None, "owner_rows": [],
@@ -245,19 +353,23 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
     if out["off"]:
         return out
 
-    text, node_ok, node_why = read_node(out["node"], reader=reader)
-    out["node_ok"], out["node_why"] = node_ok, node_why
-    if not node_ok:
+    files, folder_ok, folder_why = read_folder(out["prefix"], lister=lister)
+    out["folder_ok"], out["folder_why"], out["files"] = folder_ok, folder_why, len(files)
+    if not folder_ok:
         return out
 
-    blocks, bad = shtab_box.parse_node(text)
-    out["blocks"], out["bad"] = blocks, bad
-    # Ворота считаются ДЛЯ ВСЕХ блоков, а не только для взятого: владелец должен
-    # видеть в `--status`, почему лежащий в ящике блок не берётся, — иначе ящик
-    # выглядит сломанным ровно тогда, когда он честно отказывает.
-    for blk in blocks:
-        ok, reason, why = shtab_box.check(blk)
-        out["gates"][blk["key"]] = {"ok": ok, "reason": reason, "why": why}
+    docs, bad = shtab_box.parse_folder(files, prefix=out["prefix"])
+    out["docs"], out["bad"] = docs, bad
+
+    # ШАПКА: метки снятия сигналов + ДОКЛАД О ЗАКРЫТОЙ ДВЕРИ. Её отказ НЕ
+    # останавливает ящик — источником задач она быть перестала, а нечитаемые метки
+    # снятия дают ровно один эффект: снятый владельцем сигнал остаётся стоять. Это
+    # строже, а не слабее, и потому законно.
+    text, node_ok, node_why = read_node(out["node"], reader=reader)
+    out["node_ok"], out["node_why"] = node_ok, node_why
+    if node_ok:
+        stale, _stale_bad = shtab_box.parse_node(text)
+        out["old_door"] = shtab_box.old_door_line(len(stale))
 
     q = None if queue is False else (queue or Queue())
     live_rows, ok, qwhy = ([], False, "очередь не спрашивали")
@@ -270,13 +382,19 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
         out["owner_busy"], out["owner_rows"] = busy, ids
 
     closed_rows, closed_ok, closed_why = ([], False, "закрытые ряды не спрашивали")
-    fresh = [b for b in blocks if out["gates"].get(b["key"], {}).get("ok")]
+    # ЖИВОЙ КАНДИДАТ СЧИТАЕТСЯ ДО ЧТЕНИЯ ТЕЛ, и иначе быть не может: ворота судят
+    # тело, тело читается только у невзятых, а невзятые известны лишь из маркеров —
+    # то есть из того самого дорогого чтения, ради которого вопрос и задан. Круг
+    # разрывается ДЕШЁВЫМ признаком: кандидат — это документ, которого Штаб НЕ
+    # СНИМАЛ. Папка из одних снятых документов дорогого чтения не стои́т.
+    fresh = [d for d in docs if not d.get("revoked")]
     if q is None or not ok:
         closed_why = "очередь не прочитана — маркеров суток нет ни одного"
     elif out["owner_busy"]:
         closed_why = "в очереди работа владельца — дорогое чтение done не понадобилось"
     elif not fresh:
-        closed_why = "принятых блоков нет — дорогое чтение done не понадобилось"
+        closed_why = ("заданий, не снятых Штабом, в папке нет — дорогое чтение done "
+                      "не понадобилось")
     else:
         closed_rows, closed_ok, closed_why = q.rows(CLOSED_STATUSES)
         out["marks_asked"] = True
@@ -288,6 +406,39 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
         out["task_marks"] = shtab_box.markers(all_rows)
         if out["marks_ok"]:
             out["taken_today"] = shtab_box.taken_today(all_rows, today)
+
+    # ── ТЕЛА ДОКУМЕНТОВ ───────────────────────────────────────────────────────
+    # ПОСЛЕДНЕЕ ЧТЕНИЕ И САМОЕ ИЗБИРАТЕЛЬНОЕ: каждое тело — свой поход в мост.
+    # Не читаем у снятого (его не возьмут) и у уже взятого (маркер ключа стои́т в
+    # очереди). Порядок — тот, что назначен `parse_folder`, то есть по имени:
+    # потолок витка обязан отрезать ХВОСТ предсказуемого списка, а не случайных.
+    taken_keys = {k for _d, k in out["task_marks"]}
+    queue_ue = []
+    for doc in docs:
+        if doc.get("revoked"):
+            continue
+        if doc["key"] in taken_keys:
+            doc["taken"] = True
+            continue
+        queue_ue.append(doc)
+    cap = int(read_max) if read_max is not None else len(queue_ue)
+    for i, doc in enumerate(queue_ue):
+        if i >= cap:
+            doc["unread"] = ("тело в этот виток не читали: за виток читаем не больше %d "
+                             "документов, а ждут %d — дойдём следующим витком"
+                             % (cap, len(queue_ue)))
+            continue
+        body, body_ok, body_why = read_doc_text(doc["id"], reader=doc_reader)
+        if not body_ok:
+            doc["unread"] = body_why
+            continue
+        doc["body"] = body.strip()
+        out["read"] += 1
+        # Ворота считаются ДЛЯ ВСЕХ прочитанных, а не только для взятого: владелец
+        # должен видеть в `--status`, почему лежащее в ящике задание не берётся, —
+        # иначе ящик выглядит сломанным ровно тогда, когда он честно отказывает.
+        gate_ok, reason, why = shtab_box.check(doc)
+        out["gates"][doc["key"]] = {"ok": gate_ok, "reason": reason, "why": why}
 
     # ── СИГНАЛЬНАЯ ОСТАНОВКА ──────────────────────────────────────────────────
     # СЧИТАЕТСЯ РОВНО ТОГДА, КОГДА СПРАШИВАЛИ ЗАКРЫТЫЕ РЯДЫ, и это не экономия
@@ -308,7 +459,12 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
         out["signals_asked"] = True
         judged, judged_ok, judged_why = (ledger or read_ledger)(root)
         out["judged_ok"], out["judged_why"] = judged_ok, judged_why
-        out["released"] = sorted(sig.release_marks(text))
+        # МЕТКИ СНЯТИЯ ЖИВУТ В ШАПКЕ, а шапка с 03.09 читается отдельно и может не
+        # прочитаться. Нечитаемая шапка → меток НЕТ → снятый владельцем сигнал
+        # остаётся СТОЯТЬ. Направление отказа названо вслух: оно строже, а не
+        # слабее, и потому не требует третьего исхода — «не знаю, снят ли сигнал»
+        # и «сигнал не снят» ведут ящик к одному и тому же поступку.
+        out["released"] = sorted(sig.release_marks(text)) if node_ok else []
         left = shtab_box.budget_left(out["task_marks"], today, budget, out["marks_ok"])
         out["signals"] = sig.evaluate(
             closed=sig.box_rows(closed_rows), open_rows=live_rows, judged=judged,
@@ -326,23 +482,26 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
 
 def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
          budget=shtab_box.DAILY_BUDGET, write_journal=False, clock=None, queue=None,
-         journal_fn=None, reader=None, node=None, ledger=None):
+         journal_fn=None, reader=None, node=None, ledger=None, lister=None,
+         doc_reader=None, prefix=None, read_max=shtab_box.READ_MAX):
     """Один оборот ящика. → dict отчёта.
 
-    ``place=False`` — сухой ход: узел прочитан, блоки разобраны, ворота посчитаны,
-    текст ряда собран, ОЧЕРЕДЬ НЕ ТРОНУТА. Боевой ход отличается ровно одним
-    действием — постановкой ряда. Реестра на диске у ящика НЕТ И НЕ БУДЕТ: память
-    процесса и файл рядом с ним переживают ровно до первого self-update (их на
-    этой полосе десятки в день), а дедуп обязан пережить всё. Источник истины
-    один — ЖИВАЯ ОЧЕРЕДЬ.
+    ``place=False`` — сухой ход: папка перечислена, документы разобраны, тела
+    прочитаны, ворота посчитаны, текст ряда собран, ОЧЕРЕДЬ НЕ ТРОНУТА. Боевой ход
+    отличается ровно одним действием — постановкой ряда. Реестра на диске у ящика
+    НЕТ И НЕ БУДЕТ: память процесса и файл рядом с ним переживают ровно до первого
+    self-update (их на этой полосе десятки в день), а дедуп обязан пережить всё.
+    Источник истины один — ЖИВАЯ ОЧЕРЕДЬ.
     """
     data = build(root, queue=queue, clock=clock, reader=reader, node=node, budget=budget,
-                 ledger=ledger)
+                 ledger=ledger, lister=lister, doc_reader=doc_reader, prefix=prefix,
+                 read_max=read_max)
     today = data["today"]
     report = {"acted": False, "why": "", "today": today, "stamp": data["stamp"],
-              "node": data["node"], "blocks": len(data["blocks"]), "bad": data["bad"],
+              "node": data["node"], "docs": len(data["docs"]), "bad": data["bad"],
               "placed": [], "failed": [], "held": [], "texts": {},
               "off": data["off"], "node_ok": data["node_ok"],
+              "folder_ok": data["folder_ok"], "old_door": data["old_door"],
               "queue_ok": data["queue_ok"], "marks_ok": data["marks_ok"],
               "owner_busy": data["owner_busy"], "owner_rows": data["owner_rows"],
               "taken_today": data["taken_today"], "line": "",
@@ -357,16 +516,23 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
         return report
 
     take, held = shtab_box.select(
-        data["blocks"], task_marks=data["task_marks"], today=today, budget=budget,
+        data["docs"], task_marks=data["task_marks"], today=today, budget=budget,
         owner_busy=bool(data["owner_busy"]), limit=limit,
-        marks_ok=bool(data["marks_ok"]), node_ok=bool(data["node_ok"]),
+        marks_ok=bool(data["marks_ok"]), source_ok=bool(data["folder_ok"]),
         stop_words=data["stop"])
     report["held"] = [(k, why) for k, why in held]
-    # Отказы РАЗБОРА докладываются наравне с отказами ворот: битый блок, о котором
-    # не сказали, — это задание, молча пропавшее по дороге.
+    # Отказы РАЗБОРА докладываются наравне с отказами ворот: документ, о котором не
+    # сказали, — это задание, молча пропавшее по дороге. «Где именно» называется
+    # адресом того источника, из которого запись пришла: у документа папки это ИМЯ
+    # (строк у него нет), у блока старой формы — строка узла.
     for row in data["bad"]:
+        where = ("документ %s" % row["name"]) if row.get("name") else ("строка %s" % row.get("line"))
         report["held"].append((str(row.get("key") or "?"),
-                               "не разобран: %s (строка %s)" % (row.get("why"), row.get("line"))))
+                               "не разобран: %s (%s)" % (row.get("why"), where)))
+    # ЗАКРЫТАЯ ДВЕРЬ — ОТДЕЛЬНАЯ СТРОКА ОТЧЁТА, а не молчание: блок старой формы в
+    # шапке иначе выглядел бы для Штаба положенным заданием, которое «не берут».
+    if data["old_door"]:
+        report["held"].append(("", data["old_door"]))
 
     for blk, text in take:
         report["texts"][blk["key"]] = text
@@ -404,9 +570,12 @@ def _why(report, data):
     владелец обязан без чтения кода."""
     if data["off"]:
         return data["off_why"]
-    if not data["node_ok"]:
-        return ("узел-ящик не прочитан (%s) — что в нём лежит, НЕИЗВЕСТНО; не берём ничего"
-                % (data["node_why"] or "причина не названа"))
+    # ИСТОЧНИК — ПАПКА, И ЕГО МОЛЧАНИЕ ГОВОРИТ ПЕРВЫМ. Слово «пусто» на этой ветке
+    # прозвучать не может ни одной дорогой: перечисление не ответило (или ответило
+    # усечённым списком) — значит НЕИЗВЕСТНО, что лежит в ящике.
+    if not data["folder_ok"]:
+        return ("папка заданий не перечислена (%s) — что в ящике лежит, НЕИЗВЕСТНО; "
+                "не берём ничего" % (data["folder_why"] or "причина не названа"))
     if data["queue_asked"] and not data["queue_ok"]:
         return "очередь недоступна (%s) — не берём ничего" % (data["queue_why"] or "?")
     if data["owner_busy"]:
@@ -425,14 +594,19 @@ def _why(report, data):
         if data["marks_asked"] and not data["marks_ok"]:
             return "%s · %s" % (_marks_unread(data), data["stop"])
         return data["stop"]
-    if not data["blocks"]:
-        return ("ящик пуст: блоков в узле %s нет%s"
-                % (data["node"], (", не разобрано %d" % len(data["bad"])) if data["bad"] else ""))
+    if not data["docs"]:
+        # ПУСТАЯ ПАПКА И ЗАКРЫТАЯ ДВЕРЬ — РАЗНЫЕ НОВОСТИ. Скажи мы здесь «ящик
+        # пуст», Штаб, положивший блок в шапку по прежней памяти, прочитал бы
+        # честное сообщение как поломку — задание лежит, а полоса говорит «пусто».
+        empty = ("ящик пуст: документов %s* в папке мозга нет%s"
+                 % (data["prefix"],
+                    (", не разобрано %d" % len(data["bad"])) if data["bad"] else ""))
+        return "%s · %s" % (empty, data["old_door"]) if data["old_door"] else empty
     if report["placed"]:
         return "взято %d, отложено %d" % (len(report["placed"]), len(report["held"]))
     refused = [w for _k, w in report["held"] if w.startswith("НЕ ПРИНЯТ")]
     if refused and len(refused) == len(report["held"]):
-        return "блоков %d, принят 0 — %s" % (len(data["blocks"]), "; ".join(refused[:2]))
+        return "документов %d, принят 0 — %s" % (len(data["docs"]), "; ".join(refused[:2]))
     # ОТКАЗ ПРИБОРА — ТОЛЬКО ЕСЛИ ПРИБОР СПРАШИВАЛИ. Дорогое чтение `done` мы
     # пропускаем сознательно, когда ставить нечего, и это НЕ поломка моста: назови
     # мы её так, каждый оборот с непринятым блоком кричал бы «сверить нечем», и
@@ -441,7 +615,7 @@ def _why(report, data):
     # спрашивали, потому что незачем».
     if data["marks_asked"] and not data["marks_ok"]:
         return _marks_unread(data)
-    return "блоков %d, взято 0, отложено %d" % (len(data["blocks"]), len(report["held"]))
+    return "документов %d, взято 0, отложено %d" % (len(data["docs"]), len(report["held"]))
 
 
 def _marks_unread(data):
@@ -475,22 +649,37 @@ def _render(report=None, data=None):
     lines = []
     if data is not None:
         lines.append("день: %s (замер %s)" % (data["today"], data["stamp"]))
-        lines.append("узел: %s — %s" % (data["node"],
-                                        "прочитан" if data["node_ok"]
-                                        else "НЕ ПРОЧИТАН: %s" % data["node_why"]))
+        lines.append("источник: документы папки мозга %s* — %s"
+                     % (data["prefix"],
+                        "перечислено, детей с префиксом %d" % data["files"] if data["folder_ok"]
+                        else "НЕ ПЕРЕЧИСЛЕНА: %s" % data["folder_why"]))
+        lines.append("шапка: %s — %s" % (data["node"],
+                                         "прочитана" if data["node_ok"]
+                                         else "НЕ ПРОЧИТАНА: %s" % data["node_why"]))
+        if data["old_door"]:
+            lines.append("  ⚠ %s" % data["old_door"])
         if data["off"]:
             lines.append("СТОП-ФАЙЛ: %s" % data["off_why"])
-        lines.append("блоков в ящике: %d, не разобрано: %d"
-                     % (len(data["blocks"]), len(data["bad"])))
+        lines.append("заданий в ящике: %d, не разобрано: %d, тел прочитано: %d"
+                     % (len(data["docs"]), len(data["bad"]), data["read"]))
         for row in data["bad"]:
-            lines.append("  ✗ ключ=%s строка %s: %s"
-                         % (row.get("key"), row.get("line"), row.get("why")))
-        for blk in data["blocks"]:
-            gate = data["gates"].get(blk["key"], {})
-            lines.append("  • ключ=%s (строка %d, тело %d симв.) — %s"
-                         % (blk["key"], blk["line"], len(blk["body"]),
-                            "ворота пройдены" if gate.get("ok")
-                            else "НЕ ПРИНЯТ (%s): %s" % (gate.get("reason"), gate.get("why"))))
+            lines.append("  ✗ %s: %s"
+                         % (row.get("name") or ("ключ=%s" % row.get("key")), row.get("why")))
+        for doc in data["docs"]:
+            gate = data["gates"].get(doc["key"], {})
+            if doc.get("revoked"):
+                state = "ОТОЗВАНО ШТАБОМ (метка %s в имени)" % shtab_box.REVOKE_MARK
+            elif doc.get("taken"):
+                state = "уже брали — маркер ключа стои́т в очереди, тело не читали"
+            elif doc.get("unread"):
+                state = doc["unread"]
+            elif gate.get("ok"):
+                state = "ворота пройдены (тело %d симв.)" % len(doc.get("body") or "")
+            elif gate:
+                state = "НЕ ПРИНЯТО (%s): %s" % (gate.get("reason"), gate.get("why"))
+            else:
+                state = "состояние не определялось"
+            lines.append("  • %s (ключ=%s) — %s" % (doc["name"], doc["key"], state))
         # ТРИ СОСТОЯНИЯ ОЧЕРЕДИ, А НЕ ДВА. «Не спрашивали» — это не «недоступна»:
         # ящик, не прочитавший узел, до очереди не доходит вовсе, и рапорт
         # «НЕДОСТУПНА» повесил бы на мост чужую вину. Та же поправка, что у
@@ -535,12 +724,13 @@ def _render(report=None, data=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Ящик заданий Штаба: узел мозга → задача полосы ПК (не более одной за виток).")
+        description="Ящик заданий Штаба: документы папки мозга → задача полосы ПК "
+                    "(не более одной за виток).")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--status", action="store_true", help="что лежит в ящике и что мешает")
     mode.add_argument("--dry", action="store_true", help="собрать всё, очередь НЕ трогать")
     mode.add_argument("--place", action="store_true", help="боевая постановка")
-    parser.add_argument("--show", default=None, help="дословный текст ряда по ключу блока")
+    parser.add_argument("--show", default=None, help="дословный текст ряда по ключу задания")
     parser.add_argument("--limit", type=int, default=shtab_box.TICK_LIMIT,
                         help="потолок заданий за виток")
     parser.add_argument("--budget", type=int, default=shtab_box.DAILY_BUDGET,
@@ -555,17 +745,22 @@ def main(argv=None):
         # поставить» упиралось бы в «ничего не выбрано» ровно тогда, когда ответ
         # важнее всего.
         data = build(HERE)
-        for blk in data["blocks"]:
-            if blk["key"] != args.show:
+        for doc in data["docs"]:
+            if doc["key"] != args.show:
                 continue
-            text = shtab_box.task_text(blk, data["today"])
+            text = shtab_box.task_text(doc, data["today"])
             if text:
                 print(text)
+            elif doc.get("revoked"):
+                print("ЗАДАНИЕ ОТОЗВАНО ШТАБОМ: документ %s" % doc["name"])
+            elif doc.get("unread"):
+                print("ТЕЛО НЕ ПРОЧИТАНО: %s" % doc["unread"])
             else:
-                gate = data["gates"].get(blk["key"], {})
-                print("БЛОК НЕ ПРИНЯТ (%s): %s" % (gate.get("reason"), gate.get("why")))
+                gate = data["gates"].get(doc["key"], {})
+                print("ЗАДАНИЕ НЕ ПРИНЯТО (%s): %s" % (gate.get("reason"), gate.get("why")))
             return 0
-        print("блока с ключом %s в ящике сейчас нет" % args.show)
+        print("задания с ключом %s в ящике сейчас нет (искали документ %s)"
+              % (args.show, shtab_box.doc_name(args.show)))
         return 0
     if args.status or not (args.dry or args.place):
         data = build(HERE, budget=args.budget)

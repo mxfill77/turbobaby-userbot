@@ -101,6 +101,90 @@ def _node(*pairs):
     return "\n".join(out)
 
 
+# ═══════════════════ ПАПКА-ЗАГЛУШКА (источник с 03.09.2026) ═══════════════════
+# Задание — ОТДЕЛЬНЫЙ ДОКУМЕНТ папки мозга, значит и заглушек теперь две: одна
+# перечисляет папку (имена + file id), вторая отдаёт тело по id. Разделены они не
+# для красоты — ровно так устроен живой канал, и слить их в одну значило бы
+# спрятать от набора обе развилки переезда: «перечисление молчит» и «тело не
+# читается» — РАЗНЫЕ отказы с разными исходами.
+
+# Шапка узла БЕЗ единого блока: с 03.09 источником задач она быть перестала.
+HEAD_TEXT = "═══ ЯЩИК ЗАДАНИЙ ШТАБА — полоса ПК ═══\nЗадания лежат отдельными документами папки.\n"
+
+
+def _box(*pairs):
+    """Задания → список пар для :func:`_tick`.
+
+    Пара — ``(ключ, тело)``; имя документа собирается каноном (:func:`sb.doc_name`).
+    Тройка ``(имя, тело, "raw")`` задаёт имя ДОСЛОВНО — ею живут проверки префикса,
+    отзыва и двойников, где имя и есть предмет.
+    """
+    return list(pairs)
+
+
+def _files(pairs):
+    """Пары → (дети папки, тела по file id). Форма ответа — живая (замер 03.09:
+    у файла ровно три поля — name, id, mime)."""
+    files, bodies = [], {}
+    for i, pair in enumerate(pairs or ()):
+        name = pair[0] if len(pair) > 2 else sb.doc_name(pair[0])
+        fid = "fid-%02d" % i
+        files.append({"name": name, "id": fid, "mime": "text/plain"})
+        bodies[fid] = pair[1]
+    return files, bodies
+
+
+def _ready(*pairs):
+    """Пары → документы, ГОТОВЫЕ К ОТБОРУ: ровно такими их отдают руки.
+
+    Чистый :func:`sb.parse_folder` тел не знает — тело стои́т отдельного похода в
+    мост, и приделывает его :func:`run.build`. Проверки чистого слоя обязаны
+    повторять ЖИВУЮ форму документа, а не удобную: собери мы их иначе, `select`
+    зеленел бы на структуре, которой в бою не бывает.
+    """
+    files, bodies = _files(pairs)
+    docs, _bad = sb.parse_folder(files)
+    for doc in docs:
+        doc["body"] = bodies[doc["id"]]
+    return docs
+
+
+def _lister(files, ok=True, truncated=False, why="мост не ответил", extra=()):
+    """Перечислитель папки-заглушка. Помнит, с каким префиксом его звали.
+
+    ``extra`` — ЧУЖИЕ дети папки (без нашего префикса): они обязаны приезжать в
+    ответе и обязаны отсеиваться нами, а не только мостом.
+    """
+    seen = []
+
+    def lst(prefix):
+        seen.append(prefix)
+        if not ok:
+            raise RuntimeError(why)
+        all_files = list(files) + [dict(f) for f in extra]
+        got = [f for f in all_files if str(f.get("name") or "").startswith(prefix or "")]
+        return {"ok": True, "folder_id": "F1", "count": len(got), "files": got,
+                "folders": [], "folders_count": 0, "prefix": prefix or None,
+                "scanned": len(all_files), "truncated": bool(truncated)}
+
+    lst.seen = seen
+    return lst
+
+
+def _doc_reader(bodies, dead=()):
+    """Читатель тела по file id. ``dead`` — id, на которых чтение падает."""
+    seen = []
+
+    def read(fid):
+        seen.append(fid)
+        if fid in dead:
+            raise RuntimeError("тело документа не отдалось")
+        return bodies.get(fid, "")
+
+    read.seen = seen
+    return read
+
+
 def _reader(text):
     """Чтение узла-заглушка: помнит, какое имя у него спросили."""
     seen = []
@@ -156,11 +240,19 @@ class FakeQueue(object):
         return True, self.next_id, ""
 
 
-def _tick(node_text=None, reader=None, queue=None, place=False, root=None, **kw):
-    """Оборот ящика на заглушках. Корень — ВСЕГДА временный каталог, если не назван."""
+def _tick(docs=None, reader=None, queue=None, place=False, root=None, node_text=None,
+          lister=None, doc_reader=None, extra=(), **kw):
+    """Оборот ящика на заглушках. Корень — ВСЕГДА временный каталог, если не назван.
+
+    ``docs`` — задания папки парами (см. :func:`_box`). ``lister``/``doc_reader``
+    подменяются целиком там, где предмет проверки — сам отказ чтения.
+    """
     root = root or tempfile.mkdtemp(prefix="shtabbox_")
+    files, bodies = _files(docs or ())
     return run.tick(root=root, place=place, queue=queue if queue is not None else FakeQueue(),
-                    reader=reader or _reader(node_text if node_text is not None else _node()),
+                    lister=lister if lister is not None else _lister(files, extra=extra),
+                    doc_reader=doc_reader if doc_reader is not None else _doc_reader(bodies),
+                    reader=reader or _reader(node_text if node_text is not None else HEAD_TEXT),
                     clock=lambda tz: __import__("datetime").datetime(2026, 9, 2, 12, 0, tzinfo=tz),
                     **kw)
 
@@ -226,6 +318,12 @@ class TestReadsOnly(unittest.TestCase):
 
     WRITERS = ("append", "apply", "write_doc", "create_plain", "unregister", "register")
 
+    # ДВЕРЕЙ ЧТЕНИЯ СТАЛО ДВЕ (переезд 03.09.2026), и обе названы ПОИМЁННО, а не
+    # «всё, что не в WRITERS». Белый список против чёрного здесь принципиален:
+    # чёрный пропустил бы любую новую функцию писателя, включая пишущую, — а
+    # именно эта ошибка стоила бы всего инварианта.
+    READERS = ("read_text", "list_folder")
+
     def test_no_brain_write_call_anywhere_in_the_box(self):
         for name in ("shtab_box.py", "shtab_box_run.py"):
             tree = ast.parse(_src(name))
@@ -239,8 +337,24 @@ class TestReadsOnly(unittest.TestCase):
                 if owner in ("brain_writer", "bw"):
                     self.assertNotIn(func.attr, self.WRITERS,
                                      "%s пишет в мозг: %s.%s" % (name, owner, func.attr))
-                    self.assertEqual(func.attr, "read_text",
-                                     "%s зовёт у писателя не чтение: %s" % (name, func.attr))
+                    self.assertIn(func.attr, self.READERS,
+                                  "%s зовёт у писателя не чтение: %s" % (name, func.attr))
+
+    def test_both_reading_doors_are_really_read_only_in_the_writer_itself(self):
+        """Белый список выше стои́т на утверждении «обе двери — чтение». Проверяем ЕГО.
+
+        `list_folder` заведена этим заходом, и написать её можно было по-разному.
+        Инвариант ящика опирается на то, что она НИЧЕГО НЕ МЕНЯЕТ: экшен моста у неё
+        один, GET-овый, и никакого POST-экшена в её теле нет.
+        """
+        tree = ast.parse(_src("brain_writer.py"))
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "list_folder")
+        body = ast.dump(fn)
+        self.assertIn("list_brain_folder", body, "дверь перестала звать перечисление")
+        for forbidden in ("_post", "write_doc", "register_brain_doc", "create_brain_plain",
+                          "move_into_brain"):
+            self.assertNotIn(forbidden, body, "перечисление папки завело запись: %s" % forbidden)
 
     def test_only_one_node_name_and_it_lives_in_the_pure_module(self):
         """Имя узла названо ОДИН раз, берётся из чистого модуля и стои́т В КАНОНЕ.
@@ -326,6 +440,258 @@ class TestParse(unittest.TestCase):
         ok, reason, _why = sb.check(blocks[0])
         self.assertFalse(ok)
         self.assertEqual(reason, "bad_key")
+
+
+# ═══════════════════════════ источник: папка ═══════════════════════════
+
+
+class TestFolderSource(unittest.TestCase):
+    """ПЕРЕЕЗД 03.09.2026: задание — документ папки, а не блок в узле.
+
+    Всё, что проверяется здесь, до 03.09 не существовало ни одной строкой — поэтому
+    ни один прежний зелёный тест об этом не говорит ничего.
+    """
+
+    # ── префикс ────────────────────────────────────────────────────────
+    def test_the_prefix_lives_in_exactly_one_place(self):
+        """Второй экземпляр префикса — второй ящик, который разъедется молча."""
+        self.assertEqual("shtab_task_", sb.TASK_PREFIX)
+        hands = _src("shtab_box_run.py")
+        self.assertNotIn('"%s"' % sb.TASK_PREFIX, hands, "префикс набран в руках литералом")
+        self.assertIn("shtab_box.TASK_PREFIX", hands, "руки обязаны брать префикс у чистого модуля")
+
+    def test_the_prefix_does_not_swallow_the_header_or_the_probe(self):
+        """ЗАМЕР 03.09, а не вкус: `shtab_box`→2 документа, `shtab_box_`→1 (проба),
+        `shtab_task_`→0. Возьми мы первые два — источником задач стали бы САМА ШАПКА
+        и документ-проба, который дословно говорит «Заданий не несёт»."""
+        for foreign in ("shtab_box", "shtab_box_probe", "KB_MASTER", "cowork_esign_2026-09-03"):
+            self.assertFalse(foreign.startswith(sb.TASK_PREFIX),
+                             "префикс затягивает чужого ребёнка папки: %s" % foreign)
+
+    def test_foreign_children_are_filtered_by_US_and_not_only_by_the_bridge(self):
+        """Отбор моста — параметр запроса; решает, что считать заданием, наш код.
+
+        Проверяем на перечислении, которое ЧУЖИХ ДЕТЕЙ ВЕРНУЛО (отбор на той стороне
+        не сработал): ящик обязан отсеять их сам, а не взять `KB_MASTER` за задание.
+        """
+        q = FakeQueue()
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True,
+                    extra=[{"name": "KB_MASTER", "id": "x1", "mime": "d"},
+                           {"name": "shtab_box", "id": "x2", "mime": "d"},
+                           {"name": "shtab_box_probe", "id": "x3", "mime": "d"}])
+        self.assertEqual(["kk1"], [r["key"] for r in rep["placed"]], rep["why"])
+        self.assertEqual(1, rep["docs"], "чужой ребёнок папки заехал в задания")
+
+    def test_the_key_is_the_document_name_without_the_prefix(self):
+        docs, bad = sb.parse_folder([{"name": sb.doc_name("addr-canon.0903"), "id": "f1"}])
+        self.assertEqual([], bad)
+        self.assertEqual("addr-canon.0903", docs[0]["key"])
+        self.assertEqual(sb.doc_name("addr-canon.0903"), docs[0]["name"])
+
+    def test_a_name_of_bare_prefix_has_no_key_and_says_so(self):
+        docs, bad = sb.parse_folder([{"name": sb.TASK_PREFIX, "id": "f1"}])
+        self.assertEqual([], docs)
+        self.assertIn("ключа в нём нет", bad[0]["why"])
+
+    def test_a_document_without_a_file_id_is_refused_with_a_named_reason(self):
+        """Читать такой документ нечем: по имени мост его не отдаёт (замер 03.09)."""
+        docs, bad = sb.parse_folder([{"name": sb.doc_name("kk1"), "id": ""}])
+        self.assertEqual([], docs)
+        self.assertIn("нет file id", bad[0]["why"])
+
+    # ── порядок разбора ────────────────────────────────────────────────
+    def test_the_order_is_by_NAME_and_it_is_OURS_not_the_bridges(self):
+        """Порядок назначен явно и НЕ берётся у моста.
+
+        Мост уже сортирует, но при усечении сортирует произвольный кусок; кроме
+        того «первый» обязан быть вопросом, на который отвечает НАШ код. Подаём
+        нарочно перемешанный список — выйти он обязан по имени.
+        """
+        names = ["03-vtoroe", "01-pervoe", "02-srednee"]
+        files = [{"name": sb.doc_name(n), "id": "f%d" % i} for i, n in enumerate(names)]
+        docs, _bad = sb.parse_folder(files)
+        self.assertEqual(["01-pervoe", "02-srednee", "03-vtoroe"], [d["key"] for d in docs])
+
+    def test_the_first_by_name_is_the_one_actually_taken(self):
+        """Порядок не украшение отчёта: при потолке 1 за виток берётся ПЕРВЫЙ по имени."""
+        q = FakeQueue()
+        rep = _tick(_box(("bbb-vtoroe", GOOD_BODY), ("aaa-pervoe", GOOD_BODY)),
+                    queue=q, place=True)
+        self.assertEqual(["aaa-pervoe"], [r["key"] for r in rep["placed"]], rep["why"])
+
+    def test_the_order_is_the_SAME_on_two_ticks_in_a_row(self):
+        """Предсказуемость — это одинаковость на двух витках, а не красота списка.
+
+        Папка отдаёт детей в порядке Drive (произвольном), и он может меняться от
+        вызова к вызову. Подаём тот же набор в ОБРАТНОМ порядке — ответ обязан
+        совпасть.
+        """
+        pairs = [("bbb", GOOD_BODY), ("aaa", GOOD_BODY), ("ccc", GOOD_BODY)]
+        first, _b1 = sb.parse_folder(_files(pairs)[0])
+        second, _b2 = sb.parse_folder(_files(list(reversed(pairs)))[0])
+        self.assertEqual([d["key"] for d in first], [d["key"] for d in second])
+        self.assertEqual(["aaa", "bbb", "ccc"], [d["key"] for d in first])
+
+    # ── двойники ───────────────────────────────────────────────────────
+    def test_two_documents_with_the_same_key_refuse_BOTH(self):
+        """Drive разрешает двум файлам одно имя, а ключ — имя задачи для дедупа."""
+        files = [{"name": sb.doc_name("dup"), "id": "f1"},
+                 {"name": sb.doc_name("dup"), "id": "f2"}]
+        docs, bad = sb.parse_folder(files)
+        self.assertEqual([], docs)
+        self.assertEqual(2, len(bad))
+        self.assertIn("двойники не берём ни один", bad[0]["why"])
+
+    def test_a_revoked_twin_still_collides_with_a_fresh_one_of_the_same_key(self):
+        """«Снял и положил заново под тем же ключом» — это НЕ новая задача: маркер
+        очереди у неё был бы старый, и дедуп молча счёл бы её выполненной."""
+        files = [{"name": sb.doc_name("dup"), "id": "f1"},
+                 {"name": sb.doc_name("dup") + ".СНЯТО", "id": "f2"}]
+        docs, bad = sb.parse_folder(files)
+        self.assertEqual([], docs)
+        self.assertEqual(2, len(bad))
+
+    # ── отзыв переименованием ──────────────────────────────────────────
+    def test_a_revoked_document_is_not_taken_and_the_reason_is_in_WORDS(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ ЗАДАНИЯ: отозванный документ не берётся."""
+        q = FakeQueue()
+        rep = _tick(_box((sb.doc_name("kk1") + ".СНЯТО", GOOD_BODY, "raw")),
+                    queue=q, place=True)
+        self.assertEqual([], rep["placed"])
+        self.assertEqual([], q.tasks)
+        reasons = " ".join(w for _k, w in rep["held"])
+        self.assertIn("ОТОЗВАНО ШТАБОМ", reasons)
+        self.assertIn("kk1", reasons)
+
+    def test_POSITIVE_the_very_same_document_without_the_mark_IS_taken(self):
+        """Контроль к предыдущему: гасит именно метка, а не что-то ещё в имени."""
+        q = FakeQueue()
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True)
+        self.assertEqual(["kk1"], [r["key"] for r in rep["placed"]], rep["why"])
+
+    def test_the_revoked_document_costs_no_body_read(self):
+        """Снятого не читаем вовсе: иначе отзыв стоил бы похода в мост каждый виток."""
+        files, bodies = _files(_box((sb.doc_name("kk1") + ".СНЯТО", GOOD_BODY, "raw")))
+        reader = _doc_reader(bodies)
+        _tick(lister=_lister(files), doc_reader=reader, queue=FakeQueue(), place=True)
+        self.assertEqual([], reader.seen)
+
+    def test_the_mark_is_recognised_with_four_separators_and_any_case(self):
+        """Человек, переименовывающий файл в Drive, поставит и дефис, и пробел.
+
+        Ворота, требующие дословности, ответили бы на такое переименование
+        МОЛЧАНИЕМ — то есть ящик взял бы задание, которое Штаб считает снятым.
+        Это худший из возможных исходов, и цена терпимости здесь — ноль.
+        """
+        for tail in (".СНЯТО", "-СНЯТО", "_СНЯТО", " СНЯТО", ".снято", ".Снято"):
+            gone, clean = sb.revoked_name(sb.doc_name("kk1") + tail)
+            self.assertTrue(gone, tail)
+            self.assertEqual(sb.doc_name("kk1"), clean, tail)
+
+    def test_the_mark_must_be_a_WHOLE_word_at_the_very_end(self):
+        """Слово целиком и в хвосте — иначе снятыми оказались бы посторонние имена."""
+        for name in (sb.doc_name("snyatokrytiya"), sb.doc_name("kk1") + ".СНЯТО.ещё",
+                     sb.doc_name("СНЯТОЕ")):
+            gone, _clean = sb.revoked_name(name)
+            self.assertFalse(gone, name)
+
+    def test_a_name_that_is_prefix_plus_mark_alone_ends_up_KEYLESS_not_taken(self):
+        """Вырожденное имя `shtab_task_СНЯТО`: метку видно, а ключа под ней нет.
+
+        Проверяем ИСХОД, а не внутренний признак: как ни назови такое имя, задачей
+        оно стать не должно, и причина обязана прозвучать словами.
+        """
+        docs, bad = sb.parse_folder([{"name": sb.TASK_PREFIX + "СНЯТО", "id": "f1"}])
+        self.assertEqual([], docs)
+        self.assertIn("ключа в нём нет", bad[0]["why"])
+
+    def test_revocation_is_reported_but_does_NOT_recall_a_placed_row(self):
+        """ГРАНИЦА ОТЗЫВА, названная вслух: метка останавливает ВЗЯТИЕ, а не работу.
+
+        Уже поставленный ряд ящик не снимает ни одной веткой — это решение
+        владельца. Второй раз задание всё равно не возьмётся, но причиной будет
+        ДЕДУП, а не отзыв: «работа уже идёт» — новость важнее, чем «снято», и
+        сказать вторую значило бы намекнуть, что снятие что-то остановило.
+
+        РЯДОМ ЛЕЖИТ ЖИВОЕ ЗАДАНИЕ, и это не украшение сцены: маркеры суток ящик
+        читает только при живом кандидате, а из одних снятых документов кандидата
+        не выходит (см. соседний тест про дешёвую папку). Без соседа мы проверяли
+        бы не порядок причин, а экономию.
+        """
+        q = FakeQueue(closed=[_row("kk1")])
+        rep = _tick(_box((sb.doc_name("kk1") + ".СНЯТО", GOOD_BODY, "raw"),
+                         ("zzz-sosed", GOOD_BODY)), queue=q, place=True)
+        by_key = dict(rep["held"])
+        self.assertIn("уже брали", by_key.get("kk1", ""))
+        self.assertNotIn("ОТОЗВАНО", by_key.get("kk1", ""))
+
+    def test_a_folder_of_ONLY_revoked_documents_costs_no_expensive_read(self):
+        """Экономия, из-за которой у соседнего теста есть живой сосед.
+
+        Снятое Штабом взять нельзя ни при каких маркерах, поэтому папка из одних
+        снятых документов не стои́т 27 секунд чтения `done`. Причина при этом
+        названа словами — молчания здесь нет.
+        """
+        q = FakeQueue()
+        rep = _tick(_box((sb.doc_name("kk1") + ".СНЯТО", GOOD_BODY, "raw")),
+                    queue=q, place=True)
+        self.assertNotIn(run.CLOSED_STATUSES, q.asked)
+        self.assertIn("ОТОЗВАНО ШТАБОМ", " ".join(w for _k, w in rep["held"]))
+
+    def test_dropping_the_prefix_also_removes_the_task_but_SILENTLY(self):
+        """Тихая дорога отзыва названа честно, а не спрятана.
+
+        Убрать префикс тоже снимает задание — но ящик не скажет об этом НИЧЕГО,
+        потому что документа для него больше нет. Поэтому канон отзыва — метка.
+        """
+        q = FakeQueue()
+        rep = _tick(_box(("OFF_" + sb.doc_name("kk1"), GOOD_BODY, "raw")), queue=q, place=True)
+        self.assertEqual([], rep["placed"])
+        self.assertIn("пуст", rep["why"])
+        self.assertNotIn("ОТОЗВАНО", " ".join(w for _k, w in rep["held"]))
+
+    # ── потолок чтений ─────────────────────────────────────────────────
+    def test_the_read_ceiling_holds_and_the_dropped_ones_are_NAMED(self):
+        """ТИХОГО ОБРЕЗАНИЯ НЕТ: непрочитанные получают свою строку с числом."""
+        pairs = [("k%02d" % i, GOOD_BODY) for i in range(sb.READ_MAX + 3)]
+        files, bodies = _files(_box(*pairs))
+        reader = _doc_reader(bodies)
+        rep = _tick(lister=_lister(files), doc_reader=reader, queue=FakeQueue(), place=True)
+        self.assertEqual(sb.READ_MAX, len(reader.seen), "потолок чтений не сработал")
+        held = " ".join(w for _k, w in rep["held"])
+        self.assertIn("не больше %d" % sb.READ_MAX, held)
+        self.assertIn("дойдём следующим витком", held)
+        # …и взято при этом ровно одно: потолок чтений замков не подменяет.
+        self.assertEqual(1, len(rep["placed"]))
+
+    def test_a_document_whose_body_will_not_read_is_HELD_not_refused(self):
+        """Отказ чтения тела — это «не знаю», а не «задание плохое»."""
+        files, bodies = _files(_box(("kk1", GOOD_BODY)))
+        rep = _tick(lister=_lister(files), doc_reader=_doc_reader(bodies, dead=["fid-00"]),
+                    queue=FakeQueue(), place=True)
+        self.assertEqual([], rep["placed"])
+        held = " ".join(w for _k, w in rep["held"])
+        self.assertIn("тело документа не прочитано", held)
+        self.assertNotIn("НЕ ПРИНЯТ", held)
+
+    # ── закрытая дверь ─────────────────────────────────────────────────
+    def test_the_old_door_in_the_header_is_reported_not_silently_ignored(self):
+        """Молча закрытая дверь выглядит поломкой: у Штаба на экране лежит задание,
+        которое «почему-то не берут»."""
+        head = HEAD_TEXT + "\n" + _node(("oldkey", GOOD_BODY))
+        rep = _tick(_box(), node_text=head, queue=FakeQueue(), place=True)
+        self.assertEqual([], rep["placed"])
+        self.assertIn("старой формы", rep["why"])
+        self.assertIn(sb.TASK_PREFIX, rep["why"])
+        self.assertIn("пуст", rep["why"], "новость про пустую папку пропасть не должна")
+
+    def test_a_block_in_the_header_is_NEVER_taken_as_a_task(self):
+        """Двух дверей нет: блок в шапке источником задач не является ни одной веткой."""
+        head = HEAD_TEXT + "\n" + _node(("oldkey", GOOD_BODY))
+        q = FakeQueue()
+        rep = _tick(_box(), node_text=head, queue=q, place=True)
+        self.assertEqual([], q.tasks)
+        self.assertEqual(0, rep["docs"])
 
 
 # ═══════════════════════════ ворота приёма ═════════════════════════════
@@ -508,39 +874,81 @@ class TestNegative(unittest.TestCase):
     def test_POSITIVE_CONTROL_a_healthy_box_actually_places_a_task(self):
         """Без этого теста все пять отрицательных проходят у ящика, не берущего НИЧЕГО."""
         q = FakeQueue()
-        rep = _tick(_node(("kk1", GOOD_BODY)), queue=q, place=True)
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True)
         self.assertEqual(len(rep["placed"]), 1, rep["why"])
         self.assertEqual(rep["placed"][0]["key"], "kk1")
         self.assertEqual(len(q.tasks), 1)
         self.assertIn(GOOD_BODY, q.tasks[0][1])
 
-    # ── 1. узел недоступен ─────────────────────────────────────────────
-    def test_1_unreachable_node_says_UNKNOWN_and_takes_nothing(self):
+    # ── 1. источник недоступен ─────────────────────────────────────────
+    def test_1_unreachable_folder_says_UNKNOWN_and_takes_nothing(self):
+        """ПЕРЕЧИСЛЕНИЕ НЕ ОТВЕТИЛО → НЕИЗВЕСТНО и ноль постановок.
+
+        Проверено ЗАНОВО на новом источнике: до 03.09 роль «источник молчит» играл
+        отказ чтения узла, и зелёный старого теста не сказал бы об этой ветке
+        ничего — она другая функция и другой отказ.
+        """
         q = FakeQueue()
-        rep = _tick(reader=_dead_reader("мост не ответил"), queue=q, place=True)
+        rep = _tick(_box(("kk1", GOOD_BODY)), lister=_lister([], ok=False, why="мост не ответил"),
+                    queue=q, place=True)
         self.assertEqual(rep["placed"], [])
         self.assertEqual(q.tasks, [])
-        self.assertFalse(rep["node_ok"])
+        self.assertFalse(rep["folder_ok"])
         self.assertIn("НЕИЗВЕСТНО", rep["why"])
         # И слово «пусто» в причине НЕ звучит: пустой ящик и недоступный — разные новости.
-        self.assertNotIn("ящик пуст", rep["why"])
+        self.assertNotIn("пуст", rep["why"])
+        # Очереди мы даже не спрашивали: не зная источника, ящик не идёт дальше.
+        self.assertEqual(q.asked, [])
 
-    def test_1b_an_empty_node_reads_differently_from_an_unreachable_one(self):
+    def test_1b_an_empty_folder_reads_differently_from_an_unreachable_one(self):
         """Контраст к предыдущему: пустой ящик говорит «пуст», а не «неизвестно»."""
-        rep = _tick(_node(), place=True)
+        rep = _tick(_box(), place=True)
         self.assertIn("пуст", rep["why"])
         self.assertNotIn("НЕИЗВЕСТНО", rep["why"])
 
-    def test_1c_an_empty_text_from_the_node_counts_as_a_read_failure(self):
+    def test_1c_an_empty_text_from_a_document_counts_as_a_read_failure(self):
         """Мост, отдавший пустую строку, — это отказ чтения, а не пустой док."""
-        _text, ok, why = run.read_node("KB_x", reader=lambda name: "")
+        _text, ok, why = run.read_doc_text("fid-1", reader=lambda fid: "")
         self.assertFalse(ok)
         self.assertIn("отказом чтения", why)
+
+    def test_1d_a_TRUNCATED_listing_is_a_refusal_and_not_a_short_list(self):
+        """УСЕЧЁННЫЙ СПИСОК — НЕИЗВЕСТНО, а не «взяли что видно».
+
+        Замер 03.09 на живой папке (49 файлов, limit=3) вернул НЕ три первых по
+        алфавиту: мост сортирует уже обрезанный произвольный кусок. Наш порядок
+        разбора — «первый по имени», и на таком списке он дал бы уверенный и
+        неверный ответ.
+        """
+        q = FakeQueue()
+        files, _b = _files(_box(("kk1", GOOD_BODY)))
+        rep = _tick(_box(("kk1", GOOD_BODY)), lister=_lister(files, truncated=True),
+                    queue=q, place=True)
+        self.assertEqual(rep["placed"], [])
+        self.assertEqual(q.tasks, [])
+        self.assertFalse(rep["folder_ok"])
+        self.assertIn("НЕИЗВЕСТНО", rep["why"])
+        self.assertIn("УСЕЧЕНО", rep["why"])
+        self.assertNotIn("пуст", rep["why"])
+
+    def test_1e_a_dead_HEADER_does_not_stop_the_box(self):
+        """Шапка перестала быть источником — значит её отказ ящик не останавливает.
+
+        Ослаблением это не является: единственное, что теряется вместе с шапкой, —
+        МЕТКИ СНЯТИЯ сигналов, то есть снятый владельцем сигнал остаётся стоять.
+        Строже, а не слабее.
+        """
+        q = FakeQueue()
+        rep = _tick(_box(("kk1", GOOD_BODY)), reader=_dead_reader("шапки нет"),
+                    queue=q, place=True)
+        self.assertFalse(rep["node_ok"])
+        self.assertEqual(len(rep["placed"]), 1, rep["why"])
+        self.assertEqual(rep["build"]["released"], [])
 
     # ── 2. блок без адреса результата ──────────────────────────────────
     def test_2_block_without_a_result_address_is_refused_with_a_named_reason(self):
         q = FakeQueue()
-        rep = _tick(_node(("kk1", NO_ADDR_BODY)), queue=q, place=True)
+        rep = _tick(_box(("kk1", NO_ADDR_BODY)), queue=q, place=True)
         self.assertEqual(rep["placed"], [])
         self.assertEqual(q.tasks, [])
         reasons = " ".join(w for _k, w in rep["held"])
@@ -548,16 +956,50 @@ class TestNegative(unittest.TestCase):
         self.assertIn("адрес результата", reasons)
         # Причина обязана доехать до строки лога, а не остаться внутри отчёта.
         self.assertIn("no_address", rep["why"])
-        # …и НЕ ПРИКИДЫВАТЬСЯ ПОЛОМКОЙ МОСТА. Дорогое чтение `done` пропущено
-        # потому, что ставить нечего, — это наша экономия, а не отказ прибора.
-        # Назови мы её отказом, каждый оборот с кривым блоком кричал бы «сверить
-        # нечем», и настоящий отказ моста утонул бы в этом крике.
+        # …и НЕ ПРИКИДЫВАТЬСЯ ПОЛОМКОЙ МОСТА: отказ ворот остаётся отказом ворот, а
+        # не превращается в «сверить нечем». Назови мы его так, настоящий отказ
+        # моста утонул бы в этом крике.
         self.assertNotIn("не прочитаны", rep["why"])
-        self.assertFalse(rep["build"]["marks_asked"])
+        self.assertTrue(rep["build"]["marks_ok"])
+
+    def test_2d_the_gate_refusal_now_COSTS_the_expensive_read_and_that_is_deliberate(self):
+        """ЧЕСТНАЯ ЦЕНА ПЕРЕЕЗДА, записанная тестом, а не спрятанная.
+
+        До 03.09 отказ ворот дорогого чтения `done` не стоил: тело блока приезжало
+        вместе с узлом, ворота считались ДО очереди, и «принятых блоков нет» служило
+        дешёвым признаком «дальше не идём». Теперь тело — отдельный поход в мост, и
+        порядок обратный: сначала маркеры (кого не читать), потом тела.
+
+        ПОЧЕМУ ИМЕННО ТАК, а не наоборот. Взятые документы из папки НЕ ИСЧЕЗАЮТ —
+        они копятся в ней навсегда. Читай мы тела раньше маркеров, каждый виток
+        перечитывал бы тела всех когда-либо взятых заданий: цена росла бы БЕЗ
+        ПОТОЛКА. Цена `done` фиксированная (~27 с) и от числа заданий не зависит.
+        Меняем растущую на постоянную — сознательно.
+        """
+        q = FakeQueue()
+        rep = _tick(_box(("kk1", NO_ADDR_BODY)), queue=q, place=True)
+        self.assertEqual(rep["placed"], [])
+        self.assertIn(run.CLOSED_STATUSES, q.asked, "маркеры суток читаются ДО тел")
+
+    def test_2e_an_ALREADY_TAKEN_document_costs_no_body_read_at_all(self):
+        """Оборотная сторона того же порядка — та, ради которой он и выбран.
+
+        Документ, ключ которого уже стои́т маркером в очереди, тела не стои́т ни
+        разу: его не читают вовсе. Иначе папка, копящая взятые задания, дорожала бы
+        с каждым выполненным заданием.
+        """
+        q = FakeQueue(closed=[_row("kk1")])
+        files, bodies = _files(_box(("kk1", GOOD_BODY)))
+        reader = _doc_reader(bodies)
+        rep = _tick(_box(("kk1", GOOD_BODY)), lister=_lister(files), doc_reader=reader,
+                    queue=q, place=True)
+        self.assertEqual(rep["placed"], [])
+        self.assertEqual(reader.seen, [], "тело уже взятого задания читали зря")
+        self.assertEqual(rep["build"]["read"], 0)
 
     def test_2b_block_without_the_prohibitions_is_refused_too(self):
         q = FakeQueue()
-        rep = _tick(_node(("kk1", NO_PROHIB_BODY)), queue=q, place=True)
+        rep = _tick(_box(("kk1", NO_PROHIB_BODY)), queue=q, place=True)
         self.assertEqual(q.tasks, [])
         reasons = " ".join(w for _k, w in rep["held"])
         self.assertIn("no_prohibitions", reasons)
@@ -566,14 +1008,14 @@ class TestNegative(unittest.TestCase):
         """Отказ одному блоку не глушит ящик целиком — иначе один кривой блок Штаба
         останавливал бы канал навсегда, и выглядело бы это как «ящик сломался»."""
         q = FakeQueue()
-        rep = _tick(_node(("bad", NO_ADDR_BODY), ("good", GOOD_BODY)), queue=q, place=True)
+        rep = _tick(_box(("bad", NO_ADDR_BODY), ("good", GOOD_BODY)), queue=q, place=True)
         self.assertEqual([r["key"] for r in rep["placed"]], ["good"])
 
     # ── 3. тот же ключ второй раз ──────────────────────────────────────
     def test_3_the_same_key_is_never_taken_twice(self):
         """Дедуп по ЖИВОЙ ОЧЕРЕДИ, и закрытый ряд считается наравне с открытым."""
         q = FakeQueue(closed=[_row("kk1")])
-        rep = _tick(_node(("kk1", GOOD_BODY)), queue=q, place=True)
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True)
         self.assertEqual(rep["placed"], [])
         self.assertEqual(q.tasks, [])
         self.assertIn("уже брали", " ".join(w for _k, w in rep["held"]))
@@ -582,13 +1024,13 @@ class TestNegative(unittest.TestCase):
         """«Не берётся НИКОГДА» — это не «не берётся сегодня»: дата в маркере другая,
         а ключ тот же, и повтор всё равно запрещён."""
         q = FakeQueue(closed=[_row("kk1", day="2026-08-01")])
-        rep = _tick(_node(("kk1", GOOD_BODY)), queue=q, place=True)
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True)
         self.assertEqual(rep["placed"], [])
         self.assertIn("уже брали", " ".join(w for _k, w in rep["held"]))
 
     def test_3c_POSITIVE_a_different_key_next_to_a_taken_one_still_goes(self):
         q = FakeQueue(closed=[_row("kk1")])
-        rep = _tick(_node(("kk1", GOOD_BODY), ("kk2", GOOD_BODY)), queue=q, place=True)
+        rep = _tick(_box(("kk1", GOOD_BODY), ("kk2", GOOD_BODY)), queue=q, place=True)
         self.assertEqual([r["key"] for r in rep["placed"]], ["kk2"])
 
     def test_3d_the_marker_of_a_placed_row_is_readable_back_by_the_dedup(self):
@@ -603,13 +1045,19 @@ class TestNegative(unittest.TestCase):
         with io.open(os.path.join(root, run.STOP_FILE), "w", encoding="utf-8") as fh:
             fh.write("стоп\n")
         q = FakeQueue()
-        reader = _reader(_node(("kk1", GOOD_BODY)))
-        rep = _tick(reader=reader, queue=q, place=True, root=root)
+        files, bodies = _files(_box(("kk1", GOOD_BODY)))
+        lister, doc_reader, reader = _lister(files), _doc_reader(bodies), _reader(HEAD_TEXT)
+        rep = _tick(lister=lister, doc_reader=doc_reader, reader=reader,
+                    queue=q, place=True, root=root)
         self.assertEqual(rep["placed"], [])
         self.assertEqual(q.tasks, [])
         self.assertTrue(rep["off"])
         self.assertIn(run.STOP_FILE, rep["why"])
-        # И узла мы даже не спрашивали: выключенный ящик не ходит в мозг.
+        # И в мозг мы не ходили НИ ОДНОЙ из трёх дверей: выключенный ящик не читает
+        # ни папки, ни тел, ни шапки. Проверено ЗАНОВО: дверей стало три, и старый
+        # тест сторожил только одну из них.
+        self.assertEqual(lister.seen, [])
+        self.assertEqual(doc_reader.seen, [])
         self.assertEqual(reader.seen, [])
         # Ни очереди: выключено значит выключено, а не «прочитаем и не поставим».
         self.assertEqual(q.asked, [])
@@ -618,7 +1066,7 @@ class TestNegative(unittest.TestCase):
         """Тот же корень БЕЗ файла — задача встаёт. Значит гасит именно файл."""
         root = tempfile.mkdtemp(prefix="shtabbox_on_")
         q = FakeQueue()
-        rep = _tick(_node(("kk1", GOOD_BODY)), queue=q, place=True, root=root)
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True, root=root)
         self.assertEqual(len(rep["placed"]), 1, rep["why"])
 
     def test_4c_an_unanswerable_stop_check_means_OFF(self):
@@ -635,7 +1083,7 @@ class TestNegative(unittest.TestCase):
     # ── 5. в очереди задача владельца ──────────────────────────────────
     def test_5_an_owner_task_in_the_queue_blocks_every_block(self):
         q = FakeQueue(busy=True, busy_ids=[321])
-        rep = _tick(_node(("kk1", GOOD_BODY), ("kk2", GOOD_BODY)), queue=q, place=True)
+        rep = _tick(_box(("kk1", GOOD_BODY), ("kk2", GOOD_BODY)), queue=q, place=True)
         self.assertEqual(rep["placed"], [])
         self.assertEqual(q.tasks, [])
         self.assertIn("#321", rep["why"])
@@ -644,12 +1092,12 @@ class TestNegative(unittest.TestCase):
     def test_5b_the_owner_lock_saves_the_expensive_read_of_closed_rows(self):
         """Занятая полоса не платит 27 секунд витка за ответ, который не понадобится."""
         q = FakeQueue(busy=True, busy_ids=[321])
-        _tick(_node(("kk1", GOOD_BODY)), queue=q, place=True)
+        _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True)
         self.assertNotIn(run.CLOSED_STATUSES, q.asked)
 
     def test_5c_POSITIVE_a_free_lane_places_the_very_same_block(self):
         q = FakeQueue(busy=False)
-        rep = _tick(_node(("kk1", GOOD_BODY)), queue=q, place=True)
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True)
         self.assertEqual(len(rep["placed"]), 1, rep["why"])
 
 
@@ -660,7 +1108,7 @@ class TestCeiling(unittest.TestCase):
 
     def test_not_more_than_one_per_tick(self):
         q = FakeQueue()
-        rep = _tick(_node(("kk1", GOOD_BODY), ("kk2", GOOD_BODY), ("kk3", GOOD_BODY)),
+        rep = _tick(_box(("kk1", GOOD_BODY), ("kk2", GOOD_BODY), ("kk3", GOOD_BODY)),
                     queue=q, place=True)
         self.assertEqual(len(rep["placed"]), 1)
         self.assertIn("не больше 1 за виток", " ".join(w for _k, w in rep["held"]))
@@ -669,7 +1117,7 @@ class TestCeiling(unittest.TestCase):
         """Урок ступени E дословно: счёт по одним открытым рядам мерит одновременность."""
         closed = [_row("aa1"), _row("bb1"), _row("cc1")]
         q = FakeQueue(closed=closed)
-        rep = _tick(_node(("kk9", GOOD_BODY)), queue=q, place=True)
+        rep = _tick(_box(("kk9", GOOD_BODY)), queue=q, place=True)
         self.assertEqual(rep["placed"], [])
         self.assertIn("суточный потолок исчерпан", " ".join(w for _k, w in rep["held"]))
 
@@ -677,13 +1125,13 @@ class TestCeiling(unittest.TestCase):
         """ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ потолка: правило, глушащее всё, прошло бы тест выше."""
         closed = [_row("aa1", day="2026-09-01"), _row("bb1", day="2026-09-01"),
                   _row("cc1", day="2026-09-01")]
-        rep = _tick(_node(("kk9", GOOD_BODY)), queue=FakeQueue(closed=closed), place=True)
+        rep = _tick(_box(("kk9", GOOD_BODY)), queue=FakeQueue(closed=closed), place=True)
         self.assertEqual(len(rep["placed"]), 1, rep["why"])
 
     def test_unread_closed_rows_mean_EXHAUSTED_not_EMPTY(self):
         """Третий исход: корпус не прочитан → день исчерпан, и сказано это ДРУГИМИ словами."""
         q = FakeQueue(closed_ok=False)
-        rep = _tick(_node(("kk1", GOOD_BODY)), queue=q, place=True)
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True)
         self.assertEqual(rep["placed"], [])
         self.assertEqual(q.tasks, [])
         self.assertIn("НЕИЗВЕСТНО", rep["why"])
@@ -717,7 +1165,7 @@ class TestHands(unittest.TestCase):
 
     def test_dry_run_touches_no_queue_row(self):
         q = FakeQueue()
-        rep = _tick(_node(("kk1", GOOD_BODY)), queue=q, place=False)
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=False)
         self.assertEqual(q.tasks, [])
         self.assertEqual(rep["placed"], [])
         self.assertIn("kk1", rep["texts"])
@@ -726,13 +1174,13 @@ class TestHands(unittest.TestCase):
     def test_the_expensive_closed_corpus_is_not_read_on_an_empty_box(self):
         """Пустой ящик — обычное состояние, и платить за него полминуты витка нельзя."""
         q = FakeQueue()
-        _tick(_node(), queue=q, place=True)
+        _tick(_box(), queue=q, place=True)
         self.assertNotIn(run.CLOSED_STATUSES, q.asked)
 
     def test_the_closed_corpus_IS_read_when_there_is_a_candidate(self):
         """Положительный контроль экономии: когда есть что ставить — читаем всё."""
         q = FakeQueue()
-        _tick(_node(("kk1", GOOD_BODY)), queue=q, place=True)
+        _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True)
         self.assertIn(run.CLOSED_STATUSES, q.asked)
 
     def test_the_box_places_a_GREEN_row_and_never_an_approval_card(self):
@@ -758,22 +1206,24 @@ class TestHands(unittest.TestCase):
 
     def test_a_dead_queue_places_nothing_blindly(self):
         q = FakeQueue(ok=False)
-        rep = _tick(_node(("kk1", GOOD_BODY)), queue=q, place=True)
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True)
         self.assertEqual(q.tasks, [])
         self.assertIn("очередь недоступна", rep["why"])
 
-    def test_the_journal_line_names_the_key_and_the_row(self):
-        line = sb.index_line({"key": "kk1"}, 707, TODAY)
+    def test_the_journal_line_names_the_key_the_document_and_the_row(self):
+        """Строка журнала обязана закрывать вопрос «откуда взялась задача #N» БЕЗ
+        похода в папку: с 03.09 ответом на него служит ИМЯ ДОКУМЕНТА."""
+        line = sb.index_line({"key": "kk1", "name": sb.doc_name("kk1")}, 707, TODAY)
         self.assertIn("kk1", line)
         self.assertIn("#707", line)
-        self.assertIn(sb.NODE_NAME, line)
+        self.assertIn(sb.doc_name("kk1"), line)
 
     def test_no_state_file_is_written_anywhere(self):
         """Реестра на диске у ящика нет: его съел бы первый self-update, а дедуп обязан
         пережить всё. Источник истины один — живая очередь."""
         root = tempfile.mkdtemp(prefix="shtabbox_state_")
         before = sorted(os.listdir(root))
-        _tick(_node(("kk1", GOOD_BODY)), queue=FakeQueue(), place=True, root=root)
+        _tick(_box(("kk1", GOOD_BODY)), queue=FakeQueue(), place=True, root=root)
         self.assertEqual(sorted(os.listdir(root)), before, "ящик оставил файл в корне")
 
 
