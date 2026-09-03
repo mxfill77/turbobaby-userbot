@@ -53,6 +53,7 @@ import sys
 
 import contour_digest as cd
 import contour_digest_run as cdr
+import shtab_box_signals            # РАЗЛИЧИТЕЛЬ ВИДА РЯДА: тот же, что у остановки ящика
 import vitrina_pc as vp
 import zayavki_pc
 
@@ -290,10 +291,16 @@ def shtab_last_facts(snapshot, claims, now):
 def waiting_rows(snapshot):
     """Открытые решения владельца (`needs_approval`), РАЗВЕДЁННЫЕ по видам. → list | None.
 
-    Вид опознаётся маркером ступени B (:func:`zayavki_pc.is_zayavka`) — тем же
-    самым, которым заявку отличают три гарда демона. Второго определения здесь не
-    заводится: разойдись они, витрина начала бы звать заявку карточкой ровно в тот
-    день, когда маркер поменяют.
+    ВИД СПРАШИВАЕТСЯ У РАЗЛИЧИТЕЛЯ ЯЩИКА (:func:`shtab_box_signals.awaiting_kind`),
+    а не считается здесь заново, и это правка 03.09.2026. До неё витрина судила
+    одним признаком ступени B — и потому звала КАРТОЧКАМИ ГАРДА всё остальное,
+    включая заявки разведки: живой замер того же дня даёт четыре таких ряда из
+    пяти. Строка «карточки гарда в ожидании: 4» была прямым враньём про красные
+    операции, которых не было ни одной.
+
+    Второго определения здесь не заводится намеренно: витрина обязана называть
+    ряд тем же словом, каким его называет остановка ящика, — иначе владелец
+    читает два числа про один предмет и не знает, какому верить.
     """
     if snapshot is None:
         return None
@@ -303,8 +310,11 @@ def waiting_rows(snapshot):
             continue
         goal = item.get("goal")
         mark = zayavki_pc.parse_marker(str(goal or ""))
+        kind, how = shtab_box_signals.awaiting_kind(item)
         out.append({"id": tid, "goal": quote(goal),
                     "zayavka": zayavki_pc.is_zayavka(goal),
+                    "kind": kind, "kind_why": how,
+                    "holds": kind != shtab_box_signals.KIND_ASK,
                     "key": mark[1] if mark else ""})
     return out
 
@@ -312,13 +322,21 @@ def waiting_rows(snapshot):
 def awaiting_counts(waiting):
     """Ждущие решения → два ЧИСЛА разными именами. → dict | None.
 
-    `None` держится насквозь: слепок не прочитан — обе строки витрины скажут
+    ``holding`` — ряды, ДЕРЖАЩИЕ операцию (карточки гарда плюс неопознанные:
+    отказ консервативный). ``asking`` — ждущие мнения. Складывать их нельзя
+    НИКОГДА: первое число значит «полоса остановлена», второе — «владельцу есть
+    что почитать». Третье, ``blind``, — сколько из держащих попали туда по
+    незнанию, чтобы «не разобрали ряд» не читалось как «красная операция».
+
+    `None` держится насквозь: слепок не прочитан — все строки витрины скажут
     «НЕИЗВЕСТНО», и ни одна не подставит ноль.
     """
     if waiting is None:
         return None
-    return {"zayavki": sum(1 for w in waiting if w.get("zayavka")),
-            "cards": sum(1 for w in waiting if not w.get("zayavka"))}
+    hold = [w for w in waiting if w.get("holds")]
+    return {"holding": len(hold), "asking": len(waiting) - len(hold),
+            "blind": sum(1 for w in hold
+                         if w.get("kind") == shtab_box_signals.KIND_UNKNOWN)}
 
 
 def failed_rows(snapshot, since):

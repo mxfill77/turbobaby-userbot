@@ -30,6 +30,7 @@ import unittest
 
 import contour_digest as cd
 import contour_digest_run as cdr
+import shtab_box_signals as sbs
 import vitrina_pc as vp
 import vitrina_pc_run as run
 
@@ -68,7 +69,8 @@ def _live_facts(day=DAY):
     return {"day": day, "shtab": vp.parse_shtab("дата=%s\n[[СЕЙЧАС]]\nстроим витрину\n"
                                                 "[[ЗАСТРЯЛО]]\nничего\n[[КУДА ИДЁМ]]\nк 30" % day),
             "running": [{"id": "5", "goal": "витрина", "age": 600.0}],
-            "expects": [], "failed": [], "awaiting": {"cards": 1, "zayavki": 1},
+            "expects": [], "failed": [],
+            "awaiting": {"holding": 1, "asking": 1, "blind": 0},
             "series": {"streak": 5, "target": 30, "proved": 5, "blind": 13, "unproved": 0,
                        "unjudged": 0, "moved": 2},
             "shtab_taken": 1,
@@ -77,9 +79,9 @@ def _live_facts(day=DAY):
             # Две РАЗНЫЕ вещи в одном списке `needs_approval` — ровно то, что до 02.09
             # витрина звала одним словом: заявка внешнего канала и карточка гарда.
             "waiting": [{"id": "3", "goal": "[заявка-ревью дата=%s ключ=47b3131c052c]" % day,
-                         "zayavka": True, "key": "47b3131c052c"},
+                         "zayavka": True, "holds": False, "key": "47b3131c052c"},
                         {"id": "2", "goal": "удаление файла — разрешить?", "zayavka": False,
-                         "key": ""}],
+                         "holds": True, "key": ""}],
             "axes": {vp.AXIS_MAIN: 4, vp.AXIS_BIZ: 1, vp.AXIS_SERVICE: 22},
             "axes_why": "", "closed_day": 18,
             "idle": _idle(None, busy=1, ids=["5"]), "shtab_last": _shtab_last(7200.0)}
@@ -197,8 +199,8 @@ class TestNoZeroForUnknown(unittest.TestCase):
                                 "мёртвые источники не назвались неизвестными")
         for title in (t for _k, t in vp.PARTS):
             self.assertIn(title, text, "часть %s пропала при мёртвых источниках" % title)
-        for zero in ("взято 0 из", "карточки гарда в ожидании: 0",
-                     "заявки внешних каналов ждут решения: 0", "ось (этап 3) 0"):
+        for zero in ("взято 0 из", "ДЕРЖАТ операцию (карточки гарда): 0",
+                     "ЖДУТ МНЕНИЯ (заявки, ящик не держат): 0", "ось (этап 3) 0"):
             self.assertNotIn(zero, text, "незнание подменено нулём: %s" % zero)
 
     def test_dead_source_lines_carry_the_reason(self):
@@ -449,7 +451,7 @@ class TestSignature(unittest.TestCase):
 
     def test_changed_number_changes_signature(self):
         other = _live_facts()
-        other["awaiting"] = {"cards": 1, "zayavki": 2}
+        other["awaiting"] = {"holding": 1, "asking": 2, "blind": 0}
         self.assertNotEqual(vp.signature(_live_facts()), vp.signature(other))
 
     def test_signature_has_no_timestamp_in_it(self):
@@ -559,9 +561,41 @@ class TestZayavkiAreNotCards(unittest.TestCase):
         "10": {"goal": "работа", "status": "in_progress"},
     }, "closed": {}}
 
+    # ЖИВОЙ КОРПУС 03.09: четыре заявки разведки и одна внешнего канала, карточек
+    # гарда НОЛЬ. До правки того же дня витрина звала четыре разведзаявки
+    # «карточками гарда» — то есть сообщала о четырёх красных операциях, которых
+    # не было ни одной.
+    LIVE_SNAP = {"open": {
+        "13": {"goal": "[разведка-заявка дата=2026-09-02 ключ=38e6d0ce6598]", "status": "needs_approval"},
+        "31": {"goal": "[разведка-заявка дата=2026-09-02 ключ=8741233058f0]", "status": "needs_approval"},
+        "39": {"goal": "[разведка-заявка дата=2026-09-03 ключ=85cdcb57eb06]", "status": "needs_approval"},
+        "40": {"goal": "[разведка-заявка дата=2026-09-03 ключ=d5bb46caa17f]", "status": "needs_approval"},
+        "79": {"goal": "[заявка-ревью дата=2026-09-03 ключ=c30d8b2ab7e8]", "status": "needs_approval"},
+    }, "closed": {}}
+
     def test_live_snapshot_counts_them_apart(self):
         rows = run.waiting_rows(self.SNAP)
-        self.assertEqual(run.awaiting_counts(rows), {"zayavki": 3, "cards": 1})
+        self.assertEqual(run.awaiting_counts(rows),
+                         {"holding": 1, "asking": 3, "blind": 0})
+
+    def test_recon_claims_are_no_longer_called_guard_cards(self):
+        """ЖИВОЙ КОРПУС 03.09: держащих НОЛЬ, ждущих мнения ПЯТЬ.
+
+        Прежний признак (только маркер ступени B) дал бы здесь «карточки гарда: 4».
+        """
+        counts = run.awaiting_counts(run.waiting_rows(self.LIVE_SNAP))
+        self.assertEqual({"holding": 0, "asking": 5, "blind": 0}, counts)
+        text = "\n".join(vp.part_nums(None, None, DAY, None, counts))
+        self.assertIn("ДЕРЖАТ операцию (карточки гарда): 0", text)
+        self.assertIn("ЖДУТ МНЕНИЯ (заявки, ящик не держат): 5", text)
+
+    def test_an_unreadable_row_is_counted_as_holding_and_named_so(self):
+        """Вид не определён — считаем держащим, но говорим об этом ОТДЕЛЬНЫМ словом."""
+        snap = {"open": {"77": {"goal": "", "status": "needs_approval"}}, "closed": {}}
+        counts = run.awaiting_counts(run.waiting_rows(snap))
+        self.assertEqual({"holding": 1, "asking": 0, "blind": 1}, counts)
+        text = "\n".join(vp.part_nums(None, None, DAY, None, counts))
+        self.assertIn("неопознанным видом ряда", text)
 
     def test_unknown_survives_as_unknown(self):
         self.assertIsNone(run.waiting_rows(None))
@@ -570,9 +604,16 @@ class TestZayavkiAreNotCards(unittest.TestCase):
     def test_numbers_name_two_things_by_two_names(self):
         lines = vp.part_nums(None, None, DAY, None, run.awaiting_counts(run.waiting_rows(self.SNAP)))
         text = "\n".join(lines)
-        self.assertIn("карточки гарда в ожидании: 1", text)
-        self.assertIn("заявки внешних каналов ждут решения: 3", text)
+        self.assertIn("ДЕРЖАТ операцию (карточки гарда): 1", text)
+        self.assertIn("ЖДУТ МНЕНИЯ (заявки, ящик не держат): 3", text)
         self.assertNotIn("карточки в ожидании:", text)   # прежнего общего слова больше нет
+
+    def test_the_showcase_and_the_box_call_one_row_by_one_word(self):
+        """Различитель ОДИН: витрина и остановка ящика не вправе разойтись."""
+        rows = run.waiting_rows(self.LIVE_SNAP)
+        live = [{"id": w["id"], "status": "needs_approval", "goal": w["goal"]} for w in rows]
+        self.assertEqual(run.awaiting_counts(rows)["holding"],
+                         len(sbs.holding(sbs.split_waiting(live))))
 
     def test_owner_list_shows_a_zayavka_by_its_own_name_not_by_marker(self):
         rows = vp.part_owner(run.waiting_rows(self.SNAP))
@@ -580,7 +621,7 @@ class TestZayavkiAreNotCards(unittest.TestCase):
         self.assertIn("ЗАЯВКА внешнего канала (ключ 47b3131c052c)", text)
         self.assertIn("задачей не станет", text)
         self.assertNotIn("[заявка-ревью", text)          # машинный маркер владельцу не показываем
-        self.assertIn("#9 удаление tmp/x — разрешить?", text)   # карточка гарда — как была
+        self.assertIn("#9 ДЕРЖИТ операцию: удаление tmp/x — разрешить?", text)
 
 
 class TestIdleAndShtabArrival(unittest.TestCase):

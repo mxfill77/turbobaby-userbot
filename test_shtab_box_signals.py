@@ -46,6 +46,7 @@ import done_judge_pc as dj
 import shtab_box as sb
 import shtab_box_run as run
 import shtab_box_signals as sig
+import zayavki_pc as zp
 from test_shtab_box import (FakeQueue, GOOD_BODY, HEAD_TEXT, TODAY, _box, _doc_reader,
                             _files, _lister, _node, _reader, _ready)
 
@@ -65,10 +66,40 @@ def _closed(tid, status="done", result="", day=TODAY, key=None):
                          % (sb.MARK, day, key or ("k%03d" % tid), sb.HEAD_WORDS)}
 
 
-def _card(tid, frm="Filipp-review-claim"):
-    """Открытый ряд, ждущий ответа владельца (живая форма: заявка ступени B)."""
+def _card(tid, frm="Filipp"):
+    """КАРТОЧКА ГАРДА — ряд, ДЕРЖАЩИЙ операцию, в живой форме.
+
+    Живая форма замерена по коду демона: карточку рождает
+    ``process_new`` → ``run_task`` вернул ``needs_approval`` → ``set_needs_approval``,
+    и ``task_text`` у такого ряда — ИСХОДНЫЙ ТЕКСТ ЗАДАЧИ, без маркера вопроса.
+    Маркера здесь нет намеренно: он и есть различитель.
+    """
+    return {"id": tid, "status": "needs_approval", "from": frm,
+            "task_text": "почини гейт и закоммить\n🔴 гард: удаление файла tmp/x — разрешить?"}
+
+
+def _zayavka(tid, frm="Filipp-review-claim"):
+    """ЗАЯВКА ВНЕШНЕГО КАНАЛА (ступень B) — ждёт мнения, не держит НИЧЕГО."""
     return {"id": tid, "status": "needs_approval", "from": frm,
             "task_text": "[заявка-ревью дата=%s ключ=abcdef012345]\nвопрос владельцу" % TODAY}
+
+
+def _recon_ask(tid):
+    """ЗАЯВКА РАЗВЕДКИ (ступень E) — живая форма четырёх рядов замера 03.09."""
+    return {"id": tid, "status": "needs_approval", "from": "Filipp-recon-ask",
+            "task_text": "[разведка-заявка дата=%s ключ=38e6d0ce6598]\nповод требует "
+                         "операционного действия" % TODAY}
+
+
+def _revizor_card(tid):
+    """INFO-КАРТОЧКА РЕВИЗОРА — третий вид, освобождённый от APPROVAL_TTL."""
+    return {"id": tid, "status": "needs_approval", "from": "Filipp-revizor",
+            "task_text": "%s\n🔍 Ревизор: находки" % sig.REVIZOR_CARD_MARK}
+
+
+def _faceless(tid):
+    """Ряд БЕЗ ТЕЛА: вид определить нечем — отказ обязан быть консервативным."""
+    return {"id": tid, "status": "needs_approval", "from": "Filipp", "task_text": ""}
 
 
 def _ledger(*pairs):
@@ -157,7 +188,7 @@ class TestPurity(unittest.TestCase):
         for node in ast.walk(self.tree):
             if isinstance(node, ast.Import):
                 got |= {a.name for a in node.names}
-        self.assertEqual({"re", "contour_digest", "recon_auto", "shtab_box"}, got)
+        self.assertEqual({"re", "contour_digest", "recon_auto", "shtab_box", "zayavki_pc"}, got)
 
 
 # ═══════════════════════════ заимствованные литералы ═══════════════════
@@ -190,6 +221,61 @@ class TestMirrors(unittest.TestCase):
         """«Доказана» — слово `contour_digest`, и своего у сигналов нет."""
         self.assertNotIn("доказана", _src("shtab_box_signals.py").split("judged_of")[0][-400:])
         self.assertEqual(cd.JUDGE_PROVED, "доказана")
+
+    def test_revizor_card_mark_equals_the_daemon_one(self):
+        """Маркер info-карточки ревизора заимствован — расхождение обязано ронять ТЕСТ."""
+        import pc_orchestrator
+
+        self.assertEqual(pc_orchestrator.REVIZOR_OWNER_MARK, sig.REVIZOR_CARD_MARK)
+
+    def test_two_claim_marks_are_not_retyped_here(self):
+        """Маркеры ступеней B и E литералами здесь НЕ набраны — их спрашивают у владельца.
+
+        Третий экземпляр строки разошёлся бы с обоими молча, и разбор вернул бы
+        «карточка» на живой заявке ровно в день смены маркера. Проверяем не
+        обещание, а ИСХОДНИК.
+        """
+        src = _src("shtab_box_signals.py")
+        for mark in (zp.CLAIM_MARK, zp.RECON_MARK):
+            self.assertNotIn('"%s' % mark, src, "маркер %s набран литералом" % mark)
+
+    def test_the_daemon_frees_exactly_these_three_kinds_from_the_ttl(self):
+        """РАЗЛИЧИТЕЛЬ СТОИ́Т НА ЖИВОМ ПРАВИЛЕ ДЕМОНА, а не на нашем вкусе.
+
+        «Держит операцию» = «подлежит APPROVAL_TTL». Освобождены от TTL ровно три
+        вида (`process_approval_timeouts`), и ровно их сигнал В зовёт заявками.
+        Заведи демон четвёртый — этот тест обязан покраснеть, а не съесть его
+        молча в кучку держащих.
+        """
+        import pc_orchestrator as pc
+
+        for text in ("[заявка-ревью дата=2026-09-03 ключ=abcdef012345]\nx",
+                     "[разведка-заявка дата=2026-09-03 ключ=abcdef012345]\nx",
+                     "%s\n🔍 Ревизор: находки" % pc.REVIZOR_OWNER_MARK):
+            free = (pc._is_review_claim(text) or pc._is_recon_ask(text)
+                    or pc._is_revizor_owner_card(text))
+            kind, _how = sig.awaiting_kind({"id": 1, "task_text": text})
+            self.assertTrue(free, "демон больше не освобождает этот вид от TTL: %r" % text[:40])
+            self.assertEqual(sig.KIND_ASK, kind, "вид разошёлся с TTL-гейтом демона: %r" % text[:40])
+        card = "почини гейт\n🔴 гард: удаление файла — разрешить?"
+        self.assertFalse(pc._is_review_claim(card) or pc._is_recon_ask(card)
+                         or pc._is_revizor_owner_card(card))
+        self.assertEqual(sig.KIND_BLOCK, sig.awaiting_kind({"id": 2, "task_text": card})[0])
+
+    def test_body_is_picked_by_the_same_rule_as_the_owner_module(self):
+        """Тело ряда выбирается ТЕМ ЖЕ правилом, что у `zayavki_pc.split_awaiting`.
+
+        Слепок очереди кладёт первую строку тела в ``goal``; разойдись правила —
+        витрина и ящик назвали бы ОДИН ряд разными видами, и оба были бы уверены.
+        """
+        row = {"id": 7, "status": "needs_approval",
+               "goal": "[заявка-ревью дата=%s ключ=abcdef012345]" % TODAY}
+        self.assertEqual([row], zp.split_awaiting([row])["zayavki"])
+        self.assertEqual(sig.KIND_ASK, sig.awaiting_kind(row)[0])
+        recon = {"id": 8, "status": "needs_approval",
+                 "goal": "[разведка-заявка дата=%s ключ=abcdef012345]" % TODAY}
+        self.assertEqual([recon], zp.split_awaiting([recon])["foreign"])
+        self.assertEqual(sig.KIND_ASK, sig.awaiting_kind(recon)[0])
 
 
 # ═══════════════════════════ что считать одной причиной ════════════════
@@ -436,14 +522,91 @@ class TestNegative(unittest.TestCase):
         # А при этом ЖИВ — три failed подряд остановят и сами по себе.
         self.assertIn("сигнал А", rep["stop"])
 
-    # ── сигнал В: карточка ждёт ответа ───────────────────────────────────
+    # ── сигнал В: карточка ГАРДА ждёт ответа ─────────────────────────────
     def test_signal_c_stops_while_a_card_awaits_the_owner(self):
         rep = _tick(rows=[_card(1), _card(2)], place=True)
         self.assertEqual([], rep["placed"])
         self.assertIn("сигнал В", rep["stop"])
         self.assertIn("#1", rep["stop"])
+        self.assertIn("держат 2", rep["stop"])
         self.assertIn(sig.BY_ITSELF, rep["stop"])
         self.assertNotIn(sig.BY_OWNER, rep["stop"].split("сигнал В")[1])
+
+    # ── ЧЕТЫРЕ ОТРИЦАТЕЛЬНЫХ ТЕСТА РАЗЛИЧИТЕЛЯ (пункт 5 задания 03.09) ───
+    def test_only_claims_in_the_queue_and_the_box_takes_work(self):
+        """1. ТОЛЬКО ЗАЯВКИ — ЯЩИК БЕРЁТ ЗАДАНИЕ.
+
+        Живой корпус замера 03.09 дословно: четыре заявки разведки и одна заявка
+        внешнего канала, карточек гарда ноль. До этой правки ящик стоял на всех
+        пяти; ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ тут же — задание обязано УЕХАТЬ, иначе
+        правило «никогда ничего не берём» прошло бы проверку идеально и стоило
+        ноль.
+        """
+        rows = [_recon_ask(13), _recon_ask(31), _recon_ask(39), _recon_ask(40), _zayavka(79)]
+        rep = _tick(rows=rows, place=True)
+        self.assertEqual("", rep["stop"], rep["stop"])
+        self.assertEqual(1, len(rep["placed"]), rep["why"])
+        c = [s for s in rep["signals"] if s["sig"] == sig.SIG_C][0]
+        self.assertFalse(c["on"])
+        self.assertEqual(0, c["count"])
+        # ЖДУЩИЕ НЕ ПРОПАЛИ ИЗ ВИДА: молчание про пять открытых заявок читалось бы
+        # как «у владельца пусто» — а это ровно то враньё, от которого правка.
+        self.assertIn("ждут мнения 5", c["why"])
+
+    def test_a_guard_card_among_the_claims_still_stops_the_box(self):
+        """2. ЕСТЬ КАРТОЧКА ГАРДА — НЕ БЕРЁТ. Право карточки останавливать не тронуто."""
+        rows = [_recon_ask(13), _zayavka(79), _card(80)]
+        rep = _tick(rows=rows, place=True)
+        self.assertEqual([], rep["placed"])
+        self.assertIn("держат 1, ждут мнения 2", rep["stop"])
+        self.assertIn("#80", rep["stop"])
+
+    def test_an_unreadable_row_stops_the_box_and_says_why(self):
+        """3. ВИД РЯДА НЕ ОПРЕДЕЛЁН — НЕ БЕРЁТ, И ПРИЧИНА НАЗВАНА ОТДЕЛЬНЫМИ СЛОВАМИ.
+
+        Отказ консервативный: цена лишней остановки — виток, цена пропущенной
+        карточки гарда — красная операция, о которой владельца не спросили. Но
+        «не разобрали ряд» обязано читаться иначе, чем «владелец держит красное».
+        """
+        rep = _tick(rows=[_faceless(90)], place=True)
+        self.assertEqual([], rep["placed"])
+        self.assertIn("сигнал В", rep["stop"])
+        self.assertIn("НЕОПОЗНАННЫМ видом", rep["stop"])
+        self.assertIn("#90", rep["stop"])
+        kind, how = sig.awaiting_kind(_faceless(90))
+        self.assertEqual(sig.KIND_UNKNOWN, kind)
+        self.assertIn("нет тела", how)
+
+    def test_an_answered_guard_card_clears_the_signal_by_itself(self):
+        """4. КАРТОЧКА ОТВЕЧЕНА — СНИМАЕТСЯ САМ. Ни метки, ни правки, ни рестарта."""
+        before = _tick(rows=[_card(81), _zayavka(79)], place=True)
+        self.assertIn("держат 1", before["stop"])
+        after = _tick(rows=[dict(_card(81), status="approved"), _zayavka(79)], place=True)
+        self.assertEqual("", after["stop"], after["stop"])
+        self.assertEqual(1, len(after["placed"]), after["why"])
+
+    def test_the_revizor_info_card_is_not_a_holding_card(self):
+        """Третий вид, освобождённый демоном от TTL, ящик тоже не держит."""
+        rep = _tick(rows=[_revizor_card(70)], place=True)
+        self.assertEqual("", rep["stop"], rep["stop"])
+        self.assertEqual(1, len(rep["placed"]), rep["why"])
+
+    def test_two_numbers_never_add_up_into_one(self):
+        """Числа идут ВРОЗЬ: «держат» и «ждут мнения» в одно не складываются."""
+        split = sig.split_waiting([_card(1), _faceless(2), _recon_ask(3), _zayavka(4)])
+        self.assertEqual([1, 2], [r["id"] for r in sig.holding(split)])
+        self.assertEqual([3, 4], [r["id"] for r in split["ask"]])
+        c = sig.signal_c([_card(1), _faceless(2), _recon_ask(3), _zayavka(4)])
+        self.assertEqual(2, c["count"])
+        self.assertIn("держат 2, ждут мнения 2", c["why"])
+        self.assertNotIn("держат 4", c["why"])
+
+    def test_open_rows_that_are_not_awaiting_are_not_counted_at_all(self):
+        """Предмет В — ожидание ответа, а не открытая работа (её судит owner_busy)."""
+        split = sig.split_waiting([{"id": 1, "status": "new", "task_text": "работа"},
+                                   {"id": 2, "status": "in_progress", "task_text": "работа"}])
+        self.assertEqual([], sig.holding(split))
+        self.assertEqual([], split["ask"])
 
     def test_signal_c_clears_itself_after_the_owner_answered(self):
         """ОТРИЦАТЕЛЬНЫЙ ТЕСТ ЗАДАНИЯ: снимается САМ, без чужого вмешательства.
