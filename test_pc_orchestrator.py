@@ -2428,8 +2428,14 @@ class TestClientWatchdog(unittest.TestCase):
 
     def setUp(self):
         self._save = (o._cowork, o._notify, o._notify_critical, o._stopped,
-                      o._notify_topic, o.RAISE_VERIFY_SEC)
+                      o._notify_topic, o.RAISE_VERIFY_SEC, o._child_deploy_voice)
         self.notes, self.pushes, self.crit, self.cards = [], [], [], []
+        # ГОЛОС подъёма мимо ворот (03.09) перехватываем ОБЯЗАТЕЛЬНО: незамоканный он зовёт живой
+        # git и пишет БОЕВОЙ файл памяти подъёмов pc_orchestrator.child_raise_commit.json прямо
+        # из прогона тестов (известный класс «тесты сорят в боевое»). Своё поведение голос
+        # стережёт сам — test_deploy_voice.
+        self.voiced = []
+        o._child_deploy_voice = lambda name: self.voiced.append(name)
         o._cowork = lambda line: self.notes.append(line)
         o._notify = lambda text: self.pushes.append(text)
         o._notify_critical = lambda text: self.crit.append(text)   # критические инциденты → инбокс 1160
@@ -2442,7 +2448,7 @@ class TestClientWatchdog(unittest.TestCase):
 
     def tearDown(self):
         (o._cowork, o._notify, o._notify_critical, o._stopped,
-         o._notify_topic, o.RAISE_VERIFY_SEC) = self._save
+         o._notify_topic, o.RAISE_VERIFY_SEC, o._child_deploy_voice) = self._save
 
     def _spec(self, name, alive_seq, raiser_ok=True, skip=False):
         """Спека процесса: alive_seq — очередь ответов finder (True/False по тикам).
@@ -2717,8 +2723,14 @@ class TestWatchdogClassFix(unittest.TestCase):
 
     def setUp(self):
         self._save = (o._cowork, o._notify, o._notify_critical, o._stopped,
-                      o._notify_topic, o.RAISE_VERIFY_SEC)
+                      o._notify_topic, o.RAISE_VERIFY_SEC, o._child_deploy_voice)
         self.notes, self.pushes, self.crit, self.cards = [], [], [], []
+        # ГОЛОС подъёма мимо ворот (03.09) перехватываем ОБЯЗАТЕЛЬНО: незамоканный он зовёт живой
+        # git и пишет БОЕВОЙ файл памяти подъёмов pc_orchestrator.child_raise_commit.json прямо
+        # из прогона тестов (известный класс «тесты сорят в боевое»). Своё поведение голос
+        # стережёт сам — test_deploy_voice.
+        self.voiced = []
+        o._child_deploy_voice = lambda name: self.voiced.append(name)
         o._cowork = lambda line: self.notes.append(line)
         o._notify = lambda text: self.pushes.append(text)
         o._notify_critical = lambda text: self.crit.append(text)   # критические инциденты → инбокс 1160
@@ -2730,7 +2742,7 @@ class TestWatchdogClassFix(unittest.TestCase):
 
     def tearDown(self):
         (o._cowork, o._notify, o._notify_critical, o._stopped,
-         o._notify_topic, o.RAISE_VERIFY_SEC) = self._save
+         o._notify_topic, o.RAISE_VERIFY_SEC, o._child_deploy_voice) = self._save
 
     def _spec(self, name, finder, logfile=None, skip=False):
         raises = []
@@ -2903,8 +2915,13 @@ class TestDowntimeLife(unittest.TestCase):
         # Перехватываем ОБА канала наружу обязательно: незамоканный _notify_topic шлёт боевую
         # карточку в тему 328 прямо из прогона тестов, а _cowork — строку в мозг.
         self._save = (o._cowork, o._notify, o._notify_critical, o._notify_topic,
-                      o._stopped, o.RAISE_VERIFY_SEC)
+                      o._stopped, o.RAISE_VERIFY_SEC, o._child_deploy_voice)
         self.notes, self.cards = [], []
+        # ГОЛОС подъёма мимо ворот (03.09): предмет этого класса — ДЛИТЕЛЬНОСТЬ простоя, а не код.
+        # Незамоканный голос звал бы живой git на каждом подъёме; свою память он изолирует сам
+        # (deploy_voice._state), поведение стережёт test_deploy_voice.
+        self.voiced = []
+        o._child_deploy_voice = lambda name: self.voiced.append(name)
         o._cowork = lambda line: self.notes.append(line)
         o._notify = lambda text: self.cards.append(text)
         o._notify_critical = lambda text: self.cards.append(text)
@@ -2916,7 +2933,7 @@ class TestDowntimeLife(unittest.TestCase):
 
     def tearDown(self):
         (o._cowork, o._notify, o._notify_critical, o._notify_topic,
-         o._stopped, o.RAISE_VERIFY_SEC) = self._save
+         o._stopped, o.RAISE_VERIFY_SEC, o._child_deploy_voice) = self._save
 
     def _log_at(self, name, ts):
         """Лог процесса с mtime = ts (свидетель жизни)."""

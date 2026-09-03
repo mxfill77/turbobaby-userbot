@@ -294,7 +294,8 @@ heartbeat, не замкнув виток, на этой полосе НЕЧЕМ
 входной точки, `cut=()`):
 
     процесс          замыкание   карта знает   карта НЕ знает
-    pc_agent               5           2            3  (io_utf8, proc_identity, selfupdate_gate)
+    pc_agent               7           2            5  (io_utf8, proc_identity, selfupdate_gate,
+                                                        client_contour, deploy_voice — с 03.09)
     userbot               63           8           55
     moderation_bot        64           9           55
     pc_orchestrator       59           0 (его в карте нет вовсе — он следит за собой сам)

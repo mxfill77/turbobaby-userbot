@@ -2540,9 +2540,13 @@ class TestO6Hands(unittest.TestCase):
         import client_contour as cc
         cl = cc.closure(REPO, entries=("pc_agent.py",), cut=())
         self.assertTrue(cl.ok, cl.reason)
+        # 03.09.2026: замыкание агента 5 → 7. Приехало ОДНОЙ строкой `import deploy_voice`
+        # (голос подъёма мимо ворот), и за ней транзитивно `client_contour` — тот же признак,
+        # которым судят ворота. Тест сработал ровно так, как задуман: не протух молча, а
+        # заставил пересчитать. Числа таблицы О6 в шапке expectations_pc.py обновлены там же.
         self.assertEqual(sorted(cl.files),
-                         ["io_utf8.py", "log_setup.py", "pc_agent.py", "proc_identity.py",
-                          "selfupdate_gate.py"])
+                         ["client_contour.py", "deploy_voice.py", "io_utf8.py", "log_setup.py",
+                          "pc_agent.py", "proc_identity.py", "selfupdate_gate.py"])
 
     def test_the_run_says_it_every_single_pass(self):
         """п.3 задания: расхождение говорится КАЖДЫЙ виток, пока живо, — и попадает в состояние
