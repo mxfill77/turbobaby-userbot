@@ -9601,7 +9601,7 @@ def maybe_recon_auto(now=None, tick_path=None, state_path=None, runner=None):
 #     7× к худшему измеренному и ≤5% занятости даже на плохой сети.
 # ОТКАТ ПАУЗЫ — ручкой `SHTAB_BOX_MIN_SEC` (вернуть 1800), правки кода не требует.
 SHTAB_BOX_MIN_SEC = float(os.getenv("SHTAB_BOX_MIN_SEC", "600") or "600")     # пол паузы, с
-SHTAB_BOX_BUDGET = int(os.getenv("SHTAB_BOX_BUDGET", "3") or "3")             # заданий в сутки НА ПОЛОСУ
+SHTAB_BOX_BUDGET = int(os.getenv("SHTAB_BOX_BUDGET", "8") or "8")             # заданий в сутки НА ПОЛОСУ (местные)
 SHTAB_BOX_LIMIT = int(os.getenv("SHTAB_BOX_LIMIT", "1") or "1")               # заданий за виток
 SHTAB_BOX_TICK_FILE = _state(os.path.join(REPO, "pc_orchestrator.shtab_box_tick.json"))
 SHTAB_BOX_MARKS_KEEP = 20          # меток остановки в метке оборота: индекс, а не архив
