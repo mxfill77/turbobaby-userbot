@@ -407,7 +407,12 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
     это НЕ отказ прибора и НЕ прочитанный ноль.
     """
     stamp = now_iso(clock)
-    today = review_intake.today_utc(stamp)
+    # ДЕНЬ ЯЩИКА — МЕСТНЫЙ, А НЕ UTC (04.09.2026). `review_intake.today_utc` здесь
+    # больше не зовётся НЕ потому, что она плоха, а потому что её день считают
+    # четверо и он у них UTC по построению корпусов; сдвинь мы её — сутки уехали бы
+    # всем МОЛЧА. Своя дверь — `shtab_box.lane_day`, там же названо, что происходит
+    # с маркерами уже взятых задач на стыке двух отсчётов.
+    today = shtab_box.lane_day(stamp)
     out = {"schema": shtab_box.SCHEMA, "stamp": stamp, "today": today,
            "node": node or shtab_box.NODE_NAME, "node_ok": False, "node_why": "",
            "prefix": shtab_box.TASK_PREFIX if prefix is None else str(prefix),

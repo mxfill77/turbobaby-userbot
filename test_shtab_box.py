@@ -29,7 +29,12 @@
   сведения: чужая форма (канон ``result_ref``) воротами не берётся, а принятая —
   не только берётся, но и СУДИТСЯ живым ``done_judge_pc`` до вердикта «сделано».
 * :class:`TestCeiling` — суточный потолок и лимит витка; оба restart-proof, оба
-  считаются по маркерам ЖИВОЙ очереди чужим устройством (ступень E).
+  считаются по маркерам ЖИВОЙ очереди чужим устройством (ступень E). С 04.09.2026
+  предмет проверки здесь ещё и ОБОСНОВАНИЕ числа: потолок 8 — ограничитель ущерба
+  от разгона, и комментарий, выдающий его за долю мощности, тест не пропускает.
+* :class:`TestLaneDay` — сутки ящика по МЕСТНОМУ времени полосы (UTC+7): обе
+  стороны границы, стык с маркерами прежнего отсчёта (день не исчерпывается дважды
+  и обнуляется один раз) и неприкосновенность общей ``review_intake.today_utc``.
 * :class:`TestHands` — руки: сухой ход очередь не трогает, дорогое чтение `done`
   не спрашивается впустую, боевой ход ставит ряд.
 * :class:`TestWiring` — врезка в демона и в сводку контура.
@@ -37,6 +42,7 @@
 from __future__ import annotations
 
 import ast
+import datetime
 import io
 import os
 import tempfile
@@ -47,6 +53,7 @@ import contour_digest_run as cdr
 import done_judge_pc as dj
 import recon_auto
 import result_ref
+import review_intake            # ПРЕЖНЯЯ дверь суток: держим доказательство, что она НЕ тронута
 import shtab_box as sb
 import shtab_box_run as run
 
@@ -1118,8 +1125,12 @@ class TestCeiling(unittest.TestCase):
         self.assertIn("не больше 1 за виток", " ".join(w for _k, w in rep["held"]))
 
     def test_the_daily_ceiling_counts_CLOSED_rows_too(self):
-        """Урок ступени E дословно: счёт по одним открытым рядам мерит одновременность."""
-        closed = [_row("aa1"), _row("bb1"), _row("cc1")]
+        """Урок ступени E дословно: счёт по одним открытым рядам мерит одновременность.
+
+        Корпус набирается ОТ КОНСТАНТЫ, а не тремя строками: числом здесь был
+        прежний потолок 3, и после подъёма до 8 тест зеленел бы на пустом месте.
+        """
+        closed = [_row("q%02d" % i) for i in range(sb.DAILY_BUDGET)]
         q = FakeQueue(closed=closed)
         rep = _tick(_box(("kk9", GOOD_BODY)), queue=q, place=True)
         self.assertEqual(rep["placed"], [])
@@ -1127,8 +1138,7 @@ class TestCeiling(unittest.TestCase):
 
     def test_yesterdays_rows_do_not_eat_todays_budget(self):
         """ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ потолка: правило, глушащее всё, прошло бы тест выше."""
-        closed = [_row("aa1", day="2026-09-01"), _row("bb1", day="2026-09-01"),
-                  _row("cc1", day="2026-09-01")]
+        closed = [_row("q%02d" % i, day="2026-09-01") for i in range(sb.DAILY_BUDGET)]
         rep = _tick(_box(("kk9", GOOD_BODY)), queue=FakeQueue(closed=closed), place=True)
         self.assertEqual(len(rep["placed"]), 1, rep["why"])
 
@@ -1143,7 +1153,7 @@ class TestCeiling(unittest.TestCase):
 
     def test_the_ceiling_number_is_named_and_reused_not_reinvented(self):
         """Потолок и дедуп берутся у ступени E, а не пишутся вторым экземпляром."""
-        self.assertEqual(sb.DAILY_BUDGET, 3)
+        self.assertEqual(sb.DAILY_BUDGET, 8)
         self.assertIs(sb.budget_left.__wrapped__ if hasattr(sb.budget_left, "__wrapped__")
                       else recon_auto.budget_left, recon_auto.budget_left)
         self.assertEqual(sb.budget_left([], TODAY, 3, marks_ok=False), 0)
@@ -1160,6 +1170,127 @@ class TestCeiling(unittest.TestCase):
         # …и наш маркер прежними глазами НЕ виден: два счёта не смешиваются.
         self.assertEqual(recon_auto.markers([_row("kk1")]), [])
         self.assertEqual(sb.markers([row]), [])
+
+    def test_the_ceiling_is_honest_about_what_it_is_and_what_really_stops(self):
+        """ОБОСНОВАНИЕ — предмет проверки наравне с числом (правка 04.09.2026).
+
+        Прежний комментарий выдавал ограничитель за справедливый делёж («30%
+        медианной мощности»), и число, взятое как доля, поднимается только вместе
+        с ложью о доле. Держим тем же способом, каким полоса держит остальные
+        числа: обоснование обязано называть, ЧТО останавливает на самом деле.
+        """
+        body = _src("shtab_box.py")
+        head = body.split("DAILY_BUDGET = ")[0]
+        self.assertNotIn("30% медианной суточной мощности", head)
+        self.assertIn("ОГРАНИЧИТЕЛЬ УЩЕРБА ОТ РАЗГОНА", head)
+        self.assertIn("shtab_box_signals", head.split("ВОСЕМЬ ЗАДАЧ В СУТКИ")[-1])
+
+    def test_the_daemon_default_moved_with_the_constant(self):
+        """Подъём в чистом модуле без ручки демона был бы КОСМЕТИКОЙ.
+
+        Бой берёт число не отсюда, а из `os.getenv("SHTAB_BOX_BUDGET", …)`: оставь
+        мы там прежний дефолт — константа говорила бы 8, а ящик брал бы 3, и
+        расхождение было бы молчаливым.
+        """
+        self.assertIn('"SHTAB_BOX_BUDGET", "8"', _src("pc_orchestrator.py"))
+
+
+class TestLaneDay(unittest.TestCase):
+    """СУТКИ ЯЩИКА — МЕСТНЫЕ (правка 04.09.2026, :func:`shtab_box.lane_day`)."""
+
+    def test_the_lane_stands_at_plus_seven_and_the_offset_is_not_asked_of_the_OS(self):
+        self.assertEqual(sb.LANE_TZ.utcoffset(None), datetime.timedelta(hours=7))
+
+    def test_the_night_belongs_to_the_new_day_not_to_the_old_one(self):
+        """ЖИВОЙ СЛУЧАЙ ЗАМЕРА 04.09 ДОСЛОВНО: 02:51 местного = 19:51 UTC вчерашних.
+
+        Это и есть цена прежнего правила: по UTC ящик считал бы ночь вчерашним
+        днём и стоял бы на вчерашнем потолке до 07:00 местного.
+        """
+        self.assertEqual(sb.lane_day("2026-09-03T19:51:13Z"), "2026-09-04")
+        self.assertEqual(review_intake.today_utc("2026-09-03T19:51:13Z"), "2026-09-03")
+
+    def test_the_day_turns_at_local_midnight_and_not_at_seven(self):
+        """ГРАНИЦА НАЗВАНА С ОБЕИХ СТОРОН: минута до и минута после 17:00 UTC."""
+        self.assertEqual(sb.lane_day("2026-09-03T16:59:59Z"), "2026-09-03")
+        self.assertEqual(sb.lane_day("2026-09-03T17:00:00Z"), "2026-09-04")
+        # …а прежний рубеж 00:00 UTC днём полосы больше не является
+        self.assertEqual(sb.lane_day("2026-09-03T23:59:59Z"), "2026-09-04")
+
+    def test_an_offset_in_the_stamp_is_obeyed_not_ignored(self):
+        """Момент один, написаний много: день обязан зависеть от МОМЕНТА."""
+        self.assertEqual(sb.lane_day("2026-09-04T00:51:13+07:00"), "2026-09-04")
+        self.assertEqual(sb.lane_day("2026-09-03T17:51:13+00:00"), "2026-09-04")
+
+    def test_a_naked_stamp_is_read_as_UTC_and_not_as_this_machine(self):
+        """Чистая функция не смеет спрашивать часовой пояс ОС — иначе она нечистая."""
+        self.assertEqual(sb.lane_day("2026-09-03T17:00:00"), "2026-09-04")
+
+    def test_the_module_stays_pure_though_it_now_knows_about_time(self):
+        """Знание о СМЕЩЕНИИ — не часы. Часов не завелось: «сейчас» приезжает полем."""
+        self.assertNotIn("datetime.datetime.now", _src("shtab_box.py"))
+        with self.assertRaises(TypeError):
+            sb.lane_day()                       # без момента ответа нет вовсе
+
+    def test_the_hands_ask_the_lane_day_and_no_longer_the_utc_one(self):
+        """Правка бесполезна, если руки продолжают звать прежнюю дверь."""
+        body = _src("shtab_box_run.py")
+        self.assertIn("shtab_box.lane_day(stamp)", body)
+        self.assertNotIn("review_intake.today_utc(stamp)", body)
+
+    def test_the_shared_utc_day_is_left_untouched_for_its_four_owners(self):
+        """СОСЕДИ НЕ ТРОНУТЫ: у ступеней B и E день остаётся UTC, и это проверяется."""
+        self.assertEqual(review_intake.today_utc("2026-09-03T23:59:59Z"), "2026-09-03")
+        for mod in ("recon_auto_run.py", "review_audit_run.py", "review_intake_run.py"):
+            self.assertIn("review_intake.today_utc(stamp)", _src(mod))
+
+    def test_the_digest_counts_the_box_by_the_SAME_day_as_the_ceiling(self):
+        """Сводка и замок обязаны считать ОДНИ сутки, иначе владелец видит два числа.
+
+        Сводка показывает «взято N при потолке M», а держит потолок ящик. Останься
+        разрез сводки на UTC — ночью она называла бы вчерашний день при живом
+        сегодняшнем счёте. Окно внешних ответов при этом на UTC и остаётся: у него
+        разрез свой, и тест это ЗАКРЕПЛЯЕТ, а не молчит об этом.
+        """
+        ts = datetime.datetime(2026, 9, 3, 19, 51, 13,
+                               tzinfo=datetime.timezone.utc).timestamp()
+        self.assertEqual(cdr.day_lane(ts), "2026-09-04")
+        self.assertEqual(cdr.day_utc(ts), "2026-09-03")
+        self.assertIn("day_lane(now)", _src("contour_digest_run.py"))
+        self.assertEqual(cdr.day_lane(None), "")      # третий исход, а не сегодняшний день
+
+    def test_the_seam_never_exhausts_a_day_twice(self):
+        """ЗАМОК СТЫКА, названный числом.
+
+        Старый маркер с датой X написан внутри UTC-суток X = местного отрезка
+        [X 07:00, X+1 07:00). В корзину БОЛЕЕ ПОЗДНИХ местных суток он не попадает
+        никогда — строка сравнивается на равенство. Значит переезд не может
+        «съесть» завтрашний бюджет: единственный возможный исход стыка —
+        одноразовое обнуление, и оно проверено соседним тестом.
+        """
+        old = [("2026-09-03", "k%02d" % i) for i in range(3)]      # взяты по UTC-суткам 03.09
+        self.assertEqual(sb.budget_left(old, "2026-09-04", sb.DAILY_BUDGET), sb.DAILY_BUDGET)
+        self.assertEqual(sb.budget_left(old, "2026-09-05", sb.DAILY_BUDGET), sb.DAILY_BUDGET)
+        # …и в СВОИ местные сутки они по-прежнему считаются, а не пропадают вовсе
+        self.assertEqual(sb.budget_left(old, "2026-09-03", sb.DAILY_BUDGET), sb.DAILY_BUDGET - 3)
+
+    def test_the_seam_resets_the_day_at_most_once_and_the_price_is_named(self):
+        """Обратная половина стыка: ночные маркеры сегодня не видны — ОДИН раз.
+
+        Задача, взятая 04.09 в 02:51 местного, помечена вчерашним числом (UTC
+        03.09) и в счёт местного 04.09 не идёт. Худшая цена — прежний потолок 3
+        сверх нового 8 за одни сутки перехода, и только в день выкатки.
+        """
+        night = sb.lane_day("2026-09-03T19:51:13Z")                # местное 04.09 02:51
+        self.assertEqual(night, "2026-09-04")
+        stamped = review_intake.today_utc("2026-09-03T19:51:13Z")  # а маркер несёт вот это
+        self.assertEqual(stamped, "2026-09-03")
+        self.assertNotEqual(night, stamped)
+        self.assertEqual(sb.budget_left([(stamped, "kk1")], night, sb.DAILY_BUDGET),
+                         sb.DAILY_BUDGET)
+        # СО ВТОРЫХ СУТОК стык кончается: новые маркеры набраны местным днём
+        fresh = [(night, "n%02d" % i) for i in range(sb.DAILY_BUDGET)]
+        self.assertEqual(sb.budget_left(fresh, night, sb.DAILY_BUDGET), 0)
 
 
 # ═══════════════════════════ руки ══════════════════════════════════════
