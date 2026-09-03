@@ -301,12 +301,19 @@ class Queue(review_intake_run.Queue):
         Мост не ответил → ``ok=False``, и зовущий не ставит НИЧЕГО: замок
         владельца и потолок суток оба стоя́т на очереди, и ставить, не сверив их,
         значило бы обойти собственные правила по недосмотру.
+
+        ПРИЧИНА НАЗЫВАЕТСЯ ПО СУЩЕСТВУ, А НЕ ИМЕНЕМ КЛАССА (04.09.2026): берём
+        ``error_text``, а ``error`` оставляем запасным. С потолком времени на мост
+        у отказа появился третий вид — «не спрашивали, мост был занят», — и голое
+        ``BridgeBudgetExhausted`` в причине читалось бы как поломка прибора, тогда
+        как это отложенное чтение. Тот же класс ложных диагнозов, что закрыли в
+        ``bridge_http.explain``: имя класса не новость, новость — что произошло.
         """
         out = []
         for status in statuses:
             res = self._d.bc.get_pending(status)
             if not res.get("ok"):
-                return [], False, str(res.get("error") or "мост не ответил")
+                return [], False, str(res.get("error_text") or res.get("error") or "мост не ответил")
             for it in (res.get("items") or []):
                 if str(it.get("lane") or "pc") != "pc":
                     continue

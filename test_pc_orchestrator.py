@@ -11349,5 +11349,209 @@ class TestStageCJudgeWiring(unittest.TestCase):
                          "судья зовётся РОВНО из одного места полосы")
 
 
+class _BudgetBridge(o.Bridge):
+    """Мост с УПРАВЛЯЕМОЙ ценой вызова: сеть не задета, «секунды» идут по счётчику.
+
+    Подменяется не транспорт, а сам обмен: нам важно, что считает и режет ПОТОЛОК, а не как
+    urllib ходит по редиректам (это уже покрыто своим набором)."""
+
+    def __init__(self, cost, budget, **kw):
+        super().__init__(url="https://x", token="t", witness=lambda *a, **k: None, **kw)
+        self.cost = cost              # секунд на вызов (число или список по вызовам)
+        self.budget = budget
+        self.hits = []                # действия, реально ушедшие «в сеть»
+        self.clock = [0.0]
+
+    def _call(self, method, params=None, payload=None, budget=None, action="", cuttable=True):
+        b = self.budget if budget is None else budget
+        name = str(action or method)
+        if b is not None and cuttable and b.exhausted():
+            return b.skip(name)
+        self.hits.append(name)
+        cost = self.cost.pop(0) if isinstance(self.cost, list) else self.cost
+        if b is not None:
+            b.spend(cost, name)                      # платят ВСЕ, включая мутации
+        return {"ok": True, "items": [], "action": name}
+
+
+class TestBridgeLoopBudget(unittest.TestCase):
+    """ПОТОЛОК ВРЕМЕНИ НА МОСТ В ОДНОМ ВИТКЕ (04.09.2026).
+
+    Дефект: лестница повторов ОДНОГО вызова собственного потолка не имеет, а виток синхронен —
+    замер живого `bridge_http` инъекцией opener/sleeper дал 4802 с (80 мин) на один GET при
+    боевом `Bridge(timeout=90)`. Пока лестница лезет, встают ящик, ступени и витрина."""
+
+    def budget(self, limit=900):
+        return o.BridgeLoopBudget(limit=limit)
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ: прибор, режущий здоровый виток, хуже отсутствующего ──────────
+    def test_a_fast_bridge_never_meets_the_ceiling(self):
+        """БЫСТРЫЙ МОСТ НЕ ЛОВИТ ПОТОЛОК НИ РАЗУ. Цена вызова взята НЕ с потолка: 2.7 с — это
+        замеренная живая цена перечисления папки (2.42 и 2.66 с тёплых), а 40 вызовов — вдвое
+        больше, чем виток делает на самом деле (у ящика их до 13)."""
+        b = self.budget()
+        br = _BudgetBridge(2.7, b)
+        for _ in range(40):
+            r = br.get_pending("new")
+            self.assertTrue(r.get("ok"))
+            self.assertNotEqual(r.get("error_kind"), o.KIND_BUDGET)
+        self.assertEqual(len(br.hits), 40, "здоровый виток обязан сходить в мост все 40 раз")
+        self.assertFalse(b.exhausted())
+        self.assertEqual(b.skipped, [])
+        self.assertEqual(b.report(), "", "молчаливый виток — тот, где резать было нечего")
+
+    def test_the_ceiling_stops_the_remaining_reads_of_this_loop(self):
+        """Исчерпан → оставшиеся обращения ЭТОГО витка не делаются ВОВСЕ (сети не касаемся)."""
+        b = self.budget(limit=100)
+        br = _BudgetBridge(60.0, b)
+        self.assertTrue(br.get_pending("new").get("ok"))          # 60с — потолок цел
+        self.assertTrue(br.get_pending("approved").get("ok"))     # 120с — потолок перейдён
+        r = br.get_pending("needs_approval")
+        self.assertFalse(r.get("ok"))
+        self.assertEqual(len(br.hits), 2, "третий вызов обязан НЕ уйти в сеть")
+        self.assertEqual(b.tripped_on, "get_pending")
+
+    def test_the_third_outcome_is_not_a_zero_and_not_a_broken_instrument(self):
+        """ТРЕТИЙ ИСХОД: «не спрашивали, потому что мост был занят». Ни пустой список, ни отказ."""
+        b = self.budget(limit=1)
+        br = _BudgetBridge(5.0, b)
+        br.get_pending("new")
+        r = br.get_pending("approved")
+        self.assertFalse(r.get("ok"), "«не спрашивали» не смеет притворяться успехом")
+        self.assertTrue(r.get("budget_skipped"))
+        self.assertEqual(r.get("error_kind"), o.KIND_BUDGET)
+        self.assertEqual(r.get("error"), o.BUDGET_ERROR)
+        self.assertNotIn("items", r, "пустого списка тут нет: пустота читалась бы как «спросили»")
+        self.assertIn("не спрашивали", r["error_text"])
+        self.assertIn("мост был занят", r["error_text"])
+        # Третий исход обязан быть ОТЛИЧИМ от обоих соседей — и от сетевого отказа тоже.
+        bh = o.bridge_http
+        self.assertNotIn(o.KIND_BUDGET, (bh.KIND_NETWORK, bh.KIND_HTTP,
+                                         bh.KIND_BRIDGE, bh.KIND_OTHER))
+
+    # ── ЗАМОК ПРЕДСМЕРТНОГО ВЗГЛЯДА: путь ЗАПИСИ под потолок не ходит ───────────────────
+    def test_the_write_path_is_never_cut(self):
+        """МУТАЦИЯ НЕ РЕЖЕТСЯ НИКОГДА. Резать запись значило бы разменять зависший виток на
+        потерянную мутацию — дефект дороже исходного."""
+        b = self.budget(limit=1)
+        br = _BudgetBridge(50.0, b)
+        br.get_pending("new")                       # потолок исчерпан первым же чтением
+        self.assertTrue(b.exhausted())
+        for call in (lambda: br.claim_task(7),
+                     lambda: br.complete_task(7, "done", "ok"),
+                     lambda: br.task_heartbeat(7),
+                     lambda: br.enqueue_task("x", "y")):
+            r = call()
+            self.assertNotEqual(r.get("error_kind"), o.KIND_BUDGET,
+                                "POST обязан уйти в мост даже на исчерпанном потолке")
+        self.assertEqual([h for h in br.hits if h != "get_pending"],
+                         ["claim_task", "complete_task", "task_heartbeat", "enqueue_task"])
+
+    def test_the_proof_of_a_write_is_not_cut_either(self):
+        """`_in_status` — формально GET, но это ДОКАЗАТЕЛЬСТВО пути записи (CLAIM-VERIFY).
+        Срезанный потолком, он вернул бы None → пропуск цикла, и долетевший claim стал бы
+        сиротой. Это ровно тот размен, который запрещён."""
+        b = self.budget(limit=1)
+        br = _BudgetBridge(50.0, b)
+        br.get_pending("new")
+        self.assertTrue(b.exhausted())
+        br.hits.clear()
+        self.assertIs(br._in_status(7, "in_progress"), False)   # прочитали, ряда нет — НЕ «не знаю»
+        self.assertEqual(br.hits, ["get_pending"], "проверка записи обязана уйти в мост")
+
+    def test_a_slow_write_still_costs_the_loop(self):
+        """Мутация НЕ режется, но время своё в счётчик отдаёт: иначе медленная запись была бы для
+        витка бесплатной и потолок обходился бы сам собой."""
+        b = self.budget(limit=100)
+        br = _BudgetBridge(120.0, b)
+        br.claim_task(7)
+        self.assertTrue(b.exhausted())
+        self.assertFalse(br.get_pending("new").get("ok"))
+
+    # ── СОБЫТИЕ СО СЛОВАМИ ──────────────────────────────────────────────────────────────
+    def test_the_cut_loop_is_never_silent(self):
+        """Молчаливое сокращение витка неотличимо от поломки: событие обязано назвать секунды,
+        вызов остановки и что не успели."""
+        b = self.budget(limit=100)
+        br = _BudgetBridge(60.0, b)
+        br.get_pending("new")
+        br.get_pending("approved")
+        br._get("list_docs")
+        br._get("read_doc")
+        line = b.report()
+        self.assertIn("ПОТОЛОК МОСТА", line)
+        self.assertIn("120", line)                 # сколько секунд съел мост
+        self.assertIn("100", line)                 # из какого потолка
+        self.assertIn("get_pending", line)         # на каком вызове остановились
+        self.assertIn("list_docs", line)           # чего не сделали
+        self.assertIn("read_doc", line)
+
+    def test_the_event_is_said_once_per_loop(self):
+        """`_bridge_budget_note` зовётся и из нормального конца витка, и из ветки except: два
+        одинаковых предложения читались бы как два разных сокращённых витка."""
+        b = self.budget(limit=1)
+        br = _BudgetBridge(50.0, b)
+        br.get_pending("new")
+        br._get("list_docs")
+        said = []
+        lg = type("L", (), {"warning": lambda _s, _f, line: said.append(line)})()
+        self.assertTrue(o._bridge_budget_note(budget=b, logger=lg))
+        self.assertEqual(o._bridge_budget_note(budget=b, logger=lg), "")
+        self.assertEqual(len(said), 1)
+
+    def test_reset_clears_the_previous_loop(self):
+        """Потолок СВОЙ у каждого витка, а не накопительный: иначе демон замолчал бы навсегда
+        после первого же медленного витка."""
+        b = self.budget(limit=100)
+        br = _BudgetBridge(200.0, b)
+        br.get_pending("new")
+        self.assertTrue(b.exhausted())
+        b.reset()
+        self.assertFalse(b.exhausted())
+        self.assertEqual((b.spent, b.skipped, b.tripped_on, b.said), (0.0, [], "", False))
+        self.assertTrue(br.get_pending("new").get("ok"))
+
+    def test_zero_kills_the_branch_entirely(self):
+        """ОТКАТ ОДНОЙ РУЧКОЙ: PC_BRIDGE_LOOP_BUDGET=0 → ветка мертва, поведение прежнее."""
+        b = self.budget(limit=0)
+        br = _BudgetBridge(10_000.0, b)
+        for _ in range(5):
+            self.assertTrue(br.get_pending("new").get("ok"))
+        self.assertFalse(b.exhausted())
+        self.assertEqual(b.report(), "")
+
+    # ── ЗАМКИ УСТРОЙСТВА (греп по живому коду, а не по копии) ───────────────────────────
+    def test_the_ceiling_is_reset_in_the_loop_body_not_in_poll_once(self):
+        """«Виток» — тело главного цикла, а не `poll_once`: ящик, ступени и витрина живут ниже
+        по телу и встают ровно так же. Сброс внутри `poll_once` накрыл бы только очередь."""
+        with io.open(os.path.join(o.REPO, "pc_orchestrator.py"), encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertEqual(body.count("_bridge_budget.reset()"), 1)
+        head = body.index("def poll_once():")
+        tail = body.index("# ------------------------------- self-update", head)
+        self.assertNotIn("_bridge_budget.reset()", body[head:tail],
+                         "сброс внутри poll_once оставил бы ящик и витрину вне прибора")
+        self.assertLess(body.index("_bridge_budget.reset()"), body.index("maybe_shtab_box()"))
+
+    def test_the_write_door_is_declared_uncuttable_in_source(self):
+        """Замок от тихого возврата: обе двери пути записи обязаны звать `cuttable=False` ЯВНО."""
+        with io.open(os.path.join(o.REPO, "pc_orchestrator.py"), encoding="utf-8") as fh:
+            body = fh.read()
+        post = body.index("    def _post(self, action, **fields):")
+        self.assertIn("cuttable=False", body[post:post + 700])
+        st = body.index("    def _in_status(self, tid, status):")
+        self.assertIn("cuttable=False", body[st:st + 1600])
+
+    def test_time_is_counted_for_everyone_including_writes(self):
+        """Учёт времени и право резать — РАЗНЫЕ вопросы. Слитые в один флаг, они сделали бы
+        медленную мутацию бесплатной для витка, и потолок обходился бы сам собой."""
+        with io.open(os.path.join(o.REPO, "pc_orchestrator.py"), encoding="utf-8") as fh:
+            body = fh.read()
+        call = body.index("    def _call(self, method,")
+        seg = body[call:call + 3000]
+        self.assertIn("if b is not None:\n                b.spend(", seg,
+                      "spend обязан стоять на ВСЕХ вызовах, а не только на режущихся")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -649,6 +649,117 @@ def link_note(prefix=""):
     return "%s%s %s (каналы: %s)" % (prefix, name, age, ", ".join(chans) or "—")
 
 
+# ── ПОТОЛОК ВРЕМЕНИ НА МОСТ В ОДНОМ ВИТКЕ (класс 04.09.2026) ──────────────────────────────────
+# ДЕФЕКТ. Виток исполняется СИНХРОННО (потоков в демоне нет вовсе), а лестница повторов ОДНОГО
+# вызова моста собственного потолка не имеет: `bridge_http` даёт первое плечо + MAX_HOPS=6 хопов
+# × ECHO_TRIES=3 попытки расписки, и всё это ЦЕЛИКОМ переспрашивается READ_TRIES=3 раза для GET.
+# ЗАМЕР (инъекция opener/sleeper в живой `exchange`, сеть не задета; _scratch_bridge_budget_0904/
+# probe_ceiling.py): один GET на БОЕВОМ таймауте держит виток до 4802 с = 80 мин, на 30 с — 1622 с.
+# Оценка «9 мин» (30×3×6) неверна дважды: демон берёт `Bridge(timeout=90)`, а не DEFAULT_TIMEOUT=30,
+# и внешний цикл READ_TRIES в ней пропущен. Пока лестница лезет, встают ВСЕ потребители витка —
+# ящик, ступени, витрина: у ящика одного до 13 обращений за виток (папка 1 + шапка 1 + открытые 4
+# + закрытые 2 + тела READ_MAX=5).
+#
+# ПОТОЛОК СТОИТ ТОЛЬКО НА ПУТИ ЧТЕНИЯ, И ЭТО ГЛАВНОЕ ЗДЕСЬ. Повтор на пути ЗАПИСИ — единственное,
+# чем держится надёжность мутации (расписка забирается ПОСЛЕ того, как Apps Script исполнил
+# действие), и резать его значило бы разменять зависший виток на потерянную мутацию — дефект
+# дороже исходного. Поэтому из-под потолка выведены ДВЕ вещи, а не одна:
+#   • все POST (`_post`) — мутации;
+#   • `_in_status` — формально GET, но это ДОКАЗАТЕЛЬСТВО пути записи (CLAIM-VERIFY/COMPLETE-VERIFY,
+#     :737/:758). Срезав его, мы превратили бы долетевший claim в сироту — ровно тот же размен.
+# Чтение же дешевле повторить следующим витком: оно идемпотентно и ничего не теряет.
+#
+# ПОРОГ 900 с ИЗМЕРЕН, А НЕ НАЗНАЧЕН. Корпус — 200 строк «залипание вызова моста» живого
+# `pc_orchestrator.log` (у них сон измерен и равен 0, связь есть, работа в отрезке не шла):
+# медиана 349 · p90 504 · p95 605 · p99 779 · MAX 1437 с. Порог 900 с — это 1.16× p99, и на всём
+# корпусе он тронул бы РОВНО ОДИН виток из 200 — тот самый патологический 1437 с. Ниже брать
+# нельзя: 600 с срезали бы 11 витков, 480 с — 30, то есть прибор начал бы резать здоровое.
+# Сверху порог заперт сторожем: `WD_PRODUCT_SILENT` = 1800 с, и виток обязан замкнуться ДО того,
+# как сторож назовёт демона вставшим. 900 с оставляют ему ровно вдвое.
+# СТОРОЖА НЕ ТРОГАЕМ НИ СТРОКОЙ: он судит тишину и судит верно. Потолок как раз и делает его
+# рассуждение честным — комментарий у `WD_PRODUCT_SILENT` считает потолок одного вызова равным
+# ≈28 мин (по timeout=30), тогда как на боевых 90 с он 80 мин, то есть ВЫШЕ порога сторожа;
+# с потолком витка этот перекос закрыт со стороны витка, а не подкруткой сторожа.
+# ОТКАТ: `PC_BRIDGE_LOOP_BUDGET=0` — ветка мертва целиком, поведение прежнее.
+BRIDGE_LOOP_BUDGET = float(os.getenv("PC_BRIDGE_LOOP_BUDGET", "900") or "900")
+KIND_BUDGET = "budget"                 # третий исход: НЕ СПРАШИВАЛИ. Не ноль и не отказ прибора
+BUDGET_ERROR = "BridgeBudgetExhausted"  # имя в поле `error` — контракт «type(e).__name__» сохранён
+BUDGET_TEXT = ("не спрашивали: мост был занят — потолок времени на мост в этом витке (%.0fс) "
+               "исчерпан, остаток обращений отложен до следующего витка")
+
+
+class BridgeLoopBudget:
+    """Сколько секунд витка уже съел мост. Чистый счётчик, голден; часы инъектируются.
+
+    ТРЕТИЙ ИСХОД, а не ноль: исчерпание потолка НЕ отказ прибора и НЕ пустой ответ. Потребитель
+    обязан отличить «спросили, и там пусто» от «не спрашивали, потому что мост был занят», иначе
+    ящик возьмёт решение на несуществующих данных."""
+
+    def __init__(self, limit=None, clock=None):
+        self.clock = clock or time.perf_counter
+        self.reset(limit)
+
+    def reset(self, limit=None):
+        self.limit = BRIDGE_LOOP_BUDGET if limit is None else float(limit)
+        self.spent = 0.0
+        self.calls = 0
+        self.tripped_on = ""      # действие, НА КОТОРОМ потолок был перейдён
+        self.skipped = []         # действия, которых не сделали вовсе
+        self.said = False         # событие уже сказано в лог (см. `_bridge_budget_note`)
+
+    @property
+    def on(self):
+        return self.limit > 0
+
+    def spend(self, sec, action=""):
+        self.spent += max(0.0, float(sec))
+        self.calls += 1
+        if self.on and not self.tripped_on and self.spent >= self.limit:
+            self.tripped_on = str(action or "?")
+
+    def exhausted(self):
+        return self.on and self.spent >= self.limit
+
+    def skip(self, action):
+        """Обращение, которого не делаем. Имена не копим бесконечно — это индекс, а не архив."""
+        a = str(action or "?")
+        if a not in self.skipped:
+            self.skipped.append(a)
+        return {"ok": False, "error": BUDGET_ERROR, "error_kind": KIND_BUDGET,
+                "error_text": BUDGET_TEXT % self.limit, "budget_skipped": True, "ms": 0}
+
+    def report(self):
+        """Событие СО СЛОВАМИ или пустая строка. Молчаливое сокращение витка запрещено —
+        оно неотличимо от поломки."""
+        if not self.skipped and not self.tripped_on:
+            return ""
+        return ("ПОТОЛОК МОСТА: виток отдал мосту %.0fс из %.0fс за %d вызов(ов) — потолок перейдён "
+                "на «%s», НЕ СПРАШИВАЛИ вовсе: %s. Это не ноль и не отказ прибора: отложено до "
+                "следующего витка, виток закрываю штатно"
+                % (self.spent, self.limit, self.calls, self.tripped_on or "?",
+                   ", ".join(self.skipped) or "—"))
+
+
+_bridge_budget = BridgeLoopBudget()
+
+
+def _bridge_budget_note(budget=None, logger=None):
+    """Событие исчерпания в лог демона РОВНО ОДИН РАЗ за виток. → сказанная строка ("" — молчали).
+
+    Идемпотентность здесь не украшение: строка зовётся и из нормального конца витка, и из ветки
+    `except` (виток, упавший после обрезки, обязан всё равно назвать обрезку), а два одинаковых
+    предложения о ПОТОЛКЕ в логе читались бы как два разных сокращённых витка."""
+    b = _bridge_budget if budget is None else budget
+    if b.said:                    # прямым полем, а не getattr с умолчанием: `reset()` ставит его
+        return ""                 # всегда, и «нет атрибута» здесь было бы не умолчанием, а ошибкой
+    line = b.report()
+    if not line:
+        return ""
+    b.said = True
+    (logger or log).warning("%s", line)
+    return line
+
+
 # ------------------------------- Bridge (очередь) ----------------------------
 
 class Bridge:
@@ -672,14 +783,27 @@ class Bridge:
         self.opener = opener
         self.witness = witness          # точка инъекции свидетеля связи (боевой путь его не задаёт)
 
-    def _call(self, method, params=None, payload=None):
+    def _call(self, method, params=None, payload=None, budget=None, action="", cuttable=True):
         """Один обмен с мостом + ДВА бесплатных числа вокруг уже делаемого вызова: класс отказа
         и потраченные миллисекунды (латентность моста не мерилась вообще — «ответил за 2,3 с» и
         «залип на 122,6 с» были для системы одним событием).
 
         КОНТРАКТ ОТВЕТА СОХРАНЁН ДОСЛОВНО: `error` — по-прежнему `type(e).__name__`, на него
         смотрят семантические наборы (`_CLAIM_SEMANTIC`) и голдены. Поля ДОБАВЛЕНЫ, а не заменены:
-        `error_kind` (сеть/http/мост/иное), `error_text` (разбор по существу), `ms`."""
+        `error_kind` (сеть/http/мост/иное), `error_text` (разбор по существу), `ms`.
+
+        ДВА РАЗНЫХ ВОПРОСА, И ИХ НЕЛЬЗЯ СЛИВАТЬ В ОДИН ФЛАГ:
+          `cuttable` — можно ли ЭТОТ вызов не делать вовсе (только путь ЧТЕНИЯ);
+          учёт времени — идёт ВСЕГДА, у любого вызова, включая мутации.
+        Слей их — и медленная запись стала бы для витка БЕСПЛАТНОЙ: замер даёт одному POST до
+        1721 с на боевом таймауте, и виток, потративший их, продолжал бы спокойно читать дальше,
+        а потолок обходился бы сам собой. Поэтому мутация не режется, но своё время в счётчик
+        отдаёт — и следующее ЧТЕНИЕ уже упрётся в потолок.
+        `budget` — точка инъекции (None = боевой `_bridge_budget`)."""
+        b = _bridge_budget if budget is None else budget
+        name = str(action or method)
+        if b is not None and cuttable and b.exhausted():
+            return b.skip(name)                      # третий исход: сети не касаемся вовсе
         t0 = time.perf_counter()
         wit = self.witness or net_witness
         try:
@@ -691,16 +815,22 @@ class Bridge:
             wit(LINK_CH_BRIDGE, link_ok_by_kind(kind), detail=text)
             return {"ok": False, "error": type(e).__name__, "error_kind": kind,
                     "error_text": text, "ms": int((time.perf_counter() - t0) * 1000)}
+        finally:
+            if b is not None:
+                b.spend(time.perf_counter() - t0, name)   # платят ВСЕ, включая мутации
         # Мост ОТВЕТИЛ — связь доказана даже если ответ отрицательный по существу (`ok:false`).
         wit(LINK_CH_BRIDGE, True)
         return data
 
-    def _get(self, action, **params):
+    def _get(self, action, budget=None, cuttable=True, **params):
         q = {"action": action, "token": self.token, **{k: v for k, v in params.items() if v is not None}}
-        return self._call("GET", params=q)
+        return self._call("GET", params=q, budget=budget, action=action, cuttable=cuttable)
 
     def _post(self, action, **fields):
-        return self._call("POST", payload={"action": action, "token": self.token, **fields})
+        # МУТАЦИЯ НЕ РЕЖЕТСЯ НИ ОДНОЙ ВЕТКОЙ (`cuttable=False`): резать запись значило бы разменять
+        # зависший виток на потерянную мутацию — дефект дороже исходного. Время своё она платит.
+        return self._call("POST", payload={"action": action, "token": self.token, **fields},
+                          action=action, cuttable=False)
 
     def get_pending(self, status, lane=LANE):
         return self._get("get_pending", status=status, lane=lane)
@@ -717,8 +847,15 @@ class Bridge:
 
     def _in_status(self, tid, status):
         """Задача tid СЕЙЧАС в статусе status на МОЕЙ полосе? True | False | None (не прочитали).
-        None и False разведены: «не знаю» не смеет выдавать себя за «не легло»."""
-        r = self._get("get_pending", status=status, lane=LANE)
+        None и False разведены: «не знаю» не смеет выдавать себя за «не легло».
+
+        ПОД ПОТОЛОК ВИТКА НЕ ХОДИТ (`budget=False`), хотя формально это GET. Предмет здесь — не
+        разведка, а СУДЬБА УЖЕ СДЕЛАННОЙ МУТАЦИИ: этим чтением claim/complete отличают потерянную
+        расписку от несостоявшейся записи. Срезанное потолком, оно вернуло бы None → «не знаю» →
+        пропуск цикла, и долетевший claim стал бы сиротой. Это ровно тот размен зависшего витка на
+        потерянную мутацию, который делать запрещено, — потому путь записи выведен ЦЕЛИКОМ, вместе
+        со своим доказательством, а не только POST'ами. Время своё оно, как и мутация, платит."""
+        r = self._get("get_pending", status=status, lane=LANE, cuttable=False)
         if not (isinstance(r, dict) and r.get("ok")):
             return None
         return any(str(it.get("id")) == str(tid)
@@ -11070,6 +11207,11 @@ def _main_loop():
             # (2) Детект сна/пробуждения ДО вотчдога: если ПК спал, wall-clock скакнёт — взводим grace,
             # чтобы первый пост-пробуждение прогон вотчдога (троттлинг уже истёк) не принял медленный
             # CIM за смерть и не рестартнул зря. Взводим ТОЛЬКО на реальном скачке; норм. виток не трогаем.
+            # ПОТОЛОК МОСТА — СВОЙ У КАЖДОГО ВИТКА, и «виток» здесь ИМЕННО ЭТО ТЕЛО, а не
+            # `poll_once`: ящик, ступени и витрина живут ниже по телу и встают ровно так же, как
+            # очередь. Сбрось я счётчик внутри `poll_once`, потолок накрыл бы только его вызовы, а
+            # названные заданием пострадавшие остались бы вне прибора.
+            _bridge_budget.reset()
             now = time.time()
             awake_now = awake_monotonic()
             if _woke_from_sleep(now, _loop_prev_wall):
@@ -11115,10 +11257,15 @@ def _main_loop():
             maybe_lesson_commit_retry()  # пакет «полнота лога» п.6: докоммитить урок из спула (провал коммита ≠ вечная грязь)
             maybe_git_ff_pull()       # родитель #221: подтянуть origin/main ff-only ДО реконсиляции/self-update (тот же тик применит)
             maybe_reconcile_children()  # класс-фикс c6d8a30: применить свежий код детей на ЛЮБОЙ новый коммит
+            # СОКРАЩЁННЫЙ ВИТОК ОБЯЗАН БЫТЬ НАЗВАН СЛОВАМИ. Молчаливое сокращение неотличимо от
+            # поломки: «ящик ничего не взял» и «ящика не спрашивали, мост был занят» выглядели бы
+            # в логе одинаково. Строка идёт ДО self-update: тот выходит из функции return'ом.
+            _bridge_budget_note()
             if maybe_self_update():   # задача цикла обновила pc_orchestrator.py → эстафета новому
                 log.info("=== ДЕМОН ВЫШЕЛ ПО SELF-UPDATE (эстафета новому процессу) ===")
                 return
         except Exception as e:
+            _bridge_budget_note()     # виток, упавший ПОСЛЕ обрезки, обязан назвать обрезку тоже
             log.exception("ошибка цикла: %s", e)
         for _ in range(POLL_SEC):
             if _stopped():

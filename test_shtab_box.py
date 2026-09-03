@@ -1818,5 +1818,62 @@ class TestLaneCost(unittest.TestCase):
         self.assertNotIn("пуст", rep["why"])
 
 
+class TestBridgeBudgetThirdOutcome(unittest.TestCase):
+    """ТРЕТИЙ ИСХОД ПОТОЛОКА МОСТА доезжает до ящика СЛОВАМИ (04.09.2026).
+
+    «Не спрашивали, потому что мост был занят» — это НЕ ноль и НЕ отказ прибора. Ящик, увидевший
+    такое, не берёт ничего и говорит причину; молчаливое «взято 0» было бы неотличимо от честно
+    пустой очереди, а голое имя класса — от поломки моста."""
+
+    class _Daemon:
+        """Демон, у которого очередь уже упёрлась в потолок витка."""
+
+        def __init__(self):
+            import pc_orchestrator as o
+
+            self.o = o
+            self.budget = o.BridgeLoopBudget(limit=1)
+            self.budget.spend(50.0, "get_pending")          # потолок исчерпан ДО нашего чтения
+            self.bc = self._Bc(self)
+
+        class _Bc:
+            def __init__(self, d):
+                self.d = d
+                self.went_to_net = 0
+
+            def get_pending(self, status, lane=None):
+                if self.d.budget.exhausted():
+                    return self.d.budget.skip("get_pending")
+                self.went_to_net += 1
+                return {"ok": True, "items": []}
+
+    def test_the_box_takes_nothing_and_names_the_reason_in_words(self):
+        d = self._Daemon()
+        rows, ok, why = run.Queue(d).rows(run.OPEN_STATUSES)
+        self.assertEqual((rows, ok), ([], False), "на срезанном чтении ящик не берёт НИЧЕГО")
+        self.assertEqual(d.bc.went_to_net, 0, "срезанное чтение в сеть не уходит вовсе")
+        self.assertIn("не спрашивали", why)
+        self.assertIn("мост был занят", why)
+        self.assertNotIn("BridgeBudgetExhausted", why,
+                         "имя класса — не причина: тот же класс ложных диагнозов закрыт в explain")
+
+    def test_the_same_holds_for_the_parent_lane_reader(self):
+        """Ступень E (`recon_auto_run.Queue`) — та же дверь и то же правило."""
+        import recon_auto_run
+
+        d = self._Daemon()
+        rows, ok, why = recon_auto_run.Queue(d).rows(recon_auto_run.OPEN_STATUSES)
+        self.assertEqual((rows, ok), ([], False))
+        self.assertIn("не спрашивали", why)
+
+    def test_a_healthy_read_is_untouched(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ у потребителя: непочатый потолок ящик не задевает ничем."""
+        d = self._Daemon()
+        d.budget.reset(limit=900)
+        rows, ok, why = run.Queue(d).rows(run.OPEN_STATUSES)
+        self.assertEqual((rows, ok, why), ([], True, ""))
+        self.assertEqual(d.bc.went_to_net, len(run.OPEN_STATUSES))
+
+
 if __name__ == "__main__":            # pragma: no cover
     unittest.main(verbosity=2)

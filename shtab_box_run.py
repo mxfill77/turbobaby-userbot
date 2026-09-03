@@ -331,7 +331,11 @@ class Queue(recon_auto_run.Queue):
         for status in statuses:
             res = self._d.bc.get_pending(status, lane=LANE_ALL)
             if not res.get("ok"):
-                return [], False, str(res.get("error") or "мост не ответил")
+                # ПРИЧИНА ПО СУЩЕСТВУ, не именем класса — см. одноимённый блок у родителя.
+                # Третий исход потолка моста («не спрашивали, мост был занят») обязан доехать
+                # до ящика СЛОВАМИ: ящик и так не берёт ничего при ok=False, но молчаливое
+                # «BridgeBudgetExhausted» превратило бы отложенное чтение в мнимую поломку.
+                return [], False, str(res.get("error_text") or res.get("error") or "мост не ответил")
             for it in (res.get("items") or []):
                 item = dict(it)
                 item.setdefault("status", status)
