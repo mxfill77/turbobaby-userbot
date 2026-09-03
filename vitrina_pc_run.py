@@ -9,7 +9,9 @@
 витрина, уже измерил кто-то другой и положил на диск.
 
     queue_snapshot_pc.state.json          слепок очереди — демон пишет витком
+                                          (он же — простой полосы и приход Штаба)
     pc_orchestrator.task_started.json     отметка claim — «с какого времени в работе»
+                                          и час прихода последнего задания Штаба
     tmp/expect_pc/state.json              слой ожиданий О1–О4
     tmp/done_judge_pc/judged.json         вердикты судьи закрытия (ступень C)
     docs/review_inbox                     лоток внешних ответов
@@ -204,6 +206,87 @@ def quote(text, limit=vp.GOAL_MAX):
     return fixed
 
 
+def idle_facts(snapshot, now):
+    """Простой полосы ПРЯМО СЕЙЧАС. → dict | None (слепок не прочитан).
+
+    «Пусто» — это ``open`` без единой строки в :data:`vitrina_pc.WORK_STATUSES`;
+    почему `needs_approval` работой не считается, разобрано там же числом.
+
+    С КАКОГО ВРЕМЕНИ ПУСТО берётся у ПОСЛЕДНЕГО ЗАКРЫТИЯ, и это не приближение:
+    пока в очереди нет ни одной строки, которую полоса может взять, последним
+    событием очереди было именно закрытие — приди новая строка, она стояла бы в
+    ``open`` и ветка сюда не дошла бы. Реестр закрытых пуст (свежий чекаут,
+    обрезанный слепок) → ``sec=None`` и НЕИЗВЕСТНО с причиной, а не ноль.
+    """
+    if snapshot is None:
+        return None
+    busy = [str(tid) for tid, item in (snapshot.get("open") or {}).items()
+            if isinstance(item, dict) and str(item.get("status") or "") in vp.WORK_STATUSES]
+    if busy:
+        return {"busy": len(busy), "ids": sorted(busy, key=lambda s: (len(s), s))}
+    last_at, last_id = None, ""
+    for tid, item in (snapshot.get("closed") or {}).items():
+        if not isinstance(item, dict):
+            continue
+        try:
+            at = float(item.get("at"))
+        except (TypeError, ValueError):
+            continue
+        if last_at is None or at > last_at:
+            last_at, last_id = at, str(item.get("id") or tid)
+    if last_at is None:
+        return {"busy": 0, "sec": None,
+                "why": "в реестре закрытых нет ни одной метки времени"}
+    return {"busy": 0, "since": last_at, "since_id": last_id,
+            "since_words": stamp_words(last_at), "sec": max(0.0, float(now) - last_at)}
+
+
+def shtab_last_facts(snapshot, claims, now):
+    """Когда в очередь ПОСЛЕДНИЙ РАЗ попало задание из ящика Штаба. → dict | None.
+
+    Ряд опознаётся ТЕМ ЖЕ маркером, которым живут дедуп ящика и суточный потолок
+    (:data:`shtab_box.MARK_RE`); своей регулярки здесь нет и не будет — разойдись
+    они, витрина начала бы звать приход Штаба «ни одного» ровно в тот день, когда
+    форму маркера поменяют, и молча.
+
+    ВРЕМЯ БЕРЁТСЯ ЖИВОЕ И НАЗЫВАЕТ СЕБЯ. У маркера есть только СУТКИ (``дата=``),
+    а часы приходят с другого конца: отметка claim демона (ряд взят) либо время
+    закрытия. Первая точнее и стои́т ближе к приходу — ящик кладёт строку, и демон
+    берёт её ближайшим витком, — поэтому claim предпочитается закрытию, а какой
+    именно источник дал час, едет в поле ``at_kind`` и печатается словом.
+    """
+    if snapshot is None:
+        return None
+    import shtab_box
+
+    best = None
+    seen = 0
+    for half in ("open", "closed"):
+        for tid, item in (snapshot.get(half) or {}).items():
+            if not isinstance(item, dict):
+                continue
+            seen += 1
+            hit = shtab_box.MARK_RE.match(str(item.get("goal") or ""))
+            if not hit:
+                continue
+            rid = str(item.get("id") or tid)
+            at, kind = (claims or {}).get(rid), "claim"
+            if at is None:
+                try:
+                    at, kind = float(item.get("at")), "close"
+                except (TypeError, ValueError):
+                    at, kind = None, ""
+            row = {"found": True, "id": rid, "day": hit.group(1), "key": hit.group(2),
+                   "at": at, "at_kind": kind,
+                   "at_words": stamp_words(at) if at is not None else "",
+                   "sec": (max(0.0, float(now) - at) if at is not None else None)}
+            if best is None or (row["day"], row["at"] or 0.0) > (best["day"], best["at"] or 0.0):
+                best = row
+    if best is not None:
+        return best
+    return {"found": False, "scope": "в реестре %d строк" % seen}
+
+
 def waiting_rows(snapshot):
     """Открытые решения владельца (`needs_approval`), РАЗВЕДЁННЫЕ по видам. → list | None.
 
@@ -326,6 +409,8 @@ def collect(root=HERE, now=None, runner=None, inbox=None, day=None, shtab=None):
         "day": the_day,
         "shtab": shtab if shtab is not None else read_shtab(),
         "running": running_rows(snapshot, claims, now),
+        "idle": idle_facts(snapshot, now),
+        "shtab_last": shtab_last_facts(snapshot, claims, now),
         "expects": open_expectations(expect),
         "failed": failed_rows(snapshot, since),
         "series": counted,

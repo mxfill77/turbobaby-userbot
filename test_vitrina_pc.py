@@ -38,6 +38,23 @@ NOW = 1788352800.0                      # 2026-09-02 12:40 UTC
 DAY = "2026-09-02"
 
 
+def _idle(sec, busy=0, ids=()):
+    """Факт простоя в той форме, в какой его собирает `vitrina_pc_run.idle_facts`."""
+    if busy:
+        return {"busy": int(busy), "ids": list(ids)}
+    if sec is None:
+        return {"busy": 0, "sec": None, "why": "в реестре закрытых нет ни одной метки времени"}
+    return {"busy": 0, "sec": float(sec), "since": NOW - float(sec), "since_id": "84",
+            "since_words": "2026-09-02 11:00 UTC"}
+
+
+def _shtab_last(sec, day=DAY, found=True):
+    if not found:
+        return {"found": False, "scope": "в реестре 77 строк"}
+    return {"found": True, "id": "84", "day": day, "key": "abc123", "at": NOW - float(sec),
+            "at_kind": "claim", "at_words": "2026-09-02 10:00 UTC", "sec": float(sec)}
+
+
 def _dead_facts(day=DAY):
     """Все источники мертвы. Ровно тот случай, ради которого писан пункт 3."""
     return {"day": day, "shtab": vp.parse_shtab("", ok=False, why="мост молчит"),
@@ -64,7 +81,8 @@ def _live_facts(day=DAY):
                         {"id": "2", "goal": "удаление файла — разрешить?", "zayavka": False,
                          "key": ""}],
             "axes": {vp.AXIS_MAIN: 4, vp.AXIS_BIZ: 1, vp.AXIS_SERVICE: 22},
-            "axes_why": "", "closed_day": 18}
+            "axes_why": "", "closed_day": 18,
+            "idle": _idle(None, busy=1, ids=["5"]), "shtab_last": _shtab_last(7200.0)}
 
 
 class _Door(object):
@@ -194,7 +212,8 @@ class TestNoZeroForUnknown(unittest.TestCase):
 
     def test_empty_is_not_unknown(self):
         """«В работе ничего» и «неизвестно» — РАЗНЫЕ новости, и обе названы."""
-        empty = vp.part_now({"ok": False, "why": "нет"}, [])
+        empty = vp.part_now({"ok": False, "why": "нет"}, [], idle=_idle(600.0),
+                            shtab_last=_shtab_last(3600.0))
         dead = vp.part_now({"ok": False, "why": "нет"}, None)
         self.assertIn("полоса свободна", " ".join(empty))
         self.assertNotIn(vp.UNKNOWN, " ".join(empty).replace("Штаб не обновил", ""))
@@ -434,10 +453,22 @@ class TestSignature(unittest.TestCase):
         self.assertNotEqual(vp.signature(_live_facts()), vp.signature(other))
 
     def test_signature_has_no_timestamp_in_it(self):
-        """Штампа в подписи нет — иначе витрина правила бы себя каждый оборот."""
+        """Штампа СБОРКИ в подписи нет — иначе витрина правила бы себя каждый оборот.
+
+        До 03.09 тест ловил это запретом слова «UTC» во всём теле. Запрет был
+        ШИРЕ предмета и промахивался в обе стороны: он отвергал ВРЕМЯ СОБЫТИЯ
+        (когда закрылась строка, когда пришло задание Штаба) — число как всякое
+        другое, меняющееся только вместе с событием, — и при этом ничего не
+        говорил о настоящем источнике мигания, НЕПРЕРЫВНОМ ВОЗРАСТЕ. Теперь
+        спрошено ровно то, что защищаем: подпись не зависит от часов сборки, а
+        возраст не двигает её каждый виток (`test_idle_does_not_repaint…`).
+        """
+        stamp = "2026-09-02 12:40 UTC"
         sig = vp.signature(_live_facts())
-        self.assertNotIn("UTC", sig)
-        self.assertIn("UTC", vp.render(_live_facts(), "2026-09-02 12:40 UTC"))
+        self.assertNotIn(stamp, sig, "штамп сборки просочился в подпись")
+        self.assertNotIn("числа менялись", sig)
+        self.assertIn(stamp, vp.render(_live_facts(), stamp))
+        self.assertEqual(sig, vp.signature(_live_facts()))
 
     def test_day_start_has_a_third_outcome(self):
         self.assertIsNone(run.day_start("не дата"))
@@ -550,6 +581,221 @@ class TestZayavkiAreNotCards(unittest.TestCase):
         self.assertIn("задачей не станет", text)
         self.assertNotIn("[заявка-ревью", text)          # машинный маркер владельцу не показываем
         self.assertIn("#9 удаление tmp/x — разрешить?", text)   # карточка гарда — как была
+
+
+class TestIdleAndShtabArrival(unittest.TestCase):
+    """ОТРИЦАТЕЛЬНЫЕ ТЕСТЫ задания 03.09: молчание петли видно ЧИСЛОМ.
+
+    Повод: петлю замыкает внешний агент, который будит Штаб по пустой очереди.
+    Пока прибора нет, его молчание и настоящая тишина полосы выглядят одинаково —
+    пустой очередью, читающейся как спокойствие. Здесь закрыты все четыре случая
+    задания плюс пятый, без которого порог был бы украшением: пусто, но КОРОЧЕ
+    порога — тревоги нет.
+    """
+
+    # Слепок живой формы: пять `needs_approval` (владелец не ответил) и НИ ОДНОЙ
+    # строки, которую полоса может взять. Ровно это состояние стояло в очереди
+    # 03.09 замером — и до правки витрина звала его «полоса свободна».
+    IDLE_SNAP = {"open": {
+        "13": {"goal": "[разведка-заявка дата=2026-09-02 ключ=38e6d0ce6598]",
+               "status": "needs_approval"},
+        "31": {"goal": "[заявка-ревью дата=2026-09-02 ключ=8741233058f0]",
+               "status": "needs_approval"},
+    }, "closed": {
+        "84": {"id": "84", "at": NOW - 5 * 3600.0, "outcome": "done", "goal": "прошлая работа"},
+        "80": {"id": "80", "at": NOW - 9 * 3600.0, "outcome": "done", "goal": "ещё прошлее"},
+    }}
+
+    BUSY_SNAP = {"open": {
+        "85": {"goal": "витрина видит простой", "status": "in_progress"},
+        "13": {"goal": "заявка", "status": "needs_approval"},
+    }, "closed": dict(IDLE_SNAP["closed"])}
+
+    # ── 1. очередь занята — строка про простой НЕ тревожит ──────────────────
+    def test_busy_queue_never_alarms(self):
+        idle = run.idle_facts(self.BUSY_SNAP, NOW)
+        self.assertEqual(idle["busy"], 1, "занятость посчитана не по рабочим статусам")
+        self.assertEqual(idle["ids"], ["85"], "в занятость попал ряд, ждущий владельца")
+        self.assertEqual(vp.idle_alarm(idle, _shtab_last(99 * 3600.0)), "",
+                         "тревога сработала при занятой очереди")
+        words = vp.idle_words(idle)
+        self.assertIn("очередь НЕ пуста", words)
+        self.assertIn("#85", words)
+
+    def test_needs_approval_is_not_work(self):
+        """Ряд, ждущий владельца, занятостью НЕ считается — иначе простоя не будет НИКОГДА.
+
+        Замер 03.09: в очереди 5 таких рядов, старшему 793 минуты. Считай мы их
+        работой, строка простоя молчала бы вечно, оставаясь при этом «зелёной».
+        """
+        self.assertNotIn("needs_approval", vp.WORK_STATUSES)
+        idle = run.idle_facts(self.IDLE_SNAP, NOW)
+        self.assertEqual(idle["busy"], 0, "пять заявок владельца выданы за работу полосы")
+
+    # ── 2. пусто дольше порога — ТРЕВОЖИТ ──────────────────────────────────
+    def test_idle_over_threshold_alarms_with_numbers(self):
+        idle = run.idle_facts(self.IDLE_SNAP, NOW)                 # пусто 5 ч при пороге 4
+        self.assertAlmostEqual(idle["sec"], 5 * 3600.0, places=3)
+        self.assertEqual(idle["since_id"], "84")
+        alarm = vp.idle_alarm(idle, _shtab_last(None, found=False), DAY)
+        self.assertTrue(alarm, "простой дольше порога прошёл молча")
+        self.assertIn("ТРЕВОГА", alarm)
+        self.assertIn("5.0 ч", alarm)                              # ЧИСЛОМ, а не «давно»
+        self.assertIn("4.0 ч", alarm)                              # порог назван в самой строке
+        self.assertIn("ни одного задания", alarm)                  # и приход Штаба тоже
+        self.assertNotIn("давно", alarm)
+
+    def test_alarm_is_a_separate_line_in_the_showcase(self):
+        """Тревога — ОТДЕЛЬНАЯ строка витрины, а не приписка к строке простоя."""
+        facts = _live_facts()
+        facts["idle"] = _idle(6 * 3600.0)
+        facts["shtab_last"] = _shtab_last(None, found=False)
+        rows = vp.part_now(facts["shtab"], [], DAY, idle=facts["idle"],
+                           shtab_last=facts["shtab_last"])
+        alarms = [r for r in rows if r.startswith("ТРЕВОГА")]
+        self.assertEqual(len(alarms), 1, "тревога не отдельной строкой: %s" % rows)
+        self.assertIn("ТРЕВОГА", vp.body(facts))
+
+    def test_idle_under_threshold_is_silent(self):
+        """Пусто, но КОРОЧЕ порога — тревоги нет, а число всё равно показано."""
+        idle = _idle(vp.IDLE_ALARM_SEC - 60.0)
+        self.assertEqual(vp.idle_alarm(idle, _shtab_last(99 * 3600.0)), "")
+        self.assertIn("очередь пуста", vp.idle_words(idle))
+        self.assertIn("порог тревоги 4.0 ч", vp.idle_words(idle))
+
+    # ── 3. слепок не прочитан — НЕИЗВЕСТНО, и оно НЕ тревога ───────────────
+    def test_unread_snapshot_says_unknown_and_never_alarms(self):
+        self.assertIsNone(run.idle_facts(None, NOW))
+        self.assertIsNone(run.shtab_last_facts(None, {}, NOW))
+        self.assertIn(vp.UNKNOWN, vp.idle_words(None))
+        self.assertIn("слепок очереди не прочитан", vp.idle_words(None))
+        self.assertIn(vp.UNKNOWN, vp.shtab_last_words(None))
+        self.assertEqual(vp.idle_alarm(None, None), "", "незнание превращено в тревогу")
+
+    def test_empty_closed_registry_is_unknown_not_zero(self):
+        """Пусто, но с какого времени — не из чего взять: НЕИЗВЕСТНО, а не «0 мин»."""
+        idle = run.idle_facts({"open": {}, "closed": {}}, NOW)
+        self.assertEqual(idle["busy"], 0)
+        self.assertIsNone(idle["sec"])
+        words = vp.idle_words(idle)
+        self.assertIn(vp.UNKNOWN, words)
+        self.assertNotIn("пуста 0", words)
+        self.assertEqual(vp.idle_alarm(idle, None), "")
+
+    # ── 4. задание из ящика только что взято — счётчик обнуляется ──────────
+    def test_fresh_shtab_task_resets_both_counters(self):
+        """Ящик положил задание, демон его взял → простоя нет, приход свежий."""
+        goal = "[от Штаба дата=2026-09-02 ключ=a1b2c3d4] задание"
+        snap = {"open": {"90": {"goal": goal, "status": "in_progress"}},
+                "closed": dict(self.IDLE_SNAP["closed"])}
+        claims = {"90": NOW - 120.0}
+        idle = run.idle_facts(snap, NOW)
+        last = run.shtab_last_facts(snap, claims, NOW)
+        self.assertEqual(idle["busy"], 1, "взятое задание не обнулило простой")
+        self.assertEqual(vp.idle_alarm(idle, last), "", "тревога при только что взятом задании")
+        self.assertTrue(last["found"])
+        self.assertEqual((last["id"], last["day"], last["key"], last["at_kind"]),
+                         ("90", "2026-09-02", "a1b2c3d4", "claim"))
+        self.assertAlmostEqual(last["sec"], 120.0, places=3)
+        self.assertIn("2 мин назад", vp.shtab_last_words(last, DAY))
+
+    def test_newest_marker_wins_over_older_ones(self):
+        snap = {"open": {}, "closed": {
+            "70": {"id": "70", "at": NOW - 40 * 3600.0, "outcome": "done",
+                   "goal": "[от Штаба дата=2026-09-01 ключ=oldoldold] старое"},
+            "77": {"id": "77", "at": NOW - 20 * 3600.0, "outcome": "done",
+                   "goal": "[от Штаба дата=2026-09-02 ключ=newnewnew] новое"}}}
+        last = run.shtab_last_facts(snap, {}, NOW)
+        self.assertEqual(last["key"], "newnewnew")
+        self.assertEqual(last["at_kind"], "close", "часа нет — источник времени не назван")
+        self.assertIn("закрылось", vp.shtab_last_words(last, DAY))
+
+    def test_no_marker_anywhere_names_the_border_not_a_zero(self):
+        """Ни одного задания в реестре — это ОКНО, а не история, и так и сказано.
+
+        Живой замер 03.09: в реестре 6 открытых + 71 закрытая строка и РОВНО НОЛЬ
+        рядов с маркером ящика. Первая же боевая печать строки — тот самый случай.
+        """
+        last = run.shtab_last_facts(self.IDLE_SNAP, {}, NOW)
+        self.assertFalse(last["found"])
+        self.assertEqual(last["scope"], "в реестре 4 строк")
+        words = vp.shtab_last_words(last, DAY)
+        self.assertIn("нет ни одного", words)
+        self.assertIn("окно, а не история", words)
+
+    def test_marker_regex_is_borrowed_from_the_box(self):
+        """Своей регулярки маркера здесь нет: два экземпляра разошлись бы молча."""
+        with io.open(os.path.join(HERE, "vitrina_pc_run.py"), encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn("shtab_box.MARK_RE", body)
+        self.assertNotIn("от Штаба дата=(", body, "маркер ящика набран заново")
+
+    # ── порог: число, а не вкус ────────────────────────────────────────────
+    def test_threshold_is_the_measured_number(self):
+        """Порог 4 ч замерен, и замер назван в самом коде рядом с числом."""
+        self.assertEqual(vp.IDLE_ALARM_SEC, 14400.0)
+        with io.open(os.path.join(HERE, "vitrina_pc.py"), encoding="utf-8") as fh:
+            body = fh.read()
+        for proof in ("219.6", "3.66 ч", "медиана 34.2", "task_started"):
+            self.assertIn(proof, body, "порог стои́т без замера: нет %s" % proof)
+
+    def test_both_lines_are_in_the_live_message(self):
+        """Обе строки задания доезжают до готового сообщения витрины."""
+        facts = _live_facts()
+        facts["idle"] = _idle(2 * 3600.0)
+        facts["shtab_last"] = _shtab_last(26 * 3600.0)
+        text = vp.render(facts, "2026-09-02 12:40 UTC")
+        self.assertIn("простой полосы: очередь пуста ≥ 2.0 ч", text)
+        self.assertIn("с 2026-09-02 11:00 UTC — закрылась строка #84", text)
+        self.assertIn("приход Штаба: последнее задание #84", text)
+        self.assertIn("маркер дата=%s" % DAY, text)
+        self.assertIn("≥ 1.1 сут назад", text)
+        self.assertNotIn("ТРЕВОГА", text, "2 ч простоя подняли тревогу при пороге 4 ч")
+
+    def test_idle_changes_the_signature(self):
+        """Простой — ЧИСЛО витрины: его смена обязана двигать правку сообщения."""
+        one, two = _live_facts(), _live_facts()
+        two["idle"] = _idle(5 * 3600.0)
+        self.assertNotEqual(vp.signature(one), vp.signature(two))
+
+    def test_idle_does_not_repaint_the_showcase_every_turn(self):
+        """ЗАМОК ОТ МИГАЛКИ: возраст растёт непрерывно, а витрина — не мигалка.
+
+        Два наблюдения через виток (600 с) внутри одной получасовой ступени
+        обязаны дать ОДНУ подпись. Без ступени пустая очередь одна давала бы
+        правку каждый оборот — ~144 в сутки против максимум 48 со ступенью.
+        """
+        base = 4 * 3600.0 + 60.0
+        one, two = _live_facts(), _live_facts()
+        one["idle"], two["idle"] = _idle(base), _idle(base + vp.TICK_SEC)
+        self.assertEqual(vp.signature(one), vp.signature(two),
+                         "простой перекрашивает витрину каждый оборот")
+        far = _live_facts()
+        far["idle"] = _idle(base + vp.IDLE_STEP_SEC)
+        self.assertNotEqual(vp.signature(one), vp.signature(far),
+                            "ступень съела и настоящую смену числа")
+
+    def test_coarse_age_never_hides_that_it_is_a_step(self):
+        """Округлённое молча читается как измеренное — поэтому знак «≥» обязателен."""
+        self.assertEqual(vp.coarse_words(2 * 3600.0), "≥ 2.0 ч")
+        self.assertEqual(vp.coarse_words(120.0), "2 мин", "первая ступень испорчена «≥ 0»")
+        self.assertEqual(vp.coarse_words(None), "возраст неизвестен")
+
+    def test_live_snapshot_is_read_without_crashing(self):
+        """Боевой слепок разбирается обеими ветками — форма не выдумана."""
+        path = os.path.join(HERE, "queue_snapshot_pc.state.json")
+        if not os.path.exists(path):                   # pragma: no cover — чужое дерево
+            self.skipTest("боевого слепка в этом дереве нет")
+        with io.open(path, encoding="utf-8") as fh:
+            snap = json.load(fh)
+        now = float(snap.get("at") or NOW)
+        idle = run.idle_facts(snap, now)
+        last = run.shtab_last_facts(snap, run.read_claims(HERE), now)
+        self.assertIsNotNone(idle)
+        self.assertIn("busy", idle)
+        self.assertIn(vp.UNKNOWN, vp.idle_words(None))
+        self.assertTrue(vp.idle_words(idle).startswith("простой полосы:"))
+        self.assertTrue(vp.shtab_last_words(last, DAY).startswith("приход Штаба:"))
 
 
 if __name__ == "__main__":            # pragma: no cover
