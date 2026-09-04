@@ -436,7 +436,7 @@ def code_facts(closure_fn=None, stat_fn=None, lock_fn=None, map_fn=None, entries
     for name, entry in (entries if entries is not None else ex.CODE_ENTRIES):
         rec = {"ok": False, "entry": entry, "files": None, "newest": None, "newest_file": None,
                "reason": "", "gap": None, "mapped": None, "pid": None, "opened": None,
-               "started": None, "lock_mtime": None, "err": ""}
+               "started": None, "lock_mtime": None, "err": "", "since": None}
         try:
             cl = (closure_fn or contour.closure)(REPO, entries=(entry,), cut=())
         except Exception as e:                                        # noqa: BLE001
@@ -448,12 +448,14 @@ def code_facts(closure_fn=None, stat_fn=None, lock_fn=None, map_fn=None, entries
             files = sorted(cl.files)
             rec["files"] = len(files)
             newest, newest_file, missed = None, None, None
+            mtimes = []
             for base in files:
                 try:
                     m = float((stat_fn or os.stat)(os.path.join(REPO, base)).st_mtime)
                 except (OSError, ValueError, TypeError) as e:
                     missed = "%s: %s" % (base, str(e)[:60])
                     break                     # один нестатуемый файл делает ответ недостоверным
+                mtimes.append(m)
                 if newest is None or m > newest:
                     newest, newest_file = m, base
             if missed:
@@ -477,8 +479,99 @@ def code_facts(closure_fn=None, stat_fn=None, lock_fn=None, map_fn=None, entries
             rec["err"] = "лока у «%s» нет — момент запуска брать неоткуда" % name
         else:
             (lock_fn or _read_lock)(rec, lock, name)
+        # С КАКОГО МОМЕНТА ПРОЦЕСС ОТСТАЁТ — ТРЕТЬЕ ЧИСЛО, И БЕЗ НЕГО ТРЕВОГА ГЛОХНЕТ НАВСЕГДА.
+        # `newest` для срока ожидания НЕ ГОДИТСЯ: он едет вперёд с КАЖДЫМ коммитом в замыкание, а
+        # в замыкании userbot 67 файлов и правки идут по нескольку раз в час. Ожидание, считанное
+        # от него, обнулялось бы чужой правкой быстрее, чем истекал бы срок, и процесс, не
+        # перезапускавшийся ДВОЕ СУТОК, вечно звучал бы спокойной новостью «подхватит ближайшим
+        # витком» (замер 05.09: userbot жив с 03.09 06:02, отстал на 2 сут, `now - newest` = 6 мин).
+        # Ровно это и есть «смягчение съело настоящий отказ», от которого предостерегает задание.
+        # Предмет — САМАЯ РАННЯЯ правка, которую процесс ЕЩЁ НЕ ВЗЯЛ: она неподвижна, пока живёт
+        # воплощение, и растёт ровно так, как растёт непрочитанное ожидание.
+        started = rec.get("started")
+        if mtimes and isinstance(started, (int, float)) and started > 0:
+            behind_files = [m for m in mtimes if m > started]
+            rec["since"] = min(behind_files) if behind_files else None
         out[name] = rec
     return out
+
+
+SU_LOG_FILE = os.path.join(REPO, "pc_orchestrator.log")
+SU_TAIL_BYTES = 262144        # хвост боевого лога, который читаем: ~сутки строк self-update
+# ЧТО ИМЕННО ИЩЕМ В ХВОСТЕ. Три формы, все — ДОСЛОВНЫЕ строки самого демона (`maybe_self_update`
+# и `_dirty_block`), а не наши пересказы. Порядок в кортеже — порядок разбора, но решает не он, а
+# ВРЕМЯ строки: берётся ПОСЛЕДНЕЕ высказывание механизма, каким бы оно ни было.
+SU_MARKS = (
+    ("gate", "self-update: ", "-гейт ПРОВАЛЕН"),          # ...: unittest-гейт ПРОВАЛЕН (A→B): ...
+    ("gate", "self-update: ", "code_gate ПРОВАЛЕН"),
+    ("dirty", "self-update демона: ", "дерево ГРЯЗНОЕ"),  # ворота авто-рестарта отказали
+    ("ok", "self-update: ", "гейт пройден"),              # эстафета передана — отказа НЕТ
+)
+
+
+def su_facts(path=None, tail=None):
+    """ЧТО САМООБНОВЛЕНИЕ СКАЗАЛО О СЕБЕ ПОСЛЕДНИМ → факт для `ex.su_state`. Только чтение.
+
+    Источник — БОЕВОЙ ЛОГ ДЕМОНА, и это осознанный выбор из двух возможных. Второй путь (демон
+    кладёт штамп отказа на диск) требует правки наблюдаемого, а наблюдатель не вправе заводить себе
+    удобства в чужом процессе; лог же демон пишет и так, строки эти живут в нём с заведения
+    самообновления, и читаем мы их тем же правом, каким читаем heartbeat.
+
+    ЧЕСТНАЯ ЦЕНА НАЗВАНА: разбор стои́т на ДОСЛОВНЫХ строках демона, и переписанная формулировка
+    его лога сделает причину неназванной. Направление отказа при этом БЕЗОПАСНОЕ — не «в порядке»,
+    а `kind=None`, то есть «отказа не было» → в решении это САМЫЙ ГРОМКИЙ из исходов тревоги
+    («причина неизвестна, и это хуже названного отказа»). Сломавшийся разбор поэтому усиливает
+    сигнал, а не глушит его; тест `test_the_parse_leans_to_the_loud_side` держит это свойство.
+
+    `ok=False` — только когда файла нет или он не читается: слепота, и она тоже громкая."""
+    out = {"ok": False, "kind": None, "at": None, "why": "", "what": "", "reason": ""}
+    try:
+        if tail is None:
+            size = os.path.getsize(path or SU_LOG_FILE)
+            with open(path or SU_LOG_FILE, "rb") as fh:
+                if size > SU_TAIL_BYTES:
+                    fh.seek(size - SU_TAIL_BYTES)
+                tail = fh.read().decode("utf-8", "replace")
+    except (OSError, ValueError, TypeError) as e:
+        out["reason"] = "%s: %s" % (type(e).__name__, str(e)[:80])
+        return out
+    out["ok"] = True
+    last = None
+    for raw in str(tail).splitlines():
+        for kind, lead, mark in SU_MARKS:
+            if lead in raw and mark in raw:
+                last = (kind, raw.strip())
+                break
+    if last is None:
+        # Хвост прочитан, а высказываний механизма в нём нет вовсе. Это не «в порядке»: молчащее
+        # самообновление при живом расхождении и есть опасный случай, поэтому `kind` остаётся None.
+        out["why"] = "в хвосте лога демона высказываний самообновления нет"
+        return out
+    kind, line = last
+    if kind == "ok":
+        # ПОСЛЕДНЕЕ, ЧТО СКАЗАЛ МЕХАНИЗМ, — «эстафета передана». Значит на СЕГОДНЯШНЕЕ расхождение
+        # он не жаловался ни разу, и причина по-прежнему НЕ НАЗВАНА. Зелёным это не делает ничего.
+        out["why"] = "последнее высказывание самообновления — успешная эстафета, на нынешнее " \
+                     "расхождение оно не жаловалось"
+        return out
+    out["kind"] = kind
+    out["at"] = _su_stamp(line)
+    out["what"] = line[:300]
+    out["why"] = ("гейт самообновления провален — новый код проверку не прошёл и в бой не поехал"
+                  if kind == "gate" else
+                  "рабочее дерево грязное: ворота авто-рестарта запретили обновление, потому что "
+                  "коммит уехал бы в бой НЕ целиком")
+    return out
+
+
+def _su_stamp(line):
+    """«2026-09-04 06:36:58,147 ...» → секунды | None. Времени нет → None, а не «сейчас».
+    Через `time` (он уже импортирован), а не `datetime`: демон пишет лог МЕСТНЫМ временем, и
+    `mktime` разбирает его тем же поясом, в котором оно записано."""
+    try:
+        return time.mktime(time.strptime(str(line)[:19], "%Y-%m-%d %H:%M:%S"))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def busy_facts(path=None):
@@ -853,6 +946,11 @@ def snapshot(state, now=None, getter=None):
         # быть не должно: расхождение «диск новее памяти» — это МГНОВЕННОЕ состояние двух чисел, а
         # не накопленное молчание, и сон машины его не искажает (обе величины — стенные метки).
         "code": code_facts(),
+        # О6, вторая ось: ПОЧЕМУ обновления нет. Факт читается КАЖДЫЙ прогон, но спрашивают его
+        # только у просроченного расхождения (`ex._o6`): у процесса, чей срок ещё не вышел, вопрос
+        # «почему не обновился» сам по себе звучит обвинением — тем самым голосом, от которого
+        # ветку и лечим 05.09.2026.
+        "su": su_facts(),
     }
 
 
@@ -959,7 +1057,17 @@ def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
     # 1. ЗАКРЫТИЕ ЭПИЗОДОВ — первым: владелец обязан узнать, что кончилось, даже если сейчас
     #    открылось что-то новое.
     for key in ex.closures(facts, cfg, list(open_eps.keys())):
-        if dry or send(ex.render_close(key, LANE_LABEL)):
+        # ПОДТВЕРЖДЕНИЕ ОБНОВЛЕНИЯ ДОГОВАРИВАЕТ «С КАКОЙ НА КАКУЮ» (05.09.2026). Деталь считается
+        # ЗДЕСЬ, а не в модуле решения, по той же причине, по которой там нет ни одного обращения к
+        # миру: «стало» берётся из СВЕЖИХ фактов, «было» — из ключа эпизода. Сорвётся расчёт —
+        # закрытие уйдёт БЕЗ детали, но уйдёт: подтверждение дороже украшения.
+        detail = ""
+        if key.split("|", 1)[0] in ("o6c", "o6l"):
+            try:
+                detail = ex.code_close_detail(key, facts, cfg, now)
+            except Exception:                                         # noqa: BLE001
+                detail = ""
+        if dry or send(ex.render_close(key, LANE_LABEL, detail)):
             open_eps.pop(key, None)
             out["closed"].append(key)
 

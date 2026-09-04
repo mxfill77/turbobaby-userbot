@@ -2344,16 +2344,29 @@ class TestHandsHaveNoTeeth(unittest.TestCase):
 
 def code_fact(now=NOW, files=5, newest_ago=None, started_ago=None, ok=True, reason="",
               opened=True, pid=7092, mapped=2, gap=("io_utf8.py",), newest_file="io_utf8.py",
-              entry="pc_agent.py", err=""):
+              entry="pc_agent.py", err="", since_ago=None):
     """Факт О6 в том виде, в каком его кладут руки (`code_facts`). Оба времени — СТЕННЫЕ метки
     (mtime файла и момент запуска процесса), потому что расхождение «диск новее памяти» есть
-    разность двух абсолютных величин, а не накопленное молчание."""
+    разность двух абсолютных величин, а не накопленное молчание.
+
+    ТРЕТЬЕ ЧИСЛО `since` (05.09.2026) — самая РАННЯЯ невзятая правка, от неё считается ожидание.
+    По умолчанию оно равно `newest`: это случай ОДНОЙ свежей правки, и в нём обе величины
+    совпадают. Умолчание стои́т здесь намеренно — руки в проде кладут `since` ВСЕГДА, когда
+    процесс отстаёт, и фикстура обязана повторять живую форму, а не удобную. Кому нужен
+    разъезд (много правок подряд) — называет `since_ago` явно."""
+    newest = None if newest_ago is None else now - newest_ago
+    started = None if started_ago is None else now - started_ago
+    if since_ago is not None:
+        since = now - since_ago
+    elif newest is not None and started is not None and newest > started:
+        since = newest
+    else:
+        since = None
     return {"ok": ok, "entry": entry, "files": files, "reason": reason,
-            "newest": None if newest_ago is None else now - newest_ago,
-            "newest_file": newest_file, "gap": list(gap) if gap else None, "mapped": mapped,
-            "pid": pid, "opened": opened,
-            "started": None if started_ago is None else now - started_ago,
-            "lock_mtime": None if started_ago is None else now - started_ago, "err": err}
+            "newest": newest, "newest_file": newest_file,
+            "gap": list(gap) if gap else None, "mapped": mapped,
+            "pid": pid, "opened": opened, "since": since,
+            "started": started, "lock_mtime": started, "err": err}
 
 
 def code_facts_of(now=NOW, **per_process):
@@ -2445,7 +2458,15 @@ class TestO6ClosureIsTheSourceOfTruth(unittest.TestCase):
 
     def test_the_verdict_is_recomputed_every_run_and_never_goes_silent(self):
         """ГЛАВНОЕ ОТЛИЧИЕ ОТ ПРЕЖНЕЙ ПОМЕТКИ: она была СОБЫТИЕМ и звучала один раз. Здесь —
-        состояние: тот же факт даёт тот же вердикт на каждом из десяти подряд прогонов."""
+        состояние: тот же факт даёт вердикт на каждом из десяти подряд прогонов.
+
+        ПОПРАВКА 05.09.2026 — И ОНА НЕ ОСЛАБЛЕНИЕ, А УТОЧНЕНИЕ. Тест держал РОД вердикта
+        (`o6_pc_code_stale`) наравне с его наличием, и это молча запрещало расхождению взрослеть:
+        ожидание, перешагнувшее срок, обязано СМЕНИТЬ голос на тревогу, иначе восьмичасовой затык
+        03.09 звучал бы той же строкой, что и минутное ожидание. Теперь тест держит РОВНО своё:
+        слой не молчит НИ НА ОДНОМ витке (проверяется по семейству О6, а не по одному роду) и
+        ключ на каждое СОСТОЯНИЕ ровно один. Сама смена голоса проверяется отдельно —
+        `TestVersionNewsNotAlarm.test_the_same_gap_grows_from_news_into_alarm`."""
         seen = set()
         # Факт НЕПОДВИЖЕН (процесс не перезапускался, файл не правился), а «сейчас» едет вперёд —
         # ровно так выглядят десять подряд прогонов наблюдателя над одним и тем же расхождением.
@@ -2453,12 +2474,15 @@ class TestO6ClosureIsTheSourceOfTruth(unittest.TestCase):
         for i in range(10):
             now = NOW + i * 600.0
             f = code_facts_of(now=now, pc_agent=dict(fixed))
-            v = [x for x in ex.verdict(f, self.cfg) if x["kind"] == "o6_pc_code_stale"]
+            v = [x for x in ex.verdict(f, self.cfg)
+                 if str(x["kind"]).startswith("o6") and x.get("name") == "pc_agent"]
             self.assertEqual(len(v), 1, "виток %d промолчал при живом расхождении" % i)
             seen.add(v[0]["key"])
-        self.assertEqual(len(seen), 1,
-                         "ключ эпизода обязан быть ОДИН на воплощение процесса, иначе заметка "
-                         "повторялась бы каждые десять минут: %s" % sorted(seen))
+        # Ключей ровно два и они названы поимённо: один на ожидание, один на тревогу. Больше двух
+        # значило бы, что заметка повторяется каждые десять минут; один — что взросления нет.
+        self.assertEqual(sorted(seen), ["o6c|pc_agent|%d" % int(NOW - 186000.0),
+                                        "o6l|pc_agent|%d" % int(NOW - 186000.0)],
+                         "на воплощение процесса ровно один ключ НА СОСТОЯНИЕ: %s" % sorted(seen))
 
     def test_the_episode_closes_only_on_proven_freshness(self):
         stale = code_facts_of(pc_agent=code_fact(newest_ago=60.0, started_ago=7200.0))
@@ -2562,6 +2586,370 @@ class TestO6Hands(unittest.TestCase):
                                       (ex.CODE_FRESH, ex.CODE_STALE, ex.CODE_UNKNOWN))
             finally:
                 os.environ.pop("CC_EXPECT_PC_DIR", None)
+
+
+class TestVersionNewsNotAlarm(unittest.TestCase):
+    """ОБНОВЛЕНИЕ ВЕРСИИ ГОВОРИТ НОВОСТЬЮ, А НЕ АВАРИЕЙ (задача 229, 05.09.2026).
+
+    Предмет — ТРИ РАЗНЫХ СОСТОЯНИЯ ОДНОГО РАСХОЖДЕНИЯ, у каждого свой голос:
+      НОВОСТЬ        — на диске новее, срок ожидания не вышел: обновление ожидается;
+      ПОДТВЕРЖДЕНИЕ  — процесс перезапустился на новую версию (до правки не звучало ВОВСЕ);
+      ТРЕВОГА        — срок вышел, обновления нет: названы ожидание, срок и что известно о причине.
+
+    ПРЕДСМЕРТНЫЙ ВЗГЛЯД ЗАДАНИЯ ДЕРЖИТСЯ ЗДЕСЬ: провал этой правки выглядел бы как смягчённая
+    вместе с новостью тревога — восьмичасовой затык 03.09 проехал бы мимо владельца тихой строкой.
+    Поэтому у набора два конца: «штатное обновление НЕ ТРЕВОЖИТ» и «настоящий затык ГРОМОК», и
+    ослабить один, не покраснев другим, нельзя."""
+
+    def setUp(self):
+        self.cfg = ex.config({})
+        # Срок ожидания в конфиге — ровно тот, что объявлен измерением, а не подогнанный под тест.
+        self.wait = self.cfg["code_wait"]
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ 1 ЗАДАНИЯ ──────────────────────────────────────────────────────────
+    def test_a_normal_update_raises_no_alarm_and_does_produce_a_confirmation(self):
+        """«Обновление прошло штатно — тревоги НЕТ, а подтверждение ЕСТЬ.»
+
+        Живой сюжет ночи 05.09: коммит лёг, демон обновился ближайшим витком (замер: медиана
+        полного окна доставки 222 с). ДВЕ половины проверяются вместе, потому что порознь каждая
+        зеленела бы и при сломанной другой: молчащий слой прошёл бы первую, шумящий — вторую."""
+        started = NOW - 186000.0
+        stale = code_facts_of(pc_agent=code_fact(newest_ago=120.0, started_ago=186000.0))
+        key = "o6c|pc_agent|%d" % int(started)
+        kinds = [v["kind"] for v in ex.verdict(stale, self.cfg) if str(v["kind"]).startswith("o6")]
+        self.assertNotIn("o6_pc_code_late", kinds,
+                         "коммит двухминутной давности тревогой НЕ является: демон обновится сам")
+        self.assertIn("o6_pc_code_stale", kinds, "и молчать тоже нельзя — это новость")
+
+        # ...через 222 с (медиана измеренного окна) демон передал эстафету: процесс СВЕЖ.
+        after = code_facts_of(now=NOW + 222.0,
+                              pc_agent=code_fact(now=NOW + 222.0, newest_ago=342.0,
+                                                 started_ago=1.0))
+        self.assertEqual(ex.code_state("pc_agent", after, self.cfg, NOW + 222.0)[0], ex.CODE_FRESH)
+        self.assertEqual(ex.closures(after, self.cfg, [key]), [key],
+                         "перезапуск на свежий код обязан ЗАКРЫТЬ эпизод")
+        # ПОДТВЕРЖДЕНИЕ — то, чего не было вовсе: закрытие обязано СКАЗАТЬ про обновление версии.
+        text = ex.render_close(key, "ПК",
+                               ex.code_close_detail(key, after, self.cfg, NOW + 222.0))
+        self.assertIn("ОБНОВЛЕНИЕ СОСТОЯЛОСЬ", text)
+        self.assertIn("работает на новой версии", text)
+        self.assertIn("было воплощение от", text)     # «с какой…
+        self.assertIn("стало от", text)               # …на какую» — обе точки названы
+        for word in ("🔔", "🚨", "СТАРЫЙ КОД", "не работает"):
+            self.assertNotIn(word, text, "подтверждение — хорошая новость и звучать обязана так")
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ 2 ЗАДАНИЯ ──────────────────────────────────────────────────────────
+    def test_an_update_that_never_happened_within_the_deadline_does_raise_the_alarm(self):
+        """«Обновление не случилось за назначенный срок — тревога ЕСТЬ.»
+
+        ЖИВОЙ СЛУЧАЙ, А НЕ ВЫДУМАННЫЙ: 03.09.2026 самообновление стояло 8.3 ч (дерево грязное),
+        худшее ожидание коммита — 487.1 мин. Именно он обязан звучать бедой; если после смягчения
+        новости эта проверка зеленеет молчанием — правка неверна, и тест обязан это поймать."""
+        waited = 487.1 * 60.0                                   # ЖИВОЕ число затыка 03.09
+        f = code_facts_of(pc_agent=code_fact(newest_ago=waited, started_ago=waited + 3600.0),
+                          su=None)
+        f["su"] = {"ok": True, "kind": "dirty", "at": NOW - waited,
+                   "what": "2026-09-04 03:31:19 ERROR ... дерево ГРЯЗНОЕ ... pc_orchestrator.py"}
+        v = [x for x in ex.verdict(f, self.cfg) if x["kind"] == "o6_pc_code_late"]
+        self.assertEqual(len(v), 1, "восьмичасовой затык ОБЯЗАН быть тревогой, а не новостью")
+        self.assertEqual(v[0]["key"], "o6l|pc_agent|%d" % int(NOW - waited - 3600.0))
+        text = ex.render(v[0])
+        self.assertIn("🚨", text)                                # громко
+        self.assertIn("НЕ СЛУЧИЛОСЬ", text)
+        self.assertIn("8 ч 7 мин", text)                        # сколько ждём — числом
+        self.assertIn("срок был 90 мин", text)                  # какой был срок — числом
+        self.assertIn("дерево", text)                           # что известно о причине
+        # И запрет владельца переживает повышение громкости: ветка перезапусков не заводит.
+        self.assertIn("рестарта не делаю", text)
+        for word in ("перезапускаю", "перезапущу", "рестартую"):
+            self.assertNotIn(word, text, "наблюдатель ничего не перезапускает — запрет владельца")
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ 3 ЗАДАНИЯ ──────────────────────────────────────────────────────────
+    def test_an_unreadable_source_says_unknown_and_never_says_fine(self):
+        """«Источник состояния недоступен — говорится «неизвестно», а не «в порядке».»
+
+        Проверяются ОБА источника этой ветки, потому что недоступны они порознь: замыкание (без
+        него не судится расхождение) и самообновление (без него не называется причина)."""
+        # 1. Источник расхождения слеп → пометка СТОИТ, и слово сказано.
+        blind = code_facts_of(pc_agent=code_fact(ok=False, reason="каталог не читается",
+                                                 newest_ago=None))
+        state, info = ex.code_state("pc_agent", blind, self.cfg, NOW)
+        self.assertEqual(state, ex.CODE_UNKNOWN)
+        kinds = [v["kind"] for v in ex.verdict(blind, self.cfg)]
+        self.assertIn("o6_pc_code_unknown", kinds)
+        self.assertNotIn("o6_pc_code_stale", kinds)
+        for word in ("в порядке", "всё хорошо", "обновление ожидается"):
+            self.assertNotIn(word, ex.render({"kind": "o6_pc_code_unknown", "name": "pc_agent",
+                                              "why": info.get("why")}))
+        # 2. Источник ПРИЧИНЫ слеп, а расхождение просрочено → тревога звучит, причина названа
+        #    незнанием. Молчания здесь нет ни на одной дороге.
+        for su, expect in ((None, ex.SU_BLIND),
+                           ({"ok": False, "reason": "FileNotFoundError"}, ex.SU_BLIND),
+                           ({"ok": True, "kind": None}, ex.SU_QUIET)):
+            f = code_facts_of(pc_agent=code_fact(newest_ago=7200.0, started_ago=11000.0))
+            if su is not None:
+                f["su"] = su
+            self.assertEqual(ex.su_state(f)[0], expect)
+            v = [x for x in ex.verdict(f, self.cfg) if x["kind"] == "o6_pc_code_late"]
+            self.assertEqual(len(v), 1, "просрочка обязана звучать и при слепом источнике причины")
+            text = ex.render(v[0])
+            self.assertIn("НЕИЗВЕСТНА" if expect is ex.SU_QUIET else "не читается", text)
+            for word in ("в порядке", "всё хорошо"):
+                self.assertNotIn(word, text)
+
+    # ── ОСТАЛЬНЫЕ ГАРАНТИИ ────────────────────────────────────────────────────────────────────
+    def test_the_news_voice_carries_no_alarm_words_at_all(self):
+        """п.3: новость звучит СПОКОЙНО. Список запрещённых слов — дословно прежний заголовок и
+        его родня: до правки владелец получал «🔔 процесс несёт СТАРЫЙ КОД» на любое расхождение,
+        включая минутное, и читал это ошибкой."""
+        f = code_facts_of(pc_agent=code_fact(newest_ago=300.0, started_ago=186000.0))
+        v = [x for x in ex.verdict(f, self.cfg) if x["kind"] == "o6_pc_code_stale"][0]
+        text = ex.render(v)
+        for word in ("🚨", "СТАРЫЙ КОД", "НЕ СЛУЧИЛОСЬ", "упал", "умер", "не работает",
+                     "авария", "сбой,"):
+            self.assertNotIn(word, text, "новость не смеет звучать аварией: %s" % word)
+        self.assertIn("подхватит её ближайшим витком", text)
+        self.assertIn("это штатный ход, а не сбой", text)
+        # Числа второй оси названы ОБА, иначе «подождём» не проверить.
+        self.assertIn("срок ожидания 90 мин", text)
+        # И старая улика на месте: смягчение голоса не украло ни одного факта.
+        self.assertIn("замыкание импортов", text)
+        self.assertIn("рестарта не делаю", text)
+
+    def test_the_same_gap_grows_from_news_into_alarm_and_says_so_once_each(self):
+        """п.5: одно состояние — одно сообщение. РОВНО ОДНА новость и РОВНО одна тревога на весь
+        путь расхождения, а не заметка каждые десять минут и не тишина после первой."""
+        started, newest = NOW - 186000.0, NOW - 60.0
+        said, kinds = [], []
+        for i in range(40):                                   # 40 тиков по 10 мин = 6 ч 40 мин
+            now = NOW + i * 600.0
+            fact = code_fact(now=now, newest_ago=now - newest, started_ago=now - started)
+            f = code_facts_of(now=now, pc_agent=fact)
+            f["su"] = {"ok": True, "kind": "gate", "what": "unittest-гейт ПРОВАЛЕН"}
+            v = [x for x in ex.verdict(f, self.cfg)
+                 if str(x["kind"]).startswith("o6") and x.get("name") == "pc_agent"]
+            self.assertEqual(len(v), 1, "тик %d промолчал при живом расхождении" % i)
+            kinds.append(v[0]["kind"])
+            if v[0]["key"] not in said:
+                said.append(v[0]["key"])
+        self.assertEqual(said, ["o6c|pc_agent|%d" % int(started),
+                                "o6l|pc_agent|%d" % int(started)],
+                         "владелец обязан получить РОВНО две строки: новость, потом тревогу")
+        self.assertEqual(kinds[0], "o6_pc_code_stale")
+        self.assertEqual(kinds[-1], "o6_pc_code_late")
+        # Перелом ровно на измеренном сроке: 90 мин ожидания = 9 тиков наблюдателя.
+        flip = kinds.index("o6_pc_code_late")
+        self.assertEqual(flip, 9, "голос обязан меняться на 90-й минуте ожидания, а не раньше")
+        self.assertNotIn("o6_pc_code_stale", kinds[flip:], "назад в новость тревога не отыгрывает")
+
+    def test_a_red_gate_and_an_unnamed_cause_are_different_news(self):
+        """п.6: «не обновился, потому что гейт красный» и «причина неизвестна» — разные новости, и
+        вторая ОПАСНЕЕ. Замер 05.09: у гейта 23 живых отказа в логе, и это НАЗВАННАЯ причина."""
+        def alarm(su):
+            f = code_facts_of(pc_agent=code_fact(newest_ago=7200.0, started_ago=11000.0))
+            f["su"] = su
+            return ex.render([x for x in ex.verdict(f, self.cfg)
+                              if x["kind"] == "o6_pc_code_late"][0])
+
+        red = alarm({"ok": True, "kind": "gate", "why": "гейт самообновления провален",
+                     "what": "unittest-гейт ПРОВАЛЕН (6700489→f709d68)"})
+        quiet = alarm({"ok": True, "kind": None})
+        self.assertIn("причина НАЗВАНА механизмом: гейт красный", red)
+        self.assertIn("f709d68", red, "названная причина обязана приехать УЛИКОЙ, а не словом")
+        self.assertIn("ПРИЧИНА НЕИЗВЕСТНА, и это хуже названного отказа", quiet)
+        self.assertNotEqual(red, quiet, "две разные новости не смеют звучать одинаково")
+        self.assertNotIn("гейт красный", quiet)
+
+    def test_the_deadline_is_the_measured_rhythm_and_not_a_round_guess(self):
+        """п.4: срок взят из ИЗМЕРЕННОГО ритма витка. Тест держит связь числа с замером: 90 мин
+        обязаны перекрывать измеренный максимум доставки (2331.5 с) и объявленный самим кодом
+        потолок TASK_TIMEOUT + POLL_SEC + худший гейт = 3347 с. Уронят порог ниже — покраснеет."""
+        self.assertEqual(ex.CODE_WAIT_DEFAULT, 90.0)
+        self.assertEqual(self.wait, 5400.0)
+        measured_max, code_ceiling = 2331.5, 2700.0 + 60.0 + 587.1
+        self.assertGreater(self.wait, measured_max * 2,
+                           "срок обязан лежать выше измеренного максимума с запасом")
+        self.assertGreater(self.wait, code_ceiling,
+                           "срок обязан перекрывать потолок, объявленный самим кодом демона")
+        self.assertEqual(ex.TASK_TIMEOUT_SEC, 2700.0, "потолок задачи — часть основания срока")
+        # КОНТРФАКТ ИЗМЕРЕНИЯ: ни одна из 69 законных доставок в него не попадает (макс 38.9 мин),
+        # то есть ложных тревог на живом корпусе ноль.
+        for legit in (56.9, 222.0, 2077.4, measured_max):
+            f = code_facts_of(pc_agent=code_fact(newest_ago=legit, started_ago=legit + 90000.0))
+            self.assertFalse(ex.code_state("pc_agent", f, self.cfg, NOW)[1]["late"],
+                             "законная доставка %.1f с не смеет звать тревогу" % legit)
+
+    def test_zero_on_the_wait_axis_kills_the_alarm_and_keeps_the_news(self):
+        """Объявленный откат ТОЛЬКО тревоги. Глушить обе разом нельзя: это вернуло бы прежнюю
+        интонацию молчанием, а «сигнал не глушить» — прямой запрет задания."""
+        off = ex.config({ex.CODE_WAIT_ENV: "0"})
+        self.assertEqual(off["code_wait"], 0.0)
+        f = code_facts_of(pc_agent=code_fact(newest_ago=86400.0, started_ago=90000.0))
+        kinds = [v["kind"] for v in ex.verdict(f, off) if str(v["kind"]).startswith("o6")]
+        self.assertNotIn("o6_pc_code_late", kinds)
+        self.assertIn("o6_pc_code_stale", kinds, "новость обязана пережить откат тревоги")
+        # А общий откат О6 по-прежнему убивает ветку целиком — прежнее поведение не тронуто.
+        dead = ex.config({ex.CODE_MIN_ENV: "0"})
+        self.assertEqual([v for v in ex.verdict(f, dead) if str(v["kind"]).startswith("o6")], [])
+
+    def test_a_fresh_commit_by_someone_else_does_not_reset_our_wait(self):
+        """САМАЯ ОПАСНАЯ ДЫРА ЭТОЙ ПРАВКИ, и найдена она ЖИВЫМ прогоном, а не рассуждением.
+
+        Ожидание, считанное от САМОЙ СВЕЖЕЙ правки, обнуляется любым чужим коммитом в замыкание. У
+        userbot в замыкании 67 файлов и правки идут по нескольку раз в час, поэтому такой счёт не
+        дошёл бы до 90 минут НИКОГДА — процесс, не перезапускавшийся двое суток, вечно звучал бы
+        спокойной новостью «подхватит ближайшим витком». Это ровно то смягчение, которое съедает
+        настоящий отказ, и задание запрещает его прямым словом.
+
+        ЖИВОЙ ЗАМЕР 05.09 06:04, который это и вскрыл: userbot запущен 03.09 06:02, отстал на
+        2 сут 1 ч, а `now - newest` у него = 6 мин 15 с."""
+        started = NOW - 177496.0                      # ЖИВОЙ userbot: запущен 03.09 06:02
+        f = code_facts_of(userbot=dict(
+            code_fact(newest_ago=375.0, started_ago=177496.0, files=67),
+            # ...и самая РАННЯЯ невзятая правка — двухсуточной давности, ровно как в проде.
+            since=NOW - 172800.0))
+        state, info = ex.code_state("userbot", f, self.cfg, NOW)
+        self.assertEqual(state, ex.CODE_STALE)
+        self.assertTrue(info["wait_exact"])
+        self.assertAlmostEqual(info["waited"], 172800.0, places=3)
+        self.assertTrue(info["late"], "двое суток без перезапуска — это ТРЕВОГА, а не новость")
+        v = [x for x in ex.verdict(f, self.cfg)
+             if x["kind"] == "o6_pc_code_late" and x["name"] == "userbot"]
+        self.assertEqual(len(v), 1)
+        self.assertIn("ЖДЁМ УЖЕ 2 сут 0 ч", ex.render(v[0]))
+
+        # КОНТРФАКТ ТОЙ ЖЕ СТРОКОЙ: считай мы от `newest` — тревоги не было бы вовсе.
+        blind = code_facts_of(userbot=code_fact(newest_ago=375.0, started_ago=177496.0, files=67))
+        blind["code"]["userbot"].pop("since", None)
+        state2, info2 = ex.code_state("userbot", blind, self.cfg, NOW)
+        self.assertFalse(info2["wait_exact"])
+        self.assertAlmostEqual(info2["waited"], 375.0, places=3)
+        self.assertFalse(info2["late"], "контрфакт: по `newest` двухсуточный затык МОЛЧИТ")
+        # ...и потому собственная глухота обязана быть НАЗВАНА в самой заметке.
+        quiet = [x for x in ex.verdict(blind, self.cfg)
+                 if str(x["kind"]).startswith("o6") and x["name"] == "userbot"][0]
+        self.assertIn("ЗАНИЖАЮ", ex.render(dict(quiet, kind="o6_pc_code_late", waited=375.0,
+                                                wait_limit=self.wait, wait_exact=False)))
+
+    def test_the_hands_measure_since_from_the_earliest_untaken_edit(self):
+        """РУКИ считают `since` тем же обходом и по тому же правилу: самая ранняя правка, которая
+        НОВЕЕ момента запуска. Взятые процессом файлы в счёт не идут — иначе ожидание считалось бы
+        от кода, который давно в памяти."""
+        stamps = {"pc_agent.py": 100.0, "io_utf8.py": 500.0}      # запуск будет между ними
+
+        def stat_fn(path):
+            return type("S", (), {"st_mtime": stamps.get(os.path.basename(path), 900.0)})()
+
+        def lock_fn(rec, lock, whose):
+            rec["started"], rec["pid"], rec["opened"] = 300.0, 7092, True
+            return rec
+
+        out = run_mod.code_facts(
+            closure_fn=lambda r, entries=None, cut=None: __import__("client_contour").Closure(
+                frozenset({entries[0], "io_utf8.py"}), frozenset(), True, "ok"),
+            stat_fn=stat_fn, lock_fn=lock_fn, map_fn=lambda p: set())
+        rec = out["pc_agent"]
+        self.assertEqual(rec["newest"], 500.0)
+        self.assertEqual(rec["since"], 500.0, "правка ДО запуска (100.0) ожиданием не является")
+        # Всё замыкание старше запуска → отставать не от чего, и `since` честно пуст.
+        stamps["io_utf8.py"] = 200.0
+        out2 = run_mod.code_facts(
+            closure_fn=lambda r, entries=None, cut=None: __import__("client_contour").Closure(
+                frozenset({entries[0], "io_utf8.py"}), frozenset(), True, "ok"),
+            stat_fn=stat_fn, lock_fn=lock_fn, map_fn=lambda p: set())
+        self.assertIsNone(out2["pc_agent"]["since"])
+
+    def test_a_clock_skew_never_invents_an_overdue_update(self):
+        """mtime «из будущего» (часы разъехались, файл принесён с другой машины) не смеет родить
+        просрочку: `waited` зажат в ноль. Тревога на перекосе часов была бы ложной громкостью."""
+        f = code_facts_of(pc_agent=code_fact(newest_ago=-3600.0, started_ago=186000.0))
+        state, info = ex.code_state("pc_agent", f, self.cfg, NOW)
+        self.assertEqual(state, ex.CODE_STALE)
+        self.assertEqual(info["waited"], 0.0)
+        self.assertFalse(info["late"])
+
+    def test_the_confirmation_never_fires_without_proven_freshness(self):
+        """ПОДТВЕРЖДЕНИЕ — не вежливость, а факт: сказать «обновился» можно только на доказанной
+        свежести. Слепота и живое расхождение обязаны молчать здесь обе."""
+        key = "o6l|pc_agent|%d" % int(NOW - 186000.0)
+        for why, f in (
+            ("расхождение живо", code_facts_of(pc_agent=code_fact(newest_ago=60.0,
+                                                                  started_ago=186000.0))),
+            ("прибор слеп", code_facts_of(pc_agent=code_fact(ok=False, reason="каталог не читается"))),
+        ):
+            self.assertEqual(ex.closures(f, self.cfg, [key]), [], why)
+            self.assertEqual(ex.code_close_detail(key, f, self.cfg, NOW), "", why)
+
+    def test_every_o6_kind_is_declared_in_the_registry(self):
+        """Новый род обязан стоять в `KINDS` и иметь СВОЙ заголовок: род без заголовка печатался бы
+        безымянным «нарушение ожидания» — то есть громкость терялась бы молча."""
+        self.assertIn("o6_pc_code_late", ex.KINDS)
+        for kind in ("o6_pc_code_stale", "o6_pc_code_late", "o6_pc_code_unknown"):
+            self.assertIn(kind, ex.NOTE_HEAD)
+            self.assertNotEqual(ex.NOTE_HEAD[kind], "🔔 ожидание нарушено")
+        self.assertNotEqual(ex.NOTE_HEAD["o6_pc_code_stale"], ex.NOTE_HEAD["o6_pc_code_late"])
+
+
+class TestVersionNewsHands(unittest.TestCase):
+    """РУКИ ВТОРОЙ ОСИ: причина берётся из ДОСЛОВНЫХ строк демона, и разбор кренится в громкость."""
+
+    def test_the_named_causes_are_read_from_the_daemons_own_words(self):
+        tail = "\n".join([
+            "2026-09-04 05:41:30,415 INFO self-update: 65f2bbb→6700489 — гейт пройден, новый",
+            "2026-09-04 06:36:58,147 ERROR self-update: unittest-гейт ПРОВАЛЕН (6700489→f709d68): x",
+        ])
+        out = run_mod.su_facts(tail=tail)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["kind"], "gate")
+        self.assertIn("f709d68", out["what"])
+        self.assertIsNotNone(out["at"], "у причины обязано быть время — иначе её не проверить")
+        self.assertEqual(ex.su_state({"su": out})[0], ex.SU_GATE)
+
+        dirty = run_mod.su_facts(tail="2026-09-04 03:31:19,403 ERROR self-update демона: дерево "
+                                      "ГРЯЗНОЕ — авто-рестарт ЗАПРЕЩЁН; файлы: pc_orchestrator.py")
+        self.assertEqual(dirty["kind"], "dirty")
+        self.assertEqual(ex.su_state({"su": dirty})[0], ex.SU_DIRTY)
+
+    def test_the_last_word_wins_even_when_it_is_the_quiet_one(self):
+        """Механизм отказал, а потом обновился — отказ БОЛЬШЕ НЕ ПРИЧИНА. Иначе владелец получил бы
+        вчерашнюю причину к сегодняшнему затыку, и это хуже честного «не знаю»."""
+        tail = "\n".join([
+            "2026-09-04 06:36:58,147 ERROR self-update: unittest-гейт ПРОВАЛЕН (a→b): x",
+            "2026-09-04 16:08:14,707 INFO self-update: 6700489→2adfb02 — гейт пройден, новый",
+        ])
+        out = run_mod.su_facts(tail=tail)
+        self.assertIsNone(out["kind"])
+        self.assertEqual(ex.su_state({"su": out})[0], ex.SU_QUIET)
+
+    def test_the_parse_leans_to_the_loud_side(self):
+        """ЧЕСТНАЯ ЦЕНА РАЗБОРА. Демон перепишет формулировку лога — причина станет неназванной,
+        а НЕ «в порядке»: сломавшийся разбор обязан усиливать сигнал, а не глушить его."""
+        out = run_mod.su_facts(tail="2026-09-04 06:36:58,147 ERROR самообновление сломалось иначе")
+        self.assertTrue(out["ok"], "файл прочитан — слепотой это не является")
+        self.assertIsNone(out["kind"])
+        self.assertEqual(ex.su_state({"su": out})[0], ex.SU_QUIET,
+                         "непонятая строка обязана давать САМЫЙ ГРОМКИЙ исход, а не тихий")
+
+    def test_a_missing_log_is_blindness_and_says_so(self):
+        out = run_mod.su_facts(path=os.path.join(REPO, "нет-такого-файла-2026-09-05.log"))
+        self.assertFalse(out["ok"])
+        self.assertIn("FileNotFoundError", out["reason"])
+        self.assertEqual(ex.su_state({"su": out})[0], ex.SU_BLIND)
+
+    def test_the_live_run_carries_the_cause_fact_every_pass(self):
+        """ЖИВОЙ прогон рук: факт причины кладётся ВСЕГДА, как и факт замыкания. Отсутствие раздела
+        `su` означало бы, что тревога навсегда останется без причины и никто этого не заметит."""
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["CC_EXPECT_PC_DIR"] = d
+            try:
+                st = run_mod.load_state()
+                now = datetime.datetime.now().timestamp()
+                facts = run_mod.snapshot(st, now, lambda s: {"ok": False, "items": []})
+            finally:
+                os.environ.pop("CC_EXPECT_PC_DIR", None)
+        self.assertIn("su", facts)
+        self.assertIsInstance(facts["su"], dict)
+        self.assertIn(ex.su_state(facts)[0], (ex.SU_GATE, ex.SU_DIRTY, ex.SU_QUIET, ex.SU_BLIND))
 
 
 if __name__ == "__main__":
