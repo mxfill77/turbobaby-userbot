@@ -892,6 +892,12 @@ class TestFindingFate(unittest.TestCase):
                       cd.fate_words_queue(got), cd.benefit_words(got)):
             self.assertIn(cd.FATE_UNKNOWN, words)
             self.assertNotIn(" 0 ", " %s " % words, "ноль вместо «неизвестно»")
+        # У СТУПЕНИ B «неизвестно» ТЕПЕРЬ ОДНО ПОСТОЯННОЕ («закрыто отбором» прибора
+        # не имеет никогда), и одного `assertIn` выше стало мало: он зеленел бы и на
+        # строке, где живые числа втихую съехали в нули. Считаем ШТУКИ — при мёртвом
+        # реестре их обязано быть три (заявки, вне реестра, отбор).
+        self.assertGreaterEqual(cd.fate_words_intake(got).count(cd.FATE_UNKNOWN), 3,
+                                "постоянное «неизвестно» прикрыло собой нули живых чисел")
 
     def test_one_dead_registry_does_not_erase_the_others(self):
         """Смерть ступени E не отменяет посчитанного ступенью B."""
@@ -915,18 +921,55 @@ class TestFindingFate(unittest.TestCase):
         self.assertIsNone(run.fresh_or_none({"claims": {}}, None, NOW, "intake"),
                           "возраст не сверить → числа не едут")
 
-    def test_the_growth_of_the_section_is_four_lines_and_no_more(self):
-        """Сводку читают с телефона: стена хуже отсутствия."""
+    def _grown(self):
+        """Четыре строки прироста — те же, что уедут в Telegram, и в том же виде."""
         heads = [{"channel": "codex", "send_date": self.DAY, "outcome": "answered",
                   "reason": "", "answered": True, "rel": "docs/review_inbox/a.md"}]
         rows = run.section_external(heads, self.records(), "", self.DAY, NOW,
                                     intake=self.intake(), i_at=NOW - 10,
                                     recon=self.recon(), r_at=NOW - 10,
                                     queue=self.queue(), q_at=NOW - 10)
+        return rows, rows[1:]
+
+    def test_the_growth_of_the_section_is_four_lines_and_no_more(self):
+        """Сводку читают с телефона: стена хуже отсутствия."""
+        rows, grown = self._grown()
         self.assertEqual(len(rows), 5, "прирост раздела больше четырёх строк")
+        self.assertEqual(len(grown), 4)
         self.assertLessEqual(len(rows), cd.LIST_MAX,
                              "строки раздела не влезают в LIST_MAX и обрежутся молча")
         self.assertEqual({rd["topic"] for rd in rows}, {"external"})
+
+    def test_four_lines_are_counted_in_characters_and_not_in_rows(self):
+        """ПОПРАВКА 04.09: «четыре строки» кода — не четыре строки телефона.
+
+        Первая сборка держала потолок в единицах кода и была зелёной, а на экране
+        шириной 36 знаков разворачивалась в 26 физических строк (786 знаков) — в ту
+        самую стену, которую пункт 6 задания запрещал. Поэтому потолок мерится ЗНАКАМИ
+        готовой строки, а число взято у самой сводки: медиана её собственного пункта
+        130 знаков, четыре таких = 520, известный и объяснённый перебор → 640.
+        """
+        _rows, grown = self._grown()
+        body = sum(len(cd.line_text(rd)) for rd in grown)
+        self.assertLessEqual(body, cd.FATE_CHARS,
+                             "прирост раздела снова растёт стеной: %d знаков" % body)
+        self.assertLess(cd.FATE_CHARS, 786,
+                        "потолок не ниже той стены, ради которой заведён")
+        for rd in grown:
+            self.assertLess(len(cd.line_text(rd)), 260,
+                            "одна строка прироста тянет на экран целиком")
+
+    def test_the_shortening_did_not_cut_a_single_lock(self):
+        """Резалась вода, а не замки: определение, третий исход и паспорта на месте."""
+        _rows, grown = self._grown()
+        body = " ".join(rd["words"] for rd in grown)
+        self.assertIn("наличие заявки пользой НЕ считается", body)
+        self.assertIn("правило прибора не имеет", body)
+        self.assertIn("закрыто отбором %s" % cd.FATE_UNKNOWN, body,
+                      "третий исход ступени B ужат в ноль вместо «неизвестно»")
+        self.assertIn(self.DAY, body)
+        for rd in grown:
+            self.assertTrue(rd["addr"] and rd["age"], "паспорт числа срезан ради краткости")
 
     def test_every_new_number_carries_its_own_source_and_age(self):
         """Закон 1: у каждого числа свой адрес и свой возраст — общего нет."""
