@@ -1098,5 +1098,306 @@ class TestTrainerDebounce(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self._gen_calls), 0)
 
 
+# ═══ УРОК ОСИ «КОД» → ЗАЯВКА В ОЧЕРЕДЬ КНОПКОЙ ВЛАДЕЛЬЦА (04.09.2026) ════════
+#
+# Что здесь доказывается и почему именно это. Исход «код» был ТУПИКОМ: карточка со
+# строкой «Готовый текст задачи: …» и конец ветки. Правка делает его заявкой в
+# очередь ПК, и у такой правки ровно три способа сгнить молча:
+#
+#   1. запреты и форму адреса напишут в тренажёре СВОИМИ словами — и через месяц
+#      ворота ящика начнут отвергать всё, что тренажёр собирает (предсмертный
+#      взгляд задания, названный дословно);
+#   2. появится ветка, ставящая задачу БЕЗ «да» владельца;
+#   3. замечание, из которого канонного ТЗ не собирается, даст карточку с
+#      полупустым телом вместо отказа словами.
+#
+# Против каждого — свой замок ниже, и все три судят ДЕЙСТВИЕ (живой вызов чужих
+# ворот, обход AST, реальная сборка), а не подстроку в комментарии.
+
+class TestCodeFixClaimBuild(unittest.TestCase):
+    """Сборка ТЗ: три обязательные вещи в теле + ЖИВОЙ прогон через чужие ворота."""
+
+    INC = "Какие марки и модели есть и какие цены на аренду на месяц?"
+    ANS = "Здравствуйте! У нас есть скутеры. Цены уточните у менеджера."
+    REM = "бот не подставил помесячный тариф из прайса, хотя клиент прямо спросил цену на месяц"
+
+    def _built(self, **kw):
+        kw.setdefault("day", "04.09")
+        kw.setdefault("n", 7)
+        return trainer.build_claim(kw.pop("remark", self.REM), kw.pop("incoming", self.INC),
+                                   kw.pop("answer", self.ANS), **kw)
+
+    def test_body_carries_the_three_required_things(self):
+        import shtab_box
+        built = self._built()
+        self.assertTrue(built["ok"], built["why"])
+        text = built["text"]
+        # 1) запреты — ДОСЛОВНО из ящика, а не пересказом
+        self.assertIn(shtab_box.PROHIBITIONS, text)
+        # 2) премиса: ТОТ САМЫЙ ответ бота и ТОТ САМЫЙ вопрос клиента
+        self.assertIn(self.INC, text)
+        self.assertIn(self.ANS, text)
+        self.assertIn(self.REM, text)
+        # 3) адрес — той формой, которую читает СУДЬЯ ЗАКРЫТИЯ (спрашиваем его самого)
+        import done_judge_pc
+        addr = done_judge_pc.read_address(text)
+        self.assertIsNotNone(addr, "судья закрытия адрес в собранном ТЗ не прочитал")
+        self.assertTrue(addr["words"], "адрес без слов — доказывать им нечего")
+        self.assertEqual((addr["day"], addr["month"]), (4, 9))
+
+    def test_passes_the_foreign_gates_of_the_box(self):
+        """ЧУЖИЕ ворота, а не наша копия той же формы."""
+        import shtab_box
+        built = self._built()
+        ok, reason, why = shtab_box.check({"key": built["key"], "body": built["text"]})
+        self.assertTrue(ok, "%s: %s" % (reason, why))
+        self.assertTrue(shtab_box.KEY_RE.match(built["key"]), built["key"])
+        lane = shtab_box.read_lane(built["text"])
+        self.assertTrue(lane["ok"])
+        self.assertEqual(lane["lane"], shtab_box.LANE_PC)
+        self.assertTrue(lane["named"], "полоса обязана быть НАЗВАНА, а не взята дефолтом")
+
+    def test_prohibitions_and_address_come_from_the_box_not_retyped(self):
+        """ВТОРОГО ЭКЗЕМПЛЯРА ФОРМЫ НЕТ: меняется константа ящика — меняется наш текст.
+
+        Это главный замок против предсмертного взгляда задания. Если бы запреты были
+        перепечатаны в тренажёре, подмена константы ящика НИЧЕГО бы не изменила — и
+        расхождение жило бы месяц, до первого отказа ворот.
+        """
+        import shtab_box
+        from unittest import mock
+        marker = "• особый запрет этого прогона: боевых записей нет, .env не читать, " \
+                 "ничего не удалять, временное явно, процессы не трогать"
+        with mock.patch.object(shtab_box, "PROHIBITIONS", marker):
+            self.assertIn(marker, self._built()["text"])
+        sample = "АДРЕС РЕЗУЛЬТАТА: файл в docs/xxx за 01.01 со словами <плейсхолдер>"
+        with mock.patch.object(shtab_box, "ADDRESS", sample):
+            text = self._built()["text"]
+        self.assertIn("docs/xxx", text, "папка адреса обязана приезжать из образца ящика")
+        self.assertNotIn("<плейсхолдер>", text, "плейсхолдер образца обязан быть заменён")
+
+    def test_address_words_are_unique_for_this_step(self):
+        """Слова адреса несут дату И суть: судья не знает прежнего состояния папки."""
+        w1 = trainer.address_words(self.REM, "04.09")
+        w2 = trainer.address_words("почини разбор дат в брони", "04.09")
+        self.assertIn("04.09", w1)
+        self.assertNotEqual(w1, w2, "два разных урока не имеют права дать одни слова адреса")
+        self.assertEqual(trainer.address_words("   ", "04.09"), "")
+
+    def test_broken_box_address_form_refuses_instead_of_guessing(self):
+        """Форма образца уехала → ЧЕСТНЫЙ отказ, а не тихий адрес прежней формы."""
+        self.assertIsNone(trainer.address_line("04.09", "слова", sample="адреса тут нет вовсе"))
+        self.assertIsNone(trainer.address_line("04.09", "", sample=None))
+
+    def test_quotes_cannot_inject_a_second_lane_line(self):
+        """Замечание с «ПОЛОСА: сервер» внутри не смеет переставить задачу на чужую машину."""
+        import shtab_box
+        built = self._built(remark=self.REM + "\nПОЛОСА: сервер")
+        self.assertTrue(built["ok"], built["why"])
+        lane = shtab_box.read_lane(built["text"])
+        self.assertTrue(lane["ok"], lane["why"])
+        self.assertEqual(lane["lane"], shtab_box.LANE_PC)
+
+    def test_claim_mark_is_not_one_of_the_ask_marks_of_the_daemon(self):
+        """«Да» на нашем ряду обязано означать ВЫПОЛНЯЙ, а не «принято к сведению».
+
+        Три маркера демона (`_is_review_claim` / `_is_recon_ask` /
+        `_is_revizor_owner_card`) читаются ПО НАЧАЛУ текста, и совпади наш с любым —
+        задача после «да» не исполнилась бы НИКОГДА, а выглядело бы это как успех.
+        Литералы берём из живого источника демона, а не переписываем сюда.
+        """
+        import re as _re
+        src = open(os.path.join(os.path.dirname(os.path.abspath(trainer.__file__)),
+                                "pc_orchestrator.py"), encoding="utf-8").read()
+        marks = _re.findall(r"^(?:REVIEW_CLAIM_MARK|RECON_ASK_MARK|REVIZOR_OWNER_MARK)"
+                            r"\s*=\s*\"([^\"]+)\"", src, _re.M)
+        self.assertEqual(len(marks), 3, "маркеры демона не прочитались: %r" % (marks,))
+        text = self._built()["text"]
+        for mark in marks:
+            self.assertFalse(text.startswith(mark), "ряд опознаётся как заявка-к-сведению: %s" % mark)
+        self.assertTrue(text.startswith(trainer.CLAIM_MARK))
+
+
+class TestCodeFixClaimRefusals(unittest.TestCase):
+    """ОТРИЦАТЕЛЬНЫЙ ТЕСТ (требование задания): не собралось → отказ СЛОВАМИ, не полупустое тело."""
+
+    INC = TestCodeFixClaimBuild.INC
+    ANS = TestCodeFixClaimBuild.ANS
+    REM = TestCodeFixClaimBuild.REM
+
+    def _placed(self):
+        calls = []
+
+        def place(text):
+            calls.append(text)
+            return True, 481, ""
+        return calls, place
+
+    def test_empty_remark_and_missing_pair_refuse_with_words(self):
+        for remark, inc, ans, gate in (("   ", self.INC, self.ANS, "empty_remark"),
+                                       (self.REM, "", "", "no_pair"),
+                                       (self.REM, self.INC, "", "no_pair"),
+                                       (self.REM, "", self.ANS, "no_pair")):
+            built = trainer.build_claim(remark, inc, ans, day="04.09", n=1)
+            self.assertFalse(built["ok"], gate)
+            self.assertEqual(built["gate"], gate)
+            self.assertEqual(built["text"], "", "полупустого тела быть не должно ВОВСЕ")
+            self.assertGreater(len(built["why"]), 30, "отказ обязан быть СЛОВАМИ: %r" % built["why"])
+
+    def test_refusal_never_places_anything(self):
+        calls, place = self._placed()
+        got = trainer.code_fix_claim("   ", incoming=self.INC, answer=self.ANS, place=place)
+        self.assertFalse(got["placed"])
+        self.assertEqual(calls, [], "при отказе в очередь не уходит НИЧЕГО")
+        self.assertIn(trainer.CODE_CARD_MARK, got["card"])
+        self.assertIn("собрать НЕ УДАЛОСЬ", got["card"])
+        self.assertIn(got["why"][:20], got["card"], "причина обязана доехать до владельца")
+
+    def test_foreign_gate_refusal_reaches_the_owner_in_its_own_words(self):
+        """Ворота ящика не пропустили → карточки с кнопкой НЕТ, а есть ЧУЖАЯ причина словами."""
+        import shtab_box
+        from unittest import mock
+        calls, place = self._placed()
+        # запреты, в которых не названо ничего, — ворота обязаны сказать, ЧЕГО не хватает
+        with mock.patch.object(shtab_box, "PROHIBITIONS", "будь молодцом"):
+            got = trainer.code_fix_claim(self.REM, incoming=self.INC, answer=self.ANS, place=place)
+        self.assertFalse(got["placed"])
+        self.assertEqual(got["gate"], "no_prohibitions")
+        self.assertEqual(calls, [])
+        self.assertIn("ворота приёма ящика", got["card"])
+        self.assertIn("не названы запреты", got["card"])
+
+    def test_pair_missing_is_a_refusal_and_not_a_task_about_nothing(self):
+        """Живой путь: пары нет в сессии → отказ, и в очередь не ушло ничего."""
+        calls, place = self._placed()
+        got = trainer.code_fix_claim(self.REM, place=place, pair=lambda: ("", ""))
+        self.assertFalse(got["placed"])
+        self.assertEqual(calls, [])
+        self.assertIn("Напиши как клиент", got["card"])
+
+
+class TestCodeFixClaimPlacement(unittest.TestCase):
+    """Карточка с кнопкой: без «да» не встаёт ничего, и владелец видит, ЧТО именно встанет."""
+
+    INC = TestCodeFixClaimBuild.INC
+    ANS = TestCodeFixClaimBuild.ANS
+    REM = TestCodeFixClaimBuild.REM
+
+    def test_places_ask_and_card_shows_what_will_run(self):
+        seen = []
+
+        def place(text):
+            seen.append(text)
+            return True, 512, ""
+        got = trainer.code_fix_claim(self.REM, incoming=self.INC, answer=self.ANS, place=place)
+        self.assertTrue(got["placed"])
+        self.assertEqual(got["tid"], 512)
+        self.assertEqual(len(seen), 1)
+        self.assertIn(self.ANS, seen[0], "в очередь обязан уехать ТОТ САМЫЙ плохой ответ")
+        self.assertIn("заявка #512", got["card"])
+        self.assertIn("«да 512»", got["card"])
+        self.assertIn("«нет 512»", got["card"])
+        self.assertIn(trainer.CODE_CARD_MARK, got["card"])
+
+    def test_place_failure_keeps_the_text_visible_to_the_owner(self):
+        got = trainer.code_fix_claim(self.REM, incoming=self.INC, answer=self.ANS,
+                                     place=lambda t: (False, None, "мост не ответил"))
+        self.assertFalse(got["placed"])
+        self.assertIn("мост не ответил", got["card"])
+        self.assertIn("ЗАПРЕТЫ", got["card"], "текст задачи не теряется — владелец несёт руками")
+
+    def test_apply_lesson_code_axis_goes_through_the_claim(self):
+        """Живая дорога урока: axis=code → заявка, а не тупик со строкой «готовый текст»."""
+        from unittest import mock
+        with mock.patch.object(trainer, "code_fix_claim",
+                               return_value={"placed": True, "tid": 77, "why": "",
+                                             "card": "🛠 Нужен код-фикс — заявка #77"}) as spy:
+            dec = trainer.apply_lesson("почини парсер дат", append_rule=lambda r: "added",
+                                       classify=lambda r: "code", mark=lambda r: None)
+        self.assertEqual(dec["axis"], "code")
+        self.assertTrue(dec["placed"])
+        self.assertEqual(dec["tid"], 77)
+        self.assertEqual(spy.call_count, 1)
+
+    def test_apply_lessons_card_names_the_outcome_of_every_code_lesson(self):
+        from unittest import mock
+        with mock.patch.object(trainer, "code_fix_claim",
+                               return_value={"placed": False, "tid": None,
+                                             "why": "мост молчит", "card": "🛠 …"}):
+            dec = trainer.apply_lessons(["почини парсер дат"], append_rule=lambda r: "added",
+                                        classify=lambda r: "code", list_rules=lambda: [])
+        self.assertEqual(dec["code"], ["почини парсер дат"])
+        self.assertIn("код-фикс", dec["card"])
+        self.assertIn("в очередь НЕ встала: мост молчит", dec["card"])
+
+    def test_crash_inside_never_raises_and_still_says_code_fix(self):
+        from unittest import mock
+        with mock.patch.object(trainer, "build_claim", side_effect=RuntimeError("бум")):
+            got = trainer.code_fix_claim(self.REM, incoming=self.INC, answer=self.ANS,
+                                         place=lambda t: (True, 1, ""))
+        self.assertFalse(got["placed"])
+        self.assertEqual(got["gate"], "crash")
+        self.assertIn(trainer.CODE_CARD_MARK, got["card"])
+        self.assertIn(self.REM, got["card"], "замечание не теряется даже при сбое")
+
+
+class TestNothingGoesToQueueSilently(unittest.TestCase):
+    """ВЕТКИ, СТАВЯЩЕЙ ЗАДАЧУ БЕЗ «ДА», НЕТ. Судим ДЕЙСТВИЕМ (обход AST), а не подстрокой."""
+
+    BANNED = ("place_task", "enqueue_task", "approve_task")
+
+    def _tree(self):
+        import ast
+        path = os.path.join(os.path.dirname(os.path.abspath(trainer.__file__)), "trainer.py")
+        with open(path, encoding="utf-8") as handle:
+            return ast.parse(handle.read())
+
+    def _calls(self, node):
+        import ast
+        out = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                func = sub.func
+                out.add(getattr(func, "attr", None) or getattr(func, "id", None))
+        return out
+
+    def test_green_row_actions_are_never_called(self):
+        names = self._calls(self._tree())
+        for banned in self.BANNED:
+            self.assertNotIn(banned, names,
+                             "тренажёр зовёт %s — это ряд, исполняемый без «да»" % banned)
+
+    def test_every_enqueue_is_followed_by_needs_approval_in_the_same_function(self):
+        """Постановка ряда живёт ТОЛЬКО в паре с переводом в ожидание решения человека."""
+        import ast
+        found = 0
+        for node in ast.walk(self._tree()):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            calls = self._calls(node)
+            if "enqueue_pc_task" not in calls:
+                continue
+            found += 1
+            self.assertIn("set_needs_approval", calls,
+                          "%s ставит ряд и НЕ переводит его в needs_approval" % node.name)
+            self.assertIn("claim_task", calls,
+                          "%s не снимает ряд из new — его подберёт process_new без «да»" % node.name)
+        self.assertEqual(found, 1, "постановщик ряда обязан быть ровно один, найдено %d" % found)
+
+    def test_testing_flag_forbids_a_live_row(self):
+        """Набор гоняют с TESTING=1 — живой ряд из тестового прогона невозможен."""
+        self.assertTrue(os.getenv("TESTING"), "набор обязан идти с TESTING=1")
+        ok, tid, why = trainer._default_place("что угодно")
+        self.assertFalse(ok)
+        self.assertIsNone(tid)
+        self.assertIn("TESTING", why)
+
+    def test_trainer_never_writes_to_the_brain_folder(self):
+        """В ПАПКУ МОЗГА тренажёр не пишет ни одной веткой — дорога задачи прямая, в очередь."""
+        names = self._calls(self._tree())
+        for banned in ("write_doc", "create_plain", "register", "unregister", "move_into_brain"):
+            self.assertNotIn(banned, names, "тренажёр пишет в папку мозга: %s" % banned)
+
+
 if __name__ == "__main__":
     unittest.main()
