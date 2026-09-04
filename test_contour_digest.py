@@ -20,6 +20,9 @@
   и каждая тема имеет строку.
 * ``TestAddress`` — тема не настроена → наружу НЕ УХОДИТ ничего; настроена →
   сообщение уходит РОВНО в неё; сорванная отправка НЕ двигает окно сводки.
+* ``TestFindingFate`` — СУДЬБА находки и ПОЛЬЗА от неё (04.09.2026): пять исходов
+  задания числами, третий исход у каждого нового числа, потолок прироста в четыре
+  строки и главный замок — заявка ступени B пользой НЕ считается.
 """
 from __future__ import annotations
 
@@ -771,6 +774,251 @@ class TestExternalAnswersLine(unittest.TestCase):
         text = cd.render(rep) if not cd.is_calm(rep) else ""
         if text:
             self.assertIn("ВНЕШНИЕ ОТВЕТЫ ЗА СУТКИ", text)
+
+
+class TestFindingFate(unittest.TestCase):
+    """СУДЬБА НАХОДКИ И ПОЛЬЗА ОТ НЕЁ (заведено 04.09.2026).
+
+    Самое дорогое здесь — ``test_a_claim_alone_is_never_a_benefit``: заявку
+    ступени B получает почти каждая находка, и посчитай мы её пользой, строка
+    хвалила бы внешние каналы за разговорчивость. Остальное — третий исход у
+    КАЖДОГО нового числа и потолок в четыре строки прироста.
+    """
+
+    DAY = "2026-09-03"
+
+    # Тексты находок РАЗНЫЕ ПО СМЫСЛУ, а не по номеру: ключ считается по МЕРЕ
+    # СМЫСЛА цитаты (:func:`review_intake.claim_key`), и «находка номер 1/2/3»
+    # дала бы пять записей с ОДНИМ ключом — корпус, на котором зелёными были бы
+    # любые числа. Поймано живьём при сборке 04.09.
+    QUOTES = (
+        "СЕКРЕТНАЯ премиса заявки читается очередью и логом без правки кода",
+        "СЕКРЕТНЫЙ порог тишины наблюдателя измерен корпусом двадцати суток",
+        "СЕКРЕТНЫЙ адрес результата задания назван последней строкой файла",
+        "СЕКРЕТНЫЙ слепок очереди стареет быстрее реестра исходящих ступени",
+        "СЕКРЕТНЫЙ маркер отказа владельца лежит в причине упавшей строки",
+    )
+
+    def records(self):
+        """Пять находок суток + одна вчерашняя: чужой день обязан выпасть."""
+        out = [{"send_date": self.DAY, "kind": "УПРОЩАЕМО", "channel": "codex",
+                "pack": "p.md", "index": i, "quote": quote}
+               for i, quote in enumerate(self.QUOTES)]
+        out.append({"send_date": "2026-09-02", "kind": "УПРОЩАЕМО", "channel": "codex",
+                    "pack": "p.md", "index": 99, "quote": "вчерашняя чужая находка о другом"})
+        return out
+
+    def keys(self):
+        keys = [review_intake.claim_key(r) for r in self.records() if r["send_date"] == self.DAY]
+        assert len(set(keys)) == len(keys), "корпус теста склеился в один ключ"
+        return keys
+
+    def intake(self):
+        """Реестр ступени B: четыре находки из пяти дошли до заявки."""
+        keys = self.keys()
+        return {"claims": {k: {"keys": [k], "queue_id": 100 + n, "kind": "УПРОЩАЕМО"}
+                           for n, k in enumerate(keys[:4])}}
+
+    def recon(self):
+        """Реестр ступени E: разведка, заявка владельцу и придержанное отбором."""
+        keys = self.keys()
+        place = recon_auto.key_of(recon_auto.SRC_CLAIM, keys[0])
+        owner = recon_auto.key_of(recon_auto.SRC_CLAIM, keys[1])
+        held = recon_auto.key_of(recon_auto.SRC_CLAIM, keys[2])
+        return {"placed": {place: {"way": recon_auto.ROUTE_RECON, "src": recon_auto.SRC_CLAIM,
+                                   "queue_id": 200},
+                           owner: {"way": recon_auto.ROUTE_OWNER, "src": recon_auto.SRC_CLAIM,
+                                   "queue_id": 201}},
+                "held": {held: {"why": "бюджет суток исчерпан (2 автозадачи)"}}}
+
+    def queue(self):
+        """Слепок очереди: в работе, сдана, отклонена владельцем, ждёт решения."""
+        return _snapshot(
+            {"100": {"goal": "заявка", "status": "in_progress"},
+             "103": {"goal": "заявка", "status": "needs_approval"}},
+            dict([_closed(101, NOW - 60, "done", "заявка"),
+                  _closed(102, NOW - 60, "rejected", "заявка")]))
+
+    def fate(self, **swap):
+        got = {"records": self.records(), "day": self.DAY, "intake": self.intake(),
+               "recon": self.recon(), "queue": self.queue()}
+        got.update(swap)
+        return cd.external_fate(got["records"], got["day"], intake=got["intake"],
+                                recon=got["recon"], queue=got["queue"])
+
+    def test_all_five_outcomes_of_the_task_are_counted(self):
+        """Пять исходов задания — числами, и каждый своим."""
+        got = self.fate()
+        self.assertEqual(got["findings"], 5, "находка соседнего дня попала в счёт")
+        self.assertEqual(got["claimed"], 4, "заявка владельцу")
+        self.assertEqual(got["recon"], 1, "автозадача разведки")
+        self.assertEqual(got["owner_ask"], 1, "заявка владельцу от ступени E")
+        self.assertEqual(got["held"], 1, "придержано отбором ступени E")
+        self.assertEqual(got["rejected"], 1, "владелец отклонил")
+        self.assertEqual(got["waiting"], 1, "ждёт решения владельца")
+        self.assertEqual(got["worked"], 1, "сдано работой")
+        self.assertEqual(got["unmapped"], 1, "находка вне реестра ступени B")
+
+    def test_a_claim_alone_is_never_a_benefit(self):
+        """ПРЕДСМЕРТНЫЙ ВЗГЛЯД ЗАДАНИЯ: заявка — машинный шаг, а не польза.
+
+        Заявок четыре, дошедших до дела — две. Посчитай мы пользой «есть заявка»,
+        число росло бы вместе с болтливостью канала, а не с его толком.
+        """
+        got = self.fate()
+        self.assertEqual(got["benefit"], 2, "польза обязана считать ДЕЛО, а не заявку")
+        self.assertLess(got["benefit"], got["claimed"],
+                        "польза, равная числу заявок, хвалит канал за разговорчивость")
+        words = cd.benefit_words(got)
+        self.assertIn("наличие заявки пользой НЕ считается", words,
+                      "определение обязано ехать В СТРОКЕ, а не остаться в коде")
+        self.assertIn("правило прибора не имеет", words,
+                      "правило прибора не имеет — это обязано быть сказано, а не подразумеваться")
+
+    def test_a_finding_with_neither_task_nor_done_row_is_not_useful(self):
+        """Заявка есть, дела нет → в пользу НЕ идёт ни по одной ветке."""
+        got = self.fate(recon={"placed": {}, "held": {}},
+                        queue=_snapshot({"100": {"goal": "з", "status": "needs_approval"}}, {}))
+        self.assertEqual(got["claimed"], 4)
+        self.assertEqual(got["benefit"], 0, "четыре заявки без дела дали пользу")
+
+    def test_a_dead_registry_says_unknown_and_never_zero(self):
+        """ТРЕТИЙ ИСХОД у каждого нового числа: молчание прибора ≠ ноль."""
+        got = self.fate(intake=None, recon=None, queue=None)
+        for field in ("claimed", "unmapped", "recon", "owner_ask", "held",
+                      "waiting", "rejected", "worked", "benefit"):
+            self.assertIsNone(got[field], "поле %s подменило молчание нулём" % field)
+        for words in (cd.fate_words_intake(got), cd.fate_words_recon(got),
+                      cd.fate_words_queue(got), cd.benefit_words(got)):
+            self.assertIn(cd.FATE_UNKNOWN, words)
+            self.assertNotIn(" 0 ", " %s " % words, "ноль вместо «неизвестно»")
+
+    def test_one_dead_registry_does_not_erase_the_others(self):
+        """Смерть ступени E не отменяет посчитанного ступенью B."""
+        got = self.fate(recon=None)
+        self.assertEqual(got["claimed"], 4)
+        self.assertIsNone(got["recon"])
+        self.assertIsNone(got["benefit"], "польза стои́т на ДВУХ реестрах — половины мало")
+
+    def test_benefit_needs_both_registries_alive(self):
+        """Нижняя оценка, напечатанная как число, — это враньё прибора."""
+        self.assertIsNone(self.fate(queue=None)["benefit"])
+        self.assertIsNone(self.fate(recon=None)["benefit"])
+        self.assertEqual(self.fate()["benefit"], 2)
+
+    def test_a_stale_snapshot_keeps_its_numbers_at_home(self):
+        """Слепок старше предела → числа наружу НЕ ЕДУТ, как у серии и ящика."""
+        fresh = run.fresh_or_none({"claims": {}}, NOW - 10, NOW, "intake")
+        self.assertIsNotNone(fresh)
+        old = run.fresh_or_none({"claims": {}}, NOW - cd.limit_of("intake") - 1, NOW, "intake")
+        self.assertIsNone(old, "числа поехали по протухшему реестру")
+        self.assertIsNone(run.fresh_or_none({"claims": {}}, None, NOW, "intake"),
+                          "возраст не сверить → числа не едут")
+
+    def test_the_growth_of_the_section_is_four_lines_and_no_more(self):
+        """Сводку читают с телефона: стена хуже отсутствия."""
+        heads = [{"channel": "codex", "send_date": self.DAY, "outcome": "answered",
+                  "reason": "", "answered": True, "rel": "docs/review_inbox/a.md"}]
+        rows = run.section_external(heads, self.records(), "", self.DAY, NOW,
+                                    intake=self.intake(), i_at=NOW - 10,
+                                    recon=self.recon(), r_at=NOW - 10,
+                                    queue=self.queue(), q_at=NOW - 10)
+        self.assertEqual(len(rows), 5, "прирост раздела больше четырёх строк")
+        self.assertLessEqual(len(rows), cd.LIST_MAX,
+                             "строки раздела не влезают в LIST_MAX и обрежутся молча")
+        self.assertEqual({rd["topic"] for rd in rows}, {"external"})
+
+    def test_every_new_number_carries_its_own_source_and_age(self):
+        """Закон 1: у каждого числа свой адрес и свой возраст — общего нет."""
+        rows = run.section_external(
+            [{"channel": "codex", "send_date": self.DAY, "outcome": "answered", "reason": "",
+              "answered": True, "rel": "docs/review_inbox/a.md"}],
+            self.records(), "", self.DAY, NOW, intake=self.intake(), i_at=NOW - 10,
+            recon=self.recon(), r_at=NOW - 20, queue=self.queue(), q_at=NOW - 30)
+        addrs = [rd["addr"] for rd in rows]
+        self.assertEqual(len(set(addrs)), len(addrs), "два числа делят один адрес источника")
+        for rd in rows:
+            self.assertTrue(rd["addr"], "число без адреса источника — мнение, а не факт")
+            self.assertTrue(rd["age"])
+
+    def test_the_benefit_line_ages_by_the_older_of_its_two_sources(self):
+        """Число живо настолько, насколько жив слабейший из его источников."""
+        self.assertEqual(run._oldest(NOW - 10, NOW - 900), NOW - 900)
+        self.assertIsNone(run._oldest(NOW, None), "нет метки хоть у одного → возраста нет")
+        self.assertIn("+", cd.source("benefit")["addr"],
+                      "источник пользы обязан назвать ОБА файла, а не главный")
+
+    def test_the_owner_refusal_is_the_row_outcome_not_a_second_marker(self):
+        """«Отклонено» считает слепок очереди; второй экземпляр маркера разошёлся бы."""
+        with io.open(os.path.join(HERE, "contour_digest.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertNotIn("отклонено Филиппом", src,
+                         "литерал маркера отказа заведён вторым экземпляром")
+        got = self.fate(queue=_snapshot({}, dict([_closed(101, NOW, "rejected", "з"),
+                                                  _closed(102, NOW, "failed", "з")])))
+        self.assertEqual(got["rejected"], 1, "«упало» посчитано отказом владельца")
+
+    def test_route_words_are_borrowed_from_the_owner_module(self):
+        """Разведка и заявка владельцу — РАЗНЫЕ исходы, и слова у них не свои."""
+        keys = self.keys()
+        recon = {"placed": {recon_auto.key_of(recon_auto.SRC_CLAIM, keys[0]):
+                            {"way": recon_auto.ROUTE_OWNER}}, "held": {}}
+        got = self.fate(recon=recon)
+        self.assertEqual(got["recon"], 0)
+        self.assertEqual(got["owner_ask"], 1, "маршрут владельца посчитан разведкой")
+
+    def test_no_foreign_text_reaches_the_fate_lines(self):
+        """Тот же закон, что у счёта: дайджест, а не поток."""
+        got = self.fate()
+        for words in (cd.fate_words_intake(got), cd.fate_words_recon(got),
+                      cd.fate_words_queue(got), cd.benefit_words(got)):
+            self.assertNotIn("СЕКРЕТ", words, "чужой текст доехал до строки судьбы")
+            for quote in self.QUOTES:
+                self.assertNotIn(quote, words)
+        self.assertIn(self.DAY, cd.fate_words_intake(got), "день обязан быть НАЗВАН")
+        self.assertIn(self.DAY, cd.benefit_words(got), "день обязан быть НАЗВАН")
+
+    def test_the_finding_key_is_counted_by_stage_b_not_by_our_own_formula(self):
+        """Второй способ считать ключ промахивался бы мимо реестра молча."""
+        rec = self.records()[0]
+        self.assertEqual(cd.finding_keys([rec], self.DAY), [review_intake.claim_key(rec)])
+        self.assertEqual(cd.finding_keys([rec], "2026-09-02"), [],
+                         "чужой день попал в ключи суток")
+
+    def test_the_anchor_may_move_and_the_finding_is_still_found(self):
+        """Ключ заявки переезжает с приходом второго канала — узнаём по НАБОРУ."""
+        keys = self.keys()
+        intake = {"claims": {"чужой-якорь": {"keys": [keys[0]], "queue_id": 101}}}
+        got = self.fate(intake=intake, recon={"placed": {}, "held": {}})
+        self.assertEqual(got["claimed"], 1, "заявка потеряна из-за переехавшего якоря")
+        self.assertEqual(got["worked"], 1)
+
+    def test_new_sources_have_their_own_limits_with_named_reasons(self):
+        """Общего предела у реестров нет: ритмы разные, и это названо."""
+        for name in ("intake", "recon", "benefit"):
+            paper = cd.source(name)
+            self.assertTrue(paper["addr"])
+            self.assertIsNotNone(paper["limit"], "предел не назван — стареть будет молча")
+            self.assertTrue(paper["why"], "предел без причины — это цифра из головы")
+        self.assertNotEqual(cd.limit_of("intake"), cd.limit_of("recon"))
+        self.assertEqual(cd.limit_of("benefit"), min(cd.limit_of("recon"), cd.limit_of("queue")),
+                         "предел пары обязан браться у более быстрого источника")
+
+    def test_a_dead_tray_keeps_the_section_to_one_honest_line(self):
+        """Записей нет → судьбу считать не от чего, и четыре нуля были бы враньём."""
+        rows = run.section_external(None, None, "лоток не найден", self.DAY, NOW)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], cd.UNKNOWN)
+
+    def test_the_live_repo_shows_the_fate_under_the_external_topic(self):
+        """Живое дерево: строки судьбы стоя́т ИМЕННО в разделе внешних ответов."""
+        rep = run.build(root=HERE)
+        rows = rep["readings"]["external"]
+        self.assertGreaterEqual(len(rows), 1)
+        if len(rows) > 1:
+            body = " ".join(rd["words"] for rd in rows)
+            self.assertIn("судьба находок", body)
+            self.assertIn("ПОЛЬЗА", body)
 
 
 if __name__ == "__main__":            # pragma: no cover

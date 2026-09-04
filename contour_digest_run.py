@@ -44,6 +44,7 @@ import done_judge_pc
 import review_audit
 import review_audit_run
 import review_intake_run
+import shtab_box               # ЗА СМЕЩЕНИЕМ ПОЛОСЫ: второй экземпляр числа разошёлся бы молча
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_STATE = "contour_digest_state.json"
@@ -361,6 +362,26 @@ def day_utc(ts):
         return ""
 
 
+def day_lane(ts):
+    """Календарный день ПОЛОСЫ для счёта ящика. → 'YYYY-MM-DD'.
+
+    ЗАВЕДЕНА 04.09.2026 ВМЕСТЕ С ПЕРЕЕЗДОМ ЯЩИКА НА МЕСТНЫЕ СУТКИ, и не для
+    красоты: сводка показывает «взято N при потолке M», а замок потолка живёт в
+    ящике. Останься сводка на UTC — с 00:00 до 07:00 местного она считала бы
+    ВЧЕРАШНИЕ сутки и показывала бы владельцу одно число, пока полоса держит
+    другое. Это ровно тот молчаливый разъезд, против которого счёт ящика вообще
+    берётся у ящика (:func:`contour_digest.shtab_taken`).
+
+    Смещение НЕ набирается здесь вторым экземпляром — оно берётся у
+    :data:`shtab_box.LANE_TZ`. Соседний :func:`day_utc` остаётся UTC и не тронут:
+    у окна внешних ответов разрез свой и по своей причине.
+    """
+    try:
+        return datetime.datetime.fromtimestamp(float(ts), shtab_box.LANE_TZ).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
 def read_inbox(root, inbox=None):
     """Лоток → (шапки заходов, записи находок, причина отказа).
 
@@ -389,13 +410,58 @@ def read_inbox(root, inbox=None):
     return headers, records, ""
 
 
-def section_external(headers, records, why, day, now):
-    """«Внешние ответы за сутки» — одна строка, дайджестом, без чужих текстов."""
+def fresh_or_none(data, read_at, now, src):
+    """Слепок годен для СЧЁТА? Протух или возраст не сверить → `None`. → данные | None.
+
+    Отдельная дверь, а не ветка на месте: :func:`contour_digest.reading` пометит
+    строку «неизвестно» ПО ВОЗРАСТУ, но слова строки соберутся раньше — и числа,
+    посчитанные по протухшему слепку, поехали бы наружу под шапкой «неизвестно»,
+    то есть выглядели бы фактом. Тот же приём, каким :func:`build` гасит числа
+    серии и счёт ящика.
+    """
+    if data is None:
+        return None
+    old = cd.stale(read_at, now, cd.limit_of(src))
+    return None if (old is None or old) else data
+
+
+def _oldest(*stamps):
+    """Возраст пары источников — по БОЛЕЕ СТАРОМУ. Нет метки хоть у одного → `None`."""
+    got = list(stamps)
+    return None if any(s is None for s in got) else min(got)
+
+
+def section_external(headers, records, why, day, now, intake=None, i_at=None,
+                     recon=None, r_at=None, queue=None, q_at=None):
+    """«Внешние ответы за сутки»: счёт, СУДЬБА находок и ПОЛЬЗА от них.
+
+    Прирост 04.09.2026 — четыре строки, и ни одной больше: сводку читают с
+    телефона, а стена хуже отсутствия. Каждая строка несёт СВОЙ источник и СВОЙ
+    возраст, потому что реестры стареют по-разному и общего возраста у них нет.
+
+    Лоток мёртв → строка одна и говорит «неизвестно»: без записей находок судьбу
+    считать не от чего, и печатать при этом четыре строки нулей значило бы
+    утверждать, что находок не было.
+    """
     if headers is None or records is None:
         return [cd.dead_source("external", "inbox", why)]
     stats = cd.external_stats(headers, records, day)
-    return [cd.reading("external", cd.external_words(stats), src="inbox",
-                       read_at=now, now=now, kind=cd.external_verdict(stats))]
+    fate = cd.external_fate(records, day,
+                            intake=fresh_or_none(intake, i_at, now, "intake"),
+                            recon=fresh_or_none(recon, r_at, now, "recon"),
+                            queue=fresh_or_none(queue, q_at, now, "queue"))
+    return [
+        cd.reading("external", cd.external_words(stats), src="inbox",
+                   read_at=now, now=now, kind=cd.external_verdict(stats)),
+        cd.reading("external", cd.fate_words_intake(fate), src="intake",
+                   read_at=i_at, now=now, kind=cd.OK),
+        cd.reading("external", cd.fate_words_recon(fate), src="recon",
+                   read_at=r_at, now=now, kind=cd.OK),
+        cd.reading("external", cd.fate_words_queue(fate), src="queue",
+                   read_at=q_at, now=now, kind=cd.OK),
+        cd.reading("external", cd.benefit_words(fate), src="benefit",
+                   read_at=_oldest(r_at, q_at), now=now, kind=cd.OK),
+    ]
 
 
 def section_axis(root, since, now, runner=None):
@@ -455,6 +521,11 @@ def build(root=HERE, now=None, since=None, interval=cd.INTERVAL_SEC, runner=None
     snapshot, q_at, q_why = read_json(root, cd.source("queue")["addr"])
     expect, e_at, e_why = read_json(root, cd.source("expect")["addr"])
     outbox, o_at, o_why = read_json(root, cd.source("outbox")["addr"])
+    # РЕЕСТРЫ СУДЬБЫ — ступени B и E. Читаются здесь, а не в разделе: причина
+    # отказа у них та же, что у остальных источников, и ветка «неизвестно» обязана
+    # быть ОДНА на все файлы, а не своя у каждого раздела.
+    intake, in_at, _in_why = read_json(root, cd.source("intake")["addr"])
+    recon, rc_at, _rc_why = read_json(root, cd.source("recon")["addr"])
     heads, records, i_why = read_inbox(root, inbox)
     closed_rows, closed_count = section_closed(snapshot, q_at, q_why, since, now)
     series_rows, counted = section_series(snapshot, q_at, q_why, now, judged=read_judged(root))
@@ -462,12 +533,14 @@ def build(root=HERE, now=None, since=None, interval=cd.INTERVAL_SEC, runner=None
     # таком случае наружу НЕ ЕДУТ: сосчитанное по протухшему слепку выглядит фактом.
     if series_rows and series_rows[0].get("kind") in (cd.UNKNOWN, cd.HYPO):
         counted = None
-    # СЧЁТ ЯЩИКА — ЗА КАЛЕНДАРНЫЕ СУТКИ UTC, а не за окно сводки, и это не описка.
+    # СЧЁТ ЯЩИКА — ЗА КАЛЕНДАРНЫЕ СУТКИ, а не за окно сводки, и это не описка.
     # Потолок ящика назван В СУТКАХ и считается по маркеру с датой; покажи сводка
     # число за своё четырёхчасовое окно — владелец сверял бы с потолком две разные
-    # величины и всякий раз получал бы «недобор». Тот же день UTC, что у ящика
-    # (`review_intake.today_utc`) и у внешних ответов.
-    the_day = day or day_utc(now)
+    # величины и всякий раз получал бы «недобор». СУТКИ ЗДЕСЬ МЕСТНЫЕ С 04.09.2026:
+    # ящик переехал на них (`shtab_box.lane_day`), и разрез сводки обязан поехать
+    # вместе с ним — иначе ночью сводка показывала бы вчерашний день. Окно внешних
+    # ответов при этом остаётся на UTC (`day_utc`): у него разрез свой.
+    the_day = day or day_lane(now)
     rows = all_rows(snapshot)
     taken = cd.shtab_taken(rows, the_day)
     # Протухший слепок → числа наружу НЕ ЕДУТ, ровно как у серии: сосчитанное по
@@ -490,7 +563,9 @@ def build(root=HERE, now=None, since=None, interval=cd.INTERVAL_SEC, runner=None
             "red": section_red(snapshot, q_at, q_why, expect, e_at, e_why,
                                outbox, o_at, o_why, since, now),
             "await": section_await(snapshot, q_at, q_why, now),
-            "external": section_external(heads, records, i_why, day or day_utc(now), now),
+            "external": section_external(heads, records, i_why, day or day_utc(now), now,
+                                         intake=intake, i_at=in_at, recon=recon, r_at=rc_at,
+                                         queue=snapshot, q_at=q_at),
             "axis": section_axis(root, since, now, runner=runner),
             "series": series_rows,
         },
