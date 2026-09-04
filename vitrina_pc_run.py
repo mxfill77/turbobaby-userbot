@@ -16,11 +16,13 @@
     tmp/done_judge_pc/judged.json         вердикты судьи закрытия (ступень C)
     docs/review_inbox                     лоток внешних ответов
     git log                               следы заходов по осям за сутки
-    узел мозга `shtab_vitrina`            ЧЕЛОВЕЧЕСКИЕ части — их пишет Штаб
+    документ папки мозга `shtab_vitrina`  ЧЕЛОВЕЧЕСКИЕ части — их пишет Штаб;
+                                          берётся ДОРОГОЙ ЯЩИКА (перечисление папки
+                                          + чтение по file id), см. `read_shtab`
 
 Мост за очередью здесь НЕ ЗОВЁТСЯ, как и у сводки: `get_pending("done")` замерен в
 26.8 с, а всё внутри витка исполняется синхронно. Единственный поход в мост —
-чтение узла Штаба и запись пульса, оба доверенным писателем.
+слова Штаба и запись пульса, оба доверенным писателем.
 
 ═══ ОБНОВЛЕНИЕ НА МЕСТЕ: ТРИ ИСХОДА, А НЕ ДВА ══════════════════════════════════
 
@@ -53,6 +55,7 @@ import sys
 
 import contour_digest as cd
 import contour_digest_run as cdr
+import shtab_box_run as sbr         # ДОРОГА К ПАПКЕ МОЗГА: та же, которой ящик берёт задания
 import shtab_box_signals            # РАЗЛИЧИТЕЛЬ ВИДА РЯДА: тот же, что у остановки ящика
 import vitrina_pc as vp
 import zayavki_pc
@@ -378,26 +381,59 @@ def axes_of_day(root, since, runner=None):
     return vp.axes_tally(_hashes(total), _hashes(axis), _hashes(biz)), why
 
 
-def read_shtab(node=None, reader=None):
-    """Узел Штаба → разобранные человеческие части. → dict (:func:`vitrina_pc.parse_shtab`).
+def read_shtab(node=None, reader=None, lister=None):
+    """Слова Штаба → разобранные человеческие части. → dict (:func:`vitrina_pc.parse_shtab`).
 
-    Чтение — доверенным писателем (`brain_writer.read_text`), как у ящика: секреты
-    моста читает ОН, а этот модуль их не видит. Любой отказ — «Штаб не обновил» с
-    причиной; витрину это НЕ роняет ни одной веткой (пункт 6 задания).
+    ═══ ИСТОЧНИК — ДОКУМЕНТ ПАПКИ, А НЕ УЗЕЛ ПО ИМЕНИ (правка 04.09.2026) ══════
+
+    До неё витрина звала ``brain_writer.read_text(name=SHTAB_NODE)``, и это НЕ
+    работало ни разу: имя ``shtab_vitrina`` в живом РЕЕСТРЕ моста не
+    зарегистрировано, а на незарегистрированное имя мост отвечает дословно (живая
+    проба 04.09) — «ИМЯ НЕ РАЗРЕШЕНО: 'shtab_vitrina' … в живом реестре такого
+    ключа нет (ключей 37)». Отказ витрина честно печатала словами, поэтому сломан
+    был РОТ, а не панель: числа собирались исправно, а три человеческие части
+    сутками говорили «Штаб не обновил». Документ при этом лежал на месте — Штаб
+    положил его 03.09 ПРЯМО В ПАПКУ, а такой документ реестру не виден вовсе
+    (`brain_writer.list_folder`, §«детей 49, ключей 37, БЕЗ КЛЮЧА 15»).
+
+    ДОРОГА ВЗЯТА У ЯЩИКА ЦЕЛИКОМ, И ЭТО УСЛОВИЕ, А НЕ ЭКОНОМИЯ. Перечисление —
+    :func:`shtab_box_run.read_folder` (там же живёт правило «усечение = отказ, а не
+    короткий список»), тело — :func:`shtab_box_run.read_doc_text` (по file id, ибо
+    по имени такой документ мост не отдаёт). Заведи витрина свой поход в ту же
+    папку — вторая дорога разошлась бы с первой МОЛЧА: усечение, лечёное в одной,
+    в другой давало бы уверенный неверный ответ. Числовой адрес документа здесь не
+    зашит ни одной строкой: имя берётся из :data:`vitrina_pc.SHTAB_NODE`, id
+    приходит из перечисления.
+
+    ЧЕТЫРЕ ОТКАЗА НАЗЫВАЮТСЯ ПРИЧИНОЙ, А НЕ ПУСТОТОЙ (пункт 3 задания): папка не
+    перечислена · документа с таким именем в ней нет · имя несут ДВА документа
+    (Drive это разрешает, и который из них Штаба — неизвестно; тот же
+    консервативный отказ, что у :func:`shtab_box.parse_folder` на двойниках) ·
+    тело не прочитано либо пусто. Каждый едет в ``why`` и оттуда — в текст всех
+    трёх частей: отличать «Штаб молчит» от «мост молчит» обязан читающий.
+
+    Витрину не роняет ни одна ветка (пункт 6 прежнего задания): ``read_folder`` и
+    ``read_doc_text`` сами ловят любое исключение и отдают причину строкой.
     """
     name = node or vp.SHTAB_NODE
-    if reader is None:
-        def reader(doc):
-            import brain_writer
-
-            return brain_writer.read_text(name=doc)
-    try:
-        text = reader(name)
-    except Exception as exc:                       # noqa: BLE001 — любой отказ = «Штаб не обновил»
+    files, ok, why = sbr.read_folder(prefix=name, lister=lister)
+    if not ok:
         return vp.parse_shtab("", ok=False,
-                              why="узел %s не прочитан: %s" % (name, str(exc)[:160]))
-    if not isinstance(text, str) or not text.strip():
-        return vp.parse_shtab("", ok=False, why="узел %s отдал пустой текст" % name)
+                              why="папка мозга не прочитана: %s" % (why or "причина не названа"))
+    hits = [f for f in files
+            if isinstance(f, dict) and str(f.get("name") or "") == name]
+    if not hits:
+        return vp.parse_shtab("", ok=False,
+                              why="документа %s в папке мозга нет (детей с этим началом имени: %d)"
+                                  % (name, len(files)))
+    if len(hits) > 1:
+        return vp.parse_shtab("", ok=False,
+                              why="имя %s несут %d документа папки — который из них Штаба, "
+                                  "неизвестно, не берём ни один" % (name, len(hits)))
+    text, got, why = sbr.read_doc_text(hits[0].get("id"), reader=reader)
+    if not got:
+        return vp.parse_shtab("", ok=False,
+                              why="документ %s не прочитан: %s" % (name, why or "причина не названа"))
     return vp.parse_shtab(text)
 
 

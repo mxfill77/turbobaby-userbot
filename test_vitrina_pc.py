@@ -39,6 +39,25 @@ NOW = 1788352800.0                      # 2026-09-02 12:40 UTC
 DAY = "2026-09-02"
 
 
+# Документ Штаба в ПАПКЕ мозга — та форма, в какой его отдаёт перечисление моста
+# (замер 04.09: у файла ровно три поля — id, mime, name). Идентификатор здесь
+# ВЫДУМАННЫЙ намеренно: живой file id в тестах был бы тем самым зашитым числовым
+# адресом, который задание запрещает.
+_FILE = {"name": vp.SHTAB_NODE, "id": "ID-документа-витрины", "mime": "text/plain"}
+
+
+def _folder(files, truncated=False):
+    """Перечислитель папки в форме ответа `brain_writer.list_folder`."""
+    def _lister(_prefix):
+        return {"ok": True, "files": list(files), "count": len(files), "truncated": truncated}
+    return _lister
+
+
+def _read_source(name):
+    with io.open(os.path.join(HERE, name), encoding="utf-8") as fh:
+        return fh.read()
+
+
 def _idle(sec, busy=0, ids=()):
     """Факт простоя в той форме, в какой его собирает `vitrina_pc_run.idle_facts`."""
     if busy:
@@ -326,12 +345,77 @@ class TestShtabNode(unittest.TestCase):
             self.assertIn(title, text)
 
     def test_reader_that_raises_is_not_an_exception_for_the_caller(self):
-        def _boom(_name):
+        def _boom(_ident):
             raise RuntimeError("мост молчит")
 
-        got = run.read_shtab(reader=_boom)
+        got = run.read_shtab(reader=_boom, lister=_folder([_FILE]))
         self.assertFalse(got["ok"])
         self.assertIn("мост молчит", got["why"])
+
+    # ── ИСТОЧНИК — ДОКУМЕНТ ПАПКИ, дорогой ящика (правка 04.09.2026) ──────────
+
+    def test_words_come_from_the_folder_document_by_id(self):
+        seen = {}
+
+        def _reader(ident):
+            seen["id"] = ident
+            return "дата=2026-09-03\n[[СЕЙЧАС]]\nчиним рот витрины\n[[ЗАСТРЯЛО]]\nб\n[[КУДА ИДЁМ]]\nв"
+
+        got = run.read_shtab(reader=_reader, lister=_folder([_FILE]))
+        self.assertTrue(got["ok"], got["why"])
+        self.assertEqual(seen["id"], _FILE["id"], "тело взято НЕ по file id из перечисления")
+        self.assertEqual(got["day"], "2026-09-03")
+        self.assertIn("чиним рот витрины", vp.shtab_words(got, "now"))
+
+    def test_folder_is_asked_by_the_constant_name_and_id_is_never_hardcoded(self):
+        asked = []
+
+        got = run.read_shtab(reader=lambda _i: "[[СЕЙЧАС]]\nа",
+                             lister=lambda p: asked.append(p) or _folder([_FILE])(p))
+        self.assertTrue(got["ok"])
+        self.assertEqual(asked, [vp.SHTAB_NODE], "папку спросили не именем из константы")
+        src = _read_source("vitrina_pc_run.py") + _read_source("vitrina_pc.py")
+        self.assertNotIn(_FILE["id"], src, "числовой адрес документа зашит в код")
+
+    def test_unreadable_folder_says_why_instead_of_empty(self):
+        def _dead(_p):
+            raise RuntimeError("мост не ответил")
+
+        got = run.read_shtab(lister=_dead)
+        self.assertFalse(got["ok"])
+        self.assertIn("мост не ответил", got["why"])
+        self.assertIn(vp.NO_SHTAB, vp.shtab_words(got, "now"))
+
+    def test_missing_document_says_why_instead_of_empty(self):
+        got = run.read_shtab(lister=_folder([]))
+        self.assertFalse(got["ok"])
+        self.assertIn(vp.SHTAB_NODE, got["why"])
+        self.assertIn("нет", got["why"])
+        self.assertIn(vp.NO_SHTAB, vp.shtab_words(got, "stuck"))
+
+    def test_two_documents_with_one_name_take_neither(self):
+        twin = dict(_FILE, id="ID-второй")
+        got = run.read_shtab(reader=lambda _i: "[[СЕЙЧАС]]\nа", lister=_folder([_FILE, twin]))
+        self.assertFalse(got["ok"], "двойники по имени взяты — а который Штаба, неизвестно")
+        self.assertIn("2 документа", got["why"])
+
+    def test_prefix_neighbour_is_not_mistaken_for_the_document(self):
+        near = {"name": vp.SHTAB_NODE + "_old", "id": "ID-соседа", "mime": "text/plain"}
+        got = run.read_shtab(reader=lambda _i: "[[СЕЙЧАС]]\nа", lister=_folder([near]))
+        self.assertFalse(got["ok"], "документом сочли соседа по началу имени")
+
+    def test_empty_document_says_why_instead_of_empty(self):
+        got = run.read_shtab(reader=lambda _i: "   ", lister=_folder([_FILE]))
+        self.assertFalse(got["ok"])
+        self.assertIn("пуст", got["why"])
+
+    def test_truncated_listing_is_a_refusal_not_a_short_list(self):
+        def _cut(_p):
+            return {"ok": True, "files": [_FILE], "count": 1, "truncated": True}
+
+        got = run.read_shtab(reader=lambda _i: "[[СЕЙЧАС]]\nа", lister=_cut)
+        self.assertFalse(got["ok"], "усечённое перечисление принято за полное")
+        self.assertIn("УСЕЧЕНО", got["why"])
 
     def test_missing_section_says_so_instead_of_empty(self):
         got = vp.parse_shtab("[[СЕЙЧАС]]\nработаем")
