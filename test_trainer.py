@@ -346,6 +346,144 @@ class TestLessonAppliesAndCancels(unittest.TestCase):
         self.assertEqual(dec["status"], "empty")                            # правил нет
 
 
+# ------------- источник урока переживает формат книги (класс 03.09.2026) -----
+# Книга кладёт правило С ДАТОЙ («- (2026-07-22) текст»), пометку ставит СЫРОЙ текст урока.
+# ЧЕСТНЫЕ ЧИСЛА (замер 04.09.2026, боевой сайдкар 6 записей × снимок книги 9 буллетов):
+# путь КОДА — ДО 5 из 9, ПОСЛЕ 5 из 9 (не изменилось: suggest снимает дату САМ, :901 и :935);
+# сырая строка книги — ДО 0 из 9, ПОСЛЕ 5 из 9. Значит боевого разрыва не было, а правка
+# снимает ЗАВИСИМОСТЬ от чужого парсера. Тесты ниже пиньят обе стороны И этот контракт suggest:
+# сломается он — покраснеет здесь, а не в тишине сайдкара.
+
+class TestLessonSourceSurvivesBookFormat(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.side = os.path.join(self.tmp, "trainer_rules.json")
+        self.pb = os.path.join(self.tmp, "playbook.md")
+        self._old_pb = suggest.PLAYBOOK_FILE
+        self._old_side = trainer.TRAINER_RULES_FILE
+        suggest.PLAYBOOK_FILE = self.pb
+        trainer.TRAINER_RULES_FILE = self.side
+
+    def tearDown(self):
+        suggest.PLAYBOOK_FILE = self._old_pb
+        trainer.TRAINER_RULES_FILE = self._old_side
+
+    def test_source_found_by_rule_text_as_book_stores_it(self):
+        """Определение источника находит его по тексту, КАКИМ ЕГО ХРАНИТ КНИГА (с датой)."""
+        remark = "не переспрашивай даты, которые клиент уже назвал"
+        trainer.mark_source(remark)                                  # ставится СЫРЫМ текстом
+        self.assertEqual(trainer.rule_source(remark), trainer.TRAINER_SOURCE)
+        # ровно те формы, в которых текст приходит из книги
+        self.assertEqual(trainer.rule_source("(2026-07-22) " + remark), trainer.TRAINER_SOURCE)
+        self.assertEqual(trainer.rule_source("- (2026-07-22) " + remark), trainer.TRAINER_SOURCE)
+        self.assertTrue(trainer.is_trainer_rule("(2026-07-22) " + remark))
+
+    def test_book_bullets_gain_source_after_fix(self):
+        """ЧИСЛО на СЫРЫХ строках книги — той стороне, где правка и меняет исход.
+        Книга-фикстура ОБЯЗАТЕЛЬНО смешанная: буллеты С датой и БЕЗ даты. Именно на вторых
+        ломается «подгонка под один префикс» — они обязаны сходиться так же (замечание
+        предсмертного взгляда 04.09). Пометки лежат сырым текстом — как их кладёт mark_source."""
+        dated = ["правило альфа один", "правило бета два"]
+        plain = ["правило дельта без даты", "правило эпсилон без даты"]
+        for r in (dated[0], plain[0]):                    # источник есть ровно у половины каждой пары
+            trainer.mark_source(r)
+        text = ("# playbook\n\n## Выученные правила\n"
+                + "".join("- (2026-07-22) %s\n" % r for r in dated)
+                + "".join("- %s\n" % r for r in plain))   # ← буллеты БЕЗ префикса даты
+        with open(self.pb, "w", encoding="utf-8") as f:
+            f.write(text)
+        raw = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("- ")]
+        self.assertEqual(len(raw), 4)
+        found = sum(1 for b in raw if trainer.rule_source(b))
+        self.assertEqual(found, 2)                        # ПОСЛЕ: 2 из 4 (ДО было 0 из 4)
+        # и поимённо — чтобы «2 из 4» нельзя было набрать не теми двумя
+        self.assertEqual(trainer.rule_source("- (2026-07-22) " + dated[0]), trainer.TRAINER_SOURCE)
+        self.assertEqual(trainer.rule_source("- " + plain[0]), trainer.TRAINER_SOURCE)
+        self.assertIsNone(trainer.rule_source("- (2026-07-22) " + dated[1]))
+        self.assertIsNone(trainer.rule_source("- " + plain[1]))
+
+    def test_undated_book_bullet_key_is_unchanged_by_fix(self):
+        """Буллет БЕЗ даты правка не трогает вовсе: обе регулярки холостые, кроме дефиса.
+        Это защита от «подогнали под префикс и сломали остальное»."""
+        for s in ("правило без даты", "1. пункт с номером", "«кавычки» в начале"):
+            self.assertEqual(trainer._norm_rule(s), " ".join(s.split()).lower())
+            self.assertEqual(trainer._norm_rule("- " + s), " ".join(s.split()).lower())
+
+    def test_cancel_unmarks_when_unmark_gets_book_text(self):
+        """Снятие пометки срабатывает, даже если на снятие пришёл буллет книги С ДАТОЙ.
+        ЧЕСТНО: боевой suggest.remove_playbook_rule дату снимает САМ, поэтому сегодня сюда
+        такой текст не приходит и сироты на живом пути не было (замер 04.09: cancel через
+        живой suggest-путь оставлял 0 записей и ДО правки). Тест держит КОНТРАКТ на будущее —
+        remove_rule здесь нарочно отдаёт текст с датой."""
+        remark = "предлагай доставку явно в первом ответе"
+        trainer.mark_source(remark)
+        self.assertTrue(trainer.is_trainer_rule(remark))
+        dec = trainer.cancel_lesson(
+            1,
+            remove_rule=lambda n: {"status": "removed", "n": 1,
+                                   "rule": "(2026-07-22) " + remark, "remaining": 0},
+            list_rules=lambda: [])
+        self.assertEqual(dec["status"], "removed")
+        self.assertFalse(trainer.is_trainer_rule(remark))             # пометка СНЯТА
+        self.assertEqual(json.load(open(self.side, encoding="utf-8")), {})   # сироты не осталось
+
+    def test_old_sidecar_format_still_read_after_fix(self):
+        """Уже лежащие записи НЕ ПОТЕРЯНЫ: старый сайдкар писался сырым текстом урока, и на
+        тексте без даты новая нормализация тождественна прежней — ключ тот же."""
+        old = {"не дублируй название модели — одно упоминание модели на строку": "тренажёр",
+               "2 раза вопрос про даты в одном сообщении не пишем": "тренажёр"}
+        with open(self.side, "w", encoding="utf-8") as f:
+            json.dump(old, f, ensure_ascii=False, indent=0)
+        for k in old:                                                 # находится и как раньше…
+            self.assertEqual(trainer.rule_source(k), trainer.TRAINER_SOURCE)
+            self.assertEqual(trainer.rule_source(k.upper()), trainer.TRAINER_SOURCE)
+            # …и в форме книги, ради которой правка и делалась
+            self.assertEqual(trainer.rule_source("- (2026-07-22) " + k), trainer.TRAINER_SOURCE)
+
+    def test_norm_rule_strips_only_leading_date_prefix(self):
+        """Дата ВНУТРИ правила — часть текста, её не трогаем: снимается только ВЕДУЩИЙ префикс."""
+        self.assertEqual(trainer._norm_rule("(2026-07-22) текст"), "текст")
+        self.assertEqual(trainer._norm_rule("- (2026-07-22)   текст"), "текст")
+        self.assertEqual(trainer._norm_rule("текст (2026-07-22)"), "текст (2026-07-22)")
+        self.assertEqual(trainer._norm_rule("(в скобках) текст"), "(в скобках) текст")
+        self.assertEqual(trainer._norm_rule(None), "")
+
+    def test_live_apply_then_cancel_leaves_no_orphan(self):
+        """БОЕВОЙ путь целиком, живыми suggest.append/remove: урок → книга → отмена → сайдкар
+        ПУСТ. Здесь снятие пометки и проверяется по-настоящему (остальные тесты класса подают
+        текст руками). classify инъектируем — боевой роутер ходит в LLM, а мерим не его."""
+        with open(self.pb, "w", encoding="utf-8") as f:
+            f.write("# playbook\n\n## Выученные правила\n")
+        remark = "предлагай доставку явно в первом ответе"
+        res = trainer.apply_lesson(remark, classify=lambda r: "behavior")
+        self.assertEqual(res["status"], "added")
+        self.assertTrue(trainer.is_trainer_rule(remark))                 # пометка легла
+        rows = suggest.list_playbook_rules(open(self.pb, encoding="utf-8").read())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(trainer.rule_source(rows[0]["rule"]), trainer.TRAINER_SOURCE)
+        dec = trainer.cancel_lesson(1)
+        self.assertEqual(dec["status"], "removed")
+        self.assertEqual(json.load(open(self.side, encoding="utf-8")), {})   # сироты нет
+
+    def test_remove_playbook_rule_still_strips_date_itself(self):
+        """КОНТРАКТ suggest, на котором держалась пометка ДО правки: remove_playbook_rule
+        отдаёт тело БЕЗ даты. Правка сделала пометку независимой от него, но если контракт
+        поедет — пусть краснеет тест, а не молчит сайдкар."""
+        with open(self.pb, "w", encoding="utf-8") as f:
+            f.write("# playbook\n\n## Выученные правила\n- (2026-07-22) правило про доставку\n")
+        res = suggest.remove_playbook_rule(1)
+        self.assertEqual(res["status"], "removed")
+        self.assertEqual(res["rule"], "правило про доставку")            # дата снята САМИМ suggest
+
+    def test_norm_rule_date_shape_mirrors_suggest_parser(self):
+        """Форма префикса ОБЯЗАНА совпадать с той, что снимает парсер книги (suggest), иначе
+        ключи снова разъедутся. Обе — по ФОРМЕ \\d{4}-\\d{2}-\\d{2}, а не по календарю: 13-й
+        месяц книга тоже сняла бы, и пометка обязана вести себя так же."""
+        self.assertEqual(trainer._norm_rule("(2026-13-99) текст"), "текст")   # как и suggest
+        self.assertEqual(suggest.list_playbook_rules(
+            "## Выученные правила\n- (2026-13-99) текст\n")[0]["rule"], "текст")
+
+
 # ------------------------------- CRM-карточка [ТЕСТ] -------------------------
 
 class TestCrmCard(unittest.TestCase):
