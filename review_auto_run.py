@@ -177,11 +177,22 @@ def note_closed(queue_id, task_text, status, result, *, root=HERE, state_path=No
 # ───────────────────────────── один оборот ─────────────────────────────
 
 
+DEFAULT_PROBE_WAIT = 600       # предел ожидания у ПРОБЫ лежачего канала, с
+
+
 class _ChannelArgs(object):
-    """Ровно те поля, которые читает :func:`review_send_run.run_channel`."""
+    """Ровно те поля, которые читает :func:`review_send_run.run_channel`.
+
+    ПОЛЕ ``manus_wait`` ЗАВЕДЕНО 05.09.2026, и это не украшение. До него
+    ``run_channel`` брал предел ожидания через ``getattr(args, "manus_wait",
+    DEFAULT_MANUS_WAIT)`` — атрибута тут не было, поэтому боевой автоконтур ЖДАЛ
+    1800с и ручки к этому числу не имел ни одной (ни `.env`, ни аргумента). Теперь
+    число приезжает сюда явно: боевой заход — прежние 1800с (поведение живого
+    канала байт-в-байт), проба лежачего — короткое окно.
+    """
 
     def __init__(self, timeout, key_env, codex_bin=None, codex_model=None, codex_cd=None,
-                 manus_base=None):
+                 manus_base=None, manus_wait=None):
         self.min_chars = review_send.ANSWER_MIN_CHARS
         self.timeout = timeout
         self.key_env = key_env
@@ -190,6 +201,7 @@ class _ChannelArgs(object):
         self.codex_cd = codex_cd
         self.manus_base = manus_base or review_send_run.DEFAULT_MANUS_BASE
         self.manus_path = review_send_run.DEFAULT_MANUS_PATH
+        self.manus_wait = review_send_run.DEFAULT_MANUS_WAIT if manus_wait is None else int(manus_wait)
 
 
 def line_counts(root, paths):
@@ -290,7 +302,8 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
          channels=None, timeout=DEFAULT_TIMEOUT, key_env=review_send_run.DEFAULT_KEY_ENV,
          dry=False, write_journal=True, max_chars=review_pack.REVIEW_MAX_CHARS,
          codex_bin=None, codex_model=None, codex_cd=None, manus_base=None,
-         inbox=None, workdir=None, journal_fn=None, clock=None, only=None):
+         inbox=None, workdir=None, journal_fn=None, clock=None, only=None,
+         probe_wait=DEFAULT_PROBE_WAIT):
     """Один оборот ступени A. → dict-отчёт (никогда не бросает наружу исключений канала).
 
     Отчёт всегда несёт ``acted`` и ``why``: «повода не было» — это ИСХОД, а не
@@ -333,6 +346,7 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
         "pack_chars": pack["text_chars"],
         "pack_sha256": pack["text_sha256"],
         "hypothesis": len(case.get("hypothesis") or []),
+        "occasion": trigger.get("occasion") or ("суточный дайджест" if trigger["kind"] == "digest" else "—"),
     }
 
     prompt = review_send.build_prompt(text)
@@ -342,6 +356,20 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
     if dry:
         report["acted"] = False
         report["why"] = "сухой прогон: пакет собран, наружу не отправлено ничего"
+        return report
+
+    # ПЛАН КАНАЛОВ СЧИТАЕТСЯ ДО `note_attempt` СОЗНАТЕЛЬНО. Заход, в котором ехать
+    # некому, попыткой не является: списать её значило бы похоронить повод за чужой
+    # простой. Пакет при этом уже собран и лежит в лотке — он не потерян.
+    wanted = list(channels or list(review_send.CHANNELS))
+    plan = review_auto.channel_plan(state, wanted, stamp)
+    report["channels"] = {"send": list(plan["send"]), "probe": list(plan["probe"]),
+                          "skip": list(plan["skip"])}
+    report["channels_line"] = review_auto.channel_plan_line(plan)
+    going = list(plan["send"]) + list(plan["probe"])
+    if not going:
+        report["acted"] = False
+        report["why"] = "все каналы лежат, пакет собран и ждёт: %s" % report["channels_line"]
         return report
 
     state = review_auto.note_attempt(state, trigger["key"], trigger["kind"], stamp, pack_rel=pack_rel)
@@ -355,12 +383,17 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
         "prompt_sha256": review_send._sha256_text(prompt),
         "send_date": build_date,
     }
-    args = _ChannelArgs(timeout, key_env, codex_bin=codex_bin, codex_model=codex_model,
-                        codex_cd=codex_cd, manus_base=manus_base)
+    def _args_for(is_probe):
+        return _ChannelArgs(timeout, key_env, codex_bin=codex_bin, codex_model=codex_model,
+                            codex_cd=codex_cd, manus_base=manus_base,
+                            manus_wait=probe_wait if is_probe else None)
+
     inbox_dir = inbox or _path(root, DEFAULT_INBOX)
 
     outcomes, reasons, answers = [], [], []
-    for channel in (channels or list(review_send.CHANNELS)):
+    for channel in going:
+        is_probe = channel in plan["probe"]
+        args = _args_for(is_probe)
         if violations:
             verdict = review_send.refused_by_guard(
                 channel=channel, pack_name=ctx["pack_name"], pack_sha256=ctx["pack_sha256"],
@@ -386,7 +419,9 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
         reasons.append(verdict["reason"])
         answers.append({"channel": channel, "outcome": verdict["outcome"], "reason": verdict["reason"],
                         "answer_chars": verdict["answer_chars"], "cost_value": verdict.get("cost_value"),
-                        "cost_unit": verdict.get("cost_unit"), "file": rel})
+                        "cost_unit": verdict.get("cost_unit"), "file": rel, "probe": is_probe})
+        state = review_auto.note_channel(state, channel, verdict["outcome"], verdict["reason"],
+                                         stamp, probed=is_probe)
 
     state, verdict_slug = review_auto.note_outcome(state, trigger["key"], outcomes, reasons, stamp)
     if trigger["kind"] == "digest":
@@ -394,7 +429,10 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
     write_state(path, state)
 
     report.update({"outcomes": outcomes, "reasons": reasons, "answers": answers, "verdict": verdict_slug})
-    report["line"] = review_auto.refusal_line(trigger["key"], verdict_slug, outcomes, reasons, pack_rel)
+    report["line"] = "%s; повод: %s; каналы: %s" % (
+        review_auto.refusal_line(trigger["key"], verdict_slug, outcomes, reasons, pack_rel),
+        report["occasion"], report["channels_line"],
+    )
 
     if write_journal:
         line = "ARTIFACT ревью-контур A %s → %s: %s" % (trigger["key"], pack_rel, report["line"])
@@ -459,6 +497,8 @@ def main(argv=None):
     parser.add_argument("--codex-model", default=None)
     parser.add_argument("--codex-cd", default=None)
     parser.add_argument("--manus-base", default=None, help="адрес канала Manus (для отрицательной пробы)")
+    parser.add_argument("--probe-wait", type=int, default=DEFAULT_PROBE_WAIT,
+                        help="предел ожидания у ПРОБЫ лежачего канала, с")
     parser.add_argument("--only", choices=("chain", "digest"), default=None,
                         help="рассматривать только этот повод (проверка руками, не боевая ручка)")
     parser.add_argument("--limit", type=int, default=20)
@@ -499,6 +539,7 @@ def main(argv=None):
         channels=args.channel, timeout=args.timeout, key_env=args.key_env, dry=args.dry,
         write_journal=bool(args.journal), codex_bin=args.codex_bin, codex_model=args.codex_model,
         codex_cd=args.codex_cd, manus_base=args.manus_base, only=args.only,
+        probe_wait=args.probe_wait,
     )
     sys.stdout.write(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
     if not report.get("acted"):

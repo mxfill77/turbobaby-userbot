@@ -57,8 +57,16 @@ def _free_port():
     return port
 
 
-def _receipt(queue_id=82, *, changed=True, closed=_NOW, text=LIVE_TASK_TEXT, result=None):
-    result = result if result is not None else "FACT: commit abc1234 в git log\nRESULT: сделано"
+def _receipt(queue_id=82, *, changed=True, closed=_NOW, text=LIVE_TASK_TEXT, result=None, commits=1):
+    """Расписка-фикстура. ``commits=2`` — ПОВОД по правилу «крупный класс».
+
+    Отдельная ручка, а не новый дефолт: с 05.09.2026 поводом считается не всякая
+    закрытая цепочка, и тесты, которым нужен именно повод, обязаны просить его
+    ЯВНО — иначе смена правила прошла бы мимо них молча.
+    """
+    if result is None:
+        shas = ["abc1234", "def5678", "9012abc"][:max(0, commits)]
+        result = "FACT: %s\nRESULT: сделано" % " ".join("commit %s в git log" % s for s in shas)
     claimed = review_auto.claimed_commits(result)
     return review_auto.receipt(
         queue_id=queue_id, task_text=text, status="done", result=result,
@@ -240,12 +248,56 @@ class TestTriggers(unittest.TestCase):
             st["spool"] = review_auto.spool_add(st["spool"], rec)
         return st
 
-    def test_chain_without_operational_change_is_not_a_trigger(self):
-        self.assertIsNone(review_auto.chain_trigger(self._state_with(_receipt(1, changed=False)), _NOW))
+    def test_chain_without_any_commit_is_not_a_trigger(self):
+        rec = _receipt(1, result="RESULT: посмотрел и ничего не менял")
+        self.assertEqual(rec["change_reason"], "no_commit_claimed")
+        self.assertIsNone(review_auto.chain_trigger(self._state_with(rec), _NOW))
+
+    def test_one_verified_commit_is_a_ribbon_not_an_occasion(self):
+        """ЛЕНТА: один подтверждённый коммит, замеры сошлись — внешних не зовём.
+
+        Это и есть правка 05.09: раньше такая цепочка давала пакет, и таких за
+        04.09 было 12 из 21. Второе мнение по ней приходит суточным дайджестом.
+        """
+        rec = _receipt(1, commits=1)
+        self.assertTrue(rec["operational_change"], "фикстура должна быть операционным изменением")
+        self.assertEqual(review_auto.chain_occasion(rec)[0], False)
+        self.assertIsNone(review_auto.chain_trigger(self._state_with(rec), _NOW))
+        # …и она НЕ потеряна: дайджест берёт её тем же окном.
+        self.assertEqual([r["queue_id"] for r in review_auto.digest_trigger(
+            self._state_with(rec), "2026-09-01T13:00:00Z", 1)["receipts"]], [1])
+
+    def test_two_verified_commits_are_a_big_class_occasion(self):
+        rec = _receipt(1, commits=2)
+        ok, why = review_auto.chain_occasion(rec)
+        self.assertTrue(ok)
+        self.assertIn("крупный класс", why)
+        self.assertIn("крупный класс", review_auto.chain_trigger(self._state_with(rec), _NOW)["occasion"])
+
+    def test_claimed_commit_absent_from_the_tree_is_a_divergence_occasion(self):
+        """Заявлен коммит, а в дереве его нет — это РАСХОЖДЕНИЕ ДВУХ НАШИХ ЗАМЕРОВ.
+
+        Смена смысла названа вслух: до 05.09 такая цепочка не была поводом вовсе
+        (operational_change=False), и разошедшиеся замеры уходили молча.
+        """
+        rec = _receipt(1, changed=False)
+        self.assertFalse(rec["operational_change"])
+        self.assertEqual(rec["change_reason"], "commit_unverified")
+        self.assertIn("замеры разошлись", review_auto.chain_occasion(rec)[1])
+        self.assertIsNotNone(review_auto.chain_trigger(self._state_with(rec), _NOW))
+
+    def test_reported_failure_with_a_live_commit_is_a_divergence_occasion(self):
+        rec = review_auto.receipt(
+            queue_id=9, task_text=LIVE_TASK_TEXT, status="failed",
+            result="FACT: commit abc1234 в git log", closed_at=_NOW,
+            claimed=["abc1234"], verified=["abc1234"], artifacts=[])
+        ok, why = review_auto.chain_occasion(rec)
+        self.assertTrue(ok)
+        self.assertIn("объявила отказ", why)
 
     def test_oldest_chain_goes_first(self):
-        st = self._state_with(_receipt(2, closed="2026-09-01T11:00:00Z"),
-                              _receipt(1, closed="2026-09-01T09:00:00Z"))
+        st = self._state_with(_receipt(2, closed="2026-09-01T11:00:00Z", commits=2),
+                              _receipt(1, closed="2026-09-01T09:00:00Z", commits=2))
         self.assertEqual(review_auto.chain_trigger(st, _NOW)["receipt"]["queue_id"], 1)
 
     def test_digest_waits_for_its_hour(self):
@@ -270,11 +322,77 @@ class TestTriggers(unittest.TestCase):
         self.assertEqual(trigger["receipts"], [])
 
     def test_event_outruns_the_schedule(self):
-        self.assertEqual(review_auto.next_trigger(self._state_with(_receipt(1)), _NOW, 1)["kind"], "chain")
+        self.assertEqual(review_auto.next_trigger(self._state_with(_receipt(1, commits=2)),
+                                                  _NOW, 1)["kind"], "chain")
 
     def test_bad_digest_hour_is_refused_not_guessed(self):
         with self.assertRaises(review_auto.ReviewAutoError):
             review_auto.digest_trigger(review_auto.state_default(), _NOW, 99)
+
+
+class TestChannelHealth(unittest.TestCase):
+    """Лежачий канал перестаёт получать пакеты — и оживает САМ, без владельца.
+
+    Числа порогов не выдуманы: корпус лотка `docs/review_inbox` на 05.09 — 152
+    захода (76 codex + 76 manus). У codex 76 из 76 `answered`. У manus две серии
+    неответов подряд, длиной 14 и 22, и ОДИНОЧНЫХ провалов в корпусе ноль —
+    поэтому порог в два подряд не даёт ни одного ложного «лежит» на всём корпусе.
+    """
+
+    def _down(self, now="2026-09-01T12:00:00Z"):
+        st = review_auto.state_default()
+        for _ in range(review_auto.CHANNEL_DOWN_STRIKES):
+            st = review_auto.note_channel(st, "manus", "unknown", "answer_lost", now)
+        return st
+
+    def test_one_miss_does_not_bury_a_channel(self):
+        st = review_auto.note_channel(review_auto.state_default(), "manus",
+                                      "unknown", "answer_lost", _NOW)
+        self.assertFalse(review_auto.channel_down(st, "manus"))
+        self.assertEqual(review_auto.channel_plan(st, ["codex", "manus"], _NOW)["send"],
+                         ["codex", "manus"])
+
+    def test_two_misses_in_a_row_stop_the_packs(self):
+        plan = review_auto.channel_plan(self._down(), ["codex", "manus"], "2026-09-01T12:10:00Z")
+        self.assertEqual(plan["send"], ["codex"])
+        self.assertEqual(plan["probe"], [])
+        self.assertEqual([s["channel"] for s in plan["skip"]], ["manus"])
+        # Пропуск обязан назвать, КОГДА канал попробуют снова: без этого он читается
+        # как «выключен навсегда», а выключать внешнего критика запрещено.
+        self.assertEqual(plan["skip"][0]["next_probe_at"], "2026-09-01T18:00:00Z")
+        self.assertIn("следующая проба не раньше", review_auto.channel_plan_line(plan))
+
+    def test_the_channel_revives_by_itself_after_the_probe_window(self):
+        st = self._down()
+        late = "2026-09-01T18:00:01Z"
+        plan = review_auto.channel_plan(st, ["manus"], late)
+        self.assertEqual(plan["probe"], ["manus"], "проба не наступила — канал не оживёт никогда")
+
+        # Проба не ответила → окно отсчитывается ЗАНОВО от пробы, а не от начала лежания.
+        st_failed = review_auto.note_channel(st, "manus", "unknown", "answer_lost", late, probed=True)
+        self.assertEqual(review_auto.channel_plan(st_failed, ["manus"], "2026-09-01T20:00:00Z")["probe"], [])
+
+        # Проба ответила → здоровье вернулось ЦЕЛИКОМ, и следующий пакет едет обычным путём.
+        st_ok = review_auto.note_channel(st, "manus", "answered", "ok", late, probed=True)
+        self.assertFalse(review_auto.channel_down(st_ok, "manus"))
+        self.assertEqual(review_auto.channel_plan(st_ok, ["manus"], late)["send"], ["manus"])
+
+    def test_our_own_fault_is_never_charged_to_the_channel(self):
+        """Страж исходящего, упавшие руки и незаданный ключ — наши промахи, не канала.
+
+        Наружу в них не ушло НИЧЕГО, и хоронить за них живой канал значило бы
+        остаться без критика по собственной ошибке.
+        """
+        for reason in sorted(review_auto.CHANNEL_OUR_FAULT):
+            with self.subTest(reason=reason):
+                st = review_auto.state_default()
+                for _ in range(review_auto.CHANNEL_DOWN_STRIKES + 3):
+                    st = review_auto.note_channel(st, "manus", "refused", reason, _NOW)
+                self.assertFalse(review_auto.channel_down(st, "manus"))
+
+    def test_state_survives_a_round_trip_through_disk(self):
+        st = review_auto.state_read(json.loads(json.dumps(self._down())))
+        self.assertTrue(review_auto.channel_down(st, "manus"))
 
 
 class TestCaseBuilding(unittest.TestCase):
@@ -467,7 +585,7 @@ class TestNegativeChannel(unittest.TestCase):
         self.root = tempfile.mkdtemp(prefix="reviewauto_neg_")
         self.addCleanup(shutil.rmtree, self.root, True)
         self.state = os.path.join(self.root, "state.json")
-        self.rec = _receipt()
+        self.rec = _receipt(commits=2)          # повод по правилу «крупный класс»
         review_auto_run.write_text(
             os.path.join(self.root, *review_auto.receipt_rel(self.rec).split("/")),
             json.dumps(self.rec, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
@@ -568,6 +686,98 @@ class TestNegativeChannel(unittest.TestCase):
         self.assertFalse(report["acted"])
         self.assertEqual(review_auto_run.read_state(self.state)["digest"],
                          {"last_day": "2026-09-01", "last_reason": "empty"})
+
+
+class TestLiveChannelStillGoesOut(unittest.TestCase):
+    """ПОЛОЖИТЕЛЬНАЯ ПРОБА к правке 05.09: экономия не смеет стать немотой.
+
+    Прибор, переставший ходить наружу вовсе, — это отказ, а не экономия. Поэтому
+    здесь проверяется ровно обратное пропуску: живой канал и НАСТОЯЩИЙ повод
+    обязаны и после правки дать пакет наружу.
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="reviewauto_live_")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.state = os.path.join(self.root, "state.json")
+        self.rec = _receipt(commits=2)
+        review_auto_run.write_text(
+            os.path.join(self.root, *review_auto.receipt_rel(self.rec).split("/")),
+            json.dumps(self.rec, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        self.seen = []
+        original = review_auto_run.review_send_run.run_channel
+        self.addCleanup(setattr, review_auto_run.review_send_run, "run_channel", original)
+        review_auto_run.review_send_run.run_channel = self._answer
+
+    def _answer(self, channel, prompt, ctx, args):
+        self.seen.append((channel, getattr(args, "manus_wait", None)))
+        verdict = review_send._verdict(
+            channel=channel, pack_name=ctx["pack_name"], pack_sha256=ctx["pack_sha256"],
+            send_date=ctx["send_date"], outcome="answered", reason="ok",
+            detail="ответ канала", answer="находка: " + "я" * 400,
+            prompt_sha256=ctx["prompt_sha256"])
+        return verdict, "находка: " + "я" * 400
+
+    def _state(self, st):
+        review_auto_run.write_state(self.state, review_auto.note_digest_day(
+            dict(st, spool=[self.rec]), "2026-09-01", "answered"))
+
+    def _tick(self, now=_NOW):
+        return review_auto_run.tick(root=self.root, state_path=self.state, now=now,
+                                    digest_hour=1, write_journal=False)
+
+    def test_healthy_channels_and_a_real_occasion_still_produce_a_pack(self):
+        self._state(review_auto.state_default())
+        report = self._tick()
+        self.assertTrue(report["acted"], "живой канал и настоящий повод не дали пакета — это отказ")
+        self.assertEqual([c for c, _ in self.seen], list(review_send.CHANNELS))
+        self.assertEqual(report["outcomes"], ["answered", "answered"])
+        self.assertIn("крупный класс", report["occasion"])
+        self.assertTrue(os.path.exists(os.path.join(self.root, *report["pack"].split("/"))))
+        # Боевое ожидание живого канала правкой НЕ тронуто: те же 1800с, что и до неё.
+        self.assertEqual(dict(self.seen)["manus"], review_auto_run.review_send_run.DEFAULT_MANUS_WAIT)
+
+    def test_a_down_channel_is_skipped_while_the_live_one_keeps_working(self):
+        st = review_auto.state_default()
+        for _ in range(review_auto.CHANNEL_DOWN_STRIKES):
+            st = review_auto.note_channel(st, "manus", "unknown", "answer_lost", _NOW)
+        self._state(st)
+        report = self._tick()
+        self.assertTrue(report["acted"])
+        self.assertEqual([c for c, _ in self.seen], ["codex"])
+        self.assertEqual([s["channel"] for s in report["channels"]["skip"]], ["manus"])
+        self.assertIn("ПРОПУЩЕН manus", report["line"])
+        # В лотке ровно ОДИН файл, и он от codex: пропуск ответом не притворяется
+        # и фальшивой расписки в лоток не кладёт.
+        files = sorted(os.listdir(os.path.join(self.root, "docs", "review_inbox")))
+        self.assertEqual(len(files), 1, "пропущенный канал оставил файл в лотке")
+        self.assertTrue(files[0].endswith("-codex.md"), files[0])
+
+    def test_the_probe_goes_out_on_a_short_wait_not_the_full_one(self):
+        st = review_auto.state_default()
+        for _ in range(review_auto.CHANNEL_DOWN_STRIKES):
+            st = review_auto.note_channel(st, "manus", "unknown", "answer_lost", _NOW)
+        self._state(st)
+        report = self._tick("2026-09-01T18:00:01Z")
+        self.assertEqual(report["channels"]["probe"], ["manus"])
+        self.assertEqual(dict(self.seen)["manus"], review_auto_run.DEFAULT_PROBE_WAIT)
+        # Проба ответила → канал встал сам, без единого действия владельца.
+        self.assertFalse(review_auto.channel_down(review_auto_run.read_state(self.state), "manus"))
+
+    def test_all_channels_down_costs_no_attempt(self):
+        """Чужой простой не смеет хоронить наш повод: попытка не списывается."""
+        st = review_auto.state_default()
+        for channel in review_send.CHANNELS:
+            for _ in range(review_auto.CHANNEL_DOWN_STRIKES):
+                st = review_auto.note_channel(st, channel, "unknown", "answer_lost", _NOW)
+        self._state(st)
+        report = self._tick()
+        self.assertFalse(report["acted"])
+        self.assertIn("все каналы лежат", report["why"])
+        self.assertEqual(self.seen, [])
+        self.assertEqual(review_auto_run.read_state(self.state)["triggers"], {})
+        # …а пакет собран и лежит: он не потерян ни в одной ветке.
+        self.assertTrue(os.path.exists(os.path.join(self.root, *report["pack"].split("/"))))
 
 
 if __name__ == "__main__":

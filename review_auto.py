@@ -76,6 +76,41 @@ HYPOTHESIS_MAX = 1200        # постановка в пакете (потол�
 RESULT_HEAD_MAX = 900        # голова результата задачи в расписке
 SPOOL_MAX = 200              # кап спула закрытых цепочек (это индекс, не архив)
 
+# ─────────────── ЗДОРОВЬЕ ВНЕШНЕГО КАНАЛА (заведено 05.09.2026) ───────────────
+# ЗАЧЕМ. Заход в канал СИНХРОНЕН внутри витка, и лежачий канал берёт свой полный
+# предел ожидания КАЖДЫЙ раз, ничего не отдавая. Замер суток 04.09 (`pc_orchestrator.log`,
+# окно 00:00–24:00): 20 прогонов ступени A, медиана 1845с, сумма 37094с = 42.9% суток;
+# исход `manus` во всех двадцати — `unknown/answer_lost`, ответов ноль. Для сравнения
+# те же сутки при ЖИВОМ канале: 02.09 — 22 прогона, медиана 155с, max 250с; 03.09 —
+# 14 прогонов, медиана 172с, max 287с. Разница между живым и лежачим каналом —
+# не проценты, а порядок.
+#
+# ПОРОГ ВЫБРАН ЗАМЕРОМ, А НЕ НА ГЛАЗ. Корпус лотка `docs/review_inbox` — 152 захода
+# (76 codex + 76 manus), лента исходов по времени: у `codex` — 76 из 76 `answered`,
+# ни одного провала; у `manus` — две серии неответов подряд, длиной 14 и 22, и
+# ОДИНОЧНЫХ провалов в корпусе НОЛЬ. Значит порог в два подряд не даёт на этом
+# корпусе ни одного ложного «лежит» (0 из 152), а стои́т ровно один лишний полный
+# заход — это цена за то, чтобы разовая осечка не хоронила канал.
+CHANNEL_DOWN_STRIKES = 2
+# ОЖИВАЕТ САМ, БЕЗ ВЛАДЕЛЬЦА: лежачий канал получает пробный пакет раз в это окно.
+# Шесть часов — тот же порядок, что у ожидания О4 (след жизни полосы), и он даёт
+# каналу четыре шанса в сутки против измеренных серий в 14 и 22 захода.
+CHANNEL_PROBE_AFTER_SEC = 6 * 3600
+# ЧТО КАНАЛУ НЕ В ВИНУ. `outbound_guard` — наш пакет споткнулся о стражу исходящего,
+# `sender_crashed` — упали наши руки, `no_credentials` — не задан наш ключ. Наружу в
+# этих трёх случаях не ушло НИЧЕГО, и судить по ним канал значит хоронить живое за
+# свою же ошибку.
+CHANNEL_OUR_FAULT = frozenset({"outbound_guard", "sender_crashed", "no_credentials"})
+
+# ──────────────── ПОВОД, А НЕ ЛЕНТА (заведено 05.09.2026) ────────────────
+# Правило контура: внешних зовут ПО ПОВОДУ — закрыт крупный класс, разошлись два
+# наших замера, меняется архитектура. Пакет на каждую закрытую цепочку этому не
+# отвечает: за 04.09 закрытых цепочек 21, поводов по правилу — 8.
+# «Крупный» назван числом подтверждённых коммитов, а не размером текста: корпус
+# 103 расписок даёт 38 цепочек без коммита, 46 с одним, 15 с двумя и 4 с тремя —
+# то есть два и выше отделяет работу, тронувшую не один шаг, от однострочной правки.
+EVENT_MIN_COMMITS = 2
+
 REPORTED = {"done": "reported_done", "failed": "reported_failed"}
 
 # Коммит из результата: 7–40 hex рядом со словом-указателем. Голый hex-осколок
@@ -276,7 +311,8 @@ def spool_add(spool, rec):
 
 
 def state_default():
-    return {"schema": SCHEMA, "triggers": {}, "digest": {"last_day": None, "last_reason": None}, "spool": []}
+    return {"schema": SCHEMA, "triggers": {}, "digest": {"last_day": None, "last_reason": None},
+            "spool": [], "channels": {}}
 
 
 def state_read(raw):
@@ -300,6 +336,11 @@ def state_read(raw):
     spool = raw.get("spool")
     if isinstance(spool, list):
         st["spool"] = [r for r in spool if isinstance(r, dict) and r.get("task_id")][-SPOOL_MAX:]
+    channels = raw.get("channels")
+    if isinstance(channels, dict):
+        for name, rec in channels.items():
+            if isinstance(name, str) and isinstance(rec, dict):
+                st["channels"][name] = dict(rec)
     return st
 
 
@@ -370,6 +411,126 @@ def note_digest_day(state, day, reason):
     return st
 
 
+# ───────────────────────── здоровье внешних каналов ─────────────────────────
+
+
+def channel_failed(outcome, reason):
+    """Заход провален ПО ВИНЕ КАНАЛА? → bool.
+
+    `answered` — не провал. Всё остальное провал, КРОМЕ трёх наших собственных
+    причин (`CHANNEL_OUR_FAULT`): в них наружу не ушло ничего, и канал ни при чём.
+    """
+    if str(outcome or "") == "answered":
+        return False
+    return str(reason or "") not in CHANNEL_OUR_FAULT
+
+
+def note_channel(state, channel, outcome, reason, now_iso, *, probed=False):
+    """Исход захода → здоровье канала. → новое состояние (вход не мутируется).
+
+    Ответил — счётчик обнуляется ЦЕЛИКОМ, и лежачий встаёт тем же движением: это
+    и есть самооживление, никакого участия владельца ветка не требует.
+    """
+    st = state_read(state)
+    now = _require_now(now_iso)
+    stamp = now.isoformat().replace("+00:00", "Z")
+    rec = dict(st["channels"].get(channel) or {})
+    rec["last_at"] = stamp
+    rec["last_outcome"] = str(outcome or "")
+    rec["last_reason"] = str(reason or "")
+    if not channel_failed(outcome, reason):
+        rec["strikes"] = 0
+        rec["down_since"] = None
+        rec["last_probe_at"] = None
+    else:
+        rec["strikes"] = int(rec.get("strikes") or 0) + 1
+        if rec["strikes"] >= CHANNEL_DOWN_STRIKES and not rec.get("down_since"):
+            rec["down_since"] = stamp
+        if probed:
+            # Проба стои́т ожидания, и её надо отсчитать ОТ ПРОБЫ, а не от начала
+            # лежания: иначе следующий виток пробовал бы снова и снова.
+            rec["last_probe_at"] = stamp
+    st["channels"][channel] = rec
+    return st
+
+
+def channel_down(state, channel):
+    """Канал признан лежачим? → bool."""
+    rec = (state.get("channels") or {}).get(channel) or {}
+    return bool(rec.get("down_since"))
+
+
+def channel_plan(state, channels, now_iso):
+    """Кому из каналов пакет ЕДЕТ в этот заход. → dict.
+
+    ``{"send": [...], "probe": [...], "skip": [{"channel","why","down_since","next_probe_at"}]}``
+
+    Лежачий канал пакетов не получает, но НЕ отключён: раз в ``CHANNEL_PROBE_AFTER_SEC``
+    он попадает в ``probe`` и получает пакет снова. Ответил — здоровье возвращается
+    само (`note_channel`), и следующий заход он снова в ``send``.
+    """
+    st = state_read(state)
+    now = _require_now(now_iso)
+    plan = {"send": [], "probe": [], "skip": []}
+    for channel in list(channels or []):
+        rec = st["channels"].get(channel) or {}
+        down_since = parse_iso(rec.get("down_since"))
+        if down_since is None:
+            plan["send"].append(channel)
+            continue
+        last = parse_iso(rec.get("last_probe_at")) or down_since
+        due = last + datetime.timedelta(seconds=CHANNEL_PROBE_AFTER_SEC)
+        if now >= due:
+            plan["probe"].append(channel)
+            continue
+        plan["skip"].append({
+            "channel": channel,
+            "why": "канал лежит с %s (подряд неответов %d, последняя причина %s)" % (
+                rec.get("down_since"), int(rec.get("strikes") or 0), rec.get("last_reason") or "—"),
+            "down_since": rec.get("down_since"),
+            "next_probe_at": due.isoformat().replace("+00:00", "Z"),
+        })
+    return plan
+
+
+def channel_plan_line(plan):
+    """План каналов одной строкой для журнала. → str.
+
+    Пропуск обязан быть СЛЫШЕН и обязан назвать, КОГДА канал попробуют снова:
+    «пропущен» без времени возврата читается как «выключен навсегда».
+    """
+    parts = []
+    if plan.get("send"):
+        parts.append("шлём %s" % ", ".join(plan["send"]))
+    if plan.get("probe"):
+        parts.append("ПРОБА лежачего %s" % ", ".join(plan["probe"]))
+    for skip in plan.get("skip") or []:
+        parts.append("ПРОПУЩЕН %s (%s; следующая проба не раньше %s)"
+                     % (skip["channel"], skip["why"], skip["next_probe_at"]))
+    return "; ".join(parts) or "каналов нет"
+
+
+# ───────────────────────────── повод, а не лента ─────────────────────────────
+
+
+def chain_occasion(rec):
+    """Закрытая цепочка — ПОВОД звать внешних? → (bool, причина словами).
+
+    Три признака правила контура, и все три читаются из расписки ФАКТОМ, а не
+    оценкой. Четвёртого («меняется архитектура») в расписке нет ни одним полем —
+    он назван вслух остатком, а не подменён похожим числом.
+    """
+    verified = list(rec.get("verified_commits") or [])
+    claimed = list(rec.get("claimed_commits") or [])
+    if str(rec.get("change_reason") or "") == "commit_unverified":
+        return True, "замеры разошлись: объявлено коммитов %d, в дереве нет ни одного" % len(claimed)
+    if str(rec.get("reported_status") or "") == "reported_failed" and rec.get("operational_change"):
+        return True, "замеры разошлись: полоса объявила отказ, а коммит в дереве живой"
+    if len(verified) >= EVENT_MIN_COMMITS:
+        return True, "крупный класс: подтверждённых коммитов %d" % len(verified)
+    return False, "лента: подтверждённых коммитов %d, замеры сошлись" % len(verified)
+
+
 def refusal_line(key, verdict, outcomes, reasons, pack_rel):
     """Одна строка отказа для журнала и лога. → str.
 
@@ -397,16 +558,25 @@ def chain_trigger(state, now_iso):
 
     Берём САМУЮ СТАРУЮ подходящую: очередь поводов — очередь, а не стек;
     свежая новость, обгоняющая вчерашнюю, оставила бы вчерашнюю навсегда.
+
+    ЧТО ЗДЕСЬ ПОВОД (правка 05.09.2026). Раньше сюда проходила ЛЮБАЯ цепочка с
+    операционным изменением — то есть лента: 20 пакетов за 04.09 на 21 закрытую
+    цепочку. Теперь проходит только цепочка, отвечающая правилу контура
+    (:func:`chain_occasion`): крупный класс или расхождение двух наших замеров.
+    Остальные НЕ ТЕРЯЮТСЯ — они по-прежнему целиком идут в суточный дайджест
+    (:func:`digest_trigger` берёт окно спула, а не список поводов), то есть
+    второе мнение по ним приходит раз в сутки пачкой, а не пакетом на каждую.
     """
     st = state_read(state)
     for rec in st["spool"]:
-        if not rec.get("operational_change"):
+        is_occasion, occasion = chain_occasion(rec)
+        if not is_occasion:
             continue
         key = "chain:%s" % rec["task_id"]
         ok, why = attempt_allowed(st, key, now_iso)
         if not ok:
             continue
-        return {"kind": "chain", "key": key, "receipt": rec, "why": why}
+        return {"kind": "chain", "key": key, "receipt": rec, "why": why, "occasion": occasion}
     return None
 
 

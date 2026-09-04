@@ -9229,6 +9229,11 @@ def maybe_revizor(now=None, db_path=None, state_path=None):
 # ОТКАТ: `REVIEW_AUTO` не равен «1» → ветка не зовётся вовсе, поведение демона байт-в-байт прежнее.
 REVIEW_AUTO_MIN_SEC = float(os.getenv("REVIEW_AUTO_MIN_SEC", "300") or "300")   # пол паузы между оборотами
 REVIEW_AUTO_TIMEOUT = int(os.getenv("REVIEW_AUTO_TIMEOUT", "300") or "300")     # бюджет одного канала, с
+# Предел ожидания у ПРОБЫ лежачего канала. 600с — вдвое больше самого долгого
+# ИЗМЕРЕННОГО здорового прогона ступени A целиком (287с, корпус 36 прогонов
+# 02–03.09), то есть проба даёт живому каналу двойной запас и при этом стои́т
+# втрое меньше боевого ожидания в 1800с.
+REVIEW_AUTO_PROBE_WAIT = int(os.getenv("REVIEW_AUTO_PROBE_WAIT", "600") or "600")
 REVIEW_AUTO_DIGEST_HOUR = int(os.getenv("REVIEW_AUTO_DIGEST_HOUR", "1") or "1")  # час UTC суточного дайджеста
 REVIEW_AUTO_TICK_FILE = _state(os.path.join(REPO, "pc_orchestrator.review_auto_tick.json"))
 # И СОСТОЯНИЕ, И КОРЕНЬ ЗАПИСИ — через `_state`, а не константой REPO. Класс пойман ЖИВЬЁМ на
@@ -9320,6 +9325,8 @@ def maybe_review_auto(now=None, tick_path=None, state_path=None, runner=None):
     ничего не сделал: иначе «повода нет» стоило бы полного разбора каждые 60 секунд.
     """
     if not _review_auto_on():
+        log.info("ревью-контур A: ПРОХОДА НЕТ — ветка выключена (REVIEW_AUTO=0 либо стоп-файл %s)",
+                 os.path.basename(_flag_off_file("REVIEW_AUTO")))
         return None
     now = time.time() if now is None else now
     st = _review_auto_read_tick(tick_path)
@@ -9327,6 +9334,9 @@ def maybe_review_auto(now=None, tick_path=None, state_path=None, runner=None):
     if prev is not None:
         try:
             if (now - float(prev)) < REVIEW_AUTO_MIN_SEC:
+                # Пол паузы — это НЕ несостоявшийся проход, а «ещё не время»: прибор не
+                # запускался вовсе. Строку сюда не пишем сознательно — она легла бы на
+                # КАЖДОМ витке и утопила бы собой настоящие отказы ниже.
                 return None
         except Exception:
             pass
@@ -9336,17 +9346,26 @@ def maybe_review_auto(now=None, tick_path=None, state_path=None, runner=None):
         report = (runner or review_auto_run.tick)(
             root=_review_auto_root(), state_path=state_path or REVIEW_AUTO_STATE_FILE,
             digest_hour=REVIEW_AUTO_DIGEST_HOUR, timeout=REVIEW_AUTO_TIMEOUT, write_journal=True,
+            probe_wait=REVIEW_AUTO_PROBE_WAIT,
         )
     except Exception as e:
-        log.warning("ревью-контур A: оборот упал (fail-safe, метка уже сдвинута — "
+        log.warning("ревью-контур A: ПРОХОДА НЕТ — оборот упал (fail-safe, метка уже сдвинута, "
                     "следующая попытка через паузу): %s", e)
         return None
     if not report.get("acted"):
-        log.debug("ревью-контур A: %s", report.get("why") or "повода нет")
+        # ГРОМКО, А НЕ В DEBUG (правка 05.09.2026). Раньше здесь стоял `log.debug`, а
+        # уровень демона — INFO: каждый несостоявшийся проход ступени A не оставлял в
+        # журнале НИ ОДНОЙ строки, и молчание прибора было неотличимо от его успеха
+        # ровно там, где различить их важнее всего. Теперь исход называется словами
+        # всегда — и «повода нет», и «все каналы лежат», и «сухой прогон».
+        log.info("ревью-контур A: ПРОХОДА НЕТ — %s%s",
+                 report.get("why") or "повода нет",
+                 (" [повод %s]" % report["trigger"]) if report.get("trigger") else "")
         return report
-    log.info("ревью-контур A: повод %s → пакет %s (%s, %s знаков), исходы %s",
-             report.get("trigger"), report.get("pack"), report.get("pack_status"),
-             report.get("pack_chars"), ", ".join(report.get("outcomes") or []) or "—")
+    log.info("ревью-контур A: повод %s (%s) → пакет %s (%s, %s знаков), исходы %s; каналы: %s",
+             report.get("trigger"), report.get("occasion") or "—", report.get("pack"),
+             report.get("pack_status"), report.get("pack_chars"),
+             ", ".join(report.get("outcomes") or []) or "—", report.get("channels_line") or "—")
     _cowork(report.get("line") or "ревью-контур A: оборот без строки исхода")
     return report
 
