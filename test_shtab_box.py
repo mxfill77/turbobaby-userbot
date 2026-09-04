@@ -45,6 +45,7 @@ import ast
 import datetime
 import io
 import os
+import re
 import tempfile
 import unittest
 
@@ -1164,9 +1165,71 @@ class TestCeiling(unittest.TestCase):
         self.assertIn("НЕИЗВЕСТНО", rep["why"])
         self.assertIn("исчерпанным", rep["why"])
 
+    def test_a_box_of_FIFTY_does_not_send_the_lane_into_itself(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ ПОДЪЁМА 8 → 40 (04.09.2026, вечер).
+
+        Подъём потолка обязан отвечать на вопрос «а не уйдёт ли полоса в себя»
+        ЧИСЛОМ, а не обещанием. Здесь смоделирован ровно тот сценарий, ради
+        которого потолок и заведён: Штаб залил в папку ПОЛСОТНИ документов, все
+        ворота проходят, ни один сигнал по исходу не сработал (закрытые ряды —
+        голые маркеры без вердиктов), владелец полосу не занимает. То есть у
+        полосы отняты ВСЕ остановки, кроме двух счётных, — и ответ обязан быть
+        конечным.
+
+        ЧТО ИМЕННО ДЕРЖИТ, ПОИМЁННО И НА КАКОМ БЛОКЕ:
+
+        * **внутри витка — «не больше одной за виток»** (:data:`sb.TICK_LIMIT`),
+          и держит он со ВТОРОГО блока, а не с сорок первого. Это главный ответ
+          на «уйдёт ли полоса в себя»: сколько бы ни лежало в папке, за оборот
+          уезжает РОВНО ОДНА задача;
+        * **между витками — суточный потолок**, и он захлопывается на блоке
+          №41: сорок взято, десять остались лежать со словами «суточный потолок
+          исчерпан». Полсотни в сорок не помещаются — свойство «разгон упирается
+          в потолок» подъёмом не потеряно.
+
+        ЦЕНА ВРЕМЕНЕМ СЧИТАЕТСЯ ЗДЕСЬ ЖЕ И ОНА ГЛАВНАЯ: сорок взятых — это сорок
+        ОТДЕЛЬНЫХ витков, а виток смотрит в папку не чаще ``SHTAB_BOX_MIN_SEC``
+        (600 с). Пачка из полусотни физически не может уехать быстрее, чем за
+        40 × 600 с ≈ 6.7 часа ОДНИХ ПАУЗ, — и это до того, как полоса начнёт
+        исполнять хоть одну задачу. Человек видит разгон задолго до потолка.
+        """
+        BOX = 50
+        docs = _box(*[("kk%02d" % i, GOOD_BODY) for i in range(BOX)])
+
+        # ── 1. ОДИН ВИТОК: держит НЕ потолок, а «одна за виток», и со второго блока
+        rep = _tick(docs, queue=FakeQueue(), place=True)
+        self.assertEqual(len(rep["placed"]), 1, rep["why"])
+        self.assertEqual(rep["placed"][0]["key"], "kk00")
+        self.assertIn("не больше 1 за виток", rep["held"][0][1])
+
+        # ── 2. ВИТОК ЗА ВИТКОМ: взятое возвращается в очередь МАРКЕРОМ, как в бою
+        closed, taken, stopped_by = [], [], ""
+        for _ in range(BOX + 10):                 # запас заведомо больше потолка
+            rep = _tick(docs, queue=FakeQueue(closed=list(closed)), place=True)
+            if not rep["placed"]:
+                stopped_by = " ".join(w for _k, w in rep["held"])
+                break
+            for row in rep["placed"]:
+                taken.append(row["key"])
+                closed.append(_row(row["key"]))   # день по умолчанию — сегодняшний
+        # СХОДИМОСТЬ: цикл кончился отказом брать, а не исчерпанием запаса витков.
+        self.assertTrue(stopped_by, "полоса не остановилась за %d витков" % (BOX + 10))
+        self.assertEqual(len(taken), sb.DAILY_BUDGET)
+        self.assertEqual(len(taken), 40)
+        self.assertEqual(len(set(taken)), 40)     # дедуп не тронут: сорок РАЗНЫХ
+        self.assertEqual(taken[-1], "kk39")       # взят сороковой по счёту блок…
+        self.assertIn("суточный потолок исчерпан", stopped_by)   # …а сорок первый — нет
+        self.assertIn("40 задачи от Штаба", stopped_by)
+        self.assertEqual(BOX - len(taken), 10)    # десять остались лежать
+
+        # ── 3. ЗАВТРА ПОЛОСА СНОВА БЕРЁТ: потолок — ловушка на разгон, а не стоп-кран
+        rep = _tick(docs, queue=FakeQueue(closed=[_row(k, day="2026-09-01") for k in taken]),
+                    place=True)
+        self.assertEqual(len(rep["placed"]), 1, rep["why"])
+
     def test_the_ceiling_number_is_named_and_reused_not_reinvented(self):
         """Потолок и дедуп берутся у ступени E, а не пишутся вторым экземпляром."""
-        self.assertEqual(sb.DAILY_BUDGET, 8)
+        self.assertEqual(sb.DAILY_BUDGET, 40)
         self.assertIs(sb.budget_left.__wrapped__ if hasattr(sb.budget_left, "__wrapped__")
                       else recon_auto.budget_left, recon_auto.budget_left)
         self.assertEqual(sb.budget_left([], TODAY, 3, marks_ok=False), 0)
@@ -1191,21 +1254,44 @@ class TestCeiling(unittest.TestCase):
         медианной мощности»), и число, взятое как доля, поднимается только вместе
         с ложью о доле. Держим тем же способом, каким полоса держит остальные
         числа: обоснование обязано называть, ЧТО останавливает на самом деле.
+
+        Правка 04.09.2026 (вечер) добавила сюда второе требование: обоснование
+        обязано называть и ФИЗИЧЕСКИЙ ПРЕДЕЛ полосы. Число, поднятое без него,
+        неотличимо от взятого с потолка — а «40 выше наблюдаемого максимума 30»
+        и есть весь довод, почему ловушка не связывает здоровую работу.
         """
         body = _src("shtab_box.py")
         head = body.split("DAILY_BUDGET = ")[0]
         self.assertNotIn("30% медианной суточной мощности", head)
-        self.assertIn("ОГРАНИЧИТЕЛЬ УЩЕРБА ОТ РАЗГОНА", head)
-        self.assertIn("shtab_box_signals", head.split("ВОСЕМЬ ЗАДАЧ В СУТКИ")[-1])
+        self.assertIn("ЛОВУШКА НА РАЗГОН, А НЕ ДЕЛЁЖ", head)
+        tail = head.split("СОРОК ЗАДАЧ В СУТКИ")[-1]
+        self.assertIn("shtab_box_signals", tail)
+        self.assertIn("МАКС 30", tail)
 
     def test_the_daemon_default_moved_with_the_constant(self):
         """Подъём в чистом модуле без ручки демона был бы КОСМЕТИКОЙ.
 
         Бой берёт число не отсюда, а из `os.getenv("SHTAB_BOX_BUDGET", …)`: оставь
-        мы там прежний дефолт — константа говорила бы 8, а ящик брал бы 3, и
-        расхождение было бы молчаливым.
+        мы там прежний дефолт — константа говорила бы 40, а ящик брал бы 8, и
+        расхождение было бы молчаливым (ровно им живёт весь класс «прибор с двумя
+        экземплярами врёт обоими»).
+
+        ЧИСЛО ЗДЕСЬ НЕ НАБИРАЕТСЯ ЛИТЕРАЛОМ, а СЧИТЫВАЕТСЯ У КОНСТАНТЫ (правка
+        04.09.2026): прежняя форма `'"SHTAB_BOX_BUDGET", "8"'` держала два
+        экземпляра вместе ровно до следующей правки — поправь кто-нибудь оба
+        литерала порознь на разные числа, и тест остался бы зелёным. Теперь
+        подъём ОДНОГО экземпляра из двух красит набор немедленно.
         """
-        self.assertIn('"SHTAB_BOX_BUDGET", "8"', _src("pc_orchestrator.py"))
+        # СРАВНИВАЕМ СО СТРОКОЙ, А НЕ СО ВСЕМ ИСХОДНИКОМ: `assertIn` по файлу
+        # вываливает в отчёт весь `pc_orchestrator.py` (под мегабайт), и красный
+        # замок становится нечитаемым ровно тогда, когда его надо прочесть.
+        line = [ln for ln in _src("pc_orchestrator.py").splitlines()
+                if ln.startswith("SHTAB_BOX_BUDGET = ")]
+        self.assertEqual(len(line), 1, line)
+        self.assertIn('"SHTAB_BOX_BUDGET", "%d"' % sb.DAILY_BUDGET, line[0])
+        # …и обратная сторона того же замка: другого числа в этой строке нет —
+        # ни в имени ручки, ни во втором плече `or`.
+        self.assertEqual(re.findall(r"\d+", line[0]), [str(sb.DAILY_BUDGET)] * 2, line[0])
 
 
 class TestLaneDay(unittest.TestCase):
