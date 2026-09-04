@@ -278,20 +278,29 @@ class TestPurity(unittest.TestCase):
                          "urllib", "pathlib", "shutil", "sqlite3", "brain_writer")
     FORBIDDEN_CALLS = ("open", "getenv", "system", "popen", "now", "utcnow", "time")
 
+    # ЧИСТЫХ МОДУЛЕЙ У ЯЩИКА ДВА (04.09.2026): к отбору добавилась ПРИЁМКА
+    # (`shtab_box_accept`). Она судит текст текстом — тело задания против текста
+    # артефакта — и мира ей не нужно ровно так же: диск живёт в руках
+    # (`shtab_box_run.artifact_of`), а сюда приезжает уже прочитанная строка.
+    # Инвариант распространён на неё СРАЗУ, а не «когда-нибудь»: чистота, не
+    # закреплённая с первого дня, теряется первой же удобной правкой.
+    PURE = ("shtab_box.py", "shtab_box_accept.py")
+
     def test_no_world_in_the_pure_module(self):
-        tree = ast.parse(_src("shtab_box.py"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    self.assertNotIn(alias.name.split(".")[0], self.FORBIDDEN_MODULES,
-                                     "чистый модуль завёл мир: %s" % alias.name)
-            if isinstance(node, ast.ImportFrom) and node.module:
-                self.assertNotIn(node.module.split(".")[0], self.FORBIDDEN_MODULES,
-                                 "чистый модуль завёл мир: %s" % node.module)
-            if isinstance(node, ast.Call):
-                name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
-                self.assertNotIn(name, self.FORBIDDEN_CALLS,
-                                 "чистый модуль позвал мир: %s" % name)
+        for name in self.PURE:
+            tree = ast.parse(_src(name))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        self.assertNotIn(alias.name.split(".")[0], self.FORBIDDEN_MODULES,
+                                         "%s завёл мир: %s" % (name, alias.name))
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    self.assertNotIn(node.module.split(".")[0], self.FORBIDDEN_MODULES,
+                                     "%s завёл мир: %s" % (name, node.module))
+                if isinstance(node, ast.Call):
+                    call = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+                    self.assertNotIn(call, self.FORBIDDEN_CALLS,
+                                     "%s позвал мир: %s" % (name, call))
 
     def test_the_module_knows_no_queue_and_no_paths(self):
         body = _src("shtab_box.py")
@@ -336,7 +345,11 @@ class TestReadsOnly(unittest.TestCase):
     READERS = ("read_text", "list_folder")
 
     def test_no_brain_write_call_anywhere_in_the_box(self):
-        for name in ("shtab_box.py", "shtab_box_run.py"):
+        # ПРИЁМКА И ДОЖИМ ПОПАДАЮТ ПОД ТОТ ЖЕ ИНВАРИАНТ (04.09.2026), и это не
+        # формальность: дожим СТАВИТ задачи, то есть у него был бы самый понятный
+        # повод «заодно отметить попытку в документе Штаба». Ни одной такой ветки
+        # нет — и обхода AST теперь не миновать ни одному из трёх файлов ящика.
+        for name in ("shtab_box.py", "shtab_box_run.py", "shtab_box_accept.py"):
             tree = ast.parse(_src(name))
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):

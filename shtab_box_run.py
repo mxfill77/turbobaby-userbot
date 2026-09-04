@@ -82,9 +82,12 @@ import json
 import os
 import sys
 
+import content_product_verifier as v0
+import done_judge_pc
 import recon_auto_run
 import review_intake
 import shtab_box
+import shtab_box_accept as acc
 import shtab_box_signals as sig
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -290,6 +293,118 @@ def read_doc_text(doc_id, reader=None):
 
 
 # ───────────────────────────── очередь ─────────────────────────────
+
+
+def artifact_of(text, root=HERE):
+    """Текст ряда → (текст артефакта, прочитан ли, причина, путь). Только ЧТЕНИЕ диска.
+
+    АДРЕС И ВЫБОР ФАЙЛА — ЧУЖИЕ, И ЭТО УСЛОВИЕ, А НЕ ЭКОНОМИЯ. Адрес читает
+    :func:`done_judge_pc.read_address`, снимок по нему — :func:`done_judge_pc.scan`,
+    «отвечает ли файл словам адреса» — :func:`content_product_verifier.address_hit`.
+    Заведи приёмка своё мнение хоть об одном из трёх, она судила бы НЕ ТОТ файл,
+    который судья закрытия назвал продуктом, — и расхождение это было бы молчаливым.
+
+    ТРИ ИСХОДА, И ТРЕТИЙ НЕ ПРИТВОРЯЕТСЯ ВТОРЫМ: продукт прочитан · по адресу
+    ПУСТО · по адресу НЕСКОЛЬКО файлов, отвечающих словам, и который из них продукт
+    — неизвестно. Оба последних дают «не прочитан», то есть приёмка скажет
+    НЕИЗВЕСТНО и на дожим не отправит: гонять полосу по кругу на своей же
+    неуверенности дороже, чем сказать «не знаю».
+    """
+    addr = done_judge_pc.read_address(text)
+    if not addr:
+        return "", False, "адрес результата задачей не назван — сверять нечего", ""
+    if not addr.get("words"):
+        return "", False, "адрес назван без слов — какой файл продукт, неизвестно", ""
+    now = done_judge_pc.scan(addr, root)
+    if now is None:
+        return "", False, "чтение по адресу сорвалось (папка недоступна)", ""
+    hits = []
+    for path in sorted(now):
+        full = os.path.join(root, path.replace("/", os.sep))
+        body = done_judge_pc._read_text(full, done_judge_pc.MAX_ARTIFACT_BYTES)
+        if v0.address_hit(path, body, addr["words"]):
+            hits.append((path, body))
+    if not hits:
+        return "", False, ("по адресу нет файла, отвечающего словам адреса (%s) — продукта, "
+                           "который можно сверить с пунктами, нет" % addr["words"][:80]), ""
+    if len(hits) > 1:
+        return "", False, ("по адресу %d файла(ов) отвечают словам адреса (%s) — который из них "
+                           "продукт, приёмка не знает"
+                           % (len(hits), ", ".join(p for p, _b in hits[:3]))), ""
+    return hits[0][1], True, "", hits[0][0]
+
+
+def retry_blocks(closed_rows, seen_keys, root=HERE, artifact_fn=None,
+                 attempt_max=acc.ATTEMPT_MAX, body_max=shtab_box.BODY_MAX):
+    """Закрытые ряды ящика → (блоки ДОЖИМА, строки исходов приёмки). Диск только на чтение.
+
+    ПРИЁМКА ЗАХОДИТ ПОСЛЕ ЗАКРЫТИЯ и только к ``done``: провал (``failed``) — это не
+    «закрыто наполовину», а несостоявшийся заход, и о нём говорят сигналы
+    (:mod:`shtab_box_signals`), а не приёмка. Отправлять провал на дожим значило бы
+    завести второй механизм повтора рядом с первым и разойтись с ним молча.
+
+    ПАМЯТЬ У ДОЖИМА ОДНА И ТА ЖЕ — ЖИВАЯ ОЧЕРЕДЬ. Реестра на диске здесь нет ровно
+    по той же причине, по которой его нет у ящика: он не переживает self-update, а
+    дедуп обязан пережить всё. Уже поставленный дожим узнаётся по СВОЕМУ ключу в
+    маркерах (``seen_keys``) — то есть тем же замком, что и всё остальное.
+    """
+    art = artifact_fn or (lambda text: artifact_of(text, root))
+    blocks, notes = [], []
+    # «РЯД ИЗ ЯЩИКА» ОПОЗНАЁТ ОДНА ФУНКЦИЯ НА ПОЛОСЕ — :func:`shtab_box_signals.box_rows`,
+    # тот же маркер, которым живут дедуп и суточный счёт. Она отдаёт УРЕЗАННЫЙ ряд
+    # (номер, день, ключ, статус) и текста задания в нём нет, поэтому здесь она
+    # работает ФИЛЬТРОМ по номерам, а тело берётся из исходного ряда. Своя
+    # регулярка «а не из ящика ли это» завела бы второе мнение о том же вопросе —
+    # и разошлась бы с первым молча.
+    box_ids = {r.get("id") for r in sig.box_rows(closed_rows, statuses=("done",))}
+    for raw in (closed_rows or ()):
+        row = raw if isinstance(raw, dict) else {}
+        try:
+            num = int(row.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if num not in box_ids:
+            continue
+        text = str(row.get("task_text") or "")
+        key = acc.key_of(text)
+        if not key:
+            continue
+        body = acc.body_of(text)
+        art_text, art_ok, art_why, art_path = art(text)
+        verdict = acc.accept(body, art_text, artifact_ok=art_ok, why_unread=art_why)
+        note = {"key": key, "id": row.get("id"), "verdict": verdict["verdict"],
+                "why": verdict["why"], "artifact": art_path, "attempt": acc.attempt_of(key),
+                "card": "", "next": "", "held": ""}
+        if verdict["verdict"] != acc.RETRY:
+            notes.append(note)
+            continue
+        src = acc.source_of(text)
+        nxt, why = acc.retry_key(key, attempt_max=attempt_max)
+        if not nxt:
+            # ПОТОЛОК ПОПЫТОК ИЛИ НЕВОЗМОЖНЫЙ КЛЮЧ — молча не бросаем ни в одном
+            # случае: карточка называет заходы, пункты и способ, которым это
+            # установлено, и решение уходит владельцу.
+            note["card"] = acc.owner_card(key, verdict, attempt=acc.attempt_of(key),
+                                          name=src.get("name"))
+            note["held"] = why
+            notes.append(note)
+            continue
+        if nxt in (seen_keys or ()):
+            note["held"] = "дожим %s уже стои́т в очереди — второй раз не ставим" % nxt
+            notes.append(note)
+            continue
+        new_body, why_body = acc.retry_body(body, verdict["remainder"], acc.attempt_of(key) + 1,
+                                            artifact=art_path, body_max=body_max)
+        if not new_body:
+            note["held"] = why_body
+            notes.append(note)
+            continue
+        note["next"] = nxt
+        notes.append(note)
+        blocks.append({"key": nxt, "body": new_body, "name": src.get("name"),
+                       "id": src.get("id"), "retry": True, "of": key,
+                       "attempt": acc.attempt_of(key) + 1})
+    return blocks, notes
 
 
 class Queue(recon_auto_run.Queue):
@@ -506,6 +621,22 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
             out["taken_by_lane"] = {ln: sum(1 for d, _k in marks if d == today)
                                     for ln, marks in out["lane_marks"].items()}
 
+    # ── ПРИЁМКА И ДОЖИМ ───────────────────────────────────────────────────────
+    # ЗАХОДИТ ТОЛЬКО НА ПРОЧИТАННОМ КОРПУСЕ ЗАКРЫТЫХ РЯДОВ, и это не осторожность
+    # ради осторожности: дожим узнаёт себя по СВОЕМУ ключу в маркерах, и при
+    # непрочитанных маркерах «дожим ещё не ставили» и «мы его не видим» выглядят
+    # одинаково. Поставить на этом дожим значило бы дублировать задание — ровно то,
+    # от чего дедуп и заведён.
+    out["retry"], out["accepted"] = [], []
+    if not out["marks_ok"]:
+        out["accept_why"] = ("приёмка не заходила: закрытые ряды не прочитаны (%s) — сверять "
+                             "нечего и дожимать вслепую нельзя" % (closed_why or "причина не названа"))
+    else:
+        out["retry"], out["accepted"] = retry_blocks(
+            closed_rows, {k for _d, k in out["task_marks"]}, root)
+        out["accept_why"] = ("приёмка: закрытых заданий ящика %d, к дожиму %d"
+                             % (len(out["accepted"]), len(out["retry"])))
+
     # ── ТЕЛА ДОКУМЕНТОВ ───────────────────────────────────────────────────────
     # ПОСЛЕДНЕЕ ЧТЕНИЕ И САМОЕ ИЗБИРАТЕЛЬНОЕ: каждое тело — свой поход в мост.
     # Не читаем у снятого (его не возьмут) и у уже взятого (маркер ключа стои́т в
@@ -629,15 +760,39 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
               "stop": data["stop"], "signals": data["signals"],
               "signals_asked": data["signals_asked"],
               "stop_marks": sig.marks(data["signals"]),
-              "signal_journal": sig.journal_line(data["signals"], today)}
+              "signal_journal": sig.journal_line(data["signals"], today),
+              # ПРИЁМКА ВИДНА В ОТЧЁТЕ ВСЕГДА, включая исход ПРИНЯТО: приёмка,
+              # молчащая при успехе, неотличима от приёмки, которая не работала.
+              "accepted": list(data.get("accepted") or ()),
+              "accept_why": str(data.get("accept_why") or ""),
+              # КАРТОЧКА ВЛАДЕЛЬЦУ РОЖДАЕТСЯ ЗДЕСЬ СТРОКОЙ, А ДОСТАВКИ У НЕЁ ПОКА
+              # НЕТ, и граница названа честно, а не спрятана. Исход «пятая попытка
+              # не принята» ПОСТОЯНЕН: закрытый ряд лежит в очереди вечно, и приёмка
+              # будет рождать эту карточку КАЖДЫЙ виток. Отправлять её без замка
+              # «сказать один раз» значит завалить владельца одной и той же новостью
+              # каждые десять минут — хуже молчания. Замка у ящика нет ни одного
+              # (реестра на диске он не держит сознательно), и заводить его — своя
+              # правка со своим замером. Пока карточка живёт в отчёте и в `--status`,
+              # где её видит человек, открывший ящик.
+              "cards": [str(n.get("card")) for n in (data.get("accepted") or ())
+                        if n.get("card")]}
 
     if data["off"]:
         report["why"] = data["off_why"]
         report["build"] = {k: v for k, v in data.items() if k != "queue"}
         return report
 
+    # ДОЖИМЫ ПОДАЮТСЯ В ОТБОР ПЕРВЫМИ — «доделать начатое важнее, чем начать новое»
+    # (требование задания 04.09 дословно). При потолке витка в одну задачу это и
+    # значит буквально: пока есть чем дожать, новых документов ящик не берёт.
+    # ЛЬГОТЫ ПО СУТОЧНОМУ ПОТОЛКУ У ДОЖИМА НЕТ НИ ОДНОЙ, и отдельной ветки под это
+    # не заведено: у него свой ключ, свой маркер в очереди — значит те же
+    # `markers`, тот же `budget_left`, те же восемь на полосу
+    # (`shtab_box_accept.BUDGET_WORDS` называет это словами для следующего
+    # читающего, чтобы он не счёл отсутствие ветки поблажкой).
     take, held = shtab_box.select(
-        data["docs"], task_marks=data["task_marks"], lane_marks=data["lane_marks"],
+        list(data.get("retry") or []) + list(data["docs"]),
+        task_marks=data["task_marks"], lane_marks=data["lane_marks"],
         today=today, budget=budget,
         owner_busy=bool(data["owner_busy"]), limit=limit,
         marks_ok=bool(data["marks_ok"]), source_ok=bool(data["folder_ok"]),
@@ -675,7 +830,13 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
             report["failed"].append({"key": blk["key"], "why": err, "id": tid, "lane": lane})
             continue
         report["placed"].append({"key": blk["key"], "id": tid, "lane": lane,
-                                 "lane_named": bool(blk.get("lane_named")), "lane_words": words})
+                                 "lane_named": bool(blk.get("lane_named")), "lane_words": words,
+                                 # ДОЖИМ ВИДЕН В СТРОКЕ ИСХОДА, а не только по хвосту
+                                 # ключа: «взято #123» одинаково читается и для нового
+                                 # задания, и для четвёртого захода по старому, а это
+                                 # разные новости для того, кто смотрит на полосу.
+                                 "retry": bool(blk.get("retry")), "of": blk.get("of") or "",
+                                 "attempt": int(blk.get("attempt") or 1)})
         if write_journal:
             (journal_fn or _journal)(shtab_box.index_line(blk, tid, today), repo=root)
 
@@ -768,7 +929,9 @@ def _line(report):
     placed = report.get("placed") or []
     if not placed and not report.get("failed"):
         return ""
-    parts = ["ящик Штаба: взято %d" % len(placed)]
+    retries = sum(1 for r in placed if r.get("retry"))
+    parts = ["ящик Штаба: взято %d%s"
+             % (len(placed), (" (из них дожимов %d)" % retries) if retries else "")]
     for row in placed:
         # ПОЛОСА — В СТРОКЕ ИСХОДА, а не только в журнальном индексе. Эту строку
         # демон кладёт в `cowork_log` и в свой лог; по ней же владелец узнаёт о
@@ -848,6 +1011,18 @@ def _render(report=None, data=None):
         lines.append(shtab_box.digest_line(data["taken_today"] or 0, data["today"],
                                            ok=data["marks_ok"], why=data["marks_why"],
                                            by_lane=data.get("taken_by_lane")))
+        # ПРИЁМКА ПОКАЗЫВАЕТСЯ ВСЕГДА, включая «не заходила» и включая ПРИНЯТО.
+        # Молчащая приёмка неотличима от неработающей, а именно её и завели ради
+        # того, чтобы половинчатое закрытие перестало выглядеть закрытием.
+        lines.append("приёмка: %s" % (data.get("accept_why") or "не считалась"))
+        for note in (data.get("accepted") or ()):
+            lines.append("  · #%s ключ=%s попытка %s → %s: %s%s%s"
+                         % (note.get("id"), note.get("key"), note.get("attempt"),
+                            note.get("verdict"), str(note.get("why") or "")[:200],
+                            (" → дожим ключом %s" % note["next"]) if note.get("next") else "",
+                            (" · %s" % note["held"]) if note.get("held") else ""))
+            if note.get("card"):
+                lines.append("  ⚠ %s" % note["card"])
         # ВСЕ ЧЕТЫРЕ СИГНАЛА В ОДНОМ МЕСТЕ, включая молчащие: перечень, из которого
         # молчащие вычеркнуты, читается как «других сторожей нет».
         if not data["signals_asked"]:
