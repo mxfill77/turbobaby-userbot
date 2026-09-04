@@ -625,6 +625,58 @@ CHAIN_CB_RE = re.compile(r"^chain:(stop|status):(\d+)$")
 # гейтит владельца; действие исполняет zayavki_pc_run своим каналом к Мосту.
 ZAYAVKA_CB_RE = re.compile(r"^zayavka:(yes|no):(\d+)$")
 
+# ── КНОПКИ ВОРОТ КЛИЕНТСКОГО КОНТУРА (05.09.2026) ───────────────────────────────────────────
+# Карточка ворот показывается в теме-инбоксе, а СЛОВО ответа («выкати» / «не выкатывай») читается
+# демоном только из ТЕКСТА ЗАДАЧИ ОЧЕРЕДИ — то есть НЕ там, где карточка показана. Замер 05.09:
+# devbot темы-инбокса на голое слово отвечает «это тема-инбокс подтверждений: „да N“ / „нет N“ или
+# кнопки под карточкой», а слова «выкати» не знает вовсе. Владелец сказал прямо: «я в этой группе
+# вообще ничего нажать не могу» — и был прав, нажимать было не на что.
+#
+# ЧТО ДЕЛАЕТ ТАП: подставляет ТО ЖЕ слово в ТОТ ЖЕ разбор рычага (pc_orchestrator --gate-word).
+# Новых слов не заводит, ворот мимо оснований не открывает, fail-closed не трогает. Хвост
+# callback_data — КОММИТ (hex или иная короткая метка карточки), он идёт в лог и в тост: решение
+# по-прежнему принимается на текущий HEAD, ровно как при ответе словом.
+GATE_CB_RE = re.compile(r"^gate:(yes|no):([0-9A-Za-z._-]{1,48})$")
+GATE_WORDS = {"yes": "выкати", "no": "не выкатывай"}
+# Куда писать словом, если кнопка не дошла. Держим дословно рядом с кнопкой: подсказка обязана
+# уехать владельцу ровно в том месте, где его тап не сработал.
+GATE_ANSWER_AT = ("тема «PC-дев», сообщением «задача: выкати» или «задача: не выкатывай» "
+                  "(в теме-инбоксе голое слово не сработает — только «да N»/«нет N» и кнопки)")
+
+
+def _gate_cb_parse(data):
+    """callback_data кнопки ворот → (action, метка коммита) | None (не наш callback)."""
+    m = GATE_CB_RE.match(str(data or ""))
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _gate_cli(action, commit):
+    """Ответ воротам через демон-CLI (--gate-word «слово»): тот же разбор, что у задачи очереди.
+
+    Субпроцессом и той же механикой, что `_chain_cli`/`_zayavka_cli`, по той же причине: агент не
+    держит ни клиента Моста, ни его секретов — он роутит тап и показывает результат. Слово берём
+    из закрытой таблицы GATE_WORDS: из кнопки в командную строку не уезжает НИЧЕГО, пришедшего
+    из Telegram, — только два литерала, которые владелец мог бы написать и сам.
+    """
+    word = GATE_WORDS.get(action)
+    if not word:
+        return f"ворота {commit}: не понял кнопку ({action})."
+    if not VENV_PY.exists():
+        return f"ворота {commit}: не нашёл python venv ({VENV_PY})."
+    try:
+        r = subprocess.run(
+            [str(VENV_PY), str(REPO_DIR / "pc_orchestrator.py"), "--gate-word", word],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=90, cwd=str(REPO_DIR),
+            creationflags=NO_WINDOW,
+        )
+        out = (r.stdout or "").strip() or (r.stderr or "").strip()
+        return out or (f"ворота {commit}: пустой ответ демона на «{word}». "
+                       f"Запасной путь — {GATE_ANSWER_AT}.")
+    except Exception as e:
+        return (f"ворота {commit}: ответ «{word}» НЕ принят ({type(e).__name__}: {e}). "
+                f"Запасной путь — {GATE_ANSWER_AT}.")
+
 
 def _chain_cb_parse(data):
     """callback_data → (action, pid) | None (не наш callback)."""
@@ -701,10 +753,20 @@ def _chain_cb_route(data, uid):
     """
     parsed = _chain_cb_parse(data)
     zayavka = _zayavka_cb_parse(data)
+    gate = _gate_cb_parse(data)
     if not _chain_cb_authorized(uid):
         # owner-gate раньше разбора: чужому не подсказываем формат кнопок.
         return {"ok": False, "kind": None, "action": None, "pid": None,
                 "answer": "⛔ нет прав", "alert": True, "note": None}
+    if gate is not None:
+        # Кнопка ВОРОТ клиентского контура. Тост говорит РАЗНОЕ про «да» и «нет» намеренно: «да»
+        # только ЗАПИСЫВАЕТ основание (применение пойдёт штатной реконсиляцией), «нет» не применяет
+        # и не откатывает ничего вовсе. Обещать кнопкой «выкатываю» значило бы соврать о вердикте.
+        action, commit = gate
+        return {"ok": True, "kind": "gate", "action": action, "pid": commit,
+                "answer": ("✅ записываю твоё «да»…" if action == "yes"
+                           else "⛔ записываю отказ, ничего не применяю…"),
+                "alert": False, "note": None}
     if zayavka is not None:
         # Кнопка ЗАЯВКИ внешнего канала. Тост говорит про «принято к сведению», а не про
         # «выполняю»: ни один ответ здесь задачи не ставит, и владелец обязан видеть это
@@ -719,7 +781,11 @@ def _chain_cb_route(data, uid):
         return {"ok": False, "kind": None, "action": None, "pid": None,
                 "answer": "карточка устарела", "alert": True,
                 "note": "⚠️ Не разберу кнопку этой карточки (устаревший/битый формат). "
-                        "Пришли «статус» — дам актуальную картинку."}
+                        "Пришли «статус» — дам актуальную картинку.\n"
+                        # Тап по кнопке ВОРОТ, которую мы не разобрали, — это ответ владельца,
+                        # НЕ ставший одобрением. Молча потерять его нельзя: называем словесный
+                        # путь тут же, иначе владелец во второй раз останется без двери.
+                        f"Если это была карточка ворот — ответь словом: {GATE_ANSWER_AT}."}
     action, pid = parsed
     return {"ok": True, "kind": "chain", "action": action, "pid": pid,
             "answer": ("⏹ останавливаю цепь…" if action == "stop" else "📊 читаю статус…"),
@@ -765,7 +831,7 @@ async def on_chain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3) действие исполняет демон / ступень G (свой канал к Bridge), результат — сообщением
     #    в чат карточки. Роутим ПО ВИДУ кнопки: у цепи и у заявки разные исполнители и разные
     #    последствия, и складывать их в один вызов значило бы звать «стоп цепи» на заявке.
-    runner = _zayavka_cli if route.get("kind") == "zayavka" else _chain_cli
+    runner = {"zayavka": _zayavka_cli, "gate": _gate_cli}.get(route.get("kind"), _chain_cli)
     reply = await asyncio.to_thread(runner, route["action"], route["pid"])
     await _chain_reply(context, q, reply)
 

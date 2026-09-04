@@ -10137,6 +10137,9 @@ class TestClientContourGate(Base):
         (o._client_block, o._revizor_finding_touches_client) = self._save_cb   # боевые ворота обратно
         self.cards, self.cows, self.restarts = [], [], []
         o._notify = lambda t, *a, **k: self.cards.append(t)
+        # Карточка ворот с 05.09.2026 уходит СВОЕЙ дверью (_notify_gate_card: коммит + текст), а не
+        # общим _notify. Мокаем обе: голдены ниже читают cards[0] как ТЕКСТ карточки.
+        o._notify_gate_card = lambda c, t, *a, **k: self.cards.append(t)
         o._cowork = lambda t, *a, **k: self.cows.append(t)
         self._save_subj = o._commit_subject
         o._commit_subject = lambda c: "тема коммита"
@@ -10236,7 +10239,7 @@ class TestClientContourGate(Base):
         st, cards = {}, []
         for c in ("staraya-metka", "novaya-metka"):
             o._client_block(["userbot"], c, ["suggest.py"], where="тест", subject="s",
-                            notifier=cards.append, cowork=lambda t: None, state=st,
+                            notifier=lambda _c, t: cards.append(t), cowork=lambda t: None, state=st,
                             reason_fn=lambda x, *a, **k: None, trainer_fn=lambda x: "нет прогона")
         self.assertEqual(len(cards), 2, cards)
 
@@ -10279,7 +10282,7 @@ class TestClientContourGate(Base):
         с `reason_fn`. Иначе владелец видит причину не про тот отказ (живая проба 30.07)."""
         cards = []
         held = o._client_block(["userbot"], "4528917", ["suggest.py"], where="тест", subject="s",
-                               notifier=cards.append, cowork=lambda t: None, state={},
+                               notifier=lambda _c, t: cards.append(t), cowork=lambda t: None, state={},
                                reason_fn=lambda c, *a, **k: None,
                                trainer_fn=lambda c: "вердикт снят на ДРУГОМ коммите (d14d450)")
         self.assertEqual(held, ["suggest.py"])

@@ -1097,6 +1097,27 @@ def _notify_chain_card(pid, text, state_path=None, spawn=None):
     return True
 
 
+def _notify_gate_card(commit, text):
+    """Карточка ВОРОТ клиентского контура — С КНОПКАМИ [✅ Выкатить][⛔ Не выкатывай]
+    (dispatch_notify --gate-card, fire-and-forget). callback ловит pc_agent (owner-gate).
+
+    ЗАЧЕМ ОТДЕЛЬНАЯ ДВЕРЬ, А НЕ ПРЕЖНИЙ `_notify` (05.09.2026). Адрес карточки не меняется ни на
+    байт: его по-прежнему выбирает `dispatch_notify.deliver`, и он по-прежнему инбокс (замер
+    05.09: `deliver(карточка)` → `send_critical` → тема 1160). Меняется РОВНО одно — теперь ответ
+    ПРИНИМАЕТСЯ там же, где карточка показана: до этой правки владелец видел карточку в инбоксе,
+    а слово ответа читалось только из текста задачи очереди, которую инбокс не ставит («я в этой
+    группе вообще ничего нажать не могу», жалоба 05.09). Кнопка ворот новых слов не заводит и
+    оснований не добавляет: тап подставляет ТО ЖЕ слово в ТОТ ЖЕ `_match_command` (--gate-word).
+
+    Сбой доставки тик демона не роняет — как у всех прочих пушей."""
+    try:
+        subprocess.Popen([VENV_PY, DNOTIFY, "--gate-card", str(commit), str(text)], cwd=REPO,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+    except Exception as e:
+        log.warning("карточка ворот не отправлена (%s): %s", commit, e)
+
+
 def _notify_critical(text):
     """Критический инцидент КОНТУРА (доказанная смерть демона / 3-смерти-halt клиент-бота /
     halt-слепота контур-вотчдога) → тема Инбокс HQ-форума (INBOX_TOPIC_ID=1160); личка Филиппа —
@@ -2670,6 +2691,39 @@ def _exec_deny_unclear(text=""):
                     f"и ничего не записал. Повод остался открытым, ворота держат.\n"
                     f"Отказ — одно из слов: «{client_contour.DENY_WORD}», «нет», «отбой», «отказ», "
                     f"«не надо». Выкатка — «выкати».")
+
+
+# Рычаги, которые ВОЛЬНА поднимать кнопка карточки ворот, — и только они. Список закрыт нарочно:
+# `--gate-word` не смеет стать пультом на все команды демона (рестарты боевых ботов кнопкой из
+# инбокса — совсем другой разговор и другая карточка).
+GATE_WORD_CMDS = ("release_client", "deny_client")
+
+
+def gate_word_exec(word, match_fn=None, exec_fn=None):
+    """ОТВЕТ ВОРОТАМ ОДНИМ СЛОВОМ — точка входа для КНОПКИ карточки (pc_agent зовёт CLI после
+    owner-gate). → (ok: bool, текст ответа).
+
+    ЧТО ЭТО ТАКОЕ И ЧЕМ НЕ ЯВЛЯЕТСЯ (05.09.2026). Это НЕ вторая дорога к одобрению: слово идёт в
+    ТОТ ЖЕ `_match_command` и исполняется ТЕМ ЖЕ `_exec_command`, что и слово, приехавшее задачей
+    очереди. Набор принимаемых слов не расширен ни на одно — кнопка лишь ПОДСТАВЛЯЕТ владельцу то
+    слово, которое он и так имел право написать, туда, где его читают. Fail-closed на месте:
+    `_exec_release_client` по-прежнему только ЗАПИСЫВАЕТ основание, а применение идёт штатной
+    реконсиляцией со всеми гейтами.
+
+    ЧУЖОЕ СЛОВО НЕ ТЕРЯЕТСЯ МОЛЧА. Всё, что не рычаг ворот (в т.ч. «рестартни userbot» — рычаг
+    настоящий, но НЕ воротный), получает ОТКАЗ с НАЗВАННЫМ адресом ответа: одобрением оно не
+    становится, и владелец видит, куда писать. Молчание здесь было бы худшим исходом — ровно им
+    и болела карточка до этой правки."""
+    w = str(word or "").strip()
+    cmd = (match_fn or _match_command)(w)
+    if cmd not in GATE_WORD_CMDS:
+        return False, (f"⚠️ «{w or '(пусто)'}» — это не ответ воротам клиентского контура "
+                       f"(разбор дал {cmd or 'не команду'}), поэтому НИЧЕГО не применено и "
+                       f"ничего не записано.\n"
+                       f"Ответ воротам — «выкати» или «{client_contour.DENY_WORD}».\n"
+                       f"ГДЕ ОТВЕЧАТЬ: {client_contour.ANSWER_AT}")
+    status, result = (exec_fn or _exec_command)(cmd, text=w)
+    return status == "done", result
 
 
 def _exec_command(cmd, restart_fn=None, status_fn=None, text=""):
@@ -6609,7 +6663,11 @@ def _client_block(kinds, commit, paths, where, subject=None, notifier=None, cowo
         if muted:
             log.info("ворота контура (%s): карточка владельцу НЕ отправлена — %s", where, why)
             return held
-        (notifier or _notify)(client_contour.card_text(
+        # КАРТОЧКА С КНОПКАМИ (05.09.2026): notifier по умолчанию — `_notify_gate_card`, который
+        # берёт коммит первым доводом. Прежний `_notify` остался у всех остальных пушей; здесь он
+        # заменён потому, что ровно эта карточка ПРОСИТ ОТВЕТА, а ответить на неё из инбокса было
+        # нечем. Инъекция (тесты) принимает ту же пару (commit, text).
+        (notifier or _notify_gate_card)(commit, client_contour.card_text(
             kinds or ["боты"], commit, held,
             subject=subject if subject is not None else (subject_fn or _commit_subject)(commit),
             where=where,
@@ -11930,6 +11988,18 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"цепь #{pid}: статус недоступен ({e})")
             sys.exit(1)
+    elif arg == "--gate-word":
+        # ОТВЕТ ВОРОТАМ КНОПКОЙ карточки (pc_agent зовёт субпроцессом после owner-gate) — тем же
+        # словом и тем же разбором, каким отвечает задача очереди. Ни новых слов, ни новых
+        # оснований: см. gate_word_exec.
+        word = sys.argv[2] if len(sys.argv) > 2 else ""
+        try:
+            ok, msg = gate_word_exec(word)
+        except Exception as e:
+            print(f"ответ воротам не принят ({type(e).__name__}: {e})")
+            sys.exit(1)
+        print(msg)
+        sys.exit(0 if ok else 1)
     elif arg == "--enqueue":
         # ПРЯМОЙ КАНАЛ (этап 1): инъекция одиночки lane=pc прямо в очередь Bridge, минуя splinter.
         # Демон подхватит обычным поллингом. Работает даже при лежащем Splinter/девботе.

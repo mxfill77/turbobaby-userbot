@@ -334,5 +334,115 @@ class TestChainCallbackHandlerGolden(unittest.TestCase):
         self.assertIn("OK:stop:5", bot.sent[0][1])
 
 
+class TestGateCallback(unittest.TestCase):
+    """КНОПКИ ВОРОТ КЛИЕНТСКОГО КОНТУРА (05.09.2026). Повод — жалоба владельца «я в этой группе
+    вообще ничего нажать не могу»: карточка ворот показывалась в теме-инбоксе, а слово ответа
+    читалось только из текста задачи очереди. Кнопка закрывает разрыв, НЕ трогая ворота: тап
+    подставляет ТО ЖЕ слово в ТОТ ЖЕ разбор. Данные берём РЕАЛЬНЫЕ — из dn._gate_markup."""
+
+    OWNER = a.ALLOWED_USER_ID
+    STRANGER = a.ALLOWED_USER_ID + 1
+
+    def _real_cb(self, commit):
+        row = dn._gate_markup(commit)["inline_keyboard"][0]
+        return row[0]["callback_data"], row[1]["callback_data"]      # (да, нет)
+
+    def test_real_callback_data_shape(self):
+        yes, no = self._real_cb("4aadeb0")
+        self.assertEqual((yes, no), ("gate:yes:4aadeb0", "gate:no:4aadeb0"))
+        self.assertLessEqual(max(len(x.encode()) for x in self._real_cb("f" * 40)), 64,
+                             "callback_data не влезает в лимит Telegram")
+
+    def test_owner_yes_routes_to_gate_action(self):
+        yes, _ = self._real_cb("4aadeb0")
+        r = a._chain_cb_route(yes, self.OWNER)
+        self.assertEqual((r["ok"], r["kind"], r["action"], r["pid"]),
+                         (True, "gate", "yes", "4aadeb0"))
+        self.assertTrue(r["answer"])
+
+    def test_owner_no_routes_to_gate_action(self):
+        _, no = self._real_cb("4aadeb0")
+        r = a._chain_cb_route(no, self.OWNER)
+        self.assertEqual((r["ok"], r["kind"], r["action"]), (True, "gate", "no"))
+        self.assertIn("ничего не применяю", r["answer"].lower(),
+                      "тост «нет» обязан честно сказать, что не применяет")
+
+    def test_tost_da_ne_obeschaet_vykatku(self):
+        """«да» ЗАПИСЫВАЕТ основание, применение идёт штатной реконсиляцией. Тост «выкатываю»
+        был бы враньём о вердикте — проверяем, что его нет."""
+        yes, _ = self._real_cb("4aadeb0")
+        self.assertNotIn("выкатываю", a._chain_cb_route(yes, self.OWNER)["answer"].lower())
+
+    # ── ОТРИЦАТЕЛЬНЫЙ: тап НЕ ОТТУДА / не тем — одобрением не становится и не теряется молча ──
+    def test_stranger_gate_tap_ne_ispolnyaetsya(self):
+        yes, _ = self._real_cb("4aadeb0")
+        r = a._chain_cb_route(yes, self.STRANGER)
+        self.assertFalse(r["ok"])
+        self.assertIn("нет прав", r["answer"])
+        self.assertIsNone(r["action"], "чужой тап получил действие")
+
+    def test_bityi_gate_tap_nazyvaet_slovesnyi_adres(self):
+        """Тап по НЕразобранной кнопке ворот — ответ владельца, не ставший одобрением. Молча
+        потерять его нельзя: в пояснении обязан быть словесный адрес ответа."""
+        for bad in ("gate:maybe:abc", "gate:yes:", "gate:yes:" + "z" * 60, "gate:yes"):
+            r = a._chain_cb_route(bad, self.OWNER)
+            self.assertFalse(r["ok"], bad)
+            self.assertIn("PC-дев", r["note"] or "", bad)
+            self.assertIn("задача: выкати", r["note"] or "", bad)
+
+    def test_gate_cli_beret_slovo_iz_zakrytoi_tablicy(self):
+        """Из Telegram в командную строку не уезжает НИЧЕГО: слово — один из двух литералов."""
+        self.assertEqual(a.GATE_WORDS, {"yes": "выкати", "no": "не выкатывай"})
+        self.assertIn("не понял кнопку", a._gate_cli("выкати; rm -rf /", "abc1234"))
+
+
+class TestGateCallbackHandlerGolden(unittest.TestCase):
+    """Сквозной голден: тап по кнопке ворот → ACK + видимое сообщение, действие роутится в
+    ПРАВИЛЬНЫЙ исполнитель (_gate_cli), а не в _chain_cli («стоп цепи» на воротах)."""
+
+    def setUp(self):
+        self._save = (a._gate_cli, a._chain_cli, a._zayavka_cli)
+        self.gate, self.chain = [], []
+        a._gate_cli = lambda action, c: self.gate.append((action, c)) or f"GATE:{action}:{c}"
+        a._chain_cli = lambda action, pid: self.chain.append((action, pid)) or "CHAIN"
+        a._zayavka_cli = lambda action, tid: "ZAYAVKA"
+
+    def tearDown(self):
+        a._gate_cli, a._chain_cli, a._zayavka_cli = self._save
+
+    def _run(self, data, uid):
+        q, bot = _FakeQuery(data, uid), _FakeBot()
+        asyncio.run(a.on_chain_callback(types.SimpleNamespace(callback_query=q),
+                                        types.SimpleNamespace(bot=bot)))
+        return q, bot
+
+    def test_tap_da_uhodit_v_gate_cli(self):
+        yes = dn._gate_markup("4aadeb0")["inline_keyboard"][0][0]["callback_data"]
+        q, bot = self._run(yes, a.ALLOWED_USER_ID)
+        self.assertEqual(len(q.answers), 1)
+        self.assertEqual(self.gate, [("yes", "4aadeb0")])
+        self.assertEqual(self.chain, [], "ворота уехали в исполнитель ЦЕПЕЙ")
+        self.assertIn("GATE:yes:4aadeb0", bot.sent[0][1])
+
+    def test_tap_net_uhodit_v_gate_cli(self):
+        no = dn._gate_markup("4aadeb0")["inline_keyboard"][0][1]["callback_data"]
+        _q, bot = self._run(no, a.ALLOWED_USER_ID)
+        self.assertEqual(self.gate, [("no", "4aadeb0")])
+        self.assertIn("GATE:no:4aadeb0", bot.sent[0][1])
+
+    def test_chuzhoi_tap_nichego_ne_ispolnyaet(self):
+        yes = dn._gate_markup("4aadeb0")["inline_keyboard"][0][0]["callback_data"]
+        q, bot = self._run(yes, a.ALLOWED_USER_ID + 1)
+        self.assertEqual(self.gate, [])
+        self.assertEqual(bot.sent, [])
+        self.assertIn("нет прав", q.answers[0][0])
+
+    def test_knopki_cepei_ne_slomany(self):
+        """Замок: новая ветка не перехватила чужие кнопки."""
+        stop = dn._chain_markup(42)["inline_keyboard"][0][0]["callback_data"]
+        self._run(stop, a.ALLOWED_USER_ID)
+        self.assertEqual((self.chain, self.gate), ([("stop", "42")], []))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

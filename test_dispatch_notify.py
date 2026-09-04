@@ -686,5 +686,46 @@ class TestSessionMetrics(unittest.TestCase):
         self.assertFalse(dn._write_session_metrics(""))
 
 
+class TestGateCardAddress(unittest.TestCase):
+    """АДРЕС КАРТОЧКИ ВОРОТ (05.09.2026). Задание меняет ТОЛЬКО адресность, поэтому голден
+    стережёт обе половины сразу: карточка обязана уехать ТУДА ЖЕ, куда уезжала словом (инбокс), и
+    обязана привезти кнопки — иначе ответить оттуда, где она показана, по-прежнему нечем."""
+
+    def setUp(self):
+        self._save = (dn.send_critical, dn.send_topic)
+        self.crit, self.topic = [], []
+        dn.send_critical = lambda t, m=None: self.crit.append((t, m)) or ("инбокс", True)
+        dn.send_topic = lambda t, tid=None, m=None: self.topic.append((t, tid, m)) or ("328", True)
+
+    def tearDown(self):
+        dn.send_critical, dn.send_topic = self._save
+
+    def test_knopki_vorot_realnye(self):
+        row = dn._gate_markup("4aadeb0")["inline_keyboard"][0]
+        self.assertEqual([b["text"] for b in row], ["✅ Выкатить", "⛔ Не выкатывай"])
+        self.assertEqual([b["callback_data"] for b in row],
+                         ["gate:yes:4aadeb0", "gate:no:4aadeb0"])
+
+    def test_kartochka_s_knopkami_vsegda_v_inboks(self):
+        """ЗАМОК-1: кнопка → инбокс, ЧТО БЫ НИ СЛУЧИЛОСЬ С ПРИЗНАКОМ. Проверяем на тексте,
+        который признак сам по себе отправил бы В ДРУГУЮ тему («задача выполнена» = не ждёт)."""
+        self.assertTrue(dn.locked_to_inbox("задача #1 выполнена", dn._gate_markup("abc1234")))
+        dn.deliver("задача #1 выполнена", dn._gate_markup("abc1234"))
+        self.assertEqual(len(self.crit), 1)
+        self.assertEqual(self.topic, [], "карточка с кнопкой уехала мимо инбокса")
+        self.assertIsNotNone(self.crit[0][1], "кнопки не доехали")
+
+    def test_adres_zhivoi_kartochki_vorot_ne_smestilsya(self):
+        """Живая карточка ворот и БЕЗ кнопок ехала в инбокс (замер 05.09). Правка обязана этот
+        адрес СОХРАНИТЬ, а не переназначить: меняется способ ответа, не место показа."""
+        import client_contour as cc
+        card = cc.card_text(["userbot"], "4aadeb0", ["suggest.py"], where="проба",
+                            trainer_available=True, trainer_note="вердикта нет")
+        dn.deliver(card)                              # как было: без кнопок
+        dn.deliver(card, dn._gate_markup("4aadeb0"))  # как стало: с кнопками
+        self.assertEqual(len(self.crit), 2, "адрес карточки ворот сместился")
+        self.assertEqual(self.topic, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

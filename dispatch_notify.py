@@ -137,6 +137,25 @@ def _chain_markup(pid):
     ]]}
 
 
+def _gate_markup(commit):
+    """Инлайн-клавиатура ворот клиентского контура: [✅ Выкатить][⛔ Не выкатывай]. callback_data
+    «gate:yes:<коммит>» / «gate:no:<коммит>» слушает pc_agent (owner-gate: только владелец).
+
+    ЗАЧЕМ ОНА ВООБЩЕ (05.09.2026). Карточка ворот уезжает в тему-инбокс (deliver → send_critical),
+    а СЛОВО ответа читается на полосе ПК только из ТЕКСТА ЗАДАЧИ ОЧЕРЕДИ — то есть НЕ там, где
+    карточка показана. Кнопка закрывает ровно этот разрыв: она есть в том же сообщении, ловится
+    тем же токеном (AGENT_BOT_TOKEN), и её нажатие ПОДСТАВЛЯЕТ то же самое слово в тот же самый
+    разбор рычага. Новых слов не заводит, ворот мимо оснований не открывает.
+
+    Коммит в callback_data — КОРОТКИЙ (Telegram даёт 64 байта на всё поле): «gate:no:» + 40 hex
+    ещё влезает, но короткий оставляет запас и совпадает с тем, что владелец видит в карточке."""
+    c = str(commit or "")[:40] or "head"
+    return {"inline_keyboard": [[
+        {"text": "✅ Выкатить", "callback_data": f"gate:yes:{c}"},
+        {"text": "⛔ Не выкатывай", "callback_data": f"gate:no:{c}"},
+    ]]}
+
+
 def send(text, reply_markup=None):
     """DM Филиппу; при неудаче — фолбэк в тему 205. Возвращает (channel, ok).
     reply_markup (dict инлайн-клавиатуры) — необязательные кнопки; едут в обоих каналах.
@@ -757,6 +776,17 @@ def main():
             text = " ".join(args[2:]).strip() or f"🧩 Цепь #{pid}"
             channel, ok = deliver(text, _chain_markup(pid))
             _log.info(f"итог(карточка цепи {pid}): channel={channel} ok={ok} | {text[:90]}")
+            sys.exit(0)
+        if args and args[0] == "--gate-card":
+            # КАРТОЧКА ВОРОТ клиентского контура: текст + кнопки [✅ Выкатить][⛔ Не выкатывай].
+            # Адрес не выбираем и не называем руками — его по-прежнему решает deliver; кнопка лишь
+            # включает ЗАМОК-1 (карточка с кнопкой обязана лечь в инбокс), то есть карточка уезжает
+            # ТУДА ЖЕ, куда уезжала словом, и становится отвечаемой ОТТУДА, где показана.
+            commit = args[1] if len(args) > 1 else ""
+            text = " ".join(args[2:]).strip() or f"⛔ Ворота клиентского контура: {commit}"
+            channel, ok = deliver(text, _gate_markup(commit))
+            _log.info(f"итог(карточка ворот {commit}): channel={channel} ok={ok} | {text[:90]}")
+            print(f"channel={channel} ok={int(bool(ok))}")
             sys.exit(0)
         if args and args[0] == "--hook":
             kind = args[1] if len(args) > 1 else ""

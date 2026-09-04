@@ -256,10 +256,14 @@ class GateBase(unittest.TestCase):
             setattr(cc, _a, _v)
             self.addCleanup(lambda a=_a, v=_s: setattr(cc, a, v))
         self.p_notify = mock.patch.object(o, "_notify", lambda t: self.cards.append(t))
+        # Карточка ворот с 05.09.2026 уходит своей дверью (_notify_gate_card: коммит + текст) —
+        # она несёт КНОПКИ, а _notify их не умеет. Голдены ниже читают cards[0] как текст карточки.
+        self.p_gcard = mock.patch.object(o, "_notify_gate_card",
+                                         lambda c, t: self.cards.append(t))
         self.p_cowork = mock.patch.object(o, "_cowork", lambda t: self.cowork.append(t))
         self.p_subj = mock.patch.object(o, "_commit_subject", lambda c: "тема коммита")
         self.p_reason = mock.patch.object(cc, "release_reason", lambda *a, **k: None)
-        for p in (self.p_notify, self.p_cowork, self.p_subj, self.p_reason):
+        for p in (self.p_notify, self.p_gcard, self.p_cowork, self.p_subj, self.p_reason):
             p.start()
             self.addCleanup(p.stop)
         o._apply_restart_at.clear()
@@ -794,6 +798,129 @@ class TestOtkazVladeltsa(unittest.TestCase):
         self.assertIn("«выкати»", txt)
         self.assertIn(cc.DENY_WORD, txt, "дверь отказа обязана быть НАЗВАНА")
         self.assertIn("Отказ ничего не применяет", txt)
+
+
+# ──────── 9. КАРТОЧКА ОТВЕЧАЕТСЯ ОТТУДА ГДЕ ПОКАЗАНА (05.09.2026, жалоба владельца) ────────
+# Повод: «я в этой группе вообще ничего нажать не могу». Замер того же дня
+# (_scratch_card_where_0905/probe_where.py): карточка уезжает в тему-инбокс (deliver →
+# send_critical → 1160), слово ответа читается ТОЛЬКО из текста задачи очереди, а в самом тексте
+# карточки не было НИ ОДНОГО слова про место ответа (9 признаков места из 9 — False).
+
+class TestKartochkaNazyvaetAdresOtveta(unittest.TestCase):
+    """Карточка обязана быть отвечаемой оттуда, где показана: кнопка — основной путь, слово с
+    НАЗВАННЫМ адресом — запасной."""
+
+    def _card(self, **kw):
+        return cc.card_text(["userbot"], "abc1234", ["suggest.py"], where="проба",
+                            trainer_available=True, trainer_note="причина", **kw)
+
+    def test_adres_otveta_nazvan_chelovecheskimi_slovami(self):
+        """ПОЗИТИВ: в карточке есть и кнопка, и запасной словесный адрес — оба человеческими
+        словами, без имён функций и номеров тем в коде."""
+        txt = self._card()
+        self.assertIn("ГДЕ ОТВЕЧАТЬ", txt)
+        self.assertIn("кнопку под этим сообщением", txt)
+        self.assertIn("PC-дев", txt, "запасной адрес обязан быть назван")
+        self.assertIn("«задача: выкати»", txt, "владельцу нужен ТОЧНЫЙ текст сообщения")
+        self.assertIn("«задача: не выкатывай»", txt)
+
+    def test_kartochka_chestno_govorit_chto_slovo_v_inbokse_ne_srabotaet(self):
+        """Замер 05.09: голое слово в теме-инбоксе рычага не поднимает (devbot отвечает «это
+        тема-инбокс подтверждений», слова «выкати» не знает вовсе). Карточка обязана это сказать,
+        иначе владелец пишет слово туда, где его показали, и оно пропадает."""
+        self.assertIn("НЕ", self._card())
+        self.assertIn("инбокс", self._card())
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ 1: карточка без адреса ответа НЕ СОБИРАЕТСЯ ВОВСЕ ──
+    def test_bez_adresa_kartochka_ne_sobiraetsya(self):
+        """Карточка, просящая ответа и молчащая о его месте, — худший вид шума. Поэтому пустой
+        адрес не «карточка без адреса», а отказ собрать её: ValueError на ЛЮБОЙ пустоте."""
+        for bad in ("", "   ", "\n", 0):
+            with self.assertRaises(ValueError, msg=f"собралась без адреса на {bad!r}"):
+                self._card(answer_at=bad)
+
+    def test_none_eto_defolt_polosy_a_ne_pustota(self):
+        """Замолчать адрес можно только ЯВНОЙ пустотой: None — «возьми дефолт», и он непуст."""
+        self.assertIn("ГДЕ ОТВЕЧАТЬ", self._card(answer_at=None))
+        self.assertTrue(cc.ANSWER_AT.strip() and cc.ANSWER_AT_WORDS.strip())
+
+    def test_bez_knopok_kartochka_ne_obeschaet_knopku(self):
+        """Доставка без кнопок (личка-фолбэк) → карточка называет ТОЛЬКО словесный путь. Обещать
+        кнопку, которой владелец не увидит, — та же жалоба, что и была."""
+        txt = self._card(buttons=False)
+        self.assertIn("PC-дев", txt)
+        self.assertNotIn("кнопку под этим сообщением", txt)
+
+    def test_adres_ne_vytesnil_ni_odnogo_prezhnego_fakta(self):
+        """Замок: новая строка ДОБАВЛЕНА, а не подменила собой карточку. Прежние факты на месте."""
+        txt = self._card()
+        for must in ("Коммит: abc1234", "suggest.py", "«выкати»", cc.DENY_WORD,
+                     "git revert --no-edit abc1234", "SUGGEST_TEST_MODE"):
+            self.assertIn(must, txt, f"карточка потеряла «{must}»")
+
+
+class TestOtvetVorotamOdnimSlovom(unittest.TestCase):
+    """`gate_word_exec` — точка входа КНОПКИ. Ворота ею не меняются: тот же разбор, те же слова,
+    тот же исполнитель. Проверяем именно это, а не «кнопка что-то делает»."""
+
+    def test_knopka_da_zovet_tot_zhe_rychag(self):
+        seen = []
+        ok, msg = o.gate_word_exec("выкати",
+                                   exec_fn=lambda cmd, text="": (seen.append((cmd, text)),
+                                                                 ("done", "OK"))[1])
+        self.assertTrue(ok)
+        self.assertEqual(seen, [("release_client", "выкати")])
+        self.assertEqual(msg, "OK")
+
+    def test_knopka_net_zovet_tot_zhe_rychag_otkaza(self):
+        seen = []
+        ok, _ = o.gate_word_exec(cc.DENY_WORD,
+                                 exec_fn=lambda cmd, text="": (seen.append((cmd, text)),
+                                                               ("done", "OK"))[1])
+        self.assertTrue(ok)
+        self.assertEqual(seen, [("deny_client", cc.DENY_WORD)])
+
+    def test_nabor_slov_ne_rasshiren(self):
+        """Замок задания: кнопка не заводит новых слов. Разбор — ЖИВОЙ `_match_command`."""
+        for word in ("выкати", "не выкатывай", "нет", "отбой"):
+            self.assertIn(o._match_command(word), o.GATE_WORD_CMDS, word)
+        self.assertEqual(o.GATE_WORD_CMDS, ("release_client", "deny_client"))
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ 2: ответ НЕ ИЗ ТОГО МЕСТА одобрением не становится и не теряется ──
+    def test_chuzhoe_slovo_ne_odobrenie_i_ne_tishina(self):
+        """Слово, не являющееся ответом воротам, НЕ исполняется (в т.ч. настоящий рычаг рестарта —
+        он не воротный), и владельцу НАЗЫВАЕТСЯ адрес ответа. Молчание тут было бы тем же
+        дефектом, который чиним."""
+        for word in ("рестартни userbot", "статус контура", "не сейчас", "ага", "", "   "):
+            called = []
+            ok, msg = o.gate_word_exec(word, exec_fn=lambda *a, **k: called.append(a) or ("done", "!"))
+            self.assertFalse(ok, f"«{word}» стало одобрением")
+            self.assertEqual(called, [], f"«{word}» что-то исполнило")
+            self.assertIn("ГДЕ ОТВЕЧАТЬ", msg, f"«{word}» потерялось молча")
+            self.assertIn("PC-дев", msg)
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ 3: отказ НИЧЕГО не применяет и НИЧЕГО не откатывает ──
+    def test_otkaz_nichego_ne_primenyaet_i_ne_otkatyvaet(self):
+        """Кнопка «⛔ Не выкатывай» обязана вести себя ровно как слово: пишется СЛЕД, не трогается
+        ни один процесс, ни один коммит, ни одно основание пропуска."""
+        d = tempfile.mkdtemp(prefix="ccgw_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        rel = os.path.join(d, "release.json")
+        restarts, approved = [], []
+        real_deny = cc.deny                     # берём ДО патча: иначе лямбда звала бы сама себя
+        with mock.patch.object(o, "_head_commit", lambda: "abc1234"), \
+             mock.patch.object(o, "_cowork", lambda *a, **k: None), \
+             mock.patch.object(o, "_restart_via_pc_agent",
+                               lambda *a, **k: restarts.append(a) or (True, "x")), \
+             mock.patch.object(cc, "approve", lambda *a, **k: approved.append(a) or (True, "x")), \
+             mock.patch.object(cc, "deny", lambda c, **k: real_deny(c, path=rel, **k)):
+            ok, msg = o.gate_word_exec(cc.DENY_WORD)
+        self.assertTrue(ok)
+        self.assertEqual(restarts, [], "отказ поднял процесс")
+        self.assertEqual(approved, [], "отказ записал ОСНОВАНИЕ пропуска")
+        self.assertIn("Ничего не применяю и не откатываю", msg)
+        self.assertIsNone(cc.release_reason("abc1234", path=rel, trainer_path=rel + ".t", env={}),
+                          "после отказа ворота открылись")
 
 
 # ────────── 8. ПРАВДА ПРО ВЕРДИКТ: три состояния, а не два (05.09.2026) ──────────
