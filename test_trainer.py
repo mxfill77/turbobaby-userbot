@@ -138,19 +138,203 @@ class TestHypotheses(unittest.TestCase):
                "2) Сразу называй цену, не тяни\n"
                "- Предлагай доставку явно\n"
                "Не здоровайся дважды в одном диалоге\n")   # дубль
-        hyps = trainer.parse_hypotheses(raw)
+        # rules=[] — здесь меряем РАЗБОР, а не сверку с книгой (задача 220): книга живая и растёт,
+        # а тест обязан остаться про нумерацию и дедуп.
+        hyps = trainer.parse_hypotheses(raw, rules=[])
         self.assertEqual(len(hyps), 3)
         self.assertEqual(hyps[0], "Не здоровайся дважды в одном диалоге")
         self.assertEqual(hyps[1], "Сразу называй цену, не тяни")
 
     def test_parse_caps_at_limit(self):
         raw = "\n".join(f"правило номер {i}" for i in range(10))
-        self.assertEqual(len(trainer.parse_hypotheses(raw, limit=4)), 4)
+        self.assertEqual(len(trainer.parse_hypotheses(raw, limit=4, rules=[])), 4)
 
     def test_prompt_mentions_both_turns(self):
         system, user = trainer.hypotheses_prompt("сколько стоит?", "300 бат в сутки")
         self.assertIn("сколько стоит?", user)
         self.assertIn("300 бат в сутки", user)
+
+
+# --------------- КОНТЕКСТ ГИПОТЕЗ: книга правил + канон (задача 220) ---------------
+# Живой случай 05.09.2026 02:29 (KB_trainer_log, TEST-11): сборщик видел РОВНО ДВЕ строки и выдал
+# четыре гипотезы, из которых ДВЕ противоречат бизнесу. Обе — ДОСЛОВНО из мозга, не пересказ.
+
+LIVE_0905_BAD_ISLAND = (
+    "Клиент не указал место/остров подачи — бот должен спросить город, а не только район, если "
+    "сервис работает в нескольких локациях; не переходи сразу к району без уточнения.")
+LIVE_0905_BAD_TIME = (
+    "Уточняй точное время подачи/возврата мотобайка при заданных датах, а не только дни — не "
+    "оставляй время аренды неопределённым.")
+LIVE_0905_GOOD_PRICE = (
+    "Проверяй актуальную стоимость и наличие модели в системе перед ответом, а не полагайся на "
+    "общий прайс — не называй цену без подтверждения из базы наличия.")
+LIVE_0905_GOOD_MARK = (
+    "Подтверждай итоговые условия (депозит, шлем, даты) явным списком-чеклистом для клиента, а не "
+    "одной строкой в скобках для внутреннего трекинга.")
+
+
+class TestHypsContext(unittest.TestCase):
+    """Тренер видит книгу правил и факты о компании; вредное владельцу не показывается."""
+
+    def tearDown(self):
+        # Флаги захода — модульные (в модерботе три вызова идут подряд в одном обработчике).
+        # Между тестами их обязан гасить тест, иначе исход одного протекает в рендер другого.
+        trainer._LAST_MISSING = []
+        trainer._LAST_DROPPED = []
+
+    # --- сам контекст -------------------------------------------------------
+
+    def test_canon_carries_the_facts_that_decide_the_live_case(self):
+        """Не «канон непустой», а ИМЕННО те факты, которыми судятся обе вредные гипотезы 05.09."""
+        canon = trainer.business_canon()
+        self.assertTrue(canon, "канон обязан собираться из живых источников кода")
+        self.assertIn("ПХУКЕТЕ", canon)                       # где работаем
+        self.assertIn("Другого города и другого острова", canon)
+        self.assertIn("сроки подготовки или выдачи", canon)    # что НЕ утверждаем (белый список)
+        self.assertIn("точного времени подачи/возврата в брони нет", canon)
+        self.assertIn("весь состав брони", canon)              # поля брони: часов среди них нет
+        self.assertIn("Депозит: либо деньги, либо паспорт", canon)   # критфакты дословно
+
+    def test_prompt_carries_book_canon_and_transcript(self):
+        book = trainer.rules_book()
+        self.assertTrue(book, "книга правил обязана читаться (suggest.load_playbook)")
+        tr = "[клиент]: привет\n[менеджер]: здравствуйте\n[клиент]: adv 350 на неделю"
+        system, user = trainer.hypotheses_prompt("adv 350 на неделю", "ADV 350 — 6 286 ฿",
+                                                 transcript=tr)
+        self.assertIn("ФАКТЫ О КОМПАНИИ", system)
+        self.assertIn("КНИГА ПРАВИЛ БОТА", system)
+        self.assertIn(book.splitlines()[-1].strip(), system)   # книга ЦЕЛИКОМ, не выжимка
+        self.assertIn("привет", user)                          # весь транскрипт, а не одна реплика
+        self.assertIn("adv 350 на неделю", user)
+        self.assertEqual(trainer.last_missing(), [])
+        # Предсмертный взгляд задания: материалы даны для ПРОВЕРКИ, а не для пересказа.
+        self.assertIn("для ПРОВЕРКИ", system)
+        self.assertIn("НЕ для пересказа", system)
+
+    def test_transcript_is_cut_from_the_head_keeping_fresh_turns(self):
+        long_tr = "\n".join("[клиент]: реплика %d" % i for i in range(400))
+        self.assertGreater(len(long_tr), trainer.HYPS_TRANSCRIPT_MAX)
+        _, user = trainer.hypotheses_prompt("свежая", "ответ", canon="К", rules="П",
+                                            transcript=long_tr)
+        self.assertIn("реплика 399", user)                     # хвост уцелел
+        self.assertNotIn("реплика 0\n", user)                  # голова срезана
+        self.assertLess(len(user), len(long_tr))
+
+    # --- ОТРИЦАТЕЛЬНЫЙ ТЕСТ 1: живой случай 05.09 --------------------------
+
+    def test_live_0905_two_harmful_dropped_two_useful_stay(self):
+        """Ответ модели в НОВОМ формате на живом входе: вредные — в «ОТСЕЯНО», годные — владельцу.
+
+        Что здесь доказано машиной: секция «ОТСЕЯНО» до владельца НЕ доезжает ни одной строкой, а
+        канон (тест выше) несёт ровно те факты, которыми обе вредные и судятся. Само суждение
+        «противоречит бизнесу» выносит модель, которая теперь эти факты ВИДИТ, — и это измерено
+        живым прогоном в артефакте, а не здесь."""
+        raw = "\n".join([
+            trainer.HYPS_MARK_KEEP,
+            LIVE_0905_GOOD_PRICE,
+            LIVE_0905_GOOD_MARK,
+            trainer.HYPS_MARK_DROP,
+            LIVE_0905_BAD_ISLAND + " — противоречит факту: работаем только на Пхукете",
+            LIVE_0905_BAD_TIME + " — противоречит факту: времени подачи в брони нет",
+        ])
+        hyps = trainer.parse_hypotheses(raw, rules=[])
+        self.assertEqual(hyps, [LIVE_0905_GOOD_PRICE, LIVE_0905_GOOD_MARK])
+        shown = "\n".join(trainer.hyps_messages(hyps))
+        for bad in ("остров подачи", "точное время подачи"):
+            self.assertNotIn(bad, shown)
+        self.assertEqual(len(trainer.last_dropped()), 2)
+        self.assertIn("Скрыто гипотез: 2", shown)              # владелец видит, что отсев был
+
+    def test_flat_answer_without_markers_parses_as_before(self):
+        """FAIL-SAFE: модель ответила плоским списком (старый формат) — разбор прежний, ничего
+        не теряем. Иначе первый же ответ без секций отдал бы владельцу пустой список."""
+        raw = LIVE_0905_GOOD_PRICE + "\n" + LIVE_0905_GOOD_MARK
+        self.assertEqual(trainer.parse_hypotheses(raw, rules=[]),
+                         [LIVE_0905_GOOD_PRICE, LIVE_0905_GOOD_MARK])
+        self.assertEqual(trainer.last_dropped(), [])
+
+    # --- ОТРИЦАТЕЛЬНЫЙ ТЕСТ 2: дубль правила, которое в книге УЖЕ есть -----
+
+    def test_hypothesis_repeating_existing_rule_is_dropped(self):
+        """Повтор = то, что книга и так отказалась бы принять (suggest._rules_similar — предикат
+        append_playbook_rule). Берём ЖИВОЕ правило книги и подаём его гипотезой."""
+        book = trainer.book_rules_list()
+        self.assertTrue(book, "книга обязана разбираться в список правил")
+        existing = max(book, key=len)
+        fresh = "Не пиши клиенту служебную скобку [собрано: …] — она для менеджера"
+        raw = "\n".join([trainer.HYPS_MARK_KEEP, existing, fresh])
+        hyps = trainer.parse_hypotheses(raw)                   # rules=None → живая книга
+        self.assertNotIn(existing, hyps, "правило из книги владельцу второй раз не показываем")
+        self.assertIn(fresh, hyps, "новая гипотеза обязана уцелеть")
+        why = dict(trainer.last_dropped()).get(existing, "")
+        self.assertTrue(why.startswith("повтор правила книги"), why)
+        self.assertIn("повтор правила книги: 1", "\n".join(trainer.hyps_messages(hyps)))
+
+    def test_near_duplicate_by_meaning_is_dropped_too(self):
+        """«По смыслу», а не только дословно: перефраз правила книги тоже не показываем."""
+        rule = "не дублируй название модели — одно упоминание модели на строку"
+        raw = trainer.HYPS_MARK_KEEP + "\nне дублируй название модели, одно упоминание на строку"
+        self.assertEqual(trainer.parse_hypotheses(raw, rules=[rule]), [])
+        self.assertEqual(len(trainer.last_dropped()), 1)
+
+    def test_fragment_of_a_rule_is_not_a_repeat(self):
+        """Замок соразмерности. Предикат книги считает похожим и ВХОЖДЕНИЕ: слово «коротко» лежит
+        внутри правила стиля целиком. Без замка гипотеза умирала бы об это вхождение — живой
+        промах поймал тест панели тренажёра (кнопок стало 2 вместо 3)."""
+        rule = "Коротко, вежливо, на языке клиента. Один вопрос за раз, без давления."
+        self.assertEqual(trainer.parse_hypotheses("коротко", rules=[rule]), ["коротко"])
+        self.assertEqual(trainer.last_dropped(), [])
+        # а соразмерный повтор того же правила по-прежнему ловится
+        self.assertEqual(trainer.parse_hypotheses(rule, rules=[rule]), [])
+
+    # --- ОТРИЦАТЕЛЬНЫЙ ТЕСТ 3: канон недоступен ---------------------------
+
+    def test_blind_mode_is_said_out_loud_not_silently_old_behaviour(self):
+        """Канон/книга не прочитаны → владелец УЗНАЁТ, что тренер советует вслепую."""
+        system, _ = trainer.hypotheses_prompt("вопрос", "ответ", canon="", rules="",
+                                              transcript="")
+        self.assertIn("ФАКТОВ О КОМПАНИИ СЕЙЧАС НЕТ", system)
+        self.assertIn("КНИГИ ПРАВИЛ СЕЙЧАС НЕТ", system)
+        self.assertNotIn("ФАКТЫ О КОМПАНИИ (бизнес-канон)", system)
+        self.assertEqual(trainer.last_missing(), ["фактов о компании", "книги правил"])
+        parts = trainer.hyps_messages(["гипотеза раз", "гипотеза два"])
+        self.assertIn("ВСЛЕПУЮ", parts[0])
+        self.assertIn("фактов о компании", parts[0])
+        self.assertTrue(parts[-1].startswith(trainer.HYPS_TITLE))   # клавиатура — на последней
+        for p in parts:
+            self.assertLessEqual(len(p), trainer.TG_MSG_LIMIT)
+
+    def test_broken_source_yields_no_book_and_no_facts(self):
+        """Не «канон пустой строкой», а СБОЙ источника: книга — '', критфактов в каноне нет.
+        Тренажёр при этом не падает — исход честный, а не исключение в обработчике."""
+        broken = _BrokenSuggest()
+        self.assertEqual(trainer.rules_book(mod=broken), "")
+        self.assertEqual(trainer.book_rules_list(text=""), [])
+        self.assertNotIn("КРИТИЧНЫЕ ФАКТЫ", trainer.business_canon(mod=broken))
+
+    def test_quiet_path_adds_no_notes(self):
+        """Контекст полный и отсева не было — служебных строк над списком НЕТ (регресс вида)."""
+        trainer.hypotheses_prompt("вопрос", "ответ")
+        trainer.parse_hypotheses(trainer.HYPS_MARK_KEEP + "\nсовсем новая гипотеза про шлемы")
+        parts = trainer.hyps_messages(["одна", "две"])
+        self.assertEqual(len(parts), 1)
+        self.assertTrue(parts[0].startswith(trainer.HYPS_TITLE))
+
+
+class _BrokenSuggest:
+    """Источник, который есть, но не отдаёт ничего (сбой чтения книги/фактов)."""
+
+    KNOWN_MODELS = []
+    _COLL_LABELS = []
+
+    def load_playbook(self):
+        raise OSError("книга не прочитана")
+
+    def _read_park_snapshot(self):
+        raise OSError("снимок парка не прочитан")
+
+    def _bike_key(self, name):
+        return ""
 
 
 # ------------------------------- сессионное состояние + сброс ----------------

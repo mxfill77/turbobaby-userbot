@@ -200,24 +200,308 @@ def strip_thai(text):
 
 # ------------------------------- гипотезы (🎓 Обучить) -----------------------
 
-def hypotheses_prompt(incoming, answer):
-    """(system, user) для LLM-классификатора 1-й оси: 2–4 короткие гипотезы «что не так/что
-    улучшить» в ОТВЕТЕ бота, каждая формой правила. Инъекция call_llm — в тестах."""
-    system = (
-        "Ты — тренер клиентского бота проката мотобайков на Пхукете. Ниже реплика клиента и "
-        "ОТВЕТ бота. Назови от 2 до 4 КОРОТКИХ гипотез, что в ОТВЕТЕ можно улучшить или что не "
-        "так, КАЖДУЮ формой правила на будущее («делай так» / «не делай так»). По одной на "
-        "строку, без нумерации и без вводных слов. Пиши по-русски."
-    )
-    user = f"[клиент]: {incoming}\n[бот]: {answer}"
-    return system, user
+# КОНТЕКСТ ГИПОТЕЗ (задача 220, 05.09.2026). До этой правки сборщик видел РОВНО ДВЕ строки —
+# реплику клиента и ответ бота — и одну строку роли в системной части: ни книги правил, ни фактов
+# о компании. Замер живого случая 05.09 02:29 (KB_trainer_log, TEST-11): из четырёх гипотез две
+# противоречили бизнесу — «спроси город и остров подачи, если сервис работает в нескольких
+# локациях» (работаем только на Пхукете) и «уточняй точное время подачи/возврата» (времени в
+# модели брони нет вовсе, срок считается днями). Лечим тем, ЧТО модель видит, а не вычёркиванием
+# слов после неё: стоп-листа здесь нет и быть не должно.
+#
+# ВСЕ источники контекста — УЖЕ СУЩЕСТВУЮЩИЕ в коде и ЛОКАЛЬНЫЕ (ни одного нового хранилища):
+#   • книга правил — suggest.load_playbook() (файл manager-bot/docs/playbook.md, тот самый, куда
+#     пишет «✔ Применить» через suggest.append_playbook_rule);
+#   • факты о компании — константы КЛИЕНТСКОГО промпта suggest.* (CANON_PARTS ниже): ровно то,
+#     что бот обязан соблюдать, отвечая клиенту;
+#   • парк — suggest._read_park_snapshot() (локальный снимок Лист1) + suggest.KNOWN_MODELS;
+#   • поля брони — suggest._COLL_LABELS (что бот вообще выясняет у клиента);
+#   • диалог — накопительный транскрипт сессии тренажёра (get_transcript), а не одна реплика.
+#
+# СЕТИ ЗДЕСЬ НЕТ СОЗНАТЕЛЬНО. hypotheses_prompt зовётся СИНХРОННО в обработчике модербота
+# (moderation_bot.py: _trainer_callback, ветка «tr:teach»), а приложение собрано без
+# concurrent_updates — любой сетевой вызов отсюда тормозил бы модерацию РЕАЛЬНЫХ клиентов.
+# Поэтому берём только константы и локальные файлы: park_allowlist()/‌_delivery_zone_names()
+# ходят в Bridge и здесь ЗАПРЕЩЕНЫ (районы доставки и так лежат в CRITICAL_FACTS дословно).
+
+# Сколько символов накопленного транскрипта кладём в запрос (хвост — свежие турны).
+HYPS_TRANSCRIPT_MAX = int(os.getenv("TRAINER_HYPS_TRANSCRIPT_MAX", "3000") or "3000")
+
+# Константы клиентского промпта, несущие ФАКТЫ О КОМПАНИИ (в порядке подачи).
+CANON_PARTS = (
+    "CRITICAL_FACTS",             # депозит, прайс-ориентир, тарифы районов Пхукета, Click не сдаём
+    "APPROVAL_WHITELIST_RULE",    # что вообще разрешено утверждать; сроки подготовки/выдачи — нет
+    "AVAILABILITY_INVARIANT_RULE",
+    "GENERATION_DEFAULT_RULE",
+    "PICKUP_RULE",
+    "EXPERIENCE_SAFETY_RULE",
+    "RECEIPT_LEXICON_RULE",
+)
+
+# Две строки, которых В ВИДЕ КОНСТАНТЫ в коде нет, но факты в них — не новые: география взята из
+# роли клиентского промпта (suggest.make_system_prompt: «менеджер проката мотобайков TurboBaby
+# (Пхукет)») и из перечня районов доставки в CRITICAL_FACTS (все районы — Пхукет); «срок днями»
+# следует из состава полей брони (_COLL_LABELS: модель/срок/даты/локация/паспорт/телефон/оплата —
+# часов среди них нет) и из запрета APPROVAL_WHITELIST_RULE утверждать сроки подготовки и выдачи.
+# Новым хранилищем это не является: ни файла, ни узла мозга под них не заводили.
+CANON_GEO = ("ГДЕ РАБОТАЕМ: TurboBaby — прокат мотобайков на ПХУКЕТЕ. Другого города и другого "
+             "острова у компании нет: и выдача, и доставка — только районы Пхукета (перечень "
+             "районов с тарифами — в критичных фактах ниже).")
+CANON_TIME = ("ЧТО ТОЧНО, А ЧТО ПРОМЕЖУТКОМ: точны тариф района доставки и цена/депозит из блока "
+              "ЦЕНА по датам. Промежуток (ориентир, не обещание) — скидки за срок (~6-15% неделя, "
+              "~15-25% две, ~35-50% месяц) и вилка аэропорта 590-690. Срок аренды считается ДНЯМИ: "
+              "часов и точного времени подачи/возврата в брони нет вовсе, сроки подготовки и выдачи "
+              "бот не называет и не фиксирует — их согласует менеджер.")
 
 
-def parse_hypotheses(text, limit=4):
-    """Разобрать ответ LLM в список гипотез (2–4). Срезает нумерацию/маркеры, дедупит, режет по limit."""
+def _suggest_mod():
+    """Модуль suggest ленивым импортом. Недоступен → None (тренажёр не падает)."""
+    try:
+        import suggest
+        return suggest
+    except Exception as e:                                    # pragma: no cover — среда без suggest
+        log.warning("гипотезы: suggest не импортирован (%s) — канон недоступен", type(e).__name__)
+        return None
+
+
+def _park_models(mod):
+    """Модели РЕАЛЬНОГО парка из ЛОКАЛЬНОГО снимка Лист1 — та же выжимка, что park_allowlist_status,
+    но БЕЗ похода в Bridge (см. запрет сети выше). Ничего не прочитали → []."""
+    try:
+        keys = [mod._bike_key(n) for n in mod._read_park_snapshot()]
+        return [disp for disp, key in mod.KNOWN_MODELS if any(key in k for k in keys)]
+    except Exception:
+        return []
+
+
+def business_canon(mod=None):
+    """ФАКТЫ О КОМПАНИИ одним текстом (бизнес-канон для сверки гипотез). Пусто → канона нет,
+    и это ЧЕСТНЫЙ исход: вызывающий обязан сказать владельцу, что советует вслепую."""
+    mod = _suggest_mod() if mod is None else mod
+    if mod is None:
+        return ""
+    out = [CANON_GEO]
+    models = _park_models(mod)
+    if models:
+        out.append("ЧЕМ ОПЕРИРУЕМ (реальный парк, Лист1): " + ", ".join(models)
+                   + ". Моделей вне этого списка у нас нет.")
+    try:
+        fields = ", ".join(lbl[1][0] for lbl in mod._COLL_LABELS)
+        out.append("ЧТО БОТ ВЫЯСНЯЕТ У КЛИЕНТА (весь состав брони): " + fields
+                   + " — и ничего сверх этого списка.")
+    except Exception:
+        pass
+    out.append(CANON_TIME)
+    for name in CANON_PARTS:
+        part = getattr(mod, name, "")
+        if isinstance(part, str) and part.strip():
+            out.append(part.strip())
+    return "\n\n".join(out).strip()
+
+
+def rules_book(mod=None):
+    """Действующая книга правил ЦЕЛИКОМ (тот же файл, куда пишет «✔ Применить»). '' → книги нет."""
+    mod = _suggest_mod() if mod is None else mod
+    if mod is None:
+        return ""
+    try:
+        return mod.load_playbook().strip()      # None/сбой → AttributeError ниже, исход '' честен
+    except Exception:
+        return ""
+
+
+_BOOK_BULLET_RE = re.compile(r"^\s*[-*•]\s*(?:\(\d{4}-\d{2}-\d{2}\)\s*)?(.+)$")
+
+# ЗАМОК СОРАЗМЕРНОСТИ. suggest._rules_similar считает похожими и те пары, где одна строка ЦЕЛИКОМ
+# лежит внутри другой, — для append_playbook_rule это верно (короткое правило уже покрыто длинным),
+# а для гипотезы даёт ложный повтор: слово «коротко» лежит внутри правила стиля «Коротко, вежливо,
+# на языке клиента…», и гипотеза умирала бы об это вхождение. Повтором считаем только соразмерное
+# совпадение: короткая сторона не меньше половины длинной. Порог назван здесь, а не размазан.
+_DUP_SHARE_MIN = 0.5
+
+
+def _repeat_of(hyp, rules, mod):
+    """Правило книги, которое гипотеза повторяет (дословно или по смыслу), иначе None.
+    Предикат — suggest._rules_similar (тот же, которым append_playbook_rule отвечает 'duplicate'),
+    плюс замок соразмерности выше."""
+    similar = getattr(mod, "_rules_similar", None) if mod is not None else None
+    if similar is None:
+        return None
+    norm = getattr(mod, "_norm_rule", None) if mod is not None else None
+    for r in rules:
+        try:
+            if not similar(hyp, r):
+                continue
+        except Exception:
+            continue
+        if norm is not None:
+            a, b = norm(hyp), norm(r)
+            if a and b:
+                short, long = (a, b) if len(a) <= len(b) else (b, a)
+                if len(short) < _DUP_SHARE_MIN * len(long):
+                    continue                   # обрывок правила — не повтор
+        return r
+    return None
+
+
+def book_rules_list(text=None, mod=None):
+    """Правила книги списком — ВСЕ буллеты, а не только раздел «Выученные правила».
+    Повтором считаем совпадение с ЛЮБЫМ действующим правилом: владельцу одинаково бесполезна
+    гипотеза, дублирующая и выученное правило, и правило стиля, написанное рукой."""
+    body = rules_book(mod) if text is None else (text or "")
     out = []
-    seen = set()
+    for ln in body.splitlines():
+        m = _BOOK_BULLET_RE.match(ln)
+        if not m:
+            continue
+        r = m.group(1).strip()
+        if len(r) >= 8 and not r.startswith("("):     # «(реквизиты… пока пусто)» — не правило
+            out.append(r)
+    return out
+
+
+# Что не доехало в контекст ПОСЛЕДНЕГО запроса гипотез и что отсеялось при ПОСЛЕДНЕМ разборе.
+# Кросс-функциональная память одного захода: в модерботе hypotheses_prompt → parse_hypotheses →
+# hyps_messages зовутся подряд в ОДНОМ обработчике, а PTB собран без concurrent_updates (апдейты
+# идут последовательно) — гонки между заходами тут нет. Флаги нужны, чтобы честность («советую
+# вслепую») и отсев доехали до владельца БЕЗ правки вызывающего кода.
+_LAST_MISSING = []
+_LAST_DROPPED = []
+
+
+def last_missing():
+    """Чего не хватило в контексте последнего запроса гипотез: [] — контекст полный."""
+    return list(_LAST_MISSING)
+
+
+def last_dropped():
+    """Что отсеяно при последнем разборе: [(гипотеза, причина)]."""
+    return list(_LAST_DROPPED)
+
+
+HYPS_MARK_KEEP = "ГИПОТЕЗЫ:"
+HYPS_MARK_DROP = "ОТСЕЯНО:"
+
+HYPS_BLIND_NOTE = ("⚠️ Советую ВСЛЕПУЮ: %s — сверить гипотезы с фактами компании и с книгой "
+                   "правил было НЕЧЕМ. Каждую проверяй сам, прежде чем применять.")
+HYPS_DROPPED_NOTE = "🧹 Скрыто гипотез: %d (%s) — они не показаны, потому что не годятся."
+
+
+def hypotheses_prompt(incoming, answer, canon=None, rules=None, transcript=None):
+    """(system, user) для LLM-тренера: 2–4 короткие гипотезы «что не так/что улучшить» в ОТВЕТЕ
+    бота, каждая формой правила.
+
+    ★ Задача 220: в запрос теперь входят ФАКТЫ О КОМПАНИИ (бизнес-канон), ДЕЙСТВУЮЩАЯ КНИГА ПРАВИЛ
+    целиком и НАКОПЛЕННЫЙ транскрипт тренажёрного диалога. Материалы даны для ПРОВЕРКИ, а не для
+    пересказа — так прямо и сказано в задании модели: иначе гипотезы выродятся в выписки из книги
+    (это и есть предсмертный взгляд задания).
+
+    None у canon/rules/transcript = «собери сам из живых источников» (так работает боевой путь,
+    зовущий двумя позиционными аргументами). Явное значение — инъекция для тестов; '' — пусто.
+    """
+    mod = _suggest_mod()
+    canon = business_canon(mod) if canon is None else (canon or "")
+    rules = rules_book(mod) if rules is None else (rules or "")
+    if transcript is None:
+        try:
+            transcript = get_transcript()
+        except Exception:
+            transcript = ""
+    transcript = (transcript or "").strip()
+    if len(transcript) > HYPS_TRANSCRIPT_MAX:                 # режем ГОЛОВУ: свежие турны важнее
+        transcript = "…\n" + transcript[-HYPS_TRANSCRIPT_MAX:]
+
+    missing = []
+    if not canon:
+        missing.append("фактов о компании")
+    if not rules:
+        missing.append("книги правил")
+    global _LAST_MISSING
+    _LAST_MISSING = missing
+
+    head = ("Ты — тренер клиентского бота проката мотобайков на Пхукете. Ниже — факты о компании, "
+            "действующая книга правил бота и диалог тренажёра; замечания нужны к ПОСЛЕДНЕМУ "
+            "ответу бота.")
+    task = ("Назови от 2 до 4 КОРОТКИХ гипотез, что в ПОСЛЕДНЕМ ОТВЕТЕ бота можно улучшить или "
+            "что не так, КАЖДУЮ формой правила на будущее («делай так» / «не делай так»). По "
+            "одной на строку, без нумерации и без вводных слов. Пиши по-русски.")
+    if canon:
+        guard_facts = ("1) ФАКТЫ О КОМПАНИИ. Гипотеза, противоречащая факту, НЕ ГОДИТСЯ: не "
+                       "предлагай спрашивать или обещать то, чего у компании нет, чего она не "
+                       "фиксирует или что уже решено фактом.")
+    else:
+        guard_facts = ("1) ФАКТОВ О КОМПАНИИ СЕЙЧАС НЕТ (источник не прочитан) — сверять гипотезу "
+                       "с бизнесом нечем. Не выдумывай факты о компании и держись того, что видно "
+                       "в самом диалоге.")
+    if rules:
+        guard_rules = ("2) КНИГА ПРАВИЛ. Гипотеза, дословно или по смыслу повторяющая правило, "
+                       "которое в книге УЖЕ ЕСТЬ, НЕ ГОДИТСЯ: владелец его уже написал.")
+    else:
+        guard_rules = ("2) КНИГИ ПРАВИЛ СЕЙЧАС НЕТ (источник не прочитан) — проверить, не записано "
+                       "ли правило раньше, невозможно.")
+    guard = (
+        "ПРЕЖДЕ ЧЕМ НАЗВАТЬ ГИПОТЕЗУ, проверь её по материалам выше.\n"
+        + guard_facts + "\n" + guard_rules + "\n"
+        "Материалы даны для ПРОВЕРКИ, а НЕ для пересказа: гипотеза обязана быть замечанием к "
+        "ЭТОМУ ответу бота. Общие рассуждения, годные к любому ответу, и выписки из книги — не "
+        "гипотезы.\n"
+        "ФОРМАТ ОТВЕТА (строго, две секции):\n"
+        + HYPS_MARK_KEEP + "\n<годные гипотезы, по одной на строку>\n"
+        + HYPS_MARK_DROP + "\n<отвергнутая гипотеза — чему из фактов противоречит или какое "
+        "правило книги повторяет; отвергать нечего — оставь секцию пустой>"
+    )
+    blocks = [head, task, guard]
+    if canon:
+        blocks.append("ФАКТЫ О КОМПАНИИ (бизнес-канон):\n" + canon)
+    if rules:
+        blocks.append("КНИГА ПРАВИЛ БОТА (действующая, целиком):\n" + rules)
+    system = "\n\n".join(blocks)
+
+    user_parts = []
+    if transcript:
+        user_parts.append("ДИАЛОГ ТРЕНАЖЁРА (накопленный транскрипт):\n" + transcript)
+    user_parts.append("ПОСЛЕДНЯЯ ПАРА — замечания нужны к этому ответу бота:\n"
+                      f"[клиент]: {incoming}\n[бот]: {answer}")
+    return system, "\n\n".join(user_parts)
+
+
+def _split_sections(text):
+    """Ответ модели → (годные строки, строки секции «ОТСЕЯНО»). Маркеров нет → всё годное
+    (FAIL-SAFE: старый плоский список разбирается ровно как раньше)."""
+    keep, drop, cur = [], [], None
     for ln in (text or "").splitlines():
+        s = ln.strip()
+        low = s.lower().lstrip("#*- ").strip()
+        if low.startswith(HYPS_MARK_KEEP.lower()):
+            cur = keep
+            s = s.split(":", 1)[1] if ":" in s else ""
+        elif low.startswith(HYPS_MARK_DROP.lower()):
+            cur = drop
+            s = s.split(":", 1)[1] if ":" in s else ""
+        if not s.strip():
+            continue
+        (keep if cur is None else cur).append(s)
+    return keep, drop
+
+
+def parse_hypotheses(text, limit=4, rules=None):
+    """Разобрать ответ LLM в список гипотез (2–4). Срезает нумерацию/маркеры, дедупит, режет по limit.
+
+    ★ Задача 220. Две новые вещи, обе БЕЗ сети и БЕЗ стоп-листа слов:
+      • секция «ОТСЕЯНО» ответа модели владельцу НЕ показывается (её строки — это гипотезы,
+        которые модель сама забраковала по фактам компании, сверяясь с каноном в контексте);
+      • гипотеза, повторяющая правило, которое в книге УЖЕ ЕСТЬ, выбрасывается ДЕТЕРМИНИРОВАННО —
+        предикатом suggest._rules_similar, тем самым, которым append_playbook_rule отвечает
+        'duplicate'. То есть «повтор» здесь ровно то, что книга и так отказалась бы принять.
+    rules=None → взять живую книгу; [] → сверку не делать (чистый разбор).
+    Что выброшено и почему — в last_dropped() (доедет до владельца строкой в hyps_messages)."""
+    keep_lines, drop_lines = _split_sections(text)
+    dropped = [(s, "модель забраковала по фактам компании") for s in drop_lines]
+
+    known = book_rules_list() if rules is None else list(rules or [])
+    mod = _suggest_mod() if known else None
+
+    out, seen = [], set()
+    for ln in keep_lines:
         s = ln.strip().lstrip("-*•").strip()
         s = re.sub(r"^\(?\d+[.)]\s*", "", s).strip()
         if len(s) < 3:
@@ -226,9 +510,15 @@ def parse_hypotheses(text, limit=4):
         if key in seen:
             continue
         seen.add(key)
+        hit = _repeat_of(s, known, mod) if known else None
+        if hit:
+            dropped.append((s, "повтор правила книги: «%s»" % hit[:120]))
+            continue
         out.append(s)
         if len(out) >= limit:
             break
+    global _LAST_DROPPED
+    _LAST_DROPPED = dropped
     return out
 
 
@@ -240,13 +530,36 @@ HYPS_TITLE_CONT = "🎓 …продолжение списка гипотез:"
 _HYPS_CUT = " …[обрезано]"
 
 
-def hyps_messages(hyps, limit=TG_MSG_LIMIT):
+def _hyps_notes(blind=None, dropped=None):
+    """Служебные строки перед списком: честность про недоступный канон и счёт скрытого.
+    None → взять исход последнего захода (last_missing/last_dropped)."""
+    miss = last_missing() if blind is None else list(blind or [])
+    drop = last_dropped() if dropped is None else list(dropped or [])
+    notes = []
+    if miss:
+        notes.append(HYPS_BLIND_NOTE % ("нет " + " и ".join(miss)))
+    if drop:
+        why = []
+        n_book = sum(1 for _, r in drop if str(r).startswith("повтор правила книги"))
+        if n_book:
+            why.append("повтор правила книги: %d" % n_book)
+        if len(drop) - n_book:
+            why.append("против фактов компании: %d" % (len(drop) - n_book))
+        notes.append(HYPS_DROPPED_NOTE % (len(drop), ", ".join(why)))
+    return notes
+
+
+def hyps_messages(hyps, limit=TG_MSG_LIMIT, blind=None, dropped=None):
     """ПОЛНЫЕ тексты гипотез нумерованным списком в САМОМ сообщении (кнопки — только номера
     [1]..[N], их подписи Telegram режет по ширине — читаемость живёт здесь). → список частей;
     клавиатуру вешать на ПОСЛЕДНЮЮ. Нумерация = индекс в hyps (тот же, что в callback_data).
 
     Лимит 4096: список длиннее части рвём ПО ГРАНИЦЕ гипотезы на несколько сообщений (ничего не
-    теряем); только если ОДНА гипотеза длиннее целой части — усекаем её с явным маркером."""
+    теряем); только если ОДНА гипотеза длиннее целой части — усекаем её с явным маркером.
+
+    ★ Задача 220: если канон/книга не прочитаны, ПЕРВОЙ частью идёт честное «советую вслепую» —
+    молчаливого возврата к прежнему поведению быть не должно. Там же счёт скрытых гипотез (сами
+    тексты не показываем — они и отсеяны затем, чтобы не попасть владельцу под палец)."""
     items = [strip_thai(str(h or "").strip()) for h in (hyps or [])]
     parts, cur = [], HYPS_TITLE
     for i, h in enumerate(items):
@@ -259,6 +572,9 @@ def hyps_messages(hyps, limit=TG_MSG_LIMIT):
                 block = block[:max(0, room - len(_HYPS_CUT))] + _HYPS_CUT
         cur += "\n\n" + block
     parts.append(cur)
+    notes = _hyps_notes(blind, dropped)
+    if notes:                       # отдельной ПЕРВОЙ частью: клавиатура остаётся на последней
+        parts.insert(0, "\n\n".join(notes)[:limit])
     return parts
 
 
