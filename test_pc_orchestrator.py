@@ -10841,6 +10841,56 @@ class TestSelfUpdateDepClosure(Base):
                                    doraise=True)
 
 
+# ═══ ТРИ ЧЕЛОВЕЧЕСКИЕ СТРОКИ ЗАКРЫТИЯ — ПРОВОДКА, А НЕ МОДУЛЬ (класс 04.09.2026) ═══════════════
+# Сам сборщик проверяет `test_close_msg_pc` (43 теста, чистая логика). Здесь ровно то, чего
+# чистый набор увидеть не может: КУДА демон кладёт шапку и КОМУ он её не кладёт.
+#
+# Класс заведён по живому провалу гейта самообновления. Замер 04.09: демон стоял на 6700489 с
+# 05:41, четыре перехода подряд (f709d68, ec2c656, c5fae9b, 96ef4a1) провалены одним и тем же
+# набором — 8 красных тестов из 1030. Причина не в кодировке (кракозябры в журнале — только
+# отображение: ребёнок пишет cp1251, `_gate_unittests` декодирует utf-8): шапка легла в поле
+# `result` ВСЕМ рядам подряд и поверх маркера причины, то есть в машинный контракт.
+#
+# ДВЕ СТОРОНЫ, И ОБЕ ОБЯЗАТЕЛЬНЫ. Тесты «шапки нет» без теста «шапка есть» превращают починку в
+# удаление вызова: 1030 стали бы зелёными, а владелец снова читал бы машинную середину отчёта.
+class TestCloseLeadWiring(Base):
+    TASK = ("[от Штаба дата=2026-09-04 ключ=gate-red.0904] ЗАДАНИЕ\n\n"
+            "ЦЕЛЬ. Гейт самообновления снова зелёный, и демон поднимается на свежий код.\n\n"
+            "ЗАПРЕТЫ (стандартный блок): ничего не удалять; .env не читать.\n")
+
+    def test_owner_task_really_gets_the_three_lines(self):
+        """ПОЛОЖИТЕЛЬНЫЙ ЗАМОК: обычная задача владельца шапку ПОЛУЧАЕТ, и техника — ниже."""
+        tid = self.fb.add(task_text=self.TASK)
+        with mock.patch.object(o, "run_task", lambda *a, **k: ("done", "RESULT: ок")):
+            o.process_new()
+        res = self.fb.tasks[tid]["result"]
+        self.assertTrue(res.startswith(o.close_msg_pc.L_ASK), res[:80])
+        self.assertIn("Гейт самообновления снова зелёный", res)
+        self.assertTrue(res.endswith("RESULT: ок"), "отчёт исполнителя обязан ехать ниже шапки")
+
+    def test_reason_marker_keeps_the_first_character_and_the_head_is_still_there(self):
+        """Оба контракта РАЗОМ: ⏱ остаётся первым (его читают `NO_HEAL_PREFIXES`), а три
+        строки — на месте. Проверять их порознь мало: «починка» удалением вызова прошла бы
+        первую проверку, а «починка» снятием keep_first — вторую."""
+        bare = o.TIMEOUT_MARK + " провал [причина=run_timeout · таймаут прогона]: не ответил."
+        tid = self.fb.add(task_text=self.TASK)
+        with mock.patch.object(o, "run_task", lambda *a, **k: ("failed", bare)):
+            o.process_new()
+        res = self.fb.tasks[tid]["result"]
+        self.assertTrue(res.lstrip().startswith(o.NO_HEAL_PREFIXES), res[:80])
+        self.assertIn(o.close_msg_pc.L_ASK, res)
+        self.assertLess(res.index(o.close_msg_pc.L_ASK), res.index("[причина=run_timeout"))
+
+    def test_chain_step_row_stays_bare_for_the_supervisor(self):
+        """Шаг цепи — сырьё надзора, а не сообщение владельцу: его `result` читает
+        `_loc_after_fail` и срезает в 🛑-карту первыми 400 символами. Шапка там пуста по
+        построению (ни раздела «ЦЕЛЬ», ни строки судьи) и вытесняла бы настоящую причину."""
+        sid = self.fb.add(task_text="[шаг 1/2 родитель 9] сделай кусок")
+        with mock.patch.object(o, "run_task", lambda *a, **k: ("failed", "провал шага")):
+            o.process_new()
+        self.assertEqual(self.fb.tasks[sid]["result"], "провал шага")
+
+
 # ═══ ДОКЛАД НА ИСХОДЕ БЮДЖЕТА (класс 22.08.2026) ═══════════════════════════════════════════════
 # Ночь 21→22.08, две задачи, один почерк: работа сдана, а владелец не получил ни слова.
 #   id=21 — потолок 2700с выбран полностью, последний вызов инструмента на −63с. К этой секунде

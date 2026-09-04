@@ -255,6 +255,64 @@ class Prepend(unittest.TestCase):
                     self.assertIsInstance(cm.prepend(body, task, st), str)
 
 
+class KeepFirst(unittest.TestCase):
+    """МАРКЕР ПРИЧИНЫ ОСТАЁТСЯ ПЕРВЫМ СИМВОЛОМ — машинный контракт, не косметика.
+
+    Класс заведён 04.09.2026 по живому провалу: шапка встала поверх ⏱, и гейт шага
+    цепи (`pc_orchestrator._loc_after_fail`, `startswith(NO_HEAL_PREFIXES)`) перестал
+    узнавать таймаут. Проверяем не «красиво ли», а различает ли прибор две вещи,
+    которые обязан различать."""
+
+    MARK = "⏱"                      # ⏱ — тот же символ, что у демона в FAIL_REASONS
+    KEEP = (MARK, "✋", "отклонено Филиппом")
+
+    def _timeout_body(self):
+        return (self.MARK + " провал [причина=run_timeout · таймаут прогона]: claude не ответил "
+                "за 2700s. Следов работы в окне 04.09 10:00–10:45 UTC нет.")
+
+    def test_marker_stays_the_very_first_character(self):
+        out = cm.prepend(self._timeout_body(), TASK, "failed", self.KEEP)
+        self.assertTrue(out.startswith(self.MARK), out[:60])
+
+    def test_head_still_stands_above_the_technical_body(self):
+        # Маркер поднялся НАД шапкой, но техника по-прежнему НИЖЕ трёх строк:
+        # обрезка ест хвост, и человеческое обязано остаться в голове.
+        out = cm.prepend(self._timeout_body(), TASK, "failed", self.KEEP)
+        self.assertLess(out.index(cm.L_ASK), out.index("[причина=run_timeout"))
+        self.assertLess(out.index(cm.L_NEXT), out.index("[причина=run_timeout"))
+
+    def test_body_below_the_head_travels_byte_for_byte(self):
+        body = self._timeout_body()
+        out = cm.prepend(body, TASK, "failed", self.KEEP)
+        self.assertTrue(out.endswith(body[len(self.MARK) + 1:]),
+                        "ниже шапки правится только разделитель после маркера")
+
+    def test_idempotent_with_a_marker_no_second_head(self):
+        once = cm.prepend(self._timeout_body(), TASK, "failed", self.KEEP)
+        self.assertEqual(cm.prepend(once, TASK, "failed", self.KEEP), once)
+        self.assertEqual(once.count(cm.L_ASK), 1)
+
+    def test_unknown_marker_is_not_invented_by_the_module(self):
+        # Набор приходит СНАРУЖИ. Пустой набор — прежнее поведение: шапка первой
+        # строкой даже перед ⏱. Иначе модуль завёл бы свою копию перечня и она
+        # протухла бы на первом новом маркере.
+        out = cm.prepend(self._timeout_body(), TASK, "failed")
+        self.assertTrue(out.startswith(cm.L_ASK))
+        self.assertFalse(out.startswith(self.MARK))
+
+    def test_only_a_leading_marker_is_lifted_not_one_from_the_middle(self):
+        body = "провал: исполнитель написал " + self.MARK + " в середине отчёта"
+        out = cm.prepend(body, TASK, "failed", self.KEEP)
+        self.assertTrue(out.startswith(cm.L_ASK))
+        self.assertTrue(out.endswith(body))
+
+    def test_has_lead_sees_the_head_behind_the_marker(self):
+        once = cm.prepend(self._timeout_body(), TASK, "failed", self.KEEP)
+        self.assertTrue(cm.has_lead(once, self.KEEP))
+        self.assertFalse(cm.has_lead(once), "без набора маркер шапку заслоняет — это и есть баг")
+        self.assertFalse(cm.has_lead(self._timeout_body(), self.KEEP))
+
+
 class Invariants(unittest.TestCase):
     """Замки, которые переживают правку автора."""
 
@@ -281,6 +339,19 @@ class Invariants(unittest.TestCase):
         src = self._src("pc_orchestrator.py")
         self.assertTrue(re.search(r"^import close_msg_pc\b", src, re.M))
         self.assertIn('"close_msg_pc.py"', src)
+
+    def test_the_module_keeps_no_copy_of_the_daemons_marker_set(self):
+        # Перечень маркеров живёт в ОДНОМ месте (`pc_orchestrator.NO_HEAL_PREFIXES`) и приходит
+        # сюда параметром. Копия здесь протухла бы на первом новом маркере — и молча: шапка
+        # снова встала бы поверх него, а красным это стало бы только на гейте самообновления.
+        body = self._src("close_msg_pc.py").split('"""', 2)[-1]
+        for mark in ("⏱", "✋", "📡", "отклонено Филиппом"):
+            self.assertNotIn(mark, body, mark)
+
+    def test_the_daemon_hands_its_own_marker_set_to_the_assembly(self):
+        # Сборка получает набор демона, а не пустой: иначе `keep_first` был бы мёртвой веткой.
+        src = self._src("pc_orchestrator.py")
+        self.assertIn("close_msg_pc.prepend(result, text, status, NO_HEAL_PREFIXES)", src)
 
     def test_the_head_stands_above_the_judges_verdict(self):
         # Весь смысл порядка: режется ХВОСТ, значит человеческое — сверху.
