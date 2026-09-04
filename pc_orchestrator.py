@@ -2527,16 +2527,42 @@ _CMD_RELEASE = re.compile(
     r"^\s*(?:да[,\s]+)?(?:выкат(?:и|ывай)|раскати|примени(?:ть)?)\s*"
     r"(?:это\s+|коммит\s*|правку\s*|на\s+)?\s*(?:клиент\w*|прод\w*|бот\w*|userbot|модербот)?\s*[.!]*\s*$",
     re.I)
+# «НЕТ» воротам клиентского контура (05.09.2026). У карточки была одна дверь, и ответ владельца
+# «нет» не распознавался НИ ОДНОЙ веткой — уходил в headless как дев-задача. Слова выбраны так:
+#   • «не выкатывай» — зеркало самого рычага: та же основа, что у «выкати», спутать нельзя;
+#   • «нет» — ровно то слово, которым владелец ответил живой карточке 05.09 (повод задачи);
+#   • «отбой», «отказ», «отклоняю/отклонить», «не надо», «не применяй», «не раскатывай» — обиходные
+#     формы того же решения.
+# Список ЗАКРЫТЫЙ и якорный (весь текст = ответ): «похоже на отказ» отказом не считается —
+# см. _CMD_RELEASE_DENY_UNCLEAR, который переспрашивает вместо угадывания.
+_CMD_RELEASE_DENY = re.compile(
+    r"^\s*(?:нет|отбой|отказ|отклоняю|отклонить|"
+    r"(?:нет[,\s]+)?не\s+(?:выкат(?:ывай|ывать|ываем|и)|раскатывай|применяй|надо))\s*"
+    r"(?:это\s+|коммит\s*|правку\s*|на\s+)?\s*(?:клиент\w*|прод\w*|бот\w*|userbot|модербот)?\s*[.!]*\s*$",
+    re.I)
+# Ответ ПОХОЖ на отказ, но в закрытый список не входит: временна́я отговорка («не сейчас», «позже»)
+# решением не является. Догадка здесь стоила бы дорого в обе стороны — принять за отказ значит
+# замолчать повод, который владелец хотел отложить на час. Поэтому третий исход: ПЕРЕСПРОСИТЬ.
+# Список тоже закрытый: широкий шаблон («всё, что начинается с „не“») перехватывал бы дев-задачи.
+_CMD_RELEASE_DENY_UNCLEAR = re.compile(
+    r"^\s*(?:стоп|стой|погоди|подожди|отставить|не\s+сейчас|пока\s+нет|нет\s+пока|"
+    r"пока\s+не\s+надо|не\s+надо\s+пока|позже|потом|может\s+позже|не\s+уверен|не\s+знаю|"
+    r"воздержусь|подумаю)\s*[.!?…]*\s*$", re.I)
 
 
 def _match_command(text):
     """Распознать команду-рычаг по якорным паттернам (весь текст = команда). →
-    'restart_userbot'|'restart_moderbot'|'status'|'release_client' | None (не команда → headless-путь)."""
+    'restart_userbot'|'restart_moderbot'|'status'|'release_client'|'deny_client'|'deny_unclear'
+    | None (не команда → headless-путь)."""
     t = str(text or "")
     if _CMD_STATUS.match(t):
         return "status"
     if _CMD_RELEASE.match(t):
         return "release_client"
+    if _CMD_RELEASE_DENY.match(t):
+        return "deny_client"
+    if _CMD_RELEASE_DENY_UNCLEAR.match(t):
+        return "deny_unclear"
     if _CMD_RESTART_UB.match(t):
         return "restart_userbot"
     if _CMD_RESTART_MB.match(t):
@@ -2611,13 +2637,52 @@ def _exec_release_client(head_fn=None, approve_fn=None, cowork=None):
                     f"запрет грязного дерева остаются на месте.")
 
 
-def _exec_command(cmd, restart_fn=None, status_fn=None):
+def _exec_deny_client(head_fn=None, deny_fn=None, cowork=None):
+    """«НЕТ» ВЛАДЕЛЬЦА воротам клиентского контура. → (status, result).
+
+    Ничего не применяет, ничего не откатывает и ничего не открывает: ворота fail-closed и без
+    этого ответа держали бы коммит. Единственный эффект — СЛЕД: строка в журнал (лента) плюс
+    запись рядом с самим поводом, в реестре решений владельца. Без неё «нет» жило до конца чата, а
+    молчание неотличимо от «карточку не увидел»."""
+    commit = (head_fn or _head_commit)()
+    ok, res = (deny_fn or client_contour.deny)(commit)
+    if not ok:
+        return "failed", f"отказ не записан: {res}"
+    closed = res.get("commit") if isinstance(res, dict) else commit
+    shape = (res.get("shape") if isinstance(res, dict) else "") or "форма не запомнена"
+    log.info("ворота контура: владелец ОТКАЗАЛ по поводу %s (%s)", closed, shape)
+    (cowork or _cowork)(f"ворота клиентского контура: владелец сказал «нет» на {closed} "
+                        f"(форма «{shape}») — ничего не применяю, повод закрыт")
+    return "done", (f"🚫 Записал твой отказ по коммиту {closed}. Ничего не применяю и не откатываю "
+                    f"— живые боты остались на прежнем коде, ворота держат как держали.\n"
+                    f"По этому поводу больше не спрошу; ту же форму («{shape}») на других коммитах "
+                    f"буду класть в ленту {client_contour.DENY_MUTE_SEC // 3600} ч. Другой состав "
+                    f"клиентских файлов — спрошу снова.\n"
+                    f"Передумаешь — ответь «выкати»: отказ этого не запрещает.")
+
+
+def _exec_deny_unclear(text=""):
+    """Ответ ПОХОЖ на отказ, но словом из списка не является. → (status, result).
+
+    Догадка тут запрещена в обе стороны: «не сейчас» — это не «нет», а отложенный вопрос.
+    Ничего не пишем и ничего не решаем — ПЕРЕСПРАШИВАЕМ. Повод остаётся открытым, ворота держат."""
+    return "done", (f"❓ Не понял ответ «{str(text or '').strip()}» — как отказ его не засчитываю "
+                    f"и ничего не записал. Повод остался открытым, ворота держат.\n"
+                    f"Отказ — одно из слов: «{client_contour.DENY_WORD}», «нет», «отбой», «отказ», "
+                    f"«не надо». Выкатка — «выкати».")
+
+
+def _exec_command(cmd, restart_fn=None, status_fn=None, text=""):
     """Исполнить команду-рычаг НАПРЯМУЮ (полномочия вотчдога), без headless. → (status, result).
     Рестарт уважает рубильник и штампует анти-флап-реестр (не воюет с авто-применением кода)."""
     if cmd == "status":
         return "done", (status_fn or _contour_status)()
     if cmd == "release_client":
         return _exec_release_client()
+    if cmd == "deny_client":
+        return _exec_deny_client()
+    if cmd == "deny_unclear":
+        return _exec_deny_unclear(text)
     kind = "userbot" if cmd == "restart_userbot" else "moderbot"
     if _stopped():
         return "failed", "рубильник pc_orchestrator.stop активен — рестарт не выполняю"
@@ -3377,7 +3442,7 @@ def process_new():
         return
     cmd = _match_command(text)                 # команда-рычаг? исполняем САМИ, без headless claude
     if cmd:
-        status, result = _exec_command(cmd)
+        status, result = _exec_command(cmd, text=text)
         bc.complete_task(tid, status, result)
         log.info("COMMAND id=%s cmd=%s → %s", tid, cmd, status)
         _cowork(f"задача #{tid} (рычаг {cmd}) → {status} · {_clip(result)}")
@@ -6480,7 +6545,7 @@ def _commit_subject(commit):
 
 def _client_block(kinds, commit, paths, where, subject=None, notifier=None, cowork=None,
                   state=None, reason_fn=None, client_fn=None, subject_fn=None, trainer_fn=None,
-                  route_fn=None):
+                  route_fn=None, asked_fn=None):
     """ВОРОТА клиентского контура. → список клиентских файлов (применять НЕЛЬЗЯ) | [] (можно).
 
     Отказ — не молчание: лог + строка в журнал + карточка владельцу с коммитом, поимённым списком
@@ -6523,7 +6588,10 @@ def _client_block(kinds, commit, paths, where, subject=None, notifier=None, cowo
         # тронуты — они уже отказали выше и вернут `held` в обоих исходах; заморозка глушит ВОПРОС
         # («можно выкатить?»), которого под заморозкой всё равно никто не задаёт, и только его
         # ПОВТОР той же формы. Отказ формы, которой в эту заморозку не было, остаётся карточкой.
-        route, why = (route_fn or client_contour.gate_route)(kinds or ["боты"], held)
+        # Коммит подаётся В АДРЕС (05.09.2026), и только в него: отказ владельца закрывает ПОВОД,
+        # а повод — это «коммит + состав клиентских файлов». Без коммита отказ заглушил бы пару
+        # «дети + файлы» навсегда, и следующий, уже нужный, вопрос владелец не увидел бы никогда.
+        route, why = (route_fn or client_contour.gate_route)(kinds or ["боты"], held, commit=commit)
         muted = route == client_contour.ROUTE_FEED
         (cowork or _cowork)(
             "ворота клиентского контура: применение %s к %s ОСТАНОВЛЕНО (%s) — клиентские файлы: "
@@ -6544,6 +6612,11 @@ def _client_block(kinds, commit, paths, where, subject=None, notifier=None, cowo
             # 30.07 — карточка говорила «прогона не было» на подложенный чужой вердикт).
             trainer_available=client_contour.trainer_enabled(),
             trainer_note=(trainer_fn or client_contour.trainer_status)(commit)))
+        # ПОВОД ЗАПОМИНАЕТСЯ РОВНО ЗДЕСЬ — там, где вопрос ЗАДАН (05.09.2026). Ответ «нет» приедет
+        # отдельной задачей, формы в себе не несёт, а HEAD к тому времени успевает уехать: без этой
+        # записи отказ закрыл бы не тот повод. В ленту ушедший отказ повода не открывает — потому и
+        # не запоминается: спросили — записали, промолчали — нечего закрывать.
+        (asked_fn or client_contour.remember_asked)(commit, kinds or ["боты"], held)
     return held
 
 

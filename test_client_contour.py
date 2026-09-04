@@ -665,5 +665,213 @@ class TestZamorozkaVorot(unittest.TestCase):
         self.assertEqual(routes.count(cc.ROUTE_CARD), 14)
 
 
+# ────────── 7. «НЕТ» ВЛАДЕЛЬЦА: у карточки две двери (05.09.2026) ──────────
+# Живой повод: владелец ответил на карточку ворот «нет» и не получил НИЧЕГО — разбор такого ответа
+# не знал, записи не осталось, а молчание (которое работает как отказ) неотличимо от «не увидел
+# карточку». Здесь стережём ровно три вещи: отказ ОСТАВЛЯЕТ СЛЕД, отказ НИЧЕГО НЕ ОТКРЫВАЕТ и отказ
+# НЕ ВЕЧЕН.
+
+class TestOtkazVladeltsa(unittest.TestCase):
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix="cc_deny_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        self.rel = os.path.join(d, "client_release.json")
+        self.tr = os.path.join(d, "trainer_green.json")
+        self.flag = os.path.join(d, "pc_orchestrator.contour_frozen")
+        self.seen = os.path.join(d, "gate_seen.json")
+
+    def _route(self, kinds, held, commit, **kw):
+        return cc.gate_route(kinds, held, flag=self.flag, path=self.seen, commit=commit,
+                             release_path=self.rel, **kw)
+
+    # ── след ──
+    def test_otkaz_ostavlyaet_sled_ryadom_s_povodom(self):
+        """Запись живёт в ТОМ ЖЕ реестре решений, что и «да»: одна развилка — одно место."""
+        ok, rec = cc.deny("abc1234", path=self.rel, now=100.0, kinds=["userbot"], held=["suggest.py"])
+        self.assertTrue(ok)
+        self.assertEqual(rec["commit"], "abc1234")
+        self.assertEqual(rec["shape"], "userbot|suggest.py")
+        self.assertEqual(cc.owner_denied("abc1234", path=self.rel)["who"], "owner")
+        with open(self.rel, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertIn("denied", d)
+        self.assertEqual(cc.owner_denied("d14d450", path=self.rel), {}, "чужой коммит не закрыт")
+
+    def test_povod_berjotsya_iz_zadannogo_voprosa(self):
+        """Ответ «нет» приезжает отдельной задачей и формы в себе не несёт, а HEAD успевает уехать.
+        Значит закрывается ПОВОД, о котором спросили, а не то, что случайно лежит в HEAD."""
+        cc.remember_asked("abc1234", ["userbot", "moderbot"], ["suggest.py"], path=self.rel, now=50.0)
+        ok, rec = cc.deny("f00dfee", path=self.rel, now=100.0)      # HEAD уже другой
+        self.assertTrue(ok)
+        self.assertEqual(rec["commit"], "abc1234", "закрыт повод, о котором спрашивали")
+        self.assertEqual(rec["shape"], "moderbot,userbot|suggest.py")
+
+    def test_ne_hesh_otkazom_ne_stanovitsya(self):
+        ok, msg = cc.deny("не-коммит", path=self.rel)
+        self.assertFalse(ok)
+        self.assertIn("не похоже", msg)
+
+    # ── ОТРИЦАТЕЛЬНЫЙ №1: отказ не открывает НИЧЕГО ──
+    def test_posle_otkaza_primenenie_kommita_detyam_nevozmozhno(self):
+        """Главный замок задания: «нет» — это расписка, а не рычаг. После него оснований как не
+        было, так и нет; ворота держат тот же коммит, а `_client_block` возвращает клиентские файлы
+        (то есть применять НЕЛЬЗЯ) ровно как до отказа."""
+        cc.deny("abc1234", path=self.rel, now=100.0, kinds=["userbot"], held=["suggest.py"])
+        self.assertFalse(cc.owner_approved("abc1234", path=self.rel))
+        self.assertIsNone(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr, env={}))
+        held = o._client_block(["userbot"], "abc1234", ["suggest.py"], "проба",
+                               notifier=lambda *a, **k: None, cowork=lambda *a, **k: None,
+                               state={}, client_fn=lambda p: list(p),
+                               reason_fn=lambda c: cc.release_reason(c, path=self.rel,
+                                                                     trainer_path=self.tr, env={}),
+                               subject_fn=lambda c: "", trainer_fn=lambda c: "",
+                               route_fn=lambda k, h, **kw: self._route(k, h, "abc1234"),
+                               asked_fn=lambda *a, **k: (True, ""))
+        self.assertEqual(held, ["suggest.py"], "после отказа файл всё так же НЕ применяем")
+
+    def test_otkaz_ne_trogaet_reestr_verdikta(self):
+        """Состояние ворот отказом не правится: файл вердикта тренажёра не создан и не изменён."""
+        cc.deny("abc1234", path=self.rel, now=100.0, kinds=["userbot"], held=["suggest.py"])
+        self.assertFalse(os.path.exists(self.tr), "отказ создал файл вердикта")
+
+    # ── повод закрыт, но не навсегда ──
+    def test_po_etomu_povodu_bolshe_ne_sprashivaem(self):
+        r0, _ = self._route(["userbot"], ["suggest.py"], "abc1234")
+        self.assertEqual(r0, cc.ROUTE_CARD, "до отказа — карточка, как было")
+        cc.deny("abc1234", path=self.rel, now=100.0, kinds=["userbot"], held=["suggest.py"])
+        r1, why = self._route(["userbot"], ["suggest.py"], "abc1234")
+        self.assertEqual(r1, cc.ROUTE_FEED)
+        self.assertIn("«нет» на этот повод", why)
+
+    def test_otkaz_glushit_i_bez_zamorozki(self):
+        """«Нет» — ответ на конкретный вопрос, и ручка заморозки к нему отношения не имеет."""
+        self.assertFalse(cc.frozen(self.flag))
+        cc.deny("abc1234", path=self.rel, now=100.0, kinds=["userbot"], held=["suggest.py"])
+        self.assertEqual(self._route(["userbot"], ["suggest.py"], "abc1234")[0], cc.ROUTE_FEED)
+        self.assertFalse(os.path.exists(self.seen), "реестр форм заморозки тут ни при чём")
+
+    def test_ta_zhe_forma_na_drugom_kommite_v_lentu(self):
+        cc.deny("abc1234", path=self.rel, now=100.0, kinds=["userbot"], held=["suggest.py"])
+        r, why = self._route(["userbot"], ["suggest.py"], "d14d450", now=100.0 + 3600)
+        self.assertEqual(r, cc.ROUTE_FEED)
+        self.assertIn("ту же форму", why)
+
+    def test_otkaz_ne_vechen_dlya_pary_deti_plus_faily(self):
+        """ПРЕДСМЕРТНЫЙ ВЗГЛЯД задания: сделай отказ вечным для пары «дети + файлы» — и следующий,
+        уже НУЖНЫЙ, вопрос владелец не увидит никогда. Через DENY_MUTE_SEC карточка возвращается."""
+        cc.deny("abc1234", path=self.rel, now=100.0, kinds=["userbot"], held=["suggest.py"])
+        pozdno = 100.0 + cc.DENY_MUTE_SEC + 1
+        self.assertEqual(self._route(["userbot"], ["suggest.py"], "d14d450", now=pozdno)[0],
+                         cc.ROUTE_CARD, "через сутки та же форма на НОВОМ коммите снова громкая")
+
+    def test_novaya_forma_sprashivaet_srazu(self):
+        """«Новый коммит с новой формой спросить вправе» — и не ждёт никаких суток."""
+        cc.deny("abc1234", path=self.rel, now=100.0, kinds=["userbot"], held=["suggest.py"])
+        self.assertEqual(self._route(["userbot"], ["suggest.py", "price_gate.py"], "d14d450",
+                                     now=100.0 + 60)[0], cc.ROUTE_CARD)
+        self.assertEqual(self._route(["userbot", "moderbot"], ["suggest.py"], "d14d450",
+                                     now=100.0 + 60)[0], cc.ROUTE_CARD)
+
+    def test_nechitaemyi_reestr_znachit_gromko(self):
+        """FAIL-LOUD, как у реестра форм: не смогли прочитать решения → спрашиваем, а не молчим."""
+        cc.deny("abc1234", path=self.rel, now=100.0, kinds=["userbot"], held=["suggest.py"])
+        with mock.patch.object(cc, "_load", return_value={}):
+            self.assertEqual(self._route(["userbot"], ["suggest.py"], "abc1234")[0], cc.ROUTE_CARD)
+
+    def test_peredumal_da_posle_neta_rabotaet(self):
+        """Отказ закрывает повод, а не право владельца передумать: «выкати» после «нет» открывает."""
+        cc.deny("abc1234", path=self.rel, now=100.0, kinds=["userbot"], held=["suggest.py"])
+        cc.approve("abc1234", path=self.rel)
+        self.assertEqual(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr, env={}),
+                         "owner")
+        self.assertTrue(cc.owner_denied("abc1234", path=self.rel), "история решения не стёрта")
+
+    # ── карточка называет ОБА ответа ──
+    def test_kartochka_nazyvaet_oba_otveta(self):
+        txt = cc.card_text(["userbot"], "abc1234", ["suggest.py"], where="проба",
+                           trainer_available=True, trainer_note="причина")
+        self.assertIn("«выкати»", txt)
+        self.assertIn(cc.DENY_WORD, txt, "дверь отказа обязана быть НАЗВАНА")
+        self.assertIn("Отказ ничего не применяет", txt)
+
+
+# ────────── 8. ПРАВДА ПРО ВЕРДИКТ: три состояния, а не два (05.09.2026) ──────────
+# Живой замер 05.09: единственная зелёная запись ящика — на 74be777 (12 кейсов, corpus_sha
+# 98ad5e3e…), а на диске корпус на 16 кейсов (6d5d78f0…). Вердикт не открывает даже сам 74be777,
+# но карточка звала его «последним зелёным» — то есть верила файлу на слово ровно там, где сам
+# вердикт файлу не верит.
+
+class TestPravdaProVerdikt(unittest.TestCase):
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix="cc_verd_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        self.tr = os.path.join(d, "trainer_green.json")
+        self.cases = os.path.join(d, "trainer_cases.json")
+        with open(self.cases, "w", encoding="utf-8") as f:
+            json.dump({"cases": [{"id": i} for i in range(16)]}, f)
+
+    def _put(self, key, **kw):
+        rec = {"result": "green", "commit": key, "checks_passed": 224, "checks_total": 224,
+               "cases": 12, "cases_total": 12, "runs": 2, "clean": True,
+               "corpus_sha": cc.corpus_sha(self.cases), "when": "2026-09-04 12:00:00"}
+        rec.update(kw)
+        d = {}
+        if os.path.exists(self.tr):
+            with open(self.tr, encoding="utf-8") as f:
+                d = json.load(f)
+        d.setdefault("green", {})[key] = rec
+        with open(self.tr, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+
+    def _status(self, commit):
+        return cc.trainer_status(commit, path=self.tr, env={}, cases_path=self.cases)
+
+    # ── ОТРИЦАТЕЛЬНЫЙ №3 ──
+    def test_verdikt_s_chuzhim_korpusom_zelenym_ne_zovetsya(self):
+        """Запись есть, но снята на ДРУГОМ корпусе — значит не открывает НИ ОДНОГО коммита, и
+        словом «зелёный» её называть нельзя ни на своём коммите, ни на чужом."""
+        self._put("74be777", corpus_sha="98ad5e3e2c256542")
+        self.assertFalse(cc.trainer_verdict("74be777", path=self.tr, env={}, cases_path=self.cases)[0])
+        why = self._status("4aadeb0")
+        self.assertIn("НИ НА ОДНОМ", why)
+        self.assertIn("корпус кейсов не тот", why)
+        self.assertNotIn("последний зелёный", why)
+        self.assertNotIn("ДЕЙСТВУЮЩИЙ зелёный", why)
+
+    def test_tri_sostoyaniya_razlichimy(self):
+        """Требование задания дословно: вердикта нет вовсе · есть, но на другом коммите · есть и
+        на этом. Раньше первые два состояния сливались в одну обнадёживающую строку."""
+        self.assertIn("прогона не было", self._status("4aadeb0"))          # (1) нет вовсе
+        self._put("74be777")                                                # (2) есть, но чужой
+        why2 = self._status("4aadeb0")
+        self.assertIn("ДЕЙСТВУЮЩИЙ зелёный — на 74be777", why2)
+        self.assertIn("на этот коммит нет", why2)
+        self._put("4aadeb0")                                                # (3) есть и на этом
+        ok, why3 = cc.trainer_verdict("4aadeb0", path=self.tr, env={}, cases_path=self.cases)
+        self.assertTrue(ok)
+        self.assertIn("зелёный: кейсов", why3)
+
+    def test_zhivoi_sluchai_05_09_kartochka_ne_obnadezhivaet(self):
+        """Реплей живого случая: ящик держит 74be777 на 12-кейсовом корпусе, на диске — 16-кейсовый.
+        Карточка обязана сказать правду «зелени нет нигде», а не «зелень есть, но не тут»."""
+        self._put("74be777", corpus_sha="98ad5e3e2c256542")
+        txt = cc.card_text(["userbot", "moderbot"], "4aadeb0", ["suggest.py"], where="проба",
+                           trainer_available=True, trainer_note=self._status("4aadeb0"))
+        self.assertIn("НИ НА ОДНОМ", txt)
+        self.assertNotIn("последний зелёный — на 74be777", txt)
+
+    def test_pravila_sravneniya_korpusa_ne_oslableny(self):
+        """Замок задания: несовпадение корпуса и дальше означает «вердикта нет» — на своём коммите
+        тоже, и ни одна новая ветка этого не смягчает."""
+        for bad in ({"corpus_sha": "0" * 16}, {"runs": 1}, {"clean": False}, {"cases": 3},
+                    {"checks_passed": 95}, {"result": "unknown"}):
+            self._put("74be777", **bad)
+            self.assertFalse(cc.trainer_verdict("74be777", path=self.tr, env={},
+                                                cases_path=self.cases)[0], f"открылось на {bad}")
+            self.assertNotIn("ДЕЙСТВУЮЩИЙ зелёный", self._status("4aadeb0"), f"назвали зелёным: {bad}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

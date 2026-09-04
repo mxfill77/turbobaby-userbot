@@ -62,6 +62,9 @@ FAIL-CLOSED. Не удалось построить граф (нет входн�
     mentions(text)             → (клиентский?, что названо, определимо?) — для ворот ВХОДА (ревизор)
     release_reason(commit)     → 'owner' | 'trainer' | None — основание пропуска ворот
     approve(commit)            → записать «да» владельца
+    deny(commit)               → записать «нет» владельца (НИЧЕГО не открывает, закрывает повод)
+    owner_denied(commit)       → запись отказа на этот коммит | {}
+    remember_asked(...)        → запомнить ПОВОД, о котором спросили карточкой
     trainer_verdict(commit)    → (зачтён?, дословная причина) — ВТОРОЕ основание
     trainer_status(commit)     → строка причины для карточки владельцу
     card_text(...)             → дословный текст карточки владельцу
@@ -365,6 +368,130 @@ def owner_approved(commit, path=None):
     return isinstance(ap, dict) and c in ap
 
 
+# ------------------------- «НЕТ» ВЛАДЕЛЬЦА (класс 05.09.2026) -----------------
+# ЗАЧЕМ. У карточки ворот была ОДНА дверь: принимался только ответ «выкати». Владелец, ответивший
+# «нет», не получал ничего — ни расписки, ни следа: его решение существовало ровно до конца чата.
+# Молчание при этом работает как отказ (ворота fail-closed), но молчание НЕОТЛИЧИМО от «не увидел
+# карточку», и через месяц по журналу нельзя сказать, решение это было или недосмотр.
+#
+# ЧЕГО ОТКАЗ НЕ ДЕЛАЕТ, и это главное: он НИЧЕГО НЕ ОТКРЫВАЕТ и НИЧЕГО НЕ ПРИМЕНЯЕТ. `release_reason`
+# сюда не заглядывает ни одной веткой — ворота как держали, так и держат; отказ лишь ЗАКРЫВАЕТ ПОВОД
+# (перестаёт спрашивать о том, о чём уже спросили) и оставляет СЛЕД.
+#
+# ПОЧЕМУ ЗАПИСЬ ЖИВЁТ В ТОМ ЖЕ РЕЕСТРЕ, что и «да» (RELEASE_FILE, ключ `denied` рядом с `approved`):
+# это ОДНА развилка и одно решение владельца о ОДНОМ коммите, и разносить два исхода по разным
+# файлам значило бы дать им разную судьбу при ротации и разное время жизни. Файл вердикта тренажёра
+# (TRAINER_GREEN_FILE) здесь не участвует ВООБЩЕ: состояние ворот отказом не правится.
+#
+# ПОЧЕМУ ОТКАЗ НЕ ВЕЧЕН — и почему это не мелочь. Заглушить пару «дети + файлы» навсегда значит
+# сделать так, что СЛЕДУЮЩИЙ, уже нужный, вопрос о выкатке владелец не увидит никогда. Поэтому
+# тишина двухслойная:
+#   • ТОТ ЖЕ ПОВОД (тот же коммит + та же форма) — не спрашиваем больше никогда: это дословно тот
+#     вопрос, на который ответ уже дан;
+#   • ТА ЖЕ ФОРМА на ДРУГОМ коммите — в ленту, но лишь DENY_MUTE_SEC. Сутки выбраны замером полосы:
+#     класс 21.08 дал 14 карточек ОДНОЙ формы за сутки, а темп полосы — 4.3 закрытых задачи в сутки,
+#     то есть «нет», сказанное вчера, относится к вчерашнему состоянию дерева. Одна карточка на
+#     форму в сутки — это не залп, а молчание длиннее суток уже было бы забвением.
+DENY_MUTE_SEC = 24 * 3600
+
+
+def remember_asked(commit, kinds, held, path=None, now=None):
+    """Запомнить ПОВОД, о котором владельца СПРОСИЛИ карточкой: коммит + форма отказа.
+
+    Нужен потому, что ответ «нет» приходит ОТДЕЛЬНОЙ задачей и формы в себе не несёт, а HEAD к тому
+    времени мог уехать. Память процесса тут не годится: демон перезапускается self-update'ом по
+    нескольку раз в сутки. → (ok, причина сбоя). Не записали — не страшно: отказ тогда закроет
+    повод по HEAD, то есть у́же, а не шире (fail-closed в сторону «спросим снова»)."""
+    path = path or RELEASE_FILE
+    d = _load(path)
+    d["asked"] = {"commit": short(commit) or str(commit or ""),
+                  "shape": refusal_shape(kinds, held),
+                  "ts": time.time() if now is None else now}
+    try:
+        with io.open(path, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=0)
+    except OSError as e:
+        return False, f"повод не запомнен: {e}"
+    return True, d["asked"]["commit"]
+
+
+def asked(path=None):
+    """Открытый повод (последняя отправленная карточка ворот) → dict | {}."""
+    a = _load(path or RELEASE_FILE).get("asked")
+    return a if isinstance(a, dict) else {}
+
+
+def deny(commit, who="owner", path=None, now=None, kinds=None, held=None):
+    """Записать «НЕТ» владельца на коммит. → (ok, запись | причина).
+
+    Ворота не трогает НИ ОДНОЙ веткой: это расписка о решении, а не основание. Коммит и форму
+    берём из открытого повода (о нём и спрашивали), а `commit` — фолбэк на случай, когда повода в
+    реестре нет."""
+    path = path or RELEASE_FILE
+    d = _load(path)
+    a = d.get("asked") if isinstance(d.get("asked"), dict) else {}
+    c = short(a.get("commit")) or short(commit)
+    if not c:
+        return False, f"не похоже на коммит: {commit!r}"
+    shape = str(a.get("shape") or "") if short(a.get("commit")) == c else ""
+    if not shape and (kinds or held):
+        shape = refusal_shape(kinds, held)
+    rec = {"who": who, "ts": time.time() if now is None else now, "shape": shape}
+    dn = d.get("denied") if isinstance(d.get("denied"), dict) else {}
+    dn[c] = rec
+    if len(dn) > _KEEP:
+        for k, _v in sorted(dn.items(), key=lambda kv: kv[1].get("ts", 0))[:len(dn) - _KEEP]:
+            dn.pop(k, None)
+    d["denied"] = dn
+    try:
+        with io.open(path, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=0)
+    except OSError as e:
+        return False, f"реестр решений не записан: {e}"
+    out = dict(rec)
+    out["commit"] = c
+    return True, out
+
+
+def owner_denied(commit, path=None):
+    """Запись отказа владельца на этот коммит → dict | {}. Права выкатить НЕ даёт и не отнимает."""
+    c = short(commit)
+    if not c:
+        return {}
+    dn = _load(path or RELEASE_FILE).get("denied")
+    rec = dn.get(c) if isinstance(dn, dict) else None
+    return rec if isinstance(rec, dict) else {}
+
+
+def deny_route(commit, kinds, held, path=None, now=None):
+    """Отказ владельца уже закрыл этот повод? → ('feed', причина) | None (спрашивать можно).
+
+    None — это «отказ ничего не говорит про этот случай», а не «выкатывай». Нечитаемый реестр даёт
+    ровно None: молчать по недосмотру хуже лишней карточки (тот же fail-loud, что у `gate_route`)."""
+    c = short(commit)
+    if not c:
+        return None
+    dn = _load(path or RELEASE_FILE).get("denied")
+    if not isinstance(dn, dict) or not dn:
+        return None
+    shape = refusal_shape(kinds, held)
+    ts = time.time() if now is None else now
+    rec = dn.get(c)
+    if isinstance(rec, dict) and str(rec.get("shape") or shape) == shape:
+        return ROUTE_FEED, ("владелец сказал «нет» на этот повод (коммит %s, форма «%s») — "
+                            "повторно не спрашиваю" % (c, shape))
+    same = [(k, r) for k, r in dn.items()
+            if isinstance(r, dict) and str(r.get("shape") or "") == shape and shape]
+    if same:
+        k, r = max(same, key=lambda kr: kr[1].get("ts", 0))
+        age = ts - float(r.get("ts") or 0)
+        if 0 <= age < DENY_MUTE_SEC:
+            return ROUTE_FEED, ("владелец сказал «нет» на ту же форму «%s» (коммит %s, %d мин "
+                                "назад) — в ленту; спрошу снова через %d ч или на другой форме"
+                                % (shape, k, int(age // 60), int((DENY_MUTE_SEC - age) // 3600) + 1))
+    return None
+
+
 def corpus_sha(path=None):
     """Отпечаток корпуса кейсов (sha256, 16 hex) → '' при нечитаемом файле. Вердикт обязан назвать
     ТОТ корпус, что лежит на диске: зелень, снятая на урезанном наборе кейсов, не основание."""
@@ -373,6 +500,57 @@ def corpus_sha(path=None):
             return hashlib.sha256(f.read()).hexdigest()[:16]
     except OSError:
         return ""
+
+
+def _verdict_holds(rec, c, commit_raw, cases_path=None):
+    """ДЕРЖИТСЯ ЛИ ОДНА ЗАПИСЬ вердикта целиком. → (держится?, дословная причина).
+
+    Правила ровно те же, что стояли в теле `trainer_verdict`, — ни одно не ослаблено; вынесены
+    сюда, чтобы тем же судом можно было спросить запись про ЕЁ СОБСТВЕННЫЙ коммит. Без этого
+    карточка не отличает «вердикт есть, но на другом коммите» от «вердикта нет ни на одном»:
+    живой класс 05.09.2026 — единственная зелёная запись (74be777, корпус 12 кейсов) не открывает
+    даже сам 74be777, потому что на диске лежит корпус на 16, а карточка звала её «последним
+    зелёным»."""
+    if not isinstance(rec, dict):
+        return False, "запись битая (не объект)"
+    if str(rec.get("result") or "") != "green":
+        return False, f"запись не зелёная: result={rec.get('result')!r}"
+    rc = str(rec.get("commit") or "").strip().lower()
+    cc = str(commit_raw or "").strip().lower()
+    if short(rc) != c or (len(rc) == 40 and len(cc) == 40 and rc != cc):
+        return False, f"вердикт снят на ДРУГОМ коммите ({short(rc) or '?'}), а выкатывается {c}"
+    total, ok = rec.get("checks_total"), rec.get("checks_passed")
+    if not isinstance(total, int) or not isinstance(ok, int) or total <= 0 or ok != total:
+        return False, f"чеки не все зелёные: {ok}/{total}"
+    cases, cases_total = rec.get("cases"), rec.get("cases_total")
+    if not isinstance(cases, int) or cases < TRAINER_MIN_CASES or cases != cases_total:
+        return False, f"кейсов {cases}/{cases_total}, нужно {TRAINER_MIN_CASES} из {TRAINER_MIN_CASES}"
+    runs = rec.get("runs")
+    if not isinstance(runs, int) or runs < TRAINER_MIN_RUNS:
+        return False, f"прогонов {runs}, нужно {TRAINER_MIN_RUNS}"
+    if rec.get("clean") is not True:
+        return False, "прогон шёл по ГРЯЗНОМУ дереву — вердикт не о коммите"
+    sha = corpus_sha(cases_path)
+    if not sha or str(rec.get("corpus_sha") or "") != sha:
+        return False, "корпус кейсов не тот, на котором снят вердикт"
+    return True, ("зелёный: кейсов %s/%s, чеков %s/%s, прогонов %s, коммит совпал (%s)"
+                  % (cases, cases_total, ok, total, runs, rec.get("when") or "?"))
+
+
+def _green_elsewhere(g, cases_path=None):
+    """Записи ящика `green`, разложенные СУДОМ, а не наличием: (держатся, не держатся).
+
+    Каждый элемент — (ключ, дословная причина). «Держится» значит: эта запись открыла бы ворота
+    СВОЕМУ коммиту, спроси мы её про него. Наличие ключа в ящике не значит ничего: ящик пишет
+    раннер, а судит `_verdict_holds`."""
+    live, dead = [], []
+    for k in sorted(g or {}):
+        rec = g.get(k)
+        held, why = _verdict_holds(rec, short(k) or str(k),
+                                   rec.get("commit") if isinstance(rec, dict) else None,
+                                   cases_path)
+        (live if held else dead).append((str(k), why))
+    return live, dead
 
 
 def trainer_verdict(commit, path=None, env=None, cases_path=None):
@@ -409,32 +587,21 @@ def trainer_verdict(commit, path=None, env=None, cases_path=None):
                            % ({"unknown": "НЕИЗВЕСТНО"}.get(str(r.get("result") or ""), "КРАСНЫЙ"),
                               r.get("checks_passed"), r.get("checks_total"), r.get("cases"),
                               r.get("cases_total"), r.get("when") or "?"))
-        if g:
-            return False, ("вердикта на этот коммит нет (последний зелёный — на %s)"
-                           % ", ".join(sorted(g)[:3]))
+        # ТРИ СОСТОЯНИЯ, а не два (05.09.2026). Прежняя строка звала «последним зелёным» ЛЮБОЙ
+        # ключ ящика — то есть верила файлу на слово ровно там, где сам вердикт файлу не верит.
+        # Живой замер: единственная запись 74be777 (12 кейсов, corpus_sha 98ad5e3e…) не открывает
+        # и свой коммит — на диске корпус на 16 (6d5d78f0…). Владелец читал «зелень есть, но не на
+        # этом коммите», а правды «зелени нет нигде» не видел ни строкой.
+        live, dead = _green_elsewhere(g, cases_path)
+        if live:
+            return False, ("вердикта на этот коммит нет; ДЕЙСТВУЮЩИЙ зелёный — на %s"
+                           % ", ".join(k for k, _w in live[:3]))
+        if dead:
+            k, why = dead[0]
+            return False, ("зелёного вердикта нет НИ НА ОДНОМ коммите: запись на %s есть, но она "
+                           "не открывает и его (%s)" % (k, why))
         return False, "прогона не было"
-    if str(rec.get("result") or "") != "green":
-        return False, f"запись не зелёная: result={rec.get('result')!r}"
-    rc = str(rec.get("commit") or "").strip().lower()
-    cc = str(commit or "").strip().lower()
-    if short(rc) != c or (len(rc) == 40 and len(cc) == 40 and rc != cc):
-        return False, f"вердикт снят на ДРУГОМ коммите ({short(rc) or '?'}), а выкатывается {c}"
-    total, ok = rec.get("checks_total"), rec.get("checks_passed")
-    if not isinstance(total, int) or not isinstance(ok, int) or total <= 0 or ok != total:
-        return False, f"чеки не все зелёные: {ok}/{total}"
-    cases, cases_total = rec.get("cases"), rec.get("cases_total")
-    if not isinstance(cases, int) or cases < TRAINER_MIN_CASES or cases != cases_total:
-        return False, f"кейсов {cases}/{cases_total}, нужно {TRAINER_MIN_CASES} из {TRAINER_MIN_CASES}"
-    runs = rec.get("runs")
-    if not isinstance(runs, int) or runs < TRAINER_MIN_RUNS:
-        return False, f"прогонов {runs}, нужно {TRAINER_MIN_RUNS}"
-    if rec.get("clean") is not True:
-        return False, "прогон шёл по ГРЯЗНОМУ дереву — вердикт не о коммите"
-    sha = corpus_sha(cases_path)
-    if not sha or str(rec.get("corpus_sha") or "") != sha:
-        return False, "корпус кейсов не тот, на котором снят вердикт"
-    return True, ("зелёный: кейсов %s/%s, чеков %s/%s, прогонов %s, коммит совпал (%s)"
-                  % (cases, cases_total, ok, total, runs, rec.get("when") or "?"))
+    return _verdict_holds(rec, c, commit, cases_path)
 
 
 def trainer_enabled(env=None):
@@ -564,13 +731,21 @@ def _seen_save(shapes, path=None):
         return None, "%s: %s" % (type(e).__name__, e)
 
 
-def gate_route(kinds, held, flag=None, path=None, now=None, episode=None):
+def gate_route(kinds, held, flag=None, path=None, now=None, episode=None, commit=None,
+               release_path=None):
     """АДРЕС отказа ворот: ('card'|'feed', дословная причина).
 
     'card' — карточка владельцу, как было. 'feed' — только строка в ленту (журнал). На САМ отказ
     не влияет ничем: ворота fail-closed и держат в обоих исходах. Карточкой остаются: любой отказ
     при снятой заморозке, ПЕРВЫЙ отказ каждой формы в эпизоде заморозки и любой отказ, который мы
-    не смогли записать в реестр."""
+    не смогли записать в реестр.
+
+    ОТКАЗ ВЛАДЕЛЬЦА спрашивается ПЕРВЫМ и НЕ зависит от заморозки: «нет» — это ответ на конкретный
+    вопрос, и он закрывает повод независимо от того, лежит ли флаг заморозки. Право выкатить он не
+    меняет: обе ветки возвращают адрес, а не разрешение."""
+    d = deny_route(commit, kinds, held, release_path, now)
+    if d:
+        return d
     if not frozen(flag):
         return ROUTE_CARD, "заморозки нет (%s отсутствует) — прежнее поведение" % os.path.basename(
             flag or FREEZE_FLAG)
@@ -600,12 +775,21 @@ def gate_route(kinds, held, flag=None, path=None, now=None, episode=None):
 
 # ------------------------------- карточка владельцу ---------------------------
 
+DENY_WORD = "не выкатывай"
+
+
 def card_text(kinds, commit, client_files, subject="", where="", trainer_available=False,
               trainer_note=""):
     """Дословный текст карточки-ворот. Минимум владельца: ЧТО меняется, КАКИЕ файлы, КАКОЙ коммит,
     КАК откатить — плюс чем ворота открываются. По ВТОРОМУ основанию карточка говорит ПРИЧИНУ
     (вердикта нет / КРАСНЫЙ / снят на другом коммите) и КОМАНДУ, которой вердикт снимают: иначе
-    владелец видит «тренажёр не открыл» и не знает, что с этим делать."""
+    владелец видит «тренажёр не открыл» и не знает, что с этим делать.
+
+    ДВЕ ДВЕРИ, а не одна (05.09.2026). До этого дня карточка называла ровно один принимаемый ответ
+    («выкати»), и «нет» владельца не попадало никуда: молчание работает как отказ, но молчание
+    неотличимо от «не увидел карточку». Строка про отказ стои́т РЯДОМ со строкой про «да» и честно
+    говорит, что она не применяет ничего, — иначе новая дверь читалась бы как вторая дорога к
+    выкатке."""
     who = ", ".join(kinds) if kinds else "боты"
     subj = f" — {subject}" if str(subject or "").strip() else ""
     if trainer_available:
@@ -624,6 +808,9 @@ def card_text(kinds, commit, client_files, subject="", where="", trainer_availab
         "Пропуск — одно из двух:\n"
         " • твоё «да»: ответь «выкати» — применю этим же коммитом в ближайшую минуту;\n"
         f" • {tr}.\n"
+        f"Не надо — ответь «{DENY_WORD}» (или «нет», «отбой»): запишу твой отказ и по этому поводу\n"
+        "   спрашивать перестану. Отказ ничего не применяет и ничего не откатывает; на другом\n"
+        "   коммите с другим составом файлов спрошу снова.\n"
         f"Откатить: git revert --no-edit {commit}\n"
         "SUGGEST_TEST_MODE не трогали — второй слой на месте."
     )

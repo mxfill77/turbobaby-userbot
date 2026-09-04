@@ -189,9 +189,15 @@ class Base(unittest.TestCase):
         # Отсюда место изоляции — Base, а не отдельный класс: голден, чей вердикт зависит от того,
         # заморожен ли контур в эту минуту, — не голден. Заморозку ПО СУЩЕСТВУ проверяет
         # TestZamorozkaKontura, поднимая флаг в СВОЁМ временном каталоге.
+        # 05.09.2026, ТРЕТЬЯ течь того же класса: у карточки появилась вторая дверь («нет»), и вместе
+        # с ней запись ПОВОДА в РЕЕСТР РЕШЕНИЙ владельца (`remember_asked` из `_client_block`).
+        # Реестр боевой и лежит в корне репо ровно как реестр форм — значит прогон тестов писал бы
+        # туда «о чём спросили», а живой отказ владельца закрыл бы ПОВОД ИЗ ТЕСТА. Изоляция заводится
+        # ОДНОВРЕМЕННО с самой веткой, а не после первого живого промаха.
         _tmp_frz = tempfile.mkdtemp(prefix="frz_base_")
         for _attr, _val in (("FREEZE_FLAG", os.path.join(_tmp_frz, "pc_orchestrator.contour_frozen")),
-                            ("GATE_SEEN_FILE", os.path.join(_tmp_frz, "gate_seen.json"))):
+                            ("GATE_SEEN_FILE", os.path.join(_tmp_frz, "gate_seen.json")),
+                            ("RELEASE_FILE", os.path.join(_tmp_frz, "client_release.json"))):
             _save_frz = getattr(o.client_contour, _attr)
             setattr(o.client_contour, _attr, _val)
             self.addCleanup(lambda a=_attr, v=_save_frz: setattr(o.client_contour, a, v))
@@ -3352,6 +3358,109 @@ class TestFileProcessMap(unittest.TestCase):
         self.assertIsNone(o._match_command("обнови userbot"))                    # не наша команда
         self.assertIsNone(o._match_command("расскажи про статус контура войск"))
         self.assertIsNone(o._match_command(""))
+
+
+# ────────── ВТОРАЯ ДВЕРЬ КАРТОЧКИ ВОРОТ: «НЕТ» ВЛАДЕЛЬЦА (05.09.2026) ──────────
+# Живой повод: у карточки принимался РОВНО ОДИН ответ — «выкати». Владелец ответил «нет» и не
+# получил ничего: разбор такого ответа не знал ни одной веткой (замер 05.09 — все шесть естественных
+# форм отказа давали `_match_command` → None и уезжали в headless как дев-задача), следа не осталось
+# нигде. Ворота при этом держали — но по МОЛЧАНИЮ, а молчание неотличимо от «не увидел карточку».
+
+class TestOtkazVorotam(Base):
+
+    def setUp(self):
+        super().setUp()
+        # Base глушит ворота ради механики остальных тестов — здесь они нужны БОЕВЫЕ (тот же приём,
+        # что у TestClientContourGate ниже). Реестр решений при этом уже уведён Base'ом во временный
+        # каталог, так что прогон не пишет боевой.
+        (o._client_block, o._revizor_finding_touches_client) = self._save_cb
+
+    def test_slova_otkaza_raspoznany_bez_uchota_registra(self):
+        for t in ("не выкатывай", "Не выкатывай.", "НЕ ВЫКАТЫВАЙ", "не выкатывать", "нет",
+                  "Нет!", "отбой", "Отказ", "отклоняю", "отклонить", "не надо",
+                  "не применяй", "не раскатывай", "нет, не выкатывай"):
+            with self.subTest(t=t):
+                self.assertEqual(o._match_command(t), "deny_client")
+
+    def test_da_i_net_ne_pereputany(self):
+        """Зеркальность слов не смеет размывать границу: «выкати» — это по-прежнему только «да»."""
+        for t in ("выкати", "да, выкати", "раскати", "примени"):
+            self.assertEqual(o._match_command(t), "release_client", t)
+
+    # ── ОТРИЦАТЕЛЬНЫЙ №2 задания ──
+    def test_slovo_vne_spiska_odobreniem_ne_stanovitsya(self):
+        """Похожее на отказ — НЕ отказ; и уж тем более ни одно из этих слов не открывает ворота.
+        Догадка тут стоит дорого в обе стороны, поэтому третий исход — ПЕРЕСПРОСИТЬ."""
+        for t in ("не сейчас", "пока нет", "погоди", "стоп", "позже", "не уверен",
+                  "пока не надо", "подумаю"):
+            with self.subTest(t=t):
+                cmd = o._match_command(t)
+                self.assertEqual(cmd, "deny_unclear")
+                self.assertNotEqual(cmd, "release_client")
+                status, res = o._exec_command(cmd, text=t)
+                self.assertEqual(status, "done")
+                self.assertIn("не засчитываю", res)
+                self.assertIn("ничего не записал", res)
+        # и дев-задача с теми же словами внутри по-прежнему уезжает в headless, а не в рычаг
+        self.assertIsNone(o._match_command("тз: почини детект, пока не надо трогать прайс"))
+
+    def test_otkaz_ostavlyaet_sled_i_nichego_ne_primenyaet(self):
+        """Эффект отказа ровно один — СЛЕД: строка в ленту плюс запись рядом с поводом. Ни рестарта,
+        ни записи основания: `approve` в этой ветке не зовётся ни разу."""
+        cows, denies = [], []
+        approved = []
+        with mock.patch.object(o.client_contour, "approve",
+                               side_effect=lambda *a, **k: approved.append(a) or (True, "x")):
+            status, res = o._exec_deny_client(
+                head_fn=lambda: "abc1234",
+                deny_fn=lambda c: denies.append(c) or (True, {"commit": "abc1234",
+                                                              "shape": "userbot|suggest.py",
+                                                              "who": "owner", "ts": 1.0}),
+                cowork=lambda s: cows.append(s))
+        self.assertEqual(status, "done")
+        self.assertEqual(denies, ["abc1234"])
+        self.assertEqual(approved, [], "отказ не смеет трогать реестр оснований")
+        self.assertTrue(any("сказал «нет» на abc1234" in c for c in cows), cows)
+        self.assertIn("Ничего не применяю", res)
+        self.assertIn("выкати", res, "право передумать обязано быть названо")
+
+    def test_otkaz_ne_zapisalsya_znachit_provalen(self):
+        """Не смогли оставить след — говорим об этом, а не рапортуем «записал»."""
+        status, res = o._exec_deny_client(head_fn=lambda: "abc1234",
+                                          deny_fn=lambda c: (False, "диск только на чтение"),
+                                          cowork=lambda s: None)
+        self.assertEqual(status, "failed")
+        self.assertIn("отказ не записан", res)
+
+    def test_povod_zapominaetsya_tolko_kogda_sprosili(self):
+        """Карточка ушла → повод записан; отказ ушёл в ленту → записывать нечего (иначе «нет»
+        закрыло бы повод, о котором владельца не спрашивали)."""
+        for route, ждём in ((o.client_contour.ROUTE_CARD, 1), (o.client_contour.ROUTE_FEED, 0)):
+            with self.subTest(route=route):
+                asked = []
+                o._CLIENT_HELD_WARNED.clear()
+                held = o._client_block(
+                    ["userbot"], "abc1234", ["suggest.py"], "проба",
+                    notifier=lambda *a, **k: None, cowork=lambda *a, **k: None, state={},
+                    client_fn=lambda p: list(p), reason_fn=lambda c: None,
+                    subject_fn=lambda c: "", trainer_fn=lambda c: "",
+                    route_fn=lambda k, h, **kw: (route, "проба"),
+                    asked_fn=lambda *a, **k: asked.append(a) or (True, ""))
+                self.assertEqual(held, ["suggest.py"])
+                self.assertEqual(len(asked), ждём)
+
+    def test_kommit_doezzhaet_do_adresa_otkaza(self):
+        """Замок против ВЕЧНОГО отказа: без коммита адрес судил бы только по паре «дети + файлы»,
+        и следующий, уже нужный, вопрос владелец не увидел бы никогда."""
+        got = {}
+        o._CLIENT_HELD_WARNED.clear()
+        o._client_block(["userbot"], "abc1234", ["suggest.py"], "проба",
+                        notifier=lambda *a, **k: None, cowork=lambda *a, **k: None, state={},
+                        client_fn=lambda p: list(p), reason_fn=lambda c: None,
+                        subject_fn=lambda c: "", trainer_fn=lambda c: "",
+                        route_fn=lambda k, h, **kw: got.update(kw) or (o.client_contour.ROUTE_CARD, "п"),
+                        asked_fn=lambda *a, **k: (True, ""))
+        self.assertEqual(got.get("commit"), "abc1234")
 
 
 class TestSelfUpdateChildren(Base):
@@ -10245,7 +10354,7 @@ class TestZhivayaRuchkaMiraNevidnaGoldenam(Base):
     прогон дописал в боевой реестр."""
 
     def test_puti_ruchki_vedut_vne_repozitoriya(self):
-        for attr in ("FREEZE_FLAG", "GATE_SEEN_FILE"):
+        for attr in ("FREEZE_FLAG", "GATE_SEEN_FILE", "RELEASE_FILE"):
             with self.subTest(attr=attr):
                 p = os.path.abspath(getattr(o.client_contour, attr))
                 self.assertNotEqual(os.path.dirname(p), os.path.abspath(o.REPO),
