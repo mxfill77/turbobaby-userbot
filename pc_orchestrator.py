@@ -3426,6 +3426,31 @@ def _judge_done(tid, text, status, result, base):
     return "failed", _cap_result(done_judge_pc.fail_result(verdict, result), tid)
 
 
+def _close_plan_facts(queue=None, now=None, tick_path=None):
+    """Факты раздела «ЧТО ДАЛЬШЕ» для сообщения о закрытии. → dict (пустой = не знаем).
+
+    ПОХОДОВ В МОСТ — НОЛЬ, И ЭТО НЕ ЭКОНОМИЯ РАДИ ЭКОНОМИИ. Закрытие задачи стои́т в
+    том же синхронном витке, что и всё остальное, а у витка есть измеренный потолок
+    времени на мост (`BridgeLoopBudget`, 04.09). Спроси мы ящик и очередь заново на
+    каждом закрытии — раздел «где мы в плане» отнимал бы время у того, что в этом
+    плане делается. Поэтому оба источника уже открыты к этой минуте: ящик — слепком
+    своего оборота на диске, очередь — рядами, которые `process_new` прочитал под
+    claim и держит в руках.
+
+    ПУСТОЙ СЛОВАРЬ — ЭТО «СПРОСИЛИ, ИСТОЧНИКИ НЕ ОТВЕТИЛИ», и он даёт четыре
+    честных «НЕИЗВЕСТНО», а не тишину и не ноль. Отличать его от `None` («раздела
+    не просили») обязан вызывающий, и он отличает: сюда `None` не приходит ни одной
+    веткой."""
+    try:
+        st = _shtab_box_read_tick(tick_path)
+        return close_msg_pc.plan_facts(st.get("census"),
+                                       now=time.time() if now is None else now,
+                                       queue=queue)
+    except Exception as e:                          # noqa: BLE001 — витрина не роняет закрытие
+        log.warning("раздел «что дальше»: факты не собрались (%s) — скажем НЕИЗВЕСТНО", e)
+        return {}
+
+
 def process_new():
     """Взять СТАРЕЙШУЮ new-задачу своей полосы, исполнить, записать результат/needs_approval."""
     if _stopped():
@@ -3446,10 +3471,20 @@ def process_new():
     # каждой группы — прежний FIFO по id. Ревизорские шаги в new не соперничают: они не релизятся, пока
     # есть owner-работа (уступка МЕЖДУ шагами, _loc_after_done/вотчдог) — а уже релизнутый «текущий шаг
     # дорабатывает» штатно. Нет owner-задач → ревизорский родитель клеймится как прежде.
-    task = sorted(items, key=lambda x: (_is_revizor_parent_text(x.get("task_text")),
-                                        int(x.get("id") or 0)))[0]
+    order = sorted(items, key=lambda x: (_is_revizor_parent_text(x.get("task_text")),
+                                         int(x.get("id") or 0)))
+    task = order[0]
     tid = task.get("id")
     text = str(task.get("task_text") or "")
+    # ЧТО ЖДЁТ В ОЧЕРЕДИ — СНИМАЕТСЯ ЗДЕСЬ, А НЕ ПЕРЕД ЗАКРЫТИЕМ, и это ЕДИНСТВЕННЫЙ
+    # способ узнать это бесплатно: ряды уже прочитаны выше ради самого claim, а между
+    # claim и закрытием стои́т синхронный заход на десятки минут — второе чтение стоило
+    # бы отдельного похода в мост в самом дорогом месте витка. Цена этой дешевизны
+    # названа прямо: число описывает очередь НА МОМЕНТ ВЗЯТИЯ, и раздел так и говорит
+    # («в очереди ждёт N») — не «сейчас», а по последнему известному замеру. `ok=True`
+    # ставится ровно потому, что ряды прочитаны: неудачное чтение до сюда не доходит.
+    _plan_queue = {"ok": True, "waiting": len(order) - 1,
+                   "next_id": order[1].get("id") if len(order) > 1 else None}
     cl = bc.claim_task(tid)
     if not cl.get("ok"):
         log.info("claim id=%s не удался (%s) — пропуск", tid, cl.get("error"))
@@ -3601,7 +3636,8 @@ def process_new():
         #      среза. Признак берём готовый (`_is_chain_artifact`): он же решает, кому принадлежит
         #      провал, и второго перечня меток полоса не заводит.
         if not _is_chain_artifact(frm, text):
-            result = _cap_result(close_msg_pc.prepend(result, text, status, NO_HEAL_PREFIXES), tid)
+            result = _cap_result(close_msg_pc.prepend(result, text, status, NO_HEAL_PREFIXES,
+                                                      _close_plan_facts(_plan_queue)), tid)
         bc.complete_task(tid, status, result)
         log.info("COMPLETE id=%s status=%s", tid, status)
         # полный текст RESULT (done) / причины failed → штаб читает итог из cowork_log без скринов
@@ -9994,7 +10030,7 @@ def _shtab_box_read_tick(path=None):
         return {}
 
 
-def _shtab_box_write_tick(now, path=None, stop="", marks=(), said=()):
+def _shtab_box_write_tick(now, path=None, stop="", marks=(), said=(), census=None):
     """Метка оборота ящика + ЕГО ОСТАНОВКА, в тот же файл и без второго реестра.
 
     Полей стало четыре, и три новых нужны РАЗНЫМ читателям, а не одному:
@@ -10004,18 +10040,28 @@ def _shtab_box_write_tick(now, path=None, stop="", marks=(), said=()):
       • `said`  — о чём УЖЕ доложено в журнал. Без неё одна остановка писала бы
         строку каждые полчаса и превратила бы журнал в ленту.
 
+    ПЯТОЕ ПОЛЕ, `census` (05.09.2026) — СЛЕПОК ДЛЯ СООБЩЕНИЯ О ЗАКРЫТИИ: сколько
+    заданий ещё ждёт, какое следующее по имени, сколько доведений и когда были
+    последние взятия (`close_msg_pc.facts_from_box`). Оно живёт здесь, а не в
+    своём файле, ровно по причине абзаца ниже — и потому, что закрытие задачи не
+    смеет платить за него походом в мост: раздел «ЧТО ДАЛЬШЕ» собирается из УЖЕ
+    снятых чисел, а не спрашивает ящик заново каждое закрытие.
+
     ФАЙЛ ТОТ ЖЕ, И ЭТО ВАЖНО: у ящика нет и не будет своего реестра на диске (его
     съел бы первый self-update). Потеря этой метки стоит ОДНОЙ повторной строки в
     журнале — то есть шум, а не потерянный замок; дедуп задач по-прежнему живёт в
-    очереди, а не здесь.
+    очереди, а не здесь. Для слепка цена потери та же и названа прямо: раздел
+    «ЧТО ДАЛЬШЕ» скажет «НЕИЗВЕСТНО», а не соврёт нулём.
     """
     p = path or SHTAB_BOX_TICK_FILE
     try:
+        row = {"ts": float(now), "stop": str(stop or ""),
+               "marks": [str(m) for m in (marks or ())][:SHTAB_BOX_MARKS_KEEP],
+               "said": [str(m) for m in (said or ())][-SHTAB_BOX_MARKS_KEEP:]}
+        if isinstance(census, dict):
+            row["census"] = census
         with open(p, "w", encoding="utf-8") as f:
-            json.dump({"ts": float(now), "stop": str(stop or ""),
-                       "marks": [str(m) for m in (marks or ())][:SHTAB_BOX_MARKS_KEEP],
-                       "said": [str(m) for m in (said or ())][-SHTAB_BOX_MARKS_KEEP:]}, f,
-                      ensure_ascii=False)
+            json.dump(row, f, ensure_ascii=False)
     except Exception as e:
         log.warning("ящик Штаба: метка оборота не записана: %s", e)
 
@@ -10081,7 +10127,8 @@ def maybe_shtab_box(now=None, tick_path=None, runner=None):
     # доклада сохраняем: упади оборот — витрина продолжит показывать последнее
     # ИЗВЕСТНОЕ состояние, а не пустоту, которая читается как «остановки нет».
     _shtab_box_write_tick(now, tick_path, stop=str(st.get("stop") or ""),
-                          marks=st.get("marks") or (), said=said_before)
+                          marks=st.get("marks") or (), said=said_before,
+                          census=st.get("census"))
     try:
         import shtab_box_run
         report = (runner or shtab_box_run.tick)(
@@ -10093,8 +10140,19 @@ def maybe_shtab_box(now=None, tick_path=None, runner=None):
                     "через паузу): %s", e)
         return None
     said_now = _shtab_box_announce(report, said_before)
+    # СЛЕПОК СНИМАЕТСЯ ЗДЕСЬ И БОЛЬШЕ НИГДЕ: это единственная точка полосы, где
+    # состояние ящика уже прочитано и оплачено. Считает его ЧИСТАЯ функция —
+    # значит числа раздела «ЧТО ДАЛЬШЕ» проверяемы без моста, ящика и часов.
+    # Сорвался счёт — прежний слепок остаётся на месте и просто стареет (а старый
+    # слепок раздел не показывает, он говорит «НЕИЗВЕСТНО»).
+    census = st.get("census")
+    try:
+        census = close_msg_pc.facts_from_box(report, prev=census, now=now)
+    except Exception as e:                         # noqa: BLE001 — витрина не роняет оборот
+        log.warning("ящик Штаба: слепок для сообщения о закрытии не снят: %s", e)
     _shtab_box_write_tick(now, tick_path, stop=report.get("stop") or "",
-                          marks=report.get("stop_marks") or (), said=said_now)
+                          marks=report.get("stop_marks") or (), said=said_now,
+                          census=census)
     if not report.get("acted"):
         log.info("ящик Штаба: %s", report.get("why") or "брать нечего")
         return report

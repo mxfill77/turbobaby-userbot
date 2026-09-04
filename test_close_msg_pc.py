@@ -176,7 +176,12 @@ class Lead(unittest.TestCase):
         self.assertTrue(self.lines[2].startswith(cm.L_NEXT))
 
     def test_every_line_fits_a_phone_line(self):
-        for ln in self.lines:
+        # ПОПРАВЛЕНО 05.09: у пояснения потолок СВОЙ и больший (`GOAL_MAX`) — иначе
+        # мысль не договаривает (замер: живые цели 265 и 316 знаков). Остальные
+        # строки шапки по-прежнему под строку телефона, и это здесь и проверяется.
+        self.assertLessEqual(len(self.lines[0].split(" …(", 1)[0]),
+                             cm.GOAL_MAX + len(cm.L_ASK), self.lines[0])
+        for ln in self.lines[1:3]:
             self.assertLessEqual(len(ln), cm.LINE_MAX, ln)
 
     def test_no_line_is_empty(self):
@@ -190,16 +195,231 @@ class Lead(unittest.TestCase):
         self.assertIn("из отчёта:", self.lines[1])
         self.assertIn("3", self.lines[1])
 
-    def test_long_goal_is_cut_by_word_with_an_ellipsis(self):
+    def test_long_goal_is_shortened_meaningfully_and_says_where_the_rest_is(self):
+        # ПОПРАВЛЕНО 05.09 (прежнее имя — ..._cut_by_word_with_an_ellipsis). Голого
+        # многоточия мало: оно говорит «текст кончился не здесь» и не говорит, где
+        # он кончается. Живой обрыв, ради которого правило сменилось, — закрытие
+        # #227: «…обязана быть отвечаемой ОТТУДА, ГДЕ ОНА…» и больше ничего.
         long_goal = "ЦЕЛЬ. " + "слово " * 40
         ln = cm.lead(long_goal, report_ok(), "done").split("\n")[0]
-        self.assertLessEqual(len(ln), cm.LINE_MAX)
-        self.assertTrue(ln.endswith("…"))
-        self.assertFalse(ln.endswith("сло…"), ln)
+        # Потолок бюджетирует ТЕКСТ; служебная пометка с адресом идёт сверх него
+        # (иначе длинный адрес отчёта отнимал бы место у самой мысли).
+        self.assertLessEqual(len(ln.split(" …(", 1)[0]), cm.GOAL_MAX + len(cm.L_ASK))
+        self.assertIn("сокращено", ln)
+        self.assertIn("docs/artifacts/", ln)          # адрес отчёта назван
+        self.assertFalse(ln.endswith("сло…"), ln)     # обрубка посреди слова нет
+
+
+class Explain(unittest.TestCase):
+    """ПОЯСНЕНИЕ ДОГОВАРИВАЕТ (задание 05.09, п.3)."""
+
+    def test_short_goal_goes_byte_for_byte(self):
+        self.assertEqual(cm.explain("ЦЕЛЬ. Убрать дубль."), "Убрать дубль.")
+
+    def test_long_goal_ends_at_a_phrase_not_mid_thought(self):
+        # ЖИВОЙ ГОЛДЕН: цель задания 228 дословно, 316 знаков (замер 05.09).
+        goal = ("ЦЕЛЬ. Сообщение о закрытии задачи ДОГОВАРИВАЕТ и показывает, где мы в "
+                "плане. Сегодня оно обрывается на полуслове и заканчивается ничем: "
+                "владелец видит, что задача закрыта, но не видит ни законченного "
+                "пояснения, ни что осталось, ни куда идём. Прямой заказ владельца 05.09: "
+                "«информативность правильная, но без лишнего шума».")
+        out = cm.explain(goal, report_ok())
+        head = out.split(" …(", 1)[0]
+        self.assertTrue(head.endswith("."), head)                 # мысль закончена
+        self.assertIn(head, goal)                                 # и она ДОСЛОВНА
+        self.assertLessEqual(len(head), cm.GOAL_MAX)              # потолок бюджетирует ТЕКСТ
+        self.assertIn("сокращено", out)                           # …а остаток назван
+
+    def test_shortening_names_the_report_address(self):
+        out = cm.explain("ЦЕЛЬ. " + "слово " * 60, report_ok())
+        self.assertIn("сокращено", out)
+        self.assertIn("docs/artifacts/2026-09-04-потолок-времени-на-мост.md", out)
+
+    def test_no_address_in_the_report_is_said_not_invented(self):
+        out = cm.explain("ЦЕЛЬ. " + "слово " * 60, "отчёт без единого адреса")
+        self.assertIn(cm.CUT_NOREF.strip(), out)
+        self.assertNotIn("docs/artifacts", out)
+
+    def test_no_phrase_fits_still_cuts_by_word_and_marks(self):
+        # Ни одной точки в бюджете — режем по слову, но пометка остаётся: грубое
+        # сокращение обязано называть себя так же, как осмысленное.
+        out = cm.explain("ЦЕЛЬ. " + "оченьдлинноеслово " * 30, report_ok())
+        self.assertIn("сокращено", out)
+        self.assertNotIn("оченьдлинноесл…", out)
+
+    def test_ref_is_read_not_built(self):
+        self.assertEqual(cm.report_ref(JUDGE_OK),
+                         "docs/artifacts/2026-09-04-потолок-времени-на-мост.md")
+        self.assertEqual(cm.report_ref("ни одного адреса"), "")
+
+
+class PlanLines(unittest.TestCase):
+    """РАЗДЕЛ «ЧТО ДАЛЬШЕ»: четыре пункта, форма не меняется никогда."""
+
+    FULL = {"box": {"ok": True, "waiting": 3, "next": "00d-next.0905"},
+            "run": {"ok": True, "waiting": 1, "next_id": 229},
+            "retry": {"ok": True, "count": 0},
+            "pace": {"ok": True, "median_min": 25.0, "samples": 12}}
+
+    def test_exactly_four_bullets_always(self):
+        for facts in (self.FULL, {}, {"box": {"ok": True, "waiting": 0}}, None):
+            got = cm.plan_lines(facts if facts is not None else {})
+            self.assertEqual(len(got), cm.PLAN_LINES, got)
+
+    def test_box_says_the_count_and_the_next_by_name(self):
+        self.assertIn("ещё 3", cm.plan_lines(self.FULL)[0])
+        self.assertIn("00d-next.0905", cm.plan_lines(self.FULL)[0])
+
+    def test_running_line_says_what_waits_and_its_number(self):
+        self.assertIn("#229", cm.plan_lines(self.FULL)[1])
+
+    def test_estimate_calls_itself_an_estimate_and_names_its_basis(self):
+        line = cm.plan_lines(self.FULL)[3]
+        self.assertIn("ОЦЕНКА", line)
+        self.assertIn("медиана", line)      # из чего посчитана
+        self.assertIn("взятий", line)
+        self.assertIn("1 ч 15 мин", line)   # 3 × 25 мин
+
+    def test_the_section_is_bounded_by_number_not_by_taste(self):
+        # Предсмертный взгляд задания: раздел, выросший в простыню, хуже, чем его
+        # отсутствие. Потолок держит ЧИСЛО, а не обещание автора следующей правки.
+        block = cm.plan_block({"box": {"ok": False, "why": "ы" * 4000},
+                               "run": {}, "retry": {}, "pace": {}})
+        self.assertLessEqual(len(block), cm.PLAN_MAX)
+        self.assertLessEqual(len(block.split("\n")), cm.PLAN_LINES + 1)
+
+    def test_no_facts_at_all_means_the_section_was_not_asked_for(self):
+        self.assertEqual(cm.plan_block(None), "")
+        self.assertTrue(cm.plan_block({}).startswith(cm.PLAN_HEAD))
+
+
+class PlanFacts(unittest.TestCase):
+    """Слепок ящика → факты. Чистая арифметика, ни моста, ни диска, ни часов."""
+
+    def box_report(self, docs, marks=(), gates=None, retry=(), placed=(), folder_ok=True,
+                   marks_ok=True):
+        return {"placed": list(placed),
+                "build": {"folder_ok": folder_ok, "folder_why": "мост молчал",
+                          "marks_ok": marks_ok, "marks_why": "закрытые ряды не спрашивали",
+                          "docs": [{"key": k, "name": "shtab_task_" + k} for k in docs],
+                          "task_marks": [("2026-09-05", m) for m in marks],
+                          "gates": gates or {}, "retry": [{"key": r} for r in retry]}}
+
+    def test_incomplete_markers_give_no_number_at_all(self):
+        # ЖИВОЙ ЗАМЕР 05.09: 37 документов, 7 снятых, открытым маркером помечен 1 →
+        # «ждут 29», тогда как два десятка ключей уже взяты И ЗАКРЫТЫ (закрытых рядов
+        # ящик в тот виток не спрашивал). Число здесь врало бы втрое.
+        rep = self.box_report(["a", "b", "c"], marks=["a"], marks_ok=False)
+        got = cm.facts_from_box(rep, now=10.0)
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["waiting"], 0)          # не число, а «нет числа»
+        self.assertIn("закрытые ряды", got["why"])   # причина — ЯЩИКА, а не наша выдумка
+        # …и когда ящик причины не назвал, свою мы всё равно говорим словами.
+        rep["build"]["marks_why"] = ""
+        self.assertIn("маркеров", cm.facts_from_box(rep, now=10.0)["why"])
+
+    def test_an_unmeasurable_tick_does_not_erase_what_we_knew(self):
+        prev = {"ts": 5.0, "ok": True, "waiting": 4, "next": "a", "retry": 1, "taken": [1.0]}
+        got = cm.facts_from_box(self.box_report(["a"], marks_ok=False), prev=prev, now=99.0)
+        self.assertTrue(got["ok"])
+        self.assertEqual(got["ts"], 5.0)             # …но и не молодит: возраст судит plan_facts
+        self.assertEqual(got["waiting"], 4)
+
+    def test_waiting_is_docs_minus_taken(self):
+        got = cm.facts_from_box(self.box_report(["a", "b", "c"], marks=["b"]), now=100.0)
+        self.assertTrue(got["ok"])
+        self.assertEqual(got["waiting"], 2)
+        self.assertEqual(got["next"], "a")           # первый ПО ИМЕНИ
+
+    def test_a_doc_the_gates_already_refused_is_not_waiting(self):
+        rep = self.box_report(["a", "b"], gates={"a": {"ok": False}})
+        self.assertEqual(cm.facts_from_box(rep, now=1.0)["waiting"], 1)
+
+    def test_unread_folder_is_unknown_not_zero(self):
+        got = cm.facts_from_box(self.box_report([], folder_ok=False), now=1.0)
+        self.assertFalse(got["ok"])
+        self.assertIn("мост молчал", got["why"])
+
+    def test_takings_accumulate_and_are_capped(self):
+        prev = {"taken": [float(i) for i in range(cm.TAKEN_KEEP)]}
+        got = cm.facts_from_box(self.box_report(["a"], placed=[{"id": 1}]),
+                                prev=prev, now=999.0)
+        self.assertEqual(len(got["taken"]), cm.TAKEN_KEEP)
+        self.assertEqual(got["taken"][-1], 999.0)
+
+    def test_a_stale_snapshot_says_unknown_instead_of_yesterdays_number(self):
+        census = {"ts": 0.0, "ok": True, "waiting": 3, "next": "a", "retry": 0}
+        got = cm.plan_facts(census, now=cm.PLAN_STALE_SEC + 60.0)
+        self.assertFalse(got["box"]["ok"])
+        self.assertIn("слепку ящика", got["box"]["why"])
+
+    def test_a_fresh_snapshot_answers_with_numbers(self):
+        census = {"ts": 100.0, "ok": True, "waiting": 3, "next": "a", "retry": 2,
+                  "taken": [0.0, 600.0, 1500.0, 2400.0]}
+        got = cm.plan_facts(census, now=200.0, queue={"ok": True, "waiting": 0})
+        self.assertTrue(got["box"]["ok"])
+        self.assertEqual(got["retry"], {"ok": True, "count": 2})
+        self.assertTrue(got["pace"]["ok"])
+
+    def test_one_gap_is_not_a_rhythm(self):
+        self.assertFalse(cm._pace([0.0, 600.0])["ok"])
 
 
 class NegativeAndDeathLook(unittest.TestCase):
-    """Два обязательных теста задания."""
+    """Два обязательных теста задания 04.09 плюс три обязательных теста 05.09."""
+
+    # ── ТРИ ОТРИЦАТЕЛЬНЫХ ТЕСТА ЗАДАНИЯ 05.09 ────────────────────────────────
+
+    def test_negative_empty_box_says_it_in_words_not_by_an_empty_section(self):
+        # Раздел, молчащий при пустом ящике, неотличим от сломанного.
+        only_retry = cm.plan_lines({"box": {"ok": True, "waiting": 0},
+                                    "run": {"ok": True, "waiting": 0},
+                                    "retry": {"ok": True, "count": 2},
+                                    "pace": {"ok": True, "median_min": 20.0, "samples": 5}})
+        self.assertIn("новых заданий в ящике нет", only_retry[0])
+        self.assertIn("доведением прежних", only_retry[0])      # отдельный законный исход
+        nothing = cm.plan_lines({"box": {"ok": True, "waiting": 0},
+                                 "run": {"ok": True, "waiting": 0},
+                                 "retry": {"ok": True, "count": 0},
+                                 "pace": {"ok": True, "median_min": 20.0, "samples": 5}})
+        self.assertIn("брать нечего", nothing[0])
+        for line in only_retry + nothing:
+            self.assertTrue(line.strip(), "пустых пунктов быть не может")
+
+    def test_negative_unreachable_queue_says_unknown_not_zero(self):
+        # Ни один источник не отвечает → четыре «НЕИЗВЕСТНО» и ни одного нуля.
+        lines = cm.plan_lines({})
+        self.assertEqual(len(lines), cm.PLAN_LINES)
+        for line in lines:
+            self.assertIn("НЕИЗВЕСТНО", line, line)
+        joined = " ".join(lines)
+        for lie in ("ещё 0", "ждёт 0", "— 0", "нет"):
+            self.assertNotIn(lie, joined, joined)
+
+    def test_negative_text_over_the_cap_arrives_finished_with_an_address(self):
+        # Полный путь: собрали шапку → отдали ту же обрезку, что в проде.
+        import result_spill
+
+        body = report_ok("Очень длинное тело отчёта. " * 400)
+        out = cm.prepend(body, TASK, "done", (), self.FACTS)
+        capped, rel = result_spill.cap_result(out, tid="t", cap=4500, save=False)
+        self.assertLessEqual(len(capped), 4500)
+        # 1) человеческая часть уцелела ЦЕЛИКОМ — она сверху по построению;
+        self.assertTrue(capped.startswith(cm.L_ASK))
+        self.assertIn(cm.PLAN_HEAD, capped)
+        for line in cm.plan_lines(self.FACTS):
+            self.assertIn(line, capped)
+        # 2) сообщение кончается ЗАКОНЧЕННОЙ пометкой с адресом полного тела,
+        #    а не обрубком посреди слова.
+        self.assertIn(result_spill.TRUNC_HEAD, capped)
+        self.assertRegex(capped, r"(Полный текст: \S+|сохранить НЕ УДАЛОСЬ)")
+
+    FACTS = {"box": {"ok": True, "waiting": 2, "next": "00d-x.0905"},
+             "run": {"ok": True, "waiting": 1, "next_id": 230},
+             "retry": {"ok": True, "count": 1},
+             "pace": {"ok": True, "median_min": 30.0, "samples": 8}}
+
+    # ── ДВА ОБЯЗАТЕЛЬНЫХ ТЕСТА ЗАДАНИЯ 04.09 (не ослаблены) ──────────────────
 
     def test_negative_no_goal_no_verdict_says_not_named(self):
         task = "ПОЛОСА: пк\nЧТО СДЕЛАТЬ\n1. Померить.\nАДРЕС РЕЗУЛЬТАТА: файл в docs\n"
@@ -351,7 +571,21 @@ class Invariants(unittest.TestCase):
     def test_the_daemon_hands_its_own_marker_set_to_the_assembly(self):
         # Сборка получает набор демона, а не пустой: иначе `keep_first` был бы мёртвой веткой.
         src = self._src("pc_orchestrator.py")
-        self.assertIn("close_msg_pc.prepend(result, text, status, NO_HEAL_PREFIXES)", src)
+        self.assertIn("close_msg_pc.prepend(result, text, status, NO_HEAL_PREFIXES", src)
+
+    def test_the_daemon_hands_the_plan_facts_too(self):
+        # ПЯТЫЙ ДОВОД — ФАКТЫ РАЗДЕЛА, и он обязан ехать из демона, а не подразумеваться:
+        # без него `prepend` получил бы `None`, то есть «раздела не просили», и «ЧТО
+        # ДАЛЬШЕ» пропал бы МОЛЧА — ровно тем способом, каким его сегодня и нет.
+        src = self._src("pc_orchestrator.py")
+        self.assertIn("_close_plan_facts(_plan_queue)", src)
+        # …и факты собираются БЕЗ похода в мост: слепок с диска + уже прочитанные ряды.
+        self.assertIn("close_msg_pc.plan_facts(st.get(\"census\")", src)
+
+    def test_the_box_snapshot_is_taken_in_exactly_one_place(self):
+        # Слепок ящика снимается там, где состояние уже оплачено, и только там.
+        src = self._src("pc_orchestrator.py")
+        self.assertEqual(src.count("close_msg_pc.facts_from_box("), 1)
 
     def test_the_head_stands_above_the_judges_verdict(self):
         # Весь смысл порядка: режется ХВОСТ, значит человеческое — сверху.
