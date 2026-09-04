@@ -326,6 +326,96 @@ class TestCaseFoldedGate(_Retask):
                          cpv.PROVEN)
 
 
+class TestAddressWordsToleratePunctuation(_Retask):
+    """Запятая внутри заголовка — знак препинания, а не факт о продукте.
+
+    Живой класс 04.09: заходы 195, 208 и 210 закрыты как DISPROVEN /
+    `text_condition_failed` при сделанной и закоммиченной работе. В 195 и 208 слова адреса
+    («гейт самообновления снова зелёный причина найдена») стоя́т в заголовке артефакта ПОДРЯД,
+    и мешает им ровно запятая между «зелёный» и «причина».
+    """
+
+    # Дословный заголовок docs/artifacts/2026-09-04-gate-red-close-lead.md (заходы 195 и 208).
+    LIVE_HEAD = ("# Гейт самообновления снова зелёный, причина найдена: шапка закрытия легла "
+                 "в машинный контракт\n")
+    LIVE_WORDS = "гейт самообновления снова зелёный причина найдена"
+
+    def _gate_on(self, body, needle, path="notes.txt"):
+        gates = [{"gate_id": "words", "artifact_id": "product",
+                  "type": "path_or_text_contains_ci", "params": {"text": needle}}]
+        self._task(required_content_gates=gates)
+        bundle = self.bundle()
+        bundle["content_gates"] = gates
+        self.hashes["artifact"] = _write(self.root, path, body + "run_id: %s\n" % RUN_ID)
+        bundle["required_artifacts"][0].update(
+            {"path": path, "content_type": "text", "sha256": self.hashes["artifact"]})
+        return cpv.verify_case(bundle)
+
+    def test_the_live_comma_no_longer_fails_a_done_artifact(self):
+        """Случай 195/208 целиком: до правки — DISPROVEN, после — PROVEN."""
+        self.assertTrue(cpv.address_hit("docs/artifacts/2026-09-04-gate-red-close-lead.md",
+                                        self.LIVE_HEAD, self.LIVE_WORDS))
+        self.assertEqual(self._gate_on(self.LIVE_HEAD, self.LIVE_WORDS)["verdict"], cpv.PROVEN)
+
+    def test_other_marks_and_extra_spaces_between_words_are_tolerated(self):
+        for body in ("# **Гейт самообновления** снова — зелёный; причина найдена!\n",
+                     "гейт   самообновления\nснова\tзелёный … причина найдена\n",
+                     "«Гейт самообновления снова зелёный» (причина найдена)\n"):
+            self.assertTrue(cpv.address_hit("x.md", body, self.LIVE_WORDS), body)
+
+    def test_a_word_the_artifact_does_not_carry_still_refuses(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ, главный: нет слова — нет зачёта, и после правки тоже."""
+        for needle in ("гейт самообновления снова зелёный причина УТЕРЯНА",
+                       "гейт самообновления снова СИНИЙ причина найдена",
+                       "совсем другая фраза которой тут нет"):
+            self.assertFalse(cpv.address_hit("notes.txt", self.LIVE_HEAD, needle), needle)
+        got = self._gate_on(self.LIVE_HEAD, "гейт самообновления снова зелёный причина УТЕРЯНА")
+        self.assertEqual((got["verdict"], got["reason_code"]),
+                         (cpv.DISPROVEN, "text_condition_failed"))
+
+    def test_words_standing_apart_are_not_an_address(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ 2: врозь — не подряд, иначе адрес перестаёт что-либо доказывать.
+
+        Каждое слово обеих фраз в тексте ПРИСУТСТВУЕТ (замер по трём живым артефактам: слов,
+        которых нет вовсе, — ноль). Именно поэтому «есть ли слова где-нибудь в файле» зачётом
+        быть не может: этому условию отвечает любой длинный отчёт.
+        """
+        scattered = "гейт самообновления причина найдена снова зелёный"      # порядок переставлен
+        interleaved = "гейт самообновления снова зелёный шапка причина найдена"  # чужое слово внутри
+        for needle in (scattered, interleaved):
+            for word in needle.split():
+                self.assertIn(word.casefold(), self.LIVE_HEAD.casefold())
+            self.assertFalse(cpv.address_hit("notes.txt", self.LIVE_HEAD, needle), needle)
+
+    def test_words_are_not_glued_across_markup_scaffolding(self):
+        """Потолок промежутка ИЗМЕРЕН: 5 — законный максимум, 12 — граница таблицы."""
+        table = "| … снова зелёный |\n|---|---|---|---|\n| причина найдена …\n"
+        self.assertFalse(cpv.address_hit("x.md", table, "снова зелёный причина найдена"))
+        self.assertTrue(cpv.address_hit("x.md", "снова зелёный`) — причина найдена\n",
+                                        "снова зелёный причина найдена"))
+
+    def test_a_word_may_not_match_a_piece_of_a_longer_word(self):
+        self.assertFalse(cpv.address_hit("x.md", "# Гейтом самообновления снова зелёный, причина "
+                                                 "найденатут\n", self.LIVE_WORDS))
+
+    def test_the_name_of_the_file_answers_through_its_hyphens(self):
+        self.assertTrue(cpv.address_hit(
+            "docs/artifacts/2026-09-04-судья-терпит-пунктуацию-адреса.md",
+            "# Про другое совсем\n", "судья терпит пунктуацию адреса"))
+        self.assertFalse(cpv.address_hit(
+            "docs/artifacts/2026-09-04-судья-терпит-адреса.md",
+            "# Про другое совсем\n", "судья терпит пунктуацию адреса"))
+
+    def test_an_address_of_punctuation_alone_adds_no_hit(self):
+        """Слов в адресе ноль — новая ветка молчит, а не зачитывает пустоту.
+
+        Судится именно ветка сличения слов: дословное вхождение — прежнее поведение
+        `address_hit`, и его этот заход не трогает ни строкой.
+        """
+        self.assertFalse(cpv._words_in_order("текст , ; !\n", " , ; !"))
+        self.assertFalse(cpv._words_in_order("любой текст", ""))
+
+
 class TestMeasuredRunBinding(_Retask):
     """A measured change binds evidence to the run; only the TASK may choose that mode."""
 

@@ -212,6 +212,39 @@ def _parse_json(evidence):
 
 
 _SEPARATOR_RE = re.compile(r"[-_/.\\]+")
+# An address word is an unbroken run of letters and digits.  EVERYTHING else --
+# space, newline, any punctuation, any markup -- is a separator between words.
+# The list is defined by exclusion rather than enumerated, because an enumerated
+# list of punctuation is a list of the marks someone happened to think of: the
+# first unlisted one (a dash from a different codepoint, a typographic quote, a
+# markdown asterisk) would silently fail a proven artifact again.  ``_`` is
+# forced into the separator side: in a file NAME it stands exactly where ``-``
+# stands, and ``\w`` would otherwise count it as a letter.
+_ADDR_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+# The gap ceiling is MEASURED, not chosen: 520 live artifacts, 5309 gaps between
+# adjacent words of their headings -- the longest legitimate one is 5 chars
+# (``) -- ``), while the shortest markdown scaffolding run in bodies is 12
+# (``  |\n\n---\n\n## ``, a table edge).  10 sits above twice the legitimate
+# maximum and below the scaffolding floor, so address words may cross a comma or
+# a bold marker but never a table border or a horizontal rule.
+_ADDR_GAP_MAX = 10
+
+
+def _words_in_order(haystack, needle):
+    """Do the address words stand CONSECUTIVELY in this text?
+
+    Consecutive means: same words, same order, and between them nothing but
+    punctuation and whitespace -- not one letter and not one digit.  That last
+    clause is the whole guarantee.  Drop it and the check degrades into "are
+    these words somewhere in the file", which any long report satisfies and
+    which therefore proves nothing at all.
+    """
+    words = _ADDR_WORD_RE.findall(needle)
+    if not words:
+        return False
+    gap = r"[\W_]{1,%d}" % _ADDR_GAP_MAX
+    pattern = r"(?<![^\W_])%s(?![^\W_])" % gap.join(re.escape(word) for word in words)
+    return re.search(pattern, haystack) is not None
 
 
 def address_hit(path, text, needle):
@@ -221,9 +254,20 @@ def address_hit(path, text, needle):
     check that reads only one side reports a fact about naming style and lets it
     pass for a fact about the product.  Separators in the path are read as spaces,
     because ``x-y-z.md`` is how a file is named ``x y z``.
+
+    04.09.2026 -- the words are compared as a WORD SEQUENCE, not as a literal
+    substring.  Three closures (195, 208, 210) were sent to DISPROVEN with the
+    work done and committed; in two of them the address words were named as a
+    phrase and the heading carried the same words with a comma inside it, so a
+    comma the writer put between "зелёный" and "причина" was reported as a fact
+    about the product.  Nothing is loosened besides that: a word the artifact
+    does not carry, or words standing apart with other words between them, still
+    fail.
     """
     folded = needle.casefold()
-    return folded in text.casefold() or folded in _SEPARATOR_RE.sub(" ", path).casefold()
+    if folded in text.casefold() or folded in _SEPARATOR_RE.sub(" ", path).casefold():
+        return True
+    return _words_in_order(text.casefold(), folded) or _words_in_order(path.casefold(), folded)
 
 
 def _gate(gate_id, status, reason_code, evidence_refs=()):
