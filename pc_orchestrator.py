@@ -6343,6 +6343,14 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         # доставку правок демону своим незакоммиченным WIP.
                         "review_auto_run.py", "review_auto.py", "review_pack.py",
                         "review_send.py", "review_send_run.py", "hq_context_pack.py",
+                        # 05.09.2026: шапка пакета называет редакцию канона рамки, и читают её
+                        # РУКИ (`review_pack_build.live_frame_version`) — чистое ядро в мост не
+                        # ходит. Отсюда новый лист куста: review_auto_run → review_pack_build.
+                        # Чем опасна его грязь: этот файл решает, ЧТО ревьюер увидит на месте
+                        # версии; незакоммиченный WIP здесь тихо превращает живое чтение в
+                        # «НЕИЗВЕСТНА» на каждом пакете — и пакеты уедут наружу правильными с
+                        # виду, но без редакции правил, ради которой строка и заведена.
+                        "review_pack_build.py",
                         # 01.09.2026: ступень B — куст за ленивым `import review_intake_run` в
                         # `maybe_review_intake`. Свои зависимости у него те же (review_pack,
                         # review_send) плюс `queue_snapshot_pc`, у которого он одалживает замок

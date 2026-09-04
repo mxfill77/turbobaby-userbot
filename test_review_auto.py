@@ -35,6 +35,11 @@ import review_send
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# Версия канона рамки — ОБЯЗАТЕЛЬНЫЙ параметр сборки пакета (задача 223): её
+# читают руки живьём из KB_shtab_frame. Здесь она ФИКСТУРА и живым номером быть
+# не должна — иначе в дереве завелась бы вторая, молча стареющая копия версии.
+_FRAME = "01.01.2026 #7"
+
 # Живой текст постановки этой полосы (заголовок задачи 82, дословно): в нём есть
 # абсолютный путь. Голден намеренно не «идеализированная формулировка» — класс
 # «тест ≠ реальность» на этой полосе уже стоил зелёного юнита при живом провале.
@@ -410,7 +415,8 @@ class TestCaseBuilding(unittest.TestCase):
     def test_chain_case_builds_an_ok_pack_with_the_hypothesis_section(self):
         rec = _receipt()
         self._write_receipt(rec)
-        pack = review_pack.build_review_pack(review_auto.case_for_chain(rec, "2026-09-01"), root=self.root)
+        pack = review_pack.build_review_pack(review_auto.case_for_chain(rec, "2026-09-01"), root=self.root,
+                                             frame_version=_FRAME)
         self.assertEqual(pack["status"], "ok")
         text = review_pack.render_review_pack(pack)
         self.assertIn("## ГИПОТЕЗА ШТАБА (постановка задачи — НЕ факт и НЕ доказательство)", text)
@@ -436,7 +442,7 @@ class TestCaseBuilding(unittest.TestCase):
                                           line_counts=review_auto_run.line_counts(
                                               self.root, [review_auto.receipt_rel(rec), clean]),
                                           artifact_sources=kept, held_artifacts=held)
-        pack = review_pack.build_review_pack(case, root=self.root)
+        pack = review_pack.build_review_pack(case, root=self.root, frame_version=_FRAME)
         text = review_pack.render_review_pack(pack)
         self.assertIn("НЕ ПРИЛОЖЕНО стражей исходящего", text)
         self.assertIn(dirty, text)
@@ -459,7 +465,7 @@ class TestCaseBuilding(unittest.TestCase):
         self.assertEqual(required[0], review_auto.digest_index_rel("2026-09-01"))
         # Расписки тоже обязательны — правило ступени 1 не разрешает иначе.
         self.assertTrue(all(s["required"] for s in case["sources"]))
-        pack = review_pack.build_review_pack(case, root=self.root)
+        pack = review_pack.build_review_pack(case, root=self.root, frame_version=_FRAME)
         self.assertEqual(pack["status"], "ok")
         text = review_pack.render_review_pack(pack)
         for rec in recs:
@@ -481,7 +487,8 @@ class TestCaseBuilding(unittest.TestCase):
         counts = review_auto_run.line_counts(
             self.root, [review_auto.digest_index_rel(day)] + [review_auto.receipt_rel(r) for r in recs])
         case, pack = review_auto_run._fit_digest(
-            {"receipts": recs, "day": day}, day, counts, self.root, review_pack.REVIEW_MAX_CHARS)
+            {"receipts": recs, "day": day}, day, counts, self.root, review_pack.REVIEW_MAX_CHARS,
+            (_FRAME, None))
         self.assertEqual(pack["status"], "ok")
         self.assertLess(len(case["result_packets"]), len(recs), "ни одной расписки не отброшено")
         self.assertIn("расписок приложено %d из %d" % (len(case["result_packets"]), len(recs)),
@@ -499,7 +506,7 @@ class TestCaseBuilding(unittest.TestCase):
         self._write_receipt(rec)
         case = review_auto.case_for_chain(rec, "2026-09-01")
         self.assertEqual(case["hypothesis"], [])
-        pack = review_pack.build_review_pack(case, root=self.root)
+        pack = review_pack.build_review_pack(case, root=self.root, frame_version=_FRAME)
         self.assertIn("постановки не было", review_pack.render_review_pack(pack))
 
 
@@ -513,13 +520,19 @@ class TestStageOneUntouched(unittest.TestCase):
         with io.open(case_path, encoding="utf-8") as fh:
             case = json.load(fh)
         self.assertNotIn("hypothesis", case)
-        pack = review_pack.build_review_pack(case, root=HERE)
+        pack = review_pack.build_review_pack(case, root=HERE, frame_version=_FRAME)
         text = review_pack.render_review_pack(pack)
         self.assertNotIn("ГИПОТЕЗА ШТАБА", text)
         stored = os.path.join(HERE, "docs", "review_outbox", review_pack.pack_filename(pack))
         if os.path.exists(stored):
             with io.open(stored, encoding="utf-8", newline="") as fh:
-                self.assertEqual(fh.read(), text, "пакет ступени 1 пересобрался ИНАЧЕ")
+                was = fh.read()
+            # Сверяем ТЕЛО, а не файл целиком: 05.09 в шапку встали версия канона
+            # рамки и явная граница ревьюера, и байтового равенства с пакетами до
+            # 223 больше нет ПО ЗАМЫСЛУ. Предмет юнита — что поле гипотезы не
+            # сдвинуло разделы; шапку стережёт test_review_pack.FrameVersionHeader.
+            cut = lambda t: t[t.index("## ЦЕЛЬ"):]
+            self.assertEqual(cut(was), cut(text), "тело пакета ступени 1 пересобралось ИНАЧЕ")
 
     def test_oversized_hypothesis_is_refused_not_silently_clipped(self):
         with self.assertRaises(review_pack.ReviewPackError):

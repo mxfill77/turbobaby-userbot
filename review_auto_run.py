@@ -33,6 +33,7 @@ import sys
 
 import review_auto
 import review_pack
+import review_pack_build
 import review_send
 import review_send_run
 
@@ -251,7 +252,7 @@ def screen_artifacts(root, paths, head_lines=review_auto.ARTIFACT_HEAD_LINES):
     return kept, held
 
 
-def _fit_digest(trigger, build_date, counts, root, max_chars):
+def _fit_digest(trigger, build_date, counts, root, max_chars, frame):
     """Дайджест с ИЗМЕРЕННЫМ числом приложенных расписок. → (case, pack).
 
     Фиксированное число здесь не работает, и это ЗАМЕР, а не опасение: первый живой
@@ -268,30 +269,39 @@ def _fit_digest(trigger, build_date, counts, root, max_chars):
     for n in range(top, 0, -1):
         case = review_auto.case_for_digest(trigger["receipts"], trigger["day"], build_date,
                                            line_counts=counts, receipts_in_pack=n)
-        pack = review_pack.build_review_pack(case, root=root, max_chars=max_chars)
+        pack = review_pack.build_review_pack(case, root=root, max_chars=max_chars,
+                                             frame_version=frame[0], frame_version_note=frame[1])
         if pack["status"] == "ok":
             return case, pack
     if case is None:                       # расписок нет вовсе — сюда доходит только пустой день
         case = review_auto.case_for_digest([], trigger["day"], build_date, line_counts=counts)
-        pack = review_pack.build_review_pack(case, root=root, max_chars=max_chars)
+        pack = review_pack.build_review_pack(case, root=root, max_chars=max_chars,
+                                             frame_version=frame[0], frame_version_note=frame[1])
     return case, pack
 
 
 def _build_pack(trigger, root, build_date, max_chars):
-    """Повод → (case, pack, text, rel-путь пакета). Пишет индекс дня для дайджеста."""
+    """Повод → (case, pack, text, rel-путь пакета). Пишет индекс дня для дайджеста.
+
+    Версия канона рамки читается ЗДЕСЬ и ровно ОДИН раз на пакет: подгонка
+    дайджеста под потолок пересобирает пакет до DIGEST_RECEIPTS_MAX раз, и чтение
+    внутри цикла било бы по мосту столько же раз ради одного и того же числа.
+    """
+    frame = review_pack_build.live_frame_version()
     if trigger["kind"] == "chain":
         rec = trigger["receipt"]
         artifacts, held = screen_artifacts(root, list(rec.get("artifacts") or []))
         counts = line_counts(root, [review_auto.receipt_rel(rec)] + artifacts)
         case = review_auto.case_for_chain(rec, build_date, line_counts=counts,
                                           artifact_sources=artifacts, held_artifacts=held)
-        pack = review_pack.build_review_pack(case, root=root, max_chars=max_chars)
+        pack = review_pack.build_review_pack(case, root=root, max_chars=max_chars,
+                                             frame_version=frame[0], frame_version_note=frame[1])
     else:
         index_rel = review_auto.digest_index_rel(trigger["day"])
         write_text(_path(root, index_rel),
                    review_auto.digest_index_text(trigger["receipts"], trigger["day"], build_date))
         counts = line_counts(root, [index_rel] + [review_auto.receipt_rel(r) for r in trigger["receipts"]])
-        case, pack = _fit_digest(trigger, build_date, counts, root, max_chars)
+        case, pack = _fit_digest(trigger, build_date, counts, root, max_chars, frame)
     text = review_pack.render_review_pack(pack)
     rel = "%s/%s" % (DEFAULT_OUTBOX, review_pack.pack_filename(pack))
     write_text(_path(root, rel), text)

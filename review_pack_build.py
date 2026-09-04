@@ -34,6 +34,40 @@ def load_case(path):
         return json.load(fh)
 
 
+def live_frame_version(reader=None, test_context=None):
+    """Версия канона рамки, прочитанная ЖИВЬЁМ. → (версия|None, примечание|None).
+
+    Единственное место полосы, где сборщик пакета узнаёт редакцию правил, и оно
+    НАМЕРЕННО здесь, в руках: чистое ядро `review_pack` сети не касается.
+
+    Источник — тот же узел, что читают исполнители (`KB_shtab_frame`), через
+    того же доверенного писателя; секретов этот файл не видит. Копии версии тут
+    нет ни одной: отказ моста даёт ``None``, а не «последнюю известную» —
+    подставить вчерашний номер значило бы соврать ревьюеру о редакции правил, и
+    соврать МОЛЧА, то есть ровно тем способом, против которого правило написано.
+
+    Под гейтом и юнитами живой узел не трогаем вовсе (тот же замок, что у
+    `brain_writer` на записи): тест обязан получать «неизвестно», а не ходить в
+    мост за настоящим номером.
+    """
+    import log_setup
+
+    if (test_context if test_context is not None else log_setup.is_test_context()) and reader is None:
+        return None, "тестовый контекст: живой узел не читаем"
+    try:
+        if reader is None:
+            import brain_writer
+
+            reader = brain_writer.read_text
+        text = reader(name=review_pack.FRAME_DOC_NAME)
+    except Exception as exc:                       # noqa: BLE001 — исход один: версии нет
+        return None, "%s: %s" % (type(exc).__name__, str(exc).replace("\n", " ")[:160])
+    version = review_pack.parse_frame_version(text)
+    if not version:
+        return None, "узел прочитан (%d знаков), номер редакции в шапке не найден" % len(text or "")
+    return version, None
+
+
 def journal_argv(repo=HERE, python=None):
     """argv штатного писателя журнала. Строка идёт СТДИНОМ, а не аргументом.
 
@@ -64,9 +98,12 @@ def main(argv=None):
 
     outbox_dir = args.outbox or os.path.join(args.root, *DEFAULT_OUTBOX.split("/"))
 
+    frame_version, frame_note = live_frame_version()
+
     try:
         case = load_case(args.case)
-        pack = review_pack.build_review_pack(case, root=args.root, max_chars=args.max_chars)
+        pack = review_pack.build_review_pack(case, root=args.root, max_chars=args.max_chars,
+                                             frame_version=frame_version, frame_version_note=frame_note)
     except review_pack.ReviewPackError as exc:
         sys.stderr.write("СПЕЦИФИКАЦИЯ НЕДЕЙСТВИТЕЛЬНА: %s\n" % exc)
         return 2
@@ -81,6 +118,9 @@ def main(argv=None):
     if args.print_text:
         sys.stdout.write(text)
 
+    sys.stdout.write("ВЕРСИЯ КАНОНА: %s%s\n"
+                     % (frame_version or review_pack.FRAME_VERSION_UNKNOWN,
+                        " (%s)" % frame_note if frame_note else ""))
     sys.stdout.write("ПАКЕТ: %s (%s, %d знаков)\n" % (rel, pack["status"], pack["text_chars"]))
     sys.stdout.write("ИНДЕКС: %s\n" % line)
 

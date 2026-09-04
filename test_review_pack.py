@@ -17,15 +17,25 @@ import tempfile
 import unittest
 
 import review_pack
+import review_pack_build
 from review_pack import (
+    FRAME_DOC_NAME,
+    FRAME_VERSION_UNKNOWN,
     REVIEW_MAX_CHARS,
     TAIL_QUESTIONS,
     ReviewPackError,
     build_review_pack,
     index_line,
     pack_filename,
+    parse_frame_version,
     render_review_pack,
 )
+
+
+# Номер редакции для юнитов. Это ФИКСТУРА, а не «известная версия рамки»: код
+# версию не хранит нигде, и подставлять сюда живой номер значило бы завести ту
+# самую вторую копию — тест позеленел бы на устаревшем числе как на верном.
+FRAME_VERSION_FIXTURE = "01.01.2026 #7"
 
 
 def _write(root, rel, text):
@@ -81,6 +91,11 @@ class _Base(unittest.TestCase):
         return self.tmp
 
     def build(self, case=None, **kw):
+        # Версия канона — ОБЯЗАТЕЛЬНЫЙ параметр сборки; у хелпера она есть по
+        # умолчанию, чтобы остальные юниты мерили своё. Само требование её
+        # передать проверяется отдельно (FrameVersionHeader), а не молчанием
+        # этой строки.
+        kw.setdefault("frame_version", FRAME_VERSION_FIXTURE)
         return build_review_pack(case or _case(), root=self.root(), **kw)
 
 
@@ -125,7 +140,7 @@ class OkPack(_Base):
         self.addCleanup(shutil.rmtree, other, ignore_errors=True)
         _write(other, "result.json", '{"status": "reported_done"}\n{"tests": 31}\n')
         here = self.build()
-        there = build_review_pack(_case(), root=other)
+        there = build_review_pack(_case(), root=other, frame_version=FRAME_VERSION_FIXTURE)
         self.assertEqual(here["text_sha256"], there["text_sha256"])
         self.assertNotIn(self.root(), render_review_pack(here))
 
@@ -334,7 +349,12 @@ class Numbers(_Base):
                 {"name": "звонков", "value": 7, "source": "extra.txt"},
             ],
         )
-        pack = self.build(case, max_chars=2600)
+        # Потолок ЗАМЕРЕН, а не назначен: он обязан впускать обязательный
+        # источник и не впускать необязательный. Минимальный пакет — 2547 знаков
+        # (замер 05.09 после того, как в шапку встали версия канона и граница
+        # ревьюера), с `extra.txt` — 3000+. Прежние 2600 теперь блокируют пакет
+        # целиком, и юнит мерил бы не то, ради чего написан.
+        pack = self.build(case, max_chars=2800)
         by_name = {n["name"]: n for n in pack["numbers"]}
         self.assertEqual(by_name["звонков"]["evidence"], "unknown")
         self.assertIsNone(by_name["звонков"]["source_sha256"])
@@ -467,6 +487,166 @@ class NoSideEffects(_Base):
             elif isinstance(func, ast.Name):
                 called.add(func.id)
         self.assertEqual(called & forbidden, set(), "модуль зовёт недетерминированный источник")
+
+
+# ───────────────── версия канона рамки в шапке (задача 223) ─────────────────
+
+
+class FrameVersionHeader(_Base):
+    """Шапка называет редакцию правил, по которой мы живём, — или честно молчит.
+
+    Ревьюер спорит с нами о правилах, не имея их текста: без номера редакции
+    «у вас запрещено X» и «у вас БЫЛО запрещено X» — одна и та же фраза.
+    """
+
+    def test_header_names_the_frame_version_next_to_the_build_date(self):
+        text = render_review_pack(self.build())
+        self.assertIn("версия канона рамки", text)
+        self.assertIn(FRAME_VERSION_FIXTURE, text)
+        self.assertIn(FRAME_DOC_NAME, text)
+        # «рядом с датой сборки» — это про место, а не про настроение: строка
+        # обязана стоять В ШАПКЕ, до первого раздела, иначе её прочитают после
+        # выводов, ради которых она и нужна.
+        lines = text.splitlines()
+        self.assertLess(_line_no(lines, "версия канона рамки"), _line_no(lines, "## ЦЕЛЬ"))
+        self.assertEqual(
+            _line_no(lines, "версия канона рамки") - _line_no(lines, "пакет собран"), 1,
+            "строка версии оторвалась от даты сборки",
+        )
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ №1: источник недоступен ──
+    def test_unavailable_source_prints_unknown_and_never_a_stale_number(self):
+        text = render_review_pack(self.build(frame_version=None))
+        self.assertIn("версия канона рамки: **%s**" % FRAME_VERSION_UNKNOWN, text)
+        # Ровно то, чем эта ветка провалилась бы: подстановка «последней
+        # известной». Числа в строке версии при отказе быть не должно вовсе.
+        version_line = [ln for ln in text.splitlines() if ln.startswith("версия канона рамки")][0]
+        self.assertNotRegex(version_line, r"\d{2}\.\d{2}\.\d{4}")
+
+    def test_unavailable_source_carries_the_reason(self):
+        text = render_review_pack(self.build(frame_version=None, frame_version_note="мост не ответил: timeout"))
+        self.assertIn("мост не ответил: timeout", text)
+
+    def test_blocked_pack_also_names_the_version(self):
+        case = _case(
+            sources=[_src("gone.json")],
+            result_packets=[{"task_id": "t", "path": "gone.json", "reported_status": "reported_done"}],
+            numbers=[],
+        )
+        pack = self.build(case, frame_version=None)
+        self.assertEqual(pack["status"], "blocked")
+        self.assertIn(FRAME_VERSION_UNKNOWN, render_review_pack(pack))
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ №2: без версии пакет не собирается МОЛЧА ──
+    def test_build_without_the_parameter_refuses_loudly(self):
+        with self.assertRaises(ReviewPackError) as ctx:
+            build_review_pack(_case(), root=self.root())
+        self.assertEqual(ctx.exception.reason, "missing_frame_version")
+
+    def test_render_of_a_dict_without_the_field_refuses_loudly(self):
+        pack = self.build()
+        pack.pop("frame_version")
+        with self.assertRaises(ReviewPackError) as ctx:
+            render_review_pack(pack)
+        self.assertEqual(ctx.exception.reason, "missing_frame_version")
+
+    # ── ЗАМОК ОТ ВТОРОЙ КОПИИ (предсмертный взгляд задачи) ──
+    def test_version_stored_in_the_case_file_is_refused(self):
+        # Спецификации лежат файлами в docs/review_cases/ и пересобираются днями
+        # позже. Версия, записанная туда, — ровно та молча стареющая копия.
+        with self.assertRaises(ReviewPackError) as ctx:
+            build_review_pack(_case(frame_version="02.09.2026 #1"), root=self.root(),
+                              frame_version=FRAME_VERSION_FIXTURE)
+        self.assertEqual(ctx.exception.reason, "frame_version_in_case")
+
+    def test_the_module_stores_no_version_of_its_own(self):
+        # Ни одной даты вида ДД.ММ.ГГГГ в исходнике сборщика: номер редакции
+        # приходит извне, и захардкодить его нельзя незаметно.
+        with open(review_pack.__file__, "r", encoding="utf-8") as fh:
+            body = fh.read()
+        # Комментарий-пример шапки канона — единственное законное вхождение;
+        # мерим строки КОДА, а не текст целиком.
+        code = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+        self.assertNotRegex(code, r"\d{2}\.\d{2}\.20\d{2}\s*#\s*\d")
+
+    def test_bad_version_value_is_refused(self):
+        for bad in ("", "  ", 42, ["02.09.2026 #1"], "x" * 200):
+            with self.assertRaises(ReviewPackError):
+                build_review_pack(_case(), root=self.root(), frame_version=bad)
+
+    # ── разбор шапки канона ──
+    def test_parser_reads_the_live_header_shape(self):
+        head = "═══ РАМКА ПРОЕКТА TurboBaby — ИНСТРУКЦИИ ШТАБА (версия 02.09.2026 #1) ═══\n\nтело\n"
+        self.assertEqual(parse_frame_version(head), "02.09.2026 #1")
+
+    def test_parser_says_none_instead_of_guessing(self):
+        for text in ("", None, "рамка без номера редакции", "версия 5"):
+            self.assertIsNone(parse_frame_version(text))
+
+    def test_parser_ignores_a_number_far_below_the_header(self):
+        # Слово «версия» встречается в прозе канона; подцепить оттуда чужое
+        # число хуже, чем не найти ничего.
+        body = "шапки нет\n" * 20 + "версия 01.01.1999 #9\n"
+        self.assertIsNone(parse_frame_version(body))
+
+    # ── руки: живое чтение и его отказ ──
+    def test_hands_read_the_same_node_the_executors_read(self):
+        seen = {}
+
+        def reader(name=None):
+            seen["name"] = name
+            return "═══ РАМКА ПРОЕКТА TurboBaby (версия 03.09.2026 #2) ═══\n"
+
+        version, note = review_pack_build.live_frame_version(reader=reader)
+        self.assertEqual(seen["name"], FRAME_DOC_NAME)
+        self.assertEqual((version, note), ("03.09.2026 #2", None))
+
+    def test_hands_return_unknown_when_the_bridge_refuses(self):
+        def reader(name=None):
+            raise RuntimeError("мост не ответил")
+
+        version, note = review_pack_build.live_frame_version(reader=reader)
+        self.assertIsNone(version)
+        self.assertIn("мост не ответил", note)
+
+    def test_hands_do_not_touch_the_live_node_under_tests(self):
+        version, note = review_pack_build.live_frame_version(test_context=True)
+        self.assertIsNone(version)
+        self.assertIn("тестовый контекст", note)
+
+    def test_pure_core_still_has_no_io(self):
+        # Живое чтение живёт в РУКАХ; ядро обязано остаться чистым, иначе пакет
+        # перестанет пересобираться байт в байт.
+        with open(review_pack.__file__, "r", encoding="utf-8") as fh:
+            code = fh.read()
+        for forbidden in ("import brain_writer", "urllib", "requests", "subprocess"):
+            self.assertNotIn(forbidden, code)
+
+
+# ───────────────── роль и граница ревьюера — ЯВНО (задача 223) ─────────────────
+
+
+class ReviewerRoleAndBoundary(_Base):
+    def test_role_and_boundary_are_stated_explicitly(self):
+        text = render_review_pack(self.build())
+        self.assertIn("РОЛЬ РЕВЬЮЕРА:", text)
+        self.assertIn("ГРАНИЦА:", text)
+
+    def test_boundary_says_he_does_not_see_live_state(self):
+        text = render_review_pack(self.build())
+        self.assertIn("НЕ видит", text)
+        self.assertIn("НЕ утверждает", text)
+
+    def test_boundary_stands_before_the_facts(self):
+        lines = render_review_pack(self.build()).splitlines()
+        self.assertLess(_line_no(lines, "ГРАНИЦА:"), _line_no(lines, "## RESULT PACKET"))
+
+
+def _line_no(lines, needle):
+    for i, line in enumerate(lines):
+        if needle in line:
+            return i
+    raise AssertionError("в тексте пакета нет строки %r" % needle)
 
 
 if __name__ == "__main__":

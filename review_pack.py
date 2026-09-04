@@ -66,6 +66,36 @@ SUMMARY_LINE_MAX = 400
 SUMMARY_LINES_MAX = 20
 NUMBERS_MAX = 60
 
+# ВЕРСИЯ КАНОНА РАМКИ в шапке. Ревьюер спорит с нами о правилах, не имея их
+# текста, — и без номера редакции его ответ нельзя привязать ко времени: «у вас
+# запрещено X» и «у вас БЫЛО запрещено X» становятся одной фразой.
+#
+# Источник — ТОТ ЖЕ, что читают исполнители: живой узел `KB_shtab_frame`. Второй
+# копии рамки здесь нет и завестись не может: модуль версию НЕ ХРАНИТ, НЕ
+# УГАДЫВАЕТ и никуда не ходит — он получает её ПОЛЕМ ВХОДА (ровно как
+# ``build_date``) от рук, прочитавших канон В МОМЕНТ СБОРКИ. Инвариант чистоты
+# цел: ни сети, ни часов.
+#
+# Отсюда же запрет ``frame_version`` в спецификации случая (см. _validate_case):
+# спецификации лежат файлами в `docs/review_cases/` и пересобираются днями
+# позже — версия, записанная туда, была бы ровно той молча стареющей копией,
+# против которой правило четырёх проекций и написано.
+FRAME_DOC_NAME = "KB_shtab_frame"
+
+# Первая строка канона: «═══ РАМКА ПРОЕКТА TurboBaby — ИНСТРУКЦИИ ШТАБА (версия
+# 02.09.2026 #1) ═══». Регулярка ИЩЕТ номер редакции в чужом тексте, а не хранит
+# его: сама по себе она не стареет и ничего не утверждает о редакции.
+_RE_FRAME_VERSION = re.compile(r"верси[яи]\s+(\d{2}\.\d{2}\.\d{4}\s*#\s*\d+)", re.IGNORECASE)
+
+FRAME_VERSION_MAX = 60
+FRAME_VERSION_NOTE_MAX = 300
+FRAME_VERSION_UNKNOWN = "НЕИЗВЕСТНА"
+
+# Сентинел «ключ не передан вовсе» — отдельно от None. None значит «читали и не
+# достали» (законный исход, шапка скажет НЕИЗВЕСТНА); отсутствие ключа значит
+# «версию не спросили», и это отказ сборки, а не тихий пропуск строки.
+_UNSET = object()
+
 # ГИПОТЕЗА ШТАБА — текст ПОСТАНОВКИ, если она была. Живёт ОТДЕЛЬНЫМ полем и
 # отдельным разделом, а не строкой сводки, ровно по одной причине: постановка —
 # это то, чего от работы ХОТЕЛИ, а сводка и числа — то, что вышло. Слепив их,
@@ -246,6 +276,47 @@ def _validate_hypothesis(value):
     return out
 
 
+def parse_frame_version(text, *, head_lines=5):
+    """Номер редакции канона из ЕГО ЖЕ текста. → str | None. Чистая функция.
+
+    Смотрит только голову: номер живёт в шапке, а ниже по тексту слово «версия»
+    встречается в прозе — подцепить оттуда чужое число хуже, чем не найти
+    ничего. Не нашлось — ``None``, то есть «неизвестно», а не догадка.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    match = _RE_FRAME_VERSION.search("\n".join(text.splitlines()[:head_lines]))
+    if not match:
+        return None
+    return re.sub(r"\s*#\s*", " #", re.sub(r"\s+", " ", match.group(1).strip()))
+
+
+def _validate_frame_version(value, note):
+    """(версия, примечание) → нормализованная пара. None — законное «неизвестно»."""
+    if value is None:
+        version = None
+    elif isinstance(value, str) and value.strip():
+        version = re.sub(r"\s+", " ", value.strip())
+        if len(version) > FRAME_VERSION_MAX:
+            raise ReviewPackError(
+                "invalid_frame_version",
+                "frame_version length %d exceeds %d" % (len(version), FRAME_VERSION_MAX),
+            )
+    else:
+        raise ReviewPackError(
+            "invalid_frame_version",
+            "frame_version must be a non-empty str (версия) or None (неизвестна), got %r" % (value,),
+        )
+    if note is None:
+        return version, None
+    if not isinstance(note, str) or not note.strip():
+        raise ReviewPackError("invalid_frame_version", "frame_version_note must be a non-empty str or None")
+    text = re.sub(r"\s+", " ", note.strip())
+    if len(text) > FRAME_VERSION_NOTE_MAX:
+        text = text[: FRAME_VERSION_NOTE_MAX - 1] + "…"
+    return version, text
+
+
 def _index_manifest(sources):
     if not isinstance(sources, (list, tuple)) or not sources:
         raise ReviewPackError("invalid_sources", "case.sources must be a non-empty list")
@@ -263,6 +334,17 @@ def _index_manifest(sources):
 def _validate_case(case):
     if not isinstance(case, dict):
         raise ReviewPackError("invalid_case", "case must be a dict")
+
+    # ЗАМОК ОТ ВТОРОЙ КОПИИ. Спецификация случая — ФАЙЛ на диске; версия, попавшая
+    # в неё, переживёт редакцию канона и будет молча печататься в шапке как
+    # свежая. Версия приходит ТОЛЬКО параметром сборки, прочитанным живьём.
+    if "frame_version" in case:
+        raise ReviewPackError(
+            "frame_version_in_case",
+            "версии канона рамки в спецификации случая быть не может: она хранилась бы файлом и "
+            "молча старела. Версия читается из %s в момент сборки и передаётся параметром "
+            "frame_version=" % FRAME_DOC_NAME,
+        )
 
     kind = case.get("kind")
     if kind not in PACK_KINDS:
@@ -354,6 +436,8 @@ def _blocked_core(spec, reason, detail, extra=None):
         "task_class": spec["task_class"],
         "subject_date": spec["subject_date"],
         "build_date": spec["build_date"],
+        "frame_version": spec["frame_version"],
+        "frame_version_note": spec["frame_version_note"],
         "active_objective": spec["active_objective"],
         "summary": spec["summary"],
         "result_packets": spec["result_packets"],
@@ -446,6 +530,8 @@ def _core_from_inner(spec, inner, omitted):
         "task_class": spec["task_class"],
         "subject_date": spec["subject_date"],
         "build_date": spec["build_date"],
+        "frame_version": spec["frame_version"],
+        "frame_version_note": spec["frame_version_note"],
         "active_objective": spec["active_objective"],
         "summary": spec["summary"],
         "result_packets": result_packets,
@@ -492,21 +578,34 @@ def _required_gap(spec, inner):
     return None
 
 
-def build_review_pack(case, *, root, max_chars=REVIEW_MAX_CHARS):
+def build_review_pack(case, *, root, max_chars=REVIEW_MAX_CHARS, frame_version=_UNSET, frame_version_note=None):
     """Собрать детерминированный пакет второго мнения. → dict.
 
     ``case`` — объявленная спецификация случая (см. модульную docstring).
+    ``frame_version`` — номер редакции канона рамки, прочитанный ЖИВЬЁМ руками
+    сборки (``None`` = достать не удалось; шапка честно скажет «%s»).
+    Параметр ОБЯЗАТЕЛЕН и умолчания не имеет: пакет без строки версии в шапке
+    не собирается — но падает ГРОМКО, а не выходит молча без неё.
+
     Возвращает ``status='ok'`` либо ``status='blocked'``; в обоих случаях
     словарь сериализуем и рендерится :func:`render_review_pack`.
-    """
+    """ % FRAME_VERSION_UNKNOWN
     if not isinstance(root, str) or not root:
         raise ReviewPackError("invalid_root", "root must be a non-empty str path")
     if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
         raise ReviewPackError("invalid_max_chars", "max_chars must be a positive int, got %r" % (max_chars,))
+    if frame_version is _UNSET:
+        raise ReviewPackError(
+            "missing_frame_version",
+            "frame_version обязателен: версию канона рамки читают РУКИ в момент сборки из %s. "
+            "Достать не удалось — передай frame_version=None, и шапка скажет «%s»; молча собрать "
+            "пакет без строки версии нельзя" % (FRAME_DOC_NAME, FRAME_VERSION_UNKNOWN),
+        )
 
     spec = _validate_case(case)
     spec["root"] = root
     spec["max_chars"] = max_chars
+    spec["frame_version"], spec["frame_version_note"] = _validate_frame_version(frame_version, frame_version_note)
 
     required = [rec for rec in spec["sources"] if rec.get("required")]
     optional = [rec for rec in spec["sources"] if not rec.get("required")]
@@ -625,6 +724,27 @@ def _table(header, rows):
     return out
 
 
+def _frame_version_line(p):
+    """Строка шапки про редакцию канона. Третьего молчаливого исхода у неё нет.
+
+    Ключа в словаре нет вовсе — это НЕ «неизвестно», а несобранный пакет: значит
+    версию не спросили, и печатать вместо неё прочерк значило бы скрыть пропуск.
+    """
+    if "frame_version" not in p:
+        raise ReviewPackError(
+            "missing_frame_version",
+            "в словаре пакета нет поля frame_version: шапка без строки о версии канона рамки "
+            "не рендерится — собирай через build_review_pack(..., frame_version=…)",
+        )
+    version = p.get("frame_version")
+    note = p.get("frame_version_note")
+    if version:
+        line = "версия канона рамки: **%s** (узел `%s`, прочитан в момент сборки)" % (version, FRAME_DOC_NAME)
+        return line + (" · %s" % note if note else "")
+    line = "версия канона рамки: **%s** — узел `%s` не прочитан" % (FRAME_VERSION_UNKNOWN, FRAME_DOC_NAME)
+    return line + (": %s" % note if note else "")
+
+
 def render_review_pack(pack):
     """Детерминированный текст пакета. → str.
 
@@ -643,6 +763,7 @@ def render_review_pack(pack):
     lines.append("schema: `%s`" % p["schema"])
     lines.append("вид: **%s** (%s)" % (p["kind"], _KIND_TITLE[p["kind"]]))
     lines.append("предмет за: **%s** · пакет собран: **%s**" % (p["subject_date"], p["build_date"]))
+    lines.append(_frame_version_line(p))
     lines.append("класс задачи: `%s`" % p["task_class"])
     lines.append("статус пакета: **%s**" % status)
     lines.append("потолок: %d знаков · выдержки: %d знаков" % (p["max_chars"], p.get("body_chars", 0)))
@@ -651,6 +772,14 @@ def render_review_pack(pack):
     lines.append("")
     lines.append("Это ЗАПРОС ВТОРОГО МНЕНИЯ, а не отчёт о приёмке. Ничего наружу не отправлено,")
     lines.append("ничего не запущено; статусы ниже — ЗАЯВЛЕННЫЕ исполнителем, не проверенные.")
+    lines.append("")
+    # РОЛЬ И ГРАНИЦА — ЯВНО, а не выводимо из оговорки выше. Оговорка говорит, чем
+    # НЕ является пакет; она не говорит, чего ревьюер НЕ ВИДИТ. Без этой строки
+    # «у вас упало» и «у вас в тексте написано, что упало» для него одно и то же.
+    lines.append("РОЛЬ РЕВЬЮЕРА: внешний второй взгляд по ТЕКСТУ этого файла и только по нему.")
+    lines.append("ГРАНИЦА: живого состояния — процессов, очереди, боевых баз, переписки, таблиц —")
+    lines.append("ревьюер НЕ видит и о состоянии НЕ утверждает; текста рамки проекта у него нет,")
+    lines.append("её редакция названа строкой в шапке выше.")
     lines.append("")
 
     if status == "blocked":
