@@ -151,13 +151,21 @@ class TestForeignFileAtTheAddress(JudgeCase):
     """
 
     def test_a_foreign_file_with_a_partial_word_match_is_not_evidence(self):
-        """ОТРИЦАТЕЛЬНЫЙ: чужой файл ловит ЧАСТЬ слов адреса — этого мало."""
+        """ОТРИЦАТЕЛЬНЫЙ: чужой файл ловит ЧАСТЬ слов адреса — этого мало.
+
+        05.09: исход прежний («неизвестно»), а ДОРОГА до него другая и это намеренно. Раньше
+        чужой файл уходил в бандл и приговор приходил от V0 (`text_condition_failed`) — то есть
+        вердикт задачи НАЗЫВАЛСЯ чужим путём. Теперь такой файл кандидатом не становится вовсе:
+        `chosen` пуст, прибор не зовётся, а сам файл остаётся СВЕДЕНИЕМ в причине."""
         base = self.base()
-        _write(self.root, FOLDER + "/2026-09-01-ступень-C-про-другое.md",
-               "# Ступень C — совсем другая работа\n\nтут нет полной фразы адреса\n")
+        alien = FOLDER + "/2026-09-01-ступень-C-про-другое.md"
+        _write(self.root, alien, "# Ступень C — совсем другая работа\n\nтут нет полной фразы адреса\n")
         out = self.judge(base)
         self.assertEqual(out["verdict"], dj.UNKNOWN, out["reason"])
-        self.assertEqual(out["v0"]["reason_code"], "text_condition_failed")
+        self.assertIsNone(out["chosen"], "чужой файл продуктом задачи не объявляется")
+        self.assertIsNone(out["v0"], "до прибора такой кандидат не доходит")
+        self.assertIn("НИ ОДИН", out["reason"])
+        self.assertIn(WORDS, out["reason"], "причина называет СВОИ слова адреса")
 
     def test_own_file_answering_the_address_is_proven(self):
         """ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ рядом с отрицательными: прибор, глухой ко всему, бесполезен."""
@@ -222,13 +230,106 @@ class TestForeignFileAtTheAddress(JudgeCase):
         self.assertIn(FOLDER + "/2026-08-30-чужая-работа.md", base[dj.F_PRIOR].values())
 
 
+# ═══ ДВЕ РУКИ ОДНИМ ВИТКОМ (05.09.2026) ══════════════════════════════════════════════════════
+# С 05.09 демон берёт по ДВЕ задачи за виток («ПАРАЛЛЕЛЬ: беру 2 задач(и) одним витком»), а
+# опорная линия у каждой руки снята при СВОЁМ claim — значит в «изменилось за заход» у второй
+# руки лежит и продукт ПЕРВОЙ. Ниже — оба живых расклада того дня, дословно по числам.
+WORDS_A = "первая рука сдала продукт"
+WORDS_B = "вторая рука продукта не сдала"
+TASK_A = ("ЦЕЛЬ: рука A.\nАДРЕС РЕЗУЛЬТАТА: файл в docs/artifacts за 01.09 со словами " + WORDS_A)
+TASK_B = ("ЦЕЛЬ: рука B.\nАДРЕС РЕЗУЛЬТАТА: файл в docs/artifacts за 01.09 со словами " + WORDS_B)
+# Имена нарочно расставлены по алфавиту так, как легли живые 16/17: продукт ПЕРВОЙ руки —
+# первым. Именно порядок решал, чей файл достанется второй руке.
+REL_A = FOLDER + "/2026-09-01-а-первая-рука-сдала-продукт.md"
+REL_B = FOLDER + "/2026-09-01-я-вторая-рука-сдала-своё.md"
+# Живая форма ТЗ, на которой судья 05.09 споткнулся пять раз подряд (задачи 14–18): строка
+# адреса ПЕРЕНЕСЕНА, а `words` читается до конца ПЕРВОЙ строки — в слова попадает обрывок
+# инструкции. Настоящие слова остаются в хвосте и не участвуют ни в чём.
+TASK_B_WRAPPED = ("ЦЕЛЬ: рука B.\n"
+                  "АДРЕС РЕЗУЛЬТАТА: файл в docs/artifacts за 01.09 со словами адреса. "
+                  "Отдельной строкой\nв артефакте — ровно слова адреса подряд: "
+                  "вторая рука сдала своё")
+WRAPPED_WORDS = "адреса. Отдельной строкой"
+
+
+class TestParallelHands(JudgeCase):
+    """ЧУЖОЙ ПРОДУКТ — НЕ МОЙ АДРЕС. Вердикт каждой руки снимается с ЕЁ СОБСТВЕННОГО задания.
+
+    Замер 05.09: три закрытых параллельных пары, в ДВУХ обе задачи закрыты по ОДНОМУ адресу —
+    чужому для второй руки (16/17 и 18/21). Третья пара (14/15) разошлась СЛУЧАЙНО: её файлы
+    легли в алфавите так, что каждой руке достался свой. Случайность лечению не подлежит —
+    лечится правило, а не расклад.
+    """
+
+    def test_the_hand_without_a_product_is_not_judged_by_the_other_hands_file(self):
+        """ОТРИЦАТЕЛЬНЫЙ (задание владельца): один виток, у каждой руки СВОЙ адрес, продукт
+        только у первой. Первая — доказана, вторая — недоказана, и НИ ОДНА не судится чужим."""
+        base_a = self.base(TASK_A)
+        base_b = self.base(TASK_B)                      # обе линии сняты ДО любого продукта
+        _write(self.root, REL_A, "# Первая рука сдала продукт\n\nтело\n")
+        out_a = dj.judge(16, TASK_A, "done", base_a, run_id="pc-test-16", root=self.root)
+        out_b = dj.judge(17, TASK_B, "done", base_b, run_id="pc-test-17", root=self.root)
+
+        self.assertEqual(out_a["verdict"], dj.DONE, out_a["reason"])
+        self.assertEqual(out_a["chosen"], REL_A)
+
+        self.assertEqual(out_b["verdict"], dj.UNKNOWN, out_b["reason"])
+        self.assertIsNone(out_b["chosen"], "чужой продукт кандидатом второй руки не становится")
+        self.assertIsNone(out_b["v0"], "чужой файл прибору не подаётся вовсе")
+        self.assertEqual(out_b["address"]["words"], WORDS_B, "судится СВОИМ адресом")
+        self.assertNotIn("«%s»" % REL_A, out_b["reason"], "адресом второй руки чужой файл не зовут")
+        self.assertIn(WORDS_B, out_b["reason"])
+
+    def test_both_hands_deliver_but_the_second_address_answers_nothing(self):
+        """ЖИВОЙ РАСКЛАД 16/17: обе руки сдали продукт, слова второго адреса не отвечают ничему.
+
+        До правки вторая рука получала вердикт по файлу ПЕРВОЙ — просто потому, что он первый по
+        алфавиту среди изменённого за заход. Порядок здесь закреплён замером, а не надеждой."""
+        self.assertEqual(sorted([REL_A, REL_B])[0], REL_A, "премиса расклада: чужой файл первый")
+        base_a = self.base(TASK_A)
+        base_b = self.base(TASK_B_WRAPPED)
+        self.assertEqual(dj.read_address(TASK_B_WRAPPED)["words"], WRAPPED_WORDS,
+                         "перенос строки адреса читается как обрывок — так и было 05.09")
+        _write(self.root, REL_A, "# Первая рука сдала продукт\n\nтело\n")
+        out_a = dj.judge(16, TASK_A, "done", base_a, run_id="pc-test-16", root=self.root)
+        _write(self.root, REL_B, "# Вторая рука сдала своё\n\nтело\n")
+        out_b = dj.judge(17, TASK_B_WRAPPED, "done", base_b, run_id="pc-test-17", root=self.root)
+
+        self.assertEqual(out_a["verdict"], dj.DONE, out_a["reason"])
+        self.assertEqual(out_a["chosen"], REL_A)
+        self.assertEqual(out_b["verdict"], dj.UNKNOWN, out_b["reason"])
+        self.assertIsNone(out_b["chosen"])
+        self.assertNotIn("«%s»" % REL_A, out_b["reason"])
+        self.assertIn(REL_B, out_b["reason"], "свой файл назван СВЕДЕНИЕМ — диагноз не потерян")
+
+    def test_the_refused_candidate_is_exactly_the_one_the_instrument_fails(self):
+        """ЗАМОК ОТ ПЕРЕКРАСКИ ЗЕЛЁНОГО: снятые ветки не могли дать «сделано» НИ ОДНОЙ строкой.
+
+        Кандидатов адаптер отбирает `v0.address_hit`, и ТОТ ЖЕ вызов стои́т внутри гейта
+        `path_or_text_contains_ci`, которым судит прибор. Значит файл, которого адаптер не берёт,
+        у прибора получил бы `text_condition_failed` → `DISPROVEN` → то же «неизвестно»."""
+        alien, text = FOLDER + "/2026-09-01-чужая-работа.md", "# Чужая работа\n\nслов адреса нет\n"
+        self.assertFalse(v0.address_hit(alien, text, WORDS), "в кандидаты не попадает")
+        gate = v0._content_gate(                                          # noqa: SLF001 — гейт прибора
+            {"gate_id": dj.GATE_ID, "artifact_id": dj.ARTIFACT_ID,
+             "type": "path_or_text_contains_ci", "params": {"text": WORDS}},
+            {dj.ARTIFACT_ID: {"path": alien, "text": text, "content_type": "text"}})
+        self.assertEqual((gate["status"], gate["reason_code"]), ("FAIL", "text_condition_failed"))
+
+
 class TestOtherRefusals(JudgeCase):
     def test_product_without_the_named_words_is_not_proven(self):
+        """Файл по адресу есть, слов адреса в нём нет → «неизвестно», и файл НАЗВАН сведением.
+
+        Диагноз не теряется: путь по-прежнему в причине, но как «за заход изменилось», а не как
+        «адрес». Разница видна ровно тогда, когда файл чужой (см. `TestParallelHands`)."""
         base = self.base()
         _write(self.root, REL, "# Совсем про другое\n")
         out = self.judge(base)
         self.assertEqual(out["verdict"], dj.UNKNOWN)
-        self.assertEqual(out["v0"]["reason_code"], "text_condition_failed")
+        self.assertIsNone(out["v0"])
+        self.assertIn(REL, out["reason"], "что заход тронул — сведение, а не адрес")
+        self.assertIn("НИ ОДИН", out["reason"])
 
     def test_no_address_is_unknown_not_done(self):
         text = "ЦЕЛЬ: что-то сделать. Адреса результата нет."
