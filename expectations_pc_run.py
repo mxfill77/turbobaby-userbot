@@ -95,30 +95,47 @@ TASK_START_FILE = os.path.join(REPO, "pc_orchestrator.task_started.json")
 # О3: ОБЩИЙ канал (сведение) и лок. Сам ПРОДУКТ модербота живёт КЛЮЧОМ внутри базы — см.
 # `moderbot_facts`: mtime этого файла двигают трое, и зелёного он не даёт никому (правка 18.08).
 MOD_IPC_FILE = os.path.join(REPO, "moderation_ipc.db")
-MOD_LOCK_FILE = os.path.join(REPO, "moderation_bot.lock")     # О3: чей это продукт (номер процесса)
+# ═══ ИМЯ ЛОКА — ОДИН ИСТОЧНИК НА ВЕСЬ СЛОЙ (05.09.2026) ══════════════════════════════════════
+# До этой правки имя лока лежало литералом в ТРЁХ местах слоя (`MOD_LOCK_FILE`, `KID_FILES`,
+# `CODE_LOCKS`), и `pc_agent.lock` был написан руками ДВАЖДЫ. Пока все копии совпадают, беды нет;
+# расходятся они молча, и разошедшийся литерал звучит у владельца ровно как «лок не прочитан» —
+# то есть как слепота прибора, а не как опечатка. Теперь имя пишется ОДИН раз здесь, а путь
+# берётся `lock_path(имя)`; собирать его из кусков в другом месте больше негде.
+# Локов на полосе ровно четыре, и они же — граница прибора: `rc_supervisor` лока не пишет вовсе.
+LOCK_FILES = {
+    "pc_orchestrator": "pc_orchestrator.lock",
+    "pc_agent": "pc_agent.lock",
+    "userbot": "userbot.lock",
+    "moderation_bot": "moderation_bot.lock",
+}
+
+
+def lock_path(name):
+    """Имя процесса → ПОЛНЫЙ путь его лока | None (такого процесса слой не наблюдает)."""
+    fn = LOCK_FILES.get(name)
+    return os.path.join(REPO, fn) if fn else None
+
+
+# О3: ОБЩИЙ канал (сведение) и лок. Сам ПРОДУКТ модербота живёт КЛЮЧОМ внутри базы — см.
+# `moderbot_facts`: mtime этого файла двигают трое, и зелёного он не даёт никому (правка 18.08).
+MOD_LOCK_FILE = lock_path("moderation_bot")                   # О3: чей это продукт (номер процесса)
 # СОБСТВЕННЫЙ ПРОДУКТ ДВУХ ОСТАЛЬНЫХ ДЕТЕЙ (18.08.2026). У каждого — СВОЙ файл и СВОЙ лок; общего
 # источника на всех больше нет ни у кого. Периоды и обоснование пределов — `expectations_pc.KID_SIGNS`.
 KID_FILES = {
     # Тик `_cowork_sync_job` каждые 30 с; файл личный, писать в него больше некому.
-    "pc_agent": (os.path.join(REPO, "pc_agent.log"), os.path.join(REPO, "pc_agent.lock")),
+    "pc_agent": (os.path.join(REPO, "pc_agent.log"), lock_path("pc_agent")),
     # Keepalive Telethon раз в 60 с → `session.save()`. Продукт БИБЛИОТЕКИ, и это сказано вслух:
     # своих периодических строк у userbot нет вовсе.
-    "userbot": (os.path.join(REPO, "turbobaby_session.session"), os.path.join(REPO, "userbot.lock")),
+    "userbot": (os.path.join(REPO, "turbobaby_session.session"), lock_path("userbot")),
 }
 # О4: реестр УСПЕШНО ушедших строк журнала (`cowork_log_append.ledger_add`) — ровно то, что
 # серверное О4 видит как «след с ПК». Читаем ХВОСТ файла: кольцо на 500 строк, а нужна последняя.
 LEDGER_FILE = os.path.join(REPO, "cowork_log.ledger")
 LEDGER_TAIL_BYTES = 65536
-# О6 (02.09.2026): ЧЕЙ ЛОК несёт номер процесса и момент его запуска. Локов на полосе ровно
-# четыре, и они же — граница прибора: `rc_supervisor` лока не пишет вовсе, поэтому О6 его не судит
-# (сказано в шапке решения). Три из четырёх уже читаются здесь для О3 и детей — новых файлов
-# заведено НОЛЬ, добавлен только лок демона.
-CODE_LOCKS = {
-    "pc_orchestrator": os.path.join(REPO, "pc_orchestrator.lock"),
-    "pc_agent": os.path.join(REPO, "pc_agent.lock"),
-    "userbot": os.path.join(REPO, "userbot.lock"),
-    "moderation_bot": MOD_LOCK_FILE,
-}
+# О6 (02.09.2026): ЧЕЙ ЛОК несёт номер процесса и момент его запуска. Имена не повторяются здесь
+# ни разу — берутся из единственного источника `LOCK_FILES` (правка 05.09.2026): О3, дети и О6
+# читают ОДИН И ТОТ ЖЕ файл по одному и тому же имени, и разойтись им больше негде.
+CODE_LOCKS = {name: lock_path(name) for name in LOCK_FILES}
 # КАК ЭТОТ ЖЕ ПРОЦЕСС ЗОВЁТСЯ В РУКОПИСНОЙ КАРТЕ ДЕМОНА (`_FILE_PROCESS_RULES`). Нужно ТОЛЬКО ради
 # улики «карта знает N из M» — решение принимается вычислением и от этого словаря не зависит ни
 # одной веткой. У демона имени в карте нет вовсе (`None`): он следит за собой сам, замыканием, и
@@ -301,13 +318,41 @@ def process_probe(pid):
     return True, started
 
 
-def _read_lock(out, lock_path, whose):
+ERR_TAIL = 80          # сколько символов ПРИЧИНЫ берём в сообщение; имени это не касается
+
+
+def _why_short(exc, path=None):
+    """Отказ ФС → ПРИЧИНА словами, БЕЗ пути внутри. Режется только она.
+
+    ПОЧЕМУ ПУТЬ ВЫРЕЗАЕТСЯ, А НЕ ОСТАВЛЯЕТСЯ ПОДЛИННЕЕ (живой дефект 05.09.2026). `str(OSError)`
+    несёт имя файла ПОСЛЕДНИМ и через `repr`, а `repr` на Windows УДВАИВАЕТ каждый разделитель:
+    «[Errno 2] No such file or directory: 'D:\\\\turbobaby-bot\\\\» — это уже 57 символов из
+    прежнего среза в 60. От имени владельцу доставались ТРИ буквы, и сообщение звучало так:
+    «лок pc_agent не прочитан: [Errno 2] No such file or directory: 'D:\\\\turbobaby-bot\\\\pc_».
+    Обрезаны были ВСЕ ЧЕТЫРЕ имени полосы (mod… / pc_… / pc_… / use…), причём `pc_agent.lock` и
+    `pc_orchestrator.lock` давали ОДИН И ТОТ ЖЕ огрызок «pc_» — по сообщению их не различить.
+
+    Лечится не длиной среза, а порядком: длинный кусок (путь) выкидывается, имя файла зовущий
+    называет САМ и ЦЕЛИКОМ до среза. Тогда имя любой длины переживает любой предел — тот самый
+    следующий процесс с длинным именем, на котором «просто вписать правильное имя» сломалось бы."""
+    why = str(exc)
+    for form in ([repr(path), str(path)] if path else []):
+        why = why.replace(form, "")
+    why = why.strip().rstrip(":").strip()
+    return why[:ERR_TAIL] or type(exc).__name__
+
+
+def _read_lock(out, path, whose):
     """Дописать в факт номер из лока, время его правки и пробу процесса. Общий кусок всех троих:
-    лок у каждого свой, а устройство одно — синглтон пишет туда СВОЙ PID и отбирает устаревший."""
+    лок у каждого свой, а устройство одно — синглтон пишет туда СВОЙ PID и отбирает устаревший.
+
+    ИМЯ ФАЙЛА В ОТКАЗЕ НАЗЫВАЕТСЯ ЦЕЛИКОМ И ДО СРЕЗА (правка 05.09.2026): оно берётся у пути
+    одним куском (`os.path.basename`) — не собирается, не угадывается и не может быть обрезано
+    пределом длины. Режется только ПРИЧИНА (`_why_short`), и её потеря диагноза не отнимает."""
     try:
-        with open(lock_path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             raw = f.read().strip()
-        out["lock_mtime"] = os.stat(lock_path).st_mtime
+        out["lock_mtime"] = os.stat(path).st_mtime
         # НОМЕР — ПЕРВОЙ СТРОКОЙ. С 30.08.2026 синглтоны полосы кладут в лок ещё и личность
         # владельца (имя запуска и момент старта) — второй строкой, JSON'ом. Наблюдателю она не
         # нужна: авторство он и так сверяет ДВУМЯ приметами (`kid_writer`) и был здесь образцом.
@@ -316,7 +361,8 @@ def _read_lock(out, lock_path, whose):
         out["pid"] = int(raw.splitlines()[0].strip())
     except (OSError, ValueError, IndexError) as e:   # IndexError — пустой лок: строк ноль
         out["err"] = ("%s; " % out["err"] if out["err"] else "") + \
-                     "лок %s не прочитан: %s" % (whose, str(e)[:60])
+                     "лок %s (файл %s) не прочитан: %s" % (whose, os.path.basename(path) or path,
+                                                           _why_short(e, path))
         return out
     out["opened"], out["started"] = process_probe(out["pid"])
     return out
@@ -338,7 +384,12 @@ def own_facts(product, lock, whose):
         out["own"] = os.stat(product).st_mtime
         out["ok"] = True
     except OSError as e:
-        out["err"] = "%s: %s" % (type(e).__name__, str(e)[:80])
+        # ТОТ ЖЕ ПОРЯДОК, ЧТО У ЛОКА: имя файла целиком и до среза, режется только причина. У
+        # `turbobaby_session.session` прежний срез в 80 символов съедал хвост имени ровно так же
+        # (репр пути 83 символа) — один класс, одно лечение, одно место.
+        out["err"] = "%s: продукт %s не прочитан: %s" % (type(e).__name__,
+                                                         os.path.basename(product) or product,
+                                                         _why_short(e, product))
         return _read_lock(out, lock, whose)      # продукта нет — но проба процесса всё ещё нужна
     return _read_lock(out, lock, whose)
 
@@ -453,7 +504,7 @@ def code_facts(closure_fn=None, stat_fn=None, lock_fn=None, map_fn=None, entries
                 try:
                     m = float((stat_fn or os.stat)(os.path.join(REPO, base)).st_mtime)
                 except (OSError, ValueError, TypeError) as e:
-                    missed = "%s: %s" % (base, str(e)[:60])
+                    missed = "%s: %s" % (base, _why_short(e, os.path.join(REPO, base)))
                     break                     # один нестатуемый файл делает ответ недостоверным
                 mtimes.append(m)
                 if newest is None or m > newest:

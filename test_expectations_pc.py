@@ -2962,5 +2962,130 @@ class TestVersionNewsHands(unittest.TestCase):
         self.assertIn(ex.su_state(facts)[0], (ex.SU_GATE, ex.SU_DIRTY, ex.SU_QUIET, ex.SU_BLIND))
 
 
+class TestLockNameIsNeverCut(unittest.TestCase):
+    """ИМЯ ЛОКА НЕ ОБРЕЗАЕТСЯ (05.09.2026). Живой дефект: сообщение владельцу говорило «лок
+    pc_agent не прочитан: [Errno 2] No such file or directory: 'D:\\\\turbobaby-bot\\\\pc_» —
+    имя файла кончалось на третьей букве. Механизм — НЕ склейка пути (путь собирался верно), а
+    ОБРЕЗАНИЕ ПО ДЛИНЕ: `str(e)[:60]`, где 57 символов съедал сам путь через `repr` с удвоенными
+    разделителями. Обрезаны были ВСЕ ЧЕТЫРЕ имени полосы, и два из них («pc_agent.lock» и
+    «pc_orchestrator.lock») давали неразличимый огрызок «pc_»."""
+
+    def setUp(self):
+        self.cfg = ex.config()
+        self.d = tempfile.mkdtemp(prefix="expect_pc_lockname_")
+
+    def _err_for(self, path, whose):
+        rec = {"pid": None, "opened": None, "started": None, "lock_mtime": None, "err": ""}
+        run_mod._read_lock(rec, path, whose)
+        return rec["err"]
+
+    def test_every_watched_lock_names_its_file_whole(self):
+        """ВСЕ ЧЕТЫРЕ имени, а не то одно, на котором дефект заметили."""
+        for name, lock in run_mod.CODE_LOCKS.items():
+            err = self._err_for(os.path.join(self.d, os.path.basename(lock)), name)
+            self.assertIn(os.path.basename(lock), err,
+                          "имя лока «%s» не доехало до владельца целиком" % name)
+            self.assertIn("не прочитан", err, "третий исход обязан говориться словами")
+            self.assertNotIn("D:\\\\", err, "путь через repr снова съедает длину сообщения")
+
+    def test_a_longer_name_survives_the_very_same_cut(self):
+        """ПРЕДСМЕРТНЫЙ ВЗГЛЯД ЗАДАНИЯ: правильное имя, вписанное строкой рядом с битым, спасло бы
+        только сегодняшние четыре, а следующий процесс с ДЛИННЫМ именем сломался бы ровно так же.
+        Имя берётся у пути одним куском и стои́т ДО среза — поэтому переживает любую длину."""
+        long_name = ("pc_orchestrator_secondary_watchdog_of_the_watchdog"
+                     "_and_of_the_agent_and_of_the_userbot.lock")
+        self.assertGreater(len(long_name), max(60, run_mod.ERR_TAIL),
+                           "образец обязан быть длиннее ЛЮБОГО среза в этом файле")
+        err = self._err_for(os.path.join(self.d, long_name), "процесс_с_очень_длинным_именем")
+        self.assertIn(long_name, err)
+
+    def test_the_reason_is_cut_but_the_name_is_not(self):
+        """Режется ПРИЧИНА, и её потеря диагноза не отнимает: имя файла уже названо."""
+        class Verbose(OSError):
+            def __str__(self):
+                return "причина " * 40
+        rec = {"pid": None, "opened": None, "started": None, "lock_mtime": None, "err": ""}
+        try:
+            raise Verbose()
+        except OSError as e:
+            rec["err"] = "лок %s (файл %s) не прочитан: %s" % (
+                "pc_agent", "pc_agent.lock", run_mod._why_short(e, "неважно"))
+        self.assertIn("pc_agent.lock", rec["err"])
+        self.assertLessEqual(len(rec["err"].split("не прочитан: ")[1]), run_mod.ERR_TAIL)
+
+    def test_the_lock_name_has_exactly_one_source_in_the_module(self):
+        """ОДИН ИСТОЧНИК ИМЕНИ. Литерал «*.lock» живёт в модуле рук РОВНО в `LOCK_FILES` и нигде
+        больше: пока копий несколько, они расходятся молча, а разошедшаяся копия звучит у владельца
+        как слепота прибора, а не как опечатка."""
+        with open(os.path.join(REPO, "expectations_pc_run.py"), encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        names = [n.value for n in ast.walk(tree)
+                 if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                 and n.value.endswith(".lock") and "\n" not in n.value and " " not in n.value]
+        self.assertEqual(sorted(names), sorted(run_mod.LOCK_FILES.values()),
+                         "имя лока написано в модуле дважды — источник больше не один")
+        # И все три потребителя берут путь у него, а не собирают сами.
+        self.assertEqual(run_mod.MOD_LOCK_FILE, run_mod.lock_path("moderation_bot"))
+        for name, (_product, lock) in run_mod.KID_FILES.items():
+            self.assertEqual(lock, run_mod.lock_path(name))
+        self.assertEqual(run_mod.CODE_LOCKS,
+                         {n: run_mod.lock_path(n) for n in run_mod.LOCK_FILES})
+        self.assertEqual(sorted(run_mod.CODE_LOCKS), sorted(ex.CODE_WATCHED),
+                         "наблюдаемых и локов обязано быть поровну")
+
+    # ── ТРИ ОТРИЦАТЕЛЬНЫХ ТЕСТА ЗАДАНИЯ (п.7), по одному на исход ──────────────────────────
+    def test_no_lock_at_all_keeps_the_third_outcome_and_the_mark(self):
+        """ЛОКА НЕТ ПО-НАСТОЯЩЕМУ → «не смог посчитать» остаётся отдельным исходом, пометка
+        СТАВИТСЯ и не закрывается. Честность наблюдателя правкой не ослаблена."""
+        err = self._err_for(os.path.join(self.d, "pc_agent.lock"), "pc_agent")
+        f = code_facts_of(pc_agent=code_fact(newest_ago=60.0, started_ago=None,
+                                             opened=None, pid=None, err=err))
+        state, info = ex.code_state("pc_agent", f, self.cfg, NOW)
+        self.assertEqual(state, ex.CODE_UNKNOWN)
+        self.assertIn("не добыт", info["why"])
+        self.assertIn("pc_agent.lock", info["why"], "владелец обязан узнать, КАКОЙ файл искать")
+        notes = [v for v in ex.verdict(f, self.cfg) if v["name"] == "pc_agent"]
+        self.assertEqual([v["kind"] for v in notes], ["o6_pc_code_unknown"])
+        self.assertEqual(ex.closures(f, self.cfg, [notes[0]["key"]]), [],
+                         "слепота выздоровлением не является — эпизод не закрывается")
+
+    def test_a_lock_with_a_fresh_process_takes_the_mark_off(self):
+        """ЛОК ЕСТЬ И ПРОЦЕСС СВЕЖИЙ → замыкание СЧИТАЕТСЯ, и пометка СНИМАЕТСЯ."""
+        lock = os.path.join(self.d, "pc_agent.lock")
+        with open(lock, "w", encoding="utf-8") as fh:
+            fh.write("%d\n" % os.getpid())
+        rec = {"pid": None, "opened": None, "started": None, "lock_mtime": None, "err": ""}
+        run_mod._read_lock(rec, lock, "pc_agent")
+        self.assertEqual(rec["err"], "", "живой лок обязан читаться без единой жалобы")
+        self.assertEqual(rec["pid"], os.getpid())
+        self.assertIs(rec["opened"], True)
+        f = code_facts_of(pc_agent=code_fact(newest_ago=7200.0, started_ago=60.0))
+        self.assertEqual(ex.code_state("pc_agent", f, self.cfg, NOW)[0], ex.CODE_FRESH)
+        self.assertEqual(ex.closures(f, self.cfg, ["o6u|pc_agent"]), ["o6u|pc_agent"])
+
+    def test_a_lock_with_a_stale_process_still_raises_the_mark(self):
+        """ЛОК ЕСТЬ И ПРОЦЕСС СТАРЫЙ → пометка ставится ПО ДЕЛУ, а не по слепоте прибора."""
+        f = code_facts_of(pc_agent=code_fact(newest_ago=60.0, started_ago=186000.0))
+        state, info = ex.code_state("pc_agent", f, self.cfg, NOW)
+        self.assertEqual(state, ex.CODE_STALE)
+        self.assertGreater(info["behind"], 0)
+        notes = [v for v in ex.verdict(f, self.cfg) if v["name"] == "pc_agent"]
+        self.assertEqual(len(notes), 1)
+        self.assertIn(notes[0]["kind"], ("o6_pc_code_stale", "o6_pc_code_late"))
+        self.assertEqual(ex.closures(f, self.cfg, [notes[0]["key"]]), [])
+
+    def test_the_live_locks_either_read_or_name_themselves(self):
+        """ЖИВОЙ замер по боевым файлам: какой бы из четырёх процессов сейчас ни лежал, отказ обязан
+        называть свой файл. Тест не требует, чтобы процессы были живы, — он требует, чтобы прибор
+        не врал о своей способности их измерить."""
+        for name, lock in run_mod.CODE_LOCKS.items():
+            rec = {"pid": None, "opened": None, "started": None, "lock_mtime": None, "err": ""}
+            run_mod._read_lock(rec, lock, name)
+            if rec["err"]:
+                self.assertIn(os.path.basename(lock), rec["err"])
+            else:
+                self.assertIsInstance(rec["pid"], int)
+
+
 if __name__ == "__main__":
     unittest.main()
