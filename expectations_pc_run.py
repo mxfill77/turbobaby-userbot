@@ -69,9 +69,11 @@ EXPECT_PC_KIDS_MIN) — ветка мертва
     venv\\Scripts\\python.exe expectations_pc_run.py --dry      # решение и факты, канал не трогаем
     venv\\Scripts\\python.exe expectations_pc_run.py --status   # три состояния словами, без канала
 """
+import calendar
 import ctypes
 import json
 import os
+import re
 import sys
 import time
 
@@ -625,6 +627,126 @@ def _su_stamp(line):
         return None
 
 
+# ═══ О7: ЧТО ЖУРНАЛ ПРОДУКТА СКАЗАЛ О ЦЕНЕ (только чтение, тем же правом, что и su_facts) ═══
+#
+# ГДЕ ЖИВЁТ ПРИБОР И КТО ЕГО ОБНУЛЯЕТ — сказано здесь, чтобы он не оказался в двух экземплярах:
+#   ЧИТАЕТ ЖУРНАЛ     ровно одно место — эта функция, и только она (`grep price_facts`).
+#   СУДИТ             ровно одно место — `expectations_pc.price_state` (чистая функция фактов).
+#   ПАМЯТЬ ЭПИЗОДА    ровно один файл — `tmp/expect_pc/state.json`, ключ `open["o7p|price"]`.
+#   КРУТИТ            ровно одна задача Планировщика — `TurboBabyExpectPC`, раз в 10 минут.
+#   ОБНУЛЯЕТ          сам слой, и только доказанным пересчётом (`ex.closures` → `o7p`). Руками —
+#                     владелец, сняв ключ из `state.json`; больше никто и ничем.
+# ВТОРОГО ЭКЗЕМПЛЯРА НЕТ И БЫТЬ НЕ ДОЛЖНО. Сторож `price_gate` судит КАЖДЫЙ ответ и пишет свой
+# вердикт в журнал — но владельцу он не говорит ничего и говорить не обязан. Наш прибор ЧИТАЕТ
+# его след и не дублирует его решения ни одной строкой: порогов сторожа здесь нет вовсе.
+PRICE_LOG_FILE = os.path.join(REPO, "logs", "userbot_stderr.log")
+# Хвост журнала продукта. Замер 05.09: 5.07 МБ = 94.7 тыс. строк за 3.5 суток, то есть 4 МБ
+# накрывают заведомо больше суток — а суточный пол повтора заметки и есть самое длинное окно,
+# которое ветке нужно видеть целиком. Меньше брать нельзя: живая гасилка 05.09 лежала в 0.7 МБ
+# от конца, но между ней и последним пересчётом — 2.0 тыс. строк.
+PRICE_TAIL_BYTES = 4194304
+# ДОСЛОВНЫЕ ФОРМЫ ОБЕИХ СТРОК, снятые с живого журнала, а не пересказанные:
+#   гасилка  `suggest.py:3395` / `suggest.py:3886` — «price_gate: <карточка сторожа>»;
+#   пересчёт `price_source.py:413` — «price_source: MODEL → … кепка: …».
+# Слово «кепка:» и есть разделитель успеха от неудачи, и оно не украшение: у `price_source:` есть
+# ПЯТЬ форм-неудач («источника нет», «цену гасим», «не той схемы» …), и считать их пересчётом
+# значило бы закрывать эпизод тем самым следом, который его открывает. Замер по живому журналу:
+# строк `price_source:` 519, из них с «кепка:» — 519, без — 0, то есть на сегодняшнем корпусе
+# разделитель ничего не отсекает и введён ЗАРАНЕЕ, против пяти известных форм.
+PRICE_GATE_MARK = "price_gate: "
+PRICE_QUOTE_MARK = "price_source: "
+PRICE_QUOTE_OK = "кепка:"
+# Отметка времени в журнале продукта: «2026-09-05T09:23:25+00:00 | @кто | …». Своей отметки у
+# ценовых строк НЕТ (их пишет logging без asctime), поэтому час берётся у ближайшей соседней
+# строки — и эта неточность названа вслух и в факте (`exact`), и в заметке владельцу.
+PRICE_STAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})([+-]\d{2}:\d{2})")
+
+
+def _price_stamp(line):
+    """«2026-09-05T09:23:25+00:00 | …» → секунды эпохи | None. Зона читается ИЗ СТРОКИ, а не
+    подразумевается: журнал пишет UTC, машина живёт в UTC+7, и местное чтение дало бы ошибку в
+    семь часов — тот же класс, из-за которого `parse_iso` разбирает зону сам."""
+    m = PRICE_STAMP_RE.match(str(line))
+    if not m:
+        return None
+    try:
+        base = calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    off = m.group(2)
+    try:
+        sign = -1 if off[0] == "-" else 1
+        return float(base - sign * (int(off[1:3]) * 3600 + int(off[4:6]) * 60))
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def price_facts(path=None, tail=None):
+    """ЧТО ЖУРНАЛ ПРОДУКТА СКАЗАЛ О ЦЕНЕ ПОСЛЕДНИМ → факт для `ex.price_state`. Только чтение.
+
+    ПОРЯДОК СТРОК, А НЕ ИХ ВРЕМЯ, отвечает на вопрос «был ли пересчёт ПОСЛЕ гасилки»: журнал
+    пишется последовательно одним процессом, и «ниже по файлу» здесь строго значит «позже».
+    Время нужно только для ОДНОГО — назвать владельцу час начала молчания.
+
+    Счёт ведётся ОТ ПОСЛЕДНЕГО ПЕРЕСЧЁТА: каждый успешный пересчёт обнуляет и `since`, и
+    `gates`. Поэтому `since` — это всегда ПЕРВАЯ гасилка текущего молчания, а не последняя:
+    владельцу нужен час, когда цена замолчала, а не час, когда её погасили в очередной раз.
+
+    ТРИ ИСХОДА, как и у всех: файла нет / ошибка чтения → `ok=False` и решение обязано сказать
+    «неизвестно». Пустой хвост без ценовых строк — `ok=True` с нулями, и «неизвестно» из него
+    делает уже решение: это ПРОЧИТАННАЯ пустота, а не провал чтения."""
+    p = path or PRICE_LOG_FILE
+    out = {"ok": False, "since": None, "gate_why": None, "gates": 0, "quotes": 0,
+           "last_ok": None, "exact": True, "path": p, "err": ""}
+    try:
+        size = os.path.getsize(p)
+        with open(p, "rb") as fh:
+            if size > (PRICE_TAIL_BYTES if tail is None else tail):
+                fh.seek(-(PRICE_TAIL_BYTES if tail is None else tail), os.SEEK_END)
+                fh.readline()                # огрызок первой строки выбрасываем целиком
+            raw = fh.read()
+    except (OSError, ValueError, TypeError) as e:
+        out["err"] = "%s: %s" % (type(e).__name__, str(e)[:80])
+        return out
+    stamp = None                             # последняя ВИДЕННАЯ отметка времени
+    first = None                             # самая ранняя отметка хвоста — запас для строк выше неё
+    for chunk in raw.split(b"\n"):
+        # Кодировка журнала не объявлена нигде и на живом файле смешанная: заменяем негодные
+        # байты, а не отказываемся от строки. Потерять гасилку из-за одного кривого символа —
+        # ровно тот молчаливый провал, ради которого ветка заведена.
+        try:
+            line = chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            line = chunk.decode("cp1251", "replace")
+        got = _price_stamp(line)
+        if got is not None:
+            stamp = got
+            if first is None:
+                first = got
+            continue
+        if line.startswith(PRICE_QUOTE_MARK):
+            if PRICE_QUOTE_OK not in line:
+                continue                     # одна из пяти форм-неудач: пересчётом она не является
+            out["quotes"] += 1
+            out["last_ok"] = stamp
+            out["since"], out["gate_why"], out["gates"] = None, None, 0   # молчание оборвано
+            out["exact"] = True
+        elif line.startswith(PRICE_GATE_MARK):
+            out["gates"] += 1
+            if out["since"] is None:
+                out["since"] = stamp
+                out["exact"] = stamp is not None
+                out["gate_why"] = line[len(PRICE_GATE_MARK):].strip()[:400]
+    if out["gates"] and out["since"] is None:
+        # Гасилка нашлась ВЫШЕ первой отметки времени хвоста: своего часа у неё нет и соседа
+        # сверху тоже. Берём самую раннюю отметку хвоста как ВЕРХНЮЮ границу — она не позже
+        # начала молчания, значит возраст будет ЗАНИЖЕН, а не завышен: прибор скорее промолчит
+        # лишний тик, чем соврёт владельцу более ранним часом.
+        out["since"], out["exact"] = first, False
+    out["ok"] = True
+    return out
+
+
 def busy_facts(path=None):
     """Когда полоса в последний раз ОБЪЯВИЛА работу → {"ok","since","limit","err"}.
 
@@ -1002,6 +1124,12 @@ def snapshot(state, now=None, getter=None):
         # «почему не обновился» сам по себе звучит обвинением — тем самым голосом, от которого
         # ветку и лечим 05.09.2026.
         "su": su_facts(),
+        # О7: ЧТО ЖУРНАЛ ПРОДУКТА СКАЗАЛ О ЦЕНЕ. Счётчика тишины здесь НЕТ и быть не должно —
+        # предмет ветки не «сколько мы молчали», а «что записано в журнале»: начало молчания
+        # лежит В САМОМ ЖУРНАЛЕ стенной отметкой и переживает и сон машины, и перезапуск
+        # наблюдателя. Накопленный счётчик, как у О2/О3, здесь только терял бы эпизод при каждом
+        # рестарте задачи Планировщика.
+        "price": price_facts(),
     }
 
 
@@ -1091,6 +1219,7 @@ def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
     tstate, tinfo = ex.turn_state(facts, cfg, now)
     mstate, minfo = ex.moderbot_state(facts, cfg, now)
     cstate, cinfo = ex.client_state(facts, cfg, now)
+    pstate, pinfo = ex.price_state(facts, cfg, now)
     out = {"verdicts": len(verdicts), "notes": [], "closed": [], "dry": bool(dry),
            "queue": qstate, "turn": tstate, "why": tinfo.get("why", ""),
            # У модербота состояние ходит ПАРОЙ со своей причиной: «неизвестно» без причины
@@ -1103,7 +1232,13 @@ def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
            # О5 ходит ТРОЙКОЙ «исход + сколько ушло + чем объяснено»: у ветки, чей ожидаемый
            # результат ноль, слово без числа неотличимо от слепоты.
            "client": cstate, "client_sent": ex.client_spoken(cinfo),
-           "client_why": cinfo.get("why", "")}
+           "client_why": cinfo.get("why", ""),
+           # О7 ВСЕГДА ЕДЕТ В ИТОГ, а не только при нарушении, — и это и есть ВИТРИНА. Строка
+           # пересчитывается ИЗ ФАКТОВ каждым прогоном (как О6), поэтому она не умеет ни
+           # замолчать, пока молчание живо, ни задержаться, когда пересчёт вернулся: снимает её
+           # тот же замер, что и ставит. Час начала и причина едут рядом со словом.
+           "price": pstate, "price_since": pinfo.get("since"), "price_age": pinfo.get("age"),
+           "price_why": pinfo.get("why", ""), "price_gate_why": pinfo.get("gate_why")}
 
     # 1. ЗАКРЫТИЕ ЭПИЗОДОВ — первым: владелец обязан узнать, что кончилось, даже если сейчас
     #    открылось что-то новое.
@@ -1123,17 +1258,43 @@ def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
             out["closed"].append(key)
 
     # 2. НАРУШЕНИЯ. Одна заметка на эпизод; повторов нет НАМЕРЕННО (это шум, а не настойчивость).
+    #
+    #    ЕДИНСТВЕННОЕ ИСКЛЮЧЕНИЕ — О7, и оно обосновано устройством её эпизода, а не важностью
+    #    темы. У всех прочих ожиданий эпизод МОЖЕТ кончиться сам: демон провернётся, модербот
+    #    затикает, процесс перезапустится. Молчание цены не кончается само ни одной дорогой —
+    #    обе ветки выхода лежат в руках владельца (`ex.PRICE_BRANCHES`), и заметка, увиденная
+    #    ночью и забытая к утру, оставляет полосу без цены на неделю. Пол повтора — сутки
+    #    (`price_repeat`); ноль в этой ручке глушит повтор, а не первую заметку.
+    repeat = float(cfg.get("price_repeat", 0.0))
+    out["repeats"] = []
     for v in verdicts:
         key = str(v.get("key"))
-        if key in open_eps:
+        was = open_eps.get(key)
+        if was is not None:
+            if str(v.get("kind")) != "o7_pc_price_mute" or repeat <= 0:
+                continue
+            try:
+                said = float(was.get("said") or was.get("first") or 0.0)
+            except (TypeError, ValueError):
+                said = 0.0
+            if said <= 0 or (now - said) < repeat:
+                continue                               # пол повтора не выстоян — молчим
+            if dry:
+                out["repeats"].append(key)
+                continue
+            if not send(ex.render(v, LANE_LABEL)):
+                continue                               # не помечаем — скажем на следующем прогоне
+            was["said"] = now
+            open_eps[key] = was
+            out["repeats"].append(key)
             continue
         if dry:
             out["notes"].append(key)
-            open_eps[key] = {"first": now, "kind": v.get("kind")}
+            open_eps[key] = {"first": now, "said": now, "kind": v.get("kind")}
             continue
         if not send(ex.render(v, LANE_LABEL)):
             continue                                   # не помечаем — скажем на следующем прогоне
-        open_eps[key] = {"first": now, "kind": v.get("kind")}
+        open_eps[key] = {"first": now, "said": now, "kind": v.get("kind")}
         out["notes"].append(key)
 
     # 3. О4 — СЛЕД ЖИЗНИ НАРУЖУ. Не заметка и не вердикт: строка журнала для наблюдателя ВНЕ
@@ -1247,6 +1408,18 @@ def main():
                  (" (%s)" % out["client_why"]) if out["client_why"] else ""))
         # Дети печатаются ПОИМЁННО, КАЖДЫЙ СО СВОИМ ИСТОЧНИКОМ и своей причиной: с 18.08.2026
         # общего признака на всех нет вовсе, и отчёт обязан показывать, ЧЕМ судится каждый.
+        # ВИТРИНА О7. Строка живёт РОВНО пока живёт эпизод: она собрана из свежего замера этого
+        # же прогона, а не из памяти о заметке. Молчит цена — витрина называет час и причину;
+        # вернулся пересчёт — тем же замером строка становится «называется», и снимать её руками
+        # не нужно и нечем.
+        if out.get("price") == ex.PRICE_MUTE:
+            print("цена клиентам (О7): МОЛЧИТ с %s, причина: %s"
+                  % (ex._clock(out.get("price_since")),
+                     out.get("price_gate_why") or "сторож причины не назвал"))
+        else:
+            print("цена клиентам (О7): %s%s"
+                  % (out.get("price"),
+                     (" (%s)" % out.get("price_why")) if out.get("price_why") else ""))
         print("дети контура (публикация; у каждого СВОЙ признак и СВОЙ предел):")
         for k in out.get("kids") or []:
             print("  %-15s %-14s %-32s %s"
@@ -1269,7 +1442,9 @@ def main():
                      (" · %s" % c.get("why")) if c.get("why") else ""))
         if not out.get("code"):
             print("  не собрано%s" % ((" (%s)" % out.get("code_why")) if out.get("code_why") else ""))
-        print("нарушений: %d %s" % (out["verdicts"], out["notes"]))
+        print("нарушений: %d %s%s"
+              % (out["verdicts"], out["notes"],
+                 (" · повтор: %s" % out["repeats"]) if out.get("repeats") else ""))
         return 0
     print(json.dumps(out, ensure_ascii=False))
     return 0

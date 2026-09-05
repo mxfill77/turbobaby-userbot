@@ -3087,5 +3087,365 @@ class TestLockNameIsNeverCut(unittest.TestCase):
                 self.assertIsInstance(rec["pid"], int)
 
 
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  О7 — ЦЕНА НАЗЫВАЕТСЯ КЛИЕНТУ ЧИСЛОМ (05.09.2026)
+#
+#  ВЕСЬ НАБОР СТОИТ НА ПОДМЕНЁННОМ ЖУРНАЛЕ, а не на боевом: боевой `logs/userbot_stderr.log`
+#  здесь не читается и не пишется ни одной строкой, канал отправки подменён заглушкой, карточек
+#  владельцу не уходит. Строки фикстур — ДОСЛОВНЫЕ из живого журнала 05.09 (гасилка — та самая,
+#  что молчала семь часов; пересчёт — форма `price_source.py:413` со словом «кепка:»).
+# ══════════════════════════════════════════════════════════════════════════════════════════
+PRICE_GATE_LINE = (
+    "price_gate: ЦЕНА НЕ НАЗВАНА: записанное правило цены УСТАРЕЛО. ручки разошлись со слепком: "
+    "H3 0.15\\u21920.0 Клиенту цена не ушла. Нужно пересобрать price_source.json и снять слепок "
+    "ручек заново. (ПРАЙС-СЕТКА ПАРКА — цен не называем ни по одной модели)")
+PRICE_QUOTE_LINE = (
+    "price_source: NMAX → NMAX 2026-09-05 7сут → 400 = 400.0 x 1.0 (P1) x 1.0 [7-13]; "
+    "кепка: полный месяц; опознано по листу через ключ «NMAX PHUKET 1234»")
+# Форма-НЕУДАЧА того же префикса (`price_source.py:387`). Пересчётом она не является, и весь
+# смысл разделителя «кепка:» в том, чтобы она не закрывала эпизод.
+PRICE_QUOTE_FAIL = "price_source: источника нет — цену гасим (модель NMAX)"
+
+
+def price_stamp_line(ts):
+    """Отметка времени журнала продукта В ЖИВОМ ВИДЕ: «2026-09-05T09:23:25+00:00 | @кто | …».
+    Именно у неё ветка берёт час — своей отметки у ценовых строк нет."""
+    return "%s | @vladi_vk | VK | сколько стоит" % (
+        datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+        .replace(microsecond=0).isoformat())
+
+
+class TestPriceFacts(unittest.TestCase):
+    """РУКИ О7: подменённый журнал → факт. Боевого журнала здесь нет ни в одном кейсе."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="expect_pc_price_")
+        self.log = os.path.join(self.dir, "userbot_stderr.log")
+
+    def write(self, lines):
+        with open(self.log, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return self.log
+
+    def test_gate_without_quote_after_it_is_read_as_mute_with_its_hour(self):
+        """ЖИВОЙ СЛУЧАЙ 05.09 ЦЕЛИКОМ: пересчёт был вчера, гасилка сегодня, после неё пусто."""
+        p = self.write([price_stamp_line(NOW - 86400), PRICE_QUOTE_LINE,
+                        price_stamp_line(NOW - 3600), PRICE_GATE_LINE, PRICE_GATE_LINE,
+                        "SUGGEST: черновик #588 → IPC (bot-режим)"])
+        f = run_mod.price_facts(path=p)
+        self.assertTrue(f["ok"])
+        self.assertEqual((f["gates"], f["quotes"]), (2, 1))
+        self.assertAlmostEqual(f["since"], NOW - 3600, delta=1.0)
+        self.assertAlmostEqual(f["last_ok"], NOW - 86400, delta=1.0)
+        self.assertTrue(f["exact"])
+        self.assertIn("ручки разошлись со слепком", f["gate_why"])
+
+    def test_quote_after_gate_resets_the_silence_to_nothing(self):
+        """Пересчёт ПОСЛЕ гасилки обрывает молчание: ни начала, ни причины, ни счётчика гасилок."""
+        p = self.write([price_stamp_line(NOW - 7200), PRICE_GATE_LINE,
+                        price_stamp_line(NOW - 60), PRICE_QUOTE_LINE])
+        f = run_mod.price_facts(path=p)
+        self.assertTrue(f["ok"])
+        self.assertIsNone(f["since"])
+        self.assertIsNone(f["gate_why"])
+        self.assertEqual(f["gates"], 0)
+        self.assertAlmostEqual(f["last_ok"], NOW - 60, delta=1.0)
+
+    def test_since_is_the_FIRST_gate_of_the_silence_not_the_last(self):
+        """Владельцу нужен час, когда цена ЗАМОЛЧАЛА, а не час очередного гашения."""
+        p = self.write([price_stamp_line(NOW - 20000), PRICE_QUOTE_LINE,
+                        price_stamp_line(NOW - 10000), PRICE_GATE_LINE,
+                        price_stamp_line(NOW - 100), PRICE_GATE_LINE])
+        f = run_mod.price_facts(path=p)
+        self.assertAlmostEqual(f["since"], NOW - 10000, delta=1.0)
+        self.assertEqual(f["gates"], 2)
+
+    def test_failed_price_source_line_is_not_a_quote(self):
+        """ФОРМА-НЕУДАЧА ТОГО ЖЕ ПРЕФИКСА НЕ ЗАКРЫВАЕТ ЭПИЗОД. Без разделителя «кепка:» строка
+        «источника нет — цену гасим» обнулила бы молчание тем самым следом, который его создаёт."""
+        p = self.write([price_stamp_line(NOW - 5000), PRICE_GATE_LINE,
+                        price_stamp_line(NOW - 50), PRICE_QUOTE_FAIL])
+        f = run_mod.price_facts(path=p)
+        self.assertEqual(f["quotes"], 0)
+        self.assertAlmostEqual(f["since"], NOW - 5000, delta=1.0)
+
+    def test_missing_log_is_not_ok_and_names_itself(self):
+        """Файла нет → `ok=False` с названной причиной, а не пустой факт, читаемый как «тихо»."""
+        f = run_mod.price_facts(path=os.path.join(self.dir, "нет-такого.log"))
+        self.assertFalse(f["ok"])
+        self.assertTrue(f["err"])
+
+    def test_gate_above_the_first_stamp_says_its_hour_is_not_exact(self):
+        """Гасилка выше первой отметки хвоста: час взят у соседа, и неточность ОБЪЯВЛЕНА."""
+        p = self.write([PRICE_GATE_LINE, price_stamp_line(NOW - 900),
+                        "SUGGEST: черновик #1 → IPC (bot-режим)"])
+        f = run_mod.price_facts(path=p)
+        self.assertFalse(f["exact"])
+        self.assertAlmostEqual(f["since"], NOW - 900, delta=1.0)
+
+    def test_broken_bytes_do_not_swallow_the_gate_line(self):
+        """Кривой байт в соседней строке не смеет отнять у владельца гасилку."""
+        with open(self.log, "wb") as f:
+            f.write((price_stamp_line(NOW - 4000) + "\n").encode("utf-8"))
+            f.write(b"\xff\xfe SUGGEST: \xc0\xe1\xf0\xe0\xea\xe0\xe4\xe0\xe1\xf0\xe0\n")
+            f.write((PRICE_GATE_LINE + "\n").encode("utf-8"))
+        f = run_mod.price_facts(path=self.log)
+        self.assertTrue(f["ok"])
+        self.assertEqual(f["gates"], 1)
+
+    def test_the_live_log_is_either_read_or_names_its_refusal(self):
+        """ЖИВОЙ ЗАМЕР по боевому пути — ТОЛЬКО ЧТЕНИЕ. Тест не требует, чтобы цена молчала или
+        звучала: он требует, чтобы прибор не врал о своей способности прочитать журнал."""
+        f = run_mod.price_facts()
+        if f["ok"]:
+            self.assertIsInstance(f["gates"], int)
+            self.assertIsInstance(f["quotes"], int)
+        else:
+            self.assertIn("userbot_stderr.log", f["err"] + f["path"])
+
+
+def price_facts_of(since_ago=None, quotes=1, gates=0, ok=True, err="", exact=True,
+                   why=PRICE_GATE_LINE[len("price_gate: "):], now=NOW, last_ok_ago=None):
+    """Факт О7 в том виде, в каком его кладут руки (`price_facts`)."""
+    return {"ok": ok, "since": None if since_ago is None else now - since_ago,
+            "gate_why": None if since_ago is None else why, "gates": gates, "quotes": quotes,
+            "last_ok": None if last_ok_ago is None else now - last_ok_ago,
+            "exact": exact, "path": "подменённый журнал", "err": err}
+
+
+class TestPriceState(unittest.TestCase):
+    """РЕШЕНИЕ О7: три исхода, и ни одна дорога не ведёт к «называется» иначе как через
+    ПРОЧИТАННЫЙ след успешного пересчёта."""
+
+    def setUp(self):
+        self.cfg = ex.config({})
+
+    def test_defaults_are_the_declared_numbers(self):
+        """Порог — объявленный срок жизни кэша сторожа (30 мин), пол повтора — сутки."""
+        self.assertEqual((self.cfg["price"], self.cfg["price_repeat"]), (1800.0, 86400.0))
+
+    def test_mute_longer_than_the_threshold_is_a_verdict(self):
+        f = {"now": NOW, "price": price_facts_of(since_ago=7 * 3600, gates=2, last_ok_ago=86400)}
+        state, info = ex.price_state(f, self.cfg, NOW)
+        self.assertEqual(state, ex.PRICE_MUTE)
+        self.assertAlmostEqual(info["age"], 7 * 3600, delta=1.0)
+        v = [x for x in ex.verdict(f, self.cfg) if x["kind"] == "o7_pc_price_mute"]
+        self.assertEqual(len(v), 1)
+        self.assertEqual(v[0]["key"], "o7p|price")
+
+    def test_quote_after_gate_is_silence_not_a_verdict(self):
+        f = {"now": NOW, "price": price_facts_of(since_ago=None, quotes=519, last_ok_ago=60)}
+        self.assertEqual(ex.price_state(f, self.cfg, NOW)[0], ex.PRICE_OK)
+        self.assertEqual([x for x in ex.verdict(f, self.cfg)
+                          if x["kind"] == "o7_pc_price_mute"], [])
+
+    def test_unreadable_log_is_unknown_and_never_ok(self):
+        """ГЛАВНЫЙ ЗАМОК: непрочитанный журнал — «неизвестно», а не «цена называется»."""
+        f = {"now": NOW, "price": price_facts_of(ok=False, err="OSError: отказано")}
+        state, info = ex.price_state(f, self.cfg, NOW)
+        self.assertEqual(state, ex.PRICE_UNKNOWN)
+        self.assertNotEqual(state, ex.PRICE_OK)
+        self.assertIn("не прочитан", info["why"])
+        self.assertEqual(ex.verdict(f, self.cfg), [])
+
+    def test_no_fact_at_all_is_unknown(self):
+        self.assertEqual(ex.price_state({"now": NOW}, self.cfg, NOW)[0], ex.PRICE_UNKNOWN)
+
+    def test_empty_tail_without_any_price_line_is_unknown(self):
+        """Прочитанная ПУСТОТА тоже «неизвестно»: бот мог сутки не получить ни одного вопроса
+        о цене, и молчание журнала об этом не говорит ничего."""
+        f = {"now": NOW, "price": price_facts_of(since_ago=None, quotes=0, gates=0)}
+        state, info = ex.price_state(f, self.cfg, NOW)
+        self.assertEqual(state, ex.PRICE_UNKNOWN)
+        self.assertIn("судить не по чему", info["why"])
+
+    def test_gate_younger_than_the_threshold_waits_and_does_not_say_ok(self):
+        """Гасилка моложе порога — ещё не приговор, но и НЕ «называется»: сторож переспросит лист
+        сам, а объявить цену выданной здесь значило бы соврать ровно в момент гашения."""
+        f = {"now": NOW, "price": price_facts_of(since_ago=300, gates=1)}
+        state, info = ex.price_state(f, self.cfg, NOW)
+        self.assertEqual(state, ex.PRICE_UNKNOWN)
+        self.assertIn("порог", info["why"])
+        self.assertEqual(ex.verdict(f, self.cfg), [])
+
+    def test_zero_threshold_kills_the_branch_entirely(self):
+        """Ноль — ОБЪЯВЛЕННЫЙ откат: ветка умирает ДО чтения фактов."""
+        cfg0 = ex.config({"EXPECT_PC_PRICE_MIN": "0"})
+        f = {"now": NOW, "price": price_facts_of(since_ago=99999, gates=9)}
+        self.assertEqual(ex.price_state(f, cfg0, NOW)[0], ex.PRICE_UNKNOWN)
+        self.assertEqual(ex.verdict(f, cfg0), [])
+
+    def test_closure_needs_a_proven_quote_and_nothing_else(self):
+        """ЗАКРЫВАЕТ ТОЛЬКО ДОКАЗАННЫЙ ПЕРЕСЧЁТ. Ни ослепший журнал, ни ожидание порога, ни
+        «гасилок стало меньше» эпизод не закрывают: молчание источника выздоровлением не является."""
+        live = {"now": NOW, "price": price_facts_of(since_ago=7 * 3600, gates=2)}
+        blind = {"now": NOW, "price": price_facts_of(ok=False, err="OSError: отказано")}
+        young = {"now": NOW, "price": price_facts_of(since_ago=300, gates=1)}
+        healed = {"now": NOW, "price": price_facts_of(since_ago=None, quotes=5, last_ok_ago=30)}
+        self.assertEqual(ex.closures(live, self.cfg, ["o7p|price"]), [])
+        self.assertEqual(ex.closures(blind, self.cfg, ["o7p|price"]), [])
+        self.assertEqual(ex.closures(young, self.cfg, ["o7p|price"]), [])
+        self.assertEqual(ex.closures(healed, self.cfg, ["o7p|price"]), ["o7p|price"])
+
+    def test_the_note_carries_the_hour_the_reason_and_BOTH_branches(self):
+        """Заметка — ИЗВЕЩЕНИЕ, а не карточка: час, причина словами сторожа, две ветки дословно
+        и ни одной кнопки. И ни одного обещания что-то починить."""
+        f = {"now": NOW, "price": price_facts_of(since_ago=7 * 3600, gates=2, last_ok_ago=86400)}
+        note = ex.render(ex.verdict(f, self.cfg)[0])
+        self.assertIn("ЦЕНА КЛИЕНТАМ НЕ НАЗЫВАЕТСЯ", note)
+        self.assertIn("цена молчит с", note)
+        self.assertIn("ручки разошлись со слепком", note)
+        for branch in ex.PRICE_BRANCHES:
+            self.assertIn(branch, note)
+        self.assertIn("вернуть ручку", note)
+        self.assertIn("price_snapshot_collect.py", note)
+        self.assertIn("не раньше чем через сутки", note)
+        self.assertIn(ex.TAIL, note)
+        for forbidden in ("да/нет", "кнопк", "перезапущу", "верну ручку сам"):
+            self.assertNotIn(forbidden, note)
+
+    def test_inexact_hour_is_declared_in_the_note(self):
+        f = {"now": NOW, "price": price_facts_of(since_ago=7 * 3600, gates=1, exact=False)}
+        self.assertIn("ОСТОРОЖНО", ex.render(ex.verdict(f, self.cfg)[0]))
+
+    def test_close_line_names_the_result_not_the_owners_branch(self):
+        line = ex.render_close("o7p|price")
+        self.assertIn("ЦЕНА СНОВА НАЗЫВАЕТСЯ", line)
+        self.assertNotIn("ручк", line)          # какую ветку выбрал владелец — прибор не знает
+
+    def test_the_predeath_look_snapshot_age_is_never_the_subject(self):
+        """ПРЕДСМЕРТНЫЙ ВЗГЛЯД ЗАДАНИЯ, ЗАКРЫТЫЙ ДВАЖДЫ — поведением и текстом.
+
+        Живой случай 05.09: слепку `price_source.json` было 3.0 суток при законных 14, то есть
+        прибор, судящий по ВОЗРАСТУ, промолчал бы ровно там, где цена молчала семь часов. Здесь
+        доказано, что возраст не участвует вовсе: тот же вердикт при сколь угодно свежем слепке,
+        и ни слова о слепке в коде обеих функций решения."""
+        f = {"now": NOW, "price": price_facts_of(since_ago=7 * 3600, gates=2),
+             # Всё «здоровое» рядом: слепок свежайший, возраст законный, мост отвечает.
+             "price_snapshot": {"snapshot_on": "2026-09-05", "age_days": 0.0, "max_age_days": 14.0}}
+        self.assertEqual(ex.price_state(f, self.cfg, NOW)[0], ex.PRICE_MUTE)
+        with open(EX_SRC, encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src)
+        for fn in ("price_state", "_o7"):
+            node = [n for n in tree.body
+                    if isinstance(n, ast.FunctionDef) and n.name == fn][0]
+            body = ast.get_source_segment(src, node) or ""
+            for word in ("age_days", "max_age_days", "snapshot_on", "price_source.json"):
+                self.assertNotIn(word, body,
+                                 "%s не смеет судить по возрасту слепка (%s)" % (fn, word))
+
+
+class TestPriceHands(unittest.TestCase):
+    """РУКИ О7 в прогоне: одна заметка на эпизод, повтор не раньше суток, витрина в итоге.
+
+    ОТПРАВКА ПОДМЕНЕНА ЦЕЛИКОМ (`notifier`/`pulser` — заглушки), состояние живёт во временном
+    каталоге (`CC_EXPECT_PC_DIR`): боевой `tmp/expect_pc/state.json` не читается и не пишется,
+    владельцу не уходит ни одной строки."""
+
+    def setUp(self):
+        self.cfg = ex.config({})
+        self.dir = tempfile.mkdtemp(prefix="expect_pc_price_run_")
+        os.environ["CC_EXPECT_PC_DIR"] = self.dir
+        self.addCleanup(os.environ.pop, "CC_EXPECT_PC_DIR", None)
+        self.noted = []
+        self.addCleanup(setattr, run_mod, "snapshot", run_mod.snapshot)
+        self.log = os.path.join(self.dir, "userbot_stderr.log")
+
+    def _facts_at(self, now, since_ago, quotes=1, gates=2):
+        base = {"now": now,
+                "queue": {"ok": True, "rows": [], "dt": 1.0, "err": ""},
+                "heartbeat": {"ok": True, "raw": hb_at(300.0, now), "err": ""},
+                "silence": {"measured": True, "awake": 0.0, "why": ""},
+                "busy": {"ok": True, "since": None, "limit": ex.TASK_TIMEOUT_SEC, "err": ""},
+                "moderbot": None, "mod_silence": None, "kids": {},
+                "trace": {"ok": True, "ts": now - 600.0, "line": "", "attempt": None, "err": ""},
+                "client": {"ok": True, "sent": 0, "armed": 0, "attempted": 0, "total": 0,
+                           "last_sent": None,
+                           "pairs": {"ok": True, "sent": 0, "err": "", "last": None}},
+                "client_unknown": {"measured": True, "awake": 0.0, "since": None},
+                "kids_last": {"attempt": None, "sig": None}, "code": {}, "su": {"ok": False},
+                "price": price_facts_of(since_ago=since_ago, quotes=quotes, gates=gates, now=now)}
+        return base
+
+    def _run(self, now, since_ago, quotes=1, gates=2):
+        run_mod.snapshot = lambda st, n=None, getter=None: self._facts_at(now, since_ago,
+                                                                         quotes, gates)
+        out = run_mod.run(dry=False, now=now, getter=lambda status: {"ok": True, "items": []},
+                          notifier=lambda t: (self.noted.append(t), True)[1],
+                          pulser=lambda t: True)
+        # ТОЛЬКО СВОИ КЛЮЧИ. Крафтовые факты этого набора не описывают О6 (там `code: {}`), и
+        # её честное «замыкание не посчитано» едет в тот же список. Чужие ключи здесь не предмет:
+        # набор О7 обязан краснеть от О7, а не от соседней ветки.
+        for slot in ("notes", "repeats", "closed"):
+            out[slot] = [k for k in (out.get(slot) or []) if k.startswith("o7p")]
+        self.noted = [t for t in self.noted if "ЦЕНА" in t]
+        return out
+
+    def test_one_note_per_episode_then_a_repeat_after_a_day_then_a_closure(self):
+        """ВЕСЬ ЖИЗНЕННЫЙ ПУТЬ ЭПИЗОДА ОДНИМ КЕЙСОМ, потому что порознь он и разошёлся бы:
+        первая заметка → молчание через час → повтор через сутки → закрытие пересчётом."""
+        out = self._run(NOW, since_ago=7 * 3600)
+        self.assertEqual(out["notes"], ["o7p|price"])
+        self.assertEqual(len(self.noted), 1)
+
+        out = self._run(NOW + 3600, since_ago=8 * 3600)          # тот же эпизод час спустя
+        self.assertEqual(out["notes"], [])
+        self.assertEqual(out["repeats"], [])
+        self.assertEqual(len(self.noted), 1, "повтор раньше суток — это шум, а не настойчивость")
+
+        out = self._run(NOW + 86400 + 60, since_ago=31 * 3600)   # сутки выстояны
+        self.assertEqual(out["repeats"], ["o7p|price"])
+        self.assertEqual(len(self.noted), 2)
+
+        out = self._run(NOW + 90000, since_ago=None, quotes=9, gates=0)
+        self.assertEqual(out["closed"], ["o7p|price"])
+        self.assertIn("ЦЕНА СНОВА НАЗЫВАЕТСЯ", self.noted[-1])
+
+    def test_repeat_floor_of_zero_kills_the_repeat_but_not_the_first_note(self):
+        cfg_off = {"EXPECT_PC_PRICE_REPEAT_MIN": "0"}
+        old = dict(os.environ)
+        os.environ.update(cfg_off)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(old)))
+        self.assertEqual(self._run(NOW, since_ago=7 * 3600)["notes"], ["o7p|price"])
+        self.assertEqual(self._run(NOW + 200000, since_ago=60 * 3600)["repeats"], [])
+        self.assertEqual(len(self.noted), 1)
+
+    def test_the_showcase_line_lives_exactly_as_long_as_the_episode(self):
+        """ВИТРИНА. Пока молчание живо — слово «молчит» с часом и причиной; вернулся пересчёт —
+        тем же замером строка становится «называется». Снимать её руками нечем и не нужно."""
+        out = self._run(NOW, since_ago=7 * 3600)
+        self.assertEqual(out["price"], ex.PRICE_MUTE)
+        self.assertIsNotNone(out["price_since"])
+        self.assertIn("ручки разошлись со слепком", out["price_gate_why"])
+        out = self._run(NOW + 90000, since_ago=None, quotes=9, gates=0)
+        self.assertEqual(out["price"], ex.PRICE_OK)
+
+    def test_blind_log_keeps_the_episode_open_and_says_unknown(self):
+        """ОСЛЕПШИЙ ЖУРНАЛ НЕ ЗАКРЫВАЕТ ЭПИЗОД и не превращается в «называется»."""
+        self._run(NOW, since_ago=7 * 3600)
+        run_mod.snapshot = lambda st, n=None, getter=None: dict(
+            self._facts_at(NOW + 3600, None), price=price_facts_of(ok=False, err="OSError: нет"))
+        out = run_mod.run(dry=False, now=NOW + 3600,
+                          getter=lambda status: {"ok": True, "items": []},
+                          notifier=lambda t: (self.noted.append(t), True)[1], pulser=lambda t: True)
+        self.assertEqual(out["price"], ex.PRICE_UNKNOWN)
+        self.assertEqual(out["closed"], [])
+        self.assertEqual(len(self.noted), 1)
+
+    def test_the_instrument_reads_the_log_in_exactly_one_place(self):
+        """ПРИБОР НЕ В ДВУХ ЭКЗЕМПЛЯРАХ: журнал продукта в слое читает ровно одна функция.
+        Второй читатель разошёлся бы с первым порогом или разделителем — и владелец получил бы
+        два разных ответа об одной цене."""
+        with open(RUN_SRC, encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src)
+        readers = [n.name for n in tree.body
+                   if isinstance(n, ast.FunctionDef)
+                   and "PRICE_GATE_MARK" in (ast.get_source_segment(src, n) or "")]
+        self.assertEqual(readers, ["price_facts"])
+        self.assertEqual(src.count("PRICE_LOG_FILE"), 2)     # объявление + единственное чтение
+
+
 if __name__ == "__main__":
     unittest.main()
