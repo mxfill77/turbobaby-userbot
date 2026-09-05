@@ -1568,6 +1568,127 @@ def _task_started_get(tid, path=None):
         return None
 
 
+# ═══ ТЕРМИНАЛ НЕОБРАТИМ: ПЕЧАТЬ ЗАКРЫТИЯ И ЕЁ ЧИТАТЕЛЬ (05.09.2026) ══════════════════════════
+# ЖИВОЙ ПОВОД — id=12, `pc_orchestrator.log:13912–13928`. 16:17:35 судья сказал PROVEN, 16:20:35
+# демон закрыл ряд `done` и владельцу ушла ✅-карточка, а 16:26:45 реапер одиночек прочитал полосу,
+# увидел ТОТ ЖЕ ряд всё ещё `in_progress` (`updated` = 15:57:58, момент claim — мост его не сдвинул)
+# и снял задачу как СИРОТУ: «дочерний процесс claude (PID 6168) мёртв». Владелец получил ДВЕ
+# карточки об одной задаче с противоположными исходами, и вторая — ложь: работа была сделана и
+# доказана. Расписка `complete` при этом отказом НЕ была (иначе в логе стояло бы COMPLETE-VERIFY).
+#
+# ОШИБКА НЕ В ПРОБЕ ПРОЦЕССА: ребёнок и правда был мёртв — он отработал и вышел. Ошибка в том, что
+# ПОСЛЕ ЗАКРЫТИЯ смерть исполнителя перестаёт быть уликой вообще: у закрытой задачи исполнителя нет
+# по построению, и «нет исполнителя» там означает «сделано», а не «брошено». Отсюда правило без
+# исключений: ТЕРМИНАЛЬНОЕ СОСТОЯНИЕ НЕОБРАТИМО — ряд, который МЫ закрыли, сторож не переоткрывает
+# ни при каких признаках, каким бы свежим ни выглядел признак.
+#
+# ПОЧЕМУ ПЕЧАТЬ НЕСЁТ ВРЕМЯ, А НЕ ТОЛЬКО НОМЕР. Номера очередь ПЕРЕИСПОЛЬЗУЕТ (та же причина, по
+# которой заведён `TASK_START_RECLAIM`), и печать «номер 12 закрыт» глушила бы сторожа для СЛЕДУЮЩЕЙ
+# задачи с тем же номером — то есть чинила бы ложную карточку ценой пропущенной настоящей сироты.
+# Контрпример не выдуман, он в том же логе: номер 119 закрыт `done` 02.09 19:15:26, а 03.09 23:05:38
+# тот же номер получила НОВАЯ строка. Поэтому печать сверяется с `updated` ряда: ряд НЕ ДВИГАЛСЯ с
+# нашего закрытия → это тот самый прогон, терминал; ряд МОЛОЖЕ печати → это другая жизнь номера, и
+# судится она обычным порядком.
+
+
+def _closed_seal_of(rec):
+    """Печать терминала из записи реестра → dict | None. Форма записи двоякая (у старых отметок
+    это голая строка ISO), поэтому спрашиваем осторожно, а не `rec["closed"]`."""
+    if not isinstance(rec, dict):
+        return None
+    seal = rec.get("closed")
+    return seal if isinstance(seal, dict) else None
+
+
+def _mark_time_key(val):
+    """Ключ сортировки отметки по времени: старт, а нет старта — время печати терминала.
+    Нужен капу реестра: у записи, рождённой ОДНОЙ печатью (задачу клеймили не мы — так делает
+    owner-карточка ревизора, :func:`_revizor_owner_card`), поля `at` нет вовсе, и голый
+    `_started_at_raw` отправлял бы такую запись под нож первой, ещё до старых и ненужных."""
+    seal = _closed_seal_of(val)
+    return _started_at_raw(val) or (str(seal.get("at") or "") if seal else "")
+
+
+def _task_closed_mark(tid, status, ok=True, now=None, path=None):
+    """Запечатать ТЕРМИНАЛ задачи в реестре отметок. → ISO печати | "" (статус не терминальный).
+
+    Ставится на КАЖДОЕ закрытие полосы — единственная дорога к мосту здесь `_complete`, — включая
+    закрытие самим реапером: повторно судить уже снятую строку тоже незачем.
+
+    `ok` — что сказала РАСПИСКА моста, а не судьба записи (класс «ложный 401»: расписка и судьба
+    мутации — разные вещи). Печать ставится и на «не ok» СОЗНАТЕЛЬНО: владельцу карточка к этому
+    моменту уже ушла, и второй, противоположной, он не должен получить ни в одном исходе. Расписку
+    храним, чтобы сторож мог назвать её словами, а не молчать о том, что закрытие не подтверждено.
+
+    Печать НИКОГДА не смеет уронить закрытие: сбой диска отбрасывает нас к прежнему поведению
+    (сторож судит как раньше), а не к потерянной задаче."""
+    st_status = str(status or "")
+    if st_status not in ("done", "failed"):
+        return ""                    # approved/needs_approval терминалом не являются
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    stamp = now.isoformat()
+    try:
+        with _STATE_LOCK:            # общий реестр, два захода — см. `_task_started_mark`
+            st = _task_started_read(path)
+            key = str(tid)
+            rec = st.get(key)
+            rec = dict(rec) if isinstance(rec, dict) else {"at": _started_at_raw(rec)}
+            rec["closed"] = {"at": stamp, "status": st_status, "ok": bool(ok)}
+            st[key] = rec
+            if len(st) > TASK_START_KEEP:      # тот же кап, что у отметки старта
+                for k in sorted(st, key=lambda x: _mark_time_key(st[x]))[:len(st) - TASK_START_KEEP]:
+                    st.pop(k, None)
+            _task_started_write(st, tid, path)
+    except Exception as e:           # noqa: BLE001 — печать не смеет уронить закрытие задачи
+        log.warning("печать терминала id=%s не записана (%s) — сторож её не увидит", tid, e)
+        return ""
+    return stamp
+
+
+def _closed_by_us(tid, updated, st=None, path=None, now=None):
+    """Ряд уже закрыт НАМИ и с тех пор не двигался? → (True | False, слова для лога).
+
+    True  — терминал: этот самый прогон закрыли мы сами, и сторожам его больше не судить;
+    False — печати нет ЛИБО ряд МОЛОЖЕ печати (номер переиспользован очередью — другая жизнь).
+
+    Третий исход («времени не разобрать») уходит в True: «не знаю» здесь обязано означать
+    МОЛЧАНИЕ, а не вторую карточку поверх уже отправленной. Цена ошибки асимметрична ровно так же,
+    как у `_executor_verdict`, только знак другой — там лишнее ожидание, здесь лишняя ложь.
+
+    Возрасты меряются ОДНИМ прибором (`_age_sec`) от ОДНОГО `now`, чтобы второго разбора дат в
+    файле не заводилось: ряд старше печати ⇔ его возраст больше."""
+    if not tid and tid != 0:
+        return False, ""
+    rec = (st if isinstance(st, dict) else _task_started_read(path)).get(str(tid))
+    seal = _closed_seal_of(rec)
+    if not seal:
+        return False, ""
+    at = str(seal.get("at") or "")
+    words = ("закрыта нами %s статусом %s (расписка моста: %s)"
+             % (at or "когда-то", seal.get("status") or "?",
+                "принята" if seal.get("ok") else "НЕ ПРИНЯТА"))
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    row_age, seal_age = _age_sec(updated, now=now), _age_sec(at, now=now)
+    if row_age is None or seal_age is None:
+        return True, words + " — время сверить нечем, молчу"
+    if row_age >= seal_age:
+        return True, words
+    return False, ""                 # ряд двигался ПОСЛЕ закрытия → это другая жизнь номера
+
+
+def _complete(tid, status, result, bridge=None):
+    """ЕДИНСТВЕННАЯ дорога полосы к `complete_task`: закрыть ряд и ЗАПЕЧАТАТЬ терминал локально.
+
+    Обёртка, а не правка клиента моста, по прицельной причине: клиент в регрессе подменяется
+    двойником, и печать, спрятанная внутрь боевого класса, в тестах не жила бы вовсе — а именно её
+    обязан проверять отрицательный тест «закрыто успехом, ребёнок убит, пометка «в работе» → сторож
+    молчит». Проверяемость здесь не удобство, а условие: молчание сторожа доказать больше нечем."""
+    b = bridge if bridge is not None else bc
+    r = b.complete_task(tid, status, result)
+    _task_closed_mark(tid, status, ok=bool(isinstance(r, dict) and r.get("ok")))
+    return r
+
+
 def _git_commits_between(since, until):
     """Коммиты репо в окне → [(хеш, заголовок)]. Границы отдаём git'у в UTC с явной зоной."""
     # --reverse: от НАЧАЛА окна. Показываем первые EVIDENCE_MAX_COMMITS, а работа задачи обычно
@@ -3232,7 +3353,7 @@ def _finalize_lesson_dec(tid, text, dec):
         return
     status = dec.get("status") or "done"
     result = (dec.get("result") or "урок обработан")[:RESULT_MAX]
-    bc.complete_task(tid, status, result)
+    _complete(tid, status, result)
     log.info("LESSON id=%s route=%s → %s (%s)", tid, route, status, dec.get("reason"))
     _cowork(f"урок #{tid} [{route}] → {status} · {_clip(result)}")
     _notify_task(status, tid, result)
@@ -3455,7 +3576,7 @@ def process_lesson_waits(now=None, path=None):
         if dec is None:
             continue                             # ещё в пределах 24ч — ждём ответа учителя
         result = (dec.get("result") or "урок отдан владельцу по 24ч-таймауту")[:RESULT_MAX]
-        bc.complete_task(tid, dec.get("status") or "done", result)
+        _complete(tid, dec.get("status") or "done", result)
         _notify_task(dec.get("status") or "done", tid, result)
         log.warning("LESSON wait id=%s: 24ч без ответа учителя → %s, ожидание снято · %s",
                     tid, dec.get("status") or "done", _clip(result))
@@ -3617,7 +3738,7 @@ def _maybe_card_duty(tid, what):
     # СЛЕД РАНЬШЕ ЗАКРЫТИЯ: заметка уходит ДО complete_task — если мост упадёт на закрытии,
     # владелец уже знает о снятии, а карточка останется висеть (видимый, а не молчаливый сбой).
     note = _duty_note(tid, rule, proof)
-    cm = bc.complete_task(tid, "failed", card_duty.close_result(what, rule, proof))
+    cm = _complete(tid, "failed", card_duty.close_result(what, rule, proof))
     log.info("DUTY-CLOSE id=%s условие=%s (%s) заметка=%s bridge_ok=%s",
              tid, rule, proof, note, cm.get("ok"))
     return True
@@ -3834,7 +3955,7 @@ def _lane_crash_close(tid, exc):
                           "СОСЕДНИМ заходом того же витка, чтобы не висеть in_progress до порога "
                           "реапера; работа, если она успела лечь в git, видна по следам ниже",
                           since=_task_started_get(tid))
-        bc.complete_task(tid, "failed", msg)
+        _complete(tid, "failed", msg)
         _cowork(f"задача #{tid} → failed (заход упал исключением, ряд закрыт соседом) · {_clip(msg)}")
         _notify_task("failed", tid, "заход упал исключением внутри демона")
     except Exception as e:                  # noqa: BLE001 — уборка за упавшим не смеет упасть сама
@@ -3865,7 +3986,7 @@ def _process_one(task, _plan_queue):
         # осиротевшая owner-карточка ревизора (краш между claim и set_needs_approval): закрыть,
         # НЕ гнать headless фиктивный текст (пересоздастся следующим прогоном ревизора). Штатно
         # сюда не попадаем — ревизор claim'ит и штампует needs_approval синхронно в maybe_revizor.
-        bc.complete_task(tid, "done", "🔍 ревизор: осиротевшая owner-карточка закрыта")
+        _complete(tid, "done", "🔍 ревизор: осиротевшая owner-карточка закрыта")
         _cowork(f"ревизор: осиротевшая owner-карточка #{tid} закрыта")
         return
     if _is_review_claim(text):
@@ -3873,7 +3994,7 @@ def _process_one(task, _plan_queue):
         # в needs_approval. Закрываем — и НИКОГДА не гоним headless: текст заявки написан ВНЕШНИМ
         # каналом, и отдать его ребёнку как задание значило бы исполнять чужие команды на этой
         # машине. Штатно сюда не попадаем: ступень B ставит и переводит ряд синхронно.
-        bc.complete_task(tid, "done",
+        _complete(tid, "done",
                          "📥 осиротевшая заявка внешнего канала закрыта: заявка НЕ исполняется "
                          "(её текст — чужое мнение, а не задание). Вернётся карточкой следующим "
                          "оборотом ступени B, если находка ещё в лотке")
@@ -3885,7 +4006,7 @@ def _process_one(task, _plan_queue):
         # владельцу о поводе, который полоса разведывать НЕ ВПРАВЕ (живой ребёнок, клиентский
         # контур, операционное действие). Исполнить его значило бы обойти собственный запрет
         # ступени по недосмотру. Вернётся следующим оборотом, если повод ещё жив.
-        bc.complete_task(tid, "done",
+        _complete(tid, "done",
                          "✋ осиротевшая заявка ступени E закрыта: она НЕ исполняется (её предмет "
                          "требует операционного действия, а разведка меняет только информационное "
                          "состояние). Вернётся следующим оборотом, если повод ещё жив")
@@ -3894,14 +4015,14 @@ def _process_one(task, _plan_queue):
     cmd = _match_command(text)                 # команда-рычаг? исполняем САМИ, без headless claude
     if cmd:
         status, result = _exec_command(cmd, text=text)
-        bc.complete_task(tid, status, result)
+        _complete(tid, status, result)
         log.info("COMMAND id=%s cmd=%s → %s", tid, cmd, status)
         _cowork(f"задача #{tid} (рычаг {cmd}) → {status} · {_clip(result)}")
         _notify_task(status, tid, result)
         return
     if _is_smoke_step(text):        # обязательный финальный смоук цепи — исполняем САМИ, без headless
         status, result = _exec_smoke_step()
-        bc.complete_task(tid, status, result)
+        _complete(tid, status, result)
         log.info("SMOKE id=%s → %s", tid, status)
         _cowork(f"смоук-шаг #{tid} → {status} · {_clip(result)}")
         _notify_task(status, tid, result)
@@ -4004,7 +4125,7 @@ def _process_one(task, _plan_queue):
         if not _is_chain_artifact(frm, text):
             result = _cap_result(close_msg_pc.prepend(result, text, status, NO_HEAL_PREFIXES,
                                                       _close_plan_facts(_plan_queue)), tid)
-        bc.complete_task(tid, status, result)
+        _complete(tid, status, result)
         log.info("COMPLETE id=%s status=%s", tid, status)
         # полный текст RESULT (done) / причины failed → штаб читает итог из cowork_log без скринов
         _cowork(f"задача #{tid} → {status} · {_clip(result)}")
@@ -4138,7 +4259,7 @@ def process_approved():
             return
         if _is_revizor_owner_card(task.get("task_text")):
             # info-карточка ревизора: approve = «принято», без headless-прогона фиктивного текста
-            bc.complete_task(tid, "done", "🔍 owner-находки ревизора приняты Филиппом")
+            _complete(tid, "done", "🔍 owner-находки ревизора приняты Филиппом")
             _cowork(f"ревизор: owner-карточка #{tid} принята (approve)")
             log.info("APPROVED id=%s ревизор-owner-карточка → принято", tid)
             continue
@@ -4147,7 +4268,7 @@ def process_approved():
             # становится ни здесь, ни где-либо ещё: задачу по ней ставит человек ОТДЕЛЬНОЙ
             # постановкой, своими словами. Автопревращение чужого текста в задание — ровно тот
             # канал исполнения извне, ради закрытия которого ступень B и построена так.
-            bc.complete_task(tid, "done",
+            _complete(tid, "done",
                              "📥 заявка внешнего канала ПРИНЯТА К СВЕДЕНИЮ. Задачей она не стала "
                              "и не станет: если находку надо исполнить — поставь задачу отдельно, "
                              "своими словами")
@@ -4158,7 +4279,7 @@ def process_approved():
             # «Да» на заявке ступени E — тоже «ПРИНЯТО К СВЕДЕНИЮ». Предмет такой заявки —
             # операционное действие (рестарт, живой ребёнок, клиентский контур), и превращать
             # одобрение вопроса в разрешение действовать нельзя: одобрен ВОПРОС, а не операция.
-            bc.complete_task(tid, "done",
+            _complete(tid, "done",
                              "✋ заявка ступени E ПРИНЯТА К СВЕДЕНИЮ. Задачей она не стала: её "
                              "предмет — операционное действие, и решение по нему остаётся твоим")
             _cowork(f"ступень E: заявка #{tid} принята к сведению (задачей НЕ стала)")
@@ -4173,7 +4294,7 @@ def process_approved():
             msg = fail_result(FAIL_APPROVAL_TIMEOUT,
                               f"approve истёк (>{APPROVAL_TTL // 60} мин) — повтори задачу",
                               since=_task_started_get(tid), draft=_draft_block(tid))
-            bc.complete_task(tid, "failed", msg)
+            _complete(tid, "failed", msg)
             _cowork(f"задача #{tid} (approved) → failed · {_clip(msg)}")
             _notify_task("failed", tid, "approve истёк")
             continue
@@ -4215,11 +4336,11 @@ def process_approved():
             msg = fail_result(FAIL_MODEL_REFUSAL,
                               f"одобрено, но шаг снова упирается в красное — выполни вручную "
                               f"[{why}]: " + result[:400], since=_task_started_get(tid))
-            bc.complete_task(tid, "failed", msg)
+            _complete(tid, "failed", msg)
             _cowork(f"задача #{tid} (approved) → failed · {_clip(msg)}")
             _notify_task("failed", tid, "снова красное после approve — вручную")
         else:
-            bc.complete_task(tid, status, result)
+            _complete(tid, status, result)
             _cowork(f"задача #{tid} (approved) → {status} · {_clip(result)}")
             _notify_task(status, tid, result)
         log.info("APPROVED id=%s → %s", tid, status)
@@ -4253,7 +4374,7 @@ def process_approval_timeouts():
                               f"подтверждение не получено за {APPROVAL_TTL // 60} мин — задача "
                               "закрыта без «да»", since=_task_started_get(tid),
                               draft=_draft_block(tid))
-            bc.complete_task(tid, "failed", msg)
+            _complete(tid, "failed", msg)
             _cowork(f"задача #{tid} → failed · {_clip(msg)}")
             _notify_task("failed", tid,
                          f"подтверждение не получено за {APPROVAL_TTL // 60} мин")
@@ -4556,7 +4677,7 @@ def answer_card(tid, yes, reply="", who=None, origin=None, bridge=None, env=None
     txt = _REJECT_PREFIX + f" (ответ с ПК: {who}/{org})"
     if str(reply or "").strip():
         txt += ": " + _clip(str(reply), 300)
-    r = b.complete_task(tid, "failed", txt)
+    r = _complete(tid, "failed", txt, bridge=b)      # печать терминала — на ВСЕХ дорогах, и «нет» владельца тоже
     if r.get("ok"):
         return _answer_done(True, f"🚫 задача {tid} отклонена ({who}, {org}) — статус failed",
                             rec, "ok", ledger)
@@ -4572,6 +4693,11 @@ def answer_card(tid, yes, reply="", who=None, origin=None, bridge=None, env=None
 NO_EXEC_NEVER_RAN = "прогон на этом ПК не начинался ни разу (отметки старта нет)"
 NO_EXEC_NOT_MINE = "её вёл ЭТОТ процесс демона и уже не ведёт — дочернего claude нет"
 NO_EXEC_CHILD_DEAD = "дочерний процесс claude (PID {pid}) мёртв"
+
+# Про какие ЗАПЕЧАТАННЫЕ ряды сторож уже сказал вслух (дедуп ЛОГА, не решения). Мост, продолжающий
+# отдавать закрытый ряд как in_progress, повторяется каждый виток; новость об этом стои́т сказать
+# один раз за жизнь процесса, а не 60 раз в час — иначе она утонет в самой себе.
+_SEAL_SAID = set()
 
 
 def _executor_verdict(tid, path=None, pid_alive=None, since=None):
@@ -4688,10 +4814,24 @@ def process_stuck_singles(now=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
     now_ts = now.timestamp()
     waiting = _lesson_wait_ids()          # законно-ждущие low-уроки (родитель 334): НЕ орфаны — не реапим
+    marks = _task_started_read()          # реестр отметок читаем ОДИН раз на виток, а не на задачу
     for task in [it for it in r.get("items", []) if _lane_ok(it)]:
         tid = task.get("id")
         if tid in waiting:
             continue                      # урок законно ждёт ответа учителя (in_progress); предел — 24ч, не реапер
+        # ТЕРМИНАЛ НЕОБРАТИМ (05.09.2026, живой id=12 — разбор у `_task_closed_mark`). Ряд, который
+        # МЫ уже закрыли, реапер не переоткрывает ни при каких признаках. Стои́т ДО порогов и ДО
+        # вердикта об исполнителе сознательно: смерть headless ПОСЛЕ закрытия — нормальное
+        # завершение, а не сиротство, и спрашивать о ней уже нечего. Молчим о ЗАДАЧЕ, но не о
+        # МОСТЕ: полоса, отдающая закрытый ряд как in_progress, — это новость, и она в логе.
+        sealed, seal_why = _closed_by_us(tid, task.get("updated"), st=marks, now=now)
+        if sealed:
+            if tid not in _SEAL_SAID:
+                _SEAL_SAID.add(tid)
+                log.warning("stuck-single: id=%s НЕ СУЖУ — %s. Терминал необратим; полоса всё ещё "
+                            "отдаёт ряд как in_progress — это новость о МОСТЕ, а не о задаче",
+                            tid, seal_why)
+            continue
         if _is_running(tid):
             # ЭТУ задачу демон ведёт ПРЯМО СЕЙЧАС — её судьбу решает прогон (и его TASK_TIMEOUT),
             # а не реапер, и никакой возраст этого не меняет. Возраст тут врёт по устройству:
@@ -4737,7 +4877,7 @@ def process_stuck_singles(now=None):
                       f"(> {PC_SINGLE_STALE}с) без движения — ПК был выключен, либо прогон "
                       "застрял/оборвался посреди исполнения")
         msg = fail_result(FAIL_HEARTBEAT_TIMEOUT, detail, since=started, now=now)
-        bc.complete_task(tid, "failed", msg)
+        _complete(tid, "failed", msg)
         if alive is False:
             log.warning("stuck-single: id=%s СИРОТА (%s) in_progress %sс > %sс → failed "
                         "(исполнителя нет — ждать нечего)", tid, why, int(age), PC_ORPHAN_STALE)
@@ -5315,7 +5455,7 @@ def _maybe_task_selfheal(tid, text, fail_text, frm):
         oid = hm.group(1)
         msg = (f"🛑 самопочинка не помогла (попытка 1 исчерпана): перерождение задачи {oid} упало "
                f"повторно — нужен человек.\n{str(fail_text or '')}")[:RESULT_MAX]
-        bc.complete_task(tid, "failed", msg)
+        _complete(tid, "failed", msg)
         log.info("task-selfheal: id=%s (перерождение задачи %s) упал ПОВТОРНО → терминальный failed", tid, oid)
         _cowork(f"задача #{tid} (перерождение {oid}) → failed повторно · {_clip(msg)}")
         _notify_task("failed", tid, "самопочинка не помогла — нужен человек")
@@ -5329,7 +5469,7 @@ def _maybe_task_selfheal(tid, text, fail_text, frm):
         msg = (f"задача упала → думатель: halt, причина: {reason}\n"
                f"Перерождение не поможет (диагноз думателя выше), нужен человек.\n"
                f"{str(fail_text or '')}")[:RESULT_MAX]
-        bc.complete_task(tid, "failed", msg)
+        _complete(tid, "failed", msg)
         log.info("task-selfheal: id=%s → думатель halt (%s)", tid, reason[:120])
         _cowork(f"задача #{tid} → failed (думатель: halt) · {_clip(reason)}")
         _notify_task("failed", tid, "думатель: halt — нужен человек")
@@ -5344,7 +5484,7 @@ def _maybe_task_selfheal(tid, text, fail_text, frm):
     card = (f"🩹 задача упала → думатель: retry, правка: {fixed[:200]}, причина: {reason[:200]}\n"
             f"Перерождена задачей id {nid} (попытка 1 из 1; повторный провал = терминальный failed).\n"
             f"Исходный провал: {str(fail_text or '')[:400]}")[:RESULT_MAX]
-    bc.complete_task(tid, "done", card)           # карточка решения → cowork_log/пуш (тема 829-красное нетронуто)
+    _complete(tid, "done", card)           # карточка решения → cowork_log/пуш (тема 829-красное нетронуто)
     log.info("task-selfheal: id=%s перерождён задачей %s (retry)", tid, nid)
     _cowork(f"задача #{tid} → самопочинка retry, перерождена #{nid} · {_clip(card)}")
     _notify_task("done", tid, f"самопочинка: перерождена задачей #{nid}")
@@ -5657,7 +5797,7 @@ def _local_dec_plan(tid, text):
         msg = ("планировщик локальной декомпозиции не отработал (кондуктор "
                f"{THINKER_MODEL}/фолбэк {THINKER_FALLBACK or 'нет'}): сбой/таймаут claude -p — "
                "план не построен, повтори задачу")[:RESULT_MAX]
-        bc.complete_task(tid, "failed", msg)
+        _complete(tid, "failed", msg)
         log.warning("pcloc-dec: id=%s планировщик не отработал → failed", tid)
         _cowork(f"родитель #{tid} (pcloc-dec) → failed · {_clip(msg)}")
         _notify_task("failed", tid, "планировщик декомпозиции не отработал")
@@ -5673,7 +5813,7 @@ def _local_dec_plan(tid, text):
         else:
             msg = ("план пуст: планировщик не вернул нумерованный список «N. <шаг>». "
                    "Вывод (хвост): " + _tail(out, 700))[:RESULT_MAX]
-        bc.complete_task(tid, "failed", msg)
+        _complete(tid, "failed", msg)
         log.warning("pcloc-dec: id=%s пустой план → failed (%s)", tid, _clip(msg, 160))
         _cowork(f"родитель #{tid} (pcloc-dec) → failed · {_clip(msg)}")
         _notify_task("failed", tid, msg)
@@ -5681,7 +5821,7 @@ def _local_dec_plan(tid, text):
     if len(steps) > MAX_STEPS:
         msg = (f"план из {len(steps)} шагов превышает потолок {MAX_STEPS} — "
                "упрости ТЗ или разбей на два «декомпозируй:»")[:RESULT_MAX]
-        bc.complete_task(tid, "failed", msg)
+        _complete(tid, "failed", msg)
         log.warning("pcloc-dec: id=%s план %s шагов > %s → failed", tid, len(steps), MAX_STEPS)
         _cowork(f"родитель #{tid} (pcloc-dec) → failed · {_clip(msg)}")
         _notify_task("failed", tid, msg)
@@ -5702,7 +5842,7 @@ def _local_dec_plan(tid, text):
               + plan_txt + "\n" + _dec_red_note(steps)
               + "Шаг 1 уже в очереди. Красный шаг спросит «да» кнопкой. "
                 "После последнего шага пришлю сводку.")[:RESULT_MAX]
-    bc.complete_task(tid, "done", result)
+    _complete(tid, "done", result)
     log.info("pcloc-dec: id=%s план из %s шагов построен (done), шаг 1 релизнут", tid, len(steps))
     _cowork(f"родитель #{tid} (pcloc-dec) → done: план {len(steps)} шагов, шаг 1 в очереди · {_clip(result)}")
     _notify_task("done", tid, f"декомпозиция: план из {len(steps)} шагов, шаг 1 в очереди")
@@ -5893,7 +6033,7 @@ def _loc_post_card(pid, text):
         return
     sid = r.get("id")
     bc.claim_task(sid)                    # даже если claim не прошёл — complete финализирует
-    bc.complete_task(sid, "done", str(text)[:RESULT_MAX])
+    _complete(sid, "done", str(text)[:RESULT_MAX])
 
 
 def _loc_summary_counts(steps):
@@ -5954,7 +6094,7 @@ def _loc_post_summary(pid, steps):
         return
     sid = r.get("id")
     bc.claim_task(sid)
-    cm = bc.complete_task(sid, "done", text)
+    cm = _complete(sid, "done", text)
     _loc_summarized.add(pid)
     _loc_mark_chain_final(pid)      # финализированная цепь карточек больше не анонсирует (restart-proof)
     _cowork(f"сводка родитель {pid}: {n_done}/{total} done")  # NOTE в журнал в момент постановки
@@ -5993,7 +6133,7 @@ def _loc_stop_chain(pid, by="владельцем"):
         return False, f"цепь #{pid}: не удалось поставить сводку-стоп ({r.get('error')}) — повтори."
     sid = r.get("id")
     bc.claim_task(sid)
-    bc.complete_task(sid, "done", text)
+    _complete(sid, "done", text)
     _loc_summarized.add(pid)
     _loc_mark_chain_final(pid)      # стоп владельцем = финал: карточки цепи замолкают навсегда
     _rows, n_done, total = _loc_summary_counts(steps)
@@ -6374,7 +6514,7 @@ def _loc_after_done(pid, i, n, it, steps, items=None):
                 cr = _loc_enqueue(f"[коррекция плана родитель {pid}] после шага {i} (K={k})")
                 if cr.get("ok"):
                     bc.claim_task(cr.get("id"))
-                    bc.complete_task(cr.get("id"), "done", card[:RESULT_MAX])
+                    _complete(cr.get("id"), "done", card[:RESULT_MAX])
                     _loc_release(pid, i + 1, new_total, new_steps[0], k=k)
                     log.info("pcloc-plan-adapt: родитель %s adjust K=%s после шага %s → релиз "
                              "скорректированного шага %s/%s", pid, k, i, i + 1, new_total)
@@ -6514,16 +6654,16 @@ def _loc_finalize_orphan_synthetic(tid, text):
     sm = _SUM_RE.match(text)
     if sm:
         pid = int(sm.group(1))
-        bc.complete_task(tid, "done", _loc_summary_text(pid, _loc_chain_steps(pid)))
+        _complete(tid, "done", _loc_summary_text(pid, _loc_chain_steps(pid)))
         log.info("pcloc-dec: осиротевшая сводка id=%s доведена", tid)
         return True
     if _ADAPT_CARD_RE.match(text):
-        bc.complete_task(tid, "done", "🧭 карточка коррекции плана (осиротела при рестарте "
+        _complete(tid, "done", "🧭 карточка коррекции плана (осиротела при рестарте "
                                       "демона; шаги коррекции уже в цепочке родителя)")
         log.info("pcloc-dec: осиротевшая карточка адаптации id=%s доведена", tid)
         return True
     if _CARD_RE.match(text):
-        bc.complete_task(tid, "done", "🃏 карточка события цепи (осиротела при рестарте демона; "
+        _complete(tid, "done", "🃏 карточка события цепи (осиротела при рестарте демона; "
                                       "цепь родителя идёт своим ходом)")
         log.info("pcloc-dec: осиротевшая карточка id=%s доведена", tid)
         return True
@@ -11157,7 +11297,7 @@ def _revizor_close_undecidable_card(items, now=None, path=None):
                  else "среди пунктов есть решаемые владельцем")
         return None, 0
     n = len(_revizor_card_rows(_revizor_cards_read(path).get(str(tid))))
-    ok, why = _card_delivery_receipt(bc.complete_task(
+    ok, why = _card_delivery_receipt(_complete(
         tid, "done",
         f"🔍 ревизор: РЕШАТЬ НЕЧЕГО — все {n} пунктов карточки просят отмашку на "
         f"КЛИЕНТСКИЙ контур, а он заморожен ({os.path.basename(client_contour.FREEZE_FLAG)}): "

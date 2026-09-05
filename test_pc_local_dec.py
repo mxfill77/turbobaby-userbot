@@ -129,6 +129,18 @@ class LocBase(unittest.TestCase):
         self._save_lw = o.LESSON_WAIT_STATE
         o.LESSON_WAIT_STATE = os.path.join(tempfile.mkdtemp(), "lesson_waits.json")
         self.addCleanup(lambda: setattr(o, "LESSON_WAIT_STATE", self._save_lw))
+        # ТОТ ЖЕ КЛАСС ТРЕТЬИМ МЕСТОМ (05.09.2026): реестр отметок старта — состояние, общее на
+        # ПРОЦЕСС, а номера у фикстур этого файла начинаются с единицы и повторяются из теста в
+        # тест. С печатью терминала (`_task_closed_mark`) это стало видно сразу: закрытие ряда №N
+        # в одном тесте оставляло печать, а следующий тест лепил СВОЙ ряд №N с искусственно старым
+        # `updated` — и сторож законно молчал о «уже закрытом». В бою так не бывает (новый ряд
+        # получает `updated` ПОЗЖЕ закрытия старого), поэтому лечится изоляцией фикстуры, а не
+        # ослаблением правила. Реестр — свежий на каждый тест, ровно как LESSON_WAIT_STATE выше.
+        self._save_ts = o.TASK_START_FILE
+        o.TASK_START_FILE = os.path.join(tempfile.mkdtemp(), "task_started.json")
+        self.addCleanup(lambda: setattr(o, "TASK_START_FILE", self._save_ts))
+        o._SEAL_SAID.clear()          # дедуп ЛОГА сторожа живёт в памяти процесса — на тест свой
+        self.addCleanup(o._SEAL_SAID.clear)
         # ТОТ ЖЕ КЛАСС, ЧТО СПАМ-ЛУП _notify_chain_card, вторым местом (замечен 16.08.2026 по
         # ResourceWarning «subprocess … is still running»): process_new на КАЖДЫЙ claim спавнит
         # реальный queue_snapshot_pc.py --tick, а тот идёт в БОЕВОЙ мост и пишет в мозг. Тесты

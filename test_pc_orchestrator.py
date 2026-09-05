@@ -4996,6 +4996,120 @@ class TestOrphanNoExecutor(Base):
         self.assertEqual(o._task_started_rec(4323)["pid"], os.getpid())
 
 
+class TestTerminalIrreversible(Base):
+    """ТЕРМИНАЛ НЕОБРАТИМ (05.09.2026): закрытую задачу сторож не переоткрывает.
+
+    ЖИВОЙ ПОВОД, id=12 (`pc_orchestrator.log:13912–13928`): 16:17:35 судья сказал PROVEN, 16:20:35
+    ряд закрыт `done` и владельцу ушла ✅-карточка, 16:26:45 реапер увидел ТОТ ЖЕ ряд всё ещё
+    `in_progress` (мост не сдвинул `updated`) и снял его как СИРОТУ — «дочерний процесс claude
+    (PID 6168) мёртв». Владелец получил две карточки об одной задаче с противоположными исходами.
+
+    Проба процесса при этом НЕ ВРАЛА: ребёнок действительно был мёртв — он отработал и вышел.
+    Поэтому голден ставится не на пробу, а на порядок: у ЗАКРЫТОЙ задачи смерть исполнителя уликой
+    не является вовсе. Ниже и «красное» (сторож молчит), и контроль на пустоту (без закрытия та же
+    сцена реапится), и граница переиспользования номера — иначе фикс чинил бы одну ложную карточку
+    ценой пропущенной настоящей сироты."""
+
+    def setUp(self):
+        super().setUp()
+        self._save_tid = o._RUNNING_TID
+        o._RUNNING_TID = None
+        self.addCleanup(lambda: setattr(o, "_RUNNING_TID", self._save_tid))
+        o._SEAL_SAID.clear()                 # дедуп ЛОГА живёт в памяти процесса — на тест свой
+        self.addCleanup(o._SEAL_SAID.clear)
+        self.cards = []                      # карточки владельцу: сторож не смеет выписать вторую
+        self._save_nt = o._notify_task
+        o._notify_task = lambda kind, tid, text: self.cards.append((kind, tid))
+        self.addCleanup(lambda: setattr(o, "_notify_task", self._save_nt))
+        self.AGE = o.PC_ORPHAN_STALE + 60    # между коротким порогом сироты и длинным молчания
+
+    def _scene(self, close=True):
+        """Живая сцена id=12: прогон был, ребёнок записан, ряд «в работе» дольше порога сироты.
+        `close=True` — цепочка закрыта успехом ТОЙ ЖЕ дорогой, что и в бою (`_complete`)."""
+        tid = self.fb.add(status="in_progress", updated=iso_ago(self.AGE))
+        o._task_started_mark(tid, now=iso_dt(self.AGE))
+        o._task_started_child(tid, 31337)                       # ребёнок был и записан
+        if close:
+            o._complete(tid, "done", "RESULT: сделано, адрес результата на месте")
+            self.fb.tasks[tid]["status"] = "in_progress"        # …а полоса зовёт ряд «в работе»
+            self.fb.tasks[tid]["updated"] = iso_ago(self.AGE)   # и `updated` не двинулся
+        self.cards.clear()
+        return tid
+
+    def _reap(self):
+        # тот же фейковый `tasklist` в ЖИВОМ формате, что у сироты: ребёнка 31337 в списке НЕТ
+        with mock.patch.object(o.subprocess, "run", TestOrphanNoExecutor._tasklist()):
+            o.process_stuck_singles()
+
+    def test_closed_chain_with_dead_child_is_not_reopened(self):
+        # ОТРИЦАТЕЛЬНЫЙ ТЕСТ: закрыто успехом → процесс мёртв → пометка «в работе». Сторож МОЛЧИТ.
+        tid = self._scene()
+        self._reap()
+        self.assertEqual(self.fb.tasks[tid]["status"], "in_progress",
+                         "закрытую задачу сторож переоткрыл — терминал перестал быть терминалом")
+        self.assertNotIn("СИРОТА", str(self.fb.tasks[tid]["result"]))
+        self.assertEqual(self.cards, [], "вторая карточка об одной задаче — тот самый вред id=12")
+
+    def test_same_scene_without_close_is_reaped(self):
+        # КОНТРОЛЬ НА ПУСТОТУ: без закрытия та же сцена — настоящая сирота, и она снимается.
+        # Без этого теста первый был бы зелёным и на сторбже, выключенном целиком.
+        tid = self._scene(close=False)
+        self._reap()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertIn("СИРОТА", self.fb.tasks[tid]["result"])
+        self.assertEqual([k for k, _t in self.cards], ["failed"])
+
+    def test_reused_number_after_close_is_judged_normally(self):
+        # ГРАНИЦА: номера очередь переиспользует (живой 119 — закрыт `done` 02.09 19:15, а 03.09
+        # 23:05 тот же номер получила НОВАЯ строка). Печать старше ряда → это другая жизнь номера,
+        # и сторож судит её обычным порядком. Печать «навсегда по номеру» глушила бы его здесь.
+        tid = self._scene(close=False)
+        o._task_closed_mark(tid, "done", now=iso_dt(self.AGE + 120))   # закрыли РАНЬШЕ, чем ряд двинулся
+        self.cards.clear()
+        self._reap()
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed",
+                         "новая жизнь номера обязана судиться, иначе фикс прячет настоящих сирот")
+
+    def test_seal_written_even_when_receipt_refused(self):
+        # Расписка моста — не судьба записи (класс «ложный 401»). Карточка владельцу уже ушла,
+        # значит второй, противоположной, он не получит ни в одном исходе расписки.
+        self.fb.complete_task = lambda tid, st, res: {"ok": False, "error": "unauthorized"}
+        tid = self.fb.add(status="in_progress", updated=iso_ago(self.AGE))
+        o._complete(tid, "done", "готово")
+        seal = o._task_started_rec(tid)["closed"]
+        self.assertEqual(seal["status"], "done")
+        self.assertFalse(seal["ok"], "расписка отказа обязана быть ВИДНА в печати, а не забыта")
+        self.assertTrue(o._closed_by_us(tid, iso_ago(self.AGE))[0])
+
+    def test_non_terminal_status_leaves_no_seal(self):
+        # `approved`/`needs_approval` терминалом не являются — печатать нечего, иначе задача,
+        # вернувшаяся в работу после «да», стала бы неприкасаемой для сторожа навсегда.
+        tid = self.fb.add(status="in_progress", updated=iso_ago(self.AGE))
+        self.assertEqual(o._task_closed_mark(tid, "needs_approval"), "")
+        self.assertIsNone(o._closed_seal_of(o._task_started_rec(tid)))
+        self.assertFalse(o._closed_by_us(tid, iso_ago(self.AGE))[0])
+
+    def test_reaper_seals_its_own_close(self):
+        # сторож, снявший сироту, тоже печатает терминал: судить снятое второй раз незачем
+        tid = self._scene(close=False)
+        self._reap()
+        self.assertEqual(o._task_started_rec(tid)["closed"]["status"], "failed")
+
+    def test_every_close_goes_through_the_wrapper(self):
+        # ЗАМОК: печать стоит на ОДНОЙ дороге, и обойти её мимо `_complete` нельзя. Без замка
+        # следующая ветка закрытия молча вернула бы прежнее поведение — на своём одном пути.
+        src = inspect.getsource(o)
+        self.assertNotIn("bc.complete_task(", src,
+                         "закрытие мимо `_complete` не печатает терминал — сторож его не увидит")
+
+    def test_seal_write_failure_does_not_break_the_close(self):
+        # диск отказал → печати нет, но задача ЗАКРЫТА: откат к прежнему поведению, не к потере
+        o.TASK_START_FILE = os.path.join(o.TASK_START_FILE, "нет", "такого", "каталога.json")
+        tid = self.fb.add(status="in_progress", updated=iso_ago(self.AGE))
+        self.assertTrue(o._complete(tid, "done", "готово").get("ok"))
+        self.assertEqual(self.fb.tasks[tid]["status"], "done")
+
+
 class TestFailReasonEvidence(Base):
     """Класс 30.07.2026 «статус врёт»: причина провала называется КОДОМ, а выполненная работа —
     словами. Живой повод (замер tmp/measure_status_truth.py за двое суток): из 6 разобранных
