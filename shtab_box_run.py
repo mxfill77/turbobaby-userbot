@@ -97,6 +97,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # владелец не вспоминал, какой из них называется иначе.
 STOP_FILE = "pc_orchestrator.shtab_box.off"
 
+# ═════════════════════════ ДОЛГАЯ ПАМЯТЬ ВЗЯТЫХ КЛЮЧЕЙ ═══════════════════════
+# ЗАВЕДЕНА 05.09.2026 ПО ЖИВОМУ УЩЕРБУ, а не про запас. Разбор премисы, числа
+# круга номеров и цена — у :func:`shtab_box.merge_known`; здесь только руки.
+#
+# ФОРМАТ — JSONL, ПО ЗАПИСИ В СТРОКУ, И ЭТО ВЫБРАНО ПРОТИВ ОБРАЗЦА СОСЕДА.
+# Ступень E держит свой дедуп по ключу словарём в одном JSON
+# (`recon_auto_state.json`), и её довод («откат дерева к HEAD стёр бы реестр»)
+# закрыт тем же игнором, что берём и мы. Но у словаря есть операция, которой у
+# памяти быть не должно: ПЕРЕЗАПИСЬ ЦЕЛИКОМ. Сорвавшаяся запись, гонка двух
+# процессов, чужой пустой словарь — и память становится КОРОЧЕ, молча; а мы
+# чиним ровно тот дефект, где память замолчала. Дозапись строки существующих
+# байт не трогает: файл умеет только расти. Дедуп повторов делает ЧТЕНИЕ.
+TAKEN_FILE = "pc_orchestrator.shtab_box_taken.jsonl"
+TAKEN_SCHEMA = "turbobaby.shtab_box_taken/v1"
+
 # Корпуса рядов очереди берутся У СТУПЕНИ E, а не набираются здесь заново: это
 # один и тот же вопрос «где живут маркеры суток», и два его экземпляра разъехались
 # бы молча. `failed` и `done` читаются ОБА — маркер взятого задания уходит из
@@ -150,6 +165,103 @@ def stopped(root=HERE):
     except Exception as exc:                            # noqa: BLE001
         return True, ("проверить стоп-файл %s не удалось (%s) — считаем ВЫКЛЮЧЕНО"
                       % (STOP_FILE, exc))
+
+
+# ───────────────────────────── долгая память ─────────────────────────────
+
+
+def taken_path(root=HERE):
+    """Путь файла долгой памяти. → str."""
+    return _path(root, TAKEN_FILE)
+
+
+def read_taken(root=HERE):
+    """Долгая память ящика → (записи, ok, причина).
+
+    ТРИ ИСХОДА, И ТРЕТИЙ ОБЯЗАТЕЛЕН — тот же, что у :func:`read_ledger`:
+
+    * файла нет вовсе → честный НОЛЬ (``ok=True``). Ящик, который ещё ничего не
+      брал, и ящик, у которого память отняли, — разные новости, но по длине
+      списка они одинаковы, поэтому различает их отдельный вопрос к диску;
+    * файл прочитан → записи и ``ok=True``;
+    * файл есть, а прочитать его не вышло (диск, кодировка, битая строка) →
+      ``ok=False``. И это ЖЁСТЧЕ, чем кажется: непрочитанная память означает «не
+      знаю, какие ключи уже брали», а брать на таком незнании — это и есть
+      дубль, ради запрета которого память заведена. Вызывающий обязан прочесть
+      ``ok=False`` как «день исчерпан», а не как «память пуста».
+
+    БИТАЯ СТРОКА НЕ ПРОПУСКАЕТСЯ МОЛЧА. Пропусти мы её, потерялся бы РОВНО ОДИН
+    ключ — то есть ровно одно задание уехало бы в очередь по второму разу, и
+    никто бы не узнал. Поэтому битая строка называется номером и валит чтение
+    целиком; лечится она человеком (строку в файле видно глазом).
+    """
+    path = taken_path(root)
+    try:
+        if not os.path.exists(path):
+            return [], True, "долгой памяти ещё нет — файл %s не заводился" % TAKEN_FILE
+    except Exception as exc:                            # noqa: BLE001
+        return [], False, "долгая память не прочитана (%s): %s" % (TAKEN_FILE, str(exc)[:160])
+    rows, bad = [], []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for n, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:                       # noqa: BLE001
+                    bad.append(n)
+                    continue
+                if not isinstance(rec, dict) or not str(rec.get("key") or ""):
+                    bad.append(n)
+                    continue
+                rows.append(rec)
+    except Exception as exc:                            # noqa: BLE001
+        return [], False, "долгая память не прочитана (%s): %s" % (TAKEN_FILE, str(exc)[:160])
+    if bad:
+        return [], False, ("долгая память %s разобрана НЕ ВСЯ: строки %s не читаются — какие "
+                           "ключи уже брали, НЕИЗВЕСТНО (поправить строку руками)"
+                           % (TAKEN_FILE, ", ".join(str(n) for n in bad[:10])))
+    return rows, True, ""
+
+
+def remember(root=HERE, key="", day="", lane="", tid=None, at="", src=""):
+    """Ключ взятого задания → в долгую память. → (ok, причина).
+
+    ИДЕМПОТЕНТНО ПО КЛЮЧУ: тот же ключ второй раз строки не добавляет. Дубль в
+    памяти безвреден (читатель схлопывает по ключу), но растил бы файл на каждом
+    витке дожима.
+
+    ПИШЕМ ТОЛЬКО ПОСЛЕ УСПЕШНОЙ ПОСТАНОВКИ РЯДА, и порядок именно такой: ряд без
+    памяти о нём — это дубль (беда, которую мы чиним), а память без ряда —
+    задание, которое НИКОГДА не возьмут, и заметить это было бы нечем.
+
+    НЕЧИТАЕМАЯ ПАМЯТЬ ЗАПИСЬ НЕ ОСТАНАВЛИВАЕТ. Дозапись существующих байт не
+    трогает, поэтому даже к битому файлу новая строка ложится честно; а брать на
+    непрочитанной памяти ящику всё равно нечего — это решает :func:`read_taken`
+    своим ``ok=False``.
+    """
+    key = str(key or "").strip()
+    if not key:
+        return False, "пустой ключ — в память не пишем"
+    rows, ok, _why = read_taken(root)
+    if ok and any(str(r.get("key") or "") == key for r in rows):
+        return True, "ключ %s уже в долгой памяти" % key
+    # ПРОИСХОЖДЕНИЕ ЗАПИСИ ЛЕЖИТ В НЕЙ САМОЙ (`src`), и это не украшение: память
+    # 05.09 заводилась ЗАСЕВОМ по логу демона поверх живых постановок, и читающий
+    # обязан отличать «полоса поставила ряд и запомнила» от «ключ восстановлен
+    # задним числом» — иначе засев выглядит работой ящика, которой не было.
+    rec = {"schema": TAKEN_SCHEMA, "key": key, "day": str(day or ""),
+           "lane": str(lane or ""), "id": tid, "at": str(at or now_iso()),
+           "src": str(src or "")}
+    try:
+        with open(taken_path(root), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as exc:                            # noqa: BLE001
+        return False, ("ключ %s в долгую память НЕ ЛЁГ (%s): %s — следующий виток может взять "
+                       "это задание ВТОРОЙ РАЗ" % (key, TAKEN_FILE, str(exc)[:160]))
+    return True, ""
 
 
 # ───────────────────────────── узел-ящик ─────────────────────────────
@@ -494,7 +606,7 @@ class Queue(recon_auto_run.Queue):
 
 def build(root=HERE, queue=None, clock=None, reader=None, node=None,
           budget=shtab_box.DAILY_BUDGET, ledger=None, lister=None, doc_reader=None,
-          prefix=None, read_max=shtab_box.READ_MAX):
+          prefix=None, read_max=shtab_box.READ_MAX, taken_reader=None):
     """Всё, что нужно для решения: ящик + очередь + маркеры. → dict.
 
     Ничего не ставит и никуда не пишет — этой же функцией живут ``--status`` и
@@ -549,11 +661,24 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
            # СИГНАЛЬНАЯ ОСТАНОВКА: три состояния, как у маркеров суток, — посчитана ·
            # не посчитана, потому что до неё не дошло · посчитана и говорит «не знаю».
            "signals": [], "signals_asked": False, "signals_why": "", "released": [],
-           "judged_ok": False, "judged_why": "", "stop": ""}
+           "judged_ok": False, "judged_why": "", "stop": "",
+           # ДОЛГАЯ ПАМЯТЬ: своё поле, свой признак чтения, своя причина. Значения
+           # по умолчанию описывают путь, на котором до неё не дошли (выключенный
+           # ящик) — «не читали» и «прочитана и пуста» здесь не одно и то же.
+           "known": [], "known_ok": False, "known_n": 0,
+           "known_why": "долгую память не читали — оборот кончился раньше"}
 
     out["off"], out["off_why"] = stopped(root)
     if out["off"]:
         return out
+
+    # ДОЛГАЯ ПАМЯТЬ ЧИТАЕТСЯ ВТОРОЙ, СРАЗУ ЗА СТОП-ФАЙЛОМ, и порядок тут — цена:
+    # она стои́т ДИСКА, а не моста, и это единственный корпус, переживающий круг
+    # номеров очереди (разбор и числа — `shtab_box.merge_known`). Читаем её ДО
+    # папки, чтобы её отказ был виден даже тогда, когда мост молчит.
+    known, known_ok, known_why = (taken_reader or read_taken)(root)
+    out["known"], out["known_ok"], out["known_why"] = known, bool(known_ok), str(known_why or "")
+    out["known_n"] = len(known)
 
     files, folder_ok, folder_why = read_folder(out["prefix"], lister=lister)
     out["folder_ok"], out["folder_why"], out["files"] = folder_ok, folder_why, len(files)
@@ -606,19 +731,27 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
     else:
         closed_rows, closed_ok, closed_why = q.rows(CLOSED_STATUSES)
         out["marks_asked"] = True
-    out["marks_ok"] = bool(ok and closed_ok)
+    known = out["known"]
+    # НЕПРОЧИТАННАЯ ПАМЯТЬ РАВНА НЕПРОЧИТАННЫМ ЗАКРЫТЫМ РЯДАМ: и то и другое —
+    # «какие ключи уже брали, НЕИЗВЕСТНО», и оба ведут к одному поступку.
+    known_ok, known_why = out["known_ok"], out["known_why"]
+    out["marks_ok"] = bool(ok and closed_ok and known_ok)
     out["marks_why"] = closed_why
+    if not known_ok:
+        out["marks_why"] = "%s · %s" % (closed_why, known_why) if closed_why else known_why
     if ok:
         all_rows = list(live_rows) + list(closed_rows)
         out["rows"] = len(all_rows)
         # ДВА РАЗНЫХ СЧЁТА ИЗ ОДНОГО КОРПУСА: дедуп — по ОБЕИМ полосам (ключ есть имя
         # задачи, и «уже взято» не перестаёт быть правдой от смены машины), потолок —
         # у КАЖДОЙ свой (мощности две, и друг у друга они ничего не отнимают).
-        out["task_marks"] = shtab_box.markers(all_rows)
-        out["lane_marks"] = shtab_box.marks_by_lane(all_rows)
+        # КОРПУС ТЕПЕРЬ ШИРЕ РЯДОВ: к маркерам живой очереди подмешивается долгая
+        # память — добавлением, а не заменой (ослабить дедуп слияние не может).
+        out["task_marks"], out["lane_marks"] = shtab_box.merge_known(
+            shtab_box.markers(all_rows), shtab_box.marks_by_lane(all_rows), known)
         if out["marks_ok"]:
-            out["taken_today"] = shtab_box.taken_today(all_rows, today)
-            out["taken_by_lane"] = {ln: sum(1 for d, _k in marks if d == today)
+            out["taken_today"] = shtab_box.marks_today(out["task_marks"], today)
+            out["taken_by_lane"] = {ln: shtab_box.marks_today(marks, today)
                                     for ln, marks in out["lane_marks"].items()}
 
     # ── ПРИЁМКА И ДОЖИМ ───────────────────────────────────────────────────────
@@ -735,23 +868,35 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
 def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
          budget=shtab_box.DAILY_BUDGET, write_journal=False, clock=None, queue=None,
          journal_fn=None, reader=None, node=None, ledger=None, lister=None,
-         doc_reader=None, prefix=None, read_max=shtab_box.READ_MAX):
+         doc_reader=None, prefix=None, read_max=shtab_box.READ_MAX,
+         taken_reader=None, remember_fn=None):
     """Один оборот ящика. → dict отчёта.
 
     ``place=False`` — сухой ход: папка перечислена, документы разобраны, тела
     прочитаны, ворота посчитаны, текст ряда собран, ОЧЕРЕДЬ НЕ ТРОНУТА. Боевой ход
-    отличается ровно одним действием — постановкой ряда. Реестра на диске у ящика
-    НЕТ И НЕ БУДЕТ: память процесса и файл рядом с ним переживают ровно до первого
-    self-update (их на этой полосе десятки в день), а дедуп обязан пережить всё.
-    Источник истины один — ЖИВАЯ ОЧЕРЕДЬ.
+    отличается ДВУМЯ действиями — постановкой ряда и записью ключа в долгую
+    память (:func:`remember`), в этом порядке.
+
+    ═══ ЗДЕСЬ СТОЯЛО «РЕЕСТРА НА ДИСКЕ НЕТ И НЕ БУДЕТ» (снято 05.09.2026) ═════
+
+    Дословно: «память процесса и файл рядом с ним переживают ровно до первого
+    self-update… источник истины один — ЖИВАЯ ОЧЕРЕДЬ». Обе половины замерены и
+    обе неверны: самообновление — это ``git fetch`` + ``git pull --ff-only``, и
+    файл рядом с кодом его переживает (соседний
+    ``pc_orchestrator.shtab_box_tick.json`` несёт хвост моментов взятия сквозь
+    десяток обновлений подряд), а живая очередь НЕ вечна — её номера идут по
+    кругу, и 05.09 корпус в две с половиной сотни рядов стал семью с номерами
+    1..7. Цена ошибки — три повторно взятых закрытых задания за одни сутки.
+    Числа и разбор: :func:`shtab_box.merge_known`.
     """
     data = build(root, queue=queue, clock=clock, reader=reader, node=node, budget=budget,
                  ledger=ledger, lister=lister, doc_reader=doc_reader, prefix=prefix,
-                 read_max=read_max)
+                 read_max=read_max, taken_reader=taken_reader)
     today = data["today"]
     report = {"acted": False, "why": "", "today": today, "stamp": data["stamp"],
               "node": data["node"], "docs": len(data["docs"]), "bad": data["bad"],
-              "placed": [], "failed": [], "held": [], "texts": {},
+              "placed": [], "failed": [], "held": [], "texts": {}, "memory": [],
+              "known_ok": data["known_ok"], "known_n": data["known_n"],
               "off": data["off"], "node_ok": data["node_ok"],
               "folder_ok": data["folder_ok"], "old_door": data["old_door"],
               "queue_ok": data["queue_ok"], "marks_ok": data["marks_ok"],
@@ -837,6 +982,15 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
                                  # разные новости для того, кто смотрит на полосу.
                                  "retry": bool(blk.get("retry")), "of": blk.get("of") or "",
                                  "attempt": int(blk.get("attempt") or 1)})
+        # ПАМЯТЬ ПИШЕТСЯ СРАЗУ ЗА РЯДОМ И ДО ЖУРНАЛА: журнал — новость для людей и
+        # теряет строки, а это замок. Отказ записи не отменяет уже поставленного
+        # ряда (отменить его нечем), но обязан быть СЛЫШЕН: он и означает «следующий
+        # виток может взять то же задание второй раз».
+        mem_ok, mem_why = (remember_fn or remember)(
+            root, key=blk["key"], day=today, lane=lane, tid=tid, at=data["stamp"],
+            src="ряд очереди")
+        if not mem_ok:
+            report["memory"].append((blk["key"], mem_why))
         if write_journal:
             (journal_fn or _journal)(shtab_box.index_line(blk, tid, today), repo=root)
 
@@ -908,7 +1062,12 @@ def _why(report, data):
     # владелец перестал бы отличать настоящий отказ моста от нашей же экономии.
     # Ровно тот класс, который ступень E назвала третьим состоянием: «не
     # спрашивали, потому что незачем».
-    if data["marks_asked"] and not data["marks_ok"]:
+    # ДОЛГАЯ ПАМЯТЬ СПРОШЕНА ВСЕГДА, поэтому её отказ судится ОТДЕЛЬНЫМ условием, а
+    # не через `marks_asked`: тот признак говорит про дорогое чтение закрытых рядов,
+    # которого могло и не быть, а память читается с диска каждый оборот. Повесь мы
+    # её на чужой признак — непрочитанная память молчала бы ровно в тех витках, где
+    # ящик и так ничего не ставит, то есть новость терялась бы вся.
+    if not data["known_ok"] or (data["marks_asked"] and not data["marks_ok"]):
         return _marks_unread(data)
     return "документов %d, взято 0, отложено %d" % (len(data["docs"]), len(report["held"]))
 
@@ -920,6 +1079,9 @@ def _marks_unread(data):
     себе, вторая рядом с фразой остановки), а два её экземпляра разъехались бы
     молча — тот же класс, которым живёт весь этот куст.
     """
+    if not data.get("known_ok", True):
+        return ("долгая память ящика не прочитана (%s) — какие ключи уже брали, НЕИЗВЕСТНО; "
+                "день считаем исчерпанным и не берём ничего" % data.get("known_why", "?"))
     return ("закрытые ряды очереди не прочитаны (%s) — сколько заданий Штаба взято сегодня, "
             "НЕИЗВЕСТНО; день считаем исчерпанным и не берём ничего" % data["marks_why"])
 
@@ -943,6 +1105,10 @@ def _line(report):
                                                  "named": bool(row.get("lane_named"))})))
     if report.get("failed"):
         parts.append("не встало %d" % len(report["failed"]))
+    # ОТКАЗ ДОЛГОЙ ПАМЯТИ ЕДЕТ В ТУ ЖЕ СТРОКУ, что и постановка: молчащий отказ
+    # памяти неотличим от здоровой полосы ровно до второго взятия того же ключа.
+    for key, why in (report.get("memory") or ()):
+        parts.append("ПАМЯТЬ НЕ ЗАПИСАНА (%s): %s" % (key, why))
     return "; ".join(parts)
 
 
@@ -1008,6 +1174,12 @@ def _render(report=None, data=None):
                         else ("КОРПУС НЕ ПРОЧИТАН — день исчерпан" if data["marks_asked"]
                               else "не спрашивали, потому что незачем"),
                         data["marks_why"] or "прочитаны"))
+        # ДОЛГАЯ ПАМЯТЬ — ОТДЕЛЬНАЯ СТРОКА, а не примечание к маркерам: у неё свой
+        # прибор (диск), свой отказ и своё число, и «ключей в памяти 0» на живом
+        # ящике — это новость, ради которой правка 05.09 и делалась.
+        lines.append("долгая память: %s — ключей %d%s"
+                     % (TAKEN_FILE, data["known_n"],
+                        "" if data["known_ok"] else " · НЕ ПРОЧИТАНА: %s" % data["known_why"]))
         lines.append(shtab_box.digest_line(data["taken_today"] or 0, data["today"],
                                            ok=data["marks_ok"], why=data["marks_why"],
                                            by_lane=data.get("taken_by_lane")))

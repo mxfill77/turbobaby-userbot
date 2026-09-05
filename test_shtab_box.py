@@ -1452,13 +1452,187 @@ class TestHands(unittest.TestCase):
         self.assertIn("#707", line)
         self.assertIn(sb.doc_name("kk1"), line)
 
-    def test_no_state_file_is_written_anywhere(self):
-        """Реестра на диске у ящика нет: его съел бы первый self-update, а дедуп обязан
-        пережить всё. Источник истины один — живая очередь."""
+    def test_the_only_file_the_box_leaves_is_its_long_memory(self):
+        """ЗДЕСЬ СТОЯЛО «реестра на диске у ящика нет» (снято 05.09.2026).
+
+        Прежний замок держал премису «файл съест первый self-update, а живая
+        очередь вечна». Обе половины замерены и обе неверны (разбор —
+        `shtab_box.merge_known`), и цена ошибки — три повторно взятых закрытых
+        задания за одни сутки. Теперь на диск ложится РОВНО ОДИН файл — долгая
+        память взятых ключей, и никакого второго: реестр, растущий сам по себе,
+        остаётся запрещённым."""
         root = tempfile.mkdtemp(prefix="shtabbox_state_")
-        before = sorted(os.listdir(root))
         _tick(_box(("kk1", GOOD_BODY)), queue=FakeQueue(), place=True, root=root)
-        self.assertEqual(sorted(os.listdir(root)), before, "ящик оставил файл в корне")
+        self.assertEqual(sorted(os.listdir(root)), [run.TAKEN_FILE],
+                         "на диске обязан появиться ровно один файл — долгая память")
+
+    def test_a_dry_run_writes_no_memory_at_all(self):
+        """Сухой ход очередь не трогает — значит и памяти о взятии писать нечего.
+
+        Запиши он ключ, `--dry` ОДИН РАЗ навсегда закрыл бы задание, которое
+        никто не ставил, и заметить это было бы нечем: документ просто перестал
+        бы браться."""
+        root = tempfile.mkdtemp(prefix="shtabbox_dry_")
+        _tick(_box(("kk1", GOOD_BODY)), queue=FakeQueue(), place=False, root=root)
+        self.assertEqual(sorted(os.listdir(root)), [], "сухой ход оставил файл на диске")
+        rows, ok, why = run.read_taken(root)
+        self.assertEqual((rows, ok), ([], True), why)
+
+
+# ═══════════════════ долгая память взятых ключей ═══════════════════════
+
+
+class TestLongMemory(unittest.TestCase):
+    """Ящик помнит взятые ключи ДОЛЬШЕ, чем живёт ряд очереди (05.09.2026).
+
+    ЖИВОЙ УЩЕРБ, ОТ КОТОРОГО ЭТОТ КЛАСС: 05.09 номера очереди пошли по кругу
+    (#241 в 11:19 → «номер переиспользован очередью», ряды 1..7 в 11:44), вместе
+    с рядами исчезли маркеры, и ящик взял ЗАНОВО три уже закрытых задания. Все
+    проверки ниже — отрицательные: они падают на коде, у которого память живёт
+    только в очереди.
+    """
+
+    def _root(self):
+        return tempfile.mkdtemp(prefix="shtabbox_mem_")
+
+    # ── три обязательные отрицательные ──────────────────────────────────
+
+    def test_a_closed_key_is_not_taken_again_after_the_daemon_restarts(self):
+        """ОТРИЦАТЕЛЬНАЯ №1: закрытый ключ не берётся ВТОРОЙ РАЗ и после рестарта.
+
+        Рестарт демона моделируется честно: второй оборот идёт ДРУГИМ вызовом,
+        с ПУСТОЙ очередью (ряд закрылся и уехал) и без единого общего объекта в
+        памяти — общий у двух оборотов только корень на диске.
+        """
+        root = self._root()
+        first = _tick(_box(("kk1", GOOD_BODY)), queue=FakeQueue(), place=True, root=root)
+        self.assertEqual([r["key"] for r in first["placed"]], ["kk1"])
+
+        second = _tick(_box(("kk1", GOOD_BODY)), queue=FakeQueue(), place=True, root=root)
+        self.assertEqual(second["placed"], [], "закрытый ключ взят ВТОРОЙ раз")
+        self.assertIn("уже брали", dict(second["held"])["kk1"])
+
+    def test_a_fresh_key_is_taken_as_usual_while_memory_is_full(self):
+        """ОТРИЦАТЕЛЬНАЯ №2: память НЕ глушит ящик — новый ключ берётся как обычно.
+
+        Замок против пере-затягивания: правка, останавливающая всё подряд, прошла
+        бы проверку №1 и была бы негодной.
+        """
+        root = self._root()
+        for key in ("kk1", "kk3", "kk4"):
+            self.assertEqual(run.remember(root, key=key, day=TODAY, lane="pc")[0], True)
+        rep = _tick(_box(("kk2", GOOD_BODY)), queue=FakeQueue(), place=True, root=root)
+        self.assertEqual([r["key"] for r in rep["placed"]], ["kk2"], rep["why"])
+
+    def test_the_queue_numbering_wrapping_around_does_not_touch_key_dedup(self):
+        """ОТРИЦАТЕЛЬНАЯ №3: круг номеров очереди на дедуп по ключу не влияет.
+
+        Дословный слепок живого случая: ряд ключа стоял под номером 241, номера
+        пошли по кругу, и теперь под номерами 1..7 лежат ЧУЖИЕ ряды. Дедуп судит
+        ИМЯ ЗАДАЧИ, а не номер, — значит ключ обязан остаться взятым.
+        """
+        root = self._root()
+        big = FakeQueue()
+        big.next_id = 240
+        first = _tick(_box(("kk1", GOOD_BODY)), queue=big, place=True, root=root)
+        self.assertEqual(first["placed"][0]["id"], 241)
+
+        wrapped = FakeQueue(rows=[{"id": 1, "task_text": "чужой ряд после круга"},
+                                  {"id": 2, "task_text": "и ещё один"}],
+                            closed=[{"id": 3, "task_text": "закрытый чужой"}])
+        wrapped.next_id = 3
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=wrapped, place=True, root=root)
+        self.assertEqual(rep["placed"], [], "после круга номеров ключ взят заново")
+        self.assertIn("уже брали", dict(rep["held"])["kk1"])
+        self.assertEqual(wrapped.tasks, [], "в очередь после круга уехал ряд")
+
+    # ── устройство памяти ───────────────────────────────────────────────
+
+    def test_memory_is_written_only_after_the_row_actually_stood(self):
+        """Порядок обязателен: ряд → память. Не встал ряд — ключ НЕ запоминается,
+        иначе задание не возьмут больше никогда, и заметить это будет нечем."""
+        root = self._root()
+
+        class Refusing(FakeQueue):
+            def place_task(self, text, lane=None):
+                return False, None, "мост отказал"
+
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=Refusing(), place=True, root=root)
+        self.assertEqual(rep["placed"], [])
+        rows, ok, why = run.read_taken(root)
+        self.assertEqual((rows, ok), ([], True), why)
+
+    def test_the_same_key_never_grows_the_file_twice(self):
+        """Дозапись идемпотентна по ключу: дожим ходит витками, а файл — не лента."""
+        root = self._root()
+        self.assertEqual(run.remember(root, key="kk1", day=TODAY, lane="pc")[0], True)
+        self.assertEqual(run.remember(root, key="kk1", day=TODAY, lane="pc")[0], True)
+        rows, ok, _why = run.read_taken(root)
+        self.assertTrue(ok)
+        self.assertEqual([r["key"] for r in rows], ["kk1"])
+
+    def test_an_unreadable_memory_stops_the_box_instead_of_reading_as_empty(self):
+        """ТРЕТИЙ ИСХОД: битую память нельзя прочитать как пустую.
+
+        Пустая память у ящика, который ещё ничего не брал, и нечитаемая память —
+        разные новости; по длине списка они одинаковы. Прочитай мы вторую как
+        первую, ящик заново взял бы ВСЁ, что лежит в папке."""
+        root = self._root()
+        with io.open(run.taken_path(root), "w", encoding="utf-8") as fh:
+            fh.write('{"key": "kk1"}\n{это не json}\n')
+        rows, ok, why = run.read_taken(root)
+        self.assertEqual((rows, ok), ([], False))
+        self.assertIn("НЕИЗВЕСТНО", why)
+
+        rep = _tick(_box(("kk2", GOOD_BODY)), queue=FakeQueue(), place=True, root=root)
+        self.assertEqual(rep["placed"], [], "на нечитаемой памяти ящик взял задание")
+        self.assertIn("долгая память", rep["why"])
+
+    def test_a_missing_file_is_an_honest_zero_and_not_a_failure(self):
+        """Ящик, который ещё ничего не брал, обязан работать: файла нет — это ноль."""
+        root = self._root()
+        rows, ok, why = run.read_taken(root)
+        self.assertEqual((rows, ok), ([], True))
+        self.assertIn("не заводился", why)
+
+    def test_memory_only_adds_keys_and_never_removes_one(self):
+        """Слияние ослабить дедуп не может ни одной веткой: множество только растёт."""
+        marks, by_lane = sb.merge_known(
+            [(TODAY, "from-queue")], {"pc": [(TODAY, "from-queue")], "vps": []},
+            [{"key": "from-memory", "day": TODAY, "lane": "pc"}])
+        self.assertEqual({k for _d, k in marks}, {"from-queue", "from-memory"})
+        self.assertEqual({k for _d, k in by_lane["pc"]}, {"from-queue", "from-memory"})
+
+    def test_a_key_known_to_both_sources_is_counted_once(self):
+        """Дважды посчитанный ключ съел бы суточный потолок дважды."""
+        marks, by_lane = sb.merge_known(
+            [(TODAY, "kk1")], {"pc": [(TODAY, "kk1")], "vps": []},
+            [{"key": "kk1", "day": TODAY, "lane": "vps"}])
+        self.assertEqual(marks, [(TODAY, "kk1")])
+        self.assertEqual(sb.marks_today(marks, TODAY), 1)
+        self.assertEqual(by_lane["vps"], [])
+
+    def test_a_memory_record_without_a_day_blocks_the_key_but_no_budget(self):
+        """ТРЕТИЙ ИСХОД у поля дня: «когда взяли» неизвестно — ключ всё равно взят,
+        а вот чужой суточный бюджет он не тратит."""
+        marks, _by_lane = sb.merge_known([], {"pc": [], "vps": []},
+                                         [{"key": "kk1", "lane": "pc"}])
+        self.assertEqual([k for _d, k in marks], ["kk1"])
+        self.assertEqual(sb.marks_today(marks, TODAY), 0)
+
+    def test_a_memory_record_without_a_lane_reads_as_pc(self):
+        """Пустая полоса читается как ПК — ТЕМ ЖЕ правилом, что у ряда очереди
+        (`row_lane`), а не отдельным мнением слияния."""
+        _marks, by_lane = sb.merge_known([], {"pc": [], "vps": []},
+                                         [{"key": "kk1", "day": TODAY}])
+        self.assertEqual([k for _d, k in by_lane[sb.LANE_DEFAULT]], ["kk1"])
+        self.assertEqual(by_lane["vps"], [])
+
+    def test_the_memory_file_is_ignored_by_git(self):
+        """Отслеживаемый файл откатывался бы к HEAD вместе с деревом — то есть
+        память стиралась бы молча ровно тем же способом, что и в очереди."""
+        with io.open(os.path.join(HERE, ".gitignore"), encoding="utf-8") as fh:
+            self.assertIn(run.TAKEN_FILE, fh.read())
 
 
 # ═══════════════════════════ врезка ════════════════════════════════════
