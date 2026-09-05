@@ -749,6 +749,13 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
            # (суточный потолок у каждой свой). Одного корпуса тут мало не потому, что
            # так удобнее, а потому что вопросы разные — см. :func:`shtab_box.marks_by_lane`.
            "lane_marks": {}, "taken_by_lane": {},
+           # ВНЕШНИЙ ОТКАЗ — ОТДЕЛЬНОЕ ЧИСЛО, А НЕ ПОПРАВКА К ВЗЯТОМУ. Ключи
+           # заданий, сгоревших на чужом API; их считает ОДИН различитель
+           # (:func:`shtab_box_signals.external_refusal`), и им же пользуется
+           # сигнал А. Показывать их врозь обязательно: «взято 8» и «съедено 5»
+           # — разные новости, и одно число на обе научило бы владельца не верить
+           # ни одному.
+           "external": [], "billed_today": None, "billed_by_lane": {},
            "rows": 0, "taken_today": None,
            # СИГНАЛЬНАЯ ОСТАНОВКА: три состояния, как у маркеров суток, — посчитана ·
            # не посчитана, потому что до неё не дошло · посчитана и говорит «не знаю».
@@ -875,10 +882,25 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
         # память — добавлением, а не заменой (ослабить дедуп слияние не может).
         out["task_marks"], out["lane_marks"] = shtab_box.merge_known(
             shtab_box.markers(all_rows), shtab_box.marks_by_lane(all_rows), known)
+        # ЕДИНСТВЕННОЕ МЕСТО, ГДЕ СУТОЧНЫЙ СЧЁТ СПРАШИВАЕТ ПРО ВНЕШНИЙ ОТКАЗ, и
+        # спрашивает он ТОТ ЖЕ различитель, которым живёт сигнал А. Второго
+        # экземпляра правила у полосы нет ни одной ветки — ровно от этого
+        # предостерегал предсмертный взгляд задания.
+        out["external"] = sorted(sig.external_keys(sig.box_rows(closed_rows)))
         if out["marks_ok"]:
+            # ВЗЯТО и СЪЕДЕНО — ДВА ЧИСЛА, И ОБА НУЖНЫ. `taken_*` отвечает «сколько
+            # заданий полоса вообще взяла» (по нему живёт дедуп и по нему сводка
+            # читает маркеры), `billed_*` — «сколько слотов дня на это ушло».
+            # Слить их в одно значило бы либо соврать вверх (внешний отказ съел
+            # день, которого не тратил), либо потерять факт взятия.
             out["taken_today"] = shtab_box.marks_today(out["task_marks"], today)
             out["taken_by_lane"] = {ln: shtab_box.marks_today(marks, today)
                                     for ln, marks in out["lane_marks"].items()}
+            out["billed_today"] = shtab_box.marks_today(
+                shtab_box.billable(out["task_marks"], out["external"]), today)
+            out["billed_by_lane"] = {
+                ln: shtab_box.marks_today(shtab_box.billable(marks, out["external"]), today)
+                for ln, marks in out["lane_marks"].items()}
 
     # ── ПРИЁМКА И ДОЖИМ ───────────────────────────────────────────────────────
     # ЗАХОДИТ ТОЛЬКО НА ПРОЧИТАННОМ КОРПУСЕ ЗАКРЫТЫХ РЯДОВ, и это не осторожность
@@ -982,9 +1004,13 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
         # СУММА (6 при потолке 3) соврала бы вверх, а счёт по ОБЩИМ маркерам — вниз:
         # он записал бы серверные постановки в съеденный бюджет ПК, то есть вернул
         # бы общий потолок через чёрный ход.
-        left = min(shtab_box.budget_left(out["lane_marks"].get(ln, ()), today, budget,
-                                         out["marks_ok"])
-                   for ln in shtab_box.LANES)
+        # ПОТОЛОК СЧИТАЕТСЯ ПО СЪЕДЕННЫМ СЛОТАМ, А НЕ ПО ВЗЯТЫМ РЯДАМ (06.09.2026):
+        # ограничитель ящика переехал с календаря на ИСХОД. Вычитаются ровно те
+        # ключи, что назвал единственный различитель внешнего отказа, — и только
+        # они; всё остальное в счёте суток осталось как было.
+        left = min(shtab_box.budget_left(
+            shtab_box.billable(out["lane_marks"].get(ln, ()), out["external"]),
+            today, budget, out["marks_ok"]) for ln in shtab_box.LANES)
         live_signals = sig.evaluate(
             # ЗАКРЫТЫЕ РЯДЫ — ОБЕИХ ПОЛОС: `box_rows` отбирает по МАРКЕРУ ящика, то
             # есть видит только собственные задания. Провалившееся задание ящика не
@@ -1051,6 +1077,11 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
               "queue_ok": data["queue_ok"], "marks_ok": data["marks_ok"],
               "owner_busy": data["owner_busy"], "owner_rows": data["owner_rows"],
               "taken_today": data["taken_today"], "line": "",
+              # ВНЕШНИЕ ОТКАЗЫ ВИДНЫ В ОТЧЁТЕ ОТДЕЛЬНЫМ ЧИСЛОМ, а не спрятаны в
+              # разнице двух чисел: льгота, которую нельзя увидеть, неотличима от
+              # сломанного счёта.
+              "external": list(data.get("external") or ()),
+              "billed_today": data.get("billed_today"),
               "stop": data["stop"], "signals": data["signals"],
               "signals_asked": data["signals_asked"],
               "stop_marks": sig.marks(data["signals"]),
@@ -1464,7 +1495,9 @@ def _render(report=None, data=None):
                         "" if data["known_ok"] else " · НЕ ПРОЧИТАНА: %s" % data["known_why"]))
         lines.append(shtab_box.digest_line(data["taken_today"] or 0, data["today"],
                                            ok=data["marks_ok"], why=data["marks_why"],
-                                           by_lane=data.get("taken_by_lane")))
+                                           by_lane=data.get("taken_by_lane"),
+                                           external=len(data.get("external") or ()),
+                                           billed=data.get("billed_today")))
         # ПРИЁМКА ПОКАЗЫВАЕТСЯ ВСЕГДА, включая «не заходила» и включая ПРИНЯТО.
         # Молчащая приёмка неотличима от неработающей, а именно её и завели ради
         # того, чтобы половинчатое закрытие перестало выглядеть закрытием.

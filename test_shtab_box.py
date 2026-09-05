@@ -1294,6 +1294,52 @@ class TestCeiling(unittest.TestCase):
         self.assertEqual(re.findall(r"\d+", line[0]), [str(sb.DAILY_BUDGET)] * 2, line[0])
 
 
+class TestBillable(unittest.TestCase):
+    """ОГРАНИЧИТЕЛЬ ПО ИСХОДУ: слот суток тратит не всякий взятый ряд (06.09.2026).
+
+    Различитель внешнего отказа живёт НЕ ЗДЕСЬ (`shtab_box_signals.external_refusal`)
+    и здесь не проверяется. Проверяется арифметика маркеров: она обязана только
+    СУЖАТЬ счёт и не смеет иметь собственного мнения о чужом API.
+    """
+
+    def test_billable_without_externals_changes_nothing(self):
+        marks = [("2026-09-06", "a"), ("2026-09-06", "b")]
+        self.assertEqual(marks, sb.billable(marks, ()))
+        self.assertEqual(marks, sb.billable(marks, None))
+
+    def test_billable_drops_exactly_the_named_keys(self):
+        marks = [("2026-09-06", "a"), ("2026-09-05", "b"), ("2026-09-06", "c")]
+        self.assertEqual([("2026-09-05", "b"), ("2026-09-06", "c")],
+                         sb.billable(marks, ["a"]))
+
+    def test_billable_never_invents_a_mark(self):
+        """Ошибка различителя может дать лишний слот, но не порвать дедуп."""
+        marks = [("2026-09-06", "a")]
+        self.assertEqual([], sb.billable(marks, ["a"]))
+        self.assertEqual(marks, sb.billable(marks, ["другой ключ"]))
+
+    def test_the_daily_count_and_the_ceiling_read_the_same_narrowed_list(self):
+        marks = [("2026-09-06", "a"), ("2026-09-06", "b"), ("2026-09-06", "c")]
+        billed = sb.billable(marks, ["b"])
+        self.assertEqual(2, sb.marks_today(billed, "2026-09-06"))
+        self.assertEqual(sb.DAILY_BUDGET - 2, sb.budget_left(billed, "2026-09-06"))
+
+    def test_digest_line_says_BOTH_numbers_when_there_were_externals(self):
+        line = sb.digest_line(8, "2026-09-06", external=3, billed=5)
+        self.assertIn("взято 8", line)
+        self.assertIn("внешних отказов 3", line)
+        self.assertIn("съедено 5", line)
+
+    def test_digest_line_for_a_foreign_caller_is_untouched(self):
+        """Сводка контура видит слепок без статусов и итогов — её число прежнее.
+
+        Это НЕ два разошедшихся счёта, а честная граница прибора: отличить
+        внешний отказ по одному полю ``goal`` нельзя ничем, и молча приписывать
+        сводке льготу было бы враньём в её сторону.
+        """
+        self.assertNotIn("внешних отказов", sb.digest_line(8, "2026-09-06"))
+
+
 class TestLaneDay(unittest.TestCase):
     """СУТКИ ЯЩИКА — МЕСТНЫЕ (правка 04.09.2026, :func:`shtab_box.lane_day`)."""
 

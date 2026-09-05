@@ -634,7 +634,8 @@ class TestNegative(unittest.TestCase):
         d = [s for s in rep["signals"] if s["sig"] == sig.SIG_D][0]
         self.assertFalse(d["enforced"])
         self.assertIn("осталось", d["why"])
-        self.assertEqual(4, len(rep["signals"]), "человек обязан видеть все четыре")
+        self.assertEqual(len(sig.SIGNALS), len(rep["signals"]),
+                         "человек обязан видеть ВСЕ сигналы, а не только сработавшие")
 
     def test_signal_d_shows_the_ceiling_reached(self):
         rows = [_closed(30 + i, "done", "сдано") for i in range(sb.DAILY_BUDGET)]
@@ -686,6 +687,265 @@ class TestNegative(unittest.TestCase):
             self.assertTrue(one["on"] and not one["determinate"], letter)
 
 
+# ═══════════════════════ внешний отказ и сигнал Д ══════════════════════
+# ФИКСТУРЫ ЗДЕСЬ — ДОСЛОВНЫЕ СТРОКИ ЖИВОГО ПРОВАЛА, а не идеализированные. Взяты
+# из `pc_orchestrator.log` за 03.09.2026, из двух слотов ящика, которые премиса
+# задания назвала сгоревшими на чужом API. Правило полосы прямое: голдены детекта —
+# дословные фразы из живого провала, потому что придуманная «похожая» строка
+# зеленеет молча, а живая ловит различитель на настоящем формате.
+
+EXT_529 = ("провал [причина=exec_error · ошибка выполнения]: claude exit=1: API Error: 529 "
+           "Overloaded. This is a server-side issue, usually temporary — try again in a "
+           "moment. If it persists, check https://status.claude.com.. Следов работы в окне "
+           "03.09 13:31–13:36 UTC нет (коммитов 0, записей журнала 0).")
+# ТОТ ЖЕ ОТКАЗ ЧУЖОГО API, НО С РАБОТОЙ В ОКНЕ (живой #100). Внешним он НЕ
+# считается, и это не придирка: заход успел сделать коммит, слот полоса потратила.
+EXT_MID_WITH_WORK = ("НЕ ЗАКРЫТА, но В ОКНЕ ЗАДАЧИ ЕСТЬ РАБОТА [причина=exec_error · ошибка "
+                     "выполнения]: claude exit=1: API Error: Server error mid-response. The "
+                     "response above may be incomplete.. СЛЕДЫ в окне 03.09 13:15–13:23 UTC: "
+                     "коммитов 1 (14cb105 «Замок единственной копии: снимок книги правил»). "
+                     "Формальное закрытие не состоялось — НЕ переделывай вслепую.")
+NO_TRACE_TAIL = "Следов работы в окне 04.09 01:10–01:14 UTC нет (коммитов 0, записей журнала 0)."
+
+
+def _ext(tid, day=TODAY, key=None):
+    """Ряд, сгоревший на чужом API без следов работы — живая форма #101."""
+    return _closed(tid, "failed", EXT_529, day=day, key=key)
+
+
+class TestExternal(unittest.TestCase):
+    """ВНЕШНИЙ ОТКАЗ — ОДИН РАЗЛИЧИТЕЛЬ, ДВА ПОТРЕБИТЕЛЯ, СВОЯ ОСТАНОВКА.
+
+    Предсмертный взгляд задания назвал главный способ провалиться: различитель
+    напишут ДВАЖДЫ — свой у суточного счёта и свой у сигнала А, — и две копии
+    разойдутся молча. Поэтому здесь проверяется не только поведение, но и то,
+    что правило ОДНО (:func:`test_the_discriminator_lives_in_exactly_one_place`).
+    """
+
+    # ── положительная сторона: признак ловит живой отказ ──────────────────
+    def test_the_live_529_row_is_recognised_as_external(self):
+        ok, why = sig.external_refusal(_ext(11))
+        self.assertTrue(ok, why)
+        self.assertIn("exec_error", why)
+
+    def test_network_outage_needs_no_words_of_the_child(self):
+        """`network_outage` — это уже ВЕРДИКТ демона о внешнем; спорить с ним нечем."""
+        row = _closed(12, "failed", "📡 провал [причина=network_outage · связи нет]: "
+                                    "исполнитель молчал. " + NO_TRACE_TAIL)
+        ok, why = sig.external_refusal(row)
+        self.assertTrue(ok, why)
+
+    # ── ОТРИЦАТЕЛЬНЫЕ: «наш провал выглядит как внешний» ─────────────────
+    def test_our_own_report_quoting_the_api_error_is_NOT_external(self):
+        """ГЛАВНЫЙ отрицательный: наш черновик цитирует чужой отказ ДОСЛОВНО.
+
+        Задача про ЭТОТ САМЫЙ класс обязана процитировать в докладе и «API Error:
+        529», и «Следов работы в окне … нет» — иначе она не сможет о нём
+        рассказать. Черновик едет в итог ПЕРЕД частью демона (`fail_result`:
+        ``lead`` = маркер + черновик), поэтому поиск по строке целиком выдал бы
+        нашему провалу бесплатный слот ЗА РАССКАЗ О БЕСПЛАТНЫХ СЛОТАХ.
+
+        Здесь совпадают ВСЕ прочие условия — код ``exec_error``, следов нет, —
+        и не спасает ничто, кроме якоря: слова о чужом API лежат в НАШЕЙ части.
+        """
+        ours = ("[черновик] СДЕЛАНО: разобран класс внешнего отказа. Живой пример — "
+                "«claude exit=1: API Error: 529 Overloaded», у него в итоге стои́т "
+                "«Следов работы в окне 03.09 13:31–13:36 UTC нет (коммитов 0, записей "
+                "журнала 0)». НЕ СДЕЛАНО: тест. ")
+        row = _closed(21, "failed", ours + "провал [причина=exec_error · ошибка выполнения]: "
+                                           "claude exit=1: SyntaxError в нашем скрипте. "
+                      + NO_TRACE_TAIL)
+        ok, why = sig.external_refusal(row)
+        self.assertFalse(ok, "различитель клюнул на цитату в НАШЕМ черновике: %s" % why)
+        self.assertIn("о чужом API исполнитель не сказал ни слова", why)
+
+    def test_the_same_words_in_the_daemon_part_DO_count(self):
+        """Парный контроль к якорю: правило не «никогда», а «не в нашей части»."""
+        ok, _why = sig.external_refusal(_closed(22, "failed", EXT_529))
+        self.assertTrue(ok)
+
+    def test_a_row_with_work_in_the_window_is_ours_even_on_a_foreign_error(self):
+        """Живой #100: та же API Error, но коммит 14cb105 в окне — слот потрачен."""
+        ok, why = sig.external_refusal(_closed(23, "failed", EXT_MID_WITH_WORK))
+        self.assertFalse(ok, why)
+        self.assertIn("следы работы", why)
+
+    def test_run_timeout_without_traces_is_never_external(self):
+        """Наша задача не влезла в потолок — это наш исход, чей бы хвост ни печатался."""
+        row = _closed(24, "failed", "⏱ провал [причина=run_timeout · таймаут прогона]: "
+                                    "claude exit=1: API Error: 529 Overloaded. " + NO_TRACE_TAIL)
+        ok, why = sig.external_refusal(row)
+        self.assertFalse(ok, why)
+        self.assertIn("НАШ контур", why)
+
+    def test_unknown_window_gives_no_relief(self):
+        """Третий исход: «следы НЕ проверялись» ≠ «следов не было»."""
+        row = _closed(25, "failed", "провал [причина=exec_error · ошибка выполнения]: claude "
+                                    "exit=1: API Error: 529 Overloaded. Окно работы неизвестно "
+                                    "(отметки claim не сохранилось) — следы работы НЕ проверялись.")
+        ok, why = sig.external_refusal(row)
+        self.assertFalse(ok, why)
+        self.assertIn("НЕ ЗНАЕМ", why)
+
+    def test_owner_rejection_is_never_external(self):
+        row = _closed(26, "failed", "%s: не надо. API Error: 529 Overloaded. %s"
+                      % (sig.REJECT_MARK, NO_TRACE_TAIL))
+        ok, why = sig.external_refusal(row)
+        self.assertFalse(ok, why)
+        self.assertIn(sig.REJECT_MARK, why)
+
+    def test_a_delivered_task_is_never_external(self):
+        ok, why = sig.external_refusal(_closed(27, "done", EXT_529))
+        self.assertFalse(ok, why)
+
+    # ── потребитель 1: суточный счёт ─────────────────────────────────────
+    def test_an_external_refusal_does_not_eat_a_daily_slot(self):
+        got = _tick(closed=[_closed(31, "done", "сдано"), _ext(32)],
+                    ledger=_ledger((31, True, True)), budget=50)
+        self.assertEqual(2, got["taken_today"], "взяты обе — дедуп не ослаблен")
+        self.assertEqual(1, got["billed_today"], "съеден один слот, а не два")
+        self.assertEqual(["k032"], got["external"])
+
+    def test_the_dedup_still_remembers_the_externally_burned_key(self):
+        """Ключ ВЗЯТ (второй раз не берём), но дня он не стоил — два разных вопроса."""
+        got = _tick(closed=[_ext(33)], budget=50)
+        self.assertEqual(1, got["taken_today"])
+        self.assertEqual(0, got["billed_today"])
+
+    def test_billable_only_narrows_and_never_grows(self):
+        marks = [(TODAY, "a"), (TODAY, "b")]
+        self.assertEqual(marks, sb.billable(marks, ()))
+        self.assertEqual([(TODAY, "b")], sb.billable(marks, ["a"]))
+        self.assertEqual([], sb.billable(marks, ["a", "b", "нет такого"]))
+
+    # ── потребитель 2: сигнал А ──────────────────────────────────────────
+    def test_signal_a_does_not_count_an_external_refusal(self):
+        """Один наш провал плюс чужой отказ — «двух подряд» ещё нет."""
+        rep = _tick(closed=[_closed(41, "failed", "[причина=model_refusal · отказ модели]"),
+                            _ext(42)], budget=50)
+        a = [s for s in rep["signals"] if s["sig"] == sig.SIG_A][0]
+        self.assertFalse(a["on"], a["why"])
+        self.assertIn("вычеркнуто внешних отказов: 1", a["why"])
+
+    def test_two_of_ours_still_stop_the_box_through_a_foreign_one(self):
+        """Соседство считается по НАШИМ рядам: льгота сигнал не ослабила."""
+        rep = _tick(closed=[_closed(43, "failed", "[причина=model_refusal · отказ модели]"),
+                            _ext(44), _closed(45, "failed", "[причина=unbacked_red · заявка]")],
+                    budget=50)
+        a = [s for s in rep["signals"] if s["sig"] == sig.SIG_A][0]
+        self.assertTrue(a["on"], a["why"])
+        self.assertIn("#43", a["why"])
+        self.assertIn("#45", a["why"])
+
+    # ── своя остановка: сигнал Д ─────────────────────────────────────────
+    def test_three_external_in_a_row_stop_the_box(self):
+        rep = _tick(closed=[_ext(51), _ext(52), _ext(53)], budget=50, place=True)
+        e = [s for s in rep["signals"] if s["sig"] == sig.SIG_E][0]
+        self.assertTrue(e["on"], e["why"])
+        self.assertIn("ВНЕШНЕЕ", e["why"])
+        self.assertEqual([], rep["placed"], "ящик обязан встать")
+        self.assertIn("сигнал Д", rep["stop"])
+
+    def test_two_external_are_not_enough(self):
+        rep = _tick(closed=[_ext(54), _ext(55)], budget=50, place=True)
+        e = [s for s in rep["signals"] if s["sig"] == sig.SIG_E][0]
+        self.assertFalse(e["on"], e["why"])
+        self.assertEqual(1, len(rep["placed"]), "полоса свободна — берём")
+
+    def test_signal_e_is_named_differently_from_a_and_clears_by_itself(self):
+        """Задание требует обоих различий: другое имя и свой порядок снятия."""
+        self.assertNotEqual(sig.TITLE[sig.SIG_A], sig.TITLE[sig.SIG_E])
+        rep = _tick(closed=[_ext(56), _ext(57), _ext(58)], budget=50)
+        e = [s for s in rep["signals"] if s["sig"] == sig.SIG_E][0]
+        self.assertEqual(sig.BY_EXT, e["release"])
+        self.assertNotEqual(sig.BY_OWNER, e["release"])
+        self.assertIn("держать словом не нужно", rep["stop"])
+        self.assertFalse(sig.holdable(e), "остановка за погоду в замок не идёт")
+
+    def test_signal_e_clears_with_the_day(self):
+        """Корпус Д — сутки маркера: вчерашняя буря сегодня не держит."""
+        rep = _tick(closed=[_ext(61, day="2026-09-01"), _ext(62, day="2026-09-01"),
+                            _ext(63, day="2026-09-01")], budget=50, place=True)
+        e = [s for s in rep["signals"] if s["sig"] == sig.SIG_E][0]
+        self.assertFalse(e["on"], e["why"])
+        self.assertEqual(1, len(rep["placed"]))
+
+    def test_signal_e_stays_quiet_when_the_corpus_is_unreadable(self):
+        """Третьего «не знаю» о том же не заводим: этот факт уже держат А и Б."""
+        rep = _tick(queue=FakeQueue(rows=[], closed=[], closed_ok=False), budget=50)
+        e = [s for s in rep["signals"] if s["sig"] == sig.SIG_E][0]
+        self.assertFalse(e["on"], e["why"])
+        self.assertFalse(e["determinate"])
+        self.assertIn("уже держат А и Б", e["why"])
+
+    def test_the_journal_line_for_a_lone_e_is_a_NOTE_not_an_ASK(self):
+        """Д — новость о чужой стороне, а не развилка с выбором человека.
+
+        ЭТОТ ТЕСТ НАШЁЛ ПРАВКУ СИГНАЛА Б, а не подтвердил задуманное: три чужих
+        отказа — это один код ``exec_error``, то есть для Б «одна причина третий
+        раз», и он вставал рядом с Д, требуя слова владельца ЗА ПОГОДУ. Обещание
+        «снимается само» тонуло в просьбе положить метку.
+        """
+        got = _tick(closed=[_ext(64), _ext(65), _ext(66)], budget=50)
+        self.assertTrue(got["signal_journal"].startswith("NOTE "), got["signal_journal"])
+        b = [s for s in got["signals"] if s["sig"] == sig.SIG_B][0]
+        self.assertFalse(b["on"], b["why"])
+
+    def test_signal_b_still_counts_OUR_repeated_cause(self):
+        """Парный контроль: вычерк сузил предмет Б, а не выключил его."""
+        got = _tick(closed=[_closed(67, "failed", "[причина=run_timeout · таймаут прогона]"),
+                            _closed(68, "failed", "[причина=run_timeout · таймаут прогона]"),
+                            _closed(69, "failed", "[причина=run_timeout · таймаут прогона]")],
+                    budget=50)
+        b = [s for s in got["signals"] if s["sig"] == sig.SIG_B][0]
+        self.assertTrue(b["on"], b["why"])
+        self.assertIn("третий раз", b["why"])
+
+    # ── ОДНО ПРАВИЛО В ОДНОМ МЕСТЕ ───────────────────────────────────────
+    def test_the_discriminator_lives_in_exactly_one_place(self):
+        """Предсмертный взгляд задания: две копии правила разойдутся молча.
+
+        Проверяем ИСХОДНИКИ, а не обещание: признак внешнего отказа собран ровно
+        в одной функции, а второй потребитель (суточный счёт) её ЗОВЁТ, своих
+        литералов не набирая.
+        """
+        run_src = _src("shtab_box_run.py")
+        box_src = _src("shtab_box.py")
+        self.assertEqual(1, _src("shtab_box_signals.py").count("def external_refusal"))
+        for literal in (sig.EXT_NO_TRACE, sig.EXT_UNKNOWN_WINDOW, "api error"):
+            for name, src in (("shtab_box_run.py", run_src), ("shtab_box.py", box_src)):
+                self.assertNotIn(literal, src,
+                                 "литерал внешнего отказа «%s» продублирован в %s"
+                                 % (literal, name))
+        self.assertIn("sig.external_keys", run_src)
+
+
+class TestExternalMirrors(unittest.TestCase):
+    """Половинки признака заимствованы у демона — расхождение обязано ронять ТЕСТ."""
+
+    def test_every_external_code_is_a_live_code_of_the_daemon(self):
+        import pc_orchestrator
+
+        for code in sig.EXT_CODES:
+            self.assertIn(code, pc_orchestrator.FAIL_REASONS, code)
+
+    def test_the_no_trace_phrase_is_the_daemons_own(self):
+        """Фразу пишет `fail_result`; сменится она — различитель ослепнет молча."""
+        src = _src("pc_orchestrator.py")
+        self.assertIn(sig.EXT_NO_TRACE, src)
+        self.assertIn(sig.EXT_UNKNOWN_WINDOW, src)
+        self.assertIn("[причина=%s · %s]", src)
+        self.assertTrue(sig.FAIL_HEAD.startswith("[причина="))
+
+    def test_our_own_codes_are_deliberately_out(self):
+        """Пять кодов НАШЕГО контура внешними не бывают — это часть признака."""
+        import pc_orchestrator
+
+        ours = set(pc_orchestrator.FAIL_REASONS) - set(sig.EXT_CODES)
+        self.assertEqual({"approval_timeout", "heartbeat_timeout", "run_timeout",
+                          "model_refusal", "unbacked_red"}, ours)
+
+
 # ═══════════════════════════ видимость ═════════════════════════════════
 
 
@@ -714,7 +974,7 @@ class TestVisible(unittest.TestCase):
     def test_all_four_are_listed_even_when_quiet(self):
         got = _tick()
         words = sig.all_words(got["signals"])
-        self.assertEqual(4, len(words))
+        self.assertEqual(len(sig.SIGNALS), len(words))
         for letter in sig.SIGNALS:
             self.assertTrue(any(("сигнал %s" % letter) in w for w in words), letter)
 
