@@ -12,7 +12,10 @@
                                           (он же — простой полосы и приход Штаба)
     pc_orchestrator.task_started.json     отметка claim — «с какого времени в работе»
                                           и час прихода последнего задания Штаба
-    tmp/expect_pc/state.json              слой ожиданий О1–О4
+    tmp/expect_pc/state.json              слой ожиданий О1–О6, и он же — СЛОВА О КАЖДОМ
+                                          УЗЛЕ (слот `health`, пишется каждым тиком)
+    pc_orchestrator.client_watch.json     снимок надзора контур-вотчдога: сдался ли он
+                                          на ком-нибудь из троих детей
     tmp/done_judge_pc/judged.json         вердикты судьи закрытия (ступень C)
     docs/review_inbox                     лоток внешних ответов
     git log                               следы заходов по осям за сутки
@@ -55,6 +58,7 @@ import sys
 
 import contour_digest as cd
 import contour_digest_run as cdr
+import expectations_pc as ex     # СЛОВА ПРИБОРОВ И ПЕРЕЧЕНЬ ДЕТЕЙ — оттуда, где ими судят
 import shtab_box_run as sbr         # ДОРОГА К ПАПКЕ МОЗГА: та же, которой ящик берёт задания
 import shtab_box_signals            # РАЗЛИЧИТЕЛЬ ВИДА РЯДА: тот же, что у остановки ящика
 import vitrina_pc as vp
@@ -350,6 +354,111 @@ def failed_rows(snapshot, since):
             for r in cdr.closed_since(snapshot, since) if r.get("outcome") == "failed"]
 
 
+# ───────────────────── УЗЛЫ КОНТУРА И ИХ ПРИГОВОРЫ ─────────────────────
+# СПИСОК СОБИРАЕТСЯ ИЗ ЖИВОГО КОНТУРА, а не набирается здесь руками, и правило отбора одно:
+# УЗЛОМ становится то, у чего на полосе УЖЕ есть свой продукт на диске и прибор, который этот
+# продукт УЖЕ судит. Всё, чему пришлось бы завести пробу, в список не идёт — прямой запрет
+# задания («новых приборов не изобретать»), и отказ этот назван в артефакте числом, а не молча.
+#
+# Отсюда шесть узлов, и ни один из них здесь не выдуман:
+#   pc_orchestrator  — имя берётся у `expectations_pc.HEALTH_DAEMON`, приговор снимает О2
+#   pc_agent · userbot · moderation_bot — перечень берётся у `expectations_pc.KIDS` (это
+#                      единственное определение слова «дети» на полосе: копия списка
+#                      контур-вотчдога, закреплённая тестом), приговор снимает О3/`kids_state`
+#   контур-вотчдог   — судится СВОИМ продуктом, снимком надзора `client_watch.json`
+#   наблюдатель ожиданий — судится СВОИМ продуктом, файлом состояния `tmp/expect_pc/state.json`
+WATCH_FILE = "pc_orchestrator.client_watch.json"
+# Предел свежести снимка надзора. Контур-вотчдог тикает раз в 300 с (`pc_orchestrator
+# .CLIENT_WATCH_SEC`) ВНУТРИ витка демона; берём три промаха подряд — тем же счётом, каким сводка
+# меряет свои источники (`contour_digest.SOURCES`, «три промаха подряд»).
+WATCH_LIMIT_SEC = 900.0
+WATCHDOG_NODE = "контур-вотчдог"
+WATCHER_NODE = "наблюдатель ожиданий (TurboBabyExpectPC)"
+# ЧЕГО ПРИБОР НЕ ВИДИТ НА ЭТОМ УЗЛЕ. Оговорки детей НЕ ПЕРЕПИСАНЫ, а взяты у самого прибора
+# (`expectations_pc.KID_SIGNS[...]["caveat"]`): две копии одной оговорки разошлись бы молча на
+# первой же правке признака. Своих здесь ровно три — на узлы, у которых оговорки в слое нет.
+HEALTH_BLIND = {
+    ex.HEALTH_DAEMON: "виток доказывает оборот, а не пользу; объявленный заход оправдывает тишину",
+    # Дословно у прибора: он же и объяснил, почему этот снимок не годится в факт о детях.
+    WATCHDOG_NODE: ex.KID_REJECTED["pc_orchestrator.client_watch.json"],
+    WATCHER_NODE: "судит себя своим же файлом; выключенный ПК не наблюдает никто — это предмет "
+                  "СЕРВЕРНОГО О4, а не этой строки",
+}
+
+
+def read_watch(root=HERE, named=None):
+    """Снимок надзора контур-вотчдога → (данные, время замера, причина). Тем же чтением, что
+    у сводки: третий исход держится дверью :func:`contour_digest_run.read_json`."""
+    return cdr.read_json(root, named or WATCH_FILE)
+
+
+def watchdog_said(watch):
+    """Снимок надзора → СЛОВО прибора о самом стороже. → (слово, чем снято).
+
+    Сторож говорит о себе ровно тем, что в снимке: ребёнок, на котором он СДАЛСЯ (`halted`),
+    и есть его собственный отказ — дальше он этого ребёнка не поднимает ни разу. Возраст снимка
+    здесь НЕ судится: он едет отдельной осью (`stale`) и решает уже :func:`vitrina_pc.health_verdict`.
+    """
+    if not isinstance(watch, dict):
+        return None, "снимок надзора не прочитан"
+    kids = watch.get("children")
+    if not isinstance(kids, dict) or not kids:
+        return None, "в снимке надзора нет ни одного ребёнка"
+    halted = sorted(str(n) for n, v in kids.items()
+                    if isinstance(v, dict) and v.get("halted"))
+    if halted:
+        return ex.MOD_IDLE, "сдался на %s (подъёмов больше не будет)" % ", ".join(halted)
+    return ex.MOD_OK, "надзор за %d детьми, сдавшихся нет" % len(kids)
+
+
+def health_nodes(expect, expect_at, watch, watch_at, now):
+    """Узлы контура с приговорами. → list | None (ни один источник не прочитан).
+
+    ДВЕ ОСИ У КАЖДОГО УЗЛА, и путать их нельзя: СЛОВО прибора и ВОЗРАСТ ИСТОЧНИКА этого слова.
+    Свежее слово из замершего источника — это не свежее слово, и решает такую пару чистый слой
+    (:func:`vitrina_pc.health_verdict`); здесь только читается и складывается.
+
+    Возраст четырёх первых узлов — возраст ФАЙЛА НАБЛЮДАТЕЛЯ, а не возраст их собственных
+    продуктов, и это сказано намеренно: продукт ребёнка щупает слой ожиданий, а мы читаем то, что
+    он записал. Наблюдатель замер → все четыре строки становятся НЕИЗВЕСТНО разом, и это верно:
+    свежесть чужих продуктов нам в тот момент никто не мерил.
+    """
+    stale_ex = cd.stale(expect_at, now, cd.limit_of("expect"))
+    age_ex = cd.age_words(expect_at, now)
+    stale_wd = cd.stale(watch_at, now, WATCH_LIMIT_SEC)
+    age_wd = cd.age_words(watch_at, now)
+    said = {}
+    slot = (expect or {}).get(ex.HEALTH_SLOT) if isinstance(expect, dict) else None
+    for row in ((slot or {}).get("rows") or []) if isinstance(slot, dict) else []:
+        if isinstance(row, dict) and row.get("name"):
+            said[str(row["name"])] = row
+
+    def _from_layer(name, blind):
+        row = said.get(name) or {}
+        src = row.get("src") or ("вердикта о «%s» в состоянии наблюдателя нет" % name)
+        return {"name": name, "said": row.get("said"), "stale": stale_ex,
+                "src": quote(src, 72), "age": age_ex, "blind": quote(blind, 120)}
+
+    out = [_from_layer(ex.HEALTH_DAEMON, HEALTH_BLIND[ex.HEALTH_DAEMON])]
+    out += [_from_layer(kid, (ex.KID_SIGNS.get(kid) or {}).get("caveat") or "")
+            for kid in ex.KIDS]
+    word, why = watchdog_said(watch)
+    out.append({"name": WATCHDOG_NODE, "said": word, "stale": stale_wd,
+                "src": quote("%s: %s" % (WATCH_FILE, why), 72), "age": age_wd,
+                "blind": quote(HEALTH_BLIND[WATCHDOG_NODE], 120)})
+    # НАБЛЮДАТЕЛЬ СУДИТСЯ СВОИМ ПРОДУКТОМ, и слово у него одно: файл он пишет каждым тиком, значит
+    # «написал» и есть «работает». Молчание файла приговором «мёртв» НЕ становится — на этой полосе
+    # его нечем отличить от сна машины (стенные часы сон считают, а монотонных здесь нет), и третий
+    # исход тут не вежливость, а единственный честный ответ.
+    out.append({"name": WATCHER_NODE, "said": ex.MOD_OK if expect is not None else None,
+                "stale": stale_ex, "age": age_ex,
+                "src": quote("%s (предел %d мин)"
+                             % (cd.source("expect")["addr"],
+                                int(round(float(cd.limit_of("expect")) / 60.0))), 72),
+                "blind": quote(HEALTH_BLIND[WATCHER_NODE], 120)})
+    return out
+
+
 def open_expectations(expect):
     """Открытые ожидания О1–О4. → list | None (слой не прочитан)."""
     if expect is None:
@@ -445,7 +554,8 @@ def collect(root=HERE, now=None, runner=None, inbox=None, day=None, shtab=None):
     the_day = day or day_utc(now)
     since = day_start(the_day)
     snapshot, _q_at, q_why = cdr.read_json(root, cd.source("queue")["addr"])
-    expect, _e_at, _e_why = cdr.read_json(root, cd.source("expect")["addr"])
+    expect, expect_at, _e_why = cdr.read_json(root, cd.source("expect")["addr"])
+    watch, watch_at, _w_why = read_watch(root)
     heads, records, _i_why = cdr.read_inbox(root, inbox)
     claims = read_claims(root)
     counted = None
@@ -462,6 +572,7 @@ def collect(root=HERE, now=None, runner=None, inbox=None, day=None, shtab=None):
         "now": now,
         "day": the_day,
         "shtab": shtab if shtab is not None else read_shtab(),
+        "health": health_nodes(expect, expect_at, watch, watch_at, now),
         "running": running_rows(snapshot, claims, now),
         "idle": idle_facts(snapshot, now),
         "shtab_last": shtab_last_facts(snapshot, claims, now),

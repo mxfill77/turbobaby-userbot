@@ -1147,6 +1147,22 @@ def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
     except Exception as e:                                            # noqa: BLE001
         out["code_why"] = "ветка О6 сорвалась (%s: %.60s)" % (type(e).__name__, e)
 
+    # 7. СЛОВА О КАЖДОМ УЗЛЕ — НА ДИСК КАЖДЫМ ТИКОМ, а не при публикации пульса. Разбор — в
+    #    `expectations_pc`, §«СПИСОК ЗДОРОВЬЯ». Коротко: `state["kids"]` пишется раз в период (6 ч),
+    #    и читателю с диска доставался последний ОПУБЛИКОВАННЫЙ вердикт вместо сегодняшнего —
+    #    замершее зелёное слово, неотличимое от живого. Здесь новых замеров нет ни одного: слова
+    #    берутся из уже посчитанных `tstate` и `out["kids"]`. Ветка заведена последней и гасится в
+    #    СЕБЯ: она не вправе стоить владельцу ни заметки О1–О6, ни счётчиков тишины ниже.
+    try:
+        st[ex.HEALTH_SLOT] = {"at": now, "rows": (
+            [{"name": ex.HEALTH_DAEMON, "said": tstate, "src": ex.HEALTH_DAEMON_SRC,
+              "why": (tinfo.get("why") or "")[:120]}]
+            + [{"name": k.get("name"), "said": k.get("state"), "src": k.get("src"),
+                "why": (k.get("why") or "")[:120]}
+               for k in (out.get("kids") or []) if k.get("name")])}
+    except Exception as e:                                            # noqa: BLE001
+        out["health_why"] = "слот здоровья не собран (%s: %.60s)" % (type(e).__name__, e)
+
     if not dry:
         st["open"] = dict(list(open_eps.items())[-STATE_KEEP:])
         save_state(st)

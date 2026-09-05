@@ -30,6 +30,7 @@ import unittest
 
 import contour_digest as cd
 import contour_digest_run as cdr
+import expectations_pc as ex
 import shtab_box_signals as sbs
 import vitrina_pc as vp
 import vitrina_pc_run as run
@@ -103,7 +104,17 @@ def _live_facts(day=DAY):
                          "holds": True, "key": ""}],
             "axes": {vp.AXIS_MAIN: 4, vp.AXIS_BIZ: 1, vp.AXIS_SERVICE: 22},
             "axes_why": "", "closed_day": 18,
+            "health": _health_nodes(),
             "idle": _idle(None, busy=1, ids=["5"]), "shtab_last": _shtab_last(7200.0)}
+
+
+def _health_nodes(stale=False):
+    """Узлы здоровья спокойного контура: все приборы свежи и говорят зелёное."""
+    return [{"name": ex.HEALTH_DAEMON, "said": ex.TURN_OK, "stale": stale,
+             "src": ex.HEALTH_DAEMON_SRC, "age": "3 мин", "blind": "виток ≠ польза"}] + [
+        {"name": kid, "said": ex.MOD_OK, "stale": stale,
+         "src": (ex.KID_SIGNS[kid] or {}).get("src"), "age": "3 мин",
+         "blind": (ex.KID_SIGNS[kid] or {}).get("caveat")} for kid in ex.KIDS]
 
 
 class _Door(object):
@@ -442,13 +453,26 @@ class TestShtabNode(unittest.TestCase):
 
 
 class TestParts(unittest.TestCase):
-    """Шесть частей, и часть без строк — падение, а не тихий пропуск."""
+    """Семь частей, и часть без строк — падение, а не тихий пропуск."""
 
-    def test_all_six_parts_are_rendered(self):
+    def test_all_seven_parts_are_rendered(self):
         text = vp.render(_live_facts(), "2026-09-02 12:40 UTC")
         for _key, title in vp.PARTS:
             self.assertIn(title, text)
-        self.assertEqual(len(vp.PARTS), 6)
+        self.assertEqual(len(vp.PARTS), 7)
+
+    def test_health_stands_first_so_truncation_never_eats_it(self):
+        """Раздел здоровья ПЕРВЫЙ: витрина режется с хвоста, а обрезанный список приговоров
+        молча показал бы часть узлов как весь контур."""
+        self.assertEqual(vp.PART_KEYS[0], "health")
+        facts = _live_facts()
+        # Остановка ящика — единственная строка витрины без своего потолка (она приходит готовой
+        # фразой); ею и переполняем сообщение, чтобы обрезка сработала по-настоящему.
+        facts["box_stop"] = "ящик остановлен: " + "с" * 3800
+        text = vp.render(facts, "?")
+        self.assertIn("витрина обрезана до", text)
+        self.assertIn("ЧТО РАБОТАЕТ И ЧТО НЕТ", text)
+        self.assertIn(ex.HEALTH_DAEMON, text)
 
     def test_empty_part_is_an_error_not_a_silent_skip(self):
         facts = _live_facts()
@@ -921,6 +945,184 @@ class TestIdleAndShtabArrival(unittest.TestCase):
         self.assertIn(vp.UNKNOWN, vp.idle_words(None))
         self.assertTrue(vp.idle_words(idle).startswith("простой полосы:"))
         self.assertTrue(vp.shtab_last_words(last, DAY).startswith("приход Штаба:"))
+
+
+class TestHealthList(unittest.TestCase):
+    """ЧТО РАБОТАЕТ И ЧТО НЕТ: приговор одним словом, чем снят, чего не покрывает.
+
+    Сюда же — ОТРИЦАТЕЛЬНЫЙ ТЕСТ 4 задания (`test_fresh_trace_of_a_dead_instrument…`): состояние
+    «признак выглядит правильным, а результата нет» обязано давать отказ, а не зелёное.
+    """
+
+    EX = "tmp/expect_pc/state.json"
+    WD = run.WATCH_FILE
+
+    def _tree(self, expect=None, watch=None, ex_age=60.0, wd_age=60.0):
+        """Дерево с двумя источниками нужного возраста. → (корень, now). Боевого не касается."""
+        root = tempfile.mkdtemp(prefix="vitrina_health_")
+        os.makedirs(os.path.join(root, "tmp", "expect_pc"))
+        now = NOW
+        for rel, data, age in ((self.EX, expect, ex_age), (self.WD, watch, wd_age)):
+            if data is None:
+                continue
+            path = os.path.join(root, rel.replace("/", os.sep))
+            with io.open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False)
+            os.utime(path, (now - age, now - age))
+        return root, now
+
+    def _nodes(self, root, now):
+        expect, e_at, _w = cdr.read_json(root, cd.source("expect")["addr"])
+        watch, w_at, _w2 = run.read_watch(root)
+        return run.health_nodes(expect, e_at, watch, w_at, now)
+
+    @staticmethod
+    def _state(said=None, at=NOW):
+        rows = [{"name": ex.HEALTH_DAEMON, "said": ex.TURN_OK, "src": ex.HEALTH_DAEMON_SRC}]
+        rows += [{"name": k, "said": (said or {}).get(k, ex.MOD_OK),
+                  "src": ex.KID_SIGNS[k]["src"]} for k in ex.KIDS]
+        return {"open": {}, ex.HEALTH_SLOT: {"at": at, "rows": rows}}
+
+    @staticmethod
+    def _watch(halted=()):
+        return {"ts": NOW, "children": {k: {"deaths": 0, "halted": k in halted, "last_raise": 0.0}
+                                        for k in ex.KIDS}}
+
+    # ── список узлов ───────────────────────────────────────────────────────
+    def test_six_nodes_and_every_name_comes_from_the_live_contour(self):
+        """Шесть узлов, и ни одно имя не набрано в витрине руками."""
+        root, now = self._tree(self._state(), self._watch())
+        nodes = self._nodes(root, now)
+        names = [n["name"] for n in nodes]
+        self.assertEqual(len(nodes), 6)
+        self.assertEqual(names[:4], [ex.HEALTH_DAEMON] + list(ex.KIDS))
+        self.assertIn(run.WATCHDOG_NODE, names)
+        self.assertIn(run.WATCHER_NODE, names)
+
+    def test_every_row_says_three_things(self):
+        """Приговор одним словом · чем снят и возраст · чего прибор не видит — у КАЖДОЙ строки."""
+        root, now = self._tree(self._state(), self._watch())
+        for row in vp.part_health(self._nodes(root, now)):
+            self.assertTrue(any(w in row for w in (vp.HEALTH_OK, vp.HEALTH_BAD, vp.UNKNOWN)), row)
+            self.assertIn(" · чем: ", row)
+            self.assertIn(" · не покрывает: ", row)
+            self.assertLess(len(row), 320, "строка на узел, не абзац — читают с телефона")
+
+    def test_calm_contour_is_green_and_the_dead_child_is_red(self):
+        root, now = self._tree(self._state(), self._watch())
+        rows = vp.part_health(self._nodes(root, now))
+        self.assertIn("%s — %s" % (ex.HEALTH_DAEMON, vp.HEALTH_OK), rows[0])
+        self.assertIn("userbot — %s" % vp.HEALTH_OK, rows[2])
+        root, now = self._tree(self._state({"userbot": ex.MOD_IDLE}), self._watch())
+        rows = vp.part_health(self._nodes(root, now))
+        self.assertIn("userbot — %s" % vp.HEALTH_BAD, rows[2])
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ: свежий след покойника ──────────────────────────
+    def test_fresh_trace_of_a_dead_instrument_is_refused_not_greenlit(self):
+        """ПРИЗНАК ВЫГЛЯДИТ ПРАВИЛЬНЫМ, А РЕЗУЛЬТАТА НЕТ.
+
+        В файле наблюдателя лежит совершенно правильное зелёное слово о каждом узле — но сам файл
+        не переписывался три часа при пределе в тридцать минут. Слово это доказывает ровно одно:
+        что три часа назад кто-то его написал. Строка обязана выдать отказ и НАЗВАТЬ след.
+        """
+        root, now = self._tree(self._state(), self._watch(), ex_age=3 * 3600.0)
+        nodes = self._nodes(root, now)
+        rows = vp.part_health(nodes)
+        for node, row in zip(nodes[:4], rows[:4]):
+            said, _note = vp.health_verdict(node["said"], stale=False)
+            self.assertEqual(said, vp.HEALTH_OK, "слово в файле было зелёным — иначе тест пуст")
+            self.assertEqual(vp.health_verdict(node["said"], node["stale"])[0], vp.UNKNOWN)
+            self.assertIn(vp.HEALTH_TRACE, row)
+            self.assertNotIn("— %s ·" % vp.HEALTH_OK, row)
+        # …а сторож, чей снимок СВЕЖ, остаётся зелёным: протухание одного источника не красит
+        # соседний узел, у которого прибор свой.
+        self.assertIn("%s — %s" % (run.WATCHDOG_NODE, vp.HEALTH_OK), rows[4])
+
+    def test_stale_red_word_is_not_dressed_as_a_corpse(self):
+        """Замершее «работы нет» ложным зелёным не бывает — пугать следом покойника незачем."""
+        verdict, note = vp.health_verdict(ex.MOD_IDLE, stale=True)
+        self.assertEqual(verdict, vp.UNKNOWN)
+        self.assertNotIn(vp.HEALTH_TRACE, note)
+        self.assertIn(ex.MOD_IDLE, note)
+
+    # ── третий исход полноправен ───────────────────────────────────────────
+    def test_blind_probe_is_unknown_and_never_dead(self):
+        """Узел, о котором прибор не смог спросить, получает НЕИЗВЕСТНО, а не «не работает»."""
+        for said, stale in ((ex.MOD_UNKNOWN, False), (None, False), ("чужое слово", False),
+                            (ex.MOD_OK, None), (ex.TURN_OK, True)):
+            self.assertEqual(vp.health_verdict(said, stale)[0], vp.UNKNOWN,
+                             "слепая проба назвалась приговором: %r/%r" % (said, stale))
+
+    def test_missing_health_slot_is_unknown_with_a_named_reason(self):
+        """Наблюдатель ещё не тикал после правки → слова нет, и это сказано словами."""
+        root, now = self._tree({"open": {}}, self._watch())
+        rows = vp.part_health(self._nodes(root, now))
+        self.assertIn(vp.HEALTH_NO_WORD, rows[0])
+        self.assertIn("вердикта о «%s»" % ex.HEALTH_DAEMON, rows[0])
+
+    def test_no_sources_at_all_still_names_every_node(self):
+        """Оба источника мертвы → шесть строк НЕИЗВЕСТНО, а не пустой раздел и не ноль узлов."""
+        root, now = self._tree()
+        rows = vp.part_health(self._nodes(root, now))
+        self.assertEqual(len(rows), 6)
+        for row in rows:
+            self.assertIn(vp.UNKNOWN, row)
+            self.assertNotIn(vp.HEALTH_BAD, row)
+
+    def test_part_says_the_difference_between_no_list_and_empty_list(self):
+        self.assertIn(vp.UNKNOWN, vp.part_health(None)[0])
+        self.assertIn("НЕ «всё работает»", vp.part_health([])[0])
+
+    # ── сторож судится своим продуктом ─────────────────────────────────────
+    def test_watchdog_that_gave_up_on_a_child_is_red(self):
+        root, now = self._tree(self._state(), self._watch(halted=("moderation_bot",)))
+        row = vp.part_health(self._nodes(root, now))[4]
+        self.assertIn("%s — %s" % (run.WATCHDOG_NODE, vp.HEALTH_BAD), row)
+        self.assertIn("сдался на moderation_bot", row)
+
+    def test_frozen_watchdog_snapshot_is_a_trace_not_a_verdict(self):
+        """Снимок надзора трёхчасовой давности со словом «сдавшихся нет» — след, а не здоровье."""
+        root, now = self._tree(self._state(), self._watch(), wd_age=3 * 3600.0)
+        row = vp.part_health(self._nodes(root, now))[4]
+        self.assertIn("%s — %s" % (run.WATCHDOG_NODE, vp.UNKNOWN), row)
+        self.assertIn(vp.HEALTH_TRACE, row)
+
+    # ── ничего не изобретено: слова и списки ВЗЯТЫ, а не набраны ───────────
+    def test_words_and_lists_are_borrowed_from_the_instruments(self):
+        """Второй словарь дал бы одному состоянию два имени — сверяем с прибором дословно."""
+        self.assertEqual(vp.HEALTH_SAID[ex.MOD_OK], vp.HEALTH_OK)
+        self.assertEqual(vp.HEALTH_SAID[ex.MOD_IDLE], vp.HEALTH_BAD)
+        self.assertEqual(vp.HEALTH_SAID[ex.TURN_OK], vp.HEALTH_OK)
+        self.assertEqual(vp.HEALTH_SAID[ex.TURN_SILENT], vp.HEALTH_BAD)
+        self.assertEqual(vp.HEALTH_SAID[ex.MOD_UNKNOWN], vp.UNKNOWN)
+        self.assertEqual(run.HEALTH_BLIND[run.WATCHDOG_NODE],
+                         ex.KID_REJECTED["pc_orchestrator.client_watch.json"])
+        for kid in ex.KIDS:
+            self.assertIn(ex.KID_SIGNS[kid]["caveat"][:40],
+                          run.health_nodes({}, NOW, None, None, NOW)[1 + list(ex.KIDS).index(kid)]
+                          ["blind"])
+
+    def test_section_reads_and_probes_nothing_of_its_own(self):
+        """«Новых приборов не изобретать»: сборка узлов не щупает процессы ни одной веткой."""
+        with io.open(os.path.join(HERE, "vitrina_pc_run.py"), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename="vitrina_pc_run.py")
+        banned = {"OpenProcess", "kill", "Popen", "check_output", "tasklist", "WinDLL",
+                  "psutil", "connect", "urlopen"}
+        seen = {getattr(n.func, "attr", None) or getattr(n.func, "id", None)
+                for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        self.assertEqual(seen & banned, set(), "витрина завела свою пробу живости")
+
+    def test_live_state_of_the_observer_is_parsed_without_crashing(self):
+        """Боевой файл наблюдателя разбирается сборкой узлов — форма не выдумана."""
+        path = os.path.join(HERE, "tmp", "expect_pc", "state.json")
+        if not os.path.exists(path):                   # pragma: no cover — чужое дерево
+            self.skipTest("боевого состояния наблюдателя в этом дереве нет")
+        expect, at, _why = cdr.read_json(HERE, cd.source("expect")["addr"])
+        watch, w_at, _w2 = run.read_watch(HERE)
+        nodes = run.health_nodes(expect, at, watch, w_at, (at or NOW) + 60.0)
+        self.assertEqual(len(nodes), 6)
+        for row in vp.part_health(nodes):
+            self.assertIn(" · чем: ", row)
 
 
 if __name__ == "__main__":            # pragma: no cover
