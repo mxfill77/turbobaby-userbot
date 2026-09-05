@@ -8182,6 +8182,19 @@ async def poll_and_send(client, sender=None, jitter=None, sleep=None):
     n = 0
     _send = sender or send_to_client
     for r in rows:
+        # ДЕДУП ОТПРАВИТЕЛЯ (06.09.2026): строку берём АТОМАРНО и ровно один раз за её жизнь.
+        # Без этого замка атомарный захват решения не спасал — дубль просто переезжал на ступень
+        # дальше: выборка выше и отправка ниже разнесены через `await`, поэтому наложившиеся
+        # обороты поллинга видели ОДНУ и ту же 'ready'-строку дважды; а строка, снова ставшая
+        # 'ready' (старый путь, ретрай, правка БД), уходила клиенту ВТОРЫМ сообщением, потому
+        # что помнить о первой доставке отправителю было нечем. Теперь помнит: sent_ts.
+        won, row = moderation_ipc.claim_for_send(r["id"])
+        if not won:
+            log.info(f"SUGGEST: poll_and_send: #{r['id']} не взят в отправку "
+                     f"(статус {(row or {}).get('status')}, доставлено {(row or {}).get('sent_ts')}) "
+                     f"— второго сообщения клиенту не будет.")
+            continue
+        r = row or r                       # работаем по СВЕЖЕЙ строке, какой её вернул захват
         final = r.get("final_text") or ""
         if not final:
             moderation_ipc.mark(r["id"], "failed", reason="пустой final_text")

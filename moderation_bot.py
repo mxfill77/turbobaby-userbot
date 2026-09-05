@@ -155,7 +155,11 @@ async def job_poll_new(context):
 # ------------------------------- применение решения --------------------------
 
 async def _apply(context, chat_id, draft, dec, edit_msg_id=None):
-    """Отразить decision-dict в IPC и в интерфейсе. Клиенту НИЧЕГО не шлём."""
+    """Отразить decision-dict в IPC и в интерфейсе. Клиенту НИЧЕГО не шлём.
+
+    → 'decided' (решение взято ЭТИМ нажатием) | 'closed' (за него уже решили) | None (решения
+    не было вовсе: отказ прав, вопрос, правка). Значение нужно вызывающему, чтобы снять кнопки
+    с закрытой карточки."""
     d = dec["decision"]
     by = dec.get("_by")
     if d == "denied":
@@ -178,16 +182,28 @@ async def _apply(context, chat_id, draft, dec, edit_msg_id=None):
     if d in ("remembered", "duplicate", "no_directive", "not_saved"):
         await context.bot.send_message(chat_id, dec["card"], reply_to_message_id=draft.get("card_msg_id"))
         return
-    if d == "rejected":
-        moderation_ipc.set_decision(draft["id"], "rejected", decided_by=by)
-        await context.bot.send_message(chat_id, f"❌ Отклонено ({by})",
+    if d in ("rejected", "ready", "test_held"):
+        # АТОМАРНЫЙ ЗАХВАТ РЕШЕНИЯ (06.09.2026). Раньше здесь стоял `set_decision` — UPDATE БЕЗ
+        # предусловия по статусу, то есть решение ставилось из ЛЮБОГО состояния строки, включая
+        # уже отправленное 'sent'. Именно этой дорогой к клиенту уходило ВТОРОЕ сообщение:
+        # кнопки после решения не гасли, и повторный (или чужой) тап ✅ снова ставил 'ready'.
+        # Теперь предусловие проверяет САМА СУБД внутри одного UPDATE — победитель ровно один
+        # при любой гонке (двух модераторов, двух процессов, повторного тапа по старой карточке).
+        # Проигравший НЕ получает «Принято»: ему говорится, что уже решено и КЕМ.
+        won, row = moderation_ipc.claim_decision(
+            draft["id"], d, final_text=(None if d == "rejected" else dec.get("final_text")),
+            decided_by=by)
+        if not won:
+            log.info(f"решение по #{draft['id']} не взято ({by}): карточку уже закрыл "
+                     f"{(row or {}).get('decided_by') or '?'} "
+                     f"[{(row or {}).get('status') or 'строки нет'}]")
+            await context.bot.send_message(chat_id, moderation_core.render_closed(row),
+                                           reply_to_message_id=draft.get("card_msg_id"))
+            return "closed"
+        card = f"❌ Отклонено ({by})" if d == "rejected" else dec["card"] + f"\n— {by}"
+        await context.bot.send_message(chat_id, card,
                                        reply_to_message_id=draft.get("card_msg_id"))
-        return
-    if d in ("ready", "test_held"):
-        moderation_ipc.set_decision(draft["id"], d, final_text=dec["final_text"], decided_by=by)
-        await context.bot.send_message(chat_id, dec["card"] + f"\n— {by}",
-                                       reply_to_message_id=draft.get("card_msg_id"))
-        return
+        return "decided"
 
 
 # ---------------------- O3 кусок 1: карточка «Бронь» --------------------------
@@ -497,7 +513,17 @@ async def on_callback(update, context):
         dec = moderation_core.process_callback(draft, action, username, suggest.SUGGEST_TEST_MODE,
                                                candidate=draft.get("final_text"))
     dec["_by"] = f"@{username}" if username else "?"
-    await _apply(context, q.message.chat_id, draft, dec)
+    outcome = await _apply(context, q.message.chat_id, draft, dec)
+    if outcome in ("decided", "closed"):
+        # Кнопки с ЗАКРЫТОЙ карточки снимаем (закрыли мы или тот, кто успел раньше — неважно):
+        # иначе карточка недельной давности остаётся на вид рабочей и приглашает на второй тап.
+        # Это УДОБСТВО, а не замок: замок — предусловие в СУБД, и он держит даже если снять
+        # кнопки не удалось (Telegram недоступен, сообщение слишком старое для правки).
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception as e:
+            log.info(f"кнопки карточки #{draft['id']} не сняты ({type(e).__name__}: {e}) — "
+                     "замок решения от этого не слабеет, он в СУБД")
 
 
 async def on_group_message(update, context):

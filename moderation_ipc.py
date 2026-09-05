@@ -12,6 +12,7 @@ moderation_ipc.py — IPC между userbot (Telethon) и moderation_bot (Bot A
   posted        — бот запостил карточку (card_msg_id заполнен)
   pending_confirm — бот применил правку, ждёт подтверждения (final_text = кандидат)
   ready         — решение принято, userbot ДОЛЖЕН отправить клиенту (final_text)
+  sending       — строку ЗАБРАЛ отправитель (claim_for_send); второй поллер её не увидит
   test_held     — TEST_MODE: решение принято, но отправка заблокирована (double-lock)
   rejected      — отклонено
   sent / failed — userbot отправил / не смог
@@ -100,7 +101,12 @@ def init_db(path=None):
         # МИГРАЦИЯ для старых БД: transcript/pricing_note — СТРАТЕГИЯ-перегенерация; directive —
         # текст правки модератора (для кнопки «Запомнить как правило» → playbook); client_name —
         # first_name профиля клиента (O3 кусок 1.1: D-колонка карточки «Бронь», когда имя в тексте не названо).
-        for col in ("transcript TEXT", "pricing_note TEXT", "directive TEXT", "client_name TEXT"):
+        # sent_ts — МОМЕНТ ПЕРВОЙ ДОСТАВКИ клиенту (дедуп отправителя, 06.09.2026). Ставится
+        # РОВНО ОДИН РАЗ (COALESCE в mark) и больше не меняется никогда: это не «когда последний
+        # раз тронули строку», а «этому клиенту по этой карточке уже написали». Статус для
+        # дедупа не годится — он ходит туда-сюда (ready→sent→ready…), а штамп доставки нет.
+        for col in ("transcript TEXT", "pricing_note TEXT", "directive TEXT", "client_name TEXT",
+                    "sent_ts TEXT"):
             try:
                 c.execute("ALTER TABLE drafts ADD COLUMN " + col)
             except Exception:
@@ -340,11 +346,54 @@ def supersede_open(client_id, keep_id=None, reason=None, path=None):
         return c.execute(sql, args).rowcount
 
 
+# ---------- ДЕДУП ОТПРАВИТЕЛЯ: одна карточка — одно сообщение клиенту (06.09.2026) ----------
+# Атомарный захват решения (claim_decision) закрывает дубль НА КНОПКЕ. Этого мало: между
+# решением и клиентом стои́т ВТОРАЯ ступень — отправитель (suggest.poll_and_send: fetch_ready →
+# send → mark). У неё своих замков не было ни одного, и дубль просто переезжал на ступень
+# дальше, оставаясь живым:
+#   • два оборота поллинга накладываются (send идёт через await) — одна и та же 'ready'-строка
+#     попадает в обе выборки, и клиент получает два сообщения при ОДНОМ нажатии;
+#   • строку кто-то снова перевёл в 'ready' (старый путь без предусловия, ручная правка БД,
+#     ретрай) — отправитель послушно шлёт ВТОРОЕ, потому что помнить о первой доставке ему нечем.
+# Замок тот же, что у решения, и по той же причине: предусловие проверяет САМА СУБД внутри
+# ОДНОГО UPDATE. Двух победителей не бывает ни при какой гонке.
+STATUS_SENDING = "sending"
+
+
+def claim_for_send(draft_id, path=None):
+    """Атомарно забрать строку В ОТПРАВКУ. → (взял?: bool, строка: dict|None).
+
+    Взять можно РОВНО из 'ready' и РОВНО пока клиенту по этой карточке ещё не писали
+    (sent_ts пуст). Взял — строка уходит в 'sending' и из fetch_ready пропадает, поэтому
+    второй поллер её не увидит. Не взял → (False, строка КАК ЕСТЬ|None): отправлять нечего,
+    и это НЕ ошибка — это отказ дубля.
+
+    Честно про хвост: процесс, умерший МЕЖДУ захватом и mark, оставит строку в 'sending'
+    навсегда. Так выбрано СОЗНАТЕЛЬНО — из 'sending' нельзя ни отправить, ни «переоткрыть»
+    (его нет ни в CLAIMABLE_FROM, ни в fetch_ready), а цена ошибки несимметрична: неотправленное
+    сообщение видно в очереди и повторяется человеком, второе сообщение клиенту — нет."""
+    with _conn(path) as c:
+        cur = c.execute(
+            "UPDATE drafts SET status=?, updated_ts=? "
+            "WHERE id=? AND status='ready' AND (sent_ts IS NULL OR sent_ts='')",
+            (STATUS_SENDING, _now_iso(), draft_id),
+        )
+        won = cur.rowcount > 0
+        row = _row(c.execute("SELECT * FROM drafts WHERE id=?", (draft_id,)).fetchone())
+    return won, row
+
+
 def mark(draft_id, status, reason=None, path=None):
-    """Пометить итог отправки: sent | failed | test_held."""
+    """Пометить итог отправки: sent | failed | test_held.
+
+    Итог 'sent' ДОПОЛНИТЕЛЬНО штампует sent_ts — момент ПЕРВОЙ доставки. COALESCE тут не
+    украшение: переписать штамп значило бы забыть, что клиенту уже писали, и вернуть дубль."""
     with _conn(path) as c:
         c.execute("UPDATE drafts SET status=?, reason=?, updated_ts=? WHERE id=?",
                   (status, reason, _now_iso(), draft_id))
+        if status == "sent":
+            c.execute("UPDATE drafts SET sent_ts=COALESCE(NULLIF(sent_ts,''), ?) WHERE id=?",
+                      (_now_iso(), draft_id))
 
 
 # ------------------------------- heartbeat -----------------------------------
