@@ -10413,6 +10413,29 @@ class TestClientContourGate(Base):
                                    gate_fn=lambda mods: (True, "ok"), restart_fn=self._restart,
                                    head_fn=lambda: "4528917")
 
+    @staticmethod
+    def _kto_importit(name):
+        """Кто из файлов замыкания импортирует `name` → 'a.py, b.py' ('' — не определилось).
+        Живёт ТОЛЬКО ради текста красного: имя файла без ребра не отвечает на вопрос «почему»,
+        и оба раза (05.09, 06.09) поиск ребра шёл отдельной разведкой уже ПОСЛЕ падения гейта.
+        Ничего не утверждает и никогда не бросает — сбой здесь не смеет менять исход теста."""
+        try:
+            import ast
+            cl = o.client_contour.closure(o.REPO)
+            kto = []
+            for f in sorted(cl.files):
+                p = os.path.join(o.REPO, f)
+                with io.open(p, encoding="utf-8") as fh:
+                    tree = ast.parse(fh.read(), filename=p)
+                for mod in o.client_contour._imports_of(tree):
+                    if os.path.basename(o.client_contour._module_file(o.REPO, mod) or "").lower() \
+                            == name.lower():
+                        kto.append(f)
+                        break
+            return ", ".join(kto)
+        except Exception:                       # noqa: BLE001 — подсказка, а не утверждение
+            return ""
+
     def test_klientskii_fail_derzhitsya_i_daet_kartochku(self):
         note = self._upd(["suggest.py"])
         self.assertEqual(self.restarts, [])                       # НИ ОДНОГО рестарта живого бота
@@ -10425,18 +10448,25 @@ class TestClientContourGate(Base):
         """Внутренний контур не задет: карта на ботов не ведёт → прежний путь, ворота молчат."""
         self.assertEqual(self._upd(["pc_orchestrator.py", "gate_selective.py"]), "")
         self.assertEqual(self.cards, [])
-        # ПОИМЁННЫЙ список «внутренних» — голден с коротким сроком годности, и 05.09.2026 он этот
-        # срок пережил: в списке стоял client_contour.py, а он СТАЛ клиентским по-настоящему
-        # (a42c8ee завёл lesson_regress.py, и цепь userbot_listen → trainer → lesson_regress →
-        # client_contour стала живым ребром; замер: замыкание 30 → 33 файла). «Внутренний» — не
-        # свойство ИМЕНИ, а факт отсутствия ребра, поэтому каждое имя здесь сверяется С ГРАФОМ, а
-        # не берётся на веру: разойдётся — тест назовёт файл, а не просто покраснеет.
-        # Сам факт смены закреплён отдельным голденом test_client_contour_stal_klientskim_cepyu.
-        vnutr = ["pc_orchestrator.py", "gate_selective.py", "task_metrics.py"]
+        # ПОИМЁННЫЙ список «внутренних» — голден с коротким сроком годности, и он этот срок
+        # пережил уже ДВАЖДЫ, каждый раз ценой красного гейта и остановленного прода:
+        #   05.09.2026 — client_contour.py (a42c8ee завёл lesson_regress.py, цепь
+        #                userbot_listen → trainer → lesson_regress → client_contour; 30 → 33 файла);
+        #   06.09.2026 — task_metrics.py (1928e46 завёл season_gate.py, цепь
+        #                userbot_listen → suggest → season_gate → dispatch_notify → task_metrics;
+        #                замер одним признаком на двух деревьях: 27f3b9c 37 → вершина 40 файлов).
+        # «Внутренний» — не свойство ИМЕНИ, а факт отсутствия ребра, поэтому каждое имя здесь
+        # сверяется С ГРАФОМ, а не берётся на веру, и красный называет ЦЕПЬ, а не только файл:
+        # прошлый раз поиск ребра стоил отдельного разведочного прогона.
+        # Оба факта смены закреплены голденами: test_client_contour_stal_klientskim_cepyu и
+        # test_tretii_ishod_privel_dispatch_i_metriki_06_09 — смена ЗАПИСАНА, а не стёрта.
+        vnutr = ["pc_orchestrator.py", "gate_selective.py"]
         cl = o.client_contour.closure(o.REPO)
         self.assertTrue(cl.ok, cl.reason)
         for p in vnutr:
-            self.assertNotIn(p, cl.files, f"{p} въехал в клиентское замыкание — список устарел")
+            self.assertNotIn(p, cl.files,
+                             f"{p} въехал в клиентское замыкание — список устарел; "
+                             f"его импортируют: {self._kto_importit(p) or 'не определилось'}")
         self.assertEqual(o._client_paths(vnutr), [])
 
     def test_client_contour_stal_klientskim_cepyu(self):
@@ -10452,6 +10482,33 @@ class TestClientContourGate(Base):
             self.assertIn(zveno, cl.files, f"{zveno} выпал из клиентского замыкания — цепь порвана")
         self.assertTrue(o.client_contour.is_client("client_contour.py", o.REPO))
         self.assertEqual(o._client_paths(["client_contour.py"]), ["client_contour.py"])
+
+    def test_tretii_ishod_privel_dispatch_i_metriki_06_09(self):
+        """ЗАПИСЬ СМЕНЫ 06.09.2026: третий исход на границе сезонов сделал клиентскими ТРИ файла.
+
+        Замер ОДНИМ признаком на двух деревьях (27f3b9c — код демона; вершина): 37 → 40 файлов,
+        вошли season_gate.py, dispatch_notify.py, task_metrics.py, не вышел ни один. Цепь:
+        userbot_listen.py -> suggest.py -> season_gate.py -> dispatch_notify.py -> task_metrics.py.
+
+        Каждое ребро заведено СОЗНАТЕЛЬНО, и убрать «лишнее» здесь нечего:
+          • suggest.py импортирует season_gate верхним импортом и зовёт note_for на пути ответа —
+            это сам третий исход, клиент видит его текст;
+          • season_gate ЛЕНИВО импортирует dispatch_notify в _default_sender — это и есть «зовём
+            человека»; выдернуть ребро значит отнять карточку владельцу;
+          • dispatch_notify ЛЕНИВО импортирует task_metrics в _session_metrics_line — метрика
+            сессии, ребро старше сегодняшнего дня.
+        Импорты внутри функций признак считает СОЗНАТЕЛЬНО (шапка client_contour): модуль, который
+        процесс МОЖЕТ загрузить, клиентский. Ошибка идёт в безопасную сторону — лишний файл ворота
+        придержат и спросят владельца, клиентского не пропустят.
+
+        Красный здесь = ребро исчезло: третий исход перестал звать человека либо сезонных ворот не
+        стало вовсе. Это правильный красный, и о нём надо знать."""
+        cl = o.client_contour.closure(o.REPO)
+        self.assertTrue(cl.ok, cl.reason)
+        for zveno in ("suggest.py", "season_gate.py", "dispatch_notify.py", "task_metrics.py"):
+            self.assertIn(zveno, cl.files, f"{zveno} выпал из клиентского замыкания — цепь порвана")
+        self.assertEqual(o._client_paths(["season_gate.py", "task_metrics.py"]),
+                         ["season_gate.py", "task_metrics.py"])
 
     def test_priznak_eto_graf_a_ne_spisok(self):
         """НАСТОЯЩЕЕ свойство, которое голден выше только изображал списком имён: клиентским файл

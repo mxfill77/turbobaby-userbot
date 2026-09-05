@@ -152,7 +152,13 @@ class TestZhivoyKontur(unittest.TestCase):
         #     поэтому красноту никто не видел.
         # Признак — самообновляющийся граф; поимённый список «внутренних» устаревает без единого
         # сигнала, и это его врождённое свойство, а не поломка.
-        for name in ("pc_orchestrator.py", "pc_agent.py", "gate_selective.py", "task_metrics.py",
+        # ТРЕТЬЕ имя убрано 06.09.2026 — task_metrics.py, и снова не ради зелёного: 1928e46 завёл
+        # season_gate.py, и цепь userbot_listen → suggest → season_gate → dispatch_notify →
+        # task_metrics стала живым ребром (замер: замыкание 27f3b9c 37 → вершина 40 файлов, вошли
+        # season_gate.py, dispatch_notify.py, task_metrics.py). Цепь названа голденом ниже.
+        # Этот файл в набор гейта самообновления НЕ входит — значит и сегодня он лежал красным
+        # молча, ровно как 05.09 с brain_writer.py. Класс живой, и это его вторая встреча.
+        for name in ("pc_orchestrator.py", "pc_agent.py", "gate_selective.py",
                      "selfupdate_gate.py", "pretool_guard.py",
                      "cowork_log_append.py", "README.md"):
             self.assertFalse(cc.is_client(name, REPO), f"{name} обязан быть внутренним")
@@ -176,6 +182,24 @@ class TestZhivoyKontur(unittest.TestCase):
         for zveno in ("suggest.py", "price_gate.py", "queue_snapshot_pc.py", "brain_writer.py"):
             self.assertIn(zveno, c.files, f"{zveno} выпал из клиентского замыкания — цепь порвана")
         self.assertTrue(cc.is_client("brain_writer.py", REPO))
+
+    def test_tretii_ishod_privel_dispatch_i_metriki_06_09(self):
+        """ЗАПИСЬ СМЕНЫ 06.09.2026: третий исход на границе сезонов (1928e46) сделал клиентскими
+        ТРИ файла — season_gate.py, dispatch_notify.py, task_metrics.py. Замыкание 37 → 40
+        (замер одним признаком: дерево 27f3b9c против вершины), не вышел ни один.
+
+        Цепь: userbot_listen.py → suggest.py → season_gate.py → dispatch_notify.py →
+        task_metrics.py. Два последних ребра ЛЕНИВЫЕ (season_gate._default_sender,
+        dispatch_notify._session_metrics_line) — признак считает импорты внутри функций
+        сознательно, и здесь это ровно то, что нужно: карточку владельцу третий исход шлёт из
+        живого процесса бота.
+
+        Красный здесь = третий исход перестал звать человека. Это правильный красный."""
+        c = cc.closure(REPO)
+        self.assertTrue(c.ok, c.reason)
+        for zveno in ("suggest.py", "season_gate.py", "dispatch_notify.py", "task_metrics.py"):
+            self.assertIn(zveno, c.files, f"{zveno} выпал из клиентского замыкания — цепь порвана")
+        self.assertTrue(cc.is_client("task_metrics.py", REPO))
 
     def test_lesson_router_est_v_grafe_no_net_v_karte_processov(self):
         """Живой разрыв, который список имён не видит, а граф видит: trainer.py импортит
