@@ -371,6 +371,19 @@ def _build_pack(trigger, root, build_date, max_chars):
     return case, pack, text, rel
 
 
+def _build_failure_reason(exc):
+    """Падение сборки → слаг причины для учёта попытки. → str.
+
+    У `ReviewAutoError` слаг назван самим модулем (`.reason`) — берём его, чтобы
+    учёт считал те же классы, что и код. У чужого исключения слага нет вовсе, и
+    выдумывать его нельзя: называем ИМЯ типа, честно признавая, что класс не наш.
+    """
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, str) and reason:
+        return reason
+    return "build_crashed:%s" % type(exc).__name__
+
+
 def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOUR,
          channels=None, timeout=DEFAULT_TIMEOUT, key_env=review_send_run.DEFAULT_KEY_ENV,
          dry=False, write_journal=True, max_chars=review_pack.REVIEW_MAX_CHARS,
@@ -409,7 +422,37 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
         return {"acted": False, "why": "дайджест наступил, закрытых цепочек за сутки нет",
                 "trigger": trigger["key"]}
 
-    case, pack, text, pack_rel = _build_pack(trigger, root, build_date, max_chars)
+    # ПАДЕНИЕ СБОРКИ — ЭТО ПОПЫТКА, А НЕ НЕБЫТИЁ (правка 05.09.2026).
+    #
+    # ЧТО БЫЛО. Исключение отсюда летело наружу ДО `note_attempt`, поэтому ключа
+    # повода в `triggers` не появлялось ВОВСЕ: `attempt_allowed` вечно отвечал
+    # `first_attempt`, `MAX_ATTEMPTS` не срабатывал ни разу, а `chain_trigger`
+    # берёт САМУЮ СТАРУЮ подходящую запись — и на каждом витке выбирал ту же
+    # самую. Храповик «две попытки и хватит» здесь не спасал: он считает попытки,
+    # а попытка не засчитывалась. Живой счёт: 55 холостых витков за 05.09 на одной
+    # цепочке `pc-2026-09-02-13`, 03:09:02 → 17:09:06, ни одного пакета наружу.
+    #
+    # ЧТО СТАЛО. Попытка списывается ДО того, как исключение полетит дальше. Уже
+    # первое падение делает повод `retry_too_soon` — очередь идёт к следующей
+    # записи В ТОТ ЖЕ ВИТОК, а не через час; второе (после паузы) закрывает повод
+    # словом `abandoned` навсегда. Цена дефекта стала ДВА витка вместо бесконечности.
+    #
+    # ИСКЛЮЧЕНИЕ НЕ ГЛОТАЕТСЯ. Оно летит дальше тем же путём, и демон по-прежнему
+    # пишет его WARNING'ом (`pc_orchestrator.maybe_review_auto` → fail-safe):
+    # починка учёта не смеет заодно приглушить новость о поломке.
+    #
+    # ПОЧЕМУ ЭТО ШИРЕ ПЕРВОЙ ПРАВКИ. `not_operational` был лишь ПЕРВЫМ поводом
+    # для такого круга. Убрав только его, мы оставили бы дыру: любое следующее
+    # исключение сборки — иная кодировка артефакта, битая расписка, отказ чтения
+    # версии рамки — снова дало бы вечный круг на самой старой записи.
+    try:
+        case, pack, text, pack_rel = _build_pack(trigger, root, build_date, max_chars)
+    except Exception as exc:
+        state = review_auto.note_attempt(state, trigger["key"], trigger["kind"], stamp)
+        state, _ = review_auto.note_outcome(state, trigger["key"], ["build_failed"],
+                                            [_build_failure_reason(exc)], stamp)
+        write_state(path, state)
+        raise
     report = {
         "acted": True,
         "trigger": trigger["key"],

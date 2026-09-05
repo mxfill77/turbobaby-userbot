@@ -279,17 +279,56 @@ class TestTriggers(unittest.TestCase):
         self.assertIn("крупный класс", why)
         self.assertIn("крупный класс", review_auto.chain_trigger(self._state_with(rec), _NOW)["occasion"])
 
-    def test_claimed_commit_absent_from_the_tree_is_a_divergence_occasion(self):
-        """Заявлен коммит, а в дереве его нет — это РАСХОЖДЕНИЕ ДВУХ НАШИХ ЗАМЕРОВ.
+    def test_claimed_commit_absent_from_the_tree_is_not_an_occasion(self):
+        """Заявлен коммит, а в дереве его нет — ВНЕШНИМ разбирать нечего.
 
-        Смена смысла названа вслух: до 05.09 такая цепочка не была поводом вовсе
-        (operational_change=False), и разошедшиеся замеры уходили молча.
+        Смена смысла названа вслух дважды. Утром 05.09 эта расписка стала первой
+        веткой повода — и ровно она заклинила ступень A: `case_for_chain` требует
+        `operational_change`, а у `commit_unverified` оно ложно ПО ОПРЕДЕЛЕНИЮ,
+        то есть сборка отказывала на каждом таком поводе всегда. Живой счёт:
+        55 витков подряд на цепочке `pc-2026-09-02-13`, 03:09:02 → 17:09:06,
+        ноль пакетов наружу за сутки при 11 открытых поводах в спуле.
         """
         rec = _receipt(1, changed=False)
         self.assertFalse(rec["operational_change"])
         self.assertEqual(rec["change_reason"], "commit_unverified")
-        self.assertIn("замеры разошлись", review_auto.chain_occasion(rec)[1])
-        self.assertIsNotNone(review_auto.chain_trigger(self._state_with(rec), _NOW))
+        ok, why = review_auto.chain_occasion(rec)
+        self.assertFalse(ok)
+        self.assertIn("не повод", why)
+        # Отказ назван СВОИМ словом: у этой расписки замеры как раз разошлись, и
+        # общая фраза «замеры сошлись» соврала бы ровно в том поле, ради которого
+        # расписка и заводится.
+        self.assertNotIn("замеры сошлись", why)
+        self.assertIsNone(review_auto.chain_trigger(self._state_with(rec), _NOW))
+        # …и расхождение НЕ ПОТЕРЯНО: суточный дайджест берёт её тем же окном.
+        self.assertEqual([r["queue_id"] for r in review_auto.digest_trigger(
+            self._state_with(rec), "2026-09-01T13:00:00Z", 1)["receipts"]], [1])
+
+    def test_every_occasion_can_actually_be_built(self):
+        """ИНВАРИАНТ: ПОВОД ⇒ СБОРКА ВОЗМОЖНА. Его нарушение и есть класс 05.09.
+
+        Проверяем перебором, а не словами: любая расписка, признанная поводом,
+        обязана пройти `case_for_chain` без исключения. Утром 05.09 инвариант не
+        держался — и держать его было некому, теста на связь двух мест не
+        существовало вовсе.
+        """
+        matrix = []
+        for commits in (0, 1, 2, 3):
+            for changed in (True, False):
+                for status in ("done", "failed"):
+                    shas = ["abc1234", "def5678", "9012abc"][:commits]
+                    result = "FACT: %s\nRESULT: сделано" % " ".join(
+                        "commit %s в git log" % s for s in shas)
+                    claimed = review_auto.claimed_commits(result)
+                    matrix.append(review_auto.receipt(
+                        queue_id=1, task_text=LIVE_TASK_TEXT, status=status, result=result,
+                        closed_at=_NOW, claimed=claimed, verified=claimed if changed else []))
+        occasions = [r for r in matrix if review_auto.chain_occasion(r)[0]]
+        self.assertGreaterEqual(len(occasions), 3, "перебор не дал поводов — проверять нечего")
+        for rec in occasions:
+            self.assertTrue(rec["operational_change"],
+                            "повод без операционного изменения: %s" % rec["change_reason"])
+            review_auto.case_for_chain(rec, "2026-09-01")     # исключение здесь = провал теста
 
     def test_reported_failure_with_a_live_commit_is_a_divergence_occasion(self):
         rec = review_auto.receipt(
@@ -699,6 +738,132 @@ class TestNegativeChannel(unittest.TestCase):
         self.assertFalse(report["acted"])
         self.assertEqual(review_auto_run.read_state(self.state)["digest"],
                          {"last_day": "2026-09-01", "last_reason": "empty"})
+
+
+class TestBuildFailureIsAnAttempt(unittest.TestCase):
+    """ОТРИЦАТЕЛЬНАЯ ПРОБА к правке 05.09 (вечер): сборка упала — очередь ИДЁТ ДАЛЬШЕ.
+
+    Ломаем сборку ПРИЧИНОЙ, НЕ РАВНОЙ той, что заклинила полосу утром. Это не
+    придирка к формулировке: ключ повода не появлялся в учёте НИ ПРИ КАКОМ
+    исключении, потому что оно улетало из `tick` до `note_attempt`. Починив только
+    `not_operational`, мы оставили бы дыру ровно того же размера — следующее
+    исключение любого вида снова дало бы вечный круг на самой старой записи
+    (`chain_trigger` берёт САМУЮ СТАРУЮ подходящую).
+
+    Причина здесь — `oversized_hypothesis`: расписка с постановкой длиннее потолка
+    ступени 1. Класс живой, а не выдуманный: потолок постановки правили на этой же
+    полосе 05.09, и расписка, записанная одной редакцией, читается другой.
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="reviewauto_build_")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.state = os.path.join(self.root, "state.json")
+        # Битая — СТАРШЕ здоровой: иначе проба ничего не проверяет, очередь дошла бы
+        # до здоровой и не заметив поломки.
+        self.broken = dict(_receipt(41, commits=2, closed="2026-09-01T09:00:00Z"),
+                           hypothesis="я" * (review_pack.HYPOTHESIS_TEXT_MAX + 1))
+        self.good = _receipt(42, commits=2, closed="2026-09-01T10:00:00Z")
+        spool = []
+        for rec in (self.broken, self.good):
+            spool = review_auto.spool_add(spool, rec)
+            review_auto_run.write_text(
+                os.path.join(self.root, *review_auto.receipt_rel(rec).split("/")),
+                json.dumps(rec, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        # День дайджеста закрыт заранее: иначе он поднялся бы как ДРУГОЙ законный
+        # повод и проба мерила бы не то.
+        review_auto_run.write_state(self.state, review_auto.note_digest_day(
+            dict(review_auto.state_default(), spool=spool), "2026-09-01", "answered"))
+        original = review_auto_run.review_send_run.run_channel
+        self.addCleanup(setattr, review_auto_run.review_send_run, "run_channel", original)
+        review_auto_run.review_send_run.run_channel = self._answer
+
+    def _answer(self, channel, prompt, ctx, args):
+        verdict = review_send._verdict(
+            channel=channel, pack_name=ctx["pack_name"], pack_sha256=ctx["pack_sha256"],
+            send_date=ctx["send_date"], outcome="answered", reason="ok",
+            detail="ответ канала", answer="находка: " + "я" * 400,
+            prompt_sha256=ctx["prompt_sha256"])
+        return verdict, "находка: " + "я" * 400
+
+    def _tick(self, now):
+        return review_auto_run.tick(root=self.root, state_path=self.state, now=now,
+                                    digest_hour=1, write_journal=False)
+
+    def _key(self, rec):
+        return "chain:%s" % rec["task_id"]
+
+    def test_after_max_attempts_the_queue_reaches_the_next_record(self):
+        # 1. Сборка падает, и падает ДРУГИМ классом: `not_operational` здесь ни при чём.
+        with self.assertRaises(review_pack.ReviewPackError) as ctx:
+            self._tick(_NOW)
+        self.assertEqual(ctx.exception.reason, "oversized_hypothesis")
+
+        # 2. Попытка ЗАСЧИТАНА. До правки ключа в учёте не появлялось вовсе — и
+        #    именно поэтому `MAX_ATTEMPTS` не срабатывал никогда.
+        st = review_auto_run.read_state(self.state)
+        rec = st["triggers"][self._key(self.broken)]
+        self.assertEqual(rec["attempts"], 1)
+        self.assertEqual(rec["last_outcomes"], ["build_failed"])
+        self.assertEqual(rec["last_reasons"], ["oversized_hypothesis"])
+        self.assertEqual(rec["verdict"], "retry")
+
+        # 3. ГЛАВНОЕ: очередь НЕ ВСТАЛА — следующий виток берёт СЛЕДУЮЩУЮ запись.
+        second = self._tick("2026-09-01T12:05:00Z")
+        self.assertTrue(second["acted"], "очередь встала на битой записи")
+        self.assertEqual(second["trigger"], self._key(self.good))
+        self.assertEqual(second["outcomes"], ["answered"] * len(review_send.CHANNELS))
+        self.assertTrue(os.path.exists(os.path.join(self.root, *second["pack"].split("/"))))
+        # Битая запись не оставила в лотке ни обрубка, ни пустого пакета.
+        self.assertEqual(os.listdir(os.path.join(self.root, "docs", "review_outbox")),
+                         [os.path.basename(second["pack"])])
+
+        # 4. Через паузу — РОВНО ОДИН повтор по битой записи, и он последний.
+        with self.assertRaises(review_pack.ReviewPackError):
+            self._tick("2026-09-01T13:30:00Z")
+        st = review_auto_run.read_state(self.state)
+        broken = st["triggers"][self._key(self.broken)]
+        self.assertEqual(broken["attempts"], review_auto.MAX_ATTEMPTS)
+        self.assertTrue(broken["closed"])
+        self.assertEqual(broken["verdict"], "abandoned")
+
+        # 5. Третьего захода нет никогда, и виток больше не падает вовсе.
+        self.assertEqual(review_auto.attempt_allowed(st, self._key(self.broken),
+                                                     "2026-09-02T13:30:00Z"),
+                         (False, "already_closed"))
+        last = self._tick("2026-09-01T14:30:00Z")
+        self.assertFalse(last["acted"])
+        self.assertIn("повода нет", last["why"])
+
+    def test_the_exception_is_not_swallowed_by_the_new_accounting(self):
+        """Учёт попытки не смеет ПРИГЛУШИТЬ новость о поломке.
+
+        Исключение по-прежнему летит наружу тем же путём — демон пишет его
+        WARNING'ом (`pc_orchestrator.maybe_review_auto`, ветка fail-safe). Молча
+        съеденная поломка была бы хуже вечного круга: круг хотя бы виден в логе.
+        """
+        with self.assertRaises(review_pack.ReviewPackError):
+            self._tick(_NOW)
+
+    def test_the_live_stuck_receipt_never_reaches_the_builder_anymore(self):
+        """Живая форма заклинившей записи: коммит объявлен, в дереве не найден.
+
+        Ровно такой была `pc-2026-09-02-13` (`claimed_commits` — один, `verified` —
+        ни одного). Теперь она поводом не становится вовсе, и ключа в учёте не
+        заводит: очередь проходит мимо неё к следующей записи с ПЕРВОГО витка.
+        """
+        stuck = _receipt(13, changed=False, closed="2026-09-01T08:00:00Z")
+        review_auto_run.write_text(
+            os.path.join(self.root, *review_auto.receipt_rel(stuck).split("/")),
+            json.dumps(stuck, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        spool = review_auto.spool_add([], stuck)
+        spool = review_auto.spool_add(spool, self.good)
+        review_auto_run.write_state(self.state, review_auto.note_digest_day(
+            dict(review_auto.state_default(), spool=spool), "2026-09-01", "answered"))
+        report = self._tick(_NOW)
+        self.assertTrue(report["acted"])
+        self.assertEqual(report["trigger"], self._key(self.good))
+        self.assertNotIn(self._key(stuck), review_auto_run.read_state(self.state)["triggers"])
 
 
 class TestLiveChannelStillGoesOut(unittest.TestCase):
