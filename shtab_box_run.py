@@ -112,6 +112,15 @@ STOP_FILE = "pc_orchestrator.shtab_box.off"
 TAKEN_FILE = "pc_orchestrator.shtab_box_taken.jsonl"
 TAKEN_SCHEMA = "turbobaby.shtab_box_taken/v1"
 
+# ═════════════════════════ ЗАМОК СИГНАЛЬНОЙ ОСТАНОВКИ ════════════════════════
+# ЗАВЕДЁН 05.09.2026 ПО ТОМУ ЖЕ ЖИВОМУ УЩЕРБУ, ЧТО И ПАМЯТЬ ВЫШЕ, и по той же
+# причине: корпус живой очереди не вечен. Разбор, числа дня и доктрина «что
+# запирается, а что нет» — у :mod:`shtab_box_signals`, §«ЗАМОК ОСТАНОВКИ»; здесь
+# только руки и файл. Формат тот же JSONL и по тому же доводу: файл состояния,
+# который умеет переписываться целиком, однажды станет короче МОЛЧА — а мы чиним
+# ровно тот дефект, где состояние замолчало.
+HOLD_FILE = "pc_orchestrator.shtab_box_hold.jsonl"
+
 # Корпуса рядов очереди берутся У СТУПЕНИ E, а не набираются здесь заново: это
 # один и тот же вопрос «где живут маркеры суток», и два его экземпляра разъехались
 # бы молча. `failed` и `done` читаются ОБА — маркер взятого задания уходит из
@@ -261,6 +270,89 @@ def remember(root=HERE, key="", day="", lane="", tid=None, at="", src=""):
     except Exception as exc:                            # noqa: BLE001
         return False, ("ключ %s в долгую память НЕ ЛЁГ (%s): %s — следующий виток может взять "
                        "это задание ВТОРОЙ РАЗ" % (key, TAKEN_FILE, str(exc)[:160]))
+    return True, ""
+
+
+# ───────────────────────────── замок остановки ─────────────────────────────
+
+
+def hold_path(root=HERE):
+    """Путь файла замка остановки. → str."""
+    return _path(root, HOLD_FILE)
+
+
+def read_hold(root=HERE):
+    """Замок сигнальной остановки → (записи, ok, причина).
+
+    ТРИ ИСХОДА, дословно как у :func:`read_taken`, и третий здесь особенно
+    важен: непрочитанный замок означает «стои́т ли остановка, НЕИЗВЕСТНО», а
+    брать на таком незнании — это и есть тот самый обход остановки, ради
+    запрета которого замок заведён. Вызывающий обязан прочесть ``ok=False`` как
+    «день исчерпан» (:func:`build` кладёт его в тот же ``marks_ok``, что и
+    непрочитанные закрытые ряды), а не как «замка нет».
+
+    ФАЙЛА НЕТ — ЧЕСТНЫЙ НОЛЬ: ящик, у которого остановка ни разу не срабатывала,
+    и ящик, у которого замок отняли, — разные новости, а по длине списка они
+    одинаковы.
+
+    БИТАЯ СТРОКА ВАЛИТ ЧТЕНИЕ ЦЕЛИКОМ, а не пропускается: пропущенная строка —
+    это ровно одна забытая остановка или одно потерянное слово владельца, и не
+    узнал бы об этом никто.
+    """
+    path = hold_path(root)
+    try:
+        if not os.path.exists(path):
+            return [], True, "замка остановки ещё нет — файл %s не заводился" % HOLD_FILE
+    except Exception as exc:                            # noqa: BLE001
+        return [], False, "замок остановки не прочитан (%s): %s" % (HOLD_FILE, str(exc)[:160])
+    rows, bad = [], []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for n, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:                       # noqa: BLE001
+                    bad.append(n)
+                    continue
+                if not isinstance(rec, dict) or not str(rec.get("mark") or ""):
+                    bad.append(n)
+                    continue
+                rows.append(rec)
+    except Exception as exc:                            # noqa: BLE001
+        return [], False, "замок остановки не прочитан (%s): %s" % (HOLD_FILE, str(exc)[:160])
+    if bad:
+        return [], False, ("замок остановки %s разобран НЕ ВЕСЬ: строки %s не читаются — стои́т ли "
+                           "остановка, НЕИЗВЕСТНО (поправить строку руками)"
+                           % (HOLD_FILE, ", ".join(str(n) for n in bad[:10])))
+    return rows, True, ""
+
+
+def write_hold(root=HERE, rec=None):
+    """Запись замка (постановка или снятие) → на диск. → (ok, причина).
+
+    ДОЗАПИСЬ, А НЕ ПРАВКА: снятие ложится ОТДЕЛЬНОЙ строкой поверх постановки, а
+    схлопывает их чтение (:func:`shtab_box_signals.hold_index`). Так файл умеет
+    только расти, и сорвавшаяся запись не делает память короче.
+
+    ОТКАЗ ЗАПИСИ ОБЯЗАН БЫТЬ СЛЫШЕН СЛОВАМИ, и слова эти называют последствие:
+    незапертая остановка означает, что следующий оборот может взять задание,
+    хотя владелец ничего не снимал. Молчаливый отказ здесь неотличим от
+    работающего замка ровно до следующего взятия.
+    """
+    rec = rec if isinstance(rec, dict) else {}
+    mark = str(rec.get("mark") or "").strip()
+    if not mark:
+        return False, "пустая метка — в замок не пишем"
+    try:
+        with open(hold_path(root), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as exc:                            # noqa: BLE001
+        return False, ("метка %s в замок остановки НЕ ЛЕГЛА (%s): %s — следующий оборот может "
+                       "взять задание, хотя остановку никто не снимал"
+                       % (mark, HOLD_FILE, str(exc)[:160]))
     return True, ""
 
 
@@ -606,7 +698,7 @@ class Queue(recon_auto_run.Queue):
 
 def build(root=HERE, queue=None, clock=None, reader=None, node=None,
           budget=shtab_box.DAILY_BUDGET, ledger=None, lister=None, doc_reader=None,
-          prefix=None, read_max=shtab_box.READ_MAX, taken_reader=None):
+          prefix=None, read_max=shtab_box.READ_MAX, taken_reader=None, hold_reader=None):
     """Всё, что нужно для решения: ящик + очередь + маркеры. → dict.
 
     Ничего не ставит и никуда не пишет — этой же функцией живут ``--status`` и
@@ -662,6 +754,13 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
            # не посчитана, потому что до неё не дошло · посчитана и говорит «не знаю».
            "signals": [], "signals_asked": False, "signals_why": "", "released": [],
            "judged_ok": False, "judged_why": "", "stop": "",
+           # ЗАМОК ОСТАНОВКИ: своё поле, свой признак чтения, своя причина — по
+           # той же причине, что и у долгой памяти строкой ниже. «Замка нет» и
+           # «замок не прочитан» ведут ящик в разные стороны, и различать их
+           # обязано отдельное поле, а не длина списка.
+           "hold": [], "hold_ok": False, "hold_n": 0,
+           "hold_why": "замок остановки не читали — оборот кончился раньше",
+           "arm": [], "free": [],
            # ДОЛГАЯ ПАМЯТЬ: своё поле, свой признак чтения, своя причина. Значения
            # по умолчанию описывают путь, на котором до неё не дошли (выключенный
            # ящик) — «не читали» и «прочитана и пуста» здесь не одно и то же.
@@ -680,9 +779,29 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
     out["known"], out["known_ok"], out["known_why"] = known, bool(known_ok), str(known_why or "")
     out["known_n"] = len(known)
 
+    # ЗАМОК ЧИТАЕТСЯ ТРЕТЬИМ, РЯДОМ С ПАМЯТЬЮ И ПО ТОЙ ЖЕ ПРИЧИНЕ: он стои́т
+    # ДИСКА, а не моста, и его отказ обязан быть виден даже тогда, когда мост
+    # молчит. Больше того — именно при молчащем мосте замок и говорит: живого
+    # корпуса нет, а остановка, объявленная вчера, никуда не делась.
+    hold_recs, hold_ok, hold_why = (hold_reader or read_hold)(root)
+    out["hold"], out["hold_ok"], out["hold_why"] = hold_recs, bool(hold_ok), str(hold_why or "")
+    out["hold_n"] = len(hold_recs)
+
     files, folder_ok, folder_why = read_folder(out["prefix"], lister=lister)
     out["folder_ok"], out["folder_why"], out["files"] = folder_ok, folder_why, len(files)
     if not folder_ok:
+        # ЗАМОК ГОВОРИТ И ЗДЕСЬ — ИМЕННО ЗДЕСЬ ОН И НУЖЕН БОЛЬШЕ ВСЕГО. Мост не
+        # ответил, живых сигналов нет ни одного, ящик и так не берёт ничего; но
+        # витрина и `--status` читают `stop`, и пустая строка на запертом ящике
+        # читалась бы как «остановки нет». Снятия берутся ТОЛЬКО запомненные:
+        # шапку в этот оборот не читали, а выдумывать снятие нельзя.
+        out["signals"], out["arm"], out["free"] = sig.merge_held(
+            [], held=out["hold"], released=sig.hold_release(out["hold"], ()), now=stamp)
+        out["stop"] = sig.stop_words(out["signals"], node=out["node"], checked=False,
+                                     why="шапку узла в этот оборот не читали — %s"
+                                         % (folder_why or "папка заданий не перечислена"))
+        out["signals_why"] = out["stop"] or ("живые сигналы не считались — папка заданий не "
+                                             "перечислена")
         return out
 
     docs, bad = shtab_box.parse_folder(files, prefix=out["prefix"])
@@ -735,10 +854,17 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
     # НЕПРОЧИТАННАЯ ПАМЯТЬ РАВНА НЕПРОЧИТАННЫМ ЗАКРЫТЫМ РЯДАМ: и то и другое —
     # «какие ключи уже брали, НЕИЗВЕСТНО», и оба ведут к одному поступку.
     known_ok, known_why = out["known_ok"], out["known_why"]
-    out["marks_ok"] = bool(ok and closed_ok and known_ok)
+    # НЕПРОЧИТАННЫЙ ЗАМОК РАВЕН НЕПРОЧИТАННЫМ РЯДАМ И НЕПРОЧИТАННОЙ ПАМЯТИ, и
+    # присоединяется к ним ТЕМ ЖЕ признаком, а не пятым сигналом: вопрос у всех
+    # трёх один — «брать ли на незнании», и ответ один — «нет». Заводить под это
+    # отдельного сторожа значило бы завести второе мнение о том же.
+    out["marks_ok"] = bool(ok and closed_ok and known_ok and out["hold_ok"])
     out["marks_why"] = closed_why
-    if not known_ok:
-        out["marks_why"] = "%s · %s" % (closed_why, known_why) if closed_why else known_why
+    for extra_ok, extra_why in ((known_ok, known_why), (out["hold_ok"], out["hold_why"])):
+        if extra_ok:
+            continue
+        out["marks_why"] = ("%s · %s" % (out["marks_why"], extra_why) if out["marks_why"]
+                            else extra_why)
     if ok:
         all_rows = list(live_rows) + list(closed_rows)
         out["rows"] = len(all_rows)
@@ -810,30 +936,43 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
         doc["lane_read"] = shtab_box.read_lane(doc["body"])
 
     # ── СИГНАЛЬНАЯ ОСТАНОВКА ──────────────────────────────────────────────────
-    # СЧИТАЕТСЯ РОВНО ТОГДА, КОГДА СПРАШИВАЛИ ЗАКРЫТЫЕ РЯДЫ, и это не экономия
-    # ради экономии, а тот же третий исход, что у маркеров суток. Не дошли до
-    # дорогого чтения `done` — значит либо очередь не прочитана, либо в ней
-    # работа владельца, либо принятых блоков нет вовсе; во всех трёх случаях
-    # ящик и так не возьмёт ничего, а рапорт «сигналы говорят НЕ ЗНАЮ» повесил
-    # бы на них чужую вину и приучил владельца не верить остановке.
+    # ЖИВОЙ СЧЁТ СИГНАЛОВ идёт РОВНО ТОГДА, КОГДА СПРАШИВАЛИ ЗАКРЫТЫЕ РЯДЫ, и это
+    # не экономия ради экономии, а тот же третий исход, что у маркеров суток. Не
+    # дошли до дорогого чтения `done` — значит либо очередь не прочитана, либо в
+    # ней работа владельца, либо принятых блоков нет вовсе; во всех трёх случаях
+    # ящик и так не возьмёт ничего, а рапорт «сигналы говорят НЕ ЗНАЮ» повесил бы
+    # на них чужую вину и приучил владельца не верить остановке.
     #
-    # ДЫРЫ ЗДЕСЬ НЕТ, и это проверяемо: единственная ветка, которая СТАВИТ ряд,
-    # требует `queue_ok` и живого кандидата — то есть ровно тех условий, при
-    # которых `marks_asked` истинно. Сигналы не могут промолчать над задачей,
-    # которую взяли.
+    # ЗАМОК ЖЕ ПРИМЕНЯЕТСЯ БЕЗУСЛОВНО, И ЭТО ГЛАВНАЯ ПРАВКА 05.09.2026. Прежде
+    # запрет брать был чистой функцией от корпуса, читаемого мостом КАЖДЫЙ виток,
+    # а объявление владельцу обещало ЗАМОК («снимается ТОЛЬКО словом владельца»).
+    # Корпус этот не вечен — номера очереди идут по кругу, ряды пропадают, — и
+    # 05.09 остановка `e0140bfc78dc` исчезала МОЛЧА дважды, а ящик взял между
+    # объявлениями шесть заданий, ничего не спросив. Числа, доказательство и
+    # доктрина «что запирается, а что нет» — в шапке :mod:`shtab_box_signals`.
+    #
+    # ОДНО РЕШЕНИЕ В ОДНОМ МЕСТЕ: `out["signals"]` — единственный список, из
+    # которого дальше берутся И фраза владельцу (`stop_words` → журнал, витрина,
+    # карточка), И запрет брать (`shtab_box.select(stop_words=...)`). Второго
+    # мнения о том, стои́т ли остановка, у полосы нет ни одной ветки.
+    live_signals, judged = [], None
     if not out["marks_asked"]:
-        out["signals_why"] = ("сигналы не считались — до них не дошло (%s)"
+        out["signals_why"] = ("живые сигналы не считались — до них не дошло (%s)"
                               % (closed_why or "дорогое чтение done не понадобилось"))
     else:
         out["signals_asked"] = True
         judged, judged_ok, judged_why = (ledger or read_ledger)(root)
         out["judged_ok"], out["judged_why"] = judged_ok, judged_why
-        # МЕТКИ СНЯТИЯ ЖИВУТ В ШАПКЕ, а шапка с 03.09 читается отдельно и может не
-        # прочитаться. Нечитаемая шапка → меток НЕТ → снятый владельцем сигнал
-        # остаётся СТОЯТЬ. Направление отказа названо вслух: оно строже, а не
-        # слабее, и потому не требует третьего исхода — «не знаю, снят ли сигнал»
-        # и «сигнал не снят» ведут ящик к одному и тому же поступку.
-        out["released"] = sorted(sig.release_marks(text)) if node_ok else []
+    # МЕТКИ СНЯТИЯ ЖИВУТ В ШАПКЕ, а шапка с 03.09 читается отдельно и может не
+    # прочитаться. Прежде нечитаемая шапка означала «меток снятия НЕТ», и это
+    # звалось строгостью — но строгость эта била по ЧЕЛОВЕКУ: ящик снова просил
+    # положить метку, которую владелец уже положил, и отличить «мост молчит» от
+    # «владелец не ответил» было нечем. Слово владельца из узла не исчезает,
+    # поэтому однажды увиденное снятие ПОМНИТСЯ (:func:`shtab_box_signals.hold_release`),
+    # и молчание моста больше не отменяет решения человека.
+    out["released"] = sorted(sig.release_marks(text)) if node_ok else []
+    gone = sig.hold_release(out["hold"], out["released"])
+    if out["marks_asked"]:
         # ОСТАТОК ДНЯ ДЛЯ СИГНАЛА Г — МЕНЬШИЙ ИЗ ДВУХ, и выбор назван вслух, потому
         # что при раздельных потолках «остаток» перестал быть одним числом. Сигнал Г
         # ПОКАЗЫВАЕТ, а не держит (`enforced=False`), и первая новость показа —
@@ -846,18 +985,27 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
         left = min(shtab_box.budget_left(out["lane_marks"].get(ln, ()), today, budget,
                                          out["marks_ok"])
                    for ln in shtab_box.LANES)
-        out["signals"] = sig.evaluate(
+        live_signals = sig.evaluate(
             # ЗАКРЫТЫЕ РЯДЫ — ОБЕИХ ПОЛОС: `box_rows` отбирает по МАРКЕРУ ящика, то
             # есть видит только собственные задания. Провалившееся задание ящика не
             # перестаёт быть его провалом оттого, что исполнялось на сервере, — и
             # сигналы А/Б обязаны его сосчитать. Сегодня это ничего не меняет (рядов
             # ящика на чужой полосе ноль), а завтра закрывает дыру.
             closed=sig.box_rows(closed_rows), open_rows=live_pc, judged=judged,
-            day=today, left=left, budget=budget, released=out["released"],
+            day=today, left=left, budget=budget, released=gone,
             rows_ok=bool(closed_ok), open_ok=bool(ok), judged_ok=bool(judged_ok),
             marks_ok=bool(out["marks_ok"]))
-        out["stop"] = sig.stop_words(out["signals"], node=out["node"])
+    out["signals"], out["arm"], out["free"] = sig.merge_held(
+        live_signals, held=out["hold"], released=gone, now=stamp)
+    out["stop"] = sig.stop_words(out["signals"], node=out["node"], checked=bool(node_ok),
+                                 why=out["node_why"])
+    if out["signals_asked"]:
         out["signals_why"] = out["stop"] or "все сигналы молчат"
+    elif out["stop"]:
+        # ЗАМОК ГОВОРИТ ДАЖЕ ТАМ, ГДЕ ЖИВОЙ СЧЁТ НЕ ЗАХОДИЛ, и молчать ему нельзя:
+        # витрина и `--status` читают эту строку, а «сигналы не считались» на
+        # запертом ящике — правда, читающаяся как «остановки нет».
+        out["signals_why"] = out["stop"]
     out["queue"] = q
     return out
 
@@ -869,7 +1017,7 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
          budget=shtab_box.DAILY_BUDGET, write_journal=False, clock=None, queue=None,
          journal_fn=None, reader=None, node=None, ledger=None, lister=None,
          doc_reader=None, prefix=None, read_max=shtab_box.READ_MAX,
-         taken_reader=None, remember_fn=None):
+         taken_reader=None, remember_fn=None, hold_reader=None, hold_writer=None):
     """Один оборот ящика. → dict отчёта.
 
     ``place=False`` — сухой ход: папка перечислена, документы разобраны, тела
@@ -891,7 +1039,7 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
     """
     data = build(root, queue=queue, clock=clock, reader=reader, node=node, budget=budget,
                  ledger=ledger, lister=lister, doc_reader=doc_reader, prefix=prefix,
-                 read_max=read_max, taken_reader=taken_reader)
+                 read_max=read_max, taken_reader=taken_reader, hold_reader=hold_reader)
     today = data["today"]
     report = {"acted": False, "why": "", "today": today, "stamp": data["stamp"],
               "node": data["node"], "docs": len(data["docs"]), "bad": data["bad"],
@@ -905,7 +1053,12 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
               "stop": data["stop"], "signals": data["signals"],
               "signals_asked": data["signals_asked"],
               "stop_marks": sig.marks(data["signals"]),
-              "signal_journal": sig.journal_line(data["signals"], today),
+              # ТЕ ЖЕ СЛОВА, ЧТО УВИДИТ ВЛАДЕЛЕЦ: признак «шапку прочитали»
+              # едет и сюда, иначе журнал просил бы метку там, где фраза
+              # остановки честно говорит «проверить не удалось».
+              "signal_journal": sig.journal_line(data["signals"], today, node=data["node"],
+                                                 checked=bool(data["node_ok"]),
+                                                 why=data["node_why"]),
               # ПРИЁМКА ВИДНА В ОТЧЁТЕ ВСЕГДА, включая исход ПРИНЯТО: приёмка,
               # молчащая при успехе, неотличима от приёмки, которая не работала.
               "accepted": list(data.get("accepted") or ()),
@@ -920,7 +1073,13 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
               # правка со своим замером. Пока карточка живёт в отчёте и в `--status`,
               # где её видит человек, открывший ящик.
               "cards": [str(n.get("card")) for n in (data.get("accepted") or ())
-                        if n.get("card")]}
+                        if n.get("card")],
+              # ЗАМОК ВИДЕН В ОТЧЁТЕ ОБЕИМИ ПОЛОВИНАМИ: что заперли этим оборотом
+              # и что отпустили словом владельца. Молча запертая остановка так же
+              # плоха, как молча пропавшая, — по ней нельзя проверить, что замок
+              # вообще работает.
+              "armed": [], "freed": [], "hold_n": data["hold_n"],
+              "hold_ok": data["hold_ok"], "hold_why": data["hold_why"]}
 
     if data["off"]:
         report["why"] = data["off_why"]
@@ -955,6 +1114,21 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
     # шапке иначе выглядел бы для Штаба положенным заданием, которое «не берут».
     if data["old_door"]:
         report["held"].append(("", data["old_door"]))
+
+    # ── ЗАМОК НА ДИСК ─────────────────────────────────────────────────────────
+    # ДО ПОСТАНОВКИ РЯДА, а не после: остановка, которую заперли бы после
+    # placement, потерялась бы ровно на том обороте, где процесс упал между
+    # двумя действиями. Сухой ход (`place=False`) не пишет НИЧЕГО — `--status` и
+    # `--dry` обязаны оставаться чтением, иначе разведка меняла бы предмет.
+    if place:
+        for rec in (data.get("arm") or ()):
+            ok_w, why_w = (hold_writer or write_hold)(root, rec)
+            (report["armed"] if ok_w else report["memory"]).append(
+                rec.get("mark") if ok_w else (str(rec.get("mark") or ""), why_w))
+        for mark in (data.get("free") or ()):
+            ok_w, why_w = (hold_writer or write_hold)(root, sig.hold_free(mark, now=data["stamp"]))
+            (report["freed"] if ok_w else report["memory"]).append(
+                mark if ok_w else (str(mark), why_w))
 
     for blk, text in take:
         report["texts"][blk["key"]] = text
@@ -1067,7 +1241,8 @@ def _why(report, data):
     # которого могло и не быть, а память читается с диска каждый оборот. Повесь мы
     # её на чужой признак — непрочитанная память молчала бы ровно в тех витках, где
     # ящик и так ничего не ставит, то есть новость терялась бы вся.
-    if not data["known_ok"] or (data["marks_asked"] and not data["marks_ok"]):
+    if (not data["known_ok"] or not data["hold_ok"]
+            or (data["marks_asked"] and not data["marks_ok"])):
         return _marks_unread(data)
     return "документов %d, взято 0, отложено %d" % (len(data["docs"]), len(report["held"]))
 
@@ -1079,6 +1254,12 @@ def _marks_unread(data):
     себе, вторая рядом с фразой остановки), а два её экземпляра разъехались бы
     молча — тот же класс, которым живёт весь этот куст.
     """
+    if not data.get("hold_ok", True):
+        # ЗАМОК ГОВОРИТ ПЕРВЫМ: «не знаю, какие ключи брали» — про дубль, а «не
+        # знаю, стои́т ли остановка» — про обход решения владельца, и второе
+        # дороже. Слова разные потому, что идут за ними в разные места.
+        return ("замок сигнальной остановки не прочитан (%s) — стои́т ли остановка, НЕИЗВЕСТНО; "
+                "день считаем исчерпанным и не берём ничего" % data.get("hold_why", "?"))
     if not data.get("known_ok", True):
         return ("долгая память ящика не прочитана (%s) — какие ключи уже брали, НЕИЗВЕСТНО; "
                 "день считаем исчерпанным и не берём ничего" % data.get("known_why", "?"))
@@ -1197,17 +1378,28 @@ def _render(report=None, data=None):
                 lines.append("  ⚠ %s" % note["card"])
         # ВСЕ ЧЕТЫРЕ СИГНАЛА В ОДНОМ МЕСТЕ, включая молчащие: перечень, из которого
         # молчащие вычеркнуты, читается как «других сторожей нет».
+        # ЗАМОК — ОТДЕЛЬНАЯ СТРОКА, как и долгая память, и по той же причине: у
+        # него свой прибор (диск), свой отказ и своё число. «Запертых случаев 0»
+        # на живом ящике — это новость, а не пустое место.
+        lines.append("замок остановки: %s — записей %d%s"
+                     % (HOLD_FILE, data["hold_n"],
+                        "" if data["hold_ok"] else " · НЕ ПРОЧИТАН: %s" % data["hold_why"]))
         if not data["signals_asked"]:
             lines.append(data["signals_why"] or "сигналы: не считались")
         else:
             lines.append("сигналы (реестр вердиктов: %s%s):"
                          % ("прочитан" if data["judged_ok"] else "НЕ ПРОЧИТАН",
                             (", %s" % data["judged_why"]) if data["judged_why"] else ""))
-            for row in sig.all_words(data["signals"], data["today"]):
-                lines.append("  · %s" % row)
-            if data["released"]:
-                lines.append("  снято словом владельца: %s" % ", ".join(data["released"]))
-            lines.append("ОСТАНОВКА: %s" % (data["stop"] or "нет — ящик берёт как обычно"))
+        # ПЕРЕЧЕНЬ И СТРОКА ОСТАНОВКИ ПЕЧАТАЮТСЯ ВСЕГДА, а не только при живом
+        # счёте: запертый случай держит ящик и тогда, когда до живых сигналов
+        # оборот не дошёл, и «сигналы не считались» без него читалось бы как
+        # «остановки нет» — ровно та молчащая остановка, которую чиним.
+        for row in sig.all_words(data["signals"], data["today"]):
+            lines.append("  · %s" % row)
+        if data["released"]:
+            lines.append("  снято словом владельца (шапка этого оборота): %s"
+                         % ", ".join(data["released"]))
+        lines.append("ОСТАНОВКА: %s" % (data["stop"] or "нет — ящик берёт как обычно"))
     if report is not None:
         lines.append("исход: %s" % (report.get("why") or "—"))
         for row in report.get("placed") or []:

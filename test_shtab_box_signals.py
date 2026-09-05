@@ -47,8 +47,8 @@ import shtab_box as sb
 import shtab_box_run as run
 import shtab_box_signals as sig
 import zayavki_pc as zp
-from test_shtab_box import (FakeQueue, GOOD_BODY, HEAD_TEXT, TODAY, _box, _doc_reader,
-                            _files, _lister, _node, _reader, _ready)
+from test_shtab_box import (FakeQueue, GOOD_BODY, HEAD_TEXT, TODAY, _box, _dead_reader,
+                            _doc_reader, _files, _lister, _node, _reader, _ready)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KEY = "signal-probe-0902"
@@ -905,6 +905,221 @@ class TestWiring(unittest.TestCase):
         self.assertIn("НЕИЗВЕСТНО", rep["why"])
         self.assertIn("день считаем исчерпанным", rep["why"])
         self.assertIn("ОПРЕДЕЛИТЬ НЕЛЬЗЯ", rep["why"])
+
+
+# ═══════════════ ЗАМОК ОСТАНОВКИ (05.09.2026, живой ущерб) ════════════════════
+
+
+def _same_cause(*ids):
+    """Закрытые ряды ящика с ОДНОЙ причиной провала — корпус сигнала Б.
+
+    Форму причины набираем не от руки: код демона (`причина=<код>`) — первая
+    ступень опознания :func:`shtab_box_signals.reason_class`, и живой корпус
+    ходит именно по ней (70 упоминаний в логе демона).
+    """
+    return [_closed(i, "failed", "ошибка выполнения [причина=run_timeout · задача #%d]" % i)
+            for i in ids]
+
+
+def _proved_tail(*ids):
+    """Два доказанных `done` в хвосте — чтобы говорил РОВНО сигнал Б, а не А заодно.
+
+    Без них «две подряд недоказанные» сработали бы на тех же провалах, метки
+    стало бы две, и проверка замка мерила бы сумму двух случаев вместо одного.
+    """
+    return [_closed(i, "done") for i in ids]
+
+
+def _hold_tick(root, closed=(), node_text=None, place=True, reader=None, docs=None,
+               ledger=None, budget=50):
+    """Оборот ящика на ЗАДАННОМ корне: замок живёт на диске, и два оборота обязаны
+    смотреть в один каталог. Общий :func:`_tick` каждый раз заводит новый.
+    """
+    import datetime
+
+    lister, doc_reader = _folder(docs)
+    text = node_text if node_text is not None else HEAD_TEXT
+    return run.tick(root=root, place=place, queue=FakeQueue(rows=[], closed=list(closed)),
+                    budget=budget, reader=reader or _reader(text),
+                    lister=lister, doc_reader=doc_reader,
+                    ledger=ledger or _ledger((4, True, True), (5, True, True)),
+                    clock=lambda tz: datetime.datetime(2026, 9, 2, 12, 0, tzinfo=tz))
+
+
+class TestHold(unittest.TestCase):
+    """ЗАМОК: объявление и запрет брать — одно решение, переживающее корпус.
+
+    ПРЕДМЕТ ЗАМЕРЕН НА СВОЕЙ ПОЛОСЕ 05.09.2026, а не выдуман. Метка
+    ``e0140bfc78dc`` (сигнал Б, ряды #1, #4, #6) объявлена в 12:58:21, ПОВТОРНО
+    объявлена в 16:35:17 — той же меткой, — а между объявлениями ящик взял пять
+    заданий (14:35 · 14:50 · 15:02 · 15:22 · 15:55) и одно после (16:45). Второе
+    объявление той же метки и доказывает, что снятия не было: снятый сигнал в
+    :func:`shtab_box_signals.active` не входит и объявиться второй раз не может.
+    Причина исчезновения — корпус: номера очереди идут по кругу, ряды пропадают
+    (:func:`shtab_box.merge_known`), а запрет пересчитывался по ним каждый виток.
+    """
+
+    def setUp(self):
+        import tempfile
+
+        self.root = tempfile.mkdtemp(prefix="shtabhold_")
+        self.closed = _same_cause(1, 2, 3) + _proved_tail(4, 5)
+
+    def _arm(self):
+        """Первый оборот: сигнал Б сработал, ящик не взял ничего, замок заперт."""
+        rep = _hold_tick(self.root, closed=self.closed)
+        self.assertEqual([], rep["placed"], "остановка объявлена, а задание всё же взято")
+        self.assertIn("третий раз одна причина", rep["stop"])
+        self.assertEqual(1, len(rep["stop_marks"]), rep["stop_marks"])
+        self.assertEqual(rep["stop_marks"], rep["armed"], "остановка объявлена, но не заперта")
+        return rep["stop_marks"][0]
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ И ЕГО ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ ──────────────────────
+
+    def test_NEGATIVE_the_stop_holds_when_the_corpus_that_raised_it_vanished(self):
+        """ГЛАВНЫЙ ТЕСТ ПРАВКИ: ряды пропали — остановка осталась, взято НОЛЬ.
+
+        Это дословный повтор живого случая: корпус, на котором стои́т сигнал Б,
+        исчез (в бою — круг номеров очереди, здесь — пустые закрытые ряды), и
+        прежний код в этот момент брал следующее задание МОЛЧА.
+        """
+        mark = self._arm()
+        rep = _hold_tick(self.root, closed=[])
+        self.assertEqual([], rep["placed"], "корпус пропал — и ящик снова берёт задания")
+        self.assertIn(mark, rep["stop_marks"])
+        self.assertIn("ДЕРЖИТСЯ ЗАМКОМ", rep["stop"])
+        self.assertIn("снятия словом владельца не было", rep["stop"])
+        self.assertEqual([], rep["armed"], "запертое запирается второй раз")
+
+    def test_POSITIVE_the_very_same_second_tick_TAKES_when_nothing_was_latched(self):
+        """Контроль: без замка тот же оборот БЕРЁТ — значит меряем замок, а не «ничего».
+
+        Правило «никогда ничего не брать» прошло бы отрицательный тест идеально и
+        стои́т ноль; пара обязательна.
+        """
+        import tempfile
+
+        rep = _hold_tick(tempfile.mkdtemp(prefix="shtabhold_clean_"), closed=[])
+        self.assertEqual(1, len(rep["placed"]), rep["why"])
+        self.assertEqual("", rep["stop"])
+
+    def test_the_owners_word_frees_it_and_the_box_goes_on(self):
+        """Замок не вечен: слово владельца снимает случай, и ящик идёт дальше."""
+        mark = self._arm()
+        rep = _hold_tick(self.root, closed=[],
+                         node_text=HEAD_TEXT + "\n" + (sig.RELEASE_FORM % mark))
+        self.assertEqual([mark], rep["freed"])
+        self.assertEqual(1, len(rep["placed"]), rep["why"])
+        self.assertEqual("", rep["stop"])
+
+    # ── ТРЕТИЙ ИСХОД: МОСТ МОЛЧИТ ────────────────────────────────────────────
+
+    def test_a_remembered_release_survives_an_unreadable_node(self):
+        """Владелец снял, шапка не читается — решение человека остаётся в силе.
+
+        Прежде метки снятия жили ТОЛЬКО в шапке: не прочитали шапку → «меток
+        нет» → снятая остановка возвращалась. Слово владельца из узла не
+        исчезает, значит однажды увиденное снятие остаётся увиденным.
+        """
+        mark = self._arm()
+        _hold_tick(self.root, closed=[], node_text=HEAD_TEXT + "\n" + (sig.RELEASE_FORM % mark))
+        rep = _hold_tick(self.root, closed=[], reader=_dead_reader("мост не отдал узел"))
+        self.assertEqual("", rep["stop"], "нечитаемая шапка вернула снятую остановку")
+        self.assertNotIn(mark, rep["stop_marks"])
+
+    def test_an_unreadable_node_says_UNKNOWN_and_asks_for_NO_mark(self):
+        """Прямая проверка гипотезы задания: «мост молчит» ≠ «владелец не ответил».
+
+        Ящик держится по-прежнему («не знаю» значит «стоп»), но просьбы положить
+        метку — ту, которую владелец мог положить час назад, — больше нет.
+        """
+        self._arm()
+        rep = _hold_tick(self.root, closed=self.closed,
+                         reader=_dead_reader("мост не отдал узел"))
+        self.assertEqual([], rep["placed"])
+        self.assertIn("ПРОВЕРИТЬ НЕ УДАЛОСЬ", rep["stop"])
+        self.assertIn("НЕИЗВЕСТНО", rep["stop"])
+        self.assertNotIn("положите в узел", rep["stop"])
+        self.assertIn("класть\nзаново НЕ НУЖНО".replace("\n", " "), rep["stop"])
+        self.assertIn("ПРОВЕРИТЬ НЕ УДАЛОСЬ", rep["signal_journal"],
+                      "журнал и владелец получили РАЗНЫЕ слова об одном случае")
+
+    def test_an_undeterminate_stop_is_NOT_latched(self):
+        """Остановка «не знаю» в замок не идёт — иначе моргание моста звало бы человека.
+
+        Мост на этой полосе моргает измеримо: 05.09 — 08:18:32 «закрытые ряды не
+        прочитаны» и 16:24:53 «очередь недоступна, предел ожидания 90с». Виток
+        такая остановка держит целиком, но пережить его не смеет.
+        """
+        rep = run.tick(root=self.root, place=True,
+                       queue=FakeQueue(rows=[], closed=[], closed_ok=False), budget=50,
+                       reader=_reader(HEAD_TEXT), lister=_folder()[0],
+                       doc_reader=_folder()[1], ledger=lambda root: ({}, True, ""),
+                       clock=lambda tz: __import__("datetime").datetime(2026, 9, 2, 12, 0,
+                                                                        tzinfo=tz))
+        self.assertEqual([], rep["placed"])
+        self.assertIn("ОПРЕДЕЛИТЬ НЕЛЬЗЯ", rep["stop"])
+        self.assertEqual([], rep["armed"], "неопределимая остановка заперта навсегда")
+        self.assertFalse(os.path.exists(run.hold_path(self.root)))
+
+    # ── ЧТЕНИЕ ЗАМКА: ТРИ ИСХОДА, КАК У ВСЕХ ПРИБОРОВ ПОЛОСЫ ─────────────────
+
+    def test_an_unreadable_latch_is_not_an_empty_latch(self):
+        """Битая строка → «стои́т ли остановка, НЕИЗВЕСТНО» → не берём ничего."""
+        with io.open(run.hold_path(self.root), "w", encoding="utf-8") as fh:
+            fh.write("{это не json\n")
+        rows, ok, why = run.read_hold(self.root)
+        self.assertFalse(ok)
+        self.assertEqual([], rows)
+        self.assertIn("НЕИЗВЕСТНО", why)
+        rep = _hold_tick(self.root, closed=[])
+        self.assertEqual([], rep["placed"])
+        self.assertIn("замок сигнальной остановки не прочитан", rep["why"])
+
+    def test_a_missing_latch_file_is_an_honest_zero(self):
+        rows, ok, why = run.read_hold(self.root)
+        self.assertTrue(ok)
+        self.assertEqual([], rows)
+        self.assertIn("не заводился", why)
+
+    def test_a_failed_latch_write_is_AUDIBLE_and_names_the_consequence(self):
+        """Молчащий отказ записи неотличим от работающего замка — до взятия."""
+        rep = _hold_tick(self.root, closed=self.closed)
+        self.assertTrue(rep["armed"])
+        broken = _hold_tick(self.root, closed=self.closed,
+                            node_text=HEAD_TEXT)   # тот же случай, замок уже стои́т
+        self.assertEqual([], broken["armed"])
+        ok, why = run.write_hold(self.root, {"mark": ""})
+        self.assertFalse(ok)
+        self.assertIn("пустая метка", why)
+
+    # ── ЧИСТЫЙ СЛОЙ ─────────────────────────────────────────────────────────
+
+    def test_only_the_owners_word_and_only_a_determinate_signal_is_latchable(self):
+        """Г показывает, В снимается сам, «не знаю» уходит с прибором."""
+        four = sig.evaluate(closed=[], open_rows=[_card(9)], judged={}, day=TODAY,
+                            left=0, budget=3, rows_ok=True, open_ok=True,
+                            judged_ok=True, marks_ok=True)
+        for one in four:
+            if one["sig"] in (sig.SIG_C, sig.SIG_D):
+                self.assertFalse(sig.holdable(one), one["sig"])
+        blind = sig.signal_b([], TODAY, rows_ok=False)
+        self.assertTrue(blind["on"])
+        self.assertFalse(sig.holdable(blind), "«не знаю» просится в замок")
+
+    def test_the_latch_index_takes_the_LATER_line(self):
+        """Снятие ложится отдельной строкой поверх постановки; слова случая остаются."""
+        idx = sig.hold_index([{"mark": "aa11", "sig": "Б", "why": "случай", "at": "T1"},
+                              {"mark": "aa11", "released": True, "at": "T2"}])
+        self.assertTrue(idx["aa11"]["released"])
+        self.assertEqual("случай", idx["aa11"]["why"])
+        self.assertEqual({"aa11"}, sig.hold_release([{"mark": "aa11", "released": True}], ()))
+
+    def test_the_release_door_is_ONE_and_takes_both_sources(self):
+        """Метки шапки и метки памяти сливаются в одном месте — два разошлись бы молча."""
+        got = sig.hold_release([{"mark": "old1", "released": True},
+                                {"mark": "old2", "released": False}], ("new1",))
+        self.assertEqual({"old1", "new1"}, got)
 
 
 if __name__ == "__main__":            # pragma: no cover
