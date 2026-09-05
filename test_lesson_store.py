@@ -568,12 +568,24 @@ class TestCapacityNeverLoses(_Base):
 
 
 class TestBotNotWired(unittest.TestCase):
-    """ГРАНИЦА ШАГА: хранилище построено, бот к нему не подключён. Проверяем импортами."""
+    """ГРАНИЦА ШАГА, ПОДВИНУТАЯ 05.09.2026 и названная числом файлов, а не словом.
 
-    def test_no_bot_module_imports_the_store(self):
+    До 05.09 к хранилищу не был подключён НИКТО, и тест это и проверял. Теперь подключён РОВНО
+    ОДИН файл — `trainer.py` (путь записи урока кандидатом: кнопка «🎓 Обучить» и команда «урок:»);
+    остальные шесть по-прежнему не ходят сюда ни одной веткой. Список подключённых заперт
+    ПОИМЁННО, а не ослаблен до «кто-нибудь может»: расширение круга должно требовать правки
+    ЭТОГО списка и объяснения, а не проходить молча вместе с чужим импортом.
+
+    `suggest.py` в запрещённых особо: он собирает КЛИЕНТСКИЙ ответ, и импорт хранилища оттуда
+    означал бы, что кандидат (урок, по которому владелец ещё не назвал причину) начал влиять на
+    то, что читает клиент. Ровно этого разделения затея и добивается."""
+
+    WIRED = ("trainer.py",)
+
+    def test_only_the_named_module_imports_the_store(self):
         watched = ("trainer.py", "trainer_run.py", "moderation_bot.py", "moderation_core.py",
                    "userbot_listen.py", "lesson_router.py", "suggest.py")
-        offenders = []
+        wired = []
         for name in watched:
             path = os.path.join(HERE, name)
             if not os.path.isfile(path):
@@ -581,9 +593,10 @@ class TestBotNotWired(unittest.TestCase):
             with open(path, encoding="utf-8") as f:
                 src = f.read()
             if re.search(r"^\s*(import|from)\s+lesson_store\b", src, re.M):
-                offenders.append(name)
-        self.assertEqual(offenders, [], "бот подключён к хранилищу, а шаг этого не предусматривал: "
-                                        "%s" % offenders)
+                wired.append(name)
+        self.assertEqual(sorted(wired), sorted(self.WIRED),
+                         "круг файлов, ходящих в хранилище, разошёлся с объявленным: было %s, "
+                         "стало %s" % (sorted(self.WIRED), sorted(wired)))
 
     def test_store_file_is_outside_git(self):
         """Файл таблицы не под git: `git checkout HEAD --` молча откатил бы накопленные уроки."""

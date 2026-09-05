@@ -56,6 +56,14 @@ K_HYP_SEL = "trainer_hyp_sel"
 # снимает тот, кто первым увидел сообщение (userbot видит в группе ВСЁ, поэтому он и ловит).
 K_PENDING = "trainer_pending_lesson"
 PENDING_TTL_SEC = int(os.getenv("TRAINER_PENDING_TTL_SEC", "600") or "600")   # 10 минут
+# АВТОР ОДНОГО СЛЕДУЮЩЕГО УРОКА (05.09.2026). Кандидат обязан нести имя того, кто его записал, а
+# путь «✍ другое → свободный текст» разорван по процессам: имя видит userbot в `take_pending_lesson`,
+# а урок применяет `apply_lesson` СЛЕДУЮЩЕЙ строкой — уже без имени. Ключ несёт «<unix_ts>|<username>»
+# и живёт ОДИН раз: `take_actor` его читает и тут же гасит. Одноразовость и короткий TTL — не
+# украшение: липкое имя однажды подписало бы чужой урок именем прошлого учителя, а это ровно та
+# ложь, ради устранения которой автор и заводится.
+K_ACTOR = "trainer_lesson_actor"
+ACTOR_TTL_SEC = int(os.getenv("TRAINER_ACTOR_TTL_SEC", "900") or "900")       # 15 минут
 # Монотонный токен «состояние диалога менялось»: каждый клиентский турн и сброс инкрементят его.
 # Дебаунс-ответ, запланированный на токене S, исполняется, только если токен всё ещё S (иначе —
 # пришёл более свежий турн / был сброс → устаревший ответ не постим). Кросс-процессный (в meta):
@@ -782,7 +790,7 @@ def selected_hypotheses(get=None):
 
 
 def apply_lessons(remarks, append_rule=None, classify=None, mark=None, list_rules=None,
-                  regress=None):
+                  regress=None, who=None, get=None, set=None):
     """Применить НЕСКОЛЬКО уроков разом: каждый — ОТДЕЛЬНЫМ правилом со своим номером.
     → dict(accepted=[(n, rule), …], duplicates=[…], code=[…], errors=[…], card='<одно сообщение>').
     Пустой список → карточка-предупреждение (нечего применять). Инъекции — как в apply_lesson."""
@@ -792,32 +800,43 @@ def apply_lessons(remarks, append_rule=None, classify=None, mark=None, list_rule
         return {"accepted": [], "duplicates": [], "code": [], "errors": [],
                 "card": "⚠️ Ничего не отмечено — тапни номера гипотез и нажми «✔ Применить»."}
     accepted, duplicates, code, errors = [], [], [], []
+    # АВТОР РЕШАЕТСЯ ОДИН РАЗ НА НАЖАТИЕ, а не на урок. Запись автора ОДНОРАЗОВАЯ (`take_actor`),
+    # и если бы её забирал каждый `apply_lesson`, то при двух отмеченных гипотезах второй урок
+    # остался бы без автора — то есть одно нажатие дало бы два разных исхода. Одно нажатие —
+    # один автор у всех отмеченных.
+    author = (who or "").strip() or (take_actor(get=get, set=set) if append_rule is None else "") or ""
     # ИСХОД ЗАЯВКИ ПО КАЖДОМУ КОД-УРОКУ. Раньше сводка печатала только сам текст
     # замечания — «дальше несите руками». Теперь у каждого свой исход (встала
     # заявка / не встала и почему), и владелец видит его в ТОЙ ЖЕ карточке.
     code_decs = {}
+    cand_n = {}
     for r in items:
         dec = apply_lesson(r, append_rule=append_rule, classify=classify, mark=mark,
-                           list_rules=list_rules, regress=regress)
+                           list_rules=list_rules, regress=regress, who=author or None, get=get)
         if dec.get("axis") == "code":
             code.append(r)
             code_decs[r] = dec
-        elif dec.get("status") == "added":
+        elif dec.get("status") in ("added", STATUS_CANDIDATE):
             accepted.append(r)
+            if dec.get("n") is not None:
+                cand_n[_norm_rule(r)] = dec.get("n")
         elif dec.get("status") == "duplicate":
             duplicates.append(r)
         else:
             errors.append(r)
-    # номера правил — из книги ПОСЛЕ записи (та же нумерация, что /rules и «отмени урок N»)
-    numbers = {}
-    try:
-        if list_rules is None:
-            import suggest
-            list_rules = suggest.list_playbook_rules
-        for row in list_rules() or []:
-            numbers[_norm_rule(row.get("rule"))] = row.get("n")
-    except Exception:
-        numbers = {}
+            code_decs[r] = dec               # причина отказа словами — в ту же карточку
+    # номера уроков: у боевого пути — номера КАНДИДАТОВ из базы уроков; у старого синка (книга) —
+    # из книги ПОСЛЕ записи (та же нумерация, что /rules и «отмени урок N»).
+    numbers = dict(cand_n)
+    if append_rule is not None or list_rules is not None:
+        try:
+            if list_rules is None:
+                import suggest
+                list_rules = suggest.list_playbook_rules
+            for row in list_rules() or []:
+                numbers[_norm_rule(row.get("rule"))] = row.get("n")
+        except Exception:
+            numbers = dict(cand_n)
 
     def _num(r):
         n = numbers.get(_norm_rule(r))
@@ -825,8 +844,15 @@ def apply_lessons(remarks, append_rule=None, classify=None, mark=None, list_rule
 
     lines = []
     if accepted:
-        lines.append(f"✅ Принято уроков: {len(accepted)} (источник «{TRAINER_SOURCE}», применятся "
-                     "со следующего ответа):")
+        if append_rule is None:
+            # БОЕВОЙ путь: это КАНДИДАТЫ. Говорим это прямо — «применятся со следующего ответа»
+            # было бы враньём: по кандидату бот не отвечает никому, пока не названа причина.
+            lines.append(f"✅ Записано кандидатов: {len(accepted)} (автор @{author}). Бот по ним "
+                         "ПОКА НЕ отвечает: чтобы урок начал действовать, назови «почему» — "
+                         "причина не подставляется:")
+        else:
+            lines.append(f"✅ Принято уроков: {len(accepted)} (источник «{TRAINER_SOURCE}», применятся "
+                         "со следующего ответа):")
         lines += [_num(r) + r for r in accepted]
     if duplicates:
         lines.append("↩️ Уже было в книге правил (не задваиваем):")
@@ -841,7 +867,12 @@ def apply_lessons(remarks, append_rule=None, classify=None, mark=None, list_rule
             lines.append("• %s %s" % (r, tail))
     if errors:
         lines.append("⚠️ Не удалось записать:")
-        lines += ["• " + r for r in errors]
+        # Причина отказа — В ТОЙ ЖЕ строке. «Не удалось» без причины не чинится ничем: отказ прав,
+        # отсутствие автора и отсутствие пары клиент/бот лечатся тремя разными действиями.
+        for r in errors:
+            dec = code_decs.get(r) or {}
+            why = (dec.get("card") or "").strip().splitlines()
+            lines.append("• %s%s" % (r, (" → " + why[0]) if why else ""))
     return {"accepted": [(numbers.get(_norm_rule(r)), r) for r in accepted],
             "duplicates": duplicates, "code": code, "errors": errors,
             "card": "\n".join(lines)}
@@ -891,7 +922,47 @@ def take_pending_lesson(username, now=None, get=None, set=None):
     if who and (username or "").lstrip("@").lower() != who.lower():
         return False
     clear_pending_lesson(set)
+    # Имя забравшего кладём на ОДИН следующий урок: применение приедет отдельным вызовом и без
+    # username (userbot зовёт `apply_lesson(text)`), а кандидату автор обязателен.
+    set_actor(username or who, now=now, set=set)
     return True
+
+
+# --- автор одного следующего урока (кросс-процессный, одноразовый) ------------
+
+def set_actor(username, now=None, set=None):
+    """Запомнить, КТО пишет следующий урок. → метка времени (int). Перезапись затирает прежнего:
+    последний назвавшийся и есть автор ближайшего урока."""
+    import time as _t
+    ts = int(now if now is not None else _t.time())
+    (set or _default_set)(K_ACTOR, f"{ts}|{(username or '').lstrip('@')}")
+    return ts
+
+
+def peek_actor(now=None, get=None):
+    """Автор следующего урока, НЕ гася запись → username или None (нет записи / пусто / истёк TTL).
+    Пустое имя даёт None: «есть запись без имени» и «есть автор» — разные вещи."""
+    import time as _t
+    raw = (get or _default_get)(K_ACTOR) or ""
+    if "|" not in raw:
+        return None
+    ts, _, user = raw.partition("|")
+    ts = _to_int(ts)
+    if ts is None or not user.strip():
+        return None
+    now = int(now if now is not None else _t.time())
+    return user if (now - ts) <= ACTOR_TTL_SEC else None
+
+
+def take_actor(now=None, get=None, set=None):
+    """Забрать автора ОДИН раз: читает и гасит запись. → username или None.
+    Гасим ВСЕГДА, даже если TTL уже истёк: протухшее имя не должно ждать следующего урока."""
+    get = get or _default_get
+    set = set or _default_set
+    who = peek_actor(now, get)
+    if (get(K_ACTOR) or ""):
+        set(K_ACTOR, "")
+    return who
 
 
 def set_transcript(transcript, incoming=None, set=None):
@@ -1312,8 +1383,92 @@ def _regress_call(regress, rule, n):
         return {"spawned": False, "why": "%s: %s" % (type(e).__name__, e)}
 
 
+# ============ УРОК ВЛАДЕЛЬЦА → КАНДИДАТ В БАЗЕ УРОКОВ (05.09.2026) ==========================
+# ЧТО ПОМЕНЯЛОСЬ И ЗАЧЕМ. Кнопка «🎓 Обучить» и команда «урок:» писали строку текста в ПЛОСКУЮ
+# книгу (`suggest.append_playbook_rule` → manager-bot/docs/playbook.md). У такой записи нет ни
+# автора, ни времени, ни причины, ни номера в базе — откатить её можно только вырезав строку, а
+# ответить «кто и почему это записал» нечем вовсе. Теперь урок ложится КАНДИДАТОМ в `lesson_store`
+# со всеми пятью полями (вопрос клиента, ответ бота, как правильно, кто записал, когда), а плоская
+# книга кнопкой НЕ ПИШЕТСЯ ни байтом.
+#
+# ПРИЧИНЫ («почему») У КАНДИДАТА НЕТ, И ОНА НЕ ПОДСТАВЛЯЕТСЯ. Ни из текста урока, ни из вопроса
+# клиента, ни из чего-либо ещё: подставленное «почему» отвечает на вопрос «что написано», а не
+# «почему так правильно», и владелец потом не отличит свою причину от машинной. Кандидат лежит в
+# состоянии «причина не названа» и становится действующим ОТДЕЛЬНЫМ действием — `lesson_store.promote`,
+# который без непустой причины отказывает.
+#
+# ПРАВО берётся из ТОЧКИ ЗАПИСИ, закрытой fail-closed 05.09 (`moderation_core.may_write_rule`:
+# пустой список прав = НИКОМУ), а не из общей проверки модерации `suggest.is_approver` (у той на
+# пустом списке ответ «да», и трогать её нельзя — радиус на все кнопки модерации).
+STATUS_CANDIDATE = "candidate"
+STATUS_DENIED = "denied"
+STATUS_NO_AUTHOR = "no_author"
+STATUS_NO_PAIR = "no_pair"
+
+
+def _default_may_write(username):
+    from moderation_core import may_write_rule      # ленивый: тяжёлый модуль не тянем в импорт
+    return may_write_rule(username)
+
+
+def _default_add_candidate(**kw):
+    import lesson_store
+    return lesson_store.add_candidate(**kw)
+
+
+def lesson_candidate(remark, who=None, question=None, bot_answer=None, when=None,
+                     may_write=None, add_candidate=None, get=None, now=None):
+    """Урок владельца → КАНДИДАТ в базе уроков. → dict(status, card, n, who).
+
+    Исходы называются РАЗНЫМИ словами, потому что чинятся они по-разному:
+      `candidate`  — записан, номер в `n`;
+      `denied`     — прав на запись нет (в том числе «список прав пуст» — fail-closed);
+      `no_author`  — некому приписать урок: имени не назвал ни вызывающий, ни сессия. НЕ пишем:
+                     кандидат без автора не отзывается разрезом «автор» и не проверяется;
+      `no_pair`    — в сессии тренажёра нет пары «вопрос клиента / ответ бота», а кандидат без
+                     них — это снова строка текста, ровно та, от которой уходим;
+      `error`      — хранилище отказало (причина словами от `LessonRejected`).
+
+    Ни один исход не пишет в плоскую книгу и не зовёт `suggest.append_playbook_rule`."""
+    remark = " ".join(str(remark or "").split()).strip()
+    if not remark:
+        return {"status": "error", "n": None, "who": None,
+                "card": "⚠️ Пустой урок — нечего запоминать."}
+    get = get or _default_get
+    author = (who or "").strip() or take_actor(now=now, get=get) or ""
+    author = author.lstrip("@").strip()
+    if not author:
+        return {"status": STATUS_NO_AUTHOR, "n": None, "who": None,
+                "card": "⚠️ Урок НЕ записан: не назван автор. Кандидат обязан нести имя того, кто "
+                        "его записал — иначе его нечем ни проверить, ни отозвать."}
+    if not (may_write or _default_may_write)(author):
+        return {"status": STATUS_DENIED, "n": None, "who": author,
+                "card": "⛔ Нет прав на запись уроков — кандидат НЕ создан."}
+    if question is None or bot_answer is None:
+        pair_q, pair_a = get_last_pair(get)
+        question = pair_q if question is None else question
+        bot_answer = pair_a if bot_answer is None else bot_answer
+    if not (str(question or "").strip() and str(bot_answer or "").strip()):
+        return {"status": STATUS_NO_PAIR, "n": None, "who": author,
+                "card": "⚠️ Урок НЕ записан: нет пары «вопрос клиента / ответ бота». Напиши как "
+                        "ТЕСТ-клиент, дождись ответа бота и повтори — кандидату нужен предмет."}
+    try:
+        n = (add_candidate or _default_add_candidate)(
+            question=str(question), bot_answer=str(bot_answer), correct=remark,
+            who=author, why="", when=when, now=now)          # why="" — причину НЕ выдумываем
+    except Exception as e:                                   # noqa: BLE001 — обработчик не падает
+        log.warning("кандидат урока не записан: %s: %s", type(e).__name__, e, exc_info=True)
+        reason = getattr(e, "reason", None) or f"{type(e).__name__}: {e}"
+        return {"status": "error", "n": None, "who": author,
+                "card": f"⚠️ Урок НЕ записан в базу уроков: {reason}"}
+    return {"status": STATUS_CANDIDATE, "n": n, "who": author,
+            "card": f"✅ Записан кандидат #{n} (автор @{author}): {remark}\n"
+                    "📌 Причина не названа — пока это КАНДИДАТ, бот по нему НЕ отвечает. "
+                    "Действующим станет отдельным действием, и только когда назовёшь «почему»."}
+
+
 def _apply_lesson(remark, append_rule=None, classify=None, mark=None, list_rules=None,
-                  regress=None):
+                  regress=None, who=None, get=None):
     """Ядро apply_lesson (может бросить — снаружи fail-safe обёртка)."""
     remark = " ".join(str(remark or "").split()).strip()
     if not remark:
@@ -1330,8 +1485,15 @@ def _apply_lesson(remark, append_rule=None, classify=None, mark=None, list_rules
         return {"axis": "code", "card": got["card"], "placed": got["placed"],
                 "tid": got["tid"], "why": got["why"]}
     if append_rule is None:
-        import suggest
-        append_rule = suggest.append_playbook_rule
+        # БОЕВОЙ МАРШРУТ (05.09.2026): урок ложится КАНДИДАТОМ в базу уроков. Плоская книга здесь
+        # не пишется ни байтом и `suggest.append_playbook_rule` не зовётся ни одной веткой.
+        dec = lesson_candidate(remark, who=who, get=get)
+        return {"axis": "behavior", "status": dec["status"], "card": dec["card"],
+                "n": dec.get("n"), "who": dec.get("who")}
+    # СТАРЫЙ СИНК (плоская книга) ЖИВ ТОЛЬКО ПО ЯВНОМУ ИМЕНИ: боевые вызовы `append_rule` не
+    # передают, поэтому сюда не попадают. Ветка оставлена целой сознательно — перенос уже
+    # накопленных правил книги в базу уроков это ОТДЕЛЬНОЕ задание, и до него код, умеющий
+    # писать книгу, нужен живым и покрытым регрессом. Удалять её здесь нельзя.
     status = append_rule(remark)
     num = None
     if status in ("added", "duplicate"):
@@ -1355,9 +1517,14 @@ def _apply_lesson(remark, append_rule=None, classify=None, mark=None, list_rules
 
 
 def apply_lesson(remark, append_rule=None, classify=None, mark=None, list_rules=None,
-                 regress=None):
+                 regress=None, who=None, get=None):
     """Провести урок из тренажёра через существующий канал «урок:» (2-я ось):
-      • behavior → append_playbook_rule + пометка источника «тренажёр»; применится со следующего
+      • behavior (БОЕВОЙ путь, `append_rule` не назван) → КАНДИДАТ в базу уроков `lesson_store`
+        (:func:`lesson_candidate`): вопрос клиента, ответ бота, как правильно, кто записал, когда;
+        «почему» пусто и НЕ подставляется. Бот по кандидату не отвечает — действующим он станет
+        отдельным действием с непустой причиной. Плоская книга НЕ пишется;
+      • behavior (`append_rule` назван ЯВНО — старый синк, живой только в регрессе и для будущего
+        переноса книги) → append_playbook_rule + пометка источника «тренажёр»; применится со следующего
         черновика (playbook подмешивается в system-prompt) → dict(axis='behavior', status, card,
         n=<номер правила в книге — тот же, что у кнопочного пути и «отмени урок N»>);
       • code → в playbook НЕ пишем; задача СОБИРАЕТСЯ по канону полосы (:func:`build_claim`),
@@ -1372,7 +1539,7 @@ def apply_lesson(remark, append_rule=None, classify=None, mark=None, list_rules=
     НИКОГДА не бросает (обработчик группы не имеет права упасть на уроке): исключение внутри →
     status='error' + карточка-ошибка; след — в лог процесса, а карточку в TRN пишет вызывающий."""
     try:
-        return _apply_lesson(remark, append_rule, classify, mark, list_rules, regress)
+        return _apply_lesson(remark, append_rule, classify, mark, list_rules, regress, who, get)
     except Exception as e:
         log.warning("apply_lesson упал: %s: %s", type(e).__name__, e, exc_info=True)
         return {"axis": "behavior", "status": "error",

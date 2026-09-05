@@ -9,10 +9,13 @@ lesson_store.py — ХРАНИЛИЩЕ УРОКОВ ТРЕНАЖЁРА. Отде
 заводится ОТДЕЛЬНАЯ таблица, где у каждого урока шесть обязательных полей (вопрос клиента,
 что ответил бот, как правильно, ПОЧЕМУ, кто записал, когда), свой номер и состояние.
 
-ГРАНИЦА ШАГА, названная честно. Бот сюда не ходит НИ ОДНОЙ веткой: ни `trainer.py`, ни
-`moderation_bot.py`, ни `userbot_listen.py` этот модуль не импортируют — шаг 1 строит
-хранилище, участие бота это отдельный шаг. Проверяется грепом по импортам, а не обещанием
-(`test_lesson_store.TestBotNotWired`).
+ГРАНИЦА ШАГА, названная честно и ПОДВИНУТАЯ 05.09.2026. Шаг 1 (19.08) строил хранилище, и тогда
+сюда не ходил никто. Теперь подключён РОВНО ОДИН файл — `trainer.py`: кнопка «🎓 Обучить» и
+команда «урок:» кладут урок КАНДИДАТОМ (`add_candidate`), а плоскую книгу правил больше не
+трогают. `moderation_bot.py`, `userbot_listen.py`, `lesson_router.py` и — особо — `suggest.py`
+(сборщик КЛИЕНТСКОГО ответа) сюда по-прежнему не ходят ни одной веткой: кандидат, по которому
+владелец ещё не назвал причину, не имеет права влиять на то, что читает клиент. Круг заперт
+ПОИМЁННО грепом по импортам, а не обещанием (`test_lesson_store.TestBotNotWired`).
 
 ПОЧЕМУ TSV, А НЕ CSV, JSON ИЛИ БАЗА — три отказа, каждый по своей причине:
 
@@ -49,7 +52,8 @@ lesson_store.py — ХРАНИЛИЩЕ УРОКОВ ТРЕНАЖЁРА. Отде
      круг «разобрать → собрать заново» (круг не байт-в-байт на чужих экранированных
      последовательностях). Перед перезаписью рядом кладётся копия `.bak`.
 
-СОСТОЯНИЕ строки — либо `актив`, либо `снят(<разрез>;<штамп UTC>)`, где разрез это один из
+СОСТОЯНИЕ строки — `кандидат` (записан, но НЕ действует; заведено 05.09.2026), `актив` либо
+`снят(<разрез>;<штамп UTC>)`, где разрез это один из
 трёх, названных владельцем: `урок` (один), `день` (все за сутки), `автор` (все одного
 человека). Разрез и время живут ВНУТРИ поля состояния сознательно: колонок в таблице ровно
 восемь (шесть обязательных полей + номер + состояние), а след «кем и когда снято» терять
@@ -128,6 +132,11 @@ COL_STATE = "состояние"
 COLUMNS = (COL_NUM, COL_QUESTION, COL_BOT, COL_RIGHT, COL_WHY, COL_WHO, COL_WHEN, COL_STATE)
 HEADER_LINE = "\t".join(COLUMNS)
 
+# Индексы колонок, которые правятся ПО МЕСТУ (см. `_replace_fields`). Считаются из COLUMNS, а не
+# пишутся числами: порядок колонок — часть формата, и разъехаться эти два места не должны.
+IDX_WHY = COLUMNS.index(COL_WHY)
+IDX_STATE = COLUMNS.index(COL_STATE)
+
 # Шесть обязательных полей урока (решение владельца). Номер и состояние ставит хранилище.
 REQUIRED_FIELDS = (COL_QUESTION, COL_BOT, COL_RIGHT, COL_WHY, COL_WHO, COL_WHEN)
 
@@ -142,6 +151,15 @@ DAY_LEN = 10                       # «2026-08-19» — префикс штам�
 # Состояние строки
 # ---------------------------------------------------------------------------------------
 STATE_ACTIVE = "актив"
+# КАНДИДАТ (05.09.2026). Урок, записанный кнопкой/командой владельца, но ещё НЕ действующий.
+# Заведён потому, что у записи и у применения РАЗНАЯ цена ошибки: записать замечание должно быть
+# дёшево (иначе урок не запишут вовсе), а начать отвечать по нему всем клиентам — дорого. Поэтому
+# кандидат имеет право лежать БЕЗ причины («кандидат, причина не названа»), а действующим
+# становится только отдельным действием и только с непустой причиной (`promote`).
+# ИНВАРИАНТ, ради которого всё: действующий урок ВСЕГДА с причиной. Кандидат — не действующий:
+# `is_active` сравнивает с `актив` и на кандидате отвечает False, поэтому ни одна ветка чтения
+# «действующих» кандидата не подхватит.
+STATE_CANDIDATE = "кандидат"
 CUT_ONE = "урок"
 CUT_DAY = "день"
 CUT_WHO = "автор"
@@ -159,8 +177,13 @@ def withdrawn_state(cut, stamp):
 
 def parse_state(value):
     """Поле состояния → (снят ли, разрез, штамп). Неопознанное состояние — ГРОМКОЕ `None`
-    в разрезе, а не тихое «активен»: чужая пометка не смеет притворяться активной строкой."""
-    if value == STATE_ACTIVE:
+    в разрезе, а не тихое «активен»: чужая пометка не смеет притворяться активной строкой.
+
+    Кандидат разобран ЯВНОЙ веткой, и это не украшение: без неё `кандидат` не совпал бы ни с
+    `актив`, ни с `_RE_WITHDRAWN`, и функция объявила бы живого кандидата СНЯТЫМ с неизвестным
+    разрезом. Снятым он от этого не становится — но всякий, кто судит по этому ответу, счёл бы
+    его снятым, а откат перестал бы отличать снятое от несозревшего."""
+    if value in (STATE_ACTIVE, STATE_CANDIDATE):
         return False, None, None
     m = _RE_WITHDRAWN.match(value)
     if m is None:
@@ -322,9 +345,20 @@ def is_active(lesson):
     return lesson.state == STATE_ACTIVE
 
 
+def is_candidate(lesson):
+    return lesson.state == STATE_CANDIDATE
+
+
 def active(lessons):
-    """Только не снятые."""
+    """Только ДЕЙСТВУЮЩИЕ. Кандидаты сюда не попадают ни одной веткой — это и есть замок
+    «действующий урок всегда с причиной»: без `promote` (а он без причины отказывает) строка
+    состояние `актив` не получает."""
     return tuple(les for les in lessons if is_active(les))
+
+
+def candidates(lessons):
+    """Только кандидаты — записанные, но ещё не действующие."""
+    return tuple(les for les in lessons if is_candidate(les))
 
 
 def by_author(lessons, who):
@@ -342,10 +376,15 @@ def by_day(lessons, day):
 # ---------------------------------------------------------------------------------------
 # Запись урока
 # ---------------------------------------------------------------------------------------
-def validate(question, bot_answer, correct, why, who, when):
+def validate(question, bot_answer, correct, why, who, when, why_required=True):
     """Шесть обязательных полей → (принят ли, причина словами, имя поля).
 
-    Чистая функция: файла не трогает, вызывается и отдельно — до записи."""
+    Чистая функция: файла не трогает, вызывается и отдельно — до записи.
+
+    `why_required=False` — режим КАНДИДАТА: пустое «почему» пропускается, потому что кандидат
+    действующим уроком не является и по нему бот не отвечает никому. Все прочие пять полей
+    обязательны и там: без вопроса, ответа бота, правильного ответа, автора и времени кандидат
+    нечем ни проверить, ни отозвать. Для ДЕЙСТВУЮЩЕГО урока флаг не трогаем никогда."""
     fields = ((COL_QUESTION, question), (COL_BOT, bot_answer), (COL_RIGHT, correct),
               (COL_WHY, why), (COL_WHO, who), (COL_WHEN, when))
     for name, value in fields:
@@ -354,6 +393,8 @@ def validate(question, bot_answer, correct, why, who, when):
     for name, value in fields:
         if len(value.strip()) == 0:
             if name == COL_WHY:
+                if not why_required:
+                    continue
                 return False, REASON_WHY_EMPTY, name
             return False, REASON_EMPTY % name, name
     return True, "", None
@@ -383,14 +424,15 @@ def _append_row(target, row, need_header):
         os.fsync(f.fileno())
 
 
-def add(question, bot_answer, correct, why, who, when=None, path=None, now=None):
-    """Записать урок. → НОМЕР записанного.
+def _add_row(question, bot_answer, correct, why, who, when, path, now, state, why_required):
+    """Общее тело `add`/`add_candidate` → НОМЕР записанного.
 
     Порядок сознателен: сначала проверка обязательных полей на СЫРОМ входе (пустое «почему»
     отказывается до всякой работы), потом вычистка персонального, потом повторная проверка
     непустоты (поле, состоявшее из одних персональных данных, не должно проехать пустым)."""
     stamp = now_stamp(now) if when is None else when
-    ok, reason, field = validate(question, bot_answer, correct, why, who, stamp)
+    ok, reason, field = validate(question, bot_answer, correct, why, who, stamp,
+                                 why_required=why_required)
     if not ok:
         raise LessonRejected(reason, field=field)
 
@@ -398,6 +440,10 @@ def add(question, bot_answer, correct, why, who, when=None, path=None, now=None)
     values = ((COL_QUESTION, clean.question), (COL_BOT, clean.bot_answer),
               (COL_RIGHT, clean.correct), (COL_WHY, clean.why))
     for name, value in values:
+        # У кандидата «почему» законно пусто ВХОДОМ — проверять его на «вычистилось в пустоту»
+        # нечего: пустым оно и пришло. Прочие три поля проверяются всегда.
+        if name == COL_WHY and not why_required and len(why.strip()) == 0:
+            continue
         if len(value.strip()) == 0:
             raise LessonRejected(REASON_SCRUBBED_OUT % name, field=name)
 
@@ -407,9 +453,32 @@ def add(question, bot_answer, correct, why, who, when=None, path=None, now=None)
     need_header = (not store.exists) or os.path.getsize(target) == 0
     row = "\t".join((str(number), esc(clean.question), esc(clean.bot_answer),
                      esc(clean.correct), esc(clean.why), esc(who.strip()),
-                     esc(stamp), STATE_ACTIVE))
+                     esc(stamp), state))
     _append_row(target, row, need_header)
     return number
+
+
+def add(question, bot_answer, correct, why, who, when=None, path=None, now=None):
+    """Записать ДЕЙСТВУЮЩИЙ урок (состояние `актив`). → НОМЕР записанного.
+
+    «Почему» обязательно и здесь остаётся обязательным: это единственная дорога, кладущая строку
+    сразу действующей, и инвариант «действующий урок всегда с причиной» держится ею."""
+    return _add_row(question, bot_answer, correct, why, who, when, path, now,
+                    STATE_ACTIVE, True)
+
+
+def add_candidate(question, bot_answer, correct, who, why="", when=None, path=None, now=None):
+    """Записать КАНДИДАТА (состояние `кандидат`). → НОМЕР записанного.
+
+    Отличие от `add` ровно одно: «почему» разрешено пустым. Ни одна ветка НЕ подставляет причину
+    из текста урока — пусто значит пусто, и таким кандидат и ложится. Подстановка была бы хуже
+    пустоты: у каждого урока появилось бы «почему», которого владелец не говорил, и отличить
+    названную причину от придуманной стало бы нечем.
+
+    Порядок аргументов иной, чем у `add` (`who` перед `why`), СОЗНАТЕЛЬНО: у кандидата причины
+    обычно нет, и позиционный вызов не должен уметь молча сдвинуть автора в графу причины."""
+    return _add_row(question, bot_answer, correct, why, who, when, path, now,
+                    STATE_CANDIDATE, False)
 
 
 # ---------------------------------------------------------------------------------------
@@ -435,6 +504,19 @@ def _replace_state(raw, state):
     return head + "\t" + state
 
 
+def _replace_fields(raw, by_index):
+    """Названные колонки СЫРОЙ строки → новые УЖЕ ЭКРАНИРОВАННЫЕ значения; остальные байты
+    переносятся дословно. Разбор здесь идёт только по табуляции и БЕЗ `unesc`/`esc` — то есть
+    нетронутые поля не проходят круг «разобрать → собрать», на котором чужая последовательность
+    могла бы поменяться. Строка не той ширины не правится вовсе (лучше не тронуть, чем испортить)."""
+    parts = raw.split("\t")
+    if len(parts) != len(COLUMNS):
+        return raw
+    for idx, value in by_index.items():
+        parts[idx] = value
+    return "\t".join(parts)
+
+
 def _count_lines(target):
     """Физических строк в файле (шапка входит). Потоком: размер файла не уходит в память."""
     total = 0
@@ -444,13 +526,14 @@ def _count_lines(target):
     return total
 
 
-def _rewrite(target, state_by_line):
+def _rewrite(target, edits_by_line):
     """Единственное место, трогающее уже лежащие байты. Копия `.bak` кладётся ДО правки,
     новое тело пишется во ВРЕМЕННЫЙ файл (усекается ОН, не таблица) и въезжает атомарным
     `os.replace`. → (строк прочитано, строк записано) — числа обязаны совпасть.
 
-    Каждая строка источника переписывается в приёмник; меняется только последнее поле у
-    названных строк. Ни одна ветка не пропускает строку — в этом и состоит «не удаляем»."""
+    `edits_by_line` — {номер физической строки: {индекс колонки: экранированное значение}}.
+    Каждая строка источника переписывается в приёмник; меняются только названные поля названных
+    строк. Ни одна ветка не пропускает строку — в этом и состоит «не удаляем»."""
     shutil.copyfile(target, target + BACKUP_SUFFIX)
     tmp = target + TMP_SUFFIX
     lines_in, lines_out = 0, 0
@@ -459,9 +542,9 @@ def _rewrite(target, state_by_line):
             for idx, line in enumerate(src, start=1):
                 lines_in += 1
                 body = line.rstrip("\n").rstrip("\r")
-                state_new = state_by_line.get(idx)
-                if state_new is not None:
-                    body = _replace_state(body, state_new)
+                edit = edits_by_line.get(idx)
+                if edit:
+                    body = _replace_fields(body, edit)
                 dst.write(body + "\n")
                 lines_out += 1
             dst.flush()
@@ -502,8 +585,11 @@ def withdraw(number=None, day=None, who=None, path=None, now=None):
     for les in store.lessons:
         if not _matches(les, cut, key):
             continue
-        if is_active(les):
-            hit_lines[les.line] = state
+        # КАНДИДАТ СНИМАЕТСЯ НАРАВНЕ С ДЕЙСТВУЮЩИМ. Иначе ошибочно записанный кандидат остался бы
+        # в таблице навсегда: `active()` его не показывает, а `withdraw()` считал бы «уже снят» —
+        # и владелец, отзывая свой урок, получал бы «нечего снимать» при живой строке.
+        if is_active(les) or is_candidate(les):
+            hit_lines[les.line] = {IDX_STATE: state}
             marked.append(les.number)
         else:
             already.append(les.number)
@@ -515,6 +601,74 @@ def withdraw(number=None, day=None, who=None, path=None, now=None):
         lines_after = lines_before
 
     return WithdrawResult(cut, key, tuple(marked), tuple(already), lines_before, lines_after)
+
+
+# ---------------------------------------------------------------------------------------
+# Переход кандидата в действующие — ОТДЕЛЬНОЕ действие и ТОЛЬКО с непустой причиной
+# ---------------------------------------------------------------------------------------
+# Здесь живёт инвариант всей затеи: строка получает состояние `актив` РОВНО в двух местах —
+# в `add()` (где «почему» обязательно проверкой) и здесь. Третьей дороги в действующие нет, и
+# обе требуют непустой причины. Поэтому «действующий урок без причины» невозможен не по
+# дисциплине вызывающего, а по устройству.
+REASON_PROMOTE_NO_WHY = ("кандидат НЕ переведён в действующие: причина не названа. Причину не "
+                         "подставляем из текста урока — пусто значит пусто; назовите «почему» "
+                         "словами и повторите")
+REASON_PROMOTE_MISSING = "кандидата #%s в таблице нет"
+REASON_PROMOTE_NOT_CANDIDATE = "урок #%s не кандидат, а «%s» — переводить нечего"
+
+PromoteResult = namedtuple("PromoteResult", "ok number why reason lines_before lines_after")
+
+
+def promote(number, why="", path=None, now=None):
+    """Кандидат #number → ДЕЙСТВУЮЩИЙ урок. → PromoteResult (не бросает: отказ — это ответ).
+
+    Причина берётся из аргумента `why`, а при пустом аргументе — из самой строки (кандидата могли
+    записать сразу с причиной). Обе пусты → ОТКАЗ: ни текст урока, ни вопрос клиента, ни что-либо
+    ещё в причину НЕ превращается. Это не осторожность, а смысл поля: «почему», собранное машиной
+    из текста урока, отвечает на вопрос «что написано», а не «почему так правильно», и владелец
+    не сможет отличить свою причину от подставленной.
+
+    Право на этот переход судит ВЫЗЫВАЮЩИЙ (у полосы ПК — `moderation_core.may_write_rule`,
+    fail-closed): хранилище имён и списков не знает и знать не должно.
+
+    `lines_before`/`lines_after` в ответе — доказательство числом, что перевод не потерял строк."""
+    target = _path(path)
+    store = load(target)
+    if not store.exists:
+        return PromoteResult(False, number, "", REASON_PROMOTE_MISSING % number, 0, 0)
+
+    found = None
+    for les in store.lessons:
+        if les.number == int(number):
+            found = les
+            break
+    lines = _count_lines(target)
+    if found is None:
+        return PromoteResult(False, number, "", REASON_PROMOTE_MISSING % number, lines, lines)
+    if not is_candidate(found):
+        return PromoteResult(False, found.number, found.why,
+                             REASON_PROMOTE_NOT_CANDIDATE % (found.number, found.state),
+                             lines, lines)
+
+    given = why if isinstance(why, str) else ""
+    final_why = given.strip() or found.why.strip()
+    if len(final_why) == 0:
+        return PromoteResult(False, found.number, "", REASON_PROMOTE_NO_WHY, lines, lines)
+
+    # Причина — живой текст владельца, и чистится тем же детектором, что остальные поля. Метки
+    # считаются заново, поэтому `Лицо_1` в новой причине может обозначать НЕ того человека, что
+    # `Лицо_1` в уже лежащем вопросе: исходников тех полей у нас больше нет (они уже вычищены).
+    # Названо здесь, а не спрятано; цена — путаница меток внутри одного урока, а не утечка.
+    cleaned = scrub_lesson(found.question, found.bot_answer, found.correct, final_why).why
+    ok, reason, field = validate(found.question, found.bot_answer, found.correct, cleaned,
+                                 found.who, found.when)
+    if not ok:
+        return PromoteResult(False, found.number, cleaned, reason, lines, lines)
+
+    before, after = _rewrite(target, {found.line: {IDX_WHY: esc(cleaned),
+                                                  IDX_STATE: STATE_ACTIVE}})
+    del field                                   # имя поля отказа здесь не нужно — ветка успешная
+    return PromoteResult(True, found.number, cleaned, "", before, after)
 
 
 # ---------------------------------------------------------------------------------------
@@ -614,8 +768,10 @@ def main(argv=None):
         integ = integrity(args.path)
         print("файл: %s (%s)" % (store.path, "есть" if store.exists else "ещё не заведён"))
         print("ёмкость: %s; байт %d" % (cap.say, cap.bytes))
-        print("активных: %d; снятых: %d" % (len(active(store.lessons)),
-                                            len(store.lessons) - len(active(store.lessons))))
+        cands = candidates(store.lessons)
+        print("действующих: %d; кандидатов: %d; снятых: %d"
+              % (len(active(store.lessons)), len(cands),
+                 len(store.lessons) - len(active(store.lessons)) - len(cands)))
         print(integ.say)
         return 0
 

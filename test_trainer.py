@@ -505,9 +505,15 @@ class TestLessonAppliesAndCancels(unittest.TestCase):
         suggest.PLAYBOOK_FILE = self._old_pb
         trainer.TRAINER_RULES_FILE = self._old_side
 
+    # ПОЧЕМУ ЗДЕСЬ ТЕПЕРЬ ЯВНЫЙ `append_rule` (05.09.2026). Боевой путь урока больше НЕ пишет в
+    # плоскую книгу: он кладёт кандидата в базу уроков (`test_lesson_write.py`). Книжный синк
+    # оставлен живым для ОТДЕЛЬНОГО задания «перенос накопленных правил», и меряется он теперь
+    # только по явному имени. Убрать `append_rule=` отсюда — значит померить не то, что написано
+    # в названии теста.
     def test_behavior_rule_reaches_next_system_prompt_with_source(self):
         remark = "сразу называй цену, не тяни с ответом"
-        dec = trainer.apply_lesson(remark, classify=lambda r: "behavior")   # реальный suggest.append + mark
+        dec = trainer.apply_lesson(remark, classify=lambda r: "behavior",
+                                   append_rule=suggest.append_playbook_rule)   # старый синк книги
         self.assertEqual(dec["axis"], "behavior")
         self.assertIn(remark, suggest.load_playbook())                      # записано в книгу
         # применится со СЛЕДУЮЩЕГО ответа — правило попадает в system-prompt генератора
@@ -517,7 +523,8 @@ class TestLessonAppliesAndCancels(unittest.TestCase):
 
     def test_cancel_lesson_rolls_back_and_unmarks(self):
         remark = "предлагай доставку явно в первом ответе"
-        trainer.apply_lesson(remark, classify=lambda r: "behavior")
+        trainer.apply_lesson(remark, classify=lambda r: "behavior",
+                             append_rule=suggest.append_playbook_rule)          # старый синк книги
         self.assertIn(remark, suggest.load_playbook())
         self.assertTrue(trainer.is_trainer_rule(remark))
         dec = trainer.cancel_lesson(1)                                      # «отмени урок 1»
@@ -639,7 +646,8 @@ class TestLessonSourceSurvivesBookFormat(unittest.TestCase):
         with open(self.pb, "w", encoding="utf-8") as f:
             f.write("# playbook\n\n## Выученные правила\n")
         remark = "предлагай доставку явно в первом ответе"
-        res = trainer.apply_lesson(remark, classify=lambda r: "behavior")
+        res = trainer.apply_lesson(remark, classify=lambda r: "behavior",
+                                   append_rule=suggest.append_playbook_rule)   # старый синк книги
         self.assertEqual(res["status"], "added")
         self.assertTrue(trainer.is_trainer_rule(remark))                 # пометка легла
         rows = suggest.list_playbook_rules(open(self.pb, encoding="utf-8").read())
