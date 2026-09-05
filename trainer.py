@@ -781,7 +781,8 @@ def selected_hypotheses(get=None):
     return [hyps[i] for i in get_selection(get) if 0 <= i < len(hyps)]
 
 
-def apply_lessons(remarks, append_rule=None, classify=None, mark=None, list_rules=None):
+def apply_lessons(remarks, append_rule=None, classify=None, mark=None, list_rules=None,
+                  regress=None):
     """Применить НЕСКОЛЬКО уроков разом: каждый — ОТДЕЛЬНЫМ правилом со своим номером.
     → dict(accepted=[(n, rule), …], duplicates=[…], code=[…], errors=[…], card='<одно сообщение>').
     Пустой список → карточка-предупреждение (нечего применять). Инъекции — как в apply_lesson."""
@@ -797,7 +798,7 @@ def apply_lessons(remarks, append_rule=None, classify=None, mark=None, list_rule
     code_decs = {}
     for r in items:
         dec = apply_lesson(r, append_rule=append_rule, classify=classify, mark=mark,
-                           list_rules=list_rules)
+                           list_rules=list_rules, regress=regress)
         if dec.get("axis") == "code":
             code.append(r)
             code_decs[r] = dec
@@ -1281,7 +1282,38 @@ def _rule_number(rule, list_rules=None):
     return None
 
 
-def _apply_lesson(remark, append_rule=None, classify=None, mark=None, list_rules=None):
+def _default_regress(rule, n=None):
+    """Регрессия урока ОТДЕЛЬНЫМ ОТСОЕДИНЁННЫМ процессом (`lesson_regress.spawn`).
+
+    Импорт ЛЕНИВЫЙ и внутри try: путь урока не имеет права зависеть от того, лежит ли на диске
+    прибор — «записано» владельцу дороже, чем «измерено»."""
+    try:
+        import lesson_regress
+    except Exception as e:                                  # noqa: BLE001 — см. докстринг
+        log.warning("регрессия урока недоступна: %s: %s", type(e).__name__, e)
+        return {"spawned": False, "why": "%s: %s" % (type(e).__name__, e)}
+    return lesson_regress.spawn(rule, n=n)
+
+
+def _regress_call(regress, rule, n):
+    """ЗАПИСЬ УРОКА НЕ ЗАМЕДЛЯЕТСЯ И НЕ ОТМЕНЯЕТСЯ ПРИБОРОМ (правило задания 231).
+
+    Два замка в одной строке кода:
+      • НЕ ЖДЁТ — внутри `spawn` стои́т Popen без ожидания и без чтения потоков; корпус (≈7 мин)
+        живёт в чужом процессе, а владелец получает «✅ Принято» тогда же, когда получал вчера;
+      • НЕ РОНЯЕТ — любой сбой запуска проглатывается здесь, а не поднимается наружу: правило уже
+        ЛЕЖИТ в книге, и падение нашего прибора не имеет права превратить успешную запись в
+        карточку «урок не применён».
+    → dict(spawned, why) — для тестов и лога, карточке владельца это ничего не добавляет."""
+    try:
+        return (regress or _default_regress)(rule, n)
+    except Exception as e:                                  # noqa: BLE001 — см. докстринг
+        log.warning("регрессия урока не запущена: %s: %s", type(e).__name__, e, exc_info=True)
+        return {"spawned": False, "why": "%s: %s" % (type(e).__name__, e)}
+
+
+def _apply_lesson(remark, append_rule=None, classify=None, mark=None, list_rules=None,
+                  regress=None):
     """Ядро apply_lesson (может бросить — снаружи fail-safe обёртка)."""
     remark = " ".join(str(remark or "").split()).strip()
     if not remark:
@@ -1310,12 +1342,20 @@ def _apply_lesson(remark, append_rule=None, classify=None, mark=None, list_rules
         tag = f"урок #{num}: " if num else ""
         card = (f"✅ Принято: {tag}{remark} → записано в книгу правил (источник «{TRAINER_SOURCE}»), "
                 "применится со следующего ответа.")
+        # ПОСЛЕ ЗАПИСИ И ПОСЛЕ КАРТОЧКИ — регрессия: корпус прогонится в ЧУЖОМ процессе и отдельной
+        # строкой скажет, не сломало ли новое правило то, что вчера было зелёным. Нажатие
+        # владельца этим не удлиняется ни на прогон (см. `_regress_call`).
+        # ТОЛЬКО `added`: у `duplicate` книга не изменилась ни на символ, и гнать по ней 7 минут
+        # корпуса нечего — измерять было бы ровно то же самое, что уже измерено.
+        if status == "added":
+            _regress_call(regress, remark, num)
     else:
         card = f"⚠️ Не удалось записать правило (status={status})."
     return {"axis": "behavior", "status": status, "card": card, "n": num}
 
 
-def apply_lesson(remark, append_rule=None, classify=None, mark=None, list_rules=None):
+def apply_lesson(remark, append_rule=None, classify=None, mark=None, list_rules=None,
+                 regress=None):
     """Провести урок из тренажёра через существующий канал «урок:» (2-я ось):
       • behavior → append_playbook_rule + пометка источника «тренажёр»; применится со следующего
         черновика (playbook подмешивается в system-prompt) → dict(axis='behavior', status, card,
@@ -1324,11 +1364,15 @@ def apply_lesson(remark, append_rule=None, classify=None, mark=None, list_rules=
         проходит ЧУЖИЕ ворота приёма ящика и уходит владельцу карточкой С КНОПКОЙ
         (:func:`code_fix_claim`) → dict(axis='code', card, placed, tid, why). Без «да»
         владельца в очередь не встаёт ничего.
-    append_rule/classify/mark/list_rules инъектируются в тестах; иначе боевые suggest/lesson_router.
+    Записанный урок оси «поведение» ЗАПУСКАЕТ РЕГРЕССИЮ (`lesson_regress.spawn`, 05.09.2026):
+    корпус прогоняется в ОТДЕЛЬНОМ отсоединённом процессе и отдельной строкой говорит владельцу
+    исход тремя голосами. Нажатие не удлиняется и при упавшем приборе урок всё равно записан.
+    append_rule/classify/mark/list_rules/regress инъектируются в тестах; иначе боевые
+    suggest/lesson_router/lesson_regress.
     НИКОГДА не бросает (обработчик группы не имеет права упасть на уроке): исключение внутри →
     status='error' + карточка-ошибка; след — в лог процесса, а карточку в TRN пишет вызывающий."""
     try:
-        return _apply_lesson(remark, append_rule, classify, mark, list_rules)
+        return _apply_lesson(remark, append_rule, classify, mark, list_rules, regress)
     except Exception as e:
         log.warning("apply_lesson упал: %s: %s", type(e).__name__, e, exc_info=True)
         return {"axis": "behavior", "status": "error",
