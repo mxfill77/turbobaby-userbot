@@ -957,6 +957,90 @@ class TestLiveChannelStillGoesOut(unittest.TestCase):
         # …а пакет собран и лежит: он не потерян ни в одной ветке.
         self.assertTrue(os.path.exists(os.path.join(self.root, *report["pack"].split("/"))))
 
+    # ── КОЛОКОЛ «УХОЖУ В КАНАЛЫ НАДОЛГО» (05.09.2026) ────────────────────────────────
+    # Объявление покупает тишине оправдание у сторожа демона, поэтому оно обязано
+    # звучать РОВНО там, где тишина и рождается: перед каналами и только если в них
+    # действительно идём. Всё остальное — ложный зелёный.
+    def test_announce_rings_once_and_only_when_the_channels_are_really_entered(self):
+        self._state(review_auto.state_default())
+        rung = []
+        report = review_auto_run.tick(root=self.root, state_path=self.state, now=_NOW,
+                                      digest_hour=1, write_journal=False,
+                                      announce=lambda ch: rung.append(ch))
+        self.assertTrue(report["acted"])
+        self.assertEqual(len(rung), 1, "объявление обязано быть РОВНО одно на оборот")
+        self.assertEqual(list(rung[0]), list(review_send.CHANNELS))
+
+    def test_announce_is_silent_when_the_turn_never_reaches_a_channel(self):
+        """Сборка, не дошедшая до каналов, укладывается в секунды — грации ей не нужно.
+
+        Объявляй мы её всё равно, зависание демона в ЛЮБОМ другом месте витка получило
+        бы чужой длинный потолок: ветка против ложной тревоги стала бы источником
+        ложного зелёного."""
+        st = review_auto.state_default()
+        for channel in review_send.CHANNELS:
+            for _ in range(review_auto.CHANNEL_DOWN_STRIKES):
+                st = review_auto.note_channel(st, channel, "unknown", "answer_lost", _NOW)
+        self._state(st)
+        rung = []
+        report = review_auto_run.tick(root=self.root, state_path=self.state, now=_NOW,
+                                      digest_hour=1, write_journal=False,
+                                      announce=lambda ch: rung.append(ch))
+        self.assertFalse(report["acted"])
+        self.assertEqual(rung, [], "объявили тишину, которой не будет")
+
+    # ── УСТУПКА ВИТКА СРОЧНОЙ ЧУЖОЙ РАБОТЕ (05.09.2026) ─────────────────────────────
+    def test_the_build_steps_aside_for_a_waiting_owner_row_and_pays_no_attempt(self):
+        """Уступка — отсрочка, а не отказ: попытка не списана, повод остался самым старым,
+        пакет не собран (значит и не выброшен), в каналы не ушло ничего."""
+        self._state(review_auto.state_default())
+        rung = []
+        report = review_auto_run.tick(
+            root=self.root, state_path=self.state, now=_NOW, digest_hour=1, write_journal=False,
+            announce=lambda ch: rung.append(ch),
+            yield_fn=lambda: (True, "витка ждёт работа владельца (#16)"))
+        self.assertFalse(report["acted"])
+        self.assertTrue(report["yielded"])
+        self.assertIn("#16", report["why"])
+        self.assertEqual(self.seen, [], "сборка ушла в каналы поверх ждущей задачи владельца")
+        self.assertEqual(rung, [], "объявили тишину, которой не будет")
+        self.assertEqual(review_auto_run.read_state(self.state)["triggers"], {},
+                         "уступка списала повод попыткой — это потеря, а не отсрочка")
+        self.assertFalse(os.path.isdir(os.path.join(self.root, "docs", "review_outbox")),
+                         "пакет собран и брошен — уступка обязана стоять ДО сборки")
+
+    def test_the_next_turn_takes_the_very_same_occasion(self):
+        """Замок к предыдущему: повод, которому уступили, обязан уехать следующим оборотом."""
+        self._state(review_auto.state_default())
+        first = review_auto_run.tick(root=self.root, state_path=self.state, now=_NOW,
+                                     digest_hour=1, write_journal=False,
+                                     yield_fn=lambda: (True, "ждёт #16"))
+        second = self._tick()
+        self.assertTrue(second["acted"])
+        self.assertEqual(second["trigger"], first["trigger"])
+
+    def test_a_crashing_yield_check_never_takes_the_turn_down(self):
+        self._state(review_auto.state_default())
+
+        def boom():
+            raise RuntimeError("очередь взорвалась")
+
+        report = review_auto_run.tick(root=self.root, state_path=self.state, now=_NOW,
+                                      digest_hour=1, write_journal=False, yield_fn=boom)
+        self.assertTrue(report["acted"], "падение уступки отменило оборот целиком")
+
+    def test_a_broken_bell_never_costs_the_pack(self):
+        """Объявление — удобство сторожа, а не условие отправки: его падение оборот не роняет."""
+        self._state(review_auto.state_default())
+
+        def boom(_channels):
+            raise RuntimeError("объявить не смог")
+
+        report = review_auto_run.tick(root=self.root, state_path=self.state, now=_NOW,
+                                      digest_hour=1, write_journal=False, announce=boom)
+        self.assertTrue(report["acted"])
+        self.assertEqual(report["outcomes"], ["answered", "answered"])
+
 
 def _artifact_text(filler_lines):
     """Синтетический артефакт полосы: шапка, главные разделы и середина-наполнитель.

@@ -10007,6 +10007,34 @@ REVIEW_AUTO_TICK_FILE = _state(os.path.join(REPO, "pc_orchestrator.review_auto_t
 # снимок контур-вотчдога и спул ревизора. Корень записи выводим ИЗ пути состояния: под тестом он
 # уезжает в одноразовый temp вместе с ним, в бою равен REPO.
 REVIEW_AUTO_STATE_FILE = _state(os.path.join(REPO, "review_auto_state.json"))
+# ── ИМЯ И ПОТОЛОК ОБЪЯВЛЕНИЯ СБОРКИ (05.09.2026) ────────────────────────────────────────────
+# Имя видит владелец в карточке сторожа, поэтому оно человеческое, а не идентификатор ветки.
+REVIEW_AUTO_STAGE_NAME = "ступень A: сборка пакета внешнему ревьюеру"
+# ПОТОЛОК НЕ НАЗНАЧЕН, А ВЫВЕДЕН ИЗ ЖЁСТКИХ ПРЕДЕЛОВ САМОЙ СТУПЕНИ, и слагаемых ровно три:
+#   • `REVIEW_AUTO_TIMEOUT` (300с) — потолок захода в codex: `subprocess` режется им жёстко;
+#   • ожидание готовности manus — `review_send_run.DEFAULT_MANUS_WAIT` (1800с): каналы идут
+#     ПОСЛЕДОВАТЕЛЬНО, поэтому слагаемые складываются, а не берутся по максимуму;
+#   • `WD_PRODUCT_SILENT` — остаток витка ПОСЛЕ сборки: объявление живёт до следующего оборота,
+#     а тот ещё должен свои вызовы моста. Ровно то же слагаемое и по той же причине стои́т в
+#     `WD_BUSY_ALLOW = TASK_TIMEOUT + WD_PRODUCT_SILENT`.
+# СВЕРКА С ЗАМЕРОМ (03-05.09, 39 сборок с пакетом наружу): max самой сборки 1916с против
+# выведенных 2100с — запас 1.10×; медиана 1841с. Сумма 3900с при этом СТРОГО МЕНЬШЕ 4500с, что
+# уже покупает себе headless-прогон: ступень не вправе быть тише полноценного захода.
+REVIEW_AUTO_STAGE_FALLBACK_WAIT = 1800    # столько ждёт канал, если модуль рук не поднялся
+
+
+def _review_auto_stage_allow():
+    """Потолок ОБЪЯВЛЕННОЙ сборки пакета, сек. Считается по живым числам, а не по литералу:
+    ручку ожидания канала держит `review_send_run`, и разойдись мы с ней — потолок сторожа
+    молча отстал бы от того, что ступень на самом деле себе позволяет."""
+    wait = REVIEW_AUTO_STAGE_FALLBACK_WAIT
+    try:
+        import review_send_run                      # noqa: PLC0415 — ленивый, как и весь контур A
+        wait = int(review_send_run.DEFAULT_MANUS_WAIT)
+    except Exception as e:                          # noqa: BLE001 — падать тут нечему и незачем
+        log.warning("потолок объявления сборки: ожидание канала не прочитано (%s) — беру %sс",
+                    e, wait)
+    return int(REVIEW_AUTO_TIMEOUT + wait + WD_PRODUCT_SILENT)
 
 
 def _review_auto_root():
@@ -10081,11 +10109,72 @@ def _review_auto_write_tick(now, path=None):
         log.warning("ревью-контур A: метка оборота не записана: %s", e)
 
 
-def maybe_review_auto(now=None, tick_path=None, state_path=None, runner=None):
+def _review_auto_announce(channels=()):
+    """Ступень A ОБЪЯВЛЯЕТ свой длинный заход сторожу. Зовётся руками ступени ровно там, где
+    оборот уходит в каналы, — то есть за секунду до того, как виток замолчит на десятки минут.
+
+    ПОЧЕМУ НЕ В НАЧАЛЕ `maybe_review_auto`. Объявление покупает тишине оправдание, и покупать
+    его надо ровно на ту работу, которая тишину и производит. Объявляй мы каждые 300с «на всякий
+    случай», зависание демона В ЛЮБОМ ДРУГОМ месте витка получило бы 3900с грации вместо 1800 —
+    ветка, заведённая против ложной тревоги, стала бы источником ложного зелёного.
+
+    Сборки, не дошедшей до каналов (повода нет, все каналы лежат, сухой прогон), объявление не
+    касается вовсе: она укладывается в секунды и в порог тишины проходит без всякой грации."""
+    rec = _stage_started_mark(REVIEW_AUTO_STAGE_NAME, _review_auto_stage_allow())
+    log.info("ревью-контур A: объявляю длинный заход сторожу (каналы: %s, потолок объявления %sс)%s",
+             ", ".join(channels) or "—", _review_auto_stage_allow(),
+             "" if rec else " — ОБЪЯВИТЬ НЕ УДАЛОСЬ")
+    return rec
+
+
+def _review_auto_owner_wait(rows_fn=None):
+    """Ждёт ли витка РАБОТА ВЛАДЕЛЬЦА? → (уступаем?, строка словами).
+
+    ЗАЧЕМ УСТУПКА. Сборка пакета синхронна и по замеру 03-05.09 стои́т витку 1841с медианы. Всё
+    это время очередь не читается, и ряд владельца, ждущий клейма, ждёт ровно столько же. Цена
+    несопоставима: пакет второго мнения не срочен НИКОГДА (повод переживёт виток и уедет
+    следующим), а задача владельца срочна ПО ОПРЕДЕЛЕНИЮ — её поставил человек и ждёт ответа.
+
+    ЧТО СЧИТАЕТСЯ ЖДУЩИМ. Ряды полосы в `new` и `approved` — ровно те, которые СЛЕДУЮЩИЙ виток
+    возьмёт в работу (`process_new`, `process_approved`). `needs_approval` сюда НЕ входит
+    намеренно: он ждёт человека, а не витка, и сборка его не задерживает ни на секунду — иначе
+    одна карточка, повисшая в ожидании решения, выключила бы ступень A навсегда. Владельца от
+    ревизорского родителя отличает `_is_owner_work` — та же функция, которой судят уступку
+    ступени E и ящик Штаба; свой список исключений разошёлся бы с ней на первом новом виде ряда.
+
+    ОЧЕРЕДЬ НЕ ПРОЧИТАНА — НЕ УСТУПАЕМ, и это названо вслух. Молчащий мост означал бы вечную
+    уступку, то есть тихую смерть ступени A по чужой поломке; направление отказа выбрано в
+    сторону прежнего поведения, а не в сторону молчания."""
+    rows, ok, why = [], True, ""
+    for status in ("new", "approved"):
+        r = (rows_fn or bc.get_pending)(status)
+        if not (isinstance(r, dict) and r.get("ok")):
+            ok = False
+            why = str((r or {}).get("error_text") or (r or {}).get("error") or "мост не ответил")
+            continue
+        rows += [it for it in (r.get("items") or []) if _lane_ok(it)]
+    if not ok and not rows:
+        return False, ("очередь не прочитана (%s) — уступать вслепую не буду, иду как прежде"
+                       % why)
+    ids = [it.get("id") for it in rows if _is_owner_work(it, _revizor_chain_pids(rows))]
+    if not ids:
+        return False, ""
+    return True, ("витка ждёт работа владельца (%s) — сборка уступает ей виток; повод не потерян, "
+                  "вернёмся следующим" % ", ".join("#%s" % i for i in ids))
+
+
+def maybe_review_auto(now=None, tick_path=None, state_path=None, runner=None, waiter=None):
     """Один оборот ступени A за тик, с троттлингом по МЕТКЕ НА ДИСКЕ. → отчёт | None.
 
     None — ветка выключена флагом или пол паузы не прошёл. Метку пишем ВСЕГДА, даже когда оборот
     ничего не сделал: иначе «повода нет» стоило бы полного разбора каждые 60 секунд.
+
+    УСТУПКА ЖИВЁТ ВНУТРИ ОБОРОТА, А НЕ ЗДЕСЬ, И ЭТО РЕШЕНО ЗАМЕРОМ, А НЕ ВКУСОМ. Вопрос «не жду
+    ли я чужого витка» стои́т двух чтений очереди, то есть десятков секунд моста. Спрашивай мы
+    его тут, платить пришлось бы на КАЖДОМ проходе ступени, а 55 проходов из 94 за 03-05.09
+    поводов не имели вовсе и укладывались в 9с медианы — цена выросла бы там, где задерживать
+    нечего. Внутри оборота вопрос задаётся, только когда повод НАЙДЕН и заход вот-вот пойдёт в
+    каналы; попытка при этом ещё не списана, поэтому уступка — отсрочка, а не потеря повода.
     """
     if not _review_auto_on():
         log.info("ревью-контур A: ПРОХОДА НЕТ — ветка выключена (REVIEW_AUTO=0 либо стоп-файл %s)",
@@ -10109,7 +10198,8 @@ def maybe_review_auto(now=None, tick_path=None, state_path=None, runner=None):
         report = (runner or review_auto_run.tick)(
             root=_review_auto_root(), state_path=state_path or REVIEW_AUTO_STATE_FILE,
             digest_hour=REVIEW_AUTO_DIGEST_HOUR, timeout=REVIEW_AUTO_TIMEOUT, write_journal=True,
-            probe_wait=REVIEW_AUTO_PROBE_WAIT,
+            probe_wait=REVIEW_AUTO_PROBE_WAIT, announce=_review_auto_announce,
+            yield_fn=waiter or _review_auto_owner_wait,
         )
     except Exception as e:
         log.warning("ревью-контур A: ПРОХОДА НЕТ — оборот упал (fail-safe, метка уже сдвинута, "
@@ -12287,13 +12377,15 @@ WD_BUSY_ALLOW = int(os.getenv("PC_WD_BUSY_ALLOW", "") or (TASK_TIMEOUT + WD_PROD
 PROD_OK, PROD_SILENT, PROD_UNKNOWN = "оборот есть", "оборота нет", "неизвестно"
 
 
-def daemon_product_verdict(wall_age, silence, busy_age, limit=None, allow=None, fresh=None):
+def daemon_product_verdict(wall_age, silence, busy_age, limit=None, allow=None, fresh=None,
+                           stage=None):
     """ФАКТЫ О ПРОДУКТЕ ДЕМОНА → (исход, словами почему). Чистая функция, голден.
 
     На входе НЕТ ни одного признака жизни — ни PID, ни списка процессов: судим произведённое.
       wall_age — возраст последнего оборота по стенным часам (None — продукт не прочитан);
       silence  — НАКОПЛЕННАЯ тишина продукта в часах бодрствования (None — не измерена);
-      busy_age — возраст ОБЪЯВЛЕННОГО захода, начатого позже последнего оборота (None — такого нет).
+      busy_age — возраст ОБЪЯВЛЕННОГО захода, начатого позже последнего оборота (None — такого нет);
+      stage    — ОБЪЯВЛЕННАЯ длинная ступень витка: (возраст, имя, свой потолок) | None.
 
     ТРИ ИСХОДА, и третий обязателен: «неизвестно» возвращается на каждую дырку в фактах (продукт
     не прочитан · тишина не измерена · накопителя ещё нет). Ни одна из этих дорог не ведёт к
@@ -12306,7 +12398,14 @@ def daemon_product_verdict(wall_age, silence, busy_age, limit=None, allow=None, 
 
     ПОРЯДОК ВЕТВЕЙ. Объявленный заход спрашивается ДО измеренной тишины: «демон синхронно исполняет
     заход, начатый N минут назад» — это положительный факт с потолком, а не отсутствие факта (тот
-    же порядок, что у О2 в `expectations_pc.turn_state`)."""
+    же порядок, что у О2 в `expectations_pc.turn_state`). Объявленная СТУПЕНЬ — третьей, после
+    захода и по той же причине; потолок у неё СВОЙ и приезжает вместе с объявлением, потому что
+    жёсткие пределы у ступеней разные (у сборки пакета — ожидание канала, у прогона — TASK_TIMEOUT).
+
+    ОБЪЯВЛЕНИЕ НЕ ПОДНИМАЕТ ПОРОГ. `limit` не трогается ни одной веткой: молчание, которое никто
+    не объявлял, звенит через те же `WD_PRODUCT_SILENT`, а объявленное — через СВОЙ названный
+    потолок и ни секундой дольше. Это разные вопросы: «сколько демону позволено молчать» и
+    «сколько позволено идти вот этой названной работе»."""
     limit = WD_PRODUCT_SILENT if limit is None else limit
     allow = WD_BUSY_ALLOW if allow is None else allow
     fresh = HEARTBEAT_STALE if fresh is None else fresh
@@ -12318,6 +12417,11 @@ def daemon_product_verdict(wall_age, silence, busy_age, limit=None, allow=None, 
         return PROD_OK, "оборот %.0fс назад" % wall_age
     if busy_age is not None and 0 <= busy_age <= allow:
         return PROD_OK, "идёт объявленный заход (%.0fс из %.0fс)" % (busy_age, allow)
+    if stage is not None:
+        s_age, s_name, s_allow = stage
+        if s_age is not None and 0 <= s_age <= s_allow:
+            return PROD_OK, ("идёт объявленная ступень «%s» (%.0fс из %.0fс)"
+                             % (s_name, s_age, s_allow))
     if silence is None:
         return PROD_UNKNOWN, ("продукту %.0fс, но чем набран возраст — молчанием демона или сном "
                               "машины — не измерено" % wall_age)
@@ -12370,6 +12474,88 @@ def _wd_busy_age(product_ts, now, path=None):
     return age if age >= 0 else None
 
 
+# ── ДЛИННАЯ СТУПЕНЬ ВИТКА ОБЪЯВЛЯЕТСЯ ТЕМ ЖЕ СПОСОБОМ, ЧТО И ЗАХОД (05.09.2026) ──────────────
+# ЗАЧЕМ. Сборка пакета внешнему ревьюеру (`maybe_review_auto`) идёт СИНХРОННО в теле цикла и по
+# своему устройству ждёт канал до получаса: `review_send_run.DEFAULT_MANUS_WAIT` = 1800с. Оборот
+# `poll_once` эти полчаса не замыкается, и прибор видит РОВНО ТО ЖЕ, что увидел бы у вставшего
+# демона, — тишину продукта. ЗАМЕР 03-05.09 по pc_orchestrator.log: сборок, дошедших до канала,
+# 39; их медиана 1841с при пороге тишины 1800с, max 1916с. То есть КАЖДАЯ успешная сборка обязана
+# была позвать владельца — и 25 из 39 позвали.
+#
+# ЧЕГО ЗДЕСЬ НАМЕРЕННО НЕ СДЕЛАНО. Порог тишины не поднят ни на секунду: молчание БЕЗ объявления
+# по-прежнему звенит через `WD_PRODUCT_SILENT`. Поднять его значило бы купить тишину сборки ценой
+# слепоты ко всякому другому зависанию, а тишина сборки отличается от тишины смерти ровно одним
+# признаком — сборка способна о себе СКАЗАТЬ. Прибор и различает их по этому признаку, а не по
+# длительности.
+STAGE_START_FILE = _state(os.path.join(REPO, "pc_orchestrator.stage_started.json"))
+
+
+def _stage_started_mark(name, allow, path=None, now=None):
+    """Объявить ДЛИННУЮ СИНХРОННУЮ ступень витка. → dict записи | None (записать не смогли).
+
+    Факт для сторожа — тот же, что у отметки задачи: ВРЕМЯ ПРАВКИ ФАЙЛА. Содержимое нужно ради
+    двух вещей: назвать ступень словами в карточке владельцу и объявить её СОБСТВЕННЫЙ потолок —
+    у сборки пакета он свой, и отдать ей потолок headless-прогона было бы подарком без основания.
+
+    Чистить отметку не надо, и важно помнить почему: оправданием она считается ЛИШЬ пока сделана
+    позже последнего оборота (`_wd_stage_busy`), — значит первый же замкнувшийся виток обесценивает
+    её сам. Ровно так живёт отметка задачи; второго механизма полосе заводить незачем.
+
+    Запись не удалась — это НЕ отказ ступени: сборка пойдёт как прежде, просто её тишина будет
+    неотличима от смерти. Поэтому провал говорится словами, а не глотается."""
+    rec = {"name": str(name), "allow": int(allow), "pid": os.getpid(), "proc": _PROC_TOKEN,
+           "at": (now or datetime.datetime.now(datetime.timezone.utc)).isoformat()}
+    try:
+        with open(path or STAGE_START_FILE, "w", encoding="utf-8") as f:
+            json.dump(rec, f, ensure_ascii=False)
+    except Exception as e:      # noqa: BLE001 — объявление удобство сторожа, а не условие работы
+        log.warning("объявление ступени «%s» не записано (%s) — её тишину сторож отличить от "
+                    "остановки не сможет", name, e)
+        return None
+    return rec
+
+
+def _wd_stage_busy(product_ts, now, path=None, cap=None):
+    """Возраст ОБЪЯВЛЕННОЙ ступени → (сек, имя, потолок) | None (объявления нет либо не годится).
+
+    Четыре дороги в None, и каждая обязана вести туда, а не в «работает»:
+      • файла нет вовсе — ни одна ступень ничего не объявляла;
+      • отметка НЕ НОВЕЕ последнего оборота — это след прошлой сборки (тот же замок, что у
+        `_wd_busy_age`: без него давнее объявление вечно выдавало бы стоящий демон за занятый);
+      • объявление не разобрано (битый json, нет числа в потолке) — «не понял, что мне объявили»
+        оправданием не является: fail-closed, тишина зазвенит ровно как без объявления;
+      • потолок объявлен нулевым или отрицательным — ступень сама сказала, что грации не просит.
+
+    Потолок КЛЕММИРУЕТСЯ `cap`: ни одна ступень не вправе купить себе тишины больше, чем её уже
+    покупает полный headless-прогон (`WD_BUSY_ALLOW`). Иначе одна ошибка в числе у вызывающего
+    выключала бы сторожа целиком — и выключала бы молча."""
+    p = path or STAGE_START_FILE
+    cap = WD_BUSY_ALLOW if cap is None else cap
+    try:
+        mt = float(os.stat(p).st_mtime)
+    except Exception:
+        return None
+    if product_ts is not None and mt <= float(product_ts):
+        return None
+    age = float(now) - mt
+    if age < 0:
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            rec = json.load(f)
+        allow = rec["allow"]
+        name = str(rec.get("name") or "не названа")
+        if isinstance(allow, bool) or not isinstance(allow, (int, float)):
+            raise TypeError("потолок объявления не число: %r" % (allow,))
+    except Exception as e:      # noqa: BLE001 — молчать нельзя: на этом стои́т приговор «встал»
+        log.warning("объявление ступени не разобрано (%s: %s) — оправданием НЕ считаю", p, e)
+        return None
+    allow = min(float(allow), float(cap))
+    if allow <= 0:
+        return None
+    return age, name, allow
+
+
 def _wd_sec(val, default=0.0):
     """Число секунд из факта | default. Отдельной функцией, а не идиомой `val or 0`: та стирает
     разницу «факта нет» и «в факте ноль», а у сторожа на этой разнице стои́т и антиспам, и текст
@@ -12412,25 +12598,36 @@ def _wd_silence(raw, state, awake_now):
     return awake_now - float(prev_awake), {"prod": raw, "prod_awake": float(prev_awake)}
 
 
-def daemon_hung_card_text(silence, busy_age, pids, limit=None, allow=None):
+def daemon_hung_card_text(silence, busy_age, pids, limit=None, allow=None, stage=None):
     """Текст карточки «демон ЖИВ ПРОЦЕССОМ, но продукта не даёт» — чистая функция, голден.
 
     Карточка НЕ рапортует о подъёме, потому что подъёма не было и быть не должно: снять живой
     процесс и поднять его заново — операционное решение владельца (и красная операция: taskkill
     плюс schtasks), а не самодеятельность сторожа. Поэтому здесь названы ровно те факты, по
-    которым владелец решает сам."""
+    которым владелец решает сам.
+
+    СТРОКА ПРО СТУПЕНЬ ОБЯЗАТЕЛЬНА В ОБОИХ ИСХОДАХ. «Ступень не объявлялась» и «объявленная
+    ступень «сборка пакета» идёт дольше своего потолка» — разные новости и разные решения:
+    в первом случае владелец смотрит на демон, во втором — на канал, который не отвечает."""
     limit = WD_PRODUCT_SILENT if limit is None else limit
     allow = WD_BUSY_ALLOW if allow is None else allow
     pid_s = ", ".join(str(p) for p in pids) if pids else "не назван"
     busy = ("объявленного захода нет — отметка старта не обновлялась после последнего оборота"
             if busy_age is None else
             "объявленный заход идёт %s — дольше потолка %s" % (fmt_sleep(busy_age), fmt_sleep(allow)))
+    if stage is None:
+        st_line = "объявленной ступени нет — длинную работу витка никто не объявлял"
+    else:
+        s_age, s_name, s_allow = stage
+        st_line = ("объявленная ступень «%s» идёт %s — дольше своего потолка %s"
+                   % (s_name, fmt_sleep(_wd_sec(s_age)), fmt_sleep(s_allow)))
     return "\n".join([
         "⛔ ДЕМОН ЖИВ ПРОЦЕССОМ, НО НЕ РАБОТАЕТ — оборота poll_once нет %s (порог %s)"
         % (fmt_sleep(_wd_sec(silence)), fmt_sleep(limit)),
         RAISE_LOSS["pc_orchestrator"],
         "процесс: PID %s — жив; сторож его НЕ трогает" % pid_s,
         busy,
+        st_line,
         "решение за владельцем: снять процесс и поднять задачей Планировщика (%s) — операция "
         "красная (taskkill/schtasks), сторож её не делает" % TASK_NAME])
 
@@ -12456,7 +12653,7 @@ def daemon_raise_card_text(n_raises, down_sec, pids, rc):
 
 def watchdog(now=None, runner=None, verify_sleep=None, finder=None, state_path=None,
              notify=None, cowork=None, wall_now=None, topic=None, product=None, awake=None,
-             busy=None):
+             busy=None, stage=None):
     """НАДЁЖНЫЙ вотчдог (урок 205 — тихого сбоя быть не должно; класс-фикс 13.07 — и ЛОЖНОГО шума
     быть не должно; класс 493 — и ЛОЖНОГО ЗЕЛЁНОГО быть не должно): судит ПРОДУКТ демона (оборот
     `poll_once`, см. `daemon_product_verdict`), а не признак его жизни.
@@ -12489,7 +12686,8 @@ def watchdog(now=None, runner=None, verify_sleep=None, finder=None, state_path=N
     silence, acc = _wd_silence(raw, _wd_state_read(state_path), (awake or _wd_awake)())
     _wd_state_merge(acc, state_path)         # накопитель сохраняем ВСЕГДА и ДО любых вердиктов
     busy_age = (busy or _wd_busy_age)(prod_ts, tnow)
-    verdict, why = daemon_product_verdict(wall_age, silence, busy_age)
+    stage_rec = (stage or _wd_stage_busy)(prod_ts, tnow)
+    verdict, why = daemon_product_verdict(wall_age, silence, busy_age, stage=stage_rec)
     if wall_age is not None and wall_age <= HEARTBEAT_STALE:
         _mark_alive()                        # оборот только что был — CIM даже не дёргаем
         return "alive"
@@ -12515,7 +12713,8 @@ def watchdog(now=None, runner=None, verify_sleep=None, finder=None, state_path=N
                   "снять живой процесс — решение владельца", pids, why)
         st = _wd_state_read(state_path)
         if st.get("state") != "hung" and (tnow - _wd_sec(st.get("last_alert"))) >= WD_ALERT_COOLDOWN:
-            (notify or _notify_critical)(daemon_hung_card_text(silence, busy_age, pids))
+            (notify or _notify_critical)(daemon_hung_card_text(silence, busy_age, pids,
+                                                               stage=stage_rec))
             (cowork or _cowork)("watchdog: демон жив процессом, но оборота нет %s — подъёма НЕ "
                                 "делал, нужно решение владельца" % fmt_sleep(_wd_sec(silence)))
             _wd_state_merge({"state": "hung", "last_alert": tnow}, state_path)

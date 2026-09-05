@@ -389,11 +389,26 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
          dry=False, write_journal=True, max_chars=review_pack.REVIEW_MAX_CHARS,
          codex_bin=None, codex_model=None, codex_cd=None, manus_base=None,
          inbox=None, workdir=None, journal_fn=None, clock=None, only=None,
-         probe_wait=DEFAULT_PROBE_WAIT):
+         probe_wait=DEFAULT_PROBE_WAIT, announce=None, yield_fn=None):
     """Один оборот ступени A. → dict-отчёт (никогда не бросает наружу исключений канала).
 
     Отчёт всегда несёт ``acted`` и ``why``: «повода не было» — это ИСХОД, а не
     молчание, и вызывающий (демон) обязан уметь его записать.
+
+    ``announce`` — необязательный колокол «сейчас уйду в каналы надолго», зовётся
+    РОВНО ОДИН РАЗ и ровно перед циклом каналов. Заведён 05.09.2026: заход в
+    каналы идёт синхронно внутри витка демона и по своему устройству ждёт до
+    получаса (``review_send_run.DEFAULT_MANUS_WAIT``), а сторож демона судит по
+    обороту ``poll_once`` — то есть здоровая сборка выглядела у него смертью.
+    Колокол ставит на диск объявление, по которому сторож отличает «молчит,
+    потому что работает» от «молчит, потому что встал». Его падение оборот НЕ
+    роняет: объявление — удобство сторожа, а не условие отправки.
+
+    ``yield_fn`` — «ждёт ли витка чужая, срочная работа?». Зовётся ПОСЛЕ того,
+    как повод найден, и ДО сборки пакета: спрашивать раньше значило бы платить
+    чтением очереди за каждый холостой проход, а позже — выбрасывать уже
+    собранный пакет. Уступка попытку НЕ списывает и состояние НЕ трогает:
+    повод остаётся самым старым и уедет следующим оборотом.
     """
     stamp = now or now_iso(clock)
     path = state_path or _path(root, DEFAULT_STATE)
@@ -421,6 +436,25 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
         write_state(path, state)
         return {"acted": False, "why": "дайджест наступил, закрытых цепочек за сутки нет",
                 "trigger": trigger["key"]}
+
+    # ── ЧУЖОЙ ВИТОК ВПЕРЁД (05.09.2026) ───────────────────────────────────────
+    # Заход в каналы синхронен внутри витка демона и по замеру 03-05.09 стои́т
+    # ему 1841с медианы. Всё это время очередь не читается, и ряд владельца,
+    # ждущий клейма, ждёт ровно столько же. Цена несопоставима: пакет второго
+    # мнения не срочен НИКОГДА — повод переживёт виток и уедет следующим, — а
+    # задача владельца срочна по определению, её поставил человек.
+    #
+    # МЕСТО ВЫБРАНО, А НЕ СЛУЧИЛОСЬ: после повода (иначе чтение очереди платится
+    # за каждый холостой проход — 55 из 94 за те же сутки) и до `_build_pack`
+    # (иначе выбрасывается уже собранный пакет). Попытка НЕ списана, состояние
+    # НЕ тронуто — это отсрочка, а не отказ.
+    if yield_fn is not None:
+        try:
+            yielded, why = yield_fn()
+        except Exception as exc:    # noqa: BLE001 — уступка не смеет отнять оборот целиком
+            yielded, why = False, "уступку решить не удалось (%s) — иду как прежде" % exc
+        if yielded:
+            return {"acted": False, "why": why, "trigger": trigger["key"], "yielded": True}
 
     # ПАДЕНИЕ СБОРКИ — ЭТО ПОПЫТКА, А НЕ НЕБЫТИЁ (правка 05.09.2026).
     #
@@ -505,6 +539,12 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
                             manus_wait=probe_wait if is_probe else None)
 
     inbox_dir = inbox or _path(root, DEFAULT_INBOX)
+
+    if announce is not None:
+        try:
+            announce(tuple(going))
+        except Exception:       # noqa: BLE001 — колокол не смеет отнять у повода уже списанную попытку
+            pass
 
     outcomes, reasons, answers = [], [], []
     for channel in going:

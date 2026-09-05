@@ -1003,13 +1003,30 @@ class TestWatchdog(Base):
         """Продукт: оборот был `age` секунд назад (raw — сырая строка heartbeat, она же метка витка)."""
         self.prod = (raw or self.HB_RAW, ts, float(age))
 
-    def _wd(self, finder, wall_now=None, busy=None):
+    def _wd(self, finder, wall_now=None, busy=None, stage=None):
         return o.watchdog(runner=self._runner, verify_sleep=0, finder=finder,
                           state_path=self.state, notify=self.push, cowork=self.cow,
                           wall_now=wall_now, topic=self.card,
                           product=lambda now=None: self.prod,
                           awake=lambda: self.awake,          # None = настоящих часов нет
-                          busy=busy or (lambda ts, now: None))
+                          busy=busy or (lambda ts, now: None),
+                          stage=stage or (lambda ts, now: None))
+
+    def _stage_file(self, mtime=None, name="ступень A: сборка пакета внешнему ревьюеру",
+                    allow=3900, raw=None):
+        """НАСТОЯЩИЙ файл объявления на диске (не мок): сторож судит по его mtime и содержимому."""
+        path = os.path.join(self._tmp.name, "stage_started.json")
+        with io.open(path, "w", encoding="utf-8") as fh:
+            fh.write(raw if raw is not None else json.dumps(
+                {"name": name, "allow": allow, "pid": 4242, "proc": "4242-1788000000",
+                 "at": "2026-09-05T17:44:28.000001+00:00"}, ensure_ascii=False))
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def _stage_reader(self, path):
+        """Точка инъекции отдаёт ЖИВУЮ функцию сторожа — мокнут только путь файла."""
+        return lambda ts, now: o._wd_stage_busy(ts, now, path=path)
 
     # (a) оборот только что был → ТИШИНА: ни подъёма, ни алертов, ни обращения к CIM.
     def test_a_alive_turn_fresh_silence(self):
@@ -1325,9 +1342,122 @@ class TestWatchdog(Base):
         self.assertIn("40 м 00 с", t)
         self.assertIn("ВЕСЬ ПК-контур стоял", t)                       # цена простоя названа
         self.assertIn("объявленного захода нет", t)
+        self.assertIn("объявленной ступени нет", t)                    # и про ступень — тоже словами
         self.assertIn("taskkill/schtasks", t)                          # и что операция красная
         t2 = o.daemon_hung_card_text(5000.0, 4800.0, [13828])
         self.assertIn("объявленный заход идёт", t2)
+        # ПЕРЕЖИВШАЯ СВОЙ ПОТОЛОК СТУПЕНЬ НАЗВАНА ПО ИМЕНИ: владелец по этой строке решает,
+        # смотреть ему на демон или на канал, который не отвечает.
+        t3 = o.daemon_hung_card_text(5000.0, None, [13828],
+                                     stage=(4200.0, "ступень A: сборка пакета", 3900.0))
+        self.assertIn("объявленная ступень «ступень A: сборка пакета» идёт", t3)
+        self.assertIn("дольше своего потолка", t3)
+
+    # ─── ОБЪЯВЛЕННАЯ СТУПЕНЬ: СБОРКА ПАКЕТА НЕ ВЫГЛЯДИТ СМЕРТЬЮ ДЕМОНА (05.09.2026) ──────────
+    # Числа взяты из ЖИВОГО эпизода pc_orchestrator.log за 05.09, а не выдуманы:
+    #   17:41:24 оборот замкнулся · 17:44:28 началась сборка пакета · 18:13:02 сторож объявил
+    #   «оборота нет 1800с» · 18:15:19 сборка отдала пакет. Тревога опередила продукт на 2 м 17 с.
+    # ЗАМЕР КОРПУСА 03-05.09: сборок с пакетом наружу 39, медиана 1841с, max 1916с при пороге
+    # 1800с — то есть тревога была не случайностью, а устройством.
+    TURN_TS = 1_000_000.0            # 17:41:24, момент последнего оборота
+    STAGE_AT = TURN_TS + 184.0       # 17:44:28, старт сборки
+    ALARM_AT = TURN_TS + 1898.0      # 18:13:02, тик сторожа, объявивший демон вставшим
+
+    def test_declared_package_build_is_work_not_death(self):
+        path = self._stage_file(mtime=self.STAGE_AT)
+        self._turn(self.ALARM_AT - self.TURN_TS, ts=self.TURN_TS)
+        self._wd(lambda: [21464], wall_now=self.TURN_TS + 1598.0,
+                 stage=self._stage_reader(path))                 # тик 18:08: накопитель заводится
+        self.awake = 500.0 + o.WD_PRODUCT_SILENT                 # 18:13: тишина ровно на пороге+
+        r = self._wd(lambda: [21464], wall_now=self.ALARM_AT, stage=self._stage_reader(path))
+        self.assertEqual(r, "alive", "объявленная сборка обязана читаться работой, а не смертью")
+        self.assertEqual(self.pushes, [])                        # владельца не будим
+        self.assertEqual(self.runs["n"], 0)                      # и второй экземпляр не поднимаем
+
+    def test_the_same_silence_without_a_declaration_still_rings(self):
+        """ЗАМОК ПРАВКИ: порог тишины не поднят ни на секунду. Те же факты, но объявления нет —
+        и приговор прежний. Иначе ветка против ложной тревоги стала бы слепотой."""
+        empty = os.path.join(self._tmp.name, "нет-такого.json")
+        self._turn(self.ALARM_AT - self.TURN_TS, ts=self.TURN_TS)
+        self._wd(lambda: [21464], wall_now=self.TURN_TS + 1598.0,
+                 stage=self._stage_reader(empty))
+        self.awake = 500.0 + o.WD_PRODUCT_SILENT + 1
+        r = self._wd(lambda: [21464], wall_now=self.ALARM_AT, stage=self._stage_reader(empty))
+        self.assertEqual(r, "hung")
+        self.assertIn("объявленной ступени нет", self.pushes[0])
+
+    def test_a_stage_that_outlived_its_own_ceiling_rings_too(self):
+        """Объявление даёт СВОЙ потолок, а не бессрочную индульгенцию: пережила его — звеним."""
+        path = self._stage_file(mtime=self.STAGE_AT, allow=3900)
+        self._turn(9000.0, ts=self.TURN_TS)
+        self._wd(lambda: [21464], wall_now=self.STAGE_AT + 3600.0, stage=self._stage_reader(path))
+        self.awake = 500.0 + o.WD_PRODUCT_SILENT + 1
+        r = self._wd(lambda: [21464], wall_now=self.STAGE_AT + 3901.0,
+                     stage=self._stage_reader(path))
+        self.assertEqual(r, "hung")
+        self.assertIn("сборка пакета", self.pushes[0])            # ступень названа по имени
+
+    def test_stage_reader_refuses_every_dubious_declaration(self):
+        """Четыре дороги в «объявления нет», и каждая обязана вести туда, а не в «работает»."""
+        path = self._stage_file(mtime=self.STAGE_AT)
+        self.assertEqual(o._wd_stage_busy(self.TURN_TS, self.STAGE_AT + 100.0, path=path)[0], 100.0)
+        # 1) файла нет вовсе
+        self.assertIsNone(o._wd_stage_busy(self.TURN_TS, self.STAGE_AT, path=path + ".нет"))
+        # 2) отметка НЕ новее последнего оборота — это след прошлой сборки
+        self.assertIsNone(o._wd_stage_busy(self.STAGE_AT + 1.0, self.STAGE_AT + 100.0, path=path))
+        # 3) объявление не разобрано → fail-closed
+        bad = self._stage_file(mtime=self.STAGE_AT, raw="{это не json")
+        self.assertIsNone(o._wd_stage_busy(self.TURN_TS, self.STAGE_AT + 100.0, path=bad))
+        bad2 = self._stage_file(mtime=self.STAGE_AT, raw='{"name": "x", "allow": "много"}')
+        self.assertIsNone(o._wd_stage_busy(self.TURN_TS, self.STAGE_AT + 100.0, path=bad2))
+        # 4) потолок нулевой — ступень сама сказала, что грации не просит
+        zero = self._stage_file(mtime=self.STAGE_AT, allow=0)
+        self.assertIsNone(o._wd_stage_busy(self.TURN_TS, self.STAGE_AT + 100.0, path=zero))
+        # …и ни одна ступень не тише полного headless-прогона: потолок клеммируется
+        greedy = self._stage_file(mtime=self.STAGE_AT, allow=999_999)
+        self.assertEqual(o._wd_stage_busy(self.TURN_TS, self.STAGE_AT + 100.0, path=greedy)[2],
+                         float(o.WD_BUSY_ALLOW))
+
+    # ─── ОТРИЦАТЕЛЬНЫЙ ТЕСТ: ДЕМОН ОСТАНОВЛЕН ПО-НАСТОЯЩЕМУ, ОБЪЯВЛЕНИЯ НЕТ ─────────────────
+    # Здесь ни одна наша ветка не мокнута: продукт замер по-настоящему (строка heartbeat не
+    # меняется ни на одном тике), файла объявления на диске нет, читает его ЖИВАЯ
+    # `_wd_stage_busy`. Подменены ровно две вещи, и обе — красные операции, которых полосе не
+    # отдавали: перечень процессов (CIM) и `schtasks /Run`.
+    def test_negative_truly_stopped_daemon_without_declaration_rings_in_time(self):
+        empty = os.path.join(self._tmp.name, "объявления-нет.json")
+        self.assertFalse(os.path.exists(empty))
+        base, fired_at = 1_000_000.0, None
+        for k in range(1, 10):                       # тики сторожа раз в 5 минут
+            self._turn(300.0 * k, ts=base)           # продукт НЕ меняется: демон встал взаправду
+            self.awake = 500.0 + 300.0 * k
+            r = self._wd(lambda: [13828], wall_now=base + 300.0 * k,
+                         stage=self._stage_reader(empty))
+            if r == "hung":
+                fired_at = base + 300.0 * k
+                break
+        self.assertIsNotNone(fired_at, "остановленный демон не был объявлен ВОВСЕ")
+        # «В СРОК» = не позже порога плюс цена накопителя (первое наблюдение) и одного тика.
+        # Больше этого — уже опоздание, и тест обязан его поймать.
+        self.assertLessEqual(fired_at - base, o.WD_PRODUCT_SILENT + 600.0)
+        self.assertEqual(self.runs["n"], 0)                      # живой процесс сторож НЕ трогает
+        self.assertEqual(len(self.pushes), 1)
+        self.assertIn("НЕ РАБОТАЕТ", self.pushes[0])
+        self.assertIn("объявленной ступени нет", self.pushes[0])
+
+    def test_negative_an_open_declaration_never_shields_a_corpse(self):
+        """Самая опасная дыра новой ветки: объявление, пережившее СМЕРТЬ демона.
+
+        Порядок веток в `watchdog` её и закрывает — процессы спрашиваются ДО оправданий, — но
+        закрыт он должен быть тестом, а не памятью: оправдай мы объявление раньше проверки
+        процессов, подъём после смерти опоздал бы на весь потолок сборки."""
+        path = self._stage_file(mtime=self.STAGE_AT)          # объявление СВЕЖЕЕ и открытое
+        self._turn(400.0, ts=self.TURN_TS)
+        o._heartbeat_fresh = lambda *a, **k: False
+        seq = iter([[], [7777]])                              # процессов демона НЕТ
+        r = self._wd(lambda: next(seq), wall_now=self.STAGE_AT + 60.0,
+                     stage=self._stage_reader(path))
+        self.assertEqual(r, "restarted")
+        self.assertEqual(self.runs["n"], 1, "объявление сборки заслонило собой труп демона")
 
     def test_stopped_switch(self):
         o._stopped = lambda: True
@@ -11485,6 +11615,78 @@ class TestReviewAutoWiring(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(o.REPO, "docs", "review_receipts",
                                                      rec["task_id"] + ".json")),
                          "расписка теста уехала в боевое дерево")
+
+    # ─── УСТУПКА ВИТКА РАБОТЕ ВЛАДЕЛЬЦА (05.09.2026) ──────────────────────────────────
+    # Сборка синхронна и стои́т витку 1841с медианы (замер 03-05.09). Всё это время ряд
+    # владельца, ждущий клейма, ждёт ровно столько же. Пакет второго мнения не срочен
+    # никогда — повод переживёт виток; задача владельца срочна по определению.
+    def _rows(self, **by_status):
+        return lambda status: {"ok": True, "items": list(by_status.get(status, ()))}
+
+    def test_a_waiting_owner_row_takes_the_turn_and_the_build_steps_aside(self):
+        for status in ("new", "approved"):
+            with self.subTest(status=status):
+                rows = self._rows(**{status: [{"id": 16, "lane": "pc", "from": "Filipp",
+                                               "task_text": "одиночка владельца"}]})
+                yielded, why = o._review_auto_owner_wait(rows_fn=rows)
+                self.assertTrue(yielded)
+                self.assertIn("#16", why)
+                self.assertIn("повод не потерян", why)   # уступка это отсрочка, а не отказ
+
+    def test_a_row_that_waits_for_a_human_is_not_waiting_for_a_turn(self):
+        """`needs_approval` сборка не задерживает ни на секунду: он ждёт человека, а не витка.
+        Считай мы его — одна повисшая карточка выключила бы ступень A навсегда."""
+        rows = self._rows(needs_approval=[{"id": 9, "lane": "pc", "from": "Filipp",
+                                           "task_text": "ждёт кнопки"}])
+        self.assertEqual(o._review_auto_owner_wait(rows_fn=rows), (False, ""))
+
+    def test_the_lane_and_the_owner_are_both_judged_by_the_daemons_own_function(self):
+        # чужая полоса и ревизорская info-карточка работой владельца не являются
+        rows = self._rows(new=[{"id": 1, "lane": "srv", "from": "Filipp", "task_text": "чужая"},
+                               {"id": 2, "lane": "pc", "from": o.REVIZOR_OWNER_FROM,
+                                "task_text": "[ревизор] находка"}])
+        self.assertEqual(o._review_auto_owner_wait(rows_fn=rows), (False, ""))
+
+    def test_a_silent_bridge_never_buys_a_silent_death_of_the_stage(self):
+        """Молчащий мост означал бы ВЕЧНУЮ уступку — то есть тихую смерть ступени A по чужой
+        поломке. Отказ направлен в прежнее поведение и назван словами."""
+        yielded, why = o._review_auto_owner_wait(
+            rows_fn=lambda status: {"ok": False, "error_text": "мост молчит"})
+        self.assertFalse(yielded)
+        self.assertIn("очередь не прочитана", why)
+        self.assertIn("иду как прежде", why)
+
+    def test_the_daemon_hands_both_the_bell_and_the_yield_down_to_the_stage(self):
+        """Обе ветки мертвы, если их никто не передаёт вниз: сверяем именно передачу.
+
+        И ВТОРОЕ, РАДИ ЧЕГО ТЕСТ И СТОИ́Т ЗДЕСЬ: уступка спрашивает ЖИВУЮ очередь, поэтому
+        зваться из `maybe_review_auto` напрямую она не смеет — иначе каждый тест, зовущий
+        эту функцию, ходил бы в боевой мост (поймано живьём: прогон вырос до 106с и вернул
+        настоящий ряд полосы). Вопрос задаётся ВНУТРИ оборота, куда тест подставляет свой."""
+        seen = []
+        with mock.patch.object(o, "_flag_forced_off", lambda name: False):
+            o.maybe_review_auto(now=1_000_000.0, tick_path=self.mark,
+                                runner=lambda **kw: seen.append(kw) or {"acted": False, "why": "нет"},
+                                waiter=lambda: (False, ""))
+        self.assertIs(seen[0]["announce"], o._review_auto_announce)
+        self.assertEqual(seen[0]["yield_fn"](), (False, ""))
+        # …а по умолчанию вниз уезжает именно дежурная уступка полосы, а не что-то другое
+        seen2 = []
+        with mock.patch.object(o, "_flag_forced_off", lambda name: False):
+            o.maybe_review_auto(now=2_000_000.0, tick_path=self.mark,
+                                runner=lambda **kw: seen2.append(kw) or {"acted": False, "why": "нет"})
+        self.assertIs(seen2[0]["yield_fn"], o._review_auto_owner_wait)
+
+    def test_the_declared_ceiling_is_derived_from_the_stages_own_hard_limits(self):
+        """Потолок объявления НЕ литерал: он складывается из чисел, которые ступень реально
+        себе позволяет. Разойдись мы с ними — сторож молча отстал бы от ступени."""
+        import review_send_run                                   # noqa: PLC0415
+        self.assertEqual(o._review_auto_stage_allow(),
+                         o.REVIEW_AUTO_TIMEOUT + review_send_run.DEFAULT_MANUS_WAIT
+                         + o.WD_PRODUCT_SILENT)
+        # …и при этом ступень не тише полного headless-прогона — иначе она купила бы себе
+        # больше молчания, чем задача владельца.
+        self.assertLess(o._review_auto_stage_allow(), o.WD_BUSY_ALLOW)
 
     def test_the_turn_is_wired_into_the_loop_next_to_the_revizor(self):
         """Врезка проверяется по ИСХОДНИКУ витка: ветка, которую никто не зовёт, — мёртвая."""
