@@ -3447,6 +3447,10 @@ class TestOtkazVorotam(Base):
                     client_fn=lambda p: list(p), reason_fn=lambda c: None,
                     subject_fn=lambda c: "", trainer_fn=lambda c: "",
                     route_fn=lambda k, h, **kw: (route, "проба"),
+                    # Коммит здесь СИНТЕТИЧЕСКИЙ, а предмет теста — «записан ли повод», а не
+                    # «есть ли такой коммит в git» (проверку наличия завёл 05.09, задание
+                    # 00-no-test-cards.0905). Инжект оставляет тесту его собственный предмет.
+                    commit_known_fn=lambda c: True,
                     asked_fn=lambda *a, **k: asked.append(a) or (True, ""))
                 self.assertEqual(held, ["suggest.py"])
                 self.assertEqual(len(asked), ждём)
@@ -8777,7 +8781,12 @@ class TestNotifyHygiene(unittest.TestCase):
             return _P()
         o.subprocess.Popen = fake_popen
         try:
-            o._notify_critical("тест-инцидент")
+            # Предмет теста — ФЛАГ в argv, а не «пускают ли пробу наружу». С 05.09 дверь демона
+            # спрашивает признак пробы ДО спавна (задание 00-no-test-cards.0905), и прогон теста
+            # он честно зовёт пробой — тогда argv не рождается вовсе и мерить нечего. Подменяем
+            # признак на «боевой», чтобы тест мерил своё. Сам замок держит test_no_test_cards.
+            with mock.patch.object(o, "_live_send_allowed", lambda: (True, "боевой (тест флага)")):
+                o._notify_critical("тест-инцидент")
         finally:
             o.subprocess.Popen = real_popen
         self.assertIn("--critical", captured["argv"])
@@ -10257,10 +10266,16 @@ class TestClientContourGate(Base):
         self.addCleanup(lambda: setattr(o, "_child_reconcile_rejected", save[1]))
         self.addCleanup(lambda: setattr(o, "_last_child_commit", save[0]))
         o._last_child_commit, o._child_reconcile_rejected = "e" * 40, None
-        o.reconcile_children_tick(head_fn=lambda: head40, diff_fn=lambda a, b: ["suggest.py"],
-                                  gate_fn=lambda m: (True, "ok"), restart_fn=self._restart)
-        o._selfupdate_restart_children("e" * 7, short7, diff_fn=lambda a, b: ["suggest.py"],
-                                       restart_fn=self._restart)
+        # Обе дороги идут ЖИВЫМИ входами (в том и смысл голдена), а живой вход `commit_known_fn`
+        # не принимает — поэтому проверку наличия коммита снимаем подменой самой функции.
+        # Предмет здесь — ДЛИНА ключа дедупа, и коммиты голдена нарочно синтетические («1c0ffee»):
+        # спрашивать git про них значило бы мерить не то. Проверку входа по существу держит
+        # test_no_test_cards.TestNesushchestvuyushchiiKommit.
+        with mock.patch.object(o, "_gate_commit_known", lambda c, git_out=None: True):
+            o.reconcile_children_tick(head_fn=lambda: head40, diff_fn=lambda a, b: ["suggest.py"],
+                                      gate_fn=lambda m: (True, "ok"), restart_fn=self._restart)
+            o._selfupdate_restart_children("e" * 7, short7, diff_fn=lambda a, b: ["suggest.py"],
+                                           restart_fn=self._restart)
 
     def test_dedup_odin_kommit_dvumya_dorogami_odna_kartochka(self):
         """(а) Оба входа на ОДИН коммит в одном тике → карточка ОДНА, хотя длины 9 и 7."""
@@ -10285,6 +10300,9 @@ class TestClientContourGate(Base):
         for c in ("staraya-metka", "novaya-metka"):
             o._client_block(["userbot"], c, ["suggest.py"], where="тест", subject="s",
                             notifier=lambda _c, t: cards.append(t), cowork=lambda t: None, state=st,
+                            # Метки НАРОЧНО не хеши — в том и предмет. Наличие в git спрашивать
+                            # здесь нечего (проверка входа заведена 05.09): инжект держит предмет.
+                            commit_known_fn=lambda _c: True,
                             reason_fn=lambda x, *a, **k: None, trainer_fn=lambda x: "нет прогона")
         self.assertEqual(len(cards), 2, cards)
 

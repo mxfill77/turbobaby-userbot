@@ -29,6 +29,18 @@ import pc_orchestrator as o            # noqa: E402
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
+# КОММИТ ДЛЯ ГОЛДЕНОВ ВОРОТ БЕРЁТСЯ ЖИВОЙ (05.09.2026, задание 00-no-test-cards.0905).
+# До этого дня здесь стоял литерал `new777`, и он же четырежды уехал владельцу в ночном потоке
+# 05:14:37–05:14:56: карточка ворот просила решения про коммит, которого в git нет, а команда
+# отката в ней (`git revert --no-edit new777`) была заведомо неисполнима. С 05.09 ворота такую
+# карточку НЕ СОБИРАЮТ вовсе (`pc_orchestrator._gate_commit_known`) — несуществующий коммит это
+# дефект вызова, а не повод спросить владельца. Предмет этих тестов — «клиентский файл в
+# диапазоне удерживает детей», а не «на что похож хеш»: живой HEAD проверяет ровно предмет и
+# перестаёт зависеть от выдуманной метки. Фолбэк на литерал оставлен для дерева без git —
+# набор не обязан краснеть там, где git недоступен (тогда карточку не соберут, и голден это
+# честно покажет).
+LIVE_COMMIT = (o._git_out(["rev-parse", "HEAD"]) or "new777")
+
 
 def mkrepo(files):
     """Мини-репозиторий на диске под граф импортов. → путь (чистится в tearDown)."""
@@ -353,7 +365,7 @@ class TestVorotaVyhoda(GateBase):
 
     def test_selfupdate_deti_derzhatsya_a_agent_net(self):
         """self-update демона: клиентский файл в диапазоне → детей-ботов не рестартим."""
-        out = o._selfupdate_restart_children("old", "new777",
+        out = o._selfupdate_restart_children("old", LIVE_COMMIT,
                                              diff_fn=lambda a, b: ["suggest.py", "pc_orchestrator.py"],
                                              restart_fn=self.restart)
         self.assertEqual(self.restarts, [])
@@ -363,7 +375,7 @@ class TestVorotaVyhoda(GateBase):
     def test_selfupdate_vnutrennii_diapazon_edet(self):
         """В диапазоне только внутреннее, но карта ведёт на userbot → применяем как раньше."""
         with mock.patch.object(o, "_dirty_block", lambda *a, **k: []):
-            out = o._selfupdate_restart_children("old", "new777",
+            out = o._selfupdate_restart_children("old", LIVE_COMMIT,
                                                  diff_fn=lambda a, b: ["moderation_ipc.py"],
                                                  restart_fn=self.restart)
         # moderation_ipc.py — КЛИЕНТСКИЙ по графу (его импортит userbot_listen), значит держим

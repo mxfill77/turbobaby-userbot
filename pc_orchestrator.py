@@ -1051,12 +1051,54 @@ def _srv_delivery():
         log.warning("доставка серверной полосы не запущена: %s", e)
 
 
+def _live_send_allowed():
+    """Боевой это вызов или ПРОБА → (ok, why). Признак ОДИН на полосу и живёт в
+    `dispatch_notify.probe_verdict` — здесь его не переписывают, а спрашивают: два экземпляра
+    правила разъезжаются, и разъехавшись, глушат разное.
+
+    ПОЧЕМУ ПРОВЕРЯЕМ ЗДЕСЬ, А НЕ ТОЛЬКО В `dispatch_notify` (05.09.2026, замер). Замок внутри
+    notify смотрит на точку входа СВОЕГО процесса, а демон зовёт notify ОТДЕЛЬНЫМ ПРОЦЕССОМ —
+    и у того точка входа всегда `dispatch_notify.py`, то есть всегда «боевая». Ровно этой щелью
+    ночью 05.09 и вышли 15 пробных карточек: прогон `test_client_contour.py` дошёл до
+    `_notify_gate_card`, тот спавнил CLI, а CLI про своего родителя не знал ничего. Судить о
+    пробе может только тот, КТО ЗОВЁТ, — поэтому вопрос задаётся до спавна, в процессе-родителе.
+
+    FAIL-OPEN, И ЭТО ВЫБОР. Не смогли спросить признак (модуль не импортировался) — отправляем.
+    Запрет задания касается проб, а НЕ боевого пути: «настоящие карточки не глушить» весит больше,
+    чем лишняя проба при сломанном импорте, а у ребёнка стои́т свой замок. Промах громкий: строка
+    в журнал уходит в обоих исходах."""
+    try:
+        import dispatch_notify
+        is_probe, why = dispatch_notify.probe_verdict()
+        if is_probe and not dispatch_notify._LIVE_FROM_PROBE:
+            return False, why
+        return True, why
+    except Exception as e:
+        log.warning("признак пробы недоступен (%s) — отправляю: глушить настоящее нельзя",
+                    type(e).__name__)
+        return True, "признак недоступен"
+
+
+def _dnotify_spawn(tail, what):
+    """ЕДИНСТВЕННАЯ дверь демона наружу, к владельцу. → True = процесс отправки запущен.
+
+    Все пуши полосы (простой, карточка цепи, карточка ворот, критический, в тему) идут ЧЕРЕЗ неё
+    и потому судятся одним замком. Замок, поставленный в каждую дверь по отдельности, закрывает
+    только те, что кто-то вспомнил."""
+    live, why = _live_send_allowed()
+    if not live:
+        log.warning("ВЛАДЕЛЬЦУ НЕ ОТПРАВЛЕНО (%s) — это проба, а не боевой вызов: %s", what, why)
+        return False
+    subprocess.Popen([VENV_PY, DNOTIFY] + [str(a) for a in tail], cwd=REPO,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+    return True
+
+
 def _notify(text):
     """Пуш Филиппу через dispatch_notify (fire-and-forget, человекочитаемо)."""
     try:
-        subprocess.Popen([VENV_PY, DNOTIFY, text], cwd=REPO,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                         creationflags=NO_WINDOW)
+        _dnotify_spawn([text], "пуш")
     except Exception as e:
         log.warning("пуш не отправлен: %s", e)
 
@@ -1122,9 +1164,7 @@ def _notify_chain_card(pid, text, state_path=None, spawn=None):
         if spawn is not None:
             spawn(pid, text)
         else:
-            subprocess.Popen([VENV_PY, DNOTIFY, "--card", str(pid), str(text)], cwd=REPO,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+            _dnotify_spawn(["--card", pid, text], f"карточка цепи pid={pid}")
     except Exception as e:
         log.warning("карточка цепи не отправлена (pid=%s): %s", pid, e)
         return False
@@ -1147,9 +1187,7 @@ def _notify_gate_card(commit, text):
 
     Сбой доставки тик демона не роняет — как у всех прочих пушей."""
     try:
-        subprocess.Popen([VENV_PY, DNOTIFY, "--gate-card", str(commit), str(text)], cwd=REPO,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        _dnotify_spawn(["--gate-card", commit, text], f"карточка ворот {commit}")
     except Exception as e:
         log.warning("карточка ворот не отправлена (%s): %s", commit, e)
 
@@ -1161,9 +1199,7 @@ def _notify_critical(text):
     Fire-and-forget: сбой доставки НЕ роняет тик демона. Гигиена пульта: сюда идут ТОЛЬКО реальные
     инциденты (не рутинные done/failed задач — те видны в темах постановки 328/829, см. _notify_task)."""
     try:
-        subprocess.Popen([VENV_PY, DNOTIFY, "--critical", text], cwd=REPO,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                         creationflags=NO_WINDOW)
+        _dnotify_spawn(["--critical", text], "критический пуш")
     except Exception as e:
         log.warning("критический пуш не отправлен: %s", e)
 
@@ -1173,9 +1209,7 @@ def _notify_topic(topic, text):
     завёл детектор немоты (session_watch, 29.07): тема постановки задач 328, фолбэк инбокс 1160 →
     личка реализован внутри dispatch_notify. Fire-and-forget: сбой доставки НЕ роняет тик демона."""
     try:
-        subprocess.Popen([VENV_PY, DNOTIFY, "--topic", str(topic), text], cwd=REPO,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                         creationflags=NO_WINDOW)
+        _dnotify_spawn(["--topic", topic, text], f"сигнал в тему {topic}")
     except Exception as e:
         log.warning("сигнал в тему %s не отправлен: %s", topic, e)
 
@@ -7016,9 +7050,30 @@ def _commit_subject(commit):
     return _git_out(["log", "-1", "--format=%s", str(commit)]) or ""
 
 
+def _gate_commit_known(commit, git_out=None):
+    """Есть ли ЭТОТ коммит в ЭТОМ репозитории. → True/False. Fail-closed по построению.
+
+    Спрашиваем `git cat-file -e <commit>^{commit}` — то есть «разрешается ли метка в объект типа
+    коммит», а не «похожа ли она на хеш». Похожесть здесь не годится: `new777` на хеш не похож и
+    отсеялся бы, а вот подставленный `deadbeef` похож — и прошёл бы, оставаясь несуществующим.
+    Суффикс `^{commit}` обязателен: без него `cat-file -e` зеленеет на ЛЮБОМ объекте, включая
+    дерево и блоб, а карточка ворот говорит про коммит и предлагает `git revert`.
+
+    Пустая метка, ошибка git, таймаут — всё это НЕ «коммит есть». Не смогли доказать наличие —
+    значит для карточки его нет: спросить владельца про несуществующий коммит хуже, чем промолчать
+    и оставить строку в журнале."""
+    c = str(commit or "").strip()
+    if not c:
+        return False
+    try:
+        return (git_out or _git_out)(["cat-file", "-e", c + "^{commit}"]) is not None
+    except Exception:
+        return False
+
+
 def _client_block(kinds, commit, paths, where, subject=None, notifier=None, cowork=None,
                   state=None, reason_fn=None, client_fn=None, subject_fn=None, trainer_fn=None,
-                  route_fn=None, asked_fn=None):
+                  route_fn=None, asked_fn=None, commit_known_fn=None):
     """ВОРОТА клиентского контура. → список клиентских файлов (применять НЕЛЬЗЯ) | [] (можно).
 
     Отказ — не молчание: лог + строка в журнал + карточка владельцу с коммитом, поимённым списком
@@ -7076,6 +7131,21 @@ def _client_block(kinds, commit, paths, where, subject=None, notifier=None, cowo
                ("; карточка владельцу НЕ отправлена — " + why) if muted else ""))
         if muted:
             log.info("ворота контура (%s): карточка владельцу НЕ отправлена — %s", where, why)
+            return held
+        # ПОДЛОГ ВХОДА: КОММИТА НЕТ В РЕПОЗИТОРИИ (05.09.2026). Ночью 05.09 владельцу ушли карточки
+        # ворот на `new777` — метку, которой в git нет и не было: она литерал юнит-теста
+        # (test_client_contour.py:356). Карточка просила решения про коммит, которого не существует,
+        # и `git revert --no-edit new777` в ней был заведомо неисполним. Это ДЕФЕКТ ВЫЗОВА, а не
+        # повод спросить владельца, — поэтому карточка тут не собирается ВОВСЕ, а не собирается и
+        # придерживается. Ворота решением не тронуты: `held` возвращается тот же, отказ уже записан
+        # выше, живые боты остались на прежнем коде. Молчать об этом нельзя — строка идёт в журнал
+        # демона и в ленту: невидимый отказ собрать карточку неотличим от потерянной карточки.
+        if not (commit_known_fn or _gate_commit_known)(commit):
+            log.error("ворота контура (%s): карточка НЕ СОБРАНА — коммита «%s» нет в репозитории; "
+                      "это дефект вызова, а не повод спросить владельца", where, commit)
+            (cowork or _cowork)(
+                "ворота клиентского контура: карточка владельцу НЕ СОБРАНА — коммита %s нет в "
+                "репозитории (дефект вызова); отказ в силе, боты на прежнем коде" % (commit,))
             return held
         # КАРТОЧКА С КНОПКАМИ (05.09.2026): notifier по умолчанию — `_notify_gate_card`, который
         # берёт коммит первым доводом. Прежний `_notify` остался у всех остальных пушей; здесь он

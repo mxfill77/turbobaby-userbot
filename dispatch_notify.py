@@ -109,8 +109,106 @@ INBOX_THREAD_ID = int(os.getenv("HQ_INBOX_THREAD_ID", "1160"))
 TASKS_THREAD_ID = int(os.getenv("HQ_TASKS_TOPIC", "328"))
 
 
+# ═══════════ ЗАМОК 1: ПРОБА НЕ ПИШЕТ ВЛАДЕЛЬЦУ ВЖИВУЮ (05.09.2026) ═══════════
+# ПОВОД, ЗАМЕРЕННЫЙ, А НЕ ПРИДУМАННЫЙ. В ночь на 05.09 владельцу за 19 секунд (05:14:37–05:14:56)
+# упало 16 карточек ворот подряд — на коммиты `4528917`, `452891745`, `d860a9ad1` (июльские и
+# августовские, к той ночи отношения не имевшие) и `new777`, которого в репозитории нет вовсе.
+# Живые ворота в это время не отказывали НИ РАЗУ: в `pc_orchestrator.log` за 05:14 нет ни одной
+# строки «ОСТАНОВЛЕНО», только вотчдог. То есть весь поток дала ПРОБА, ходившая боевым путём
+# отправки. Настоящих поводов за сутки было три.
+#
+# ПОЧЕМУ ЗАМОК СТОИТ ИМЕННО ЗДЕСЬ, В `_api`. Это ЕДИНСТВЕННОЕ место, где модуль трогает сеть:
+# через него идут send, send_critical, send_topic, send_topic_strict, edit_topic_strict — и любая
+# дверь, которую здесь заведут завтра. Замок, поставленный в каждую дверь по отдельности, protect
+# только те двери, которые кто-то вспомнил; поставленный в горлышко — все.
+#
+# ПРИЗНАК СТРУКТУРНЫЙ, А НЕ ФЛАГ. Флаг «это тест» проваливается ровно тем, что следующий заход
+# забудет его выставить, и поток повторится. Поэтому мы не спрашиваем зовущего, кто он, а СМОТРИМ
+# НА ТОЧКУ ВХОДА ПРОЦЕССА: боевые входы полосы — это файлы, лежащие В КОРНЕ репозитория
+# (pc_orchestrator.py, pc_agent.py, dispatch_notify.py, pretool_guard.py, expectations_pc_run.py,
+# deploy_voice.py, lesson_regress.py, rc_supervisor.py, review_audit_run.py — все до одного).
+# Пробы и тесты живут ГДЕ УГОДНО ЕЩЁ: `_scratch_*/x.py`, `tmp/x.py`, `test_*.py`, `python -c`,
+# REPL, чужое дерево. Автору пробы не надо помнить НИ О ЧЁМ — молчание получается само.
+#
+# FAIL-CLOSED: всё, чего не удалось разобрать (точки входа нет, путь не разобрался), считается
+# ПРОБОЙ. Не смогли доказать, что вызов боевой — значит он не боевой.
+REPO_ROOT = HERE
+
+# Явно и намеренно разрешённая живая отправка ИЗ ПРОБЫ. Процесс-локальная переменная, а НЕ
+# переменная окружения — и это выбор, а не мелочь: env наследуется детьми и переживает скрипт,
+# поэтому один раз выставленный `LIVE=1` в оболочке разрешил бы отправку всем следующим пробам
+# смены, то есть вернул бы ровно тот класс, от которого замок и заводится. Здесь разрешение
+# умирает вместе с процессом, который его выдал.
+_LIVE_FROM_PROBE = ""
+
+
+def allow_live_from_probe(reason):
+    """ЯВНОЕ НАМЕРЕННОЕ ДЕЙСТВИЕ, которым проба берёт на себя живую отправку владельцу.
+
+    Причина обязана быть названа СЛОВАМИ и уходит в лог: разрешение, которого потом не найти в
+    журнале, неотличимо от дефекта. Пустая причина — ValueError, а не «разрешено молча»."""
+    global _LIVE_FROM_PROBE
+    r = str(reason or "").strip()
+    if not r:
+        raise ValueError("allow_live_from_probe: причина обязана быть названа словами — "
+                         "живая отправка владельцу без названной причины не разрешается")
+    _LIVE_FROM_PROBE = r
+    _log.info(f"ЖИВАЯ ОТПРАВКА ИЗ ПРОБЫ РАЗРЕШЕНА ЯВНО: {r}")
+    return r
+
+
+def _entry_point():
+    """Абсолютный путь файла, С КОТОРОГО ЗАПУЩЕН процесс. Пустая строка = входа нет."""
+    p = getattr(sys.modules.get("__main__"), "__file__", None) or (sys.argv[0] if sys.argv else "")
+    try:
+        return os.path.abspath(p) if p else ""
+    except Exception:
+        return ""
+
+
+def probe_verdict(entry=None, env=None):
+    """ЧИСТАЯ функция «это проба?» → (is_probe: bool, why: str).
+
+    Всё, о чём судит, принимает доводами — поэтому проверяется тестом без сети и без подстроенного
+    процесса. `entry` — путь точки входа, `env` — окружение."""
+    env = os.environ if env is None else env
+    entry = _entry_point() if entry is None else entry
+    if env.get("PYTEST_CURRENT_TEST"):
+        return True, "идёт тест (PYTEST_CURRENT_TEST)"
+    if not entry:
+        return True, "точка входа не названа (python -c / REPL / встроенный интерпретатор)"
+    base = os.path.basename(entry)
+    if base.startswith("test_") or base.endswith("_test.py"):
+        return True, f"точка входа — тест «{base}»"
+    try:
+        d = os.path.dirname(os.path.abspath(entry))
+        root = os.path.normcase(os.path.abspath(REPO_ROOT))
+        same = os.path.normcase(d) == root
+    except Exception:
+        return True, f"путь точки входа «{entry}» не разобрался"
+    if not same:
+        return True, f"точка входа «{base}» лежит НЕ в корне репозитория ({d})"
+    return False, f"боевая точка входа «{base}» в корне репозитория"
+
+
+def live_send_verdict():
+    """Пускать ли этот вызов в сеть → (ok: bool, why: str). Замок 1 целиком."""
+    is_probe, why = probe_verdict()
+    if not is_probe:
+        return True, why
+    if _LIVE_FROM_PROBE:
+        return True, f"проба ({why}), но живая отправка разрешена явно: {_LIVE_FROM_PROBE}"
+    return False, why
+
+
 def _api(method, payload):
-    """POST в Bot API. Возвращает (ok, body). Токен/URL НЕ логируем."""
+    """POST в Bot API. Возвращает (ok, body). Токен/URL НЕ логируем.
+
+    ЗАМОК 1 (см. выше) стои́т ПЕРВОЙ строкой: из пробы наружу по умолчанию не уходит ничего."""
+    live, why = live_send_verdict()
+    if not live:
+        _log.info(f"ЖИВАЯ ОТПРАВКА НЕ СДЕЛАНА — это проба: {method} — {why}")
+        return False, {"ok": False, "description": "проба: живая отправка владельцу запрещена — " + why}
     url = "https://api.telegram.org/bot" + TOKEN + "/" + method
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
