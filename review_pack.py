@@ -717,6 +717,20 @@ def _short(sha):
     return sha[:12] if isinstance(sha, str) and sha else _NA
 
 
+def _lines_cell(src):
+    """Ячейка «строки» в таблице источников. → str.
+
+    Сплошной кусок печатается как прежде («1-80»). ВЫБОРКА обязана назвать себя
+    прямо здесь: «1-301 · показано 150» — иначе диапазон 1-301 читается как «весь
+    файл приложен», и ревьюер судит работу по трети текста, не зная об этом.
+    """
+    plain = "%d-%d" % (src["start_line"], src["end_line"])
+    kept = src.get("excerpt_lines")
+    if kept is None or not src.get("gaps"):
+        return plain
+    return "%s · показано %d" % (plain, kept)
+
+
 def _table(header, rows):
     out = ["| " + " | ".join(header) + " |", "|" + "|".join(["---"] * len(header)) + "|"]
     for row in rows:
@@ -863,7 +877,7 @@ def render_review_pack(pack):
                 src["lane"],
                 src["evidence_status"],
                 "да" if src["required"] else "нет",
-                "%d-%d" % (src["start_line"], src["end_line"]),
+                _lines_cell(src),
                 str(src["excerpt_chars"]),
                 "`%s`" % _short(src["source_sha256"]),
                 "`%s`" % _short(src["excerpt_sha256"]),
@@ -879,6 +893,32 @@ def render_review_pack(pack):
     else:
         lines.append("%s источников в пакете нет" % _NA)
     lines.append("")
+
+    # ПРОПУСКИ ВНУТРИ ИСТОЧНИКА — отдельным разделом и ДО «опущено». «Опущено» —
+    # это про файлы, которых нет в пакете вовсе; здесь про файл, который ЕСТЬ, но
+    # приложен не целиком. Слепив их, ревьюер решает, что видит источник целиком.
+    # Раздела нет, когда пропусков нет: прежние пакеты рендерятся байт в байт.
+    gapped = [src for src in p["sources"] if src.get("gaps")]
+    if gapped:
+        lines.append("## ПРОПУЩЕНО ВНУТРИ ИСТОЧНИКОВ (чего ревьюер НЕ видит)")
+        lines.append("")
+        lines.append("Источник приложен ВЫБОРКОЙ разделов, а не первыми N строками: место отдано")
+        lines.append("цели, критериям приёмки, результату, ограничениям и спорному доказательству,")
+        lines.append("остальное — по остатку. Не вошедшее названо здесь и помечено в самом тексте.")
+        lines.append("")
+        for src in gapped:
+            missing = sum(int(g.get("lines") or 0) for g in src["gaps"])
+            lines.append(
+                "- `%s` — показано %s из %s строк, не вошло %d: %s"
+                % (
+                    src["path"],
+                    src.get("excerpt_lines", _NA),
+                    src.get("source_lines", _NA),
+                    missing,
+                    ", ".join("%d–%d (%d)" % (g["start"], g["end"], g["lines"]) for g in src["gaps"]),
+                )
+            )
+        lines.append("")
 
     lines.append("## ОПУЩЕНО (omitted)")
     lines.append("")

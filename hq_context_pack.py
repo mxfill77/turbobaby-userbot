@@ -41,6 +41,13 @@ OMISSION_REASONS = ("missing", "unreadable", "context_limit")
 
 OBJECTIVE_MAX_CHARS = 1000
 
+# Пропуск ВНУТРИ источника называется В ТЕЛЕ, а не только в таблице. Ревьюер
+# читает тело — и «текст просто кончился» и «отсюда вырезано 45 строк» обязаны
+# для него различаться, иначе он посоветует то, что уже сделано в невидимой ему
+# части (замер 05.09: 56 пакетов из 76 резались на строке 80, медианная доля
+# переданного артефакта 36.2%).
+GAP_MARK = "[… ПРОПУЩЕНО %d строк(и): %d–%d — в пакет не вошли …]\n"
+
 # Hard denylist: any path *segment* that contains one of these tokens is denied,
 # no matter how the caller spells the manifest. Note it is ``logs`` (not ``log``)
 # to match the contract literally.
@@ -157,6 +164,66 @@ def _validate_route(route):
     return {k: route[k] for k in sorted(route)}
 
 
+def _validate_line_ranges(value, start_line, end_line, source_index):
+    """Необязательная ВЫБОРКА строк внутри объявленного окна. → [(s, e), …].
+
+    Ключа нет вовсе → ``None``, и источник едет сплошным куском ровно как
+    раньше: манифест, хеши и тело такого источника не сдвигаются ни на байт.
+
+    Диапазоны обязаны идти по возрастанию и не пересекаться. Пересечение
+    напечатало бы строку дважды (и удвоило бы её в хеше выдержки), обратный
+    порядок перемешал бы текст — выдержка перестала бы быть выдержкой.
+    """
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ContextPackError(
+            "invalid_line_ranges", "source[%d] line_ranges must be a non-empty list" % source_index
+        )
+    out = []
+    prev_end = 0
+    for j, pair in enumerate(value):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ContextPackError(
+                "invalid_line_ranges", "source[%d] line_ranges[%d] must be a [start, end] pair" % (source_index, j)
+            )
+        start, end = pair
+        for bound in (start, end):
+            if not isinstance(bound, int) or isinstance(bound, bool):
+                raise ContextPackError(
+                    "invalid_line_ranges", "source[%d] line_ranges[%d] bounds must be ints" % (source_index, j)
+                )
+        if end < start or start < start_line or end > end_line:
+            raise ContextPackError(
+                "invalid_line_ranges",
+                "source[%d] line_ranges[%d]=%d-%d is not inside the declared window %d-%d"
+                % (source_index, j, start, end, start_line, end_line),
+            )
+        if start <= prev_end:
+            raise ContextPackError(
+                "invalid_line_ranges",
+                "source[%d] line_ranges[%d]=%d-%d overlaps or precedes the previous range" % (source_index, j, start, end),
+            )
+        prev_end = end
+        out.append((start, end))
+    return out
+
+
+def _gaps_for(ranges, start_line, end_line):
+    """Дополнение выборки внутри окна. → [{'start','end','lines'}, …].
+
+    Пропуск — это ФАКТ вычитания, а не мнение сборщика: что не попало ни в один
+    диапазон, то ревьюер не увидит, и оно обязано быть названо числом строк.
+    """
+    gaps = []
+    cursor = start_line
+    for start, end in ranges:
+        if start > cursor:
+            gaps.append({"start": cursor, "end": start - 1, "lines": start - cursor})
+        cursor = end + 1
+    if cursor <= end_line:
+        gaps.append({"start": cursor, "end": end_line, "lines": end_line - cursor + 1})
+    return gaps
+
+
 def _validate_coverage_plan(coverage_plan):
     if coverage_plan is None:
         return None
@@ -220,6 +287,9 @@ def _validate_manifest(source_manifest, root):
                 "source[%d] inclusive range %d-%d is not a positive ordered range" % (i, start_line, end_line),
             )
 
+        raw_ranges = record.get("line_ranges")
+        line_ranges = None if raw_ranges is None else _validate_line_ranges(raw_ranges, start_line, end_line, i)
+
         deny_token = _is_denylisted(path)
 
         full = _resolve_within_root(root, path)
@@ -236,6 +306,7 @@ def _validate_manifest(source_manifest, root):
                 "required": required,
                 "start_line": start_line,
                 "end_line": end_line,
+                "line_ranges": line_ranges,
                 "full_path": full,
                 "deny_token": deny_token,
             }
@@ -245,8 +316,9 @@ def _validate_manifest(source_manifest, root):
 
 def _manifest_evidence(validated):
     """Canonical manifest hash pre-image (order-sensitive, path/role/range/etc)."""
-    canonical_records = [
-        {
+    canonical_records = []
+    for v in validated:
+        rec = {
             "path": v["path"],
             "role": v["role"],
             "lane": v["lane"],
@@ -255,8 +327,12 @@ def _manifest_evidence(validated):
             "start_line": v["start_line"],
             "end_line": v["end_line"],
         }
-        for v in validated
-    ]
+        # Ключ добавляется ТОЛЬКО когда выборка объявлена: иначе хеш манифеста
+        # сдвинулся бы у всех прежних пакетов, и старое перестало бы сверяться
+        # с новым по одному и тому же числу.
+        if v.get("line_ranges") is not None:
+            rec["line_ranges"] = [list(pair) for pair in v["line_ranges"]]
+        canonical_records.append(rec)
     return _sha256_text(_canonical(canonical_records)), canonical_records
 
 
@@ -265,6 +341,30 @@ def _read_source(v):
     with open(v["full_path"], "r", encoding="utf-8") as fh:
         content = fh.read()
     return content
+
+
+def _render_excerpt(lines, ranges, start_line, end_line):
+    """Тело выдержки: куски файла плюс НАЗВАННЫЕ пропуски между ними. → str.
+
+    Сплошной источник (один диапазон во всё окно) рендерится ровно как прежде —
+    ни одной метки: иначе прежние пакеты перестали бы совпадать байт в байт.
+    """
+    def _nl(chunk):
+        return chunk if chunk.endswith("\n") or chunk == "" else chunk + "\n"
+
+    if list(ranges) == [(start_line, end_line)]:
+        return _nl("".join(lines[start_line - 1 : end_line]))
+
+    segments = [(start, end, True) for start, end in ranges]
+    segments += [(gap["start"], gap["end"], False) for gap in _gaps_for(ranges, start_line, end_line)]
+    segments.sort(key=lambda seg: seg[0])
+    parts = []
+    for start, end, keep in segments:
+        if keep:
+            parts.append(_nl("".join(lines[start - 1 : end])))
+        else:
+            parts.append(GAP_MARK % (end - start + 1, start, end))
+    return "".join(parts)
 
 
 def _blocked(reason, case_id, task_class, detail, extra=None):
@@ -371,22 +471,32 @@ def build_context_pack(
                 "source %r range %d-%d exceeds %d line(s)" % (v["path"], v["start_line"], v["end_line"], len(lines)),
             )
 
-        excerpt = "".join(lines[v["start_line"] - 1 : v["end_line"]])
-        accepted.append(
-            {
-                "path": v["path"],
-                "role": v["role"],
-                "lane": v["lane"],
-                "evidence_status": v["evidence_status"],
-                "required": v["required"],
-                "start_line": v["start_line"],
-                "end_line": v["end_line"],
-                "source_sha256": _sha256_text(content),
-                "excerpt_sha256": _sha256_text(excerpt),
-                "excerpt_chars": len(excerpt),
-                "_excerpt": excerpt,
-            }
-        )
+        ranges = v["line_ranges"] or [(v["start_line"], v["end_line"])]
+        # ВЫДЕРЖКА — только строки файла, без наших вставок: её sha256 обязан
+        # оставаться хешем ТЕКСТА ИСТОЧНИКА, иначе доказательство превращается в
+        # доказательство нашей же разметки. Метки пропусков живут в ТЕЛЕ.
+        excerpt = "".join("".join(lines[start - 1 : end]) for start, end in ranges)
+        rendered = _render_excerpt(lines, ranges, v["start_line"], v["end_line"])
+        src = {
+            "path": v["path"],
+            "role": v["role"],
+            "lane": v["lane"],
+            "evidence_status": v["evidence_status"],
+            "required": v["required"],
+            "start_line": v["start_line"],
+            "end_line": v["end_line"],
+            "source_sha256": _sha256_text(content),
+            "excerpt_sha256": _sha256_text(excerpt),
+            "excerpt_chars": len(excerpt),
+            "_excerpt": excerpt,
+            "_rendered": rendered,
+        }
+        if v["line_ranges"] is not None:
+            src["line_ranges"] = [list(pair) for pair in ranges]
+            src["gaps"] = _gaps_for(ranges, v["start_line"], v["end_line"])
+            src["excerpt_lines"] = sum(end - start + 1 for start, end in ranges)
+            src["source_lines"] = len(lines)
+        accepted.append(src)
 
     # ---- Deterministic size enforcement over the assembled body ----
     def _block_for(src):
@@ -399,7 +509,7 @@ def build_context_pack(
                 src["evidence_status"],
                 src["start_line"],
                 src["end_line"],
-                src["_excerpt"] if src["_excerpt"].endswith("\n") or src["_excerpt"] == "" else src["_excerpt"] + "\n",
+                src["_rendered"],
             )
         )
 
@@ -462,8 +572,9 @@ def build_context_pack(
                     }
                 )
 
-    sources_out = [
-        {
+    sources_out = []
+    for s in accepted_by_order:
+        rec = {
             "path": s["path"],
             "role": s["role"],
             "lane": s["lane"],
@@ -475,8 +586,10 @@ def build_context_pack(
             "excerpt_sha256": s["excerpt_sha256"],
             "excerpt_chars": s["excerpt_chars"],
         }
-        for s in accepted_by_order
-    ]
+        for key in ("line_ranges", "gaps", "excerpt_lines", "source_lines"):
+            if key in s:
+                rec[key] = s[key]
+        sources_out.append(rec)
 
     pack = {
         "schema": SCHEMA,

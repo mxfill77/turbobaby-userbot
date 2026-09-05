@@ -793,5 +793,204 @@ class TestLiveChannelStillGoesOut(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.root, *report["pack"].split("/"))))
 
 
+def _artifact_text(filler_lines):
+    """Синтетический артефакт полосы: шапка, главные разделы и середина-наполнитель.
+
+    Заголовки взяты в живом написании артефактов ПК («ЦЕЛЬ», «КРИТЕРИИ ПРИЁМКИ»,
+    «РЕЗУЛЬТАТ», «ЗАПРЕТЫ И ОГРАНИЧЕНИЯ», «СПОРНОЕ ДОКАЗАТЕЛЬСТВО»), а не в
+    придуманном: срез судят по НИМ, и голден на выдуманных словах зеленел бы, пока
+    живой артефакт резался бы по-прежнему.
+    """
+    lines = ["# Артефакт полосы ПК — проба среза", "", "FACT: строка жизни в шапке.", ""]
+    lines += ["## ЦЕЛЬ", "", "Проверить, что место достаётся главному, а не первым строкам.", ""]
+    lines += ["## СЕРЕДИНА %d" % i for i in range(0, 0)]
+    for i in range(filler_lines // 4):
+        lines += ["## ПОДРОБНОСТЬ %d" % i, "", "строка наполнителя номер %d" % i, ""]
+    lines += ["## КРИТЕРИИ ПРИЁМКИ", "", "Приёмка: цель и результат видны ревьюеру целиком.", ""]
+    lines += ["## РЕЗУЛЬТАТ", "", "Итог: доля переданного выросла, пропуски названы.", ""]
+    lines += ["## ЗАПРЕТЫ И ОГРАНИЧЕНИЯ", "", "Потолок пакета не поднимался ни на знак.", ""]
+    lines += ["## СПОРНОЕ ДОКАЗАТЕЛЬСТВО", "", "Контрфакт: без выборки ревьюер видел треть текста.", ""]
+    return "\n".join(lines) + "\n"
+
+
+class TestArtifactOrder(unittest.TestCase):
+    """Артефакт едет ГЛАВНЫМ, а не первым (правка 05.09.2026, находка внешнего аудита F3).
+
+    Два ОТРИЦАТЕЛЬНЫХ теста здесь обязательны и стоят первыми: длинный артефакт
+    обязан сохранить цель/критерии/результат и порезать СЕРЕДИНУ, а короткий —
+    доехать ЦЕЛИКОМ и БЕЗ единой пометки о пропусках. Второй ловит ровно ту
+    ошибку, которой такая правка обычно и кончается: пакет начинает объявлять
+    пропуск там, где ничего не пропущено.
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="reviewauto_order_")
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def _artifact(self, rel, text):
+        review_auto_run.write_text(os.path.join(self.root, *rel.split("/")), text)
+        return rel
+
+    def _pack(self, rec, plans, held=()):
+        counts = review_auto_run.line_counts(self.root, [review_auto.receipt_rel(rec)] + list(plans))
+        case = review_auto.case_for_chain(rec, "2026-09-05", line_counts=counts,
+                                          artifact_sources=list(plans), held_artifacts=list(held),
+                                          artifact_plans=plans)
+        return review_pack.build_review_pack(case, root=self.root, frame_version=_FRAME)
+
+    # ── ОТРИЦАТЕЛЬНЫЙ 1: длиннее потолка ──
+    def test_long_artifact_keeps_goal_criteria_result_and_cuts_the_middle(self):
+        rec = _receipt(commits=2)
+        review_auto_run.write_text(
+            os.path.join(self.root, *review_auto.receipt_rel(rec).split("/")),
+            json.dumps(rec, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        rel = self._artifact("docs/artifacts/2026-09-05-длинный.md", _artifact_text(400))
+        plans, held = review_auto_run.plan_artifacts(self.root, [rel], 60)
+        self.assertEqual(held, [])
+        plan = plans[rel]
+        self.assertFalse(plan["full"])
+        self.assertGreater(plan["total_lines"], plan["kept_lines"])
+
+        pack = self._pack(rec, plans)
+        self.assertEqual(pack["status"], "ok")
+        text = review_pack.render_review_pack(pack)
+        # Главное — ЦЕЛИКОМ, включая тело каждого раздела, а не только заголовок.
+        for must in ("## ЦЕЛЬ", "место достаётся главному",
+                     "## КРИТЕРИИ ПРИЁМКИ", "цель и результат видны ревьюеру целиком",
+                     "## РЕЗУЛЬТАТ", "доля переданного выросла",
+                     "## ЗАПРЕТЫ И ОГРАНИЧЕНИЯ", "## СПОРНОЕ ДОКАЗАТЕЛЬСТВО"):
+            self.assertIn(must, text, "главное не доехало: %r" % must)
+        # …а середина порезана, и порез НАЗВАН — в теле, в таблице и в сводке.
+        self.assertNotIn("строка наполнителя номер 40", text)
+        self.assertIn("[… ПРОПУЩЕНО", text)
+        self.assertIn("## ПРОПУЩЕНО ВНУТРИ ИСТОЧНИКОВ", text)
+        self.assertIn("НЕ ВОШЛО В ПАКЕТ", text)
+        self.assertIn("· показано ", text)
+        self.assertEqual(review_send.outbound_violations(review_send.build_prompt(text)), [])
+
+    # ── ОТРИЦАТЕЛЬНЫЙ 2: короче потолка ──
+    def test_short_artifact_travels_whole_with_no_gaps_and_no_gap_notice(self):
+        rec = _receipt(commits=2)
+        review_auto_run.write_text(
+            os.path.join(self.root, *review_auto.receipt_rel(rec).split("/")),
+            json.dumps(rec, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        rel = self._artifact("docs/artifacts/2026-09-05-короткий.md", _artifact_text(8))
+        plans, _ = review_auto_run.plan_artifacts(self.root, [rel], 200)
+        plan = plans[rel]
+        self.assertTrue(plan["full"])
+        self.assertEqual(plan["kept_lines"], plan["total_lines"])
+        self.assertEqual(plan["dropped"], [])
+        self.assertIsNone(review_auto.gap_summary_line(rel, plan))
+
+        pack = self._pack(rec, plans)
+        text = review_pack.render_review_pack(pack)
+        self.assertIn("строка наполнителя номер 1", text)
+        for must_not in ("[… ПРОПУЩЕНО", "## ПРОПУЩЕНО ВНУТРИ ИСТОЧНИКОВ", "НЕ ВОШЛО В ПАКЕТ", "· показано "):
+            self.assertNotIn(must_not, text, "пакет объявил пропуск, которого нет: %r" % must_not)
+        source = [s for s in pack["sources"] if s["path"] == rel][0]
+        self.assertNotIn("gaps", source)
+        self.assertNotIn("line_ranges", source)
+
+    def test_subsection_inherits_the_weight_of_its_parent(self):
+        text = "\n".join([
+            "# шапка", "", "## РЕЗУЛЬТАТ", "тело", "### 3.1 без ключевого слова", "тело",
+            "## БОЛТОВНЯ", "тело",
+        ]) + "\n"
+        by_title = {s["title"]: s["weight"] for s in review_auto._sections(text.splitlines())}
+        self.assertEqual(by_title["3.1 без ключевого слова"], by_title["РЕЗУЛЬТАТ"])
+        self.assertEqual(by_title["БОЛТОВНЯ"], 0)
+
+    def test_ranges_never_overlap_and_never_exceed_the_budget(self):
+        plan = review_auto.plan_artifact_excerpt(_artifact_text(300), max_lines=45)
+        self.assertLessEqual(plan["kept_lines"], 45)
+        prev = 0
+        for start, end in plan["ranges"]:
+            self.assertGreater(start, prev)
+            self.assertGreaterEqual(end, start)
+            prev = end
+        # Пропуски покрывают ровно то, что не вошло: сумма сходится, дыр в учёте нет.
+        self.assertEqual(sum(g["lines"] for g in plan["dropped"]),
+                         plan["total_lines"] - plan["kept_lines"])
+
+    def test_zero_budget_is_refused_not_guessed(self):
+        with self.assertRaises(review_auto.ReviewAutoError):
+            review_auto.plan_artifact_excerpt("текст", max_lines=0)
+
+    def test_fit_chain_spends_the_reserve_instead_of_leaving_it_empty(self):
+        """ЗАМЕР лотка 05.09: медианный резерв 3517 знаков при потолке 15000.
+
+        Подбор бюджета обязан отдать артефакту БОЛЬШЕ прежних 80 строк, когда место
+        есть, и НЕ поднять при этом потолок пакета ни на знак.
+        """
+        rec = _receipt(commits=2)
+        review_auto_run.write_text(
+            os.path.join(self.root, *review_auto.receipt_rel(rec).split("/")),
+            json.dumps(rec, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        rel = self._artifact("docs/artifacts/2026-09-05-крупный.md", _artifact_text(600))
+        rec["artifacts"] = [rel]
+        case, pack = review_auto_run._fit_chain(rec, "2026-09-05", self.root,
+                                                review_pack.REVIEW_MAX_CHARS, (_FRAME, None))
+        self.assertEqual(pack["status"], "ok")
+        source = [s for s in pack["sources"] if s["path"] == rel][0]
+        self.assertGreater(source["excerpt_lines"], review_auto.ARTIFACT_HEAD_LINES)
+        self.assertLessEqual(pack["text_chars"], review_pack.REVIEW_MAX_CHARS)
+        self.assertEqual(pack["max_chars"], review_pack.REVIEW_MAX_CHARS)
+
+    def test_artifact_that_never_fits_is_not_promised_in_the_summary(self):
+        """Пакет не смеет обещать «показано N строк» у источника, которого в нём нет."""
+        rec = _receipt(commits=2)
+        review_auto_run.write_text(
+            os.path.join(self.root, *review_auto.receipt_rel(rec).split("/")),
+            json.dumps(rec, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        # Строки нарочно длинные: даже нижний бюджет строк не влезет в потолок пакета.
+        fat = "\n".join(["# ЦЕЛЬ"] + ["ж" * 900 for _ in range(200)]) + "\n"
+        rel = self._artifact("docs/artifacts/2026-09-05-неподъёмный.md", fat)
+        rec["artifacts"] = [rel]
+        case, pack = review_auto_run._fit_chain(rec, "2026-09-05", self.root,
+                                                review_pack.REVIEW_MAX_CHARS, (_FRAME, None))
+        text = review_pack.render_review_pack(pack)
+        self.assertNotIn(rel, [s["path"] for s in pack["sources"]])
+        self.assertNotIn("НЕ ВОШЛО В ПАКЕТ из %s" % rel, text)
+        # …но и промолчать о нём пакет не смеет: имя, размер и причина названы.
+        self.assertIn("НЕ ПРИЛОЖЕН по потолку пакета", text)
+        self.assertIn(rel, text)
+
+
+class TestTaskTextCeiling(unittest.TestCase):
+    """ТЗ либо целиком до «ЧТО СДЕЛАТЬ» включительно, либо пакет ГОВОРИТ, что обрезано."""
+
+    def test_short_task_text_travels_whole_without_any_mark(self):
+        text = "ЦЕЛЬ: короткая постановка. ЧТО СДЕЛАТЬ: одно действие."
+        self.assertEqual(review_auto.task_text_for_pack(text), text)
+        self.assertNotIn("ОБРЕЗАНО", review_auto.sanitize(text))
+
+    def test_long_task_keeps_everything_up_to_and_including_what_to_do(self):
+        body = "ЦЕЛЬ: %s\n\nЗАПРЕТЫ: ничего не удалять.\n\nЧТО СДЕЛАТЬ\n\n1. Первый пункт.\n2. Второй пункт.\n" % ("подробность " * 250)
+        tail = "\nАРИФМЕТИКА. Потолок 2700 с.\n\nПРЕДСМЕРТНЫЙ ВЗГЛЯД: провалится тем-то.\n"
+        out = review_auto.task_text_for_pack(body + tail)
+        self.assertIn("1. Первый пункт.", out)
+        self.assertIn("2. Второй пункт.", out)
+        self.assertNotIn("ПРЕДСМЕРТНЫЙ ВЗГЛЯД", out)
+        self.assertIn("ДО раздела «ЧТО СДЕЛАТЬ» включительно", out)
+
+    def test_clip_names_itself_with_numbers_and_never_exceeds_the_ceiling(self):
+        long_text = "з" * 5000
+        out = review_auto.clip_named(long_text, 300)
+        self.assertLessEqual(len(out), 300)
+        self.assertIn("ОБРЕЗАНО", out)
+        self.assertIn("5000", out)
+
+    def test_sanitized_hypothesis_stays_inside_the_stage_one_ceiling(self):
+        """Прежняя обрезка давала 1202 знака при потолке 1200 — ступень 1 отказала бы."""
+        out = review_auto.sanitize("я" * 9000)
+        self.assertLessEqual(len(out), review_pack.HYPOTHESIS_TEXT_MAX)
+        self.assertEqual(review_send.outbound_violations(out), [])
+
+    def test_live_task_text_still_loses_the_absolute_path_after_the_new_clip(self):
+        out = review_auto.sanitize(review_auto.task_text_for_pack(LIVE_TASK_TEXT))
+        self.assertNotIn("turbobaby-bot", out)
+        self.assertEqual(review_send.outbound_violations(out), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

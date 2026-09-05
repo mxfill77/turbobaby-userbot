@@ -223,6 +223,31 @@ def line_counts(root, paths):
     return out
 
 
+def plan_artifacts(root, paths, max_lines):
+    """Артефакты → (планы выборки, задержанные стражей). Руки: читают диск, решает чистый модуль.
+
+    Что именно ЕДЕТ, знает только план: с 05.09 артефакт приходит выборкой разделов
+    по весу, а не первыми N строками. Поэтому и страже показывается ИМЕННО ВЫБРАННЫЙ
+    ТЕКСТ — экран головы после смены порядка проверял бы не то, что уезжает наружу.
+    """
+    plans, held = {}, []
+    for rel in paths:
+        try:
+            with open(_path(root, rel), "r", encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue                                   # нет файла — сборщик назовёт причину сам
+        plan = review_auto.plan_artifact_excerpt(text, max_lines=max_lines)
+        lines = text.splitlines(keepends=True)
+        excerpt = "".join("".join(lines[start - 1 : end]) for start, end in plan["ranges"])
+        found = review_send.outbound_violations(excerpt)
+        if found:
+            held.append({"path": rel, "kinds": sorted({v["kind"] for v in found})})
+        else:
+            plans[rel] = plan
+    return plans, held
+
+
 def screen_artifacts(root, paths, head_lines=review_auto.ARTIFACT_HEAD_LINES):
     """Отсеять артефакты, чья ГОЛОВА спотыкается о стражу исходящего. → (принятые, задержанные).
 
@@ -280,6 +305,50 @@ def _fit_digest(trigger, build_date, counts, root, max_chars, frame):
     return case, pack
 
 
+def _fit_chain(rec, build_date, root, max_chars, frame):
+    """Цепочка с ИЗМЕРЕННЫМ строчным бюджетом артефакта. → (case, pack).
+
+    Бюджет не назначен, а подобран сборкой — тем же приёмом, что у `_fit_digest`, и
+    по той же причине: размер артефакта не постоянен, а любое фиксированное число
+    либо блокирует пакет в подробные дни, либо оставляет место пустым в короткие
+    (замер лотка 05.09: медианный неиспользованный резерв 3517 знаков при потолке
+    15000, максимум 8754 — то есть больше половины пакета уходило впустую).
+
+    ПОТОЛОК ПАКЕТА ЗДЕСЬ НЕ ТРОГАЕТСЯ НИ ОДНОЙ ВЕТКОЙ: `max_chars` приходит сверху
+    и только СУДИТ попытку. Меняется распределение уже имеющегося места, а не его
+    количество — иначе пакет стал бы длиннее, но не умнее.
+    """
+    artifacts = list(rec.get("artifacts") or [])
+
+    def assemble(plans, held, oversized=()):
+        counts = line_counts(root, [review_auto.receipt_rel(rec)] + list(plans))
+        case = review_auto.case_for_chain(rec, build_date, line_counts=counts,
+                                          artifact_sources=list(plans), held_artifacts=held,
+                                          artifact_plans=plans, oversized_artifacts=oversized)
+        return case, review_pack.build_review_pack(case, root=root, max_chars=max_chars,
+                                                   frame_version=frame[0], frame_version_note=frame[1])
+
+    case = pack = None
+    plans = held = None
+    for budget in review_auto.ARTIFACT_LINE_BUDGETS:
+        plans, held = plan_artifacts(root, artifacts, budget)
+        case, pack = assemble(plans, held)
+        # Влез И артефакт доехал: источник, выпавший по потолку, — это тот же
+        # обрубок, только названный другим словом, и уменьшать бюджет ещё есть куда.
+        if pack["status"] == "ok" and not [o for o in pack["omitted"] if o.get("reason") == "context_limit"]:
+            return case, pack
+
+    # Ни один бюджет не вместил артефакт. Пересобираем БЕЗ него: иначе сводка
+    # обещала бы «показано N строк» у источника, которого в пакете нет вовсе, —
+    # то есть врала бы ровно в том месте, ради честности которого правка и делалась.
+    # Причину назовёт раздел «ОПУЩЕНО» словом `context_limit`, как и раньше.
+    lost = {o["path"] for o in (pack["omitted"] if pack else []) if o.get("reason") == "context_limit"}
+    if lost:
+        oversized = [{"path": path, "lines": (plans or {}).get(path, {}).get("total_lines")} for path in sorted(lost)]
+        case, pack = assemble({k: v for k, v in (plans or {}).items() if k not in lost}, held, oversized)
+    return case, pack
+
+
 def _build_pack(trigger, root, build_date, max_chars):
     """Повод → (case, pack, text, rel-путь пакета). Пишет индекс дня для дайджеста.
 
@@ -289,13 +358,7 @@ def _build_pack(trigger, root, build_date, max_chars):
     """
     frame = review_pack_build.live_frame_version()
     if trigger["kind"] == "chain":
-        rec = trigger["receipt"]
-        artifacts, held = screen_artifacts(root, list(rec.get("artifacts") or []))
-        counts = line_counts(root, [review_auto.receipt_rel(rec)] + artifacts)
-        case = review_auto.case_for_chain(rec, build_date, line_counts=counts,
-                                          artifact_sources=artifacts, held_artifacts=held)
-        pack = review_pack.build_review_pack(case, root=root, max_chars=max_chars,
-                                             frame_version=frame[0], frame_version_note=frame[1])
+        case, pack = _fit_chain(trigger["receipt"], build_date, root, max_chars, frame)
     else:
         index_rel = review_auto.digest_index_rel(trigger["day"])
         write_text(_path(root, index_rel),

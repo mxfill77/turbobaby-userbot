@@ -72,7 +72,13 @@ RETRY_AFTER_SEC = 3600
 # бы всю работу, закрытую после порога.
 DIGEST_WINDOW_SEC = 24 * 3600
 
-HYPOTHESIS_MAX = 1200        # постановка в пакете (потолок самого пакета — 2000)
+# ПОСТАНОВКА В ПАКЕТЕ. Было 1200 при объявленном потолке ступени 1 в 2000 — то есть
+# ТЗ резалось МОЛЧА и на треть раньше, чем обещано (замер 05.09: расписка задачи 173
+# несёт ровно 1202 знака постановки, обрыв пришёлся внутрь первого пункта). Потолок
+# НЕ ПОДНЯТ: 2000 — это `review_pack.HYPOTHESIS_TEXT_MAX`, он был объявлен и раньше;
+# снята молчаливая недодача внутри него. Константа берётся у ступени 1, а не
+# дублируется числом: разъехавшись, они дали бы `oversized_hypothesis` на сборке.
+HYPOTHESIS_MAX = review_pack.HYPOTHESIS_TEXT_MAX
 RESULT_HEAD_MAX = 900        # голова результата задачи в расписке
 SPOOL_MAX = 200              # кап спула закрытых цепочек (это индекс, не архив)
 
@@ -119,6 +125,18 @@ REPORTED = {"done": "reported_done", "failed": "reported_failed"}
 _RE_COMMIT = re.compile(
     r"(?i)\b(?:commit|коммит|коммита|коммите|коммитом|hash|хеш|хеша)\b[^0-9a-f\n]{0,40}([0-9a-f]{7,40})\b"
 )
+
+# ГРАНИЦА ТЗ. Задание кончается там, где кончается «ЧТО СДЕЛАТЬ»: ниже идут
+# служебные разделы (арифметика, временное, предсмертный взгляд, адрес результата),
+# которые ревьюеру не нужны и место съедают. Раздел ищется ЗАГОЛОВКОМ в живом
+# формате ящика, а не догадкой по номеру пункта.
+_RE_TASK_DO = re.compile(r"(?im)^[^\S\n]{0,8}(?:#{1,6}\s*)?(?:\d+[.)]\s*)?ЧТО\s+СДЕЛАТЬ\b")
+_RE_TASK_TAIL = re.compile(
+    r"(?im)^[^\S\n]{0,8}(?:#{1,6}\s*)?(?:АРИФМЕТИКА|ВРЕМЕННОЕ|ПРЕДСМЕРТНЫЙ|ОСОБО\s+ПРО|"
+    r"АДРЕС\s+РЕЗУЛЬТАТА|ПРИЗНАК\s+СДЕЛАННОСТИ)\b"
+)
+_TASK_TAIL_NOTE = " [ТЗ приложено ДО раздела «ЧТО СДЕЛАТЬ» включительно; служебный хвост (%d знаков) не приложен]"
+_CLIP_MARK = " [ОБРЕЗАНО: показано %d знаков из %d]"
 
 _REDACT_MARK = "[снято стражей: %s]"
 _REDACT_LINE = "[строка снята стражей: %s]"
@@ -194,6 +212,54 @@ def day_of(now_iso):
 # ───────────────────────────── стража постановки ─────────────────────────────
 
 
+def clip_named(text, limit):
+    """Обрезка, КОТОРАЯ СЕБЯ НАЗЫВАЕТ. → str длиной не больше ``limit``.
+
+    Прежний хвост « …» не отличался от многоточия внутри самого текста: ревьюер
+    не мог понять, кончилось ТЗ или его обрубили, — и советовал сделать то, что
+    уже сделано в невидимой ему части. Теперь обрыв несёт ЧИСЛА: сколько показано
+    из скольких. Влезает — не приписывается ничего.
+
+    Потолок соблюдается СТРОГО (в отличие от прежнего «+2 знака»): ступень 1
+    отказывает на `oversized_hypothesis`, и молчаливый перебор превратил бы
+    обрезку в отказ сборки.
+    """
+    text = str(text or "")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ReviewAutoError("invalid_limit", "limit must be a positive int, got %r" % (limit,))
+    if len(text) <= limit:
+        return text
+    room = max(1, limit - len(_CLIP_MARK % (0, len(text))) - 8)   # запас на рост числа знаков
+    head = text[:room].rstrip()
+    return head + (_CLIP_MARK % (len(head), len(text)))
+
+
+def task_text_for_pack(text, *, limit=HYPOTHESIS_MAX):
+    """ТЗ для пакета: ЦЕЛИКОМ или ДО «ЧТО СДЕЛАТЬ» включительно, но НЕ МОЛЧА. → str.
+
+    Лестница ровно из трёх ступеней, и на каждой пакет говорит, что он сделал:
+
+    1. влезает целиком — едет целиком, без единой пометки;
+    2. не влезает — едет голова ДО раздела «ЧТО СДЕЛАТЬ» включительно, и хвост
+       НАЗВАН числом знаков (``_TASK_TAIL_NOTE``);
+    3. не влезает даже голова — обрезка называет себя числами (``clip_named``).
+
+    Молчаливого исхода нет ни одного: «текст кончился» и «текст обрубили» для
+    ревьюера обязаны выглядеть по-разному.
+    """
+    full = str(text or "")
+    if len(full) <= limit:
+        return full
+    match_do = _RE_TASK_DO.search(full)
+    if match_do is None:
+        return full
+    tail = _RE_TASK_TAIL.search(full, match_do.end())
+    if tail is None:
+        return full
+    head = full[: tail.start()].rstrip()
+    return head + (_TASK_TAIL_NOTE % (len(full) - len(head)))
+
+
 def sanitize(text, *, limit=HYPOTHESIS_MAX):
     """Свободный текст → безопасный для отправки наружу. → str.
 
@@ -211,8 +277,7 @@ def sanitize(text, *, limit=HYPOTHESIS_MAX):
     for kind, rx in _REDACT_RULES:
         out = rx.sub(_REDACT_MARK % kind, out)
     out = " ".join(out.split())          # многострочная постановка → одна строка пакета
-    if len(out) > limit:
-        out = out[:limit].rstrip() + " …"
+    out = clip_named(out, limit)
 
     # Fail-closed: что стража всё ещё видит — снимаем ЦЕЛОЙ СТРОКОЙ. Три прохода,
     # потому что снятие одной находки может открыть следующую; не сошлось — текста
@@ -280,7 +345,7 @@ def receipt(*, queue_id, task_text, status, result, closed_at, claimed, verified
         "closed_at": closed.isoformat().replace("+00:00", "Z"),
         "closed_day": closed.date().isoformat(),
         "reported_status": REPORTED[status],
-        "hypothesis": sanitize(task_text),
+        "hypothesis": sanitize(task_text_for_pack(task_text)),
         "result_head": sanitize(result, limit=RESULT_HEAD_MAX),
         "claimed_commits": list(claimed or []),
         "verified_commits": [c for c in (verified or []) if c in (claimed or [])],
@@ -623,10 +688,164 @@ def next_trigger(state, now_iso, digest_hour):
 # ───────────────────────────── спецификация случая ─────────────────────────────
 
 
-ARTIFACT_HEAD_LINES = 80     # сколько строк артефакта берём в пакет (голова = заголовок и итог)
+# ────────────── АРТЕФАКТ ЕДЕТ ГЛАВНЫМ, А НЕ ПЕРВЫМ (правка 05.09.2026) ──────────────
+# ЧТО БЫЛО. `ARTIFACT_HEAD_LINES = 80` брал ПЕРВЫЕ 80 строк артефакта — фиксированный
+# срез, ничего не знающий о содержании. Пересчёт лотка своими руками 05.09
+# (76 пакетов `docs/review_outbox`): срез ровно на строке 80 у 56 пакетов, медианная
+# доля переданного артефакта 0.362 (min 0.215), медианный НЕИСПОЛЬЗОВАННЫЙ резерв
+# пакета 3517 знаков при потолке 15000 (max 8754). То есть ревьюер судил работу по
+# трети её текста при наполовину пустом пакете — и советовал сделанное в невидимой
+# ему части. Виноват был вход, а не ревьюер.
+#
+# ЧТО СТАЛО. Место распределяется ПО ВАЖНОСТИ РАЗДЕЛА, а не по порядку строк:
+# сначала цель, критерии приёмки, результат, ограничения и спорное доказательство,
+# остальное — по остатку. Не влезшее НАЗЫВАЕТСЯ (раздел, строки, сколько их).
+#
+# ПОТОЛОК ПАКЕТА НЕ ПОДНЯТ: он как был 15000 (`review_pack.REVIEW_MAX_CHARS`), так и
+# остался. Растёт только СТРОЧНЫЙ бюджет артефакта, и он не назначен, а ИЗМЕРЕН
+# сборкой: `review_auto_run._fit_chain` пробует бюджеты сверху вниз и берёт первый
+# влезший — ровно тем же приёмом, которым дайджест подбирает число расписок.
+ARTIFACT_HEAD_LINES = 80          # прежний фиксированный срез — остался запасной веткой
+# Лестница идёт и ВНИЗ от прежних 80, и это не мелочь: артефакт, не влезавший
+# восемьюдесятью строками, раньше вылетал ЦЕЛИКОМ (живой случай — повод
+# pc-2026-09-04-196, `context_limit`, ревьюер не увидел ни строки при свободных
+# 7761 знаках у прочих пакетов). Тридцать строк цели и результата — это не «мало»,
+# это разница между «судит по главному» и «не видит ничего».
+ARTIFACT_LINE_BUDGETS = (200, 150, 110, 80, 50, 30)
+ARTIFACT_MIN_SECTION_LINES = 6    # обрубок раздела короче этого бесполезен — лучше назвать его пропуском
+
+_RE_MD_HEADING = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
+
+# Вес раздела — порядок из задания: цель · критерии приёмки · результат ·
+# ограничения · спорное доказательство. Слова взяты из ЖИВЫХ заголовков артефактов
+# полосы, а не придуманы: «ЦЕЛЬ», «ЧТО СЧИТАЕМ СДЕЛАННЫМ», «ИТОГ», «FACT»,
+# «ЗАПРЕТЫ», «КОНТРФАКТ», «ЗАМЕР». Заголовок без единого слова из списка получает
+# вес 0 и едет по остатку — молча выброшенным он не бывает ни в одной ветке.
+_SECTION_WEIGHTS = (
+    (5, re.compile(r"(?i)\bцел[ьи]\b|\bповод\b|\bвопрос|\bзачем\b|\bзадани|\bпремис")),
+    (4, re.compile(r"(?i)критери|приёмк|приемк|признак сделанн|что счита|как проверит|сделанност")),
+    (3, re.compile(r"(?i)результат|\bитог|вывод|что сделан|\bfact\b|\bответ|что измен")),
+    (2, re.compile(r"(?i)ограничен|запрет|границ|чего не|не сделан|остат|риск")),
+    (1, re.compile(r"(?i)спорн|доказательств|контрфакт|замер|числ|мина|провер|опроверж")),
+)
+_PREAMBLE_WEIGHT = 6              # шапка до первого заголовка: имя, дата, FACT — всегда первой
 
 
-def _source(path, *, role, required, line_counts, cap=None, evidence_status="reported"):
+def section_weight(title):
+    """Вес заголовка по словам задания. → int (0 — «остальное»). Чистая функция."""
+    for weight, rx in _SECTION_WEIGHTS:
+        if rx.search(title or ""):
+            return weight
+    return 0
+
+
+def _sections(lines):
+    """Разбор текста на разделы по markdown-заголовкам. → [{start,end,title,weight}].
+
+    Подраздел без своего ключевого слова НАСЛЕДУЕТ вес родителя: «### 3.1 Замер»
+    внутри «## РЕЗУЛЬТАТ» — это по-прежнему результат, и терять его из-за того, что
+    в его собственном заголовке нужного слова нет, значило бы резать по форме.
+    """
+    heads = []
+    for i, line in enumerate(lines, 1):
+        m = _RE_MD_HEADING.match(line)
+        if m:
+            heads.append((i, len(m.group(1)), m.group(2).strip()))
+    out = []
+    if not heads or heads[0][0] > 1:
+        end = (heads[0][0] - 1) if heads else len(lines)
+        if end >= 1:
+            out.append({"start": 1, "end": end, "title": "шапка", "weight": _PREAMBLE_WEIGHT})
+    stack = []                     # [(уровень, вес)] — родители текущего заголовка
+    for idx, (start, level, title) in enumerate(heads):
+        end = (heads[idx + 1][0] - 1) if idx + 1 < len(heads) else len(lines)
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        weight = section_weight(title) or (stack[-1][1] if stack else 0)
+        stack.append((level, weight))
+        out.append({"start": start, "end": end, "title": title, "weight": weight})
+    return out
+
+
+def _merge(ranges):
+    out = []
+    for start, end in sorted(ranges):
+        if out and start <= out[-1][1] + 1:
+            out[-1][1] = max(out[-1][1], end)
+        else:
+            out.append([start, end])
+    return out
+
+
+def plan_artifact_excerpt(text, *, max_lines):
+    """Текст артефакта → ВЫБОРКА разделов под бюджет строк. Чистая функция.
+
+    ``{"total_lines", "kept_lines", "ranges": [[s,e],…], "dropped": [{…}], "full": bool}``
+
+    Влезает целиком — едет целиком, без выборки и без пометок о пропусках: пакет не
+    смеет объявлять пропуск там, где его нет. Не влезает — берутся разделы по весу
+    (цель → критерии → результат → ограничения → спорное → остальное), и КАЖДЫЙ
+    невзятый кусок называется в ``dropped`` с заголовками и числом строк.
+    """
+    if not isinstance(max_lines, int) or isinstance(max_lines, bool) or max_lines < 1:
+        raise ReviewAutoError("invalid_max_lines", "max_lines must be a positive int, got %r" % (max_lines,))
+    lines = str(text or "").splitlines()
+    total = max(1, len(lines))
+    if len(lines) <= max_lines:
+        return {"total_lines": total, "kept_lines": total, "ranges": [[1, total]], "dropped": [], "full": True}
+
+    budget = max_lines
+    taken = []
+    for sec in sorted(_sections(lines), key=lambda s: (-s["weight"], s["start"])):
+        if budget <= 0:
+            break
+        size = sec["end"] - sec["start"] + 1
+        if size <= budget:
+            taken.append([sec["start"], sec["end"]])
+            budget -= size
+        elif budget >= ARTIFACT_MIN_SECTION_LINES:
+            # Раздел целиком не влез — берём его ГОЛОВУ, хвост назовём пропуском.
+            taken.append([sec["start"], sec["start"] + budget - 1])
+            budget = 0
+    ranges = _merge(taken) or [[1, min(total, max_lines)]]
+
+    dropped, cursor = [], 1
+    titles = _sections(lines)
+    for start, end in ranges + [[total + 1, total + 1]]:
+        if start > cursor:
+            names = [s["title"] for s in titles if s["start"] >= cursor and s["start"] <= start - 1]
+            dropped.append({"start": cursor, "end": start - 1, "lines": start - cursor, "titles": names})
+        cursor = max(cursor, end + 1)
+    kept = sum(end - start + 1 for start, end in ranges)
+    return {"total_lines": total, "kept_lines": kept, "ranges": ranges, "dropped": dropped, "full": False}
+
+
+def gap_summary_line(path, plan):
+    """Пропуски артефакта одной строкой сводки пакета. → str | None.
+
+    Ревьюер обязан знать, ЧЕГО он не видит: «не вошло» без имён разделов читается
+    как «там было то же самое», а именно это и произвело находки-пересказы.
+    """
+    if plan.get("full"):
+        return None
+    names = []
+    for rec in plan.get("dropped") or ():
+        for title in rec.get("titles") or ():
+            if title not in names:
+                names.append(title)
+    shown = "; ".join("«%s»" % t for t in names[:4])
+    if len(names) > 4:
+        shown += " и ещё %d раздел(ов)" % (len(names) - 4)
+    line = "НЕ ВОШЛО В ПАКЕТ из %s: %d строк(и) из %d (показано %d) — %s." % (
+        path, plan["total_lines"] - plan["kept_lines"], plan["total_lines"], plan["kept_lines"],
+        shown or "разделов без заголовков",
+    )
+    # Потолки берутся У СТУПЕНИ 1, а не дублируются числами здесь: разъехавшиеся
+    # константы дали бы `invalid_summary` на сборке уже готового пакета.
+    return line[: review_pack.SUMMARY_LINE_MAX]
+
+
+def _source(path, *, role, required, line_counts, cap=None, plan=None, evidence_status="reported"):
     """Запись манифеста источника. ``line_counts`` — ФАКТ с диска, принесённый руками.
 
     Границы строк выдуманными быть не могут: сборщик контекста сверяет их с
@@ -635,7 +854,7 @@ def _source(path, *, role, required, line_counts, cap=None, evidence_status="rep
     """
     total = int((line_counts or {}).get(path) or 1)
     end = max(1, min(total, cap) if cap else total)
-    return {
+    rec = {
         "path": path,
         "role": role,
         "lane": "pc",
@@ -644,6 +863,14 @@ def _source(path, *, role, required, line_counts, cap=None, evidence_status="rep
         "start_line": 1,
         "end_line": end,
     }
+    if plan is not None:
+        # ОКНО — весь файл, а выборка внутри него: так таблица источников
+        # печатает настоящий размер артефакта, и «показано 150 из 301» видно без
+        # похода в репозиторий, которого у ревьюера нет.
+        rec["end_line"] = max(1, min(total, plan["total_lines"]))
+        if not plan.get("full"):
+            rec["line_ranges"] = [list(pair) for pair in plan["ranges"]]
+    return rec
 
 
 def _clip(text, limit):
@@ -659,7 +886,8 @@ def _commit_words(rec):
     return "коммита не объявлено — работа только на чтение"
 
 
-def case_for_chain(rec, build_date, *, line_counts=None, artifact_sources=(), held_artifacts=()):
+def case_for_chain(rec, build_date, *, line_counts=None, artifact_sources=(), held_artifacts=(),
+                   artifact_plans=None, oversized_artifacts=()):
     """Расписка закрытой цепочки → спецификация случая для :mod:`review_pack`.
 
     ``task_class`` = ``code_green`` не по умолчанию, а по определению повода:
@@ -669,13 +897,30 @@ def case_for_chain(rec, build_date, *, line_counts=None, artifact_sources=(), he
     if not rec.get("operational_change"):
         raise ReviewAutoError("not_operational", "цепочка %r не меняла операционного состояния" % rec.get("task_id"))
     rel = receipt_rel(rec)
+    plans = dict(artifact_plans or {})
     sources = [_source(rel, role="evidence", required=True, line_counts=line_counts)]
+    gap_lines = []
     for path in artifact_sources:
-        # Артефакт едет ГОЛОВОЙ, а не целиком: их пишут на тысячи строк, и
-        # честный потолок пакета съедался бы одним из них. Обмана нет — границы
-        # строк печатаются в таблице источников, ревьюер видит «1-80» сам.
-        sources.append(_source(path, role="context", required=False,
-                               line_counts=line_counts, cap=ARTIFACT_HEAD_LINES))
+        # Артефакт едет ГЛАВНЫМ, а не первым: план выборки принесли руки (у чистого
+        # модуля диска нет), веса разделов посчитала `plan_artifact_excerpt`. Плана
+        # нет — падаем на прежний срез головы, но МОЛЧА он больше не режет: пропуск
+        # называется строкой сводки в обеих ветках.
+        plan = plans.get(path)
+        if plan is None:
+            sources.append(_source(path, role="context", required=False,
+                                   line_counts=line_counts, cap=ARTIFACT_HEAD_LINES))
+            total = int((line_counts or {}).get(path) or 1)
+            if total > ARTIFACT_HEAD_LINES:
+                gap_lines.append(gap_summary_line(path, {
+                    "total_lines": total, "kept_lines": ARTIFACT_HEAD_LINES, "full": False,
+                    "dropped": [{"start": ARTIFACT_HEAD_LINES + 1, "end": total,
+                                 "lines": total - ARTIFACT_HEAD_LINES, "titles": []}],
+                }))
+            continue
+        sources.append(_source(path, role="context", required=False, line_counts=line_counts, plan=plan))
+        line = gap_summary_line(path, plan)
+        if line:
+            gap_lines.append(line)
     summary = [
         "Повод: ЗАКРЫТАЯ ЦЕПОЧКА полосы ПК %s, изменившая операционное состояние." % rec["task_id"],
         "Заявленный исполнителем статус: %s; %s." % (rec["reported_status"], _commit_words(rec)),
@@ -692,6 +937,16 @@ def case_for_chain(rec, build_date, *, line_counts=None, artifact_sources=(), he
             "НЕ ПРИЛОЖЕНО стражей исходящего: %s (%s) — файл остаётся в дереве, наружу не уехал."
             % (held.get("path"), ", ".join(held.get("kinds") or []))
         )
+    # Артефакт, не влезший даже нижним бюджетом, ОБЯЗАН быть назван здесь. Убрав его
+    # из манифеста молча, пакет перестал бы даже упоминать о нём: раздел «опущено»
+    # говорит только о том, что в манифесте БЫЛО, — и молчание читалось бы как
+    # «артефакта у работы нет», а это другая новость.
+    for big in oversized_artifacts or ():
+        summary.append(
+            "НЕ ПРИЛОЖЕН по потолку пакета: %s (%s строк) — не влезает даже минимальным бюджетом "
+            "выборки; файл остаётся в дереве." % (big.get("path"), big.get("lines"))
+        )
+    summary.extend(gap_lines[: max(0, review_pack.SUMMARY_LINES_MAX - len(summary))])
     numbers = [
         {"name": "цепочка · подтверждённых коммитов", "value": len(rec["verified_commits"]), "source": rel},
         {"name": "цепочка · объявленных коммитов", "value": len(rec["claimed_commits"]), "source": rel},

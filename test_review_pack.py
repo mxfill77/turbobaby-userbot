@@ -649,5 +649,40 @@ def _line_no(lines, needle):
     raise AssertionError("в тексте пакета нет строки %r" % needle)
 
 
+class GapsAreNamed(_Base):
+    """Пакет обязан НАЗЫВАТЬ, чего ревьюер не видит (заведено 05.09.2026).
+
+    Отрицательная половина здесь важнее положительной: раздел о пропусках не
+    смеет появляться, когда пропусков нет, — иначе пакет объявляет дыру там, где
+    источник приложен целиком, и прежние пакеты перестают рендериться байт в байт.
+    """
+
+    def test_no_section_and_no_marker_when_nothing_is_skipped(self):
+        text = render_review_pack(self.build())
+        self.assertNotIn("## ПРОПУЩЕНО ВНУТРИ ИСТОЧНИКОВ", text)
+        self.assertNotIn("· показано ", text)
+        self.assertNotIn("[… ПРОПУЩЕНО", text)
+
+    def test_section_names_the_file_the_share_and_every_gap(self):
+        _write(self.tmp, "long.md", "".join("строка %d\n" % i for i in range(1, 31)))
+        case = _case(sources=[
+            _src("result.json", role="evidence", start=1, end=2),
+            dict(_src("long.md", role="context", required=False, start=1, end=30),
+                 line_ranges=[[1, 4], [20, 22]]),
+        ])
+        pack = self.build(case)
+        self.assertEqual(pack["status"], "ok")
+        text = render_review_pack(pack)
+        self.assertIn("## ПРОПУЩЕНО ВНУТРИ ИСТОЧНИКОВ (чего ревьюер НЕ видит)", text)
+        self.assertIn("показано 7 из 30 строк, не вошло 23", text)
+        self.assertIn("5–19 (15)", text)
+        self.assertIn("23–30 (8)", text)
+        self.assertIn("| 1-30 · показано 7 |", text)
+        self.assertIn("[… ПРОПУЩЕНО 15 строк(и): 5–19", text)
+        # Раздел стои́т ДО «опущено»: это разные новости — «файла нет вовсе» и
+        # «файл есть, но приложен не целиком».
+        self.assertLess(text.index("## ПРОПУЩЕНО ВНУТРИ"), text.index("## ОПУЩЕНО (omitted)"))
+
+
 if __name__ == "__main__":
     unittest.main()

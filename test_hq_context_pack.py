@@ -420,5 +420,56 @@ class NoSideEffect(_Base):
         self.assertEqual(sorted(os.listdir(self.root())), listing_before)  # no file written
 
 
+class TestLineRanges(_Base):
+    """Выборка строк внутри источника (заведено 05.09.2026).
+
+    Ключ ``line_ranges`` необязателен, и это ГЛАВНОЕ его свойство: без него
+    источник обязан рендериться и хешироваться байт в байт как раньше — иначе
+    прежние пакеты в лотке перестали бы сверяться с новыми по одному и тому же
+    числу, и «изменилось» стало бы неотличимо от «пересобрано».
+    """
+
+    def _file(self, rel="docs/a.md", n=20):
+        _write(self.root(), rel, "".join("строка %d\n" % i for i in range(1, n + 1)))
+        return rel
+
+    def test_absence_of_the_key_changes_nothing_byte_for_byte(self):
+        rel = self._file()
+        plain = build_context_pack("c", "read", "цель", [_src(rel, end=20)], root=self.root())
+        self.assertEqual(plain["status"], "ok")
+        self.assertNotIn("gaps", plain["sources"][0])
+        self.assertNotIn("line_ranges", plain["sources"][0])
+        # Тот же манифест, но с выборкой «во всё окно» — это ДРУГОЙ манифест.
+        same = build_context_pack("c", "read", "цель",
+                                  [dict(_src(rel, end=20), line_ranges=[[1, 20]])], root=self.root())
+        self.assertEqual(same["body"], plain["body"])          # тело совпадает…
+        self.assertNotEqual(same["manifest_sha256"], plain["manifest_sha256"])  # …а объявление — нет
+
+    def test_selection_keeps_only_the_named_ranges_and_marks_the_gap(self):
+        rel = self._file()
+        pack = build_context_pack("c", "read", "цель",
+                                  [dict(_src(rel, end=20), line_ranges=[[1, 3], [10, 12]])],
+                                  root=self.root())
+        src = pack["sources"][0]
+        self.assertEqual(src["excerpt_lines"], 6)
+        self.assertEqual(src["source_lines"], 20)
+        self.assertEqual(src["gaps"], [{"start": 4, "end": 9, "lines": 6},
+                                       {"start": 13, "end": 20, "lines": 8}])
+        self.assertIn("строка 3\n", pack["body"])
+        self.assertNotIn("строка 5\n", pack["body"])
+        self.assertIn("[… ПРОПУЩЕНО 6 строк(и): 4–9", pack["body"])
+        self.assertIn("[… ПРОПУЩЕНО 8 строк(и): 13–20", pack["body"])
+        # Хеш выдержки — хеш ТЕКСТА ИСТОЧНИКА, без наших меток.
+        self.assertEqual(src["excerpt_sha256"],
+                         hcp._sha256_text("".join("строка %d\n" % i for i in [1, 2, 3, 10, 11, 12])))
+
+    def test_overlapping_or_reversed_ranges_are_refused(self):
+        rel = self._file()
+        for bad in ([[1, 5], [4, 8]], [[5, 8], [1, 3]], [[3, 1]], [[0, 4]], [[1, 99]], []):
+            with self.assertRaises(ContextPackError, msg="принято негодное %r" % (bad,)):
+                build_context_pack("c", "read", "цель",
+                                   [dict(_src(rel, end=20), line_ranges=bad)], root=self.root())
+
+
 if __name__ == "__main__":
     unittest.main()
