@@ -2148,5 +2148,261 @@ class TestBridgeBudgetThirdOutcome(unittest.TestCase):
         self.assertEqual(d.bc.went_to_net, len(run.OPEN_STATUSES))
 
 
+class _Sender(object):
+    """Дверь наружу-заглушка в форме ``dispatch_notify.send_topic_strict``.
+
+    Форма повторена ДОСЛОВНО — ``(текст, тема) → (канал, ok, detail)``: мок,
+    разошедшийся с живой дверью, зеленел бы молча, и это ровно тот класс, на
+    котором полоса ПК уже обжигалась (`CLAUDE.md`, «Форматы»).
+    """
+
+    def __init__(self, ok=True, why="тема закрыта"):
+        self._ok, self._why = ok, why
+        self.sent = []
+
+    def __call__(self, text, topic):
+        self.sent.append((text, int(topic)))
+        return ("topic:%s" % topic, self._ok, "9001" if self._ok else self._why)
+
+
+class _Notifier(object):
+    """Заглушка на месте :func:`run.notify_taken` — считает ИЗВЕЩЕНИЯ, а не отправки."""
+
+    def __init__(self, ok=True, why="не отправлено", boom=None):
+        self._ok, self._why, self._boom = ok, why, boom
+        self.texts = []
+
+    def __call__(self, text):
+        self.texts.append(text)
+        if self._boom:
+            raise RuntimeError(self._boom)
+        return (self._ok, "9001" if self._ok else "", "" if self._ok else self._why)
+
+
+class TestTakeNotice(unittest.TestCase):
+    """ВЗЯТИЕ ВИДНО ВЛАДЕЛЬЦУ (задание 05-box-take-visible.0905).
+
+    ПРЕМИСА, ПЕРЕМЕРЕННАЯ ПО КОДУ 06.09.2026, а не принятая на слово: до этой
+    правки о взятии задания Штаба знали только лог демона и журнал среды
+    (``_journal`` → ``cowork_log``), а отправки наружу у ящика не было ни одной —
+    имя ``dispatch_notify`` не встречалось ни в одном из четырёх его модулей.
+    Владелец видел собственные задания потому, что сам их отправлял; положенное
+    Штабом было для него невидимо вплоть до закрытия. Премиса подтвердилась.
+
+    ПРЕДСМЕРТНЫЙ ВЗГЛЯД ЗАДАНИЯ ЗАКРЫТ ДВУМЯ ТЕСТАМИ, а не обещанием: извещение
+    не смеет стать карточкой с кнопками (:meth:`test_the_notice_carries_no_buttons_
+    and_never_goes_to_the_inbox`) и не смеет стать пересказом задания
+    (:meth:`test_the_notice_is_two_short_lines_and_quotes_the_goal_verbatim`).
+    """
+
+    # ── текст ────────────────────────────────────────────────────────────────
+
+    def test_the_notice_names_the_row_the_key_the_lane_and_the_author(self):
+        """Пункт 3 задания: номер очереди, ключ, полоса, суть цели, пометка Штаба."""
+        blk = {"key": "kk1", "body": GOOD_BODY, "lane": sb.LANE_PC, "lane_named": True}
+        text = sb.take_notice(blk, 707, TODAY)
+        self.assertIn("#707", text)
+        self.assertIn("kk1", text)
+        self.assertIn("ПК", text)
+        self.assertIn("пересчитать", text)          # ДОСЛОВНЫЙ кусок цели, не пересказ
+        self.assertIn(sb.NOTICE_BY_SHTAB, text)
+
+    def test_the_notice_is_two_short_lines_and_quotes_the_goal_verbatim(self):
+        """Пункт 4: одна-две строки, без пересказа. Длинное режется по дороге."""
+        blk = {"key": "kk1", "body": GOOD_BODY, "lane": sb.LANE_PC, "lane_named": True}
+        text = sb.take_notice(blk, 707, TODAY)
+        self.assertEqual(len(text.splitlines()), 2, "извещение расползлось за две строки")
+        self.assertLessEqual(len(text), sb.NOTICE_MAX)
+        # ЗАПРЕТЫ, ПРИЗНАК СДЕЛАННОСТИ И АДРЕС — ЭТО И ЕСТЬ ПЕРЕСКАЗ ЗАДАНИЯ.
+        # Ни один из них в извещении стоять не смеет: владельцу показывают, что
+        # взяли, а не переписывают ему постановку.
+        for chunk in ("ПРИЗНАК СДЕЛАННОСТИ", "АДРЕС РЕЗУЛЬТАТА", "ничего не удалять"):
+            self.assertNotIn(chunk, text, "извещение пересказывает задание: %s" % chunk)
+
+    def test_a_long_goal_loses_its_tail_and_never_the_head(self):
+        """Режем ХВОСТ цели: номер, ключ и пометка происхождения — то, ради чего
+        извещение существует, и обрезаться они не смеют ни при какой длине."""
+        blk = {"key": "kk1", "lane": sb.LANE_PC, "lane_named": True,
+               "body": "ЦЕЛЬ: " + ("длинная цель " * 200)}
+        text = sb.take_notice(blk, 707, TODAY)
+        self.assertLessEqual(len(text), sb.NOTICE_MAX)
+        self.assertIn("#707", text)
+        self.assertIn("kk1", text)
+        self.assertIn(sb.NOTICE_BY_SHTAB, text)
+        self.assertTrue(text.rstrip().endswith("…"), "обрезали не хвост")
+
+    def test_the_goal_is_the_GOAL_and_not_the_first_line_of_the_body(self):
+        """Первой строкой тела стои́т «ПОЛОСА: пк». Взяв её за цель, извещение
+        рассказывало бы про полосу дважды, а про цель — ни разу."""
+        body = "ПОЛОСА: пк\n\nЦЕЛЬ. Владелец видит взятие своими глазами.\n\nЧТО СДЕЛАТЬ\n1. …"
+        self.assertEqual(sb.goal_of(body), "Владелец видит взятие своими глазами.")
+
+    def test_a_goal_on_the_next_line_is_still_found(self):
+        self.assertEqual(sb.goal_of("ЦЕЛЬ\nстрока под заголовком"), "строка под заголовком")
+
+    def test_no_goal_is_SAID_and_never_guessed(self):
+        """Третий исход и здесь: цели нет → говорим словами, а не подставляем
+        первую попавшуюся строку. «ПОЛОСА: пк» в графе «цель» врёт молча."""
+        self.assertEqual(sb.goal_of("ПОЛОСА: пк\n\nЧТО СДЕЛАТЬ\n1. …"), sb.NOTICE_NO_GOAL)
+        self.assertEqual(sb.goal_of(""), sb.NOTICE_NO_GOAL)
+        self.assertEqual(sb.goal_of(None), sb.NOTICE_NO_GOAL)
+
+    def test_a_retry_is_named_so_it_is_not_read_as_a_second_notice(self):
+        """Дожим — четвёртый заход по СТАРОМУ ключу. Без пометки он приходит
+        владельцу тем же словом «взято» и выглядит задвоением, которого нет."""
+        blk = {"key": "kk1.d4", "body": GOOD_BODY, "lane": sb.LANE_PC, "lane_named": True,
+               "retry": True, "of": "kk1", "attempt": 4}
+        self.assertIn("дожим, попытка 4", sb.take_notice(blk, 707, TODAY))
+        plain = {"key": "kk1", "body": GOOD_BODY, "lane": sb.LANE_PC, "lane_named": True}
+        self.assertNotIn("дожим", sb.take_notice(plain, 707, TODAY))
+
+    # ── дверь ────────────────────────────────────────────────────────────────
+
+    def test_the_notice_carries_no_buttons_and_never_goes_to_the_inbox(self):
+        """ПРЯМОЙ ЗАПРЕТ ЗАДАНИЯ: «новых карточек не заводить… кнопок у него нет и
+        ответа оно не ждёт». Судим по ДЕЙСТВИЮ — обходом AST на вызовы и на
+        доводы, а не грепом: имена запрещённых дверей законно стоя́т в докстринге,
+        который объясняет, почему их здесь нет, и грепающая проверка ловила бы
+        собственное объяснение.
+        """
+        tree = ast.parse(_src("shtab_box_run.py"))
+        named, kwargs = set(), set()
+        for node in ast.walk(tree):
+            # ИМЯ ДВЕРИ СЧИТАЕТСЯ УПОМЯНУТЫМ И ТОГДА, КОГДА ЕЁ НЕ ЗОВУТ НА МЕСТЕ, а
+            # кладут в переменную и зовут через неё: одного обхода ВЫЗОВОВ мало —
+            # `door = dispatch_notify.send_critical` проехало бы мимо него молча.
+            if isinstance(node, ast.Attribute):
+                named.add(node.attr)
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+                if name:
+                    named.add(name)
+                for kw in (node.keywords or []):
+                    if kw.arg:
+                        kwargs.add(kw.arg)
+        for door in ("send_critical", "send_topic", "deliver", "awaits_reply", "send"):
+            self.assertNotIn(door, named, "ящик открыл дверь с каскадом/кнопкой: %s" % door)
+        self.assertIn("send_topic_strict", named, "дверь без каскада не названа вовсе")
+        self.assertNotIn("reply_markup", kwargs, "извещению приделали клавиатуру")
+
+    def test_the_topic_is_the_working_one_and_taken_from_dispatch_notify(self):
+        """Тема постановки задач (328) живёт ОДНИМ значением в ``dispatch_notify``;
+        второй её экземпляр здесь разошёлся бы с первым молча."""
+        import dispatch_notify
+
+        s = _Sender()
+        ok, detail, why = run.notify_taken("извещение", sender=s)
+        self.assertEqual((ok, why), (True, ""))
+        self.assertEqual(detail, "9001")
+        self.assertEqual([t for _t, t in s.sent], [dispatch_notify.TASKS_THREAD_ID])
+        self.assertEqual(dispatch_notify.TASKS_THREAD_ID, 328)
+
+    def test_an_empty_notice_is_not_sent_at_all(self):
+        s = _Sender()
+        ok, _detail, why = run.notify_taken("   ", sender=s)
+        self.assertFalse(ok)
+        self.assertEqual(s.sent, [])
+        self.assertIn("пустой текст", why)
+
+    def test_a_refused_door_returns_its_reason(self):
+        """Отказ у двери без фолбэков обязан ВОЗВРАЩАТЬСЯ причиной: иначе «взяли и
+        сказали» неотличимо от «взяли, а сказать не смогли»."""
+        ok, _detail, why = run.notify_taken("текст", sender=_Sender(ok=False, why="бота нет в теме"))
+        self.assertFalse(ok)
+        self.assertIn("бота нет в теме", why)
+
+    # ── виток ────────────────────────────────────────────────────────────────
+
+    def test_taking_a_task_sends_exactly_one_notice(self):
+        q, n = FakeQueue(), _Notifier()
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True, notify_fn=n)
+        self.assertEqual(len(rep["placed"]), 1)
+        self.assertEqual(len(n.texts), 1, "одно взятие — одно извещение")
+        self.assertEqual(len(rep["noticed"]), 1)
+        self.assertEqual(rep["notice_failed"], [])
+        self.assertIn("#%s" % rep["placed"][0]["id"], n.texts[0])
+        self.assertIn(sb.NOTICE_BY_SHTAB, n.texts[0])
+
+    def test_a_second_tick_over_the_same_key_says_nothing_twice(self):
+        """Пункт 5: перезапуск демона не задваивает извещение — потому что не
+        задваивает ВЗЯТИЕ. Корень тот же, долгая память та же, маркер ряда на
+        месте: до строки извещения второй виток не доходит вовсе."""
+        root = tempfile.mkdtemp(prefix="shtabnotice_")
+        n = _Notifier()
+        first = _tick(_box(("kk1", GOOD_BODY)), queue=FakeQueue(), place=True,
+                      root=root, notify_fn=n)
+        self.assertEqual(len(first["placed"]), 1)
+        second = _tick(_box(("kk1", GOOD_BODY)), queue=FakeQueue(rows=[_row("kk1")]),
+                       place=True, root=root, notify_fn=n)
+        self.assertEqual(second["placed"], [])
+        self.assertEqual(len(n.texts), 1, "второй виток сказал о том же взятии ещё раз")
+
+    def test_a_task_sent_by_the_OWNER_makes_no_notice_at_all(self):
+        """ПУНКТ 6, ОТРИЦАТЕЛЬНЫЙ ТЕСТ. Иначе владелец получит эхо собственного
+        сообщения. Ящик крутится на живой очереди, полной работы владельца, — и
+        молчит: цикл извещения идёт по документам ПАПКИ, а ряд владельца встаёт в
+        очередь мимо ящика.
+        """
+        owner_rows = [{"id": 11, "task_text": "почини цену на месяц", "status": "new"},
+                      {"id": 12, "task_text": "посмотри лог демона", "status": "in_progress"}]
+        n = _Notifier()
+        rep = _tick(_box(), queue=FakeQueue(rows=owner_rows, busy=True, busy_ids=[11, 12]),
+                    place=True, notify_fn=n)
+        self.assertEqual(n.texts, [], "извещение ушло на задание, которое ящик не брал")
+        self.assertEqual(rep["noticed"], [])
+        self.assertEqual(rep["notices"], [])
+
+    def test_the_notice_is_born_in_exactly_ONE_place_in_the_whole_lane(self):
+        """Отрицательный тест закрыт МЕСТОМ, а не условием: условие можно ошибочно
+        вычислить, места ошибиться нельзя. Дорога владельца
+        (``pc_orchestrator.enqueue_pc_task``) об извещении не знает ни строкой —
+        значит породить его не может даже при сломанном признаке.
+        """
+        born = []
+        for name in sorted(os.listdir(HERE)):
+            if not name.endswith(".py") or name.startswith("test_") or name == "shtab_box.py":
+                continue
+            tree = ast.parse(_src(name))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "take_notice":
+                    born.append(name)
+        self.assertEqual(sorted(set(born)), ["shtab_box_run.py"],
+                         "извещение рождается больше чем в одном месте: %s" % sorted(set(born)))
+
+    def test_a_dry_run_shows_the_text_and_sends_nothing(self):
+        """Запрет задания дословно: «проверка идёт на отключённой отправке либо
+        разбором готового текста, а не живой посылкой»."""
+        q, n = FakeQueue(), _Notifier()
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=False, notify_fn=n)
+        self.assertEqual(q.tasks, [])
+        self.assertEqual(n.texts, [], "сухой ход послал живое сообщение")
+        self.assertEqual(len(rep["notices"]), 1)
+        self.assertTrue(rep["notices"][0]["dry"])
+        self.assertIn(sb.NOTICE_BY_SHTAB, rep["notices"][0]["text"])
+        self.assertIn("НЕ ОТПРАВЛЕНО", run._render(report=rep))
+
+    def test_a_failed_delivery_neither_drops_the_row_nor_goes_silent(self):
+        """Ряд уже стои́т, и молчание Telegram — не повод бросать очередь. Но «взяли,
+        а сказать не смогли» обязано быть СЛЫШНО строкой исхода."""
+        q = FakeQueue()
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True,
+                    notify_fn=_Notifier(ok=False, why="бота нет в теме"))
+        self.assertEqual(len(q.tasks), 1, "неушедшее извещение уронило постановку ряда")
+        self.assertEqual(len(rep["placed"]), 1)
+        self.assertEqual(rep["noticed"], [])
+        self.assertEqual(len(rep["notice_failed"]), 1)
+        self.assertIn("ИЗВЕЩЕНИЕ НЕ УШЛО", rep["line"])
+        self.assertIn("бота нет в теме", rep["line"])
+
+    def test_an_exploding_door_does_not_take_the_tick_down(self):
+        """Дверь наружу роняет виток ящика ни одной веткой: очередь дороже новости."""
+        q = FakeQueue()
+        rep = _tick(_box(("kk1", GOOD_BODY)), queue=q, place=True,
+                    notify_fn=_Notifier(boom="сокет закрыт"))
+        self.assertEqual(len(rep["placed"]), 1)
+        self.assertEqual(len(rep["notice_failed"]), 1)
+        self.assertIn("сокет закрыт", rep["notice_failed"][0]["why"])
+
+
 if __name__ == "__main__":            # pragma: no cover
     unittest.main(verbosity=2)

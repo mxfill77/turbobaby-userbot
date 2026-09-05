@@ -1017,7 +1017,8 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
          budget=shtab_box.DAILY_BUDGET, write_journal=False, clock=None, queue=None,
          journal_fn=None, reader=None, node=None, ledger=None, lister=None,
          doc_reader=None, prefix=None, read_max=shtab_box.READ_MAX,
-         taken_reader=None, remember_fn=None, hold_reader=None, hold_writer=None):
+         taken_reader=None, remember_fn=None, hold_reader=None, hold_writer=None,
+         notify_fn=None):
     """Один оборот ящика. → dict отчёта.
 
     ``place=False`` — сухой ход: папка перечислена, документы разобраны, тела
@@ -1079,7 +1080,13 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
               # плоха, как молча пропавшая, — по ней нельзя проверить, что замок
               # вообще работает.
               "armed": [], "freed": [], "hold_n": data["hold_n"],
-              "hold_ok": data["hold_ok"], "hold_why": data["hold_why"]}
+              "hold_ok": data["hold_ok"], "hold_why": data["hold_why"],
+              # ИЗВЕЩЕНИЕ О ВЗЯТИИ — ТРЕМЯ РАЗНЫМИ ГРАФАМИ, а не одним счётчиком:
+              # «текст собран» (`notices` — есть и на сухом ходу), «ушло»
+              # (`noticed`) и «не ушло, вот почему» (`notice_failed`). Один
+              # счётчик слил бы «сказали» с «собирались сказать», а именно эта
+              # разница и есть предмет задания 05.09.
+              "notices": [], "noticed": [], "notice_failed": []}
 
     if data["off"]:
         report["why"] = data["off_why"]
@@ -1140,6 +1147,15 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
         if not place:
             report["held"].append((blk["key"],
                                    "сухой ход: текст собран, очередь не тронута (%s)" % words))
+            # ТЕКСТ ИЗВЕЩЕНИЯ ПОКАЗЫВАЕМ И НА СУХОМ ХОДУ, НЕ ОТПРАВЛЯЯ. Запрет
+            # задания дословно: «проверка идёт на отключённой отправке либо
+            # разбором готового текста, а не живой посылкой» — значит у владельца
+            # обязана быть дорога увидеть будущее извещение целиком, ничего не
+            # послав. Номера очереди на сухом ходу НЕ БЫВАЕТ, и вместо него стои́т
+            # прочерк: подставить сюда правдоподобное число значило бы показать
+            # владельцу номер ряда, которого не существует.
+            report["notices"].append({"key": blk["key"], "id": "", "dry": True,
+                                      "text": shtab_box.take_notice(blk, "—", today)})
             continue
         if not (data["queue_ok"] and data.get("queue") is not None):
             report["held"].append((blk["key"], "очередь недоступна — не ставим вслепую"))
@@ -1167,6 +1183,41 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
             report["memory"].append((blk["key"], mem_why))
         if write_journal:
             (journal_fn or _journal)(shtab_box.index_line(blk, tid, today), repo=root)
+        # ── ИЗВЕЩЕНИЕ ВЛАДЕЛЬЦУ: «полоса ВЗЯЛА задание Штаба» ────────────────
+        # СТОИ́Т ПОСЛЕДНИМ В ЦЕПОЧКЕ ВЗЯТИЯ, и порядок выбран, а не случаен: ряд →
+        # память (замок) → журнал (индекс) → извещение (новость человеку). Встань
+        # оно раньше замка — процесс, упавший между отправкой и `remember`, оставил
+        # бы владельцу извещение о взятии, которого следующий виток не помнит и
+        # берёт заново: одно взятие, ДВА извещения.
+        #
+        # «ОДНО ВЗЯТИЕ — ОДНО ИЗВЕЩЕНИЕ» ДЕРЖИТСЯ НЕ СВОИМ РЕЕСТРОМ, А ТЕМ ЖЕ
+        # ДЕДУПОМ, ЧТО И ВЗЯТИЕ (пункт 5 задания). Извещение живёт ВНУТРИ ветки
+        # `placed` — то есть ровно там, где `select` уже пропустил ключ мимо
+        # маркеров очереди и долгой памяти. Перезапуск демона не задваивает его
+        # потому, что не задваивает ВЗЯТИЕ: следующий виток видит маркер ряда и
+        # ключ в `taken`, и до этой строки не доходит вовсе. Второй реестр «кому
+        # уже сказали» разошёлся бы с первым молча — это класс 539 в чистом виде.
+        #
+        # ОТРИЦАТЕЛЬНЫЙ ТЕСТ (пункт 6) ЗАКРЫТ МЕСТОМ, А НЕ УСЛОВИЕМ: задание,
+        # присланное владельцем напрямую, в этот цикл не попадает НИ ОДНОЙ дорогой
+        # — цикл идёт по документам папки мозга (`take`), а владелец кладёт ряд
+        # прямо в очередь мимо ящика. Условия «а не владелец ли это» здесь нет
+        # СОЗНАТЕЛЬНО: условие можно ошибочно вычислить, места ошибиться нельзя.
+        #
+        # СБОЙ ДОСТАВКИ НЕ ОТМЕНЯЕТ ВЗЯТИЯ и не роняет виток: ряд уже стои́т, и
+        # молчание Telegram — не повод бросать очередь. Но оно ОБЯЗАНО БЫТЬ СЛЫШНО
+        # строкой отчёта: «взято и сказали» и «взято, а сказать не смогли» — разные
+        # новости, и различать их владелец обязан без чтения кода.
+        notice = shtab_box.take_notice(blk, tid, today)
+        report["notices"].append({"key": blk["key"], "id": tid, "dry": False, "text": notice})
+        try:
+            n_ok, n_detail, n_why = (notify_fn or notify_taken)(notice)
+        except Exception as exc:                        # noqa: BLE001
+            n_ok, n_detail, n_why = False, "", "извещение не ушло: %s" % exc
+        if n_ok:
+            report["noticed"].append({"key": blk["key"], "id": tid, "msg": n_detail})
+        else:
+            report["notice_failed"].append({"key": blk["key"], "id": tid, "why": n_why})
 
     report["acted"] = bool(report["placed"] or report["failed"])
     report["line"] = _line(report)
@@ -1180,6 +1231,48 @@ def _journal(line, repo=HERE):
     import review_intake_run
 
     return review_intake_run.journal(line, repo=repo)
+
+
+def notify_taken(text, topic=None, sender=None):
+    """Извещение о взятии — в рабочую тему постановки задач. → (ok, detail, why).
+
+    ═══ ЗАЧЕМ ОНО ВООБЩЕ ЕСТЬ (премиса задания 05.09, перемерена по коду) ══════
+
+    До этой правки о взятии задания Штаба узнавали ДВОЕ и оба не владелец: лог
+    демона и журнал среды (:func:`_journal` → ``cowork_log``). Отправки наружу у
+    ящика не было ни одной — ``dispatch_notify`` не упоминался ни в одном из
+    четырёх его модулей. Задания, которые владелец шлёт САМ, видны ему потому, что
+    он их отправил; положенное Штабом было невидимо до самого закрытия.
+
+    ═══ ПОЧЕМУ ДВЕРЬ ИМЕННО `send_topic_strict` ══════════════════════════════
+
+    У ``send_topic`` каскад «тема → инбокс 1160 → личка», и он там прав для
+    сигналов о жизни контура. Здесь он был бы ВРЕДЕН: инбокс 1160 — тема, которую
+    владелец открывает РАДИ ОТВЕТА, а это извещение ответа не ждёт (пункт запретов:
+    «кнопок у него нет и ответа оно не ждёт»). Севшее в 1160 извещение читается как
+    заявка и требует от владельца действия, которого мы не просим. Поэтому дверь
+    без фолбэков: чужой адрес здесь хуже молчания, а отказ ВОЗВРАЩАЕТСЯ причиной,
+    чтобы виток мог о нём отчитаться, а не проглотить.
+
+    ТЕМУ БЕРЁМ У ``dispatch_notify``, А НЕ СВОЮ КОНСТАНТУ: номер темы постановки
+    задач живёт там одним значением (``TASKS_THREAD_ID``), и второй его экземпляр
+    здесь разошёлся бы с первым молча — ровно классом «правишь не ту ручку».
+
+    КАРТОЧКИ НЕ РОЖДАЕМ НИ ОДНОЙ: ``reply_markup`` не передаётся и передать его
+    нечем — у ``send_topic_strict`` такого довода нет вовсе.
+    """
+    body = str(text or "").strip()
+    if not body:
+        return False, "", "пустой текст извещения — не отправляем"
+    import dispatch_notify
+
+    tid = int(topic if topic is not None else dispatch_notify.TASKS_THREAD_ID)
+    # ИМЯ МЕСТНОЙ ПЕРЕМЕННОЙ — НЕ `send`: инвариант «ящик не открывает дверей с
+    # каскадом и кнопкой» судит по ВЫЗЫВАЕМЫМ ИМЕНАМ обходом AST, и `send(...)`
+    # здесь погасил бы его собственной подписью, а не чужой дверью.
+    door = sender if sender is not None else dispatch_notify.send_topic_strict
+    _channel, ok, detail = door(body, tid)
+    return bool(ok), (detail if ok else ""), ("" if ok else str(detail or "не отправлено"))
 
 
 def _why(report, data):
@@ -1290,6 +1383,14 @@ def _line(report):
     # памяти неотличим от здоровой полосы ровно до второго взятия того же ключа.
     for key, why in (report.get("memory") or ()):
         parts.append("ПАМЯТЬ НЕ ЗАПИСАНА (%s): %s" % (key, why))
+    # НЕУШЕДШЕЕ ИЗВЕЩЕНИЕ — В ТОЙ ЖЕ СТРОКЕ, И ТОЛЬКО ОНО. Успех сюда не пишется
+    # СОЗНАТЕЛЬНО: строка исхода едет в журнал на КАЖДОМ взятии, и «сказали
+    # владельцу» в ней — шум, повторяющий сам факт взятия. А вот «взяли, а сказать
+    # не смогли» иначе не узнать ниоткуда: извещения нет и новости о том, что его
+    # нет, тоже нет — ровно та невидимость, ради снятия которой всё это заведено.
+    for row in (report.get("notice_failed") or ()):
+        parts.append("ИЗВЕЩЕНИЕ НЕ УШЛО (#%s, ключ %s): %s"
+                     % (row.get("id"), row.get("key"), row.get("why")))
     return "; ".join(parts)
 
 
@@ -1413,6 +1514,19 @@ def _render(report=None, data=None):
                          % (row["key"], row.get("lane") or "?", row["why"]))
         for key, why in report.get("held") or []:
             lines.append("  отложено ключ=%s: %s" % (key or "—", why))
+        # ИЗВЕЩЕНИЕ ПОКАЗЫВАЕТСЯ ЦЕЛИКОМ И ДОСЛОВНО, тем самым текстом, который
+        # уходит владельцу. Пересказ здесь («извещение отправлено») сделал бы
+        # `--dry` бесполезным ровно для того, ради чего он тут и нужен: увидеть
+        # будущее сообщение, ничего не послав.
+        for row in report.get("notices") or []:
+            sent = [n for n in (report.get("noticed") or ()) if n.get("key") == row.get("key")]
+            bad = [n for n in (report.get("notice_failed") or ()) if n.get("key") == row.get("key")]
+            mark = ("СУХОЙ ХОД, НЕ ОТПРАВЛЕНО" if row.get("dry")
+                    else ("ОТПРАВЛЕНО (message_id=%s)" % (sent[0].get("msg") or "?") if sent
+                          else ("НЕ ОТПРАВЛЕНО: %s" % (bad[0].get("why") if bad else "?"))))
+            lines.append("  извещение ключ=%s — %s:" % (row.get("key"), mark))
+            for piece in str(row.get("text") or "").splitlines():
+                lines.append("    | %s" % piece)
     return "\n".join(lines)
 
 

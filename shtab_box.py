@@ -1259,6 +1259,93 @@ def index_line(block, queue_id, day):
                queue_id))
 
 
+NOTICE_GOAL_MAX = 110          # сколько букв цели влезает в извещение
+NOTICE_MAX = 400               # потолок всего извещения: длинное режется по дороге
+NOTICE_HEAD = "📥 Ящик Штаба: ВЗЯТО задание"
+NOTICE_BY_SHTAB = "Задание положил Штаб САМ, владелец его не пересылал"
+NOTICE_NO_GOAL = "цель в документе не названа"
+# Заголовки, которыми Штаб открывает цель в теле задания. Первый найденный и берём:
+# ищем ЗАГОЛОВОК, а не первую строку — первой в теле стои́т «ПОЛОСА: пк», и извещение
+# рассказывало бы владельцу про полосу дважды, а про цель — ни разу.
+_GOAL_HEADS = ("ЦЕЛЬ", "GOAL")
+
+
+def goal_of(body, limit=NOTICE_GOAL_MAX):
+    """Тело задания → ОДНА строка сути цели. → str.
+
+    Пересказа здесь нет и быть не может: берётся ДОСЛОВНЫЙ кусок чужого текста,
+    обрезанный по длине. Сочинять сводку чужого задания своим кодом — ровно тот
+    «пересказ», которым предсмертный взгляд задания обещает провал.
+
+    ЦЕЛИ НЕ НАШЛОСЬ — ГОВОРИМ ЭТО СЛОВАМИ (:data:`NOTICE_NO_GOAL`), а не подставляем
+    первую попавшуюся строку: «ПОЛОСА: пк» в графе «цель» читается как измеренный
+    факт о задании и врёт молча.
+    """
+    lines = [" ".join(raw.split()) for raw in str(body or "").splitlines()]
+    lines = [ln for ln in lines if ln]
+    for i, line in enumerate(lines):
+        head = line.upper()
+        for word in _GOAL_HEADS:
+            if not head.startswith(word):
+                continue
+            tail = line[len(word):].lstrip(" .:—-–")
+            if not tail and i + 1 < len(lines):
+                tail = lines[i + 1]
+            tail = " ".join(tail.split())
+            if not tail:
+                continue
+            return tail if len(tail) <= limit else tail[:limit - 1] + "…"
+    return NOTICE_NO_GOAL
+
+
+def take_notice(block, queue_id, day, goal=None):
+    """Извещение владельцу в рабочую тему: «полоса ВЗЯЛА задание Штаба». → str.
+
+    ДВЕ СТРОКИ, И ЭТО ПОТОЛОК, А НЕ СТИЛЬ. Пункт 4 задания 05.09 дословно:
+    «длинное режется по дороге и теряет хвост». Хвост здесь — как раз пометка
+    происхождения, ради которой извещение и заводилось.
+
+    ЧТО В НЁМ ОБЯЗАНО БЫТЬ, по пункту 3 задания, и почему каждое:
+
+        номер очереди   владелец идёт по нему в очередь, не спрашивая нас
+        ключ задания    по нему задание опознаётся в папке мозга и в журнале
+        полоса          «на какой машине это исполнится» — первый вопрос к
+                        автоматической постановке (тот же довод, что у `index_line`)
+        суть цели       ДОСЛОВНО из тела (:func:`goal_of`), одной строкой
+        пометка Штаба   :data:`NOTICE_BY_SHTAB` — иначе извещение неотличимо от
+                        эха задания, которое владелец отправил сам
+
+    КНОПОК НЕТ И ОТВЕТА НЕ ЖДЁТ — это извещение, а не карточка (прямой запрет
+    задания). Здесь оно выражено тем, что функция отдаёт ТЕКСТ и ничего больше:
+    разметки клавиатуры ей неоткуда взять даже по ошибке.
+
+    ДОЖИМ НАЗЫВАЕТСЯ ОТДЕЛЬНО. Без него четвёртый заход по старому ключу приходит
+    владельцу словом «взято» — тем же, каким приходит новое задание, — и выглядит
+    как задвоение извещения, которого на самом деле нет.
+    """
+    lane = lane_words({"lane": block.get("lane") or LANE_DEFAULT,
+                       "named": bool(block.get("lane_named"))}
+                      if "lane" in block else lane_of(block))
+    again = ""
+    if block.get("retry"):
+        again = " · дожим, попытка %d" % int(block.get("attempt") or 1)
+    head = ("%s — очередь #%s, ключ %s, %s%s"
+            % (NOTICE_HEAD, queue_id, str(block.get("key") or "?"), lane, again))
+    tail = ("%s. Цель: %s"
+            % (NOTICE_BY_SHTAB,
+               goal if goal is not None else goal_of(block.get("body"))))
+    text = head + "\n" + tail
+    if len(text) <= NOTICE_MAX:
+        return text
+    # РЕЖЕМ ХВОСТ ЦЕЛИ, А НЕ ГОЛОВУ: номер, ключ и пометка происхождения — это то,
+    # ради чего извещение существует, и обрезаться они не смеют ни при какой длине.
+    keep = NOTICE_MAX - len(head) - len(tail) + len(str(goal if goal is not None
+                                                        else goal_of(block.get("body"))))
+    body_goal = (goal if goal is not None else goal_of(block.get("body")))
+    return head + "\n" + ("%s. Цель: %s" % (NOTICE_BY_SHTAB,
+                                            body_goal[:max(1, keep - 1)] + "…"))
+
+
 def digest_line(taken, day, ok=True, why="", by_lane=None):
     """Отдельный счёт для сводки контура: «задач от Штаба взято N». → str.
 
