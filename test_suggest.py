@@ -7961,6 +7961,193 @@ class TestDepositChoiceNotConflict(unittest.TestCase):
                       suggest._smoke_deposit_conflict("депозит 3000 ฿ … депозит 5000 ฿"))
 
 
+# ===== ДЕПОЗИТ ПАРКА — НЕ САМОПРОТИВОРЕЧИЕ БРОНИ (06.09.2026, ТРЕТИЙ случай класса #92) =====
+# Инвариант чека — про ОДНУ БРОНЬ: один байк, один депозит. В ПЕРЕЧИСЛЕНИИ ПАРКА депозит свой у
+# каждой модели, и шесть сумм там — шесть разных объектов, а не шесть мнений об одном.
+# Класс разбирался трижды: 30.07 в тренажёре (docs/artifacts/2026-07-30-trainer-verdict-run.md:11,
+# суммы 3000/5000/7000/20000), 31.07 и 08.08 у ревизора, 04.09 — карточкой владельцу
+# (pc_orchestrator.log:12595, окно 1791810538). Признак различения — СТРОКА-носитель модели как
+# позиция суммы (suggest._smoke_dep_position_at).
+#
+# ГОЛДЕН — ДОСЛОВНЫЙ текст прода, окно 488841305, drafts.id=354, status=posted, 2026-07-28T09:19:49Z
+# (выписан в docs/artifacts/2026-07-31-revizor-false-findings-audit.md §1). Это ТОТ САМЫЙ текст, на
+# котором чек дал улику «разные суммы депозита: 3000 ฿, 5000 ฿, 7000 ฿, 15000 ฿, 20000 ฿, 25000 ฿».
+LIVE_PARK_354 = """Актуальный прайс по нашему парку:
+
+Скутеры:
+
+NMAX 155
+• Сутки: 337 ฿
+• Неделя (7 дней): 2217 ฿
+• Месяц: от 5000 ฿
+• Депозит: 3000 ฿ / паспорт
+
+XMAX 300
+• Сутки: 593 ฿
+• Неделя (7 дней): 3902 ฿
+• Месяц: от 8900 ฿
+• Депозит: 5000 ฿ / паспорт
+
+XMAX 300 New Gen
+• Сутки: 704 ฿
+• Неделя (7 дней): 4632 ฿
+• Месяц: от 9900 ฿
+• Депозит: 7000 ฿ / паспорт
+
+ADV 350
+• Сутки: 749 ฿
+• Неделя (7 дней): 4928 ฿
+• Месяц: от 10900 ฿
+• Депозит: 7000 ฿ / паспорт
+
+FORZA 300
+• Сутки: 518 ฿
+• Неделя (7 дней): 3408 ฿
+• Месяц: от 7900 ฿
+• Депозит: 5000 ฿ / паспорт
+
+XADV 750
+• Сутки: 2091 ฿
+• Неделя (7 дней): 13759 ฿
+• Месяц: от 33900 ฿
+• Депозит: 25000 ฿ / паспорт
+
+XSR 155
+• Сутки: 502 ฿
+• Неделя (7 дней): 3303 ฿
+• Месяц: от 7490 ฿
+• Депозит: 7000 ฿ / паспорт
+
+Мотоциклы:
+
+CBR 650R
+• Сутки: 1528 ฿
+• Неделя (7 дней): 9519 ฿
+• Месяц: от 18900 ฿
+• Депозит: 20000 ฿ / паспорт
+
+CB 650R
+• Сутки: 1528 ฿
+• Неделя (7 дней): 9519 ฿
+• Месяц: от 18900 ฿
+• Депозит: 20000 ฿ / паспорт
+
+CB 300R
+• Сутки: 757 ฿
+• Неделя (7 дней): 4716 ฿
+• Месяц: от 9900 ฿
+• Депозит: 15000 ฿ / паспорт
+
+MT-03
+• Сутки: 927 ฿
+• Неделя (7 дней): 5775 ฿
+• Месяц: от 10990 ฿
+• Депозит: 15000 ฿ / паспорт
+
+NINJA 400
+• Сутки: 1007 ฿
+• Неделя (7 дней): 6274 ฿
+• Месяц: от 11900 ฿
+• Депозит: 20000 ฿ / паспорт
+
+VULCAN 650S
+• Сутки: 1528 ฿
+• Неделя (7 дней): 9519 ฿
+• Месяц: от 18900 ฿
+• Депозит: 20000 ฿ / паспорт
+
+Минимальный срок: скутеры от 5 дней, мотоциклы от 3.
+
+Подскажите, какая модель вас заинтересовала и на какие даты — проверю наличие."""
+
+
+class TestParkListingIsNotBookingConflict(unittest.TestCase):
+    """ПЕРЕЧИСЛЕНИЕ ПАРКА депозитом себе не противоречит: у каждой модели он СВОЙ, это прайс."""
+
+    def test_live_park_354_six_steps_is_not_conflict(self):
+        # дословный текст карточки 04.09: 6 ступеней депозита, 13 позиций — находки быть не должно
+        self.assertEqual(suggest._smoke_deposit_conflict(LIVE_PARK_354), "")
+
+    def test_live_park_354_has_all_six_steps(self):
+        # замок голдена: если текст усохнет, тест выше позеленеет впустую
+        found = {int(m.group(1).replace(" ", ""))
+                 for m in suggest._SMOKE_DEP_AMOUNT_RE.finditer(LIVE_PARK_354)}
+        self.assertEqual(found, {3000, 5000, 7000, 15000, 20000, 25000})
+
+    def test_live_292_two_xmax_generations_is_not_conflict(self):
+        # ДВА ПОКОЛЕНИЯ одной модели — две позиции парка (5000 у 2020-2022, 7000 у NEW 2023+).
+        # Канон _detect_models склеивает их в один ключ 'XMAX', поэтому позицию ведём СТРОКОЙ.
+        self.assertEqual(suggest._smoke_deposit_conflict(LIVE_YEAR_292), "")
+
+    def test_generations_get_different_positions(self):
+        # прямой замок на склейку поколений: у двух сумм РАЗНЫЕ позиции
+        pos = [suggest._smoke_dep_position_at(LIVE_YEAR_292, m.start(1))
+               for m in suggest._SMOKE_DEP_AMOUNT_RE.finditer(LIVE_YEAR_292)]
+        self.assertEqual(len(pos), 2)
+        self.assertNotEqual(pos[0], pos[1])
+        # а канон-модель у них ОДНА — то, из-за чего ключ по модели не годится
+        self.assertEqual(suggest._detect_models(LIVE_YEAR_292), ["XMAX"])
+
+    def test_park_line_carries_model_heading_above(self):
+        # строка «• Депозит: 3000 ฿ / паспорт» модель НЕ называет — позиция берётся с заголовка выше
+        m = suggest._SMOKE_DEP_AMOUNT_RE.search(LIVE_PARK_354)
+        head_at = suggest._smoke_dep_position_at(LIVE_PARK_354, m.start(1))
+        self.assertIsNotNone(head_at)
+        self.assertEqual(LIVE_PARK_354[head_at:].split("\n", 1)[0].strip(), "NMAX 155")
+
+
+class TestDepositConflictInsideOneBookingStillCaught(unittest.TestCase):
+    """ОТРИЦАТЕЛЬНЫЙ ТЕСТ, главный: чек, переставший ругаться на всё, бесполезен. Настоящее
+    самопротиворечие ВНУТРИ ОДНОЙ брони обязано ловиться после правки так же, как до неё."""
+
+    def test_same_booking_two_sums_across_lines(self):
+        # модель названа один раз сверху, вторая сумма её НЕ переназывает → одна позиция
+        bad = suggest._smoke_deposit_conflict(
+            "YAMAHA NMAX 155 на 5 дней — 1685 ฿ (337 ฿/день), депозит 3000 ฿.\n"
+            "Итого к оплате при получении: аренда 1685 ฿, депозит 5000 ฿.")
+        self.assertIn("разные суммы депозита", bad)
+        self.assertIn("3000 ฿", bad)
+        self.assertIn("5000 ฿", bad)
+
+    def test_same_booking_two_sums_one_line(self):
+        bad = suggest._smoke_deposit_conflict(
+            "NMAX 155 | дней: 7, стоимость: 3099 бат, депозит: 3000 бат, депозит: 7000 бат.")
+        self.assertIn("разные суммы депозита", bad)
+
+    def test_two_sums_without_any_model_still_caught(self):
+        # модели нет вовсе → позиция у обеих сумм одна (None) → сравниваем, как раньше
+        bad = suggest._smoke_deposit_conflict(
+            "Бронь подтверждена. Депозит 3000 ฿ вносится при получении.\n"
+            "Напоминаю: депозит 15000 ฿ наличными.")
+        self.assertIn("разные суммы депозита", bad)
+
+    def test_passport_branch_works_inside_park_listing(self):
+        # половина чека («деньги И паспорт») судит по КЛАУЗЕ и признаком не ослаблена:
+        # работает и в тексте с 13 позициями парка. Строка называет СВОЮ модель, то есть это
+        # своя позиция с одной суммой — сработать может только ветка паспорта.
+        bad = suggest._smoke_deposit_conflict(
+            LIVE_PARK_354 + "\n\nNMAX 155: депозит 3000 ฿ и паспорт нужны оба при получении.")
+        self.assertIn("одновременно", bad)
+
+    def test_bare_sum_appended_to_park_belongs_to_last_position(self):
+        # строка БЕЗ своей модели наследует позицию ближайшего заголовка выше (VULCAN 650S,
+        # депозит 20000 ฿) — и чужая сумма 3000 ฿ в ней остаётся противоречием этой позиции.
+        # Замок «правка не приглушила текст с перечислением целиком».
+        bad = suggest._smoke_deposit_conflict(
+            LIVE_PARK_354 + "\n\nДепозит 3000 ฿ вносится при получении.")
+        self.assertIn("разные суммы депозита", bad)
+        self.assertIn("20000 ฿", bad)
+
+    def test_check_is_wired_into_smoke_checks(self):
+        # правится ТОТ чек, что ходит в ревизор: имя и связь с _smoke_checks не разъехались
+        checks = {c["name"]: c for c in suggest._smoke_checks(
+            "NMAX 155 на 5 дней, депозит 3000 ฿.\nИтого: депозит 5000 ฿.", {})}
+        self.assertIn("депозит без противоречий", checks)
+        self.assertFalse(checks["депозит без противоречий"]["ok"])
+        clean = {c["name"]: c for c in suggest._smoke_checks(LIVE_PARK_354, {})}
+        self.assertTrue(clean["депозит без противоречий"]["ok"])
+
+
 class TestScarcityNegationAndScope(unittest.TestCase):
     """Клеймы дефицита: «не успеваем» (про время подачи, да ещё с отрицанием) — не срочность;
     повелительные формы («успевайте»/«успей») срочность несут и ловятся."""
