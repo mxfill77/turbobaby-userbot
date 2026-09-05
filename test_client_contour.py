@@ -592,12 +592,21 @@ class TestZhivyeCepi(unittest.TestCase):
         self.assertIn("suggest.py", hits)
 
 
-# ────────── 6. ЗАМОРОЗКА КОНТУРА: повтор отказа — в ленту (21.08.2026) ──────────
-# Живой факт, из которого раздел заведён (замер по pc_orchestrator.log за 21.08): 14 отказов ворот,
+# ── 6. ЗАМОРОЗКА КОНТУРА: под заморозкой владельца не спрашивают вовсе (05.09.2026) ──
+# Живой факт, из которого раздел заведён 21.08 (замер по pc_orchestrator.log): 14 отказов ворот,
 # 14 карточек владельцу, и все 14 — про ОДНУ форму «userbot,moderbot | price_gate.py,
 # price_source.py, suggest.py». Размножал их КОММИТ в подписи дедупа, а не смена отказа: все 14
-# коммитов трогали только docs/. Здесь стережём, что заморозка глушит РОВНО повтор формы и не
-# трогает ни право на выкатку, ни первый отказ формы, ни новый эпизод заморозки.
+# коммитов трогали только docs/. Тогда в ленту увели ПОВТОР формы, оставив первый отказ громким.
+#
+# ПОЧЕМУ ПРАВИЛО ПЕРЕПИСАНО (замер 05.09.2026, тот же лог): 25 отказов, 21 подавлен — и всё равно
+# ЧЕТЫРЕ карточки, потому что форма включает состав клиентских файлов, а он растёт с каждой задачей
+# ночи (7 файлов → 8 → 10 → 3). Мера «новая форма — новость» под заморозкой ложна: решение владельца
+# от состава файлов не зависит. Постоянное решение владельца 05.09.2026 дословно: «пока контур
+# заморожен — про выкатку детей не спрашивать вовсе».
+#
+# Здесь стережём ЧЕТЫРЕ вещи: под заморозкой карточки нет НИ ПРИ КАКОЙ смене состава; без заморозки
+# карточка уходит на каждом отказе как раньше; молчание не трогает право на выкатку; отказ остаётся
+# в ленте целиком.
 
 class TestZamorozkaVorot(unittest.TestCase):
 
@@ -635,67 +644,127 @@ class TestZamorozkaVorot(unittest.TestCase):
         self.assertEqual(a, "moderbot,userbot|price_gate.py,suggest.py")
         self.assertNotEqual(a, cc.refusal_shape(["userbot", "moderbot"], ["suggest.py"]))
 
-    # ── глушим ТОЛЬКО повтор ──
-    def test_pervyi_otkaz_formy_gromkii_povtor_v_lentu(self):
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ 1: под заморозкой карточки нет ни при какой смене состава ──
+    def test_pod_zamorozkoi_dazhe_pervyi_otkaz_v_lentu(self):
+        """Ветка, рождавшая все четыре карточки 05.09, снята: первый отказ формы больше НЕ громкий."""
         self._freeze()
-        r1, _ = self._route(["userbot"], ["suggest.py"])
+        r1, why1 = self._route(["userbot"], ["suggest.py"])
         r2, why2 = self._route(["userbot"], ["suggest.py"])
-        r3, why3 = self._route(["userbot"], ["suggest.py"])
-        self.assertEqual(r1, cc.ROUTE_CARD)
-        self.assertEqual((r2, r3), (cc.ROUTE_FEED, cc.ROUTE_FEED))
-        self.assertIn("повтор отказа №2", why2)
-        self.assertIn("повтор отказа №3", why3)
+        self.assertEqual((r1, r2), (cc.ROUTE_FEED, cc.ROUTE_FEED))
+        self.assertIn("не спрашиваю ВОВСЕ", why1)
+        self.assertIn("отказ №1", why1)
+        self.assertIn("отказ №2", why2)
 
-    def test_novaya_forma_gromkaya_dazhe_pod_zamorozkoi(self):
-        """«Отказ по причине, которой раньше не было» — новость, а не шум."""
+    def test_smena_sostava_faylov_kartochku_ne_rozhdaet(self):
+        """ГЛАВНЫЙ отрицательный тест задания: состав клиентских файлов менялся 05.09 четыре раза и
+        четыре раза покупал карточку. Теперь не покупает НИ ОДНОЙ — ни ростом, ни убылью, ни сменой
+        того, кого держим."""
         self._freeze()
-        self.assertEqual(self._route(["userbot"], ["suggest.py"])[0], cc.ROUTE_CARD)
-        self.assertEqual(self._route(["userbot"], ["suggest.py"])[0], cc.ROUTE_FEED)
-        r, why = self._route(["userbot"], ["suggest.py", "pricing.py"])   # состав изменился
-        self.assertEqual(r, cc.ROUTE_CARD)
-        self.assertIn("которой в эту заморозку ещё не было", why)
-        r2, _ = self._route(["userbot", "moderbot"], ["suggest.py"])      # кого держим изменилось
-        self.assertEqual(r2, cc.ROUTE_CARD)
+        sostavy = (["suggest.py"],
+                   ["suggest.py", "pricing.py"],                       # состав вырос
+                   ["suggest.py", "pricing.py", "price_source.py"],    # ещё вырос
+                   ["pricing.py"],                                     # состав убыл и сменился
+                   ["a.py", "b.py", "c.py", "d.py", "e.py"])           # состав совсем чужой
+        for s in sostavy:
+            for kinds in (["userbot"], ["userbot", "moderbot"], ["moderbot"]):
+                with self.subTest(sostav=s, kinds=kinds):
+                    self.assertEqual(self._route(kinds, s)[0], cc.ROUTE_FEED)
 
-    def test_novyi_epizod_zamorozki_nachinaet_razgovor_zanovo(self):
-        """Тишина не имеет права стать вечной: другая заморозка (другой mtime флага) → снова карточка."""
+    def test_novyi_epizod_schet_zanovo_no_vopros_ne_vozvrashchaetsya(self):
+        """Новая заморозка начинает СЧЁТ заново — но не вопрос: пока флаг лежит, адрес один."""
         self._freeze()
-        self.assertEqual(self._route(["userbot"], ["suggest.py"])[0], cc.ROUTE_CARD)
-        self.assertEqual(self._route(["userbot"], ["suggest.py"])[0], cc.ROUTE_FEED)
+        self.assertIn("отказ №1", self._route(["userbot"], ["suggest.py"])[1])
+        self.assertIn("отказ №2", self._route(["userbot"], ["suggest.py"])[1])
         ep0 = cc.freeze_episode(self.flag)
-        os.utime(self.flag, (ep0 + 3600, ep0 + 3600))                     # разморозили и заморозили снова
+        os.utime(self.flag, (ep0 + 3600, ep0 + 3600))              # разморозили и заморозили снова
         self.assertNotEqual(cc.freeze_episode(self.flag), ep0)
-        self.assertEqual(self._route(["userbot"], ["suggest.py"])[0], cc.ROUTE_CARD)
+        r, why = self._route(["userbot"], ["suggest.py"])
+        self.assertEqual(r, cc.ROUTE_FEED, "новый эпизод заморозки — всё ещё заморозка")
+        self.assertIn("отказ №1", why, "счёт эпизода начинается заново")
 
-    def test_reestr_ne_zapisalsya_znachit_gromko(self):
-        """FAIL-LOUD: не смогли запомнить форму → молчать не имеем права (оба захода — карточка)."""
+    def test_reestr_ne_zapisalsya_no_molchim(self):
+        """Сбой реестра адреса больше не решает: счёт — бухгалтерия, решение стои́т на ФЛАГЕ.
+        Прежний fail-loud снят СОЗНАТЕЛЬНО — он охранял правило, которого больше нет."""
         self._freeze()
         with mock.patch.object(cc, "_seen_save", return_value=(None, "OSError: диск только на чтение")):
             r1, why1 = self._route(["userbot"], ["suggest.py"])
             r2, why2 = self._route(["userbot"], ["suggest.py"])
-        self.assertEqual((r1, r2), (cc.ROUTE_CARD, cc.ROUTE_CARD))
-        self.assertIn("НЕ записан", why1)
-        self.assertIn("НЕ записан", why2)
+        self.assertEqual((r1, r2), (cc.ROUTE_FEED, cc.ROUTE_FEED))
+        self.assertIn("счётчик форм НЕ записан", why1)
+        self.assertIn("номер назвать не смог", why2)
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ 2: без заморозки — карточка как раньше ──
+    def test_bez_zamorozki_kartochka_na_kazhdom_otkaze(self):
+        """ПРЕДСМЕРТНЫЙ ВЗГЛЯД задания: провалимся, если заглушим карточку целиком. Снятая заморозка
+        обязана вернуть вопрос НА КАЖДОМ отказе — включая те самые составы, что молчали выше."""
+        for s in (["suggest.py"], ["suggest.py", "pricing.py"], ["pricing.py"]):
+            for _ in range(3):                       # повтор той же формы тоже громкий: заморозки нет
+                with self.subTest(sostav=s):
+                    r, why = self._route(["userbot"], s)
+                    self.assertEqual(r, cc.ROUTE_CARD)
+                    self.assertIn("заморозки нет", why)
+        self.assertFalse(os.path.exists(self.seen), "без заморозки реестр форм не трогаем вовсе")
+
+    def test_snyatie_zamorozki_vozvrashchaet_vopros_tem_zhe_tikom(self):
+        """Отмена — одно движение и без перезапуска: тот же вызов, тот же состав, флага нет → карточка."""
+        self._freeze()
+        self.assertEqual(self._route(["userbot"], ["suggest.py"])[0], cc.ROUTE_FEED)
+        os.remove(self.flag)                          # ← ровно то, чем владелец отменяет правило
+        self.assertEqual(self._route(["userbot"], ["suggest.py"])[0], cc.ROUTE_CARD)
 
     # ── реплей ЖИВОГО корпуса 21.08 ──
     _ZHIVYE_14 = ("3b85c06", "ce464ee", "c8b0d09", "e081ba4", "9dc1f5d", "5ac6a53", "ab16dcd",
                   "f64bc3c", "93b8f22", "1dfb625", "a8ad93d", "803911d", "a6f7533", "046e9c3")
     _ZHIVAYA_FORMA = (["userbot", "moderbot"], ["price_gate.py", "price_source.py", "suggest.py"])
 
-    def test_replei_14_otkazov_2108_pod_zamorozkoi_odna_kartochka(self):
-        """Дословный корпус 21.08: 14 отказов, 14 РАЗНЫХ коммитов, форма одна. Под заморозкой
-        владельцу уходит РОВНО одна карточка, остальные 13 — в ленту."""
+    def test_replei_14_otkazov_2108_pod_zamorozkoi_ni_odnoi_kartochki(self):
+        """Дословный корпус 21.08: 14 отказов, 14 РАЗНЫХ коммитов, форма одна. Было — 14 карточек,
+        стало с 21.08 — одна, стало с 05.09 — НИ ОДНОЙ."""
         self._freeze()
         routes = [self._route(*self._ZHIVAYA_FORMA)[0] for _c in self._ZHIVYE_14]
         self.assertEqual(len(routes), 14)
-        self.assertEqual(routes.count(cc.ROUTE_CARD), 1)
-        self.assertEqual(routes.count(cc.ROUTE_FEED), 13)
-        self.assertEqual(routes[0], cc.ROUTE_CARD, "громким остаётся ПЕРВЫЙ, а не случайный")
+        self.assertEqual(routes.count(cc.ROUTE_CARD), 0)
+        self.assertEqual(routes.count(cc.ROUTE_FEED), 14)
 
     def test_replei_14_otkazov_bez_zamorozki_vse_14_kartochek(self):
         """Контроль: ручки нет → те же 14 отказов дают те же 14 карточек, что и было."""
         routes = [self._route(*self._ZHIVAYA_FORMA)[0] for _c in self._ZHIVYE_14]
         self.assertEqual(routes.count(cc.ROUTE_CARD), 14)
+
+    # ── реплей ЖИВОГО корпуса 05.09 (тот, из-за которого правило переписано) ──
+    # Дословный замер по pc_orchestrator.log за 05.09: 25 отказов ворот, ПЯТЬ разных форм, порядок
+    # «CCCCCCCADDDDDDDDEEEEEEEEB». Форма A («trainer.py») карточки не купила — она была названа
+    # раньше в ту же заморозку; остальные ЧЕТЫРЕ родились за сутки заново и дали 4 карточки.
+    _FORMY_0509 = {
+        "A": ["trainer.py"],
+        "B": ["expectations_pc.py", "lesson_regress.py", "trainer.py"],
+        "C": ["brain_writer.py", "content_product_verifier.py", "expectations_pc.py",
+              "price_source.json", "price_source.py", "shtab_box.py", "trainer.py"],
+        "D": ["brain_writer.py", "content_product_verifier.py", "expectations_pc.py",
+              "price_source.json", "price_source.py", "review_pack.py", "shtab_box.py",
+              "trainer.py"],
+        "E": ["brain_writer.py", "client_contour.py", "content_product_verifier.py",
+              "expectations_pc.py", "lesson_regress.py", "price_source.json", "price_source.py",
+              "review_pack.py", "shtab_box.py", "trainer.py"],
+    }
+    _PORYADOK_0509 = "CCCCCCCADDDDDDDDEEEEEEEEB"
+
+    def test_replei_25_otkazov_0509_nol_kartochek(self):
+        """ЧИСЛО ЗАДАНИЯ: живые 25 отказов 05.09 стоили владельцу 4 карточек. Стоят 0."""
+        self._freeze()
+        # Форма A была названа ДО 05.09 в ту же заморозку — воспроизводим это состояние реестра.
+        self._route(["userbot", "moderbot"], self._FORMY_0509["A"])
+        routes = [self._route(["userbot", "moderbot"], self._FORMY_0509[ch])[0]
+                  for ch in self._PORYADOK_0509]
+        self.assertEqual(len(routes), 25)
+        self.assertEqual(routes.count(cc.ROUTE_CARD), 0, "владельцу не уходит НИ ОДНОЙ")
+        self.assertEqual(routes.count(cc.ROUTE_FEED), 25, "и все 25 остаются в ленте")
+
+    def test_replei_25_otkazov_0509_bez_zamorozki_vse_25_gromkie(self):
+        """Контроль того же корпуса: снимут заморозку — те же 25 отказов снова спросят владельца."""
+        routes = [self._route(["userbot", "moderbot"], self._FORMY_0509[ch])[0]
+                  for ch in self._PORYADOK_0509]
+        self.assertEqual(routes.count(cc.ROUTE_CARD), 25)
 
 
 # ────────── 7. «НЕТ» ВЛАДЕЛЬЦА: у карточки две двери (05.09.2026) ──────────

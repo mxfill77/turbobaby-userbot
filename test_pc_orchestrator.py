@@ -10429,17 +10429,23 @@ class TestZhivayaRuchkaMiraNevidnaGoldenam(Base):
 
 
 class TestZamorozkaKontura(TestClientContourGate):
-    """ЗАМОРОЗКА КОНТУРА (21.08.2026): пока клиентский контур заморожен, ПОВТОР отказа ворот уходит
-    В ЛЕНТУ, а не карточкой владельцу. Ворота при этом держат ровно как держали.
+    """ЗАМОРОЗКА КОНТУРА (правило 21.08.2026, переписано 05.09.2026): пока клиентский контур
+    заморожен, отказ ворот уходит В ЛЕНТУ, а не карточкой владельцу — ЛЮБОЙ отказ, а не только
+    повтор формы. Ворота при этом держат ровно как держали.
 
-    Живой факт: за 21.08 владелец получил 14 карточек ворот (замер по pc_orchestrator.log), все 14 —
-    про одну форму «userbot,moderbot | price_gate.py, price_source.py, suggest.py», и все 14
-    коммитов трогали ТОЛЬКО docs/. Здесь — три ОТРИЦАТЕЛЬНЫХ теста задания на боевых функциях:
-      (а) обычная (повторная) остановка при заморозке — карточки НЕТ, запись в ленте ЕСТЬ;
+    Живой факт 21.08: владелец получил 14 карточек ворот (замер по pc_orchestrator.log), все 14 —
+    про одну форму «userbot,moderbot | price_gate.py, price_source.py, suggest.py». Тогда в ленту
+    увели ПОВТОР формы. Живой факт 05.09: 25 отказов, 21 подавлен — и всё равно 4 карточки, потому
+    что форма включает состав клиентских файлов, а он растёт с каждой задачей ночи. Постоянное
+    решение владельца 05.09.2026 дословно: «пока контур заморожен — про выкатку детей не спрашивать
+    вовсе».
+
+    Здесь — три ОТРИЦАТЕЛЬНЫХ теста задания на боевых функциях:
+      (а) остановка при заморозке — карточки НЕТ ни при какой смене состава, запись в ленте ЕСТЬ;
       (б) выкатка ВСЁ-ТАКИ произошла — сообщение владельцу ЕСТЬ;
       (в) ручка выключена — карточки приходят как прежде.
-    Плюс замки: ворота под заморозкой НЕ пускают, отказ НОВОЙ формы остаётся громким, провал
-    самообновления демона по гейту остаётся громким."""
+    Плюс замки: молчание ворот НЕ применяет к детям ничего, провал самообновления демона по гейту
+    остаётся громким (чужой класс, решением владельца не тронут)."""
 
     def setUp(self):
         super().setUp()
@@ -10465,40 +10471,53 @@ class TestZamorozkaKontura(TestClientContourGate):
                                    gate_fn=lambda mods: (True, "ok"), restart_fn=self._restart,
                                    head_fn=lambda: commit)
 
-    # ── (а) обычная остановка при заморозке: карточки НЕТ, лента ЕСТЬ ──
+    # ── (а) остановка при заморозке: карточки НЕТ, лента ЕСТЬ ──
     def test_a_obychnaya_ostanovka_pod_zamorozkoi_bez_kartochki(self):
+        """ПЕРВЫЙ же отказ идёт в ленту: ветка «первый отказ формы громкий» снята решением
+        владельца 05.09 — ровно она и рождала все четыре карточки суток."""
         self._freeze()
-        self._upd_c("3b85c06", ["suggest.py"])          # первый отказ формы — ещё громкий
-        self.assertEqual(len(self.cards), 1, self.cards)
-        cards_after_first, cows_after_first = len(self.cards), len(self.cows)
-        note = self._upd_c("ce464ee", ["suggest.py"])   # ОБЫЧНАЯ остановка: та же форма, новый коммит
-        self.assertEqual(len(self.cards), cards_after_first, "карточки быть НЕ должно")
-        self.assertGreater(len(self.cows), cows_after_first, "запись в ленте быть ОБЯЗАНА")
+        note = self._upd_c("3b85c06", ["suggest.py"])
+        self.assertEqual(self.cards, [], "карточки быть НЕ должно даже на ПЕРВОМ отказе")
+        self.assertTrue(self.cows, "запись в ленте быть ОБЯЗАНА")
         feed = self.cows[-1]
         self.assertIn("ОСТАНОВЛЕНО", feed)
-        self.assertIn("ce464ee", feed)
+        self.assertIn("3b85c06", feed)
         self.assertIn("suggest.py", feed)
         self.assertIn("карточка владельцу НЕ отправлена", feed)
         self.assertIn("ОСТАНОВЛЕНО воротами клиентского контура", note)
         self.assertEqual(self.restarts, [], "ворота держат: ни одного рестарта живого бота")
 
     def test_a2_vorota_pod_zamorozkoi_vse_ravno_derzhat(self):
-        """Замок задания: заморозка глушит ВОПРОС, а не ворота. Держим и молча."""
+        """ЗАМОК ЗАДАНИЯ: молчание ворот не применяет к детям НИЧЕГО. Держим — и молча."""
         self._freeze()
         for c in ("3b85c06", "ce464ee", "c8b0d09", "e081ba4"):
             self._upd_c(c, ["suggest.py"])
-        self.assertEqual(self.restarts, [])
-        self.assertEqual(len(self.cards), 1, "громким остаётся первый отказ формы, остальные — лента")
+        self.assertEqual(self.restarts, [], "молчание ≠ разрешение: выкатки нет ни одной")
+        self.assertEqual(self.cards, [], "и ни одного вопроса владельцу")
 
-    def test_a3_otkaz_novoi_formy_ostaetsya_gromkim(self):
-        """«Отказ по причине, которой раньше не было» задание велело сохранить громким."""
+    def test_a3_smena_sostava_faylov_kartochku_ne_rozhdaet(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ 1 задания на БОЕВОЙ дороге: состав клиентских файлов 05.09 менялся
+        четыре раза и четыре раза покупал карточку. Теперь не покупает ни одной."""
         self._freeze()
-        self._upd_c("3b85c06", ["suggest.py"])
-        self._upd_c("ce464ee", ["suggest.py"])                     # повтор → тихо
-        self.assertEqual(len(self.cards), 1)
-        self._upd_c("c8b0d09", ["suggest.py", "pricing.py"])       # состав ИНОЙ → снова карточка
-        self.assertEqual(len(self.cards), 2, self.cards)
-        self.assertIn("pricing.py", self.cards[-1])
+        for c, changed in (("3b85c06", ["suggest.py"]),
+                           ("ce464ee", ["suggest.py"]),                       # тот же состав
+                           ("c8b0d09", ["suggest.py", "pricing.py"]),         # состав вырос
+                           ("e081ba4", ["pricing.py"]),                       # состав убыл
+                           ("9dc1f5d", ["price_source.py", "suggest.py"])):   # состав иной
+            self._upd_c(c, changed)
+        self.assertEqual(self.cards, [], self.cards)
+        self.assertEqual(len(self.cows), 5, "а в ленте — все пять отказов")
+        self.assertTrue(all("карточка владельцу НЕ отправлена" in s for s in self.cows))
+
+    def test_a4_otkaz_v_lente_polnym_sostavom(self):
+        """ЗАПРЕТ ЗАДАНИЯ: невидимо владельцу ≠ невидимо вообще. В ленте — коммит, кого держим,
+        поимённый состав клиентских файлов и причина."""
+        self._freeze()
+        self._upd_c("c8b0d09", ["suggest.py", "pricing.py", "docs/x.md"])
+        feed = self.cows[-1]
+        for chunk in ("c8b0d09", "userbot", "moderbot", "suggest.py", "pricing.py",
+                      "контур заморожен", "не спрашиваю ВОВСЕ"):
+            self.assertIn(chunk, feed, feed)
 
     # ── (б) выкатка ВСЁ-ТАКИ произошла: сообщение владельцу ЕСТЬ ──
     def test_b_sostoyavshayasya_vykatka_gromkaya(self):
