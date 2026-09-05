@@ -44,6 +44,7 @@ moderation_card.py — КАРТОЧКА МОДЕРАЦИИ: вопрос кли�
 import datetime
 
 import price_source
+import season_gate   # ГАРД границы сезонов — там же, где его боевой вызывающий (см. SEASON_*)
 import suggest
 
 # ------------------------------- три действия человека ------------------------
@@ -115,9 +116,13 @@ CANNOT_NO_PRICE = "no_price"     # модель без цены
 # а не своей копией: сменят порог там — поедет и карточка.
 LONG_TERM_DAYS = suggest._CAP_MIN_DAYS
 
-SEASON_ONE = "one"           # старт и конец в одном периоде
-SEASON_CROSSES = "crosses"   # период пересекает границу сезонов
-SEASON_UNKNOWN = "unknown"   # проверить нечем — ТРЕТИЙ исход, а не «всё хорошо»
+# Вердикты границы сезонов — ИМЕНА ЖИВОГО ГАРДА, а не свои копии. Сам гард переехал в
+# `season_gate` 06.09.2026: до переезда у него не было ни одного боевого вызывающего, а
+# клиентскому пути (`suggest`) звать его отсюда нельзя — этот модуль импортирует `suggest`,
+# и обратный импорт замкнул бы петлю. Реализация теперь одна на обе стороны.
+SEASON_ONE = season_gate.SEASON_ONE           # старт и конец в одном периоде
+SEASON_CROSSES = season_gate.SEASON_CROSSES   # период пересекает границу сезонов
+SEASON_UNKNOWN = season_gate.SEASON_UNKNOWN   # проверить нечем — ТРЕТИЙ исход, а не «всё хорошо»
 
 
 def _s(value):
@@ -140,6 +145,9 @@ def _get(rec, key):
     return rec.get(key)
 
 
+# `_date` и `_period_name` после переезда гарда (06.09) отсюда никем не зовутся — оставлены
+# намеренно и НЕ удалены: разбор даты карточки понадобится ей самой, а сносить чужой рабочий
+# код мимо задания запрещено. Живые копии обеих живут в `season_gate`.
 def _date(iso):
     """'ГГГГ-ММ-ДД' → date | None. Не дата — это «не знаю», а НЕ сегодняшний день."""
     s = _s(iso)
@@ -204,25 +212,11 @@ def _period_name(period):
 def season_span(iso_start, iso_end, doc=None):
     """Сезонные периоды на КРАЯХ срока аренды. → (вердикт, (имя старта, имя конца), пояснение).
 
-    Вердикт SEASON_UNKNOWN — полноправный третий исход: таблицы периодов нет, дат нет, дата вне
-    периодов файла. «Не смог проверить» НЕ превращается в «проверено и хорошо» ни одной веткой.
-
-    Конец срока берём КАК НАЗВАН клиентом: в «Календаре» обе даты входят в срок. На самой
-    границе это назовёт пересечением срок, задевающий её последним днём, — перекос СОЗНАТЕЛЬНО
-    в сторону «спроси человека»: лишний вопрос дешевле неверной цены."""
-    d = price_source.load() if doc is None else doc
-    if d is None:
-        return SEASON_UNKNOWN, None, "таблица периодов не прочиталась (price_source.json)"
-    ds, de = _date(iso_start), _date(iso_end)
-    if ds is None or de is None:
-        return SEASON_UNKNOWN, None, "дат аренды нет — сезон не определяю"
-    p1, p2 = price_source.period_of(d, ds), price_source.period_of(d, de)
-    if p1 is None or p2 is None:
-        return SEASON_UNKNOWN, None, "дата вне периодов файла цен"
-    n1, n2 = _period_name(p1), _period_name(p2)
-    if p1.get("key") == p2.get("key"):
-        return SEASON_ONE, (n1, n2), n1
-    return SEASON_CROSSES, (n1, n2), n1 + " → " + n2
+    ПРОВОДКА К ЖИВОМУ ГАРДУ, а не вторая его копия: тело переехало в `season_gate.span`
+    06.09.2026 вместе с подключением третьего исхода в клиентском пути. Карточка и путь ответа
+    обязаны судить границу ОДНИМ кодом — разъехавшись, они сказали бы владельцу и клиенту разное
+    об одних и тех же датах."""
+    return season_gate.span(iso_start, iso_end, doc=doc)
 
 
 def cannot_compute(facts, hints, doc=None):

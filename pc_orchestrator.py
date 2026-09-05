@@ -6973,6 +6973,15 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         # с 298a387 гейт падал на этом тесте каждым тиком (замер по
                         # pc_orchestrator.log 01.09 — «FAILED (failures=1) — остаюсь на старом коде»).
                         "model_name.py",
+                        # 06.09.2026: ТРЕТИЙ ИСХОД на границе сезонов — `import season_gate` в
+                        # suggest.py, тот же вход в куст, что у price_gate и model_name. Своих
+                        # листьев не приносит: тянет только `price_source`, уже стоящий выше.
+                        # ЧЕМ ОПАСНА ЕГО ГРЯЗЬ: этот файл решает, назовёт ли бот цену на срок
+                        # через стык сезонов или позовёт человека. Незакоммиченный WIP здесь
+                        # тихо меняет ИСХОД клиентского ответа — самый дорогой вид грязи из
+                        # возможных: клиент получит число, которого владелец не называл, и
+                        # увидят это не тестом, а деньгами.
+                        "season_gate.py",
                         # 01.09.2026: ступень A ревью-контура — куст за ленивым `import
                         # review_auto_run` в `_review_auto_note`/`maybe_review_auto`:
                         #   review_auto_run → review_auto → {review_pack → hq_context_pack, review_send}
