@@ -2718,7 +2718,88 @@ def _proc_line(label, pids, extra=""):
     return base + (f" · {extra}" if extra else "")
 
 
-def _contour_status(finder=None, items=None, revizor_state=None):
+# ═══ ДВЕРЬ ВЛАДЕЛЬЦА НЕСЁТ КОД СТАРШЕ ДИСКА (05.09.2026) ═════════════════════════════════════
+#
+# ЗАЧЕМ. `pc_agent` — единственный вход для нажатий и команд владельца с телефона, и демон его
+# НЕ перезапускает своими руками (прежнее решение, не трогаем). Пометка «ЖДЁТ РУЧНОГО рестарта»
+# при этом РАЗОВАЯ: она звучит один раз в момент самообновления и на этом умирает. Дальше сводка
+# контура говорит про агента «жив (PID …)» — и это правда про процесс, но ложь про дверь: живой
+# процесс может нести образ файла недельной давности и не знать НИ ОДНОЙ новой кнопки.
+#
+# ЖИВАЯ ЦЕНА КЛАССА, замер 05.09: владелец нажал кнопку ворот в 10:29, разбор вернул
+# «action=None ok=False» — ветку `gate:` добавили в 05:20 того же дня, а процесс стартовал
+# 03.09 05:02:18 и нёс код коммита 2f015bb (30.08 20:31). Прогон роутера ОБЕИХ версий на том же
+# `data='gate:no:4528917'`: код диска → action=no ok=True, код 2f015bb → action=None ok=False,
+# то есть старая версия воспроизводит живую строку ДОСЛОВНО. Сводка всё это время писала «жив».
+#
+# ПОРОГ ИЗМЕРЕН, А НЕ НАЗНАЧЕН. Корпус: 15 стартов агента по ротации `pc_agent.log{,.1,.2,.3}`
+# (18.08 14:09 … 03.09 05:02) против 4 правок его import-замыкания. ЗАКРЫТЫЕ эпизоды «правка →
+# ближайший старт»: 2f015bb 6 мин, a209241 30 мин — MAX ЗАКОННОГО 30 мин. ОТКРЫТЫЕ (старта не
+# было вовсе): f7e0e63 — 46 ч 35 мин, 4bbe548 — 6 ч 38 мин. Порог 90 мин = 3× максимума
+# законного: на корпусе он даёт 0 ложных (оба закрытых эпизода ниже) и ловит 2 из 2 открытых.
+# Корпус закрытых эпизодов МАЛ (две точки) — потому взят запас втрое, а не впритык.
+#
+# ПЕРЕЗАПУСКОМ ЭТО НЕ ЗАНИМАЕТСЯ НИ ОДНОЙ ВЕТКОЙ. Функция только СЧИТАЕТ и НАЗЫВАЕТ; ни одного
+# вызова taskkill/schtasks/spawn здесь нет и быть не должно — поднимает дверь владелец.
+AGENT_STALE_SEC = int(os.getenv("PC_AGENT_STALE_SEC", "5400") or "5400")   # 90 мин; 0 → ветка мертва
+
+
+def _agent_code_stale(finder=None, probe_fn=None, mtime_fn=None, closure_fn=None, now=None):
+    """Живой pc_agent несёт код старше диска? → (отставание в секундах | None, строка для сводки).
+
+    ТРИ ИСХОДА, а не два — «не смог проверить» отдельно от «в порядке»:
+      • (None, "")            — процесса нет, либо код в памяти не старше диска: сказать нечего;
+      • (None, "…НЕИЗВЕСТНО") — момент старта или mtime не читаются: молчанием это не закрываем;
+      • (сек,  "…")           — расхождение НАЗВАНО числом; ⚠️ добавляется по измеренному порогу.
+
+    Предмет — МОМЕНТ РОЖДЕНИЯ процесса против mtime файлов его import-замыкания (тех же пяти, что
+    считает `_agent_hit`). Файл на диске новее рождения процесса ⇒ этот текст в память НЕ попадал:
+    Python читает исходник один раз, на импорте. Обратное неверно только для правок, не влияющих
+    на импорт, — потому строка говорит «код старше диска», а не «кнопка сломана».
+    """
+    if AGENT_STALE_SEC <= 0:
+        return None, ""
+    pids = (finder or _find_pids_by_script)(_AGENT_ENTRY)
+    if not pids:
+        return None, ""                       # мёртв или CIM молчит — про это говорит _proc_line
+    probe = probe_fn or (lambda pid: proc_identity.process_probe(pid).started)
+    started = None
+    for pid in pids:
+        try:
+            s = probe(pid)
+        except Exception:                                                  # noqa: BLE001
+            s = None
+        if s is not None:
+            started = s if started is None else min(started, s)
+    if started is None:
+        return None, "возраст кода НЕИЗВЕСТЕН (момент старта процесса не читается)"
+    closure, why = _agent_closure(closure_fn=closure_fn)
+    names = sorted(closure) if closure else [_AGENT_ENTRY]
+    getm = mtime_fn or (lambda p: os.path.getmtime(p))
+    newest, newest_name = None, ""
+    for name in names:
+        try:
+            m = getm(os.path.join(REPO, name))
+        except Exception:                                                  # noqa: BLE001
+            continue
+        if newest is None or m > newest:
+            newest, newest_name = m, name
+    if newest is None:
+        return None, "возраст кода НЕИЗВЕСТЕН (файлы замыкания агента не читаются%s)" % (
+            "" if closure else ": " + (why or "замыкание не посчитано"))
+    lag = newest - started
+    if lag <= 0:
+        return None, ""                       # процесс родился ПОСЛЕ последней правки — свежий
+    hrs, mins = int(lag) // 3600, int(lag) % 3600 // 60
+    age = ("%d ч %02d мин" % (hrs, mins)) if hrs else ("%d мин" % mins)
+    head = ("⚠️ ДВЕРЬ ВЛАДЕЛЬЦА НЕСЁТ КОД СТАРШЕ ДИСКА на %s" if lag > AGENT_STALE_SEC
+            else "код старше диска на %s") % age
+    tail = ("ЖДЁТ РУЧНОГО рестарта (кнопки новее этого времени не работают; порог %d мин измерен)"
+            % (AGENT_STALE_SEC // 60) if lag > AGENT_STALE_SEC else "рестарт ожидается")
+    return lag, "%s — %s, свежее всех %s" % (head, tail, newest_name)
+
+
+def _contour_status(finder=None, items=None, revizor_state=None, stale_fn=None):
     """Статус клиентского контура: живость+PID userbot/moderation_bot/pc_agent/pc_orchestrator,
     свежесть heartbeat демона, секция «в работе» (ТОЛЬКО живые локальные цепи — без призраков
     финализированных родителей) и честная строка последнего тика ревизора. → многострочный текст
@@ -2735,10 +2816,17 @@ def _contour_status(finder=None, items=None, revizor_state=None):
                   f"свеж ({int(age)}с назад)" if age <= HEARTBEAT_STALE else f"ПРОТУХ ({int(age)}с назад)")
     except Exception:
         hb_txt = "нет"
+    # Про АГЕНТА мало сказать «жив»: живой процесс на старом образе — это мёртвые кнопки у
+    # владельца при зелёной строке в сводке. Расхождение называется ЗДЕСЬ, а не только разовой
+    # пометкой в момент самообновления (см. _agent_code_stale).
+    try:
+        _, ag_extra = (stale_fn or _agent_code_stale)(finder=find)
+    except Exception as e:                                                 # noqa: BLE001
+        ag_extra = "возраст кода НЕИЗВЕСТЕН (%s)" % type(e).__name__
     lines = ["📊 Статус контура:",
              _proc_line("userbot", ub),
              _proc_line("moderation_bot", mb, mb_extra),
-             _proc_line("pc_agent", ag),
+             _proc_line("pc_agent", ag, ag_extra),
              _proc_line("pc_orchestrator", orch, f"heartbeat {hb_txt}"),
              "🔧 В работе:"]
     # Снимок очереди берём сами (если не подан). ТРИ ИСХОДА, а не два (19.08.2026):

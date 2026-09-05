@@ -12043,5 +12043,132 @@ class TestParallelLanes(Base):
         self.assertIn("th.start()", src)
 
 
+class TestAgentCodeStale(unittest.TestCase):
+    """ДВЕРЬ ВЛАДЕЛЬЦА НЕСЁТ КОД СТАРШЕ ДИСКА — расхождение обязано быть названо в СВОДКЕ.
+
+    Живой класс 05.09.2026: pc_agent стартовал 03.09 05:02:18 на коде 2f015bb (30.08 20:31), в
+    05:20 05.09 в него добавили ветку кнопок ворот, а в 10:29 владелец нажал кнопку и получил
+    «action=None ok=False». Сводка контура всё это время писала про агента «жив (PID 8388)» — про
+    процесс правда, про дверь ложь. Числа и прогон обеих версий роутера — в артефакте задачи.
+
+    Порог 90 мин ИЗМЕРЕН (см. AGENT_STALE_SEC): max законного эпизода «правка → ближайший старт»
+    на корпусе 15 стартов = 30 мин, порог взят втрое с запасом.
+    """
+
+    H = 3600.0
+
+    def _stale(self, started, newest, **kw):
+        """Прогон на подставных часах: процесс родился `started`, свежий файл правлен `newest`."""
+        return o._agent_code_stale(
+            finder=kw.pop("finder", lambda name: [4242]),
+            probe_fn=kw.pop("probe_fn", lambda pid: started),
+            mtime_fn=kw.pop("mtime_fn", lambda path: newest),
+            closure_fn=kw.pop("closure_fn", None), **kw)
+
+    # ---- ДВА ОБЯЗАТЕЛЬНЫХ ОТРИЦАТЕЛЬНЫХ ТЕСТА ----
+
+    def test_process_starshe_diska_nazvan_raskhozhdeniem_a_ne_v_poryadke(self):
+        """ОТРИЦАТЕЛЬНЫЙ №1: процесс, несущий код старше диска, НЕ смеет выглядеть «в порядке».
+
+        Воспроизводим живой случай числом: старт 03.09 05:02:18, правка 05.09 05:20:57 — между
+        ними 48 ч 18 мин. Ветка обязана вернуть ЧИСЛО и слова расхождения, а не пустую строку.
+        """
+        started = 1000000.0
+        lag, note = self._stale(started, started + 48 * self.H + 18 * 60)
+        self.assertIsNotNone(lag, "расхождение не посчитано — сводка сказала бы «жив» и только")
+        self.assertGreater(lag, o.AGENT_STALE_SEC)
+        self.assertIn("КОД СТАРШЕ ДИСКА", note)
+        self.assertIn("48 ч 18 мин", note)                 # отставание названо ЧИСЛОМ, а не словом
+        self.assertIn("ЖДЁТ РУЧНОГО рестарта", note)
+        self.assertNotIn("в порядке", note)
+
+    def test_process_na_svezhem_kode_raskhozhdeniem_ne_nazyvaetsya(self):
+        """ОТРИЦАТЕЛЬНЫЙ №2: процесс, родившийся ПОСЛЕ последней правки, — не расхождение.
+
+        Без этого теста ветка, кричащая всегда, прошла бы первый тест и обесценила бы сводку:
+        предупреждение, которое горит постоянно, читается как фон и перестаёт быть новостью.
+        """
+        newest = 1000000.0
+        lag, note = self._stale(newest + 5 * 60, newest)    # старт на 5 минут ПОЗЖЕ правки
+        self.assertIsNone(lag)
+        self.assertEqual(note, "")
+
+    # ---- порог, а не круглое число ----
+
+    def test_nizhe_izmerennogo_poroga_govorit_bez_trevogi(self):
+        """Отставание в 20 мин (ниже измеренного максимума законного 30 мин) НАЗЫВАЕТСЯ, но без
+        ⚠️: свежая правка ждёт рестарта штатно, и звать это аварией значило бы врать."""
+        started = 1000000.0
+        lag, note = self._stale(started, started + 20 * 60)
+        self.assertEqual(int(lag), 20 * 60)
+        self.assertIn("код старше диска", note)
+        self.assertNotIn("⚠️", note)
+        self.assertNotIn("ЖДЁТ РУЧНОГО", note)
+
+    def test_vyshe_poroga_trevoga(self):
+        started = 1000000.0
+        _lag, note = self._stale(started, started + o.AGENT_STALE_SEC + 60)
+        self.assertIn("⚠️", note)
+
+    def test_porog_izmeren_a_ne_kruglyi(self):
+        """Порог обязан быть 3× от измеренного максимума законного (30 мин) — 5400 с."""
+        self.assertEqual(o.AGENT_STALE_SEC, 5400)
+
+    # ---- третий исход: «не смог проверить» ≠ «в порядке» ----
+
+    def test_moment_starta_ne_chitaetsya_govorit_neizvestno(self):
+        lag, note = self._stale(None, 1000000.0)
+        self.assertIsNone(lag)
+        self.assertIn("НЕИЗВЕСТ", note)                     # молчанием исход не закрываем
+
+    def test_fajly_zamykaniya_ne_chitayutsya_govorit_neizvestno(self):
+        def boom(path):
+            raise OSError("нет доступа")
+        lag, note = self._stale(1000000.0, None, mtime_fn=boom)
+        self.assertIsNone(lag)
+        self.assertIn("НЕИЗВЕСТ", note)
+
+    def test_processa_net_vetka_molchit(self):
+        """Мёртвого агента судит _proc_line («НЕ ЖИВ»), а не эта ветка: двух приговоров об одном
+        не даём."""
+        lag, note = self._stale(1000000.0, 1000000.0, finder=lambda name: [])
+        self.assertIsNone(lag)
+        self.assertEqual(note, "")
+
+    def test_otkat_porogom_v_nol(self):
+        save = o.AGENT_STALE_SEC
+        self.addCleanup(lambda: setattr(o, "AGENT_STALE_SEC", save))
+        o.AGENT_STALE_SEC = 0
+        lag, note = self._stale(1000000.0, 1000000.0 + 99 * self.H)
+        self.assertIsNone(lag)
+        self.assertEqual(note, "")
+
+    # ---- расхождение доезжает до СВОДКИ, а не живёт в функции ----
+
+    def test_svodka_nazyvaet_raskhozhdenie_v_stroke_agenta(self):
+        txt = o._contour_status(finder=lambda name: [7], items=[], revizor_state={},
+                                stale_fn=lambda finder=None: (99999, "⚠️ КОД СТАРШЕ ДИСКА на 27 ч"))
+        line = [ln for ln in txt.splitlines() if ln.startswith("pc_agent:")][0]
+        self.assertIn("жив", line)
+        self.assertIn("КОД СТАРШЕ ДИСКА", line)             # обе правды в ОДНОЙ строке
+
+    def test_svodka_ne_padaet_esli_vetka_slomalas(self):
+        """Сводка — единственная картинка контура: её нельзя ронять диагностикой о двери."""
+        def boom(finder=None):
+            raise RuntimeError("прибор сломался")
+        txt = o._contour_status(finder=lambda name: [7], items=[], revizor_state={}, stale_fn=boom)
+        self.assertIn("pc_agent:", txt)
+        self.assertIn("НЕИЗВЕСТ", txt)
+
+    # ---- инвариант: ветка НАЗЫВАЕТ, но не поднимает ----
+
+    def test_vetka_nikogo_ne_perezapuskaet(self):
+        """ЗАПРЕТ задания: авто-перезапуска чужого процесса не заводим. Проверяем ТЕКСТОМ, потому
+        что «забыли и добавили» — это ровно тот дефект, который тест обязан ловить."""
+        src = inspect.getsource(o._agent_code_stale)
+        for forbidden in ("taskkill", "schtasks", "Popen", "subprocess", "_spawn", "restart"):
+            self.assertNotIn(forbidden, src, f"в ветке появилось {forbidden!r} — это перезапуск")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
