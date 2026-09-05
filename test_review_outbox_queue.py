@@ -131,6 +131,30 @@ class TestOrigin(unittest.TestCase):
 
 class TestRetryKind(unittest.TestCase):
 
+    def test_empty_and_unfinished_are_routed_apart(self):
+        """«Канал кончил и промолчал» и «канал ещё работает» — РАЗНЫЕ повторы.
+
+        Замер 05.09.2026: у 25 промахов канал печатал `credit_usage: 0` при
+        `status=completed`. Звать это «оплачено» и добирать ЗАБОРОМ — повтор,
+        который не мог сработать ни разу: терминальная пустая задача пуста
+        навсегда. Единственный повтор с шансом — новая ОТПРАВКА.
+        """
+        self.assertEqual(Q.origin("channel_idle")[0], "external")
+        self.assertEqual(Q.retry_kind(*Q.origin("channel_idle")[:1])[0], "resend")
+
+        # А вот НЕзаконченная работа оплачена по-настоящему и добирается забором:
+        # задача на той стороне живая и может дописаться после нашего ухода.
+        self.assertEqual(Q.origin("poll_timeout")[0], "spent")
+        self.assertEqual(Q.retry_kind("spent", task_id="tsk1")[0], "refetch")
+
+        self.assertNotEqual(Q.origin("channel_idle")[0], Q.origin("poll_timeout")[0])
+
+    def test_answer_lost_was_narrowed_not_widened(self):
+        """Старый ярлык остался при своём буквальном смысле и НЕ вырос."""
+        self.assertEqual(Q.origin("answer_lost")[0], "spent")
+        self.assertIn("answer_lost", Q._SPENT)
+        self.assertNotIn("answer_lost", Q._EXTERNAL)
+
     def test_external_is_resend(self):
         self.assertEqual(Q.retry_kind("external")[0], "resend")
 

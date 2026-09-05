@@ -450,13 +450,25 @@ def classify_manus(
     status=None,
     body=None,
     min_chars=ANSWER_MIN_CHARS,
+    idle_error=None,
+    poll_timeout=False,
+    credit_usage=None,
 ):
     """Факты HTTP-захода → вердикт. → (dict, str answer). Чистая функция.
 
     Единица цены канала — заход (``request``), а не токены: сколько токенов
     сжёг Manus у себя, наружу он не сообщает, и придумывать ему цену в чужих
     единицах отправщик не станет.
+
+    ЦЕНУ НАЗЫВАЕТ КВИТАНЦИЯ, А НЕ ЯРЛЫК. ``credit_usage`` — то, что канал сам
+    напечатал о списании; когда он это сделал, в вердикт уезжает его число, а не
+    наша догадка «заход был — значит единица». Разница не бухгалтерская: на 25
+    промахах 05.09.2026 канал печатал ``credit_usage: 0`` при ``status=completed``,
+    а мы записывали им цену 1 — то есть отчёт полосы утверждал оплату там, где
+    поставщик прямым текстом сказал, что денег не взял. ``None`` — «квитанции
+    нет», и тогда цену называет прежнее правило захода.
     """
+    receipt = credit_usage if isinstance(credit_usage, int) and not isinstance(credit_usage, bool) else None
     make = lambda outcome, reason, detail, answer="", cost=None: _verdict(  # noqa: E731
         "manus",
         pack_name,
@@ -491,7 +503,40 @@ def classify_manus(
     #    принята и оплачена, ответ мы просто не увидели).
     if transport_error and not request_sent:
         return make("refused", "channel_unreachable", "адрес недоступен: %s" % transport_error, cost=0), ""
+
+    # 2а. КАНАЛ ЗАКОНЧИЛ И ПРОМОЛЧАЛ — свой исход, а не разновидность потери.
+    #     Задача в терминальном состоянии, сообщений ассистента ноль. Это НЕ
+    #     «ответ пустой» (пустое ответом здесь не становится нигде) и НЕ «ответ
+    #     потерялся по дороге»: терять было нечего, канал ничего и не сказал.
+    #     Квитанция здесь ОКОНЧАТЕЛЬНА — работа кончена, дописывать списание не
+    #     из чего, — поэтому цену называет она.
+    if idle_error:
+        return (
+            make(
+                "unknown",
+                "channel_idle",
+                "канал закончил задачу и не сказал ни слова: %s" % idle_error,
+                cost=receipt if receipt is not None else 0,
+            ),
+            "",
+        )
+
     if transport_error:
+        # 2б. Потолок ожидания на ЖИВОЙ работе — тоже свой исход. Работа не
+        #     кончена, значит квитанция ещё не окончательна: назвать ценой её
+        #     сегодняшний ноль значило бы утверждать, что канал не спишет ничего
+        #     за то, что прямо сейчас делает. Цена остаётся консервативной.
+        if poll_timeout:
+            return (
+                make(
+                    "unknown",
+                    "poll_timeout",
+                    "канал принял работу и не закончил её в отведённый срок (квитанция на момент отказа от "
+                    "ожидания: %s): %s" % (_NA if receipt is None else receipt, transport_error),
+                    cost=1,
+                ),
+                "",
+            )
         return (
             make("unknown", "answer_lost", "запрос ушёл, ответ не дошёл: %s" % transport_error, cost=1),
             "",
@@ -535,7 +580,18 @@ def classify_manus(
     if shape:
         return make("refused", shape[0], shape[1], answer, cost=1), answer
 
-    return make("answered", "ok", "ответ получен целиком, код %s, %s" % (status, note), answer, cost=1), answer
+    # Ответ получен — задача кончена, квитанция окончательна и цену называет она.
+    return (
+        make(
+            "answered",
+            "ok",
+            "ответ получен целиком, код %s, %s%s"
+            % (status, note, "" if receipt is None else ", квитанция канала %s" % receipt),
+            answer,
+            cost=receipt if receipt is not None else 1,
+        ),
+        answer,
+    )
 
 
 def refused_by_guard(*, channel, pack_name, pack_sha256, prompt_sha256, send_date, violations, channel_target=None):

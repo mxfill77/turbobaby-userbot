@@ -11,6 +11,7 @@
 
 import ast
 import io
+import json
 import os
 import shutil
 import socket
@@ -518,6 +519,338 @@ class NoSideEffects(_Base):
         self.assertEqual(OUTCOMES, ("answered", "refused", "unknown"))
         self.assertEqual(CHANNELS, ("codex", "manus"))
         self.assertGreaterEqual(ANSWER_MIN_CHARS, 100)
+
+
+# ───────────── ожидание Мануса: завершённое пустое против живой работы ─────────────
+#
+# Повод корпусом, а не мнением (замер 05.09.2026 по `docs/review_inbox/*-manus.md`):
+# 25 промахов одной формы, каждый 1802–1807 с, все с последним состоянием
+# `completed`, все на ПЕРВОЙ части — 45 095 с (12.53 ч) ожидания пустоты, ответов
+# ноль. Ниже — отрицательные пробы ровно на то, чем этот класс держался, и на
+# два соседних случая, которые правка обязана НЕ сломать.
+
+_LIVE_EMPTY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "manus_task_completed_empty.live.json")
+_TASK_ID = "9mdzM3AoxrRK9vbeJ3pUcc"
+
+
+def _live_empty_body():
+    """Дословное тело живого «завершено и молчит». → str.
+
+    Читается с диска, а не собирается в тесте: сочинённое телo проверяло бы наше
+    представление о канале. Это тот самый ответ, на котором прибор простоял
+    1802 с (задача 9mdzM3AoxrRK9vbeJ3pUcc, снято из протокола захода).
+    """
+    with io.open(_LIVE_EMPTY, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _body_with_reply(text, *, state="running"):
+    """То же тело, но ассистент СКАЗАЛ. → str.
+
+    Строится ИЗ живого: наше сообщение с меткой части остаётся на месте
+    посимвольно, ответ добавляется следующим — ровно так канал и отвечает.
+    """
+    obj = json.loads(_live_empty_body())
+    obj["status"] = state
+    obj["output"].append(
+        {
+            "id": "assistantMsg",
+            "status": "completed",
+            "role": "assistant",
+            "type": "message",
+            "content": [{"type": "output_text", "text": text}],
+        }
+    )
+    return json.dumps(obj, ensure_ascii=False)
+
+
+class _Clock(object):
+    """Часы и сон одной парой: сон ДВИГАЕТ часы, наружу не уходит ничего."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class _FakeManus(object):
+    """Подставной канал на границе сокета (`manus_http`), а не мимо неё.
+
+    Подменяется САМЫЙ НИЖНИЙ наш слой: всё, что выше (разбор тела, отсечка по
+    метке части, счёт опросов), работает боевым кодом. Мок, вставленный выше,
+    прятал бы именно ту ветку, ради которой тест и пишется.
+    """
+
+    def __init__(self, polls):
+        self.polls = list(polls)
+        self.gets = 0
+        self.posts = 0
+
+    def __call__(self, url, *, key, data=None, method="GET", timeout=None):
+        if method == "POST":
+            self.posts += 1
+            return {
+                "target": url,
+                "request_sent": True,
+                "transport_error": None,
+                "status": 200,
+                "body": json.dumps({"task_id": _TASK_ID, "task_url": "https://manus.im/app/" + _TASK_ID}),
+            }
+        self.gets += 1
+        item = self.polls[min(self.gets - 1, len(self.polls) - 1)]
+        out = {"target": url, "request_sent": True, "transport_error": None, "status": 200, "body": None}
+        out.update(item)
+        return out
+
+
+class ManusEmptyAnswerTest(unittest.TestCase):
+    """Четыре исхода ожидания, и ни один не выдаёт пустое за ответ."""
+
+    POLL = 10
+    WAIT = 1800
+
+    def setUp(self):
+        self._real_http = review_send_run.manus_http
+        self.addCleanup(setattr, review_send_run, "manus_http", self._real_http)
+
+    def _wait(self, polls, *, parts=9, part=1, wait=None):
+        """Прогнать боевое место ожидания на записанных ответах. → (исход, факты, часы)."""
+        fake = _FakeManus(polls)
+        review_send_run.manus_http = fake
+        clock = _Clock()
+        facts = {
+            "task_id": _TASK_ID,
+            "polls": 0,
+            "waited_sec": 0,
+            "last_state": None,
+            "last_poll_error": None,
+            "poll_note": None,
+            "request_sent": False,
+            "transport_error": None,
+            "status": None,
+            "body": None,
+            "idle_error": None,
+            "poll_timeout": False,
+            "credit_usage": None,
+        }
+        started = clock()
+        outcome = review_send_run._wait_reply(
+            facts,
+            marker=review_send_run._PART_MARK % (part, parts),
+            key="проба",
+            base="https://api.manus.ai",
+            task_path=review_send_run.DEFAULT_MANUS_TASK_PATH,
+            poll=self.POLL,
+            deadline=started + (self.WAIT if wait is None else wait),
+            started=started,
+            clock=clock,
+            sleep=clock.sleep,
+            tag=" на часть %d/%d" % (part, parts),
+        )
+        return outcome, facts, clock
+
+    # ─── отрицательная проба 1: завершённое пустое кончается за секунды ───
+
+    def test_completed_without_body_ends_the_wait_in_seconds(self):
+        """Живое «completed, сообщений 0» обязано кончить ожидание СРАЗУ.
+
+        Именно здесь и стоял класс: та же самая запись держала прибор 1802 с.
+        """
+        outcome, facts, _clock = self._wait([{"body": _live_empty_body()}])
+
+        self.assertEqual(outcome, "idle")
+        # Число, которым теперь стоит этот случай.
+        self.assertEqual(facts["waited_sec"], self.POLL * review_send_run.MANUS_EMPTY_CONFIRM_POLLS)
+        self.assertEqual(facts["waited_sec"], 20)
+        self.assertEqual(facts["polls"], review_send_run.MANUS_EMPTY_CONFIRM_POLLS)
+        # Живой промах стоил 1802 с — снято 1782 с, то есть 98.9%.
+        self.assertLess(facts["waited_sec"], 1802 / 50.0)
+        # Квитанция канала прочитана, а не додумана.
+        self.assertEqual(facts["credit_usage"], 0)
+        self.assertTrue(facts["idle_error"])
+        self.assertIn("channel_idle", facts["idle_error"])
+        self.assertFalse(facts["poll_timeout"], "терминальная пустота — это не исчерпанный потолок")
+        self.assertIsNone(facts["transport_error"], "терминальная пустота — это не обрыв транспорта")
+
+    def test_idle_verdict_says_channel_idle_and_charges_by_receipt(self):
+        """Ярлык у пустого СВОЙ, а цена — по квитанции канала, а не по ярлыку."""
+        _outcome, facts, _clock = self._wait([{"body": _live_empty_body()}])
+        verdict, answer = classify_manus(
+            request_sent=facts["request_sent"],
+            transport_error=facts["transport_error"],
+            status=facts["status"],
+            body=facts["body"],
+            idle_error=facts["idle_error"],
+            poll_timeout=facts["poll_timeout"],
+            credit_usage=facts["credit_usage"],
+            **_common()
+        )
+        self.assertEqual(verdict["reason"], "channel_idle")
+        self.assertNotEqual(verdict["reason"], "answer_lost", "ярлык свалки расширять запрещено")
+        self.assertEqual(verdict["outcome"], "unknown")
+        self.assertEqual(verdict["cost_value"], 0, "канал напечатал credit_usage=0 — платить нечем")
+        self.assertEqual(answer, "", "пустое ответом не становится ни одной веткой")
+        self.assertEqual(verdict["answer_chars"], 0)
+
+    # ─── отрицательная проба 2: настоящий ответ через минуту НЕ теряется ───
+
+    def test_real_answer_after_a_minute_is_not_called_empty(self):
+        """Шесть опросов молчания (60 с), затем разбор — это ОТВЕТ, а не пустота."""
+        silent = {"body": json.dumps({"status": "running", "output": [], "credit_usage": 0})}
+        reply = {"body": _body_with_reply("1. Упрощаемо: снять отдельный статус.\n2. Остальное неснимаемо.")}
+        outcome, facts, _clock = self._wait([silent] * 6 + [reply])
+
+        self.assertEqual(outcome, "ready")
+        self.assertEqual(facts["polls"], 7)
+        self.assertEqual(facts["waited_sec"], 70)
+        self.assertIsNone(facts["idle_error"], "живой ответ не смеет получить ярлык пустого")
+        self.assertFalse(facts["poll_timeout"])
+
+    def test_answer_arriving_together_with_completed_still_wins(self):
+        """Задача закончилась ВМЕСТЕ с ответом — это ответ, а не немота.
+
+        Замок на порядок веток внутри ожидания: поменяй их местами — и законный
+        разбор был бы выброшен как «канал промолчал».
+        """
+        outcome, facts, _clock = self._wait([{"body": _body_with_reply(LONG_ANSWER, state="completed")}])
+        self.assertEqual(outcome, "ready")
+        self.assertIsNone(facts["idle_error"])
+        self.assertEqual(facts["polls"], 1)
+
+    def test_single_completed_poll_is_not_enough_to_declare_silence(self):
+        """Немота ПОДТВЕРЖДАЕТСЯ, а не объявляется с одного взгляда.
+
+        Гонка «статус терминален раньше, чем дописан текст» наблюдением не
+        закрыта, поэтому один опрос немотой не считается: пришедший вторым ответ
+        забирает исход себе.
+        """
+        outcome, facts, _clock = self._wait(
+            [{"body": _live_empty_body()}, {"body": _body_with_reply(LONG_ANSWER, state="completed")}]
+        )
+        self.assertEqual(outcome, "ready")
+        self.assertIsNone(facts["idle_error"])
+
+    # ─── отрицательная проба 3: обрыв транспорта — СВОЙ исход, а не «пусто» ───
+
+    def test_transport_break_keeps_its_own_outcome(self):
+        """Мёртвый сокет до самого потолка — `answer_lost`, и не `channel_idle`."""
+        broken = {"transport_error": "ConnectionResetError: [Errno 104] Connection reset by peer", "status": None}
+        outcome, facts, _clock = self._wait([broken], wait=60)
+
+        self.assertEqual(outcome, "timeout")
+        self.assertIsNone(facts["idle_error"], "обрыв транспорта пустотой канала не является")
+        self.assertIn("Connection reset", facts["transport_error"])
+
+        verdict, _answer = classify_manus(
+            request_sent=facts["request_sent"],
+            transport_error=facts["transport_error"],
+            status=facts["status"],
+            body=facts["body"],
+            idle_error=facts["idle_error"],
+            poll_timeout=facts["poll_timeout"],
+            credit_usage=facts["credit_usage"],
+            **_common()
+        )
+        self.assertEqual(verdict["reason"], "poll_timeout")
+        self.assertNotEqual(verdict["reason"], "channel_idle")
+
+    def test_transport_break_before_ceiling_is_answer_lost(self):
+        """Обрыв, донесённый наверх без исчерпания потолка, остаётся `answer_lost`."""
+        verdict, _answer = classify_manus(
+            request_sent=True,
+            transport_error="TimeoutError: timed out",
+            idle_error=None,
+            poll_timeout=False,
+            **_common()
+        )
+        self.assertEqual((verdict["outcome"], verdict["reason"]), ("unknown", "answer_lost"))
+        self.assertEqual(verdict["cost_value"], 1)
+
+    # ─── «ещё работает»: потолок исчерпан на ЖИВОЙ задаче ───
+
+    def test_still_running_at_the_ceiling_is_its_own_label(self):
+        """Нетерминальное состояние до конца бюджета — `poll_timeout`, не пустота."""
+        running = {"body": json.dumps({"status": "running", "output": [], "credit_usage": 0})}
+        outcome, facts, _clock = self._wait([running], wait=60)
+
+        self.assertEqual(outcome, "timeout")
+        self.assertTrue(facts["poll_timeout"])
+        self.assertIsNone(facts["idle_error"])
+        self.assertEqual(facts["last_state"], "running")
+
+        verdict, _answer = classify_manus(
+            request_sent=facts["request_sent"],
+            transport_error=facts["transport_error"],
+            status=facts["status"],
+            body=facts["body"],
+            idle_error=facts["idle_error"],
+            poll_timeout=facts["poll_timeout"],
+            credit_usage=facts["credit_usage"],
+            **_common()
+        )
+        self.assertEqual(verdict["reason"], "poll_timeout")
+        # Работа НЕ кончена — квитанция ещё не окончательна, цена консервативна.
+        self.assertEqual(verdict["cost_value"], 1)
+
+    # ─── четыре исхода РАЗВЕДЕНЫ ───
+
+    def test_four_outcomes_carry_four_different_labels(self):
+        """`answer_lost` перестал быть свалкой: у каждого исхода своё имя."""
+        answered, _a = classify_manus(
+            request_sent=True, status=200, body=LONG_ANSWER, credit_usage=1, **_common()
+        )
+        idle, _b = classify_manus(
+            request_sent=True, status=200, body=_live_empty_body(),
+            idle_error="channel_idle: задача пуста", credit_usage=0, **_common()
+        )
+        working, _c = classify_manus(
+            request_sent=True, status=200, body=None,
+            transport_error="poll_timeout: не ответила", poll_timeout=True, **_common()
+        )
+        broken, _d = classify_manus(
+            request_sent=True, transport_error="OSError: сокет умер", **_common()
+        )
+
+        labels = [v["reason"] for v in (answered, idle, working, broken)]
+        self.assertEqual(labels, ["ok", "channel_idle", "poll_timeout", "answer_lost"])
+        self.assertEqual(len(set(labels)), 4, "исходы обязаны РАЗЛИЧАТЬСЯ, а не сливаться")
+        self.assertEqual(answered["outcome"], "answered")
+        for verdict in (idle, working, broken):
+            self.assertEqual(verdict["outcome"], "unknown")
+            self.assertEqual(verdict["answer_chars"], 0)
+
+    def test_receipt_names_the_price_of_an_answered_run(self):
+        """Цену захода называет квитанция канала, а не наш ярлык."""
+        paid, _a = classify_manus(request_sent=True, status=200, body=LONG_ANSWER, credit_usage=7, **_common())
+        self.assertEqual(paid["cost_value"], 7)
+        # Квитанции нет — прежнее правило захода, и это НЕ ноль.
+        silent, _b = classify_manus(request_sent=True, status=200, body=LONG_ANSWER, **_common())
+        self.assertEqual(silent["cost_value"], 1)
+
+    def test_credit_usage_reader_tells_zero_from_absent(self):
+        """Ноль — ответ квитанции, отсутствие поля — молчание о цене."""
+        self.assertEqual(review_send_run.manus_credit_usage(_live_empty_body()), 0)
+        self.assertEqual(review_send_run.manus_credit_usage('{"credit_usage": 12}'), 12)
+        self.assertIsNone(review_send_run.manus_credit_usage('{"status": "completed"}'))
+        self.assertIsNone(review_send_run.manus_credit_usage('{"credit_usage": true}'))
+        self.assertIsNone(review_send_run.manus_credit_usage("не json"))
+
+    def test_live_fixture_is_the_case_it_claims_to_be(self):
+        """Фикстура обязана быть тем самым случаем, иначе голден врёт."""
+        obj = json.loads(_live_empty_body())
+        self.assertEqual(obj["status"], "completed")
+        self.assertEqual(obj["credit_usage"], 0)
+        self.assertEqual([m["role"] for m in obj["output"]], ["user"])
+        # Канал замер за 3 секунды — ровно поэтому ждать его 1800 с бессмысленно.
+        self.assertEqual(int(obj["updated_at"]) - int(obj["created_at"]), 3)
+        state, text, note = review_send_run.manus_output_text(obj)
+        self.assertEqual(state, "completed")
+        self.assertEqual(text, "")
+        self.assertIn("текстовых кусков 0", note)
 
 
 if __name__ == "__main__":

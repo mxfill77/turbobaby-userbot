@@ -112,6 +112,23 @@ DEFAULT_MANUS_POLL = 10
 # менялись 6 опросов подряд (60 с при шаге 10 с).
 MANUS_SETTLE_POLLS = 6
 
+# Сколько подряд опросов задача обязана выглядеть ЗАКОНЧЕННОЙ И НЕМОЙ, прежде
+# чем ожидание ответа на часть будет прекращено. Замер 05.09.2026 по 25 живым
+# промахам: канал ставит `status=completed` за 3 с (`created_at` 1788609083 →
+# `updated_at` 1788609086), кладёт в `output` РОВНО ОДНО сообщение — наше же, с
+# ролью `user`, — и печатает `credit_usage: 0`. Ни в одном из 25 случаев после
+# этого не появилось ничего: состояние терминально и по доке, и по факту.
+#
+# Почему не 1 (выйти с первого же опроса): подтверждение стои́т ОДИН шаг опроса
+# (10 с) против 1800 с прежнего ожидания, а страхует от единственного случая,
+# который наблюдением не закрыт — гонки, где канал переводит статус в
+# терминальный РАНЬШЕ, чем дописывает текст ответа. Цена страховки 0.55% от
+# снимаемого, поэтому она куплена. Почему не 6 (как у затишья): затишье судит
+# по КОСВЕННОМУ признаку (ничего не менялось), а здесь признак ПРЯМОЙ —
+# документированное терминальное состояние, и держать его под тем же
+# подозрением значит платить за одно и то же дважды.
+MANUS_EMPTY_CONFIRM_POLLS = 2
+
 # Сколько знаков канал держит ВСТРОЕННЫМ ТЕКСТОМ в одном сообщении. Порог 400 —
 # не единственный: ПОД ним канал молча срезает длинное сообщение и укладывает
 # остаток ВЛОЖЕНИЕМ, оставляя ревьюеру ~1100 знаков и строку
@@ -492,6 +509,34 @@ def manus_settled_signature(body):
     return "%s|%d|%s|%s" % (obj.get("updated_at"), len(messages), last.get("id"), status)
 
 
+def manus_credit_usage(body):
+    """КВИТАНЦИЯ канала за задачу. → int | None.
+
+    ``None`` значит «канал квитанции не дал», и это НЕ ноль: своего суждения о
+    чужой цене у отправщика нет ни одной веткой. Поле `credit_usage` канал
+    печатает в теле `GET /v1/tasks/{id}` рядом со `status`; на 25 промахах
+    05.09.2026 оно равнялось нулю при `status=completed` — то есть канал сам
+    сказал, что работы не делал и денег не взял.
+
+    Читается ЧИСЛО, а не истинность: ноль — полноценный ответ квитанции, и
+    путать его с «поля нет» нельзя, иначе бесплатный отказ станет неотличим от
+    молчания канала о цене.
+    """
+    obj = _json_or_none(body)
+    if not isinstance(obj, dict):
+        return None
+    value = obj.get("credit_usage")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value == int(value):
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return None
+
+
 def manus_error_text(body):
     """Текст ошибки задачи, если канал его дал. → str."""
     obj = _json_or_none(body)
@@ -583,6 +628,7 @@ def _wait_settled(facts, *, key, base, task_path, poll, settle_polls, deadline, 
         facts["waited_sec"] = int(clock() - started)
         if clock() >= deadline:
             facts["request_sent"] = True
+            facts["poll_timeout"] = True
             facts["transport_error"] = (
                 "poll_timeout: задача %s не дошла до готовности%s за %d с "
                 "(опросов %d, последнее состояние %s%s)"
@@ -618,6 +664,7 @@ def _wait_settled(facts, *, key, base, task_path, poll, settle_polls, deadline, 
         state, _text, note = manus_output_text(got["body"])
         facts["last_state"] = state
         facts["poll_note"] = note
+        facts["credit_usage"] = manus_credit_usage(got["body"])
 
         if state == _MANUS_FAILED:
             facts["request_sent"] = True
@@ -647,19 +694,53 @@ def _wait_settled(facts, *, key, base, task_path, poll, settle_polls, deadline, 
             return "ready"
 
 
-def _wait_reply(facts, *, marker, key, base, task_path, poll, deadline, started, clock, sleep, tag=""):
-    """Дождаться ОТВЕТА канала на конкретную часть. → "ready" | "timeout" | "http" | "failed".
+def _wait_reply(
+    facts,
+    *,
+    marker,
+    key,
+    base,
+    task_path,
+    poll,
+    deadline,
+    started,
+    clock,
+    sleep,
+    tag="",
+    confirm_polls=MANUS_EMPTY_CONFIRM_POLLS,
+):
+    """Дождаться ОТВЕТА канала на конкретную часть. → "ready" | "idle" | "timeout" | "http" | "failed".
 
     Между частями ждать «затишья» нельзя и не нужно. Нельзя — потому что
     `status` живой задачи неделями сидит в `running`/`pending` и о готовности
     ничего не сообщает (обе живые пробы 01.09). Не нужно — потому что здесь есть
     ПОЛОЖИТЕЛЬНЫЙ признак, а не догадка: после нашей части появилось сообщение
     ассистента с текстом, значит часть принята и можно слать следующую.
+
+    Исходов ЧЕТЫРЕ, и они РАЗНЫЕ — свалка «ответа нет» была дефектом:
+
+    * ``ready`` — текст ассистента после нашей метки есть. Проверяется ПЕРВЫМ, до
+      всякого разбора состояния: ответ остаётся ответом, каким бы словом канал ни
+      назвал состояние задачи.
+    * ``idle`` — задача ЗАКОНЧЕНА (`status=completed`) и НЕМА. Терминальное
+      состояние ждать больше нечего: ждать его — значит ждать, пока изменится то,
+      что по доке канала уже не меняется. До 05.09.2026 этой ветки здесь не было,
+      и каждый такой случай стоил полного бюджета (замер: 25 промахов, 1802–1807 с
+      каждый, 12.53 ч суммарно, ответов ноль).
+    * ``timeout`` — потолок ожидания исчерпан на НЕтерминальном состоянии. Это
+      «канал ещё работает, а мы больше не ждём», и путать это с ``idle`` нельзя:
+      там работа кончена, здесь — брошена нами, и добрать её позже ещё можно.
+    * ``failed`` / ``http`` — отказ, объявленный каналом.
+
+    Пустое НЕ становится ответом ни одной веткой: ``idle`` уезжает наверх
+    отдельным фактом (``facts["idle_error"]``) и отдельным ярлыком, а не текстом.
     """
+    facts["empty_polls"] = 0
     while True:
         facts["waited_sec"] = int(clock() - started)
         if clock() >= deadline:
             facts["request_sent"] = True
+            facts["poll_timeout"] = True
             facts["transport_error"] = (
                 "poll_timeout: задача %s не ответила%s за %d с (опросов %d, последнее состояние %s%s)"
                 % (
@@ -691,6 +772,7 @@ def _wait_reply(facts, *, marker, key, base, task_path, poll, deadline, started,
         state, text, note = manus_output_text(got["body"], after_marker=marker)
         facts["last_state"] = state
         facts["poll_note"] = note
+        facts["credit_usage"] = manus_credit_usage(got["body"])
 
         if state == _MANUS_FAILED:
             facts["request_sent"] = True
@@ -700,8 +782,36 @@ def _wait_reply(facts, *, marker, key, base, task_path, poll, deadline, started,
             )
             return "failed"
 
+        # ОТВЕТ ВПЕРЁД ВСЕГО. Порядок здесь не стилистика: поменяй его местами со
+        # следующей веткой — и задача, закончившаяся ВМЕСТЕ с ответом (законный и
+        # частый случай), была бы объявлена немой, а живой разбор выброшен.
         if text.strip():
             return "ready"
+
+        if state == _MANUS_DONE:
+            facts["empty_polls"] += 1
+            if facts["empty_polls"] >= max(1, int(confirm_polls)):
+                facts["request_sent"] = True
+                facts["idle_error"] = (
+                    "channel_idle: задача %s закончена состоянием %s и не сказала ни слова%s "
+                    "(подтверждено %d опросами подряд, ждали %d с, квитанция канала %s; %s)"
+                    % (
+                        facts.get("task_id"),
+                        _MANUS_DONE,
+                        tag,
+                        facts["empty_polls"],
+                        facts["waited_sec"],
+                        _NA_STATE if facts.get("credit_usage") is None else facts["credit_usage"],
+                        note,
+                    )
+                )
+                return "idle"
+            continue
+
+        # Состояние нетерминальное — счётчик подтверждений обнуляется. Иначе два
+        # разнесённых по времени `completed` (например, вокруг ожившей задачи)
+        # сложились бы в подтверждение, которого никто не наблюдал.
+        facts["empty_polls"] = 0
 
 
 def send_manus(
@@ -785,6 +895,13 @@ def send_manus(
     facts["parts_sent"] = 1
     facts["part_chars"] = [len(part) for part in parts]
     facts["part_error"] = None
+    # Три факта разведения исходов. Заводятся ЗДЕСЬ, а не по месту установки:
+    # вызывающий читает их через `.get`, и отсутствие ключа было бы неотличимо
+    # от «не случилось», а протокол захода недосчитался бы графы.
+    facts["idle_error"] = None  # канал закончил и промолчал
+    facts["poll_timeout"] = False  # потолок исчерпан на живой работе
+    facts["empty_polls"] = 0
+    facts["credit_usage"] = None  # квитанция канала: None ≠ 0
 
     # Приём не состоялся (обрыв, 4xx, 5xx) — тело ошибки уезжает наверх ДОСЛОВНО
     # и судится там же, где судилось раньше. Опрашивать нечего.
@@ -861,6 +978,26 @@ def send_manus(
     facts["answer_from_output"] = bool(text.strip())
     if text.strip():
         facts["body"] = text
+        return facts
+
+    # Задача КОНЧЕНА и нема — тот же исход, что и между частями, и звать его надо
+    # тем же словом. Без этой ветки хвост захода отдавал бы `accepted_no_answer`
+    # («принял, ответа нет»), то есть ОПЛАЧЕННЫЙ заход, который слой повтора
+    # честно попытался бы добрать ЗАБОРОМ, — а забирать из терминальной пустой
+    # задачи нечего и не станет никогда.
+    if state == _MANUS_DONE:
+        facts["idle_error"] = (
+            "channel_idle: задача %s закончена состоянием %s и не сказала ни слова "
+            "(ждали %d с, опросов %d, квитанция канала %s; %s)"
+            % (
+                facts.get("task_id"),
+                _MANUS_DONE,
+                facts["waited_sec"],
+                facts["polls"],
+                _NA_STATE if facts.get("credit_usage") is None else facts["credit_usage"],
+                note,
+            )
+        )
     return facts
 
 
@@ -956,6 +1093,9 @@ def run_channel(channel, prompt, ctx, args):
         transport_error=facts["transport_error"],
         status=facts["status"],
         body=facts["body"],
+        idle_error=facts.get("idle_error"),
+        poll_timeout=facts.get("poll_timeout", False),
+        credit_usage=facts.get("credit_usage"),
         **common
     )
 
@@ -1003,6 +1143,7 @@ def fetch_only(args):
             transport_error=got["transport_error"],
             status=got["status"],
             body=text if (state == _MANUS_DONE and text.strip()) else got["body"],
+            credit_usage=manus_credit_usage(got["body"]),
             **common
         )
     sys.stdout.write("ИСХОД: %s (%s) — %s\n" % (verdict["title"], verdict["reason"], verdict["detail"]))
