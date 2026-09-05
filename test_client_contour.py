@@ -197,9 +197,21 @@ class TestOsnovaniya(unittest.TestCase):
         self.d = tempfile.mkdtemp(prefix="cc_rel_")
         self.rel = os.path.join(self.d, "release.json")
         self.tr = os.path.join(self.d, "trainer.json")
+        # ИЗОЛЯЦИЯ РУЧКИ ЗАМОРОЗКИ — с 05.09.2026 она решает не только адрес отказа, но и САМО
+        # основание пропуска (`release_reason` → `freeze_holds_release`). Без увода пути голдены
+        # этого класса читали бы БОЕВОЙ флаг: он лежит с 21.08, и «зелёный вердикт открывает
+        # ворота» краснел бы, не изменившись ни строкой. Ровно та же течь, что закрыта в GateBase.
+        self.flag = os.path.join(self.d, "pc_orchestrator.contour_frozen")
+        _s = cc.FREEZE_FLAG
+        cc.FREEZE_FLAG = self.flag
+        self.addCleanup(lambda: setattr(cc, "FREEZE_FLAG", _s))
 
     def tearDown(self):
         shutil.rmtree(self.d, ignore_errors=True)
+
+    def freeze(self):
+        with open(self.flag, "w", encoding="utf-8") as f:
+            f.write("контур заморожен (тест)\n")
 
     def test_bez_osnovanii_derzhim(self):
         self.assertIsNone(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr, env={}))
@@ -268,6 +280,99 @@ class TestOsnovaniya(unittest.TestCase):
         ok, msg = cc.approve("не-коммит")
         self.assertFalse(ok)
         self.assertIn("не похоже", msg)
+
+    # ─────── ОТРИЦАТЕЛЬНЫЙ ТЕСТ №1 ЗАДАНИЯ (05.09.2026) ───────
+    # ПОД ЗАМОРОЗКОЙ ЗЕЛЁНЫЙ ВЕРДИКТ ВОРОТ НЕ ОТКРЫВАЕТ.
+    # Живой замер класса: 26.08 03:35:35 в реестр легла зелёная запись 74be777 → 03:35:43 демон
+    # написал «основание пропуска «trainer» — применяем к userbot,moderbot». Восемь секунд, и
+    # заморозка (лежит с 21.08) не удержала ничего: она жила только в адресе отказа.
+
+    def test_pod_zamorozkoi_zelenyi_verdikt_ne_otkryvaet_vorota(self):
+        """ГЛАВНЫЙ замок задания: вердикт зелёный ПО СУЩЕСТВУ (его же и проверяем строкой ниже),
+        а ворота под заморозкой держат. Не «вердикт испортился» — основание не действует."""
+        self._verdict()
+        self.assertTrue(cc.trainer_green("abc1234", path=self.tr, env={}),
+                        "вердикт обязан быть зелёным САМ ПО СЕБЕ, иначе тест доказывает не то")
+        self.freeze()
+        self.assertIsNone(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr, env={}),
+                          "под заморозкой зелёный вердикт открыл ворота")
+
+    def test_pod_zamorozkoi_poimyonnoe_da_vladelca_prohodit(self):
+        """Заморозка глушит МАШИНУ, а не человека: «да» на ЭТОТ коммит работает и под флагом."""
+        self.freeze()
+        cc.approve("abc1234", path=self.rel)
+        self.assertEqual(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr, env={}),
+                         "owner")
+
+    def test_snyatie_zamorozki_vozvrashchaet_vtoroe_osnovanie_tem_zhe_tikom(self):
+        """Ручка одна и снимается одним движением: файла нет → прежнее поведение байт-в-байт."""
+        self._verdict()
+        self.freeze()
+        self.assertIsNone(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr, env={}))
+        os.remove(self.flag)
+        self.assertEqual(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr, env={}),
+                         "trainer")
+
+    def test_sostoyanie_zamorozki_neizvestno_derzhim(self):
+        """FAIL-CLOSED и направление ОБРАТНОЕ `frozen()`: «не знаю, лежит ли флаг» → не открываем.
+        Право выкатить на живого клиента — не то место, где незнание толкуют в сторону движения."""
+        self._verdict()
+        with mock.patch.object(cc, "freeze_known", lambda flag=None: None):
+            self.assertIsNone(cc.release_reason("abc1234", path=self.rel, trainer_path=self.tr,
+                                                env={}))
+            self.assertFalse(cc.frozen(), "а вот АДРЕС отказа на незнании остаётся громким")
+
+    # ─────── ОТРИЦАТЕЛЬНЫЙ ТЕСТ №2 ЗАДАНИЯ (05.09.2026) ───────
+    # ВЕРДИКТ НА КОММИТЕ A НЕ ОТКРЫВАЕТ ВОРОТА КОММИТУ B С ТЕМ ЖЕ ПРЕФИКСОМ.
+    # Живой путь ровно такой: запись несёт 40 hex (bind_head), а спрашивают ворота коротким —
+    # `_reconcile_children` подаёт head[:9]. Прежнее условие включало полную сверку, только когда
+    # ОБЕ стороны 40-символьные, то есть в бою сверяло РОВНО СЕМЁРКУ.
+
+    A40 = "abc1234" + "a" * 33                       # кандидат, на котором снят вердикт
+    B40 = "abc1234" + "b" * 33                       # HEAD: тот же префикс abc1234, другой коммит
+
+    def _expand(self, s):
+        """Раскрыватель-двойник git: короткую метку доводит до полного хеша ТОГО коммита."""
+        for full in (self.A40, self.B40):
+            if full.startswith(s):
+                return full
+        return ""
+
+    def test_verdikt_kandidata_ne_vykatyvaet_head_s_tem_zhe_prefiksom(self):
+        self._verdict(commit=self.A40)
+        ok, why = cc.trainer_verdict(self.B40[:9], path=self.tr, env={}, expand=self._expand)
+        self.assertFalse(ok, "вердикт кандидата открыл ворота ДРУГОМУ коммиту")
+        self.assertIn("ДРУГОМ коммите", why)
+        self.assertIsNone(cc.release_reason(self.B40[:9], path=self.rel, trainer_path=self.tr,
+                                            env={}, expand=self._expand))
+
+    def test_svoi_kommit_korotkoi_metkoi_po_prezhnemu_otkryvaet(self):
+        """Замок не должен убить живое: та же короткая метка СВОЕГО коммита ворота открывает."""
+        self._verdict(commit=self.A40)
+        self.assertEqual(cc.release_reason(self.A40[:9], path=self.rel, trainer_path=self.tr,
+                                           env={}, expand=self._expand), "trainer")
+
+    def test_bez_raskryvatelya_sverka_otkazyvaet_a_ne_schitaet_prefiks(self):
+        """Нечем привести короткую сторону к длинной → сверка ОТКАЗЫВАЕТ (fail-closed), и это
+        касается СВОЕГО коммита тоже: молчание git не повод верить семёрке."""
+        self._verdict(commit=self.A40)
+        for probe in (self.A40[:9], self.B40[:9]):
+            ok, why = cc.trainer_verdict(probe, path=self.tr, env={})
+            self.assertFalse(ok, probe)
+            self.assertIn("ОТКАЗАНА", why)
+
+    def test_devyatka_protiv_devyatki_tozhe_ne_prefiks(self):
+        """Одинаковая длина префикса не спасает: 7 символов режет `short()` с обеих сторон."""
+        self._verdict(commit=self.A40[:9])
+        ok, why = cc.same_commit(self.A40[:9], self.B40[:9], self._expand)
+        self.assertFalse(ok)
+        self.assertIn("РАЗНЫЕ", why)
+
+    def test_krivoi_raskryvatel_ne_otkryvaet_vorota(self):
+        """Ответ раскрывателя ПРОВЕРЯЕТСЯ: не 40 hex или не начинается с запрошенного — ''."""
+        for bad in (lambda s: "z" * 40, lambda s: "0" * 40, lambda s: "abc", lambda s: None,
+                    lambda s: (_ for _ in ()).throw(RuntimeError("git молчит"))):
+            self.assertEqual(cc.full_commit("abc1234", bad), "", bad)
 
 
 # ─────────────────────────── 3. ВОРОТА ВЫХОДА ───────────────────────────

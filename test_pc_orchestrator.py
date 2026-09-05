@@ -10805,6 +10805,52 @@ class TestZamorozkaKontura(TestClientContourGate):
         self.assertTrue(self.restarts)
         self.assertTrue(any("ВЫКАТКА СОСТОЯЛАСЬ" in c for c in self.cards), self.cards)
 
+    # ── (г) ЗАМОРОЗКА ДЕРЖИТ ПРИМЕНЕНИЕ, А НЕ ТОЛЬКО ВОПРОС (класс 05.09.2026) ──
+    # Живой замер класса: 26.08 03:35:35 в реестр легла зелёная запись 74be777 → 03:35:43 демон
+    # написал «основание пропуска «trainer» — коммит 74be777a8 применяем к userbot,moderbot».
+    # ВОСЕМЬ СЕКУНД. Заморозка лежала с 21.08 и не удержала ничего: она жила только в АДРЕСЕ отказа.
+    # Живых ботов тогда спас не замок, а случайность — красный юнит-гейт следом.
+
+    def test_g_pod_zamorozkoi_zelenyi_verdikt_ne_vykatyvaet_botov(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ ЗАДАНИЯ на БОЕВОЙ дороге и с НАСТОЯЩИМ вердиктом: реестр во
+        временном файле, `release_reason` не замокан. Контроль — та же запись без заморозки."""
+        _rel, trn = self._trainer_paths()
+        self._put_verdict(trn)
+        self._freeze()
+        note = self._upd(["suggest.py"])
+        self.assertEqual(self.restarts, [], "зелёный вердикт выкатил ботов под заморозкой")
+        self.assertEqual(self.cards, [], "и вопроса владельцу под заморозкой быть не должно")
+        self.assertIn("ОСТАНОВЛЕНО воротами клиентского контура", note)
+        os.remove(self.flag)                       # КОНТРОЛЬ: тот же вердикт без заморозки
+        self.cows[:] = []
+        note2 = self._upd(["suggest.py"])
+        self.assertEqual(sorted(self.restarts), ["moderbot", "userbot"], note2)
+
+    def test_g2_vtoroi_zamok_derzhit_lyuboe_osnovanie_krome_da(self):
+        """ЗАМОК НА РЕЗУЛЬТАТЕ, а не на перечне оснований: `release_reason` подменён и говорит
+        «trainer» напрямую (так же скажет любое будущее третье основание) — ворота всё равно
+        держат. Перечислять «что-либо ещё» по именам значило бы протухнуть на первом новом."""
+        self._freeze()
+        o.client_contour.release_reason = lambda *a, **k: "trainer"
+        self._upd_c("4528917", ["suggest.py"])
+        self.assertEqual(self.restarts, [], "второй замок пропустил основание «trainer»")
+        self.assertTrue(any("ДЕРЖАТ" in s and "контур ЗАМОРОЖЕН" in s for s in self.cows), self.cows)
+
+    def test_g3_lenta_ne_zovet_snimat_verdikt_pod_zamorozkoi(self):
+        """Строка отказа обязана говорить ПРАВДУ о том, чего ждём: под заморозкой прежнее «жду
+        „да“ владельца ИЛИ зелёный тренажёр» звало владельца снять вердикт, который не откроет
+        ничего — то есть на 15 минут прогона впустую."""
+        self._freeze()
+        self._upd_c("3b85c06", ["suggest.py"])
+        feed = self.cows[-1]
+        self.assertIn("жду поимённого «да» владельца", feed)
+        self.assertNotIn("или зелёный тренажёр", feed)
+
+    def test_g4_bez_zamorozki_stroka_otkaza_prezhnyaya(self):
+        """Контроль: ручки нет → формулировка байт-в-байт прежняя."""
+        self._upd_c("3b85c06", ["suggest.py"])
+        self.assertIn("жду «да» владельца или зелёный тренажёр", self.cows[-1])
+
     # ── (в) ручка выключена: карточки приходят как прежде ──
     def test_v_bez_ruchki_kartochki_kak_prezhde(self):
         for c in ("3b85c06", "ce464ee", "c8b0d09", "e081ba4"):
@@ -10843,6 +10889,90 @@ class TestZamorozkaKontura(TestClientContourGate):
             code_gate=lambda: (True, "ok"), tests_gate=lambda: (False, "красные"),
             spawner=lambda: True, dirty_fn=lambda *a, **k: [], deps_fn=lambda: []))
         self.assertTrue(any("провалил unittest-гейт" in c for c in self.cards), self.cards)
+
+
+class TestSverkaKommitaBezPrefiksa(unittest.TestCase):
+    """СВЕРКА КОММИТА ВЕРДИКТА — БЕЗ ПРЕФИКСА (класс 05.09.2026).
+
+    Прежнее условие включало полную сверку, только когда ОБЕ стороны 40-символьные, а живой путь
+    такой пары не даёт никогда: запись несёт 40 hex (`trainer_run.bind_head`, замер реестра 05.09 —
+    все 5 записей по 40), а спрашивают ворота коротким (`_reconcile_children` → `head[:9]`,
+    self-update и `maybe_update_bots` → `git rev-parse --short`, 7). То есть в бою сверялась РОВНО
+    СЕМЁРКА, и вердикт, снятый на замороженном кандидате, имел право выкатить HEAD.
+
+    Раскрыватель живёт ЗДЕСЬ, а не в `client_contour`: тот модуль чистый по построению («ни git,
+    ни subprocess, ни сети» — его шапка). Без раскрывателя судья ОТКАЗЫВАЕТ, а не считает префикс."""
+
+    A40 = "abc1234" + "a" * 33
+    B40 = "abc1234" + "b" * 33
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix="sverka_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        self.trn = os.path.join(d, "trainer_green.json")
+        self.rel = os.path.join(d, "release.json")
+        self.flag = os.path.join(d, "pc_orchestrator.contour_frozen")   # заморозки НЕТ (файл не создан)
+        for attr, val in (("TRAINER_GREEN_FILE", self.trn), ("RELEASE_FILE", self.rel),
+                          ("FREEZE_FLAG", self.flag)):
+            save = getattr(o.client_contour, attr)
+            setattr(o.client_contour, attr, val)
+            self.addCleanup(lambda a=attr, v=save: setattr(o.client_contour, a, v))
+
+    def _put(self, commit):
+        rec = {"commit": commit, "result": "green", "checks_passed": 96, "checks_total": 96,
+               "cases": 12, "cases_total": 12, "runs": 2, "clean": True,
+               "corpus": "trainer_cases.json", "corpus_sha": o.client_contour.corpus_sha(),
+               "runner": o.client_contour.TRAINER_RUNNER, "ts": 1.0, "when": "2026-09-05 00:08"}
+        with io.open(self.trn, "w", encoding="utf-8") as f:
+            json.dump({"green": {o.client_contour.short(commit): rec}}, f)
+
+    def _fake_git(self, s):
+        for full in (self.A40, self.B40):
+            if full.startswith(s):
+                return full
+        return ""
+
+    # ── сам раскрыватель ──
+    def test_raskryvatel_sprashivaet_rev_parse_verify_s_suffiksom(self):
+        seen = []
+
+        def git_out(args):
+            seen.append(list(args))
+            return self.A40
+
+        self.assertEqual(o._git_expand_commit("abc1234a", git_out=git_out), self.A40)
+        self.assertEqual(seen, [["rev-parse", "--verify", "abc1234a^{commit}"]],
+                         "без ^{commit} метка резолвится в любой объект, включая дерево и блоб")
+
+    def test_raskryvatel_ne_verit_musoru(self):
+        """Молчание git, неоднозначный префикс, не-40 — всё это '' («не смог»), а НЕ «совпало»."""
+        for out in (None, "", "abc1234", "z" * 40, "not a hash"):
+            self.assertEqual(o._git_expand_commit("abc1234", git_out=lambda a, r=out: r), "")
+        self.assertEqual(o._git_expand_commit("не-хеш"), "")
+        self.assertEqual(o._git_expand_commit("abc1234",
+                                              git_out=lambda a: (_ for _ in ()).throw(OSError())), "")
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ ЗАДАНИЯ на боевом решении ворот ──
+    def test_verdikt_kandidata_ne_otkryvaet_head_s_tem_zhe_prefiksom(self):
+        self._put(self.A40)
+        with mock.patch.object(o, "_git_expand_commit", self._fake_git):
+            self.assertIsNone(o._release_reason(self.B40[:9]),
+                              "вердикт кандидата открыл ворота ДРУГОМУ коммиту")
+            self.assertEqual(o._release_reason(self.A40[:9]), "trainer",
+                             "а свой коммит короткой меткой открывать обязан")
+
+    def test_bez_gita_sverka_otkazyvaet(self):
+        """FAIL-CLOSED: git молчит → ворота держат и говорят «ОТКАЗАНА», а не считают семёрку."""
+        self._put(self.A40)
+        with mock.patch.object(o, "_git_expand_commit", lambda c: ""):
+            self.assertIsNone(o._release_reason(self.A40[:9]))
+            self.assertIn("ОТКАЗАНА", o._trainer_status(self.A40[:9]))
+
+    def test_kartochka_i_reshenie_chitayut_odin_raskryvatel(self):
+        """Разойдись источники — владелец получит причину не про тот отказ (живой класс 30.07)."""
+        self._put(self.A40)
+        with mock.patch.object(o, "_git_expand_commit", self._fake_git):
+            self.assertIn("ДРУГОМ коммите", o._trainer_status(self.B40[:9]))
 
 
 class SudimPoFaktuANePoRaspiske(unittest.TestCase):

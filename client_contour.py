@@ -67,8 +67,11 @@ FAIL-CLOSED. Не удалось построить граф (нет входн�
     remember_asked(...)        → запомнить ПОВОД, о котором спросили карточкой
     trainer_verdict(commit)    → (зачтён?, дословная причина) — ВТОРОЕ основание
     trainer_status(commit)     → строка причины для карточки владельцу
+    same_commit(a, b, expand)  → (один ли это коммит?, причина) — БЕЗ сверки по префиксу
     card_text(...)             → дословный текст карточки владельцу
     frozen()                   → контур заморожен? (ЕДИНСТВЕННАЯ ручка тишины отказов)
+    freeze_known()             → True | False | None — та же ручка С ТРЕТЬИМ ИСХОДОМ
+    freeze_holds_release()     → (держит ли заморозка АВТОМАТИЧЕСКИЕ основания?, причина)
     refusal_shape(kinds, held) → подпись отказа БЕЗ коммита (кого держим | какие файлы)
     gate_route(kinds, held)    → ('card'|'feed', причина) — АДРЕС отказа, не право на выкатку
 """
@@ -309,6 +312,7 @@ def mentions(text, repo=None, cl=None, modules=None):
 # ------------------------- основания пропуска ворот ---------------------------
 # Ровно ДВА: «да» владельца ИЛИ зелёный прогон через тренажёр. Реестр — на диске (переживает
 # рестарт демона), в .gitignore по маске pc_orchestrator.*.json.
+# ПОД ЗАМОРОЗКОЙ ОСТАЁТСЯ ОДНО — «да» владельца (05.09.2026, см. `freeze_holds_release`).
 
 RELEASE_FILE = os.path.join(REPO, "pc_orchestrator.client_release.json")
 TRAINER_GREEN_FILE = os.path.join(REPO, "pc_orchestrator.client_trainer_green.json")
@@ -502,7 +506,72 @@ def corpus_sha(path=None):
         return ""
 
 
-def _verdict_holds(rec, c, commit_raw, cases_path=None):
+# ─── СВЕРКА КОММИТА: ПРЕФИКС НЕ ДОКАЗЫВАЕТ НИЧЕГО (класс 05.09.2026) ───
+# ЗАЧЕМ. Прежнее условие звучало «полные хеши сверяем целиком, а не по префиксу», а делало другое:
+#     short(rc) != c or (len(rc) == 40 and len(cc) == 40 and rc != cc)
+# полная сверка включалась ТОЛЬКО когда ОБЕ стороны 40-символьные. Живой путь такой пары не даёт
+# НИКОГДА: вердикт пишет `trainer_run.bind_head()` — это 40 hex (замер реестра 05.09: все 5 записей
+# по 40), а спрашивают ворота коротким — `_reconcile_children` подаёт `head[:9]`, self-update и
+# `maybe_update_bots` — вывод `git rev-parse --short` (7). То есть в бою сверялась РОВНО СЕМЁРКА, и
+# вердикт, снятый на кандидате, имел право выкатить любой другой коммит с тем же префиксом. Тот же
+# дефект у пары «9 против 9»: `short()` режет обе стороны до семи, и 74be777a8 против 74be777b1
+# проходило как «тот же коммит».
+#
+# ПРАВИЛО ТЕПЕРЬ ОДНО: сверка по префиксу ЗАПРЕЩЕНА. Короткая сторона ПРИВОДИТСЯ к длинной
+# (`expand` — раскрыватель, в проде git `rev-parse --verify`, живёт в pc_orchestrator: этот модуль
+# ЧИСТЫЙ и git не зовёт), а не смогли привести — сверка ОТКАЗЫВАЕТ, и ворота держат (fail-closed).
+#
+# ПОЧЕМУ БАЙТ-В-БАЙТ РАВНЫЕ МЕТКИ ПРОХОДЯТ БЕЗ РАСКРЫТИЯ. Это не поблажка и не префикс: обе стороны
+# назвали ОДНУ И ТУ ЖЕ строку, а раскрыватель — функция от строки, и на равных входах он вернул бы
+# равные выходы. Раскрытие здесь не могло бы различить их ни при каком исходе, зато стоило бы по
+# два вызова git на каждый тик реконсиляции (и ровно этой веткой ходит `_green_elsewhere`, где
+# запись спрашивают про её СОБСТВЕННЫЙ коммит).
+# ЧЕСТНЫЙ ОСТАТОК: если запись СОКРАЩЁННАЯ (в бою таких нет) и ворота спросили той же сокращённой
+# меткой, различить «та же метка» и «та же метка, но сегодня она про другой коммит» нечем. Живого
+# случая нет: раннер пишет 40 с самого заведения формата.
+
+
+def full_commit(commit, expand=None):
+    """Полный 40-hex этого коммита. → str ('' — назвать не смогли, и это НЕ «совпало»).
+
+    40 пришло — оно и есть. Короче — раскрываем `expand`, а ОТВЕТ РАСКРЫВАТЕЛЯ ПРОВЕРЯЕМ: 40 hex и
+    начинается с того, что спрашивали. Без проверки кривой раскрыватель мог бы свести две разные
+    короткие метки к одной и открыть ворота ровно тем, что задумано их закрывать."""
+    s = str(commit or "").strip().lower()
+    if not re.match(r"^[0-9a-f]{7,40}$", s):
+        return ""
+    if len(s) == 40:
+        return s
+    if expand is None:
+        return ""
+    try:
+        out = str(expand(s) or "").strip().lower()
+    except Exception:                     # noqa: BLE001 — «раскрыть не смог» это НЕ «совпало»
+        return ""
+    return out if len(out) == 40 and re.match(r"^[0-9a-f]{40}$", out) and out.startswith(s) else ""
+
+
+def same_commit(a, b, expand=None):
+    """ОДИН ЛИ ЭТО КОММИТ. → (да?, дословная причина отказа). Сверки по префиксу здесь нет."""
+    x, y = str(a or "").strip().lower(), str(b or "").strip().lower()
+    if not short(x) or not short(y):
+        return False, ("сверка коммита невозможна: %r против %r — на хеши не похоже"
+                       % (a, b))
+    if x == y:
+        return True, ""                   # одна и та же метка: сравнивать префиксы не с чем
+    if short(x) != short(y):
+        return False, ("вердикт снят на ДРУГОМ коммите (%s), а выкатывается %s" % (short(x), short(y)))
+    fx, fy = full_commit(x, expand), full_commit(y, expand)
+    if not fx or not fy:
+        return False, ("сверка коммита ОТКАЗАНА: «%s» и «%s» сходятся ТОЛЬКО префиксом %s, а полный "
+                       "хеш назвать нечем — по префиксу ворота не открываются" % (x, y, short(x)))
+    if fx != fy:
+        return False, ("вердикт снят на ДРУГОМ коммите (%s), а выкатывается %s: общий префикс %s, "
+                       "но коммиты РАЗНЫЕ" % (fx[:12], fy[:12], short(x)))
+    return True, ""
+
+
+def _verdict_holds(rec, c, commit_raw, cases_path=None, expand=None):
     """ДЕРЖИТСЯ ЛИ ОДНА ЗАПИСЬ вердикта целиком. → (держится?, дословная причина).
 
     Правила ровно те же, что стояли в теле `trainer_verdict`, — ни одно не ослаблено; вынесены
@@ -510,15 +579,19 @@ def _verdict_holds(rec, c, commit_raw, cases_path=None):
     карточка не отличает «вердикт есть, но на другом коммите» от «вердикта нет ни на одном»:
     живой класс 05.09.2026 — единственная зелёная запись (74be777, корпус 12 кейсов) не открывает
     даже сам 74be777, потому что на диске лежит корпус на 16, а карточка звала её «последним
-    зелёным»."""
+    зелёным».
+
+    `c` — КЛЮЧ ящика, под которым запись лежит. Судьёй он больше НЕ служит: ключ пишет раннер, а
+    сверяется ПОЛЕ `commit` (см. `same_commit`) — подлог ключа ловится там же и той же дорогой.
+    `expand` — раскрыватель короткого хеша в полный (см. `same_commit`): без него сверка разных по
+    длине меток ОТКАЗЫВАЕТ, а не проходит по семёрке."""
     if not isinstance(rec, dict):
         return False, "запись битая (не объект)"
     if str(rec.get("result") or "") != "green":
         return False, f"запись не зелёная: result={rec.get('result')!r}"
-    rc = str(rec.get("commit") or "").strip().lower()
-    cc = str(commit_raw or "").strip().lower()
-    if short(rc) != c or (len(rc) == 40 and len(cc) == 40 and rc != cc):
-        return False, f"вердикт снят на ДРУГОМ коммите ({short(rc) or '?'}), а выкатывается {c}"
+    ok_commit, why_commit = same_commit(rec.get("commit"), commit_raw, expand)
+    if not ok_commit:
+        return False, why_commit
     total, ok = rec.get("checks_total"), rec.get("checks_passed")
     if not isinstance(total, int) or not isinstance(ok, int) or total <= 0 or ok != total:
         return False, f"чеки не все зелёные: {ok}/{total}"
@@ -537,23 +610,24 @@ def _verdict_holds(rec, c, commit_raw, cases_path=None):
                   % (cases, cases_total, ok, total, runs, rec.get("when") or "?"))
 
 
-def _green_elsewhere(g, cases_path=None):
+def _green_elsewhere(g, cases_path=None, expand=None):
     """Записи ящика `green`, разложенные СУДОМ, а не наличием: (держатся, не держатся).
 
     Каждый элемент — (ключ, дословная причина). «Держится» значит: эта запись открыла бы ворота
     СВОЕМУ коммиту, спроси мы её про него. Наличие ключа в ящике не значит ничего: ящик пишет
-    раннер, а судит `_verdict_holds`."""
+    раннер, а судит `_verdict_holds`. Раскрыватель сюда доезжает, но ни одного вызова git не
+    стоит: запись спрашивают про ЕЁ ЖЕ метку, а равные метки `same_commit` сводит без раскрытия."""
     live, dead = [], []
     for k in sorted(g or {}):
         rec = g.get(k)
         held, why = _verdict_holds(rec, short(k) or str(k),
                                    rec.get("commit") if isinstance(rec, dict) else None,
-                                   cases_path)
+                                   cases_path, expand)
         (live if held else dead).append((str(k), why))
     return live, dead
 
 
-def trainer_verdict(commit, path=None, env=None, cases_path=None):
+def trainer_verdict(commit, path=None, env=None, cases_path=None, expand=None):
     """ВТОРОЕ основание — ЗЕЛЁНЫЙ ПРОГОН ЧЕРЕЗ ТРЕНАЖЁР. → (зачтён?, дословная причина).
 
     Канал ровно тот, что был заложен интерфейсом (a8f8822): безголовый раннер `trainer_run.py`
@@ -565,7 +639,9 @@ def trainer_verdict(commit, path=None, env=None, cases_path=None):
       • дерево на прогоне было ЧИСТОЕ (иначе вердикт удостоверяет не коммит, а чей-то WIP);
       • корпус тот же, что на диске (corpus_sha);
       • коммит ТОТ ЖЕ: не только ключ-семёрка, но и поле commit — вердикт, снятый на другом HEAD,
-        не засчитывается (полные хеши сверяем целиком, а не по префиксу).
+        не засчитывается. Сверка по ПРЕФИКСУ запрещена (`same_commit`, класс 05.09.2026):
+        короткая сторона приводится к длинной раскрывателем `expand`, а нечем привести — сверка
+        ОТКАЗЫВАЕТ и ворота держат.
     Рубильник PC_TRAINER_GREEN=0/off ГАСИТ основание целиком (аварийный возврат к «только да»).
     Любое «не знаю» (нет файла, битая запись, нечитаемый корпус) → False: fail-closed."""
     if not trainer_enabled(env):
@@ -592,7 +668,7 @@ def trainer_verdict(commit, path=None, env=None, cases_path=None):
         # Живой замер: единственная запись 74be777 (12 кейсов, corpus_sha 98ad5e3e…) не открывает
         # и свой коммит — на диске корпус на 16 (6d5d78f0…). Владелец читал «зелень есть, но не на
         # этом коммите», а правды «зелени нет нигде» не видел ни строкой.
-        live, dead = _green_elsewhere(g, cases_path)
+        live, dead = _green_elsewhere(g, cases_path, expand)
         if live:
             return False, ("вердикта на этот коммит нет; ДЕЙСТВУЮЩИЙ зелёный — на %s"
                            % ", ".join(k for k, _w in live[:3]))
@@ -601,7 +677,7 @@ def trainer_verdict(commit, path=None, env=None, cases_path=None):
             return False, ("зелёного вердикта нет НИ НА ОДНОМ коммите: запись на %s есть, но она "
                            "не открывает и его (%s)" % (k, why))
         return False, "прогона не было"
-    return _verdict_holds(rec, c, commit, cases_path)
+    return _verdict_holds(rec, c, commit, cases_path, expand)
 
 
 def trainer_enabled(env=None):
@@ -612,23 +688,30 @@ def trainer_enabled(env=None):
     return str(env.get(TRAINER_GREEN_ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
 
 
-def trainer_status(commit, path=None, env=None, cases_path=None):
+def trainer_status(commit, path=None, env=None, cases_path=None, expand=None):
     """Дословная причина «почему тренажёр (не) открыл ворота» — для карточки владельцу."""
-    return trainer_verdict(commit, path, env, cases_path)[1]
+    return trainer_verdict(commit, path, env, cases_path, expand)[1]
 
 
-def trainer_green(commit, path=None, env=None):
+def trainer_green(commit, path=None, env=None, expand=None):
     """Зелёный прогон тренажёра на ЭТОТ коммит? (двоичный ответ для release_reason)."""
-    return trainer_verdict(commit, path, env)[0]
+    return trainer_verdict(commit, path, env, expand=expand)[0]
 
 
-def release_reason(commit, kind=None, path=None, trainer_path=None, env=None):
+def release_reason(commit, kind=None, path=None, trainer_path=None, env=None, flag=None,
+                   expand=None):
     """Основание пропуска ворот для коммита. → 'owner' | 'trainer' | None (оснований нет — держим).
     kind принимается для симметрии вызовов; решение принимается ПО КОММИТУ: рестарт применяет
-    состояние диска целиком, «частично выкатить» нельзя, значит и одобрять надо коммит."""
+    состояние диска целиком, «частично выкатить» нельзя, значит и одобрять надо коммит.
+
+    ПОД ЗАМОРОЗКОЙ АВТОМАТИЧЕСКИХ ОСНОВАНИЙ НЕТ (класс 05.09.2026, см. `freeze_holds_release`):
+    проходит ТОЛЬКО поимённое «да» владельца на ЭТОТ коммит, и оно спрашивается ПЕРВЫМ — заморозка
+    глушит машину, а не человека."""
     if owner_approved(commit, path):
         return "owner"
-    if trainer_green(commit, trainer_path, env):
+    if freeze_holds_release(flag)[0]:
+        return None
+    if trainer_green(commit, trainer_path, env, expand):
         return "trainer"
     return None
 
@@ -701,14 +784,72 @@ SEEN_KEEP = 50
 ROUTE_CARD, ROUTE_FEED = "card", "feed"
 
 
+def freeze_known(flag=None):
+    """Лежит ли ручка заморозки — С ТРЕТЬИМ ИСХОДОМ. → True | False | None («не знаю»).
+
+    Третий исход заведён 05.09.2026 потому, что у признака появились ДВА читателя с
+    ПРОТИВОПОЛОЖНЫМИ направлениями отказа, и одна и та же «не знаю» обязана разъехаться:
+      • `frozen()` (адрес отказа) — FAIL-LOUD: не знаю → спрашиваем владельца, то есть НЕ заморожены;
+      • `freeze_holds_release()` (право выкатить) — FAIL-CLOSED: не знаю → держим.
+    Свести их к одному булеву значит подарить одной из сторон неверный по смыслу дефолт."""
+    try:
+        os.stat(flag or FREEZE_FLAG)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:                       # каталог не читается, том отвалился — исход НЕИЗВЕСТЕН
+        return None
+
+
 def frozen(flag=None):
     """ЕДИНСТВЕННАЯ ручка тишины отказов: ФАЙЛ `pc_orchestrator.contour_frozen` в корне репо.
 
     Почему файл, а не переменная окружения: заморозка — СОСТОЯНИЕ МИРА, а не конфигурация сборки.
     Файл видно в `ls`, он читается каждым тиком (демон перезапускать не нужно), а разморозка — одно
     движение: удалить файл, и карточки возвращаются тем же тиком. Ручек ровно одна: нет файла →
-    прежнее поведение байт-в-байт."""
-    return os.path.exists(flag or FREEZE_FLAG)
+    прежнее поведение байт-в-байт.
+
+    FAIL-LOUD и байт-в-байт как раньше: «не знаю» здесь значит False (спрашиваем владельца)."""
+    return freeze_known(flag) is True
+
+
+# ─── ЗАМОРОЗКА ДЕРЖИТ ПРИМЕНЕНИЕ, А НЕ ТОЛЬКО ВОПРОС (класс 05.09.2026) ───
+# ЗАЧЕМ. До этой правки заморозка жила ТОЛЬКО в `gate_route`, то есть решала АДРЕС отказа —
+# карточка или лента. Право выкатить она не трогала ни одной веткой: `release_reason` про неё не
+# знал вовсе, и зелёная запись вердикта открывала ворота под заморозкой ровно так же, как без неё.
+# Живой замер 26.08.2026: 03:35:35 в реестр легла зелёная запись 74be777 → 03:35:43 демон написал
+# «ворота контура: основание пропуска «trainer» — коммит 74be777a8 применяем к userbot,moderbot».
+# ВОСЕМЬ СЕКУНД, ни карточки, ни кнопки, ни задачи в очередь. Живых ботов тогда спас не замок, а
+# случайность — красный юнит-гейт следом. Код признавал это про себя сам: `_notify_deploy_happened`
+# существует ровно для случая «под заморозкой выкатка ВСЁ-ТАКИ состоялась».
+#
+# ПРАВИЛО. Пока флаг лежит, ворота открывает ТОЛЬКО поимённое «да» владельца на ЭТОТ коммит.
+# Ни зелёный вердикт, ни любое будущее третье основание — ничего. Заморозка глушит МАШИНУ, а
+# человека не глушит: «да» спрашивается ПЕРВЫМ и живёт как жило.
+#
+# FAIL-CLOSED, и направление ОБРАТНОЕ `frozen()`: «состояние заморозки неизвестно» → ДЕРЖИМ.
+# Право выкатить на живого клиента — не то место, где незнание толкуют в пользу движения.
+#
+# ЧЕГО ЭТО НЕ ДЕЛАЕТ: ворота и без заморозки держат ровно как держали (это ДОБАВЛЕННЫЙ замок, а не
+# замена прежним); адрес отказа не тронут ни строкой; разморозка возвращает второе основание тем же
+# тиком, без перезапуска демона.
+
+
+def freeze_holds_release(flag=None):
+    """Держит ли ЗАМОРОЗКА автоматические основания пропуска. → (держит?, дословная причина).
+
+    «Держит» = зелёный вердикт (и что угодно, кроме поимённого «да» владельца) ворот НЕ открывает.
+    Причину возвращаем строкой, а не глотаем: ей объясняются и лента, и карточка — иначе владелец
+    видит «тренажёр зелёный», а выкатки нет, и причина не названа нигде."""
+    st = freeze_known(flag)
+    if st is False:
+        return False, ""
+    name = os.path.basename(flag or FREEZE_FLAG)
+    if st is None:
+        return True, ("состояние заморозки НЕИЗВЕСТНО (%s не читается) — автоматические основания "
+                      "не действуют (fail-closed)" % name)
+    return True, ("контур ЗАМОРОЖЕН (%s) — зелёный вердикт тренажёра ворот НЕ открывает; открыть "
+                  "может только поимённое «да» владельца на этот коммит" % name)
 
 
 EPISODE_UNKNOWN = -1     # «эпизод назвать не смог» — НЕ «нулевой»: сравнение с ним всегда даёт «новый»

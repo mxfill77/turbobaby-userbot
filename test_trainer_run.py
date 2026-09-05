@@ -40,6 +40,14 @@ class Base(unittest.TestCase):
         self.d = tempfile.mkdtemp(prefix="trrun_")
         self.v = os.path.join(self.d, "verdict.json")
         self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        # ИЗОЛЯЦИЯ РУЧКИ ЗАМОРОЗКИ (05.09.2026): с этого дня она решает не только адрес отказа, но
+        # и САМО основание пропуска (`release_reason` → `freeze_holds_release`). Боевой флаг лежит
+        # с 21.08 — без увода пути голден «зелёный вердикт даёт основание trainer» краснел бы, не
+        # изменившись ни строкой, и вердикт теста зависел бы от решения владельца об эту минуту.
+        self.flag = os.path.join(self.d, "pc_orchestrator.contour_frozen")
+        _s = cc.FREEZE_FLAG
+        cc.FREEZE_FLAG = self.flag
+        self.addCleanup(lambda: setattr(cc, "FREEZE_FLAG", _s))
 
     def put(self, rec, key=None, box="green"):
         with io.open(self.v, "w", encoding="utf-8") as f:
@@ -110,6 +118,35 @@ class TestFormatVerdikta(Base):
             d = json.load(f)
         self.assertNotIn(cc.short(C40), d["green"])
         self.assertIn(cc.short(C40), d["red"])          # красный остаётся — карточке есть что сказать
+
+
+# ───────── 2а. ПРОГОН-ЗАМЕР И ПРОГОН-ВЫКАТКА РАЗЛИЧАЮТСЯ УМОЛЧАНИЕМ (05.09.2026) ─────────
+# ЗАЧЕМ. Запись вердикта — не «сохранение результата», а АКТ ВЫКАТКИ: зелёная запись открывает
+# ворота, и демон применяет коммит к живым userbot/moderbot ближайшим витком (живой замер 26.08:
+# 8 секунд от записи до «применяем»). До этого дня запись была УМОЛЧАНИЕМ, а безопасный замер
+# требовал вспомнить `--no-write`. Частота вызовов обратная: замер зовут постоянно, запись в бою
+# случилась один раз за всю жизнь ворот. Дешевле обязана быть ошибка, которая случается чаще.
+
+class TestZamerNeVykatka(unittest.TestCase):
+    def _a(self, argv):
+        return tr.build_parser().parse_args(argv)
+
+    def test_umolchanie_ne_pishet_reestr(self):
+        """ГЛАВНОЕ: голый вызов — ЗАМЕР. Забытый ключ теперь стоит второго запуска, а не выкатки."""
+        self.assertFalse(tr.writes_registry(self._a([])))
+        self.assertFalse(tr.writes_registry(self._a(["--runs", "2"])))
+        self.assertFalse(tr.writes_registry(self._a(["--only", "3", "--report", "x.md"])))
+
+    def test_zapis_tolko_po_yavnomu_slovu(self):
+        self.assertTrue(tr.writes_registry(self._a(["--write"])))
+        self.assertTrue(tr.writes_registry(self._a(["--runs", "2", "--write"])))
+
+    def test_no_write_zhiv_i_silnee_write(self):
+        """Ключ `--no-write` стои́т в чужих командах и подсказках уроков (lesson_regress) — умереть
+        молча он не имеет права. Противоречие двух ключей разрешается в сторону «не трогать»."""
+        self.assertFalse(tr.writes_registry(self._a(["--no-write"])))
+        self.assertFalse(tr.writes_registry(self._a(["--write", "--no-write"])))
+        self.assertFalse(tr.writes_registry(self._a(["--runs", "1", "--only", "3", "--no-write"])))
 
 
 # ─────────────────────── 3. ВОРОТА ЗАСЧИТЫВАЮТ ВЕРДИКТ ───────────────────────
@@ -537,9 +574,12 @@ class PrivyazkaZameraKKommitu(unittest.TestCase):
         tr.run_corpus = lambda cases, runs=2, ph=None: ([], passed, ok, allc, list(failed), [])
 
     def run_main(self, extra=()):
+        # `--write` СТОИТ ЗДЕСЬ ЯВНО (05.09.2026): предмет этого класса — привязка записи к
+        # коммиту, а с этого дня запись реестра идёт только по явному ключу (умолчание = замер).
+        # Реестр — во ВРЕМЕННОМ `--out`, боевого не касаемся ни одним вызовом.
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = tr.main(["--cases", self.cases, "--out", self.v, "--runs", "2", *extra])
+            rc = tr.main(["--cases", self.cases, "--out", self.v, "--runs", "2", "--write", *extra])
         return rc, out.getvalue()
 
     def last_rec(self):
