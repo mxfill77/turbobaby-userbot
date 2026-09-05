@@ -12,8 +12,10 @@ import sys
 import json
 import types
 import shutil
+import inspect
 import tempfile
 import datetime
+import threading            # ДВЕ РУКИ (задача 238): барьер доказывает перекрытие заходов
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -11713,6 +11715,241 @@ class TestBridgeLoopBudget(unittest.TestCase):
         seg = body[call:call + 3000]
         self.assertIn("if b is not None:\n                b.spend(", seg,
                       "spend обязан стоять на ВСЕХ вызовах, а не только на режущихся")
+
+
+class TestParallelLanes(Base):
+    """ДВЕ ЗАДАЧИ ОДНОВРЕМЕННО (04.09.2026, задача 238).
+
+    Замки здесь про три вещи, и все три уже стоили бы полосе работы, будь они забыты:
+      • параллель НАСТОЯЩАЯ (заходы перекрываются во времени, а не идут друг за другом);
+      • ПОТОЛОК ДВА держится кодом, а не обещанием;
+      • СМЕРТЬ ОДНОГО не уносит второго и не оставляет ряд висеть `in_progress` навсегда.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # СЛЕПОК ОЧЕРЕДИ В ТЕСТАХ НЕ СНИМАЕМ. `process_new` зовёт его отдельным ПРОЦЕССОМ, а тот
+        # пишет в живой узел мозга `queue_state_pc`: боевых записей у теста быть не должно, и
+        # удваивать их вдвое (две руки — два спавна) тем более незачем.
+        save = o._queue_snapshot
+        o._queue_snapshot = lambda why: None
+        self.addCleanup(lambda: setattr(o, "_queue_snapshot", save))
+
+    def _lanes(self, n):
+        """Поставить число рук на время теста (и вернуть прежнее после)."""
+        save = o.PARALLEL_TASKS
+        o.PARALLEL_TASKS = n
+        self.addCleanup(lambda: setattr(o, "PARALLEL_TASKS", save))
+
+    # ── потолок ──────────────────────────────────────────────────────────────────────────────
+    def test_potolok_dva_derzhitsya_kodom_a_ne_obeshchaniem(self):
+        """Ручка вверх не работает СОЗНАТЕЛЬНО: задание разрешило ровно два, и «ровно два» обязано
+        быть свойством кода. Иначе первая же строка в .env подняла бы полосу до пяти рук."""
+        for asked, expect in ((1, 1), (2, 2), (5, 2), (99, 2), (0, 1), (-3, 1)):
+            self._lanes(asked)
+            self.assertEqual(o.parallel_lanes(), expect, f"ручка={asked}")
+
+    def test_musor_v_ruchke_chitaetsya_kak_prezhnee_povedenie(self):
+        """Непонятная настройка не смеет ВКЛЮЧАТЬ новое устройство — только оставлять старое."""
+        self._lanes("две")
+        self.assertEqual(o.parallel_lanes(), 1)
+
+    def test_byudzhet_protsessov_zazhimaet_ruki(self):
+        """Число рук не смеет обогнать бюджет процессов claude этой машины: обогнав, вторая рука
+        упёрлась бы в `_claude_budget_gate` и отдала бы задачу в failed за чужой лимит."""
+        self._lanes(2)
+        save = o.MAX_CLAUDE_PROCS
+        o.MAX_CLAUDE_PROCS = 1
+        self.addCleanup(lambda: setattr(o, "MAX_CLAUDE_PROCS", save))
+        self.assertEqual(o.parallel_lanes(), 1)
+
+    # ── факты очереди ────────────────────────────────────────────────────────────────────────
+    def test_fakty_ocheredi_odinakovy_dlya_oboikh_zakhodov(self):
+        order = [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
+        self.assertEqual(o._plan_queue_facts(order, 1), {"ok": True, "waiting": 3, "next_id": 2})
+        self.assertEqual(o._plan_queue_facts(order, 2), {"ok": True, "waiting": 2, "next_id": 3})
+        # Очередь короче числа рук — «ждёт 0» и следующего нет; отрицательных чисел не бывает.
+        self.assertEqual(o._plan_queue_facts([{"id": 9}], 2), {"ok": True, "waiting": 0,
+                                                               "next_id": None})
+
+    # ── сама параллель ───────────────────────────────────────────────────────────────────────
+    def test_dva_ryada_zakryty_odnim_vitkom(self):
+        self._lanes(2)
+        a, b = self.fb.add(status="new"), self.fb.add(status="new")
+        self._claude(0, "сделано\nRESULT: сделано")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[a]["status"], "done")
+        self.assertEqual(self.fb.tasks[b]["status"], "done")
+
+    def test_zakhody_deystvitelno_perekryvayutsya_vo_vremeni(self):
+        """ГЛАВНЫЙ ЗАМОК. «Оба ряда закрыты» зеленело бы и на последовательном исполнении — оно
+        закрыло бы их тоже, только вдвое дольше. Поэтому спрашиваем НЕ исход, а перекрытие:
+        каждый заход отмечает вход, ждёт ВТОРОГО и только потом отвечает. Последовательный код
+        на этом встал бы намертво (второй заход не начался бы никогда) — тест ловит его
+        таймаутом барьера, а не догадкой."""
+        self._lanes(2)
+        self.fb.add(status="new")
+        self.fb.add(status="new")
+        both_in = threading.Barrier(2, timeout=20)
+        seen = []
+
+        def fake(prompt, timeout, cwd, env):
+            seen.append("in")
+            both_in.wait()          # разойдётся ТОЛЬКО если рядом работает вторая рука
+            return (0, "сделано\nRESULT: сделано", "")
+        o.run_claude = fake
+        o.process_new()
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(sorted(t["status"] for t in self.fb.tasks.values()), ["done", "done"])
+
+    def test_odna_ruka_beryot_odin_ryad_kak_prezhde(self):
+        """Откат ручкой обязан давать БАЙТ-В-БАЙТ прежнее поведение: один ряд за виток."""
+        self._lanes(1)
+        a, b = self.fb.add(status="new"), self.fb.add(status="new")
+        self._claude(0, "сделано\nRESULT: сделано")
+        o.process_new()
+        self.assertEqual(self.fb.tasks[a]["status"], "done")
+        self.assertEqual(self.fb.tasks[b]["status"], "new")     # второй ряд не тронут
+
+    def test_bolshe_dvukh_ryadov_ne_beryotsya_nikogda(self):
+        self._lanes(2)
+        ids = [self.fb.add(status="new") for _ in range(5)]
+        self._claude(0, "сделано\nRESULT: сделано")
+        o.process_new()
+        done = [i for i in ids if self.fb.tasks[i]["status"] == "done"]
+        untouched = [i for i in ids if self.fb.tasks[i]["status"] == "new"]
+        self.assertEqual(len(done), 2)
+        self.assertEqual(len(untouched), 3)
+
+    # ── реапер не смеет убить соседа ─────────────────────────────────────────────────────────
+    def test_reaper_vidit_ZHIVYMI_oba_zakhoda(self):
+        """ЦЕНА ОШИБКИ ЗДЕСЬ — ЧУЖАЯ РАБОТА. `_executor_verdict` по правилу «отметку делал этот
+        процесс, а исполняю не её» выносит приговор СИРОТА и снимает задачу по короткому порогу.
+        С ОДНОЙ переменной `_RUNNING_TID` сосед живого захода получал бы этот приговор."""
+        self._lanes(2)
+        self.fb.add(status="new")
+        self.fb.add(status="new")
+        both_in = threading.Barrier(2, timeout=20)
+        verdicts = []
+
+        def fake(prompt, timeout, cwd, env):
+            both_in.wait()          # обе руки внутри — вот момент, ради которого тест написан
+            verdicts.append({tid: o._executor_verdict(tid)[0] for tid in (1, 2)})
+            return (0, "сделано\nRESULT: сделано", "")
+        o.run_claude = fake
+        o.process_new()
+        self.assertTrue(verdicts)
+        for v in verdicts:
+            self.assertEqual(v, {1: True, 2: True}, "живой сосед объявлен сиротой")
+        # …а после витка полоса снова свободна: обе руки убрали себя из множества
+        self.assertEqual(o._RUNNING_TIDS, set())
+        self.assertIsNone(o._RUNNING_TID)
+
+    # ── смерть одного из двух ────────────────────────────────────────────────────────────────
+    def test_smert_odnogo_ne_unosit_vtorogo_i_ryad_ne_visnet(self):
+        """ПУНКТ 5 ЗАДАНИЯ. Заход A падает исключением ВНУТРИ демона. Требуем двух вещей сразу:
+        B доработал и закрылся штатно, а ряд A закрыт честным failed — не оставлен `in_progress`,
+        где его пришлось бы ждать 90 минут порога реапера."""
+        self._lanes(2)
+        a, b = self.fb.add(status="new"), self.fb.add(status="new")
+        started = threading.Event()
+
+        def fake(prompt, timeout, cwd, env):
+            # Кто из двух — узнаём по номеру в промпте: текст задачи в него уже подставлен.
+            started.set()
+            if o._current_tid() == a:
+                raise RuntimeError("рука отвалилась")
+            started.wait(10)
+            return (0, "сделано\nRESULT: сделано", "")
+        o.run_claude = fake
+        o.process_new()
+        self.assertEqual(self.fb.tasks[b]["status"], "done", "смерть соседа унесла живой заход")
+        self.assertEqual(self.fb.tasks[a]["status"], "failed")
+        self.assertNotEqual(self.fb.tasks[a]["status"], "in_progress")
+
+    def test_upavshiy_ryad_ne_trogaem_esli_most_promolchal(self):
+        """ТРИ ИСХОДА, А НЕ ДВА: мост не сказал, в каком ряд состоянии → закрывать по догадке
+        нельзя. Ряд остаётся реаперу, у которого мерка длинная, но честная."""
+        self.fb._in_status = lambda tid, status: None
+        closed = []
+        save = self.fb.complete_task
+        self.fb.complete_task = lambda tid, st, res: closed.append(tid) or {"ok": True}
+        self.addCleanup(lambda: setattr(self.fb, "complete_task", save))
+        o._lane_crash_close(4242, RuntimeError("boom"))
+        self.assertEqual(closed, [])
+
+    # ── замок git ────────────────────────────────────────────────────────────────────────────
+    def test_svoi_pishushchie_git_vyzovy_idut_pod_zamkom(self):
+        """Точка сериализации обязана быть ОДНА и стоять на пути ВСЕХ своих коммитов демона."""
+        held = []
+        import contextlib
+
+        @contextlib.contextmanager
+        def fake_hold(owner="", timeout=None, **kw):
+            held.append(owner)
+            yield "взят"
+        with mock.patch.object(o.git_serial_pc, "hold", fake_hold), \
+             mock.patch.object(o.subprocess, "run",
+                               lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="ok",
+                                                                     stderr="")):
+            o._git_call(["commit", "-m", "x"])
+            self.assertEqual(len(held), 1, "коммит прошёл МИМО замка")
+            o._git_out(["rev-parse", "HEAD"])
+            self.assertEqual(len(held), 1, "чтение зря встало в очередь")
+
+    def test_ne_dozhdalis_zamka_eto_nazvannaya_prichina_a_ne_None(self):
+        """«Не дождался очереди» и «git отказал» — разные новости; глотать первую в None нельзя."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def deny(owner="", timeout=None, **kw):
+            raise o.git_serial_pc.GitSerialTimeout("занято")
+            yield                                    # pragma: no cover
+        with mock.patch.object(o.git_serial_pc, "hold", deny):
+            rc, out, err = o._git_call(["commit", "-m", "x"])
+        self.assertEqual(rc, 75)
+        self.assertIn("git_serial_pc", err)
+
+    def test_rebyonku_dayut_adres_zamka_i_abzats(self):
+        """Ребёнок гоняет git своими руками, и остановить его можно только словом. Слово даём в
+        ДВУХ местах: переменной окружения и абзацем преамбулы — при одной руке ни того, ни другого
+        абзаца не будет (при одной руке он был бы враньём)."""
+        self._lanes(2)
+        self.fb.add(status="new")
+        seen = {}
+
+        def fake(prompt, timeout, cwd, env):
+            seen["env"] = env.get(o.git_serial_pc.LOCK_ENV)
+            seen["prompt"] = prompt
+            return (0, "сделано\nRESULT: сделано", "")
+        o.run_claude = fake
+        o.process_new()
+        self.assertTrue(seen["env"])
+        self.assertIn("git_serial_pc.py", seen["prompt"])
+        self.assertIn("index.lock", seen["prompt"])
+
+    # ── инварианты устройства ────────────────────────────────────────────────────────────────
+    def test_heartbeat_ostalsya_POSLEDNEY_strokoy_oborota(self):
+        """На этом стоя́т О2 и О4: heartbeat означает «оборот ЗАМКНУЛСЯ», а не «начался». Две руки
+        сходятся ВНУТРИ `process_new`, поэтому снаружи виток остался тем же одним витком."""
+        with io.open(os.path.join(o.REPO, "pc_orchestrator.py"), encoding="utf-8") as fh:
+            body = fh.read()
+        seg = body[body.index("def poll_once():"):]
+        seg = seg[:seg.index("\n\n\n")]
+        lines = [ln.strip() for ln in seg.splitlines()
+                 if ln.strip() and not ln.strip().startswith("#")]
+        self.assertTrue(lines[-1].startswith("_write_heartbeat()"),
+                        f"последней строкой витка стало «{lines[-1]}»")
+        # РОВНО ОДИН ВЫЗОВ — на этом стоит О4 («оборот замкнулся»). Считаем по КОДУ, а не по тексту:
+        # рядом в комментарии имя функции названо словами, и голый count дал бы два.
+        self.assertEqual(sum(1 for ln in lines if ln.startswith("_write_heartbeat()")), 1)
+
+    def test_process_new_dozhidaetsya_obeikh_ruk(self):
+        """`join` не украшение: без него виток вернул бы управление, пока дети ещё работают, —
+        и heartbeat соврал бы о замкнутом обороте, а слепок очереди снялся бы на полдороге."""
+        src = inspect.getsource(o._process_parallel)
+        self.assertIn("th.join()", src)
+        self.assertIn("th.start()", src)
 
 
 if __name__ == "__main__":

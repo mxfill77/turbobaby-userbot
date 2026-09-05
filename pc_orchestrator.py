@@ -43,6 +43,7 @@ import logging
 import hashlib
 import datetime
 import tempfile
+import threading            # ДВА ЗАХОДА В ВИТКЕ (задача 238): руки — потоки, замки — ниже
 import subprocess
 import urllib.request
 import urllib.parse
@@ -64,6 +65,7 @@ import proc_identity          # ЛИЧНОСТЬ ПРОЦЕССА (номер + 
 import done_judge_pc          # СУДЬЯ ЗАКРЫТИЯ (ступень C): продукт по НАЗВАННОМУ АДРЕСУ судит V0, а не отчёт
 import deploy_voice           # ГОЛОС подъёма ребёнка МИМО ВОРОТ: какой коммит выкачен; ничего не запрещает
 import close_msg_pc           # ТРИ ЧЕЛОВЕЧЕСКИЕ СТРОКИ в начале сообщения о закрытии; чистая, ничего не судит
+import git_serial_pc          # ОДИН ИНДЕКС — ОДНА РУКА: замок ядра на git-писателей полосы (задача 238)
 try:
     # Словарь ВИДОВ красных операций и разбор карточки — у гарда, и только у него: демону нужно
     # понять, НА ЧТО именно владелец сказал «да» (`kinds_from_card`), а держать второй список
@@ -300,6 +302,23 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # 3 отказа подряд → карточка владельцу (инцидент 22.07: 18×claude.exe, ПК тормозит).
 MAX_CLAUDE_PROCS = int(os.getenv("PC_MAX_CLAUDE_PROCS", "2") or "2")
 CLAUDE_BUDGET_WAIT_SEC = int(os.getenv("PC_CLAUDE_BUDGET_WAIT_SEC", "60") or "60")
+# ── ДВЕ ЗАДАЧИ ОДНОВРЕМЕННО (04.09.2026, задача 238) ─────────────────────────────────────────
+# ЧТО СТАЛО ПАРАЛЛЕЛЬНЫМ: ровно тело `process_new` — «взять ряд → прогнать headless → закрыть».
+# Всё остальное в обороте осталось ПОСЛЕДОВАТЕЛЬНЫМ и стои́т на прежних местах: реаперы, надзор
+# карточек, дирижёр цепей, слепок очереди и `_write_heartbeat()`. Это не осторожность ради
+# осторожности — на порядке этих строк стоя́т О2 и О4 («оборот ЗАМКНУЛСЯ», а не «начался»), и
+# heartbeat обязан остаться ПОСЛЕДНЕЙ строкой витка. Поэтому оба захода СХОДЯТСЯ (join) внутри
+# `process_new`: виток по-прежнему один, просто внутри него две руки, а не одна.
+#
+# ПОТОЛОК ДВА, И ОН НЕ ПОДНИМАЕТСЯ ЗДЕСЬ. Бюджет процессов claude на этой машине уже разрешает
+# два (`MAX_CLAUDE_PROCS`), и число заходов зажато тем же числом: `min(2, MAX_CLAUDE_PROCS)`.
+# Ручка вниз есть (`PC_PARALLEL_TASKS=1` → байт-в-байт прежний однорукий путь), ручки вверх нет
+# СОЗНАТЕЛЬНО — иначе «параллель ровно два» держалось бы обещанием, а не кодом.
+PARALLEL_TASKS_MAX = 2
+PARALLEL_TASKS = int(os.getenv("PC_PARALLEL_TASKS", "2") or "2")
+# Сколько ждать замок git внутри захода. Меньше TASK_TIMEOUT: заход, упёршийся в чужой коммит,
+# обязан отдать ЧЕСТНЫЙ отказ внутри своего бюджета, а не быть убитым таймаутом задачи.
+GIT_LOCK_WAIT_SEC = float(os.getenv("PC_GIT_LOCK_WAIT_SEC", "") or 900.0)
 # Базовая папка версионных установок claude-code (AppData\Roaming\Claude\claude-code\<версия>\claude.exe).
 # Резолвим НОВЕЙШУЮ установку сами → путь переживает автообновление, даже когда .env-путь протух (WinError 2).
 _CLAUDE_BASE = os.path.join(os.getenv("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming"),
@@ -440,6 +459,23 @@ _RE_RESULT = re.compile(r"(?m)^\s*RESULT:\s*\S")   # признак резуль
 #      факт: в ре-ране задачи 48 (02:32:43→02:41:48) у гарда НЕТ НИ ОДНОЙ строки `ask` — красное
 #      объявил ребёнок сам. Лечится этим абзацем, который стоит ПОСЛЕ преамбулы (последнее слово).
 # Оба канала строго ПО КЛАССУ операции: имя класса берётся из карточки, на которую нажали «да».
+# ── ВТОРОЙ ЗАХОД РЯДОМ С ТОБОЙ (04.09.2026, задача 238) ──────────────────────────────────────
+# Абзац идёт ребёнку ТОЛЬКО когда параллель включена: при одном заходе он был бы враньём, а
+# враньё в преамбуле дороже молчания. Просим ровно одно — коммитить через обёртку; всё остальное
+# (чтение, тесты, правки файлов) двух рук не боится, и запрещать их значило бы платить временем
+# за несуществующий класс.
+PARALLEL_GIT_CLAUSE = (
+    "\nРЯДОМ С ТОБОЙ ИДЁТ ВТОРОЙ ЗАХОД, И ИНДЕКС GIT У ВАС ОДИН НА ДВОИХ. Поэтому КАЖДУЮ "
+    "пишущую команду git (add, commit, а также reset/checkout/stash/merge/pull/push) выполняй "
+    "через обёртку-замок, а не напрямую:\n"
+    "  venv/Scripts/python.exe git_serial_pc.py -- git add -- <файлы>\n"
+    "  venv/Scripts/python.exe git_serial_pc.py -- git commit -m \"<сообщение>\"\n"
+    "Обёртка ЖДЁТ своей очереди и потом делает ровно то, что просили; её код возврата — код "
+    "возврата git. Чтение (status, log, diff, rev-parse) замка не требует — зови как обычно. "
+    "Если увидишь «Unable to create '.git/index.lock': File exists» — это сосед коммитит прямо "
+    "сейчас: подожди и повтори через обёртку, НЕ удаляй файл замка (удаление чужого живого "
+    "замка портит индекс обоим).\n")
+
 APPROVED_CLAUSE = (
     "\nОДОБРЕНИЕ ВЛАДЕЛЬЦА (перебивает запрет выше ТОЛЬКО для названного класса): Филипп уже "
     "нажал «да» по ЭТОЙ задаче на операции класса: {kinds}. Такую операцию ВЫПОЛНИ САМ — гард "
@@ -1377,22 +1413,28 @@ def _task_started_mark(tid, now=None, path=None):
 
     Вместе с моментом пишем PID ЭТОГО процесса демона. Он нужен реаперу: демон одноворкерный и
     синхронный, поэтому «отметку сделал я, а исполняю сейчас не эту задачу» = у задачи нет живого
-    ребёнка. Без PID тот же вывод пришлось бы изображать молчанием."""
-    st = _task_started_read(path)
-    key = str(tid)
-    now = now or datetime.datetime.now(datetime.timezone.utc)
-    if key in st and not _mark_is_recycled(st[key], now):
+    ребёнка. Без PID тот же вывод пришлось бы изображать молчанием.
+
+    ПОПРАВКА 04.09.2026: «одноворкерный» выше протухло — заходов в витке два. Само правило про PID
+    уцелело (его страхует запись PID РЕБЁНКА, см. `_executor_verdict` п.4), а вот чтение-правка-
+    запись реестра целиком перестала быть безопасной и потому идёт под `_STATE_LOCK`: без него
+    две отметки, поставленные в одну секунду, затирали бы друг друга."""
+    with _STATE_LOCK:
+        st = _task_started_read(path)
+        key = str(tid)
+        now = now or datetime.datetime.now(datetime.timezone.utc)
+        if key in st and not _mark_is_recycled(st[key], now):
+            return _started_at_raw(st[key])
+        if key in st:      # тот же номер, но ДРУГАЯ задача: окно улик берём от НАСТОЯЩЕГО claim
+            log.info("отметка старта id=%s старше %sс (%s) — номер переиспользован очередью, "
+                     "отметку ставлю заново", tid, TASK_START_RECLAIM, _started_at_raw(st[key]))
+        st[key] = {"at": now.isoformat(),
+                   "pid": os.getpid(), "proc": _PROC_TOKEN}
+        if len(st) > TASK_START_KEEP:    # кап: отметки давно закрытых задач никому не нужны
+            for k in sorted(st, key=lambda x: _started_at_raw(st[x]))[:len(st) - TASK_START_KEEP]:
+                st.pop(k, None)
+        _task_started_write(st, tid, path)
         return _started_at_raw(st[key])
-    if key in st:      # тот же номер, но ДРУГАЯ задача: окно улик берём от НАСТОЯЩЕГО claim
-        log.info("отметка старта id=%s старше %sс (%s) — номер переиспользован очередью, "
-                 "отметку ставлю заново", tid, TASK_START_RECLAIM, _started_at_raw(st[key]))
-    st[key] = {"at": now.isoformat(),
-               "pid": os.getpid(), "proc": _PROC_TOKEN}
-    if len(st) > TASK_START_KEEP:        # кап: отметки давно закрытых задач никому не нужны
-        for k in sorted(st, key=lambda x: _started_at_raw(st[x]))[:len(st) - TASK_START_KEEP]:
-            st.pop(k, None)
-    _task_started_write(st, tid, path)
-    return _started_at_raw(st[key])
 
 
 def _task_started_rec(tid, path=None):
@@ -1411,6 +1453,12 @@ def _task_started_child(tid, child_pid, path=None):
     «ребёнка нет». Перезапись сознательна: у второй попытки headless свой ребёнок."""
     if not tid or not child_pid:
         return
+    with _STATE_LOCK:
+        _task_started_child_locked(tid, child_pid, path)
+
+
+def _task_started_child_locked(tid, child_pid, path=None):
+    """Тело `_task_started_child` под уже взятым `_STATE_LOCK` (см. там же — про два захода)."""
     st = _task_started_read(path)
     key = str(tid)
     rec = st.get(key)
@@ -1440,14 +1488,15 @@ def _task_started_draft(tid, rel, path=None):
     подняло бы черновик прошлой жизни этого номера — тот же класс, что чинит TASK_START_RECLAIM."""
     if not tid or not rel:
         return
-    st = _task_started_read(path)
-    key = str(tid)
-    rec = st.get(key)
-    rec = dict(rec) if isinstance(rec, dict) else {"at": _started_at_raw(rec)}
-    rec["draft"] = str(rel)
-    rec.setdefault("pid", os.getpid())
-    st[key] = rec
-    _task_started_write(st, tid, path)
+    with _STATE_LOCK:        # общий реестр, два захода — см. `_task_started_mark`
+        st = _task_started_read(path)
+        key = str(tid)
+        rec = st.get(key)
+        rec = dict(rec) if isinstance(rec, dict) else {"at": _started_at_raw(rec)}
+        rec["draft"] = str(rel)
+        rec.setdefault("pid", os.getpid())
+        st[key] = rec
+        _task_started_write(st, tid, path)
 
 
 def _draft_block(tid, rel=None, path=None):
@@ -1896,8 +1945,60 @@ def _wait_awake(proc, timeout, slice_sec=None, wall=None, awake=None):
 
 
 _RUNNING_TID = None      # tid, который демон исполняет ПРЯМО СЕЙЧАС (None — не исполняет ничего).
-# Ставит и снимает `run_task`. Демон одноворкерный и синхронный: витка, в котором эта переменная
-# была бы неправдой, не существует — `poll_once` не может идти параллельно с прогоном.
+# Ставит и снимает `run_task`.
+#
+# ПОПРАВКА 04.09.2026 (задача 238): ОДНОЙ переменной этого факта больше НЕ ХВАТАЕТ. Заходов в
+# витке стало два, и «текущая задача» перестала быть единственным числом: поток A ставит сюда
+# свой tid, поток B — свой, и последний перезаписывает первого. Прежняя строка при этом НЕ УДАЛЕНА
+# и продолжает работать — её читают два десятка тестовых фикстур, которые просто присваивают
+# `o._RUNNING_TID = 777`; ломать их значило бы уронить регресс, ничего не проверив. Правда живёт
+# теперь в МНОЖЕСТВЕ `_RUNNING_TIDS`, а спрашивают её через `_is_running()`, который согласен и с
+# множеством, и со старой переменной.
+#
+# ЦЕНА ОШИБКИ ЗДЕСЬ АСИММЕТРИЧНА, И ИМЕННО ОНА ДИКТУЕТ УСТРОЙСТВО. `_executor_verdict` по правилу
+# «отметку делал этот процесс, а исполняем не её» выносит приговор СИРОТА и снимает задачу по
+# короткому порогу. При двух заходах одна переменная сделала бы этот приговор ЛОЖНЫМ ровно для
+# соседа — то есть реапер убивал бы живую работу. Отсюда множество, а не «и так сойдёт».
+_RUNNING_TIDS = set()    # ВСЕ tid, которые демон ведёт прямо сейчас (0, 1 или 2)
+_RUNNING_LOCK = threading.RLock()      # его страж: множество меняют два потока
+_TL_TASK = threading.local()           # tid ЭТОГО потока — кому приписать PID порождённого ребёнка
+# ОБЩЕЕ СОСТОЯНИЕ НА ДИСКЕ — ЧЕРЕЗ ОЧЕРЕДЬ. Реестр отметок старта читается-и-переписывается
+# целиком (`_task_started_read` → правка → `_task_started_write`), и два потока, сделавших это
+# одновременно, ПОТЕРЯЛИ БЫ отметку одного из них — а на отметке стои́т и окно улик, и приговор
+# сироты. Замок внутрипроцессный: между процессами демона такой гонки нет (их и не бывает двух
+# одновременно дольше окна self-update).
+_STATE_LOCK = threading.RLock()
+_BOTS_LOCK = threading.RLock()         # рестарт живых ботов — по одному: два сразу дерутся за PID-файлы
+
+
+def parallel_lanes():
+    """Сколько заходов полосе разрешено вести ОДНОВРЕМЕННО в этом витке → 1 или 2.
+
+    Потолок зажат кодом дважды: константой `PARALLEL_TASKS_MAX` и бюджетом процессов claude этой
+    машины. Мусор в ручке (буквы, отрицательное) читается как 1 — то есть как ПРЕЖНЕЕ поведение:
+    непонятная настройка не смеет включать новое устройство."""
+    try:
+        n = int(PARALLEL_TASKS)
+    except Exception:
+        return 1
+    return max(1, min(n, PARALLEL_TASKS_MAX, MAX_CLAUDE_PROCS))
+
+
+def _current_tid():
+    """tid, который ведёт ЭТОТ поток. Фолбэк на `_RUNNING_TID` — для однорукого пути и тестов,
+    которые ставят глобальную переменную руками и потока не заводят вовсе."""
+    tid = getattr(_TL_TASK, "tid", None)
+    return _RUNNING_TID if tid is None else tid
+
+
+def _is_running(tid):
+    """Демон ведёт задачу `tid` прямо сейчас? → bool. Единственный законный способ это спросить.
+
+    Согласие со СТАРОЙ переменной оставлено намеренно: фикстуры регресса ставят только её."""
+    with _RUNNING_LOCK:
+        if any(str(tid) == str(t) for t in _RUNNING_TIDS):
+            return True
+    return _RUNNING_TID is not None and str(tid) == str(_RUNNING_TID)
 
 
 def run_claude(prompt, timeout, cwd, env, popen=None, waiter=None):
@@ -1936,11 +2037,16 @@ def run_claude(prompt, timeout, cwd, env, popen=None, waiter=None):
     # осиротевшую задачу можно судить только по молчанию, то есть ждать 90 минут. Приписываем её
     # текущей задаче (`_RUNNING_TID`), а не аргументом: сигнатуру `run_claude` подменяют два
     # десятка тестовых фикстур, и лишний параметр сломал бы их все, ничего не проверив.
+    # …и ПРИПИСЫВАЕМ ЕЁ СВОЕМУ ПОТОКУ, а не «текущей задаче процесса» (поправка 04.09.2026):
+    # заходов в витке два, глобальная `_RUNNING_TID` при них показывает того, кто стартовал
+    # ПОСЛЕДНИМ, — и PID ребёнка A лёг бы в отметку задачи B. Цена этой описки — ровно та, ради
+    # которой отметка и заведена: обе задачи стали бы неразличимы для приговора о сиротстве.
+    _tid = _current_tid()
     try:
-        _task_started_child(_RUNNING_TID, getattr(p, "pid", None))
+        _task_started_child(_tid, getattr(p, "pid", None))
     except Exception as e:                  # запись PID — улика, а не условие прогона
         log.warning("PID ребёнка задачи %s не записан (%s) — сирота будет судиться по молчанию",
-                    _RUNNING_TID, e)
+                    _tid, e)
     try:
         out, err, spent, slept = (waiter or _wait_awake)(p, timeout)
     except TimeoutError:
@@ -2332,7 +2438,14 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
     env["PYTHONIOENCODING"] = "utf-8"            # ребёнок пишет stdout/stderr в utf-8 → нет кракозябр (пара к encoding в run_claude)
     env[ASK_MARKER_ENV] = marker_path            # pretool_guard в headless пишет сюда красную карточку
     env[MARKER_TOKEN_ENV] = run_token            # …штампуя её нашим токеном — чужие карточки отсеем
+    # АДРЕС ЗАМКА ПОЛОСЫ — РЕБЁНКУ (04.09.2026). Заходов в дереве два, индекс один; ребёнок гоняет
+    # git своими руками, и остановить его мы можем только словом. Слово даём в двух местах сразу:
+    # переменной окружения (её видит любой его скрипт) и абзацем преамбулы (его видит модель).
+    env[git_serial_pc.LOCK_ENV] = git_serial_pc.lock_path()
+    env[git_serial_pc.OWNER_ENV] = f"task#{tid}"
     prompt = (note + PREAMBLE) if note else PREAMBLE
+    if parallel_lanes() > 1:
+        prompt += PARALLEL_GIT_CLAUSE
     # ОДОБРЕНИЕ — ДВА КАНАЛА (см. APPROVED_CLAUSE): гарду env-маркер, модели абзац ПОСЛЕ преамбулы.
     # Пустой approved → обе строки не выполняются, поведение прежнее байт-в-байт.
     kinds = sorted(k for k in (str(x).strip() for x in (approved or ())) if k)
@@ -2481,6 +2594,9 @@ def run_task(tid, text, note="", approved=(), approved_object=""):
     _t0 = time.monotonic()
     _start = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     _RUNNING_TID = tid
+    _TL_TASK.tid = tid        # своя, ПОТОЧНАЯ правда: её читает `run_claude` (см. `_current_tid`)
+    with _RUNNING_LOCK:
+        _RUNNING_TIDS.add(tid)
     try:
         status, result = _run_task_impl(tid, text, note, _mctx, approved, approved_object)
     finally:
@@ -2488,7 +2604,13 @@ def run_task(tid, text, note="", approved=(), approved_object=""):
         # и растянувшийся виток без неё — разные состояния, и раньше их не различал никто. Ставим
         # в finally: провал задачи работой быть не перестал.
         _last_work_at = time.time()
-        _RUNNING_TID = None
+        with _RUNNING_LOCK:
+            _RUNNING_TIDS.discard(tid)
+            # Старую переменную гасим ТОЛЬКО когда не ведём больше ничего: при двух заходах
+            # первый закончившийся не смеет объявить полосу свободной за второго.
+            if not _RUNNING_TIDS:
+                _RUNNING_TID = None
+        _TL_TASK.tid = None
     try:
         eff, _ = repo_thinking_settings()
         log.info(task_metrics.metrics_line(
@@ -3451,8 +3573,37 @@ def _close_plan_facts(queue=None, now=None, tick_path=None):
         return {}
 
 
+def _plan_queue_facts(order, taken):
+    """ЧТО ЖДЁТ В ОЧЕРЕДИ на момент взятия → факты для раздела «что дальше». ЧИСТАЯ функция.
+
+    Это ЕДИНСТВЕННЫЙ способ узнать очередь бесплатно: ряды уже прочитаны ради самого claim, а
+    между claim и закрытием стои́т синхронный заход на десятки минут — второе чтение стоило бы
+    отдельного похода в мост в самом дорогом месте витка. Цена дешевизны названа прямо: число
+    описывает очередь НА МОМЕНТ ВЗЯТИЯ, и раздел так и говорит («в очереди ждёт N») — не «сейчас»,
+    а по последнему известному замеру. `ok=True` ставится ровно потому, что ряды прочитаны:
+    неудачное чтение до сюда не доходит.
+
+    `taken` — сколько рядов виток забирает СЕБЕ (1 или 2). При двух заходах ждать остаётся на
+    один ряд меньше, и оба захода обязаны сказать это одинаково: расхождение в двух отчётах об
+    одной очереди читалось бы как сбой моста, которого не было."""
+    return {"ok": True, "waiting": max(0, len(order) - taken),
+            "next_id": order[taken].get("id") if len(order) > taken else None}
+
+
 def process_new():
-    """Взять СТАРЕЙШУЮ new-задачу своей полосы, исполнить, записать результат/needs_approval."""
+    """Взять СТАРЕЙШИЕ new-задачи своей полосы (одну или ДВЕ), исполнить, записать исход.
+
+    ДВА ЗАХОДА ОДНОВРЕМЕННО (04.09.2026, задача 238). Рядов в очереди хватает, а рука была одна:
+    потолок полосы упирался не в тик (пол паузы ящика 600 с при фактическом периоде витка около
+    того же) и не в бюджет процессов (он уже разрешал два), а в то, что `run_task` идёт СИНХРОННО
+    внутри витка. Теперь заходов может быть два; сходятся они ЗДЕСЬ ЖЕ, до возврата, — снаружи
+    `process_new` виток остался ровно тем же одним витком, и `_write_heartbeat()` по-прежнему
+    последняя строка оборота (на этом стоя́т О2 и О4).
+
+    ЧТО ОСТАЛОСЬ ПОСЛЕДОВАТЕЛЬНЫМ И ПОЧЕМУ: чтение очереди и сортировка приоритета — один раз на
+    виток (два чтения дали бы двум заходам РАЗНЫЕ очереди и разошедшиеся отчёты); коммиты — под
+    общим замком (`git_serial_pc`); рестарт ботов — под `_BOTS_LOCK`; всё вне `process_new`
+    (реаперы, надзор карточек, дирижёр цепей, слепок, heartbeat) не тронуто ни строкой."""
     if _stopped():
         return
     r = bc.get_pending("new")
@@ -3473,18 +3624,83 @@ def process_new():
     # дорабатывает» штатно. Нет owner-задач → ревизорский родитель клеймится как прежде.
     order = sorted(items, key=lambda x: (_is_revizor_parent_text(x.get("task_text")),
                                          int(x.get("id") or 0)))
-    task = order[0]
+    taken = min(parallel_lanes(), len(order))
+    facts = _plan_queue_facts(order, taken)
+    if taken <= 1:
+        _process_one(order[0], facts)       # однорукий путь — байт-в-байт прежний
+        return
+    _process_parallel(order[:taken], facts)
+
+
+def _process_parallel(tasks, plan_queue):
+    """Провести НЕСКОЛЬКО заходов одновременно и дождаться ВСЕХ. → None.
+
+    СМЕРТЬ ОДНОГО НЕ УБИВАЕТ ВТОРОГО, и это не пожелание, а устройство: каждый заход живёт в своём
+    потоке, и его исключение ловится ЗДЕСЬ, у самого корня, — до `join`. Второй в этот момент
+    работает и доработает: у потоков нет общего кадра, который мог бы развалиться. Ряд упавшего
+    закрывается честным failed прямо тут — иначе он остался бы `in_progress` НАВСЕГДА, потому что
+    реапер одиночек судит по молчанию, а молчать этот ряд будет ровно до порога в 90 минут.
+
+    СМЕРТЬ ВСЕГО ПРОЦЕССА (BSOD, kill, self-update) сюда не приходит вовсе — там оба ряда остаются
+    `in_progress` и их разбирает прежний реапер (`process_stuck_singles`) по PID ребёнка, который
+    у каждого захода СВОЙ (см. `run_claude`). Ни одна ветка этого не изменила."""
+    def _lane(task):
+        tid = task.get("id")
+        try:
+            _process_one(task, plan_queue)
+        except BaseException as e:          # noqa: BLE001 — падение одной руки не смеет унести вторую
+            log.exception("заход id=%s УПАЛ исключением (%s) — закрываю ряд, сосед продолжает", tid, e)
+            _lane_crash_close(tid, e)
+
+    threads = [threading.Thread(target=_lane, args=(t,), name=f"pc-lane-{t.get('id')}",
+                                daemon=False) for t in tasks]
+    log.info("ПАРАЛЛЕЛЬ: беру %s задач(и) одним витком — id=%s",
+             len(tasks), ", ".join(str(t.get("id")) for t in tasks))
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    log.info("ПАРАЛЛЕЛЬ: обе руки сошлись, виток продолжается")
+
+
+def _lane_crash_close(tid, exc):
+    """Ряд захода, умершего исключением, → честный failed. Молчание здесь стоило бы 90 минут.
+
+    Закрываем ТОЛЬКО то, что мы же и взяли: если ряд не в `in_progress` (claim не состоялся, или
+    заход успел закрыться сам и упал уже после), трогать чужое состояние нельзя."""
+    if not tid:
+        return
+    try:
+        # ТРИ ИСХОДА, А НЕ ДВА. `_in_status` разводит «не знаю» (None) и «нет» (False) СОЗНАТЕЛЬНО,
+        # и мы обязаны их развести тоже: закрывать ряд, о котором мост промолчал, значит писать
+        # исход по догадке. Не знаем — говорим это и оставляем ряд реаперу, у которого мерка
+        # длинная, но честная.
+        st = bc._in_status(tid, "in_progress")
+        if st is None:
+            log.warning("заход id=%s упал, а мост не сказал, в каком ряд состоянии — НЕ закрываю "
+                        "по догадке; разберёт реапер одиночек", tid)
+            return
+        if not st:
+            log.info("заход id=%s упал, но ряд уже не in_progress — не трогаю", tid)
+            return
+        msg = fail_result(FAIL_EXEC_ERROR,
+                          f"заход полосы умер исключением внутри демона: {exc!r}. Ряд закрыт "
+                          "СОСЕДНИМ заходом того же витка, чтобы не висеть in_progress до порога "
+                          "реапера; работа, если она успела лечь в git, видна по следам ниже",
+                          since=_task_started_get(tid))
+        bc.complete_task(tid, "failed", msg)
+        _cowork(f"задача #{tid} → failed (заход упал исключением, ряд закрыт соседом) · {_clip(msg)}")
+        _notify_task("failed", tid, "заход упал исключением внутри демона")
+    except Exception as e:                  # noqa: BLE001 — уборка за упавшим не смеет упасть сама
+        log.error("ряд id=%s упавшего захода закрыть НЕ удалось (%s) — его разберёт реапер", tid, e)
+
+
+def _process_one(task, _plan_queue):
+    """ОДИН заход: claim → исполнение → закрытие ряда. Тело прежнего `process_new` без правок
+    смысла: разрез сделан ровно по границе «выбрали ряд | работаем с рядом», чтобы две руки
+    делили выбор, но не делили работу."""
     tid = task.get("id")
     text = str(task.get("task_text") or "")
-    # ЧТО ЖДЁТ В ОЧЕРЕДИ — СНИМАЕТСЯ ЗДЕСЬ, А НЕ ПЕРЕД ЗАКРЫТИЕМ, и это ЕДИНСТВЕННЫЙ
-    # способ узнать это бесплатно: ряды уже прочитаны выше ради самого claim, а между
-    # claim и закрытием стои́т синхронный заход на десятки минут — второе чтение стоило
-    # бы отдельного похода в мост в самом дорогом месте витка. Цена этой дешевизны
-    # названа прямо: число описывает очередь НА МОМЕНТ ВЗЯТИЯ, и раздел так и говорит
-    # («в очереди ждёт N») — не «сейчас», а по последнему известному замеру. `ok=True`
-    # ставится ровно потому, что ряды прочитаны: неудачное чтение до сюда не доходит.
-    _plan_queue = {"ok": True, "waiting": len(order) - 1,
-                   "next_id": order[1].get("id") if len(order) > 1 else None}
     cl = bc.claim_task(tid)
     if not cl.get("ok"):
         log.info("claim id=%s не удался (%s) — пропуск", tid, cl.get("error"))
@@ -3607,7 +3823,11 @@ def process_new():
             # Тот же класс третьим местом (разбор §2): при уже упёршемся в потолок result приписка
             # про обновление ботов отбрасывалась голым срезом ЦЕЛИКОМ и молча — то есть терялся не
             # хвост отчёта, а факт рестарта живого бота. Режет та же функция: молча — нигде.
-            result = _cap_result(result + maybe_update_bots(tid, text, head_before), tid)
+            # ПОД ЗАМКОМ: рестарт живых ботов — операция над ОДНИМИ И ТЕМИ ЖЕ процессами и
+            # PID-файлами, и две руки, вошедшие сюда разом, гасили бы одного и того же ребёнка
+            # дважды. Замок внутрипроцессный: второй заход просто подождёт секунды.
+            with _BOTS_LOCK:
+                result = _cap_result(result + maybe_update_bots(tid, text, head_before), tid)
             status, result = _judge_done(tid, text, status, result, done_base)
         # ТРИ ЧЕЛОВЕЧЕСКИЕ СТРОКИ — ПЕРЕД ТЕХНИКОЙ, и это ЕДИНСТВЕННОЕ место сборки на полосе
         # (замок — `test_close_msg_pc.Invariants`, считает вхождения в этом файле). Стои́т ПОСЛЕ
@@ -4228,10 +4448,12 @@ def _executor_verdict(tid, path=None, pid_alive=None, since=None):
          А вот проба, НЕ ОТВЕТИВШАЯ вовсе (таймаут `tasklist`, класс #171), — это НЕ ЗНАЮ:
          её молчание не смеет значить «мёртв», иначе живую задачу снимет чужой таймаут.
       5. Отметку делал ЭТОТ процесс, а исполняем сейчас не её (п.1 не сработал) → ребёнка нет:
-         демон одноворкерный и синхронный, его дети живут внутри `run_task` и только там.
+         дети демона живут внутри `run_task` и только там. ПОПРАВКА 04.09.2026: заходов стало
+         два, поэтому п.1 спрашивает МНОЖЕСТВО ведомых задач (`_is_running`), а не одну
+         переменную; с одной переменной это правило выносило бы «сирота» живому соседу.
       6. Отметку делал ДРУГОЙ процесс демона, PID ребёнка в ней не записан → НЕ ЗНАЮ: тот демон
          мог умереть, а его headless — остаться и работать (класс осиротевшего claude.exe)."""
-    if _RUNNING_TID is not None and str(tid) == str(_RUNNING_TID):
+    if _is_running(tid):
         return True, "исполняем прямо сейчас (эта задача — текущая)"
     st = _task_started_read(path)
     if not st:
@@ -4324,13 +4546,16 @@ def process_stuck_singles(now=None):
         tid = task.get("id")
         if tid in waiting:
             continue                      # урок законно ждёт ответа учителя (in_progress); предел — 24ч, не реапер
-        if _RUNNING_TID is not None and str(tid) == str(_RUNNING_TID):
+        if _is_running(tid):
             # ЭТУ задачу демон ведёт ПРЯМО СЕЙЧАС — её судьбу решает прогон (и его TASK_TIMEOUT),
             # а не реапер, и никакой возраст этого не меняет. Возраст тут врёт по устройству:
             # бюджет прогона тратится только на бодрствование (`_wait_awake`), а `updated` растёт
-            # по стенным часам — проспавший ПК делает живую задачу «старой» ни за что. Витка, где
-            # эта ветка сработала бы, сегодня нет (демон одноворкерный и синхронный) — это замок
-            # на будущее, и стои́т он раньше всех порогов сознательно.
+            # по стенным часам — проспавший ПК делает живую задачу «старой» ни за что.
+            # «ЗАМОК НА БУДУЩЕЕ» СТАЛ ЗАМКОМ НА СЕГОДНЯ (04.09.2026): заходов в витке два, и
+            # спрашиваем мы теперь `_is_running` (множество), а не одну переменную. С одной
+            # переменной эта ветка пропускала бы СОСЕДА живого захода дальше — к приговору
+            # «сирота» по правилу «отметку делал я, а исполняю не её», то есть реапер снимал бы
+            # работающую задачу. Стои́т раньше всех порогов сознательно.
             continue
         age = _age_sec(task.get("updated"), now=now) or 0
         if age <= min(PC_ORPHAN_STALE, PC_SINGLE_STALE):
@@ -4432,11 +4657,14 @@ _DEP_FALLBACK_WARNED = False   # о срыве графа говорим оди�
 
 
 def _git_out(args):
-    """git в REPO → stdout.strip() | None (тихо: git недоступен/ошибка — self-update просто молчит)."""
+    """git в REPO → stdout.strip() | None (тихо: git недоступен/ошибка — self-update просто молчит).
+
+    ПИШУЩИЙ вызов идёт ПОД ЗАМКОМ ПОЛОСЫ (04.09.2026): в витке два захода, а индекс один. Читающий
+    (а здесь почти всё чтение — rev-parse/log/diff) замок не берёт: очередь на чтениях удлинила бы
+    виток, чей возраст меряют О2/О4, не купив ничего."""
     try:
-        p = subprocess.run(["git"] + args, cwd=REPO, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=15, creationflags=NO_WINDOW)
-        return p.stdout.strip() if p.returncode == 0 else None
+        r = _git_locked(["git"] + list(args), timeout=15, owner="_git_out")
+        return r["out"] if r["rc"] == 0 else None
     except Exception:
         return None
 
@@ -4445,13 +4673,41 @@ def _git_call(args, timeout=90):
     """git в REPO → (returncode, stdout, stderr) | None (git недоступен/исключение).
     В отличие от _git_out даёт returncode: для fetch/status/ff-only пустой stdout ≠ ошибка
     (fetch пишет в stderr, чистое дерево = пустой status, merge-base --is-ancestor кодирует
-    ответ ТОЛЬКО кодом возврата). timeout щедрый — fetch ходит в сеть."""
+    ответ ТОЛЬКО кодом возврата). timeout щедрый — fetch ходит в сеть.
+
+    ЗДЕСЬ ЖИВУТ ВСЕ СВОИ КОММИТЫ ДЕМОНА (урок, повтор урока), и с 04.09.2026 они идут ПОД ЗАМКОМ
+    ПОЛОСЫ: два захода в витке — два писателя одного индекса. Отказ замка не глотаем в None молча —
+    он получает СВОЮ строку в логе, потому что «не дождался очереди» и «git отказал» это разные
+    новости, и лечатся они по-разному."""
     try:
-        p = subprocess.run(["git"] + args, cwd=REPO, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout, creationflags=NO_WINDOW)
-        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+        r = _git_locked(["git"] + list(args), timeout=timeout, owner="_git_call")
+        return r["rc"], r["out"], r["err"]
     except Exception:
         return None
+
+
+def _git_locked(argv, timeout, owner):
+    """Один git-вызов: пишущий — через `git_serial_pc`, читающий — напрямую. → {rc, out, err}.
+
+    Отдельная функция, а не два хвоста в вызывающих: точка сериализации обязана быть ОДНА и
+    называться по имени — иначе следующая правка заведёт третий путь к индексу мимо замка, и
+    предсмертный взгляд задания («параллель сделают, а замок забудут») сбудется изнутри."""
+    def _plain():
+        p = subprocess.run(argv, cwd=REPO, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout,
+                           creationflags=NO_WINDOW)
+        return {"rc": p.returncode, "out": (p.stdout or "").strip(),
+                "err": (p.stderr or "").strip()}
+    if not git_serial_pc.needs_lock(argv):
+        return _plain()
+    try:
+        with git_serial_pc.hold(owner=f"{owner}: {' '.join(str(a) for a in argv[1:3])}",
+                                timeout=GIT_LOCK_WAIT_SEC) as how:
+            log.info("git под замком полосы (%s): %s", how, " ".join(str(a) for a in argv[1:4]))
+            return _plain()
+    except git_serial_pc.GitSerialTimeout as e:
+        log.error("git НЕ выполнен: замок полосы не отдали — %s", e)
+        return {"rc": 75, "out": "", "err": f"git_serial_pc: {e}"}
 
 
 def _dep_files(entry=DEP_ENTRY, closure_fn=None):
@@ -6377,6 +6633,13 @@ _ORCH_RUNTIME = ("pc_orchestrator.py", "gate_selective.py", "task_metrics.py",
                  # задачи, а ТО, ЧТО ВЛАДЕЛЕЦ УВИДИТ ПЕРВЫМ, открыв телефон. Модуль чистый (только
                  # re + `done_judge_pc`, который стоит строкой выше), замыкание не растит.
                  "close_msg_pc.py",
+                 # 04.09.2026: ТОЧКА СЕРИАЛИЗАЦИИ GIT (задача 238). Верхний импорт, и пропуск снова
+                 # поймал сам гейт, а не автор — седьмой раз подряд. Цена грязи здесь выше обычной:
+                 # незакоммиченная правка `git_serial_pc.py` меняет ТО, ЧЕМ ДВА ЗАХОДА ДЕЛЯТ ОДИН
+                 # ИНДЕКС, и уехала бы в бой ровно в тот момент, когда рук стало две. Модуль чистый
+                 # для замыкания (argparse/contextlib/json/os/subprocess/threading/time — стандартная
+                 # библиотека, своих модулей репозитория не тянет), замыкание не растит.
+                 "git_serial_pc.py",
                  # 30.07.2026: демон импортирует их СВЕРХУ, значит незакоммиченная правка уедет в
                  # бой вместе с рестартом. pretool_guard — новый импорт (словарь видов красного для
                  # разбора одобренной карточки), io_utf8 стоял в импортах и в список не попал.
