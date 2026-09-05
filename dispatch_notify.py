@@ -201,6 +201,49 @@ def live_send_verdict():
     return False, why
 
 
+# ─── ИДЕНТИФИКАТОР ПОСЛЕДНЕЙ ОТПРАВКИ — для АРХИВА, а не для маршрута (05.09.2026) ───────────
+# Каскады send/send_critical/send_topic возвращают (channel, ok) и НОМЕРА сообщения не отдают:
+# зовущему он был не нужен, пока лог был обрезком в 90 символов. Архиву он нужен ровно затем,
+# чтобы наша исходящая строка была СВЕРЯЕМА с самим Telegram: без message_id архивная строка —
+# это наше слово о том, что мы отправили, а с ним — адрес, по которому это проверяется.
+#
+# Почему снимок, а не возврат из каждой функции: `_api` — ЕДИНСТВЕННОЕ горлышко всех отправок
+# (пять дверей выше зовут его и никто не ходит в сеть мимо), поэтому один снимок здесь покрывает
+# все каскады и все фолбэки разом, не трогая ни одной сигнатуры и ни одного вызывающего.
+# Процесс живёт одну доставку (хук/CLI — one-shot), поэтому «последний» здесь означает «наш».
+_LAST_SEND = {"mid": None, "chat": None, "thread": None}
+
+
+def last_send_id():
+    """message_id последнего УСПЕШНОГО sendMessage/editMessageText → str.
+
+    '-' означает «номера нет»: отправка не состоялась, ушла из пробы (замок 1) или Telegram
+    ответил без `result.message_id`. Это НЕ то же самое, что отсутствие поля `mid=` в строке
+    лога: отсутствие поля означает строку, написанную кодом СТАРШЕ 05.09.2026, то есть заведомо
+    обрезанную по 90 символов. Разница нужна разбору архива (`chatlog_ingest.py --source
+    dispatch`), который иначе не отличил бы «текст целый, номера нет» от «текст обрезан»."""
+    mid = _LAST_SEND.get("mid")
+    return str(mid) if mid else "-"
+
+
+def _remember_send(method, body):
+    """Запомнить номер только что отправленного сообщения. Никогда не бросает и ничего не меняет
+    в судьбе отправки: снимок вторичен, и сбой разбора ответа не смеет отменить доставку."""
+    try:
+        if method not in ("sendMessage", "editMessageText"):
+            return
+        if not (isinstance(body, dict) and body.get("ok")):
+            return
+        res = body.get("result")
+        if not isinstance(res, dict) or not res.get("message_id"):
+            return
+        _LAST_SEND["mid"] = res.get("message_id")
+        _LAST_SEND["chat"] = (res.get("chat") or {}).get("id")
+        _LAST_SEND["thread"] = res.get("message_thread_id")
+    except Exception:
+        pass
+
+
 def _api(method, payload):
     """POST в Bot API. Возвращает (ok, body). Токен/URL НЕ логируем.
 
@@ -215,6 +258,7 @@ def _api(method, payload):
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
             body = json.loads(r.read().decode("utf-8"))
+            _remember_send(method, body)
             return bool(body.get("ok")), body
     except urllib.error.HTTPError as e:
         try:
@@ -631,6 +675,31 @@ _RE_SECRET_VALUE = re.compile(
     r"(?i)([A-Za-z_]*(?:token|api_?key|secret|password|passwd|pwd)[A-Za-z_]*)(\s*[=:]\s*)(\S+)")
 CMD_MAX = 220     # символов команды в пинге ожидания: карточка должна остаться читаемой
 
+# ─── АРХИВНАЯ СТРОКА ИТОГА (05.09.2026, первая очередь хранилища переписки) ───────────────────
+# До этого дня итог доставки писался в лог как `text[:90]` — в ВОСЬМИ одинаковых местах ниже.
+# Замер переписи 05.09: наша исходящая доля форума Штаба ≈50 сообщений в сутки при типовом
+# размере ~700 Б, то есть обрезка выбрасывала СЕМЬ ВОСЬМЫХ каждой собственной карточки —
+# единственной половины архива, которая у полосы уже есть и не стоит ни одного запроса в
+# Telegram. Снятие обрезки отдаёт эту половину даром: 35 КБ/сут, 12 МБ в год.
+#
+# ЧТО ЗДЕСЬ ДЕЛАЕТСЯ ПОМИМО СНЯТИЯ ОБРЕЗКИ, и почему это не украшение:
+#   1) перевод строки заменяется на « ⏎ » — тем же знаком, каким его давно заменяет
+#      `userbot_listen`. Инвариант «одна строка лога = одно сообщение» до сих пор держался
+#      СЛУЧАЙНО (в 90 символов перенос попадал редко); на полном тексте карточка с переносами
+#      развалила бы разбор архива на первой же многострочной сводке;
+#   2) значения токенов/паролей маскируются тем же `_RE_SECRET_VALUE`, что и команда в пинге.
+#      Обрезка в 90 символов была СЛУЧАЙНЫМ замком от утечки секрета в лог — снимая её, замок
+#      надо поставить осознанный, иначе первая же карточка с `TOKEN=…` в теле легла бы в файл
+#      целиком.
+# Потолка длины здесь НЕТ намеренно: потолок — это та же обрезка под другим именем.
+_ARCH_NL = " ⏎ "
+
+
+def arch_text(text):
+    """Текст карточки для архивной строки лога: ЦЕЛИКОМ, в одну строку, с маской секретов."""
+    s = _RE_SECRET_VALUE.sub(lambda m: m.group(1) + m.group(2) + "***", str(text or ""))
+    return s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", _ARCH_NL)
+
 
 def _last_tool_command(path, limit=CMD_MAX):
     """Команда, ждущая разрешения = ПОСЛЕДНИЙ tool_use в transcript-е сессии (тот же живой
@@ -850,7 +919,8 @@ def main():
             # рассосётся, ждёт владельца»), а не отдельный маршрут: адрес выбирает deliver.
             text = " ".join(args[1:]).strip() or "🔔 Оркестратор: критический инцидент"
             channel, ok = deliver(text, declared=True)
-            _log.info(f"итог(критич): channel={channel} ok={ok} | {text[:90]}")
+            _log.info(f"итог(критич): channel={channel} ok={ok} mid={last_send_id()} "
+                      f"| {arch_text(text)}")
             sys.exit(0)
         if args and args[0] == "--topic":
             # ЯВНО НАЗВАННЫЙ АДРЕС — не маршрут: вызывающий сам знает тему и признак не
@@ -863,7 +933,8 @@ def main():
                 tid, rest = int(rest[0]), rest[1:]
             text = " ".join(rest).strip() or "🔔 Dispatch"
             channel, ok = send_topic(text, tid)
-            _log.info(f"итог(тема): channel={channel} ok={ok} | {text[:90]}")
+            _log.info(f"итог(тема): channel={channel} ok={ok} mid={last_send_id()} "
+                      f"| {arch_text(text)}")
             print(f"channel={channel} ok={int(bool(ok))}")
             sys.exit(0)
         if args and args[0] == "--card":
@@ -873,7 +944,8 @@ def main():
             pid = args[1] if len(args) > 1 else ""
             text = " ".join(args[2:]).strip() or f"🧩 Цепь #{pid}"
             channel, ok = deliver(text, _chain_markup(pid))
-            _log.info(f"итог(карточка цепи {pid}): channel={channel} ok={ok} | {text[:90]}")
+            _log.info(f"итог(карточка цепи {pid}): channel={channel} ok={ok} "
+                      f"mid={last_send_id()} | {arch_text(text)}")
             sys.exit(0)
         if args and args[0] == "--gate-card":
             # КАРТОЧКА ВОРОТ клиентского контура: текст + кнопки [✅ Выкатить][⛔ Не выкатывай].
@@ -883,7 +955,8 @@ def main():
             commit = args[1] if len(args) > 1 else ""
             text = " ".join(args[2:]).strip() or f"⛔ Ворота клиентского контура: {commit}"
             channel, ok = deliver(text, _gate_markup(commit))
-            _log.info(f"итог(карточка ворот {commit}): channel={channel} ok={ok} | {text[:90]}")
+            _log.info(f"итог(карточка ворот {commit}): channel={channel} ok={ok} "
+                      f"mid={last_send_id()} | {arch_text(text)}")
             print(f"channel={channel} ok={int(bool(ok))}")
             sys.exit(0)
         if args and args[0] == "--hook":
@@ -909,7 +982,8 @@ def main():
                     _log.info("METRICS сессии записан: %.160s", _m)
                 else:
                     _log.info("METRICS сессии не записан (замерить нечего)")
-                _log.info(f"итог(session_end): channel={channel} ok={ok} | {text[:90]}")
+                _log.info(f"итог(session_end): channel={channel} ok={ok} "
+                          f"mid={last_send_id()} | {arch_text(text)}")
                 sys.exit(0)
             if kind == "stop":
                 # ── ЛИЧКА — ТОЛЬКО ТО, ЧЕГО НЕТ В ИНБОКСЕ И ЧТО ТРЕБУЕТ ОТВЕТА ──────────────
@@ -923,14 +997,16 @@ def main():
                 # в тему постановки задач (10.08.2026: ответа она не ждёт, признак ведёт её
                 # в 328), а `--hook stop` по-прежнему возвращает 0 (хук не считает это сбоем).
                 _log.info("итог(stop): личка пропущена — итог сессии уходит в тему "
-                          f"{TASKS_THREAD_ID} хуком session_end | {text[:90]}")
+                          f"{TASKS_THREAD_ID} хуком session_end mid={last_send_id()} "
+                          f"| {arch_text(text)}")
                 sys.exit(0)
             if kind == "notification":
                 # Сессия ЖДЁТ разрешения — признак читает это в самом тексте («ждёт твоего
                 # разрешения/ввода») и ведёт в инбокс 1160, личка — фолбэк. Отдельной ветки
                 # «этот вид всегда критический» больше нет: вид не адрес.
                 channel, ok = deliver(text)
-                _log.info(f"итог(notification): channel={channel} ok={ok} | {text[:90]}")
+                _log.info(f"итог(notification): channel={channel} ok={ok} "
+                          f"mid={last_send_id()} | {arch_text(text)}")
                 sys.exit(0)
         elif args:
             text = " ".join(args).strip()
@@ -943,7 +1019,7 @@ def main():
         else:
             text = "🔔 Dispatch"
         channel, ok = deliver(text)
-        _log.info(f"итог: channel={channel} ok={ok} | {text[:90]}")
+        _log.info(f"итог: channel={channel} ok={ok} mid={last_send_id()} | {arch_text(text)}")
     except Exception as e:
         # НИКОГДА не роняем вызывающий процесс
         try:
