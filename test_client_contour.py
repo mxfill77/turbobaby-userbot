@@ -131,10 +131,39 @@ class TestZhivoyKontur(unittest.TestCase):
             self.assertTrue(cc.is_client(name, REPO), f"{name} обязан быть клиентским")
 
     def test_zhivye_vnutrennie_fayly(self):
+        # ДВА имени убраны 05.09.2026, и оба — не ради зелёного, а потому что перестали быть
+        # правдой ПО ФАКТУ (цепи названы голденом ниже):
+        #   • client_contour.py — с a42c8ee (задача 231, регрессия урока);
+        #   • brain_writer.py — РАНЬШЕ сегодняшнего происшествия: он был клиентским уже на
+        #     d92fd0f (замер 05.09), то есть этот тест лежал красным и МОЛЧА — он не входит в
+        #     набор гейта самообновления (там только test_pc_orchestrator + test_pc_local_dec),
+        #     поэтому красноту никто не видел.
+        # Признак — самообновляющийся граф; поимённый список «внутренних» устаревает без единого
+        # сигнала, и это его врождённое свойство, а не поломка.
         for name in ("pc_orchestrator.py", "pc_agent.py", "gate_selective.py", "task_metrics.py",
-                     "client_contour.py", "selfupdate_gate.py", "pretool_guard.py",
-                     "cowork_log_append.py", "brain_writer.py", "README.md"):
+                     "selfupdate_gate.py", "pretool_guard.py",
+                     "cowork_log_append.py", "README.md"):
             self.assertFalse(cc.is_client(name, REPO), f"{name} обязан быть внутренним")
+
+    def test_client_contour_sam_stal_klientskim_05_09(self):
+        """ЗАПИСЬ СМЕНЫ, а не подгонка: модуль самих ворот въехал в клиентское замыкание, и цепь
+        названа поимённо. Замыкание выросло 30 → 33 файла (вошли client_contour.py,
+        lesson_regress.py, trainer_run.py) — замер 05.09.2026 на d92fd0f против вершины.
+
+        Направление ошибки безопасное (лишний файл держим и спрашиваем владельца, клиентского не
+        пропускаем), поэтому чинится ГОЛДЕН, а не признак. Красный здесь = ребро исчезло, и это
+        новость, о которой надо знать: значит регрессия урока отвязалась от тренажёра."""
+        c = cc.closure(REPO)
+        self.assertTrue(c.ok, c.reason)
+        for zveno in ("trainer.py", "lesson_regress.py", "client_contour.py"):
+            self.assertIn(zveno, c.files, f"{zveno} выпал из клиентского замыкания — цепь порвана")
+        self.assertTrue(cc.is_client("client_contour.py", REPO))
+        # Вторая цепь, старее первой: userbot_listen → suggest → price_gate → queue_snapshot_pc →
+        # brain_writer. Писатель журнала клиентский не «по смыслу», а потому что ворота цены его
+        # тянут; список имён этого не знал, граф знал всегда.
+        for zveno in ("suggest.py", "price_gate.py", "queue_snapshot_pc.py", "brain_writer.py"):
+            self.assertIn(zveno, c.files, f"{zveno} выпал из клиентского замыкания — цепь порвана")
+        self.assertTrue(cc.is_client("brain_writer.py", REPO))
 
     def test_lesson_router_est_v_grafe_no_net_v_karte_processov(self):
         """Живой разрыв, который список имён не видит, а граф видит: trainer.py импортит

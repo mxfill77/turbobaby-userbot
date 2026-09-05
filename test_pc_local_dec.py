@@ -847,6 +847,41 @@ class TestPriorityOwnerOverRevizor(LocBase):
         self.assertEqual(self.fb.rows[rev]["status"], "done")                      # декомпозирован
         self.assertTrue(self.fb.chain_news()[0]["task_text"].startswith(f"[шаг 1/2 родитель {rev}]"))
 
+    def _lanes(self, n):
+        """Ручку параллели пришпиливаем КОДОМ, а не .env: голден обязан ловить класс на любой машине
+        (и ровно наоборот — красноту гейта 05.09 дала боевая ручка, которой на чужой машине нет)."""
+        save = o.parallel_lanes
+        o.parallel_lanes = lambda: n
+        self.addCleanup(lambda: setattr(o, "parallel_lanes", save))
+
+    def test_parallel_dve_ruki_ne_uvozyat_revizorskogo_roditelya(self):
+        """КЛАСС 05.09.2026 (гейт самообновления держал прод 2 ч 46 мин). Параллель 04.09 сохранила
+        ПОРЯДОК сортировки и потеряла ИСКЛЮЧИТЕЛЬНОСТЬ: `min(lanes, len(order))` брал голову списка
+        целиком, поэтому пара [owner, ревизорский родитель] уезжала в работу ОДНИМ витком. Уступка
+        говорит обратное словами «уступка ДО думателя адаптации — лимиты не тратим»: думатель
+        декомпозиции тратился на ревизора ровно тогда, когда owner-работа ещё идёт."""
+        self._lanes(2)
+        rev = self.fb.enqueue_task(o.PC_LOCAL_DEC_FROM, self.REV)["id"]
+        owner = self.fb.enqueue_task("Filipp", "owner-задача из Dispatch")["id"]
+        self.exec_queue.append(("done", "RESULT: owner готов"))
+        o.process_new()
+        self.assertEqual(self.fb.rows[owner]["status"], "done", "owner взят первой рукой")
+        self.assertEqual(self.fb.rows[rev]["status"], "new",
+                         "вторая рука не смеет брать ревизорского родителя при owner-работе")
+        self.assertEqual(self.planner_prompts, [], "думатель декомпозиции на ревизора не потрачен")
+
+    def test_parallel_dve_owner_zadachi_po_prezhnemu_paroi(self):
+        """КОНТРОЛЬНЫЙ ОПЫТ к тесту выше — он один и доказывает, что замок СУЖЕН до смеси, а не
+        выключил параллель целиком: две owner-задачи двумя руками идут ОДНИМ витком, как и 04.09."""
+        self._lanes(2)
+        a = self.fb.enqueue_task("Filipp", "owner A из 328")["id"]
+        b = self.fb.enqueue_task("Filipp", "owner B из 829")["id"]
+        self.exec_queue.append(("done", "RESULT: A готов"))
+        self.exec_queue.append(("done", "RESULT: B готов"))
+        o.process_new()
+        self.assertEqual(self.fb.rows[a]["status"], "done")
+        self.assertEqual(self.fb.rows[b]["status"], "done")
+
     def test_revizor_chain_releases_normally_without_owner(self):
         # РЕГРЕСС: без owner-работы ревизорская цепь релизит следующий шаг как обычно (уступки нет)
         pid = self._revizor_parent()

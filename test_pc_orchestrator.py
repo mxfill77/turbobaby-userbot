@@ -10172,8 +10172,51 @@ class TestClientContourGate(Base):
         """Внутренний контур не задет: карта на ботов не ведёт → прежний путь, ворота молчат."""
         self.assertEqual(self._upd(["pc_orchestrator.py", "gate_selective.py"]), "")
         self.assertEqual(self.cards, [])
-        self.assertEqual(o._client_paths(["pc_orchestrator.py", "gate_selective.py",
-                                          "task_metrics.py", "client_contour.py"]), [])
+        # ПОИМЁННЫЙ список «внутренних» — голден с коротким сроком годности, и 05.09.2026 он этот
+        # срок пережил: в списке стоял client_contour.py, а он СТАЛ клиентским по-настоящему
+        # (a42c8ee завёл lesson_regress.py, и цепь userbot_listen → trainer → lesson_regress →
+        # client_contour стала живым ребром; замер: замыкание 30 → 33 файла). «Внутренний» — не
+        # свойство ИМЕНИ, а факт отсутствия ребра, поэтому каждое имя здесь сверяется С ГРАФОМ, а
+        # не берётся на веру: разойдётся — тест назовёт файл, а не просто покраснеет.
+        # Сам факт смены закреплён отдельным голденом test_client_contour_stal_klientskim_cepyu.
+        vnutr = ["pc_orchestrator.py", "gate_selective.py", "task_metrics.py"]
+        cl = o.client_contour.closure(o.REPO)
+        self.assertTrue(cl.ok, cl.reason)
+        for p in vnutr:
+            self.assertNotIn(p, cl.files, f"{p} въехал в клиентское замыкание — список устарел")
+        self.assertEqual(o._client_paths(vnutr), [])
+
+    def test_client_contour_stal_klientskim_cepyu(self):
+        """ЗАПИСЬ СМЕНЫ, а не подгонка (05.09.2026): client_contour.py клиентский, и вот РЕБРО.
+
+        Красный гейт самообновления держал прод 2 ч 46 мин ровно потому, что смена была МОЛЧАЛИВОЙ:
+        голден выше знал только «этот файл внутренний» и не умел сказать, ЧЕМ это перестало быть
+        правдой. Здесь цепь названа поимённо. Тест покраснеет, если ребро исчезнет, — и это
+        правильный красный: значит регрессия урока отвязалась от тренажёра, и об этом надо знать."""
+        cl = o.client_contour.closure(o.REPO)
+        self.assertTrue(cl.ok, cl.reason)
+        for zveno in ("trainer.py", "lesson_regress.py", "client_contour.py"):
+            self.assertIn(zveno, cl.files, f"{zveno} выпал из клиентского замыкания — цепь порвана")
+        self.assertTrue(o.client_contour.is_client("client_contour.py", o.REPO))
+        self.assertEqual(o._client_paths(["client_contour.py"]), ["client_contour.py"])
+
+    def test_priznak_eto_graf_a_ne_spisok(self):
+        """НАСТОЯЩЕЕ свойство, которое голден выше только изображал списком имён: клиентским файл
+        делает РЕБРО, а не имя. Одно и то же имя в одном и том же каталоге — клиентское при живом
+        импорте и внутреннее без него. Проверяется на СВОЁМ дереве (боевое не трогаем)."""
+        with tempfile.TemporaryDirectory() as d:
+            vhod, modul = os.path.join(d, "userbot_listen.py"), os.path.join(d, "nekii.py")
+            io.open(modul, "w", encoding="utf-8").close()
+            with io.open(vhod, "w", encoding="utf-8") as f:
+                f.write("import nekii\n")
+            cl = o.client_contour.closure(d, entries=("userbot_listen.py",))
+            self.assertTrue(cl.ok, cl.reason)
+            self.assertTrue(o.client_contour.is_client("nekii.py", cl=cl), "ребро есть — клиентский")
+            with io.open(vhod, "w", encoding="utf-8") as f:
+                f.write("# ребра больше нет\n")
+            cl2 = o.client_contour.closure(d, entries=("userbot_listen.py",))
+            self.assertTrue(cl2.ok, cl2.reason)
+            self.assertFalse(o.client_contour.is_client("nekii.py", cl=cl2), "ребра нет — внутренний")
 
     def test_fail_closed_priznak_upal(self):
         with mock.patch.object(o.client_contour, "is_client", side_effect=RuntimeError("нет графа")):
@@ -11762,6 +11805,35 @@ class TestParallelLanes(Base):
         o.MAX_CLAUDE_PROCS = 1
         self.addCleanup(lambda: setattr(o, "MAX_CLAUDE_PROCS", save))
         self.assertEqual(o.parallel_lanes(), 1)
+
+    # ── приоритет полосы против второй руки (класс 05.09.2026) ───────────────────────────────
+    def test_vtoraya_ruka_ne_beret_revizorskogo_roditelya_pri_owner_rabote(self):
+        """Порядок отвечает «кто первый», ЧИСЛО взятых рядов — «сколько их вообще», и параллель
+        обязана уважать оба. Смесь [owner, ревизорский родитель] → берём ОДИН ряд: думатель
+        декомпозиции не тратится на ревизора, пока owner-работа идёт (уступка, b0a68e5)."""
+        rev = {"id": 1, "task_text": "[ревизор дата=2026-09-05 класс=спор] почини срез"}
+        own = {"id": 2, "task_text": "тз: owner-задача из Dispatch"}
+        self.assertEqual(o._lanes_owner_priority([own, rev], 2), 1)
+
+    def test_dve_owner_zadachi_paralleli_ne_lishayutsya(self):
+        """Замок СУЖЕН до смеси: одинаковый приоритет двух рядов параллель не выключает."""
+        own = [{"id": 2, "task_text": "тз: owner A"}, {"id": 3, "task_text": "тз: owner B"}]
+        self.assertEqual(o._lanes_owner_priority(own, 2), 2)
+
+    def test_bez_owner_raboty_revizory_klemyatsya_kak_prezhde(self):
+        """Owner-рядов нет вовсе → прежнее поведение целиком: уступать некому, и вторая рука
+        ревизорского родителя берёт. Иначе замок молча урезал бы полосу вдвое на пустой очереди."""
+        rev = [{"id": 1, "task_text": "[ревизор дата=2026-09-05 класс=спор] раз"},
+               {"id": 2, "task_text": "[ревизор дата=2026-09-05 класс=спор] два"}]
+        self.assertEqual(o._lanes_owner_priority(rev, 2), 2)
+        self.assertEqual(o._lanes_owner_priority([], 1), 1)          # пустой список руку не отнимает
+
+    def test_odnorukii_put_zamkom_ne_tronut(self):
+        """Однорукая полоса (ручка=1) обязана остаться байт-в-байт прежней при ЛЮБОМ составе."""
+        rev = {"id": 1, "task_text": "[ревизор дата=2026-09-05 класс=спор] почини срез"}
+        own = {"id": 2, "task_text": "тз: owner-задача"}
+        for order in ([own, rev], [rev], [own]):
+            self.assertEqual(o._lanes_owner_priority(order, 1), 1)
 
     # ── факты очереди ────────────────────────────────────────────────────────────────────────
     def test_fakty_ocheredi_odinakovy_dlya_oboikh_zakhodov(self):
