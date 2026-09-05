@@ -445,8 +445,13 @@ class TestRememberRule(unittest.TestCase):
     """Фаза 2: кнопка «📌 Запомнить как правило» — approver-гейт, дистилляция, append, дедуп, fail-safe."""
 
     def setUp(self):
+        # БЫЛО: `= set()` — весь класс гонялся с ПУСТЫМ списком, и test_remember_approver_appends
+        # ждал 'remembered'. Тем самым набор фиксировал дыру (пустой список = пропуск в книгу) как
+        # ПРАВИЛЬНОЕ поведение и пережил бы любой рефакторинг. Теперь класс гоняется на НЕПУСТОМ
+        # списке — как боевой контур (замер 05.09: 5 записей), — а пустой список судят
+        # отрицательные тесты TestRuleWriteFailClosed ниже.
         self._wl = suggest.APPROVER_USERNAMES
-        suggest.APPROVER_USERNAMES = set()
+        suggest.APPROVER_USERNAMES = {"danya"}
 
     def tearDown(self):
         suggest.APPROVER_USERNAMES = self._wl
@@ -518,6 +523,98 @@ class TestRememberRule(unittest.TestCase):
         kb = moderation_bot._kb(moderation_bot._kb_confirm, 7)
         flat = [(b.text, b.callback_data) for row in kb.inline_keyboard for b in row]
         self.assertTrue(any("Запомнить" in t and c == "m:7:remember" for t, c in flat))
+
+
+class TestRuleWriteFailClosed(unittest.TestCase):
+    """ПУСТОЙ СПИСОК ПРАВ БОЛЬШЕ НЕ ПРОПУСК В КНИГУ ПРАВИЛ (05.09).
+
+    Дыра: `remember_rule` судил право общей проверкой `suggest.is_approver`, а та на ПУСТОМ
+    списке отвечает True ВСЕМ — сознательно, иначе пустой env обездвижил бы всю модерацию.
+    Для записи в книгу цена ошибки другая: правило переживает заход и правит ответы всем
+    клиентам. Список опустошается ОДНОЙ переменной окружения и без единой строки в журнале,
+    заморозка контура эту ветку не покрывает, статус закрытой карточки её не останавливает —
+    значит единственный замок обязан стоять в самой точке записи.
+
+    Тесты держат ТРИ вещи разом: (1) на пустом списке запись отказана; (2) на непустом своё имя
+    пишет, а постороннее нет; (3) на пустом списке approve/reject/правка ответа работают КАК
+    ПРЕЖДЕ — то есть радиус правки не вышел за одну операцию (предсмертный взгляд задания:
+    «дыра закрыта, а бот молчит» — хуже дыры)."""
+
+    def setUp(self):
+        self._wl = suggest.APPROVER_USERNAMES
+        self._intake = suggest.INTAKE_APPROVERS
+
+    def tearDown(self):
+        suggest.APPROVER_USERNAMES = self._wl
+        suggest.INTAKE_APPROVERS = self._intake
+
+    @staticmethod
+    def _spy_appender(calls):
+        def appender(rule, now=None):
+            calls.append(rule)
+            return "added"
+        return appender
+
+    def test_empty_whitelist_denies_rule_write(self):
+        """(1) СПИСОК ПУСТ → запись правила ОТКАЗАНА, и appender не звался НИ РАЗУ."""
+        suggest.APPROVER_USERNAMES = set()
+        suggest.INTAKE_APPROVERS = set()
+        calls = []
+        d = moderation_core.remember_rule(
+            {"directive": "не называть цену без дат"}, "postoronniy_0905",
+            distill=lambda directive, call_llm=None: "R", appender=self._spy_appender(calls))
+        self.assertEqual(d["decision"], "denied", d)
+        self.assertIsNone(d["rule"])
+        self.assertEqual(calls, [])                       # в книгу не ушло НИЧЕГО
+        # и никакое имя не проходит на пустоте — даже похожее на своё
+        for name in ("danya", "@danya", "DANYA", "", None):
+            self.assertFalse(moderation_core.may_write_rule(name), name)
+
+    def test_nonempty_whitelist_own_writes_stranger_does_not(self):
+        """(2) СПИСОК НЕПУСТ → своё имя пишет (регистр и «@» терпимы), постороннее не пишет."""
+        suggest.APPROVER_USERNAMES = {"danya"}
+        for own in ("danya", "@danya", "Danya"):
+            calls = []
+            d = moderation_core.remember_rule(
+                {"directive": "жёстче про депозит"}, own,
+                distill=lambda directive, call_llm=None: "Жёстче про депозит",
+                appender=self._spy_appender(calls))
+            self.assertEqual(d["decision"], "remembered", own)
+            self.assertEqual(calls, ["Жёстче про депозит"], own)
+        calls = []
+        d = moderation_core.remember_rule(
+            {"directive": "жёстче про депозит"}, "postoronniy_0905",
+            distill=lambda directive, call_llm=None: "R", appender=self._spy_appender(calls))
+        self.assertEqual(d["decision"], "denied", d)
+        self.assertEqual(calls, [])
+
+    def test_empty_whitelist_keeps_approve_reject_edit_working(self):
+        """(3) РАДИУС: на ПУСТОМ списке кнопки одобрения, отказа и правки ответа — как прежде."""
+        suggest.APPROVER_USERNAMES = set()
+        suggest.INTAKE_APPROVERS = set()
+        draft = {"id": 1, "draft": "черновик ответа"}
+        stranger = "postoronniy_0905"
+        self.assertTrue(suggest.is_approver(stranger))                    # общая проверка НЕ тронута
+        self.assertEqual(moderation_core.process_callback(draft, "yes", stranger, True)["decision"],
+                         "test_held")                                     # ✅ одобрение
+        self.assertEqual(moderation_core.process_callback(draft, "no", stranger, True)["decision"],
+                         "rejected")                                      # ❌ отказ
+        self.assertEqual(moderation_core.process_callback(draft, "more", stranger, True)["decision"],
+                         "await_more")                                    # ✏️ правка ответа
+        self.assertEqual(moderation_core.process_callback(draft, "send", stranger, True,
+                                                          candidate="итог")["decision"], "test_held")
+        # ...и ровно одна операция из четырёх закрыта
+        self.assertEqual(moderation_core.remember_rule(
+            {"directive": "x"}, stranger, distill=lambda d, call_llm=None: "R",
+            appender=lambda *a, **k: "added")["decision"], "denied")
+
+    def test_intake_approver_rename_alone_would_not_close_it(self):
+        """ЗАМОК НА ЛОЖНЫЙ ФИКС: подмена имени функции на разборщика заявок дыру не закрывает —
+        при пустом INTAKE_APPROVERS он фолбэком уходит в ту же общую проверку и отвечает True."""
+        suggest.APPROVER_USERNAMES = set()
+        suggest.INTAKE_APPROVERS = set()
+        self.assertTrue(suggest.is_intake_approver("postoronniy_0905"))   # фолбэк на is_approver
+        self.assertFalse(moderation_core.may_write_rule("postoronniy_0905"))
 
 
 class TestDegradationAndExecutor(unittest.TestCase):

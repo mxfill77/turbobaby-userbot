@@ -482,11 +482,34 @@ def distill_rule(directive, call_llm=None):
     return " ".join((out or "").split()).strip()
 
 
+def may_write_rule(username):
+    """Право на ЗАПИСЬ правила в книгу — FAIL-CLOSED: ПУСТОЙ список прав = НИКОМУ.
+
+    Отличие от общей проверки (`suggest.is_approver`) сознательное, и путать их нельзя:
+    там пустой список = «можно любому», и это НЕ дефект — на пустом env иначе обездвижилась бы
+    вся модерация (approve, reject, send, правка ответа). Цена ошибки у ЗАПИСИ В КНИГУ другая и
+    несимметричная: лишний отказ — одна ненажатая кнопка на одной карточке, лишнее «да» —
+    посторонний правит правила, по которым бот отвечает ВСЕМ клиентам во всех следующих заходах.
+    Поэтому дыра закрывается ЗДЕСЬ, в одной операции, а не в общей проверке (радиус: одна кнопка
+    «📌 Запомнить как правило»).
+
+    Членство в списке НЕ переписываем — его по-прежнему судит `suggest.is_approver` (одна
+    нормализация `@`/регистра, без второй копии, которая разъедется). Здесь добавлено ровно одно:
+    на пустом списке ответ «нет» вместо «да».
+
+    Смена имени на `suggest.is_intake_approver` дыру НЕ закрывает: при пустом INTAKE_APPROVERS он
+    уходит фолбэком в тот же `is_approver` (suggest.py:1730) и на пустоте отвечает True."""
+    if not suggest.APPROVER_USERNAMES:
+        return False
+    return suggest.is_approver(username)
+
+
 def remember_rule(draft, username, call_llm=None, distill=None, appender=None, now=None):
     """Кнопка «📌 Запомнить как правило»: approver-гейт → дистилляция ДИРЕКТИВЫ модератора → APPEND
     в playbook. Возвращает decision-dict (без I/O карточки — постит moderation_bot). distill/appender
-    инъектируются в тестах. FAIL-SAFE: сбой записи → 'not_saved' (правка уже применена к черновику)."""
-    if not suggest.is_approver(username):
+    инъектируются в тестах. FAIL-SAFE: сбой записи → 'not_saved' (правка уже применена к черновику).
+    Гейт — `may_write_rule` (fail-closed), а не общая `suggest.is_approver`."""
+    if not may_write_rule(username):
         return {"decision": "denied", "rule": None, "card": "⛔ Нет прав на запись правил"}
     directive = (draft.get("directive") or "").strip()
     if not directive:
