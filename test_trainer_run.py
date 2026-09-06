@@ -576,8 +576,9 @@ class PrivyazkaZameraKKommitu(unittest.TestCase):
         """Корпус НЕ гоняем (живая голова — минуты и токены): числа замера здесь не предмет."""
         # Седьмое значение — `plan` (критерий F, 07.09.2026): стенд повторяет ЖИВОЙ контракт
         # `run_corpus`, иначе `main` распакует шесть значений из шести и класс «мок отстал от
-        # прода» вернётся молча.
-        tr.run_corpus = lambda cases, runs=2, ph=None: (
+        # прода» вернётся молча. `point` — контрольная точка (07.09.2026): `main` подаёт её ВСЕГДА
+        # (None, когда `--state` не назвали), и стенд без этого имени падал бы TypeError.
+        tr.run_corpus = lambda cases, runs=2, ph=None, log=print, point=None: (
             [], passed, ok, allc, list(failed), [],
             {str(c.get("id")): {"class": "", "rounds": runs, "need": runs, "green": runs,
                                 "red": 0, "unknown": 0, "ok": True, "tolerated": []}
@@ -1218,6 +1219,345 @@ class TretiyIskhodStanciya(unittest.TestCase):
         self.assertNotIn("price_figure", case.get("expect") or {},
                          "станция третьего исхода требует цифру — это второй исход, а не третий")
         self.assertIn("{when_cross}", " ".join(case["lines"]), "даты зашиты в реплику")
+
+
+# ═══════════ 9. КОНТРОЛЬНАЯ ТОЧКА НАБОРА: цена обрыва — ОДИН КЕЙС (07.09.2026) ═══════════════
+
+def _case_stub(outcomes=None, calls=None, spy=None, boom=()):
+    """Вместо ЖИВОЙ головы: исход круга задан таблицей id → True | False | 'причина неизвестности'.
+
+    Формат возврата дословно повторяет живой `run_case` (id, name, ok, unknown, checks, draft,
+    note) — иначе `run_one_case` считал бы не то, что считает в бою."""
+    outcomes = outcomes or {}
+
+    def fake(case, ph, log=print):
+        cid = str(case.get("id"))
+        if spy is not None:
+            spy(cid)
+        if calls is not None:
+            calls.append(cid)
+        if cid in boom:
+            raise RuntimeError("обрыв захода на кейсе " + cid)
+        out = outcomes.get(cid, True)
+        unk = out if isinstance(out, str) else None
+        checks = [{"name": "чек", "ok": out is True, "expected": "ожидание", "fact": "факт"}]
+        if unk:
+            checks = [dict(c, unknown=True) for c in checks]
+        return {"id": case.get("id"), "name": case.get("name"), "ok": out is True,
+                "unknown": unk, "checks": checks, "draft": "черновик", "note": ""}
+    return fake
+
+
+class KontrolnayaTochkaNabora(unittest.TestCase):
+    """ТАЙМАУТ ОБЯЗАН СТОИТЬ ОДИН КЕЙС, А НЕ ВЕСЬ ЗАХОД (07.09.2026).
+
+    Живой повод, числом: корпус 17 кейсов даёт 38 кругов (13×2 + 4×3 классу), круг 43.7–46.6 с ⇒
+    1661–1771 с при потолке захода 2700 с. Промежуточной записи у прогона не было ни одной —
+    обрыв на 40-й минуте стоил ВСЁ и повтор за этим.
+
+    Живой головы здесь нет: `run_case` подменяется стендом, `head_commit`/`dirty_tracked`/
+    `tree_key`/`placeholders` — тоже, git не зовётся вовсе. Предмет класса — НЕ качество ответов, а
+    единица записи, привязка к основанию и отказ на чужом основании."""
+
+    IDS = (1, 2)                                   # два обычных кейса → по 2 круга каждому
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="trpoint_")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        self.state = os.path.join(self.d, "точка.json")
+        self.v = os.path.join(self.d, "verdict.json")
+        self.ph = {"when": "с 6 по 11 октября"}
+        self.cases = [{"id": i, "name": "кейс %d" % i} for i in self.IDS]
+        self.casefile = os.path.join(self.d, "cases.json")
+        with io.open(self.casefile, "w", encoding="utf-8") as f:
+            json.dump({"cases": [{"id": i, "name": "кейс %d" % i} for i in range(1, 13)]}, f)
+        keep = (tr.run_case, tr.head_commit, tr.dirty_tracked, tr.tree_key, tr.placeholders)
+
+        def _restore():
+            (tr.run_case, tr.head_commit, tr.dirty_tracked, tr.tree_key,
+             tr.placeholders) = keep
+        self.addCleanup(_restore)
+
+    def quiet(self, *_a, **_k):
+        pass
+
+    def basis(self, **kw):
+        b = {"commit": C40, "corpus": "cases.json", "corpus_sha": "3bae79ae6967a195", "runs": 2,
+             "criterion": tr.criterion_text(2), "criterion_id": tr.CRITERION,
+             "tree": "0000dead0000beef", "ph": tr.ph_key(self.ph)}
+        b.update(kw)
+        return b
+
+    def doc(self):
+        with io.open(self.state, encoding="utf-8") as f:
+            return json.load(f)
+
+    def cases_in_point(self):
+        """Сколько ЗАКРЫТЫХ кейсов лежит в файле точки ПРЯМО СЕЙЧАС (по всем наборам)."""
+        try:
+            sets = self.doc().get("sets") or {}
+        except (OSError, ValueError):
+            return 0
+        return sum(len((s or {}).get("cases") or {}) for s in sets.values())
+
+    def gonka(self, point, outcomes=None, calls=None, spy=None, boom=()):
+        tr.run_case = _case_stub(outcomes, calls=calls, spy=spy, boom=boom)
+        return tr.run_corpus(self.cases, runs=2, ph=self.ph, log=self.quiet, point=point)
+
+    # ── п.1: ТОЧКА СТАВИТСЯ ПОСЛЕ КЕЙСА, А НЕ ПОСЛЕ КРУГА ───────────────────────────────────
+    def test_tochka_stavitsya_posle_keisa_a_ne_posle_kruga(self):
+        """Половина кругов исходом НЕ является: точка обязана появиться после ВСЕХ кругов кейса."""
+        seen = []
+        pt = tr.open_point(self.state, self.basis())
+        self.gonka(pt, spy=lambda _cid: seen.append(self.cases_in_point()))
+        # четыре круга (2 кейса × 2): к началу 1-го и 2-го круга кейса 1 в точке НЕТ НИЧЕГО,
+        # к началу обоих кругов кейса 2 — ровно один закрытый кейс.
+        self.assertEqual(seen, [0, 0, 1, 1],
+                         "точка встала после круга, а не после закрытого кейса")
+        self.assertEqual(self.cases_in_point(), 2)
+
+    def test_v_tochke_lezhit_ves_keis_celikom_a_ne_ego_itog(self):
+        pt = tr.open_point(self.state, self.basis())
+        self.gonka(pt)
+        rec = self.doc()["sets"][pt.key]["cases"]["1"]
+        self.assertEqual(len(rec["results"]), 2, "круги кейса в точку не легли")
+        self.assertEqual(rec["plan"]["rounds"], 2)
+        self.assertEqual((rec["checks_ok"], rec["checks_all"]), (2, 2))
+        self.assertEqual((rec["failed"], rec["unknown"]), ([], []))
+        self.assertEqual(rec["results"][0]["draft"], "черновик", "черновик круга потерян")
+
+    # ── п.5: ЗАКРЫТЫЙ КЕЙС НЕ ГОНЯЕТСЯ ЗАНОВО — ЧИСЛАМИ ─────────────────────────────────────
+    def test_zakrytyi_keis_ne_gonyaetsya_zanovo_chislami(self):
+        pt = tr.open_point(self.state, self.basis())
+        c1 = []
+        r1 = self.gonka(pt, calls=c1)
+        self.assertEqual(len(c1), 4, "первый заход прогнал не четыре круга")
+        self.assertEqual((pt.live_rounds, pt.taken_rounds), (4, 0))
+
+        pt2 = tr.open_point(self.state, self.basis())      # ТО ЖЕ основание
+        self.assertEqual(pt2.reset, "", "сброс на том же основании")
+        c2 = []
+        r2 = self.gonka(pt2, calls=c2)
+        self.assertEqual(c2, [], "уже закрытые кейсы гонялись ВТОРОЙ раз")
+        self.assertEqual((pt2.live_rounds, pt2.taken_rounds), (0, 4))
+        # числа набора совпали дословно: возобновление даёт ТОТ ЖЕ вердикт, а не похожий
+        self.assertEqual(r1[1:], r2[1:], "возобновлённый набор дал другие числа")
+        self.assertEqual(len(r2[0]), 4, "круги из точки не доехали до отчёта")
+
+    def test_obryv_posredi_nabora_stoit_odin_keis(self):
+        """Обрыв на кейсе 2 → кейс 1 закрыт и уцелел; второй заход платит только за кейс 2."""
+        pt = tr.open_point(self.state, self.basis())
+        with self.assertRaises(RuntimeError):
+            self.gonka(pt, boom=("2",))
+        self.assertEqual(self.cases_in_point(), 1, "закрытый кейс не пережил обрыва")
+        self.assertEqual(pt.live_rounds, 2)
+
+        pt2 = tr.open_point(self.state, self.basis())
+        c2 = []
+        res, passed, ok, allc, failed, unknown, plan = self.gonka(pt2, calls=c2)
+        self.assertEqual(c2, ["2", "2"], "второй заход заплатил не за один кейс")
+        self.assertEqual((pt2.taken, pt2.live), (["1"], ["2"]))
+        self.assertEqual((pt2.taken_rounds, pt2.live_rounds), (2, 2))
+        self.assertEqual((passed, ok, allc), (2, 4, 4), "склеенный набор посчитан неверно")
+        self.assertEqual(sorted(plan), ["1", "2"])
+
+    def test_krasnyi_i_neizvestno_lozhatsya_v_tochku_naravne_s_zelyonym(self):
+        """Точка — запись СОСТОЯВШЕГОСЯ замера, а не механизм повтора: перегон красного кейса
+        перекатывал бы лотерею головы до нужного исхода."""
+        pt = tr.open_point(self.state, self.basis())
+        self.gonka(pt, outcomes={"1": False, "2": "голова смолчала"})
+        pt2 = tr.open_point(self.state, self.basis())
+        c2 = []
+        _res, passed, ok, allc, failed, unknown, _plan = self.gonka(pt2, calls=c2)
+        self.assertEqual(c2, [], "красный и неизвестный кейсы перегнали заново")
+        self.assertEqual(passed, 0)
+        self.assertEqual((ok, allc), (0, 2), "счёт чеков красного кейса не пережил точку")
+        self.assertEqual(len(failed), 2, "красные круги из точки не назвались")
+        self.assertEqual(len(unknown), 2, "«неизвестно» из точки потерялось")
+
+    # ── п.2/п.3: ОТРИЦАТЕЛЬНЫЕ — ТОЧКА ВЫГЛЯДИТ ГОДНОЙ, А ОСНОВАНИЕ ДРУГОЕ ──────────────────
+    def _green_point_then(self, **other):
+        """Настоящий ЗЕЛЁНЫЙ набор под основанием А → открыть его основанием Б. → Point(Б)."""
+        pt = tr.open_point(self.state, self.basis())
+        self.gonka(pt)
+        sets = self.doc()["sets"]
+        stored = list(sets.values())[0]["cases"]
+        self.assertEqual(len(stored), 2, "стенд не собрал годной на вид точки")
+        self.assertTrue(all(c["plan"]["ok"] for c in stored.values()), "кейсы в точке не зелёные")
+        return tr.open_point(self.state, self.basis(**other))
+
+    def test_otr_chuzhoi_kommit_otkaz_a_ne_zelyonoe(self):
+        pt2 = self._green_point_then(commit=OTHER40)
+        self.assertTrue(pt2.reset, "чужое основание принято МОЛЧА")
+        self.assertIn("коммит", pt2.reset)
+        self.assertEqual(pt2.done, {}, "зелёные кейсы чужого коммита доиспользованы")
+        c2 = []
+        self.gonka(pt2, calls=c2)
+        self.assertEqual(len(c2), 4, "набор на новом основании начат не заново")
+
+    def test_otr_chuzhoi_korpus_otkaz(self):
+        pt2 = self._green_point_then(corpus_sha="ffffffffffffffff")
+        self.assertIn("отпечаток корпуса", pt2.reset)
+        self.assertEqual(pt2.done, {})
+
+    def test_otr_drugoe_chislo_krugov_otkaz(self):
+        pt2 = self._green_point_then(runs=3, criterion=tr.criterion_text(3))
+        self.assertIn("кругов базово", pt2.reset)
+        self.assertEqual(pt2.done, {})
+
+    def test_otr_drugoi_kriterii_otkaz(self):
+        pt2 = self._green_point_then(criterion="E: всем по два круга, зелёными обязаны быть все")
+        self.assertIn("критерий", pt2.reset)
+        self.assertEqual(pt2.done, {})
+
+    def test_otr_pravki_dereva_otkaz(self):
+        """Коммит тот же, а код на диске другой: правка дерева — это другой замер."""
+        pt2 = self._green_point_then(tree="11112222aaaabbbb")
+        self.assertIn("правки дерева", pt2.reset)
+        self.assertEqual(pt2.done, {})
+
+    def test_otr_drugie_podstanovki_otkaz(self):
+        """Даты уезжают сами (месяц, живая таблица периодов) — кейс на других датах не тот же."""
+        pt2 = self._green_point_then(ph=tr.ph_key({"when": "с 6 по 11 ноября"}))
+        self.assertIn("подстановки", pt2.reset)
+        self.assertEqual(pt2.done, {})
+
+    def test_otr_ne_znayu_sovpadeniem_ne_schitaetsya(self):
+        """Два «не знаю» — это не «то же самое», а два неизмеренных факта."""
+        self.assertTrue(tr.basis_diff(self.basis(tree="?"), self.basis(tree="?")),
+                        "«?» против «?» прошло как совпадение")
+        self.assertTrue(tr.basis_diff(self.basis(ph="?"), self.basis()))
+        self.assertEqual(tr.basis_diff(self.basis(), self.basis()), [],
+                         "одинаковые основания разошлись")
+
+    def test_otr_podlog_klyucha_ne_prokhodit_verim_polyam(self):
+        """Ключ основания подменён на наш, а поля внутри чужие → верим ПОЛЯМ, а не ключу."""
+        pt = tr.open_point(self.state, self.basis())
+        self.gonka(pt)
+        d = self.doc()
+        mine = d["sets"].pop(pt.key)
+        mine["basis"]["commit"] = OTHER40                  # поля чужие, ключ прежний
+        d["sets"][pt.key] = mine
+        with io.open(self.state, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        pt2 = tr.open_point(self.state, self.basis())
+        self.assertIn("основание НЕ то", pt2.reset)
+        self.assertEqual(pt2.done, {})
+
+    def test_prezhnii_nabor_ne_stiraetsya_a_lozhitsya_ryadom(self):
+        pt = tr.open_point(self.state, self.basis())
+        self.gonka(pt)
+        pt2 = tr.open_point(self.state, self.basis(commit=OTHER40))
+        self.gonka(pt2)
+        sets = self.doc()["sets"]
+        self.assertEqual(len(sets), 2, "прежний набор затёрт новым основанием")
+        self.assertIn(pt.key, sets)
+        self.assertEqual(len(sets[pt.key]["cases"]), 2, "прежний набор потерял кейсы")
+        # вернулись на прежнее основание — прежний набор нашёлся и доигрывается
+        pt3 = tr.open_point(self.state, self.basis())
+        self.assertEqual(pt3.reset, "")
+        self.assertEqual(sorted(pt3.done), ["1", "2"])
+
+    # ── битая/чужая запись КЕЙСА: гоняем заново и называем причину ──────────────────────────
+    def test_bitaya_zapis_keisa_gonyaetsya_zanovo_s_prichinoi(self):
+        pt = tr.open_point(self.state, self.basis())
+        self.gonka(pt)
+        pt2 = tr.open_point(self.state, self.basis())
+        pt2.done["1"] = {"id": "1", "plan": {"rounds": 2}}          # без кругов и счёта чеков
+        rec, why = pt2.get(self.cases[0], 2)
+        self.assertIsNone(rec)
+        self.assertIn("кругов", why)
+        c2 = []
+        self.gonka(pt2, calls=c2)
+        self.assertEqual(c2, ["1", "1"], "битая запись доиспользована")
+
+    def test_zapis_pod_chuzhim_klyuchom_ne_prinimaetsya(self):
+        pt = tr.open_point(self.state, self.basis())
+        self.gonka(pt)
+        pt.done["1"]["id"] = "9"
+        self.assertIn("чужим ключом", pt.get(self.cases[0], 2)[1])
+
+    def test_men_she_krugov_chem_trebuet_kriterii_ne_prinimaetsya(self):
+        pt = tr.open_point(self.state, self.basis())
+        self.gonka(pt)
+        pt.done["1"]["results"] = pt.done["1"]["results"][:1]
+        self.assertIn("кругов в записи", pt.get(self.cases[0], 2)[1])
+
+    def test_faila_tochki_ne_bylo_eto_ne_sbros(self):
+        pt = tr.open_point(os.path.join(self.d, "нет.json"), self.basis())
+        self.assertEqual((pt.reset, pt.done), ("", {}))
+
+    def test_bityi_fail_tochki_nazyvaet_prichinu_i_nachinaet_zanovo(self):
+        with io.open(self.state, "w", encoding="utf-8") as f:
+            f.write("{это не json")
+        pt = tr.open_point(self.state, self.basis())
+        self.assertIn("не разобран", pt.reset)
+        self.assertEqual(pt.done, {})
+
+    # ── вердикт ОБЯЗАН СКАЗАТЬ, что собран возобновлением ───────────────────────────────────
+    def test_verdikt_govorit_chto_sobran_vozobnovleniem(self):
+        pt = tr.open_point(self.state, self.basis())
+        self.gonka(pt)
+        pt2 = tr.open_point(self.state, self.basis())
+        _r, passed, ok, allc, failed, _unk, plan = self.gonka(pt2)
+        rec = tr.build_verdict(C40, 2, passed, ok, allc, 2, True, failed, "sha", now=1.0,
+                               plan=plan, point=tr.point_info(pt2))
+        self.assertEqual(rec["resumed"], 2)
+        self.assertEqual(rec["resumed_rounds"], 4)
+        self.assertEqual(sorted(rec["resumed_why"]), ["1", "2"])
+        self.assertEqual(rec["point_reset"], "")
+
+    def test_verdikt_nesyot_prichinu_sbrosa(self):
+        pt2 = self._green_point_then(commit=OTHER40)
+        rec = tr.build_verdict(OTHER40, 2, 2, 4, 4, 2, True, [], "sha", now=1.0,
+                               point=tr.point_info(pt2))
+        self.assertIn("коммит", rec["point_reset"])
+        self.assertEqual(rec["resumed"], 0)
+
+    def test_staryi_vyzov_bez_tochki_ne_slomalsya(self):
+        rec = tr.build_verdict(C40, 12, 12, 96, 96, 2, True, [], "sha", now=1.0)
+        self.assertEqual((rec["resumed"], rec["resumed_rounds"], rec["point_reset"]), (0, 0, ""))
+
+    # ── ГЛАВНЫЙ ОТРИЦАТЕЛЬНЫЙ ТЕСТ (п.3): годная на вид точка чужого основания НЕ зеленит ────
+    def test_otr_glavnyi_zelyonaya_tochka_chuzhogo_osnovaniya_ne_dayot_zelyonogo_verdikta(self):
+        """Точка на месте, 12 кейсов внутри, ВСЕ чеки зелёные — а основание другое. Прибор обязан
+        показать ОТКАЗ и померить заново, а не отдать чужую зелень за свою."""
+        big = [{"id": i, "name": "кейс %d" % i} for i in range(1, 13)]
+        tr.head_commit = lambda: C40
+        tr.dirty_tracked = lambda: []
+        tr.tree_key = lambda: "0000dead0000beef"
+        tr.placeholders = lambda: self.ph
+        # 1) ЗЕЛЁНЫЙ набор под коммитом C40 — настоящий, собранный живым писателем точки
+        basis_a = tr.point_basis(C40, cc.corpus_sha(self.casefile), 2, self.ph,
+                                 corpus="cases.json", tree="0000dead0000beef")
+        pt = tr.open_point(self.state, basis_a)
+        tr.run_case = _case_stub()
+        tr.run_corpus(big, runs=2, ph=self.ph, log=self.quiet, point=pt)
+        self.assertEqual(len(pt.done), 12)
+        self.assertTrue(all(v["plan"]["ok"] for v in pt.done.values()))
+
+        # 2) тот же файл точки, но ВЕРШИНА ДРУГАЯ, и живой прогон на ней КРАСНЫЙ
+        tr.head_commit = lambda: OTHER40
+        tr.run_case = _case_stub({str(i): False for i in range(1, 13)})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = tr.main(["--cases", self.casefile, "--out", self.v, "--runs", "2",
+                          "--no-write", "--state", self.state])
+        txt = out.getvalue()
+        self.assertEqual(rc, 1, "чужая зелёная точка выдана за свой зелёный вердикт")
+        self.assertIn("ИТОГ: RED", txt)
+        self.assertIn("ТОЧКА СБРОШЕНА", txt)
+        self.assertIn("коммит", txt)
+        self.assertIn("взято из неё кейсов 0", txt)
+        self.assertFalse(os.path.exists(self.v), "замер тронул реестр вердиктов")
+        # прежний зелёный набор при этом НЕ УНИЧТОЖЕН — он лежит рядом под своим основанием
+        self.assertEqual(len(self.doc()["sets"]), 2)
+        self.assertEqual(len(self.doc()["sets"][pt.key]["cases"]), 12)
+
+    def test_tochka_ne_otkryvaet_zapis_reestra(self):
+        """`--state` — это память о закрытых кейсах, а не вердикт: реестра он не касается."""
+        a = tr.build_parser().parse_args(["--state", self.state])
+        self.assertFalse(tr.writes_registry(a))
 
 
 if __name__ == "__main__":

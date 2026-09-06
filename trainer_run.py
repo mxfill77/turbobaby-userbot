@@ -76,11 +76,42 @@ Bridge — ЖИВОЙ (read-only GET прайса/зон/FAQ): ожидания 
     он стои́т в чужих командах и в подсказках уроков, и молчаливая смерть флага сделала бы их
     «неизвестной опцией» вместо честного замера. Вместе с `--write` побеждает ОН (fail-closed).
 
+КОНТРОЛЬНАЯ ТОЧКА НАБОРА — `--state <файл>` (07.09.2026). До этого дня прогон был МОНОЛИТЕН:
+результат появлялся ТОЛЬКО в конце (`build_verdict` после последнего круга), промежуточной записи
+не было ни одной, и обрыв на любой минуте стоил ВЕСЬ заход целиком плюс повтор за ним. Цена этого
+свойства измерена: 17 кейсов дают 38 кругов (13×2 + 4×3 классу), круг 43.7–46.6 с ⇒ 1661–1771 с
+при потолке захода 2700 с — то есть один медленный круг или одна пауза границы, и полный вердикт
+не помещается в заход ВООБЩЕ, а помещавшийся вчера пропадает целиком.
+  • ТОЧКА СТАВИТСЯ ПОСЛЕ КЕЙСА, А НЕ ПОСЛЕ КРУГА. Исход кейса решает критерий F ПОСЛЕ всех его
+    кругов (большинство 2 из 3); половина кругов исходом не является, и записанная как исход дала
+    бы зелёное там, где решения ещё нет. Поэтому единица записи — ЗАКРЫТЫЙ кейс со всеми кругами.
+  • ТОЧКА ПРИВЯЗАНА К ОСНОВАНИЮ ЦЕЛИКОМ (`point_basis`): коммит, корпус и его sha, число кругов,
+    критерий (ид И текст правила), отпечаток ПРАВОК дерева (`tree_key` — sha `git diff HEAD`) и
+    отпечаток ПОДСТАНОВОК (`ph_key` — даты и окно через границу сезонов уезжают сами). Любое
+    расхождение → набор начинается ЗАНОВО, а причина НАЗЫВАЕТСЯ ВСЛУХ (stdout + поле
+    `point_reset` самой записи вердикта). Молчаливое доиспользование чужой точки склеило бы
+    вердикт из двух версий кода — ровно тот подлог, ради запрета которого вердикт привязан к
+    коммиту целиком. «Не знаю» (`?` у отпечатка дерева/подстановок) совпадением НЕ считается.
+  • ПРЕЖНИЙ НАБОР НЕ СТИРАЕТСЯ: точка держит наборы ПО КЛЮЧУ ОСНОВАНИЯ (`sets`), и смена
+    основания заводит новый набор рядом, а не поверх. Вернулись на прежнее основание — прежний
+    набор нашёлся и доигрывается.
+  • КРАСНЫЙ И «НЕИЗВЕСТНО» ЛОЖАТСЯ В ТОЧКУ НАРАВНЕ С ЗЕЛЁНЫМ. Точка — запись СОСТОЯВШЕГОСЯ
+    замера, а не механизм повтора: перегонять красный кейс на возобновлении значило бы
+    перекатывать лотерею головы до нужного исхода.
+  • ЗАПИСЬ АТОМАРНА (`tmp` + `os.replace`): убитый посреди записи процесс оставляет прошлую точку
+    целой, а не половину файла.
+  • ТОЧКА НЕ РЕЕСТР И НЕ ВЕРДИКТ: `--state` не открывает `--write` ни одной веткой, ворот не
+    трогает и в клиентский контур не ходит.
+Что точка НЕ ловит честно: правку дерева ВНУТРИ захода (отпечаток снимается на входе, как и
+`clean`) — тот же остаток, что у привязки к коммиту, и сторожит его `head_moved`.
+
 Запуск:
     venv/Scripts/python.exe trainer_run.py                 # 12 кейсов × 2 прогона, ЗАМЕР без записи
     venv/Scripts/python.exe trainer_run.py --runs 1 --only 3                # разведка одного кейса
     venv/Scripts/python.exe trainer_run.py --runs 2 --write   # ЗАМЕР + ЗАПИСЬ = выкатка при зелёном
     venv/Scripts/python.exe trainer_run.py --report docs/artifacts/<файл>.md
+    venv/Scripts/python.exe trainer_run.py --state tmp/trainer_state/набор.json --only 1,2,3
+    venv/Scripts/python.exe trainer_run.py --state tmp/trainer_state/набор.json   # добор остатка
 Код выхода: 0 — вердикт зелёный (записан, если просили `--write`); 1 — не зелёный; 2 — прогон не
 состоялся (инфраструктура: нет корпуса, git молчит, HEAD уехал) — вердикта нет вовсе, ворота держат.
 """
@@ -815,6 +846,223 @@ def rounds_line(by_case):
     return " ".join("%s:%s" % (k, by_case[k]) for k in sorted(by_case, key=_num_key))
 
 
+# ══════════════════ КОНТРОЛЬНАЯ ТОЧКА НАБОРА: единица — ЗАКРЫТЫЙ КЕЙС ════════════════════════
+# ЗАЧЕМ (арифметика, а не вкус). Прогон вердикта монолитен: 38 кругов × 43.7–46.6 с = 1661–1771 с
+# при потолке захода 2700 с. Контрольной точки у него не было ни одной, поэтому таймаут стоил не
+# единицу работы, а ВЕСЬ заход и повтор за ним. Точка делает цену обрыва равной ОДНОМУ кейсу.
+#
+# ПОЧЕМУ ПОСЛЕ КЕЙСА, А НЕ ПОСЛЕ КРУГА. Исход кейса решает критерий F ПОСЛЕ ВСЕХ его кругов
+# (класс «обязательное упоминание» — большинство ≥2 из 3). Круг исходом не является: записанный
+# как исход первый зелёный круг кейса класса дал бы зелёное там, где решения ещё нет, а первый
+# красный — красное у кейса, который критерий зачтёт. Поэтому единица записи — закрытый кейс
+# целиком, со всеми своими кругами, планом и прощёнными кругами.
+#
+# ПОЧЕМУ ОСНОВАНИЕ ЦЕЛИКОМ. Точка обещает «эти кейсы уже померены», и обещание держится ровно
+# настолько, насколько совпадает ВСЁ, от чего зависел замер. Совпал один коммит — мало: другой
+# корпус, другое число кругов, другой критерий зачёта или другие подставленные даты дают ДРУГОЙ
+# замер под тем же именем. Расхождение любого поля → набор ЗАНОВО и вслух.
+
+POINT_KEEP = 8                    # столько наборов разных оснований точка держит рядом
+
+_BASIS_WORDS = {"commit": "коммит", "corpus": "корпус", "corpus_sha": "отпечаток корпуса",
+                "runs": "кругов базово", "criterion": "критерий (правило)",
+                "criterion_id": "критерий (ид)", "tree": "правки дерева",
+                "ph": "подстановки (даты)"}
+
+
+def tree_key():
+    """Отпечаток ПРАВОК рабочего дерева против HEAD (sha256, 16 hex) → '?' — git не ответил.
+
+    Коммита мало: python грузит модули С ДИСКА, и на грязном дереве код опознаётся НЕ коммитом.
+    Берём весь патч `git diff HEAD` (не список имён): дважды правленный один файл даёт тот же
+    список путей и РАЗНЫЙ код. Чистое дерево даёт стабильный отпечаток пустого патча.
+    '?' — это ТРЕТИЙ ИСХОД, и он не равен ни одному другому значению (см. `basis_diff`)."""
+    rc, out = _git(["diff", "HEAD"])
+    if rc != 0:
+        return "?"
+    return hashlib.sha256((out or "").encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def ph_key(ph):
+    """Отпечаток ПОДСТАНОВОК кейсов (sha256, 16 hex) → '?' — посчитать нечем.
+
+    Даты уезжают САМИ (месяц в `placeholders`, окно через границу сезонов — из живой таблицы
+    периодов), а кейс, померенный на других датах, — это другой замер, а не тот же."""
+    try:
+        raw = json.dumps(ph or {}, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return "?"
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def point_basis(commit, sha, runs, ph, corpus=None, tree=None):
+    """ОСНОВАНИЕ набора — всё, от чего зависит замер кейса. → dict.
+
+    `tree`/`ph` можно подать готовыми (тесты и повторные вызовы), иначе считаются здесь."""
+    return {"commit": str(commit or ""),
+            "corpus": str(corpus or os.path.basename(CASES_FILE)),
+            "corpus_sha": str(sha or ""),
+            "runs": int(runs),
+            "criterion": criterion_text(runs),
+            "criterion_id": CRITERION,
+            "tree": tree_key() if tree is None else str(tree),
+            "ph": ph_key(ph) if not isinstance(ph, str) else ph}
+
+
+def basis_key(basis):
+    """Ключ основания (sha256, 16 hex) — под ним набор лежит в файле точки."""
+    raw = json.dumps(basis or {}, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _val(v):
+    """Значение поля основания для человека: длинное режем, чтобы причина читалась строкой."""
+    s = str(v)
+    return s if len(s) <= 46 else s[:43] + "…"
+
+
+def basis_diff(old, new):
+    """ЧЕМ основания разошлись. → список дословных причин ('' пустой список = сошлись целиком).
+
+    Незнание (`?` у отпечатка дерева или подстановок) совпадением НЕ считается НИ РАЗУ, даже когда
+    '?' стои́т с обеих сторон: два «не знаю» — это не «то же самое», а два неизмеренных факта."""
+    out = []
+    for k in sorted(set(old or {}) | set(new or {})):
+        a, b = (old or {}).get(k), (new or {}).get(k)
+        word = _BASIS_WORDS.get(k, k)
+        if k in ("tree", "ph") and (str(a) == "?" or str(b) == "?"):
+            out.append("%s: назвать нечем (%s против %s) — «не знаю» совпадением не считается"
+                       % (word, _val(a), _val(b)))
+            continue
+        if a != b:
+            out.append("%s: %s против %s" % (word, _val(a), _val(b)))
+    return out
+
+
+def case_rec_bad(rec, case, runs):
+    """Годна ли запись кейса из точки. → '' (годна) либо дословная причина отказа.
+
+    Fail-closed: битую, чужую или разошедшуюся по числу кругов запись НЕ чиним и НЕ доверяем ей —
+    кейс гоняется заново, а причина называется."""
+    if not isinstance(rec, dict):
+        return "запись кейса битая (не объект)"
+    if str(rec.get("id")) != str(case.get("id")):
+        return "запись лежит под чужим ключом (в ней id=%s)" % _val(rec.get("id"))
+    plan = rec.get("plan")
+    if not isinstance(plan, dict) or not isinstance(rec.get("results"), list):
+        return "в записи нет плана либо кругов"
+    want = rounds_for(case, runs)
+    if int(plan.get("rounds") or 0) != want or len(rec["results"]) != want:
+        return ("кругов в записи %s (план) / %d (фактом), а критерий требует %d"
+                % (_val(plan.get("rounds")), len(rec["results"]), want))
+    for fld in ("checks_ok", "checks_all"):
+        if not isinstance(rec.get(fld), int):
+            return "в записи нет счёта чеков (%s)" % fld
+    if not isinstance(rec.get("failed"), list) or not isinstance(rec.get("unknown"), list):
+        return "в записи нет списков провалов/неизвестного"
+    return ""
+
+
+class Point(object):
+    """Контрольная точка набора: ЗАКРЫТЫЕ кейсы ОДНОГО основания, переживающие обрыв прогона.
+
+    Держит весь документ точки в памяти (`doc`) и переписывает его целиком атомарно после каждого
+    закрытого кейса. Наборы ЧУЖИХ оснований в документе не трогаются — они лежат рядом."""
+
+    def __init__(self, path, basis, doc=None, done=None, reset=""):
+        self.path = str(path)
+        self.basis = dict(basis or {})
+        self.key = basis_key(self.basis)
+        self.doc = doc if isinstance(doc, dict) else {}
+        self.done = dict(done or {})
+        self.reset = str(reset or "")
+        self.taken, self.taken_rounds = [], 0        # взято из точки: кейсы и их круги
+        self.live, self.live_rounds = [], 0          # прогнано живьём в ЭТОМ заходе
+
+    def get(self, case, runs):
+        """Годная запись ЭТОГО кейса → (запись | None, причина отказа | '')."""
+        rec = self.done.get(str(case.get("id")))
+        if rec is None:
+            return None, ""
+        why = case_rec_bad(rec, case, runs)
+        return (None, why) if why else (rec, "")
+
+    def put(self, rec):
+        """Кейс ЗАКРЫТ → в точку, на диск, атомарно. → (записано?, причина отказа | путь)."""
+        self.done[str(rec.get("id"))] = rec
+        sets = self.doc.get("sets") if isinstance(self.doc.get("sets"), dict) else {}
+        now = time.time()
+        sets[self.key] = {"basis": self.basis, "ts": now,
+                          "when": datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
+                          "cases": self.done}
+        if len(sets) > POINT_KEEP:
+            old = sorted(sets.items(), key=lambda kv: (kv[1] or {}).get("ts", 0))
+            for k, _v in old[:len(sets) - POINT_KEEP]:
+                if k != self.key:
+                    sets.pop(k, None)
+        self.doc["sets"] = sets
+        tmp = self.path + ".tmp"
+        try:
+            d = os.path.dirname(os.path.abspath(self.path))
+            if d and not os.path.isdir(d):
+                os.makedirs(d)
+            with io.open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.doc, f, ensure_ascii=False)
+            os.replace(tmp, self.path)              # атомарно: убитая запись не рвёт прошлую точку
+        except OSError as e:
+            return False, "точка не записана: %s" % e
+        return True, self.path
+
+
+def open_point(path, basis):
+    """Открыть контрольную точку по её ОСНОВАНИЮ. → Point (её `reset` — причина сброса либо '').
+
+    Расхождение основания НЕ чинится и НЕ доиспользуется частями: набор начинается ЗАНОВО, причину
+    несёт `reset`, и её обязан сказать вслух вызывающий. Прежний набор при этом НЕ стирается — он
+    остаётся в файле под своим ключом основания и найдётся, если вернуться на то основание.
+    Отсутствия файла сбросом НЕ зовём: точки просто ещё не было."""
+    doc = {}
+    try:
+        with io.open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except OSError:
+        return Point(path, basis)                        # точки ещё не было — это не сброс
+    except ValueError as e:
+        return Point(path, basis, reset="файл точки не разобран (%s) — набор начат ЗАНОВО" % e)
+    if not isinstance(doc, dict):
+        return Point(path, basis, reset="файл точки не объект — набор начат ЗАНОВО")
+    sets = doc.get("sets") if isinstance(doc.get("sets"), dict) else {}
+    mine = sets.get(basis_key(basis))
+    if isinstance(mine, dict):
+        diff = basis_diff(mine.get("basis") or {}, basis)
+        if diff:
+            # Ключ сошёлся, а поля нет — подлог либо битый файл. Верим ПОЛЯМ, а не ключу.
+            return Point(path, basis, doc,
+                         reset="набор под тем же ключом, но основание НЕ то: " + "; ".join(diff))
+        done = mine.get("cases") if isinstance(mine.get("cases"), dict) else {}
+        return Point(path, basis, doc, done)
+    if not sets:
+        return Point(path, basis, doc)                   # файл есть, наборов нет — не сброс
+    last = max(sets.values(), key=lambda v: (v or {}).get("ts", 0) if isinstance(v, dict) else 0)
+    cases = (last or {}).get("cases") if isinstance(last, dict) else {}
+    diff = basis_diff((last or {}).get("basis") or {}, basis)
+    return Point(path, basis, doc,
+                 reset=("в точке лежит набор ДРУГОГО ОСНОВАНИЯ (закрытых кейсов %d, записан %s) — "
+                        "он НЕ доиспользуется, набор начат ЗАНОВО; расхождение: %s"
+                        % (len(cases if isinstance(cases, dict) else {}),
+                           _val((last or {}).get("when") or "?"),
+                           "; ".join(diff) or "поля основания не названы (запись без основания)")))
+
+
+def point_info(point):
+    """Что сказать вердикту про контрольную точку. → dict (пустой — точки не было вовсе)."""
+    if point is None:
+        return {}
+    return {"path": point.path, "basis": point.key, "reset": point.reset,
+            "taken": list(point.taken), "taken_rounds": int(point.taken_rounds),
+            "live": list(point.live), "live_rounds": int(point.live_rounds)}
+
+
 # ─────────────────────────────────────── прогон ──────────────────────────────────────────────
 
 def run_case(case, ph, log=print):
@@ -856,21 +1104,89 @@ def run_case(case, ph, log=print):
             "checks": checks, "draft": draft, "note": note}
 
 
-def run_corpus(cases, runs=2, ph=None, log=print):
+def run_one_case(case, runs, ph, log=print):
+    """ВСЕ круги ОДНОГО кейса + его исход по критерию → САМОДОСТАТОЧНАЯ запись кейса (dict).
+
+    Это ЕДИНИЦА НАБОРА и единица контрольной точки: раньше этого места исхода не существует
+    (критерий F решает после всех кругов), позже — уже не нужно ничего пересчитывать, потому что
+    всё, чем кейс входит в вердикт, лежит в этой записи: `results` (круги с черновиками и чеками),
+    `plan` (класс, круги, нужное большинство, зелёные/красные/неизвестные, прощённые),
+    `checks_ok`/`checks_all` (счёт чеков ЭТОГО кейса), `failed`/`unknown` (его строки для вердикта).
+
+    Запись обязана быть JSON-сериализуемой целиком — на ней стои́т возобновление.
+
+    Чеки круга с исходом НЕИЗВЕСТНО и чеки ПРОЩЁННОГО критерием круга не идут НИ в `checks_ok`,
+    НИ в `checks_all`, НИ в `failed`: они не зелёные (доказывать нечем либо доказано обратное) и не
+    красные для вердикта (кейс зачтён большинством). Иначе вышло бы одно из двух вранья — либо
+    зелень над текстом, который признан негодным, либо красный вердикт у кейса, который критерий
+    зачёл."""
+    cid = case.get("id")
+    klass = case_class(case)
+    total = rounds_for(case, runs)
+    need = need_green(total, klass)
+    mine, failed, unknown = [], [], []
+    checks_ok = checks_all = 0
+    for r in range(1, total + 1):
+        t0 = time.time()
+        res = run_case(case, ph, log=log)
+        res["run"] = r
+        res["rounds"] = total
+        res["sec"] = round(time.time() - t0, 1)
+        mine.append(res)
+        skipped = [c["name"] for c in res["checks"] if c.get("skipped")]
+        log("  [%s] кейс %s «%s» прогон %d/%d — %s (%.0fс)%s"
+            % ("UNK" if res.get("unknown") else ("OK " if res["ok"] else "RED"), cid,
+               case.get("name"), r, total,
+               ("НЕИЗВЕСТНО: " + str(res["unknown"])) if res.get("unknown") else
+               ("все чеки зелёные" if res["ok"] else
+                "провалено: " + ", ".join(c["name"] for c in res["checks"]
+                                          if not c["ok"] and not c.get("skipped"))),
+               res["sec"], (" [снято: " + ", ".join(skipped) + "]") if skipped else ""))
+    greens = [x for x in mine if x["ok"] and not x.get("unknown")]
+    unks = [x for x in mine if x.get("unknown")]
+    # «Неизвестно» гасит кейс ЦЕЛИКОМ и мимо большинства: судить нечем — значит не зачтено.
+    case_ok = len(greens) >= need and not unks
+    forgiven = []
+    for res in mine:
+        r = res["run"]
+        if res.get("unknown"):
+            unknown.append(f"{cid}/{r} {res['unknown']}")
+            continue
+        bad = [c["name"] for c in res["checks"] if not c["ok"] and not c.get("skipped")]
+        if case_ok and bad:
+            # МЕНЬШИНСТВО у зачтённого кейса: круг остаётся в отчёте красным и с черновиком,
+            # но вердикту не идёт ни зелёным, ни красным — как круг «неизвестно».
+            res["tolerated"] = ("прощён критерием %s: класс «%s», зелёных кругов %d из %d "
+                                "(нужно %d)" % (CRITERION, klass, len(greens), total, need))
+            forgiven.append("%s/%s %s" % (cid, r, ", ".join(bad)))
+            log("  [ПРОЩЁН] кейс %s прогон %d/%d — %s" % (cid, r, total, res["tolerated"]))
+            continue
+        for c in res["checks"]:
+            if c.get("skipped"):
+                continue                           # снят с причиной — в счёт не идёт (виден в отчёте)
+            checks_all += 1
+            checks_ok += 1 if c["ok"] else 0
+            if not c["ok"]:
+                failed.append(f"{cid}/{r} {c['name']}")
+    return {"id": str(cid), "results": mine,
+            "plan": {"class": klass, "rounds": total, "need": need, "green": len(greens),
+                     "red": len(mine) - len(greens) - len(unks), "unknown": len(unks),
+                     "ok": bool(case_ok), "tolerated": forgiven},
+            "checks_ok": checks_ok, "checks_all": checks_all,
+            "failed": failed, "unknown": unknown}
+
+
+def run_corpus(cases, runs=2, ph=None, log=print, point=None):
     """Корпус × круги → (результаты, passed_cases, checks_passed, checks_total, failed, unknown,
     plan).
 
     СКОЛЬКО КРУГОВ у кейса и СКОЛЬКО ЗЕЛЁНЫХ ему нужно, решает КРИТЕРИЙ F (узел «КРИТЕРИЙ
-    НАБОРА» выше): кейс класса «обязательное упоминание» идёт `CLASS_RUNS` кругов и зачитывается
-    БОЛЬШИНСТВОМ, остальные — прежние `runs` кругов, и зелёными обязаны быть все. Исход кейса
-    решается ПОСЛЕ всех его кругов, а не накоплением по ходу: пока круги не кончились, неизвестно,
-    меньшинство ли этот красный.
+    НАБОРА» выше) — и то и другое живёт в `run_one_case`, здесь идёт только СБОРКА набора.
 
-    Чеки круга с исходом НЕИЗВЕСТНО и чеки ПРОЩЁННОГО критерием круга не идут НИ в
-    `checks_passed`, НИ в `checks_total`, НИ в `failed`: они не зелёные (доказывать нечем либо
-    доказано обратное) и не красные для вердикта (кейс зачтён большинством). Иначе вышло бы одно
-    из двух вранья — либо зелень над текстом, который признан негодным, либо красный вердикт у
-    кейса, который критерий зачёл.
+    `point` — контрольная точка (`open_point`) либо None. С точкой каждый ЗАКРЫТЫЙ кейс тут же
+    ложится на диск, а кейс, уже лежащий в точке ГОДНОЙ записью, НЕ ГОНЯЕТСЯ ВОВСЕ: его круги
+    берутся как есть. Отказ точки в записи прогон НЕ РОНЯЕТ (замер дороже точки), но называется
+    вслух — иначе следующий заход молча начал бы набор сначала.
 
     `plan` — dict id → {class, rounds, need, green, red, unknown, ok, tolerated}: из него вердикт
     берёт число кругов КАЖДОГО кейса и список прощённых кругов, чтобы читатель вердикта видел
@@ -880,64 +1196,40 @@ def run_corpus(cases, runs=2, ph=None, log=print):
     passed = checks_ok = checks_all = 0
     for case in cases:
         cid = case.get("id")
-        klass = case_class(case)
-        total = rounds_for(case, runs)
-        need = need_green(total, klass)
-        mine = []
-        for r in range(1, total + 1):
-            t0 = time.time()
-            res = run_case(case, ph, log=log)
-            res["run"] = r
-            res["rounds"] = total
-            res["sec"] = round(time.time() - t0, 1)
-            results.append(res)
-            mine.append(res)
-            skipped = [c["name"] for c in res["checks"] if c.get("skipped")]
-            log("  [%s] кейс %s «%s» прогон %d/%d — %s (%.0fс)%s"
-                % ("UNK" if res.get("unknown") else ("OK " if res["ok"] else "RED"), cid,
-                   case.get("name"), r, total,
-                   ("НЕИЗВЕСТНО: " + str(res["unknown"])) if res.get("unknown") else
-                   ("все чеки зелёные" if res["ok"] else
-                    "провалено: " + ", ".join(c["name"] for c in res["checks"]
-                                              if not c["ok"] and not c.get("skipped"))),
-                   res["sec"], (" [снято: " + ", ".join(skipped) + "]") if skipped else ""))
-        greens = [x for x in mine if x["ok"] and not x.get("unknown")]
-        unks = [x for x in mine if x.get("unknown")]
-        # «Неизвестно» гасит кейс ЦЕЛИКОМ и мимо большинства: судить нечем — значит не зачтено.
-        case_ok = len(greens) >= need and not unks
-        forgiven = []
-        for res in mine:
-            r = res["run"]
-            if res.get("unknown"):
-                unknown.append(f"{cid}/{r} {res['unknown']}")
-                continue
-            bad = [c["name"] for c in res["checks"] if not c["ok"] and not c.get("skipped")]
-            if case_ok and bad:
-                # МЕНЬШИНСТВО у зачтённого кейса: круг остаётся в отчёте красным и с черновиком,
-                # но вердикту не идёт ни зелёным, ни красным — как круг «неизвестно».
-                res["tolerated"] = ("прощён критерием %s: класс «%s», зелёных кругов %d из %d "
-                                    "(нужно %d)" % (CRITERION, klass, len(greens), total, need))
-                forgiven.append("%s/%s %s" % (cid, r, ", ".join(bad)))
-                log("  [ПРОЩЁН] кейс %s прогон %d/%d — %s" % (cid, r, total, res["tolerated"]))
-                continue
-            for c in res["checks"]:
-                if c.get("skipped"):
-                    continue                       # снят с причиной — в счёт не идёт (виден в отчёте)
-                checks_all += 1
-                checks_ok += 1 if c["ok"] else 0
-                if not c["ok"]:
-                    failed.append(f"{cid}/{r} {c['name']}")
-        plan[str(cid)] = {"class": klass, "rounds": total, "need": need, "green": len(greens),
-                          "red": len(mine) - len(greens) - len(unks), "unknown": len(unks),
-                          "ok": bool(case_ok), "tolerated": forgiven}
-        passed += 1 if case_ok else 0
+        rec, why = point.get(case, runs) if point is not None else (None, "")
+        if why:
+            log("  [ТОЧКА ОТКАЗ] кейс %s: %s — кейс гоняется ЗАНОВО" % (cid, why))
+        if rec is None:
+            rec = run_one_case(case, runs, ph, log=log)
+            if point is not None:
+                point.live.append(str(cid))
+                point.live_rounds += int(rec["plan"]["rounds"])
+                wok, where = point.put(rec)
+                log("  [ТОЧКА] кейс %s закрыт и записан → %s" % (cid, where) if wok else
+                    "  [ТОЧКА НЕ ЗАПИСАНА] кейс %s: %s — при обрыве он будет гоняться заново"
+                    % (cid, where))
+        else:
+            p = rec["plan"]
+            point.taken.append(str(cid))
+            point.taken_rounds += int(p["rounds"])
+            log("  [ИЗ ТОЧКИ] кейс %s «%s» — %d кругов НЕ гонялись: %s (зелёных %d из %d, нужно "
+                "%d, неизвестно %d)"
+                % (cid, case.get("name"), p["rounds"], "ЗАЧТЁН" if p["ok"] else "НЕ зачтён",
+                   p["green"], p["rounds"], p["need"], p["unknown"]))
+        results.extend(rec["results"])
+        plan[str(cid)] = rec["plan"]
+        checks_ok += int(rec["checks_ok"])
+        checks_all += int(rec["checks_all"])
+        failed.extend(rec["failed"])
+        unknown.extend(rec["unknown"])
+        passed += 1 if rec["plan"]["ok"] else 0
     return results, passed, checks_ok, checks_all, failed, unknown, plan
 
 
 # ─────────────────────────────────────── вердикт ─────────────────────────────────────────────
 
 def build_verdict(commit, cases_total, passed, checks_ok, checks_all, runs, clean, failed,
-                  sha, now=None, unknown=None, bind=None, plan=None):
+                  sha, now=None, unknown=None, bind=None, plan=None, point=None):
     """Запись вердикта РОВНО в том виде, который читают ворота (client_contour.trainer_verdict).
 
     `unknown` — список исходов «судить нечего» (молчащая голова). Он ГАСИТ зелёное, но красным
@@ -965,11 +1257,22 @@ def build_verdict(commit, cases_total, passed, checks_ok, checks_all, runs, clea
     оказался меньшинством», и обязан лезть в код за правилом — ровно то, что чинится.
     Поле `runs` остаётся БАЗОВЫМ числом кругов (его и сверяют ворота с `TRAINER_MIN_RUNS`);
     сколько кругов вышло на самом деле, говорят `runs_by_case` и `runs_max` — два разных факта,
-    и сводить их в одно число значило бы соврать одному из читателей."""
+    и сводить их в одно число значило бы соврать одному из читателей.
+
+    `point` — сводка контрольной точки (`point_info`). Из неё в запись ложатся ЧЕТЫРЕ поля,
+    которых до 07.09.2026 не было ни одного: `resumed`/`resumed_why` — сколько кейсов ВЗЯТО ИЗ
+    ТОЧКИ (в этом заходе их не гоняли) и какие именно, `resumed_rounds` — сколько кругов за ними
+    стои́т, `point_reset` — почему набор пришлось начать заново. ЗЕЛЁНОГО ЭТИ ПОЛЯ НЕ МЕНЯЮТ и
+    менять не должны: точка привязана к основанию ЦЕЛИКОМ (коммит, корпус, круги, критерий,
+    правки дерева, подстановки), и набор, собранный за два захода на одном основании, — это тот
+    же набор, а не склейка двух. Но читатель вердикта обязан ВИДЕТЬ, что он собран возобновлением,
+    а не восстанавливать это чтением логов."""
     now = time.time() if now is None else now
     unknown = list(unknown or [])
     bind = bind or {}
     plan = plan or {}
+    point = point or {}
+    taken = [str(x) for x in (point.get("taken") or [])]
     by_case = {str(k): int((v or {}).get("rounds") or 0) for k, v in plan.items()}
     tolerated = [t for _k, v in sorted(plan.items(), key=lambda kv: _num_key(kv[0]))
                  for t in ((v or {}).get("tolerated") or [])]
@@ -987,6 +1290,9 @@ def build_verdict(commit, cases_total, passed, checks_ok, checks_all, runs, clea
         "runs_by_case": by_case, "runs_line": rounds_line(by_case),
         "runs_max": max(by_case.values()) if by_case else int(runs),
         "tolerated": len(tolerated), "tolerated_why": tolerated[:40],
+        "resumed": len(taken), "resumed_why": taken[:40],
+        "resumed_rounds": int(point.get("taken_rounds") or 0),
+        "point_reset": str(point.get("reset") or ""),
         "checks_passed": checks_ok, "checks_total": checks_all,
         "cases": passed, "cases_total": cases_total, "runs": runs, "clean": bool(clean),
         "head_moved": head_moved, "head_after": str(bind.get("head_after") or ""),
@@ -1055,6 +1361,13 @@ def report_md(rec, results, commit, runs):
                 if rec.get("tolerated") else ""), "",
              f"**Критерий:** {rec.get('criterion') or '—'}", "",
              f"**Кругов по кейсам:** `{rec.get('runs_line') or '—'}`", "",
+             ("**Контрольная точка:** взято из неё кейсов %d (кругов %d — в этом заходе они НЕ "
+              "гонялись): %s" % (rec.get("resumed") or 0, rec.get("resumed_rounds") or 0,
+                                 ", ".join(rec.get("resumed_why") or []) or "—")
+              if rec.get("resumed") else "**Контрольная точка:** не использована — весь набор "
+              "прогнан в один заход"), "",
+             *([f"**ТОЧКА СБРОШЕНА (набор начат заново):** {rec['point_reset']}", ""]
+               if rec.get("point_reset") else []),
              "| # | кейс | прогон | итог | чеки | провалено |", "|---|---|---|---|---|---|"]
     for r in results:
         live = [c for c in r["checks"] if not c.get("skipped")]
@@ -1103,6 +1416,13 @@ def build_parser():
                     help="явный замер без записи; сегодня это и есть умолчание, а вместе с "
                          "--write побеждает этот ключ (fail-closed)")
     ap.add_argument("--drafts", action="store_true", help="печатать черновики целиком")
+    # КОНТРОЛЬНАЯ ТОЧКА (07.09.2026). Ключ НЕ трогает реестр и НЕ подразумевает `--write`:
+    # точка — это память о ЗАКРЫТЫХ кейсах, а не вердикт. Подробности — шапка модуля.
+    ap.add_argument("--state", default="",
+                    help="файл КОНТРОЛЬНОЙ ТОЧКИ: закрытый кейс ложится в него сразу, и на "
+                         "следующем заходе с тем же ОСНОВАНИЕМ (коммит, корпус, круги, критерий, "
+                         "правки дерева, подстановки) он не гоняется заново; расхождение "
+                         "основания начинает набор ЗАНОВО и говорит об этом вслух")
     return ap
 
 
@@ -1151,11 +1471,26 @@ def main(argv=None):
           % (CRITERION, CLASS_NAME, len(in_class), ", ".join(in_class) or "нет", CLASS_RUNS,
              need_green(CLASS_RUNS, CLASS_NAME), CLASS_RUNS, a.runs, plan_rounds))
     ph = placeholders()
-    results, passed, ok, allc, failed, unknown, plan = run_corpus(cases, runs=a.runs, ph=ph)
+    # КОНТРОЛЬНАЯ ТОЧКА. Основание собирается ЗДЕСЬ и целиком — до первого круга, чтобы сброс был
+    # объявлен ДО того, как заход потратит хоть одну минуту головы.
+    point = None
+    if a.state:
+        basis = point_basis(commit, sha, a.runs, ph, corpus=os.path.basename(a.cases))
+        point = open_point(a.state, basis)
+        if point.reset:
+            print("ТОЧКА СБРОШЕНА — НАБОР НАЧАТ ЗАНОВО: " + point.reset)
+        print("КОНТРОЛЬНАЯ ТОЧКА: %s · основание %s (коммит %s, корпус %s, кругов %d, критерий %s, "
+              "правки дерева %s, подстановки %s) · закрытых кейсов в ней %d: %s"
+              % (a.state, point.key, commit[:7], basis["corpus_sha"], basis["runs"],
+                 basis["criterion_id"], basis["tree"], basis["ph"], len(point.done),
+                 ", ".join(sorted(point.done, key=_num_key)) or "нет"))
+    results, passed, ok, allc, failed, unknown, plan = run_corpus(cases, runs=a.runs, ph=ph,
+                                                                  point=point)
 
     verify_head(bind)                        # вершина на выходе: сдвиг НАЗЫВАЕТСЯ, а не глотается
+    pinfo = point_info(point)
     rec = build_verdict(commit, total, passed, ok, allc, a.runs, clean, failed, sha,
-                        unknown=unknown, bind=bind, plan=plan)
+                        unknown=unknown, bind=bind, plan=plan, point=pinfo)
     print("\nИТОГ: %s — кейсов %d/%d, чеков %d/%d, прогонов %d, дерево %s%s"
           % (rec["result"].upper(), rec["cases"], rec["cases_total"], rec["checks_passed"],
              rec["checks_total"], rec["runs"],
@@ -1165,6 +1500,13 @@ def main(argv=None):
     # читалось из вывода прогона, а не восстанавливалось чтением кода.
     print("КРИТЕРИЙ: " + rec["criterion"])
     print("КРУГОВ ПО КЕЙСАМ: " + rec["runs_line"])
+    if point is not None:
+        # ЧИСЛА ВОЗОБНОВЛЕНИЯ — двумя счётчиками, а не одним: «сколько сэкономлено» и «сколько
+        # стоил этот заход» — разные факты, и сводить их в одно число значило бы соврать обоим.
+        print("ТОЧКА: взято из неё кейсов %d (кругов %d — голову не звали ни разу) · прогнано "
+              "живьём кейсов %d (кругов %d) · точка: %s"
+              % (len(point.taken), point.taken_rounds, len(point.live), point.live_rounds,
+                 point.path))
     if rec["tolerated"]:
         print("ПРОЩЕНО БОЛЬШИНСТВОМ (в зачёт чеков не идёт): " + "; ".join(rec["tolerated_why"][:12]))
     if rec["head_moved"]:
