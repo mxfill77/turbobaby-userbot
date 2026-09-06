@@ -319,6 +319,15 @@ def expectations(case, transcript, note, hints):
         "avail": suggest.availability_from_note(note),
         "delivery_line": suggest._delivery_block_from_note(note),
         "sheet_line": suggest._sheet_block_from_note(note),
+        # МИНИМАЛЬНЫЙ СРОК — из ТОЙ ЖЕ записки, что питает черновик. Пусто → ветка «короче
+        # минимума» не срабатывала, гарантии в этом кейсе нет вовсе и чека тоже.
+        #   `pairs` — предмет чека КОДА: ПОСТУСЛОВИЕ гарантии (правило звучит клиенту). Мерить
+        #     ДОСЛОВНОЙ строкой кода нельзя: сказала голова сама — код молчит по построению,
+        #     и дословного совпадения не будет НИКОГДА (живой замер 06.09: 2 круга из 3).
+        #   `line` — та самая дословная строка; нужна `llm_prose`, чтобы текст КОДА не шёл голове
+        #     в зачёт, и развилке require_any.
+        "min_term_pairs": suggest.min_term_pairs_from_note(note),
+        "min_term_line": suggest.min_term_line_from_note(note, case.get("lang", "ru")),
         "zone": case.get("zone"),
         "zone_price": case.get("zone_price"),
         "full_data": bool(hints.get("model") and hints.get("has_dates") and hints.get("maps_link")),
@@ -338,10 +347,10 @@ def _zone_expectation(exp):
 
 
 def _code_blocks(exp):
-    """Строки, которые вставляет в черновик КОД ДОСЛОВНО (quote/доставка/сетка) — их текст берётся
-    из листа как есть и авторству LLM не принадлежит."""
+    """Строки, которые вставляет в черновик КОД ДОСЛОВНО (quote/доставка/сетка/минимальный срок) —
+    их текст берётся из листа или из записки как есть и авторству LLM не принадлежит."""
     out = []
-    for key in ("j_line", "delivery_line", "sheet_line"):
+    for key in ("j_line", "delivery_line", "sheet_line", "min_term_line"):
         out += [ln.strip() for ln in (exp.get(key) or "").split("\n") if ln.strip()]
     return out
 
@@ -447,12 +456,43 @@ def case_checks(case, draft, exp):
         out.append(_chk(f"без «{word}»", not found,
                         f"формулировки «{word}» в ответе нет",
                         f"есть: «{word}»" if found else "нет"))
+    # 16. РАЗДЕЛЕНИЕ ЧЕКА (06.09.2026): минимальный срок с этого дня ГАРАНТИРУЕТ КОД
+    # (`suggest.ensure_min_term`), а не голова. Значит и мерить его обязан чек КОДА — но мерить
+    # ПОСТУСЛОВИЕ гарантии («правило звучит клиенту»), а НЕ дословную строку кода: гарантия
+    # намеренно молчит, когда голова сказала правило сама, и чек на дословность краснил бы
+    # ЗДОРОВЫЙ ответ. Это не рассуждение: живой прогон 06.09 дал ровно такой красный на 2 кругах
+    # из 3, где ответ клиенту был безупречен.
+    min_pairs = [tuple(p) for p in (exp.get("min_term_pairs") or [])]
+    min_line = (exp.get("min_term_line") or "").strip()
+    if min_pairs:
+        reached = suggest.min_term_said(client, min_pairs, lang)
+        out.append(_chk("минимальный срок доехал", reached,
+                        "правило «сдаём от N дней» звучит клиенту — минимум назван числом и"
+                        " сказано, что короче не сдаём (гарантия suggest.ensure_min_term)",
+                        ("правило в тексте (%s)" % ("строку дописал КОД" if min_line in client
+                                                    else "своими словами головы")) if reached
+                        else "правила в тексте клиента НЕТ ни в каком виде"))
     req = case.get("require_any") or []
     if req:
+        # Токены, которые ТЕПЕРЬ закрывает строка КОДА, голове в зачёт не идут: зелёный чек над
+        # текстом, который дописал код, ничего не доказывает о голове (тот же класс, из-за
+        # которого 22.08 молчащая голова набирала 58.9% набора). Правило РЕЖЕТ ПО ФАКТУ, а не по
+        # номеру кейса: сработала ли гарантия на ЭТОЙ записке — видно из min_term_line, и у
+        # кейсов 5/6 (опыт/менеджер) она пуста, поэтому их require_any остаётся мерой ГОЛОВЫ.
+        by_code = [w for w in req if suggest.word_hit(w.lower(), min_line.lower())] if min_line else []
         hit = [w for w in req if suggest.word_hit(w.lower(), low)]
-        out.append(_chk("обязательное упоминание", bool(hit),
-                        "в ответе есть одно из: " + ", ".join(req),
-                        ("есть: " + ", ".join(hit)) if hit else "нет ни одного"))
+        chk = _chk("обязательное упоминание", bool(hit),
+                   "в ответе есть одно из: " + ", ".join(req),
+                   ("есть: " + ", ".join(hit)) if hit else "нет ни одного")
+        if by_code:
+            # ЧТО ГОЛОВА СКАЗАЛА САМА — считаем по её прозе (client МИНУС вставки КОДА) и печатаем
+            # в отчёт. Числу это место даёт, вердикту — нет: снятый чек в зачёт не идёт.
+            own = [w for w in req if suggest.word_hit(w.lower(), prose.lower())]
+            chk["fact"] = ("голова сама: " + (", ".join(own) if own else "не сказала ничего")
+                           + "; закрыто гарантией кода: " + ", ".join(by_code))
+            chk["skipped"] = ("гарантирует КОД (suggest.ensure_min_term) — голове не "
+                              "засчитывается; мерит чек «минимальный срок доехал»")
+        out.append(chk)
     for c in out:
         if c["name"] in skip:
             c["skipped"] = str(skip[c["name"]])       # снят С ПРИЧИНОЙ, а не молча

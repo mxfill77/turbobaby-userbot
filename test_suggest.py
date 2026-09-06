@@ -9217,5 +9217,141 @@ class TestSuggestCredentialContainment(unittest.TestCase):
         self.assertEqual(binds, ['ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()'])
 
 
+class TestMinTermGuarantee(unittest.TestCase):
+    """МИНИМАЛЬНЫЙ СРОК — ГАРАНТИЯ КОДА (06.09.2026).
+
+    Правило писаное, дословно (`KB_knowledge_base`, «Правила цен v2», п.5): «Минимальные сроки
+    аренды: скутеры — от 5 дней; мотоциклы — от 3 дней; исключение XSR155 — от 5 дней. Запрос
+    короче минимума → отвечаем «сдаём от N дней» + называем цену на минимальный срок.»
+    До 06.09 его доносила ТОЛЬКО голова, и правило доезжало не всегда. Здесь проверяется, что
+    теперь его доносит КОД — и что делает он это ИДЕМПОТЕНТНО: сказала голова сама → вход
+    возвращается байт-в-байт, дубля в здоровом ответе не появляется."""
+
+    # Записка ровно того вида, что печатает `_resolve_model_price` веткой `min` (живой случай
+    # кейса 10: NMAX 155 на сутки).
+    NOTE = ("ЦЕНА: скутеры сдаём от 5 дней (короче срок не оформляем); цена за 5 дн: 307 ฿/день; "
+            "итого 1535 ฿; депозит 3000 ฿; свободен на эти даты.")
+    # Дословный текст, уехавший клиенту в провальном круге (замер 06.09): согласие сдать байк на
+    # срок, которого контора не сдаёт. ВАЖНО: это НЕ обязательно молчание головы — живой круг
+    # 06.09 показал, что такой же текст собирает КОД, вырезав правильный отказ головы
+    # (`drop_answered_questions` + `ensure_closing_question`). Гарантии всё равно: она судит
+    # ГОТОВЫЙ текст, а не автора.
+    RED = "Здравствуйте! Учли — NMAX 155 на 6–7 октября. Бронируем?"
+
+    def test_pravilo_beretsya_iz_zapiski_a_ne_iz_literala(self):
+        self.assertEqual(suggest.min_term_pairs_from_note(self.NOTE), [("скутеры", 5)])
+        # число — то же, что в правиле цен (SCOOTER_MIN_DAYS), а не переписанная руками цифра
+        self.assertEqual(suggest.min_term_pairs_from_note(self.NOTE)[0][1], suggest.SCOOTER_MIN_DAYS)
+
+    def test_molchanie_golovy_zakryvaet_kod_tretim_iskhodom(self):
+        out = suggest.ensure_min_term(self.RED, self.NOTE, "ru")
+        client = suggest.client_facing_text(out)
+        self.assertIn("от 5 дней", client)                 # минимум НАЗВАН числом
+        self.assertIn("не оформляем", client)              # и прямо сказано, что короче не сдаём
+        self.assertTrue(out.startswith(self.RED))          # чужой текст не переписан
+
+    def test_golova_skazala_sama_vkhod_bait_v_bait(self):
+        said = ("NMAX 155 на сутки, к сожалению, не оформляем — скутеры от 5 дней, это 1535 ฿. "
+                "Рассмотрите 5 дней?")
+        self.assertEqual(suggest.ensure_min_term(said, self.NOTE, "ru"), said)
+
+    def test_vetka_ne_srabatyvala_vkhod_bait_v_bait(self):
+        # срок клиента НЕ короче минимума → в записке ветки `min` нет → гарантия молчит (fail-safe)
+        ok_note = "ЦЕНА из Календаря бронирования: XMAX 300 — за 5 дней 4500 ฿; депозит 5000 ฿."
+        self.assertEqual(suggest.ensure_min_term(self.RED, ok_note, "ru"), self.RED)
+        self.assertEqual(suggest.ensure_min_term(self.RED, "", "ru"), self.RED)
+        self.assertEqual(suggest.ensure_min_term("", self.NOTE, "ru"), "")
+        self.assertIsNone(suggest.min_term_line_from_note(ok_note))
+
+    def test_sluzhebnaya_pometka_ostayotsya_khvostom(self):
+        draft = self.RED + "\n[собрано: модель ✅ срок ✅ даты ✅]"
+        out = suggest.ensure_min_term(draft, self.NOTE, "ru")
+        self.assertTrue(out.rstrip().endswith("[собрано: модель ✅ срок ✅ даты ✅]"))
+        self.assertIn("от 5 дней", suggest.client_facing_text(out))
+
+    def test_neskolko_modelei_nazvany_oba_minimuma(self):
+        note = ("ЦЕНЫ ПО МОДЕЛЯМ:\n"
+                "- NMAX 155: скутеры сдаём от 5 дней (короче срок не оформляем); цена за 5 дн: 1535 ฿\n"
+                "- CB650R: мотоциклы сдаём от 3 дней (короче срок не оформляем); цена за 3 дн: 4500 ฿")
+        self.assertEqual(suggest.min_term_pairs_from_note(note), [("скутеры", 5), ("мотоциклы", 3)])
+        client = suggest.client_facing_text(suggest.ensure_min_term(self.RED, note, "ru"))
+        self.assertIn("от 5 дней", client)
+        self.assertIn("от 3 дней", client)
+        # назван только один из двух минимумов → это НЕ полный ответ, дописываем
+        self.assertFalse(suggest.min_term_said("скутеры от 5 дней",
+                                                        suggest.min_term_pairs_from_note(note)))
+
+    def test_chislo_vnutri_chisla_ne_zaschityvaetsya(self):
+        # «15 дней» не есть «5 дней» (то же правило слова, что у word_hit)
+        self.assertFalse(suggest.min_term_said("Есть варианты от 15 дней", [("скутеры", 5)]))
+        self.assertTrue(suggest.min_term_said("сдаём от 5 дней", [("скутеры", 5)]))
+
+    def test_en_vetka_govorit_po_angliiski(self):
+        line = suggest.min_term_line_from_note(self.NOTE, "en")
+        self.assertIn("5 days", line)
+        self.assertNotIn("дней", line)
+        out = suggest.ensure_min_term("Hello! Noted — NMAX 155 for Oct 6–7. Shall we book?",
+                                      self.NOTE, "en")
+        self.assertIn("5 days", suggest.client_facing_text(out))
+
+    def test_kontrfakt_snyataya_garantiya_vozvrashchaet_prezhnee(self):
+        """КОНТРФАКТ: рубильник `MIN_TERM_GUARANTEE_OFF=1` возвращает ПРЕЖНЕЕ поведение на том же
+        входе. Без него доказано лишь то, что ответ вообще бывает."""
+        prev = os.environ.get("MIN_TERM_GUARANTEE_OFF")
+        try:
+            os.environ["MIN_TERM_GUARANTEE_OFF"] = "1"
+            self.assertEqual(suggest.ensure_min_term(self.RED, self.NOTE, "ru"), self.RED)
+            os.environ["MIN_TERM_GUARANTEE_OFF"] = "0"
+            self.assertNotEqual(suggest.ensure_min_term(self.RED, self.NOTE, "ru"), self.RED)
+        finally:
+            if prev is None:
+                os.environ.pop("MIN_TERM_GUARANTEE_OFF", None)
+            else:
+                os.environ["MIN_TERM_GUARANTEE_OFF"] = prev
+
+    def test_garantiya_stoit_v_OBOIKH_paiplainakh(self):
+        """Правка «класс-фикс — сразу на обе полосы»: и generate_draft, и strategy-перегенерация.
+        Судим ПО ТЕКСТУ файла: обе точки обязаны звать гарантию, иначе одна дорога останется на
+        настроении головы и молча."""
+        with open(suggest.__file__, encoding="utf-8") as f:
+            src = f.read()
+        self.assertEqual(src.count("ensure_min_term(out, pricing_note, lang)"), 4,
+                         "гарантия минимального срока стои́т не по два раза в обоих пайплайнах")
+        self.assertEqual(src.count("out = ensure_price_figure(out, pricing_note, lang)"), 2)
+
+    def test_poyas_stoit_POSLE_rezhushchikh_shagov(self):
+        """МЕСТО ПОЯСА — не вкусовщина, а причина живого дефекта 06.09: `drop_answered_questions`
+        вырезал правильный отказ головы как переспрос, `ensure_closing_question` подставил
+        «Бронируем?», и клиенту уехало согласие на срок, которого мы не сдаём.
+
+        Отсюда ДВА инварианта позиции, и оба проверяются по тексту функций:
+          * НИ ОДИН вызов гарантии не стои́т раньше резака вопросов — иначе он бесполезен;
+          * ПОСЛЕДНИЙ стои́т позже всех, кто клиентский текст ещё правит."""
+        with open(suggest.__file__, encoding="utf-8") as f:
+            src = f.read()
+        bodies = {
+            "generate_draft": src[src.index("def generate_draft("):src.index("def regenerate_draft(")],
+            "regenerate_draft": src[src.index("def regenerate_draft("):src.index("# ===== E2E-СМОУК")]
+            if "# ===== E2E-СМОУК" in src else
+            src[src.index("def regenerate_draft("):src.index("_SMOKE_MONTHS_GEN")],
+        }
+        for name, body in bodies.items():
+            cutter = body.rindex("drop_answered_questions(out, facts, lang)")
+            first = body.index("ensure_min_term(out, pricing_note, lang)")
+            last = body.rindex("ensure_min_term(out, pricing_note, lang)")
+            self.assertGreater(first, cutter,
+                               "%s: гарантия зовётся ДО резака вопросов — правило съедят" % name)
+            self.assertGreater(last, body.rindex("ensure_closing_question(out, facts, lang"),
+                               "%s: пояс стои́т раньше сборки закрывающего вопроса" % name)
+
+    def test_garantiya_idempotentna(self):
+        """Два вызова подряд обязаны дать тот же текст, что один: иначе пояс дублировал бы строку
+        в каждом ответе, где голова промолчала."""
+        once = suggest.ensure_min_term(self.RED, self.NOTE, "ru")
+        twice = suggest.ensure_min_term(once, self.NOTE, "ru")
+        self.assertEqual(twice, once)
+        self.assertEqual(suggest.client_facing_text(once).count("от 5 дней"), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

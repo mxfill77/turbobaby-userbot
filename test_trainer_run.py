@@ -799,5 +799,114 @@ class DvaProizvoditelyaOzhidaniy(unittest.TestCase):
                                            "Остался последний, успевайте!")["ok"])
 
 
+class TestChekMinimalnogoSrokaRazdelyon(unittest.TestCase):
+    """РАЗДЕЛЕНИЕ ЧЕКА (06.09.2026). Минимальный срок с этого дня держит КОД
+    (`suggest.ensure_min_term`), значит экзамен головы этого себе засчитывать не имеет права:
+    зелёный чек над текстом, который дописал код, о голове не говорит НИЧЕГО (тот же класс, из-за
+    которого 22.08 молчащая голова набирала 58.9% набора).
+
+    Половина КОДА — новый чек «минимальный срок доехал»: ПОСТУСЛОВИЕ гарантии, то есть правило
+    звучит клиенту, чьими бы словами оно ни прозвучало. Дословность строки кода предметом чека
+    быть НЕ МОЖЕТ: сказала голова сама — гарантия по построению молчит, и посимвольного совпадения
+    не будет никогда (живой замер 06.09: так вышло на 2 кругах из 3).
+    Половина ГОЛОВЫ — всё остальное; `require_any` при сработавшей гарантии СНИМАЕТСЯ С ПРИЧИНОЙ
+    и в зачёт не идёт."""
+
+    NOTE_MIN = ("ЦЕНА: скутеры сдаём от 5 дней (короче срок не оформляем); цена за 5 дн: "
+                "307 ฿/день; итого 1535 ฿; депозит 3000 ฿; свободен на эти даты.")
+    NOTE_OK = ("ЦЕНА: NMAX 155, 5 дн.\n<<<QUOTE>>>\nNMAX — 307 ฿/день; итого 1535 ฿; "
+               "депозит 3000 ฿; свободен на эти даты.\n<<<END_QUOTE>>>")
+    CASE10 = {"id": 10, "lang": "ru", "expect": {},
+              "require_any": ["от 5 дней", "5 дней", "от 3"],
+              "_transcript": "[клиент]: Нужен NMAX 155 с 6 по 7 октября, всего на сутки. Сколько?"}
+    CASE6 = {"id": 6, "lang": "ru", "expect": {},
+             "require_any": ["опыт", "ездил", "на чём", "как долго", "водил"],
+             "_transcript": "[клиент]: Хочу взять что-нибудь на неделю покататься по острову."}
+
+    def _exp(self, note, lang="ru"):
+        return tr.expectations({"id": 10, "lang": lang},
+                               "[клиент]: NMAX 155 на сутки", note,
+                               {"model": "NMAX 155", "has_dates": True})
+
+    def _by_name(self, case, draft, note):
+        return {c["name"]: c for c in tr.case_checks(case, draft, self._exp(note))}
+
+    def test_ozhidanie_beretsya_iz_toi_zhe_zapiski(self):
+        """Ожидание берётся из ТОЙ ЖЕ записки, что питает черновик, — не из литерала теста."""
+        exp = self._exp(self.NOTE_MIN)
+        self.assertEqual(exp["min_term_line"], suggest.min_term_line_from_note(self.NOTE_MIN, "ru"))
+        self.assertEqual(exp["min_term_pairs"], suggest.min_term_pairs_from_note(self.NOTE_MIN))
+        self.assertIsNone(self._exp(self.NOTE_OK)["min_term_line"])
+        self.assertEqual(self._exp(self.NOTE_OK)["min_term_pairs"], [])
+
+    def test_chek_koda_zelen_ot_LYUBOGO_avtora_i_krasen_kogda_pravila_net(self):
+        red = "Здравствуйте! Учли — NMAX 155 на 6–7 октября. Бронируем?"
+        after = suggest.ensure_min_term(red, self.NOTE_MIN, "ru")
+        by = self._by_name(self.CASE10, after, self.NOTE_MIN)
+        self.assertTrue(by["минимальный срок доехал"]["ok"])
+        self.assertIn("строку дописал КОД", by["минимальный срок доехал"]["fact"])
+        # ГОЛОВА сказала правило сама, строки кода в тексте нет — чек всё равно ЗЕЛЁН: предмет
+        # чека — постусловие, а не авторство. (Ровно здесь ломался первый вариант чека.)
+        said = "Здравствуйте! Скутеры мы сдаём от 5 дней, на сутки, к сожалению, не оформляем."
+        by_said = self._by_name(self.CASE10, said, self.NOTE_MIN)
+        self.assertTrue(by_said["минимальный срок доехал"]["ok"])
+        self.assertIn("своими словами головы", by_said["минимальный срок доехал"]["fact"])
+        # правила нет ни в каком виде → чек КОДА КРАСЕН (ослаблением он не является)
+        self.assertFalse(self._by_name(self.CASE10, red, self.NOTE_MIN)
+                         ["минимальный срок доехал"]["ok"])
+
+    def test_zhivoi_defekt_0609_krasnit_chek(self):
+        """РЕГРЕСС на живой дефект 06.09: голова ответила верно, а `drop_answered_questions` +
+        `ensure_closing_question` вырезали отказ и подставили «Бронируем?». Текст, уехавший
+        клиенту, — согласие на срок, которого мы не сдаём; чек обязан быть КРАСНЫМ."""
+        eaten = "Здравствуйте! Учли — NMAX 155 на 6–7 октября. Бронируем?"
+        self.assertFalse(self._by_name(self.CASE10, eaten, self.NOTE_MIN)
+                         ["минимальный срок доехал"]["ok"])
+
+    def test_golove_ne_zaschityvaetsya_to_chto_dopisal_kod(self):
+        red = "Здравствуйте! Учли — NMAX 155 на 6–7 октября. Бронируем?"
+        after = suggest.ensure_min_term(red, self.NOTE_MIN, "ru")
+        chk = self._by_name(self.CASE10, after, self.NOTE_MIN)["обязательное упоминание"]
+        self.assertTrue(chk.get("skipped"), "чек головы не снят — код зеленит экзамен за голову")
+        self.assertIn("ensure_min_term", chk["skipped"])
+        # и в отчёте видно, что голова сама не сказала ничего
+        self.assertIn("голова сама: не сказала ничего", chk["fact"])
+
+    def test_chto_golova_skazala_sama_vidno_chislom(self):
+        said = ("NMAX 155 на сутки, к сожалению, не оформляем — скутеры от 5 дней. "
+                "Рассмотрите 5 дней?")
+        chk = self._by_name(self.CASE10, said, self.NOTE_MIN)["обязательное упоминание"]
+        self.assertTrue(chk.get("skipped"))
+        self.assertIn("голова сама: от 5 дней", chk["fact"])
+
+    def test_chuzhie_keisy_ostayutsya_meroi_golovy(self):
+        """РЕЖЕТ ПО ФАКТУ, а не по номеру кейса: у 5/6 гарантия не срабатывает вовсе, и их
+        `require_any` (опыт/менеджер) остаётся полноценным чеком ГОЛОВЫ."""
+        chk = self._by_name(self.CASE6, "Здравствуйте! А на чём раньше ездили?", self.NOTE_OK)
+        self.assertNotIn("минимальный срок доехал", chk)
+        self.assertFalse(chk["обязательное упоминание"].get("skipped"))
+        self.assertTrue(chk["обязательное упоминание"]["ok"])
+        red = self._by_name(self.CASE6, "Здравствуйте! Отличный выбор, бронируем?", self.NOTE_OK)
+        self.assertFalse(red["обязательное упоминание"]["ok"])   # голову по-прежнему краснит
+
+    def test_snyatyi_chek_v_zachyot_ne_idyot(self):
+        """Снятый чек не считается ни зелёным, ни красным — так же, как `skip` корпуса."""
+        red = "Здравствуйте! Учли — NMAX 155 на 6–7 октября. Бронируем?"
+        after = suggest.ensure_min_term(red, self.NOTE_MIN, "ru")
+        checks = tr.case_checks(self.CASE10, after, self._exp(self.NOTE_MIN))
+        live = [c for c in checks if not c.get("skipped")]
+        self.assertTrue(all(c["name"] != "обязательное упоминание" for c in live))
+        self.assertIn("минимальный срок доехал", [c["name"] for c in live])
+
+    def test_proza_golovy_ne_soderzhit_stroku_koda(self):
+        """`llm_prose` вычитает вставку КОДА — иначе чек языка (и любой будущий чек прозы) мерил
+        бы голову чужим текстом."""
+        exp = self._exp(self.NOTE_MIN)
+        after = suggest.ensure_min_term("Здравствуйте! Бронируем?", self.NOTE_MIN, "ru")
+        prose = tr.llm_prose(suggest.client_facing_text(after), exp)
+        self.assertNotIn(exp["min_term_line"], prose)
+        self.assertIn("Бронируем?", prose)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
