@@ -1353,20 +1353,24 @@ def _rule_number(rule, list_rules=None):
     return None
 
 
-def _default_regress(rule, n=None):
+def _default_regress(rule, n=None, act=None):
     """Регрессия урока ОТДЕЛЬНЫМ ОТСОЕДИНЁННЫМ процессом (`lesson_regress.spawn`).
 
     Импорт ЛЕНИВЫЙ и внутри try: путь урока не имеет права зависеть от того, лежит ли на диске
-    прибор — «записано» владельцу дороже, чем «измерено»."""
+    прибор — «записано» владельцу дороже, чем «измерено».
+
+    `act` — КАКОЕ движение мерим («записан» / «снят»). Оно едет до самой строки исхода, потому что
+    прибор говорит владельцу «Урок #N записан · регрессия…», и на отмене эта строка была бы
+    ложью о своём же поводе."""
     try:
         import lesson_regress
     except Exception as e:                                  # noqa: BLE001 — см. докстринг
         log.warning("регрессия урока недоступна: %s: %s", type(e).__name__, e)
         return {"spawned": False, "why": "%s: %s" % (type(e).__name__, e)}
-    return lesson_regress.spawn(rule, n=n)
+    return lesson_regress.spawn(rule, n=n, act=act)
 
 
-def _regress_call(regress, rule, n):
+def _regress_call(regress, rule, n, act=None):
     """ЗАПИСЬ УРОКА НЕ ЗАМЕДЛЯЕТСЯ И НЕ ОТМЕНЯЕТСЯ ПРИБОРОМ (правило задания 231).
 
     Два замка в одной строке кода:
@@ -1375,9 +1379,16 @@ def _regress_call(regress, rule, n):
       • НЕ РОНЯЕТ — любой сбой запуска проглатывается здесь, а не поднимается наружу: правило уже
         ЛЕЖИТ в книге, и падение нашего прибора не имеет права превратить успешную запись в
         карточку «урок не применён».
-    → dict(spawned, why) — для тестов и лога, карточке владельца это ничего не добавляет."""
+    → dict(spawned, why) — для тестов и лога, карточке владельца это ничего не добавляет.
+
+    ОБЕ СТОРОНЫ ХОДЯТ ОДНОЙ ДВЕРЬЮ: `act` отличает записанный урок от снятого, а замки «не ждёт»
+    и «не роняет» одни и те же — отмена не имеет права ни подвиснуть на приборе, ни отмениться
+    из-за него (урок УЖЕ снят в базе к моменту вызова)."""
     try:
-        return (regress or _default_regress)(rule, n)
+        call = regress or _default_regress
+        # `act` ДОКЛАДЫВАЕТСЯ ТОЛЬКО КОГДА НАЗВАН: сторона записи зовёт прибор ровно так же, как
+        # звала вчера (двухаргументно), и ни одна её инъекция от этой правки не меняется.
+        return call(rule, n, act=act) if act else call(rule, n)
     except Exception as e:                                  # noqa: BLE001 — см. докстринг
         log.warning("регрессия урока не запущена: %s: %s", type(e).__name__, e, exc_info=True)
         return {"spawned": False, "why": "%s: %s" % (type(e).__name__, e)}
@@ -1547,37 +1558,174 @@ def apply_lesson(remark, append_rule=None, classify=None, mark=None, list_rules=
                         "см. лог процесса. Правило можно повторить."}
 
 
-def _cancel_lesson(n, remove_rule=None, list_rules=None, unmark=None):
+# ====== ОТМЕНА УРОКА ПО НОМЕРУ → ОТЗЫВ В БАЗЕ УРОКОВ (06.09.2026) ==========================
+# ЧТО ПОМЕНЯЛОСЬ И ПОЧЕМУ ЭТО НЕ КОСМЕТИКА. С 06.09 (коммит 8bfb55b) секция «Выученные правила»
+# в промпте берётся из БАЗЫ уроков (`suggest.load_playbook` → `lesson_store.active`), а плоская
+# книга стала СНИМКОМ. «отмени урок N» при этом продолжала вырезать буллет ИЗ КНИГИ — то есть
+# отвечала владельцу «↩️ Отменил урок #N», ничего не меняя в ответе бота: урок оставался
+# действующим в базе и продолжал ехать в каждый промпт. Успешная карточка при неснятом уроке
+# опаснее отказа, поэтому команда переведена на `lesson_store.withdraw` — единственный законный
+# отзыв. Своего пути к таблице здесь нет и быть не должно.
+#
+# ЧЕТЫРЕ ИСХОДА НАЗЫВАЮТСЯ РАЗНЫМИ СЛОВАМИ, потому что чинятся по-разному:
+#   `withdrawn`  — снят сейчас (строка ОСТАЛАСЬ, поменялось только состояние);
+#   `already`    — этот номер уже снят раньше; повторная отмена НИЧЕГО не ломает и не врёт;
+#   `not_found`  — такого номера в базе нет вовсе (внятный отказ, а не тихое «ок»);
+#   `no_store`   — таблицы уроков нет на диске (снимать нечего, и это не то же самое, что `not_found`).
+# Плюс `denied`/`no_author` до всякого касания таблицы и `error` — падение внутри.
+#
+# ПРАВО — ТО ЖЕ САМОЕ, ЧТО У ПЕРЕВОДА КАНДИДАТА В ДЕЙСТВУЮЩИЕ (`moderation_core.may_write_rule`,
+# fail-closed: пустой список прав = НИКОМУ), и это решение о симметрии, а не осторожность:
+# перевод кандидата и отзыв действующего — два конца одной ручки, которой владелец меняет то, по
+# чему бот отвечает ВСЕМ клиентам. Разрешить отзыв шире, чем перевод, значило бы отдать посторонним
+# право стереть правило, записать которое они не вправе.
+#
+# НОМЕР ЗДЕСЬ — НОМЕР БАЗЫ, А НЕ НОМЕР БУЛЛЕТА /rules. На день перевода они совпадают (переезд
+# книги дал урокам базы номера 1…9 в порядке буллетов), но расходятся с первым же новым уроком:
+# база нумерует навсегда и номеров не переиспользует, а книга перенумеровывает буллеты при каждом
+# удалении. Свести ПОКАЗ и СНЯТИЕ на базу — отдельное решение, названное в `suggest.py:1046`;
+# до него карточка НАЗЫВАЕТ ТЕКСТ снятого урока, чтобы промах номером был виден сразу.
+ACT_WITHDRAWN = "снят"                 # что за движение ушло в регрессию (add-сторона — «записан»)
+
+STATUS_WITHDRAWN = "withdrawn"
+STATUS_ALREADY = "already"
+STATUS_NOT_FOUND = "not_found"
+STATUS_NO_STORE = "no_store"
+
+
+def _default_withdraw(number, path=None, now=None):
+    import lesson_store
+    return lesson_store.withdraw(number=number, path=path, now=now)
+
+
+def _default_find_lesson(number, path=None):
+    """Урок базы по номеру → (Lesson|None, есть ли таблица). Только ЧТЕНИЕ: нужно ради текста
+    урока (карточка и снимок-книга) и ради состояния (уже снят?). Отзыв всё равно делает
+    `withdraw` — второго писателя таблицы здесь нет."""
+    import lesson_store
+    store = lesson_store.load(path)
+    for les in store.lessons:
+        if les.number == int(number):
+            return les, store.exists
+    return None, store.exists
+
+
+def _book_forget(text, remove_rule=None, list_rules=None, unmark=None):
+    """Снятый урок → убрать его буллет из КНИГИ-СНИМКА (и пометку источника). → dict(status, n).
+
+    ЗАЧЕМ ЭТО ВООБЩЕ ЕСТЬ, если ответ читается из базы: у чтения базы есть ТРЕТИЙ ИСХОД —
+    «база не прочитана» (`suggest.active_lesson_bullets` → `read_ok=False`), и тогда в промпт
+    идёт книга-снимок. Оставленный в ней буллет вернул бы снятый урок в ответ ровно в тот момент,
+    когда база недоступна, — то есть отмена держалась бы только на исправности файла.
+
+    СОВПАДЕНИЕ ТОЛЬКО ТОЧНОЕ (нормализованный текст равен), и это не придирчивость: нечёткий
+    матчинг `_rules_similar` (Jaccard ≥ 0.6) на живой книге может указать на СОСЕДНЕЕ правило, а
+    цена промаха здесь — молча вырезанная чужая строка. Совпало не ровно одно → книгу НЕ ТРОГАЕМ
+    и говорим об этом (`skipped`/`ambiguous`), потому что не тронуть дешевле, чем испортить."""
+    body = " ".join(str(text or "").split())
+    if not body:
+        return {"status": "no_text", "n": None}
+    import suggest
+    list_rules = list_rules or suggest.list_playbook_rules
+    remove_rule = remove_rule or suggest.remove_playbook_rule
+    key = _norm_rule(body)
+    hits = [r for r in (list_rules() or []) if _norm_rule(r.get("rule")) == key]
+    if len(hits) == 0:
+        return {"status": "skipped", "n": None}          # в книге-снимке этого правила нет
+    if len(hits) > 1:
+        return {"status": "ambiguous", "n": None}        # одинаковых два — не гадаем
+    res = remove_rule(hits[0]["n"]) or {}
+    if res.get("status") == "removed":
+        (unmark or unmark_source)(res.get("rule") or body)
+    return {"status": res.get("status"), "n": res.get("n")}
+
+
+def _cancel_lesson(n, who=None, may_write=None, withdraw=None, find=None, remove_rule=None,
+                   list_rules=None, unmark=None, regress=None, get=None, now=None, path=None):
     """Ядро cancel_lesson (может бросить — снаружи fail-safe обёртка)."""
-    if remove_rule is None or list_rules is None:
-        import suggest
-        remove_rule = remove_rule or suggest.remove_playbook_rule
-        list_rules = list_rules or suggest.list_playbook_rules
-    res = remove_rule(n)
-    status = res.get("status")
-    if status == "removed":
-        (unmark or unmark_source)(res.get("rule"))
-        card = f"↩️ Отменил урок #{res.get('n')}: {res.get('rule')} (осталось правил: {res.get('remaining')})."
-    elif status == "not_found":
-        card = f"⚠️ Урока #{n} нет — правил всего {len(list_rules())}."
-    elif status == "empty":
-        card = "⚠️ Книга правил пуста — отменять нечего."
-    elif status == "ambiguous":
-        card = "⚠️ Неоднозначно — уточни номер урока."
-    else:
-        card = f"⚠️ Не удалось отменить урок #{n} (status={status})."
-    return {"status": status, "card": card}
+    num = _to_int(n)
+    if num is None:
+        return {"status": "error", "n": None, "who": None,
+                "card": f"⚠️ Не разобрал номер урока в «{n}» — назови число: «отмени урок 7»."}
+    # АВТОР — ДО всякого касания таблицы: право судится по имени, а безымянного движения у
+    # действующего урока быть не может.
+    #
+    # ЧИТАЕМ НЕ ГАСЯ (`peek_actor`), и у этого выбора названы обе цены. Гашение отняло бы автора
+    # у следующего «урок: …» — запись автора одноразовая и приготовлена ИМЕННО для урока, а
+    # отмена не вправе портить чужое движение. Плата за peek — имя «липнет» на свой TTL (15 мин):
+    # внутри окна отмену подпишет тот, кто нажимал кнопку. Радиус этой платы ограничен тем, что
+    # отзыв НЕ подписывает строку именем вовсе (в состоянии живут разрез и штамп), а на входе в
+    # команду стои́т ещё и проверка вызывающего. Липкое имя тут решает «пускать ли», а не «кто
+    # это сделал», и потому не создаёт той лжи, ради которой запись автора одноразова.
+    author = (who or "").strip().lstrip("@") or (peek_actor(now=now, get=get) or "")
+    if not author:
+        return {"status": STATUS_NO_AUTHOR, "n": num, "who": None,
+                "card": f"⛔ Урок #{num} НЕ отменён: не видно, КТО отменяет. Отзыв действующего "
+                        "урока идёт под тем же правом, что и перевод кандидата в действующие, а "
+                        "право судится по имени. Нажми «🎓 Обучить»/«✍ другое» в модерботе (кнопка "
+                        "называет автора) и повтори команду."}
+    if not (may_write or _default_may_write)(author):
+        return {"status": STATUS_DENIED, "n": num, "who": author,
+                "card": f"⛔ Нет прав на отмену уроков — урок #{num} НЕ снят. Отзыв действующего "
+                        "урока требует того же права, что и запись."}
+
+    les, exists = (find or _default_find_lesson)(num, path)
+    res = (withdraw or _default_withdraw)(num, path=path, now=now)
+    text = " ".join(str(getattr(les, "correct", "") or "").split())
+    short = text if len(text) <= 120 else text[:119] + "…"
+
+    if res.marked:
+        book = _book_forget(text, remove_rule=remove_rule, list_rules=list_rules, unmark=unmark)
+        reg = _regress_call(regress, text or ("урок #%d" % num), num, act=ACT_WITHDRAWN)
+        card = (f"↩️ Урок #{num} СНЯТ: {short}\n"
+                f"📌 Строка из базы НЕ удалена (было строк {res.lines_before}, стало "
+                f"{res.lines_after}) — она осталась с пометкой «снят», и по ней видно, когда и "
+                "каким разрезом его сняли. Бот по этому уроку больше не отвечает.")
+        if book.get("status") == "removed":
+            card += " Буллет книги-снимка убран заодно."
+        elif book.get("status") == "ambiguous":
+            card += " В книге-снимке таких буллетов несколько — её не трогал, поправь руками."
+        return {"status": STATUS_WITHDRAWN, "n": num, "who": author, "rule": text,
+                "lines_before": res.lines_before, "lines_after": res.lines_after,
+                "book": book, "regress": reg, "card": card}
+
+    if res.already:
+        state = str(getattr(les, "state", "") or "")
+        return {"status": STATUS_ALREADY, "n": num, "who": author, "rule": text,
+                "lines_before": res.lines_before, "lines_after": res.lines_after,
+                "card": f"✅ Урок #{num} уже отменён раньше (состояние «{state}») — повторная "
+                        f"отмена ничего не меняет и ничего не ломает: {short}"}
+
+    if not exists:
+        return {"status": STATUS_NO_STORE, "n": num, "who": author,
+                "card": f"⚠️ Базы уроков нет на диске — отменять нечего, урок #{num} не снят. "
+                        "Это НЕ «урока нет»: таблица не заведена вовсе."}
+
+    return {"status": STATUS_NOT_FOUND, "n": num, "who": author,
+            "lines_before": res.lines_before, "lines_after": res.lines_after,
+            "card": f"⚠️ Урока #{num} в базе НЕТ — ничего не снято. Номер здесь — номер БАЗЫ "
+                    "уроков (его называет карточка записи), а не порядковый номер буллета /rules."}
 
 
-def cancel_lesson(n, remove_rule=None, list_rules=None, unmark=None):
-    """«отмени урок N» — откат правила N (нумерация как в /rules). remove_rule/list_rules/unmark
-    инъектируются; иначе боевой suggest + сайдкар. Возвращает dict(status, card).
+def cancel_lesson(n, who=None, may_write=None, withdraw=None, find=None, remove_rule=None,
+                  list_rules=None, unmark=None, regress=None, get=None, now=None, path=None):
+    """«отмени урок N» — ОТЗЫВ УРОКА #N В БАЗЕ (`lesson_store.withdraw`, разрез «урок»).
+
+    N — номер БАЗЫ уроков. Право — `moderation_core.may_write_rule` (то же, что у перевода
+    кандидата в действующие; пустой список прав = НИКОМУ). Строка таблицы НЕ УДАЛЯЕТСЯ: меняется
+    только состояние, и `lines_before`/`lines_after` в ответе это доказывают числом.
+    → dict(status, card, n, who, …) со статусами `withdrawn` | `already` | `not_found` |
+    `no_store` | `denied` | `no_author` | `error`.
+
+    may_write/withdraw/find/remove_rule/list_rules/unmark/regress/get/path инъектируются в тестах;
+    иначе боевые `moderation_core` + `lesson_store` + `suggest` + `lesson_regress`.
     НИКОГДА не бросает: исключение внутри → status='error' + карточка-ошибка (след — в лог
     процесса; карточку в TRN пишет вызывающий)."""
     try:
-        return _cancel_lesson(n, remove_rule, list_rules, unmark)
+        return _cancel_lesson(n, who, may_write, withdraw, find, remove_rule, list_rules,
+                              unmark, regress, get, now, path)
     except Exception as e:
         log.warning("cancel_lesson(#%s) упал: %s: %s", n, type(e).__name__, e, exc_info=True)
-        return {"status": "error",
+        return {"status": "error", "n": _to_int(n), "who": None,
                 "card": f"⚠️ Урок #{n} не отменён — внутренняя ошибка ({type(e).__name__}), "
                         "см. лог процесса. Команду можно повторить."}

@@ -8,7 +8,9 @@ test_trainer.py — ГРУППА-ТРЕНАЖЁР клиентского бот�
 Покрытие (по ТЗ):
   • «Заново» чистит контекст ТЕСТ-клиента (collected_facts пуст) и N++;
   • урок применяется со следующего ответа (behavior → playbook → в system-prompt), источник «тренажёр»;
-  • «отмени урок N» откатывает правило и снимает пометку источника;
+  • «отмени урок N» ОТЗЫВАЕТ урок #N в базе (`lesson_store.withdraw`, право — как у перевода
+    кандидата), после чего он не доезжает до промпта; буллет книги-снимка и пометка источника
+    снимаются заодно, а строка таблицы ОСТАЁТСЯ с отметкой «снят»;
   • CRM-карточка из тренажёра помечена [ТЕСТ] (боевые «Входящие брони» не трогаем);
   • изоляция: is_trainer_chat строго по привязанному chat_id (вне группы — боевой путь);
   • шапка [тренажёр | ТЕСТ-N | правил: K] присутствует; подсказка-строка присутствует;
@@ -28,6 +30,7 @@ os.environ.setdefault("TESTING", "1")
 
 import trainer
 import suggest
+import lesson_store
 import moderation_ipc
 
 
@@ -474,9 +477,15 @@ class TestLessonRouting(unittest.TestCase):
         self.assertIn("RuntimeError", dec["card"])                  # тип виден владельцу
 
     def test_cancel_lesson_never_raises(self):
+        """Исключение ВНУТРИ отмены не роняет обработчик группы.
+
+        МЕРИТСЯ ТЕПЕРЬ НА ОТЗЫВЕ В БАЗЕ, а не на правке книги (06.09.2026): работу делает он, и
+        падать по-настоящему может он. Книга-снимок правится после и best-effort. `find`
+        инъектирован сознательно — без него ветка пошла бы читать БОЕВУЮ таблицу уроков."""
         dec = trainer.cancel_lesson(
-            3, remove_rule=lambda n: (_ for _ in ()).throw(RuntimeError("книга сломана")),
-            list_rules=lambda: [], unmark=lambda r: True)
+            3, who="filipp", may_write=lambda _u: True,
+            find=lambda _n, _p=None: (None, True),
+            withdraw=lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("таблица сломана")))
         self.assertEqual(dec["status"], "error")
         self.assertIn("не отменён", dec["card"])
         self.assertIn("RuntimeError", dec["card"])
@@ -500,10 +509,20 @@ class TestLessonAppliesAndCancels(unittest.TestCase):
         self._old_side = trainer.TRAINER_RULES_FILE
         suggest.PLAYBOOK_FILE = self.pb
         trainer.TRAINER_RULES_FILE = os.path.join(self.tmp, "trainer_rules.json")
+        # БАЗА УРОКОВ — ТОЖЕ В ПЕСОЧНИЦУ (06.09.2026). С подключением отмены к отзыву в базе
+        # ветка отмены читает и правит таблицу; без подмены обоих путей (модульного и того,
+        # откуда читает промпт) тест трогал бы БОЕВОЙ `lesson_store.tsv` этой машины.
+        self.store = os.path.join(self.tmp, "lesson_store.tsv")
+        self._old_store = lesson_store.STORE_PATH
+        self._old_base = suggest.LESSON_BASE_PATH
+        lesson_store.STORE_PATH = self.store
+        suggest.LESSON_BASE_PATH = self.store
 
     def tearDown(self):
         suggest.PLAYBOOK_FILE = self._old_pb
         trainer.TRAINER_RULES_FILE = self._old_side
+        lesson_store.STORE_PATH = self._old_store
+        suggest.LESSON_BASE_PATH = self._old_base
 
     # ПОЧЕМУ ЗДЕСЬ ТЕПЕРЬ ЯВНЫЙ `append_rule` (05.09.2026). Боевой путь урока больше НЕ пишет в
     # плоскую книгу: он кладёт кандидата в базу уроков (`test_lesson_write.py`). Книжный синк
@@ -521,20 +540,43 @@ class TestLessonAppliesAndCancels(unittest.TestCase):
         self.assertIn(remark, sysp)
         self.assertTrue(trainer.is_trainer_rule(remark))                    # источник «тренажёр»
 
-    def test_cancel_lesson_rolls_back_and_unmarks(self):
+    # ПОЧЕМУ ЭТИ ДВА ТЕСТА ПЕРЕПИСАНЫ, А НЕ ОСЛАБЛЕНЫ (06.09.2026). Они мерили ВЫРЕЗАНИЕ БУЛЛЕТА
+    # ИЗ КНИГИ и были зелёными ровно тогда, когда команда НЕ отменяла урок: с коммита 8bfb55b
+    # ответ собирается из базы, и правка книги на него не влияет — то есть старый зелёный
+    # доказывал ложь («↩️ Отменил» при живом уроке в промпте). Предмет обоих сохранён целиком —
+    # «после отмены правило не доезжает до промпта, пометка источника снята» и «промах номером
+    # получает внятный ответ»; поменялось МЕСТО, где это правда, и оно названо здесь.
+    def test_cancel_lesson_withdraws_in_base_and_unmarks(self):
         remark = "предлагай доставку явно в первом ответе"
-        trainer.apply_lesson(remark, classify=lambda r: "behavior",
-                             append_rule=suggest.append_playbook_rule)          # старый синк книги
+        n = lesson_store.add(question="сколько стоит на неделю?", bot_answer="уточню и вернусь",
+                             correct=remark, why="владелец назвал причину", who="filipp",
+                             when="2026-09-06T10:00:00Z", path=self.store)
+        suggest.append_playbook_rule(remark)         # тот же текст лежит и в книге-снимке
+        trainer.mark_source(remark)
         self.assertIn(remark, suggest.load_playbook())
         self.assertTrue(trainer.is_trainer_rule(remark))
-        dec = trainer.cancel_lesson(1)                                      # «отмени урок 1»
-        self.assertEqual(dec["status"], "removed")
-        self.assertNotIn(remark, suggest.load_playbook())                  # правило откатано
-        self.assertFalse(trainer.is_trainer_rule(remark))                  # пометка снята
 
-    def test_cancel_out_of_range(self):
-        dec = trainer.cancel_lesson(9)
-        self.assertEqual(dec["status"], "empty")                            # правил нет
+        dec = trainer.cancel_lesson(n, who="filipp", may_write=lambda _u: True,   # «отмени урок N»
+                                    path=self.store, regress=lambda *_a, **_k: {"spawned": False})
+        self.assertEqual(dec["status"], trainer.STATUS_WITHDRAWN, dec["card"])
+        self.assertNotIn(remark, suggest.load_playbook())                  # из ОТВЕТА ушло
+        self.assertFalse(trainer.is_trainer_rule(remark))                  # пометка снята
+        rows = lesson_store.load(self.store).lessons
+        self.assertEqual([l.number for l in rows], [n], "строка урока пропала из таблицы")
+        self.assertEqual(lesson_store.active(rows), ())
+
+    def test_cancel_names_missing_number_and_missing_base_apart(self):
+        no_base = trainer.cancel_lesson(9, who="filipp", may_write=lambda _u: True,
+                                        path=self.store)
+        self.assertEqual(no_base["status"], trainer.STATUS_NO_STORE, no_base["card"])
+        n = lesson_store.add(question="вопрос", bot_answer="ответ", correct="какое-то правило",
+                             why="причина", who="filipp", when="2026-09-06T10:00:00Z",
+                             path=self.store)
+        gone = trainer.cancel_lesson(n + 5, who="filipp", may_write=lambda _u: True,
+                                     path=self.store)
+        self.assertEqual(gone["status"], trainer.STATUS_NOT_FOUND, gone["card"])
+        self.assertEqual([l.number for l in lesson_store.active(lesson_store.load(self.store)
+                                                                .lessons)], [n])
 
 
 # ------------- источник урока переживает формат книги (класс 03.09.2026) -----
@@ -609,12 +651,18 @@ class TestLessonSourceSurvivesBookFormat(unittest.TestCase):
         remark = "предлагай доставку явно в первом ответе"
         trainer.mark_source(remark)
         self.assertTrue(trainer.is_trainer_rule(remark))
+        les = lesson_store.Lesson(1, "вопрос", "ответ", remark, "причина", "filipp",
+                                  "2026-09-06T10:00:00Z", lesson_store.STATE_ACTIVE, 2)
         dec = trainer.cancel_lesson(
-            1,
+            1, who="filipp", may_write=lambda _u: True,
+            find=lambda _n, _p=None: (les, True),
+            withdraw=lambda *_a, **_k: lesson_store.WithdrawResult(
+                lesson_store.CUT_ONE, 1, (1,), (), 2, 2),
+            list_rules=lambda: [{"n": 1, "date": "2026-07-22", "rule": remark}],
             remove_rule=lambda n: {"status": "removed", "n": 1,
                                    "rule": "(2026-07-22) " + remark, "remaining": 0},
-            list_rules=lambda: [])
-        self.assertEqual(dec["status"], "removed")
+            regress=lambda *_a, **_k: {"spawned": False})
+        self.assertEqual(dec["status"], trainer.STATUS_WITHDRAWN, dec["card"])
         self.assertFalse(trainer.is_trainer_rule(remark))             # пометка СНЯТА
         self.assertEqual(json.load(open(self.side, encoding="utf-8")), {})   # сироты не осталось
 
@@ -642,9 +690,16 @@ class TestLessonSourceSurvivesBookFormat(unittest.TestCase):
     def test_live_apply_then_cancel_leaves_no_orphan(self):
         """БОЕВОЙ путь целиком, живыми suggest.append/remove: урок → книга → отмена → сайдкар
         ПУСТ. Здесь снятие пометки и проверяется по-настоящему (остальные тесты класса подают
-        текст руками). classify инъектируем — боевой роутер ходит в LLM, а мерим не его."""
+        текст руками). classify инъектируем — боевой роутер ходит в LLM, а мерим не его.
+
+        С 06.09.2026 отмена идёт ОТЗЫВОМ В БАЗЕ, поэтому у теста появилась своя таблица уроков:
+        буллет книги команда правит ЗАОДНО и по ТОЧНОМУ тексту снятого урока — на этом стыке
+        сирота и появлялась бы, если бы текст в книгу и в базу лёг разный."""
         with open(self.pb, "w", encoding="utf-8") as f:
             f.write("# playbook\n\n## Выученные правила\n")
+        store = os.path.join(self.tmp, "lesson_store.tsv")
+        self.addCleanup(setattr, lesson_store, "STORE_PATH", lesson_store.STORE_PATH)
+        lesson_store.STORE_PATH = store
         remark = "предлагай доставку явно в первом ответе"
         res = trainer.apply_lesson(remark, classify=lambda r: "behavior",
                                    append_rule=suggest.append_playbook_rule)   # старый синк книги
@@ -653,8 +708,13 @@ class TestLessonSourceSurvivesBookFormat(unittest.TestCase):
         rows = suggest.list_playbook_rules(open(self.pb, encoding="utf-8").read())
         self.assertEqual(len(rows), 1)
         self.assertEqual(trainer.rule_source(rows[0]["rule"]), trainer.TRAINER_SOURCE)
-        dec = trainer.cancel_lesson(1)
-        self.assertEqual(dec["status"], "removed")
+        n = lesson_store.add(question="вопрос", bot_answer="ответ", correct=remark,
+                             why="владелец назвал причину", who="filipp",
+                             when="2026-09-06T10:00:00Z", path=store)
+        dec = trainer.cancel_lesson(n, who="filipp", may_write=lambda _u: True, path=store,
+                                    regress=lambda *_a, **_k: {"spawned": False})
+        self.assertEqual(dec["status"], trainer.STATUS_WITHDRAWN, dec["card"])
+        self.assertEqual(dec["book"]["status"], "removed", dec["book"])   # буллет книги убран
         self.assertEqual(json.load(open(self.side, encoding="utf-8")), {})   # сироты нет
 
     def test_remove_playbook_rule_still_strips_date_itself(self):

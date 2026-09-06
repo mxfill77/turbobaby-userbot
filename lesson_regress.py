@@ -13,7 +13,9 @@ lesson_regress.py — РЕГРЕССИЯ УРОКА: после урока ко�
     и файла `TRAINER_GREEN_FILE` в этом модуле нет ни одного (сверяется тестом `test_lesson_regress`
     по тексту файла). В реестр ворот регрессия не кладёт ничего;
   • НЕ правит книгу правил и НЕ откатывает урок. Она ИЗМЕРЯЕТ и ГОВОРИТ; снятие урока остаётся
-    движением владельца — у него для этого есть «отмени урок N» (`trainer.cancel_lesson`);
+    движением владельца — у него для этого есть «отмени урок N» (`trainer.cancel_lesson` →
+    `lesson_store.withdraw`). С 06.09.2026 это движение прибор ЗАПУСКАЕТ так же, как запись
+    (`act=снят`): корпус меряет обе стороны, потому что ответ меняют обе;
   • НЕ задерживает нажатие. `spawn()` — fire-and-forget Popen отдельным ОТСОединённым процессом
     (DETACHED_PROCESS), урок пишется и карточка «✅ Принято» уходит владельцу как раньше. Прогон
     идёт ПОСЛЕ и в чужом процессе; его падение урока не отменяет;
@@ -82,6 +84,19 @@ OFF_ENV = "LESSON_REGRESS_OFF"
 BUDGET_ENV = "LESSON_REGRESS_BUDGET_SEC"
 BUDGET_DEFAULT = 1800                    # потолок одного захода, секунды
 MAX_GLUED = 4                            # сколько раз подряд склейка перезапускает замер
+# ДВА ДВИЖЕНИЯ ВЛАДЕЛЬЦА, ОБА МЕНЯЮТ ОТВЕТ, ОБА МЕРЯЮТСЯ ОДНИМ КОРПУСОМ (06.09.2026). Прибор
+# завёлся на записи и говорил «Урок #N записан» безусловно; с подключением команды отмены урока
+# к отзыву в базе тем же прибором меряется и снятие. Слово движения едет от нажатия до строки
+# исхода: строка «Урок #7 записан» о СНЯТОМ уроке была бы ложью о собственном поводе, а именно
+# по ней владелец судит, что вообще произошло.
+#
+# ИМЁН ЧУЖИХ ПИСАТЕЛЕЙ ЗДЕСЬ НЕТ И НИЖЕ НЕ БУДЕТ. Тело модуля держит инвариант «прибор ИЗМЕРЯЕТ
+# и ГОВОРИТ, но сам ничего не откатывает», и держит его ТЕКСТОМ: набор проверяет, что имён
+# функций отката и записи книги в теле файла не встречается вовсе (`test_lesson_regress`,
+# `test_regression_does_not_touch_the_rule_book`). Замок дешёвый и потому строгий — упоминание
+# ради красоты комментария его не сто́ит.
+ACT_ADDED = "записан"
+ACT_WITHDRAWN = "снят"
 HISTORY_KEEP = 10
 LINE_MAX = 700                           # «одна короткая строка» — режем по границе, а не молча
 _PENDING_KEEP = 20
@@ -135,16 +150,21 @@ def write_state(d, path=None):
     return True, path
 
 
-def note_pending(n, rule, path=None, now=None):
+def note_pending(n, rule, path=None, now=None, act=None):
     """Пометить урок как ждущий замера. Пишется в НАЖАТИИ владельца, поэтому дёшево и fail-safe:
     один маленький json. Именно эта пометка делает СКЛЕЙКУ возможной — идущий замер увидит урок,
-    приехавший после его старта, и перезапустится по итоговой книге."""
+    приехавший после его старта, и перезапустится по итоговой книге.
+
+    `act` — КАКОЕ движение владельца привело замер: `записан` (умолчание) или `снят`. Хранится
+    рядом с номером потому, что склейка может собрать в один прогон и запись, и отмену, а строка
+    исхода обязана назвать каждое движение своим словом."""
     now = time.time() if now is None else now
     try:
         d = read_state(path)
         pend = d.get("pending")
         pend = pend if isinstance(pend, list) else []
-        pend.append({"n": n, "rule": str(rule or "")[:300], "ts": now})
+        pend.append({"n": n, "rule": str(rule or "")[:300], "ts": now,
+                     "act": str(act or ACT_ADDED)})
         d["pending"] = pend[-_PENDING_KEEP:]
         return write_state(d, path)[0]
     except Exception:                                        # noqa: BLE001 — урок важнее пометки
@@ -426,14 +446,30 @@ def _num(cid):
 
 # ─────────────────────────────────────── строка исхода ───────────────────────────────────────
 
+def _act(les):
+    """Движение одного урока: `записан` (умолчание — так писали до 06.09) или `снят`."""
+    a = str((les or {}).get("act") or "").strip()
+    return a if a in (ACT_ADDED, ACT_WITHDRAWN) else ACT_ADDED
+
+
 def _lesson_tag(lessons):
-    """«урок #12» / «уроки #12,#13,#14 (склейка)» / «урок» — по числу склеенных."""
-    nums = [str(l.get("n")) for l in (lessons or []) if l.get("n") is not None]
-    if not nums:
+    """«Урок #12 записан» / «Урок #12 снят» / склейка — по числу и ПО ДВИЖЕНИЮ склеенных.
+
+    Смешанная склейка (одно записали, другое сняли) называет движение У КАЖДОГО номера: одно
+    общее слово на такую пару соврало бы про половину прогона, а прибор и так не знает, которое
+    из движений сломало корпус."""
+    items = [l for l in (lessons or []) if l.get("n") is not None]
+    if not items:
         return "Урок записан"
-    if len(nums) == 1:
-        return "Урок #%s записан" % nums[0]
-    return "Уроки #%s записаны (склейка %d в один прогон)" % (",#".join(nums), len(nums))
+    if len(items) == 1:
+        return "Урок #%s %s" % (items[0]["n"], _act(items[0]))
+    acts = {_act(l) for l in items}
+    nums = [str(l["n"]) for l in items]
+    if len(acts) == 1:
+        word = "записаны" if acts == {ACT_ADDED} else "сняты"
+        return "Уроки #%s %s (склейка %d в один прогон)" % (",#".join(nums), word, len(items))
+    pairs = ", ".join("#%s (%s)" % (l["n"], _act(l)) for l in items)
+    return "Уроки %s — склейка %d в один прогон" % (pairs, len(items))
 
 
 def outcome_line(cmp_res, now_rec, lessons=None, base_from=""):
@@ -459,11 +495,19 @@ def outcome_line(cmp_res, now_rec, lessons=None, base_from=""):
                          % (b["id"], chk.get("name") or "?",
                             (chk.get("expected") or "?")[:70], (chk.get("fact") or "?")[:70]))
         more = len(cmp_res["broken"]) - len(parts)
-        nums = [l.get("n") for l in (lessons or []) if l.get("n") is not None]
-        line = ("🔴 %s · регрессия корпуса: СЛОМАЛОСЬ %d кейсов из %d — %s%s. Урок НЕ снят: "
-                "снять — «отмени урок %s»."
+        items = [l for l in (lessons or []) if l.get("n") is not None]
+        last = items[-1] if items else {}
+        # ЧТО ДЕЛАТЬ С КРАСНЫМ — ЗАВИСИТ ОТ ДВИЖЕНИЯ. Совет «снять — отмени урок N» после ОТМЕНЫ
+        # звал бы снимать уже снятое; обратной команды («вернуть урок N») у полосы нет вовсе, и
+        # прибор об этом ГОВОРИТ, а не советует несуществующее.
+        if _act(last) == ACT_WITHDRAWN:
+            tail = ("Отмена НЕ откатана: строка #%s в базе помечена снятой, и вернуть её "
+                    "командой сегодня нечем — это отдельное движение." % last.get("n"))
+        else:
+            tail = "Урок НЕ снят: снять — «отмени урок %s»." % (last.get("n") or "N")
+        line = ("🔴 %s · регрессия корпуса: СЛОМАЛОСЬ %d кейсов из %d — %s%s. %s"
                 % (tag, len(cmp_res["broken"]), now_rec.get("cases_seen", 0), "; ".join(parts),
-                   (" и ещё %d" % more) if more > 0 else "", nums[-1] if nums else "N"))
+                   (" и ещё %d" % more) if more > 0 else "", tail))
         if glued:
             line += " Который из склеенных сломал — прибор не знает: мерилась книга целиком."
         if now_rec.get("head_moved"):
@@ -500,18 +544,20 @@ def say(line, popen=None):
 
 # ─────────────────────────────────────── запуск из урока ─────────────────────────────────────
 
-def spawn(rule, n=None, popen=None, env=None, path=None, now=None):
+def spawn(rule, n=None, popen=None, env=None, path=None, now=None, act=None):
     """ЗАПУСК ИЗ НАЖАТИЯ ВЛАДЕЛЬЦА — и единственное, что здесь важно, это НЕ ЖДАТЬ.
 
     Отсоединённый процесс (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW),
     без ожидания, без чтения потоков: урок пишется и карточка уходит владельцу, как раньше.
+    `act` — движение владельца (`записан` по умолчанию, `снят` у отмены урока): едет в пометку
+    склейки и оттуда в строку исхода.
     НИКОГДА не бросает — предсмертный взгляд задания («регрессию повесят внутрь нажатия») закрыт
     именно здесь. → dict(spawned, why)."""
     why = off(env)
     if why:
         return {"spawned": False, "why": why}
     try:
-        note_pending(n, rule, path=path, now=now)            # склейка возможна и до старта ребёнка
+        note_pending(n, rule, path=path, now=now, act=act)   # склейка возможна и до старта ребёнка
         (popen or subprocess.Popen)([VENV_PY, SELF, "--after-lesson"], cwd=REPO,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                     stdin=subprocess.DEVNULL, creationflags=DETACHED)
