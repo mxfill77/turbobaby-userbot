@@ -184,6 +184,13 @@ ARTIFACT_ID = "result"
 # Потолок прибора, не наш: `content_product_verifier._max_bytes` отвергает всё крупнее.
 MAX_ARTIFACT_BYTES = v0.DEFAULT_MAX_BYTES
 
+# ЗАЯВКА ИСПОЛНИТЕЛЯ — ровно три слова знает V0 (`content_product_verifier`, `invalid_reported_claim`).
+# Здесь живут два из них: «сделано» — у обычного закрытия, «заявки нет» — у ряда, припаркованного
+# маркером гарда (см. `judge_parked`). Вердикта прибора эта строка не меняет ни в одной ветке —
+# она едет в пакет заявки как СВЕДЕНИЕ о том, что говорил исполнитель; врать в ней нечем и незачем.
+CLAIM_DONE, CLAIM_NONE = "reported_done", "unknown"
+CASE_DONE, CASE_PARKED = "pc-done", "pc-park"   # префикс пакета: суд закрытия ≠ суд парковки
+
 # Режимы врезки. `addr` — дефолт: судим там, где адрес НАЗВАН. `all` — полное правило владельца
 # (нет адреса → тоже не «сделано»); почему не дефолт — в разборе ступени C, числом.
 MODE_OFF, MODE_ADDR, MODE_ALL = "off", "addr", "all"
@@ -375,8 +382,13 @@ def run_token(tid, draft_rel=None):
     return "pc-task-%s" % (tid if tid not in (None, "") else "unknown")
 
 
-def _packets(case_id, run_id, addr, gates, status, root):
-    """Пакет задачи и пакет заявки — файлами, как требует V0. Пишет ДЕМОН, не исполнитель."""
+def _packets(case_id, run_id, addr, gates, status, root, claim_word=CLAIM_DONE):
+    """Пакет задачи и пакет заявки — файлами, как требует V0. Пишет ДЕМОН, не исполнитель.
+
+    `claim_word` — ЗАЯВКА ИСПОЛНИТЕЛЯ, а не наш вывод. У закрытия «сделано» она `reported_done`;
+    у ряда, ПРИПАРКОВАННОГО маркером гарда, заявки нет вовсе (stdout исполнителя выброшен там же,
+    где родилась карточка) — и тогда сюда идёт `unknown`. Писать «reported_done» за исполнителя,
+    который ничего не заявлял, значило бы подложить прибору чужие слова."""
     rel_dir = "%s/%s" % (PACKET_DIR, case_id)
     full_dir = os.path.join(root, rel_dir.replace("/", os.sep))
     os.makedirs(full_dir, exist_ok=True)
@@ -384,7 +396,7 @@ def _packets(case_id, run_id, addr, gates, status, root):
             v0.RUN_BINDING_FIELD: v0.RUN_BINDING_MEASURED,
             "address": {"folder": addr["folder"], "path": addr.get("path"), "words": addr["words"]},
             "required_content_gates": gates}
-    claim = {"schema_version": "v0.1", "case_id": case_id, "reported_claim": "reported_done",
+    claim = {"schema_version": "v0.1", "case_id": case_id, "reported_claim": claim_word,
              "reported_status": str(status), "unknowns": []}
     out = {}
     for key, obj in (("task_packet", task), ("result_packet", claim)):
@@ -404,6 +416,30 @@ def judge(tid, text, status, base, run_id=None, root=REPO):
     виной, а не проход мимо. Судья, падающий на своей задаче, закрыл бы её как зелёную."""
     if str(status) != "done":
         return None
+    return _judged(tid, text, status, base, CLAIM_DONE, CASE_DONE, run_id, root)
+
+
+def judge_parked(tid, text, base, run_id=None, root=REPO):
+    """ВЕРДИКТ ПО АДРЕСУ ДЛЯ РЯДА, ПРИПАРКОВАННОГО МАРКЕРОМ ГАРДА (06.09.2026).
+
+    ТОТ ЖЕ ПРИБОР И ТЕ ЖЕ ВЕТКИ, что у `judge` — отличаются ровно два поля пакета, и оба
+    честные: `reported_status` = `needs_approval` (ряд действительно припаркован, а не сдан) и
+    `reported_claim` = `unknown` (заявки исполнителя нет вовсе: его stdout выброшен там же, где
+    родилась карточка гарда, — `pc_orchestrator._run_task_impl` возвращает карточку, а не отчёт).
+
+    ЗАЧЕМ ОТДЕЛЬНАЯ ДВЕРЬ, А НЕ `judge(..., "done", ...)`. Второе — это подлог: прибор получил бы
+    заявку «исполнитель сказал done» там, где исполнитель не сказал ничего, и пакет заявки на
+    диске врал бы будущему читателю. Вердикт от этого не изменился бы ни в одном случае (ни один
+    гейт V0 на `reported_claim` не смотрит — он его только несёт), и ровно поэтому подлог был бы
+    ДАРОМ: цена нулевая, вред молчаливый.
+
+    Своего суждения о «сделано» здесь нет ни одной ветки: вердикт — дословный ответ того же V0."""
+    return _judged(tid, text, "needs_approval", base, CLAIM_NONE, CASE_PARKED, run_id, root)
+
+
+def _judged(tid, text, status, base, claim_word, case_prefix, run_id, root):
+    """ОБЩЕЕ ТЕЛО обоих судов (см. `judge` и `judge_parked`). Отдельной публичной двери у него
+    нет намеренно: гейт «судим только то, что заявлено сделанным» обязан стоять у входа."""
     try:
         addr = (base or {}).get("address") or read_address(text)
         if not addr:
@@ -467,10 +503,10 @@ def judge(tid, text, status, base, run_id=None, root=REPO):
                                 "до захода (дословная копия «%s») — файл старше начала захода, "
                                 "продуктом он не стал" % (chosen, twin), addr, chosen)
         run_id = run_id or run_token(tid)
-        case_id = "pc-done-%s" % (tid if tid not in (None, "") else "unknown")
+        case_id = "%s-%s" % (case_prefix, tid if tid not in (None, "") else "unknown")
         gates = [{"gate_id": GATE_ID, "artifact_id": ARTIFACT_ID, "type": "path_or_text_contains_ci",
                   "params": {"text": words}}]
-        packets = _packets(case_id, run_id, addr, gates, status, root)
+        packets = _packets(case_id, run_id, addr, gates, status, root, claim_word)
         bundle = {
             "schema_version": "v0.1", "case_id": case_id, "workspace_root": root, "run_id": run_id,
             "task_packet": packets["task_packet"], "result_packet": packets["result_packet"],
