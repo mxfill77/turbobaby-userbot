@@ -927,6 +927,44 @@ class TestPureLogic(unittest.TestCase):
         self.assertNotIn("ДИРЕКТИВА МЕНЕДЖЕРА",                  # без директивы блока нет
                          suggest.make_system_prompt("FAQ", "ru"))
 
+    def test_paklok_in_prompt_is_490_and_agrees_with_the_live_zones(self):
+        """ЗАМОК ЗОНЫ ПАКЛОК (решение владельца 06.09.2026-3, дословно «паклок — 490»).
+
+        ЧТО ЗДЕСЬ СТЕРЕЖЁТСЯ И ПОЧЕМУ ИМЕННО ПРОМПТ. Цену доставки в боте называют ДВЕ сетки:
+        живой резолвер зон (`delivery` → `delivery_zones_get`) и СТАТИЧЕСКАЯ строка критфактов,
+        которая уезжает в системный промпт ВСЕГДА. Резолвер про Паклок говорил 490 и до правки;
+        спорила только строка промпта — она держала Паклок в группе 390 вместе с Кароном, и
+        клиент мог услышать 390 мимо резолвера. Юнита на это не было ни одного: до 06.09
+        расхождение двух сеток не краснело нигде.
+
+        СВЕРКА ИДЁТ С ФИКСТУРОЙ ЖИВОЙ ДВЕРИ, а не с числом, переписанным сюда руками: число в
+        тесте, списанное с того же места, что и правка, доказывает только согласие с самим собой.
+        Формат фикстуры ПОЗИЦИОННЫЙ (`[name, lat, lon, price, radius]`) — правило-класс CLAUDE.md.
+        """
+        import io
+        fixt = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "fixtures", "delivery_zones_get.live.json")
+        with io.open(fixt, encoding="utf-8") as f:
+            live = {z[0]: z[3] for z in json.load(f)["zones"]}
+        self.assertEqual(live["Паклок"], 490)      # живая дверь — сторона, которую выбрал владелец
+        self.assertEqual(live["Карон"], 390)
+
+        sysp = suggest.make_system_prompt("FAQ", "ru")
+        line = re.search(r"Доставка по районам \(฿\):(.+?)Забор бесплатно\.", sysp, re.S)
+        self.assertIsNotNone(line, "строки доставки в промпте нет вовсе")
+        zones = {}
+        for chunk in line.group(1).replace("\n", " ").split(";"):
+            m = re.match(r"^(.+?)\s+([\d\-]+)$", chunk.strip().rstrip(".").strip())
+            if m:
+                for nm in m.group(1).split("/"):
+                    zones[nm.strip()] = m.group(2)
+        # Решение владельца — ровно про ОДНУ зону, и тест меряет обе стороны этой границы:
+        # Паклок обязан переехать к 490, Карон обязан ОСТАТЬСЯ на 390. Тест, забывший про
+        # соседа, пропустил бы «поправил группу целиком» — а это уже не то, что решил владелец.
+        self.assertEqual(zones.get("Паклок"), str(live["Паклок"]))
+        self.assertEqual(zones.get("Карон"), str(live["Карон"]))
+        self.assertNotIn("Карон/Паклок", sysp)
+
     def test_generation_default_rule_in_prompt(self):
         # Глобальное правило поколений в системном промпте (кейс @cryptopeppa 15.07): по умолчанию
         # ТОЛЬКО актуальное поколение (New Gen), без годов и без «старый»; прежнее/года — по явному
