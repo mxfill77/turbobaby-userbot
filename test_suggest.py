@@ -4408,6 +4408,64 @@ class TestPriceSheetManyVariantsRobust(unittest.TestCase):
         self.assertIn("XMAX 300", block)                   # успевшие модели в сетке
         self.assertNotIn("ADV 350\n• Сутки: 749 ฿", block)  # висящий юнит не дождались — без цифр
 
+    # ── КОНТРФАКТ ПО ЗВЕНУ «СЛЕД С ЧИСЛОМ» (06.09.2026, задание 00-m-sheet-deadline.0906) ──────
+    # Пара обязана быть ПАРОЙ: одна сборка упирается в дедлайн и оставляет число, ВТОРАЯ на том же
+    # парке и той же двери укладывается и не оставляет НИЧЕГО. Без второй половины «след есть»
+    # означало бы всего лишь «строка в коде есть», а не «строка появляется тогда и только тогда,
+    # когда порог сработал»: лог, который пишется всегда, ничего не различает.
+
+    def test_deadline_that_fired_leaves_a_number_not_silence(self):
+        # МЕДЛЕННАЯ сборка: ADV висит дольше дедлайна → порог обязан назвать ЧИСЛО выброшенного
+        # (сколько котировок и из скольких) и ЧИСЛО моделей, которых клиент не увидит вовсе.
+        import unittest.mock as mock
+        with mock.patch.object(suggest, "_SHEET_DEADLINE", 1):
+            with self.assertLogs("suggest", level="WARNING") as cm:
+                suggest.price_sheet("2026-07-15", getter=self._getter(slow=("ADV",), delay=8.0))
+        fired = [m for m in cm.output if "ПОРОГ СРАБОТАЛ" in m]
+        self.assertEqual(1, len(fired), "сработавший дедлайн обязан оставить РОВНО одну сводку")
+        # Число выброшенного названо обеими сторонами дроби, а не одной.
+        self.assertRegex(fired[0], r"выбросил 18 quote из 48")
+        # Парк класса: ADV 6 юнитов × 3 срока = 18 котировок, и это ВСЯ модель ADV 350.
+        self.assertRegex(fired[0], r"Моделей срезано ЦЕЛИКОМ 1 из 4")
+        self.assertIn("ADV 350", fired[0])
+        # Ложная причина закрыта: модель, срезанная целиком, зовётся дедлайном, а не непроверенностью.
+        by_model = [m for m in cm.output if "ADV 350 в сетку НЕ вошла" in m]
+        self.assertEqual(1, len(by_model))
+        self.assertIn("ДЕДЛАЙН", by_model[0])
+        self.assertIn("срезал ВСЕ 18 её котировки", by_model[0])
+        self.assertNotIn("занятость НЕ ПРОВЕРЕНА (признака нет в ответе)", by_model[0])
+
+    def test_a_build_that_fits_leaves_no_trace_at_all(self):
+        # ОБЫЧНАЯ сборка на БОЕВОМ значении дедлайна: та же дверь, тот же парк, но без висящих
+        # юнитов. Порог не срабатывает — и не смеет написать о себе ни строки: иначе владелец
+        # каждый день читал бы аварию там, где её нет, и перестал бы читать вовсе.
+        with self.assertLogs("suggest", level="INFO") as cm:
+            rows = suggest.price_sheet("2026-07-15", getter=self._getter())
+        self.assertTrue(rows)
+        self.assertEqual([], [m for m in cm.output if "ПОРОГ СРАБОТАЛ" in m])
+        self.assertEqual([], [m for m in cm.output if "не уложился в дедлайн" in m])
+        # И сводка честно говорит ноль, а не молчит о разрезе.
+        built = [m for m in cm.output if "сетка построена за" in m]
+        self.assertEqual(1, len(built))
+        self.assertIn("из них дедлайном 0", built[0])
+        self.assertIn("из них дедлайном срезаны целиком 0", built[0])
+
+    def test_the_deadline_value_is_taken_from_the_measurement_not_from_a_round_number(self):
+        # ХРАПОВИК ЗАМЕРА. Значение обязано остаться привязанным к своему замеру 06.09: худшая
+        # измеренная сборка плохого окна × двукратный запас. Разъедется код с замером —
+        # покраснеет здесь, а не через 16 суток на живом клиенте (класс протухания порога).
+        worst_measured, median_measured = 118.4, 104.7   # 12 повторов 06.09, плохое окно двери
+        self.assertEqual(round(2 * worst_measured, 1), float(suggest._SHEET_DEADLINE))
+        # И порог обязан остаться ВЫШЕ медианы того, что терпит: ниже медианы — гарантированная ложь.
+        self.assertGreater(suggest._SHEET_DEADLINE, median_measured)
+        # ...и НИЖЕ аналитического потолка сборки, иначе он мёртвый код, а не порог: ⌈111/8⌉
+        # очередей на место × собственный потолок двери (pricing.HTTP_TIMEOUT) = предел сборки,
+        # у которой ВСЕ вызовы умерли по таймауту. Законной сборки выше этого числа не бывает.
+        import math
+        hard_ceiling = math.ceil(111 / 8) * suggest.pricing.HTTP_TIMEOUT
+        self.assertEqual(280, hard_ceiling)
+        self.assertLess(suggest._SHEET_DEADLINE, hard_ceiling)
+
 
 class TestPriceSheetAvailability(unittest.TestCase):
     """ЗАНЯТОСТЬ НА МНОГОМОДЕЛЬНОМ ПУТИ (20.08.2026). До правки сетка квотировала ВЕСЬ парк и

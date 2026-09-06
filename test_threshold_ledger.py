@@ -100,8 +100,10 @@ class TestLiveTree(unittest.TestCase):
 
     def test_ratchet_of_thresholds_without_measurement(self):
         """ХРАПОВИК. «Замера нет» — законный исход, и потому в него можно СБЕЖАТЬ. Замок один:
-        число таких порогов не смеет расти. Замер 06.09 — 12; растёт только с разрешения."""
-        self.assertLessEqual(self.out["counts"][tl.NO_MEASURE], 12,
+        число таких порогов не смеет расти. Заведён 06.09 на 12; в тот же день ЗАТЯНУТ до 11 —
+        `_SHEET_DEADLINE` получил свой замер (12 повторов боевой сборки). Храповик, который не
+        затягивается после выясненного порога, разрешает молча вернуться назад."""
+        self.assertLessEqual(self.out["counts"][tl.NO_MEASURE], 11,
                              "порогов без замера стало больше — это регресс, а не мелочь")
         self.assertLessEqual(self.out["counts"][tl.NOT_A_THRESHOLD], 1)
 
@@ -109,8 +111,8 @@ class TestLiveTree(unittest.TestCase):
         """п.6 задания: числа отчёта считает КОД, а не рука. Разъедутся — покраснеет тут."""
         c = self.out["counts"]
         self.assertEqual(21, self.out["total"])
-        self.assertEqual(8, c[tl.OK])
-        self.assertEqual(12, c[tl.NO_MEASURE])
+        self.assertEqual(9, c[tl.OK])            # 8 при заведении реестра + _SHEET_DEADLINE 06.09
+        self.assertEqual(11, c[tl.NO_MEASURE])   # 12 при заведении − выясненный _SHEET_DEADLINE
         self.assertEqual(1, c[tl.NOT_A_THRESHOLD])
         self.assertEqual(2, len(self.out["with_unit_limit"]))
 
