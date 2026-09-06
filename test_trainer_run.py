@@ -1410,6 +1410,18 @@ class KontrolnayaTochkaNabora(unittest.TestCase):
         self.assertIn("критерий", pt2.reset)
         self.assertEqual(pt2.done, {})
 
+    def test_prichina_pokazyvaet_DVA_RAZNYH_znacheniya_a_ne_dva_odinakovyh(self):
+        """Живой замер 07.09: критерий на 2 и на 3 круга совпадает первыми 46 символами, и обрезка
+        печатала «X против X» — прибор называл расхождение и показывал два одинаковых значения."""
+        why = tr.basis_diff(self.basis(criterion=tr.criterion_text(2)),
+                            self.basis(criterion=tr.criterion_text(3)))
+        self.assertEqual(len(why), 1)
+        left, right = why[0].split(" против ")
+        self.assertNotEqual(left.split(": ", 1)[1], right,
+                            "причина показала два одинаковых значения — читатель решит, что врут")
+        self.assertIn("2", left)
+        self.assertIn("3", right)
+
     def test_otr_pravki_dereva_otkaz(self):
         """Коммит тот же, а код на диске другой: правка дерева — это другой замер."""
         pt2 = self._green_point_then(tree="11112222aaaabbbb")
