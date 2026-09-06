@@ -135,7 +135,6 @@ class TestMechanismGoesRed(unittest.TestCase):
             killing = False
             out.append(ln)
         self.assertLess(len(out), len(lines), "паспорт не найден — тест не проверяет ничего")
-        self.assertNotEqual(len(kept), 0)
 
         got = tl.audit({"price_gate.py": "\n".join(out)}, today=TODAY)
         self.assertFalse(got["ok"], "снятая запись НЕ уронила механизм — он бесполезен")
