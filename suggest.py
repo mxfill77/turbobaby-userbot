@@ -706,14 +706,46 @@ PLAYBOOK_FILE = os.path.join(BASE_DIR, "manager-bot", "docs", "playbook.md")
 PLAYBOOK_MAX_RULES = int(os.getenv("PLAYBOOK_MAX_RULES", "100") or "100")
 
 
-def load_playbook():
-    """Текст книги правил из PLAYBOOK_FILE. Нет файла/пусто/ошибка чтения → '' (FAIL-SAFE:
-    генерация не ломается, блок в промпте просто не появляется)."""
+def load_playbook_file():
+    """СЫРОЙ текст книги с диска, без подстановки. Нет файла/пусто/ошибка чтения → '' (FAIL-SAFE:
+    генерация не ломается, блок в промпте просто не появляется).
+
+    Зовут его те, кто книгу ПРАВИТ (показ /rules, точечное удаление, поиск конфликта перед
+    записью): их номера и матчинг обязаны совпадать с ФАЙЛОМ, который они мутируют. До 06.09
+    эту роль исполнял `load_playbook`; теперь тот отдаёт текст ДЛЯ ПРОМПТА и с файлом уже не
+    совпадает."""
     try:
         with open(PLAYBOOK_FILE, encoding="utf-8") as f:
             return f.read().strip()
     except Exception:
         return ""
+
+
+def load_playbook():
+    """Книга правил В ТОМ ВИДЕ, В КАКОМ ОНА ИДЁТ В ПРОМПТ (подключено 06.09.2026).
+
+    ИСТОЧНИК ВЫУЧЕННЫХ ПРАВИЛ — БАЗА УРОКОВ `lesson_store`, и только состояние `актив`.
+    Секция «Выученные правила» книги ЗАМЕЩАЕТСЯ действующими уроками базы целиком; прочие
+    секции книги (стиль/факты/запреты — они уроками не являются и в базу не переносились)
+    идут из файла как раньше. Отсюда ровно то разделение, ради которого затея:
+
+      • действующий урок (`актив`) в ответ ПОПАДАЕТ;
+      • кандидат (записан, причина не названа) НЕ попадает ни одной веткой — `lesson_store.active`
+        сравнивает состояние с `актив`, и кандидат не совпадает;
+      • снятый урок НЕ попадает — та же ветка;
+      • буллет, дописанный/поправленный в КНИГЕ руками, ответ больше НЕ меняет: секция
+        замещается, а не объединяется (объединение оставило бы книгу вторым источником, и
+        расхождение шло бы молча).
+
+    ТРЕТИЙ ИСХОД ЕСТЬ И ОН НЕ «ПУСТО»: база не прочитана (файла нет, импорт не удался, все
+    строки неразобраны) → возвращается КНИГА как раньше. Пустая секция при этом означала бы
+    «действующих уроков ноль», а это другое утверждение — см. `active_lesson_bullets`.
+    Откат целиком: `LESSON_BASE_READ_OFF=1`."""
+    text = load_playbook_file()
+    bullets, read_ok = active_lesson_bullets()
+    if not read_ok:
+        return text
+    return _put_learned_section(text, bullets)
 
 
 _LEARNED_HEADER = "## Выученные правила"
@@ -748,6 +780,103 @@ def _playbook_learned_rules(text):
             if r:
                 out.append(r)
     return out
+
+
+# --- ИСТОЧНИК ВЫУЧЕННЫХ ПРАВИЛ: база уроков (подключено 06.09.2026) ------------------------
+# ЧТО ИЗМЕНИЛОСЬ ОДНОЙ СТРОКОЙ: до 06.09 выученные правила ехали в промпт ИЗ ФАЙЛА книги
+# (`manager-bot/docs/playbook.md`); теперь — ИЗ БАЗЫ `lesson_store.tsv`, разрез `актив`. Книга
+# осталась на диске байт в байт и стала СНИМКОМ: её читают только те, кто её же и правит
+# (`list_playbook_rules` / `find_playbook_conflict` / `remove_playbook_rule` / append), и
+# восстановление (`docs/lesson_base/`).
+#
+# ПОЧЕМУ ЗАМЕЩЕНИЕ, А НЕ ОБЪЕДИНЕНИЕ. Объединение оставило бы книгу вторым источником: правило,
+# дописанное в неё руками или прежним `append_playbook_rule`, продолжало бы влиять на клиента
+# МИМО ворот «действующий урок всегда с причиной». Ровно этого разделения затея и добивается,
+# поэтому секция книги замещается целиком.
+#
+# ЦЕНА ЭТОГО РЕШЕНИЯ НАЗВАНА ВСЛУХ, А НЕ СПРЯТАНА: `lesson_router._style_sink` и
+# `moderation_core` по-прежнему дописывают поведенческое правило В КНИГУ — с 06.09 такая запись
+# до ответа НЕ доходит. На день подключения расхождения ноль (9 буллетов книги = 9 действующих
+# уроков базы, тексты посимвольно равны), но оно начнётся с первой же такой записи. Перевод
+# писателей на базу — отдельное решение, а не хвост подключения чтения.
+LESSON_BASE_PATH = None            # None → боевая таблица lesson_store.STORE_PATH; тесты ставят свою
+LESSON_BASE_OFF = _flag("LESSON_BASE_READ_OFF")   # объявленный откат: чтение базы выключено целиком
+
+_LESSON_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _lesson_bullet(les):
+    """Действующий урок → буллет секции «Выученные правила» ТОЙ ЖЕ формы, что пишет
+    `append_playbook_rule`: «- (ГГГГ-ММ-ДД) текст». Форма важна не для красоты: по ней
+    `_playbook_learned_rules` и `list_playbook_rules` узнаю́т правило.
+
+    Перевод строки внутри урока СХЛОПЫВАЕТСЯ. Урок многострочен почти всегда, а секция книги
+    строчная: неcхлопнутый урок разорвал бы её и превратился бы в несколько «правил», причём
+    молча. Дата берётся из поля `когда` базы; штамп нераспознан → буллет без даты (это честнее
+    подставленного «сегодня»)."""
+    body = " ".join(str(getattr(les, "correct", "") or "").split())
+    if not body:
+        return ""
+    day = str(getattr(les, "when", "") or "")[:10]
+    return "- (%s) %s" % (day, body) if _LESSON_DAY_RE.match(day) else "- " + body
+
+
+def active_lesson_bullets(path=None):
+    """Действующие уроки базы → (кортеж буллетов, ПРОЧИТАНА ЛИ БАЗА).
+
+    ВТОРОЙ ЧЛЕН ПАРЫ — НЕ УКРАШЕНИЕ, А ТРЕТИЙ ИСХОД. Пустой кортеж отвечает на два разных
+    вопроса, и путать их нельзя: `((), True)` значит «база прочитана, действующих уроков ноль»
+    (тогда секция в промпте пуста — это и есть отзыв урока в действии), а `((), False)` значит
+    «источник не прочитан» — и тогда вызывающий возвращается к книге-снимку, а не объявляет,
+    что уроков нет. Отсутствие файла базы `lesson_store.load` сам называет состоянием
+    `exists=False`, а не притворной пустотой; неразобранные строки — `reading.blind`.
+
+    Кандидатов здесь нет ни одной веткой: отбор идёт `lesson_store.active`, а он сравнивает
+    состояние с `актив`. Своего парсера таблицы тут нет и быть не должно."""
+    if LESSON_BASE_OFF:
+        return (), False
+    try:
+        import lesson_store
+        store = lesson_store.load(LESSON_BASE_PATH if path is None else path)
+    except Exception as e:                                  # noqa: BLE001 — FAIL-SAFE пути ответа
+        log.warning("база уроков не прочитана (%s) — в промпт идёт книга-снимок", e)
+        return (), False
+    if not store.exists:
+        return (), False
+    if store.reading.blind:
+        log.warning("база уроков: %s — в промпт идёт книга-снимок", store.reading.say("строк"))
+        return (), False
+    bullets = tuple(b for b in (_lesson_bullet(les) for les in lesson_store.active(store.lessons)) if b)
+    return bullets, True
+
+
+def _put_learned_section(text, bullets):
+    """Текст книги + буллеты базы → текст для промпта. Секция «Выученные правила» замещается
+    ЦЕЛИКОМ; заголовков и порядка прочих секций не трогаем.
+
+    Буллетов ноль → секции нет вовсе, вместе с заголовком: пустой заголовок в промпте — это
+    строка, которой модель не может следовать, а «действующих уроков нет» она выражает хуже,
+    чем отсутствие блока."""
+    lines = (text or "").splitlines()
+    body = [b for b in bullets if b]
+    start = next((i for i, ln in enumerate(lines)
+                  if ln.strip().lower().startswith(_LEARNED_HEADER.lower())), None)
+    if start is None:
+        if not body:
+            return (text or "").strip()
+        return ((text or "").rstrip() + "\n\n" + _LEARNED_HEADER + "\n" + "\n".join(body)).strip()
+    end = next((j for j in range(start + 1, len(lines)) if lines[j].strip().startswith("## ")),
+               len(lines))
+    out = lines[:start]
+    for chunk in (([_LEARNED_HEADER] + body) if body else [], lines[end:]):
+        if not chunk:
+            continue
+        while out and not out[-1].strip():
+            out.pop()
+        if out:
+            out.append("")
+        out.extend(chunk)
+    return "\n".join(out).strip()
 
 
 def append_playbook_rule(rule, now=None):
@@ -826,7 +955,9 @@ def find_playbook_conflict(rule, text=None):
     пересечение содержательных слов ИЛИ вложенность), но ПРОТИВОПОЛОЖНАЯ полярность (одно с
     отрицанием, другое без). → текст конфликтующего правила ЛИБО '' (клэша нет). Это НЕ дедуп:
     дедуп ловит похожие ОДНОЙ полярности, здесь — похожие ПРОТИВОПОЛОЖНОЙ. text=None → боевой
-    playbook (load_playbook); в тестах передаётся явно. FAIL-SAFE: пусто/битьё → ''."""
+    playbook-ФАЙЛ (load_playbook_file); в тестах передаётся явно. FAIL-SAFE: пусто/битьё → ''.
+    ФАЙЛ, А НЕ ПРОМПТ (06.09.2026): разрешение конфликта (`replace_playbook_rule`) правит книгу,
+    поэтому и искать конфликт надо в ней — иначе замена била бы не туда."""
     rule = " ".join(str(rule or "").split()).strip()
     if not rule:
         return ""
@@ -834,7 +965,7 @@ def find_playbook_conflict(rule, text=None):
     if not topic_new:
         return ""
     pol_new = _rule_polarity(rule)
-    text = load_playbook() if text is None else text
+    text = load_playbook_file() if text is None else text
     for e in _playbook_learned_rules(text):
         topic_old = _rule_topic(e)
         if not topic_old:
@@ -899,8 +1030,14 @@ def replace_playbook_rule(old_rule, new_rule, now=None):
 def list_playbook_rules(text=None):
     """Выученные правила книги как список dict {'n','date','rule'} в порядке файла (n — 1-based,
     совпадает и с показом /rules, и с номером-селектором remove_playbook_rule). text=None → боевой
-    playbook (load_playbook); в тестах передаётся явно. FAIL-SAFE: пусто/битьё → []."""
-    text = load_playbook() if text is None else text
+    playbook-ФАЙЛ (load_playbook_file); в тестах передаётся явно. FAIL-SAFE: пусто/битьё → [].
+
+    ФАЙЛ, А НЕ ПРОМПТ (06.09.2026), и это осознанная граница: `remove_playbook_rule` удаляет
+    N-й буллет ИЗ ФАЙЛА, поэтому нумерация показа обязана быть нумерацией файла — иначе «удали 3»
+    било бы не по тому правилу. ЦЕНА названа вслух: с 06.09 удаление правила через /rules больше
+    НЕ гарантирует, что бот перестанет по нему отвечать — по нему отвечает действующий урок базы,
+    и снимает его `lesson_store.withdraw`. Свести показ и снятие на базу — отдельное решение."""
+    text = load_playbook_file() if text is None else text
     out, inside, n = [], False, 0
     for ln in (text or "").splitlines():
         s = ln.strip()
