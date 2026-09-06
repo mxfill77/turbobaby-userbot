@@ -117,6 +117,8 @@ load_dotenv()
 os.environ.setdefault("TURBOBABY_TEST_LOGS", "1")
 
 import client_contour                                                    # noqa: E402
+import price_source                                                      # noqa: E402
+import season_gate                                                       # noqa: E402
 import suggest                                                           # noqa: E402
 import trainer                                                           # noqa: E402
 
@@ -133,6 +135,123 @@ _LAT_RE = re.compile(r"[a-zA-Z]")
 # «• Сутки:» / «• Неделя:» — строки СЕТКИ прайса по парку. Для контрпримера (клиент спросил ТОЛЬКО
 # про депозит) их появление и есть провал «вывалили прайс».
 _SHEET_LINE_RE = re.compile(r"^\s*[•\-\*]\s*(?:сутки|неделя|месяц|day|week|month)\s*:", re.I | re.M)
+
+# ── ТРЕТИЙ ИСХОД: ОКНО СЧИТАЕТСЯ ИЗ ЖИВОЙ ТАБЛИЦЫ, А НЕ ЗАШИВАЕТСЯ ────────────────────────────
+# Кейс третьего исхода («цену не считаю, зовёт человека», `season_gate`) обязан идти на сроке,
+# который ДЕЙСТВИТЕЛЬНО пересекает границу сезонов. Зашитые даты этого не держат, и вот ЖИВОЕ
+# доказательство, а не опасение: сама реплика клиента, с которой снят кейс 17
+# (`logs/userbot_stderr.log:51830`, 03.08.2026), просит цену «с 27.12 по 18.01» — и обе эти даты
+# лежат ВНУТРИ одного периода P5 ПИК (12-15…02-05), то есть границу НЕ пересекают вовсе
+# (`season_gate.span` → `one`, замер 07.09.2026). Зашей мы даты живой фразы — кейс молча проверял
+# бы обычный расчёт под именем третьего исхода. Поэтому окно СЧИТАЕТСЯ от ближайшей границы
+# `price_source.json` и ПРОВЕРЯЕТСЯ `season_gate.span`; не сошлось — исход «неизвестно», а не
+# зелёное (молчание таблицы выздоровлением не является — то же правило, что у слоя ожиданий).
+NEEDS_SEASON_CROSS = "season_cross"
+CROSS_BACK = 5        # суток ДО границы
+CROSS_FWD = 5         # суток ПОСЛЕ границы (обе даты входят в срок — правило листа «Календарь»)
+CROSS_MARGIN = 3      # запас, чтобы старт был в будущем и пайплайн не ушёл в «уточните даты»
+CROSS_HORIZON = 400   # дальше года границы искать незачем — их девять на круг
+
+# ЦЕНОВАЯ ЦИФРА ТРЕТЬЕГО ИСХОДА. Запрет шире, чем «число с ฿»: записка `season_gate` отдельной
+# строкой запрещает и «от … ฿», и диапазон, и СРЕДНЕЕ по периоду — значит ловить надо ЛЮБОЕ
+# число, звучащее ценой, а не только помеченное валютой.
+_MONEY_RE = re.compile(
+    r"(?:от|около|примерно|from|about|around)?\s*\d[\d\s]{0,8}\d*\s*"
+    r"(?:฿|бат\w*|бахт\w*|thb|baht|usd|\$|€)"
+    r"|\d[\d\s]{0,8}\d*\s*(?:/|за|в|per)\s*(?:день|сутки|сут\b|неделю|месяц|day|week|month)",
+    re.I)
+_NUM_RE = re.compile(r"\d[\d\s]{0,8}\d|\d+")
+_YEAR_RE = re.compile(r"^(?:19|20)\d\d$")
+# Разрешённая цифра прощается ТОЛЬКО в имени модели — то есть сразу за латинским словом
+# («XMAX 300», «CB 650R»). Голый список номеров прощал бы и «примерно 650», а это уже ориентир
+# цены: разрешать надо КОНТЕКСТ, а не число.
+_MODEL_CTX_RE = re.compile(r"[A-Za-z][A-Za-z\-]{0,12}[\s\-]*$")
+
+
+def price_hits(text, allow=()):
+    """Всё, что звучит ЦЕНОЙ, в тексте клиента. → список найденного (пусто = цены нет ни в каком виде).
+
+    Два сита, и второе — главное:
+      1. число С ВАЛЮТОЙ или СО СТАВКОЙ («307 ฿», «от 1535 бат», «300 в день») — цена всегда,
+         даже если само число разрешено кейсом: «300» в «XMAX 300» и «300 ฿» — разные факты;
+      2. ЛЮБОЕ число от трёх знаков, кроме годов и кроме цифр ИМЕНИ модели (число из `allow`,
+         стоящее сразу за латинским словом). Диапазон «1200–1500», среднее «около 1350» и
+         ориентир «от 1200» попадают сюда все три — им не нужен ни знак валюты, ни слово «цена»,
+         а клиенту они звучат ценой одинаково.
+    Годы отданы СОСЕДНЕМУ чеку («нет годов»): одна вина — один красный, иначе отчёт врёт числом."""
+    allow = {str(a).strip() for a in allow if str(a).strip()}
+    text = text or ""
+    out = []
+    for m in _MONEY_RE.finditer(text):
+        hit = m.group(0).strip()
+        if hit and hit not in out:
+            out.append(hit)
+    for m in _NUM_RE.finditer(text):
+        raw = m.group(0).strip()
+        num = re.sub(r"\s+", "", raw)
+        if len(num) < 3 or _YEAR_RE.match(num):
+            continue
+        if num in allow and _MODEL_CTX_RE.search(text[:m.start()]):
+            continue                       # цифра ИМЕНИ модели, а не цены
+        if raw not in out:
+            out.append(raw)
+    return out
+
+
+def cross_window(today=None, doc=None):
+    """Окно аренды, ПЕРЕСЕКАЮЩЕЕ ближайшую границу сезонов, — из ЖИВОЙ таблицы периодов.
+    → dict(ok, text, iso_start, iso_end, seam, why). `ok=False` — окна нет, и `why` называет причину.
+
+    Границу ищем ПО ФАЙЛУ (`price_source.period_of`), своей копии календаря здесь нет: перепишут
+    сезоны — поедет и окно. Найденное окно СВЕРЯЕТСЯ `season_gate.span`, и несошедшаяся сверка
+    даёт `ok=False`, а не «наверное пересекает»."""
+    out = {"ok": False, "text": "", "iso_start": "", "iso_end": "", "seam": "", "why": ""}
+    d = today or suggest.today_phuket()
+    doc = price_source.load() if doc is None else doc
+    if doc is None:
+        out["why"] = "таблица сезонов не прочиталась (price_source.json) — окно считать нечем"
+        return out
+    day = d + datetime.timedelta(days=CROSS_MARGIN + CROSS_BACK)
+    for _ in range(CROSS_HORIZON):
+        try:
+            prev = price_source.period_of(doc, day - datetime.timedelta(days=1))
+            cur = price_source.period_of(doc, day)
+        except Exception as exc:                  # noqa: BLE001 — отказ файла ≠ «границы нет»
+            out["why"] = "периоды не разобрались (%s)" % type(exc).__name__
+            return out
+        if prev is not None and cur is not None and prev.get("key") != cur.get("key"):
+            ds = day - datetime.timedelta(days=CROSS_BACK)
+            de = day + datetime.timedelta(days=CROSS_FWD - 1)
+            verdict, _names, detail = season_gate.span(ds.isoformat(), de.isoformat(), doc=doc)
+            if verdict != season_gate.SEASON_CROSSES:
+                out["why"] = ("окно %s → %s границу НЕ пересекает (%s: %s)"
+                              % (ds.isoformat(), de.isoformat(), verdict, detail))
+                return out
+            out.update(ok=True, iso_start=ds.isoformat(), iso_end=de.isoformat(), seam=detail,
+                       text="с %02d.%02d по %02d.%02d" % (ds.day, ds.month, de.day, de.month))
+            return out
+        day += datetime.timedelta(days=1)
+    out["why"] = "границы сезонов в ближайшие %d суток не нашлось" % CROSS_HORIZON
+    return out
+
+
+def cross_guard(case, transcript, ph=None):
+    """Кейс третьего исхода судим ТОЛЬКО на окне, реально пересекающем границу. → причина или ''.
+
+    Непустая причина означает исход НЕИЗВЕСТНО (не зелёный и не красный): судить третий исход не
+    на его условии — это зелень по неверной причине, и она была бы МОЛЧАЛИВОЙ. Сверяем не свою
+    веру в плейсхолдер, а ДАТЫ, которые из реплики разобрал сам пайплайн."""
+    if str(case.get("needs") or "") != NEEDS_SEASON_CROSS:
+        return ""
+    cross = (ph or {}).get("cross") or {}
+    if cross and not cross.get("ok"):
+        return "окно через границу не собрано: " + (str(cross.get("why")) or "причина не названа")
+    h = suggest.extract_booking_hints(transcript)
+    verdict, _names, detail = season_gate.span(h.get("iso_start"), h.get("iso_end"))
+    if verdict == season_gate.SEASON_CROSSES:
+        return ""
+    return ("даты кейса границу сезонов НЕ пересекают (%s: %s) — кейс проверял бы обычный расчёт "
+            "под именем третьего исхода" % (verdict, detail))
 
 
 _IPC_ISOLATED = False
@@ -261,12 +380,19 @@ def placeholders(today=None):
     mo = d.month % 12 + 1
     nyr = yr + (1 if mo == 12 else 0)
     nmo = mo % 12 + 1
+    # ОКНО ЧЕРЕЗ ГРАНИЦУ СЕЗОНОВ — единственный плейсхолдер, который НЕ выводится из календаря
+    # месяцев: он считается из ЖИВОЙ таблицы периодов (узел «ТРЕТИЙ ИСХОД» выше). Не собралось —
+    # подставляем обычное окно, а кейс третьего исхода ГАСИТ `cross_guard` исходом «неизвестно»:
+    # молча позеленеть на непересекающих датах нельзя ни одной веткой.
+    cross = cross_window(today=d)
     return {
         "when": f"с 6 по 11 {_MONTHS_GEN[mo]}",                     # 5 дней
         "when_sloppy": f"с 6ого по 11ое {_MONTHS_GEN[mo]}",         # живая небрежная форма ТЕСТ-11
         "when_1d": f"с 6 по 7 {_MONTHS_GEN[mo]}",                   # ровно сутки
         "when_month": f"с 6 {_MONTHS_GEN[mo]} по 6 {_MONTHS_GEN[nmo]}",   # месяц+ (кап тарифа)
         "when_en": f"from {_MONTHS_EN[mo]} 6 to {_MONTHS_EN[mo]} 11",
+        "when_cross": cross["text"] or f"с 6 по 11 {_MONTHS_GEN[mo]}",    # через границу сезонов
+        "cross": cross,
         "year": str(yr), "year_next": str(nyr),
     }
 
@@ -477,6 +603,21 @@ def case_checks(case, draft, exp):
                         ("правило в тексте (%s)" % ("строку дописал КОД" if min_line in client
                                                     else "своими словами головы")) if reached
                         else "правила в тексте клиента НЕТ ни в каком виде"))
+    # 17. ТРЕТИЙ ИСХОД: цены нет НИ В КАКОМ ВИДЕ. Чек существует отдельно от `forbid` потому, что
+    # `forbid` меряет СЛОВА (`suggest.word_hit`), а запрещено здесь ЧИСЛО — и не одно конкретное,
+    # а любое: точное, «от … ฿», диапазон, среднее по периоду. Разрешённые цифры кейс называет
+    # ПОИМЁННО и с причиной (`forbid_price.allow`) — молча тут не разрешается ничего.
+    fp = case.get("forbid_price")
+    if fp:
+        allow = (fp.get("allow") or []) if isinstance(fp, dict) else []
+        money = price_hits(client, allow)
+        out.append(_chk("цены нет ни в каком виде", not money,
+                        "в ответе нет ни одной ценовой цифры: ни точной, ни «от … ฿», ни "
+                        "диапазона, ни среднего по периоду"
+                        + (" (разрешено кейсом: " + ", ".join(str(a) for a in allow) + ")"
+                           if allow else ""),
+                        ("цена прозвучала: " + ", ".join(money[:6])) if money
+                        else "ценовых цифр в тексте нет"))
     req = case.get("require_any") or []
     if req:
         # Токены, которые ТЕПЕРЬ закрывает строка КОДА, голове в зачёт не идут: зелёный чек над
@@ -684,6 +825,13 @@ def run_case(case, ph, log=print):
     подлежат — зелёный чек над текстом, который дописал код, ничего не доказывает."""
     isolate_ipc()                      # боевая мета/очередь недоступны по построению
     tr = build_transcript(case, ph)
+    # УСЛОВИЕ КЕЙСА ПРОВЕРЯЕТСЯ ДО ГОЛОВЫ. Кейс, объявивший `needs`, судится только на своём
+    # условии; не сошлось — «неизвестно» БЕЗ круга головы (и без его 47 секунд): зелёное по
+    # неверной причине хуже честного «проверить было нечем».
+    blocked = cross_guard(case, tr, ph)
+    if blocked:
+        return {"id": case.get("id"), "name": case.get("name"), "ok": False, "unknown": blocked,
+                "checks": [], "draft": "", "note": ""}
     case = dict(case, _transcript=tr)
     first = not trainer.has_manager_turn(tr)
     with _HeadWatch() as hw:

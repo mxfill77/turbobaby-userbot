@@ -9,6 +9,7 @@ test_trainer_run.py — ГОЛДЕНЫ безголового прогона т�
 import test_isolation  # noqa: F401 — TESTING=1, боевой IPC заблокирован
 import ast
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -17,6 +18,8 @@ import tempfile
 import unittest
 
 import client_contour as cc
+import price_source
+import season_gate
 import suggest
 import trainer_run as tr
 
@@ -935,14 +938,27 @@ class KriterijNaboraF(unittest.TestCase):
         self.assertEqual(tr.case_class({"id": 99, "require_any": ["что угодно"]}), tr.CLASS_NAME,
                          "новый кейс с require_any в класс не попал — вернулась лотерея")
 
-    def test_zhivoy_korpus_daet_rovno_tri_keisa_klassa_i_35_krugov(self):
-        """Цена критерия — не оценка, а СЧЁТ по живому корпусу: 16 кейсов, 3 в классе → 35 кругов."""
+    def test_zhivoy_korpus_daet_rovno_chetyre_keisa_klassa_i_38_krugov(self):
+        """Цена критерия — не оценка, а СЧЁТ по живому корпусу: 17 кейсов, 4 в классе → 38 кругов.
+
+        ЧИСЛА ПОИМЁННО (07.09.2026, заведение кейса 17 «третий исход»). Прежние — 16 / 3 / 35:
+          • 16 → 17: корпус вырос РОВНО на один кейс — станцию, где верный ответ есть «не считаю,
+            зовём человека». До него такой станции не было ни одной, и экзамен не различал третий
+            исход вовсе;
+          • 3 → 4 в классе: класс присваивает НЕ номер, а признак `require_any` в самом кейсе
+            (`case_class`). У кейса 17 он непустой по существу дела, а не ради круга: слова
+            передачи человеку — это и есть его ответ, и они сочиняются ГОЛОВОЙ, то есть подвержены
+            той же измеренной лотерее 4.3% на круг, ради которой критерий F и заведён;
+          • 35 → 38: 13 обычных кейсов × 2 круга = 26, плюс 4 кейса класса × 3 круга = 12. Ровно
+            +3 круга, и все три — новому кейсу; ни одному прежнему цена не изменилась.
+        Строгость НЕ ослаблена: здесь по-прежнему `assertEqual`, а не «не меньше трёх»."""
         cases, _sha = tr.load_cases()
         klass = [c for c in cases if tr.case_class(c)]
-        self.assertEqual(len(cases), 16)
-        self.assertEqual(sorted(str(c["id"]) for c in klass), ["10", "5", "6"])
-        self.assertEqual(sum(tr.rounds_for(c, 2) for c in cases), 35)
-        self.assertEqual(sum(2 for _c in cases), 32, "прежняя цена посчитана не по корпусу")
+        self.assertEqual(len(cases), 17)
+        self.assertEqual(sorted(str(c["id"]) for c in klass), ["10", "17", "5", "6"])
+        self.assertEqual(sum(tr.rounds_for(c, 2) for c in cases), 38)
+        self.assertEqual(13 * 2 + 4 * 3, 38, "разбор 38 кругов на слагаемые не сходится")
+        self.assertEqual(sum(2 for _c in cases), 34, "прежняя цена посчитана не по корпусу")
 
     def test_razvedka_i_regress_uroka_lishnih_krugov_ne_platyat(self):
         """`runs=1` зелёным не бывает ни одной веткой — большинству там нечего защищать."""
@@ -1053,6 +1069,155 @@ class KriterijNaboraF(unittest.TestCase):
         v = os.path.join(d, "verdict.json")
         self.assertTrue(tr.write_verdict(rec, v)[0])
         self.assertTrue(cc.trainer_green(C40, path=v, env={}))
+
+
+# ─────────────────── 8. ТРЕТИЙ ИСХОД: станция «цену называть НЕЛЬЗЯ» ─────────────────────────
+# Заведено 07.09.2026. До этого дня у экзамена не было НИ ОДНОЙ станции третьего исхода: корпус
+# спрашивал либо «число обязано прозвучать» (1,3,7,8,13,16), либо «сетку вываливать нельзя»
+# (4,15) — и оба вопроса про то, ЧТО СКАЗАТЬ, а не про право не считать вовсе. Кейс 17 несёт
+# третий: числа быть не должно НИ В КАКОМ ВИДЕ, и при этом ответ обязан ПРОЗВУЧАТЬ словами
+# передачи человеку. Живой головы здесь нет — предмет тестов ниже — сборка окна и чеки.
+
+class TretiyIskhodStanciya(unittest.TestCase):
+    DOC = {"season": {"periods": [
+        {"key": "P1", "name": "ИЮНЬ-СЕНТЯБРЬ", "from": "06-01", "to": "09-30"},
+        {"key": "P2", "name": "ОКТЯБРЬ", "from": "10-01", "to": "10-31"},
+        {"key": "P5", "name": "ПИК", "from": "12-15", "to": "02-05", "crosses_year": True},
+    ]}}
+
+    def case17(self):
+        cases, _sha = tr.load_cases()
+        by = {c["id"]: c for c in cases}
+        self.assertIn(17, by, "кейса третьего исхода в корпусе нет")
+        return by[17]
+
+    # ── окно СЧИТАЕТСЯ из живой таблицы и СВЕРЯЕТСЯ, а не объявляется ───────────────────────
+    def test_okno_schitaetsya_i_peresekaet_granicu(self):
+        w = tr.cross_window(today=datetime.date(2026, 9, 7), doc=self.DOC)
+        self.assertTrue(w["ok"], w["why"])
+        self.assertEqual((w["iso_start"], w["iso_end"]), ("2026-09-26", "2026-10-05"))
+        self.assertEqual(season_gate.span(w["iso_start"], w["iso_end"], doc=self.DOC)[0],
+                         season_gate.SEASON_CROSSES)
+        self.assertEqual(w["text"], "с 26.09 по 05.10")
+
+    def test_okno_edet_za_tablicey_a_ne_za_kalendarem(self):
+        """Сдвинули границу в таблице — поехало окно. Это и есть «даты не зашиты»."""
+        doc = {"season": {"periods": [
+            {"key": "A", "name": "А", "from": "01-01", "to": "11-14"},
+            {"key": "B", "name": "Б", "from": "11-15", "to": "12-31"}]}}
+        w = tr.cross_window(today=datetime.date(2026, 9, 7), doc=doc)
+        self.assertTrue(w["ok"], w["why"])
+        self.assertEqual((w["iso_start"], w["iso_end"]), ("2026-11-10", "2026-11-19"))
+
+    def test_tablicy_net_okna_net_i_prichina_nazvana(self):
+        """Мёртвая таблица → «не знаю», а не «наверное не пересекает»: молчание источника
+        выздоровлением не является (то же правило, что у слоя ожиданий ПК)."""
+        saved = price_source.load
+        self.addCleanup(setattr, price_source, "load", saved)
+        price_source.load = lambda *a, **k: None
+        w = tr.cross_window(today=datetime.date(2026, 9, 7))
+        self.assertFalse(w["ok"])
+        self.assertIn("price_source", w["why"])
+
+    def test_granicy_net_vovse_ne_zelenoe_a_prichina(self):
+        doc = {"season": {"periods": [{"key": "A", "name": "А", "from": "01-01", "to": "12-31"}]}}
+        w = tr.cross_window(today=datetime.date(2026, 9, 7), doc=doc)
+        self.assertFalse(w["ok"])
+        self.assertIn("границы сезонов", w["why"])
+
+    # ── ГЛАВНЫЙ ЗАМОК: не пересеклось → НЕИЗВЕСТНО, а не зелёное ────────────────────────────
+    def test_nepersechenie_daet_neizvestno_a_ne_zelenoe(self):
+        """КОНТРФАКТ зашитых дат: буквальные даты живой реплики (27.12→18.01) лежат в одном
+        периоде — кейс на них обязан стать «неизвестно», а не тихо позеленеть."""
+        case = dict(self.case17(), lines=["Подскажите x-max с 27.12 по 18.01 сколько будет стоить"])
+        tr_txt = tr.build_transcript(case, {})
+        why = tr.cross_guard(case, tr_txt, {"cross": {"ok": True}})
+        self.assertTrue(why, "непересекающее окно прошло как годное — зелень по неверной причине")
+        self.assertIn("НЕ пересекают", why)
+
+    def test_run_case_na_nepersekayushchem_okne_daet_neizvestno_bez_kruga_golovy(self):
+        """ЖИВОЙ `run_case`, а не только гард: на зашитых датах кейс отдаёт НЕИЗВЕСТНО и не
+        тратит круг головы вовсе (голова здесь не подменена — её просто не зовут)."""
+        case = dict(self.case17(), lines=["Подскажите x-max с 27.12 по 18.01 сколько будет стоить"])
+        res = tr.run_case(case, {"cross": {"ok": True}}, log=lambda *a, **k: None)
+        self.assertFalse(res["ok"], "непересекающее окно дало ЗЕЛЁНЫЙ круг")
+        self.assertTrue(res["unknown"], "исход назван не «неизвестно»")
+        self.assertEqual(res["checks"], [], "чеки посчитаны там, где судить было нечем")
+        self.assertEqual(res["draft"], "", "круг головы потрачен впустую")
+
+    def test_zhivaya_replika_svoimi_datami_granicu_ne_peresekaet(self):
+        """Тот же факт, снятый прямо с таблицы: основание запрета зашивать даты — измеренное."""
+        self.assertEqual(season_gate.span("2026-12-27", "2027-01-18", doc=self.DOC)[0],
+                         season_gate.SEASON_ONE)
+
+    def test_guard_molchit_na_chuzhih_keisah(self):
+        self.assertEqual(tr.cross_guard({"id": 1}, "что угодно", {}), "")
+
+    def test_nesobrannoe_okno_gasit_keis_s_prichinoy(self):
+        why = tr.cross_guard({"id": 17, "needs": "season_cross"}, "",
+                             {"cross": {"ok": False, "why": "таблица не прочиталась"}})
+        self.assertIn("таблица не прочиталась", why)
+
+    # ── ЧЕКИ РАЗЛИЧАЮТ ТРИ ИСХОДА: число / молчание / зов человека ──────────────────────────
+    def test_lyubaya_cenovaya_cifra_krasnaya(self):
+        for bad in ("итого 12500 ฿", "от 350 ฿ в сутки", "примерно 1200–1500 за весь срок",
+                    "в среднем 1350 в день", "выйдет 8 400 бат", "около 700 THB"):
+            self.assertTrue(tr.price_hits(bad, ["300"]), f"цена прошла молча: {bad}")
+
+    def test_razreshennye_cifry_modeli_ne_cena_a_s_valyutoy_snova_cena(self):
+        self.assertEqual(tr.price_hits("Уточню по XMAX 300 у коллеги", ["300"]), [])
+        self.assertTrue(tr.price_hits("XMAX 300 стоит 300 ฿ в день", ["300"]),
+                        "разрешённое число с валютой перестало быть ценой")
+
+    def test_razreshenie_deystvuet_tolko_v_imeni_modeli(self):
+        """Прощается КОНТЕКСТ, а не число: голый «примерно 650» — ценовой ориентир, а не имя."""
+        self.assertEqual(tr.price_hits("Подойдёт CB 650R", ["650"]), [])
+        self.assertTrue(tr.price_hits("Ну, где-то примерно 650, точнее скажет коллега", ["650"]),
+                        "ориентир цены прощён по списку разрешённых номеров")
+
+    def test_daty_srok_i_god_cenoy_ne_schitayutsya(self):
+        self.assertEqual(tr.price_hits("Окно с 26.09 по 05.10, это 10 суток", []), [])
+        self.assertEqual(tr.price_hits("поколение 2024", []), [],
+                         "год отнят у соседнего чека «нет годов» — одна вина, два красных")
+
+    def test_chek_treh_ishodov_sobran_i_nazvan(self):
+        case = self.case17()
+        exp = {"j_line": "", "delivery_line": "", "sheet_line": "", "min_term_line": "",
+               "min_term_pairs": [], "avail": "", "full_data": False,
+               "zone": None, "zone_price": None}
+        case = dict(case, _transcript="")
+        by = {c["name"]: c for c in tr.case_checks(
+            case, "Здравствуйте! Даты попали на стык сезонов — цену на такой срок считает "
+                  "человек, коллега вернётся с точной суммой.", exp)}
+        self.assertIn("цены нет ни в каком виде", by)
+        self.assertTrue(by["цены нет ни в каком виде"]["ok"])
+        self.assertTrue(by["обязательное упоминание"]["ok"], "зов человека не засчитан")
+
+    def test_chislo_krasnit_a_molchanie_tozhe_krasnoe(self):
+        case = dict(self.case17(), _transcript="")
+        exp = {"j_line": "", "delivery_line": "", "sheet_line": "", "min_term_line": "",
+               "min_term_pairs": [], "avail": "", "full_data": False,
+               "zone": None, "zone_price": None}
+        # ИСХОД «ЧИСЛО»: цена прозвучала → красный
+        by = {c["name"]: c for c in tr.case_checks(
+            case, "Здравствуйте! Ориентировочно от 450 ฿ в сутки, точнее скажет коллега.", exp)}
+        self.assertFalse(by["цены нет ни в каком виде"]["ok"], "названная цена прошла")
+        # ИСХОД «МОЛЧАНИЕ»: числа нет, но и человека не позвали → тоже красный
+        by = {c["name"]: c for c in tr.case_checks(
+            case, "Здравствуйте! Отличный выбор, XMAX 300 — надёжный скутер.", exp)}
+        self.assertTrue(by["цены нет ни в каком виде"]["ok"])
+        self.assertFalse(by["обязательное упоминание"]["ok"],
+                         "уход от ответа зачтён — станция перестала различать три исхода")
+
+    # ── корпус: станция ОДНА и она объявлена ────────────────────────────────────────────────
+    def test_keis_17_obyavlyaet_uslovie_i_zapret(self):
+        case = self.case17()
+        self.assertEqual(case.get("needs"), tr.NEEDS_SEASON_CROSS)
+        self.assertTrue(case.get("forbid_price"))
+        self.assertTrue(case.get("require_any"))
+        self.assertNotIn("price_figure", case.get("expect") or {},
+                         "станция третьего исхода требует цифру — это второй исход, а не третий")
+        self.assertIn("{when_cross}", " ".join(case["lines"]), "даты зашиты в реплику")
 
 
 if __name__ == "__main__":
