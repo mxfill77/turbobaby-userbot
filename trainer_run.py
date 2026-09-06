@@ -29,9 +29,14 @@ Bridge — ЖИВОЙ (read-only GET прайса/зон/FAQ): ожидания 
 который питает черновик, поэтому смена цен в листе вердикт не красит (правило-класс «проверка
 повторяет живой формат»).
 
-ЗЕЛЁНЫЙ ВЕРДИКТ (критерий из артефакта, §5) — все условия сразу:
-  • 12 кейсов корпуса, каждый прошёл ВСЕ применимые чеки (12 из 12, не «11 из 12»);
-  • ДВА прогона из двух (генератор недетерминирован — один прогон ничего не доказывает);
+ЗЕЛЁНЫЙ ВЕРДИКТ (критерий из артефакта, §5; с 07.09.2026 — ВАРИАНТ F, см. узел «КРИТЕРИЙ
+НАБОРА» ниже по файлу) — все условия сразу:
+  • 12 кейсов корпуса, каждый ЗАЧТЁН (12 из 12, не «11 из 12»);
+  • ДВА прогона из двух (генератор недетерминирован — один прогон ничего не доказывает), а
+    кейсам класса «обязательное упоминание» — ТРИ круга с зачётом большинством ≥2 из 3: у них
+    ИЗМЕРЕНА лотерея головы 4.3% на круг, и «ни одного красного» ломалось бы без дефекта
+    продукта в каждом шестом прогоне (замер a5f799a). Прощается только КРАСНОЕ МЕНЬШИНСТВО у
+    зачтённого кейса, и прощённый круг в счёт чеков не идёт вовсе;
   • дерево ЧИСТОЕ и `git rev-parse HEAD` не сдвинулся за время прогона (демон коммитит сам —
     вердикт, снятый на плывущем HEAD, удостоверял бы другой код);
   • НИ ОДНОГО исхода «неизвестно» (22.08.2026): голова, не давшая текста, зелёного не даёт ни
@@ -572,6 +577,103 @@ class _HeadWatch(object):
         return None
 
 
+# ────────────── КРИТЕРИЙ НАБОРА: ВАРИАНТ F ПО ИЗМЕРЕННОЙ ЛОТЕРЕЕ (07.09.2026) ────────────────
+# ЗАЧЕМ. Прежний критерий — «два круга, ни одного красного, у всех кейсов» — по арифметике не
+# выдерживает ИЗМЕРЕННОЙ лотереи головы. ЗАМЕР 06–07.09 (docs/artifacts/2026-09-06-частота-
+# лотереи-три-кейса-06.09.md, коммит a5f799a): частота красного круга БЕЗ дефекта продукта —
+# 4.3% у кейса 5 и 4.3% у кейса 6 (23 круга на кейс, объединённая выборка). При двух таких
+# кейсах «два круга без единого красного» даёт зелёный НАБОР лишь в 83.7% прогонов: каждый
+# шестой красный набор рождается лотереей, а не дефектом. Чтобы держать 90%, частота обязана
+# быть ≤2.6% на круг — она вдвое больше, и уменьшить её критерием нельзя, она свойство головы.
+#
+# ЧТО СДЕЛАНО (решение Штаба 07.09 — вариант F таблицы §5.3 того же артефакта): кейсам КЛАССА
+# «обязательное упоминание» — ТРИ круга с зачётом БОЛЬШИНСТВОМ (≥2 из 3), остальным — два круга
+# и все зелёные, как было. Цена +3 кейс-круга (35 вместо 32, ≈1632 с вместо ≈1492 — плюс 9%
+# времени экзамена), набор поднимается до 98.9%, а сила детекции ровно та же, что у втрое более
+# дорогого «три круга ВСЕМ» (вариант B, 48 кругов).
+#
+# ЧТО СОЗНАТЕЛЬНО НЕ СДЕЛАНО И НЕ ДОЛЖНО ПРИЕХАТЬ ПОЗЖЕ ПОД ВИДОМ УПРОЩЕНИЯ. Вариант D
+# («классу хватает ОДНОГО зелёного круга из двух») дешевле F на все три круга и поднимает набор
+# до 99.6% — и ОТКЛОНЁН: он роняет поимку ползучей регрессии (кейс, который сломан и краснеет в
+# трети прогонов) с 51% до 9%, то есть превращает чек в украшение. «≥1 из N» — это не упрощение
+# F, а другой вариант с другой ценой, и заводить его надо решением, а не рефакторингом.
+#
+# КЛАСС БЕРЁТСЯ ИЗ КОРПУСА, А НЕ СПИСКОМ НОМЕРОВ В КОДЕ. Признак — непустой `require_any` у
+# самого кейса (`trainer_cases.json`), а не «кейсы 5, 6, 10»: список номеров протухнет на первом
+# же новом кейсе с чеком прозы головы, и протухнет МОЛЧА — новый кейс поедет на двух кругах и
+# вернёт сегодняшнюю лотерею, ничем себя не выдав. Номеров кейсов в этом файле нет ни одного.
+#
+# ГРАНИЦЫ ПОСЛАБЛЕНИЯ — их четыре, и ни одна не расширена:
+#   • «неизвестно» большинством НЕ ЛЕЧИТСЯ: молчащая голова гасит и кейс, и весь набор, ровно
+#     как гасила (класс 22.08). Прощается только КРАСНЫЙ круг — то есть ответ, который прибор
+#     ИЗМЕРИЛ и признал негодным, а не тот, которого не было;
+#   • прощается только МЕНЬШИНСТВО и только у кейса, зачтённого в целом: 2 красных круга из 3 —
+#     красный кейс и красный набор, и все его красные круги идут в `failed` пофамильно;
+#   • чеки прощённого круга не идут НИ в `checks_passed`, НИ в `checks_total`, НИ в `failed` —
+#     ровно как чеки круга «неизвестно». Считать прощённый круг зелёным значило бы врать числом
+#     вместо честного «этот круг в зачёт не идёт»;
+#   • при `runs` меньше `TRAINER_MIN_RUNS` лишних кругов НЕ ТРАТИМ ВОВСЕ: такой прогон зелёным
+#     не бывает ни одной веткой (`build_verdict` требует `runs >= TRAINER_MIN_RUNS`), а значит
+#     большинство ему нечего защищать. Разведка `--runs 1 --only 5` и регресс урока
+#     (`lesson_regress`, тоже `runs=1`) стоят ровно столько же, сколько стоили до 07.09.
+CRITERION = "F"
+CLASS_NAME = "обязательное упоминание"
+CLASS_RUNS = 3
+
+
+def case_class(case):
+    """Класс кейса — ИЗ КОРПУСА. → имя класса либо '' (кейс класса не несёт).
+
+    Единственный признак класса «обязательное упоминание» — непустой `require_any` в самом
+    кейсе. Ни одного номера кейса здесь нет и быть не должно (см. узел выше)."""
+    return CLASS_NAME if (case.get("require_any") or []) else ""
+
+
+def rounds_for(case, runs):
+    """Сколько кругов гонять ЭТОМУ кейсу при базовом числе кругов `runs`. → int.
+
+    Кейс класса получает не «+1», а ПОЛ в `CLASS_RUNS`: при `--runs 5` он идёт те же 5, а не 6.
+    При `runs` ниже порога ворот критерий не работает вовсе — зелёного вердикта у такого прогона
+    не бывает, и платить за большинство незачем."""
+    runs = int(runs)
+    if runs < client_contour.TRAINER_MIN_RUNS:
+        return runs
+    return max(runs, CLASS_RUNS) if case_class(case) else runs
+
+
+def need_green(rounds, klass):
+    """Сколько ЗЕЛЁНЫХ кругов из `rounds` нужно кейсу для зачёта. → int.
+
+    Классу — большинство (для трёх кругов это 2), остальным — ВСЕ круги, как было до 07.09."""
+    rounds = int(rounds)
+    return (rounds // 2 + 1) if klass else rounds
+
+
+def criterion_text(runs):
+    """Применённый критерий ОДНОЙ строкой — в вердикт, в отчёт и в карточку владельцу.
+
+    Строка описывает ПРАВИЛО, действующее в этом коде; сколько кругов вышло у каждого кейса,
+    говорит отдельное поле `runs_by_case` (правило и его применение — разные факты)."""
+    return ("%s: кейсам класса «%s» (признак — require_any в корпусе) %d круга, зачёт "
+            "большинством ≥%d из %d; остальным %d круга, зелёными обязаны быть все; «неизвестно» "
+            "большинством не лечится"
+            % (CRITERION, CLASS_NAME, CLASS_RUNS, need_green(CLASS_RUNS, CLASS_NAME), CLASS_RUNS,
+               int(runs)))
+
+
+def _num_key(k):
+    """Порядок кейсов в строке «кругов по кейсам»: числа числами, прочее словами."""
+    s = str(k)
+    return (0, int(s), "") if s.isdigit() else (1, 0, s)
+
+
+def rounds_line(by_case):
+    """«Кругов у каждого кейса» человекочитаемой строкой: `1:2 2:2 … 5:3 6:3 …`. → str."""
+    if not by_case:
+        return "—"
+    return " ".join("%s:%s" % (k, by_case[k]) for k in sorted(by_case, key=_num_key))
+
+
 # ─────────────────────────────────────── прогон ──────────────────────────────────────────────
 
 def run_case(case, ph, log=print):
@@ -607,53 +709,87 @@ def run_case(case, ph, log=print):
 
 
 def run_corpus(cases, runs=2, ph=None, log=print):
-    """Корпус × runs прогонов → (результаты, passed_cases, checks_passed, checks_total, failed,
-    unknown). Кейс зачтён, только если ВСЕ его чеки зелёные в КАЖДОМ прогоне (flake-контроль
-    артефакта) и НИ В ОДНОМ прогоне исход не был «неизвестно».
+    """Корпус × круги → (результаты, passed_cases, checks_passed, checks_total, failed, unknown,
+    plan).
 
-    Чеки кейса с исходом НЕИЗВЕСТНО не идут НИ в `checks_passed`, НИ в `checks_total`, НИ в
-    `failed`: они не зелёные (доказывать нечем) и не красные (продукт не уличён). Иначе вышло бы
-    одно из двух вранья — либо зелень над текстом кода, либо обвинение кода в молчании границы."""
+    СКОЛЬКО КРУГОВ у кейса и СКОЛЬКО ЗЕЛЁНЫХ ему нужно, решает КРИТЕРИЙ F (узел «КРИТЕРИЙ
+    НАБОРА» выше): кейс класса «обязательное упоминание» идёт `CLASS_RUNS` кругов и зачитывается
+    БОЛЬШИНСТВОМ, остальные — прежние `runs` кругов, и зелёными обязаны быть все. Исход кейса
+    решается ПОСЛЕ всех его кругов, а не накоплением по ходу: пока круги не кончились, неизвестно,
+    меньшинство ли этот красный.
+
+    Чеки круга с исходом НЕИЗВЕСТНО и чеки ПРОЩЁННОГО критерием круга не идут НИ в
+    `checks_passed`, НИ в `checks_total`, НИ в `failed`: они не зелёные (доказывать нечем либо
+    доказано обратное) и не красные для вердикта (кейс зачтён большинством). Иначе вышло бы одно
+    из двух вранья — либо зелень над текстом, который признан негодным, либо красный вердикт у
+    кейса, который критерий зачёл.
+
+    `plan` — dict id → {class, rounds, need, green, red, unknown, ok, tolerated}: из него вердикт
+    берёт число кругов КАЖДОГО кейса и список прощённых кругов, чтобы читатель вердикта видел
+    правило, не открывая код."""
     ph = ph or placeholders()
-    results, failed, unknown = [], [], []
+    results, failed, unknown, plan = [], [], [], {}
     passed = checks_ok = checks_all = 0
     for case in cases:
         cid = case.get("id")
-        case_ok = True
-        for r in range(1, runs + 1):
+        klass = case_class(case)
+        total = rounds_for(case, runs)
+        need = need_green(total, klass)
+        mine = []
+        for r in range(1, total + 1):
             t0 = time.time()
             res = run_case(case, ph, log=log)
             res["run"] = r
+            res["rounds"] = total
             res["sec"] = round(time.time() - t0, 1)
             results.append(res)
-            unk = res.get("unknown")
-            if unk:
-                unknown.append(f"{cid}/{r} {unk}")
-            else:
-                for c in res["checks"]:
-                    if c.get("skipped"):
-                        continue                   # снят с причиной — в счёт не идёт (виден в отчёте)
-                    checks_all += 1
-                    checks_ok += 1 if c["ok"] else 0
-                    if not c["ok"]:
-                        failed.append(f"{cid}/{r} {c['name']}")
-            case_ok = case_ok and res["ok"] and not unk
+            mine.append(res)
             skipped = [c["name"] for c in res["checks"] if c.get("skipped")]
             log("  [%s] кейс %s «%s» прогон %d/%d — %s (%.0fс)%s"
-                % ("UNK" if unk else ("OK " if res["ok"] else "RED"), cid, case.get("name"), r, runs,
-                   ("НЕИЗВЕСТНО: " + str(unk)) if unk else
+                % ("UNK" if res.get("unknown") else ("OK " if res["ok"] else "RED"), cid,
+                   case.get("name"), r, total,
+                   ("НЕИЗВЕСТНО: " + str(res["unknown"])) if res.get("unknown") else
                    ("все чеки зелёные" if res["ok"] else
                     "провалено: " + ", ".join(c["name"] for c in res["checks"]
                                               if not c["ok"] and not c.get("skipped"))),
                    res["sec"], (" [снято: " + ", ".join(skipped) + "]") if skipped else ""))
+        greens = [x for x in mine if x["ok"] and not x.get("unknown")]
+        unks = [x for x in mine if x.get("unknown")]
+        # «Неизвестно» гасит кейс ЦЕЛИКОМ и мимо большинства: судить нечем — значит не зачтено.
+        case_ok = len(greens) >= need and not unks
+        forgiven = []
+        for res in mine:
+            r = res["run"]
+            if res.get("unknown"):
+                unknown.append(f"{cid}/{r} {res['unknown']}")
+                continue
+            bad = [c["name"] for c in res["checks"] if not c["ok"] and not c.get("skipped")]
+            if case_ok and bad:
+                # МЕНЬШИНСТВО у зачтённого кейса: круг остаётся в отчёте красным и с черновиком,
+                # но вердикту не идёт ни зелёным, ни красным — как круг «неизвестно».
+                res["tolerated"] = ("прощён критерием %s: класс «%s», зелёных кругов %d из %d "
+                                    "(нужно %d)" % (CRITERION, klass, len(greens), total, need))
+                forgiven.append("%s/%s %s" % (cid, r, ", ".join(bad)))
+                log("  [ПРОЩЁН] кейс %s прогон %d/%d — %s" % (cid, r, total, res["tolerated"]))
+                continue
+            for c in res["checks"]:
+                if c.get("skipped"):
+                    continue                       # снят с причиной — в счёт не идёт (виден в отчёте)
+                checks_all += 1
+                checks_ok += 1 if c["ok"] else 0
+                if not c["ok"]:
+                    failed.append(f"{cid}/{r} {c['name']}")
+        plan[str(cid)] = {"class": klass, "rounds": total, "need": need, "green": len(greens),
+                          "red": len(mine) - len(greens) - len(unks), "unknown": len(unks),
+                          "ok": bool(case_ok), "tolerated": forgiven}
         passed += 1 if case_ok else 0
-    return results, passed, checks_ok, checks_all, failed, unknown
+    return results, passed, checks_ok, checks_all, failed, unknown, plan
 
 
 # ─────────────────────────────────────── вердикт ─────────────────────────────────────────────
 
 def build_verdict(commit, cases_total, passed, checks_ok, checks_all, runs, clean, failed,
-                  sha, now=None, unknown=None, bind=None):
+                  sha, now=None, unknown=None, bind=None, plan=None):
     """Запись вердикта РОВНО в том виде, который читают ворота (client_contour.trainer_verdict).
 
     `unknown` — список исходов «судить нечего» (молчащая голова). Он ГАСИТ зелёное, но красным
@@ -671,10 +807,24 @@ def build_verdict(commit, cases_total, passed, checks_ok, checks_all, runs, clea
     Условие зелёного НЕ РАСШИРЕНО: «HEAD не сдвинулся» стои́т в критерии с самого начала (шапка
     модуля, §ЗЕЛЁНЫЙ ВЕРДИКТ) — оно жило веткой `main()`, которая на сдвиге просто не доходила до
     записи. Теперь то же самое условие живёт в самой записи, и зелёная запись со сдвинутой
-    вершиной физически не собирается — ни из CLI, ни из чужого раннера замера."""
+    вершиной физически не собирается — ни из CLI, ни из чужого раннера замера.
+
+    `plan` — разбор кругов по кейсам от `run_corpus`. Из него в запись ложатся ЧЕТЫРЕ поля,
+    которых до 07.09.2026 не было ни одного: `criterion` (каким ПРАВИЛОМ получен исход),
+    `runs_by_case`/`runs_line` (сколько кругов вышло у КАЖДОГО кейса) и `tolerated`/
+    `tolerated_why` (какие красные круги прощены большинством и за что). Без них читатель
+    вердикта не отличает «зелёный, потому что всё зелено» от «зелёный, потому что красный круг
+    оказался меньшинством», и обязан лезть в код за правилом — ровно то, что чинится.
+    Поле `runs` остаётся БАЗОВЫМ числом кругов (его и сверяют ворота с `TRAINER_MIN_RUNS`);
+    сколько кругов вышло на самом деле, говорят `runs_by_case` и `runs_max` — два разных факта,
+    и сводить их в одно число значило бы соврать одному из читателей."""
     now = time.time() if now is None else now
     unknown = list(unknown or [])
     bind = bind or {}
+    plan = plan or {}
+    by_case = {str(k): int((v or {}).get("rounds") or 0) for k, v in plan.items()}
+    tolerated = [t for _k, v in sorted(plan.items(), key=lambda kv: _num_key(kv[0]))
+                 for t in ((v or {}).get("tolerated") or [])]
     head_moved = str(bind.get("head_moved") or "")
     green = (not unknown
              and passed == cases_total >= client_contour.TRAINER_MIN_CASES
@@ -685,6 +835,10 @@ def build_verdict(commit, cases_total, passed, checks_ok, checks_all, runs, clea
         "commit": commit,
         "result": "green" if green else ("red" if failed or not unknown else "unknown"),
         "unknown": len(unknown), "unknown_why": unknown[:40],
+        "criterion": criterion_text(runs), "criterion_id": CRITERION,
+        "runs_by_case": by_case, "runs_line": rounds_line(by_case),
+        "runs_max": max(by_case.values()) if by_case else int(runs),
+        "tolerated": len(tolerated), "tolerated_why": tolerated[:40],
         "checks_passed": checks_ok, "checks_total": checks_all,
         "cases": passed, "cases_total": cases_total, "runs": runs, "clean": bool(clean),
         "head_moved": head_moved, "head_after": str(bind.get("head_after") or ""),
@@ -748,11 +902,17 @@ def report_md(rec, results, commit, runs):
              f"**Кейсы:** {rec['cases']}/{rec['cases_total']} · "
              f"**чеки:** {rec['checks_passed']}/{rec['checks_total']}"
              + (f" · **неизвестно:** {rec.get('unknown')} кейсо-прогонов"
-                if rec.get("unknown") else ""), "",
+                if rec.get("unknown") else "")
+             + (f" · **прощено большинством:** {rec.get('tolerated')} кругов"
+                if rec.get("tolerated") else ""), "",
+             f"**Критерий:** {rec.get('criterion') or '—'}", "",
+             f"**Кругов по кейсам:** `{rec.get('runs_line') or '—'}`", "",
              "| # | кейс | прогон | итог | чеки | провалено |", "|---|---|---|---|---|---|"]
     for r in results:
         live = [c for c in r["checks"] if not c.get("skipped")]
         bad = [c["name"] for c in live if not c["ok"]]
+        if r.get("tolerated"):
+            bad = bad + ["**" + r["tolerated"] + "**"]
         skipped = ["%s (%s)" % (c["name"], c["skipped"]) for c in r["checks"] if c.get("skipped")]
         lines.append("| %s | %s | %s | %s | %s | %s |"
                      % (r["id"], r["name"], r["run"],
@@ -833,20 +993,32 @@ def main(argv=None):
         want = {s.strip() for s in a.only.split(",") if s.strip()}
         cases = [c for c in cases if str(c.get("id")) in want]
 
+    plan_rounds = sum(rounds_for(c, a.runs) for c in cases)
+    in_class = [str(c.get("id")) for c in cases if case_class(c)]
     print(f"ПРОГОН ТРЕНАЖЁРА: коммит {commit[:7]} ЗАФИКСИРОВАН на входе, кейсов {len(cases)} из "
           f"{total}, прогонов {a.runs}, дерево "
           f"{'чистое' if clean else 'ГРЯЗНОЕ: ' + ', '.join(dirty or ['? git не ответил'])}")
+    print("КРИТЕРИЙ %s: кейсов класса «%s» — %d (%s), им по %d круга с зачётом ≥%d из %d; "
+          "остальным по %d. Кейс-кругов всего: %d"
+          % (CRITERION, CLASS_NAME, len(in_class), ", ".join(in_class) or "нет", CLASS_RUNS,
+             need_green(CLASS_RUNS, CLASS_NAME), CLASS_RUNS, a.runs, plan_rounds))
     ph = placeholders()
-    results, passed, ok, allc, failed, unknown = run_corpus(cases, runs=a.runs, ph=ph)
+    results, passed, ok, allc, failed, unknown, plan = run_corpus(cases, runs=a.runs, ph=ph)
 
     verify_head(bind)                        # вершина на выходе: сдвиг НАЗЫВАЕТСЯ, а не глотается
     rec = build_verdict(commit, total, passed, ok, allc, a.runs, clean, failed, sha,
-                        unknown=unknown, bind=bind)
+                        unknown=unknown, bind=bind, plan=plan)
     print("\nИТОГ: %s — кейсов %d/%d, чеков %d/%d, прогонов %d, дерево %s%s"
           % (rec["result"].upper(), rec["cases"], rec["cases_total"], rec["checks_passed"],
              rec["checks_total"], rec["runs"],
              "чистое" if clean else "ГРЯЗНОЕ (tree_dirty: true)",
              (", НЕИЗВЕСТНО %d кейсо-прогонов" % len(unknown)) if unknown else ""))
+    # ПРАВИЛО И ЕГО ПРИМЕНЕНИЕ — двумя строками, чтобы «каким правилом получен этот исход»
+    # читалось из вывода прогона, а не восстанавливалось чтением кода.
+    print("КРИТЕРИЙ: " + rec["criterion"])
+    print("КРУГОВ ПО КЕЙСАМ: " + rec["runs_line"])
+    if rec["tolerated"]:
+        print("ПРОЩЕНО БОЛЬШИНСТВОМ (в зачёт чеков не идёт): " + "; ".join(rec["tolerated_why"][:12]))
     if rec["head_moved"]:
         # Замер принадлежит ЗАФИКСИРОВАННОМУ коммиту и НИКОМУ больше: новой вершине его не
         # приписываем (её не мерили), старой не удостоверяем (код мог уехать под ногами).

@@ -310,8 +310,11 @@ def measure(runner=None, only=None, log=None, now=None, deadline=None):
             return {"ok": False, "why": "корпус пуст — сравнивать нечего", "unknown": [],
                     "cases": {}, "sec": 0.0}
         ph = runner.placeholders()
-        results, _passed, ok_c, all_c, _failed, unknown = runner.run_corpus(cases, runs=1, ph=ph,
-                                                                           log=log)
+        # Седьмое значение (`plan` — разбор кругов по кейсам, критерий F от 07.09.2026) регрессу
+        # урока не нужно: он ходит `runs=1`, а при runs ниже порога ворот критерий лишних кругов
+        # не назначает вовсе (`trainer_run.rounds_for`) — цена регресса не изменилась ни на круг.
+        results, _passed, ok_c, all_c, _failed, unknown, _plan = runner.run_corpus(
+            cases, runs=1, ph=ph, log=log)
     except Exception as e:                                  # noqa: BLE001 — граница, а не продукт
         return {"ok": False, "why": "прогон оборвался (%s: %s)" % (type(e).__name__, e),
                 "unknown": [], "cases": {}, "sec": round((time.time() - t0), 1)}
@@ -329,7 +332,7 @@ def measure(runner=None, only=None, log=None, now=None, deadline=None):
         # ТОЛЬКО по красным — цена подтверждения пропорциональна беде, а не корпусу.
         try:
             again = [c for c in cases if str(c.get("id")) in set(red_ids)]
-            res2, _p, ok2, all2, _f, unk2 = runner.run_corpus(again, runs=1, ph=ph, log=log)
+            res2, _p, ok2, all2, _f, unk2, _pl2 = runner.run_corpus(again, runs=1, ph=ph, log=log)
         except Exception as e:                              # noqa: BLE001
             return {"ok": False, "why": "подтверждение красных оборвалось (%s: %s)"
                                         % (type(e).__name__, e),

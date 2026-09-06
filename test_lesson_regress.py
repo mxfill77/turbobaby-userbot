@@ -78,7 +78,13 @@ class StubRunner(object):
         failed = ["%s/1 %s" % (r["id"], c["name"])
                   for r in results for c in r["checks"] if not c["ok"] and not c.get("skipped")]
         passed = sum(1 for r in results if r["ok"])
-        return results, passed, ok, allc, failed, unknown
+        # Седьмым значением — `plan` (разбор кругов по кейсам, критерий F от 07.09.2026). Стенд
+        # обязан отдавать РОВНО то, что отдаёт живой `run_corpus`: шестизначный стенд зеленел бы
+        # на коде, который распаковывает семь, и класс «мок разошёлся с продом» вернулся бы.
+        plan = {str(r["id"]): {"class": "", "rounds": 1, "need": 1, "green": 1 if r["ok"] else 0,
+                               "red": 0 if r["ok"] else 1, "unknown": 0, "ok": bool(r["ok"]),
+                               "tolerated": []} for r in results}
+        return results, passed, ok, allc, failed, unknown, plan
 
 
 class Tmp(unittest.TestCase):

@@ -403,7 +403,7 @@ class TestMolchashchayaGolova(unittest.TestCase):
         tr.run_case = lambda case, ph, log=print: {
             "id": case["id"], "name": "тест", "ok": False, "unknown": "голова промолчала",
             "checks": [{"name": "нет годов", "ok": True, "unknown": True}], "draft": "d", "note": ""}
-        res, passed, ok, allc, failed, unknown = tr.run_corpus(
+        res, passed, ok, allc, failed, unknown, _plan = tr.run_corpus(
             [{"id": 1}], runs=1, ph={}, log=lambda *a, **k: None)
         self.assertEqual((passed, ok, allc, failed), (0, 0, 0, []))
         self.assertEqual(len(unknown), 1)
@@ -571,7 +571,14 @@ class PrivyazkaZameraKKommitu(unittest.TestCase):
 
     def fake_run(self, passed=11, ok=95, allc=96, failed=("10/1 нет утверждений о наличии",)):
         """Корпус НЕ гоняем (живая голова — минуты и токены): числа замера здесь не предмет."""
-        tr.run_corpus = lambda cases, runs=2, ph=None: ([], passed, ok, allc, list(failed), [])
+        # Седьмое значение — `plan` (критерий F, 07.09.2026): стенд повторяет ЖИВОЙ контракт
+        # `run_corpus`, иначе `main` распакует шесть значений из шести и класс «мок отстал от
+        # прода» вернётся молча.
+        tr.run_corpus = lambda cases, runs=2, ph=None: (
+            [], passed, ok, allc, list(failed), [],
+            {str(c.get("id")): {"class": "", "rounds": runs, "need": runs, "green": runs,
+                                "red": 0, "unknown": 0, "ok": True, "tolerated": []}
+             for c in cases})
 
     def run_main(self, extra=()):
         # `--write` СТОИТ ЗДЕСЬ ЯВНО (05.09.2026): предмет этого класса — привязка записи к
@@ -906,6 +913,146 @@ class TestChekMinimalnogoSrokaRazdelyon(unittest.TestCase):
         prose = tr.llm_prose(suggest.client_facing_text(after), exp)
         self.assertNotIn(exp["min_term_line"], prose)
         self.assertIn("Бронируем?", prose)
+
+
+# ───────────── 10. КРИТЕРИЙ НАБОРА — ВАРИАНТ F ПО ИЗМЕРЕННОЙ ЛОТЕРЕЕ (07.09.2026) ─────────────
+# ЗАЧЕМ ЭТИ ГОЛДЕНЫ. Критерий — это ПОСЛАБЛЕНИЕ, а послабление, у которого нет отрицательных
+# тестов, через месяц незаметно превращается в «зелёное всегда». Здесь их три и все живые:
+# стабильно красный кейс краснеет и на трёх кругах; два красных из трёх — красный кейс; молчащая
+# голова большинством не лечится. Живой головы нет ни в одном тесте — `run_case` подменён,
+# круги задаются списком: предмет здесь ПРАВИЛО ЗАЧЁТА, а не продукт.
+
+class KriterijNaboraF(unittest.TestCase):
+    KLASS = {"id": 5, "name": "класс", "require_any": ["опыт", "ездил"]}
+    PROSTOY = {"id": 1, "name": "обычный"}
+
+    # ── принадлежность классу берётся ИЗ КОРПУСА, а не списком номеров ───────────────────────
+    def test_klass_beryotsya_iz_korpusa_a_ne_spiskom_nomerov(self):
+        self.assertEqual(tr.case_class(self.KLASS), tr.CLASS_NAME)
+        self.assertEqual(tr.case_class(self.PROSTOY), "")
+        self.assertEqual(tr.case_class({"id": 5}), "",
+                         "класс присвоен по НОМЕРУ кейса — список номеров протухнет молча")
+        self.assertEqual(tr.case_class({"id": 99, "require_any": ["что угодно"]}), tr.CLASS_NAME,
+                         "новый кейс с require_any в класс не попал — вернулась лотерея")
+
+    def test_zhivoy_korpus_daet_rovno_tri_keisa_klassa_i_35_krugov(self):
+        """Цена критерия — не оценка, а СЧЁТ по живому корпусу: 16 кейсов, 3 в классе → 35 кругов."""
+        cases, _sha = tr.load_cases()
+        klass = [c for c in cases if tr.case_class(c)]
+        self.assertEqual(len(cases), 16)
+        self.assertEqual(sorted(str(c["id"]) for c in klass), ["10", "5", "6"])
+        self.assertEqual(sum(tr.rounds_for(c, 2) for c in cases), 35)
+        self.assertEqual(sum(2 for _c in cases), 32, "прежняя цена посчитана не по корпусу")
+
+    def test_razvedka_i_regress_uroka_lishnih_krugov_ne_platyat(self):
+        """`runs=1` зелёным не бывает ни одной веткой — большинству там нечего защищать."""
+        self.assertEqual(tr.rounds_for(self.KLASS, 1), 1)
+        self.assertEqual(tr.rounds_for(self.KLASS, 2), 3)
+        self.assertEqual(tr.rounds_for(self.KLASS, 5), 5, "пол CLASS_RUNS стал прибавкой +1")
+        self.assertEqual(tr.rounds_for(self.PROSTOY, 2), 2)
+
+    def test_porog_zachyota_bolshinstvom_tolko_u_klassa(self):
+        self.assertEqual(tr.need_green(3, tr.CLASS_NAME), 2)
+        self.assertEqual(tr.need_green(5, tr.CLASS_NAME), 3)
+        self.assertEqual(tr.need_green(2, ""), 2, "обычному кейсу разрешили красный круг")
+
+    def test_variant_d_ne_priehal_pod_vidom_uproshcheniya(self):
+        """ОТКЛОНЁННЫЙ вариант D («хватает одного зелёного») роняет поимку регрессии с 51% до 9%.
+        Замок числом: порог класса обязан расти с числом кругов, а не стоять на единице."""
+        self.assertGreater(tr.need_green(3, tr.CLASS_NAME), 1)
+        self.assertGreater(tr.need_green(9, tr.CLASS_NAME), tr.need_green(3, tr.CLASS_NAME))
+
+    # ── обвязка: круги задаются списком, живой головы нет ────────────────────────────────────
+    def _rounds(self, case, outcomes):
+        """`outcomes` — список кругов: True зелёный, False красный, str «неизвестно»."""
+        box = {"i": 0}
+        saved = tr.run_case
+        self.addCleanup(setattr, tr, "run_case", saved)
+
+        def fake(c, ph, log=print):
+            out = outcomes[min(box["i"], len(outcomes) - 1)]
+            box["i"] += 1
+            unk = out if isinstance(out, str) else None
+            checks = [{"name": "обязательное упоминание", "ok": out is True}]
+            return {"id": c["id"], "name": c.get("name"), "ok": out is True, "unknown": unk,
+                    "checks": [dict(c2, unknown=True) for c2 in checks] if unk else checks,
+                    "draft": "d", "note": ""}
+        tr.run_case = fake
+        return tr.run_corpus([case], runs=2, ph={}, log=lambda *a, **k: None)
+
+    def test_dva_zelenyh_iz_treh_keis_zachten_a_krasnyi_krug_proshchen_i_nazvan(self):
+        res, passed, ok, allc, failed, unknown, plan = self._rounds(self.KLASS, [True, False, True])
+        self.assertEqual(len(res), 3, "кейсу класса дали не три круга")
+        self.assertEqual((passed, failed, unknown), (1, [], []))
+        self.assertEqual((ok, allc), (2, 2), "чеки прощённого круга попали в зачёт")
+        self.assertEqual(plan["5"]["tolerated"], ["5/2 обязательное упоминание"])
+        self.assertIn("прощён критерием F", res[1]["tolerated"])
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ ПЕРВЫЙ: СТАБИЛЬНО красный остаётся красным и на трёх кругах ───────
+    def test_otr1_stabilno_krasnyi_keis_krasen_i_na_treh_krugah(self):
+        res, passed, ok, allc, failed, unknown, plan = self._rounds(self.KLASS,
+                                                                    [False, False, False])
+        self.assertEqual(len(res), 3)
+        self.assertEqual(passed, 0, "стабильно красный кейс зачтён большинством")
+        self.assertEqual(len(failed), 3, "красные круги не названы пофамильно")
+        self.assertEqual((ok, allc), (0, 3))
+        self.assertEqual(plan["5"]["tolerated"], [], "красное большинство прощено")
+        self.assertEqual(tr.build_verdict(C40, 16, passed, ok, allc, 2, True, failed,
+                                          cc.corpus_sha(), now=1.0, plan=plan)["result"], "red")
+
+    def test_otr1_dva_krasnyh_iz_treh_tozhe_krasnyi(self):
+        """Граница послабления: прощается МЕНЬШИНСТВО, а не «хотя бы один зелёный» (вариант D)."""
+        _res, passed, _ok, _allc, failed, _unk, plan = self._rounds(self.KLASS,
+                                                                     [True, False, False])
+        self.assertEqual(passed, 0)
+        self.assertEqual(len(failed), 2)
+        self.assertEqual(plan["5"]["tolerated"], [])
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ ВТОРОЙ: «неизвестно» большинством НЕ лечится ──────────────────────
+    def test_otr2_neizvestno_bolshinstvom_ne_lechitsya(self):
+        _res, passed, _ok, _allc, failed, unknown, plan = self._rounds(
+            self.KLASS, [True, True, "голова промолчала"])
+        self.assertEqual(passed, 0, "молчащая голова зачтена большинством зелёных")
+        self.assertEqual(failed, [])
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(plan["5"]["unknown"], 1)
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ ТРЕТИЙ: обычному кейсу послабления не досталось ───────────────────
+    def test_otr3_obychnomu_keisu_krasnyi_krug_ne_proshchen(self):
+        _res, passed, _ok, _allc, failed, _unk, plan = self._rounds(self.PROSTOY, [True, False])
+        self.assertEqual(plan["1"]["rounds"], 2, "обычному кейсу дали лишние круги")
+        self.assertEqual(passed, 0, "красный круг прощён кейсу ВНЕ класса")
+        self.assertEqual(failed, ["1/2 обязательное упоминание"])
+
+    # ── вердикт НАЗЫВАЕТ правило и число кругов у каждого кейса ──────────────────────────────
+    def test_verdikt_nazyvaet_kriterii_i_krugi_kazhdogo_keisa(self):
+        _res, passed, ok, allc, failed, _unk, plan = self._rounds(self.KLASS, [True, False, True])
+        rec = tr.build_verdict(C40, 1, passed, ok, allc, 2, True, failed, cc.corpus_sha(),
+                               now=1.0, plan=plan)
+        self.assertIn("F", rec["criterion"])
+        self.assertIn(tr.CLASS_NAME, rec["criterion"])
+        self.assertIn("require_any", rec["criterion"], "правило названо номерами, а не признаком")
+        self.assertEqual(rec["criterion_id"], "F")
+        self.assertEqual(rec["runs_by_case"], {"5": 3})
+        self.assertEqual(rec["runs_line"], "5:3")
+        self.assertEqual(rec["runs_max"], 3)
+        self.assertEqual(rec["tolerated"], 1)
+        self.assertEqual(rec["tolerated_why"], ["5/2 обязательное упоминание"])
+        self.assertEqual(rec["runs"], 2, "базовое число кругов подменено фактическим")
+
+    def test_stroka_krugov_chitaema_i_uporyadochena_chislami(self):
+        self.assertEqual(tr.rounds_line({"10": 3, "2": 2, "5": 3}), "2:2 5:3 10:3")
+        self.assertEqual(tr.rounds_line({}), "—")
+
+    def test_vorota_prezhnego_verdikta_ne_zametili_pribavki_poley(self):
+        """Соседнее место: ворота читают ту же запись — новые поля не смеют её сломать."""
+        rec = tr.build_verdict(C40, 12, 12, 96, 96, 2, True, [], cc.corpus_sha(), now=1.0,
+                               plan={"5": {"rounds": 3, "tolerated": []}})
+        d = tempfile.mkdtemp(prefix="trrun_f_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        v = os.path.join(d, "verdict.json")
+        self.assertTrue(tr.write_verdict(rec, v)[0])
+        self.assertTrue(cc.trainer_green(C40, path=v, env={}))
 
 
 if __name__ == "__main__":
