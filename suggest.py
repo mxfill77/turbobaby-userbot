@@ -3400,8 +3400,10 @@ def _safe_quote_for_model(model, ds, de, getter=None, name_filter=None):
     try:
         may, card = price_gate.allow()
     except Exception as e:                     # сторож не отработал → это НЕ разрешение
-        may, card = False, ("ЦЕНА НЕ НАЗВАНА: сторож свежести не отработал (%s)."
-                            % type(e).__name__)
+        # Имя причины ПЕРВЫМ — той же формой, что и у карточки сторожа: строка ложится в журнал
+        # продукта дословно, и разбор эпизода не должен зависеть от того, кто её собрал.
+        may, card = False, ("[%s] ЦЕНА НЕ НАЗВАНА: сторож свежести не отработал (%s)."
+                            % (price_gate.KIND_NOT_READ, type(e).__name__))
     if not may:
         log.warning("price_gate: %s (модель %s)", card, model)
         return {"status": "error", "quote": None}
@@ -3888,8 +3890,8 @@ def price_sheet_status(ds, getter=None, _now=None, _fleet=None, _gate=None):
         try:
             may, card = gate()
         except Exception as e:            # сторож не отработал → это НЕ разрешение
-            may, card = False, ("ЦЕНА НЕ НАЗВАНА: сторож свежести не отработал (%s)."
-                                % type(e).__name__)
+            may, card = False, ("[%s] ЦЕНА НЕ НАЗВАНА: сторож свежести не отработал (%s)."
+                                % (price_gate.KIND_NOT_READ, type(e).__name__))
         if not may:
             # Молчит ВЕСЬ список: пустой rows доводится до `_PRICE_SHEET_UNAVAILABLE` (без чисел,
             # без переспроса модели). Кэш сетки НЕ трогаем ни на чтение, ни на запись — иначе

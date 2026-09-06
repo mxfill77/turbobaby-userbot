@@ -60,6 +60,31 @@ STALE = "УСТАРЕЛО"
 UNKNOWN = "НЕИЗВЕСТНО"
 STATES = (FRESH, STALE, UNKNOWN)
 
+# ── ИМЕНА ПРИЧИН. Трёх исходов мало владельцу: под одним `НЕИЗВЕСТНО` живут ДВА разных
+# события с ПРОТИВОПОЛОЖНЫМ действием — «ручку повернули» (чинится пересборкой слепка) и
+# «ручку не удалось снять» (пересборка ЗАПРЕЩЕНА: слепок собрался бы с двери, которую как раз
+# и не прочитали). До 06.09.2026 обе причины несли ОДИН хвост карточки «нужно пересобрать
+# price_source.json» — то есть непрочитанная дверь советовала владельцу ровно то, чего делать
+# нельзя. Имя причины идёт ПЕРВЫМ в карточке и потому попадает в журнал продукта дословно
+# (`suggest.py` пишет карточку как есть), а значит греп по журналу различает их СЧЁТОМ, а не
+# на глаз. Политику имена НЕ меняют: цену по-прежнему не называет ни одна причина, кроме
+# `СВЕЖЕЕ`, и `may_quote` считается ровно по `state`, а не по имени причины.
+KIND_FRESH = "СВЕЖЕЕ"
+KIND_DIVERGED = "РУЧКА РАЗОШЛАСЬ"
+KIND_OLD = "СЛЕПОК СТАР"
+KIND_NOT_READ = "РУЧКА НЕ СНЯЛАСЬ"
+KIND_NO_SNAPSHOT = "СЛЕПКА НЕТ"
+KINDS = (KIND_FRESH, KIND_DIVERGED, KIND_OLD, KIND_NOT_READ, KIND_NO_SNAPSHOT)
+
+# ЧТО ВЛАДЕЛЬЦУ ДЕЛАТЬ — по причине, а не по исходу. Разное действие и есть весь смысл разделения.
+KIND_ACTION = {
+    KIND_DIVERGED: "Нужно пересобрать price_source.json и снять слепок ручек заново.",
+    KIND_OLD: "Нужно пересобрать price_source.json и снять слепок ручек заново.",
+    KIND_NO_SNAPSHOT: "Нужно СОБРАТЬ price_source.json заново: слепка ручек в нём нет вовсе.",
+    KIND_NOT_READ: ("Пересобирать price_source.json НЕ НАДО: слепок мог и не устареть — не "
+                    "прочитан ЖИВОЙ лист. Смотреть надо дверь моста (quote_price), а не файл."),
+}
+
 # ── ПОРОГ. Имя — ключ окружения; 0 → возрастная ветка мертва (объявленный откат). ──────────
 MAX_AGE_ENV = "PRICE_FRESH_MAX_AGE_DAYS"
 MAX_AGE_DEFAULT = 14.0
@@ -180,7 +205,7 @@ def judge(snapshot, live, now=None, max_age=None):
     if not isinstance(snapshot, dict) or not snapshot.get("handles"):
         unproven.append("записанное правило не несёт слепка ручек — сверять не с чем")
         return _verdict(UNKNOWN, unproven[0], age, limit, diverged, unverified, agreed,
-                        proven, unproven)
+                        proven, unproven, kind=KIND_NO_SNAPSHOT)
 
     # Порог 0 — ОБЪЯВЛЕННЫЙ ОТКАТ: возрастная ветка мертва целиком, улик не даёт ни в одну
     # сторону, судим только ручки. Поэтому её не «пропускают молча», а не входят в неё вовсе.
@@ -238,9 +263,22 @@ def judge(snapshot, live, now=None, max_age=None):
                     proven, unproven)
 
 
-def _verdict(state, why, age, limit, diverged, unverified, agreed, proven, unproven):
-    """Сборка вердикта одним местом: `may_quote` истинен РОВНО у одного исхода из трёх."""
+def _verdict(state, why, age, limit, diverged, unverified, agreed, proven, unproven, kind=None):
+    """Сборка вердикта одним местом: `may_quote` истинен РОВНО у одного исхода из трёх.
+
+    `kind` — ИМЯ ПРИЧИНЫ, а не второй исход: считается из уже собранных улик и на `may_quote`
+    не влияет ни одной веткой. Доказанное устаревание при этом различается по УЛИКЕ, а не по
+    порядку: разошедшаяся ручка сильнее возраста, потому что она названа числом («было→стало»),
+    а возраст говорит лишь «мог устареть»."""
+    if kind is None:
+        if state == FRESH:
+            kind = KIND_FRESH
+        elif state == STALE:
+            kind = KIND_DIVERGED if diverged else KIND_OLD
+        else:
+            kind = KIND_NOT_READ
     return {"state": state,
+            "kind": kind,
             "may_quote": (state == FRESH),
             "call_owner": (state != FRESH),
             "why": why,
@@ -275,13 +313,35 @@ def bot_action(verdict):
             "quote": dict(QUENCH)}
 
 
+def reason_kind(verdict):
+    """Вердикт → ОДНО имя причины из `KINDS`. Чужой/битый вердикт — «РУЧКА НЕ СНЯЛАСЬ»:
+    неразобранное не смеет притвориться ни свежестью, ни доказанным устареванием."""
+    kind = verdict.get("kind") if isinstance(verdict, dict) else None
+    if kind in KINDS:
+        return kind
+    state = verdict.get("state") if isinstance(verdict, dict) else None
+    if state == FRESH:
+        return KIND_FRESH
+    if state == STALE:
+        return KIND_DIVERGED if (isinstance(verdict, dict) and verdict.get("diverged")) else KIND_OLD
+    return KIND_NOT_READ
+
+
 def owner_card(verdict):
-    """Текст владельцу. Называет ИСХОД и ПРИЧИНУ: «ручку повернули» и «лист не ответил»
-    чинятся по-разному, и слить их в одно «что-то не так» значит отнять у него действие."""
+    """Текст владельцу. Называет ИСХОД, ПРИЧИНУ и ДЕЙСТВИЕ: «ручку повернули» и «лист не
+    ответил» чинятся по-разному, и слить их в одно «что-то не так» значит отнять у него действие.
+
+    ИМЯ ПРИЧИНЫ СТОИТ ПЕРВЫМ и в квадратных скобках — не ради вида: карточку `suggest` кладёт
+    в журнал продукта ДОСЛОВНО, поэтому имя оказывается в начале строки `price_gate: …` и
+    греп различает причины СЧЁТОМ. Хвост-действие тоже разный: до 06.09.2026 непрочитанная
+    дверь советовала «пересобрать price_source.json», то есть собрать слепок с той самой двери,
+    которую прочитать не удалось."""
     state = verdict.get("state") if isinstance(verdict, dict) else UNKNOWN
     why = verdict.get("why") if isinstance(verdict, dict) else None
+    kind = reason_kind(verdict)
     head = ("ЦЕНА НЕ НАЗВАНА: записанное правило цены УСТАРЕЛО." if state == STALE
             else "ЦЕНА НЕ НАЗВАНА: свежесть записанного правила ПРОВЕРИТЬ НЕ УДАЛОСЬ.")
-    tail = ("Клиенту цена не ушла. Нужно пересобрать price_source.json и снять слепок ручек "
-            "заново.")
-    return "%s %s %s" % (head, why if isinstance(why, str) and why.strip() else "причина не названа", tail)
+    tail = "Клиенту цена не ушла. %s" % KIND_ACTION.get(kind, KIND_ACTION[KIND_NOT_READ])
+    return "[%s] %s %s %s" % (kind, head,
+                              why if isinstance(why, str) and why.strip() else "причина не названа",
+                              tail)

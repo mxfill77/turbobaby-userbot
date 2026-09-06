@@ -88,7 +88,12 @@ def live_handles(get=None):
                 answer = caller("quote_price", bike=bike,
                                 date_start=WINDOW[0], date_end=WINDOW[1])
             except Exception as exc:                 # noqa: BLE001 — отказ двери, не авария
-                refusals.append("%s/%s: %s" % (cell, bike, type(exc).__name__))
+                # СЛОВА ОТКАЗА, а не только имя класса: у врезки два разных RuntimeError —
+                # «бюджет пробы исчерпан» и «проба не уложилась в свой предел», — и по одному
+                # имени класса владелец не отличил бы «дверь не спрашивали» от «дверь молчала».
+                said = str(exc).strip()
+                refusals.append("%s/%s: %s%s" % (cell, bike, type(exc).__name__,
+                                                 (" — %s" % said[:70]) if said else ""))
                 continue
             if not isinstance(answer, dict) or answer.get("ok") is not True:
                 refusals.append("%s/%s: дверь отказала" % (cell, bike))
