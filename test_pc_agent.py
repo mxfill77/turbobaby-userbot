@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pc_agent as a
 import dispatch_notify as dn
+import shtab_box_signals as sig    # ПРОИЗВОДИТЕЛЬ кнопки снятия остановки ящика
 
 
 class TestChildStderrLog(unittest.TestCase):
@@ -442,6 +443,202 @@ class TestGateCallbackHandlerGolden(unittest.TestCase):
         stop = dn._chain_markup(42)["inline_keyboard"][0][0]["callback_data"]
         self._run(stop, a.ALLOWED_USER_ID)
         self.assertEqual((self.chain, self.gate), ([("stop", "42")], []))
+
+
+class TestBoxReleaseCallback(unittest.TestCase):
+    """СНЯТИЕ СИГНАЛЬНОЙ ОСТАНОВКИ ЯЩИКА ШТАБА ОТВЕТОМ В TELEGRAM (06.09.2026).
+
+    Повод замерен по коду: остановка ящика не выходила наружу ни одной веткой, а снять
+    её можно было ТОЛЬКО строкой `[[ЯЩИК СНЯТЬ метка=…]]` в узле мозга — то есть не с
+    телефона. Кнопка закрывает разрыв, НЕ трогая сам ящик: тап зовёт ту же дверь, что и
+    слово (`shtab_box_run --free`), и снимает РОВНО один записанный случай.
+
+    ДАННЫЕ БЕРЁМ РЕАЛЬНЫЕ — из `shtab_box_signals.release_buttons`, то есть у того, кто
+    кнопку и печатает. Набери мы `callback_data` здесь литералом, две формы разъехались
+    бы молча на первой же правке производителя — ровно так проверяются кнопки цепей,
+    заявок и ворот.
+    """
+
+    OWNER = a.ALLOWED_USER_ID
+    STRANGER = a.ALLOWED_USER_ID + 1
+    MARK = "e0140bfc78dc"          # живая метка полосы (сигнал Б, случай 05.09)
+
+    def _real_cb(self, mark=None):
+        row = sig.release_buttons(mark or self.MARK)["inline_keyboard"][0]
+        return row[0]["callback_data"]
+
+    def test_real_callback_data_shape(self):
+        self.assertEqual(self._real_cb(), "box:free:%s" % self.MARK)
+        self.assertLessEqual(len(self._real_cb("f" * 32).encode()), 64,
+                             "callback_data не влезает в лимит Telegram")
+
+    def test_owner_tap_routes_to_the_box_release(self):
+        r = a._chain_cb_route(self._real_cb(), self.OWNER)
+        self.assertEqual((r["ok"], r["kind"], r["action"], r["pid"]),
+                         (True, "box", "free", self.MARK))
+        self.assertTrue(r["answer"])
+
+    def test_tost_ne_obeschaet_nemedlennogo_vzyatiya(self):
+        """Взятие произойдёт следующим витком ящика (до 30 минут). Тост «ящик поехал»
+        был бы враньём о сроке — проверяем, что его нет."""
+        answer = a._chain_cb_route(self._real_cb(), self.OWNER)["answer"].lower()
+        self.assertIn("снимаю", answer)
+        self.assertNotIn("взял", answer)
+
+    # ── КОНТРФАКТ ЗАДАНИЯ: ЧУЖОЙ ОТВЕТ НЕ ПРОХОДИТ ───────────────────────────────
+    def test_stranger_tap_ne_snimaet_nichego(self):
+        """«Снять может ТОЛЬКО владелец» — и отказ ВНЯТНЫЙ, а не тишина."""
+        r = a._chain_cb_route(self._real_cb(), self.STRANGER)
+        self.assertFalse(r["ok"])
+        self.assertIn("нет прав", r["answer"])
+        self.assertTrue(r["alert"], "чужому отказали тостом, который он может не заметить")
+        self.assertIsNone(r["action"], "чужой тап получил действие")
+
+    def test_bityi_tap_nazyvaet_slovesnyi_adres(self):
+        """Тап по неразобранной кнопке — ответ владельца, не ставший снятием. Молча
+        потерять его нельзя: в пояснении обязан быть словесный адрес ответа."""
+        for bad in ("box:free:", "box:free:ЖЖЖ", "box:free:" + "f" * 40, "box:hold:aa11bb22"):
+            r = a._chain_cb_route(bad, self.OWNER)
+            self.assertFalse(r["ok"], bad)
+            self.assertIn("ящик снять", r["note"] or "", bad)
+
+    def test_cli_ne_puskaet_chuzhoe_v_komandnuyu_stroku(self):
+        """Из Telegram в argv уезжает ТОЛЬКО метка, уже просеянная регуляркой."""
+        self.assertIn("не понял кнопку", a._box_cli("hold", self.MARK))
+        self.assertIn("не разобрана", a._box_cli("free", "aa11; rm -rf /"))
+
+
+class TestBoxReleaseWord(unittest.TestCase):
+    """СЛОВЕСНЫЙ ПУТЬ — запасной, и он не декорация: живой класс 05.09 — процесс агента
+    оказался СТАРШЕ кнопки, и тап владельца получил «карточка устарела». Форма слова та
+    же, что печатает извещение, и сверяем мы её С ИЗВЕЩЕНИЕМ, а не с литералом."""
+
+    MARK = "e0140bfc78dc"
+
+    def test_the_word_form_is_the_one_the_notice_prints(self):
+        told = sig.RELEASE_WORD % self.MARK
+        self.assertEqual(self.MARK, a.box_word_mark(told),
+                         "агент не понимает слово, которое сам же обещал в извещении")
+
+    def test_the_word_is_forgiving_to_people_who_copy_it(self):
+        for said in ("ящик снять %s" % self.MARK, "ЯЩИК СНЯТЬ %s" % self.MARK,
+                     "ящик: снять   %s" % self.MARK, "box free %s" % self.MARK,
+                     "  ящик снять %s  " % self.MARK):
+            self.assertEqual(self.MARK, a.box_word_mark(said), said)
+
+    def test_a_foreign_phrase_is_NOT_a_release(self):
+        for said in ("", "статус", "ящик", "ящик снять", "ящик снять всё",
+                     "ящик снять ЖЖЖЖЖЖ", "снять %s" % self.MARK):
+            self.assertEqual("", a.box_word_mark(said), said)
+
+    def test_the_command_is_listed_in_the_help(self):
+        """Перечень команд КАНОНИЧЕСКИЙ: команда, которой нет в подсказке, не существует
+        для владельца — он о ней не узнает ниоткуда."""
+        self.assertTrue(any("ящик снять" in c for c in a.KNOWN_COMMANDS))
+
+
+class _FakeMsg:
+    def __init__(self, text, thread=a.HQ_THREAD_ID):
+        self.text = text
+        self.message_thread_id = thread
+
+
+class TestBoxReleaseWordHandlerGolden(unittest.IsolatedAsyncioTestCase):
+    """Сквозной голден словесного пути: кто вправе — снимает, кто не вправе — получает
+    ВНЯТНЫЙ отказ (условие задания дословно: «не тишина»)."""
+
+    MARK = "e0140bfc78dc"
+
+    def setUp(self):
+        self._save = a._box_cli
+        self.calls, self.sent = [], []
+        a._box_cli = lambda action, mark: self.calls.append((action, mark)) or "BOX:OK"
+
+        async def _send(context, chat_id, text, **kw):
+            self.sent.append(text)
+        self._save_send = a._send
+        a._send = _send
+
+    def tearDown(self):
+        a._box_cli, a._send = self._save, self._save_send
+
+    async def _say(self, text, uid):
+        update = types.SimpleNamespace(
+            effective_message=_FakeMsg(text),
+            effective_chat=types.SimpleNamespace(id=a.HQ_CHAT_ID),
+            effective_user=types.SimpleNamespace(id=uid))
+        await a.on_message(update, types.SimpleNamespace(bot=_FakeBot()))
+
+    async def test_owner_word_frees_the_case(self):
+        await self._say(sig.RELEASE_WORD % self.MARK, a.ALLOWED_USER_ID)
+        self.assertEqual([("free", self.MARK)], self.calls)
+        self.assertEqual(["BOX:OK"], self.sent)
+
+    async def test_stranger_word_frees_nothing_and_is_answered(self):
+        await self._say(sig.RELEASE_WORD % self.MARK, a.ALLOWED_USER_ID + 1)
+        self.assertEqual([], self.calls, "чужое слово сняло остановку")
+        self.assertEqual(1, len(self.sent), "чужому ответили тишиной")
+        self.assertIn("Нет прав", self.sent[0])
+
+    async def test_a_broken_mark_is_answered_by_the_MARK_and_not_by_the_help(self):
+        """Общая подсказка «не знаю такой команды» здесь врёт: команду мы знаем, не
+        разобралась МЕТКА. Свести это к «не знаю» значило бы потерять ответ человека."""
+        await self._say("ящик снять всё", a.ALLOWED_USER_ID)
+        self.assertEqual([], self.calls)
+        self.assertIn("Метку не разобрал", self.sent[0])
+
+    async def test_a_stranger_saying_anything_else_still_gets_silence(self):
+        """Молчание чужому осталось правилом: болтливее агент не стал."""
+        await self._say("статус", a.ALLOWED_USER_ID + 1)
+        self.assertEqual([], self.sent)
+
+
+class TestBoxReleaseHandlerGolden(unittest.TestCase):
+    """Сквозной голден кнопки: тап → ACK + видимое сообщение, действие уходит в ПРАВИЛЬНЫЙ
+    исполнитель (_box_cli), а не в чужой («стоп цепи» на остановке ящика)."""
+
+    MARK = "e0140bfc78dc"
+
+    def setUp(self):
+        self._save = (a._box_cli, a._chain_cli, a._gate_cli, a._zayavka_cli)
+        self.box, self.chain, self.gate = [], [], []
+        a._box_cli = lambda action, m: self.box.append((action, m)) or f"BOX:{action}:{m}"
+        a._chain_cli = lambda action, pid: self.chain.append((action, pid)) or "CHAIN"
+        a._gate_cli = lambda action, c: self.gate.append((action, c)) or "GATE"
+        a._zayavka_cli = lambda action, tid: "ZAYAVKA"
+
+    def tearDown(self):
+        a._box_cli, a._chain_cli, a._gate_cli, a._zayavka_cli = self._save
+
+    def _run(self, data, uid):
+        q, bot = _FakeQuery(data, uid), _FakeBot()
+        asyncio.run(a.on_chain_callback(types.SimpleNamespace(callback_query=q),
+                                        types.SimpleNamespace(bot=bot)))
+        return q, bot
+
+    def test_tap_uhodit_v_box_cli(self):
+        cb = sig.release_buttons(self.MARK)["inline_keyboard"][0][0]["callback_data"]
+        q, bot = self._run(cb, a.ALLOWED_USER_ID)
+        self.assertEqual(len(q.answers), 1)                       # мгновенный ACK ровно один
+        self.assertEqual(self.box, [("free", self.MARK)])
+        self.assertEqual((self.chain, self.gate), ([], []), "остановка уехала в чужой исполнитель")
+        self.assertIn("BOX:free:%s" % self.MARK, bot.sent[0][1])
+
+    def test_chuzhoi_tap_nichego_ne_snimaet(self):
+        cb = sig.release_buttons(self.MARK)["inline_keyboard"][0][0]["callback_data"]
+        q, bot = self._run(cb, a.ALLOWED_USER_ID + 1)
+        self.assertEqual(self.box, [])
+        self.assertEqual(bot.sent, [], "чужому в чат ничего не шлём")
+        self.assertIn("нет прав", q.answers[0][0])
+
+    def test_chuzhie_knopki_ne_slomany(self):
+        """Замок: новая ветка не перехватила кнопки цепей, ворот и заявок."""
+        self._run(dn._chain_markup(42)["inline_keyboard"][0][0]["callback_data"],
+                  a.ALLOWED_USER_ID)
+        self._run(dn._gate_markup("4aadeb0")["inline_keyboard"][0][0]["callback_data"],
+                  a.ALLOWED_USER_ID)
+        self.assertEqual((self.chain, self.gate, self.box),
+                         ([("stop", "42")], [("yes", "4aadeb0")], []))
 
 
 if __name__ == "__main__":

@@ -48,7 +48,7 @@ import shtab_box_run as run
 import shtab_box_signals as sig
 import zayavki_pc as zp
 from test_shtab_box import (FakeQueue, GOOD_BODY, HEAD_TEXT, TODAY, _box, _dead_reader,
-                            _doc_reader, _files, _lister, _node, _reader, _ready)
+                            _doc_reader, _files, _HoldDoor, _lister, _node, _reader, _ready)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KEY = "signal-probe-0902"
@@ -143,6 +143,7 @@ def _tick(node_text=None, closed=(), rows=(), ledger=None, place=False, budget=5
     text = node_text if node_text is not None else HEAD_TEXT
     lister, doc_reader = _folder(docs)
     q = queue if queue is not None else FakeQueue(rows=list(rows), closed=list(closed))
+    kw.setdefault("hold_notify_fn", _HoldDoor())
     return run.tick(root=tempfile.mkdtemp(prefix="shtabsig_"), place=place, queue=q,
                     budget=budget, reader=_reader(text),
                     lister=kw.pop("lister", lister), doc_reader=kw.pop("doc_reader", doc_reader),
@@ -1191,7 +1192,7 @@ def _proved_tail(*ids):
 
 
 def _hold_tick(root, closed=(), node_text=None, place=True, reader=None, docs=None,
-               ledger=None, budget=50):
+               ledger=None, budget=50, hold_notify_fn=None):
     """Оборот ящика на ЗАДАННОМ корне: замок живёт на диске, и два оборота обязаны
     смотреть в один каталог. Общий :func:`_tick` каждый раз заводит новый.
     """
@@ -1203,6 +1204,7 @@ def _hold_tick(root, closed=(), node_text=None, place=True, reader=None, docs=No
                     budget=budget, reader=reader or _reader(text),
                     lister=lister, doc_reader=doc_reader,
                     ledger=ledger or _ledger((4, True, True), (5, True, True)),
+                    hold_notify_fn=hold_notify_fn or _HoldDoor(),
                     clock=lambda tz: datetime.datetime(2026, 9, 2, 12, 0, tzinfo=tz))
 
 
@@ -1380,6 +1382,250 @@ class TestHold(unittest.TestCase):
         got = sig.hold_release([{"mark": "old1", "released": True},
                                 {"mark": "old2", "released": False}], ("new1",))
         self.assertEqual({"old1", "new1"}, got)
+
+
+class TestStopIsHeardAndAnswered(unittest.TestCase):
+    """ОСТАНОВКА ВИДНА ВЛАДЕЛЬЦУ И СНИМАЕТСЯ ОТВЕТОМ В TELEGRAM (задание 06.09.2026).
+
+    ПРЕМИСА, ПЕРЕМЕРЕННАЯ ПО КОДУ, А НЕ ПРИНЯТАЯ НА СЛОВО. До этой правки поднятая
+    остановка не выходила за полосу ни одной веткой: `stop_words` уезжала в лог демона,
+    в витрину и строкой `ASK` в журнал, а единственная дверь наружу
+    (`shtab_box_run.notify_taken`) зовётся ТОЛЬКО внутри ветки `placed` — то есть на
+    ВЗЯТИИ. Остановленный ящик не берёт ничего по построению, значит на остановке эта
+    дверь не открывалась НИКОГДА. Снять её можно было ровно одним способом — строкой
+    `[[ЯЩИК СНЯТЬ метка=…]]` в узле мозга, то есть не с телефона. Премиса подтвердилась.
+
+    ЖИВОЙ ПУТЬ ЗДЕСЬ НЕ ТРОГАЕТСЯ НИ ОДНОЙ ВЕТКОЙ: дверь всегда заглушка `_HoldDoor`,
+    и из набора наружу не уходит ничего (замок задания «пробных извещений не слать»).
+    """
+
+    def setUp(self):
+        import tempfile
+
+        self.root = tempfile.mkdtemp(prefix="shtabtell_")
+        # Один случай: сигнал Б («третий раз одна причина»), хвост доказан — иначе
+        # заодно говорил бы А, и меряли бы сумму двух остановок вместо одной.
+        self.closed = _same_cause(1, 2, 3) + _proved_tail(4, 5)
+
+    def _arm(self, door=None, closed=None):
+        door = door or _HoldDoor()
+        rep = _hold_tick(self.root, closed=self.closed if closed is None else closed,
+                         hold_notify_fn=door)
+        return rep, door
+
+    # ── ИЗВЕЩЕНИЕ ────────────────────────────────────────────────────────────
+
+    def test_a_raised_stop_reaches_the_owner_at_all(self):
+        """Главный факт задания: остановка перестала быть невидимой."""
+        rep, door = self._arm()
+        self.assertEqual([], rep["placed"], "остановка объявлена, а задание всё же взято")
+        self.assertEqual(1, len(door.sent), "остановка снова никому не сказана")
+        self.assertEqual(1, len(rep["hold_told"]))
+        self.assertEqual([], rep["hold_notice_failed"])
+
+    def test_the_notice_names_the_signal_the_rows_and_how_to_release(self):
+        """ТРИ ЧАСТИ ПО ЗАДАНИЮ: какой сигнал · какие ряды подняли · чем снимается."""
+        _rep, door = self._arm()
+        text, markup = door.sent[0]
+        self.assertIn("сигнал", text.lower())
+        self.assertIn("Б", text)                                  # ЧТО сработало
+        self.assertIn("третий раз одна причина", text)
+        for row in ("#1", "#2", "#3"):                            # КАКИЕ РЯДЫ подняли
+            self.assertIn(row, text, "ряды случая в извещении не названы")
+        self.assertIn("ящик снять", text)                         # ЧЕМ снимается — словом
+        self.assertIn("PC-дев", text)                             # и ГДЕ это слово говорить
+        self.assertTrue(markup and markup.get("inline_keyboard"), "карточка приехала без кнопки")
+
+    def test_the_button_carries_the_mark_of_THIS_case_and_fits_telegram(self):
+        _rep, door = self._arm()
+        _text, markup = door.sent[0]
+        data = markup["inline_keyboard"][0][0]["callback_data"]
+        self.assertTrue(data.startswith("box:free:"), data)
+        self.assertLessEqual(len(data.encode("utf-8")), 64, "callback_data не влезает в Telegram")
+        self.assertIn(data.split(":")[-1], _rep["stop_marks"], "кнопка зовёт снять чужой случай")
+
+    def test_the_notice_words_are_the_SAME_as_the_journal_words(self):
+        """Владелец читает про один случай в двух местах, и разъехаться они не смеют:
+        и фраза остановки, и карточка печатают «чем снимается» ОДНОЙ функцией."""
+        rep, door = self._arm()
+        way = sig.telegram_way(rep["stop_marks"][0])
+        self.assertIn(way, door.sent[0][0])
+        self.assertIn(way, rep["stop"])
+
+    # ── ДЕДУП (пункт 5 задания) ──────────────────────────────────────────────
+
+    def test_ONE_stop_is_told_ONCE_no_matter_how_many_ticks_pass(self):
+        """Виток ящика — 30 минут, остановка живёт до слова владельца. Доклад ПО ФАКТУ
+        дал бы под полсотни карточек за ночь; докладываем СЛУЧАЙ, и ровно один раз."""
+        _rep, door = self._arm()
+        for _ in range(3):
+            again = _hold_tick(self.root, closed=self.closed, hold_notify_fn=door)
+            self.assertEqual([], again["placed"])
+            self.assertTrue(again["stop"], "остановка исчезла между витками")
+        self.assertEqual(1, len(door.sent), "об одной остановке сказали %d раз" % len(door.sent))
+
+    def test_the_dedup_survives_a_vanished_corpus_because_it_lives_in_the_latch(self):
+        """Второго реестра «кому сказали» нет: признак лежит в файле замка, рядом с
+        самой остановкой. Поэтому пропавший корпус (живой класс 05.09 — номера очереди
+        идут по кругу) не рождает второй карточки о том же случае."""
+        _rep, door = self._arm()
+        gone = _hold_tick(self.root, closed=[], hold_notify_fn=door)
+        self.assertIn("ДЕРЖИТСЯ ЗАМКОМ", gone["stop"])
+        self.assertEqual(1, len(door.sent))
+
+    def test_a_DIFFERENT_case_is_told_on_its_own(self):
+        """Дедуп по случаю, а не по факту остановки: новая улика — новая новость.
+        Молчание про вторую поломку было бы той же молчащей остановкой."""
+        _rep, door = self._arm()
+        other = _hold_tick(self.root, closed=_same_cause(7, 8, 9) + _proved_tail(4, 5),
+                           hold_notify_fn=door)
+        self.assertTrue(other["stop_marks"])
+        self.assertEqual(2, len(door.sent), "о втором случае не сказали")
+
+    # ── СУХОЙ ХОД И ОТКАЗ ДОСТАВКИ ───────────────────────────────────────────
+
+    def test_a_dry_run_shows_the_card_and_sends_NOTHING(self):
+        """Запрет задания дословно: «из проверки не уходит НИЧЕГО». Дорога увидеть
+        будущую карточку целиком, ничего не послав, обязана быть."""
+        door = _HoldDoor()
+        rep = _hold_tick(self.root, closed=self.closed, place=False, hold_notify_fn=door)
+        self.assertEqual([], door.sent, "сухой ход послал живое сообщение")
+        self.assertEqual(1, len(rep["hold_notices"]))
+        self.assertTrue(rep["hold_notices"][0]["dry"])
+        self.assertIn("ОСТАНОВКЕ", run._render(report=rep))
+        self.assertFalse(os.path.exists(run.hold_path(self.root)),
+                         "сухой ход написал на диск")
+
+    def test_a_failed_delivery_is_AUDIBLE_and_the_next_tick_says_it_AGAIN(self):
+        """«Сказали» ложится на диск ПОСЛЕ доставки: не ушло — скажем следующим витком.
+        Записывай мы вперёд — сорвавшаяся отправка стала бы молчанием навсегда, а мы
+        чиним ровно молчание."""
+        dead = _HoldDoor(ok=False, why="бота нет в инбоксе")
+        rep = _hold_tick(self.root, closed=self.closed, hold_notify_fn=dead)
+        self.assertEqual(1, len(rep["hold_notice_failed"]))
+        self.assertEqual([], rep["hold_told"])
+        self.assertIn("ИЗВЕЩЕНИЕ ОБ ОСТАНОВКЕ НЕ УШЛО", rep["why"])
+        self.assertIn("бота нет в инбоксе", rep["why"])
+        self.assertTrue(rep["armed"], "неушедшее извещение отменило запирание остановки")
+        alive = _HoldDoor()
+        again = _hold_tick(self.root, closed=self.closed, hold_notify_fn=alive)
+        self.assertEqual(1, len(alive.sent), "о молчащей остановке так и не сказали")
+        self.assertEqual(1, len(again["hold_told"]))
+
+    def test_an_exploding_door_does_not_take_the_tick_down(self):
+        """Дверь наружу роняет виток ящика ни одной веткой: замок дороже новости."""
+        rep = _hold_tick(self.root, closed=self.closed,
+                         hold_notify_fn=_HoldDoor(boom="сокет закрыт"))
+        self.assertTrue(rep["armed"])
+        self.assertEqual(1, len(rep["hold_notice_failed"]))
+        self.assertIn("сокет закрыт", rep["hold_notice_failed"][0]["why"])
+
+    # ── СНЯТИЕ ОТВЕТОМ (пункты 2–4 задания) ──────────────────────────────────
+
+    def test_the_right_answer_frees_THIS_case_and_the_box_goes_on(self):
+        """ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ контрфакта: верное снятие проходит и ящик едет."""
+        rep, _door = self._arm()
+        mark = rep["stop_marks"][0]
+        ok, words = run.free_mark(mark, root=self.root, by="Telegram")
+        self.assertTrue(ok, words)
+        self.assertIn("Остановка снята", words)
+        self.assertIn(mark, words)
+        after = _hold_tick(self.root, closed=[])
+        self.assertEqual("", after["stop"], "снятая остановка держит ящик")
+        self.assertEqual(1, len(after["placed"]), after["why"])
+
+    def test_a_WRONG_mark_frees_NOTHING(self):
+        """КОНТРФАКТ ЗАДАНИЯ: снятие по неверной метке не проходит. Закрыто МЕСТОМ —
+        снимаются только случаи, которые ящик сам записал в замок."""
+        rep, _door = self._arm()
+        ok, words = run.free_mark("deadbeef", root=self.root, by="Telegram")
+        self.assertFalse(ok)
+        self.assertIn("НЕТ", words)
+        self.assertIn(rep["stop_marks"][0], words, "не показали, какие метки открыты")
+        after = _hold_tick(self.root, closed=self.closed)
+        self.assertEqual([], after["placed"], "неверная метка всё же отпустила ящик")
+        self.assertTrue(after["stop"])
+
+    def test_the_release_frees_EXACTLY_that_case_and_not_the_other(self):
+        """«Снимает ИМЕННО этот случай» — обещание фразы остановки. Две поднятые
+        остановки, снята одна: вторая обязана держать ящик дальше."""
+        rep = _hold_tick(self.root, closed=_same_cause(1, 2, 3), hold_notify_fn=_HoldDoor())
+        marks = sorted(rep["stop_marks"])
+        self.assertEqual(2, len(marks), "нужен корпус, поднимающий ДВА сигнала: %s" % marks)
+        ok, _words = run.free_mark(marks[0], root=self.root)
+        self.assertTrue(ok)
+        after = _hold_tick(self.root, closed=[])
+        self.assertEqual([], after["placed"], "снятие одного случая отпустило оба")
+        self.assertIn(marks[1], after["stop_marks"])
+        self.assertNotIn(marks[0], after["stop_marks"])
+
+    def test_a_second_tap_on_the_same_card_is_not_an_error(self):
+        """Повторный тап по той же карточке — обычное дело у человека, и пугать его
+        отказом за это нельзя. Но и «снято» второй раз говорить не о чем."""
+        rep, _door = self._arm()
+        mark = rep["stop_marks"][0]
+        run.free_mark(mark, root=self.root)
+        ok, words = run.free_mark(mark, root=self.root)
+        self.assertTrue(ok)
+        self.assertIn("уже снята", words)
+
+    def test_an_OLD_latch_record_says_where_the_rows_are_instead_of_denying_them(self):
+        """ЗАПИСИ СТАРШЕ 06.09 ПОЛЯ УЛИК НЕ ИМЕЮТ ВОВСЕ, и живая запись полосы
+        `ddac4cc3b98a` (сигнал А, заперта 06.09 11:45Z, ряды #101 и #102) именно такая.
+        Сказать о ней «рядов нет» значило бы соврать: ряды есть, их нет В ЗАПИСИ.
+        """
+        old = {"mark": "ddac4cc3b98a", "sig": "А", "at": "2026-09-06T11:45:39Z",
+               "why": "2 последних НАШИХ закрытых задания ящика подряд без вердикта "
+                      "«сделано»: #101 — закрыта как failed, #102 — закрыта как failed"}
+        text = sig.hold_notice(old)
+        self.assertNotIn("Рядов у случая нет", text)
+        self.assertIn("названы в причине", text)
+        self.assertIn("#101", text)                       # и они там действительно есть
+        self.assertIn("ящик снять ddac4cc3b98a", text)    # снять её всё равно есть чем
+
+    def test_a_released_case_is_never_told_about(self):
+        """Снятая остановка новостью не является: карточка о ней звала бы снимать
+        снятое. Проверяем чистый слой — он же и решает."""
+        self.assertEqual([], sig.untold([{"mark": "aa11", "sig": "Б", "why": "случай"},
+                                         {"mark": "aa11", "released": True}]))
+        self.assertEqual(["aa11"], [r["mark"] for r in
+                                    sig.untold([{"mark": "aa11", "sig": "Б", "why": "случай"}])])
+
+    def test_an_unreadable_latch_refuses_the_release_instead_of_guessing(self):
+        """Дописать снятие в файл, который не прочитан, значит снять НЕИЗВЕСТНО ЧТО."""
+        with io.open(run.hold_path(self.root), "w", encoding="utf-8") as fh:
+            fh.write("{это не json\n")
+        ok, words = run.free_mark("aa11bb22", root=self.root)
+        self.assertFalse(ok)
+        self.assertIn("не прочитан", words)
+
+    def test_an_empty_mark_frees_nothing(self):
+        ok, words = run.free_mark("", root=self.root)
+        self.assertFalse(ok)
+        self.assertIn("не названа", words)
+
+    def test_the_release_leaves_a_trace_of_WHO_answered(self):
+        """След нужен человеку, читающему замок глазами: дорог снятия стало две."""
+        rep, _door = self._arm()
+        mark = rep["stop_marks"][0]
+        run.free_mark(mark, root=self.root, by="Telegram")
+        rows, ok, _why = run.read_hold(self.root)
+        self.assertTrue(ok)
+        freed = [r for r in rows if r.get("mark") == mark and r.get("released")]
+        self.assertEqual(1, len(freed))
+        self.assertEqual("Telegram", freed[0].get("by"))
+
+    # ── ЧИСТЫЙ СЛОЙ: ЗАПИСЬ ДОКЛАДА НЕ ТРОГАЕТ САМ СЛУЧАЙ ────────────────────
+
+    def test_the_told_line_does_not_overwrite_the_moment_of_the_case(self):
+        """Чтение схлопывает строки одной метки поздней поверх ранней: положи мы в
+        строку доклада поле `at` — оно затёрло бы МОМЕНТ СЛУЧАЯ, то самое число,
+        которым запомненный сигнал объясняет человеку, когда его видели живьём."""
+        idx = sig.hold_index([{"mark": "aa11", "sig": "Б", "why": "случай", "at": "T1"},
+                              sig.hold_told("aa11", now="T2")])
+        self.assertEqual("T1", idx["aa11"]["at"])
+        self.assertEqual("T2", idx["aa11"]["told_at"])
+        self.assertTrue(idx["aa11"]["told"])
 
 
 if __name__ == "__main__":            # pragma: no cover

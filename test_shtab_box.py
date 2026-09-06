@@ -252,6 +252,29 @@ class FakeQueue(object):
         return True, self.next_id, ""
 
 
+class _HoldDoor(object):
+    """Дверь извещения об ОСТАНОВКЕ-заглушка в форме :func:`run.notify_hold`.
+
+    ФОРМА ПОВТОРЕНА ДОСЛОВНО — ``(текст, кнопки) → (ok, канал, причина)``: мок,
+    разошедшийся с живой дверью, зеленел бы молча, и это ровно тот класс, на котором
+    полоса ПК уже обжигалась (`CLAUDE.md`, «Форматы»).
+
+    Живёт ЗДЕСЬ, а не в наборе сигналов, по той же причине, по которой там же живут
+    `FakeQueue` и `_reader`: предмет один, и второй экземпляр заглушки разошёлся бы с
+    первым молча.
+    """
+
+    def __init__(self, ok=True, why="инбокс закрыт", boom=None):
+        self._ok, self._why, self._boom = ok, why, boom
+        self.sent = []
+
+    def __call__(self, text, markup=None):
+        self.sent.append((text, markup))
+        if self._boom:
+            raise RuntimeError(self._boom)
+        return (self._ok, "inbox" if self._ok else "", "" if self._ok else self._why)
+
+
 def _tick(docs=None, reader=None, queue=None, place=False, root=None, node_text=None,
           lister=None, doc_reader=None, extra=(), **kw):
     """Оборот ящика на заглушках. Корень — ВСЕГДА временный каталог, если не назван.
@@ -261,6 +284,13 @@ def _tick(docs=None, reader=None, queue=None, place=False, root=None, node_text=
     """
     root = root or tempfile.mkdtemp(prefix="shtabbox_")
     files, bodies = _files(docs or ())
+    # ДВЕРЬ ИЗВЕЩЕНИЯ ОБ ОСТАНОВКЕ ЗАГЛУШЕНА ПО УМОЛЧАНИЮ ВО ВСЁМ НАБОРЕ (06.09.2026).
+    # Условие задания дословно: «пробных извещений владельцу не слать ни одного — у
+    # боевого пути и проверки разные вызовы, из проверки не уходит НИЧЕГО». Чужой
+    # замок `dispatch_notify` (замок 1) это и так ловит — ЗАМЕРЕНО: до заглушки набор
+    # доходил до боевой двери и получал «проба: живая отправка владельцу запрещена», —
+    # но замок своего предмета обязан стоять здесь, а не в соседнем модуле.
+    kw.setdefault("hold_notify_fn", _HoldDoor())
     return run.tick(root=root, place=place, queue=queue if queue is not None else FakeQueue(),
                     lister=lister if lister is not None else _lister(files, extra=extra),
                     doc_reader=doc_reader if doc_reader is not None else _doc_reader(bodies),
@@ -2304,19 +2334,31 @@ class TestTakeNotice(unittest.TestCase):
 
     # ── дверь ────────────────────────────────────────────────────────────────
 
-    def test_the_notice_carries_no_buttons_and_never_goes_to_the_inbox(self):
-        """ПРЯМОЙ ЗАПРЕТ ЗАДАНИЯ: «новых карточек не заводить… кнопок у него нет и
-        ответа оно не ждёт». Судим по ДЕЙСТВИЮ — обходом AST на вызовы и на
-        доводы, а не грепом: имена запрещённых дверей законно стоя́т в докстринге,
-        который объясняет, почему их здесь нет, и грепающая проверка ловила бы
-        собственное объяснение.
+    # Двери с каскадом и/или клавиатурой. Список тот же, что стоял здесь с 05.09.
+    CASCADE_DOORS = ("send_critical", "send_topic", "deliver", "awaits_reply", "send")
+    # ЕДИНСТВЕННОЕ ИСКЛЮЧЕНИЕ, НАЗВАННОЕ ПОИМЁННО. Белый список против чёрного здесь
+    # принципиален ровно так же, как у дверей чтения мозга: «всё, кроме этой функции»
+    # ловит и ту ветку, которую завтра напишет забывший про инвариант.
+    HOLD_DOOR = "notify_hold"
+
+    def _door_names(self, inside=None, outside=None):
+        """Имена вызовов и доводов модуля ящика, отобранные ПО ФУНКЦИИ. → (имена, доводы).
+
+        ИМЯ ДВЕРИ СЧИТАЕТСЯ УПОМЯНУТЫМ И ТОГДА, КОГДА ЕЁ НЕ ЗОВУТ НА МЕСТЕ, а кладут
+        в переменную и зовут через неё: одного обхода ВЫЗОВОВ мало —
+        ``door = dispatch_notify.send_critical`` проехало бы мимо него молча.
         """
         tree = ast.parse(_src("shtab_box_run.py"))
+        picked = set()
+        for fn in ast.walk(tree):
+            if isinstance(fn, ast.FunctionDef) and fn.name == (inside or outside):
+                picked.update(id(n) for n in ast.walk(fn))
         named, kwargs = set(), set()
         for node in ast.walk(tree):
-            # ИМЯ ДВЕРИ СЧИТАЕТСЯ УПОМЯНУТЫМ И ТОГДА, КОГДА ЕЁ НЕ ЗОВУТ НА МЕСТЕ, а
-            # кладут в переменную и зовут через неё: одного обхода ВЫЗОВОВ мало —
-            # `door = dispatch_notify.send_critical` проехало бы мимо него молча.
+            # «Внутри названной функции» и «во всём модуле, КРОМЕ неё» — один обход и
+            # один признак: два похожих обхода разъехались бы молча.
+            if (inside and id(node) not in picked) or (outside and id(node) in picked):
+                continue
             if isinstance(node, ast.Attribute):
                 named.add(node.attr)
             if isinstance(node, ast.Call):
@@ -2326,10 +2368,52 @@ class TestTakeNotice(unittest.TestCase):
                 for kw in (node.keywords or []):
                     if kw.arg:
                         kwargs.add(kw.arg)
-        for door in ("send_critical", "send_topic", "deliver", "awaits_reply", "send"):
+        return named, kwargs
+
+    def test_the_TAKE_notice_carries_no_buttons_and_never_goes_to_the_inbox(self):
+        """ПРЯМОЙ ЗАПРЕТ ЗАДАНИЯ 05.09: «новых карточек не заводить… кнопок у него нет
+        и ответа оно не ждёт». Судим по ДЕЙСТВИЮ — обходом AST на вызовы и на доводы,
+        а не грепом: имена запрещённых дверей законно стоя́т в докстрингах, которые
+        объясняют, почему их здесь нет, и грепающая проверка ловила бы собственное
+        объяснение.
+
+        ═══ ЗДЕСЬ СТОЯЛ ЗАПРЕТ НА ВЕСЬ МОДУЛЬ (сужен 06.09.2026) ═════════════════
+
+        Прежняя проверка обходила ВЕСЬ ``shtab_box_run.py`` и запрещала каскадные
+        двери где угодно в нём. Предмет у неё был ОДИН — извещение о ВЗЯТИИ, — а
+        область на весь файл; 06.09 владелец потребовал для ДРУГОГО сообщения ровно
+        обратного: сигнальная остановка обязана уходить КРИТИЧЕСКИМ каналом (1160
+        первым, личка откатом) и С КНОПКОЙ, потому что она ЖДЁТ ОТВЕТА — им она и
+        снимается. Признак адреса один и тот же («ждёт ли ответа», правило владельца
+        10.08.2026), и по нему два сообщения обязаны ехать в РАЗНЫЕ двери.
+
+        СУЖЕНИЕ — НЕ ОСЛАБЛЕНИЕ, и вот чем это доказано: запрет остался полным для
+        ВСЕГО модуля, кроме одной поимённо названной функции :data:`HOLD_DOOR`;
+        область покрытия включает и код вне функций, где «дверь в переменной» была бы
+        так же опасна. Что происходит ВНУТРИ исключения, проверяет соседний тест —
+        то есть незапрещённого места в модуле не осталось ни одного.
+        """
+        named, kwargs = self._door_names(outside=self.HOLD_DOOR)
+        for door in self.CASCADE_DOORS:
             self.assertNotIn(door, named, "ящик открыл дверь с каскадом/кнопкой: %s" % door)
         self.assertIn("send_topic_strict", named, "дверь без каскада не названа вовсе")
-        self.assertNotIn("reply_markup", kwargs, "извещению приделали клавиатуру")
+        self.assertNotIn("reply_markup", kwargs, "извещению о взятии приделали клавиатуру")
+
+    def test_the_STOP_notice_uses_the_critical_channel_and_only_that_one(self):
+        """Обратный инвариант той же пары: у извещения об ОСТАНОВКЕ дверь ОДНА и
+        каскадная. Проверяем не «что-то каскадное вызвано», а ИМЕННО ``send_critical``:
+        1160 первым каналом, личка откатом — тот адрес, где владелец отвечает.
+
+        ВТОРОЙ ДВЕРИ ВНУТРИ ИСКЛЮЧЕНИЯ БЫТЬ НЕ ДОЛЖНО: `deliver` сам выбирает адрес
+        по признаку и в ЭТОМ месте был бы вторым мнением о том же (адрес здесь решён
+        видом сообщения), а `send_topic_strict` увёз бы карточку с кнопкой в тему
+        постановки, где владелец ответа не ждёт.
+        """
+        named, _kwargs = self._door_names(inside=self.HOLD_DOOR)
+        self.assertIn("send_critical", named, "остановка поехала не критическим каналом")
+        for door in ("send_topic", "deliver", "awaits_reply", "send_topic_strict"):
+            self.assertNotIn(door, named, "у извещения об остановке завелась вторая дверь: %s"
+                             % door)
 
     def test_the_topic_is_the_working_one_and_taken_from_dispatch_notify(self):
         """Тема постановки задач (328) живёт ОДНИМ значением в ``dispatch_notify``;

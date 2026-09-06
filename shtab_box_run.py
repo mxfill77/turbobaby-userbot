@@ -8,6 +8,7 @@
     venv/Scripts/python.exe shtab_box_run.py --dry      # что УШЛО БЫ в очередь, дословно
     venv/Scripts/python.exe shtab_box_run.py --place    # боевая постановка
     venv/Scripts/python.exe shtab_box_run.py --show KEY # дословный текст ряда по ключу задания
+    venv/Scripts/python.exe shtab_box_run.py --free МЕТКА  # снять остановку (зовёт кнопка pc_agent)
 
 ИСТОЧНИК ЗАДАНИЙ С 03.09.2026 — ОТДЕЛЬНЫЕ ДОКУМЕНТЫ ПАПКИ МОЗГА с префиксом
 :data:`shtab_box.TASK_PREFIX` в имени. Раньше задание было блоком внутри узла
@@ -52,6 +53,14 @@
 очереди читается теперь по ОБЕИМ полосам (``lane='all'``, один вызов на статус,
 проверено живьём): иначе маркер задания, уехавшего на сервер, стал бы невидим и
 ящик ставил бы его заново каждые полчаса — МОЛЧА.
+
+ОСТАНОВКА ВЫХОДИТ НАРУЖУ И СНИМАЕТСЯ ОТВЕТОМ В TELEGRAM (06.09.2026). До этого дня
+она не выходила за полосу ни одной веткой (лог демона, витрина и строка `ASK` в
+журнал), а снять её можно было ТОЛЬКО правкой узла мозга — с телефона это не
+делается. Теперь поднятая остановка уходит владельцу ОДИН раз критическим каналом
+с кнопкой (:func:`notify_hold`), а ответ приходит обратно сюда: `pc_agent` зовёт
+``--free <метка>`` (:func:`free_mark`). Дедуп держит ТОТ ЖЕ файл замка, что и саму
+остановку, — второго реестра «кому уже сказали» у полосы нет ни одной ветки.
 
 СИГНАЛЬНАЯ ОСТАНОВКА (02.09.2026) СЧИТАЕТСЯ ЗДЕСЬ, А РЕШАЕТСЯ В :mod:`shtab_box_signals`.
 Руки приносят четыре корпуса фактов и ни одного вердикта: закрытые ряды очереди с
@@ -1044,7 +1053,7 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
          journal_fn=None, reader=None, node=None, ledger=None, lister=None,
          doc_reader=None, prefix=None, read_max=shtab_box.READ_MAX,
          taken_reader=None, remember_fn=None, hold_reader=None, hold_writer=None,
-         notify_fn=None):
+         notify_fn=None, hold_notify_fn=None):
     """Один оборот ящика. → dict отчёта.
 
     ``place=False`` — сухой ход: папка перечислена, документы разобраны, тела
@@ -1112,6 +1121,13 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
               # вообще работает.
               "armed": [], "freed": [], "hold_n": data["hold_n"],
               "hold_ok": data["hold_ok"], "hold_why": data["hold_why"],
+              # ИЗВЕЩЕНИЕ ОБ ОСТАНОВКЕ — ТЕМИ ЖЕ ТРЕМЯ ГРАФАМИ, что и извещение о
+              # взятии: «текст собран» (есть и на сухом ходу) · «ушло и записано,
+              # что сказали» · «не ушло, вот почему». Один счётчик слил бы
+              # «сказали» с «собирались сказать» — а именно эта разница и есть
+              # предмет задания 06.09: молчащую остановку от сказанной нельзя
+              # отличить ничем другим.
+              "hold_notices": [], "hold_told": [], "hold_notice_failed": [],
               # ИЗВЕЩЕНИЕ О ВЗЯТИИ — ТРЕМЯ РАЗНЫМИ ГРАФАМИ, а не одним счётчиком:
               # «текст собран» (`notices` — есть и на сухом ходу), «ушло»
               # (`noticed`) и «не ушло, вот почему» (`notice_failed`). Один
@@ -1167,6 +1183,48 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
             ok_w, why_w = (hold_writer or write_hold)(root, sig.hold_free(mark, now=data["stamp"]))
             (report["freed"] if ok_w else report["memory"]).append(
                 mark if ok_w else (str(mark), why_w))
+
+    # ── ИЗВЕЩЕНИЕ ВЛАДЕЛЬЦУ: «ЯЩИК ОСТАНОВЛЕН СИГНАЛОМ» ──────────────────────
+    # СТОИ́Т ПОСЛЕ ЗАПИСИ ЗАМКА, и порядок выбран, а не случаен: карточка зовёт
+    # снять ИМЕННО ЭТОТ случай кнопкой с меткой, а снимается случай, ЗАПИСАННЫЙ в
+    # замок. Скажи мы раньше записи — владелец получил бы кнопку на случай,
+    # которого в замке нет, и его тап честно ответил бы «метки нет». Поэтому в
+    # список «о чём говорим» идут ровно те свежие записи, что ЛЕГЛИ НА ДИСК
+    # (`report["armed"]`), плюс старые, о которых сказать не удалось раньше.
+    #
+    # СУХОЙ ХОД СОБИРАЕТ ТЕКСТ И НЕ ШЛЁТ НИЧЕГО — запрет задания дословно:
+    # «пробных извещений владельцу не слать ни одного; у боевого пути и проверки
+    # разные вызовы». Владелец обязан иметь дорогу увидеть будущую карточку
+    # целиком, ничего не послав, — как у извещения о взятии.
+    armed_now = {str(m) for m in (report["armed"] or ())}
+    tell = sig.untold(list(data.get("hold") or ())
+                      + [r for r in (data.get("arm") or ())
+                         if not place or str(r.get("mark") or "") in armed_now])
+    for rec in tell:
+        mark = str(rec.get("mark") or "")
+        notice = sig.hold_notice(rec)
+        report["hold_notices"].append({"mark": mark, "dry": not place, "text": notice})
+        if not place:
+            continue
+        # СБОЙ ДОСТАВКИ НЕ ОТМЕНЯЕТ ОСТАНОВКИ и не роняет виток: замок уже стои́т,
+        # и молчание Telegram — не повод отпускать ящик. Но оно ОБЯЗАНО БЫТЬ
+        # СЛЫШНО (`_why`), и «сказали» на диск не ложится: следующий виток скажет
+        # заново — это ровно то, ради чего признак `told` пишется ПОСЛЕ отправки.
+        try:
+            n_ok, n_where, n_why = (hold_notify_fn or notify_hold)(
+                notice, sig.release_buttons(mark))
+        except Exception as exc:                        # noqa: BLE001
+            n_ok, n_where, n_why = False, "", "извещение об остановке не ушло: %s" % exc
+        if not n_ok:
+            report["hold_notice_failed"].append({"mark": mark, "why": n_why})
+            continue
+        ok_w, why_w = (hold_writer or write_hold)(root, sig.hold_told(mark, now=data["stamp"]))
+        report["hold_told"].append({"mark": mark, "channel": n_where, "written": bool(ok_w)})
+        if not ok_w:
+            # Молчащий отказ этой записи неотличим от здорового дедупа ровно до
+            # следующего витка, когда владелец получит ту же карточку второй раз.
+            report["memory"].append(
+                (mark, "%s — извещение об этой остановке уйдёт ВТОРОЙ раз" % why_w))
 
     for blk, text in take:
         report["texts"][blk["key"]] = text
@@ -1253,6 +1311,15 @@ def tick(root=HERE, place=False, limit=shtab_box.TICK_LIMIT,
     report["acted"] = bool(report["placed"] or report["failed"])
     report["line"] = _line(report)
     report["why"] = _why(report, data)
+    # НЕУШЕДШЕЕ ИЗВЕЩЕНИЕ ОБ ОСТАНОВКЕ ЕДЕТ В `why`, А НЕ В `line`, и это не вкус:
+    # `_line` пишется ТОЛЬКО при взятии (`placed`/`failed`), а остановленный ящик
+    # не берёт ничего по построению — то есть на остановке строки исхода не бывает
+    # вовсе, и новость утонула бы ровно в том случае, ради которого заведена.
+    # `why` демон кладёт в лог КАЖДЫЙ оборот, в том числе холостой.
+    for row in (report["hold_notice_failed"] or ()):
+        report["why"] = ("%s · ИЗВЕЩЕНИЕ ОБ ОСТАНОВКЕ НЕ УШЛО (метка %s): %s — владелец о ней НЕ "
+                         "ЗНАЕТ, скажем следующим витком"
+                         % (report["why"], row.get("mark"), row.get("why")))
     report["build"] = {k: v for k, v in data.items() if k != "queue"}
     return report
 
@@ -1304,6 +1371,100 @@ def notify_taken(text, topic=None, sender=None):
     door = sender if sender is not None else dispatch_notify.send_topic_strict
     _channel, ok, detail = door(body, tid)
     return bool(ok), (detail if ok else ""), ("" if ok else str(detail or "не отправлено"))
+
+
+def notify_hold(text, markup=None, sender=None):
+    """Извещение об ОСТАНОВКЕ — критическим каналом, С КНОПКОЙ. → (ok, канал, причина).
+
+    ═══ ПОЧЕМУ ЭТО ВТОРАЯ ДВЕРЬ, А НЕ ВЕТКА ПЕРВОЙ ═══════════════════════════
+
+    Соседняя :func:`notify_taken` шлёт БЕЗ каскада и БЕЗ кнопки, и в её докстринге
+    прямо сказано почему: извещение о взятии ответа не ждёт, а севшее в инбокс
+    1160 читается как заявка и требует действия, которого мы не просим. Здесь всё
+    ровно наоборот: остановка ЖДЁТ ответа — им она и снимается, — а инбокс 1160
+    есть тема ответа владельца. Один признак («ждёт ли ответа», правило владельца
+    10.08.2026) разводит два сообщения по двум дверям.
+
+    Слить их в одну функцию с флагом было бы дешевле на три строки и дороже на
+    один класс: флаг можно вычислить неверно, дверь перепутать нельзя. Ровно тем
+    же доводом живёт отрицательный тест извещения о взятии («закрыто МЕСТОМ, а не
+    условием»).
+
+    КАСКАД ЗДЕСЬ ЗАКОНЕН И НУЖЕН: `send_critical` идёт тема 1160 → личка, и
+    `reply_markup` едет ОБОИМИ каналами (замок доктрины адреса) — у карточки с
+    кнопкой смена канала не смеет отнять кнопку, иначе владельцу нечем ответить.
+
+    ОТКАЗ ВОЗВРАЩАЕТСЯ ПРИЧИНОЙ, а не глотается: «сказали» и «сказать не смогли»
+    — разные новости, и от второй зависит, скажем ли мы это следующим витком
+    (:func:`shtab_box_signals.hold_told` пишется только после успеха).
+    """
+    body = str(text or "").strip()
+    if not body:
+        return False, "", "пустой текст извещения — не отправляем"
+    import dispatch_notify
+
+    # ИМЯ МЕСТНОЙ ПЕРЕМЕННОЙ — НЕ `send`, по той же причине, что у соседней двери:
+    # инвариант «каскад и кнопка живут ровно в одной функции» судит по ВЫЗЫВАЕМЫМ
+    # ИМЕНАМ обходом AST, и `send(...)` здесь погасил бы его собственной подписью.
+    door = sender if sender is not None else dispatch_notify.send_critical
+    channel, ok = door(body, markup)
+    return bool(ok), (str(channel) if ok else ""), ("" if ok else "канал %s отказал" % channel)
+
+
+def free_mark(mark, root=HERE, at="", by="", hold_reader=None, hold_writer=None):
+    """Снятие остановки ОТВЕТОМ ВЛАДЕЛЬЦА (кнопка или слово Telegram). → (ok, слова).
+
+    Слова возвращаются ГОТОВЫМИ и печатает их `pc_agent` в чат карточки — второй
+    формулировки того же исхода заводить нельзя (тот же довод, что у
+    `zayavki_pc_run.answer`): «снято» на кнопке и «снято» в замке разошлись бы
+    словами при одном действии.
+
+    ═══ ЧЕТЫРЕ ИСХОДА, И НИ ОДИН НЕ МОЛЧИТ ══════════════════════════════════
+
+    * замок не прочитан → НЕ СНИМАЕМ. Дописать снятие в файл, который мы не сумели
+      прочесть, значит снять НЕИЗВЕСТНО ЧТО: метка могла принадлежать другому
+      случаю, а могла не существовать вовсе;
+    * метки в замке нет → НЕ СНИМАЕМ и называем открытые. Это контрфакт задания
+      («снятие по неверной метке не проходит») и он закрыт МЕСТОМ: снимаются
+      только те случаи, которые ящик сам записал, — выдуманная метка не найдёт
+      себе записи ни одной дорогой;
+    * метка уже снята → ``ok``, но словами «уже». Повторный тап по той же
+      карточке — обычное дело у человека, и пугать его отказом за это нельзя;
+    * снято → говорим, ЧТО именно снято и когда ящик поедет.
+
+    ПРАВО ЗДЕСЬ НЕ СУДИТСЯ, И ЭТО НАЗВАНО ВСЛУХ, а не забыто. Личности звонящего
+    у этого слоя нет вовсе: он видит аргумент командной строки. Право судит ОДНО
+    место — `pc_agent`, где живёт номер владельца и куда физически приходит тап
+    (`_chain_cb_authorized`); второй экземпляр этого номера здесь разошёлся бы с
+    первым молча. ``by`` — СЛЕД для человека, читающего замок, а не проверка.
+    """
+    m = str(mark or "").strip()
+    if not m:
+        return False, "⚠️ Метка не названа — снимать нечего."
+    held, ok, why = (hold_reader or read_hold)(root)
+    if not ok:
+        return False, ("⚠️ Остановка НЕ СНЯТА: замок не прочитан (%s). Пока замок не читается, "
+                       "ящик не берёт ничего и снять случай нечем — строку файла %s надо "
+                       "поправить руками." % (why, HOLD_FILE))
+    idx = sig.hold_index(held)
+    rec = idx.get(m)
+    if rec is None:
+        live = sorted(k for k, r in idx.items() if not r.get("released"))
+        return False, ("⚠️ Метки %s в замке остановки НЕТ — ничего не снято. Открытых остановок: "
+                       "%s. Метку берите из самого извещения: она снимает ровно тот случай, о "
+                       "котором пришла." % (m, ", ".join(live) if live else "ни одной"))
+    if rec.get("released"):
+        return True, ("✅ Остановка %s (сигнал %s) уже снята%s — снимать второй раз нечего."
+                      % (m, str(rec.get("sig") or "?"),
+                         (" %s" % rec["at"]) if rec.get("at") else ""))
+    ok_w, why_w = (hold_writer or write_hold)(root, sig.hold_free(m, now=at or now_iso(None), by=by))
+    if not ok_w:
+        return False, ("⚠️ Остановка %s НЕ СНЯТА: %s. Ящик по-прежнему не берёт заданий."
+                       % (m, why_w))
+    return True, ("✅ Остановка снята: сигнал %s (%s), метка %s. Ящик берёт задания Штаба со "
+                  "следующего витка. Снят РОВНО этот случай — такой же следующий остановит снова."
+                  % (str(rec.get("sig") or "?"),
+                     sig.TITLE.get(str(rec.get("sig") or ""), "имя сигнала не сохранилось"), m))
 
 
 def _why(report, data):
@@ -1551,6 +1712,20 @@ def _render(report=None, data=None):
         # уходит владельцу. Пересказ здесь («извещение отправлено») сделал бы
         # `--dry` бесполезным ровно для того, ради чего он тут и нужен: увидеть
         # будущее сообщение, ничего не послав.
+        # ИЗВЕЩЕНИЕ ОБ ОСТАНОВКЕ — ТАКЖЕ ДОСЛОВНО И ТАКЖЕ ВСЕГДА. На сухом ходу
+        # это единственная дорога увидеть будущую карточку, ничего не послав;
+        # на боевом — доказательство, что о стоящем ящике сказали (или что не
+        # смогли). Пересказ здесь сделал бы `--dry` бесполезным.
+        for row in report.get("hold_notices") or []:
+            told = [n for n in (report.get("hold_told") or ()) if n.get("mark") == row.get("mark")]
+            bad = [n for n in (report.get("hold_notice_failed") or ())
+                   if n.get("mark") == row.get("mark")]
+            mark = ("СУХОЙ ХОД, НЕ ОТПРАВЛЕНО" if row.get("dry")
+                    else ("ОТПРАВЛЕНО (канал %s)" % (told[0].get("channel") or "?") if told
+                          else ("НЕ ОТПРАВЛЕНО: %s" % (bad[0].get("why") if bad else "?"))))
+            lines.append("  извещение об ОСТАНОВКЕ метка=%s — %s:" % (row.get("mark"), mark))
+            for piece in str(row.get("text") or "").splitlines():
+                lines.append("    | %s" % piece)
         for row in report.get("notices") or []:
             sent = [n for n in (report.get("noticed") or ()) if n.get("key") == row.get("key")]
             bad = [n for n in (report.get("notice_failed") or ()) if n.get("key") == row.get("key")]
@@ -1572,6 +1747,9 @@ def main(argv=None):
     mode.add_argument("--dry", action="store_true", help="собрать всё, очередь НЕ трогать")
     mode.add_argument("--place", action="store_true", help="боевая постановка")
     parser.add_argument("--show", default=None, help="дословный текст ряда по ключу задания")
+    parser.add_argument("--free", default=None,
+                        help="снять сигнальную остановку по метке (зовёт кнопка/слово pc_agent)")
+    parser.add_argument("--by", default="", help="кем снято — след в замке, не проверка права")
     parser.add_argument("--limit", type=int, default=shtab_box.TICK_LIMIT,
                         help="потолок заданий за виток")
     parser.add_argument("--budget", type=int, default=shtab_box.DAILY_BUDGET,
@@ -1580,6 +1758,13 @@ def main(argv=None):
     parser.add_argument("--json", action="store_true", help="отчёт машиночитаемо")
     args = parser.parse_args(argv)
 
+    if args.free:
+        # СНЯТИЕ — ОТДЕЛЬНАЯ ДОРОГА, И ОНА НЕ ЧИТАЕТ НИ МОСТА, НИ ОЧЕРЕДИ: ответ
+        # владельца обязан проходить и тогда, когда мост молчит, — иначе решение
+        # человека зависело бы от прибора, к которому оно не имеет отношения.
+        ok, words = free_mark(args.free, root=HERE, by=args.by)
+        print(words)
+        return 0 if ok else 1
     if args.show:
         # ТЕКСТ ПО КЛЮЧУ — отдельная дорога, не зависящая от отбора: замок владельца
         # и потолок суток режут блок ДО сборки текста, и «покажи, что ты собирался
