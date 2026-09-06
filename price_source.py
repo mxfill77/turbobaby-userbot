@@ -64,6 +64,28 @@ _FALSE = ("0", "false", "no", "off", "нет", "выкл")
 _SCHEMA = "turbobaby/price_source"
 _cache = {"key": None, "doc": None}
 
+# ── КОДЫ ПРИЧИН «числа по файлу нет» (07.09.2026) ─────────────────────────────
+# Свободный текст `why` остаётся ЧЕЛОВЕКУ (лог, замеры), а решение третьего исхода «модель без
+# цены» (`noprice_gate`) стои́т на КОДЕ: подстрока русской фразы контрактом не является и
+# отваливается от первой же правки формулировки — молча и в сторону «класс не сработал».
+# Коды НЕ МЕНЯЮТ ни одного числа и ни одной ветки: это имя уже принимавшегося решения.
+WHY_NO_ROW = "no_row"           # строки этой модели в файле нет вовсе
+WHY_NOT_JUDGED = "not_judged"   # строка есть, а базы в ней нет («НЕ СУДИМО»)
+WHY_AMBIGUOUS = "ambiguous"     # обрывок речи подходит нескольким строкам — не угадываем
+WHY_DATE_OUT = "date_out"       # дата вне периодов файла
+WHY_BUCKET_OUT = "bucket_out"   # срок вне корзин файла
+WHY_NO_MULT = "no_mult"         # в файле нет множителя для класса/корзины
+
+# ПРО МОДЕЛЬ, А НЕ ПРО ДАТУ/СРОК/СХЕМУ. Ровно эти два состояния означают «у ЭТОЙ модели числа
+# НЕТ», и только они включают третий исход. `WHY_AMBIGUOUS` сюда НЕ входит СОЗНАТЕЛЬНО: там
+# цена в файле ЕСТЬ, неизвестно лишь какая из нескольких, — это «не угадываем», а не «нет».
+MODEL_HAS_NO_PRICE = (WHY_NO_ROW, WHY_NOT_JUDGED)
+
+# Общий литерал: его печатает `resolve_row`, и по РАВЕНСТВУ с ним `day_price` отличает «строки
+# нет» от «строк несколько». Сравнение на равенство с одной константой, а не поиск подстроки:
+# у неоднозначности текст форматируется именем модели и совпасть с этим литералом не может.
+_WHY_NO_ROW_TEXT = "модели нет в файле"
+
 
 def enabled():
     """Служит ли источником цены ЗАПИСАННОЕ ПРАВИЛО. По умолчанию — ДА (переключение 20.08).
@@ -280,7 +302,7 @@ def resolve_row(doc, model, key_fn, quote=None):
             return row, "%s «%s» (семейство; %s)" % (how, src, gen)
         if len(hit) > 1 or len(fam) > 1:
             return None, "«%s» подходит нескольким строкам файла — не угадываем" % src
-    return None, "модели нет в файле"
+    return None, _WHY_NO_ROW_TEXT
 
 
 def day_price(doc, model, start, days, key_fn, quote=None):
@@ -291,17 +313,21 @@ def day_price(doc, model, start, days, key_fn, quote=None):
     info["matched"] = how
     if row is None:
         info["why"] = how
+        info["code"] = WHY_NO_ROW if how == _WHY_NO_ROW_TEXT else WHY_AMBIGUOUS
         return None, info
     if not row.get("judged") or row.get("base_thb_per_day") is None:
         info["why"] = "НЕ СУДИМО (порог наблюдений файла)"
+        info["code"] = WHY_NOT_JUDGED
         return None, info
     per = period_of(doc, start)
     if per is None:
         info["why"] = "дата вне периодов файла"
+        info["code"] = WHY_DATE_OUT
         return None, info
     buck = bucket_of(doc, days)
     if buck is None:
         info["why"] = "срок вне корзин файла"
+        info["code"] = WHY_BUCKET_OUT
         return None, info
     try:
         season = float(per["multiplier"][row["class"]])
@@ -309,6 +335,7 @@ def day_price(doc, model, start, days, key_fn, quote=None):
         base = float(row["base_thb_per_day"])
     except (KeyError, TypeError, ValueError):
         info["why"] = "в файле нет множителя для класса/корзины"
+        info["code"] = WHY_NO_MULT
         return None, info
     info.update(base=base, period=per.get("key"), period_name=per.get("name"),
                 season=season, bucket=buck.get("bucket"), term=term,
@@ -372,7 +399,10 @@ def reprice(res, model, ds, de, key_fn):
                            она бы гасила сезонную поправку — тот самый недобор, ради которого
                            ветка и заводится.
     Файл недоступен/не судит эту модель → {'status': 'error', 'quote': None}: молчание, а не
-    старое число и не выдумка.
+    старое число и не выдумка. С 07.09.2026 гашение ИМЕНИ СВОЕЙ ПРИЧИНЫ не теряет: если числа
+    нет именно У МОДЕЛИ (`MODEL_HAS_NO_PRICE`), в словарь кладётся ДОБАВОЧНЫЙ ключ `noprice` с
+    кодом. Он ничего не решает и никем не обязан читаться — на нём стои́т третий исход
+    `noprice_gate`, а прежние читатели видят ровно прежнее гашение.
     """
     if not enabled():
         return res
@@ -399,6 +429,14 @@ def reprice(res, model, ds, de, key_fn):
     if day is None:
         log.info("price_source: цены по файлу нет (%s) — цену гасим (модель %s)",
                  info.get("why"), model)
+        if info.get("code") in MODEL_HAS_NO_PRICE:
+            # ИМЯ СОСТОЯНИЯ, А НЕ РЕШЕНИЕ. Ключ `noprice` говорит вызывающему ровно одно: числа
+            # нет У ЭТОЙ МОДЕЛИ (а не «источник не прочитался», не «протухло», не «занят»).
+            # Отвечать ли им третьим исходом — дело `noprice_gate`, здесь не решается ничего.
+            # Контракт словаря НЕ МЕНЯЕТСЯ: `status`/`quote` прежние, ключ ДОБАВОЧНЫЙ, и все
+            # существующие читатели (`_safe_quote_for_model`, тесты) видят прежнее гашение.
+            return {"status": "error", "quote": None, "noprice": info["code"],
+                    "noprice_why": info.get("why")}
         return dead
     out = dict(q)
     out["day_price"] = day

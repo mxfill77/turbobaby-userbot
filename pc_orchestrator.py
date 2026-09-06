@@ -7186,6 +7186,14 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         # возможных: клиент получит число, которого владелец не называл, и
                         # увидят это не тестом, а деньгами.
                         "season_gate.py",
+                        # 07.09.2026: ВТОРОЙ ТРЕТИЙ ИСХОД — «модель без цены», `import
+                        # noprice_gate` в suggest.py, тот же вход в куст, что у season_gate.
+                        # Своих листьев не приносит НИ ОДНОГО: тянет `price_source` (уже выше) и
+                        # ЛЕНИВО `dispatch_notify` (тоже уже выше). ЧЕМ ОПАСНА ЕГО ГРЯЗЬ — тем
+                        # же, чем у соседа: файл решает, назовёт ли бот число на модель, которой
+                        # в записанном правиле нет, или позовёт человека. Незакоммиченный WIP
+                        # здесь тихо меняет ИСХОД клиентского ответа.
+                        "noprice_gate.py",
                         # 01.09.2026: ступень A ревью-контура — куст за ленивым `import
                         # review_auto_run` в `_review_auto_note`/`maybe_review_auto`:
                         #   review_auto_run → review_auto → {review_pack → hq_context_pack, review_send}

@@ -201,6 +201,33 @@ class TestZhivoyKontur(unittest.TestCase):
             self.assertIn(zveno, c.files, f"{zveno} выпал из клиентского замыкания — цепь порвана")
         self.assertTrue(cc.is_client("task_metrics.py", REPO))
 
+    def test_vtoroy_tretii_ishod_ne_privel_ni_odnogo_lishnego_rebra_07_09(self):
+        """ЗАПИСЬ СМЕНЫ 07.09.2026: второй третий исход — «модель без цены» — ввёл в клиентское
+        замыкание РОВНО ОДИН файл, `noprice_gate.py`. Замер: 40 → 41, не вышел ни один.
+
+        Цепь: userbot_listen.py → suggest.py → noprice_gate.py → dispatch_notify.py →
+        task_metrics.py. Второе и третье рёбра ЛЕНИВЫЕ (noprice_gate._default_sender,
+        dispatch_notify._session_metrics_line) — то же устройство, что у соседа по классу.
+
+        ПОИМЁННО, ЗАЧЕМ КАЖДОЕ РЕБРО, и почему побочных здесь нет:
+          • suggest → noprice_gate — путь ответа обязан УЗНАТЬ имя исхода, иначе третьего исхода
+            не существует;
+          • noprice_gate → price_source — только за КОДАМИ причин (`MODEL_HAS_NO_PRICE`); файл
+            модуль не читает и чисел не считает. Ребро не новое: `price_source` уже был
+            клиентским через `suggest` и `season_gate`;
+          • noprice_gate → dispatch_notify — этим карточка доезжает до владельца. Красный здесь =
+            третий исход перестал звать человека, и это правильный красный.
+        Обратных рёбер модуль не завёл ни одного: `import suggest` в нём запрещён замком
+        test_noprice_gate.TestBoundaries.test_module_does_not_import_suggest."""
+        c = cc.closure(REPO)
+        self.assertTrue(c.ok, c.reason)
+        for zveno in ("suggest.py", "noprice_gate.py", "dispatch_notify.py", "task_metrics.py"):
+            self.assertIn(zveno, c.files, f"{zveno} выпал из клиентского замыкания — цепь порвана")
+        self.assertTrue(cc.is_client("noprice_gate.py", REPO))
+        # Ворота ВЫХОДА обязаны накрывать новый файл ровно как соседа по классу.
+        self.assertEqual(o._client_paths(["noprice_gate.py", "season_gate.py"]),
+                         ["noprice_gate.py", "season_gate.py"])
+
     def test_lesson_router_est_v_grafe_no_net_v_karte_processov(self):
         """Живой разрыв, который список имён не видит, а граф видит: trainer.py импортит
         lesson_router.py (значит правка доедет до обоих ботов), а _FILE_PROCESS_RULES про него
