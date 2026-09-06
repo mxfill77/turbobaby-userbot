@@ -22,7 +22,9 @@ import ast
 import datetime
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 
 import expectations_pc as ex
@@ -567,6 +569,101 @@ class TestRunHands(unittest.TestCase):
         run_mod.run(now=NOW, getter=self._getter([]), notifier=self._note)
         self.assertTrue(os.path.exists(os.path.join(self.dir, "state.json")))
         self.assertEqual(run_mod._dir(), self.dir)
+
+
+class TestNoteChannelAnswerIsAPair(unittest.TestCase):
+    """06.09.2026: `send_note` РАЗБИРАЕТ пару `(channel, ok)`, а не берёт `bool()` от неё.
+
+    Класс, который здесь заперт: непустой кортеж истинен ВСЕГДА, поэтому `bool(("none", False))`
+    — это `True`. До правки отказ канала числился успехом, руки помечали эпизод сказанным
+    (`open[key] = {"said": now}`) при ненаписанной заметке, и дальше заметка О1–О6 не повторялась
+    НИКОГДА (`if was is not None: continue`), а О7 молчала до пола повтора — сутки. Ветка
+    `if not send(...): continue  # не помечаем` была недостижима при живом канале.
+
+    КАНАЛ ЗДЕСЬ ПОДСТАВНОЙ, И ЭТО НЕ ГИГИЕНА, А УСТРОЙСТВО ПРОВЕРКИ. Боевой `dispatch_notify` в
+    процесс не импортируется вовсе: `send_note` зовёт `import dispatch_notify` ВНУТРИ себя, то
+    есть берёт то, что лежит в `sys.modules`, — а там на время кейса стои́т модуль без токена,
+    без сокета и без единой ветки отправки. Из проверки не уходит НИЧЕГО ни одной дорогой."""
+
+    def _channel(self, answer):
+        """Подменить модуль канала ответом `answer` и вернуть список позванных текстов."""
+        seen = []
+        fake = types.ModuleType("dispatch_notify")
+
+        def deliver(text, reply_markup=None, declared=None):
+            seen.append(text)
+            return answer
+
+        fake.deliver = deliver
+        prev = sys.modules.get("dispatch_notify")
+
+        def restore():
+            if prev is None:
+                sys.modules.pop("dispatch_notify", None)
+            else:
+                sys.modules["dispatch_notify"] = prev
+
+        self.addCleanup(restore)
+        sys.modules["dispatch_notify"] = fake
+        return seen
+
+    def test_channel_refusal_is_not_a_delivery(self):
+        """Живая ветка отказа `deliver` — «бота нет»: `("none", False)`."""
+        seen = self._channel(("none", False))
+        self.assertIs(run_mod.send_note("заметка ожидания"), False)
+        self.assertEqual(seen, ["заметка ожидания"], "канал обязан быть позван ровно один раз")
+
+    def test_both_channels_down_is_not_a_delivery(self):
+        """Фолбэк в личку тоже лёг — канал называет себя, но признак остаётся ложью."""
+        self._channel(("DM", False))
+        self.assertIs(run_mod.send_note("заметка ожидания"), False)
+
+    def test_a_delivered_note_is_still_a_delivery(self):
+        """Вторая половина замка: инвариант без неё запрещал бы успех вообще."""
+        self._channel(("inbox", True))
+        self.assertIs(run_mod.send_note("заметка ожидания"), True)
+
+    def test_a_shape_that_is_not_a_pair_is_not_a_delivery(self):
+        """Форма ответа, отличная от пары, — НЕ успех: распаковка срывается, ветка отдаёт False.
+        Сторона ошибки выбрана: непомеченный эпизод скажется на следующем прогоне, а ложное
+        «сказано» не чинится ничем."""
+        self._channel(True)
+        self.assertIs(run_mod.send_note("заметка ожидания"), False)
+
+    def test_the_form_is_read_from_the_code_not_from_the_docstring(self):
+        """Замок формы: в `send_note` есть распаковка пары и нет `bool()` прямо от вызова."""
+        with open(RUN_SRC, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        fn = [n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "send_note"]
+        self.assertEqual(len(fn), 1)
+        pairs = [n for n in ast.walk(fn[0])
+                 if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Tuple)
+                 and isinstance(n.value, ast.Call)
+                 and isinstance(n.value.func, ast.Attribute) and n.value.func.attr == "deliver"]
+        self.assertEqual(len(pairs), 1, "пара канала обязана разбираться, а не сворачиваться")
+        wrapped = [n for n in ast.walk(fn[0])
+                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                   and n.func.id == "bool" and n.args and isinstance(n.args[0], ast.Call)]
+        self.assertEqual(wrapped, [], "bool() от вызова канала — это и есть чинимый класс")
+
+    def test_every_other_call_site_parses_the_pair_too(self):
+        """Храповик на соседей: в `dispatch_notify` КАЖДЫЙ вызов `deliver` разбирает пару.
+        Замер 06.09.2026 — 6 вызовов из 6; седьмым был `expectations_pc_run.send_note`."""
+        with open(os.path.join(REPO, "dispatch_notify.py"), encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        calls, unpacked = 0, 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                fname = getattr(node.value.func, "id", getattr(node.value.func, "attr", ""))
+                if fname == "deliver":
+                    calls += 1
+                    unpacked += int(isinstance(node.targets[0], ast.Tuple))
+            elif isinstance(node, ast.Call) and getattr(node.func, "id", "") == "bool":
+                inner = node.args[0] if node.args else None
+                if isinstance(inner, ast.Call) and getattr(inner.func, "attr", "") == "deliver":
+                    calls += 1                       # свёрнутая пара — вызов есть, разбора нет
+        self.assertEqual((calls, unpacked), (6, 6))
 
 
 class TestPulseChannelMutedInTestRun(unittest.TestCase):
