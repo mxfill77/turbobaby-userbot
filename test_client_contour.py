@@ -167,6 +167,9 @@ class TestZhivoyKontur(unittest.TestCase):
         """ЗАПИСЬ СМЕНЫ, а не подгонка: модуль самих ворот въехал в клиентское замыкание, и цепь
         названа поимённо. Замыкание выросло 30 → 33 файла (вошли client_contour.py,
         lesson_regress.py, trainer_run.py) — замер 05.09.2026 на d92fd0f против вершины.
+        ПОПРАВКА 07.09.2026: из этих трёх `trainer_run.py` в замыкании БОЛЬШЕ НЕТ — ребро
+        `lesson_regress → trainer_run` объявлено границей процесса (`PROCESS_BOUNDARY_EDGES`,
+        класс `TestGranicaProcessa` ниже). Два других звена цепи живы и проверяются здесь.
 
         Направление ошибки безопасное (лишний файл держим и спрашиваем владельца, клиентского не
         пропускаем), поэтому чинится ГОЛДЕН, а не признак. Красный здесь = ребро исчезло, и это
@@ -239,6 +242,87 @@ class TestZhivoyKontur(unittest.TestCase):
     def test_put_docs_i_testy_vnutrennie(self):
         self.assertFalse(cc.is_client("docs/ENV_PLAYBOOK.md", REPO))
         self.assertFalse(cc.is_client("test_suggest.py", REPO))
+
+
+class TestGranicaProcessa(unittest.TestCase):
+    """ГРАНИЦА ПРОЦЕССА НА ОТДЕЛЬНОМ РЕБРЕ (`PROCESS_BOUNDARY_EDGES`, 07.09.2026).
+
+    Направление ошибки здесь, в отличие от всего остального в этом файле, НЕ безопасное: граница
+    СУЖАЕТ охрану. Поэтому её меряют с обеих сторон — сколько вышло (обязано быть ровно одно имя)
+    и что обязано остаться (отрицательные тесты ниже)."""
+
+    def _bez_granicy(self, cut):
+        """То же замыкание, посчитанное БЕЗ границы — база для «что именно вышло»."""
+        save = cc._BOUNDARY
+        cc._BOUNDARY = frozenset()
+        try:
+            cc._cache.clear()
+            cl = cc.closure(REPO, entries=cc.CLIENT_ENTRIES, cut=cut)
+        finally:
+            cc._BOUNDARY = save
+            cc._cache.clear()
+        return cl
+
+    def test_vyshel_rovno_odin_i_eto_raner(self):
+        """ЧИСЛОМ ДО И ПОСЛЕ, обоими замыканиями: живыми воротами (`cut=()`, 78 → 77) и умолчанием
+        признака (41 → 40). Вышло РОВНО одно имя — `trainer_run.py`, и ни одного имени данных."""
+        for cut, (was_f, now_f) in ((), (78, 77)), (None, (41, 40)):
+            with self.subTest(cut=cut):
+                base = self._bez_granicy(cut)
+                cl = cc.closure(REPO, entries=cc.CLIENT_ENTRIES, cut=cut)
+                self.assertTrue(base.ok and cl.ok, cl.reason)
+                self.assertEqual((len(base.files), len(cl.files)), (was_f, now_f))
+                self.assertEqual(set(base.files) - set(cl.files), {"trainer_run.py"},
+                                 "из охраны вышло НЕ ровно то, что объявлено границей")
+                self.assertEqual(set(base.data) - set(cl.data), set(),
+                                 "граница увела за собой ДАННЫЕ — этого она делать не вправе")
+                self.assertEqual(set(cl.files) - set(base.files), set())
+
+    def test_ostalis_te_kto_obyazan_ostatsya(self):
+        """ОТРИЦАТЕЛЬНЫЙ: файлы, обязанные остаться в замыкании, в нём и остались — ПРОГОНОМ.
+
+        Первым идёт сам импортёр (`lesson_regress.py`): граница снимает РЕБРО, а не файл, и путать
+        её со срезом нельзя — бот зовёт из него `spawn()` по-настоящему. Дальше — вторая половина
+        того же файла (`client_contour.py` приезжает из него же вторым ребром) и корпус, который
+        на воротах и висит."""
+        cl = cc.closure(REPO)
+        gate = cc.closure(REPO, entries=cc.CLIENT_ENTRIES, cut=())
+        self.assertTrue(cl.ok and gate.ok, cl.reason)
+        for name in ("lesson_regress.py", "trainer.py", "client_contour.py", "suggest.py",
+                     "userbot_listen.py", "moderation_bot.py", "lesson_router.py"):
+            self.assertIn(name, cl.files, f"{name} выпал из замыкания — граница съела лишнее")
+            self.assertIn(name, gate.files, f"{name} выпал из замыкания ВОРОТ")
+        self.assertTrue(cc.is_client("trainer_cases.json", REPO))
+        self.assertEqual(o._client_paths(["lesson_regress.py"]), ["lesson_regress.py"])
+
+    def test_granica_derzhit_rovno_svoyo_rebro(self):
+        """ОТРИЦАТЕЛЬНЫЙ на синтетическом дереве: граница снимает ОДНО ребро, а не модуль.
+
+        Тот же `цель.py`, импортированный ЛЮБЫМ другим файлом замыкания, въезжает как раньше —
+        иначе объявление одного ребра тихо прятало бы модуль от всех ворот сразу."""
+        d = mkrepo({"userbot_listen.py": "import мост\n", "moderation_bot.py": "x = 1\n",
+                    "мост.py": "def f():\n    import цель\n", "цель.py": "Y = 1\n",
+                    "второй.py": "import цель\n"})
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        save = cc._BOUNDARY
+        try:
+            cc._BOUNDARY = frozenset({("мост.py", "цель")})
+            cc._cache.clear()
+            self.assertNotIn("цель.py", cc.closure(d).files)      # ребро снято
+            with open(os.path.join(d, "мост.py"), "a", encoding="utf-8") as f:
+                f.write("import второй\n")                        # обход теперь идёт вторым путём
+            cc._cache.clear()
+            self.assertIn("цель.py", cc.closure(d).files,
+                          "граница спрятала модуль от ДРУГОГО импортёра — это уже не ребро, а срез")
+        finally:
+            cc._BOUNDARY = save
+            cc._cache.clear()
+
+    def test_kortezh_granicy_nazvan_poimenno(self):
+        """Кортеж границ читается глазами и обязан оставаться коротким: каждое ребро — сужение
+        охраны, и новое заводится замером, а не по аналогии."""
+        self.assertEqual(cc.PROCESS_BOUNDARY_EDGES, (("lesson_regress.py", "trainer_run"),))
+        self.assertEqual(cc._BOUNDARY, frozenset(cc.PROCESS_BOUNDARY_EDGES))
 
 
 # ─────────────────────────── 2. ОСНОВАНИЯ ПРОПУСКА ───────────────────────────

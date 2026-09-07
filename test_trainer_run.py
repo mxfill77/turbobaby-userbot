@@ -283,37 +283,68 @@ class TestPipelineNeRazoshelsya(unittest.TestCase):
                     break
         return out
 
-    def test_raner_v_konture_rovno_odnim_nazvannym_rebrom(self):
-        """Прогонщик В замыкании ботов, и попал он туда РОВНО ОДНИМ названным ребром.
+    def test_raner_ne_v_klientskom_konture(self):
+        """Раннер НЕ попадает в замыкание ботов — иначе он сам упрётся в ворота.
 
-        ЧТО УСТАРЕЛО И ПОЧЕМУ. Сторож требовал, чтобы прогонщик и корпус в замыкание ботов НЕ
-        попадали вовсе («иначе он сам упрётся в ворота»). 05.09.2026 владелец завёл РЕГРЕССИЮ
-        УРОКА (`a42c8ee`, задача 231): после записанного урока корпус прогоняется и говорит исход.
-        Дорога — `trainer.py:1366` → `lesson_regress` → `lesson_regress.py:297` `import trainer_run`,
-        и этим одним ребром прогонщик въехал в замыкание, а за ним корпус (`trainer_cases.json`
-        назван литералом `client_contour.py:319`, а сам `client_contour` приехал импортом из
-        прогонщика). Требовать сегодня отсутствия — требовать отката решения владельца.
+        СТОРОЖ ВОССТАНОВЛЕН, А НЕ ПЕРЕПИСАН (07.09.2026). Он требовал этого с самого начала;
+        05.09 владелец завёл РЕГРЕССИЮ УРОКА (`a42c8ee`, задача 231), прогонщик въехал в
+        замыкание одним ребром `lesson_regress.py:297`, и сторож покраснел. 07.09 его привели к
+        этому факту — то есть починили СТОРОЖА, а не причину; сегодня убрана ПРИЧИНА, и требование
+        вернулось дословно.
 
-        ПРЕДМЕТ ОХРАНЫ ЖИВ И НАЗВАН ТОЧНЕЕ ПРЕЖНЕГО. Опасность была не в самом членстве, а в том,
-        что прогонщик прирастёт к боевому рантайму НЕЗАМЕТНО и не одной дорогой. Поэтому ребро
-        закреплено ПОИМЁННО: импортёр прогонщика в замыкании обязан быть ровно один и ровно тот.
-        Второй импортёр — красный гейт в тот же день, что и раньше.
+        ПОЧЕМУ РЕБРО ПОБОЧНОЕ (замер, а не рассуждение): `import trainer_run` живёт ВНУТРИ
+        `measure()`, а `measure()` исполняется только в ОТСОЕДИНЁННОМ процессе, который поднимает
+        `lesson_regress.spawn()` (`Popen [python, lesson_regress.py, --after-lesson]`,
+        DETACHED_PROCESS). Из живого бота зовётся ровно `spawn()` (`trainer.py:1366` →
+        `lesson_regress.spawn`), и правка прогонщика не меняет ответ клиента ни одной дорогой.
+        Ребро объявлено ГРАНИЦЕЙ ПРОЦЕССА — `client_contour.PROCESS_BOUNDARY_EDGES`.
 
-        ЦЕНА НАЗВАНА ВСЛУХ, А НЕ ЗАМАЗАНА: правка `trainer_run.py` и `trainer_cases.json` теперь
-        проходит через ворота клиентского контура (`_client_block`), а контур заморожен решением
-        владельца от 05.09. Статически это верно, фактически — ребро пересекает ГРАНИЦУ ПРОЦЕССА
-        (`lesson_regress.spawn` поднимает отсоединённый `python lesson_regress.py --after-lesson`,
-        а `import trainer_run` живёт внутри `measure()` и в памяти ботов не исполняется никогда).
-        Считать ли `lesson_regress.py` входной точкой ЧУЖОГО процесса (`FOREIGN_ENTRIES`, как
-        `pc_orchestrator.py` и `pc_agent.py`) — решение о ВОРОТАХ и владельца, не этого теста;
-        здесь ворота не тронуты ни строкой."""
+        ЦЕНА НАЗВАНА ЧИСЛОМ: замыкание ворот (`cut=()`, `pc_orchestrator._CLIENT_CUT`) 78 → 77
+        файлов, вышел РОВНО `trainer_run.py`; данных 50 → 50 — не вышло ни одного имени.
+
+        КОРПУС ОСТАЛСЯ КЛИЕНТСКИМ, И ЭТО ВЕРНОЕ КРАСНОЕ, а не недоделка. `trainer_cases.json`
+        держится литералом `client_contour.py` (`TRAINER_CASES_FILE`), а сами ворота с 07.09
+        приезжают в замыкание ШЕСТЬЮ импортёрами (`deploy_voice`, `lesson_regress`,
+        `pc_orchestrator`, `recon_auto_run`, `trainer_run`, `zayavki_pc_run`) — после снятия среза
+        ворот. Вывести корпус можно только выведя из замыкания САМИ ВОРОТА, а это сужение охраны
+        далеко за пределы «раннер и корпус» и решение владельца, не этого теста."""
         cl = cc.closure(REPO)
         self.assertTrue(cl.ok, cl.reason)
-        self.assertTrue(cc.is_client("trainer_run.py", REPO), "прогонщик выпал из замыкания — "
-                        "ребро регрессии урока исчезло, а тест об этом не знает")
-        self.assertEqual(self._importers_of("trainer_run", cl.files), ["lesson_regress.py"],
+        self.assertFalse(cc.is_client("trainer_run.py", REPO),
+                         "прогонщик снова в клиентском замыкании — правка экзамена опять упрётся "
+                         "в ворота контура")
+        gate = cc.closure(REPO, entries=cc.CLIENT_ENTRIES, cut=())
+        self.assertTrue(gate.ok, gate.reason)
+        self.assertNotIn("trainer_run.py", gate.files,
+                         "прогонщик в замыкании ЖИВЫХ ВОРОТ (cut=()) — именно им судит _client_block")
+        self.assertEqual(self._importers_of("trainer_run", gate.files), ["lesson_regress.py"],
                          "прогонщик тащат в контур НЕ ОДНИМ названным ребром")
-        self.assertTrue(cc.is_client("trainer_cases.json", REPO))
+        self.assertTrue(cc.is_client("trainer_cases.json", REPO),
+                        "корпус вышел из замыкания — значит вышли и сами ворота client_contour.py, "
+                        "а это сужение охраны, о котором обязан решать владелец")
+
+    def test_import_ranera_ostayotsya_lenivym(self):
+        """ЗАМОК ГРАНИЦЫ: право не считать ребро стои́т на ЛЕНИВОСТИ импорта, и ничем другим.
+
+        Поднимут `import trainer_run` на верхний уровень `lesson_regress.py` — бот начнёт грузить
+        прогонщик В СВОЮ ПАМЯТЬ на первом же `import lesson_regress` из `trainer.py`, и граница
+        станет ложью, а ворота — дырой. Судим по AST (ветвь `body` модуля), а не по отступам."""
+        with io.open(os.path.join(REPO, "lesson_regress.py"), encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename="lesson_regress.py")
+        top = set()
+        for node in tree.body:                       # РОВНО верхний уровень, без ast.walk
+            if isinstance(node, ast.Import):
+                top |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                top.add(node.module.split(".")[0])
+        self.assertNotIn("trainer_run", top,
+                         "импорт прогонщика поднят на верхний уровень lesson_regress.py — "
+                         "граница процесса в client_contour.PROCESS_BOUNDARY_EDGES стала ложью")
+        lazy = [n.lineno for n in ast.walk(tree)
+                if isinstance(n, ast.Import)
+                and any(a.name.split(".")[0] == "trainer_run" for a in n.names)]
+        self.assertTrue(lazy, "импорт прогонщика исчез из lesson_regress.py вовсе — граница "
+                              "описывает ребро, которого нет: снять её из ворот")
 
     def test_edge_check_catches_a_second_importer(self):
         """ОТРИЦАТЕЛЬНЫЙ: второй импортёр прогонщика ловится, а проза о нём — нет.
