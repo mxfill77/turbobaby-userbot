@@ -3414,15 +3414,19 @@ class TestAgentHitByClosure(unittest.TestCase):
     def test_selfupdate_marks_the_agent_on_a_file_the_map_never_knew(self):
         """Сквозь весь путь: коммит ТОЛЬКО в io_utf8.py — прежде `procs` был пуст и функция
         выходила первым же `return ''`, то есть агент не помечался НИКОГДА."""
-        kinds = []
+        kinds, raised = [], []
         note = o._selfupdate_restart_children(
             "aaa1111", "bbb2222", diff_fn=lambda a, b: ["io_utf8.py"],
             restart_fn=lambda kind: kinds.append(kind) or (True, [1], "ok"),
-            state={}, dirty_fn=lambda: [])
+            state={}, dirty_fn=lambda: [],
+            # 07.09.2026: пометка «ждёт ручного» сменилась САМОПОДЪЁМОМ. Предмет теста прежний —
+            # признак агента по ВЫЧИСЛЕННОМУ замыканию; подъём здесь подставной (боевого процесса
+            # юниты не касаются), а его вызов и есть доказательство, что признак сработал.
+            selfraise_fn=lambda commit, why="": (raised.append((commit, why))
+                                                 or "pc_agent изменён — САМОПОДЪЁМ ВЫПОЛНЕН"))
         self.assertEqual(kinds, [], "рестартить этим заходом не должны были НИКОГО")
-        self.assertIn("ЖДЁТ РУЧНОГО рестарта", note)
-        self.assertTrue([s for s in self.said if s.startswith("cowork:")],
-                        "пометка обязана доехать до журнала строкой")
+        self.assertEqual(raised, [("bbb2222", "self-update")])
+        self.assertIn("САМОПОДЪЁМ", note)
 
     def test_the_restart_route_of_the_bots_is_untouched(self):
         """Границу правки называем тестом: замыкание сменило ПРИЗНАК агента, а не маршрут ботов.
@@ -3431,7 +3435,8 @@ class TestAgentHitByClosure(unittest.TestCase):
         o._selfupdate_restart_children(
             "aaa1111", "bbb2222", diff_fn=lambda a, b: ["io_utf8.py"],
             restart_fn=lambda kind: kinds.append(kind) or (True, [1], "ok"),
-            state={}, dirty_fn=lambda: [], client_block_fn=lambda *a, **k: [])
+            state={}, dirty_fn=lambda: [], client_block_fn=lambda *a, **k: [],
+            selfraise_fn=lambda commit, why="": "подставной самоподъём")
         self.assertEqual(kinds, [], "ни один бот не смеет рестартоваться от правки инфраструктуры")
         self.assertEqual(o._classify_changed(["io_utf8.py"]), ([], []))
 
@@ -3626,16 +3631,21 @@ class TestSelfUpdateChildren(Base):
         self.assertEqual(kinds, [])                                              # никого не тронули
         self.assertEqual(note, "")
 
-    def test_d_pc_agent_manual_note_not_restarted(self):
-        kinds, cows = [], []
+    def test_d_pc_agent_selfraised_not_restarted_as_a_bot(self):
+        """07.09.2026: агент больше не «ждёт ручного» — его поднимает СВОЯ ветка (`selfraise_agent`),
+        а маршрут рестарта ботов его по-прежнему не касается ни одним вызовом."""
+        kinds, cows, raised = [], [], []
         o._cowork = lambda s: cows.append(s)
         note = o._selfupdate_restart_children(
             "old", "c3",
             diff_fn=lambda a, b: ["pc_agent.py"],
             restart_fn=lambda kind: kinds.append(kind) or (True, [1], "x"),
-            state={}, now=1, cooldown=120)
-        self.assertEqual(kinds, [])                                              # агент чужими руками НЕ рестартим
-        self.assertIn("РУЧНОГО рестарта", note)
+            state={}, now=1, cooldown=120,
+            selfraise_fn=lambda commit, why="": (raised.append(commit)
+                                                 or "pc_agent изменён — САМОПОДЪЁМ ВЫПОЛНЕН"))
+        self.assertEqual(kinds, [])                     # маршрутом ботов агента НЕ трогаем
+        self.assertEqual(raised, ["c3"])                # его поднимает своя, узкая ветка
+        self.assertIn("САМОПОДЪЁМ", note)
 
     def test_e_antiflap_recent_restart_suppressed(self):
         kinds = []
@@ -3735,13 +3745,20 @@ class TestReconcileChildren(Base):
     _LIVE_NONE = staticmethod(lambda: (None, "none", "юнит: живых детей не спрашиваем"))
 
     def _run(self, head, changed, **kw):
+        # САМОПОДЪЁМ АГЕНТА ПОДСТАВНОЙ ВСЕГДА (07.09.2026): боевая ветка снимает и поднимает живую
+        # дверь владельца, и юниту её касаться нельзя ни одним заходом (пункт 6 задания). Здесь
+        # умолчание, а не в бою: забытая инъекция в БУДУЩЕМ тесте не должна бить по агенту.
+        self.selfraised = getattr(self, "selfraised", [])
         return o.reconcile_children_tick(
             head_fn=lambda: head,
             diff_fn=lambda a, b: changed,
             gate_fn=kw.get("gate_fn", (lambda mods: (True, "ok"))),
             restart_fn=kw.get("restart_fn"),
             now=kw.get("now", 1000), cooldown=kw.get("cooldown", 120), state=kw.get("state"),
-            live_base_fn=kw.get("live_base_fn", self._LIVE_NONE))
+            live_base_fn=kw.get("live_base_fn", self._LIVE_NONE),
+            selfraise_fn=kw.get("selfraise_fn",
+                                lambda commit, why="": (self.selfraised.append((commit, why))
+                                                        or "pc_agent изменён — САМОПОДЪЁМ ВЫПОЛНЕН")))
 
     # ───── ЖИВАЯ БАЗА ДЕТЕЙ: сам признак, без тика (22.08.2026) ─────
     def test_live_base_beret_SAMOGO_STAROGO_rebenka(self):
@@ -3869,17 +3886,19 @@ class TestReconcileChildren(Base):
         self.assertEqual((note, kinds), ("", []))
         self.assertEqual(o._last_child_commit, "d0c50000")
 
-    def test_pc_agent_commit_manual_note_not_restarted(self):
-        # pc_agent.py в диффе ВНЕ self-update → реконсиляция даёт пометку «ждёт ручного рестарта»,
-        # но чужими руками НЕ рестартит (та же ручная карта, что в _selfupdate_restart_children).
+    def test_pc_agent_commit_selfraised_not_restarted_as_a_bot(self):
+        # pc_agent.py в диффе ВНЕ self-update → реконсиляция зовёт СВОЮ ветку агента (07.09.2026:
+        # прежде здесь была пометка «ждёт ручного рестарта» и остановка). Маршрут рестарта ботов
+        # агента по-прежнему не касается ни одним вызовом.
         o._last_child_commit = "old"
         kinds, cows = [], []
         o._cowork = lambda s: cows.append(s)
         note = self._run("a9e17c000", ["pc_agent.py"],
                          restart_fn=lambda k: kinds.append(k) or (True, [1], "x"), state={})
-        self.assertEqual(kinds, [])                               # агент чужими руками НЕ рестартим
-        self.assertIn("РУЧНОГО рестарта", note)
-        self.assertEqual(o._last_child_commit, "a9e17c000")       # пометка разовая — метку двигаем (не спамим каждый тик)
+        self.assertEqual(kinds, [])                               # маршрутом ботов агента НЕ трогаем
+        self.assertEqual(self.selfraised, [("a9e17c000", "реконсиляция")])
+        self.assertIn("САМОПОДЪЁМ", note)
+        self.assertEqual(o._last_child_commit, "a9e17c000")       # коммит применён — метку двигаем
 
     def test_no_child_files_advances_marker_only(self):
         # коммит тронул только сам pc_orchestrator.py/доки → метку двигаем, никого не рестартим.
@@ -12888,6 +12907,359 @@ class TestAgentCodeStale(unittest.TestCase):
         src = inspect.getsource(o._agent_code_stale)
         for forbidden in ("taskkill", "schtasks", "Popen", "subprocess", "_spawn", "restart"):
             self.assertNotIn(forbidden, src, f"в ветке появилось {forbidden!r} — это перезапуск")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════
+# САМОПОДЪЁМ ДВЕРИ ВЛАДЕЛЬЦА ПОСЛЕ ПРАВКИ ЕЁ КОДА (задание Штаба 07.09.2026)
+#
+# Предмет — `selfraise_agent` и три его чистых ядра. Ни один тест не касается боевого процесса:
+# всё внешнее подставное (пункт 6 задания — боевой путь и проверка ОБЯЗАНЫ различаться), а сами
+# боевые двери (`_stop_pc_agent`, `_raise_pc_agent_guarded`) под юнитами отказывают своим замком,
+# и это тоже голден, а не случайность.
+# ═══════════════════════════════════════════════════════════════════════════════════════════
+class AgentCodeParsesTest(unittest.TestCase):
+    """ПУНКТ 1: новый код разбирается ДО того, как тронули живого."""
+
+    def test_zhivoe_zamykanie_agenta_razbiraetsya(self):
+        ok, detail = o.agent_code_parses()
+        self.assertTrue(ok, "живой код агента обязан разбираться: %s" % detail)
+        self.assertIn("разобрано", detail)
+
+    def test_slomannyi_sintaksis_daet_otkaz_s_nomerom_stroki(self):
+        ok, detail = o.agent_code_parses(names=["pc_agent.py"],
+                                         read_fn=lambda p: "def f(:\n    pass\n")
+        self.assertFalse(ok)
+        self.assertIn("pc_agent.py:1", detail)          # отказ называет файл и строку, а не «плохо»
+
+    def test_neprochitannyi_fail_eto_otkaz_a_ne_poryadok(self):
+        """FAIL-CLOSED: «не смог прочитать» ≠ «разобралось». Иначе снятая дверь ради кода, про
+        который мы ничего не знаем."""
+        def boom(p):
+            raise OSError("диск не отвечает")
+        ok, detail = o.agent_code_parses(names=["pc_agent.py"], read_fn=boom)
+        self.assertFalse(ok)
+        self.assertIn("НЕ ПРОЧИТАН", detail)
+
+    def test_pustoe_zamykanie_eto_otkaz(self):
+        ok, detail = o.agent_code_parses(names=[], read_fn=lambda p: "")
+        self.assertFalse(ok)
+        self.assertIn("разбирать нечего", detail)
+
+    def test_razbor_ne_ispolnyaet_chuzhoi_modul(self):
+        """`compile` вместо импорта — намеренно: разбор не смеет запускать чужой код."""
+        ok, _ = o.agent_code_parses(names=["x.py"],
+                                    read_fn=lambda p: "raise SystemExit('меня исполнили')\n")
+        self.assertTrue(ok, "код с исключением на верхнем уровне РАЗБИРАЕТСЯ — исполнять его нельзя")
+
+
+class AgentRaiseAllowedTest(unittest.TestCase):
+    """ПУНКТ 4: счётчик попыток и остыв — с числами, которые ИЗМЕРЕНЫ."""
+
+    def test_chisla_izmereny_a_ne_kruglye(self):
+        """Корпус 57.1 суток: 25 коммитов в замыкание агента, МАКСИМУМ за любой час — 2,
+        минимальная пауза между коммитами 2396 с. Отсюда 2 попытки за 3600 с и остыв 600 с."""
+        self.assertEqual(o.AGENT_RAISE_TRIES, 2)
+        self.assertEqual(o.AGENT_RAISE_WINDOW, 3600)
+        self.assertEqual(o.AGENT_RAISE_COOLDOWN, 600)
+        self.assertLess(o.AGENT_RAISE_COOLDOWN, 2396,
+                        "остыв обязан быть НИЖЕ минимальной законной паузы между коммитами")
+
+    def test_pervaya_popytka_razreshena(self):
+        ok, why, loud = o.agent_raise_allowed(1000.0, at=[])
+        self.assertTrue(ok)
+        self.assertIn("попытка 1 из 2", why)
+        self.assertFalse(loud)
+
+    def test_ostyv_derzhit_tikho_a_ischerpanie_gromko(self):
+        """Громкость двух отказов РАЗНАЯ. Остыв ловит второй заход по ТОМУ ЖЕ событию (один
+        коммит приходит и self-update'ом, и реконсиляцией) — будить владельца сразу после
+        удавшегося подъёма нельзя. Исчерпание — авария, и она обязана быть громкой."""
+        ok, why, loud = o.agent_raise_allowed(1000.0 + 60, at=[1000.0])
+        self.assertFalse(ok)
+        self.assertIn("остыв", why)
+        self.assertFalse(loud, "остыв НЕ авария — громкого канала он не занимает")
+
+    def test_tretya_popytka_v_okne_ischerpana(self):
+        ok, why, loud = o.agent_raise_allowed(1000.0 + 1400, at=[1000.0, 1000.0 + 700])
+        self.assertFalse(ok)
+        self.assertIn("исчерпаны попытки", why)
+        self.assertTrue(loud, "исчерпание обязано быть ГРОМКИМ, а не молчанием")
+
+    def test_za_oknom_schetchik_zabyvaet(self):
+        ok, _why, _loud = o.agent_raise_allowed(1000.0 + 3601 + 700, at=[1000.0, 1000.0 + 700])
+        self.assertTrue(ok, "попытки старше окна не смеют держать законное событие")
+
+    def test_reshenie_chistoe_spisok_ne_menyaet(self):
+        at = [1000.0]
+        o.agent_raise_allowed(9000.0, at=at)
+        self.assertEqual(at, [1000.0], "решение обязано быть чистым — список пополняет вызывающий")
+
+
+class AgentRaiseVerdictTest(unittest.TestCase):
+    """ПУНКТЫ 2 и 5: подъём ДОКАЗЫВАЕТСЯ. Кода возврата команды в этом суде нет вовсе."""
+
+    LOCK_OLD = {"pid": 111, "written": 1000.0, "mtime": 1000.0}
+    LOCK_NEW = {"pid": 222, "written": 2000.0, "mtime": 2000.0}
+
+    def test_otricatelnyi_komanda_vernula_nol_a_processa_net(self):
+        """ЖИВОЙ СЛУЧАЙ 23.08.2026 06:08:54 — сторож записал «подъём ok=True, PID после=[]».
+        Механизм ОБЯЗАН показать отказ: ноль команды процессом не является."""
+        outcome, said = o.agent_raise_verdict([111], [], None, self.LOCK_OLD, self.LOCK_OLD)
+        self.assertEqual(outcome, "failed")
+        self.assertIn("НЕ ВЗЯЛСЯ", said)
+
+    def test_prezhnii_pid_zhiv_znachit_kod_staryi(self):
+        outcome, said = o.agent_raise_verdict([111], [111], [111], self.LOCK_OLD, self.LOCK_OLD)
+        self.assertEqual(outcome, "failed")
+        self.assertIn("не сменился", said)
+
+    def test_process_podnyalsya_i_umer_za_pauzu(self):
+        outcome, said = o.agent_raise_verdict([111], [222], [], self.LOCK_OLD, self.LOCK_NEW)
+        self.assertEqual(outcome, "failed")
+        self.assertIn("УМЕР", said)
+
+    def test_lok_ne_obnovilsya(self):
+        outcome, said = o.agent_raise_verdict([111], [222], [222], self.LOCK_OLD, self.LOCK_OLD)
+        self.assertEqual(outcome, "failed")
+        self.assertIn("лок НЕ обновился", said)
+
+    def test_lok_ne_perepisan_po_vremeni(self):
+        stale = {"pid": 222, "written": 500.0, "mtime": 500.0}
+        outcome, said = o.agent_raise_verdict([111], [222], [222],
+                                              {"pid": 111, "written": 1000.0}, stale)
+        self.assertEqual(outcome, "failed")
+        self.assertIn("не переписан", said)
+
+    def test_slepoi_cim_eto_tretii_iskhod_a_ne_uspekh(self):
+        for args in (([111], None, None, self.LOCK_OLD, self.LOCK_NEW),
+                     (None, [222], [222], self.LOCK_OLD, self.LOCK_NEW),
+                     ([111], [222], None, self.LOCK_OLD, self.LOCK_NEW),
+                     ([111], [222], [222], self.LOCK_OLD, None)):
+            outcome, said = o.agent_raise_verdict(*args)
+            self.assertEqual(outcome, "unknown", "слепота обязана быть ТРЕТЬИМ исходом: %s" % said)
+
+    def test_dokazannyi_podyom(self):
+        outcome, said = o.agent_raise_verdict([111], [222], [222], self.LOCK_OLD, self.LOCK_NEW)
+        self.assertEqual(outcome, "ok")
+        self.assertIn("222", said)
+        self.assertIn("лок обновлён", said)
+
+    def test_agent_lezhal_do_podyoma_tozhe_dokazuem(self):
+        outcome, _said = o.agent_raise_verdict([], [222], [222], None, self.LOCK_NEW)
+        self.assertEqual(outcome, "ok")
+
+    def test_kod_vozvrata_komandy_v_sud_ne_vkhodit(self):
+        """Текстом: суд не принимает и не смотрит успех команды подъёма — только факты."""
+        self.assertNotIn("rok", inspect.getsource(o.agent_raise_verdict))
+
+
+class AgentWaitProbesTest(unittest.TestCase):
+    """Ожидания вокруг подъёма: сроки названы, слепая проба «ушёл»/«не появился» не означает."""
+
+    def test_pid_poyavilsya_na_pervoi_probe(self):
+        self.assertEqual(o._agent_wait_pids(lambda: [222], sleeper=lambda s: None), [222])
+
+    def test_pid_poyavilsya_dobornoi_proboi(self):
+        seq = [[], [], [222]]
+        self.assertEqual(o._agent_wait_pids(lambda: seq.pop(0), sleeper=lambda s: None), [222])
+
+    def test_ne_poyavilsya_za_srok(self):
+        self.assertEqual(o._agent_wait_pids(lambda: [], sleeper=lambda s: None), [])
+
+    def test_slepaya_poslednyaya_proba_eto_neizvestno(self):
+        self.assertIsNone(o._agent_wait_pids(lambda: None, sleeper=lambda s: None))
+
+    def test_staryi_ushel_tolko_po_chestnoi_pustote(self):
+        self.assertEqual(o._agent_wait_gone(lambda: [], sleeper=lambda s: None), (True, []))
+        gone, _left = o._agent_wait_gone(lambda: None, sleeper=lambda s: None)
+        self.assertFalse(gone, "слепая проба НЕ доказывает, что старый агент ушёл")
+
+    def test_staryi_ne_ushel_nazvan_nomerom(self):
+        self.assertEqual(o._agent_wait_gone(lambda: [111], sleeper=lambda s: None), (False, [111]))
+
+
+class SelfRaiseAgentFlowTest(unittest.TestCase):
+    """Сквозной ход `selfraise_agent` на ПОДСТАВНЫХ вызовах: боевого процесса — ни одна ветка."""
+
+    def setUp(self):
+        self.cows, self.loud, self.cards, self.killed = [], [], [], []
+        self.raised = False
+
+    def _raiser(self):
+        self.raised = True
+        return True, "schtasks rc=0"
+
+    def _run(self, **kw):
+        """Подставной ПК: до подъёма живёт номер 111 и старый лок, после — 222 и новый.
+        Ни одного боевого вызова: ни CIM, ни taskkill, ни Планировщика."""
+        base = dict(commit="c0ffee1", why="self-update",
+                    parse_fn=lambda: (True, "разобрано 8 файл(ов)"),
+                    killer=lambda pids, seen: (self.killed.extend(pids) or list(pids), ""),
+                    raiser=self._raiser,
+                    lock_fn=lambda: ({"pid": 222, "written": 2000.0} if self.raised
+                                     else {"pid": 111, "written": 1000.0}),
+                    sleeper=lambda s: None, now=1000.0, state=[],
+                    journal=self.cows.append, critical=self.loud.append,
+                    notifier=self.cards.append,
+                    wait_gone=lambda find, sleeper=None: (True, []),
+                    wait_pids=lambda find, sleeper=None: find(),
+                    finder=lambda: ([222] if self.raised else [111]))
+        base.update(kw)
+        return o.selfraise_agent(**base)
+
+    # ---- ПУНКТ 1: проверка ПЕРЕД снятием ----
+
+    def test_nerazobrannyi_kod_ne_trogaet_zhivogo_agenta_vovse(self):
+        note = self._run(parse_fn=lambda: (False, "pc_agent.py:12 invalid syntax"),
+                         killer=lambda p, s: self.fail("живого агента тронули при неразобранном коде"),
+                         raiser=lambda: self.fail("подъём при неразобранном коде"))
+        self.assertIn("НЕ РАЗБИРАЕТСЯ", note)
+        self.assertIn("НЕ ТРОНУТ", note)
+        self.assertEqual(self.killed, [])
+        self.assertTrue(self.cows, "отказ разбора обязан быть ОТДЕЛЬНОЙ строкой в ленте")
+        self.assertTrue([c for c in self.loud if "НЕ РАЗБИРАЕТСЯ" in c])
+
+    # ---- ПУНКТ 2: подъём ДОКАЗЫВАЕТСЯ ----
+
+    def test_dokazannyi_podyom_vladeltsa_ne_zovet(self):
+        note = self._run()
+        self.assertIn("САМОПОДЪЁМ ВЫПОЛНЕН", note)
+        self.assertEqual(self.loud, [], "доказанный подъём НЕ смеет занимать громкий канал")
+        self.assertTrue([c for c in self.cards if "ПОДНЯТ САМ" in c])
+        self.assertTrue([s for s in self.cows if "поднят САМ" in s])
+        self.assertEqual(self.killed, [111], "снимаем РОВНО прежний номер агента")
+
+    # ---- ПУНКТ 5: подъём ВЫГЛЯДИТ удавшимся, а процесса нет ----
+
+    def test_otricatelnyi_komanda_nol_processa_net_zovem_vladeltsa(self):
+        note = self._run(raiser=lambda: (True, "schtasks /Run rc=0"),
+                         wait_pids=lambda find, sleeper=None: [])
+        self.assertIn("НЕ ДОКАЗАН", note)
+        self.assertIn("НЕ ВЗЯЛСЯ", note)
+        self.assertIn("было PID 111", note)               # прежнее состояние ОПИСАНО
+        self.assertTrue([c for c in self.loud if "НЕ ПОДТВЕРЖДЁН" in c],
+                        "владельца обязаны позвать ГРОМКО: %s" % self.loud)
+        self.assertEqual(self.cards, [], "тихой карточки «поднят» при провале быть не должно")
+
+    def test_staryi_ne_snyalsya_podyom_otmenyaetsya(self):
+        """Singleton-лок: поднимать поверх живого старого бессмысленно — новый экземпляр выйдет."""
+        note = self._run(wait_gone=lambda find, sleeper=None: (False, [111]),
+                         raiser=lambda: self.fail("подъём поверх неснятого старого"))
+        self.assertIn("не снялся", note)
+        self.assertIn("ЖДЁТ РУЧНОГО рестарта", note)
+        self.assertTrue([c for c in self.loud if "ОТМЕНЁН" in c])
+
+    def test_slepoi_cim_do_podyoma_nichego_ne_snimaet(self):
+        note = self._run(finder=lambda: None, killer=lambda p, s: self.fail("удар вслепую"))
+        self.assertIn("НЕ НАЧАТ", note)
+        self.assertTrue(self.loud)
+
+    def test_lezhachego_agenta_podnimaem_bez_snyatiya(self):
+        note = self._run(finder=lambda: ([222] if self.raised else []),
+                         wait_gone=lambda find, sleeper=None: self.fail("ждать ухода некого"))
+        self.assertIn("САМОПОДЪЁМ ВЫПОЛНЕН", note)
+        self.assertEqual(self.killed, [])
+
+    # ---- ПУНКТ 4: петля ----
+
+    def test_ischerpanie_popytok_gromkii_otkaz_a_ne_molchanie(self):
+        note = self._run(state=[1000.0 - 1200, 1000.0 - 700],
+                         killer=lambda p, s: self.fail("подъём при исчерпанных попытках"))
+        self.assertIn("исчерпаны попытки", note)
+        self.assertIn("ЖДЁТ РУЧНОГО рестарта", note)
+        self.assertTrue([c for c in self.loud if "ОСТАНОВЛЕН" in c],
+                        "исчерпание обязано быть ГРОМКИМ: %s" % self.loud)
+
+    def test_popytka_zapisyvaetsya_rovno_odna_na_zakhod(self):
+        state = []
+        self._run(state=state)
+        self.assertEqual(state, [1000.0])
+
+    def test_vtoroi_zakhod_po_tomu_zhe_kommitu_ne_budit_vladeltsa(self):
+        """Живой класс: ОДИН коммит приходит ДВУМЯ дорогами (self-update и реконсиляция). Второй
+        заход обязан промолчать — карточка «самоподъём остановлен» сразу после удавшегося подъёма
+        была бы ложной тревогой каждый раз, когда всё сработало."""
+        state = []
+        first = self._run(state=state)
+        self.assertIn("САМОПОДЪЁМ ВЫПОЛНЕН", first)
+        second = self._run(state=state, why="реконсиляция",
+                           killer=lambda p, s: self.fail("второй удар по агенту за одно событие"))
+        self.assertIn("остыв", second)
+        self.assertEqual(self.loud, [], "остыв НЕ смеет занимать громкий канал: %s" % self.loud)
+
+    def test_rubilnik_otkata_vozvrashchaet_prezhnee_povedenie(self):
+        real = o.AGENT_SELFRAISE_OFF
+        try:
+            o.AGENT_SELFRAISE_OFF = True
+            note = self._run(killer=lambda p, s: self.fail("рубильник не удержал"))
+        finally:
+            o.AGENT_SELFRAISE_OFF = real
+        self.assertIn("ЖДЁТ РУЧНОГО рестарта", note)
+
+
+class SelfRaiseAgentBoundaryTest(unittest.TestCase):
+    """ПУНКТ 3: граница разрешения УЗКАЯ — только агент, и это доказывается тестом."""
+
+    def test_v_vetke_net_ni_odnogo_imeni_klientskogo_kontura(self):
+        src = inspect.getsource(o.selfraise_agent)
+        for forbidden in ("userbot", "moderbot", "moderation_bot", "_restart_via_pc_agent",
+                          "_raise_client_bot"):
+            self.assertNotIn(forbidden, src,
+                             "в ветке самоподъёма появилось %r — граница разрешения поехала" % forbidden)
+
+    def test_u_vetki_net_parametra_kogo_podnimat(self):
+        """Структурный замок: перепутать цель нельзя — цели в сигнатуре нет вовсе."""
+        params = list(inspect.signature(o.selfraise_agent).parameters)
+        for bad in ("kind", "name", "target", "who"):
+            self.assertNotIn(bad, params)
+
+    def test_podnimatel_zovet_rovno_zadachu_pc_agent(self):
+        seen = []
+        real = o._schtasks_run
+        try:
+            o._schtasks_run = lambda task=None: (seen.append(task) or (0, "ok"))
+            ok, _detail = o._raise_pc_agent()
+        finally:
+            o._schtasks_run = real
+        self.assertEqual(seen, ["pc_agent"])
+        self.assertTrue(ok)
+
+    def test_ni_bot_ni_demon_ne_tronuty_ni_odnoi_vetkoi(self):
+        real_restart, real_bot = o._restart_via_pc_agent, o._raise_client_bot
+        def boom(*a, **k):
+            raise AssertionError("тронули клиентский контур из ветки самоподъёма агента")
+        try:
+            o._restart_via_pc_agent, o._raise_client_bot = boom, boom
+            note = o.selfraise_agent(
+                commit="c1", parse_fn=lambda: (True, "ok"), finder=lambda: [111],
+                lock_fn=lambda: {"pid": 222, "written": 2.0}, sleeper=lambda s: None,
+                now=1000.0, state=[], journal=lambda s: None, critical=lambda s: None,
+                notifier=lambda s: None)
+        finally:
+            o._restart_via_pc_agent, o._raise_client_bot = real_restart, real_bot
+        self.assertIsInstance(note, str)
+
+    def test_boevye_dveri_pod_yunitami_otkazyvayut(self):
+        """ПУНКТ 6: боевой путь и проверка РАЗЛИЧАЮТСЯ. Забытая инъекция обязана дать ОТКАЗ,
+        а не удар по двери владельца."""
+        killed, err = o._stop_pc_agent([4242], 1000.0)
+        self.assertEqual(killed, [])
+        self.assertIn("под юнит-тестами", err)
+        ok, detail = o._raise_pc_agent_guarded()
+        self.assertFalse(ok)
+        self.assertIn("под юнит-тестами", detail)
+
+    def test_pravka_botov_vetku_agenta_ne_budit(self):
+        # анти-флап держит рестарт бота СОЗНАТЕЛЬНО: проверяем границу, а не карточку деплоя —
+        # состоявшийся рестарт увёл бы тест в боевой `_notify_deploy_happened` (живая карточка).
+        called = []
+        note = o._selfupdate_restart_children(
+            "aaa1111", "bbb2222", diff_fn=lambda a, b: ["userbot_listen.py"],
+            restart_fn=lambda kind: (True, [1], "ok"), state={"userbot": 1000}, now=1050,
+            cooldown=120, dirty_fn=lambda: [], client_block_fn=lambda *a, **k: [],
+            selfraise_fn=lambda *a, **k: called.append(a) or "не должно")
+        self.assertEqual(called, [], "правка бота не смеет поднимать дверь владельца")
+        self.assertIn("анти-флап", note)
 
 
 if __name__ == "__main__":

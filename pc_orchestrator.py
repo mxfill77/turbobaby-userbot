@@ -7961,7 +7961,7 @@ def _diff_names(old_commit, new_commit):
 
 def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_fn=None,
                                  now=None, cooldown=None, state=None, dirty_fn=None,
-                                 client_block_fn=None, bots_hit_fn=None):
+                                 client_block_fn=None, bots_hit_fn=None, selfraise_fn=None):
     """После УСПЕШНОГО self-update демона: рестарт затронутых детей по ЯВНОЙ карте на основе диффа
     old..new. → строка-итог для лога/cowork ('' если никого не трогали). Правила:
       • userbot/moderbot → штатный рестарт механикой вотчдога (_restart_via_pc_agent), с уважением
@@ -7997,14 +7997,9 @@ def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_f
     if not (procs or ask_ub or ask_mb):
         return ""                                  # тронуты только не-код-файлы — никого не рестартим
     notes = []
-    if "pc_agent" in procs:                        # агент себя чужими руками не рестартует — только пометка
-        procs.pop("pc_agent")
-        msg = ("pc_agent изменён — ЖДЁТ РУЧНОГО рестарта (Планировщик/сам подхватит), "
-               "чужими руками не трогаю")
-        log.info("self-update дети: %s", msg)
-        _cowork(f"авто-применил {new_commit}: {msg}")
-        _notify(f"ℹ️ Оркестратор: {msg} (self-update {new_commit})")
-        notes.append(msg)
+    if "pc_agent" in procs:                        # ДВЕРЬ ВЛАДЕЛЬЦА ПОДНИМАЕМ САМИ (07.09.2026):
+        procs.pop("pc_agent")                      # прежде здесь была только пометка «ждёт ручного»
+        notes.append((selfraise_fn or selfraise_agent)(new_commit, "self-update"))
     # ВОРОТА КЛИЕНТСКОГО КОНТУРА (30.07): self-update демона имеет право обновить СЕБЯ, но не имеет
     # права молча выкатить клиентскую правку, попавшую в тот же диапазон коммитов, — ровно так 28.07
     # старый suggest.py уехал «прицепом» к чужому self-update. Держим только ДЕТЕЙ-ботов: сам демон
@@ -8384,7 +8379,7 @@ def _adopt_live_child_base(head, live_fn=None):
 
 def reconcile_children_tick(head_fn=None, diff_fn=None, gate_fn=None, restart_fn=None,
                             now=None, cooldown=None, state=None, client_block_fn=None,
-                            live_base_fn=None, bots_hit_fn=None):
+                            live_base_fn=None, bots_hit_fn=None, selfraise_fn=None):
     """Тело реконсиляции детей на новый коммит (без троттлинга — троттлит maybe_reconcile_children).
     → строка-итог для лога ('' если нечего/рубильник). Всё внешнее инъектируется для тестов.
     Метку/rejected хранит в модульных глобалах (переживают тики; рестарт демона их сбрасывает — и
@@ -8440,13 +8435,10 @@ def reconcile_children_tick(head_fn=None, diff_fn=None, gate_fn=None, restart_fn
             return ("ворота клиентского контура: применение %s ОСТАНОВЛЕНО, боты на прежнем коде "
                     "(%s)%s" % (short, ", ".join(_held), _agent_note))
     notes, gate_red = [], False
-    if pc_agent_hit:                      # агент себя чужими руками не рестартует — только пометка (признак по замыканию, как в _selfupdate_restart_children)
-        msg = ("pc_agent изменён — ЖДЁТ РУЧНОГО рестарта (Планировщик/сам подхватит), "
-               "чужими руками не трогаю")
-        log.info("реконсиляция детей: %s", msg)
-        _cowork(f"авто-применил {short}: {msg}")
-        _notify(f"ℹ️ Оркестратор: {msg} (реконсиляция {short})")
-        notes.append(msg)
+    if pc_agent_hit:                      # ДВЕРЬ ВЛАДЕЛЬЦА ПОДНИМАЕМ САМИ (07.09.2026): признак по
+                                          # замыканию, как в _selfupdate_restart_children. Ветка
+                                          # стои́т ПОСЛЕ ворот — удержанный коммит сюда не доходит.
+        notes.append((selfraise_fn or selfraise_agent)(short, "реконсиляция"))
     for kind, label, files in (("userbot", "userbot", ub_files), ("moderbot", "модербот", mb_files)):
         if not files:
             continue
@@ -8557,6 +8549,363 @@ def _raise_pc_agent():
     """Поднять pc_agent через Планировщик (у него отдельная задача schtasks). → (ok, detail)."""
     rc, out = _schtasks_run("pc_agent")
     return rc == 0, f"schtasks /Run /TN pc_agent rc={rc}: {_tail(out, 160)}"
+
+
+# ═══ САМОПОДЪЁМ ДВЕРИ ВЛАДЕЛЬЦА ПОСЛЕ ПРАВКИ ЕЁ СОБСТВЕННОГО КОДА (07.09.2026) ════════════════
+#
+# ЗАЧЕМ. Слово владельца 07.09: «сделай патч на будущее что бы в таких случаях меня не звать».
+# Прежнее поведение обеих дорог применения (self-update и реконсиляция): увидев правку в
+# замыкании агента, они писали «ЖДЁТ РУЧНОГО рестарта» и на этом ОСТАНАВЛИВАЛИСЬ. Дальше жил
+# ПРОЦЕСС со старым образом файла: сводка контура честно говорила «жив (PID …)», а кнопок нового
+# кода в нём не было — тот самый класс, который меряет `_agent_code_stale` (живой замер 05.09:
+# дверь несла код на 48 ч 18 мин старше диска, кнопка ворот вернула `action=None ok=False`).
+#
+# ПОЧЕМУ ОДНОГО `schtasks /Run` МАЛО. У агента singleton-лок: `main()` ПЕРВЫМ действием зовёт
+# `acquire_agent_lock()` и при живом владельце лока просто `return` (pc_agent.py:1209). Значит
+# запуск второго экземпляра ПОВЕРХ живого старого не грузит новый код вовсе — сторож так поднимает
+# только МЁРТВОГО агента. Отсюда снятие старого, и отсюда же — узость разрешения.
+#
+# ГРАНИЦА РАЗРЕШЕНИЯ (пункт 3 задания). Эта ветка снимает и поднимает РОВНО pc_agent и рОвно
+# после правки его собственного import-замыкания. Слова `userbot`/`moderbot`/`pc_orchestrator`
+# в ней не встречаются ни разу, у функции нет параметра «кого», а подниматель по умолчанию —
+# единственный: задача Планировщика `pc_agent`. Доказывается голденами класса
+# `SelfRaiseAgentBoundary` (никто, кроме агента, не тронут ни одной веткой).
+#
+# ЧИСЛА ПЕТЛЕВОЙ ЗАЩИТЫ ИЗМЕРЕНЫ, А НЕ НАЗНАЧЕНЫ (пункт 4). Корпус — коммиты в import-замыкание
+# агента (8 файлов: client_contour, decision_waits, deploy_voice, io_utf8, log_setup, pc_agent,
+# proc_identity, selfupdate_gate) за 57.1 суток: 25 штук = 0.44/сут; МАКСИМУМ за любой час — 2;
+# минимальная пауза между двумя коммитами — 2396 с (39 м 56 с). Отсюда потолок 2 попытки за
+# 3600 с (ровно измеренный максимум законных событий в час: третья попытка за тот же час законным
+# событием не объясняется — это петля) и остыв 600 с (вчетверо ниже минимальной законной паузы,
+# то есть ни одного законного события не режет). Исчерпание — ГРОМКИЙ отказ в инбокс, не молчание.
+#
+# СРОК ПОДЪЁМА. Корпус подъёмов агента сторожем (4 эпизода в логе демона): 03.09 04:15:00 —
+# процесс был на месте уже на первой контрольной пробе (прибор сторожа RAISE_VERIFY_SEC=8 с;
+# «pc_agent ЗАПУСК» в логе агента 04:14:52.964, то есть около секунды); 23.08 06:08:54 —
+# `подъём ok=True, PID после=[]`, а ЗАПУСК в логе агента лишь 06:16:21.7, на 7 м 27 с позже.
+# Вторая точка НАШЕЙ команде не приписана (внутри окна мог сработать собственный триггер задачи
+# Планировщика), поэтому срок по ней не берётся: 90 с = 11× прибора сторожа и на ДОКАЗАННОЙ паре
+# даёт ноль ложных «не взялся». Не уложился — исход не «поднялся», а ГРОМКИЙ зов владельца с
+# описанием прежнего состояния. Цена честности названа: на эпизоде вида 23.08 зов будет ложным.
+#
+# ЧТО ЭТА ВЕТКА НЕ ДЕЛАЕТ. Не судит жизнь агента (это предмет контур-вотчдога, он живёт своим
+# счётчиком смертей и своим остывом), не трогает удержанный воротами коммит (в реконсиляции
+# ветка стои́т ПОСЛЕ ворот и на удержании не зовётся вовсе) и не объявляет успех по коду возврата
+# команды: `schtasks` вернул ноль — это ещё не процесс (живой случай 23.08).
+AGENT_SELFRAISE_OFF = (os.getenv("PC_AGENT_SELFRAISE_OFF", "").strip().lower()
+                       in ("1", "true", "yes", "on"))                    # рубильник отката
+AGENT_RAISE_TRIES = int(os.getenv("PC_AGENT_RAISE_TRIES", "2") or "2")           # попыток за окно
+AGENT_RAISE_WINDOW = int(os.getenv("PC_AGENT_RAISE_WINDOW", "3600") or "3600")   # окно попыток, с
+AGENT_RAISE_COOLDOWN = int(os.getenv("PC_AGENT_RAISE_COOLDOWN", "600") or "600")  # остыв, с
+AGENT_RAISE_SETTLE = int(os.getenv("PC_AGENT_RAISE_SETTLE", "8") or "8")         # 1-я проба PID, с
+AGENT_RAISE_DEADLINE = int(os.getenv("PC_AGENT_RAISE_DEADLINE", "90") or "90")   # срок появления PID
+AGENT_RAISE_POLL = int(os.getenv("PC_AGENT_RAISE_POLL", "10") or "10")           # шаг добора проб, с
+AGENT_RAISE_HOLD = int(os.getenv("PC_AGENT_RAISE_HOLD", "15") or "15")           # «жив спустя паузу»
+AGENT_GONE_DEADLINE = int(os.getenv("PC_AGENT_GONE_DEADLINE", "20") or "20")     # ждём смерти старого
+
+_agent_raise_at = []      # моменты ПОПЫТОК самоподъёма (память демона; рестарт демона её сбрасывает)
+
+
+def agent_code_parses(names=None, read_fn=None, closure_fn=None):
+    """ПУНКТ 1: новый код агента РАЗБИРАЕТСЯ? → (ok, словами). Чистая при инъекции чтения.
+
+    Только `compile(..., "exec")`: разбор не смеет ИСПОЛНЯТЬ чужой модуль, поэтому ни импорта,
+    ни запуска здесь нет. FAIL-CLOSED — файл не прочитан считается ОТКАЗОМ, а не «разобрался»:
+    дверь владельца не снимают ради кода, про который неизвестно, поднимется ли он."""
+    base = ""
+    if names is None:
+        closure, why = _agent_closure(closure_fn=closure_fn)
+        names = sorted(closure) if closure else [_AGENT_ENTRY]
+        if not closure:
+            base = " (замыкание не посчитано: %s — проверен только вход)" % (why or "причина не названа")
+    names = list(names)
+    def _read(p):
+        with open(os.path.join(REPO, p), encoding="utf-8") as f:
+            return f.read()
+    read = read_fn or _read
+    checked = 0
+    for name in names:
+        if not str(name).endswith(".py"):
+            continue
+        try:
+            src = read(name)
+        except Exception as e:                                             # noqa: BLE001
+            return False, "%s НЕ ПРОЧИТАН (%s: %s)" % (name, type(e).__name__, str(e)[:80])
+        try:
+            compile(src, str(name), "exec")
+        except SyntaxError as e:
+            return False, "%s:%s %s" % (name, e.lineno, (e.msg or "не разобрался"))
+        except Exception as e:                                             # noqa: BLE001
+            return False, "%s не разобрался (%s: %s)" % (name, type(e).__name__, str(e)[:80])
+        checked += 1
+    if not checked:
+        return False, "разбирать нечего — ни одного .py в замыкании агента"
+    return True, "разобрано %d файл(ов)%s" % (checked, base)
+
+
+def agent_raise_allowed(now, at=None, tries=None, window=None, cooldown=None):
+    """ПУНКТ 4: попытка самоподъёма разрешена? → (ok, словами, громко?). ЧИСТАЯ (голден): список
+    попыток НЕ меняет — его пополняет вызывающий, и ровно один раз.
+
+    ГРОМКОСТЬ РАЗНАЯ У ДВУХ ОТКАЗОВ, и это не украшение. ИСЧЕРПАНИЕ — авария (агент не держится,
+    владельца зовём); ОСТЫВ — чаще всего законное сдвоенное событие: один и тот же коммит приходит
+    и дорогой self-update, и дорогой реконсиляции, и второй заход обязан промолчать, а не будить
+    владельца сразу после удавшегося подъёма. Измерено: минимальная пауза между двумя коммитами в
+    замыкание агента — 2396 с, то есть остыв 600 с законных СОБЫТИЙ не режет вовсе; всё, что он
+    ловит, — это второй заход по ТОМУ ЖЕ событию."""
+    at = _agent_raise_at if at is None else at
+    tries = AGENT_RAISE_TRIES if tries is None else tries
+    window = AGENT_RAISE_WINDOW if window is None else window
+    cooldown = AGENT_RAISE_COOLDOWN if cooldown is None else cooldown
+    recent = [t for t in at if now - t < window]
+    if recent and (now - max(recent)) < cooldown:
+        return False, ("остыв: прошлая попытка %s назад, порог %s"
+                       % (fmt_sleep(now - max(recent)), fmt_sleep(cooldown))), False
+    if len(recent) >= tries:
+        return False, ("исчерпаны попытки: %d за %s при потолке %d"
+                       % (len(recent), fmt_sleep(window), tries)), True
+    return True, "попытка %d из %d за %s" % (len(recent) + 1, tries, fmt_sleep(window)), False
+
+
+def agent_raise_verdict(before, after, late, lock_before, lock_after, deadline=None, hold=None):
+    """ПУНКТЫ 2 и 5: подъём ДОКАЗАН? → (исход, словами). ЧИСТАЯ (голден).
+
+    Исход ∈ 'ok' | 'failed' | 'unknown'. Кода возврата команды подъёма здесь НЕТ СОЗНАТЕЛЬНО:
+    живой случай 23.08 06:08:54 — `schtasks` вернул ноль, а процесса не появилось. Судим по трём
+    доказательствам подряд: НОМЕР сменился (прежний PID не жив), ЛОК переписан новым владельцем,
+    процесс ЖИВ спустя паузу. «Не смог проверить» — отдельный третий исход, он НЕ успех."""
+    deadline = AGENT_RAISE_DEADLINE if deadline is None else deadline
+    hold = AGENT_RAISE_HOLD if hold is None else hold
+    if after is None:
+        return "unknown", "PID после подъёма не подтверждён (CIM слеп) — подъём НЕ ДОКАЗАН"
+    if not after:
+        return "failed", "PID НЕ ПОЯВИЛСЯ за %s — подъём НЕ ВЗЯЛСЯ" % fmt_sleep(deadline)
+    old = set(int(p) for p in (before or []))
+    still = sorted(old & set(int(p) for p in after))
+    if still:
+        return "failed", ("прежний PID %s ЖИВ — процесс не сменился, код остался старым"
+                          % ", ".join(map(str, still)))
+    if before is None:
+        return "unknown", "прежние PID не были видны (CIM слеп) — смену процесса доказать нечем"
+    if late is None:
+        return "unknown", "жив ли процесс спустя %s — не подтверждено (CIM слеп)" % fmt_sleep(hold)
+    if not late:
+        return "failed", "процесс появился и УМЕР за %s" % fmt_sleep(hold)
+    if lock_after is None:
+        return "unknown", "pc_agent.lock не читается — обновление лока не доказано"
+    lock_pid = int(lock_after.get("pid") or 0)
+    if lock_pid not in [int(p) for p in late]:
+        return "failed", ("pc_agent.lock держит номер %s, а живой процесс %s — лок НЕ обновился"
+                          % (lock_pid or "нет", ", ".join(map(str, late))))
+    if lock_before is not None:
+        was = lock_before.get("written") or lock_before.get("mtime")
+        got = lock_after.get("written") or lock_after.get("mtime")
+        if was is not None and got is not None and not (got > was):
+            return "failed", "pc_agent.lock не переписан (время прежнее) — лок НЕ обновился"
+    return "ok", ("новый PID %s вместо %s, лок обновлён, процесс жив спустя %s"
+                  % (", ".join(map(str, late)), ", ".join(map(str, sorted(old))) or "пустоты",
+                     fmt_sleep(hold)))
+
+
+def _agent_wait_pids(finder, deadline=None, settle=None, poll=None, sleeper=None):
+    """Ждём ПОЯВЛЕНИЯ PID агента до срока. → список | [] (не появился) | None (последняя проба слепа).
+    Первая проба — через `settle` (прибор сторожа), дальше добор шагами `poll` до `deadline`."""
+    deadline = AGENT_RAISE_DEADLINE if deadline is None else deadline
+    settle = AGENT_RAISE_SETTLE if settle is None else settle
+    poll = AGENT_RAISE_POLL if poll is None else poll
+    sleep = sleeper or time.sleep
+    waited = float(settle)
+    sleep(settle)
+    while True:
+        try:
+            pids = finder()
+        except Exception as e:                                             # noqa: BLE001
+            log.warning("самоподъём агента: контрольный поиск PID упал (%s) — исход НЕИЗВЕСТЕН", e)
+            pids = None
+        if pids:
+            return pids
+        if waited >= deadline:
+            return [] if pids == [] else None      # последняя проба честна — верим ей, а не памяти
+        step = min(max(1, poll), max(0.0, deadline - waited))
+        sleep(step)
+        waited += step
+
+
+def _agent_wait_gone(finder, deadline=None, poll=2, sleeper=None):
+    """Ждём, пока СТАРЫЙ агент реально исчезнет (иначе singleton-лок не пустит новый код).
+    → (ушёл?, что видно). Слепая проба «ушёл» НЕ означает: доказательством считается только
+    честная пустота."""
+    deadline = AGENT_GONE_DEADLINE if deadline is None else deadline
+    sleep = sleeper or time.sleep
+    waited = 0.0
+    while True:
+        try:
+            pids = finder()
+        except Exception:                                                  # noqa: BLE001
+            pids = None
+        if pids == []:
+            return True, []
+        if waited >= deadline:
+            return False, pids
+        step = min(max(1, poll), max(0.0, deadline - waited))
+        sleep(step)
+        waited += step
+
+
+def _stop_pc_agent(pids, seen_at):
+    """Снять ЖИВОГО pc_agent по ОПОЗНАННЫМ номерам — той же механикой, которой контур снимает
+    ботов (`pc_agent._taskkill` → `proc_identity.kill_ok`: образ обязан быть python, рождение —
+    не позже момента наблюдения; не опознали — не бьём). → (снятые, отказ словами).
+
+    ПОД ЮНИТ-ТЕСТАМИ НЕ БЬЁТ ВОВСЕ (пункт 6 задания: боевой путь и проверка обязаны различаться).
+    Голдены гоняют логику на подставном убийце; забытая инъекция обязана дать отказ, а не удар по
+    двери владельца."""
+    if "unittest" in sys.modules:
+        return [], "боевой удар запрещён под юнит-тестами (проверка идёт на подставных вызовах)"
+    try:
+        import pc_agent   # lazy: не тянем telegram в импорт демона
+    except Exception as e:                                                 # noqa: BLE001
+        return [], "импорт pc_agent не удался: %s" % e
+    killed = []
+    for pid in pids or []:
+        try:
+            if pc_agent._taskkill(pid, seen_at):
+                killed.append(pid)
+        except Exception as e:                                             # noqa: BLE001
+            log.warning("самоподъём агента: taskkill %s упал (%s)", pid, e)
+    return killed, ""
+
+
+def _raise_pc_agent_guarded():
+    """Тот же штатный подъём агента, что у сторожа, но с замком пункта 6: под юнит-тестами
+    боевая задача Планировщика НЕ зовётся."""
+    if "unittest" in sys.modules:
+        return False, "боевой schtasks запрещён под юнит-тестами (проверка на подставных вызовах)"
+    return _raise_pc_agent()
+
+
+def _agent_lock_read(path=None):
+    """Запись pc_agent.lock → dict | None. Только чтение файла, ничего не пишем и не снимаем."""
+    try:
+        return proc_identity.read_lock(path or os.path.join(REPO, "pc_agent.lock"))
+    except Exception as e:                                                 # noqa: BLE001
+        log.warning("самоподъём агента: pc_agent.lock не прочитан (%s)", e)
+        return None
+
+
+def selfraise_agent(commit="", why="self-update", finder=None, killer=None, raiser=None,
+                    parse_fn=None, lock_fn=None, sleeper=None, now=None, state=None,
+                    notifier=None, critical=None, journal=None, wait_pids=None, wait_gone=None):
+    """ПОДНЯТЬ ДВЕРЬ ВЛАДЕЛЬЦА САМИМ после правки её собственного кода. → строка-итог для лога.
+
+    Порядок обязателен, и в нём весь смысл (задание Штаба 07.09):
+      1. РАЗБОР ДО ПРИКОСНОВЕНИЯ — новый код не разбирается ⇒ живой агент НЕ тронут вовсе;
+      2. ПЕТЛЕВАЯ ЗАЩИТА — счётчик попыток и остыв; исчерпание ⇒ ГРОМКИЙ отказ, а не молчание;
+      3. снять старого и ДОЖДАТЬСЯ, что он ушёл (иначе новый экземпляр умрёт на singleton-локе);
+      4. поднять штатной задачей Планировщика — той же, которой поднимает сторож;
+      5. ДОКАЗАТЬ подъём тремя фактами (номер сменился · лок переписан · жив спустя паузу).
+    Ни одна ветка не объявляет успех без доказательства; «не смог проверить» — третий исход, и он
+    ЗОВЁТ владельца. Всё внешнее инъектируется: голдены боевых процессов не касаются."""
+    now = time.time() if now is None else now
+    state = _agent_raise_at if state is None else state
+    say = journal or _cowork
+    loud = critical or _notify_critical
+    quiet = notifier or (lambda t: _notify_topic(RAISE_ALARM_TOPIC, t))
+    head = "pc_agent изменён (%s%s)" % (why, (" %s" % commit) if commit else "")
+    manual = "ЖДЁТ РУЧНОГО рестарта"
+
+    def _stop(msg, card=None):
+        log.error("самоподъём агента: %s", msg)
+        say(msg)
+        if card:
+            loud(card)
+        return msg
+
+    if AGENT_SELFRAISE_OFF:
+        msg = "%s — самоподъём выключен рубильником PC_AGENT_SELFRAISE_OFF, %s" % (head, manual)
+        log.info("самоподъём агента: %s", msg)
+        say(msg)
+        return msg
+    # ── ПУНКТ 1: разбор ДО того, как тронули живого ──────────────────────────────────────────
+    pok, pdetail = (parse_fn or agent_code_parses)()
+    if not pok:
+        return _stop(
+            "%s, но новый код НЕ РАЗБИРАЕТСЯ (%s) — ЖИВОЙ АГЕНТ НЕ ТРОНУТ, %s" % (head, pdetail, manual),
+            "⚠️ Оркестратор: новый код pc_agent НЕ РАЗБИРАЕТСЯ — %s.\nЖивой агент НЕ тронут, дверь "
+            "владельца осталась на прежнем коде (это лучше, чем снять её ради кода, который не "
+            "поднимется). Нужен фикс синтаксиса." % pdetail)
+    # ── ПУНКТ 4: петлевая защита ─────────────────────────────────────────────────────────────
+    allowed, limit_why, limit_loud = agent_raise_allowed(now, state)
+    if not allowed:
+        return _stop(
+            "%s — самоподъём НЕ выполнен (%s), %s" % (head, limit_why, manual),
+            ("⚠️ Оркестратор: САМОПОДЪЁМ pc_agent ОСТАНОВЛЕН — %s.\nДверь владельца (тема 205) может "
+             "нести старый код: подними агента вручную задачей Планировщика pc_agent и посмотри, "
+             "почему он не держится." % limit_why) if limit_loud else None)
+    state.append(now)
+    del state[:max(0, len(state) - 64)]            # список попыток не растёт бесконечно
+    find = finder or (lambda: _find_pids_by_script(_AGENT_ENTRY))
+    try:
+        before = find()
+    except Exception as e:                                                 # noqa: BLE001
+        log.warning("самоподъём агента: поиск прежнего PID упал (%s)", e)
+        before = None
+    if before is None:
+        return _stop(
+            "%s — не видно, жив ли прежний агент (CIM слеп): подъём НЕ НАЧАТ, %s" % (head, manual),
+            "⚠️ Оркестратор: самоподъём pc_agent НЕ НАЧАТ — CIM не отвечает, и жив ли прежний агент, "
+            "неизвестно. Снимать вслепую нельзя. Дверь владельца может нести старый код (%s) — "
+            "подними вручную." % (commit or "новый коммит"))
+    # ── ПУНКТ 3 (механика): снять старого и дождаться, что он УШЁЛ ───────────────────────────
+    stopped, kill_err = (killer or _stop_pc_agent)(before, now)
+    if before:
+        gone, left = (wait_gone or _agent_wait_gone)(find, sleeper=sleeper)
+        if not gone:
+            seen = ", ".join(map(str, left)) if left else "номер не виден (CIM слеп)"
+            return _stop(
+                "%s — СТАРЫЙ агент не снялся за %s (видно: %s%s): подъём отменён, дверь на прежнем "
+                "коде, %s" % (head, fmt_sleep(AGENT_GONE_DEADLINE), seen,
+                              ("; " + kill_err) if kill_err else "", manual),
+                "⚠️ Оркестратор: САМОПОДЪЁМ pc_agent ОТМЕНЁН — старый процесс не снялся (%s)%s.\n"
+                "Новый экземпляр всё равно упёрся бы в singleton-лок и вышел, поэтому не поднимаем. "
+                "Сними агента вручную и запусти задачу Планировщика pc_agent."
+                % (seen, (": " + kill_err) if kill_err else ""))
+    lock_before = (lock_fn or _agent_lock_read)()
+    # ── ПУНКТ 3 (механика): подъём ровно тем, чем поднимает сторож ───────────────────────────
+    try:
+        rok, rdetail = (raiser or _raise_pc_agent_guarded)()
+    except Exception as e:                                                 # noqa: BLE001
+        rok, rdetail = False, "подниматель упал: %s" % e
+    # ── ПУНКТ 2 и ПУНКТ 5: подъём ДОКАЗЫВАЕТСЯ, а не объявляется ────────────────────────────
+    after = (wait_pids or _agent_wait_pids)(find, sleeper=sleeper)
+    late = None
+    if after:
+        (sleeper or time.sleep)(AGENT_RAISE_HOLD)
+        try:
+            late = find()
+        except Exception as e:                                             # noqa: BLE001
+            log.warning("самоподъём агента: проба «жив спустя паузу» упала (%s)", e)
+            late = None
+    lock_after = (lock_fn or _agent_lock_read)()
+    outcome, said = agent_raise_verdict(before, after, late, lock_before, lock_after)
+    was_s = ", ".join(map(str, before)) or "агент лежал"
+    if outcome == "ok":
+        pid_s = ", ".join(map(str, late))
+        msg = "%s — САМОПОДЪЁМ ВЫПОЛНЕН: %s" % (head, said)
+        log.info("самоподъём агента: %s", msg)
+        say("авто-применил %s: pc_agent поднят САМ (PID %s → %s), владельца не звали"
+            % (commit or "правку", was_s, pid_s))
+        quiet("🔁 pc_agent ПОДНЯТ САМ после правки его кода (%s)\n%s\nвладельца звать не потребовалось"
+              % (commit or "новый коммит", said))
+        return msg
+    return _stop(
+        "%s — САМОПОДЪЁМ НЕ ДОКАЗАН (%s): %s; было PID %s, снято %s; команда подъёма: %s. %s"
+        % (head, outcome, said, was_s, ", ".join(map(str, stopped)) or "никого",
+           _tail(str(rdetail), 120), manual),
+        "⚠️ САМОПОДЪЁМ pc_agent НЕ ПОДТВЕРЖДЁН — %s\nбыло: PID %s · снято: %s · команда подъёма "
+        "(ok=%s): %s\n%s — подними агента вручную задачей Планировщика pc_agent."
+        % (said, was_s, ", ".join(map(str, stopped)) or "никого", rok, _tail(str(rdetail), 120),
+           RAISE_LOSS.get("pc_agent", "процесс контура не работает")))
 
 
 def _raise_client_bot(kind):
