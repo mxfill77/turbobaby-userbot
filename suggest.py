@@ -8633,6 +8633,16 @@ async def poll_and_send(client, sender=None, jitter=None, sleep=None):
     n = 0
     _send = sender or send_to_client
     for r in rows:
+        # ЗАМОК КАНАЛА (WA-2b, 07.09.2026): строка WhatsApp-инбаунда НЕ уходит Telegram-отправкой.
+        # client_id у неё — производное от НОМЕРА, а не Telegram-id: попытка отправки по нему
+        # либо упала бы, либо (хуже) нашла бы ЧУЖОГО адресата. Двери wa_send нет ни на VPS, ни на
+        # ПК (KB_WA_PLAN §7), поэтому одобренный WA-черновик закрывается честной причиной, а не
+        # молчанием: менеджер видит в карточке, что отправка ещё не включена.
+        if is_wa_client_ref(r.get("client_ref")):
+            log.warning(f"{WA_SEND_DISABLED_MSG} | черновик #{r['id']} для {r.get('client_ref')} "
+                        f"одобрен, но каналом не отправлен")
+            moderation_ipc.mark(r["id"], "failed", reason=WA_SEND_DISABLED_MSG)
+            continue
         # ДЕДУП ОТПРАВИТЕЛЯ (06.09.2026): строку берём АТОМАРНО и ровно один раз за её жизнь.
         # Без этого замка атомарный захват решения не спасал — дубль просто переезжал на ступень
         # дальше: выборка выше и отправка ниже разнесены через `await`, поэтому наложившиеся
@@ -8752,9 +8762,127 @@ async def poll_and_post_intake(client, poster=None, group_id=None, photo_finder=
     return n
 
 
+# --- КАНАЛ WHATSAPP: как отличить его строку в общей очереди модерации (WA-2b, 07.09.2026) ------
+# У WA-инбаунда та же очередь, те же карточки и тот же lesson_router, что у Telegram, — второго
+# контура модерации канал не заводит (KB_WA_PLAN §3). Отличается ОДНО: адресация. Telegram-строка
+# несёт client_ref «@username» или «idNNN», WhatsApp — «WA · +номер · имя», и по этому префиксу
+# отправка узнаёт, что канала для доставки ещё нет. Определение живёт ЗДЕСЬ (а не в wa_bridge),
+# чтобы suggest не импортировал мост: зависимость обязана идти в одну сторону.
+WA_CLIENT_REF_PREFIX = "WA · "
+WA_SEND_DISABLED_MSG = "WA-отправка отключена (ключ не задан)"
+
+
+def is_wa_client_ref(ref) -> bool:
+    """Строка очереди пришла из WhatsApp? Решает ПРЕФИКС адреса; None/мусор → False (fail-safe:
+    сомнение не превращает телеграмную строку в неотправляемую)."""
+    return str(ref or "").startswith(WA_CLIENT_REF_PREFIX)
+
+
+async def draft_from_transcript(transcript, *, client_id, client_ref, client_name=None,
+                                first=False, strip_repeat_greeting=False, is_partner=False,
+                                call_llm=None, faq=None, notify=None):
+    """ОБЩЕЕ ТЕЛО КЛИЕНТСКОГО ПУТИ: контекст диалога → цена/парк/книга правил → черновик →
+    запись для карточки модерации. → rec (dict для moderation_ipc.enqueue_draft) либо None,
+    если черновика быть не должно (парк не получен, сбой генерации, пустой вывод, брак гварда).
+
+    Заведено 07.09.2026 (WA-2b): у WhatsApp-инбаунда ТОТ ЖЕ путь, что у Telegram, — иначе рядом
+    вырос бы второй клиентский конвейер со своей ценой, своим парком и своими гвардами, который
+    расходился бы с первым молча. Telegram-специфичное осталось у вызывающего: выборка истории
+    окна (_fetch_messages), reply-режим и pending. Сюда приходит ГОТОВЫЙ транскрипт в том же
+    формате «[клиент]:/[менеджер]:», кем бы он ни был собран.
+
+    notify — необязательная асинхронная «заметка модератору» (в Telegram это post_mod_note,
+    привязанный к живому клиенту). Нет её → отказ виден только в логе; молчания нет ни в одной
+    ветке. transcript пустой → None (генерировать не из чего)."""
+    if not (transcript or "").strip():
+        return None
+
+    async def _note(text):
+        if notify is None:
+            log.warning(f"SUGGEST[note→log] {text}")
+            return
+        try:
+            await notify(text)
+        except Exception as e:
+            log.warning(f"SUGGEST: заметка модератору не ушла: {e} | {text}")
+
+    last_client_line = ""
+    for ln in reversed(transcript.split("\n")):
+        if ln.startswith("[клиент]:"):
+            last_client_line = ln[len("[клиент]:"):].strip()
+            break
+    # Язык — по ВСЕМУ клиенту, не по последней реплике: латинское название модели («Adv 350»)
+    # в русском диалоге НЕ должно переключать ответ на EN.
+    lang = detect_lang_from_client(transcript)
+    faq = faq if faq is not None else load_faq()
+    # Двухфазная цена: даты есть → пробуем Календарь (pricing.quote), иначе/None → фолбэк.
+    # В ПОТОКЕ (to_thread): построение сетки — живые HTTP-quote; синхронно оно морозило Telethon
+    # event loop (живой провал 20:52→20:59: 6м16с заморозки → «Security error… Too many messages
+    # had to be ignored» от Telegram). Поток снимает заморозку; сам билд ускорен пулом в price_sheet.
+    price_note = await asyncio.to_thread(
+        build_pricing_note, extract_booking_hints(transcript), lang=lang)
+    try:                                   # allowlist парка (Лист1) + ОТКУДА он взят
+        allow, park_src = park_allowlist_status()
+    except Exception as e:
+        allow, park_src = None, PARK_NONE
+        log.info(f"SUGGEST: park_allowlist упал ({type(e).__name__}) — парк считаю НЕполученным")
+    if park_src == PARK_NONE:
+        # Класс 28.07 09:24: мост отдал 404, парк не получен НИ ОТКУДА, а черновик всё равно
+        # собирался — LLM без ограничения моделей мог предложить то, чего в парке нет. Нет данных →
+        # нет черновика: клиенту молчим, менеджеру говорим. «Парк реально пуст» (PARK_EMPTY) и
+        # «моста в контуре нет» (PARK_UNCONFIGURED) сюда НЕ попадают — это не сбой.
+        log.warning(f"SUGGEST: парк НЕ получен для {client_ref} — черновик не собираю")
+        await _note(f"⚠️ Черновик НЕ собран для {client_ref}: данные парка "
+                    f"недоступны (ни Bridge, ни снимок park_list.md) — проверьте мост")
+        return None
+    try:                                   # книга правил; недоступна → '' (fail-safe)
+        pb = load_playbook()
+    except Exception:
+        pb = ""
+    try:
+        draft = generate_draft(transcript, lang, faq, is_first_contact=first,
+                               pricing_note=price_note, call_llm=call_llm, park_models=allow,
+                               playbook=pb, is_partner=is_partner)
+    except Exception as e:   # сбой генератора (напр. claude CLI не найден / API-ошибка) — НЕ молчим
+        reason = " ".join(str(e).split())[:200] or type(e).__name__
+        log.warning(f"SUGGEST: сбой генерации для {client_ref}: {reason}")
+        await _note(f"⚠️ Черновик НЕ сгенерирован для {client_ref}: {reason}")
+        return None
+    if not draft:            # пустой вывод LLM — раньше молчали, теперь видно в группе (конец слепоты)
+        log.warning(f"SUGGEST: пустой черновик для {client_ref} — пропускаю.")
+        await _note(f"⚠️ Черновик НЕ сгенерирован для {client_ref}: пустой вывод LLM")
+        return None
+    # Гард повторного приветствия (родитель #311): LLM порой здоровается вопреки промпту. Если это
+    # НЕ первый ответ бота ИЛИ уже было автоприветствие Business — детерминированно срезаем зачин
+    # из черновика перед отправкой (belt-and-suspenders поверх промпта «не здоровайся повторно»).
+    if strip_repeat_greeting:
+        stripped = strip_greeting(draft)
+        if stripped != draft:
+            log.info(f"SUGGEST: срезано повторное приветствие в черновике для {client_ref}.")
+            draft = stripped
+    # Гвард-модель (шаг 4/7 #274): текст черновика заявляет модель («дам развёрнуто по Nmax»),
+    # а карточки прайс-блока — чужой (MT-03) ⇒ черновик врёт о собственном теле. Бракуем ШТАТНЫМ
+    # каналом отбраковки-до-модерации (тем же, что сбой/пустая генерация): причина в лог + видимая
+    # заметка в группу, карточки/IPC нет — кривой прайс не доезжает ни до модератора, ни до клиента.
+    mismatch = model_claim_mismatch(draft, price_note)
+    if mismatch:
+        log.warning(f"SUGGEST: черновик ЗАБРАКОВАН (гвард-модель) для {client_ref}: {mismatch}")
+        await _note(f"🛑 Черновик ЗАБРАКОВАН (гвард-модель) для {client_ref}: {mismatch}")
+        return None
+    return {
+        "client_id": client_id, "client_ref": client_ref, "lang": lang,
+        "incoming": last_client_line, "draft": draft, "first_contact": first,
+        # контекст для СТРАТЕГИЯ-перегенерации (реплика модератора → директива поверх этого):
+        "transcript": transcript, "pricing_note": price_note,
+        # имя клиента — для D-колонки карточки «Бронь», если клиент в тексте не назвался:
+        "client_name": client_name,
+    }
+
+
 async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
     """Врезка в on_incoming: собрать диалог → черновик → на модерацию.
-    bot-режим → в IPC (бот запостит карточку с кнопками); иначе reply-режим (в группу)."""
+    bot-режим → в IPC (бот запостит карточку с кнопками); иначе reply-режим (в группу).
+    Тело «транскрипт → черновик» общее с WhatsApp-инбаундом — draft_from_transcript."""
     if not is_enabled():
         return None
     # ЖЁСТКИЙ блок КОДОМ ДО LLM (слой 1; родитель: инцидент @Pleummmm 15.07 11:23): сообщение
@@ -8787,83 +8915,20 @@ async def on_client_message(client, sender, me_id, call_llm=None, faq=None):
     is_first_bot_reply = first_contact_from(msgs, me_id) and not greeting_already_sent(transcript)
     has_autogreeting = autogreeting_already_sent(transcript)
     first = is_first_bot_reply and not has_autogreeting
-    last_client_line = ""
-    for ln in reversed(transcript.split("\n")):
-        if ln.startswith("[клиент]:"):
-            last_client_line = ln[len("[клиент]:"):].strip()
-            break
-    # Язык — по ВСЕМУ клиенту, не по последней реплике: латинское название модели («Adv 350»)
-    # в русском диалоге НЕ должно переключать ответ на EN.
-    lang = detect_lang_from_client(transcript)
-    faq = faq if faq is not None else load_faq()
-    # Двухфазная цена: даты есть → пробуем Календарь (pricing.quote), иначе/None → фолбэк.
-    # В ПОТОКЕ (to_thread): построение сетки — живые HTTP-quote; синхронно оно морозило Telethon
-    # event loop (живой провал 20:52→20:59: 6м16с заморозки → «Security error… Too many messages
-    # had to be ignored» от Telegram). Поток снимает заморозку; сам билд ускорен пулом в price_sheet.
-    price_note = await asyncio.to_thread(
-        build_pricing_note, extract_booking_hints(transcript), lang=lang)
-    try:                                   # allowlist парка (Лист1) + ОТКУДА он взят
-        allow, park_src = park_allowlist_status()
-    except Exception as e:
-        allow, park_src = None, PARK_NONE
-        log.info(f"SUGGEST: park_allowlist упал ({type(e).__name__}) — парк считаю НЕполученным")
-    if park_src == PARK_NONE:
-        # Класс 28.07 09:24: мост отдал 404, парк не получен НИ ОТКУДА, а черновик всё равно
-        # собирался — LLM без ограничения моделей мог предложить то, чего в парке нет. Нет данных →
-        # нет черновика: клиенту молчим, менеджеру говорим. «Парк реально пуст» (PARK_EMPTY) и
-        # «моста в контуре нет» (PARK_UNCONFIGURED) сюда НЕ попадают — это не сбой.
-        log.warning(f"SUGGEST: парк НЕ получен для {client_ref} — черновик не собираю")
-        await post_mod_note(client, f"⚠️ Черновик НЕ собран для {client_ref}: данные парка "
-                                    f"недоступны (ни Bridge, ни снимок park_list.md) — проверьте мост")
-        return None
-    try:                                   # книга правил; недоступна → '' (fail-safe)
-        pb = load_playbook()
-    except Exception:
-        pb = ""
     # Партнёрский чат (шаг 3/6 #4): признак по имени окна (title/username). Обычный клиентский DM →
     # False (регресс байт-в-байт); партнёрское окно → гард не даёт черновику подтверждать доставку
     # партнёра от нашего лица. Групповую маршрутизацию партнёрок держит вызывающий контур (userbot).
     is_partner = is_partner_chat(sender)
-    try:
-        draft = generate_draft(transcript, lang, faq, is_first_contact=first,
-                               pricing_note=price_note, call_llm=call_llm, park_models=allow,
-                               playbook=pb, is_partner=is_partner)
-    except Exception as e:   # сбой генератора (напр. claude CLI не найден / API-ошибка) — НЕ молчим
-        reason = " ".join(str(e).split())[:200] or type(e).__name__
-        log.warning(f"SUGGEST: сбой генерации для {client_ref}: {reason}")
-        await post_mod_note(client, f"⚠️ Черновик НЕ сгенерирован для {client_ref}: {reason}")
+    rec = await draft_from_transcript(
+        transcript, client_id=client_id, client_ref=client_ref,
+        client_name=getattr(sender, "first_name", None), first=first,
+        # автоприветствие Business в окне ИЛИ это не первый ответ бота → повторный зачин срезаем
+        strip_repeat_greeting=(not is_first_bot_reply) or has_autogreeting,
+        is_partner=is_partner, call_llm=call_llm, faq=faq,
+        notify=lambda text: post_mod_note(client, text))
+    if rec is None:
         return None
-    if not draft:            # пустой вывод LLM — раньше молчали, теперь видно в группе (конец слепоты)
-        log.warning(f"SUGGEST: пустой черновик для {client_ref} — пропускаю.")
-        await post_mod_note(client, f"⚠️ Черновик НЕ сгенерирован для {client_ref}: пустой вывод LLM")
-        return None
-    # Гард повторного приветствия (родитель #311): LLM порой здоровается вопреки промпту. Если это
-    # НЕ первый ответ бота ИЛИ уже было автоприветствие Business — детерминированно срезаем зачин
-    # из черновика перед отправкой (belt-and-suspenders поверх промпта «не здоровайся повторно»).
-    if (not is_first_bot_reply) or has_autogreeting:
-        stripped = strip_greeting(draft)
-        if stripped != draft:
-            why = "автоприветствие Business в окне" if has_autogreeting else "не первый ответ бота"
-            log.info(f"SUGGEST: срезано повторное приветствие в черновике для {client_ref} ({why}).")
-            draft = stripped
-    # Гвард-модель (шаг 4/7 #274): текст черновика заявляет модель («дам развёрнуто по Nmax»),
-    # а карточки прайс-блока — чужой (MT-03) ⇒ черновик врёт о собственном теле. Бракуем ШТАТНЫМ
-    # каналом отбраковки-до-модерации (тем же, что сбой/пустая генерация): причина в лог + видимая
-    # заметка в группу, карточки/IPC нет — кривой прайс не доезжает ни до модератора, ни до клиента.
-    mismatch = model_claim_mismatch(draft, price_note)
-    if mismatch:
-        log.warning(f"SUGGEST: черновик ЗАБРАКОВАН (гвард-модель) для {client_ref}: {mismatch}")
-        await post_mod_note(client, f"🛑 Черновик ЗАБРАКОВАН (гвард-модель) для {client_ref}: {mismatch}")
-        return None
-
-    rec = {
-        "client_id": client_id, "client_ref": client_ref, "lang": lang,
-        "incoming": last_client_line, "draft": draft, "first_contact": first,
-        # контекст для СТРАТЕГИЯ-перегенерации (реплика модератора → директива поверх этого):
-        "transcript": transcript, "pricing_note": price_note,
-        # first_name профиля — для D-колонки карточки «Бронь», если клиент в тексте не назвался:
-        "client_name": getattr(sender, "first_name", None),
-    }
+    draft = rec["draft"]
     # bot-режим: кладём в IPC, карточку с кнопками запостит moderation_bot.
     if bot_mode_active():
         try:
