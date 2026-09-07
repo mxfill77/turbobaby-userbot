@@ -234,11 +234,32 @@ class TestGoldenLiveCases(FlagBase):
         # Тест это не скрывает и не смягчает: сосед `test_both_live_cases_moved_towards_what_
         # client_paid` продолжает мерить главное (счёт всё ещё ближе к уплаченному, чем лист:
         # 122 < 221) и остался ЗЕЛЁНЫМ без единой правки. Разбор — в артефакте 06.09.
-        self.assertEqual(res["quote"]["day_price"], 920)   # 662 x 1.389 (P4) x 1.000
-        self.assertEqual(res["quote"]["total"], 12880)
+        #
+        # ГОЛДЕН ПЕРЕСЧИТАН ТРЕТИЙ РАЗ 07.09.2026 — решением владельца 07.09.2026-1 (срок через
+        # границу периодов считается ПО ДНЯМ) и его ответом «полной» на вопрос о ступени. И вот
+        # что тут важно назвать вслух: ЭТОТ ЖИВОЙ СЛУЧАЙ САМ ЛЕЖИТ ЧЕРЕЗ ГРАНИЦУ. 12-25.12.2025 —
+        # это 3 суток P4 («до 20 декабря», множитель 1.389) и 11 суток P5 (пик, 1.467), то есть
+        # ДВЕ суточные ставки: 920 и 971. Единственной среди них нет, поэтому `day_price` теперь
+        # НЕ НАЗЫВАЕТСЯ ВОВСЕ (None) — среднее 13441/14 = 960 запрещено записанным правилом и
+        # здесь не подставляется. Ступень срока осталась ОДНА и от полной длительности (корзина
+        # 7-14, множитель 1.000) — ровно ответ владельца.
+        #
+        # ЦЕНА ЭТОГО СДВИГА НАЗВАНА ЧЕСТНО, как и в прошлый раз. Клиент заплатил 798 ฿/сут =
+        # 11172 ฿ за срок. Счёт по дате начала промахивался на +1708, счёт по дням промахивается
+        # на +2269 — то есть ПО ЭТОМУ ОДНОМУ случаю разбивка увела расчёт ДАЛЬШЕ от денег на
+        # 561 ฿. Тест это не прячет; сосед `test_both_live_cases_moved_towards_what_client_paid`
+        # продолжает мерить главное (правило всё ещё ближе к уплаченному, чем лист: 2269 < 3090).
+        self.assertIsNone(res["quote"]["day_price"])       # 920 (P4) и 971 (P5) — «одной» нет
+        self.assertEqual(res["quote"]["total"], 13441)     # 3 x 920 + 11 x 971
 
     def test_both_live_cases_moved_towards_what_client_paid(self):
         # Смысл всей ветки одной проверкой: 317→437 при уплаченных 464, 577→710 при 798.
+        #
+        # ЕДИНИЦА СРАВНЕНИЯ У ВТОРОГО СЛУЧАЯ СМЕНИЛАСЬ 07.09.2026, и не по вкусу: dlg120 лежит
+        # ЧЕРЕЗ границу периодов, суточной ставки у него больше нет ни одной (см. соседний тест),
+        # а СУММА ЗА СРОК есть и точна. Меряем её — против уплаченного за срок и против листа за
+        # срок. Первый случай (dlg179) лежит ВНУТРИ одного периода, ставка у него по-прежнему
+        # одна, и он мерится как мерился: правка на него не влияет ни битом.
         self.on()
         a = price_source.reprice({"status": "ok", "quote": live_quote()},
                                  "NMAX 155", "2026-01-29", "2026-02-05", suggest._bike_key)
@@ -247,7 +268,7 @@ class TestGoldenLiveCases(FlagBase):
                                     bike="YAMAHA XMAX 300 NEW 2023-")},
             "XMAX 300", "2025-12-12", "2025-12-26", suggest._bike_key)
         self.assertLess(abs(a["quote"]["day_price"] - 464), abs(317 - 464))
-        self.assertLess(abs(b["quote"]["day_price"] - 798), abs(577 - 798))
+        self.assertLess(abs(b["quote"]["total"] - 798 * 14), abs(8082 - 798 * 14))   # 2269 < 3090
 
 
 # ───────────────────────── 3-бис. опознание модели (мина первого замера) ─────────────────────────
@@ -318,7 +339,11 @@ class TestModelResolution(FlagBase):
         # ПЕРЕСЧИТАНО 06.09.2026 второй раз — множитель срока 0.82 → 1.000: срок 14 суток лёг в
         # опорную корзину по решению владельца 06.09.2026-1 (граница 13 → 14). Тот же голден и
         # та же причина, что у `TestGoldenLiveCases.test_dlg120_december_xmax_fourteen_days`.
-        self.assertEqual(b["quote"]["day_price"], 920)
+        # 07.09.2026 СМЕНИЛСЯ СВИДЕТЕЛЬ, а не предмет: этот срок лежит через границу P4 → P5,
+        # суточной ставки у него больше нет ни одной (разбивка по дням, решение 07.09.2026-1),
+        # и опознание модели теперь доказывает СУММА. Она поколенческая ровно так же, как была
+        # ставка: 13441 стои́т на базе 662 НОВОГО поколения, у старого (557) вышло бы другое.
+        self.assertEqual(b["quote"]["total"], 13441)
 
 
 # ──────────── 3б. разведение поколений XMAX: ЦЕНОЙ, а не только именем строки ────────────
@@ -552,6 +577,234 @@ class TestCaps(FlagBase):
         self.assertIsNone(cap)
         cap, _ = price_source.cap_for(doc, "XMAX 300", suggest._bike_key, live_cap_price=9900)
         self.assertEqual(cap, 9900)
+
+
+# ────────────────── 5б. РАЗБИВКА СРОКА ПО ДНЯМ (решение 07.09.2026-1) ──────────────────
+
+class TestSplitByDays(FlagBase):
+    """Срок через границу периодов считается ПО ДНЯМ, ступень — от ПОЛНОЙ длительности.
+
+    Основание — решение владельца `07.09.2026-1` и его ОТВЕТ от 07.09.2026 на первый
+    оставшийся вопрос, дословно: «полная скидка что бы разница была конечно же не такая».
+    Оба лежат в узле `KB_business_rules`, оба процитированы докстрокой `price_source.term_total`.
+
+    Голдены 5023 и 8124 — не круглые числа из головы: это счёт ЖИВЫМ файлом для примера самого
+    решения (NMAX 155, 31 сутки с 06.10.2026), опубликованный в правиле. 5023 — ответ владельца
+    («полной»), 8124 — отвергнутое им чтение («куска»). Разъедется файл — покраснеют они.
+    """
+
+    Q = {"bike": "YAMAHA NMAX 155", "model": "YAMAHA NMAX 155"}
+    OFF = price_source.SPLIT_OFF_ENV
+
+    def setUp(self):
+        FlagBase.setUp(self)
+        self.on()
+        self._split = os.environ.get(self.OFF)
+        os.environ.pop(self.OFF, None)          # разбивка — ДЕФОЛТ, поэтому ручку СНИМАЕМ
+        self.doc = price_source.load()
+
+    def tearDown(self):
+        if self._split is None:
+            os.environ.pop(self.OFF, None)
+        else:
+            os.environ[self.OFF] = self._split
+        FlagBase.tearDown(self)
+
+    def _term(self, iso="2026-10-06", days=31, model="NMAX 155", env=None, doc=None):
+        return price_source.term_total(doc or self.doc, model, datetime.date.fromisoformat(iso),
+                                       days, suggest._bike_key, quote=self.Q, env=env)
+
+    # ── п.2 задания: ступень одна и от ПОЛНОЙ длительности ──
+    def test_step_comes_from_the_full_term_not_from_the_piece(self):
+        # Ответ владельца числом: 26 суток в P2 + 5 суток в P3, но корзина у обоих кусков —
+        # «30+» (ступень ПОЛНОГО срока в 31 сутки). Чтение «по куску» дало бы корзины 15-29 и
+        # 4-6, то есть 8124 ฿ вместо 5023 — на 3101 ฿ (61.7 %) дороже НА ОДНОЙ БРОНИ.
+        total, info = self._term()
+        self.assertEqual(info["bucket"], "30+")
+        self.assertEqual(total, 5023)
+        self.assertNotEqual(total, 8124)
+
+    def test_each_day_goes_by_the_multiplier_of_its_own_period(self):
+        total, info = self._term()
+        self.assertEqual(info["segments"], [("P2", 26, 158), ("P3", 5, 183)])
+        self.assertEqual(sum(n for _k, n, _r in info["segments"]), 31)   # ни одни сутки не потеряны
+        self.assertEqual(26 * 158 + 5 * 183, total)
+        self.assertTrue(info["split"])
+
+    # ── п.3 задания: округление ПОСУТОЧНОЕ, и оно вынуждено п.4 ──
+    def test_rounding_is_per_day_not_at_the_end(self):
+        # 298 × 1.000 × 0.53 = 157.94. Посуточно: round(157.94) × 31 = 4898 — ровно то число,
+        # что бот называет сегодня. Округли мы в конце: round(157.94 × 31) = 4896, и срок
+        # ВНУТРИ одного периода разошёлся бы с сегодняшней ценой на 2 ฿. Отсюда порядок.
+        total, info = self._term(iso="2026-09-20", days=31)    # P1 → P2, ставка одна и та же
+        self.assertEqual(info["day_prices"], [158])
+        self.assertEqual(total, 4898)
+        self.assertNotEqual(total, int(round(298 * 1.0 * 0.53 * 31)))
+
+    # ── п.4 задания: срок внутри одного периода обязан дать ТУ ЖЕ цену ──
+    def test_every_window_inside_one_period_keeps_the_old_number(self):
+        # Числом, а не словом: весь год × три срока. «Та же цена» = ровно прежняя формула
+        # int(round(цена_суток × срок)), которой жил модуль до 07.09.2026.
+        same = crossed = 0
+        d0 = datetime.date(2026, 1, 1)
+        for i in range(365):
+            ds = d0 + datetime.timedelta(days=i)
+            for n in (1, 7, 30):
+                keys = {price_source.period_of(self.doc, ds + datetime.timedelta(days=j))["key"]
+                        for j in range(n)}
+                day, _i = price_source.day_price(self.doc, "NMAX 155", ds, n,
+                                                 suggest._bike_key, quote=self.Q)
+                total, _t = price_source.term_total(self.doc, "NMAX 155", ds, n,
+                                                    suggest._bike_key, quote=self.Q)
+                if len(keys) == 1:
+                    self.assertEqual(total, int(round(day * n)), "%s %d сут" % (ds, n))
+                    same += 1
+                else:
+                    crossed += 1
+        self.assertGreater(same, 500)      # выборка не выродилась в пустую
+        self.assertGreater(crossed, 100)   # и границы в ней есть, иначе замок ничего не сторожит
+
+    # ── п.6 задания: КОНТРФАКТ. Выключенная разбивка обязана дать ДРУГОЙ ответ ──
+    def test_declared_rollback_gives_the_pre_change_answer(self):
+        on, _i = self._term()
+        off, info_off = self._term(env={self.OFF: "1"})
+        self.assertEqual(on, 5023)
+        self.assertEqual(off, 4898)        # счёт по периоду ДАТЫ НАЧАЛА, побайтно как до правки
+        self.assertNotEqual(on, off)       # совпали бы — разбивка не доказана
+        self.assertFalse(info_off["split"])
+
+    def test_rollback_word_is_read_from_the_environment_on_every_call(self):
+        res = {"status": "ok", "quote": live_quote(days=31, cap_active=False, cap_price=None)}
+        self.assertEqual(price_source.reprice(res, "NMAX 155", "2026-10-06", "2026-11-06",
+                                              suggest._bike_key)["quote"]["total"], 5023)
+        os.environ[self.OFF] = "1"
+        back = price_source.reprice(res, "NMAX 155", "2026-10-06", "2026-11-06",
+                                    suggest._bike_key)["quote"]
+        self.assertEqual(back["total"], 4898)
+        self.assertEqual(back["day_price"], 158)
+
+    def test_garbage_in_the_rollback_word_keeps_the_split_on(self):
+        # Неразбор падает на сторону РЕШЕНИЯ ВЛАДЕЛЬЦА: выключает опознанное слово, не опечатка.
+        for v in ("", "  ", "мусор", "2", "оff"):
+            self.assertFalse(price_source.split_off({self.OFF: v}), v)
+        for v in ("1", "true", "ON", " да ", "yes"):
+            self.assertTrue(price_source.split_off({self.OFF: v}), v)
+
+    # ── п.7 задания: две ставки — значит ОДНОЙ ставки нет, и выдумывать её нечем ──
+    def test_single_daily_rate_is_named_only_when_it_is_single(self):
+        two = price_source.reprice({"status": "ok", "quote": live_quote(days=31, cap_active=False,
+                                                                        cap_price=None)},
+                                   "NMAX 155", "2026-10-06", "2026-11-06", suggest._bike_key)
+        self.assertEqual(two["quote"]["total"], 5023)
+        self.assertIsNone(two["quote"]["day_price"])     # 158 и 183 — «одной» среди них нет
+        one = price_source.reprice({"status": "ok", "quote": live_quote(days=31, cap_active=False,
+                                                                        cap_price=None)},
+                                   "NMAX 155", "2026-09-20", "2026-10-21", suggest._bike_key)
+        self.assertEqual(one["quote"]["day_price"], 158)  # граница P1 → P2: ставка одна на всех
+        self.assertEqual(one["quote"]["total"], 4898)
+
+    def test_no_average_over_the_period_ever_reaches_the_client(self):
+        # Записанное правило запрещает СРЕДНЕЕ прямым текстом. Замок предметный: в клиентской
+        # фразе срока через границу суточной ставки нет ВООБЩЕ — ни настоящей, ни выведенной
+        # делением (5023 / 31 = 162), а итог остаётся ТОЧНЫМ.
+        res = price_source.reprice({"status": "ok", "quote": live_quote(days=31, cap_active=False,
+                                                                        cap_price=None)},
+                                   "NMAX 155", "2026-10-06", "2026-11-06", suggest._bike_key)
+        phrase = suggest._client_price(res["quote"])
+        self.assertNotIn("฿/день", phrase)
+        self.assertNotIn("162", phrase)
+        self.assertIn("5023", phrase)
+
+    # ── п.5 задания: ТРЕТИЙ ИСХОД не снесён, а усилен ──
+    def _holed_file(self):
+        """Файл цены с ДЫРОЙ в календаре: 11-19 января не принадлежат ни одному периоду."""
+        body = json.dumps({
+            "schema": "turbobaby/price_source",
+            "base": {"models": [{"model": "NMAX 155", "sheet_model": "YAMAHA NMAX 155",
+                                 "judged": True, "base_thb_per_day": 298, "class": "скутер"}]},
+            "season": {"periods": [
+                {"key": "PA", "name": "А", "from": "01-01", "to": "01-10",
+                 "multiplier": {"скутер": 1.0}},
+                {"key": "PB", "name": "Б", "from": "01-20", "to": "12-31",
+                 "multiplier": {"скутер": 1.5}}]},
+            "term": {"buckets": [{"bucket": "1-3", "days_from": 1, "days_to": 3, "multiplier": 1.0},
+                                 {"bucket": "4+", "days_from": 4, "days_to": 400,
+                                  "multiplier": 0.53}]}}, ensure_ascii=False)
+        fd, p = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        with io.open(p, "w", encoding="utf-8") as f:
+            f.write(body)
+        price_source.PATH = p
+        price_source._cache.update(key=None, doc=None)
+        self.addCleanup(lambda: os.path.exists(p) and os.unlink(p))
+        return price_source.load()
+
+    def test_a_day_without_a_period_in_the_middle_of_the_term_still_refuses(self):
+        doc = self._holed_file()
+        self.assertIsNotNone(doc)
+        # КОНТРОЛЬ: фикстура сама по себе считает — иначе замок доказывал бы поломку фикстуры.
+        ok, _i = self._term(iso="2026-01-01", days=3, doc=doc)
+        self.assertEqual(ok, 894)                                  # 298 × 1.0 × 1.0 × 3 суток
+        # ОТКАЗ: старт 08.01 в периоде PA, но 11.01 внутри срока не принадлежит ни одному.
+        total, info = self._term(iso="2026-01-08", days=7, doc=doc)
+        self.assertIsNone(total)
+        self.assertEqual(info["code"], price_source.WHY_DATE_OUT)
+
+    def test_that_refusal_reaches_the_answer_path_as_silence_not_as_a_number(self):
+        self._holed_file()
+        res = price_source.reprice({"status": "ok", "quote": live_quote(days=7, text=None)},
+                                   "NMAX 155", "2026-01-08", "2026-01-15", suggest._bike_key)
+        self.assertEqual(res["status"], "error")
+        self.assertIsNone(res["quote"])
+        # И это НЕ класс «модель без цены»: цена у модели есть, непосчитаем ДЕНЬ.
+        self.assertNotIn("noprice", res)
+
+    def test_the_split_made_this_lock_stronger_not_weaker(self):
+        # Названо вслух, потому что это единственное место, где правка МЕНЯЕТ третий исход.
+        # До 07.09 период спрашивался ТОЛЬКО у даты начала — день без периода в СЕРЕДИНЕ срока
+        # не видела ни одна ветка, и цена называлась по соседнему периоду молча. Объявленный
+        # откат эту слепоту возвращает вместе с прежним счётом, и здесь это зафиксировано.
+        doc = self._holed_file()
+        blind, _i = self._term(iso="2026-01-08", days=7, doc=doc, env={self.OFF: "1"})
+        self.assertIsNotNone(blind)                       # прежнее поведение: дыры не видит
+        seeing, info = self._term(iso="2026-01-08", days=7, doc=doc)
+        self.assertIsNone(seeing)                         # новое поведение: видит и отказывает
+        self.assertEqual(info["code"], price_source.WHY_DATE_OUT)
+
+    def test_unreadable_table_still_kills_the_price_after_the_split(self):
+        price_source.PATH = os.path.join(HERE, "нет-такого-файла-price_source.json")
+        price_source._cache.update(key=None, doc=None)
+        res = price_source.reprice({"status": "ok", "quote": live_quote(days=31)},
+                                   "NMAX 155", "2026-10-06", "2026-11-06", suggest._bike_key)
+        self.assertEqual(res["status"], "error")
+        self.assertIsNone(res["quote"])
+        self.assertNotIn("5023", json.dumps(res, ensure_ascii=False))
+
+    # ── ГЛАВНЫЙ ЗАПРЕТ ЗАДАЧИ: условие применения потолка НЕ ТРОНУТО ──
+    def test_the_cap_condition_itself_is_not_touched_by_the_split(self):
+        # Второй вопрос решения 07.09.2026-1 ПЕРЕОТКРЫТ и ждёт замера, поэтому признак
+        # «низкий сезон» остаётся ровно сегодняшним — множитель периода ДАТЫ НАЧАЛА == 1.000.
+        # Меняется только СУММА, которую этому признаку подают.
+        _t, info = self._term()                                  # 06.10 → P2 (1.000) + P3 (1.16)
+        per = price_source.period_of(self.doc, datetime.date(2026, 10, 6))
+        self.assertEqual(info["low_season"], float(per["multiplier"]["скутер"]) == 1.0)
+        self.assertTrue(info["low_season"])                      # хотя пять суток НЕ низкого
+        self.assertEqual(info["segments"][1][0], "P3")
+        _t2, info2 = self._term(iso="2026-11-30", days=31)       # старт вне дна → признака нет
+        self.assertFalse(info2["low_season"])
+
+    def test_the_split_feeds_the_cap_a_new_sum_and_that_is_visible(self):
+        # Следствие, названное числом, а не спрятанное: кепка NMAX 155 в файле — 5000 ฿/мес.
+        # Счёт по дате начала давал 4898 (под кепкой), счёт по дням даёт 5023 (над ней).
+        # Условие не менялось ни одной строкой — изменилась сумма, и предикат сработал.
+        q = live_quote(days=31, cap_active=True, cap_price=5000, text=None)
+        res = price_source.reprice({"status": "ok", "quote": q},
+                                   "NMAX 155", "2026-10-06", "2026-11-06", suggest._bike_key)
+        self.assertEqual(res["quote"]["total"], 5023)
+        self.assertEqual(res["quote"]["cap_price"], 5000)
+        self.assertTrue(suggest._cap_applies(res["quote"]))
+        off = dict(res["quote"], total=4898)
+        self.assertFalse(suggest._cap_applies(off))
 
 
 # ───────────────────────────── 6. врезка в путь ответа ─────────────────────────────
