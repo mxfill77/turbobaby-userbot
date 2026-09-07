@@ -281,6 +281,55 @@ class TestFieldReadFromGuardPlace(unittest.TestCase):
         card = live_card("delete", "", "rm suggest.py")
         self.assertEqual(CD.facts(card, "guard")["num"], "1 цель")
 
+    def test_number_matches_the_printer_on_whole_vocabulary(self):
+        """ЗАМОК ОТ ТИХОГО РАЗЪЕЗДА: читающая сторона обязана отдавать РОВНО то число, которое
+        напечатала печатающая, — и не на одном виде, а на всём живом словаре.
+
+        Именно здесь ломается связка со смещением: `39fb7e4` (03.09.2026) вставил между объектом
+        и числом строку последствия, и `lines[i + 1]` стал читать её. Тест сверяет с источником
+        (`_card_fields`), поэтому следующая вставленная строка покраснит гейт СРАЗУ и на всех
+        видах, а не потеряет число молча в карточке владельца."""
+        lost = []
+        for kind, (obj, cmd) in _LIVE_TARGET.items():
+            printed = " ".join((PG._card_fields(kind, obj, cmd)[1] or "").split())
+            got = CD.facts(live_card(kind, obj, cmd), "guard")["num"]
+            if got != printed:
+                lost.append("%s: напечатано %r, прочитано %r" % (kind, printed, got))
+        self.assertEqual(lost, [], "читатель числа разъехался с печатающей стороной: %s"
+                         % "; ".join(lost))
+
+    def test_conseq_prefix_mirrors_the_live_guard(self):
+        """Зеркало литерала, а не пересказ: строку последствия дежурный знает своей копией
+        (модуль чистый, импорта гарда в нём нет) — расхождение обязано падать здесь."""
+        self.assertEqual(CD._CONSEQ_PREFIX, PG.CONSEQ_LINE_PREFIX,
+                         "строка последствия в гарде переименована — читатель числа ослеп")
+
+    # ── ОТРИЦАТЕЛЬНЫЕ: число ВЫГЛЯДИТ на месте, но принадлежит ДРУГОЙ строке ──
+    # Обе фикстуры зелены у сегодняшнего (смещение) и у правильного (место) читателя, и обе
+    # КРАСНЫ у наивного «поискать „Число:“ подальше» — того самого фикса, которым позиционную
+    # связку чинят вторично. Прибор обязан показать отказ, а не правдоподобное чужое число.
+
+    def test_foreign_number_line_below_the_body_is_not_borrowed(self):
+        """Строка «Число:», приехавшая в ТЕЛО карточки, полем не считается: своей строки числа
+        у блока нет — значит «не знаю», а не число из чужой строки."""
+        card = "\n".join(ln for ln in live_card("delete", "", "rm suggest.py").splitlines()
+                         if not ln.startswith("Число: "))
+        f = CD.facts(card + "\nЧисло: 99 целей", "guard")
+        self.assertEqual(f["obj"], "suggest.py", "объект должен читаться как прежде")
+        self.assertEqual(f["num"], "", "число взято из чужой строки тела")
+
+    def test_number_is_not_borrowed_from_the_next_block(self):
+        """Маркер ПК МНОГОБЛОЧНЫЙ, и объект берётся из ПЕРВОГО блока (`object_from_card`). Число
+        обязано быть числом ТОГО ЖЕ блока: у второго оно напечатано и выглядит на месте."""
+        first = "\n".join(ln for ln in PG._card("kill", "PID 4872", "taskkill /PID 4872 /F").splitlines()
+                          if not ln.startswith("Число: "))
+        second = PG._card("delete", "", "rm suggest.py")
+        card = GUARD_PREFIX + first + "\n" + second + "\n" + PG.KIND_LINE_PREFIX + "kill"
+        self.assertIn("Число: 1 цель", second, "фикстура собрана не из живой карточки")
+        f = CD.facts(card, "guard")
+        self.assertEqual(f["obj"], "PID 4872", "объект должен остаться от первого блока")
+        self.assertEqual(f["num"], "", "число одолжено у соседнего блока")
+
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
 #  FAIL-CLOSED
