@@ -7023,6 +7023,102 @@ def _classify_changed(paths):
     return ub, mb
 
 
+# ═══ ПРИЗНАК «ПРАВКА ДОЕЗЖАЕТ ДО РАНТАЙМА БОТОВ» — ЗАМЫКАНИЕМ, А НЕ КАРТОЙ (07.09.2026) ═══════
+#
+# ПЯТЫЙ СЛУЧАЙ ОДНОГО КЛАССА, и пятого списка не будет. Первые три чинились ДОБАВЛЕНИЕМ ИМЕНИ в
+# `_FILE_PROCESS_RULES` (`delivery.py` dae330a, `trainer.py`, `trainer_log.py` — каждое после
+# живого «бот часами на старом коде»), четвёртый (агент) уже вылечен ВЫЧИСЛЕНИЕМ (`_agent_hit`,
+# 02.09). Пятый — здесь, и он хуже прочих, потому что молчит не пометка, а ВОРОТА.
+#
+# ЧТО ИМЕННО БЫЛО СЛОМАНО (замер 07.09, docs/artifacts/2026-09-07-client_contour-ворота-и-13-файлов-замер.md).
+# Все три боевых входа в ворота стояли ЗА картой: `if not (ub or mb): return ""`. Коммит, тронувший
+# файл, которого карта не знает, до `_client_block` не доходил ВООБЩЕ — а значит и до заморозки.
+# Живой прогон боевой дороги на коммите истории `0cbd317` (changed=['pc_orchestrator.py']):
+# ворота спрошены 0 раз, заморозка спрошена 0 раз, возврат ''. Дыра меряется числом: на корпусе
+# 200 последних коммитов охраняемое множество удержало бы 36, а ворота спросили про 14 —
+# ДВАДЦАТЬ ДВА коммита проехали мимо вопроса, которого им никто не задал.
+#
+# ЧТО МЕНЯЕТСЯ, А ЧТО НЕТ. Меняется ВОПРОС воротам: «спросить ли про этот коммит» считает
+# замыкание, а не карта. НЕ меняется МАРШРУТ РЕСТАРТА: кого перезапускать, по-прежнему решает
+# `_classify_changed` — рестартить живого бота на каждый коммит в инфраструктуру никто не просил,
+# и та же граница проведена у агента 02.09. Ворота пропустили, а карта молчит → не рестартим
+# никого, ровно как раньше.
+#
+# КАРТА НЕ СНЯТА И ОСТАЛАСЬ В ОБЪЕДИНЕНИИ, потому что она НЕ подмножество вычисленного: замер
+# 07.09 называет имя — `pricing_advisor.py` попадает под правило `startswith("pricing")`, а в
+# замыкании ботов его нет (его пока никто не импортит). Ровно об этом и предупреждает шапка
+# `_client_paths`: карта ловит имя, которого ещё никто не импортит. Расхождение обеих сторон
+# НАЗЫВАЕТСЯ СТРОКОЙ ЛОГА поимённо — молчаливым оно быть не имеет права (правило п.1 задания
+# 00-z-contour-hole-fix.0907), и его же держит голден
+# test_karta_rasstupaetsya_s_vychisleniem_i_eto_vidno.
+#
+# ГРАФА НЕТ → РЕШАЕТ КАРТА, то есть прежнее поведение байт-в-байт. «Не знаю» здесь не имеет права
+# стать «нечего спрашивать»: fail-closed живёт дальше по дороге, в самих воротах (`_client_paths`).
+_BOT_ENTRIES = (("userbot", "userbot_listen.py"), ("moderbot", "moderation_bot.py"))
+_bots_gap_said = set()       # об одном и том же расхождении говорим один раз на запуск демона
+
+
+def _bot_closure(entry, closure_fn=None):
+    """Транзитивное import-замыкание ОДНОГО живого бота (basename, lower) → (множество | None, причина).
+
+    Тот же обход и тот же снятый срез (`cut=()`), что у `_agent_closure` и у ворот контура: вопрос
+    «что грузит в память ЭТОТ процесс», а не «что увидит клиент». ДАННЫЕ (не-.py по литералам)
+    входят в множество наравне с кодом — правило json меняет ответ клиента вообще без рестарта, и
+    именно этим множеством судят ворота (`_client_paths`), а спрашивать их шире, чем они держат,
+    или у́же, чем держат, одинаково бессмысленно."""
+    try:
+        cl = (closure_fn or client_contour.closure)(REPO, entries=(entry,), cut=())
+    except Exception as e:                                             # noqa: BLE001
+        return None, "%s: %s" % (type(e).__name__, str(e)[:80])
+    if not cl.ok:
+        return None, str(cl.reason or "причина не названа")
+    if entry not in cl.files:
+        return None, "в замыкании нет самой входной точки %s" % entry
+    return (set(cl.files) | set(cl.data)), ""
+
+
+def _bots_hit(changed, closure_fn=None, said=None):
+    """Правка из этих файлов доедет до рантайма ЖИВЫХ БОТОВ? → (userbot_files, moderbot_files).
+
+    Это ВОПРОС ВОРОТАМ, а не приказ рестартить: возврат идёт в `_client_block`, а кого
+    перезапускать, отдельно решает карта (`_classify_changed`). Ответ — ВЫЧИСЛЕННОЕ замыкание ∪
+    карта; рукописный список остаётся только слагаемым и звучит один, когда графа нет."""
+    said = _bots_gap_said if said is None else said
+    files = [str(p) for p in (changed or [])]
+    ub_map, mb_map = _classify_changed(files)
+    out = {"userbot": list(ub_map), "moderbot": list(mb_map)}
+    for kind, entry in _BOT_ENTRIES:
+        closure, why = _bot_closure(entry, closure_fn=closure_fn)
+        by_map = set(out[kind])
+        if closure is None:
+            key = "нет графа:" + kind
+            if key not in said:
+                said.add(key)
+                log.warning("признак ботов (%s): замыкание не посчитано (%s) — решаю ЗАПАСНОЙ "
+                            "картой (прежнее поведение)", kind, why)
+            continue
+        by_closure = {p for p in files if os.path.basename(p).lower() in closure}
+        gap = sorted(by_closure - by_map)
+        if gap:
+            key = kind + "|" + "|".join(gap)
+            if key not in said:
+                said.add(key)
+                log.info("признак ботов (%s): ВЫЧИСЛЕНИЕ видит %d файл(ов), которых карта не "
+                         "относит к боту: %s (замыкание %d имён, карта знает %d) — прежним "
+                         "правилом ворота про такой коммит не спросили бы никогда",
+                         kind, len(gap), ", ".join(gap), len(closure), len(by_map))
+        extra = sorted(by_map - by_closure)
+        if extra:
+            key = "карта шире:" + kind + "|" + "|".join(extra)
+            if key not in said:
+                said.add(key)
+                log.info("признак ботов (%s): карта относит к боту %s, а замыкание — нет; "
+                         "держу ОБА (карта не подмножество вычисленного)", kind, ", ".join(extra))
+        keep = by_map | by_closure
+        out[kind] = [p for p in files if p in keep]
+    return out["userbot"], out["moderbot"]
+
+
 # ───────── ЗАПРЕТ АВТО-РЕСТАРТА ПОВЕРХ ГРЯЗНОГО ДЕРЕВА (класс 28.07.2026) ─────────
 # Живой инцидент: демон обновил себя 1f5d10d→580d0d4, диффил от СВОЕГО запущенного коммита,
 # поймал в диапазон старый 7a3c9b6 (suggest.py, pricing.py) и рестартнул userbot 16900 и
@@ -7411,15 +7507,57 @@ def _dirty_block(kind, commit, where, label=None, dirty_fn=None, notifier=None,
 _CLIENT_HELD_WARNED = {}     # «кого держим» → (коммит, кортеж клиентских файлов), о чём уже сказали
 
 
-def _client_paths(paths):
-    """Клиентские пути из списка — ПРИЗНАК (граф импортов) ∪ явная карта рестарта ботов.
-    Объединение, а не «или-или»: карта ловит имя, которого ещё никто не импортит (новый
-    suggest_*.py), граф ловит модуль, которого в карте нет (lesson_router.py — его тянет
+# ═══ СРЕЗ НА ЧУЖИХ ПРОЦЕССАХ СНЯТ У ВОРОТ, И ТОЛЬКО У НИХ (07.09.2026) ════════════════════════
+#
+# ЧТО БЫЛО. Ворота судили замыканием со срезом (`cut=FOREIGN_ENTRIES` — обход не идёт сквозь
+# `pc_orchestrator.py` и `pc_agent.py`), то есть 41 файл. Живой бот грузит БОЛЬШЕ: срез стои́т на
+# ЛЕНИВОМ ребре `moderation_core._default_lesson_enqueue` → `import pc_orchestrator`, а Python на
+# этом ребре читает модуль С ДИСКА в момент вызова — в процессе бота, без всякого рестарта.
+# Замер 07.09 назвал цену поимённо: 13 файлов, которые живой ответ грузит, а ворота пропускали, и
+# ДВЕНАДЦАТЬ из них способны изменить ответ клиенту (проба «сломай один модуль» → импорт демона
+# падает → `price_gate.allow()` отвечает «цена НЕ названа»). Множество становится 78 файлов и
+# 50 имён данных.
+#
+# ПОЧЕМУ ЭТО НЕ ОТМЕНА СРЕЗА ВООБЩЕ. Дефолт `client_contour.closure` НЕ тронут: ворота ВХОДА
+# (`client_contour.mentions` на дев-ТЗ ревизора) и голдены живого признака читают прежнее
+# замыкание со срезом. Срез снят РОВНО в одном вопросе — «что ворота выкатки держат», — и снят он
+# параметром, ради которого срез 07.08 и переехал из тела обхода в аргумент.
+#
+# ПОЧЕМУ ДЕМОН ПРОДОЛЖАЕТ ВЫКАТЫВАТЬСЯ САМ. `_client_block` зовётся ТОЛЬКО с трёх дорог рестарта
+# ДЕТЕЙ; self-update самого демона и его эстафета ворот не спрашивают ни строкой. Ирония прежняя и
+# правильная: эта правка живёт в `pc_orchestrator.py`, который теперь клиентский для ворот детей и
+# по-прежнему внутренний для самого демона.
+#
+# ЧТО ЭТО СТОИТ (замер на корпусе 200 последних коммитов, обе ноги вместе): останавливалось 14 →
+# останавливается 47; перестал останавливаться НИ ОДИН. Разряды роста названы поимённо в артефакте
+# дня; под заморозкой прибавка не стоит владельцу ни одной карточки (`gate_route` → лента).
+_CLIENT_CUT = ()             # СРЕЗ СНЯТ: ворота держат то же, что живой бот грузит в память
+
+
+def _client_closure(closure_fn=None):
+    """Множество, которым судят ВОРОТА ВЫКАТКИ ДЕТЕЙ. → Closure (та же, что у `_bots_hit`).
+
+    Отдельная функция, а не литерал в вызове, чтобы охраняемое множество и признак достижимости
+    нельзя было развести по недосмотру: спрашивать ворота у́же, чем они держат, — это ровно та
+    дыра, которую чинит правка 07.09."""
+    return (closure_fn or client_contour.closure)(
+        REPO, entries=client_contour.CLIENT_ENTRIES, cut=_CLIENT_CUT)
+
+
+def _client_paths(paths, closure_fn=None):
+    """Клиентские пути из списка — ПРИЗНАК (граф импортов БЕЗ среза) ∪ явная карта рестарта ботов.
+    Объединение, а не «или-или»: карта ловит имя, которого ещё никто не импортит (замер 07.09 —
+    `pricing_advisor.py`), граф ловит модуль, которого в карте нет (lesson_router.py — его тянет
     trainer.py, а карта про него не знает). Признак упал → считаем клиентским (fail-closed)."""
+    try:
+        cl = (closure_fn or _client_closure)()
+    except Exception as e:                           # noqa: BLE001 — «не знаю» это НЕ «внутренний»
+        log.error("ворота контура: замыкание БЕЗ СРЕЗА не посчиталось (%s) — считаю КЛИЕНТСКИМ всё", e)
+        cl = None
     out = []
     for p in (paths or []):
         try:
-            hit = client_contour.is_client(p, REPO)
+            hit = True if cl is None else client_contour.is_client(p, REPO, cl=cl)
         except Exception as e:                       # noqa: BLE001 — «не знаю» это НЕ «внутренний»
             log.error("ворота контура: признак упал на «%s» (%s) — считаю КЛИЕНТСКИМ", p, e)
             hit = True
@@ -7709,7 +7847,7 @@ def _restart_via_pc_agent(kind, settle=0.5, wait_cycles=20):
 
 def maybe_update_bots(tid, text, head_before, changed_fn=None, gate_fn=None,
                       restart_fn=None, is_dev_fn=None, head_fn=None, dirty_fn=None,
-                      client_block_fn=None):
+                      client_block_fn=None, bots_hit_fn=None):
     """После done дев-задачи применить свежий код к боту(ам). → строка-суффикс для карточки/cowork
     ('' если обновлять нечего). Уважает стоп-флаг и ЗАПРЕТ грязного дерева (_dirty_block):
     рестарт идёт только если чисты файлы, которые несёт ЭТОТ бот. Всё внешнее инъектируется."""
@@ -7725,19 +7863,31 @@ def maybe_update_bots(tid, text, head_before, changed_fn=None, gate_fn=None,
     changed = (changed_fn or _changed_files_since)(head_before)
     if not changed:
         return ""
-    ub_files, mb_files = _classify_changed(changed)
-    if not (ub_files or mb_files):
+    ub_files, mb_files = _classify_changed(changed)      # МАРШРУТ рестарта — карта, не тронута
+    # ВОПРОС ВОРОТАМ — ВЫЧИСЛЕНИЕ (07.09.2026). До этого дня здесь стоял ранний возврат по карте, и
+    # коммит, тронувший файл вне карты, до ворот не доходил вовсе (замер: 22 коммита из 200).
+    ask_ub, ask_mb = (bots_hit_fn or _bots_hit)(changed)
+    if not (ask_ub or ask_mb):
         return ""
     commit = (head_fn or _head_commit)()
     # ВОРОТА КЛИЕНТСКОГО КОНТУРА (30.07): коммит задел файл, доезжающий до ЖИВОГО клиента → не
     # применяем, владельцу карточка. Смотрим ВЕСЬ дифф задачи (не только выбранное картой) и ДО
     # гейта: рестарт поднимает состояние диска ЦЕЛИКОМ — «частично выкатить» нельзя, а гонять
     # тесты ради рестарта, которого не будет, незачем. Ровно та же очерёдность, что у грязного дерева.
-    _kinds = [k for k, f in (("userbot", ub_files), ("moderbot", mb_files)) if f]
+    _kinds = [k for k, f in (("userbot", ask_ub), ("moderbot", ask_mb)) if f]
     _held = (client_block_fn or _client_block)(_kinds, commit, changed, "авто-обновление после задачи")
     if _held:
+        # «Карточка отправлена» здесь НЕ утверждается (07.09.2026): адрес отказа выбирает
+        # `gate_route`, и под заморозкой он ВСЕГДА лента — карточки не было ни одной. Строка врала
+        # и до правки, но правка делает её частой (14 → 47 остановок на корпусе 200), а рапорт о
+        # неотправленной карточке — это ровно тот молчаливый ложный зелёный, который FACT-культура
+        # запрещает. Отказ записан в журнал самими воротами в обоих исходах — о нём и говорим.
         return (" | авто-обновление ОСТАНОВЛЕНО воротами клиентского контура (%s): боты остались на "
-                "прежнем коде, владельцу отправлена карточка" % ", ".join(_held))
+                "прежнем коде, отказ записан воротами" % ", ".join(_held))
+    if not (ub_files or mb_files):
+        # Ворота ПРОПУСТИЛИ, а карта рестарта никого не называет → не рестартим никого, ровно как
+        # до правки. Вопрос воротам расширен, маршрут рестарта — нет.
+        return ""
     # Селективный гейт (порт VPS): промежуточный шаг цепи / одиночка под флагом → только затронутые
     # тесты; финальный шаг → полный гейт (неубираем); сбой селектора → полный (fail-safe). Флаги
     # off (дефолт) → mode=off → прежний путь _affected_test_modules байт-в-байт.
@@ -7811,7 +7961,7 @@ def _diff_names(old_commit, new_commit):
 
 def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_fn=None,
                                  now=None, cooldown=None, state=None, dirty_fn=None,
-                                 client_block_fn=None):
+                                 client_block_fn=None, bots_hit_fn=None):
     """После УСПЕШНОГО self-update демона: рестарт затронутых детей по ЯВНОЙ карте на основе диффа
     old..new. → строка-итог для лога/cowork ('' если никого не трогали). Правила:
       • userbot/moderbot → штатный рестарт механикой вотчдога (_restart_via_pc_agent), с уважением
@@ -7842,7 +7992,9 @@ def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_f
         procs.setdefault("pc_agent", [p for p in changed
                                       if os.path.basename(p).lower()
                                       in (_agent_closure()[0] or set())] or list(changed))
-    if not procs:
+    # ВОПРОС ВОРОТАМ — ВЫЧИСЛЕНИЕ (07.09.2026), маршрут рестарта ниже по-прежнему по карте (`procs`).
+    ask_ub, ask_mb = (bots_hit_fn or _bots_hit)(changed)
+    if not (procs or ask_ub or ask_mb):
         return ""                                  # тронуты только не-код-файлы — никого не рестартим
     notes = []
     if "pc_agent" in procs:                        # агент себя чужими руками не рестартует — только пометка
@@ -7857,7 +8009,7 @@ def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_f
     # права молча выкатить клиентскую правку, попавшую в тот же диапазон коммитов, — ровно так 28.07
     # старый suggest.py уехал «прицепом» к чужому self-update. Держим только ДЕТЕЙ-ботов: сам демон
     # уже обновился и это внутренний контур.
-    _bots = [k for k in ("userbot", "moderbot") if k in procs]
+    _bots = [k for k, f in (("userbot", ask_ub), ("moderbot", ask_mb)) if f or k in procs]
     if _bots:
         _held = (client_block_fn or _client_block)(_bots, new_commit, changed,
                                                    "реконсиляция детей после self-update")
@@ -8232,7 +8384,7 @@ def _adopt_live_child_base(head, live_fn=None):
 
 def reconcile_children_tick(head_fn=None, diff_fn=None, gate_fn=None, restart_fn=None,
                             now=None, cooldown=None, state=None, client_block_fn=None,
-                            live_base_fn=None):
+                            live_base_fn=None, bots_hit_fn=None):
     """Тело реконсиляции детей на новый коммит (без троттлинга — троттлит maybe_reconcile_children).
     → строка-итог для лога ('' если нечего/рубильник). Всё внешнее инъектируется для тестов.
     Метку/rejected хранит в модульных глобалах (переживают тики; рестарт демона их сбрасывает — и
@@ -8252,10 +8404,14 @@ def reconcile_children_tick(head_fn=None, diff_fn=None, gate_fn=None, restart_fn
     if head == _last_child_commit or head == _child_reconcile_rejected:
         return ""                         # нет нового коммита ИЛИ этот HEAD уже провалил гейт — ждём новый
     changed = (diff_fn or _diff_names)(_last_child_commit, head)
-    ub_files, mb_files = _classify_changed(changed)
+    ub_files, mb_files = _classify_changed(changed)      # МАРШРУТ рестарта — карта, не тронута
     pc_agent_hit = _agent_hit(changed)   # ВЫЧИСЛЕННОЕ замыкание агента, карта — запасная (02.09.2026)
-    if not (ub_files or mb_files or pc_agent_hit):
-        _last_child_commit = head         # тронуты только не-код-файлы детей (pc_orchestrator/доки/тесты) — двигаем метку
+    # ВОПРОС ВОРОТАМ — ВЫЧИСЛЕННОЕ замыкание БОТОВ (07.09.2026). Именно этот ранний возврат и был
+    # второй ногой дыры: `pc_orchestrator.py` в комментарии ниже назван «не-код-файлом детей», хотя
+    # живой бот грузит его лениво с диска — и коммит в него двигал метку молча, мимо ворот.
+    ask_ub, ask_mb = (bots_hit_fn or _bots_hit)(changed)
+    if not (ub_files or mb_files or pc_agent_hit or ask_ub or ask_mb):
+        _last_child_commit = head         # тронуты только не-код-файлы детей (доки/тесты) — двигаем метку
         return ""
     now = time.time() if now is None else now
     cooldown = APPLY_COOLDOWN_SEC if cooldown is None else cooldown
@@ -8267,13 +8423,22 @@ def reconcile_children_tick(head_fn=None, diff_fn=None, gate_fn=None, restart_fn
     # _child_reconcile_rejected здесь СПЕЦИАЛЬНО не ставим: он глушит повторную проверку этого HEAD
     # насовсем, а нам ровно наоборот — ждать решения владельца и применить, когда оно будет.
     # Пометку про pc_agent тоже придержим: коммит удержан целиком, полуприменения не бывает.
-    if ub_files or mb_files:
-        _kinds = [k for k, f in (("userbot", ub_files), ("moderbot", mb_files)) if f]
+    if ask_ub or ask_mb:
+        _kinds = [k for k, f in (("userbot", ask_ub), ("moderbot", ask_mb)) if f]
         _held = (client_block_fn or _client_block)(_kinds, short, changed,
                                                    "реконсиляция детей на новый коммит")
         if _held:
+            # ПОМЕТКА АГЕНТА НЕ ТЕРЯЕТСЯ, НО И НЕ КРИЧИТ КАЖДЫЙ ТИК (07.09.2026). С расширением
+            # вопроса ворота стали держать и коммит в округу агента (`pc_agent.py` лежит в
+            # замыкании ботов), а придержанная пометка — это потеря новости, которую владелец
+            # получал. Отдать её громким каналом нельзя: удержанный коммит НЕ двигает метку, тик
+            # приходит каждые 60 с, и `_cowork`/`_notify` дали бы спам без единого нового факта
+            # (у самих ворот дедуп по «коммит + состав», у пометки его нет). Поэтому она едет той
+            # же строкой отказа — в лог демона, ровно раз в тик и без второго адресата.
+            _agent_note = (" ; pc_agent изменён — ждёт РУЧНОГО рестарта (пометка придержана вместе "
+                           "с коммитом)") if pc_agent_hit else ""
             return ("ворота клиентского контура: применение %s ОСТАНОВЛЕНО, боты на прежнем коде "
-                    "(%s)" % (short, ", ".join(_held)))
+                    "(%s)%s" % (short, ", ".join(_held), _agent_note))
     notes, gate_red = [], False
     if pc_agent_hit:                      # агент себя чужими руками не рестартует — только пометка (признак по замыканию, как в _selfupdate_restart_children)
         msg = ("pc_agent изменён — ЖДЁТ РУЧНОГО рестарта (Планировщик/сам подхватит), "

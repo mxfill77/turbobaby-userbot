@@ -10444,10 +10444,29 @@ class TestClientContourGate(Base):
         self.assertIn("suggest.py", self.cards[0])
         self.assertIn("git revert --no-edit 4528917", self.cards[0])
 
-    def test_vnutrennii_fail_ne_trogaet_vorota(self):
-        """Внутренний контур не задет: карта на ботов не ведёт → прежний путь, ворота молчат."""
-        self.assertEqual(self._upd(["pc_orchestrator.py", "gate_selective.py"]), "")
-        self.assertEqual(self.cards, [])
+    def test_vnutrennii_dlya_DEMONA_no_klientskii_dlya_VOROT_07_09(self):
+        """ЗАПИСЬ СМЕНЫ 07.09.2026: «внутренний» перестал быть ОДНИМ словом — их теперь два, и
+        голден держит ОБА, потому что разошлись они не по недосмотру, а по устройству.
+
+        Голден звался `test_vnutrennii_fail_ne_trogaet_vorota` и требовал `_upd(...) == ""`:
+        коммит в демона проезжал мимо ворот молча. Замер 07.09 назвал цену — 13 файлов, которые
+        живой ответ клиенту грузит в процесс, и 12 из них способны этот ответ изменить.
+
+        ЧТО ОСТАЛОСЬ ПРЕЖНИМ (первая половина теста): замыкание ПО УМОЛЧАНИЮ (`cut=FOREIGN_ENTRIES`)
+        этих имён не содержит — срез на чужих процессах жив, ворота ВХОДА (`mentions`) и голдены
+        живого признака читают его как читали. Красный здесь по-прежнему значит «ребро появилось».
+
+        ЧТО ПОМЕНЯЛОСЬ (вторая половина): ворота ВЫКАТКИ ДЕТЕЙ судят замыканием БЕЗ среза
+        (`_client_closure`, `cut=()`) — тем же, каким считается достижимость. Срез отвечает на
+        вопрос «что увидит клиент ЧЕРЕЗ ЧУЖОЙ ПРОЦЕСС», а живой бот грузит `pc_orchestrator` с
+        диска сам, лениво, из `moderation_core._default_lesson_enqueue`.
+
+        Строгость поднята, не ослаблена: было «проезжает молча», стало «удержано и записано»."""
+        note = self._upd(["pc_orchestrator.py", "gate_selective.py"])
+        self.assertEqual(self.restarts, [])
+        self.assertIn("ОСТАНОВЛЕНО воротами клиентского контура", note)
+        for p in ("pc_orchestrator.py", "gate_selective.py"):
+            self.assertIn(p, note)
         # ПОИМЁННЫЙ список «внутренних» — голден с коротким сроком годности, и он этот срок
         # пережил уже ДВАЖДЫ, каждый раз ценой красного гейта и остановленного прода:
         #   05.09.2026 — client_contour.py (a42c8ee завёл lesson_regress.py, цепь
@@ -10465,9 +10484,11 @@ class TestClientContourGate(Base):
         self.assertTrue(cl.ok, cl.reason)
         for p in vnutr:
             self.assertNotIn(p, cl.files,
-                             f"{p} въехал в клиентское замыкание — список устарел; "
+                             f"{p} въехал в клиентское замыкание СО СРЕЗОМ — список устарел; "
                              f"его импортируют: {self._kto_importit(p) or 'не определилось'}")
-        self.assertEqual(o._client_paths(vnutr), [])
+        # А ворота выкатки судят БЕЗ среза — и держат оба имени. Два множества, две правды, и
+        # расхождение здесь ОБЪЯВЛЕНО голденом, а не обнаружится однажды красным гейтом.
+        self.assertEqual(o._client_paths(vnutr), vnutr)
 
     def test_client_contour_stal_klientskim_cepyu(self):
         """ЗАПИСЬ СМЕНЫ, а не подгонка (05.09.2026): client_contour.py клиентский, и вот РЕБРО.
@@ -10700,11 +10721,18 @@ class TestClientContourGate(Base):
                          ["moderbot", "userbot"])
         self.assertEqual(self.cards, [])
 
-    def test_vnutrennii_kommit_edet_bez_vsyakogo_verdikta(self):
-        """Контроль второй половины: внутренний контур вердикта не спрашивает — как и раньше."""
+    def test_okruga_demona_derzhitsya_no_verdikta_ne_sprashivaet_07_09(self):
+        """ЗАПИСЬ СМЕНЫ 07.09.2026 к контролю второй половины.
+
+        Голден звался `test_vnutrennii_kommit_edet_bez_vsyakogo_verdikta` и требовал `== ""`. С
+        07.09 ворота выкатки судят замыканием БЕЗ среза, и округа демона под ними: коммит
+        УДЕРЖИВАЕТСЯ. Что тест проверяет на самом деле и что не изменилось — второе основание
+        (вердикт тренажёра) на этой дороге не спрашивается: под заморозкой его нет вовсе, а
+        отказ приходит от самих ворот, а не от отсутствия зелёного прогона."""
         self._trainer_paths()
-        self.assertEqual(self._upd(["pc_orchestrator.py", "gate_selective.py"]), "")
-        self.assertEqual(self.cards, [])
+        note = self._upd(["pc_orchestrator.py", "gate_selective.py"])
+        self.assertEqual(self.restarts, [])
+        self.assertIn("ОСТАНОВЛЕНО воротами клиентского контура", note)
 
 
 class TestZhivayaRuchkaMiraNevidnaGoldenam(Base):
@@ -10745,6 +10773,177 @@ class TestZhivayaRuchkaMiraNevidnaGoldenam(Base):
             return                       # боевого реестра нет вовсе — пачкать нечего
         with io.open(live, encoding="utf-8") as f:
             self.assertNotIn(shape, f.read(), "прогон дописал БОЕВОЙ реестр форм")
+
+
+class TestDyraVorotZakryta0709(Base):
+    """ДЫРА ВОРОТ КЛИЕНТСКОГО КОНТУРА ЗАКРЫТА ОБЕИМИ НОГАМИ (07.09.2026, задание
+    00-z-contour-hole-fix.0907). Замер дня доказал двойную дыру, и голдены здесь держат обе.
+
+    НОГА ОХРАНЫ: ворота судили замыканием СО СРЕЗОМ (41 файл), а живой бот грузит 78 — срез стои́т
+    на ленивом ребре `moderation_core._default_lesson_enqueue` → `import pc_orchestrator`, которое
+    Python читает С ДИСКА в момент вызова, в процессе бота. 13 файлов живой ответ грузил мимо
+    ворот, 12 из них способны этот ответ изменить (проба «сломай один модуль» 07.09).
+
+    НОГА ДОСТИЖИМОСТИ: все три боевых входа в ворота стояли ЗА картой `_FILE_PROCESS_RULES`
+    (`if not (ub or mb): return ""`), и коммит вне карты до `_client_block` НЕ ДОХОДИЛ — а значит
+    и до заморозки. Живой прогон боевой дороги на коммите истории `0cbd317`: ворота спрошены 0
+    раз, заморозка спрошена 0 раз. Пятый случай класса «список имён» — и пятого списка нет:
+    признак считается замыканием, ровно как признак агента с 02.09.
+
+    ЧТО ЭТО СТОИТ (корпус 200 последних коммитов): останавливалось 14 → останавливается 47,
+    перестал останавливаться НИ ОДИН."""
+
+    def setUp(self):
+        super().setUp()
+        (o._client_block, o._revizor_finding_touches_client) = self._save_cb   # боевые ворота обратно
+        self.cards, self.cows, self.restarts = [], [], []
+        o._notify = lambda t, *a, **k: self.cards.append(t)
+        o._notify_gate_card = lambda c, t, *a, **k: self.cards.append(t)
+        o._cowork = lambda t, *a, **k: self.cows.append(t)
+        self._save_subj = o._commit_subject
+        o._commit_subject = lambda c: "тема коммита"
+        self.addCleanup(lambda: setattr(o, "_commit_subject", self._save_subj))
+        self._save_rr = o.client_contour.release_reason
+        o.client_contour.release_reason = lambda *a, **k: None       # оснований пропуска нет
+        self.addCleanup(lambda: setattr(o.client_contour, "release_reason", self._save_rr))
+        # ЖИВАЯ ручка заморозки и БОЕВОЙ реестр форм голденам не видны (замок 22.08.2026).
+        d = tempfile.mkdtemp(prefix="hole_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        self.flag = os.path.join(d, "pc_orchestrator.contour_frozen")
+        for attr, val in (("FREEZE_FLAG", self.flag),
+                          ("GATE_SEEN_FILE", os.path.join(d, "gate_seen.json"))):
+            save = getattr(o.client_contour, attr)
+            setattr(o.client_contour, attr, val)
+            self.addCleanup(lambda a=attr, v=save: setattr(o.client_contour, a, v))
+        o._apply_restart_at.clear()
+        o._CLIENT_HELD_WARNED.clear()
+        o._bots_gap_said.clear()
+        self.addCleanup(o._CLIENT_HELD_WARNED.clear)
+        self.addCleanup(o._bots_gap_said.clear)
+
+    def _restart(self, kind):
+        self.restarts.append(kind)
+        return True, [4242], "PID поднят, лог свежий"
+
+    def _upd(self, changed, commit="4528917"):
+        return o.maybe_update_bots(5, "тз: правка", "old", changed_fn=lambda hb: changed,
+                                   gate_fn=lambda mods: (True, "ok"), restart_fn=self._restart,
+                                   head_fn=lambda: commit)
+
+    # ── ЗАМОК: у ворот не может быть файла, о котором их не спросят ──
+    def test_zamok_sprashivayut_obo_vsyom_chto_derzhat(self):
+        """СТРУКТУРНЫЙ ЗАМОК, а не пример: если ворота файл ДЕРЖАТ, про него обязаны СПРОСИТЬ.
+
+        Ровно это неравенство и было дырой: множество ворот держало 36 коммитов из 200, а вопрос
+        задавался про 14 — двадцать два проезжали мимо вопроса, которого им никто не задал.
+        Проверяется на ВСЕХ .py корня репозитория, а не на выбранных именах: перечень имён
+        протухает на первом новом файле, а замок — нет."""
+        py = sorted(n for n in os.listdir(o.REPO)
+                    if n.lower().endswith(".py") and os.path.isfile(os.path.join(o.REPO, n)))
+        self.assertGreater(len(py), 50, "корень репозитория прочитан не целиком")
+        nemye = [n for n in py if o._client_paths([n]) and not any(o._bots_hit([n]))]
+        self.assertEqual(nemye, [], "ворота ДЕРЖАТ эти файлы, но про них не спросят: %s" % nemye)
+
+    # ── КОНТРФАКТ 1: коммит истории, который ворота пропускали ──
+    def test_kontrfakt_kommit_v_demona_teper_uderzhan(self):
+        """`0cbd317` («Снятие залипшего отказа гейта…», 06.09) — коммит из ОДНОГО файла
+        `pc_orchestrator.py`. Замер 07.09 прогнал на нём боевые ворота: `held=[]`, «применять
+        можно». После правки тот же вход обязан быть УДЕРЖАН."""
+        changed = ["pc_orchestrator.py"]                 # дифф коммита 0cbd317, замер 07.09
+        self.assertEqual(o._client_paths(changed), changed)
+        ask_ub, ask_mb = o._bots_hit(changed)
+        self.assertTrue(ask_ub and ask_mb, "про коммит в демона обязаны спросить ОБОИХ ботов")
+        note = self._upd(changed, commit="0cbd317")
+        self.assertEqual(self.restarts, [])
+        self.assertIn("ОСТАНОВЛЕНО воротами клиентского контура", note)
+
+    # ── КОНТРФАКТ 2: исполнение доходит до заморозки ──
+    def test_kontrfakt_ispolnenie_dohodit_do_zamorozki(self):
+        """Второй контрфакт задания: на боевой дороге исполнение обязано ДОЙТИ до заморозки.
+
+        До правки счётчик показывал ноль — не «заморозка разрешила», а «её не спросили»: ранний
+        возврат по карте отрезал дорогу раньше. Здесь ворота НЕ инъектируются, наружу уведены
+        только карточка, журнал и обе ручки состояния."""
+        with io.open(self.flag, "w", encoding="utf-8") as f:
+            f.write("контур заморожен (тест)\n")
+        zvali = []
+        real = o.client_contour.freeze_holds_release
+        with mock.patch.object(o.client_contour, "freeze_holds_release",
+                               lambda *a, **k: (zvali.append(1), real(*a, **k))[1]):
+            note = self._upd(["pc_orchestrator.py"], commit="0cbd317")
+        self.assertTrue(zvali, "исполнение до заморозки НЕ дошло — ворота снова спрашивают позже неё")
+        self.assertIn("ОСТАНОВЛЕНО воротами клиентского контура", note)
+        self.assertEqual(self.cards, [], "под заморозкой прибавка строгости не стоит ни одной карточки")
+        self.assertTrue([c for c in self.cows if "ОСТАНОВЛЕНО" in c], "отказ обязан лечь в ленту")
+
+    # ── ЧТО НЕ ТРОНУТО: маршрут рестарта остался картой ──
+    def test_marshrut_restarta_ostalsya_kartoi(self):
+        """Вопрос воротам расширен, МАРШРУТ РЕСТАРТА — нет. Ворота пропустили («да» владельца), а
+        карта на ботов не указывает → не рестартим никого, ровно как до правки. Иначе правка
+        рестартила бы живого бота на каждый коммит в инфраструктуру, чего никто не просил (та же
+        граница проведена у признака агента 02.09)."""
+        with mock.patch.object(o.client_contour, "release_reason", lambda *a, **k: "owner"):
+            note = self._upd(["pc_orchestrator.py"], commit="0cbd317")
+        self.assertEqual(self.restarts, [], "карта молчит → рестарта быть не должно")
+        self.assertEqual(note, "")
+        self.assertEqual(o._classify_changed(["pc_orchestrator.py"]), ([], []))
+
+    # ── РАСХОЖДЕНИЕ КАРТЫ И ВЫЧИСЛЕНИЯ — ВИДИМОЕ, А НЕ МОЛЧАЛИВОЕ ──
+    def test_karta_ne_podmnozhestvo_i_eto_vidno(self):
+        """Премиса «список имён — подмножество вычисленного» НЕВЕРНА, и имя названо замером
+        07.09: `pricing_advisor.py` попадает под правило `startswith("pricing")`, а в замыкании
+        ботов его нет — его пока никто не импортит. Карта поэтому НЕ снята: оба слагаемых живут,
+        а расхождение обязано звучать строкой лога, а не молчать (правило п.1 задания).
+
+        Красный здесь = либо файл наконец импортировали (тогда расхождения нет и голден правится
+        замером), либо карту сняли и fail-closed стал у́же."""
+        self.assertTrue(o._procs_for_file("pricing_advisor.py") & {"userbot", "moderbot"})
+        cl = o._client_closure()
+        self.assertTrue(cl.ok, cl.reason)
+        self.assertNotIn("pricing_advisor.py", cl.files)
+        ub, mb = o._bots_hit(["pricing_advisor.py"])
+        self.assertEqual((ub, mb), (["pricing_advisor.py"], ["pricing_advisor.py"]),
+                         "карта обязана остаться слагаемым: вычисление этого имени не знает")
+        with self.assertLogs(o.log, level="INFO") as cm:
+            o._bots_gap_said.clear()
+            o._bots_hit(["pricing_advisor.py"])
+        self.assertTrue([s for s in cm.output if "pricing_advisor.py" in s and "карта" in s],
+                        "расхождение обязано быть НАЗВАНО: %s" % cm.output)
+
+    def test_vychislenie_shire_karty_i_eto_tozhe_zvuchit(self):
+        """Обратное расхождение — то самое, ради которого правка. `pc_orchestrator.py` карта к
+        ботам не относит, вычисление относит; строка лога обязана назвать файл поимённо."""
+        with self.assertLogs(o.log, level="INFO") as cm:
+            o._bots_gap_said.clear()
+            ub, mb = o._bots_hit(["pc_orchestrator.py"])
+        self.assertEqual((ub, mb), (["pc_orchestrator.py"], ["pc_orchestrator.py"]))
+        self.assertTrue([s for s in cm.output
+                         if "pc_orchestrator.py" in s and "ВЫЧИСЛЕНИЕ видит" in s],
+                        "молчаливое расхождение запрещено: %s" % cm.output)
+
+    def test_net_grafa_reshaet_karta_prezhnim_povedeniem(self):
+        """Графа нет → решает ЗАПАСНАЯ карта, то есть прежнее поведение байт-в-байт. «Не знаю»
+        здесь не смеет стать «нечего спрашивать»: fail-closed живёт дальше, в самих воротах."""
+        broken = lambda *a, **k: o.client_contour.Closure(frozenset(), frozenset(), False, "нет графа")
+        self.assertEqual(o._bots_hit(["suggest.py"], closure_fn=broken),
+                         (["suggest.py"], ["suggest.py"]))
+        self.assertEqual(o._bots_hit(["pc_orchestrator.py"], closure_fn=broken), ([], []))
+        with self.assertLogs(o.log, level="WARNING") as cm:
+            o._bots_gap_said.clear()
+            o._bots_hit(["suggest.py"], closure_fn=broken)
+        self.assertTrue([s for s in cm.output if "ЗАПАСНОЙ" in s], cm.output)
+
+    # ── ЧТО НЕ СЛОМАНО: то, что законно проезжало, проезжает ──
+    def test_doki_i_testy_proezzhayut_kak_ranshe(self):
+        """п.4 задания «что не ломать»: коммит, который клиента не касается, обязан проезжать и
+        после. На корпусе 200 коммитов перестал останавливаться НИ ОДИН; здесь — замок на классе,
+        который даёт большинство таких коммитов."""
+        for changed in (["README.md"], ["docs/artifacts/2026-09-07-x.md"],
+                        ["test_suggest.py", "docs/ENV_PLAYBOOK.md"], []):
+            self.assertEqual(o._bots_hit(changed), ([], []), changed)
+            self.assertEqual(self._upd(changed), "", changed)
+        self.assertEqual(self.restarts, [])
+        self.assertEqual(self.cards, [])
 
 
 class TestZamorozkaKontura(TestClientContourGate):

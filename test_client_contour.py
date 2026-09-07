@@ -485,15 +485,44 @@ class TestVorotaVyhoda(GateBase):
         self.assertEqual(len(self.cards), 1)
         self.assertIn("suggest.py", self.cards[0])
 
-    def test_vnutrennii_kommit_primenyaetsya_kak_ranshe(self):
-        """Контроль «не задели вторую половину»: не-клиентский рантайм-файл едет сам.
-        pc_agent.py карта ведёт на процесс pc_agent — рестарт бота не назначается, но и ворот нет."""
+    def test_kommit_v_okrugu_demona_teper_derzhitsya_07_09(self):
+        """ЗАПИСЬ СМЕНЫ 07.09.2026, а не подгонка: коммит в округу демона ворота ДЕРЖАТ.
+
+        Голден звался `test_vnutrennii_kommit_primenyaetsya_kak_ranshe` и требовал `res == ""` со
+        словами «карта на ботов не указывает → прежний путь байт-в-байт». Ровно это и было дырой:
+        `pc_agent.py` лежит в замыкании живых ботов (цепь userbot_listen → moderation_core →
+        ЛЕНИВЫЙ `import pc_orchestrator` → pc_agent), то есть правка доезжает до процесса бота с
+        диска, а ворота о ней не спрашивали вовсе — их вход стоял ЗА картой рестарта.
+
+        Строгость не ослаблена, а поднята: было «проезжает молча», стало «удержано и записано».
+        Красный здесь = ребро исчезло ИЛИ вопрос воротам снова сузили до карты."""
         res = o.maybe_update_bots(1, "тз: правка агента", "old",
                                   changed_fn=lambda h: ["pc_agent.py"],
                                   gate_fn=self.gate_green, restart_fn=self.restart,
                                   head_fn=lambda: "aaaa111", dirty_fn=lambda: [])
-        self.assertEqual(self.cards, [])
-        self.assertEqual(res, "")               # карта на ботов не указывает → прежний путь байт-в-байт
+        self.assertEqual(self.restarts, [])
+        self.assertIn("ОСТАНОВЛЕНО воротами клиентского контура", res)
+        self.assertIn("pc_agent.py", res)
+        # Отказ не молчит: строка идёт в журнал. Карточки здесь нет и быть не может — метка
+        # «aaaa111» в репозитории не резолвится, и `_gate_commit_known` карточку не собирает
+        # (правило 05.09: не спрашивать владельца про несуществующий коммит). Ворот это не
+        # касается — они уже отказали, и `res` выше это говорит.
+        self.assertTrue([c for c in self.cowork if "ОСТАНОВЛЕНО" in c and "pc_agent.py" in c],
+                        "отказ ворот обязан лечь строкой в журнал: %s" % self.cowork)
+
+    def test_stroka_otkaza_ne_utverzhdaet_chto_kartochka_ushla(self):
+        """Рапорт не смеет обещать карточку, которой под заморозкой не бывает (07.09.2026).
+
+        Адрес отказа выбирает `gate_route`, и под заморозкой он ВСЕГДА лента. Строка «владельцу
+        отправлена карточка» врала и до правки, но правка делает отказ частым (14 → 47 остановок
+        на корпусе 200), а рапорт о неотправленной карточке — молчаливый ложный зелёный."""
+        res = o.maybe_update_bots(1, "тз: поправь детект", "old",
+                                  changed_fn=lambda h: ["suggest.py"],
+                                  gate_fn=self.gate_green, restart_fn=self.restart,
+                                  head_fn=lambda: "4528917", dirty_fn=lambda: [])
+        self.assertIn("ОСТАНОВЛЕНО воротами клиентского контура", res)
+        self.assertNotIn("карточка", res)
+        self.assertIn("отказ записан воротами", res)
 
     def test_fail_closed_priznak_upal(self):
         """Признак кинул исключение → файл считаем клиентским, применения нет."""
@@ -560,17 +589,32 @@ class TestVorotaVyhoda(GateBase):
         self.assertEqual(sorted(self.restarts), ["moderbot", "userbot"])
         self.assertEqual(o._last_child_commit, "4528917456789")
 
-    def test_rekonsilyaciya_vnutrennego_edet_kak_ranshe(self):
-        """ВНУТРЕННИЙ контур не задет: pc_agent.py в диффе → прежняя пометка, ворота молчат."""
+    def test_rekonsilyaciya_derzhit_okrugu_demona_i_ne_teryaet_pometku_07_09(self):
+        """ЗАПИСЬ СМЕНЫ 07.09.2026: тик реконсиляции ДЕРЖИТ коммит в округу демона, а пометка
+        агента при этом НЕ ТЕРЯЕТСЯ — она едет той же строкой отказа.
+
+        Голден звался `test_rekonsilyaciya_vnutrennego_edet_kak_ranshe` и требовал, чтобы метка
+        ушла вперёд, а ворота промолчали. Это и была дыра достижимости: вход в ворота стоял ЗА
+        картой рестарта, карта про `pc_agent.py` знает только процесс `pc_agent` — и коммит
+        проезжал мимо вопроса.
+
+        Почему пометка едет строкой отказа, а не громким каналом: удержанный коммит НЕ двигает
+        метку, тик приходит каждые 60 с, и `_cowork`/`_notify` дали бы спам без единого нового
+        факта (дедуп есть у ворот, у пометки его нет). Красный здесь = либо ворота снова
+        пропускают округу демона, либо пометку опять потеряли."""
         o._last_child_commit = "aaaaaaaaaaaa"
         o._child_reconcile_rejected = None
         out = o.reconcile_children_tick(head_fn=lambda: "bbbbbbbbbbbb",
                                         diff_fn=lambda a, b: ["pc_agent.py"],
                                         gate_fn=self.gate_green, restart_fn=self.restart)
-        self.assertIn("ЖДЁТ РУЧНОГО рестарта", out)
-        self.assertEqual(o._last_child_commit, "bbbbbbbbbbbb")   # метка ушла вперёд — прежний путь
-        self.assertEqual([c for c in self.cards if "ворота" in c.lower()], [])
-        self.assertIn("ЖДЁТ РУЧНОГО рестарта", self.cards[0])    # штатная старая пометка на месте
+        self.assertIn("ОСТАНОВЛЕНО", out)
+        self.assertIn("pc_agent.py", out)
+        self.assertIn("ждёт РУЧНОГО рестарта", out)              # пометка не потеряна
+        self.assertEqual(self.restarts, [])
+        self.assertEqual(o._last_child_commit, "aaaaaaaaaaaa")   # метка НЕ ушла — коммит удержан
+        self.assertIsNone(o._child_reconcile_rejected)           # не «отвергнут» — ждём решения
+        # Громких каналов пометка НЕ занимает: спама раз в 60 с быть не должно.
+        self.assertEqual([c for c in self.cards if "ЖДЁТ РУЧНОГО" in c], [])
 
     def test_kartochka_ne_povtoryaetsya_kazhdyi_tik(self):
         """Реконсиляция приходит каждые 60 с — карточка обязана уйти РОВНО один раз на коммит+состав."""
