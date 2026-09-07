@@ -604,9 +604,32 @@ class TestPureLayer(unittest.TestCase):
             self.assertNotIn(one, seen, "счётчик пошёл наружу: %s" % one)
 
 
-# ═════════════════════ ИНВАРИАНТ SERIES_COUNTER_UNWIRED ═════════════════════════════════════
-# ХОД ЦЕПИ НЕ ТРОНУТ — числом, а не обещанием. Счётчик построен и НЕ ПОДКЛЮЧЁН: ноль обращений
-# из боевого кода. Проза освобождена по той же границе, что и у судьи (действие, не подстрока).
+# ═════════════════════ ИНВАРИАНТ SERIES_COUNTER_WIRING_IS_NAMED ═════════════════════════════
+# ХОД ЦЕПИ НЕ ТРОНУТ — числом, а не обещанием. Проза освобождена по той же границе, что и у
+# судьи (действие, не подстрока).
+#
+# ЧТО УСТАРЕЛО И ПОЧЕМУ (02.09.2026). Инвариант звался `SERIES_COUNTER_UNWIRED` и требовал НОЛЬ
+# обращений из боевого кода: счётчик был построен и сознательно не подключён (пункт 2 контракта
+# 17.08 — «построить и НЕ ПОДКЛЮЧАТЬ»). 02.09.2026 владелец счётчик ПОДКЛЮЧИЛ: коммиты `8238d91`
+# и `64acb2b` завели сводку контура, и она берёт у счётчика ПРИЗНАК СЛУЖЕБНОГО КОРНЯ
+# (`contour_digest.py:124` — `import series_pc`). Требовать сегодня ноль обращений значит
+# требовать отката решения владельца, а не охранять предмет.
+#
+# ПРЕДМЕТ ОХРАНЫ ТОТ ЖЕ, И СТРОГОСТЬ НЕ СНИЖЕНА. Опасность была не в самом факте вызова, а в том,
+# что счётчик въедет в боевой ход НЕЗАМЕТНО и оттуда — куда попало. Поэтому список мест, которым
+# звать счётчик РАЗРЕШЕНО, назван ПОИМЁННО и коротко; любой другой боевой файл, назвавший
+# счётчик, роняет тест ровно как прежде. Список — это ПЕРЕЧЕНЬ ОСОЗНАННЫХ РЕШЕНИЙ, и пятое имя
+# в нём заводят так же осознанно, как заводили второе.
+_WIRING_ALLOWED = {
+    # 02.09.2026, `8238d91`/`64acb2b`: сводка контура берёт признак служебного корня. Литералом
+    # его набирать нельзя — два экземпляра одной регулярки расходятся молча.
+    "contour_digest.py": "сводка контура: признак служебного корня",
+    # руки сводки: имя счётчика стои́т в осях движения (`AXIS3_PATHS`) — строкой, не импортом.
+    "contour_digest_run.py": "руки сводки: имя файла в осях движения",
+    # демон: имя в СПИСКЕ МОДУЛЕЙ self-update (лист куста `maybe_contour_digest`), строкой.
+    # Импорта счётчика у демона нет и быть не должно — это проверяется отдельно, см. ниже.
+    "pc_orchestrator.py": "self-update: лист import-замыкания сводки",
+}
 
 def prod_sources(repo):
     """Боевые `*.py` В КОРНЕ (не рекурсивно, `test_*.py` не в счёте), ТОЛЬКО ОТСЛЕЖИВАЕМЫЕ git.
@@ -670,18 +693,43 @@ def wiring_findings(src, where="<строка>"):
     return out
 
 
-class TestCounterIsUnwired(unittest.TestCase):
+class TestCounterWiringIsNamed(unittest.TestCase):
     """FAIL-CLOSED: git не ответил или файлов ноль → провал, а не «нарушений нет»."""
 
-    def test_no_prod_module_calls_the_counter(self):
+    def test_only_the_named_places_call_the_counter(self):
+        """Счётчик зовут РОВНО названные места. Новое имя в боевом ходе — красный гейт."""
         files = prod_sources(REPO)
         self.assertIsNotNone(files, "git ls-files не ответил — множество боевых файлов неизвестно")
         self.assertGreater(len(files), 30, "боевых файлов подозрительно мало: %d" % len(files))
-        found = []
+        found = {}
         for path in files:
             with io.open(path, encoding="utf-8") as handle:
-                found.extend(wiring_findings(handle.read(), os.path.basename(path)))
-        self.assertEqual(found, [], "СЧЁТЧИК ПОДКЛЮЧЁН, а заход это запретил: %s" % found)
+                hits = wiring_findings(handle.read(), os.path.basename(path))
+            if hits:
+                found[os.path.basename(path)] = hits
+        stranger = sorted(set(found) - set(_WIRING_ALLOWED))
+        self.assertEqual(stranger, [], "СЧЁТЧИК ВЪЕХАЛ В НЕНАЗВАННОЕ МЕСТО: %s"
+                         % {k: found[k] for k in stranger})
+        # И обратное: место, названное разрешённым, обязано счётчик ДЕЙСТВИТЕЛЬНО звать. Иначе
+        # список тихо превратится в амнистию «на будущее» и перестанет быть перечнем решений.
+        idle = sorted(set(_WIRING_ALLOWED) - set(found))
+        self.assertEqual(idle, [], "имя в списке разрешённых, а вызова нет — список протух: %s"
+                         % idle)
+
+    def test_the_named_list_catches_a_stranger(self):
+        """ОТРИЦАТЕЛЬНЫЙ: подключение из НЕназванного файла ловится и после правки.
+
+        Кормим тем же прибором, каким считает живой тест, — синтетическим боевым файлом. Боевого
+        дерева правка не касается ни байтом."""
+        for name, src in (("прямой импорт", "import series_pc\n"),
+                          ("переименование", "import series_pc as sp\n"),
+                          ("частичный", "from series_pc import fold\n"),
+                          ("динамика строкой", "m = __import__('series_pc')\n")):
+            with self.subTest(name):
+                hits = wiring_findings(src, "userbot_listen.py")
+                self.assertTrue(hits, "подлог «%s» не пойман" % name)
+                self.assertNotIn("userbot_listen.py", _WIRING_ALLOWED,
+                                 "чужак попал в список разрешённых")
 
     def test_the_invariant_catches_an_injected_wiring(self):
         for name, src in [("прямой импорт", "import series_pc\n"),
@@ -692,11 +740,51 @@ class TestCounterIsUnwired(unittest.TestCase):
         self.assertEqual(wiring_findings('"""про series_pc словами"""\nX = 1\n'), [],
                          "проза помечена подключением")
 
-    def test_the_daemon_does_not_carry_the_counter_at_all(self):
-        """Демон не знает о счётчике и на уровне списка модулей самообновления: попади имя в
-        import-замыкание, любая правка счётчика перезапускала бы демона."""
+    def test_the_daemon_names_the_counter_but_never_imports_it(self):
+        """Демон знает имя счётчика РОВНО ОДНИМ способом — строкой в списке модулей self-update.
+
+        ЧТО УСТАРЕЛО. Сторож требовал, чтобы имени счётчика в демоне не было ВООБЩЕ («попади имя
+        в import-замыкание, любая правка счётчика перезапускала бы демона»). 02.09.2026 сводка
+        контура поехала ленивым `import contour_digest_run` из `maybe_contour_digest`, и её лист
+        `series_pc.py` обязан стоять в списке self-update — иначе демон крутил бы старый код
+        сводки. Перезапуск на правку счётчика стал ЗАКОННОЙ ценой подключения, и её платит
+        владелец, а не молчание.
+
+        ПРЕДМЕТ ОХРАНЫ ЖИВ И СТРОЖЕ: имя разрешено ровно как ДАННЫЕ (строковый литерал в списке),
+        а вот ИМПОРТА счётчика демоном по-прежнему быть не должно ни одного — иначе счётчик въехал
+        бы в память живого демона и стал бы частью его хода, а не листом чужого куста."""
         with io.open(os.path.join(REPO, "pc_orchestrator.py"), encoding="utf-8") as handle:
-            self.assertNotIn(MODULE, handle.read(), "имя счётчика просочилось в демона")
+            text = handle.read()
+        tree = ast.parse(text)
+        prose = docstring_nodes(tree)
+        imports, names, literals = [], [], []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and id(node) in prose:
+                continue
+            if isinstance(node, ast.Import):
+                imports.extend(node.lineno for a in node.names
+                               if a.name.split(".")[0] == MODULE)
+            elif isinstance(node, ast.ImportFrom):
+                if (node.module or "").split(".")[0] == MODULE:
+                    imports.append(node.lineno)
+            elif isinstance(node, ast.Name) and node.id == MODULE:
+                names.append(node.lineno)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                    and MODULE in node.value:
+                literals.append((node.lineno, node.value))
+        self.assertEqual(imports, [], "демон ИМПОРТИРУЕТ счётчик: строки %s" % imports)
+        self.assertEqual(names, [], "имя счётчика стои́т в коде демона: строки %s" % names)
+        self.assertEqual([v for _l, v in literals], [MODULE + ".py"],
+                         "имя счётчика в демоне не только строкой списка self-update: %s"
+                         % literals)
+
+    def test_the_daemon_check_catches_a_real_import(self):
+        """ОТРИЦАТЕЛЬНЫЙ: настоящий импорт счётчика демоном обязан ловиться, строка — нет."""
+        self.assertTrue(wiring_findings("import series_pc\n", "pc_orchestrator.py"))
+        self.assertTrue(wiring_findings("from series_pc import fold\n", "pc_orchestrator.py"))
+        self.assertEqual(wiring_findings('"""лист куста series_pc.py"""\nX = 1\n',
+                                         "pc_orchestrator.py"), [],
+                         "проза о счётчике помечена подключением")
 
     def test_the_counter_does_not_name_the_judge_in_live_code(self):
         """Судья лежит НЕ ПОДКЛЮЧЁННЫМ. Счётчик объясняет родство правила ПРОЗОЙ (это законно и

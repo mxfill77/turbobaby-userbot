@@ -2665,9 +2665,32 @@ class TestO6Hands(unittest.TestCase):
         # (голос подъёма мимо ворот), и за ней транзитивно `client_contour` — тот же признак,
         # которым судят ворота. Тест сработал ровно так, как задуман: не протух молча, а
         # заставил пересчитать. Числа таблицы О6 в шапке expectations_pc.py обновлены там же.
+        # 06.09.2026: замыкание агента 7 → 8. Опять ОДНОЙ строкой — `import decision_waits`
+        # (`pc_agent.py:58`, коммит `aa0de0e` «Открытые решения владельца не теряются в ночь»).
+        # Растяжка сработала второй раз тем же способом: карта `_FILE_PROCESS_RULES` про
+        # `decision_waits.py` не знает ни одним правилом, то есть отставание карты выросло с
+        # 5 файлов до 6 — и это ровно тот факт, ради которого О6 считает ЗАМЫКАНИЕ, а не карту.
+        # Числа таблицы О6 в шапке expectations_pc.py пересчитаны там же (7→8, 5→6).
         self.assertEqual(sorted(cl.files),
-                         ["client_contour.py", "deploy_voice.py", "io_utf8.py", "log_setup.py",
-                          "pc_agent.py", "proc_identity.py", "selfupdate_gate.py"])
+                         ["client_contour.py", "decision_waits.py", "deploy_voice.py",
+                          "io_utf8.py", "log_setup.py", "pc_agent.py", "proc_identity.py",
+                          "selfupdate_gate.py"])
+
+    def test_the_live_closure_check_catches_a_moved_tree(self):
+        """ОТРИЦАТЕЛЬНЫЙ: растяжка обязана краснеть на ЛЮБОМ сдвиге замыкания и после пересчёта.
+
+        Кормим тем же прибором (`client_contour.closure`), но с ДРУГОЙ входной точкой — замыкание
+        обязано отличаться от списка агента. Сравнение остаётся посписочным и полным: и лишний
+        файл, и пропавший роняют его одинаково."""
+        import client_contour as cc
+        agent = sorted(cc.closure(REPO, entries=("pc_agent.py",), cut=()).files)
+        for name, moved in (("лишний файл", agent + ["чужой.py"]),
+                            ("пропавший файл", agent[:-1]),
+                            ("другая входная точка",
+                             sorted(cc.closure(REPO, entries=("pc_orchestrator.py",),
+                                               cut=()).files))):
+            with self.subTest(name):
+                self.assertNotEqual(agent, moved, "сдвиг «%s» не пойман" % name)
 
     def test_the_run_says_it_every_single_pass(self):
         """п.3 задания: расхождение говорится КАЖДЫЙ виток, пока живо, — и попадает в состояние

@@ -1,5 +1,9 @@
 {
   "files": {
+    "anonymize_corpus_stable.py": {
+      "points": 3,
+      "readers": 3
+    },
     "booking_draft.py": {
       "points": 19,
       "readers": 15
@@ -24,25 +28,69 @@
       "points": 6,
       "readers": 3
     },
+    "card_terminal_log.py": {
+      "points": 27,
+      "readers": 10
+    },
     "chain_plan_read.py": {
       "points": 3,
       "readers": 1
     },
+    "chatlog_find.py": {
+      "points": 4,
+      "readers": 3
+    },
+    "chatlog_ingest.py": {
+      "points": 5,
+      "readers": 4
+    },
+    "chatlog_store.py": {
+      "points": 20,
+      "readers": 15
+    },
     "client_contour.py": {
-      "points": 16,
-      "readers": 12
+      "points": 29,
+      "readers": 20
+    },
+    "close_msg_pc.py": {
+      "points": 33,
+      "readers": 15
     },
     "collect_booking.py": {
       "points": 2,
       "readers": 2
     },
+    "content_product_verifier.py": {
+      "points": 2,
+      "readers": 2
+    },
+    "contour_digest.py": {
+      "points": 50,
+      "readers": 23
+    },
+    "contour_digest_run.py": {
+      "points": 18,
+      "readers": 12
+    },
     "cowork_log_append.py": {
       "points": 11,
       "readers": 9
     },
+    "decision_waits.py": {
+      "points": 32,
+      "readers": 12
+    },
     "delivery.py": {
       "points": 5,
       "readers": 4
+    },
+    "deploy_voice.py": {
+      "points": 22,
+      "readers": 11
+    },
+    "deps_registry_check.py": {
+      "points": 5,
+      "readers": 3
     },
     "diag_smoke_274.py": {
       "points": 1,
@@ -53,8 +101,20 @@
       "readers": 2
     },
     "dispatch_notify.py": {
-      "points": 34,
-      "readers": 13
+      "points": 46,
+      "readers": 20
+    },
+    "done_judge_pc.py": {
+      "points": 14,
+      "readers": 8
+    },
+    "expectations_pc.py": {
+      "points": 93,
+      "readers": 33
+    },
+    "expectations_pc_run.py": {
+      "points": 37,
+      "readers": 11
     },
     "fetch_client_chats.py": {
       "points": 3,
@@ -68,9 +128,21 @@
       "points": 4,
       "readers": 3
     },
+    "git_serial_pc.py": {
+      "points": 8,
+      "readers": 7
+    },
     "io_utf8.py": {
       "points": 1,
       "readers": 1
+    },
+    "lesson_migrate_book.py": {
+      "points": 1,
+      "readers": 1
+    },
+    "lesson_regress.py": {
+      "points": 42,
+      "readers": 22
     },
     "lesson_router.py": {
       "points": 49,
@@ -84,6 +156,14 @@
       "points": 16,
       "readers": 8
     },
+    "mark_vs_address_pc.py": {
+      "points": 7,
+      "readers": 2
+    },
+    "model_name.py": {
+      "points": 10,
+      "readers": 6
+    },
     "moderation_core.py": {
       "points": 21,
       "readers": 15
@@ -92,29 +172,125 @@
       "points": 3,
       "readers": 2
     },
+    "noprice_gate.py": {
+      "points": 2,
+      "readers": 2
+    },
     "pc_agent.py": {
-      "points": 17,
-      "readers": 12
+      "points": 24,
+      "readers": 15
     },
     "pc_orchestrator.py": {
-      "points": 320,
-      "readers": 164
+      "points": 411,
+      "readers": 211
     },
     "pretool_guard.py": {
-      "points": 145,
-      "readers": 97
+      "points": 160,
+      "readers": 106
+    },
+    "price_revouch.py": {
+      "points": 7,
+      "readers": 2
+    },
+    "price_snapshot_collect.py": {
+      "points": 4,
+      "readers": 4
+    },
+    "price_snapshot_publish.py": {
+      "points": 2,
+      "readers": 2
+    },
+    "price_source.py": {
+      "points": 13,
+      "readers": 7
     },
     "pricing.py": {
       "points": 9,
       "readers": 5
     },
+    "pricing_advisor.py": {
+      "points": 1,
+      "readers": 1
+    },
+    "proc_bytes.py": {
+      "points": 22,
+      "readers": 12
+    },
+    "proc_identity.py": {
+      "points": 6,
+      "readers": 6
+    },
+    "queue_snapshot_pc.py": {
+      "points": 2,
+      "readers": 2
+    },
     "rc_supervisor.py": {
       "points": 10,
       "readers": 8
     },
+    "recon_auto.py": {
+      "points": 51,
+      "readers": 15
+    },
+    "recon_auto_run.py": {
+      "points": 22,
+      "readers": 10
+    },
     "recon_servicing.py": {
       "points": 2,
       "readers": 1
+    },
+    "result_spill.py": {
+      "points": 5,
+      "readers": 5
+    },
+    "review_audit.py": {
+      "points": 52,
+      "readers": 17
+    },
+    "review_audit_run.py": {
+      "points": 23,
+      "readers": 7
+    },
+    "review_auto.py": {
+      "points": 52,
+      "readers": 23
+    },
+    "review_auto_run.py": {
+      "points": 17,
+      "readers": 9
+    },
+    "review_intake.py": {
+      "points": 54,
+      "readers": 27
+    },
+    "review_intake_run.py": {
+      "points": 16,
+      "readers": 11
+    },
+    "review_outbox_queue.py": {
+      "points": 21,
+      "readers": 9
+    },
+    "review_outbox_queue_run.py": {
+      "points": 31,
+      "readers": 10
+    },
+    "review_pack.py": {
+      "points": 2,
+      "readers": 2
+    },
+    "review_pack_build.py": {
+      "points": 1,
+      "readers": 1
+    },
+    "review_send.py": {
+      "points": 8,
+      "readers": 7
+    },
+    "review_send_run.py": {
+      "points": 4,
+      "readers": 4
     },
     "reviewer.py": {
       "points": 5,
@@ -124,6 +300,10 @@
       "points": 8,
       "readers": 1
     },
+    "season_gate.py": {
+      "points": 2,
+      "readers": 2
+    },
     "selfupdate_gate.py": {
       "points": 2,
       "readers": 1
@@ -132,35 +312,79 @@
       "points": 29,
       "readers": 14
     },
+    "shtab_box.py": {
+      "points": 40,
+      "readers": 17
+    },
+    "shtab_box_accept.py": {
+      "points": 17,
+      "readers": 13
+    },
+    "shtab_box_run.py": {
+      "points": 67,
+      "readers": 18
+    },
+    "shtab_box_signals.py": {
+      "points": 76,
+      "readers": 33
+    },
+    "srv_delivery.py": {
+      "points": 10,
+      "readers": 7
+    },
     "task_metrics.py": {
       "points": 9,
       "readers": 5
     },
+    "threshold_ledger.py": {
+      "points": 1,
+      "readers": 1
+    },
     "trainer.py": {
-      "points": 35,
-      "readers": 29
+      "points": 77,
+      "readers": 49
     },
     "trainer_log.py": {
       "points": 15,
       "readers": 13
     },
+    "trainer_pin.py": {
+      "points": 12,
+      "readers": 7
+    },
     "trainer_run.py": {
-      "points": 18,
-      "readers": 11
+      "points": 67,
+      "readers": 26
+    },
+    "vitrina_pc.py": {
+      "points": 26,
+      "readers": 15
+    },
+    "vitrina_pc_run.py": {
+      "points": 28,
+      "readers": 14
+    },
+    "zayavki_pc.py": {
+      "points": 54,
+      "readers": 20
+    },
+    "zayavki_pc_run.py": {
+      "points": 37,
+      "readers": 16
     }
   },
-  "measured": "2026-08-08",
+  "measured": "2026-09-07",
   "method": "nonparse_scan/swallow,or_empty,guard_empty",
   "scope": "*.py корня репо, без test_*.py и без userbot_listen.py,moderation_bot.py,suggest.py",
   "signatures": {
-    "guard_empty": 1,
-    "or_empty": 674,
-    "swallow": 170
+    "guard_empty": 4,
+    "or_empty": 1962,
+    "swallow": 329
   },
   "totals": {
-    "files": 46,
-    "points": 845,
-    "readers": 503,
-    "readers_all": 1094
+    "files": 118,
+    "points": 2295,
+    "readers": 1173,
+    "readers_all": 2991
   }
 }

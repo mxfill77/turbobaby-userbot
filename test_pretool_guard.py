@@ -1283,6 +1283,36 @@ class TestTechnicalCardsNarrowed(unittest.TestCase):
 
 _CL = "cla" + "sp"        # как _CLASP выше: файл теста не должен краснеть на скане самого гарда
 
+# ── ЗЕРКАЛО ПУТЕЙ ГАРДА В ПРАВИЛАХ РАЗРЕШЕНИЙ ────────────────────────────────────────────────
+# Функцией, а не телом теста: на ней стои́т и живая сверка, и ОТРИЦАТЕЛЬНЫЙ тест (подлог кормится
+# синтетическим списком, боевой файл настроек при этом не трогается ни байтом).
+# ГЛАГОЛ РОВНО ОДИН — `Edit(`. Движок разрешений сверяет `Edit(путь)` и НЕ смотрит `Write(путь)`
+# вовсе (замер Dispatch 22.08.2026); владелец на этом основании перевёл все 12 записей
+# `Write(путь)` в `Edit(путь)` — коммит `1a21072` от 23.08.2026, пути в скобках не менялись.
+
+def _to_rule(win_path):
+    """`D:\\turbobaby-bot\\x.py` → `//d/turbobaby-bot/x.py` (обратное `_from_rule`)."""
+    p = win_path.replace("\\", "/")
+    if len(p) > 1 and p[1] == ":":
+        p = "//" + p[0].lower() + p[2:]
+    return p
+
+
+def _from_rule(rule):
+    """`Edit(//d/x/y.py)` → нормализованный путь Windows (или "" — правило без скобок)."""
+    if "(" not in rule or not rule.endswith(")"):
+        return ""
+    inner = rule[rule.index("(") + 1:-1]
+    if inner.startswith("//") and len(inner) > 3:
+        inner = inner[2] + ":" + inner[3:]             # //d/x → d:/x
+    return os.path.normcase(os.path.normpath(inner))
+
+
+def _mirror_gap(allow, sources, tool="Edit"):
+    """Пути `sources`, которых НЕТ в правилах `allow` под глаголом `tool`. Пусто = зеркало целое."""
+    listed = {_from_rule(r) for r in allow if r.startswith(tool + "(")}
+    return [s for s in sources if os.path.normcase(os.path.normpath(s)) not in listed]
+
 
 class TestClaspSplitBySubcommand(unittest.TestCase):
     """ГОЛДЕНЫ развода clasp по ПОДКОМАНДЕ (29.07). За сутки clasp дал 10 карточек, из них 6 —
@@ -1764,22 +1794,37 @@ class TestGuardSourcesWriteIsNotExecution(unittest.TestCase):
 
     def test_guard_sources_mirrored_in_settings(self):
         """Список виден В ПРАВИЛАХ, а не только в коде: хук решает ПОВЕРХ слоя настроек, зелёными
-        обязаны быть ОБА. Тест сторожит расхождение двух списков."""
+        обязаны быть ОБА. Тест сторожит расхождение двух списков.
+
+        ГЛАГОЛ ЗЕРКАЛА — `Edit(`, И ЭТО РЕШЕНИЕ ВЛАДЕЛЬЦА, А НЕ ПОСЛАБЛЕНИЕ (22–23.08.2026).
+        Сторож требовал зеркала В ДВУХ глаголах — `Edit(путь)` И `Write(путь)`. Правка Dispatch
+        22.08 (закоммичена `1a21072` 23.08) перевела ВСЕ 12 записей `Write(путь)` в `Edit(путь)`,
+        опираясь на замер «движок сверяет только `Edit(путь)`, `Write(путь)` не смотрит вовсе»:
+        multiset путей в скобках совпал байт в байт, изменился ровно глагол. Требовать сегодня
+        `Write(`-зеркала значит требовать правила, которое движок не читает ни одной веткой, —
+        сторож охранял бы слово, а не предмет. Предмет прежний и проверяется в полную силу: КАЖДЫЙ
+        путь `_GUARD_SOURCES` обязан стоять в `permissions.allow` (ловится `_mirror_gap`)."""
         import json as _json
         with io.open(os.path.join(PROJ, ".claude", "settings.json"), encoding="utf-8") as f:
             allow = _json.load(f)["permissions"]["allow"]
+        gap = _mirror_gap(allow, g._GUARD_SOURCES)
+        self.assertEqual(gap, [], "путь гарда не виден в правилах разрешений: %s" % gap)
 
-        def to_win(rule):
-            inner = rule[rule.index("(") + 1:-1]           # Edit(//d/x/y.py) → //d/x/y.py
-            if inner.startswith("//") and len(inner) > 3:
-                inner = inner[2] + ":" + inner[3:]         # //d/x → d:/x
-            return os.path.normcase(os.path.normpath(inner))
+    def test_the_mirror_check_catches_a_missing_rule(self):
+        """ОТРИЦАТЕЛЬНЫЙ: сторож обязан ловить пропажу правила и после смены глагола.
 
-        for tool in ("Edit", "Write"):
-            listed = {to_win(r) for r in allow if r.startswith(tool + "(")}
-            for src in g._GUARD_SOURCES:
-                with self.subTest(tool=tool, src=src):
-                    self.assertIn(os.path.normcase(os.path.normpath(src)), listed)
+        Три подлога, каждый — способ тихо вынуть путь из слоя настроек: правило убрали совсем;
+        правило осталось, но под глаголом, которого движок не читает (`Write(`); путь подменён
+        соседом с тем же именем в другом дереве."""
+        full = ["Edit(%s)" % _to_rule(p) for p in g._GUARD_SOURCES]
+        self.assertEqual(_mirror_gap(full, g._GUARD_SOURCES), [], "полное зеркало не признано")
+        self.assertEqual(len(_mirror_gap(full[:-1], g._GUARD_SOURCES)), 1, "пропажа не поймана")
+        write_only = ["Write(%s)" % _to_rule(p) for p in g._GUARD_SOURCES]
+        self.assertEqual(len(_mirror_gap(write_only, g._GUARD_SOURCES)), len(g._GUARD_SOURCES),
+                         "правило под нечитаемым глаголом зачтено за зеркало")
+        foreign = ["Edit(//c/other/%s)" % os.path.basename(p) for p in g._GUARD_SOURCES]
+        self.assertEqual(len(_mirror_gap(foreign, g._GUARD_SOURCES)), len(g._GUARD_SOURCES),
+                         "тёзка из чужого дерева зачтён за путь гарда")
 
     def test_deny_and_bypass_untouched(self):
         import json as _json
@@ -1863,12 +1908,47 @@ class TestLiveSettingsAfterClaspSplit(unittest.TestCase):
         self.assertNotEqual(p.get("defaultMode"), "bypassPermissions")
         self.assertNotIn("bypassPermissions", json.dumps(p))
 
+    @staticmethod
+    def _verb_canon(rules):
+        """`Write(путь)` → `Edit(путь)`. ТА ЖЕ канонизация, которую владелец применил к боевому
+        файлу 22.08.2026 (коммит `1a21072` 23.08): движок сверяет только `Edit(путь)`, поэтому
+        12 записей сменили ГЛАГОЛ, а пути в скобках остались байт в байт теми же."""
+        return [("Edit(" + r[len("Write("):]) if r.startswith("Write(") else r for r in rules]
+
     def test_live_matches_staged_once_applied(self):
+        """Боевой файл = замороженный артефакт 29.07 ПОСЛЕ канонизации глагола, и ничего сверх.
+
+        ЧТО УСТАРЕЛО И ПОЧЕМУ. Сторож требовал ДОСЛОВНОГО равенства с артефактом 29.07. 22.08
+        владелец перевёл `Write(путь)` в `Edit(путь)` — правило, которого движок не читает, в
+        правило, которое читает; артефакт заморожен и глагол в нём остался прежним. Требовать
+        дословного равенства значит требовать отката решения владельца. Строгость НЕ снижена:
+        сравнение по-прежнему ПОЛНОЕ и по спискам целиком — любое ДРУГОЕ расхождение (новое
+        правило, пропавший `ask`, изменённый путь, переставленный порядок) роняет тест, что и
+        показывает `test_the_staged_comparison_still_catches_any_other_drift`."""
         live = self._perms(self.LIVE)
         if "Bash(" + _CL + " *)" in live["ask"]:
             self.skipTest("settings ещё не применён владельцем (общее правило clasp на месте)")
-        self.assertEqual(live["allow"], self._perms(self.STAGED)["allow"])
-        self.assertEqual(live["ask"], self._perms(self.STAGED)["ask"])
+        staged = self._perms(self.STAGED)
+        self.assertEqual(self._verb_canon(live["allow"]), self._verb_canon(staged["allow"]))
+        self.assertEqual(self._verb_canon(live["ask"]), self._verb_canon(staged["ask"]))
+
+    def test_the_staged_comparison_still_catches_any_other_drift(self):
+        """ОТРИЦАТЕЛЬНЫЙ: канонизация глагола снимает РОВНО глагол и ничего больше.
+
+        Четыре подлога на синтетических списках (боевой файл не трогается): лишнее правило,
+        пропавшее правило, подменённый путь, переставленный порядок."""
+        base = ["Edit(//d/turbobaby-bot/**)", "Write(//d/turbobaby-bot/**)", "Bash(git status)"]
+        canon = self._verb_canon
+        self.assertEqual(canon(base), ["Edit(//d/turbobaby-bot/**)", "Edit(//d/turbobaby-bot/**)",
+                                       "Bash(git status)"], "глагол не канонизирован")
+        for name, other in (("лишнее правило", base + ["Bash(rm -rf *)"]),
+                            ("пропавшее правило", base[:-1]),
+                            ("подменённый путь", ["Edit(//d/other/**)"] + base[1:]),
+                            ("переставленный порядок", list(reversed(base)))):
+            with self.subTest(name):
+                self.assertNotEqual(canon(base), canon(other), "подлог «%s» не пойман" % name)
+        # И обратное: канонизация НЕ склеивает разные пути под одним глаголом.
+        self.assertNotEqual(canon(["Write(//d/a)"]), canon(["Write(//d/b)"]))
 
 
 _DOT_ENV = "." + "env"      # имя секрета собираем из кусков: сам файл теста читает гард

@@ -90,13 +90,31 @@ class TestLiveTree(unittest.TestCase):
         self.assertEqual(tl.OK, rows["HORIZON_LATENCY_DAYS"]["state"])
 
     def test_uncovered_is_named_by_number_and_the_number_is_true(self):
-        """Молчаливого усечения нет: непокрытое названо ЧИСЛОМ, и число сверено с деревом."""
+        """Молчаливого усечения нет: непокрытое названо ЧИСЛОМ, и число сверено с деревом.
+
+        РАСТЯЖКА, А НЕ КОНСТАНТА: 06.09 замер дал 71, 07.09 тем же прибором — 79 (кандидатов
+        73 → 81, покрыто поимённо те же два). Число в модуле пересчитано, а не подогнано; сам
+        механизм не тронут ни строкой, что и показывает отрицательный тест ниже."""
         text = _live("pc_orchestrator.py")
         named = set(tl.COVERED_NAMES["pc_orchestrator.py"])
         outside = len([c for c in tl.scan_text(text) if c[0] not in named])
         self.assertEqual(tl.UNCOVERED["pc_orchestrator.py"], outside,
                          "число вне охвата разъехалось с деревом — поправь UNCOVERED")
         self.assertIn(str(outside), tl.UNCOVERED_NOTE)
+
+    def test_the_uncovered_count_catches_a_new_threshold(self):
+        """ОТРИЦАТЕЛЬНЫЙ: новый порог в непокрытом файле обязан двигать число и после пересчёта.
+
+        Кормим тем же прибором (`scan_text`) синтетическим текстом — боевой файл не трогается."""
+        base = "X_TIMEOUT = 900\n"
+        one = len(tl.scan_text(base))
+        self.assertEqual(one, 1, "прибор не увидел даже одного порога")
+        self.assertEqual(len(tl.scan_text(base + "Y_BUDGET = 30\n")), one + 1,
+                         "новый порог не изменил счёт — растяжка ослепла")
+        # Поимённое покрытие вычитается ровно по имени, а не по похожести.
+        cands = tl.scan_text(base + "Y_BUDGET = 30\n")
+        self.assertEqual(len([c for c in cands if c[0] not in {"X_TIMEOUT"}]), one,
+                         "вычитание покрытого имени работает не по имени")
 
     def test_ratchet_of_thresholds_without_measurement(self):
         """ХРАПОВИК. «Замера нет» — законный исход, и потому в него можно СБЕЖАТЬ. Замок один:

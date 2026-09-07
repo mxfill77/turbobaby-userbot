@@ -261,10 +261,76 @@ class TestPipelineNeRazoshelsya(unittest.TestCase):
             "раннер разошёлся с боевым _trainer_generate: живой %s ≠ раннер %s. Вердикт тренажёра "
             "перестал удостоверять то, что увидит владелец в группе." % (live, mine))
 
-    def test_raner_ne_v_klientskom_konture(self):
-        """Раннер и корпус НЕ должны попасть в замыкание ботов — иначе он сам упрётся в ворота."""
-        self.assertFalse(cc.is_client("trainer_run.py", REPO))
-        self.assertFalse(cc.is_client("trainer_cases.json", REPO))
+    @staticmethod
+    def _importers_of(stem, files, repo=None):
+        """Файлы замыкания, ИМПОРТИРУЮЩИЕ модуль `stem` (ast, а не подстрока). → sorted список."""
+        repo = REPO if repo is None else repo
+        out = []
+        for name in sorted(files):
+            try:
+                with io.open(os.path.join(repo, name), encoding="utf-8") as f:
+                    tree = ast.parse(f.read(), filename=name)
+            except (OSError, SyntaxError):
+                out.append(name + " (НЕ РАЗОБРАН)")     # fail-closed: незнание ≠ «не импортирует»
+                continue
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Import) and any(
+                        a.name.split(".")[0] == stem for a in n.names):
+                    out.append(name)
+                    break
+                if isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == stem:
+                    out.append(name)
+                    break
+        return out
+
+    def test_raner_v_konture_rovno_odnim_nazvannym_rebrom(self):
+        """Прогонщик В замыкании ботов, и попал он туда РОВНО ОДНИМ названным ребром.
+
+        ЧТО УСТАРЕЛО И ПОЧЕМУ. Сторож требовал, чтобы прогонщик и корпус в замыкание ботов НЕ
+        попадали вовсе («иначе он сам упрётся в ворота»). 05.09.2026 владелец завёл РЕГРЕССИЮ
+        УРОКА (`a42c8ee`, задача 231): после записанного урока корпус прогоняется и говорит исход.
+        Дорога — `trainer.py:1366` → `lesson_regress` → `lesson_regress.py:297` `import trainer_run`,
+        и этим одним ребром прогонщик въехал в замыкание, а за ним корпус (`trainer_cases.json`
+        назван литералом `client_contour.py:319`, а сам `client_contour` приехал импортом из
+        прогонщика). Требовать сегодня отсутствия — требовать отката решения владельца.
+
+        ПРЕДМЕТ ОХРАНЫ ЖИВ И НАЗВАН ТОЧНЕЕ ПРЕЖНЕГО. Опасность была не в самом членстве, а в том,
+        что прогонщик прирастёт к боевому рантайму НЕЗАМЕТНО и не одной дорогой. Поэтому ребро
+        закреплено ПОИМЁННО: импортёр прогонщика в замыкании обязан быть ровно один и ровно тот.
+        Второй импортёр — красный гейт в тот же день, что и раньше.
+
+        ЦЕНА НАЗВАНА ВСЛУХ, А НЕ ЗАМАЗАНА: правка `trainer_run.py` и `trainer_cases.json` теперь
+        проходит через ворота клиентского контура (`_client_block`), а контур заморожен решением
+        владельца от 05.09. Статически это верно, фактически — ребро пересекает ГРАНИЦУ ПРОЦЕССА
+        (`lesson_regress.spawn` поднимает отсоединённый `python lesson_regress.py --after-lesson`,
+        а `import trainer_run` живёт внутри `measure()` и в памяти ботов не исполняется никогда).
+        Считать ли `lesson_regress.py` входной точкой ЧУЖОГО процесса (`FOREIGN_ENTRIES`, как
+        `pc_orchestrator.py` и `pc_agent.py`) — решение о ВОРОТАХ и владельца, не этого теста;
+        здесь ворота не тронуты ни строкой."""
+        cl = cc.closure(REPO)
+        self.assertTrue(cl.ok, cl.reason)
+        self.assertTrue(cc.is_client("trainer_run.py", REPO), "прогонщик выпал из замыкания — "
+                        "ребро регрессии урока исчезло, а тест об этом не знает")
+        self.assertEqual(self._importers_of("trainer_run", cl.files), ["lesson_regress.py"],
+                         "прогонщик тащат в контур НЕ ОДНИМ названным ребром")
+        self.assertTrue(cc.is_client("trainer_cases.json", REPO))
+
+    def test_edge_check_catches_a_second_importer(self):
+        """ОТРИЦАТЕЛЬНЫЙ: второй импортёр прогонщика ловится, а проза о нём — нет.
+
+        Прибор кормится синтетическим деревом во временном каталоге: боевые файлы не трогаются."""
+        with tempfile.TemporaryDirectory() as d:
+            names = {"чистый.py": "X = 1\n",
+                     "проза.py": '"""словами про trainer_run и корпус"""\nY = 2\n',
+                     "подлог.py": "import trainer_run\n",
+                     "подлог2.py": "from trainer_run import run_corpus\n",
+                     "битый.py": "def (\n"}
+            for name, src in names.items():
+                with io.open(os.path.join(d, name), "w", encoding="utf-8") as f:
+                    f.write(src)
+            got = self._importers_of("trainer_run", list(names), repo=d)
+        self.assertEqual(got, ["битый.py (НЕ РАЗОБРАН)", "подлог.py", "подлог2.py"],
+                         "подлог не пойман либо проза принята за импорт: %s" % got)
 
     def test_raner_ne_trogaet_zhivoi_userbot(self):
         """Ни Telethon, ни singleton-лока, ни отправки: прогон не может задеть боевой процесс.
