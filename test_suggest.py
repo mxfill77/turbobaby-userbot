@@ -9180,10 +9180,33 @@ class TestGuardExperienceMention(unittest.TestCase):
 
 
 class TestSuggestCredentialContainment(unittest.TestCase):
+    """ЗАМОК ПЕЧАТИ (10.09.2026, класс КЛЮЧ-В-ВЫВОДЕ-ТЕСТА).
+
+    Проверки этого класса держат в руках ЖИВОЙ ключ из окружения и текст боевого файла —
+    и до 10.09 каждая из трёх сверок при падении печатала предмет спора ДОСЛОВНО:
+    `assertEqual` кладёт обе стороны в сообщение о провале, а сообщение уезжает в вывод
+    прогона, оттуда — в лог захода, в артефакт, в пакет ревьюеру. Красным этот класс уже
+    бывал (шестой красный полного прогона, заход 244), то есть путь не гипотетический.
+
+    Поэтому сравнение и ОТЧЁТ О НЁМ разведены: сравнивается по-прежнему то же самое
+    (equality сторон, пустота списка попаданий, дословность строки привязки), а в сообщение
+    уходит только ПРИЗНАК — пусто/непусто, сколько, в какой строке. Значения нет ни при
+    успехе, ни при падении, ни одним символом.
+
+    Предмет проверки при этом НЕ ослаблен: каждый assert ниже краснеет ровно на тех входах,
+    на которых краснел прежний, — это закреплено отрицательным тестом
+    `TestCredentialContainmentPrintsNoValue`.
+    """
+
     def test_anthropic_key_is_read_only_from_environment(self):
-        self.assertEqual(
-            suggest.ANTHROPIC_API_KEY,
-            os.getenv("ANTHROPIC_API_KEY", "").strip(),
+        live = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        bound = suggest.ANTHROPIC_API_KEY
+        # ФОРМУЛИРОВКА БЕЗ ЗНАЧЕНИЯ: где расхождение — видно, что именно разошлось — нет.
+        self.assertTrue(
+            bound == live,
+            "ANTHROPIC_API_KEY: связанное при импорте и живое окружение разошлись "
+            "(bound_empty={}, live_empty={}); значение не печатаем — класс "
+            "КЛЮЧ-В-ВЫВОДЕ-ТЕСТА".format(not bound, not live),
         )
 
     def test_api_path_fails_before_provider_import_when_key_missing(self):
@@ -9204,17 +9227,144 @@ class TestSuggestCredentialContainment(unittest.TestCase):
     _SECRET_RE = re.compile("s" + "k" + "-" + "[a-z]{2,6}" + "-" + r"[A-Za-z0-9_\-]{16,}")
     _KEY_BIND_RE = re.compile(r"^ANTHROPIC_API_KEY\s*=.*$", re.M)
 
+    _CANON_BIND = 'ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()'
+
     def _suggest_source(self):
         with open(suggest.__file__, encoding="utf-8") as f:
             return f.read()
 
+    @staticmethod
+    def _hit_lines(rx, text):
+        """Номера строк попаданий — АДРЕС вместо предмета: то, что нашлось, не возвращаем."""
+        return [i for i, line in enumerate(text.splitlines(), 1) if rx.search(line)]
+
     def test_suggest_source_holds_no_secret_like_literal(self):
-        hits = self._SECRET_RE.findall(self._suggest_source())
-        self.assertEqual(hits, [], "в suggest.py появился литерал, похожий на секрет")
+        src = self._suggest_source()
+        hits = self._SECRET_RE.findall(src)          # сам предмет проверки прежний
+        self.assertEqual(
+            len(hits), 0,
+            "в suggest.py появился литерал, похожий на секрет: {} шт., строки {} "
+            "— значение не печатаем (класс КЛЮЧ-В-ВЫВОДЕ-ТЕСТА), смотреть глазами по "
+            "номеру строки".format(len(hits), self._hit_lines(self._SECRET_RE, src)),
+        )
 
     def test_key_binding_in_source_is_environment_only(self):
-        binds = self._KEY_BIND_RE.findall(self._suggest_source())
-        self.assertEqual(binds, ['ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()'])
+        src = self._suggest_source()
+        binds = self._KEY_BIND_RE.findall(src)       # сам предмет проверки прежний
+        # Строка привязки могла бы нести литерал ключа — поэтому в отчёт идёт только адрес.
+        self.assertTrue(
+            binds == [self._CANON_BIND],
+            "привязка ANTHROPIC_API_KEY в suggest.py не канонична: найдено {} шт. "
+            "в строках {}, каноничных среди них {} — текст строки не печатаем "
+            "(класс КЛЮЧ-В-ВЫВОДЕ-ТЕСТА)".format(
+                len(binds), self._hit_lines(self._KEY_BIND_RE, src),
+                sum(1 for b in binds if b == self._CANON_BIND)),
+        )
+
+
+class TestCredentialContainmentPrintsNoValue(unittest.TestCase):
+    """ОТРИЦАТЕЛЬНЫЙ ТЕСТ ЗАМКА ПЕЧАТИ (10.09.2026, класс КЛЮЧ-В-ВЫВОДЕ-ТЕСТА).
+
+    В закрытый путь НАМЕРЕННО подсовывается значение боевой формы — и проверяется, что оно
+    наружу не выходит: ни целиком, ни куском в 8 символов, ни с головы, ни с хвоста.
+
+    Рядом стои́т КОНТРОЛЬ «при снятой гарантии ответ ДРУГОЙ»: прежняя форма сверки (голый
+    `assertEqual`) на ТОМ ЖЕ входе печатает значение целиком, и тест это показывает. Без
+    контроля зелёный не доказывал бы ничего — он был бы зелёным и у теста, который просто
+    не краснеет. Поэтому здесь же проверено, что закрытый путь на этом входе КРАСНЕЕТ.
+
+    Значение синтетическое и собрано из кусков: непрерывного образца, похожего на секрет,
+    в тексте этого файла не появляется (идиома ТЗ S1 §3.5).
+    """
+
+    NEEDLE = "s" + "k" + "-" + "ant" + "-" + "Zq7w2Er9Ty4Ui1Op6As3Df"
+    CASE = TestSuggestCredentialContainment
+
+    class _OldFormEnv(unittest.TestCase):
+        """ГАРАНТИЯ СНЯТА: как сверка выглядела до 10.09. Вложена сознательно — загрузчик
+        unittest ходит по модулю, а не внутрь классов, и сама по себе она не прогоняется."""
+
+        def runTest(self):
+            self.assertEqual(suggest.ANTHROPIC_API_KEY,
+                             os.getenv("ANTHROPIC_API_KEY", "").strip())
+
+    class _OldFormHits(unittest.TestCase):
+        """ГАРАНТИЯ СНЯТА: прежняя сверка списка попаданий."""
+        SRC = ""
+
+        def runTest(self):
+            hits = TestSuggestCredentialContainment._SECRET_RE.findall(self.SRC)
+            self.assertEqual(hits, [], "в suggest.py появился литерал, похожий на секрет")
+
+    class _OldFormBinds(unittest.TestCase):
+        """ГАРАНТИЯ СНЯТА: прежняя сверка строки привязки."""
+        SRC = ""
+
+        def runTest(self):
+            binds = TestSuggestCredentialContainment._KEY_BIND_RE.findall(self.SRC)
+            self.assertEqual(
+                binds,
+                ['ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()'])
+
+    def _fail_text(self, name, cls=None):
+        """Весь текст, который прогон отдал бы наружу по этому кейсу (пусто = зелёный)."""
+        res = unittest.TestResult()
+        (cls or self.CASE)(name).run(res)
+        return "\n".join(t for _case, t in (res.failures + res.errors))
+
+    def _assert_red_but_mute(self, text):
+        self.assertTrue(text, "вход обязан краснеть — иначе предмет проверки ослаблен")
+        self.assertNotIn(self.NEEDLE, text)
+        self.assertNotIn(self.NEEDLE[:8], text)
+        self.assertNotIn(self.NEEDLE[-8:], text)
+
+    # ── путь 1: расхождение окружения и связанного значения ─────────────────────────────
+    def test_env_mismatch_is_red_and_carries_no_value(self):
+        with mock.patch.object(suggest, "ANTHROPIC_API_KEY", self.NEEDLE), \
+             mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+            self._assert_red_but_mute(
+                self._fail_text("test_anthropic_key_is_read_only_from_environment"))
+
+    def test_env_mismatch_without_the_guarantee_prints_the_value(self):
+        """ТОТ ЖЕ вход, снятая гарантия → ДРУГОЙ ответ: значение уезжает в вывод целиком."""
+        with mock.patch.object(suggest, "ANTHROPIC_API_KEY", self.NEEDLE), \
+             mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+            self.assertIn(self.NEEDLE, self._fail_text("runTest", cls=self._OldFormEnv))
+
+    # ── путь 2: литерал, похожий на секрет, в тексте боевого файла ──────────────────────
+    def test_source_literal_is_red_and_carries_no_value(self):
+        fake = 'x = "' + self.NEEDLE + '"\n'
+        with mock.patch.object(self.CASE, "_suggest_source", lambda _s: fake):
+            text = self._fail_text("test_suggest_source_holds_no_secret_like_literal")
+        self._assert_red_but_mute(text)
+        self.assertIn("строки [1]", text)          # АДРЕС назван, предмет — нет
+
+    def test_source_literal_without_the_guarantee_prints_the_value(self):
+        self._OldFormHits.SRC = 'x = "' + self.NEEDLE + '"\n'
+        try:
+            self.assertIn(self.NEEDLE, self._fail_text("runTest", cls=self._OldFormHits))
+        finally:
+            self._OldFormHits.SRC = ""
+
+    # ── путь 3: строка привязки ключа в тексте боевого файла ────────────────────────────
+    def test_key_binding_is_red_and_carries_no_value(self):
+        fake = 'ANTHROPIC_API_KEY = "' + self.NEEDLE + '"\n'
+        with mock.patch.object(self.CASE, "_suggest_source", lambda _s: fake):
+            text = self._fail_text("test_key_binding_in_source_is_environment_only")
+        self._assert_red_but_mute(text)
+        self.assertIn("строках [1]", text)
+
+    def test_key_binding_without_the_guarantee_prints_the_value(self):
+        self._OldFormBinds.SRC = 'ANTHROPIC_API_KEY = "' + self.NEEDLE + '"\n'
+        try:
+            self.assertIn(self.NEEDLE, self._fail_text("runTest", cls=self._OldFormBinds))
+        finally:
+            self._OldFormBinds.SRC = ""
+
+    # ── предмет проверки не ослаблен: на боевом тексте обе файловые сверки зелёные ──────
+    def test_green_input_stays_green(self):
+        self.assertEqual(self._fail_text("test_suggest_source_holds_no_secret_like_literal"), "")
+        self.assertEqual(self._fail_text("test_key_binding_in_source_is_environment_only"), "")
 
 
 class TestMinTermGuarantee(unittest.TestCase):
