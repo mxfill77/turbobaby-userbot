@@ -119,14 +119,15 @@ class _Base(unittest.TestCase):
         `who=` у перевода обязателен с 09.09.2026: перевод оставляет след из четырёх частей
         (автор, время, номер, откат), и безымянный перевод хранилище отклоняет само."""
         n = LS.add_candidate(question=Q, bot_answer=A, correct=correct, who=who, when=when,
-                             path=self.store)
+                             path=self.store, source=LS.SOURCE_TRAINER)
         res = LS.promote(n, why=why, who=who, path=self.store)
         self.assertTrue(res.ok, res.reason)
         return n
 
     def add_candidate(self, correct="кандидат без причины", who="filipp"):
         return LS.add_candidate(question=Q, bot_answer=A, correct=correct, who=who,
-                                when="2026-09-06T10:00:00Z", path=self.store)
+                                when="2026-09-06T10:00:00Z", path=self.store,
+                                source=LS.SOURCE_TRAINER)   # источник обязателен с 09.09.2026
 
     def cancel(self, n, **kw):
         """Боевой вход команды со всеми путями в песочницу (прибор — шпион)."""

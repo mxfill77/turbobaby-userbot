@@ -69,8 +69,10 @@ class _Base(unittest.TestCase):
         self.store = os.path.join(box.name, "lesson_store.tsv")
 
     def add_live(self, **over):
+        # `source` обязателен с 09.09.2026 (см. `TestSourceIsMandatory`): запись без источника
+        # отказывается, поэтому песочница называет его по умолчанию.
         kw = dict(question=Q_LIVE, bot_answer=BOT_LIVE, correct=RIGHT_LIVE, why=WHY_LIVE,
-                  who=WHO_LIVE, when=WHEN_LIVE, path=self.store)
+                  who=WHO_LIVE, when=WHEN_LIVE, path=self.store, source=LS.SOURCE_TRAINER)
         kw.update(over)
         return LS.add(**kw)
 
@@ -179,7 +181,11 @@ class TestWithdrawKeepsRow(_Base):
                          tuple(before.split("\n")[2].split("\t")[1:6]))
 
     def test_all_other_bytes_untouched(self):
-        """Снятие меняет ТОЛЬКО последнее поле своей строки: остальные строки байт в байт те же."""
+        """Снятие меняет ТОЛЬКО поле состояния своей строки: остальные строки байт в байт те же.
+
+        Сверка идёт ПО ИМЕНОВАННОМУ ИНДЕКСУ, а не «всё кроме последнего поля»: с 09.09.2026
+        последнее поле строки — это ИСТОЧНИК, а не состояние, и прежний `rsplit` молча сравнивал
+        бы состояние со состоянием, объявляя чистым любое движение графы источника."""
         before = self.raw().split("\n")
         LS.withdraw(number=self.n2, path=self.store, now=0)
         after = self.raw().split("\n")
@@ -187,8 +193,13 @@ class TestWithdrawKeepsRow(_Base):
         for idx, (was, now) in enumerate(zip(before, after)):
             if idx == 2:                                   # строка урока n2 (0 — шапка)
                 self.assertNotEqual(was, now)
-                self.assertEqual(was.rsplit("\t", 1)[0], now.rsplit("\t", 1)[0],
-                                 "снятие тронуло не только поле состояния")
+                was_f, now_f = was.split("\t"), now.split("\t")
+                self.assertEqual(len(was_f), len(now_f), "снятие поменяло ширину строки")
+                for col, (a, b) in enumerate(zip(was_f, now_f)):
+                    if col == LS.IDX_STATE:
+                        continue
+                    self.assertEqual(a, b, "снятие тронуло колонку «%s»" % LS.COLUMNS[col])
+                self.assertNotEqual(was_f[LS.IDX_STATE], now_f[LS.IDX_STATE])
             else:
                 self.assertEqual(was, now, "снятие тронуло ЧУЖУЮ строку %d" % idx)
 
@@ -487,12 +498,17 @@ class TestOneLineOneLesson(_Base):
             self.assertNotIn("\t", LS.esc(sample))
 
     def test_header_and_columns(self):
+        """НОВЫЙ файл получает девятиколоночную шапку; восемь прежних колонок стоят на прежних
+        местах, а источник дописан ХВОСТОМ (09.09.2026)."""
         self.add_live()
         first = self.raw().split("\n")[0]
         self.assertEqual(first, LS.HEADER_LINE)
-        self.assertEqual(len(LS.COLUMNS), 8, "колонок обязано быть восемь: шесть полей + номер + состояние")
+        self.assertEqual(len(LS.COLUMNS_BASE), 8,
+                         "обязательных колонок восемь: шесть полей + номер + состояние")
+        self.assertEqual(len(LS.COLUMNS), 9, "девятая — необязательный хвост «источник»")
         self.assertEqual(LS.COLUMNS[0], LS.COL_NUM)
-        self.assertEqual(LS.COLUMNS[-1], LS.COL_STATE)
+        self.assertEqual(LS.COLUMNS_BASE[-1], LS.COL_STATE)
+        self.assertEqual(LS.COLUMNS[-1], LS.COL_SOURCE)
 
 
 class TestReaderSaysNonparse(_Base):

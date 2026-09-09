@@ -61,10 +61,39 @@ lesson_store.py — ХРАНИЛИЩЕ УРОКОВ ТРЕНАЖЁРА. Отде
 
 СОСТОЯНИЕ строки — `кандидат` (записан, но НЕ действует; заведено 05.09.2026), `актив` либо
 `снят(<разрез>;<штамп UTC>)`, где разрез это один из
-трёх, названных владельцем: `урок` (один), `день` (все за сутки), `автор` (все одного
-человека). Разрез и время живут ВНУТРИ поля состояния сознательно: колонок в таблице ровно
-восемь (шесть обязательных полей + номер + состояние), а след «кем и когда снято» терять
-нельзя — иначе откат перестаёт быть обратимым знанием.
+ЧЕТЫРЁХ: `урок` (один), `день` (все за сутки), `автор` (все одного человека) — три названных
+владельцем — и `источник` (весь набор одного происхождения; заведён 09.09.2026). Разрез и
+время живут ВНУТРИ поля состояния сознательно: след «кем и когда снято» терять нельзя —
+иначе откат перестаёт быть обратимым знанием.
+
+ИСТОЧНИК НАБОРА — ДЕВЯТАЯ КОЛОНКА И НЕОБЯЗАТЕЛЬНЫЙ ХВОСТ ФОРМАТА (09.09.2026).
+
+ЗАЧЕМ. До 09.09 набор строк можно было ВКЛЮЧИТЬ (перенос книги влил девять правил одним
+вызовом), а СНЯТЬ одним движением — нет: разрезов было три, и ни один не спрашивал «откуда
+эта строка взялась». Разрез `автор` набором не является: перенос подписался именем `владелец`,
+и тем же именем будет подписано всё, что владелец запишет завтра руками. Разрез `день` тоже:
+в тот же день ложились кандидаты тренажёра. Пока источника нет, грузить внешний экспорт
+переписки менеджеров НЕЛЬЗЯ — влить его будет можно, а вынуть обратно нечем.
+
+ХВОСТ, А НЕ ПЕРЕПИСЫВАНИЕ (решение Штаба, заходом не пересматривается). Колонка добавлена
+ПОСЛЕДНЕЙ, и это не косметика: индексы всех восьми прежних колонок остались прежними
+(`IDX_STATE` == 7 в обеих ширинах), поэтому уже лежащая строка из восьми полей читается ТЕМ ЖЕ
+кодом и правится теми же ветками (`promote`, `rollback`, `withdraw` по трём прежним разрезам).
+Ни одна ветка не переписывает лежащие строки ради нового формата: замка у таблицы нет, а
+потеря чужой строки дороже единообразия. Цена названа: шапка уже заведённого файла остаётся
+восьмиколоночной (её тоже не переписываем), поэтому `load` знает ОБЕ шапки, а новый файл
+получает девятиколоночную.
+
+ТРЕТИЙ ИСХОД ВМЕСТО ВЫДУМАННОГО ЗНАЧЕНИЯ. У строки без хвоста источник не «пустой» и не
+«тренажёр по умолчанию», а НЕИЗВЕСТЕН (`SOURCE_UNKNOWN is None`, словами — `SAY_UNKNOWN`).
+Подставить сюда правдоподобное значение значило бы приписать девяти живым строкам
+происхождение, которого никто не записывал, и снятие набора начало бы задевать чужое.
+Строка с неизвестным источником не попадает НИ В ОДИН разрез `источник` — ни одной веткой.
+
+НОВАЯ ЗАПИСЬ БЕЗ ИСТОЧНИКА — ОТКАЗ, а не строка с пустым полем: иначе «неизвестен» перестал бы
+означать «формат был старше» и начал бы означать «вызывающий поленился», а разделить их через
+неделю стало бы нечем. Значения источника перечислены ОДНИМ списком (`SOURCES`), а не строками
+по вызовам, и запись с чужим значением тоже отказывает.
 
 ПЕРСОНАЛЬНОЕ НЕ ПОПАДАЕТ В ТАБЛИЦУ ПО УСТРОЙСТВУ, а не по дисциплине вызывающего: `add()`
 прогоняет четыре ТЕКСТОВЫХ поля через детектор `anonymize_corpus._clean_text` — тот самый,
@@ -108,9 +137,10 @@ lesson_store.py — ХРАНИЛИЩЕ УРОКОВ ТРЕНАЖЁРА. Отде
 непустую причину и ИМЯ автора перевода.
 
 ЗАПУСК:
-    venv/Scripts/python.exe lesson_store.py --status          # ёмкость и целостность числами
+    venv/Scripts/python.exe lesson_store.py --status          # ёмкость, целостность и источники
     venv/Scripts/python.exe lesson_store.py --list            # активные уроки
     venv/Scripts/python.exe lesson_store.py --list --all      # вместе со снятыми
+    venv/Scripts/python.exe lesson_store.py --list --source тренажёр   # только один набор
     venv/Scripts/python.exe lesson_store.py --trace           # след переводов и откатов
 """
 
@@ -143,14 +173,28 @@ COL_WHY = "почему"
 COL_WHO = "кто_записал"
 COL_WHEN = "когда"
 COL_STATE = "состояние"
+# ДЕВЯТАЯ, НЕОБЯЗАТЕЛЬНАЯ (09.09.2026) — см. шапку. Стои́т ПОСЛЕДНЕЙ, чтобы индексы восьми
+# прежних колонок не сдвинулись ни на один: только так уже лежащая строка читается и правится
+# тем же кодом, что вчера.
+COL_SOURCE = "источник"
 
-COLUMNS = (COL_NUM, COL_QUESTION, COL_BOT, COL_RIGHT, COL_WHY, COL_WHO, COL_WHEN, COL_STATE)
+# ВОСЕМЬ ОБЯЗАТЕЛЬНЫХ — формат, в котором лежат строки до 09.09.2026. Отдельным именем, а не
+# срезом `COLUMNS[:-1]`: по нему судит читатель старой строки, и подпирать это арифметикой среза
+# нельзя — следующая колонка сдвинет срез молча.
+COLUMNS_BASE = (COL_NUM, COL_QUESTION, COL_BOT, COL_RIGHT, COL_WHY, COL_WHO, COL_WHEN, COL_STATE)
+COLUMNS = COLUMNS_BASE + (COL_SOURCE,)
+HEADER_BASE_LINE = "\t".join(COLUMNS_BASE)
 HEADER_LINE = "\t".join(COLUMNS)
+# Две ЗАКОННЫЕ ширины строки. Всё остальное — битая строка, как и раньше.
+WIDTHS = (len(COLUMNS_BASE), len(COLUMNS))
 
 # Индексы колонок, которые правятся ПО МЕСТУ (см. `_replace_fields`). Считаются из COLUMNS, а не
 # пишутся числами: порядок колонок — часть формата, и разъехаться эти два места не должны.
+# ОБА индекса лежат ВНУТРИ восьмиколоночной части — это и есть замок «хвост ничего не сдвинул»
+# (проверяется тестом, а не глазом).
 IDX_WHY = COLUMNS.index(COL_WHY)
 IDX_STATE = COLUMNS.index(COL_STATE)
+IDX_SOURCE = COLUMNS.index(COL_SOURCE)
 
 # Шесть обязательных полей урока (решение владельца). Номер и состояние ставит хранилище.
 REQUIRED_FIELDS = (COL_QUESTION, COL_BOT, COL_RIGHT, COL_WHY, COL_WHO, COL_WHEN)
@@ -178,9 +222,61 @@ STATE_CANDIDATE = "кандидат"
 CUT_ONE = "урок"
 CUT_DAY = "день"
 CUT_WHO = "автор"
-CUTS = (CUT_ONE, CUT_DAY, CUT_WHO)
+# ЧЕТВЁРТЫЙ РАЗРЕЗ (09.09.2026) — набор одного происхождения. Живёт ЗДЕСЬ, в том же кортеже, что
+# три прежних, и ни одной копией рядом: всё, что судит о разрезах (проверка имени, регулярка
+# состояния, разбор снятия, ошибка «не знаю такого»), читает `CUTS`, а не свой список.
+CUT_SOURCE = "источник"
+CUTS = (CUT_ONE, CUT_DAY, CUT_WHO, CUT_SOURCE)
 
-_RE_WITHDRAWN = re.compile(r"^снят\((урок|день|автор);([^)]+)\)$")
+# Регулярка состояния СОБИРАЕТСЯ ИЗ `CUTS`, а не переписывается руками: раньше здесь стоял
+# литерал `(урок|день|автор)`, и четвёртый разрез разошёлся бы с ним МОЛЧА — снятое по источнику
+# читалось бы как «состояние не опознано», то есть снятым с неизвестным разрезом.
+_RE_WITHDRAWN = re.compile(r"^снят\((" + "|".join(re.escape(c) for c in CUTS) + r");([^)]+)\)$")
+
+# ---------------------------------------------------------------------------------------
+# Источник набора — ЗАКРЫТЫЙ СПИСОК В ОДНОМ МЕСТЕ (решение Штаба, п.4)
+# ---------------------------------------------------------------------------------------
+# ПОЧЕМУ СПИСОК, А НЕ СВОБОДНАЯ СТРОКА. Источник — это КЛЮЧ ОТКАТА: по нему набор снимается
+# целиком. Свободная строка даёт опечатку («тренажер» без ё), а опечатка даёт снятие НУЛЯ строк
+# с честным кодом успеха — то есть ложный зелёный ровно в той операции, ради которой всё
+# затевалось. Поэтому значение проверяется на записи, а `withdraw(source=…)` с чужим значением
+# ГРОМКО отказывается, а не «снимает 0».
+#
+# ПОЧЕМУ ИМЕННО ЭТИ ТРИ. Первые два — живые дороги записи, которые есть сегодня (`trainer`
+# кладёт кандидата, `lesson_migrate_book` вливает книгу). Третий назван ЗАРАНЕЕ и намеренно:
+# внешний экспорт переписки менеджеров — тот самый набор, ради которого источник и заводится,
+# и класть его в базу можно только тогда, когда снять его одним движением уже есть чем.
+SOURCE_TRAINER = "тренажёр"
+SOURCE_BOOK = "перенос_книги"
+SOURCE_EXPORT = "экспорт_переписки"
+SOURCES = (SOURCE_TRAINER, SOURCE_BOOK, SOURCE_EXPORT)
+
+# ТРЕТИЙ ИСХОД чтения источника: не пусто и не значение, а «не знаю». `None` выбран сознательно —
+# тем же словарём, каким `_leading_number` отвечает на нечитаемый номер: подставленное значение
+# заняло бы чужой набор.
+SOURCE_UNKNOWN = None
+SAY_UNKNOWN = "источник неизвестен"
+
+
+def norm_source(value):
+    """Ключ источника: без пробелов по краям, регистр не значим. `None`/пусто → `None`."""
+    if value is None:
+        return None
+    key = str(value).strip().casefold()
+    return key or None
+
+
+_SOURCE_KEYS = {norm_source(s): s for s in SOURCES}
+
+
+def known_source(value):
+    """Значение источника → КАНОНИЧЕСКОЕ из `SOURCES` либо `None` («такого источника не знаю»)."""
+    return _SOURCE_KEYS.get(norm_source(value))
+
+
+def say_source(source):
+    """Источник строки → слова для человека. Неизвестный называется словами, а не пустотой."""
+    return SAY_UNKNOWN if source is SOURCE_UNKNOWN else source
 
 
 def withdrawn_state(cut, stamp):
@@ -251,6 +347,17 @@ REASON_TYPE = "урок НЕ записан: поле «%s» должно быт
 # а не проехать пустым. Честно: это непройденная ветка, и она названа непройденной.
 REASON_SCRUBBED_OUT = ("урок НЕ записан: поле «%s» после вычистки персонального стало пустым — "
                        "в нём не было ничего, кроме персональных данных")
+# ИСТОЧНИК НАБОРА (09.09.2026). Отказ, а не запись с пустым полем: «источник неизвестен» обязано
+# означать РОВНО одно — «строка старше формата». Разрешить пустой источник новой записи значило бы
+# смешать её со старой строкой навсегда, и снятие набора перестало бы отвечать за свой охват.
+REASON_SOURCE_EMPTY = ("урок НЕ записан: не назван ИСТОЧНИК НАБОРА. Источник — это ключ, которым "
+                       "набор снимается целиком; без него строка встанет в базу навсегда, и "
+                       "вынуть её вместе со своим набором будет нечем. Назовите один из: %s"
+                       % ", ".join(SOURCES))
+REASON_SOURCE_UNKNOWN = ("урок НЕ записан: источник «%s» мне неизвестен. Значения источника живут "
+                         "ОДНИМ списком в коде (lesson_store.SOURCES), а не строками по вызовам — "
+                         "иначе опечатка молча заводит набор, который потом ничем не снять. "
+                         "Знаю: %s")
 
 
 class LessonRejected(ValueError):
@@ -291,7 +398,13 @@ def scrub_lesson(question, bot_answer, correct, why):
 # ---------------------------------------------------------------------------------------
 # Чтение таблицы
 # ---------------------------------------------------------------------------------------
-Lesson = namedtuple("Lesson", "number question bot_answer correct why who when state line")
+# `source` стои́т ПОСЛЕ `line`, хотя в файле он девятое поле, а `line` полем не является вовсе.
+# Причина не косметическая: у последнего поля есть ЗНАЧЕНИЕ ПО УМОЛЧАНИЮ, и старая девятиаргументная
+# сборка `Lesson(...)` (её делают чужие тесты) продолжает работать, отвечая «источник неизвестен» —
+# ровно то, что означает строка без хвоста. Вставь `source` перед `line` — и тот же вызов упал бы
+# на нехватке аргумента, то есть формат хвоста перестал бы быть необязательным для читателя.
+Lesson = namedtuple("Lesson", "number question bot_answer correct why who when state line source")
+Lesson.__new__.__defaults__ = (SOURCE_UNKNOWN,)
 Store = namedtuple("Store", "lessons reading broken exists path")
 
 
@@ -321,6 +434,22 @@ def _leading_number(raw):
     return None
 
 
+def _source_of(parts):
+    """Поля строки → источник набора либо `SOURCE_UNKNOWN`.
+
+    ТРИ входа дают «не знаю», и все три — честно: хвоста у строки нет вовсе (старый формат);
+    хвост есть, но пуст (файл правили руками); хвост есть, но из одних пробелов. Ни один из них
+    не превращается в значение — иначе строка попала бы в чужой набор и уехала с его снятием.
+
+    Значение ВНЕ `SOURCES` при чтении НЕ отбрасывается: оно переносится дословно, как и чужая
+    экранированная последовательность. Списком судится ЗАПИСЬ, а не чтение — выкинуть текст,
+    который кто-то положил руками, здесь было бы потерей, а не строгостью."""
+    if len(parts) <= IDX_SOURCE:
+        return SOURCE_UNKNOWN
+    value = unesc(parts[IDX_SOURCE]).strip()
+    return value or SOURCE_UNKNOWN
+
+
 def load(path=None):
     """Таблица целиком → Store. Сбой чтения ГРОМКИЙ (исключение наверх), отсутствие файла —
     названное состояние `exists=False`, а не притворная пустота.
@@ -337,16 +466,20 @@ def load(path=None):
             row = line.rstrip("\n").rstrip("\r")
             if len(row.strip()) == 0:
                 continue
-            if idx == 1 and row == HEADER_LINE:
+            # ДВЕ ЗАКОННЫЕ ШАПКИ, и обе пропускаются. Восьмиколоночная — та, что уже лежит в
+            # заведённых файлах: переписать её значило бы тронуть лежащую строку, а этого решение
+            # Штаба не разрешает. Не узнай мы её — она пошла бы в `broken` и подняла НЕРАЗБОР.
+            if idx == 1 and row in (HEADER_LINE, HEADER_BASE_LINE):
                 continue
             seen += 1
             parts = row.split("\t")
-            if len(parts) != len(COLUMNS) or not parts[0].strip().isdigit():
+            if len(parts) not in WIDTHS or not parts[0].strip().isdigit():
                 broken.append((idx, row))
                 continue
             lessons.append(Lesson(int(parts[0].strip()), unesc(parts[1]), unesc(parts[2]),
                                   unesc(parts[3]), unesc(parts[4]), unesc(parts[5]),
-                                  unesc(parts[6]), unesc(parts[7]), idx))
+                                  unesc(parts[6]), unesc(parts[7]), idx,
+                                  _source_of(parts)))
     return Store(tuple(lessons), parse_outcome.reading(seen, len(lessons)),
                  tuple(broken), True, target)
 
@@ -388,6 +521,40 @@ def by_day(lessons, day):
     return tuple(les for les in lessons if day_of(les.when) == key)
 
 
+def by_source(lessons, source):
+    """Уроки ОДНОГО набора. Строка с неизвестным источником сюда не попадает ни при каком
+    ключе — включая попытку спросить `None`: «не знаю» набором не является, и снимать по нему
+    целиком было бы снятием всего, что старше формата."""
+    key = norm_source(source)
+    if key is None:
+        return ()
+    return tuple(les for les in lessons
+                 if les.source is not SOURCE_UNKNOWN and norm_source(les.source) == key)
+
+
+def unknown_source(lessons):
+    """Уроки, у которых источника нет (строки старше формата). Названы отдельным разрезом ЧТЕНИЯ,
+    но НЕ разрезом снятия: снять «всё, что старше формата» одним движением — это не набор, а
+    возраст, и такого требования не было."""
+    return tuple(les for les in lessons if les.source is SOURCE_UNKNOWN)
+
+
+def sources_census(lessons):
+    """Перепись набора числами: {источник или SAY_UNKNOWN: сколько строк}. Порядок — `SOURCES`,
+    потом чужие значения, потом неизвестные: так строка отчёта не пляшет между запусками."""
+    seen = Counter(say_source(les.source) for les in lessons)
+    out = []
+    for src in SOURCES:
+        if seen.get(src):
+            out.append((src, seen.pop(src)))
+    rest = seen.pop(SAY_UNKNOWN, 0)
+    for name in sorted(seen):
+        out.append((name, seen[name]))
+    if rest:
+        out.append((SAY_UNKNOWN, rest))
+    return tuple(out)
+
+
 # ---------------------------------------------------------------------------------------
 # Запись урока
 # ---------------------------------------------------------------------------------------
@@ -413,6 +580,19 @@ def validate(question, bot_answer, correct, why, who, when, why_required=True):
                 return False, REASON_WHY_EMPTY, name
             return False, REASON_EMPTY % name, name
     return True, "", None
+
+
+def validate_source(source):
+    """Источник новой строки → (принят ли, причина словами, канонический источник).
+
+    Чистая функция, как и `validate`: файла не трогает, зовётся и отдельно. Отказ здесь — это
+    ОТКАЗ В ЗАПИСИ, а не предупреждение (решение Штаба, п.3)."""
+    if source is None or len(str(source).strip()) == 0:
+        return False, REASON_SOURCE_EMPTY, None
+    canon = known_source(source)
+    if canon is None:
+        return (False, REASON_SOURCE_UNKNOWN % (str(source).strip(), ", ".join(SOURCES)), None)
+    return True, "", canon
 
 
 def _next_number(store):
@@ -443,17 +623,26 @@ def _append_row(target, row, need_header, header=HEADER_LINE):
         os.fsync(f.fileno())
 
 
-def _add_row(question, bot_answer, correct, why, who, when, path, now, state, why_required):
+def _add_row(question, bot_answer, correct, why, who, when, path, now, state, why_required,
+             source):
     """Общее тело `add`/`add_candidate` → НОМЕР записанного.
 
     Порядок сознателен: сначала проверка обязательных полей на СЫРОМ входе (пустое «почему»
-    отказывается до всякой работы), потом вычистка персонального, потом повторная проверка
-    непустоты (поле, состоявшее из одних персональных данных, не должно проехать пустым)."""
+    отказывается до всякой работы), потом источник набора, потом вычистка персонального, потом
+    повторная проверка непустоты (поле, состоявшее из одних персональных данных, не должно
+    проехать пустым).
+
+    ИСТОЧНИК ПРОВЕРЯЕТСЯ ПОСЛЕ ШЕСТИ ПОЛЕЙ, а не перед ними, и это не безразлично: у вызова, где
+    не названо НИЧЕГО, отказ обязан назвать более старое и более жёсткое требование владельца
+    («почему»), иначе новая проверка перехватила бы чужие отказы и спрятала их причину."""
     stamp = now_stamp(now) if when is None else when
     ok, reason, field = validate(question, bot_answer, correct, why, who, stamp,
                                  why_required=why_required)
     if not ok:
         raise LessonRejected(reason, field=field)
+    ok_src, reason_src, src = validate_source(source)
+    if not ok_src:
+        raise LessonRejected(reason_src, field=COL_SOURCE)
 
     clean = scrub_lesson(question, bot_answer, correct, why)
     values = ((COL_QUESTION, clean.question), (COL_BOT, clean.bot_answer),
@@ -472,21 +661,26 @@ def _add_row(question, bot_answer, correct, why, who, when, path, now, state, wh
     need_header = (not store.exists) or os.path.getsize(target) == 0
     row = "\t".join((str(number), esc(clean.question), esc(clean.bot_answer),
                      esc(clean.correct), esc(clean.why), esc(who.strip()),
-                     esc(stamp), state))
+                     esc(stamp), state, esc(src)))
     _append_row(target, row, need_header)
     return number
 
 
-def add(question, bot_answer, correct, why, who, when=None, path=None, now=None):
+def add(question, bot_answer, correct, why, who, source=None, when=None, path=None, now=None):
     """Записать ДЕЙСТВУЮЩИЙ урок (состояние `актив`). → НОМЕР записанного.
 
     «Почему» обязательно и здесь остаётся обязательным: это единственная дорога, кладущая строку
-    сразу действующей, и инвариант «действующий урок всегда с причиной» держится ею."""
+    сразу действующей, и инвариант «действующий урок всегда с причиной» держится ею.
+
+    `source` объявлен со значением по умолчанию `None` не ради необязательности, а ради ОТКАЗА
+    СЛОВАМИ: без него вызывающий получил бы `TypeError` про недостающий аргумент, то есть
+    сообщение для разработчика вместо причины для человека."""
     return _add_row(question, bot_answer, correct, why, who, when, path, now,
-                    STATE_ACTIVE, True)
+                    STATE_ACTIVE, True, source)
 
 
-def add_candidate(question, bot_answer, correct, who, why="", when=None, path=None, now=None):
+def add_candidate(question, bot_answer, correct, who, source=None, why="", when=None, path=None,
+                  now=None):
     """Записать КАНДИДАТА (состояние `кандидат`). → НОМЕР записанного.
 
     Отличие от `add` ровно одно: «почему» разрешено пустым. Ни одна ветка НЕ подставляет причину
@@ -495,9 +689,12 @@ def add_candidate(question, bot_answer, correct, who, why="", when=None, path=No
     названную причину от придуманной стало бы нечем.
 
     Порядок аргументов иной, чем у `add` (`who` перед `why`), СОЗНАТЕЛЬНО: у кандидата причины
-    обычно нет, и позиционный вызов не должен уметь молча сдвинуть автора в графу причины."""
+    обычно нет, и позиционный вызов не должен уметь молча сдвинуть автора в графу причины.
+
+    ИСТОЧНИК обязателен и у кандидата: кандидат — такая же строка таблицы, и снимать набор
+    придётся вместе с теми, кто ещё не дозрел до действующего."""
     return _add_row(question, bot_answer, correct, why, who, when, path, now,
-                    STATE_CANDIDATE, False)
+                    STATE_CANDIDATE, False, source)
 
 
 # ---------------------------------------------------------------------------------------
@@ -509,18 +706,33 @@ WithdrawResult = namedtuple("WithdrawResult", "cut key marked already lines_befo
 
 
 def _matches(lesson, cut, key):
+    """Подходит ли строка под разрез. КАЖДАЯ ветка названа, и есть ЯВНЫЙ хвост `False`.
+
+    До 09.09 хвоста не было: последней строкой стояло `return norm_who(...)`, то есть «всё, что
+    не урок и не день, — автор». С четвёртым разрезом такой хвост стал бы миной: неизвестный
+    разрез молча снимал бы по автору."""
     if cut == CUT_ONE:
         return lesson.number == key
     if cut == CUT_DAY:
         return day_of(lesson.when) == key
-    return norm_who(lesson.who) == key
+    if cut == CUT_WHO:
+        return norm_who(lesson.who) == key
+    if cut == CUT_SOURCE:
+        # Строка без источника не принадлежит НИ ОДНОМУ набору — см. `by_source`.
+        return lesson.source is not SOURCE_UNKNOWN and norm_source(lesson.source) == key
+    return False
 
 
 def _replace_state(raw, state):
-    """Последнее поле СЫРОЙ строки → новое состояние. Остальные байты не трогаются вовсе:
-    круг «разобрать → собрать» не байт-в-байт на чужих экранированных последовательностях."""
-    head, _tail = raw.rsplit("\t", 1)
-    return head + "\t" + state
+    """Последнее поле ВОСЬМИКОЛОНОЧНОЙ части СЫРОЙ строки → новое состояние. Остальные байты не
+    трогаются вовсе: круг «разобрать → собрать» не байт-в-байт на чужих экранированных
+    последовательностях.
+
+    ВЕТКОЙ НЕ ЗОВЁТСЯ НИ ОТКУДА (снятие и перевод ходят через `_replace_fields`), но оставлен и
+    ПОЧИНЕН, а не удалён: прежнее тело резало по ПОСЛЕДНЕЙ табуляции, и на строке с хвостом
+    источника оно записало бы состояние в графу источника. Мина, которая ждала бы первого
+    вызывающего."""
+    return _replace_fields(raw, {IDX_STATE: state})
 
 
 def _replace_fields(raw, by_index):
@@ -529,9 +741,16 @@ def _replace_fields(raw, by_index):
     нетронутые поля не проходят круг «разобрать → собрать», на котором чужая последовательность
     могла бы поменяться. Строка не той ширины не правится вовсе (лучше не тронуть, чем испортить)."""
     parts = raw.split("\t")
-    if len(parts) != len(COLUMNS):
+    if len(parts) not in WIDTHS:
         return raw
     for idx, value in by_index.items():
+        # ХВОСТ НЕ ДОПИСЫВАЕТСЯ ПРАВКОЙ. У восьмиколоночной строки графы источника нет, и
+        # `parts[8] = …` бросил бы IndexError ПОСРЕДИ перезаписи — то есть после копии `.bak` и
+        # на половине временного файла. Решение Штаба ровно об этом: формат растёт хвостом у НОВЫХ
+        # строк, а лежащие не переписываются; поэтому здесь пропуск, а не рост строки. Что ни одна
+        # ветка не пытается править источник — сторожит тест на исходнике.
+        if idx >= len(parts):
+            continue
         parts[idx] = value
     return "\t".join(parts)
 
@@ -572,22 +791,34 @@ def _rewrite(target, edits_by_line):
     return lines_in, lines_out
 
 
-def withdraw(number=None, day=None, who=None, path=None, now=None):
-    """Снять уроки одним из ТРЁХ разрезов владельца: `number=` (один урок), `day=` (все за
-    сутки), `who=` (всё записанное одним человеком). → WithdrawResult.
+def withdraw(number=None, day=None, who=None, source=None, path=None, now=None):
+    """Снять уроки одним из ЧЕТЫРЁХ разрезов: `number=` (один урок), `day=` (все за сутки),
+    `who=` (всё записанное одним человеком), `source=` (ВЕСЬ НАБОР одного происхождения).
+    → WithdrawResult.
 
     Строки НЕ УДАЛЯЮТСЯ: меняется только поле состояния, след остаётся. `lines_before` и
-    `lines_after` в ответе — это доказательство числом, что ни одна строка не пропала."""
-    given = [(CUT_ONE, number), (CUT_DAY, day), (CUT_WHO, who)]
+    `lines_after` в ответе — это доказательство числом, что ни одна строка не пропала.
+
+    РАЗРЕЗ `source=` С ЧУЖИМ ЗНАЧЕНИЕМ ОТКАЗЫВАЕТ ГРОМКО, а не снимает ноль строк. Причина
+    названа у `SOURCES`: «снял 0» с кодом успеха — это ложный зелёный ровно в той операции,
+    ради которой разрез и заведён, и отличить опечатку от честно пустого набора вызывающему
+    было бы нечем."""
+    given = [(CUT_ONE, number), (CUT_DAY, day), (CUT_WHO, who), (CUT_SOURCE, source)]
     named = [(cut, val) for cut, val in given if val is not None]
     if len(named) != 1:
-        raise ValueError("снятие требует РОВНО одного разреза из трёх (number=/day=/who=), "
-                         "передано: %d" % len(named))
+        raise ValueError("снятие требует РОВНО одного разреза из четырёх "
+                         "(number=/day=/who=/source=), передано: %d" % len(named))
     cut, key = named[0]
     if cut == CUT_ONE:
         key = int(key)
     elif cut == CUT_DAY:
         key = key.strip()
+    elif cut == CUT_SOURCE:
+        canon = known_source(key)
+        if canon is None:
+            raise ValueError("снятие набора: источник %r мне неизвестен (знаю %s). Ничего не "
+                             "тронуто" % (key, ", ".join(SOURCES)))
+        key = norm_source(canon)
     else:
         key = norm_who(key)
 
@@ -701,7 +932,9 @@ def _raw_fields(target, lineno):
             if idx != lineno:
                 continue
             parts = line.rstrip("\n").rstrip("\r").split("\t")
-            return parts if len(parts) == len(COLUMNS) else None
+            # ОБЕ ширины целые. Строка старого формата остаётся полноправной: её по-прежнему можно
+            # перевести в действующие и откатить — хвост источника к этому отношения не имеет.
+            return parts if len(parts) in WIDTHS else None
     return None
 
 
@@ -949,9 +1182,10 @@ def integrity(path=None):
 # CLI
 # ---------------------------------------------------------------------------------------
 def _render(lesson):
-    return ("#%d [%s] %s | %s\n    вопрос: %s\n    ответил бот: %s\n    как правильно: %s\n"
-            "    почему: %s" % (lesson.number, lesson.state, lesson.who, lesson.when,
-                                lesson.question, lesson.bot_answer, lesson.correct, lesson.why))
+    return ("#%d [%s] %s | %s | набор: %s\n    вопрос: %s\n    ответил бот: %s\n"
+            "    как правильно: %s\n    почему: %s"
+            % (lesson.number, lesson.state, lesson.who, lesson.when, say_source(lesson.source),
+               lesson.question, lesson.bot_answer, lesson.correct, lesson.why))
 
 
 def main(argv=None):
@@ -963,6 +1197,7 @@ def main(argv=None):
     ap.add_argument("--all", action="store_true", help="вместе со снятыми")
     ap.add_argument("--who", help="только уроки этого человека")
     ap.add_argument("--day", help="только уроки за сутки ГГГГ-ММ-ДД")
+    ap.add_argument("--source", help="только уроки этого набора (%s)" % ", ".join(SOURCES))
     ap.add_argument("--path", help="другой файл таблицы (по умолчанию %s)" % STORE_NAME)
     args = ap.parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -986,6 +1221,10 @@ def main(argv=None):
         print("действующих: %d; кандидатов: %d; снятых: %d"
               % (len(active(store.lessons)), len(cands),
                  len(store.lessons) - len(active(store.lessons)) - len(cands)))
+        # НАБОРЫ ЧИСЛАМИ — иначе «снять набор» нечем прицелиться. Строки старше формата названы
+        # своим словом, а не свалены в первый попавшийся источник.
+        census = sources_census(store.lessons)
+        print("наборы: %s" % ("; ".join("%s — %d" % pair for pair in census) or "—"))
         print(integ.say)
         return 0
 
@@ -994,6 +1233,8 @@ def main(argv=None):
         rows = by_author(rows, args.who)
     if args.day is not None:
         rows = by_day(rows, args.day)
+    if args.source is not None:
+        rows = by_source(rows, args.source)
     if not args.all:
         rows = active(rows)
     for les in rows:

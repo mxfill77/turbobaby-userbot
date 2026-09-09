@@ -87,6 +87,7 @@ class _Base(unittest.TestCase):
         kw.setdefault("who", OWNER)
         kw.setdefault("when", "2026-09-09T10:00:00Z")
         kw.setdefault("path", self.store)
+        kw.setdefault("source", LS.SOURCE_TRAINER)          # источник обязателен с 09.09.2026
         return LS.add_candidate(**kw)
 
     def sha(self):
@@ -339,23 +340,45 @@ class TestTheDoorItself(_Base):
 
 
 # =======================================================================================
-# П.5 задания: поля ИСТОЧНИКА НАБОРА у урока нет — замок на факт, чтобы он не потерялся
+# П.5 задания 08.09: поля ИСТОЧНИКА НАБОРА у урока НЕ БЫЛО — замок на факт и на его закрытие
 # =======================================================================================
 class TestNoBatchSourceColumnYet(unittest.TestCase):
     """ЧИТАЮЩИЙ замок, а не требование. Задание Штаба спросило отдельной строкой: есть ли у урока
-    поле ИСТОЧНИКА набора и можно ли откатить набор одного источника целиком. Ответ — НЕТ, и он
-    записан здесь ЧИСЛОМ, чтобы следующий шаг начинался с факта, а не с пересказа."""
+    поле ИСТОЧНИКА набора и можно ли откатить набор одного источника целиком. 08.09 ответ был
+    НЕТ, и он записан здесь ЧИСЛОМ, чтобы следующий шаг начинался с факта, а не с пересказа.
 
-    def test_columns_are_eight_and_none_of_them_is_a_source(self):
-        self.assertEqual(len(LS.COLUMNS), 8, LS.COLUMNS)
-        for name in LS.COLUMNS:
+    09.09.2026 ответ СТАЛ ДА, и класс переписан, а не удалён: он держит ровно то, что закрывало
+    прежний пробел, и краснеет, если хвост источника или четвёртый разрез из кода уйдут. Прежние
+    утверждения («колонок восемь», «разрезов три») сохранены как ИСТОРИЯ формата — восьмиколоночная
+    часть по-прежнему восемь колонок, потому что лежащие строки не переписывались."""
+
+    def test_columns_grew_by_a_tail_and_the_old_eight_are_untouched(self):
+        # прежний факт: восемь колонок, среди них источника нет — он верен ДЛЯ СТАРОЙ ЧАСТИ
+        self.assertEqual(len(LS.COLUMNS_BASE), 8, LS.COLUMNS_BASE)
+        for name in LS.COLUMNS_BASE:
             self.assertNotIn("источник", name)
+        # новый факт: девятая колонка — источник, и она ПОСЛЕДНЯЯ (хвост, а не вставка)
+        self.assertEqual(len(LS.COLUMNS), 9, LS.COLUMNS)
+        self.assertEqual(LS.COLUMNS[-1], LS.COL_SOURCE)
+        self.assertEqual(LS.COLUMNS[:8], LS.COLUMNS_BASE)
+        # …и ни один индекс старых колонок не сдвинулся — это и есть «читается по-прежнему»
+        self.assertEqual(LS.IDX_STATE, LS.COLUMNS_BASE.index(LS.COL_STATE))
+        self.assertEqual(LS.IDX_WHY, LS.COLUMNS_BASE.index(LS.COL_WHY))
 
-    def test_cuts_are_three_and_none_of_them_is_a_source(self):
-        """Разрезов снятия три — урок, день, автор. Четвёртого («набор») нет ни одной веткой."""
-        self.assertEqual(LS.CUTS, (LS.CUT_ONE, LS.CUT_DAY, LS.CUT_WHO))
+    def test_cuts_are_four_and_the_fourth_is_the_source(self):
+        """Разрезов снятия ЧЕТЫРЕ — урок, день, автор, источник. Три прежних стоят на своих
+        местах и в прежнем порядке: четвёртый добавлен хвостом, как и колонка."""
+        self.assertEqual(LS.CUTS, (LS.CUT_ONE, LS.CUT_DAY, LS.CUT_WHO, LS.CUT_SOURCE))
+        # прежде это бросало ValueError — теперь это законное состояние
+        state = LS.withdrawn_state(LS.CUT_SOURCE, "2026-09-09T10:00:00Z")
+        self.assertEqual(state, "снят(источник;2026-09-09T10:00:00Z)")
+        gone, cut, stamp = LS.parse_state(state)
+        self.assertTrue(gone)
+        self.assertEqual(cut, LS.CUT_SOURCE, "регулярка состояния не знает четвёртого разреза")
+        self.assertEqual(stamp, "2026-09-09T10:00:00Z")
+        # а вот пятого разреза по-прежнему нет, и незнание остаётся ГРОМКИМ
         with self.assertRaises(ValueError):
-            LS.withdrawn_state("источник", "2026-09-09T10:00:00Z")
+            LS.withdrawn_state("набор", "2026-09-09T10:00:00Z")
 
 
 if __name__ == "__main__":

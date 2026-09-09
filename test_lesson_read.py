@@ -83,13 +83,14 @@ class _Base(unittest.TestCase):
         suggest.LESSON_BASE_OFF = False
 
     def add_active(self, correct, question="Сколько стоит на неделю?", bot="Уточню и вернусь."):
+        # `source` обязателен с 09.09.2026: запись без источника отказывается.
         n = LS.add(question=question, bot_answer=bot, correct=correct, why=WHY, who=WHO,
-                   when=WHEN, path=self.store)
+                   when=WHEN, path=self.store, source=LS.SOURCE_TRAINER)
         return n, self.stored(n)
 
     def add_candidate(self, correct, question="А депозит какой?", bot="Не знаю."):
         n = LS.add_candidate(question=question, bot_answer=bot, correct=correct, who=WHO,
-                             when=WHEN, path=self.store)
+                             when=WHEN, path=self.store, source=LS.SOURCE_TRAINER)
         return n, self.stored(n)
 
     def stored(self, number):

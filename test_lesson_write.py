@@ -110,6 +110,7 @@ class _Base(unittest.TestCase):
         kw.setdefault("who", "filipp")
         kw.setdefault("when", "2026-09-05T10:00:00Z")
         kw.setdefault("path", self.store)
+        kw.setdefault("source", LS.SOURCE_TRAINER)          # источник обязателен с 09.09.2026
         return LS.add_candidate(**kw)
 
 
@@ -395,9 +396,27 @@ class TestInvariants(unittest.TestCase):
         self.addCleanup(box.cleanup)
         store = os.path.join(box.name, "lesson_store.tsv")
         with self.assertRaises(LS.LessonRejected) as cm:
-            LS.add(Q, A, REMARK, "", "filipp", when="2026-09-05T10:00:00Z", path=store)
+            LS.add(Q, A, REMARK, "", "filipp", source=LS.SOURCE_TRAINER,
+                   when="2026-09-05T10:00:00Z", path=store)
         self.assertEqual(cm.exception.field, LS.COL_WHY)
         self.assertFalse(os.path.exists(store))
+
+    def test_add_names_why_before_source_when_both_are_missing(self):
+        """ПОРЯДОК ОТКАЗОВ, а не просто «оба обязательны». Источник заведён 09.09.2026 и
+        проверяется ПОСЛЕ шести полей: у вызова, где не названо ничего, отказ обязан назвать
+        более старое и более жёсткое требование владельца («почему»), иначе новая проверка
+        перехватила бы чужие отказы и спрятала их причину."""
+        box = tempfile.TemporaryDirectory(prefix="lesson_write_order_")
+        self.addCleanup(box.cleanup)
+        store = os.path.join(box.name, "lesson_store.tsv")
+        with self.assertRaises(LS.LessonRejected) as cm:
+            LS.add(Q, A, REMARK, "", "filipp", when="2026-09-05T10:00:00Z", path=store)
+        self.assertEqual(cm.exception.field, LS.COL_WHY, cm.exception.reason)
+        # …а при названной причине тот же вызов упирается уже в источник
+        with self.assertRaises(LS.LessonRejected) as cm2:
+            LS.add(Q, A, REMARK, "причина есть", "filipp", when="2026-09-05T10:00:00Z", path=store)
+        self.assertEqual(cm2.exception.field, LS.COL_SOURCE, cm2.exception.reason)
+        self.assertFalse(os.path.exists(store), "отказ оставил файл таблицы")
 
 
 if __name__ == "__main__":

@@ -1427,6 +1427,18 @@ def _default_add_candidate(**kw):
     return lesson_store.add_candidate(**kw)
 
 
+def _lesson_source():
+    """ИСТОЧНИК НАБОРА для всего, что кладёт тренажёр (09.09.2026). Читается из списка хранилища,
+    а не пишется здесь литералом: значения источника живут ОДНИМ местом (`lesson_store.SOURCES`).
+
+    Совпадение с `TRAINER_SOURCE` (тоже «тренажёр») — совпадение СЛОВА, а не одна сущность:
+    `TRAINER_SOURCE` помечает автора правила в плоском сайдкаре `trainer_rules.json` и ключуется
+    ТЕКСТОМ правила, а источник набора — колонка таблицы уроков и ключ отката. Сводить их в одну
+    константу нельзя: переименуй кто-нибудь пометку сайдкара — и набор в базе сменил бы ключ."""
+    import lesson_store
+    return lesson_store.SOURCE_TRAINER
+
+
 def lesson_candidate(remark, who=None, question=None, bot_answer=None, when=None,
                      may_write=None, add_candidate=None, get=None, now=None):
     """Урок владельца → КАНДИДАТ в базе уроков. → dict(status, card, n, who).
@@ -1466,7 +1478,8 @@ def lesson_candidate(remark, who=None, question=None, bot_answer=None, when=None
     try:
         n = (add_candidate or _default_add_candidate)(
             question=str(question), bot_answer=str(bot_answer), correct=remark,
-            who=author, why="", when=when, now=now)          # why="" — причину НЕ выдумываем
+            who=author, why="", when=when, now=now,          # why="" — причину НЕ выдумываем
+            source=_lesson_source())                         # набор называется ВСЕГДА
     except Exception as e:                                   # noqa: BLE001 — обработчик не падает
         log.warning("кандидат урока не записан: %s: %s", type(e).__name__, e, exc_info=True)
         reason = getattr(e, "reason", None) or f"{type(e).__name__}: {e}"

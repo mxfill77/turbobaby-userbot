@@ -550,7 +550,8 @@ class TestLessonAppliesAndCancels(unittest.TestCase):
         remark = "предлагай доставку явно в первом ответе"
         n = lesson_store.add(question="сколько стоит на неделю?", bot_answer="уточню и вернусь",
                              correct=remark, why="владелец назвал причину", who="filipp",
-                             when="2026-09-06T10:00:00Z", path=self.store)
+                             when="2026-09-06T10:00:00Z", path=self.store,
+                             source=lesson_store.SOURCE_TRAINER)
         suggest.append_playbook_rule(remark)         # тот же текст лежит и в книге-снимке
         trainer.mark_source(remark)
         self.assertIn(remark, suggest.load_playbook())
@@ -571,7 +572,7 @@ class TestLessonAppliesAndCancels(unittest.TestCase):
         self.assertEqual(no_base["status"], trainer.STATUS_NO_STORE, no_base["card"])
         n = lesson_store.add(question="вопрос", bot_answer="ответ", correct="какое-то правило",
                              why="причина", who="filipp", when="2026-09-06T10:00:00Z",
-                             path=self.store)
+                             path=self.store, source=lesson_store.SOURCE_TRAINER)
         gone = trainer.cancel_lesson(n + 5, who="filipp", may_write=lambda _u: True,
                                      path=self.store)
         self.assertEqual(gone["status"], trainer.STATUS_NOT_FOUND, gone["card"])
@@ -710,7 +711,8 @@ class TestLessonSourceSurvivesBookFormat(unittest.TestCase):
         self.assertEqual(trainer.rule_source(rows[0]["rule"]), trainer.TRAINER_SOURCE)
         n = lesson_store.add(question="вопрос", bot_answer="ответ", correct=remark,
                              why="владелец назвал причину", who="filipp",
-                             when="2026-09-06T10:00:00Z", path=store)
+                             when="2026-09-06T10:00:00Z", path=store,
+                             source=lesson_store.SOURCE_TRAINER)
         dec = trainer.cancel_lesson(n, who="filipp", may_write=lambda _u: True, path=store,
                                     regress=lambda *_a, **_k: {"spawned": False})
         self.assertEqual(dec["status"], trainer.STATUS_WITHDRAWN, dec["card"])
