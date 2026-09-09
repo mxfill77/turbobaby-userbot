@@ -181,6 +181,40 @@ def _taskkill(pid, seen_at):
         return False
 
 
+# ───────── ЗАМОК БЕЗОПАСНОГО РЕЖИМА ПЕРЕД ПОДЪЁМОМ РЕБЁНКА (09.09.2026) ─────────
+# Ребёнок поднимается ВСЕГДА — замок дверь не закрывает ни одной веткой. Он лишь отнимает у
+# неодобренного кода право писать ЖИВОМУ клиенту и говорит об этом вслух в ту же секунду.
+# Вся логика вердикта и все слова живут в `deploy_voice` (родитель, вне клиентского замыкания);
+# здесь — только вызов в ДВУХ местах подъёма, ровно там, где уже передаются `cwd` и `creationflags`.
+
+def _safe_mode_gate(kind):
+    """Вердикт замка ДО `Popen`. → (env|None, decision|None).
+
+    `env=None` означает «ничего не подмешиваем»: `Popen(env=None)` — это наследование окружения
+    родителя, то есть прежнее поведение байт-в-байт (исход «коммит одобрен» и снятый замок).
+    Исключений не выпускает: подъём важнее замка. Но и незнание здесь не толкуется в пользу
+    движения — отказ самого замка кончается безопасным режимом, а не тишиной."""
+    try:
+        d = deploy_voice.safe_mode_decision()
+        return deploy_voice.safe_mode_env(d), d
+    except BaseException:                    # noqa: BLE001 — замок не имеет права уронить подъём
+        alog.warning("замок безопасного режима отказал целиком — поднимаю БЕЗ права писать клиенту")
+        try:
+            # Имя флага названо здесь ВТОРОЙ раз в дереве СОЗНАТЕЛЬНО: это последний рубеж, и он
+            # не имеет права зависеть от того самого модуля, который только что отказал.
+            return dict(os.environ, SUGGEST_TEST_MODE="1"), None
+        except BaseException:
+            return None, None
+
+
+def _say_safe_mode(kind, decision):
+    """Причина безопасного режима ВСЛУХ сразу после `Popen`. Молчит законно, когда режима нет."""
+    try:
+        deploy_voice.announce_safe_mode(kind, deploy_voice.DOOR_START, decision, log_fn=alog.info)
+    except BaseException:                    # noqa: BLE001 — крик не отменяет состоявшийся подъём
+        pass
+
+
 class UserbotProcess:
     """Управляет жизненным циклом userbot_listen.py. Блокирующие методы зовём через to_thread."""
 
@@ -209,10 +243,12 @@ class UserbotProcess:
         # НИКОГДА не системным и НИКОГДА не сам себя (pc_agent.py).
         # ФИКС 1 (#128): stdout+stderr ребёнка → logs/userbot_stderr.log (смерть оставит traceback).
         logf = _child_log_handle("userbot")
+        child_env, lock = _safe_mode_gate("userbot")   # вердикт ДО запуска; None = не трогаем env
         self.proc = subprocess.Popen([str(VENV_PY), str(LISTEN_SCRIPT)], cwd=str(REPO_DIR),
                                      stdout=logf, stderr=subprocess.STDOUT,
-                                     creationflags=NO_WINDOW)
+                                     creationflags=NO_WINDOW, env=child_env)
         alog.info(f"userbot запущен агентом, PID {self.proc.pid}")
+        _say_safe_mode("userbot", lock)
 
         # 2) Подстраховка от гонки: подождём и перепроверим. Если экземпляров >1 —
         #    оставляем один, лишние убиваем. (singleton-гард в userbot_listen.py
@@ -345,10 +381,12 @@ class ModerbotProcess:
             return f"не нашёл python venv: {VENV_PY}"
         # ФИКС 1 (#128): stdout+stderr ребёнка → logs/moderbot_stderr.log (смерть оставит traceback).
         logf = _child_log_handle("moderbot")
+        child_env, lock = _safe_mode_gate("moderbot")  # вердикт ДО запуска; None = не трогаем env
         self.proc = subprocess.Popen([str(VENV_PY), str(MODERBOT_SCRIPT)], cwd=str(REPO_DIR),
                                      stdout=logf, stderr=subprocess.STDOUT,
-                                     creationflags=NO_WINDOW)
+                                     creationflags=NO_WINDOW, env=child_env)
         alog.info(f"moderation_bot запущен агентом, PID {self.proc.pid}")
+        _say_safe_mode("moderbot", lock)
         time.sleep(2.0)
         pids = _find_moderbot_pids()
         if not pids:

@@ -658,5 +658,239 @@ class TestIOLayer(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ══════ 6. ЗАМОК БЕЗОПАСНОГО РЕЖИМА: подъём ВСЕГДА, но без права писать клиенту (09.09.2026) ═══
+# Отрицательный тест обязателен и стои́т в центре: на НЕОДОБРЕННОМ коммите ребёнок поднят И флаг
+# выставлен И причина названа; на ОДОБРЕННОМ — флаг замком не выставлен сам собой. Контрфакт:
+# при снятом замке ТОТ ЖЕ вход даёт другой ответ.
+
+APPROVED_HASH = "1599bd7aa11"      # форма ключа реестра решений (сверяются первые 7 символов)
+UNAPPROVED_HASH = "f3e50ee2131"    # на нём дети живут с 08.09, и в реестре его нет
+
+
+def _head_of(commit):
+    return lambda repo=None: commit
+
+
+def _approves(*commits):
+    import client_contour as cc
+    keys = {cc.short(c) for c in commits}
+    return lambda commit, path=None: cc.short(commit) in keys
+
+
+def _freeze_holds(flag=None):
+    return True, ("контур ЗАМОРОЖЕН (pc_orchestrator.contour_frozen) — зелёный вердикт тренажёра "
+                  "ворот НЕ открывает; открыть может только поимённое «да» владельца")
+
+
+def _freeze_free(flag=None):
+    return False, ""
+
+
+def _boom(*a, **k):
+    raise RuntimeError("BOOM")
+
+
+def _decide(commit=UNAPPROVED_HASH, approves=(), freeze=_freeze_holds, env=None):
+    return dv.safe_mode_decision(head_fn=_head_of(commit), approved_fn=_approves(*approves),
+                                 freeze_fn=freeze, env=env or {})
+
+
+class TestSafeModeVerdict(unittest.TestCase):
+    """ЧАСТЬ 1: вердикт тремя уже существующими читателями, и он fail-closed."""
+
+    def test_unapproved_commit_gets_safe_mode(self):
+        d = _decide()
+        self.assertTrue(d.safe)
+        self.assertEqual(d.outcome, dv.NOT_APPROVED)
+        self.assertIn(UNAPPROVED_HASH[:dv.SHORT], d.commit)
+
+    def test_approved_commit_changes_nothing(self):
+        d = _decide(commit=APPROVED_HASH, approves=(APPROVED_HASH,))
+        self.assertFalse(d.safe)
+        self.assertEqual(d.outcome, dv.APPROVED)
+        self.assertIsNone(dv.safe_mode_env(d))
+
+    def test_approved_wins_over_freeze(self):
+        """Под заморозкой ворота открывает ПОИМЁННОЕ «да» — замок судит так же, а не строже."""
+        d = _decide(commit=APPROVED_HASH, approves=(APPROVED_HASH,), freeze=_freeze_holds)
+        self.assertFalse(d.safe)
+
+    def test_git_silent_is_not_permission(self):
+        d = _decide(commit=None)
+        self.assertTrue(d.safe)
+        self.assertEqual(d.outcome, dv.UNSURE)
+        self.assertIn("НЕИЗВЕСТЕН", d.reason)
+
+    def test_unreadable_registry_is_not_permission(self):
+        d = dv.safe_mode_decision(head_fn=_head_of(APPROVED_HASH), approved_fn=_boom,
+                                  freeze_fn=_freeze_holds, env={})
+        self.assertTrue(d.safe, "нечитаемый реестр решений НЕ имеет права значить «одобрено»")
+
+    def test_unreadable_freeze_holds(self):
+        d = dv.safe_mode_decision(head_fn=_head_of(UNAPPROVED_HASH), approved_fn=_approves(),
+                                  freeze_fn=_boom, env={})
+        self.assertTrue(d.safe)
+        self.assertEqual(d.outcome, dv.NOT_APPROVED)
+
+    def test_no_freeze_and_no_yes_is_unsure_not_green(self):
+        """Заморозка не держит — но прочих оснований замок НЕ ЧИТАЕТ, и «не знаю» ≠ «разрешено»."""
+        d = _decide(freeze=_freeze_free)
+        self.assertTrue(d.safe)
+        self.assertEqual(d.outcome, dv.UNSURE)
+
+    def test_total_failure_is_safe_mode(self):
+        d = dv.safe_mode_decision(head_fn=_boom, approved_fn=_boom, freeze_fn=_boom, env={})
+        self.assertTrue(d.safe, "отказ самого замка обязан кончаться безопасным режимом")
+
+    def test_lock_takes_the_freeze_reader_that_holds_on_unknown(self):
+        """ИЗ ДВУХ ФУНКЦИЙ ЗАМОРОЗКИ берём ту, что при незнании ДЕРЖИТ. Проверяем не по имени в
+        коде, а по вызову: `frozen()` (при незнании False) не должна звучать вовсе."""
+        import client_contour as cc
+        called = []
+        save_h, save_f = cc.freeze_holds_release, cc.frozen
+        try:
+            cc.freeze_holds_release = lambda flag=None: (called.append("holds"), (True, "з"))[1]
+            cc.frozen = lambda flag=None: called.append("frozen") or False
+            d = dv.safe_mode_decision(head_fn=_head_of(UNAPPROVED_HASH),
+                                      approved_fn=_approves(), env={})
+        finally:
+            cc.freeze_holds_release, cc.frozen = save_h, save_f
+        self.assertEqual(called, ["holds"], "замок позвал не ту функцию заморозки: %s" % called)
+        self.assertTrue(d.safe)
+
+    def test_raise_memory_is_not_consulted(self):
+        """НЕ СУДИТЬ ПО ПАМЯТИ ПОДЪЁМОВ: её пишет сам подъём и ПОСЛЕ start() — она свидетельствует
+        о себе. Ломаем оба её читателя: вердикт обязан получиться без них."""
+        save_p, save_r = dv.read_prev, dv.remember
+        try:
+            dv.read_prev, dv.remember = _boom, _boom
+            d = _decide()
+        finally:
+            dv.read_prev, dv.remember = save_p, save_r
+        self.assertEqual(d.outcome, dv.NOT_APPROVED)
+
+    def test_verdict_carries_no_permission_to_close_the_door(self):
+        """Замок дверь не закрывает: в вердикте нет поля, которое можно прочитать как «не поднимать»."""
+        self.assertEqual(set(dv.SafeMode._fields), {"safe", "outcome", "commit", "reason"})
+        self.assertIn(_decide().outcome, dv.SAFE_OUTCOMES)
+
+
+class TestSafeModeEnv(unittest.TestCase):
+    """ЧАСТЬ 2: флаг, который ребёнок УЖЕ умеет читать, кладётся в окружение запуска."""
+
+    def test_env_adds_the_flag_and_keeps_the_rest(self):
+        e = dv.safe_mode_env(_decide(), base={"KEEP": "1"})
+        self.assertEqual(e[dv.SAFE_MODE_ENV], dv.SAFE_MODE_ON)
+        self.assertEqual(e["KEEP"], "1")
+
+    def test_env_is_none_when_approved_so_popen_inherits_as_before(self):
+        d = _decide(commit=APPROVED_HASH, approves=(APPROVED_HASH,))
+        self.assertIsNone(dv.safe_mode_env(d, base={"KEEP": "1"}))
+
+    def test_lock_never_removes_an_existing_flag(self):
+        """ЗАМОК УМЕЕТ ТОЛЬКО ДОБАВЛЯТЬ. Одобренный коммит при уже стоящем флаге НЕ снимает его:
+        функция возвращает None, то есть окружение родителя уезжает к ребёнку как есть."""
+        base = {dv.SAFE_MODE_ENV: dv.SAFE_MODE_ON}
+        d = _decide(commit=APPROVED_HASH, approves=(APPROVED_HASH,))
+        self.assertIsNone(dv.safe_mode_env(d, base=base))
+        self.assertEqual(base[dv.SAFE_MODE_ENV], dv.SAFE_MODE_ON)
+
+    def test_flag_name_is_the_one_the_child_actually_reads(self):
+        """Голден против расхождения: имя флага сверяется с ЖИВЫМ кодом ребёнка, а не с памятью."""
+        with io.open(os.path.join(REPO, "suggest.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('_flag("%s"' % dv.SAFE_MODE_ENV, src)
+        self.assertIn("if %s:" % dv.SAFE_MODE_ENV, src)     # второй слой в send_to_client
+
+    def test_flag_value_is_accepted_by_the_child_reader(self):
+        """Значение флага сверяем со списком, который читает САМ ребёнок (`suggest._flag`), —
+        иначе замок выставил бы флаг, а ребёнок счёл бы его выключенным и промолчал об этом.
+        Список берём из ЖИВОГО исходника, а не из памяти: разойтись он может молча."""
+        with io.open(os.path.join(REPO, "suggest.py"), encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        truthy = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_flag":
+                for cmp_node in ast.walk(node):
+                    if isinstance(cmp_node, ast.Compare) and isinstance(cmp_node.ops[0], ast.In):
+                        truthy = ast.literal_eval(cmp_node.comparators[0])
+        self.assertIsNotNone(truthy, "не нашёл список истинных значений в suggest._flag")
+        self.assertIn(dv.SAFE_MODE_ON.lower(), truthy)
+
+
+class TestSafeModeVoice(unittest.TestCase):
+    """ЧАСТЬ 3: причина звучит ВСЛУХ в ту же секунду — какой коммит и что он не одобрен."""
+
+    def test_line_names_the_commit_and_the_reason(self):
+        line = dv.safe_mode_line(UB, dv.DOOR_START, _decide())
+        self.assertIn(UNAPPROVED_HASH[:dv.SHORT], line)
+        self.assertIn("НЕ одобрен", line)
+        self.assertIn(dv.SAFE_MODE_ENV, line)
+        self.assertIn(UB, line)
+        self.assertIn(dv.SAFE_WORDS, line)
+
+    def test_line_is_one_line_and_fits_the_journal(self):
+        line = dv.safe_mode_line(MB, dv.DOOR_START, _decide())
+        self.assertNotIn("\n", line)
+        self.assertLess(len(line), 600)
+
+    def test_line_is_silent_when_approved(self):
+        d = _decide(commit=APPROVED_HASH, approves=(APPROVED_HASH,))
+        self.assertEqual(dv.safe_mode_line(UB, dv.DOOR_START, d), "")
+        self.assertEqual(dv.safe_card_text(UB, dv.DOOR_START, d), "")
+
+    def test_card_names_commit_and_does_not_promise_a_button(self):
+        text = dv.safe_card_text(UB, dv.DOOR_START, _decide())
+        self.assertIn(UNAPPROVED_HASH[:dv.SHORT], text)
+        self.assertIn("НЕ снимает", text)
+
+    def test_announce_writes_journal_and_wakes_the_owner(self):
+        j, w, lg = [], [], []
+        said = dv.announce_safe_mode(UB, dv.DOOR_START, _decide(),
+                                     journal=j.append, wake=w.append, log_fn=lg.append)
+        self.assertTrue(said)
+        self.assertEqual(len(j), 1)
+        self.assertEqual(len(w), 1)
+        self.assertIn(UNAPPROVED_HASH[:dv.SHORT], j[0])
+        self.assertIn(UNAPPROVED_HASH[:dv.SHORT], w[0])
+        self.assertEqual(lg, [said])
+
+    def test_announce_is_silent_on_approved_commit(self):
+        j, w = [], []
+        d = _decide(commit=APPROVED_HASH, approves=(APPROVED_HASH,))
+        self.assertEqual(dv.announce_safe_mode(UB, dv.DOOR_START, d,
+                                               journal=j.append, wake=w.append), "")
+        self.assertEqual((j, w), ([], []))
+
+    def test_announce_never_breaks_the_raise(self):
+        for kw in ({"journal": _boom}, {"wake": _boom}, {"log_fn": _boom}, {"decision": None}):
+            d = kw.pop("decision", _decide())
+            kw.setdefault("journal", lambda s: None)
+            kw.setdefault("wake", lambda s: None)
+            dv.announce_safe_mode(UB, dv.DOOR_START, d, **kw)    # не бросает — этого и стережём
+
+
+class TestSafeModeCounterfactual(unittest.TestCase):
+    """Контрфакт: при СНЯТОМ замке тот же вход даёт другой ответ. Иначе тест ничего не меряет."""
+
+    def test_same_input_different_answer_when_the_lock_is_off(self):
+        on = _decide(env={})
+        off = _decide(env={dv.LOCK_OFF_ENV: "1"})
+        self.assertTrue(on.safe)
+        self.assertFalse(off.safe)
+        self.assertEqual(off.outcome, dv.LOCK_OFF)
+        self.assertIsNotNone(dv.safe_mode_env(on))
+        self.assertIsNone(dv.safe_mode_env(off))
+        self.assertNotEqual(dv.safe_mode_line(UB, dv.DOOR_START, on),
+                            dv.safe_mode_line(UB, dv.DOOR_START, off))
+
+    def test_the_voice_knob_does_not_switch_off_the_lock(self):
+        """`DEPLOY_VOICE_OFF` гасит рассказ о коммите — но не право писать клиенту: иначе одно
+        движение давало бы немого ребёнка МОЛЧА, ровно тот «ложный зелёный навсегда»."""
+        d = _decide(env={dv.OFF_ENV: "1"})
+        self.assertTrue(d.safe)
+        self.assertTrue(dv.safe_mode_line(UB, dv.DOOR_START, d))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

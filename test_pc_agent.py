@@ -9,10 +9,12 @@ import os
 import sys
 import time
 import types
+import shutil
 import asyncio
 import tempfile
 import subprocess
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import pc_agent as a
@@ -639,6 +641,137 @@ class TestBoxReleaseHandlerGolden(unittest.TestCase):
                   a.ALLOWED_USER_ID)
         self.assertEqual((self.chain, self.gate, self.box),
                          ([("stop", "42")], [("yes", "4aadeb0")], []))
+
+
+class _FakeProc:
+    def __init__(self, pid=4242):
+        self.pid = pid
+
+    def poll(self):
+        return None
+
+
+class TestSafeModeAtBothRaisePlaces(unittest.TestCase):
+    """ЗАМОК БЕЗОПАСНОГО РЕЖИМА (09.09.2026) — ОБА места подъёма, а не одно.
+
+    Реальные боты НЕ поднимаются: `subprocess.Popen` подменён целиком, PID-искатели тоже.
+    Стережём ровно две вещи, и обе — отрицательные:
+      • на НЕОДОБРЕННОМ коммите ребёнок ПОДНЯТ (Popen состоялся) И флаг выставлен И причина названа;
+      • на ОДОБРЕННОМ коммите замок в окружение не лезет вовсе (`env=None` = наследование, как было).
+    """
+
+    def setUp(self):
+        import deploy_voice as dv
+        self.dv = dv
+        self.tmp = tempfile.mkdtemp(prefix="pa_safe_")
+        self._logs, self._popen = a.LOGS_DIR, a.subprocess.Popen
+        self._sleep, self._ub, self._mb = a.time.sleep, a._find_userbot_pids, a._find_moderbot_pids
+        self._decide, self._say = dv.safe_mode_decision, dv.announce_safe_mode
+        a.LOGS_DIR = Path(self.tmp)
+        a.time.sleep = lambda *_a, **_k: None
+        a.subprocess.Popen = self._fake_popen
+        a._find_userbot_pids = self._pids
+        a._find_moderbot_pids = self._pids
+        dv.announce_safe_mode = self._fake_say
+        self._reset()
+
+    def _fake_say(self, kind, door, d, **k):
+        """Повторяет КОНТРАКТ настоящего крика: на неопасном вердикте он молчит законно (голден
+        этого молчания живёт в test_deploy_voice). Настоящий звать нельзя — он спавнит процессы."""
+        if d is None or not getattr(d, "safe", False):
+            return ""
+        self.said.append((kind, d))
+        return "сказано"
+
+    def _reset(self):
+        """Состояние ОДНОГО прогона. Патчи ставит setUp один раз: повторный его вызов из цикла
+        запомнил бы уже подменённые функции как «оригинал» и утёк бы патчами наружу."""
+        self.calls, self.said, self._seen = [], [], 0
+
+    def tearDown(self):
+        a.LOGS_DIR, a.subprocess.Popen = self._logs, self._popen
+        a.time.sleep, a._find_userbot_pids, a._find_moderbot_pids = self._sleep, self._ub, self._mb
+        self.dv.safe_mode_decision, self.dv.announce_safe_mode = self._decide, self._say
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _fake_popen(self, argv, **kw):
+        self.calls.append(kw)
+        try:
+            kw["stdout"].close()          # ручку лога ребёнка настоящий Popen забрал бы себе
+        except Exception:
+            pass
+        return _FakeProc()
+
+    def _pids(self):
+        """До запуска — пусто (иначе start() откажется), после — один живой PID."""
+        self._seen += 1
+        return [] if self._seen == 1 else [4242]
+
+    def _verdict(self, safe, outcome, commit="f3e50ee21"):
+        d = self.dv.SafeMode(safe, outcome, commit, "причина для теста")
+        self.dv.safe_mode_decision = lambda **k: d
+        return d
+
+    def _start(self, kind):
+        self._reset()
+        if kind == "userbot":
+            return a.UserbotProcess().start()
+        with mock.patch.dict(os.environ, {"MODERBOT_TOKEN": "x"}):
+            return a.ModerbotProcess().start()
+
+    def test_unapproved_commit_raises_the_child_and_mutes_it(self):
+        for kind in ("userbot", "moderbot"):
+            with self.subTest(kind=kind):
+                d = self._verdict(True, self.dv.NOT_APPROVED)
+                msg = self._start(kind)
+                self.assertEqual(len(self.calls), 1, "ребёнок НЕ поднят — замок закрыл дверь")
+                env = self.calls[0].get("env")
+                self.assertIsNotNone(env, "флаг безопасного режима не доехал до ребёнка")
+                self.assertEqual(env[self.dv.SAFE_MODE_ENV], self.dv.SAFE_MODE_ON)
+                self.assertIn("PID", msg)
+                self.assertEqual([s[1] for s in self.said], [d], "причина не названа вслух")
+
+    def test_approved_commit_leaves_the_environment_alone(self):
+        for kind in ("userbot", "moderbot"):
+            with self.subTest(kind=kind):
+                self._verdict(False, self.dv.APPROVED)
+                self._start(kind)
+                self.assertEqual(len(self.calls), 1)
+                self.assertIsNone(self.calls[0].get("env"),
+                                  "замок тронул окружение на ОДОБРЕННОМ коммите")
+                self.assertEqual(self.said, [], "на одобренном коммите крика быть не должно")
+
+    def test_broken_lock_still_raises_the_child_and_still_mutes_it(self):
+        """Отказ самого замка не имеет права ни отменить подъём, ни выдать право писать клиенту."""
+        def _boom(**k):
+            raise RuntimeError("BOOM")
+        for kind in ("userbot", "moderbot"):
+            with self.subTest(kind=kind):
+                self.dv.safe_mode_decision = _boom
+                self._start(kind)
+                self.assertEqual(len(self.calls), 1, "сломанный замок отменил подъём")
+                env = self.calls[0].get("env")
+                self.assertEqual(env[self.dv.SAFE_MODE_ENV], self.dv.SAFE_MODE_ON)
+
+    def test_both_raise_places_ask_the_lock(self):
+        """Мест подъёма РОВНО два, и оба спрашивают замок ДО Popen — сверка по живому исходнику."""
+        import ast as _ast
+        with open(a.__file__, encoding="utf-8") as f:
+            src = f.read()
+        child = []
+        for cls in _ast.walk(_ast.parse(src)):
+            if not isinstance(cls, _ast.ClassDef):
+                continue
+            for fn in cls.body:
+                if not (isinstance(fn, _ast.FunctionDef) and fn.name == "start"):
+                    continue
+                child += [n for n in _ast.walk(fn) if isinstance(n, _ast.Call)
+                          and isinstance(n.func, _ast.Attribute) and n.func.attr == "Popen"]
+        self.assertEqual(len(child), 2, "мест подъёма ребёнка стало не два: %d" % len(child))
+        for n in child:
+            self.assertTrue(any(k.arg == "env" for k in n.keywords),
+                            "место подъёма в строке %d не передаёт окружение" % n.lineno)
+        self.assertEqual(src.count("_safe_mode_gate("), 3)   # объявление + два места подъёма
 
 
 if __name__ == "__main__":
