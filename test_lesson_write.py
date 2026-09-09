@@ -167,7 +167,8 @@ class TestFourNegatives(_Base):
     def test_4_withdraw_takes_the_candidate_off_and_active_shows_it(self):
         """`withdraw()` снимает кандидата; строка при этом ОСТАЁТСЯ (числа строк совпадают)."""
         n_live = self.add_candidate()
-        LS.promote(n_live, why="клиент дважды спросил цену и не получил её", path=self.store)
+        LS.promote(n_live, why="клиент дважды спросил цену и не получил её", who="filipp",
+                   path=self.store)
         n_cand = self.add_candidate(correct="второй урок")
         self.assertEqual([l.number for l in LS.active(self.rows())], [n_live])
         self.assertEqual([l.number for l in LS.candidates(self.rows())], [n_cand])
@@ -188,7 +189,7 @@ class TestFourNegatives(_Base):
         self.assertEqual(len(rows), 2, "снятие удалило строку вместо пометки")
         self.assertTrue(LS.parse_state(rows[1].state)[0])
         # снятый кандидат в действующие уже не переводится
-        self.assertFalse(LS.promote(n_cand, why="передумал", path=self.store).ok)
+        self.assertFalse(LS.promote(n_cand, why="передумал", who="filipp", path=self.store).ok)
 
 
 # =======================================================================================
@@ -215,7 +216,7 @@ class TestWhyIsNeverInvented(_Base):
         """Названная причина ложится дословно (после вычистки персонального), строк не теряя."""
         n = self.add_candidate()
         why = "клиент спросил цену прямым текстом, а бот ушёл в «вернусь» — это потеря заявки"
-        res = LS.promote(n, why=why, path=self.store)
+        res = LS.promote(n, why=why, who="filipp", path=self.store)
         self.assertTrue(res.ok, res.reason)
         self.assertEqual(res.lines_before, res.lines_after)
         row = self.rows()[0]
@@ -223,14 +224,14 @@ class TestWhyIsNeverInvented(_Base):
         self.assertEqual(row.why, why)
         self.assertEqual([l.number for l in LS.active(self.rows())], [n])
         # Повторный перевод уже действующего урока — названный отказ, а не тихое «ок».
-        again = LS.promote(n, why=why, path=self.store)
+        again = LS.promote(n, why=why, who="filipp", path=self.store)
         self.assertFalse(again.ok)
         self.assertIn("не кандидат", again.reason)
 
     def test_candidate_may_carry_a_why_from_the_start(self):
         """Кандидат ВПРАВЕ иметь причину сразу — тогда `promote` берёт её из строки."""
         n = self.add_candidate(why="цена была посчитана и не названа")
-        res = LS.promote(n, path=self.store)
+        res = LS.promote(n, who="filipp", path=self.store)
         self.assertTrue(res.ok, res.reason)
         self.assertEqual(self.rows()[0].why, "цена была посчитана и не названа")
 

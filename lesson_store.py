@@ -100,10 +100,18 @@ lesson_store.py — ХРАНИЛИЩЕ УРОКОВ ТРЕНАЖЁРА. Отде
 переполнению НЕТ: превышение порога комфорта делает таблицу МЕДЛЕННЕЕ и говорит об этом
 вслух, но не теряет ни строки и не отказывает в записи.
 
+ПЕРЕВОД КАНДИДАТА В ДЕЙСТВУЮЩИЕ ЖИВЁТ ЗДЕСЬ, А ДВЕРЬ К НЕМУ — СНАРУЖИ (09.09.2026). До 09.09
+`promote()` не звал НИКТО, кроме тестов: петля обучения не замыкалась, и вердикт владельца
+правилом не становился ни при каком его старании. Теперь у перевода есть дверь (`lesson_promote.py`
+— CLI, и слово владельца в теме 205 через `pc_agent`), а у самого перевода — СЛЕД и ОТКАТ
+(`promote_log_path`, `rollback`). Право по-прежнему судит вызывающий; хранилище требует своё —
+непустую причину и ИМЯ автора перевода.
+
 ЗАПУСК:
     venv/Scripts/python.exe lesson_store.py --status          # ёмкость и целостность числами
     venv/Scripts/python.exe lesson_store.py --list            # активные уроки
     venv/Scripts/python.exe lesson_store.py --list --all      # вместе со снятыми
+    venv/Scripts/python.exe lesson_store.py --trace           # след переводов и откатов
 """
 
 import argparse
@@ -421,11 +429,15 @@ def _next_number(store):
     return top + 1
 
 
-def _append_row(target, row, need_header):
-    """Дозапись ОДНОЙ строки. `"a"` не усекает файл ни при каких обстоятельствах."""
+def _append_row(target, row, need_header, header=HEADER_LINE):
+    """Дозапись ОДНОЙ строки. `"a"` не усекает файл ни при каких обстоятельствах.
+
+    `header` назван параметром (а не взят из константы внутри) ради СЛЕДА ПЕРЕВОДА: у него своя
+    шапка и свои колонки, а дисциплина записи нужна ровно та же — дозапись плюс `fsync`. Второй
+    писатель с собственным `open` разошёлся бы с этим по мелочи молча."""
     with open(target, "a", encoding="utf-8", newline="") as f:
         if need_header:
-            f.write(HEADER_LINE + "\n")
+            f.write(header + "\n")
         f.write(row + "\n")
         f.flush()
         os.fsync(f.fileno())
@@ -620,13 +632,114 @@ def withdraw(number=None, day=None, who=None, path=None, now=None):
 REASON_PROMOTE_NO_WHY = ("кандидат НЕ переведён в действующие: причина не названа. Причину не "
                          "подставляем из текста урока — пусто значит пусто; назовите «почему» "
                          "словами и повторите")
+# АВТОР ПЕРЕВОДА (09.09.2026) — второе жёсткое требование, рядом с причиной и по той же причине.
+# Перевод обязан оставлять след из четырёх частей (автор, время, номер, откат), и безымянный след
+# не откатывается осмысленно: спросить не с кого, а «кто включил это правило всем клиентам» —
+# ровно тот вопрос, ради которого таблица и заведена. Проверка стои́т ЗДЕСЬ, в единственной
+# дороге в действующие, а не в вызывающем: иначе её обойдёт первый же новый вызывающий.
+REASON_PROMOTE_NO_WHO = ("кандидат НЕ переведён в действующие: не назван автор перевода. След "
+                         "перевода обязан нести имя — иначе откат некому приписать и спросить "
+                         "не с кого")
 REASON_PROMOTE_MISSING = "кандидата #%s в таблице нет"
 REASON_PROMOTE_NOT_CANDIDATE = "урок #%s не кандидат, а «%s» — переводить нечего"
 
-PromoteResult = namedtuple("PromoteResult", "ok number why reason lines_before lines_after")
+# ---------------------------------------------------------------------------------------
+# СЛЕД ПЕРЕВОДА и ОТКАТ (09.09.2026)
+# ---------------------------------------------------------------------------------------
+# ЗАЧЕМ ОТДЕЛЬНЫЙ ФАЙЛ, А НЕ КОЛОНКА В ТАБЛИЦЕ. Порядок и число колонок — часть формата
+# (`COLUMNS`), и девятая колонка переписала бы ВСЕ уже лежащие строки. А главное: у перевода
+# может быть больше одного события на урок (перевод → откат → снова перевод), и в одну клетку
+# история не ложится. След — своя ДОПИСЫВАЕМАЯ таблица рядом с таблицей уроков.
+#
+# ЧЕМ ОТКАТ ОТЛИЧАЕТСЯ ОТ СНЯТИЯ, и почему это НЕ одно и то же устройство. `withdraw` говорит
+# «этот урок больше не действует» и оставляет состояние `снят(...)` — то есть НОВОЕ состояние,
+# которого до перевода не было. Откат обязан вернуть РОВНО ТО, что было: состояние `кандидат`
+# и прежнее «почему» — включая пустое. Поэтому в след кладутся СЫРЫЕ (ещё экранированные) байты
+# полей до правки, и возвращаются они дословно, без круга «разобрать → собрать»: на чужой
+# последовательности (`\q`) этот круг не байт-в-байт, и «ровно то состояние» перестало бы быть
+# правдой на первом же уроке, который правили руками.
+PROMOTE_LOG_SUFFIX = ".promote"
+ACT_PROMOTE = "перевод"
+ACT_ROLLBACK = "откат"
+TRACE_COLUMNS = ("когда", "действие", "номер", "кто", "было_состояние", "было_почему",
+                 "стало_почему")
+TRACE_HEADER = "\t".join(TRACE_COLUMNS)
+
+REASON_ROLLBACK_NO_WHO = ("откат НЕ сделан: не назван автор отката. Откат — такое же движение "
+                          "правила, по которому бот отвечает всем клиентам, и безымянным он "
+                          "не бывает")
+REASON_ROLLBACK_NO_TRACE = ("откат НЕ сделан: перевода урока #%s в следе нет. Откатывать нечего — "
+                            "этот номер в действующие никто не переводил")
+REASON_ROLLBACK_DONE = "откат НЕ сделан: перевод урока #%s уже откачен (%s), второй раз нечего"
+REASON_ROLLBACK_MISSING = "откат НЕ сделан: урока #%s в таблице нет"
+REASON_ROLLBACK_MOVED = ("откат НЕ сделан: урок #%s после перевода изменился (состояние «%s») — "
+                         "откат вернул бы не то состояние, которое было до перевода. Ничего не "
+                         "тронуто; смотрите след перевода и решайте словами")
+
+Trace = namedtuple("Trace", "stamp act number who prev_state prev_why new_why line")
+
+PromoteResult = namedtuple("PromoteResult",
+                           "ok number why reason lines_before lines_after who stamp")
+RollbackResult = namedtuple("RollbackResult",
+                            "ok number state why reason lines_before lines_after who stamp")
 
 
-def promote(number, why="", path=None, now=None):
+def promote_log_path(path=None):
+    """Путь следа переводов — ВСЕГДА рядом со своей таблицей и производный от неё. Так тест,
+    подменивший таблицу временным файлом, автоматически уводит туда же и след: разъехаться
+    боевому следу с тестовой таблицей нечем."""
+    return _path(path) + PROMOTE_LOG_SUFFIX
+
+
+def _raw_fields(target, lineno):
+    """СЫРЫЕ (ещё экранированные) поля физической строки файла → список | None.
+
+    Нужно там, где важны БАЙТЫ, а не смысл: `Lesson` несёт уже разэкранированный текст, и
+    обратное `esc(unesc(x))` не тождественно на чужой последовательности."""
+    with open(target, encoding="utf-8", newline="") as f:
+        for idx, line in enumerate(f, start=1):
+            if idx != lineno:
+                continue
+            parts = line.rstrip("\n").rstrip("\r").split("\t")
+            return parts if len(parts) == len(COLUMNS) else None
+    return None
+
+
+def _trace_append(log_path, stamp, act, number, who, prev_state, prev_why, new_why):
+    """Одна строка следа. Дозапись + `fsync`, как у самой таблицы; шапка — своя."""
+    need_header = (not os.path.exists(log_path)) or os.path.getsize(log_path) == 0
+    row = "\t".join((stamp, act, str(number), esc(who.strip()), prev_state, prev_why, new_why))
+    _append_row(log_path, row, need_header, header=TRACE_HEADER)
+
+
+def load_trace(path=None, number=None):
+    """След переводов таблицы → кортеж Trace в порядке файла (`number=` — только этот урок).
+
+    Битая строка следа ПРОПУСКАЕТСЯ молча для читателя, но из файла не исчезает: след — тоже
+    дозаписываемая таблица, и стирающих веток у него нет ни одной."""
+    log_path = promote_log_path(path)
+    if not os.path.exists(log_path):
+        return ()
+    out = []
+    with open(log_path, encoding="utf-8", newline="") as f:
+        for idx, line in enumerate(f, start=1):
+            body = line.rstrip("\n").rstrip("\r")
+            if idx == 1 and body == TRACE_HEADER:
+                continue
+            parts = body.split("\t")
+            if len(parts) != len(TRACE_COLUMNS):
+                continue
+            got = _leading_number(parts[2])
+            if got is None:
+                continue
+            if number is not None and got != int(number):
+                continue
+            out.append(Trace(parts[0], parts[1], got, unesc(parts[3]), parts[4], parts[5],
+                             parts[6], idx))
+    return tuple(out)
+
+
+def promote(number, why="", who="", path=None, now=None):
     """Кандидат #number → ДЕЙСТВУЮЩИЙ урок. → PromoteResult (не бросает: отказ — это ответ).
 
     Причина берётся из аргумента `why`, а при пустом аргументе — из самой строки (кандидата могли
@@ -636,13 +749,24 @@ def promote(number, why="", path=None, now=None):
     не сможет отличить свою причину от подставленной.
 
     Право на этот переход судит ВЫЗЫВАЮЩИЙ (у полосы ПК — `moderation_core.may_write_rule`,
-    fail-closed): хранилище имён и списков не знает и знать не должно.
+    fail-closed): хранилище имён и списков не знает и знать не должно. АВТОРА (`who`) хранилище,
+    наоборот, требует само: имя нужно не для права, а для СЛЕДА, и без него перевод отказывает.
+
+    СЛЕД пишется ДО правки таблицы, и порядок выбран сознательно. Оборвись процесс между следом
+    и правкой — в следе будет запись о переводе, которого не случилось, и откат на неё честно
+    ответит «урок не в том состоянии» (строка всё ещё `кандидат`). Обратный порядок дал бы
+    ДЕЙСТВУЮЩИЙ урок без записи об откате — то есть правило, работающее на всех клиентов, которое
+    нечем вернуть. Из двух неполных исходов выбран тот, где лишняя строка следа, а не потерянный
+    откат.
 
     `lines_before`/`lines_after` в ответе — доказательство числом, что перевод не потерял строк."""
+    stamp = now_stamp(now)
+    author = who.strip() if isinstance(who, str) else ""
     target = _path(path)
     store = load(target)
     if not store.exists:
-        return PromoteResult(False, number, "", REASON_PROMOTE_MISSING % number, 0, 0)
+        return PromoteResult(False, number, "", REASON_PROMOTE_MISSING % number, 0, 0,
+                             author, stamp)
 
     found = None
     for les in store.lessons:
@@ -651,16 +775,21 @@ def promote(number, why="", path=None, now=None):
             break
     lines = _count_lines(target)
     if found is None:
-        return PromoteResult(False, number, "", REASON_PROMOTE_MISSING % number, lines, lines)
+        return PromoteResult(False, number, "", REASON_PROMOTE_MISSING % number, lines, lines,
+                             author, stamp)
     if not is_candidate(found):
         return PromoteResult(False, found.number, found.why,
                              REASON_PROMOTE_NOT_CANDIDATE % (found.number, found.state),
-                             lines, lines)
+                             lines, lines, author, stamp)
 
     given = why if isinstance(why, str) else ""
     final_why = given.strip() or found.why.strip()
     if len(final_why) == 0:
-        return PromoteResult(False, found.number, "", REASON_PROMOTE_NO_WHY, lines, lines)
+        return PromoteResult(False, found.number, "", REASON_PROMOTE_NO_WHY, lines, lines,
+                             author, stamp)
+    if len(author) == 0:
+        return PromoteResult(False, found.number, "", REASON_PROMOTE_NO_WHO, lines, lines,
+                             author, stamp)
 
     # Причина — живой текст владельца, и чистится тем же детектором, что остальные поля. Метки
     # считаются заново, поэтому `Лицо_1` в новой причине может обозначать НЕ того человека, что
@@ -670,12 +799,79 @@ def promote(number, why="", path=None, now=None):
     ok, reason, field = validate(found.question, found.bot_answer, found.correct, cleaned,
                                  found.who, found.when)
     if not ok:
-        return PromoteResult(False, found.number, cleaned, reason, lines, lines)
+        return PromoteResult(False, found.number, cleaned, reason, lines, lines, author, stamp)
 
-    before, after = _rewrite(target, {found.line: {IDX_WHY: esc(cleaned),
-                                                  IDX_STATE: STATE_ACTIVE}})
+    raw = _raw_fields(target, found.line)
+    if raw is None:                             # строка не той ширины — правим только целые
+        return PromoteResult(False, found.number, cleaned,
+                             REASON_PROMOTE_MISSING % found.number, lines, lines, author, stamp)
+    new_why = esc(cleaned)
+    _trace_append(promote_log_path(path), stamp, ACT_PROMOTE, found.number, author,
+                  raw[IDX_STATE], raw[IDX_WHY], new_why)
+    before, after = _rewrite(target, {found.line: {IDX_WHY: new_why, IDX_STATE: STATE_ACTIVE}})
     del field                                   # имя поля отказа здесь не нужно — ветка успешная
-    return PromoteResult(True, found.number, cleaned, "", before, after)
+    return PromoteResult(True, found.number, cleaned, "", before, after, author, stamp)
+
+
+def rollback(number, who="", path=None, now=None):
+    """ОТКАТ ПЕРЕВОДА урока #number → RollbackResult (не бросает: отказ — это ответ).
+
+    Возвращает РОВНО то состояние, которое было до перевода: прежнее состояние строки (`кандидат`)
+    и прежнее «почему» — теми же БАЙТАМИ, что лежали в файле. Доказательство — не обещание:
+    `test_lesson_promote` сверяет sha256 всей таблицы до перевода и после отката.
+
+    ТРИ ПРИЧИНЫ ОТКАЗАТЬ, и каждая названа своими словами, потому что чинятся они по-разному:
+    перевода в следе нет вовсе; перевод уже откачен; урок ПОСЛЕ перевода изменился (сняли,
+    перевели снова, поправили руками) — тогда откат вернул бы не то, что было, и мы не трогаем
+    ничего. Молчаливая правка «как получится» здесь опаснее отказа: владелец нажал «верни как
+    было», и получить он обязан либо это, либо внятное «не могу».
+
+    След отката дописывается ПОСЛЕ правки — обратный promote порядок, и по той же логике выбора:
+    оборванная запись оставит откат несделанным и повторимым, а не «откачено» на действующем
+    уроке, который вернуть уже нечем."""
+    stamp = now_stamp(now)
+    author = who.strip() if isinstance(who, str) else ""
+    target = _path(path)
+    n = int(number)
+    if len(author) == 0:
+        return RollbackResult(False, n, "", "", REASON_ROLLBACK_NO_WHO, 0, 0, author, stamp)
+
+    seen = load_trace(path, number=n)
+    last = seen[-1] if len(seen) > 0 else None
+    if last is None:
+        return RollbackResult(False, n, "", "", REASON_ROLLBACK_NO_TRACE % n, 0, 0, author, stamp)
+    if last.act != ACT_PROMOTE:
+        return RollbackResult(False, n, "", "", REASON_ROLLBACK_DONE % (n, last.stamp), 0, 0,
+                              author, stamp)
+
+    store = load(target)
+    found = None
+    for les in store.lessons:
+        if les.number == n:
+            found = les
+            break
+    lines = _count_lines(target) if store.exists else 0
+    if found is None:
+        return RollbackResult(False, n, "", "", REASON_ROLLBACK_MISSING % n, lines, lines,
+                              author, stamp)
+
+    raw = _raw_fields(target, found.line)
+    # СВЕРКА С БАЙТАМИ, А НЕ СО СМЫСЛОМ: откатываем ровно тот перевод, который лежит в строке
+    # сейчас. «Действующий» спрашиваем у `is_active` — единственного места, где написано, что это
+    # значит; второе сравнение с литералом состояния было бы вторым определением. «Почему» сверяем
+    # ДОСЛОВНО с тем, что записал перевод: правка руками между переводом и откатом обязана быть
+    # видна, а не затёрта откатом.
+    if raw is None or not is_active(found) or raw[IDX_WHY] != last.new_why:
+        return RollbackResult(False, n, found.state, found.why,
+                              REASON_ROLLBACK_MOVED % (n, found.state), lines, lines,
+                              author, stamp)
+
+    before, after = _rewrite(target, {found.line: {IDX_WHY: last.prev_why,
+                                                  IDX_STATE: last.prev_state}})
+    _trace_append(promote_log_path(path), stamp, ACT_ROLLBACK, n, author,
+                  raw[IDX_STATE], last.new_why, last.prev_why)
+    return RollbackResult(True, n, last.prev_state, unesc(last.prev_why), "", before, after,
+                          author, stamp)
 
 
 # ---------------------------------------------------------------------------------------
@@ -763,6 +959,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="хранилище уроков тренажёра (чтение)")
     ap.add_argument("--status", action="store_true", help="ёмкость и целостность числами")
     ap.add_argument("--list", action="store_true", help="перечислить уроки")
+    ap.add_argument("--trace", action="store_true", help="след переводов и откатов")
     ap.add_argument("--all", action="store_true", help="вместе со снятыми")
     ap.add_argument("--who", help="только уроки этого человека")
     ap.add_argument("--day", help="только уроки за сутки ГГГГ-ММ-ДД")
@@ -770,6 +967,16 @@ def main(argv=None):
     args = ap.parse_args(sys.argv[1:] if argv is None else argv)
 
     store = load(args.path)
+    if args.trace:
+        seen = load_trace(args.path)
+        print("след: %s (%s)" % (promote_log_path(args.path),
+                                 "есть" if len(seen) > 0 else "пуст или не заведён"))
+        for t in seen:
+            print("%s  %-7s #%-4d %-16s было «%s» → стало «%s»"
+                  % (t.stamp, t.act, t.number, t.who, unesc(t.prev_state), unesc(t.new_why)))
+        print("— всего движений: %d" % len(seen))
+        return 0
+
     if not args.list:
         cap = capacity(args.path)
         integ = integrity(args.path)

@@ -114,10 +114,13 @@ class _Base(unittest.TestCase):
 
     # --- сущности песочницы ----------------------------------------------------
     def add_active(self, correct=RULE, why=WHY, who="filipp", when="2026-09-06T10:00:00Z"):
-        """Действующий урок в базе (через штатный путь: кандидат → promote с причиной)."""
+        """Действующий урок в базе (через штатный путь: кандидат → promote с причиной и автором).
+
+        `who=` у перевода обязателен с 09.09.2026: перевод оставляет след из четырёх частей
+        (автор, время, номер, откат), и безымянный перевод хранилище отклоняет само."""
         n = LS.add_candidate(question=Q, bot_answer=A, correct=correct, who=who, when=when,
                              path=self.store)
-        res = LS.promote(n, why=why, path=self.store)
+        res = LS.promote(n, why=why, who=who, path=self.store)
         self.assertTrue(res.ok, res.reason)
         return n
 

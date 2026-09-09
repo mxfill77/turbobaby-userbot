@@ -20,6 +20,11 @@ pc_agent.py — удалённое управление userbot'ом с теле
                               последние ~5 строк); если лог большой — выжимка + ПОЛНЫЙ лог файлом
   ящик снять <метка>        → снять сигнальную остановку ящика Штаба (та же дверь, что у кнопки
                               под извещением: shtab_box_run.py --free <метка>)
+  урок кандидаты            → уроки, записанные кнопкой «Обучить», но ещё НЕ включённые
+  урок включи N: причина    → перевести кандидата #N в ДЕЙСТВУЮЩИЕ (lesson_promote.py; без
+                              причины — отказ, право судит moderation_core.may_write_rule)
+  урок откати N             → вернуть урок #N ровно в состояние до включения (не «снять»)
+  урок след                 → кто, когда и какой урок включал
   иное → подсказка со списком команд
 
 Большие выводы (>3500 символов) — файлом (send_document), в тексте короткая выжимка.
@@ -629,6 +634,10 @@ KNOWN_COMMANDS = (
     "сводка (summary) — дайджест лога",
     "обновись (restart) — само-рестарт агента",
     "ящик снять <метка> — снять сигнальную остановку ящика Штаба (метка — из извещения)",
+    "урок кандидаты — какие уроки записаны, но ещё НЕ включены",
+    "урок включи N: причина — включить кандидата #N (без причины — отказ)",
+    "урок откати N — вернуть урок #N ровно в то состояние, что было до включения",
+    "урок след — кто, когда и какой урок включал",
 )
 
 
@@ -755,6 +764,96 @@ def _box_cli(action, mark):
     except Exception as e:
         return (f"ящик Штаба: снятие метки {mark} НЕ прошло ({type(e).__name__}: {e}). "
                 f"Запасной путь — {BOX_ANSWER_AT}.")
+
+
+# ── СЛОВО ВЛАДЕЛЬЦА: ВКЛЮЧИТЬ УРОК / ОТКАТИТЬ ВКЛЮЧЕНИЕ (09.09.2026) ────────────────────────
+# ЧТО ЭТО ЗА ДВЕРЬ И ПОЧЕМУ ОНА ЗДЕСЬ. Кнопка «🎓 Обучить» в тренажёре кладёт урок КАНДИДАТОМ, а
+# кандидата бот не читает: действующим он становится ОТДЕЛЬНЫМ действием (`lesson_store.promote`).
+# До 09.09 это действие не звал никто, кроме тестов, — то есть вердикт владельца правилом не
+# становился ни при каком его старании. Дверь нужна такая, до которой владелец дотягивается С
+# ТЕЛЕФОНА, и тема 205 — единственная его дверь на ПК, которую можно завести, не трогая ни
+# клиентского бота, ни модербота: ровно тем же устройством, что «ящик снять <метка>».
+#
+# ЧТО ДЕЛАЕТ СЛОВО: зовёт `lesson_promote.py` субпроцессом — ту же дверь, что и с консоли. Право
+# судит НЕ агент: allowlist темы 205 решает «пускать ли к команде», а «вправе ли этот человек
+# менять правила бота» решает `moderation_core.may_write_rule` внутри двери, по ИМЕНИ в Telegram.
+# Два гейта здесь не дублируют друг друга — они про разное, и слабее ни один не делает.
+#
+# ПРИЧИНА ЕДЕТ ДОСЛОВНО, И ПОЭТОМУ РАЗБИРАЕТСЯ ИЗ ОРИГИНАЛА СООБЩЕНИЯ. Роутер темы 205 работает
+# на `text` = `msg.text.lower()`, и причина, проехавшая через него, легла бы в таблицу уроков
+# строчными буквами навсегда. Здесь берётся `msg.text` как есть.
+LESSON_ON_RE = re.compile(
+    r"^(?:урок|lesson)[\s:]+(?:включи(?:ть)?|on)\s+#?(\d+)\s*[:\-—]?\s*(.*)$",
+    re.IGNORECASE | re.DOTALL)
+LESSON_BACK_RE = re.compile(r"^(?:урок|lesson)[\s:]+(?:откати(?:ть)?|rollback)\s+#?(\d+)$",
+                            re.IGNORECASE)
+LESSON_LIST_RE = re.compile(r"^(?:урок|lesson)[\s:]+(?:кандидаты|candidates)$", re.IGNORECASE)
+LESSON_TRACE_RE = re.compile(r"^(?:урок|lesson)[\s:]+(?:след|trace)$", re.IGNORECASE)
+# «Почти команда» — чтобы промах формой не уехал в общее «не знаю»: команду мы знаем, не
+# разобрался ХВОСТ. Тот же довод, что у `BOX_WORD_HEAD_RE`.
+LESSON_HEAD_RE = re.compile(
+    r"^(?:урок|lesson)[\s:]+(?:включи(?:ть)?|откати(?:ть)?|кандидаты|след|on|rollback"
+    r"|candidates|trace)\b", re.IGNORECASE)
+LESSON_ANSWER_AT = ("тема «PC-дев» / консоль ПК, командой "
+                    "«venv/Scripts/python.exe lesson_promote.py --who <имя> --promote N "
+                    "--why \"причина\"»")
+
+
+def lesson_word(text):
+    """Слово владельца про урок → (действие, номер, причина) | None (не наша команда).
+
+    ЧИСТАЯ функция, поэтому голденится без Telegram. Действия: `promote` (номер и причина),
+    `rollback` (номер), `candidates`/`trace` (без номера). Регистр команды не значим, а регистр
+    ПРИЧИНЫ сохраняется дословно — её текст ложится в таблицу уроков и читается человеком."""
+    body = " ".join(str(text or "").split()).strip().lstrip("/").strip()
+    if not body:
+        return None
+    m = LESSON_ON_RE.match(body)
+    if m:
+        return ("promote", int(m.group(1)), m.group(2).strip())
+    m = LESSON_BACK_RE.match(body)
+    if m:
+        return ("rollback", int(m.group(1)), "")
+    if LESSON_LIST_RE.match(body):
+        return ("candidates", None, "")
+    if LESSON_TRACE_RE.match(body):
+        return ("trace", None, "")
+    return None
+
+
+def _lesson_cli(action, number, why, who):
+    """Движение уроком через `lesson_promote.py` → текст ответа.
+
+    Субпроцессом и той же механикой, что `_box_cli`/`_gate_cli`, по той же причине: агент роутит
+    слово и показывает результат, а решение о праве, причине и следе принимает дверь. Слова исхода
+    печатает ДВЕРЬ, а не мы: вторая формулировка того же исхода разошлась бы с первой молча."""
+    if not VENV_PY.exists():
+        return f"урок: не нашёл python venv ({VENV_PY})."
+    argv = [str(VENV_PY), str(REPO_DIR / "lesson_promote.py")]
+    # `who` и `why` приходят УЖЕ строками: имя нормализует единственное место, где «имени нет»
+    # что-то значит (роутер темы 205), а причину отдаёт `lesson_word`, у которой пустая причина
+    # это `""`, а не `None`. Второй раз подставлять здесь пустую строку значило бы завести ВТОРОЕ
+    # место, решающее, что такое «нет имени», — и разъехаться с первым молча.
+    if action == "promote":
+        argv += ["--who", who, "--promote", str(int(number)), "--why", why]
+    elif action == "rollback":
+        argv += ["--who", who, "--rollback", str(int(number))]
+    elif action == "candidates":
+        argv += ["--candidates"]
+    elif action == "trace":
+        argv += ["--trace"]
+    else:
+        return f"урок: не понял действие ({action})."
+    try:
+        r = subprocess.run(
+            argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120, cwd=str(REPO_DIR), creationflags=NO_WINDOW,
+        )
+        out = (r.stdout or "").strip() or (r.stderr or "").strip()
+        return out or (f"урок: пустой ответ на «{action}». Запасной путь — {LESSON_ANSWER_AT}.")
+    except Exception as e:
+        return (f"урок: движение «{action}» НЕ прошло ({type(e).__name__}: {e}). "
+                f"Запасной путь — {LESSON_ANSWER_AT}.")
 
 
 def _gate_cb_parse(data):
@@ -1049,6 +1148,24 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mark = box_word_mark(text)
             alog.info("команда: снять остановку ящика, метка %s", mark)
             await _send(context, chat_id, await asyncio.to_thread(_box_cli, "free", mark))
+
+        elif lesson_word(msg.text):
+            # ПРИЧИНА БЕРЁТСЯ ИЗ ОРИГИНАЛА (`msg.text`), а не из `text`: тот приведён к нижнему
+            # регистру для сверки команд, и причина уехала бы в таблицу уроков строчной навсегда.
+            act, num, why = lesson_word(msg.text)
+            author = (user.username or "").strip() if user else ""
+            alog.info("команда урока: %s #%s от @%s", act, num, author or "?")
+            await _send(context, chat_id,
+                        await asyncio.to_thread(_lesson_cli, act, num, why, author))
+
+        elif LESSON_HEAD_RE.match(text):
+            # ПОЧТИ КОМАНДА — ЭТО РЕШЕНИЕ ВЛАДЕЛЬЦА, А НЕ МУСОР (тот же довод, что у ящика):
+            # общая подсказка «не знаю «урок …»» здесь врёт — команду мы знаем, не разобрался хвост.
+            alog.info("движение уроком: хвост не разобран в %r", (msg.text or "")[:120])
+            await _send(context, chat_id,
+                        "⚠️ Не разобрал команду урока. Формы: «урок включи 7: причина словами» · "
+                        "«урок откати 7» · «урок кандидаты» · «урок след». Номер — из карточки "
+                        "записи кандидата. Ничего не изменено.")
 
         elif BOX_WORD_HEAD_RE.match(text):
             # ПОЧТИ КОМАНДА — ЭТО ОТВЕТ ВЛАДЕЛЬЦА, А НЕ МУСОР. Общая подсказка

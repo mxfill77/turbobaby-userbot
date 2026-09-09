@@ -140,7 +140,8 @@ class TestOnlyActiveReachTheAnswer(_Base):
         а не когда был записан. Ворота «действующий урок всегда с причиной» на месте."""
         n, text = self.add_candidate("КАНДИДАТ предлагай шлем в подарок на неделю")
         self.assertNotIn(text, self.prompt())
-        LS.promote(n, why="владелец назвал причину при подтверждении", path=self.store)
+        LS.promote(n, why="владелец назвал причину при подтверждении", who="filipp",
+                   path=self.store)
         self.assertIn(text, self.prompt(), "утверждённый урок в ответ не попал")
 
     def test_candidate_alone_leaves_the_learned_section_empty(self):

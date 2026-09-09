@@ -1729,3 +1729,151 @@ def cancel_lesson(n, who=None, may_write=None, withdraw=None, find=None, remove_
         return {"status": "error", "n": _to_int(n), "who": None,
                 "card": f"⚠️ Урок #{n} не отменён — внутренняя ошибка ({type(e).__name__}), "
                         "см. лог процесса. Команду можно повторить."}
+
+
+# ====== ПЕРЕВОД КАНДИДАТА В ДЕЙСТВУЮЩИЕ И ОТКАТ ПЕРЕВОДА (09.09.2026) =======================
+# ЧЕГО НЕ ХВАТАЛО, НАЗВАНО ЧИСЛОМ, А НЕ СЛОВОМ «недоделано». `lesson_store.promote` живёт с
+# 05.09, и до 09.09 его не звал НИ ОДИН файл дерева, кроме тестов (`test_lesson_write`,
+# `test_lesson_cancel`, `test_lesson_read` — грепом по дереву верхнего уровня совпадений вне них
+# ноль). Следствие было не косметическим: кнопка «🎓 Обучить» писала КАНДИДАТА, кандидата не
+# читает `active()`, а перевести его в действующие было НЕЧЕМ — то есть вердикт владельца не
+# становился правилом ни при каком его старании, и петля обучения не замыкалась вовсе.
+#
+# ПЕРЕВОД — ОТДЕЛЬНОЕ ДЕЙСТВИЕ, А НЕ ХВОСТ ВЕРДИКТА, и это решение, а не удобство. Нажатие
+# «Обучить» по-прежнему кладёт кандидата и НЕ включает ничего (`lesson_candidate` не зовёт
+# `promote` ни одной веткой — заперто тестом). Цена ошибки у записи и у включения разная:
+# записать замечание должно быть дёшево, а начать отвечать по нему ВСЕМ клиентам — дорого, и
+# второе требует отдельного «да» с причиной.
+#
+# ПРАВО — ТО ЖЕ, ЧТО У ЗАПИСИ И У ОТМЕНЫ: `moderation_core.may_write_rule` (fail-closed, пустой
+# список прав = НИКОМУ). Своего списка здесь нет и быть не должно: три конца одной ручки, которой
+# владелец меняет то, по чему бот отвечает всем клиентам, обязаны судиться одним механизмом.
+#
+# СЛЕД ИЗ ЧЕТЫРЁХ ЧАСТЕЙ (автор, время, номер, откат) пишет ХРАНИЛИЩЕ, а не эта функция:
+# `lesson_store.promote` требует имя автора сам и сам дописывает строку следа. Здесь только
+# гейт права, вопрос-ответ владельцу словами и карточка.
+STATUS_PROMOTED = "promoted"
+STATUS_NO_WHY = "no_why"
+STATUS_ROLLED_BACK = "rolled_back"
+STATUS_REFUSED = "refused"
+
+
+def _default_promote(number, why, who, path=None, now=None):
+    import lesson_store
+    return lesson_store.promote(number, why=why, who=who, path=path, now=now)
+
+
+def _default_rollback(number, who, path=None, now=None):
+    import lesson_store
+    return lesson_store.rollback(number, who=who, path=path, now=now)
+
+
+def _actor_for(who, get=None, now=None):
+    """Имя того, кто делает движение правилом → строка (пусто = не видно КТО).
+
+    Читаем НЕ ГАСЯ (`peek_actor`), ровно по доводу `_cancel_lesson`: запись автора одноразова и
+    приготовлена для следующего «урок: …», а перевод не вправе портить чужое движение."""
+    name = (who or "").strip().lstrip("@")
+    if name:
+        return name
+    return (peek_actor(now=now, get=get) or "").strip().lstrip("@")
+
+
+def _promote_lesson(n, why=None, who=None, may_write=None, promote=None, get=None, now=None,
+                    path=None):
+    """Ядро promote_lesson (может бросить — снаружи fail-safe обёртка)."""
+    num = _to_int(n)
+    if num is None:
+        return {"status": "error", "n": None, "who": None,
+                "card": f"⚠️ Не разобрал номер урока в «{n}» — назови число: "
+                        "«урок включи 7: причина словами»."}
+    author = _actor_for(who, get=get, now=now)
+    if not author:
+        return {"status": STATUS_NO_AUTHOR, "n": num, "who": None,
+                "card": f"⛔ Урок #{num} НЕ включён: не видно, КТО включает. Перевод кандидата в "
+                        "действующие идёт под тем же правом, что запись и отмена, а право "
+                        "судится по имени."}
+    if not (may_write or _default_may_write)(author):
+        return {"status": STATUS_DENIED, "n": num, "who": author,
+                "card": f"⛔ Нет прав на перевод уроков — урок #{num} НЕ включён. Включение "
+                        "требует того же права, что и запись."}
+    # ПРИЧИНА СПРАШИВАЕТСЯ ЗДЕСЬ ТОЖЕ, и это не дубль проверки хранилища: владельцу нужен внятный
+    # ответ на СВОИХ словах, а хранилище проверит то же самое ещё раз — оно не верит никому.
+    reason_text = " ".join(str(why or "").split()).strip()
+    res = (promote or _default_promote)(num, reason_text, author, path=path, now=now)
+    if not res.ok:
+        status = STATUS_NO_WHY if "причина не названа" in res.reason else STATUS_REFUSED
+        return {"status": status, "n": num, "who": author, "reason": res.reason,
+                "card": f"⛔ Урок #{num} НЕ включён: {res.reason}."}
+    return {"status": STATUS_PROMOTED, "n": num, "who": author, "why": res.why,
+            "lines_before": res.lines_before, "lines_after": res.lines_after,
+            "card": f"✅ Урок #{num} ВКЛЮЧЁН — бот отвечает по нему со следующего ответа.\n"
+                    f"📌 Причина: {res.why}\n"
+                    f"📌 След: включил @{author}, {res.stamp}, номер {num}. Вернуть как было — "
+                    f"«урок откати {num}» (строк было {res.lines_before}, стало "
+                    f"{res.lines_after} — ничего не потеряно)."}
+
+
+def promote_lesson(n, why=None, who=None, may_write=None, promote=None, get=None, now=None,
+                   path=None):
+    """«урок включи N: причина» — ПЕРЕВОД КАНДИДАТА #N В ДЕЙСТВУЮЩИЕ (`lesson_store.promote`).
+
+    N — номер БАЗЫ уроков (его называет карточка записи кандидата). Право —
+    `moderation_core.may_write_rule` (то же, что у записи и у «отмени урок N»; пустой список
+    прав = НИКОМУ). Причина ОБЯЗАТЕЛЬНА и не подставляется ниоткуда: пустая → отказ словами.
+    → dict(status, card, n, who, …) со статусами `promoted` | `no_why` | `refused` | `denied` |
+    `no_author` | `error`.
+
+    may_write/promote/get/now/path инъектируются в тестах; иначе боевые `moderation_core` +
+    `lesson_store`. НИКОГДА не бросает: исключение внутри → status='error' + карточка-ошибка."""
+    try:
+        return _promote_lesson(n, why, who, may_write, promote, get, now, path)
+    except Exception as e:
+        log.warning("promote_lesson(#%s) упал: %s: %s", n, type(e).__name__, e, exc_info=True)
+        return {"status": "error", "n": _to_int(n), "who": None,
+                "card": f"⚠️ Урок #{n} не включён — внутренняя ошибка ({type(e).__name__}), "
+                        "см. лог процесса. Команду можно повторить."}
+
+
+def _rollback_promotion(n, who=None, may_write=None, rollback=None, get=None, now=None,
+                        path=None):
+    """Ядро rollback_promotion (может бросить — снаружи fail-safe обёртка)."""
+    num = _to_int(n)
+    if num is None:
+        return {"status": "error", "n": None, "who": None,
+                "card": f"⚠️ Не разобрал номер урока в «{n}» — назови число: «урок откати 7»."}
+    author = _actor_for(who, get=get, now=now)
+    if not author:
+        return {"status": STATUS_NO_AUTHOR, "n": num, "who": None,
+                "card": f"⛔ Откат перевода урока #{num} НЕ сделан: не видно, КТО откатывает."}
+    if not (may_write or _default_may_write)(author):
+        return {"status": STATUS_DENIED, "n": num, "who": author,
+                "card": f"⛔ Нет прав — откат перевода урока #{num} НЕ сделан."}
+    res = (rollback or _default_rollback)(num, author, path=path, now=now)
+    if not res.ok:
+        return {"status": STATUS_REFUSED, "n": num, "who": author, "reason": res.reason,
+                "card": f"⛔ {res.reason}."}
+    return {"status": STATUS_ROLLED_BACK, "n": num, "who": author, "state": res.state,
+            "lines_before": res.lines_before, "lines_after": res.lines_after,
+            "card": f"↩️ Перевод урока #{num} ОТКАЧЕН: состояние вернулось в «{res.state}», "
+                    f"причина — в то же значение, что была до включения. Бот по этому уроку "
+                    f"больше не отвечает.\n"
+                    f"📌 След: откатил @{author}, {res.stamp}, номер {num} (строк было "
+                    f"{res.lines_before}, стало {res.lines_after})."}
+
+
+def rollback_promotion(n, who=None, may_write=None, rollback=None, get=None, now=None, path=None):
+    """«урок откати N» — ОТКАТ ПЕРЕВОДА урока #N (`lesson_store.rollback`).
+
+    Возвращает РОВНО то состояние строки, которое было до перевода (состояние и «почему» теми же
+    байтами), а не «снимает» урок: снятие — это «отмени урок N», и оно кладёт третье, НОВОЕ
+    состояние `снят(...)`, которого до перевода не было. Право — то же `may_write_rule`.
+    → dict(status, card, n, who, …) со статусами `rolled_back` | `refused` | `denied` |
+    `no_author` | `error`. НИКОГДА не бросает."""
+    try:
+        return _rollback_promotion(n, who, may_write, rollback, get, now, path)
+    except Exception as e:
+        log.warning("rollback_promotion(#%s) упал: %s: %s", n, type(e).__name__, e, exc_info=True)
+        return {"status": "error", "n": _to_int(n), "who": None,
+                "card": f"⚠️ Откат перевода урока #{n} не сделан — внутренняя ошибка "
+                        f"({type(e).__name__}), см. лог процесса. Команду можно повторить."}
