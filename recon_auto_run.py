@@ -353,7 +353,9 @@ class Queue(review_intake_run.Queue):
         if not ok:
             return False, None, str(err or "enqueue отклонён")
         d.bc.claim_task(tid)
-        res = d.bc.set_needs_approval(tid, text, topic=d.NEEDS_APPROVAL_TOPIC)
+        # `frm` называем ЯВНО: второй признак маршрута (`_is_owner_work`) судит по `from`
+        # ряда, а не по тексту, и выведенное из маркера значение слабее настоящего.
+        res = d.bc.set_needs_approval(tid, text, topic=d.NEEDS_APPROVAL_TOPIC, frm=ASK_FROM)
         if not (isinstance(res, dict) and res.get("ok")):
             why = str((res or {}).get("error_text") or (res or {}).get("error")
                       or "мост не ответил распиской")

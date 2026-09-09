@@ -840,6 +840,90 @@ def _bridge_budget_note(budget=None, logger=None):
     return line
 
 
+# ═══ МАРШРУТ ИНФОРМАЦИОННОЙ ЗАЯВКИ: СПИСКОМ, А НЕ КАРТОЧКОЙ (09.09.2026) ═════════
+# Решает чистый слой `zayavki_route_pc`; здесь только руки: спросить второй признак,
+# записать снятое в реестр и КРИКНУТЬ в лог. Разбор, числа и оба признака — в шапке
+# того модуля; повторять их здесь значит завести вторую редакцию правила.
+#
+# ПОЧЕМУ ИМПОРТ ЛЕНИВЫЙ. `zayavki_route_pc` тянет `shtab_box_signals`, а тот —
+# `contour_digest`/`recon_auto`/`shtab_box`: куст на импорте демона (тот же приём и
+# по той же причине, что у ступени G — `import zayavki_pc_run` внутри функции).
+#
+# СБОЙ ЛЮБОЙ ЧАСТИ = ПРЕЖНИЙ МАРШРУТ. Не смогли разобрать ряд, не поднялся модуль,
+# не записался реестр — карточка уходит владельцу, как вчера. Направление отказа
+# названо вслух: заглушенный вопрос владельца дороже лишней карточки.
+_ROUTE_REGISTRY = "zayavki_route_pc_state.json"
+
+
+def _route_enabled():
+    return str(os.getenv("ZAYAVKI_ROUTE_PC_OFF") or "").strip().lower() not in ("1", "true", "yes", "on")
+
+
+def _route_registry_path():
+    """Реестр маршрута. Под тестом уезжает в temp — тем же дискриминатором, которым
+    полоса уже уводит боевые логи и спулы (`log_setup.state_path`, класс «гейт съел спул»)."""
+    try:
+        import log_setup
+        return log_setup.state_path(os.path.join(REPO, _ROUTE_REGISTRY))
+    except Exception:
+        return os.path.join(REPO, _ROUTE_REGISTRY)
+
+
+def _route_registry_write(row, verdict):
+    """Снятую с инбокса заявку — в реестр (атомарно). → bool «записали»."""
+    path = _route_registry_path()
+    try:
+        try:
+            with open(path, encoding="utf-8") as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            state = {}
+        import zayavki_route_pc
+        fresh = zayavki_route_pc.registry_add(
+            state, row, verdict, datetime.datetime.now(datetime.timezone.utc).timestamp())
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(fresh, f, ensure_ascii=False, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        log.warning("маршрут заявок: реестр не записан (%s) — карточку НЕ снимаем", e)
+        return False
+
+
+def _route_needs_approval(tid, what, topic, frm=None):
+    """Ряд, которому просят карточку → тема карточки или None. → тема|None.
+
+    Снятие карточки и запись в реестр СЦЕПЛЕНЫ: реестр не лёг — тема остаётся, и
+    заявка уезжает карточкой. Иначе снятое исчезло бы без следа, а это прямой
+    запрет задания («ничего не подавлять молча»)."""
+    try:
+        import zayavki_route_pc
+    except Exception as e:
+        log.warning("маршрут заявок: модуль не поднялся (%s) — карточка как прежде", e)
+        return topic
+    try:
+        row = {"id": tid, "task_text": what, "status": "needs_approval"}
+        if str(frm or "").strip():
+            row["from"] = str(frm).strip()
+        frm, _how = zayavki_route_pc.from_of(row)
+        verdict = zayavki_route_pc.decide(
+            dict(row, **{"from": frm}),
+            owner_work=_is_owner_work({"from": frm, "task_text": what}, ()),
+            enabled=_route_enabled())
+        new_topic, aloud = zayavki_route_pc.card_topic(verdict, topic)
+        if not aloud:
+            return topic
+        if not _route_registry_write(row, verdict):
+            return topic
+        log.info("МАРШРУТ ЗАЯВОК: #%s снята с инбокса владельца — %s | %s",
+                 tid, verdict.get("why"), zayavki_route_pc.list_line(row, verdict))
+        return new_topic
+    except Exception as e:
+        log.warning("маршрут заявок: разбор ряда #%s упал (%s) — карточка как прежде", tid, e)
+        return topic
+
+
 # ------------------------------- Bridge (очередь) ----------------------------
 
 class Bridge:
@@ -978,8 +1062,21 @@ class Bridge:
             return {"ok": True, "verified_by_fact": True, "receipt_error": err}
         return r
 
-    def set_needs_approval(self, tid, what, topic=NEEDS_APPROVAL_TOPIC):
+    def set_needs_approval(self, tid, what, topic=NEEDS_APPROVAL_TOPIC, frm=None):
         # topic → Splinter постит красную карточку в эту тему (по уточнению Филиппа — 829).
+        #
+        # `frm` — `from` РЯДА, если зовущий его знает. Наружу в Мост он не едет ни одним полем
+        # (протокол `set_needs_approval` его не знает и знать не должен): он нужен ВТОРОМУ
+        # признаку маршрута — `_is_owner_work`, который судит по `from`, а не по тексту. Не
+        # назвали — признак выводится из маркера, и это слабее: маркер и `from` кладёт один код,
+        # но проверить это здесь нечем. Поэтому дороги, которые `from` знают, называют его.
+        #
+        # ЗАМОК МАРШРУТА (09.09.2026): информационная заявка ТЕМЫ НЕ НАЗЫВАЕТ. Это ЕДИНСТВЕННОЕ
+        # горлышко, через которое рождается карточка ряда `needs_approval` — сюда стекаются все
+        # четыре дороги (гард `_ask_owner`, ступень B, ступень E, owner-карточка ревизора).
+        # Замок, поставленный в каждую дорогу по отдельности, защитил бы только вспомненные;
+        # поставленный в горлышко — все, включая ту, которую заведут завтра.
+        topic = _route_needs_approval(tid, what, topic, frm=frm)
         return self._post("set_needs_approval", id=tid, what=(what or "")[:RESULT_MAX], topic=topic)
 
     def approve_task(self, tid, approved_by, origin=ORIGIN_HUMAN, ticket=None):
@@ -7407,7 +7504,21 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         #     доставленный наполовину, он роняет `lesson_store.add` на импорте —
                         #     и путь записи урока умирает молча, а путь чтения возвращается к
                         #     книге-снимку третьим исходом, не сказав об этом никому.
-                        "lesson_store.py", "anonymize_corpus.py")
+                        "lesson_store.py", "anonymize_corpus.py",
+                        # 09.09.2026: МАРШРУТ ИНФОРМАЦИОННОЙ ЗАЯВКИ — куст за ленивым `import
+                        # zayavki_route_pc` в `_route_needs_approval`. Своих новых листьев РОВНО
+                        # ОДИН: сам модуль. Его единственная зависимость `shtab_box_signals` уже
+                        # стои́т в остатке выше (ящик), а `zayavki_pc`, чьи признаки различитель
+                        # спрашивает, — там же строкой ступени G; множество это схлопывает, и
+                        # дублировать нельзя (список сверяется МНОЖЕСТВАМИ).
+                        # ЧЕМ ОПАСНА ЕГО ГРЯЗЬ, названо прямо: этот файл решает, УВИДИТ ЛИ
+                        # ВЛАДЕЛЕЦ КАРТОЧКУ. Недоставленный на диск демона — `_route_needs_approval`
+                        # ловит отказ импорта и отдаёт прежнюю тему, то есть маршрут возвращается
+                        # ко вчерашнему (это и есть выбранное направление отказа). Доставленный
+                        # НАПОЛОВИНУ опаснее: список `SELF_DECLARED` старой редакции при новом
+                        # различителе снял бы карточку с рода, который её заслуживает, — и
+                        # молчание это увидел бы не тест, а неотвеченный вопрос владельца.
+                        "zayavki_route_pc.py")
 # остаток: ленивые импорты вне ворот грязного дерева
 
 

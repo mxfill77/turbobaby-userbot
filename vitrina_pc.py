@@ -101,6 +101,7 @@ import re
 import contour_digest as cd
 import expectations_pc as ex
 import shtab_box
+import zayavki_route_pc      # СТРОКИ «МИМО ИНБОКСА»: своего счёта и своих слов витрина не заводит
 
 SCHEMA = "turbobaby.vitrina_pc/v1"
 
@@ -674,7 +675,7 @@ def part_goal(shtab, counted, today=""):
     return out
 
 
-def part_nums(counted, taken, day, external, awaiting, box_stop=""):
+def part_nums(counted, taken, day, external, awaiting, box_stop="", routed=None):
     """ЧИСЛА: серия с ОПОРОЙ · ящик Штаба · внешний контур · ДЕРЖАТ и ЖДУТ МНЕНИЯ.
 
     ДВЕ РАЗНЫЕ ВЕЩИ БОЛЬШЕ НЕ ЗОВУТСЯ ОДНИМ СЛОВОМ (правка 02.09.2026). До неё
@@ -744,6 +745,16 @@ def part_nums(counted, taken, day, external, awaiting, box_stop=""):
                   if blind else ""))
     out.append("ЖДУТ МНЕНИЯ (заявки, ящик не держат): %s (ответ кнопкой; задачами они не станут)"
                % number(None if awaiting is None else got.get("asking"), why))
+    # ТРЕТЬЕ ЧИСЛО ЭТОГО РЯДА — «МИМО ИНБОКСА» (09.09.2026), и складывать его с двумя
+    # верхними тоже нельзя. Оно про заявки, которым карточки НЕ БЫЛО ВОВСЕ: род
+    # объявил себя не-задачей, второй признак подтвердил, что работы ряд не держит,
+    # и вопрос уехал СПИСКОМ. Без этой строки снятие было бы молчаливым подавлением
+    # — прямой запрет задания. Числа и список собирает `zayavki_route_pc`, здесь
+    # только место показа; реестр не прочитан → НЕИЗВЕСТНО, а не ноль.
+    out += zayavki_route_pc.vitrina_lines(
+        (routed or {}).get("rows") if isinstance(routed, dict) else None,
+        ok=bool(isinstance(routed, dict) and routed.get("ok")),
+        why=(routed or {}).get("why") if isinstance(routed, dict) else "реестр маршрута не прочитан")
     return out
 
 
@@ -805,7 +816,8 @@ def body(facts):
         "goal": part_goal(shtab, got.get("series"), today),
         "nums": part_nums(got.get("series"), got.get("shtab_taken"), today,
                           got.get("external"), got.get("awaiting"),
-                          box_stop=got.get("box_stop") or ""),
+                          box_stop=got.get("box_stop") or "",
+                          routed=got.get("routed")),
         "axes": part_axes(got.get("axes"), got.get("closed_day"), got.get("axes_why") or ""),
         "owner": part_owner(got.get("waiting")),
     }

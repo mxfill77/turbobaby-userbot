@@ -63,6 +63,7 @@ import shtab_box_run as sbr         # ДОРОГА К ПАПКЕ МОЗГА: т�
 import shtab_box_signals            # РАЗЛИЧИТЕЛЬ ВИДА РЯДА: тот же, что у остановки ящика
 import vitrina_pc as vp
 import zayavki_pc
+import zayavki_route_pc            # ОКНО СУТОК РЕЕСТРА МАРШРУТА: своего счёта витрина не заводит
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_STATE = "vitrina_pc_state.json"
@@ -70,6 +71,9 @@ CLAIM_FILE = "pc_orchestrator.task_started.json"
 # Метка оборота ящика Штаба: в ней же с 02.09 лежит ФРАЗА ЕГО ОСТАНОВКИ. Имя
 # зеркалит `pc_orchestrator.SHTAB_BOX_TICK_FILE`; равенство сторожит тест.
 BOX_TICK_FILE = "pc_orchestrator.shtab_box_tick.json"
+# Реестр маршрута заявок: его пишет горлышко карточки в демоне. Имя зеркалит
+# `pc_orchestrator._ROUTE_REGISTRY` и `zayavki_route_pc.REGISTRY`; равенство — тестом.
+ROUTED_FILE = zayavki_route_pc.REGISTRY
 
 # Узел ПУЛЬСА в мозге: тот же текст витрины, чтобы Штаб видел состояние полосы, не
 # заходя в Telegram. Ключ свой; в чужие узлы витрина не пишет ни одной веткой.
@@ -179,6 +183,29 @@ def read_box_stop(root=HERE, named=None):
         return ""
     stop = got.get("stop") if isinstance(got, dict) else None
     return str(stop) if isinstance(stop, str) else ""
+
+
+def read_routed(root=HERE, now=None, named=None):
+    """Реестр маршрута заявок → записи ПОСЛЕДНИХ СУТОК. → dict(ok, rows, why).
+
+    Читаем ЧУЖОЙ ФАЙЛ, а не пересчитываем маршрут заново: решение принято один раз
+    в горлышке `pc_orchestrator.Bridge.set_needs_approval`, и второе мнение о том,
+    была ли карточка, разошлось бы с первым МОЛЧА.
+
+    ФАЙЛА НЕТ — ЭТО ``ok=False``, А НЕ НОЛЬ. «Мимо инбокса ушло 0» читалось бы как
+    измеренный факт и было бы неотличимо от суток, в которые реестр просто не
+    прочитался. Тот же закон, которым живёт единая дверь числа витрины.
+    """
+    path = cdr._path(root, named or ROUTED_FILE)
+    try:
+        with io.open(path, encoding="utf-8") as fh:
+            got = json.load(fh)
+    except Exception as e:                         # noqa: BLE001 — незнание называется словом
+        return {"ok": False, "rows": None, "why": "реестр маршрута не прочитан (%s)"
+                                                  % type(e).__name__}
+    if not isinstance(got, dict):
+        return {"ok": False, "rows": None, "why": "реестр маршрута не разобрался"}
+    return {"ok": True, "rows": zayavki_route_pc.day_rows(got, now_ts(now)), "why": ""}
 
 
 def running_rows(snapshot, claims, now):
@@ -581,6 +608,7 @@ def collect(root=HERE, now=None, runner=None, inbox=None, day=None, shtab=None):
         "series": counted,
         "shtab_taken": cd.shtab_taken(cdr.all_rows(snapshot), the_day),
         "box_stop": read_box_stop(root),
+        "routed": read_routed(root, now),
         "external": external,
         "awaiting": awaiting_counts(waiting),
         "waiting": waiting,
