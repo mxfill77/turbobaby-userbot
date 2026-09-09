@@ -972,6 +972,56 @@ class TestVisible(unittest.TestCase):
         got = _tick(rows=[_card(1)])
         self.assertTrue(got["signal_journal"].startswith("NOTE "), got["signal_journal"])
 
+    # ── ОСТАНОВКА «НЕ ЗНАЮ» ЗОВЁТ ПРИБОР, А НЕ ВЛАДЕЛЬЦА (09.09.2026) ────────
+    # ЖИВОЙ СЛУЧАЙ, РАДИ КОТОРОГО ЭТИ ТРИ ПРОВЕРКИ ЗАВЕДЕНЫ: 09.09 в 09:53:34 UTC
+    # ящик встал двумя сигналами «закрытые ряды очереди не прочитаны» и попросил у
+    # владельца слово с двумя метками снятия; в 10:04:02 UTC он взял задание #231
+    # САМ — владелец не отвечал ничем. Просьба была ложной по трём разным причинам
+    # сразу, и каждую держит своя строка ниже.
+
+    def test_an_undeterminate_stop_asks_the_owner_for_NOTHING(self):
+        """Ждём прибор: ни метки, ни кнопки, ни слова владельца — и ящик всё равно стои́т."""
+        got = _tick(queue=FakeQueue(rows=[], closed=[], closed_ok=False), place=True)
+        words = got["stop"]
+        self.assertIn("ОПРЕДЕЛИТЬ НЕЛЬЗЯ", words)              # ЧТО сработало — на месте
+        self.assertIn("ЖДЁМ ПРИБОР", words)                    # ЧЕМ снимается — прибором
+        self.assertNotIn("[[ЯЩИК СНЯТЬ метка=", words)         # метку не просим
+        self.assertNotIn("кнопка", words)                      # кнопки не обещаем
+        self.assertNotIn(sig.BY_OWNER, words)
+        # ТОРМОЗ НА МЕСТЕ: фраза непустая, значит `select` не берёт ничего.
+        self.assertEqual([], got["placed"], "тормоз ослаблен вместе с текстом")
+        self.assertTrue(got["signal_journal"].startswith("NOTE "), got["signal_journal"])
+        # И кнопки действительно нет ни в замке, ни в двери наружу.
+        self.assertEqual([], got["armed"])
+        self.assertEqual([], got["hold_notices"])
+
+    def test_a_DETERMINATE_stop_still_calls_the_owner_word_for_word(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ к правке 09.09: определённая остановка зовёт как вчера."""
+        got = _tick(closed=[_closed(11, "failed", "[причина=exec_error · ошибка]"),
+                            _closed(12, "failed", "[причина=run_timeout · таймаут]")],
+                    place=True)
+        words = got["stop"]
+        self.assertIn(sig.BY_OWNER, words)                     # «ТОЛЬКО словом владельца»
+        self.assertIn("[[ЯЩИК СНЯТЬ метка=", words)            # метка снятия
+        self.assertIn("кнопка под извещением", words)          # кнопка обещана
+        self.assertIn(sb.NODE_NAME, words)
+        self.assertNotIn("ЖДЁМ ПРИБОР", words)                 # чужой ветки здесь нет
+        self.assertTrue(got["signal_journal"].startswith("ASK "), got["signal_journal"])
+        self.assertEqual([], got["placed"])
+        self.assertTrue(got["armed"], "определённую остановку перестали запирать")
+        self.assertTrue(got["hold_notices"], "кнопку обещали, а извещения нет")
+
+    def test_a_DETERMINATE_stop_beside_a_blind_one_keeps_BOTH_words_and_the_ASK(self):
+        """Одной настоящей развилки достаточно; слепая рядом своих слов не занимает."""
+        blind = sig.signal_b([], TODAY, rows_ok=False)
+        real = sig.held_signal({"mark": "aa11bb22cc33", "sig": sig.SIG_A, "count": 2,
+                                "why": "две подряд недоказанные", "at": "2026-09-09T09:00:00Z"})
+        line = sig.journal_line([blind, real], TODAY)
+        self.assertTrue(line.startswith("ASK "), line)
+        self.assertIn("ЖДЁМ ПРИБОР", line)                             # слепая — своими
+        self.assertIn(sig.RELEASE_FORM % "aa11bb22cc33", line)         # определённая — прежними
+        self.assertIn(sig.BY_OWNER, line)
+
     def test_all_four_are_listed_even_when_quiet(self):
         got = _tick()
         words = sig.all_words(got["signals"])
