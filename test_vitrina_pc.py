@@ -461,18 +461,19 @@ class TestParts(unittest.TestCase):
             self.assertIn(title, text)
         self.assertEqual(len(vp.PARTS), 7)
 
-    def test_health_stands_first_so_truncation_never_eats_it(self):
-        """Раздел здоровья ПЕРВЫЙ: витрина режется с хвоста, а обрезанный список приговоров
-        молча показал бы часть узлов как весь контур."""
-        self.assertEqual(vp.PART_KEYS[0], "health")
-        facts = _live_facts()
-        # Остановка ящика — единственная строка витрины без своего потолка (она приходит готовой
-        # фразой); ею и переполняем сообщение, чтобы обрезка сработала по-настоящему.
-        facts["box_stop"] = "ящик остановлен: " + "с" * 3800
-        text = vp.render(facts, "?")
-        self.assertIn("витрина обрезана до", text)
-        self.assertIn("ЧТО РАБОТАЕТ И ЧТО НЕТ", text)
-        self.assertIn(ex.HEALTH_DAEMON, text)
+    def test_order_is_owner_first_and_instruments_last(self):
+        """РЕШЕНИЕ 2 ШТАБА 09.09: порядок задан пользой для владельца, а не привычкой.
+
+        Сперва то, что ждёт его ОТВЕТА, и то, что застряло; длинные описания приборов — ниже
+        всех. Прежний порядок был этому обратен, и цена замерена: при живом теле 4837 симв.
+        раздел ЖДЁТ ВЛАДЕЛЬЦА не доезжал ни разу, держа при этом пять рядов до четырёх суток.
+        """
+        self.assertEqual(vp.PART_KEYS[0], "owner")
+        self.assertEqual(vp.PART_KEYS[1], "stuck")
+        self.assertEqual(vp.PART_KEYS[-1], "health")
+        text = vp.render(_live_facts(), "?")
+        self.assertLess(text.index("ЖДЁТ ВЛАДЕЛЬЦА"), text.index("ЗАСТРЯЛО"))
+        self.assertLess(text.index("ЗАСТРЯЛО"), text.index("ЧТО РАБОТАЕТ И ЧТО НЕТ"))
 
     def test_empty_part_is_an_error_not_a_silent_skip(self):
         facts = _live_facts()
@@ -513,6 +514,203 @@ class TestParts(unittest.TestCase):
         rows = vp.part_now({"ok": False, "why": "нет"}, [{"id": "5", "goal": "ц", "age": None}])
         self.assertIn("НЕИЗВЕСТНО", " ".join(rows))
         self.assertIn("отметки claim нет", " ".join(rows))
+
+
+class TestWindow(unittest.TestCase):
+    """ОКНО СООБЩЕНИЯ: режем ЦЕЛЫМИ разделами и объявляем себя (решение 3 Штаба 09.09).
+
+    Сюда же ОТРИЦАТЕЛЬНЫЙ ТЕСТ 6 задания, и он здесь главный: искусственно раздутая
+    машинная часть обязана дать сообщение, которое САМО говорит, что обрезано и чего не
+    хватает, — а тот же вход при СНЯТОЙ гарантии обязан дать другой ответ.
+    """
+
+    @staticmethod
+    def _fat(chars=3800):
+        """Факты с искусственно РАЗДУТОЙ машинной частью. → dict.
+
+        Раздувается остановка ящика: это единственная строка витрины без своего потолка
+        (она приходит готовой фразой из метки оборота демона), и потому единственная,
+        которой переполнение делается честно — не подгонкой потолка под желаемое число.
+        """
+        facts = _live_facts()
+        facts["box_stop"] = "ящик остановлен: " + "с" * int(chars)
+        return facts
+
+    @staticmethod
+    def _before_note(text):
+        """Всё, что стои́т ДО объявления обрезки: сами разделы, без их имён в объявлении."""
+        return text.split(vp.CUT_MARK)[0]
+
+    def test_calm_turn_fits_and_claims_no_cutting(self):
+        text, cut, lost = vp.message(_live_facts(), "?")
+        self.assertLessEqual(len(text), vp.TEXT_MAX)
+        self.assertEqual((cut, lost), ([], 0))
+        self.assertNotIn(vp.CUT_MARK, text, "спокойный оборот объявил несуществующую обрезку")
+        for _key, title in vp.PARTS:
+            self.assertIn(title, text)
+
+    def test_cut_takes_whole_sections_never_half(self):
+        """Раздел либо показан ЦЕЛИКОМ, либо снят. Оборванный читается как полный."""
+        facts = self._fat()
+        text, cut, _lost = vp.message(facts, "?")
+        self.assertLessEqual(len(text), vp.TEXT_MAX)
+        self.assertTrue(cut, "раздутая машинная часть не вызвала обрезки — вход слаб")
+        for title, block in vp.sections(facts, blind=False):
+            if title in cut:
+                self.assertNotIn(title, self._before_note(text),
+                                 "снятый раздел %s всё же попал в текст кусками" % title)
+            else:
+                self.assertIn(block, text, "раздел %s доехал НЕ ЦЕЛИКОМ" % title)
+
+    def test_cut_names_the_number_and_every_missing_section(self):
+        """РЕШЕНИЕ 3: сказать ЧИСЛОМ, сколько не поместилось, и НАЗВАТЬ снятые разделы."""
+        text, cut, lost = vp.message(self._fat(), "?")
+        self.assertIn(vp.CUT_MARK, text)
+        self.assertGreater(lost, 0)
+        self.assertIn("не поместилось %d симв." % lost, text, "число потери не названо")
+        for title in cut:
+            self.assertIn(title, text, "снятый раздел %s не назван — обрезка молчит" % title)
+        self.assertIn(vp.FULL_PLACE, text, "не сказано, где читать снятое")
+
+    def test_no_section_disappears_without_a_word_about_itself(self):
+        """ПУНКТ 5 задания на ПЯТИ раздутиях: третьего исхода нет ни на одном."""
+        for fat in (0, 900, 2400, 3800, 9000):
+            facts = self._fat(fat) if fat else _live_facts()
+            text, cut, _lost = vp.message(facts, "?")
+            self.assertLessEqual(len(text), vp.TEXT_MAX, "окно пробито на раздутии %d" % fat)
+            for title, block in vp.sections(facts, blind=False):
+                whole, named = block in text, (title in cut and title in text)
+                self.assertTrue(whole or named,
+                                "раздел %s пропал МОЛЧА при раздутии %d" % (title, fat))
+                self.assertNotEqual(whole, named,
+                                    "раздел %s и показан, и объявлен снятым (%d)" % (title, fat))
+
+    def test_negative_inflated_machine_part_must_announce_what_is_missing(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ 6 задания, главный.
+
+        «Снятая гарантия» — в точности прежний нож: склеить всё и отрезать по символу на
+        потолке. Он ТОЖЕ печатал строку об обрезке, поэтому сверяется не наличие слова, а
+        ровно то, ради чего заведено решение 3: названо ли ЧИСЛО и названы ли ИМЕНА.
+        """
+        facts = self._fat()
+        text, cut, lost = vp.message(facts, "?")
+
+        # ГАРАНТИЯ НА МЕСТЕ: обрезка названа числом и именами, разделы целы.
+        self.assertTrue(cut)
+        self.assertIn("не поместилось %d симв." % lost, text)
+        for title in cut:
+            self.assertIn(title, text)
+        self.assertEqual([t for t, b in vp.sections(facts, blind=False)
+                          if t in self._before_note(text) and b not in text], [],
+                         "новый нож порвал раздел посередине")
+
+        # ГАРАНТИЯ СНЯТА: тот же вход, прежний нож по символу — и ответ ДРУГОЙ по трём
+        # признакам сразу, каждый из которых и есть предмет решения 3.
+        naked = "\n".join([vp.HEAD, "числа менялись последний раз: ?", "",
+                           vp.body(facts, blind=True), "", vp.FOOT])[:vp.TEXT_MAX]
+        self.assertNotEqual(naked, text, "гарантия ничего не поменяла — тест не сторожит ничего")
+        torn = [t for t, b in vp.sections(facts, blind=True) if t in naked and b not in naked]
+        self.assertTrue(torn, "прежний нож не порвал раздела посередине — вход слаб")
+        silent = [t for t in cut if t not in naked]
+        self.assertTrue(silent, "прежний нож не потерял МОЛЧА ни одного раздела")
+        self.assertNotIn("не поместилось", naked, "прежний нож всё-таки называл потерю числом")
+
+    def test_owner_section_survives_the_worst_inflation(self):
+        """ПРОДУКТ задания: раздел, ждущий ОТВЕТА владельца, доезжает, пока влезает хоть один."""
+        text, cut, _lost = vp.message(self._fat(3800), "?")
+        self.assertNotIn("ЖДЁТ ВЛАДЕЛЬЦА", cut)
+        self.assertIn("#3 ЗАЯВКА внешнего канала", text)
+
+    def test_announcement_survives_even_when_nothing_else_does(self):
+        """Вырожденная ветка: окно меньше шапки с подвалом — режется ГОЛОВА, не объявление."""
+        text, cut, lost = vp.message(_live_facts(), "?", limit=400)
+        self.assertLessEqual(len(text), 400)
+        self.assertIn(vp.CUT_MARK, text, "молчаливая обрезка на вырожденном окне")
+        self.assertEqual(len(cut), len(vp.PARTS))
+        self.assertGreater(lost, 0)
+
+    def test_lost_counts_the_silence_not_the_announcement(self):
+        """Число потери — цена МОЛЧАНИЯ: объявление из неё не вычитается."""
+        blocks = [("А", "А\n" + "а" * 400), ("Б", "Б\n" + "б" * 400)]
+        text, cut, lost = vp.fit_message("ш", blocks, "п", limit=600)
+        self.assertEqual(cut, ["Б"])
+        self.assertEqual(lost, len("\n\n") + len(blocks[1][1]))
+        self.assertLessEqual(len(text), 600)
+        self.assertGreater(len(text), 600 - len(vp.cut_words(lost, cut)),
+                           "объявление вычли из потери — потеря занижена")
+
+    def test_signature_watches_the_full_body_not_the_window(self):
+        """Подпись по окну не заметила бы смены в снятом разделе — витрина стояла бы молча."""
+        one, two = self._fat(), self._fat()
+        two["health"] = [dict(n, blind="слепота стала другой") for n in one["health"]]
+        self.assertNotEqual(vp.signature(one), vp.signature(two))
+        self.assertEqual(vp.message(one, "?")[0], vp.message(two, "?")[0])
+
+
+class TestBlindTailsMoved(unittest.TestCase):
+    """РЕШЕНИЕ 4 ШТАБА 09.09: хвосты «не покрывает» ПЕРЕНЕСЕНЫ, а не удалены.
+
+    Перенос считается состоявшимся только при трёх вещах разом: в окне их нет, место
+    названо словами, по которым их найдут, и в этом месте они ЛЕЖАТ ДОСЛОВНО.
+    """
+
+    def test_window_has_no_tails_but_names_where_they_went(self):
+        text = vp.render(_live_facts(), "?")
+        self.assertNotIn(" %s: " % vp.BLIND_WORDS, text, "хвосты остались в окне")
+        self.assertIn(vp.BLIND_WORDS, text, "слов, по которым их найдут, в окне нет")
+        self.assertIn(vp.FULL_PLACE, text, "место переноса не названо")
+
+    def test_full_text_carries_every_tail_verbatim(self):
+        facts = _live_facts()
+        full = vp.full_text(facts, "?")
+        tails = [n.get("blind") for n in facts["health"] if n.get("blind")]
+        self.assertGreaterEqual(len(tails), 4, "фикстура без хвостов ничего не сторожит")
+        for tail in tails:
+            self.assertIn(tail, full, "хвост потерян при переносе: %s" % tail)
+        self.assertNotIn(vp.CUT_MARK, full, "полный текст сам обрезан — переносить некуда")
+        for _key, title in vp.PARTS:
+            self.assertIn(title, full)
+
+    def test_tail_is_on_by_default_so_forgetting_the_key_says_more(self):
+        node = {"name": "узел", "said": ex.TURN_OK, "stale": False, "src": "источник",
+                "age": "1 мин", "blind": "слепота прибора"}
+        self.assertIn("слепота прибора", vp.health_row(node))
+        self.assertNotIn("слепота прибора", vp.health_row(node, blind=False))
+
+    def test_pointer_line_only_where_there_are_nodes_to_point_at(self):
+        """Указывать на слепоту приборов, которых не собрали, — обещать несуществующий текст."""
+        self.assertIn(vp.BLIND_MOVED, vp.part_health(_health_nodes(), blind=False))
+        self.assertNotIn(vp.BLIND_MOVED, vp.part_health(None, blind=False))
+        self.assertNotIn(vp.BLIND_MOVED, vp.part_health([], blind=False))
+
+    def test_moving_the_tails_buys_room_and_the_pointer_costs_less(self):
+        """Перенос обязан быть ВЫГОДНЫМ: указатель дешевле того, что он заменил.
+
+        Фикстура здесь МЕНЬШЕ боевой (4 узла с короткими хвостами против шести живых), и
+        числа честно разные: на ней перенос освобождает 128 симв., на живом теле оборота
+        09.09 — 597 симв. хвостов против одной строки указателя. Порог взят по фикстуре, а
+        не по боевому замеру: тест обязан падать на СВОЁМ корпусе, а не на чужом.
+        """
+        facts = _live_facts()
+        gross = sum(len(" · %s: %s" % (vp.BLIND_WORDS, n["blind"]))
+                    for n in facts["health"] if n.get("blind"))
+        net = len(vp.body(facts, blind=True)) - len(vp.body(facts, blind=False))
+        self.assertGreater(gross, len(vp.BLIND_MOVED), "указатель дороже того, что он заменил")
+        self.assertGreater(net, 100, "перенос не освободил окна — незачем было переносить")
+
+    def test_pulse_gets_the_full_text_and_the_topic_gets_the_window(self):
+        """Перенос состоялся только если полный текст ДЕЙСТВИТЕЛЬНО уехал в пульс."""
+        door, seen = _Door(), []
+        with tempfile.TemporaryDirectory() as root:
+            rep = run.tick(root=root, state=os.path.join(root, "st.json"), now=NOW, send=True,
+                           pulse=True, runner=_git_none, sender=door.send, editor=door.edit,
+                           daemon=_Daemon(), shtab=vp.parse_shtab("", ok=False, why="нет"),
+                           pulser=lambda t: seen.append(t) or {"ok": True})
+        self.assertTrue(rep["ok"], rep.get("why"))
+        self.assertEqual(len(seen), 1)
+        self.assertIn(vp.FULL_HEAD, seen[0], "в пульс уехал не полный текст")
+        self.assertNotEqual(seen[0], rep["text"], "в пульс уехало окно, а не оригинал")
+        self.assertNotIn(vp.FULL_HEAD, rep["text"])
 
 
 class TestAxes(unittest.TestCase):

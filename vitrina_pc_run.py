@@ -657,15 +657,28 @@ def put(text, topic, message_id=None, sender=None, editor=None):
 
 
 def write_pulse(text, key=PULSE_KEY, writer=None):
-    """Тот же текст — в узел пульса мозга. → (ok, причина).
+    """ПОЛНЫЙ текст витрины — в узел пульса мозга. → (ok, причина).
 
     Замена дока целиком доверенным писателем, как у слепка очереди: у витрины нет
     истории по построению, и дописывание превратило бы узел в ленту. Страж усушки
     снят по той же причине — спокойный контур короче тревожного.
 
+    СТРАЖ ИСХОДЯЩЕГО ЗОВЁТСЯ ЗДЕСЬ СВОИМ ВЫЗОВОМ (правка 09.09.2026), и это не
+    перестраховка. До неё пульс получал ТОТ ЖЕ текст, что и тема, — а тот уже прошёл
+    стража в :func:`put`, и защита держалась транзитивно. С 09.09 тексты РАЗНЫЕ:
+    полный несёт разделы и хвосты, которых в окне не было, и без своей проверки они
+    уехали бы в мозг непросмотренными. Отказ стража пульс НЕ РОНЯЕТ и витрину тем
+    более: он возвращается строкой ровно как молчание моста.
+
     Пульс витрину НЕ РОНЯЕТ: мозг молчит → сообщение в теме всё равно уже стои́т, и
     это сказано строкой, а не проглочено.
     """
+    import review_audit
+
+    hits = review_audit.outbound_safe(text)
+    if hits:
+        return False, ("узел пульса %s не тронут: страж исходящего задержал полный текст (%s)"
+                       % (key, ", ".join(sorted({h["kind"] for h in hits}))))
     if writer is None:
         def writer(body):
             import brain_writer
@@ -711,9 +724,13 @@ def tick(root=HERE, state=None, now=None, send=False, pulse=False, runner=None,
                 "sig_same": True, "message_id": st.get("message_id"), "ok": True,
                 "how": "не тронута", "facts": facts}
     changed_at = now
-    text = vp.render(facts, stamp_words(changed_at))
+    # ДВА ТЕКСТА ОТ ОДНИХ ФАКТОВ, и собираются они ОБА здесь, а не порознь: в тему едет
+    # ОКНО (разделы целиком, снятые названы), в узел пульса — ВСЁ. Собери их в разных
+    # местах — и оборот, показавший окно, мог бы положить в пульс текст другой минуты.
+    text, cut, lost = vp.message(facts, stamp_words(changed_at))
     report = {"text": text, "facts": facts, "ok": False, "how": "не тронута", "why": "",
-              "message_id": st.get("message_id"), "sig_same": False}
+              "message_id": st.get("message_id"), "sig_same": False,
+              "cut": cut, "lost": lost}
     if not send:
         return report
     topic, why = cdr.review_audit_run.audit_topic(daemon)
@@ -730,7 +747,11 @@ def tick(root=HERE, state=None, now=None, send=False, pulse=False, runner=None,
         if not wrote:
             report["state_why"] = swhy
     if pulse and ok:
-        p_ok, p_why = write_pulse(text, writer=pulser)
+        # В ПУЛЬС ИДЁТ ПОЛНЫЙ ТЕКСТ, А НЕ ТОТ ЖЕ, ЧТО В ТЕМУ (правка 09.09.2026). Пульс —
+        # то самое место, где разделы и хвосты «не покрывает» читаются целиком, и назван
+        # он в самом сообщении (`vitrina_pc.FULL_PLACE`). Клади мы сюда окно, перенос стал
+        # бы удалением: снятое окном не лежало бы НИГДЕ, а сообщение обещало бы обратное.
+        p_ok, p_why = write_pulse(vp.full_text(facts, stamp_words(changed_at)), writer=pulser)
         report["pulse"], report["pulse_why"] = p_ok, p_why
     return report
 
@@ -744,6 +765,8 @@ def main(argv=None):                               # pragma: no cover — рук
     ap = argparse.ArgumentParser(description="Живая витрина состояния полосы ПК")
     ap.add_argument("--status", action="store_true", help="что видит витрина, числами")
     ap.add_argument("--dry", action="store_true", help="показать витрину ДОСЛОВНО, не отправляя")
+    ap.add_argument("--full", action="store_true",
+                    help="ПОЛНЫЙ текст (всё, что уходит в узел пульса): без окна и с хвостами")
     ap.add_argument("--send", action="store_true", help="положить/поправить витрину в теме")
     ap.add_argument("--pulse", action="store_true", help="тот же текст — в узел пульса мозга")
     ap.add_argument("--create-node", action="store_true", help="завести узел пульса (один раз)")
@@ -756,9 +779,20 @@ def main(argv=None):                               # pragma: no cover — рук
         facts = collect()
         print(vp.body(facts))
         return 0
+    if args.full:
+        # ВТОРАЯ ДОРОГА К ПЕРЕНЕСЁННОМУ, и ей не нужны ни мост, ни Telegram: снятое окном
+        # читается прямо здесь. Нужна она затем, что узел пульса пишется только на удачном
+        # показе, — а спросить «что там не влезло» надо и в тот оборот, когда показ сорвался.
+        print(vp.full_text(collect(), stamp_words(now_ts())))
+        return 0
     if args.dry:
         facts = collect()
-        print(vp.render(facts, stamp_words(now_ts())))
+        text, cut, lost = vp.message(facts, stamp_words(now_ts()))
+        print(text)
+        print("\n--- окно: %d из %d симв.%s"
+              % (len(text), vp.TEXT_MAX,
+                 (" · снято разделов %d (%s), не поместилось %d симв. — они в %s"
+                  % (len(cut), ", ".join(cut), lost, vp.FULL_PLACE)) if cut else " · снято 0"))
         return 0
     rep = tick(send=bool(args.send), pulse=bool(args.pulse), force=bool(args.force))
     if rep.get("skipped"):
