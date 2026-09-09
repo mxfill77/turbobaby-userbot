@@ -25,6 +25,13 @@ pc_agent.py — удалённое управление userbot'ом с теле
                               причины — отказ, право судит moderation_core.may_write_rule)
   урок откати N             → вернуть урок #N ровно в состояние до включения (не «снять»)
   урок след                 → кто, когда и какой урок включал
+  урок наборы               → какие наборы лежат в базе и по сколько строк
+  урок набор <ключ>         → ШАГ 1: что за набор — сколько уйдёт, когда залит, кем (чтение)
+  урок набор сними <ключ> <N>: причина
+                            → ШАГ 2: снять НАБОР ЦЕЛИКОМ (lesson_batch.py). Подтверждение обязано
+                              называть объект — ключ И число строк; без числа или с чужим числом
+                              отказ, и не тронуто ничего
+  урок набор верни <ключ>   → вернуть набор ровно в то состояние, что было до снятия (побайтно)
   иное → подсказка со списком команд
 
 Большие выводы (>3500 символов) — файлом (send_document), в тексте короткая выжимка.
@@ -638,6 +645,9 @@ KNOWN_COMMANDS = (
     "урок включи N: причина — включить кандидата #N (без причины — отказ)",
     "урок откати N — вернуть урок #N ровно в то состояние, что было до включения",
     "урок след — кто, когда и какой урок включал",
+    "урок наборы · урок набор <ключ> — какие наборы есть и что в наборе (чтение)",
+    "урок набор сними <ключ> <N>: причина — снять НАБОР целиком (объект: ключ И число)",
+    "урок набор верни <ключ> — вернуть набор ровно в то, что было до снятия",
 )
 
 
@@ -789,47 +799,104 @@ LESSON_BACK_RE = re.compile(r"^(?:урок|lesson)[\s:]+(?:откати(?:ть)?
                             re.IGNORECASE)
 LESSON_LIST_RE = re.compile(r"^(?:урок|lesson)[\s:]+(?:кандидаты|candidates)$", re.IGNORECASE)
 LESSON_TRACE_RE = re.compile(r"^(?:урок|lesson)[\s:]+(?:след|trace)$", re.IGNORECASE)
+
+# НАБОР — ВТОРОЙ ОБЪЕКТ ТОГО ЖЕ СЛОВА (09.09.2026). Снятие набора зовётся тем же «урок» и тем же
+# роутером, что перевод: второго роутера рядом не заводим. Отличает объект слово «набор» сразу
+# после команды — у урока объект номер, у набора ключ источника.
+#
+# ЧИСЛО В ПОДТВЕРЖДЕНИИ — НЕОБЯЗАТЕЛЬНАЯ ГРУППА, И ЭТО СОЗНАТЕЛЬНО. Соблазн потребовать его
+# регуляркой велик, но тогда «урок набор сними экспорт_переписки: ошиблись файлом» (число забыли)
+# уехало бы в «хвост не разобран» — то есть владелец услышал бы «не понял команду» вместо
+# «подтверждение обязано называть число». Отказ выписывает ДВЕРЬ, которая знает, чего не хватает.
+#
+# КЛЮЧ — `[^\s:]+`, а не `\S+`: владелец пишет «сними экспорт_переписки: причина» без пробела
+# перед двоеточием, и жадное `\S+` унесло бы двоеточие внутрь ключа — набор стал бы неизвестным
+# на ровном месте. Жадность при этом обязательна (ленивое `\S+?` отдало бы ключом первую букву).
+LESSON_BATCH_OFF_RE = re.compile(
+    r"^(?:урок|lesson)[\s:]+набор[\s:]+(?:сними|снять|off)\s+([^\s:]+)(?:\s+#?(\d+))?\s*[:\-—]?"
+    r"\s*(.*)$", re.IGNORECASE | re.DOTALL)
+LESSON_BATCH_BACK_RE = re.compile(
+    r"^(?:урок|lesson)[\s:]+набор[\s:]+(?:верни(?:ть)?|back)\s+(\S+)$", re.IGNORECASE)
+# ПОКАЗ — ключ и БОЛЬШЕ НИЧЕГО. Глаголы движения исключены явным взглядом вперёд: без него
+# «урок набор сними» (ключ забыли) разобралось бы как ПОКАЗ набора с ключом «сними» — то есть
+# опечатка в опасной команде притворилась бы безобидным чтением.
+LESSON_BATCH_SHOW_RE = re.compile(
+    r"^(?:урок|lesson)[\s:]+набор[\s:]+(?!сними\b|снять\b|off\b|верни\b|вернуть\b|back\b)(\S+)$",
+    re.IGNORECASE)
+LESSON_BATCH_LIST_RE = re.compile(r"^(?:урок|lesson)[\s:]+(?:наборы|batches)$", re.IGNORECASE)
+
 # «Почти команда» — чтобы промах формой не уехал в общее «не знаю»: команду мы знаем, не
 # разобрался ХВОСТ. Тот же довод, что у `BOX_WORD_HEAD_RE`.
 LESSON_HEAD_RE = re.compile(
-    r"^(?:урок|lesson)[\s:]+(?:включи(?:ть)?|откати(?:ть)?|кандидаты|след|on|rollback"
-    r"|candidates|trace)\b", re.IGNORECASE)
+    r"^(?:урок|lesson)[\s:]+(?:включи(?:ть)?|откати(?:ть)?|кандидаты|след|наборы|набор|on"
+    r"|rollback|candidates|trace|batches)\b", re.IGNORECASE)
 LESSON_ANSWER_AT = ("тема «PC-дев» / консоль ПК, командой "
                     "«venv/Scripts/python.exe lesson_promote.py --who <имя> --promote N "
                     "--why \"причина\"»")
+BATCH_ANSWER_AT = ("тема «PC-дев» / консоль ПК, командой "
+                   "«venv/Scripts/python.exe lesson_batch.py --who <имя> --off <ключ> "
+                   "--count N --why \"причина\"»")
+# Действия НАБОРА — одним перечнем, а не проверкой префикса `batch_` по месту: перечень читается
+# и роутером, и выбором двери, и разъехаться им нечем.
+LESSON_BATCH_ACTS = ("batch_off", "batch_back", "batch_show", "batch_census")
 
 
 def lesson_word(text):
-    """Слово владельца про урок → (действие, номер, причина) | None (не наша команда).
+    """Слово владельца про урок или НАБОР → (действие, номер, причина, ключ) | None.
 
-    ЧИСТАЯ функция, поэтому голденится без Telegram. Действия: `promote` (номер и причина),
-    `rollback` (номер), `candidates`/`trace` (без номера). Регистр команды не значим, а регистр
-    ПРИЧИНЫ сохраняется дословно — её текст ложится в таблицу уроков и читается человеком."""
+    ЧИСТАЯ функция, поэтому голденится без Telegram. Действия урока: `promote` (номер и причина),
+    `rollback` (номер), `candidates`/`trace`. Действия набора: `batch_show` (ключ),
+    `batch_off` (ключ, число в поле номера, причина), `batch_back` (ключ), `batch_census`.
+    Регистр команды не значим, а регистр ПРИЧИНЫ сохраняется дословно — её текст ложится в
+    таблицу уроков и читается человеком.
+
+    ЧЕТВЁРТОЕ ПОЛЕ (ключ набора) добавлено 09.09.2026 и всегда присутствует: у команд урока оно
+    пустая строка. Отдавать наборам свой кортеж другой длины значило бы завести у вызывающего
+    развилку по длине — то есть второй роутер под видом распаковки."""
     body = " ".join(str(text or "").split()).strip().lstrip("/").strip()
     if not body:
         return None
+    # НАБОР РАЗБИРАЕТСЯ ПЕРВЫМ: его формы длиннее и специфичнее, и любая из них, попав сначала на
+    # разбор урока, была бы отвергнута — но уже после того, как «урок» съеден.
+    m = LESSON_BATCH_OFF_RE.match(body)
+    if m:
+        count = int(m.group(2)) if m.group(2) else None
+        return ("batch_off", count, m.group(3).strip(), m.group(1))
+    m = LESSON_BATCH_BACK_RE.match(body)
+    if m:
+        return ("batch_back", None, "", m.group(1))
+    m = LESSON_BATCH_SHOW_RE.match(body)
+    if m:
+        return ("batch_show", None, "", m.group(1))
+    if LESSON_BATCH_LIST_RE.match(body):
+        return ("batch_census", None, "", "")
     m = LESSON_ON_RE.match(body)
     if m:
-        return ("promote", int(m.group(1)), m.group(2).strip())
+        return ("promote", int(m.group(1)), m.group(2).strip(), "")
     m = LESSON_BACK_RE.match(body)
     if m:
-        return ("rollback", int(m.group(1)), "")
+        return ("rollback", int(m.group(1)), "", "")
     if LESSON_LIST_RE.match(body):
-        return ("candidates", None, "")
+        return ("candidates", None, "", "")
     if LESSON_TRACE_RE.match(body):
-        return ("trace", None, "")
+        return ("trace", None, "", "")
     return None
 
 
-def _lesson_cli(action, number, why, who):
-    """Движение уроком через `lesson_promote.py` → текст ответа.
+def _lesson_cli(action, number, why, who, source=""):
+    """Движение уроком или НАБОРОМ через дверь-CLI → текст ответа.
 
     Субпроцессом и той же механикой, что `_box_cli`/`_gate_cli`, по той же причине: агент роутит
     слово и показывает результат, а решение о праве, причине и следе принимает дверь. Слова исхода
-    печатает ДВЕРЬ, а не мы: вторая формулировка того же исхода разошлась бы с первой молча."""
+    печатает ДВЕРЬ, а не мы: вторая формулировка того же исхода разошлась бы с первой молча.
+
+    ДВЕРЕЙ ДВЕ, А РОУТЕР ОДИН: у урока объект — номер (`lesson_promote.py`), у набора — ключ
+    источника (`lesson_batch.py`). Выбор двери идёт по перечню `LESSON_BATCH_ACTS`, а не по
+    префиксу имени действия, разобранному здесь на месте."""
     if not VENV_PY.exists():
         return f"урок: не нашёл python venv ({VENV_PY})."
-    argv = [str(VENV_PY), str(REPO_DIR / "lesson_promote.py")]
+    door = "lesson_batch.py" if action in LESSON_BATCH_ACTS else "lesson_promote.py"
+    argv = [str(VENV_PY), str(REPO_DIR / door)]
     # `who` и `why` приходят УЖЕ строками: имя нормализует единственное место, где «имени нет»
     # что-то значит (роутер темы 205), а причину отдаёт `lesson_word`, у которой пустая причина
     # это `""`, а не `None`. Второй раз подставлять здесь пустую строку значило бы завести ВТОРОЕ
@@ -842,6 +909,19 @@ def _lesson_cli(action, number, why, who):
         argv += ["--candidates"]
     elif action == "trace":
         argv += ["--trace"]
+    elif action == "batch_show":
+        argv += ["--show", source]
+    elif action == "batch_census":
+        argv += ["--census"]
+    elif action == "batch_back":
+        argv += ["--who", who, "--back", source]
+    elif action == "batch_off":
+        # `--count` НЕ ПОДСТАВЛЯЕТСЯ, если владелец числа не назвал: «объект не назван» обязано
+        # доехать до двери как отсутствие, а не как выдуманный ноль. Дверь на этом откажет
+        # словами про подтверждение, а не посчитает, что снять надо ноль строк.
+        argv += ["--who", who, "--off", source, "--why", why]
+        if number is not None:
+            argv += ["--count", str(int(number))]
     else:
         return f"урок: не понял действие ({action})."
     try:
@@ -850,10 +930,12 @@ def _lesson_cli(action, number, why, who):
             timeout=120, cwd=str(REPO_DIR), creationflags=NO_WINDOW,
         )
         out = (r.stdout or "").strip() or (r.stderr or "").strip()
-        return out or (f"урок: пустой ответ на «{action}». Запасной путь — {LESSON_ANSWER_AT}.")
+        answer_at = BATCH_ANSWER_AT if action in LESSON_BATCH_ACTS else LESSON_ANSWER_AT
+        return out or (f"урок: пустой ответ на «{action}». Запасной путь — {answer_at}.")
     except Exception as e:
+        answer_at = BATCH_ANSWER_AT if action in LESSON_BATCH_ACTS else LESSON_ANSWER_AT
         return (f"урок: движение «{action}» НЕ прошло ({type(e).__name__}: {e}). "
-                f"Запасной путь — {LESSON_ANSWER_AT}.")
+                f"Запасной путь — {answer_at}.")
 
 
 def _gate_cb_parse(data):
@@ -1152,20 +1234,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif lesson_word(msg.text):
             # ПРИЧИНА БЕРЁТСЯ ИЗ ОРИГИНАЛА (`msg.text`), а не из `text`: тот приведён к нижнему
             # регистру для сверки команд, и причина уехала бы в таблицу уроков строчной навсегда.
-            act, num, why = lesson_word(msg.text)
+            act, num, why, source = lesson_word(msg.text)
             author = (user.username or "").strip() if user else ""
-            alog.info("команда урока: %s #%s от @%s", act, num, author or "?")
+            alog.info("команда урока: %s #%s набор %r от @%s", act, num, source, author or "?")
             await _send(context, chat_id,
-                        await asyncio.to_thread(_lesson_cli, act, num, why, author))
+                        await asyncio.to_thread(_lesson_cli, act, num, why, author, source))
 
         elif LESSON_HEAD_RE.match(text):
             # ПОЧТИ КОМАНДА — ЭТО РЕШЕНИЕ ВЛАДЕЛЬЦА, А НЕ МУСОР (тот же довод, что у ящика):
             # общая подсказка «не знаю «урок …»» здесь врёт — команду мы знаем, не разобрался хвост.
             alog.info("движение уроком: хвост не разобран в %r", (msg.text or "")[:120])
             await _send(context, chat_id,
-                        "⚠️ Не разобрал команду урока. Формы: «урок включи 7: причина словами» · "
-                        "«урок откати 7» · «урок кандидаты» · «урок след». Номер — из карточки "
-                        "записи кандидата. Ничего не изменено.")
+                        "⚠️ Не разобрал команду урока. Формы по ОДНОМУ уроку: «урок включи 7: "
+                        "причина словами» · «урок откати 7» · «урок кандидаты» · «урок след». "
+                        "Формы по НАБОРУ: «урок наборы» · «урок набор <ключ>» · «урок набор сними "
+                        "<ключ> <сколько строк>: причина словами» · «урок набор верни <ключ>». "
+                        "Номер — из карточки записи кандидата, ключ и число — из «урок набор "
+                        "<ключ>». Ничего не изменено.")
 
         elif BOX_WORD_HEAD_RE.match(text):
             # ПОЧТИ КОМАНДА — ЭТО ОТВЕТ ВЛАДЕЛЬЦА, А НЕ МУСОР. Общая подсказка

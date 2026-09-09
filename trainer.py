@@ -1890,3 +1890,161 @@ def rollback_promotion(n, who=None, may_write=None, rollback=None, get=None, now
         return {"status": "error", "n": _to_int(n), "who": None,
                 "card": f"⚠️ Откат перевода урока #{n} не сделан — внутренняя ошибка "
                         f"({type(e).__name__}), см. лог процесса. Команду можно повторить."}
+
+
+# ---------------------------------------------------------------------------------------
+# ДВЕРЬ СНЯТИЯ НАБОРА — два шага, и объект называется во втором (09.09.2026)
+# ---------------------------------------------------------------------------------------
+# ЗАЧЕМ ДВА ШАГА, А НЕ ОДИН. Снятие набора — самое широкое движение таблицы: одна команда трогает
+# столько строк, сколько в наборе, и владелец в момент команды этого числа НЕ ЗНАЕТ. Показ и
+# снятие разведены не ради церемонии, а чтобы между ними встало ЧИСЛО: подтверждение обязано
+# назвать ключ И сколько строк уйдёт (решение Штаба, заходом не пересматривается).
+#
+# ПОКАЗ ПРАВА НЕ СПРАШИВАЕТ, и это симметрия, а не послабление: `--candidates` и `--trace` у двери
+# перевода тоже читают без права. Право судится там, где что-то МЕНЯЕТСЯ.
+#
+# ПРАВО — ТО ЖЕ САМОЕ, ЧТО У ПЕРЕВОДА, ЗАПИСИ И ОТМЕНЫ: `moderation_core.may_write_rule`
+# (fail-closed, пустой список = НИКОМУ). Своего второго права здесь нет ни строкой — четыре конца
+# одной ручки обязаны судиться одним механизмом.
+STATUS_BATCH_OFF = "batch_withdrawn"
+STATUS_BATCH_BACK = "batch_restored"
+
+
+def _default_batch_withdraw(source, count, why, who, path=None, now=None):
+    import lesson_store
+    return lesson_store.batch_withdraw(source, count=count, why=why, who=who, path=path, now=now)
+
+
+def _default_batch_restore(source, who, path=None, now=None):
+    import lesson_store
+    return lesson_store.batch_restore(source, who=who, path=path, now=now)
+
+
+def _batch_card(source, card=None, path=None):
+    """ШАГ ПЕРВЫЙ словами: что за набор и что уйдёт. ТОЛЬКО ЧТЕНИЕ, права не спрашивает."""
+    if card is None:
+        import lesson_store
+        card = lesson_store.batch_card
+    ok, reason, got = card(source, path=path)
+    if not ok:
+        return {"status": STATUS_REFUSED, "source": None, "reason": reason,
+                "card": f"⛔ {reason}."}
+    if got.rows == 0:
+        return {"status": "empty", "source": got.source, "count": 0,
+                "card": f"📦 Набор «{got.source}»: в таблице НЕТ НИ ОДНОЙ строки этого набора. "
+                        f"Снимать нечего.\n📌 Что вообще лежит: "
+                        + ("; ".join("%s — %d" % pair for pair in got.census) or "—")}
+    who_say = ", ".join("@" + name for name in got.who) or "— автор не записан"
+    when_say = got.first if got.first == got.last else f"{got.first} … {got.last}"
+    return {"status": "shown", "source": got.source, "count": got.movable,
+            "numbers": got.numbers,
+            "card": f"📦 Набор «{got.source}» — {got.rows} строк(и) в таблице.\n"
+                    f"📌 Снять сейчас можно: {got.movable} (действующие и кандидаты); "
+                    f"уже снято раньше: {got.withdrawn}.\n"
+                    f"📌 Залит: {when_say}\n"
+                    f"📌 Записал: {who_say}\n"
+                    f"➡️ Чтобы снять, назови объект ЦЕЛИКОМ — ключ и число: "
+                    f"«урок набор сними {got.source} {got.movable}: причина словами». "
+                    f"Вернуть потом — «урок набор верни {got.source}»."}
+
+
+def _withdraw_batch(source, count=None, why=None, who=None, may_write=None, withdraw=None,
+                    get=None, now=None, path=None):
+    """Ядро withdraw_batch (может бросить — снаружи fail-safe обёртка)."""
+    author = _actor_for(who, get=get, now=now)
+    if not author:
+        return {"status": STATUS_NO_AUTHOR, "source": None, "who": None,
+                "card": f"⛔ Набор «{source}» НЕ снят: не видно, КТО снимает. Снятие набора идёт "
+                        "под тем же правом, что запись и перевод, а право судится по имени."}
+    if not (may_write or _default_may_write)(author):
+        return {"status": STATUS_DENIED, "source": None, "who": author,
+                "card": f"⛔ Нет прав — набор «{source}» НЕ снят. Снятие набора требует того же "
+                        "права, что и запись урока."}
+    # Причина едет ДОСЛОВНО, включая «не передали» (`None`): нормализует её ОДНО место —
+    # `lesson_store.batch_withdraw`. Подставить здесь `why or ""` значило бы завести второе
+    # место, решающее, что такое «причины нет», и разъехаться с первым молча.
+    res = (withdraw or _default_batch_withdraw)(source, count, why, author, path=path, now=now)
+    if not res.ok:
+        return {"status": STATUS_REFUSED, "source": res.source, "who": author,
+                "reason": res.reason, "card": f"⛔ {res.reason}."}
+    return {"status": STATUS_BATCH_OFF, "source": res.source, "who": author, "count": res.count,
+            "numbers": res.numbers, "why": res.why,
+            "lines_before": res.lines_before, "lines_after": res.lines_after,
+            "card": f"🧹 Набор «{res.source}» СНЯТ ЦЕЛИКОМ: {res.count} строк(и) больше не "
+                    f"отвечают клиентам.\n"
+                    f"📌 Причина: {res.why}\n"
+                    f"📌 След: снял @{author}, {res.stamp}, набор «{res.source}», строк "
+                    f"{res.count}. Строк в файле было {res.lines_before}, стало "
+                    f"{res.lines_after} — ничего не удалено.\n"
+                    f"↩️ Вернуть как было: «урок набор верни {res.source}»."}
+
+
+def withdraw_batch(source, count=None, why=None, who=None, may_write=None, withdraw=None,
+                   get=None, now=None, path=None):
+    """«урок набор сними <ключ> <N>: причина» — СНЯТИЕ ВСЕГО НАБОРА одним движением.
+
+    Объект называется ЦЕЛИКОМ: ключ набора и число строк, которые уйдут. Число сверяется с живой
+    таблицей — названо не то, отказ, и ничего не тронуто. Право — `moderation_core.may_write_rule`
+    (то же, что у записи, перевода и отмены; пустой список = НИКОМУ). Причина обязательна.
+    → dict(status, card, source, who, …) со статусами `batch_withdrawn` | `refused` | `denied` |
+    `no_author` | `error`. НИКОГДА не бросает."""
+    try:
+        return _withdraw_batch(source, count, why, who, may_write, withdraw, get, now, path)
+    except Exception as e:
+        log.warning("withdraw_batch(%s) упал: %s: %s", source, type(e).__name__, e, exc_info=True)
+        return {"status": "error", "source": None, "who": None,
+                "card": f"⚠️ Набор «{source}» не снят — внутренняя ошибка ({type(e).__name__}), "
+                        "см. лог процесса. Команду можно повторить."}
+
+
+def _restore_batch(source, who=None, may_write=None, restore=None, get=None, now=None, path=None):
+    """Ядро restore_batch (может бросить — снаружи fail-safe обёртка)."""
+    author = _actor_for(who, get=get, now=now)
+    if not author:
+        return {"status": STATUS_NO_AUTHOR, "source": None, "who": None,
+                "card": f"⛔ Набор «{source}» НЕ возвращён: не видно, КТО возвращает."}
+    if not (may_write or _default_may_write)(author):
+        return {"status": STATUS_DENIED, "source": None, "who": author,
+                "card": f"⛔ Нет прав — набор «{source}» НЕ возвращён."}
+    res = (restore or _default_batch_restore)(source, author, path=path, now=now)
+    if not res.ok:
+        return {"status": STATUS_REFUSED, "source": res.source, "who": author,
+                "reason": res.reason, "card": f"⛔ {res.reason}."}
+    return {"status": STATUS_BATCH_BACK, "source": res.source, "who": author, "count": res.count,
+            "numbers": res.numbers,
+            "lines_before": res.lines_before, "lines_after": res.lines_after,
+            "card": f"↩️ Набор «{res.source}» ВОЗВРАЩЁН: {res.count} строк(и) снова в том "
+                    f"состоянии, в котором были до снятия.\n"
+                    f"📌 Снимали с причиной: {res.why or '— причина не записана'}\n"
+                    f"📌 След: вернул @{author}, {res.stamp}, набор «{res.source}» (строк в файле "
+                    f"было {res.lines_before}, стало {res.lines_after})."}
+
+
+def restore_batch(source, who=None, may_write=None, restore=None, get=None, now=None, path=None):
+    """«урок набор верни <ключ>» — ВОЗВРАТ набора, снятого последним незакрытым движением.
+
+    Возвращает РОВНО те состояния, что были до снятия (у одних строк `актив`, у других
+    `кандидат`), а не «включает всё подряд». Право — то же `may_write_rule`.
+    → dict(status, card, source, who, …) со статусами `batch_restored` | `refused` | `denied` |
+    `no_author` | `error`. НИКОГДА не бросает."""
+    try:
+        return _restore_batch(source, who, may_write, restore, get, now, path)
+    except Exception as e:
+        log.warning("restore_batch(%s) упал: %s: %s", source, type(e).__name__, e, exc_info=True)
+        return {"status": "error", "source": None, "who": None,
+                "card": f"⚠️ Набор «{source}» не возвращён — внутренняя ошибка "
+                        f"({type(e).__name__}), см. лог процесса. Команду можно повторить."}
+
+
+def batch_card(source, card=None, path=None):
+    """«урок набор <ключ>» — ШАГ ПЕРВЫЙ: показать набор. ТОЛЬКО ЧТЕНИЕ, права не требует.
+
+    → dict(status, card, source, count) со статусами `shown` | `empty` | `refused` | `error`.
+    НИКОГДА не бросает."""
+    try:
+        return _batch_card(source, card, path)
+    except Exception as e:
+        log.warning("batch_card(%s) упал: %s: %s", source, type(e).__name__, e, exc_info=True)
+        return {"status": "error", "source": None,
+                "card": f"⚠️ Набор «{source}» показать не смог — внутренняя ошибка "
+                        f"({type(e).__name__}), см. лог процесса. Ничего не изменено."}

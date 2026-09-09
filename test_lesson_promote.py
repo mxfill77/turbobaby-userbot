@@ -314,11 +314,14 @@ class TestTheDoorItself(_Base):
         Регистр здесь не косметика: причина ложится в таблицу уроков дословно и читается человеком,
         а роутер темы 205 работает на `msg.text.lower()` — разбор на нём испортил бы её навсегда."""
         import pc_agent
+        # ЧЕТВЁРТОЕ ПОЛЕ (ключ набора) добавлено 09.09.2026 и у команд ОДНОГО урока всегда пусто.
+        # Голдены обновлены здесь, а не обойдены срезом `[:3]`: срез спрятал бы ровно ту ошибку,
+        # ради которой они стоят, — уехавшее не в то поле значение.
         self.assertEqual(pc_agent.lesson_word("урок включи 7: Клиент дважды спросил цену"),
-                         ("promote", 7, "Клиент дважды спросил цену"))
-        self.assertEqual(pc_agent.lesson_word("УРОК ОТКАТИ 7"), ("rollback", 7, ""))
-        self.assertEqual(pc_agent.lesson_word("урок кандидаты"), ("candidates", None, ""))
-        self.assertEqual(pc_agent.lesson_word("урок след"), ("trace", None, ""))
+                         ("promote", 7, "Клиент дважды спросил цену", ""))
+        self.assertEqual(pc_agent.lesson_word("УРОК ОТКАТИ 7"), ("rollback", 7, "", ""))
+        self.assertEqual(pc_agent.lesson_word("урок кандидаты"), ("candidates", None, "", ""))
+        self.assertEqual(pc_agent.lesson_word("урок след"), ("trace", None, "", ""))
         # Чужие команды темы 205 не задеты ни одной формой.
         for alien in ("статус", "ящик снять abcdef123456", "обнови userbot", ""):
             self.assertIsNone(pc_agent.lesson_word(alien), alien)

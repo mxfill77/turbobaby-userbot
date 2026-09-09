@@ -136,12 +136,22 @@ lesson_store.py — ХРАНИЛИЩЕ УРОКОВ ТРЕНАЖЁРА. Отде
 (`promote_log_path`, `rollback`). Право по-прежнему судит вызывающий; хранилище требует своё —
 непустую причину и ИМЯ автора перевода.
 
+СНЯТИЕ НАБОРА ЦЕЛИКОМ — С НАЗВАННЫМ ОБЪЕКТОМ, СО СЛЕДОМ И ОБРАТИМОЕ (09.09.2026). Разрез
+`withdraw(source=…)` умеет пометить набор снятым — и только: он не знает, кто снимает и зачем,
+не оставляет следа и НЕ ВОЗВРАЩАЕТСЯ. Поверх него живут `batch_card` (шаг первый: что за набор,
+сколько строк, когда залит, кем), `batch_withdraw` (шаг второй: снять, назвав КЛЮЧ и ЧИСЛО строк)
+и `batch_restore` (вернуть одним движением, побайтно). Подтверждение без названного объекта не
+выписывается вовсе — это решение Штаба, и проверка стои́т ЗДЕСЬ, а не только в двери: гейт,
+оставленный вызывающему, обойдёт первый же новый вызывающий. Дверь снаружи — `lesson_batch.py`
+и слово владельца в теме 205 через `pc_agent`.
+
 ЗАПУСК:
     venv/Scripts/python.exe lesson_store.py --status          # ёмкость, целостность и источники
     venv/Scripts/python.exe lesson_store.py --list            # активные уроки
     venv/Scripts/python.exe lesson_store.py --list --all      # вместе со снятыми
     venv/Scripts/python.exe lesson_store.py --list --source тренажёр   # только один набор
     venv/Scripts/python.exe lesson_store.py --trace           # след переводов и откатов
+    venv/Scripts/python.exe lesson_store.py --batch-trace     # след снятий и возвратов НАБОРОВ
 """
 
 import argparse
@@ -1108,6 +1118,343 @@ def rollback(number, who="", path=None, now=None):
 
 
 # ---------------------------------------------------------------------------------------
+# НАБОР ЦЕЛИКОМ: карточка, снятие с НАЗВАННЫМ ОБЪЕКТОМ, возврат (09.09.2026)
+# ---------------------------------------------------------------------------------------
+# ЗАЧЕМ ЭТО СВЕРХ `withdraw(source=…)`, который уже есть. `withdraw` умеет пометить набор снятым
+# — и на этом всё: он не спрашивает, кто снимает и зачем, не оставляет следа и НЕ ВОЗВРАЩАЕТСЯ.
+# Снятие набора — самая широкая операция таблицы (одно движение трогает столько строк, сколько
+# в наборе), и у неё обязаны быть три вещи, которых у голого разреза нет: названный объект,
+# след и обратный ход. Здесь они и живут. Второго писателя таблицы это НЕ заводит: правку по
+# месту по-прежнему делает `withdraw`/`_rewrite`, а не своя копия цикла.
+#
+# ОБЪЕКТ НАЗЫВАЕТСЯ ЧИСЛОМ, И ЭТО РЕШЕНИЕ ШТАБА, А НЕ УДОБСТВО ЗДЕСЬ. Подтверждение снятия обязано
+# нести КЛЮЧ набора и ЧИСЛО строк, которые уйдут; подтверждение без объекта не выписывается вовсе.
+# Проверка стои́т В ХРАНИЛИЩЕ, а не только в двери, ровно по доводу `REASON_PROMOTE_NO_WHO`: гейт,
+# оставленный вызывающему, обойдёт первый же новый вызывающий, и обойдёт молча.
+#
+# ЧЕМ ЧИСЛО ЛУЧШЕ ХРАНИМОГО «ШАГА 1». Ждать «сначала посмотрел, потом снял» можно было бы
+# состоянием (кому что показали и когда), но такое состояние ПРОТУХАЕТ: между показом и
+# подтверждением набор мог вырасти, и снялось бы не то, что показали. Число сверяется с ЖИВЫМ
+# файлом в момент снятия — оно не может отстать от таблицы, потому что берётся из неё же.
+# Расхождение названо числами в обе стороны («названо N, а в наборе M») и НЕ ТРОГАЕТ НИЧЕГО.
+#
+# ЗАЧЕМ СВОЙ СЛЕД, А НЕ СЛЕД ПЕРЕВОДА. У следа перевода ключ — НОМЕР урока, и `rollback(N)`
+# берёт по номеру ПОСЛЕДНЮЮ запись. Положи снятие набора туда — и откат перевода на любом уроке
+# набора ответил бы «перевод уже откачен» (последняя запись не `перевод`), то есть соврал бы про
+# чужое движение. Объекты разные — ключ набора и номер урока, — и таблицы у них разные.
+BATCH_LOG_SUFFIX = ".batch"
+ACT_BATCH_OFF = "снятие_набора"
+ACT_BATCH_BACK = "возврат_набора"
+# СТРОКА СЛЕДА — НА КАЖДЫЙ УРОК, а не одна на движение со списком внутри. Список номеров и
+# прежних состояний в одной ячейке потребовал бы своего разделителя, а состояние снятого урока
+# уже содержит `;` (`снят(источник;штамп)`) — то есть разделитель пришлось бы выдумывать и
+# экранировать вторым, своим способом поверх общего `esc`.
+#
+# У ДВИЖЕНИЯ СВОЙ НОМЕР, А НЕ ШТАМП ВМЕСТО НОМЕРА — и это ЗАМЕРЕННАЯ ошибка, а не осторожность.
+# Первая редакция опознавала движение общим штампом всех его строк, и на паре «снял → вернул →
+# снял», уложившейся в ОДНУ СЕКУНДУ, второе снятие получало тот же штамп, что первое, — то есть
+# считалось уже закрытым, и возврат отвечал «снятия в следе нет» при живом снятом наборе (тест
+# `test_off_back_off_again_returns_the_right_withdrawal` красил это до правки). Штамп секундный,
+# и опираться на его уникальность нельзя ни в одной ветке.
+BATCH_COLUMNS = ("когда", "действие", "движение", "ключ", "кто", "почему", "номер",
+                 "было_состояние", "стало_состояние", "всего", "ссылка")
+BATCH_HEADER = "\t".join(BATCH_COLUMNS)
+
+REASON_BATCH_UNKNOWN = ("набор НЕ снят: источник «%s» мне неизвестен (знаю %s). Ничего не "
+                        "тронуто — снимать по неизвестному ключу нечего")
+REASON_BATCH_NO_WHO = ("набор НЕ снят: не назван автор снятия. Снятие набора — самое широкое "
+                       "движение таблицы, и безымянным оно не бывает: спросить было бы не с кого")
+REASON_BATCH_NO_WHY = ("набор НЕ снят: причина не названа. Причину не подставляем ниоткуда — "
+                       "пусто значит пусто; назовите «почему» словами и повторите")
+# ОТКАЗ, А НЕ «СНЯЛ 0». Тот же довод, что у чужого значения разреза: код успеха при нуле снятых
+# строк — ложный зелёный ровно в той операции, ради которой всё затевалось.
+REASON_BATCH_NO_COUNT = ("набор НЕ снят: в подтверждении не названо ЧИСЛО строк. Подтверждение "
+                         "обязано называть объект целиком — ключ набора И сколько строк уйдёт; "
+                         "посмотрите набор и повторите с числом")
+REASON_BATCH_COUNT = ("набор «%s» НЕ снят: названо %d строк, а снять сейчас можно %d. Объект "
+                      "подтверждения не тот, что в таблице, — ничего не тронуто. Посмотрите "
+                      "набор заново и подтвердите живым числом")
+REASON_BATCH_EMPTY = ("набор «%s» НЕ снят: снимать нечего — ни одной действующей строки и ни "
+                      "одного кандидата с этим источником в таблице нет")
+REASON_BATCH_NO_TABLE = "набор «%s» НЕ снят: таблицы уроков ещё нет вовсе"
+# СТРОКА НЕ ТОЙ ШИРИНЫ — ОТКАЗ ДО ЛЮБОЙ ПРАВКИ. Своими словами, а не через расхождение чисел:
+# чинится это иначе (руками, в файле), и назвать номер строки владельцу дороже, чем промолчать.
+REASON_BATCH_BROKEN = ("набор «%s» НЕ снят: строка урока #%s не той ширины — её байты вернуть "
+                       "нечем, а снимать набор без возврата нельзя. Ничего не тронуто")
+
+REASON_BACK_NO_WHO = ("набор НЕ возвращён: не назван автор возврата. Возврат — такое же движение "
+                      "правил, по которым бот отвечает всем клиентам, и безымянным он не бывает")
+REASON_BACK_NO_TRACE = ("набор «%s» НЕ возвращён: снятия этого набора в следе нет. Возвращать "
+                        "нечего — этот ключ никто не снимал")
+REASON_BACK_MOVED = ("набор «%s» НЕ возвращён: урок #%s после снятия изменился (состояние «%s», "
+                     "а снятие оставило «%s»). Возврат вернул бы не то, что было; ничего не "
+                     "тронуто — смотрите след набора и решайте словами")
+REASON_BACK_MISSING = "набор «%s» НЕ возвращён: урока #%s, снятого этим движением, в таблице нет"
+
+BatchCard = namedtuple("BatchCard",
+                       "source rows movable withdrawn numbers first last who census")
+BatchTrace = namedtuple("BatchTrace",
+                        "stamp act move source who why number prev_state new_state total ref "
+                        "line")
+BatchResult = namedtuple("BatchResult",
+                         "ok source count numbers reason lines_before lines_after who why stamp")
+
+
+def batch_log_path(path=None):
+    """Путь следа НАБОРОВ — рядом со своей таблицей и производный от неё, ровно по доводу
+    `promote_log_path`: тест, подменивший таблицу временным файлом, уводит туда же и след."""
+    return _path(path) + BATCH_LOG_SUFFIX
+
+
+def _batch_rows(lessons, key):
+    """Строки набора → (снимаемые, уже снятые). Разрез берётся у `_matches`, а не пишется здесь
+    вторым: разъехаться охвату показа с охватом снятия нечем."""
+    movable, withdrawn = [], []
+    for les in lessons:
+        if not _matches(les, CUT_SOURCE, key):
+            continue
+        # Кандидат уходит вместе с действующим — тем же доводом, что в `withdraw`: иначе
+        # ошибочно залитый набор оставил бы за собой кандидатов, которых нечем вынуть.
+        (movable if (is_active(les) or is_candidate(les)) else withdrawn).append(les)
+    return tuple(movable), tuple(withdrawn)
+
+
+def batch_card(source, path=None):
+    """ШАГ ПЕРВЫЙ: что это за набор → (ок, причина словами, BatchCard | None). ТОЛЬКО ЧТЕНИЕ.
+
+    Отвечает на четыре вопроса решения: КЛЮЧ, СКОЛЬКО уроков уйдёт, КОГДА залит (первый и
+    последний штамп) и КЕМ записан. Число `movable` — это ровно то, что владелец обязан назвать
+    в подтверждении, и берётся оно тем же `_matches`, каким снимает `withdraw`."""
+    canon = known_source(source)
+    if canon is None:
+        return False, REASON_BATCH_UNKNOWN % (str(source).strip(), ", ".join(SOURCES)), None
+    store = load(path)
+    rows = by_source(store.lessons, canon)
+    movable, withdrawn = _batch_rows(store.lessons, norm_source(canon))
+    stamps = sorted(les.when for les in rows)
+    authors = tuple(sorted({les.who.strip() for les in rows if les.who.strip()}))
+    return True, "", BatchCard(canon, len(rows), len(movable), len(withdrawn),
+                               tuple(les.number for les in movable),
+                               stamps[0] if stamps else "", stamps[-1] if stamps else "",
+                               authors, sources_census(store.lessons))
+
+
+def load_batch_trace(path=None, source=None):
+    """След наборов → кортеж BatchTrace в порядке файла (`source=` — только этот ключ).
+
+    Битая строка пропускается для читателя, но из файла не исчезает: стирающих веток у следа
+    нет ни одной."""
+    log_path = batch_log_path(path)
+    if not os.path.exists(log_path):
+        return ()
+    key = norm_source(source) if source is not None else None
+    out = []
+    with open(log_path, encoding="utf-8", newline="") as f:
+        for idx, line in enumerate(f, start=1):
+            body = line.rstrip("\n").rstrip("\r")
+            if idx == 1 and body == BATCH_HEADER:
+                continue
+            parts = body.split("\t")
+            if len(parts) != len(BATCH_COLUMNS):
+                continue
+            move = _leading_number(parts[2])
+            number = _leading_number(parts[6])
+            total = _leading_number(parts[9])
+            if move is None or number is None or total is None:
+                continue
+            if key is not None and norm_source(parts[3]) != key:
+                continue
+            out.append(BatchTrace(parts[0], parts[1], move, parts[3], unesc(parts[4]),
+                                  unesc(parts[5]), number, parts[7], parts[8], total,
+                                  parts[10], idx))
+    return tuple(out)
+
+
+def _next_batch_move(path=None):
+    """Номер следующего движения набора: максимум занятого + 1. Считается по ВСЕМУ следу, а не
+    по одному ключу: номер обязан быть уникальным на файл, иначе ссылка возврата стала бы
+    двусмысленной ровно тогда, когда наборов больше одного."""
+    top = 0
+    for t in load_batch_trace(path):
+        if t.move > top:
+            top = t.move
+    return top + 1
+
+
+def open_batch_withdrawal(path=None, source=None):
+    """ПОСЛЕДНЕЕ снятие набора, которое ещё НЕ возвращено → кортеж строк следа (пусто — нет).
+
+    «Не возвращено» судится ССЫЛКОЙ НА НОМЕР ДВИЖЕНИЯ, а не порядком строк и не штампом: возврат
+    пишет в графу `ссылка` номер того снятия, которое отменил. Судить «по последнему движению»
+    было бы неверно на паре снял → вернул → снял (там последнее снятие старше последнего
+    возврата, но открыто именно оно), а судить по штампу — неверно внутри одной секунды."""
+    seen = load_batch_trace(path, source=source)
+    closed = {_leading_number(t.ref) for t in seen if t.act == ACT_BATCH_BACK}
+    closed.discard(None)
+    groups, order = {}, []
+    for t in seen:
+        if t.act != ACT_BATCH_OFF or t.move in closed:
+            continue
+        if t.move not in groups:
+            groups[t.move] = []
+            order.append(t.move)
+        groups[t.move].append(t)
+    if not order:
+        return ()
+    return tuple(groups[order[-1]])
+
+
+def _batch_trace_append(log_path, rows):
+    """Строки следа набора одним движением. Дозапись + `fsync`, как у самой таблицы."""
+    need_header = (not os.path.exists(log_path)) or os.path.getsize(log_path) == 0
+    for row in rows:
+        _append_row(log_path, "\t".join(row), need_header, header=BATCH_HEADER)
+        need_header = False
+
+
+def batch_withdraw(source, count=None, why="", who="", path=None, now=None):
+    """ШАГ ВТОРОЙ: снять ВЕСЬ набор `source`, названный ключом И числом строк `count`.
+    → BatchResult (не бросает: отказ — это ответ, а не исключение).
+
+    ПОРЯДОК ОТКАЗОВ ВЫБРАН, А НЕ СЛУЧИЛСЯ. Ключ → автор → причина → число → сверка числа.
+    Причина спрашивается РАНЬШЕ числа сознательно: «почему» — единственное жёсткое требование
+    владельца к таблице уроков и требование более старое, а новая проверка, перехватывающая
+    чужие отказы, прячет их причину (тот же выбор, что у источника в `add`). Ключ идёт первым:
+    пока не понято, О ЧЁМ речь, остальные вопросы задавать не о чем.
+
+    СЛЕД ПИШЕТСЯ ДО ПРАВКИ — тем же выбором, что у `promote`. Оборвись процесс между следом и
+    правкой: в следе останется снятие, которого не случилось, и возврат честно ответит «урок
+    после снятия изменился» (строка всё ещё действующая). Обратный порядок дал бы СНЯТЫЙ набор
+    без записи о снятии — то есть строки, которые нечем вернуть.
+
+    ПРАВКУ ДЕЛАЕТ `withdraw(source=…)`, а не своя копия цикла: второй писатель разошёлся бы с
+    первым молча. Штамп передаётся ему тот же (`now`), поэтому состояние в таблице и графа
+    `стало_состояние` следа — одни и те же байты."""
+    stamp = now_stamp(now)
+    author = who.strip() if isinstance(who, str) else ""
+    # `isinstance`, а не `why or ""`: вторая форма схлопывает «не передали» и «передали пустое»
+    # в одно, и `0`/`[]`, приехавшие сюда по ошибке вызывающего, стали бы неотличимы от честной
+    # пустой причины. Идиома взята у `promote` в этом же файле, а не выдумана рядом.
+    given = why if isinstance(why, str) else ""
+    reason_text = " ".join(given.split()).strip()
+
+    canon = known_source(source)
+    if canon is None:
+        return BatchResult(False, None, 0, (),
+                           REASON_BATCH_UNKNOWN % (str(source).strip(), ", ".join(SOURCES)),
+                           0, 0, author, reason_text, stamp)
+    if len(author) == 0:
+        return BatchResult(False, canon, 0, (), REASON_BATCH_NO_WHO, 0, 0, author,
+                           reason_text, stamp)
+    if len(reason_text) == 0:
+        return BatchResult(False, canon, 0, (), REASON_BATCH_NO_WHY, 0, 0, author,
+                           reason_text, stamp)
+    named = _leading_number(str(count)) if count is not None else None
+    if named is None:
+        return BatchResult(False, canon, 0, (), REASON_BATCH_NO_COUNT, 0, 0, author,
+                           reason_text, stamp)
+
+    target = _path(path)
+    store = load(target)
+    if not store.exists:
+        return BatchResult(False, canon, named, (), REASON_BATCH_NO_TABLE % canon, 0, 0,
+                           author, reason_text, stamp)
+    lines = _count_lines(target)
+    movable, _already = _batch_rows(store.lessons, norm_source(canon))
+    if len(movable) == 0:
+        return BatchResult(False, canon, named, (), REASON_BATCH_EMPTY % canon, lines, lines,
+                           author, reason_text, stamp)
+    if named != len(movable):
+        return BatchResult(False, canon, named, tuple(les.number for les in movable),
+                           REASON_BATCH_COUNT % (canon, named, len(movable)), lines, lines,
+                           author, reason_text, stamp)
+
+    new_state = withdrawn_state(CUT_SOURCE, stamp)
+    move = _next_batch_move(path)
+    rows = []
+    for les in movable:
+        raw = _raw_fields(target, les.line)
+        if raw is None:                       # строка не той ширины — правим только целые
+            # ОТКАЗ ЗДЕСЬ ЕЩЁ БЕЗОПАСЕН: след не написан (он пишется одним куском ниже), файл не
+            # тронут. Проверить ширину заранее нельзя — `Lesson` до `_raw_fields` о ней молчит.
+            return BatchResult(False, canon, named, (),
+                               REASON_BATCH_BROKEN % (canon, les.number),
+                               lines, lines, author, reason_text, stamp)
+        rows.append((stamp, ACT_BATCH_OFF, str(move), canon, esc(author), esc(reason_text),
+                     str(les.number), raw[IDX_STATE], new_state, str(len(movable)), ""))
+    _batch_trace_append(batch_log_path(path), rows)
+    res = withdraw(source=canon, path=path, now=now)
+    return BatchResult(True, canon, len(res.marked), tuple(res.marked), "",
+                       res.lines_before, res.lines_after, author, reason_text, stamp)
+
+
+def batch_restore(source, who="", path=None, now=None):
+    """ВОЗВРАТ набора `source` — ОДНО движение, обратное последнему незакрытому снятию.
+    → BatchResult (не бросает).
+
+    Возвращает РОВНО ТЕ БАЙТЫ состояния, которые лежали до снятия (у одних строк это `актив`,
+    у других `кандидат`, у третьих — снятие ПРЕЖНИМ разрезом): состояние берётся из следа, а не
+    вычисляется заново. Поэтому файл после возврата побайтно равен файлу до снятия — прочие поля
+    не трогаются вовсе (`_replace_fields` переносит их дословно).
+
+    ЧИСЛА В ПОДТВЕРЖДЕНИИ ЗДЕСЬ НЕТ, и это не забывчивость: возврат не расширяет охват и не
+    теряет строк — он отменяет ИМЕННО ТО движение, которое записано в следе. Опасное направление
+    одно, и объект называется в нём.
+
+    ВСЁ ИЛИ НИЧЕГО. Разошлась хоть одна строка (её правили руками, сняли снова, перевели) —
+    отказ целиком, и таблица не трогается ни одной правкой: вернуть половину набора хуже, чем
+    не вернуть ничего, потому что вторую половину после этого нечем опознать.
+
+    След дописывается ПОСЛЕ правки — обратный `batch_withdraw` порядок и по той же логике
+    выбора: оборванная запись оставит возврат несделанным и повторимым, а не «возвращено» на
+    снятом наборе."""
+    stamp = now_stamp(now)
+    author = who.strip() if isinstance(who, str) else ""
+    canon = known_source(source)
+    if canon is None:
+        return BatchResult(False, None, 0, (),
+                           REASON_BATCH_UNKNOWN % (str(source).strip(), ", ".join(SOURCES)),
+                           0, 0, author, "", stamp)
+    if len(author) == 0:
+        return BatchResult(False, canon, 0, (), REASON_BACK_NO_WHO, 0, 0, author, "", stamp)
+
+    opened = open_batch_withdrawal(path, source=canon)
+    if len(opened) == 0:
+        return BatchResult(False, canon, 0, (), REASON_BACK_NO_TRACE % canon, 0, 0, author,
+                           "", stamp)
+
+    target = _path(path)
+    store = load(target)
+    lines = _count_lines(target) if store.exists else 0
+    by_number = {les.number: les for les in store.lessons}
+    edits = {}
+    for t in opened:
+        les = by_number.get(t.number)
+        if les is None:
+            return BatchResult(False, canon, 0, (), REASON_BACK_MISSING % (canon, t.number),
+                               lines, lines, author, "", stamp)
+        raw = _raw_fields(target, les.line)
+        # СВЕРКА С БАЙТАМИ, А НЕ СО СМЫСЛОМ: возвращаем ровно то снятие, которое лежит в строке
+        # сейчас. Правка руками между снятием и возвратом обязана быть ВИДНА, а не затёрта.
+        if raw is None or raw[IDX_STATE] != t.new_state:
+            got = les.state if raw is None else raw[IDX_STATE]
+            return BatchResult(False, canon, 0, (),
+                               REASON_BACK_MOVED % (canon, t.number, got, t.new_state),
+                               lines, lines, author, "", stamp)
+        edits[les.line] = {IDX_STATE: t.prev_state}
+
+    before, after = _rewrite(target, edits)
+    ref = opened[0].move
+    move = _next_batch_move(path)
+    back_rows = [(stamp, ACT_BATCH_BACK, str(move), canon, esc(author), esc(opened[0].why),
+                  str(t.number), t.new_state, t.prev_state, str(len(opened)), str(ref))
+                 for t in opened]
+    _batch_trace_append(batch_log_path(path), back_rows)
+    return BatchResult(True, canon, len(opened), tuple(t.number for t in opened), "",
+                       before, after, author, opened[0].why, stamp)
+
+
+# ---------------------------------------------------------------------------------------
 # Ёмкость и целостность
 # ---------------------------------------------------------------------------------------
 # ПОРОГ КОМФОРТА — ИЗМЕРЕН, а не назначен (замер 19.08.2026 на строках живого размера,
@@ -1194,6 +1541,8 @@ def main(argv=None):
     ap.add_argument("--status", action="store_true", help="ёмкость и целостность числами")
     ap.add_argument("--list", action="store_true", help="перечислить уроки")
     ap.add_argument("--trace", action="store_true", help="след переводов и откатов")
+    ap.add_argument("--batch-trace", action="store_true", dest="batch_trace",
+                    help="след снятий и возвратов НАБОРОВ (своя таблица, свой ключ)")
     ap.add_argument("--all", action="store_true", help="вместе со снятыми")
     ap.add_argument("--who", help="только уроки этого человека")
     ap.add_argument("--day", help="только уроки за сутки ГГГГ-ММ-ДД")
@@ -1210,6 +1559,18 @@ def main(argv=None):
             print("%s  %-7s #%-4d %-16s было «%s» → стало «%s»"
                   % (t.stamp, t.act, t.number, t.who, unesc(t.prev_state), unesc(t.new_why)))
         print("— всего движений: %d" % len(seen))
+        return 0
+
+    if args.batch_trace:
+        # СВОЙ след и СВОЙ ключ: у набора объект — источник, а не номер урока (см. §НАБОР).
+        seen = load_batch_trace(args.path)
+        print("след наборов: %s (%s)" % (batch_log_path(args.path),
+                                         "есть" if len(seen) > 0 else "пуст или не заведён"))
+        for t in seen:
+            print("%s  движение %-4d %-14s %-18s #%-4d %-16s было «%s» → стало «%s» (всего %d)"
+                  % (t.stamp, t.move, t.act, t.source, t.number, t.who, t.prev_state,
+                     t.new_state, t.total))
+        print("— всего строк следа: %d" % len(seen))
         return 0
 
     if not args.list:
