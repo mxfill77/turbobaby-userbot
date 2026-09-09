@@ -57,6 +57,7 @@ import sys
 import recon_auto
 import review_intake
 import review_intake_run
+import zayavki_lotok_run
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -346,8 +347,20 @@ class Queue(review_intake_run.Queue):
         ok, tid, err = self._d.enqueue_pc_task(text, frm=TASK_FROM)
         return (bool(ok), tid, "" if ok else str(err or "enqueue отклонён"))
 
+    def claim_marks(self, rows):
+        """Ряды → пары «день, ключ» ступени E. Регулярка СВОЯ, лоток ОБЩИЙ. → list."""
+        return recon_auto.markers(rows, "ask")
+
     def place_ask(self, text):
-        """ЗАЯВКА ВЛАДЕЛЬЦУ — ряд, минующий ``new``. → (ok, id|None, причина)."""
+        """ЗАЯВКА ВЛАДЕЛЬЦУ — ЛОТОК, а ряда ожидания нет. → (ok, адрес|id|None, причина).
+
+        Три действия ступени (`enqueue` → `claim` → `set_needs_approval`) остаются
+        на месте и исполняются, только если лоток заявку НЕ ВЗЯЛ: разошлись
+        признаки, рубильник поднят, файл не лёг — прежний путь, ряд и карточка.
+        """
+        took, rel, why_lot = self.to_lotok(text, ASK_FROM)
+        if took:
+            return True, rel, ""
         d = self._d
         ok, tid, err = d.enqueue_pc_task(text, frm=ASK_FROM)
         if not ok:
@@ -378,6 +391,7 @@ def build(root=HERE, queue=None, clock=None, prober=None):
     out = {"stamp": stamp, "today": today, "causes": [], "why": [], "queue_ok": False,
            "owner_busy": None, "owner_rows": [], "task_marks": [], "ask_marks": [],
            "routes": {}, "signals": [], "expect_why": "", "rows": 0,
+           "lotok_ok": False, "lotok_why": "лоток не спрашивали",
            "closed_ok": False, "budget_ok": False, "budget_why": "", "marks_ok": False}
 
     eps, why = expect_open(root)
@@ -387,7 +401,7 @@ def build(root=HERE, queue=None, clock=None, prober=None):
 
     # Клиент моста поднимается РОВНО ОДИН РАЗ за сборку: каждый `Queue()` тянет за
     # собой импорт демона, и три вызова подряд стоили бы трёх его запусков.
-    q = None if queue is False else (queue or Queue())
+    q = None if queue is False else (queue or Queue(root=root))
     live_rows, ok, qwhy = ([], False, "очередь не спрашивали")
     if q is not None:
         live_rows, ok, qwhy = q.rows(OPEN_STATUSES)
@@ -452,9 +466,19 @@ def build(root=HERE, queue=None, clock=None, prober=None):
     # Полнота корпуса — И открытые, И `failed`, И `done`. Любая непрочитанная
     # половина делает счёт неполным, а неполный счёт по правилу третьего исхода
     # значит «день исчерпан», а не «день пуст» (`recon_auto.budget_left`).
-    out["marks_ok"] = bool(ok and closed_ok and budget_ok)
+    # ЛОТОК — ЧАСТЬ КОРПУСА, А НЕ ДОБАВКА К НЕМУ (09.09.2026). Заявка владельцу
+    # ряда больше не создаёт, и её маркер в очереди не появится НИКОГДА. Не
+    # прочитав лоток, потолок `ask_budget` считал бы пустой день каждый оборот —
+    # ровно тот класс, что дал пять разведок за одни сутки при потолке 2. Лоток не
+    # прочитан → корпус НЕПОЛНЫЙ, и день считается исчерпанным, а не пустым.
+    lot_rows, lot_ok, lot_why = zayavki_lotok_run.marker_rows(root)
+    if not lot_ok:
+        out["why"].append("лоток заявок не прочитан (%s) — сколько поставлено сегодня, "
+                          "НЕИЗВЕСТНО; день считаем ИСЧЕРПАННЫМ" % lot_why)
+    out["lotok_ok"], out["lotok_why"] = lot_ok, lot_why
+    out["marks_ok"] = bool(ok and closed_ok and budget_ok and lot_ok)
     if ok:
-        all_rows = list(live_rows) + list(closed_rows) + list(budget_rows)
+        all_rows = list(live_rows) + list(closed_rows) + list(budget_rows) + list(lot_rows)
         out["rows"] = len(all_rows)
         out["task_marks"] = recon_auto.markers(all_rows, "task")
         out["ask_marks"] = recon_auto.markers(all_rows, "ask")

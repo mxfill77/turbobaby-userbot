@@ -119,6 +119,7 @@ import re
 import contour_digest as cd
 import expectations_pc as ex
 import shtab_box
+import zayavki_lotok_pc      # СТРОКИ ЛОТКА: своего счёта и своих слов витрина не заводит
 import zayavki_route_pc      # СТРОКИ «МИМО ИНБОКСА»: своего счёта и своих слов витрина не заводит
 
 SCHEMA = "turbobaby.vitrina_pc/v1"
@@ -755,7 +756,7 @@ def part_goal(shtab, counted, today=""):
     return out
 
 
-def part_nums(counted, taken, day, external, awaiting, box_stop="", routed=None):
+def part_nums(counted, taken, day, external, awaiting, box_stop="", routed=None, lotok=None):
     """ЧИСЛА: серия с ОПОРОЙ · ящик Штаба · внешний контур · ДЕРЖАТ и ЖДУТ МНЕНИЯ.
 
     ДВЕ РАЗНЫЕ ВЕЩИ БОЛЬШЕ НЕ ЗОВУТСЯ ОДНИМ СЛОВОМ (правка 02.09.2026). До неё
@@ -837,6 +838,19 @@ def part_nums(counted, taken, day, external, awaiting, box_stop="", routed=None)
         (routed or {}).get("rows") if isinstance(routed, dict) else None,
         ok=bool(isinstance(routed, dict) and routed.get("ok")),
         why=(routed or {}).get("why") if isinstance(routed, dict) else "реестр маршрута не прочитан")
+    # ЧЕТВЁРТОЕ ЧИСЛО РЯДА — ЛОТОК (09.09.2026), и оно про то, чего в очереди НЕТ ВОВСЕ.
+    # Три числа выше считают РЯДЫ; это считает заявки, по которым ряда ожидания не
+    # создавалось: род объявил себя не-задачей, второй признак подтвердил, что работы
+    # она не держит, и она легла файлом в лоток. Складывать его с тремя верхними
+    # нельзя — у них разные предметы. Без этой строки изъятие было бы молчаливым, а
+    # молчаливого изъятия задание запрещает прямо. Числа и слова собирает
+    # `zayavki_lotok_pc`, здесь только место показа; лоток не прочитан → НЕИЗВЕСТНО с
+    # причиной, а не ноль.
+    out += zayavki_lotok_pc.vitrina_lines(
+        (lotok or {}).get("rows") if isinstance(lotok, dict) else None,
+        ok=bool(isinstance(lotok, dict) and lotok.get("ok")),
+        why=((lotok or {}).get("why") or "") if isinstance(lotok, dict)
+            else "лоток не спрашивали — зовущий его не назвал")
     return out
 
 
@@ -899,7 +913,7 @@ def sections(facts, blind=True):
         "nums": part_nums(got.get("series"), got.get("shtab_taken"), today,
                           got.get("external"), got.get("awaiting"),
                           box_stop=got.get("box_stop") or "",
-                          routed=got.get("routed")),
+                          routed=got.get("routed"), lotok=got.get("lotok")),
         "axes": part_axes(got.get("axes"), got.get("closed_day"), got.get("axes_why") or ""),
         "owner": part_owner(got.get("waiting")),
     }

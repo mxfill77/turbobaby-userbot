@@ -63,6 +63,8 @@ import shtab_box_run as sbr         # ДОРОГА К ПАПКЕ МОЗГА: т�
 import shtab_box_signals            # РАЗЛИЧИТЕЛЬ ВИДА РЯДА: тот же, что у остановки ящика
 import vitrina_pc as vp
 import zayavki_pc
+import zayavki_lotok_pc            # ОКНО ДНЯ ЛОТКА: своего счёта витрина не заводит
+import zayavki_lotok_run           # ЧТЕНИЕ ЛОТКА: тем же, чем читается лоток ревью
 import zayavki_route_pc            # ОКНО СУТОК РЕЕСТРА МАРШРУТА: своего счёта витрина не заводит
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -206,6 +208,24 @@ def read_routed(root=HERE, now=None, named=None):
     if not isinstance(got, dict):
         return {"ok": False, "rows": None, "why": "реестр маршрута не разобрался"}
     return {"ok": True, "rows": zayavki_route_pc.day_rows(got, now_ts(now)), "why": ""}
+
+
+def read_lotok(root=HERE, day=""):
+    """Лоток информационных заявок → записи ЗА ДЕНЬ. → dict(ok, rows, why).
+
+    Читаем ЧУЖИМ ЧТЕНИЕМ (`zayavki_lotok_run.rows`), а не своим обходом каталога:
+    второй читатель одного лотка разошёлся бы с первым молча — тот же закон, по
+    которому витрина не заводит своего счёта маршрута.
+
+    ЛОТОК НЕ ПРОЧИТАН — ЭТО ``ok=False``, А НЕ НОЛЬ. «В лотке 0» читалось бы как
+    измеренный факт и было бы неотличимо от суток, в которые каталог просто не
+    открылся. Прямое требование задания и тот же закон, которым живёт единая
+    дверь числа витрины.
+    """
+    got, ok, why = zayavki_lotok_run.rows(root)
+    if not ok:
+        return {"ok": False, "rows": None, "why": why or "лоток не прочитан"}
+    return {"ok": True, "rows": zayavki_lotok_pc.day_rows(got, day), "why": ""}
 
 
 def running_rows(snapshot, claims, now):
@@ -609,6 +629,7 @@ def collect(root=HERE, now=None, runner=None, inbox=None, day=None, shtab=None):
         "shtab_taken": cd.shtab_taken(cdr.all_rows(snapshot), the_day),
         "box_stop": read_box_stop(root),
         "routed": read_routed(root, now),
+        "lotok": read_lotok(root, the_day),
         "external": external,
         "awaiting": awaiting_counts(waiting),
         "waiting": waiting,

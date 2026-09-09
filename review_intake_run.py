@@ -39,6 +39,8 @@ import subprocess
 import sys
 
 import review_intake
+import zayavki_lotok_pc
+import zayavki_lotok_run
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -327,8 +329,11 @@ class Queue:
     ей запрещено).
     """
 
-    def __init__(self, daemon=None):
+    def __init__(self, daemon=None, root=HERE):
         self._d = daemon or _daemon()
+        # Корень нужен ЛОТКУ, и он поле, а не константа: под тестом лоток обязан
+        # уехать во временный каталог вместе со всем прочим состоянием ступени.
+        self._root = root
 
     def markers(self):
         """Ключи уже стоящих заявок из ЖИВОЙ очереди. → (list[(дата,ключ)], ok, why).
@@ -345,7 +350,57 @@ class Queue:
                 return [], False, str(res.get("error") or "мост не ответил")
             rows = [it for it in (res.get("items") or []) if str(it.get("lane") or "pc") == "pc"]
             out.extend(review_intake.claim_markers(rows))
+        # ЛОТОК — ВТОРАЯ ПОЛОВИНА ТОГО ЖЕ КОРПУСА (09.09.2026). Информационная заявка
+        # ряда больше не создаёт, а дедуп и суточный потолок считаются ПО ЖИВОЙ ОЧЕРЕДИ.
+        # Не спросив лоток, счёт увидел бы пустой день и разрешил ставить заново то,
+        # что уже лежит: тот же класс, что дал пять разведок за сутки при потолке 2.
+        # Лоток не прочитан → ok=False, и зовущий не ставит НИЧЕГО — так же, как при
+        # молчащем мосте: непрочитанный корпус значит «не знаю, сколько поставлено».
+        lot, lot_ok, lot_why = zayavki_lotok_run.marker_rows(self._root)
+        if not lot_ok:
+            return [], False, lot_why
+        out.extend(self.claim_marks(lot))
         return out, True, ""
+
+    def claim_marks(self, rows):
+        """Ряды (очереди или лотка) → пары «день, ключ» СВОЕЙ ступени. → list.
+
+        Отдельным методом ровно затем, чтобы ступень E переопределила его СВОЕЙ
+        регуляркой, не заводя второго чтения лотка: маркеры у ступеней разные, а
+        лоток один.
+        """
+        return review_intake.claim_markers(rows)
+
+    def to_lotok(self, text, frm, day=""):
+        """Заявка → ЛОТОК вместо ряда ожидания. → (взяли?, адрес|None, почему).
+
+        ЕДИНСТВЕННОЕ МЕСТО, ГДЕ РЕШЕНИЕ СТАНОВИТСЯ ДЕЙСТВИЕМ. Своего различителя
+        здесь нет: род и «держит ли работу» судит `zayavki_route_pc.decide`, тот
+        же, которым полоса уже живёт. Оба признака обязаны совпасть; разошлись,
+        не спрошены, рубильник поднят, модуль не поднялся, файл не лёг — ПРЕЖНИЙ
+        ПУТЬ, ряд и карточка. Направление отказа выбрано в сторону владельца:
+        заглушенная заявка дороже лишнего ряда.
+        """
+        if not zayavki_lotok_run.enabled():
+            return False, None, "лоток выключен рубильником %s" % zayavki_lotok_pc.OFF_FLAG
+        try:
+            row = zayavki_lotok_pc.row_of(text, frm)
+            verdict = zayavki_lotok_pc.informational(
+                row, owner_work=self._d._is_owner_work(row, ()))
+            if not verdict.get("informational"):
+                return False, None, verdict.get("why") or "не информационная заявка"
+            marks = self.claim_marks([{"task_text": text}])
+            got_day, key = (marks[0] if marks else (day, ""))
+            verdict = dict(verdict, key=key)
+            stamp = now_iso()
+            ok, rel, why = zayavki_lotok_run.put(text, verdict, stamp,
+                                                 got_day or day, root=self._root)
+            if not ok:
+                return False, None, why
+            return True, rel, verdict.get("why") or ""
+        except Exception as exc:                   # noqa: BLE001 — сбой = прежний путь
+            return False, None, "лоток не сработал (%s: %s) — ставим ряд как прежде" % (
+                type(exc).__name__, exc)
 
     def place(self, text, topic=None):
         """Ряд-заявка в очередь + карточка владельцу. → (ok, id|None, причина).
@@ -355,6 +410,14 @@ class Queue:
         ``new``/``in_progress``, и её добьёт гард ``process_new`` — заявка не
         исполняется НИ ОДНОЙ веткой, даже осиротевшая.
         """
+        # ЛОТОК СТОИ́Т ПЕРВЫМ, ДО enqueue (09.09.2026). Прежний замок снимал у ряда
+        # ТЕМУ карточки — рычаг, которого принимающая сторона не читает вовсе
+        # (devbot VPS отбирает ряды по метке `from`, живой ряд #232). Значит
+        # перекрывать надо ПОВОД: пока ряд `needs_approval` существует, он висит у
+        # владельца. Взял лоток — ряда не создаётся ни одного.
+        took, rel, why_lot = self.to_lotok(text, CLAIM_FROM)
+        if took:
+            return True, rel, ""
         d = self._d
         ok, tid, err = d.enqueue_pc_task(text, frm=CLAIM_FROM)
         if not ok:
@@ -429,7 +492,7 @@ def tick(root=HERE, state_path=None, inbox=DEFAULT_INBOX, budget=DEFAULT_BUDGET,
         report["why"] = "сухой ход: заявки построены, очередь не тронута"
         report["held"] = [(c["claim"]["key"], "сухой ход") for c in claims]
         return report
-    markers, ok, why = (queue or Queue()).markers() if queue is not False else ([], True, "")
+    markers, ok, why = (queue or Queue(root=root)).markers() if queue is not False else ([], True, "")
     if not ok:
         # ТА ЖЕ доктрина, что у ревизора: очередь недоступна → дедуп не сверить →
         # НЕ ставим ничего. Слепая постановка дублей дороже отложенной заявки.
@@ -444,7 +507,7 @@ def tick(root=HERE, state_path=None, inbox=DEFAULT_INBOX, budget=DEFAULT_BUDGET,
             today=today, budget=budget if not force else max(budget, len(claims)), limit=limit)
     by_key = {c["claim"]["key"]: c for c in claims}
     report["selected"] = len(take)
-    q = queue or Queue()
+    q = queue or Queue(root=root)
     attempted = set()
     for claim in take:
         attempted.update(review_intake.claim_keys(claim))
