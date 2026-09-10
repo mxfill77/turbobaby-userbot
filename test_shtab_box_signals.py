@@ -38,6 +38,7 @@ from __future__ import annotations
 import ast
 import io
 import os
+import sys
 import unittest
 
 import card_terminal_log as ctl
@@ -1676,6 +1677,281 @@ class TestStopIsHeardAndAnswered(unittest.TestCase):
         self.assertEqual("T1", idx["aa11"]["at"])
         self.assertEqual("T2", idx["aa11"]["told_at"])
         self.assertTrue(idx["aa11"]["told"])
+
+
+def _cp1251_console():
+    """Поток, ПРИТВОРЯЮЩИЙСЯ трубой на Windows. → TextIOWrapper поверх байтов.
+
+    Ровно то, что получает дочерний процесс, когда вместо консоли ему дали трубу:
+    кодовая страница системы (cp1251) и политика ошибки ``strict``. Настоящей
+    консоли в наборе нет и быть не должно — фикстура повторяет её КОДИРОВКОЙ.
+    """
+    return io.TextIOWrapper(io.BytesIO(), encoding="cp1251", errors="strict",
+                            newline="", write_through=True)
+
+
+class _LockedCp1251(io.TextIOWrapper):
+    """Поток, который УЙТИ с cp1251 не может. → фикстура ВТОРОГО слоя канала.
+
+    Не выдумка: так ведёт себя всякий приёмник, чью кодировку задал не мы. Слой
+    UTF-8 на нём не берётся, и вся тяжесть ложится на политику ошибки — ровно ту
+    ветку, где решение Штаба №2 (подстановка объявляет себя) и работает.
+    """
+
+    def reconfigure(self, **kw):
+        if "encoding" in kw:
+            raise ValueError("кодировка потока прибита снаружи")
+        return super().reconfigure(**kw)
+
+
+def _locked_cp1251():
+    return _LockedCp1251(io.BytesIO(), encoding="cp1251", errors="strict",
+                         newline="", write_through=True)
+
+
+def _seen(stream, enc="cp1251"):
+    """Что легло в поток → str. Кодировку называет вызывающий: в том, КАКОЙ она
+    оказалась после починки канала, и состои́т половина замера."""
+    stream.flush()
+    return stream.buffer.getvalue().decode(enc, "replace")
+
+
+class TestConsoleChannelCp1251(unittest.TestCase):
+    """КАНАЛ ВЫВОДА КОМАНДНОЙ СТРОКИ ЯЩИКА НА cp1251-КОНСОЛИ (задание 11.09.2026).
+
+    ЖИВОЙ ПОВОД С ЧИСЛАМИ. 10.09 в 17:37:47Z снятие остановки ``db2bbe4aa216``
+    ПРОШЛО и легло строкой замка (``by="Telegram"``), а печать исхода упала
+    ``UnicodeEncodeError`` на ``✅`` (U+2705): труба дочернего процесса кодируется
+    страницей системы (cp1251), знака в ней нет. Владелец получил ТРЕЙСБЕК ВМЕСТО
+    СЛОВА «СНЯТО» — последняя дверь снятия сообщила обратное истине.
+
+    ОТРИЦАТЕЛЬНЫЙ ТЕСТ ЗДЕСЬ КОНТРФАКТОМ, а не наблюдением: на одном и том же
+    потоке-притворщике ПРЕЖНИЙ канал обязан упасть, а нынешний — напечатать и
+    отдать ТОТ ЖЕ код возврата. Без падающей половины зелёный тест не значил бы
+    ничего: он был бы зелёным и до правки.
+    """
+
+    def setUp(self):
+        import tempfile
+
+        self.root = tempfile.mkdtemp(prefix="shtabcon_")
+        self.closed = _same_cause(1, 2, 3) + _proved_tail(4, 5)
+        del run._CONSOLE_LOST[:]          # счётчик канала — общий на процесс
+        self._save = (sys.stdout, sys.stderr, run.HERE)
+
+    def tearDown(self):
+        sys.stdout, sys.stderr, run.HERE = self._save
+        del run._CONSOLE_LOST[:]
+
+    def _armed(self):
+        """Поднять остановку во ВРЕМЕННОМ корне → метка. Боевого замка не касаемся."""
+        rep = _hold_tick(self.root, closed=self.closed, hold_notify_fn=_HoldDoor())
+        self.assertTrue(rep["stop_marks"], rep["why"])
+        return rep["stop_marks"][0]
+
+    def _cli(self, argv, locked=False):
+        """Прогон командной строки на притворщике → (код, что напечатано).
+
+        ``locked`` выбирает СЛОЙ канала: обычная труба уходит в UTF-8 (слой 1,
+        живая дорога кнопки), прибитая остаётся в cp1251 и проверяет объявляющую
+        себя подстановку (слой 2).
+        """
+        out, err = (_locked_cp1251(), _locked_cp1251()) if locked \
+            else (_cp1251_console(), _cp1251_console())
+        sys.stdout, sys.stderr = out, err
+        run.HERE = self.root
+        try:
+            code = run.main(argv)
+        finally:
+            sys.stdout, sys.stderr = self._save[0], self._save[1]
+        enc = "cp1251" if locked else "utf-8"
+        return code, _seen(out, enc) + _seen(err, enc)
+
+    # ── КОНТРФАКТ: ПРЕЖНИЙ КАНАЛ ПРОТИВ НЫНЕШНЕГО ────────────────────────────
+
+    def test_the_OLD_channel_DIES_on_a_cp1251_pipe_where_the_NEW_one_SPEAKS(self):
+        """ДВЕ ПОЛОВИНЫ ОДНОГО ЗАМЕРА, обе на одном тексте и одной кодировке.
+
+        Прогон А — дословно прежний код: ``print(words)`` в непочиненный поток. Он
+        ОБЯЗАН упасть; зелень здесь означала бы, что фикстура не повторяет трубу
+        владельца, и весь тест не стои́т ничего.
+
+        Прогон Б — нынешняя командная строка целиком, от разбора аргументов до
+        кода возврата.
+        """
+        import tempfile
+
+        # Слова прогона А снимаются на ОТДЕЛЬНОМ корне: снимая метку своего корня,
+        # тест сам сделал бы её «уже снятой» и мерил бы дальше не тот текст.
+        other = tempfile.mkdtemp(prefix="shtabcon_a_")
+        rep = _hold_tick(other, closed=self.closed, hold_notify_fn=_HoldDoor())
+        _ok, words = run.free_mark(rep["stop_marks"][0], root=other, by="Telegram")
+        self.assertIn("✅", words, "решение №1 нарушено: значок выкинули из текста")
+        mark = self._armed()
+
+        old = _cp1251_console()                      # ПРОГОН А — как было до правки
+        with self.assertRaises(UnicodeEncodeError) as boom:
+            print(words, file=old)
+        self.assertEqual("✅", boom.exception.object[boom.exception.start])
+        self.assertEqual("", _seen(old), "упавшая печать всё же что-то сказала")
+
+        code, said = self._cli(["--free", mark])     # ПРОГОН Б — как стало
+        self.assertEqual(0, code)
+        self.assertIn("Остановка снята", said, "новый канал потерял само сообщение")
+        self.assertIn("✅", said, "значок доехал не целым — а он в utf-8 обязан быть целым")
+        self.assertIn(mark, said)
+
+    def test_the_channel_speaks_UTF8_because_that_is_what_the_LIVE_reader_decodes(self):
+        """ЖИВАЯ ДОРОГА ЭТОЙ КОМАНДЫ — НЕ КОНСОЛЬ, А ТРУБА К `pc_agent._box_cli`,
+        и читает он её ``encoding="utf-8"``. Оставь мы вывод в cp1251 — трейсбек
+        сменился бы мохибейком на всей кириллице разом, то есть владелец опять не
+        прочитал бы слова «снято». Проверяем ровно теми kwargs, какими читает агент.
+        """
+        mark = self._armed()
+        out = _cp1251_console()
+        sys.stdout, sys.stderr = out, _cp1251_console()
+        run.HERE = self.root
+        try:
+            self.assertEqual(0, run.main(["--free", mark, "--by", "Telegram"]))
+        finally:
+            sys.stdout, sys.stderr = self._save[0], self._save[1]
+        self.assertEqual("utf-8", out.encoding, "канал не ушёл в utf-8 — агент прочтёт мусор")
+        out.flush()
+        as_agent_reads = out.buffer.getvalue().decode("utf-8", "replace")
+        self.assertIn("✅ Остановка снята", as_agent_reads)
+        self.assertNotIn("�", as_agent_reads, "в чтении агента появился мохибейк")
+
+    def test_the_module_uses_the_LANE_device_and_does_not_grow_a_second_one(self):
+        """Шов `io_utf8.force_utf8` заведён 30.07.2026 на ЭТОТ же класс. Свой
+        переключатель кодировки здесь разошёлся бы с ним молча (класс 539), поэтому
+        зовётся ЛАНЕВОЕ устройство, а своего в модуле нет ни одной строкой."""
+        src = _src("shtab_box_run.py")
+        self.assertIn("io_utf8", src, "ящик снова чинит вывод сам по себе")
+        self.assertIn("force_utf8()", src)
+        self.assertNotIn('reconfigure(encoding=', src,
+                         "заведён второй переключатель кодировки мимо io_utf8")
+
+    def test_the_substitution_ANNOUNCES_itself_and_never_silently_edits_the_text(self):
+        """Решение Штаба №2, ВТОРОЙ СЛОЙ КАНАЛА: поток, который уйти с cp1251 не смог.
+        Штатный ``replace`` поставил бы ``?`` и промолчал — тот же класс, что
+        молчаливая обрезка. Знак назван кодовой точкой ДВАЖДЫ: вставкой на месте (её
+        видит читающий строку) и строкой-замечанием (её видит смотрящий на хвост)."""
+        new = _locked_cp1251()
+        self.assertEqual(1, run.console_ready(new))
+        self.assertEqual("cp1251", new.encoding, "фикстура обязана остаться прибитой")
+        run.say("итог: ✅ снято", stream=new)
+        said = _seen(new)
+        self.assertIn("[U+2705]", said, "подстановка не назвала знак")
+        self.assertNotIn("итог: ? снято", said, "канал молча подменил текст на «?»")
+        self.assertIn("ЗАМЕЧАНИЕ КАНАЛА", said, "о подстановке не сказано отдельной строкой")
+        self.assertIn("U+2705", run.console_note())
+        self.assertIn("итог: ", said)
+        self.assertIn(" снято", said, "текст сообщения пострадал сверх одного знака")
+
+    def test_a_LOCKED_stream_still_gets_the_release_words_and_the_same_code(self):
+        """Худшая труба полосы: с cp1251 не уходит. Сообщение обязано доехать всё
+        равно — со знаком, названным кодовой точкой, и с тем же кодом возврата."""
+        mark = self._armed()
+        code, said = self._cli(["--free", mark], locked=True)
+        self.assertEqual(0, code)
+        self.assertIn("Остановка снята", said)
+        self.assertIn("[U+2705]", said)
+
+    def test_a_plain_print_of_the_module_is_fixed_TOO_without_touching_that_print(self):
+        """«Один раз на весь модуль, а не каждую печать по отдельности»: чинится САМ
+        ПОТОК, поэтому обычный ``print`` — в том числе чужой, из ``argparse`` или из
+        :mod:`shtab_box_signals` — едет по тому же каналу, и править его не нужно ни
+        одной строкой."""
+        new = _locked_cp1251()
+        run.console_ready(new)
+        print(sig.RELEASE_BTN, file=new)             # 🔓 U+1F513, чужой модуль
+        print(sig.STOP_NOTICE_HEAD, file=new)        # ⛔ U+26D4, чужой модуль
+        said = _seen(new)
+        self.assertIn("[U+1F513]", said)
+        self.assertIn("[U+26D4]", said)
+        self.assertIn("Снять остановку", said)
+
+    def test_every_printable_sign_of_the_box_survives_the_channel(self):
+        """ОБЩИЙ ЗАМОК, А НЕ ПЕРЕЧЕНЬ ЗНАКОВ. Перечень протух бы на первом новом
+        значке — ровно тот дефект, которым живёт весь этот разбор. Берём ВСЕ
+        строковые литералы трёх модулей ящика и прогоняем через ХУДШИЙ поток."""
+        new = _locked_cp1251()
+        run.console_ready(new)
+        seen = 0
+        for name in ("shtab_box_run.py", "shtab_box.py", "shtab_box_signals.py"):
+            for node in ast.walk(ast.parse(_src(name))):
+                if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                    continue
+                try:
+                    node.value.encode("cp1251")
+                except UnicodeEncodeError:
+                    seen += 1
+                    print(node.value, file=new)      # упадёт — тест красный
+        self.assertGreaterEqual(seen, 20, "фикстура перестала находить незаписываемые знаки")
+        self.assertIn("[U+", _seen(new))
+
+    # ── КОД ВОЗВРАТА СНЯТИЯ (пункт 4 задания) ────────────────────────────────
+
+    def test_the_release_return_code_did_NOT_move_success_is_still_zero(self):
+        """Успех по-прежнему НУЛЬ — и теперь этот нуль доезжает до владельца вместе
+        со словом «снято», а не вместо него."""
+        mark = self._armed()
+        code, said = self._cli(["--free", mark])
+        self.assertEqual(0, code)
+        self.assertIn("Остановка снята", said)
+        rows, ok, _why = run.read_hold(self.root)
+        self.assertTrue(ok)
+        self.assertTrue([r for r in rows if r.get("mark") == mark and r.get("released")],
+                        "снятие не легло на диск")
+
+    def test_the_refusal_return_code_did_NOT_move_either_it_is_still_one(self):
+        """Отказ по-прежнему ЕДИНИЦА, и говорит о снятии, а не о печати."""
+        self._armed()
+        code, said = self._cli(["--free", "deadbeef"])
+        self.assertEqual(1, code)
+        self.assertIn("НЕТ", said)
+        self.assertIn("⚠", said, "значок отказа пропал из вывода")
+        locked_code, locked_said = self._cli(["--free", "deadbeef"], locked=True)
+        self.assertEqual(1, locked_code, "на худшей трубе код отказа поехал")
+        self.assertIn("[U+26A0]", locked_said, "на худшей трубе знак не назвал себя")
+
+    def test_a_DEAD_stream_no_longer_turns_a_DONE_release_into_a_failure(self):
+        """Решение Штаба №3, худший случай: канал починить не удалось вовсе.
+        Снятие УЖЕ на диске — значит код возврата обязан говорить о нём. Молчание
+        честнее трейсбека поверх удавшегося действия."""
+        mark = self._armed()
+
+        class _Dead(object):
+            encoding = "cp1251"
+
+            def write(self, _s):
+                raise OSError("труба закрыта")
+
+            def flush(self):
+                raise OSError("труба закрыта")
+
+        sys.stdout, sys.stderr = _Dead(), _Dead()
+        run.HERE = self.root
+        try:
+            self.assertEqual(0, run.main(["--free", mark]),
+                             "мёртвый вывод снова объявил удавшееся снятие провалом")
+        finally:
+            sys.stdout, sys.stderr = self._save[0], self._save[1]
+        rows, ok, _why = run.read_hold(self.root)
+        self.assertTrue(ok)
+        self.assertTrue([r for r in rows if r.get("mark") == mark and r.get("released")])
+
+    def test_console_ready_never_takes_the_run_down_by_itself(self):
+        """Починка канала не смеет уронить ход: поток без ``reconfigure`` и поток,
+        который на ней взрывается, обязаны просто не считаться."""
+        class _NoRec(object):
+            pass
+
+        class _Boom(object):
+            def reconfigure(self, **_kw):
+                raise ValueError("нельзя")
+
+        self.assertEqual(0, run.console_ready(_NoRec(), _Boom()))
 
 
 if __name__ == "__main__":            # pragma: no cover
