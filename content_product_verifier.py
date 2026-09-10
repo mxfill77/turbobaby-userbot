@@ -81,10 +81,79 @@ _RUN_DECLARATION_RE = re.compile(
     r"(?<![0-9A-Za-z_])[\"']?%s[\"']?\s*[:=]\s*[\"']?(%s)" % (RUN_ID_FIELD, _RUN_ID_BODY))
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _DRIVE_RE = re.compile(r"^[A-Za-z]:")
-_SENSITIVE_RE = re.compile(
-    r"(?:AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|[\"']?(?:api[_-]?key|secret|password)[\"']?\s*[:=]\s*[\"']?\S+|\bsk-[A-Za-z0-9_-]{16,})",
+# TWO FACTS THAT USED TO BE ONE.  "This text CARRIES the value of a secret" and
+# "this text SPEAKS about secrets" are different claims, and one pattern could
+# only answer their union.  The split below is the whole of the 11.09.2026 change.
+#
+# ``_SECRET_VALUE_RE`` holds the shapes that ARE a value standing alone: an AWS
+# id, a PEM header, an ``sk-`` token.  Each is a value by its own form -- no
+# neighbouring word is needed to make it one, and prose describing a secret has
+# no reason to contain one.  These keep the hard refusal they always had.
+_SECRET_VALUE_RE = re.compile(
+    r"(?:AKIA[0-9A-Z]{16}"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|\bsk-[A-Za-z0-9_-]{16,})",
     re.IGNORECASE,
 )
+# ``_SENSITIVE_RE`` is the union as it always was -- the alternation is
+# character-for-character the old one, only named groups were added, so ``search``
+# still matches exactly what it matched before.  Its extra arm is the NAMED PAIR:
+# ``named`` is the key NAME plus its separator (and an opening quote if there was
+# one), ``value`` is the run that follows.  That arm is the one that cannot tell
+# the two facts apart: "ANTHROPIC_API_KEY: разошлись" and "ANTHROPIC_API_KEY: <a
+# live key>" are the same shape.  So the name is kept, the value is dropped, and
+# the question "was that value real?" is never asked -- see ``_redact_sensitive``.
+_SENSITIVE_RE = re.compile(
+    r"(?:AKIA[0-9A-Z]{16}"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|(?P<named>[\"']?(?:api[_-]?key|secret|password)[\"']?\s*[:=]\s*[\"']?)(?P<value>\S+)"
+    r"|\bsk-[A-Za-z0-9_-]{16,})",
+    re.IGNORECASE,
+)
+# What replaces a redacted span.  ONE character, and it carries NO word character
+# by construction: ``_ADDR_WORD_RE`` reads an address word as an unbroken run of
+# letters and digits, so a marker made of letters could bridge two neighbouring
+# words into an address hit that the file does not contain.  One character also
+# stays far under ``_ADDR_GAP_MAX``, so a redaction standing BETWEEN two address
+# words cannot break a hit that the file does contain.
+REDACTION = "·"
+
+
+def _redact_sensitive(text):
+    """Blank what FOLLOWS a key name, keep the name.  -> (text, spans redacted).
+
+    Reached only after ``_SECRET_VALUE_RE`` has already refused the text, so in
+    practice every span here is a named pair.
+
+    WHY REDACT INSTEAD OF REFUSE, for this arm only.  Refusing the whole read
+    keeps secrets out of the verdict and also destroys the verdict: an artifact
+    that DISCUSSES a key -- naming the variable, quoting the assertion that
+    caught it -- trips the named arm without containing one secret, and the run
+    that wrote it gets no verdict at all.  That is not a hypothetical; it is what
+    closed run 245 as a failure.  Redaction gives the same guarantee strictly
+    earlier: the value never enters ``text``, so there is nothing left to leak.
+
+    WHAT THIS DOES NOT CLAIM, said out loud because the temptation is real.  It
+    does not decide that the blanked run was prose.  Deciding that would mean
+    comparing it against the live secret -- holding the value in order to judge
+    it, which is the event the boundary exists to prevent.  The design answer is
+    to stop needing the answer: both readings are blanked, so the verdict no
+    longer depends on which one it was.
+
+    ONE THING THIS DELIBERATELY COSTS, named rather than hidden: if an address
+    word happened to stand inside a redacted run, it disappears with it and the
+    address goes unproven.  That failure is conservative -- it can only withhold
+    a verdict, never grant one -- and it is the same outcome the refusal gave.
+    """
+    count = 0
+
+    def _swap(match):
+        nonlocal count
+        count += 1
+        named = match.group("named")
+        return REDACTION if named is None else named + REDACTION
+
+    return _SENSITIVE_RE.sub(_swap, text), count
 
 
 class VerificationInputError(ValueError):
@@ -196,9 +265,27 @@ def _read_declared(root, record, *, expected_types=None):
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise UnsafeEvidenceError("binary_or_non_utf8") from exc
-    if _SENSITIVE_RE.search(text):
+    if _SECRET_VALUE_RE.search(text):
+        # THE HALF THAT DID NOT MOVE.  A value-shaped run is a secret whatever
+        # stands around it, so this is the same refusal with the same reason code
+        # the file has always raised -- and it is checked over the WHOLE text,
+        # before any split, so ``api_key: sk-<token>`` is refused here rather
+        # than quietly redacted by the named arm that would also have matched it.
         raise UnsafeEvidenceError("sensitive_content")
-    return {"path": rel, "content_type": content_type, "text": text, "sha256": expected_hash}
+    redactions = 0
+    if content_type == "json":
+        # RECEIPTS AND PACKETS KEEP THE HARD BOUNDARY, and the asymmetry is
+        # deliberate.  A json body here is machine evidence this verifier itself
+        # parses -- a test receipt, a task packet -- and a secret inside one is a
+        # real leak with no prose to save.  Redacting it would also break the
+        # parse in a way that reads like a different fault.  Prose artifacts get
+        # redaction; machine evidence gets the refusal it always had.
+        if _SENSITIVE_RE.search(text):
+            raise UnsafeEvidenceError("sensitive_content")
+    else:
+        text, redactions = _redact_sensitive(text)
+    return {"path": rel, "content_type": content_type, "text": text,
+            "sha256": expected_hash, "redactions": redactions}
 
 
 def _parse_json(evidence):
@@ -401,6 +488,12 @@ def _content_gate(spec, artifacts):
             present = needle.casefold() in evidence["text"].casefold()
         else:
             present = needle in evidence["text"]
+        if kind == "text_absent" and evidence.get("redactions"):
+            # ABSENCE CANNOT BE PROVEN ON TEXT WE BLANKED OURSELVES.  Redaction
+            # removes exactly the shapes an absence gate is usually pointed at,
+            # so reading "not found" here would report our own erasure as the
+            # product's cleanliness.  Third outcome, not a pass and not a fail.
+            return _gate(gate_id, "UNKNOWN", "redacted_evidence_absence_unprovable", (artifact_id,))
         ok = present if kind != "text_absent" else not present
         return _gate(gate_id, "PASS" if ok else "FAIL", "ok" if ok else "text_condition_failed", (artifact_id,))
     if evidence["content_type"] != "python":
@@ -590,10 +683,24 @@ def verify_case(bundle):
         if _canonical(content_gates) != _canonical(task_gates):
             return _output(case_id, DISPROVEN, "task_gate_binding_mismatch", reported_claim, gates + [_gate("V0_TASK_BINDING", "FAIL", "task_gate_binding_mismatch", (task["path"],))], (), (), refs)
         gates.append(_gate("V0_TASK_BINDING", "PASS", "task_declares_content_gates", (task["path"],)))
+        # REDACTION IS SAID OUT LOUD, with a count and the artifacts it touched.
+        # A verdict standing on text this verifier quietly altered would be a
+        # verdict about a file nobody has.  The count is a number, never a value.
+        redacted = sorted(name for name, one in artifacts.items() if one.get("redactions"))
+        if redacted:
+            gates.append(_gate("V0_SENSITIVE_REDACTED", "PASS",
+                               "redacted_%d_spans" % sum(artifacts[name]["redactions"] for name in redacted),
+                               tuple(redacted)))
         content_results = [_content_gate(spec, artifacts) for spec in content_gates]
         failed = next((gate for gate in content_results if gate["status"] == "FAIL"), None)
         if failed:
             return _output(case_id, DISPROVEN, failed["reason_code"], reported_claim, gates + [_gate("V0_ARTIFACT_READBACK", "FAIL", failed["reason_code"], failed["evidence_refs"])] + content_results, (), (), refs)
+        unsure = next((gate for gate in content_results if gate["status"] == "UNKNOWN"), None)
+        if unsure:
+            # A content gate that could not decide is UNKNOWN, never a silent
+            # PASS: the loop above only looked for FAIL, so without this branch
+            # an undecided gate would have been read as satisfied.
+            return _output(case_id, UNKNOWN, unsure["reason_code"], reported_claim, gates + [_gate("V0_ARTIFACT_READBACK", "UNKNOWN", unsure["reason_code"], unsure["evidence_refs"])] + content_results, [{"reason_code": unsure["reason_code"], "evidence_ref": ref} for ref in (unsure["evidence_refs"] or [""])], (), refs)
         gates.extend([_gate("V0_ARTIFACT_READBACK", "PASS", "ok", tuple(sorted(artifacts)))] + content_results)
     except UnsafeEvidenceError as exc:
         return _output(case_id, UNKNOWN if str(exc) == "sensitive_content" else DISPROVEN, str(exc), reported_claim, gates + [_gate("V0_ARTIFACT_READBACK", "UNKNOWN" if str(exc) == "sensitive_content" else "FAIL", str(exc))], [{"reason_code": str(exc), "evidence_ref": ""}] if str(exc) == "sensitive_content" else (), (), refs)

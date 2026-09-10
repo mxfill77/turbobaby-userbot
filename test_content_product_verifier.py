@@ -67,6 +67,121 @@ class _Bundle(unittest.TestCase):
         }
 
 
+class TestSecretShapedProse(_Bundle):
+    """Говорит о секретах — судится; несёт значение — по-прежнему нет (11.09.2026).
+
+    THE LIVE CASE, not a hypothetical: run 245 of the PC lane (2026-09-10) did the work, landed
+    commit 22f57a2 and wrote its artifact at the named address -- and was closed as a FAILURE
+    because the verifier refused to read the evidence.  Measured on the live file 11.09:
+    _SENSITIVE_RE hit it EXACTLY ONCE, at line 90, on the named arm, and the blanked run was
+    9 non-ASCII characters -- Russian prose inside the assertion message the run quoted to prove
+    it had STOPPED printing the key.  Zero hits for all three value-shaped arms.
+    """
+
+    # Фикстура повторяет живую строку 90 артефакта 245 и его же способ говорить о значении —
+    # отпечатком и длиной. Отпечаток здесь заведомо вымышленный: настоящих величин в тестах нет.
+    ABOUT = ("# Ключ в выводе теста\n\n"
+             "Печать закрыта; о значении сказано только отпечатком sha256[:10] `0badc0ffee`\n"
+             "и длиной 51 символ — величинами необратимыми. Дословно ассерт говорил:\n"
+             "    AssertionError: False is not true : ANTHROPIC_API_KEY: связанное при импорте\n"
+             "    и живое окружение разошлись; значение не печатаем\n\n"
+             "Адрес: КЛЮЧ-В-ВЫВОДЕ-ТЕСТА-СЛЕД-НАРУЖУ-1009.\n")
+
+    def _text_artifact(self, body, gate_type="path_or_text_contains_ci", needle=None):
+        needle = needle or "КЛЮЧ-В-ВЫВОДЕ-ТЕСТА-СЛЕД-НАРУЖУ-1009"
+        # Привязка к прогону у бандла по умолчанию `declared` — артефакт обязан НАЗВАТЬ прогон
+        # сам. Здесь это фикстура, а не предмет проверки: предмет — читаемость прозы про секреты.
+        self.hashes["artifact"] = _write(self.root, "artifact.md",
+                                         body + "\nrun_id: %s\n" % RUN_ID)
+        gates = [{"gate_id": "addr", "artifact_id": "product", "type": gate_type,
+                  "params": {"text": needle}}]
+        task = {"schema_version": "v0.1", "run_id": RUN_ID, "required_content_gates": gates}
+        self.hashes["task"] = _write(self.root, "task.json",
+                                     json.dumps(task, separators=(",", ":"), ensure_ascii=False))
+        bundle = self.bundle()
+        bundle["task_packet"]["sha256"] = self.hashes["task"]
+        bundle["required_artifacts"] = [{"artifact_id": "product", "path": "artifact.md",
+                                         "sha256": self.hashes["artifact"], "content_type": "text",
+                                         "required": True, "max_bytes": 5000}]
+        bundle["content_gates"] = gates
+        return bundle
+
+    def test_the_two_facts_are_told_apart_by_shape_alone(self):
+        """ПРИЗНАК, названный одной строкой: значение узнаётся по СОБСТВЕННОЙ форме.
+
+        Соседнее слово ему не нужно; поэтому признак поднимается, не сверяя текст ни с каким
+        живым значением — то есть не совершая того самого события, ради которого граница и стои́т.
+        """
+        self.assertTrue(cpv._SENSITIVE_RE.search(self.ABOUT),      # noqa: SLF001 — предмет
+                        "разговор о секретах союзом ловится — так и было")
+        self.assertIsNone(cpv._SECRET_VALUE_RE.search(self.ABOUT),  # noqa: SLF001 — предмет
+                          "но значения в этом разговоре нет ни одного")
+
+    def test_prose_speaking_by_fingerprint_and_length_gets_a_verdict(self):
+        """ОТРИЦАТЕЛЬНЫЙ №2 из задания: артефакт 245 обязан СУДИТЬСЯ, а не остаться без вердикта."""
+        got = cpv.verify_case(self._text_artifact(self.ABOUT))
+        self.assertEqual(got["verdict"], cpv.PROVEN, got["reason_code"])
+        gate = next(g for g in got["gates"] if g["gate_id"] == "V0_SENSITIVE_REDACTED")
+        self.assertEqual(gate["reason_code"], "redacted_1_spans", "редакция не названа числом")
+
+    def test_an_artifact_carrying_a_value_shaped_run_is_still_refused(self):
+        """ОТРИЦАТЕЛЬНЫЙ №1 из задания: строгость НЕ ослаблена (решение Штаба 2).
+
+        Тот же текст, но на месте прозы стои́т вымышленное значение НАСТОЯЩЕГО ВИДА — и оно
+        останавливает чтение целиком. Здесь же закрыта дыра: значение стои́т ПОСЛЕ имени ключа,
+        то есть попадает под именную ветку союза, и без сплошной проверки формы было бы молча
+        отредактировано вместо отказа."""
+        body = self.ABOUT.replace("связанное", "sk-vymyshlennoezachenie00")
+        got = cpv.verify_case(self._text_artifact(body))
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.UNKNOWN, "sensitive_content"))
+        self.assertNotIn("vymyshlennoezachenie", json.dumps(got, ensure_ascii=False),
+                         "значение уехало в вывод судьи")
+
+    def test_a_value_shaped_run_standing_alone_is_refused_too(self):
+        """Та же строгость без имени рядом: форма сама по себе — уже значение."""
+        got = cpv.verify_case(self._text_artifact(self.ABOUT + "\nAKIA0000000000000000\n"))
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.UNKNOWN, "sensitive_content"))
+
+    def test_the_key_name_survives_but_the_value_does_not(self):
+        clean, count = cpv._redact_sensitive(self.ABOUT)      # noqa: SLF001 — предмет проверки
+        self.assertEqual(count, 1)
+        self.assertIn("ANTHROPIC_API_KEY", clean, "имя переменной — не секрет, оно обязано жить")
+        self.assertNotIn("связанное", clean, "значение осталось в тексте")
+        self.assertIn(cpv.REDACTION, clean)
+
+    def test_the_address_check_is_not_weakened_by_redaction(self):
+        """ОТРИЦАТЕЛЬНЫЙ: адрес по-прежнему обязателен, и чужой файл им не становится."""
+        body = "# Совсем другая работа\n\nAPI_KEY: значение\n"
+        got = cpv.verify_case(self._text_artifact(body))
+        self.assertEqual((got["verdict"], got["reason_code"]),
+                         (cpv.DISPROVEN, "text_condition_failed"))
+
+    def test_absence_cannot_be_proven_on_text_we_blanked(self):
+        """ОТРИЦАТЕЛЬНЫЙ: `text_absent` по редактированному тексту — UNKNOWN, а не ложный PASS.
+
+        Иначе доказательство «ключа в файле НЕТ» стало бы тривиально истинным ровно потому, что
+        ключ стёрли мы сами. Живой заход 245 доказывал именно такое утверждение."""
+        got = cpv.verify_case(self._text_artifact(self.ABOUT, gate_type="text_absent",
+                                                  needle="строка-которой-нет"))
+        self.assertEqual((got["verdict"], got["reason_code"]),
+                         (cpv.UNKNOWN, "redacted_evidence_absence_unprovable"))
+
+    def test_absence_still_passes_on_text_with_nothing_to_redact(self):
+        """Контроль рядом: без редакции гейт отсутствия работает как работал."""
+        got = cpv.verify_case(self._text_artifact("# Чисто\n\nКЛЮЧ-В-ВЫВОДЕ-ТЕСТА-СЛЕД-НАРУЖУ-1009\n",
+                                                  gate_type="text_absent",
+                                                  needle="строка-которой-нет"))
+        self.assertEqual(got["verdict"], cpv.PROVEN, got["reason_code"])
+
+    def test_machine_evidence_keeps_the_hard_refusal(self):
+        """Граница НЕ снята целиком: json-доказательство (пакет, расписка теста) по-прежнему
+        отвергается, а не редактируется — там нет прозы, которую стоило бы спасать."""
+        text = '{"state":"green","password":"not-a-real-password","run_id":"%s"}' % RUN_ID
+        self.hashes["artifact"] = _write(self.root, "artifact.json", text)
+        got = cpv.verify_case(self.bundle())
+        self.assertEqual((got["verdict"], got["reason_code"]), (cpv.UNKNOWN, "sensitive_content"))
+
+
 class TestVerdicts(_Bundle):
     def test_complete_fixture_is_proven_and_repeatable(self):
         first = cpv.verify_case(self.bundle())
