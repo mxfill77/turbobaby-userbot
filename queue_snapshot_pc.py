@@ -96,6 +96,22 @@ WORD = {"new": "стои́т в очереди", "in_progress": "в работе
 # Дословность маркера сторожит тест (сверяет с литералом в `pc_orchestrator.py`), а не эта строка.
 REJECT_MARK = "отклонено Филиппом"
 
+# ТРЕТИЙ ИСХОД ЗАКРЫТИЯ — «НЕИЗВЕСТНО» (11.09.2026), и он приходит ТЕМ ЖЕ СПОСОБОМ, что и отказ
+# владельца: своего статуса у него в очереди нет (их ровно шесть), поэтому он живёт МАРКЕРОМ в
+# `result`. Разбирает маркер САМ СУДЬЯ (`done_judge_pc.outcome_of`) — одно место на всех
+# читателей полосы; здесь только перевод его слова в исход слепка.
+#
+# ЗАЧЕМ ОТДЕЛЬНЫЙ ИСХОД, А НЕ СТРОКА СРЕДИ УПАВШИХ. Живой случай 10.09.2026: заход 245 сделал
+# работу, положил коммит `22f57a2` и артефакт по названному адресу — и лёг в слепок «упало»,
+# потому что судья не смог ПРОЧИТАТЬ доказательство (артефакт был про секреты). Штаб читает
+# слепок и видит провал там, где провала не было. «Упало» зовёт переотправить, «неизвестно»
+# зовёт чинить СУДЬЮ — это разные новости и разные адресаты.
+OUT_DONE, OUT_FAILED, OUT_REJECTED, OUT_UNKNOWN = "done", "failed", "rejected", "unknown"
+# Слово судьи ЗАИМСТВОВАНО литералом, а не импортировано, — та же идиома, что у `REJECT_MARK`
+# строкой выше, и по той же причине: чистый слой слепка не тянет за собой ни V0, ни диск.
+# Равенство сторожит тест, а не эта строка.
+JUDGE_UNKNOWN_WORD = "неизвестно"                  # = done_judge_pc.UNKNOWN
+
 
 def _int_from(mapping, name, default):
     """Целое из отображения; мусор и пустота → значение по умолчанию (о подмене говорим вслух)."""
@@ -226,21 +242,24 @@ def render_body(rows, closed, failed_at, now):
                       "очередь пуста"),
              ""]
 
-    done_ids, failed_rows, rejected_rows, unsure_ids = [], [], [], []
+    done_ids, failed_rows, rejected_rows, unknown_rows, unsure_ids = [], [], [], [], []
     for tid, item in sorted(closed.items(), key=_closed_key):
         outcome = item.get("outcome")
-        if outcome == "failed":
+        if outcome == OUT_FAILED:
             failed_rows.append(item)
-        elif outcome == "rejected":
+        elif outcome == OUT_REJECTED:
             rejected_rows.append(item)
-        elif outcome == "done":
+        elif outcome == OUT_UNKNOWN:
+            unknown_rows.append(item)
+        elif outcome == OUT_DONE:
             done_ids.append(tid)
         else:
             unsure_ids.append(tid)
     parts.append("ЗАКРЫТО ЗА СУТКИ — на момент снятия "
-                 "(%d: сдано %d, упало %d, отклонено владельцем %d, исход не сверен %d):"
+                 "(%d: сдано %d, упало %d, отклонено владельцем %d, НЕИЗВЕСТНО %d, "
+                 "исход не сверен %d):"
                  % (len(closed), len(done_ids), len(failed_rows), len(rejected_rows),
-                    len(unsure_ids)))
+                    len(unknown_rows), len(unsure_ids)))
     if done_ids:
         parts.append("  сдано: " + " ".join("#" + str(t) for t in done_ids))
     if failed_rows:
@@ -258,6 +277,16 @@ def render_body(rows, closed, failed_at, now):
             parts.append("    #%s · %s · отказ: %s"
                          % (item.get("id"), one_line(item.get("goal"), GOAL_MAX),
                             reject_words(item.get("why"))))
+    if unknown_rows:
+        # ОТДЕЛЬНОЙ СТРОКОЙ И СО СЛОВАМИ СУДЬИ. Работа могла быть сделана целиком: судья сказал
+        # не «плохо», а «не смог прочитать» — и обязан сказать ПОЧЕМУ и по какому адресу.
+        # Переотправлять такое бессмысленно, пока не починен судья.
+        parts.append("  НЕИЗВЕСТНО — судья НЕ СМОГ прочитать продукт; это про СУДЬЮ, а не про "
+                     "работу, и переотправка ряда его не чинит:")
+        for item in unknown_rows:
+            parts.append("    #%s · %s · судья: %s"
+                         % (item.get("id"), one_line(item.get("goal"), GOAL_MAX),
+                            one_line(judge_reason(item.get("why")), WHY_MAX)))
     if unsure_ids:
         parts.append("  исход не сверен: " + " ".join("#" + str(t) for t in unsure_ids))
     if not closed:
@@ -352,10 +381,52 @@ def merge_closed(prev_open, now_open, prev_closed, now, window):
     return closed
 
 
+def judge_outcome(result):
+    """Слово судьи закрытия из текста итога | `None`. РАЗБОР МАРКЕРА ОДИН и живёт У СУДЬИ.
+
+    ЭТА ФУНКЦИЯ НАМЕРЕННО ВНЕ ЧИСТОГО СЛОЯ (её нет в списке `QSNAP_PC_PURE`): она делает импорт,
+    а чистые функции слепка не делают ничего, кроме строк. Импорт ленивый и обёрнут: судья тянет
+    за собой V0, а слепок обязан сниматься и там, где судьи нет вовсе. Не собрался — ветка честно
+    молчит, и исход остаётся прежним «упало», а не выдумывается.
+
+    Второго разбора маркера здесь нет ни одной строкой: две копии одного разбора расходятся
+    молча, и именно на этом классе полоса уже обжигалась."""
+    try:
+        import done_judge_pc
+    except Exception:                                   # noqa: BLE001 — см. докстринг
+        return None
+    return done_judge_pc.outcome_of(result)
+
+
 def outcome_of(result):
-    """Исход упавшей строки: `rejected` (владелец сказал НЕТ) или `failed` (сбой). Разница не
-    косметическая — сбой переотправляют, решение человека переотправлять НЕЛЬЗЯ."""
-    return "rejected" if one_line(result, WHY_MAX).startswith(REJECT_MARK) else "failed"
+    """Исход упавшей строки: `rejected` (владелец сказал НЕТ) · `unknown` (судья не смог
+    прочитать продукт) · `failed` (сбой). Разница не косметическая — сбой переотправляют,
+    решение человека переотправлять НЕЛЬЗЯ, а неизвестность зовёт чинить СУДЬЮ, а не работу.
+
+    Порядок проверок: отказ владельца ПЕРВЫМ. Он стои́т в начале строки и ни один вердикт судьи
+    его не перекрывает; обратный порядок дал бы отказу владельца чужое имя.
+
+    НЕ ДОКАЗАНО судьёй — это `failed`, и это не упущение: там прибор ПРОЧИТАЛ продукт и ответил
+    «нет», то есть ряд действительно упал. Отдельного разреза требует ровно тот исход, где о
+    работе не сказано ничего."""
+    if one_line(result, WHY_MAX).startswith(REJECT_MARK):
+        return OUT_REJECTED
+    if judge_outcome(result) == JUDGE_UNKNOWN_WORD:
+        return OUT_UNKNOWN
+    return OUT_FAILED
+
+
+def judge_reason(result):
+    """ПРИЧИНА СЛОВАМИ СУДЬИ из текста итога. → строка (никогда не пустая).
+
+    Пункт 4 решения Штаба: «неизвестно» без названной причины не принимается. Здесь это
+    ЧИТАЕТСЯ обратно — и если причины в тексте нет, так и сказано, а не показан пустой хвост."""
+    try:
+        import done_judge_pc
+        why = done_judge_pc.reason_of(result)
+    except Exception:                                   # noqa: BLE001 — судьи нет → скажем прямо
+        why = None
+    return why or one_line(result, WHY_MAX) or "причина судьёй не названа"
 
 
 def reject_words(result):

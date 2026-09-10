@@ -61,8 +61,8 @@ WORK_GUARD = "РАЗВЕДКА ГАРДА ПОЛОСЫ ПК: по чему он 
 WORK_ULTRA = "ultrathink\n\nБАЗОВАЯ ЛИНИЯ БОТА: прогнать 62 строгие пары эталона и посчитать"
 
 
-def entry(key, verdict, root, closed_at):
-    return sp.make_entry(key, verdict, root, closed_at)
+def entry(key, verdict, root, closed_at, reason=None):
+    return sp.make_entry(key, verdict, root, closed_at, reason)
 
 
 def fresh_state():
@@ -75,6 +75,14 @@ class TestCleanRuleIsBorrowed(unittest.TestCase):
 
     def test_the_word_is_literally_the_judges_word(self):
         self.assertEqual(sp.PROVEN, rj.PROVEN, "слово чистоты разошлось с судьёй")
+
+    def test_the_unknown_word_is_literally_the_judges_word_too(self):
+        """С 11.09.2026 счётчик знает ДВА слова, и оба обязаны быть словами судьи.
+
+        Второе появилось не для красоты: неизвестность получила льготу (не засчитывает и не
+        рвёт), и опознаётся она СЛОВОМ. Разойдись это слово с судейским — льгота досталась бы
+        никому, а полоса не заметила бы вовсе."""
+        self.assertEqual(sp.UNKNOWN, rj.UNKNOWN, "слово неизвестности разошлось с судьёй")
 
     def test_only_the_proven_verdict_is_clean(self):
         self.assertIs(sp.is_clean(rj.PROVEN), True)
@@ -96,10 +104,17 @@ class TestCleanRuleIsBorrowed(unittest.TestCase):
             self.assertNotIn(one, names, "счётчик повторил порядок силы: %s" % one)
         body = [n.value for n in ast.walk(tree)
                 if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-        for word in (rj.DISPROVEN, rj.UNKNOWN):
-            live = [s for s in body if word in s and not s.lstrip().startswith(MODULE)]
-            self.assertEqual([s for s in live if len(s) < 40], [],
-                             "слово «%s» заведено литералом в счётчике" % word)
+        # `НЕ ДОКАЗАН` счётчику по-прежнему не нужен: всё, что не ДОКАЗАН и не НЕИЗВЕСТНО, —
+        # обрыв, и второй список обрывов разошёлся бы с первым молча. `НЕИЗВЕСТНО` с 11.09.2026
+        # заведено СОЗНАТЕЛЬНО и ровно одним литералом — тем, чьё равенство судье сторожит тест
+        # выше; счёт этого литерала здесь и есть замок от второго экземпляра.
+        live = [s for s in body if rj.DISPROVEN in s and not s.lstrip().startswith(MODULE)]
+        self.assertEqual([s for s in live if len(s) < 40], [],
+                         "слово «%s» заведено литералом в счётчике" % rj.DISPROVEN)
+        exact = [s for s in body if s == rj.UNKNOWN]
+        self.assertEqual(len(exact), 1,
+                         "экземпляров литерала «%s» в счётчике не один, а %d"
+                         % (rj.UNKNOWN, len(exact)))
 
 
 # ═════════════════════ 2. ПРИЗНАК СЛУЖЕБНОСТИ ════════════════════════════════════════════════
@@ -810,6 +825,96 @@ class TestCounterWiringIsNamed(unittest.TestCase):
                 if (node.module or "").split(".")[0] == "result_judge_pc":
                     found.append(node.lineno)
         self.assertEqual(found, [], "имя судьи в живом коде счётчика: строки %s" % found)
+
+
+# ═════════════════════ ТРЕТИЙ ИСХОД: ТРИ ОТРИЦАТЕЛЬНЫХ (11.09.2026, п. 4 решения) ════════════
+# Повод — живой: заход 245 (10.09.2026) сделал работу, положил коммит 22f57a2 и артефакт по
+# названному адресу, а был закрыт провалом, потому что судья не смог ПРОЧИТАТЬ доказательство.
+# Все три проверки ниже сторожат ровно те границы, на которых такая правка обычно ломается.
+
+WHY_245 = "V0: UNKNOWN / sensitive_content по адресу «docs/artifacts/2026-09-10-…-1009.md»"
+
+
+class TestThirdOutcomeNegatives(unittest.TestCase):
+
+    def test_a_real_failure_is_still_a_failure(self):
+        """ОТРИЦАТЕЛЬНЫЙ 1. Настоящий провал по-прежнему рвёт серию и входит в знаменатель.
+
+        Самая дорогая ошибка этой правки — сделать льготу общей: тогда полоса перестала бы
+        падать вовсе, и число «тридцать подряд» стало бы бессмысленным."""
+        st, _ = sp.fold(fresh_state(), [entry("1@" + AT1, rj.PROVEN, WORK_JUDGE, AT1),
+                                        entry("2@" + AT2, rj.PROVEN, WORK_GUARD, AT2)], NOW)
+        self.assertEqual(st[sp.STREAK], 2)
+        out, turn = sp.fold(st, [entry("3@" + AT3, rj.DISPROVEN, WORK_SERIES, AT3,
+                                       "по адресу ПУСТО")], NOW)
+        self.assertEqual(out[sp.STREAK], 0, "провал серию не оборвал")
+        self.assertEqual(out[sp.BREAKS], 1)
+        self.assertEqual(out[sp.CHAINS], 3, "провал обязан входить в знаменатель")
+        self.assertEqual(out[sp.UNKNOWNS], 0, "провал засчитан неизвестностью")
+        self.assertEqual(turn["broken"], 1)
+
+    def test_unknown_neither_counts_nor_breaks(self):
+        """ОТРИЦАТЕЛЬНЫЙ 2. Неизвестность серию не рвёт И в знаменатель не входит.
+
+        Обе половины обязательны. Рвала бы — заход 245 обнулял бы серию за чужую слепоту;
+        входила бы в знаменатель — полоса отвечала бы числом за то, чего не делала."""
+        st, _ = sp.fold(fresh_state(), [entry("11@" + AT1, rj.PROVEN, WORK_JUDGE, AT1),
+                                        entry("12@" + AT2, rj.PROVEN, WORK_GUARD, AT2)], NOW)
+        out, turn = sp.fold(st, [entry("13@" + AT3, rj.UNKNOWN, WORK_SERIES, AT3, WHY_245)], NOW)
+        self.assertEqual(out[sp.STREAK], 2, "неизвестность оборвала серию")
+        self.assertEqual(out[sp.BREAKS], 0, "неизвестность засчитана обрывом")
+        self.assertEqual(out[sp.CHAINS], 2, "неизвестность вошла в знаменатель")
+        self.assertEqual(out[sp.UNKNOWNS], 1, "неизвестность не сосчитана вовсе")
+        self.assertEqual(turn["unknown"], 1)
+        self.assertIn("sensitive_content", out[sp.WHY_UNKNOWN], "причина не названа в состоянии")
+        # …и следующая доказанная цепочка продолжает ТУ ЖЕ серию, а не начинает новую.
+        out2, _ = sp.fold(out, [entry("14@" + AT4, rj.PROVEN, WORK_JUDGE, AT4)], NOW)
+        self.assertEqual(out2[sp.STREAK], 3)
+        # Учтённой неизвестная цепочка всё же СТАЛА: иначе она вернулась бы следующим оборотом.
+        again, turn2 = sp.fold(out2, [entry("13@" + AT3, rj.UNKNOWN, WORK_SERIES, AT3, WHY_245)],
+                               NOW)
+        self.assertEqual((again[sp.UNKNOWNS], turn2["again"]), (1, 1), "неизвестная сосчитана дважды")
+
+    def test_unknown_without_a_named_reason_is_not_accepted(self):
+        """ОТРИЦАТЕЛЬНЫЙ 3. «Неизвестно» без названной причины льготы НЕ получает — это обрыв.
+
+        Без этого замка правка была бы дырой: любой исход, названный неизвестным, выпадал бы из
+        знаменателя молча, и серия росла бы на том, чего никто не смотрел."""
+        for reason in (None, "", "   "):
+            st, _ = sp.fold(fresh_state(), [entry("21@" + AT1, rj.PROVEN, WORK_JUDGE, AT1)], NOW)
+            out, turn = sp.fold(st, [entry("22@" + AT2, rj.UNKNOWN, WORK_GUARD, AT2, reason)], NOW)
+            self.assertIs(sp.is_unknown(rj.UNKNOWN, reason), False, repr(reason))
+            self.assertEqual(out[sp.STREAK], 0, "безпричинная неизвестность серию не оборвала")
+            self.assertEqual(out[sp.BREAKS], 1, repr(reason))
+            self.assertEqual(out[sp.UNKNOWNS], 0, "безпричинная неизвестность получила льготу")
+            self.assertEqual(turn["unknown"], 0)
+
+
+class TestUnknownIsLoud(unittest.TestCase):
+    """Решение Штаба, п. 3: число неизвестных видно ВСЕГДА, а доля выше пятой части — тревога."""
+
+    def test_the_number_is_printed_even_when_it_is_zero(self):
+        text = sp.render(fresh_state())
+        self.assertIn("НЕИЗВЕСТНЫХ 0", text, "нулевое число спрятано — читается как «не бывает»")
+
+    def test_the_share_above_one_fifth_is_an_alarm_about_the_judge(self):
+        # 1 неизвестная на 4 рассмотренных — это 1/4 > 1/5, тревога.
+        rows = [entry("%d@%s" % (i, AT1), rj.PROVEN, WORK_JUDGE, AT1) for i in range(31, 34)]
+        rows.append(entry("34@" + AT2, rj.UNKNOWN, WORK_GUARD, AT2, WHY_245))
+        st, _ = sp.fold(fresh_state(), rows, NOW)
+        self.assertEqual((st[sp.CHAINS], st[sp.UNKNOWNS]), (3, 1))
+        self.assertIs(sp.unknown_alarm(st), True)
+        text = sp.render(st)
+        self.assertIn("ТРЕВОГА", text)
+        self.assertIn("про СУДЬЮ", text, "тревога обязана называть, кого чинить")
+
+    def test_one_unknown_in_ten_is_not_an_alarm(self):
+        """Контроль рядом с тревогой: прибор, кричащий всегда, не сообщает ничего."""
+        rows = [entry("%d@%s" % (i, AT1), rj.PROVEN, WORK_JUDGE, AT1) for i in range(41, 50)]
+        rows.append(entry("50@" + AT2, rj.UNKNOWN, WORK_GUARD, AT2, WHY_245))
+        st, _ = sp.fold(fresh_state(), rows, NOW)
+        self.assertIs(sp.unknown_alarm(st), False)
+        self.assertNotIn("ТРЕВОГА", sp.render(st))
 
 
 if __name__ == "__main__":

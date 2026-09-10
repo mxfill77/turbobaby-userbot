@@ -251,7 +251,8 @@ def git_moves(root, since_ts, paths, runner=None):
 def _closed_words(rows):
     named = []
     for row in rows[-cd.LIST_MAX:]:
-        word = {"done": "сдана", "failed": "упало", "rejected": "отклонено владельцем"}.get(
+        word = {"done": "сдана", "failed": "упало", "rejected": "отклонено владельцем",
+                cd.OUT_UNKNOWN: "НЕИЗВЕСТНО (судья не прочитал продукт)"}.get(
             row.get("outcome"), "исход не сверен")
         named.append("#%s %s" % (row.get("id"), word))
     # Остаток НАЗЫВАЕТСЯ числом: список, обрезанный молча, читается как полный.
@@ -281,10 +282,20 @@ def section_red(snapshot, q_at, q_why, expect, e_at, e_why, outbox, o_at, o_why,
         rows = closed_since(snapshot, since)
         bad = [r for r in rows if r.get("outcome") == "failed"]
         unsure = [r for r in rows if r.get("outcome") is None]
+        # НЕИЗВЕСТНЫЕ ЗАКРЫТИЯ — СВОЕЙ СТРОКОЙ И ТАК ЖЕ ГРОМКО, как упавшие (решение Штаба
+        # 11.09.2026, п. 3). До этого они лежали среди «упало», и владелец читал провал работы
+        # там, где полоса работу сделала, а прибор не смог её прочитать (живой случай 245).
+        unread = [r for r in rows if cd.is_unknown(r)]
         if bad:
             out.append(cd.reading("red", "упало строк %d: %s" % (
                 len(bad), " · ".join("#%s %s" % (r["id"], quote(r.get("why"), 50))
                                      for r in bad[:cd.LIST_MAX])),
+                src="queue", read_at=q_at, now=now, kind=cd.RED))
+        if unread:
+            out.append(cd.reading("red", "НЕИЗВЕСТНО — судья не прочитал продукт у %d строк: %s "
+                                         "(это про СУДЬЮ, а не про работу)" % (
+                len(unread), " · ".join("#%s %s" % (r["id"], quote(r.get("why"), 50))
+                                        for r in unread[:cd.LIST_MAX])),
                 src="queue", read_at=q_at, now=now, kind=cd.RED))
         if unsure:
             out.append(cd.reading("red", "исход не сверен у %d строк: %s" % (
@@ -507,12 +518,21 @@ def read_judged(root=HERE):
 
 
 def section_series(snapshot, read_at, why, now, judged=None):
-    """Серия цепочек: паспорт источника отдельно от чисел — числа считает чистая логика."""
+    """Серия цепочек: паспорт источника отдельно от чисел — числа считает чистая логика.
+
+    ТРЕВОГА ПРО СУДЬЮ ЛОМАЕТ СПОКОЙСТВИЕ СВОДКИ, а не остаётся числом в хвосте строки
+    (решение Штаба 11.09.2026, п. 3). Спокойная сводка схлопывается в одну фразу и
+    разделов не печатает вовсе — то есть тревога, оставленная строкой серии, при доле
+    неизвестного выше пятой части читалась бы как «всё тихо». Красный вид `RED` тут
+    выбран не для громкости ради громкости: `is_calm` смотрит именно на вид.
+    """
     if snapshot is None:
         return [cd.dead_source("series", "queue", why)], None
     rows = all_closed(snapshot)
-    return ([cd.reading("series", "", src="queue", read_at=read_at, now=now, kind=cd.OK)],
-            cd.series(rows, judged=judged))
+    counted = cd.series(rows, judged=judged)
+    kind = cd.RED if counted.get("alarm") else cd.OK
+    return ([cd.reading("series", "", src="queue", read_at=read_at, now=now, kind=kind)],
+            counted)
 
 
 # ───────────────────────────── оборот ─────────────────────────────

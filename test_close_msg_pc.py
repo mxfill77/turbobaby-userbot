@@ -94,9 +94,17 @@ class Verdict(unittest.TestCase):
         line = done_judge_pc.line({"verdict": done_judge_pc.UNKNOWN, "reason": "адреса нет"})
         self.assertEqual(cm.verdict_word(line), done_judge_pc.UNKNOWN)
 
-    def test_unknown_prefix_of_failed_close_is_a_verdict_too(self):
-        text = done_judge_pc.fail_result({"reason": "по адресу пусто"}, "отчёт исполнителя")
-        self.assertEqual(cm.verdict_word(text), done_judge_pc.UNKNOWN)
+    def test_both_markers_of_a_failed_close_are_verdicts_too(self):
+        """С 11.09.2026 маркеров у судьи ДВА, и оба обязаны читаться словом исхода.
+
+        Читай мы один — «не доказано» приходило бы владельцу как «судья молчал», то есть самый
+        сильный исход выглядел бы отсутствием суда."""
+        for word, reason in ((done_judge_pc.UNKNOWN, "sensitive_content по адресу"),
+                             (done_judge_pc.UNPROVEN, "по адресу пусто")):
+            text = done_judge_pc.fail_result({"verdict": word, "reason": reason},
+                                             "отчёт исполнителя")
+            self.assertEqual(cm.verdict_word(text), word, reason)
+            self.assertEqual(done_judge_pc.reason_of(text), reason, "причина читается обратно")
 
     def test_report_without_a_judge_line_has_no_verdict(self):
         self.assertIsNone(cm.verdict_word("Всё получилось прекрасно, 20 из 20."))
@@ -437,10 +445,11 @@ class NegativeAndDeathLook(unittest.TestCase):
         cheer = ("ВСЁ ПРЕКРАСНО: задача закрыта, 20 из 20 проверок зелены, замечаний нет.\n"
                  "Дальше можно ничего не делать.")
         report = done_judge_pc.fail_result(
-            {"reason": "по адресу ПУСТО: за 04.09 в «docs/artifacts» нет ни одного файла"},
+            {"verdict": done_judge_pc.UNPROVEN,
+             "reason": "по адресу ПУСТО: за 04.09 в «docs/artifacts» нет ни одного файла"},
             cheer)
         lines = cm.lead(TASK, report, "failed").split("\n")
-        self.assertIn(done_judge_pc.UNKNOWN, lines[1])
+        self.assertIn(done_judge_pc.UNPROVEN, lines[1])
         for word in ("ПРЕКРАСНО", "зелены", "замечаний"):
             self.assertNotIn(word, lines[1])
         self.assertTrue(lines[2].startswith(cm.L_NEXT + "остановились"), lines[2])

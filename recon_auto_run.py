@@ -218,15 +218,21 @@ def repeat_signals(root=HERE, inbox=None, rows=None):
         slot["where"].append(rel)
     try:
         import done_judge_pc
-        prefix = done_judge_pc.UNKNOWN_PREFIX
+        outcome_of = done_judge_pc.outcome_of
+        # ПРИЧИНА — СЛОВАМИ САМОГО СУДЬИ, по исходу, а не одна на все недоказанные закрытия.
+        # С 11.09.2026 исходов три, и слить «не прочитал» с «прочитал, ответ нет» значило бы
+        # положить в разведку одну причину там, где их две — то есть спрятать ту, что реже.
+        why_by = {done_judge_pc.UNKNOWN: "неизвестно: продукт по адресу не прочитан",
+                  done_judge_pc.UNPROVEN: "не доказано: продукт прочитан, «сделано» не подтвердилось"}
     except Exception:                                   # noqa: BLE001
-        prefix = ""
-    if prefix:
+        outcome_of, why_by = None, {}
+    if outcome_of is not None:
         for it in (rows or []):
-            if prefix not in str((it or {}).get("result") or ""):
+            word = outcome_of(str((it or {}).get("result") or ""))
+            if word is None:
                 continue
             cls = "вердикт V0 при закрытии"
-            reason = "неизвестно: продукт по адресу не прочитан"
+            reason = why_by.get(word, "вердикт судьи: %s" % word)
             slot = counts.setdefault((cls, reason), {"class": cls, "reason": reason,
                                                      "count": 0, "where": []})
             slot["count"] += 1

@@ -120,7 +120,9 @@ class TestCounterfact(Case):
     def test_red_address_still_parks_the_row_and_asks_the_owner(self):
         """ТОТ ЖЕ вход, продукта по адресу НЕТ → ряд паркуется, как и до правки."""
         v, action, rule, proof = self.run_lane(product=None)
-        self.assertEqual(v["verdict"], dj.UNKNOWN)
+        # 11.09.2026: слово исхода стало третьим — «не доказано» (папку прочитали, ответ «нет»).
+        # Решение о ряде от этого не сдвинулось ни на шаг: паркует ЛЮБОЕ недоказанное закрытие.
+        self.assertEqual(v["verdict"], dj.UNPROVEN)
         self.assertEqual(action, MA.PARK)
         self.assertEqual(rule, MA.R_RED_ADDRESS)
         self.assertIn("адрес", proof.lower() + rule)
@@ -157,7 +159,7 @@ class TestFileWithoutTheAddressWords(Case):
         ПАРКУЕТСЯ. Иначе «адрес» превратился бы в «папку», и продуктом задачи считался бы
         любой файл, положенный туда в то же окно (в параллельном витке — продукт второй руки)."""
         v, action, rule, proof = self.run_lane(product=[(FOLDER + "/" + OTHER_NAME, OTHER_BODY)])
-        self.assertEqual(v["verdict"], dj.UNKNOWN)
+        self.assertEqual(v["verdict"], dj.UNPROVEN)
         self.assertEqual(action, MA.PARK)
         self.assertEqual(rule, MA.R_RED_ADDRESS)
         self.assertIn("не отвечает словам", proof)

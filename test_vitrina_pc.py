@@ -914,6 +914,57 @@ class TestZayavkiAreNotCards(unittest.TestCase):
         self.assertIn("ЖДУТ МНЕНИЯ (заявки, ящик не держат): 3", text)
         self.assertNotIn("карточки в ожидании:", text)   # прежнего общего слова больше нет
 
+    def test_the_unknown_count_stands_next_to_the_series_even_at_zero(self):
+        """ТРЕТИЙ ИСХОД В ВИТРИНЕ (11.09.2026, п. 3 решения Штаба).
+
+        Число печатается ВСЕГДА, в том числе нулём: исход, спрятанный при нуле,
+        читается как «такого не бывает» — ровно так «неизвестно» и жило до правки.
+        """
+        counted = {"streak": 5, "target": 30, "proved": 5, "blind": 0, "unproved": 0,
+                   "unjudged": 0, "moved": 2, "window": 10, "unknown": 0, "denom": 10,
+                   "alarm": False}
+        text = "\n".join(vp.part_nums(counted, 1, DAY, None, None))
+        self.assertIn("серия: 5 из 30 подряд", text)
+        self.assertIn("НЕИЗВЕСТНО 0 из 10", text, "нулевое число спрятано")
+        self.assertNotIn("ТРЕВОГА", text, "тревога при нуле неизвестных")
+
+    def test_the_share_above_one_fifth_is_an_alarm_about_the_judge(self):
+        """Доля выше пятой части звучит ТРЕВОГОЙ и называет, кого чинить — СУДЬЮ.
+
+        Слова берутся у сводки: разойдись два показа одного числа — владелец
+        получил бы две новости об одном событии и не узнал бы, какая верна."""
+        counted = {"streak": 3, "target": 30, "proved": 3, "blind": 0, "unproved": 0,
+                   "unjudged": 0, "moved": 0, "window": 4, "unknown": 1, "denom": 3,
+                   "alarm": True}
+        text = "\n".join(vp.part_nums(counted, 1, DAY, None, None))
+        self.assertIn(cd.unknown_words(counted), text, "витрина сочинила свои слова")
+        self.assertIn("ТРЕВОГА ПРО СУДЬЮ", text)
+        self.assertIn("не про работу", text)
+
+    def test_an_unreadable_snapshot_gives_unknown_not_zero(self):
+        """Слепка нет → «НЕИЗВЕСТНО (причина)», и НИКОГДА не ноль (закон витрины)."""
+        text = "\n".join(vp.part_nums(None, None, DAY, None, None))
+        self.assertIn("неизвестных: %s" % vp.UNKNOWN, text)
+        self.assertNotIn("неизвестных: 0", text)
+
+    def test_a_real_failure_is_still_shown_as_a_failure(self):
+        """ОТРИЦАТЕЛЬНЫЙ. Настоящее падение остаётся падением и в витрине тоже.
+
+        И вторая половина того же замера: неизвестная строка из «упало за сутки»
+        УХОДИТ (`failed_rows` берёт только `outcome == "failed"`) — то есть без
+        строки неизвестных рядом с серией она не была бы видна владельцу нигде.
+        Ровно эту дыру закрывает проверка выше."""
+        snap = {"open": {}, "closed": {
+            "244": {"id": "244", "at": 100.0, "goal": "цель", "outcome": "failed",
+                    "why": "⏱ таймаут 45 мин"},
+            "245": {"id": "245", "at": 101.0, "goal": "цель", "outcome": "unknown",
+                    "why": "V0: UNKNOWN / sensitive_content по адресу «…-1009.md»"}}}
+        rows = run.failed_rows(snap, 0.0)
+        self.assertEqual([r["id"] for r in rows], ["244"], "исходы слиплись в один")
+        text = "\n".join(vp.part_stuck({}, [], rows, DAY))
+        self.assertIn("упало за сутки 1", text)
+        self.assertNotIn("245", text, "неизвестность показана падением")
+
     def test_the_showcase_and_the_box_call_one_row_by_one_word(self):
         """Различитель ОДИН: витрина и остановка ящика не вправе разойтись."""
         rows = run.waiting_rows(self.LIVE_SNAP)

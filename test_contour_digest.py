@@ -35,6 +35,7 @@ import unittest
 
 import contour_digest as cd
 import contour_digest_run as run
+import queue_snapshot_pc
 import recon_auto
 import review_intake
 import series_pc
@@ -247,6 +248,82 @@ def _proved(*ids):
 def _blind(*ids):
     """Реестр вердиктов: названные строки закрыты БЕЗ АДРЕСА (судить было нечем)."""
     return {str(i): {cd.F_PROVED: False, cd.F_ADDRESSED: False} for i in ids}
+
+
+def _unknown_row(tid, goal="ЦЕЛЬ: правка"):
+    """Ряд, закрытый ТРЕТЬИМ исходом: судья не смог прочитать продукт (живой случай 245)."""
+    return {"id": tid, "outcome": cd.OUT_UNKNOWN, "goal": goal,
+            "why": "V0: UNKNOWN / sensitive_content по адресу «docs/artifacts/…-1009.md»"}
+
+
+class TestThirdOutcomeInTheSeries(unittest.TestCase):
+    """Решение Штаба 11.09.2026: НЕИЗВЕСТНО не засчитывает, не рвёт и звучит громко.
+
+    Все три отрицательных пункта задания проверяются здесь на ТОМ ЖЕ приборе, которым сводка
+    считает серию боем, а не на его копии."""
+
+    def test_the_word_mirrors_the_snapshot(self):
+        """Литерал ЗАИМСТВОВАН у слепка очереди. Разойдись они — исход стал бы невидимым, и
+        именно молча: неизвестная строка снова считалась бы обрывом."""
+        self.assertEqual(cd.OUT_UNKNOWN, queue_snapshot_pc.OUT_UNKNOWN)
+
+    def test_a_real_failure_is_still_a_failure(self):
+        """ОТРИЦАТЕЛЬНЫЙ 1: `failed` рвёт серию и стои́т в знаменателе, как стоял."""
+        rows = [{"id": 1, "outcome": "done", "goal": "ЦЕЛЬ: правка"},
+                {"id": 2, "outcome": "failed", "goal": "ЦЕЛЬ: правка"}]
+        got = cd.series(rows, judged=_proved(1))
+        self.assertEqual(got["streak"], 0, "провал серию не оборвал")
+        self.assertEqual((got["unknown"], got["denom"]), (0, 2))
+        self.assertIs(got["alarm"], False)
+
+    def test_unknown_neither_counts_nor_breaks(self):
+        """ОТРИЦАТЕЛЬНЫЙ 2: неизвестная строка серию не рвёт и из знаменателя выходит."""
+        rows = [{"id": 1, "outcome": "done", "goal": "ЦЕЛЬ: правка"},
+                _unknown_row(2),
+                {"id": 3, "outcome": "done", "goal": "ЦЕЛЬ: правка"}]
+        got = cd.series(rows, judged=_proved(1, 3))
+        self.assertEqual(got["streak"], 2, "неизвестная строка разорвала серию надвое")
+        self.assertEqual(got["unknown"], 1)
+        self.assertEqual(got["window"], 3)
+        self.assertEqual(got["denom"], 2, "неизвестная осталась в знаменателе")
+        # …и в разборе закрытий её нет ни в одном из четырёх слов: она не «сдана» ничем.
+        self.assertEqual(got["proved"] + got["blind"] + got["unproved"] + got["unjudged"],
+                         got["denom"])
+
+    def test_an_unknown_row_never_becomes_clean(self):
+        """Замок с другой стороны: льгота не должна превращаться в зачёт.
+
+        `is_clean` обязана отвечать «нет» даже при доказанной записи в реестре — ряд закрыт не
+        `done`, и зачесть его значило бы засчитать работу, которую никто не прочитал."""
+        row = _unknown_row(7)
+        self.assertIs(cd.is_unknown(row), True)
+        self.assertIs(cd.is_clean(row, judged=_proved(7)), False)
+
+    def test_the_number_is_printed_even_when_it_is_zero(self):
+        """ОТРИЦАТЕЛЬНЫЙ 3 (первая половина решения п. 3): ноль печатается тоже."""
+        got = cd.series([{"id": 1, "outcome": "done", "goal": "ЦЕЛЬ: правка"}],
+                        judged=_proved(1))
+        self.assertIn("НЕИЗВЕСТНО 0 из 1", cd.series_line(got))
+
+    def test_the_share_above_one_fifth_is_an_alarm_about_the_judge(self):
+        """Замок от дыры: льгота, о которой не кричат, становится способом не считаться."""
+        rows = [{"id": i, "outcome": "done", "goal": "ЦЕЛЬ: правка"} for i in range(1, 4)]
+        rows.append(_unknown_row(4))
+        got = cd.series(rows, judged=_proved(1, 2, 3))
+        self.assertIs(got["alarm"], True, "1 из 4 — это выше пятой части")
+        words = cd.series_line(got)
+        self.assertIn("НЕИЗВЕСТНО 1 из 4", words)
+        self.assertIn(cd.MARK[cd.RED], words, "тревога звучит тише красного")
+        self.assertIn("ПРО СУДЬЮ", words, "тревога не называет, кого чинить")
+        self.assertIn("НЕИЗВЕСТНО 1 из 4", cd.journal_line({"series": got, "readings": {}}))
+
+    def test_one_unknown_in_ten_is_not_an_alarm(self):
+        """Контроль рядом с тревогой: прибор, кричащий всегда, не сообщает ничего."""
+        rows = [{"id": i, "outcome": "done", "goal": "ЦЕЛЬ: правка"} for i in range(1, 10)]
+        rows.append(_unknown_row(10))
+        got = cd.series(rows, judged=_proved(*range(1, 10)))
+        self.assertIs(got["alarm"], False)
+        self.assertNotIn(cd.MARK[cd.RED], cd.series_line(got))
 
 
 class TestSeries(unittest.TestCase):

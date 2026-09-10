@@ -109,11 +109,16 @@ class TestPositiveControl(JudgeCase):
 
 class TestMandatoryNegatives(JudgeCase):
     def test_report_says_done_but_the_address_is_empty(self):
-        """ОТРИЦАТЕЛЬНЫЙ 1 (задание, п. 3). Отчёт успешен, адрес назван, по адресу ПУСТО."""
+        """ОТРИЦАТЕЛЬНЫЙ 1 (задание, п. 3). Отчёт успешен, адрес назван, по адресу ПУСТО.
+
+        11.09.2026: исход назван третьим словом — `не доказано`, а не `неизвестно`. Чтение по
+        адресу УДАЛОСЬ и вернуло «нет», а это самый сильный из трёх исходов. Разница не
+        косметическая: льгота неизвестности (серию не рвёт) сюда НЕ распространяется."""
         base = self.base()
         _write(self.root, FOLDER + "/2026-08-30-другое.md", BODY)   # соседний день — не адрес
         out = self.judge(base)
-        self.assertEqual(out["verdict"], dj.UNKNOWN)
+        self.assertEqual(out["verdict"], dj.UNPROVEN)
+        self.assertNotEqual(out["verdict"], dj.DONE)
         self.assertIn("ПУСТО", out["reason"])
         self.assertIsNone(out["v0"])
 
@@ -126,7 +131,8 @@ class TestMandatoryNegatives(JudgeCase):
         _write(self.root, REL, OLD)
         base = self.base()                                  # опорный снимок ВИДИТ труп
         out = self.judge(base)                              # заход не тронул ничего
-        self.assertEqual(out["verdict"], dj.UNKNOWN)
+        # 11.09: `DISPROVEN` прибора переводится СВОИМ словом полосы, а не общим «неизвестно».
+        self.assertEqual(out["verdict"], dj.UNPROVEN)
         self.assertEqual(out["v0"]["verdict"], v0.DISPROVEN)
         self.assertEqual(out["v0"]["reason_code"], "changed_scope_mismatch")
         self.assertIn(WORDS.casefold(), OLD.casefold())     # признак был зелёным
@@ -136,7 +142,7 @@ class TestMandatoryNegatives(JudgeCase):
         _write(self.root, REL, OLD)
         base = self.base()
         out = dj.judge(90, TASK, "done", base, run_id="pc-test-90", root=self.root)
-        self.assertEqual(out["verdict"], dj.UNKNOWN)
+        self.assertEqual(out["verdict"], dj.UNPROVEN)
 
 
 class TestForeignFileAtTheAddress(JudgeCase):
@@ -161,7 +167,7 @@ class TestForeignFileAtTheAddress(JudgeCase):
         alien = FOLDER + "/2026-09-01-ступень-C-про-другое.md"
         _write(self.root, alien, "# Ступень C — совсем другая работа\n\nтут нет полной фразы адреса\n")
         out = self.judge(base)
-        self.assertEqual(out["verdict"], dj.UNKNOWN, out["reason"])
+        self.assertEqual(out["verdict"], dj.UNPROVEN, out["reason"])
         self.assertIsNone(out["chosen"], "чужой файл продуктом задачи не объявляется")
         self.assertIsNone(out["v0"], "до прибора такой кандидат не доходит")
         self.assertIn("НИ ОДИН", out["reason"])
@@ -195,7 +201,7 @@ class TestForeignFileAtTheAddress(JudgeCase):
         base = self.base()
         _write(self.root, REL, BODY)                       # заход «принёс» её под адресным именем
         out = self.judge(base)
-        self.assertEqual(out["verdict"], dj.UNKNOWN, out["reason"])
+        self.assertEqual(out["verdict"], dj.UNPROVEN, out["reason"])
         self.assertIn("ЛЕЖАЛО тут до захода", out["reason"])
         self.assertIn("2026-08-30-чужая-работа.md", out["reason"])
         self.assertIsNone(out["v0"], "до прибора такой кандидат не доходит")
@@ -273,7 +279,7 @@ class TestParallelHands(JudgeCase):
         self.assertEqual(out_a["verdict"], dj.DONE, out_a["reason"])
         self.assertEqual(out_a["chosen"], REL_A)
 
-        self.assertEqual(out_b["verdict"], dj.UNKNOWN, out_b["reason"])
+        self.assertEqual(out_b["verdict"], dj.UNPROVEN, out_b["reason"])
         self.assertIsNone(out_b["chosen"], "чужой продукт кандидатом второй руки не становится")
         self.assertIsNone(out_b["v0"], "чужой файл прибору не подаётся вовсе")
         self.assertEqual(out_b["address"]["words"], WORDS_B, "судится СВОИМ адресом")
@@ -297,7 +303,7 @@ class TestParallelHands(JudgeCase):
 
         self.assertEqual(out_a["verdict"], dj.DONE, out_a["reason"])
         self.assertEqual(out_a["chosen"], REL_A)
-        self.assertEqual(out_b["verdict"], dj.UNKNOWN, out_b["reason"])
+        self.assertEqual(out_b["verdict"], dj.UNPROVEN, out_b["reason"])
         self.assertIsNone(out_b["chosen"])
         self.assertNotIn("«%s»" % REL_A, out_b["reason"])
         self.assertIn(REL_B, out_b["reason"], "свой файл назван СВЕДЕНИЕМ — диагноз не потерян")
@@ -319,14 +325,14 @@ class TestParallelHands(JudgeCase):
 
 class TestOtherRefusals(JudgeCase):
     def test_product_without_the_named_words_is_not_proven(self):
-        """Файл по адресу есть, слов адреса в нём нет → «неизвестно», и файл НАЗВАН сведением.
+        """Файл по адресу есть, слов адреса в нём нет → «не доказано», и файл НАЗВАН сведением.
 
         Диагноз не теряется: путь по-прежнему в причине, но как «за заход изменилось», а не как
         «адрес». Разница видна ровно тогда, когда файл чужой (см. `TestParallelHands`)."""
         base = self.base()
         _write(self.root, REL, "# Совсем про другое\n")
         out = self.judge(base)
-        self.assertEqual(out["verdict"], dj.UNKNOWN)
+        self.assertEqual(out["verdict"], dj.UNPROVEN)
         self.assertIsNone(out["v0"])
         self.assertIn(REL, out["reason"], "что заход тронул — сведение, а не адрес")
         self.assertIn("НИ ОДИН", out["reason"])
@@ -342,12 +348,14 @@ class TestOtherRefusals(JudgeCase):
         self.assertEqual(out["verdict"], dj.UNKNOWN)
         self.assertIn("НЕ СНЯТ", out["reason"])
 
-    def test_disappeared_product_is_unknown(self):
+    def test_disappeared_product_is_unproven_not_unknown(self):
+        """Продукт СНЕСЛИ за заход. Папка прочитана, ответ получен — «не доказано», не «неизвестно»:
+        исчезновение это ДЕЙСТВИЕ захода, а не слепота судьи, и льготу оно не покупает."""
         _write(self.root, REL, BODY)
         base = self.base()
         os.remove(os.path.join(self.root, REL.replace("/", os.sep)))
         out = self.judge(base)
-        self.assertEqual(out["verdict"], dj.UNKNOWN)
+        self.assertEqual(out["verdict"], dj.UNPROVEN)
         self.assertIn("ИСЧЕЗЛО", out["reason"])
         self.assertNotIn("нет ни одного файла", out["reason"])   # «не появилось» ≠ «снесли»
 
@@ -361,6 +369,73 @@ class TestOtherRefusals(JudgeCase):
             out = dj.judge(90, TASK, "done", base, root=self.root)
             self.assertIsNotNone(out)
             self.assertNotEqual(out["verdict"], dj.DONE)
+
+
+class TestThreeOutcomes(unittest.TestCase):
+    """ТРЕТИЙ ИСХОД (11.09.2026): «не смог прочитать» перестало называться падением.
+
+    ПОВОД ЖИВОЙ. Заход 245 (10.09.2026 01:04) сделал работу, положил коммит 22f57a2 и артефакт
+    по названному адресу — и лёг в очередь провалом с причиной `V0: UNKNOWN / sensitive_content`.
+    Судья не смог ПРОЧИТАТЬ доказательство, потому что доказательство было про секреты.
+    """
+
+    def test_three_words_of_the_instrument_map_to_three_words_of_the_lane(self):
+        """Схлопывание трёх в два и было корнем: в очередь ехал один маркер на оба исхода."""
+        self.assertEqual(len({dj.DONE, dj.UNPROVEN, dj.UNKNOWN}), 3, "слова полосы совпали")
+        self.assertEqual(dj._V0_WORD,                                # noqa: SLF001 — предмет
+                         {v0.PROVEN: dj.DONE, v0.DISPROVEN: dj.UNPROVEN, v0.UNKNOWN: dj.UNKNOWN})
+        self.assertEqual(sorted(dj._V0_WORD), sorted(v0.VERDICTS),   # noqa: SLF001
+                         "перевод знает не все слова прибора")
+
+    def test_an_unrecognised_instrument_word_does_not_buy_the_lenient_outcome(self):
+        """Мусорный вердикт прибора → НЕ ДОКАЗАНО. У неизвестности есть льгота, и купить её
+        неразобранным ответом нельзя."""
+        self.assertEqual(dj._V0_WORD.get("МУСОР", dj.UNPROVEN), dj.UNPROVEN)  # noqa: SLF001
+
+    def test_the_two_markers_are_not_substrings_of_each_other(self):
+        """Разбор идёт перебором голов: будь одна головой другой — исход читался бы неверно."""
+        self.assertNotIn(dj.UNKNOWN_PREFIX, dj.UNPROVEN_PREFIX)
+        self.assertNotIn(dj.UNPROVEN_PREFIX, dj.UNKNOWN_PREFIX)
+        self.assertEqual(set(dj.PREFIX), {dj.UNKNOWN, dj.UNPROVEN})
+
+    def test_one_parser_reads_both_markers_and_the_reason(self):
+        """ОДНО МЕСТО РАЗБОРА. Второй экземпляр разошёлся бы с первым молча — класс полосы."""
+        for word, why in ((dj.UNKNOWN, "V0: UNKNOWN / sensitive_content по адресу «a.md»"),
+                          (dj.UNPROVEN, "по адресу ПУСТО: за 10.09 нет ни одного файла")):
+            text = dj.fail_result({"verdict": word, "reason": why}, "отчёт исполнителя")
+            self.assertEqual(dj.outcome_of(text), word, why)
+            self.assertEqual(dj.reason_of(text), why)
+            self.assertNotIn(dj.PREFIX[word], dj.strip_marks(text))
+            self.assertIn("отчёт исполнителя", text, "отчёт исполнителя не выброшен")
+
+    def test_a_failure_outside_the_court_carries_no_word(self):
+        """Таймаут и обрыв связи судья не судил: приписать ему слово нельзя ни одно."""
+        self.assertIsNone(dj.outcome_of("[причина=run_timeout · таймаут прогона]"))
+        self.assertIsNone(dj.outcome_of(""))
+        self.assertIsNone(dj.reason_of("[причина=run_timeout · таймаут прогона]"))
+
+    def test_unknown_without_a_named_reason_is_not_accepted(self):
+        """ОТРИЦАТЕЛЬНЫЙ 3 задания. Неизвестность без причины льготы не получает НИГДЕ:
+
+        ни в принятом слове, ни в маркере очереди, ни в реестре. Замок стои́т у источника —
+        значит счётчику серии подложить безпричинную неизвестность попросту нечем."""
+        for reason in (None, "", "   "):
+            bad = {"verdict": dj.UNKNOWN, "reason": reason, "address": {"words": "x"}}
+            self.assertEqual(dj.accepted(bad), dj.UNPROVEN, repr(reason))
+            self.assertEqual(dj.outcome_of(dj.fail_result(bad, "отчёт")), dj.UNPROVEN, repr(reason))
+        good = {"verdict": dj.UNKNOWN, "reason": "sensitive_content по адресу «a.md»"}
+        self.assertEqual(dj.accepted(good), dj.UNKNOWN)
+        self.assertEqual(dj.accepted({"verdict": dj.DONE, "reason": ""}), dj.DONE)
+        self.assertEqual(dj.accepted(None), dj.UNPROVEN)
+
+    def test_the_status_did_not_move_with_the_word(self):
+        """ОТРИЦАТЕЛЬНЫЙ 1 задания на этом слое: оба недоказанных исхода по-прежнему уводят ряд
+        в `failed`. Статусов в очереди шесть, своего у неизвестности нет, и заводить его —
+        не решение этого захода."""
+        for word in (dj.UNPROVEN, dj.UNKNOWN):
+            addressed = {"verdict": word, "reason": "почему", "address": {"words": "x"}}
+            self.assertTrue(dj.enforces(addressed, dj.MODE_ADDR), word)
+            self.assertFalse(dj.enforces(addressed, dj.MODE_OFF), word)
 
 
 class TestEnforcement(unittest.TestCase):

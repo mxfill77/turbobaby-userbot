@@ -12275,11 +12275,30 @@ class TestStageCJudgeWiring(unittest.TestCase):
                         body.index("if not done_judge_pc.enforces(verdict, mode):"))
 
     def test_addressed_and_unproven_is_not_done(self):
-        bad = {"verdict": o.done_judge_pc.UNKNOWN, "reason": "по адресу ПУСТО",
+        bad = {"verdict": o.done_judge_pc.UNPROVEN, "reason": "по адресу ПУСТО",
                "address": {"words": "x"}}
         status, text = self.run_mode("addr", bad)
         self.assertEqual(status, "failed")
-        self.assertTrue(text.startswith(o.done_judge_pc.UNKNOWN_PREFIX))
+        self.assertTrue(text.startswith(o.done_judge_pc.UNPROVEN_PREFIX))
+        self.assertIn("RESULT: ок", text, "отчёт исполнителя не выбрасывается, а съезжает вниз")
+
+    def test_the_third_outcome_reaches_the_queue_under_its_own_marker(self):
+        """ТРЕТИЙ ИСХОД (11.09.2026) в единственной точке вызова судьи на полосе.
+
+        СТАТУС НЕ СДВИНУЛСЯ — оба недоказанных исхода по-прежнему `failed`, потому что статусов
+        в очереди шесть и своего у неизвестности нет. Сдвинулась ЗАПИСЬ: маркер называет исход
+        отдельным словом, и по нему очередь, сводка и счёт серии отличают «не смог прочитать» от
+        «прочитал, ответ нет». До правки оба ехали под одним маркером, и заход 245 (10.09,
+        коммит 22f57a2, артефакт на месте) числился провалом."""
+        why = "V0: UNKNOWN / sensitive_content по адресу «docs/artifacts/…-1009.md»"
+        unread = {"verdict": o.done_judge_pc.UNKNOWN, "reason": why, "address": {"words": "x"}}
+        status, text = self.run_mode("addr", unread)
+        self.assertEqual(status, "failed", "статус третьего исхода сдвинулся — это не решение захода")
+        self.assertTrue(text.startswith(o.done_judge_pc.UNKNOWN_PREFIX), text[:80])
+        self.assertEqual(o.done_judge_pc.outcome_of(text), o.done_judge_pc.UNKNOWN)
+        import queue_snapshot_pc                    # слепок демон зовёт отдельным процессом
+        self.assertEqual(queue_snapshot_pc.outcome_of(text), queue_snapshot_pc.OUT_UNKNOWN,
+                         "слепок очереди третий исход не увидел")
         self.assertIn("RESULT: ок", text, "отчёт исполнителя не выбрасывается, а съезжает вниз")
 
     def test_proven_stays_done_and_says_so_at_the_head(self):

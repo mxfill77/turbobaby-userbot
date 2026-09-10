@@ -25,6 +25,7 @@ import os
 import tempfile
 import unittest
 
+import done_judge_pc as dj
 import queue_snapshot_pc as q
 
 T0 = 1786721422.0          # 2026-08-14 15:30:22 UTC — время живой пробы (сверено арифметикой)
@@ -334,6 +335,51 @@ class TestOwnerRejection(Base):
         text = q.render_body([], {"555": {"id": "555", "at": T0, "goal": "ЦЕЛЬ: X",
                                           "outcome": "rejected", "why": q.REJECT_MARK}}, T0, T0)
         self.assertIn("переотправке не подлежит", text)
+
+    def test_неизвестность_судьи_падением_НЕ_называется(self):
+        """ТРЕТИЙ ИСХОД (11.09.2026). Живой заход 245 сделал работу, положил коммит 22f57a2 и
+        артефакт по названному адресу — и лёг в слепок «упало», потому что судья не смог его
+        ПРОЧИТАТЬ. Штаб читает слепок и видел провал там, где провала не было."""
+        self.assertEqual(q.JUDGE_UNKNOWN_WORD, dj.UNKNOWN, "слово судьи разошлось со слепком")
+        why = "V0: UNKNOWN / sensitive_content по адресу «docs/artifacts/…-1009.md»"
+        text = dj.fail_result({"verdict": dj.UNKNOWN, "reason": why}, "отчёт исполнителя")
+        self.assertEqual(q.outcome_of(text), q.OUT_UNKNOWN)
+        self.assertEqual(q.judge_reason(text), why, "причина судьи не читается обратно")
+
+    def test_не_доказано_остаётся_падением(self):
+        """ОТРИЦАТЕЛЬНЫЙ 1: прибор ПРОЧИТАЛ и ответил «нет» — это по-прежнему `failed`.
+
+        Отдельный разрез положен ровно тому исходу, где о работе не сказано ничего; раздать его
+        всем недоказанным значило бы убрать из слепка падения вовсе."""
+        text = dj.fail_result({"verdict": dj.UNPROVEN, "reason": "по адресу ПУСТО"}, "отчёт")
+        self.assertEqual(q.outcome_of(text), q.OUT_FAILED)
+
+    def test_безпричинная_неизвестность_льготы_не_получает(self):
+        """ОТРИЦАТЕЛЬНЫЙ 3: «неизвестно» без названной причины в слепок неизвестностью не идёт.
+
+        Замок стои́т у источника — маркер выбирает `done_judge_pc.accepted`, — поэтому подложить
+        слепку безпричинную неизвестность нечем."""
+        text = dj.fail_result({"verdict": dj.UNKNOWN, "reason": ""}, "отчёт")
+        self.assertEqual(q.outcome_of(text), q.OUT_FAILED)
+
+    def test_отказ_владельца_сильнее_маркера_судьи(self):
+        """Порядок разбора назван: отказ человека не смеет получить чужое имя."""
+        why = "V0: UNKNOWN / sensitive_content по адресу «a.md»"
+        judged = dj.fail_result({"verdict": dj.UNKNOWN, "reason": why}, "отчёт")
+        self.assertEqual(q.outcome_of(q.REJECT_MARK + " (кнопка) " + judged), "rejected")
+
+    def test_неизвестность_видна_отдельной_строкой_и_числом(self):
+        """Штаб читает мозг САМ: разница «упало ↔ неизвестно» обязана быть В ТЕКСТЕ."""
+        why = "V0: UNKNOWN / sensitive_content по адресу «a.md»"
+        text = q.render_body([], {"245": {"id": "245", "at": T0, "goal": "ЦЕЛЬ: закрыть ключ",
+                                          "outcome": q.OUT_UNKNOWN,
+                                          "why": dj.fail_result({"verdict": dj.UNKNOWN,
+                                                                 "reason": why}, "отчёт")}},
+                             T0, T0)
+        self.assertIn("НЕИЗВЕСТНО 1", text)
+        self.assertIn("упало 0", text, "неизвестность посчитана падением")
+        self.assertIn("про СУДЬЮ, а не про работу", text)
+        self.assertIn("sensitive_content", text, "причина судьи не доехала до Штаба")
 
     def test_настоящее_падение_отказом_НЕ_называется(self):
         self.assertEqual(q.outcome_of("⏱ таймаут 45 мин"), "failed")

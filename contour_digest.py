@@ -147,6 +147,20 @@ F_ADDRESSED = "addressed"
 LIST_MAX = 6                  # строк в разделе; остаток называется числом
 GOAL_MAX = 78                 # цель строки очереди в одну строку сообщения
 
+# ═════════════════════════ ТРЕТИЙ ИСХОД ЗАКРЫТИЯ (11.09.2026) ════════════════
+# Исход РЯДА, а не вердикт о нём: слепок очереди уже отделяет «судья не смог
+# прочитать» от «упало» (:data:`queue_snapshot_pc.OUT_UNKNOWN`). Литерал
+# ЗАИМСТВОВАН, а не импортирован — та же идиома, что у имён полей реестра выше, и
+# равенство сторожит тест.
+OUT_UNKNOWN = "unknown"
+
+# ДОЛЯ НЕИЗВЕСТНОГО, ВЫШЕ КОТОРОЙ ЭТО ТРЕВОГА ПРО СУДЬЮ. Пятая часть — число
+# Штаба (решение 11.09.2026, п. 3), а не замер: оно назначено вместе с самим
+# правилом и здесь только исполняется. Считается ДОЛЕЙ ОКНА, а не долей
+# знаменателя: знаменатель как раз и уменьшается на неизвестные, и доля от него
+# росла бы сама собой, превращая тревогу в самосбывающуюся.
+UNKNOWN_ALARM_NUM, UNKNOWN_ALARM_DEN = 1, 5
+
 # ═════════════════════════ ИСХОДЫ СТРОКИ ═════════════════════════════════════
 
 OK = "ok"                     # измерено, и это НЕ новость
@@ -762,6 +776,22 @@ def judged_of(tid, judged=None):
     return JUDGE_UNPROVED
 
 
+def is_unknown(row):
+    """Цепочка вышла НЕИЗВЕСТНОЙ — судья не смог прочитать её продукт? → bool.
+
+    Спрашивается у ИСХОДА РЯДА, а не у реестра вердиктов: слепок очереди уже
+    отделил этот исход маркером судьи (:func:`queue_snapshot_pc.outcome_of`), и
+    второе мнение о том же вопросе разошлось бы с первым молча.
+
+    ГРАНИЦА НАЗВАНА, А НЕ ПОДРАЗУМЕВАЕТСЯ: «судья не смог прочитать» — это НЕ
+    «адрес не назван». Второе остаётся своим словом (:data:`JUDGE_BLIND`), в
+    знаменателе и в обрывах. Там споткнулся не судья — там задача не сказала, чем
+    себя проверять, и прятать это из счёта значило бы открыть дыру ровно того
+    класса, от которого сторожит :data:`UNKNOWN_ALARM_NUM`.
+    """
+    return isinstance(row, dict) and row.get("outcome") == OUT_UNKNOWN
+
+
 def is_clean(row, judged=None):
     """ЧИСТАЯ цепочка = СДАНА и ДОКАЗАНА судьёй. → bool.
 
@@ -788,6 +818,18 @@ def series(rows, target=SERIES_TARGET, judged=None):
     `unjudged`), и сумма их равна числу сданных строк окна. Без него владелец
     читал бы одну цифру серии, не видя, на чём она стои́т, — а именно это и
     позволило числу врать до 02.09.
+
+    ═══ НЕИЗВЕСТНОСТЬ НЕ ЗАСЧИТЫВАЕТ И НЕ РВЁТ (11.09.2026) ═════════════════
+
+    Решение Штаба, п. 2. Цепочка, у которой судья НЕ СМОГ ПРОЧИТАТЬ продукт, из
+    ЗНАМЕНАТЕЛЯ выходит (`denom` = окно минус неизвестные) и серию не обрывает —
+    обход хвоста её ПРОПУСКАЕТ, а не останавливается на ней. Довод прямой: цепочка
+    осуждена не за работу, а за то, что прибор её не прочитал, и записывать это в
+    провал полосы значило бы мерить судью работой.
+
+    ЗАМОК ОТ ДЫРЫ СТОИ́Т ТУТ ЖЕ, и он громкий: `unknown` печатается ВСЕГДА, а доля
+    выше :data:`UNKNOWN_ALARM_NUM`/:data:`UNKNOWN_ALARM_DEN` от окна — тревога.
+    Без него «неизвестно» стало бы способом не считаться ни в одном числе.
     """
     taken, service = [], 0
     for row in (rows or []):
@@ -798,11 +840,17 @@ def series(rows, target=SERIES_TARGET, judged=None):
         taken.append(row)
     window = taken[-int(target):] if target else taken
     tally = {JUDGE_PROVED: 0, JUDGE_BLIND: 0, JUDGE_UNPROVED: 0, JUDGE_SILENT: 0}
+    unknown = 0
     for row in window:
+        if is_unknown(row):
+            unknown += 1
+            continue
         if is_closed_done((row or {}).get("outcome")):
             tally[judged_of((row or {}).get("id"), judged)] += 1
     streak, moved = 0, 0
     for row in reversed(window):
+        if is_unknown(row):
+            continue                      # не засчитывает и не рвёт — просто не участвует
         if not is_clean(row, judged):
             break
         streak += 1
@@ -810,6 +858,8 @@ def series(rows, target=SERIES_TARGET, judged=None):
             moved += 1
     return {"target": int(target), "streak": streak, "moved": moved,
             "window": len(window), "service": service, "seen": len(taken),
+            "unknown": unknown, "denom": len(window) - unknown,
+            "alarm": unknown * UNKNOWN_ALARM_DEN > len(window) * UNKNOWN_ALARM_NUM,
             "proved": tally[JUDGE_PROVED], "blind": tally[JUDGE_BLIND],
             "unproved": tally[JUDGE_UNPROVED], "unjudged": tally[JUDGE_SILENT]}
 
@@ -856,6 +906,28 @@ def shtab_line(taken, day, rd=None):
     return line_text(shown)
 
 
+def unknown_words(counted):
+    """ЧИСЛО НЕИЗВЕСТНЫХ — вслух и всегда, тревога — теми же словами, что красное.
+
+    ВСЕГДА, в том числе нулём: исход, спрятанный при нуле, читается как «такого не
+    бывает», а именно так «неизвестно» и жило до 11.09 — его не было видно нигде.
+
+    ТРЕВОГА ЗВУЧИТ ПРО СУДЬЮ, А НЕ ПРО РАБОТУ, и это не оформление: доля выше
+    пятой части означает, что прибор перестал читать продукт, а не что полоса
+    перестала его делать. Читающий, который спутает эти две новости, пойдёт чинить
+    не то. Слово :data:`MARK` берётся у красного — тревоге положено звучать так же
+    громко, как звучит красное, и другим шрифтом её звучать нельзя.
+    """
+    got = counted if isinstance(counted, dict) else {}
+    unknown, window = got.get("unknown", 0), got.get("window", 0)
+    words = "НЕИЗВЕСТНО %d из %d" % (unknown, window)
+    if not got.get("alarm"):
+        return words
+    return ("%s: %s — доля выше %d/%d, и это ТРЕВОГА ПРО СУДЬЮ, а не про работу "
+            "(продукт не прочитан, а не не сделан)"
+            % (MARK[RED], words, UNKNOWN_ALARM_NUM, UNKNOWN_ALARM_DEN))
+
+
 def series_line(counted, rd=None):
     """Строка серии — ОТДЕЛЬНАЯ и всегда одна. → str.
 
@@ -872,11 +944,12 @@ def series_line(counted, rd=None):
     got = counted or {}
     words = ("%d чистых подряд из %d · судья доказал %d · закрыто без адреса %d "
              "· не доказано %d · судья не судил %d · из них меняли операционное состояние %d "
-             "· цепочек в окне %d · служебных мимо счёта %d"
+             "· цепочек в окне %d (в знаменателе %d) · %s · служебных мимо счёта %d"
              % (got.get("streak", 0), got.get("target", SERIES_TARGET),
                 got.get("proved", 0), got.get("blind", 0), got.get("unproved", 0),
                 got.get("unjudged", 0), got.get("moved", 0),
-                got.get("window", 0), got.get("service", 0)))
+                got.get("window", 0), got.get("denom", got.get("window", 0)),
+                unknown_words(got), got.get("service", 0)))
     if rd is None:
         return "• %s" % words
     shown = dict(rd)
@@ -972,12 +1045,16 @@ def journal_line(report):
     # индексом, а от одной перестаёт быть правдой.
     return ("NOTE СВОДКА КОНТУРА · ПК · интервал %s: закрылось %s · красного %d · неизвестного %d "
             "· ждёт решения %d · серия %d/%d (доказал судья %d · без адреса %d · меняли "
-            "состояние %d) · задач от Штаба взято %s · %s"
+            "состояние %d · %s) · задач от Штаба взято %s · %s"
             % (interval_words(report.get("interval", INTERVAL_SEC)),
                report.get("closed_count") if isinstance(report.get("closed_count"), int) else "?",
                reds, unk, waits, counted.get("streak", 0), counted.get("target", SERIES_TARGET),
                counted.get("proved", 0), counted.get("blind", 0),
                counted.get("moved", 0),
+               # ЧИСЛО НЕИЗВЕСТНЫХ ЕДЕТ И В ЖУРНАЛ. Индекс, в котором его нет, показывает
+               # серию, стоящую на невидимом знаменателе, — ровно та ложь, которую 02.09
+               # закрыли для «без адреса» и которая 11.09 вернулась бы через новый исход.
+               unknown_words(counted),
                # «?» вместо нуля при мёртвом источнике: журнал — индекс, и ноль в
                # нём читается как измеренный факт, а не как «спросить не смогли».
                taken if isinstance(taken, int) else "?",
