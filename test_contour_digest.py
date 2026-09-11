@@ -35,10 +35,13 @@ import unittest
 
 import contour_digest as cd
 import contour_digest_run as run
+import done_judge_pc
 import queue_snapshot_pc
 import recon_auto
 import review_intake
 import series_pc
+import vitrina_pc as vp
+import vitrina_pc_run as vpr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NOW = 1788290000.0
@@ -1139,6 +1142,135 @@ class TestFindingFate(unittest.TestCase):
             body = " ".join(rd["words"] for rd in rows)
             self.assertIn("судьба находок", body)
             self.assertIn("ПОЛЬЗА", body)
+
+
+def _stale_corpus(tmp):
+    """Слепок очереди с ТРЕМЯ чистыми цепочками + реестр судьи, их доказавший.
+
+    → метка замера слепка (его `mtime`), от которой тесты отсчитывают возраст.
+    Корпус выбран так, чтобы при живом счёте серия была ЯВНО НЕ НУЛЕВОЙ: иначе
+    «ноль вместо неизвестности» и «честный ноль» неотличимы, и тест зеленел бы на
+    сломанном показе.
+    """
+    path = os.path.join(tmp, cd.source("queue")["addr"])
+    closed = dict(_closed(n, NOW - 5000 + n, "done", "ЦЕЛЬ: правка %d" % n) for n in (1, 2, 3))
+    with io.open(path, "w", encoding="utf-8") as fh:
+        json.dump(_snapshot(closed_rows=closed), fh)
+    ledger = os.path.join(tmp, done_judge_pc.LEDGER.replace("/", os.sep))
+    os.makedirs(os.path.dirname(ledger), exist_ok=True)
+    rows = {str(n): {cd.F_PROVED: True, cd.F_ADDRESSED: True, "seq": n} for n in (1, 2, 3)}
+    with io.open(ledger, "w", encoding="utf-8") as fh:
+        json.dump({"schema": done_judge_pc.LEDGER_SCHEMA, "rows": rows}, fh)
+    return os.path.getmtime(path)
+
+
+def _no_git(*_a, **_k):
+    raise OSError("git в проверке не зовём")
+
+
+def _window_series(text):
+    """Строка витрины, несущая серию. Нет такой — падение, а не пустая строка."""
+    for line in text.splitlines():
+        if "серия" in line:
+            return line.strip()
+    raise AssertionError("в витрине не осталось строки серии вовсе")
+
+
+class TestStaleSourceIsSpokenNotZeroed(unittest.TestCase):
+    """ОТРИЦАТЕЛЬНЫЙ ТЕСТ задания 31-a: величина по протухшему источнику — СЛОВО, а не ноль.
+
+    ОБА ПОКАЗА ОДНОЙ ВЕЛИЧИНЫ ПРОВЕРЯЮТСЯ ОДНИМ КОРПУСОМ И В ОДНОМ КЛАССЕ, и это
+    не удобство сборки: формула серии у журнальной сводки и у витрины ОДНА
+    (:func:`contour_digest.series`, зовут её обе одной строкой), а разошлись они
+    ПРАВИЛОМ ПОКАЗА НЕИЗВЕСТНОСТИ. Проверяй их порознь — разойдутся снова и снова
+    молча.
+
+    Вход один на все проверки: слепок очереди СТАРШЕ своего предела
+    (`cd.limit_of("queue")`), три чистых цепочки, судья их доказал. На коде до
+    правки 11.09.2026 этот вход давал ДВА неверных ответа сразу — «серия 3 из 30»
+    в витрине (число по слепку ЛЮБОГО возраста) и «серия 0/30» в журнале (ноль на
+    месте уже погашенного числа). Ровно эти две строки Штаб 11.09 прочитал,
+    сложил в вывод и доложил владельцу неправдой; цена класса заплачена один раз,
+    и второй раз её платить нечем.
+    """
+
+    def test_the_journal_index_says_question_mark_where_the_number_is_damped(self):
+        """Журнал: погашенная серия печатается знаком вопроса, а не нулём.
+
+        ДО правки здесь стояло «серия 0/30 · доказал судья 0 … НЕИЗВЕСТНО 0 из 0»
+        — четыре нуля, каждый читается как ИЗМЕРЕННЫЙ факт.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            at = _stale_corpus(tmp)
+            future = at + cd.limit_of("queue") + 600
+            rep = run.build(root=tmp, now=future, since=future - cd.INTERVAL_SEC, runner=_no_git)
+            self.assertIsNone(rep["series"], "сборка перестала гасить числа протухшего слепка")
+            line = cd.journal_line(rep)
+        self.assertNotIn("серия 0/%d" % cd.SERIES_TARGET, line,
+                         "погашенное число напечатано нулём — ноль в индексе читается фактом")
+        self.assertIn("серия ?/%d" % cd.SERIES_TARGET, line)
+        self.assertIn("доказал судья ?", line)
+        self.assertIn("НЕИЗВЕСТНО ? из ?", line,
+                      "«0 из 0» утверждает, что неизвестных не было, а спросить было нечем")
+
+    def test_the_shop_window_refuses_to_count_on_a_stale_snapshot(self):
+        """Витрина: слепок старше предела считать НЕЛЬЗЯ — ни в фактах, ни на печати.
+
+        ДО правки ветка в `collect` была одна (`if snapshot is not None`), и число
+        ехало наружу по слепку любого возраста, хотя текст самой витрины обещал
+        «не прочитан ИЛИ СТАРШЕ ПРЕДЕЛА».
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            at = _stale_corpus(tmp)
+            future = at + cd.limit_of("queue") + 600
+            facts = vpr.collect(root=tmp, now=future, runner=_no_git,
+                                shtab=vp.parse_shtab("", ok=False, why="узла нет"))
+            self.assertIsNone(facts["series"], "серия посчитана по слепку старше предела")
+            line = _window_series(vp.render(facts, "?"))
+        self.assertIn(vp.UNKNOWN, line)
+        self.assertIn("старше предела", line, "причина названа у́же правды: слепок ПРОЧИТАН, но стар")
+        self.assertNotIn("3 из %d подряд" % cd.SERIES_TARGET, line,
+                         "число по протухшему слепку подано фактом")
+
+    def test_a_fresh_snapshot_still_carries_the_real_number_in_both_shows(self):
+        """ЗАМОК ОБРАТНОЙ СТОРОНЫ: живое число правкой не убито.
+
+        Показ, который молчит ВСЕГДА, зелен по той же причине, по какой был зелен
+        сломанный, — поэтому свежий слепок обязан дать РОВНО те же три цепочки в
+        обоих показах.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            at = _stale_corpus(tmp)
+            fresh = at + 10.0
+            rep = run.build(root=tmp, now=fresh, since=fresh - cd.INTERVAL_SEC, runner=_no_git)
+            facts = vpr.collect(root=tmp, now=fresh, runner=_no_git,
+                                shtab=vp.parse_shtab("", ok=False, why="узла нет"))
+            line = cd.journal_line(rep)
+            window = _window_series(vp.render(facts, "?"))
+        self.assertEqual(rep["series"]["streak"], 3)
+        self.assertEqual(facts["series"]["streak"], 3)
+        self.assertIn("серия 3/%d" % cd.SERIES_TARGET, line)
+        self.assertIn("3 из %d подряд" % cd.SERIES_TARGET, window)
+        self.assertNotIn("?", line.split("· задач от Штаба")[0].split("серия")[1],
+                         "свежий слепок напечатан незнанием — показ замолчал вместо счёта")
+
+    def test_both_shows_take_the_limit_from_the_one_place_that_names_it(self):
+        """Второй копии предела нет: граница показа стои́т РОВНО на `cd.limit_of("queue")`.
+
+        Проверяется поведением, а не грепом по числу: собственный предел витрины
+        выдал бы себя тем, что граница уехала бы с чужой. Десять секунд по обе
+        стороны от предела — и ответ обязан смениться.
+        """
+        limit = cd.limit_of("queue")
+        self.assertEqual(limit, 3600, "предел слепка переехал — проверка обязана поехать за ним")
+        with tempfile.TemporaryDirectory() as tmp:
+            at = _stale_corpus(tmp)
+            before = vpr.collect(root=tmp, now=at + limit - 10, runner=_no_git,
+                                 shtab=vp.parse_shtab("", ok=False, why="узла нет"))
+            after = vpr.collect(root=tmp, now=at + limit + 10, runner=_no_git,
+                                shtab=vp.parse_shtab("", ok=False, why="узла нет"))
+        self.assertIsNotNone(before["series"], "витрина замолчала РАНЬШЕ предела — предел свой")
+        self.assertIsNone(after["series"], "витрина считает ПОСЛЕ предела — предел свой")
 
 
 if __name__ == "__main__":            # pragma: no cover

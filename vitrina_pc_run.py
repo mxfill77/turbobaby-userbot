@@ -600,14 +600,26 @@ def collect(root=HERE, now=None, runner=None, inbox=None, day=None, shtab=None):
     now = now_ts(now)
     the_day = day or day_utc(now)
     since = day_start(the_day)
-    snapshot, _q_at, q_why = cdr.read_json(root, cd.source("queue")["addr"])
+    snapshot, q_at, q_why = cdr.read_json(root, cd.source("queue")["addr"])
     expect, expect_at, _e_why = cdr.read_json(root, cd.source("expect")["addr"])
     watch, watch_at, _w_why = read_watch(root)
     heads, records, _i_why = cdr.read_inbox(root, inbox)
     claims = read_claims(root)
+    # СЕРИЯ СЧИТАЕТСЯ ТОЛЬКО ПО СВЕЖЕМУ СЛЕПКУ (правка 11.09.2026, задание 31-a).
+    # До неё ветка была одна — `if snapshot is not None`, — и витрина печатала число
+    # по слепку ЛЮБОГО ВОЗРАСТА, подавая его фактом. Текст самой витрины при этом
+    # обещал обратное («слепок очереди не прочитан ИЛИ СТАРШЕ ПРЕДЕЛА»,
+    # :func:`vitrina_pc.part_nums`) — обещание без кода за ним. Цена: 11.09 Штаб
+    # прочитал в витрине «серия 3 из 30» по протухшему слепку и доложил неправду.
+    #
+    # Предел берётся ТАМ, ГДЕ УЖЕ НАЗВАН (`contour_digest.SOURCES["queue"]`, 3600 с),
+    # дверью сводки :func:`contour_digest_run.fresh_or_none`: второй экземпляр числа
+    # развёл бы два показа одной величины молча. Возраст не сверить → тоже `None`,
+    # третий исход в «неизвестно», а не в «свежо».
     counted = None
-    if snapshot is not None:
-        counted = cd.series(cdr.all_closed(snapshot), judged=cdr.read_judged(root))
+    fresh = cdr.fresh_or_none(snapshot, q_at, now, "queue")
+    if fresh is not None:
+        counted = cd.series(cdr.all_closed(fresh), judged=cdr.read_judged(root))
     tally, axes_why = axes_of_day(root, since, runner=runner)
     waiting = waiting_rows(snapshot)
     closed_day = None if snapshot is None else len(cdr.closed_since(snapshot, since))
