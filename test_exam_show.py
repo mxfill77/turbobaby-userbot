@@ -290,12 +290,46 @@ class TestCandidateRecord(Base):
         self.assertEqual(r["правила"], "v7")
         self.assertTrue(r["время"].endswith("Z"))
 
+    def test_a_missing_proof_is_named_and_not_left_blank(self):
+        """Нет коммита в черновике → в строке стои́т СЛОВО, а не пустая графа.
+
+        Пустая графа среди трёх опор вердикта читается как «коммита не было», хотя значит «мы его
+        не записали», и отличить одно от другого потом нечем."""
+        os.remove(exam_show.shot_path(1))
+        self.put_shot(_shot(corpus="ffffffffffffffff") | {"commit": "", "rules": None})
+        self.tap()
+        r = exam_show.load_verdicts(self.log)[0]
+        self.assertEqual(r["коммит"], "НЕ ЗАПИСАНО(коммит)")
+        self.assertEqual(r["правила"], "НЕ ЗАПИСАНО(версия правил)")
+        self.assertEqual(r["корпус"], "ffffffffffffffff", "целая опора не смеет пострадать")
+
+    def test_a_wrong_typed_proof_is_not_swallowed_as_empty(self):
+        """`0`/`[]`, приехавшие по ошибке вызывающего, не выдают себя за честно пустое значение."""
+        for junk in (0, [], None, "   "):
+            self.assertEqual(exam_show._evidence(junk, "коммит"), "НЕ ЗАПИСАНО(коммит)")
+        self.assertEqual(exam_show._evidence("  abc1234 ", "коммит"), "abc1234")
+
     def test_candidate_never_becomes_active_on_any_path(self):
-        """Ни одна ветка модуля не пишет состояния «актив» и не зовёт перевод."""
+        """Ни одна ветка модуля не пишет состояния «актив» и не зовёт перевод.
+
+        Меряем ИМЕНА И ЛИТЕРАЛЫ КОДА через `ast`, а не текст файла. Прежняя редакция читала весь
+        исходник целиком и покраснела от собственного объяснения в докстроке (там названа зрячая
+        форма `lesson_store.promote`) — то есть от ПРОЗЫ, а не от поведения. Проверка, которую
+        нельзя объяснить, не объяснив её в запрещённых словах, сторожит не то."""
+        import ast
         import inspect
-        src = inspect.getsource(exam_show)
-        self.assertNotIn("актив", src)
-        self.assertNotIn("promote", src)
+        tree = ast.parse(inspect.getsource(exam_show))
+        names, literals = set(), set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                names.add(node.attr)
+            elif isinstance(node, ast.Name):
+                names.add(node.id)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                literals.add(node.value)
+        self.assertNotIn("promote", names, "перевода кандидата модуль не зовёт ни одной веткой")
+        self.assertNotIn("актив", literals, "состояния «актив» модуль не пишет ни одним литералом")
+        self.assertEqual(exam_show.STATE_CANDIDATE, "кандидат")
         self.tap()
         self.assertEqual({r["состояние"] for r in exam_show.load_verdicts(self.log)}, {"кандидат"})
 

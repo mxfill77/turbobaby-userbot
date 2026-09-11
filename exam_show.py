@@ -370,6 +370,21 @@ def _esc(value):
     return lesson_store.esc(value)
 
 
+def _evidence(value, what):
+    """Поле ДОКАЗАТЕЛЬСТВА для строки журнала: пустота здесь — новость, а не пустая графа.
+
+    Вердикт держится на трёх опорах — коммит, отпечаток корпуса, версия правил. Пустая графа
+    среди них читается как «коммита не было», хотя значит «мы его не записали», и отличить одно
+    от другого потом нечем: строка журнала — это всё, что останется. Поэтому отсутствие
+    называется СЛОВАМИ и видно прямо в строке.
+
+    `isinstance`, а не `or ""`: приехавшие по ошибке вызывающего `0`, `[]` или `None` перестают
+    быть неотличимы от честно пустой строки (та же зрячая форма, что у `lesson_store.promote`)."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return "НЕ ЗАПИСАНО(%s)" % what
+
+
 def load_verdicts(path=None):
     """Журнал → список словарей. Файла нет — пустой список (это не ошибка)."""
     target = path or VERDICTS
@@ -428,8 +443,10 @@ def tap(case_id, verdict, who, path=None, right_fn=None, now=None, cases_path=No
     row = "\t".join([
         str(number), STATE_CANDIDATE, stamp(now), _esc(who or ""),
         str(shot.get("case")), str(shot.get("total")), word,
-        _esc(shot.get("commit") or ""), _esc(shot.get("corpus") or ""),
-        _esc(shot.get("rules") or ""), _esc(shot_ref(case_id)),
+        _esc(_evidence(shot.get("commit"), "коммит")),
+        _esc(_evidence(shot.get("corpus"), "корпус")),
+        _esc(_evidence(shot.get("rules"), "версия правил")),
+        _esc(shot_ref(case_id)),
     ])
     need_header = not os.path.exists(target) or os.path.getsize(target) == 0
     with open(target, "a", encoding="utf-8", newline="\n") as f:
