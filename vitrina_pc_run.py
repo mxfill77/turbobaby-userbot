@@ -620,6 +620,11 @@ def collect(root=HERE, now=None, runner=None, inbox=None, day=None, shtab=None):
     fresh = cdr.fresh_or_none(snapshot, q_at, now, "queue")
     if fresh is not None:
         counted = cd.series(cdr.all_closed(fresh), judged=cdr.read_judged(root))
+    # ПРИЧИНА ЕДЕТ ВМЕСТЕ С ПОГАШЕННЫМ ЧИСЛОМ (правка 11.09.2026, хвост задания 31-a).
+    # Считает её та же дверь и по тем же веткам, что гасят число, — иначе показ и
+    # гашение разъехались бы на первой правке порога, и строка витрины объясняла бы
+    # незнание причиной, по которой оно не наступало.
+    series_why = cdr.fresh_why(snapshot, q_at, now, "queue", q_why)
     tally, axes_why = axes_of_day(root, since, runner=runner)
     waiting = waiting_rows(snapshot)
     closed_day = None if snapshot is None else len(cdr.closed_since(snapshot, since))
@@ -638,6 +643,7 @@ def collect(root=HERE, now=None, runner=None, inbox=None, day=None, shtab=None):
         "expects": open_expectations(expect),
         "failed": failed_rows(snapshot, since),
         "series": counted,
+        "series_why": series_why,
         "shtab_taken": cd.shtab_taken(cdr.all_rows(snapshot), the_day),
         "box_stop": read_box_stop(root),
         "routed": read_routed(root, now),

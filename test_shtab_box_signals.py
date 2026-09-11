@@ -104,11 +104,24 @@ def _faceless(tid):
 
 
 def _ledger(*pairs):
-    """(tid, proved, addressed) → реестр вердиктов в форме судьи."""
+    """(tid, proved, addressed) → реестр вердиктов в форме судьи.
+
+    КЛЮЧ — ИМЯ РЯДА, А НЕ НОМЕР (правка 11.09.2026 вслед за коммитом ff8b149). До неё
+    фикстура ключевала номером, и это было ВЕРНО ровно до того дня, когда ключом
+    реестра стало имя: с той минуты набор описывал реестр, которого на полосе больше
+    нет, и зеленел бы на читателе, спрашивающем голым номером, — то есть сторожил бы
+    прежний дефект вместо продукта.
+
+    Имя поднимает ЕДИНСТВЕННАЯ ДВЕРЬ :func:`contour_digest.row_name`, а текст ряда
+    берётся у :func:`_closed` — той же функции, что кладёт ряд в очередь. Собери мы
+    имя здесь руками («ключ плюс решётка плюс номер»), у набора завелось бы второе
+    правило имени, и разошлось бы оно с первым молча.
+    """
     rows = {}
     for i, (tid, ok, addressed) in enumerate(pairs, 1):
-        rows[str(tid)] = {dj.F_PROVED: bool(ok), dj.F_ADDRESSED: bool(addressed),
-                          dj.F_REASON: "проба", dj.F_SEQ: i}
+        name = cd.row_name(tid, _closed(tid)["task_text"])
+        rows[name] = {dj.F_PROVED: bool(ok), dj.F_ADDRESSED: bool(addressed),
+                      dj.F_REASON: "проба", dj.F_SEQ: i}
     return lambda root: (rows, True, "")
 
 
@@ -1952,6 +1965,76 @@ class TestConsoleChannelCp1251(unittest.TestCase):
                 raise ValueError("нельзя")
 
         self.assertEqual(0, run.console_ready(_NoRec(), _Boom()))
+
+
+class TestLedgerAskedByName(unittest.TestCase):
+    """ЧИТАТЕЛЬ РЕЕСТРА СПРАШИВАЕТ ИМЕНЕМ (хвост задания 32-a, закрыт 11.09.2026).
+
+    Ключом реестра судьи стало ИМЯ закрытого ряда («ключ маркера плюс номер»,
+    коммит ff8b149), а сигнальный слой продолжал спрашивать ГОЛЫМ НОМЕРОМ. Отказ
+    выходил безопасным по направлению — «судья не судил» не сильнее незнания, — но
+    НЕВЕРНЫМ: семь перенесённых миграцией записей слой не находил, и доказанная
+    задача читалась как недоказанная. Сигнал А на такой паре останавливает ящик,
+    то есть цена ошибки — вставший ящик при исправной полосе.
+
+    Имя поднимает ЕДИНСТВЕННАЯ ДВЕРЬ :func:`contour_digest.row_name` — здесь она же
+    и в наборе, чтобы фикстура не развела с продуктом второй экземпляр правила.
+    """
+
+    def _row(self, tid, key=None, status="done"):
+        """Ряд ящика в той форме, в какой его отдаёт :func:`shtab_box_signals.box_rows`."""
+        return sig.box_rows([_closed(tid, status, "сдано", key=key)])[0]
+
+    def test_a_verdict_lying_under_the_name_is_found(self):
+        """ОТРИЦАТЕЛЬНЫЙ: запись под ИМЕНЕМ обязана находиться.
+
+        Падает на коде до правки: `judged_of` звался без цели, имя не собиралось,
+        и вердикт «доказана» читался как «судья не судил».
+        """
+        row = self._row(11)
+        name = cd.row_name(11, _closed(11)["task_text"])
+        self.assertEqual("k011#11", name, "имя собралось не тем правилом")
+        ledger = {name: {dj.F_PROVED: True, dj.F_ADDRESSED: True, dj.F_REASON: "проба"}}
+        ok, words = sig.proved(row, ledger)
+        self.assertTrue(ok, "запись под именем %r не найдена: %s" % (name, words))
+        self.assertEqual(cd.JUDGE_PROVED, words)
+
+    def test_the_signal_reader_carries_the_row_text_for_the_name(self):
+        """Имя собирается ИЗ САМОГО РЯДА: `box_rows` обязан донести его первую строку."""
+        row = self._row(11)
+        self.assertIn("goal", row, "ряд ящика не несёт своей первой строки — имя собирать не из чего")
+        self.assertEqual("k011#11", cd.row_name(row["id"], row.get("goal")))
+
+    # ── КОНТРОЛЬ ОБРАТНОЙ СТОРОНЫ ────────────────────────────────────────
+    def test_a_row_without_a_marker_is_still_found_by_the_number(self):
+        """Маркера нет — имени нет, и ключом остаётся НОМЕР: прежнее поведение цело.
+
+        Контроль против «починили одно, сломали другое»: правка, заменившая номер
+        именем БЕЗУСЛОВНО, потеряла бы записи безмаркерных рядов молча.
+        """
+        bare = {"id": 77, "status": "done", "result": "сдано"}
+        self.assertEqual("77", cd.row_name(77, bare.get("goal")))
+        ledger = {"77": {dj.F_PROVED: True, dj.F_ADDRESSED: True, dj.F_REASON: "проба"}}
+        ok, words = sig.proved(bare, ledger)
+        self.assertTrue(ok, "безмаркерный ряд потерял свой вердикт: %s" % words)
+
+    def test_a_row_with_no_record_at_all_still_says_the_judge_was_silent(self):
+        """Записи нет вовсе → «судья не судил». Правка не смеет родить вердикт из пустоты."""
+        row = self._row(11)
+        for empty in ({}, None, {"посторонний#1": {dj.F_PROVED: True}}):
+            ok, words = sig.proved(row, empty)
+            self.assertFalse(ok, "вердикт выдуман на реестре %r" % (empty,))
+            self.assertIn(cd.JUDGE_SILENT, words)
+
+    def test_the_old_number_key_no_longer_answers_for_a_marked_row(self):
+        """Окно перехода названо вслух: у ряда С МАРКЕРОМ номерной ключ больше не отвечает.
+
+        Это не потеря, а следствие ff8b149 (номер переиспользуется, именем не является)
+        и ровно то, что закрыла миграция реестра. Тест держит границу названной.
+        """
+        ok, words = sig.proved(self._row(11), {"11": {dj.F_PROVED: True, dj.F_ADDRESSED: True}})
+        self.assertFalse(ok, "номерной ключ ответил за именованный ряд")
+        self.assertIn(cd.JUDGE_SILENT, words)
 
 
 if __name__ == "__main__":            # pragma: no cover

@@ -737,16 +737,27 @@ def part_stuck(shtab, expects, failed, today=""):
     return out
 
 
-def part_goal(shtab, counted, today=""):
+def part_goal(shtab, counted, today="", why=""):
     """ЭТАП И КУДА ИДЁМ: слова Штаба + чем меряется рост и сколько осталось.
 
     Критерий фазы берётся у сводки (:data:`contour_digest.SERIES_TARGET`) — второе
     определение «тридцати подряд» развело бы два показа при одном источнике.
+
+    ``why`` — ПОЧЕМУ числа нет, готовыми словами от :func:`contour_digest_run.fresh_why`
+    (правка 11.09.2026, хвост задания 31-a). До неё здесь стоял один литерал на все
+    исходы — «слепок очереди не прочитан», — и при слепке, который ПРОЧИТАН и просто
+    старше предела, строка утверждала неправду и посылала чинить диск вместо вставшего
+    демона. Слова считаются ТАМ, где известен возраст и предел; своего разбора здесь
+    не заводится — он разошёлся бы с гашением числа на первой же правке порога.
+
+    Причину не подали → прежний текст: правка не роняет чужие вызовы, а величина
+    («НЕИЗВЕСТНО», а не ноль) не трогается ни одной веткой — она верна с f5dc9ab.
     """
     out = ["Штаб: %s" % shtab_words(shtab, "goal", today)]
     if not counted:
         out.append("критерий фазы: %d чистых цепочек подряд · сейчас %s"
-                   % (cd.SERIES_TARGET, number(None, "слепок очереди не прочитан")))
+                   % (cd.SERIES_TARGET,
+                      number(None, why or "слепок очереди не прочитан")))
         return out
     streak = counted.get("streak", 0)
     target = counted.get("target", cd.SERIES_TARGET)
@@ -923,7 +934,7 @@ def sections(facts, blind=True):
         "now": part_now(shtab, got.get("running"), today,
                         idle=got.get("idle"), shtab_last=got.get("shtab_last")),
         "stuck": part_stuck(shtab, got.get("expects"), got.get("failed"), today),
-        "goal": part_goal(shtab, got.get("series"), today),
+        "goal": part_goal(shtab, got.get("series"), today, why=got.get("series_why") or ""),
         "nums": part_nums(got.get("series"), got.get("shtab_taken"), today,
                           got.get("external"), got.get("awaiting"),
                           box_stop=got.get("box_stop") or "",

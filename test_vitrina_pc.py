@@ -1374,5 +1374,86 @@ class TestHealthList(unittest.TestCase):
             self.assertIn(" · чем: ", row)
 
 
+class TestStaleIsNotUnread(unittest.TestCase):
+    """ПРИЧИНА ГОВОРИТ ПРАВДУ (хвост задания 31-a, закрыт 11.09.2026).
+
+    «Слепок НЕ ПРОЧИТАН» и «слепок ПРОЧИТАН, но старше предела» — РАЗНЫЕ исходы с
+    разной починкой: первый лечат мостом и диском, второй — вставшим демоном,
+    который слепок больше не обновляет. Строка цели витрины печатала на оба один
+    текст — «слепок очереди не прочитан», — то есть при живом файле на диске
+    утверждала неправду и посылала чинить не то место.
+
+    ВЕЛИЧИНА НЕ ТРОГАЕТСЯ: слово `НЕИЗВЕСТНО` на месте в обоих исходах и было верно
+    до правки (коммит f5dc9ab). Правится РОВНО причина в скобках.
+
+    Третий исход назван отдельно и не слит с протуханием: возраст не сверить — это
+    не «стар», а «сказать нечем» (тот же закон, что у :func:`contour_digest.stale`).
+    """
+
+    LIMIT = 3600.0
+
+    def _why(self, data, read_at, now=NOW):
+        return cdr.fresh_why(data, read_at, now, "queue")
+
+    def _goal_line(self, why):
+        rows = vp.part_goal({"ok": False, "why": "нет"}, None, DAY, why=why)
+        got = [r for r in rows if "критерий фазы" in r]
+        self.assertEqual(1, len(got), "строка цели не одна: %r" % (rows,))
+        return got[0]
+
+    # ── ОТРИЦАТЕЛЬНЫЙ: два входа — два разных слова ──────────────────────
+    def test_stale_and_unread_are_not_the_same_words(self):
+        """Падает до правки: оба входа давали дословно одну строку."""
+        unread = self._goal_line(self._why(None, None))
+        stale = self._goal_line(self._why({"open": {}, "closed": {}}, NOW - self.LIMIT - 60.0))
+        self.assertNotEqual(unread, stale,
+                            "два разных исхода напечатаны одной причиной: %r" % unread)
+        self.assertIn("не прочитан", unread)
+        self.assertNotIn("не прочитан", stale,
+                         "прочитанный слепок назван непрочитанным: %r" % stale)
+        self.assertIn("старше предела", stale)
+
+    def test_the_stale_line_names_the_limit_it_was_judged_by(self):
+        """Предел берётся ТАМ, ГДЕ НАЗВАН, — второго экземпляра числа не заводится."""
+        stale = self._goal_line(self._why({"closed": {}}, NOW - self.LIMIT - 60.0))
+        self.assertIn(str(int(cd.limit_of("queue"))), stale)
+
+    def test_the_third_outcome_is_its_own_words(self):
+        """Возраст не сверить → своё слово, а не «стар» и не «не прочитан»."""
+        blind = self._goal_line(self._why({"closed": {}}, None))
+        self.assertNotIn("старше предела", blind)
+        self.assertNotIn("не прочитан", blind)
+        self.assertIn("возраст", blind)
+
+    # ── КОНТРОЛЬ: показ величины не тронут ───────────────────────────────
+    def test_the_shown_value_is_still_the_word_not_a_zero(self):
+        """Во всех трёх исходах стои́т НЕИЗВЕСТНО — ровно как поставил f5dc9ab."""
+        for why in (self._why(None, None),
+                    self._why({"closed": {}}, NOW - self.LIMIT - 60.0),
+                    self._why({"closed": {}}, None)):
+            line = self._goal_line(why)
+            self.assertIn(vp.UNKNOWN, line)
+            self.assertNotIn("сейчас 0", line, "незнание подменено нулём: %r" % line)
+
+    def test_a_fresh_snapshot_says_nothing_and_the_count_is_printed(self):
+        """ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ: свежий слепок — причины нет, печатается ЧИСЛО."""
+        self.assertEqual("", self._why({"closed": {}}, NOW - 10.0))
+        line = [r for r in vp.part_goal({"ok": False, "why": "нет"}, {"streak": 4, "target": 30}, DAY)
+                if "критерий фазы" in r][0]
+        self.assertIn("сейчас 4", line)
+        self.assertNotIn(vp.UNKNOWN, line)
+
+    def test_the_default_keeps_the_old_words_for_callers_that_say_nothing(self):
+        """Причину не подали — прежний текст: правка не роняет чужие вызовы."""
+        self.assertIn("слепок очереди не прочитан", self._goal_line(""))
+
+    def test_the_reason_reaches_the_goal_line_through_the_whole_vitrina(self):
+        """Дверь доезжает ДО ТЕКСТА: причина, положенная в факты, видна в витрине."""
+        facts = _dead_facts()
+        facts["series_why"] = self._why({"closed": {}}, NOW - self.LIMIT - 60.0)
+        text = vp.render(facts, "2026-09-11 12:40 UTC")
+        self.assertIn("старше предела", text)
+
+
 if __name__ == "__main__":            # pragma: no cover
     unittest.main(verbosity=2)
