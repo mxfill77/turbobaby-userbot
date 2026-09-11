@@ -9539,5 +9539,218 @@ class TestMinTermGuarantee(unittest.TestCase):
         self.assertEqual(suggest.client_facing_text(once).count("от 5 дней"), 1)
 
 
+class TestPricePromiseGuarantee(unittest.TestCase):
+    """ОБЕЩАНИЕ «УТОЧНЮ И ВЕРНУСЬ» — ГАРАНТИЯ КОДА (12.09.2026).
+
+    До этой правки обещание держалось УСЕРДИЕМ ГОЛОВЫ: тёмная ценовая записка ПРОСИТ «ответь, что
+    уточнишь цену и вернёшься», а ни одна строка сборки этого не дописывала (разбор —
+    `docs/artifacts/2026-09-11-ЗОНД-pyat-sborok-1109.md`, §6). Цена просьбы мерена на соседнем
+    классе: ≈14 % красных кругов на побайтно одном промпте (кейс 10, замер 06.09).
+    Здесь проверяется, что теперь обещание доносит КОД — и что он при этом НЕ ЛОМАЕТ обратный
+    случай: резак `drop_price_deflection`, снимающий обещание при ПОСЧИТАННОЙ цене, остаётся живым,
+    и спорить им нечем ни в одном порядке вызова."""
+
+    # Тёмная записка ДОСЛОВНО той формы, что печатает `_resolve_model_price` веткой noprice/error —
+    # ровно она наблюдалась в живом тёмном круге кейса 8 11.09 (ЗОНД pyat-sborok, премиса П1).
+    DARK = ("ЦЕНА: точная цена из Календаря сейчас недоступна — НЕ называй никакого числа "
+            "(в т.ч. из FAQ); ответь, что уточнишь цену и вернёшься.")
+    # Черновик тёмного круга БЕЗ обещания — тот класс ответа, который правка закрывает.
+    MUTE = "Здравствуйте! Учли — XMAX 300 на 6–11 октября. Байк свободен. Бронируем?"
+    MUTE_EN = "Hi! Noted — XMAX 300 for Oct 6–11. The bike is available. Shall we book?"
+
+    def _ok_note(self):
+        """Записка с ПОСЧИТАННОЙ ценой — тем же построением, что голдены резака выше."""
+        return (suggest._quote_marker_note() + "\n" + suggest._QUOTE_OPEN +
+                "\nXMAX 300 (New Gen) — за 5 дней 4500 ฿; депозит 5000 ฿.\n" + suggest._QUOTE_CLOSE)
+
+    # ── п.3: формулировки БЕРУТСЯ ГОТОВЫЕ, а не сочиняются ───────────────────────────────────
+    def test_stroki_vzjaty_iz_strahovki_i_ih_rovno_dve(self):
+        self.assertEqual(sorted(suggest.PRICE_PROMISE_LINES), ["en", "ru"])
+        self.assertEqual(suggest.price_promise_line("ru"), "Уточню у команды и вернусь.")
+        self.assertEqual(suggest.price_promise_line("en"),
+                         "Let me check with the team and get back to you.")
+        # неизвестный язык → RU: прежнее поведение пост-чека (там язык проверялся равенством 'en')
+        self.assertEqual(suggest.price_promise_line("th"), suggest.price_promise_line("ru"))
+
+    def test_postchek_i_garantija_govorjat_odno_i_to_zhe(self):
+        """Одна пара строк на всю сборку: если пост-чек и гарантия разойдутся текстом, у клиента
+        появится ВТОРАЯ формулировка — а их заводить нельзя. Судим по живому пост-чеку."""
+        draft = "XMAX 300 стоит 9999 ฿ за 5 дней."          # число вне белого списка → перепишет
+        out = suggest.postcheck_draft(draft, "ru", pricing_note=self.DARK)
+        self.assertIn(suggest.price_promise_line("ru"), out)
+        out_en = suggest.postcheck_draft("XMAX 300 costs 9999 THB for 5 days.", "en",
+                                         pricing_note=self.DARK)
+        self.assertIn(suggest.price_promise_line("en"), out_en)
+
+    # ── п.6(а): записка без цены, черновик без обещания → обещание ПОЯВЛЯЕТСЯ ────────────────
+    def test_molchanie_ob_obeshchanii_zakryvaet_kod(self):
+        out = suggest.ensure_price_promise(self.MUTE, self.DARK, "ru")
+        client = suggest.client_facing_text(out)
+        self.assertIn("Уточню у команды и вернусь.", client)
+        self.assertTrue(suggest.price_promise_said(client))
+        self.assertTrue(out.startswith(self.MUTE))          # чужой текст не переписан ни словом
+
+    # ── п.6(б): обещание ОДНО, не два ────────────────────────────────────────────────────────
+    def test_golova_skazala_sama_vhod_bait_v_bait(self):
+        said = "Учли — XMAX 300 на 6–11 октября. Уточню цену на эти даты и вернусь. Бронируем?"
+        self.assertEqual(suggest.ensure_price_promise(said, self.DARK, "ru"), said)
+
+    def test_zhivaja_fraza_kejsa_8_vtorogo_obeshchanija_ne_poluchaet(self):
+        """ПОРОГ ШИРОТЫ ДЕТЕКТОРА МЕРЕН ЖИВЫМ ТЕКСТОМ, а не вкусом: узкий `_DEFLECT_RE` резака эту
+        фразу НЕ ловит (между «get» и «back» стои́т «right»), и на ней дописыватель поставил бы
+        второе обещание. Проверяем оба утверждения — иначе тест зеленел бы на чём угодно."""
+        live = ("Noted — XMAX 300 for Oct 6–11. Let me check the exact price for those dates "
+                "and get right back to you.")
+        self.assertIsNone(suggest._DEFLECT_RE.search("get right back to you"))
+        self.assertTrue(suggest.price_promise_said(live))
+        self.assertEqual(suggest.ensure_price_promise(live, self.DARK, "en"), live)
+
+    # ── п.6(в): записка С ценой → обещание НЕ дописано ───────────────────────────────────────
+    def test_cena_poschitana_obeshchanie_ne_dopisyvaetsja(self):
+        note = self._ok_note()
+        draft = ("Учли — XMAX 300, 25–30 июля.\n\n"
+                 "XMAX 300 (New Gen) — за 5 дней 4500 ฿; депозит 5000 ฿.")
+        self.assertFalse(suggest.price_promise_due(note))
+        self.assertEqual(suggest.ensure_price_promise(draft, note, "ru"), draft)
+        self.assertEqual(suggest.ensure_price_promise(draft, note, "en"), draft)
+
+    # ── п.6(г): английская дорога ────────────────────────────────────────────────────────────
+    def test_en_vetka_govorit_po_anglijski(self):
+        out = suggest.ensure_price_promise(self.MUTE_EN, self.DARK, "en")
+        client = suggest.client_facing_text(out)
+        self.assertIn("Let me check with the team and get back to you.", client)
+        self.assertNotIn("Уточню", client)
+
+    # ── п.4: решение по ЗАПИСКЕ, а не по тексту, который система напечатала сама ──────────────
+    def test_reshenie_prinimaet_zapiska_a_ne_tekst_otveta(self):
+        """Голова НАПИСАЛА число и слова «цена посчитана» — а записка тёмная. Событие «цену
+        посчитали» этим не наступило: цифра в таком ответе взята из головы, и гарантия обязана
+        дописать обещание, а не поверить тексту. Признак, поднимаемый написанием слов вместо
+        совершения события, запрещён заданием прямо."""
+        bragging = "Учли — XMAX 300. Цена посчитана: 4500 ฿ за 5 дней. Бронируем?"
+        self.assertTrue(suggest.price_promise_due(self.DARK))
+        out = suggest.ensure_price_promise(bragging, self.DARK, "ru")
+        self.assertIn("Уточню у команды и вернусь.", suggest.client_facing_text(out))
+
+    def test_vetki_gde_obeshchat_ne_k_mestu_molchat(self):
+        """Замок от лишнего обещания: не всякая записка без цены просит обещания. «Дат в диалоге
+        НЕТ» и «клиент назвал серию» просят ответа У КЛИЕНТА — «вернусь» там не к месту."""
+        no_dates = ("ЦЕНА: дат аренды в диалоге НЕТ — попроси у клиента даты (начало/конец) и "
+                    "срок. НЕ называй НИКАКУЮ цену. Цену назовём только после дат, из Календаря.")
+        series = ("ЦЕНА: клиент назвал серию (XSR), а в парке несколько вариантов (XSR155, "
+                  "XSR900) с РАЗНОЙ ценой/классом — НЕ называй никакого числа; уточни у клиента, "
+                  "какая именно модель нужна, и назови цену уже после уточнения.")
+        for note in (no_dates, series, ""):
+            self.assertFalse(suggest.price_promise_due(note), note[:40])
+            self.assertEqual(suggest.ensure_price_promise(self.MUTE, note, "ru"), self.MUTE)
+        self.assertEqual(suggest.ensure_price_promise("", self.DARK, "ru"), "")
+
+    def test_sluzhebnaja_pometka_ostajotsja_hvostom(self):
+        draft = self.MUTE + "\n[уточнить: цена]"
+        out = suggest.ensure_price_promise(draft, self.DARK, "ru")
+        self.assertTrue(out.rstrip().endswith("[уточнить: цена]"))
+        self.assertIn("Уточню у команды и вернусь.", suggest.client_facing_text(out))
+
+    def test_garantija_idempotentna(self):
+        once = suggest.ensure_price_promise(self.MUTE, self.DARK, "ru")
+        twice = suggest.ensure_price_promise(once, self.DARK, "ru")
+        self.assertEqual(twice, once)
+        self.assertEqual(suggest.client_facing_text(once).count("Уточню у команды и вернусь."), 1)
+        once_en = suggest.ensure_price_promise(self.MUTE_EN, self.DARK, "en")
+        self.assertEqual(suggest.ensure_price_promise(once_en, self.DARK, "en"), once_en)
+
+    # ── п.5: НЕ ЛОМАТЬ ОБРАТНЫЙ СЛУЧАЙ ──────────────────────────────────────────────────────
+    def test_rezak_ostalsja_rabochim(self):
+        """Резак обещания при ГОТОВОМ расчёте обязан работать как до правки — на своём же голдене."""
+        note = self._ok_note()
+        draft = ("Отлично, даты учли — XMAX 300, 25–30 июля, 5 дней. "
+                 "Уточню наличие на эти даты и вернусь с точной стоимостью.\n\n"
+                 "XMAX 300 (New Gen) — за 5 дней 4500 ฿; депозит 5000 ฿.")
+        out = suggest.ensure_price_promise(suggest.drop_price_deflection(draft, note, "ru"),
+                                           note, "ru")
+        low = suggest.client_facing_text(out).lower()
+        self.assertNotIn("вернусь", low)                    # обещание снято и НЕ дописано обратно
+        self.assertIn("4500", out)                          # сама цена уцелела
+        self.assertIn("даты учли", out)
+
+    def test_rezak_i_dopisyvatel_ne_sporjat(self):
+        """ОБЩИЙ ВЕНТИЛЬ, ЧИТАЕМЫЙ В ПРОТИВОПОЛОЖНЫХ ЗНАКАХ: резак живёт при НЕПУСТОМ множестве
+        посчитанных цифр, дописыватель — при ПУСТОМ, значит оба на одной записке не срабатывают
+        никогда и ПОРЯДОК исхода не меняет. Проверяем обоими порядками на всех фикстурах, а не
+        рассуждением."""
+        ok = self._ok_note()
+        fixtures = [
+            (self.MUTE, self.DARK, "ru"),
+            (self.MUTE_EN, self.DARK, "en"),
+            ("Уточню наличие на эти даты и вернусь с точной стоимостью.", self.DARK, "ru"),
+            ("Учли — XMAX 300, 25–30 июля. Уточню и вернусь.\n\nXMAX 300 (New Gen) — за 5 дней "
+             "4500 ฿; депозит 5000 ฿.", ok, "ru"),
+            (self.MUTE, ok, "ru"),
+        ]
+        for draft, note, lang in fixtures:
+            prod = suggest.ensure_price_promise(
+                suggest.drop_price_deflection(draft, note, lang), note, lang)
+            swap = suggest.drop_price_deflection(
+                suggest.ensure_price_promise(draft, note, lang), note, lang)
+            self.assertEqual(prod, swap, "порядок резак/дописыватель изменил исход: %r" % draft[:40])
+            # «оба сработали» невозможно по построению: вентили противоположны
+            self.assertFalse(bool(suggest.computed_price_figures(note))
+                             and suggest.price_promise_due(note))
+
+    def test_vzaimoiskljuchajushchie_venteli(self):
+        """Тот же инвариант — прямо на вентилях, без текста: `price_promise_due` не бывает True
+        одновременно с непустым `computed_price_figures`."""
+        for note in (self.DARK, self._ok_note(), "", "ЦЕНА: дат аренды в диалоге НЕТ"):
+            if suggest.price_promise_due(note):
+                self.assertEqual(suggest.computed_price_figures(note), set())
+
+    # ── откат ────────────────────────────────────────────────────────────────────────────────
+    def test_kontrfakt_snjataja_garantija_vozvrashchaet_prezhnee(self):
+        """КОНТРФАКТ: рубильник `PRICE_PROMISE_GUARANTEE_OFF=1` возвращает ПРЕЖНЕЕ поведение на том
+        же входе. Без него доказано лишь то, что ответ вообще бывает."""
+        prev = os.environ.get("PRICE_PROMISE_GUARANTEE_OFF")
+        try:
+            os.environ["PRICE_PROMISE_GUARANTEE_OFF"] = "1"
+            self.assertEqual(suggest.ensure_price_promise(self.MUTE, self.DARK, "ru"), self.MUTE)
+            os.environ["PRICE_PROMISE_GUARANTEE_OFF"] = "0"
+            self.assertNotEqual(suggest.ensure_price_promise(self.MUTE, self.DARK, "ru"), self.MUTE)
+        finally:
+            if prev is None:
+                os.environ.pop("PRICE_PROMISE_GUARANTEE_OFF", None)
+            else:
+                os.environ["PRICE_PROMISE_GUARANTEE_OFF"] = prev
+
+    # ── место в пайплайнах ───────────────────────────────────────────────────────────────────
+    def test_garantija_stoit_v_OBOIH_paiplainah(self):
+        """«Класс-фикс — сразу на обе полосы»: и generate_draft, и strategy-перегенерация, по два
+        вызова в каждой (ранний + пояс). Судим ПО ТЕКСТУ файла."""
+        with open(suggest.__file__, encoding="utf-8") as f:
+            src = f.read()
+        self.assertEqual(src.count("ensure_price_promise(out, pricing_note, lang)"), 4,
+                         "гарантия обещания стои́т не по два раза в обоих пайплайнах")
+
+    def test_pojas_stoit_POSLE_rezhushchih_shagov(self):
+        """МЕСТО ПОЯСА — не вкусовщина, а тот же живой класс, что у минимального срока 06.09:
+        `drop_answered_questions` + `ensure_closing_question` вдвоём съедают правильный абзац
+        головы. Отсюда два инварианта позиции, оба по тексту функций."""
+        with open(suggest.__file__, encoding="utf-8") as f:
+            src = f.read()
+        bodies = {
+            "generate_draft": src[src.index("def generate_draft("):src.index("def regenerate_draft(")],
+            "regenerate_draft": src[src.index("def regenerate_draft("):src.index("_SMOKE_MONTHS_GEN")],
+        }
+        for name, body in bodies.items():
+            cutter = body.rindex("drop_answered_questions(out, facts, lang)")
+            first = body.index("ensure_price_promise(out, pricing_note, lang)")
+            last = body.rindex("ensure_price_promise(out, pricing_note, lang)")
+            self.assertGreater(first, cutter,
+                               "%s: гарантия зовётся ДО резака вопросов — обещание съедят" % name)
+            self.assertGreater(last, body.rindex("ensure_closing_question(out, facts, lang"),
+                               "%s: пояс стои́т раньше сборки закрывающего вопроса" % name)
+            # пояс обещания стои́т ПОЗЖЕ резака обещания на обеих дорогах (живой порядок прода)
+            self.assertGreater(last, body.rindex("drop_price_deflection(out, pricing_note, lang)"),
+                               "%s: пояс обещания раньше резака обещания" % name)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
