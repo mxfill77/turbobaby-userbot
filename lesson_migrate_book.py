@@ -290,6 +290,57 @@ def read_back(path=None):
 
 
 # ---------------------------------------------------------------------------------------
+# ПРОСТАВИТЬ ИСТОЧНИК УЖЕ ЛЕЖАЩИМ СТРОКАМ ПЕРЕНОСА (11.09.2026)
+# ---------------------------------------------------------------------------------------
+# ЗАЧЕМ ЭТО ЗДЕСЬ, А НЕ В ХРАНИЛИЩЕ. Девять строк легли 06.09, когда графы источника ещё не
+# существовало, и потому читаются как «источник неизвестен» — то есть разрез `источник` и откат
+# набора снимают на них НОЛЬ строк. Проставить источник может только тот, кто ДОКАЗЫВАЕТ
+# происхождение, а доказательство живёт ровно здесь: эти строки положил ЭТОТ модуль и оставил на
+# них СВОИ литералы. Хранилище номера принимает, но ничьего происхождения не угадывает.
+#
+# ПРИЗНАК — ДВА ЛИТЕРАЛА СРАЗУ, а не один. `MIGRATION_WHY` — служебная причина, `MIGRATION_WHO` —
+# автор переноса; вместе их не ставит ни одна другая дорога записи (тренажёр кладёт причину
+# владельца и автором самого владельца-оператора). Одного признака мало: причину «перенос 05.09»
+# теоретически может вписать человек руками, и тогда источник уехал бы к строке, которой этот
+# модуль не клал. Совпали ОБА — это СОБЫТИЕ переноса, а не сходство.
+#
+# ТРЕТИЙ ИСХОД НАЗВАН И НЕ СХЛОПНУТ: строка, не несущая обоих литералов, попадает в `unknown` и
+# источника НЕ получает. Догадка здесь была бы хуже пустоты — она положила бы чужую строку в
+# набор, который однажды снимут целиком.
+StampPlan = namedtuple("StampPlan", "numbers unknown total say")
+
+
+def book_rows(path=None):
+    """Строки таблицы, про которые ДОКАЗАНО, что их положил перенос книги. → StampPlan.
+
+    Чистое чтение: файла не трогает. Уже помеченные источником сюда тоже входят — отсеет их
+    `lesson_store.set_source`, и отсеет СЧИТАЯ, а не молча."""
+    numbers, unknown, total = [], [], 0
+    for les in lesson_store.load(path).lessons:
+        total += 1
+        if (les.why.strip() == MIGRATION_WHY
+                and lesson_store.norm_who(les.who) == lesson_store.norm_who(MIGRATION_WHO)):
+            numbers.append(les.number)
+        else:
+            unknown.append(les.number)
+    return StampPlan(tuple(numbers), tuple(unknown), total,
+                     "строк в таблице %d; происхождение ДОКАЗАНО у %d (оба литерала переноса: "
+                     "причина «%s» и автор «%s»); у %d происхождение НЕИЗВЕСТНО — источник им не "
+                     "ставится" % (total, len(numbers), MIGRATION_WHY, MIGRATION_WHO,
+                                   len(unknown)))
+
+
+def stamp_source(path=None, apply=False):
+    """Проставить доказанным строкам источник `перенос_книги`. → (StampPlan, SetSourceResult|None).
+
+    `apply=False` (по умолчанию) — план числами, в таблицу НЕ пишется ни байта."""
+    plan = book_rows(path)
+    if not apply or not plan.numbers:
+        return plan, None
+    return plan, lesson_store.set_source(plan.numbers, MIGRATION_SOURCE, path=path)
+
+
+# ---------------------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------------------
 def main(argv=None):
@@ -297,8 +348,24 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="перенос книги правил в базу уроков")
     ap.add_argument("--dry", action="store_true", help="план числами, НИЧЕГО не пишет (умолчание)")
     ap.add_argument("--apply", action="store_true", help="выполнить перенос")
+    ap.add_argument("--stamp-source", action="store_true",
+                    help="проставить источник УЖЕ ЛЕЖАЩИМ строкам переноса (с --apply — записать)")
     ap.add_argument("--path", help="другой файл таблицы уроков")
     args = ap.parse_args(sys.argv[1:] if argv is None else argv)
+
+    if args.stamp_source:
+        plan, res = stamp_source(args.path, apply=bool(args.apply))
+        print(plan.say)
+        if res is None:
+            print("это СУХОЙ прогон: в таблицу не записано ни байта (нужен --apply)")
+        else:
+            print("источник «%s» проставлен: строк %d; уже несли источник %d; названных, но не "
+                  "найденных %d; физических строк до %d, после %d"
+                  % (res.source, res.stamped, res.already, len(res.missing),
+                     res.lines_before, res.lines_after))
+        got = lesson_store.version(args.path)
+        print("версия базы: %s" % got.say)
+        return 0
 
     snap = latest_snapshot()
     print("снимок: %s" % snap.say)
