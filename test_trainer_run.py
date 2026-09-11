@@ -1792,5 +1792,105 @@ class PustoeOzhidanie(unittest.TestCase):
         self.assertIn("quote-блок: НЕТ", md)
 
 
+class TestPodborOdnaModelChekKorpusa(unittest.TestCase):
+    """ЧЕК, КОТОРЫЙ СУДИТ СЛОВО ВЛАДЕЛЬЦА 12.09.2026 («только про спрошенную модель и одну-две
+    альтернативы»). Предмет — QUOTE-БЛОК ЗАПИСКИ: строки в него вставляет КОД, и правило говорит
+    ровно о том, сколько моделей код посчитал и подал. Текст головы предметом быть не может —
+    пересказ блока своими словами краснил бы здоровый ответ.
+
+    ОТРИЦАТЕЛЬНЫЙ ТЕСТ ЧИСЛОМ (требование задания). Фикстура `NOTE_10` — ДОСЛОВНАЯ записка из
+    снимка `exam_shots/case-1.json`, собранного 11.09.2026 на коммите 1c2ccee: спрошен XMAX 300
+    (макси-скутер), в блоке ДЕСЯТЬ моделей, из них семь мотоциклов. На ней:
+      • НАБОР ЧЕКОВ БЕЗ НОВОГО ОЖИДАНИЯ — зелёный ЦЕЛИКОМ (это и есть «прошёл 12 из 12» 11.09);
+      • тот же набор С ожиданием `one_model` — КРАСНЫЙ ровно одним чеком, новым.
+    На записке с тремя моделями (спрошенная + две альтернативы) чек зелёный в обоих наборах."""
+
+    HEAD = ("ЦЕНА из Календаря бронирования ПОСЧИТАНА по НЕСКОЛЬКИМ моделям: первой в блоке идёт "
+            "та, что спросил клиент.\n")
+    LINES_10 = [
+        "XMAX 300 New Gen — 682 ฿/день; итого 3410 ฿; депозит: паспорт; свободен на эти даты.",
+        "ADV 350 — 634 ฿/день; итого 3170 ฿; депозит: паспорт; свободен на эти даты.",
+        "FORZA 300 — 502 ฿/день; итого 2510 ฿; депозит: паспорт; свободен на эти даты.",
+        "XSR 155 — 457 ฿/день; итого 2285 ฿; депозит: паспорт; свободен на эти даты.",
+        "CBR 650R — 1486 ฿/день; итого 7430 ฿; депозит: паспорт; свободен на эти даты.",
+        "CB 650R — 1486 ฿/день; итого 7430 ฿; депозит: паспорт; свободен на эти даты.",
+        "CB 300R — 656 ฿/день; итого 3280 ฿; депозит: паспорт; свободен на эти даты.",
+        "MT-03 — 745 ฿/день; итого 3725 ฿; депозит: паспорт; свободен на эти даты.",
+        "NINJA 400 — 1179 ฿/день; итого 5895 ฿; депозит: паспорт; свободен на эти даты.",
+        "VULCAN 650S — 1100 ฿/день; итого 5500 ฿; депозит: паспорт; свободен на эти даты.",
+    ]
+    CASE = {"id": 1, "lang": "ru", "expect": {"quote": True, "price_figure": True},
+            "_transcript": "[клиент]: Здравствуйте! Хочу XMAX 300 с 6 по 11 октября"}
+    CHECK = "подбор: спрошенная первая, альтернатив не больше двух"
+
+    def _note(self, lines):
+        return (self.HEAD + suggest._QUOTE_OPEN + "\n" + "\n".join(lines) + "\n"
+                + suggest._QUOTE_CLOSE)
+
+    def _draft(self, lines):
+        return "Здравствуйте! Вот что можем предложить на эти даты:\n" + "\n".join(lines)
+
+    def _checks(self, lines, one_model=None):
+        case = dict(self.CASE)
+        if one_model:
+            case["expect"] = dict(case["expect"], one_model=one_model)
+        note = self._note(lines)
+        exp = tr.expectations(case, case["_transcript"], note,
+                              {"model": "XMAX 300", "has_dates": True})
+        return {c["name"]: c for c in tr.case_checks(case, self._draft(lines), exp)}
+
+    def test_desyat_modelei_do_pravki_zelyono_posle_krasno(self):
+        before = self._checks(self.LINES_10)
+        red_before = [n for n, c in before.items() if not c["ok"]]
+        self.assertEqual(red_before, [], "набор БЕЗ нового ожидания обязан быть зелёным на десяти "
+                                         "моделях — иначе отрицательный тест меряет чужой чек")
+        self.assertNotIn(self.CHECK, before, "без one_model чека не существует вовсе")
+        after = self._checks(self.LINES_10, one_model="XMAX 300")
+        self.assertFalse(after[self.CHECK]["ok"], "десять моделей прошли новый чек")
+        self.assertIn("моделей 10", after[self.CHECK]["fact"])
+        red_after = [n for n, c in after.items() if not c["ok"]]
+        self.assertEqual(red_after, [self.CHECK], "покраснел не только новый чек: %s" % red_after)
+
+    def test_tri_modeli_zelyono_i_do_i_posle(self):
+        three = self.LINES_10[:3]
+        self.assertEqual([n for n, c in self._checks(three).items() if not c["ok"]], [])
+        after = self._checks(three, one_model="XMAX 300")
+        self.assertTrue(after[self.CHECK]["ok"], after[self.CHECK]["fact"])
+        self.assertEqual([n for n, c in after.items() if not c["ok"]], [])
+
+    def test_pervaya_ne_sproshennaya_krasnit_dazhe_na_dvuh(self):
+        """Не только ЧИСЛО: спрошенная обязана быть ПЕРВОЙ. Две модели, но первая чужая — красно."""
+        by = self._checks(self.LINES_10[1:3], one_model="XMAX 300")
+        self.assertFalse(by[self.CHECK]["ok"])
+        self.assertIn("ПЕРВАЯ НЕ СПРОШЕННАЯ", by[self.CHECK]["fact"])
+
+    def test_bez_quote_bloka_ishod_neizvesten_a_ne_zelyon(self):
+        """Записки нет — судить НЕЧЕМ. Третий исход, а не зелёное (правило класса `no_basis`)."""
+        case = dict(self.CASE, expect=dict(self.CASE["expect"], one_model="XMAX 300"))
+        exp = tr.expectations(case, case["_transcript"], "ЦЕНА: уточню и вернусь",
+                              {"model": "XMAX 300", "has_dates": True})
+        by = {c["name"]: c for c in tr.case_checks(case, "Уточню и вернусь.", exp)}
+        self.assertTrue(by[self.CHECK].get("unknown"), "пустая записка дала вердикт вместо «нечем»")
+
+    def test_imena_modelei_beryotsya_iz_bloka_a_ne_iz_prozy(self):
+        """`quote_models` читает ОБА формата строк кода и не считает моделью служебную строку."""
+        self.assertEqual(tr.quote_models("\n".join(self.LINES_10[:2])),
+                         ["XMAX 300 New Gen", "ADV 350"])
+        self.assertEqual(tr.quote_models("- NMAX 155: 307 ฿/день; итого 1535 ฿."), ["NMAX 155"])
+        self.assertEqual(tr.quote_models(""), [])
+        self.assertEqual(tr.quote_models("цена и депозит указаны ЗА КАЖДЫЙ юнит"), [])
+
+    def test_fikstura_doslovna_zhivomu_snimku_1109(self):
+        """Литерал теста — ДОСЛОВНАЯ копия живой записки, а не пересказ. Снимка нет на диске —
+        исход НЕИЗВЕСТНО (тест пропущен), а не тихое «сошлось»."""
+        path = os.path.join(REPO, "exam_shots", "case-1.json")
+        if not os.path.exists(path):
+            self.skipTest("снимка 11.09 нет на диске — сверять литерал не с чем")
+        with io.open(path, encoding="utf-8") as f:
+            shot = json.load(f)
+        live = suggest._quote_block_from_note(shot.get("note") or "")
+        self.assertEqual([ln for ln in (live or "").split("\n") if ln.strip()], self.LINES_10)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

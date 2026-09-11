@@ -113,18 +113,67 @@ def find_case(case_id, cases=None):
     return None, len(cases)
 
 
-def shot_path(case_id):
-    return os.path.join(SHOTS_DIR, "case-%s.json" % case_id)
+# ── ДВА СЛОТА ОДНОГО КЕЙСА: снимок ключуется КОММИТОМ СБОРКИ (заведено 12.09.2026) ──────────
+# ЗАЧЕМ. До этого дня у кейса был РОВНО ОДИН файл `case-N.json`, и `freeze` отказывался его
+# трогать («перезаписи нет по построению»). Правило верное — вердикт владельца привязан к тексту,
+# и молча подменять текст нельзя. Но у него был второй, незамеченный эффект: после ПРАВКИ КОДА
+# показать кейс на новом коде стало невозможно вовсе — единственный слот занят снимком старого.
+# Развязка: слот ключуется коммитом. Снимок старого кода остаётся на диске НЕТРОНУТЫМ, снимок
+# нового ложится рядом, показ берёт НОВЕЙШИЙ и печатает его коммит в карточке (он там и так был).
+# Отказ от перезаписи при этом цел: слот одного и того же коммита второй раз не собирается.
+
+LEGACY_SHOT = "case-%s.json"                    # слот до 12.09.2026 — читается, но не пишется
+SLOT_SHOT = "case-%s@%s.json"                   # слот, ключуемый коммитом сборки
+
+
+def shot_path(case_id, commit=None):
+    """Путь слота. Без коммита — ПРЕЖНЕЕ имя (`case-N.json`): по нему читаются снимки,
+    собранные до 12.09.2026, и на него по-прежнему смотрят вызывающие, которым нужен «тот самый
+    файл». С коммитом — слот этого коммита."""
+    if commit:
+        return os.path.join(SHOTS_DIR, SLOT_SHOT % (case_id, commit))
+    return os.path.join(SHOTS_DIR, LEGACY_SHOT % case_id)
+
+
+def shot_slots(case_id):
+    """ВСЕ слоты кейса на диске, НОВЕЙШИЙ ПЕРВЫМ. → list[(путь, shot)].
+
+    Порядок — по `built_at` снимка, а не по mtime файла: mtime меняет любое касание диска (копия,
+    git checkout, антивирус), а момент сборки записан внутри и принадлежит самому тексту. Снимок
+    без `built_at` уходит в конец: неизвестный возраст не смеет выиграть у известного."""
+    out = []
+    try:
+        names = sorted(os.listdir(SHOTS_DIR))
+    except OSError:
+        return out
+    head, tail = LEGACY_SHOT % case_id, "case-%s@" % case_id
+    for name in names:
+        if name != head and not (name.startswith(tail) and name.endswith(".json")):
+            continue
+        path = os.path.join(SHOTS_DIR, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                shot = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(shot, dict):
+            out.append((path, shot))
+    out.sort(key=lambda p: str(p[1].get("built_at") or ""), reverse=True)
+    return out
 
 
 def shot_ref(case_id):
     """Ссылка на черновик ДЛЯ ЖУРНАЛА: путь от корня репо, а с чужого диска — как есть.
 
+    Ссылается на ТОТ слот, который показан (новейший), а не на имя кейса вообще: вердикт владельца
+    относится к конкретному тексту, и строка журнала обязана вести к нему.
+
     `os.path.relpath` на Windows БРОСАЕТ `ValueError`, когда цель и корень на разных томах
     (`path is on mount 'C:', start on mount 'D:'`) — поймано своим же набором, когда каталог
     черновиков подменили на временный в `%TEMP%`. Падение здесь стоило бы вердикта владельца:
     исключение прилетело бы ПОСЛЕ проверки права и слова, то есть на самом последнем шаге."""
-    p = shot_path(case_id)
+    slots = shot_slots(case_id)
+    p = slots[0][0] if slots else shot_path(case_id)
     try:
         return os.path.relpath(p, REPO)
     except ValueError:
@@ -132,13 +181,9 @@ def shot_ref(case_id):
 
 
 def load_shot(case_id):
-    try:
-        with open(shot_path(case_id), encoding="utf-8") as f:
-            return json.load(f)
-    except OSError:
-        return None
-    except ValueError:
-        return None
+    """НОВЕЙШИЙ снимок кейса из всех слотов | None. Слотов нет — None (это не ошибка)."""
+    slots = shot_slots(case_id)
+    return slots[0][1] if slots else None
 
 
 def question_of(case):
@@ -169,8 +214,11 @@ def reason_line(shot, limit=220):
 def freeze(case_id, cases_path=None, runner=None, now=None, ph=None):
     """Собрать черновик кейса ОДИН раз и положить на диск. → (ok, путь|причина, shot|None).
 
-    ЕДИНСТВЕННАЯ ветка модуля, зовущая голову. Уже лежащий черновик НЕ перезаписывается: иначе
-    «покажи ещё раз» молча меняло бы судимый текст — ровно то, от чего модуль и заведён.
+    ЕДИНСТВЕННАЯ ветка модуля, зовущая голову. Уже лежащий черновик НЕ перезаписывается НИ ОДНОЙ
+    веткой: иначе «покажи ещё раз» молча меняло бы судимый текст — ровно то, от чего модуль и
+    заведён. Отказ считается ПО КОММИТУ (12.09.2026): слот этого коммита уже собран — второй раз
+    голову не зовём; коммит другой — это ДРУГОЙ ПРОДУКТ, и ему положен свой слот рядом со старым.
+    Старые слоты не трогаются и не удаляются никогда.
 
     ОКНО ДАТ (`ph`) БЕРЁТСЯ ОДИН РАЗ И ИДЁТ В ОБА МЕСТА — голове (через `run_case`) и в записанный
     вопрос (через `trainer_run.substitute`). Два отдельных вызова `placeholders()` разъехались бы
@@ -183,9 +231,12 @@ def freeze(case_id, cases_path=None, runner=None, now=None, ph=None):
     case, total = find_case(case_id, load_cases(cases_path))
     if case is None:
         return False, "кейса %s в корпусе нет (всего %d)" % (case_id, total), None
-    if os.path.exists(shot_path(case_id)):
-        return False, "черновик кейса %s уже собран: %s (перезаписи нет по построению)" % (
-            case_id, shot_path(case_id)), load_shot(case_id)
+    commit = head_commit()
+    for path, shot in shot_slots(case_id):
+        if str(shot.get("commit") or "") == commit or not commit:
+            return False, ("черновик кейса %s на коммите %s уже собран: %s (перезаписи нет по "
+                           "построению)" % (case_id, shot.get("commit") or "?", path)), shot
+    target = shot_path(case_id, commit)
     import trainer_run                                   # ленивый импорт: тянет suggest и сеть
 
     if ph is None:
@@ -204,34 +255,44 @@ def freeze(case_id, cases_path=None, runner=None, now=None, ph=None):
         "lang": case.get("lang") or "", "question": trainer_run.substitute(raw, ph),
         "question_raw": raw,
         "draft": draft, "note": rec.get("note") or "",
-        "corpus": corpus_fingerprint(cases_path), "commit": head_commit(),
+        "corpus": corpus_fingerprint(cases_path), "commit": commit,
         "rules": rules_version(), "built_at": stamp(now),
     }
     os.makedirs(SHOTS_DIR, exist_ok=True)
-    with open(shot_path(case_id), "w", encoding="utf-8", newline="\n") as f:
+    with open(target, "w", encoding="utf-8", newline="\n") as f:
         json.dump(shot, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
-    return True, shot_path(case_id), shot
+    return True, target, shot
 
 
 # ---------------------------------------------------------------------------------------
 # карточка и кнопки
 # ---------------------------------------------------------------------------------------
 
-def card_text(shot):
-    """Ровно пять частей пункта 5: номер из скольки · вопрос · ответ · причина · зачем тап."""
-    return (
+def card_text(shot, slots_total=None):
+    """Ровно пять частей пункта 5: номер из скольки · вопрос · ответ · причина · зачем тап.
+
+    `slots_total` — сколько слотов этого кейса лежит на диске. Больше одного → карточка говорит
+    прямо, что показан САМЫЙ НОВЫЙ, а прежний жив: иначе владелец, увидев второй раз тот же кейс,
+    не отличит «показали заново то же» от «показали ответ нового кода»."""
+    older = ""
+    if slots_total and int(slots_total) > 1:
+        older = ("\nЭто НОВЕЙШИЙ снимок кейса (всего слотов %d); прежние сохранены и не тронуты — "
+                 "их коммиты другие." % int(slots_total))
+    head = (
         "🎓 ЭКЗАМЕН · кейс %s из %s — %s\n"
-        "Показан ЗАФИКСИРОВАННЫЙ ответ от %s (коммит %s, корпус %s). Голова сейчас НЕ звалась.\n\n"
-        "❓ КЛИЕНТ:\n%s\n\n"
+        "Показан ЗАФИКСИРОВАННЫЙ ответ от %s (коммит %s, корпус %s). Голова сейчас НЕ звалась." % (
+            shot.get("case"), shot.get("total"), shot.get("name") or "без имени",
+            shot.get("built_at") or "?", shot.get("commit") or "?", shot.get("corpus") or "?"))
+    body = (
+        "\n\n❓ КЛИЕНТ:\n%s\n\n"
         "🤖 БОТ:\n%s\n\n"
         "📌 ПОЧЕМУ так: %s\n\n"
         "Ниже — твой вердикт. Он ляжет КАНДИДАТОМ (счёта «пройдено N из 17» не будет, ворота не "
         "двинутся), причина не обязательна, откат по номеру." % (
-            shot.get("case"), shot.get("total"), shot.get("name") or "без имени",
-            shot.get("built_at") or "?", shot.get("commit") or "?", shot.get("corpus") or "?",
             shot.get("question") or "(вопрос не записан)",
             shot.get("draft") or "(ответа нет)", reason_line(shot)))
+    return head + older + body
 
 
 def markup(case_id):
@@ -371,7 +432,7 @@ def show(case_id, chat=None, sender=None, agent_fn=None, cases_path=None):
     if sender is None:
         import dispatch_notify
         sender = dispatch_notify.send_chat_strict
-    channel, ok, detail = sender(card_text(shot), dest, markup(case_id))
+    channel, ok, detail = sender(card_text(shot, len(shot_slots(case_id))), dest, markup(case_id))
     if not ok:
         return False, "⛔ показ НЕ прошёл (%s): %s" % (channel, detail)
     return True, "✅ кейс %s из %s показан в %s, message_id=%s. Ждём тапа." % (
@@ -537,6 +598,8 @@ def build_parser():
     p.add_argument("--show", action="store_true",
                    help="показать СОХРАНЁННЫЙ черновик в группу-тренажёр (голову не зовёт)")
     p.add_argument("--card", action="store_true", help="напечатать карточку, ничего не отправляя")
+    p.add_argument("--slots", action="store_true",
+                   help="перечислить слоты кейса (новейший первым) — ничего не меняет")
     p.add_argument("--tap", choices=sorted(VERDICTS_WORDS), help="записать вердикт кандидатом")
     p.add_argument("--who", default="", help="автор вердикта (имя владельца)")
     p.add_argument("--rollback", help="откат вердикта по номеру")
@@ -588,12 +651,23 @@ def main(argv=None):
         print(("✅ черновик кейса %s собран и сохранён: %s" % (a.case, where)) if ok
               else "⛔ черновик не собран: %s" % where)
         return 0 if ok else 1
+    if a.slots:
+        slots = shot_slots(a.case)
+        if not slots:
+            print("слотов кейса %s нет ни одного — сперва --freeze." % a.case)
+            return 1
+        print("слотов кейса %s: %d (новейший первым)" % (a.case, len(slots)))
+        for i, (path, shot) in enumerate(slots):
+            print("%s %s · коммит %s · корпус %s · собран %s" % (
+                "→" if i == 0 else " ", os.path.basename(path), shot.get("commit") or "?",
+                shot.get("corpus") or "?", shot.get("built_at") or "?"))
+        return 0
     if a.card:
         shot = load_shot(a.case)
         if shot is None:
             print("⛔ сохранённого черновика кейса %s нет — сперва --freeze." % a.case)
             return 1
-        print(card_text(shot))
+        print(card_text(shot, len(shot_slots(a.case))))
         return 0
     if a.show:
         ok, msg = show(a.case)

@@ -8385,10 +8385,11 @@ class TestClassSuggestOffer(unittest.TestCase):
     NMAX = "NMAX 155CC BLACK PHUKET 4255"
     XMAX = "XMAX 300CC NEW GEN PHUKET 5001"
     ADV = "ADV 350CC WHITE PHUKET 5801"
+    FORZA = "FORZA 300CC WHITE PHUKET 5901"         # третий макси — без него «ближайшие по цене»
     XADV = "XADV 750CC BLACK PHUKET 7701"           # тяжёлый класс
     CB = "CB 650CC R PHUKET 6501"                   # мотоцикл (верх лестницы)
-    FLEET_NAMES = [NMAX, XMAX, ADV, XADV, CB]
-    PRICE = {NMAX: 450, XMAX: 939, ADV: 749, XADV: 1945, CB: 1290}
+    FLEET_NAMES = [NMAX, XMAX, ADV, FORZA, XADV, CB]
+    PRICE = {NMAX: 450, XMAX: 939, ADV: 749, FORZA: 600, XADV: 1945, CB: 1290}
 
     DS, DE = "2026-07-15", "2026-07-20"
     TODAY = datetime.date(2026, 7, 11)
@@ -8440,77 +8441,141 @@ class TestClassSuggestOffer(unittest.TestCase):
         """Клиентский блок из служебных скобок (то, что КОД вставит на место [QUOTE])."""
         return suggest._quote_block_from_note(note) or ""
 
-    # ---------- (а) спрошенная СВОБОДНА: она первая, следом только тот же класс и выше ----------
-    def test_a_asked_model_is_first_then_same_class_and_above(self):
-        note = self._note()
+    # ---------- (а) спрошенная СВОБОДНА: она первая, следом НЕ БОЛЬШЕ ДВУХ того же класса --------
+    def test_a_asked_model_is_first_then_at_most_two_of_the_same_class(self):
+        """СЛОВО ВЛАДЕЛЬЦА 12.09.2026. Спрошен ADV 350 (макси): в блоке он и ДВЕ ближайшие по цене
+        макси-модели — одна дешевле, одна дороже. Мотоциклов нет ни одного, хотя они свободны."""
+        note = self._note(model="ADV 350")
         block = self._block(note)
         lines = [ln for ln in block.split("\n") if ln.strip()]
-        self.assertTrue(lines[0].startswith("NMAX 155"), f"основной вариант не первый: {lines}")
         names = [ln.split(" — ")[0] for ln in lines]
-        # тот же класс и выше — есть; ниже спрошенного в парке нет никого, выше есть все три
-        self.assertIn("XMAX 300 New Gen", names)     # макси-скутеры (выше обычного скутера)
-        self.assertIn("ADV 350", names)              # макси-скутеры
-        self.assertIn("CB 650R", names)              # мотоциклы (верх лестницы)
-        self.assertIn("ПОСЧИТАНА по НЕСКОЛЬКИМ моделям", note)
+        self.assertTrue(lines[0].startswith("ADV 350"), f"основной вариант не первый: {lines}")
+        self.assertEqual(len(names), 3, f"в блоке не 1+2 модели: {names}")
+        self.assertEqual(set(names[1:]), {"FORZA 300", "XMAX 300 New Gen"})
+        for moto in ("CB 650R", "NMAX 155", "XADV 750"):     # верх лестницы и низ — оба молчат
+            self.assertNotIn(moto, block)
+        self.assertIn("НЕ БОЛЕЕ ЧЕМ ДВУМ", note)             # записка говорит то же, что делает блок
+        self.assertIn("ТОГО ЖЕ класса", note)
+        self.assertNotIn("того же класса или выше", note)    # формула 20.08 из записки ушла
         # запрет называть другие модели СНЯТ: прежней формулы в инструкции больше нет
         self.assertNotIn("ДРУГИХ моделей в этом ответе НЕ приводи", note)
         # цифры LLM по-прежнему НЕ видит (маркерный режим цел на каждой строке списка)
-        self.assertNotIn(str(self.PRICE[self.ADV] * 5), suggest.make_system_prompt("FAQ", "ru",
-                                                                                   pricing_note=note))
+        self.assertNotIn(str(self.PRICE[self.XMAX] * 5), suggest.make_system_prompt(
+            "FAQ", "ru", pricing_note=note))
+
+    def test_a2_alternatives_are_the_nearest_by_price_not_the_first_two(self):
+        """«Ближайшие по цене» — это ЧИСЛО, а не порядок парка: спрошен XMAX (самый дорогой макси),
+        дороже него в классе нет никого → обе альтернативы берутся с дешёвой стороны."""
+        names = [ln.split(" — ")[0] for ln in self._block(self._note(model="XMAX 300")).split("\n")
+                 if ln.strip()]
+        self.assertEqual(names[0], "XMAX 300 New Gen")
+        self.assertEqual(set(names[1:]), {"ADV 350", "FORZA 300"})
 
     # ---------- (б) спрошенная ЗАНЯТА: есть замены того же класса, отказа НЕТ ----------
     def test_b_busy_asked_model_gets_replacements_not_refusal(self):
-        note = self._note(busy=(self.NMAX,))
+        note = self._note(busy=(self.XMAX,), model="XMAX 300")
         block = self._block(note)
         names = [ln.split(" — ")[0] for ln in block.split("\n") if ln.strip()]
-        self.assertNotIn("NMAX 155", names)          # цену занятой не называем ни строкой
-        self.assertIn("XMAX 300 New Gen", names)     # замена того же класса или выше
-        self.assertIn("ADV 350", names)
+        self.assertNotIn("XMAX 300 New Gen", names)  # цену занятой не называем ни строкой
+        self.assertEqual(set(names), {"ADV 350", "FORZA 300"})   # тот же класс, не больше двух
         self.assertIn("ЗАПРОШЕННАЯ МОДЕЛЬ ЗАНЯТА", note)
+        self.assertIn("НЕ БОЛЬШЕ ДВУХ моделей ТОГО ЖЕ класса", note)
         # прежний отказ («уточню наличие и цену на эти даты и вернусь») ушёл
         self.assertNotIn("уточню наличие и цену на эти даты и вернусь", note)
         self.assertNotIn("все подходящие байки заняты", note)
 
-    # ---------- (в) свободных того же класса и выше НЕТ: вниз классом бот НЕ идёт ----------
-    def test_c_never_falls_below_class_when_nothing_free_above(self):
-        # спрошен XMAX 300 (макси). Всё, что того же класса и выше, ЗАНЯТО; свободен только NMAX —
-        # он классом НИЖЕ, и предлагать его боту нельзя (правило 2).
-        busy = (self.XMAX, self.ADV, self.XADV, self.CB)
+    # ---------- (в) свободных того же класса НЕТ: вниз классом бот НЕ идёт ----------
+    def test_c_never_falls_below_class_when_nothing_free_in_class(self):
+        # спрошен XMAX 300 (макси). Всё, что того же класса, ЗАНЯТО; свободен только NMAX —
+        # он классом НИЖЕ, и предлагать его боту нельзя (правило 20.08, оно остаётся).
+        busy = (self.XMAX, self.ADV, self.FORZA)
         note = self._note(busy=busy, model="XMAX 300")
         self.assertNotIn("NMAX", note)               # ни строкой, ни числом — вниз не скатились
         self.assertNotIn(str(self.PRICE[self.NMAX] * 5), note)
-        self.assertNotIn("ПОСЧИТАНА по НЕСКОЛЬКИМ моделям", note)
+        self.assertNotIn("ПОСЧИТАНА по спрошенной модели и НЕ БОЛЕЕ", note)
         # честный прежний ответ занятости цел (подбор не подменяет собой отказ)
         self.assertIn("заняты", note)
+        # и мотоциклы, которые СВОБОДНЫ и прежде уехали бы заменой, теперь молчат
+        for moto in ("CB 650R", "XADV"):
+            self.assertNotIn(moto, note)
 
-        # тот же запрет, когда спрошенная СВОБОДНА, а выше свободных нет: список не появляется
-        note2 = self._note(busy=(self.ADV, self.XADV, self.CB), model="XMAX 300")
-        self.assertNotIn("NMAX", note2)
-        self.assertIsNotNone(suggest._quote_block_from_note(note2))   # своя цена у клиента есть
-        self.assertNotIn("ADV 350", self._block(note2))
+    def test_c2_asked_free_and_class_empty_offers_higher_class_without_list(self):
+        """ВЕТКА «В КЛАССЕ БОЛЬШЕ НИКОГО». Спрошенная свободна, других моделей её класса нет
+        (или все заняты): в блоке ОДНА посчитанная строка, перечня нет, цен чужих моделей нет,
+        а записка велит одной строкой предложить класс выше.
+
+        ЖИВЫМИ ДАННЫМИ ЭТА ВЕТКА ОТДЕЛЬНО НЕ ПРОВЕРЯЕТСЯ — на живом парке она включена в обычный
+        путь NMAX 155 (единственный обычный скутер), и отличить её там от «подбор не строился»
+        нечем. Поэтому исход на живом — НЕИЗВЕСТНО, а доказательство здесь."""
+        note = self._note(busy=(self.ADV, self.FORZA), model="XMAX 300")
+        block = self._block(note)
+        lines = [ln for ln in block.split("\n") if ln.strip()]
+        self.assertEqual(len(lines), 1, f"в блоке не одна строка: {lines}")
+        self.assertTrue(lines[0].startswith("XMAX 300 New Gen"))
+        self.assertIn("свободных ТОГО ЖЕ класса на эти даты больше нет", note)
+        self.assertIn("ОДНА короткая строка-предложение посмотреть класс выше", note)
+        self.assertNotIn("ADV 350", note)            # перечня нет
+        self.assertNotIn("FORZA", note)
+        self.assertNotIn("CB 650R", note)            # и класс выше НЕ перечисляется поимённо
+        self.assertNotIn(str(self.PRICE[self.CB] * 5), note)     # и без цен по нему
 
     # ---------- (г) про мощность клиент не говорил → тяжёлого класса в ответе НЕТ ----------
     def test_d_heavy_class_only_when_client_named_power_size_experience(self):
-        block = self._block(self._note())
+        block = self._block(self._note(model="ADV 350"))
         self.assertNotIn("XADV", block.upper())      # тяжёлый сам собой не поднимается
         self.assertNotIn(str(self.PRICE[self.XADV] * 5), block)
-        # а сказал про мощность/опыт — тяжёлый законен
-        block2 = self._block(self._note(heavy_ok=True))
+        # а сказал про мощность/опыт — тяжёлый законен (правило 20.08 остаётся в силе)
+        block2 = self._block(self._note(model="ADV 350", heavy_ok=True, busy=(self.XMAX,)))
         self.assertIn("XADV 750", block2)
 
-    # ---------- правило 6: список не влез → число не влезших уходит клиенту ----------
-    def test_message_cap_never_truncates_silently(self):
+    # ---------- предел числа: слово владельца режет раньше потолка сообщения ----------
+    def test_owner_limit_cuts_before_the_message_cap(self):
+        """ХВОСТ «СВОБОДНО ЕЩЁ N» СНЯТ (слово владельца 12.09): его держало правило «все свободные,
+        предела нет», а оно отменено. Блок больше не умеет ни обрезать список, ни объявлять число:
+        обрезать нечего — в него приходит не больше двух альтернатив."""
         alts = [f"МОДЕЛЬ {i:02d} — 1000 ฿ за 5 дней; депозит 3000 ฿." for i in range(1, 13)]
         block, more = suggest._class_offer_block("NMAX 155 — 2250 ฿.", alts, msg_max=400)
-        self.assertGreater(more, 0)                          # часть не влезла
+        self.assertGreater(more, 0)                          # часть не влезла — число вызывающему
         self.assertLessEqual(len(block), 400)                # потолок соблюдён
-        self.assertIn(f"Свободно ещё {more}", block)         # число названо, а не проглочено
-        self.assertIn("какой класс интересует", block)       # и предложено назвать класс
+        self.assertNotIn("Свободно ещё", block)              # хвоста клиенту больше нет
         self.assertTrue(block.startswith("NMAX 155 —"))      # основной вариант не выброшен никогда
-        # всё влезает → хвоста нет вовсе (правило «предела по числу моделей нет»)
+        self.assertFalse(hasattr(suggest, "_class_offer_tail"), "хвост остался в коде мёртвым")
         block2, more2 = suggest._class_offer_block("NMAX 155 — 2250 ฿.", alts, msg_max=4096)
         self.assertEqual(more2, 0)
-        self.assertNotIn("Свободно ещё", block2)
+
+    # ---------- арифметика «одна дешевле, одна дороже» (чистая функция, без сети) ----------
+    def test_two_alternatives_arithmetic_is_nearest_on_each_side(self):
+        def row(name, total):
+            return (name, f"{total} ฿", {"total": total, "day_price": total // 5})
+        free = [row("A", 1000), row("B", 2000), row("C", 2900), row("D", 3100),
+                row("E", 4000), row("F", 9000)]
+        # опора 3000: ближайшая дешевле — C, ближайшая дороже — D
+        picked = [r[0] for r in suggest.class_alternatives(free, {"total": 3000})]
+        self.assertEqual(picked, ["C", "D"])
+        # дороже опоры нет никого → обе берутся с дешёвой стороны, ближайшие
+        picked2 = [r[0] for r in suggest.class_alternatives(free, {"total": 99000})]
+        self.assertEqual(picked2, ["E", "F"])
+        # дешевле нет никого → обе с дорогой стороны
+        picked3 = [r[0] for r in suggest.class_alternatives(free, {"total": 100})]
+        self.assertEqual(picked3, ["A", "B"])
+        # ОПОРЫ НЕТ (спрошенная занята, её quote пуст) → две самые дешёвые, названный выбор
+        self.assertEqual([r[0] for r in suggest.class_alternatives(free, None)], ["A", "B"])
+        # предел — два, сколько бы ни было свободных
+        self.assertLessEqual(len(suggest.class_alternatives(free, {"total": 3000})), 2)
+        self.assertEqual(suggest._CLASS_ALT_MAX, 2)
+        # единственная свободная — одна и уходит («одну-две»), пустой список остаётся пустым
+        self.assertEqual([r[0] for r in suggest.class_alternatives([row("A", 1000)], None)], ["A"])
+        self.assertEqual(suggest.class_alternatives([], {"total": 3000}), [])
+
+    def test_alternative_without_a_number_never_pushes_out_a_priced_one(self):
+        """Строка без числа сортироваться не может — она идёт ПОСЛЕ посчитанных, а не вместо."""
+        free = [("БЕЗЦЕНЫ", "—", None), ("A", "1000 ฿", {"total": 1000}),
+                ("B", "2000 ฿", {"total": 2000})]
+        self.assertEqual([r[0] for r in suggest.class_alternatives(free, {"total": 1500})],
+                         ["A", "B"])
+        self.assertEqual([r[0] for r in suggest.class_alternatives(
+            [("БЕЗЦЕНЫ", "—", None), ("A", "1000 ฿", {"total": 1000})], {"total": 1500})],
+            ["БЕЗЦЕНЫ", "A"])
 
     # ---------- лестница классов и её правила (чистые функции, без сети) ----------
     def test_class_ladder_matches_owner_rule(self):
@@ -8524,14 +8589,16 @@ class TestClassSuggestOffer(unittest.TestCase):
         self.assertIsNone(suggest.park_class("СамокатХ"))    # неизвестной модели ранга нет
 
     def test_scope_rules_are_the_owner_rules(self):
-        # ниже классом — никогда; тяжёлый — только по сигналу клиента
-        self.assertEqual(suggest.class_offer_scope("XMAX 300"),
-                         {"макси-скутеры", "мотоциклы"})
+        # СЛОВО ВЛАДЕЛЬЦА 12.09.2026: только СВОЙ класс. Мотоциклы на спрошенный макси-скутер —
+        # ровно то, что владелец назвал дословно («причём тут… столько мотоциклов выходит»).
+        self.assertEqual(suggest.class_offer_scope("XMAX 300"), {"макси-скутеры"})
+        self.assertNotIn("мотоциклы", suggest.class_offer_scope("NMAX 155"))
+        # тяжёлый — только по сигналу клиента (правило 20.08 остаётся)
         self.assertEqual(suggest.class_offer_scope("XMAX 300", heavy_ok=True),
-                         {"макси-скутеры", "тяжёлые", "мотоциклы"})
+                         {"макси-скутеры", "тяжёлые"})
         # «дешевле/проще» от клиента — единственный ключ к классу ниже; тяжёлый им НЕ открывается
         self.assertEqual(suggest.class_offer_scope("XMAX 300", cheaper_ok=True),
-                         {"обычные скутеры", "макси-скутеры", "мотоциклы"})
+                         {"обычные скутеры", "макси-скутеры"})
         self.assertIsNone(suggest.class_offer_scope("PCX 160"))   # класса нет → подбора нет
 
     def test_cheaper_request_opens_the_class_below(self):

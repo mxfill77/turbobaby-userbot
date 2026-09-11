@@ -106,8 +106,9 @@ class TestFrozenTextIsWhatIsShown(Base):
         self.assertIn(shot["draft"], send.calls[0]["text"])
 
     def test_freeze_does_not_overwrite_an_existing_shot(self):
-        """Второй `--freeze` НЕ пересобирает: иначе «покажи ещё раз» молча меняло бы судимый текст."""
-        self.put_shot(_shot())
+        """Второй `--freeze` НА ТОМ ЖЕ КОММИТЕ не пересобирает: иначе «покажи ещё раз» молча
+        меняло бы судимый текст. Слот опознаётся коммитом сборки (12.09.2026)."""
+        self.put_shot(_shot(commit=exam_show.head_commit()))
         called = []
 
         def runner(case):
@@ -127,6 +128,46 @@ class TestFrozenTextIsWhatIsShown(Base):
             self.assertIn(key, shot)
         self.assertEqual(shot["corpus"], exam_show.corpus_fingerprint())
         self.assertTrue(os.path.exists(path))
+
+    def test_new_commit_gets_its_own_slot_and_the_old_one_survives(self):
+        """ВТОРОЙ СЛОТ, КЛЮЧУЕМЫЙ КОММИТОМ (12.09.2026). Снимок старого кода остаётся на диске
+        БАЙТ-В-БАЙТ, новый ложится рядом, показ берёт НОВЕЙШИЙ и называет его коммит в карточке.
+
+        Зачем правило: до 12.09 у кейса был один слот, и `freeze` отказывал по ФАКТУ файла —
+        показать кейс на новом коде было нельзя вовсе, единственное место занято старым текстом."""
+        old = self.put_shot(_shot(commit="deadbee"))
+        old_path = exam_show.shot_path(1)
+        ok, path, new = exam_show.freeze(
+            1, runner=lambda c: {"draft": "ответ НОВОГО кода", "note": "новая записка"}, ph=PH)
+        self.assertTrue(ok, path)
+        self.assertNotEqual(path, old_path, "новый снимок лёг в тот же файл — старый затёрт")
+        self.assertTrue(os.path.exists(old_path), "старый слот исчез с диска")
+        with open(old_path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["draft"], old["draft"], "старый слот изменён")
+        self.assertEqual(new["commit"], exam_show.head_commit())
+        # показ берёт новейший — и в карточке стои́т ЕГО коммит, а не коммит прежнего слота
+        self.assertEqual(exam_show.load_shot(1)["draft"], "ответ НОВОГО кода")
+        self.assertEqual(len(exam_show.shot_slots(1)), 2)
+        card = exam_show.card_text(exam_show.load_shot(1), len(exam_show.shot_slots(1)))
+        self.assertIn(exam_show.head_commit(), card)
+        self.assertNotIn("deadbee", card)
+        self.assertIn("НОВЕЙШИЙ снимок кейса (всего слотов 2)", card)
+        # ссылка в журнал вердиктов ведёт на ПОКАЗАННЫЙ слот, а не на имя кейса вообще
+        self.assertIn(os.path.basename(path), exam_show.shot_ref(1))
+
+    def test_newest_is_by_built_at_not_by_file_mtime(self):
+        """Новизна судится по `built_at` СНИМКА, а не по mtime файла: mtime двигает любое касание
+        диска (копия, checkout, антивирус), а момент сборки принадлежит самому тексту."""
+        a = _shot(commit="aaaaaaa")
+        a["built_at"], a["draft"] = "2026-09-11T00:00:00Z", "старый"
+        b = _shot(commit="bbbbbbb")
+        b["built_at"], b["draft"] = "2026-09-12T00:00:00Z", "новый"
+        for shot in (b, a):                      # b кладём ПЕРВЫМ — mtime у него старше
+            with open(exam_show.shot_path(1, shot["commit"]), "w", encoding="utf-8") as f:
+                json.dump(shot, f, ensure_ascii=False)
+        self.assertEqual(exam_show.load_shot(1)["draft"], "новый")
+        self.assertEqual([s["commit"] for _p, s in exam_show.shot_slots(1)],
+                         ["bbbbbbb", "aaaaaaa"])
 
     def test_empty_draft_is_not_saved_as_a_shot(self):
         """Молчащая голова не смеет оставить пустой черновик — судить было бы нечего."""
