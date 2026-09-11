@@ -487,6 +487,61 @@ def chat_reachable(chat_id):
     return False, "code=%s %s" % (resp.get("error_code"), str(resp.get("description", ""))[:120])
 
 
+def _scrub_token(text):
+    """Вычистить ЗНАЧЕНИЕ токена из любой строки, уходящей наружу (stdout, лог, отчёт).
+
+    Telegram своего токена в описании ошибки сегодня не повторяет — но «сегодня не повторяет»
+    гарантией не является, а цена промаха односторонняя: секрет, один раз попавший в лог или в
+    отчёт владельца, оттуда уже не вынимается. Поэтому чистка стои́т НА ВЫХОДЕ двери, а не на
+    доверии к чужому формату ответа."""
+    s = text if isinstance(text, str) else str(text)
+    tok = TOKEN if isinstance(TOKEN, str) else ""
+    return s.replace(tok, "<токен скрыт>") if tok else s
+
+
+def _identity_line(result):
+    """Результат `getMe` → одна строка словами: «@имя «видимое имя» id=<число>». ЧИСТАЯ функция.
+
+    Отделена от двери затем, что сверяется БЕЗ СЕТИ: форма ответа Telegram — это голден, а не
+    догадка. Поля в нём необязательные (у бота может не быть `username`), и пустое поле называется
+    СЛОВАМИ, а не исчезает из строки: «имени нет» и «имя не прочитано» чинятся по-разному, а
+    исчезнувшее поле читается как первое при любом из двух."""
+    res = result if isinstance(result, dict) else {}
+    uname = res.get("username")
+    title = res.get("first_name")
+    bid = res.get("id")
+    return " ".join((
+        ("@" + uname.strip()) if isinstance(uname, str) and uname.strip() else "@-имени НЕТ",
+        ("«%s»" % title.strip()) if isinstance(title, str) and title.strip() else "«видимого имени НЕТ»",
+        ("id=%s" % bid) if isinstance(bid, int) and not isinstance(bid, bool) else "id НЕ ПРОЧИТАН",
+    ))
+
+
+def bot_identity():
+    """КТО МЫ ДЛЯ TELEGRAM → (ok, строка словами). НИЧЕГО НЕ ОТПРАВЛЯЕТ.
+
+    `getMe` — вызов САМОМУ СЕБЕ: наружу не уходит ни одного сообщения, ни один чат и ни один
+    участник следа не видит. Дверь заведена 12.09.2026 затем, что публичное имя бота ЧТЕНИЕМ КОДА
+    не узнаётся вовсе: в репозитории лежит только имя ПЕРЕМЕННОЙ с токеном (`AGENT_BOT_TOKEN`), а
+    @-имя и числовой идентификатор живут на стороне Telegram и меняются владельцем бота без единой
+    правки здесь. Догадка по имени переменной именем НЕ является, а владельцу имя нужно ровно
+    затем, чтобы добавить бота в группу, — и промах здесь стоит добавления ЧУЖОГО бота.
+
+    Токен не печатается ни в успехе, ни в отказе: всё, что уходит наружу, проходит `_scrub_token`.
+    Токена нет → это ТРЕТИЙ ИСХОД («отсюда не видно»), а не «бота нет»."""
+    if not TOKEN:
+        return False, "нет AGENT_BOT_TOKEN — кто мы, отсюда не видно"
+    ok, resp = _api("getMe", {})
+    if ok:
+        body = resp if isinstance(resp, dict) else {}
+        return True, _scrub_token(_identity_line(body.get("result")))
+    r = resp if isinstance(resp, dict) else {}
+    code, desc = r.get("error_code"), r.get("description")
+    return False, _scrub_token("code=%s %s" % (
+        code if isinstance(code, int) else "НЕ ПРОЧИТАН",
+        desc[:120] if isinstance(desc, str) else "описания нет"))
+
+
 def edit_topic_strict(text, thread_id, message_id):
     """ПРАВКА уже стоящего сообщения темы, БЕЗ каскада и БЕЗ отправки нового. → (channel, ok, detail).
 
@@ -986,6 +1041,15 @@ def main():
             _log.info(f"итог(критич): channel={channel} ok={ok} mid={last_send_id()} "
                       f"| {arch_text(text)}")
             sys.exit(0)
+        if args and args[0] == "--whoami":
+            # КТО МЫ ДЛЯ TELEGRAM. Вызов самому себе (getMe): наружу не уходит ни одного
+            # сообщения. Ветка стои́т ЗДЕСЬ, а не в отдельном скрипте, по двум причинам: замок 1
+            # пускает в сеть только боевые точки входа в корне репозитория, а токен живёт ровно в
+            # этом модуле — второй читатель `.env` был бы вторым местом, где секрет может утечь.
+            ok, why = bot_identity()
+            print(("✅ бот отправки агента: " if ok else "⛔ имя бота не прочитано: ") + why)
+            _log.info(f"итог(--whoami): ok={int(bool(ok))} | {why}")
+            sys.exit(0 if ok else 1)
         if args and args[0] == "--topic":
             # ЯВНО НАЗВАННЫЙ АДРЕС — не маршрут: вызывающий сам знает тему и признак не
             # спрашивается (`--topic [id] <текст>`, по умолчанию 328 — тема постановки задач).

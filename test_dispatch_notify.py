@@ -727,5 +727,86 @@ class TestGateCardAddress(unittest.TestCase):
         self.assertEqual(self.topic, [])
 
 
+class TestBotIdentity(unittest.TestCase):
+    """Дверь `getMe` (12.09.2026): имя бота читается, наружу не уходит НИЧЕГО, тайна не печатается.
+
+    Живой Bot API не дёргаем — подменяем `_api` и смотрим, каким методом и с чем дверь ходит."""
+
+    def setUp(self):
+        self._save = (dn._api, dn.TOKEN)
+        self.calls = []
+        dn.TOKEN = "test-token"
+
+    def tearDown(self):
+        (dn._api, dn.TOKEN) = self._save
+
+    def test_reads_name_and_id_and_never_sends(self):
+        """Успех: в строке @-имя, видимое имя и номер. Метод РОВНО один и это getMe."""
+        def api(method, payload):
+            self.calls.append((method, payload))
+            return True, {"ok": True, "result": {"id": 1234567890, "is_bot": True,
+                                                 "first_name": "TurboBaby Agent",
+                                                 "username": "tb_agent_bot"}}
+        dn._api = api
+        ok, why = dn.bot_identity()
+        self.assertTrue(ok)
+        self.assertIn("@tb_agent_bot", why)
+        self.assertIn("«TurboBaby Agent»", why)
+        self.assertIn("id=1234567890", why)
+        self.assertEqual([m for m, _ in self.calls], ["getMe"], "дверь ходила не тем методом")
+        self.assertEqual(self.calls[0][1], {}, "в getMe уехала посылка — дверь обязана быть пустой")
+
+    def test_nothing_is_sent_on_any_path(self):
+        """Ни одна ветка двери не зовёт sendMessage — ни при успехе, ни при отказе."""
+        seen = []
+
+        def api(method, payload):
+            seen.append(method)
+            return False, {"ok": False, "error_code": 401, "description": "Unauthorized"}
+        dn._api = api
+        ok, _ = dn.bot_identity()
+        self.assertFalse(ok)
+        self.assertNotIn("sendMessage", seen)
+        self.assertEqual(seen, ["getMe"])
+
+    def test_missing_fields_named_in_words(self):
+        """У бота нет username → это НАЗВАНО словами, а не выпало из строки молча."""
+        line = dn._identity_line({"id": 7, "first_name": ""})
+        self.assertIn("@-имени НЕТ", line)
+        self.assertIn("«видимого имени НЕТ»", line)
+        self.assertIn("id=7", line)
+
+    def test_id_not_a_number_is_named_not_guessed(self):
+        """Номер приехал не числом (или не приехал) → «НЕ ПРОЧИТАН», а не 0 и не пусто."""
+        self.assertIn("id НЕ ПРОЧИТАН", dn._identity_line({"username": "x", "id": None}))
+        self.assertIn("id НЕ ПРОЧИТАН", dn._identity_line({"username": "x", "id": "8"}))
+        self.assertIn("id НЕ ПРОЧИТАН", dn._identity_line(None))
+
+    def test_secret_value_never_leaks_into_the_answer(self):
+        """ГЛАВНЫЙ замок: даже если ЧУЖОЙ ответ вернёт нашу тайну в описании — наружу не уйдёт.
+
+        Подставное значение намеренно НЕ похоже на настоящую форму: сторож исходящего ловит форму,
+        а проверяем мы поведение чистки, и совпадение форм здесь ничего бы не добавило."""
+        marker = "PODSTAVNOE-ZNACHENIE-NE-TAJNA"
+        dn.TOKEN = marker
+
+        def api(method, payload):
+            return False, {"ok": False, "error_code": 401,
+                           "description": "Unauthorized for " + marker}
+        dn._api = api
+        ok, why = dn.bot_identity()
+        self.assertFalse(ok)
+        self.assertNotIn(marker, why, "значение из переменной токена уехало в ответ двери")
+        self.assertIn("<токен скрыт>", why)
+
+    def test_no_token_is_a_third_outcome(self):
+        """Токена нет → «отсюда не видно», а не «бота нет»: в сеть при этом не ходим вовсе."""
+        dn.TOKEN = ""
+        dn._api = lambda m, p: self.fail("дверь пошла в сеть без токена")
+        ok, why = dn.bot_identity()
+        self.assertFalse(ok)
+        self.assertIn("отсюда не видно", why)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
