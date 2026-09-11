@@ -11,8 +11,19 @@ import shutil
 import tempfile
 import unittest
 
+import exam_reshow
 import exam_show
 import pc_agent
+import trainer_run
+
+# Окно дат для тестов. Берётся ДОВОДОМ, а не живым `trainer_run.placeholders()`: живое окно ходит
+# за таблицей периодов ради `when_cross`, а набор в сеть не ходит ни разу. Ключи — те же, что у
+# живого окна; подставляет их ТА ЖЕ `trainer_run.substitute`, что и прогон, — своей копии
+# подстановки у набора нет по построению (иначе он зеленел бы на собственной реализации).
+PH = {"when": "с 6 по 11 октября", "when_sloppy": "с 6ого по 11ое октября",
+      "when_1d": "с 6 по 7 октября", "when_month": "с 6 октября по 6 ноября",
+      "when_en": "from October 6 to October 11", "when_cross": "с 28 октября по 3 ноября",
+      "cross": {"text": "с 28 октября по 3 ноября"}, "year": "2026", "year_next": "2027"}
 
 
 def _shot(case=1, total=17, corpus="aaaaaaaaaaaaaaaa", commit="deadbee", rules="v1"):
@@ -102,7 +113,7 @@ class TestFrozenTextIsWhatIsShown(Base):
         def runner(case):
             called.append(case)
             return {"draft": "другой ответ", "note": ""}
-        ok, why, _ = exam_show.freeze(1, runner=runner)
+        ok, why, _ = exam_show.freeze(1, runner=runner, ph=PH)
         self.assertFalse(ok)
         self.assertEqual(called, [], "голова не должна была зваться вовсе")
         self.assertIn("уже собран", why)
@@ -110,7 +121,7 @@ class TestFrozenTextIsWhatIsShown(Base):
 
     def test_freeze_saves_the_three_fingerprints(self):
         ok, path, shot = exam_show.freeze(
-            1, runner=lambda c: {"draft": "ответ", "note": "записка"})
+            1, runner=lambda c: {"draft": "ответ", "note": "записка"}, ph=PH)
         self.assertTrue(ok, path)
         for key in ("corpus", "commit", "rules", "built_at"):
             self.assertIn(key, shot)
@@ -120,11 +131,183 @@ class TestFrozenTextIsWhatIsShown(Base):
     def test_empty_draft_is_not_saved_as_a_shot(self):
         """Молчащая голова не смеет оставить пустой черновик — судить было бы нечего."""
         ok, why, shot = exam_show.freeze(
-            1, runner=lambda c: {"draft": "   ", "note": "", "unknown": "голова молчала"})
+            1, runner=lambda c: {"draft": "   ", "note": "", "unknown": "голова молчала"}, ph=PH)
         self.assertFalse(ok)
         self.assertIsNone(shot)
         self.assertIn("голова молчала", why)
         self.assertFalse(os.path.exists(exam_show.shot_path(1)))
+
+
+# ──────────── ВОПРОС В КАРТОЧКЕ — ТОТ ЖЕ, ЧТО ВИДЕЛА ГОЛОВА (заведено 12.09.2026) ────────────
+# Живой дефект: в показанной владельцу карточке кейса 1 стояло «…XMAX 300 {when_sloppy}…», а в
+# ответе бота ниже — сами даты «с 6 по 11 октября». Подстановка в прогоне была, в показе — нет:
+# `freeze` клал в снимок СЫРУЮ строку корпуса. Карточка при этом не врала — она честно печатала
+# то, что лежало в снимке. Поэтому чинится снимок, а не карточка.
+
+class TestTheQuestionIsTheOneTheHeadSaw(Base):
+    def corpus(self, cases):
+        """Свой корпус во временном каталоге — боевого `trainer_cases.json` не касаемся ничем."""
+        p = os.path.join(self.tmp, "cases.json")
+        with open(p, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"cases": cases}, f, ensure_ascii=False)
+        return p
+
+    TEMPLATED = {"id": 1, "name": "с шаблоном", "lang": "ru",
+                 "lines": ["Здравствуйте! Хочу XMAX 300 {when_sloppy}, залог паспортом"]}
+    PLAIN = {"id": 2, "name": "без шаблона", "lang": "ru",
+             "lines": ["Требуется ли депозит?"]}
+
+    def frozen(self, case):
+        path = self.corpus([case])
+        ok, where, shot = exam_show.freeze(
+            case["id"], cases_path=path, runner=lambda c: {"draft": "ответ", "note": "записка"},
+            ph=PH)
+        self.assertTrue(ok, where)
+        return shot
+
+    def test_the_shot_carries_the_dates_and_not_the_template(self):
+        """ПОСЛЕ правки: в снимок ложится текст с подставленными датами, шаблона не остаётся."""
+        shot = self.frozen(self.TEMPLATED)
+        self.assertIn("с 6ого по 11ое октября", shot["question"])
+        self.assertNotIn("{", shot["question"])
+        self.assertNotIn("when_sloppy", shot["question"])
+
+    def test_the_raw_corpus_line_is_kept_and_not_lost(self):
+        """Сырая строка НЕ ТЕРЯЕТСЯ — она рядом, ключом `question_raw`: по ней видно, из какого
+        кейса собран вопрос, и подстановку всегда можно пересчитать."""
+        shot = self.frozen(self.TEMPLATED)
+        self.assertEqual(shot["question_raw"], self.TEMPLATED["lines"][0])
+        self.assertNotEqual(shot["question_raw"], shot["question"])
+
+    def test_a_case_without_a_template_is_byte_for_byte_the_same(self):
+        """ОТРИЦАТЕЛЬНАЯ сторона: кейсу без шаблона правка не меняет ни байта."""
+        shot = self.frozen(self.PLAIN)
+        self.assertEqual(shot["question"], self.PLAIN["lines"][0])
+        self.assertEqual(shot["question"], shot["question_raw"])
+
+    def test_the_card_repeats_the_shot_byte_for_byte(self):
+        """ОДИН ИСТОЧНИК ПРАВДЫ: карточка не подрисовывает ничего — строка вопроса в ней совпадает
+        со строкой снимка побайтно."""
+        shot = self.frozen(self.TEMPLATED)
+        card = exam_show.card_text(shot)
+        self.assertIn(shot["question"], card)
+        line = [ln for ln in card.splitlines() if ln == shot["question"]]
+        self.assertEqual(len(line), 1, "вопрос обязан стоять в карточке ОТДЕЛЬНОЙ строкой, дословно")
+
+    def test_one_window_goes_both_to_the_head_and_into_the_question(self):
+        """Окно дат считается РОВНО ОДИН РАЗ и идёт в оба места — голове и в записанный вопрос.
+
+        Два отдельных `placeholders()` разъехались бы на границе суток и месяца, и снимок держал бы
+        вопрос, которого голова не видела. Подставной прогонщик выдаёт РАЗНОЕ окно на каждый вызов —
+        расхождение стало бы видно текстом, а не рассуждением."""
+        import sys as _sys
+        import types
+        fake = types.ModuleType("trainer_run")
+        state = {"n": 0, "seen": []}
+
+        def placeholders():
+            state["n"] += 1
+            return {"when_sloppy": "ОКНО-%d" % state["n"]}
+
+        def run_case(case, ph):
+            state["seen"].append(ph)
+            return {"draft": "ответ", "note": "записка"}
+
+        fake.placeholders = placeholders
+        fake.run_case = run_case
+        fake.substitute = trainer_run.substitute        # подстановка — НАСТОЯЩАЯ, не копия
+        real = _sys.modules.get("trainer_run")
+        _sys.modules["trainer_run"] = fake
+        try:
+            ok, where, shot = exam_show.freeze(1, cases_path=self.corpus([self.TEMPLATED]))
+        finally:
+            if real is None:
+                _sys.modules.pop("trainer_run", None)
+            else:
+                _sys.modules["trainer_run"] = real
+        self.assertTrue(ok, where)
+        self.assertEqual(state["n"], 1, "окно посчитано больше одного раза — оно разъедется")
+        self.assertIn("ОКНО-1", shot["question"])
+        self.assertEqual(state["seen"][0]["when_sloppy"], "ОКНО-1")
+
+    def test_the_substituter_is_the_runners_own(self):
+        """Второй подстановки на полосе нет: показ зовёт ТУ ЖЕ функцию, что готовит реплики голове.
+
+        Проверка на исходнике — своя копия `format(**ph)` зеленела бы на любом поведенческом тесте
+        ровно до первого расхождения, а расходятся такие копии молча."""
+        import inspect
+        self.assertIn("trainer_run.substitute", inspect.getsource(exam_show.freeze))
+        self.assertNotIn("format(", inspect.getsource(exam_show.question_of))
+        self.assertIn("substitute(raw, ph)", inspect.getsource(trainer_run.build_transcript))
+
+    def test_no_template_survives_in_the_card_on_any_of_the_seventeen(self):
+        """ЗАМОК ЧИСЛОМ на ЖИВОМ корпусе: ни в одной из карточек не остаётся фигурных скобок.
+
+        Мерить на одном кейсе мало — шаблонов в корпусе пять видов, и промах любого из них даёт
+        владельцу ту же небрежность на другом кейсе."""
+        cases = exam_show.load_cases()
+        self.assertEqual(len(cases), 17, "корпус переехал — пересчитать замок")
+        raw_with_template, card_with_template = 0, 0
+        for case in cases:
+            raw = exam_show.question_of(case)
+            if "{" in raw:
+                raw_with_template += 1
+            shot = _shot(case=case.get("id"), total=len(cases)) | {
+                "question": trainer_run.substitute(raw, PH), "note": "записка", "draft": "ответ"}
+            if "{" in exam_show.card_text(shot):
+                card_with_template += 1
+        self.assertEqual(raw_with_template, 10, "в корпусе 10 кейсов из 17 несут шаблон в первой реплике")
+        self.assertEqual(card_with_template, 0, "в карточке не смеет остаться НИ ОДНОГО шаблона")
+
+
+# ────────────────────── ПЕРЕПОКАЗ: та же карточка + названное отличие ──────────────────────
+
+class TestReshow(Base):
+    def test_a_reshow_without_a_named_difference_sends_nothing(self):
+        """Перепоказ без отличия — вторая одинаковая карточка: владелец ищет разницу сам."""
+        self.put_shot(_shot(corpus=exam_show.corpus_fingerprint()))
+        send = self.sender()
+        ok, msg = exam_reshow.reshow(1, "   ", sender=send, agent_fn=self.fresh_agent())
+        self.assertFalse(ok)
+        self.assertEqual(send.calls, [], "наружу не должно уйти ничего")
+        self.assertIn("отличия", msg)
+
+    def test_the_header_names_the_reshow_and_the_living_buttons(self):
+        head = exam_reshow.header(1, "даты вместо шаблона")
+        self.assertIn("ПЕРЕПОКАЗ", head)
+        self.assertIn("кнопки рабочие", head)
+        self.assertIn("даты вместо шаблона", head)
+
+    def test_the_reshow_carries_the_whole_card_and_the_same_buttons(self):
+        """Карточка идёт ЦЕЛИКОМ и одним сообщением, кнопки — те же, что у обычного показа."""
+        shot = self.put_shot(_shot(corpus=exam_show.corpus_fingerprint()))
+        send = self.sender()
+        ok, _msg = exam_reshow.reshow(1, "отличие", sender=send, agent_fn=self.fresh_agent())
+        self.assertTrue(ok)
+        self.assertEqual(len(send.calls), 1, "перепоказ РОВНО один")
+        text = send.calls[0]["text"]
+        self.assertIn(exam_show.card_text(shot), text)
+        self.assertTrue(text.startswith(exam_reshow.MARK))
+        self.assertEqual(send.calls[0]["markup"], exam_show.markup(1))
+
+    def test_the_reshow_never_reaches_the_head(self):
+        """У перепоказа нет дороги к голове ни одной веткой — проверка на исходнике модуля."""
+        import inspect
+        src = inspect.getsource(exam_reshow)
+        for word in ("trainer_run", "run_case", "generate", "freeze"):
+            self.assertNotIn(word, src)
+
+    def test_the_reshow_keeps_every_lock_of_the_show(self):
+        """Замки показа работают и на перепоказе: чужой адрес и несвежий ловец отказывают."""
+        self.put_shot(_shot(corpus=exam_show.corpus_fingerprint()))
+        send = self.sender()
+        ok, msg = exam_reshow.reshow(1, "отличие", sender=send, chat=-1, agent_fn=self.fresh_agent())
+        self.assertFalse(ok)
+        self.assertEqual(send.calls, [])
+        ok, msg = exam_reshow.reshow(1, "отличие", sender=send,
+                                     agent_fn=lambda: (False, "агент СТАРШЕ кода кнопки"))
+        self.assertFalse(ok)
+        self.assertEqual(send.calls, [], "несвежий ловец обязан остановить и перепоказ")
 
 
 # ───────────────────────────── ОДИН КЕЙС И ОДИН АДРЕС ────────────────────────────────────

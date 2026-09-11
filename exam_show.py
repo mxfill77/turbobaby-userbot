@@ -142,10 +142,15 @@ def load_shot(case_id):
 
 
 def question_of(case):
-    """Вопрос клиента одной строкой — ПЕРВАЯ реплика кейса ДОСЛОВНО, с подставленными датами.
+    """СЫРАЯ первая реплика кейса — так, как она лежит в корпусе, с шаблоном даты и всем прочим.
 
-    Дословно потому, что владелец судит ответ на тот вопрос, который бот видел; пересказ («клиент
-    спросил про цену») сделал бы вердикт непроверяемым."""
+    Дат ЗДЕСЬ НЕ ПОДСТАВЛЯЕТ НИ ОДНОЙ, и это не недоделка: подстановка на полосе ровно одна —
+    `trainer_run.substitute`, и зовёт её `freeze` (единственное место, где известно окно `ph`,
+    с которым кейс уходил голове). Вторая подстановка здесь разошлась бы с прогоном молча.
+
+    Сырая строка нужна самому снимку: она ложится в него ключом `question_raw` рядом с показанным
+    вопросом. Дословно — потому что владелец судит ответ на тот вопрос, который бот видел; пересказ
+    («клиент спросил про цену») сделал бы вердикт непроверяемым."""
     lines = case.get("lines") or []
     return str(lines[0]) if lines else ""
 
@@ -161,30 +166,43 @@ def reason_line(shot, limit=220):
     return note[:limit] + ("…" if len(note) > limit else "")
 
 
-def freeze(case_id, cases_path=None, runner=None, now=None):
+def freeze(case_id, cases_path=None, runner=None, now=None, ph=None):
     """Собрать черновик кейса ОДИН раз и положить на диск. → (ok, путь|причина, shot|None).
 
     ЕДИНСТВЕННАЯ ветка модуля, зовущая голову. Уже лежащий черновик НЕ перезаписывается: иначе
-    «покажи ещё раз» молча меняло бы судимый текст — ровно то, от чего модуль и заведён."""
+    «покажи ещё раз» молча меняло бы судимый текст — ровно то, от чего модуль и заведён.
+
+    ОКНО ДАТ (`ph`) БЕРЁТСЯ ОДИН РАЗ И ИДЁТ В ОБА МЕСТА — голове (через `run_case`) и в записанный
+    вопрос (через `trainer_run.substitute`). Два отдельных вызова `placeholders()` разъехались бы
+    на границе суток и месяца, и снимок хранил бы вопрос, которого голова не видела. Замер
+    12.09.2026, кейс 1: в снимке лежала СЫРАЯ строка корпуса `…XMAX 300 {when_sloppy}…`, а в ответе
+    головы стояли сами даты «с 6 по 11 октября» — владельцу показали шаблон вместо вопроса.
+
+    `ph` доводом, а не только изнутри: с подставленным `runner` (набор) живое окно считать нечем и
+    незачем — `placeholders()` ходит за живой таблицей периодов ради `when_cross`."""
     case, total = find_case(case_id, load_cases(cases_path))
     if case is None:
         return False, "кейса %s в корпусе нет (всего %d)" % (case_id, total), None
     if os.path.exists(shot_path(case_id)):
         return False, "черновик кейса %s уже собран: %s (перезаписи нет по построению)" % (
             case_id, shot_path(case_id)), load_shot(case_id)
-    if runner is None:                                   # ленивый импорт: тянет suggest и сеть
-        import trainer_run
+    import trainer_run                                   # ленивый импорт: тянет suggest и сеть
 
+    if ph is None:
+        ph = trainer_run.placeholders()
+    if runner is None:
         def runner(c):
-            return trainer_run.run_case(c, trainer_run.placeholders())
+            return trainer_run.run_case(c, ph)
     rec = runner(case)
     draft = (rec.get("draft") or "").strip()
     if not draft:
         return False, "голова не дала черновика (%s) — показывать нечего" % (
             rec.get("unknown") or "причина не названа"), None
+    raw = question_of(case)
     shot = {
         "case": case.get("id"), "total": total, "name": case.get("name") or "",
-        "lang": case.get("lang") or "", "question": question_of(case),
+        "lang": case.get("lang") or "", "question": trainer_run.substitute(raw, ph),
+        "question_raw": raw,
         "draft": draft, "note": rec.get("note") or "",
         "corpus": corpus_fingerprint(cases_path), "commit": head_commit(),
         "rules": rules_version(), "built_at": stamp(now),
