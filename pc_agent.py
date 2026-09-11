@@ -705,6 +705,24 @@ GATE_ANSWER_AT = ("тема «PC-дев», сообщением «задача: 
                   "(в теме-инбоксе голое слово не сработает — только «да N»/«нет N» и кнопки)")
 
 
+# ── КНОПКА ВЕРДИКТА ЭКЗАМЕНА В ГРУППЕ-ТРЕНАЖЁРЕ (11.09.2026) ───────────────────────────────
+# Карточку кейса шлёт `exam_show.py` НАШИМ ЖЕ токеном (dispatch_notify.send_chat_strict →
+# AGENT_BOT_TOKEN), поэтому тап по ней приходит СЮДА, а не модерботу. Нового бота заводить не
+# понадобилось ни для показа, ни для приёма: пара «dispatch_notify шлёт — pc_agent ловит» уже
+# работает на кнопках ворот, здесь она переиспользована.
+#
+# ЧТО ДЕЛАЕТ ТАП: зовёт `exam_show.py --tap ok|no --case N` — ту же дверь, что и рука с консоли.
+# Дверь судит право (`moderation_core.may_write_rule`, fail-closed) и кладёт вердикт КАНДИДАТОМ
+# в свой журнал. В реестр ворот, в счёт «пройдено N из 17» и в базу уроков эта ветка не пишет
+# ни байта — кандидат действующим не становится ни одним путём.
+#
+# Хвост callback_data — НОМЕР КЕЙСА, и регулярка пропускает только цифры: из Telegram в командную
+# строку не уезжает ничего, кроме числа, которое владелец мог бы набрать и сам.
+EXAM_CB_RE = re.compile(r"^exam:(ok|no):([0-9]{1,3})$")
+EXAM_ANSWER_AT = ("консоль репозитория, командой «exam_show.py --case N --tap ok|no --who <имя>» "
+                  "(словом в тему это пока не делается)")
+
+
 # ── КНОПКА СНЯТИЯ СИГНАЛЬНОЙ ОСТАНОВКИ ЯЩИКА ШТАБА (06.09.2026) ────────────────────────────
 # Ящик Штаба (`shtab_box_run`) сам останавливает полосу, когда его задания перестают
 # доказываться. До 06.09 остановка не выходила наружу вовсе, а снять её можно было ровно одним
@@ -972,6 +990,38 @@ def _gate_cli(action, commit):
                 f"Запасной путь — {GATE_ANSWER_AT}.")
 
 
+def _exam_cb_parse(data):
+    """callback_data кнопки экзамена → (вердикт, номер кейса) | None (не наш callback)."""
+    m = EXAM_CB_RE.match(str(data or ""))
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _exam_cli(action, case, who):
+    """Вердикт экзамена через дверь `exam_show.py --tap`: тот же путь, что и рука с консоли.
+
+    Субпроцессом и той же механикой, что `_gate_cli`, по той же причине: агент роутит тап и
+    показывает результат, а судит право и пишет журнал ДВЕРЬ. Имя автора едет из `from_user`
+    Telegram — выдумать его здесь нельзя, а без имени право fail-closed откажет, и это верно:
+    вердикт без автора непроверяем."""
+    if action not in ("ok", "no"):
+        return f"экзамен, кейс {case}: не понял кнопку ({action})."
+    if not VENV_PY.exists():
+        return f"экзамен, кейс {case}: не нашёл python venv ({VENV_PY})."
+    try:
+        r = subprocess.run(
+            [str(VENV_PY), str(REPO_DIR / "exam_show.py"), "--case", str(case),
+             "--tap", action, "--who", str(who or "")],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=90, cwd=str(REPO_DIR), creationflags=NO_WINDOW,
+        )
+        out = (r.stdout or "").strip() or (r.stderr or "").strip()
+        return out or (f"экзамен, кейс {case}: пустой ответ двери на «{action}». "
+                       f"Запасной путь — {EXAM_ANSWER_AT}.")
+    except Exception as e:
+        return (f"экзамен, кейс {case}: вердикт «{action}» НЕ записан ({type(e).__name__}: {e}). "
+                f"Запасной путь — {EXAM_ANSWER_AT}.")
+
+
 def _chain_cb_parse(data):
     """callback_data → (action, pid) | None (не наш callback)."""
     m = CHAIN_CB_RE.match(str(data or ""))
@@ -1049,6 +1099,7 @@ def _chain_cb_route(data, uid):
     zayavka = _zayavka_cb_parse(data)
     gate = _gate_cb_parse(data)
     box = _box_cb_parse(data)
+    exam = _exam_cb_parse(data)
     if not _chain_cb_authorized(uid):
         # owner-gate раньше разбора: чужому не подсказываем формат кнопок.
         return {"ok": False, "kind": None, "action": None, "pid": None,
@@ -1060,6 +1111,16 @@ def _chain_cb_route(data, uid):
         action, mark = box
         return {"ok": True, "kind": "box", "action": action, "pid": mark,
                 "answer": "🔓 снимаю остановку…", "alert": False, "note": None}
+    if exam is not None:
+        # Кнопка ВЕРДИКТА ЭКЗАМЕНА. Тост говорит «записываю кандидатом», а не «зачтено»: тап
+        # НИЧЕГО не засчитывает, счёта «пройдено N из 17» не двигает и ворот не открывает —
+        # обещать кнопкой зачёт значило бы соврать о последствиях раньше, чем владелец отпустит
+        # палец. Что именно легло — скажет ответ самой двери.
+        action, case = exam
+        return {"ok": True, "kind": "exam", "action": action, "pid": case,
+                "answer": ("✅ записываю «верно» кандидатом…" if action == "ok"
+                           else "❌ записываю «неверно» кандидатом…"),
+                "alert": False, "note": None}
     if gate is not None:
         # Кнопка ВОРОТ клиентского контура. Тост говорит РАЗНОЕ про «да» и «нет» намеренно: «да»
         # только ЗАПИСЫВАЕТ основание (применение пойдёт штатной реконсиляцией), «нет» не применяет
@@ -1078,7 +1139,8 @@ def _chain_cb_route(data, uid):
                 "answer": ("✅ принимаю к сведению…" if action == "yes" else "❌ закрываю заявку…"),
                 "alert": False, "note": None}
     if parsed is None:
-        # Наш бот (AGENT_BOT_TOKEN) шлёт ТОЛЬКО карточки цепи, заявок и ворот → неразобранный
+        # Наш бот (AGENT_BOT_TOKEN) шлёт ТОЛЬКО карточки цепи, заявок, ворот, ящика и экзамена
+        # (пять видов, шестого нет) → неразобранный
         # callback = старый формат / протухшая карточка. Честно говорим это, а не молчим.
         #
         # ПРИЧИНУ НЕ ВЫДУМЫВАЕМ (класс 06.09.2026, живой замер). 05.09 10:29:12 владелец нажал
@@ -1146,8 +1208,14 @@ async def on_chain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3) действие исполняет демон / ступень G (свой канал к Bridge), результат — сообщением
     #    в чат карточки. Роутим ПО ВИДУ кнопки: у цепи и у заявки разные исполнители и разные
     #    последствия, и складывать их в один вызов значило бы звать «стоп цепи» на заявке.
-    runner = {"zayavka": _zayavka_cli, "gate": _gate_cli,
-              "box": _box_cli}.get(route.get("kind"), _chain_cli)
+    # Имя автора нужно ровно одной двери — экзамену (вердикт без автора непроверяем), поэтому
+    # оно подмешивается замыканием, а не третьим аргументом всем четырём: лишний параметр у
+    # `_chain_cli`/`_gate_cli` означал бы, что имя тапнувшего им зачем-то нужно.
+    # `getattr`, а не `.username`: у пользователя Telegram ника может не быть вовсе (поле
+    # необязательное), и падение здесь уронило бы обработчик ВСЕХ кнопок, а не одной нашей.
+    who = getattr(q.from_user, "username", "") or ""
+    runner = {"zayavka": _zayavka_cli, "gate": _gate_cli, "box": _box_cli,
+              "exam": (lambda a, p: _exam_cli(a, p, who))}.get(route.get("kind"), _chain_cli)
     reply = await asyncio.to_thread(runner, route["action"], route["pid"])
     await _chain_reply(context, q, reply)
 
