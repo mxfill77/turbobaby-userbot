@@ -40,6 +40,7 @@ import queue_snapshot_pc
 import recon_auto
 import review_intake
 import series_pc
+import shtab_box
 import vitrina_pc as vp
 import vitrina_pc_run as vpr
 
@@ -489,6 +490,164 @@ class TestSeriesCountsOnlyTheProven(unittest.TestCase):
         rep = run.build(root=tempfile.gettempdir(), now=NOW, since=NOW - 10,
                         runner=lambda *a, **k: (_ for _ in ()).throw(OSError("нет")))
         self.assertIn("СЕРИЯ ЦЕПОЧЕК:", cd.render(rep))
+
+
+# ───────────── ИМЯ РЯДА ПРОТИВ ПЕРЕИСПОЛЬЗУЕМОГО НОМЕРА (задание 32-a) ─────────────
+
+_GOAL_OLD = "[от Штаба дата=2026-09-09 ключ=09-x-staryi-ryad.0909] ЗАДАНИЕ ШТАБА ИЗ ЯЩИКА"
+_GOAL_NEW = "[от Штаба дата=2026-09-11 ключ=32-a-imya-ryada.1109] ЗАДАНИЕ ШТАБА ИЗ ЯЩИКА"
+_GOAL_SAME_DAY = "[от Штаба дата=2026-09-11 ключ=31-a-pokaz-neizvestno.1109] ЗАДАНИЕ ШТАБА"
+_VERDICT_PROVED = {"verdict": done_judge_pc.DONE, "address": {"words": "слова адреса"},
+                   "reason": "V0: PROVEN / all_gates_passed"}
+
+
+def _named_row(tid, goal, at=100.0):
+    """Закрытая строка слепка — РОВНО те поля, что кладёт `contour_digest_run.all_closed`.
+
+    Имя своё, а не `_closed`: под этим именем в файле УЖЕ живёт помощник (:55) с другой
+    формой аргументов, и второй экземпляр молча заслонил бы первый — 28 чужих тестов
+    падали с `TypeError`, пока имя было общим (замер 11.09).
+    """
+    return {"id": tid, "at": at, "outcome": "done", "goal": goal, "why": ""}
+
+
+def _note_as_the_lane_does(root, tid, verdict, goal=None):
+    """Позвать писателя ТАК, КАК ЕГО ЗОВЁТ ПОЛОСА НА ЭТОМ КОДЕ.
+
+    Шим назван вслух и нужен ровно контролю обратной стороны: до правки имени не
+    существует вовсе, и контроль, написанный только под новый вызов, падал бы на
+    HEAD по отсутствию имени, а не по существу. Тогда «честная цепочка считается»
+    осталось бы недоказанным ДО правки — то есть нечем было бы отличить починку от
+    показа, который молчит всегда.
+    """
+    try:
+        return done_judge_pc.note(tid, verdict, root=root, name=cd.row_name(tid, goal))
+    except (AttributeError, TypeError):                  # код до 11.09: имени нет ни в одной двери
+        return done_judge_pc.note(tid, verdict, root=root)
+
+
+class TestRowNameNotNumber(unittest.TestCase):
+    """ОТРИЦАТЕЛЬНЫЙ ТЕСТ №2 переписи 30-a: вердикт под номером не смеет зачесть ДРУГОЙ ряд.
+
+    Корпус — живая улика полосы: за 10.09.2026 нумерация очереди начиналась заново
+    ДВАЖДЫ, и в реестре судьи (плоский `{номер: вердикт}`, 158 ключей от 1 до 245,
+    поля дня нет ни одного) лежат номера И до сброса, И после. Обычный тест здесь
+    зелен всегда: запись есть, число печатается, исключений нет.
+
+    ПИСАТЕЛЬ И ЧИТАТЕЛЬ ЗДЕСЬ НАСТОЯЩИЕ, а реестр лежит файлом на своём корне:
+    между `done_judge_pc.note` и `contour_digest.judged_of` лежит ключ словаря, и
+    молча разойтись может именно он. Боевого реестра и боевой очереди тест не
+    касается ни одной веткой.
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="row_name_32a_")
+        self.addCleanup(__import__("shutil").rmtree, self.root, True)
+
+    def _series(self, rows):
+        return cd.series(rows, judged=done_judge_pc.read_ledger(self.root))
+
+    # ─── падает на сегодняшнем коде ───
+
+    def test_a_verdict_left_under_the_bare_number_does_not_count_a_new_row(self):
+        """ГЛАВНЫЙ: `proved` под номером 4 от 09.09 против НОВОГО ряда 4 от 11.09.
+
+        Пишется голым номером НАМЕРЕННО — так писал код до 11.09, и ровно так лежат
+        151 запись живого реестра, чьё имя восстановить нечем.
+        """
+        done_judge_pc.note(4, _VERDICT_PROVED, root=self.root)
+        got = self._series([_named_row(4, _GOAL_NEW)])
+        self.assertEqual(got["streak"], 0, "чужой вердикт зачёл ряд, которого судья не судил")
+        self.assertEqual(got["proved"], 0)
+        self.assertEqual(got["unjudged"], 1, "исход обязан быть «судья не судил», а не «доказано»")
+
+    def test_a_verdict_of_the_previous_row_with_the_same_number_does_not_count(self):
+        """То же, но вердикт лёг ИМЕНЕМ прежнего ряда: имя обязано не совпасть."""
+        _note_as_the_lane_does(self.root, 4, _VERDICT_PROVED, goal=_GOAL_OLD)
+        got = self._series([_named_row(4, _GOAL_NEW)])
+        self.assertEqual(got["streak"], 0)
+        self.assertEqual(got["unjudged"], 1)
+
+    def test_the_judge_writes_the_name_and_not_the_number(self):
+        """Продукт задания: ключ реестра — имя. Иначе сшивка осталась бы номерной."""
+        _note_as_the_lane_does(self.root, 4, _VERDICT_PROVED, goal=_GOAL_NEW)
+        keys = list(done_judge_pc.read_ledger(self.root))
+        self.assertEqual(keys, ["32-a-imya-ryada.1109#4"])
+
+    # ─── КОНТРОЛЬ ОБРАТНОЙ СТОРОНЫ: зелен и ДО правки ───
+
+    def test_an_honest_proven_chain_is_still_counted(self):
+        """Показ, который не засчитывает НИКОГДА, зелен по той же причине, что сломанный."""
+        _note_as_the_lane_does(self.root, 4, _VERDICT_PROVED, goal=_GOAL_NEW)
+        got = self._series([_named_row(4, _GOAL_NEW)])
+        self.assertEqual(got["streak"], 1, "честная доказанная цепочка перестала считаться")
+        self.assertEqual(got["proved"], 1)
+
+    def test_a_chain_of_three_honest_rows_still_grows(self):
+        """Серия обязана РАСТИ: единица могла бы быть случайностью одной ветки."""
+        rows = []
+        for num, goal in ((1, _GOAL_OLD), (2, _GOAL_SAME_DAY), (3, _GOAL_NEW)):
+            _note_as_the_lane_does(self.root, num, _VERDICT_PROVED, goal=goal)
+            rows.append(_named_row(num, goal, at=100.0 + num))
+        got = self._series(rows)
+        self.assertEqual((got["streak"], got["proved"]), (3, 3))
+
+    # ─── свойства самого имени ───
+
+    def test_two_resets_in_one_day_are_still_two_names(self):
+        """Почему не «номер плюс день»: 10.09 нумерация сбрасывалась ДВАЖДЫ ЗА СУТКИ.
+
+        Оба маркера несут ОДИН день — «номер+день» дал бы им одно имя, и вердикт
+        одного ряда зачёл бы другой.
+        """
+        self.assertNotEqual(cd.row_name(4, _GOAL_NEW), cd.row_name(4, _GOAL_SAME_DAY))
+
+    def test_a_resent_task_keeps_its_key_and_changes_its_number(self):
+        """Почему не «ключ маркера» один: у переотправленной задачи ключ ТОТ ЖЕ."""
+        self.assertNotEqual(cd.row_name(4, _GOAL_NEW), cd.row_name(9, _GOAL_NEW))
+
+    def test_a_row_without_a_marker_keeps_the_number_and_that_is_named(self):
+        """Названный остаток: маркера нет — имени нет, остаётся АДРЕС (номер)."""
+        self.assertEqual(cd.row_name(4, "ЦЕЛЬ: правка"), "4")
+        self.assertEqual(cd.row_name(4, None), "4")
+
+    def test_the_name_is_raised_from_the_row_and_not_from_a_report_about_it(self):
+        """Имя поднимается из ПЕРВОЙ строки ряда, а не из текста, где маркер упомянут."""
+        self.assertEqual(cd.row_name(4, "отчёт: задача [от Штаба дата=2026-09-11 "
+                                        "ключ=32-a-imya-ryada.1109] сдана"), "4")
+
+    def test_the_one_form_agrees_with_every_marker_owner(self):
+        """Пятый экземпляр разбора разошёлся бы молча — согласие сверяется с хозяевами."""
+        for owner, sample in ((shtab_box.MARK_RE, _GOAL_NEW),
+                              (recon_auto._TASK_RE, "[разведка дата=2026-09-05 ключ=cc17298127d2]"),
+                              (recon_auto._ASK_RE,
+                               "[разведка-заявка дата=2026-09-05 ключ=cc17298127d2]"),
+                              (review_intake._RE_CLAIM,
+                               "[заявка-ревью дата=2026-09-09 ключ=eab084d7799b]")):
+            his = owner.match(sample)
+            mine = cd.ROW_MARK.match(sample)
+            self.assertIsNotNone(his, "образец разошёлся с живой регуляркой хозяина: %r" % sample)
+            self.assertIsNotNone(mine, "своя форма не узнала живой маркер: %r" % sample)
+            self.assertEqual(mine.group(1), his.group(2))
+            self.assertEqual(cd.row_name(7, sample), "%s#7" % his.group(2))
+
+    def test_the_longest_legal_marker_survives_the_goal_line(self):
+        """Граница измерена: писатель видит ТЕКСТ, читатель — обрезанную цель.
+
+        Обрезка `goal_line` по 90 символов обязана оставить маркер целым — иначе
+        имена двух дверей разошлись бы молча на длинном ключе.
+        """
+        longest = "[от Штаба дата=2026-09-11 ключ=%s] ЗАДАНИЕ ШТАБА ИЗ ЯЩИКА" % ("k" * 40)
+        self.assertLessEqual(longest.index("]") + 1, queue_snapshot_pc.GOAL_MAX)
+        self.assertEqual(cd.row_name(4, queue_snapshot_pc.goal_line(longest)),
+                         cd.row_name(4, longest))
+        self.assertEqual(cd.row_name(4, longest), "%s#4" % ("k" * 40))
+
+    def test_the_reader_asks_the_ledger_by_name_end_to_end(self):
+        """Обе двери одной строкой: что писатель положил, читатель обязан найти."""
+        _note_as_the_lane_does(self.root, 5, _VERDICT_PROVED, goal=_GOAL_NEW)
+        said = cd.judged_of(5, done_judge_pc.read_ledger(self.root), goal=_GOAL_NEW)
+        self.assertEqual(said, cd.JUDGE_PROVED)
 
 
 class TestSeriesEndToEnd(unittest.TestCase):
