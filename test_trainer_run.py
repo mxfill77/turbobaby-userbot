@@ -1669,5 +1669,128 @@ class KontrolnayaTochkaNabora(unittest.TestCase):
         self.assertFalse(tr.writes_registry(a))
 
 
+# ───────── ПУСТОЕ ОЖИДАНИЕ = ТРЕТИЙ ИСХОД, А НЕ ПРОВАЛ (класс, заведён 11.09.2026) ─────────
+# ЖИВОЙ СЛУЧАЙ, из которого класс родился: кейс 3 предполёта 11.09 покраснел чеком «строка J
+# дословно», хотя ни сборка, ни голова не виноваты — записка круга 1 quote-блока НЕ НЕСЛА, и
+# чек искал строку, которой не существует (docs/artifacts/2026-09-11-ЗАПИСКА-kejs3-sborka-1109.md).
+#
+# ГОЛОВЫ ЗДЕСЬ НЕТ НИ ОДНОГО КРУГА и сети нет ни одного запроса: обе записки — строки ниже.
+# Это ОТРИЦАТЕЛЬНЫЙ тест класса: фикстура A обязана дать «неизвестно», фикстура B — остаться
+# ПРОВАЛОМ, потому что там ожидание есть и судить ЕСТЬ чем. Ослабь любую из двух — и правка
+# превратится либо в заплату на один чек, либо в глушилку настоящих красных.
+J_LINE = "NMAX — 307 ฿/день; итого 1535 ฿; депозит 3000 ฿; свободен на эти даты."
+D_LINE = "Доставка в Раваи — 590 ฿ (один раз, туда)."
+NOTE_WITH = ("ЦЕНА (данные Календаря): NMAX 155, 06.10.2026–11.10.2026.\n"
+             "<<<QUOTE>>>\n" + J_LINE + "\n<<<END_QUOTE>>>\n"
+             "<<<DELIVERY>>>\n" + D_LINE + "\n<<<END_DELIVERY>>>\n")
+NOTE_WITHOUT = ("ЦЕНА: не удалось однозначно разобрать модель/даты для Календаря — НЕ называй "
+                "цифр и попроси уточнить модель и даты.\n")
+DRAFT_NO_FIGURE = ("Здравствуйте! Спасибо за обращение. Подскажите, пожалуйста, точную модель и "
+                   "даты — подберу вариант и всё оформим.")
+TRANSCRIPT = ("[клиент]: Здравствуйте! Хочу арендовать NMAX 155 с 6 по 11 октября.\n"
+              "[клиент]: Вот точка доставки: https://www.google.com/maps/place/Rawai+Beach/"
+              "@7.771,98.327,15z")
+CASE_PUSTO = {"id": 3, "name": "фикстура кейса 3 (голова не звалась)", "lang": "ru",
+              "zone": "Раваи", "zone_price": 590,
+              "expect": {"quote": True, "delivery": True, "price_figure": True, "sheet": True}}
+# ЧЕТЫРЕ ЧЕКА КЛАССА: ожидание каждого приходит из ЦЕНОВОЙ ЗАПИСКИ и может не собраться вовсе.
+CLASS_CHECKS = ("строка J дословно", "доставка = цена зоны", "цена цифрой",
+                "сетка прайса дословно")
+
+
+class PustoeOzhidanie(unittest.TestCase):
+    """Правило ОДНО и на все чеки класса: ожидание не собралось → «судить нечем»."""
+
+    def checks(self, note, draft=DRAFT_NO_FIGURE, case=None):
+        case = dict(case or CASE_PUSTO, _transcript=TRANSCRIPT)
+        hints = suggest.extract_booking_hints(TRANSCRIPT)
+        exp = tr.expectations(case, TRANSCRIPT, note, hints)
+        return {c["name"]: c for c in tr.case_checks(case, draft, exp)}
+
+    def test_pustoe_ozhidanie_daet_neizvestno_a_ne_proval(self):
+        """ФИКСТУРА A. Записки без quote-блока достаточно, чтобы чек перестал судить."""
+        got = self.checks(NOTE_WITHOUT)
+        chk = got["строка J дословно"]
+        self.assertTrue(chk.get("unknown"),
+                        "чек красит RED там, где ожидания нет вовсе — судить было нечем")
+        self.assertIn("quote-блок", chk["unknown"])
+
+    def test_pravilo_odno_na_vse_cheki_klassa_a_ne_zaplata(self):
+        """Заплата на один чек не засчитана: все ЧЕТЫРЕ чека класса обязаны отдать третий исход."""
+        got = self.checks(NOTE_WITHOUT)
+        got_unknown = [n for n in CLASS_CHECKS if got.get(n, {}).get("unknown")]
+        self.assertEqual(sorted(got_unknown), sorted(CLASS_CHECKS),
+                         "правило накрыло не все чеки класса: " + repr(got_unknown))
+
+    def test_ozhidanie_est_otvet_bez_cifry_ostayotsya_provalom(self):
+        """ФИКСТУРА B. Блок в записке ЕСТЬ — судить есть чем, и провал обязан остаться провалом."""
+        got = self.checks(NOTE_WITH)
+        for name in ("строка J дословно", "доставка = цена зоны", "цена цифрой"):
+            chk = got[name]
+            self.assertFalse(chk["ok"], f"[{name}] ответ без цифры внезапно зелёный")
+            self.assertFalse(chk.get("unknown"),
+                             f"[{name}] настоящий красный проглочен «неизвестным»")
+
+    def test_neizvestnoe_ne_prevrashchaetsya_v_zelyonoe(self):
+        """ПРЯМОЙ ЗАПРЕТ задания: пустое ожидание в ЗЕЛЁНОЕ не переводится.
+
+        Ловушка была реальной: у чека «цена цифрой» есть запасная ветка «хоть какая-то цифра с
+        валютой», и на записке БЕЗ блоков она красила зелёным цифру, взятую головой из воздуха."""
+        draft = "Здравствуйте! Аренда выйдет 1500 ฿ за весь срок."
+        chk = self.checks(NOTE_WITHOUT, draft=draft)["цена цифрой"]
+        self.assertTrue(chk.get("unknown"),
+                        "цифра из воздуха зачтена зелёным: сверять было не с чем")
+
+    def test_krug_uhodit_v_neizvestno_a_ne_v_krasnoe(self):
+        """ЖИВОЙ `run_case`: круг с несобранным ожиданием — НЕ зелёный и НЕ красный.
+
+        Голова подменена стендом (сети нет), но наблюдатель `_HeadWatch` остаётся настоящим:
+        стенд её «спрашивает», поэтому молчанием исход не объясняется — он объясняется ЗАПИСКОЙ."""
+        case = dict(CASE_PUSTO, lines=["Здравствуйте! Хочу арендовать NMAX 155 с 6 по 11 октября."])
+        keep = (tr.generate, suggest._default_llm)
+        self.addCleanup(lambda: (setattr(tr, "generate", keep[0]),
+                                 setattr(suggest, "_default_llm", keep[1])))
+        suggest._default_llm = lambda system, user: DRAFT_NO_FIGURE
+        tr.generate = lambda transcript, first: (
+            suggest._default_llm("s", "u"), NOTE_WITHOUT,
+            suggest.extract_booking_hints(transcript))
+        res = tr.run_case(case, {}, log=lambda *a, **k: None)
+        self.assertTrue(res.get("unknown"), "круг без ожидания назван красным")
+        self.assertFalse(res["ok"], "круг без ожидания зачтён зелёным")
+        self.assertIn("судить нечем", res["unknown"])
+
+    def test_grafa_ishodov_i_trevoga_pro_pribor(self):
+        """Число неизвестных звучит СЛОВАМИ, и доля выше пятой части объявляется тревогой."""
+        rows = [{"ok": True, "unknown": None}, {"ok": True, "unknown": None},
+                {"ok": False, "unknown": None}, {"ok": False, "unknown": "судить нечем: X"}]
+        c = tr.outcome_counts(rows)
+        self.assertEqual((c["green"], c["red"], c["unknown"], c["total"]), (2, 1, 1, 4))
+        self.assertTrue(c["alarm"], "доля неизвестных 1/4 выше пятой части, а тревоги нет")
+        self.assertIn("ПРИБОР", c["alarm"])
+        self.assertIn("НЕИЗВЕСТНО 1 из 4", tr.outcome_line(rows))
+        tihie = [{"ok": True, "unknown": None}] * 9 + [{"ok": False, "unknown": "судить нечем: X"}]
+        self.assertFalse(tr.outcome_counts(tihie)["alarm"], "тревога поднята на доле 1/10")
+
+    def test_priznaki_zapiski_ryadom_s_chernovikom(self):
+        """Причина красного перестаёт быть невосстановимой: признаки записки видны в отчёте."""
+        self.assertIn("quote-блок: есть", tr.note_marks(NOTE_WITH))
+        self.assertIn("доставка: есть", tr.note_marks(NOTE_WITH))
+        bez = tr.note_marks(NOTE_WITHOUT)
+        self.assertIn("quote-блок: НЕТ", bez)
+        self.assertIn("не удалось однозначно разобрать", bez, "ветка записки себя не назвала")
+        self.assertEqual(tr.note_marks(""), "записки нет вовсе")
+
+    def test_otchyot_pokazyvaet_neizvestnye_otdelno(self):
+        """Круг «неизвестно» не проваливается между строк: свой раздел, причина и записка."""
+        results = [{"id": "3", "name": "кейс 3", "run": 1, "ok": False,
+                    "unknown": "[строка J дословно] судить нечем: quote-блока нет",
+                    "checks": [], "draft": DRAFT_NO_FIGURE, "note": NOTE_WITHOUT}]
+        md = tr.report_md(_rec(result="unknown"), results, C40, 1)
+        self.assertIn("НЕИЗВЕСТНО — судить было нечем", md)
+        self.assertIn("Исходы кейсо-прогонов:", md)
+        self.assertIn("НЕИЗВЕСТНО 1 из 1", md)
+        self.assertIn("quote-блок: НЕТ", md)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

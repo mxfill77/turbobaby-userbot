@@ -555,11 +555,14 @@ def case_checks(case, draft, exp):
         sheet = exp.get("sheet_line")
         lines = [ln.strip() for ln in (sheet or "").split("\n") if ln.strip()]
         missing = [ln for ln in lines if ln not in client]
-        out.append(_chk("сетка прайса дословно", bool(lines) and not missing,
-                        "строки сетки парка из sheet-блока — посимвольно в тексте клиента",
-                        ("сетка не собрана — прайс-интент не сработал" if not lines
-                         else ("не найдено дословно: " + " | ".join(missing)[:200] if missing
-                               else "сетка в черновике посимвольно"))))
+        chk = _chk("сетка прайса дословно", bool(lines) and not missing,
+                   "строки сетки парка из sheet-блока — посимвольно в тексте клиента",
+                   ("сетка не собрана — прайс-интент не сработал" if not lines
+                    else ("не найдено дословно: " + " | ".join(missing)[:200] if missing
+                          else "сетка в черновике посимвольно")))
+        if not lines:                          # ожидание не собралось → третий исход (правило класса)
+            chk["unknown"] = suggest.no_basis("sheet-блока в ценовой записке нет — искать нечего")
+        out.append(chk)
     # 8. контрпример прайса: клиент про сетку не спрашивал — вываливать её нельзя
     if want.get("no_sheet"):
         hit = _SHEET_LINE_RE.findall(client)
@@ -575,10 +578,17 @@ def case_checks(case, draft, exp):
         # ЧИСЛО ЦЕЛИКОМ, а не кусок: «590» внутри «5900» — другая цена (правило suggest.word_hit)
         hit = [n for n in nums if suggest.word_hit(n, client)]
         has = bool(hit) if nums else bool(re.search(r"\d[\d\s]{2,}\s*(?:฿|бат|thb|baht)", client, re.I))
-        out.append(_chk("цена цифрой", has,
-                        "посчитанная цена (числа из quote/сетки) звучит клиенту",
-                        ("числа в тексте: " + ", ".join(hit[:4])) if hit else
-                        ("посчитанных чисел в тексте нет" if nums else "цифры цены в тексте нет")))
+        chk = _chk("цена цифрой", has,
+                   "посчитанная цена (числа из quote/сетки) звучит клиенту",
+                   ("числа в тексте: " + ", ".join(hit[:4])) if hit else
+                   ("посчитанных чисел в тексте нет" if nums else "цифры цены в тексте нет"))
+        if not nums:
+            # Ожидания нет: цену НЕ ПОСЧИТАЛИ, сверять не с чем. Запасная ветка меряет «хоть какую-то
+            # цифру с валютой» — а такая цифра могла прийти и из головы, так что её зелёное ничего не
+            # доказывало и раньше. Третий исход честнее обоих исходов запасной ветки.
+            chk["unknown"] = suggest.no_basis("посчитанной цены в записке нет "
+                                              "(ни quote-, ни sheet-блока) — сверять не с чем")
+        out.append(chk)
 
     # 10. тайские буквы: ฿ живёт, буквы — нет (strip_thai отработал)
     thai = [c for c in client if trainer._is_thai_letter(c)]
@@ -1119,6 +1129,21 @@ def run_case(case, ph, log=print):
                                 "непустой черновик от боевого пайплайна",
                                 "голова ответила, но черновик пуст — оборвался пайплайн")]}
     checks = case_checks(case, draft, expectations(case, tr, note, hints))
+    # ТРЕТИЙ ИСХОД ПО ОЖИДАНИЮ (11.09.2026, правило класса — `suggest.no_basis`): хотя бы один чек
+    # не смог собрать ожидание из ценовой записки → судить НЕЧЕМ, и кейс уходит в ТУ ЖЕ ветку
+    # `unknown`, что и молчащая голова. Не зелёный (доказывать нечем) и не красный (кода мы не
+    # уличили — пустой была ЗАПИСКА). Прочие провалы круга при этом НЕ ЗАМАЛЧИВАЮТСЯ: они
+    # названы в причине поимённо, хотя вердикту и не идут.
+    blank = [c for c in checks if c.get("unknown")]
+    if blank:
+        why = "; ".join("[%s] %s" % (c["name"], c["unknown"]) for c in blank)
+        other_bad = [c["name"] for c in checks
+                     if not c["ok"] and not c.get("skipped") and not c.get("unknown")]
+        if other_bad:
+            why += (" · сверх того провалено (вердикту не идёт, кейс неизвестен): "
+                    + ", ".join(other_bad))
+        return {"id": case.get("id"), "name": case.get("name"), "ok": False, "unknown": why,
+                "checks": checks, "draft": draft, "note": note}
     return {"id": case.get("id"), "name": case.get("name"), "unknown": None,
             "ok": all(c["ok"] for c in checks if not c.get("skipped")),
             "checks": checks, "draft": draft, "note": note}
@@ -1363,6 +1388,58 @@ def write_verdict(rec, path=None):
 
 # ─────────────────────────────────────── отчёт ───────────────────────────────────────────────
 
+def note_marks(note):
+    """ПРИЗНАКИ ЦЕНОВОЙ ЗАПИСКИ одной строкой: есть ли quote-блок, блок доставки, сетка,
+    подтверждено ли наличие, и ЧЕМ ЗАПИСКА НАЗЫВАЕТ СЕБЯ (её первая строка).
+
+    Зачем: до 11.09.2026 в отчёте был виден ЧЕРНОВИК и НЕ была видна ЗАПИСКА, из которой чек брал
+    ожидание, — причина красного оказывалась невосстановимой задним числом (живой случай: кейс 3
+    предполёта, `docs/artifacts/2026-09-11-ЗАПИСКА-kejs3-sborka-1109.md`, §5 дефект 2: чтобы
+    назвать ветку, пришлось снимать записку заново отдельной пробой, и круга это уже не вернуло).
+
+    Ветки, которые называют себя, видны прямо в первой строке («ЦЕНА: дат аренды в диалоге НЕТ»,
+    «ЦЕНА: не удалось однозначно разобрать модель/даты», нота границы сезонов); ветка `ok` себя не
+    называет — её признак несут блоки, и они здесь тоже есть. Ни секретов, ни клиентского текста
+    тут не появляется: записку пишет НАШ код, и берём мы из неё только наличие блоков и заголовок."""
+    n = note or ""
+    if not n.strip():
+        return "записки нет вовсе"
+    head = " ".join(n.strip().split("\n")[0].split())
+    return ("quote-блок: %s · доставка: %s · сетка: %s · наличие: %s · ветка (первая строка): «%s»"
+            % ("есть" if suggest._quote_block_from_note(n) else "НЕТ",
+               "есть" if suggest._delivery_block_from_note(n) else "НЕТ",
+               "есть" if suggest._sheet_block_from_note(n) else "НЕТ",
+               "подтверждено" if suggest.availability_from_note(n) else "не подтверждено",
+               head[:120]))
+
+
+def outcome_counts(results):
+    """ГРОМКАЯ ГРАФА исходов кейсо-прогонов → dict(green, red, unknown, total, share, alarm).
+
+    `alarm` — непустая строка, когда неизвестных БОЛЬШЕ ПЯТОЙ ЧАСТИ: это тревога про ПРИБОР
+    (ожидания перестали собираться), а не про продукт, и она обязана звучать СЛОВАМИ, а не
+    выводиться читателем из разницы «кейсы минус чеки»."""
+    total = len(results)
+    unk = sum(1 for r in results if r.get("unknown"))
+    green = sum(1 for r in results if r.get("ok") and not r.get("unknown"))
+    red = total - green - unk
+    share = (float(unk) / total) if total else 0.0
+    alarm = ""
+    if total and unk * 5 > total:
+        alarm = ("ТРЕВОГА ПРО ПРИБОР: неизвестных %d из %d (%.0f%%) — выше пятой части. Ожидания "
+                 "не собираются, и это вопрос к ПРИБОРУ и его источникам, а не к продукту."
+                 % (unk, total, share * 100))
+    return {"green": green, "red": red, "unknown": unk, "total": total,
+            "share": share, "alarm": alarm}
+
+
+def outcome_line(results):
+    """Та же графа одной строкой — для итога прогона в консоли и шапки отчёта."""
+    c = outcome_counts(results)
+    return ("кейсо-прогонов %d: зелёных %d · красных %d · НЕИЗВЕСТНО %d из %d"
+            % (c["total"], c["green"], c["red"], c["unknown"], c["total"]))
+
+
 def report_md(rec, results, commit, runs):
     """Отчёт прогона таблицей (для docs/artifacts) — по кейсам и провалившимся чекам."""
     lines = [f"# Прогон тренажёра — вердикт {rec['result'].upper()}", "",
@@ -1375,10 +1452,13 @@ def report_md(rec, results, commit, runs):
              + f" · **корпус:** {rec['corpus']} (`{rec['corpus_sha']}`)", "",
              f"**Кейсы:** {rec['cases']}/{rec['cases_total']} · "
              f"**чеки:** {rec['checks_passed']}/{rec['checks_total']}"
-             + (f" · **неизвестно:** {rec.get('unknown')} кейсо-прогонов"
-                if rec.get("unknown") else "")
              + (f" · **прощено большинством:** {rec.get('tolerated')} кругов"
                 if rec.get("tolerated") else ""), "",
+             # ГРОМКАЯ ГРАФА ИСХОДОВ: зелёные/красные/неизвестные из скольких — отдельной строкой и
+             # ВСЕГДА, а не только когда неизвестные есть. Читатель не обязан выводить их вычитанием.
+             "**Исходы кейсо-прогонов:** " + outcome_line(results), "",
+             *([f"> ⚠️ **{outcome_counts(results)['alarm']}**", ""]
+               if outcome_counts(results)["alarm"] else []),
              f"**Критерий:** {rec.get('criterion') or '—'}", "",
              f"**Кругов по кейсам:** `{rec.get('runs_line') or '—'}`", "",
              ("**Контрольная точка:** взято из неё кейсов %d (кругов %d — в этом заходе они НЕ "
@@ -1412,7 +1492,20 @@ def report_md(rec, results, commit, runs):
                     continue
                 lines += [f"- **[{c['name']}]**", f"  - ожидание: {c['expected']}",
                           f"  - факт: {c['fact']}"]
-            lines += ["", "```", (r.get("draft") or "")[:1200], "```", ""]
+            # ПРИЗНАКИ ЗАПИСКИ РЯДОМ С ЧЕРНОВИКОМ: чек берёт ожидание из неё, и без неё причина
+            # красного невосстановима задним числом (см. `note_marks`).
+            lines += ["- признаки записки: " + note_marks(r.get("note")),
+                      "", "```", (r.get("draft") or "")[:1200], "```", ""]
+    unk_rows = [r for r in results if r.get("unknown")]
+    if unk_rows:
+        lines += ["", "## НЕИЗВЕСТНО — судить было нечем", "",
+                  "Эти круги НЕ зелёные и НЕ красные: ворот они не открывают, в зачётную серию не "
+                  "идут и её же не рвут. Записка показана рядом — по ней видно, чего не хватило.", ""]
+        for r in unk_rows:
+            lines += [f"### кейс {r['id']} «{r['name']}», прогон {r['run']}",
+                      f"- причина: {r['unknown']}",
+                      "- признаки записки: " + note_marks(r.get("note")),
+                      "", "```", (r.get("draft") or "")[:1200], "```", ""]
     return "\n".join(lines) + "\n"
 
 
@@ -1511,11 +1604,16 @@ def main(argv=None):
     pinfo = point_info(point)
     rec = build_verdict(commit, total, passed, ok, allc, a.runs, clean, failed, sha,
                         unknown=unknown, bind=bind, plan=plan, point=pinfo)
-    print("\nИТОГ: %s — кейсов %d/%d, чеков %d/%d, прогонов %d, дерево %s%s"
+    print("\nИТОГ: %s — кейсов %d/%d, чеков %d/%d, прогонов %d, дерево %s"
           % (rec["result"].upper(), rec["cases"], rec["cases_total"], rec["checks_passed"],
              rec["checks_total"], rec["runs"],
-             "чистое" if clean else "ГРЯЗНОЕ (tree_dirty: true)",
-             (", НЕИЗВЕСТНО %d кейсо-прогонов" % len(unknown)) if unknown else ""))
+             "чистое" if clean else "ГРЯЗНОЕ (tree_dirty: true)"))
+    # ГРОМКАЯ ГРАФА ИСХОДОВ — отдельной строкой и ВСЕГДА (а не хвостом «, НЕИЗВЕСТНО N» только при
+    # ненулевых): число неизвестных обязано быть видно словами, а не выводиться вычитанием.
+    print("ИСХОДЫ: " + outcome_line(results))
+    _alarm = outcome_counts(results)["alarm"]
+    if _alarm:
+        print("⚠️  " + _alarm)
     # ПРАВИЛО И ЕГО ПРИМЕНЕНИЕ — двумя строками, чтобы «каким правилом получен этот исход»
     # читалось из вывода прогона, а не восстанавливалось чтением кода.
     print("КРИТЕРИЙ: " + rec["criterion"])
