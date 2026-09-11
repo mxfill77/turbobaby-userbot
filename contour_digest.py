@@ -588,6 +588,37 @@ def _recon_record(ckey, rec, table):
     return None
 
 
+def _closed_by_num(closed):
+    """Реестр закрытых рядов → разрез ПО НОМЕРУ, свежая запись побеждает. → dict.
+
+    Единственное место полосы, которое спрашивает реестр закрытых по номеру: у заявки ступени B
+    сохранён `queue_id`, и другого адреса у неё нет. Само чтение осталось прежним, поменялся
+    реестр: с 12.09.2026 его ключ — ЛИЧНОСТЬ ряда (`queue_snapshot_pc.closed_id`, «номер +
+    цель»), потому что номер очередь переиспользует. Прямое `closed.get(номер)` после этого
+    промахивалось бы ВСЕГДА, и каждая заявка с закрывшимся рядом молча уехала бы в `offsnap`.
+
+    Одноимённых записей теперь может быть две — берётся ПОЗДНЯЯ: заявка спрашивает про судьбу
+    ряда, а не про историю номера, и её ряд — тот, что жил под этим номером последним. Точнее по
+    имеющимся данным не ответить: у заявки хранится номер, а не цель, — и это ограничение
+    названо здесь, а не спрятано. Старый (номерной) ключ тоже читается — разрез строится по полю
+    `id` записи, которое было в ней всегда."""
+    if not isinstance(closed, dict):
+        return {}
+    out, stamp = {}, {}
+    for key, item in closed.items():
+        if not isinstance(item, dict):
+            continue
+        num = str(item.get("id") if item.get("id") is not None else key)
+        try:
+            at = float(item.get("at"))
+        except (TypeError, ValueError):
+            at = None
+        if num in out and not (at is not None and (stamp.get(num) is None or at > stamp[num])):
+            continue
+        out[num], stamp[num] = item, at
+    return out
+
+
 def external_fate(records, day, intake=None, recon=None, queue=None):
     """Находки суток → их СУДЬБА по трём реестрам полосы. → dict.
 
@@ -634,7 +665,7 @@ def external_fate(records, day, intake=None, recon=None, queue=None):
                 out["held"] += 1
     if isinstance(queue, dict):
         opened = queue.get("open") if isinstance(queue.get("open"), dict) else {}
-        closed = queue.get("closed") if isinstance(queue.get("closed"), dict) else {}
+        closed = _closed_by_num(queue.get("closed"))
         out["waiting"] = out["rejected"] = out["worked"] = out["offsnap"] = 0
         for key, (_ckey, rec) in claimed:
             tid = str(rec.get("queue_id"))

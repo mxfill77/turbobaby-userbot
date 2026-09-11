@@ -1196,6 +1196,81 @@ class TestIdleAndShtabArrival(unittest.TestCase):
         self.assertTrue(vp.shtab_last_words(last, DAY).startswith("приход Штаба:"))
 
 
+class TestReaderHealsItself(unittest.TestCase):
+    """ЧИТАТЕЛЬ ВЫПРАВЛЯЕТСЯ САМ — ЭТО ПРОВЕРЯЕТСЯ, А НЕ ПРЕДПОЛАГАЕТСЯ (12.09.2026).
+
+    Витрина врала не своей ошибкой: «с какого времени пусто» она берёт как `max(at)`
+    по реестру закрытых, а реестр ключевался переиспользуемым НОМЕРОМ и терял новые
+    закрытия. Живой случай 11.09: реестр замёрз на 13:47Z, после чего полоса закрыла
+    шесть рядов, и витрина 4 часа звала работающую очередь пустой — 9 завышений
+    простоя и одна ложная ТРЕВОГА за сутки.
+
+    Реестру вернули личность (`queue_snapshot_pc.closed_id`), витрину не тронули НИ
+    ОДНОЙ строкой. Здесь на фикстуре доказывается, что этого хватило первой строке —
+    и ЧЕСТНО показывается, чего не хватило второй.
+    """
+
+    GOAL_A = "[от Штаба дата=2026-09-10 ключ=23-a-kopiya-ramki.1009] вчерашний ряд"
+    GOAL_B = "[от Штаба дата=2026-09-11 ключ=44-a-vitok-slepota.1209] сегодняшний ряд"
+
+    def broken(self):
+        """Реестр, каким его оставлял ключ-номер: вчерашняя запись #4 съела сегодняшнюю."""
+        return {"open": {}, "closed": {
+            "4": {"id": "4", "at": NOW - 20 * 3600.0, "outcome": "done", "goal": self.GOAL_A}}}
+
+    def fixed(self):
+        """Тот же час, но реестр ключеван личностью: обе записи под номером 4 живы."""
+        snap = self.broken()
+        snap["closed"] = dict(snap["closed"])
+        snap["closed"]["4@" + self.GOAL_B] = {"id": "4", "at": NOW - 600.0, "outcome": "done",
+                                              "goal": self.GOAL_B}
+        return snap
+
+    def test_idle_line_heals_itself_on_the_fixed_registry(self):
+        """СТРОКА «С КАКОГО ВРЕМЕНИ ПУСТО» — выправляется сама, числом.
+
+        20 часов простоя против 10 минут: одна и та же функция, один и тот же час,
+        разница только в реестре. Правки читателя не потребовалось ни одной."""
+        was = run.idle_facts(self.broken(), NOW)
+        self.assertAlmostEqual(was["sec"], 20 * 3600.0, places=3)
+        self.assertTrue(vp.idle_alarm(was, _shtab_last(None, found=False), DAY),
+                        "ложной тревоги не случилось — фикстура не воспроизводит класс")
+        now_ok = run.idle_facts(self.fixed(), NOW)
+        self.assertAlmostEqual(now_ok["sec"], 600.0, places=3)
+        self.assertEqual(now_ok["since_id"], "4")
+        self.assertEqual(vp.idle_alarm(now_ok, _shtab_last(None, found=False), DAY), "",
+                         "тревога пережила починку реестра")
+        self.assertIn("10 мин", vp.idle_words(now_ok))
+
+    def test_shtab_line_gets_the_right_key_but_the_hour_is_still_by_number(self):
+        """СТРОКА «ПОСЛЕДНЕЕ ЗАДАНИЕ» — выправляется ЧАСТЬЮ, и вторая часть названа.
+
+        Ключ задания чинится реестром: свежая запись появилась, и по сравнению
+        `(день, час)` побеждает она, а не вчерашняя. А ЧАС по-прежнему берётся из
+        отметок claim ПО НОМЕРУ (`vitrina_pc_run:328`), то есть у того, кто владеет
+        номером СЕЙЧАС, — и реестром это не лечится ничем. Мешает ровно одно место,
+        и оно в читателе; правка витрины этим заходом запрещена, поэтому здесь
+        зафиксировано состояние, а не сделан вид, что класс закрыт целиком."""
+        claims = {"4": NOW - 300.0}                 # claim нынешнего владельца номера 4
+        was = run.shtab_last_facts(self.broken(), claims, NOW)
+        self.assertEqual(was["key"], "23-a-kopiya-ramki.1009", "класс не воспроизведён")
+        now_ok = run.shtab_last_facts(self.fixed(), claims, NOW)
+        self.assertEqual(now_ok["key"], "44-a-vitok-slepota.1209", "ключ не выправился")
+        self.assertEqual(now_ok["at_kind"], "claim")
+        self.assertAlmostEqual(now_ok["at"], claims["4"], places=3)
+        # ОТРИЦАТЕЛЬНАЯ ПОЛОВИНА: час пришёл от НОМЕРА, а не от найденной записи.
+        self.assertNotAlmostEqual(now_ok["at"], NOW - 600.0, places=3,
+                                  msg="час внезапно взят у своей записи — правило показа "
+                                      "изменилось, и этот тест обязан быть переписан")
+
+    def test_reader_file_was_not_touched_by_this_fix(self):
+        """Замок на само утверждение «читатель не правился»: строки склейки на месте."""
+        with io.open(os.path.join(HERE, "vitrina_pc_run.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('at, kind = (claims or {}).get(rid), "claim"', src,
+                      "читатель всё-таки поправлен — утверждение п.7 стало ложным")
+
+
 class TestHealthList(unittest.TestCase):
     """ЧТО РАБОТАЕТ И ЧТО НЕТ: приговор одним словом, чем снят, чего не покрывает.
 

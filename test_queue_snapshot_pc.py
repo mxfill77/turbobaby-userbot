@@ -258,9 +258,12 @@ class TestSnapshotBody(Base):
             self.assertIn(words, text)
 
     def test_исход_не_сверен_пока_упавшие_не_прочитаны(self):
-        """Третий исход: ушла из открытых, а упавшие не прочитались → НЕ «сдано»."""
+        """Третий исход: ушла из открытых, а упавшие не прочитались → НЕ «сдано».
+
+        Адрес записи спрашивается ЛИЧНОСТЬЮ (с 12.09.2026 ключ реестра — она, а не номер): будь
+        тут снова голый «553», тест зеленел бы ровно на том устройстве, которое и врало."""
         closed = q.merge_closed({"553": {"goal": "ЦЕЛЬ: X"}}, {}, {}, T0, 86400)
-        self.assertIsNone(closed["553"]["outcome"])
+        self.assertIsNone(closed[q.closed_id("553", "ЦЕЛЬ: X")]["outcome"])
         text = q.render_body([], closed, None, T0)
         self.assertIn("исход не сверен: #553", text)
         self.assertIn("исход не сверен 1", text)
@@ -269,7 +272,7 @@ class TestSnapshotBody(Base):
     def test_ушедшая_и_не_найденная_среди_упавших_это_сдано(self):
         closed = q.merge_closed({"553": {"goal": "ЦЕЛЬ: X"}}, {}, {}, T0, 86400)
         closed = q.apply_failed(closed, [], T0, 86400)
-        self.assertEqual(closed["553"]["outcome"], "done")
+        self.assertEqual(closed[q.closed_id("553", "ЦЕЛЬ: X")]["outcome"], "done")
 
     def test_строка_старше_суток_из_слепка_уходит(self):
         old = {"553": {"id": "553", "at": T0 - 90000, "goal": "ЦЕЛЬ: X", "outcome": "done"}}
@@ -305,6 +308,164 @@ class TestSnapshotBody(Base):
 def rejected_row(tid, updated, why="(кнопка)", goal="ЦЕЛЬ: снять слой ожиданий"):
     return row(tid, "failed", updated, text="ultrathink\n\n" + goal,
                result=(q.REJECT_MARK + " " + why).strip())
+
+
+# ══════════ 3-тер. ЗАКРЫТИЕ ОПОЗНАЁТСЯ ЛИЧНОСТЬЮ, А НЕ НОМЕРОМ (12.09.2026) ════════════════
+# ВТОРОЙ СЛУЧАЙ ОДНОГО КЛАССА, и потому он закрыт правилом, а не заплатой. Номер ряда очередь
+# ПЕРЕИСПОЛЬЗУЕТ (за сутки 10–11.09 номера 1–6 прошли по три круга), а реестр закрытых ключевался
+# им: совпадение номера читалось как «этот ряд уже записан», и новое закрытие молча отбрасывалось.
+# Цена замерена: из 23 закрытий суток в реестр попало 11 (потеряно 52 %), а после заморозки
+# реестра — 6 из 6. Обычный тест здесь зелен ВСЕГДА: записи есть, числа печатаются, исключений
+# нет. Ловит только корпус с ПОВТОРНО ВЫДАННЫМ номером — он ниже.
+#
+# Цели фикстур несут живой маркер ящика: ключ в нём уникален для задания, и он же — то самое
+# «неповторяемое имя события», которым правило переписи 11.09 велит сопровождать номер.
+GOAL_A = "[от Штаба дата=2026-09-10 ключ=23-a-kopiya-ramki.1009] ЗАДАНИЕ ШТАБА ИЗ ЯЩИКА"
+GOAL_B = "[от Штаба дата=2026-09-11 ключ=44-a-vitok-slepota.1209] ЗАДАНИЕ ШТАБА ИЗ ЯЩИКА"
+
+
+class TestClosureIdentity(Base):
+    def test_два_ряда_с_одним_номером_дают_ДВЕ_записи(self):
+        """(а) Вчерашняя запись #4 ещё в окне суток, сегодня тот же номер закрылся.
+
+        ДО правки живой замер давал 1 запись (новое закрытие отбрасывалось `continue`), после —
+        2. Это и есть та потеря, из-за которой прибор показывал вчерашний ряд как последний."""
+        prev_closed = {"4": {"id": "4", "at": T0 - 20 * 3600, "goal": GOAL_A,
+                             "outcome": "done", "why": ""}}
+        closed = q.merge_closed({"4": {"goal": GOAL_B, "status": "in_progress"}}, {},
+                                prev_closed, T0, 86400)
+        self.assertEqual(len(closed), 2, "закрытие второго ряда под тем же номером потеряно")
+        self.assertEqual({str(i["goal"]) for i in closed.values()}, {GOAL_A, GOAL_B})
+        self.assertEqual([str(i["id"]) for i in closed.values()], ["4", "4"],
+                         "номер у обоих один — различает их ЛИЧНОСТЬ, а не он")
+
+    def test_номер_переиспользован_в_открытой_половине_закрытие_не_теряется(self):
+        """(а-2) Тот же класс в обратную сторону: ушёл #4 (ряд A), пришёл #4 (ряд B).
+
+        Номер остаётся в открытой половине, и по номеру закрытие A не замечалось ВОВСЕ —
+        замер ДО: 0 записей. Правило одно, поэтому оба вопроса задаются личностью."""
+        step1 = q.merge_closed({"4": {"goal": GOAL_A, "status": "in_progress"}},
+                               {"4": {"goal": GOAL_B, "status": "in_progress"}}, {}, T0, 86400)
+        self.assertEqual(len(step1), 1, "ряд A закрылся, а номер его спрятал")
+        self.assertEqual(str(list(step1.values())[0]["goal"]), GOAL_A)
+        step2 = q.merge_closed({"4": {"goal": GOAL_B, "status": "in_progress"}}, {}, step1,
+                               T0 + 1800, 86400)
+        self.assertEqual(len(step2), 2)
+
+    def test_один_ряд_увиденный_дважды_дубля_не_даёт(self):
+        """(б) ОТРИЦАТЕЛЬНЫЙ: личность обязана РАЗЛИЧАТЬ соседей и НЕ различать сам ряд.
+
+        Без этой половины «починка» свелась бы к ключу-уникуму: записей стало бы больше, а
+        реестр — мусором. Прогоняем ряд через все три ветки реестра подряд."""
+        one = {"7": {"goal": GOAL_B, "status": "in_progress"}}
+        closed = q.merge_closed(one, {}, {}, T0, 86400)
+        self.assertEqual(len(closed), 1)
+        closed = q.merge_closed(one, {}, closed, T0 + 600, 86400)
+        self.assertEqual(len(closed), 1, "второй взгляд на тот же ряд родил дубль")
+        closed = q.apply_failed(closed, [{"id": "7", "since": T0, "goal": GOAL_B,
+                                          "result": "сбой окна"}], T0 + 900, 86400)
+        self.assertEqual(len(closed), 1, "ветка упавших родила дубль того же ряда")
+        closed = q.seed_done(closed, [{"id": "7", "since": T0, "goal": GOAL_B}], T0 + 900, 86400)
+        self.assertEqual(len(closed), 1, "ветка посева родила дубль того же ряда")
+        self.assertEqual(list(closed.values())[0]["outcome"], "failed",
+                         "посев не смеет перебивать сверенный исход")
+
+    def test_последним_закрытием_читается_тот_кто_закрылся_позже(self):
+        """(в) Вторая причина той же слепоты: показ шёл по УБЫВАНИЮ НОМЕРА.
+
+        Порознь эти две правки не проверяются: почини только ключ — #12 так и останется
+        «последним», хотя после него закрылись меньшие номера."""
+        prev = {"12": {"id": "12", "at": T0 - 3 * 3600, "goal": GOAL_A, "outcome": "done",
+                       "why": ""},
+                "4": {"id": "4", "at": T0 - 600, "goal": GOAL_B, "outcome": "done", "why": ""}}
+        closed = q.merge_closed({}, {}, prev, T0, 86400)
+        order = [str(i["id"]) for _k, i in sorted(closed.items(), key=q._closed_key)]
+        self.assertEqual(order, ["4", "12"], "порядок показа всё ещё по номеру, а не по времени")
+        self.assertIn("сдано: #4 #12", q.render_body([], closed, T0, T0))
+
+    def test_запись_без_времени_самой_свежей_не_объявляется(self):
+        """ОТРИЦАТЕЛЬНЫЙ к порядку: «времени нет» — это конец списка, а не 1970-й год."""
+        prev = {"9": {"id": "9", "at": None, "goal": GOAL_A, "outcome": "done", "why": ""},
+                "3": {"id": "3", "at": T0 - 60, "goal": GOAL_B, "outcome": "done", "why": ""}}
+        closed = dict(q.merge_closed({}, {}, prev, T0, 86400))
+        closed[q.closed_id("9", GOAL_A)] = prev["9"]      # окно суток выбрасывает безвременную
+        order = [str(i["id"]) for _k, i in sorted(closed.items(), key=q._closed_key)]
+        self.assertEqual(order, ["3", "9"])
+
+    def test_ветка_упавших_не_затирает_чужой_ряд_с_тем_же_номером(self):
+        """(п.6) Соседняя ветка: `apply_failed` клала запись по номеру БЕЗУСЛОВНО — исход нового
+        ряда затирал прежнего владельца номера, и тот исчезал молча."""
+        closed = q.merge_closed({"4": {"goal": GOAL_A, "status": "in_progress"}}, {}, {},
+                                T0 - 3600, 86400)
+        closed = q.apply_failed(closed, [{"id": "4", "since": T0, "goal": GOAL_B,
+                                          "result": "сбой"}], T0, 86400)
+        self.assertEqual(len(closed), 2, "упавший ряд затёр собой чужую запись того же номера")
+        by_goal = {str(i["goal"]): i["outcome"] for i in closed.values()}
+        self.assertEqual(by_goal[GOAL_A], "done", "ряд A ушёл и среди упавших не найден — сдан")
+        self.assertEqual(by_goal[GOAL_B], "failed")
+
+    def test_ветка_посева_не_прячет_сдачу_за_чужим_номером(self):
+        """(п.6) Вторая соседняя ветка: `seed_done` пропускала по номеру — совпадение прятало
+        настоящее «сдано». Ветка зовётся раз на жизнь состояния, но правило одно на всех."""
+        closed = {q.closed_id("4", GOAL_A): {"id": "4", "at": T0 - 3600, "goal": GOAL_A,
+                                             "outcome": "failed", "why": "сбой"}}
+        got = q.seed_done(closed, [{"id": "4", "since": T0 - 1800, "goal": GOAL_B}], T0, 86400)
+        self.assertEqual(len(got), 2, "посев пропустил сдачу, увидев чужой номер")
+        self.assertEqual(got[q.closed_id("4", GOAL_B)]["outcome"], "done")
+        self.assertEqual(got[q.closed_id("4", GOAL_A)]["outcome"], "failed", "чужой исход тронут")
+
+    def test_подпись_меняется_на_втором_закрытии_того_же_номера(self):
+        """Без этого слепок бы не переписался ВОВСЕ: подпись жила номером и исходом, и второе
+        закрытие того же номера оставляло её прежней — потеря была молчаливой дважды."""
+        one = {q.closed_id("4", GOAL_A): {"id": "4", "at": T0 - 60, "goal": GOAL_A,
+                                          "outcome": "done", "why": ""}}
+        two = dict(one)
+        two[q.closed_id("4", GOAL_B)] = {"id": "4", "at": T0, "goal": GOAL_B, "outcome": "done",
+                                         "why": ""}
+        base = {"ok": True, "at": T0, "rows": [], "failed_at": T0}
+        self.assertNotEqual(q.signature(dict(base, closed=one)),
+                            q.signature(dict(base, closed=two)))
+
+    def test_старое_состояние_читается_без_шага_переноса(self):
+        """Миграция: состояние прежнего кода ключевано голым номером. Записи всегда несли `id` и
+        `goal`, поэтому личность считается ИЗ НИХ — отдельного переноса не нужно ни одного."""
+        old = {"4": {"id": "4", "at": T0 - 60, "goal": GOAL_A, "outcome": "done", "why": ""}}
+        got = q.merge_closed({}, {}, old, T0, 86400)
+        self.assertEqual(list(got), [q.closed_id("4", GOAL_A)])
+        self.assertEqual(got[q.closed_id("4", GOAL_A)]["outcome"], "done")
+
+    def test_личность_названа_словами_и_стоит_на_НЕИЗМЕННОМ(self):
+        """Личность = номер + цель. Цель у ряда неизменна (текста в очереди не правит ни одна
+        операция), а времена не годятся: `at` одной записи приходит то моментом наблюдения, то
+        временем строки из очереди — ключ с ним развалил бы один ряд надвое."""
+        self.assertEqual(q.closed_id("4", GOAL_A), q.closed_id(4, GOAL_A),
+                         "номер строкой и числом — один ряд")
+        self.assertNotEqual(q.closed_id("4", GOAL_A), q.closed_id("4", GOAL_B))
+        self.assertNotEqual(q.closed_id("4", GOAL_A), q.closed_id("5", GOAL_A))
+        self.assertEqual(q.closed_id("4", None), q.closed_id("4", ""),
+                         "безымянный ряд вырождается в номер — это прежнее поведение, не потеря")
+
+    def test_живой_оборот_показывает_оба_закрытия_одного_номера(self):
+        """Сквозь ВЕСЬ оборот, а не по чистым функциям: два ряда под номером 4 закрываются
+        подряд, и в текст слепка обязаны попасть оба."""
+        w = Writer()
+        a = row(4, "in_progress", "2026-08-14T15:31:36.719Z", text="ultrathink\n\n" + GOAL_A)
+        b = row(4, "in_progress", "2026-08-14T16:31:36.719Z", text="ultrathink\n\n" + GOAL_B)
+        self.tick(Bridge([a]), w, T0)
+        self.tick(Bridge([b]), w, T0 + 60)                    # номер переиспользован
+        self.tick(Bridge([]), w, T0 + 120)                    # и второй ряд закрылся
+        text = w.texts[-1]
+        self.assertIn("ЗАКРЫТО ЗА СУТКИ", text)
+        self.assertIn("сдано: #4 #4", text, "второе закрытие того же номера съедено реестром")
+        # Компактная строка выше номерами ряды не различает — значит различить их обязан показ:
+        self.assertIn("НОМЕР ПЕРЕИСПОЛЬЗОВАН ОЧЕРЕДЬЮ", text)
+        self.assertIn("23-a-kopiya-ramki.1009", text)
+        self.assertIn("44-a-vitok-slepota.1209", text)
+
+    def test_разрез_повтора_молчит_когда_повтора_нет(self):
+        """ОТРИЦАТЕЛЬНЫЙ к разрезу: в обычные сутки он не прибавляет слепку ни строки."""
+        closed = q.merge_closed({"4": {"goal": GOAL_A}, "5": {"goal": GOAL_B}}, {}, {}, T0, 86400)
+        self.assertNotIn("ПЕРЕИСПОЛЬЗОВАН", q.render_body([], closed, T0, T0))
 
 
 class TestOwnerRejection(Base):
@@ -437,7 +598,11 @@ class TestOwnerRejection(Base):
 # Граница держится отсутствием инструментов, а не докстрингом (зеркало EXPECT_PC_PURE полосы).
 _PURE = ("one_line", "goal_line", "fmt_ts", "age_min", "as_float", "_age_words", "_section",
          "render_body", "_row_key", "_closed_key", "render", "signature", "merge_closed",
-         "apply_failed", "outcome_of", "reject_words")
+         "apply_failed", "outcome_of", "reject_words",
+         # Личность закрытого ряда и разрез реестра по ней (12.09.2026) — та же граница: ключ
+         # считается АРИФМЕТИКОЙ над переданным, ни часов, ни диска ему не нужно. `seed_done`
+         # внесён заодно: третья ветка того же реестра жила вне замка без причины.
+         "closed_id", "_rekey", "seed_done")
 _FORBIDDEN_CALLS = frozenset(("open", "exec", "eval", "compile", "__import__", "input", "print"))
 _FORBIDDEN_ROOTS = frozenset(("os", "sys", "subprocess", "socket", "urllib", "time", "shutil",
                               "pathlib", "tempfile", "sqlite3", "brain_writer", "pc_orchestrator",
