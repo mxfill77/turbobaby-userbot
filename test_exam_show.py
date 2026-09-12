@@ -26,11 +26,32 @@ PH = {"when": "с 6 по 11 октября", "when_sloppy": "с 6ого по 11�
       "cross": {"text": "с 28 октября по 3 ноября"}, "year": "2026", "year_next": "2027"}
 
 
-def _shot(case=1, total=17, corpus="aaaaaaaaaaaaaaaa", commit="deadbee", rules="v1"):
+# Отпечаток ЖИВОГО корпуса — умолчание фикстуры с 12.09.2026. До этого дня снимок набора носил
+# выдуманный отпечаток («aaaa…»), и это было безразлично: замок отпечатка стоял только у показа.
+# Теперь его спрашивает и ЗАПИСЬ ВЕРДИКТА, поэтому снимок фикстуры обязан быть самосогласованным —
+# иначе набор целиком мерил бы один и тот же отказ. Тесты, которым нужен РАСХОД, называют чужой
+# отпечаток явно (их ровно два, и оба про расход).
+def _live_corpus():
+    return exam_show.corpus_fingerprint()
+
+
+def _shot(case=1, total=17, corpus=None, commit="deadbee", rules="v1", hints=None):
     return {"case": case, "total": total, "name": "первый контакт", "lang": "ru",
             "question": "Здравствуйте! Хочу XMAX 300", "draft": "Здравствуйте! 307 ฿/день.",
-            "note": "<<<QUOTE>>> NMAX — 307 ฿/день", "corpus": corpus, "commit": commit,
-            "rules": rules, "built_at": "2026-09-11T00:00:00Z"}
+            "note": "<<<QUOTE>>> NMAX — 307 ฿/день",
+            "corpus": _live_corpus() if corpus is None else corpus, "commit": commit,
+            "rules": rules, "built_at": "2026-09-11T00:00:00Z",
+            "hints": [] if hints is None else list(hints)}
+
+
+def _hint(obs, rule):
+    return {"observation": obs, "rule": rule}
+
+
+# Две подсказки фикстуры: с наблюдением и без него (второе — законный исход `split_pair`, когда
+# модель не соблюла формат, и он обязан доезжать до кнопки живым).
+HINTS = [_hint("назвал срок выдачи, которого не знает", "не называй сроков выдачи"),
+         _hint("", "спрашивай даты аренды до цены")]
 
 
 class Base(unittest.TestCase):
@@ -39,14 +60,35 @@ class Base(unittest.TestCase):
         self.shots = os.path.join(self.tmp, "shots")
         os.makedirs(self.shots)
         self.log = os.path.join(self.tmp, "verdicts.tsv")
+        self.desk = os.path.join(self.tmp, "session.json")
+        self.lessons = os.path.join(self.tmp, "lessons.tsv")
         self._shots_was, exam_show.SHOTS_DIR = exam_show.SHOTS_DIR, self.shots
         self._verd_was, exam_show.VERDICTS = exam_show.VERDICTS, self.log
+        # СТОЛ И БАЗА УРОКОВ — ВО ВРЕМЕННОЕ МЕСТО. Без этих двух подмен набор писал бы в боевой
+        # `exam_session.json` и в боевую таблицу уроков, по которой бот отвечает клиентам.
+        self._sess_was, exam_show.SESSION = exam_show.SESSION, self.desk
+        self._less_was, exam_show.LESSON_PATH = exam_show.LESSON_PATH, self.lessons
         self.addCleanup(self._restore)
 
     def _restore(self):
         exam_show.SHOTS_DIR = self._shots_was
         exam_show.VERDICTS = self._verd_was
+        exam_show.SESSION = self._sess_was
+        exam_show.LESSON_PATH = self._less_was
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def critic(self, hints=None):
+        """ПОДСТАВНОЙ КРИТИК. Голову набор не зовёт ни разу и ни одной веткой: живой критик ходит
+        в LLM, а подсказки — данные, и проверять на них надо разбор, а не удачу модели."""
+        return lambda q, a, tr="": list(HINTS if hints is None else hints)
+
+    def lesson_rows(self):
+        """Строки временной базы уроков (шапка не в счёт). Файла нет — пусто."""
+        try:
+            with open(self.lessons, encoding="utf-8") as f:
+                return [ln for ln in f.read().splitlines()[1:] if ln.strip()]
+        except OSError:
+            return []
 
     def raw(self):
         """Байты журнала. Отдельным методом ради закрытия файла: ResourceWarning в выводе гейта
@@ -114,7 +156,7 @@ class TestFrozenTextIsWhatIsShown(Base):
         def runner(case):
             called.append(case)
             return {"draft": "другой ответ", "note": ""}
-        ok, why, _ = exam_show.freeze(1, runner=runner, ph=PH)
+        ok, why, _ = exam_show.freeze(1, runner=runner, ph=PH, critic=self.critic())
         self.assertFalse(ok)
         self.assertEqual(called, [], "голова не должна была зваться вовсе")
         self.assertIn("уже собран", why)
@@ -122,7 +164,8 @@ class TestFrozenTextIsWhatIsShown(Base):
 
     def test_freeze_saves_the_three_fingerprints(self):
         ok, path, shot = exam_show.freeze(
-            1, runner=lambda c: {"draft": "ответ", "note": "записка"}, ph=PH)
+            1, runner=lambda c: {"draft": "ответ", "note": "записка"}, ph=PH,
+            critic=self.critic())
         self.assertTrue(ok, path)
         for key in ("corpus", "commit", "rules", "built_at"):
             self.assertIn(key, shot)
@@ -138,7 +181,8 @@ class TestFrozenTextIsWhatIsShown(Base):
         old = self.put_shot(_shot(commit="deadbee"))
         old_path = exam_show.shot_path(1)
         ok, path, new = exam_show.freeze(
-            1, runner=lambda c: {"draft": "ответ НОВОГО кода", "note": "новая записка"}, ph=PH)
+            1, runner=lambda c: {"draft": "ответ НОВОГО кода", "note": "новая записка"}, ph=PH,
+            critic=self.critic())
         self.assertTrue(ok, path)
         self.assertNotEqual(path, old_path, "новый снимок лёг в тот же файл — старый затёрт")
         self.assertTrue(os.path.exists(old_path), "старый слот исчез с диска")
@@ -172,7 +216,8 @@ class TestFrozenTextIsWhatIsShown(Base):
     def test_empty_draft_is_not_saved_as_a_shot(self):
         """Молчащая голова не смеет оставить пустой черновик — судить было бы нечего."""
         ok, why, shot = exam_show.freeze(
-            1, runner=lambda c: {"draft": "   ", "note": "", "unknown": "голова молчала"}, ph=PH)
+            1, runner=lambda c: {"draft": "   ", "note": "", "unknown": "голова молчала"}, ph=PH,
+            critic=self.critic())
         self.assertFalse(ok)
         self.assertIsNone(shot)
         self.assertIn("голова молчала", why)
@@ -202,7 +247,7 @@ class TestTheQuestionIsTheOneTheHeadSaw(Base):
         path = self.corpus([case])
         ok, where, shot = exam_show.freeze(
             case["id"], cases_path=path, runner=lambda c: {"draft": "ответ", "note": "записка"},
-            ph=PH)
+            ph=PH, critic=self.critic())
         self.assertTrue(ok, where)
         return shot
 
@@ -257,10 +302,12 @@ class TestTheQuestionIsTheOneTheHeadSaw(Base):
         fake.placeholders = placeholders
         fake.run_case = run_case
         fake.substitute = trainer_run.substitute        # подстановка — НАСТОЯЩАЯ, не копия
+        fake.build_transcript = trainer_run.build_transcript      # и сборка реплик тоже настоящая
         real = _sys.modules.get("trainer_run")
         _sys.modules["trainer_run"] = fake
         try:
-            ok, where, shot = exam_show.freeze(1, cases_path=self.corpus([self.TEMPLATED]))
+            ok, where, shot = exam_show.freeze(1, cases_path=self.corpus([self.TEMPLATED]),
+                                               critic=self.critic())
         finally:
             if real is None:
                 _sys.modules.pop("trainer_run", None)
@@ -327,9 +374,11 @@ class TestReshow(Base):
         self.assertTrue(ok)
         self.assertEqual(len(send.calls), 1, "перепоказ РОВНО один")
         text = send.calls[0]["text"]
-        self.assertIn(exam_show.card_text(shot), text)
+        # счёт «пройдено K» — часть карточки с 12.09.2026, и перепоказ несёт её наравне с показом:
+        # сравнение с карточкой БЕЗ счёта расходилось бы на одну строку шапки
+        self.assertIn(exam_show.card_text(shot, passed=0), text)
         self.assertTrue(text.startswith(exam_reshow.MARK))
-        self.assertEqual(send.calls[0]["markup"], exam_show.markup(1))
+        self.assertEqual(send.calls[0]["markup"], exam_show.markup(1, shot))
 
     def test_the_reshow_never_reaches_the_head(self):
         """У перепоказа нет дороги к голове ни одной веткой — проверка на исходнике модуля."""
@@ -468,11 +517,16 @@ class TestFourNegatives(Base):
 
     def test_whitespace_and_case_around_a_known_word_are_tolerated(self):
         """Пробел и регистр вокруг ключа прощаются НАМЕРЕННО: ключ приходит из кнопки, а руками
-        его набирают с консоли, и «OK » — это тот же вердикт, а не второй."""
-        self.put_shot(_shot())
-        for word in (" ok", "OK", "No "):
-            ok, _ = exam_show.tap(1, word, "@свой", right_fn=lambda who: True)
-            self.assertTrue(ok, word)
+        его набирают с консоли, и «OK » — это тот же вердикт, а не второй.
+
+        КЕЙСЫ РАЗНЫЕ (правка 12.09.2026). Прежняя редакция била тремя словами по ОДНОМУ кейсу, и
+        сегодня это меряло бы не прощение пробела, а замок «одна запись на кейс»: второй тап
+        отказал бы по причине, к регистру отношения не имеющей."""
+        for case, word in ((1, " ok"), (2, "OK"), (3, "No ")):
+            self.put_shot(_shot(case=case))
+            ok, msg = exam_show.tap(case, word, "@свой", right_fn=lambda who: True,
+                                    sender=self.sender(), agent_fn=self.fresh_agent())
+            self.assertTrue(ok, "%s → %s" % (word, msg))
 
     def test_tap_without_a_frozen_text_is_refused(self):
         """Вердикт без текста, к которому он относится, непроверяем — потому не пишется."""
@@ -493,10 +547,11 @@ class TestFourNegatives(Base):
 class TestCandidateRecord(Base):
     def setUp(self):
         super().setUp()
-        self.put_shot(_shot(commit="abc1234", corpus="ffffffffffffffff", rules="v7"))
+        self.put_shot(_shot(commit="abc1234", rules="v7"))
 
-    def tap(self, verdict="ok", who="@filipp"):
-        return exam_show.tap(1, verdict, who, right_fn=lambda w: True)
+    def tap(self, verdict="ok", who="@filipp", case=1):
+        return exam_show.tap(case, verdict, who, right_fn=lambda w: True,
+                             sender=self.sender(), agent_fn=self.fresh_agent())
 
     def test_record_carries_all_seven_parts(self):
         ok, msg = self.tap()
@@ -512,7 +567,7 @@ class TestCandidateRecord(Base):
                                         "вердикт не привязан к размеру корпуса, по которому вынесен")
         self.assertEqual(r["вердикт"], "верно")
         self.assertEqual(r["коммит"], "abc1234")
-        self.assertEqual(r["корпус"], "ffffffffffffffff")
+        self.assertEqual(r["корпус"], exam_show.corpus_fingerprint())
         self.assertEqual(r["правила"], "v7")
         self.assertTrue(r["время"].endswith("Z"))
 
@@ -544,12 +599,13 @@ class TestCandidateRecord(Base):
         Пустая графа среди трёх опор вердикта читается как «коммита не было», хотя значит «мы его
         не записали», и отличить одно от другого потом нечем."""
         os.remove(exam_show.shot_path(1))
-        self.put_shot(_shot(corpus="ffffffffffffffff") | {"commit": "", "rules": None})
+        self.put_shot(_shot() | {"commit": "", "rules": None})
         self.tap()
         r = exam_show.load_verdicts(self.log)[0]
         self.assertEqual(r["коммит"], "НЕ ЗАПИСАНО(коммит)")
         self.assertEqual(r["правила"], "НЕ ЗАПИСАНО(версия правил)")
-        self.assertEqual(r["корпус"], "ffffffffffffffff", "целая опора не смеет пострадать")
+        self.assertEqual(r["корпус"], exam_show.corpus_fingerprint(),
+                         "целая опора не смеет пострадать")
 
     def test_a_wrong_typed_proof_is_not_swallowed_as_empty(self):
         """`0`/`[]`, приехавшие по ошибке вызывающего, не выдают себя за честно пустое значение."""
@@ -588,10 +644,15 @@ class TestCandidateRecord(Base):
         self.assertNotIn("почему", self.raw())
 
     def test_numbers_grow_and_are_never_reused(self):
-        self.tap("ok")
-        self.tap("no")
+        """Откат освобождает КЕЙС, но не НОМЕР: пересуженный кейс получает новую строку.
+
+        Кейсы разные (правка 12.09.2026) — три вердикта по одному кейсу сегодня запрещены самим
+        замком «одна запись на кейс», и меряли бы его, а не рост номеров."""
+        self.put_shot(_shot(case=2))
+        self.tap("ok", case=1)
+        self.tap("no", case=2)
         exam_show.rollback(2, who="@filipp", path=self.log)
-        self.tap("ok")
+        self.tap("ok", case=2)
         nums = [r["номер"] for r in exam_show.load_verdicts(self.log)]
         self.assertEqual(nums, [1, 2, 3], "откат не смеет освободить номер под чужой вердикт")
 
@@ -624,7 +685,8 @@ class TestCandidateRecord(Base):
 
     def test_a_tab_in_the_author_name_cannot_break_the_table(self):
         """Экранирование ЧУЖОЕ (lesson_store.esc) — своя вторая копия разъехалась бы с первой."""
-        exam_show.tap(1, "ok", "@зло\tсюда\nи сюда", right_fn=lambda w: True, path=self.log)
+        exam_show.tap(1, "ok", "@зло\tсюда\nи сюда", right_fn=lambda w: True, path=self.log,
+                      sender=self.sender(), agent_fn=self.fresh_agent())
         self.assertEqual(len(self.raw().splitlines()), 2)
         self.assertEqual(len(exam_show.load_verdicts(self.log)), 1)
 
@@ -648,10 +710,23 @@ class TestAgentRoute(unittest.TestCase):
         self.assertEqual((route["action"], route["pid"]), ("ok", "3"))
         self.assertTrue(route["answer"], "тост не смеет быть пустым — иначе «часики» повиснут")
 
-    def test_the_toast_promises_a_candidate_and_not_a_pass(self):
-        for data, word in (("exam:ok:3", "кандидат"), ("exam:no:3", "кандидат")):
-            self.assertIn(word, pc_agent._chain_cb_route(data, self.OWNER)["answer"])
-        self.assertNotIn("зачт", pc_agent._chain_cb_route("exam:ok:3", self.OWNER)["answer"])
+    def test_the_toast_promises_exactly_what_the_door_does(self):
+        """Тост обещает РОВНО то, что произойдёт, и у пяти кнопок он разный.
+
+        Правка 12.09.2026. Прежняя редакция требовала слова «кандидат» у обоих вердиктов, потому
+        что счёта «пройдено K» не существовало вовсе и вердикт не значил ничего. Сегодня счёт есть
+        (слово владельца 12.09), и обещать «кандидатом» там, где кейс засчитывается, значило бы
+        соврать в другую сторону. Инвариант, который остаётся: тост не смеет обещать БОЛЬШЕ, чем
+        делает дверь, и не смеет быть пустым — иначе «часики» на кнопке повиснут."""
+        said = {d: pc_agent._chain_cb_route("exam:%s:3" % d, self.OWNER)["answer"]
+                for d in ("ok", "no", "go", "own", "h1", "h4")}
+        self.assertEqual(len(set(said.values())), len(said), "две кнопки с одним тостом")
+        for key, text in said.items():
+            self.assertTrue(text.strip(), key)
+            self.assertNotIn("зачт", text, key)
+            self.assertNotIn("экзамен пройден", text, key)
+        self.assertIn("4", said["h4"], "тумблер обязан назвать номер, который отмечает")
+        self.assertNotIn("урок", said["h1"], "тумблер уроков не пишет — обещать их нельзя")
 
     def test_a_stranger_is_refused_before_the_data_is_parsed(self):
         route = pc_agent._chain_cb_route("exam:ok:3", (self.OWNER or 0) + 99999)
@@ -664,10 +739,418 @@ class TestAgentRoute(unittest.TestCase):
         self.assertEqual(pc_agent._chain_cb_route("box:free:aabbcc", self.OWNER)["kind"], "box")
 
     def test_only_a_number_can_travel_from_telegram_into_the_command_line(self):
-        """Инвариант безопасности: хвост callback_data просеян регуляркой до цифр."""
+        """Инвариант безопасности: в командную строку двери едут ТОЛЬКО цифры.
+
+        Меряется теперь САМА СБОРКА аргументов (`exam_args`), а не текст регулярки: сверка с
+        литералом шаблона зеленела бы ровно до дня, когда шаблон законно поменяли, — и в этот день
+        сказала бы «сломалось» про правку, ничего не ослабившую. Здесь проверено поведение: что бы
+        ни пришло из Telegram, в argv не появляется ни одного символа, кроме цифр и наших ключей."""
         import re
-        self.assertEqual(pc_agent.EXAM_CB_RE.pattern, r"^exam:(ok|no):([0-9]{1,3})$")
-        self.assertIsNone(re.match(pc_agent.EXAM_CB_RE, "exam:ok:1 --who @root"))
+        allowed = {"--case", "--tap", "--apply", "--own", "--toggle", "ok", "no"}
+        for data in ("exam:ok:3", "exam:no:17", "exam:go:1", "exam:own:1", "exam:h1:2",
+                     "exam:h4:170"):
+            action, case = pc_agent._exam_cb_parse(data)
+            args = pc_agent.exam_args(action, case)
+            self.assertIsNotNone(args, data)
+            for piece in args:
+                self.assertTrue(piece in allowed or piece.isdigit(),
+                                "в командную строку уехало не число и не наш ключ: %r" % piece)
+        for alien in ("exam:ok:1 --who @root", "exam:h5:1", "exam:ok:абв", "exam:go:1;rm -rf /"):
+            self.assertIsNone(re.match(pc_agent.EXAM_CB_RE, alien), alien)
+
+
+# ═══════════ РАБОЧЕЕ МЕСТО ВЛАДЕЛЬЦА: ПОДСКАЗКИ, ТУМБЛЕРЫ, УРОКИ (12.09.2026) ═══════════════
+
+class DeskBase(Base):
+    """Общая обстановка рабочего места: кейс 1 с подсказками, кейс 2 без них (ему приходить
+    следующим), право выдано, отправщик и ловец подставные."""
+
+    def setUp(self):
+        super().setUp()
+        self.put_shot(_shot(case=1, hints=HINTS))
+        self.put_shot(_shot(case=2, hints=HINTS))
+        self.send = self.sender()
+
+    def yes(self, _who=None):
+        return True
+
+    def toggle(self, n, case=1, who="@filipp"):
+        return exam_show.toggle(case, n, who, right_fn=self.yes, session_path=self.desk)
+
+    def apply(self, case=1, who="@filipp"):
+        return exam_show.apply_marked(case, who, right_fn=self.yes, path=self.log,
+                                      session_path=self.desk, sender=self.send,
+                                      agent_fn=self.fresh_agent())
+
+    def tap(self, verdict="ok", case=1, who="@filipp"):
+        return exam_show.tap(case, verdict, who, right_fn=self.yes, path=self.log,
+                             sender=self.send, agent_fn=self.fresh_agent())
+
+
+class TestHintsAreBornAtFreezeAndLiveInTheShot(Base):
+    def test_the_shot_carries_the_hints_with_both_fields(self):
+        """Подсказка — ДВА поля: наблюдение (что не так здесь) и правило (как надо всегда)."""
+        ok, path, shot = exam_show.freeze(
+            1, runner=lambda c: {"draft": "ответ", "note": "записка"}, ph=PH,
+            critic=self.critic())
+        self.assertTrue(ok, path)
+        self.assertEqual(len(shot["hints"]), 2)
+        self.assertEqual(shot["hints"][0]["observation"], HINTS[0]["observation"])
+        self.assertEqual(shot["hints"][0]["rule"], HINTS[0]["rule"])
+        with open(path, encoding="utf-8") as f:                 # и они ЛЕЖАТ НА ДИСКЕ, а не в RAM
+            self.assertEqual(json.load(f)["hints"], shot["hints"])
+
+    def test_a_silent_critic_does_not_cancel_the_paid_draft(self):
+        """Круг головы за черновик уже оплачен: отказ критика не смеет его выбросить."""
+        def broken(q, a, tr=""):
+            raise RuntimeError("критик упал")
+        ok, path, shot = exam_show.freeze(
+            1, runner=lambda c: {"draft": "ответ", "note": ""}, ph=PH, critic=broken)
+        self.assertTrue(ok, path)
+        self.assertEqual(shot["hints"], [])
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_hint_without_a_rule_is_dropped_on_read(self):
+        """Правило — то, что ложится уроком. Подсказка без него до кнопки не доезжает."""
+        got = exam_show.hints_of({"hints": [_hint("наблюдение", "  "), "строка", 7,
+                                            _hint("", "правило живо")]})
+        self.assertEqual(got, [{"observation": "", "rule": "правило живо"}])
+
+    def test_more_than_four_hints_are_cut_to_four(self):
+        """Кнопок-номеров ровно четыре: пятая подсказка не имеет чем быть нажатой."""
+        many = [_hint("н%d" % i, "п%d" % i) for i in range(9)]
+        self.assertEqual(len(exam_show.hints_of({"hints": many})), 4)
+
+    def test_the_critic_is_the_very_one_behind_the_teach_button(self):
+        """Второго критика нет: живой сборщик зовёт ровно три чужие функции тренажёра."""
+        import inspect
+        src = inspect.getsource(exam_show._default_critic)
+        for name in ("trainer.hypotheses_prompt", "trainer.parse_hypotheses", "trainer.split_pair"):
+            self.assertIn(name, src, name)
+        self.assertIn("paired=True", src)
+
+
+class TestTheCardIsAWorkplace(DeskBase):
+    def test_the_header_carries_the_score(self):
+        card = exam_show.card_text(exam_show.load_shot(1), passed=3)
+        self.assertIn("кейс 1 из 17 · пройдено 3", card)
+
+    def test_the_score_is_absent_when_it_was_not_counted(self):
+        """«Ноль» и «не считали» — разные новости; подставить первое вместо второго нельзя."""
+        self.assertNotIn("пройдено", exam_show.card_text(exam_show.load_shot(1)))
+
+    def test_the_card_shows_observation_and_rule_of_every_hint(self):
+        card = exam_show.card_text(exam_show.load_shot(1), passed=0)
+        self.assertIn("1. " + HINTS[0]["observation"], card)
+        self.assertIn(HINTS[0]["rule"], card)
+        self.assertIn(HINTS[1]["rule"], card)
+        self.assertIn("наблюдение критик не назвал", card, "пустое поле названо словами")
+
+    def test_a_shot_without_hints_says_so_and_keeps_the_old_buttons(self):
+        """Старые снимки не ломаем: слова «подсказок нет» и РОВНО прежние две кнопки."""
+        old = _shot(case=5)
+        card = exam_show.card_text(old)
+        self.assertIn("подсказок критика в этом снимке нет", card)
+        self.assertEqual(exam_show.markup(5, old), {"inline_keyboard": [[
+            {"text": "✅ Верно", "callback_data": "exam:ok:5"},
+            {"text": "❌ Неверно", "callback_data": "exam:no:5"}]]})
+
+    def test_a_shot_with_hints_gets_the_four_kinds_of_buttons(self):
+        kb = exam_show.markup(1, exam_show.load_shot(1))["inline_keyboard"]
+        flat = [b["callback_data"] for row in kb for b in row]
+        self.assertEqual(flat, ["exam:ok:1", "exam:h1:1", "exam:h2:1", "exam:own:1", "exam:go:1"])
+        labels = [b["text"] for row in kb for b in row]
+        self.assertIn("✅ Верно", labels)
+        self.assertIn("✍️ своё", labels)
+        self.assertIn("✔ Применить", labels)
+
+    def test_every_button_of_the_card_is_understood_by_the_catcher(self):
+        """ЗАМЫКАНИЕ: каждая кнопка карточки разбирается ловцом и превращается в аргументы двери.
+        Кнопка, которую ловец не знает, — это молчащий тап, а он стоил владельцу дня 05.09."""
+        kb = exam_show.markup(1, exam_show.load_shot(1))["inline_keyboard"]
+        for row in kb:
+            for b in row:
+                parsed = pc_agent._exam_cb_parse(b["callback_data"])
+                self.assertIsNotNone(parsed, b["callback_data"])
+                self.assertIsNotNone(pc_agent.exam_args(*parsed), b["callback_data"])
+
+    def test_the_card_says_in_words_what_each_button_does(self):
+        card = exam_show.card_text(exam_show.load_shot(1), passed=0)
+        for word in ("✅ Верно", "ТУМБЛЕРЫ", "✔ Применить", "✍️ своё", "10 минут"):
+            self.assertIn(word, card, word)
+
+
+class TestTogglesMarkAndNothingElse(DeskBase):
+    def test_a_number_marks_and_a_second_tap_unmarks(self):
+        ok, msg = self.toggle(1)
+        self.assertTrue(ok, msg)
+        self.assertEqual(exam_show.load_session(self.desk)["selected"], [1])
+        ok, msg = self.toggle(1)
+        self.assertTrue(ok, msg)
+        self.assertEqual(exam_show.load_session(self.desk)["selected"], [])
+        self.assertIn("снял отметку", msg)
+
+    def test_marks_accumulate_and_are_named_back(self):
+        self.toggle(2)
+        ok, msg = self.toggle(1)
+        self.assertTrue(ok, msg)
+        self.assertEqual(exam_show.load_session(self.desk)["selected"], [1, 2])
+        self.assertIn("1, 2", msg)
+
+    def test_a_toggle_writes_neither_a_verdict_nor_a_lesson(self):
+        """Промах пальцем не смеет стать действующим правилом."""
+        self.toggle(1)
+        self.toggle(2)
+        self.assertFalse(os.path.exists(self.log), "журнала вердиктов не должно появиться")
+        self.assertEqual(self.lesson_rows(), [], "в базу уроков тумблер не пишет ни строки")
+
+
+class TestFiveNegativesOfTheWorkplace(DeskBase):
+    def test_a_tap_on_a_stale_hint_number_refuses_and_writes_nothing(self):
+        ok, msg = self.toggle(4)
+        self.assertFalse(ok)
+        self.assertIn("устарела", msg)
+        self.assertEqual(exam_show.load_session(self.desk).get("selected", []), [])
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_a_tap_on_a_hint_of_another_shot_refuses(self):
+        """Стол собран на одном снимке, показан другой: номер 1 значит разные правила."""
+        self.toggle(1)
+        exam_show.save_session(dict(exam_show.load_session(self.desk),
+                                    shot_key="другой@снимок"), self.desk)
+        ok, msg = self.toggle(2)
+        self.assertFalse(ok)
+        self.assertIn("на другом снимке", msg)
+        self.assertEqual(self.lesson_rows(), [])
+
+    def test_a_verdict_on_a_shot_with_an_alien_corpus_is_refused(self):
+        self.put_shot(_shot(case=7, corpus="0000000000000000", hints=HINTS))
+        for door in (lambda: self.tap("ok", case=7), lambda: self.apply(case=7),
+                     lambda: exam_show.toggle(7, 1, "@filipp", right_fn=self.yes,
+                                              session_path=self.desk)):
+            ok, msg = door()
+            self.assertFalse(ok, msg)
+            self.assertIn("0000000000000000", msg)
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_a_second_yes_on_the_same_case_makes_one_record_not_two(self):
+        ok, first = self.tap("ok")
+        self.assertTrue(ok, first)
+        ok, second = self.tap("ok")
+        self.assertFalse(ok)
+        self.assertIn("уже судим", second)
+        self.assertEqual(len(exam_show.load_verdicts(self.log)), 1)
+        # откат освобождает кейс — иначе пересудить его было бы нечем
+        exam_show.rollback(1, who="@filipp", path=self.log)
+        ok, third = self.tap("no")
+        self.assertTrue(ok, third)
+        self.assertEqual(len(exam_show.load_verdicts(self.log)), 2)
+
+    def test_apply_without_marks_refuses_in_words(self):
+        ok, msg = self.apply()
+        self.assertFalse(ok)
+        self.assertIn("Ничего не отмечено", msg)
+        self.assertFalse(os.path.exists(self.log))
+        self.assertEqual(self.lesson_rows(), [])
+
+    def test_after_the_last_case_comes_the_result_and_not_an_eighteenth(self):
+        last = str(exam_show.load_cases()[-1]["id"])
+        self.assertIsNone(exam_show.next_case_id(last))
+        said = exam_show.advance(last, path=self.log, sender=self.send,
+                                 agent_fn=self.fresh_agent())
+        self.assertIn("ЭКЗАМЕН ПРОЙДЕН", said)
+        self.assertIn("из 17", said)
+        self.assertEqual(self.send.calls, [], "восемнадцатой карточки не существует")
+
+    def test_the_right_is_fail_closed_on_every_new_door(self):
+        """Право одно на все двери, и на пустом списке — НИКОМУ."""
+        for door in (lambda: exam_show.toggle(1, 1, "@чужой", right_fn=lambda w: False,
+                                              session_path=self.desk),
+                     lambda: exam_show.apply_marked(1, "@чужой", right_fn=lambda w: False,
+                                                    path=self.log, session_path=self.desk),
+                     lambda: exam_show.own_start(1, "@чужой", right_fn=lambda w: False,
+                                                 session_path=self.desk)):
+            ok, msg = door()
+            self.assertFalse(ok)
+            self.assertIn("не вправе", msg)
+        self.assertFalse(os.path.exists(self.log))
+        self.assertEqual(self.lesson_rows(), [])
+
+
+class TestApplyWritesLessonsAndAdvances(DeskBase):
+    def test_marked_hints_become_lessons_with_author_source_and_reason(self):
+        import lesson_store
+        self.toggle(1)
+        self.toggle(2)
+        ok, msg = self.apply()
+        self.assertTrue(ok, msg)
+        store = lesson_store.load(self.lessons)
+        self.assertEqual(len(store.lessons), 2, "каждая отмеченная подсказка — ОТДЕЛЬНЫЙ урок")
+        first = store.lessons[0]
+        self.assertEqual(first.correct, HINTS[0]["rule"], "уроком ложится ПРАВИЛО подсказки")
+        self.assertEqual(first.who, "@filipp")
+        self.assertEqual(first.source, lesson_store.SOURCE_EXAM)
+        self.assertIn("критик, подтверждено тапом", first.why)
+        self.assertIn(HINTS[0]["observation"], first.why, "причина — наблюдение критика")
+        self.assertEqual(first.question, exam_show.load_shot(1)["question"])
+        self.assertEqual(first.bot_answer, exam_show.load_shot(1)["draft"])
+
+    def test_the_lesson_acts_at_once_in_training_mode(self):
+        import lesson_store
+        self.toggle(1)
+        self.apply()
+        self.assertEqual(len(lesson_store.active(lesson_store.load(self.lessons).lessons)), 1)
+
+    def test_one_line_turns_the_rule_off_and_the_tap_lays_a_candidate(self):
+        """Слово владельца отменяет «действует сразу» — переключение стоит одной строки."""
+        import lesson_store
+        was, exam_show.EXAM_LESSON_MODE = exam_show.EXAM_LESSON_MODE, "candidate"
+        try:
+            self.toggle(1)
+            ok, msg = self.apply()
+            self.assertTrue(ok, msg)
+            lessons = lesson_store.load(self.lessons).lessons
+            self.assertEqual(len(lesson_store.active(lessons)), 0)
+            self.assertEqual(len(lesson_store.candidates(lessons)), 1)
+            self.assertIn("КАНДИДАТАМИ", msg)
+        finally:
+            exam_show.EXAM_LESSON_MODE = was
+
+    def test_the_verdict_is_wrong_and_carries_the_lesson_numbers(self):
+        self.toggle(1)
+        self.toggle(2)
+        ok, msg = self.apply()
+        self.assertTrue(ok, msg)
+        rows = exam_show.load_verdicts(self.log)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["вердикт"], "неверно")
+        self.assertEqual(rows[0]["уроки"], "1, 2")
+        self.assertEqual(rows[0]["состояние"], "кандидат",
+                         "вердикт остаётся кандидатом, даже когда урок уже действует")
+
+    def test_the_marks_are_cleared_so_a_second_apply_cannot_repeat_them(self):
+        self.toggle(1)
+        self.apply()
+        self.assertEqual(exam_show.load_session(self.desk)["selected"], [])
+
+    def test_the_next_case_comes_by_itself_after_every_verdict(self):
+        ok, msg = self.tap("ok")
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(self.send.calls), 1, "следующая карточка обязана уйти сама")
+        self.assertIn("кейс 2 из 17", self.send.calls[0]["text"])
+        self.assertIn("пройдено 1", self.send.calls[0]["text"], "счёт двинулся на зачтённый кейс")
+
+    def test_a_silent_telegram_does_not_undo_a_written_verdict(self):
+        """Вердикт уже на диске: сорвавшийся показ следующего кейса не смеет его отменить."""
+        def dead(text, chat, markup=None):
+            raise RuntimeError("Telegram молчит")
+        ok, msg = exam_show.tap(1, "ok", "@filipp", right_fn=self.yes, path=self.log,
+                                sender=dead, agent_fn=self.fresh_agent())
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(exam_show.load_verdicts(self.log)), 1)
+        self.assertIn("вердикт при этом ЗАПИСАН", msg,
+                      "сорвавшийся показ обязан сказать словами, что вердикт всё-таки лёг")
+
+
+class TestOwnWordsLesson(DeskBase):
+    def start(self, who="@filipp", now=None):
+        return exam_show.own_start(1, who, right_fn=self.yes, session_path=self.desk, now=now)
+
+    def take(self, text, who="@filipp", now=None):
+        return exam_show.own_take(text, who, right_fn=self.yes, path=self.log,
+                                  session_path=self.desk, now=now, sender=self.send,
+                                  agent_fn=self.fresh_agent())
+
+    def test_the_next_message_becomes_a_candidate_lesson(self):
+        import lesson_store
+        ok, msg = self.start()
+        self.assertTrue(ok, msg)
+        self.assertIn("10 минут", msg)
+        ok, msg = self.take("не называй сроков выдачи вообще")
+        self.assertTrue(ok, msg)
+        lessons = lesson_store.load(self.lessons).lessons
+        self.assertEqual(len(lessons), 1)
+        self.assertEqual(lessons[0].correct, "не называй сроков выдачи вообще")
+        self.assertEqual(lessons[0].source, lesson_store.SOURCE_EXAM)
+        self.assertEqual(lessons[0].why, "", "причину за владельца не выдумывает ни одна ветка")
+        self.assertEqual(len(lesson_store.candidates(lessons)), 1)
+
+    def test_the_card_says_in_one_line_how_to_switch_it_on(self):
+        self.start()
+        _ok, msg = self.take("правило своими словами")
+        self.assertIn("lesson_promote.py", msg)
+        self.assertIn("--why", msg)
+
+    def test_the_verdict_and_the_next_case_follow_the_own_lesson(self):
+        self.start()
+        ok, msg = self.take("правило своими словами")
+        self.assertTrue(ok, msg)
+        rows = exam_show.load_verdicts(self.log)
+        self.assertEqual([rows[0]["вердикт"], rows[0]["уроки"]], ["неверно", "1"])
+        self.assertEqual(len(self.send.calls), 1)
+        self.assertIn("кейс 2 из 17", self.send.calls[0]["text"])
+
+    def test_after_ten_minutes_the_waiting_is_over_and_nothing_is_written(self):
+        self.start(now=1000)
+        ok, msg = self.take("поздний текст", now=1000 + exam_show.PENDING_TTL_SEC + 1)
+        self.assertFalse(ok)
+        self.assertIn("10 минут", msg)
+        self.assertEqual(self.lesson_rows(), [])
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_a_text_without_any_waiting_is_never_a_lesson(self):
+        ok, msg = self.take("просто реплика в группе")
+        self.assertFalse(ok)
+        self.assertIn("ожидания", msg)
+        self.assertEqual(self.lesson_rows(), [])
+
+    def test_the_waiting_belongs_to_the_one_who_asked_for_it(self):
+        self.start(who="@filipp")
+        ok, msg = self.take("чужой текст", who="@посторонний")
+        self.assertFalse(ok)
+        self.assertIn("принадлежит", msg)
+        self.assertEqual(self.lesson_rows(), [])
+
+    def test_an_empty_text_is_not_a_lesson(self):
+        self.start()
+        ok, msg = self.take("   \n  ")
+        self.assertFalse(ok)
+        self.assertIn("Пустой урок", msg)
+        self.assertEqual(self.lesson_rows(), [])
+
+
+class TestTheTwoReadersOfOneDesk(DeskBase):
+    """КОНТРАКТ: стол пишет `exam_show`, а ждущий кейс читает `pc_agent` — СВОИМ разбором.
+
+    Второй читатель заведён не от хорошей жизни: `import exam_show` в агенте затаскивает прогонщик
+    корпуса в замыкание живых ворот клиентского контура (замер — `test_trainer_run`). Цена второго
+    разбора — риск разъезда ключей, и сторожит его этот класс, а не аккуратность."""
+
+    def test_what_one_writes_the_other_reads(self):
+        self.start_ok = self.assertTrue(exam_show.own_start(
+            1, "@filipp", right_fn=self.yes, session_path=self.desk, now=1000)[0])
+        self.assertEqual(str(pc_agent._exam_pending_case(path=self.desk, now=1001)), "1")
+
+    def test_the_catcher_agrees_on_the_ten_minute_ttl(self):
+        exam_show.own_start(1, "@filipp", right_fn=self.yes, session_path=self.desk, now=1000)
+        late = 1000 + exam_show.PENDING_TTL_SEC + 1
+        self.assertIsNone(pc_agent._exam_pending_case(path=self.desk, now=late))
+        self.assertEqual(exam_show.pending_own(self.desk, now=late), (None, None))
+
+    def test_a_desk_without_waiting_is_silence_for_the_catcher(self):
+        """Показ кейса ставит стол БЕЗ ожидания — и ловец обязан молчать на каждом сообщении."""
+        exam_show.save_session({"case": "1", "shot_key": "x", "selected": [1]}, self.desk)
+        self.assertIsNone(pc_agent._exam_pending_case(path=self.desk))
+
+    def test_an_unreadable_desk_is_fail_closed(self):
+        """Ложное «жду» превратило бы первое сообщение владельца в урок, которого он не писал."""
+        with open(self.desk, "w", encoding="utf-8") as f:
+            f.write("{это не json")
+        self.assertIsNone(pc_agent._exam_pending_case(path=self.desk))
+        self.assertIsNone(pc_agent._exam_pending_case(path=os.path.join(self.tmp, "нет.json")))
+
+    def test_the_catcher_watches_the_very_group_where_the_card_hangs(self):
+        self.assertEqual(pc_agent.EXAM_CHAT_ID, exam_show.TRAINER_CHAT)
 
 
 class TestSenderDoor(unittest.TestCase):
