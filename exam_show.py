@@ -541,6 +541,21 @@ def no_hints_line(shot):
     return "🔎 %s." % NO_HINTS
 
 
+def critic_line(shot):
+    """Исход круга критика ОДНОЙ строкой для собирающего (`--freeze`). → строка.
+
+    Отдельно от `no_hints_line`, потому что читатели разные: владельцу в карточке нужны СЛОВА о
+    том, чего он не увидит, а собирающему — ЧИСЛА круга, включая удачный исход (сколько подсказок
+    и за сколько секунд). Их объединение заставило бы одну строку врать одному из двоих."""
+    rep = (shot or {}).get("critic")
+    if not isinstance(rep, dict):
+        return "🔎 критик: исход не записан (снимок старого образца)."
+    if rep.get("outcome") == OUT_HINTS:
+        return "🔎 критик: подсказок %d, ждали %s с (предел %s)." % (
+            int(rep.get("parsed") or 0), rep.get("waited"), rep.get("limit"))
+    return no_hints_line(shot)
+
+
 def hints_block(shot):
     """Подсказки критика НУМЕРОВАННЫМ списком в САМОМ тексте карточки. → строка.
 
@@ -1411,9 +1426,13 @@ def main(argv=None):
         print("⛔ кейс не назван (--case N). Умолчания нет: один кейс на экран — это правило.")
         return 2
     if a.freeze:
-        ok, where, _shot = freeze(a.case)
+        ok, where, shot = freeze(a.case)
         print(("✅ черновик кейса %s собран и сохранён: %s" % (a.case, where)) if ok
               else "⛔ черновик не собран: %s" % where)
+        # ИСХОД КРУГА КРИТИКА — СРАЗУ, А НЕ ПРИ ПОКАЗЕ. Собирающий видит ту же новость, что увидит
+        # владелец сутки спустя, и видит её в ту минуту, когда ещё может позвать круг заново.
+        if ok and shot:
+            print(critic_line(shot))
         return 0 if ok else 1
     if a.slots:
         slots = shot_slots(a.case)

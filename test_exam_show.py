@@ -1348,6 +1348,16 @@ class TestThreeOutcomesOfTheHints(Base):
         with open(path, encoding="utf-8") as f:
             self.assertEqual(json.load(f)["critic"], shot["critic"])
 
+    def test_the_collector_is_told_the_outcome_right_away(self):
+        """Собирающий узнаёт исход в ту минуту, когда ещё может позвать круг заново."""
+        _h, ok_rep = self.ask(self.FORM)
+        line = exam_show.critic_line({"critic": ok_rep})
+        self.assertIn("подсказок 2", line)
+        self.assertIn(str(exam_show.CRITIC_TIMEOUT), line)
+        for answer in ("", self.ALL_DROPPED):
+            self.assertIn("НЕИЗВЕСТНО", exam_show.critic_line({"critic": self.ask(answer)[1]}))
+        self.assertIn("старого образца", exam_show.critic_line(_shot(case=5)))
+
     def test_a_fallen_critic_is_named_silent_and_does_not_cancel_the_shot(self):
         """Круг оборвался исключением — снимок жив, а исход назван словом, а не тишиной."""
         def broken(q, a, tr=""):
