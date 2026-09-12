@@ -718,9 +718,19 @@ GATE_ANSWER_AT = ("тема «PC-дев», сообщением «задача: 
 #
 # Хвост callback_data — НОМЕР КЕЙСА, и регулярка пропускает только цифры: из Telegram в командную
 # строку не уезжает ничего, кроме числа, которое владелец мог бы набрать и сам.
-EXAM_CB_RE = re.compile(r"^exam:(ok|no):([0-9]{1,3})$")
+#
+# ★ 12.09.2026, рабочее место экзамена. Кнопок стало пять видов, и ВСЕ ОНИ ПО-ПРЕЖНЕМУ несут
+# только цифры: `ok`/`no` — вердикт, `h1`…`h4` — номер подсказки-тумблера, `own` — «напишу своё»,
+# `go` — «✔ Применить». Номер подсказки уехал В ГОЛОВУ ключа, а не вторым хвостом, ровно затем,
+# чтобы хвост остался ОДНИМ числом и правило «из Telegram едет только число» не пришлось
+# ослаблять ради второй группы.
+EXAM_CB_RE = re.compile(r"^exam:(ok|no|own|go|h[1-4]):([0-9]{1,3})$")
 EXAM_ANSWER_AT = ("консоль репозитория, командой «exam_show.py --case N --tap ok|no --who <имя>» "
                   "(словом в тему это пока не делается)")
+# Группа-тренажёр: карточка экзамена висит ТАМ, и ответ владельца на «✍️ своё» приходит оттуда же.
+# Число названо здесь литералом по той же причине, по какой оно названо литералом в `exam_show`:
+# адрес, взятый из изменяемого места, может однажды указать в клиентский чат.
+EXAM_CHAT_ID = -5193185299
 
 
 # ── КНОПКА СНЯТИЯ СИГНАЛЬНОЙ ОСТАНОВКИ ЯЩИКА ШТАБА (06.09.2026) ────────────────────────────
@@ -996,29 +1006,83 @@ def _exam_cb_parse(data):
     return (m.group(1), m.group(2)) if m else None
 
 
-def _exam_cli(action, case, who):
-    """Вердикт экзамена через дверь `exam_show.py --tap`: тот же путь, что и рука с консоли.
+# Стол экзамена — маленький json, который пишет `exam_show`. ЧИТАЕМ ЕГО САМИ, А НЕ ЧЕРЕЗ ИМПОРТ
+# `exam_show`, и это не удобство, а ЗАМЕР: `import exam_show` в этом файле затаскивает в замыкание
+# ЖИВЫХ ВОРОТ клиентского контура прогонщик корпуса (`exam_show.freeze` → `import trainer_run`), и
+# правка прогонщика после этого упирается в ворота. Цена названа числом самим набором
+# (`test_trainer_run.test_raner_ne_v_klientskom_konture`: замыкание ворот 77 → 78 файлов, лишним
+# входит ровно `trainer_run.py`). Две строчки разбора здесь дешевле сужения охраны там.
+#
+# СОГЛАСИЕ ДВУХ ЧИТАТЕЛЕЙ ОДНОГО ФАЙЛА СТОРОЖИТ НАБОР: `exam_show.own_start` пишет — этот читатель
+# читает, и контрактный тест сверяет их на живом файле. Разъедутся ключи — покраснеет он, а не
+# владелец, чей урок молча не поймали.
+EXAM_DESK = REPO_DIR / "exam_session.json"
+EXAM_DESK_CASE, EXAM_DESK_UNTIL = "case", "own_until"
+
+
+def _exam_pending_case(path=None, now=None):
+    """Кейс, ждущий урока СВОИМИ СЛОВАМИ → номер | None (ожидания нет / истекли 10 минут).
+
+    ОШИБКА ЧТЕНИЯ = «ожидания нет», fail-closed. Исход выбран, а не случился: ложное «жду»
+    превратило бы первое же сообщение владельца в группе в урок, которого он не писал."""
+    try:
+        with io.open(str(path or EXAM_DESK), encoding="utf-8") as f:
+            desk = json.load(f)
+        until = int(desk[EXAM_DESK_UNTIL])
+    except Exception:                                                       # noqa: BLE001
+        return None
+    if (now if now is not None else time.time()) > until:
+        return None
+    return desk.get(EXAM_DESK_CASE)
+
+
+def exam_args(action, case):
+    """Кнопка экзамена → аргументы двери `exam_show.py` | None (кнопка не наша).
+
+    ЧИСТАЯ функция, и вынесена ею намеренно: это единственное место, где решается, ЧТО именно
+    сделает тап, — и голденить его надо без субпроцесса, без Telegram и без диска. Всё, что она
+    отдаёт, состоит из литералов и ЦИФР, приехавших через `EXAM_CB_RE`: строки из Telegram в
+    командную строку не попадает ни одной."""
+    tail = ["--case", str(case)]
+    if action in ("ok", "no"):
+        return tail + ["--tap", action]
+    if action == "go":
+        return tail + ["--apply"]
+    if action == "own":
+        return tail + ["--own"]
+    if action.startswith("h") and action[1:].isdigit():
+        return tail + ["--toggle", action[1:]]
+    return None
+
+
+def _exam_cli(action, case, who, stdin_text=None):
+    """Кнопка экзамена через дверь `exam_show.py`: тот же путь, что и рука с консоли.
 
     Субпроцессом и той же механикой, что `_gate_cli`, по той же причине: агент роутит тап и
-    показывает результат, а судит право и пишет журнал ДВЕРЬ. Имя автора едет из `from_user`
-    Telegram — выдумать его здесь нельзя, а без имени право fail-closed откажет, и это верно:
-    вердикт без автора непроверяем."""
-    if action not in ("ok", "no"):
+    показывает результат, а судит право, пишет журнал и базу уроков ДВЕРЬ. Имя автора едет из
+    `from_user` Telegram — выдумать его здесь нельзя, а без имени право fail-closed откажет, и это
+    верно: вердикт без автора непроверяем.
+
+    `stdin_text` — урок владельца СВОИМИ СЛОВАМИ. Едет через stdin, а не через argv: это живая
+    кириллица произвольной длины, а argv на Windows ходит через кодировку консоли и коверкает её
+    молча. Заодно принцип «из Telegram в командную строку едет только число» остаётся целым — текст
+    в командной строке не появляется ни разу."""
+    args = ["--own-text"] if stdin_text is not None else exam_args(action, case)
+    if args is None:
         return f"экзамен, кейс {case}: не понял кнопку ({action})."
     if not VENV_PY.exists():
         return f"экзамен, кейс {case}: не нашёл python venv ({VENV_PY})."
     try:
         r = subprocess.run(
-            [str(VENV_PY), str(REPO_DIR / "exam_show.py"), "--case", str(case),
-             "--tap", action, "--who", str(who or "")],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            [str(VENV_PY), str(REPO_DIR / "exam_show.py")] + args + ["--who", str(who or "")],
+            input=stdin_text, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=90, cwd=str(REPO_DIR), creationflags=NO_WINDOW,
         )
         out = (r.stdout or "").strip() or (r.stderr or "").strip()
         return out or (f"экзамен, кейс {case}: пустой ответ двери на «{action}». "
                        f"Запасной путь — {EXAM_ANSWER_AT}.")
     except Exception as e:
-        return (f"экзамен, кейс {case}: вердикт «{action}» НЕ записан ({type(e).__name__}: {e}). "
+        return (f"экзамен, кейс {case}: «{action}» НЕ записано ({type(e).__name__}: {e}). "
                 f"Запасной путь — {EXAM_ANSWER_AT}.")
 
 
@@ -1112,14 +1176,17 @@ def _chain_cb_route(data, uid):
         return {"ok": True, "kind": "box", "action": action, "pid": mark,
                 "answer": "🔓 снимаю остановку…", "alert": False, "note": None}
     if exam is not None:
-        # Кнопка ВЕРДИКТА ЭКЗАМЕНА. Тост говорит «записываю кандидатом», а не «зачтено»: тап
-        # НИЧЕГО не засчитывает, счёта «пройдено N из 17» не двигает и ворот не открывает —
-        # обещать кнопкой зачёт значило бы соврать о последствиях раньше, чем владелец отпустит
-        # палец. Что именно легло — скажет ответ самой двери.
+        # Кнопки РАБОЧЕГО МЕСТА ЭКЗАМЕНА. Тост обещает РОВНО ТО, что произойдёт, и у пяти кнопок
+        # он разный намеренно: у номера последствий нет вовсе (тумблер), у «✔ Применить» они
+        # необратимы в одну сторону (урок начинает действовать на всех клиентов), у вердикта
+        # последствие — строка журнала. Один общий тост на пять кнопок обещал бы владельцу не то,
+        # что он нажал, раньше, чем он отпустит палец.
         action, case = exam
+        said = {"ok": "✅ записываю «верно»…", "no": "❌ записываю «неверно»…",
+                "go": "🎓 записываю уроки и вердикт…",
+                "own": "✍️ слушаю: следующим сообщением — правило…"}.get(action)
         return {"ok": True, "kind": "exam", "action": action, "pid": case,
-                "answer": ("✅ записываю «верно» кандидатом…" if action == "ok"
-                           else "❌ записываю «неверно» кандидатом…"),
+                "answer": said or ("☑️ отмечаю подсказку %s…" % action[1:]),
                 "alert": False, "note": None}
     if gate is not None:
         # Кнопка ВОРОТ клиентского контура. Тост говорит РАЗНОЕ про «да» и «нет» намеренно: «да»
@@ -1228,6 +1295,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- гейт доступа ДО любой команды ---
+    # 0) ГРУППА-ТРЕНАЖЁР: ровно одна ветка и только при ОБЪЯВЛЕННОМ ожидании «✍️ своё».
+    # Ставится она ДО гейта темы 205 по единственной причине: карточка экзамена висит в другом
+    # чате, и ответ владельца на неё приходит оттуда. Узость ветки — по построению: чужой чат,
+    # чужой человек и отсутствие живого ожидания дают ровно то же молчание, что и раньше, а сам
+    # текст берётся ДОСЛОВНО (не нижним регистром и без срезанного «/»): это правило владельца, и
+    # править его нам нечем.
+    if chat.id == EXAM_CHAT_ID:
+        if (user.id if user else None) != ALLOWED_USER_ID:
+            return
+        if await asyncio.to_thread(_exam_pending_case) is None:
+            return
+        raw = msg.text or ""
+        alog.info("экзамен: ловлю урок своими словами (%d симв.)", len(raw))
+        who = getattr(user, "username", "") or ""
+        reply = await asyncio.to_thread(_exam_cli, "own", "", who, raw)
+        await _send(context, chat.id, reply)
+        return
     # 1) только наш чат и только тема 205 — прочее молча игнорим
     if chat.id != HQ_CHAT_ID or msg.message_thread_id != HQ_THREAD_ID:
         return
