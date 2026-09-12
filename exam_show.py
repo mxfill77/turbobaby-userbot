@@ -97,6 +97,42 @@ HINT_OBS, HINT_RULE = "observation", "rule"
 # по ним владелец потом отличит урок, за который отвечает критик, от урока, написанного руками.
 HINT_WHY_MARK = "критик, подтверждено тапом"
 
+# ── ТРИ ИСХОДА ПОДСКАЗОК ВМЕСТО ОДНОГО (заведено 12.09.2026, задание 52-b) ──────────────────
+# ЗАЧЕМ. До сегодня снимок без подсказок выглядел ОДИНАКОВО во всех случаях — и когда критик не
+# ответил вовсе, и когда ответил, а разбор не вынул ни одной гипотезы. Замер 52-a
+# (`docs/artifacts/2026-09-12-СНИМКИ-odin-devyat-1209.md`, Р1): на девяти кейсах пришло 2 подсказки
+# из потолка 36, причина у восьми снимков была НЕИЗВЕСТНА ПО УСТРОЙСТВУ — сырой ответ нигде не
+# сохранялся, а молчание головы неотличимо от пустого разбора.
+#
+# КОРЕНЬ МОЛЧАНИЯ НАЗВАН ЧИСЛОМ (замер 12.09.2026, `tmp/exam52b/probe-case-*.json`): круг критика
+# стоит ДОЛЬШЕ шестидесяти секунд, а `suggest._cli_llm` на таймауте возвращает ПУСТУЮ СТРОКУ и НЕ
+# бросает исключения — значит ветка «критик подсказок не дал» не срабатывала ни разу, и снимок
+# молча ложился с нулём подсказок. Отсюда два следствия, оба сделаны ниже: у исхода должно быть
+# СВОЁ СЛОВО, а у вызова критика — СВОЙ потолок (`CRITIC_TIMEOUT`).
+OUT_HINTS = "hints"          # (а) подсказки есть — сколько
+OUT_SILENT = "silent"        # (б) критик не ответил — предел ожидания и сколько ждали
+OUT_UNPARSED = "unparsed"    # (в) ответил, но разбор не вынул ни одной — длина ответа в знаках
+
+# ── ПОТОЛОК ВЫЗОВА КРИТИКА — СВОЙ, А НЕ ОБЩИЙ С ЧЕРНОВИКОМ ──────────────────────────────────
+# ОБЩИМ ОН И БЫЛ, и это названо прямо: `suggest.CLI_TIMEOUT` (60 с, `suggest.py:244`) питает ОБА
+# круга единицы — и черновик (`trainer_run.run_case`), и критика (`_default_critic` →
+# `suggest.default_llm_caller` → `suggest._cli_llm`). Второй круг платил за первый: предел мерили
+# черновику, а упирался в него критик, у которого и работа другая, и материал больше (системная
+# часть запроса — 10752 знака против нескольких сотен у черновика).
+#
+# ЗНАЧЕНИЕ — ЗАМЕР, А НЕ КРУГЛОЕ ЧИСЛО. Пять кругов критика на замороженных снимках 12.09.2026
+# (`tmp/exam52b/probe-case-*.json`): 44.9 · 61.0 · 121.8 · 122.5 · 128.3 с. Медиана 121.8, максимум
+# 128.3 — то есть ПРЕЖНИЙ потолок 60 с вдвое меньше медианы круга, и 4 круга из 5 обязаны были в
+# него не уложиться. Потолок взят как УДВОЕННЫЙ МАКСИМУМ ЗАМЕРА (128.3 × 2 = 256.6 → 257): запас
+# даёт кругу право быть вдвое хуже худшего измеренного, а не «сколько-нибудь побольше».
+CRITIC_TIMEOUT = int(os.getenv("EXAM_CRITIC_TIMEOUT", "0") or 0) or 257
+
+# ВРЕМЕННОЕ МЕСТО СЫРОГО ОТВЕТА КРИТИКА — НАЗВАНО ЯВНО и лежит ВНЕ git (`tmp/` в .gitignore).
+# В снимок владельцу сырой ответ НЕ КЛАДЁТСЯ ни одной веткой: снимок читает Telegram-карточка, а
+# ответ критика — служебный текст на тысячи знаков. В снимке живут только ДЛИНА и ОТПЕЧАТОК, по
+# которым сохранённый файл опознаётся однозначно.
+CRITIC_RAW_DIR = os.path.join(REPO, "tmp", "exam_critic")
+
 
 # ---------------------------------------------------------------------------------------
 # отпечатки: чем именно подписан показанный текст
@@ -256,22 +292,110 @@ def hints_of(shot):
     return out[:HINTS_MAX]
 
 
-def _default_critic(question, answer, transcript=""):
-    """ЖИВОЙ КРИТИК — ТОТ ЖЕ, что у кнопки «🎓 Обучить» модербота, и другого здесь нет.
+def _save_critic_raw(case_id, raw):
+    """Сырой ответ критика → файл во ВРЕМЕННОМ месте. → (путь относительно репо, длина, отпечаток).
 
-    Ровно три чужих вызова, все из `trainer`: запрос (`hypotheses_prompt`, с доводом `paired=True`
-    — просим два поля вместо одного), разбор (`parse_hypotheses` — он же отсеивает повторы книги
-    правил) и расклейка пары (`split_pair`). Собственной логики критики здесь НЕТ ни строки: она
-    разъехалась бы с кнопкой молча, и владелец получал бы на одну ошибку бота два суждения.
+    ЗАЧЕМ ФАЙЛ. До 12.09.2026 ответ головы не сохранялся нигде, и вопрос «почему разбор не вынул
+    ни одной подсказки» был неотвечаем ПО УСТРОЙСТВУ: ответа больше не существовало. Круг головы
+    уже оплачен — выбрасывать его текст значит платить второй раз за тот же диагноз.
+
+    Писать НЕ УДАЛОСЬ — это НЕ повод уронить снимок: возвращаем пустой путь и живые длину с
+    отпечатком, которые считаны из строки в памяти, а не с диска."""
+    length = len(raw or "")
+    digest = hashlib.sha256((raw or "").encode("utf-8")).hexdigest()[:16]
+    try:
+        os.makedirs(CRITIC_RAW_DIR, exist_ok=True)
+        name = "case-%s-%s.txt" % (case_id, stamp().replace(":", "").replace("-", ""))
+        path = os.path.join(CRITIC_RAW_DIR, name)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(raw or "")
+        # Относительный путь короче и читается в карточке, но `relpath` БРОСАЕТ ValueError, когда
+        # место лежит на ДРУГОМ ДИСКЕ (Windows, замер 12.09.2026 — временный каталог набора на C:,
+        # репозиторий на D:). Адрес при этом терять нельзя: он и есть весь смысл сохранения.
+        try:
+            return os.path.relpath(path, REPO).replace("\\", "/"), length, digest
+        except ValueError:
+            return path.replace("\\", "/"), length, digest
+    except Exception as e:                                                  # noqa: BLE001
+        print("сырой ответ критика сохранить не удалось (%s) — длина и отпечаток всё равно есть"
+              % type(e).__name__)
+        return "", length, digest
+
+
+def _default_critic(question, answer, transcript="", case_id=""):
+    """ЖИВОЙ КРИТИК — ТОТ ЖЕ, что у кнопки «🎓 Обучить» модербота, и другого здесь нет.
+    → (подсказки, отчёт об исходе).
+
+    Ровно три чужих вызова, все из `trainer`: запрос (`trainer.hypotheses_prompt`, с доводом
+    `paired=True` — просим два поля вместо одного), разбор (`trainer.parse_hypotheses` — он же
+    отсеивает повторы книги правил) и расклейка пары (`trainer.split_pair`). Собственной логики
+    критики здесь НЕТ ни строки: она разъехалась бы с кнопкой молча, и владелец получал бы на одну
+    ошибку бота два суждения.
 
     ТРАНСКРИПТ ПЕРЕДАЁТСЯ ДОВОДОМ. Умолчание `hypotheses_prompt` («собери сам») ходит за живой
     сессией тренажёра в боевую `moderation_ipc`, которой у экзамена нет и быть не должно: кейс
-    судится по своему транскрипту, а не по тому, что кто-то печатал в тренажёре час назад."""
+    судится по своему транскрипту, а не по тому, что кто-то печатал в тренажёре час назад.
+
+    ОТЧЁТ ВОЗВРАЩАЕТСЯ ВТОРЫМ ЗНАЧЕНИЕМ, А НЕ ПЕЧАТАЕТСЯ. Печать умирает вместе с процессом
+    заморозки, а вопрос «почему подсказок нет» владелец задаёт СУТКИ СПУСТЯ, глядя в карточку.
+    Поэтому исход едет в снимок полем, и слова для (б) и (в) там разные."""
     import suggest
     import trainer
     system, user = trainer.hypotheses_prompt(question, answer, transcript=transcript, paired=True)
-    raw = suggest.default_llm_caller()(system, user)
-    return [trainer.split_pair(h) for h in trainer.parse_hypotheses(raw, limit=HINTS_MAX)]
+    was = getattr(suggest, "CLI_TIMEOUT", None)
+    t0 = time.time()
+    try:
+        suggest.CLI_TIMEOUT = CRITIC_TIMEOUT
+        raw = suggest.default_llm_caller()(system, user)
+    finally:
+        if was is not None:
+            suggest.CLI_TIMEOUT = was
+    waited = round(time.time() - t0, 1)
+    path, length, digest = _save_critic_raw(case_id, raw)
+    hints = [trainer.split_pair(h) for h in trainer.parse_hypotheses(raw, limit=HINTS_MAX)]
+    return hints, critic_report(hints, waited=waited, raw_len=length, raw_sha256=digest,
+                                raw_path=path, limit=CRITIC_TIMEOUT)
+
+
+def _call_critic(fn, question, draft, transcript, case_id):
+    """Позвать критика, ПОДОБРАВ подпись. → то, что он вернул.
+
+    Живому критику номер кейса нужен (им именуется сохранённый сырой ответ), а подставленным в
+    наборах — нет, и их подписи менять не за что: они проверяют поведение заморозки, а не критика.
+    Разбор подписи сделан ЯВНО, а не ловлей `TypeError`: `TypeError`, брошенный ВНУТРИ критика,
+    неотличим от «не тот довод», и слепая ловля позвала бы голову ВТОРОЙ раз — за деньги и молча."""
+    try:
+        import inspect
+        params = inspect.signature(fn).parameters
+        takes = "case_id" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):                    # подписи нет (C-функция, mock) — зовём встарь
+        takes = False
+    if takes:
+        return fn(question, draft, transcript, case_id=case_id)
+    return fn(question, draft, transcript)
+
+
+def critic_report(hints, waited=None, raw_len=0, raw_sha256="", raw_path="", limit=None,
+                  error=""):
+    """Факты круга критика → ОТЧЁТ ОБ ИСХОДЕ (dict). Чистая функция, головы не зовёт.
+
+    РЕШАЕТ ДЛИНА ОТВЕТА, А НЕ ДОГАДКА. Пусто → критик НЕ ОТВЕТИЛ (исход «б»); непусто, а подсказок
+    ноль → ОТВЕТИЛ, но разбор ничего не вынул (исход «в»). Третьего способа получить ноль нет:
+    исключение критика приходит сюда доводом `error` и считается молчанием — ответа-то нет.
+
+    ОБА НУЛЕВЫХ ИСХОДА ЧЕСТНО ГОВОРЯТ «НЕИЗВЕСТНО, ПОЧЕМУ», и это не фигура речи: ни предел
+    ожидания, ни длина ответа не объясняют причину — они называют, ЧТО именно померено."""
+    n = len(hints or [])
+    if n:
+        outcome = OUT_HINTS
+    elif int(raw_len or 0) > 0:
+        outcome = OUT_UNPARSED
+    else:
+        outcome = OUT_SILENT
+    return {"outcome": outcome, "parsed": n, "raw_len": int(raw_len or 0),
+            "raw_sha256": raw_sha256 or "", "raw_path": raw_path or "",
+            "waited": waited, "limit": limit, "error": error or ""}
 
 
 def reason_line(shot, limit=220):
@@ -343,17 +467,28 @@ def freeze(case_id, cases_path=None, runner=None, now=None, ph=None, critic=None
     except Exception as e:                                                  # noqa: BLE001
         print("метки примеров снять не удалось (%s) — снимок кладём без них" % type(e).__name__)
         examples = []
-    hints = []
+    # ИСХОД КРУГА КРИТИКА — ОТДЕЛЬНЫМ ПОЛЕМ СНИМКА, и полей исхода три, а не одно (52-b).
+    # Подставленный критик (набор) отдаёт ПРОСТО СПИСОК — тогда отчёт собирается здесь из того,
+    # что видно: сколько подсказок вышло. Живой отдаёт ПАРУ (подсказки, отчёт) и кладёт в отчёт то,
+    # чего отсюда не видно ни одной веткой: сколько ждали и какой длины был ответ. Разделяет их
+    # ТИП, а не длина: список из двух подсказок — тоже последовательность из двух.
+    hints, report = [], None
     try:
-        got = (critic or _default_critic)(question, draft, transcript)
+        got = _call_critic(critic or _default_critic, question, draft, transcript, case.get("id"))
+        if isinstance(got, tuple):
+            got, report = got
         hints = hints_of({"hints": got})
     except Exception as e:                                                  # noqa: BLE001
         print("критик подсказок не дал (%s) — снимок кладём без них" % type(e).__name__)
+        report = critic_report([], error=type(e).__name__, limit=CRITIC_TIMEOUT)
+    if report is None:
+        report = critic_report(hints, limit=CRITIC_TIMEOUT)
     shot = {
         "case": case.get("id"), "total": total, "name": case.get("name") or "",
         "lang": case.get("lang") or "", "question": question,
         "question_raw": raw,
         "draft": draft, "note": rec.get("note") or "", "hints": hints,
+        "critic": report,
         "examples": examples,
         "corpus": corpus_fingerprint(cases_path), "commit": commit,
         "rules": rules_version(), "built_at": stamp(now),
@@ -369,6 +504,43 @@ def freeze(case_id, cases_path=None, runner=None, now=None, ph=None, critic=None
 # карточка и кнопки
 # ---------------------------------------------------------------------------------------
 
+def no_hints_line(shot):
+    """Подсказок в снимке НЕТ — сказать, ПОЧЕМУ ИМЕННО. → строка. Исходов три, слова у всех разные.
+
+    ЗАЧЕМ РАЗНЫЕ СЛОВА. До 12.09.2026 строка была одна на все случаи, и владелец, читая «подсказок
+    нет», не мог отличить «критик не ответил» от «ответил, а разбор ничего не вынул». Это не
+    придирка к формулировке: у первого чинится потолок вызова, у второго — промпт или разбор, и
+    одинаковые слова прятали, какое из двух чинить. Замер 52-a: восемь снимков из девяти показывали
+    ЭТУ строку, и у трёх из них причиной был таймаут, а у пяти — неизвестно что.
+
+    ОБА НУЛЕВЫХ ИСХОДА ГОВОРЯТ «НЕИЗВЕСТНО, ПОЧЕМУ» ПРЯМО. Названы только измеренные числа —
+    сколько ждали при каком пределе (б) и какой длины пришёл ответ (в). Сказать вместо этого
+    «подсказок нет» значило бы выдать НЕЗНАНИЕ за ОТВЕТ: у бота нашлось бы что улучшить, просто
+    механизм этого не донёс.
+
+    СНИМОК СТАРОГО ОБРАЗЦА (ключа `critic` нет вовсе) показывается РОВНО КАК ПРЕЖДЕ. Он собран до
+    того, как исходы развели, и приписывать старому коду новое поведение нельзя: он не мерил ни
+    ожидания, ни длины."""
+    rep = (shot or {}).get("critic")
+    if not isinstance(rep, dict):
+        return "🔎 %s." % NO_HINTS
+    outcome = rep.get("outcome") or ""
+    if outcome == OUT_SILENT:
+        waited = rep.get("waited")
+        limit = rep.get("limit")
+        how = ("ждали %s с при пределе %s с" % (waited, limit) if waited is not None and limit
+               else "предел ожидания %s с" % limit if limit else "сколько ждали — не записано")
+        why = (" (круг оборвался: %s)" % rep.get("error")) if rep.get("error") else ""
+        return ("🔎 ПОДСКАЗОК НЕТ: критик НЕ ОТВЕТИЛ%s — %s. Почему именно — НЕИЗВЕСТНО: "
+                "ответа нет вовсе, разбирать нечего." % (why, how))
+    if outcome == OUT_UNPARSED:
+        where = (", сохранён в %s" % rep.get("raw_path")) if rep.get("raw_path") else ""
+        return ("🔎 ПОДСКАЗОК НЕТ: критик ОТВЕТИЛ — %d знаков%s, — но разбор не вынул из ответа "
+                "ни одной подсказки. Почему именно — НЕИЗВЕСТНО: ответ есть, а гипотез в нём "
+                "разбор не нашёл." % (int(rep.get("raw_len") or 0), where))
+    return "🔎 %s." % NO_HINTS
+
+
 def hints_block(shot):
     """Подсказки критика НУМЕРОВАННЫМ списком в САМОМ тексте карточки. → строка.
 
@@ -380,7 +552,7 @@ def hints_block(shot):
     («вот что не так здесь» и «вот как надо всегда»), и слитые в одну фразу они читаются как одно."""
     hints = hints_of(shot)
     if not hints:
-        return "🔎 %s." % NO_HINTS
+        return no_hints_line(shot)
     out = ["🔎 ЧТО УЛУЧШИТЬ — подсказки критика (того же, что стои́т за кнопкой «🎓 Обучить»):"]
     for i, h in enumerate(hints, 1):
         obs = h[HINT_OBS] or "наблюдение критик не назвал"

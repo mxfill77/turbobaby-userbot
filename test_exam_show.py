@@ -1204,6 +1204,163 @@ class TestReachProbes(unittest.TestCase):
         self.assertIn("не логируем", body)
 
 
+# ═══════════ ТРИ ИСХОДА ПОДСКАЗОК ВМЕСТО ОДНОГО (12.09.2026, задание 52-b) ═══════════════════
+
+class TestThreeOutcomesOfTheHints(Base):
+    """Снимок без подсказок обязан говорить, ПОЧЕМУ их нет, и у двух нулевых исходов слова РАЗНЫЕ.
+
+    ГОЛОВА ЗДЕСЬ НЕ ЗОВЁТСЯ НИ РАЗУ: подменена ровно она (`suggest.default_llm_caller`), а запрос,
+    разбор, сохранение сырого ответа и сборка отчёта — настоящие. Подменить вместо головы весь
+    критик значило бы мерить собственную фикстуру."""
+
+    # Ответ в ПРАВИЛЬНОЙ форме — той самой, что живьём отдали 5 ответов из 5 (замер 12.09.2026):
+    # маркер секции, строки двумя частями через «||», пустая секция отсева.
+    FORM = ("ГИПОТЕЗЫ:\n"
+            "назвал 307 ฿/день, хотя в прайсе 449 || называй цены дословно из прайса\n"
+            "написал «свободен», не проверив календарь || не подтверждай наличие без проверки\n"
+            "ОТСЕЯНО:\n(нет)")
+    # Ответ ЕСТЬ, а гипотез в нём разбор не находит: модель забраковала всё сама.
+    ALL_DROPPED = ("ГИПОТЕЗЫ:\n"
+                   "ОТСЕЯНО:\nвсё, что нашлось, уже написано в книге правил — добавить нечего")
+
+    def setUp(self):
+        super().setUp()
+        import trainer
+        self.trainer = trainer
+        self.raws = os.path.join(self.tmp, "critic_raw")
+        self._raw_was, exam_show.CRITIC_RAW_DIR = exam_show.CRITIC_RAW_DIR, self.raws
+        # ЖИВЫЕ ИСТОЧНИКИ ЗАПРОСА — ПУСТЫМИ: канон и книга правил ходят в сеть, а набор не ходит
+        # туда ни разу (шапка модуля). Разбор при пустой книге сверяет повторы ни с чем — ровно
+        # то, что нужно: предмет здесь исход, а не содержание книги.
+        self._canon_was, trainer.business_canon = trainer.business_canon, lambda mod=None: ""
+        self._book_was, trainer.rules_book = trainer.rules_book, lambda mod=None: ""
+        self.addCleanup(self._restore_critic)
+
+    def _restore_critic(self):
+        exam_show.CRITIC_RAW_DIR = self._raw_was
+        self.trainer.business_canon = self._canon_was
+        self.trainer.rules_book = self._book_was
+
+    def ask(self, answer):
+        """Живой критик с подменённой головой. → (подсказки, отчёт)."""
+        import suggest
+        was = suggest.default_llm_caller
+        suggest.default_llm_caller = lambda: (lambda s, u: answer)
+        try:
+            return exam_show._default_critic("вопрос", "ответ бота", "транскрипт", case_id=1)
+        finally:
+            suggest.default_llm_caller = was
+
+    def test_an_answer_in_the_right_form_yields_the_hints(self):
+        """(а) Форма соблюдена — подсказки вынимаются, и исход назван числом."""
+        hints, rep = self.ask(self.FORM)
+        self.assertEqual(len(hints), 2)
+        self.assertEqual(hints[0]["observation"], "назвал 307 ฿/день, хотя в прайсе 449")
+        self.assertEqual(hints[0]["rule"], "называй цены дословно из прайса")
+        self.assertEqual(rep["outcome"], exam_show.OUT_HINTS)
+        self.assertEqual(rep["parsed"], 2)
+
+    def test_an_empty_answer_is_the_silent_critic(self):
+        """(б) Ответа нет вовсе — исход «критик не ответил», с пределом и сроком ожидания."""
+        hints, rep = self.ask("")
+        self.assertEqual(hints, [])
+        self.assertEqual(rep["outcome"], exam_show.OUT_SILENT)
+        self.assertEqual(rep["raw_len"], 0)
+        self.assertEqual(rep["limit"], exam_show.CRITIC_TIMEOUT)
+        self.assertIsNotNone(rep["waited"], "сколько ждали — измеренное число, а не пропуск")
+
+    def test_an_answer_that_yields_nothing_is_the_third_outcome(self):
+        """(в) Ответ ЕСТЬ, а подсказок ноль — это НЕ (а) и НЕ (б), и длина ответа названа."""
+        hints, rep = self.ask(self.ALL_DROPPED)
+        self.assertEqual(hints, [])
+        self.assertEqual(rep["outcome"], exam_show.OUT_UNPARSED)
+        self.assertNotEqual(rep["outcome"], exam_show.OUT_SILENT)
+        self.assertEqual(rep["raw_len"], len(self.ALL_DROPPED))
+        self.assertGreater(rep["raw_len"], 0)
+
+    def test_the_words_of_the_two_empty_outcomes_differ_and_both_say_unknown(self):
+        """Разные слова — весь смысл правки: одинаковые прятали, ЧТО именно чинить."""
+        silent = exam_show.no_hints_line({"critic": self.ask("")[1]})
+        unparsed = exam_show.no_hints_line({"critic": self.ask(self.ALL_DROPPED)[1]})
+        self.assertNotEqual(silent, unparsed)
+        self.assertIn("НЕ ОТВЕТИЛ", silent)
+        self.assertIn("ОТВЕТИЛ —", unparsed)
+        for line in (silent, unparsed):
+            self.assertIn("НЕИЗВЕСТНО", line, "нулевой исход не смеет выдавать незнание за ответ")
+
+    def test_an_old_shot_without_the_critic_key_is_shown_as_before(self):
+        """Снимок старого образца: прежние слова и РОВНО прежние две кнопки."""
+        old = _shot(case=5)
+        self.assertNotIn("critic", old)
+        self.assertIn("подсказок критика в этом снимке нет", exam_show.card_text(old))
+        self.assertEqual(exam_show.markup(5, old), {"inline_keyboard": [[
+            {"text": "✅ Верно", "callback_data": "exam:ok:5"},
+            {"text": "❌ Неверно", "callback_data": "exam:no:5"}]]})
+
+    def test_the_raw_answer_lives_in_the_temp_place_and_never_in_the_shot(self):
+        """Сырой ответ сохранён ФАЙЛОМ, а в снимок едут только длина и отпечаток."""
+        _hints, rep = self.ask(self.FORM)
+        # Путь относителен репозиторию, а на чужом диске — абсолютен (см. `_save_critic_raw`):
+        # набор гоняется из временного каталога C:, а репозиторий лежит на D:.
+        path = os.path.join(exam_show.REPO, rep["raw_path"])
+        self.assertTrue(os.path.exists(path), rep["raw_path"])
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), self.FORM)
+        self.assertTrue(os.path.normcase(os.path.normpath(path)).startswith(
+            os.path.normcase(os.path.normpath(self.raws))), "временное место набора, а не боевое")
+        self.assertEqual(rep["raw_len"], len(self.FORM))
+        self.assertEqual(len(rep["raw_sha256"]), 16)
+        self.assertNotIn(self.FORM, json.dumps(rep, ensure_ascii=False))
+
+    def test_the_critic_ceiling_is_its_own_and_is_given_back_after_the_call(self):
+        """Потолок критика СВОЙ, и потолок черновика после круга остаётся прежним."""
+        import suggest
+        was = suggest.CLI_TIMEOUT
+        self.assertNotEqual(exam_show.CRITIC_TIMEOUT, was, "общий потолок — это и был дефект")
+        seen = []
+        caller_was = suggest.default_llm_caller
+        suggest.default_llm_caller = lambda: (lambda s, u: seen.append(suggest.CLI_TIMEOUT) or "")
+        try:
+            exam_show._default_critic("в", "о", "т", case_id=1)
+        finally:
+            suggest.default_llm_caller = caller_was
+        self.assertEqual(seen, [exam_show.CRITIC_TIMEOUT], "круг критика идёт под СВОИМ потолком")
+        self.assertEqual(suggest.CLI_TIMEOUT, was, "потолок черновика не угнан")
+
+    def test_a_line_without_the_separator_still_becomes_a_hint(self):
+        """ЗАМОК на fail-safe `split_pair`: строка без «||» — это ПРАВИЛО, а не потерянная подсказка.
+
+        Правило — то, что ложится уроком; выбросить его из-за несоблюдённого формата значило бы
+        терять работу оплаченного круга. Поэтому такой ответ даёт исход (а), а не (в), и тест
+        стои́т здесь, чтобы «развести исходы» однажды не сломало этот fail-safe заодно."""
+        hints, rep = self.ask("ГИПОТЕЗЫ:\nне называй сроков выдачи — их согласует менеджер")
+        self.assertEqual(len(hints), 1)
+        self.assertEqual(hints[0]["observation"], "")
+        self.assertEqual(rep["outcome"], exam_show.OUT_HINTS)
+
+    def test_the_shot_carries_the_outcome_of_the_critic_round(self):
+        """Исход едет В СНИМОК: вопрос «почему подсказок нет» задаётся СУТКИ спустя, глядя в файл."""
+        ok, path, shot = exam_show.freeze(
+            1, runner=lambda c: {"draft": "ответ", "note": ""}, ph=PH, critic=self.critic())
+        self.assertTrue(ok, path)
+        self.assertEqual(shot["critic"]["outcome"], exam_show.OUT_HINTS)
+        self.assertEqual(shot["critic"]["parsed"], len(shot["hints"]))
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["critic"], shot["critic"])
+
+    def test_a_fallen_critic_is_named_silent_and_does_not_cancel_the_shot(self):
+        """Круг оборвался исключением — снимок жив, а исход назван словом, а не тишиной."""
+        def broken(q, a, tr=""):
+            raise RuntimeError("критик упал")
+        ok, path, shot = exam_show.freeze(
+            1, runner=lambda c: {"draft": "ответ", "note": ""}, ph=PH, critic=broken)
+        self.assertTrue(ok, path)
+        self.assertEqual(shot["hints"], [])
+        self.assertEqual(shot["critic"]["outcome"], exam_show.OUT_SILENT)
+        self.assertEqual(shot["critic"]["error"], "RuntimeError")
+        self.assertIn("НЕИЗВЕСТНО", exam_show.no_hints_line(shot))
+
+
 def dispatch_notify_module():
     import dispatch_notify
     return dispatch_notify
