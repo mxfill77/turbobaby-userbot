@@ -332,10 +332,20 @@ def freeze(case_id, cases_path=None, runner=None, now=None, ph=None, critic=None
     # заплачен, а снимок без подсказок — законный снимок (`NO_HINTS`), который показывается и
     # судится как все, собранные до 12.09. Уронить его из-за молчания критика значило бы выбросить
     # оплаченный ответ и заставить платить второй раз.
+    # МЕТКИ ЖИВЫХ ПРИМЕРОВ, которые видела голова (задание 51-b). Транскрипт тот же, что у головы
+    # и у критика — `build_transcript` чистая функция от (case, ph), и второй её вызов даёт тот же
+    # текст. Подбор детерминирован, поэтому метки здесь — те самые, что стояли в промпте, а не
+    # похожие. Пусто — законный исход («примеров ниже порога нет»), а не поломка.
+    transcript = trainer_run.build_transcript(case, ph)
+    try:
+        import suggest
+        examples = suggest.live_examples_marks(transcript)
+    except Exception as e:                                                  # noqa: BLE001
+        print("метки примеров снять не удалось (%s) — снимок кладём без них" % type(e).__name__)
+        examples = []
     hints = []
     try:
-        got = (critic or _default_critic)(question, draft,
-                                          trainer_run.build_transcript(case, ph))
+        got = (critic or _default_critic)(question, draft, transcript)
         hints = hints_of({"hints": got})
     except Exception as e:                                                  # noqa: BLE001
         print("критик подсказок не дал (%s) — снимок кладём без них" % type(e).__name__)
@@ -344,6 +354,7 @@ def freeze(case_id, cases_path=None, runner=None, now=None, ph=None, critic=None
         "lang": case.get("lang") or "", "question": question,
         "question_raw": raw,
         "draft": draft, "note": rec.get("note") or "", "hints": hints,
+        "examples": examples,
         "corpus": corpus_fingerprint(cases_path), "commit": commit,
         "rules": rules_version(), "built_at": stamp(now),
     }
@@ -401,11 +412,30 @@ def card_text(shot, slots_total=None, passed=None):
     body = (
         "\n\n❓ КЛИЕНТ:\n%s\n\n"
         "🤖 БОТ:\n%s\n\n"
-        "📌 ПОЧЕМУ так: %s\n\n%s\n\n%s" % (
+        "📌 ПОЧЕМУ так: %s\n%s\n\n%s\n\n%s" % (
             shot.get("question") or "(вопрос не записан)",
-            shot.get("draft") or "(ответа нет)", reason_line(shot),
+            shot.get("draft") or "(ответа нет)", reason_line(shot), examples_line(shot),
             hints_block(shot), buttons_legend(shot)))
     return head + older + body
+
+
+def examples_line(shot):
+    """ПО ЧЕМУ бот отвечал так — одной строкой (задание 51-b). → строка.
+
+    Различает ТРИ исхода, а не два. Снимок, собранный ДО 51-b, ключа `examples` не имеет вовсе, и
+    звать его «примеров не было» значило бы приписать старому коду поведение нового: он живых
+    примеров не искал ни разу. Поэтому ключа нет → строки нет вовсе; ключ есть и пуст → сказано
+    прямо, что соседей выше порога не нашлось и голова шла по ручным парам.
+
+    САМИ ПРИМЕРЫ В КАРТОЧКУ НЕ ИДУТ. Это чужая переписка, пусть и обезличенная: владельцу нужен
+    ОТВЕТ на вопрос «откуда бот это взял», а не пересказ базы в Telegram."""
+    if "examples" not in (shot or {}):
+        return ""
+    marks = [m for m in (shot.get("examples") or []) if str(m).strip()]
+    if not marks:
+        return ("📚 ОБРАЗЦЫ: живых примеров выше порога не нашлось — отвечал по общей памятке "
+                "стиля и ручным парам.")
+    return "📚 ОБРАЗЦЫ: по %d живым ответам менеджеров (%s)." % (len(marks), ", ".join(marks))
 
 
 def buttons_legend(shot):
