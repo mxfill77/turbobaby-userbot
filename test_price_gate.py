@@ -278,7 +278,22 @@ class TestQuenchShape(GateBase):
         # следит). Совпадение держится ЭТИМ тестом, а не обещанием.
         self.assertEqual(price_freshness.QUENCH, {"status": "error", "quote": None})
 
-    def test_answer_path_asks_the_gate_before_pricing(self):
+    def test_client_path_no_longer_asks_the_gate_and_keeps_the_door_number(self):
+        """ПЕРЕВЁРНУТО 12.09.2026. Прежде здесь стояло «путь ответа спрашивает сторожа ДО счёта
+        и при отказе отдаёт QUENCH» — законно, пока число клиенту давал ФАЙЛ: снимок
+        устаревает молча, и несвежесть обязана была означать молчание.
+
+        Решение владельца 12.09.2026 (узел `business_rules`, блок ДВЕРЬ-ИСТОЧНИК-1209,
+        дословно «можно ориентироваться на этот лист») сделало источником клиентского числа
+        ЖИВУЮ ДВЕРЬ, а она не устаревает по построению — она и есть живое положение ручек.
+        Гасить её верный ответ из-за старости снимка значило бы оставить файлу власть над
+        клиентским ответом ровно там, где решение владельца её сняло.
+
+        ЧТО ИЗ ЭТОГО НЕ СЛЕДУЕТ: сторож не снят и не сломан. Он цел целиком, его вердикт,
+        карточка, бюджет проб и формы гашения проверяются всеми прочими замками этого файла
+        (они зелены без единой правки), и предмет у него остался — внутренние пути и прибор
+        расхождения `door_price`. Форма гашения `QUENCH` тоже цела: её совпадение с формой
+        пути ответа держит тест выше."""
         seen = {"asked": False}
 
         def fake_allow(*a, **kw):
@@ -286,20 +301,42 @@ class TestQuenchShape(GateBase):
             return False, "ЦЕНА НЕ НАЗВАНА: проба"
 
         def never(*a, **kw):
-            raise AssertionError("счёт по файлу не должен звучать при запрете сторожа")
+            raise AssertionError("счёт по файлу в клиентский ответ не идёт ни одной веткой")
+
+        # ДВЕРЬ ЗДЕСЬ ОБЯЗАНА ПО-НАСТОЯЩЕМУ ОТВЕТИТЬ, и до 12.09 она этого не делала: прежний
+        # гэттер не знал действия `fleet`, юнит не разрешался, и котировка не получалась вовсе.
+        # Прежней редакции теста это не мешало — она меряла ОТКАЗ сторожа, который наступал
+        # раньше и мимо двери. Теперь предмет замера — что число двери ПЕРЕЖИВАЕТ отказ, и на
+        # молчащей двери такой тест зеленел бы по неправильной причине.
+        fleet = ["NMAX 155CC BLACK PHUKET 4255"]
+
+        def getter(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in fleet]}}
+            return {"ok": True, "data": {
+                "day_price": 317, "total": 2217, "deposit": 3000, "available": True,
+                "days": 7, "bike": params.get("bike", ""), "cap_active": False,
+                "cap_price": None}}
 
         real_allow, real_reprice = price_gate.allow, suggest.price_source.reprice
         price_gate.allow, suggest.price_source.reprice = fake_allow, never
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
         try:
-            out = suggest._safe_quote_for_model(
-                "NMAX 155", "2026-01-29", "2026-02-05",
-                getter=lambda params: {"ok": True, "data": {
-                    "day_price": 317, "total": 2217, "deposit": 3000, "available": True,
-                    "days": 7, "cap_active": False, "cap_price": None}})
+            out = suggest._safe_quote_for_model("NMAX 155", "2026-01-29", "2026-02-05",
+                                                getter=getter)
         finally:
             price_gate.allow, suggest.price_source.reprice = real_allow, real_reprice
-        self.assertTrue(seen["asked"])
-        self.assertEqual(out, price_freshness.QUENCH)
+            suggest.pricing._FLEET_CACHE["data"] = None
+            suggest.pricing._FLEET_CACHE["ts"] = 0
+        # 1) Сторожа клиентский путь не спрашивает вовсе — отказавший мок остался нетронутым.
+        self.assertFalse(seen["asked"])
+        # 2) И число ДВЕРИ доехало целым, хотя сторож был настроен отказать наотрез.
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["quote"]["total"], 2217)
+        self.assertEqual(out["quote"]["day_price"], 317)
+        # 3) Счёта по файлу не звалось ни разу: подменённый `reprice` бросил бы AssertionError.
+        self.assertNotEqual(out, price_freshness.QUENCH)
 
 
 # ────────── 4. ДВА РАЗНЫХ ИСХОДА СТОРОЖА РАЗЛИЧИМЫ В ЖУРНАЛЕ И В КАРТОЧКЕ (06.09.2026) ──────

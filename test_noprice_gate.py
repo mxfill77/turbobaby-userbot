@@ -178,33 +178,61 @@ class TestPriceExists(Base):
 # --------------------------- (б) у модели цены НЕТ ----------------------------
 
 class TestModelWithoutPrice(Base):
-    """ОТРИЦАТЕЛЬНЫЙ ТЕСТ 2. Модель без строки в правиле даёт третий исход И карточку."""
+    """ПЕРЕВЁРНУТО 12.09.2026. Прежде: «модель без строки в правиле даёт третий исход И
+    карточку». Теперь на КЛИЕНТСКОМ пути этого класса НЕ НАСТУПАЕТ ВОВСЕ, и вот почему.
 
-    def test_verdict_is_no_row(self):
-        """Состояние данных названо ИМЕНЕМ, а не догадкой: правило прочитано, живая дверь модель
-        прокотировала, строки для неё в правиле нет."""
+    Решение владельца 12.09.2026 (узел `business_rules`, блок ДВЕРЬ-ИСТОЧНИК-1209, дословно
+    «можно ориентироваться на этот лист») сделало источником клиентского числа ЖИВУЮ ДВЕРЬ.
+    Условие класса — «дверь модель ПРОКОТИРОВАЛА, а строки для неё в файле нет». Раз число
+    клиенту даёт дверь, а она эту модель прокотировала, то цена ЕСТЬ, и молчать не о чем:
+    незнание файла перестало быть утверждением о цене. Третий исход остался, но его причиной
+    стало молчание САМОЙ ДВЕРИ (`door_price`, `test_door_price.py`).
+
+    ЧТО НЕ СЛОМАНО И НЕ УДАЛЕНО: модуль `noprice_gate` цел, его чистые функции и карточка
+    владельцу проверяются прежними замками ниже (они зелены без правки), врезка в `suggest`
+    на месте. Класс СПИТ, а не снят: вернёт владелец счёт по файлу — вернётся и он.
+    Именно поэтому тесты ниже перевёрнуты, а не выброшены."""
+
+    def test_missing_row_no_longer_silences_the_client(self):
+        """ГЛАВНАЯ ПЕРЕМЕНА КЛАССА. Состояние «в файле строки нет» ПО-ПРЕЖНЕМУ СУЩЕСТВУЕТ и
+        по-прежнему опознаётся файлом — но клиентскую цену больше не гасит: её называет дверь."""
+        # 1) Состояние данных не исчезло: файл REBEL правда не судит, и это видно прямо.
+        doc = price_source.load()
+        row, _how = price_source.resolve_row(doc, "REBEL", suggest._bike_key,
+                                             {"bike": self.FLEET_NAMES[1]})
+        self.assertIsNone(row, "фикстура протухла: REBEL появилась в файле — замер нужен новый")
+        # 2) А клиентский путь на том же входе ЦЕНУ ТЕПЕРЬ ДАЁТ — число ДВЕРИ, не файла.
         res = suggest._safe_quote_for_model("REBEL", DS, DE, getter=self._getter())
-        self.assertEqual(res["status"], "error")
-        self.assertIsNone(res["quote"])
-        self.assertEqual(res.get("noprice"), price_source.WHY_NO_ROW)
-        self.assertEqual(noprice_gate.kind_of(res), noprice_gate.KIND_NO_ROW)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["quote"]["total"], self.TAR["REBEL 300"])
+        # 3) Ключа `noprice` на клиентском пути не рождается ни одной веткой, и класс молчит.
+        self.assertNotIn("noprice", res)
+        self.assertIsNone(noprice_gate.kind_of(res))
         kind, _p, _q = suggest._resolve_model_price("REBEL", DS, DE, 10, False,
                                                     getter=self._getter())
-        self.assertEqual(kind, noprice_gate.KIND_NO_ROW)
+        self.assertEqual(kind, "ok")
 
-    def test_client_gets_answer_without_any_number(self):
-        note = self._note(TR_NOPRICE)
+    def test_guarantees_of_the_note_are_intact_even_though_it_sleeps(self):
+        """Записка класса НЕ ИСПОРЧЕНА и все свои гарантии держит — проверено ЧИСТО, мимо пути
+        ответа. Если владелец вернёт счёт по файлу, класс обязан ожить целым, а не обнаружить,
+        что его текст тихо разъехался, пока его никто не звал."""
+        note = noprice_gate.client_note("ru")
         self.assertIn("называет человек", note)
-        # 1) ЧИСЛА НЕТ ВООБЩЕ: белый список пост-чека пуст, значит ЛЮБАЯ цифра в ответе LLM
-        #    будет заклеймлена. Это и есть «без выдуманного числа», проверенное живым замком.
-        self.assertEqual(suggest._pc_wl_price_numbers(noprice_gate.client_note("ru")), set())
-        self.assertEqual(suggest.computed_price_figures(note), set())
-        # 2) МОЛЧАНИЕ ЗАПРЕЩЕНО РОВНО ТАК ЖЕ, как выдуманное число: записка требует ответить...
+        # ЧИСЛА НЕТ ВООБЩЕ: белый список пост-чека пуст, значит ЛЮБАЯ цифра ответа LLM будет
+        # заклеймлена. Это и есть «без выдуманного числа», проверенное живым замком.
+        self.assertEqual(suggest._pc_wl_price_numbers(note), set())
+        # МОЛЧАНИЕ ЗАПРЕЩЕНО РОВНО ТАК ЖЕ, как выдуманное число: записка требует ответить...
         self.assertIn("МОЛЧАТЬ ТОЖЕ НЕЛЬЗЯ", note)
-        # 3) ...назвать человека и не подставить вместо цены соседнюю модель.
+        # ...назвать человека и не подставить вместо цены соседнюю модель.
         self.assertIn("СРЕДНИМ по классу", note)
         self.assertIn("Цены ДРУГИХ моделей вместо неё тоже НЕ называй", note)
         self.assertNotIn("[QUOTE]", note)
+
+    def test_client_now_hears_the_door_number_instead(self):
+        """Живая сборка записки целиком: вместо слов про человека звучит цена ДВЕРИ."""
+        note = self._note(TR_NOPRICE)
+        self.assertNotIn("называет человек", note)
+        self.assertIn(str(self.TAR["REBEL 300"]), note)
 
     def test_owner_card_carries_model_dates_reason(self):
         h = self._hints(TR_NOPRICE)
@@ -283,22 +311,25 @@ class TestCounterfact(Base):
     """КОНТРФАКТ, названный заданием: при СНЯТОЙ гарантии тот же вход обязан дать ДРУГОЙ ответ.
     Совпал бы — гарантия не доказана, и это было бы записано словами, а не спрятано."""
 
-    def test_same_input_different_answer(self):
+    def test_contribution_on_the_client_path_is_now_exactly_zero(self):
+        """ПЕРЕВЁРНУТО 12.09.2026, и перевёрнуто В ЧЕСТНУЮ СТОРОНУ. Прежде контрфакт требовал,
+        чтобы снятая гарантия дала ДРУГОЙ ответ, и это доказывало вклад класса. Теперь ответ
+        ОДИНАКОВ — и ровно это и есть правда: на клиентском пути класс СПИТ, его вклад РОВНО
+        НУЛЕВОЙ, потому что цену называет дверь. Сказать «вклад есть» было бы неправдой, и мы
+        её не говорим — как не говорили и обратную в прежней редакции этого теста.
+
+        Замок сравнивает записку ПОСИМВОЛЬНО, а не «примерно»: вклад ноль обязан быть нулём."""
         with_gate = self._note(TR_NOPRICE)
         os.environ[noprice_gate.OFF_ENV] = "1"
         try:
             without_gate = self._note(TR_NOPRICE)
         finally:
             os.environ.pop(noprice_gate.OFF_ENV, None)
-        self.assertNotEqual(with_gate, without_gate)
-        # ЧЕМ ИМЕННО разный: с гарантией клиенту сказано, что цену называет человек; без неё —
-        # прежнее «уточню цену и вернусь», и человека не зовёт никто.
-        self.assertIn("называет человек", with_gate)
-        self.assertNotIn("называет человек", without_gate)
-        self.assertIn("уточнишь цену и вернёшься", without_gate)
-        # Числа не появляется НИ ТАМ, НИ ТАМ: вклад класса — позвать человека, а не спрятать
-        # цифру. Сказать «без гарантии бот врал числом» было бы неправдой, и мы её не говорим.
-        self.assertEqual(suggest._pc_wl_price_numbers(without_gate), set())
+        self.assertEqual(with_gate, without_gate)
+        self.assertNotIn("называет человек", with_gate)
+        # Ни там, ни там класс не гасит цену: число ДВЕРИ звучит в обоих.
+        self.assertIn(str(self.TAR["REBEL 300"]), with_gate)
+        self.assertIn(str(self.TAR["REBEL 300"]), without_gate)
 
     def test_card_disappears_with_the_guarantee(self):
         h = self._hints(TR_NOPRICE)
@@ -315,10 +346,12 @@ class TestBoundaries(Base):
     владельцу превратится в поток — то есть в шум, который перестанут читать."""
 
     def test_stale_price_is_not_this_class(self):
-        """«Цена протухла» и «цены нет» — РАЗНЫЕ вещи, и свежесть судит отдельный механизм
-        (`price_gate`). Он стои́т РАНЬШЕ по потоку и гасит цену СВОЕЙ карточкой; при несвежести
-        число в правиле ЕСТЬ. Разводятся они не словом, а по построению: гашение сторожа ключа
-        `noprice` не несёт и до третьего исхода не доходит ни одной дорогой."""
+        """«Цена протухла» и «цены нет» — РАЗНЫЕ вещи, и это по-прежнему так. РАЗОШЛОСЬ с 12.09
+        то, ЧТО ДЕЛАЕТ несвежесть: прежде сторож `price_gate` гасил цену своей карточкой, а
+        теперь клиентское число он не гасит вовсе (его предмет — старение СНИМКА, а снимок
+        клиентских чисел больше не даёт; разбор — докстрока `door_price`). Разведение класса
+        держится тем же построением: ключа `noprice` на клиентском пути не рождается, и до
+        третьего исхода «модель без цены» несвежесть не доходит ни одной дорогой."""
         save = suggest.price_gate.allow
         os.environ["PRICE_GATE_TTL_MIN"] = "60"   # врезка сторожа включена
         try:
@@ -327,7 +360,8 @@ class TestBoundaries(Base):
         finally:
             suggest.price_gate.allow = save
             os.environ["PRICE_GATE_TTL_MIN"] = "0"
-        self.assertEqual(res["status"], "error")
+        self.assertEqual(res["status"], "ok")      # отказ сторожа ответа двери не отнимает
+        self.assertEqual(res["quote"]["total"], self.TAR["NMAX 155"])
         self.assertNotIn("noprice", res)
         self.assertIsNone(noprice_gate.kind_of(res))
 

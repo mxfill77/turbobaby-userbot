@@ -7413,6 +7413,15 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         # в записанном правиле нет, или позовёт человека. Незакоммиченный WIP
                         # здесь тихо меняет ИСХОД клиентского ответа.
                         "noprice_gate.py",
+                        # 12.09.2026: ИСТОЧНИК КЛИЕНТСКОГО ЧИСЛА — `import door_price` в
+                        # suggest.py, тот же вход в куст, что у season_gate и noprice_gate.
+                        # Своих листьев не приносит НИ ОДНОГО: тянет только `price_source`
+                        # (уже выше) плюс stdlib. ЧЕМ ОПАСНА ЕГО ГРЯЗЬ — тем же, чем у обоих
+                        # соседей, и на градус хуже: те два решают, назовёт ли бот число, а
+                        # этот решает, КАКОЕ число он назовёт. Незакоммиченный WIP здесь
+                        # молча меняет САМУ ЦЕНУ в клиентском ответе, и увидят это не
+                        # тестом, а деньгами.
+                        "door_price.py",
                         # 01.09.2026: ступень A ревью-контура — куст за ленивым `import
                         # review_auto_run` в `_review_auto_note`/`maybe_review_auto`:
                         #   review_auto_run → review_auto → {review_pack → hq_context_pack, review_send}

@@ -807,7 +807,22 @@ class TestSplitByDays(FlagBase):
         self.assertFalse(suggest._cap_applies(off))
 
 
-# ───────────────────────────── 6. врезка в путь ответа ─────────────────────────────
+# ─────────────── 6. ВРЕЗКИ В КЛИЕНТСКИЙ ПУТЬ ОТВЕТА БОЛЬШЕ НЕТ (12.09.2026) ───────────────
+#
+# ЧТО ЗДЕСЬ ПРОВЕРЯЛОСЬ ДО 12.09 И ПОЧЕМУ ПЕРЕВЁРНУТО. Класс замерял врезку счёта по файлу в
+# путь ответа: флаг поднят → число файла ЗАМЕНЯЕТ число двери, а дословная строка столбца J
+# снимается. Решение владельца 12.09.2026 (узел `business_rules`, блок ДВЕРЬ-ИСТОЧНИК-1209,
+# дословно «можно ориентироваться на этот лист») эту врезку СНЯЛО: клиенту уходит число ЖИВОЙ
+# ДВЕРИ, а файл остался для внутренних прикидок и для прибора расхождения.
+#
+# ОСНОВАНИЕ НЕ МНЕНИЕ, А ЗАМЕР (`docs/artifacts/2026-09-12-cena-tri-chisla-sezon.md`): на
+# XMAX 300 нового поколения дверь дала 704 ฿/сут и сошлась с листом владельца ДО БАТА, файл дал
+# 682, а на карточке из трёх моделей недобор составил 765 ฿.
+#
+# САМ СЧЁТ ПО ФАЙЛУ НЕ ТРОНУТ И ПРОВЕРЯЕТСЯ ВЫШЕ ЭТОГО КЛАССА, всеми прежними замками
+# (`reprice` считает ровно как считал — секции 1-5 этого файла зелены без единой правки).
+# Перевёрнут РОВНО вопрос «доезжает ли его число до клиента», и ответ на него теперь НЕТ.
+# Клиентский источник целиком меряет `test_door_price.py`.
 
 class TestWiredIntoAnswerPath(FlagBase):
     FLEET = FLEET
@@ -849,13 +864,26 @@ class TestWiredIntoAnswerPath(FlagBase):
         self.off()
         self.assertIn(J179, self._note())
 
-    def test_flag_on_replaces_the_number_and_drops_column_j(self):
+    def test_flag_on_no_longer_replaces_the_number_nor_drops_column_j(self):
+        """ПЕРЕВЁРНУТО 12.09.2026. Прежде здесь стояло «437 ฿/день, итого 3059 ฿ и 317 в ответе
+        НЕТ» — то есть число ФАЙЛА вместо числа двери. Теперь наоборот: клиенту уходит 317/2217
+        двери, дословная строка столбца J цела, а счёта по файлу в ответе нет ни одной цифрой.
+
+        Замок сильнее равенства чисел: 437 и 3059 — это те САМЫЕ числа, которые файл на этом
+        входе и считает (проверено секциями 1-5 этого файла), поэтому их отсутствие в ответе
+        доказывает снятую подмену, а не сломанную фикстуру."""
         self.on()
         note = self._note()
-        self.assertIn("437 ฿/день", note)
-        self.assertIn("итого 3059 ฿", note)
-        self.assertNotIn("317", note)
-        self.assertNotIn(J179, note)
+        self.assertIn(J179, note)                     # J-строка листа ДОСЛОВНО
+        self.assertIn("317", note)                    # суточная ставка ДВЕРИ
+        self.assertIn("2217", note)                   # итог ДВЕРИ
+        self.assertNotIn("437 ฿/день", note)          # счёта по файлу в ответе нет
+        self.assertNotIn("итого 3059 ฿", note)
+        # Файл при этом по-прежнему СЧИТАЕТ — молчит он в ответе, а не в себе:
+        doc = price_source.load()
+        total, _info = price_source.term_total(doc, "NMAX 155", datetime.date(2026, 1, 29), 7,
+                                               suggest._bike_key)
+        self.assertEqual(total, 3059)
 
     def test_availability_still_decided_by_the_live_door(self):
         self.on()
@@ -863,7 +891,14 @@ class TestWiredIntoAnswerPath(FlagBase):
         self.assertIn("все подходящие байки заняты", note)
         self.assertNotIn("437", note)
 
-    def test_broken_file_makes_the_bot_silent_not_inventive(self):
+    def test_broken_file_no_longer_silences_the_client_price(self):
+        """ПЕРЕВЁРНУТО 12.09.2026, и это самая важная из трёх перемен. Прежде битый файл гасил
+        ответ в молчание — законно, пока число клиенту давал ФАЙЛ. Теперь число даёт ДВЕРЬ, и
+        молчать из-за чужой поломки значило бы оставить файлу власть над клиентским ответом
+        ровно там, где решение владельца её сняло.
+
+        «Не выдумывает» СОХРАНЕНО целиком: в ответе звучат 317/2217 — числа, ПРИШЕДШИЕ ИЗ
+        ДВЕРИ, — и ни одного числа файла (437/3059), потому что считать их нечем вовсе."""
         self.on()
         fd, p = tempfile.mkstemp(suffix=".json")
         os.close(fd)
@@ -872,15 +907,21 @@ class TestWiredIntoAnswerPath(FlagBase):
         self.addCleanup(lambda: os.path.exists(p) and os.unlink(p))
         price_source.PATH = p
         price_source._cache.update(key=None, doc=None)
+        self.assertIsNone(price_source.load())        # файл правда не читается
         note = self._note()
-        self.assertIn("НЕ называй никакого числа", note)
-        for n in ("317", "2217", "437", "3059"):
+        self.assertIn("317", note)                    # цена ДВЕРИ прозвучала
+        self.assertIn("2217", note)
+        for n in ("437", "3059"):                     # выдумки нет: чисел файла нет
             self.assertNotIn(n, note)
 
     def test_deposit_and_park_model_survive(self):
+        """Депозит и имя модели парка — слово ЖИВОЙ ДВЕРИ и им остаются. Форма строки депозита
+        сменилась вместе с источником: до 12.09 её собирал `_client_price` из поля `deposit`
+        («депозит 3000 ฿»), потому что `reprice` снимал J-текст; теперь J-текст цел и несёт
+        депозит своими словами («депозит: 3000 бат»). Число то же и пришло с той же двери."""
         self.on()
         note = self._note()
-        self.assertIn("депозит 3000 ฿", note)
+        self.assertIn("депозит: 3000 бат", note)
         self.assertIn("NMAX 155", note)
 
 
