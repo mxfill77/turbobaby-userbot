@@ -112,7 +112,9 @@ class Base(unittest.TestCase):
         return send
 
     def fresh_agent(self):
-        return lambda: (True, "агент свеж (подставной)")
+        # `**_` — не вкусовщина: боевой `show` зовёт замок С ТОКЕНАМИ карточки (`tokens=…`), и
+        # подставной ловец, не принимающий их, скрыл бы разъезд подписи молча.
+        return lambda **_: (True, "агент свеж (подставной)")
 
 
 # ───────────────────────── ПОКАЗЫВАЕТСЯ СОХРАНЁННОЕ, А НЕ СВЕЖЕЕ ─────────────────────────
@@ -395,7 +397,7 @@ class TestReshow(Base):
         self.assertFalse(ok)
         self.assertEqual(send.calls, [])
         ok, msg = exam_reshow.reshow(1, "отличие", sender=send,
-                                     agent_fn=lambda: (False, "агент СТАРШЕ кода кнопки"))
+                                     agent_fn=lambda **_: (False, "агент СТАРШЕ кода кнопки"))
         self.assertFalse(ok)
         self.assertEqual(send.calls, [], "несвежий ловец обязан остановить и перепоказ")
 
@@ -447,7 +449,18 @@ class TestOneCaseOneAddress(Base):
         self.assertEqual(send.calls, [])
 
 
-# ─────────────────── ЗАМОК: КНОПКА НЕ СМЕЕТ БЫТЬ НОВЕЕ СВОЕГО ЛОВЦА ──────────────────────
+# ────────── ЗАМОК: ЖИВОЙ ЛОВЕЦ ОБЯЗАН РАЗБИРАТЬ КНОПКИ ИМЕННО ЭТОЙ КАРТОЧКИ ─────────────
+#
+# Предмет замка поменялся 12.09.2026 (задание 52-d): было «оба файла кнопки старше процесса»,
+# стало «pc_agent.py старше процесса И его разбор принимает каждый колбэк карточки». Причина
+# названа числами в шапке `exam_show` и в двух артефактах за 12.09: прежний состав замыкания
+# остановил показ дважды (отставание 1097 с и 1575 с) на `exam_show.py` — файле, которого живой
+# агент в себе НЕ НЕСЁТ ВОВСЕ (тап спавнит дверь отдельным процессом, `pc_agent.py:1077`).
+
+# Разбор ПРЕЖНЕГО агента: до коммита 56ca76a он знал ровно две кнопки. Фикстура историческая, а
+# не выдуманная — ровно такой разбор и жил в процессе, когда карточка уже печатала шесть кнопок.
+NARROW_PARSE = 'EXAM_CB_RE = re.compile(r"^exam:(ok|no):([0-9]{1,3})$")'
+
 
 class TestStaleAgentLock(Base):
     def _lock(self, pid=4242, started=1000.0):
@@ -457,20 +470,91 @@ class TestStaleAgentLock(Base):
             f.write(json.dumps({"pid": pid, "started": started, "script": "pc_agent.py"}))
         return p
 
+    def _cbs(self, case_id=1, hints=3):
+        """Колбэки, которые НАПЕЧАТАЕТ карточка снимка с таким числом подсказок."""
+        made = [_hint("наблюдение %d" % i, "правило %d" % i) for i in range(1, hints + 1)]
+        return exam_show.card_callbacks(case_id, _shot(hints=made))
+
+    def _live_parse(self, _path=None):
+        """Разбор ЖИВОГО агента, прочитанный с диска (read-only, файла не касаемся)."""
+        with open("pc_agent.py", encoding="utf-8", errors="replace") as f:
+            return f.read()
+
+    # ─── (1) ВРЕМЯ: разбор правлен после старта процесса ───
+
     def test_agent_older_than_the_button_forbids_the_show(self):
         lock = self._lock(started=1000.0)
-        carries, why = exam_show.agent_carries_button(lock, mtime_fn=lambda p: 2000.0)
+        carries, why = exam_show.agent_carries_button(
+            lock, mtime_fn=lambda p: 2000.0, callbacks=self._cbs())
         self.assertIs(carries, False)
         self.assertIn("СТАРШЕ", why)
+        self.assertIn("1000 с", why, "отставание обязано быть названо ЧИСЛОМ")
         self.assertIn("обновись", why, "цена снятия обязана быть названа словами")
 
-    def test_agent_newer_than_the_button_allows_it(self):
+    def test_time_lock_watches_the_parser_file_only(self):
+        """СУТЬ ПРАВКИ 52-d: свежесть меряется по файлу, живущему В ПАМЯТИ процесса, и только.
+
+        Наш собственный файл из сравнения по времени убран: агент его не импортирует, ребёнок
+        читает его с диска на каждом тапе. Контрфакт прежнего состава стоит прямо в проверке —
+        останься `exam_show.py` в замыкании, запрошенный ниже mtime 10^9 дал бы отказ."""
+        self.assertEqual(exam_show.BUTTON_CLOSURE, ("pc_agent.py",))
+        asked = []
+
+        def mtime(path):
+            asked.append(os.path.basename(path))
+            return 1e9 if path.endswith("exam_show.py") else 2000.0
+
         lock = self._lock(started=9000.0)
-        carries, _ = exam_show.agent_carries_button(lock, mtime_fn=lambda p: 2000.0)
-        self.assertIs(carries, True)
+        carries, why = exam_show.agent_carries_button(
+            lock, mtime_fn=mtime, callbacks=self._cbs(), read_fn=self._live_parse)
+        self.assertIs(carries, True, why)
+        self.assertEqual(asked, ["pc_agent.py"],
+                         "у замка нет права спрашивать возраст файла, которого агент не несёт")
+
+    # ─── (2) СОДЕРЖИМОЕ: префикс, которого разбор не принимает ───
+
+    def test_prefix_the_parser_rejects_forbids_the_show(self):
+        """ГЛАВНЫЙ ОТРИЦАТЕЛЬНЫЙ: файлы свежие, а кнопок агент не разбирает → НЕТ, с числами."""
+        lock = self._lock(started=9000.0)
+        cbs = self._cbs(hints=3)
+        self.assertEqual(len(cbs), 6, "карточка с 3 подсказками печатает 6 кнопок")
+        carries, why = exam_show.agent_carries_button(
+            lock, mtime_fn=lambda p: 2000.0, callbacks=cbs, read_fn=lambda p: NARROW_PARSE)
+        self.assertIs(carries, False)
+        # 5 из 6: прежний разбор принимает РОВНО «exam:ok:1», а «exam:no:…» карточка с
+        # подсказками не печатает вовсе — её второй ряд занят номерами.
+        self.assertIn("НЕ принимает 5 из 6", why, "отказ обязан быть назван ЧИСЛОМ")
+        for dead in ("exam:h1:1", "exam:h2:1", "exam:h3:1", "exam:own:1", "exam:go:1"):
+            self.assertIn(dead, why, "непонятая кнопка обязана быть названа по имени")
+        self.assertNotIn("СТАРШЕ", why, "это отказ ПО СОДЕРЖИМОМУ, а не по времени")
+
+    def test_a_case_number_wider_than_the_parser_also_refuses(self):
+        """Разбор берёт 1–3 цифры номера; четырёхзначный кейс — тот же класс, другая дорога."""
+        lock = self._lock(started=9000.0)
+        carries, why = exam_show.agent_carries_button(
+            lock, mtime_fn=lambda p: 2000.0, callbacks=self._cbs(case_id=1234),
+            read_fn=self._live_parse)
+        self.assertIs(carries, False)
+        self.assertIn("exam:ok:1234", why)
+
+    def test_the_live_parser_accepts_every_button_the_live_card_prints(self):
+        """КОНТРАКТ ДВУХ ЖИВЫХ ФАЙЛОВ, и он здесь главный на будущее.
+
+        Сверяется не литерал, а печать `markup` при ПОЛНОМ наборе подсказок (`HINTS_MAX`) против
+        разбора из живого `pc_agent.py`. Разъедутся — покраснеет он, а не владелец, чей тап молча
+        не дошёл до двери."""
+        rx, words = exam_show.agent_parse()
+        self.assertIsNotNone(rx, words)
+        cbs = self._cbs(hints=exam_show.HINTS_MAX)
+        self.assertEqual(len(cbs), exam_show.HINTS_MAX + 3)
+        bad = [t for t in cbs if not rx.match(t)]
+        self.assertEqual(bad, [], "живой агент не разбирает свои же кнопки: %s (разбор %s)"
+                         % (bad, words))
+
+    # ─── (3) НЕИЗВЕСТНО: третий исход, и он тоже запрещает ───
 
     def test_third_outcome_is_unknown_and_it_also_forbids(self):
-        """Нет лока / нет момента старта → НЕИЗВЕСТНО, и оно НЕ разрешает показ."""
+        """Нет лока / нет момента старта / нет карточки / нет разбора → НЕИЗВЕСТНО."""
         carries, why = exam_show.agent_carries_button(os.path.join(self.tmp, "нет-такого"))
         self.assertIsNone(carries)
         self.assertIn("лока", why)
@@ -479,13 +563,52 @@ class TestStaleAgentLock(Base):
             f.write("4242\n")
         carries2, _ = exam_show.agent_carries_button(legacy)
         self.assertIsNone(carries2)
+        lock = self._lock(started=9000.0)
+        # карточка не предъявлена — «ДА» отсюда не выходит
+        carries3, why3 = exam_show.agent_carries_button(lock, mtime_fn=lambda p: 2000.0)
+        self.assertIsNone(carries3)
+        self.assertIn("кнопок на сверку 0", why3)
+        # разбор переехал из файла — сверять не с чем
+        carries4, why4 = exam_show.agent_carries_button(
+            lock, mtime_fn=lambda p: 2000.0, callbacks=self._cbs(),
+            read_fn=lambda p: "# разбор уехал в другой модуль\n")
+        self.assertIsNone(carries4)
+        self.assertIn("EXAM_CB_RE", why4)
         self.put_shot(_shot(corpus=exam_show.corpus_fingerprint()))
         send = self.sender()
         for verdict in (False, None):
-            ok, msg = exam_show.show(1, sender=send, agent_fn=lambda: (verdict, "почему-то"))
+            ok, msg = exam_show.show(1, sender=send, agent_fn=lambda **_: (verdict, "почему-то"))
             self.assertFalse(ok)
             self.assertIn("НЕИЗВЕСТНО" if verdict is None else "НЕТ", msg)
         self.assertEqual(send.calls, [], "при недоказанном ловце наружу не уходит ничего")
+
+    # ─── сквозняк: отказ по содержимому останавливает ЖИВОЙ показ, а не только функцию ───
+
+    def test_show_sends_nothing_when_the_parser_is_narrow(self):
+        self.put_shot(_shot(corpus=exam_show.corpus_fingerprint(), hints=HINTS))
+        lock = self._lock(started=9000.0)
+        send = self.sender()
+        ok, msg = exam_show.show(
+            1, sender=send,
+            agent_fn=lambda **kw: exam_show.agent_carries_button(
+                lock, mtime_fn=lambda p: 2000.0, read_fn=lambda p: NARROW_PARSE, **kw))
+        self.assertFalse(ok)
+        self.assertIn("НЕ принимает", msg)
+        self.assertEqual(send.calls, [], "непонятая кнопка наружу не уходит")
+
+    def test_show_hands_the_lock_the_real_card_buttons(self):
+        """Замок судит колбэки ЭТОГО снимка: число подсказок задаёт предмет сверки."""
+        self.put_shot(_shot(corpus=exam_show.corpus_fingerprint(), hints=HINTS))
+        seen = []
+
+        def spy(callbacks=None, **_):
+            seen.append(list(callbacks or []))
+            return True, "подставной"
+
+        ok, _msg = exam_show.show(1, sender=self.sender(), agent_fn=spy)
+        self.assertTrue(ok)
+        self.assertEqual(seen, [["exam:ok:1", "exam:h1:1", "exam:h2:1",
+                                 "exam:own:1", "exam:go:1"]])
 
 
 # ──────────────────────────── ЧЕТЫРЕ ОТРИЦАТЕЛЬНЫХ У ТАПА ───────────────────────────────
