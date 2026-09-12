@@ -818,7 +818,7 @@ def agent_carries_button(lock_path=None, mtime_fn=None, files=None, callbacks=No
                 pid, len(bad), len(cbs), ", ".join("«%s»" % t for t in bad),
                 parse_words, AGENT_SRC))
     return True, (
-        "живой агент (pid %s) стартовал позже правки «%s» И разбирает все %d колбэка карточки "
+        "живой агент (pid %s) стартовал позже правки «%s» И разбирает ВСЕ её колбэки, числом %d "
         "(разбор «%s») — кнопки он поймёт" % (pid, name, len(cbs), parse_words))
 
 
