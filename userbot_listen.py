@@ -42,6 +42,7 @@ load_dotenv()
 import suggest  # noqa: E402
 import trainer  # noqa: E402  ГРУППА-ТРЕНАЖЁР (изолированный путь; боевой поток не задет)
 import trainer_log  # noqa: E402  ЛОГ ТРЕНАЖЁРА в мозг (KB_trainer_log; fail-safe, ничего не блокирует)
+import trainer_photo  # noqa: E402  СНИМОК В ТРЕНАЖЁРЕ: загрузка в папку входящих + чтение головой
 import booking_draft  # noqa: E402  (текст-команда «до crm» в тренажёре — мост 2.1, read-only)
 import proc_identity  # noqa: E402  ЛИЧНОСТЬ ПРОЦЕССА: номер + имя запуска + момент старта
 
@@ -429,7 +430,31 @@ async def on_trainer_group(event):
     geo = getattr(msg, "geo", None)
     gm = suggest.geo_marker(geo) if geo is not None else None
     has_photo = getattr(msg, "photo", None) is not None
-    body = trainer.client_body(text, has_photo=has_photo, geo_marker=gm)
+    note = None
+    if has_photo:
+        # ЧТЕНИЕ СНИМКА (задания 60-a/60-b/60-d). Первой строкой — гашение: чтение головой длится
+        # 78…88 с (замер 60-a), а дебаунс ответа 8 с. Подпись и снимок приходят РАЗНЫМИ апдейтами
+        # (живой след 12.09 18:10), значит ответ на подпись уже запланирован и без bump_seq
+        # бот ответил бы «пришлите фото» за 8 с — то есть опоздал бы к собственному снимку.
+        trainer.bump_seq()
+        try:
+            desc = await trainer_photo.intake(
+                msg, chat_id=chat_id, chat_title=trainer.TRAINER_GROUP_NAME, sender=sender)
+        except Exception as e:
+            # Сорванный снимок НЕ имеет права уронить турн: молчание бота — тот самый дефект,
+            # ради которого всё это заводилось. Падаем в прежний бессодержательный «[фото]».
+            log.warning(f"{_now()} | ТРЕНАЖЁР/фото: разбор снимка сорвался: {type(e).__name__}: {e}")
+            desc = None
+        if desc:
+            note = trainer_photo.transcript_body(desc)
+            log.info(f"{_now()} | ТРЕНАЖЁР/фото: msg={getattr(msg, 'id', '?')} "
+                     f"хранение={desc.get('saved') or '—'} чтение={desc.get('outcome')} "
+                     f"байт={desc.get('bytes')} строк={desc.get('lines')} "
+                     f"{('· ' + desc['reason']) if desc.get('reason') else ''}")
+            words = trainer_photo.human_note(desc)
+            if words:
+                await _trainer_send(event.client, chat_id, words)
+    body = trainer.client_body(text, has_photo=has_photo, geo_marker=gm, photo_note=note)
     await _trainer_client_turn(event, body)
 
 

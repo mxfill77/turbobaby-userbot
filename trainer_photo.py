@@ -45,6 +45,8 @@ trainer_photo.py — СНИМОК В ТРЕНАЖЁРЕ: загрузка вло
 import os
 import re
 import json
+import glob
+import asyncio
 import subprocess
 import tempfile
 import logging
@@ -132,10 +134,16 @@ def photo_path(chat_id, msg_id, kind="jpg"):
     return os.path.join(PHOTO_DIR, f"trn_{int(chat_id)}_{int(msg_id)}.{kind}")
 
 
-async def download(msg, chat_id=None, msg_id=None):
+async def download(msg, chat_id=None, msg_id=None, target=None):
     """Скачать вложение сообщения ТЕМ ЖЕ сеансом, которым бот и так работает: у объекта Telethon
     `Message` метод `download_media` ходит через КЛИЕНТА, которому сообщение принадлежит, — второй
     сессии здесь не заводится ни одной.
+
+    `target` — ЯВНО названный путь файла. Не задан → временное место разбора `PHOTO_DIR`
+    (поведение задания 60-a). Задан → качаем ТУДА и больше никуда: врезка в слушателя (60-d)
+    кладёт снимок СРАЗУ в папку входящих `photo_inbox.INBOX_DIR`, чтобы строка индекса и чтение
+    головой пришлись на ОДИН И ТОТ ЖЕ файл. Вторая копия того же снимка на диске означала бы, что
+    Штаб и голова смотрят на разные байты.
 
     → dict(ok, path, bytes, kind, reason). ok=False означает исход НЕ СКАЧАЛОСЬ.
     Исключения не выпускает: сорванная загрузка обязана дать ТРЕТИЙ исход, а не уронить турн."""
@@ -145,12 +153,12 @@ async def download(msg, chat_id=None, msg_id=None):
     if getattr(msg, "photo", None) is None and getattr(msg, "media", None) is None:
         out["reason"] = "в сообщении нет вложения"
         return out
+    target = target or photo_path(cid, mid)
     try:
-        os.makedirs(PHOTO_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
     except Exception as e:
-        out["reason"] = f"каталог {PHOTO_DIR} не создан: {type(e).__name__}"
+        out["reason"] = f"каталог {os.path.dirname(target)} не создан: {type(e).__name__}"
         return out
-    target = photo_path(cid, mid)
     try:
         got = await msg.download_media(file=target)
     except Exception as e:
@@ -314,3 +322,100 @@ def human_note(desc):
     if o == NOT_DOWNLOADED:
         return WORDS_NOT_DOWNLOADED
     return WORDS_NOT_RECOGNIZED
+
+
+# ═══════════════ ОДНА ДОСТАВКА — ОДИН ПУТЬ, ОДНА СТРОКА (задание 60-d) ═══════════════════════
+# Врезка в слушателя обязана делать ТРИ вещи за одну доставку: положить снимок в папку входящих
+# (задание 60-b), родить РОВНО ОДНУ строку индекса и прочитать снимок головой (задание 60-a).
+# Третьей ветки здесь нет СОЗНАТЕЛЬНО: стоило бы хранению и чтению разойтись по двум местам —
+# и появился бы способ получить строку без файла (или файл без строки), то есть ровно тот
+# молчаливый пропуск, против которого 60-b и заводилось.
+#
+# Почему СНАЧАЛА строка, ПОТОМ чтение. Загрузка — секунды, чтение головой — 78…88 с (замер 60-a).
+# Строка пишется сразу после загрузки: сорвись чтение хоть насмерть, Штаб всё равно узнает, что
+# снимок пришёл и лежит. Обратный порядок терял бы факт доставки ради факта чтения.
+#
+# Второй копии снимка не заводим: качаем СРАЗУ в папку входящих, и читаем ТОТ ЖЕ файл.
+# `tmp/trainer_photos` остаётся местом ручного разбора 60-a и врезкой не используется.
+
+
+def _inbox_twin(msg_id, inbox_dir):
+    """Уже лежащий файл этого сообщения (повторная доставка). Имя снимка несёт номер сообщения
+    последним полем (`…_msg106536.jpg`), поэтому находится он БЕЗ индекса. Нет файла → ""."""
+    try:
+        hits = sorted(glob.glob(os.path.join(inbox_dir, "*_msg%d.*" % int(msg_id))))
+    except OSError as e:
+        # Папка недоступна — это НОВОСТЬ, а не «файла нет»: молчаливое "" тут сделало бы
+        # неисправный диск неотличимым от честного отсутствия снимка.
+        log.warning("ТРЕНАЖЁР/фото: папка входящих %s не читается: %s", inbox_dir, e)
+        return ""
+    return hits[0] if hits else ""
+
+
+async def intake(msg, *, chat_id=None, msg_id=None, chat_title="", sender=None, when=None,
+                 caption=None, llm=None, index_path=None, inbox_dir=None):
+    """ПУТЬ СНИМКА ЦЕЛИКОМ: скачать → записать строку индекса → прочитать головой. Один вызов,
+    один файл, одна строка. Сети в тестах не требует: голова инъектируется через `llm`.
+
+    → dict исхода ЧТЕНИЯ (как у `describe`) плюс четыре поля связки:
+       saved       — исход ХРАНЕНИЯ словами `photo_inbox` (СОХРАНЁН · НЕ СКАЧАН · НЕ КАРТИНКА ·
+                     пусто на повторе);
+       index_line  — родившаяся строка индекса ("" — строки не было ни одной);
+       path        — файл, который и записан в индекс, и прочитан (он один и тот же);
+       read        — звалось ли чтение вообще.
+
+    Исключений не выпускает ни одной веткой: сорванный снимок не имеет права уронить турн."""
+    import photo_inbox
+    import photo_inbox_fetch as pif        # sender_label/is_image_message/_fix_extension — одно
+                                           # мнение на репозиторий, своих копий не заводим
+
+    cid = chat_id if chat_id is not None else getattr(msg, "chat_id", None)
+    mid = msg_id if msg_id is not None else getattr(msg, "id", None)
+    when = when if when is not None else getattr(msg, "date", None)
+    cap = caption if caption is not None else getattr(msg, "message", None)
+    if cap is None:
+        cap = ""                          # подписи не было — пустая колонка, а не потеря
+    inbox = inbox_dir or photo_inbox.INBOX_DIR
+
+    res = {"outcome": NOT_DOWNLOADED, "lines": 0, "text": "", "bytes": 0, "kind": None,
+           "reason": "", "saved": "", "index_line": "", "path": "", "read": False}
+
+    if cid is None or mid is None:
+        # Ключ повтора — ПАРА (чат, номер сообщения). Подставить сюда ноль значило бы склеить
+        # ВСЕ безымянные доставки в один ключ: первая записалась бы, остальные ушли бы как
+        # «уже в индексе». Лучше честный отказ со словами.
+        res["reason"] = "у сообщения нет номера чата или номера сообщения"
+        return res
+
+    plan = photo_inbox.plan_save(has_photo=pif.is_image_message(msg), chat_id=cid, msg_id=mid,
+                                 when=when, index_path=index_path, inbox_dir=inbox)
+    if plan["act"] != "save":
+        res["saved"] = plan["outcome"]
+        res["reason"] = plan["reason"]
+        if plan["outcome"] == photo_inbox.NOT_A_PHOTO:
+            return res                    # вложения не было: ни строки, ни чтения, ни байта
+        # ПОВТОР той же доставки. Второй строки не рождаем и второй раз не качаем — но уже
+        # лежащий файл читаем: ответ бота обязан быть содержательным и на повторе.
+        twin = _inbox_twin(mid, inbox)
+        if not twin:
+            return res
+        res["path"] = twin
+        res["read"] = True
+        res.update(await asyncio.to_thread(describe, twin, llm))
+        return res
+
+    got = await download(msg, chat_id=cid, msg_id=mid, target=plan["path"])
+    path = pif._fix_extension(got["path"]) if got["path"] else ""
+    saved = photo_inbox.commit_save(
+        plan, chat=(chat_title or "?"), chat_id=cid, msg_id=mid, when=when,
+        sender=pif.sender_label(msg, sender), caption=cap,
+        downloaded_path=path, error=("" if got["ok"] else got["reason"]),
+        index_path=index_path)
+    res.update(saved=saved["outcome"], index_line=saved["line"], bytes=saved["bytes"],
+               path=path or plan["path"], reason=saved["reason"])
+    if saved["outcome"] != photo_inbox.SAVED:
+        return res                        # читать НЕЧЕГО: исход остаётся НЕ СКАЧАЛОСЬ
+    res["read"] = True
+    res.update(await asyncio.to_thread(describe, path, llm))
+    res["path"] = path
+    return res
