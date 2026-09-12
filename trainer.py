@@ -154,17 +154,24 @@ def _clean_manager(text):
     return "\n".join(out).strip()
 
 
-def client_body(text, has_photo=False, geo_marker=None):
+def client_body(text, has_photo=False, geo_marker=None, photo_note=None):
     """Тело клиентской реплики для транскрипта — ПО ТЕМ ЖЕ правилам, что suggest.transcript_from
     (ЛС-путь): текст (если есть) → иначе фото «[фото]» → иначе гео-маркер «[локация lat,lon]» →
     иначе «[медиа/без текста]». Врезка чинит тренажёрный путь: гео-ПИН и фото Telegram доходят
     до collected_facts и резолвера доставки МАРКЕРАМИ (иначе, собирая турн из event.raw_text,
-    мы теряли вложения → пин не резолвился в зону, паспорт-фото не засчитывалось в трекер)."""
+    мы теряли вложения → пин не резолвился в зону, паспорт-фото не засчитывалось в трекер).
+
+    ФОТО БОЛЬШЕ НЕ ВЫТЕСНЯЕТСЯ ПОДПИСЬЮ (12.09.2026, задание 60-a). До правки первая же ветка
+    возвращала текст и снимок исчезал БЕССЛЕДНО: сообщение «вот моя сетка» + фотография доходило
+    до головы одной подписью, и голова честно отвечала, что вложения нет. Теперь подпись и снимок
+    едут ВМЕСТЕ. `photo_note` — уже прочитанное содержимое снимка (`trainer_photo.transcript_body`):
+    подан — едет он, не подан — прежний бессодержательный маркер «[фото]»."""
     t = (text or "").strip()
+    mark = (photo_note or "").strip() or ("[фото]" if has_photo else "")
     if t:
-        return text
-    if has_photo:
-        return "[фото]"
+        return (text + "\n" + mark) if mark else text
+    if mark:
+        return mark
     if geo_marker:
         return geo_marker
     return "[медиа/без текста]"
