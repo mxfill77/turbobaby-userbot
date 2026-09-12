@@ -50,13 +50,52 @@ TRAINER_CHAT = -5193185299
 SHOTS_DIR = os.path.join(REPO, "exam_shots")            # сохранённые черновики (в git)
 VERDICTS = os.path.join(REPO, "exam_verdicts.tsv")      # журнал тапов (рантайм, вне git)
 CASES = os.path.join(REPO, "trainer_cases.json")
+SESSION = os.path.join(REPO, "exam_session.json")       # рабочий стол ОДНОГО кейса (вне git)
 
-HEADER = "номер\tсостояние\tвремя\tавтор\tкейс\tиз\tвердикт\tкоммит\tкорпус\tправила\tчерновик"
+# ПУТЬ БАЗЫ УРОКОВ ОТДЕЛЬНЫМ ИМЕНЕМ — ради набора, а не ради гибкости. `None` значит «боевая
+# таблица, та же, куда пишет кнопка «🎓 Обучить»»: второй базы уроков у полосы нет и не заводится.
+# Набор подменяет это поле на временный файл и тем доказывает, что боевых строк не пишет ни одна
+# ветка; инъекция параметром в каждый вызов дала бы ту же возможность, но забыть её можно было бы
+# в одном месте из пяти, а забытое умолчание здесь пишет в живую базу.
+LESSON_PATH = None
+
+# Колонка «уроки» добавлена ПОСЛЕДНЕЙ (12.09.2026): у вердикта «неверно» теперь есть номера
+# уроков, которые этот вердикт породил. В конец — чтобы строки, написанные до сегодня, читались
+# прежним разбором без единой правки (`load_verdicts` добивает недостающие поля пустотой).
+HEADER = ("номер\tсостояние\tвремя\tавтор\tкейс\tиз\tвердикт\tкоммит\tкорпус\tправила\t"
+          "черновик\tуроки")
 STATE_CANDIDATE = "кандидат"
 
 # Вердикт — ЗАКРЫТАЯ таблица из двух слов. Из Telegram в журнал не уезжает ничего, кроме ключа,
 # который владелец мог бы написать и сам (тот же приём, что у `pc_agent.GATE_WORDS`).
 VERDICTS_WORDS = {"ok": "верно", "no": "неверно"}
+
+# ── ОДНО СЛОВО, КОТОРЫМ ВЛАДЕЛЕЦ ОТМЕНЯЕТ «УРОК ДЕЙСТВУЕТ СРАЗУ» (пункт 5 задания) ──────────
+# Режим `training` (умолчание): тап по подсказке кладёт урок СРАЗУ ДЕЙСТВУЮЩИМ — автор владелец,
+# причина — наблюдение критика, подтверждённое его пальцем. Режим `candidate`: тот же тап кладёт
+# КАНДИДАТА, и урок начинает действовать отдельным движением (`lesson_promote.py --promote N`).
+#
+# ПЕРЕКЛЮЧЕНИЕ СТОИТ ОДНОЙ СТРОКИ и ровно поэтому оно здесь, а не размазано по веткам: поменять
+# литерал умолчания ниже — и обе двери (тап по подсказке и «✍️ своё») меняют исход разом. Env-имя
+# названо рядом, чтобы отменить правило можно было и не правя код вовсе.
+LESSON_MODE_TRAINING = "training"
+LESSON_MODE_CANDIDATE = "candidate"
+EXAM_LESSON_MODE = (os.getenv("EXAM_LESSON_MODE", LESSON_MODE_TRAINING).strip().lower()
+                    or LESSON_MODE_TRAINING)
+
+# ── ПОДСКАЗКИ КРИТИКА ──────────────────────────────────────────────────────────────────────
+# Их рождает ЗАМОРОЗКА и они лежат В СНИМКЕ рядом с ответом. Не показ и не тап: подсказка,
+# собранная в момент показа, менялась бы от круга к кругу — ровно тот класс, ради которого
+# заморожен сам ответ (см. шапку модуля). Снимок без подсказок (все, собранные до 12.09.2026)
+# показывается со словами «подсказок нет» и работает В ТОЧНОСТИ как прежде: старые кнопки,
+# старый журнал, ни одного отказа.
+HINTS_MAX = 4
+NO_HINTS = "подсказок критика в этом снимке нет — он собран до того, как критика позвали"
+# Два поля одной подсказки. Имена ключей — латиницей, как у остальных полей снимка.
+HINT_OBS, HINT_RULE = "observation", "rule"
+# Причина урока, рождённого тапом. Слова обязаны быть ОДНИ И ТЕ ЖЕ в базе уроков и в карточке:
+# по ним владелец потом отличит урок, за который отвечает критик, от урока, написанного руками.
+HINT_WHY_MARK = "критик, подтверждено тапом"
 
 
 # ---------------------------------------------------------------------------------------
@@ -200,6 +239,41 @@ def question_of(case):
     return str(lines[0]) if lines else ""
 
 
+def hints_of(shot):
+    """Подсказки снимка → список dict(наблюдение, правило). Их нет — пустой список.
+
+    Чистит на ЧТЕНИИ, а не на записи: снимок лежит на диске месяцами, а разбор меняется, и
+    подсказка с пустым правилом (правило — то, что ложится уроком) не должна доехать до кнопки
+    ни из старого файла, ни из будущего формата."""
+    out = []
+    for item in (shot or {}).get("hints") or []:
+        if not isinstance(item, dict):
+            continue
+        rule = " ".join(str(item.get(HINT_RULE) or "").split()).strip()
+        obs = " ".join(str(item.get(HINT_OBS) or "").split()).strip()
+        if rule:
+            out.append({HINT_OBS: obs, HINT_RULE: rule})
+    return out[:HINTS_MAX]
+
+
+def _default_critic(question, answer, transcript=""):
+    """ЖИВОЙ КРИТИК — ТОТ ЖЕ, что у кнопки «🎓 Обучить» модербота, и другого здесь нет.
+
+    Ровно три чужих вызова, все из `trainer`: запрос (`hypotheses_prompt`, с доводом `paired=True`
+    — просим два поля вместо одного), разбор (`parse_hypotheses` — он же отсеивает повторы книги
+    правил) и расклейка пары (`split_pair`). Собственной логики критики здесь НЕТ ни строки: она
+    разъехалась бы с кнопкой молча, и владелец получал бы на одну ошибку бота два суждения.
+
+    ТРАНСКРИПТ ПЕРЕДАЁТСЯ ДОВОДОМ. Умолчание `hypotheses_prompt` («собери сам») ходит за живой
+    сессией тренажёра в боевую `moderation_ipc`, которой у экзамена нет и быть не должно: кейс
+    судится по своему транскрипту, а не по тому, что кто-то печатал в тренажёре час назад."""
+    import suggest
+    import trainer
+    system, user = trainer.hypotheses_prompt(question, answer, transcript=transcript, paired=True)
+    raw = suggest.default_llm_caller()(system, user)
+    return [trainer.split_pair(h) for h in trainer.parse_hypotheses(raw, limit=HINTS_MAX)]
+
+
 def reason_line(shot, limit=220):
     """ПРИЧИНА ответа одной строкой (пункт 5 задания) — из записки, которую получила голова.
 
@@ -211,7 +285,7 @@ def reason_line(shot, limit=220):
     return note[:limit] + ("…" if len(note) > limit else "")
 
 
-def freeze(case_id, cases_path=None, runner=None, now=None, ph=None):
+def freeze(case_id, cases_path=None, runner=None, now=None, ph=None, critic=None):
     """Собрать черновик кейса ОДИН раз и положить на диск. → (ok, путь|причина, shot|None).
 
     ЕДИНСТВЕННАЯ ветка модуля, зовущая голову. Уже лежащий черновик НЕ перезаписывается НИ ОДНОЙ
@@ -250,11 +324,26 @@ def freeze(case_id, cases_path=None, runner=None, now=None, ph=None):
         return False, "голова не дала черновика (%s) — показывать нечего" % (
             rec.get("unknown") or "причина не названа"), None
     raw = question_of(case)
+    question = trainer_run.substitute(raw, ph)
+    # ПОДСКАЗКИ РОЖДАЮТСЯ ЗДЕСЬ И БОЛЬШЕ НИГДЕ. Критику дан ТОТ ЖЕ транскрипт, который видела
+    # голова (`build_transcript` — чистая функция, головы не зовёт), и ЗАМОРОЖЕННЫЙ черновик.
+    #
+    # ОТКАЗ КРИТИКА НЕ ОТМЕНЯЕТ СНИМКА, и это выбор, а не халатность: круг головы за черновик уже
+    # заплачен, а снимок без подсказок — законный снимок (`NO_HINTS`), который показывается и
+    # судится как все, собранные до 12.09. Уронить его из-за молчания критика значило бы выбросить
+    # оплаченный ответ и заставить платить второй раз.
+    hints = []
+    try:
+        got = (critic or _default_critic)(question, draft,
+                                          trainer_run.build_transcript(case, ph))
+        hints = hints_of({"hints": got})
+    except Exception as e:                                                  # noqa: BLE001
+        print("критик подсказок не дал (%s) — снимок кладём без них" % type(e).__name__)
     shot = {
         "case": case.get("id"), "total": total, "name": case.get("name") or "",
-        "lang": case.get("lang") or "", "question": trainer_run.substitute(raw, ph),
+        "lang": case.get("lang") or "", "question": question,
         "question_raw": raw,
-        "draft": draft, "note": rec.get("note") or "",
+        "draft": draft, "note": rec.get("note") or "", "hints": hints,
         "corpus": corpus_fingerprint(cases_path), "commit": commit,
         "rules": rules_version(), "built_at": stamp(now),
     }
@@ -269,38 +358,99 @@ def freeze(case_id, cases_path=None, runner=None, now=None, ph=None):
 # карточка и кнопки
 # ---------------------------------------------------------------------------------------
 
-def card_text(shot, slots_total=None):
-    """Ровно пять частей пункта 5: номер из скольки · вопрос · ответ · причина · зачем тап.
+def hints_block(shot):
+    """Подсказки критика НУМЕРОВАННЫМ списком в САМОМ тексте карточки. → строка.
+
+    Полные формулировки живут здесь, а не на кнопках, по той же причине, по какой они живут в
+    тексте у кнопки «🎓 Обучить» (`trainer.hyps_messages`): подпись инлайн-кнопки Telegram режет по
+    ширине экрана, и правило, ради которого владелец жмёт номер, он бы на кнопке не дочитал.
+
+    Наблюдение и правило — РАЗНЫМИ строками и с разными значками: это два разных утверждения
+    («вот что не так здесь» и «вот как надо всегда»), и слитые в одну фразу они читаются как одно."""
+    hints = hints_of(shot)
+    if not hints:
+        return "🔎 %s." % NO_HINTS
+    out = ["🔎 ЧТО УЛУЧШИТЬ — подсказки критика (того же, что стои́т за кнопкой «🎓 Обучить»):"]
+    for i, h in enumerate(hints, 1):
+        obs = h[HINT_OBS] or "наблюдение критик не назвал"
+        out.append("%d. %s\n    → правило: %s" % (i, obs, h[HINT_RULE]))
+    return "\n".join(out)
+
+
+def card_text(shot, slots_total=None, passed=None):
+    """Рабочее место владельца на один кейс: счёт · вопрос · ответ · причина · подсказки · что
+    делают кнопки.
 
     `slots_total` — сколько слотов этого кейса лежит на диске. Больше одного → карточка говорит
     прямо, что показан САМЫЙ НОВЫЙ, а прежний жив: иначе владелец, увидев второй раз тот же кейс,
-    не отличит «показали заново то же» от «показали ответ нового кода»."""
+    не отличит «показали заново то же» от «показали ответ нового кода».
+
+    `passed` — сколько кейсов УЖЕ зачтено верными. `None` значит «счёт не считали», и тогда его в
+    шапке нет вовсе: ноль и «не считали» — разные новости, и подставить первое вместо второго
+    значило бы соврать владельцу числом."""
     older = ""
     if slots_total and int(slots_total) > 1:
         older = ("\nЭто НОВЕЙШИЙ снимок кейса (всего слотов %d); прежние сохранены и не тронуты — "
                  "их коммиты другие." % int(slots_total))
+    score = "" if passed is None else " · пройдено %d" % int(passed)
     head = (
-        "🎓 ЭКЗАМЕН · кейс %s из %s — %s\n"
+        "🎓 ЭКЗАМЕН · кейс %s из %s%s — %s\n"
         "Показан ЗАФИКСИРОВАННЫЙ ответ от %s (коммит %s, корпус %s). Голова сейчас НЕ звалась." % (
-            shot.get("case"), shot.get("total"), shot.get("name") or "без имени",
+            shot.get("case"), shot.get("total"), score, shot.get("name") or "без имени",
             shot.get("built_at") or "?", shot.get("commit") or "?", shot.get("corpus") or "?"))
     body = (
         "\n\n❓ КЛИЕНТ:\n%s\n\n"
         "🤖 БОТ:\n%s\n\n"
-        "📌 ПОЧЕМУ так: %s\n\n"
-        "Ниже — твой вердикт. Он ляжет КАНДИДАТОМ (счёта «пройдено N из 17» не будет, ворота не "
-        "двинутся), причина не обязательна, откат по номеру." % (
+        "📌 ПОЧЕМУ так: %s\n\n%s\n\n%s" % (
             shot.get("question") or "(вопрос не записан)",
-            shot.get("draft") or "(ответа нет)", reason_line(shot)))
+            shot.get("draft") or "(ответа нет)", reason_line(shot),
+            hints_block(shot), buttons_legend(shot)))
     return head + older + body
 
 
-def markup(case_id):
-    """Две кнопки. callback_data ловит `pc_agent` тем же токеном, которым карточка отправлена."""
-    return {"inline_keyboard": [[
-        {"text": "✅ Верно", "callback_data": "exam:ok:%s" % case_id},
-        {"text": "❌ Неверно", "callback_data": "exam:no:%s" % case_id},
-    ]]}
+def buttons_legend(shot):
+    """Что делает каждая кнопка — СЛОВАМИ и в самой карточке. → строка.
+
+    Не украшение: у номеров-тумблеров нет ни одного визуального состояния в Telegram, которое
+    владелец увидел бы до нажатия, а у «✔ Применить» последствие необратимо в одну сторону (урок
+    начинает действовать на всех клиентов). Цена непонятой кнопки здесь — правило, которого
+    владелец не хотел."""
+    if not hints_of(shot):
+        return ("Ниже — твой вердикт: «верно» или «неверно». Он ложится в журнал экзамена, "
+                "откат по номеру.")
+    mode = ("урок начинает действовать СРАЗУ" if EXAM_LESSON_MODE == LESSON_MODE_TRAINING
+            else "урок ложится КАНДИДАТОМ и включается отдельным движением")
+    return ("Кнопки: «✅ Верно» — кейс зачтён и сразу придёт следующий. Номера 1…%d — ТУМБЛЕРЫ "
+            "(тап отмечает, повторный снимает), отметь нужные и жми «✔ Применить»: отмеченные "
+            "подсказки станут уроками (%s), кейс пойдёт «неверно», следующий придёт сам. "
+            "«✍️ своё» — напишешь правило своими словами ОТВЕТОМ на эту карточку, 10 минут."
+            % (len(hints_of(shot)), mode))
+
+
+def markup(case_id, shot=None):
+    """Кнопки карточки. callback_data ловит `pc_agent` тем же токеном, которым она отправлена.
+
+    ДВА НАБОРА, и это не ветвление ради ветвления. Снимок БЕЗ подсказок (все, собранные до
+    12.09.2026) получает РОВНО ПРЕЖНИЕ две кнопки: тапнуть по нему можно сегодня и завтра, а
+    «✔ Применить» на нём отказывал бы всегда — кнопка, которая не может сработать ни разу, хуже
+    её отсутствия. Снимок С подсказками получает набор пункта 4 задания.
+
+    `shot=None` — прежний вызов (две кнопки). Умолчание выбрано в пользу старого поведения
+    сознательно: забытый довод даёт карточку, которая работает, а не карточку без вердикта."""
+    hints = hints_of(shot or {})
+    if not hints:
+        return {"inline_keyboard": [[
+            {"text": "✅ Верно", "callback_data": "exam:ok:%s" % case_id},
+            {"text": "❌ Неверно", "callback_data": "exam:no:%s" % case_id},
+        ]]}
+    numbers = [{"text": str(i), "callback_data": "exam:h%d:%s" % (i, case_id)}
+               for i in range(1, len(hints) + 1)]
+    return {"inline_keyboard": [
+        [{"text": "✅ Верно", "callback_data": "exam:ok:%s" % case_id}],
+        numbers,
+        [{"text": "✍️ своё", "callback_data": "exam:own:%s" % case_id},
+         {"text": "✔ Применить", "callback_data": "exam:go:%s" % case_id}],
+    ]}
 
 
 # ---------------------------------------------------------------------------------------
@@ -432,7 +582,12 @@ def show(case_id, chat=None, sender=None, agent_fn=None, cases_path=None):
     if sender is None:
         import dispatch_notify
         sender = dispatch_notify.send_chat_strict
-    channel, ok, detail = sender(card_text(shot, len(shot_slots(case_id))), dest, markup(case_id))
+    # СТОЛ ПЕРЕВОДИТСЯ НА ПОКАЗАННЫЙ КЕЙС ДО ОТПРАВКИ. Иначе первый же тумблер нового кейса лёг бы
+    # на стол предыдущего и получил отказ «отметки собраны на другом снимке» — то есть карточка
+    # приходила бы уже сломанной. Отметки при этом обнуляются: они принадлежали прежнему снимку.
+    save_session({"case": str(case_id), "shot_key": shot_key(shot), "selected": []})
+    text = card_text(shot, len(shot_slots(case_id)), passed=passed_count(load_verdicts()))
+    channel, ok, detail = sender(text, dest, markup(case_id, shot))
     if not ok:
         return False, "⛔ показ НЕ прошёл (%s): %s" % (channel, detail)
     return True, "✅ кейс %s из %s показан в %s, message_id=%s. Ждём тапа." % (
@@ -494,30 +649,124 @@ def _next_number(rows):
     return (max((r["номер"] for r in rows), default=0)) + 1
 
 
-def tap(case_id, verdict, who, path=None, right_fn=None, now=None, cases_path=None):
-    """ТАП = ВЕРДИКТ, и он записывается КАНДИДАТОМ. → (ok, строка словами).
+def verdicts_of_case(case_id, rows):
+    """ЖИВЫЕ (не откаченные) вердикты этого кейса. Откаченный в счёт не идёт и повтора не держит:
+    откат на то и откат, чтобы владелец мог пересудить кейс."""
+    return [r for r in rows
+            if str(r["кейс"]) == str(case_id) and r["состояние"] == STATE_CANDIDATE]
 
-    Порядок отказов выбран, а не случился: право → слово вердикта → сохранённый черновик.
-    Право первым потому, что оно единственное несимметричное: лишний отказ стоит одной ненажатой
-    кнопки, лишнее «да» кладёт в журнал чужое показание под именем владельца."""
-    may = right_fn
-    if may is None:
-        import moderation_core
-        may = moderation_core.may_write_rule
-    if not may(who):
-        return False, ("⛔ «%s» не вправе судить экзамен: имя не в списке правящих книгу правил. "
-                       "Ничего не записано. Право одно на все двери (запись урока, перевод "
-                       "кандидата, снятие набора) и на пустом списке НИКОМУ — это не сбой, а "
-                       "замок." % (who or "(имя не названо)"))
-    word = VERDICTS_WORDS.get(str(verdict or "").strip().lower())
-    if not word:
-        return False, "⛔ не понял вердикт «%s»: знаю только ok и no. Ничего не записано." % verdict
+
+def passed_count(rows):
+    """Сколько кейсов зачтено ВЕРНЫМИ. Считает КЕЙСЫ, а не строки: два «верно» по одному кейсу
+    (их не должно быть, но журнал живёт дольше нашей уверенности) дают единицу, а не двойку."""
+    return len({str(r["кейс"]) for r in rows
+                if r["состояние"] == STATE_CANDIDATE and r["вердикт"] == VERDICTS_WORDS["ok"]})
+
+
+# ---------------------------------------------------------------------------------------
+# РАБОЧИЙ СТОЛ ОДНОГО КЕЙСА: отметки тумблеров и ожидание «✍️ своё»
+# ---------------------------------------------------------------------------------------
+# ЖИВЁТ СВОИМ ФАЙЛОМ, А НЕ В `moderation_ipc.meta`, где живут отметки тренажёра. Три причины,
+# и первая же закрывает вопрос: боевую базу пишет живой модербот каждые 5 секунд, а заданию велено
+# её не касаться. Вторая: отметки тренажёра принадлежат ДИАЛОГУ в группе, а наши — КОНКРЕТНОМУ
+# СНИМКУ кейса, и смешать их значило бы дать «✔ Применить» подобрать чужие гипотезы. Третья:
+# состояние обязано переживать перезапуск агента — между показом карточки и тапом по ней проходят
+# часы.
+#
+# ОТМЕТКА ПРИВЯЗАНА К СНИМКУ, а не к номеру кейса: `shot_key` — коммит плюс момент сборки. Снимок
+# сменился (собрали кейс на новом коде) — прежние отметки к нему не относятся ни одной, и тап по
+# ним ОТКАЗЫВАЕТ словами. Это и есть «тап по устаревшей подсказке»: номер 3 старого снимка и
+# номер 3 нового — разные правила, и записать второе вместо первого было бы подлогом.
+
+PENDING_TTL_SEC = 600                                    # 10 минут, как у «✍ другое» тренажёра
+
+
+def shot_key(shot):
+    """Отпечаток КОНКРЕТНОГО снимка: коммит сборки плюс её момент. Пусто → ''."""
+    if not isinstance(shot, dict):
+        return ""
+    return "%s@%s" % (shot.get("commit") or "?", shot.get("built_at") or "?")
+
+
+def load_session(path=None):
+    """Рабочий стол → словарь. Файла нет или он побит — пустой стол (это не ошибка)."""
+    try:
+        with open(path or SESSION, encoding="utf-8") as f:
+            got = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def save_session(data, path=None):
+    target = path or SESSION
+    with open(target, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(data or {}, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    return target
+
+
+def _desk(case_id, shot, path=None):
+    """Стол ЭТОГО кейса на ЭТОМ снимке → (стол, свежий ли).
+
+    Стол чужого кейса или чужого снимка не чинится и не переносится: он возвращается как
+    несвежий, и решение (отказать или начать заново) принимает вызывающий — у тапа по номеру и у
+    показа нового кейса оно разное."""
+    got = load_session(path)
+    fresh = (str(got.get("case") or "") == str(case_id)
+             and str(got.get("shot_key") or "") == shot_key(shot))
+    return got, fresh
+
+
+def _may(right_fn):
+    """Право на дверь экзамена — ОДНО на все двери и fail-closed. → функция-предикат."""
+    if right_fn is not None:
+        return right_fn
+    import moderation_core
+    return moderation_core.may_write_rule
+
+
+DENY_RIGHT = ("⛔ «%s» не вправе судить экзамен: имя не в списке правящих книгу правил. "
+              "Ничего не записано. Право одно на все двери (запись урока, перевод "
+              "кандидата, снятие набора) и на пустом списке НИКОМУ — это не сбой, а замок.")
+
+
+def _judgeable(case_id, cases_path=None):
+    """Снимок кейса, ГОДНЫЙ К СУЖДЕНИЮ → (shot, None) либо (None, отказ словами).
+
+    Два замка, и второй заведён 12.09.2026. Первый: снимка нет — вердикт без текста, к которому
+    он относится, непроверяем. Второй: отпечаток корпуса снимка разошёлся с живым — кейс под
+    снимком поменялся, и вердикт лёг бы на вопрос, которого владельцу не показывали. До сегодня
+    этот замок стоял только у ПОКАЗА (`show`), а у записи тапа его не было вовсе: показ отказывал,
+    а рука с консоли и старая висящая карточка проходили мимо него."""
     shot = load_shot(case_id)
     if shot is None:
-        return False, ("⛔ тап по кейсу %s не записан: сохранённого черновика нет, а вердикт без "
-                       "текста, к которому он относится, непроверяем." % case_id)
+        return None, ("⛔ тап по кейсу %s не записан: сохранённого черновика нет, а вердикт без "
+                      "текста, к которому он относится, непроверяем." % case_id)
+    live = corpus_fingerprint(cases_path)
+    if (shot.get("corpus") or "") != live:
+        return None, ("⛔ вердикт по кейсу %s НЕ записан: снимок собран на корпусе %s, а на диске "
+                      "сейчас %s — кейс под снимком поменялся. Пересоберите кейс и покажите заново."
+                      % (case_id, shot.get("corpus") or "?", live))
+    return shot, None
+
+
+def _write_verdict(case_id, shot, word, who, lessons=(), path=None, now=None):
+    """Строка вердикта в журнал → (номер, строка словами). Замок повтора стои́т ДО неё.
+
+    ОДИН КЕЙС — ОДИН ЖИВОЙ ВЕРДИКТ (слово владельца 12.09: «Верно дважды по одному кейсу — одна
+    запись»). Второй тап по уже судимому кейсу не пишет НИЧЕГО и называет номер первого: две
+    строки об одном кейсе сделали бы счёт «пройдено K» неопределённым, а пересудить кейс и так
+    есть чем — откатом по номеру, после которого кейс снова свободен."""
     target = path or VERDICTS
     rows = load_verdicts(target)
+    live = verdicts_of_case(case_id, rows)
+    if live:
+        first = live[0]
+        return None, ("↩️ кейс %s уже судим: вердикт №%s «%s» от %s. Второй записи не делаем — "
+                      "одна запись на кейс. Пересудить: «exam_show.py --rollback %s», после этого "
+                      "кейс снова свободен." % (case_id, first["номер"], first["вердикт"],
+                                                first["время"], first["номер"]))
     number = _next_number(rows)
     row = "\t".join([
         str(number), STATE_CANDIDATE, stamp(now), _esc(who or ""),
@@ -526,19 +775,304 @@ def tap(case_id, verdict, who, path=None, right_fn=None, now=None, cases_path=No
         _esc(_evidence(shot.get("corpus"), "корпус")),
         _esc(_evidence(shot.get("rules"), "версия правил")),
         _esc(shot_ref(case_id)),
+        _esc(", ".join(str(n) for n in lessons)),
     ])
     need_header = not os.path.exists(target) or os.path.getsize(target) == 0
     with open(target, "a", encoding="utf-8", newline="\n") as f:
         if need_header:
             f.write(HEADER + "\n")
         f.write(row + "\n")
-    return True, ("📝 Записано КАНДИДАТОМ №%d: кейс %s из %s — «%s», автор %s, время %s.\n"
-                  "Коммит %s · корпус %s · правила %s.\n"
-                  "Действующим не стало, счёт не двинулся, ворота не тронуты. "
-                  "Откат: «exam_show.py --rollback %d»." % (
-                      number, shot.get("case"), shot.get("total"), word, who or "?", stamp(now),
-                      shot.get("commit") or "?", shot.get("corpus") or "?",
-                      shot.get("rules") or "?", number))
+    return number, ("📝 Записано КАНДИДАТОМ №%d: кейс %s из %s — «%s», автор %s, время %s.\n"
+                    "Коммит %s · корпус %s · правила %s.%s\n"
+                    "Откат: «exam_show.py --rollback %d»." % (
+                        number, shot.get("case"), shot.get("total"), word, who or "?", stamp(now),
+                        shot.get("commit") or "?", shot.get("corpus") or "?",
+                        shot.get("rules") or "?",
+                        ("\nУроки этого вердикта: " + ", ".join("#%s" % n for n in lessons))
+                        if lessons else "", number))
+
+
+def tap(case_id, verdict, who, path=None, right_fn=None, now=None, cases_path=None,
+        sender=None, agent_fn=None):
+    """ТАП = ВЕРДИКТ, и он записывается КАНДИДАТОМ. → (ok, строка словами).
+
+    Порядок отказов выбран, а не случился: право → слово вердикта → сохранённый черновик →
+    отпечаток корпуса → не судим ли кейс уже. Право первым потому, что оно единственное
+    несимметричное: лишний отказ стоит одной ненажатой кнопки, лишнее «да» кладёт в журнал чужое
+    показание под именем владельца.
+
+    ПОСЛЕ ВЕРДИКТА СЛЕДУЮЩИЙ КЕЙС ПРИХОДИТ САМ (слово владельца 12.09). Отправка идёт ПОСЛЕ
+    записи и её исход на вердикт не влияет ни одной веткой: вердикт уже лежит на диске, и
+    молчание Telegram не смеет его отменить."""
+    if not _may(right_fn)(who):
+        return False, DENY_RIGHT % (who or "(имя не названо)")
+    word = VERDICTS_WORDS.get(str(verdict or "").strip().lower())
+    if not word:
+        return False, "⛔ не понял вердикт «%s»: знаю только ok и no. Ничего не записано." % verdict
+    shot, why = _judgeable(case_id, cases_path)
+    if shot is None:
+        return False, why
+    number, said = _write_verdict(case_id, shot, word, who, path=path, now=now)
+    if number is None:
+        return False, said
+    return True, said + "\n" + advance(case_id, path=path, sender=sender, agent_fn=agent_fn,
+                                       cases_path=cases_path)
+
+
+# ---------------------------------------------------------------------------------------
+# СЛЕДУЮЩИЙ КЕЙС ПРИХОДИТ САМ
+# ---------------------------------------------------------------------------------------
+
+def next_case_id(case_id, cases_path=None):
+    """Кейс, идущий В КОРПУСЕ за названным → id | None (названный был последним).
+
+    Порядок берётся из КОРПУСА, а не из арифметики `+1`: номера кейсов сегодня идут подряд, но
+    это свойство файла, а не закон, и выпавший номер превратил бы «следующий» в «никакой»."""
+    cases = load_cases(cases_path)
+    ids = [str(c.get("id")) for c in cases]
+    try:
+        i = ids.index(str(case_id))
+    except ValueError:
+        return None
+    return ids[i + 1] if i + 1 < len(ids) else None
+
+
+def advance(case_id, path=None, sender=None, agent_fn=None, cases_path=None):
+    """Показать СЛЕДУЮЩИЙ кейс либо подвести итог экзамена. → строка словами (не бросает).
+
+    ИТОГ, А НЕ ВОСЕМНАДЦАТЫЙ КЕЙС: за последним кейсом корпуса следующего нет, и просить его
+    неоткуда. Ветка `+1` дала бы «черновика кейса 18 нет» — отказ вместо праздника.
+
+    НЕ БРОСАЕТ НИ ПРИ ЧЁМ и это главное её свойство: вердикт владельца уже записан на диск, и
+    сорвавшийся показ следующего кейса не смеет превратить успешную запись в исключение."""
+    try:
+        nxt = next_case_id(case_id, cases_path)
+        rows = load_verdicts(path or VERDICTS)
+        passed = passed_count(rows)
+        total = len(load_cases(cases_path))
+        if nxt is None:
+            return ("🏁 ЭКЗАМЕН ПРОЙДЕН: кейс %s был последним. Верных %d из %d. "
+                    "Следующего кейса нет — просить его неоткуда." % (case_id, passed, total))
+        ok, said = show(nxt, sender=sender, agent_fn=agent_fn, cases_path=cases_path)
+        return ("➡️ Следующий кейс %s: %s" % (nxt, said)) if ok else (
+            "➡️ Следующий кейс %s НЕ ушёл: %s" % (nxt, said))
+    except Exception as e:                                                  # noqa: BLE001
+        return ("➡️ Следующий кейс не ушёл (%s) — вердикт при этом ЗАПИСАН. "
+                "Показать руками: «exam_show.py --case <N> --show»." % type(e).__name__)
+
+
+# ---------------------------------------------------------------------------------------
+# ТУМБЛЕРЫ ПОДСКАЗОК, «✔ ПРИМЕНИТЬ» И «✍️ СВОЁ»
+# ---------------------------------------------------------------------------------------
+
+def _hint_or_why(case_id, number, shot, session_path=None):
+    """Подсказка под названным номером → (индекс, подсказка, None) либо (None, None, отказ).
+
+    ТРИ РАЗНЫХ ОТКАЗА, и разными словами: подсказок в снимке нет вовсе; номер вне списка; стол
+    собран на ДРУГОМ снимке. Третий — это и есть «тап по устаревшей подсказке»: карточка висит в
+    группе неделями, а кейс за это время могли пересобрать на новом коде, и номер 3 старой
+    карточки означал бы тогда чужое правило."""
+    hints = hints_of(shot)
+    if not hints:
+        return None, None, ("⛔ тапать нечего: %s. Ничего не записано." % NO_HINTS)
+    try:
+        i = int(number)
+    except (TypeError, ValueError):
+        return None, None, "⛔ не понял номер подсказки «%s». Ничего не записано." % number
+    if not (1 <= i <= len(hints)):
+        return None, None, ("⛔ подсказки №%d в этом снимке нет (их %d) — карточка, по которой ты "
+                            "тапнул, устарела. Ничего не записано." % (i, len(hints)))
+    desk, fresh = _desk(case_id, shot, session_path)
+    if desk and desk.get("case") is not None and not fresh:
+        return None, None, ("⛔ отметки на столе собраны на другом снимке (%s), а показан %s — "
+                            "номера значат разные правила. Ничего не записано: покажи кейс заново."
+                            % (desk.get("shot_key") or "?", shot_key(shot)))
+    return i, hints[i - 1], None
+
+
+def toggle(case_id, number, who, right_fn=None, session_path=None, cases_path=None):
+    """Тумблер номера подсказки: отмечен → снять, не отмечен → отметить. → (ok, строка словами).
+
+    Сам по себе НИЧЕГО не записывает ни в базу уроков, ни в журнал вердиктов: промах пальцем не
+    должен становиться действующим правилом (тот же урок, что у тумблеров тренажёра, где до
+    05.09 тап по номеру сразу писал правило)."""
+    if not _may(right_fn)(who):
+        return False, DENY_RIGHT % (who or "(имя не названо)")
+    shot, why = _judgeable(case_id, cases_path)
+    if shot is None:
+        return False, why
+    i, hint, why = _hint_or_why(case_id, number, shot, session_path)
+    if i is None:
+        return False, why
+    desk, fresh = _desk(case_id, shot, session_path)
+    marked = sorted({int(x) for x in (desk.get("selected") or [])}) if fresh else []
+    marked = sorted(set(marked) - {i}) if i in marked else sorted(set(marked) | {i})
+    desk = dict(desk, case=str(case_id), shot_key=shot_key(shot), selected=marked)
+    save_session(desk, session_path)
+    head = ("☑️ отметил %d" % i) if i in marked else ("▫️ снял отметку %d" % i)
+    if not marked:
+        return True, "%s. Отмечено: ничего. «✔ Применить» сейчас откажет — отмечать нечего." % head
+    return True, "%s: «%s».\nОтмечено: %s. Жми «✔ Применить» — станут уроками." % (
+        head, hint[HINT_RULE], ", ".join(str(x) for x in marked))
+
+
+def _lesson_write(shot, rule, why, who, add_fn=None):
+    """Одна строка в базу уроков → номер. База ТА ЖЕ, что у кнопки «🎓 Обучить» (`lesson_store`),
+    второй базы уроков не заводится ни одной веткой.
+
+    РЕЖИМ РЕШАЕТСЯ ЗДЕСЬ И ОДНИМ МЕСТОМ (`EXAM_LESSON_MODE`). Непустая причина → урок ложится
+    ДЕЙСТВУЮЩИМ: она и есть то, чего хранилище требует от действующего урока, и подставлять её
+    нечем — причина названа критиком и подтверждена пальцем владельца. Пустая причина → кандидат:
+    урок своими словами приходит без «почему», и выдумывать его запрещено."""
+    import lesson_store
+    if add_fn is not None:
+        return add_fn(shot, rule, why, who)
+    common = dict(question=str(shot.get("question") or ""),
+                  bot_answer=str(shot.get("draft") or ""), correct=rule,
+                  who=who, source=lesson_store.SOURCE_EXAM, path=LESSON_PATH)
+    if why and EXAM_LESSON_MODE == LESSON_MODE_TRAINING:
+        return lesson_store.add(why=why, **common)
+    return lesson_store.add_candidate(**common)
+
+
+def apply_marked(case_id, who, right_fn=None, path=None, now=None, session_path=None,
+                 cases_path=None, add_fn=None, sender=None, agent_fn=None):
+    """«✔ Применить»: отмеченные подсказки → уроки, вердикт «неверно», следующий кейс.
+
+    ПУСТОЙ ВЫБОР — ОТКАЗ СЛОВАМИ, а не «неверно без уроков»: владелец, нажавший «Применить» не
+    отметив ничего, промахнулся мимо номера, и молча записать ему вердикт значило бы засчитать
+    кейс за жест, которого он не делал.
+
+    ПОРЯДОК: сначала уроки, потом вердикт. Оборвись процесс между ними — в базе будут уроки без
+    вердикта (видно в `--trace` как несудимый кейс, лечится вторым тапом), обратный порядок дал бы
+    вердикт со ссылкой на уроки, которых нет."""
+    if not _may(right_fn)(who):
+        return False, DENY_RIGHT % (who or "(имя не названо)")
+    shot, why = _judgeable(case_id, cases_path)
+    if shot is None:
+        return False, why
+    desk, fresh = _desk(case_id, shot, session_path)
+    marked = sorted({int(x) for x in (desk.get("selected") or [])}) if fresh else []
+    if not marked:
+        return False, ("⚠️ Ничего не отмечено — тапни номера подсказок и нажми «✔ Применить». "
+                       "Ни урока, ни вердикта не записано.")
+    hints = hints_of(shot)
+    stale = [i for i in marked if not (1 <= i <= len(hints))]
+    if stale:
+        return False, ("⛔ отмечены номера, которых в снимке нет (%s из %d) — карточка устарела. "
+                       "Ничего не записано." % (", ".join(str(x) for x in stale), len(hints)))
+    numbers, failed = [], []
+    for i in marked:
+        h = hints[i - 1]
+        reason = ("%s: %s" % (HINT_WHY_MARK, h[HINT_OBS])) if h[HINT_OBS] else ""
+        try:
+            numbers.append(_lesson_write(shot, h[HINT_RULE], reason, who, add_fn))
+        except Exception as e:                                              # noqa: BLE001
+            failed.append("%d (%s)" % (i, getattr(e, "reason", None) or type(e).__name__))
+    if not numbers:
+        return False, ("⛔ ни один урок не записан (%s) — вердикт тоже не пишем: он ссылался бы на "
+                       "уроки, которых нет." % "; ".join(failed))
+    number, said = _write_verdict(case_id, shot, VERDICTS_WORDS["no"], who, lessons=numbers,
+                                  path=path, now=now)
+    if number is None:
+        return False, said + "\nУроки при этом записаны: %s." % ", ".join(
+            "#%s" % n for n in numbers)
+    save_session(dict(desk, selected=[]), session_path)
+    mode = ("действуют СРАЗУ" if EXAM_LESSON_MODE == LESSON_MODE_TRAINING
+            else "легли КАНДИДАТАМИ и пока не действуют")
+    tail = ("\n⚠️ Не записаны подсказки: %s." % "; ".join(failed)) if failed else ""
+    return True, ("🎓 Уроков записано %d (%s), автор %s, источник «экзамен», причина — наблюдение "
+                  "критика.%s\n%s\n%s" % (
+                      len(numbers), mode, who or "?", tail, said,
+                      advance(case_id, path=path, sender=sender, agent_fn=agent_fn,
+                              cases_path=cases_path)))
+
+
+def own_start(case_id, who, right_fn=None, session_path=None, cases_path=None, now=None):
+    """«✍️ своё»: включить ожидание свободного текста от владельца. → (ok, строка словами).
+
+    Ожидание живёт 10 минут — ровно как у «✍ другое» тренажёра, и по той же причине: забытое
+    ожидание не должно однажды съесть случайную реплику как правило.
+
+    КАРТОЧКА ПРОСИТ ОТВЕТИТЬ НА НЕЁ, а не просто написать. Наш бот в группе — не модербот: обычное
+    сообщение может до него и не дойти (настройка приватности бота в группах), а ОТВЕТ на его
+    собственное сообщение доходит всегда. Просьба ответить стоит владельцу одного движения и
+    снимает зависимость от настройки, которой отсюда не видно."""
+    if not _may(right_fn)(who):
+        return False, DENY_RIGHT % (who or "(имя не названо)")
+    shot, why = _judgeable(case_id, cases_path)
+    if shot is None:
+        return False, why
+    desk, fresh = _desk(case_id, shot, session_path)
+    if not fresh:
+        desk = {"case": str(case_id), "shot_key": shot_key(shot), "selected": []}
+    until = int(now if now is not None else time.time()) + PENDING_TTL_SEC
+    save_session(dict(desk, case=str(case_id), shot_key=shot_key(shot),
+                      own_until=until, own_who=(who or "").lstrip("@")), session_path)
+    return True, ("✍️ Слушаю: напиши правило СЛЕДУЮЩИМ сообщением — ОТВЕТОМ на эту карточку. "
+                  "Запишу его целиком, как сказано (префикс не нужен). Жду 10 минут. "
+                  "Причины у такого урока нет, поэтому он ляжет КАНДИДАТОМ.")
+
+
+def pending_own(session_path=None, now=None):
+    """Активное ожидание «своё» → (кейс, автор) либо (None, None). TTL истёк — ожидания нет.
+
+    Зовётся ЛОВЦОМ (`pc_agent`) на каждом сообщении владельца в группе-тренажёре, поэтому не
+    открывает ни снимков, ни журнала: один маленький json и сравнение чисел."""
+    desk = load_session(session_path)
+    until = desk.get("own_until")
+    try:
+        until = int(until)
+    except (TypeError, ValueError):
+        return None, None
+    if int(now if now is not None else time.time()) > until:
+        return None, None
+    return desk.get("case"), desk.get("own_who") or ""
+
+
+def own_take(text, who, right_fn=None, path=None, now=None, session_path=None, cases_path=None,
+             add_fn=None, sender=None, agent_fn=None):
+    """Свободный текст владельца → урок КАНДИДАТОМ, вердикт «неверно», следующий кейс.
+
+    КАНДИДАТОМ ВСЕГДА, и это не забытая ветка: у урока своими словами нет «почему» — его не
+    называл ни критик, ни владелец, — а действующий урок без причины хранилище не принимает и
+    принимать не должно. Подставить причину из самого текста урока нечем: она ответила бы на
+    вопрос «что написано», а не «почему так правильно»."""
+    case_id, owner = pending_own(session_path, now)
+    if case_id is None:
+        return False, ("⛔ ожидания «✍️ своё» нет или истекли 10 минут — текст правилом НЕ записан. "
+                       "Нажми «✍️ своё» под карточкой ещё раз.")
+    name = (who or "").lstrip("@")
+    if owner and name.lower() != owner.lower():
+        return False, ("⛔ ожидание «✍️ своё» принадлежит @%s, а пишет @%s — ничего не записано."
+                       % (owner, name or "?"))
+    if not _may(right_fn)(who):
+        return False, DENY_RIGHT % (who or "(имя не названо)")
+    rule = " ".join(str(text or "").split()).strip()
+    if not rule:
+        return False, "⚠️ Пустой урок — нечего запоминать. Ожидание снято, нажми «✍️ своё» заново."
+    shot, why = _judgeable(case_id, cases_path)
+    if shot is None:
+        return False, why
+    try:
+        n = _lesson_write(shot, rule, "", who, add_fn)
+    except Exception as e:                                                  # noqa: BLE001
+        return False, ("⛔ урок НЕ записан в базу уроков: %s. Вердикт тоже не пишем."
+                       % (getattr(e, "reason", None) or type(e).__name__))
+    number, said = _write_verdict(case_id, shot, VERDICTS_WORDS["no"], who, lessons=[n],
+                                  path=path, now=now)
+    desk = load_session(session_path)
+    desk.pop("own_until", None)
+    desk.pop("own_who", None)
+    save_session(desk, session_path)
+    how = ("✅ Записан КАНДИДАТ урока #%s (автор %s, источник «экзамен»): %s\n"
+           "📌 Причина не названа — бот по нему пока НЕ отвечает. Включить одной строкой:\n"
+           "venv/Scripts/python.exe lesson_promote.py --who %s --promote %s --why \"<почему так "
+           "правильно>\"" % (n, who or "?", rule, name or "<имя>", n))
+    if number is None:
+        return False, how + "\n" + said
+    return True, how + "\n" + said + "\n" + advance(case_id, path=path, sender=sender,
+                                                    agent_fn=agent_fn, cases_path=cases_path)
 
 
 def rollback(number, who="", path=None, now=None):
@@ -601,6 +1135,13 @@ def build_parser():
     p.add_argument("--slots", action="store_true",
                    help="перечислить слоты кейса (новейший первым) — ничего не меняет")
     p.add_argument("--tap", choices=sorted(VERDICTS_WORDS), help="записать вердикт кандидатом")
+    p.add_argument("--toggle", help="тумблер номера подсказки (1…4): отметить/снять")
+    p.add_argument("--apply", action="store_true",
+                   help="«✔ Применить»: отмеченные подсказки → уроки, вердикт «неверно»")
+    p.add_argument("--own", action="store_true",
+                   help="«✍️ своё»: ждать урок своими словами 10 минут")
+    p.add_argument("--own-text", action="store_true",
+                   help="забрать урок своими словами; САМ ТЕКСТ читается со stdin, не из argv")
     p.add_argument("--who", default="", help="автор вердикта (имя владельца)")
     p.add_argument("--rollback", help="откат вердикта по номеру")
     p.add_argument("--trace", action="store_true", help="перепись журнала вердиктов")
@@ -611,7 +1152,20 @@ def build_parser():
 
 
 def main(argv=None):
+    # ЛАНЕВОЙ ШОВ ВЫВОДА. Модуль импортировал `io_utf8` с первого дня, но НЕ ЗВАЛ его ни разу —
+    # то есть шов был объявлен и не включён. Цена именно у этой двери выше обычной: её вывод
+    # читает `pc_agent` субпроцессом, и любой из эмодзи ответа (⛔ ✅ 📝 🎓) на cp1251-консоли
+    # уронил бы печать ПОСЛЕ того, как вердикт уже лёг на диск, — владелец увидел бы трассу
+    # вместо расписки о записанном вердикте.
+    io_utf8.force_utf8()
     a = build_parser().parse_args(argv)
+    if a.own_text:
+        # ТЕКСТ ЕДЕТ ЧЕРЕЗ stdin, А НЕ ЧЕРЕЗ argv, и это не вкусовщина: правило владельца — живая
+        # кириллица произвольной длины, а argv на Windows ходит через кодировку консоли и коверкает
+        # её молча (класс известен полосе по журнальному писателю). stdin с явным utf-8 не коверкает.
+        ok, msg = own_take(sys.stdin.read(), a.who)
+        print(msg)
+        return 0 if ok else 1
     if a.trace:
         print(trace())
         return 0
@@ -636,11 +1190,19 @@ def main(argv=None):
         ok, msg = rollback(a.rollback, who=a.who)
         print(msg)
         return 0 if ok else 1
-    if a.tap:
+    for key, door in (("tap", None), ("toggle", toggle), ("apply", apply_marked),
+                      ("own", own_start)):
+        if not getattr(a, key):
+            continue
         if not a.case:
             print("⛔ кейс не назван (--case N) — ничего не записано.")
             return 2
-        ok, msg = tap(a.case, a.tap, a.who)
+        if key == "tap":
+            ok, msg = tap(a.case, a.tap, a.who)
+        elif key == "toggle":
+            ok, msg = toggle(a.case, a.toggle, a.who)
+        else:
+            ok, msg = door(a.case, a.who)
         print(msg)
         return 0 if ok else 1
     if not a.case:
