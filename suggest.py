@@ -40,6 +40,7 @@ import price_gate  # сторож свежести записанного пра
 import delivery  # резолвер зоны/цены доставки по maps-ссылке клиента (Bridge); пусто → [уточнить]
 import season_gate  # ТРЕТИЙ ИСХОД на границе сезонов: цену не считаем, зовём человека карточкой
 import noprice_gate  # ТРЕТИЙ ИСХОД «модель без цены»: числа у модели нет — зовём человека
+import style_examples  # ЖИВЫЕ примеры «вопрос → ответ менеджера» под текущий вопрос (задание 51-b)
 
 log = logging.getLogger("suggest")
 
@@ -518,6 +519,74 @@ STYLE_FEWSHOT = (
     "НЕ источник цен/наличия — цену бери только из блока ЦЕНА):\n"
     + _render_fewshot(STYLE_FEWSHOT_PAIRS)
 )
+
+
+# --- ПОДОБРАННЫЕ ЖИВЫЕ ПРИМЕРЫ (задание 51-b, 12.09.2026) ---------------------
+# ЗАЧЕМ. Список `STYLE_FEWSHOT_PAIRS` выше не знает вопроса, на который отвечает голова: на «дайте
+# прайс» и на «байк не заводится» он показывает одни и те же 18 пар, отобранных руками в июле.
+# Слово владельца 12.09: «у нас полтора года переписок с клиентами скачано. Это по ним надо
+# учиться». `style_examples` подбирает 3–5 ближайших обменов ПОД ТЕКУЩИЙ ВОПРОС из обезличенной
+# базы (`client_chats.anonstable.jsonl`) — словарно, детерминированно, без сети и ключей.
+#
+# РУЧНЫЕ ПАРЫ НЕ УДАЛЕНЫ И НЕ ОСЛАБЛЕНЫ: они остаются ЗАПАСНЫМ путём. Живых примеров выше порога
+# нет (короткий вопрос, чужая тема, база недоступна) — голова видит ровно тот блок, что видела до
+# этой правки, БАЙТ В БАЙТ. Так же и при выключенном подборе.
+
+def _render_live_fewshot(examples):
+    """Подобранные пары → блок для промпта. Метка примера стои́т ПРИ КАЖДОЙ паре, а не общим
+    списком внизу: карточка экзамена и снимок ссылаются на те же адреса, и владелец, спросив
+    «откуда бот это взял», обязан найти строку по метке, не пересчитывая порядок."""
+    out = []
+    for e in examples:
+        out.append("— Клиент (д%s·р%s): %s\n  Мы: %s" % (e["dialog"], e["msg"], e["client"], e["company"]))
+    return "\n".join(out)
+
+
+def _style_block(client_question: str = "") -> str:
+    """Блок стиля для промпта: памятка + примеры. → строка.
+
+    Пустой вопрос → `STYLE_FEWSHOT` БЕЗ единого отличия. Это не оптимизация, а замок регресса:
+    десятки существующих вызовов `make_system_prompt` вопроса не передают, и любой из них обязан
+    получить прежний промпт посимвольно.
+
+    Отказ подбора НЕ роняет ответ клиенту: база на диске может отсутствовать, быть битой или
+    смениться на непрочитываемую — ни один из этих случаев не стои́т того, чтобы клиент остался
+    без ответа, и все три сводятся к запасному пути."""
+    if not client_question:
+        return STYLE_FEWSHOT
+    try:
+        picked = style_examples.pick(client_question)
+    except Exception as e:                                              # noqa: BLE001
+        log.warning("style_examples: подбор отказал (%s) — ручные пары запасным путём", type(e).__name__)
+        return STYLE_FEWSHOT
+    if not picked:
+        return STYLE_FEWSHOT
+    return (
+        "\n\n" + STYLE_GUIDE
+        + "\n\nПРИМЕРЫ ЖИВЫХ ОТВЕТОВ, ПОДОБРАННЫЕ ПОД ЭТОТ ВОПРОС (%d шт., из нашей переписки с "
+          "клиентами; метка «дN·рM» — номер диалога и реплики):\n" % len(picked)
+        + _render_live_fewshot(picked)
+        + "\n\nКАК ЧИТАТЬ ЭТИ ПРИМЕРЫ: бери из них ТОН, ФОРМУ, ДЛИНУ и ПОРЯДОК ВОПРОСОВ — так "
+          "пишут наши менеджеры живым клиентам. ЧИСЛА В НИХ — ИЛЛЮСТРАЦИЯ ФОРМАТА, А НЕ ДАННЫЕ: "
+          "цену, депозит, наличие, сроки и правила бери ТОЛЬКО из блока ЦЕНА и правил выше. "
+          "Примеры отвечают на ПОХОЖИЙ вопрос, а не на этот: их содержание не переносится в "
+          "ответ, переносится манера. Метки «дN·рM» — служебные, клиенту их НЕ показывай."
+    )
+
+
+def live_examples_marks(transcript: str):
+    """Метки примеров, которые получит голова на ЭТОМ транскрипте → ['д85·р141', …].
+
+    Нужна снимку экзамена: карточка обязана мочь сказать владельцу «по образцу N живых ответов»,
+    а для этого адреса примеров должны лежать РЯДОМ С СУДИМЫМ ТЕКСТОМ, а не пересчитываться при
+    показе. Текста переписки не отдаёт ни одной строкой — только адреса."""
+    q = _last_client_line(transcript)
+    if not q:
+        return []
+    try:
+        return style_examples.marks(style_examples.pick(q))
+    except Exception:                                                   # noqa: BLE001
+        return []
 
 
 # ------------------------------- парк (Лист1) --------------------------------
@@ -2348,6 +2417,22 @@ def _client_messages(transcript: str):
     """Реплики КЛИЕНТА (не менеджера) в хронологическом порядке, lowercased."""
     return [ln[len("[клиент]:"):].strip().lower()
             for ln in (transcript or "").split("\n") if ln.startswith("[клиент]:")]
+
+
+def _last_client_line(transcript: str) -> str:
+    """ПОСЛЕДНЯЯ реплика клиента, В ИСХОДНОМ РЕГИСТРЕ — это и есть ТЕКУЩИЙ вопрос.
+
+    Не `_client_messages`, хотя разбор тот же: тот отдаёт lowercase, а подбор примеров зовёт
+    `model_name.find_mentions`, и отданный ему текст обязан быть тем же, что видит остальной
+    контур. Регистр детектору сегодня безразличен, но зависимость от этого нигде не записана.
+
+    ИМЕННО ПОСЛЕДНЯЯ, А НЕ ВЕСЬ ТРАНСКРИПТ: примеры подбираются «по похожести на ТЕКУЩИЙ вопрос»
+    (слово задания). Склейка всех реплик диалога размывает вопрос до темы — на длинном диалоге
+    доля совпавшей массы падает механически, и подбор молча замолкал бы тем чаще, чем дольше
+    идёт переписка, то есть ровно там, где помощь нужнее."""
+    lines = [ln[len("[клиент]:"):].strip()
+             for ln in (transcript or "").split("\n") if ln.startswith("[клиент]:")]
+    return lines[-1] if lines else ""
 
 
 def _detect_model(text: str):
@@ -5634,7 +5719,10 @@ ANTI_LOOP_NOTE = (
 def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pricing_note: str = "",
                        directive: str = "", park_models=None, playbook: str = "", pressure=None,
                        collected=None, ready: bool = False, just=None, vehicle_type: str = "bike",
-                       is_partner: bool = False) -> str:
+                       is_partner: bool = False, client_question: str = "") -> str:
+    """…`client_question` — ТЕКУЩИЙ вопрос клиента для подбора живых примеров (задание 51-b).
+    Дефолт `""` → подбора нет и промпт БАЙТ В БАЙТ прежний: вызывающие, которым примеры не нужны
+    (и все существующие тесты), ничего не замечают."""
     lang_name = "русском" if lang == "ru" else "английском"
     # Правило языка ЖЁСТКОЕ и в один ряд с остальными (правка 03.09.2026, вариант A). RU-путь — байт-в-байт.
     lang_rule = ("\n\nREPLY LANGUAGE (STRICT — ranks with the rules above): the client writes in ENGLISH, "
@@ -5895,7 +5983,7 @@ def make_system_prompt(faq: str, lang: str, is_first_contact: bool = False, pric
         + AVAILABILITY_INVARIANT_RULE + GENERATION_DEFAULT_RULE + PICKUP_RULE + RECEIPT_LEXICON_RULE + lang_rule
         + playbook_block
         + "\n\nFAQ и эталонные формулировки:\n" + (faq or "(FAQ недоступен — опирайся на критичные факты выше)")
-        + STYLE_FEWSHOT
+        + _style_block(client_question)
     )
 
 
@@ -8024,7 +8112,8 @@ def generate_draft(transcript: str, lang: str, faq: str,
     vehicle_type = detectVehicleType(transcript)
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
                                 park_models=park_models, playbook=playbook, collected=facts,
-                                ready=ready, just=just, vehicle_type=vehicle_type, is_partner=is_partner)
+                                ready=ready, just=just, vehicle_type=vehicle_type, is_partner=is_partner,
+                                client_question=_last_client_line(transcript))
     out = _strip_service_prefix(call_llm(system, transcript))
     # Пост-чек ДО сборки сетки: сканируем LLM-текст (intro/outro), дословный прайс-блок КОДА не
     # трогаем. Утверждения цвет/наличие/цена вне белого списка → «уточню»-форма + пометка модератору.
@@ -8141,7 +8230,7 @@ def regenerate_draft(transcript: str, lang: str, faq: str, is_first_contact: boo
     system = make_system_prompt(faq, lang, is_first_contact, pricing_note,
                                 directive=directive, park_models=park_models, playbook=playbook,
                                 collected=facts, ready=ready, just=just, vehicle_type=vehicle_type,
-                                is_partner=is_partner)
+                                is_partner=is_partner, client_question=_last_client_line(transcript))
     out = _strip_service_prefix(call_llm(system, transcript))
     # Тот же пост-чек, что в generate_draft (до сборки сетки): цвет/наличие/цена вне данных → «уточню».
     out = postcheck_draft(out, lang, pricing_note=pricing_note, call_llm=call_llm, transcript=transcript)
