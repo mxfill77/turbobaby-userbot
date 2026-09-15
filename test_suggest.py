@@ -8953,7 +8953,10 @@ class TestClassSuggestOffer(unittest.TestCase):
         self.assertNotIn("Is the NMAX available for these dates?", pairs)
         target = pairs["Добрый день, что есть с 08.10. На 8 дней из скутеров"]
         self.assertIn("Вот что можем предложить:", target)
-        self.assertIn("NMAX 155CC | дней: 8 стоимость: 2 507 (Скидка за срок 7%, 313 в день), "
+        # ВЕЛИЧИНА СТАВКИ УБРАНА 15.09 (задание 62-i): ожидание переставлено с «7%» на место «N%».
+        # Замок не ослаблен, а переставлен на то, что этот тест и держит — ЦЕЛЕВУЮ ФОРМУ строки:
+        # поля, порядок и подводка сверяются по-прежнему дословно, сменилась ровно величина.
+        self.assertIn("NMAX 155CC | дней: 8 стоимость: 2 507 (Скидка за срок N%, 313 в день), "
                       "депозит: 3 000 бат", target)
         self.assertIn("XADV 750CC | дней: 8 стоимость: 15 557", target)
         for pair in suggest.STYLE_FEWSHOT_PAIRS:
@@ -10205,6 +10208,159 @@ class TestTermDiscountLadderIsCutOnTheWayIn(unittest.TestCase):
         """Вход без лестницы рез не трогает ни байтом — регресс всех прочих тестов цел."""
         cleaned, cut = suggest.strip_term_discount_ladder("FAQ")
         self.assertEqual((cleaned, cut), ("FAQ", 0))
+
+
+class TestTermDiscountPercentHasNoValueInExamples(unittest.TestCase):
+    """Задание 62-i: в собранном промпте не остаётся ВЕЛИЧИНЫ процента скидки за срок — ни в
+    примерах формата, ни в примерах расчёта подаваемого FAQ.
+
+    Вырезка 62-e снимала только ЛЕСТНИЦУ (два-плюс процента при двух-плюс сроках) и одиночный
+    процент пропускала сознательно; после неё в боевом промпте оставалось ДЕВЯТЬ величин — 7 в
+    парах «клиент → наш ответ» и 2 в строках FAQ под словами «Формат ответа, который ты
+    используешь». Здесь закрывается этот остаток: пример учит ФОРМЕ, а не величине."""
+
+    # счётчик C — ДОСЛОВНО тот, которым мерили 13.09 и 15.09: любой процент рядом со скидкой за
+    # срок в окне ±60. Копия намеренная: замер обязан быть независим от правила.
+    RE_PCT = re.compile(r"\d+(?:[.,]\d+)?\s*%")
+    RE_DISC = re.compile("скидк|discount|уступк", re.I)
+    RE_TERM = re.compile("срок|term|недел|week|месяц|month|\\bдн\\w*|\\bday", re.I)
+
+    @classmethod
+    def count_c(cls, text):
+        n = 0
+        for m in cls.RE_PCT.finditer(text):
+            win = text[max(0, m.start() - 60):min(len(text), m.end() + 60)]
+            if cls.RE_DISC.search(win) and cls.RE_TERM.search(win):
+                n += 1
+        return n
+
+    FAQ_EXAMPLES = (
+        "> NMAX 155CC | 7 дней: 2 217 ฿ (317 ฿/день, скидка за срок 6%), депозит 3 000 ฿",
+        "Продление считается по тарифу за новый срок. > XMAX 300 NEW | 12 дней: 11 032 ฿ "
+        "(919 ฿/день, скидка 11%), депозит 7 000 ฿",
+    )
+    # контрпримеры: проценты, которые скидкой ЗА СРОК не являются и правке не подлежат
+    KEEP = (
+        "**Скутеры (скидка категории 25%):**\n- HONDA PCX 150 — 349, депозит 3 000",
+        "**Мотоциклы (скидка категории 15%):**\n- XSR 155 — 590, депозит 7 000",
+        "Вывод: 80% обращений — это цена, выбор модели, оплата, доставка, сроки и депозит.",
+        "Бронь за месяц до дат — предоплата 100%, ближе — по договорённости.",
+    )
+
+    def test_no_term_discount_percent_reaches_the_prompt(self):
+        """ГЛАВНОЕ: сколько бы величин ни стояло на входе, в промпте их ноль."""
+        for faq in ("FAQ",) + self.FAQ_EXAMPLES:
+            p = suggest.make_system_prompt("FAQ\n" + faq, "ru")
+            self.assertEqual(self.count_c(p), 0,
+                             "величина процента скидки за срок доехала до промпта: %r" % faq[:60])
+
+    def test_manual_examples_carry_the_slot_not_the_value(self):
+        """Примеры формата остаются примерами ФОРМАТА: поля, порядок и тон целы, ушло число."""
+        pairs = dict(suggest.STYLE_FEWSHOT_PAIRS)
+        ru = pairs["Добрый день, что есть с 08.10. На 8 дней из скутеров"]
+        en = pairs["What do you have from Oct 8th, for 8 days? Scooters"]
+        self.assertEqual(self.count_c(ru), 0)
+        self.assertEqual(self.count_c(en), 0)
+        self.assertIn("(Скидка за срок N%, 313 в день)", ru)      # строение слота цело
+        self.assertIn("(Term discount N%, 313 per day)", en)
+        self.assertIn("стоимость: 2 507", ru)                     # прайсовые числа НЕ тронуты
+        self.assertIn("депозит: 3 000 бат", ru)
+        self.assertEqual(ru.count("Скидка за срок N%"), 4)        # все четыре строки, а не одна
+        self.assertEqual(en.count("Term discount N%"), 3)
+
+    def test_faq_calculation_examples_lose_the_value_not_the_shape(self):
+        """Два примера расчёта FAQ режутся ТЕМ ЖЕ правилом: величина уходит, формат строки цел."""
+        for txt in self.FAQ_EXAMPLES:
+            fed = suggest._faq_for_prompt(txt)
+            self.assertEqual(self.count_c(fed), 0, "величина осталась: %r" % txt[:60])
+            self.assertIn(suggest.TERM_DISCOUNT_PCT_SLOT, fed)
+            self.assertEqual(fed.count("|"), txt.count("|"))      # поля строки не потеряны
+            self.assertIn("депозит", fed)
+
+    def test_counterexamples_are_untouched(self):
+        """Скидка КАТЕГОРИИ и проценты не о скидке — не наш предмет: текст цел байт в байт."""
+        for txt in self.KEEP:
+            self.assertEqual(suggest._faq_for_prompt(txt), txt,
+                             "правило тронуло не скидку за срок: %r" % txt[:60])
+
+    def test_live_doc_category_discounts_survive(self):
+        """Тот же контрпример на ЖИВОМ тексте, а не на синтетике: проценты скидки КАТЕГОРИИ
+        доезжают до промпта целыми, а процентов скидки ЗА СРОК в нём ноль."""
+        with open(suggest.LOCAL_FAQ, encoding="utf-8") as f:
+            doc = f.read()
+        fed = suggest._faq_for_prompt(doc)
+        self.assertIn("скидка категории 25%", fed)
+        self.assertIn("скидка категории 15%", fed)
+        self.assertEqual(self.count_c(fed), 0)
+
+    def test_rule_and_counter_agree_on_every_input(self):
+        """Замок против обеих ошибок разом: правило меняет текст РОВНО там, где счётчик видит
+        процент скидки за срок, и нигде больше. Ловил бы у́же — остался бы процент; шире — съел бы
+        скидку категории (первая редакция правила с богатым словарём сроков именно это и делала)."""
+        for txt in self.FAQ_EXAMPLES + self.KEEP + (
+                "Скидки за срок: неделя ~6–15%, 2 недели ~15–25%, месяц ~35–50%.",
+                "NMAX 155CC | дней: 8 стоимость: 2 507 (Скидка за срок 7%, 313 в день)",
+                "**Скутеры (скидка категории 25%):**\n- HONDA PCX 150 — 349 ฿/день, депозит 3 000"):
+            fed = suggest._faq_for_prompt(txt)
+            self.assertEqual(self.count_c(txt) > 0, fed != txt,
+                             "правило и счётчик разошлись на %r" % txt[:70])
+
+    def test_slot_carries_no_digit_percent(self):
+        """Место не смеет само быть тем, что снимает: ни цифры с процентом, ни слова «ступень»."""
+        self.assertEqual(re.findall(r"\d+\s*%", suggest.TERM_DISCOUNT_PCT_SLOT), [])
+        self.assertNotIn("ступен", suggest.TERM_DISCOUNT_PCT_SLOT.lower())
+
+    def test_mask_is_wired_at_both_points_of_feeding(self):
+        """Замок на подмену места: маска обязана стоять на ОБОИХ входах текста в промпт — и на
+        FAQ, и на блоке примеров. Путь примеров важен отдельно: подобранные живые пары берутся
+        из базы переписок, править которую полоса ПК не смеет. Судим по тексту файла."""
+        with open(suggest.__file__, encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("+ _examples_for_prompt(_style_block(client_question))", src)
+        self.assertIn("text, masked = mask_term_discount_percent(text)", src)
+
+    def test_picked_live_examples_are_masked_too(self):
+        """Ветка подобранных живых примеров: подложенный процент до промпта не доезжает."""
+        keep = suggest._style_block
+        spiked = ("\n— Клиент: Сколько за 9 дней?\n  Мы: NMAX 155CC | дней: 9 стоимость: 2 900 "
+                  "(Скидка за срок 13%, 322 в день), депозит: 3 000 бат")
+        suggest._style_block = lambda q="": spiked
+        try:
+            p = suggest.make_system_prompt("FAQ", "ru", client_question="скидка за 9 дней?")
+        finally:
+            suggest._style_block = keep
+        self.assertEqual(self.count_c(p), 0)
+        self.assertIn("Скидка за срок N%", p)
+
+    def test_price_block_keeps_its_live_percent(self):
+        """ЧЕГО МАСКА НЕ КАСАЕТСЯ. Процент в блоке ЦЕНА приходит строкой J Календаря по КОНКРЕТНЫМ
+        датам — это единственный живой источник скидки, и он едет клиенту дословно (правило
+        владельца, отдельный замок в наборе). Маска стои́т на подаче FAQ и примеров, а ценовую
+        записку вызывающий кладёт мимо неё."""
+        note = ("ЦЕНА из Календаря: NMAX 155CC | дней: 8 стоимость: 2 507 "
+                "(Скидка за срок 7%, 313 в день), депозит: 3 000 бат")
+        p = suggest.make_system_prompt("FAQ", "ru", pricing_note=note)
+        self.assertIn("Скидка за срок 7%", p)
+
+    def test_mask_announces_itself_with_a_number(self):
+        """Молчаливого снятия величины нет: сработавшая маска кладёт в журнал ЧИСЛО снятого,
+        а на входе без процентов не объявляется вовсе."""
+        seen = []
+        real = suggest.log.info
+        suggest.log.info = lambda msg, *a, **kw: seen.append((msg, a))
+        try:
+            suggest.make_system_prompt("FAQ\n" + self.FAQ_EXAMPLES[0], "ru")
+            suggest.make_system_prompt("FAQ без процентов", "ru")
+        finally:
+            suggest.log.info = real
+        said = [(m, a) for m, a in seen if "снято" in m]
+        self.assertEqual(len(said), 1, "маска сработала молча либо объявилась на пустом месте")
+        self.assertEqual(said[0][1][0], 1, "в журнале нет ЧИСЛА снятых величин")
+
+    def test_input_without_percent_is_byte_for_byte_unchanged(self):
+        """Вход без процента скидки за срок маска не трогает ни байтом — прежний регресс цел."""
+        self.assertEqual(suggest.mask_term_discount_percent("FAQ"), ("FAQ", 0))
+        self.assertEqual(suggest.mask_term_discount_percent(""), ("", 0))
 
 
 if __name__ == "__main__":
