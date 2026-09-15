@@ -481,7 +481,9 @@ class TestParts(unittest.TestCase):
         self.assertIn("не ждёт ничего", vp.body(facts))
         saved = vp.part_owner
         try:
-            vp.part_owner = lambda _w: []
+            # `sliders` приехал 15.09.2026 вместе с прибором ползунков; подмена обязана
+            # повторять ЖИВУЮ подпись части, иначе падает не проверяемый закон, а вызов.
+            vp.part_owner = lambda _w, sliders=None: []
             with self.assertRaises(AssertionError):
                 vp.body(facts)
         finally:

@@ -883,7 +883,7 @@ def part_axes(tally, closed_day, why=""):
     return [axes_words(tally, closed_day, why)]
 
 
-def part_owner(waiting):
+def part_owner(waiting, sliders=None):
     """ЖДЁТ ВЛАДЕЛЬЦА: открытые решения списком, коротко.
 
     У заявки внешнего канала своя строка, и это не косметика. Её `goal` в слепке —
@@ -892,11 +892,21 @@ def part_owner(waiting):
     находки, ни того, что решать. Печатать его как «цель» значило показывать
     ключ вместо смысла — а смысл теперь приезжает отдельным сообщением ступени G,
     и витрина на него УКАЗЫВАЕТ, вместо того чтобы пересказывать чужой текст.
+
+    ``sliders`` (15.09.2026, прибор `polzunki_pc`) — строки ПРИБОРОВ, чей вопрос ждёт
+    решения человека и НЕ живёт рядом очереди. Они дописываются ПОСЛЕ рядов и режутся
+    отдельно от них: обрежь их общий :func:`listed`, и вопрос прибора молча исчез бы
+    за списком заявок. Пустой список — законное молчание прибора (у ползунков это
+    исход «совпадает»), и тогда раздел выглядит ровно как до 15.09. Ряды очереди при
+    этом НЕ подменяются: строка «решения владельца не ждёт ничего» уходит только
+    вместе с приходом чужой строки — иначе раздел утверждал бы и «ничего», и вопрос.
     """
+    extra = [one_line(s, 400) for s in (sliders or []) if str(s or "").strip()]
     if waiting is None:
-        return ["%s: %s" % ("открытые решения", number(None, "слепок очереди не прочитан"))]
+        return ["%s: %s" % ("открытые решения",
+                            number(None, "слепок очереди не прочитан"))] + extra
     if not waiting:
-        return ["решения владельца не ждёт ничего"]
+        return (["решения владельца не ждёт ничего"] if not extra else []) + extra
     rows = []
     for w in waiting:
         # ДЕРЖИТ ли ряд ящик — говорится В КАЖДОЙ СТРОКЕ, а не выводится из вида:
@@ -914,7 +924,7 @@ def part_owner(waiting):
         else:
             rows.append("#%s ДЕРЖИТ операцию: %s"
                         % (w.get("id"), one_line(w.get("goal"), GOAL_MAX)))
-    return listed(rows)
+    return listed(rows) + extra
 
 
 # ═════════════════════════ СБОРКА ════════════════════════════════════════════
@@ -940,7 +950,7 @@ def sections(facts, blind=True):
                           box_stop=got.get("box_stop") or "",
                           routed=got.get("routed"), lotok=got.get("lotok")),
         "axes": part_axes(got.get("axes"), got.get("closed_day"), got.get("axes_why") or ""),
-        "owner": part_owner(got.get("waiting")),
+        "owner": part_owner(got.get("waiting"), sliders=got.get("sliders")),
     }
     out = []
     for key, title in PARTS:

@@ -506,6 +506,42 @@ def health_nodes(expect, expect_at, watch, watch_at, now):
     return out
 
 
+# ───────────────────── строка прибора ползунков (15.09.2026) ─────────────────
+# ЧИТАЕТСЯ ФАЙЛ, А НЕ МОДУЛЬ, и это решение, а не лень. Прибор `polzunki_pc` ходит в живую
+# дверь (девять GET, ≈2 мин), и позови витрина его код — она перестала бы быть чистым
+# читателем дисков (инвариант `VITRINA_PC_READS_ONLY`), а её виток получил бы сеть. Поэтому
+# прибор кладёт ГОТОВУЮ строку в своё состояние, а витрина её показывает и называет возраст
+# замера: строка без возраста читалась бы как сегодняшняя, даже если прибор замер неделю назад.
+POLZUNKI_FILE = "polzunki_pc_state.json"
+# Предел свежести замера — ТРОЙНОЙ пол каденции прибора (6 ч): один пропущенный круг бывает
+# (демон занят заходом), три подряд означают, что прибора никто не звал.
+POLZUNKI_LIMIT_SEC = 3 * 6 * 3600.0
+
+
+def slider_rows(root=HERE, now=None, named=None):
+    """Строки прибора ползунков для раздела «ЖДЁТ ВЛАДЕЛЬЦА». → list (пусто = прибор молчит).
+
+    Три исхода прибора приезжают сюда уже словами; витрина их НЕ пересказывает и не судит
+    заново. Своих здесь ровно два решения: показывать ли строку вовсе (молчание прибора —
+    это пустой список, а не пустая строка) и как назвать возраст его замера.
+    """
+    data, at, why = cdr.read_json(root, named or POLZUNKI_FILE)
+    if not isinstance(data, dict):
+        return ["ползунки скидки: %s"
+                % vp.number(None, "прибор ещё не отчитывался (%s)"
+                            % (why or POLZUNKI_FILE))]
+    row = str(data.get("vitrina") or "").strip()
+    if not row:
+        return []
+    stale = cd.stale(at, now, POLZUNKI_LIMIT_SEC)
+    age = cd.age_words(at, now)
+    if stale:
+        # ЗАМЕРШИЙ ПРИБОР НЕ ПОКАЗЫВАЕТ СВОЕГО ПРОШЛОГО КАК НАСТОЯЩЕГО: строка остаётся, но
+        # впереди неё стои́т слово о том, что числа в ней могли устареть.
+        return ["%s [замер %s — прибор молчит дольше предела, числа могли устареть]" % (row, age)]
+    return ["%s [замер %s]" % (row, age)]
+
+
 def open_expectations(expect):
     """Открытые ожидания О1–О4. → list | None (слой не прочитан)."""
     if expect is None:
@@ -651,6 +687,7 @@ def collect(root=HERE, now=None, runner=None, inbox=None, day=None, shtab=None):
         "external": external,
         "awaiting": awaiting_counts(waiting),
         "waiting": waiting,
+        "sliders": slider_rows(root, now),
         "axes": tally,
         "axes_why": axes_why,
         "closed_day": closed_day,
