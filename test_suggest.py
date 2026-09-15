@@ -9945,5 +9945,88 @@ class TestPricePromiseGuarantee(unittest.TestCase):
                                "%s: пояс обещания раньше резака обещания" % name)
 
 
+class TestTermDiscountLadderIsCutOnTheWayIn(unittest.TestCase):
+    """Задание 62-e: лестница процентов скидки за срок НЕ доезжает до собранного промпта
+    НИ ОДНОЙ веткой. Док мозга `faq` и локальный фолбэк при этом не правятся — рез стои́т
+    ровно на подаче FAQ в промпт."""
+
+    # тот же счётчик B, которым мерил замер 13.09: сами числа лестницы, любой дефис, с % и без
+    _DASH = "[-‐‑‒–—−]"
+    RE_LADDER = re.compile(r"(?<!\d)(?:6\s*%s\s*15|15\s*%s\s*25|35\s*%s\s*50)(?!\d)"
+                           % (_DASH, _DASH, _DASH))
+
+    LADDER_TEXTS = (
+        "Базовая цена в день и депозит. Скидки за срок: неделя ~6–15%, 2 недели ~15–25%, "
+        "месяц ~35–50% (зависит от категории).",                      # обе нынешние редакции дока
+        "Скидки за срок: неделя 4-9%, 2 недели 11-19%, месяц 28-44%.",          # другие числа
+        "Term discounts: week about 6-15%, two weeks 15-25%, month 35-50%.",    # по-английски
+        "Скидки за срок:\n- неделя — 8%\n- 2 недели — 17%\n- месяц — 40%",      # пунктами списка
+        "За месяц уступка 40%, за неделю 8% — зависит от категории.",           # другой порядок
+        "Скидка: 7 дней 6%, 30 дней 35%.",                                      # лестница сутками
+    )
+    NOT_LADDER_TEXTS = (
+        "> NMAX 155CC | 7 дней: 2 217 ฿ (317 ฿/день, скидка за срок 6%), депозит 3 000 ฿",
+        "**Скутеры (скидка категории 25%):**\n- HONDA PCX 150 — 349 ฿/день, депозит 3 000",
+        "Вывод: 80% обращений — это цена, выбор модели, оплата, доставка, сроки и депозит.",
+    )
+
+    def test_ladder_never_reaches_the_prompt(self):
+        """Главное: как бы лестницу ни записали в FAQ, в собранном промпте её нет."""
+        for txt in self.LADDER_TEXTS:
+            p = suggest.make_system_prompt("FAQ\n" + txt, "ru")
+            self.assertEqual(self.RE_LADDER.findall(p), [],
+                             "лестница доехала до промпта: %r" % txt[:60])
+            self.assertIn(suggest.LADDER_CUT_MARK, p, "рез не объявил себя в тексте промпта")
+
+    def test_rule_is_semantic_not_a_single_line(self):
+        """Правило режет ПО СМЫСЛУ: ловит все переписи и МОЛЧИТ на том, что лестницей не является
+        (один процент при одном сроке — пример расчёта, скидка категории)."""
+        for txt in self.LADDER_TEXTS:
+            _, cut = suggest.strip_term_discount_ladder(txt)
+            self.assertEqual(cut, 1, "правило не поймало лестницу: %r" % txt[:60])
+        for txt in self.NOT_LADDER_TEXTS:
+            cleaned, cut = suggest.strip_term_discount_ladder(txt)
+            self.assertEqual(cut, 0, "правило срезало не лестницу: %r" % txt[:60])
+            self.assertEqual(cleaned, txt, "текст изменён там, где резать нечего")
+
+    def test_cut_keeps_the_useful_neighbour_sentence(self):
+        """Рез берёт ФРАГМЕНТ, а не строку: полезное соседнее предложение остаётся."""
+        cleaned, cut = suggest.strip_term_discount_ladder(self.LADDER_TEXTS[0])
+        self.assertEqual(cut, 1)
+        self.assertIn("Базовая цена в день и депозит.", cleaned)
+
+    def test_mark_adds_neither_a_step_word_nor_a_percent(self):
+        """Метка реза не смеет ни называть процент, ни говорить слово «ступень»: иначе счётчик
+        запрета в критфактах перестанет отличаться от лестницы, а сам рез станет тем, что режет."""
+        self.assertNotIn("ступен", suggest.LADDER_CUT_MARK.lower())
+        self.assertEqual(re.findall(r"\d+\s*%", suggest.LADDER_CUT_MARK), [])
+
+    def test_cut_is_wired_at_the_point_of_feeding(self):
+        """Замок на подмену места: рез обязан стоять в самой сборке промпта, а не у одного из
+        вызывающих — иначе ветка мимо него вернёт лестницу молча. Судим по тексту файла."""
+        with open(suggest.__file__, encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('"\\n\\nFAQ и эталонные формулировки:\\n" + (_faq_for_prompt(faq)', src)
+
+    def test_cut_announces_itself_with_a_number(self):
+        """Молчаливое вырезание запрещено: сработавший рез оставляет в журнале ЧИСЛО убранного."""
+        seen = []
+        real = suggest.log.info
+        suggest.log.info = lambda msg, *a, **kw: seen.append((msg, a))
+        try:
+            suggest.make_system_prompt("FAQ\n" + self.LADDER_TEXTS[0], "ru")
+            suggest.make_system_prompt("FAQ без лестницы", "ru")
+        finally:
+            suggest.log.info = real
+        cuts = [(m, a) for m, a in seen if "лестниц" in m]
+        self.assertEqual(len(cuts), 1, "рез сработал молча либо объявился на пустом месте")
+        self.assertEqual(cuts[0][1], (1,), "в журнале нет ЧИСЛА убранных фрагментов")
+
+    def test_stub_faq_prompt_is_byte_for_byte_unchanged(self):
+        """Вход без лестницы рез не трогает ни байтом — регресс всех прочих тестов цел."""
+        cleaned, cut = suggest.strip_term_discount_ladder("FAQ")
+        self.assertEqual((cleaned, cut), ("FAQ", 0))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
