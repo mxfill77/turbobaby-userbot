@@ -1038,6 +1038,71 @@ def update_client_unknown(state, client, awake, now):
     return {"measured": True, "awake": silent, "since": since, "why": ""}
 
 
+def update_queue_blind(state, q, awake, now):
+    """Накопить СЛЕПОТУ О1 и посчитать ЭПИЗОДЫ → {"measured","awake","since","why","episodes",
+    "misses"}. Устройство — то же, что у `update_client_unknown`; предмет другой: там не читается
+    источник истины о клиентах, здесь не получается СНИМОК ОЧЕРЕДИ.
+
+    СЧЁТ ИДЁТ ВСЕГДА И С ПЕРВОГО ПРОМАХА, а голос — только после отсрочки (`ex._o1_blind`). Это
+    и есть требуемое разделение громкости и вердикта: эпизод, погасший быстрее отсрочки, в счёт
+    попадает, а владельцу не показывается. Обратный порядок (показывать всё, что считаем) дал бы
+    по замеру 15.09 шестнадцать сообщений в сутки — отказ приёмки, а не бдительность.
+
+    ЧАСЫ БОДРСТВОВАНИЯ, а не стенные, по той же причине, что у О2/О3/О5: ПК спит, и первый же
+    промах после сна имеет стенной возраст, равный сну, — заметка «не вижу очереди 9 часов» была
+    бы ложной ровно на длину сна.
+
+    ПОЛУЧЕННЫЙ СНИМОК ОБНУЛЯЕТ СЧЁТЧИК БЕЗУСЛОВНО и безразлично к тому, ЧТО он показал: предмет
+    здесь — способность смотреть, а не увиденное. Счётчик ЭПИЗОДОВ при этом не обнуляется
+    никогда: он память полосы о том, сколько раз она слепла, и ноль в нём значит «не слепла»."""
+    prev = state.get("qblind") if isinstance(state.get("qblind"), dict) else {}
+    readable = bool(q.get("ok")) if isinstance(q, dict) else False
+    episodes = int(prev.get("episodes") or 0)
+    misses = int(prev.get("misses") or 0)
+    since = prev.get("since")
+    why = str((q or {}).get("err") or "") if isinstance(q, dict) else ""
+    if readable:
+        state["qblind"] = {"wall": now, "awake": awake, "blind": 0.0, "since": None,
+                           "why": "", "episodes": episodes, "misses": 0}
+        return {"measured": True, "awake": 0.0, "since": None, "episodes": episodes,
+                "misses": 0, "why": "снимок очереди получен — слепоты нет"}
+    # ЭПИЗОД ОТКРЫВАЕТСЯ ЗДЕСЬ, ДО ЛЮБОГО ПОРОГА И ДО ЛЮБЫХ ЧАСОВ. Даже когда часов бодрствования
+    # нет вовсе и длину мы посчитать не сможем, ФАКТ слепоты посчитан — «не смог измерить» не
+    # смеет превратиться в «не было».
+    misses += 1
+    if since is None:
+        since, episodes = now, episodes + 1
+    cur = {"wall": now, "awake": awake, "episodes": episodes, "misses": misses,
+           "why": why[:160]}
+    if awake is None:
+        state["qblind"] = dict(cur, blind=None, since=since)
+        return {"measured": False, "awake": None, "since": since, "episodes": episodes,
+                "misses": misses,
+                "why": why or "часов бодрствования нет — сон от слепоты не отличить"}
+    prev_awake = prev.get("awake")
+    try:
+        prev_awake = None if prev_awake is None else float(prev_awake)
+    except (TypeError, ValueError):
+        prev_awake = None
+    if prev_awake is None or awake < prev_awake:
+        # Первое наблюдение или перезагрузка машины: длину эпизода мерить не от чего. Эпизод
+        # ПОСЧИТАН (выше), но НЕ ИЗМЕРЕН — и это разные слова.
+        state["qblind"] = dict(cur, blind=0.0, since=now)
+        return {"measured": False, "awake": 0.0, "since": now, "episodes": episodes,
+                "misses": misses,
+                "why": why or ("прошлого наблюдения нет" if prev_awake is None
+                               else "часы бодрствования пошли назад — машина перезагрузилась")}
+    prev_blind = prev.get("blind")
+    try:
+        blind = 0.0 if prev_blind is None else float(prev_blind)
+    except (TypeError, ValueError):
+        blind = 0.0
+    blind += max(0.0, min(awake - prev_awake, STEP_CAP_SEC))
+    state["qblind"] = dict(cur, blind=blind, since=since)
+    return {"measured": True, "awake": blind, "since": since, "episodes": episodes,
+            "misses": misses, "why": why or "причина не названа"}
+
+
 def update_waits(state, facts, now):
     """Накопить ЧИСТОЕ ОЖИДАНИЕ каждой ждущей строки полосы ПК — время, простоянное ИМЕННО ПРИ
     СВОБОДНОЙ полосе. Именно по нему О1 берёт порог (обоснование — шапка expectations_pc).
@@ -1083,6 +1148,10 @@ def snapshot(state, now=None, getter=None):
     life = state.get("life") if isinstance(state.get("life"), dict) else {}
     life_kids = state.get("kids") if isinstance(state.get("kids"), dict) else {}
     client = client_facts()
+    # СНИМОК ОЧЕРЕДИ СНИМАЕТСЯ ЗДЕСЬ, А НЕ В ЛИТЕРАЛЕ НИЖЕ, потому что его исход нужен ДВАЖДЫ:
+    # сам снимок и счётчик слепоты О1, который обязан обновиться ТЕМ ЖЕ наблюдением, а не задним
+    # числом. Второго вызова моста это не добавляет ни одного — вызов ровно один, как и был.
+    queue = queue_facts(getter)
     mod_silence = update_mod_silence(state, mod, awake, now)
     # КАЖДЫЙ РЕБЁНОК — СО СВОИМ ИСТОЧНИКОМ И СВОИМ СЧЁТЧИКОМ ТИШИНЫ (18.08.2026). Модербот кладётся
     # сюда ТЕМИ ЖЕ объектами, что и в свои прежние ключи, — не копией: один ребёнок обязан иметь
@@ -1095,7 +1164,10 @@ def snapshot(state, now=None, getter=None):
         kids[name] = {"fact": fact, "silence": update_kid_silence(state, name, fact, awake, now)}
     return {
         "now": now,
-        "queue": queue_facts(getter),
+        "queue": queue,
+        # О1, ТРЕТИЙ ИСХОД: накопленная СЛЕПОТА и счёт её эпизодов. Порядок тот же, что у О5:
+        # счётчик обновляется ПОСЛЕ снятия снимка, тем же наблюдением.
+        "queue_blind": update_queue_blind(state, queue, awake, now),
         "heartbeat": hb,
         "silence": update_silence(state, hb, awake, now),
         "busy": busy_facts(),
@@ -1229,13 +1301,21 @@ def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
     verdicts = ex.verdict(facts, cfg)
     send = notifier or send_note
     open_eps = dict(st.get("open") or {})
-    qstate = ex.queue_state(facts, cfg, now)[0]
+    qstate, qinfo = ex.queue_state(facts, cfg, now)
     tstate, tinfo = ex.turn_state(facts, cfg, now)
     mstate, minfo = ex.moderbot_state(facts, cfg, now)
     cstate, cinfo = ex.client_state(facts, cfg, now)
     pstate, pinfo = ex.price_state(facts, cfg, now)
     out = {"verdicts": len(verdicts), "notes": [], "closed": [], "dry": bool(dry),
            "queue": qstate, "turn": tstate, "why": tinfo.get("why", ""),
+           # ОЧЕРЕДЬ ХОДИТ ТРОЙКОЙ «исход + причина + счёт эпизодов», и счёт едет в витрину
+           # ВСЕГДА, а не только когда прибор заговорил. Это и есть отделение громкости от
+           # вердикта с другой стороны: молчащая ветка обязана быть ВИДНА в `--status`, иначе
+           # «сообщений не было» неотличимо от «слепоты не было».
+           "queue_why": qinfo.get("why", ""),
+           "queue_blind": (facts.get("queue_blind") or {}).get("awake"),
+           "queue_episodes": (facts.get("queue_blind") or {}).get("episodes"),
+           "queue_misses": (facts.get("queue_blind") or {}).get("misses"),
            # У модербота состояние ходит ПАРОЙ со своей причиной: «неизвестно» без причины
            # читается как «плохо», а это разные новости.
            "moderbot": mstate, "mod_why": minfo.get("why", ""),

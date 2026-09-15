@@ -3567,5 +3567,205 @@ class TestPriceHands(unittest.TestCase):
         self.assertEqual(src.count("PRICE_LOG_FILE"), 2)     # объявление + единственное чтение
 
 
+class TestQueueBlindIsTheThirdOutcome(TestRunHands):
+    """О1, ТРЕТИЙ ИСХОД: отказ моста больше не ГАСИТ сторожа очереди (заведено 15.09.2026).
+
+    ОТРИЦАТЕЛЬНЫЙ ТЕСТ ЗДЕСЬ ДВУСТОРОННИЙ, и обе стороны обязательны:
+      · мост отвечает НЕ ok → прибор обязан сказать НЕИЗВЕСТНО и не промолчать;
+      · мост отвечает нормально → прибор обязан МОЛЧАТЬ.
+    Одна сторона без другой ничего не доказывает: прибор, который кричит всегда, проходит первую
+    и проваливает вторую, а прежний (молчавший всегда) — ровно наоборот.
+
+    БОЕВОЙ КАНАЛ И КАНАЛ ПРОВЕРКИ РАЗЛИЧАЮТСЯ: заметки собирает `self._note`, а живое имя
+    `run_mod.send_note` подменено ловушкой `self.leaked` — наружу из проверки не уходит НИЧЕГО,
+    и если завтра кто-то позовёт боевой канал мимо аргумента, тест покажет это списком."""
+
+    TICK = 600.0                                     # период наблюдателя: задача Планировщика, 10 мин
+
+    def setUp(self):
+        super().setUp()
+        # ЧАСЫ БОДРСТВОВАНИЯ ИНЪЕКТИРУЕМ: настоящие читают живую машину, и кейс краснел бы от
+        # того, давно ли владелец её будил. Отдаём ИЗМЕРЕННЫЕ секунды, а не None: None — это
+        # отдельный, третий исход самих часов, и он проверяется своим кейсом.
+        self.awake = 10000.0
+        self.addCleanup(setattr, run_mod, "awake_seconds", run_mod.awake_seconds)
+        run_mod.awake_seconds = lambda: self.awake
+        # ЛОВУШКА БОЕВОГО КАНАЛА. Возвращает True — как боевой: подмена, всегда молчащая False,
+        # проверяла бы ветку fail-safe вместо утечки.
+        self.leaked = []
+        self.addCleanup(setattr, run_mod, "send_note", run_mod.send_note)
+        run_mod.send_note = lambda text: (self.leaked.append(text), True)[1]
+        self.addCleanup(setattr, run_mod, "heartbeat_facts", run_mod.heartbeat_facts)
+        self._hb(hb_at(60))
+
+    def _dead(self, status):
+        """Мост ответил, но обмен не завершён — ЖИВОЙ класс отскока второго плеча, дословно."""
+        raise RuntimeError("мост ответил, но обмен не завершён (BridgeTransportError): "
+                           "второе плечо моста (echo) бросает обратно на наш же /exec")
+
+    def _ticks(self, n, getter, start=0.0):
+        """n наблюдений подряд с шагом периода наблюдателя. → список итогов прогонов.
+
+        Оборот демона держим свежим НА КАЖДОМ тике: иначе О2 заговорит о молчании, которого мы
+        не ставили, — и кейс про очередь краснел бы от соседней ветки."""
+        outs = []
+        for i in range(n):
+            when = NOW + start + i * self.TICK
+            self.awake = 10000.0 + start + i * self.TICK
+            self._hb(hb_at(60, now=when))
+            outs.append(run_mod.run(now=when, getter=getter, notifier=self._note))
+        return outs
+
+    # СУДИМ ТОЛЬКО СВОЮ ВЕТКУ. Слой держит семь ожиданий разом, и «весь слой молчит» — не то
+    # утверждение, которое здесь проверяется: предмет кейсов — голос О1 о снимке очереди.
+    @staticmethod
+    def _o1u(outs):
+        return [k for o in outs for k in o["notes"] if str(k).startswith("o1u|")]
+
+    def _said(self):
+        return [t for t in self.sent if "не вижу очереди полосы" in t]
+
+    def _closed(self, outs):
+        return [k for o in outs for k in o["closed"] if str(k).startswith("o1u|")]
+
+    # ── сторона 1: признак выглядит правильным, результата нет ────────────────────────────────
+    def test_bridge_not_ok_makes_the_watchman_say_unknown_and_not_be_silent(self):
+        outs = self._ticks(8, self._dead)             # 7 шагов × 600 с = 4200 с > отсрочки 3648 с
+        self.assertEqual([o["queue"] for o in outs], [ex.QUEUE_UNKNOWN] * 8)
+        self.assertEqual(len(self._o1u(outs)), 1,
+                         "один сигнал на эпизод — не на строку и не на оборот")
+        self.assertEqual(len(self._said()), 1)
+        said = self._said()[0]
+        self.assertIn("не вижу очереди полосы", said)
+        self.assertIn("причина последнего промаха", said)
+        self.assertIn("BridgeTransportError", said, "причина обязана ехать в самой заметке")
+        # НЕИЗВЕСТНОСТЬ — НЕ КРАСНОЕ: приговора очереди в тексте нет ни одного.
+        for word in ("стои́т", "мёртв", "авария", "не работает"):
+            self.assertNotIn(word, said.lower().replace("ё", "ё"))
+        self.assertEqual(self.leaked, [], "из проверки наружу не ушло ничего")
+
+    def test_the_verdict_is_not_a_violation_and_does_not_name_a_single_task(self):
+        """Третий исход не превращается в нарушение: видов О1 о СТРОКАХ здесь нет ни одного."""
+        outs = self._ticks(8, self._dead)
+        kinds = [k for o in outs for k in o["notes"] if str(k).startswith("o1")]
+        self.assertEqual(kinds, self._o1u(outs), "видов О1 о СТРОКАХ здесь быть не может: "
+                                                 "строк мы не видели ни одной")
+        # Тот же снимок глазами `queue_state`: «неизвестно», а НЕ «стои́т».
+        self.assertNotIn(ex.QUEUE_STUCK, [o["queue"] for o in outs])
+
+    # ── сторона 2: мост отвечает нормально — прибор обязан молчать ────────────────────────────
+    def test_bridge_ok_keeps_the_watchman_silent(self):
+        outs = self._ticks(8, self._getter([]))
+        self.assertEqual((self._o1u(outs), self._said(), self.leaked), ([], [], []))
+        self.assertEqual([o["queue"] for o in outs], [ex.QUEUE_OK] * 8)
+        self.assertEqual(outs[-1]["queue_episodes"], 0, "слепоты не было — эпизодов ноль")
+
+    # ── п.3: громкость отделена от вердикта ──────────────────────────────────────────────────
+    def test_an_episode_shorter_than_the_delay_is_counted_but_never_shown(self):
+        """Эпизод, погасший быстрее отсрочки, В СЧЁТ ИДЁТ, а владельцу не показывается.
+
+        Это и есть требуемое разделение: по замеру 15.09 таких эпизодов шестнадцать в сутки, и
+        показать их все значило бы провалить приёмку шумом."""
+        short = self._ticks(3, self._dead)            # 1200 с слепоты — короче отсрочки
+        self.assertEqual(self._o1u(short), [])
+        self.assertEqual(short[-1]["queue_episodes"], 1, "посчитан")
+        self.assertEqual(short[-1]["queue_misses"], 3)
+        healed = self._ticks(1, self._getter([]), start=3 * self.TICK)
+        self.assertEqual((self._said(), self.leaked), ([], []))
+        self.assertEqual(healed[0]["queue_episodes"], 1, "память об эпизоде не стирается")
+        self.assertEqual(healed[0]["queue_misses"], 0, "промахи подряд обнулены снимком")
+
+    def test_a_second_episode_speaks_again_and_the_first_one_closes(self):
+        """ОДИН сигнал на ЭПИЗОД, а не один на всю жизнь наблюдателя: новая слепота — новый ключ."""
+        self._ticks(8, self._dead)
+        self.assertEqual(len(self._said()), 1)
+        back = self._ticks(1, self._getter([]), start=8 * self.TICK)
+        self.assertEqual(len(self._closed(back)), 1, "снимок получен — эпизод закрыт доказанно")
+        self.assertTrue(any("ожидание снова выполняется" in t for t in self.sent))
+        again = self._ticks(8, self._dead, start=9 * self.TICK)
+        self.assertEqual(len(self._o1u(again)), 1)
+        self.assertEqual(again[-1]["queue_episodes"], 2)
+        self.assertEqual(self.leaked, [])
+
+    # ── контрфакт: со снятой правкой тот же вход даёт ДРУГОЙ ответ ────────────────────────────
+    def test_counterfactual_without_the_patch_the_same_input_is_silent(self):
+        """СНЯТАЯ ПРАВКА — это `_o1`, выходящий на `rows is None` без третьего исхода, то есть
+        ровно тот код, что стоял до 15.09.2026. Тот же вход обязан дать ДРУГОЙ ответ."""
+        blind = {"measured": True, "awake": 9999.0, "since": NOW - 9999.0,
+                 "why": "мост ответил без ok на new", "episodes": 3, "misses": 4}
+        f = dict(facts(ok=False, err="мост ответил без ok на new"), queue_blind=blind)
+        self.assertEqual([v["kind"] for v in ex.verdict(f)], ["o1_pc_queue_unknown"])
+        self.addCleanup(setattr, ex, "_o1_blind", ex._o1_blind)
+        ex._o1_blind = lambda facts, cfg, now: []     # ← правка снята
+        self.assertEqual(ex.verdict(f), [], "до правки тот же вход давал молчание")
+
+    def test_zero_kills_the_voice_and_keeps_the_count(self):
+        """Ноль в ручке — ОБЪЯВЛЕННЫЙ откат голоса. Счёт эпизодов руками он не трогает: память
+        о слепоте дороже её громкости, и «тихо» не обязано значить «не считаем»."""
+        blind = {"measured": True, "awake": 9999.0, "since": NOW - 9999.0,
+                 "why": "мост молчит", "episodes": 3, "misses": 4}
+        f = dict(facts(ok=False), queue_blind=blind)
+        self.assertEqual(ex.verdict(f, ex.config({"EXPECT_PC_QBLIND_MIN": "0"})), [])
+        outs = self._ticks(3, self._dead)
+        self.assertEqual(outs[-1]["queue_episodes"], 1)
+
+    def test_unmeasured_blindness_never_becomes_a_verdict(self):
+        """«Не смог измерить» не превращается ни в приговор, ни в благополучие: пометки нет, а
+        эпизод при этом ПОСЧИТАН (см. кейс выше). Третий исход есть и у самих часов."""
+        for blind in ({"measured": False, "awake": None, "since": NOW, "why": "часов нет"},
+                      {"measured": False, "awake": 0.0, "since": NOW, "why": "первое наблюдение"},
+                      None, "мусор"):
+            f = dict(facts(ok=False), queue_blind=blind)
+            self.assertEqual(ex.verdict(f), [], repr(blind))
+
+    def test_the_hands_count_the_episode_even_without_an_awake_clock(self):
+        """Часов бодрствования нет → длину не измерить, но ФАКТ слепоты обязан быть посчитан."""
+        st = {}
+        got = run_mod.update_queue_blind(st, {"ok": False, "err": "мост молчит"}, None, NOW)
+        self.assertEqual((got["measured"], got["episodes"], got["misses"]), (False, 1, 1))
+        self.assertEqual(st["qblind"]["episodes"], 1)
+
+    # ── п.3: у порога есть ЗАПИСЬ ЗАМЕРА и поведение при её протухании ────────────────────────
+    def test_the_delay_is_measured_not_round_and_carries_its_measurement(self):
+        self.assertAlmostEqual(ex.config({})["qblind"], 3648.0)
+        for round_guess in (1800.0, 3600.0, 5400.0, 7200.0):
+            self.assertNotAlmostEqual(ex.config({})["qblind"], round_guess)
+        m = ex.QBLIND_MEASURE
+        for field in ("at", "log", "episodes", "median", "max", "tick"):
+            self.assertIn(field, m)
+        # ЧИСЛО ОБЯЗАНО БЫТЬ ВЫВЕДЕНО ИЗ ЗАМЕРА, А НЕ СТОЯТЬ РЯДОМ С НИМ: максимум замкнутого
+        # эпизода плюс один собственный оборот наблюдателя.
+        self.assertAlmostEqual(ex.config({})["qblind"], m["max"] + m["tick"])
+        self.assertGreater(m["max"], m["median"], "замер обязан нести и разброс")
+
+    def test_a_stale_measurement_shouts_in_words_and_does_not_move_the_threshold(self):
+        """ПОВЕДЕНИЕ ПРИ ПРОТУХШЕМ ЗАМЕРЕ: порог сам не меняется ни на секунду, а возраст
+        основания едет СЛОВАМИ в той же заметке. Тихо подкрученное число хуже старого."""
+        base = ex.qblind_measure_age(NOW)
+        self.assertIsNotNone(base)
+        fresh = NOW + 86400.0 * 5
+        stale = NOW + 86400.0 * (ex.QBLIND_STALE_DAYS + 400)
+        self.assertFalse(ex.qblind_measure_stale(fresh))
+        self.assertTrue(ex.qblind_measure_stale(stale))
+        blind = {"measured": True, "awake": 9999.0, "since": NOW, "why": "мост молчит",
+                 "episodes": 1, "misses": 2}
+        say = {}
+        for name, when in (("fresh", fresh), ("stale", stale)):
+            f = dict(facts(ok=False, now=when), queue_blind=blind)
+            v = ex.verdict(f)[0]
+            say[name] = ex.render(v)
+            self.assertAlmostEqual(v["limit"], 3648.0, msg="порог не смеет двигаться сам")
+        self.assertIn("ПЕРЕСНИМИ", say["stale"])
+        self.assertNotIn("ПЕРЕСНИМИ", say["fresh"])
+        self.assertIn(ex.QBLIND_MEASURE["at"], say["fresh"])
+
+    def test_the_watchman_names_its_own_border_out_loud(self):
+        """Границу прибора называет САМ прибор, а не только артефакт: в докстринге ветки сказано,
+        чего она НЕ наблюдает. Без этого «молчит» и «не смотрит» снова станут одним словом."""
+        doc = ex._o1_blind.__doc__ or ""
+        for must in ("НЕ НАБЛЮДАЕТ", "ПОЧЕМУ молчит мост", "СОБСТВЕННУЮ СМЕРТЬ"):
+            self.assertIn(must, doc)
+
+
 if __name__ == "__main__":
     unittest.main()
