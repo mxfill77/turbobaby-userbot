@@ -194,7 +194,11 @@ def closed_since(snapshot, since):
         if since is not None and (at is None or at < float(since)):
             continue
         rows.append({"id": item.get("id") or tid, "at": at, "outcome": item.get("outcome"),
-                     "goal": item.get("goal") or "", "why": item.get("why") or ""})
+                     "goal": item.get("goal") or "", "why": item.get("why") or "",
+                     # ВИНОВНИК НЕИЗВЕСТНОСТИ ЕДЕТ С РЯДА, а не вычисляется здесь: считающий слой
+                     # чист и различитель спросить не может. Нет поля → `None`, и счёт отнесёт
+                     # ряд к судье, то есть к прежнему поведению.
+                     "by": item.get("by")})
     return sorted(rows, key=lambda r: (r.get("at") is None, r.get("at") or 0))
 
 

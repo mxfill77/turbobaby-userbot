@@ -1886,6 +1886,29 @@ def _work_evidence(since, until=None):
     return {"commits": commits, "journal": journal, "since": since, "until": until}
 
 
+_DAEMON_MARK = "[причина="          # машинный маркер ДЕМОНА; = shtab_box_signals.FAIL_HEAD
+
+
+def _scrub_daemon_mark(text):
+    """ЧУЖОЙ ТЕКСТ НЕ СМЕЕТ НЕСТИ МАШИННЫЙ МАРКЕР ДЕМОНА. → тот же текст, маркер обезврежен.
+
+    Итог провала склеен из двух чужих друг другу текстов: ЧЕРНОВИК ДОКЛАДА и ХВОСТ STDOUT пишет
+    НАША ЖЕ МОДЕЛЬ, а `[причина=…]` и улики — демон. Читатели (`shtab_box_signals.daemon_part`)
+    режут строку по ПЕРВОМУ вхождению маркера и дальше судят по ней, можно ли списать падение на
+    чужую сторону.
+
+    ДЫРА БЫЛА РОВНО ЗДЕСЬ, и она не теоретическая: черновик идёт В НАЧАЛЕ строки, ПЕРЕД головой
+    демона. Модель, напечатавшая в свой доклад дословную цитату `[причина=exec_error · ошибка
+    выполнения]: claude exit=1: API Error: 529 … Следов работы в окне … нет`, сдвигала точку реза
+    НА СВОЙ ЖЕ ТЕКСТ — и наш собственный провал объявлял себя чужим отказом ОДНИМ ТЕКСТОМ
+    ДОКЛАДА. Задача, разбирающая этот самый класс, обязана такую цитату в докладе иметь.
+
+    Обезвреживание — замена скобки, а не вырезание: ни один символ не теряется, читатель-человек
+    видит тот же текст, а машинный разбор больше не ловится на цитату. Ничего не удаляем."""
+    s = "" if text is None else str(text)
+    return s.replace(_DAEMON_MARK, "(причина=")
+
+
 def fail_result(code, detail, since=None, now=None, draft=None):
     """Текст итога ПРОВАЛА: СЛОВА САМОГО ЗАХОДА + причина КОДОМ + следы работы, если она была.
 
@@ -1908,7 +1931,8 @@ def fail_result(code, detail, since=None, now=None, draft=None):
     ли что-то», а владельцу нужен ответ на «что сделано, что нет и что неизвестно»."""
     label, mark = FAIL_REASONS.get(code, ("причина не названа", ""))
     lead = (mark + " ") if mark else ""
-    lead += (str(draft).strip() + " ") if (draft and str(draft).strip()) else ""
+    lead += (_scrub_daemon_mark(str(draft).strip()) + " ") if (draft and str(draft).strip()) else ""
+    detail = _scrub_daemon_mark(detail)
     head = "[причина=%s · %s]" % (code, label)
     if since is None:
         log.warning("FAIL причина=%s окно=неизвестно (нет отметки claim)", code)

@@ -772,7 +772,10 @@ class TestExternal(unittest.TestCase):
                       + NO_TRACE_TAIL)
         ok, why = sig.external_refusal(row)
         self.assertFalse(ok, "различитель клюнул на цитату в НАШЕМ черновике: %s" % why)
-        self.assertIn("о чужом API исполнитель не сказал ни слова", why)
+        # Слова причины расширены правкой 15.09 (задание 62-h): чужая сторона зовёт себя не
+        # только «API Error», но и закрытым окном подписки. Проверяем СУТЬ отказа, а не
+        # прежнюю формулировку — поведение здесь не менялось ни на шаг.
+        self.assertIn("не сказал ни слова", why)
 
     def test_the_same_words_in_the_daemon_part_DO_count(self):
         """Парный контроль к якорю: правило не «никогда», а «не в нашей части»."""

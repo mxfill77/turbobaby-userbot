@@ -155,6 +155,10 @@ GOAL_MAX = 78                 # цель строки очереди в одну
 # ЗАИМСТВОВАН, а не импортирован — та же идиома, что у имён полей реестра выше, и
 # равенство сторожит тест.
 OUT_UNKNOWN = "unknown"
+# Виновник неизвестности — ЗАИМСТВОВАННЫЙ литерал (= `queue_snapshot_pc.UNKNOWN_BY_EXT`), а не
+# импорт: слой чистый и диска не касается. Равенство сторожит тест, а не эта строка. Поля на ряду
+# нет (старое состояние на диске) → виновником считается судья, то есть прежнее поведение.
+UNKNOWN_BY_EXT = "чужая сторона"
 
 # ДОЛЯ НЕИЗВЕСТНОГО, ВЫШЕ КОТОРОЙ ЭТО ТРЕВОГА ПРО СУДЬЮ. Пятая часть — число
 # Штаба (решение 11.09.2026, п. 3), а не замер: оно назначено вместе с самим
@@ -920,10 +924,12 @@ def series(rows, target=SERIES_TARGET, judged=None):
         taken.append(row)
     window = taken[-int(target):] if target else taken
     tally = {JUDGE_PROVED: 0, JUDGE_BLIND: 0, JUDGE_UNPROVED: 0, JUDGE_SILENT: 0}
-    unknown = 0
+    unknown, unknown_ext = 0, 0
     for row in window:
         if is_unknown(row):
             unknown += 1
+            if (row or {}).get("by") == UNKNOWN_BY_EXT:
+                unknown_ext += 1
             continue
         if is_closed_done((row or {}).get("outcome")):
             tally[judged_of((row or {}).get("id"), judged,
@@ -940,6 +946,7 @@ def series(rows, target=SERIES_TARGET, judged=None):
     return {"target": int(target), "streak": streak, "moved": moved,
             "window": len(window), "service": service, "seen": len(taken),
             "unknown": unknown, "denom": len(window) - unknown,
+            "unknown_ext": unknown_ext, "unknown_judge": unknown - unknown_ext,
             "alarm": unknown * UNKNOWN_ALARM_DEN > len(window) * UNKNOWN_ALARM_NUM,
             "proved": tally[JUDGE_PROVED], "blind": tally[JUDGE_BLIND],
             "unproved": tally[JUDGE_UNPROVED], "unjudged": tally[JUDGE_SILENT]}
@@ -1008,8 +1015,21 @@ def unknown_words(counted):
     unknown = got.get("unknown", 0) if got else "?"
     window = got.get("window", 0) if got else "?"
     words = "НЕИЗВЕСТНО %s из %s" % (unknown, window)
+    # ДВА ВИНОВНИКА НАЗЫВАЮТСЯ ВСЛУХ И ВСЕГДА, как и само число. Без разреза владелец читает одну
+    # цифру и идёт чинить СУДЬЮ там, где надо ПЕРЕЖДАТЬ ЧУЖОЙ КАНАЛ, — а это две разные работы.
+    if got:
+        words += " (судья %s · чужая сторона %s)" % (got.get("unknown_judge", 0),
+                                                     got.get("unknown_ext", 0))
     if not got.get("alarm"):
         return words
+    # АДРЕСАТ ТРЕВОГИ ВЫБИРАЕТСЯ БОЛЬШИНСТВОМ ВИНОВНИКА, а не жребием: тревога звучит одинаково
+    # громко, но зовёт разное. Чужая сторона большинством → это ТРЕВОГА ПРО КАНАЛ (решение Штаба
+    # 15.09.2026, п. 3): прибор исправен, продукта не было вовсе, и чинить в полосе нечего.
+    ext = got.get("unknown_ext", 0) or 0
+    if ext * 2 >= (got.get("unknown", 0) or 0):
+        return ("%s: %s — доля выше %d/%d, и это ТРЕВОГА ПРО КАНАЛ, а не про работу "
+                "(чужая сторона отказывала, продукта не было вовсе)"
+                % (MARK[RED], words, UNKNOWN_ALARM_NUM, UNKNOWN_ALARM_DEN))
     return ("%s: %s — доля выше %d/%d, и это ТРЕВОГА ПРО СУДЬЮ, а не про работу "
             "(продукт не прочитан, а не не сделан)"
             % (MARK[RED], words, UNKNOWN_ALARM_NUM, UNKNOWN_ALARM_DEN))
