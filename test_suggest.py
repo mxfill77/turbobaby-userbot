@@ -6902,7 +6902,15 @@ class TestRunLiveSmoke(unittest.TestCase):
     # откуда взялось прежнее 307/1535, и нужен, если владелец вернёт файл источником.
     # ЭТОТ НАБОР БЫЛ КРАСЕН И ДО ПРАВКИ 12.09 (5 тестов, зафиксировано в
     # tmp/pc_report/baseline_fails.txt от 06.09) — правка его красноту не создавала.
-    J_RULE_LINE = "2400 ฿ за 5 дней (Скидка за срок 15%, 480 ฿ в день); депозит 3000 ฿"
+    #
+    # ХВОСТ «; свободен на эти даты» ВЕРНУЛСЯ 15.09.2026 вместе с носителем подтверждения наличия
+    # (остаток 2 артефакта ДВЕРЬ-dovodka-derevo-1309). Это НЕ новая деталь ожидания, а возврат к
+    # прежнему: до 13.09 канон этого набора кончался ровно этими словами — `git show 3d3704b`,
+    # «307 ฿/день; итого 1535 ฿; депозит 3000 ฿; свободен на эти даты». Носитель печатается ТОЛЬКО
+    # под `available` из ответа двери (`suggest._avail_code_suffix`), и мок этого набора отдаёт
+    # `available: True` — значит хвост здесь ОБЯЗАН быть; занятость/молчание двери его не дают.
+    J_RULE_LINE = ("2400 ฿ за 5 дней (Скидка за срок 15%, 480 ฿ в день); депозит 3000 ฿; "
+                   "свободен на эти даты")
 
     def setUp(self):
         self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
@@ -7023,26 +7031,28 @@ class TestRunLiveSmoke(unittest.TestCase):
         # строки цены, падавшим раньше него. Проверка не снята и не ослаблена — она стала точной.
         av_fact = next(c["fact"] for c in r["checks"] if c["name"] == "нет утверждений о наличии")
         self.assertIn("Успевайте", av_fact)                      # красит дефицит…
-        # ПЕРЕВЁРНУТО 13.09.2026, И ЭТО ЗАПИСЬ ОБ ОСТАТКЕ, А НЕ О ПОБЕДЕ — читать её надо так.
-        # Прежде здесь стояло `assertNotIn("свободен")`: с 23.08 клейм наличия, ПОДТВЕРЖДЁННЫЙ
-        # данными Bridge, нарушением быть перестал. Носитель у подтверждения ровно ОДИН и
-        # дословный — фраза `suggest._AVAIL_CODE_PHRASE` в ЦЕНОВОЙ ЗАПИСКЕ, которую печатал
-        # `_client_price` под `if q.get("available")` (`availability_from_note`, замер 23.08 на
-        # 84 живых черновиках). С решением ДВЕРЬ-ИСТОЧНИК-1209 записку на этом пути собирает не
-        # он: клиенту уходит ДОСЛОВНАЯ строка двери, и носитель пропал ПО ПОСТРОЕНИЮ — не сломан,
-        # а перестал печататься. Проверяющий снова видит `avail=None` и снова клеймит «свободен»,
-        # хотя дверь в этом же прогоне вернула `available=True`.
-        # НАПРАВЛЕНИЕ ОШИБКИ БЕЗОПАСНОЕ (fail-closed: клейм лишний, а не пропущенный), исход чека
-        # прежний — красный, — но ТОЧНОСТЬ диагностики потеряна, и это остаток, а не норма.
-        # Возврат носителя — правка ПРОДУКТА и уходит отдельным заданием; здесь остаток
-        # ЗАПИСАН, а не спрятан: два замка ниже пришпиливают ПРИЧИНУ, а не симптом, и покраснеют
-        # в тот день, когда носитель вернут, — то есть сами позовут переписать эти строки назад.
-        self.assertIn("свободен", av_fact)
+        # ПЕРЕПИСАНО НАЗАД 15.09.2026 — НОСИТЕЛЬ ВЕРНУЛСЯ, И ЗАМОК ВЕРНУЛСЯ НА ПРЕЖНИЙ ПРЕДМЕТ.
+        # 13.09 здесь стояло `assertIn("свободен", av_fact)` — запись ОБ ОСТАТКЕ, а не о победе:
+        # с решением ДВЕРЬ-ИСТОЧНИК-1209 записку на этом пути собирал не `_client_price`, носитель
+        # пропал ПО ПОСТРОЕНИЮ, и проверяющий клеймил ПОДТВЕРЖДЁННОЕ наличие лишним клеймом
+        # (fail-closed, исход чека прежний, но точность диагностики потеряна). Тот замок был
+        # пришпилен к ПРИЧИНЕ и сам позвал переписать эти строки, когда носитель вернут.
+        # ПРЕДМЕТ ЗАМКА — ТОТ ЖЕ, ЧТО ДО 13.09, БУКВА В БУКВУ: «клейм наличия, ПОДТВЕРЖДЁННЫЙ
+        # данными Bridge, нарушением НЕ является» (`_av_unsupported`: avail_pos законен при
+        # state is True). Ослабления нет — из красного не сделано зелёное: чек «нет утверждений о
+        # наличии» ОСТАЁТСЯ КРАСНЫМ (assertFalse выше), красит его дефицит «Успевайте», у которого
+        # источника данных нет вовсе. Изменился не исход, а ТОЧНОСТЬ: в факте чека больше нет
+        # лишнего слова «свободен».
+        self.assertNotIn("свободен", av_fact)                    # …а подтверждённое наличие — НЕ красит
         client = suggest.client_facing_text(r["draft"])
-        self.assertNotIn(suggest._AVAIL_CODE_PHRASE, client)     # носителя в тексте правда нет…
+        self.assertIn(suggest._AVAIL_CODE_PHRASE, client)        # носитель в тексте ЕСТЬ…
         self.assertIs(self._getter()({"action": "quote_price", "bike": self.FLEET[0],
                                       "date_start": "2026-08-06", "date_end": "2026-08-11"}
-                                     )["data"]["available"], True)   # …хотя дверь сказала «да»
+                                     )["data"]["available"], True)   # …и дверь сказала «да»
+        # И это НЕ замок на пустом месте: «свободен и в наличии» в черновике ЕСТЬ (см. `bad`), то
+        # есть клеймить было ЧТО. Отсутствие слова в факте чека доказывает, что проверяющий получил
+        # `avail=True` носителем, а не что клейма не было.
+        self.assertIn("свободен", client)
         self.assertFalse(by["депозит без противоречий"])         # 3000 vs 5000
         self.assertIn("ОЖИДАНИЕ/ФАКТ", r["card"])                # карточка с диффом
         self.assertIn("нет годов", r["card"])
@@ -7236,6 +7246,175 @@ class TestMinQuoteAvailCarrier(unittest.TestCase):
             for available in (True, False):
                 with self.subTest(дней=days, свободен=available):
                     self.assertFalse(self._avail_check(days, available, draft)["ok"])
+
+
+class TestDoorPathAvailCarrier(unittest.TestCase):
+    """ПУТЬ ЖИВОЙ ДВЕРИ: носитель подтверждённого наличия обязан ехать в ЦЕНОВОЙ ЗАПИСКЕ (возврат
+    15.09.2026, остаток 2 артефакта ДВЕРЬ-dovodka-derevo-1309).
+
+    ЖИВОЙ ПРОВАЛ, которым этот набор рождён. С решением ДВЕРЬ-ИСТОЧНИК-1209 (12.09) дословная
+    строка столбца J двери больше не снимается, и обе J-ветки печати цены (`_client_price`,
+    `_quote_j_line`) возвращали её РАНЬШЕ дописки носителя. Замер 15.09 ДО правки: записка на пути
+    двери 717 симв., фразы `_AVAIL_CODE_PHRASE` в ней НЕТ, `availability_from_note` → None — хотя
+    дверь в том же прогоне вернула `available=True`. Проверяющий клеймил ПОДТВЕРЖДЁННОЕ наличие
+    лишним клеймом (fail-closed: клейм лишний, а не пропущенный, — но диагностика неточна).
+    ПОСЛЕ правки: 739 симв., фраза есть, `availability_from_note` → True.
+
+    ОТЛИЧИЕ ОТ `TestMinQuoteAvailCarrier`: там мост отдаёт котировку БЕЗ поля `text` (ветка
+    СБОРКИ — путь до 12.09), здесь — С дословной строкой столбца J, как отвечает ЖИВАЯ дверь
+    сегодня. Ровно эта разница и уронила носитель, поэтому соседний набор оставался зелёным.
+
+    ОБА КОНЦА ЗАМКА. Дверь сказала «доступно» → носитель в записке ОБЯЗАН быть. Дверь сказала «не
+    доступно» либо промолчала про наличие → носителя быть НЕ должно, и проверяющий обязан увидеть
+    клейм. Мок — живой формат прода (правило-класс CLAUDE.md); боевых файлов набор не касается."""
+
+    FLEET = ["NMAX 155CC BLACK PHUKET 4255"]
+    TODAY = datetime.date(2026, 9, 1)
+    MAPS = "https://www.google.com/maps/place/Rawai+Beach/@7.771,98.327,15z"
+    # ВХОД МОКА: дословная строка столбца J живой двери (депозит словами внутри строки).
+    J_LINE = "2400 ฿ за 5 дней (Скидка за срок 15%, 480 ฿ в день); депозит 3000 ฿"
+    # Черновик повторяет фразу КОДА — то же, что делает голова, увидев записку.
+    DRAFT = ("Здравствуйте! NMAX 155 — " + J_LINE + "; свободен на эти даты.\n"
+             "Доставка в Раваи — 590 ฿. Бронируем?")
+    CHECK = "нет утверждений о наличии"
+
+    def setUp(self):
+        self._save = (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+                      suggest.pricing.BRIDGE_TOKEN)
+        suggest.pricing.PRICING_ACTION = "quote_price"
+        suggest.pricing.BRIDGE_URL = "https://x"
+        suggest.pricing.BRIDGE_TOKEN = "t"
+        suggest.pricing._FLEET_CACHE["data"] = None
+        suggest.pricing._FLEET_CACHE["ts"] = 0
+
+    def tearDown(self):
+        (suggest.pricing.PRICING_ACTION, suggest.pricing.BRIDGE_URL,
+         suggest.pricing.BRIDGE_TOKEN) = self._save
+        suggest.pricing._FLEET_CACHE["data"] = None
+
+    # ТРИ ОТВЕТА ДВЕРИ ПРО НАЛИЧИЕ: сказала «да», сказала «нет», не сказала ничего. Третий — НЕ
+    # синоним второго: «неизвестно» и «занято» здесь разные исходы, и записка обязана молчать в
+    # обоих (fail-closed), а не выдавать одно за другое.
+    SAID_YES, SAID_NO, SAID_NOTHING = "да", "нет", "молчит"
+
+    def _q(self, said):
+        """Котировка в ЖИВОМ формате двери: с дословным `text` столбца J."""
+        q = {"day_price": 480, "total": 2400, "deposit": 3000, "days": 5,
+             "cap_active": False, "cap_price": 0, "text": self.J_LINE}
+        if said == self.SAID_YES:
+            q["available"] = True
+        elif said == self.SAID_NO:
+            q["available"] = False
+        return q                                      # SAID_NOTHING → ключа нет вовсе
+
+    def _getter(self, said):
+        def fake(params):
+            if params.get("action") == "fleet":
+                return {"ok": True, "data": {"bikes": [{"name": n} for n in self.FLEET]}}
+            ds, de = params.get("date_start"), params.get("date_end")
+            days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
+            data = dict(self._q(said), days=days)
+            return {"ok": True, "data": data}
+        return fake
+
+    def _resolve(self):
+        with open(os.path.join(suggest.BASE_DIR, "fixtures",
+                               "delivery_zones_get.live.json"), encoding="utf-8") as f:
+            zones = json.load(f)["zones"]
+        return lambda text: suggest.delivery.resolve_delivery(7.771, 98.327, zones)
+
+    def _probe(self):
+        ds = datetime.date(2026, 10, 6)
+        return {"model": "NMAX 155", "iso_start": ds.isoformat(),
+                "iso_end": (ds + datetime.timedelta(days=5)).isoformat(),
+                "maps_link": self.MAPS, "lang": "ru", "zone": "Раваи", "zone_price": 590}
+
+    def _note(self, said):
+        p = self._probe()
+        transcript = "\n".join("[клиент]: " + ln for ln in suggest._smoke_client_lines(p))
+        hints = suggest.extract_booking_hints(transcript, today=self.TODAY)
+        g = self._getter(said)
+        return suggest._with_delivery_resolver(
+            self._resolve(),
+            lambda: suggest.build_pricing_note(hints, lang="ru", getter=g, today=self.TODAY))
+
+    def _exp(self, said):
+        p = self._probe()
+        transcript = "\n".join("[клиент]: " + ln for ln in suggest._smoke_client_lines(p))
+        return suggest._smoke_expectations(transcript, p, self._getter(said),
+                                           self._resolve(), self.TODAY)
+
+    def _avail_check(self, said, draft=None):
+        checks = suggest._smoke_checks(draft if draft is not None else self.DRAFT,
+                                       self._exp(said))
+        return [c for c in checks if c["name"] == self.CHECK][0]
+
+    def test_premise_door_answer_carries_verbatim_j_text(self):
+        """ПОСЫЛКА набора, замком: дверь отвечает С дословным `text`, и он доезжает до записки —
+        иначе этот набор мерил бы не тот путь (ветку сборки) и был бы зелёным ни о чём."""
+        note = self._note(self.SAID_YES)
+        self.assertIn(self.J_LINE, note)                        # строка двери в записке ДОСЛОВНА
+        self.assertIsNotNone(suggest._quote_block_from_note(note))   # это маркерный режим `ok`
+
+    def test_door_said_yes_carrier_is_in_the_note(self):
+        """КОНЕЦ ПЕРВЫЙ: дверь сказала «доступно» → носитель в записке ЕСТЬ и читается как True."""
+        note = self._note(self.SAID_YES)
+        self.assertIn(suggest._AVAIL_CODE_PHRASE, note)
+        self.assertIs(suggest.availability_from_note(note), True)
+        self.assertIs(self._exp(self.SAID_YES)["avail"], True)
+
+    def test_door_said_no_or_nothing_has_no_carrier(self):
+        """КОНЕЦ ВТОРОЙ: дверь сказала «не доступно» ЛИБО промолчала → носителя в записке НЕТ, и
+        читается это как «данных нет» (None), а не как False: занятость запиской не переносится."""
+        for said in (self.SAID_NO, self.SAID_NOTHING):
+            with self.subTest(дверь=said):
+                note = self._note(said)
+                self.assertNotIn(suggest._AVAIL_CODE_PHRASE, note)
+                self.assertIsNone(suggest.availability_from_note(note))
+                self.assertIsNone(self._exp(said)["avail"])
+
+    def test_checker_sees_both_ends(self):
+        """ПРОВЕРЯЮЩИЙ ОБЯЗАН УВИДЕТЬ ОБА КОНЦА на ОДНОМ И ТОМ ЖЕ черновике: дверь сказала «да» —
+        клейм наличия ЗАКОНЕН (чек зелёный); сказала «нет» или промолчала — клейм НЕ подтверждён
+        (чек красный, и слово «свободен» стои́т в факте). Это и есть замок от подкрутки ради
+        зелёного: текст бота не менялся между концами, менялся только ответ двери."""
+        self.assertTrue(self._avail_check(self.SAID_YES)["ok"])
+        for said in (self.SAID_NO, self.SAID_NOTHING):
+            with self.subTest(дверь=said):
+                c = self._avail_check(said)
+                self.assertFalse(c["ok"], c)
+                self.assertIn("свободен", c["fact"])
+
+    def test_printing_point_prints_iff_door_said_yes(self):
+        """ТОЧКА ПЕЧАТИ, обе J-ветки: носитель дописывается ТОГДА И ТОЛЬКО ТОГДА, когда доступность
+        пришла ответом двери. «Не доступно» и «промолчала» дают ОДИНАКОВОЕ молчание — оно законно.
+        Замок стои́т на обеих ветках: `_client_price` (клиентская фраза) и `_quote_j_line`
+        (служебный quote-блок, ИМЕННО он едет в записку в маркерном режиме)."""
+        for said, want in ((self.SAID_YES, True), (self.SAID_NO, False),
+                           (self.SAID_NOTHING, False)):
+            with self.subTest(дверь=said):
+                q = self._q(said)
+                phrase = suggest._client_price(q)
+                self.assertEqual(suggest._AVAIL_CODE_PHRASE in phrase, want, phrase)
+                block = suggest._quote_j_line(q, phrase)
+                self.assertEqual(suggest._AVAIL_CODE_PHRASE in block, want, block)
+                self.assertIn(self.J_LINE, block)        # строка двери цела в обоих исходах
+
+    def test_carrier_is_not_duplicated(self):
+        """Дверь САМА произнесла эти слова в своём `text` → второй раз их не дописываем (тот же
+        инвариант, что у депозита #253): носитель ОДИН, иначе клиент читает фразу дважды."""
+        q = dict(self._q(self.SAID_YES), text=self.J_LINE + "; " + suggest._AVAIL_CODE_PHRASE)
+        phrase = suggest._client_price(q)
+        self.assertEqual(phrase.count(suggest._AVAIL_CODE_PHRASE), 1, phrase)
+        self.assertEqual(suggest._quote_j_line(q, phrase).count(suggest._AVAIL_CODE_PHRASE), 1)
+
+    def test_scarcity_still_red_on_both_ends(self):
+        """Носитель судит ТОЛЬКО наличие: дефицит источника данных не имеет и краснит при ЛЮБОМ
+        ответе двери — возврат носителя ослаблением проверяющего не является."""
+        draft = "Остался последний NMAX 155, успевайте забронировать!"
+        for said in (self.SAID_YES, self.SAID_NO, self.SAID_NOTHING):
+            with self.subTest(дверь=said):
+                self.assertFalse(self._avail_check(said, draft)["ok"])
 
 
 class TestPastStartDateGate(unittest.TestCase):

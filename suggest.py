@@ -3737,19 +3737,46 @@ def _cap_applies(q) -> bool:
         return True
 
 
+def _avail_code_suffix(q, phrase: str) -> str:
+    """ЕДИНСТВЕННОЕ МЕСТО, дописывающее к строке цены НОСИТЕЛЬ подтверждённого наличия.
+
+    Фраза `_AVAIL_CODE_PHRASE` («свободен на эти даты») — единственный дословный носитель, которым
+    ФАКТ наличия из ответа Bridge переходит границу «печать → проверяющий» (читает его
+    `availability_from_note`, и только из ЦЕНОВОЙ ЗАПИСКИ). Печатается ТОГДА И ТОЛЬКО ТОГДА, когда
+    доступность пришла ответом двери: `q["available"]` истинно. Неизвестна или занято → носителя
+    нет, и молчание здесь ЗАКОННО — fail-closed: «нет фразы» читается как «данных нет», а не как
+    «занят» (False запиской не переносится вовсе).
+
+    ЗАЧЕМ ОТДЕЛЬНАЯ ФУНКЦИЯ (возврат 15.09.2026, остаток 2 артефакта ДВЕРЬ-dovodka-derevo-1309).
+    До 12.09 носитель печатался в ветке СБОРКИ `_client_price` (`price_source.reprice` снимал
+    дословный текст столбца J, и сборка была единственным путём). С решением ДВЕРЬ-ИСТОЧНИК-1209
+    текст двери больше не снимается, обе J-ветки (`_client_price` и `_quote_j_line`) возвращают
+    его РАНЬШЕ дописки — и носитель пропал ПО ПОСТРОЕНИЮ: не сломан, а перестал печататься. Замер
+    13.09→15.09 на пути живой двери: записка 717 симв., фразы нет, `availability_from_note` → None
+    при `available=True` в том же прогоне; проверяющий клеймил ПОДТВЕРЖДЁННОЕ наличие лишним
+    клеймом (безопасно — fail-closed, но неточно). Правило собрано в одну функцию, чтобы третья
+    ветка печати цены не разошлась с двумя первыми молча, как разошлись эти.
+    """
+    if not isinstance(q, dict) or not q.get("available"):
+        return phrase
+    if _AVAIL_CODE_PHRASE in phrase:           # уже несёт (не дублируем — как и депозит)
+        return phrase
+    return (phrase.rstrip() + "; " + _AVAIL_CODE_PHRASE) if phrase.strip() else _AVAIL_CODE_PHRASE
+
+
 def _client_price(q: dict) -> str:
     """Фраза ЦЕНЫ клиенту из quote. Правила цен v2, п.1 и п.5:
     кап (низкий сезон, срок от месяца, total>cap_price) → «аренда от <cap> ฿/мес …» вместо J-цены
     (+депозит/наличие) — предикат один на все четыре точки, см. _cap_applies;
-    иначе — поле text из quote ДОСЛОВНО (цена J); иначе — сборка из day_price/total/deposit."""
+    иначе — поле text из quote ДОСЛОВНО (цена J); иначе — сборка из day_price/total/deposit.
+    Носитель подтверждённого наличия дописывается ВСЕМ трём веткам одним правилом —
+    `_avail_code_suffix` (см. его про возврат 15.09.2026)."""
     cap_price = q.get("cap_price")
     if _cap_applies(q):
         parts = [f"аренда от {cap_price} ฿/мес — предложение низкого сезона"]
         if q.get("deposit") is not None:
             parts.append(f"депозит {q['deposit']} ฿")
-        if q.get("available"):
-            parts.append("свободен на эти даты")
-        return "; ".join(parts)
+        return _avail_code_suffix(q, "; ".join(parts))
     if isinstance(q.get("text"), str) and q["text"].strip():
         phrase = q["text"].strip()             # J-цена дословно (п.5)
         # шаг 2/7 #253: депозит модели ОБЯЗАН быть в котировке (клиент назвал модель+срок → его
@@ -3758,7 +3785,7 @@ def _client_price(q: dict) -> str:
         dep = q.get("deposit")
         if dep is not None and str(dep) not in phrase:
             phrase += f"; депозит {dep} ฿"
-        return phrase
+        return _avail_code_suffix(q, phrase)
     parts = []
     if q.get("day_price") is not None:
         parts.append(f"{q['day_price']} ฿/день")
@@ -3766,9 +3793,7 @@ def _client_price(q: dict) -> str:
         parts.append(f"итого {q['total']} ฿")
     if q.get("deposit") is not None:
         parts.append(f"депозит {q['deposit']} ฿")
-    if q.get("available"):
-        parts.append("свободен на эти даты")
-    return "; ".join(parts)
+    return _avail_code_suffix(q, "; ".join(parts))
 
 
 def _quote_j_line(q, phrase, passport_dep=False) -> str:
@@ -3792,7 +3817,11 @@ def _quote_j_line(q, phrase, passport_dep=False) -> str:
         dep = q.get("deposit")                 # депозит из поля quote, если J его не несёт (#253)
         if dep is not None and str(dep) not in phrase_j:
             phrase_j += f"; депозит {dep} ฿"
-        return phrase_j
+        # НОСИТЕЛЬ НАЛИЧИЯ — третий инвариант клиентской фразы, обязанный доехать в хвост (возврат
+        # 15.09.2026). На пути ЖИВОЙ ДВЕРИ маркерный режим (kind=='ok') кладёт в записку ИМЕННО эту
+        # строку, а не phrase: не допиши её здесь — и носитель не доедет до проверяющего ни одной
+        # веткой, сколько ни печатай его `_client_price`. Правило одно на все точки печати.
+        return _avail_code_suffix(q, phrase_j)
     return phrase
 
 
@@ -7862,10 +7891,13 @@ def availability_state(avail):
     return None
 
 
-# ДОСЛОВНАЯ фраза, которой КОД подтверждает наличие. Печатает её `_client_price` и РОВНО под
-# `if q.get("available")` — обе точки (:3458 и :3477), другого источника у неё нет. Литерал держим
-# рядом с читателем и сверяем тестом: разойдётся печать и чтение — гард начнёт звать правду
-# выдумкой, а это ровно тот дефект, из-за которого 23.08 покраснел кейс 10.
+# ДОСЛОВНАЯ фраза, которой КОД подтверждает наличие. Печатает её РОВНО ОДНА функция —
+# `_avail_code_suffix` — и РОВНО под `q.get("available")`; её зовут обе J-ветки (`_client_price`,
+# `_quote_j_line`) и ветка сборки, другого источника у фразы нет. Литерал держим рядом с читателем
+# и сверяем тестом: разойдётся печать и чтение — гард начнёт звать правду выдумкой, а это ровно тот
+# дефект, из-за которого 23.08 покраснел кейс 10.
+# ДО 15.09.2026 точек печати было две (:3458/:3477) и обе — в `_client_price`; на пути живой двери
+# записку собирает НЕ он, поэтому носитель туда не доезжал вовсе (возврат — см. _avail_code_suffix).
 _AVAIL_CODE_PHRASE = "свободен на эти даты"
 
 
