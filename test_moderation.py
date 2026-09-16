@@ -284,8 +284,16 @@ class TestEndToEndMax2stix(unittest.TestCase):
     # Живой парк @max2stix: 2 старых XMAX (дешевле, деп 5000) + 1 новый 2023+ (дороже, деп 7000).
     FLEET_NAMES = ["XMAX 300CC GREY PHUKET 4246", "XMAX 300CC BLUE PHUKET 4247",
                    "XMAX 300CC NEW 2023 PHUKET 7701"]
-    OLD = (790, 4700, 23700, 5000, True, 8900)     # старое поколение: тариф, депозит, кап
-    NEW = (939, 5600, 28170, 7000, True, 9900)     # новое поколение (2023+): дороже, деп 7000
+    # ЧИСЛА ДВЕРИ — ЖИВОЙ ЗАМЕР, А НЕ СИНТЕТИКА (поправка 16.09.2026, задание 62-m).
+    # Суточная ставка, депозит и кап сняты ЖИВОЙ дверью `quote_price` на опорной корзине
+    # (проба 7 суток низкого сезона 2026-09-07..09-14, снято 26.08.2026, сверено 01.09.2026
+    # «до бата» на юнитах «XMAX 300CC NEW BLACK PHUKET 8969» и «XMAX 300CC BLUE PHUKET 5773»;
+    # адрес — `price_source.json` → `base.models` → XMAX 300, поля `source`/`owner_decision`).
+    # Депозит (7000/5000) и кап (9900/8900) стояли здесь живыми с самого начала — расходилась
+    # РОВНО суточная ставка: 939/790 придуманы 15.07.2026 вместе с голденом (9ca9473) и не
+    # совпадают ни с дверью, ни с файлом.
+    OLD = (557, 5000, True, 8900)     # старое поколение: ставка суток, депозит, кап
+    NEW = (662, 7000, True, 9900)     # новое поколение (2023+): дороже, деп 7000
 
     def setUp(self):
         self._wl = suggest.APPROVER_USERNAMES
@@ -316,11 +324,18 @@ class TestEndToEndMax2stix(unittest.TestCase):
             ds, de = params.get("date_start"), params.get("date_end")
             days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
             new = "2023" in bike or "NEW" in bike.upper()
-            d1, d7, d30, dep, ca, cp = self.NEW if new else self.OLD
-            total = {1: d1, 7: d7, 30: d30}.get(days, d1)
-            return {"ok": True, "data": {"day_price": round(total / max(days, 1)), "total": total,
+            day, dep, ca, cp = self.NEW if new else self.OLD
+            # СРОК СЧИТАЕТСЯ, А НЕ БЕРЁТСЯ ИЗ ТРЁХ КЛЕТОК. Прежняя таблица `{1: d1, 7: d7,
+            # 30: d30}.get(days, d1)` на ВОСЬМИ сутках ответа не имела и отдавала ОДНОДНЕВНЫЙ
+            # итог за весь срок: 939 ฿ за 8 суток, то есть 117 ฿/сут — число, которого не даёт
+            # ни дверь, ни файл (разбор 16.09.2026, задание 62-m). Голден просит 16-24 июля =
+            # 8 суток: это опорная корзина 7-14, где ступень срока ровно 1.000, а сезон P1
+            # (июнь-сентябрь) тоже 1.000 — значит ставка равна снятой дверью, а итог ей кратен.
+            total = day * max(days, 1)
+            # J-строка живого листа НЕСЁТ и суточную ставку («… в день»), см. suggest._quote_j_line.
+            return {"ok": True, "data": {"day_price": day, "total": total,
                     "deposit": dep, "available": True, "days": days, "cap_active": ca,
-                    "cap_price": cp, "text": f"{days} дн — {total} ฿"}}
+                    "cap_price": cp, "text": f"{days} дн — {total} ฿ ({day} ฿/день)"}}
         return fake
 
     _TODAY = datetime.date(2026, 7, 11)
