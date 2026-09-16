@@ -751,7 +751,7 @@ class TestExternal(unittest.TestCase):
         self.assertTrue(ok, why)
 
     # ── ОТРИЦАТЕЛЬНЫЕ: «наш провал выглядит как внешний» ─────────────────
-    def test_our_own_report_quoting_the_api_error_is_NOT_external(self):
+    def test_our_own_report_quoting_the_api_error_buys_nothing(self):
         """ГЛАВНЫЙ отрицательный: наш черновик цитирует чужой отказ ДОСЛОВНО.
 
         Задача про ЭТОТ САМЫЙ класс обязана процитировать в докладе и «API Error:
@@ -760,22 +760,31 @@ class TestExternal(unittest.TestCase):
         ``lead`` = маркер + черновик), поэтому поиск по строке целиком выдал бы
         нашему провалу бесплатный слот ЗА РАССКАЗ О БЕСПЛАТНЫХ СЛОТАХ.
 
-        Здесь совпадают ВСЕ прочие условия — код ``exec_error``, следов нет, —
-        и не спасает ничто, кроме якоря: слова о чужом API лежат в НАШЕЙ части.
+        ПЕРЕСМОТРЕН 17.09 (задание 62-p). До снятия словаря тест требовал «наше» на
+        ряде «claude exit=1: SyntaxError в нашем скрипте» без следов — и держался
+        этот ответ ТОЛЬКО на отсутствии слов «API Error» в части демона. Но ошибка
+        скрипта внутри захода — вывод инструмента, код возврата CLI она не ставит; в
+        переписи 62-p (22 ряда `exec_error` за 05.08–16.09) такой формы нет ни одной.
+        Суть теста — «цитата в черновике ничего не покупает» — проверяется теперь
+        прямо: ответ с цитатой РАВЕН ответу без неё, а на ветке без процессного
+        падения (rc = 0) цитата не даёт льготы вовсе.
         """
         ours = ("[черновик] СДЕЛАНО: разобран класс внешнего отказа. Живой пример — "
                 "«claude exit=1: API Error: 529 Overloaded», у него в итоге стои́т "
                 "«Следов работы в окне 03.09 13:31–13:36 UTC нет (коммитов 0, записей "
                 "журнала 0)». НЕ СДЕЛАНО: тест. ")
-        row = _closed(21, "failed", ours + "провал [причина=exec_error · ошибка выполнения]: "
-                                           "claude exit=1: SyntaxError в нашем скрипте. "
-                      + NO_TRACE_TAIL)
-        ok, why = sig.external_refusal(row)
-        self.assertFalse(ok, "различитель клюнул на цитату в НАШЕМ черновике: %s" % why)
-        # Слова причины расширены правкой 15.09 (задание 62-h): чужая сторона зовёт себя не
-        # только «API Error», но и закрытым окном подписки. Проверяем СУТЬ отказа, а не
-        # прежнюю формулировку — поведение здесь не менялось ни на шаг.
-        self.assertIn("не сказал ни слова", why)
+        daemon = ("провал [причина=exec_error · ошибка выполнения]: claude exit=1: нет вывода. "
+                  + NO_TRACE_TAIL)
+        with_quote = sig.external_refusal(_closed(21, "failed", ours + daemon))
+        without = sig.external_refusal(_closed(21, "failed", daemon))
+        self.assertEqual(without[0], with_quote[0], "цитата в черновике поменяла ответ")
+        self.assertNotIn("API Error", with_quote[1], "слова черновика протекли в причину")
+        rc_zero = sig.external_refusal(_closed(
+            21, "failed", ours + "провал [причина=exec_error · ошибка выполнения]: "
+                                 "insufficient_output: нет строки RESULT. " + NO_TRACE_TAIL))
+        self.assertFalse(rc_zero[0], "различитель клюнул на цитату в НАШЕМ черновике: %s"
+                         % rc_zero[1])
+        self.assertIn("процессного падения", rc_zero[1])
 
     def test_the_same_words_in_the_daemon_part_DO_count(self):
         """Парный контроль к якорю: правило не «никогда», а «не в нашей части»."""

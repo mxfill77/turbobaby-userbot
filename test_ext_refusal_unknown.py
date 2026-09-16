@@ -40,11 +40,35 @@ LIVE_101 = ("провал [причина=exec_error · ошибка выпол�
             "Overloaded. This is a server-side issue, usually temporary — try again in a "
             "moment. If it persists, check https://status.claude.com.. Следов работы в окне "
             "03.09 13:31–13:36 UTC нет (коммитов 0, записей журнала 0).")
-# Ряд #12, 03.09.2026 — НАШ провал под тем же кодом: чужой стороны не назвал никто.
-LIVE_12_OURS = ("провал [причина=exec_error · ошибка выполнения]: claude exit=1: нет вывода. "
-                "Следов работы в окне 02.09 21:59–21:59 UTC нет (коммитов 0, записей "
-                "журнала 0).")
+# Ряд #12, 03.09.2026. До 17.09 фикстура звалась «НАШ провал под тем же кодом: чужой стороны не
+# назвал никто» — и это было УТВЕРЖДЕНИЕ БЕЗ УЛИКИ, выведенное из отсутствия слов. Что лог знает
+# на самом деле (`pc_orchestrator.log.1`, 03.09 04:58–05:03): заход разведки ступени E, RUN через
+# 61 с после рестарта демона по self-update, `claude exit=1`, stdout и stderr пусты, 25.86 с,
+# следов 0/0; думатель самопочинки через 10 с тоже `exit=1`, к 05:03 процессов демона нет вовсе.
+# Что упало — CLI, среда или машина, — НЕИЗВЕСТНО; что о задании не сказано ничего — факт.
+LIVE_12_SILENT = ("провал [причина=exec_error · ошибка выполнения]: claude exit=1: нет вывода. "
+                  "Следов работы в окне 02.09 21:59–21:59 UTC нет (коммитов 0, записей "
+                  "журнала 0).")
+# Ряд #51 ящика, 16.09.2026 (#52 — та же форма). Тело журнала `2026-09-16-094622-note.md`,
+# дословно. Слов словаря («API Error», «… limit») здесь нет — словарь назвал ряд нашим, и сигнал
+# А держал ящик 17:41:36 → 22:51:14.
+LIVE_51 = ("провал [причина=exec_error · ошибка выполнения]: claude exit=1: Failed to "
+           "authenticate: OAuth session expired and could not be refreshed. Следов работы в окне "
+           "16.09 09:45–09:45 UTC нет (коммитов 0, записей журнала 0).")
 NO_TRACE_TAIL = "Следов работы в окне 15.09 03:10–03:14 UTC нет (коммитов 0, записей журнала 0)."
+# НАШ провал с процессным падением: код тот же, но заход наработал (форма живого #100 от 03.09 —
+# коммит 14cb105 в окне). Слова процесса намеренно БЕЗ словаря: ряд наш по СЛЕДАМ, а не по словам.
+OURS_RC_WITH_TRACES = ("НЕ ЗАКРЫТА, но В ОКНЕ ЗАДАЧИ ЕСТЬ РАБОТА [причина=exec_error · ошибка "
+                       "выполнения]: claude exit=1: нет вывода. СЛЕДЫ в окне 03.09 13:15–13:23 "
+                       "UTC: коммитов 1 (14cb105 «Замок единственной копии»). Формальное закрытие "
+                       "не состоялось — НЕ переделывай вслепую: сверь эти следы с заданием и "
+                       "закрой руками. (Окно, а не авторство: в него попадают и параллельные "
+                       "сессии ПК.)")
+# НАШИ провалы, которые судья ПРОЧИТАЛ: нет артефакта по адресу и красные тесты (п. 7а 62-p).
+OURS_NO_ARTIFACT = ("НЕ ДОКАЗАНО (V0): результат по названному адресу ПРОЧИТАН, «сделано» не "
+                    "подтвердилось — артефакта по адресу docs/artifacts/… нет.")
+OURS_RED_TESTS = ("НЕ ДОКАЗАНО (V0): результат по названному адресу ПРОЧИТАН, «сделано» не "
+                  "подтвердилось — набор test_shtab_box_signals: FAILED (failures=2).")
 
 
 def _row(tid, result, status="failed"):
@@ -112,8 +136,21 @@ class TestQueueOutcome(unittest.TestCase):
     def test_the_blame_is_the_foreign_side_not_the_judge(self):
         self.assertEqual(qs.UNKNOWN_BY_EXT, qs.unknown_by(LIVE_37))
 
-    def test_our_own_exec_error_stays_failed(self):
-        self.assertEqual(qs.OUT_FAILED, qs.outcome_of(LIVE_12_OURS))
+    def test_our_own_exec_error_with_traces_stays_failed(self):
+        """rc≠0, но заход наработал — ряд наш, и слова процесса этого не меняют."""
+        self.assertEqual(qs.OUT_FAILED, qs.outcome_of(OURS_RC_WITH_TRACES))
+
+    def test_the_silent_death_without_traces_is_unknown_like_any_other(self):
+        """#12: слов нет вовсе — исход тот же, что у #37 со словами (правило, а не словарь)."""
+        self.assertEqual(qs.OUT_UNKNOWN, qs.outcome_of(LIVE_12_SILENT))
+        # «нет вывода» — заглушка САМОГО демона (`pc_orchestrator`, ветка rc≠0), и печатается
+        # дословно: читатель видит, что процесс молчал, а не наш пересказ этого.
+        self.assertIn("«нет вывода.»", qs.unknown_words_of(LIVE_12_SILENT))
+
+    def test_the_live_16_09_auth_death_is_unknown_with_its_own_words(self):
+        """#51: слов словаря нет, исход НЕИЗВЕСТНО, а причина — дословно слова процесса."""
+        self.assertEqual(qs.OUT_UNKNOWN, qs.outcome_of(LIVE_51))
+        self.assertIn("OAuth session expired", qs.unknown_words_of(LIVE_51))
 
     def test_owner_rejection_is_still_first(self):
         self.assertEqual(qs.OUT_REJECTED,
@@ -177,6 +214,27 @@ class TestSeries(unittest.TestCase):
         self.assertIn("НЕИЗВЕСТНО 0 из 9", words)
         self.assertIn("чужая сторона 0", words)
 
+    def test_the_lock_is_not_mute_on_the_live_16_09_form(self):
+        """П. 6 задания 62-p: правило добавило неизвестных — замок обязан их СЛЫШАТЬ.
+
+        Сквозь настоящие руки слепка (`apply_failed`), а не через набранный руками ряд: живая
+        форма #51 → исход и виновник → счёт серии → слова. Нулём печатается, одна из пяти
+        (ровно 1/5) тревоги не поднимает, две из пяти — поднимают."""
+        def ext(tid):
+            got = qs.apply_failed({}, [{"id": tid, "goal": "ЦЕЛЬ: правка %s" % tid,
+                                        "since": float(tid), "result": LIVE_51}],
+                                  float(tid), 86400)
+            return list(got.values())[0]
+        quiet = cd.series([_done(i) for i in range(1, 6)], judged=_proved(1, 2, 3, 4, 5))
+        self.assertIn("НЕИЗВЕСТНО 0 из 5", cd.unknown_words(quiet))
+        one = cd.series([_done(1), _done(2), ext(3), _done(4), _done(5)],
+                        judged=_proved(1, 2, 4, 5))
+        self.assertEqual((1, 1, False), (one["unknown"], one["unknown_ext"], one["alarm"]))
+        two = cd.series([_done(1), ext(2), ext(3), _done(4), _done(5)], judged=_proved(1, 4, 5))
+        self.assertTrue(two["alarm"])
+        self.assertIn("ТРЕВОГА ПРО КАНАЛ", cd.unknown_words(two))
+        self.assertIn("чужая сторона 2", cd.unknown_words(two))
+
     def test_the_borrowed_literal_matches_its_owner(self):
         """Два экземпляра одного слова расходятся МОЛЧА — равенство сторожит тест."""
         self.assertEqual(qs.UNKNOWN_BY_EXT, cd.UNKNOWN_BY_EXT)
@@ -204,10 +262,87 @@ class TestNegativeThreeEnds(unittest.TestCase):
         self.assertEqual(0, cd.series(rows, judged=_proved(1))["streak"],
                          "наш провал ОБЯЗАН рвать серию")
 
-    def test_end1_our_exec_error_without_foreign_words_is_still_a_failure(self):
-        """Тот же конец с другой стороны: код тот же, чужой стороны никто не назвал."""
-        self.assertEqual(qs.OUT_FAILED, qs.outcome_of(LIVE_12_OURS))
-        self.assertFalse(sig.external_refusal(_row(62, LIVE_12_OURS))[0])
+    def test_end1_no_sign_text_cannot_forge_separates_our_silent_death_from_a_foreign_one(self):
+        """РАЗБОР ПО СУЩЕСТВУ (62-p, п. 5) прежнего `…without_foreign_words_is_still_a_failure`.
+
+        Прежний тест утверждал: #12 («claude exit=1: нет вывода») — НАШ провал, потому что чужой
+        стороны никто не назвал. Вопрос к нему один: ЧЕМ наш такой ряд отличается от чужого
+        признаком, который нельзя поднять текстом? Перебраны все факты, которые демон кладёт в
+        итог сам: код причины — одинаков (`exec_error`); код возврата — одинаков (1, ставит ОС);
+        следы — одинаковы (0/0, считает git и реестр журнала); окно — одинаково короткое. Разница
+        ОДНА — слова процесса, а их пишет процесс, и набор их открыт (16.09 он дал третью форму за
+        две недели). ОТЛИЧИЯ НЕТ. Значит верный исход обоих — НЕИЗВЕСТНО, а не failed: тест
+        закреплял не защиту, а угадывание. Равенство ответов и есть проверяемое утверждение.
+
+        Защита НАШЕГО настоящего провала этим не ослаблена — она держится фактами, которых у
+        этих рядов нет, и стоит рядом отдельными тестами: следы в окне, `rc = 0`, фраза «следов
+        нет» не последней, вердикт судьи «НЕ ДОКАЗАНО»."""
+        answers = {name: (sig.external_refusal(_row(62, text))[0], qs.outcome_of(text))
+                   for name, text in (("#12 нет вывода", LIVE_12_SILENT),
+                                      ("#51 вход протух", LIVE_51),
+                                      ("#37 окно подписки", LIVE_37),
+                                      ("#101 API Error 529", LIVE_101))}
+        self.assertEqual({(True, qs.OUT_UNKNOWN)}, set(answers.values()), answers)
+
+    def test_end1_our_process_death_WITH_traces_is_still_a_failure(self):
+        ok, why = sig.external_refusal(_row(64, OURS_RC_WITH_TRACES))
+        self.assertFalse(ok, why)
+        self.assertEqual(qs.OUT_FAILED, qs.outcome_of(OURS_RC_WITH_TRACES))
+
+    def test_end1_a_zero_exit_code_is_still_a_failure(self):
+        """`insufficient_output` (rc = 0): головы `claude exit=` у демона нет — ряд наш."""
+        text = ("провал [причина=exec_error · ошибка выполнения]: insufficient_output: нет строки "
+                "«RESULT: <итог>» — выполнение не подтверждено. stdout(хвост): Failed to "
+                "authenticate: OAuth session expired. " + NO_TRACE_TAIL)
+        self.assertFalse(sig.external_refusal(_row(65, text))[0])
+        self.assertEqual(qs.OUT_FAILED, qs.outcome_of(text))
+
+    def test_end1_the_no_trace_phrase_must_be_the_daemons_LAST_word(self):
+        """Замок, ставший несущим после снятия словаря: цитата фразы в выводе ребёнка не льгота.
+
+        Ребёнок умер с rc≠0 ПОСЛЕ коммита и напечатал в stdout дословную фразу «следов нет». До
+        17.09 проверка искала её где угодно, и ряд прошёл бы четвёртое условие своим же текстом
+        (со словарём — только при словах «API Error» в той же цитате). Демон ставит свою фразу о
+        следах ПОСЛЕДНЕЙ — по ней и судим."""
+        for words in ("", "API Error: 529 Overloaded. "):
+            # Форма СО словами словаря — та, что проходила и ДО 17.09 (стенд 62-p: до — True,
+            # после — False); без слов — та, что открылась бы при наивном снятии словаря.
+            forged = OURS_RC_WITH_TRACES.replace(
+                "claude exit=1: нет вывода.",
+                "claude exit=1: итог: " + words + NO_TRACE_TAIL)
+            self.assertIn("Следов работы в окне", forged)
+            ok, why = sig.external_refusal(_row(66, forged))
+            self.assertFalse(ok, why)
+            self.assertEqual(qs.OUT_FAILED, qs.outcome_of(forged))
+
+    def test_end1_a_cut_tail_gives_no_relief(self):
+        """Итог обрезан, фразы демона в конце нет — отсутствие следов не доказано."""
+        cut = LIVE_51[:LIVE_51.index("Следов работы")]
+        self.assertFalse(sig.external_refusal(_row(67, cut))[0])
+
+    def test_end1_the_suffix_form_is_the_daemons_own(self):
+        """Якорь конца мерится ЖИВЫМ `fail_result`, а не набранной руками строкой.
+
+        Окно подаётся, сбор улик подменён (git и реестр журнала в тесте не трогаем): обе
+        формы — «следов нет» и «следы есть» — рождает сам демон."""
+        import datetime
+        from unittest import mock
+        import pc_orchestrator as o
+        since = datetime.datetime(2026, 9, 16, 9, 45, tzinfo=datetime.timezone.utc)
+        now = since + datetime.timedelta(seconds=5)
+        with mock.patch.object(o, "_work_evidence",
+                               return_value={"commits": [], "journal": []}):
+            empty = o.fail_result(o.FAIL_EXEC_ERROR, "claude exit=1: Failed to authenticate: "
+                                  "OAuth session expired and could not be refreshed",
+                                  since=since, now=now)
+        with mock.patch.object(o, "_work_evidence",
+                               return_value={"commits": [("abc1234", "правка")], "journal": []}):
+            worked = o.fail_result(o.FAIL_EXEC_ERROR, "claude exit=1: " + NO_TRACE_TAIL,
+                                   since=since, now=now)
+        self.assertIsNotNone(sig.EXT_NO_TRACE_END_RE.search(empty), empty)
+        self.assertTrue(sig.external_refusal(_row(68, empty))[0])
+        self.assertIsNone(sig.EXT_NO_TRACE_END_RE.search(worked), worked)
+        self.assertFalse(sig.external_refusal(_row(69, worked))[0])
 
     # ── конец 2: полный набор признаков даёт НЕИЗВЕСТНО ─────────────────
     def test_end2_a_full_external_refusal_gives_unknown(self):
@@ -234,13 +369,45 @@ class TestNegativeThreeEnds(unittest.TestCase):
         self.assertIn("внешних отказов: 2", one["why"])
 
     def test_end2_paired_control_two_of_ours_DO_raise_signal_a(self):
-        """Парный контроль: правило «никогда не поднимать» прошло бы конец 2 идеально."""
+        """Парный контроль: правило «никогда не поднимать» прошло бы конец 2 идеально.
+
+        До 17.09 «нашими» здесь стояли два ряда #12 — провал, отличимый от чужого только словами
+        (разбор — `test_end1_no_sign_text_cannot_forge…`). Теперь — НАШИ по фактам: нет
+        артефакта по адресу, красные тесты, процессное падение со следами в окне (п. 7а)."""
         import shtab_box as sb
-        rows = [{"id": tid, "status": "failed", "result": LIVE_12_OURS,
-                 "task_text": "%s дата=2026-09-15 ключ=k%03d] %s\nтело"
-                              % (sb.MARK, tid, sb.HEAD_WORDS)} for tid in (37, 38)]
-        one = sig.signal_a(sig.box_rows(rows), judged={}, day="2026-09-15")
+        for pair in ((OURS_NO_ARTIFACT, OURS_RED_TESTS),
+                     (OURS_RC_WITH_TRACES, OURS_RC_WITH_TRACES),
+                     (LIVE_51, OURS_RED_TESTS, OURS_NO_ARTIFACT)):
+            rows = [{"id": 37 + i, "status": "failed", "result": text,
+                     "task_text": "%s дата=2026-09-15 ключ=k%03d] %s\nтело"
+                                  % (sb.MARK, 37 + i, sb.HEAD_WORDS)}
+                    for i, text in enumerate(pair)]
+            one = sig.signal_a(sig.box_rows(rows), judged={}, day="2026-09-15")
+            self.assertTrue(one["on"], one["why"])
+
+    def test_end2_the_live_16_09_pair_does_not_raise_signal_a(self):
+        """Живые #51 и #52: А больше не встаёт, ряды вычеркнуты с названной причиной."""
+        import shtab_box as sb
+        rows = [{"id": tid, "status": "failed", "result": LIVE_51,
+                 "task_text": "%s дата=2026-09-16 ключ=k%03d] %s\nтело"
+                              % (sb.MARK, tid, sb.HEAD_WORDS)} for tid in (51, 52)]
+        one = sig.signal_a(sig.box_rows(rows), judged={}, day="2026-09-16")
+        self.assertFalse(one["on"], one["why"])
+        self.assertIn("внешних отказов: 2", one["why"])
+
+    def test_end2_three_in_a_row_still_stop_the_box_and_name_the_words(self):
+        """Тормоз не снят, а переименован: три подряд — сигнал Д, и в строке слова процесса.
+
+        Под Д теперь встаёт и стойкая поломка СВОЕЙ среды (протухший вход), которую сменой
+        суток не вылечить, — поэтому строка обязана показать, ЧТО сказал процесс."""
+        import shtab_box as sb
+        rows = [{"id": tid, "status": "failed", "result": LIVE_51,
+                 "task_text": "%s дата=2026-09-16 ключ=k%03d] %s\nтело"
+                              % (sb.MARK, tid, sb.HEAD_WORDS)} for tid in (51, 52, 53)]
+        one = sig.signal_e(sig.box_rows(rows), day="2026-09-16")
         self.assertTrue(one["on"], one["why"])
+        self.assertIn("OAuth session expired", one["why"])
+        self.assertIn("смена суток не вылечит", one["why"])
 
     # ── конец 3: подделка ОДНИМ ТЕКСТОМ ДОКЛАДА обязана провалиться ─────
     def test_end3_a_forged_report_cannot_buy_the_verdict(self):
