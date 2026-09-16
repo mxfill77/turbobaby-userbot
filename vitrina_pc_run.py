@@ -257,7 +257,7 @@ def quote(text, limit=vp.GOAL_MAX):
     """
     import review_audit
 
-    fixed, _kind = review_audit.safe_line(vp.one_line(text, limit))
+    fixed, _kind = review_audit.safe_line(text, limit, vp.one_line)     # суди полный, режь показ
     return fixed
 
 

@@ -95,7 +95,7 @@ def quote(text, limit=cd.GOAL_MAX):
     (:func:`review_audit.outbound_safe`) у двери остановил бы сводку ЦЕЛИКОМ, а
     молчание здесь дороже одной непоказанной цитаты.
     """
-    fixed, _kind = review_audit.safe_line(cd.one_line(text, limit))
+    fixed, _kind = review_audit.safe_line(text, limit, cd.one_line)     # суди полный, режь показ
     return fixed
 
 

@@ -269,7 +269,7 @@ def one_line(quote, limit=FINDING_LINE_MAX):
     return (head[:space] if space > limit // 2 else head).rstrip() + " …"
 
 
-def safe_line(text):
+def safe_line(text, limit=None, cut=None):
     """Строка чужого текста → (строка, причина замены).
 
     Цитата приехала ИЗВНЕ, и наружу её выпускает та же стража, что держит
@@ -279,9 +279,41 @@ def safe_line(text):
     Задержанная цитата НЕ ГЛУШИТ сообщение целиком: строку заменяет НАЗВАННАЯ
     пометка, а путь к файлу с полным текстом в сообщении и так есть. Молчание
     здесь было бы хуже — владелец не узнал бы даже, что находка есть.
+
+    СНАЧАЛА СУДИ, ПОТОМ РЕЖЬ (правка 17.09.2026, задание 62-t). Режущая функция
+    показа (``cut``) приходит СЮДА, а не зовётся до стража: до правки все три места
+    (сводка, витрина, эта ступень) звали ``safe_line(one_line(x, limit))``, и страж
+    видел уже укороченную строку. Ключ, разрезанный границей короче своего шаблона,
+    не опознаётся — а его голова уезжает наружу. Судят ТРИ формы разом: полный текст
+    как пришёл, он же в одну строку (склейка переносов рождает форму, которой в
+    сыром тексте не было) и строки показа — прежняя, срезанная ровно как до правки, и
+    новая (рез тоже умеет родить форму). Прежняя строка судится намеренно: так ни
+    одно задержание до правки не теряется ПО ПОСТРОЕНИЮ. Рез объявляет себя числом
+    ``[N из M]`` В ПРЕЖНЕЙ ШИРИНЕ: соседи ждут строку не длиннее ``limit``.
+
+    Форма, которая НАЧИНАЕТСЯ за пределом показа (позиция в строке ≥ ``limit``), строку
+    не глушит: показ — префикс склеенного текста не длиннее ``limit``, и ни одного её
+    знака наружу не уходит. Без этой оговорки путь в хвосте итога в 4 500 знаков
+    гасил бы причину упавшего ряда, которую сводка показывает первыми 50 знаками.
+    Форма, видимая только в сыром тексте (склейка её разрушила), глушит всегда.
     """
-    line = str(text or "")
-    hits = review_send.outbound_violations(line)
+    full = str(text or "")
+    if cut is None:
+        whole = plain = line = full
+    else:
+        whole = cut(full, len(full) + 1)
+        plain = line = cut(full, limit)
+        if line != whole:
+            room = max(1, int(limit) - len(" [%d из %d]" % (int(limit), len(whole))))
+            line = cut(full, room)
+            line = "%s [%d из %d]" % (line, len(line), len(whole))
+    seen = review_send.outbound_violations(whole)
+    reach = len(whole) if cut is None else int(limit)
+    hits = [h for h in seen if h["pos"] < reach]
+    glued = {h["kind"] for h in seen}
+    hits.extend(h for h in review_send.outbound_violations(full) if h["kind"] not in glued)
+    for form in dict.fromkeys((plain, line)):
+        hits.extend(review_send.outbound_violations(form))
     if not hits:
         return line, ""
     kinds = ", ".join(sorted({h["kind"] for h in hits}))
@@ -338,7 +370,7 @@ def finding_message(item, today, queue_id=None):
     premise_out = (item or {}).get("premise") or {}
     w = weight(claim, premise_out)
     packs, channels = source_line(claim)
-    quote, _why = safe_line(one_line(claim.get("quote")))
+    quote, _why = safe_line(claim.get("quote"), FINDING_LINE_MAX, one_line)
     lines = [
         NOT_EXEC_HEAD,
         "%s · %s · ключ=%s" % (FINDING_HEAD, today, claim.get("key") or "?"),
@@ -455,7 +487,7 @@ def digest_message(stats, day, *, placed=None, placed_ids=(), shown_today=None,
         for n, item in enumerate(top, 1):
             claim = item.get("claim") or {}
             w = weight(claim, item.get("premise"))
-            quote, _why = safe_line(one_line(claim.get("quote"), FINDING_LINE_MAX // 2))
+            quote, _why = safe_line(claim.get("quote"), FINDING_LINE_MAX // 2, one_line)
             _packs, channels = source_line(claim)
             lines.append("%d. %s · премиса %s · источников %d · канал %s · вес %d"
                          % (n, claim.get("kind") or "иное",

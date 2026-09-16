@@ -351,7 +351,11 @@ def outbound(text, markup=None, sender=None):
         return "none", False, "в тексте граница чужой цитаты — разбор пропустил чужие строки, не шлём"
     hits = review_audit.outbound_safe(text)
     if hits:
-        return "none", False, "страж исходящего: %s" % "; ".join(str(h) for h in hits[:3])
+        # ОТКАЗ НЕ НЕСЁТ НАЙДЕННОГО (17.09.2026, задание 62-t): `str(h)` печатал поле
+        # `sample` — до 24 знаков самой формы — в причину, а причина едет в отчёт захода.
+        # Наружу только вид, число находок и длина текста.
+        return "none", False, "страж исходящего: %s (находок %d, текст %d знаков)" % (
+            ", ".join(sorted({h["kind"] for h in hits})), len(hits), len(str(text or "")))
     send = sender or dispatch_notify.deliver
     channel, ok = send(text, markup)
     return channel, bool(ok), ("" if ok else "канал %s отказал" % channel)

@@ -277,6 +277,13 @@ def sanitize(text, *, limit=HYPOTHESIS_MAX):
     for kind, rx in _REDACT_RULES:
         out = rx.sub(_REDACT_MARK % kind, out)
     out = " ".join(out.split())          # многострочная постановка → одна строка пакета
+    # СУДИТ ПОЛНАЯ СТРОКА, ДО РЕЗА (17.09.2026, задание 62-t): склейка переносов
+    # способна родить форму, которой не видели правила снятия на сыром тексте
+    # (телефон, разнесённый пробелами шире своего шаблона), и рез по потолку разрезал
+    # бы её мимо стражи ниже. Нашла — строка снимается целиком, как и в цикле.
+    early = review_send.outbound_violations(out)
+    if early:
+        out = _REDACT_LINE % ", ".join(sorted({v["kind"] for v in early}))
     out = clip_named(out, limit)
 
     # Fail-closed: что стража всё ещё видит — снимаем ЦЕЛОЙ СТРОКОЙ. Три прохода,

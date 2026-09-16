@@ -576,5 +576,145 @@ class TestDaemonWiring(unittest.TestCase):
         self.assertIn("review_audit.py", self.o._ORCH_LAZY_UNCOVERED)
 
 
+def _common(a, b):
+    """Длина самой длинной общей подстроки — мера утёкшего куска формы."""
+    best, prev = 0, [0] * (len(b) + 1)
+    for ca in a:
+        cur = [0] * (len(b) + 1)
+        for j, cb in enumerate(b, 1):
+            if ca == cb:
+                cur[j] = prev[j - 1] + 1
+                best = max(best, cur[j])
+        prev = cur
+    return best
+
+
+class TestJudgeBeforeCut62t(unittest.TestCase):
+    """СНАЧАЛА СУДИ, ПОТОМ РЕЖЬ (задание 62-t, 17.09.2026).
+
+    До правки сводка, витрина и эта ступень звали ``safe_line(one_line(x, limit))``: страж
+    видел уже срезанную строку, и форма, разрезанная границей короче своего шаблона, уезжала
+    наружу головой. Образцы здесь ВЫДУМАННЫЕ и собираются склейкой литералов; ни один тест
+    не печатает форму — только длины и счёт.
+    """
+
+    KEY_BODY = "Zq7" * 8
+    KEY = "sk" + "-" + KEY_BODY           # выдуманный ключ формы «ключ провайдера», 27 знаков
+    HELD = "[строка не показана"
+
+    def _quotes(self):
+        import contour_digest_run as cdr
+        import vitrina_pc_run as vpr
+
+        return (("сводка", lambda t, n: cdr.quote(t, n)),
+                ("витрина", lambda t, n: vpr.quote(t, n)),
+                ("Аудит", lambda t, n: ra.safe_line(t, n, ra.one_line)[0]))
+
+    def test_the_key_cut_by_the_border_is_held_and_nothing_of_it_leaves(self):
+        text = "," * 40 + self.KEY + " хвост причины"      # граница 50 режет ключ на 10-м знаке тела
+        for name, quote in self._quotes():
+            out = quote(text, 50)
+            self.assertIn(self.HELD, out, name)
+            self.assertLess(_common(self.KEY_BODY, out), 4, name)
+
+    def test_contrafact_the_old_order_lets_the_head_of_the_key_out(self):
+        # тот же вход, порядок HEAD: резать, потом судить — пропуск с куском тела ключа
+        import contour_digest as cd
+
+        text = "," * 40 + self.KEY + " хвост причины"
+        old = ra.safe_line(cd.one_line(text, 50))[0]
+        self.assertNotIn(self.HELD, old)
+        self.assertGreaterEqual(_common(self.KEY_BODY, old), 4)
+
+    def test_no_hold_of_the_old_order_is_lost_on_a_sweep(self):
+        import contour_digest as cd
+        import vitrina_pc as vp
+
+        forms = (self.KEY, "ivan.testov" + "@" + "example-mail.com", "+66 81 234 5678",
+                 "1234567890" + ":" + "AAb_" * 9, "x" * 30 + " a" + "@" + "b.coma1zzz")
+        cuts = (("сводка", cd.one_line, 50), ("витрина", vp.one_line, 48), ("Аудит", ra.one_line, 150))
+        lost = 0
+        for form in forms:
+            for _name, cut, limit in cuts:
+                for off in range(0, limit + 8):
+                    text = "," * off + form + " хвост"
+                    if ra.safe_line(cut(text, limit))[1] and not ra.safe_line(text, limit, cut)[1]:
+                        lost += 1
+        self.assertEqual(lost, 0)
+
+    def test_the_form_born_by_the_cut_is_still_held(self):
+        import contour_digest as cd
+
+        text = "x" * 30 + " a" + "@" + "b.coma1zzz"          # полная строка почты не несёт
+        self.assertEqual(ra.safe_line(text)[1], "")
+        self.assertTrue(ra.safe_line(cd.one_line(text, 40))[1])
+        self.assertTrue(ra.safe_line(text, 40, cd.one_line)[1])
+
+    def test_glued_lines_are_judged_before_the_cut(self):
+        phone = "+66" + "\n" * 20 + "81 234 5678"             # сырой текст шаблона не даёт, склейка даёт
+        from review_send import outbound_violations
+
+        self.assertEqual(outbound_violations(phone), [])
+        text = "," * 44 + phone + " хвост"
+        for name, quote in self._quotes():
+            out = quote(text, 50)
+            self.assertIn(self.HELD, out, name)
+            self.assertLess(_common("81 234 5678", out), 4, name)
+
+    def test_a_form_wholly_past_the_show_does_not_kill_the_line(self):
+        text = "СПРАШИВАЛИ: причина упавшего ряда " + "," * 60 + self.KEY
+        for name, quote in self._quotes():
+            out = quote(text, 50)
+            self.assertNotIn(self.HELD, out, name)
+            self.assertLess(_common(self.KEY_BODY, out), 4, name)
+
+    def test_the_cut_names_itself_by_number_within_the_old_width(self):
+        text = "обычная причина падения без форм " * 6
+        for name, quote in self._quotes():
+            for limit in (46, 48, 50, 64, 150):
+                out = quote(text, limit)
+                self.assertLessEqual(len(out), limit, (name, limit))
+                self.assertIn("из %d]" % len(" ".join(text.split())), out, (name, limit))
+
+    def test_short_text_is_shown_as_is(self):
+        for name, quote in self._quotes():
+            self.assertEqual(quote("короткая причина", 50), "короткая причина", name)
+
+    def test_the_refusal_carries_no_piece_of_the_form(self):
+        for name, quote in self._quotes():
+            out = quote("причина " + self.KEY, 50)
+            self.assertIn(self.HELD, out, name)
+            self.assertLess(_common(self.KEY_BODY, out), 4, name)
+
+    def test_zayavki_refusal_reason_carries_kind_not_sample(self):
+        import sys
+        import types
+        from unittest import mock
+
+        stub = types.ModuleType("dispatch_notify")        # дверь Telegram читает конфиг при импорте
+        with mock.patch.dict(sys.modules, {"dispatch_notify": stub}):
+            import zayavki_pc_run
+
+            _ch, ok, why = zayavki_pc_run.outbound("заявка " + self.KEY, None,
+                                                   sender=lambda t, m: ("stub", True))
+        self.assertFalse(ok)
+        self.assertIn("ключ провайдера", why)
+        self.assertNotIn("sample", why)
+        self.assertLess(_common(self.KEY_BODY, why), 4)
+
+    def test_pack_sanitizer_judges_the_glued_text_before_the_clip(self):
+        import review_auto
+        from review_send import outbound_violations
+
+        phone = "+66" + "\n" * 20 + "81 234 5678"
+        leaked = 0
+        for limit in range(60, 140):
+            out = review_auto.sanitize("Постановка " + "слово " * 8 + phone + " дальше" * 20, limit=limit)
+            self.assertEqual(outbound_violations(out), [])
+            if _common("81 234 5678", out) >= 4:
+                leaked += 1
+        self.assertEqual(leaked, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
