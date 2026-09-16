@@ -919,6 +919,153 @@ class TestGates(unittest.TestCase):
         self.assertIsNone(sb.task_text({"key": "kk1", "body": GOOD_BODY}, "вчера"))
 
 
+# ═══════════════════ ЁМКОСТЬ СТРОКИ ОЧЕРЕДИ (замер 16.09.2026) ═══════════════════
+
+
+def _body_of_units(n, fill="проба ёмкости строки очереди "):
+    """Правдоподобное тело РОВНО n единиц UTF-16: запреты, заполнитель, адрес последней строкой."""
+    head = NO_ADDR_BODY + "\n\n"
+    tail = "\n" + ADDR_LINE
+    left = n - sb.units(head) - sb.units(tail)
+    step = sb.units(fill)
+    filler = (fill * (left // step + 2))
+    out, used = [], 0
+    for ch in filler:                       # по символу: заполнитель может нести символы вне BMP
+        w = sb.units(ch)
+        if used + w > left:
+            break
+        out.append(ch)
+        used += w
+    while used < left:
+        out.append("ж")
+        used += 1
+    text = "".join(out)
+    if text[-1:].isspace():
+        text = text[:-1] + "ж"
+    body = head + text + tail
+    assert sb.units(body) == n, (sb.units(body), n)
+    return body
+
+
+class TestQueueCapacity(unittest.TestCase):
+    """Потолок тела сведён с ИЗМЕРЕННОЙ ёмкостью строки очереди и без замера не действует.
+
+    Предмет — не «число поменяли», а три свойства: тело, которое мост порежет, ворота НЕ
+    пропускают и называют числом; считается та же единица, в которой режет мост (UTF-16);
+    число без свежей записи замера краснеет словами.
+    """
+
+    TODAY_OK = "2026-09-16"
+
+    def _day(self, shift):
+        base = datetime.date.fromisoformat(sb.CAPACITY_RECORD["date"])
+        return (base + datetime.timedelta(days=shift)).isoformat()
+
+    def test_the_ceiling_is_derived_from_the_measured_capacity(self):
+        self.assertEqual(sb.BODY_MAX, sb.QUEUE_ROW_CAP - sb.HEADER_RESERVE)
+        self.assertEqual((sb.QUEUE_ROW_CAP, sb.HEADER_RESERVE, sb.BODY_MAX), (5000, 500, 4500))
+        rec = sb.CAPACITY_RECORD
+        self.assertEqual(rec["cap"], sb.QUEUE_ROW_CAP, "запись замера меряла не то число")
+        self.assertEqual((rec["max_whole"], rec["min_cut"]), (rec["cap"], rec["cap"] + 1))
+        self.assertEqual(rec["unit"], "utf16")
+        self.assertIn("stand.py", rec["how"], "запись обязана называть, ЧЕМ мерено")
+
+    def test_NEGATIVE_a_body_over_the_ceiling_is_refused_with_the_number(self):
+        """Тело на единицу длиннее потолка — ОТКАЗ с числом; ровно потолок — проходит.
+
+        До 16.09 этот же вход (4501 единица) ворота брали: потолок стоял 6000, а мост
+        режет строку на 5000, — и хвост с адресом результата до судьи не доезжал.
+        """
+        ok, reason, why = sb.check({"key": "kk1", "body": _body_of_units(sb.BODY_MAX + 1)},
+                                   self.TODAY_OK)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "too_long")
+        for number in (sb.BODY_MAX + 1, sb.BODY_MAX, sb.QUEUE_ROW_CAP):
+            self.assertIn(str(number), why, "отказ обязан назвать число %d" % number)
+        ok, reason, why = sb.check({"key": "kk1", "body": _body_of_units(sb.BODY_MAX)},
+                                   self.TODAY_OK)
+        self.assertTrue(ok, "%s %s" % (reason, why))
+
+    def test_the_ceiling_counts_utf16_units_not_python_characters(self):
+        """Символ вне BMP мост считает ДВУМЯ единицами — ворота обязаны считать так же."""
+        body = _body_of_units(sb.BODY_MAX + 1, fill="📥 проба ")
+        self.assertLessEqual(len(body), sb.BODY_MAX, "предпосылка: по len() тело влезает")
+        ok, reason, _why = sb.check({"key": "kk1", "body": body}, self.TODAY_OK)
+        self.assertFalse(ok, "ворота считают len(), а мост режет UTF-16")
+        self.assertEqual(reason, "too_long")
+
+    def test_the_worst_header_with_the_longest_body_fits_the_queue_row(self):
+        """Худшая шапка, какую пропускают ворота, + тело BODY_MAX — в ёмкости строки.
+
+        Худшая: ключ KEY_MAX, file id 44, полоса НЕ названа (самые длинные её слова).
+        Шапка, переросшая запас, обязана красить набор здесь, а не резать живой ряд.
+        """
+        body = _body_of_units(sb.BODY_MAX)
+        self.assertTrue(sb.read_lane(body)["ok"] and not sb.read_lane(body)["named"])
+        key = "k" * sb.KEY_MAX
+        text = sb.task_text({"key": key, "body": body, "name": sb.doc_name(key), "id": "x" * 44},
+                            self.TODAY_OK)
+        self.assertIsNotNone(text)
+        self.assertLessEqual(sb.units(text) - sb.units(body), sb.HEADER_RESERVE)
+        self.assertLessEqual(sb.units(text), sb.QUEUE_ROW_CAP)
+
+    def test_live_bodies_of_15_16_09_fall_on_the_measured_side(self):
+        """Живые тела Штаба: 3742 доехало целым — проходит; 4811/4926/5608 резаны — отказ."""
+        ok, reason, why = sb.check({"key": "kk1", "body": _body_of_units(3742)}, self.TODAY_OK)
+        self.assertTrue(ok, "%s %s" % (reason, why))
+        for n in (4811, 4926, 5608):
+            ok, reason, _why = sb.check({"key": "kk1", "body": _body_of_units(n)}, self.TODAY_OK)
+            self.assertFalse(ok, "тело %d мост режет, а ворота берут" % n)
+            self.assertEqual(reason, "too_long")
+
+    def test_NEGATIVE_no_record_means_red_words_not_a_silent_pass(self):
+        from unittest import mock
+
+        ok, why = sb.capacity_state(self.TODAY_OK, record={})
+        self.assertFalse(ok)
+        self.assertIn("записи замера", why)
+        with mock.patch.object(sb, "CAPACITY_RECORD", {}):
+            ok, reason, why = sb.check({"key": "kk1", "body": GOOD_BODY}, self.TODAY_OK)
+            self.assertFalse(ok)
+            self.assertEqual(reason, "capacity_unmeasured")
+            ok, reason, _why = sb.check({"key": "kk1", "body": GOOD_BODY})
+            self.assertFalse(ok, "без дня запись всё равно обязана существовать")
+            self.assertIsNone(sb.task_text({"key": "kk1", "body": GOOD_BODY}, self.TODAY_OK))
+
+    def test_NEGATIVE_a_record_of_another_number_is_red(self):
+        rec = dict(sb.CAPACITY_RECORD, cap=6000)
+        ok, why = sb.capacity_state(self.TODAY_OK, record=rec)
+        self.assertFalse(ok)
+        self.assertIn("не сходится", why)
+
+    def test_NEGATIVE_a_stale_record_stops_the_box_with_words(self):
+        """Протухла — отказ словами на ОБЕИХ дорогах постановки; в срок — проходит."""
+        last = self._day(sb.CAPACITY_TTL_DAYS)
+        stale = self._day(sb.CAPACITY_TTL_DAYS + 1)
+        self.assertEqual(sb.capacity_state(last), (True, ""))
+        ok, why = sb.capacity_state(stale)
+        self.assertFalse(ok)
+        self.assertIn("ПРОТУХЛА", why)
+        self.assertIn(str(sb.CAPACITY_TTL_DAYS), why)
+        blk = {"key": "kk1", "body": GOOD_BODY}
+        self.assertIsNone(sb.task_text(dict(blk), stale))
+        self.assertIsNotNone(sb.task_text(dict(blk), last))
+        take, held = sb.select([dict(blk)], today=stale)
+        self.assertEqual(take, [])
+        self.assertIn("capacity_unmeasured", held[0][1])
+        self.assertIn("ПРОТУХЛА", held[0][1])
+        take, _held = sb.select([dict(blk)], today=last)
+        self.assertEqual(len(take), 1, "в срок запись не мешает ничему")
+
+    def test_an_unreadable_day_is_unknown_and_red(self):
+        ok, why = sb.capacity_state("вчера")
+        self.assertFalse(ok)
+        self.assertIn("НЕИЗВЕСТНА", why)
+        take, held = sb.select([{"key": "kk1", "body": GOOD_BODY}], today="")
+        self.assertEqual(take, [])
+        self.assertIn("capacity_unmeasured", held[0][1])
+
+
 # ═══════════════════════════ ОТРИЦАТЕЛЬНЫЕ ═════════════════════════════
 
 

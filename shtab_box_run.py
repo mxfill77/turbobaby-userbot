@@ -959,7 +959,7 @@ def build(root=HERE, queue=None, clock=None, reader=None, node=None,
         # Ворота считаются ДЛЯ ВСЕХ прочитанных, а не только для взятого: владелец
         # должен видеть в `--status`, почему лежащее в ящике задание не берётся, —
         # иначе ящик выглядит сломанным ровно тогда, когда он честно отказывает.
-        gate_ok, reason, why = shtab_box.check(doc)
+        gate_ok, reason, why = shtab_box.check(doc, today)
         out["gates"][doc["key"]] = {"ok": gate_ok, "reason": reason, "why": why}
         # ПОЛОСА ЧИТАЕТСЯ У КАЖДОГО ПРОЧИТАННОГО, А НЕ ТОЛЬКО У ВЗЯТОГО, и по той же
         # причине, что и ворота: владелец обязан видеть в `--status`, КУДА уедет

@@ -207,6 +207,13 @@ class TheRetryBodyCarriesTheRemainder(unittest.TestCase):
         self.assertIsNone(body)
         self.assertIn(u"при потолке", why)
 
+    def test_the_retry_default_moved_with_the_body_ceiling(self):
+        """Умолчание потолка дожима — экземпляр shtab_box.BODY_MAX (замер ёмкости 16.09)."""
+        import inspect
+
+        default = inspect.signature(acc.retry_body).parameters["body_max"].default
+        self.assertEqual(default, shtab_box.BODY_MAX)
+
 
 class TheRowIsParsedBackWithoutTheBridge(unittest.TestCase):
     """Дожим встаёт ТЕМ ЖЕ документом — по строке происхождения самого ряда."""
