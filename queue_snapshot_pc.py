@@ -153,15 +153,44 @@ def config(env=None):
 # Ни одна функция ниже не ходит в мир: ни файла, ни сети, ни часов сверх переданного `now`.
 # Граница держится инвариантом QSNAP_PC_PURE в тесте, а не обещанием этого абзаца.
 
-def one_line(value, limit):
-    """Первая НЕПУСТАЯ строка значения, схлопнутая в одну и обрезанная. Нечего показать → ""."""
+def first_line(value):
+    """Первая НЕПУСТАЯ строка значения, схлопнутая в одну, ЦЕЛИКОМ. Нечего показать → ""."""
     if value is None:
         return ""
     for raw in str(value).splitlines():
         piece = " ".join(raw.split())
         if piece:
-            return piece if len(piece) <= limit else piece[:limit - 1] + "…"
+            return piece
     return ""
+
+
+def one_line(value, limit):
+    """Первая НЕПУСТАЯ строка значения, схлопнутая в одну и обрезанная. Нечего показать → ""."""
+    piece = first_line(value)
+    return piece if len(piece) <= limit else piece[:limit - 1] + "…"
+
+
+# РЕШЕНИЕ СУДИТСЯ ПО ПОЛНОМУ ТЕКСТУ, ОБРЕЗКА ЖИВЁТ ТОЛЬКО НА ПУТИ ПОКАЗА (17.09.2026, задание 62-s).
+# До этой правки `_rows_from` резал итог ряда до первой строки в `WHY_MAX` символов ПЕРЕД разбором
+# исхода, и `apply_failed` судил по обрезку. Цена измерена: фраза демона «Следов работы … нет»
+# у живого #51 (16.09) начинается после 138-го символа, и ветка «неизвестно — чужая сторона»,
+# которой полагается последняя фраза итога, в слепке не срабатывала ни на одном живом ряду.
+# Третий случай класса «решение по тексту, который прибор сам обрезал» (витрина 4833 при окне
+# 3900, тело задания 5000 на мосту). Показ режется, но ОБЪЯВЛЯЕТ СЕБЯ ЧИСЛОМ (:func:`shown`).
+def shown(value, limit):
+    """ПОКАЗ человеку: первая непустая строка в `limit` символов, и обрезка объявляет себя
+    числом — сколько символов итога НЕ показано. Молчаливая обрезка запрещена: укороченная
+    причина без пометки читалась бы как полная.
+
+    Единица — символ текста, схлопнутого в одну строку: первая строка — его начало, поэтому
+    «показано N из M» точно, а хвост (и следующие строки) — ровно то, что не показано."""
+    whole = " ".join(("" if value is None else str(value)).split())
+    head = first_line(value)
+    if len(head) > limit:
+        head = head[:limit - 1]
+    elif len(head) == len(whole):
+        return head
+    return "%s… [показано %d из %d симв., хвост не показан]" % (head, len(head), len(whole))
 
 
 # Строки-пустышки в НАЧАЛЕ задания: ручки мощности, а не цель. Список не выдуман — в этом репо
@@ -285,7 +314,7 @@ def render_body(rows, closed, failed_at, now):
         for item in failed_rows:
             parts.append("    #%s · %s · причина: %s"
                          % (item.get("id"), one_line(item.get("goal"), GOAL_MAX),
-                            one_line(item.get("why"), WHY_MAX) or "причина не названа очередью"))
+                            shown(item.get("why"), WHY_MAX) or "причина не названа очередью"))
     if rejected_rows:
         # ОТДЕЛЬНОЙ СТРОКОЙ, А НЕ СРЕДИ УПАВШИХ: «упало» зовёт переотправить, «отклонено» —
         # запрещает. В очереди обе половины лежат под одним статусом `failed`, и без этого
@@ -294,7 +323,7 @@ def render_body(rows, closed, failed_at, now):
         for item in rejected_rows:
             parts.append("    #%s · %s · отказ: %s"
                          % (item.get("id"), one_line(item.get("goal"), GOAL_MAX),
-                            reject_words(item.get("why"))))
+                            shown(reject_words(item.get("why")), WHY_MAX)))
     if unknown_rows:
         # ОТДЕЛЬНОЙ СТРОКОЙ И СО СЛОВАМИ ТОГО, КТО НАЗВАЛ ПРИЧИНУ. Работа могла быть сделана
         # целиком: сказано не «плохо», а «прочитать не удалось» — и обязано быть сказано ПОЧЕМУ.
@@ -310,7 +339,7 @@ def render_body(rows, closed, failed_at, now):
             for item in by_judge:
                 parts.append("    #%s · %s · судья: %s"
                              % (item.get("id"), one_line(item.get("goal"), GOAL_MAX),
-                                one_line(judge_reason(item.get("why")), WHY_MAX)))
+                                shown(judge_reason(item.get("why")), WHY_MAX)))
         if by_ext:
             parts.append("  НЕИЗВЕСТНО (чужая сторона) — заход умер у ПОСТАВЩИКА, не оставив "
                          "следов работы; это про КАНАЛ, а не про работу, и провалом полосы не "
@@ -318,7 +347,7 @@ def render_body(rows, closed, failed_at, now):
             for item in by_ext:
                 parts.append("    #%s · %s · чужая сторона: %s"
                              % (item.get("id"), one_line(item.get("goal"), GOAL_MAX),
-                                one_line(unknown_words_of(item.get("why")), WHY_MAX)))
+                                shown(unknown_words_of(item.get("why")), WHY_MAX)))
     if unsure_ids:
         parts.append("  исход не сверен: " + " ".join("#" + str(t) for t in unsure_ids))
     # ПОВТОР НОМЕРА НАЗЫВАЕТСЯ ВСЛУХ, И ТОЛЬКО КОГДА ОН ЕСТЬ. Реестр теперь различает два ряда,
@@ -445,7 +474,7 @@ def render(view, now):
                            view.get("failed_at"), view.get("at"))
     else:
         last = view.get("last_good")
-        why = one_line(view.get("err"), WHY_MAX) or "причина не названа"
+        why = shown(view.get("err"), WHY_MAX) or "причина не названа"
         when = "последний верный снимок: %s" % fmt_ts(last)
         if age_min(last, now) is not None:
             when += " (%s назад)" % _age_words(last, now)
@@ -574,7 +603,7 @@ def outcome_of(result):
     ЛЬГОТЫ БЕЗ ПРИЧИНЫ ЗДЕСЬ НЕТ, как и у судьи: слова причины приходят от самого различителя и
     печатаются в показе (:func:`unknown_words_of`). Четыре условия различителя обязательны все,
     и ни одно из них не производится текстом доклада — разбор в `shtab_box_signals`."""
-    if one_line(result, WHY_MAX).startswith(REJECT_MARK):
+    if first_line(result).startswith(REJECT_MARK):
         return OUT_REJECTED
     if judge_outcome(result) == JUDGE_UNKNOWN_WORD:
         return OUT_UNKNOWN
@@ -615,13 +644,13 @@ def judge_reason(result):
         why = done_judge_pc.reason_of(result)
     except Exception:                                   # noqa: BLE001 — судьи нет → скажем прямо
         why = None
-    return why or one_line(result, WHY_MAX) or "причина судьёй не названа"
+    return why or first_line(result) or "причина судьёй не названа"
 
 
 def reject_words(result):
     """Что владелец сказал СВЕРХ самого отказа (кнопка · кто ответил · пояснение). Маркер из
-    строки убираем: он машинный и в разрезе «отклонено» не новость."""
-    head = one_line(result, WHY_MAX)
+    строки убираем: он машинный и в разрезе «отклонено» не новость. Режет ПОКАЗ (:func:`shown`)."""
+    head = first_line(result)
     tail = head[len(REJECT_MARK):].strip(" :·—-") if head.startswith(REJECT_MARK) else head
     return tail or "пояснения не оставлено"
 
@@ -752,7 +781,8 @@ def _rows_from(items, fallback_status):
                     "lane": it.get("lane"),
                     "since": _parse_iso(it.get("updated")) or _parse_iso(it.get("created")),
                     "goal": goal_line(it.get("task_text")),
-                    "result": one_line(it.get("result"), WHY_MAX)})
+                    # ИТОГ ЦЕЛИКОМ: по нему судит `apply_failed`. Режется только показ (`shown`).
+                    "result": "" if it.get("result") is None else str(it.get("result"))})
     return out
 
 

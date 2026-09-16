@@ -554,5 +554,120 @@ class TestJudgeUnknownStaysInSignalA(unittest.TestCase):
                          sig.signal_a(rows, judged={})["on"])
 
 
+# ═══════════════════════ 62-s: ОБРЕЗКА НЕ СУДИТ, МАРКЕР — НА СВОЁМ МЕСТЕ ═══════════════════════
+# Две дыры и одна правка (17.09.2026). (1) Слепок резал итог до первой строки в 110 символов ДО
+# разбора исхода — живой #51 со шапкой закрытия давал «упало», и тем же срезом «упало» давал живой
+# #55 (неизвестность судьи): первая строка итога в очереди — шапка «СПРАШИВАЛИ». (2) Судья искал
+# маркер ГДЕ УГОДНО — цитата в черновике таймаута и в докладе «не доказано» покупала «неизвестно».
+# Обрезка случайно прикрывала (2) в слепке; полный текст без якоря открыл бы её шире (стенд:
+# 4 из 5 неизвестны против 2 из 5 настоящих). Поэтому замки стоя́т парами.
+
+import close_msg_pc as cm                  # noqa: E402
+import pc_orchestrator as o                # noqa: E402
+
+
+def _queue(body, status="failed"):
+    """Живая форма итога в очереди: шапку кладёт единственный сборщик, как демон на закрытии."""
+    return cm.prepend(body, "ЦЕЛЬ: разбор", status, o.NO_HEAL_PREFIXES, {})
+
+
+QUOTE = "«%s — пример»" % dj.UNKNOWN_PREFIX
+
+
+def _snap(text, tid=7):
+    rows = qs._rows_from([{"id": tid, "status": "failed", "result": text, "task_text": "ЦЕЛЬ %d" % tid,
+                           "updated": "2026-09-17T00:00:00.000Z"}], "failed")
+    got = qs.apply_failed({}, rows, rows[0]["since"] + 60, 86400)
+    return list(got.values())[0]
+
+
+class TestCutDoesNotJudge62s(unittest.TestCase):
+    """Решение — по полному тексту; маркер судьи — в начале строки и до части демона."""
+
+    def test_the_live_queue_form_really_starts_with_the_header(self):
+        """Посылка замков: у живого итога первая строка — шапка, а не маркер и не причина."""
+        text = _queue(LIVE_51)
+        self.assertTrue(text.startswith(cm.L_ASK), text[:40])
+        self.assertGreater(text.index("Следов работы"), qs.WHY_MAX)
+
+    def test_live_51_in_the_queue_form_is_unknown_in_the_snapshot(self):
+        item = _snap(_queue(LIVE_51))
+        self.assertEqual((qs.OUT_UNKNOWN, qs.UNKNOWN_BY_EXT), (item["outcome"], item.get("by")))
+
+    def test_live_55_in_the_queue_form_is_unknown_in_the_snapshot(self):
+        item = _snap(_queue(_judge_unknown(REASON_55)))
+        self.assertEqual((qs.OUT_UNKNOWN, qs.UNKNOWN_BY_JUDGE), (item["outcome"], item.get("by")))
+        self.assertEqual(REASON_55, dj.reason_of(_queue(_judge_unknown(REASON_55))))
+
+    def test_rows_keep_the_whole_result(self):
+        text = _queue(LIVE_51)
+        rows = qs._rows_from([{"id": 1, "status": "failed", "result": text}], "failed")
+        self.assertEqual(text, rows[0]["result"])
+
+    def test_a_quote_in_our_timeout_draft_buys_nothing(self):
+        for text in (_timeout(draft="разбор: %s" % QUOTE), _queue(_timeout(draft="разбор: %s" % QUOTE))):
+            self.assertIsNone(dj.outcome_of(text))
+            self.assertIsNone(dj.reason_of(text))
+            self.assertEqual(qs.OUT_FAILED, _snap(text)["outcome"])
+
+    def test_a_quote_in_a_not_proven_report_buys_nothing(self):
+        for report in ("Разбор: %s" % QUOTE, "FACT: x\n%s — цитата строкой" % dj.UNKNOWN_PREFIX):
+            text = _queue(dj.fail_result({"verdict": dj.UNPROVEN, "reason": "нет артефакта"}, report))
+            self.assertEqual(dj.UNPROVEN, dj.outcome_of(text))
+            self.assertEqual(qs.OUT_FAILED, _snap(text)["outcome"])
+
+    def test_a_line_of_child_stdout_after_the_daemon_head_buys_nothing(self):
+        """Вывод ребёнка многострочен и лежит ПОСЛЕ части демона: начало строки там ничего не значит."""
+        text = _queue(o.fail_result(o.FAIL_EXEC_ERROR, "claude exit=1: x\n%s — цитата" % dj.UNKNOWN_PREFIX))
+        self.assertIsNone(dj.outcome_of(text))
+        self.assertEqual(qs.OUT_FAILED, _snap(text)["outcome"])
+
+    def test_the_selfheal_wrapper_keeps_the_judges_word(self):
+        """Строки самопочинки (pc_orchestrator.py, ветка halt) лежат НАД маркером судьи."""
+        text = ("задача упала → думатель: halt, причина: продукт двойной\n"
+                "Перерождение не поможет (диагноз думателя выше), нужен человек.\n"
+                + _judge_unknown(REASON_55))
+        self.assertEqual(dj.UNKNOWN, dj.outcome_of(text))
+
+    def test_the_borrowed_daemon_head_matches_its_owner(self):
+        self.assertEqual(o._DAEMON_MARK, dj._DAEMON_HEAD)
+        self.assertEqual(sig.FAIL_HEAD, dj._DAEMON_HEAD)
+
+    def test_our_real_failure_and_signal_a_are_as_yesterday(self):
+        ours = _queue(OURS_NO_ARTIFACT)
+        self.assertEqual(qs.OUT_FAILED, _snap(ours)["outcome"])
+        rows = [_box(61, "failed", ours), _box(62, "failed", _queue(_timeout(draft="разбор: %s" % QUOTE)))]
+        self.assertTrue(sig.signal_a(rows, judged={})["on"])
+        ext = [_box(51, "failed", _queue(LIVE_51)), _box(52, "failed", _queue(LIVE_51))]
+        self.assertFalse(sig.signal_a(ext, judged={})["on"])
+
+    def test_the_count_is_loud_and_a_fifth_raises_the_alarm_on_live_forms(self):
+        texts = [_queue(_timeout(draft="разбор: %s" % QUOTE)),
+                 _queue(dj.fail_result({"verdict": dj.UNPROVEN, "reason": "нет"}, "Разбор: %s" % QUOTE)),
+                 _queue(LIVE_51), _queue(_judge_unknown(REASON_55)), _queue(OURS_NO_ARTIFACT)]
+        recs = []
+        for i, text in enumerate(texts):
+            item = _snap(text, tid=80 + i)
+            item["at"] = 1000 + i
+            recs.append(item)
+        got = cd.series(recs, target=5, judged={})
+        self.assertEqual((2, 1, True), (got["unknown"], got["unknown_ext"], got["alarm"]))
+        self.assertIn("НЕИЗВЕСТНО 2 из 5", cd.unknown_words(got))
+        zero = cd.series(recs[:2] + recs[4:], target=5, judged={})
+        self.assertIn("НЕИЗВЕСТНО 0 из 3", cd.unknown_words(zero))
+
+    def test_the_cut_on_show_declares_itself_by_number(self):
+        line = qs.shown(LIVE_51, qs.WHY_MAX)
+        self.assertIn("[показано %d из %d симв., хвост не показан]" % (qs.WHY_MAX - 1, len(LIVE_51)), line)
+        why = _queue(LIVE_51)
+        first = why.splitlines()[0]
+        self.assertIn("[показано %d из %d симв., хвост не показан]" % (len(first), len(" ".join(why.split()))),
+                      qs.shown(why, qs.WHY_MAX), "у формы очереди не объявлены строки ниже шапки")
+        self.assertEqual("коротко", qs.shown("коротко", qs.WHY_MAX), "короткое помечено зря")
+        self.assertIn("хвост не показан", qs.shown("строка\nвторая", qs.WHY_MAX), "потеря строк молчит")
+        body = qs.render_body([], {"k": _snap(why, tid=51)}, 0, 0)
+        self.assertIn("показано", [ln for ln in body.splitlines() if "#51" in ln][0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
