@@ -449,5 +449,110 @@ class TestNegativeThreeEnds(unittest.TestCase):
         self.assertIn("[причина=exec_error · ошибка выполнения]", text)
 
 
+# ═══════════════════════ 5. НЕИЗВЕСТНОСТЬ СУДЬИ СИГНАЛ А НЕ ПРОХОДИТ (17.09.2026, 62-r) ══════
+#
+# Вопрос Штаба: чем «неизвестно» судьи отличается от чужого отказа ДЛЯ СИГНАЛА А. Ответ —
+# фактами, которых текст не производит (разбор — артефакт 62-r в docs/artifacts за 17.09):
+#   • судья зовётся ТОЛЬКО на `done` (`done_judge_pc.judge`), то есть процесс вышел с rc=0 и
+#     части демона `[причина=…]: claude exit=<не ноль> … следов нет` у ряда нет вовсе — оба
+#     условия правила 62-p ложны, и то же правило называет ряд НАШИМ;
+#   • слот съеден: живой #55 шёл 845.58 с и положил коммит 1ba5506, а чужой отказ #51 — 4.38 с,
+#     0/0, и слот вернул (`shtab_box.billable` вычитает только ключи различителя);
+#   • препятствие судье создал ПРОДУКТ: у 4 из 4 рядов ящика за срез (#102, #245, #3, #55) —
+#     второй файл по словам адреса либо секретоподобная строка в артефакте;
+#   • у вычеркнутого чужого отказа есть своя остановка (сигнал Д, три подряд), у неизвестности
+#     судьи её нет — вычерк из А не оставил бы ни одной.
+# Поэтому ряд остаётся в корпусе А, а льготу (не засчитывает и не рвёт) даёт только серия.
+
+import done_judge_pc as dj                 # noqa: E402
+import shtab_box as sb                     # noqa: E402
+
+# Ряд #55 ящика, 17.09.2026: причина — ДОСЛОВНО `pc_orchestrator.log:1034`, маркер кладёт живой
+# `done_judge_pc.fail_result`. Хвост доклада исполнителя условный (в лог он не пишется).
+REASON_55 = ("по адресу за заход изменилось 2 файла(ов), отвечающих словам адреса "
+             "(docs/artifacts/2026-09-17-zamer-sekund-dveri-quote-price-1709.md, "
+             "docs/artifacts/2026-09-17-ВОСЕМЬ-sutok-zhivaya-dver-1709.md) — который из них "
+             "продукт задачи, судья не знает")
+# Ряд #102 ящика, 06.09.2026 (`pc_orchestrator.log.1:15534`, путь в логе обрезан — здесь условный).
+REASON_102 = ("по адресу за заход изменилось 3 файла(ов), отвечающих словам адреса "
+              "(docs/artifacts/2026-09-06-a.md, docs/artifacts/2026-09-06-b.md, "
+              "docs/artifacts/2026-09-06-c.md) — который из них продукт задачи, судья не знает")
+
+
+def _judge_unknown(reason, report="FACT: commit в git log. Отчёт исполнителя."):
+    return dj.fail_result({"verdict": dj.UNKNOWN, "reason": reason}, report)
+
+
+def _box(tid, status, result, key=None):
+    """Ряд очереди с маркером ящика → ряд корпуса сигналов (через живой `box_rows`)."""
+    raw = {"id": tid, "status": status, "result": result,
+           "task_text": "%s дата=2026-09-17 ключ=%s] %s\nтело"
+                        % (sb.MARK, key or ("k%03d" % tid), sb.HEAD_WORDS)}
+    return sig.box_rows([raw])[0]
+
+
+def _timeout(draft=None):
+    import pc_orchestrator as o
+    return o.fail_result(o.FAIL_RUN_TIMEOUT, "headless не уложился в 2700s", since=None,
+                         draft=draft)
+
+
+class TestJudgeUnknownStaysInSignalA(unittest.TestCase):
+    """Неизвестность судьи — НЕ чужой отказ: из корпуса сигнала А она не вычёркивается."""
+
+    def test_the_live_55_form_is_ours_by_the_same_rule(self):
+        """То же правило (62-p), а не второе: части демона нет — различитель говорит «наш»."""
+        text = _judge_unknown(REASON_55)
+        self.assertEqual(dj.UNKNOWN, dj.outcome_of(text), "фикстура не в живой форме судьи")
+        yes, words = sig.external_refusal({"status": "failed", "result": text})
+        self.assertFalse(yes, words)
+        self.assertIn("нет части демона", words)
+
+    def test_the_series_still_gives_its_grace_and_names_the_judge(self):
+        """Льгота серии цела (П4): исход «неизвестно», виновник — судья, а не чужая сторона."""
+        text = _judge_unknown(REASON_55)
+        self.assertEqual(qs.OUT_UNKNOWN, qs.outcome_of(text))
+        self.assertEqual(qs.UNKNOWN_BY_JUDGE, qs.unknown_by(text))
+
+    def test_the_slot_is_eaten_unlike_a_foreign_refusal(self):
+        """Суточный счёт возвращает слот ТОЛЬКО чужому отказу: #51 — да, #55 — нет."""
+        rows = [_box(51, "failed", LIVE_51, key="k-ext"),
+                _box(55, "failed", _judge_unknown(REASON_55), key="k-judge")]
+        self.assertEqual({"k-ext"}, sig.external_keys(rows))
+
+    def test_two_judge_unknowns_in_a_row_still_stop_the_box(self):
+        rows = [_box(55, "failed", _judge_unknown(REASON_55)),
+                _box(56, "failed", _judge_unknown(REASON_102))]
+        got = sig.signal_a(rows, judged={})
+        self.assertTrue(got["on"], got["why"])
+        self.assertEqual(["#55", "#56"], got["evidence"])
+
+    def test_the_live_06_09_pair_timeout_then_judge_unknown_stops_as_it_did(self):
+        """Живая остановка 06.09 18:46:09: #101 таймаут 2700 с, #102 — судья «3 файла»."""
+        rows = [_box(101, "failed", _timeout()),
+                _box(102, "failed", _judge_unknown(REASON_102))]
+        got = sig.signal_a(rows, judged={})
+        self.assertTrue(got["on"], got["why"])
+
+    def test_a_proved_neighbour_keeps_it_silent(self):
+        """ПОЛОЖИТЕЛЬНЫЙ КОНТРОЛЬ, живое состояние 17.09: #54 доказан, #55 неизвестен — А молчит."""
+        r54 = _box(54, "done", "сдано")
+        rows = [r54, _box(55, "failed", _judge_unknown(REASON_55))]
+        judged = {cd.row_name(54, r54["goal"]): {"proved": True, "addressed": True}}
+        got = sig.signal_a(rows, judged=judged)
+        self.assertFalse(got["on"], got["why"])
+
+    def test_a_quoted_judge_marker_in_our_timeout_buys_nothing(self):
+        """Маркер судьи ищется в тексте ГДЕ УГОДНО (`done_judge_pc.outcome_of`): цитата в
+        черновике нашего таймаута делает ряд «неизвестным» для разбора исхода. Сигнал А по
+        этому тексту не судит, поэтому пара наших таймаутов с цитатой держит ящик, как без неё."""
+        quoted = _timeout(draft="разбор: «%s — пример»" % dj.UNKNOWN_PREFIX)
+        rows = [_box(61, "failed", quoted), _box(62, "failed", quoted)]
+        self.assertTrue(sig.signal_a(rows, judged={})["on"])
+        plain = [_box(61, "failed", _timeout()), _box(62, "failed", _timeout())]
+        self.assertEqual(sig.signal_a(plain, judged={})["on"],
+                         sig.signal_a(rows, judged={})["on"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
