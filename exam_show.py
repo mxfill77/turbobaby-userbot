@@ -53,6 +53,16 @@ VERDICTS = os.path.join(REPO, "exam_verdicts.tsv")      # журнал тапо�
 CASES = os.path.join(REPO, "trainer_cases.json")
 SESSION = os.path.join(REPO, "exam_session.json")       # рабочий стол ОДНОГО кейса (вне git)
 
+# ── ЖИВОЙ НАБОР (заведён 17.09.2026, задание 63-n) ───────────────────────────────────────────
+# Кейсы из обезличенной базы переписки (`client_chats.anonstable.jsonl`) с ответом менеджера
+# эталоном. Свой корпус и свой каталог снимков, оба под .gitignore: внутри живой текст клиента и
+# менеджера, а база переписки в git не идёт ни строкой. Корпус тренажёра НЕ трогается, и это не
+# осторожность: его отпечаток держит все снимки основного набора, и кейс, дописанный туда, отказал
+# бы показу каждого из семнадцати («черновик собран на корпусе …, а на диске сейчас …»).
+LIVE_DIR = os.path.join(REPO, "exam_live")
+LIVE_CASES = os.path.join(LIVE_DIR, "cases.json")
+LIVE_SHOTS = os.path.join(LIVE_DIR, "shots")
+
 # ПУТЬ БАЗЫ УРОКОВ ОТДЕЛЬНЫМ ИМЕНЕМ — ради набора, а не ради гибкости. `None` значит «боевая
 # таблица, та же, куда пишет кнопка «🎓 Обучить»»: второй базы уроков у полосы нет и не заводится.
 # Набор подменяет это поле на временный файл и тем доказывает, что боевых строк не пишет ни одна
@@ -576,6 +586,55 @@ def reason_line(shot, limit=220):
     return note[:limit] + ("…" if len(note) > limit else "")
 
 
+# ── ЭТАЛОН: ОТВЕТ ЧЕЛОВЕКА РЯДОМ С ОТВЕТОМ БОТА (заведён 17.09.2026, задание 63-n) ────────────
+# ЗАЧЕМ. Владелец судит ответ бота с эталоном перед глазами: что ответил живой менеджер на тот же
+# вопрос тогда. Эталон приходит из КОРПУСА кейса (поле `reference`) и ложится в снимок ОТДЕЛЬНЫМ
+# полем — рядом с `draft`, но не внутри него.
+#
+# ТРИ ЗАМКА ОТ СМЕШЕНИЯ:
+#   1. голова эталона НЕ ВИДИТ: `freeze` отдаёт раннеру кейс БЕЗ поля `reference` — иначе бот
+#      списал бы ответ, по которому его судят, и сравнение мерило бы копирование;
+#   2. критику эталон не передаётся: подсказки остаются теми же, что у кнопки «🎓 Обучить»;
+#   3. в карточке эталон стои́т СВОИМ блоком с пометкой «ответ человека», ПОСЛЕ блока бота, и с
+#      `draft` не склеивается ни одной веткой.
+# Снимок без поля (все снимки основного набора) показывается БАЙТ В БАЙТ как прежде: блока нет.
+REFERENCE_KEY = "reference"
+REFERENCE_FIELDS = ("who", "text", "mark", "parts", "gap_sec", "base")
+
+
+def reference_of(case):
+    """Эталон кейса → dict для снимка | None (поля у кейса нет — эталона не заявляли).
+
+    Поле ЕСТЬ, а текста нет — отдаётся dict с пустым текстом, а не None: «эталона не заявляли» и
+    «заявили, а сцепить не смогли» — разные новости, и карточка говорит их разными словами."""
+    if REFERENCE_KEY not in (case or {}):
+        return None
+    ref = case.get(REFERENCE_KEY)
+    ref = ref if isinstance(ref, dict) else {}
+    out = dict((k, ref[k]) for k in REFERENCE_FIELDS if k in ref)
+    out["who"] = str(ref.get("who") or "менеджер")
+    out["text"] = str(ref.get("text") or "").strip()
+    return out
+
+
+def reference_block(shot):
+    """Эталон человека в карточке → строка. Поля в снимке нет — '' (блока нет вовсе).
+
+    Пустой текст при поле — слова «не сцеплен», а не пустой блок: эталон не выдумывается."""
+    if REFERENCE_KEY not in (shot or {}):
+        return ""
+    ref = shot.get(REFERENCE_KEY)
+    ref = ref if isinstance(ref, dict) else {}
+    text = str(ref.get("text") or "").strip()
+    if not text:
+        return ("👤 ЭТАЛОН — ОТВЕТ ЧЕЛОВЕКА: ответ менеджера на этот вопрос в базе НЕ сцеплен — "
+                "сравнивать не с чем, выдумывать его не стали.")
+    where = ", ".join(x for x in (str(ref.get("mark") or ""),
+                                  ("база %s" % ref["base"]) if ref.get("base") else "") if x)
+    return ("👤 ЭТАЛОН — ОТВЕТ ЧЕЛОВЕКА (%s, тогда%s). Это НЕ ответ бота, бот его не видел:\n%s" % (
+        ref.get("who") or "менеджер", (", " + where) if where else "", text))
+
+
 def freeze(case_id, cases_path=None, runner=None, now=None, ph=None, critic=None):
     """Собрать черновик кейса ОДИН раз и положить на диск. → (ok, путь|причина, shot|None).
 
@@ -618,7 +677,10 @@ def freeze(case_id, cases_path=None, runner=None, now=None, ph=None, critic=None
         if runner is None:
             def runner(c):
                 return trainer_run.run_case(c, ph)
-        rec = runner(case)
+        # ГОЛОВА И КРИТИК ВИДЯТ КЕЙС БЕЗ ЭТАЛОНА (замок 1 узла «ЭТАЛОН»): поле вырезается здесь,
+        # до первого чужого вызова, а в снимок эталон кладётся из ПОЛНОГО кейса ниже.
+        head_case = dict((k, v) for k, v in case.items() if k != REFERENCE_KEY)
+        rec = runner(head_case)
         draft = (rec.get("draft") or "").strip()
         if not draft:
             return False, "голова не дала черновика (%s) — показывать нечего" % (
@@ -636,7 +698,7 @@ def freeze(case_id, cases_path=None, runner=None, now=None, ph=None, critic=None
         # головы и у критика — `build_transcript` чистая функция от (case, ph), и второй её вызов
         # даёт тот же текст. Подбор детерминирован, поэтому метки здесь — те самые, что стояли в
         # промпте, а не похожие. Пусто — законный исход («примеров ниже порога нет»), а не поломка.
-        transcript = trainer_run.build_transcript(case, ph)
+        transcript = trainer_run.build_transcript(head_case, ph)
         try:
             import suggest
             examples = suggest.live_examples_marks(transcript)
@@ -673,6 +735,10 @@ def freeze(case_id, cases_path=None, runner=None, now=None, ph=None, critic=None
             # Пустой список — «ловушка стояла, карточек не было»; поля нет — снимок старше ловушки.
             OWNER_CARDS_KEY: [dict(c) for c in trap.cards],
         }
+        # ЭТАЛОН — ТОЛЬКО когда кейс его заявил: снимки основного набора ключа не получают, и их
+        # состав полей остаётся прежним.
+        if REFERENCE_KEY in case:
+            shot[REFERENCE_KEY] = reference_of(case)
         os.makedirs(SHOTS_DIR, exist_ok=True)
         with open(target, "w", encoding="utf-8", newline="\n") as f:
             json.dump(shot, f, ensure_ascii=False, indent=2, sort_keys=True)
@@ -773,6 +839,7 @@ def card_text(shot, slots_total=None, passed=None):
         older = ("\nЭто НОВЕЙШИЙ снимок кейса (всего слотов %d); прежние сохранены и не тронуты — "
                  "их коммиты другие." % int(slots_total))
     score = "" if passed is None else " · пройдено %d" % int(passed)
+    ref = reference_block(shot)
     head = (
         "🎓 ЭКЗАМЕН · кейс %s из %s%s — %s\n"
         "Показан ЗАФИКСИРОВАННЫЙ ответ от %s (коммит %s, корпус %s). Голова сейчас НЕ звалась." % (
@@ -781,9 +848,11 @@ def card_text(shot, slots_total=None, passed=None):
     body = (
         "\n\n❓ КЛИЕНТ:\n%s\n\n"
         "🤖 БОТ:\n%s\n\n"
+        "%s"
         "📌 ПОЧЕМУ так: %s\n%s\n\n%s\n\n%s" % (
             shot.get("question") or "(вопрос не записан)",
-            shot.get("draft") or "(ответа нет)", reason_line(shot), examples_line(shot),
+            shot.get("draft") or "(ответа нет)", (ref + "\n\n") if ref else "",
+            reason_line(shot), examples_line(shot),
             hints_block(shot), buttons_legend(shot)))
     return head + older + body
 
@@ -1691,7 +1760,26 @@ def build_parser():
     p.add_argument("--agent", action="store_true", help="несёт ли живой pc_agent код кнопки")
     p.add_argument("--reach", action="store_true",
                    help="видна ли группа-тренажёр нашему боту (getChat, ничего не отправляет)")
+    p.add_argument("--live", action="store_true",
+                   help="ЖИВОЙ набор (exam_live/): только --freeze, --card, --slots; показа и тапа нет")
     return p
+
+
+# Что живой набор умеет СЕГОДНЯ. Показ и двери тапа ему НЕ подключены, и отказ говорит почему:
+# колбэк `exam:ok:N` агент несёт в дверь ОСНОВНОГО набора, а журнал вердиктов и стол у наборов
+# общие — тап по живому кейсу 1 лёг бы вердиктом кейсу 1 тренажёра.
+LIVE_DOORS = ("freeze", "card", "slots")
+LIVE_REFUSED = ("⛔ живой набор показу и тапу НЕ подключён: колбэк «exam:<слово>:N» агент несёт в "
+                "дверь ОСНОВНОГО набора, а журнал вердиктов и стол у наборов общие — тап по живому "
+                "кейсу лёг бы вердиктом кейсу тренажёра с тем же номером. Доступно: --freeze, "
+                "--card, --slots. Ничего не сделано.")
+
+
+def use_live_set():
+    """Переключить модуль на живой набор: корпус и каталог снимков. Журнал и стол НЕ переключаются
+    — двери, которые их пишут, живому набору закрыты (`LIVE_REFUSED`)."""
+    global CASES, SHOTS_DIR
+    CASES, SHOTS_DIR = LIVE_CASES, LIVE_SHOTS
 
 
 def main(argv=None):
@@ -1702,6 +1790,13 @@ def main(argv=None):
     # вместо расписки о записанном вердикте.
     io_utf8.force_utf8()
     a = build_parser().parse_args(argv)
+    if a.live:
+        others = ("show", "tap", "toggle", "apply", "own", "own_text", "rollback", "trace",
+                  "agent", "reach")
+        if any(getattr(a, k) for k in others) or not any(getattr(a, k) for k in LIVE_DOORS):
+            print(LIVE_REFUSED)
+            return 2
+        use_live_set()
     if a.own_text:
         # ТЕКСТ ЕДЕТ ЧЕРЕЗ stdin, А НЕ ЧЕРЕЗ argv, и это не вкусовщина: правило владельца — живая
         # кириллица произвольной длины, а argv на Windows ходит через кодировку консоли и коверкает

@@ -1910,5 +1910,94 @@ def dispatch_notify_module():
     return dispatch_notify
 
 
+# ───────── ЭТАЛОН ЧЕЛОВЕКА РЯДОМ С ОТВЕТОМ БОТА (заведено 17.09.2026, задание 63-n) ─────────
+# Текст эталона фикстуры выдуманный и нарочно не похож на ответ бота: смешение было бы видно
+# подстрокой, а не рассуждением.
+
+REF_TEXT = "Добрый день! Уточните, пожалуйста, даты и район — подберём."
+
+
+class TestTheReferenceStandsApart(Base):
+    def corpus(self, cases):
+        p = os.path.join(self.tmp, "cases.json")
+        with open(p, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"cases": cases}, f, ensure_ascii=False)
+        return p
+
+    LIVE = {"id": 1, "name": "живое первое сообщение", "lang": "ru",
+            "lines": ["Здравствуйте, хочу взять байк в аренду"], "expect": {},
+            "reference": {"who": "менеджер", "text": REF_TEXT, "mark": "д7·р1", "parts": 1,
+                          "gap_sec": 146, "base": "0123456789abcdef"}}
+
+    def with_ref(self, text=REF_TEXT):
+        return dict(_shot(), reference={"who": "менеджер", "text": text, "mark": "д7·р1",
+                                        "base": "0123456789abcdef"})
+
+    def test_a_shot_without_the_field_gets_no_block_and_the_same_card(self):
+        """Снимок основного набора (поля нет) — блока нет, карточка та же, что без правки: вырезка
+        блока из карточки со снимком-двойником С ПОЛЕМ даёт ровно карточку без поля."""
+        plain = exam_show.card_text(_shot())
+        self.assertEqual(exam_show.reference_block(_shot()), "")
+        self.assertNotIn("ЭТАЛОН", plain)
+        withref = exam_show.card_text(self.with_ref())
+        self.assertEqual(withref.replace(exam_show.reference_block(self.with_ref()) + "\n\n", ""),
+                         plain)
+
+    def test_the_reference_is_its_own_block_after_the_bot_and_marked_human(self):
+        shot = self.with_ref()
+        card = exam_show.card_text(shot)
+        self.assertEqual(card.count(REF_TEXT), 1)
+        bot = card.split("🤖 БОТ:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(bot, shot["draft"], "в блок бота подмешано чужое")
+        self.assertNotIn(REF_TEXT, bot)
+        self.assertLess(card.index("🤖 БОТ:"), card.index("👤 ЭТАЛОН — ОТВЕТ ЧЕЛОВЕКА"))
+        self.assertLess(card.index("👤 ЭТАЛОН — ОТВЕТ ЧЕЛОВЕКА"), card.index("📌 ПОЧЕМУ"))
+        self.assertIn("Это НЕ ответ бота", card)
+        self.assertIn("д7·р1", card)
+
+    def test_an_empty_reference_says_not_linked_and_invents_nothing(self):
+        block = exam_show.reference_block(self.with_ref(text="  "))
+        self.assertIn("НЕ сцеплен", block)
+        self.assertNotIn(":\n", block)
+
+    def test_freeze_puts_the_reference_in_the_shot_and_hides_it_from_head_and_critic(self):
+        seen_head, seen_critic = [], []
+
+        def runner(case):
+            seen_head.append(case)
+            return {"draft": "ответ бота", "note": "записка"}
+
+        def critic(q, a, tr=""):
+            seen_critic.append((q, a, tr))
+            return list(HINTS)
+        ok, where, shot = exam_show.freeze(1, cases_path=self.corpus([self.LIVE]), runner=runner,
+                                           ph=PH, critic=critic)
+        self.assertTrue(ok, where)
+        self.assertNotIn("reference", seen_head[0], "голова увидела эталон")
+        self.assertNotIn(REF_TEXT, json.dumps(seen_head, ensure_ascii=False))
+        self.assertNotIn(REF_TEXT, json.dumps(seen_critic, ensure_ascii=False))
+        self.assertEqual(shot["reference"]["text"], REF_TEXT)
+        self.assertEqual(shot["reference"]["mark"], "д7·р1")
+        self.assertEqual(shot["draft"], "ответ бота")
+        with open(where, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["reference"]["text"], REF_TEXT)
+
+    def test_freeze_of_a_case_without_the_field_adds_no_key(self):
+        case = dict(self.LIVE)
+        case.pop("reference")
+        ok, where, shot = exam_show.freeze(
+            1, cases_path=self.corpus([case]), runner=lambda c: {"draft": "ответ", "note": ""},
+            ph=PH, critic=self.critic())
+        self.assertTrue(ok, where)
+        self.assertNotIn("reference", shot)
+
+    def test_the_live_set_refuses_show_and_tap_and_switches_nothing(self):
+        was = (exam_show.CASES, exam_show.SHOTS_DIR)
+        for argv in (["--live", "--case", "1", "--show"], ["--live", "--case", "1", "--tap", "ok"],
+                     ["--live", "--trace"], ["--live", "--case", "1"]):
+            self.assertEqual(exam_show.main(argv), 2, argv)
+            self.assertEqual((exam_show.CASES, exam_show.SHOTS_DIR), was, argv)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
