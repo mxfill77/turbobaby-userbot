@@ -964,6 +964,9 @@ class ManusPartsIntoOneTaskTest(unittest.TestCase):
         self.assertEqual(facts["parts_seen"], list(range(1, n + 1)), "число доехавших называет канал")
         self.assertEqual(facts["silent_turns"], n - 1)
         self.assertIsNone(facts["split_error"])
+        # Протокол помнит код КАЖДОГО POST (создание + досылки) и ответ на досылку.
+        self.assertEqual(facts["part_status"], [200] * n, "код ответа на каждую часть")
+        self.assertEqual(len(facts["part_replies"]), n - 1, "ответ на каждую досылку")
         # Склейка тел частей в задаче — исходный текст знак в знак.
         heads = [review_send_run._part_head(k, n) for k in range(1, n + 1)]
         bodies = [m["content"][0]["text"][len(h):] for m, h in zip(channel.user_messages(), heads)]
@@ -973,6 +976,27 @@ class ManusPartsIntoOneTaskTest(unittest.TestCase):
         self.assertEqual(answer, "")
         # Цена немоты по часам захода: по два подтверждающих опроса на часть.
         self.assertEqual(facts["waited_sec"], n * 10 * review_send_run.MANUS_EMPTY_CONFIRM_POLLS)
+
+    def test_refused_follow_up_keeps_its_own_code_in_the_protocol(self):
+        """Досылка k/N отбита кодом — протокол называет КОД ЭТОЙ части, а не «< 400 у всех»."""
+        base = _TaskChannel("silent")
+
+        def channel(url, *, key, data=None, method="GET", timeout=None):
+            if method == "POST" and base.posts == 2:
+                base.posts += 1
+                return {"target": url, "request_sent": True, "transport_error": None,
+                        "status": 429, "body": '{"code":"too_many"}'}
+            return base(url, key=key, data=data, method=method, timeout=timeout)
+
+        review_send_run.manus_http = channel
+        clock = _Clock()
+        facts = review_send_run.send_manus(
+            self.PROMPT, key="проба", wait=1800, poll=10, sleep=clock.sleep, clock=clock
+        )
+        self.assertEqual(facts["part_status"], [200, 200, 429])
+        self.assertEqual(facts["parts_sent"], 3)
+        self.assertIn("часть 3/", facts["part_error"])
+        self.assertEqual(facts["part_replies"][-1], '{"code":"too_many"}')
 
     def test_replying_channel_still_gets_an_answer(self):
         """Поведение 01.09 («ПРИНЯТО» на каждую часть) не сломано правкой."""
