@@ -774,7 +774,7 @@ class TestCandidateRecord(Base):
         self.put_shot(_shot(case=2))
         self.tap("ok", case=1)
         self.tap("no", case=2)
-        exam_show.rollback(2, who="@filipp", path=self.log)
+        exam_show.rollback(2, who="@filipp", path=self.log, right_fn=lambda w: True)
         self.tap("ok", case=2)
         nums = [r["номер"] for r in exam_show.load_verdicts(self.log)]
         self.assertEqual(nums, [1, 2, 3], "откат не смеет освободить номер под чужой вердикт")
@@ -782,7 +782,7 @@ class TestCandidateRecord(Base):
     def test_rollback_keeps_the_row_and_only_changes_the_state(self):
         self.tap()
         before = self.raw().splitlines()
-        ok, msg = exam_show.rollback(1, who="@filipp", path=self.log)
+        ok, msg = exam_show.rollback(1, who="@filipp", path=self.log, right_fn=lambda w: True)
         self.assertTrue(ok, msg)
         after = self.raw().splitlines()
         self.assertEqual(len(before), len(after), "строка обязана остаться на месте")
@@ -793,18 +793,56 @@ class TestCandidateRecord(Base):
 
     def test_second_rollback_refuses_with_its_own_words(self):
         self.tap()
-        exam_show.rollback(1, who="@f", path=self.log)
-        ok, msg = exam_show.rollback(1, who="@f", path=self.log)
+        exam_show.rollback(1, who="@f", path=self.log, right_fn=lambda w: True)
+        ok, msg = exam_show.rollback(1, who="@f", path=self.log, right_fn=lambda w: True)
         self.assertFalse(ok)
         self.assertIn("уже не кандидат", msg)
 
     def test_rollback_of_a_missing_number_touches_nothing(self):
         self.tap()
         raw = self.raw()
-        ok, msg = exam_show.rollback(99, who="@f", path=self.log)
+        ok, msg = exam_show.rollback(99, who="@f", path=self.log, right_fn=lambda w: True)
         self.assertFalse(ok)
         self.assertIn("нет", msg)
         self.assertEqual(self.raw(), raw)
+
+    def test_rollback_asks_the_same_right_as_the_record(self):
+        """ЗАМОК ОТКАТА (17.09.2026): до правки чужое имя откатывало вердикт №1 живым вызовом.
+
+        Предикат права — СПИСОК ИМЁН с нормализацией `@`/регистра, как у `suggest.is_approver`, а
+        не «да/нет» литералом: иначе проверка зеленела бы и на двери, которая имени не читает."""
+        def right(who):
+            return (who or "").lstrip("@").lower() == "filipp"
+        self.tap()
+        raw = self.raw()
+        for alien in ("chuzhoy_0917", "@chuzhoy_0917", "", None):
+            ok, msg = exam_show.rollback(1, who=alien, path=self.log, right_fn=right)
+            self.assertFalse(ok, msg)
+            self.assertIn("не вправе откатывать", msg)
+            self.assertIn("Вердикт №1 не тронут", msg)
+            self.assertEqual(self.raw(), raw, "чужой откат не смеет тронуть ни байта журнала")
+        ok, msg = exam_show.rollback(1, who="@Filipp", path=self.log, right_fn=right)
+        self.assertTrue(ok, msg)
+        self.assertEqual(exam_show.passed_count(exam_show.load_verdicts(self.log)), 0)
+
+    def test_rollback_and_record_ask_one_and_the_same_default_right(self):
+        """Без подставленного права ОБЕ двери зовут ОДИН предикат — `moderation_core.may_write_rule`.
+        Меряем вызовами, а не текстом исходника: общий предикат, позванный одной дверью и не
+        позванный другой, в тексте выглядел бы одинаково."""
+        import moderation_core
+        asked = []
+
+        def spy(who):
+            asked.append(who)
+            return False
+        was, moderation_core.may_write_rule = moderation_core.may_write_rule, spy
+        try:
+            ok_tap, _ = exam_show.tap(1, "ok", "@кто", path=self.log)
+            ok_rb, msg = exam_show.rollback(1, who="@кто", path=self.log)
+        finally:
+            moderation_core.may_write_rule = was
+        self.assertEqual((ok_tap, ok_rb), (False, False), msg)
+        self.assertEqual(asked, ["@кто", "@кто"], "откат обязан спросить тот же предикат, что запись")
 
     def test_a_tab_in_the_author_name_cannot_break_the_table(self):
         """Экранирование ЧУЖОЕ (lesson_store.esc) — своя вторая копия разъехалась бы с первой."""
@@ -1064,7 +1102,7 @@ class TestFiveNegativesOfTheWorkplace(DeskBase):
         self.assertIn("уже судим", second)
         self.assertEqual(len(exam_show.load_verdicts(self.log)), 1)
         # откат освобождает кейс — иначе пересудить его было бы нечем
-        exam_show.rollback(1, who="@filipp", path=self.log)
+        exam_show.rollback(1, who="@filipp", path=self.log, right_fn=self.yes)
         ok, third = self.tap("no")
         self.assertTrue(ok, third)
         self.assertEqual(len(exam_show.load_verdicts(self.log)), 2)
@@ -1240,6 +1278,113 @@ class TestOwnWordsLesson(DeskBase):
         self.assertFalse(ok)
         self.assertIn("Пустой урок", msg)
         self.assertEqual(self.lesson_rows(), [])
+
+
+class TestAJudgedCaseGetsNoLessons(DeskBase):
+    """ЗАМОК «УЖЕ СУДИМ» СТОИТ ДО УРОКОВ (17.09.2026). До правки обе двери сперва писали урок, а
+    потом слышали «второй записи не делаем»: живой прогон 17.09 оставил урок #18 действующим без
+    вердикта. Стол здесь остаётся на судимом кейсе — так живьём бывает на последнем кейсе и на
+    кейсе, за которым нет снимка: показ следующего отказывает ДО перевода стола."""
+
+    def judge_and_stay(self):
+        ok, msg = exam_show.tap(1, "ok", "@filipp", right_fn=self.yes, path=self.log,
+                                sender=self.send, agent_fn=lambda **_: (None, "следующего нет"))
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(exam_show.load_verdicts(self.log)), 1)
+
+    def test_apply_on_a_judged_case_writes_zero_lessons(self):
+        self.toggle(1)
+        self.judge_and_stay()
+        self.assertEqual(exam_show.load_session(self.desk)["selected"], [1],
+                         "стол обязан остаться на судимом кейсе — иначе меряем не тот замок")
+        ok, msg = self.apply()
+        self.assertFalse(ok, msg)
+        self.assertIn("уже судим", msg)
+        self.assertIn(exam_show.JUDGED_NO_LESSONS, msg)
+        self.assertEqual(self.lesson_rows(), [], "по судимому кейсу уроков — ноль")
+        self.assertEqual(len(exam_show.load_verdicts(self.log)), 1)
+
+    def test_own_words_on_a_judged_case_write_zero_lessons_and_end_the_waiting(self):
+        self.judge_and_stay()
+        ok, msg = exam_show.own_start(1, "@filipp", right_fn=self.yes, session_path=self.desk)
+        self.assertTrue(ok, msg)
+        ok, msg = exam_show.own_take("правило своими словами", "@filipp", right_fn=self.yes,
+                                     path=self.log, session_path=self.desk, sender=self.send,
+                                     agent_fn=self.fresh_agent())
+        self.assertFalse(ok, msg)
+        self.assertIn("уже судим", msg)
+        self.assertIn(exam_show.JUDGED_NO_LESSONS, msg)
+        self.assertEqual(self.lesson_rows(), [], "по судимому кейсу уроков — ноль")
+        self.assertEqual(len(exam_show.load_verdicts(self.log)), 1)
+        self.assertEqual(exam_show.pending_own(self.desk), (None, None),
+                         "ожидание снято: следующий текст не должен слышать тот же отказ")
+
+    def test_a_free_case_still_gets_its_lessons(self):
+        """Обратная сторона замка: несудимый кейс пишет уроки как прежде."""
+        self.toggle(1)
+        ok, msg = self.apply()
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(self.lesson_rows()), 1)
+
+
+class TestRulesVersionIsAStringFromTheLiveType(Base):
+    """ВЕРСИЯ ПРАВИЛ — СТРОКОЙ (17.09.2026). Значение снимается с ЖИВОГО `lesson_store.Version`
+    настоящей таблицы, а не подставляется строкой: прежний набор собирал снимок с `rules="v1"` и
+    потому не видел, что живой тип — кортеж, который `json.dump` кладёт списком."""
+
+    def live_version(self):
+        import lesson_store
+        lesson_store.add(question="вопрос", bot_answer="ответ", correct="правило",
+                         why="потому что так", who="@filipp", source=lesson_store.SOURCE_EXAM,
+                         path=self.lessons)
+        v = lesson_store.version(self.lessons)
+        self.assertIs(type(v), lesson_store.Version)
+        self.assertTrue(v.ok, v.say)
+        return v
+
+    def test_freeze_writes_the_version_as_a_string(self):
+        v = self.live_version()
+        ok, path, shot = exam_show.freeze(
+            1, runner=lambda c: {"draft": "ответ", "note": ""}, ph=PH, critic=self.critic())
+        self.assertTrue(ok, path)
+        self.assertEqual(shot["rules"], v.said)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["rules"], v.said, "на диске — строка, а не список")
+
+    def test_an_old_shot_with_the_list_form_reads_as_the_version(self):
+        """Старый снимок НЕ переписывается: его список читается версией при записи вердикта."""
+        v = self.live_version()
+        old = json.loads(json.dumps(v))
+        self.assertIsInstance(old, list, "так живой тип ложился в снимки 11–17.09")
+        self.assertEqual(exam_show.rules_text(old), v.said)
+        self.put_shot(_shot(rules=old))
+        ok, msg = exam_show.tap(1, "ok", "@filipp", right_fn=lambda w: True, path=self.log,
+                                sender=self.sender(), agent_fn=self.fresh_agent())
+        self.assertTrue(ok, msg)
+        self.assertEqual(exam_show.load_verdicts(self.log)[0]["правила"], v.said)
+        self.assertIn("правила %s." % v.said, msg, "квитанция владельцу — версия, а не печать типа")
+        self.assertNotIn("[", msg.split("правила", 1)[1].split("\n", 1)[0])
+
+    def test_an_unverified_version_is_named_not_invented(self):
+        """Поле разошлось с таблицей → версия НЕ подставляется ни записанной, ни пересчитанной."""
+        import lesson_store
+        self.live_version()
+        with open(lesson_store.version_path(self.lessons), "w", encoding="utf-8") as f:
+            f.write("0000000000000000")
+        v = lesson_store.version(self.lessons)
+        self.assertFalse(v.ok)
+        self.assertEqual(exam_show.rules_text(v), "")
+        self.assertEqual(exam_show.rules_text(json.loads(json.dumps(v))), "")
+        self.put_shot(_shot(rules=json.loads(json.dumps(v))))
+        exam_show.tap(1, "ok", "@filipp", right_fn=lambda w: True, path=self.log,
+                      sender=self.sender(), agent_fn=self.fresh_agent())
+        self.assertEqual(exam_show.load_verdicts(self.log)[0]["правила"],
+                         "НЕ ЗАПИСАНО(версия правил)")
+
+    def test_a_string_version_stays_as_it_was(self):
+        self.assertEqual(exam_show.rules_text("v7"), "v7")
+        self.assertEqual(exam_show.rules_text(None), "")
+        self.assertEqual(exam_show.rules_text(0), "")
 
 
 class TestTheTwoReadersOfOneDesk(DeskBase):

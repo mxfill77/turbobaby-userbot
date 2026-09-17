@@ -158,13 +158,47 @@ def head_commit():
         return ""
 
 
-def rules_version():
-    """Версия базы правил одним полем (заведена 11.09.2026). Нет базы — так и говорим."""
+def rules_version(path=None):
+    """Версия базы правил ОДНОЙ СТРОКОЙ (заведена 11.09.2026). Нет базы или не сверена — ''.
+
+    ПРАВКА 17.09.2026. До неё здесь стояло `lesson_store.version() or ""`, а `version()` с 11.09
+    (`3ec5c06`) отдаёт не строку, а кортеж `Version(said, live, ok, exists, say)`. `json.dump` клал
+    его в снимок СПИСКОМ, квитанция печатала список целиком, а журнал писал
+    `НЕ ЗАПИСАНО(версия правил)`: `_evidence` законно не принимает не-строку. Замер 17.09: список
+    лежит в 16 боевых снимках из 16 — опора вердикта терялась у КАЖДОГО вердикта с первого.
+
+    База та же, в которую пишет урок (`LESSON_PATH`), а не умолчание модуля уроков: версия,
+    снятая с одной таблицы, при уроках, легших в другую, называла бы не ту базу."""
     try:
         import lesson_store
-        return lesson_store.version() or ""
+        return rules_text(lesson_store.version(LESSON_PATH if path is None else path))
     except Exception:                                                      # noqa: BLE001
         return ""
+
+
+def rules_text(value):
+    """Поле версии правил — в снимке, журнале и квитанции — ОДНОЙ СТРОКОЙ. → str ('' = не названа).
+
+    ФОРМ ТРИ, и старая читается без правки файла: строка (как есть); живой `lesson_store.Version`;
+    его JSON-след — список `[said, live, ok, exists, say]`, каким он лёг во все снимки 11–17.09.
+    Порядок в списке зашит ПО МЕСТУ, а не по полям живого типа: переставь кто-нибудь поля
+    `Version`, лежащие на диске списки своего порядка не поменяют.
+
+    Версия отдаётся ТОЛЬКО сверенной (`ok` истинно и записанное равно пересчитанному). Несверенная
+    не подставляется ни записанным полем, ни пересчётом — ровно правило `lesson_store.version`:
+    поле, принятое на слово, поднимается вписыванием. Пустота дальше называется словами
+    (`_evidence`), а не выдумывается."""
+    if isinstance(value, str):
+        return value.strip()
+    if hasattr(value, "_fields") and {"said", "live", "ok"} <= set(value._fields):
+        said, live, ok = value.said, value.live, value.ok
+    elif isinstance(value, (list, tuple)) and len(value) >= 3:
+        said, live, ok = value[0], value[1], value[2]
+    else:
+        return ""
+    if ok is True and isinstance(said, str) and said.strip() and said == live:
+        return said.strip()
+    return ""
 
 
 def stamp(now=None):
@@ -1064,29 +1098,47 @@ def _judgeable(case_id, cases_path=None):
     return shot, None
 
 
-def _write_verdict(case_id, shot, word, who, lessons=(), path=None, now=None):
-    """Строка вердикта в журнал → (номер, строка словами). Замок повтора стои́т ДО неё.
+def _judged_why(case_id, path=None):
+    """Кейс УЖЕ судим? → отказ словами | None (свободен).
 
     ОДИН КЕЙС — ОДИН ЖИВОЙ ВЕРДИКТ (слово владельца 12.09: «Верно дважды по одному кейсу — одна
     запись»). Второй тап по уже судимому кейсу не пишет НИЧЕГО и называет номер первого: две
     строки об одном кейсе сделали бы счёт «пройдено K» неопределённым, а пересудить кейс и так
-    есть чем — откатом по номеру, после которого кейс снова свободен."""
+    есть чем — откатом по номеру, после которого кейс снова свободен.
+
+    ОТДЕЛЬНОЙ ФУНКЦИЕЙ С 17.09.2026: спрашивают её ДВЕ стороны. `_write_verdict` — последним
+    замком перед строкой журнала; «✔ Применить» и «✍️ своё» — ДО записи уроков (см. там)."""
+    live = verdicts_of_case(case_id, load_verdicts(path or VERDICTS))
+    if not live:
+        return None
+    first = live[0]
+    return ("↩️ кейс %s уже судим: вердикт №%s «%s» от %s. Второй записи не делаем — "
+            "одна запись на кейс. Пересудить: «exam_show.py --rollback %s --who <имя>», после "
+            "этого кейс снова свободен." % (case_id, first["номер"], first["вердикт"],
+                                             first["время"], first["номер"]))
+
+
+# Хвост отказа у дверей, которые пишут уроки. Слова заведены ради того, что до 17.09.2026 было
+# НЕПРАВДОЙ: на этом отказе урок уже лежал в базе действующим (живой прогон 17.09, урок #18).
+JUDGED_NO_LESSONS = "Уроков по нему не записано ни одного."
+
+
+def _write_verdict(case_id, shot, word, who, lessons=(), path=None, now=None):
+    """Строка вердикта в журнал → (номер, строка словами). Замок повтора стои́т ДО неё
+    (`_judged_why`) и остаётся здесь последним, даже когда дверь спросила его раньше: между
+    вопросом и строкой мог лечь чужой вердикт."""
     target = path or VERDICTS
+    judged = _judged_why(case_id, target)
+    if judged:
+        return None, judged
     rows = load_verdicts(target)
-    live = verdicts_of_case(case_id, rows)
-    if live:
-        first = live[0]
-        return None, ("↩️ кейс %s уже судим: вердикт №%s «%s» от %s. Второй записи не делаем — "
-                      "одна запись на кейс. Пересудить: «exam_show.py --rollback %s», после этого "
-                      "кейс снова свободен." % (case_id, first["номер"], first["вердикт"],
-                                                first["время"], first["номер"]))
     number = _next_number(rows)
     row = "\t".join([
         str(number), STATE_CANDIDATE, stamp(now), _esc(who or ""),
         str(shot.get("case")), str(shot.get("total")), word,
         _esc(_evidence(shot.get("commit"), "коммит")),
         _esc(_evidence(shot.get("corpus"), "корпус")),
-        _esc(_evidence(shot.get("rules"), "версия правил")),
+        _esc(_evidence(rules_text(shot.get("rules")), "версия правил")),
         _esc(shot_ref(case_id)),
         _esc(", ".join(str(n) for n in lessons)),
     ])
@@ -1097,10 +1149,10 @@ def _write_verdict(case_id, shot, word, who, lessons=(), path=None, now=None):
         f.write(row + "\n")
     return number, ("📝 Записано КАНДИДАТОМ №%d: кейс %s из %s — «%s», автор %s, время %s.\n"
                     "Коммит %s · корпус %s · правила %s.%s\n"
-                    "Откат: «exam_show.py --rollback %d»." % (
+                    "Откат: «exam_show.py --rollback %d --who <имя>»." % (
                         number, shot.get("case"), shot.get("total"), word, who or "?", stamp(now),
                         shot.get("commit") or "?", shot.get("corpus") or "?",
-                        shot.get("rules") or "?",
+                        rules_text(shot.get("rules")) or "?",
                         ("\nУроки этого вердикта: " + ", ".join("#%s" % n for n in lessons))
                         if lessons else "", number))
 
@@ -1258,12 +1310,21 @@ def apply_marked(case_id, who, right_fn=None, path=None, now=None, session_path=
 
     ПОРЯДОК: сначала уроки, потом вердикт. Оборвись процесс между ними — в базе будут уроки без
     вердикта (видно в `--trace` как несудимый кейс, лечится вторым тапом), обратный порядок дал бы
-    вердикт со ссылкой на уроки, которых нет."""
+    вердикт со ссылкой на уроки, которых нет.
+
+    НО «УЖЕ СУДИМ» — ДО УРОКОВ (правка 17.09.2026). Прежде этот замок стоял только в
+    `_write_verdict`, то есть ПОСЛЕ уроков: повторное «Применить» по судимому кейсу слышало «второй
+    записи не делаем», а урок при этом уже лежал в базе ДЕЙСТВУЮЩИМ, без вердикта (живой прогон
+    17.09: урок #18 `актив`). Живьём это настало бы там, где стол остаётся на судимом кейсе, —
+    на последнем кейсе и на кейсе, за которым нет снимка."""
     if not _may(right_fn)(who):
         return False, DENY_RIGHT % (who or "(имя не названо)")
     shot, why = _judgeable(case_id, cases_path)
     if shot is None:
         return False, why
+    judged = _judged_why(case_id, path)
+    if judged:
+        return False, judged + "\n" + JUDGED_NO_LESSONS
     desk, fresh = _desk(case_id, shot, session_path)
     marked = sorted({int(x) for x in (desk.get("selected") or [])}) if fresh else []
     if not marked:
@@ -1367,6 +1428,16 @@ def own_take(text, who, right_fn=None, path=None, now=None, session_path=None, c
     shot, why = _judgeable(case_id, cases_path)
     if shot is None:
         return False, why
+    # «УЖЕ СУДИМ» — ДО УРОКА (17.09.2026), по той же причине, что у «✔ Применить». Ожидание
+    # снимается и здесь: прежде оно снималось после попытки, и текст, пришедший вслед, не должен
+    # десять минут подряд слышать тот же отказ.
+    judged = _judged_why(case_id, path)
+    if judged:
+        desk = load_session(session_path)
+        desk.pop("own_until", None)
+        desk.pop("own_who", None)
+        save_session(desk, session_path)
+        return False, judged + "\n" + JUDGED_NO_LESSONS
     try:
         n = _lesson_write(shot, rule, "", who, add_fn)
     except Exception as e:                                                  # noqa: BLE001
@@ -1388,12 +1459,24 @@ def own_take(text, who, right_fn=None, path=None, now=None, session_path=None, c
                                                     agent_fn=agent_fn, cases_path=cases_path)
 
 
-def rollback(number, who="", path=None, now=None):
+DENY_ROLLBACK = ("⛔ «%s» не вправе откатывать вердикт экзамена: имя не в списке правящих книгу "
+                 "правил. Вердикт №%s не тронут. Откат требует того же права, что и запись: "
+                 "откатить вердикт чужой рукой — то же, что чужой рукой его записать.")
+
+
+def rollback(number, who="", path=None, now=None, right_fn=None):
     """Откат вердикта ПО НОМЕРУ. Строка ОСТАЁТСЯ, меняется только состояние. → (ok, строка).
 
     Строку не удаляем ни одной веткой: удалённый вердикт не отличить от невыставленного, и
     перепись задним числом соврала бы про то, что владелец смотрел. Повторный откат отказывает —
-    «уже откачен» это другая новость, чем «откатил»."""
+    «уже откачен» это другая новость, чем «откатил».
+
+    ПРАВО — ТО ЖЕ, ЧТО У ЗАПИСИ, И СПРАШИВАЕТСЯ ПЕРВЫМ (правка 17.09.2026). До неё откат имени не
+    судил вовсе: живой прогон 17.09 — чужое имя откатило вердикт №1, а откат снимает кейс со счёта
+    «пройдено» и освобождает его под новый вердикт. Первым — по той же несимметрии, что у `tap`:
+    чужой не узнаёт даже, есть ли в журнале такой номер."""
+    if not _may(right_fn)(who):
+        return False, DENY_ROLLBACK % (who or "(имя не названо)", number)
     target = path or VERDICTS
     rows = load_verdicts(target)
     hit = [r for r in rows if r["номер"] == int(number)]
