@@ -582,6 +582,21 @@ def channel_plan_line(plan):
     return "; ".join(parts) or "каналов нет"
 
 
+def nearest_probe_at(plan):
+    """Когда наступит БЛИЖАЙШАЯ проба среди пропущенных каналов. → ISO | None.
+
+    Сравнение по времени, а не по строке: `isoformat` опускает микросекунды, когда
+    они нулевые, и строки двух каналов лексикографически не сравнимы. ``None`` —
+    пропущенных нет или ни одно время не разобрано; вызывающий называет это словом.
+    """
+    best, best_at = None, None
+    for skip in plan["skip"]:                     # ключ ставит `channel_plan` всегда
+        at = parse_iso(skip.get("next_probe_at"))
+        if at is not None and (best_at is None or at < best_at):
+            best, best_at = skip.get("next_probe_at"), at
+    return best
+
+
 # ───────────────────────────── повод, а не лента ─────────────────────────────
 
 

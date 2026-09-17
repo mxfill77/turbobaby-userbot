@@ -12082,6 +12082,42 @@ class TestReviewAutoWiring(unittest.TestCase):
                                 runner=lambda **kw: seen2.append(kw) or {"acted": False, "why": "нет"})
         self.assertIs(seen2[0]["yield_fn"], o._review_auto_owner_wait)
 
+    def test_a_skipped_build_leaves_a_journal_line_with_reason_occasion_and_probe_time(self):
+        """Пропуск сборки при лежащих каналах (17.09.2026) НЕ молчалив: живые руки ступени через
+        живую ветку демона обязаны оставить в журнале причину, повод и время ближайшей пробы."""
+        import review_auto                                       # noqa: PLC0415
+        import review_auto_run                                   # noqa: PLC0415
+        import review_send                                       # noqa: PLC0415
+        state_path = os.path.join(self.tmp, "state.json")
+        rec = review_auto.receipt(queue_id=63, task_text="тз", status="done",
+                                  result="FACT: commit abc1234 и commit def5678",
+                                  closed_at="2026-09-01T11:00:00Z",
+                                  claimed=["abc1234", "def5678"], verified=["abc1234", "def5678"])
+        st = review_auto.state_default()
+        for channel in review_send.CHANNELS:
+            for _ in range(review_auto.CHANNEL_DOWN_STRIKES):
+                st = review_auto.note_channel(st, channel, "unknown", "channel_idle", "2026-09-01T12:00:00Z")
+        review_auto_run.write_state(state_path, review_auto.note_digest_day(
+            dict(st, spool=[rec]), "2026-09-01", "answered"))
+
+        def must_not_build(*a, **kw):
+            self.fail("пакет собран при лежащих каналах и ненаступившей пробе")
+
+        with mock.patch.object(o, "REVIEW_AUTO_STATE_FILE", state_path), \
+             mock.patch.object(o, "_flag_forced_off", lambda name: False), \
+             mock.patch.object(review_auto_run, "_build_pack", must_not_build), \
+             self.assertLogs(o.log, level="INFO") as cm:
+            report = o.maybe_review_auto(
+                now=1_000_000.0, tick_path=self.mark, state_path=state_path,
+                runner=lambda **kw: review_auto_run.tick(now="2026-09-01T12:05:00Z", **kw),
+                waiter=lambda: self.fail("уступка спрошена ради пакета, который не поедет"))
+        self.assertTrue(report["skipped_build"])
+        line = [m for m in cm.output if "ПРОХОДА НЕТ" in m]
+        self.assertEqual(len(line), 1, cm.output)
+        self.assertIn("все каналы лежат, ближайшая проба не раньше 2026-09-01T18:00:00Z — сборка пропущена",
+                      line[0])
+        self.assertIn("[повод chain:%s]" % rec["task_id"], line[0])
+
     def test_the_declared_ceiling_is_derived_from_the_stages_own_hard_limits(self):
         """Потолок объявления НЕ литерал: он складывается из чисел, которые ступень реально
         себе позволяет. Разойдись мы с ними — сторож молча отстал бы от ступени."""

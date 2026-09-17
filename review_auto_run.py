@@ -437,6 +437,40 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
         return {"acted": False, "why": "дайджест наступил, закрытых цепочек за сутки нет",
                 "trigger": trigger["key"]}
 
+    # ── НЕ СОБИРАТЬ, КОГДА ЕХАТЬ НЕКОМУ (17.09.2026) ──────────────────────────
+    # План каналов — чистая функция состояния и часов, поэтому он считается ДО
+    # уступки и сборки, а не после них. Замер 48 ч живого журнала (15.09 17:45 →
+    # 17.09 17:45): 280 проходов собрали пакет при лежащих каналах, и ни один не
+    # уехал; каждый платил двумя чтениями очереди (уступка), чтением узла рамки и
+    # сборкой — 3 310–14 148 с за окно, 1.9–8.2% (артефакт CENA-vitka, п.1в).
+    #
+    # ПОВОД НЕ ТЕРЯЕТСЯ: состояние здесь не трогается ни одним полем, ровно как и
+    # раньше в ветке «все каналы лежат» — повод остаётся в спуле без попытки, и
+    # оборот, на котором проба наступила, соберёт его СВЕЖИМ и повезёт. Читателей
+    # у пакета, собранного без отправки, в коде нет (ступень F и сводка идут по
+    # файлам ЗАХОДОВ в `docs/review_inbox`, а не по лотку исходящих). Сухой прогон
+    # собирает по-прежнему: его читатель — человек, который сборку и заказал.
+    #
+    # Пропуск НЕ молчалив: причина, повод и время ближайшей пробы уходят в строку
+    # исхода, демон печатает её в журнал (`maybe_review_auto`, «ПРОХОДА НЕТ — …»).
+    wanted = list(channels or list(review_send.CHANNELS))
+    plan = review_auto.channel_plan(state, wanted, stamp)
+    if not dry and not (plan["send"] or plan["probe"]):
+        channels_line = review_auto.channel_plan_line(plan)
+        nearest = review_auto.nearest_probe_at(plan)
+        return {
+            "acted": False,
+            "skipped_build": True,
+            "trigger": trigger["key"],
+            "kind": trigger["kind"],
+            "occasion": trigger.get("occasion") or ("суточный дайджест" if trigger["kind"] == "digest" else "—"),
+            "channels": {"send": [], "probe": [], "skip": list(plan["skip"])},
+            "channels_line": channels_line,
+            "next_probe_at": nearest,
+            "why": "все каналы лежат, ближайшая проба не раньше %s — сборка пропущена, повод ждёт пробы: %s"
+                   % (nearest or "НЕИЗВЕСТНО", channels_line),
+        }
+
     # ── ЧУЖОЙ ВИТОК ВПЕРЁД (05.09.2026) ───────────────────────────────────────
     # Заход в каналы синхронен внутри витка демона и по замеру 03-05.09 стои́т
     # ему 1841с медианы. Всё это время очередь не читается, и ряд владельца,
@@ -508,19 +542,14 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
         report["why"] = "сухой прогон: пакет собран, наружу не отправлено ничего"
         return report
 
-    # ПЛАН КАНАЛОВ СЧИТАЕТСЯ ДО `note_attempt` СОЗНАТЕЛЬНО. Заход, в котором ехать
-    # некому, попыткой не является: списать её значило бы похоронить повод за чужой
-    # простой. Пакет при этом уже собран и лежит в лотке — он не потерян.
-    wanted = list(channels or list(review_send.CHANNELS))
-    plan = review_auto.channel_plan(state, wanted, stamp)
+    # ПЛАН КАНАЛОВ ПОСЧИТАН ДО `note_attempt` СОЗНАТЕЛЬНО (и с 17.09 — ещё до сборки).
+    # Заход, в котором ехать некому, попыткой не является: списать её значило бы
+    # похоронить повод за чужой простой. Сюда такой заход больше не доходит вовсе —
+    # он вернулся выше, не собирая пакета, — поэтому `going` здесь не пуст.
     report["channels"] = {"send": list(plan["send"]), "probe": list(plan["probe"]),
                           "skip": list(plan["skip"])}
     report["channels_line"] = review_auto.channel_plan_line(plan)
     going = list(plan["send"]) + list(plan["probe"])
-    if not going:
-        report["acted"] = False
-        report["why"] = "все каналы лежат, пакет собран и ждёт: %s" % report["channels_line"]
-        return report
 
     state = review_auto.note_attempt(state, trigger["key"], trigger["kind"], stamp, pack_rel=pack_rel)
     write_state(path, state)          # заход отмечен ДО сети: обрыв здесь обязан стоить попытку

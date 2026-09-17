@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import ast
+import datetime
 import io
 import json
 import os
@@ -954,8 +955,10 @@ class TestLiveChannelStillGoesOut(unittest.TestCase):
         self.assertIn("все каналы лежат", report["why"])
         self.assertEqual(self.seen, [])
         self.assertEqual(review_auto_run.read_state(self.state)["triggers"], {})
-        # …а пакет собран и лежит: он не потерян ни в одной ветке.
-        self.assertTrue(os.path.exists(os.path.join(self.root, *report["pack"].split("/"))))
+        # С 17.09.2026 пакет в этой ветке НЕ СОБИРАЕТСЯ вовсе: ехать ему некому, а повод
+        # цел в спуле и соберётся свежим на обороте пробы (TestNoBuildWhileNobodyRides).
+        self.assertNotIn("pack", report)
+        self.assertFalse(os.path.isdir(os.path.join(self.root, "docs", "review_outbox")))
 
     # ── КОЛОКОЛ «УХОЖУ В КАНАЛЫ НАДОЛГО» (05.09.2026) ────────────────────────────────
     # Объявление покупает тишине оправдание у сторожа демона, поэтому оно обязано
@@ -1040,6 +1043,210 @@ class TestLiveChannelStillGoesOut(unittest.TestCase):
                                       digest_hour=1, write_journal=False, announce=boom)
         self.assertTrue(report["acted"])
         self.assertEqual(report["outcomes"], ["answered", "answered"])
+
+
+class TestNoBuildWhileNobodyRides(unittest.TestCase):
+    """НЕ СОБИРАТЬ ПАКЕТ, КОГДА ЕХАТЬ НЕКОМУ (17.09.2026, задача 63-m).
+
+    Замер 48 ч живого журнала (15.09 17:45 → 17.09 17:45): 280 проходов ступени A
+    собрали пакет при лежащих каналах и ненаступившей пробе — и ни один не уехал.
+    Стенд здесь ДВУСТОРОННИЙ, и обе стороны обязательны: экономия, которая заодно
+    отменила бы пробу, — это отказ, а не экономия.
+
+    Ловушка на всё, что уходит из процесса: сокет, подпроцесс, руки канала. Сборка
+    и чтение версии рамки (обращение к мосту в бою) считаются обёрткой.
+    """
+
+    T0 = _NOW                                   # оба канала легли; проба не раньше T0 + 6 ч
+    PROBE = "2026-09-01T18:00:00Z"
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="reviewauto_skip_")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.state = os.path.join(self.root, "state.json")
+        self.trap = {"socket": 0, "subprocess": 0, "channel": [], "build": 0, "frame": 0, "yield": 0}
+        self._patch(socket.socket, "connect", self._trap_socket)
+        self._patch(socket, "create_connection", self._trap_socket)
+        self._patch(review_auto_run.subprocess, "run", self._trap_subprocess)
+        self._patch(review_auto_run.subprocess, "Popen", self._trap_subprocess)
+        self._patch(review_auto_run.review_send_run, "run_channel", self._channel)
+        build, frame = review_auto_run._build_pack, review_auto_run.review_pack_build.live_frame_version
+        self._patch(review_auto_run, "_build_pack", self._counted("build", build))
+        self._patch(review_auto_run.review_pack_build, "live_frame_version", self._counted("frame", frame))
+
+    def _patch(self, owner, name, value):
+        self.addCleanup(setattr, owner, name, getattr(owner, name))
+        setattr(owner, name, value)
+
+    def _counted(self, key, fn):
+        def wrapper(*a, **kw):
+            self.trap[key] += 1
+            return fn(*a, **kw)
+        return wrapper
+
+    def _trap_socket(self, *a, **kw):
+        self.trap["socket"] += 1
+        raise OSError("ловушка стенда: наружу нельзя")
+
+    def _trap_subprocess(self, *a, **kw):
+        self.trap["subprocess"] += 1
+        raise OSError("ловушка стенда: подпроцесс нельзя")
+
+    def _channel(self, channel, prompt, ctx, args):
+        # Канал на стенде ЛЕЖИТ и на пробе: так живые 8 проб из 8 за те же 48 ч.
+        self.trap["channel"].append((channel, getattr(args, "manus_wait", None)))
+        verdict = review_send._verdict(
+            channel=channel, pack_name=ctx["pack_name"], pack_sha256=ctx["pack_sha256"],
+            send_date=ctx["send_date"], outcome="unknown", reason="channel_idle",
+            detail="стенд: канал молчит", prompt_sha256=ctx["prompt_sha256"])
+        return verdict, ""
+
+    def _yield(self):
+        self.trap["yield"] += 1
+        return False, ""
+
+    def _down_state(self, spool):
+        for rec in spool:
+            review_auto_run.write_text(
+                os.path.join(self.root, *review_auto.receipt_rel(rec).split("/")),
+                json.dumps(rec, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        st = review_auto.state_default()
+        for channel in review_send.CHANNELS:
+            for _ in range(review_auto.CHANNEL_DOWN_STRIKES):
+                st = review_auto.note_channel(st, channel, "unknown", "channel_idle", self.T0)
+        review_auto_run.write_state(self.state, review_auto.note_digest_day(
+            dict(st, spool=spool), "2026-09-01", "answered"))
+
+    def _tick(self, now):
+        return review_auto_run.tick(root=self.root, state_path=self.state, now=now, digest_hour=1,
+                                    write_journal=False, yield_fn=self._yield)
+
+    def _closed_arrives(self, queue_id, stamp):
+        """Повод приходит БОЕВОЙ дверью демона — `note_closed`, а не правкой спула."""
+        class _GitSaysAlive(object):
+            returncode = 0
+        return review_auto_run.note_closed(
+            queue_id, LIVE_TASK_TEXT, "done", "FACT: commit abc1234 и commit def5678 в git log",
+            root=self.root, state_path=self.state, stamp=stamp,
+            runner=lambda *a, **kw: _GitSaysAlive())
+
+    @staticmethod
+    def _every_5_min(start, end):
+        """Шаг стенда = пол паузы демона между проходами (`REVIEW_AUTO_MIN_SEC` = 300с)."""
+        at = review_auto.parse_iso(start)
+        stop = review_auto.parse_iso(end)
+        while at <= stop:
+            yield at.isoformat().replace("+00:00", "Z")
+            at += datetime.timedelta(seconds=300)
+
+    def _outbox(self):
+        folder = os.path.join(self.root, "docs", "review_outbox")
+        return sorted(os.listdir(folder)) if os.path.isdir(folder) else []
+
+    def test_nobody_rides_so_nothing_is_built_and_the_skip_names_the_probe(self):
+        rec = _receipt(commits=2)
+        self._down_state([rec])
+        turns = list(self._every_5_min("2026-09-01T12:05:00Z", "2026-09-01T17:55:00Z")) + ["2026-09-01T17:59:59Z"]
+        reports = [self._tick(now) for now in turns]
+        self.assertEqual(len(reports), 72)
+        self.assertEqual(self.trap["build"], 0, "собрано пакетов при лежащих каналах: %d (ловушка %r, в лотке %d)"
+                         % (self.trap["build"], self.trap, len(self._outbox())))
+        self.assertEqual(self.trap["frame"], 0, "чтений версии рамки: %d" % self.trap["frame"])
+        self.assertEqual(self.trap["yield"], 0, "чтений очереди ради уступки: %d" % self.trap["yield"])
+        self.assertEqual(self._outbox(), [], "в лотке исходящих появились пакеты")
+        self.assertEqual((self.trap["socket"], self.trap["subprocess"], self.trap["channel"]), (0, 0, []))
+        for report in reports:
+            # Пропуск НЕ молчалив: причина, повод и время ближайшей пробы — в строке исхода.
+            self.assertFalse(report["acted"])
+            self.assertTrue(report.get("skipped_build"))
+            self.assertEqual(report["trigger"], "chain:%s" % rec["task_id"])
+            self.assertEqual(report["next_probe_at"], self.PROBE)
+            self.assertIn("все каналы лежат", report["why"])
+            self.assertIn("сборка пропущена", report["why"])
+            self.assertIn(self.PROBE, report["why"])
+        self.assertEqual(review_auto_run.read_state(self.state)["triggers"], {})
+
+    def test_probe_time_builds_and_sends_as_before(self):
+        rec = _receipt(commits=2)
+        self._down_state([rec])
+        report = self._tick(self.PROBE)
+        self.assertTrue(report["acted"])
+        self.assertFalse(report.get("skipped_build"))
+        self.assertEqual(self.trap["build"], 1)
+        self.assertEqual(self.trap["yield"], 1, "уступка владельцу обязана спрашиваться, как прежде")
+        self.assertEqual(report["channels"]["probe"], list(review_send.CHANNELS))
+        self.assertEqual([c for c, _ in self.trap["channel"]], list(review_send.CHANNELS))
+        self.assertEqual(dict(self.trap["channel"])["manus"], review_auto_run.DEFAULT_PROBE_WAIT)
+        self.assertEqual(self._outbox(), [os.path.basename(report["pack"])])
+        self.assertEqual((self.trap["socket"], self.trap["subprocess"]), (0, 0))
+        self.assertEqual(review_auto_run.read_state(self.state)["triggers"]["chain:%s" % rec["task_id"]]["attempts"], 1)
+
+    def test_one_due_channel_is_enough_to_build(self):
+        """Проба наступила хотя бы у одного — собираем и везём ему; второй пропущен с временем."""
+        rec = _receipt(commits=2)
+        self._down_state([rec])
+        st = review_auto_run.read_state(self.state)
+        st["channels"]["codex"]["last_probe_at"] = "2026-09-01T15:00:00Z"       # его проба — 21:00
+        review_auto_run.write_state(self.state, st)
+        report = self._tick(self.PROBE)
+        self.assertTrue(report["acted"])
+        self.assertEqual(self.trap["build"], 1)
+        self.assertEqual([c for c, _ in self.trap["channel"]], ["manus"])
+        self.assertIn("ПРОПУЩЕН codex", report["channels_line"])
+        self.assertIn("2026-09-01T21:00:00Z", report["channels_line"])
+
+    def test_the_occasion_that_arrives_during_the_skip_lives_until_the_probe_and_leaves(self):
+        """ПОВОД ЖИВ — отдельная проверка, а не следствие: приходит В ПРОПУСК, уезжает НА ПРОБЕ."""
+        self._down_state([])
+        self.assertIn("повода нет", self._tick("2026-09-01T12:05:00Z")["why"])
+
+        rec = self._closed_arrives(77, "2026-09-01T13:02:00Z")
+        self.assertIsNotNone(rec)
+        key = "chain:%s" % rec["task_id"]
+        skipped = [self._tick(now) for now in self._every_5_min("2026-09-01T13:05:00Z", "2026-09-01T17:55:00Z")]
+        self.assertEqual(len(skipped), 59)
+        self.assertEqual({r["trigger"] for r in skipped}, {key})
+        self.assertTrue(all(r.get("skipped_build") for r in skipped))
+        self.assertEqual(self.trap["build"], 0)
+        st = review_auto_run.read_state(self.state)
+        self.assertEqual([r["task_id"] for r in st["spool"]], [rec["task_id"]], "повод выпал из спула")
+        self.assertNotIn(key, st["triggers"], "пропуск списал повод попыткой")
+
+        probe = self._tick(self.PROBE)
+        self.assertTrue(probe["acted"])
+        self.assertEqual(probe["trigger"], key, "на пробе уехал не тот повод")
+        self.assertEqual(self.trap["build"], 1)
+        self.assertEqual([c for c, _ in self.trap["channel"]], list(review_send.CHANNELS))
+        inbox = sorted(os.listdir(os.path.join(self.root, "docs", "review_inbox")))
+        self.assertEqual(len(inbox), 2)
+        self.assertTrue(all(rec["task_id"] in name for name in inbox), inbox)
+        after = review_auto_run.read_state(self.state)["triggers"][key]
+        self.assertEqual((after["attempts"], after["closed"], after["verdict"]), (1, False, "retry"))
+
+        # Проба не ответила — повод по-прежнему жив и ждёт СЛЕДУЮЩЕЙ пробы, названной временем.
+        later = self._tick("2026-09-01T19:05:00Z")
+        self.assertTrue(later.get("skipped_build"))
+        self.assertEqual(later["trigger"], key)
+        self.assertEqual(later["next_probe_at"], "2026-09-02T00:00:00Z")
+        self.assertEqual(self.trap["build"], 1)
+        self.assertEqual((self.trap["socket"], self.trap["subprocess"]), (0, 0))
+
+    def test_manual_dry_run_still_builds_for_the_human_reader(self):
+        """Единственный читатель сборки без отправки — человек с `--dry`: ему пакет нужен."""
+        self._down_state([_receipt(commits=2)])
+        report = review_auto_run.tick(root=self.root, state_path=self.state, now="2026-09-01T12:05:00Z",
+                                      digest_hour=1, dry=True, write_journal=False)
+        self.assertFalse(report["acted"])
+        self.assertEqual(self.trap["build"], 1)
+        self.assertEqual(len(self._outbox()), 1)
+        self.assertEqual(self.trap["channel"], [])
+
+    def test_nearest_probe_is_the_earliest_of_the_skipped(self):
+        plan = {"send": [], "probe": [], "skip": [
+            {"channel": "codex", "next_probe_at": "2026-09-01T21:00:00.500000Z"},
+            {"channel": "manus", "next_probe_at": "2026-09-01T18:00:00Z"}]}
+        self.assertEqual(review_auto.nearest_probe_at(plan), "2026-09-01T18:00:00Z")
+        self.assertIsNone(review_auto.nearest_probe_at({"send": [], "probe": [], "skip": []}))
 
 
 def _artifact_text(filler_lines):
