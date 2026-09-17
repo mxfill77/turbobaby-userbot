@@ -433,6 +433,138 @@ def critic_report(hints, waited=None, raw_len=0, raw_sha256="", raw_path="", lim
             "waited": waited, "limit": limit, "error": error or ""}
 
 
+# ── ЛОВУШКА КАРТОЧЕК ВЛАДЕЛЬЦУ НА КРУГ СБОРКИ (заведена 17.09.2026, задание 63-h) ────────────
+# ПОВОД — ЖИВОЙ СЛУЧАЙ, А НЕ ОПАСЕНИЕ. 17.09.2026 заморозка кейса 17 (третий исход «период через
+# границу сезонов») позвала БОЕВУЮ доставку владельцу: голова идёт `suggest.py:5678` →
+# `season_gate.note_for` без отправителя → `raise_card` → `_default_sender()` →
+# `dispatch_notify.deliver`. Попытка одна, дошла ли — неизвестно
+# (`docs/artifacts/2026-09-17-KARTOCHKI-ostatka-nabora-1709.md`, первый раздел).
+#
+# ПОЧЕМУ ЗАМОК ПРОБЫ ЕЁ НЕ ОСТАНОВИЛ. `dispatch_notify.probe_verdict` судит по КАТАЛОГУ точки
+# входа, а этот файл лежит в корне репозитория — то есть по признаку он боевой вход. Признак
+# верен для pc_agent и демона и неверен для сборки черновика, и чинить это СО СТОРОНЫ ОТПРАВИТЕЛЯ
+# задание запрещает: ни сторожей, ни отправителя эта правка не трогает ни строкой.
+#
+# ЧТО ДЕЛАЕТ ЛОВУШКА. На время круга сборки (голова, критик, метки примеров) у ОБОИХ сторожей
+# третьего исхода подменяется `_default_sender` — тот самый ленивый геттер, который они зовут,
+# когда отправителя не передали (а путь ответа не передаёт его никогда). Текст карточки не
+# уходит никуда, а ложится в снимок полем `owner_cards` рядом с ответом. Второй слой — заглушка
+# на месте модуля `dispatch_notify` в `sys.modules`: любая ДРУГАЯ ветка круга, которая завтра
+# лениво импортирует отправителя, получит заглушку, её попытка будет записана тем же полем, а
+# сама отправка — отказана исключением.
+#
+# ПОСЛЕ КРУГА ЛОВУШКА СНИМАЕТСЯ ПРИ ЛЮБОМ ИСХОДЕ (`finally`): геттеры сторожей, запись модуля
+# в `sys.modules` и память «карточка уже поднята» (`_seen`) возвращаются ровно к тому, что было
+# до круга. Память возвращается потому, что пойманная карточка владельцу НЕ сказана, и отметка
+# «сказали» в живущем дальше процессе была бы враньём.
+#
+# НЕ ВСТАЛА — ГОЛОВУ НЕ ЗОВЁМ. Переименуй кто-нибудь `_default_sender` у сторожа — ловушка молча
+# не накрыла бы его, и утечка вернулась бы без единого следа. Поэтому отсутствие геттера —
+# отказ сборки словами, а не «ловим что нашлось».
+OWNER_CARD_GATES = ("season_gate", "noprice_gate")
+OWNER_CARDS_KEY = "owner_cards"
+OWNER_CARD_TRAP_CHANNEL = "ловушка круга сборки"
+
+
+class _SenderStub(type(os)):
+    """Заглушка модуля отправителя на время круга: любое имя — функция, которая ЗАПИСЫВАЕТ
+    попытку и ОТКАЗЫВАЕТ исключением. Служебные имена (`__path__`, `__spec__` …) не подделываются:
+    машина импорта спрашивает их у модуля и обязана получить честное «нет такого»."""
+
+    def __init__(self, trap):
+        super(_SenderStub, self).__init__("dispatch_notify")
+        self.__dict__["_trap"] = trap
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        trap = self.__dict__["_trap"]
+
+        def refused(*args, **kwargs):
+            trap.caught("dispatch_notify." + name, args[0] if args else kwargs.get("text", ""))
+            raise RuntimeError("%s: отправка из круга сборки запрещена" % OWNER_CARD_TRAP_CHANNEL)
+        return refused
+
+
+class OwnerCardTrap(object):
+    """Ловушка карточек владельцу на ОДИН круг сборки. `cards` — пойманные карточки по порядку:
+    dict(gate, text). Счёт попыток — длина этого списка; в сеть не уходит ни одна."""
+
+    def __init__(self, gates=OWNER_CARD_GATES):
+        self.gates = tuple(gates)
+        self.cards = []
+        self._senders = []
+        self._seen = []
+        self._module = None
+        self._set = False
+
+    def caught(self, gate, text):
+        self.cards.append({"gate": str(gate), "text": str(text if text is not None else "")})
+
+    def _sender_for(self, gate):
+        def getter():
+            def send(text, *args, **kwargs):
+                self.caught(gate, text)
+                return (OWNER_CARD_TRAP_CHANNEL, True)
+            return send
+        return getter
+
+    def __enter__(self):
+        import importlib
+        try:
+            for name in self.gates:
+                mod = importlib.import_module(name)
+                if not callable(mod.__dict__.get("_default_sender")):
+                    raise LookupError("у сторожа «%s» нет `_default_sender` — ловушке нечего "
+                                      "подменить, и его карточка ушла бы мимо неё" % name)
+                self._senders.append((mod, mod.__dict__["_default_sender"]))
+                mod._default_sender = self._sender_for(name)
+                seen = mod.__dict__.get("_seen")
+                if isinstance(seen, dict):
+                    self._seen.append((seen, dict(seen)))
+            self._module = sys.modules.get("dispatch_notify")
+            sys.modules["dispatch_notify"] = _SenderStub(self)
+            self._set = True
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        for mod, real in reversed(self._senders):
+            mod._default_sender = real
+        self._senders = []
+        for seen, before in self._seen:
+            seen.clear()
+            seen.update(before)
+        self._seen = []
+        if self._set:
+            if self._module is None:
+                sys.modules.pop("dispatch_notify", None)
+            else:
+                sys.modules["dispatch_notify"] = self._module
+            self._module = None
+            self._set = False
+        return False
+
+
+def owner_card_trap():
+    """Ловушка, которую ставит `freeze`. Фабрикой, а не классом напрямую: набор подменяет её
+    пустышкой и тем доказывает, что без ловушки та же сборка даёт попытку (контрфакт)."""
+    return OwnerCardTrap()
+
+
+def owner_cards_line(shot):
+    """Сколько карточек владельцу поймано на круге сборки — ОДНОЙ строкой для собирающего."""
+    cards = (shot or {}).get(OWNER_CARDS_KEY)
+    if not isinstance(cards, list):
+        return "📮 карточки владельцу: поля нет — снимок собран без ловушки"
+    if not cards:
+        return "📮 карточек владельцу на круге сборки: 0 — ловушка стояла, ни одна ветка карточку не подняла"
+    return ("📮 карточек владельцу на круге сборки: %d — НЕ отправлены, лежат в снимке (%s): %s"
+            % (len(cards), OWNER_CARDS_KEY, ", ".join(str(c.get("gate") or "?") for c in cards)))
+
+
 def reason_line(shot, limit=220):
     """ПРИЧИНА ответа одной строкой (пункт 5 задания) — из записки, которую получила голова.
 
@@ -470,69 +602,84 @@ def freeze(case_id, cases_path=None, runner=None, now=None, ph=None, critic=None
             return False, ("черновик кейса %s на коммите %s уже собран: %s (перезаписи нет по "
                            "построению)" % (case_id, shot.get("commit") or "?", path)), shot
     target = shot_path(case_id, commit)
-    import trainer_run                                   # ленивый импорт: тянет suggest и сеть
+    # ЛОВУШКА КАРТОЧЕК ВЛАДЕЛЬЦУ стоит ДО первого импорта пути ответа и снимается в `finally` при
+    # любом исходе круга (узел «ЛОВУШКА КАРТОЧЕК» выше). Не встала — голову не зовём.
+    trap = owner_card_trap()
+    try:
+        trap.__enter__()
+    except Exception as e:                                                  # noqa: BLE001
+        return False, ("ловушка карточек владельцу не встала (%s: %s) — голову не зову: карточка "
+                       "третьего исхода ушла бы владельцу вживую" % (type(e).__name__, e)), None
+    try:
+        import trainer_run                               # ленивый импорт: тянет suggest и сеть
 
-    if ph is None:
-        ph = trainer_run.placeholders()
-    if runner is None:
-        def runner(c):
-            return trainer_run.run_case(c, ph)
-    rec = runner(case)
-    draft = (rec.get("draft") or "").strip()
-    if not draft:
-        return False, "голова не дала черновика (%s) — показывать нечего" % (
-            rec.get("unknown") or "причина не названа"), None
-    raw = question_of(case)
-    question = trainer_run.substitute(raw, ph)
-    # ПОДСКАЗКИ РОЖДАЮТСЯ ЗДЕСЬ И БОЛЬШЕ НИГДЕ. Критику дан ТОТ ЖЕ транскрипт, который видела
-    # голова (`build_transcript` — чистая функция, головы не зовёт), и ЗАМОРОЖЕННЫЙ черновик.
-    #
-    # ОТКАЗ КРИТИКА НЕ ОТМЕНЯЕТ СНИМКА, и это выбор, а не халатность: круг головы за черновик уже
-    # заплачен, а снимок без подсказок — законный снимок (`NO_HINTS`), который показывается и
-    # судится как все, собранные до 12.09. Уронить его из-за молчания критика значило бы выбросить
-    # оплаченный ответ и заставить платить второй раз.
-    # МЕТКИ ЖИВЫХ ПРИМЕРОВ, которые видела голова (задание 51-b). Транскрипт тот же, что у головы
-    # и у критика — `build_transcript` чистая функция от (case, ph), и второй её вызов даёт тот же
-    # текст. Подбор детерминирован, поэтому метки здесь — те самые, что стояли в промпте, а не
-    # похожие. Пусто — законный исход («примеров ниже порога нет»), а не поломка.
-    transcript = trainer_run.build_transcript(case, ph)
-    try:
-        import suggest
-        examples = suggest.live_examples_marks(transcript)
-    except Exception as e:                                                  # noqa: BLE001
-        print("метки примеров снять не удалось (%s) — снимок кладём без них" % type(e).__name__)
-        examples = []
-    # ИСХОД КРУГА КРИТИКА — ОТДЕЛЬНЫМ ПОЛЕМ СНИМКА, и полей исхода три, а не одно (52-b).
-    # Подставленный критик (набор) отдаёт ПРОСТО СПИСОК — тогда отчёт собирается здесь из того,
-    # что видно: сколько подсказок вышло. Живой отдаёт ПАРУ (подсказки, отчёт) и кладёт в отчёт то,
-    # чего отсюда не видно ни одной веткой: сколько ждали и какой длины был ответ. Разделяет их
-    # ТИП, а не длина: список из двух подсказок — тоже последовательность из двух.
-    hints, report = [], None
-    try:
-        got = _call_critic(critic or _default_critic, question, draft, transcript, case.get("id"))
-        if isinstance(got, tuple):
-            got, report = got
-        hints = hints_of({"hints": got})
-    except Exception as e:                                                  # noqa: BLE001
-        print("критик подсказок не дал (%s) — снимок кладём без них" % type(e).__name__)
-        report = critic_report([], error=type(e).__name__, limit=CRITIC_TIMEOUT)
-    if report is None:
-        report = critic_report(hints, limit=CRITIC_TIMEOUT)
-    shot = {
-        "case": case.get("id"), "total": total, "name": case.get("name") or "",
-        "lang": case.get("lang") or "", "question": question,
-        "question_raw": raw,
-        "draft": draft, "note": rec.get("note") or "", "hints": hints,
-        "critic": report,
-        "examples": examples,
-        "corpus": corpus_fingerprint(cases_path), "commit": commit,
-        "rules": rules_version(), "built_at": stamp(now),
-    }
-    os.makedirs(SHOTS_DIR, exist_ok=True)
-    with open(target, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(shot, f, ensure_ascii=False, indent=2, sort_keys=True)
-        f.write("\n")
-    return True, target, shot
+        if ph is None:
+            ph = trainer_run.placeholders()
+        if runner is None:
+            def runner(c):
+                return trainer_run.run_case(c, ph)
+        rec = runner(case)
+        draft = (rec.get("draft") or "").strip()
+        if not draft:
+            return False, "голова не дала черновика (%s) — показывать нечего" % (
+                rec.get("unknown") or "причина не названа"), None
+        raw = question_of(case)
+        question = trainer_run.substitute(raw, ph)
+        # ПОДСКАЗКИ РОЖДАЮТСЯ ЗДЕСЬ И БОЛЬШЕ НИГДЕ. Критику дан ТОТ ЖЕ транскрипт, который видела
+        # голова (`build_transcript` — чистая функция, головы не зовёт), и ЗАМОРОЖЕННЫЙ черновик.
+        #
+        # ОТКАЗ КРИТИКА НЕ ОТМЕНЯЕТ СНИМКА, и это выбор, а не халатность: круг головы за черновик
+        # уже заплачен, а снимок без подсказок — законный снимок (`NO_HINTS`), который показывается
+        # и судится как все, собранные до 12.09. Уронить его из-за молчания критика значило бы
+        # выбросить оплаченный ответ и заставить платить второй раз.
+        # МЕТКИ ЖИВЫХ ПРИМЕРОВ, которые видела голова (задание 51-b). Транскрипт тот же, что у
+        # головы и у критика — `build_transcript` чистая функция от (case, ph), и второй её вызов
+        # даёт тот же текст. Подбор детерминирован, поэтому метки здесь — те самые, что стояли в
+        # промпте, а не похожие. Пусто — законный исход («примеров ниже порога нет»), а не поломка.
+        transcript = trainer_run.build_transcript(case, ph)
+        try:
+            import suggest
+            examples = suggest.live_examples_marks(transcript)
+        except Exception as e:                                              # noqa: BLE001
+            print("метки примеров снять не удалось (%s) — снимок кладём без них" % type(e).__name__)
+            examples = []
+        # ИСХОД КРУГА КРИТИКА — ОТДЕЛЬНЫМ ПОЛЕМ СНИМКА, и полей исхода три, а не одно (52-b).
+        # Подставленный критик (набор) отдаёт ПРОСТО СПИСОК — тогда отчёт собирается здесь из
+        # того, что видно: сколько подсказок вышло. Живой отдаёт ПАРУ (подсказки, отчёт) и кладёт в
+        # отчёт то, чего отсюда не видно ни одной веткой: сколько ждали и какой длины был ответ.
+        # Разделяет их ТИП, а не длина: список из двух подсказок — тоже последовательность из двух.
+        hints, report = [], None
+        try:
+            got = _call_critic(critic or _default_critic, question, draft, transcript,
+                               case.get("id"))
+            if isinstance(got, tuple):
+                got, report = got
+            hints = hints_of({"hints": got})
+        except Exception as e:                                              # noqa: BLE001
+            print("критик подсказок не дал (%s) — снимок кладём без них" % type(e).__name__)
+            report = critic_report([], error=type(e).__name__, limit=CRITIC_TIMEOUT)
+        if report is None:
+            report = critic_report(hints, limit=CRITIC_TIMEOUT)
+        shot = {
+            "case": case.get("id"), "total": total, "name": case.get("name") or "",
+            "lang": case.get("lang") or "", "question": question,
+            "question_raw": raw,
+            "draft": draft, "note": rec.get("note") or "", "hints": hints,
+            "critic": report,
+            "examples": examples,
+            "corpus": corpus_fingerprint(cases_path), "commit": commit,
+            "rules": rules_version(), "built_at": stamp(now),
+            # КАРТОЧКИ ВЛАДЕЛЬЦУ, пойманные ловушкой на этом круге, — рядом с ответом, дословно.
+            # Пустой список — «ловушка стояла, карточек не было»; поля нет — снимок старше ловушки.
+            OWNER_CARDS_KEY: [dict(c) for c in trap.cards],
+        }
+        os.makedirs(SHOTS_DIR, exist_ok=True)
+        with open(target, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(shot, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+        return True, target, shot
+    finally:
+        trap.__exit__(None, None, None)
 
 
 # ---------------------------------------------------------------------------------------
@@ -1621,6 +1768,7 @@ def main(argv=None):
         # владелец сутки спустя, и видит её в ту минуту, когда ещё может позвать круг заново.
         if ok and shot:
             print(critic_line(shot))
+            print(owner_cards_line(shot))
         return 0 if ok else 1
     if a.slots:
         slots = shot_slots(a.case)

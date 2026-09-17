@@ -1639,6 +1639,272 @@ class TestThreeOutcomesOfTheHints(Base):
         self.assertIn("НЕИЗВЕСТНО", exam_show.no_hints_line(shot))
 
 
+# ═══════════ ЛОВУШКА КАРТОЧЕК ВЛАДЕЛЬЦУ НА КРУГ СБОРКИ (17.09.2026, задание 63-h) ═════════════
+
+# Периоды — ФИКСТУРА ДОВОДОМ (`doc=`), а не боевой `price_source.json`: набор ценового файла не
+# касается ни чтением. Границы те же, что у боевого файла 07.09 (P1 06-01…09-30, P2 10-01…10-31).
+SEASON_DOC = {"season": {"periods": [
+    {"key": "P1", "name": "ИЮНЬ-СЕНТЯБРЬ", "from": "06-01", "to": "09-30"},
+    {"key": "P2", "name": "ОКТЯБРЬ", "from": "10-01", "to": "10-31"}]}}
+HINTS_CROSS = {"models": ["XMAX 300"], "iso_start": "2026-09-26", "iso_end": "2026-10-05",
+               "hint_days": 9}
+HINTS_NOPRICE = {"models": ["REBEL 300"], "iso_start": "2026-10-06", "iso_end": "2026-10-11",
+                 "hint_days": 5}
+
+
+class _NoTrap(object):
+    """КОНТРФАКТ: ловушки нет. Та же сборка обязана дать попытку, иначе ноль ниже доказывал бы
+    лишь то, что отправки на этом пути не бывает вообще."""
+
+    def __init__(self):
+        self.cards = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class Boom(Exception):
+    """Голова упала посреди круга — ловушка обязана сняться и тогда."""
+
+
+class TestOwnerCardTrap(Base):
+    """Сборка черновика не шлёт владельцу НИЧЕГО, а текст карточки ложится в снимок.
+
+    «Боевой отправитель» здесь — счётчик на месте `_default_sender` обоих сторожей: ровно та
+    ручка, которую боевой геттер отдаёт (`dispatch_notify.deliver`). Настоящий `dispatch_notify`
+    набор не зовёт ни одной веткой. Раннер зовёт сторожей В ФОРМЕ ПУТИ ОТВЕТА — без `sender`,
+    как `suggest.py` (эта форма сама заперта `test_live_call_sites_pass_no_sender`)."""
+
+    def setUp(self):
+        super(TestOwnerCardTrap, self).setUp()
+        import noprice_gate
+        import season_gate
+        self.gates = {"season_gate": season_gate, "noprice_gate": noprice_gate}
+        self.live = {}
+        for name, mod in self.gates.items():
+            self.addCleanup(setattr, mod, "_default_sender", mod._default_sender)
+            self.addCleanup(mod.reset)
+            mod.reset()
+            calls = []
+            self.live[name] = calls
+            mod._default_sender = self._live_getter(calls)
+        for key in (season_gate.OFF_ENV, noprice_gate.OFF_ENV):
+            if key in os.environ:
+                self.addCleanup(os.environ.__setitem__, key, os.environ[key])
+                del os.environ[key]
+        self.addCleanup(setattr, exam_show, "owner_card_trap", exam_show.owner_card_trap)
+
+    @staticmethod
+    def _live_getter(calls):
+        def getter():
+            def deliver(text, reply_markup=None, declared=None):
+                calls.append(text)
+                return ("боевой (счётчик набора)", True)
+            return deliver
+        return getter
+
+    def attempts(self):
+        return {name: len(calls) for name, calls in self.live.items()}
+
+    def corpus(self):
+        p = os.path.join(self.tmp, "cases.json")
+        with open(p, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"cases": [
+                {"id": 1, "name": "через границу сезонов", "lang": "ru",
+                 "lines": ["Нужен XMAX 300 с 26 сентября по 5 октября"]},
+                {"id": 2, "name": "модель без цены", "lang": "ru",
+                 "lines": ["Сколько Rebel 300 с 6 по 11 октября?"]}]}, f, ensure_ascii=False)
+        return p
+
+    @staticmethod
+    def season_runner(c):
+        import season_gate
+        note = season_gate.note_for(HINTS_CROSS, lang="ru", doc=SEASON_DOC)
+        return {"draft": "Даты на стыке сезонов, цену посчитает коллега.", "note": note or ""}
+
+    @staticmethod
+    def noprice_runner(c):
+        import noprice_gate
+        note = noprice_gate.note_for(noprice_gate.KIND_NO_ROW, HINTS_NOPRICE, model="REBEL 300",
+                                     lang="ru")
+        return {"draft": "Цену на эту модель назовёт коллега.", "note": note or ""}
+
+    def build(self, case_id, runner):
+        return exam_show.freeze(case_id, cases_path=self.corpus(), runner=runner, ph=PH,
+                                critic=self.critic([]))
+
+    # ── пункт 3: двусторонний отрицательный ──────────────────────────────────────────────
+    def test_season_case_under_trap_sends_nothing_and_keeps_the_card(self):
+        import season_gate
+        ok, path, shot = self.build(1, self.season_runner)
+        self.assertTrue(ok, path)
+        self.assertEqual(self.attempts(), {"season_gate": 0, "noprice_gate": 0})
+        cards = shot[exam_show.OWNER_CARDS_KEY]
+        self.assertEqual([c["gate"] for c in cards], ["season_gate"])
+        self.assertTrue(cards[0]["text"].startswith(season_gate.CARD_HEAD), cards[0]["text"])
+        for part in ("XMAX 300", "2026-09-26", "2026-10-05", "P1 ИЮНЬ-СЕНТЯБРЬ → P2 ОКТЯБРЬ"):
+            self.assertIn(part, cards[0]["text"])
+        with open(path, encoding="utf-8") as f:
+            on_disk = json.load(f)
+        self.assertEqual(on_disk[exam_show.OWNER_CARDS_KEY], cards, "карточка не легла в файл")
+        self.assertEqual(on_disk["draft"], "Даты на стыке сезонов, цену посчитает коллега.")
+
+    def test_season_case_without_trap_does_attempt(self):
+        exam_show.owner_card_trap = _NoTrap
+        ok, path, shot = self.build(1, self.season_runner)
+        self.assertTrue(ok, path)
+        self.assertEqual(self.attempts(), {"season_gate": 1, "noprice_gate": 0})
+        self.assertEqual(shot[exam_show.OWNER_CARDS_KEY], [])
+
+    def test_noprice_case_under_trap_sends_nothing_and_keeps_the_card(self):
+        import noprice_gate
+        ok, path, shot = self.build(2, self.noprice_runner)
+        self.assertTrue(ok, path)
+        self.assertEqual(self.attempts(), {"season_gate": 0, "noprice_gate": 0})
+        cards = shot[exam_show.OWNER_CARDS_KEY]
+        self.assertEqual([c["gate"] for c in cards], ["noprice_gate"])
+        self.assertTrue(cards[0]["text"].startswith(noprice_gate.CARD_HEAD), cards[0]["text"])
+        for part in ("REBEL 300", "2026-10-06", "2026-10-11", "модели нет в записанном правиле"):
+            self.assertIn(part, cards[0]["text"])
+
+    def test_noprice_case_without_trap_does_attempt(self):
+        exam_show.owner_card_trap = _NoTrap
+        ok, path, _shot = self.build(2, self.noprice_runner)
+        self.assertTrue(ok, path)
+        self.assertEqual(self.attempts(), {"season_gate": 0, "noprice_gate": 1})
+
+    def test_unknown_branch_importing_the_sender_is_caught_too(self):
+        """ВТОРОЙ СЛОЙ: ветка, которой нет в переписи, лениво импортирует отправителя сама."""
+        import sys
+        was = sys.modules.get("dispatch_notify")
+        self.addCleanup(lambda: sys.modules.__setitem__("dispatch_notify", was) if was is not None
+                        else sys.modules.pop("dispatch_notify", None))
+        calls = []
+
+        class LiveStandIn(object):
+            @staticmethod
+            def deliver(text, reply_markup=None, declared=None):
+                calls.append(text)
+                return ("боевой (счётчик набора)", True)
+        stand_in = LiveStandIn()
+        sys.modules["dispatch_notify"] = stand_in
+
+        def runner(c):
+            import dispatch_notify
+            try:
+                dispatch_notify.deliver("⛔ карточка из ветки, которой нет в переписи")
+            except RuntimeError:
+                pass
+            return {"draft": "ответ", "note": ""}
+        ok, path, shot = self.build(1, runner)
+        self.assertTrue(ok, path)
+        self.assertEqual(calls, [])
+        self.assertEqual(shot[exam_show.OWNER_CARDS_KEY],
+                         [{"gate": "dispatch_notify.deliver",
+                           "text": "⛔ карточка из ветки, которой нет в переписи"}])
+        self.assertIs(sys.modules.get("dispatch_notify"), stand_in, "модуль не вернулся на место")
+        exam_show.owner_card_trap = _NoTrap
+        ok, path, _shot = self.build(2, runner)
+        self.assertTrue(ok, path)
+        self.assertEqual(len(calls), 1, "без ловушки та же ветка обязана дойти до отправителя")
+
+    # ── пункт 2: снимается после круга — и при падении тоже ───────────────────────────────
+    def test_trap_is_removed_after_the_round(self):
+        import sys
+        before = {n: m._default_sender for n, m in self.gates.items()}
+        had = "dispatch_notify" in sys.modules
+        was = sys.modules.get("dispatch_notify")
+        ok, path, _shot = self.build(1, self.season_runner)
+        self.assertTrue(ok, path)
+        for name, mod in self.gates.items():
+            self.assertIs(mod._default_sender, before[name], name)
+            self.assertEqual(mod._seen, {}, "пойманная карточка оставила отметку «сказано»")
+        self.assertEqual("dispatch_notify" in sys.modules, had)
+        self.assertIs(sys.modules.get("dispatch_notify"), was)
+
+    def test_trap_is_removed_when_the_head_falls(self):
+        import sys
+        before = {n: m._default_sender for n, m in self.gates.items()}
+        had = "dispatch_notify" in sys.modules
+        was = sys.modules.get("dispatch_notify")
+
+        def falling(c):
+            self.season_runner(c)
+            raise Boom("голова упала после карточки")
+        with self.assertRaises(Boom):
+            self.build(1, falling)
+        for name, mod in self.gates.items():
+            self.assertIs(mod._default_sender, before[name], name)
+            self.assertEqual(mod._seen, {})
+        self.assertEqual("dispatch_notify" in sys.modules, had)
+        self.assertIs(sys.modules.get("dispatch_notify"), was)
+        self.assertEqual(self.attempts(), {"season_gate": 0, "noprice_gate": 0})
+        self.assertEqual(exam_show.shot_slots(1), [], "упавший круг не кладёт снимка")
+        # и следующая, уже живая, отправка в том же процессе снова идёт боевым путём
+        import season_gate
+        season_gate.note_for(HINTS_CROSS, doc=SEASON_DOC)
+        self.assertEqual(self.attempts()["season_gate"], 1)
+
+    def test_trap_that_cannot_be_set_stops_the_head(self):
+        """Не встала — голову не зовём, частичная подмена откатана."""
+        import season_gate
+        before = season_gate._default_sender
+        called = []
+        exam_show.owner_card_trap = lambda: exam_show.OwnerCardTrap(gates=("season_gate", "json"))
+
+        def runner(c):
+            called.append(c)
+            return {"draft": "ответ", "note": ""}
+        ok, why, shot = self.build(1, runner)
+        self.assertFalse(ok)
+        self.assertIsNone(shot)
+        self.assertEqual(called, [])
+        self.assertIn("ловушка карточек владельцу не встала", why)
+        self.assertIn("_default_sender", why)
+        self.assertIs(season_gate._default_sender, before)
+
+    # ── перепись заперта: форма живых вызовов и список сторожей ───────────────────────────
+    def test_live_call_sites_pass_no_sender(self):
+        """Путь ответа зовёт сторожей БЕЗ `sender` — значит через `_default_sender`, который
+        ловушка и подменяет. Вызовов ровно два: появится третий — перепись устарела."""
+        import ast
+        import suggest
+        with open(suggest.__file__, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        sites = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "note_for" and isinstance(node.func.value, ast.Name)):
+                sites.append((node.func.value.id, [k.arg for k in node.keywords]))
+        self.assertEqual(sorted(s[0] for s in sites), ["noprice_gate", "season_gate"])
+        for gate, kws in sites:
+            self.assertNotIn("sender", kws, gate)
+
+    def test_every_default_sender_in_the_repo_is_trapped(self):
+        """Каждый модуль корня с ленивым `_default_sender` стоит в списке ловушки."""
+        root = os.path.dirname(os.path.abspath(exam_show.__file__))
+        found = set()
+        for name in os.listdir(root):
+            # файлы гарда не открываются набором вовсе: по ним идёт отдельное решение владельца
+            if not name.endswith(".py") or name.startswith(("test_", "pretool_guard")):
+                continue
+            with open(os.path.join(root, name), encoding="utf-8", errors="replace") as f:
+                if "\ndef _default_sender(" in f.read():
+                    found.add(name[:-3])
+        self.assertEqual(found, set(exam_show.OWNER_CARD_GATES))
+
+    def test_collector_line_names_the_caught_cards(self):
+        self.assertIn("поля нет", exam_show.owner_cards_line(_shot()))
+        self.assertIn(": 0 —", exam_show.owner_cards_line(dict(_shot(), owner_cards=[])))
+        line = exam_show.owner_cards_line(dict(_shot(), owner_cards=[
+            {"gate": "season_gate", "text": "⛔ НЕ СЧИТАЮ"}]))
+        self.assertIn(": 1 — НЕ отправлены", line)
+        self.assertIn("season_gate", line)
+
+
 def dispatch_notify_module():
     import dispatch_notify
     return dispatch_notify
