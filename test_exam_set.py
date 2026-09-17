@@ -279,5 +279,70 @@ class TestLiveDoorRefusesACaseNotInTheSet(Base):
         self.assertIn("слотов кейса 1 нет", out)
 
 
+class TestReadinessForAHumanRun(Base):
+    DRAFT, NOTE, REF = "ответ бота целиком", "записка головы", "Добрый день, на какие даты?"
+
+    def shot(self, case_id, commit, built_at, **fields):
+        shot = {"case": case_id, "draft": self.DRAFT, "note": self.NOTE, "built_at": built_at,
+                "hints": [{"observation": "замечание", "rule": "правило"}], "critic": {"outcome": "hints"},
+                "reference": {"who": "менеджер", "text": self.REF, "mark": "д%d·р1" % case_id},
+                "corpus": exam_set.version(self.path), "owner_cards": []}
+        shot.update(fields)
+        with open(os.path.join(self.shots, "case-%s@%s.json" % (case_id, commit)), "w",
+                  encoding="utf-8") as f:
+            json.dump(shot, f, ensure_ascii=False)
+
+    def setUp(self):
+        super(TestReadinessForAHumanRun, self).setUp()
+        self.legacy([dict(_case(5), id=13, source_key=STRICT), dict(_case(22), id=14, source_key=STRICT),
+                     dict(_case(57), id=15, source_key=STRICT)])
+
+    def test_each_missing_part_is_named_and_counted(self):
+        self.shot(13, "aaa1111", "2026-09-17T14:00:00Z")
+        self.shot(14, "aaa1111", "2026-09-17T14:00:00Z", note="", hints=[], critic={"outcome": "silent"})
+        got = exam_set.readiness(self.path)
+        self.assertEqual((got["cases"], got["ready"]), (3, 1))
+        self.assertEqual(got["have"], {"снимок": 2, "ответ бота": 2, "причина": 1, "подсказки": 1,
+                                       "эталон": 2})
+        rows = dict((r["id"], r) for r in got["rows"])
+        self.assertEqual(rows[13]["missing"], [])
+        self.assertEqual(rows[14]["missing"], ["причина", "подсказки"])
+        self.assertEqual(rows[15]["missing"], list(exam_set.READY_PARTS))
+        self.assertIsNone(rows[15]["shot"])
+
+    def test_the_newest_slot_is_judged_because_the_card_shows_it(self):
+        self.shot(13, "aaa1111", "2026-09-17T14:00:00Z")
+        self.shot(13, "bbb2222", "2026-09-17T15:00:00Z", hints=[])
+        row = exam_set.readiness(self.path)["rows"][0]
+        self.assertEqual((row["shot"], row["slots"], row["missing"]),
+                         ("case-13@bbb2222.json", 2, ["подсказки"]))
+
+    def test_shot_built_on_another_set_version_is_counted_not_hidden(self):
+        self.shot(13, "aaa1111", "2026-09-17T14:00:00Z", corpus="e68a554d1c38e960")
+        self.shot(14, "aaa1111", "2026-09-17T14:00:00Z")
+        got = exam_set.readiness(self.path)
+        self.assertEqual(got["corpus_is_set_version"], 1)
+        self.assertEqual([r["corpus_is_set_version"] for r in got["rows"]], [False, True, None])
+
+    def test_no_text_leaves_and_nothing_is_written(self):
+        self.shot(13, "aaa1111", "2026-09-17T14:00:00Z")
+        sha, shot_dir, was = _sha(self.path), sorted(os.listdir(self.shots)), exam_show.SHOTS_DIR
+        buf = io.StringIO()
+        prev = exam_set.SET_CASES
+        exam_set.SET_CASES = self.path
+        try:
+            with redirect_stdout(buf):
+                rc = exam_set.main(["--ready"])
+        finally:
+            exam_set.SET_CASES = prev
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        for text in (self.DRAFT, self.NOTE, self.REF, "Здравствуйте", "замечание"):
+            self.assertNotIn(text, out)
+        self.assertEqual(json.loads(out)["ready"], 1)
+        self.assertEqual((_sha(self.path), sorted(os.listdir(self.shots)), exam_show.SHOTS_DIR),
+                         (sha, shot_dir, was))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

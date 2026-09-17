@@ -216,6 +216,56 @@ def census(path=None):
             "events": len(ledger(path)), "archived": len(archived(path))}
 
 
+# ── ГОТОВНОСТЬ К ПРОГОНУ ЧЕЛОВЕКОМ (17.09.2026, задание 63-s) ────────────────────────────────────
+# Человеку отдаётся кейс, у которого в НОВЕЙШЕМ слоте (его и покажет карточка) есть все четыре части:
+# ответ бота, причина ответа (записка головы, поле `note`), подсказки критика и эталон менеджера.
+# Нехватка называется ИМЕНЕМ части, а не «не готов»: снимок без подсказок и кейс без снимка лечатся
+# разным действием. Текста не отдаётся ни строки — только длины, счёт и метки обезличенной базы.
+READY_PARTS = ("снимок", "ответ бота", "причина", "подсказки", "эталон")
+
+
+def readiness(path=None, shots_dir=None):
+    """Набор → dict: сколько кейсов, у скольких есть каждая часть, кто готов и чего недостаёт кому.
+
+    Слоты читает `exam_show.shot_slots` (тот же порядок «новейший первым», что у карточки): каталог
+    снимков переключается на время вызова и возвращается при любом исходе, как `use_live_set`."""
+    import exam_show
+    path = path or SET_CASES
+    shots_dir = shots_dir or os.path.join(os.path.dirname(path), "shots")
+    doc, ver = load(path), version(path)
+    rows, have = [], collections.Counter()
+    was = exam_show.SHOTS_DIR
+    exam_show.SHOTS_DIR = shots_dir
+    try:
+        for case in doc["cases"]:
+            slots = exam_show.shot_slots(case.get("id"))
+            shot = slots[0][1] if slots else {}
+            ref = shot.get("reference") if isinstance(shot.get("reference"), dict) else {}
+            crit = shot.get("critic") if isinstance(shot.get("critic"), dict) else {}
+            parts = {"снимок": bool(slots), "ответ бота": bool(_clean(shot.get("draft"))),
+                     "причина": bool(_clean(shot.get("note"))),
+                     "подсказки": bool(exam_show.hints_of(shot)),
+                     "эталон": bool(_clean(ref.get("text")))}
+            have.update(k for k in READY_PARTS if parts[k])
+            missing = [k for k in READY_PARTS if not parts[k]]
+            rows.append({
+                "id": case.get("id"), "source": source_of(case),
+                "mark": str((case.get("reference") or {}).get("mark") or ""),
+                "shot": os.path.basename(slots[0][0]) if slots else None, "slots": len(slots),
+                "draft_len": len(_clean(shot.get("draft"))), "note_len": len(_clean(shot.get("note"))),
+                "hints": len(exam_show.hints_of(shot)), "critic": crit.get("outcome"),
+                "reference_len": len(_clean(ref.get("text"))),
+                "owner_cards": len(shot.get("owner_cards") or []) if slots else None,
+                "corpus_is_set_version": (shot.get("corpus") == ver) if slots else None,
+                "ready": not missing, "missing": missing})
+    finally:
+        exam_show.SHOTS_DIR = was
+    return {"version": ver, "cases": len(rows), "have": dict((k, have[k]) for k in READY_PARTS),
+            "ready": sum(1 for r in rows if r["ready"]),
+            "corpus_is_set_version": sum(1 for r in rows if r["corpus_is_set_version"]),
+            "rows": rows}
+
+
 # ---------------------------------------------------------------------------------------------
 # запись: одна дисциплина на все события
 # ---------------------------------------------------------------------------------------------
@@ -495,6 +545,8 @@ def build_parser():
     p = argparse.ArgumentParser(description="Набор обучения: перепись, завести строгую сцепку, "
                                             "назвать источник, откат по источнику.")
     p.add_argument("--census", action="store_true", help="перепись: версия, кейсы по источникам")
+    p.add_argument("--ready", action="store_true",
+                   help="готовность к прогону человеком: снимок, ответ, причина, подсказки, эталон")
     p.add_argument("--import-strict", action="store_true",
                    help="завести кейсы строгой сцепки из обезличенной базы")
     p.add_argument("--set-source", nargs=2, metavar=("N", "KEY"),
@@ -517,9 +569,12 @@ def main(argv=None):
         elif a.census:
             print(json.dumps(census(), ensure_ascii=False, sort_keys=True))
             return 0
+        elif a.ready:
+            print(json.dumps(readiness(), ensure_ascii=False, sort_keys=True))
+            return 0
         else:
-            print("⛔ не назван ни один ключ действия (--census / --import-strict / --set-source / "
-                  "--rollback)")
+            print("⛔ не назван ни один ключ действия (--census / --ready / --import-strict / "
+                  "--set-source / --rollback)")
             return 2
     except SetRejected as e:
         print("⛔ %s — ничего не сделано" % e)
