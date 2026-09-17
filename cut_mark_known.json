@@ -1,0 +1,820 @@
+{
+ "files": {
+  "anonymize_corpus.py": {
+   "head|''.join(('#' if c.isdigit() else c for c in raw))[:26]": 1,
+   "head|low[:k]": 1,
+   "head|m.group(0)[:m.start(1) - m.start(0)]": 1,
+   "head|m.group(0)[:m.start(group) - m.start(0)]": 1,
+   "head|out[0][:m.start(1)]": 1,
+   "head|t[:mt.start()]": 2,
+   "tail|left[-40:]": 1,
+   "tail|left[-45:]": 1
+  },
+  "anonymize_corpus_stable.py": {
+   "head|hmac.new(salt, b'anon-salt-fingerprint', hashlib.sha256).hexdigest()[:16]": 1,
+   "head|keys[:3]": 1
+  },
+  "booking_draft.py": {
+   "head|[d for d in pool if pref and _norm_alnum(d).startswith(pref)][:3]": 1,
+   "head|_norm_alnum(key_in)[:3]": 1,
+   "tail|(p.stderr or '').strip()[-300:]": 1
+  },
+  "bot.py": {
+   "head|dialogs[:20]": 1
+  },
+  "brain_probe_pc.py": {
+   "head|words[:MSG_MAX]": 1
+  },
+  "brain_writer.py": {
+   "head|canon[:4]": 2,
+   "head|canon_name(k)[:4]": 1,
+   "head|json.dumps(r, ensure_ascii=False)[:300]": 5,
+   "head|json.dumps(w, ensure_ascii=False)[:300]": 1,
+   "head|old[:pos]": 3,
+   "head|t[:600]": 1
+  },
+  "bridge_http.py": {
+   "head|_reason_text(exc)[:200]": 1,
+   "head|str(exc)[:300]": 2,
+   "head|str(getattr(exc, 'reason', '') or name)[:120]": 1
+  },
+  "build_dec_port_spec.py": {
+   "head|json.dumps(r, ensure_ascii=False)[:300]": 2
+  },
+  "card_duty.py": {
+   "head|lines[:i]": 1
+  },
+  "card_terminal_log.py": {
+   "head|t[:limit]": 1,
+   "tail|list(entries or [])[-WATCH_KEEP:]": 1,
+   "tail|out[-WATCH_KEEP:]": 1
+  },
+  "chain_plan_read.py": {
+   "head|str(it.get('result') or '')[:2600]": 1,
+   "head|str(it.get('task_text') or '')[:1200]": 1
+  },
+  "chatlog_find.py": {
+   "head|d_from[:7]": 1,
+   "head|d_to[:7]": 1,
+   "head|rows[:200]": 1,
+   "head|rows[:a.show]": 2,
+   "head|str(r.get('topic') or r.get('topic_name') or '-')[:22]": 1
+  },
+  "chatlog_ingest.py": {
+   "head|fn[:22]": 1,
+   "head|fn[:40]": 1,
+   "head|store.who_ref('data_export/%s/%s' % (cat, fn))[:9]": 1
+  },
+  "chatlog_store.py": {
+   "head|' '.join(str(rec.get('text') or '').split())[:INDEX_HEAD]": 1,
+   "head|day[:4]": 1,
+   "head|day[:7]": 1,
+   "head|h[:12]": 1,
+   "head|hashlib.sha1(payload.encode('utf-8')).hexdigest()[:16]": 1,
+   "head|s[:10]": 1,
+   "head|s[:60]": 2,
+   "head|who_ref(digits)[:9]": 1,
+   "head|who_ref(m.group(0).lower())[:9]": 1,
+   "head|who_ref(nick.lower())[:9]": 2
+  },
+  "client_contour.py": {
+   "head|fx[:12]": 1,
+   "head|fy[:12]": 1,
+   "head|hashlib.sha256(f.read()).hexdigest()[:16]": 1,
+   "head|live[:3]": 1,
+   "head|m.group(1)[:7]": 1,
+   "head|sorted(ap.items(), key=lambda kv: kv[1].get('ts', 0))[:len(ap) - _KEEP]": 1,
+   "head|sorted(dn.items(), key=lambda kv: kv[1].get('ts', 0))[:len(dn) - _KEEP]": 1,
+   "tail|sorted(shapes.items(), key=lambda kv: kv[1].get('last', 0))[-SEEN_KEEP:]": 1
+  },
+  "client_silence_pc.py": {
+   "bytes|f.read(SHA_CHUNK)": 1,
+   "head|str(e)[:120]": 2,
+   "head|str(e)[:60]": 1,
+   "head|str(e)[:80]": 2
+  },
+  "close_msg_pc.py": {
+   "head|cut[:space]": 1,
+   "head|s[:end]": 1,
+   "head|s[:m.start() + 1]": 1,
+   "head|s[:max(1, cap - 1)]": 1,
+   "head|str(build.get('off_why') or (build.get('folder_why') if not build.get('folder_ok') else '') or build.get('marks_why') or 'корпус маркеров очереди не прочитан — сколько ещё ждёт, неизвестно')[:200]": 1,
+   "helper|_clip(next_step(status, report), LINE_MAX - len(L_NEXT))": 1,
+   "helper|_clip(s, cap)": 2,
+   "helper|_clip(word, LINE_MAX - len(L_GOT))": 1,
+   "helper|_clip(x, LINE_MAX)": 1,
+   "helper|_clip_block(PLAN_HEAD + '\\n' + body, PLAN_MAX)": 1,
+   "tail|taken[-TAKEN_KEEP:]": 1
+  },
+  "content_product_verifier.py": {
+   "bytes|handle.read(max_bytes + 1)": 1
+  },
+  "contour_digest.py": {
+   "head|kinds[:EXTERNAL_TOP]": 1,
+   "head|reasons[:EXTERNAL_TOP]": 1,
+   "head|rows[:LIST_MAX]": 1,
+   "head|text[:max(1, limit - 1)]": 1,
+   "helper|one_line(report.get('send_why') or 'причина не названа', 90)": 1,
+   "helper|one_line(why, 120)": 1,
+   "helper|shown('blind')": 1,
+   "helper|shown('moved')": 1,
+   "helper|shown('proved')": 1,
+   "helper|shown('streak')": 1,
+   "tail|taken[-int(target):]": 1
+  },
+  "contour_digest_run.py": {
+   "head|bad[:cd.LIST_MAX]": 1,
+   "head|rows[:3]": 1,
+   "head|sorted(eps)[:cd.LIST_MAX]": 1,
+   "head|sorted(fresh)[:cd.LIST_MAX]": 1,
+   "head|sorted(rows)[:cd.LIST_MAX]": 1,
+   "head|unread[:cd.LIST_MAX]": 1,
+   "head|unsure[:cd.LIST_MAX]": 1,
+   "tail|rows[-cd.LIST_MAX:]": 1
+  },
+  "cowork_log_append.py": {
+   "head|' '.join(str(line or '').split())[:LEDGER_LINE_MAX]": 1,
+   "head|head[:cut]": 1,
+   "head|json.dumps(r, ensure_ascii=False)[:300]": 2,
+   "head|json.dumps(w, ensure_ascii=False)[:300]": 1,
+   "head|text[:budget]": 1,
+   "helper|_cut_head(line, max(1, cap - len(tail)))": 1,
+   "tail|(old + [json.dumps(rec, ensure_ascii=False)])[-keep:]": 1
+  },
+  "decision_waits.py": {
+   "head|changed[:5]": 1,
+   "head|gone[:5]": 1,
+   "head|ws[:10]": 1,
+   "tail|d.get('closed', [])[-KEEP_CLOSED:]": 1
+  },
+  "delivery.py": {
+   "bytes|r.read(_MAPS_BODY_CAP)": 1
+  },
+  "deploy_voice.py": {
+   "head|items[:cap]": 1,
+   "head|s[:SHORT]": 1
+  },
+  "deps_registry_check.py": {
+   "tail|'\\n'.join((ln for ln in out.splitlines() if ln.strip()))[-1500:]": 1
+  },
+  "diag_status_truth.py": {
+   "head|c[2][:80]": 2,
+   "head|r[2][:80]": 2,
+   "head|why[:150]": 1,
+   "head|wj[:4]": 1
+  },
+  "dialog_card.py": {
+   "head|head_part[:len(head_part) - early]": 1,
+   "head|rest[:len(rest) - tail]": 1,
+   "head|t[:limit]": 1,
+   "helper|_clip(' '.join(_s(text).split()), limit)": 1,
+   "helper|_clip(head_turn, HEAD_CLIP)": 1,
+   "helper|_clip(t['text'], TURN_CLIP)": 1,
+   "tail|stale[-STALE_SHOWN:]": 1
+  },
+  "dispatch_notify.py": {
+   "head|desc[:120]": 1,
+   "head|line[:90]": 3,
+   "head|sid[:8]": 1,
+   "head|str(commit or '')[:40]": 1,
+   "head|str(resp.get('description', ''))[:120]": 3,
+   "head|str(resp.get('description', ''))[:160]": 1,
+   "head|str(resp.get('description', ''))[:80]": 3,
+   "head|str(resp2.get('description', ''))[:80]": 2,
+   "head|text[:limit]": 2
+  },
+  "done_judge_pc.py": {
+   "bytes|handle.read(LEDGER_READ_MAX)": 1,
+   "bytes|handle.read(cap + 1)": 2,
+   "head|fresh[:4]": 1,
+   "head|fresh_hits[:4]": 1,
+   "head|s[:at]": 1,
+   "head|str(exc)[:120]": 1,
+   "head|str(verdict.get('reason') or '')[:REASON_MAX]": 1,
+   "tail|sorted(rows.items(), key=lambda pair: _seq_of(pair[1]))[-LEDGER_MAX:]": 1
+  },
+  "exam_show.py": {
+   "head|hashlib.sha256((raw or '').encode('utf-8')).hexdigest()[:16]": 1,
+   "head|hashlib.sha256(f.read()).hexdigest()[:16]": 1,
+   "head|note[:limit]": 1,
+   "head|out[:HINTS_MAX]": 1,
+   "head|parts[:len(cols)]": 1,
+   "head|str(body.get('description', ''))[:120]": 1
+  },
+  "expectations_pc.py": {
+   "head|list(gap)[:8]": 1,
+   "head|why[:why_max]": 1
+  },
+  "expectations_pc_run.py": {
+   "bytes|fh.seek(-(PRICE_TAIL_BYTES if tail is None else tail), os.SEEK_END)": 1,
+   "head|(k.get('why') or '')[:120]": 1,
+   "head|(r.get('why') or '')[:120]": 1,
+   "head|(tinfo.get('why') or '')[:120]": 1,
+   "head|line[:160]": 2,
+   "head|line[:300]": 1,
+   "head|line[len(PRICE_GATE_MARK):].strip()[:400]": 1,
+   "head|note[:120]": 1,
+   "head|str(e)[:120]": 2,
+   "head|str(e)[:80]": 6,
+   "head|str(it.get('task_text') or '')[:200]": 1,
+   "head|str(line)[:19]": 1,
+   "head|why[:160]": 1,
+   "head|why[:ERR_TAIL]": 1,
+   "tail|list(open_eps.items())[-STATE_KEEP:]": 1
+  },
+  "export_all.py": {
+   "head|''.join((c if c.isalnum() else '_' for c in dialog.name))[:40]": 1,
+   "head|''.join((c if c.isalnum() else '_' for c in name))[:40]": 1
+  },
+  "git_serial_pc.py": {
+   "head|args[:2]": 1
+  },
+  "journal_measure.py": {
+   "head|text[:160]": 1
+  },
+  "kb_master_append_2307.py": {
+   "head|head[:sep_start]": 1,
+   "head|sep_line[:40]": 1,
+   "head|text[:hits[0].start()]": 1
+  },
+  "lesson_migrate_book.py": {
+   "bytes|f.read(65536)": 1,
+   "head|book_sha[:8]": 2,
+   "head|snap_sha[:8]": 1
+  },
+  "lesson_promote.py": {
+   "head|text[:99]": 1
+  },
+  "lesson_regress.py": {
+   "head|(chk.get('expected') or '?')[:70]": 1,
+   "head|(chk.get('fact') or '?')[:70]": 1,
+   "head|(cmp_res.get('why') or '')[:200]": 1,
+   "head|cmp_res['broken'][:3]": 1,
+   "head|line[:LINE_MAX - 1]": 1,
+   "head|str(base.get('commit'))[:7]": 1,
+   "head|str(c.get('expected'))[:160]": 1,
+   "head|str(c.get('fact'))[:160]": 1,
+   "head|str(rule or '')[:300]": 1,
+   "head|unk2[:4]": 1,
+   "head|unknown[:4]": 1,
+   "tail|(st.get('history') or [])[-5:]": 1,
+   "tail|hist[-HISTORY_KEEP:]": 1,
+   "tail|pend[-_PENDING_KEEP:]": 1
+  },
+  "lesson_store.py": {
+   "head|hashlib.sha256(f.read()).hexdigest()[:VERSION_LEN]": 1,
+   "head|stamp[:DAY_LEN]": 1
+  },
+  "list_ops_groups.py": {
+   "head|t[:n]": 1,
+   "head|who[:20]": 3
+  },
+  "moderation_card.py": {
+   "head|s[:10]": 1
+  },
+  "moderation_core.py": {
+   "head|s[:n - 1]": 1,
+   "helper|_clip_err(e)": 1,
+   "helper|_clip_err(err)": 1
+  },
+  "noprice_gate.py": {
+   "head|list(_seen)[:len(_seen) - _SEEN_CAP]": 1
+  },
+  "pc_agent.py": {
+   "head|(msg.text or '')[:120]": 3,
+   "head|echo[:80]": 1,
+   "head|gate_msg[:300]": 1,
+   "head|text[:1500]": 1,
+   "tail|_read_log_lines()[-15:]": 1,
+   "tail|last_msgs[-5:]": 1
+  },
+  "pc_orchestrator.py": {
+   "bytes|report_draft.read(full)": 1,
+   "head|'\\n'.join((f'- {str(x).strip()}' for x in items or [] if str(x).strip()))[:cap]": 1,
+   "head|'\\n'.join(lines)[:RESULT_MAX]": 1,
+   "head|'🔁 Завершено плановым рестартом демона (самомодификация pc_orchestrator): claude-процесс задачи штатно погашен в окне управляемого self-update-рестарта — работа к этому моменту сделана (RESULT в логе, коммит в git). Это НЕ сбой.'[:RESULT_MAX]": 1,
+   "head|('%sНЕ ЗАКРЫТА, но %s %s: %s. СЛЕДЫ в окне %s: %s. Формальное закрытие не состоялось — НЕ переделывай вслепую: сверь эти следы с заданием и закрой руками. (Окно, а не авторство: в него попадают и параллельные сессии ПК.)' % (lead, WORK_DONE_MARK, head, detail, win, ', '.join(parts)))[:RESULT_MAX]": 1,
+   "head|('%sпровал %s: %s. Окно работы неизвестно (отметки claim не сохранилось) — следы работы НЕ проверялись.' % (lead, head, detail))[:RESULT_MAX]": 1,
+   "head|('%sпровал %s: %s. Следов работы в окне %s нет (коммитов 0, записей журнала 0).' % (lead, head, detail, win))[:RESULT_MAX]": 1,
+   "head|('NEEDS_APPROVAL (гард): ' + '\\n'.join(uniq))[:RESULT_MAX]": 1,
+   "head|('план пуст: планировщик не вернул нумерованный список «N. <шаг>». Вывод (хвост): ' + _tail(out, 700))[:RESULT_MAX]": 1,
+   "head|('планировщик заявил красное: ' + claim)[:RESULT_MAX]": 1,
+   "head|(base + (f'0 шагов done — {note}' if note else 'шагов не найдено (очередь пуста?)'))[:RESULT_MAX]": 1,
+   "head|(dec.get('result') or 'урок обработан')[:RESULT_MAX]": 1,
+   "head|(dec.get('result') or 'урок отдан владельцу по 24ч-таймауту')[:RESULT_MAX]": 1,
+   "head|(done_last[i].splitlines() or ['(пусто)'])[0][:300]": 1,
+   "head|(f'🧩 Декомпозиция (локальный дирижёр PC): {len(steps)} шагов — исполняю ПО ОДНОМУ (lane=pc, sequential-релиз: следующий шаг встаёт только после done предыдущего).\\n' + plan_txt + '\\n' + _dec_red_note(steps) + 'Шаг 1 уже в очереди. Красный шаг спросит «да» кнопкой. После последнего шага пришлю сводку.')[:RESULT_MAX]": 1,
+   "head|(head + '\\n' + '\\n'.join(lines))[:RESULT_MAX]": 1,
+   "head|(p.get('transcript') or '').strip()[:4000]": 1,
+   "head|(str(dit.get('result') or '').strip().splitlines() or ['(пусто)'])[0][:200]": 1,
+   "head|(str(text or '').strip().splitlines() or ['(пусто)'])[0][:300]": 1,
+   "head|(subject or '').strip()[:80]": 1,
+   "head|(verdict['reason'] or '(без причины)')[:300]": 2,
+   "head|(what or '')[:RESULT_MAX]": 1,
+   "head|[str(m) for m in marks or ()][:SHTAB_BOX_MARKS_KEEP]": 1,
+   "head|_REPLY_FIELDS[:3]": 1,
+   "head|card[:RESULT_MAX]": 1,
+   "head|commit[:9]": 2,
+   "head|commits[:EVIDENCE_MAX_COMMITS]": 1,
+   "head|f'[клиентский контур, нужна твоя отмашка; {why}] {ev}'[:_REVIZOR_EVIDENCE_MAX]": 1,
+   "head|f'[ревизор дата={today} класс={cls}] {tt}'[:RESULT_MAX]": 1,
+   "head|f'[самопочинка задачи {tid}, попытка 1] {fixed}'[:RESULT_MAX]": 1,
+   "head|f'[шаг {i}/{n} родитель {pid}] [самопочинка шага {i}, попытка 1] {fixed}'[:RESULT_MAX]": 1,
+   "head|f'[шаг {j}/{total} родитель {pid}] {mark}{ref_mark}{text}'[:RESULT_MAX]": 1,
+   "head|f'{SMOKE_STEP_MARK}: смоук {status} — {tail}.'[:RESULT_MAX]": 1,
+   "head|f'{SMOKE_STEP_MARK}: смоук НЕ отработал — {type(e).__name__}: {e} (недостоверный прогон → шаг failed, цепь остановлена)'[:RESULT_MAX]": 1,
+   "head|f'{SMOKE_STEP_MARK}: смоук ПРОВАЛЕН — цепь остановлена.\\n{body}'[:RESULT_MAX]": 1,
+   "head|f'{SMOKE_STEP_MARK}: смоук вернул неизвестный статус {status!r} → трактую как провал (шаг failed)'[:RESULT_MAX]": 1,
+   "head|f'задача упала → думатель: halt, причина: {reason}\\nПерерождение не поможет (диагноз думателя выше), нужен человек.\\n{str(fail_text or '')}'[:RESULT_MAX]": 1,
+   "head|f'план из {len(steps)} шагов превышает потолок {MAX_STEPS} — упрости ТЗ или разбей на два «декомпозируй:»'[:RESULT_MAX]": 1,
+   "head|f'планировщик локальной декомпозиции не отработал (кондуктор {THINKER_MODEL}/фолбэк {THINKER_FALLBACK or 'нет'}): сбой/таймаут claude -p — план не построен, повтори задачу'[:RESULT_MAX]": 1,
+   "head|f'чек «{name}»: {c.get('fact')}'[:_REVIZOR_EVIDENCE_MAX]": 1,
+   "head|f'чек «{name}»: {detail}'[:_REVIZOR_EVIDENCE_MAX]": 1,
+   "head|f'🛑 самопочинка не помогла (попытка 1 исчерпана): перерождение задачи {oid} упало повторно — нужен человек.\\n{str(fail_text or '')}'[:RESULT_MAX]": 1,
+   "head|f'🩹 задача упала → думатель: retry, правка: {fixed[:200]}, причина: {reason[:200]}\\nПерерождена задачей id {nid} (попытка 1 из 1; повторный провал = терминальный failed).\\nИсходный провал: {str(fail_text or '')[:400]}'[:RESULT_MAX]": 1,
+   "head|fail_text[:400]": 2,
+   "head|first[:400]": 1,
+   "head|fixed[:200]": 2,
+   "head|greeting[:600]": 1,
+   "head|hashlib.sha1(str(text).encode('utf-8')).hexdigest()[:12]": 1,
+   "head|head[:9]": 1,
+   "head|journal[:EVIDENCE_MAX_JOURNAL]": 1,
+   "head|keys[:REVIZOR_CARD_KEYS_MAX]": 1,
+   "head|order[:taken]": 1,
+   "head|reason[:120]": 2,
+   "head|reason[:200]": 2,
+   "head|rec['keys'][:REVIZOR_CARD_KEYS_MAX]": 1,
+   "head|result[:400]": 1,
+   "head|s[:200]": 1,
+   "head|s[:60]": 1,
+   "head|s[:n]": 1,
+   "head|sorted(st, key=lambda x: _mark_time_key(st[x]))[:len(st) - TASK_START_KEEP]": 1,
+   "head|sorted(st, key=lambda x: _started_at_raw(st[x]))[:len(st) - TASK_START_KEEP]": 1,
+   "head|state[:max(0, len(state) - 64)]": 1,
+   "head|str(body.get('description'))[:80]": 1,
+   "head|str(d.get('error_text') or d.get('error') or 'мост не ответил распиской')[:200]": 1,
+   "head|str(detail or '')[:200]": 1,
+   "head|str(detail or '')[:300]": 1,
+   "head|str(e)[:80]": 4,
+   "head|str(f.get('session_id'))[:8]": 1,
+   "head|str(f.get('task_text') or '').strip()[:_REVIZOR_EVIDENCE_MAX]": 1,
+   "head|str(fail_text or '')[:1200]": 2,
+   "head|str(fail_text or '')[:400]": 1,
+   "head|str(head)[:9]": 1,
+   "head|str(it.get('class') or '').strip()[:8]": 1,
+   "head|str(it.get('evidence') or '').strip()[:_REVIZOR_EVIDENCE_MAX]": 1,
+   "head|str(it.get('result') or '').strip()[:2000]": 1,
+   "head|str(it.get('task_text') or '').strip()[:1500]": 1,
+   "head|str(it.get('task_text') or '').strip()[:_REVIZOR_TASK_MAX]": 1,
+   "head|str(ref)[:9]": 1,
+   "head|str(task_text or '')[:2000]": 1,
+   "head|str(text)[:RESULT_MAX]": 1,
+   "head|t[:400]": 1,
+   "head|t[:5]": 1,
+   "helper|_cap_result(close_msg_pc.prepend(result, text, status, NO_HEAL_PREFIXES, _close_plan_facts(_plan_queue)), tid)": 1,
+   "helper|_cap_result(done_judge_pc.fail_result(verdict, result), tid)": 1,
+   "helper|_cap_result(done_judge_pc.line(verdict) + '\\n' + result, tid)": 1,
+   "helper|_cap_result(mark_vs_address_pc.close_result(card, rule, proof, obj=obj, kind=kind, draft=_draft_block(tid)), tid)": 1,
+   "helper|_cap_result(out_s, tid)": 1,
+   "helper|_cap_result(result + maybe_update_bots(tid, text, head_before), tid)": 1,
+   "helper|_cap_result(result, tid)": 1,
+   "helper|_clip(card)": 1,
+   "helper|_clip(card, 400)": 1,
+   "helper|_clip(claim, 160)": 1,
+   "helper|_clip(claim, 700)": 1,
+   "helper|_clip(fail_text)": 1,
+   "helper|_clip(msg)": 10,
+   "helper|_clip(msg, 160)": 1,
+   "helper|_clip(out_s or err_tail or 'нет вывода', 400)": 1,
+   "helper|_clip(reason)": 3,
+   "helper|_clip(reply, 80)": 1,
+   "helper|_clip(result)": 7,
+   "helper|_clip(str(reply or ''), 300)": 1,
+   "helper|_clip(str(reply), 300)": 1,
+   "helper|_clip(text)": 2,
+   "helper|_clip(x, 90)": 1,
+   "helper|_last_line(err_s)": 1,
+   "helper|_last_line(out_s)": 1,
+   "helper|_tail((p.stderr or '') + (p.stdout or ''), 400)": 2,
+   "helper|_tail((p.stderr or '').strip(), 120)": 3,
+   "helper|_tail(detail, 160)": 7,
+   "helper|_tail(detail, 200)": 2,
+   "helper|_tail(gmsg, 200)": 2,
+   "helper|_tail(ok_add[2], 160)": 1,
+   "helper|_tail(out, 120)": 1,
+   "helper|_tail(out, 160)": 1,
+   "helper|_tail(out, 700)": 1,
+   "helper|_tail(r[2], 160)": 1,
+   "helper|_tail(rc[2], 160)": 2,
+   "helper|_tail(s, 80)": 1,
+   "helper|_tail(staged[2], 160)": 1,
+   "helper|_tail(str(detail), 120)": 1,
+   "helper|_tail(str(detail), 160)": 1,
+   "helper|_tail(str(detail), 200)": 1,
+   "helper|_tail(str(rdetail), 120)": 2,
+   "helper|_tail_shown(err)": 1,
+   "helper|_tail_shown(out_s)": 1,
+   "helper|_tail_shown(r[2], 160)": 1,
+   "tail|(self.outages + [(self.down_since, now)])[-LINK_OUTAGE_KEEP:]": 1,
+   "tail|(sent + [key])[-CHAIN_CARD_SENT_MAX:]": 1,
+   "tail|[str(m) for m in said or ()][-SHTAB_BOX_MARKS_KEEP:]": 1,
+   "tail|[t for t in hist if 0 <= tnow - t < window][-50:]": 1,
+   "tail|full[-n:]": 1,
+   "tail|keep[-_REVIZOR_SPOOL_MAX:]": 1,
+   "tail|lines[-APPROVAL_LEDGER_KEEP:]": 1,
+   "tail|pairs[-REVIZOR_CARDS_MAX:]": 1,
+   "tail|s[-n:]": 1
+  },
+  "pretool_guard.py": {
+   "bytes|f.read(400000)": 1,
+   "bytes|f.read(_SECRET_HEAD_BYTES)": 1,
+   "head|' '.join(str(card or '').split())[:200]": 1,
+   "head|a[:n]": 1,
+   "head|c[:200]": 2,
+   "head|c[:room]": 1,
+   "head|d[:300]": 1,
+   "head|lines[:i]": 1,
+   "head|parts[:i]": 2,
+   "head|s[:CONSEQ_OBJ_MAX]": 1,
+   "head|toks[:j]": 1,
+   "head|toks[:k + 1]": 1,
+   "tail|d.group(1)[-8:]": 1,
+   "tail|m.group(1)[-6:]": 1,
+   "tail|m.group(1)[-8:]": 1,
+   "tail|sid[-8:]": 1
+  },
+  "price_freshness.py": {
+   "head|text[:10]": 1
+  },
+  "price_freshness_run.py": {
+   "head|refusals[:6]": 1,
+   "head|said[:70]": 1
+  },
+  "price_quench_pc.py": {
+   "head|' '.join(str(head or '').split())[:120]": 1,
+   "head|why[:200]": 1
+  },
+  "price_quench_pc_probe.py": {
+   "head|' '.join((note or '').strip().split('\\n')[0].split())[:180]": 1,
+   "head|' '.join(str(card).split())[:200]": 1,
+   "head|str(e)[:120]": 2,
+   "head|str(e)[:160]": 2,
+   "tail|(list(st.get('obs') or []) + [obs_trim])[-keep:]": 1
+  },
+  "price_revouch.py": {
+   "head|stray[:5]": 1,
+   "head|stray[:8]": 1
+  },
+  "price_snapshot_publish.py": {
+   "head|generated_at[:10]": 1
+  },
+  "proc_bytes.py": {
+   "bytes|f.read(16)": 1,
+   "bytes|f.read(65536)": 1,
+   "head|(fp.get('двери') or {}).get('код', [])[:20]": 1,
+   "head|fp['digest'][:12]": 2
+  },
+  "queue_snapshot_pc.py": {
+   "head|head[:limit - 1]": 1,
+   "head|piece[:GOAL_MAX - 1]": 1,
+   "head|piece[:limit - 1]": 1,
+   "helper|first_line(result)": 3,
+   "helper|first_line(value)": 2,
+   "helper|goal_line(it.get('task_text'))": 1,
+   "helper|one_line(goal, GOAL_MAX)": 1,
+   "helper|one_line(item.get('goal'), GOAL_MAX)": 5,
+   "helper|one_line(row.get('goal'), GOAL_MAX)": 1,
+   "helper|one_line(text, GOAL_MAX)": 1,
+   "helper|shown(item.get('why'), WHY_MAX)": 1,
+   "helper|shown(judge_reason(item.get('why')), WHY_MAX)": 1,
+   "helper|shown(reject_words(item.get('why')), WHY_MAX)": 1,
+   "helper|shown(unknown_words_of(item.get('why')), WHY_MAX)": 1,
+   "helper|shown(view.get('err'), WHY_MAX)": 1
+  },
+  "rc_auth_detect.py": {
+   "head|a[:minlen]": 1,
+   "head|b[:minlen]": 1
+  },
+  "recon_auto.py": {
+   "head|[str(w) for w in sig.get('where') or []][:6]": 1,
+   "head|hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]": 1,
+   "head|out[:limit]": 1
+  },
+  "recon_auto_run.py": {
+   "head|str(exc)[:120]": 1,
+   "head|why[:200]": 1
+  },
+  "recon_servicing.py": {
+   "head|items[:SAMPLES_PER_TOPIC]": 1,
+   "head|text.replace('\\n', ' ⏎ ')[:n]": 1
+  },
+  "report_draft.py": {
+   "head|block[:max(1, block_max - 1)]": 1,
+   "head|s[:raw_max]": 1
+  },
+  "result_spill.py": {
+   "head|head[:cut]": 1,
+   "head|head[:max(0, cap - len(tail))]": 1,
+   "head|line[:RESCUE_MAX]": 1,
+   "head|s[:32]": 1,
+   "head|text[:budget]": 1,
+   "helper|cut_head(s, budget)": 1
+  },
+  "review_audit.py": {
+   "head|'\\n'.join(lines)[:MESSAGE_MAX]": 2,
+   "head|head[:cuts[-1]]": 1,
+   "head|head[:space]": 1,
+   "head|rank(stats.get('items') or [])[:max(0, int(top_n))]": 1,
+   "head|text[:limit]": 1
+  },
+  "review_auto.py": {
+   "head|c[:12]": 3,
+   "head|full[:tail.start()]": 1,
+   "head|gap_lines[:max(0, review_pack.SUMMARY_LINES_MAX - len(summary))]": 1,
+   "head|line[:review_pack.SUMMARY_LINE_MAX]": 1,
+   "head|names[:4]": 1,
+   "head|ordered[:min(receipts_in_pack, review_pack.HYPOTHESIS_RECORDS_MAX)]": 1,
+   "head|ordered[:receipts_in_pack]": 2,
+   "head|text[:limit]": 1,
+   "head|text[:room]": 1,
+   "helper|_clip(r['hypothesis'], DIGEST_HYPOTHESIS_MAX)": 1,
+   "helper|clip_named(out, limit)": 1,
+   "tail|[r for r in spool if isinstance(r, dict) and r.get('task_id')][-SPOOL_MAX:]": 1,
+   "tail|out[-SPOOL_MAX:]": 1
+  },
+  "review_auto_run.py": {
+   "head|rows[:limit]": 1
+  },
+  "review_intake.py": {
+   "head|(quote or '').split(':')[0][:60]": 1,
+   "head|(src.get('pack_sha256') or '—')[:12]": 1,
+   "head|hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]": 1,
+   "head|out[:ANCHOR_MAX]": 2,
+   "head|probes[:3]": 1,
+   "head|text[:CLAIM_TEXT_MAX]": 1,
+   "head|text[:QUOTE_MAX]": 1,
+   "head|word[:STEM_LEN]": 1,
+   "helper|_clip_quote(src.get('quote'))": 1
+  },
+  "review_intake_run.py": {
+   "head|(done.stderr or b'').decode('utf-8', 'replace').strip()[:200]": 1,
+   "head|(src['pack_sha256'] or '—')[:12]": 1,
+   "head|why[:200]": 1
+  },
+  "review_outbox_queue_run.py": {
+   "tail|out.strip()[-300:]": 2
+  },
+  "review_pack.py": {
+   "head|sha[:12]": 1,
+   "head|text.splitlines()[:head_lines]": 1,
+   "head|text[:FRAME_VERSION_NOTE_MAX - 1]": 1
+  },
+  "review_pack_build.py": {
+   "head|str(exc).replace('\\n', ' ')[:160]": 1
+  },
+  "review_send.py": {
+   "head|body.strip()[:200]": 1,
+   "head|json.dumps(body, ensure_ascii=False)[:200]": 1,
+   "head|sample[:24]": 1,
+   "head|sha[:12]": 1,
+   "tail|(stderr or stdout or '').strip()[-300:]": 1
+  },
+  "review_send_run.py": {
+   "head|ctx['prompt_sha256'][:12]": 1,
+   "head|line[:limit]": 1
+  },
+  "reviewer.py": {
+   "head|clause.strip()[:120]": 1,
+   "head|ctx.strip()[:100]": 1,
+   "head|j_phrase[:80]": 1,
+   "head|text[:200]": 3
+  },
+  "scout.py": {
+   "head|active_personal[:40]": 1,
+   "head|chat['name'][:32]": 1,
+   "head|info['name'][:35]": 1,
+   "head|sorted_users[:20]": 1
+  },
+  "season_gate.py": {
+   "head|list(_seen)[:len(_seen) - _SEEN_CAP]": 1,
+   "head|s[:10]": 1
+  },
+  "selfupdate_gate.py": {
+   "head|(r.stderr or r.stdout).strip()[:500]": 2
+  },
+  "session_watch.py": {
+   "head|f['session_id'][:8]": 1
+  },
+  "shtab_box.py": {
+   "head|body_goal[:max(1, keep - 1)]": 1,
+   "head|rec['how'][:60]": 1,
+   "head|tail[:limit - 1]": 1
+  },
+  "shtab_box_accept.py": {
+   "head|line[:REMAINDER_MAX]": 1,
+   "head|low[:STEM]": 1,
+   "head|missing[:8]": 1,
+   "head|point['text'][:POINT_CHARS]": 1,
+   "head|str(task_text or '').splitlines()[:5]": 1,
+   "head|str(v.get('why') or 'причина не названа')[:300]": 1,
+   "head|text[:160]": 1
+  },
+  "shtab_box_run.py": {
+   "head|addr['words'][:80]": 1,
+   "head|bad[:10]": 2,
+   "head|hits[:3]": 1,
+   "head|ident[:12]": 2,
+   "head|json.dumps(r, ensure_ascii=False, default=str)[:200]": 1,
+   "head|refused[:2]": 1,
+   "head|str(exc)[:160]": 9,
+   "head|str(exc)[:180]": 1,
+   "head|str(exc)[:200]": 1,
+   "head|str(note.get('why') or '')[:200]": 1
+  },
+  "shtab_box_signals.py": {
+   "head|[str(e) for e in evidence or ()][:6]": 1,
+   "head|[str(e) for e in one.get('evidence') or ()][:6]": 1,
+   "head|list(rows or [])[:limit]": 1,
+   "head|said[:EXT_SAID_SHOW - 1]": 1,
+   "head|said[:tail.start()]": 1,
+   "head|text[:at]": 1,
+   "head|why[:STOP_NOTICE_WHY_MAX - 1]": 1,
+   "head|why[:max(1, len(why) - over - 1)]": 1,
+   "head|words[:CANON_SHOW]": 1,
+   "head|worst['ids'][:6]": 1,
+   "tail|ours[-STREAK_FLOOR:]": 1,
+   "tail|same_day[-EXT_STREAK_FLOOR:]": 1
+  },
+  "srv_delivery.py": {
+   "head|(b.get('hub_head') or '-')[:8]": 1,
+   "head|(b.get('hub_head') or u'НЕТ')[:7]": 1,
+   "head|(b.get('srv_head') or '-')[:7]": 1,
+   "head|(b.get('srv_head') or '-')[:8]": 1,
+   "head|(facts.get('hub_head') or '-')[:12]": 1,
+   "head|(facts.get('srv_head') or '-')[:12]": 1,
+   "head|hub[:7]": 2,
+   "head|s[:7]": 1,
+   "head|srv[:7]": 3,
+   "tail|hub_out.strip()[-300:]": 1,
+   "tail|out.strip()[-200:]": 1,
+   "tail|out.strip()[-300:]": 3,
+   "tail|srv_out.strip()[-300:]": 1
+  },
+  "style_examples.py": {
+   "bytes|f.read(1 << 20)": 1,
+   "head|h.hexdigest()[:16]": 1,
+   "head|scored[:max(0, int(limit))]": 1
+  },
+  "suggest.py": {
+   "head|' '.join(str(e).split())[:200]": 2,
+   "head|(cand or '')[:200]": 1,
+   "head|(draft or '')[:200]": 1,
+   "head|(text or '')[:200]": 1,
+   "head|[r for r in rows if r[0] is None][:limit - len(pick)]": 1,
+   "head|[side[0] for side in (cheaper, dearer) if side][:limit]": 1,
+   "head|bullets[:len(bullets) - PLAYBOOK_MAX_RULES + 1]": 1,
+   "head|cut_by_deadline[:5]": 2,
+   "head|frag[:len(frag) - len(frag.lstrip())]": 1,
+   "head|lines[:cut]": 1,
+   "head|lines[:start]": 1,
+   "head|ln[:len(ln) - len(ln.lstrip())]": 1,
+   "head|models_cut_whole[:6]": 1,
+   "head|rest[:max(0, limit - len(pick))]": 1,
+   "head|sorted(priced, key=lambda r: (r[0], r[1]))[:limit]": 1,
+   "head|stem[:1]": 1,
+   "head|stem[:3]": 1,
+   "head|str(getattr(les, 'when', '') or '')[:10]": 1,
+   "head|t[:m.start()]": 2,
+   "head|t[:nl]": 1,
+   "head|t[:s]": 1,
+   "head|text[:m.start()]": 7,
+   "tail|(p.stderr or '').strip()[-300:]": 1,
+   "tail|_client_messages(transcript)[-BOOKING_WINDOW:]": 1
+  },
+  "task_metrics.py": {
+   "head|str(_t)[:96]": 1
+  },
+  "threshold_ledger_run.py": {
+   "head|(r['unit_limit'] or '—')[:80]": 1,
+   "head|r['unit'][:80]": 1,
+   "head|r['why'][:96]": 1
+  },
+  "trainer.py": {
+   "head|' '.join(parts)[:int(cap)]": 1,
+   "head|'\\n\\n'.join(notes)[:limit]": 1,
+   "head|[p for p in clean.split() if p][:int(words)]": 1,
+   "head|answer[:QUOTE_MAX]": 1,
+   "head|block[:max(0, room - len(_HYPS_CUT))]": 1,
+   "head|built['text'][:600]": 1,
+   "head|hashlib.sha256(str(remark or '').encode('utf-8')).hexdigest()[:8]": 1,
+   "head|hit[:120]": 1,
+   "head|incoming[:QUOTE_MAX]": 1,
+   "head|remark[:QUOTE_MAX]": 1,
+   "head|text[:119]": 1,
+   "head|why[:200]": 1,
+   "tail|transcript[-HYPS_TRANSCRIPT_MAX:]": 1
+  },
+  "trainer_log.py": {
+   "head|json.dumps(r, ensure_ascii=False)[:200]": 1,
+   "head|json.dumps(w, ensure_ascii=False)[:200]": 1,
+   "head|line[:120]": 1,
+   "head|line[:160]": 4,
+   "head|t[:cut]": 1
+  },
+  "trainer_photo.py": {
+   "bytes|f.read(16)": 1,
+   "head|head[:4]": 1,
+   "tail|(p.stderr or '').strip()[-300:]": 1
+  },
+  "trainer_pin.py": {
+   "head|hashlib.sha256((s or '').encode('utf-8')).hexdigest()[:16]": 1,
+   "head|k[:160]": 2
+  },
+  "trainer_run.py": {
+   "head|' | '.join(missing)[:200]": 1,
+   "head|(r.get('draft') or '')[:1200]": 2,
+   "head|after[:7]": 1,
+   "head|commit[:7]": 3,
+   "head|failed[:20]": 1,
+   "head|failed[:40]": 1,
+   "head|hashlib.sha256((out or '').encode('utf-8', 'replace')).hexdigest()[:16]": 1,
+   "head|hashlib.sha256(raw.encode('utf-8', 'replace')).hexdigest()[:16]": 2,
+   "head|head[:120]": 1,
+   "head|hit[:4]": 1,
+   "head|list(bind.get('dirty_paths') or [])[:40]": 1,
+   "head|money[:6]": 1,
+   "head|names[:6]": 1,
+   "head|old[:len(sets) - POINT_KEEP]": 1,
+   "head|rec['tolerated_why'][:12]": 1,
+   "head|s[:43]": 1,
+   "head|sorted(box.items(), key=lambda kv: kv[1].get('ts', 0))[:len(box) - client_contour._KEEP]": 1,
+   "head|sorted(set(bad))[:10]": 1,
+   "head|sorted(set(thai))[:10]": 1,
+   "head|str(bind.get('commit') or '?')[:7]": 1,
+   "head|taken[:40]": 1,
+   "head|text[:m.start()]": 1,
+   "head|tolerated[:40]": 1,
+   "head|unknown[:12]": 1,
+   "head|unknown[:40]": 1
+  },
+  "vitrina_pc.py": {
+   "head|rows[:limit]": 1,
+   "head|text[:max(1, limit - 1)]": 1,
+   "helper|one_line(body, SHTAB_PART_MAX)": 1,
+   "helper|one_line(box_stop, TEXT_MAX)": 1,
+   "helper|one_line(f.get('why'), 48)": 1,
+   "helper|one_line(got.get('blind'), 120)": 1,
+   "helper|one_line(got.get('name'), 40)": 1,
+   "helper|one_line(got.get('skipped'), 200)": 1,
+   "helper|one_line(got.get('src'), 72)": 1,
+   "helper|one_line(got.get('why'), 110)": 1,
+   "helper|one_line(got.get('why'), 120)": 1,
+   "helper|one_line(note, 130)": 1,
+   "helper|one_line(one.get('goal'), GOAL_MAX)": 1,
+   "helper|one_line(s, 400)": 1,
+   "helper|one_line(w.get('goal'), GOAL_MAX)": 2,
+   "helper|one_line(why, 90)": 1,
+   "helper|one_line(word, 40)": 1,
+   "tail|text[-limit:]": 1
+  },
+  "vitrina_pc_run.py": {
+   "head|str(exc)[:160]": 1,
+   "head|str(res)[:160]": 1
+  },
+  "wa_bridge.py": {
+   "head|[it for it in items if isinstance(it, dict)][:cap]": 1,
+   "tail|items[-CTX_KEEP:]": 1
+  },
+  "zayavki_lotok_pc.py": {
+   "head|got[:limit]": 1,
+   "head|safe[:64]": 1
+  },
+  "zayavki_pc.py": {
+   "head|'\\n'.join(lines)[:MSG_MAX]": 1,
+   "head|by_graph[:3]": 1,
+   "head|by_words[:3]": 1,
+   "head|closed[:5]": 1,
+   "head|held[:8]": 1,
+   "head|one[:max(1, limit - 1)]": 1,
+   "head|sig['cost'][:3]": 1,
+   "head|sig['defect'][:3]": 1,
+   "helper|_clip(', '.join(channels(d)), PATHS_MAX)": 1,
+   "helper|_clip(', '.join(files), PATHS_MAX)": 1,
+   "helper|_clip(', '.join(names), PATHS_MAX)": 1,
+   "helper|_clip(', '.join(packs(d)), PATHS_MAX)": 1,
+   "helper|_clip(d.get('premise_why'))": 1,
+   "helper|_clip(d.get('why'), WHY_MAX)": 2,
+   "helper|_clip(defect_why, WHY_MAX)": 1,
+   "helper|_clip(held[0].get('why'), 200)": 1,
+   "helper|_clip(r.get('why'), 90)": 1
+  },
+  "zayavki_route_pc.py": {
+   "head|got[:limit]": 1
+  }
+ },
+ "base": "03c8fbf (дерево = HEAD, отслеживаемых правок нет)",
+ "measured": "2026-09-17",
+ "note": "перепись резов дерева на 17.09, задание 63-o. НЕ список проверенных мест: из них места класса без права — перепись 63-d (docs/artifacts/2026-09-17-SVIDETEL-kanala-git-1709.md, 48 мест), остальные поимённо не разобраны. Список только убывает: total и дата прибиты в test_cut_mark_scan",
+ "method": "cut_mark_scan/head,tail,helper,bytes",
+ "total": 755
+}
