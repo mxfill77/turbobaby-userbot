@@ -5376,3 +5376,80 @@ class TestEffectNotSubstring(unittest.TestCase):
              "tool_input": {"file_path": os.path.join(PROJ, "docs", "artifacts", "x.md"),
                             "content": "обычный отчёт про мост и BRIDGE_TOKEN словами"}}
         self.assertEqual(g.decide(d)[0], "defer")
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# ПОСЛАБЛЕНИЯ 12.09.2026: свои корни записи (`_TRUSTED_ROOTS`) и чтение из сети по белому списку
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+class TestTrustedRootsAndNetRead(unittest.TestCase):
+    """Замер 12.09.2026 по `pretool_guard.log` (4000 последних решений): 328 карточек `ask`, из
+    них 190 `network` и 123 `write_outside` — 95% всех подтверждений владельца. Оба класса
+    ослаблены ТОЧЕЧНО, и этот прибор стережёт ГРАНИЦУ послабления с обеих сторон: что стало
+    зелёным — зелено, что обязано остаться красным — красно. Без второй половины послабление
+    молча выросло бы до «сеть и запись разрешены»."""
+
+    def _w(self, path, content="ok"):
+        return {"tool_name": "Write", "cwd": PROJ,
+                "tool_input": {"file_path": path, "content": content}}
+
+    # ── (а) ЗАПИСЬ: четыре замеренных корня молчат ────────────────────────────────────────────
+    def test_trusted_roots_are_silent(self):
+        for p in (r"D:\turbobaby-bike-bot\src\locales.rs",
+                  r"D:\t27-apex\og_design.py",
+                  r"D:\t27work\rss.xml",
+                  r"D:\tmp\queen_probe\board.json"):
+            self.assertEqual(g.decide(self._w(p))[0], "defer", p)
+
+    # ── (б) ЗАПИСЬ: граница корня НЕ ползёт по префиксу строки (`D:\tmp2` ≠ `D:\tmp`) ─────────
+    def test_lookalike_root_still_asks(self):
+        self.assertEqual(g.decide(self._w(r"D:\tmp2\x.txt"))[:2], ("ask", "write_outside"))
+
+    # ── (в) ЗАПИСЬ: C:\Users сознательно НЕ доверен — там ключи и креды ───────────────────────
+    def test_users_root_still_asks(self):
+        self.assertEqual(g.decide(self._w(r"C:\Users\mxfill1\x.txt"))[:2], ("ask", "write_outside"))
+
+    # ── (г) ЗАПИСЬ: секрет ВНУТРИ доверенного корня спрашивает как спрашивал ──────────────────
+    def test_secret_inside_trusted_root_still_asks(self):
+        self.assertEqual(g.decide(self._w(r"D:\turbobaby-bike-bot\.env", "TOKEN=1"))[0], "ask")
+
+    # ── (д) СЕТЬ: чтение по белому списку молчит ──────────────────────────────────────────────
+    def test_whitelisted_read_is_silent(self):
+        for c in ('curl -s "https://api.github.com/repos/gHashTag/t27"',
+                  "curl -sL https://raw.githubusercontent.com/gHashTag/t27/master/README.md",
+                  "timeout 40 curl -sL --max-time 35 https://t27.ai/rss.xml -o D:/t27work/rss.xml"):
+            self.assertEqual(g.decide(bash(c))[0], "defer", c)
+
+    # ── (е) СЕТЬ: четыре замка, каждый обязан вернуть карточку ────────────────────────────────
+    def test_foreign_host_still_asks(self):
+        self.assertEqual(g.decide(bash("curl https://example.com/x"))[:2], ("ask", "network"))
+
+    def test_send_body_still_asks(self):
+        self.assertEqual(
+            g.decide(bash("curl -X POST -d @payload.json https://api.github.com/repos"))[:2],
+            ("ask", "network"))
+
+    def test_ssh_channel_still_asks(self):
+        self.assertEqual(g.decide(bash("ssh root@198.51.100.7 uptime"))[:2], ("ask", "network"))
+
+    def test_url_from_variable_still_asks(self):
+        # адрес собран из переменной — разобрать нечего, и угадывать гард не имеет права
+        self.assertEqual(g.decide(bash('curl -s "$B/queen/public-board"'))[:2], ("ask", "network"))
+
+    def test_one_allowlisted_segment_does_not_whiten_the_other(self):
+        c = "curl -s https://api.github.com/x && curl -s https://evil.example/y"
+        self.assertEqual(g.decide(bash(c))[:2], ("ask", "network"))
+
+    # ── (ж) КУДА ЛОЖИТСЯ СКАЧАННОЕ: `-o` — флаг инструмента, сторож редиректов его не видит ───
+    def test_download_outside_sanctioned_zone_still_asks(self):
+        c = "curl -sL https://t27.ai/rss.xml -o C:/Windows/Temp/x.xml"
+        self.assertEqual(g.decide(bash(c))[0], "ask", c)
+
+    def test_remote_name_download_still_asks(self):
+        # `-O`: имя файла выбирает сервер, каталог — чужой cwd
+        self.assertEqual(g.decide(bash("curl -O https://api.github.com/x"))[0], "ask")
+
+    # ── (з) послабление НАЗЫВАЕТ СЕБЯ: зелёное чтение не безлико, в журнале виден хост ────────
+    def test_green_net_read_names_itself(self):
+        d, k, o = g.decide(bash('curl -s "https://api.github.com/repos/gHashTag/t27"'))
+        self.assertEqual((d, k), ("defer", "net_read"))
+        self.assertEqual(o, "api.github.com")

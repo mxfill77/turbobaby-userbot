@@ -792,6 +792,87 @@ def _net_scan(cmd):
     return kind, target
 
 
+# ── БЕЛЫЙ СПИСОК ЧТЕНИЯ ИЗ СЕТИ (заведён 12.09.2026 замером, решение владельца) ───────────────
+# Тот же замер 4000 решений: 190 карточек `network` из 328 всех `ask`, и адреса в них — 123
+# raw.githubusercontent.com, 61 api.github.com, 27 t27.ai, остальное единицами. Это ЧТЕНИЕ
+# публичных исходников и документации, то есть ровно тот случай, ради которого владелец каждый
+# раз жал «разрешить».
+#
+# ЧТО ОСТАЁТСЯ КРАСНЫМ — три независимых замка, любой из них возвращает карточку:
+#   • инструмент не из `_NET_READ_TOOLS` (ssh/scp/nc/telnet) — это канал, а не чтение;
+#   • признак ОТПРАВКИ тела (`-d`, `--data*`, `-F`, `-T`, `--upload-file`, `-Body`, `-InFile`,
+#     `-X POST|PUT|PATCH|DELETE`) — наружу уходит содержимое, а отправленное не вернуть;
+#   • адрес не из `_NET_ALLOWED_HOSTS` ИЛИ его в сегменте нет вовсе (собран из переменной —
+#     `curl "$B/queen/board"`). Неразобранный адрес судим как чужой: угадывать нельзя.
+# Плюс четвёртый, общий: значение секрета в тексте команды (`_env_value_in_text` /
+# `_secret_value_leak`) отменяет послабление целиком — GET умеет вынести секрет в самом URL.
+#
+# Послабление снимает ТОЛЬКО карточку вида `network`: в решающем цикле стои́т `continue`, а не
+# `return`, поэтому все прочие красные ветви (env, секреты, запись, удаление) судят команду как
+# раньше — тем же заходом.
+_NET_READ_TOOLS = {"curl", "wget", "iwr", "irm", "invoke-webrequest", "invoke-restmethod"}
+_NET_ALLOWED_HOSTS = ("api.github.com", "raw.githubusercontent.com", "github.com",
+                      "objects.githubusercontent.com", "codeload.github.com", "t27.ai")
+_RE_NET_SEND = re.compile(
+    r"(?i)(?:^|\s)(?:-d|--data(?:-[a-z]+)?|--json|-F|--form|-T|--upload-file|-Body|-InFile|-Form)"
+    r"(?:[=\s]|$)"
+    r"|(?:^|\s)(?:-X|--request|-Method)[=\s]+(?:POST|PUT|PATCH|DELETE)\b")
+_RE_NET_URL = re.compile(r"(?i)\bhttps?://([A-Za-z0-9._\-]+)")
+# КУДА ЛОЖИТСЯ СКАЧАННОЕ. Заведено 12.09.2026 вместе с послаблением и СТОИТ КОМПЕНСАЦИЕЙ: до него
+# `curl … -o C:/Windows/x` проходил бы молча, потому что `-o` — флаг инструмента, а не
+# перенаправление шелла, и сторож редиректов (`_RE_LEAK_REDIR`) его не видит. Раньше эту запись
+# прикрывала сама карточка `network`; сняв её, обязаны прикрыть цель отдельно.
+_RE_NET_OUT = re.compile(r"(?i)(?:^|\s)(?:-o|--output|-OutFile)[=\s]+(\S+)")
+_RE_NET_REMOTE_NAME = re.compile(r"(?:^|\s)(?:-O|--remote-name)(?:\s|$)")
+_NET_OUT_NULL = ("/dev/null", "nul", "$null")
+
+
+def _net_sanctioned(cmd, cwd=None):
+    """True ⇔ КАЖДЫЙ выход наружу в этой команде — чтение по адресу из белого списка.
+    Разбор структурный и зеркалит `_net_scan` (та же нарезка сегментов, та же командная позиция,
+    те же обёртки `timeout N`/`sudo`) — иначе два прибора судили бы одну команду по-разному.
+
+    Fail-closed везде: сомнение (нет адреса, чужой хост, непонятный инструмент, сбой разбора)
+    возвращает False, то есть карточку. Пустой результат (`seen` остался False) — тоже False:
+    «сети не нашли» не повод объявлять послабление."""
+    if not cmd:
+        return False
+    if _env_value_in_text(cmd) or _secret_value_leak(cmd):
+        return False
+    seen = False
+    for i, seg in enumerate(_split_segments(cmd)):
+        if i % 2:
+            continue
+        try:
+            toks = shlex.split(seg)
+        except Exception:
+            toks = seg.split()
+        j = _cmd_index(toks)
+        if j is None or j >= len(toks):
+            continue
+        name = _base(toks[j])
+        if name not in _OPEN_NET_TOOLS and name not in _SSH_TOOLS:
+            continue
+        seen = True
+        if name not in _NET_READ_TOOLS:
+            return False
+        if _RE_NET_SEND.search(seg):
+            return False
+        hosts = [h.lower() for h in _RE_NET_URL.findall(seg)]
+        if not hosts or any(h not in _NET_ALLOWED_HOSTS for h in hosts):
+            return False
+        if _RE_NET_REMOTE_NAME.search(seg):
+            return False            # имя файла выбирает СЕРВЕР, а каталог — чужой cwd
+        for tgt in _RE_NET_OUT.findall(seg):
+            t = tgt.strip("'\"")
+            if t.lower() in _NET_OUT_NULL:
+                continue
+            p = t if os.path.isabs(t) else os.path.join(cwd or PROJECT, t)
+            if not (_inside_project(p) or _sanctioned_outside(p)):
+                return False        # скачанное ложится ВНЕ разрешённых зон → карточка
+    return seen
+
+
 # СНЯТА 02.08.2026 (класс Д-5): здесь стояла `_net_cmd_kind` — «совместимая обёртка над
 # `_net_scan`, только вид, без цели». Совместимость была не с кем: машинный счёт по AST дал НОЛЬ
 # ссылок во всём репозитории, включая тесты. Вид сети берут прямо из `_net_scan(cmd)[0]`.
@@ -1797,11 +1878,43 @@ def _is_memory_store(path):
     return ".claude" in parts[:i] and "projects" in parts[:i]
 
 
+# Корни ЧУЖИХ проектов владельца, где запись подтверждения не требует. Список НАЗНАЧЕН ЗАМЕРОМ,
+# а не на глаз (12.09.2026): 4000 последних решений гарда дали 328 карточек `ask`, из них 123 —
+# `write_outside`, и 115 из этих 123 пришлись ровно на четыре корня ниже (83 bike-bot, 16 t27-apex,
+# 11 tmp, 5 t27work). Решение владельца — снять их; остаток в 8 карточек спрашивает как спрашивал.
+#
+# ПОЧЕМУ ЭТО НЕ ДЫРА В СЕКРЕТАХ: ветка `write_outside` в `_decide_write` стои́т ПОСЛЕДНЕЙ — до неё
+# уже отработали `_is_secret_path`, `_is_claude_path` и проверка выноса ЗНАЧЕНИЯ секрета в тело
+# записи. Поэтому `.env`, `*.session` и конфиг `.claude` внутри этих корней спрашивают как раньше;
+# новым зелёным становится ТОЛЬКО обычный исходник чужого проекта.
+#
+# `C:/Users` СОЗНАТЕЛЬНО НЕ ВНЕСЁН, хотя дал 12 карточек: там живут ключи, креды и конфиги, и цена
+# одной ошибки несоизмерима с двенадцатью подтверждениями.
+_TRUSTED_ROOTS = ("D:/turbobaby-bike-bot", "D:/t27-apex", "D:/t27work", "D:/tmp")
+_TRUSTED_ROOTS_N = tuple(os.path.normcase(os.path.normpath(p)) for p in _TRUSTED_ROOTS)
+
+
+def _is_trusted_root(path):
+    """Путь лежит В ОДНОМ из `_TRUSTED_ROOTS` (сам корень тоже считается). Сравнение — по
+    нормализованному пути с разделителем на конце, а не по префиксу строки: иначе `D:/tmp2`
+    прошёл бы как `D:/tmp` (тот же класс, что закрыт в `_inside_project`)."""
+    if not path:
+        return False
+    try:
+        ap = path if os.path.isabs(path) else os.path.join(PROJECT, path)
+        ap = os.path.normcase(os.path.normpath(ap))
+    except Exception:
+        return False
+    return any(ap == r or ap.startswith(r + os.sep) for r in _TRUSTED_ROOTS_N)
+
+
 def _sanctioned_outside(path):
     """Зоны ВНЕ репо, где запись не требует подтверждения: временные каталоги harness'а
-    (`%TEMP%\\claude\\**`, включая скретчпад) и хранилище памяти агента. Оба — рабочая зона самой
-    сессии, не вектор эскалации. Живой факт аудита 22:27: 6 из 20 последних Allow были про них."""
-    return _is_scratchpad(path) or _is_temp_zone(path) or _is_memory_store(path)
+    (`%TEMP%\\claude\\**`, включая скретчпад), хранилище памяти агента и рабочие корни владельца
+    (`_TRUSTED_ROOTS`). Первые два — рабочая зона самой сессии, не вектор эскалации (живой факт
+    аудита 22:27: 6 из 20 последних Allow были про них); третий заведён замером 12.09.2026."""
+    return (_is_scratchpad(path) or _is_temp_zone(path) or _is_memory_store(path)
+            or _is_trusted_root(path))
 
 
 def _is_test_target(path):
@@ -3589,7 +3702,7 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False, skip_kinds=frozenset()):
                 continue
             # Сеть: красное — только НАСТОЯЩИЙ выход наружу. Свой ssh-канал и упоминание слова
             # в тексте карточки не порождают (см. _net_scan).
-            if kind == "network" and netk != "open":
+            if kind == "network" and (netk != "open" or _net_sanctioned(cmd, cwd)):
                 continue
             if kind == "clasp":
                 # Разводим по подкоманде: чтение — зелёное, выкатка/исполнение — красное.
@@ -3681,6 +3794,15 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False, skip_kinds=frozenset()):
     # ВСЕГДА. Вид ставим честный: в журнале видно, что решение принято разбором запроса.
     if sq and sq[0] == "sqlite_read":
         return ("defer", "sqlite_read", sq[1])
+    # Команда — ЧТЕНИЕ ИЗ СЕТИ по белому списку и ничего больше. Ровно тот же случай, что у
+    # `sqlite_read` строкой выше: смотрелки шелла `curl` не знают, и БЕЗ ЭТОЙ ВЕТКИ послабление
+    # `network` не дало бы владельцу ничего. Замер 12.09.2026 на живой команде из лога:
+    # `curl -s "https://api.github.com/repos/…"` → `('ask', 'unknown', '')`, то есть карточка
+    # сменила ИМЯ, а жать её пришлось бы по-прежнему — и вид стал БЕЗЛИКИМ вместо честного.
+    # Та же доктрина лога, что у `sqlite_read`/`cfg_read`: смягчение не должно стоить прозрачности,
+    # поэтому вид называем, и в журнале видно, ЧЕМ принято решение и на какой хост ходили.
+    if _net_sanctioned(cmd, cwd):
+        return ("defer", "net_read", _net_scan(cmd)[1])
     return ("ask", "unknown", "")
 
 
