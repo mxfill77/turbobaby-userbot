@@ -1991,12 +1991,189 @@ class TestTheReferenceStandsApart(Base):
         self.assertTrue(ok, where)
         self.assertNotIn("reference", shot)
 
-    def test_the_live_set_refuses_show_and_tap_and_switches_nothing(self):
-        was = (exam_show.CASES, exam_show.SHOTS_DIR)
-        for argv in (["--live", "--case", "1", "--show"], ["--live", "--case", "1", "--tap", "ok"],
-                     ["--live", "--trace"], ["--live", "--case", "1"]):
-            self.assertEqual(exam_show.main(argv), 2, argv)
-            self.assertEqual((exam_show.CASES, exam_show.SHOTS_DIR), was, argv)
+
+# ─────────────── РАЗВОД ХРАНИЛИЩ: живой набор и тренажёр (18.09.2026, задание 63-t) ───────────────
+# До развода отказ `LIVE_REFUSED` стоял у показа и тапа живого набора потому, что журнал, стол и база
+# уроков у наборов были общие: тап по живому кейсу 13 лёг бы вердиктом кейсу 13 тренажёра. Этот
+# класс держит обратное ОБЕИМИ сторонами: у каждого набора свои файлы, и запись одного не видна
+# другому ни байтом. ВСЕ пути обоих наборов — во временном месте, включая `LIVE_*`: `use_live_set`
+# переключает модуль на них, и без подмены набор писал бы в боевой `exam_live/`.
+
+class TestTwoSetsKeepApart(unittest.TestCase):
+    LIVE_NAMES = ("LIVE_CASES", "LIVE_SHOTS", "LIVE_VERDICTS", "LIVE_DESK", "LIVE_LESSONS")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="exam_two_sets_")
+        self._state = exam_show.set_state()
+        self._live_was = dict((k, getattr(exam_show, k)) for k in self.LIVE_NAMES)
+        self.addCleanup(self._restore)
+        self.paths = {}
+        for side in ("trainer", "live"):
+            root = os.path.join(self.tmp, side)
+            os.makedirs(os.path.join(root, "shots"))
+            self.paths[side] = {"cases": os.path.join(root, "cases.json"),
+                                "shots": os.path.join(root, "shots"),
+                                "verdicts": os.path.join(root, "verdicts.tsv"),
+                                "desk": os.path.join(root, "desk.json"),
+                                "lessons": os.path.join(root, "lessons.tsv")}
+            with open(self.paths[side]["cases"], "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"cases": [{"id": 13, "name": "%s 13" % side, "lines": ["вопрос"]},
+                                     {"id": 14, "name": "%s 14" % side, "lines": ["вопрос"]}]},
+                          f, ensure_ascii=False)
+        t, lv = self.paths["trainer"], self.paths["live"]
+        exam_show.restore_set(dict(self._state, CASES=t["cases"], SHOTS_DIR=t["shots"],
+                                   VERDICTS=t["verdicts"], SESSION=t["desk"],
+                                   LESSON_PATH=t["lessons"], HEAD_LESSON_PATH=None,
+                                   SET_NAME=exam_show.SET_TRAINER, CB_HEAD="exam",
+                                   AGENT_CB_NAME="EXAM_CB_RE"))
+        (exam_show.LIVE_CASES, exam_show.LIVE_SHOTS, exam_show.LIVE_VERDICTS, exam_show.LIVE_DESK,
+         exam_show.LIVE_LESSONS) = (lv["cases"], lv["shots"], lv["verdicts"], lv["desk"],
+                                    lv["lessons"])
+        self.trainer = exam_show.set_state()
+        exam_show.use_live_set()
+        self.live = exam_show.set_state()
+        for side, state in (("trainer", self.trainer), ("live", self.live)):
+            exam_show.restore_set(state)
+            shot = _shot(case=13, total=2, hints=HINTS,
+                         corpus=exam_show.corpus_fingerprint(self.paths[side]["cases"]))
+            with open(exam_show.shot_path(13, "deadbee"), "w", encoding="utf-8") as f:
+                json.dump(shot, f, ensure_ascii=False)
+        exam_show.restore_set(self.trainer)
+        self.sent = []
+
+    def _restore(self):
+        exam_show.restore_set(self._state)
+        for k, v in self._live_was.items():
+            setattr(exam_show, k, v)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def files(self, side):
+        """Байты журнала, стола и базы уроков набора (None — файла нет)."""
+        out = {}
+        for key in ("verdicts", "desk", "lessons"):
+            try:
+                with open(self.paths[side][key], "rb") as f:
+                    out[key] = f.read()
+            except OSError:
+                out[key] = None
+        return out
+
+    def door_kwargs(self):
+        def send(text, chat, markup=None):
+            self.sent.append(markup)
+            return ("ловушка", True, "0")
+        return {"right_fn": lambda _w=None: True, "sender": send,
+                "agent_fn": lambda callbacks=None: (True, "стенд")}
+
+    def test_use_live_set_moves_every_storage_and_keeps_the_head_base(self):
+        self.assertEqual(exam_show.VERDICTS, self.paths["trainer"]["verdicts"])
+        exam_show.use_live_set()
+        exam_show.use_live_set()                      # повтор не затирает базу головы
+        lv = self.paths["live"]
+        self.assertEqual((exam_show.CASES, exam_show.SHOTS_DIR, exam_show.VERDICTS,
+                          exam_show.SESSION, exam_show.LESSON_PATH),
+                         (lv["cases"], lv["shots"], lv["verdicts"], lv["desk"], lv["lessons"]))
+        self.assertEqual(exam_show.HEAD_LESSON_PATH, self.paths["trainer"]["lessons"])
+        self.assertEqual((exam_show.SET_NAME, exam_show.CB_HEAD, exam_show.AGENT_CB_NAME),
+                         ("живой", "examlive", "EXAM_LIVE_CB_RE"))
+
+    def test_a_live_tap_leaves_no_trace_at_the_trainer_case_and_back(self):
+        """ДВУСТОРОННИЙ ОТРИЦАТЕЛЬНЫЙ: кейс 13 есть в обоих наборах."""
+        before_t, before_l = self.files("trainer"), self.files("live")
+        exam_show.restore_set(self.live)
+        ok, said = exam_show.tap(13, "ok", "@filipp", **self.door_kwargs())
+        self.assertTrue(ok, said)
+        self.assertIn("журнал набора «живой»", said)
+        self.assertEqual(self.files("trainer"), before_t, "тап живого набора наследил у тренажёра")
+        after_l = self.files("live")
+        self.assertNotEqual(after_l["verdicts"], before_l["verdicts"])
+        row = exam_show.load_verdicts(self.paths["live"]["verdicts"])[0]
+        self.assertEqual((row["набор"], row["кейс"], row["вердикт"]), ("живой", "13", "верно"))
+        self.assertEqual(row["корпус"], exam_show.corpus_fingerprint(self.paths["live"]["cases"]))
+
+        exam_show.restore_set(self.trainer)
+        ok, said = exam_show.tap(13, "ok", "@filipp", **self.door_kwargs())
+        self.assertTrue(ok, said)
+        self.assertNotIn("уже судим", said, "вердикт живого набора закрыл кейс тренажёра")
+        self.assertEqual(self.files("live"), after_l, "тап тренажёра наследил у живого набора")
+        row = exam_show.load_verdicts(self.paths["trainer"]["verdicts"])[0]
+        self.assertEqual((row["набор"], row["кейс"]), ("тренажёр", "13"))
+
+    def test_toggle_apply_and_own_of_the_live_set_write_only_its_own_files(self):
+        before_t = self.files("trainer")
+        exam_show.restore_set(self.live)
+        kw = self.door_kwargs()
+        self.assertTrue(exam_show.toggle(13, 1, "@filipp", right_fn=kw["right_fn"])[0])
+        ok, said = exam_show.apply_marked(13, "@filipp", **kw)
+        self.assertTrue(ok, said)
+        self.assertIn("ЖИВОГО набора", said)
+        self.assertNotIn("действуют СРАЗУ", said, "урок живого набора на бота не действует")
+        with open(self.paths["live"]["lessons"], encoding="utf-8") as f:
+            self.assertEqual(len([x for x in f.read().splitlines()[1:] if x.strip()]), 1)
+        self.assertEqual(self.files("trainer"), before_t)
+        exam_show.restore_set(self.trainer)
+        live_desk = self.files("live")["desk"]
+        self.assertTrue(exam_show.own_start(13, "@filipp", right_fn=kw["right_fn"])[0])
+        self.assertEqual(self.files("live")["desk"], live_desk, "«своё» тренажёра тронуло стол живого")
+        exam_show.restore_set(self.live)
+        self.assertEqual(exam_show.pending_own(), (None, None),
+                         "ожидание тренажёра видно со стола живого набора")
+
+    def test_the_live_card_has_its_own_head_and_the_live_agent_parses_it(self):
+        exam_show.restore_set(self.live)
+        shot = _shot(case=13, hints=[_hint("н%d" % i, "п%d" % i)
+                                     for i in range(exam_show.HINTS_MAX)])
+        cbs = exam_show.card_callbacks(13, shot)
+        self.assertTrue(all(c.startswith("examlive:") for c in cbs), cbs)
+        rx, words = exam_show.agent_parse()
+        self.assertIsNotNone(rx, words)
+        self.assertEqual([c for c in cbs if not rx.match(c)], [])
+        trx, _w = exam_show.agent_parse(name="EXAM_CB_RE")
+        self.assertEqual([c for c in cbs if trx.match(c)], [], "разбор тренажёра взял кнопку живого")
+        self.assertIn("ЖИВОЙ НАБОР", exam_show.card_text(shot))
+        exam_show.restore_set(self.trainer)
+        self.assertEqual([c for c in exam_show.card_callbacks(13, shot) if rx.match(c)], [])
+        self.assertNotIn("ЖИВОЙ НАБОР", exam_show.card_text(shot))
+
+    def test_the_agent_routes_the_live_head_to_the_live_door(self):
+        owner = pc_agent.ALLOWED_USER_ID
+        route = pc_agent._chain_cb_route("examlive:h2:13", owner)
+        self.assertEqual((route["ok"], route["kind"], route["action"], route["pid"]),
+                         (True, "exam_live", "h2", "13"))
+        self.assertIn("живой набор", route["answer"])
+        self.assertEqual(pc_agent._chain_cb_route("exam:h2:13", owner)["kind"], "exam")
+        for alien in ("examlive:ok:", "examlive:ok:1234", "examlive:ok:1;x", "exam:live:ok:1"):
+            self.assertIsNone(pc_agent._exam_live_cb_parse(alien), alien)
+
+    def test_the_catcher_gives_the_text_to_the_later_waiting_desk(self):
+        kw = self.door_kwargs()
+        exam_show.own_start(13, "@filipp", right_fn=kw["right_fn"], now=1000)
+        exam_show.restore_set(self.live)
+        exam_show.own_start(13, "@filipp", right_fn=kw["right_fn"], now=1100)
+        desks = (("trainer", self.paths["trainer"]["desk"]), ("live", self.paths["live"]["desk"]))
+        self.assertEqual(pc_agent._exam_pending_set(desks=desks, now=1200), ("live", "13"))
+        late = 1000 + exam_show.PENDING_TTL_SEC + 50
+        self.assertEqual(pc_agent._exam_pending_set(desks=desks, now=late), ("live", "13"))
+        self.assertIsNone(pc_agent._exam_pending_set(desks=desks, now=late + 100))
+
+    def test_the_live_desk_literal_of_the_catcher_is_the_desk_of_the_door(self):
+        self.assertEqual(
+            os.path.normcase(os.path.relpath(str(pc_agent.EXAM_LIVE_DESK), str(pc_agent.REPO_DIR))),
+            os.path.normcase(os.path.relpath(self._live_was["LIVE_DESK"], exam_show.REPO)))
+
+    def test_the_trace_and_the_rollback_hint_name_the_set(self):
+        exam_show.restore_set(self.live)
+        self.assertIn("набора «живой»", exam_show.trace())
+        exam_show.tap(13, "no", "@filipp", **self.door_kwargs())
+        self.assertIn("набор живой", exam_show.trace())
+        self.assertIn("exam_show.py --live --rollback",
+                      exam_show.tap(13, "ok", "@filipp", **self.door_kwargs())[1])
+
+    def test_only_reach_is_closed_to_the_live_set_and_it_switches_nothing(self):
+        was = exam_show.set_state()
+        self.assertEqual(exam_show.main(["--live", "--reach"]), 2)
+        self.assertEqual(exam_show.set_state(), was)
+        self.assertEqual(exam_show.LIVE_CLOSED, ("reach",))
 
 
 if __name__ == "__main__":

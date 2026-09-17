@@ -725,8 +725,15 @@ GATE_ANSWER_AT = ("тема «PC-дев», сообщением «задача: 
 # чтобы хвост остался ОДНИМ числом и правило «из Telegram едет только число» не пришлось
 # ослаблять ради второй группы.
 EXAM_CB_RE = re.compile(r"^exam:(ok|no|own|go|h[1-4]):([0-9]{1,3})$")
+# ★ 18.09.2026, ЖИВОЙ НАБОР (задание 63-t). Номера кейсов у двух наборов общие (кейс 13 есть в
+# обоих), поэтому набор едет В ГОЛОВЕ ключа, а не в хвосте: хвост остаётся одним числом. Тап по
+# `examlive:` зовёт ту же дверь с `--live`, и вердикт ложится в журнал ЖИВОГО набора
+# (`exam_live/verdicts.tsv`), а не тренажёра. Регулярка отдельная и с тем же хвостом: разбор
+# тренажёра (`EXAM_CB_RE`) остаётся байт в байт прежним, а `exam_show.agent_parse` сверяет карточку
+# живого набора именно с этой строкой.
+EXAM_LIVE_CB_RE = re.compile(r"^examlive:(ok|no|own|go|h[1-4]):([0-9]{1,3})$")
 EXAM_ANSWER_AT = ("консоль репозитория, командой «exam_show.py --case N --tap ok|no --who <имя>» "
-                  "(словом в тему это пока не делается)")
+                  "(для живого набора — с --live; словом в тему это пока не делается)")
 # Группа-тренажёр: карточка экзамена висит ТАМ, и ответ владельца на «✍️ своё» приходит оттуда же.
 # Число названо здесь литералом по той же причине, по какой оно названо литералом в `exam_show`:
 # адрес, взятый из изменяемого места, может однажды указать в клиентский чат.
@@ -1006,6 +1013,12 @@ def _exam_cb_parse(data):
     return (m.group(1), m.group(2)) if m else None
 
 
+def _exam_live_cb_parse(data):
+    """callback_data кнопки ЖИВОГО набора → (вердикт, номер кейса) | None (не наш callback)."""
+    m = EXAM_LIVE_CB_RE.match(str(data or ""))
+    return (m.group(1), m.group(2)) if m else None
+
+
 # Стол экзамена — маленький json, который пишет `exam_show`. ЧИТАЕМ ЕГО САМИ, А НЕ ЧЕРЕЗ ИМПОРТ
 # `exam_show`, и это не удобство, а ЗАМЕР: `import exam_show` в этом файле затаскивает в замыкание
 # ЖИВЫХ ВОРОТ клиентского контура прогонщик корпуса (`exam_show.freeze` → `import trainer_run`), и
@@ -1018,13 +1031,29 @@ def _exam_cb_parse(data):
 # владелец, чей урок молча не поймали.
 EXAM_DESK = REPO_DIR / "exam_session.json"
 EXAM_DESK_CASE, EXAM_DESK_UNTIL = "case", "own_until"
+# Стол ЖИВОГО набора (18.09.2026) — свой файл в его каталоге; `exam_show.LIVE_DESK` пишет его, этот
+# литерал читает, и контрактный тест сверяет их так же, как пару столов тренажёра.
+EXAM_LIVE_DESK = REPO_DIR / "exam_live" / "desk.json"
+EXAM_SET_TRAINER, EXAM_SET_LIVE = "trainer", "live"
 
 
-def _exam_pending_case(path=None, now=None):
-    """Кейс, ждущий урока СВОИМИ СЛОВАМИ → номер | None (ожидания нет / истекли 10 минут).
+def _exam_pending_set(desks=None, now=None):
+    """Чьё ожидание «✍️ своё» живо → (набор, кейс) | None. Набор — `EXAM_SET_TRAINER`/`EXAM_SET_LIVE`.
 
-    ОШИБКА ЧТЕНИЯ = «ожидания нет», fail-closed. Исход выбран, а не случился: ложное «жду»
-    превратило бы первое же сообщение владельца в группе в урок, которого он не писал."""
+    Ждать могут ОБА стола сразу (владелец нажал «своё» под карточкой тренажёра, а потом под
+    карточкой живого набора). Текст тогда уходит тому, чьё ожидание ОТКРЫТО ПОЗЖЕ (больший
+    `own_until`: срок у обоих один, 10 минут), — это последняя кнопка, которую владелец нажал.
+    Ответ двери называет набор, так что ошибка адреса не бывает молчаливой."""
+    best = None
+    for name, path in (desks or ((EXAM_SET_TRAINER, EXAM_DESK), (EXAM_SET_LIVE, EXAM_LIVE_DESK))):
+        wait = _exam_desk_wait(path, now)
+        if wait is not None and (best is None or wait[1] > best[2]):
+            best = (name, wait[0], wait[1])
+    return (best[0], best[1]) if best else None
+
+
+def _exam_desk_wait(path=None, now=None):
+    """Живое ожидание на столе → (кейс, own_until) | None. Разбор ОДИН на оба стола."""
     try:
         with io.open(str(path or EXAM_DESK), encoding="utf-8") as f:
             desk = json.load(f)
@@ -1033,7 +1062,16 @@ def _exam_pending_case(path=None, now=None):
         return None
     if (now if now is not None else time.time()) > until:
         return None
-    return desk.get(EXAM_DESK_CASE)
+    return desk.get(EXAM_DESK_CASE), until
+
+
+def _exam_pending_case(path=None, now=None):
+    """Кейс, ждущий урока СВОИМИ СЛОВАМИ → номер | None (ожидания нет / истекли 10 минут).
+
+    ОШИБКА ЧТЕНИЯ = «ожидания нет», fail-closed. Исход выбран, а не случился: ложное «жду»
+    превратило бы первое же сообщение владельца в группе в урок, которого он не писал."""
+    wait = _exam_desk_wait(path, now)
+    return wait[0] if wait is not None else None
 
 
 def exam_args(action, case):
@@ -1055,8 +1093,11 @@ def exam_args(action, case):
     return None
 
 
-def _exam_cli(action, case, who, stdin_text=None):
+def _exam_cli(action, case, who, stdin_text=None, live=False):
     """Кнопка экзамена через дверь `exam_show.py`: тот же путь, что и рука с консоли.
+
+    `live` — кнопка ЖИВОГО набора: к аргументам двери спереди встаёт `--live`, и дверь пишет в его
+    журнал, стол и базу уроков. Больше ничем путь живого набора от тренажёра не отличается.
 
     Субпроцессом и той же механикой, что `_gate_cli`, по той же причине: агент роутит тап и
     показывает результат, а судит право, пишет журнал и базу уроков ДВЕРЬ. Имя автора едет из
@@ -1070,6 +1111,8 @@ def _exam_cli(action, case, who, stdin_text=None):
     args = ["--own-text"] if stdin_text is not None else exam_args(action, case)
     if args is None:
         return f"экзамен, кейс {case}: не понял кнопку ({action})."
+    if live:
+        args = ["--live"] + args
     if not VENV_PY.exists():
         return f"экзамен, кейс {case}: не нашёл python venv ({VENV_PY})."
     try:
@@ -1164,6 +1207,7 @@ def _chain_cb_route(data, uid):
     gate = _gate_cb_parse(data)
     box = _box_cb_parse(data)
     exam = _exam_cb_parse(data)
+    exam_live = _exam_live_cb_parse(data)
     if not _chain_cb_authorized(uid):
         # owner-gate раньше разбора: чужому не подсказываем формат кнопок.
         return {"ok": False, "kind": None, "action": None, "pid": None,
@@ -1175,19 +1219,23 @@ def _chain_cb_route(data, uid):
         action, mark = box
         return {"ok": True, "kind": "box", "action": action, "pid": mark,
                 "answer": "🔓 снимаю остановку…", "alert": False, "note": None}
-    if exam is not None:
+    if exam is not None or exam_live is not None:
         # Кнопки РАБОЧЕГО МЕСТА ЭКЗАМЕНА. Тост обещает РОВНО ТО, что произойдёт, и у пяти кнопок
         # он разный намеренно: у номера последствий нет вовсе (тумблер), у «✔ Применить» они
         # необратимы в одну сторону (урок начинает действовать на всех клиентов), у вердикта
         # последствие — строка журнала. Один общий тост на пять кнопок обещал бы владельцу не то,
         # что он нажал, раньше, чем он отпустит палец.
-        action, case = exam
+        # Живой набор (18.09.2026) — свой вид `exam_live`: его исполнитель зовёт дверь с `--live`,
+        # а тост называет набор, потому что уроки там на ответы бота не действуют.
+        action, case = exam if exam is not None else exam_live
         said = {"ok": "✅ записываю «верно»…", "no": "❌ записываю «неверно»…",
                 "go": "🎓 записываю уроки и вердикт…",
                 "own": "✍️ слушаю: следующим сообщением — правило…"}.get(action)
-        return {"ok": True, "kind": "exam", "action": action, "pid": case,
-                "answer": said or ("☑️ отмечаю подсказку %s…" % action[1:]),
-                "alert": False, "note": None}
+        said = said or ("☑️ отмечаю подсказку %s…" % action[1:])
+        if exam is None:
+            said = "живой набор: " + said
+        return {"ok": True, "kind": "exam" if exam is not None else "exam_live",
+                "action": action, "pid": case, "answer": said, "alert": False, "note": None}
     if gate is not None:
         # Кнопка ВОРОТ клиентского контура. Тост говорит РАЗНОЕ про «да» и «нет» намеренно: «да»
         # только ЗАПИСЫВАЕТ основание (применение пойдёт штатной реконсиляцией), «нет» не применяет
@@ -1282,7 +1330,9 @@ async def on_chain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # необязательное), и падение здесь уронило бы обработчик ВСЕХ кнопок, а не одной нашей.
     who = getattr(q.from_user, "username", "") or ""
     runner = {"zayavka": _zayavka_cli, "gate": _gate_cli, "box": _box_cli,
-              "exam": (lambda a, p: _exam_cli(a, p, who))}.get(route.get("kind"), _chain_cli)
+              "exam": (lambda a, p: _exam_cli(a, p, who)),
+              "exam_live": (lambda a, p: _exam_cli(a, p, who, live=True))}.get(
+                  route.get("kind"), _chain_cli)
     reply = await asyncio.to_thread(runner, route["action"], route["pid"])
     await _chain_reply(context, q, reply)
 
@@ -1304,12 +1354,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.id == EXAM_CHAT_ID:
         if (user.id if user else None) != ALLOWED_USER_ID:
             return
-        if await asyncio.to_thread(_exam_pending_case) is None:
+        pending = await asyncio.to_thread(_exam_pending_set)
+        if pending is None:
             return
         raw = msg.text or ""
-        alog.info("экзамен: ловлю урок своими словами (%d симв.)", len(raw))
+        alog.info("экзамен (%s): ловлю урок своими словами (%d симв.)", pending[0], len(raw))
         who = getattr(user, "username", "") or ""
-        reply = await asyncio.to_thread(_exam_cli, "own", "", who, raw)
+        reply = await asyncio.to_thread(_exam_cli, "own", "", who, raw,
+                                        pending[0] == EXAM_SET_LIVE)
         await _send(context, chat.id, reply)
         return
     # 1) только наш чат и только тема 205 — прочее молча игнорим

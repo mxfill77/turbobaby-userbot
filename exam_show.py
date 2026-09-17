@@ -63,6 +63,29 @@ LIVE_DIR = os.path.join(REPO, "exam_live")
 LIVE_CASES = os.path.join(LIVE_DIR, "cases.json")
 LIVE_SHOTS = os.path.join(LIVE_DIR, "shots")
 
+# ── РАЗВОД ХРАНИЛИЩ ДВУХ НАБОРОВ (18.09.2026, задание 63-t) ─────────────────────────────────
+# До этого дня `use_live_set` переключал только корпус и снимки, а журнал вердиктов, стол и база
+# уроков у наборов были ОБЩИЕ: тап по живому кейсу 13 лёг бы вердиктом кейсу 13 тренажёра, и
+# `_judged_why` отказал бы тренажёру «кейс уже судим» чужим вердиктом. Теперь у живого набора
+# всё своё и лежит в его каталоге (весь `exam_live/` под .gitignore); файлы тренажёра прежние.
+#
+# УРОКИ ЖИВОГО НАБОРА НА ОТВЕТЫ БОТА НЕ ДЕЙСТВУЮТ, и это следствие развода, названное вслух:
+# голова читает базу тренажёра, а не эту. Перенос урока отсюда в боевую базу — отдельное
+# движение владельца, а не побочный эффект тапа.
+LIVE_VERDICTS = os.path.join(LIVE_DIR, "verdicts.tsv")   # журнал тапов живого набора
+LIVE_DESK = os.path.join(LIVE_DIR, "desk.json")          # стол живого набора
+LIVE_LESSONS = os.path.join(LIVE_DIR, "lessons.tsv")     # база уроков живого набора
+
+# ИМЯ НАБОРА едет в каждую строку журнала (графа «набор») и в шапку карточки живого набора:
+# происхождение записи видно по самой записи, а не по тому, из какого файла её прочли.
+SET_TRAINER, SET_LIVE = "тренажёр", "живой"
+SET_NAME = SET_TRAINER
+# ГОЛОВА callback_data. У живого набора своя, и это вторая половина развода: номер кейса в хвосте у
+# наборов общий (кейс 13 есть в обоих), значит набор обязан ехать в самой кнопке — иначе агент не
+# знает, в чью дверь нести тап. Разбор головы в агенте — своё имя (`AGENT_CB_NAME`).
+CB_HEAD, AGENT_CB_NAME = "exam", "EXAM_CB_RE"
+LIVE_CB_HEAD, LIVE_AGENT_CB_NAME = "examlive", "EXAM_LIVE_CB_RE"
+
 # ПУТЬ БАЗЫ УРОКОВ ОТДЕЛЬНЫМ ИМЕНЕМ — ради набора, а не ради гибкости. `None` значит «боевая
 # таблица, та же, куда пишет кнопка «🎓 Обучить»»: второй базы уроков у полосы нет и не заводится.
 # Набор подменяет это поле на временный файл и тем доказывает, что боевых строк не пишет ни одна
@@ -73,8 +96,10 @@ LESSON_PATH = None
 # Колонка «уроки» добавлена ПОСЛЕДНЕЙ (12.09.2026): у вердикта «неверно» теперь есть номера
 # уроков, которые этот вердикт породил. В конец — чтобы строки, написанные до сегодня, читались
 # прежним разбором без единой правки (`load_verdicts` добивает недостающие поля пустотой).
+# Графа «набор» — тоже в конец и по той же причине (18.09.2026): строки без неё читаются, а пустая
+# графа у них значит «записано до развода», то есть журналом тренажёра.
 HEADER = ("номер\tсостояние\tвремя\tавтор\tкейс\tиз\tвердикт\tкоммит\tкорпус\tправила\t"
-          "черновик\tуроки")
+          "черновик\tуроки\tнабор")
 STATE_CANDIDATE = "кандидат"
 
 # Вердикт — ЗАКРЫТАЯ таблица из двух слов. Из Telegram в журнал не уезжает ничего, кроме ключа,
@@ -182,6 +207,24 @@ def rules_version(path=None):
     try:
         import lesson_store
         return rules_text(lesson_store.version(LESSON_PATH if path is None else path))
+    except Exception:                                                      # noqa: BLE001
+        return ""
+
+
+# База, которую читает ГОЛОВА. У тренажёра это та же база, куда пишет урок (`LESSON_PATH`), а у
+# живого набора — нет: его уроки лежат отдельно и голове не видны. Поэтому версия правил СНИМКА
+# (то, по чему бот отвечал) берётся отсюда, а не из базы уроков набора. `use_live_set` кладёт сюда
+# прежний `LESSON_PATH`; `None` значит боевую базу по умолчанию.
+HEAD_LESSON_PATH = None
+
+
+def head_rules_version():
+    """Версия правил, по которым отвечала ГОЛОВА. → str ('' = не названа)."""
+    if SET_NAME != SET_LIVE:
+        return rules_version()
+    try:
+        import lesson_store
+        return rules_text(lesson_store.version(HEAD_LESSON_PATH))
     except Exception:                                                      # noqa: BLE001
         return ""
 
@@ -730,7 +773,7 @@ def freeze(case_id, cases_path=None, runner=None, now=None, ph=None, critic=None
             "critic": report,
             "examples": examples,
             "corpus": corpus_fingerprint(cases_path), "commit": commit,
-            "rules": rules_version(), "built_at": stamp(now),
+            "rules": head_rules_version(), "built_at": stamp(now),
             # КАРТОЧКИ ВЛАДЕЛЬЦУ, пойманные ловушкой на этом круге, — рядом с ответом, дословно.
             # Пустой список — «ловушка стояла, карточек не было»; поля нет — снимок старше ловушки.
             OWNER_CARDS_KEY: [dict(c) for c in trap.cards],
@@ -840,10 +883,14 @@ def card_text(shot, slots_total=None, passed=None):
                  "их коммиты другие." % int(slots_total))
     score = "" if passed is None else " · пройдено %d" % int(passed)
     ref = reference_block(shot)
+    # Карточка тренажёра — байт в байт прежняя; у живого набора в шапке набор и его версия, чтобы
+    # две карточки кейса с одним номером нельзя было перепутать глазами.
+    which = ("" if SET_NAME != SET_LIVE else
+             " · ЖИВОЙ НАБОР (версия %s)" % (shot.get("corpus") or "?"))
     head = (
-        "🎓 ЭКЗАМЕН · кейс %s из %s%s — %s\n"
+        "🎓 ЭКЗАМЕН%s · кейс %s из %s%s — %s\n"
         "Показан ЗАФИКСИРОВАННЫЙ ответ от %s (коммит %s, корпус %s). Голова сейчас НЕ звалась." % (
-            shot.get("case"), shot.get("total"), score, shot.get("name") or "без имени",
+            which, shot.get("case"), shot.get("total"), score, shot.get("name") or "без имени",
             shot.get("built_at") or "?", shot.get("commit") or "?", shot.get("corpus") or "?"))
     body = (
         "\n\n❓ КЛИЕНТ:\n%s\n\n"
@@ -886,8 +933,9 @@ def buttons_legend(shot):
     if not hints_of(shot):
         return ("Ниже — твой вердикт: «верно» или «неверно». Он ложится в журнал экзамена, "
                 "откат по номеру.")
-    mode = ("урок начинает действовать СРАЗУ" if EXAM_LESSON_MODE == LESSON_MODE_TRAINING
-            else "урок ложится КАНДИДАТОМ и включается отдельным движением")
+    mode = lesson_mode_words(
+        "урок начинает действовать СРАЗУ",
+        "урок ложится КАНДИДАТОМ и включается отдельным движением")
     return ("Кнопки: «✅ Верно» — кейс зачтён и сразу придёт следующий. Номера 1…%d — ТУМБЛЕРЫ "
             "(тап отмечает, повторный снимает), отметь нужные и жми «✔ Применить»: отмеченные "
             "подсказки станут уроками (%s), кейс пойдёт «неверно», следующий придёт сам. "
@@ -895,8 +943,30 @@ def buttons_legend(shot):
             % (len(hints_of(shot)), mode))
 
 
+def lesson_mode_words(training, candidate):
+    """Что станет с уроком — СЛОВАМИ, по набору и режиму. → строка.
+
+    У живого набора ответ один при любом режиме: урок ложится в ЕГО базу, а голова её не читает.
+    Сказать владельцу «действует СРАЗУ» там значило бы пообещать правку бота, которой не будет."""
+    if SET_NAME == SET_LIVE:
+        return ("урок ложится в базу уроков ЖИВОГО набора (%s) и на ответы бота НЕ действует"
+                % repo_rel(LESSON_PATH))
+    return training if EXAM_LESSON_MODE == LESSON_MODE_TRAINING else candidate
+
+
+def repo_rel(path):
+    """Путь от корня репо прямыми косыми; с другого тома — как есть (`relpath` там бросает, см.
+    `shot_ref`)."""
+    try:
+        return os.path.relpath(str(path), REPO).replace("\\", "/")
+    except ValueError:
+        return str(path)
+
+
 def markup(case_id, shot=None):
     """Кнопки карточки. callback_data ловит `pc_agent` тем же токеном, которым она отправлена.
+
+    Голова колбэка — `CB_HEAD` набора: `exam:` у тренажёра, `examlive:` у живого (18.09.2026).
 
     ДВА НАБОРА, и это не ветвление ради ветвления. Снимок БЕЗ подсказок (все, собранные до
     12.09.2026) получает РОВНО ПРЕЖНИЕ две кнопки: тапнуть по нему можно сегодня и завтра, а
@@ -906,18 +976,19 @@ def markup(case_id, shot=None):
     `shot=None` — прежний вызов (две кнопки). Умолчание выбрано в пользу старого поведения
     сознательно: забытый довод даёт карточку, которая работает, а не карточку без вердикта."""
     hints = hints_of(shot or {})
+    cb = CB_HEAD
     if not hints:
         return {"inline_keyboard": [[
-            {"text": "✅ Верно", "callback_data": "exam:ok:%s" % case_id},
-            {"text": "❌ Неверно", "callback_data": "exam:no:%s" % case_id},
+            {"text": "✅ Верно", "callback_data": "%s:ok:%s" % (cb, case_id)},
+            {"text": "❌ Неверно", "callback_data": "%s:no:%s" % (cb, case_id)},
         ]]}
-    numbers = [{"text": str(i), "callback_data": "exam:h%d:%s" % (i, case_id)}
+    numbers = [{"text": str(i), "callback_data": "%s:h%d:%s" % (cb, i, case_id)}
                for i in range(1, len(hints) + 1)]
     return {"inline_keyboard": [
-        [{"text": "✅ Верно", "callback_data": "exam:ok:%s" % case_id}],
+        [{"text": "✅ Верно", "callback_data": "%s:ok:%s" % (cb, case_id)}],
         numbers,
-        [{"text": "✍️ своё", "callback_data": "exam:own:%s" % case_id},
-         {"text": "✔ Применить", "callback_data": "exam:go:%s" % case_id}],
+        [{"text": "✍️ своё", "callback_data": "%s:own:%s" % (cb, case_id)},
+         {"text": "✔ Применить", "callback_data": "%s:go:%s" % (cb, case_id)}],
     ]}
 
 
@@ -975,7 +1046,10 @@ AGENT_SRC = "pc_agent.py"
 BUTTON_CLOSURE = (AGENT_SRC,)
 # Где в исходнике агента лежит разбор `exam:`-колбэков. Вынимается ТЕКСТОМ, а не импортом:
 # `import pc_agent` затащил бы сюда живого бота с его конфигом, а нужна ровно одна строка.
-_AGENT_PARSE_RE = re.compile(r"""EXAM_CB_RE\s*=\s*re\.compile\(\s*r?(['"])(.+?)\1""")
+def _agent_parse_re(name):
+    """Поиск строки разбора с ИМЕНЕМ `name` в исходнике агента. Имя — целым словом: разбор живого
+    набора не должен находиться поиском разбора тренажёра и наоборот."""
+    return re.compile(r"""\b%s\s*=\s*re\.compile\(\s*r?(['"])(.+?)\1""" % re.escape(name))
 
 
 def card_callbacks(case_id, shot=None):
@@ -987,11 +1061,14 @@ def card_callbacks(case_id, shot=None):
     return [b["callback_data"] for row in rows for b in row]
 
 
-def agent_parse(src_path=None, read_fn=None):
+def agent_parse(src_path=None, read_fn=None, name=None):
     """Разбор `exam:` ЖИВОГО агента, вынутый из его исходника → (скомпилированное|None, словами).
 
     None — «сверять не с чем», и это НЕИЗВЕСТНО, а не разрешение: исчезнувший `EXAM_CB_RE`
-    значит «разбор переехал», а переехавший разбор мы не знаем."""
+    значит «разбор переехал», а переехавший разбор мы не знаем.
+
+    `name` — имя разбора; по умолчанию разбор ТЕКУЩЕГО набора (`AGENT_CB_NAME`)."""
+    name = name or AGENT_CB_NAME
     path = src_path or os.path.join(REPO, AGENT_SRC)
     try:
         if read_fn is not None:
@@ -1002,10 +1079,10 @@ def agent_parse(src_path=None, read_fn=None):
     except OSError as e:
         return None, "исходник агента (%s) не прочитан (%s) — чем он разбирает тап, не видно" % (
             os.path.basename(path), type(e).__name__)
-    m = _AGENT_PARSE_RE.search(text)
+    m = _agent_parse_re(name).search(text)
     if m is None:
-        return None, ("в «%s» нет `EXAM_CB_RE` — разбор кнопки переехал, и сверять карточку "
-                      "не с чем" % os.path.basename(path))
+        return None, ("в «%s» нет `%s` — разбор кнопки переехал, и сверять карточку "
+                      "не с чем" % (os.path.basename(path), name))
     try:
         return re.compile(m.group(2)), m.group(2)
     except re.error as e:
@@ -1329,9 +1406,11 @@ def _judged_why(case_id, path=None):
         return None
     first = live[0]
     return ("↩️ кейс %s уже судим: вердикт №%s «%s» от %s. Второй записи не делаем — "
-            "одна запись на кейс. Пересудить: «exam_show.py --rollback %s --who <имя>», после "
+            "одна запись на кейс. Пересудить: «exam_show.py%s --rollback %s --who <имя>», после "
             "этого кейс снова свободен." % (case_id, first["номер"], first["вердикт"],
-                                             first["время"], first["номер"]))
+                                             first["время"],
+                                             " --live" if SET_NAME == SET_LIVE else "",
+                                             first["номер"]))
 
 
 # Хвост отказа у дверей, которые пишут уроки. Слова заведены ради того, что до 17.09.2026 было
@@ -1357,20 +1436,24 @@ def _write_verdict(case_id, shot, word, who, lessons=(), path=None, now=None):
         _esc(_evidence(rules_text(shot.get("rules")), "версия правил")),
         _esc(shot_ref(case_id)),
         _esc(", ".join(str(n) for n in lessons)),
+        _esc(SET_NAME),
     ])
     need_header = not os.path.exists(target) or os.path.getsize(target) == 0
     with open(target, "a", encoding="utf-8", newline="\n") as f:
         if need_header:
             f.write(HEADER + "\n")
         f.write(row + "\n")
-    return number, ("📝 Записано КАНДИДАТОМ №%d: кейс %s из %s — «%s», автор %s, время %s.\n"
+    live = " --live" if SET_NAME == SET_LIVE else ""
+    return number, ("📝 Записано КАНДИДАТОМ №%d в журнал набора «%s» (%s): кейс %s из %s — «%s», "
+                    "автор %s, время %s.\n"
                     "Коммит %s · корпус %s · правила %s.%s\n"
-                    "Откат: «exam_show.py --rollback %d --who <имя>»." % (
-                        number, shot.get("case"), shot.get("total"), word, who or "?", stamp(now),
+                    "Откат: «exam_show.py%s --rollback %d --who <имя>»." % (
+                        number, SET_NAME, repo_rel(target), shot.get("case"), shot.get("total"),
+                        word, who or "?", stamp(now),
                         shot.get("commit") or "?", shot.get("corpus") or "?",
                         rules_text(shot.get("rules")) or "?",
                         ("\nУроки этого вердикта: " + ", ".join("#%s" % n for n in lessons))
-                        if lessons else "", number))
+                        if lessons else "", live, number))
 
 
 def tap(case_id, verdict, who, path=None, right_fn=None, now=None, cases_path=None,
@@ -1439,7 +1522,8 @@ def advance(case_id, path=None, sender=None, agent_fn=None, cases_path=None):
             "➡️ Следующий кейс %s НЕ ушёл: %s" % (nxt, said))
     except Exception as e:                                                  # noqa: BLE001
         return ("➡️ Следующий кейс не ушёл (%s) — вердикт при этом ЗАПИСАН. "
-                "Показать руками: «exam_show.py --case <N> --show»." % type(e).__name__)
+                "Показать руками: «exam_show.py%s --case <N> --show»." % (
+                    type(e).__name__, " --live" if SET_NAME == SET_LIVE else ""))
 
 
 # ---------------------------------------------------------------------------------------
@@ -1568,8 +1652,7 @@ def apply_marked(case_id, who, right_fn=None, path=None, now=None, session_path=
         return False, said + "\nУроки при этом записаны: %s." % ", ".join(
             "#%s" % n for n in numbers)
     save_session(dict(desk, selected=[]), session_path)
-    mode = ("действуют СРАЗУ" if EXAM_LESSON_MODE == LESSON_MODE_TRAINING
-            else "легли КАНДИДАТАМИ и пока не действуют")
+    mode = lesson_mode_words("действуют СРАЗУ", "легли КАНДИДАТАМИ и пока не действуют")
     tail = ("\n⚠️ Не записаны подсказки: %s." % "; ".join(failed)) if failed else ""
     return True, ("🎓 Уроков записано %d (%s), автор %s, источник «экзамен», причина — наблюдение "
                   "критика.%s\n%s\n%s" % (
@@ -1665,10 +1748,21 @@ def own_take(text, who, right_fn=None, path=None, now=None, session_path=None, c
     desk.pop("own_until", None)
     desk.pop("own_who", None)
     save_session(desk, session_path)
-    how = ("✅ Записан КАНДИДАТ урока #%s (автор %s, источник «экзамен»): %s\n"
-           "📌 Причина не названа — бот по нему пока НЕ отвечает. Включить одной строкой:\n"
-           "venv/Scripts/python.exe lesson_promote.py --who %s --promote %s --why \"<почему так "
-           "правильно>\"" % (n, who or "?", rule, name or "<имя>", n))
+    if SET_NAME == SET_LIVE:
+        # Номер урока здесь — номер В БАЗЕ ЖИВОГО НАБОРА. Строка перевода без `--path` перевела бы
+        # урок тренажёра с тем же номером: ровно тот класс, от которого развод и заведён.
+        how = ("✅ Записан КАНДИДАТ урока #%s в базу уроков ЖИВОГО набора (%s; автор %s, источник "
+               "«экзамен»): %s\n"
+               "📌 На ответы бота он НЕ действует — база живого набора голове не видна. Перевести "
+               "в действующие ВНУТРИ этой базы:\n"
+               "venv/Scripts/python.exe lesson_promote.py --path %s --who %s --promote %s --why "
+               "\"<почему так правильно>\"" % (n, repo_rel(LESSON_PATH), who or "?", rule,
+                                               repo_rel(LESSON_PATH), name or "<имя>", n))
+    else:
+        how = ("✅ Записан КАНДИДАТ урока #%s (автор %s, источник «экзамен»): %s\n"
+               "📌 Причина не названа — бот по нему пока НЕ отвечает. Включить одной строкой:\n"
+               "venv/Scripts/python.exe lesson_promote.py --who %s --promote %s --why \"<почему так "
+               "правильно>\"" % (n, who or "?", rule, name or "<имя>", n))
     if number is None:
         return False, how + "\n" + said
     return True, how + "\n" + said + "\n" + advance(case_id, path=path, sender=sender,
@@ -1721,13 +1815,17 @@ def rollback(number, who="", path=None, now=None, right_fn=None):
 
 
 def trace(path=None):
-    rows = load_verdicts(path)
+    target = path or VERDICTS
+    rows = load_verdicts(target)
+    where = "набора «%s» (%s)" % (SET_NAME, repo_rel(target))
     if not rows:
-        return "Журнал вердиктов пуст — тапов не было."
-    out = ["Вердиктов в журнале: %d" % len(rows)]
+        return "Журнал вердиктов %s пуст — тапов не было." % where
+    out = ["Вердиктов в журнале %s: %d" % (where, len(rows))]
     for r in rows:
-        out.append("№%d %s · кейс %s из %s — «%s» · %s · %s" % (
-            r["номер"], r["состояние"], r["кейс"], r["из"], r["вердикт"], r["автор"], r["время"]))
+        # Графы «набор» нет у строк, записанных до развода, — они из журнала тренажёра.
+        out.append("№%d %s · набор %s · версия %s · кейс %s из %s — «%s» · %s · %s" % (
+            r["номер"], r["состояние"], r["набор"] or SET_TRAINER, r["корпус"], r["кейс"], r["из"],
+            r["вердикт"], r["автор"], r["время"]))
     return "\n".join(out)
 
 
@@ -1761,27 +1859,49 @@ def build_parser():
     p.add_argument("--reach", action="store_true",
                    help="видна ли группа-тренажёр нашему боту (getChat, ничего не отправляет)")
     p.add_argument("--live", action="store_true",
-                   help="ЖИВОЙ набор (exam_live/): только --freeze, --card, --slots; показа и тапа нет")
+                   help="ЖИВОЙ набор (exam_live/): свой корпус, снимки, журнал, стол и уроки; "
+                        "закрыт только --reach")
     return p
 
 
-# Что живой набор умеет СЕГОДНЯ. Показ и двери тапа ему НЕ подключены, и отказ говорит почему:
-# колбэк `exam:ok:N` агент несёт в дверь ОСНОВНОГО набора, а журнал вердиктов и стол у наборов
-# общие — тап по живому кейсу 1 лёг бы вердиктом кейсу 1 тренажёра.
-LIVE_DOORS = ("freeze", "card", "slots")
-LIVE_REFUSED = ("⛔ живой набор показу и тапу НЕ подключён: колбэк «exam:<слово>:N» агент несёт в "
-                "дверь ОСНОВНОГО набора, а журнал вердиктов и стол у наборов общие — тап по живому "
-                "кейсу лёг бы вердиктом кейсу тренажёра с тем же номером. Доступно: --freeze, "
-                "--card, --slots. Ничего не сделано.")
+# Что живой набор умеет С 18.09.2026 (задание 63-t): всё, что тренажёр, но В СВОИХ файлах —
+# `use_live_set` переключает корпус, снимки, журнал вердиктов, стол и базу уроков разом, а кнопки
+# карточки несут свою голову (`examlive:`), по которой агент зовёт эту дверь с `--live`.
+# ЗАКРЫТ ОДИН ХОД — `--reach`: группа-тренажёр одна на оба набора, и проба её видимости от набора не
+# зависит; под `--live` она ничего нового не сказала бы, а открытый лишний ход — лишний путь в сеть.
+LIVE_DOORS = ("freeze", "card", "slots", "show", "tap", "toggle", "apply", "own", "own_text",
+              "rollback", "trace", "agent")
+LIVE_CLOSED = ("reach",)
+LIVE_REFUSED = ("⛔ ход «--reach» живому набору не нужен: группа-тренажёр одна на оба набора, и её "
+                "видимость проверяется без --live. Ничего не сделано.")
 LIVE_GONE = ("⛔ кейса %s в живом наборе нет — не заводился или откачен (`exam_set.py --census`). "
              "Его снимки, если были, лежат на диске нетронутыми, но набор их не отдаёт. Ничего не сделано.")
 
+# Всё, что переключает набор. Одним перечнем — чтобы набор (и любой, кто переключал модуль в
+# процессе) мог вернуть РОВНО то, что было, а не половину: половина и была прежним дефектом.
+SET_FIELDS = ("CASES", "SHOTS_DIR", "VERDICTS", "SESSION", "LESSON_PATH", "HEAD_LESSON_PATH",
+              "SET_NAME", "CB_HEAD", "AGENT_CB_NAME")
+
+
+def set_state():
+    """Текущие значения `SET_FIELDS` → dict (для возврата через `restore_set`)."""
+    return dict((k, globals()[k]) for k in SET_FIELDS)
+
+
+def restore_set(state):
+    globals().update(dict((k, state[k]) for k in SET_FIELDS if k in state))
+
 
 def use_live_set():
-    """Переключить модуль на живой набор: корпус и каталог снимков. Журнал и стол НЕ переключаются
-    — двери, которые их пишут, живому набору закрыты (`LIVE_REFUSED`)."""
-    global CASES, SHOTS_DIR
+    """Переключить модуль на живой набор: корпус, снимки, журнал вердиктов, стол, база уроков,
+    голова кнопок. Повторный вызов ничего не сдвигает (база головы не затирается базой набора)."""
+    global CASES, SHOTS_DIR, VERDICTS, SESSION, LESSON_PATH, HEAD_LESSON_PATH
+    global SET_NAME, CB_HEAD, AGENT_CB_NAME
+    if SET_NAME != SET_LIVE:
+        HEAD_LESSON_PATH = LESSON_PATH
     CASES, SHOTS_DIR = LIVE_CASES, LIVE_SHOTS
+    VERDICTS, SESSION, LESSON_PATH = LIVE_VERDICTS, LIVE_DESK, LIVE_LESSONS
+    SET_NAME, CB_HEAD, AGENT_CB_NAME = SET_LIVE, LIVE_CB_HEAD, LIVE_AGENT_CB_NAME
 
 
 def main(argv=None):
@@ -1793,9 +1913,7 @@ def main(argv=None):
     io_utf8.force_utf8()
     a = build_parser().parse_args(argv)
     if a.live:
-        others = ("show", "tap", "toggle", "apply", "own", "own_text", "rollback", "trace",
-                  "agent", "reach")
-        if any(getattr(a, k) for k in others) or not any(getattr(a, k) for k in LIVE_DOORS):
+        if any(getattr(a, k) for k in LIVE_CLOSED):
             print(LIVE_REFUSED)
             return 2
         use_live_set()
