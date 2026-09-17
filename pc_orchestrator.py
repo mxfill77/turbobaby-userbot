@@ -504,6 +504,23 @@ def _tail(s, n=500):
     return s[-n:] if s else ""
 
 
+def _tail_shown(s, n=500):
+    """Хвост строки ДЛЯ ПОКАЗА в итоге задачи: рез объявляет себя числом (правило 62-s, 63-c).
+    Короче потолка → байт-в-байт как `_tail`. Решения по этому показу не принимаются."""
+    full = (s or "").strip()
+    if len(full) <= n:
+        return full
+    return "[показан хвост %d из %d симв.] %s" % (n, len(full), full[-n:])
+
+
+def _last_line(s):
+    """Последняя непустая строка текста → str. Место, куда CLI ставит свою фатальную строку."""
+    for line in reversed(str(s or "").splitlines()):
+        if line.strip():
+            return line.strip()
+    return ""
+
+
 def _cap_result(text, tid=None):
     """Отчёт под потолок очереди БЕЗ молчаливой потери: тело на диск ДО реза, в очередь — голова
     с пометкой (числа + адрес тела + замок верификации). Короче потолка → БАЙТ-В-БАЙТ, как было.
@@ -2659,10 +2676,21 @@ def _approved_scope(item):
 #                 21115 ms: Could not connect to server»
 #   Telegram   : «NetworkError: httpx.ConnectError: [Errno 11001] getaddrinfo failed»
 #   мост       : URLError / TimeoutError (37 отказов)
-# Ищем ТОЛЬКО В ХВОСТАХ вывода (последние ~500 символов, те же `_tail`, что идут в диагноз):
-# фатальная строка CLI печатается последней, а совпадение в СЕРЕДИНЕ чужого вывода (задача про
-# сетевой код, лог теста) назвало бы сетью настоящую ошибку — ровно та ложь, только с другого
-# конца. Регистр не важен: живые формы приходят и «ConnectionRefused», и «ECONNREFUSED».
+# Ищем ТОЛЬКО НА ПОСЛЕДНЕЙ НЕПУСТОЙ СТРОКЕ каждого потока (`_last_line`): фатальная строка CLI
+# печатается последней, а совпадение в СЕРЕДИНЕ чужого вывода (задача про сетевой код, лог теста)
+# назвало бы сетью настоящую ошибку — ровно та ложь, только с другого конца. Регистр не важен:
+# живые формы приходят и «ConnectionRefused», и «ECONNREFUSED».
+# ДО 17.09.2026 (задание 63-c) «последнее» мерилось ЧИСЛОМ — 500 символов хвоста, — и число якорем
+# не было: цитата сетевой фразы в тексте модели за 499 знаков до строки CLI покупала вердикт «сеть»
+# (самопочинка не зовётся, карточка «исполнитель ни при чём», ложное свидетельство канала API), а
+# фатальная строка длиннее 500 знаков теряла голову с признаком. Правило то же, что у судьи и
+# различителя чужого отказа (62-p, 62-s): решение судит ПОЛНЫЙ текст, машинный знак читается там,
+# куда его ставит машина; режется только показ (`_tail_shown`), и рез объявляет себя числом.
+# Живой корпус, на котором это проверено: 5 форм смерти CLI из 5 — одна последняя строка stdout
+# (#284, #100, #101, #33/#37, #51); вердикта `network_outage` в трёх логах демона — 0.
+# ЦЕНА, НАЗВАННАЯ ВСЛУХ: многострочная машинная форма, где признак стоит НЕ на последней строке
+# (стек с `code: 'ECONNREFUSED'` в середине, строка-подсказка после ошибки), сетью больше не
+# называется по тексту; её ловит второй свидетель — полоса, измеренная молчащей. Живых таких — 0.
 _RE_NET_TEXT = re.compile(
     r"(?:unable to connect to api"
     r"|could not resolve host"
@@ -2676,11 +2704,12 @@ _RE_NET_TEXT = re.compile(
     r"|proxy connect|socket hang up|fetch failed)", re.I)
 
 
-def _fail_is_network(out_s, err_tail, watch=None, witness=None):
+def _fail_is_network(out_s, err_s, watch=None, witness=None):
     """Провал ребёнка объясняется ВНЕШНИМ ОБРЫВОМ СВЯЗИ? → разбор по существу (str) | '' .
 
     ДВА независимых свидетеля, и каждого ДОСТАТОЧНО:
-      1) ребёнок сказал о связи САМ (его хвост несёт живой сетевой отпечаток) — прямее не бывает:
+      1) ребёнок сказал о связи САМ (ПОСЛЕДНЯЯ строка stdout или stderr несёт живой сетевой
+         отпечаток; судится полный поток, не срез) — прямее не бывает:
          это свидетельство ровно об ЭТОЙ задаче, а не о полосе вообще;
       2) полоса измерена молчащей (`LinkWatch` ≥2 каналов) — тогда неважно, чем именно ребёнок
          оправдывался: он работал внутри окна, в котором связи не было.
@@ -2689,7 +2718,7 @@ def _fail_is_network(out_s, err_tail, watch=None, witness=None):
     w = _link if watch is None else watch
     wit = net_witness if witness is None else witness
     parts = []
-    hit = _RE_NET_TEXT.search(_tail(out_s) + "\n" + _tail(err_tail))
+    hit = _RE_NET_TEXT.search(_last_line(out_s)) or _RE_NET_TEXT.search(_last_line(err_s))
     if hit:
         wit(LINK_CH_API, False, detail="исполнитель: «%s»" % hit.group(0), watch=w)
         parts.append("исполнитель сказал о связи сам: «%s»" % hit.group(0))
@@ -2816,7 +2845,7 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
             log.info("id=%s NEEDS_APPROVAL (карточка ГАРДА, маркер нашего запуска)", tid)
             return "needs_approval", card
         out_s = (out or "").strip()
-        err_tail = _tail(err)
+        err_tail = _tail_shown(err)          # ПОКАЗ stderr; решение о сети судит полный `err`
         if rc != 0:
             # класс «самомодификация → ложный failed» (порт 48d9c64): claude погашен ПЛАНОВЫМ
             # self-update-рестартом демона (4 признака) — это НЕ сбой → done, думателя НЕ зовём.
@@ -2827,7 +2856,7 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
                                 "pc_orchestrator): claude-процесс задачи штатно погашен в окне "
                                 "управляемого self-update-рестарта — работа к этому моменту сделана "
                                 "(RESULT в логе, коммит в git). Это НЕ сбой.")[:RESULT_MAX]
-            net = _fail_is_network(out_s, err_tail)
+            net = _fail_is_network(out_s, err)
             if net:
                 # ИМЯ ПО ИЗМЕРЕННОЙ ПРИЧИНЕ. 04.08 ровно здесь родилось «я сломался»: внешний
                 # обрыв ушёл в очередь как `exec_error`, и штаб дважды строил на нём следующий шаг.
@@ -2843,7 +2872,7 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
         if not out_s:
             # Обрыв связи НЕ ЖЖЁТ вторую попытку: авто-повтор заведён под транзиент пустого
             # stdout, а в молчащей сети он гарантированно повторит тот же провал вторым прогоном.
-            net = _fail_is_network("", err_tail)
+            net = _fail_is_network("", err)
             if net:
                 log.warning("id=%s пустой stdout при ОБРЫВЕ СВЯЗИ (попытка %s/2) — повтор не "
                             "тратим: %s", tid, attempt, net)
@@ -2882,7 +2911,7 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
             log.warning("id=%s insufficient_output (нет «RESULT:») → failed", tid)
             return "failed", fail_result(FAIL_EXEC_ERROR,
                                          "insufficient_output: нет строки «RESULT: <итог>» — "
-                                         "выполнение не подтверждено. stdout(хвост): " + _tail(out_s)
+                                         "выполнение не подтверждено. stdout(хвост): " + _tail_shown(out_s)
                                          + (" | stderr(хвост): " + err_tail if err_tail else ""),
                                          since=_task_started_get(tid),
                                          draft=_draft_block(tid, draft_rel))

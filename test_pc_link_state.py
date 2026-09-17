@@ -342,6 +342,16 @@ class TestTaskFailureIsNamedByMeasuredCause(LinkBase):
         self.assertIn(o.WORK_DONE_MARK, res)
         self.assertIn("a3f75dd", res)
 
+    def test_63c_long_stderr_in_the_result_says_how_much_was_cut(self):
+        """Путь показа (63-c): рез stderr в итоге объявляет себя числом; решение судит полный поток."""
+        status, res, _ = self._run(rc=1, out="", err="предупреждение\n" + "w" * 700)
+        self.assertEqual(o.FAIL_CODE_RE.search(res).group(1), o.FAIL_EXEC_ERROR)
+        self.assertIn("[показан хвост 500 из 715 симв.]", res)
+
+    def test_63c_network_line_after_a_long_stderr_is_still_network(self):
+        status, res, _ = self._run(rc=1, out="", err="w" * 900 + "\n" + LIVE_TG)
+        self.assertEqual(o.FAIL_CODE_RE.search(res).group(1), o.FAIL_NETWORK_OUTAGE)
+
 
 class TestGapIsNamedByMeasuredCause(LinkBase):
     """305 строк «детект пробуждения ПК» за сутки, 303 с собственной пометкой «сна 0с»."""
@@ -492,6 +502,76 @@ class TestStuckSingleNotJudgedWhileLinkWasDown(LinkBase):
         o._link.witness(o.LINK_CH_BRIDGE, True, now=now_ts - age + 10 + 600)
         fb = self._reap(age)
         self.assertEqual([c[1] for c in fb.completed], ["failed"])
+
+
+# ═══════════ 63-c: «сеть или наша ошибка» судит полный поток, знак — на последней строке ═══════════
+# Живые строки смерти CLI (дословно из расписок и перепись 62-p): все — ОДНА ПОСЛЕДНЯЯ строка stdout.
+LIVE_CLI_NOT_NET = ("Failed to authenticate: OAuth session expired and could not be refreshed",  # #51
+                    "You've hit your session limit · resets 10:30pm",                           # #33
+                    "API Error: Server error mid-response. The response above may be incomplete.")  # #100
+LIVE_NET = (LIVE_API_284, LIVE_GIT, LIVE_TG)
+
+
+def _head_verdict_63c(out, err):
+    """Решение HEAD (до 63-c) дословным выражением: хвосты по 500 знаков."""
+    out_s = (out or "").strip()
+    return o._RE_NET_TEXT.search(o._tail(out_s) + "\n" + o._tail(o._tail(err))) is not None
+
+
+class TestNetSignIsReadOnItsLine63c(LinkBase):
+    """Рез в 500 знаков не якорь: цитата покупала «сеть», длинная строка CLI её теряла."""
+
+    def _new(self, out, err):
+        return bool(o._fail_is_network((out or "").strip(), err, watch=o._link,
+                                       witness=lambda *a, **k: None))
+
+    def test_contrafact_a_quote_before_the_cli_line_no_longer_buys_network(self):
+        out = "доклад: 62-p разбирал «%s» у #284.\n%s" % (LIVE_API_284, LIVE_CLI_NOT_NET[0])
+        self.assertTrue(_head_verdict_63c(out, ""), "HEAD называл это сетью")
+        self.assertFalse(self._new(out, ""))
+
+    def test_contrafact_a_long_cli_line_keeps_its_head(self):
+        out = LIVE_API_284 + " " + "x" * 600
+        self.assertFalse(_head_verdict_63c(out, ""), "HEAD срезал голову строки с признаком")
+        self.assertTrue(self._new(out, ""))
+
+    def test_price_named_a_sign_not_on_the_last_line_is_not_read(self):
+        err = "Error: fetch failed\n  code: 'ECONNREFUSED'\n}"
+        self.assertTrue(_head_verdict_63c("", err))
+        self.assertFalse(self._new("", err))
+
+    def test_sweep_lock_a_quote_anywhere_before_the_cli_line_is_ours(self):
+        """Замок: всё, что HEAD называл НАШЕЙ ошибкой, названо нашей и теперь; цитата — никогда не сеть."""
+        n = lost = 0
+        for net in LIVE_NET:
+            for cli in LIVE_CLI_NOT_NET:
+                for pad in range(0, 1500, 11):
+                    out = "доклад «%s» %s\n%s" % (net, "," * pad, cli)
+                    for stream in ("out", "err"):
+                        a, b = (out, "") if stream == "out" else ("", out)
+                        head, new = _head_verdict_63c(a, b), self._new(a, b)
+                        n += 1
+                        lost += (not head) and new
+                        self.assertFalse(new)
+        self.assertEqual((n, lost), (3 * 3 * 137 * 2, 0))
+
+    def test_sweep_live_network_line_is_named_network_as_before(self):
+        """Что HEAD называл сетью на живой форме (строка CLI последней), названо сетью и теперь."""
+        n = 0
+        for net in LIVE_NET:
+            for pad in range(0, 1500, 11):
+                text = "частичный ответ %s\n%s" % ("," * pad, net)
+                for a, b in ((text, ""), ("", text), (text, text)):
+                    self.assertEqual(_head_verdict_63c(a, b), self._new(a, b))
+                    self.assertTrue(self._new(a, b))
+                    n += 1
+        self.assertEqual(3 * 137 * 3, n)
+
+    def test_the_cut_of_the_shown_stderr_names_itself_by_number(self):
+        self.assertEqual(o._tail("  короткий  "), o._tail_shown("  короткий  "))
+        shown = o._tail_shown("я" * 800)
+        self.assertTrue(shown.startswith("[показан хвост 500 из 800 симв.] "))
+        self.assertTrue(shown.endswith("я" * 500))
 
 
 if __name__ == "__main__":

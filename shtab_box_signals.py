@@ -279,6 +279,14 @@ UNKNOWN_PREFIX = ("НЕИЗВЕСТНО (V0): результат по назва
 # есть в класс, который ничего не значит.
 UNPROVEN_PREFIX = ("НЕ ДОКАЗАНО (V0): результат по названному адресу ПРОЧИТАН, "
                    "«сделано» не подтвердилось")    # = done_judge_pc.UNPROVEN_PREFIX
+# ЯКОРЬ МАРКЕРА СУДЬИ — ЗАИМСТВОВАН ТЕМ ЖЕ ПРИЁМОМ, что и литералы выше (17.09.2026, задание 63-c).
+# Разбор маркера на полосе один — `done_judge_pc.outcome_of`, — но импортировать судью чистый слой
+# не может (он тянет V0 и диск; набор соседей пришпилен `test_module_imports_only_pure_neighbours`).
+# Поэтому здесь не второе правило, а зеркало первого: образец равен `done_judge_pc._HEAD_RE`
+# (маркер В НАЧАЛЕ СТРОКИ), зона — до части демона (`FAIL_HEAD` = `done_judge_pc._DAEMON_HEAD`).
+# Равенство образцов И ответов на сплошном корпусе сторожит тест, а не обещание.
+JUDGE_HEAD_RE = re.compile(r"^[ \t]*(%s)" % "|".join(
+    re.escape(p) for p in (UNKNOWN_PREFIX, UNPROVEN_PREFIX)), re.MULTILINE)  # = done_judge_pc._HEAD_RE
 # Человеческие имена кодов — тоже зеркало (`pc_orchestrator.FAIL_REASONS`), и
 # тоже под тестом. Незнакомый код НЕ теряется: он остаётся классом под своим
 # собственным именем, потому что новый код демона — это новая причина, а не
@@ -476,20 +484,37 @@ def reason_class(result):
     повторяющаяся поломка, а не три разных случая.
     """
     text = str(result or "")
-    m = FAIL_CODE_RE.search(text)
+    # КАЖДЫЙ МАШИННЫЙ ЗНАК — НА СВОЁМ МЕСТЕ (17.09.2026, задание 63-c). До этой правки код причины
+    # и оба маркера судьи искались ГДЕ УГОДНО, и код — первым: вердикт судьи над докладом, который
+    # цитирует `[причина=exec_error …]`, считался «ошибкой выполнения», таймаут с цитатой
+    # `(причина=exec_error` в черновике — тоже, а «не доказано» над цитатой «неизвестно» — вторым
+    # исходом. Сигнал Б складывал такие ряды в одну причину. Порядок теперь тот же, что у исхода
+    # слепка (`queue_snapshot_pc.outcome_of`): отказ владельца → судья → код демона.
+    if text.lstrip().startswith(REJECT_MARK):
+        return (CLS_REJECT, "маркер отказа владельца")
+    mark = judge_mark(text)
+    if mark == UNKNOWN_PREFIX:
+        return (CLS_UNKNOWN, "маркер вердикта судьи")
+    if mark == UNPROVEN_PREFIX:
+        return (CLS_UNPROVEN, "маркер вердикта судьи")
+    m = FAIL_CODE_RE.search(daemon_part(text))
     if m:
         code = m.group(1)
         return ("%s (%s)" % (FAIL_NAMES.get(code, "код демона"), code), "код причины")
-    if text.lstrip().startswith(REJECT_MARK):
-        return (CLS_REJECT, "маркер отказа владельца")
-    if UNKNOWN_PREFIX in text:
-        return (CLS_UNKNOWN, "маркер вердикта судьи")
-    if UNPROVEN_PREFIX in text:
-        return (CLS_UNPROVEN, "маркер вердикта судьи")
     canon = canon_reason(text)
     if not canon:
         return (CLS_SILENT, "итог пуст")
     return ("прочее: %s" % canon, "канон причины (сравнение по строке целиком)")
+
+
+def judge_mark(result):
+    """Текст итога → маркер судьи НА ЕГО МЕСТЕ (:data:`UNKNOWN_PREFIX` | :data:`UNPROVEN_PREFIX`)
+    | `None`. Зеркало `done_judge_pc.outcome_of`: строка начинается маркером и стоит до части
+    демона; цитата в докладе или в выводе ребёнка маркером не считается."""
+    text = str(result or "")
+    at = text.find(FAIL_HEAD)
+    got = JUDGE_HEAD_RE.search(text if at < 0 else text[:at])
+    return got.group(1) if got else None
 
 
 def daemon_part(result):

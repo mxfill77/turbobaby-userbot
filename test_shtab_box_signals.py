@@ -2049,5 +2049,93 @@ class TestLedgerAskedByName(unittest.TestCase):
         self.assertIn(cd.JUDGE_SILENT, words)
 
 
+# ═══════════════ 63-c: причина сигнала Б — знаки на своих местах ═══════════════
+
+# Формы набраны по живым сборщикам: шапка закрытия — строки с постоянными метками
+# (`close_msg_pc.prepend`, отделена пустой строкой), маркер судьи — первой строкой своей
+# части (`done_judge_pc.line`), итог провала — `pc_orchestrator.fail_result` (черновик
+# одной строкой ПЕРЕД головой демона, `[причина=` в нём обезврежен в `(причина=`).
+_HEADER_63C = "СПРАШИВАЛИ: разбор класса\nВЫШЛО: вердикт не назван\nДАЛЬШЕ: стоп\n\n"
+_Q_CODE = "[причина=exec_error · ошибка выполнения]: claude exit=1: цитата"
+_Q_SCRUBBED = "(причина=exec_error · ошибка выполнения]: claude exit=1: цитата"
+
+
+def _corpus_63c():
+    """Сплошной корпус: шапка × место маркера × цитаты в докладе × часть демона."""
+    heads = ("", _HEADER_63C, "🔁 самопочинка: причина: повтор\n")
+    judge = ("", dj.UNKNOWN_PREFIX + " — адрес пуст\n", dj.UNPROVEN_PREFIX + " — 2 файла\n",
+             "⏱ " + dj.UNKNOWN_PREFIX + " — цитата не в начале строки\n")
+    reports = ("", "доклад без цитат\nRESULT: ок",
+               "доклад цитирует «%s»\nRESULT: ок" % dj.UNKNOWN_PREFIX,
+               "доклад цитирует\n%s — строка доклада\nRESULT: ок" % dj.UNPROVEN_PREFIX,
+               "доклад цитирует %s\nRESULT: ок" % _Q_CODE)
+    daemon = ("", "⏱ 🧾 ЧЕРНОВИК: %s провал [причина=run_timeout · таймаут прогона]: 2700s. "
+                  "Окно работы неизвестно." % _Q_SCRUBBED,
+              "провал [причина=exec_error · ошибка выполнения]: claude exit=1: вывод\n%s\n"
+              "Следов работы в окне 17.09 01:00–01:05 UTC нет (коммитов 0, записей журнала 0)."
+              % dj.UNKNOWN_PREFIX)
+    for h in heads:
+        for j in judge:
+            for r in reports:
+                for d in daemon:
+                    yield h + j + r + ("\n" + d if d else "")
+
+
+class TestReasonClassReadsMarksInPlace63c(unittest.TestCase):
+    """Вторая копия разбора маркера (`reason_class`) читает знак там, куда его ставит машина."""
+
+    def test_the_anchor_is_a_mirror_of_the_judge_not_a_third_rule(self):
+        self.assertEqual(dj._HEAD_RE.pattern, sig.JUDGE_HEAD_RE.pattern)
+        self.assertEqual(dj._HEAD_RE.flags, sig.JUDGE_HEAD_RE.flags)
+        self.assertEqual(dj._DAEMON_HEAD, sig.FAIL_HEAD)
+
+    def test_sweep_the_mirror_answers_as_the_judge_on_every_form(self):
+        words = {None: None, sig.UNKNOWN_PREFIX: dj.UNKNOWN, sig.UNPROVEN_PREFIX: dj.UNPROVEN}
+        n = 0
+        for text in _corpus_63c():
+            n += 1
+            self.assertEqual(dj.outcome_of(text), words[sig.judge_mark(text)], text)
+        self.assertEqual(180, n)
+
+    def test_contrafact_unproven_over_a_quoted_unknown_stays_unproven(self):
+        text = _HEADER_63C + dj.UNPROVEN_PREFIX + " — 2 файла\nдоклад цитирует «%s»" % dj.UNKNOWN_PREFIX
+        self.assertEqual(sig.CLS_UNPROVEN, sig.reason_class(text)[0])
+
+    def test_contrafact_judge_verdict_over_a_quoted_daemon_code_is_the_judges(self):
+        text = _HEADER_63C + dj.UNKNOWN_PREFIX + " — адрес пуст\nдоклад цитирует " + _Q_CODE
+        self.assertEqual(sig.CLS_UNKNOWN, sig.reason_class(text)[0])
+
+    def test_contrafact_a_scrubbed_quote_in_the_draft_does_not_name_the_code(self):
+        text = ("⏱ 🧾 ЧЕРНОВИК: %s провал [причина=run_timeout · таймаут прогона]: 2700s. "
+                "Окно работы неизвестно." % _Q_SCRUBBED)
+        cls, how = sig.reason_class(text)
+        self.assertIn("run_timeout", cls)
+        self.assertEqual("код причины", how)
+
+    def test_contrafact_signal_b_does_not_glue_three_different_rows_by_quotes(self):
+        rows = [
+            {"id": 1, "day": TODAY, "status": "failed", "result": _HEADER_63C + dj.UNKNOWN_PREFIX
+             + " — адрес пуст\nдоклад цитирует " + _Q_CODE},
+            {"id": 2, "day": TODAY, "status": "failed", "result": "⏱ 🧾 ЧЕРНОВИК: %s провал "
+             "[причина=run_timeout · таймаут прогона]: 2700s. Окно работы неизвестно." % _Q_SCRUBBED},
+            {"id": 3, "day": TODAY, "status": "failed",
+             "result": "закрыто руками: разбор строки «причина=exec_error» не сошёлся"},
+        ]
+        self.assertFalse(sig.signal_b(rows, TODAY)["on"])
+
+    def test_sweep_the_lock_what_was_named_in_place_is_named_the_same(self):
+        """Замок не ослаблен: знак, стоявший на своём месте, опознаётся как прежде."""
+        for head in ("", _HEADER_63C):
+            self.assertEqual(sig.CLS_UNKNOWN,
+                             sig.reason_class(head + dj.UNKNOWN_PREFIX + " — адрес пуст")[0])
+            self.assertEqual(sig.CLS_UNPROVEN,
+                             sig.reason_class(head + dj.UNPROVEN_PREFIX + " — 2 файла")[0])
+            self.assertEqual(sig.CLS_REJECT, sig.reason_class(ctl.REJECT_MARK + ": не надо")[0])
+            for code in sig.FAIL_NAMES:
+                cls, how = sig.reason_class(head + "провал [причина=%s · имя]: подробности" % code)
+                self.assertEqual(("%s (%s)" % (sig.FAIL_NAMES[code], code), "код причины"),
+                                 (cls, how))
+
+
 if __name__ == "__main__":            # pragma: no cover
     unittest.main(verbosity=2)
