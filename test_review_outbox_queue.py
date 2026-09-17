@@ -149,6 +149,11 @@ class TestRetryKind(unittest.TestCase):
 
         self.assertNotEqual(Q.origin("channel_idle")[0], Q.origin("poll_timeout")[0])
 
+    def test_parts_split_is_resend_not_refetch(self):
+        """Обрезок в задаче ревьюера не дописывается: забирать нечего, повтор — отправкой."""
+        self.assertEqual(Q.origin("parts_split")[0], "external")
+        self.assertEqual(Q.retry_kind(*Q.origin("parts_split")[:1])[0], "resend")
+
     def test_answer_lost_was_narrowed_not_widened(self):
         """Старый ярлык остался при своём буквальном смысле и НЕ вырос."""
         self.assertEqual(Q.origin("answer_lost")[0], "spent")

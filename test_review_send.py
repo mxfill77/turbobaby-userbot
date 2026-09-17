@@ -853,5 +853,172 @@ class ManusEmptyAnswerTest(unittest.TestCase):
         self.assertIn("текстовых кусков 0", note)
 
 
+# ───────────────────── досылка частями: все части в ОДНУ задачу ─────────────────────
+
+
+class _TaskChannel(object):
+    """Подставной канал С ПАМЯТЬЮ ЗАДАЧ на границе сокета (`manus_http`).
+
+    Досылка с `taskId` кладёт сообщение в ту же задачу, опрос отдаёт `output`
+    задачи — форма тела та же, что у живого 05.09/17.09. Режимы:
+
+    * ``silent`` — живое поведение с 04.09: `completed`, ассистент молчит, квитанция 0;
+    * ``reply``  — поведение 01.09: «ПРИНЯТО» на каждую часть, разбор на последнюю;
+    * ``split``  — досылка кодом 200, но в НОВУЮ задачу;
+    * ``drop``   — досылка кодом 200 в ту же задачу, а сообщения в ней нет.
+    """
+
+    def __init__(self, mode="silent"):
+        self.mode = mode
+        self.tasks = {}
+        self.posts = 0
+        self.gets = 0
+
+    def _message(self, task, role, text):
+        task["output"].append(
+            {
+                "id": "m%d" % len(task["output"]),
+                "status": "completed",
+                "role": role,
+                "type": "message",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        )
+
+    def _new_task(self):
+        tid = "task%d" % (len(self.tasks) + 1)
+        credit = 4 if self.mode == "reply" else 0
+        self.tasks[tid] = {"id": tid, "status": "completed", "output": [], "credit_usage": credit}
+        return tid
+
+    def __call__(self, url, *, key, data=None, method="GET", timeout=None):
+        out = {"target": url, "request_sent": True, "transport_error": None, "status": 200}
+        if method == "POST":
+            self.posts += 1
+            payload = json.loads(data.decode("utf-8"))
+            tid = payload.get("taskId")
+            if not tid or self.mode == "split":
+                tid = self._new_task()
+            task = self.tasks[tid]
+            if not (self.mode == "drop" and payload.get("taskId")):
+                self._message(task, "user", payload["prompt"])
+                if self.mode == "reply":
+                    last = "— ПОСЛЕДНЯЯ." in payload["prompt"].split("\n", 1)[0]
+                    self._message(task, "assistant", LONG_ANSWER if last else "ПРИНЯТО")
+            out["body"] = json.dumps({"task_id": tid, "task_url": "https://manus.im/app/" + tid})
+            return out
+        self.gets += 1
+        out["body"] = json.dumps(self.tasks[url.rsplit("/", 1)[-1]], ensure_ascii=False)
+        return out
+
+    def user_messages(self, tid="task1"):
+        return [m for m in self.tasks[tid]["output"] if m["role"] == "user"]
+
+
+class ManusPartsIntoOneTaskTest(unittest.TestCase):
+    """Все части пакета уходят в ОДНУ задачу, и сколько доехало — говорит канал."""
+
+    # 60 строк по 100 знаков: заведомо длиннее потолка сообщения, частей несколько.
+    PROMPT = "".join("строка %02d " % i + "ж" * 90 + "\n" for i in range(60))
+
+    def setUp(self):
+        self._real_http = review_send_run.manus_http
+        self.addCleanup(setattr, review_send_run, "manus_http", self._real_http)
+
+    def _send(self, mode):
+        channel = _TaskChannel(mode)
+        review_send_run.manus_http = channel
+        clock = _Clock()
+        facts = review_send_run.send_manus(
+            self.PROMPT, key="проба", wait=1800, poll=10, sleep=clock.sleep, clock=clock
+        )
+        verdict, answer = classify_manus(
+            request_sent=facts["request_sent"],
+            transport_error=facts["transport_error"],
+            status=facts["status"],
+            body=facts["body"],
+            idle_error=facts["idle_error"],
+            poll_timeout=facts["poll_timeout"],
+            credit_usage=facts["credit_usage"],
+            split_error=facts["split_error"],
+            **_common()
+        )
+        return channel, facts, verdict, answer
+
+    def test_prompt_really_needs_parts(self):
+        self.assertGreaterEqual(len(review_send_run.manus_parts(self.PROMPT)), 3)
+
+    def test_silent_channel_receives_every_part_in_one_task(self):
+        """Живое поведение с 04.09: немота на части 1 больше НЕ кончает заход.
+
+        До правки тот же вход давал `parts_sent 1` и одну часть в задаче — ровно
+        то, что владелец увидел у ревьюера 17.09.
+        """
+        n = len(review_send_run.manus_parts(self.PROMPT))
+        channel, facts, verdict, answer = self._send("silent")
+
+        self.assertEqual(channel.posts, n, "входов в канал ровно столько, сколько частей")
+        self.assertEqual(len(channel.tasks), 1, "задача у ревьюера одна")
+        self.assertEqual(len(channel.user_messages()), n, "в задаче лежат ВСЕ части")
+        self.assertEqual(facts["parts_sent"], n)
+        self.assertEqual(facts["parts_seen"], list(range(1, n + 1)), "число доехавших называет канал")
+        self.assertEqual(facts["silent_turns"], n - 1)
+        self.assertIsNone(facts["split_error"])
+        # Склейка тел частей в задаче — исходный текст знак в знак.
+        heads = [review_send_run._part_head(k, n) for k in range(1, n + 1)]
+        bodies = [m["content"][0]["text"][len(h):] for m, h in zip(channel.user_messages(), heads)]
+        self.assertEqual("".join(bodies), self.PROMPT)
+        # Ревьюер получил всё и промолчал — это немота, а не ответ и не обрезок.
+        self.assertEqual((verdict["outcome"], verdict["reason"]), ("unknown", "channel_idle"))
+        self.assertEqual(answer, "")
+        # Цена немоты по часам захода: по два подтверждающих опроса на часть.
+        self.assertEqual(facts["waited_sec"], n * 10 * review_send_run.MANUS_EMPTY_CONFIRM_POLLS)
+
+    def test_replying_channel_still_gets_an_answer(self):
+        """Поведение 01.09 («ПРИНЯТО» на каждую часть) не сломано правкой."""
+        n = len(review_send_run.manus_parts(self.PROMPT))
+        channel, facts, verdict, answer = self._send("reply")
+
+        self.assertEqual(channel.posts, n)
+        self.assertEqual(facts["parts_seen"], list(range(1, n + 1)))
+        self.assertEqual(facts["silent_turns"], 0)
+        self.assertEqual((verdict["outcome"], verdict["reason"]), ("answered", "ok"))
+        self.assertEqual(answer.strip(), LONG_ANSWER.strip(), "в ответ не подмешаны «ПРИНЯТО» прежних частей")
+        self.assertEqual(verdict["cost_value"], 4)
+
+    def test_part_in_another_task_is_split_not_answer(self):
+        """Код 200 на досылку, но канал назвал ДРУГУЮ задачу — признак из ответа канала."""
+        channel, facts, verdict, answer = self._send("split")
+
+        self.assertEqual(channel.posts, 2, "дальше второй части слать некуда")
+        self.assertIn("ДРУГУЮ задачу", facts["split_error"])
+        self.assertEqual((verdict["outcome"], verdict["reason"]), ("unknown", "parts_split"))
+        self.assertEqual(answer, "")
+
+    def test_part_accepted_but_absent_is_split(self):
+        """Код 200 и тот же `task_id`, а сообщения в задаче нет — часть не доехала."""
+        channel, facts, verdict, _answer = self._send("drop")
+
+        self.assertEqual(channel.posts, 2)
+        self.assertEqual(len(channel.user_messages()), 1)
+        self.assertIn("не видна в задаче", facts["split_error"])
+        self.assertEqual((verdict["outcome"], verdict["reason"]), ("unknown", "parts_split"))
+
+    def test_quoted_mark_inside_a_part_is_not_a_delivered_part(self):
+        """Метка, ПРОЦИТИРОВАННАЯ внутри текста, частью не считается — только рамка в начале."""
+        body = {
+            "status": "completed",
+            "output": [
+                {"role": "user", "content": [{"type": "output_text", "text": review_send_run._part_head(1, 3) + "цитата: [ЧАСТЬ 2/3] — продолжение"}]},
+                {"role": "assistant", "content": [{"type": "output_text", "text": review_send_run._part_head(3, 3)}]},
+            ],
+        }
+        self.assertEqual(review_send_run.manus_parts_seen(json.dumps(body, ensure_ascii=False), 3), [1])
+
+    def test_live_body_holds_exactly_part_one(self):
+        """Живое тело 05.09 (`completed`, квитанция 0): канал держит часть 1 из 9, и только её."""
+        self.assertEqual(review_send_run.manus_parts_seen(_live_empty_body(), 9), [1])
+
+
 if __name__ == "__main__":
     unittest.main()

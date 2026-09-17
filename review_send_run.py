@@ -591,6 +591,16 @@ def manus_chunks(text, limit):
     return out or [""]
 
 
+def _part_head(index, total):
+    """Рамка части ``index`` из ``total``. → str. Одна на отправку и на опознание."""
+    mark = _PART_MARK % (index, total)
+    if index == 1:
+        return _PART_FIRST % {"n": total, "prev": total - 1, "mark": mark}
+    if index == total:
+        return _PART_LAST % {"n": total, "mark": mark}
+    return _PART_NEXT % {"mark": mark}
+
+
 def manus_parts(prompt, limit=MANUS_CHUNK_CHARS, overhead=MANUS_PART_OVERHEAD):
     """Готовые СООБЩЕНИЯ канала (кусок текста плюс рамка части). → list[str].
 
@@ -602,17 +612,36 @@ def manus_parts(prompt, limit=MANUS_CHUNK_CHARS, overhead=MANUS_PART_OVERHEAD):
         return [prompt]
     bodies = manus_chunks(prompt, max(200, limit - overhead))
     total = len(bodies)
-    out = []
-    for index, body in enumerate(bodies, 1):
-        mark = _PART_MARK % (index, total)
-        if index == 1:
-            head = _PART_FIRST % {"n": total, "prev": total - 1, "mark": mark}
-        elif index == total:
-            head = _PART_LAST % {"n": total, "mark": mark}
-        else:
-            head = _PART_NEXT % {"mark": mark}
-        out.append(head + body)
-    return out
+    return [_part_head(index, total) + body for index, body in enumerate(bodies, 1)]
+
+
+def _holds_head(body, head):
+    """Держит ли задача НАШЕ сообщение с этой рамкой. → bool.
+
+    Признак — из ответа КАНАЛА: сообщение с ролью `user` в `output` ЭТОЙ задачи,
+    которое НАЧИНАЕТСЯ рамкой части. Именно начало, а не вхождение метки: пакет
+    может цитировать метки (разбор этой самой резки их цитирует), и вхождение
+    засчитало бы часть, которой в задаче нет.
+    """
+    want = head.replace("\r\n", "\n")
+    for msg in _manus_messages(body):
+        role = msg.get("role")
+        if not (isinstance(role, str) and role.strip().lower() == "user"):
+            continue
+        if "".join(_msg_text(msg)).replace("\r\n", "\n").lstrip().startswith(want):
+            return True
+    return False
+
+
+def manus_parts_seen(body, total):
+    """Какие части из ``total`` канал держит в задаче. → list[int] по возрастанию.
+
+    Число доехавших частей называет КАНАЛ, а не наш счётчик отправок: код 200 на
+    досылку значит «запрос принят», а не «сообщение легло в ту же задачу».
+    """
+    if not isinstance(total, int) or total < 2:
+        return []
+    return [k for k in range(1, total + 1) if _holds_head(body, _part_head(k, total))]
 
 
 def _wait_settled(facts, *, key, base, task_path, poll, settle_polls, deadline, started, clock, sleep, tag=""):
@@ -708,8 +737,9 @@ def _wait_reply(
     sleep,
     tag="",
     confirm_polls=MANUS_EMPTY_CONFIRM_POLLS,
+    head=None,
 ):
-    """Дождаться ОТВЕТА канала на конкретную часть. → "ready" | "idle" | "timeout" | "http" | "failed".
+    """Дождаться ОТВЕТА канала на конкретную часть. → "ready" | "idle" | "missing" | "timeout" | "http" | "failed".
 
     Между частями ждать «затишья» нельзя и не нужно. Нельзя — потому что
     `status` живой задачи неделями сидит в `running`/`pending` и о готовности
@@ -734,8 +764,16 @@ def _wait_reply(
 
     Пустое НЕ становится ответом ни одной веткой: ``idle`` уезжает наверх
     отдельным фактом (``facts["idle_error"]``) и отдельным ярлыком, а не текстом.
+
+    ``head`` — рамка части, которую мы только что послали. Задана — ни ответ, ни
+    немота не судятся, пока канал не ПОКАЖЕТ эту часть в задаче (:func:`_holds_head`).
+    Без замка досыл в уже закрытую задачу читал бы её ПРЕЖНЕЕ состояние: прежний
+    `completed` за немоту новой части, прежнее «ПРИНЯТО» за ответ на неё. Задача
+    закончена, а части в ней нет и после подтверждения — исход ``missing``
+    (``facts["split_error"]``): часть до ревьюера не доехала.
     """
     facts["empty_polls"] = 0
+    facts["missing_polls"] = 0
     while True:
         facts["waited_sec"] = int(clock() - started)
         if clock() >= deadline:
@@ -781,6 +819,23 @@ def _wait_reply(
                 manus_error_text(got["body"]) or "текста ошибки канал не дал",
             )
             return "failed"
+
+        if head is not None and not _holds_head(got["body"], head):
+            facts["empty_polls"] = 0
+            if state != _MANUS_DONE:
+                facts["missing_polls"] = 0
+                continue
+            facts["missing_polls"] += 1
+            if facts["missing_polls"] >= max(1, int(confirm_polls)):
+                facts["request_sent"] = True
+                facts["split_error"] = (
+                    "часть %s не видна в задаче %s: задача закончена, нашего сообщения в ней нет "
+                    "(подтверждено %d опросами подряд, ждали %d с; %s)"
+                    % (marker, facts.get("task_id"), facts["missing_polls"], facts["waited_sec"], note)
+                )
+                return "missing"
+            continue
+        facts["missing_polls"] = 0
 
         # ОТВЕТ ВПЕРЁД ВСЕГО. Порядок здесь не стилистика: поменяй его местами со
         # следующей веткой — и задача, закончившаяся ВМЕСТЕ с ответом (законный и
@@ -845,9 +900,20 @@ def send_manus(
 
     Поэтому исходящее едет ЧАСТЯМИ по ОДНОЙ задаче (`taskId` доки v1 — «for
     continuing existing tasks (multi-turn)»): часть 1 создаёт задачу, остальные
-    досылаются в неё же, и между частями отправщик ДОЖИДАЕТСЯ ответа канала.
-    Склейка частей подряд равна исходному тексту знак в знак: рамка добавляется
-    поверх куска, а не вместо него.
+    досылаются в неё же, и между частями отправщик ДОЖИДАЕТСЯ, пока канал закроет
+    ход. Склейка частей подряд равна исходному тексту знак в знак: рамка
+    добавляется поверх куска, а не вместо него.
+
+    ХОД ЗАКРЫТ — ЭТО ОТВЕТ ЛИБО НЕМОТА, НО ТОЛЬКО ПРИ ЧАСТИ, ВИДНОЙ В ЗАДАЧЕ (правка
+    17.09.2026). До неё следующая часть уходила лишь после ТЕКСТА ассистента, а
+    немота на промежуточной части кончала весь заход: канал с 04.09 закрывает
+    задачу за 2–6 с молча (`completed`, `credit_usage: 0`), и оба живых захода
+    17.09 кончились `parts 10 · parts_sent 1` — ревьюер получил первую часть с
+    шапкой «придёт 10 частями», остальных девяти и трёх вопросов из хвоста (части
+    9–10) не видел ни разу. Немота на промежуточной части ответа и не требует: мы сами
+    просим там одно слово. Сколько частей доехало, называет КАНАЛ
+    (:func:`manus_parts_seen` по `output` задачи и `task_id` в ответе на
+    досылку), а не счётчик отправок: не собралось в одной задаче — ``split_error``.
 
     Ни одна ветка НЕ превращает «не дождались» в «готово», и ни одна не выдаёт
     оборванную досылку за целую: не ушедшая часть возвращается наверх фактом
@@ -901,7 +967,11 @@ def send_manus(
     facts["idle_error"] = None  # канал закончил и промолчал
     facts["poll_timeout"] = False  # потолок исчерпан на живой работе
     facts["empty_polls"] = 0
+    facts["missing_polls"] = 0
     facts["credit_usage"] = None  # квитанция канала: None ≠ 0
+    facts["split_error"] = None  # части не собрались у канала в одной задаче
+    facts["parts_seen"] = None  # номера частей, которые канал показал в задаче
+    facts["silent_turns"] = 0  # промежуточных частей, закрытых каналом молча
 
     # Приём не состоялся (обрыв, 4xx, 5xx) — тело ошибки уезжает наверх ДОСЛОВНО
     # и судится там же, где судилось раньше. Опрашивать нечего.
@@ -917,13 +987,13 @@ def send_manus(
     if not facts["task_id"] or wait <= 0:
         return facts
 
-    # Между частями ждём ОТВЕТА на предыдущую часть, а не затишья: у ответа есть
-    # положительный признак (сообщение ассистента после нашей метки), а затишье
-    # здесь и медленнее, и врёт — `status` о готовности не сообщает.
-    for index in range(1, len(parts)):
+    total = len(parts)
+
+    def wait_part(index):
+        # Ход по части закрыт, только когда канал ПОКАЗАЛ её в задаче (`head`).
         outcome = _wait_reply(
             facts,
-            marker=_PART_MARK % (index, len(parts)),
+            marker=_PART_MARK % (index, total),
             key=key,
             base=base,
             task_path=task_path,
@@ -932,9 +1002,37 @@ def send_manus(
             started=started,
             clock=clock,
             sleep=sleep,
-            tag=" на часть %d/%d" % (index, len(parts)),
+            tag=" на часть %d/%d" % (index, total),
+            head=_part_head(index, total),
         )
-        if outcome != "ready":
+        if outcome in ("ready", "idle"):
+            facts["parts_seen"] = manus_parts_seen(facts["body"], total)
+        return outcome
+
+    def split_by_channel(upto):
+        # Части 1..upto обязаны стоять в задаче все: одна потерянная посередине —
+        # и ревьюер склеит обрезок, ни словом об этом не узнав.
+        lost = [k for k in range(1, upto + 1) if k not in (facts["parts_seen"] or [])]
+        if lost:
+            facts["request_sent"] = True
+            facts["split_error"] = "в задаче %s канал показал %d из %d частей (нет: %s)" % (
+                facts.get("task_id"),
+                upto - len(lost),
+                upto,
+                ", ".join(str(k) for k in lost),
+            )
+        return bool(lost)
+
+    for index in range(1, total):
+        outcome = wait_part(index)
+        if outcome == "idle":
+            # Немота на ПРОМЕЖУТОЧНОЙ части — не конец захода: часть в задаче, ход
+            # закрыт, а ответа на неё мы и не ждём по существу (просим одно слово).
+            facts["idle_error"] = None
+            facts["empty_polls"] = 0
+            facts["silent_turns"] += 1
+            outcome = "ready"
+        if outcome != "ready" or split_by_channel(index):
             return facts
 
         got = post(parts[index], task_id=facts["task_id"])
@@ -947,9 +1045,36 @@ def send_manus(
             facts["request_sent"] = True
             facts["part_error"] = "часть %d/%d не ушла (код %s)" % (
                 index + 1,
-                len(parts),
+                total,
                 got["status"] if got["status"] is not None else _NA_STATE,
             )
+            return facts
+        # Код 200 — это «запрос принят», а не «легло в ту же задачу». Канал назвал
+        # в ответе другую задачу — часть ушла мимо ревьюера, дальше слать некуда.
+        # Сверяется ровно поле `task_id`: форма ответа на досылку живьём не
+        # записана, и `id` в ней может оказаться идентификатором СООБЩЕНИЯ.
+        got_obj = _json_or_none(got["body"])
+        got_id = got_obj.get("task_id") if isinstance(got_obj, dict) else None
+        if isinstance(got_id, str) and got_id.strip() and got_id.strip() != facts["task_id"]:
+            facts["status"] = got["status"]
+            facts["body"] = got["body"]
+            facts["request_sent"] = True
+            facts["split_error"] = "часть %d/%d канал положил в ДРУГУЮ задачу (%s вместо %s)" % (
+                index + 1,
+                total,
+                got_id.strip(),
+                facts["task_id"],
+            )
+            return facts
+
+    if total > 1:
+        # Последняя часть судится тем же замком: иначе прежний `completed` задачи
+        # был бы принят за готовность ответа на часть, которой канал ещё не видел.
+        outcome = wait_part(total)
+        if outcome in ("ready", "idle") and split_by_channel(total):
+            facts["idle_error"] = None
+            return facts
+        if outcome != "ready":
             return facts
 
     outcome = _wait_settled(
@@ -968,7 +1093,12 @@ def send_manus(
     if outcome != "ready":
         return facts
 
-    marker = _PART_MARK % (len(parts), len(parts)) if len(parts) > 1 else None
+    if total > 1:
+        facts["parts_seen"] = manus_parts_seen(facts["body"], total)
+        if split_by_channel(total):
+            return facts
+
+    marker = _PART_MARK % (total, total) if total > 1 else None
     state, text, note = manus_output_text(facts["body"], after_marker=marker)
     facts["last_state"] = state
     facts["poll_note"] = note
@@ -1096,6 +1226,7 @@ def run_channel(channel, prompt, ctx, args):
         idle_error=facts.get("idle_error"),
         poll_timeout=facts.get("poll_timeout", False),
         credit_usage=facts.get("credit_usage"),
+        split_error=facts.get("split_error"),
         **common
     )
 

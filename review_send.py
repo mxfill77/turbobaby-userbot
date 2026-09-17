@@ -453,6 +453,7 @@ def classify_manus(
     idle_error=None,
     poll_timeout=False,
     credit_usage=None,
+    split_error=None,
 ):
     """Факты HTTP-захода → вердикт. → (dict, str answer). Чистая функция.
 
@@ -503,6 +504,21 @@ def classify_manus(
     #    принята и оплачена, ответ мы просто не увидели).
     if transport_error and not request_sent:
         return make("refused", "channel_unreachable", "адрес недоступен: %s" % transport_error, cost=0), ""
+
+    # ЧАСТИ НЕ СОБРАЛИСЬ У КАНАЛА В ОДНОЙ ЗАДАЧЕ. Стоит ПЕРЕД немотой и перед
+    # ответом: ревьюер видел обрезок, и что бы он ни сказал (или ни промолчал),
+    # сказано это не о пакете. Признак называет канал (его `output` и его
+    # `task_id`), а не счётчик наших отправок. Квитанция — если канал её дал.
+    if split_error:
+        return (
+            make(
+                "unknown",
+                "parts_split",
+                "пакет не собран у канала в одной задаче: %s" % split_error,
+                cost=receipt if receipt is not None else 1,
+            ),
+            "",
+        )
 
     # 2а. КАНАЛ ЗАКОНЧИЛ И ПРОМОЛЧАЛ — свой исход, а не разновидность потери.
     #     Задача в терминальном состоянии, сообщений ассистента ноль. Это НЕ
