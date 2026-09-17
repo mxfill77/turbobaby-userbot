@@ -59,6 +59,7 @@ import sys
 import contour_digest as cd
 import contour_digest_run as cdr
 import expectations_pc as ex     # СЛОВА ПРИБОРОВ И ПЕРЕЧЕНЬ ДЕТЕЙ — оттуда, где ими судят
+import node_age_pc                  # ВОЗРАСТ ПЕРЕД СОДЕРЖИМЫМ: одно правило показа узлов полосы
 import shtab_box_run as sbr         # ДОРОГА К ПАПКЕ МОЗГА: та же, которой ящик берёт задания
 import shtab_box_signals            # РАЗЛИЧИТЕЛЬ ВИДА РЯДА: тот же, что у остановки ящика
 import vitrina_pc as vp
@@ -573,7 +574,7 @@ def axes_of_day(root, since, runner=None):
     return vp.axes_tally(_hashes(total), _hashes(axis), _hashes(biz)), why
 
 
-def read_shtab(node=None, reader=None, lister=None):
+def read_shtab(node=None, reader=None, lister=None, now=None):
     """Слова Штаба → разобранные человеческие части. → dict (:func:`vitrina_pc.parse_shtab`).
 
     ═══ ИСТОЧНИК — ДОКУМЕНТ ПАПКИ, А НЕ УЗЕЛ ПО ИМЕНИ (правка 04.09.2026) ══════
@@ -626,6 +627,12 @@ def read_shtab(node=None, reader=None, lister=None):
     if not got:
         return vp.parse_shtab("", ok=False,
                               why="документ %s не прочитан: %s" % (name, why or "причина не названа"))
+    # ВОЗРАСТ ПЕРЕД СОДЕРЖИМЫМ (17.09.2026, 63-r): решает общий модуль полосы, а не своя ветка.
+    # Отказ (устарело / возраст неизвестен у узла с порогом) едет причиной во все три части — тем же
+    # путём, что «не прочитан»: содержимое при отказе в витрину не попадает ни одним словом.
+    age = node_age_pc.decide(name, text, now)
+    if not age["show"]:
+        return vp.parse_shtab("", ok=False, why=age["head"])
     return vp.parse_shtab(text)
 
 
@@ -671,7 +678,7 @@ def collect(root=HERE, now=None, runner=None, inbox=None, day=None, shtab=None):
         "schema": vp.SCHEMA,
         "now": now,
         "day": the_day,
-        "shtab": shtab if shtab is not None else read_shtab(),
+        "shtab": shtab if shtab is not None else read_shtab(now=now),
         "health": health_nodes(expect, expect_at, watch, watch_at, now),
         "running": running_rows(snapshot, claims, now),
         "idle": idle_facts(snapshot, now),

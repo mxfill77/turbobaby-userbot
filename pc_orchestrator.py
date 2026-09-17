@@ -7475,6 +7475,12 @@ _ORCH_LAZY_UNCOVERED = ("suggest.py", "reviewer.py", "pc_agent.py", "moderation_
                         # молча меняет САМУ ЦЕНУ в клиентском ответе, и увидят это не
                         # тестом, а деньгами.
                         "door_price.py",
+                        # 17.09.2026: ВОЗРАСТ ПЕРЕД СОДЕРЖИМЫМ (63-r) — `import node_age_pc` в
+                        # vitrina_pc_run.py (ленивый куст витрины) и лениво в brain_writer --probe.
+                        # Своих листьев не приносит: только stdlib. ЧЕМ ОПАСНА ЕГО ГРЯЗЬ: файл
+                        # решает, покажет ли витрина слова Штаба или скажет «устарел»; WIP здесь
+                        # тихо либо прячет живое, либо подаёт старое за сейчас.
+                        "node_age_pc.py",
                         # 01.09.2026: ступень A ревью-контура — куст за ленивым `import
                         # review_auto_run` в `_review_auto_note`/`maybe_review_auto`:
                         #   review_auto_run → review_auto → {review_pack → hq_context_pack, review_send}

@@ -868,9 +868,15 @@ def main(argv=None):
             return 0
         if a.probe:
             t = read_text(doc_id=a.doc_id, name=a.name)
+            # ВОЗРАСТ ПЕРЕД СОДЕРЖИМЫМ (17.09.2026, 63-r): первая строка показа — время снятия и
+            # возраст по штампу в тексте; устаревший узел с порогом голову НЕ показывает. Узел
+            # ищется в таблице по канону имени, без моста; по --id имени нет → «вне таблицы».
+            import node_age_pc
+            age = node_age_pc.decide(canon_name(a.name) if a.name else "id:" + a.doc_id, t)
+            _out(age["head"])
             _out("PROBE ok: %d символов, строк %d, U+FFFD %d; голова:"
                  % (len(t), t.count("\n") + 1, t.count(_FFFD)))
-            _out(t[:600])
+            _out(t[:600] if age["show"] else "(голова не показана: %s)" % age["outcome"])
             return 0
         text = " ".join(a.text).strip()
         if not text or text == "-":

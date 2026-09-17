@@ -418,10 +418,18 @@ def shtab_words(parsed, key, today=""):
     if not body:
         return "%s: раздела нет в узле %s" % (NO_SHTAB, SHTAB_NODE)
     words = one_line(body, SHTAB_PART_MAX)
-    old = days_between(got.get("day"), today) if (got.get("day") and today) else None
-    if old is not None and old > SHTAB_STALE_DAYS:
-        return "%s [Штаб обновлял %d сут назад — %s]" % (words, old, got.get("day"))
-    return words
+    # ВОЗРАСТ ПЕРЕД СОДЕРЖИМЫМ (правка 17.09.2026, задание 63-r, правило R1 `node_age_pc`). До неё
+    # возраст ехал ХВОСТОМ и только старше :data:`SHTAB_STALE_DAYS` — слова трёхдневной давности
+    # читались как сегодняшние, а хвост резало окно сообщения первым. Порога отказа у узла Штаба
+    # нет (замер 63-r не снялся: 3 промежутка записи за 14.9 сут) — поэтому только возраст, без
+    # отказа; отказ, когда порог появится, стоит в `vitrina_pc_run.read_shtab`, где есть часы.
+    day = got.get("day")
+    old = days_between(day, today) if (day and today) else None
+    if old is None:
+        return "[возраст слов Штаба неизвестен: %s] %s" % (
+            "штампа дата= в узле нет" if not day else "дата витрины не передана", words)
+    loud = " ⚠️" if old > SHTAB_STALE_DAYS else ""
+    return "[Штаб обновлял %s, %d сут назад%s] %s" % (day, old, loud, words)
 
 
 # ═════════════════════════ ОСИ ═══════════════════════════════════════════════
