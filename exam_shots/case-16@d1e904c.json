@@ -1,0 +1,43 @@
+{
+  "built_at": "2026-09-17T07:12:46Z",
+  "case": 16,
+  "commit": "d1e904c",
+  "corpus": "99e6b78177a1d533",
+  "critic": {
+    "error": "",
+    "limit": 257,
+    "outcome": "hints",
+    "parsed": 4,
+    "raw_len": 901,
+    "raw_path": "tmp/exam_critic/case-16-20260917T071246Z.txt",
+    "raw_sha256": "ef787ff069041173",
+    "waited": 58.7
+  },
+  "draft": "Hello! Thanks for reaching out 🤝\n\nNMAX — YAMAHA NMAX 155 | дней: 5, стоимость: 1685 (скидка за срок 0%, 337 в день), депозит: 3000 бат; свободен на эти даты.\n\nRawai is within our delivery zone — delivery will be arranged there, and if you take the paid delivery, pick-up at the end of the rental is free.\n\nShall we go ahead and book it?\n\nDelivery to Раваи — 590 ฿ (with paid delivery, bike pickup at the end of the rental is free).\n[collected: model ✅ term ✅ dates ✅ geo ✅]",
+  "examples": [],
+  "hints": [
+    {
+      "observation": "Цена в ответе (337 бат/день, итого 1685) не совпадает с прайсом NMAX155 (449 бат/день, депозит 3000)",
+      "rule": "называй клиенту цену только дословно из блока ЦЕНА/прайса, не пересчитывай и не искажай цифры."
+    },
+    {
+      "observation": "Бот написал «свободен на эти даты», подтвердив наличие байка без проверки календаря",
+      "rule": "не подтверждай наличие/свободность конкретного байка на даты без проверки — пиши, что уточнишь и вернёшься."
+    },
+    {
+      "observation": "Бот назвал клиенту цифру «скидка за срок 0%»",
+      "rule": "не называй клиенту процент или ступень скидки за срок вообще — только итоговую цену из блока ЦЕНА."
+    },
+    {
+      "observation": "Ответ на английском сообщении клиента содержит русские метки «дней, стоимость, депозит, бат»",
+      "rule": "отвечай клиенту полностью на его языке, не смешивай термины на русском."
+    }
+  ],
+  "lang": "en",
+  "name": "EN: модель + даты + гео-пин Раваи — зеркало кейса 3",
+  "note": "ЦЕНА из Календаря бронирования ПОСЧИТАНА (посчитана ТОЛЬКО эта модель — цены и депозиты моделей, которых в расчёте нет, НЕ называй и НЕ выдумывай). Каноническую строку цены вставит КОД ДОСЛОВНО на место метки [QUOTE]: выведи метку [QUOTE] ОТДЕЛЬНОЙ строкой там, где в ответе должна звучать цена; сам НИКАКИЕ числа цены/итога/депозита НЕ называй, НЕ пересказывай и НЕ выдумывай (ни из FAQ, ни ориентиров) — цифры уже посчитаны и придут кодом. «Уточню цену и вернусь» НЕ пиши: цена уже есть.\n<<<QUOTE>>>\nNMAX — YAMAHA NMAX 155 | дней: 5, стоимость: 1685 (скидка за срок 0%, 337 в день), депозит: 3000 бат; свободен на эти даты.\n<<<END_QUOTE>>>\n<<<DELIVERY>>>\nDelivery to Раваи — 590 ฿ (with paid delivery, bike pickup at the end of the rental is free).\n<<<END_DELIVERY>>>",
+  "question": "Hello! I would like to rent NMAX 155 from October 6 to October 11.",
+  "question_raw": "Hello! I would like to rent NMAX 155 {when_en}.",
+  "rules": "7d19b1db352e8f76",
+  "total": 17
+}
