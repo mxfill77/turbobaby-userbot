@@ -8350,6 +8350,37 @@ def _autofetch_note(cond, msg, *, quiet_from_fresh=False, path=None, cowork=None
     return True
 
 
+# ── ГДЕ git СТАВИТ СЕТЕВОЙ ЗНАК (17.09.2026, задание 63-d) ─────────────────────────────────────
+# ДО ЭТОЙ ПРАВКИ свидетель канала git судил `_tail(stderr, 160)`. Число 160 родилось в #221 как
+# бюджет СТРОКИ ЖУРНАЛА, а свидетель (05.08) взял уже срезанный показ — якорем число не было:
+#   • живая строка 04.08 длиной 162 знака потеряла под ним голову `fatal:` (в логе так и лежит
+#     «tal: unable to access…») — знак уцелел случайно, потому что curl пишет его в конец строки;
+#   • обрыв посреди передачи («error: RPC failed; curl 56 Recv failure: Connection reset by peer»)
+#     git отодвигает своими строками дальше 160 знаков — и обрыв звался «не знаю»;
+#   • с другого конца рез пускал ЧУЖОЙ текст: строки `remote:` пишет сервер (раз он ответил — связь
+#     была), а имена ссылок, путей и адресов git цитирует в '…'.
+# Правило класса то же, что у 62-s и 63-c: решение судит ПОЛНЫЙ поток, знак читается там, куда
+# его ставит машина, режется только показ (`_tail_shown`), и рез объявляет себя числом. Машины
+# здесь две: git пишет свой отказ строкой с меткой `fatal:`/`error:`, ssh-клиент — строкой `ssh:`.
+# Цитаты '…' внутри этих строк до поиска вырезаются.
+# ЦЕНА, НАЗВАННАЯ ВСЛУХ: git с переведёнными метками («фатальная ошибка:») знака не даст → None,
+# то есть «не измерил», а не ложное «связи нет»; живые отказы fetch полосы — английские (2 из 2).
+_GIT_SIGN_LINE = re.compile(r"^(?:fatal|error|ssh):")
+_GIT_QUOTED = re.compile(r"'[^'\n]*'")
+
+
+def _git_net_sign(err):
+    """Сетевой знак в ПОЛНОМ stderr git → найденная фраза (str) | ''. Читаются только строки,
+    которые git и ssh-клиент начинают своей меткой; чужие имена в '…' до поиска вырезаются."""
+    for line in str(err or "").splitlines():
+        line = line.strip()
+        if _GIT_SIGN_LINE.match(line):
+            hit = _RE_NET_TEXT.search(_GIT_QUOTED.sub("''", line))
+            if hit:
+                return hit.group(0)
+    return ""
+
+
 def git_ff_pull_tick(call_fn=None):
     """Тело авто-фетча (без троттлинга — троттлит maybe_git_ff_pull). git-вызовы инъектируются для тестов.
     → строка-итог для лога/NOTE ('' = нечего делать / тихий пропуск: git недоступен, detached, уже
@@ -8386,13 +8417,15 @@ def git_ff_pull_tick(call_fn=None):
     # 3. fetch origin (сеть; сбой не критичен — повторим на следующем интервале)
     r = call(["fetch", "origin"])
     if not r or r[0] != 0:
-        detail = _tail(r[2], 160) if r else "git недоступен"
+        detail = _tail_shown(r[2], 160) if r else "git недоступен"   # ТОЛЬКО показ: журнал и лог
         # ВТОРОЙ СВИДЕТЕЛЬ СВЯЗИ — БЕСПЛАТНО, из уже случившегося отказа. Живой формат 04.08:
         # «fatal: unable to access '…': Failed to connect to github.com port 443 after 21115 ms:
         # Could not connect to server». Не-сетевой отказ fetch (права, кривой remote) о СВЯЗИ не
-        # свидетельствует ничего → None, состояние не трогаем.
-        net_witness(LINK_CH_GIT, False if _RE_NET_TEXT.search(detail) else None,
-                    detail="git fetch: " + detail)
+        # свидетельствует ничего → None, состояние не трогаем. Судится ПОЛНЫЙ stderr, а не показ
+        # (`_git_net_sign`, 63-d); свидетельство несёт ровно найденный знак, как у канала API.
+        sign = _git_net_sign(r[2]) if r else ""
+        net_witness(LINK_CH_GIT, False if sign else None,
+                    detail=("git fetch: «%s»" % sign) if sign else ("git fetch: " + detail))
         if _autofetch_note("fetch_failed",
                            f"авто-фетч: git fetch origin не удался — {detail} (пропуск, повтор позже)"):
             log.warning("авто-фетч: git fetch origin не удался — %s", detail)

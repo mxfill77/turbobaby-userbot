@@ -574,5 +574,144 @@ class TestNetSignIsReadOnItsLine63c(LinkBase):
         self.assertTrue(shown.endswith("я" * 500))
 
 
+# ═══════════ 63-d: свидетель канала git судит полный stderr, знак — на строке своей метки ═══════════
+# Живые отказы fetch полосы (pc_orchestrator.log*, 2 из 2) полной формой. Первая лежит в логе
+# срезанной до «tal: unable to access…»: 162 знака под резом 160.
+LIVE_GIT_LOG = ("fatal: unable to access 'https://github.com/mxfill77/turbobaby-userbot.git/': Failed "
+                "to connect to github.com port 443 after 21115 ms: Could not connect to server")
+LIVE_GIT_DNS = ("fatal: unable to access 'https://github.com/mxfill77/turbobaby-userbot.git/': Could "
+                "not resolve host: github.com")
+# Формы git и ssh-клиента, которых в логах полосы нет (транспорт https), — по их сообщениям.
+GIT_SSH_TAIL = ("fatal: Could not read from remote repository.\n\nPlease make sure you have the correct "
+                "access rights\nand the repository exists.")
+GIT_RPC_TAIL = ("error: 4270 bytes of body are still expected\nfetch-pack: unexpected disconnect while "
+                "reading sideband packet\nfatal: early EOF\nfatal: fetch-pack: invalid index-pack output")
+GIT_NET_SIGNS = (LIVE_GIT_LOG, LIVE_GIT_DNS, LIVE_GIT,
+                 "ssh: connect to host github.com port 22: Connection refused",
+                 "error: RPC failed; curl 56 Recv failure: Connection reset by peer")
+GIT_NOT_NET = ("fatal: Authentication failed for 'https://github.com/x/y.git/'",
+               "remote: Repository not found.\nfatal: repository 'https://github.com/x/y.git/' not found",
+               "fatal: unable to access 'https://github.com/x/y.git/': The requested URL returned error: 503",
+               "fatal: 'origin' does not appear to be a git repository\n" + GIT_SSH_TAIL,
+               "error: cannot lock ref 'refs/remotes/origin/main': Unable to create "
+               "'D:/turbobaby-bot/.git/refs/remotes/origin/main.lock': File exists.")
+
+
+def _head_verdict_63d(err):
+    """Решение HEAD (до 63-d) дословным выражением: `_RE_NET_TEXT.search(_tail(r[2], 160))`."""
+    return o._RE_NET_TEXT.search(o._tail(err, 160)) is not None
+
+
+def _eol(text, eol):
+    return text.replace("\n", eol)
+
+
+class TestGitWitnessJudgesFullStderr63d(LinkBase):
+    """Рез 160 — бюджет строки журнала (#221), а не якорь: свидетель судил показ."""
+
+    def _tick(self, err):
+        """Живой `git_ff_pull_tick` на провале fetch. → (сеть?, detail свидетеля, строки журнала)."""
+        seen, notes = [], []
+
+        def call(args, timeout=90):
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, o.GIT_PULL_BRANCH, "")
+            if args == ["status", "--porcelain"]:
+                return (0, "", "")
+            if args == ["fetch", "origin"]:
+                return (128, "", err)
+            raise AssertionError("после провала fetch git не зовётся: %s" % (args,))
+
+        with mock.patch.object(o, "_stopped", lambda: False), \
+                mock.patch.object(o, "_autofetch_note", lambda cond, msg, **k: notes.append(msg)), \
+                mock.patch.object(o, "net_witness",
+                                  lambda ch, ok, detail="", **k: seen.append((ch, ok, detail))):
+            self.assertEqual(o.git_ff_pull_tick(call_fn=call), "fetch не удался")
+        self.assertEqual([s[0] for s in seen], [o.LINK_CH_GIT])
+        self.assertIn(seen[0][1], (False, None), "у канала git свидетельство провала троично")
+        return seen[0][1] is False, seen[0][2], notes
+
+    def test_contrafact_i_server_text_no_longer_buys_network(self):
+        """Сервер ответил 503 и написал `remote:` со словами обрыва: связь БЫЛА."""
+        err = ("remote: fetch failed, try again later\n"
+               "fatal: unable to access 'https://github.com/x/y.git/': The requested URL returned error: 503")
+        self.assertTrue(_head_verdict_63d(err), "HEAD называл это сетью")
+        self.assertFalse(self._tick(err)[0])
+
+    def test_contrafact_i_quoted_ref_name_no_longer_buys_network(self):
+        """Имя ссылки — чужой текст в '…'; причина — стухший замок ссылки на диске."""
+        err = ("error: cannot lock ref 'refs/remotes/origin/fix/econnreset-retry': Unable to create "
+               "'D:/turbobaby-bot/.git/refs/remotes/origin/fix/econnreset-retry.lock': File exists.")
+        self.assertTrue(_head_verdict_63d(err), "HEAD называл это сетью")
+        self.assertFalse(self._tick(err)[0])
+
+    def test_contrafact_ii_reset_mid_transfer_is_network_again(self):
+        err = GIT_NET_SIGNS[4] + "\n" + GIT_RPC_TAIL
+        self.assertFalse(_head_verdict_63d(err), "HEAD не видел знак за 160 знаками")
+        net, detail, _ = self._tick(err)
+        self.assertTrue(net)
+        self.assertEqual(detail, "git fetch: «Connection reset»", "свидетельство — ровно найденный знак")
+
+    def test_live_line_162_lost_its_head_under_the_cut_and_the_cut_names_itself(self):
+        self.assertEqual(len(LIVE_GIT_LOG), 162)
+        self.assertTrue(o._tail(LIVE_GIT_LOG, 160).startswith("tal: unable to access"),
+                        "ровно так строка лежит в pc_orchestrator.log")
+        self.assertTrue(_head_verdict_63d(LIVE_GIT_LOG))
+        net, detail, notes = self._tick(LIVE_GIT_LOG)
+        self.assertTrue(net)
+        self.assertEqual(detail, "git fetch: «Failed to connect to github.com port 443»")
+        self.assertEqual(len(notes), 1)
+        self.assertIn("[показан хвост 160 из 162 симв.] tal: unable to access", notes[0])
+        short = self._tick(LIVE_GIT_DNS)[2][0]
+        self.assertIn("не удался — " + LIVE_GIT_DNS + " (пропуск", short, "короче потолка — как прежде")
+
+    def test_sweep_network_named_before_is_named_now(self):
+        """Замок: что HEAD звал сетью на машинной строке — сеть и теперь; потерь 0."""
+        n = head_net = lost = gained = 0
+        for sign in GIT_NET_SIGNS:
+            for tail in ("", GIT_SSH_TAIL, GIT_RPC_TAIL):
+                for pad in range(30):
+                    for eol in ("\n", "\r\n"):
+                        lines = ["remote: Enumerating objects: %d, done." % i for i in range(pad)]
+                        err = _eol("\n".join(lines + [sign] + ([tail] if tail else [])), eol)
+                        head, new = _head_verdict_63d(err), bool(o._git_net_sign(err))
+                        n += 1
+                        head_net += head
+                        lost += head and not new
+                        gained += new and not head
+                        self.assertTrue(new, err)
+        # 330 = хвост RPC (170 знаков после знака) 5×30×2 + DNS-строка под ssh-хвостом с CRLF 30:
+        # на них HEAD знака не видел, а связи не было.
+        self.assertEqual((n, head_net, lost, gained), (5 * 3 * 30 * 2, 570, 0, 330))
+
+    def test_sweep_not_network_stays_not_network(self):
+        n = 0
+        for form in GIT_NOT_NET:
+            for pad in range(30):
+                for eol in ("\n", "\r\n"):
+                    lines = ["remote: Counting objects: %d%%" % i for i in range(pad)]
+                    err = _eol("\n".join(lines + [form]), eol)
+                    self.assertEqual(_head_verdict_63d(err), bool(o._git_net_sign(err)), err)
+                    self.assertFalse(o._git_net_sign(err))
+                    n += 1
+        self.assertEqual(n, 5 * 30 * 2)
+
+    def test_sweep_foreign_text_never_buys_network(self):
+        """Знак обрыва в чужом тексте (`remote:` и имя в '…') перед не-сетевой причиной."""
+        n = head_net = 0
+        for form in GIT_NOT_NET:
+            for sign in GIT_NET_SIGNS:
+                phrase = o._RE_NET_TEXT.search(sign).group(0)
+                for foreign in ("remote: %s" % phrase,
+                                "error: cannot lock ref 'refs/remotes/origin/%s': File exists." % phrase):
+                    for gap in range(0, 30, 3):
+                        lines = [foreign] + ["remote: Compressing objects: %d%%" % i for i in range(gap)]
+                        err = "\n".join(lines + [form])
+                        head_net += _head_verdict_63d(err)
+                        self.assertFalse(o._git_net_sign(err), err)
+                        n += 1
+        self.assertEqual((n, head_net), (5 * 5 * 2 * 10, 33), "33 входа HEAD звал «связи нет»")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
