@@ -808,5 +808,74 @@ class TestBotIdentity(unittest.TestCase):
         self.assertIn("отсюда не видно", why)
 
 
+class TestMessagePresent(unittest.TestCase):
+    """ЧТЕНИЕ НАЗАД своего сообщения (19.09.2026): холостая правка разметки ТОЙ ЖЕ разметкой.
+
+    Живой Bot API не дёргаем. Предмет класса — три исхода и ОДИН отказ до сети, ценой которого
+    иначе была бы карточка владельца БЕЗ КНОПОК."""
+
+    MARKUP = {"inline_keyboard": [[{"text": "✅ Верно", "callback_data": "examlive:ok:14"}]]}
+
+    def setUp(self):
+        self._save = (dn._api, dn.TOKEN)
+        self.calls = []
+        dn.TOKEN = "test-token"
+
+    def tearDown(self):
+        (dn._api, dn.TOKEN) = self._save
+
+    def api(self, ok, body):
+        def _api(method, payload):
+            self.calls.append((method, payload))
+            return ok, body
+        return _api
+
+    def test_not_modified_is_the_proof_that_the_message_lies_there(self):
+        """ГЛАВНЫЙ ИСХОД: Telegram отказал холостой правке — значит сообщение есть и кнопки те же."""
+        dn._api = self.api(False, {"ok": False, "error_code": 400,
+                                   "description": "Bad Request: message is not modified: specified "
+                                                  "new message content and reply markup are exactly "
+                                                  "the same"})
+        seen, why = dn.message_present(-5193185299, 1931, self.MARKUP)
+        self.assertIs(seen, True)
+        self.assertIn("НА МЕСТЕ", why)
+        self.assertEqual([m for m, _ in self.calls], ["editMessageReplyMarkup"])
+        self.assertEqual(self.calls[0][1]["reply_markup"], self.MARKUP, "уехала ЧУЖАЯ разметка")
+        self.assertEqual(self.calls[0][1]["message_id"], 1931)
+
+    def test_a_missing_message_is_a_no_and_a_foreign_error_is_unknown(self):
+        """«не найдено» → НЕТ; всё прочее (чат не найден, замок пробы) → НЕИЗВЕСТНО, не «нет»."""
+        dn._api = self.api(False, {"ok": False, "error_code": 400,
+                                   "description": "Bad Request: message to edit not found"})
+        self.assertIs(dn.message_present(-1, 5, self.MARKUP)[0], False)
+        dn._api = self.api(False, {"ok": False, "error_code": 400,
+                                   "description": "Bad Request: chat not found"})
+        self.assertIsNone(dn.message_present(-1, 5, self.MARKUP)[0])
+        dn._api = self.api(False, {"ok": False, "description": "проба: живая отправка запрещена"})
+        self.assertIsNone(dn.message_present(-1, 5, self.MARKUP)[0])
+
+    def test_an_accepted_edit_also_proves_it(self):
+        dn._api = self.api(True, {"ok": True, "result": {"message_id": 1931}})
+        self.assertIs(dn.message_present(-1, 1931, self.MARKUP)[0], True)
+
+    def test_without_markup_the_door_refuses_before_the_net(self):
+        """ЗАМОК, РАДИ КОТОРОГО КЛАСС: правка без разметки СНЯЛА БЫ кнопки — в сеть не идём вовсе."""
+        dn._api = lambda m, p: self.fail("дверь пошла в сеть без разметки — кнопки бы слетели")
+        seen, why = dn.message_present(-5193185299, 1931)
+        self.assertIsNone(seen)
+        self.assertIn("СНЯЛА БЫ кнопки", why)
+
+    def test_nothing_is_ever_sent_and_a_bad_number_is_unknown(self):
+        """Ни одна ветка не зовёт sendMessage; номер не числом — НЕИЗВЕСТНО, а не «нет»."""
+        seen_methods = []
+        dn._api = lambda m, p: (seen_methods.append(m), (False, {"ok": False}))[1]
+        dn.message_present(-1, 5, self.MARKUP)
+        self.assertEqual(seen_methods, ["editMessageReplyMarkup"])
+        dn._api = lambda m, p: self.fail("в сеть с нечисловым номером ходить незачем")
+        self.assertIsNone(dn.message_present(-1, "не-число", self.MARKUP)[0])
+        dn.TOKEN = ""
+        self.assertIsNone(dn.message_present(-1, 5, self.MARKUP)[0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

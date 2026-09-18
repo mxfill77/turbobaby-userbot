@@ -2186,6 +2186,68 @@ class TestTwoSetsKeepApart(TwoSetsBase):
         self.assertEqual(exam_show.LIVE_CLOSED, ("reach",))
 
 
+# ───────── ПЕРЕПОКАЗ ЖИВОГО НАБОРА И ЧТЕНИЕ НАЗАД (19.09.2026, задание 97) ─────────
+# ЗАЧЕМ ЗДЕСЬ, А НЕ В `TestReshow`. Тот класс мерит перепоказ ОДНОГО набора, и на нём подмена
+# набора невидима: номера кейсов у наборов ОБЩИЕ, снимок находится, кнопки рисуются, карточка
+# уходит — просто это карточка ЧУЖОГО кейса с кнопками чужого журнала. Отличие видно только когда
+# рядом стоя́т оба набора с одним и тем же номером — то есть на этом стенде.
+
+class TestReshowOfTheLiveSet(TwoSetsBase):
+    def test_the_same_number_reshows_a_different_case_in_each_set(self):
+        """ДВУСТОРОННИЙ: кейс 13 есть в обоих, и набор решает, ЧЕЙ текст и ЧЬИ кнопки уедут."""
+        sent = []
+
+        def send(text, dest, markup=None):
+            sent.append({"text": text, "markup": markup})
+            return ("ловушка", True, "0")
+        agent = lambda callbacks=None: (True, "стенд")                      # noqa: E731
+        exam_show.restore_set(self.live)
+        ok, said = exam_reshow.reshow(13, "карточка последняя", sender=send, agent_fn=agent)
+        self.assertTrue(ok, said)
+        self.assertIn("ЖИВОЙ НАБОР", sent[0]["text"])
+        self.assertTrue(all(b["callback_data"].startswith("examlive:")
+                            for row in sent[0]["markup"]["inline_keyboard"] for b in row))
+        exam_show.restore_set(self.trainer)
+        ok, said = exam_reshow.reshow(13, "карточка последняя", sender=send, agent_fn=agent)
+        self.assertTrue(ok, said)
+        self.assertNotIn("ЖИВОЙ НАБОР", sent[1]["text"])
+        self.assertTrue(all(b["callback_data"].startswith("exam:")
+                            for row in sent[1]["markup"]["inline_keyboard"] for b in row))
+
+    def test_the_flag_switches_the_set_and_a_case_outside_it_gets_no_door(self):
+        """`--live` переключает набор ДО всего прочего; кейса нет в наборе — дверь не открывается."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = exam_reshow.main(["--live", "--case", "99", "--note", "отличие"])
+        self.assertEqual(code, 1)
+        self.assertIn("в живом наборе нет", out.getvalue())
+        self.assertEqual((exam_show.SET_NAME, exam_show.CB_HEAD),
+                         (exam_show.SET_LIVE, exam_show.LIVE_CB_HEAD))
+        self.assertEqual(exam_show.VERDICTS, self.paths["live"]["verdicts"])
+
+    def test_reading_back_asks_with_the_markup_of_the_very_snapshot(self):
+        """ЧТЕНИЕ НАЗАД берёт разметку ИЗ СНИМКА: чужая правка сменила бы владельцу кнопки."""
+        exam_show.restore_set(self.live)
+        asked = []
+
+        def ask(chat, mid, markup):
+            asked.append((chat, mid, markup))
+            return True, "сообщение НА МЕСТЕ"
+        seen, why = exam_reshow.seen(13, 1931, ask=ask)
+        self.assertIs(seen, True)
+        self.assertEqual(asked[0][0], exam_show.TRAINER_CHAT)
+        self.assertEqual(asked[0][1], 1931)
+        self.assertEqual(asked[0][2], exam_show.markup(13, exam_show.load_shot(13)))
+
+    def test_reading_back_without_a_snapshot_is_unknown_and_never_asks(self):
+        """Снимка нет — исход НЕИЗВЕСТНО, и в сеть не идём вовсе: строить разметку не из чего."""
+        exam_show.restore_set(self.live)
+        seen, why = exam_reshow.seen(
+            14, 1931, ask=lambda *a, **k: self.fail("пошли читать без снимка"))
+        self.assertIsNone(seen)
+        self.assertIn("снимка кейса 14 нет", why)
+
+
 # ═════ СТРОКА КНОПКИ РЕШАЕТ, В ЧЕЙ ЖУРНАЛ ЛЯЖЕТ ВЕРДИКТ (18.09.2026, задание 67a) ═══════════
 # ЗАЧЕМ ОТДЕЛЬНЫЙ КЛАСС, КОГДА РЯДОМ ДВА ПОХОЖИХ. Прежние наборы мерят ПОЛОВИНЫ пути врозь:
 # `TestAgentRoute` — разбор строки без двери, `TestTwoSetsKeepApart` — дверь без строки. Между

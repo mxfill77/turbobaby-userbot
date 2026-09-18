@@ -24,6 +24,18 @@
 умолчания, и пустое отличие отказывает ДО сети.
 
     venv/Scripts/python.exe exam_reshow.py --case 1 --note "<чем отличается>" [--dry]
+    venv/Scripts/python.exe exam_reshow.py --live --case 14 --note "<чем отличается>"
+    venv/Scripts/python.exe exam_reshow.py --live --case 14 --seen <номер сообщения>
+
+ДВА КЛЮЧА, ЗАВЕДЁННЫЕ 19.09.2026 (задание 97), и оба — следствие живого набора:
+
+* `--live` — набор `exam_live/` (свой корпус, снимки, журнал, стол, уроки и голова кнопок
+  `examlive:`). До него перепоказ умел ТОЛЬКО тренажёр и на живом кейсе 14 показал бы кейс 14
+  ТРЕНАЖЁРА: номера у наборов общие, а корпуса разные — подмена прошла бы молча и с рабочими
+  кнопками чужого журнала.
+* `--seen` — ЧТЕНИЕ НАЗАД показанного: лежит ли карточка с названным номером в чате. Живёт здесь,
+  а не отдельной дверью, потому что разметку для холостой правки надо строить ИЗ ТОГО ЖЕ снимка,
+  каким карточка ушла (`exam_show.markup`), — иначе чтение подменило бы кнопки владельцу.
 """
 import argparse
 import sys
@@ -66,12 +78,42 @@ def reshow(case_id, note, sender=None, chat=None, agent_fn=None):
     return exam_show.show(case_id, chat=chat, sender=wrapped, agent_fn=agent_fn)
 
 
+def seen(case_id, message_id, chat=None, ask=None):
+    """Лежит ли показанная карточка в чате → (исход, строка словами). НИЧЕГО НЕ ОТПРАВЛЯЕТ.
+
+    Разметка строится из ТОГО ЖЕ снимка, которым карточка уехала: правка чужой разметкой сменила бы
+    владельцу кнопки вместо того, чтобы прочитать сообщение. Снимка нет — читать нечем, и это
+    НЕИЗВЕСТНО, а не «сообщения нет»."""
+    shot = exam_show.load_shot(case_id)
+    if shot is None:
+        return None, ("⛔ снимка кейса %s нет — разметку карточки строить не из чего, читать назад "
+                      "нечем. Ничего не сделано" % case_id)
+    if ask is None:
+        import dispatch_notify
+        ask = dispatch_notify.message_present
+    return ask(exam_show.TRAINER_CHAT if chat is None else int(chat), message_id,
+               exam_show.markup(case_id, shot))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="перепоказ сохранённого кейса экзамена")
     ap.add_argument("--case", required=True, type=int)
     ap.add_argument("--note", default="", help="чем этот показ отличается от предыдущего")
     ap.add_argument("--dry", action="store_true", help="напечатать текст и НЕ отправлять")
+    ap.add_argument("--live", action="store_true",
+                    help="ЖИВОЙ набор (exam_live/): свой корпус, снимки, журнал, стол и уроки")
+    ap.add_argument("--seen", help="ЧТЕНИЕ НАЗАД: лежит ли в чате карточка с этим номером "
+                                   "(ничего не отправляет и кнопок не меняет)")
     a = ap.parse_args(argv if argv is not None else sys.argv[1:])
+    if a.live:
+        exam_show.use_live_set()
+        if exam_show.find_case(a.case)[0] is None:
+            print(exam_show.LIVE_GONE % a.case)
+            return 1
+    if a.seen:
+        ok, msg = seen(a.case, a.seen)
+        print("%s — %s" % ({True: "ЛЕЖИТ", False: "НЕТ", None: "НЕИЗВЕСТНО"}[ok], msg))
+        return 0 if ok else 1
     if a.dry:
         seen = []
 
