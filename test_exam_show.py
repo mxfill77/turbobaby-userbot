@@ -2543,5 +2543,289 @@ class TestLiveWordsEndWhereObservationEnds(TwoSetsBase):
                         "слова тренажёра про режим урока пропали вовсе")
 
 
+# ─────────── СВЕЖЕСТЬ СНИМКА: СУДИМ КЕЙС, А НЕ ФАЙЛ КОРПУСА (19.09.2026, задание 99) ──────────
+#
+# Класс, из которого заведено: снимок кейса 1 живого набора собран, когда в наборе был ОДИН кейс;
+# рядом в тот же файл завели кейсы 13…23, отпечаток ФАЙЛА поменялся — и единственный несудимый кейс
+# стал непоказуемым, хотя сам не менялся ни байтом. Отказ при этом произносил про кейс то, чего не
+# мерил. Ниже — двусторонне: тот же кейс проходит, ИЗМЕНЁННЫЙ не проходит, а чего снимок не хранит,
+# то даёт НЕИЗВЕСТНО (третий исход обязателен: молчание снимка согласием не является).
+
+class TestShotFreshnessJudgesTheCaseNotTheFile(Base):
+    CASE = {"id": 1, "name": "первый контакт", "lang": "ru",
+            "lines": ["Здравствуйте! Хочу XMAX 300"],
+            "reference": {"who": "менеджер", "text": "Здравствуйте, свободен", "mark": "д1·р1",
+                          "parts": 1, "gap_sec": 12, "base": "abc123"}}
+
+    def corpus(self, cases):
+        """Свой корпус во временном каталоге: боевого `trainer_cases.json` не касаемся ничем."""
+        path = os.path.join(self.tmp, "cases-%d.json" % len(os.listdir(self.tmp)))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"about": "тест", "version": 1, "cases": cases}, f, ensure_ascii=False)
+        return path
+
+    def shot_of(self, case, corpus_fp="0000000000000000", case_fp=None, **over):
+        """Снимок, собранный ИЗ ЭТОГО кейса — ровно те поля, что кладёт боевой `freeze`."""
+        shot = _shot(case=case["id"], corpus=corpus_fp, hints=HINTS)
+        shot.update({"name": case.get("name") or "", "lang": case.get("lang") or "",
+                     "question_raw": exam_show.question_of(case),
+                     "reference": exam_show.reference_of(case)})
+        if case_fp is not None:
+            shot[exam_show.CASE_FP_KEY] = case_fp
+        shot.update(over)
+        return shot
+
+    def test_the_same_case_in_a_grown_file_is_still_fresh(self):
+        """ГЛАВНОЕ: файл вырос соседними кейсами — снимок жив, потому что СВОЙ кейс тот же."""
+        alone = self.corpus([self.CASE])
+        grown = self.corpus([self.CASE, {"id": 13, "name": "чужой", "lang": "ru",
+                                         "lines": ["другой вопрос"]}])
+        self.assertNotEqual(exam_show.corpus_fingerprint(alone),
+                            exam_show.corpus_fingerprint(grown), "фикстура не воспроизводит класс")
+        shot = self.shot_of(self.CASE, corpus_fp=exam_show.corpus_fingerprint(alone))
+        fresh, why = exam_show.shot_fresh(1, shot, cases_path=grown)
+        self.assertIs(fresh, True, why)
+        self.assertIn("САМ КЕЙС", why)
+
+    def test_a_changed_case_is_refused_even_though_the_file_is_the_same_size(self):
+        """ОТРИЦАТЕЛЬНЫЙ: поменяли первую реплику кейса — снимок не годен ни показу, ни вердикту."""
+        alone = self.corpus([self.CASE])
+        edited = dict(self.CASE, lines=["Здравствуйте! Хочу NMAX 155"])
+        shot = self.shot_of(self.CASE, corpus_fp=exam_show.corpus_fingerprint(alone))
+        fresh, why = exam_show.shot_fresh(1, shot, cases_path=self.corpus([edited]))
+        self.assertIs(fresh, False, why)
+        self.assertIn("ПОМЕНЯЛСЯ", why)
+        self.assertIn("первая реплика", why)
+
+    def test_a_changed_name_or_reference_is_refused_too(self):
+        """Сверяются ЧЕТЫРЕ дословных поля, а не одно: имя и эталон тоже."""
+        base = self.corpus([self.CASE])
+        shot = self.shot_of(self.CASE, corpus_fp=exam_show.corpus_fingerprint(base))
+        for over, mark in ((dict(name="другое имя"), "«name»"),
+                           (dict(lang="en"), "«lang»"),
+                           (dict(reference=dict(self.CASE["reference"], text="иной эталон")),
+                            "эталон")):
+            fresh, why = exam_show.shot_fresh(
+                1, shot, cases_path=self.corpus([dict(self.CASE, **over)]))
+            self.assertIs(fresh, False, why)
+            self.assertIn(mark, why)
+
+    def test_what_the_shot_does_not_keep_gives_unknown_not_permission(self):
+        """ТРЕТИЙ ИСХОД: у кейса непусто головное поле, которого снимок не хранит → НЕИЗВЕСТНО.
+
+        И `show`, и вердикт на нём ОТКАЗЫВАЮТ: «сверить нечем» — не разрешение."""
+        base = self.corpus([self.CASE])
+        shot = self.put_shot(self.shot_of(self.CASE, corpus_fp=exam_show.corpus_fingerprint(base)))
+        for over in (dict(forbid=["слово"]), dict(require_any=["что-то"]),
+                     dict(expect={"цена": 1}), dict(lines=self.CASE["lines"] + ["и ещё вопрос"])):
+            path = self.corpus([dict(self.CASE, **over)])
+            fresh, why = exam_show.shot_fresh(1, shot, cases_path=path)
+            self.assertIsNone(fresh, why)
+            self.assertIn("НЕИЗВЕСТНО", why)
+            send = self.sender()
+            ok, msg = exam_show.show(1, sender=send, agent_fn=self.fresh_agent(), cases_path=path)
+            self.assertFalse(ok, msg)
+            self.assertEqual(send.calls, [], "на НЕИЗВЕСТНО наружу не смеет уйти ничего")
+
+    def test_a_case_gone_from_the_corpus_is_unknown_not_fresh(self):
+        base = self.corpus([self.CASE])
+        shot = self.shot_of(self.CASE, corpus_fp=exam_show.corpus_fingerprint(base))
+        fresh, why = exam_show.shot_fresh(1, shot, cases_path=self.corpus([{"id": 13}]))
+        self.assertIsNone(fresh, why)
+        self.assertIn("больше нет", why)
+
+    def test_the_case_fingerprint_ignores_key_order_and_catches_content(self):
+        """Отпечаток кейса: порядок ключей ему безразличен, содержание — нет."""
+        same = dict(reversed(list(self.CASE.items())))
+        self.assertEqual(exam_show.case_fingerprint(self.CASE), exam_show.case_fingerprint(same))
+        self.assertNotEqual(exam_show.case_fingerprint(self.CASE),
+                            exam_show.case_fingerprint(dict(self.CASE, lang="en")))
+        self.assertEqual(exam_show.case_fingerprint("не dict"), "")
+
+    def test_a_shot_with_a_case_fingerprint_is_judged_by_it(self):
+        """У снимка ЕСТЬ отпечаток кейса → судим по нему, полей не спрашиваем (сильный путь)."""
+        grown = self.corpus([self.CASE, {"id": 13, "name": "чужой", "lang": "ru"}])
+        right = self.shot_of(self.CASE, case_fp=exam_show.case_fingerprint(self.CASE))
+        fresh, why = exam_show.shot_fresh(1, right, cases_path=grown)
+        self.assertIs(fresh, True, why)
+        self.assertIn("отпечаток кейса", why)
+        wrong = self.shot_of(self.CASE, case_fp="ffffffffffffffff")
+        fresh, why = exam_show.shot_fresh(1, wrong, cases_path=grown)
+        self.assertIs(fresh, False, why)
+        self.assertIn("ffffffffffffffff", why)
+
+    def test_the_words_always_name_both_file_fingerprints(self):
+        """Оба числа корпуса — в КАЖДОЙ ветке: по ним отказ сходится с журналом и артефактом."""
+        base = self.corpus([self.CASE])
+        shot = self.shot_of(self.CASE, corpus_fp="0000000000000000")
+        for path in (base, self.corpus([dict(self.CASE, name="иное")])):
+            _, why = exam_show.shot_fresh(1, shot, cases_path=path)
+            self.assertIn("0000000000000000", why)
+            self.assertIn(exam_show.corpus_fingerprint(path), why)
+
+    def test_show_and_the_verdict_answer_the_same_question(self):
+        """Показ и запись вердикта спрашивают ОДНУ функцию: карточка с мёртвой кнопкой не уйдёт."""
+        import inspect
+        for fn in (exam_show.show, exam_show._judgeable):
+            self.assertIn("shot_fresh", inspect.getsource(fn))
+        grown = self.corpus([self.CASE, {"id": 13, "name": "чужой", "lang": "ru"}])
+        self.put_shot(self.shot_of(self.CASE, corpus_fp="0000000000000000"))
+        send = self.sender()
+        ok, msg = exam_show.show(1, sender=send, agent_fn=self.fresh_agent(), cases_path=grown)
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(send.calls), 1)
+        ok, said = exam_show.tap(1, "ok", "@filipp", right_fn=lambda _w=None: True,
+                                 cases_path=grown, sender=self.sender(),
+                                 agent_fn=self.fresh_agent())
+        self.assertTrue(ok, said)
+        rows = exam_show.verdicts_of_case(1, exam_show.load_verdicts())
+        self.assertEqual([r["вердикт"] for r in rows], ["верно"], self.raw())
+
+    def test_freeze_writes_the_case_fingerprint_into_the_new_shot(self):
+        """Новые снимки несут отпечаток КЕЙСА — дальше сильный путь работает без сверки полей."""
+        path = self.corpus([self.CASE])
+        ok, where, shot = exam_show.freeze(1, cases_path=path, ph=PH,
+                                          runner=lambda c: {"draft": "ответ", "note": ""},
+                                          critic=self.critic())
+        self.assertTrue(ok, where)
+        self.assertEqual(shot[exam_show.CASE_FP_KEY], exam_show.case_fingerprint(self.CASE))
+        with open(where, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)[exam_show.CASE_FP_KEY],
+                             exam_show.case_fingerprint(self.CASE))
+
+
+# ───────── ПОКАЗ МИМО ХОДА ЭКЗАМЕНА: СТОЛ НЕ ДВИГАЕМ, ШАПКА НАЗЫВАЕТ ОТЛИЧИЕ ──────────
+#
+# Заведено 19.09.2026 (задание 99): владелец просит показать ОДИН кейс, а номер текущего кейса
+# оставить прежним. Прежний `show` переводил стол ВСЕГДА — то есть «покажи, не двигая стол» было
+# невыполнимо в принципе, а не «неудобно».
+
+class TestShowBesideTheExamRun(Base):
+    def desk_bytes(self):
+        with open(self.desk, "rb") as f:
+            return f.read()
+
+    def test_keep_desk_does_not_touch_the_desk_file_by_a_single_byte(self):
+        exam_show.save_session({"case": "22", "shot_key": "чужой@ключ", "selected": []})
+        was, was_mtime = self.desk_bytes(), os.path.getmtime(self.desk)
+        self.put_shot(_shot(corpus=exam_show.corpus_fingerprint(), hints=HINTS))
+        send = self.sender()
+        ok, msg = exam_show.show(1, sender=send, agent_fn=self.fresh_agent(), keep_desk=True)
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.desk_bytes(), was, "стол переписан при --keep-desk")
+        self.assertEqual(os.path.getmtime(self.desk), was_mtime, "стол тронут по времени")
+        self.assertIn("Стол НЕ двигали", msg)
+        self.assertIn("22", msg)
+
+    def test_the_default_show_still_moves_the_desk(self):
+        """ОТРИЦАТЕЛЬНЫЙ: без ключа поведение прежнее — стол переводится на показанный кейс."""
+        exam_show.save_session({"case": "22", "shot_key": "чужой@ключ", "selected": []})
+        shot = self.put_shot(_shot(corpus=exam_show.corpus_fingerprint(), hints=HINTS))
+        ok, msg = exam_show.show(1, sender=self.sender(), agent_fn=self.fresh_agent())
+        self.assertTrue(ok, msg)
+        desk = exam_show.load_session()
+        self.assertEqual(desk["case"], "1")
+        self.assertEqual(desk["shot_key"], exam_show.shot_key(shot))
+        self.assertNotIn("Стол НЕ двигали", msg)
+
+    def test_a_kept_desk_with_marks_is_named_as_a_cost_not_hidden(self):
+        """Оставленный стол С ОТМЕТКАМИ — цена, названная словами: номера карточки откажут."""
+        exam_show.save_session({"case": "22", "shot_key": "чужой@ключ", "selected": [1, 2]})
+        self.put_shot(_shot(corpus=exam_show.corpus_fingerprint(), hints=HINTS))
+        ok, msg = exam_show.show(1, sender=self.sender(), agent_fn=self.fresh_agent(),
+                                 keep_desk=True)
+        self.assertTrue(ok, msg)
+        self.assertIn("откажут", msg)
+
+    def test_the_note_goes_before_the_card_and_changes_no_button(self):
+        shot = self.put_shot(_shot(corpus=exam_show.corpus_fingerprint(), hints=HINTS))
+        send = self.sender()
+        ok, msg = exam_show.show(1, sender=send, agent_fn=self.fresh_agent(),
+                                 note="  🆕 ПЕРВЫЙ ПОКАЗ  ")
+        self.assertTrue(ok, msg)
+        text = send.calls[0]["text"]
+        self.assertTrue(text.startswith("🆕 ПЕРВЫЙ ПОКАЗ"), text[:40])
+        self.assertIn(exam_show.card_text(shot, 1, passed=0), text)
+        self.assertEqual(send.calls[0]["markup"], exam_show.markup(1, shot),
+                         "шапка не смеет менять ни одной кнопки")
+
+    def test_the_note_is_a_property_of_the_send_and_not_of_the_shot(self):
+        """Шапка в снимок не ложится: следующий показ её не наследует."""
+        shot = self.put_shot(_shot(corpus=exam_show.corpus_fingerprint(), hints=HINTS))
+        exam_show.show(1, sender=self.sender(), agent_fn=self.fresh_agent(), note="шапка разовая")
+        with open(exam_show.shot_path(1), encoding="utf-8") as f:
+            self.assertNotIn("шапка разовая", f.read())
+        send = self.sender()
+        exam_show.show(1, sender=send, agent_fn=self.fresh_agent())
+        self.assertEqual(send.calls[0]["text"], exam_show.card_text(shot, 1, passed=0))
+
+    def test_the_cli_carries_both_keys_all_the_way_to_the_door(self):
+        """CLI-ПУТЬ, а не функция: ключ, не доехавший до двери, — свой класс (замер 19.09 у `--seen`)."""
+        seen = {}
+
+        def stub(case_id, **kw):
+            seen.update(dict(kw, case=case_id))
+            return True, "ok (подстава)"
+        was, exam_show.show = exam_show.show, stub
+        try:
+            rc = exam_show.main(["--case", "1", "--show", "--keep-desk", "--note", "шапка CLI"])
+        finally:
+            exam_show.show = was
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen.get("case"), "1")
+        self.assertIs(seen.get("keep_desk"), True)
+        self.assertEqual(seen.get("note"), "шапка CLI")
+
+
+# ── ЧУЖОЙ ПУСТОЙ СТОЛ НЕ ОТКАЗЫВАЕТ ТУМБЛЕРУ: ОХРАНЯЮТСЯ ОТМЕТКИ, А НЕ ФАКТ ЧУЖОГО КЕЙСА ──
+
+class TestAnEmptyAlienDeskYieldsToTheFirstTap(Base):
+    def setUp(self):
+        super().setUp()
+        self.shot = self.put_shot(_shot(corpus=exam_show.corpus_fingerprint(), hints=HINTS))
+        self.right = lambda _w=None: True
+
+    def test_the_first_number_tap_takes_over_an_empty_alien_desk(self):
+        exam_show.save_session({"case": "22", "shot_key": "чужой@ключ", "selected": []})
+        ok, said = exam_show.toggle(1, 1, "@filipp", right_fn=self.right)
+        self.assertTrue(ok, said)
+        desk = exam_show.load_session()
+        self.assertEqual(desk["case"], "1")
+        self.assertEqual(desk["shot_key"], exam_show.shot_key(self.shot))
+        self.assertEqual(desk["selected"], [1])
+
+    def test_an_alien_desk_with_marks_still_refuses_word_for_word(self):
+        """ОТРИЦАТЕЛЬНЫЙ: отметки чужого снимка охраняются ровно как прежде."""
+        exam_show.save_session({"case": "22", "shot_key": "чужой@ключ", "selected": [2]})
+        ok, said = exam_show.toggle(1, 1, "@filipp", right_fn=self.right)
+        self.assertFalse(ok, said)
+        self.assertIn("собраны на другом снимке", said)
+        self.assertEqual(exam_show.load_session()["case"], "22", "чужой стол тронут отказом")
+
+    def test_the_takeover_drops_the_waiting_of_the_other_case(self):
+        """Ожидание «✍️ своё» ЧУЖОГО кейса не переезжает: иначе следующая реплика владельца легла
+        бы уроком не тому кейсу."""
+        import time
+        exam_show.save_session({"case": "22", "shot_key": "чужой@ключ", "selected": [],
+                                "own_until": int(time.time()) + 600, "own_who": "filipp"})
+        ok, said = exam_show.toggle(1, 1, "@filipp", right_fn=self.right)
+        self.assertTrue(ok, said)
+        desk = exam_show.load_session()
+        self.assertNotIn("own_until", desk)
+        self.assertNotIn("own_who", desk)
+        self.assertEqual(exam_show.pending_own(), (None, None))
+
+    def test_apply_works_right_after_the_takeover(self):
+        """Сквозной путь: чужой пустой стол → тумблер → «✔ Применить» пишет урок и вердикт."""
+        exam_show.save_session({"case": "22", "shot_key": "чужой@ключ", "selected": []})
+        ok, said = exam_show.toggle(1, 1, "@filipp", right_fn=self.right)
+        self.assertTrue(ok, said)
+        ok, said = exam_show.apply_marked(1, "@filipp", right_fn=self.right,
+                                          sender=self.sender(), agent_fn=self.fresh_agent())
+        self.assertTrue(ok, said)
+        self.assertEqual(len(self.lesson_rows()), 1)
+        self.assertIn("неверно", self.raw())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
