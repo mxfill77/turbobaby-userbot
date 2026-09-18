@@ -5,10 +5,14 @@
 на временные, сеть не зовётся ни разу (отправитель всегда подставной), голова не зовётся вовсе.
 """
 
+import asyncio
+import contextlib
+import io
 import json
 import os
 import shutil
 import tempfile
+import types
 import unittest
 
 import exam_reshow
@@ -1999,7 +2003,11 @@ class TestTheReferenceStandsApart(Base):
 # другому ни байтом. ВСЕ пути обоих наборов — во временном месте, включая `LIVE_*`: `use_live_set`
 # переключает модуль на них, и без подмены набор писал бы в боевой `exam_live/`.
 
-class TestTwoSetsKeepApart(unittest.TestCase):
+class TwoSetsBase(unittest.TestCase):
+    """Обстановка ДВУХ наборов разом: у каждого свой корпус, снимки, журнал, стол и база уроков,
+    и все они временные. Кейс 13 есть в ОБОИХ — без общего номера двусторонний отрицательный
+    доказывал бы не развод хранилищ, а разные номера кейсов."""
+
     LIVE_NAMES = ("LIVE_CASES", "LIVE_SHOTS", "LIVE_VERDICTS", "LIVE_DESK", "LIVE_LESSONS")
 
     def setUp(self):
@@ -2065,6 +2073,8 @@ class TestTwoSetsKeepApart(unittest.TestCase):
         return {"right_fn": lambda _w=None: True, "sender": send,
                 "agent_fn": lambda callbacks=None: (True, "стенд")}
 
+
+class TestTwoSetsKeepApart(TwoSetsBase):
     def test_use_live_set_moves_every_storage_and_keeps_the_head_base(self):
         self.assertEqual(exam_show.VERDICTS, self.paths["trainer"]["verdicts"])
         exam_show.use_live_set()
@@ -2174,6 +2184,200 @@ class TestTwoSetsKeepApart(unittest.TestCase):
         self.assertEqual(exam_show.main(["--live", "--reach"]), 2)
         self.assertEqual(exam_show.set_state(), was)
         self.assertEqual(exam_show.LIVE_CLOSED, ("reach",))
+
+
+# ═════ СТРОКА КНОПКИ РЕШАЕТ, В ЧЕЙ ЖУРНАЛ ЛЯЖЕТ ВЕРДИКТ (18.09.2026, задание 67a) ═══════════
+# ЗАЧЕМ ОТДЕЛЬНЫЙ КЛАСС, КОГДА РЯДОМ ДВА ПОХОЖИХ. Прежние наборы мерят ПОЛОВИНЫ пути врозь:
+# `TestAgentRoute` — разбор строки без двери, `TestTwoSetsKeepApart` — дверь без строки. Между
+# ними живёт шов `_exam_cli`, и ставит `--live` перед аргументами ровно он. Убери там одну строку
+# — разбор по-прежнему скажет «exam_live», дверь по-прежнему разведёт хранилища, оба набора
+# останутся зелёными, а вердикт живого набора ляжет в журнал тренажёра. Здесь путь пройден
+# ЦЕЛИКОМ: строка `callback_data` → живой обработчик кнопки → выбор исполнителя → argv двери →
+# байты файла на диске.
+#
+# ПОЧЕМУ У КАЖДОГО ЗЕЛЁНОГО НАЖАТИЯ ЕСТЬ БЛИЗНЕЦ С ПОДМЕНЁННОЙ ГОЛОВОЙ. Зелёный прогон
+# доказывает, что живая строка доехала домой, но НЕ доказывает, что доехала она ИМЕННО из-за
+# головы `examlive:`: тот же зелёный получился бы, если бы журнал был один на оба набора. Мутант
+# строки отделяет одно от другого — подменили голову, и вердикт обязан уйти к соседу, не оставив
+# в журнале живого набора ни байта.
+#
+# ДВЕРЬ ЗОВЁТСЯ В ЭТОМ ЖЕ ПРОЦЕССЕ, А НЕ СУБПРОЦЕССОМ, и свойство свежего процесса подделано
+# явно (`_fake_run` возвращает набор к тренажёру ПЕРЕД каждым вызовом `main`): иначе первый же
+# `--live` оставил бы модуль на живом наборе, и следующее нажатие тренажёра писало бы в чужие
+# файлы — не потому, что так делает прод, а потому, что так вышло у набора.
+class TestTheButtonStringDecidesTheJournal(TwoSetsBase):
+    STORES = ("verdicts", "desk", "lessons")
+    WHO = "стенд-67a"
+
+    def setUp(self):
+        super().setUp()
+        # Право на дверь — подставное. Предмет этого набора маршрут, а не список правящих книгу
+        # правил, и живой `moderation_core.may_write_rule` потащил бы сюда боевой список имён.
+        was_may = exam_show._may
+        exam_show._may = lambda right_fn: (right_fn or (lambda _who=None: True))
+        self.addCleanup(setattr, exam_show, "_may", was_may)
+        # Субпроцесс двери подменён шимом ИМЕННО У АГЕНТА (`pc_agent.subprocess`), а не в самом
+        # модуле `subprocess`: глобальная подмена задела бы всех, кто его зовёт в этом процессе.
+        was_sub = pc_agent.subprocess
+        pc_agent.subprocess = types.SimpleNamespace(run=self._fake_run)
+        self.addCleanup(setattr, pc_agent, "subprocess", was_sub)
+        self.argv = []          # argv КАЖДОГО вызова двери: в нём и живёт `--live`
+        self.checks = 0         # сверок «чужое хранилище байт в байт то же» — считаем их
+
+    # ── механика стенда ──────────────────────────────────────────────────────────────────
+    def _fake_run(self, argv, **kwargs):
+        """Вызов двери субпроцессом → та же дверь в этом процессе. → объект с полями `run`."""
+        argv = [str(x) for x in argv]
+        self.argv.append(argv)
+        if os.path.basename(argv[1]) != "exam_show.py":
+            # Чужая дверь (цепь/ворота/ящик) — её мы не исполняем вовсе: набор про неё не спрашивал.
+            return types.SimpleNamespace(stdout="", stderr="чужая дверь", returncode=0)
+        exam_show.restore_set(self.trainer)      # свежий процесс всегда стартует на тренажёре
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = exam_show.main(argv[2:])
+        finally:
+            exam_show.restore_set(self.trainer)
+        return types.SimpleNamespace(stdout=buf.getvalue(), stderr="", returncode=rc)
+
+    def press(self, data):
+        """Нажатие кнопки ЖИВЫМ обработчиком агента → (route, ответ двери словами).
+
+        Зовётся настоящий `on_chain_callback`, а не переписанный здесь выбор исполнителя: словарь
+        `{"exam": …, "exam_live": …}` живёт в нём, и второй его экземпляр в наборе разъехался бы
+        с первым молча — ровно тот класс, ради которого этот набор и написан."""
+        said = []
+        q = types.SimpleNamespace(
+            data=data,
+            from_user=types.SimpleNamespace(id=pc_agent.ALLOWED_USER_ID, username=self.WHO),
+            message=types.SimpleNamespace(chat_id=exam_show.TRAINER_CHAT, message_thread_id=None),
+            answer=lambda *a, **k: asyncio.sleep(0))
+        update = types.SimpleNamespace(callback_query=q)
+        bot = types.SimpleNamespace(
+            send_message=lambda chat, text, **k: (said.append(text), asyncio.sleep(0))[1])
+        asyncio.run(pc_agent.on_chain_callback(update, types.SimpleNamespace(bot=bot)))
+        return pc_agent._chain_cb_route(data, pc_agent.ALLOWED_USER_ID), "\n".join(said)
+
+    def both(self):
+        return dict((side, self.files(side)) for side in ("trainer", "live"))
+
+    def foreign_untouched(self, before, mine, data):
+        """Чужое хранилище байт в байт то же → число сверок растёт на длину хранилища."""
+        alien = "live" if mine == "trainer" else "trainer"
+        after = self.both()
+        for key in self.STORES:
+            self.checks += 1
+            self.assertEqual(after[alien][key], before[alien][key],
+                             "нажатие «%s» наследило у набора «%s», файл %s" % (data, alien, key))
+        return after
+
+    def live_cbs(self):
+        exam_show.restore_set(self.live)
+        cbs = exam_show.card_callbacks(13, exam_show.load_shot(13))
+        exam_show.restore_set(self.trainer)
+        return cbs
+
+    # ── п.3: чем строка живого набора отличается от строки тренажёра ─────────────────────
+    def test_the_head_is_the_whole_difference_between_the_two_strings(self):
+        """Отличие РОВНО ОДНО и оно названо: голова до первого двоеточия. Хвост общий."""
+        live = self.live_cbs()
+        exam_show.restore_set(self.trainer)
+        trainer = exam_show.card_callbacks(13, exam_show.load_shot(13))
+        self.assertEqual([c.split(":", 1)[1] for c in live],
+                         [c.split(":", 1)[1] for c in trainer], "хвосты кнопок разошлись")
+        self.assertEqual(sorted(set(c.split(":", 1)[0] for c in live)), ["examlive"])
+        self.assertEqual(sorted(set(c.split(":", 1)[0] for c in trainer)), ["exam"])
+        # Разборы ВЗАИМНО ИСКЛЮЧАЮЩИЕ: ни одна кнопка не разбирается обоими.
+        for c in live:
+            self.assertIsNone(pc_agent._exam_cb_parse(c), c)
+            self.assertIsNotNone(pc_agent._exam_live_cb_parse(c), c)
+        for c in trainer:
+            self.assertIsNone(pc_agent._exam_live_cb_parse(c), c)
+            self.assertIsNotNone(pc_agent._exam_cb_parse(c), c)
+
+    def test_the_live_string_walks_the_whole_way_into_the_live_journal(self):
+        """ЗЕЛЁНЫЙ ПУТЬ ЦЕЛИКОМ: строка кнопки → обработчик → argv с `--live` → строка журнала."""
+        data = "examlive:ok:13"
+        self.assertIn(data, self.live_cbs(), "стенд жмёт кнопку, которой в карточке нет")
+        before = self.both()
+        route, said = self.press(data)
+        self.assertEqual(route["kind"], "exam_live")
+        self.assertEqual(len(self.argv), 1, "дверь позвана не один раз")
+        self.assertEqual(self.argv[0][2], "--live", self.argv[0])
+        after = self.foreign_untouched(before, "live", data)
+        self.assertNotEqual(after["live"]["verdicts"], before["live"]["verdicts"])
+        rows = exam_show.load_verdicts(self.paths["live"]["verdicts"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["набор"], rows[0]["кейс"], rows[0]["вердикт"]),
+                         ("живой", "13", "верно"))
+        self.assertIn("журнал набора «живой»", said)
+        self.assertEqual(self.checks, 3)
+
+    def test_the_substituted_head_never_reaches_the_live_journal(self):
+        """МУТАНТ СТРОКИ: у живой кнопки подменена ГОЛОВА, хвост не тронут ни символом.
+
+        Подменённая строка обязана (1) не позвать дверь с `--live`, (2) не оставить в журнале
+        живого набора ни байта, (3) уехать вердиктом тренажёру — то есть доказать, что журнал
+        выбирает именно голова, а не «так сложилось»."""
+        live = "examlive:ok:13"
+        mutant = live.replace("examlive:", "exam:", 1)
+        self.assertEqual(mutant.split(":", 1)[1], live.split(":", 1)[1], "мутант тронул хвост")
+        before = self.both()
+        route, said = self.press(mutant)
+        self.assertEqual(route["kind"], "exam", "подменённая строка осталась строкой живого набора")
+        self.assertNotIn("--live", self.argv[0], self.argv[0])
+        after = self.foreign_untouched(before, "trainer", mutant)
+        self.assertIsNone(after["live"]["verdicts"], "подменённая строка завела журнал живого набора")
+        self.assertNotEqual(after["trainer"]["verdicts"], before["trainer"]["verdicts"])
+        self.assertEqual(exam_show.load_verdicts(self.paths["trainer"]["verdicts"])[0]["набор"],
+                         "тренажёр")
+        self.assertIn("журнал набора «тренажёр»", said)
+        self.assertEqual(self.checks, 3)
+
+    def test_a_broken_head_reaches_neither_journal(self):
+        """Мутанты, которым не достаётся НИ ОДИН набор: похожая голова — это чужая голова."""
+        aliens = ("examlive:ok:13 ", "Examlive:ok:13", "examlivex:ok:13", "exam live:ok:13",
+                  " examlive:ok:13", "examlive:ok:13;exam:ok:13")
+        for alien in aliens:
+            before = self.both()
+            route, _said = self.press(alien)
+            self.assertNotIn(route.get("kind"), ("exam", "exam_live"), alien)
+            self.assertEqual([a for a in self.argv
+                              if os.path.basename(a[1]) == "exam_show.py"], [], alien)
+            after = self.both()
+            for side in ("trainer", "live"):
+                for key in self.STORES:
+                    self.checks += 1
+                    self.assertEqual(after[side][key], before[side][key],
+                                     "чужая строка «%s» тронула набор «%s» (%s)" % (alien, side, key))
+        self.assertEqual(self.checks, len(aliens) * 6)
+
+    # ── п.4: двусторонне и ЧИСЛОМ, а не примером ────────────────────────────────────────
+    def test_every_button_of_both_sets_is_compared_against_the_other_journal(self):
+        """ДВУСТОРОННЕ И ПОЛНЫМ КРУГОМ: жмём ВСЕ кнопки карточки каждого набора и после КАЖДОГО
+        нажатия сверяем ВСЁ хранилище соседа побайтно. Пример доказал бы одну кнопку из пяти."""
+        order = ("h1", "h2", "go", "own", "ok")   # вердикт последним: судимый кейс закрывает двери
+        pressed = 0
+        for side, head in (("live", "examlive"), ("trainer", "exam")):
+            cbs = self.live_cbs() if side == "live" else exam_show.card_callbacks(
+                13, exam_show.load_shot(13))
+            self.assertEqual(sorted(c.split(":")[1] for c in cbs), sorted(order),
+                             "карточка набора «%s» несёт не те кнопки" % side)
+            for action in order:
+                data = "%s:%s:13" % (head, action)
+                before = self.both()
+                self.press(data)
+                self.foreign_untouched(before, side, data)
+                pressed += 1
+        self.assertEqual(pressed, 10)
+        self.assertEqual(self.checks, 30, "сверок вышло не столько, сколько нажатий × хранилищ")
+        # И обе стороны действительно писали — иначе сверки зеленели бы на пустоте.
+        for side, name in (("live", "живой"), ("trainer", "тренажёр")):
+            rows = exam_show.load_verdicts(self.paths[side]["verdicts"])
+            self.assertEqual([r["набор"] for r in rows], [name], side)
+            with open(self.paths[side]["lessons"], encoding="utf-8") as f:
+                self.assertTrue([x for x in f.read().splitlines()[1:] if x.strip()], side)
 
 
 if __name__ == "__main__":
