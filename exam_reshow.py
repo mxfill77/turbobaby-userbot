@@ -115,10 +115,13 @@ def main(argv=None):
         print("%s — %s" % ({True: "ЛЕЖИТ", False: "НЕТ", None: "НЕИЗВЕСТНО"}[ok], msg))
         return 0 if ok else 1
     if a.dry:
-        seen = []
+        # Список зовётся НЕ `seen`: этим именем зовётся дверь чтения назад, и локальная переменная
+        # с тем же именем делает ЛОКАЛЬНЫМ весь `seen` в функции — ветка `--seen` выше падала
+        # `UnboundLocalError` ДО сети (замер 19.09.2026, живой прогон после показа кейса 14).
+        printed = []
 
         def dry(text, dest, markup=None):
-            seen.append(text)
+            printed.append(text)
             print("─── ушло бы в %s (%d симв., фигурных скобок %d) ───\n%s\n─── кнопки: %s"
                   % (dest, len(text), text.count("{"), text, markup))
             return ("СУХО", True, "0")

@@ -2239,6 +2239,17 @@ class TestReshowOfTheLiveSet(TwoSetsBase):
         self.assertEqual(asked[0][1], 1931)
         self.assertEqual(asked[0][2], exam_show.markup(13, exam_show.load_shot(13)))
 
+    def test_the_seen_key_reaches_its_door_from_the_command_line(self):
+        """ДВЕРЬ ЗОВЁТСЯ ИЗ CLI, а не только из кода. Замер 19.09.2026: локальный список сухого
+        прогона звался `seen` — тем же именем, что дверь, — и `--seen` падал `UnboundLocalError`
+        ДО сети. Набор этого не видел: он звал `seen()` напрямую, минуя разбор ключей."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = exam_reshow.main(["--live", "--case", "14", "--seen", "1931"])
+        self.assertEqual(code, 1)
+        self.assertIn("НЕИЗВЕСТНО", out.getvalue())
+        self.assertIn("снимка кейса 14 нет", out.getvalue())
+
     def test_reading_back_without_a_snapshot_is_unknown_and_never_asks(self):
         """Снимка нет — исход НЕИЗВЕСТНО, и в сеть не идём вовсе: строить разметку не из чего."""
         exam_show.restore_set(self.live)
