@@ -2453,5 +2453,95 @@ class TestTheButtonStringDecidesTheJournal(TwoSetsBase):
                 self.assertTrue([x for x in f.read().splitlines()[1:] if x.strip()], side)
 
 
+# ───── СЛОВА ЖИВОГО НАБОРА КОНЧАЮТСЯ ТАМ, ГДЕ КОНЧАЕТСЯ НАБЛЮДЕНИЕ (19.09.2026, задание 67d) ─────
+# До 19.09 живой набор печатал владельцу «на ответы бота НЕ действует» — утверждение о судьбе его
+# ТЕКСТА во всей системе. Замер 18.09 23:13 показал обратное: урок, написанный ОТВЕТОМ на карточку,
+# доехал до головы репликой ТЕСТ-клиента (оба полигона сидят в одной группе), и через восемь секунд
+# владелец увидел своё содержание в ответе бота. Модуль наблюдает СВОЮ базу и то, что её никто не
+# читает; ни комнаты, ни транскрипта, ни входа головы он не видит ни одной строкой.
+#
+# ЗАМОК ДЕРЖИТ ТРИ ВЕЩИ РАЗОМ, и каждая проверена во ВСЕХ ТРЁХ местах показа (легенда кнопок
+# карточки · ответ «✔ Применить» · ответ «✍️ своё»): (1) обещания о судьбе текста нет ни в одном;
+# (2) известный путь назван вслух — «прочитает как слова клиента», «в одной комнате»; (3) то, что
+# модуль ВПРАВЕ сказать, сказано — «правилом бота не становится». Возврат старой фразы хотя бы в
+# одном месте красит класс: мутант проверен числом (задание 67d, п.3).
+
+class TestLiveWordsEndWhereObservationEnds(TwoSetsBase):
+    """Три места, где фраза живого набора доходит до человека, — все из этого модуля."""
+
+    FATE_FORBIDDEN = ("на ответы бота", "не действует", "голове не видна", "не видна голове")
+    MUST_SAY = ("правилом бота", "как слова клиента", "одной комнате")
+
+    def check_words(self, said, where, phrase=None):
+        """`phrase` — та часть показа, которая ОБЪЯСНЯЕТ последствие; пути в ней быть не должно.
+
+        Не весь текст: у ответа «✍️ своё» рядом с объяснением стои́т СТРОКА ЗАПУСКА, которую
+        владелец копирует, и путь в ней — не устройство напоказ, а обязательный аргумент."""
+        low = said.lower()
+        for bad in self.FATE_FORBIDDEN:
+            self.assertNotIn(bad, low, "%s судит о судьбе ТЕКСТА («%s») — этого модуль не "
+                                       "наблюдает" % (where, bad))
+        for good in self.MUST_SAY:
+            self.assertIn(good, low, "%s не называет вслух «%s» — известный путь промолчал"
+                          % (where, good))
+        for ugly in ("lessons.tsv", "exam_live/"):
+            self.assertNotIn(ugly, (phrase or said).lower(),
+                             "%s объясняет последствие путём к файлу, а не по-человечески" % where)
+
+    def live_card(self):
+        exam_show.restore_set(self.live)
+        return exam_show.card_text(_shot(case=13, total=2, hints=HINTS))
+
+    def test_the_card_legend_of_the_live_set_stops_at_what_it_observes(self):
+        self.check_words(self.live_card(), "легенда кнопок карточки")
+
+    def test_the_apply_answer_of_the_live_set_stops_at_what_it_observes(self):
+        exam_show.restore_set(self.live)
+        kw = self.door_kwargs()
+        self.assertTrue(exam_show.toggle(13, 1, "@filipp", right_fn=kw["right_fn"])[0])
+        ok, said = exam_show.apply_marked(13, "@filipp", **kw)
+        self.assertTrue(ok, said)
+        self.check_words(said, "ответ «✔ Применить»")
+        self.assertIn("ЖИВОГО набора", said, "ответ перестал называть набор")
+
+    def test_the_own_words_answer_of_the_live_set_stops_at_what_it_observes(self):
+        """И ПОВЕДЕНИЕ ТУТ ЖЕ: слова другие, а урок, вердикт и строка включения — ровно прежние."""
+        exam_show.restore_set(self.live)
+        kw = self.door_kwargs()
+        self.assertTrue(exam_show.own_start(13, "@filipp", right_fn=kw["right_fn"])[0])
+        ok, said = exam_show.own_take("не обещай сроков выдачи", "@filipp", **kw)
+        self.assertTrue(ok, said)
+        pin = [ln for ln in said.splitlines() if ln.startswith("📌")]
+        self.assertEqual(len(pin), 1, "объясняющая строка ответа не одна: %r" % pin)
+        self.check_words(said, "ответ «✍️ своё»", phrase=pin[0])
+        self.assertIn("lesson_promote.py", said, "строка включения урока пропала из ответа")
+        with open(self.paths["live"]["lessons"], encoding="utf-8") as f:
+            self.assertEqual(len([x for x in f.read().splitlines()[1:] if x.strip()]), 1)
+        self.assertEqual([r["кейс"] for r in
+                          exam_show.load_verdicts(self.paths["live"]["verdicts"])], ["13"])
+
+    def test_the_waiting_answer_warns_about_the_shared_room_in_both_sets(self):
+        """ЧЕТВЁРТОЕ МЕСТО, добавленное 19.09: ответ «✍️ своё» ждёт текст — и это последняя минута,
+        когда предупредить ещё не поздно. У ОБОИХ наборов: группа у них одна, и текст владельца
+        станет репликой клиента независимо от того, чья карточка висит."""
+        for side, state in (("живой", self.live), ("тренажёр", self.trainer)):
+            exam_show.restore_set(state)
+            ok, said = exam_show.own_start(13, "@filipp", right_fn=lambda _w=None: True)
+            self.assertTrue(ok, said)
+            low = said.lower()
+            self.assertIn("как слова клиента", low, "%s: ожидание молчит про комнату" % side)
+            self.assertIn("одной комнате", low, "%s: ожидание молчит про комнату" % side)
+            self.assertIn("10 минут", low, "%s: срок ожидания пропал из ответа" % side)
+
+    def test_the_trainer_words_are_untouched_and_never_borrow_the_live_caution(self):
+        """ОТРИЦАТЕЛЬНЫЙ: предупреждение живого набора тренажёру не уехало, его слова прежние."""
+        exam_show.restore_set(self.trainer)
+        card = exam_show.card_text(_shot(case=13, total=2, hints=HINTS))
+        self.assertNotIn("одной комнате", card, "предупреждение живого набора уехало тренажёру")
+        self.assertNotIn("правилом бота", card, "слова живого набора уехали тренажёру")
+        self.assertTrue(("СРАЗУ" in card) or ("КАНДИДАТОМ" in card),
+                        "слова тренажёра про режим урока пропали вовсе")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
