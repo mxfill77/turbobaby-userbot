@@ -2017,6 +2017,33 @@ def trace(path=None):
 # CLI
 # ---------------------------------------------------------------------------------------
 
+def note_from(note, path, read_fn=None):
+    """Шапка показа из двух возможных источников → (шапка, отказ|None).
+
+    ФАЙЛ, А НЕ argv, ДЛЯ ЖИВОГО ТЕКСТА. Кириллица и эмодзи в argv на Windows ходят через кодировку
+    консоли и коверкаются МОЛЧА — тот же класс, из-за которого урок владельца («✍️ своё») читается
+    со stdin, а не из argv. Здесь цена промаха та же: мохибейк уедет владельцу в карточке, и
+    отозвать её нечем. Файл читается с ЯВНЫМ utf-8, и нечитаемый файл — отказ ДО сети.
+
+    ДВА ИСТОЧНИКА РАЗОМ — ОТКАЗ, а не молчаливый выбор одного: вызывающий, назвавший оба, не знает,
+    какой текст уедет владельцу, и угадывать за него здесь нельзя."""
+    note, path = str(note or ""), str(path or "").strip()
+    if note.strip() and path:
+        return "", ("⛔ шапка названа ДВАЖДЫ (--note и --note-file) — какой текст уедет владельцу, "
+                    "отсюда не видно. Ничего не отправлено.")
+    if not path:
+        return note, None
+    try:
+        if read_fn is not None:
+            return read_fn(path), None
+        with open(path, encoding="utf-8") as f:
+            return f.read(), None
+    except (OSError, UnicodeDecodeError) as e:
+        return "", ("⛔ шапку из «%s» прочитать не удалось (%s) — карточку без неё не отправляем: "
+                    "владелец получил бы вторую похожую без объяснения. Ничего не отправлено." % (
+                        path, type(e).__name__))
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         description="Показ ОДНОГО кейса экзамена владельцу и запись тапа кандидатом.")
@@ -2028,6 +2055,9 @@ def build_parser():
     p.add_argument("--note", default="",
                    help="шапка ПЕРЕД карточкой: чем эта отправка отличается (свойство отправки, "
                         "в снимок не ложится)")
+    p.add_argument("--note-file", dest="note_file", default="",
+                   help="шапка ИЗ ФАЙЛА в utf-8 — так и надо для живой кириллицы и эмодзи "
+                        "(argv на Windows ходит через кодировку консоли и коверкает их молча)")
     p.add_argument("--keep-desk", action="store_true", dest="keep_desk",
                    help="НЕ переводить стол на показанный кейс: номер текущего кейса останется "
                         "прежним (показ мимо хода экзамена)")
@@ -2200,7 +2230,11 @@ def main(argv=None):
         print(card_text(shot, len(shot_slots(a.case))))
         return 0
     if a.show:
-        ok, msg = show(a.case, note=a.note, keep_desk=a.keep_desk)
+        note, why = note_from(a.note, a.note_file)
+        if why:
+            print(why)
+            return 2
+        ok, msg = show(a.case, note=note, keep_desk=a.keep_desk)
         print(msg)
         return 0 if ok else 1
     print("⛔ не назван ни один ключ действия (--freeze / --show / --card / --tap / --rollback).")

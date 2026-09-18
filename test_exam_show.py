@@ -2759,6 +2759,46 @@ class TestShowBesideTheExamRun(Base):
         exam_show.show(1, sender=send, agent_fn=self.fresh_agent())
         self.assertEqual(send.calls[0]["text"], exam_show.card_text(shot, 1, passed=0))
 
+    def test_a_live_cyrillic_note_travels_by_file_and_not_by_argv(self):
+        """Шапка владельцу — ИЗ ФАЙЛА в utf-8: argv на Windows коверкает кириллицу молча.
+
+        Мерится ДОСЛОВНО и с эмодзи: мохибейк в карточке отозвать нечем."""
+        head = "🆕 ПЕРВЫЙ ПОКАЗ · кейс 1 — стол не двигали (22)"
+        path = os.path.join(self.tmp, "note.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(head + "\n")
+        got, why = exam_show.note_from("", path)
+        self.assertIsNone(why)
+        self.assertEqual(got.strip(), head)
+        self.put_shot(_shot(corpus=exam_show.corpus_fingerprint(), hints=HINTS))
+        seen = {}
+        was, exam_show.show = exam_show.show, lambda cid, **kw: (seen.update(kw) or (True, "ok"))
+        try:
+            rc = exam_show.main(["--case", "1", "--show", "--note-file", path])
+        finally:
+            exam_show.show = was
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen.get("note").strip(), head, "шапка доехала до двери не дословно")
+
+    def test_two_sources_of_the_note_and_an_unreadable_file_refuse_before_the_net(self):
+        """ОТРИЦАТЕЛЬНЫЕ: две шапки разом и нечитаемый файл — отказ ДО сети, наружу ничего."""
+        self.put_shot(_shot(corpus=exam_show.corpus_fingerprint(), hints=HINTS))
+        got, why = exam_show.note_from("из argv", os.path.join(self.tmp, "note.txt"))
+        self.assertEqual(got, "")
+        self.assertIn("ДВАЖДЫ", why)
+        got, why = exam_show.note_from("", os.path.join(self.tmp, "нет-такого.txt"))
+        self.assertEqual(got, "")
+        self.assertIn("прочитать не удалось", why)
+        send = self.sender()
+        was, exam_show.show = exam_show.show, lambda *a, **k: (True, send("x", 0) and "не должно")
+        try:
+            rc = exam_show.main(["--case", "1", "--show", "--note", "a",
+                                 "--note-file", os.path.join(self.tmp, "note.txt")])
+        finally:
+            exam_show.show = was
+        self.assertEqual(rc, 2)
+        self.assertEqual(send.calls, [], "на отказе шапки наружу не смеет уйти ничего")
+
     def test_the_cli_carries_both_keys_all_the_way_to_the_door(self):
         """CLI-ПУТЬ, а не функция: ключ, не доехавший до двери, — свой класс (замер 19.09 у `--seen`)."""
         seen = {}
