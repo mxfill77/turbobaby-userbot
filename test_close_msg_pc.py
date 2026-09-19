@@ -19,12 +19,14 @@
 месте (иначе «одна единица» задания жила бы обещанием, а не проверкой).
 """
 
+import json
 import os
 import re
 import unittest
 
 import close_msg_pc as cm
 import done_judge_pc
+import shtab_box
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
@@ -371,6 +373,98 @@ class PlanFacts(unittest.TestCase):
 
     def test_one_gap_is_not_a_rhythm(self):
         self.assertFalse(cm._pace([0.0, 600.0])["ok"])
+
+
+class WaitingAgainstTheLiveGate(unittest.TestCase):
+    """«Ждут N» ПРОТИВ ЖИВЫХ ВОРОТ — замок класса 19.09.2026 («ящик не видит лежащих»).
+
+    ПОВОД — ЗАМЕР, А НЕ ВООБРАЖЕНИЕ. 19.09.2026 04:03 UTC живой `--status`: в папке 260
+    документов, три из них лежат непрочитанными вторые сутки (`67b-urok-iskazhen.1809`,
+    `67f-kodirovka-i-schetchik.1909`, `67g-petlya-zhivogo-nabora.1909`), и все три ворота
+    отвергли одной причиной — `too_long`: тела 4873, 4853 и 4514 единиц UTF-16 при потолке
+    :data:`shtab_box.BODY_MAX` = 4500. А слепок оборота в тот час говорил `waiting: 0`, и
+    сообщение о закрытии сказало бы владельцу :data:`close_msg_pc.P_BOX_EMPTY` — «брать
+    нечего», то есть УТВЕРЖДЕНИЕ о пустом ящике поверх трёх лежащих документов.
+
+    ЧЕМ ЭТОТ НАБОР ОТЛИЧАЕТСЯ ОТ СОСЕДНЕГО ``test_a_doc_the_gates_already_refused_is_not_waiting``.
+    Тот подаёт вердикт ворот РУКАМИ (``{"ok": False}``) и стережёт арифметику вычитания. Здесь
+    вердикт поднимают САМИ ВОРОТА (:func:`shtab_box.check`) на теле, собранном по ту и по эту
+    сторону потолка, — то есть стережётся СТЫК двух модулей: разойдись потолок ворот со счётом
+    ждущих, синтетический вердикт этого не заметил бы ни одной веткой.
+
+    ДЕНЬ БЕРЁТСЯ У ЗАПИСИ ЗАМЕРА ЁМКОСТИ, А НЕ У КАЛЕНДАРЯ: ворота закрываются, когда запись
+    старше :data:`shtab_box.CAPACITY_TTL_DAYS` (30 суток), и набор, пришпиленный к 19.09.2026,
+    начал бы падать `capacity_unmeasured` с середины октября — по причине, к предмету теста
+    отношения не имеющей.
+    """
+
+    DAY = shtab_box.CAPACITY_RECORD["date"]
+
+    def body(self, size):
+        """Тело, проходящее ВСЕ ворота кроме длины, ровно ``size`` единиц UTF-16. → str.
+
+        Набивка — кириллическая буква (одна кодовая единица UTF-16 на символ) и стои́т ПОСЛЕ
+        адреса результата: подрежь мы хвост — резался бы именно адрес, и отказ приехал бы
+        `no_address`, то есть тест мерил бы не то, что назвал.
+        """
+        head = ("ЦЕЛЬ. Замок счёта ждущих: тело по ту и по эту сторону потолка.\n"
+                "%s\n%s\n" % (shtab_box.PROHIBITIONS, shtab_box.ADDRESS))
+        pad = int(size) - shtab_box.units(head)
+        self.assertGreater(pad, 0, "голова тела уже переросла заказанный размер")
+        return head + "я" * pad
+
+    def census(self, bodies):
+        """{ключ: тело} → слепок оборота, собранный ЖИВЫМИ воротами. → dict."""
+        docs, gates = [], {}
+        for key in sorted(bodies):
+            doc = {"key": key, "name": shtab_box.doc_name(key), "body": bodies[key]}
+            ok, reason, why = shtab_box.check(doc, self.DAY)
+            gates[key] = {"ok": ok, "reason": reason, "why": why}
+            docs.append(doc)
+        return cm.facts_from_box(
+            {"placed": [],
+             "build": {"folder_ok": True, "folder_why": "", "marks_ok": True, "marks_why": "",
+                       "docs": docs, "task_marks": [], "gates": gates, "retry": []}},
+            now=100.0)
+
+    def test_three_bodies_over_the_cap_leave_waiting_at_zero(self):
+        # ЖИВОЙ СЛУЧАЙ 19.09, воспроизведённый по эту сторону моста: три тела через потолок —
+        # и «ждут» отвечает НОЛЬ при трёх лежащих документах.
+        over = shtab_box.BODY_MAX + 1
+        got = self.census({"67b-urok-iskazhen.1809": self.body(over),
+                           "67f-kodirovka-i-schetchik.1909": self.body(over),
+                           "67g-petlya-zhivogo-nabora.1909": self.body(over)})
+        self.assertTrue(got["ok"], "корпус полон — число обязано быть числом")
+        self.assertEqual(got["waiting"], 0)
+        self.assertEqual(got["next"], "")
+
+    def test_the_refusal_does_not_travel_with_the_number(self):
+        # ОТДЕЛЬНАЯ НАХОДКА ЗАДАНИЯ 19.09, записанная замком: причина отказа в слепок НЕ ЕДЕТ
+        # ни одним полем. Пока это так, «ждут 0» и «в ящике пусто» для читателя слепка — одно
+        # и то же, и различить их ему нечем.
+        got = self.census({"67g-petlya-zhivogo-nabora.1909":
+                           self.body(shtab_box.BODY_MAX + 1)})
+        self.assertNotIn("too_long", json.dumps(got, ensure_ascii=False))
+        self.assertEqual(cm.plan_lines({"box": {"ok": True, "waiting": got["waiting"]},
+                                        "run": {}, "retry": {"ok": True, "count": 0},
+                                        "pace": {}})[0], cm.P_BOX_EMPTY)
+
+    def test_a_body_under_the_cap_makes_waiting_more_than_zero(self):
+        # ОБЯЗАТЕЛЬНЫЙ ОТРИЦАТЕЛЬНЫЙ ТЕСТ ЗАДАНИЯ 19.09 (п.5): подаём заведомо ГОДНОЕ тело в тот
+        # же корпус — и ждущих становится больше нуля. Годное взято по САМОЙ границе (ровно
+        # потолок), потому что живой 67g перерос её на 14 единиц: сдвинься граница на единицу —
+        # и это должно быть видно ТЕСТОМ, а не вторыми сутками молчания.
+        bodies = {"67b-urok-iskazhen.1809": self.body(shtab_box.BODY_MAX + 1),
+                  "67f-kodirovka-i-schetchik.1909": self.body(shtab_box.BODY_MAX + 1),
+                  "67g-petlya-zhivogo-nabora.1909": self.body(shtab_box.BODY_MAX + 1),
+                  "00-godnoe-telo.1909": self.body(shtab_box.BODY_MAX)}
+        got = self.census(bodies)
+        self.assertEqual(got["waiting"], 1)
+        self.assertEqual(got["next"], "00-godnoe-telo.1909")
+        self.assertIn("00-godnoe-telo.1909",
+                      cm.plan_lines({"box": {"ok": True, "waiting": got["waiting"],
+                                             "next": got["next"]},
+                                     "run": {}, "retry": {}, "pace": {}})[0])
 
 
 class NegativeAndDeathLook(unittest.TestCase):
