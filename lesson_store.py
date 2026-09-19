@@ -188,16 +188,31 @@ COL_STATE = "состояние"
 # прежних колонок не сдвинулись ни на один: только так уже лежащая строка читается и правится
 # тем же кодом, что вчера.
 COL_SOURCE = "источник"
+# ДЕСЯТАЯ и ОДИННАДЦАТАЯ (20.09.2026) — НОМЕР ЗАЛИВКИ и РЕЖИМ. Тем же устройством, каким 09.09
+# лёг `источник`: хвостом, чтобы индексы девяти прежних колонок не сдвинулись ни на один.
+#
+# ПОЧЕМУ ПАРОЙ, А НЕ ПО ОДНОЙ. Десятиколоночная строка («партия есть, режима нет») — это лишнее
+# состояние формата, которого никто не заводил и на котором нечего решать. Законных ширин
+# по-прежнему ТРИ, и хвост растёт целиком: ширина 10 — битая строка, как и всякая другая.
+COL_BATCH = "партия"
+COL_MODE = "режим"
 
 # ВОСЕМЬ ОБЯЗАТЕЛЬНЫХ — формат, в котором лежат строки до 09.09.2026. Отдельным именем, а не
 # срезом `COLUMNS[:-1]`: по нему судит читатель старой строки, и подпирать это арифметикой среза
 # нельзя — следующая колонка сдвинет срез молча.
 COLUMNS_BASE = (COL_NUM, COL_QUESTION, COL_BOT, COL_RIGHT, COL_WHY, COL_WHO, COL_WHEN, COL_STATE)
-COLUMNS = COLUMNS_BASE + (COL_SOURCE,)
+# ДЕВЯТЬ — формат 09.09–20.09.2026. Тоже отдельным именем и по тому же доводу: по нему судит
+# читатель строки, легшей до хвоста партии, и срезом `COLUMNS[:-2]` его подпирать нельзя.
+COLUMNS_SRC = COLUMNS_BASE + (COL_SOURCE,)
+COLUMNS = COLUMNS_SRC + (COL_BATCH, COL_MODE)
 HEADER_BASE_LINE = "\t".join(COLUMNS_BASE)
+HEADER_SRC_LINE = "\t".join(COLUMNS_SRC)
 HEADER_LINE = "\t".join(COLUMNS)
-# Две ЗАКОННЫЕ ширины строки. Всё остальное — битая строка, как и раньше.
-WIDTHS = (len(COLUMNS_BASE), len(COLUMNS))
+# ТРИ ЗАКОННЫЕ ширины строки. Всё остальное — битая строка, как и раньше.
+WIDTHS = (len(COLUMNS_BASE), len(COLUMNS_SRC), len(COLUMNS))
+# Три законные ШАПКИ — ровно по числу ширин. Собираются из тех же кортежей, а не пишутся
+# литералами: разойтись списку колонок с шапкой нечем.
+HEADERS = (HEADER_BASE_LINE, HEADER_SRC_LINE, HEADER_LINE)
 
 # Индексы колонок, которые правятся ПО МЕСТУ (см. `_replace_fields`). Считаются из COLUMNS, а не
 # пишутся числами: порядок колонок — часть формата, и разъехаться эти два места не должны.
@@ -206,6 +221,8 @@ WIDTHS = (len(COLUMNS_BASE), len(COLUMNS))
 IDX_WHY = COLUMNS.index(COL_WHY)
 IDX_STATE = COLUMNS.index(COL_STATE)
 IDX_SOURCE = COLUMNS.index(COL_SOURCE)
+IDX_BATCH = COLUMNS.index(COL_BATCH)
+IDX_MODE = COLUMNS.index(COL_MODE)
 
 # Шесть обязательных полей урока (решение владельца). Номер и состояние ставит хранилище.
 REQUIRED_FIELDS = (COL_QUESTION, COL_BOT, COL_RIGHT, COL_WHY, COL_WHO, COL_WHEN)
@@ -237,7 +254,12 @@ CUT_WHO = "автор"
 # три прежних, и ни одной копией рядом: всё, что судит о разрезах (проверка имени, регулярка
 # состояния, разбор снятия, ошибка «не знаю такого»), читает `CUTS`, а не свой список.
 CUT_SOURCE = "источник"
-CUTS = (CUT_ONE, CUT_DAY, CUT_WHO, CUT_SOURCE)
+# ПЯТЫЙ РАЗРЕЗ (20.09.2026) — ОДНА ЗАЛИВКА набора. Не «вместо источника», а УЖЕ него: источник
+# снимает все партии, партия — ровно одну. Разрез записывается В САМУ СТРОКУ (`снят(партия;…)`),
+# и это не украшение: без него две заливки одного набора, снятые по отдельности, выглядели бы в
+# таблице одинаково, и владелец не увидел бы глазом, что уехало — весь набор или одна поставка.
+CUT_BATCH = "партия"
+CUTS = (CUT_ONE, CUT_DAY, CUT_WHO, CUT_SOURCE, CUT_BATCH)
 
 # Регулярка состояния СОБИРАЕТСЯ ИЗ `CUTS`, а не переписывается руками: раньше здесь стоял
 # литерал `(урок|день|автор)`, и четвёртый разрез разошёлся бы с ним МОЛЧА — снятое по источнику
@@ -295,6 +317,198 @@ def known_source(value):
 def say_source(source):
     """Источник строки → слова для человека. Неизвестный называется словами, а не пустотой."""
     return SAY_UNKNOWN if source is SOURCE_UNKNOWN else source
+
+
+# ---------------------------------------------------------------------------------------
+# ПАРТИЯ — НОМЕР ЗАЛИВКИ ВНУТРИ ИСТОЧНИКА (20.09.2026, задание 68f)
+# ---------------------------------------------------------------------------------------
+# ЗАЧЕМ, ОДНОЙ ФРАЗОЙ: источник — это ОТКУДА, а не КОГДА. Второй экспорт переписки ляжет тем же
+# значением `экспорт_переписки`, что и первый, и `--off экспорт_переписки` снимет ОБА — то есть
+# заодно снесёт заливку, к которой претензий не было. Ключ снятия обязан уметь целиться в ОДНУ
+# заливку, и партия — это ровно её номер.
+#
+# ПОЧЕМУ ЧИСЛО, А НЕ ИМЯ. Ключ снятия уже несёт имя (источник); второе свободное имя рядом дало бы
+# опечатку и снятие нуля строк с кодом успеха — мина, разобранная у `SOURCES`. Число сравнивается
+# точно и порядок даёт даром: «первая заливка», «вторая», «третья».
+#
+# ПОЧЕМУ НЕОБЯЗАТЕЛЬНА У ОДИНОЧНОЙ ЗАПИСИ. Урок, записанный владельцем кнопкой, заливкой не
+# является: он пришёл один и снимается номером. Требовать у него партию значило бы выдумать
+# номер там, где события заливки не было. Поэтому у партии есть ТРЕТИЙ ИСХОД — `None`, «номера
+# заливки нет», и он НЕ равен нулю и не равен «любой».
+BATCH_UNKNOWN = None
+SAY_BATCH_UNKNOWN = "партия не названа"
+REASON_BATCH_BAD = ("урок НЕ записан: номер заливки «%s» не читается. Партия — это ЦЕЛОЕ ЧИСЛО "
+                    "больше нуля (1, 2, 3…): им целится снятие одной заливки мимо остальных")
+
+
+class _AnyBatch(object):
+    """Сентинел «любая партия» для ключа снятия.
+
+    ОТДЕЛЬНЫМ ОБЪЕКТОМ, А НЕ `None`: у партии `None` — ЗНАЧЕНИЕ («номера заливки нет»), и строки
+    без номера снимаются им прицельно. Схлопни эти два смысла в один — и `--off источник` без
+    номера снял бы либо всё под видом «без номера», либо ничего под видом «любая»; оба исхода
+    молчаливы."""
+
+    __slots__ = ()
+
+    def __repr__(self):
+        return "BATCH_ANY"
+
+
+BATCH_ANY = _AnyBatch()
+
+
+def norm_batch(value):
+    """Значение партии → целое > 0 либо `BATCH_UNKNOWN`. Ноль, минус и мусор — «не знаю», а не 0:
+    подставленный ноль занял бы номер, которого никто не заливал."""
+    if value is BATCH_ANY or value is None:
+        return BATCH_UNKNOWN
+    text = str(value).strip()
+    if not text.isdigit():
+        return BATCH_UNKNOWN
+    num = int(text)
+    return num if num > 0 else BATCH_UNKNOWN
+
+
+def validate_batch(batch):
+    """Партия новой строки → (принят ли, причина словами, номер | None). Чистая функция.
+
+    `None` ПРИНИМАЕТСЯ: одиночная запись живёт без номера заливки (см. шапку). Отказ здесь — это
+    названный мусор (`0`, `-3`, `первая`), а не отсутствие."""
+    if batch is None:
+        return True, "", BATCH_UNKNOWN
+    num = norm_batch(batch)
+    if num is BATCH_UNKNOWN:
+        return False, REASON_BATCH_BAD % str(batch).strip(), None
+    return True, "", num
+
+
+def say_batch(batch):
+    """Партия строки → слова для человека. Отсутствие называется словами, а не пустотой."""
+    return SAY_BATCH_UNKNOWN if batch is BATCH_UNKNOWN else "заливка №%d" % batch
+
+
+# Слово, которым человек называет «строки БЕЗ номера заливки». Одно на все двери — иначе у
+# каждой завелось бы своё, и владелец, выучив одно, получил бы отказ в соседней.
+BATCH_KEY_NONE = "-"
+
+
+def batch_key(text):
+    """СЛОВО ЧЕЛОВЕКА о заливке → ключ для дверей. Три исхода, ровно как у самого ключа:
+    не названо (`None`/пусто) → `BATCH_ANY` («весь набор»); «-» → `BATCH_UNKNOWN` («строки без
+    номера»); всё прочее отдаётся ДОСЛОВНО — судит его дверь (`norm_batch`/`validate_batch`),
+    а не разбор. Второе место, решающее, что такое «номер», разошлось бы с первым молча."""
+    if text is None:
+        return BATCH_ANY
+    body = str(text).strip()
+    if body == "":
+        return BATCH_ANY
+    if body == BATCH_KEY_NONE:
+        return BATCH_UNKNOWN
+    return body
+
+
+# ---------------------------------------------------------------------------------------
+# РЕЖИМ — ОБУЧЕНИЕ ИЛИ БОЙ, И ОН НЕ ПАРАМЕТР НИ ОДНОЙ ДВЕРИ (20.09.2026, задание 68f)
+# ---------------------------------------------------------------------------------------
+# ТРЕТИЙ ВОПРОС К ЛЮБОМУ ПРИЗНАКУ: можно ли ПОДНЯТЬ его, НЕ СОВЕРШИВ события? Тот же вопрос
+# решил устройство версии таблицы (см. §ВЕРСИЯ): порядковый номер редакции вписывается руками за
+# секунду и потому негоден ЦЕЛИКОМ. У режима ответ обязан быть такой же жёсткий: «обучение» —
+# это ПРАВО строки стать правилом, по которому бот отвечает клиентам, и вписываться руками оно
+# не смеет.
+#
+# ПОЭТОМУ РЕЖИМ НЕ ЯВЛЯЕТСЯ АРГУМЕНТОМ НИ ОДНОЙ ФУНКЦИИ ЗАПИСИ. Его не передают — его ВЫВОДЯТ из
+# ИСТОЧНИКА, то есть из того самого события записи, которое уже названо, уже судится закрытым
+# списком и уже fail-closed (`validate_source`). Вписать «обучение» в строку нечем: такого входа
+# у хранилища нет. Это сторожит не дисциплина вызывающего, а отсутствие двери (инвариант
+# `test_lesson_mode.TestModeHasNoDoor`).
+#
+# ЧЕСТНО О ЦЕНЕ ВЫБОРА. Карта источников ПОЛНАЯ, но у одного источника значение — «не знаю»:
+# `экзамен` кладут ОБА экзамена, тренажёрный и живой, и разводит их сегодня только файл
+# (`exam_show.SET_NAME`). Подставить им «обучение» было бы умолчанием, притворяющимся знанием, —
+# ровно тем, что дороже пустоты: урок, пришедший из живого набора, получил бы право отвечать
+# клиентам за подписью «обучение». Поэтому у `экзамен` режим — ТРЕТИЙ ИСХОД, и он виден в строке
+# словами. Закрыть его до значения — правка ВЫЗЫВАЮЩЕГО (`exam_show` обязан называть разные
+# источники живому и тренажёрному экзамену), и она здесь не сделана; названа остатком.
+MODE_TRAIN = "обучение"
+MODE_FIGHT = "бой"
+MODES = (MODE_TRAIN, MODE_FIGHT)
+MODE_UNKNOWN = None
+SAY_MODE_UNKNOWN = "режим неизвестен"
+
+# КАРТА ИСТОЧНИК → РЕЖИМ. Полная по `SOURCES` (сторожит тест): новый источник не проедет молча
+# «неизвестным» — его придётся назвать здесь руками и в тот же час, когда его заводят.
+SOURCE_MODE = {
+    # тренажёр — синтетический диалог, клиента за ним нет
+    SOURCE_TRAINER: MODE_TRAIN,
+    # перенос книги — не переписка вовсе, а выписка из книги знаний
+    SOURCE_BOOK: MODE_TRAIN,
+    # экспорт переписки менеджеров — ЖИВЫЕ клиенты, ровно тот набор, ради которого всё затевалось
+    SOURCE_EXPORT: MODE_FIGHT,
+    # экзамен — ДВУСМЫСЛЕН: им кладут и тренажёрный, и живой (см. шапку)
+    SOURCE_EXAM: MODE_UNKNOWN,
+}
+
+_MODE_KEYS = {m.casefold(): m for m in MODES}
+
+
+def known_mode(value):
+    """Значение режима → КАНОНИЧЕСКОЕ из `MODES` либо `None` («такого режима не знаю»)."""
+    if value is None:
+        return None
+    return _MODE_KEYS.get(str(value).strip().casefold())
+
+
+def mode_of_source(source):
+    """ИСТОЧНИК → РЕЖИМ строки либо `MODE_UNKNOWN`. Чистая функция, единственная дорога, которой
+    режим вообще появляется у новой строки.
+
+    Неизвестный источник тоже даёт `MODE_UNKNOWN`, а не отказ: судить источник — дело
+    `validate_source`, и второго судьи здесь заводить нечего."""
+    canon = known_source(source)
+    if canon is None:
+        return MODE_UNKNOWN
+    return SOURCE_MODE.get(canon, MODE_UNKNOWN)
+
+
+def say_mode(mode):
+    """Режим строки → слова для человека. Неизвестный называется словами, а не пустотой."""
+    return SAY_MODE_UNKNOWN if mode is MODE_UNKNOWN else mode
+
+
+def mode_conflict(lesson):
+    """Режим, ЗАПИСАННЫЙ в строке, расходится с тем, что даёт её ИСТОЧНИК → True.
+
+    Зачем вторая сверка, если режим и так вычисляется при записи: файл лежит на диске, и рука
+    правит его быстрее, чем дверь. Вписать «обучение» строке набора `экспорт_переписки` дверью
+    нельзя — а руками можно, и код, сравнивающий только поле, выдал бы такой строке право
+    отвечать клиентам. Расхождение — это НЕ «режим неизвестен» и не «режим бой», а отдельная
+    новость: строку правили мимо двери.
+
+    Неизвестность (с любой стороны) расхождением НЕ является: «не знаю» ничему не противоречит.
+    Та же развилка, что у `Version.ok` — сказать надо обе стороны, а не одну."""
+    expect = mode_of_source(lesson.source)
+    if expect is MODE_UNKNOWN or lesson.mode is MODE_UNKNOWN:
+        return False
+    return lesson.mode != expect
+
+
+def is_training(lesson):
+    """Урок записан В ОБУЧЕНИИ — строгое сравнение с одним значением И согласие с источником.
+
+    Отдельной функцией, а не сравнением по месту: «не бой» и «обучение» — РАЗНЫЕ вопросы, и
+    строка с неизвестным режимом обязана отвечать False на оба. Всякий, кто спросит «можно ли
+    считать это правилом», обязан спрашивать здесь — и получить FAIL-CLOSED на расхождении:
+    строка, которой режим вписали руками вопреки её набору, права правила не получает."""
+    return lesson.mode == MODE_TRAIN and not mode_conflict(lesson)
+
+
+def is_fight(lesson):
+    """Урок пришёл ИЗ БОЯ. Зеркало `is_training` — но БЕЗ замка на расхождении, и это не
+    забывчивость: замок fail-closed обязан закрывать ПРАВО, а не отнимать подозрение. Строка,
+    у которой написано «бой», считается боевой даже при споре с источником — сомнение здесь
+    работает в сторону осторожности, а не против неё."""
+    return lesson.mode == MODE_FIGHT
 
 
 def withdrawn_state(cut, stamp):
@@ -421,8 +635,12 @@ def scrub_lesson(question, bot_answer, correct, why):
 # сборка `Lesson(...)` (её делают чужие тесты) продолжает работать, отвечая «источник неизвестен» —
 # ровно то, что означает строка без хвоста. Вставь `source` перед `line` — и тот же вызов упал бы
 # на нехватке аргумента, то есть формат хвоста перестал бы быть необязательным для читателя.
-Lesson = namedtuple("Lesson", "number question bot_answer correct why who when state line source")
-Lesson.__new__.__defaults__ = (SOURCE_UNKNOWN,)
+Lesson = namedtuple("Lesson", "number question bot_answer correct why who when state line source "
+                              "batch mode")
+# Умолчания — ровно ТРЕТЬИ ИСХОДЫ, по одному на каждое поле хвоста. Ни одно из них не является
+# значением: `Lesson(...)` без хвоста описывает строку, про которую мы НЕ ЗНАЕМ, из какой она
+# заливки и в каком режиме записана, — а не строку обучения из первой заливки.
+Lesson.__new__.__defaults__ = (SOURCE_UNKNOWN, BATCH_UNKNOWN, MODE_UNKNOWN)
 Store = namedtuple("Store", "lessons reading broken exists path")
 
 
@@ -468,6 +686,34 @@ def _source_of(parts):
     return value or SOURCE_UNKNOWN
 
 
+def _batch_of(parts):
+    """Поля строки → НОМЕР ЗАЛИВКИ либо `BATCH_UNKNOWN`.
+
+    Три входа дают «не знаю», и все три честно: хвоста партии у строки нет (формат до 20.09);
+    графа есть, но пуста (одиночная запись — заливкой не является); графа есть, но не читается
+    числом (файл правили руками). Ни один не превращается в номер: подставленная единица увела бы
+    строку в чужую заливку и уехала бы с её снятием."""
+    if len(parts) <= IDX_BATCH:
+        return BATCH_UNKNOWN
+    return norm_batch(unesc(parts[IDX_BATCH]))
+
+
+def _mode_of(parts):
+    """Поля строки → РЕЖИМ либо `MODE_UNKNOWN`.
+
+    ХВОСТА НЕТ — ЗНАЧИТ НЕИЗВЕСТНО, а не «обучение». Это главное правило совместимости всей
+    затеи: строка, легшая до 20.09, про свой режим не говорила НИЧЕГО, и подставить ей значение
+    здесь значило бы выдать нашу догадку за её показание. Умолчание, притворяющееся знанием,
+    дороже пустоты — особенно это, дающее право отвечать клиентам.
+
+    Значение ВНЕ `MODES` переносится дословно (как и у источника): списком судится ЗАПИСЬ.
+    Но `is_training` сравнивает СТРОГО, поэтому чужое значение права правила не даёт."""
+    if len(parts) <= IDX_MODE:
+        return MODE_UNKNOWN
+    value = unesc(parts[IDX_MODE]).strip()
+    return value or MODE_UNKNOWN
+
+
 def load(path=None):
     """Таблица целиком → Store. Сбой чтения ГРОМКИЙ (исключение наверх), отсутствие файла —
     названное состояние `exists=False`, а не притворная пустота.
@@ -484,10 +730,11 @@ def load(path=None):
             row = line.rstrip("\n").rstrip("\r")
             if len(row.strip()) == 0:
                 continue
-            # ДВЕ ЗАКОННЫЕ ШАПКИ, и обе пропускаются. Восьмиколоночная — та, что уже лежит в
-            # заведённых файлах: переписать её значило бы тронуть лежащую строку, а этого решение
-            # Штаба не разрешает. Не узнай мы её — она пошла бы в `broken` и подняла НЕРАЗБОР.
-            if idx == 1 and row in (HEADER_LINE, HEADER_BASE_LINE):
+            # ТРИ ЗАКОННЫЕ ШАПКИ, и все три пропускаются. Восьми- и девятиколоночная — те, что
+            # уже лежат в заведённых файлах: переписать их значило бы тронуть лежащую строку, а
+            # этого решение Штаба не разрешает. Не узнай мы их — они пошли бы в `broken` и подняли
+            # НЕРАЗБОР на ровном месте, то есть объявили бы живую таблицу нечитаемой.
+            if idx == 1 and row in HEADERS:
                 continue
             seen += 1
             parts = row.split("\t")
@@ -497,7 +744,7 @@ def load(path=None):
             lessons.append(Lesson(int(parts[0].strip()), unesc(parts[1]), unesc(parts[2]),
                                   unesc(parts[3]), unesc(parts[4]), unesc(parts[5]),
                                   unesc(parts[6]), unesc(parts[7]), idx,
-                                  _source_of(parts)))
+                                  _source_of(parts), _batch_of(parts), _mode_of(parts)))
     return Store(tuple(lessons), parse_outcome.reading(seen, len(lessons)),
                  tuple(broken), True, target)
 
@@ -670,6 +917,51 @@ def by_source(lessons, source):
                  if les.source is not SOURCE_UNKNOWN and norm_source(les.source) == key)
 
 
+def by_batch(lessons, source, batch):
+    """Уроки ОДНОЙ ЗАЛИВКИ названного набора. `batch=BATCH_ANY` — все заливки этого источника
+    (то же, что `by_source`), `batch=BATCH_UNKNOWN` — только строки БЕЗ номера заливки.
+
+    Три ответа, а не два, СОЗНАТЕЛЬНО: «любая» и «без номера» — разные множества, и схлопнуть их
+    значило бы снять при одном ключе то, что показали при другом."""
+    rows = by_source(lessons, source)
+    if batch is BATCH_ANY:
+        return rows
+    want = norm_batch(batch) if batch is not BATCH_UNKNOWN else BATCH_UNKNOWN
+    return tuple(les for les in rows if les.batch == want)
+
+
+def batches_census(lessons, source=None):
+    """Перепись ЗАЛИВОК числами: {(источник, партия | None): сколько строк}. Порядок —
+    `SOURCES`, внутри источника по номеру, строки без номера последними: так строка отчёта не
+    пляшет между запусками (тот же довод, что у `sources_census`)."""
+    rows = lessons if source is None else by_source(lessons, source)
+    seen = Counter((say_source(les.source), les.batch) for les in rows)
+    order = {name: i for i, name in enumerate(SOURCES)}
+
+    def key(pair):
+        src, num = pair
+        return (order.get(src, len(SOURCES)), src,
+                0 if num is not BATCH_UNKNOWN else 1, num or 0)
+
+    return tuple((pair, seen[pair]) for pair in sorted(seen, key=key))
+
+
+def modes_census(lessons):
+    """Перепись РЕЖИМОВ числами: {режим словами: сколько строк}. Неизвестный называется словами
+    и стои́т последним — он не режим, а его отсутствие."""
+    seen = Counter(say_mode(les.mode) for les in lessons)
+    out = []
+    for name in MODES:
+        if seen.get(name):
+            out.append((name, seen.pop(name)))
+    rest = seen.pop(SAY_MODE_UNKNOWN, 0)
+    for name in sorted(seen):
+        out.append((name, seen[name]))
+    if rest:
+        out.append((SAY_MODE_UNKNOWN, rest))
+    return tuple(out)
+
+
 def unknown_source(lessons):
     """Уроки, у которых источника нет (строки старше формата). Названы отдельным разрезом ЧТЕНИЯ,
     но НЕ разрезом снятия: снять «всё, что старше формата» одним движением — это не набор, а
@@ -762,17 +1054,23 @@ def _append_row(target, row, need_header, header=HEADER_LINE):
 
 
 def _add_row(question, bot_answer, correct, why, who, when, path, now, state, why_required,
-             source):
+             source, batch=None):
     """Общее тело `add`/`add_candidate` → НОМЕР записанного.
 
     Порядок сознателен: сначала проверка обязательных полей на СЫРОМ входе (пустое «почему»
-    отказывается до всякой работы), потом источник набора, потом вычистка персонального, потом
-    повторная проверка непустоты (поле, состоявшее из одних персональных данных, не должно
-    проехать пустым).
+    отказывается до всякой работы), потом источник набора, потом партия, потом вычистка
+    персонального, потом повторная проверка непустоты (поле, состоявшее из одних персональных
+    данных, не должно проехать пустым).
 
     ИСТОЧНИК ПРОВЕРЯЕТСЯ ПОСЛЕ ШЕСТИ ПОЛЕЙ, а не перед ними, и это не безразлично: у вызова, где
     не названо НИЧЕГО, отказ обязан назвать более старое и более жёсткое требование владельца
-    («почему»), иначе новая проверка перехватила бы чужие отказы и спрятала их причину."""
+    («почему»), иначе новая проверка перехватила бы чужие отказы и спрятала их причину. ПАРТИЯ
+    идёт ПОСЛЕ источника тем же доводом: пока не понято, из какого набора строка, номер заливки
+    внутри него обсуждать не о чем.
+
+    РЕЖИМА СРЕДИ АРГУМЕНТОВ НЕТ И НЕ БУДЕТ (см. §РЕЖИМ). Он ВЫЧИСЛЯЕТСЯ здесь из уже принятого
+    источника — последней точкой перед сборкой строки, когда событие записи уже названо целиком
+    и уже прошло все отказы."""
     stamp = now_stamp(now) if when is None else when
     ok, reason, field = validate(question, bot_answer, correct, why, who, stamp,
                                  why_required=why_required)
@@ -781,6 +1079,10 @@ def _add_row(question, bot_answer, correct, why, who, when, path, now, state, wh
     ok_src, reason_src, src = validate_source(source)
     if not ok_src:
         raise LessonRejected(reason_src, field=COL_SOURCE)
+    ok_batch, reason_batch, lot = validate_batch(batch)
+    if not ok_batch:
+        raise LessonRejected(reason_batch, field=COL_BATCH)
+    mode = mode_of_source(src)
 
     clean = scrub_lesson(question, bot_answer, correct, why)
     values = ((COL_QUESTION, clean.question), (COL_BOT, clean.bot_answer),
@@ -797,9 +1099,15 @@ def _add_row(question, bot_answer, correct, why, who, when, path, now, state, wh
     store = load(target)
     number = _next_number(store)
     need_header = (not store.exists) or os.path.getsize(target) == 0
+    # НОВАЯ СТРОКА ВСЕГДА ПОЛНОЙ ШИРИНЫ — одиннадцать граф, даже когда хвост пуст. Пустая графа
+    # читается как ТРЕТИЙ ИСХОД («партия не названа», «режим неизвестен»), а вот строка короче
+    # формата означала бы ровно то же самое ВТОРЫМ способом — и два способа сказать одно рано или
+    # поздно разойдутся.
     row = "\t".join((str(number), esc(clean.question), esc(clean.bot_answer),
                      esc(clean.correct), esc(clean.why), esc(who.strip()),
-                     esc(stamp), state, esc(src)))
+                     esc(stamp), state, esc(src),
+                     "" if lot is BATCH_UNKNOWN else str(lot),
+                     "" if mode is MODE_UNKNOWN else esc(mode)))
     _append_row(target, row, need_header)
     # ВЕРСИЯ ПОДНИМАЕТСЯ ЗДЕСЬ, а не в `add`/`add_candidate`: это последняя точка, после которой
     # байты урока УЖЕ лежат. Поднять её раньше значило бы назвать версию намерения.
@@ -807,7 +1115,8 @@ def _add_row(question, bot_answer, correct, why, who, when, path, now, state, wh
     return number
 
 
-def add(question, bot_answer, correct, why, who, source=None, when=None, path=None, now=None):
+def add(question, bot_answer, correct, why, who, source=None, when=None, path=None, now=None,
+        batch=None):
     """Записать ДЕЙСТВУЮЩИЙ урок (состояние `актив`). → НОМЕР записанного.
 
     «Почему» обязательно и здесь остаётся обязательным: это единственная дорога, кладущая строку
@@ -815,13 +1124,17 @@ def add(question, bot_answer, correct, why, who, source=None, when=None, path=No
 
     `source` объявлен со значением по умолчанию `None` не ради необязательности, а ради ОТКАЗА
     СЛОВАМИ: без него вызывающий получил бы `TypeError` про недостающий аргумент, то есть
-    сообщение для разработчика вместо причины для человека."""
+    сообщение для разработчика вместо причины для человека.
+
+    `batch` — НОМЕР ЗАЛИВКИ, необязателен (см. §ПАРТИЯ). Стои́т ПОСЛЕДНИМ, а не рядом с
+    источником, сознательно: позиционные вызовы, написанные до 20.09, обязаны значить ровно то
+    же, что значили, — и значат, потому что ни один из них до этого места не дотягивается."""
     return _add_row(question, bot_answer, correct, why, who, when, path, now,
-                    STATE_ACTIVE, True, source)
+                    STATE_ACTIVE, True, source, batch)
 
 
 def add_candidate(question, bot_answer, correct, who, source=None, why="", when=None, path=None,
-                  now=None):
+                  now=None, batch=None):
     """Записать КАНДИДАТА (состояние `кандидат`). → НОМЕР записанного.
 
     Отличие от `add` ровно одно: «почему» разрешено пустым. Ни одна ветка НЕ подставляет причину
@@ -833,9 +1146,12 @@ def add_candidate(question, bot_answer, correct, who, source=None, why="", when=
     обычно нет, и позиционный вызов не должен уметь молча сдвинуть автора в графу причины.
 
     ИСТОЧНИК обязателен и у кандидата: кандидат — такая же строка таблицы, и снимать набор
-    придётся вместе с теми, кто ещё не дозрел до действующего."""
+    придётся вместе с теми, кто ещё не дозрел до действующего.
+
+    ПАРТИЯ — тем же доводом: кандидат заливки уходит вместе со своей заливкой, а не со всем
+    набором."""
     return _add_row(question, bot_answer, correct, why, who, when, path, now,
-                    STATE_CANDIDATE, False, source)
+                    STATE_CANDIDATE, False, source, batch)
 
 
 # ---------------------------------------------------------------------------------------
@@ -861,6 +1177,13 @@ def _matches(lesson, cut, key):
     if cut == CUT_SOURCE:
         # Строка без источника не принадлежит НИ ОДНОМУ набору — см. `by_source`.
         return lesson.source is not SOURCE_UNKNOWN and norm_source(lesson.source) == key
+    if cut == CUT_BATCH:
+        # Ключ ПАРЫ: (источник, партия). Источник судится тем же условием, что выше, — второго
+        # определения «строка принадлежит набору» здесь нет.
+        src_key, lot = key
+        if lesson.source is SOURCE_UNKNOWN or norm_source(lesson.source) != src_key:
+            return False
+        return lesson.batch == lot
     return False
 
 
@@ -897,19 +1220,27 @@ def _replace_fields(raw, by_index):
 
 
 def _grow_row(raw, tail):
-    """СЫРАЯ восьмиколоночная строка + УЖЕ ЭКРАНИРОВАННЫЙ хвост → девятиколоночная строка.
+    """СЫРАЯ строка законной ширины + УЖЕ ЭКРАНИРОВАННЫЙ хвост → строка СЛЕДУЮЩЕЙ законной ширины.
     Всё прочее возвращается НЕТРОНУТЫМ.
+
+    `tail` — строка (одна графа) либо кортеж граф. Обе формы, а не одна: перевод 8→9 приписывает
+    источник, перевод 9→11 приписывает партию и режим ПАРОЙ, и разбивать вторую на два прохода
+    значило бы завести на полпути строку ширины 10, которой в формате нет.
 
     Это единственное место, где лежащая строка РАСТЁТ, и оно намеренно узкое. `_replace_fields`
     расти отказывается (см. комментарий там): правка полей не смеет менять ширину строки, иначе
-    `parts[8] = …` бросил бы IndexError посреди перезаписи. Рост — отдельное действие с отдельным
-    именем, и применяется он только переводом формата (`set_source`), а не правкой.
+    `parts[9] = …` бросил бы IndexError посреди перезаписи. Рост — отдельное действие с отдельным
+    именем, и применяется он только переводом формата (`set_source`, `set_batch`), а не правкой.
 
-    Строка ЛЮБОЙ другой ширины не трогается вовсе: девятиколоночная хвост уже несёт (второй
-    приписал бы ей десятую графу), а битая — не та строка, чтобы на ней угадывать."""
-    if len(raw.split("\t")) != len(COLUMNS_BASE):
+    ЗАКОННОСТЬ СУДИТСЯ ПО ОБЕИМ СТОРОНАМ: и исходная ширина, и получившаяся обязаны быть в
+    `WIDTHS`. Отсюда даром получается три отказа, каждый из которых иначе пришлось бы сторожить
+    руками: строка, уже несущая хвост, второго не получит; битая строка не трогается вовсе;
+    восьмиколоночная не перепрыгнет сразу в одиннадцать, миновав источник (8+2 = 10, ширины нет)."""
+    fields = (tail,) if isinstance(tail, str) else tuple(tail)
+    parts = raw.split("\t")
+    if len(parts) not in WIDTHS or (len(parts) + len(fields)) not in WIDTHS:
         return raw
-    return raw + "\t" + tail
+    return raw + "".join("\t" + f for f in fields)
 
 
 def _count_lines(target):
@@ -1030,10 +1361,106 @@ def set_source(numbers, source, path=None):
     return SetSourceResult(canon, want, stamped, already, tuple(missing), before, after)
 
 
-def withdraw(number=None, day=None, who=None, source=None, path=None, now=None):
+# ---------------------------------------------------------------------------------------
+# ПЕРЕВОД УЖЕ ЛЕЖАЩИХ СТРОК В ФОРМАТ С ПАРТИЕЙ И РЕЖИМОМ (20.09.2026)
+# ---------------------------------------------------------------------------------------
+# ТОТ ЖЕ ПРИЁМ, ЧТО 11.09 У ИСТОЧНИКА, и намеренно тот же: строки не создаются, не удаляются и не
+# переписываются — у них ДОРАСТАЕТ хвост. Номера называются ПОИМЁННО по тому же доводу
+# (`set_source`): признак накрыл бы строку, ПОХОЖУЮ на заливку, то есть поставил бы догадку туда,
+# где нужен факт. Кто доказал, из какой поставки строка, тот и перечисляет номера.
+#
+# РЕЖИМ ЗДЕСЬ ТОЖЕ НЕ ПАРАМЕТР. Он выводится из ИСТОЧНИКА уже лежащей строки — и это важнее, чем
+# кажется: будь режим входом, перевод формата стал бы той самой дверью, которой «обучение»
+# вписывается руками задним числом. Её нет.
+SetBatchResult = namedtuple("SetBatchResult",
+                            "batch numbers stamped already no_source missing modes "
+                            "lines_before lines_after")
+
+REASON_SET_BATCH_BAD = ("партия НЕ проставлена: номер заливки «%s» не читается. Партия — это "
+                        "ЦЕЛОЕ ЧИСЛО больше нуля; ничего не тронуто")
+
+
+def set_batch(numbers, batch, path=None):
+    """Проставить НОМЕР ЗАЛИВКИ уже лежащим строкам, названным ПОИМЁННО. → SetBatchResult.
+
+    Вместе с партией дорастает и РЕЖИМ — одной парой, потому что ширины 10 в формате нет
+    (см. `_grow_row`). Значение режима берётся из ИСТОЧНИКА строки (`mode_of_source`), а не с
+    входа; у двусмысленного источника оно честно пусто.
+
+    ЧЕТЫРЕ ЧИСЛА В ОТВЕТЕ, И НИ ОДНО НЕ СХЛОПНУТО: `stamped` — получили номер; `already` — хвост
+    уже несли (второй раз не ставим); `no_source` — строка осталась восьмиколоночной, то есть без
+    источника, и партию ей ставить НЕ ЗА ЧТО (режим выводить не из чего); `missing` — названного
+    номера в таблице нет. Это четыре РАЗНЫЕ новости, и подводить их под общий итог значило бы
+    прятать ту, из-за которой стоит остановиться.
+
+    `modes` — перепись режимов, которые легли этой правкой: {режим словами: сколько строк}.
+    Вызывающий обязан УВИДЕТЬ, что именно он проставил, а не поверить, что «вычислилось верно»."""
+    lot = norm_batch(batch)
+    if lot is BATCH_UNKNOWN:
+        raise LessonRejected(REASON_SET_BATCH_BAD % str(batch).strip(), field=COL_BATCH)
+
+    target = _path(path)
+    store = load(target)
+    if not store.exists:
+        return SetBatchResult(lot, tuple(numbers), 0, 0, (), tuple(numbers), (), 0, 0)
+
+    want = tuple(int(n) for n in numbers)
+    by_number = {les.number: les for les in store.lessons}
+    # Ширины читаются ОДНИМ проходом: судить «есть ли уже хвост» по значению поля нельзя —
+    # одиннадцатиколоночная строка с пустой партией выглядела бы как строка без хвоста, и второй
+    # хвост уехал бы ей в тринадцатую графу.
+    widths = {}
+    with open(target, encoding="utf-8", newline="") as f:
+        for idx, line in enumerate(f, start=1):
+            widths[idx] = len(line.rstrip("\n").rstrip("\r").split("\t"))
+
+    tails, stamped, already, no_source, missing = {}, 0, 0, [], []
+    modes = Counter()
+    for num in want:
+        les = by_number.get(num)
+        if les is None:
+            missing.append(num)
+            continue
+        width = widths.get(les.line)
+        if width == len(COLUMNS):
+            already += 1
+            continue
+        if width != len(COLUMNS_SRC):
+            # Восьмиколоночная (источника нет) или битая. Хвост не приписываем ни в одном случае:
+            # у первой режим выводить не из чего, вторую угадывать нечем.
+            no_source.append(num)
+            continue
+        mode = mode_of_source(les.source)
+        tails[les.line] = (str(lot), "" if mode is MODE_UNKNOWN else esc(mode))
+        modes[say_mode(mode)] += 1
+        stamped += 1
+
+    if not tails:
+        lines = _count_lines(target)
+        return SetBatchResult(lot, want, 0, already, tuple(no_source), tuple(missing),
+                              tuple(sorted(modes.items())), lines, lines)
+
+    # Шапка растёт ТОЛЬКО если она девятиколоночная — тем же доводом, что у `set_source`:
+    # `_grow_row` сам откажется трогать чужую ширину, но спрашивать его вслепую было бы ставкой
+    # на его молчание.
+    with open(target, encoding="utf-8", newline="") as f:
+        head = f.readline().rstrip("\n").rstrip("\r")
+    if head == HEADER_SRC_LINE:
+        tails[1] = (COL_BATCH, COL_MODE)
+
+    before, after = _rewrite(target, {}, tails_by_line=tails)
+    return SetBatchResult(lot, want, stamped, already, tuple(no_source), tuple(missing),
+                          tuple(sorted(modes.items())), before, after)
+
+
+def withdraw(number=None, day=None, who=None, source=None, batch=BATCH_ANY, path=None, now=None):
     """Снять уроки одним из ЧЕТЫРЁХ разрезов: `number=` (один урок), `day=` (все за сутки),
     `who=` (всё записанное одним человеком), `source=` (ВЕСЬ НАБОР одного происхождения).
     → WithdrawResult.
+
+    `batch=` — СУЖЕНИЕ разреза `source=` до ОДНОЙ ЗАЛИВКИ. Без него снимается весь набор, все
+    его партии, — это ШИРЕ, а не другое, и прежние вызовы значат ровно то, что значили.
+    `batch=BATCH_UNKNOWN` — прицельно строки набора БЕЗ номера заливки (те, что легли до 20.09).
 
     Строки НЕ УДАЛЯЮТСЯ: меняется только поле состояния, след остаётся. `lines_before` и
     `lines_after` в ответе — это доказательство числом, что ни одна строка не пропала.
@@ -1048,6 +1475,12 @@ def withdraw(number=None, day=None, who=None, source=None, path=None, now=None):
         raise ValueError("снятие требует РОВНО одного разреза из четырёх "
                          "(number=/day=/who=/source=), передано: %d" % len(named))
     cut, key = named[0]
+    # ПАРТИЯ — НЕ ПЯТЫЙ ВХОД, А СУЖЕНИЕ ЧЕТВЁРТОГО. Отдельным разрезом она быть не может: номер
+    # заливки без источника ни на что не указывает (заливка №1 есть у каждого набора), и принять
+    # его одного значило бы снять по номеру строки ЧУЖИХ наборов.
+    if batch is not BATCH_ANY and cut != CUT_SOURCE:
+        raise ValueError("снятие по партии требует НАЗВАННОГО источника (source=…): номер "
+                         "заливки без набора ни на что не указывает. Ничего не тронуто")
     if cut == CUT_ONE:
         key = int(key)
     elif cut == CUT_DAY:
@@ -1058,6 +1491,15 @@ def withdraw(number=None, day=None, who=None, source=None, path=None, now=None):
             raise ValueError("снятие набора: источник %r мне неизвестен (знаю %s). Ничего не "
                              "тронуто" % (key, ", ".join(SOURCES)))
         key = norm_source(canon)
+        if batch is not BATCH_ANY:
+            # Разрез МЕНЯЕТСЯ на `партия`, и это видно в самой строке: `снят(партия;штамп)`
+            # против `снят(источник;штамп)`. Иначе владелец, глядя в таблицу, не отличил бы
+            # снятие одной поставки от снятия всего набора.
+            lot = norm_batch(batch) if batch is not BATCH_UNKNOWN else BATCH_UNKNOWN
+            if batch is not BATCH_UNKNOWN and lot is BATCH_UNKNOWN:
+                raise ValueError("снятие заливки: номер %r не читается (нужно целое больше "
+                                 "нуля). Ничего не тронуто" % (batch,))
+            cut, key = CUT_BATCH, (key, lot)
     else:
         key = norm_who(key)
 
@@ -1171,8 +1613,9 @@ def _raw_fields(target, lineno):
             if idx != lineno:
                 continue
             parts = line.rstrip("\n").rstrip("\r").split("\t")
-            # ОБЕ ширины целые. Строка старого формата остаётся полноправной: её по-прежнему можно
-            # перевести в действующие и откатить — хвост источника к этому отношения не имеет.
+            # ВСЕ ТРИ ширины целые. Строка старого формата остаётся полноправной: её по-прежнему
+            # можно перевести в действующие и откатить — хвосты источника, партии и режима к
+            # этому отношения не имеют.
             return parts if len(parts) in WIDTHS else None
     return None
 
@@ -1385,9 +1828,42 @@ ACT_BATCH_BACK = "возврат_набора"
 # считалось уже закрытым, и возврат отвечал «снятия в следе нет» при живом снятом наборе (тест
 # `test_off_back_off_again_returns_the_right_withdrawal` красил это до правки). Штамп секундный,
 # и опираться на его уникальность нельзя ни в одной ветке.
-BATCH_COLUMNS = ("когда", "действие", "движение", "ключ", "кто", "почему", "номер",
-                 "было_состояние", "стало_состояние", "всего", "ссылка")
+#
+# ГРАФА `партия` ДОПИСАНА В ХВОСТ 20.09.2026 — и именно в хвост, а не в середину: след, лежащий
+# в файле с 09.09, обязан читаться тем же кодом. Читатель принимает ОБЕ ширины (одиннадцать без
+# партии и двенадцать с ней), и у старой строки партия — третий исход, а не первая заливка.
+BATCH_COLUMNS_BASE = ("когда", "действие", "движение", "ключ", "кто", "почему", "номер",
+                      "было_состояние", "стало_состояние", "всего", "ссылка")
+BATCH_COLUMNS = BATCH_COLUMNS_BASE + (COL_BATCH,)
+BATCH_WIDTHS = (len(BATCH_COLUMNS_BASE), len(BATCH_COLUMNS))
 BATCH_HEADER = "\t".join(BATCH_COLUMNS)
+BATCH_HEADER_BASE = "\t".join(BATCH_COLUMNS_BASE)
+IDX_TRACE_BATCH = BATCH_COLUMNS.index(COL_BATCH)
+# ТРИ ЗНАЧЕНИЯ ГРАФЫ `партия` В СЛЕДЕ, И ПУСТО — НЕ ОДНО ИЗ ДВУХ, А ТРЕТЬЕ. Пусто значит «ключом
+# движения была не заливка, а ВЕСЬ набор» (так же читается и строка старого следа, где графы нет
+# вовсе). Строки НАБОРА БЕЗ НОМЕРА заливки — свой ключ, и он называется словом: спутай эти два, и
+# возврат «строк без номера» отменил бы снятие всего набора.
+BATCH_NONE_MARK = "без_номера"
+
+
+def _trace_batch_of(parts):
+    """Поля строки следа → ключ заливки: `BATCH_ANY` (снимали весь набор), `BATCH_UNKNOWN`
+    (снимали строки без номера) либо номер."""
+    if len(parts) <= IDX_TRACE_BATCH:
+        return BATCH_ANY
+    text = unesc(parts[IDX_TRACE_BATCH]).strip()
+    if text == "":
+        return BATCH_ANY
+    if text == BATCH_NONE_MARK:
+        return BATCH_UNKNOWN
+    return norm_batch(text)
+
+
+def say_trace_batch(lot):
+    """Ключ заливки движения → слова для человека."""
+    if lot is BATCH_ANY:
+        return "весь набор"
+    return SAY_BATCH_UNKNOWN if lot is BATCH_UNKNOWN else "заливка №%d" % lot
 
 REASON_BATCH_UNKNOWN = ("набор НЕ снят: источник «%s» мне неизвестен (знаю %s). Ничего не "
                         "тронуто — снимать по неизвестному ключу нечего")
@@ -1420,11 +1896,18 @@ REASON_BACK_MOVED = ("набор «%s» НЕ возвращён: урок #%s п
                      "тронуто — смотрите след набора и решайте словами")
 REASON_BACK_MISSING = "набор «%s» НЕ возвращён: урока #%s, снятого этим движением, в таблице нет"
 
+REASON_BATCH_LOT_BAD = ("набор НЕ снят: номер заливки «%s» не читается (нужно целое больше нуля "
+                        "либо «без номера»). Ничего не тронуто")
+REASON_BATCH_LOT_EMPTY = ("заливка №%d набора «%s» НЕ снята: снимать нечего — ни одной "
+                          "действующей строки и ни одного кандидата с этим номером в таблице "
+                          "нет. Посмотрите, какие заливки есть, и повторите")
+
 BatchCard = namedtuple("BatchCard",
-                       "source rows movable withdrawn numbers first last who census")
+                       "source batch rows movable withdrawn numbers first last who census "
+                       "lots modes")
 BatchTrace = namedtuple("BatchTrace",
                         "stamp act move source who why number prev_state new_state total ref "
-                        "line")
+                        "line batch")
 BatchResult = namedtuple("BatchResult",
                          "ok source count numbers reason lines_before lines_after who why stamp")
 
@@ -1435,12 +1918,18 @@ def batch_log_path(path=None):
     return _path(path) + BATCH_LOG_SUFFIX
 
 
-def _batch_rows(lessons, key):
+def _batch_rows(lessons, key, batch=BATCH_ANY):
     """Строки набора → (снимаемые, уже снятые). Разрез берётся у `_matches`, а не пишется здесь
-    вторым: разъехаться охвату показа с охватом снятия нечем."""
+    вторым: разъехаться охвату показа с охватом снятия нечем.
+
+    `batch` сужает до одной заливки — ТЕМ ЖЕ выбором разреза, каким сужает `withdraw`, и по той
+    же причине: карточка обязана показывать ровно то множество, которое уедет."""
+    cut = CUT_SOURCE if batch is BATCH_ANY else CUT_BATCH
+    if batch is not BATCH_ANY:
+        key = (key, norm_batch(batch) if batch is not BATCH_UNKNOWN else BATCH_UNKNOWN)
     movable, withdrawn = [], []
     for les in lessons:
-        if not _matches(les, CUT_SOURCE, key):
+        if not _matches(les, cut, key):
             continue
         # Кандидат уходит вместе с действующим — тем же доводом, что в `withdraw`: иначе
         # ошибочно залитый набор оставил бы за собой кандидатов, которых нечем вынуть.
@@ -1448,28 +1937,44 @@ def _batch_rows(lessons, key):
     return tuple(movable), tuple(withdrawn)
 
 
-def batch_card(source, path=None):
+def batch_card(source, path=None, batch=BATCH_ANY):
     """ШАГ ПЕРВЫЙ: что это за набор → (ок, причина словами, BatchCard | None). ТОЛЬКО ЧТЕНИЕ.
 
-    Отвечает на четыре вопроса решения: КЛЮЧ, СКОЛЬКО уроков уйдёт, КОГДА залит (первый и
-    последний штамп) и КЕМ записан. Число `movable` — это ровно то, что владелец обязан назвать
-    в подтверждении, и берётся оно тем же `_matches`, каким снимает `withdraw`."""
+    Отвечает на вопросы решения: КЛЮЧ, СКОЛЬКО уроков уйдёт, СКОЛЬКО ЗАЛИВОК уйдёт, КОГДА залит
+    (первый и последний штамп), КЕМ записан и в каком РЕЖИМЕ лежат строки. Число `movable` — это
+    ровно то, что владелец обязан назвать в подтверждении, и берётся оно тем же `_matches`, каким
+    снимает `withdraw`.
+
+    `lots` — перепись заливок ({(источник, партия): строк}) ПО ТОМУ ЖЕ множеству, что уедет.
+    Она и есть ответ на «две заливки снимутся вместе или порознь»: при `batch=BATCH_ANY` в ней
+    больше одной строки — значит одним движением уедут обе, и это видно ДО движения, а не после.
+    `modes` — перепись режимов того же множества: снимать «обучение» и «бой» вслепую одним
+    ключом владелец больше не обязан."""
     canon = known_source(source)
     if canon is None:
         return False, REASON_BATCH_UNKNOWN % (str(source).strip(), ", ".join(SOURCES)), None
+    if batch is not BATCH_ANY and batch is not BATCH_UNKNOWN and norm_batch(batch) is BATCH_UNKNOWN:
+        return False, REASON_BATCH_LOT_BAD % str(batch).strip(), None
     store = load(path)
-    rows = by_source(store.lessons, canon)
-    movable, withdrawn = _batch_rows(store.lessons, norm_source(canon))
+    lot = batch if batch in (BATCH_ANY, BATCH_UNKNOWN) else norm_batch(batch)
+    rows = by_batch(store.lessons, canon, lot)
+    movable, withdrawn = _batch_rows(store.lessons, norm_source(canon), lot)
     stamps = sorted(les.when for les in rows)
     authors = tuple(sorted({les.who.strip() for les in rows if les.who.strip()}))
-    return True, "", BatchCard(canon, len(rows), len(movable), len(withdrawn),
+    return True, "", BatchCard(canon, lot, len(rows), len(movable), len(withdrawn),
                                tuple(les.number for les in movable),
                                stamps[0] if stamps else "", stamps[-1] if stamps else "",
-                               authors, sources_census(store.lessons))
+                               authors, sources_census(store.lessons),
+                               batches_census(rows), modes_census(rows))
 
 
-def load_batch_trace(path=None, source=None):
-    """След наборов → кортеж BatchTrace в порядке файла (`source=` — только этот ключ).
+def load_batch_trace(path=None, source=None, batch=BATCH_ANY):
+    """След наборов → кортеж BatchTrace в порядке файла (`source=` — только этот ключ,
+    `batch=` — только эта заливка).
+
+    ОБЕ ШИРИНЫ СТРОКИ ЗАКОННЫ: одиннадцать граф (след до 20.09, партии в нём не было вовсе) и
+    двенадцать. У строки старого следа партия — ТРЕТИЙ ИСХОД, а не первая заливка: объявить её
+    заливкой №1 значило бы соврать про движение, которого мы не видели.
 
     Битая строка пропускается для читателя, но из файла не исчезает: стирающих веток у следа
     нет ни одной."""
@@ -1477,14 +1982,15 @@ def load_batch_trace(path=None, source=None):
     if not os.path.exists(log_path):
         return ()
     key = norm_source(source) if source is not None else None
+    want_lot = batch if batch in (BATCH_ANY, BATCH_UNKNOWN) else norm_batch(batch)
     out = []
     with open(log_path, encoding="utf-8", newline="") as f:
         for idx, line in enumerate(f, start=1):
             body = line.rstrip("\n").rstrip("\r")
-            if idx == 1 and body == BATCH_HEADER:
+            if idx == 1 and body in (BATCH_HEADER, BATCH_HEADER_BASE):
                 continue
             parts = body.split("\t")
-            if len(parts) != len(BATCH_COLUMNS):
+            if len(parts) not in BATCH_WIDTHS:
                 continue
             move = _leading_number(parts[2])
             number = _leading_number(parts[6])
@@ -1493,9 +1999,12 @@ def load_batch_trace(path=None, source=None):
                 continue
             if key is not None and norm_source(parts[3]) != key:
                 continue
+            lot = _trace_batch_of(parts)
+            if want_lot is not BATCH_ANY and lot != want_lot:
+                continue
             out.append(BatchTrace(parts[0], parts[1], move, parts[3], unesc(parts[4]),
                                   unesc(parts[5]), number, parts[7], parts[8], total,
-                                  parts[10], idx))
+                                  parts[10], idx, lot))
     return tuple(out)
 
 
@@ -1510,14 +2019,18 @@ def _next_batch_move(path=None):
     return top + 1
 
 
-def open_batch_withdrawal(path=None, source=None):
+def open_batch_withdrawal(path=None, source=None, batch=BATCH_ANY):
     """ПОСЛЕДНЕЕ снятие набора, которое ещё НЕ возвращено → кортеж строк следа (пусто — нет).
+
+    `batch=` сужает до одной заливки: сняли партию 1, потом партию 2 — вернуть надо ТУ, которую
+    назвали, а не последнюю по времени. Без сужения поведение прежнее (последнее незакрытое
+    движение этого ключа), и прежние вызывающие значат ровно то, что значили.
 
     «Не возвращено» судится ССЫЛКОЙ НА НОМЕР ДВИЖЕНИЯ, а не порядком строк и не штампом: возврат
     пишет в графу `ссылка` номер того снятия, которое отменил. Судить «по последнему движению»
     было бы неверно на паре снял → вернул → снял (там последнее снятие старше последнего
     возврата, но открыто именно оно), а судить по штампу — неверно внутри одной секунды."""
-    seen = load_batch_trace(path, source=source)
+    seen = load_batch_trace(path, source=source, batch=batch)
     closed = {_leading_number(t.ref) for t in seen if t.act == ACT_BATCH_BACK}
     closed.discard(None)
     groups, order = {}, []
@@ -1541,9 +2054,13 @@ def _batch_trace_append(log_path, rows):
         need_header = False
 
 
-def batch_withdraw(source, count=None, why="", who="", path=None, now=None):
-    """ШАГ ВТОРОЙ: снять ВЕСЬ набор `source`, названный ключом И числом строк `count`.
+def batch_withdraw(source, count=None, why="", who="", path=None, now=None, batch=BATCH_ANY):
+    """ШАГ ВТОРОЙ: снять набор `source`, названный ключом И числом строк `count`.
     → BatchResult (не бросает: отказ — это ответ, а не исключение).
+
+    `batch=` сужает ключ до ОДНОЙ ЗАЛИВКИ. Это и есть замок от класса «второй экспорт снялся
+    вместе с первым»: без номера ключ значит ВЕСЬ набор (шире, а не другое), с номером —
+    ровно одну поставку, и вторая остаётся лежать действующей.
 
     ПОРЯДОК ОТКАЗОВ ВЫБРАН, А НЕ СЛУЧИЛСЯ. Ключ → автор → причина → число → сверка числа.
     Причина спрашивается РАНЬШЕ числа сознательно: «почему» — единственное жёсткое требование
@@ -1557,9 +2074,18 @@ def batch_withdraw(source, count=None, why="", who="", path=None, now=None):
     без записи о снятии — то есть строки, которые нечем вернуть.
 
     ПРАВКУ ДЕЛАЕТ `withdraw(source=…)`, а не своя копия цикла: второй писатель разошёлся бы с
-    первым молча. Штамп передаётся ему тот же (`now`), поэтому состояние в таблице и графа
-    `стало_состояние` следа — одни и те же байты."""
-    stamp = now_stamp(now)
+    первым молча. Штамп передаётся ему тот же, поэтому состояние в таблице и графа
+    `стало_состояние` следа — одни и те же байты.
+
+    ЗАМЕРЕННАЯ МИНА (20.09.2026, 1 срыв на 25 прогонов). «Тот же штамп» до этой правки держался
+    на передаче `now=None` — а `None` значит «спроси часы», и часы спрашивались ДВАЖДЫ: здесь и
+    внутри `withdraw`. Переступи вызов границу секунды между ними — след говорил 22:44:23,
+    строка получала 22:44:24, и возврат честно отказывал («урок после снятия изменился») на
+    наборе, которого никто не трогал. То есть НЕВОЗВРАТНОЕ снятие, и ровно на живой дороге:
+    в тестах `now` обычно назван числом и мины не видно. Мгновение берётся ОДИН раз и едет вниз
+    числом; `None` дальше этой строки не уходит."""
+    moment = time.time() if now is None else now
+    stamp = now_stamp(moment)
     author = who.strip() if isinstance(who, str) else ""
     # `isinstance`, а не `why or ""`: вторая форма схлопывает «не передали» и «передали пустое»
     # в одно, и `0`/`[]`, приехавшие сюда по ошибке вызывающего, стали бы неотличимы от честной
@@ -1572,6 +2098,12 @@ def batch_withdraw(source, count=None, why="", who="", path=None, now=None):
         return BatchResult(False, None, 0, (),
                            REASON_BATCH_UNKNOWN % (str(source).strip(), ", ".join(SOURCES)),
                            0, 0, author, reason_text, stamp)
+    # НОМЕР ЗАЛИВКИ СУДИТСЯ СРАЗУ ЗА КЛЮЧОМ и ДО автора с причиной: он — часть ключа, а пока не
+    # понято, О ЧЁМ речь, остальные вопросы задавать не о чем (тот же порядок, что у источника).
+    if batch is not BATCH_ANY and batch is not BATCH_UNKNOWN and norm_batch(batch) is BATCH_UNKNOWN:
+        return BatchResult(False, canon, 0, (), REASON_BATCH_LOT_BAD % str(batch).strip(),
+                           0, 0, author, reason_text, stamp)
+    lot = batch if batch in (BATCH_ANY, BATCH_UNKNOWN) else norm_batch(batch)
     if len(author) == 0:
         return BatchResult(False, canon, 0, (), REASON_BATCH_NO_WHO, 0, 0, author,
                            reason_text, stamp)
@@ -1589,16 +2121,19 @@ def batch_withdraw(source, count=None, why="", who="", path=None, now=None):
         return BatchResult(False, canon, named, (), REASON_BATCH_NO_TABLE % canon, 0, 0,
                            author, reason_text, stamp)
     lines = _count_lines(target)
-    movable, _already = _batch_rows(store.lessons, norm_source(canon))
+    movable, _already = _batch_rows(store.lessons, norm_source(canon), lot)
     if len(movable) == 0:
-        return BatchResult(False, canon, named, (), REASON_BATCH_EMPTY % canon, lines, lines,
+        empty = (REASON_BATCH_EMPTY % canon if lot is BATCH_ANY
+                 else REASON_BATCH_LOT_EMPTY % (lot, canon) if lot is not BATCH_UNKNOWN
+                 else REASON_BATCH_EMPTY % canon)
+        return BatchResult(False, canon, named, (), empty, lines, lines,
                            author, reason_text, stamp)
     if named != len(movable):
         return BatchResult(False, canon, named, tuple(les.number for les in movable),
                            REASON_BATCH_COUNT % (canon, named, len(movable)), lines, lines,
                            author, reason_text, stamp)
 
-    new_state = withdrawn_state(CUT_SOURCE, stamp)
+    new_state = withdrawn_state(CUT_SOURCE if lot is BATCH_ANY else CUT_BATCH, stamp)
     move = _next_batch_move(path)
     rows = []
     for les in movable:
@@ -1609,17 +2144,25 @@ def batch_withdraw(source, count=None, why="", who="", path=None, now=None):
             return BatchResult(False, canon, named, (),
                                REASON_BATCH_BROKEN % (canon, les.number),
                                lines, lines, author, reason_text, stamp)
+        # ПАРТИЯ В СЛЕД ПИШЕТСЯ ИЗ КЛЮЧА ДВИЖЕНИЯ, а не из строки урока: движение снимало ИМЕННО
+        # эту заливку, и возврат обязан искать себя по ключу, которым снимали. При снятии всего
+        # набора графа пуста — это честно, снимали не заливку.
         rows.append((stamp, ACT_BATCH_OFF, str(move), canon, esc(author), esc(reason_text),
-                     str(les.number), raw[IDX_STATE], new_state, str(len(movable)), ""))
+                     str(les.number), raw[IDX_STATE], new_state, str(len(movable)), "",
+                     "" if lot is BATCH_ANY
+                     else BATCH_NONE_MARK if lot is BATCH_UNKNOWN else str(lot)))
     _batch_trace_append(batch_log_path(path), rows)
-    res = withdraw(source=canon, path=path, now=now)
+    res = withdraw(source=canon, batch=lot, path=path, now=moment)
     return BatchResult(True, canon, len(res.marked), tuple(res.marked), "",
                        res.lines_before, res.lines_after, author, reason_text, stamp)
 
 
-def batch_restore(source, who="", path=None, now=None):
+def batch_restore(source, who="", path=None, now=None, batch=BATCH_ANY):
     """ВОЗВРАТ набора `source` — ОДНО движение, обратное последнему незакрытому снятию.
     → BatchResult (не бросает).
+
+    `batch=` называет, КАКУЮ ЗАЛИВКУ возвращать. Без него возвращается последнее незакрытое
+    движение этого ключа — прежнее поведение, слово в слово.
 
     Возвращает РОВНО ТЕ БАЙТЫ состояния, которые лежали до снятия (у одних строк это `актив`,
     у других `кандидат`, у третьих — снятие ПРЕЖНИМ разрезом): состояние берётся из следа, а не
@@ -1647,7 +2190,7 @@ def batch_restore(source, who="", path=None, now=None):
     if len(author) == 0:
         return BatchResult(False, canon, 0, (), REASON_BACK_NO_WHO, 0, 0, author, "", stamp)
 
-    opened = open_batch_withdrawal(path, source=canon)
+    opened = open_batch_withdrawal(path, source=canon, batch=batch)
     if len(opened) == 0:
         return BatchResult(False, canon, 0, (), REASON_BACK_NO_TRACE % canon, 0, 0, author,
                            "", stamp)
@@ -1675,8 +2218,14 @@ def batch_restore(source, who="", path=None, now=None):
     before, after = _rewrite(target, edits)
     ref = opened[0].move
     move = _next_batch_move(path)
+    # Ключ заливки в строке возврата — ТОТ ЖЕ, что в отменяемом снятии, и взят из следа, а не с
+    # входа: возврат отменяет движение, а не пересказывает намерение вызывающего.
+    back_lot = ("" if opened[0].batch is BATCH_ANY
+                else BATCH_NONE_MARK if opened[0].batch is BATCH_UNKNOWN
+                else str(opened[0].batch))
     back_rows = [(stamp, ACT_BATCH_BACK, str(move), canon, esc(author), esc(opened[0].why),
-                  str(t.number), t.new_state, t.prev_state, str(len(opened)), str(ref))
+                  str(t.number), t.new_state, t.prev_state, str(len(opened)), str(ref),
+                  back_lot)
                  for t in opened]
     _batch_trace_append(batch_log_path(path), back_rows)
     return BatchResult(True, canon, len(opened), tuple(t.number for t in opened), "",
@@ -1758,9 +2307,10 @@ def integrity(path=None):
 # CLI
 # ---------------------------------------------------------------------------------------
 def _render(lesson):
-    return ("#%d [%s] %s | %s | набор: %s\n    вопрос: %s\n    ответил бот: %s\n"
+    return ("#%d [%s] %s | %s | набор: %s | %s | %s\n    вопрос: %s\n    ответил бот: %s\n"
             "    как правильно: %s\n    почему: %s"
             % (lesson.number, lesson.state, lesson.who, lesson.when, say_source(lesson.source),
+               say_batch(lesson.batch), say_mode(lesson.mode),
                lesson.question, lesson.bot_answer, lesson.correct, lesson.why))
 
 
@@ -1776,6 +2326,10 @@ def main(argv=None):
     ap.add_argument("--who", help="только уроки этого человека")
     ap.add_argument("--day", help="только уроки за сутки ГГГГ-ММ-ДД")
     ap.add_argument("--source", help="только уроки этого набора (%s)" % ", ".join(SOURCES))
+    ap.add_argument("--batch", help="только уроки этой заливки (число; «-» — строки без номера); "
+                                    "требует --source")
+    ap.add_argument("--mode", help="только уроки этого режима (%s; «-» — режим неизвестен)"
+                                   % ", ".join(MODES))
     ap.add_argument("--path", help="другой файл таблицы (по умолчанию %s)" % STORE_NAME)
     args = ap.parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -1815,6 +2369,14 @@ def main(argv=None):
         # своим словом, а не свалены в первый попавшийся источник.
         census = sources_census(store.lessons)
         print("наборы: %s" % ("; ".join("%s — %d" % pair for pair in census) or "—"))
+        # ЗАЛИВКИ И РЕЖИМЫ ЧИСЛАМИ — по тому же доводу, что наборы: без них не видно ни того,
+        # что одним ключом уедут две поставки, ни того, сколько строк лежит без названного режима.
+        lots = batches_census(store.lessons)
+        print("заливки: %s" % ("; ".join("%s/%s — %d" % (src, num if num is not BATCH_UNKNOWN
+                                                         else "без номера", cnt)
+                                          for (src, num), cnt in lots) or "—"))
+        print("режимы: %s" % ("; ".join("%s — %d" % pair
+                                        for pair in modes_census(store.lessons)) or "—"))
         print(integ.say)
         return 0
 
@@ -1825,6 +2387,18 @@ def main(argv=None):
         rows = by_day(rows, args.day)
     if args.source is not None:
         rows = by_source(rows, args.source)
+    if args.batch is not None:
+        if args.source is None:
+            print("--batch требует --source: номер заливки без набора ни на что не указывает")
+            return 2
+        rows = by_batch(rows, args.source, batch_key(args.batch))
+    if args.mode is not None:
+        want = None if args.mode.strip() == "-" else known_mode(args.mode)
+        if want is None and args.mode.strip() != "-":
+            print("--mode: режим «%s» мне неизвестен (знаю %s)"
+                  % (args.mode.strip(), ", ".join(MODES)))
+            return 2
+        rows = tuple(les for les in rows if les.mode == want)
     if not args.all:
         rows = active(rows)
     for les in rows:

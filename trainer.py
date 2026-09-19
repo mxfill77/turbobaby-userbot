@@ -1972,22 +1972,27 @@ STATUS_BATCH_OFF = "batch_withdrawn"
 STATUS_BATCH_BACK = "batch_restored"
 
 
-def _default_batch_withdraw(source, count, why, who, path=None, now=None):
+def _default_batch_withdraw(source, count, why, who, path=None, now=None, batch=None):
     import lesson_store
-    return lesson_store.batch_withdraw(source, count=count, why=why, who=who, path=path, now=now)
+    return lesson_store.batch_withdraw(source, count=count, why=why, who=who, path=path, now=now,
+                                       batch=lesson_store.batch_key(batch))
 
 
-def _default_batch_restore(source, who, path=None, now=None):
+def _default_batch_restore(source, who, path=None, now=None, batch=None):
     import lesson_store
-    return lesson_store.batch_restore(source, who=who, path=path, now=now)
+    return lesson_store.batch_restore(source, who=who, path=path, now=now,
+                                      batch=lesson_store.batch_key(batch))
 
 
-def _batch_card(source, card=None, path=None):
-    """ШАГ ПЕРВЫЙ словами: что за набор и что уйдёт. ТОЛЬКО ЧТЕНИЕ, права не спрашивает."""
+def _batch_card(source, card=None, path=None, batch=None):
+    """ШАГ ПЕРВЫЙ словами: что за набор и что уйдёт. ТОЛЬКО ЧТЕНИЕ, права не спрашивает.
+
+    `batch` — СЛОВО ВЛАДЕЛЬЦА о заливке (не названо → весь набор, «-» → строки без номера,
+    число → одна поставка). В ключ оно переводится ОДНИМ местом (`lesson_store.batch_key`)."""
+    import lesson_store
     if card is None:
-        import lesson_store
         card = lesson_store.batch_card
-    ok, reason, got = card(source, path=path)
+    ok, reason, got = card(source, path=path, batch=lesson_store.batch_key(batch))
     if not ok:
         return {"status": STATUS_REFUSED, "source": None, "reason": reason,
                 "card": f"⛔ {reason}."}
@@ -1998,20 +2003,34 @@ def _batch_card(source, card=None, path=None):
                         + ("; ".join("%s — %d" % pair for pair in got.census) or "—")}
     who_say = ", ".join("@" + name for name in got.who) or "— автор не записан"
     when_say = got.first if got.first == got.last else f"{got.first} … {got.last}"
+    # СКОЛЬКО ЗАЛИВОК УЙДЁТ — числом и ДО движения. Ради этой строки партия и заводилась: без неё
+    # владелец узнавал бы, что одним ключом уехали две поставки, только после снятия.
+    lots_say = "; ".join(
+        ("№%d" % num if num is not lesson_store.BATCH_UNKNOWN else "без номера") + f" — {cnt}"
+        for (_src, num), cnt in got.lots) or "—"
+    modes_say = "; ".join("%s — %d" % pair for pair in got.modes) or "—"
+    key_say = (got.source if got.batch is lesson_store.BATCH_ANY
+               else f"{got.source}, "
+                    + lesson_store.say_trace_batch(got.batch))
+    lot_arg = ("" if got.batch is lesson_store.BATCH_ANY
+               else " " + (lesson_store.BATCH_KEY_NONE
+                           if got.batch is lesson_store.BATCH_UNKNOWN else str(got.batch)))
     return {"status": "shown", "source": got.source, "count": got.movable,
-            "numbers": got.numbers,
-            "card": f"📦 Набор «{got.source}» — {got.rows} строк(и) в таблице.\n"
+            "numbers": got.numbers, "batch": got.batch,
+            "card": f"📦 Набор «{key_say}» — {got.rows} строк(и) в таблице.\n"
                     f"📌 Снять сейчас можно: {got.movable} (действующие и кандидаты); "
                     f"уже снято раньше: {got.withdrawn}.\n"
+                    f"📌 Заливки, которые уйдут этим ключом: {lots_say}\n"
+                    f"📌 Режимы строк: {modes_say}\n"
                     f"📌 Залит: {when_say}\n"
                     f"📌 Записал: {who_say}\n"
                     f"➡️ Чтобы снять, назови объект ЦЕЛИКОМ — ключ и число: "
-                    f"«урок набор сними {got.source} {got.movable}: причина словами». "
-                    f"Вернуть потом — «урок набор верни {got.source}»."}
+                    f"«урок набор сними {got.source}{lot_arg} {got.movable}: причина словами». "
+                    f"Вернуть потом — «урок набор верни {got.source}{lot_arg}»."}
 
 
 def _withdraw_batch(source, count=None, why=None, who=None, may_write=None, withdraw=None,
-                    get=None, now=None, path=None):
+                    get=None, now=None, path=None, batch=None):
     """Ядро withdraw_batch (может бросить — снаружи fail-safe обёртка)."""
     author = _actor_for(who, get=get, now=now)
     if not author:
@@ -2025,7 +2044,8 @@ def _withdraw_batch(source, count=None, why=None, who=None, may_write=None, with
     # Причина едет ДОСЛОВНО, включая «не передали» (`None`): нормализует её ОДНО место —
     # `lesson_store.batch_withdraw`. Подставить здесь `why or ""` значило бы завести второе
     # место, решающее, что такое «причины нет», и разъехаться с первым молча.
-    res = (withdraw or _default_batch_withdraw)(source, count, why, author, path=path, now=now)
+    res = (withdraw or _default_batch_withdraw)(source, count, why, author, path=path, now=now,
+                                                batch=batch)
     if not res.ok:
         return {"status": STATUS_REFUSED, "source": res.source, "who": author,
                 "reason": res.reason, "card": f"⛔ {res.reason}."}
@@ -2042,8 +2062,11 @@ def _withdraw_batch(source, count=None, why=None, who=None, may_write=None, with
 
 
 def withdraw_batch(source, count=None, why=None, who=None, may_write=None, withdraw=None,
-                   get=None, now=None, path=None):
-    """«урок набор сними <ключ> <N>: причина» — СНЯТИЕ ВСЕГО НАБОРА одним движением.
+                   get=None, now=None, path=None, batch=None):
+    """«урок набор сними <ключ> [<партия>] <N>: причина» — СНЯТИЕ НАБОРА одним движением.
+
+    `batch` не назван — уходит ВЕСЬ набор, все заливки (прежнее поведение, слово в слово).
+    Назван — уходит РОВНО эта заливка, остальные остаются лежать действующими.
 
     Объект называется ЦЕЛИКОМ: ключ набора и число строк, которые уйдут. Число сверяется с живой
     таблицей — названо не то, отказ, и ничего не тронуто. Право — `moderation_core.may_write_rule`
@@ -2051,7 +2074,8 @@ def withdraw_batch(source, count=None, why=None, who=None, may_write=None, withd
     → dict(status, card, source, who, …) со статусами `batch_withdrawn` | `refused` | `denied` |
     `no_author` | `error`. НИКОГДА не бросает."""
     try:
-        return _withdraw_batch(source, count, why, who, may_write, withdraw, get, now, path)
+        return _withdraw_batch(source, count, why, who, may_write, withdraw, get, now, path,
+                               batch)
     except Exception as e:
         log.warning("withdraw_batch(%s) упал: %s: %s", source, type(e).__name__, e, exc_info=True)
         return {"status": "error", "source": None, "who": None,
@@ -2059,7 +2083,8 @@ def withdraw_batch(source, count=None, why=None, who=None, may_write=None, withd
                         "см. лог процесса. Команду можно повторить."}
 
 
-def _restore_batch(source, who=None, may_write=None, restore=None, get=None, now=None, path=None):
+def _restore_batch(source, who=None, may_write=None, restore=None, get=None, now=None, path=None,
+                   batch=None):
     """Ядро restore_batch (может бросить — снаружи fail-safe обёртка)."""
     author = _actor_for(who, get=get, now=now)
     if not author:
@@ -2068,7 +2093,7 @@ def _restore_batch(source, who=None, may_write=None, restore=None, get=None, now
     if not (may_write or _default_may_write)(author):
         return {"status": STATUS_DENIED, "source": None, "who": author,
                 "card": f"⛔ Нет прав — набор «{source}» НЕ возвращён."}
-    res = (restore or _default_batch_restore)(source, author, path=path, now=now)
+    res = (restore or _default_batch_restore)(source, author, path=path, now=now, batch=batch)
     if not res.ok:
         return {"status": STATUS_REFUSED, "source": res.source, "who": author,
                 "reason": res.reason, "card": f"⛔ {res.reason}."}
@@ -2082,15 +2107,17 @@ def _restore_batch(source, who=None, may_write=None, restore=None, get=None, now
                     f"было {res.lines_before}, стало {res.lines_after})."}
 
 
-def restore_batch(source, who=None, may_write=None, restore=None, get=None, now=None, path=None):
-    """«урок набор верни <ключ>» — ВОЗВРАТ набора, снятого последним незакрытым движением.
+def restore_batch(source, who=None, may_write=None, restore=None, get=None, now=None, path=None,
+                  batch=None):
+    """«урок набор верни <ключ> [<партия>]» — ВОЗВРАТ набора, снятого последним незакрытым
+    движением (а при названной партии — ИМЕННО той заливки).
 
     Возвращает РОВНО те состояния, что были до снятия (у одних строк `актив`, у других
     `кандидат`), а не «включает всё подряд». Право — то же `may_write_rule`.
     → dict(status, card, source, who, …) со статусами `batch_restored` | `refused` | `denied` |
     `no_author` | `error`. НИКОГДА не бросает."""
     try:
-        return _restore_batch(source, who, may_write, restore, get, now, path)
+        return _restore_batch(source, who, may_write, restore, get, now, path, batch)
     except Exception as e:
         log.warning("restore_batch(%s) упал: %s: %s", source, type(e).__name__, e, exc_info=True)
         return {"status": "error", "source": None, "who": None,
@@ -2098,13 +2125,14 @@ def restore_batch(source, who=None, may_write=None, restore=None, get=None, now=
                         f"({type(e).__name__}), см. лог процесса. Команду можно повторить."}
 
 
-def batch_card(source, card=None, path=None):
-    """«урок набор <ключ>» — ШАГ ПЕРВЫЙ: показать набор. ТОЛЬКО ЧТЕНИЕ, права не требует.
+def batch_card(source, card=None, path=None, batch=None):
+    """«урок набор <ключ> [<партия>]» — ШАГ ПЕРВЫЙ: показать набор. ТОЛЬКО ЧТЕНИЕ, права не
+    требует.
 
     → dict(status, card, source, count) со статусами `shown` | `empty` | `refused` | `error`.
     НИКОГДА не бросает."""
     try:
-        return _batch_card(source, card, path)
+        return _batch_card(source, card, path, batch)
     except Exception as e:
         log.warning("batch_card(%s) упал: %s: %s", source, type(e).__name__, e, exc_info=True)
         return {"status": "error", "source": None,

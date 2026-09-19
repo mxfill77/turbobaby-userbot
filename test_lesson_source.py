@@ -116,7 +116,9 @@ class TestTailIsOptional(_Sandbox):
     def test_new_row_carries_the_source_as_the_ninth_field(self):
         n = self.add_active("не пиши «уточню и вернусь»", LS.SOURCE_TRAINER)
         body = [ln for ln in self.raw().split("\n") if ln.strip()]
-        self.assertEqual(len(body[1].split("\t")), 9, "хвост источника не дописан")
+        # НОВАЯ строка с 20.09 полной ширины (11), но ИСТОЧНИК стои́т там же, где стоял, —
+        # девятым полем. Число названо точное: «не меньше девяти» пропустило бы сдвиг графы.
+        self.assertEqual(len(body[1].split("\t")), 11, "хвост партии и режима не дописан")
         self.assertEqual(body[1].split("\t")[LS.IDX_SOURCE], LS.SOURCE_TRAINER)
         got = LS.load(self.store).lessons[0]
         self.assertEqual(got.number, n)
@@ -590,7 +592,12 @@ class TestOnePlaceOnly(unittest.TestCase):
         text = self.src("lesson_store.py")
         self.assertNotIn("len(parts) != len(COLUMNS)", text,
                          "осталась сверка ширины с одной шириной — старая строка уедет в НЕРАЗБОР")
-        self.assertEqual(LS.WIDTHS, (8, 9))
+        self.assertNotIn("len(parts) != len(COLUMNS_SRC)", text,
+                         "сверка ширины с одной шириной вернулась вторым именем")
+        self.assertEqual(LS.WIDTHS, (8, 9, 11))
+        # ШИРИНЫ 10 В ФОРМАТЕ НЕТ И НЕ ДОЛЖНО БЫТЬ: хвост партии и режима растёт ПАРОЙ, иначе
+        # на полпути заводится строка, про которую нечего решать.
+        self.assertNotIn(10, LS.WIDTHS)
 
 
 if __name__ == "__main__":

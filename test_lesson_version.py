@@ -197,12 +197,17 @@ class TestSetSourceOnLegacyRows(_Sandbox):
         self.assertEqual(len(store.broken), 0, "перевод сделал строку неразбираемой")
 
     def test_header_grows_with_the_rows(self):
-        """Шапка переезжает вместе со строками: файл остаётся законным для читателя."""
+        """Шапка переезжает вместе со строками: файл остаётся законным для читателя.
+
+        `set_source` растит восьмиколоночную шапку РОВНО до девяти — не до одиннадцати: партию
+        и режим он не проставляет ни одной веткой, и шапка не смеет обещать граф, которых в
+        строках нет."""
         self.write_legacy(2)
         LS.set_source((1, 2), LS.SOURCE_BOOK, path=self.store)
         with open(self.store, encoding="utf-8", newline="") as f:
             head = f.readline().rstrip("\n").rstrip("\r")
-        self.assertEqual(head, LS.HEADER_LINE)
+        self.assertEqual(head, LS.HEADER_SRC_LINE)
+        self.assertIn(head, LS.HEADERS, "шапка после перевода не из законных")
 
     def test_unknown_source_is_refused_loudly(self):
         """Чужое значение источника — ГРОМКИЙ отказ через ту же дверь проверки, а не «0 строк»."""

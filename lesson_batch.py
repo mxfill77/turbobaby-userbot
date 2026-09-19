@@ -101,6 +101,12 @@ def main(argv=None):
                     help="сколько строк уйдёт — ЧАСТЬ ПОДТВЕРЖДЕНИЯ, обязательна при --off")
     ap.add_argument("--why", default="", help="причина снятия СЛОВАМИ (обязательна при --off)")
     ap.add_argument("--back", metavar="КЛЮЧ", help="вернуть набор, снятый последним движением")
+    # ПАРТИЯ — СУЖЕНИЕ КЛЮЧА, а не второй ключ: без неё всё работает ровно как вчера (весь
+    # набор), с ней уезжает одна поставка. Значение «-» — строки набора БЕЗ номера заливки,
+    # то есть легшие до 20.09.
+    ap.add_argument("--batch", metavar="N",
+                    help="номер ЗАЛИВКИ внутри набора: снять/показать/вернуть РОВНО её "
+                         "(«-» — строки без номера). Не названа — весь набор, как прежде")
     ap.add_argument("--census", action="store_true", help="перечислить наборы числами (чтение)")
     ap.add_argument("--trace", action="store_true", help="показать след наборов (чтение)")
     ap.add_argument("--path", help="другой файл таблицы (по умолчанию боевой lesson_store.tsv)")
@@ -115,7 +121,7 @@ def main(argv=None):
 
     import trainer
     if args.show is not None:
-        dec = trainer.batch_card(args.show, path=args.path)
+        dec = trainer.batch_card(args.show, path=args.path, batch=args.batch)
         print(dec["card"])
         return EXIT_OK if dec["status"] in ("shown", "empty") else EXIT_REFUSED
 
@@ -134,9 +140,9 @@ def main(argv=None):
         # `_leading_number`): второе разошлось бы с первым молча. Дверь передаёт названное как
         # есть, включая «не названо» (`None`).
         dec = trainer.withdraw_batch(args.off, count=args.count, why=args.why, who=args.who,
-                                     path=args.path)
+                                     path=args.path, batch=args.batch)
     else:
-        dec = trainer.restore_batch(args.back, who=args.who, path=args.path)
+        dec = trainer.restore_batch(args.back, who=args.who, path=args.path, batch=args.batch)
     print(dec["card"])
     return EXIT_OK if dec["status"] in ("batch_withdrawn", "batch_restored") else EXIT_REFUSED
 

@@ -498,17 +498,25 @@ class TestOneLineOneLesson(_Base):
             self.assertNotIn("\t", LS.esc(sample))
 
     def test_header_and_columns(self):
-        """НОВЫЙ файл получает девятиколоночную шапку; восемь прежних колонок стоят на прежних
-        местах, а источник дописан ХВОСТОМ (09.09.2026)."""
+        """НОВЫЙ файл получает ОДИННАДЦАТИколоночную шапку; восемь прежних колонок стоят на
+        прежних местах, источник — девятой (09.09.2026), партия и режим дописаны ХВОСТОМ
+        (20.09.2026). Число названо здесь ОДНО и точное: «не меньше» пропустило бы лишнюю графу,
+        появившуюся мимо решения."""
         self.add_live()
         first = self.raw().split("\n")[0]
         self.assertEqual(first, LS.HEADER_LINE)
         self.assertEqual(len(LS.COLUMNS_BASE), 8,
                          "обязательных колонок восемь: шесть полей + номер + состояние")
-        self.assertEqual(len(LS.COLUMNS), 9, "девятая — необязательный хвост «источник»")
+        self.assertEqual(len(LS.COLUMNS_SRC), 9, "девятая — необязательный хвост «источник»")
+        self.assertEqual(len(LS.COLUMNS), 11, "десятая и одиннадцатая — «партия» и «режим»")
         self.assertEqual(LS.COLUMNS[0], LS.COL_NUM)
         self.assertEqual(LS.COLUMNS_BASE[-1], LS.COL_STATE)
-        self.assertEqual(LS.COLUMNS[-1], LS.COL_SOURCE)
+        self.assertEqual(LS.COLUMNS_SRC[-1], LS.COL_SOURCE)
+        self.assertEqual(LS.COLUMNS[-2:], (LS.COL_BATCH, LS.COL_MODE))
+        # ХВОСТ НИЧЕГО НЕ СДВИНУЛ — замок на индексах, а не на глазах.
+        self.assertEqual(LS.COLUMNS[:9], LS.COLUMNS_SRC)
+        self.assertEqual(LS.IDX_STATE, 7)
+        self.assertEqual(LS.IDX_SOURCE, 8)
 
 
 class TestReaderSaysNonparse(_Base):
