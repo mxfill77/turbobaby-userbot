@@ -380,9 +380,11 @@ class TestReshow(Base):
         self.assertTrue(ok)
         self.assertEqual(len(send.calls), 1, "перепоказ РОВНО один")
         text = send.calls[0]["text"]
-        # счёт «пройдено K» — часть карточки с 12.09.2026, и перепоказ несёт её наравне с показом:
-        # сравнение с карточкой БЕЗ счёта расходилось бы на одну строку шапки
-        self.assertIn(exam_show.card_text(shot, passed=0), text)
+        # СЧЁТ И МЕСТО — часть карточки (счёт с 12.09.2026, место с 19.09.2026, задание 67l), и
+        # перепоказ несёт их наравне с показом: сравнение с карточкой БЕЗ них разошлось бы на
+        # шапку. Числа литералами, а не вызовом `case_place`: корпус тренажёра — 17 кейсов с
+        # id 1…17, кейс 1 в нём ПЕРВЫЙ, журнал вердиктов на этом стенде пуст.
+        self.assertIn(exam_show.card_text(shot, passed=0, judged=0, place=(1, 17)), text)
         self.assertTrue(text.startswith(exam_reshow.MARK))
         self.assertEqual(send.calls[0]["markup"], exam_show.markup(1, shot))
 
@@ -412,7 +414,7 @@ class TestOneCaseOneAddress(Base):
     def test_card_carries_all_five_parts(self):
         shot = _shot()
         text = exam_show.card_text(shot)
-        self.assertIn("кейс 1 из 17", text)
+        self.assertIn("кейс №1", text)
         self.assertIn(shot["question"], text)
         self.assertIn(shot["draft"], text)
         self.assertIn("ПОЧЕМУ так", text)
@@ -997,12 +999,50 @@ class TestHintsAreBornAtFreezeAndLiveInTheShot(Base):
 
 class TestTheCardIsAWorkplace(DeskBase):
     def test_the_header_carries_the_score(self):
-        card = exam_show.card_text(exam_show.load_shot(1), passed=3)
-        self.assertIn("кейс 1 из 17 · пройдено 3", card)
+        """Шапка: ИМЯ кейса, его МЕСТО, сколько судили и сколько верных — каждое своим именем.
+
+        Правка 19.09.2026 (67l). Прежняя редакция ждала «кейс 1 из 17 · пройдено 3» и была зелёной
+        на ТРЁХ подлогах разом: числитель «1» — это `id` кейса, а не его место; «17» — мощность
+        корпуса на день сборки СНИМКА; «пройдено» стои́т над числом ВЕРНЫХ, а этим словом на полосе
+        зовут другое (ворота: «пройдено N из 17» = кейс прошёл все чеки в двух прогонах). У
+        тренажёра id идут подряд 1…17, поэтому первые два подлога совпадали с правдой по
+        случайности и ни один тест их не видел."""
+        card = exam_show.card_text(exam_show.load_shot(1), passed=3, judged=5, place=(1, 17))
+        self.assertIn("кейс №1 · 1-й из 17 · судимых 5 · верных 3", card)
+        self.assertNotIn("пройдено", card, "слово ворот над чужой величиной")
+
+    def test_the_place_is_the_position_and_never_the_case_id(self):
+        """ЗАМОК 67l: «кейс 13 из 12» не собирается ни на одном корпусе.
+
+        Живой набор 19.09.2026: 12 кейсов с id [1, 13, 14 … 23] — они унаследованы от корпуса
+        тренажёра и подряд НЕ идут. Пара (id, сколько всего) давала владельцу номер БОЛЬШЕ
+        знаменателя; пара (место, сколько всего) не может дать его ни при каком корпусе."""
+        cases = [{"id": i} for i in [1, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]]
+        self.assertEqual(exam_show.case_place(13, cases), (2, 12))
+        self.assertEqual(exam_show.case_place(23, cases), (12, 12))
+        self.assertEqual(exam_show.case_place(99, cases), (None, 12))
+        card = exam_show.card_text(_shot(case=13, total=12), place=exam_show.case_place(13, cases))
+        self.assertIn("кейс №13 · 2-й из 12", card)
+        self.assertNotIn("кейс 13 из 12", card)
+        for pos, total in (exam_show.case_place(c["id"], cases) for c in cases):
+            self.assertLessEqual(pos, total, "место кейса обогнало знаменатель")
+
+    def test_the_place_is_measured_now_and_not_read_from_the_frozen_shot(self):
+        """Знаменатель — ЖИВОЙ корпус, а не `shot["total"]`, замороженный днём сборки.
+
+        Замер 19.09.2026: `exam_live/shots/case-1@881f421.json` несёт `total=1` — снимок собран,
+        когда в наборе был один кейс. Показ этого кейса сегодня, при двенадцати в корпусе, напечатал
+        бы «из 1»: число верное на день сборки и лживое на день показа."""
+        frozen = _shot(case=1, total=1)
+        card = exam_show.card_text(frozen, place=(1, 12))
+        self.assertIn("кейс №1 · 1-й из 12", card)
+        self.assertNotIn("из 1 ", card, "знаменатель взят из снимка, а не из живого корпуса")
 
     def test_the_score_is_absent_when_it_was_not_counted(self):
         """«Ноль» и «не считали» — разные новости; подставить первое вместо второго нельзя."""
-        self.assertNotIn("пройдено", exam_show.card_text(exam_show.load_shot(1)))
+        card = exam_show.card_text(exam_show.load_shot(1))
+        for word in ("верных", "судимых", "-й из"):
+            self.assertNotIn(word, card, word)
 
     def test_the_card_shows_observation_and_rule_of_every_hint(self):
         card = exam_show.card_text(exam_show.load_shot(1), passed=0)
@@ -1202,8 +1242,12 @@ class TestApplyWritesLessonsAndAdvances(DeskBase):
         ok, msg = self.tap("ok")
         self.assertTrue(ok, msg)
         self.assertEqual(len(self.send.calls), 1, "следующая карточка обязана уйти сама")
-        self.assertIn("кейс 2 из 17", self.send.calls[0]["text"])
-        self.assertIn("пройдено 1", self.send.calls[0]["text"], "счёт двинулся на зачтённый кейс")
+        self.assertIn("кейс №2 · 2-й из 17", self.send.calls[0]["text"])
+        # ДВА ЧИСЛА, А НЕ ОДНО (67l): «судимых» двигает ЛЮБОЙ вердикт, «верных» — только зачтённый.
+        # До 19.09 в шапке стояло одно число под именем «пройдено», и на «неверно» оно законно
+        # стояло на месте — владелец читал это как сломанный счётчик (9 таких тапов из 11 в живом
+        # журнале). Здесь тап «ok», поэтому двинулись оба.
+        self.assertIn("судимых 1 · верных 1", self.send.calls[0]["text"])
 
     def test_a_silent_telegram_does_not_undo_a_written_verdict(self):
         """Вердикт уже на диске: сорвавшийся показ следующего кейса не смеет его отменить."""
@@ -1253,7 +1297,7 @@ class TestOwnWordsLesson(DeskBase):
         rows = exam_show.load_verdicts(self.log)
         self.assertEqual([rows[0]["вердикт"], rows[0]["уроки"]], ["неверно", "1"])
         self.assertEqual(len(self.send.calls), 1)
-        self.assertIn("кейс 2 из 17", self.send.calls[0]["text"])
+        self.assertIn("кейс №2 · 2-й из 17", self.send.calls[0]["text"])
 
     def test_after_ten_minutes_the_waiting_is_over_and_nothing_is_written(self):
         self.start(now=1000)
@@ -2745,7 +2789,7 @@ class TestShowBesideTheExamRun(Base):
         self.assertTrue(ok, msg)
         text = send.calls[0]["text"]
         self.assertTrue(text.startswith("🆕 ПЕРВЫЙ ПОКАЗ"), text[:40])
-        self.assertIn(exam_show.card_text(shot, 1, passed=0), text)
+        self.assertIn(exam_show.card_text(shot, 1, passed=0, judged=0, place=(1, 17)), text)
         self.assertEqual(send.calls[0]["markup"], exam_show.markup(1, shot),
                          "шапка не смеет менять ни одной кнопки")
 
@@ -2757,7 +2801,8 @@ class TestShowBesideTheExamRun(Base):
             self.assertNotIn("шапка разовая", f.read())
         send = self.sender()
         exam_show.show(1, sender=send, agent_fn=self.fresh_agent())
-        self.assertEqual(send.calls[0]["text"], exam_show.card_text(shot, 1, passed=0))
+        self.assertEqual(send.calls[0]["text"],
+                         exam_show.card_text(shot, 1, passed=0, judged=0, place=(1, 17)))
 
     def test_a_live_cyrillic_note_travels_by_file_and_not_by_argv(self):
         """Шапка владельцу — ИЗ ФАЙЛА в utf-8: argv на Windows коверкает кириллицу молча.
