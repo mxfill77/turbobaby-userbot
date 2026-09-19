@@ -1775,8 +1775,65 @@ def _lesson_write(shot, rule, why, who, add_fn=None):
     return lesson_store.add_candidate(**common)
 
 
+# ── КОРПУС МЕРИТ И УРОКИ ЭКЗАМЕНА (19.09.2026, задание 67i) ─────────────────────────────────
+# ЧТО БЫЛО. Прибор регрессии (`lesson_regress`) заведён 05.09 у ОДНОЙ двери — кнопки «🎓 Обучить»
+# тренажёра (`trainer.py:1428`). Имени прибора в этом файле не было ни одного вхождения, а уроки
+# эта дверь пишет теми же шестью полями и в режиме `training` — СРАЗУ ДЕЙСТВУЮЩИМИ, в ту самую
+# боевую таблицу, которую читает голова. То есть правило, записанное владельцем через экзамен,
+# корпусом не мерилось вовсе: он видел «🎓 Уроков записано 3» и не видел «и ничего не сломалось».
+#
+# ТРИ ЗАМКА, ВСЕ ТРИ ЗЕРКАЛЯТ `trainer._regress_call` и ни один не изобретён заново:
+#   • НЕ ЖДЁТ — внутри отсоединённый Popen, карточка владельцу уходит тогда же, когда уходила;
+#   • НЕ РОНЯЕТ — любой сбой прибора проглатывается здесь: уроки и вердикт УЖЕ на диске, и
+#     падение измерителя не имеет права превратить состоявшуюся запись в отказ;
+#   • НЕ ИМПОРТИТ СВЕРХУ — `lesson_regress` тянет `trainer_run`, а тот весь пайплайн. Импорт
+#     живёт внутри функции: дверь зовётся субпроцессом из `pc_agent` на каждый тап.
+#
+# НАБОР ЕДЕТ ВМЕСТЕ С УРОКОМ. У прибора с сегодня свой журнал на набор, и `SET_NAME` выбирает,
+# в какой лечь. Без этого урок #14 живого набора склеился бы с уроком #14 тренажёра в одну строку
+# исхода — номер у них общий, а таблицы разные.
+# ФРАЗА ОБЕЩАЕТ РОВНО ТО, ЧТО ПРИБОР УМЕЕТ СКАЗАТЬ, и перечисляет ВСЕ его исходы, включая
+# «мерить нечего». Иначе дверь повторила бы предикат прибора своими словами — а два места,
+# решающих один вопрос, расходятся ровно на следующей правке одного из них.
+REGRESS_SAID = ("⏳ Прибор регрессии позван (журнал набора «%s»): исход — «сломалось N кейсов», "
+                "«ничего не сломалось» либо «корпусом НЕ МЕРЕН» — придёт ОТДЕЛЬНОЙ строкой. "
+                "Полный прогон корпуса занимает минут семь.")
+
+
+def _default_regress(lessons, set_name=None, base=None):
+    """Регрессия уроков ОТДЕЛЬНЫМ ОТСОЕДИНЁННЫМ процессом (`lesson_regress.spawn_many`).
+
+    ОДИН ПРОЦЕСС НА НАЖАТИЕ, а не на урок: «✔ Применить» с тремя отмеченными подсказками — это
+    одно движение пальца владельца, и строк исхода о нём обязана быть одна."""
+    try:
+        import lesson_regress                                # noqa: PLC0415 — см. блок выше
+    except Exception as e:                                   # noqa: BLE001
+        return {"spawned": False, "why": "%s: %s" % (type(e).__name__, e), "noted": 0}
+    key = lesson_regress.SET_LIVE if set_name == SET_LIVE else lesson_regress.SET_TRAINER
+    return lesson_regress.spawn_many(lessons, set_name=key, base=base)
+
+
+def _regress_call(lessons, regress=None, set_name=None, base=None):
+    """Позвать прибор и НИКОГДА не уронить дверь. → dict(spawned, why[, noted])."""
+    try:
+        return (regress or _default_regress)(lessons, set_name=set_name, base=base)
+    except Exception as e:                                   # noqa: BLE001 — см. блок выше
+        return {"spawned": False, "why": "%s: %s" % (type(e).__name__, e), "noted": 0}
+
+
+def regress_said(got, set_name=None):
+    """Что сказать владельцу СРАЗУ про замер → строка (пустая, если говорить не о чем).
+
+    ОБЕЩАНИЕ ДАЁТСЯ ТОЛЬКО КОГДА ЗАМЕР ПОШЁЛ. Строка «исход придёт» при погашенном рубильнике
+    (`LESSON_REGRESS_OFF=1`, `TESTING=1`) заставила бы владельца ждать сообщения, которого не
+    будет, — а молчание он хотя бы читает как молчание."""
+    if not (got or {}).get("spawned"):
+        return ""
+    return REGRESS_SAID % (set_name or SET_NAME)
+
+
 def apply_marked(case_id, who, right_fn=None, path=None, now=None, session_path=None,
-                 cases_path=None, add_fn=None, sender=None, agent_fn=None):
+                 cases_path=None, add_fn=None, sender=None, agent_fn=None, regress_fn=None):
     """«✔ Применить»: отмеченные подсказки → уроки, вердикт «неверно», следующий кейс.
 
     ПУСТОЙ ВЫБОР — ОТКАЗ СЛОВАМИ, а не «неверно без уроков»: владелец, нажавший «Применить» не
@@ -1810,12 +1867,18 @@ def apply_marked(case_id, who, right_fn=None, path=None, now=None, session_path=
     if stale:
         return False, ("⛔ отмечены номера, которых в снимке нет (%s из %d) — карточка устарела. "
                        "Ничего не записано." % (", ".join(str(x) for x in stale), len(hints)))
-    numbers, failed = [], []
+    numbers, failed, written = [], [], []
     for i in marked:
         h = hints[i - 1]
         reason = ("%s: %s" % (HINT_WHY_MARK, h[HINT_OBS])) if h[HINT_OBS] else ""
         try:
-            numbers.append(_lesson_write(shot, h[HINT_RULE], reason, who, add_fn))
+            n = _lesson_write(shot, h[HINT_RULE], reason, who, add_fn)
+            numbers.append(n)
+            # `in_book` — ТО ЖЕ УСЛОВИЕ, ЧТО У `_lesson_write`, и написано оно тут ровно теми же
+            # двумя словами: непустая причина И режим `training` дают ДЕЙСТВУЮЩИЙ урок, всё
+            # прочее — кандидата. Прибору нужен не номер строки, а ответ «едет ли она в книгу».
+            written.append({"n": n, "rule": h[HINT_RULE],
+                            "in_book": bool(reason) and EXAM_LESSON_MODE == LESSON_MODE_TRAINING})
         except Exception as e:                                              # noqa: BLE001
             failed.append("%d (%s)" % (i, getattr(e, "reason", None) or type(e).__name__))
     if not numbers:
@@ -1827,11 +1890,17 @@ def apply_marked(case_id, who, right_fn=None, path=None, now=None, session_path=
         return False, said + "\nУроки при этом записаны: %s." % ", ".join(
             "#%s" % n for n in numbers)
     save_session(dict(desk, selected=[]), session_path)
+    # ЗАМЕР ЗОВЁТСЯ ПОСЛЕ ВЕРДИКТА, А НЕ ВМЕСТО НЕГО. Порядок тот же, что у уроков: сперва то, что
+    # владелец просил, и лишь потом то, чем мы это проверяем. Оборвись процесс здесь — на диске
+    # останутся уроки и вердикт, то есть ровно то, что он нажимал; обратный порядок дал бы замер
+    # книги, которой ещё нет.
+    measured = regress_said(_regress_call(written, regress_fn, set_name=SET_NAME, base=LESSON_PATH))
     mode = lesson_mode_words("действуют СРАЗУ", "легли КАНДИДАТАМИ и пока не действуют")
     tail = ("\n⚠️ Не записаны подсказки: %s." % "; ".join(failed)) if failed else ""
     return True, ("🎓 Уроков записано %d (%s), автор %s, источник «экзамен», причина — наблюдение "
-                  "критика.%s\n%s\n%s" % (
+                  "критика.%s\n%s%s\n%s" % (
                       len(numbers), mode, who or "?", tail, said,
+                      ("\n" + measured) if measured else "",
                       advance(case_id, path=path, sender=sender, agent_fn=agent_fn,
                               cases_path=cases_path)))
 
@@ -1887,7 +1956,7 @@ def pending_own(session_path=None, now=None):
 
 
 def own_take(text, who, right_fn=None, path=None, now=None, session_path=None, cases_path=None,
-             add_fn=None, sender=None, agent_fn=None):
+             add_fn=None, sender=None, agent_fn=None, regress_fn=None):
     """Свободный текст владельца → урок КАНДИДАТОМ, вердикт «неверно», следующий кейс.
 
     КАНДИДАТОМ ВСЕГДА, и это не забытая ветка: у урока своими словами нет «почему» — его не
@@ -1949,8 +2018,13 @@ def own_take(text, who, right_fn=None, path=None, now=None, session_path=None, c
                "правильно>\"" % (n, who or "?", rule, name or "<имя>", n))
     if number is None:
         return False, how + "\n" + said
-    return True, how + "\n" + said + "\n" + advance(case_id, path=path, sender=sender,
-                                                    agent_fn=agent_fn, cases_path=cases_path)
+    # ТОТ ЖЕ ПРИБОР, ЧТО У «✔ ПРИМЕНИТЬ», И ТА ЖЕ ОЧЕРЁДНОСТЬ. Урок своими словами ложится
+    # КАНДИДАТОМ, то есть книгу головы сегодня не меняет, — но решает это не дверь: предмет замера
+    # определяет прибор по базе, и он же скажет владельцу, мерил он что-нибудь или нет.
+    measured = regress_said(_regress_call([{"n": n, "rule": rule, "in_book": False}], regress_fn,
+                                          set_name=SET_NAME, base=LESSON_PATH))
+    return True, how + "\n" + said + (("\n" + measured) if measured else "") + "\n" + advance(
+        case_id, path=path, sender=sender, agent_fn=agent_fn, cases_path=cases_path)
 
 
 DENY_ROLLBACK = ("⛔ «%s» не вправе откатывать вердикт экзамена: имя не в списке правящих книгу "

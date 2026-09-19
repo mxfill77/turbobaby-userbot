@@ -2867,5 +2867,124 @@ class TestAnEmptyAlienDeskYieldsToTheFirstTap(Base):
         self.assertIn("неверно", self.raw())
 
 
+# ───────── ДВЕРЬ ЭКЗАМЕНА ЗОВЁТ ПРИБОР РЕГРЕССИИ (19.09.2026, задание 67i) ─────────
+# ЗАЧЕМ КЛАСС. До сегодня имени `lesson_regress` в `exam_show.py` не было ни одного вхождения:
+# урок, записанный кнопкой «✔ Применить» в режиме `training`, ложился в боевую таблицу СРАЗУ
+# ДЕЙСТВУЮЩИМ, голова читала его со следующего черновика — и корпусом он не мерился. Класс держит
+# обратное: обе кнопки двери зовут прибор, и зовут его РОВНО ОДИН раз на нажатие.
+#
+# НАСТОЯЩИЙ ПРИБОР ЗДЕСЬ НЕ ПОДНИМАЕТСЯ НИ РАЗУ. `regress_fn` перехватывает вызов до `spawn_many`,
+# поэтому ни одного отсоединённого процесса, ни одного круга головы и ни одной строки владельцу
+# эти тесты не рождают. Что делает сам прибор, меряет свой набор (`test_lesson_regress`).
+
+class TestTheExamDoorCallsTheInstrument(TwoSetsBase):
+
+    def setUp(self):
+        TwoSetsBase.setUp(self)
+        self.calls = []
+
+    def spy(self, lessons, set_name=None, base=None):
+        self.calls.append({"lessons": list(lessons), "set": set_name, "base": base})
+        return {"spawned": True, "why": "", "noted": len(lessons)}
+
+    def kw(self):
+        return dict(self.door_kwargs(), regress_fn=self.spy)
+
+    def test_apply_calls_the_instrument_once_with_every_written_lesson(self):
+        kw = self.kw()
+        self.assertTrue(exam_show.toggle(13, 1, "@filipp", right_fn=kw["right_fn"])[0])
+        self.assertTrue(exam_show.toggle(13, 2, "@filipp", right_fn=kw["right_fn"])[0])
+        ok, said = exam_show.apply_marked(13, "@filipp", **kw)
+        self.assertTrue(ok, said)
+        self.assertEqual(len(self.calls), 1, "одно нажатие — один замер, а не по замеру на урок")
+        call = self.calls[0]
+        self.assertEqual([l["n"] for l in call["lessons"]], [1, 2])
+        self.assertEqual(call["set"], exam_show.SET_TRAINER)
+        self.assertEqual(call["base"], self.paths["trainer"]["lessons"])
+
+    def test_the_door_tells_the_instrument_which_lessons_enter_the_book(self):
+        """Подсказка С наблюдением ложится ДЕЙСТВУЮЩЕЙ, без наблюдения — кандидатом; книга берёт
+        только первую, и прибор обязан узнать об этом от двери, а не гадать по номеру."""
+        kw = self.kw()
+        exam_show.toggle(13, 1, "@filipp", right_fn=kw["right_fn"])
+        exam_show.toggle(13, 2, "@filipp", right_fn=kw["right_fn"])
+        exam_show.apply_marked(13, "@filipp", **kw)
+        self.assertEqual([l["in_book"] for l in self.calls[0]["lessons"]], [True, False])
+
+    def test_own_words_lesson_is_reported_as_a_candidate(self):
+        kw = self.kw()
+        exam_show.own_start(13, "@filipp", right_fn=kw["right_fn"])
+        ok, said = exam_show.own_take("не повторяй вопрос про даты", "@filipp", **kw)
+        self.assertTrue(ok, said)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual([l["in_book"] for l in self.calls[0]["lessons"]], [False],
+                         "«✍️ своё» пишет кандидатом ВСЕГДА — в книгу головы он не едет")
+
+    def test_the_live_set_is_measured_in_its_own_journal(self):
+        """ДВУСТОРОННИЙ: та же кнопка из другого набора называет прибору ДРУГОЙ набор и базу."""
+        exam_show.restore_set(self.live)
+        kw = self.kw()
+        exam_show.toggle(13, 1, "@filipp", right_fn=kw["right_fn"])
+        ok, said = exam_show.apply_marked(13, "@filipp", **kw)
+        self.assertTrue(ok, said)
+        self.assertEqual(self.calls[0]["set"], exam_show.SET_LIVE)
+        self.assertEqual(self.calls[0]["base"], self.paths["live"]["lessons"])
+        self.assertNotEqual(self.calls[0]["base"], self.paths["trainer"]["lessons"])
+
+    def test_the_card_promises_the_outcome_only_when_the_run_started(self):
+        kw = self.kw()
+        exam_show.toggle(13, 1, "@filipp", right_fn=kw["right_fn"])
+        ok, said = exam_show.apply_marked(13, "@filipp", **kw)
+        self.assertTrue(ok, said)
+        self.assertIn("ОТДЕЛЬНОЙ строкой", said)
+        self.assertIn("НЕ МЕРЕН", said, "перечислены ВСЕ исходы прибора, включая «мерить нечего»")
+
+        # Контрфакт — на СОСЕДНЕМ наборе: кейс 13 тренажёра уже судим, а в живом наборе он свой,
+        # со своим снимком и своим журналом (в том и смысл развода).
+        exam_show.restore_set(self.live)
+        exam_show.toggle(13, 1, "@filipp", right_fn=kw["right_fn"])
+        quiet = dict(kw, regress_fn=lambda *a, **k: {"spawned": False, "why": "рубильник"})
+        ok2, said2 = exam_show.apply_marked(13, "@filipp", **quiet)
+        self.assertTrue(ok2, said2)
+        self.assertNotIn("ОТДЕЛЬНОЙ строкой", said2,
+                         "обещать строку, которой не будет, хуже молчания")
+
+    def test_a_crashing_instrument_never_loses_the_lesson_or_the_verdict(self):
+        """Зеркало `NegLessonSurvives` тренажёра: урок дороже замера."""
+        def boom(*a, **k):
+            raise RuntimeError("прибор развалился")
+        kw = dict(self.kw(), regress_fn=boom)
+        exam_show.toggle(13, 1, "@filipp", right_fn=kw["right_fn"])
+        ok, said = exam_show.apply_marked(13, "@filipp", **kw)
+        self.assertTrue(ok, said)
+        self.assertIn("Уроков записано 1", said)
+        self.assertNotIn("ОТДЕЛЬНОЙ строкой", said)
+        with open(self.paths["trainer"]["lessons"], encoding="utf-8") as f:
+            self.assertEqual(len([x for x in f.read().splitlines()[1:] if x.strip()]), 1)
+        with open(self.paths["trainer"]["verdicts"], encoding="utf-8") as f:
+            self.assertIn("неверно", f.read())
+
+    def test_a_refused_press_pays_for_no_run(self):
+        """Ничего не отмечено — ни урока, ни вердикта, ни семи минут корпуса."""
+        ok, said = exam_show.apply_marked(13, "@filipp", **self.kw())
+        self.assertFalse(ok)
+        self.assertEqual(self.calls, [])
+
+    def test_the_door_asks_the_real_instrument_by_name(self):
+        """Замок от подмены: боевая ветка зовёт именно `lesson_regress.spawn_many`, и импорт у неё
+        ЛЕНИВЫЙ — верхнеуровневый затянул бы `trainer_run` в память двери."""
+        with io.open(exam_show.__file__.replace(".pyc", ".py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("lesson_regress.spawn_many", src)
+        head = src.split("REPO = os.path.dirname", 1)[0]
+        self.assertNotIn("import lesson_regress", head,
+                         "импорт прибора обязан жить ВНУТРИ функции")
+        import lesson_regress
+        self.assertTrue(hasattr(lesson_regress, "spawn_many"))
+        self.assertEqual(exam_show.SET_LIVE, "живой")
+        self.assertEqual(lesson_regress.SET_LIVE, "live",
+                         "набор двери — слово человеку, ключ прибора — argv ребёнка")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

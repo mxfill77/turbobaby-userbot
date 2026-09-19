@@ -51,9 +51,24 @@ lesson_regress.py — РЕГРЕССИЯ УРОКА: после урока ко�
 исходе прямо говорит, что прибор не знает, КОТОРЫЙ из них сломал — иначе владельцу сказали бы
 «твой урок #14 в порядке» о прогоне, мерившем #12+#13+#14.
 
+ВТОРАЯ ДВЕРЬ УРОКА — ЭКЗАМЕН (19.09.2026, задание 67i). Прибор родился при одном писателе и его
+одного и знал: `trainer.py` (`:1428`, `:1432`). Между тем уроки пишет и `exam_show.py` — кнопками
+«✔ Применить» и «✍️ своё», — и имени `lesson_regress` в нём не было НИ ОДНОГО вхождения: правило,
+записанное владельцем через экзамен, ложилось в ту же боевую таблицу, которую читает голова, и
+корпусом не мерилось. Владелец снова видел «записано» без «и ничего не сломалось» — ровно та
+слепота, ради которой прибор и заведён, только другой дверью. Теперь дверь зовёт его обеими
+кнопками, и у вызова есть два новых слова:
+  • НАБОР (`--set trainer|live`) — чей это урок. У набора СВОЙ файл состояния и СВОЙ лок: эталон,
+    история и очередь склейки не пересекаются. Общий журнал склеил бы урок #14 тренажёра с уроком
+    #14 живого набора — это разные правила из разных таблиц, а номер у них один;
+  • БАЗА (`base` в пометке) — куда лёг урок. По ней прибор решает, ЕСТЬ ЛИ ЧТО МЕРИТЬ
+    (`head_reads`): голова открывает ровно один файл уроков, и правило, легшее мимо него, книгу
+    не меняет ни байтом. Такой урок получает ЧЕТВЁРТЫЙ голос — «корпусом НЕ МЕРЕН», а не ✅.
+
 Запуск:
-    venv/Scripts/python.exe lesson_regress.py --after-lesson        # то, что зовёт trainer (детач)
-    venv/Scripts/python.exe lesson_regress.py --status              # что лежит в эталоне
+    venv/Scripts/python.exe lesson_regress.py --after-lesson        # то, что зовут trainer и exam_show (детач)
+    venv/Scripts/python.exe lesson_regress.py --after-lesson --set live   # то же для живого набора
+    venv/Scripts/python.exe lesson_regress.py --status [--set live] # что лежит в эталоне набора
     venv/Scripts/python.exe lesson_regress.py --dry --only 1,4      # механизм на двух кейсах, без строки
 Рубильники: `LESSON_REGRESS_OFF=1` гасит ветку целиком (урок пишется как раньше);
 `LESSON_REGRESS_BUDGET_SEC` — потолок времени на один заход (по умолчанию 1800с).
@@ -76,6 +91,28 @@ DNOTIFY = os.path.join(REPO, "dispatch_notify.py")
 STATE_FILE = os.path.join(REPO, "pc_orchestrator.lesson_regress.json")
 LOCK_FILE = os.path.join(REPO, "pc_orchestrator.lesson_regress.lock")
 
+# ── ДВА НАБОРА — ДВА ЖУРНАЛА (19.09.2026, задание 67i) ───────────────────────────────────────
+# ЗАЧЕМ РАЗВОД, А НЕ ОДИН ФАЙЛ. Прибор завёлся при одном писателе (кнопка «🎓 Обучить» тренажёра) и
+# знал ровно одну базу уроков. С 18.09 у экзамена два набора, у каждого СВОЯ база и СВОЯ нумерация:
+# урок #14 есть и там, и там, и это разные правила. Общее состояние склеило бы их молча — очередь
+# склейки хранит НОМЕР, и строка исхода сказала бы «Уроки #14,#14 записаны (склейка 2 в один
+# прогон)» о двух правилах из разных таблиц. Поэтому у набора свой файл состояния и свой лок:
+# эталон, история и очередь склейки одного набора недостижимы из другого ни одной веткой.
+#
+# КЛЮЧИ НАБОРА — ЛАТИНИЦЕЙ, И ЭТО НЕ ВКУСОВЩИНА: ключ едет в argv отсоединённого ребёнка
+# (`--set live`), а argv на Windows ходит через кодировку консоли и коверкает кириллицу молча
+# (тот же класс, из-за которого `exam_show --own-text` принимает текст через stdin). Человеку
+# показываются слова из `SET_WORDS`, машине — ключ.
+SET_TRAINER = "trainer"
+SET_LIVE = "live"
+SETS = (SET_TRAINER, SET_LIVE)
+SET_WORDS = {SET_TRAINER: "тренажёр", SET_LIVE: "живой набор"}
+
+LIVE_STATE_FILE = os.path.join(REPO, "pc_orchestrator.lesson_regress.live.json")
+LIVE_LOCK_FILE = os.path.join(REPO, "pc_orchestrator.lesson_regress.live.lock")
+_SET_FILES = {SET_TRAINER: (STATE_FILE, LOCK_FILE),
+              SET_LIVE: (LIVE_STATE_FILE, LIVE_LOCK_FILE)}
+
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 DETACHED = (getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | NO_WINDOW)
@@ -97,6 +134,8 @@ MAX_GLUED = 4                            # сколько раз подряд с
 # ради красоты комментария его не сто́ит.
 ACT_ADDED = "записан"
 ACT_WITHDRAWN = "снят"
+# Исход «мерить нечего» — СВОЁ слово, а не оттенок «не состоялось»: см. `outcome_line`.
+VERDICT_NOTHING = "nothing"
 HISTORY_KEEP = 10
 LINE_MAX = 700                           # «одна короткая строка» — режем по границе, а не молча
 _PENDING_KEEP = 20
@@ -122,6 +161,68 @@ def budget_sec(env=None):
     except ValueError:
         return BUDGET_DEFAULT
     return v if v > 0 else BUDGET_DEFAULT
+
+
+# ─────────────────────────────────────── наборы ──────────────────────────────────────────────
+
+def norm_set(name=None):
+    """Имя набора → ключ. Неизвестное и пустое → тренажёр: прибор жил на нём одном, и умолчание
+    обязано остаться прежним — иначе опечатка в argv увела бы замер в чужой журнал."""
+    key = str(name or "").strip().lower()
+    return key if key in SETS else SET_TRAINER
+
+
+def set_word(name=None):
+    """Набор словами — для строки владельцу."""
+    return SET_WORDS[norm_set(name)]
+
+
+def state_file(set_name=None):
+    return _SET_FILES[norm_set(set_name)][0]
+
+
+def lock_file(set_name=None):
+    return _SET_FILES[norm_set(set_name)][1]
+
+
+def head_reads(base_path=None):
+    """Читает ли ГОЛОВА эту базу уроков → (да/нет, почему нет словами).
+
+    ПРЕДМЕТ — ПУТЬ, А НЕ ИМЯ НАБОРА. Голова открывает ровно один файл уроков
+    (`suggest.active_lesson_bullets` → `lesson_store.STORE_PATH`; поле `suggest.LESSON_BASE_PATH` —
+    шов набора, в проде `None`), и урок, легший мимо него, книгу головы не меняет ни байтом.
+    Спрашивать про это обязательно: корпус меряет КНИГУ, и прогон после урока, которого в книге
+    нет, вернул бы «✅ ничего не сломалось» — зелёное по устройству, а не по замеру. Такое зелёное
+    хуже молчания: оно отвечает на вопрос, которого не задавали, словами вопроса, который задали.
+
+    `None` (умолчание базы) значит боевую таблицу — то есть ДА. Импорт ленивый: предикат зовётся
+    в отсоединённом ребёнке, а не в памяти двери."""
+    if not base_path:
+        return True, ""
+    try:
+        import lesson_store                                  # noqa: PLC0415 — см. докстринг
+        head = lesson_store.STORE_PATH
+    except Exception:                                        # noqa: BLE001
+        # УЗНАТЬ НЕ СМОГЛИ — ЗАМЕР НЕ ОТМЕНЯЕМ. Отказ здесь стоил бы третьего голоса дважды:
+        # и замера нет, и причина выдумана. Пусть меряет — исход скажет правду сам.
+        return True, ""
+    try:
+        same = os.path.normcase(os.path.abspath(str(base_path))) == \
+            os.path.normcase(os.path.abspath(str(head)))
+    except (TypeError, ValueError):                          # noqa: BLE001
+        return True, ""
+    if same:
+        return True, ""
+    return False, ("урок лёг в %s, а голова читает %s — в её книгу он не едет"
+                   % (_rel(base_path), _rel(head)))
+
+
+def _rel(path):
+    """Путь от корня репо прямыми косыми (в строку владельцу едет он, а не абсолютный)."""
+    try:
+        return os.path.relpath(str(path), REPO).replace("\\", "/")
+    except ValueError:
+        return str(path)
 
 
 # ─────────────────────────────────────── состояние ───────────────────────────────────────────
@@ -150,21 +251,32 @@ def write_state(d, path=None):
     return True, path
 
 
-def note_pending(n, rule, path=None, now=None, act=None):
+def note_pending(n, rule, path=None, now=None, act=None, base=None, in_book=None):
     """Пометить урок как ждущий замера. Пишется в НАЖАТИИ владельца, поэтому дёшево и fail-safe:
     один маленький json. Именно эта пометка делает СКЛЕЙКУ возможной — идущий замер увидит урок,
     приехавший после его старта, и перезапустится по итоговой книге.
 
     `act` — КАКОЕ движение владельца привело замер: `записан` (умолчание) или `снят`. Хранится
     рядом с номером потому, что склейка может собрать в один прогон и запись, и отмену, а строка
-    исхода обязана назвать каждое движение своим словом."""
+    исхода обязана назвать каждое движение своим словом.
+
+    `base` — В КАКУЮ БАЗУ лёг урок. Хранится рядом с номером, а не берётся из имени набора, потому
+    что судит о замере ПУТЬ (`head_reads`): набор — это слово владельцу, а файл — факт.
+
+    `in_book` — ЕДЕТ ЛИ СТРОКА В КНИГУ ГОЛОВЫ (`True` у действующего, `False` у кандидата). Поле
+    отдельное от базы, потому что мимо книги можно лечь двумя разными способами: не в тот файл и
+    не в том состоянии. `None` значит «писатель не сказал» — так зовёт прибор тренажёр, и для него
+    ничего не меняется: незнание толкуется в пользу замера, а не против него."""
     now = time.time() if now is None else now
     try:
         d = read_state(path)
         pend = d.get("pending")
         pend = pend if isinstance(pend, list) else []
-        pend.append({"n": n, "rule": str(rule or "")[:300], "ts": now,
-                     "act": str(act or ACT_ADDED)})
+        rec = {"n": n, "rule": str(rule or "")[:300], "ts": now,
+               "act": str(act or ACT_ADDED), "base": str(base) if base else ""}
+        if in_book is not None:
+            rec["in_book"] = bool(in_book)
+        pend.append(rec)
         d["pending"] = pend[-_PENDING_KEEP:]
         return write_state(d, path)[0]
     except Exception:                                        # noqa: BLE001 — урок важнее пометки
@@ -462,32 +574,48 @@ def _act(les):
     return a if a in (ACT_ADDED, ACT_WITHDRAWN) else ACT_ADDED
 
 
-def _lesson_tag(lessons):
+def _lesson_tag(lessons, set_name=None):
     """«Урок #12 записан» / «Урок #12 снят» / склейка — по числу и ПО ДВИЖЕНИЮ склеенных.
 
     Смешанная склейка (одно записали, другое сняли) называет движение У КАЖДОГО номера: одно
     общее слово на такую пару соврало бы про половину прогона, а прибор и так не знает, которое
-    из движений сломало корпус."""
+    из движений сломало корпус.
+
+    НАБОР ЕДЕТ В САМУ СТРОКУ, когда он не тренажёр (19.09.2026). Номер урока у наборов общий —
+    #14 есть в обеих таблицах, — и строка без набора отправила бы владельца искать правило не в
+    той базе. У тренажёра слова нет намеренно: так строка осталась дословно прежней там, где
+    набор один и назывался молчанием."""
+    key = norm_set(set_name)
+    mark = "" if key == SET_TRAINER else " (%s)" % SET_WORDS[key]
     items = [l for l in (lessons or []) if l.get("n") is not None]
     if not items:
-        return "Урок записан"
+        return "Урок записан" + mark
     if len(items) == 1:
-        return "Урок #%s %s" % (items[0]["n"], _act(items[0]))
+        return "Урок #%s%s %s" % (items[0]["n"], mark, _act(items[0]))
     acts = {_act(l) for l in items}
     nums = [str(l["n"]) for l in items]
     if len(acts) == 1:
         word = "записаны" if acts == {ACT_ADDED} else "сняты"
-        return "Уроки #%s %s (склейка %d в один прогон)" % (",#".join(nums), word, len(items))
+        return "Уроки #%s%s %s (склейка %d в один прогон)" % (
+            ",#".join(nums), mark, word, len(items))
     pairs = ", ".join("#%s (%s)" % (l["n"], _act(l)) for l in items)
-    return "Уроки %s — склейка %d в один прогон" % (pairs, len(items))
+    return "Уроки %s%s — склейка %d в один прогон" % (pairs, mark, len(items))
 
 
-def outcome_line(cmp_res, now_rec, lessons=None, base_from=""):
+def outcome_line(cmp_res, now_rec, lessons=None, base_from="", set_name=None):
     """ОДНА короткая строка владельцу — тремя голосами. Третий не заменяется молчанием."""
-    tag = _lesson_tag(lessons)
+    tag = _lesson_tag(lessons, set_name)
     glued = len([l for l in (lessons or []) if l.get("n") is not None]) > 1
     v = cmp_res.get("verdict")
-    if v == "unknown":
+    if v == VERDICT_NOTHING:
+        # ЧЕТВЁРТЫЙ ГОЛОС, И ОН НЕ ОТТЕНОК ТРЕТЬЕГО. «Не состоялось» значит «прибор пытался и не
+        # смог» — оно зовёт повторить. Здесь пытаться нечему: урока нет в предмете замера, и
+        # повтор ничего не изменит. Сказать сюда ✅ — соврать словом «сломалось»: корпус цел, но
+        # про ЭТОТ урок он не знает ничего.
+        line = ("❔ %s · корпусом НЕ МЕРЕН: %s. Это НЕ «ничего не сломалось» — замера не было "
+                "вовсе. Урок начнёт мериться корпусом, когда попадёт в базу, которую читает "
+                "голова." % (tag, cmp_res.get("why") or "причина не названа"))
+    elif v == "unknown":
         line = ("❔ %s · регрессия корпуса НЕ СОСТОЯЛАСЬ: %s → НЕИЗВЕСТНО, сломал ли урок корпус "
                 "(это не «всё хорошо»). Повторю на следующем уроке; проверить руками: "
                 "venv/Scripts/python.exe trainer_run.py --runs 1 --no-write"
@@ -554,35 +682,129 @@ def say(line, popen=None):
 
 # ─────────────────────────────────────── запуск из урока ─────────────────────────────────────
 
-def spawn(rule, n=None, popen=None, env=None, path=None, now=None, act=None):
+def _launch(set_name=None, popen=None):
+    """Отсоединённый ребёнок `lesson_regress.py --after-lesson [--set <ключ>]`. Ключ набора —
+    латиницей (см. шапку): argv на Windows коверкает кириллицу молча."""
+    argv = [VENV_PY, SELF, "--after-lesson"]
+    key = norm_set(set_name)
+    if key != SET_TRAINER:
+        argv += ["--set", key]
+    (popen or subprocess.Popen)(argv, cwd=REPO, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                creationflags=DETACHED)
+
+
+def spawn(rule, n=None, popen=None, env=None, path=None, now=None, act=None,
+          set_name=None, base=None, in_book=None):
     """ЗАПУСК ИЗ НАЖАТИЯ ВЛАДЕЛЬЦА — и единственное, что здесь важно, это НЕ ЖДАТЬ.
 
     Отсоединённый процесс (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW),
     без ожидания, без чтения потоков: урок пишется и карточка уходит владельцу, как раньше.
     `act` — движение владельца (`записан` по умолчанию, `снят` у отмены урока): едет в пометку
-    склейки и оттуда в строку исхода.
+    склейки и оттуда в строку исхода. `set_name`/`base` — чей это урок и в какой он таблице:
+    первое выбирает ЖУРНАЛ (свой файл состояния и свой лок), второе решает, есть ли что мерить.
     НИКОГДА не бросает — предсмертный взгляд задания («регрессию повесят внутрь нажатия») закрыт
     именно здесь. → dict(spawned, why)."""
     why = off(env)
     if why:
         return {"spawned": False, "why": why}
     try:
-        note_pending(n, rule, path=path, now=now, act=act)   # склейка возможна и до старта ребёнка
-        (popen or subprocess.Popen)([VENV_PY, SELF, "--after-lesson"], cwd=REPO,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                    stdin=subprocess.DEVNULL, creationflags=DETACHED)
+        path = path or state_file(set_name)
+        # склейка возможна и до старта ребёнка
+        note_pending(n, rule, path=path, now=now, act=act, base=base, in_book=in_book)
+        _launch(set_name, popen)
         return {"spawned": True, "why": ""}
     except Exception as e:                                   # noqa: BLE001 — см. докстринг
         return {"spawned": False, "why": "%s: %s" % (type(e).__name__, e)}
 
 
+def spawn_many(lessons, popen=None, env=None, path=None, now=None, act=None,
+               set_name=None, base=None):
+    """Уроки ОДНОГО нажатия → пометка на КАЖДЫЙ и ОДИН отсоединённый замер. → dict(spawned, why, noted).
+
+    ПОЧЕМУ НЕ «`spawn` В ЦИКЛЕ». У склейки есть щель, и её видно только на коротком исходе:
+    длинный прогон (корпус, ≈7 мин) успевает подобрать пометки братьев, а исход «мерить нечего»
+    кончается за миллисекунды — второй ребёнок поднялся бы уже по пустой очереди и сказал бы
+    владельцу ВТОРУЮ строку про то же нажатие. «✔ Применить» с тремя отмеченными подсказками
+    давало бы три строки об одном движении пальца. Пометки кладём все, процесс поднимаем один."""
+    items = [l for l in (lessons or []) if isinstance(l, dict)]
+    why = off(env)
+    if why:
+        return {"spawned": False, "why": why, "noted": 0}
+    path = path or state_file(set_name)
+    noted = 0
+    for les in items:
+        if note_pending(les.get("n"), les.get("rule"), path=path, now=now,
+                        act=les.get("act") or act, base=base, in_book=les.get("in_book")):
+            noted += 1
+    if not noted:
+        return {"spawned": False, "why": "ни одной пометки не легло — поднимать замер не на что",
+                "noted": 0}
+    try:
+        _launch(set_name, popen)
+    except Exception as e:                                   # noqa: BLE001 — урок важнее прибора
+        return {"spawned": False, "why": "%s: %s" % (type(e).__name__, e), "noted": noted}
+    return {"spawned": True, "why": "", "noted": noted}
+
+
+def _base_of(lessons, set_name=None):
+    """Какая база уроков у этого захода → (путь|None, известна ли).
+
+    Берётся ПОСЛЕДНЯЯ названная: склейка собирает уроки одного набора, а значит одной таблицы, —
+    но если пометка пришла из старой версии двери (поля `base` в ней нет), набор договаривает за
+    неё: у тренажёра умолчание значит боевую таблицу, у любого другого набора — НЕ ЗНАЕМ, и
+    незнание тут не выдаётся за боевую базу."""
+    for les in reversed(lessons or []):
+        b = (les or {}).get("base")
+        if b:
+            return str(b), True
+    return None, norm_set(set_name) == SET_TRAINER
+
+
+def worth_measuring(lessons, set_name=None, reads_fn=None):
+    """Есть ли в этом заходе хоть что-то, что МЕНЯЕТ книгу головы → (мерить?, почему нет).
+
+    МИМО КНИГИ ЛОЖАТСЯ ДВУМЯ РАЗНЫМИ СПОСОБАМИ, и оба должны спрашиваться, иначе замок закрывает
+    половину двери:
+      1) НЕ В ТОТ ФАЙЛ — база набора, которую голова не открывает (`head_reads`);
+      2) НЕ В ТОМ СОСТОЯНИИ — кандидат. Книга берёт `lesson_store.active()`, то есть ровно
+         `актив`; кандидат лежит в боевой таблице и в книгу не едет ни байтом. Дверь «✍️ своё»
+         пишет кандидатом ВСЕГДА — у урока своими словами нет причины, — значит без этого пункта
+         самый частый урок экзамена гонял бы корпус семь минут ради заведомого «✅».
+
+    СНЯТИЕ УРОКА — ТОЖЕ ИЗМЕНЕНИЕ КНИГИ, и оно меряется: `act=снят` убирает строку из книги, а
+    ответ меняют обе стороны (правило 06.09). Поэтому судим по `in_book`, а не по слову движения.
+
+    НЕЗНАНИЕ ТОЛКУЕТСЯ В ПОЛЬЗУ ЗАМЕРА. Пометка без `in_book` (так зовёт тренажёр, так лежат
+    пометки, написанные до сегодня) считается едущей в книгу: лишний замер стоит семи минут чужого
+    процесса, а пропущенный — той самой слепоты, ради которой прибор заведён."""
+    les_base, known = _base_of(lessons, set_name)
+    if not known:
+        return False, ("база урока не названа, а набор «%s» боевой таблицей не пользуется"
+                       % set_word(set_name))
+    reads, why_not = (reads_fn or head_reads)(les_base)
+    if not reads:
+        return False, why_not
+    items = [l for l in (lessons or []) if isinstance(l, dict)]
+    flags = [l.get("in_book") for l in items if "in_book" in l]
+    if items and len(flags) == len(items) and not any(flags):
+        return False, ("урок лёг КАНДИДАТОМ, а книга головы берёт только действующие правила — "
+                       "ломать корпусу пока нечем")
+    return True, ""
+
+
 def after_lesson(runner=None, only=None, log=None, path=None, say_fn=None, deadline=None,
-                 max_glued=MAX_GLUED, lock=None):
+                 max_glued=MAX_GLUED, lock=None, set_name=None, reads_fn=None):
     """Тело отсоединённого процесса: одиночка → замер → склейка → сравнение → ОДНА строка.
 
     → dict(ran, verdict, line, lessons, glued, why). `ran=False` при незанятом локе (наш урок
-    склеится с идущим замером — это не потеря ответа, а его объединение)."""
+    склеится с идущим замером — это не потеря ответа, а его объединение).
+
+    `set_name` выбирает ЖУРНАЛ набора: файл состояния и лок. Общими они были ровно один день, и
+    цена общности названа в шапке — склейка двух правил с одним номером из разных таблиц."""
     log = log or (lambda *_a, **_k: None)
+    path = path or state_file(set_name)
+    lock = lock or lock_file(set_name)
     took, why = acquire(lock)
     if not took:
         return {"ran": False, "verdict": "", "line": "", "lessons": [], "glued": 0, "why": why}
@@ -590,6 +812,18 @@ def after_lesson(runner=None, only=None, log=None, path=None, say_fn=None, deadl
     lessons, glued, rec, cmp_res, base_from = [], 0, None, None, ""
     try:
         lessons = take_pending(path)
+        # МЕРИТЬ ЛИ ВООБЩЕ — СПРАШИВАЕТСЯ ДО ПЕРВОГО КРУГА ГОЛОВЫ, а не после него: корпус стоит
+        # ≈7 минут чужого времени, и платить их за ответ, известный заранее, незачем. Эталон при
+        # этом НЕ ТРОГАЕТСЯ ни полем: замера не было, а последнее известное число — было.
+        measure_it, why_not = worth_measuring(lessons, set_name, reads_fn)
+        if not measure_it:
+            cmp_res = {"verdict": VERDICT_NOTHING, "broken": [], "fixed": [], "why": why_not}
+            rec = {"ok": False, "why": why_not, "unknown": [], "cases": {}, "sec": 0.0}
+            _save(rec, cmp_res, lessons, path=path)
+            line = outcome_line(cmp_res, rec, lessons, set_name=set_name)
+            (say_fn or say)(line)
+            return {"ran": True, "verdict": VERDICT_NOTHING, "line": line, "lessons": lessons,
+                    "glued": 0, "why": why_not}
         while True:
             rec = measure(runner=runner, only=only, log=log, deadline=deadline)
             fresh = take_pending(path)
@@ -607,14 +841,14 @@ def after_lesson(runner=None, only=None, log=None, path=None, say_fn=None, deadl
         base, base_from = baseline(corpus_sha=(rec or {}).get("corpus_sha"), path=path)
         cmp_res = compare(rec, base)
         _save(rec, cmp_res, lessons, path=path)
-        line = outcome_line(cmp_res, rec, lessons, base_from=base_from)
+        line = outcome_line(cmp_res, rec, lessons, base_from=base_from, set_name=set_name)
         (say_fn or say)(line)
         return {"ran": True, "verdict": cmp_res["verdict"], "line": line, "lessons": lessons,
                 "glued": glued, "why": ""}
     except Exception as e:                                   # noqa: BLE001 — третий голос вместо тишины
         line = outcome_line({"verdict": "unknown",
                              "why": "внутренняя ошибка %s: %s" % (type(e).__name__, e)},
-                            rec or {}, lessons)
+                            rec or {}, lessons, set_name=set_name)
         (say_fn or say)(line)
         return {"ran": True, "verdict": "unknown", "line": line, "lessons": lessons,
                 "glued": glued, "why": "%s: %s" % (type(e).__name__, e)}
@@ -657,14 +891,18 @@ def main(argv=None):
     ap.add_argument("--status", action="store_true", help="что лежит в эталоне (ничего не гоняет)")
     ap.add_argument("--dry", action="store_true", help="прогнать и НЕ отправлять строку владельцу")
     ap.add_argument("--only", default="", help="через запятую: id кейсов (разведка механизма)")
+    ap.add_argument("--set", dest="set_name", default=SET_TRAINER, choices=list(SETS),
+                    help="чей журнал: trainer (умолчание) | live (живой набор экзамена)")
     a = ap.parse_args(argv)
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:                                        # noqa: BLE001 — старый поток
         pass
+    key = norm_set(a.set_name)
     if a.status:
-        st = read_state()
+        st = read_state(state_file(key))
         base, frm = baseline(state=st)
+        print("набор: %s (%s)" % (SET_WORDS[key], _rel(state_file(key))))
         print("эталон: %s" % frm)
         if base:
             print("  кейсов %s/%s, чеков %s/%s, снят %s, коммит %s"
@@ -672,7 +910,7 @@ def main(argv=None):
                      base.get("checks_ok"), base.get("checks_all"), base.get("when"),
                      str(base.get("commit"))[:7]))
         print("очередь склейки: %d" % len(st.get("pending") or []))
-        print("замер: %s" % ("свободно" if _lock_free() else "ИДЁТ"))
+        print("замер: %s" % ("свободно" if _lock_free(lock_file(key)) else "ИДЁТ"))
         for h in (st.get("history") or [])[-5:]:
             print("  · %s кейсов %s/%s чеков %s/%s %.0fс уроки %s"
                   % (h.get("verdict"), h.get("cases_ok"), h.get("cases_seen"), h.get("checks_ok"),
@@ -681,12 +919,12 @@ def main(argv=None):
     only = [s for s in a.only.split(",") if s.strip()] if a.only else None
     if a.dry:
         rec = measure(only=only, log=print)
-        base, frm = baseline(corpus_sha=rec.get("corpus_sha"))
+        base, frm = baseline(corpus_sha=rec.get("corpus_sha"), path=state_file(key))
         cmp_res = compare(rec, base)
-        print("\nИСХОД: " + outcome_line(cmp_res, rec, [], base_from=frm))
+        print("\nИСХОД: " + outcome_line(cmp_res, rec, [], base_from=frm, set_name=key))
         print("(--dry: строка владельцу НЕ отправлена, эталон НЕ переписан)")
         return 0 if cmp_res["verdict"] in ("ok", "base") else 1
-    got = after_lesson(log=print)
+    got = after_lesson(log=print, set_name=key)
     print(got.get("line") or ("замер не запускался: " + str(got.get("why"))))
     return 0
 
