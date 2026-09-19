@@ -805,6 +805,8 @@ def part_nums(counted, taken, day, external, awaiting, box_stop="", routed=None,
         # Нечитаемый слепок — это «не знаем», а не «неизвестных ноль»: ноль здесь
         # читался бы как измеренный факт (та же дверь, что у :func:`number`).
         out.append("неизвестных: %s" % number(None, "слепок очереди не прочитан или старше предела"))
+        out.append("исход не сверен: %s"
+                   % number(None, "слепок очереди не прочитан или старше предела"))
     else:
         out.append("серия: %d из %d подряд · судья доказал %d · без адреса %d · не доказано %d "
                    "· судья не судил %d · из них меняли состояние %d"
@@ -813,6 +815,13 @@ def part_nums(counted, taken, day, external, awaiting, box_stop="", routed=None,
                       counted.get("unproved", 0), counted.get("unjudged", 0),
                       counted.get("moved", 0)))
         out.append(cd.unknown_words(counted))
+        # ВТОРАЯ ПОЛОВИНА ТОЙ ЖЕ ДЫРЫ (решение Штаба 19.09.2026, п. 2). С 19.09
+        # серию не рвёт и ряд, чей исход ещё не прочитала ОЧЕРЕДЬ, — он тоже
+        # вышел из знаменателя и тоже не виден нигде больше: `failed_rows`
+        # витрины отбирает по слову `failed`, а у несверенного слова нет вовсе.
+        # Слова берутся у сводки (:func:`contour_digest.unsure_words`), а не
+        # сочиняются заново: два показа одного числа расходятся молча.
+        out.append(cd.unsure_words(counted))
     out.append("ящик Штаба за %s: взято %s из %d за сутки"
                % (day or "?", number(taken, "слепок очереди не прочитан"),
                   shtab_box.DAILY_BUDGET))

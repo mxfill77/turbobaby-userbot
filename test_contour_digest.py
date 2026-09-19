@@ -13,7 +13,11 @@
 * ``TestNegative`` — ОТРИЦАТЕЛЬНЫЙ ТЕСТ задания: источник недоступен → сводка
   ГОВОРИТ «неизвестно», а не пропускает строку молча. Проверяется и на уровне
   строки, и на уровне готового сообщения, и на живом дереве без файлов.
-* ``TestSeries`` — счёт серии: чистая = сдана, «не сверен» — обрыв; служебные
+* ``TestUnsureOutcomeInTheSeries`` — решение Штаба 19.09.2026: «исход не сверен»
+  (очередь ещё не отвечала) серию НЕ РВЁТ и выходит из знаменателя, как и
+  «неизвестно»; показ объявляет число ВСЕГДА, а ненулевое прямо говорит, что
+  число серии неполно. Отрицательный тест 67m закреплён здесь.
+* ``TestSeries`` — счёт серии: чистая = сдана И доказана; служебные
   корни мимо счёта признаком :mod:`series_pc`; метки читающих строк ВЫВОДЯТСЯ из
   модулей-владельцев, а не набраны литералом.
 * ``TestCalm`` — спокойно = ОДНА строка, разделов нет; неспокойно = разделы есть,
@@ -330,15 +334,128 @@ class TestThirdOutcomeInTheSeries(unittest.TestCase):
         self.assertNotIn(cd.MARK[cd.RED], cd.series_line(got))
 
 
+def _unsure_row(tid, goal="ЦЕЛЬ: правка"):
+    """Ряд, чей исход НЕ СВЕРЕН: слепок видел уход строки, а очередь ещё не отвечала.
+
+    Форма взята у писателя (:func:`queue_snapshot_pc.merge_closed`), а не набрана здесь:
+    согласие двух экземпляров сторожит
+    :meth:`TestUnsureOutcomeInTheSeries.test_the_shape_comes_from_the_writer`."""
+    return {"id": tid, "at": 1789807226.0, "goal": goal, "outcome": None, "why": ""}
+
+
+class TestUnsureOutcomeInTheSeries(unittest.TestCase):
+    """Решение Штаба 19.09.2026: «исход не сверен» серию НЕ РВЁТ и объявляет себя числом.
+
+    ПОВОД ЗАМЕРЕН, А НЕ ПРЕДПОЛОЖЕН — заход 67m, ряд #106
+    (`docs/artifacts/2026-09-19-SERIYA-67m-106-1909.md`): ложный ноль жил 554 с, витрина
+    попала в окно один раз и показала `0 из 30 · судья доказал 10` при верном `7`, и по
+    этому нулю Штаб завёл лишний ряд очереди. Здесь тот же случай закреплён числом на ТОМ
+    ЖЕ приборе, которым сводка считает серию боем."""
+
+    @staticmethod
+    def _window(n):
+        """`n` чистых доказанных рядов подряд + реестр вердиктов к ним."""
+        rows = [{"id": i, "outcome": "done", "goal": "ЦЕЛЬ: правка %d" % i}
+                for i in range(1, n + 1)]
+        return rows, _proved(*range(1, n + 1))
+
+    def test_unsure_leaves_the_denominator_and_keeps_the_streak(self):
+        """ОТРИЦАТЕЛЬНЫЙ ТЕСТ 67m, ЗАКРЕПЛЁННЫЙ (п. 5 задания): «артефакт по адресу написан,
+        исход не сверен» даёт серию ПРЕЖНЕЙ длины и знаменатель НА ЕДИНИЦУ МЕНЬШЕ.
+
+        Числа реплея 67m, на которые это ложится: ряд #106 сдан и доказан судьёй
+        (`seq 369`, `PROVEN`), а слепок в ту минуту нёс `outcome: null`. Прежний код давал
+        `streak 0` при верных `6`; знаменатель при этом не ужимался вовсе (16 вместо 15)."""
+        rows, judged = self._window(6)
+        rows.append({"id": 7, "outcome": "done", "goal": "ЦЕЛЬ: правка 7"})
+        judged.update(_proved(7))
+        counted = cd.series(rows, judged=judged)
+        self.assertEqual(counted["streak"], 7, "контроль: сверенный ряд серию продолжает")
+        self.assertEqual(counted["denom"], 7)
+
+        rows[-1] = _unsure_row(7, "ЦЕЛЬ: правка 7")   # тот же ряд, исход ещё не сверен
+        got = cd.series(rows, judged=judged)
+        self.assertEqual(got["streak"], 6, "серия обязана остаться ПРЕЖНЕЙ длины")
+        self.assertEqual(got["denom"], 6, "знаменатель обязан ужаться на единицу")
+        self.assertEqual(got["window"], 7, "ряд из ОКНА никуда не девается — он виден")
+        self.assertEqual(got["unsure"], 1)
+
+    def test_the_verdict_of_the_judge_does_not_rescue_an_unsure_row(self):
+        """ЛЬГОТА НЕ ЗАЧЁТ: несверенный ряд серию не продолжает даже при `PROVEN`.
+
+        Иначе правка была бы не льготой, а подгонкой: ряд, чей исход очередь ещё не
+        читала, зачитывался бы работой по одному лишь вердикту судьи."""
+        rows, judged = self._window(3)
+        rows.append(_unsure_row(4))
+        judged.update(_proved(4))
+        got = cd.series(rows, judged=judged)
+        self.assertEqual(got["streak"], 3, "льгота превратилась в зачёт")
+        self.assertEqual(got["proved"], 3, "несверенный ряд заехал в разбор закрытий")
+
+    def test_failed_still_breaks_the_streak(self):
+        """КОНТРПРИМЕР: «упало» — это ПРОЧИТАННЫЙ ответ очереди, и он рвёт по-прежнему."""
+        rows, judged = self._window(3)
+        rows.append({"id": 4, "outcome": "failed", "goal": "ЦЕЛЬ: правка 4"})
+        self.assertEqual(cd.series(rows, judged=judged)["streak"], 0)
+        self.assertIs(cd.is_unsure({"id": 4, "outcome": "failed"}), False,
+                      "«упало» опознано несверенным — слово исхода перестало различать")
+
+    def test_the_number_is_announced_even_when_it_is_zero(self):
+        """П. 2, первая половина: молчаливое число запрещено — ноль печатается тоже."""
+        rows, judged = self._window(2)
+        words = cd.series_line(cd.series(rows, judged=judged))
+        self.assertIn("ИСХОД НЕ СВЕРЕН у 0 из 2", words)
+        self.assertNotIn("НЕПОЛНО", words, "полное число объявлено неполным")
+
+    def test_a_nonzero_number_says_the_series_is_incomplete(self):
+        """П. 2, вторая половина: человек обязан ВИДЕТЬ, что число неполно, а не гадать."""
+        rows, judged = self._window(2)
+        rows.append(_unsure_row(3))
+        counted = cd.series(rows, judged=judged)
+        for where, words in (("строка серии", cd.series_line(counted)),
+                             ("журнальный индекс",
+                              cd.journal_line({"series": counted, "readings": {}})),
+                             ("витрина", "\n".join(vp.part_nums(
+                                 counted, 1, "2026-09-19", None, None)))):
+            self.assertIn("ИСХОД НЕ СВЕРЕН у 1 из 3", words, "число молчит в: %s" % where)
+            self.assertIn("ЧИСЛО СЕРИИ НЕПОЛНО", words, "неполнота молчит в: %s" % where)
+
+    def test_a_dead_source_is_a_question_mark_not_a_zero(self):
+        """НЕ СОСЧИТАНО — НЕ НОЛЬ: погашенный слепок не смеет печатать «0 из 0»."""
+        self.assertEqual(cd.unsure_words(None), "ИСХОД НЕ СВЕРЕН у ? из ?")
+        self.assertEqual(cd.unsure_words({}), "ИСХОД НЕ СВЕРЕН у ? из ?")
+
+    def test_the_shape_comes_from_the_writer(self):
+        """ЗАМОК МЕЖДУ ДВУМЯ ЭКЗЕМПЛЯРАМИ: признак читателя обязан ловить запись писателя.
+
+        Ряд рождается несверенным в :func:`queue_snapshot_pc.merge_closed`, а судит его
+        :func:`contour_digest.is_unsure`. Разойдись они — счёт молча перестал бы давать
+        льготу, и увидеть это было бы нечем."""
+        born = queue_snapshot_pc.merge_closed(
+            {"7": {"goal": "ЦЕЛЬ: правка 7"}}, {}, {}, 1789807226.0, 86400)
+        self.assertEqual(len(born), 1)
+        row = list(born.values())[0]
+        self.assertIs(cd.is_unsure(row), True, "признак читателя не ловит запись писателя")
+        self.assertIs(row.get(queue_snapshot_pc.F_WAS_UNSURE), True)
+
+
 class TestSeries(unittest.TestCase):
     """Счёт серии цепочек — отдельной строкой и с названными определениями."""
 
-    def test_clean_is_done_and_unsure_breaks_the_streak(self):
+    def test_clean_is_done_and_unsure_does_not_break_the_streak(self):
+        """ПЕРЕПИСАН ПО СУЩЕСТВУ 19.09.2026, а не ослаблен: до правки этот тест требовал
+        `streak == 1` со словами «„не сверен“ обязан обрывать серию» — то есть закреплял
+        ПРЕЖНЕЕ правило, отменённое решением Штаба (п. 1). Проверок стало БОЛЬШЕ, а не
+        меньше: кроме длины серии спрашивается знаменатель, которого прежний тест не
+        спрашивал вовсе."""
         rows = [{"id": 1, "outcome": "done", "goal": "работа"},
                 {"id": 2, "outcome": None, "goal": "работа"},
                 {"id": 3, "outcome": "done", "goal": "работа"}]
-        self.assertEqual(cd.series(rows, judged=_proved(1, 3))["streak"], 1,
-                         "«не сверен» обязан обрывать серию")
+        got = cd.series(rows, judged=_proved(1, 3))
+        self.assertEqual(got["streak"], 2,
+                         "«не сверен» рвёт серию — а это очередь не прочитала, не полоса упала")
+        self.assertEqual(got["unsure"], 1)
+        self.assertEqual(got["denom"], 2, "несверенный ряд остался в знаменателе")
 
     def test_failed_breaks_the_streak(self):
         rows = [{"id": 1, "outcome": "done", "goal": "работа"},
