@@ -1903,6 +1903,103 @@ def _work_evidence(since, until=None):
     return {"commits": commits, "journal": journal, "since": since, "until": until}
 
 
+# ---------------- ЗАКОННОЕ УДЕРЖАНИЕ: след работы в РАБОЧЕМ ДЕРЕВЕ (69a, 20.09.2026) ------------
+#
+# ЗАЧЕМ ТРЕТИЙ ВИД УЛИК. `_work_evidence` выше собирает ДВА: коммиты и записи журнала. Обоих у
+# доделывающего заход исполнителя может не быть ни одного — коммит он делает последним действием,
+# а журнальную строку ещё позже. Живой замер (69a): ряд 134 положил на диск артефакт 32207 Б и
+# четыре файла кода, и итог его провала при этом честно сказал «коммитов=0», потому что РАБОЧЕГО
+# ДЕРЕВА не смотрел никто. Здесь смотрим ровно его.
+#
+# ПОЧЕМУ ИМЕННО `git status`, А НЕ ОБХОД КАТАЛОГА. Обход видит 52518 файлов (замер 20.09) и вместе
+# с продуктом видит СОБСТВЕННУЮ бухгалтерию демона — heartbeat, реестр отметок, снимок очереди,
+# логи, `tmp/`. Такой признак поднимал бы сам демон, то есть доказывал бы работу заходом своего
+# же витка. `git status --porcelain` отдаёт РОВНО рабочее дерево как продукт: все перечисленные
+# файлы состояния лежат под `.gitignore` (`pc_orchestrator.*.json`, `*.log`, `*.db`, `tmp/`,
+# `cowork_log.ledger`) и в выдачу не попадают ни одной строкой. Замер 20.09: 2210 путей, 0.17 с
+# против 1.35 с у полного обхода.
+#
+# `--no-optional-locks` — не косметика: в витке ДВА захода и один индекс, и обновление индекса
+# из сторожа спорило бы с чужим живым коммитом за `.git/index.lock`. Сторож читает и не пишет.
+WORK_TRACE_MAX_PATHS = int(os.getenv("PC_WORK_TRACE_PATHS", "8000") or "8000")
+
+
+def _work_hold_on():
+    """Рубильник отката правки 69a → True, пока не сказано обратное (PC_WORK_HOLD_OFF=1).
+
+    Выключенный рубильник возвращает сторожу поведение до 20.09.2026 дословно: короткий порог
+    сироты применяется к любому доказанному отсутствию исполнителя, следа работы никто не ищет."""
+    return str(os.getenv("PC_WORK_HOLD_OFF") or "").strip().lower() not in ("1", "true", "yes", "on")
+
+
+def _porcelain_paths(out):
+    """Строки `git status --porcelain` → пути (str). Переименование даёт ЦЕЛЬ, а не источник."""
+    paths = []
+    for line in str(out or "").splitlines():
+        rest = line[3:] if len(line) > 3 else ""
+        if not rest:
+            continue
+        if " -> " in rest:                 # R  старое -> новое: работа лежит в НОВОМ
+            rest = rest.split(" -> ", 1)[1]
+        rest = rest.strip()
+        if rest.startswith('"') and rest.endswith('"') and len(rest) > 1:
+            try:
+                rest = json.loads(rest)    # git цитирует C-escape'ами; для наших путей это JSON
+            except Exception:
+                rest = rest[1:-1]
+        if rest:
+            paths.append(rest)
+    return paths
+
+
+def _worktree_trace_since(since, now=None, status_out=None):
+    """Писал ли кто-то в РАБОЧЕЕ ДЕРЕВО после момента `since`? → (True | False | None, словами).
+
+    True  — ЕСТЬ след: есть путь, изменённый позже `since`. Это СОВЕРШЁННОЕ СОБЫТИЕ — байты на
+            диске, а не запись в памяти демона и не факт смерти чужого процесса.
+    False — следа нет: дерево прочитано целиком, ни один путь не моложе `since`.
+    None  — НЕ ЗНАЮ: git не ответил, окно неизвестно, бюджет путей исчерпан. Молчание пробы не
+            смеет значить «работы не было» — та же асимметрия, что у `_executor_verdict`:
+            лишнее ожидание стоит времени, ложный реап стоит работы.
+
+    ЧЕГО ЭТОТ ПРИЗНАК НЕ ДОКАЗЫВАЕТ, И ЭТО НАЗВАНО ВСЛУХ: он не доказывает АВТОРСТВА. В витке
+    два захода, и след соседа по времени неотличим от следа этого ряда (общий корень — ровно то
+    же, чем общий `moderation_ipc.db` опасен для О3, см. CLAUDE.md). Поэтому след даёт не
+    неприкосновенность, а ОТСРОЧКУ до длинной мерки `PC_SINGLE_STALE`, которая сама стои́т на
+    замере: 771 живой заход за 54 суток, максимум 2669.9 с — длиннее 5400 с не был НИ ОДИН."""
+    if since is None:
+        return None, "окна нет: момента claim не сохранилось — искать след не в чем"
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if status_out is None:
+        try:
+            status_out = _git_out(["--no-optional-locks", "status", "--porcelain"])
+        except Exception as e:               # noqa: BLE001 — проба не роняет сторожа
+            return None, f"git status не ответил ({e}) — рабочее дерево не прочитано"
+        if status_out is None:
+            return None, "git status не ответил — рабочее дерево не прочитано"
+    since_ts = since.timestamp()
+    paths = _porcelain_paths(status_out)
+    if len(paths) > WORK_TRACE_MAX_PATHS:
+        return None, (f"путей в дереве {len(paths)} > бюджета {WORK_TRACE_MAX_PATHS} — "
+                      "дерево не досмотрено, след неизвестен")
+    newest, newest_path = None, ""
+    for rel in paths:
+        try:
+            mt = os.stat(os.path.join(REPO, *rel.rstrip("/").split("/"))).st_mtime
+        except OSError:
+            continue                        # путь исчез между status и stat — не показание
+        if newest is None or mt > newest:
+            newest, newest_path = mt, rel
+    if newest is None:
+        return False, "рабочее дерево прочитано: изменённых путей нет вовсе"
+    if newest <= since_ts:
+        return False, (f"рабочее дерево прочитано ({len(paths)} путей): свежее claim нет ничего, "
+                       f"самый свежий — {newest_path}")
+    ago = int(now.timestamp() - newest)
+    return True, (f"след работы в рабочем дереве: {newest_path} записан после claim "
+                  f"({ago}с назад, путей в дереве {len(paths)})")
+
+
 _DAEMON_MARK = "[причина="          # машинный маркер ДЕМОНА; = shtab_box_signals.FAIL_HEAD
 
 
@@ -5062,6 +5159,10 @@ NO_EXEC_CHILD_DEAD = "дочерний процесс claude (PID {pid}) мёр�
 # один раз за жизнь процесса, а не 60 раз в час — иначе она утонет в самой себе.
 _SEAL_SAID = set()
 
+# Про какие ряды сторож уже сказал «УДЕРЖАНА» (дедуп ЛОГА, не решения — 69a). Удержание живёт до
+# длинной мерки, то есть до 85 витков поллинга; новость стои́т сказать один раз, а не 85.
+_HOLD_SAID = set()
+
 
 def _executor_verdict(tid, path=None, pid_alive=None, since=None):
     """Есть ли у задачи tid ЖИВОЙ исполнитель? → (True | False | None, причина словами).
@@ -5216,6 +5317,28 @@ def process_stuck_singles(now=None):
         # вообще застать её старт (иначе «отметки нет» — не показание, а потерянная память).
         alive, why = _executor_verdict(tid, since=now - datetime.timedelta(seconds=age))
         limit = PC_ORPHAN_STALE if alive is False else PC_SINGLE_STALE
+        # since: отметка claim, а если её нет (задача клеймлена до появления реестра) — по возрасту.
+        # Поднято СЮДА из ветки приговора (69a): окно удержания меряется от claim, и знать его надо
+        # ДО выбора порога, а не после.
+        started = _task_started_get(tid) or (now - datetime.timedelta(seconds=age))
+        # ЗАКОННОЕ УДЕРЖАНИЕ (69a, 20.09.2026). Короткий порог сироты стоит на замере 05.08 про
+        # ряды, которые НЕ ЗАПУСКАЛИСЬ: ждать нечего, потому что работы не было и быть не могло.
+        # Двум другим литералам вердикта он не был измерен ни разу, а различие между ними —
+        # пропасть: «дочерний claude мёртв» истинно у КАЖДОГО доделавшего захода (замер 69a:
+        # 771 заход из 771 за 54 суток), то есть о брошенной работе не говорит ничего. Поэтому
+        # там, где прогон НАЧИНАЛСЯ, спрашиваем о совершённом событии — следе в рабочем дереве, —
+        # и при следе судим ряд длинной меркой. Это не отмена приговора, а отсрочка: 5400 с выше
+        # наблюдённого максимума живого захода (2669.9 с) в 2.02 раза.
+        held = ""
+        if limit == PC_ORPHAN_STALE and why != NO_EXEC_NEVER_RAN and _work_hold_on():
+            trace, trace_why = _worktree_trace_since(started, now=now)
+            if trace is not False:
+                limit, held = PC_SINGLE_STALE, trace_why
+                if tid not in _HOLD_SAID:
+                    _HOLD_SAID.add(tid)
+                    log.warning("stuck-single: id=%s УДЕРЖАНА — исполнителя нет (%s), но %s. "
+                                "Судится длинной меркой %sс вместо порога сироты %sс",
+                                tid, why, trace_why, PC_SINGLE_STALE, PC_ORPHAN_STALE)
         if age <= limit:
             continue
         # ВОЗРАСТ НЕ РАСТЁТ, ПОКА СВЯЗИ НЕТ — та же дисциплина, что «бюджет тратится только на
@@ -5229,26 +5352,32 @@ def process_stuck_singles(now=None):
                         "(возраст без обрыва %sс ≤ %sс)", tid, int(age), blind,
                         int(age) - blind, limit)
             continue
-        # since: отметка claim, а если её нет (задача клеймлена до появления реестра) — по возрасту
-        started = _task_started_get(tid) or (now - datetime.timedelta(seconds=age))
-        if alive is False:
+        orphan_fast = (alive is False and limit == PC_ORPHAN_STALE)
+        if orphan_fast:
             detail = (f"СИРОТА: живого исполнителя нет — {why}. Задача провисела in_progress "
                       f"{int(age)}с (порог сироты {PC_ORPHAN_STALE}с). Снята ПО ФАКТУ отсутствия "
                       f"процесса, а не по молчанию: ждать {PC_SINGLE_STALE}с было нечего и некого")
+        elif alive is False:
+            # УДЕРЖАННЫЙ РЯД, ДОЖИВШИЙ ДО ДЛИННОЙ МЕРКИ. Итог обязан назвать обе половины правды:
+            # исполнителя нет — и след работы был, поэтому по короткому порогу ряд НЕ снимали.
+            detail = (f"ПК-таймаут одиночки: живого исполнителя нет — {why}, но {held or 'след работы был'}. "
+                      f"Поэтому ряд судился длинной меркой: провисел in_progress {int(age)}с "
+                      f"(> {PC_SINGLE_STALE}с), а не снят через {PC_ORPHAN_STALE}с по порогу сироты")
         else:
             detail = (f"ПК-таймаут одиночки: задача провисела in_progress {int(age)}с "
                       f"(> {PC_SINGLE_STALE}с) без движения — ПК был выключен, либо прогон "
                       "застрял/оборвался посреди исполнения")
         msg = fail_result(FAIL_HEARTBEAT_TIMEOUT, detail, since=started, now=now)
         _complete(tid, "failed", msg)
-        if alive is False:
+        if orphan_fast:
             log.warning("stuck-single: id=%s СИРОТА (%s) in_progress %sс > %sс → failed "
                         "(исполнителя нет — ждать нечего)", tid, why, int(age), PC_ORPHAN_STALE)
             _cowork(f"задача #{tid} (сирота, исполнителя нет) → failed через {int(age)}с · {_clip(msg)}")
             _notify_task("failed", tid, f"сирота: живого исполнителя нет ({why})")
         else:
             log.warning("stuck-single: id=%s in_progress %sс > %sс → failed (ПК-ливнесс одиночки; "
-                        "исполнитель: %s)", tid, int(age), PC_SINGLE_STALE, why)
+                        "исполнитель: %s%s)", tid, int(age), PC_SINGLE_STALE, why,
+                        ("; удержание: " + held) if held else "")
             _cowork(f"задача #{tid} (одиночка) → failed по ПК-таймауту ({int(age)}с) · {_clip(msg)}")
             _notify_task("failed", tid, "ПК-таймаут одиночки (застряла in_progress)")
 

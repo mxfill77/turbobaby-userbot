@@ -156,6 +156,14 @@ class Base(unittest.TestCase):
         self.addCleanup(lambda: (setattr(o, "_work_evidence", self._save_ev[0]),
                                  setattr(o, "TASK_START_FILE", self._save_ev[1]),
                                  setattr(o, "COWORK_LEDGER", self._save_ev[2])))
+        # СЛЕД РАБОТЫ В РАБОЧЕМ ДЕРЕВЕ (69a, 20.09.2026) — по умолчанию следа НЕТ, и это та же
+        # причина, что двумя блоками выше: сторож одиночек с 20.09 спрашивает `git status` ЖИВОГО
+        # репозитория, а рабочая копия во время прогона тестов грязна почти всегда (у этого захода
+        # — 2210 путей замером). Без подмены каждый тест реапера зеленел бы или краснел от чужой
+        # работы рядом. Саму пробу и её разбор проверяет TestWorkHoldTrace, подменяя это же место.
+        self._save_trace = o._worktree_trace_since
+        o._worktree_trace_since = lambda since, now=None, status_out=None: (False, "тест: дерево чисто")
+        self.addCleanup(lambda: setattr(o, "_worktree_trace_since", self._save_trace))
         # ЗАПРЕТ грязного дерева (класс 28.07): в тестах дерево по умолчанию ЧИСТОЕ — живой git не
         # дёргаем и не зависим от состояния рабочей копии. Сам запрет проверяет
         # TestDirtyTreeBlocksRestart, подменяя это же место своим списком.
@@ -4878,22 +4886,35 @@ class TestOrphanNoExecutor(Base):
         return self.fb.add(status="in_progress", updated=iso_ago(age or self.ORPHAN_AGE))
 
     @staticmethod
-    def _tasklist(alive_pid=None):
-        """Фейковый `tasklist` В ЖИВОМ ФОРМАТЕ вывода, а не подмена внутреннего имени пробы.
+    def _tasklist(alive_pid=None, porcelain=""):
+        """Фейковый ОТВЕТ СИСТЕМЫ В ЖИВОМ ФОРМАТЕ на обе пробы сторожа, а не подмена его имён.
 
         Так тест держится за ПОВЕДЕНИЕ (что демон делает, увидев такой ответ системы), а не за
         устройство, и остаётся осмысленным на ЛЮБОМ модуле — в том числе на старом, где имени
-        `_pid_alive_probe` ещё нет. Формат обоих ответов списан с живого замера 05.08: строка CSV
-        на найденный процесс и «задачи не найдены» с rc=0 — на ненайденный."""
+        `_pid_alive_probe` ещё нет. Формат ответов `tasklist` списан с живого замера 05.08: строка
+        CSV на найденный процесс и «задачи не найдены» с rc=0 — на ненайденный.
+
+        ВТОРАЯ ПРОБА ПОЯВИЛАСЬ 20.09.2026 (69a): сторож спрашивает ещё и `git status --porcelain` —
+        был ли след работы в рабочем дереве. Отвечаем и ей, в её живом формате (пусто = чистое
+        дерево), по двум причинам. Первая: без ответа фейк отдавал бы на git строку про `tasklist`,
+        и тест доказывал бы разбор мусора. Вторая, важнее: РЕАЛЬНОЕ дерево репозитория во время
+        прогона тестов грязное почти всегда, и тест, не назвавший его состояние, зеленел бы или
+        краснел от чужой работы рядом. `stderr` — не косметика: боевой `_git_locked` читает его,
+        и `SimpleNamespace` без этого поля роняет пробу в «не знаю»."""
         def run(*a, **k):
             argv = a[0] if a else []
-            m = re.search(r"PID eq (\d+)", " ".join(str(x) for x in argv))
+            joined = " ".join(str(x) for x in argv)
+            if "--porcelain" in joined:
+                return types.SimpleNamespace(returncode=0, stdout=porcelain, stderr="")
+            m = re.search(r"PID eq (\d+)", joined)
             pid = int(m.group(1)) if m else None
             if alive_pid is not None and pid == alive_pid:
                 return types.SimpleNamespace(
-                    returncode=0, stdout='"claude.exe","%d","Console","1","120 000 КБ"\n' % pid)
+                    returncode=0, stdout='"claude.exe","%d","Console","1","120 000 КБ"\n' % pid,
+                    stderr="")
             return types.SimpleNamespace(
-                returncode=0, stdout="INFO: No tasks are running which match the specified criteria.\n")
+                returncode=0, stdout="INFO: No tasks are running which match the specified criteria.\n",
+                stderr="")
         return run
 
     # --- «красное до»: сирота снимается быстро -------------------------------
@@ -4906,7 +4927,10 @@ class TestOrphanNoExecutor(Base):
                          "задача без исполнителя обязана сниматься, не дожидаясь 90 мин")
 
     def test_orphan_child_process_dead_reaped_fast(self):
-        # прогон был, ребёнок мёртв, задача так и осталась in_progress (случай 284/291)
+        # прогон был, ребёнок мёртв, РАБОЧЕЕ ДЕРЕВО ЧИСТО (Base) — работы не осталось нигде
+        # (случай 284/291). С 20.09 состояние дерева входит в приговор, и «чисто» здесь не
+        # умолчание, а названное условие: со следом работы тот же ряд обязан быть УДЕРЖАН,
+        # и это отдельный тест TestWorkHoldTrace.
         tid = self._stale()
         o._task_started_mark(tid, now=iso_dt(self.ORPHAN_AGE))
         o._task_started_child(tid, 31337)
@@ -4918,7 +4942,7 @@ class TestOrphanNoExecutor(Base):
         # отметку делал ЭТОТ процесс, а исполняем сейчас не её → ребёнка нет: демон синхронный
         tid = self._stale()
         o._task_started_mark(tid, now=iso_dt(self.ORPHAN_AGE))     # pid = наш, child не записан
-        o.process_stuck_singles()
+        o.process_stuck_singles()                                  # дерево чисто (Base)
         self.assertEqual(self.fb.tasks[tid]["status"], "failed")
 
     def test_orphan_result_names_the_fact_not_the_silence(self):
@@ -5143,6 +5167,190 @@ class TestOrphanNoExecutor(Base):
         o._task_started_mark(4323, now=t0)
         self.assertLess(abs((o._task_started_get(4323) - t0).total_seconds()), 2)
         self.assertEqual(o._task_started_rec(4323)["pid"], os.getpid())
+
+
+class TestWorkHoldTrace(Base):
+    """ЗАКОННОЕ УДЕРЖАНИЕ: сторож не хоронит заход, который ПИШЕТ (69a, 20.09.2026).
+
+    ЖИВОЙ ПОВОД, ряд 134 (`docs/artifacts/2026-09-20-68y-SIROTASCHET-2009.md`): 16:26 CLAIM,
+    16:46:08 артефакт 32207 Б лёг на диск, 16:58 демон умер и через 3 с после собственного
+    рождения новый процесс объявил ряд сиротой — «дочерний процесс claude (PID 2968) мёртв»,
+    1946 с > 300 с. Приговор опирался на признак, который истинен у КАЖДОГО доделавшего захода:
+    замер 69a по 771 строке METRICS за 54 суток — 771 мёртвый ребёнок из 771, и ни одна смерть
+    не есть событие «работу бросили».
+
+    Поэтому там, где прогон НАЧИНАЛСЯ, сторож спрашивает о совершённом событии — следе в рабочем
+    дереве. Ниже обе стороны мутанта («жив и пишет» → НЕ хоронить, «нет вовсе» → хоронить),
+    контрфакт рубильником отката и граница: удержание — отсрочка до длинной мерки, а не вечность.
+
+    Своё дерево: `o.REPO` уводится во временный каталог, боевой репозиторий тесты не читают и не
+    трогают. Base по умолчанию подменяет саму пробу — здесь она ВОЗВРАЩЕНА живой."""
+
+    def setUp(self):
+        super().setUp()
+        o._worktree_trace_since = self._save_trace          # Base подменил — здесь судим живую пробу
+        self._save_repo = o.REPO
+        o.REPO = tempfile.mkdtemp()                         # своё «рабочее дерево» на тест
+        self.addCleanup(lambda: setattr(o, "REPO", self._save_repo))
+        self._save_tid = o._RUNNING_TID
+        o._RUNNING_TID = None
+        self.addCleanup(lambda: setattr(o, "_RUNNING_TID", self._save_tid))
+        o._HOLD_SAID.clear()                                # дедуп ЛОГА живёт в памяти процесса
+        self.addCleanup(o._HOLD_SAID.clear)
+        self.AGE = o.PC_ORPHAN_STALE + 60                   # между коротким порогом и длинным
+        o._task_started_mark(90002, now=iso_dt(9999))       # реестр НЕ пуст: пустой = «не знаю»
+
+    def _file(self, rel, age_sec):
+        """Файл в НАШЕМ дереве с возрастом записи `age_sec` секунд. → относительный путь."""
+        full = os.path.join(o.REPO, *rel.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write("продукт захода\n")
+        t = datetime.datetime.now(datetime.timezone.utc).timestamp() - age_sec
+        os.utime(full, (t, t))
+        return rel
+
+    def _orphan_row(self, age=None):
+        """Сцена 134: ряд in_progress старше короткого порога, прогон БЫЛ, ребёнок записан."""
+        tid = self.fb.add(status="in_progress", updated=iso_ago(age or self.AGE))
+        o._task_started_mark(tid, now=iso_dt(age or self.AGE))
+        o._task_started_child(tid, 31337)
+        return tid
+
+    def _reap(self, porcelain):
+        # живой формат обоих ответов системы: ребёнка 31337 в списке НЕТ, дерево — как сказано
+        with mock.patch.object(o.subprocess, "run",
+                               TestOrphanNoExecutor._tasklist(porcelain=porcelain)):
+            o.process_stuck_singles()
+
+    # --- разбор выдачи `git status --porcelain` ------------------------------
+
+    def test_porcelain_paths_read_live_shapes(self):
+        # ЖИВЫЕ ФОРМЫ СТРОКИ, снятые с `git status --porcelain` этого репозитория 20.09
+        rows = ' M exam_show.py\n?? docs/artifacts/2026-09-20-68v-MOHIBEIK-2009.md\n?? "Claude outputs/"\nR  old.py -> new.py\n'
+        self.assertEqual(o._porcelain_paths(rows),
+                         ["exam_show.py", "docs/artifacts/2026-09-20-68v-MOHIBEIK-2009.md",
+                          "Claude outputs/", "new.py"])   # переименование даёт ЦЕЛЬ, а не источник
+
+    def test_empty_status_is_absence_not_unknown(self):
+        # чистое дерево — это ФАКТ «следа нет», а не незнание: иначе удержание стало бы вечным
+        state, why = o._worktree_trace_since(iso_dt(600), status_out="")
+        self.assertIs(state, False)
+        self.assertIn("нет", why)
+
+    # --- сама проба: три исхода, и третий обязателен -------------------------
+
+    def test_write_after_claim_is_a_trace(self):
+        rel = self._file("docs/artifacts/2026-09-20-69a-PROBA.md", age_sec=30)
+        state, why = o._worktree_trace_since(iso_dt(600), status_out="?? " + rel)
+        self.assertIs(state, True)
+        self.assertIn(rel, why)
+
+    def test_write_before_claim_is_not_a_trace(self):
+        # ГРАНИЦА: старый файл следом НЕ является, иначе любое грязное дерево держало бы всё
+        rel = self._file("stale.py", age_sec=7200)
+        state, _ = o._worktree_trace_since(iso_dt(600), status_out=" M " + rel)
+        self.assertIs(state, False)
+
+    def test_git_silence_is_unknown_not_absence(self):
+        # молчание пробы — «не знаю», как и у `tasklist` (класс #171): цена ошибки асимметрична
+        with mock.patch.object(o, "_git_out", lambda args: None):
+            state, why = o._worktree_trace_since(iso_dt(600))
+        self.assertIsNone(state)
+        self.assertIn("git status", why)
+
+    def test_no_claim_window_is_unknown(self):
+        self.assertIsNone(o._worktree_trace_since(None, status_out="?? x.py")[0])
+
+    def test_budget_overflow_is_unknown_not_absence(self):
+        # дерево, не досмотренное до конца, не смеет объявить «следа нет»
+        many = "\n".join("?? f%d.py" % i for i in range(o.WORK_TRACE_MAX_PATHS + 5))
+        self.assertIsNone(o._worktree_trace_since(iso_dt(600), status_out=many)[0])
+
+    # --- МУТАНТ В ОБЕ СТОРОНЫ на боевом пути сторожа -------------------------
+
+    def test_alive_and_writing_is_not_buried(self):
+        # СТОРОНА 1: исполнитель «мёртв» пробой процессов, но продукт лёг на диск ПОСЛЕ claim.
+        # Ровно сцена 134 — и ровно её сторож обязан НЕ хоронить.
+        tid = self._orphan_row()
+        rel = self._file("docs/artifacts/2026-09-20-69a-PROBA.md", age_sec=30)
+        self._reap("?? " + rel)
+        self.assertEqual(self.fb.tasks[tid]["status"], "in_progress",
+                         "заход, пишущий свой артефакт, похоронен как сирота — класс 134 жив")
+
+    def test_no_executor_and_no_trace_is_buried(self):
+        # СТОРОНА 2: исполнителя нет и работы нет нигде → короткий порог как прежде
+        tid = self._orphan_row()
+        self._file("stale.py", age_sec=7200)                 # дерево грязное, но СТАРОЕ
+        self._reap(" M stale.py")
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertIn("СИРОТА", self.fb.tasks[tid]["result"])
+
+    def test_counterfact_rollback_switch_buries_the_same_row(self):
+        # КОНТРФАКТ: ТОТ ЖЕ вход при снятой правке даёт ДРУГОЙ ответ. Рубильник отката —
+        # единственное отличие между этим тестом и первой стороной мутанта.
+        tid = self._orphan_row()
+        rel = self._file("docs/artifacts/2026-09-20-69a-PROBA.md", age_sec=30)
+        with mock.patch.dict(os.environ, {"PC_WORK_HOLD_OFF": "1"}):
+            self._reap("?? " + rel)
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed",
+                         "без правки та же сцена обязана хорониться — иначе контрфакт пуст")
+        self.assertIn("СИРОТА", self.fb.tasks[tid]["result"])
+
+    # --- границы удержания ---------------------------------------------------
+
+    def test_never_ran_is_not_held_by_someone_elses_trace(self):
+        # ЗАМОК НА ЗАМЕР 05.08: ряд, который НЕ ЗАПУСКАЛСЯ (случай 305), снимается быстро даже
+        # при свежем следе — след тогда заведомо чужой, а ждать своего исполнителя нечего.
+        tid = self.fb.add(status="in_progress", updated=iso_ago(self.AGE))   # отметки старта НЕТ
+        o._task_started_mark(90003, now=iso_dt(50000))       # реестр застал бы её старт
+        rel = self._file("docs/artifacts/2026-09-20-69a-PROBA.md", age_sec=30)
+        self._reap("?? " + rel)
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertIn("не начинался ни разу", self.fb.tasks[tid]["result"])
+
+    def test_hold_is_a_delay_not_immunity(self):
+        # УДЕРЖАНИЕ НЕ ВЕЧНО: дожив до длинной мерки, ряд закрывается — и итог называет ОБЕ
+        # половины правды (исполнителя нет И след работы был), иначе владелец прочтёт полуправду.
+        tid = self._orphan_row(age=o.PC_SINGLE_STALE + 120)
+        rel = self._file("docs/artifacts/2026-09-20-69a-PROBA.md", age_sec=30)
+        self._reap("?? " + rel)
+        r = self.fb.tasks[tid]["result"]
+        self.assertEqual(self.fb.tasks[tid]["status"], "failed")
+        self.assertIn("след работы", r)
+        self.assertIn("живого исполнителя нет", r)
+        self.assertNotIn("СИРОТА", r)            # это НЕ сирота: работа была, и об этом сказано
+
+    def test_unknown_trace_holds_too(self):
+        # «не знаю» про дерево судится длинной меркой — как и «не знаю» про процесс
+        tid = self._orphan_row()
+        with mock.patch.object(o, "_git_out", lambda args: None), \
+             mock.patch.object(o.subprocess, "run", TestOrphanNoExecutor._tasklist()):
+            o.process_stuck_singles()
+        self.assertEqual(self.fb.tasks[tid]["status"], "in_progress")
+
+    def test_live_executor_path_unchanged(self):
+        # РЕГРЕСС: у живого ребёнка правка не меняет ничего — она живёт только на ветке `alive is False`
+        tid = self._orphan_row()
+        self._file("docs/artifacts/2026-09-20-69a-PROBA.md", age_sec=30)
+        with mock.patch.object(o.subprocess, "run",
+                               TestOrphanNoExecutor._tasklist(31337, porcelain="?? x.md")):
+            o.process_stuck_singles()
+        self.assertEqual(self.fb.tasks[tid]["status"], "in_progress")
+
+    def test_probe_reads_the_tree_without_touching_the_index(self):
+        # ЗАМОК НА ИНДЕКС: в витке два захода и один индекс. Сторож обязан читать дерево
+        # ключом `--no-optional-locks`, иначе обновление индекса поспорит с чужим живым коммитом.
+        seen = {}
+
+        def spy(args):
+            seen["argv"] = list(args)
+            return ""
+
+        with mock.patch.object(o, "_git_out", spy):
+            o._worktree_trace_since(iso_dt(600))
+        self.assertIn("--no-optional-locks", seen["argv"])
+        self.assertIn("status", seen["argv"])
 
 
 class TestTerminalIrreversible(Base):
