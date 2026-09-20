@@ -19,8 +19,17 @@ test_utf8_output_guard.py — СТРАЖ класса кодировки выв�
      (FileHandler/basicConfig(filename=)) задаёт encoding= явно. force_utf8() эту полосу НЕ
      закрывает — он трогает только stdout/stderr; файл берёт локаль (cp1251) → эмодзи 📊 в
      open(log,'w')/log.info падает 'charmap' ровно как в пайпе (потенциальный ЧЕТВЁРТЫЙ укус).
+  D) ЧТЕНИЕ СВОЕГО stdin: КАЖДЫЙ модуль, забирающий ТЕКСТ со stdin, объявляет на этом канале
+     utf-8 явно — ланевым `io_utf8.read_stdin_utf8()`, `sys.stdin.reconfigure(encoding=…)` либо
+     собственным чтением байтов через `.buffer`. Полоса заведена 20.09.2026 (задание 68v) ПОСЛЕ
+     укуса, а не до: дверь экзамена читала трубу голым `sys.stdin.read()`, и три урока владельца,
+     написанные своими словами 18–19.09, легли в базу живого набора мохибейком
+     («РљР°СЃР°РµРјРѕ …» вместо «Касаемо …», 175 символов у ловца против 305 на диске).
+     Отличие полосы D от прочих в том, что она МОЛЧАЛИВА до конца: длина растёт, текст непустой,
+     обратное чтение сходится, ни один гард не краснеет — ошибку видит только владелец.
 Новое место (print-скрипт без force_utf8 / text=True без encoding / open()|FileHandler|
-basicConfig(filename=) без encoding) валит гейт — класс не вернётся молча.
+basicConfig(filename=) без encoding / чтение stdin без объявленного utf-8) валит гейт — класс не
+вернётся молча.
 
 ГРАНИЦЫ задачи: userbot_listen.py, moderation_bot.py и клиентский suggest.py тут НЕ проверяются
 (их правка запрещена контуром) — тот же класс на них остаётся отдельным остатком.
@@ -66,6 +75,19 @@ _RUNNERS = {"run", "Popen", "check_output"}
 # log_setup.py — центральная фабрика RotatingFileHandler для ОБОИХ логов (pc_agent+pc_orchestrator):
 # оброни там encoding — и оба лога разом уедут в cp1251, потому держим её под стражем в первую очередь.
 FILE_WRITERS = SUBPROCESS_READERS + ("log_setup.py",)
+
+# Полоса D — модули контура, забирающие ТЕКСТ СО СВОЕГО stdin. Перечень открытый, как и у полос
+# A–C, и слабость у него та же (родившееся позже для стража не существует), — поэтому сюда
+# поимённо внесены все четыре места, где класс уже кусал или мог бы: дверь экзамена (укус 18.09),
+# писатель журнала (укус 29.07), писатель мозга и гард. `pc_orchestrator` держим здесь ради
+# ОТРИЦАТЕЛЬНОГО показания: он трогает `sys.stdin` только `isatty()`, текста не читает, и
+# появление в нём чтения обязано сразу потребовать объявленной кодировки.
+STDIN_READERS = ENTRYPOINTS + ("exam_show.py", "brain_writer.py", "pretool_guard.py")
+
+# Как модуль ОБЪЯВЛЯЕТ utf-8 на входной полосе. Три формы, и все три живые в репозитории:
+# ланевое устройство (`exam_show`), reconfigure самого потока (`dispatch_notify`, `pretool_guard`)
+# и собственное чтение байтов (`brain_writer`, `cowork_log_append`).
+_STDIN_TEXT_READS = {"read", "readline", "readlines"}
 
 # Файловые sink'и logging: пишут запись в файл кодировкой ЛОКАЛИ, если не задать encoding= (StreamHandler
 # в набор НЕ входит — его stdout/stderr закрывает force_utf8(), полоса A).
@@ -157,6 +179,51 @@ def logging_file_sink_without_encoding(tree):
     return sorted(bad)
 
 
+def _is_sys_stdin(node):
+    return (isinstance(node, ast.Attribute) and node.attr == "stdin"
+            and isinstance(node.value, ast.Name) and node.value.id == "sys")
+
+
+def _declares_stdin_utf8(tree):
+    """Объявил ли модуль utf-8 на ВХОДНОЙ полосе (любой из трёх живых форм)."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _callee_name(node.func)
+        if name == "read_stdin_utf8":
+            return True
+        if (name == "reconfigure" and _has_kw(node, "encoding")
+                and isinstance(node.func, ast.Attribute) and _is_sys_stdin(node.func.value)):
+            return True
+        if (name == "getattr" and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "buffer"):
+            return True
+        if isinstance(node.func, ast.Attribute) and node.func.attr in _STDIN_TEXT_READS:
+            v = node.func.value
+            if isinstance(v, ast.Attribute) and v.attr == "buffer":
+                return True
+    return False
+
+
+def stdin_text_reads(tree):
+    """→ [lineno] мест, где модуль забирает ТЕКСТ со `sys.stdin`.
+
+    Два вида: `sys.stdin.read()` (и родня) и `json.load(sys.stdin)` — передача самого потока
+    чужому разбору. `sys.stdin.isatty()` сюда НЕ идёт: это вопрос о терминале, а не текст.
+    `getattr(sys.stdin, "buffer", …)` тоже нет — это и есть правильное чтение байтов."""
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if (isinstance(node.func, ast.Attribute) and node.func.attr in _STDIN_TEXT_READS
+                and _is_sys_stdin(node.func.value)):
+            out.append(node.lineno)
+        elif (_callee_name(node.func) != "getattr"
+              and any(_is_sys_stdin(a) for a in node.args)):
+            out.append(node.lineno)
+    return sorted(set(out))
+
+
 def calls_force_utf8(tree):
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and _callee_name(node.func) == "force_utf8":
@@ -217,6 +284,54 @@ class TestFileWritesUtf8(unittest.TestCase):
             offenders, {},
             "FileHandler/basicConfig(filename=) без encoding= пишет лог кодировкой локали → эмодзи "
             "в log.info падает 'charmap'. Добавь encoding='utf-8'. Строки: %s" % offenders)
+
+
+class TestStdinReadsUtf8(unittest.TestCase):
+    """Полоса ЧТЕНИЯ СВОЕГО stdin: кто забирает оттуда текст — объявляет utf-8 явно.
+
+    ПРОВЕРКА НА МОДУЛЬ, а не на строку, и это сознательно (тот же приём, что у полосы A):
+    `reconfigure` чинит ВЕСЬ поток процесса разом, и требовать объявления у каждого чтения
+    значило бы плодить второй переключатель рядом с первым — класс 539."""
+
+    def test_no_stdin_text_read_without_declared_utf8(self):
+        offenders = {}
+        for n in STDIN_READERS:
+            tree = _parse(n)
+            bad = stdin_text_reads(tree)
+            if bad and not _declares_stdin_utf8(tree):
+                offenders[n] = bad
+        self.assertEqual(
+            offenders, {},
+            "чтение stdin без объявленного utf-8 декодирует ТРУБУ кодировкой локали Windows "
+            "(cp1251) → мохибейк, которого не видит ни один гард: длина растёт, текст непустой, "
+            "обратное чтение сходится. Читай io_utf8.read_stdin_utf8(). Строки: %s" % offenders)
+
+    def test_the_guard_itself_bites_and_stays_quiet_on_the_right_shape(self):
+        """МУТАНТ САМОГО СТРАЖА, в обе стороны. Без него «зелено» значило бы только «детектор
+        ничего не находит» — а полоса D как раз и опасна тем, что молчит при поломке."""
+        bare = ast.parse("import sys\ntext = sys.stdin.read()\n")
+        self.assertEqual(stdin_text_reads(bare), [2])
+        self.assertFalse(_declares_stdin_utf8(bare))
+        lane = ast.parse("import io_utf8\ntext = io_utf8.read_stdin_utf8()\n")
+        self.assertEqual(stdin_text_reads(lane), [])
+        self.assertTrue(_declares_stdin_utf8(lane))
+        switched = ast.parse('import sys\nsys.stdin.reconfigure(encoding="utf-8")\n'
+                             "text = sys.stdin.read()\n")
+        self.assertEqual(stdin_text_reads(switched), [3])
+        self.assertTrue(_declares_stdin_utf8(switched), "reconfigure не засчитан объявлением")
+        handed = ast.parse("import json, sys\nd = json.load(sys.stdin)\n")
+        self.assertEqual(stdin_text_reads(handed), [2], "поток, отданный чужому разбору, пропущен")
+        tty = ast.parse("import sys\nok = sys.stdin.isatty()\n")
+        self.assertEqual(stdin_text_reads(tty), [], "isatty принят за чтение текста")
+
+    def test_the_bitten_door_is_actually_under_this_guard(self):
+        """ОТРИЦАТЕЛЬНОЕ ПОКАЗАНИЕ СТРАЖА: если бы дверь экзамена не читала stdin вовсе, полоса
+        была бы зелёной ни от чего. Проверяем, что предмет у неё есть и он объявлен."""
+        tree = _parse("exam_show.py")
+        self.assertTrue(_declares_stdin_utf8(tree),
+                        "дверь экзамена перестала объявлять utf-8 на входе")
+        self.assertEqual(stdin_text_reads(tree), [],
+                         "у двери снова есть чтение stdin мимо ланевого устройства")
 
 
 class TestOutOfScopeListedHonestly(unittest.TestCase):
