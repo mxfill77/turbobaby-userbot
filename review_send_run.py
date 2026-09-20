@@ -216,6 +216,23 @@ def journal_argv(repo=HERE, python=None):
 
 # ───────────────────────────── канал Codex (CLI) ─────────────────────────────
 
+# Голова канала — ОДНО значение полосы, живущее РОВНО здесь. Три боевые двери
+# (демон `review_auto_run.tick` → `_ChannelArgs`, повтор очереди
+# `review_outbox_queue_run.retry_argv`, ручной вызов) зовут `send_codex` без
+# имени модели, и до 20.09.2026 `-m` в argv не появлялся НИ РАЗУ: имя выбирал
+# сам CLI. Выбирал он `gpt-6-astra` — строки, которой в бинаре v0.151.0 нет
+# вовсе, — и их сервер отвечал `400 invalid_request_error` «requires a newer
+# version of Codex»: 26 карточек лотка подряд с 12.09 по 20.09, ответов 0.
+# `gpt-5.6-terra` тут не догадка: это голова ПОСЛЕДНЕГО УСПЕШНОГО захода канала
+# (дословная шапка живого прогона 01.09 —
+# `docs/artifacts/2026-09-01-разведка-каналов-ревью.md`, стр. 53), и она же
+# лежит строкой в самом `codex.exe` 0.151.0.
+# Ручки в окружении здесь нет СОЗНАТЕЛЬНО (класс #194, как `EXECUTOR_MODEL`
+# демона): застрявшее в чьём-то `.env` имя не смеет молча переключить голову
+# канала. Смена модели — правка этой строки и коммит; явный `--codex-model`
+# по-прежнему сильнее умолчания.
+DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
+
 
 def resolve_codex(explicit=None):
     """Путь к запускаемому Codex. → str | None.
@@ -263,6 +280,9 @@ def send_codex(prompt, *, root, workdir, binary=None, model=None, cd=None, timeo
         os.remove(out_path)
 
     argv = [exe, "exec", "--sandbox", sandbox, "--color", "never", "--output-last-message", out_path]
+    # Молчание вызывающего — это НЕ «пусть решает CLI»: именно так канал и лёг.
+    # Имя берётся из единственного места полосы, а названное явно сильнее его.
+    model = model or DEFAULT_CODEX_MODEL
     if model:
         argv += ["-m", model]
     if cd:

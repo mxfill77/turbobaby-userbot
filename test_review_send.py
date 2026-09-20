@@ -1044,5 +1044,105 @@ class ManusPartsIntoOneTaskTest(unittest.TestCase):
         self.assertEqual(review_send_run.manus_parts_seen(_live_empty_body(), 9), [1])
 
 
+# ───────── ручка модели канала codex (заведена 20.09.2026, ключ Штаба 68z.2009) ─────────
+#
+# Повод корпусом, а не мнением (замер 20.09 по `docs/review_inbox/*-codex.md`):
+# 26 карточек подряд с 12.09 по 20.09 — `КАНАЛ ОТКАЗАЛ` / `channel_error`, и у
+# всех одна причина: их сервер отвечает `400 invalid_request_error` на модель
+# `gpt-6-astra`, которую выбирает САМ CLI v0.151.0, потому что ни одна из трёх
+# боевых дверей (демон · повтор очереди · ручной вызов) имени модели не называла —
+# `--codex-model` у всех трёх пуст (default=None), и `-m` в argv не появлялся ни
+# разу. Ниже — замок на то, что имя доезжает до argv ЛЮБОЙ дверью, что явный
+# флаг по-прежнему сильнее умолчания и что значение лежит в ОДНОМ месте, а не
+# переписано трижды.
+
+
+class _CodexArgvSpy(object):
+    """Перехват запуска канала: argv записан, наружу не ушло ни байта."""
+
+    def __init__(self):
+        self.argv = None
+
+    def __call__(self, argv, **kw):
+        self.argv = list(argv)
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+
+class CodexModelHandle(unittest.TestCase):
+    def _spy(self):
+        spy = _CodexArgvSpy()
+        real = subprocess.run
+        subprocess.run = spy
+        self.addCleanup(setattr, subprocess, "run", real)
+        return spy
+
+    def _ctx(self, tmp):
+        return dict(
+            pack_name=PACK_NAME,
+            pack_sha256=PACK_SHA,
+            prompt_sha256=PROMPT_SHA,
+            send_date=DATE,
+            root=tmp,
+            workdir=tmp,
+        )
+
+    def test_model_reaches_argv_when_the_caller_names_nothing(self):
+        """Дверь молчит об имени — имя берётся из умолчания полосы, а не у CLI."""
+        spy = self._spy()
+        with tempfile.TemporaryDirectory() as tmp:
+            # `binary=__file__` — заведомо существующий файл: резолвер вернёт его,
+            # а запуска не будет вовсе (subprocess.run перехвачен).
+            facts = review_send_run.send_codex("текст пакета", root=tmp, workdir=tmp, binary=__file__)
+        argv = spy.argv
+        self.assertIn("-m", argv, "имени модели нет в строке запуска; argv двери: %r" % (argv,))
+        self.assertEqual(argv[argv.index("-m") + 1], review_send_run.DEFAULT_CODEX_MODEL)
+        self.assertIn(review_send_run.DEFAULT_CODEX_MODEL, facts["target"],
+                      "адрес канала в карточке обязан называть модель: %r" % (facts["target"],))
+
+    def test_explicit_flag_is_stronger_than_the_default(self):
+        """`--codex-model` остаётся ручкой: названное имя сильнее умолчания."""
+        spy = self._spy()
+        with tempfile.TemporaryDirectory() as tmp:
+            review_send_run.send_codex("текст", root=tmp, workdir=tmp, binary=__file__, model="имя-из-ручки")
+        argv = spy.argv
+        self.assertEqual(argv[argv.index("-m") + 1], "имя-из-ручки")
+        self.assertNotIn(review_send_run.DEFAULT_CODEX_MODEL, argv)
+
+    def test_daemon_door_carries_the_model_too(self):
+        """Дверь 1: демон собирает ровно `_ChannelArgs` с `codex_model=None`."""
+        import review_auto_run
+
+        args = review_auto_run._ChannelArgs(30, review_send_run.DEFAULT_KEY_ENV)
+        self.assertIsNone(args.codex_model, "проверяем именно случай «демон имени не называет»")
+        args.codex_bin = __file__
+        spy = self._spy()
+        with tempfile.TemporaryDirectory() as tmp:
+            review_send_run.run_channel("codex", "текст пакета", self._ctx(tmp), args)
+        self.assertIn("-m", spy.argv, "argv двери демона: %r" % (spy.argv,))
+        self.assertEqual(spy.argv[spy.argv.index("-m") + 1], review_send_run.DEFAULT_CODEX_MODEL)
+
+    def test_retry_door_names_no_model_and_still_gets_one(self):
+        """Дверь 2: повтор очереди зовёт ТОТ ЖЕ отправщик без флага — имя приходит умолчанием."""
+        import review_outbox_queue_run
+
+        argv = review_outbox_queue_run.retry_argv(
+            {"kind": "resend", "pack": "docs/review_outbox/x.md", "channel": "codex"},
+            root=os.path.dirname(os.path.abspath(__file__)),
+        )
+        self.assertNotIn("--codex-model", argv, "повтор флага не несёт — и не обязан: %r" % (argv,))
+        self.assertTrue(argv[1].endswith(review_outbox_queue_run.SENDER))
+        self.assertTrue(review_send_run.DEFAULT_CODEX_MODEL.strip(), "пустое умолчание вернуло бы выбор CLI")
+
+    def test_value_lives_in_exactly_one_place(self):
+        """Имя написано ОДИН раз и только у отправщика: три копии разъехались бы молча."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        name = review_send_run.DEFAULT_CODEX_MODEL
+        with io.open(review_send_run.__file__, "r", encoding="utf-8") as fh:
+            self.assertEqual(fh.read().count('"%s"' % name), 1)
+        for rel in ("review_auto_run.py", "review_outbox_queue_run.py", "pc_orchestrator.py"):
+            with io.open(os.path.join(here, rel), "r", encoding="utf-8") as fh:
+                self.assertNotIn(name, fh.read(), "%s держит вторую копию имени модели" % rel)
+
+
 if __name__ == "__main__":
     unittest.main()
