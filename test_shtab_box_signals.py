@@ -852,7 +852,12 @@ class TestExternal(unittest.TestCase):
                             _ext(42)], budget=50)
         a = [s for s in rep["signals"] if s["sig"] == sig.SIG_A][0]
         self.assertFalse(a["on"], a["why"])
-        self.assertIn("вычеркнуто внешних отказов: 1", a["why"])
+        # СЛОВА ПОМЕНЯЛИСЬ 20.09.2026 (задание 68i), СУТЬ — НЕТ, и тест не ослаблен,
+        # а усилен: прежде строка называла ЧИСЛО вычеркнутых, теперь ещё и СОРТ
+        # каждого с адресом сигнала. «Вычеркнуто 7» без имён ровно так и прятало от
+        # владельца два ряда, которые внешними отказами не были.
+        self.assertIn("внешний отказ: 1 — их считает сигнал Д", a["why"])
+        self.assertIn("вычеркнуто из корпуса А", a["why"])
 
     def test_two_of_ours_still_stop_the_box_through_a_foreign_one(self):
         """Соседство считается по НАШИМ рядам: льгота сигнал не ослабила."""
@@ -2135,6 +2140,184 @@ class TestReasonClassReadsMarksInPlace63c(unittest.TestCase):
                 cls, how = sig.reason_class(head + "провал [причина=%s · имя]: подробности" % code)
                 self.assertEqual(("%s (%s)" % (sig.FAIL_NAMES[code], code), "код причины"),
                                  (cls, how))
+
+
+# ═══════════ ТРИ ИСХОДА РАЗВЕДЕНЫ (20.09.2026, задание 68i) ═══════════════════
+# ЖИВЫЕ РЯДЫ, А НЕ ВЫДУМАННЫЕ. Все три формы сняты с корпуса 19.09.2026
+# (`pc_orchestrator.shtab_box_hold.jsonl` — четыре подъёма А за вечер; журнал
+# серверного демона — тело #113):
+#   • #111/#112 — наш провал полосы ПК: сорт `наша недоказанная`, кормит А;
+#   • #114 — lane=vps, status=done, реестра вердиктов ПК о нём нет и быть не может
+#     (пишет его ПК-демон, а ряд закрывал серверный) → сорт `не прочитано судьёй`;
+#   • #113 — lane=vps, exec_error, 19.8 с, tokens_in=0 tokens_out=0 → заход не
+#     начинался, но различитель внешнего отказа читает литералы ПК-демона и на
+#     чужой формат ответить НЕ МОЖЕТ → сорт `итог чужой полосы`.
+# ТЕКСТ ЧУЖОГО ДЕМОНА ВЗЯТ ДОСЛОВНО (VPS `status_truth.fail_result`, ветка «следов
+# нет»): его голова и хвост ОБЕ не совпадают с ПК-литералами — это и есть материальная
+# причина, по которой ряд #113 нельзя опознать здесь.
+VPS_FAIL = ("провал [причина=exec_error · ошибка выполнения]: задача упала → думатель: halt, "
+            "причина: exit=1. СЛЕДОВ РАБОТЫ в окне 19.09 15:50–15:51 UTC не найдено "
+            "(коммитов 0, записей журнала 0) — судя по уликам, работа не начиналась либо "
+            "оборвалась до первого следа.")
+
+
+def _vps(tid, status="failed", result=VPS_FAIL, day=TODAY, key=None):
+    """Ряд ЧУЖОЙ полосы. Поле `lane` — то же, что кладёт мост и читает `shtab_box.row_lane`."""
+    row = _closed(tid, status, result, day=day, key=key)
+    row["lane"] = sb.LANE_VPS
+    return row
+
+
+def _ours_fail(tid, day=TODAY, key=None):
+    """НАСТОЯЩИЙ провал нашей полосы: код причины наш, следов нет, внешним не бывает."""
+    return _closed(tid, "failed", "провал [причина=run_timeout · таймаут прогона]: 2700s. "
+                                  + NO_TRACE_TAIL, day=day, key=key)
+
+
+class TestThreeOutcomesSplit68i(unittest.TestCase):
+    """Сигнал А кормит РОВНО ОДИН сорт, и это проверяется числом с обеих сторон."""
+
+    # ── п.1: три разных исхода больше не один ────────────────────────────
+    def test_three_live_rows_get_three_different_sorts(self):
+        """Один вход — три РАЗНЫХ имени исхода, а не одно «недоказана»."""
+        self.assertEqual(sig.SORT_OURS, sig.sort_of(_ours_fail(112), {})[0])
+        self.assertEqual(sig.SORT_FOREIGN, sig.sort_of(_vps(113), {})[0])
+        self.assertEqual(sig.SORT_UNREAD, sig.sort_of(_vps(114, "done", ""), {})[0])
+        self.assertEqual(sig.SORT_EXT, sig.sort_of(_ext(101), {})[0])
+        # ИМЯ РЯДА ПОДНИМАЕТСЯ ИЗ `goal`, а `goal` кладёт `box_rows` — спрашивать судью
+        # о сыром ряде очереди нельзя ни здесь, ни в бою (тот же класс, что правка 11.09).
+        self.assertEqual(sig.SORT_PROVED,
+                         sig.sort_of(sig.box_rows([_closed(9)])[0],
+                                     _ledger((9, True, True))(None)[0])[0])
+
+    def test_every_sort_names_the_signal_that_counts_it(self):
+        """Вычерк без адреса и есть та самая «вычеркнуто: 7» — читатель обязан видеть КУДА."""
+        self.assertEqual({sig.SORT_OURS: sig.SIG_A, sig.SORT_EXT: sig.SIG_E,
+                          sig.SORT_UNREAD: sig.SIG_F, sig.SORT_FOREIGN: sig.SIG_G},
+                         sig.SORT_SIGNAL)
+        rep = _tick(closed=[_ext(101), _vps(113), _vps(114, "done", ""), _ours_fail(115)],
+                    budget=50)
+        why = [s for s in rep["signals"] if s["sig"] == sig.SIG_A][0]["why"]
+        for word in (sig.SORT_EXT, sig.SORT_UNREAD, sig.SORT_FOREIGN,
+                     sig.SIG_E, sig.SIG_F, sig.SIG_G):
+            self.assertIn(word, why)
+
+    # ── п.4: ОТРИЦАТЕЛЬНЫЙ ТЕСТ, обе половины ЧИСЛОМ ─────────────────────
+    def test_NEGATIVE_two_external_refusals_do_NOT_raise_signal_a(self):
+        """Пара «внешний отказ + внешний отказ» — сигнал А НЕ встаёт. Число: наших 0."""
+        rep = _tick(closed=[_ext(101), _ext(102)], budget=50)
+        a = [s for s in rep["signals"] if s["sig"] == sig.SIG_A][0]
+        self.assertFalse(a["on"], a["why"])
+        self.assertEqual(0, a["count"])
+        self.assertIn("из них наших 0", a["why"])
+        self.assertEqual("", rep["stop"])
+
+    def test_NEGATIVE_two_foreign_lane_failures_do_NOT_raise_signal_a(self):
+        """Та же пара, но сорт «итог чужой полосы» — живая форма #113. А молчит."""
+        rep = _tick(closed=[_vps(113), _vps(119)], budget=50)
+        a = [s for s in rep["signals"] if s["sig"] == sig.SIG_A][0]
+        self.assertFalse(a["on"], a["why"])
+        self.assertEqual(0, a["count"])
+
+    def test_NEGATIVE_a_delivered_row_the_judge_never_read_does_NOT_raise_signal_a(self):
+        """Живая пара 19.09 18:06 (#113+#114) — ни одного настоящего провала. А молчит."""
+        rep = _tick(closed=[_vps(113), _vps(114, "done", "")], budget=50)
+        a = [s for s in rep["signals"] if s["sig"] == sig.SIG_A][0]
+        self.assertFalse(a["on"], a["why"])
+        self.assertEqual(0, a["count"])
+
+    def test_POSITIVE_two_real_failures_DO_raise_signal_a(self):
+        """Пара «настоящий провал + настоящий провал» — А встаёт, числом 2."""
+        rep = _tick(closed=[_ours_fail(111), _ours_fail(112)], budget=50)
+        a = [s for s in rep["signals"] if s["sig"] == sig.SIG_A][0]
+        self.assertTrue(a["on"], a["why"])
+        self.assertEqual(sig.STREAK_FLOOR, a["count"])
+        self.assertEqual(["#111", "#112"], a["evidence"])
+        self.assertIn("СИГНАЛЬНАЯ ОСТАНОВКА ЯЩИКА", rep["stop"])
+
+    # ── п.5: КОНТРФАКТ — со снятой правкой тот же вход даёт ДРУГОЙ ответ ─
+    def test_COUNTERFACT_the_old_condition_raises_signal_a_on_the_very_same_input(self):
+        """Прежнее условие (корпус = всё, кроме опознанного внешнего) на том же входе ВСТАЁТ."""
+        rows = sig.box_rows([_vps(113), _vps(114, "done", "")])
+        # ДОСЛОВНО прежняя строка корпуса сигнала А до 20.09.2026 (одна, коммит до правки):
+        old_corpus = [r for r in rows if not sig.external_refusal(r)[0]]
+        old_tail = old_corpus[-sig.STREAK_FLOOR:]
+        old_on = (len(old_tail) == sig.STREAK_FLOOR
+                  and not any(sig.proved(r, {})[0] for r in old_tail))
+        self.assertTrue(old_on, "прежнее условие обязано вставать — иначе контрфакта нет")
+        new = sig.signal_a(rows, {})
+        self.assertFalse(new["on"], new["why"])
+        self.assertNotEqual(old_on, new["on"])
+
+    # ── п.3: ПРАВО НЕ ОСЛАБЛЕНО ──────────────────────────────────────────
+    def test_RIGHT_is_not_weakened_owner_word_only_and_no_self_release_branch(self):
+        """Снимает ТОЛЬКО владелец, ветки самоснятия у новых сигналов НЕТ ни одной."""
+        for one in (sig.signal_f([_vps(i, "done", "") for i in (1, 2, 3)], {}),
+                    sig.signal_g([_vps(i) for i in (1, 2, 3)], {})):
+            self.assertTrue(one["on"], one["why"])
+            self.assertEqual(sig.BY_OWNER, one["release"])
+            self.assertTrue(one["enforced"])
+            self.assertTrue(one["determinate"])
+            self.assertTrue(one["mark"])
+            self.assertNotIn(sig.BY_DAY, one["why"])
+            self.assertNotIn(sig.BY_ITSELF, one["why"])
+
+    def test_RIGHT_is_not_weakened_the_new_sorts_still_stop_the_box(self):
+        """Разведение — не льгота: три подряд каждого нового сорта ДЕРЖАТ ящик."""
+        for closed in ([_vps(i, "done", "") for i in (11, 12, 13)],
+                       [_vps(i) for i in (21, 22, 23)]):
+            rep = _tick(closed=closed, budget=50)
+            self.assertIn("СИГНАЛЬНАЯ ОСТАНОВКА ЯЩИКА", rep["stop"])
+            self.assertIn("ТОЛЬКО словом владельца", rep["stop"])
+
+    def test_RIGHT_is_not_weakened_signal_a_behaviour_on_refusal_is_byte_identical(self):
+        """Поведение при отказе прибора не изменилось: «не знаю» по-прежнему «стоп»."""
+        for kw in ({"rows_ok": False}, {"judged_ok": False}):
+            one = sig.signal_a([], {}, day=TODAY, **kw)
+            self.assertTrue(one["on"], one["why"])
+            self.assertEqual(sig.BY_OWNER, one["release"])
+            self.assertFalse(one["determinate"])
+            self.assertIn("«не знаю» значит «стоп»", one["why"])
+
+    def test_the_owner_refusal_still_feeds_signal_a_border_named_aloud(self):
+        """ГРАНИЦА ВСЛУХ: решение владельца из А не уводили — сигнал не ослаблен сверх заказа."""
+        row = _closed(60, "failed", ctl.REJECT_MARK + ": не надо")
+        self.assertEqual(sig.SORT_OURS, sig.sort_of(row, {})[0])
+
+    def test_a_blind_or_unproved_verdict_still_feeds_signal_a(self):
+        """Судья ПРОЧИТАЛ и сказал «нет» — это наша работа, а не поломка судьи."""
+        rows_led, _ok, _w = _ledger((71, False, True), (72, False, False))(None)
+        got = sig.box_rows([_closed(71), _closed(72)])
+        self.assertEqual(sig.SORT_OURS, sig.sort_of(got[0], rows_led)[0])  # судья: «не доказана»
+        self.assertEqual(sig.SORT_OURS, sig.sort_of(got[1], rows_led)[0])  # судья: «без адреса»
+
+    # ── счёт сортов и невычеркнутые ряды ─────────────────────────────────
+    def test_the_tally_always_names_all_five_sorts(self):
+        """Ключ без значения читался бы как «сорта не существует»."""
+        self.assertEqual({s: 0 for s in sig.SORTS}, sig.sort_tally([], {}))
+        got = sig.sort_tally(sig.box_rows([_ours_fail(1), _ext(2), _vps(3),
+                                           _vps(4, "done", "")]), {})
+        self.assertEqual({sig.SORT_OURS: 1, sig.SORT_EXT: 1, sig.SORT_FOREIGN: 1,
+                          sig.SORT_UNREAD: 1, sig.SORT_PROVED: 0}, got)
+
+    def test_a_proved_row_between_two_failures_still_breaks_the_streak(self):
+        """Доказанная задача РВЁТ череду — вычёркиваются только три немых сорта."""
+        rows = sig.box_rows([_ours_fail(81), _closed(82)])
+        one = sig.signal_a(rows, _ledger((82, True, True))(None)[0])
+        self.assertFalse(one["on"], one["why"])
+
+    def test_box_rows_carries_the_lane_from_its_single_owner(self):
+        """Полоса спрашивается у `shtab_box.row_lane`, второго правила не заводится."""
+        got = sig.box_rows([_closed(1), _vps(2)])
+        self.assertEqual([sb.LANE_PC, sb.LANE_VPS], [r["lane"] for r in got])
+        for raw, row in zip([_closed(1), _vps(2)], got):
+            self.assertEqual(sb.row_lane(raw), row["lane"])
+
+    def test_evaluate_lists_all_seven_signals_in_a_fixed_order(self):
+        """Молчащие показываются тоже: список без них читается как «их не существует»."""
+        got = sig.evaluate(closed=[], open_rows=[], judged={}, day=TODAY, left=5, budget=50)
+        self.assertEqual(list(sig.SIGNALS), [s["sig"] for s in got])
+        self.assertEqual(7, len(got))
 
 
 if __name__ == "__main__":            # pragma: no cover
