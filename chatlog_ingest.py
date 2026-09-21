@@ -43,6 +43,7 @@ import os
 import re
 import sys
 import json
+import time
 import argparse
 
 import chatlog_store as store
@@ -378,17 +379,195 @@ def run(sources, verbose=True, dry=False):
     return st
 
 
+# ─────────────────────────── часы захвата: --tick (22.09.2026) ───────────────────────────
+# ЧЕГО НЕ ХВАТАЛО С 05.09: не хранилища, а ЖИВОГО ВЫЗЫВАЮЩЕГО. Модули родились 05.09 одним
+# коммитом (f991db9f), захват отработал один раз руками в 18:42:57 — и больше его не звал никто.
+# Замер 22.09: последний байт архива 05.09 18:43:00, прирост за 16 суток — 0.
+#
+# ПОЧЕМУ НЕ НА ПУТИ ПРИЁМА СООБЩЕНИЯ, как просилось бы по смыслу слова «архив переписки».
+# Две причины, обе с числом:
+#   1) `userbot_listen.py` — КЛИЕНТСКОЕ замыкание (`client_contour.closure()`, замер 22.09:
+#      50 файлов, `userbot_listen.py` внутри), то есть закрытые ворота: правка там — слово
+#      владельца, а не наша;
+#   2) даже будь ворота открыты, место всё равно не там. Захват — ПАКЕТНЫЙ: он перечитывает
+#      `userbot.log(+ротация)`, `dispatch_notify.log`, `delivery_6m.jsonl` и 30 выгрузок целиком
+#      (замер 22.09: 2.17с, 43 104 сообщения за проход). Повешенный на каждое входящее, он стоил
+#      бы 2.17с и полного перечитывания архива НА КАЖДОЕ СООБЩЕНИЕ — квадрат по объёму и
+#      задержка в клиентском ответе ради строки, которая и так уже лежит в журнале на диске.
+# Настоящее место — оборот демона ПК (`pc_orchestrator.poll_once`), который НЕ клиентский
+# (тот же замер: `pc_orchestrator.py` вне замыкания) и уже носит ровно такие вызовы
+# (`_queue_snapshot`, `_srv_delivery`).
+#
+# ЧАСТОТУ РЕШАЕТ ЭТОТ МОДУЛЬ, А НЕ ЗВОНЯЩИЙ. Демон зовёт `--tick` каждый оборот (медиана 172с),
+# а идти ли на диск — решает штамп: `CHATLOG_TICK_EVERY_MIN`, по умолчанию 360 мин = 4 захвата в
+# сутки. Запас против потери огромен: `userbot.log` набирает ≈106 КБ/сут при потолке ротации
+# 5 МБ, то есть перекат раз в ≈47 суток, а бэкап выбрасывается только на четвёртом.
+# ОТКАТ: `CHATLOG_TICK_OFF=1` в окружении демона — ветка мертва целиком, диск не читается вовсе.
+TICK_STATE_ENV = "CHATLOG_TICK_STATE"
+DEFAULT_TICK_STATE = os.path.join(HERE, "tmp", "chatlog_tick", "state.json")
+EVERY_MIN = int(os.environ.get("CHATLOG_TICK_EVERY_MIN", "360"))
+OFF_ENV = "CHATLOG_TICK_OFF"
+
+
+def due(prev, now, every_min=None):
+    """→ bool. Пора ли идти на диск. ЧИСТАЯ: ни диска, ни часов, ни окружения — только счёт.
+
+    Инвариант держит тест `CHATLOG_TICK_PURE`: решение о частоте обязано быть проверяемым без
+    подмены времени и файлов, иначе регресс на нём не напишешь."""
+    every = (EVERY_MIN if every_min is None else every_min) * 60
+    if every <= 0:
+        return True
+    last = float((prev or {}).get("ran_at") or 0)
+    if not last:
+        return True          # штампа нет вовсе — захват ещё не звали ни разу, ждать нечего
+    # Часы могли уехать назад (перевод времени, выход из сна) — отрицательная разница не имеет
+    # права запереть захват навсегда. Копия замка `srv_delivery.due`, класс тот же.
+    return (now - last) >= every or (now - last) < 0
+
+
+def tick_state_path(path=None):
+    return path or (os.getenv(TICK_STATE_ENV) or "").strip() or DEFAULT_TICK_STATE
+
+
+def read_tick_state(path=None):
+    try:
+        with io.open(tick_state_path(path), encoding="utf-8") as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_tick_state(state, path=None):
+    path = tick_state_path(path)
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(state, ensure_ascii=False, indent=1, sort_keys=True))
+    os.replace(tmp, path)
+
+
+LOCK_STALE_S = int(os.environ.get("CHATLOG_TICK_LOCK_STALE_S", "900"))
+
+
+def lock_path(state_path=None):
+    return tick_state_path(state_path) + ".lock"
+
+
+def lock_take(path, now):
+    """→ True, если замок взят ЭТИМ процессом. Единственная атомарная операция, одинаково
+    работающая на Windows и POSIX, — `O_CREAT|O_EXCL`.
+
+    ЗАЧЕМ ВЗАИМНОЕ ИСКЛЮЧЕНИЕ, ХОТЯ ЗАХВАТ ИДЕМПОТЕНТЕН. Дедуп (`store.existing_keys`) читает
+    уже лежащее ДО записи — значит два захвата, читающие ОДНОВРЕМЕННО, видят одно и то же
+    пустое место и оба дописывают. Это не гипотеза: замер 22.09 — два одновременных захвата
+    положили в архив 1118 дублей в 16 файлах дня и побайтно испортили 2 файла (append двух
+    процессов в один файл перемешал строки). Идемпотентность защищает от ПОВТОРА, а не от
+    ОДНОВРЕМЕННОСТИ, и перепутать их стоило архиву целостности.
+
+    Брошенный замок (процесс упал, не дойдя до `finally`) старше `LOCK_STALE_S` перехватывается.
+    Без этой ветки одно падение остановило бы архив НАВСЕГДА и молча — ровно тем способом, от
+    которого мы его сейчас и чиним."""
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, ("%d %d" % (os.getpid(), int(now))).encode("ascii"))
+        finally:
+            os.close(fd)
+        return True
+    except FileExistsError:
+        # Возраст судим по времени ЗАЯВКИ, записанной В САМ замок, а не по mtime файла: у mtime
+        # своя шкала (часы файловой системы), и сверка двух разных шкал даёт ложную «брошенность»
+        # на ровном месте — то есть кражу ЖИВОГО замка, ради предотвращения которой он и заведён.
+        age = None
+        try:
+            with io.open(path, encoding="ascii", errors="replace") as f:
+                age = now - float(f.read().split()[-1])
+        except (OSError, ValueError, IndexError):
+            age = None
+        if age is None:
+            return False                  # замок нечитаем — считаем ЧУЖИМ ЖИВЫМ, это безопасная сторона
+        if abs(age) < LOCK_STALE_S:
+            return False                  # чужой ЖИВОЙ заход — уходим молча, это не ошибка
+        lock_drop(path)                   # брошенный (или часы уехали на четверть часа) — берём
+        return lock_take(path, now)
+    except OSError:
+        return False
+
+
+def lock_drop(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def tick(now=None, every_min=None, state=None, state_path=None, runner=None, sources=None):
+    """Один оборот часов захвата. → dict ТОЛЬКО С ЧИСЛАМИ.
+
+    НИ ОДНОЙ СТРОКИ ПЕРЕПИСКИ НАРУЖУ НИ В ОДНОЙ ВЕТКЕ — включая ветку ошибки. Исключение
+    разбора несёт в себе кусок разбираемой строки (`json.JSONDecodeError` цитирует документ,
+    `UnicodeDecodeError` — байты), поэтому в штамп и в возврат идёт ТОЛЬКО ИМЯ КЛАССА
+    исключения, а `str(e)` не берётся нигде. Держит тест `test_oshibka_ne_vynosit_tekst`.
+
+    ШТАМП СТАВИТСЯ ДО ЗАХОДА, А НЕ ПОСЛЕ. Заход длится ~2.2с (замер 22.09: 43 104 сообщения за
+    проход), и штамп после него оставлял бы эти 2.2с открытыми для второго захода. Замок закрыт
+    дважды: заявкой на штамп и файлом-замком (`lock_take`)."""
+    now = time.time() if now is None else now
+    if os.environ.get(OFF_ENV):
+        return {"ran": False, "why": u"выключено флагом " + OFF_ENV}
+    prev = read_tick_state(state_path) if state is None else dict(state)
+    if not due(prev, now, every_min):
+        return {"ran": False, "why": u"рано", "ran_at": prev.get("ran_at")}
+    lp = lock_path(state_path)
+    if not lock_take(lp, now):
+        return {"ran": False, "why": u"заход уже идёт"}
+    try:
+        fn = runner or (lambda: run(list(sources or SOURCES), verbose=False))
+        new = dict(prev)
+        new["ran_at"] = now                       # ЗАЯВКА: до захода, не после (см. шапку)
+        new["runs"] = int(prev.get("runs") or 0) + 1
+        write_tick_state(new, state_path)
+        try:
+            st = fn()
+        except Exception as e:
+            new["last_error_at"] = now
+            new["last_error"] = type(e).__name__  # ИМЯ КЛАССА, не текст: см. шапку функции
+            new["errors"] = int(prev.get("errors") or 0) + 1
+            write_tick_state(new, state_path)
+            return {"ran": True, "ok": False, "error": type(e).__name__}
+        written = int((st or {}).get("written") or 0)
+        new["written"] = written
+        new["total_written"] = int(prev.get("total_written") or 0) + written
+        new["last_error"] = None
+        write_tick_state(new, state_path)
+        return {"ran": True, "ok": True, "written": written,
+                "dup": int((st or {}).get("dup") or 0),
+                "days": int((st or {}).get("days") or 0)}
+    finally:
+        lock_drop(lp)
+
+
 def _main(argv):
     ap = argparse.ArgumentParser(
         description="Захват в chatlog/ того, что уже лежит на диске. В Telegram не ходит.")
     ap.add_argument("--source", action="append", choices=list(SOURCES) + ["all"],
                     help="источник; можно повторять; по умолчанию all")
     ap.add_argument("--dry", action="store_true", help="прочитать и посчитать, НЕ записывая")
+    ap.add_argument("--tick", action="store_true",
+                    help="оборот часов захвата: идти на диск решает штамп частоты")
+    ap.add_argument("--now", action="store_true",
+                    help="захват немедленно, штамп частоты игнорируем")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
     src = a.source or ["all"]
     sources = list(SOURCES) if "all" in src else [s for s in SOURCES if s in src]
-    res = run(sources, verbose=not a.quiet, dry=a.dry)
+    if a.tick or a.now:
+        res = tick(every_min=(0 if a.now else None), sources=sources)
+    else:
+        res = run(sources, verbose=not a.quiet, dry=a.dry)
     print(json.dumps(res, ensure_ascii=False, sort_keys=True))
     return 0
 

@@ -609,5 +609,356 @@ class TestArchLine(unittest.TestCase):
             self.dn._LAST_SEND.update(save)
 
 
+# ─────────────────── 7. ЧАСЫ ЗАХВАТА: живой вызывающий (22.09.2026) ───────────────────
+# Чего не хватало архиву с 05.09 — не склада, а ВЫЗЫВАЮЩЕГО. Здесь проверяется сам вызов:
+# решение о частоте, штамп, откат, немота ветки ошибки и то, что демон его действительно зовёт.
+# Боевого штампа `tmp/chatlog_tick/state.json` эти тесты НЕ КАСАЮТСЯ ни одной веткой: каждому
+# тесту свой путь во временном каталоге.
+
+class TestTickChasy(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="turbobaby_TESTING_tick_")
+        self.state = os.path.join(self.tmp, "state.json")
+        self._save_off = os.environ.get(ingest.OFF_ENV)
+        os.environ.pop(ingest.OFF_ENV, None)
+
+    def tearDown(self):
+        if self._save_off is None:
+            os.environ.pop(ingest.OFF_ENV, None)
+        else:
+            os.environ[ingest.OFF_ENV] = self._save_off
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # --- решение о частоте: чистая функция ---
+
+    def test_bez_shtampa_idem_srazu(self):
+        """Ровно этот случай и есть 22.09: штампа нет, потому что захват не звали ни разу."""
+        self.assertTrue(ingest.due({}, 1_700_000_000.0, 360))
+        self.assertTrue(ingest.due(None, 1_700_000_000.0, 360))
+
+    def test_svezhiy_shtamp_derzhit(self):
+        now = 1_700_000_000.0
+        self.assertFalse(ingest.due({"ran_at": now - 60}, now, 360))
+        self.assertFalse(ingest.due({"ran_at": now - 359 * 60}, now, 360))
+
+    def test_staryy_shtamp_puskaet(self):
+        now = 1_700_000_000.0
+        self.assertTrue(ingest.due({"ran_at": now - 360 * 60}, now, 360))
+        self.assertTrue(ingest.due({"ran_at": now - 3 * 3600}, now, 60))
+
+    def test_chasy_uehali_nazad_ne_zapirayut_zahvat(self):
+        """Выход из сна и перевод времени дают штамп ИЗ БУДУЩЕГО. Без этой ветки архив встал бы
+        молча и навсегда — ровно тем способом, каким он уже стоял 16 суток."""
+        now = 1_700_000_000.0
+        self.assertTrue(ingest.due({"ran_at": now + 10 ** 6}, now, 360))
+
+    def test_nol_minut_otklyuchaet_chastotu(self):
+        now = 1_700_000_000.0
+        self.assertTrue(ingest.due({"ran_at": now}, now, 0))
+
+    def test_CHATLOG_TICK_PURE(self):
+        """Инвариант: решение о частоте не трогает ни диск, ни часы, ни окружение. Иначе его
+        нельзя проверить регрессом, а непроверяемая частота — это и есть вставший архив."""
+        import inspect
+        src = inspect.getsource(ingest.due)
+        for zapret in ("os.", "io.", "open(", "time.", "getenv", "environ"):
+            self.assertNotIn(zapret, src, "due() перестала быть чистой: %s" % zapret)
+
+    # --- оборот ---
+
+    def _tick(self, **kw):
+        kw.setdefault("state_path", self.state)
+        return ingest.tick(**kw)
+
+    def test_tick_zovet_zahvat_i_pishet_shtamp(self):
+        zvali = []
+        r = self._tick(now=1_700_000_000.0, every_min=360,
+                       runner=lambda: (zvali.append(1) or {"written": 17, "dup": 4, "days": 2}))
+        self.assertEqual(len(zvali), 1)
+        self.assertEqual((r["ran"], r["ok"], r["written"]), (True, True, 17))
+        st = ingest.read_tick_state(self.state)
+        self.assertEqual(st["ran_at"], 1_700_000_000.0)
+        self.assertEqual((st["runs"], st["written"], st["total_written"]), (1, 17, 17))
+
+    def test_vtoroy_tick_srazu_ne_idet_na_disk(self):
+        """Частоту решает модуль, а не звонящий: демон тикает раз в ~172с, а захват — раз в 6 ч."""
+        zvali = []
+        run = lambda: (zvali.append(1) or {"written": 3})
+        self._tick(now=1_700_000_000.0, every_min=360, runner=run)
+        r = self._tick(now=1_700_000_060.0, every_min=360, runner=run)
+        self.assertEqual(len(zvali), 1, "захват пошёл на диск раньше срока")
+        self.assertFalse(r["ran"])
+        r = self._tick(now=1_700_000_000.0 + 6 * 3600, every_min=360, runner=run)
+        self.assertEqual(len(zvali), 2)
+        self.assertEqual(ingest.read_tick_state(self.state)["total_written"], 6)
+
+    def test_otkat_flagom_ubivaet_vetku_celikom(self):
+        zvali = []
+        os.environ[ingest.OFF_ENV] = "1"
+        r = self._tick(now=1_700_000_000.0, every_min=0,
+                       runner=lambda: (zvali.append(1) or {"written": 1}))
+        self.assertEqual(zvali, [], "CHATLOG_TICK_OFF не остановил захват")
+        self.assertFalse(r["ran"])
+        self.assertFalse(os.path.exists(self.state), "выключенная ветка тронула диск")
+
+    def test_oshibka_ne_vynosit_tekst_perepiski(self):
+        """ЗАПРЕТ ЗАДАНИЯ, ПОСТАВЛЕННЫЙ КОДОМ: содержимое переписки не выходит наружу НИ В ОДНОЙ
+        ветке, включая ветку ошибки. `json.JSONDecodeError` цитирует разбираемый документ, а
+        `UnicodeDecodeError` — сырые байты: положи `str(e)` в штамп — и переписка окажется в
+        файле состояния, который никто не считает секретным."""
+        tajna = "клиент просил скидку на нмакс до 12000"
+
+        def padaet():
+            raise ValueError(tajna)
+
+        r = self._tick(now=1_700_000_000.0, every_min=0, runner=padaet)
+        self.assertEqual((r["ran"], r["ok"], r["error"]), (True, False, "ValueError"))
+        st = ingest.read_tick_state(self.state)
+        self.assertEqual((st["last_error"], st["errors"]), ("ValueError", 1))
+        with io.open(self.state, encoding="utf-8") as f:
+            syroy = f.read()
+        self.assertNotIn(tajna, syroy, "текст исключения (а с ним переписка) лёг в штамп")
+        self.assertNotIn("скидку", syroy)
+        self.assertNotIn(tajna, json.dumps(r, ensure_ascii=False))
+
+    # --- взаимное исключение заходов (замер 22.09: 1118 дублей и 2 битых файла) ---
+
+    def test_vtoroy_zahod_pri_vzyatom_zamke_ne_idet(self):
+        """ЖИВОЙ КЛАСС, А НЕ ГИПОТЕЗА: дедуп читает лежащее ДО записи, поэтому два захвата,
+        идущие одновременно, оба видят пустое место и оба дописывают."""
+        lp = ingest.lock_path(self.state)
+        self.assertTrue(ingest.lock_take(lp, 1_700_000_000.0))
+        try:
+            zvali = []
+            r = self._tick(now=1_700_000_000.0, every_min=0,
+                           runner=lambda: (zvali.append(1) or {"written": 9}))
+            self.assertEqual(zvali, [], "второй захват пошёл на диск при взятом замке")
+            self.assertFalse(r["ran"])
+        finally:
+            ingest.lock_drop(lp)
+
+    def test_zamok_snimaetsya_posle_zahoda(self):
+        lp = ingest.lock_path(self.state)
+        self._tick(now=1_700_000_000.0, every_min=0, runner=lambda: {"written": 1})
+        self.assertFalse(os.path.exists(lp), "замок остался висеть после удачного захода")
+        self._tick(now=1_700_000_100.0, every_min=0, runner=lambda: (_ for _ in ()).throw(IOError()))
+        self.assertFalse(os.path.exists(lp), "замок остался висеть после ПАДЕНИЯ захода")
+
+    def test_broshennyy_zamok_perehvatyvaetsya(self):
+        """Без этой ветки одно падение остановило бы архив навсегда и молча — тем самым
+        способом, от которого мы его чиним."""
+        lp = ingest.lock_path(self.state)
+        self.assertTrue(ingest.lock_take(lp, 1_700_000_000.0))
+        pozzhe = 1_700_000_000.0 + ingest.LOCK_STALE_S + 60
+        self.assertTrue(ingest.lock_take(lp, pozzhe), "брошенный замок запер захват навсегда")
+        ingest.lock_drop(lp)
+
+    def test_shtamp_stavitsya_DO_zahoda(self):
+        """2.2с захода — это окно, в которое влезает второй заход. Штамп после захода оставлял
+        бы его открытым; проверяем заявку изнутри самого захода."""
+        vidno = {}
+
+        def dolgiy():
+            vidno.update(ingest.read_tick_state(self.state))
+            return {"written": 2}
+
+        self._tick(now=1_700_000_000.0, every_min=360, runner=dolgiy)
+        self.assertEqual(vidno.get("ran_at"), 1_700_000_000.0,
+                         "штамп не заявлен до захода — окно гонки открыто")
+
+    def test_shtamp_testa_ne_boevoy(self):
+        """Тесты не касаются боевых файлов состояния — проверка самой ручки, а не обещания."""
+        self.assertEqual(ingest.tick_state_path(self.state), self.state)
+        self.assertNotEqual(ingest.tick_state_path(self.state), ingest.DEFAULT_TICK_STATE)
+        self.assertTrue(ingest.DEFAULT_TICK_STATE.endswith(
+            os.path.join("tmp", "chatlog_tick", "state.json")))
+
+
+class TestDemonZovetZahvat(unittest.TestCase):
+    """Вызывающий обязан БЫТЬ, а не быть написанным. Читаем исходник демона, а не верим шапке."""
+
+    def setUp(self):
+        with io.open(os.path.join(HERE, "pc_orchestrator.py"), encoding="utf-8") as f:
+            self.src = f.read()
+
+    def _poll_once_kod(self):
+        """Тело `poll_once` БЕЗ КОММЕНТАРИЕВ — исполняемые строки, а не текст.
+
+        ПОЧЕМУ НЕ ПРОСТО ПОДСТРОКА (найдено мутантом M4, 22.09). Закомментированный вызов
+        содержит ту же подстроку, что и живой: `assertIn('_chatlog_capture("poll")', telo)`
+        зеленел на `# _chatlog_capture("poll")`. Тест, зелёный на мёртвом вызове, сторожем не
+        является — он ровно та тишина, из-за которой архив простоял 16 суток."""
+        i = self.src.index("def poll_once(")
+        stroki = []
+        for syraya in self.src[i:].split("\n")[1:]:
+            if syraya.strip() and not syraya[:1].isspace():
+                break                           # вышли из тела функции по отступу, а не по `def`
+            s = syraya.split("#", 1)[0].strip()  # хвостовой комментарий тоже не код
+            if s and not s.startswith('"""'):
+                stroki.append(s)
+        return stroki
+
+    def test_demon_zovet_chatlog_ingest_tick(self):
+        self.assertIn('"chatlog_ingest.py"), "--tick"', self.src,
+                      "демон не зовёт захват — архив снова без часов")
+
+    def test_vyzov_stoit_v_poll_once(self):
+        self.assertIn('_chatlog_capture("poll")', self._poll_once_kod(),
+                      "вызова нет среди ИСПОЛНЯЕМЫХ строк оборота")
+
+    def test_heartbeat_ostalsya_posledney_strokoy(self):
+        """На этом стоя́т О2 и О4: heartbeat говорит «оборот ЗАМКНУЛСЯ». Захват обязан встать
+        ДО него, иначе новый вызов молча переехал бы смысл двух ожиданий полосы."""
+        kod = self._poll_once_kod()
+        self.assertEqual(kod[-1], "_write_heartbeat()", "heartbeat перестал быть последней строкой")
+        self.assertLess(kod.index('_chatlog_capture("poll")'), kod.index("_write_heartbeat()"))
+
+    def test_pod_testami_demon_ne_spavnit_zahvat(self):
+        """ЗАМЕР, А НЕ ОСТОРОЖНОСТЬ: первый же прогон гейта после появления вызова доехал до
+        живого `poll_once`, запустил ДВА настоящих захвата и положил в БОЕВОЙ архив 1118 дублей
+        в 16 файлах дня плюс 2 побайтно испорченных файла. Проверка обязана отличаться от
+        боевого пути — иначе гейт становится писателем."""
+        i = self.src.index("def _chatlog_capture(")
+        telo = self.src[i:self.src.index("\ndef ", i + 10)]
+        self.assertIn('if "unittest" in sys.modules:', telo,
+                      "гейт снова будет писать в боевой архив")
+        self.assertLess(telo.index('"unittest" in sys.modules'), telo.index("subprocess.Popen"),
+                        "замок стои́т ПОСЛЕ спавна — то есть не стои́т")
+
+    def test_vyzov_bez_importa(self):
+        """Спавн, а не импорт: ребра в графе нет — значит клиентское замыкание не растёт."""
+        self.assertNotIn("import chatlog_ingest", self.src)
+        self.assertNotIn("import chatlog_store", self.src)
+
+
+# ───────── 8. ЧЕТЫРЕ ВЫДУМАННЫХ СООБЩЕНИЯ: что именно ложится в архив ─────────
+# Все четыре придуманы здесь и сейчас; боевой архив не открывается ни на чтение, ни на запись.
+
+class TestVydumannyeSoobshcheniya(_Rooted):
+    def setUp(self):
+        _Rooted.setUp(self)
+        self.src = tempfile.mkdtemp(prefix="turbobaby_TESTING_vyd_")
+        self._save_here = ingest.HERE
+        ingest.HERE = self.src
+
+    def tearDown(self):
+        ingest.HERE = self._save_here
+        shutil.rmtree(self.src, ignore_errors=True)
+        _Rooted.tearDown(self)
+
+    def _put(self, name, body):
+        p = os.path.join(self.src, name)
+        d = os.path.dirname(p)
+        if d and not os.path.isdir(d):
+            os.makedirs(d)
+        with io.open(p, "w", encoding="utf-8", newline="\n") as f:
+            f.write(body)
+        return p
+
+    def _export(self, msgs, cat="vydumannoe", fn="chat.json"):
+        self._put(os.path.join("data_export", cat, fn),
+                  json.dumps({"id": -100999888777, "name": "Выдуманная группа",
+                              "messages": msgs}, ensure_ascii=False))
+
+    # 1. обычное
+    def test_obychnoe_soobshchenie(self):
+        self._put("userbot.log",
+                  "2026-09-22T05:00:00+00:00 | @vydumannyi | Выдуманный | "
+                  "когда можно забрать выдуманный байк\n")
+        w = store.Writer()
+        self.assertEqual(ingest.ingest_userbot(w), 1)
+        w.commit()
+        rows = find.search_days([], group=ingest.GROUP_CLIENT_DM)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("выдуманный байк", rows[0]["text"])
+        self.assertTrue(rows[0]["who_ref"].startswith("p"), "автор не псевдонимизирован")
+        self.assertNotIn("vydumannyi", json.dumps(rows, ensure_ascii=False))
+        self.assertEqual(rows[0]["media"], [])
+
+    # 2. с ответом-на
+    def test_soobshchenie_s_otvetom_na(self):
+        """`reply_to` есть ТОЛЬКО у выгрузок: `userbot.log` его не пишет, значит и взять неоткуда."""
+        self._export([{"id": 11, "from_id": 501, "date": "2026-09-22T06:00:00",
+                       "text": "сколько стоит выдуманная аренда на месяц"},
+                      {"id": 12, "from_id": 502, "date": "2026-09-22T06:01:00",
+                       "text": "выдуманный ответ по цене", "reply_to": 11},
+                      {"id": 13, "from_id": 503, "date": "2026-09-22T06:02:00",
+                       "text": "третий автор, чтобы чат считался группой"}])
+        w = store.Writer()
+        self.assertEqual(ingest.ingest_export(w), 3)
+        w.commit()
+        rows = find.search_days(["выдуманный ответ"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["reply_to"], 11)
+        self.assertEqual(rows[0]["mid"], 12)
+        pervoe = find.search_days(["выдуманная аренда"])[0]
+        self.assertIsNone(pervoe["reply_to"], "ответ-на появился там, где его не было")
+
+    # 3. с фото
+    def test_soobshchenie_s_foto_teryaet_fayl_no_ne_fakt(self):
+        """ОТДЕЛЬНОЙ СТРОКОЙ: у фото записывается ТОЛЬКО отметка о факте вложения. Ни имени
+        файла, ни ссылки — и это проверяется перебором ключей, а не чтением шапки."""
+        self._export([{"id": 21, "from_id": 601, "date": "2026-09-22T07:00:00", "text": "[PHOTO]"},
+                      {"id": 22, "from_id": 602, "date": "2026-09-22T07:01:00", "text": "[VOICE]"},
+                      {"id": 23, "from_id": 603, "date": "2026-09-22T07:02:00",
+                       "text": "выдуманная подпись к фото"}])
+        w = store.Writer()
+        ingest.ingest_export(w)
+        w.commit()
+        rows = find.search_days([])
+        s_media = [r for r in rows if r["media"]]
+        self.assertEqual(len(s_media), 2)
+        vidy = sorted(m["kind"] for r in s_media for m in r["media"])
+        self.assertEqual(vidy, ["photo", "voice"])
+        for r in s_media:
+            for m in r["media"]:
+                self.assertEqual(sorted(m.keys()), ["kind", "note"],
+                                 "в медиа завелось поле сверх отметки")
+                for zapret in ("file", "path", "url", "link", "name", "id"):
+                    self.assertNotIn(zapret, m, "адрес вложения уехал в архив")
+        telo = json.dumps(rows, ensure_ascii=False)
+        self.assertNotIn(".jpg", telo)
+        self.assertNotIn("http", telo)
+
+    # 4. от бота
+    def test_soobshchenie_ot_bota_lozhitsya_kak_obychnoe(self):
+        """ЧЕСТНО: признака «это бот» в архиве НЕТ ни одного, и фильтра ботов тоже нет. Сообщение
+        бота ложится неотличимо от человеческого — это свойство, а не поломка, и оно записано
+        тестом, чтобы не считаться потом открытием."""
+        self._put("userbot.log",
+                  "2026-09-22T08:00:00+00:00 | @vydumannyi_bot | Выдуманный бот | "
+                  "выдуманное автоуведомление о брони\n"
+                  "2026-09-22T08:01:00+00:00 | id777000 | Telegram | выдуманный код входа\n")
+        w = store.Writer()
+        self.assertEqual(ingest.ingest_userbot(w), 2, "сообщение бота отброшено молча")
+        w.commit()
+        rows = find.search_days([], group=ingest.GROUP_CLIENT_DM)
+        self.assertEqual(len(rows), 2)
+        for r in rows:
+            telo = json.dumps(r, ensure_ascii=False)
+            # Слово `bot` в строке есть законно — это `src: userbot.log`, имя ИСТОЧНИКА.
+            # Ловим НИК бота, а не подстроку: слишком широкий замок краснеет на своём же поле.
+            self.assertNotIn("vydumannyi_bot", telo, "ник бота уехал в архив вместо псевдонима")
+            self.assertNotIn("id777000", telo, "числовой id уехал в архив вместо псевдонима")
+            self.assertNotIn("is_bot", r, "в архиве завёлся признак бота — его там не было")
+            self.assertTrue(r["who_ref"].startswith("p"))
+        self.assertEqual(len(find.search_days(["автоуведомление"])), 1)
+
+    # общий замок на все четыре
+    def test_chetyre_soobshcheniya_odnim_zahvatom_bez_lichnosti(self):
+        self._put("userbot.log",
+                  "2026-09-22T05:00:00+00:00 | @vydumannyi | Выдуманный Человек | обычное выдуманное\n"
+                  "2026-09-22T08:00:00+00:00 | @vydumannyi_bot | Выдуманный Бот | выдуманное от бота\n")
+        self._export([{"id": 31, "from_id": 701, "date": "2026-09-22T09:00:00", "text": "[PHOTO]"},
+                      {"id": 32, "from_id": 702, "date": "2026-09-22T09:01:00",
+                       "text": "выдуманный ответ-на", "reply_to": 31},
+                      {"id": 33, "from_id": 703, "date": "2026-09-22T09:02:00", "text": "третий"}])
+        st = ingest.run(["userbot", "export"], verbose=False)
+        self.assertEqual(st["written"], 5)
+        telo = json.dumps(find.search_days([]), ensure_ascii=False)
+        for lichnost in ("Человек", "Бот", "vydumannyi", "@"):
+            self.assertNotIn(lichnost, telo, "личность уехала в архив: %s" % lichnost)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
