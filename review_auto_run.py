@@ -604,7 +604,14 @@ def tick(*, root=HERE, state_path=None, now=None, digest_hour=DEFAULT_DIGEST_HOU
         reasons.append(verdict["reason"])
         answers.append({"channel": channel, "outcome": verdict["outcome"], "reason": verdict["reason"],
                         "answer_chars": verdict["answer_chars"], "cost_value": verdict.get("cost_value"),
-                        "cost_unit": verdict.get("cost_unit"), "file": rel, "probe": is_probe})
+                        "cost_unit": verdict.get("cost_unit"),
+                        # Голова канала едет тем же путём, что и квитанция: отчёт
+                        # ступени A — единственное место, где обе полосы видны рядом,
+                        # и смена чужой головы обязана быть видна в нём, а не только
+                        # в карточке отдельного канала.
+                        "model_reported": verdict.get("model_reported"),
+                        "model_requested": verdict.get("model_requested"),
+                        "file": rel, "probe": is_probe})
         state = review_auto.note_channel(state, channel, verdict["outcome"], verdict["reason"],
                                          stamp, probed=is_probe)
 

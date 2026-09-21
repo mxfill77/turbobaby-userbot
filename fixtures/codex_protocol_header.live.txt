@@ -1,0 +1,11 @@
+OpenAI Codex v0.151.0
+--------
+workdir: D:\turbobaby-bot
+model: gpt-5.6-terra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: ultra
+reasoning summaries: none
+session id: 01a0c17f-7344-7901-ab26-6b74af4009c1
+--------

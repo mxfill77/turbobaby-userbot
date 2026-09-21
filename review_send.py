@@ -69,6 +69,11 @@ PROMPT_MAX_CHARS = review_pack.REVIEW_MAX_CHARS + 9000
 
 _NA = "—"
 
+# ГОЛОВА КАНАЛА, КОГДА КАНАЛ ЕЁ НЕ НАЗВАЛ. Отдельное слово, а не пустая строка и
+# не `—`: пустое место в карточке читается как «поля нет», а прочерк — как «мы не
+# смотрели». Здесь же ни то ни другое: смотрели, и канал промолчал.
+_MODEL_UNNAMED = "не названа"
+
 # ── Стража исходящего ──────────────────────────────────────────────────────
 #
 # Судим по ФОРМЕ значения, а не по слову. Признак «в тексте встретилось слово
@@ -206,6 +211,43 @@ def outbound_violations(text):
 
 # ───────────────────────────── вердикт ─────────────────────────────
 
+# Потолок имени головы. Имя модели — короткий ярлык (`manus-1.6-adaptive` — 19
+# знаков, `gpt-5.6-terra` — 13); всё, что длиннее, ярлыком не является, и пускать
+# его в карточку целиком нельзя: чужое поле однажды придёт абзацем текста, и он
+# разорвёт строку карточки, которую человек читает глазами.
+MODEL_NAME_MAX = 120
+
+
+def _clean_model(value):
+    """Имя головы из чужого поля → str | None. Чистая функция.
+
+    ``None`` возвращается ровно тогда, когда назвать нечего: поля нет, оно не
+    строка, оно пустое или в нём одни пробелы. ВЫДУМАННОГО значения не появляется
+    ни на одной ветке — нет умолчания, нет подстановки нашей константы, нет
+    «наверное, та же, что вчера». Слепота здесь честнее догадки: именно догадка
+    и сделала бы новое поле бесполезным в тот единственный день, ради которого
+    его заводят, — в день чужой подмены головы.
+    """
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if not name:
+        return None
+    return name[:MODEL_NAME_MAX]
+
+
+def model_words(verdict):
+    """Две строки карточки про голову канала. → (ответила, просили).
+
+    Одно место на обе стороны: карточка и журнал обязаны звать «не названа»
+    одним и тем же словом, иначе два разных прочерка в двух местах заставят
+    читателя гадать, какой из них значит «не смотрели».
+    """
+    return (
+        verdict.get("model_reported") or _MODEL_UNNAMED,
+        verdict.get("model_requested") or _MODEL_UNNAMED,
+    )
+
 
 def _verdict(
     channel,
@@ -219,9 +261,26 @@ def _verdict(
     answer="",
     cost_unit=None,
     cost_value=None,
+    model_reported=None,
+    model_requested=None,
     target=None,
     prompt_sha256=None,
 ):
+    """Вердикт одного захода. → dict.
+
+    ДВА ПОЛЯ ПРО ГОЛОВУ, А НЕ ОДНО, и это не избыточность. ``model_reported`` —
+    имя, которое назвал САМ КАНАЛ в своём ответе (Manus: поле `model` тела
+    `GET /v1/tasks/{id}`; Codex: строка `model:` его же протокола). ``model_requested``
+    — имя, которое назвали МЫ в запросе (Codex: `-m` в argv; Manus: ничего, поля
+    модели в теле запроса нет вовсе). У Codex они обычно совпадают, у Manus не
+    совпадают никогда — и ровно на их РАСХОЖДЕНИИ видно чужую подмену головы:
+    12–20.09.2026 канал Codex лёг 26 карточек подряд потому, что просили одно, а
+    отвечала `gpt-6-astra`, которой в бинаре нет. Слить их в одно поле значит
+    сделать ту же слепоту вечной.
+
+    ``None`` в любом из них значит «не названа», и это НЕ пустая строка: пустое
+    место читается как «поля нет», а «не названа» — как «смотрели, и не сказали».
+    """
     if outcome not in OUTCOMES:
         raise ReviewSendError("invalid_outcome", "outcome=%r not in %r" % (outcome, list(OUTCOMES)))
     answer = answer or ""
@@ -241,6 +300,8 @@ def _verdict(
         "answer_sha256": _sha256_text(answer) if answer else None,
         "cost_unit": cost_unit,
         "cost_value": cost_value,
+        "model_reported": _clean_model(model_reported),
+        "model_requested": _clean_model(model_requested),
     }
     rec["sha256"] = _sha256_text(
         json.dumps(rec, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
@@ -297,6 +358,44 @@ def parse_codex_tokens(stdout):
     return None
 
 
+# Шапка протокола Codex, которую он печатает ПЕРВЫМИ строками каждого захода
+# (живой замер 21.09.2026, `tmp/review_auto/codex_stderr.txt`):
+#
+#     OpenAI Codex v0.151.0
+#     --------
+#     workdir: D:\turbobaby-bot
+#     model: gpt-5.6-terra
+#     provider: openai
+#
+# Якорь — НАЧАЛО СТРОКИ (`^model:`), а не вхождение слова: пакет второго мнения
+# сам обсуждает модели, и «model:» встречается в тексте ответа сколько угодно раз.
+_RE_CODEX_MODEL = re.compile(r"^[ \t]*model:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
+
+# ШАПКА ЧИТАЕТСЯ ТОЛЬКО В ШАПКЕ. Одного якоря на начало строки мало: ответ канала
+# — свободный текст, и строка «model: …» с начала строки в нём совершенно законна
+# (внешнего ревьюера мы сами спрашиваем про модели). Без этого предела поле
+# «голова канала» однажды процитировало бы САМ ОТВЕТ и выдало бы наш же текст за
+# чужое решение — то есть ровно ту ошибку, ради которой поле и заводится, только
+# наоборот. Живой протокол печатает `model:` четвёртой строкой; сорок — запас на
+# порядок.
+_MODEL_SCAN_LINES = 40
+
+
+def parse_codex_model(stream):
+    """Голова, которую НАЗВАЛ САМ Codex в шапке протокола. → str | None.
+
+    Читается из ВЫВОДА канала, а не из нашего argv, и в этом весь смысл: имя в
+    argv — просьба, имя в шапке — ответ. Ровно их расхождение и было невидимо с
+    12 по 20.09.2026, когда CLI молча брал `gpt-6-astra`, которой в бинаре нет.
+    Канал не запустился — шапки нет — честное ``None``, а не наша константа.
+    """
+    if not isinstance(stream, str):
+        return None
+    head = "\n".join(stream.split("\n", _MODEL_SCAN_LINES)[:_MODEL_SCAN_LINES])
+    match = _RE_CODEX_MODEL.search(head)
+    return _clean_model(match.group(1)) if match else None
+
+
 def classify_codex(
     *,
     channel_target,
@@ -312,6 +411,7 @@ def classify_codex(
     last_message=None,
     last_message_error=None,
     min_chars=ANSWER_MIN_CHARS,
+    model_requested=None,
 ):
     """Факты прогона CLI → вердикт. → (dict, str answer). Чистая функция.
 
@@ -326,6 +426,16 @@ def classify_codex(
     cost = parse_codex_tokens(stdout)
     if cost is None:
         cost = parse_codex_tokens(stderr)
+    # Голову ищем в ОБОИХ потоках, но порядок здесь ОБРАТНЫЙ порядку цены, и это
+    # не небрежность. Когда stdout — труба (а у отправщика он всегда труба), Codex
+    # кладёт туда ТОЛЬКО текст ответа, а шапку со строкой `model:` уводит в stderr.
+    # Значит первым обязан спрашиваться stderr: спроси мы stdout первым, поле
+    # «голова канала» цитировало бы ответ внешнего ревьюера о моделях вместо
+    # решения канала. stdout остаётся вторым на случай, когда протокол попадёт
+    # туда (запуск не в трубу) — но никогда не идёт раньше.
+    model_said = parse_codex_model(stderr)
+    if model_said is None:
+        model_said = parse_codex_model(stdout)
     make = lambda outcome, reason, detail, answer="": _verdict(  # noqa: E731 — узкий локальный шорткат
         "codex",
         pack_name,
@@ -337,6 +447,8 @@ def classify_codex(
         answer=answer,
         cost_unit="tokens",
         cost_value=cost,
+        model_reported=model_said,
+        model_requested=model_requested,
         target=channel_target,
         prompt_sha256=prompt_sha256,
     )
@@ -454,6 +566,7 @@ def classify_manus(
     poll_timeout=False,
     credit_usage=None,
     split_error=None,
+    model_reported=None,
 ):
     """Факты HTTP-захода → вердикт. → (dict, str answer). Чистая функция.
 
@@ -470,6 +583,12 @@ def classify_manus(
     нет», и тогда цену называет прежнее правило захода.
     """
     receipt = credit_usage if isinstance(credit_usage, int) and not isinstance(credit_usage, bool) else None
+    # ГОЛОВУ НАЗЫВАЕТ ОТВЕТ, А НЕ ЗАПРОС — та же доктрина, что у квитанции выше, и
+    # у Manus она не формальность: имени модели в теле нашего запроса нет НИ ОДНОГО
+    # поля (`prompt`, `taskId`, `agentProfile` — весь список), значит просимого
+    # имени у этого канала не существует в принципе. Отсюда `model_requested=None`
+    # ЛИТЕРАЛОМ и без ручки: подставить сюда что-нибудь «для симметрии» значило бы
+    # написать в карточку просьбу, которой мы не высказывали.
     make = lambda outcome, reason, detail, answer="", cost=None: _verdict(  # noqa: E731
         "manus",
         pack_name,
@@ -481,6 +600,8 @@ def classify_manus(
         answer=answer,
         cost_unit="request",
         cost_value=cost,
+        model_reported=model_reported,
+        model_requested=None,
         target=channel_target,
         prompt_sha256=prompt_sha256,
     )
@@ -681,6 +802,13 @@ def render_answer(verdict, answer, *, pack_rel):
     lines.append("schema: `%s`" % verdict["schema"])
     lines.append("исход: **%s** (`%s`)" % (verdict["title"], verdict["outcome"]))
     lines.append("причина: `%s`" % verdict["reason"])
+    # Голова канала стои́т ЗДЕСЬ, между причиной и датой, а не в хвосте среди
+    # sha256: карточку читают глазами и сверху вниз, а вопрос «кто отвечал» —
+    # того же ряда, что «чем кончилось» и «почему». Обе стороны названы всегда,
+    # даже когда обе молчат: строка «не названа» — это показание, а её отсутствие
+    # было бы неотличимо от старой карточки, где поля не было вовсе.
+    said, asked = model_words(verdict)
+    lines.append("голова канала (по ответу): `%s` · в запросе просили: `%s`" % (said, asked))
     lines.append("отправлено: **%s** · канал: **%s**" % (verdict["send_date"], verdict["channel"]))
     lines.append("адрес канала: `%s`" % (verdict.get("target") or _NA))
     lines.append("пакет: `%s`" % pack_rel)

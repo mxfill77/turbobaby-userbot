@@ -264,6 +264,11 @@ def send_codex(prompt, *, root, workdir, binary=None, model=None, cd=None, timeo
         "stderr": "",
         "last_message": None,
         "last_message_error": None,
+        # Имя, которое РЕАЛЬНО уехало в argv, а не константа умолчания: между
+        # ними стои́т `model = model or DEFAULT_CODEX_MODEL` и ветка `if model`,
+        # и читать умолчание вместо argv значит рапортовать о просьбе, которой не
+        # было. Заполняется ниже, ровно там, где argv собирается.
+        "model_sent": None,
     }
     exe = resolve_codex(binary)
     if not exe:
@@ -285,6 +290,7 @@ def send_codex(prompt, *, root, workdir, binary=None, model=None, cd=None, timeo
     model = model or DEFAULT_CODEX_MODEL
     if model:
         argv += ["-m", model]
+        facts["model_sent"] = model
     if cd:
         argv += ["-C", cd]
     argv.append("-")
@@ -560,6 +566,27 @@ def manus_credit_usage(body):
     return None
 
 
+def manus_model(body):
+    """ГОЛОВА, КОТОРОЙ КАНАЛ ОТВЕТИЛ. → str | None.
+
+    Поле `model` канал печатает в теле `GET /v1/tasks/{id}` рядом со `status` и
+    `credit_usage` — и это его решение, а не наша просьба: имени модели в теле
+    запроса нет ни одного поля (`prompt`, `taskId`, `agentProfile` — весь список).
+    Живые значения на диске: `manus-1.6-agent` (01.09.2026) и `manus-1.6-adaptive`
+    (05–21.09.2026) — ЕДИНСТВЕННОЕ поле, сменившее значение между отвечавшей и
+    молчащей половинами корпуса (перепись 69m, 21.09.2026).
+
+    ``None`` значит «канал головы не назвал», и это НЕ пустая строка и НЕ наша
+    догадка: тела нет, тело не JSON, поля нет, поле не строка — все четыре случая
+    дают один честный ответ. Подставить сюда последнее известное значение значило
+    бы сделать прибор слепым ровно в день следующей подмены.
+    """
+    obj = _json_or_none(body)
+    if not isinstance(obj, dict):
+        return None
+    return review_send._clean_model(obj.get("model"))
+
+
 def manus_error_text(body):
     """Текст ошибки задачи, если канал его дал. → str."""
     obj = _json_or_none(body)
@@ -717,6 +744,7 @@ def _wait_settled(facts, *, key, base, task_path, poll, settle_polls, deadline, 
         facts["last_state"] = state
         facts["poll_note"] = note
         facts["credit_usage"] = manus_credit_usage(got["body"])
+        facts["model"] = manus_model(got["body"]) or facts.get("model")
 
         if state == _MANUS_FAILED:
             facts["request_sent"] = True
@@ -834,6 +862,13 @@ def _wait_reply(
         facts["last_state"] = state
         facts["poll_note"] = note
         facts["credit_usage"] = manus_credit_usage(got["body"])
+        # НАЗВАННОЕ ИМЯ НЕ СТИРАЕТСЯ БЕЗЫМЯННЫМ ОПРОСОМ (`or`, а не прямое
+        # присваивание). Опросов за заход десятки, и любой из них может вернуть
+        # тело без `model` — служебное, укороченное, чужой формы. Прямое
+        # присваивание отдавало бы наверх «не названа» после того, как канал уже
+        # назвался, то есть прибор терял бы показание об УСПЕШНОМ заходе тем
+        # чаще, чем дольше он ждал. Новое имя по-прежнему сильнее прежнего.
+        facts["model"] = manus_model(got["body"]) or facts.get("model")
 
         if state == _MANUS_FAILED:
             facts["request_sent"] = True
@@ -872,7 +907,7 @@ def _wait_reply(
                 facts["request_sent"] = True
                 facts["idle_error"] = (
                     "channel_idle: задача %s закончена состоянием %s и не сказала ни слова%s "
-                    "(подтверждено %d опросами подряд, ждали %d с, квитанция канала %s; %s)"
+                    "(подтверждено %d опросами подряд, ждали %d с, квитанция канала %s, голова %s; %s)"
                     % (
                         facts.get("task_id"),
                         _MANUS_DONE,
@@ -880,6 +915,7 @@ def _wait_reply(
                         facts["empty_polls"],
                         facts["waited_sec"],
                         _NA_STATE if facts.get("credit_usage") is None else facts["credit_usage"],
+                        facts.get("model") or review_send._MODEL_UNNAMED,
                         note,
                     )
                 )
@@ -992,6 +1028,12 @@ def send_manus(
     facts["empty_polls"] = 0
     facts["missing_polls"] = 0
     facts["credit_usage"] = None  # квитанция канала: None ≠ 0
+    # ГОЛОВА КАНАЛА живёт отдельным фактом ровно по той же причине, что и квитанция:
+    # на успехе `facts["body"]` ЗАМЕЩАЕТСЯ собранным текстом ассистента (см. ниже),
+    # и поле `model` вместе с сырым конвертом исчезает. Читатель факта оттого и
+    # получил бы «не названа» именно там, где канал ответил, — то есть поле было бы
+    # пустым ровно в успешных заходах, а это худший вид слепоты: молчаливый.
+    facts["model"] = None  # имя головы из ответа канала: None ≠ имя
     facts["split_error"] = None  # части не собрались у канала в одной задаче
     facts["parts_seen"] = None  # номера частей, которые канал показал в задаче
     facts["silent_turns"] = 0  # промежуточных частей, закрытых каналом молча
@@ -1151,13 +1193,14 @@ def send_manus(
     if state == _MANUS_DONE:
         facts["idle_error"] = (
             "channel_idle: задача %s закончена состоянием %s и не сказала ни слова "
-            "(ждали %d с, опросов %d, квитанция канала %s; %s)"
+            "(ждали %d с, опросов %d, квитанция канала %s, голова %s; %s)"
             % (
                 facts.get("task_id"),
                 _MANUS_DONE,
                 facts["waited_sec"],
                 facts["polls"],
                 _NA_STATE if facts.get("credit_usage") is None else facts["credit_usage"],
+                facts.get("model") or review_send._MODEL_UNNAMED,
                 note,
             )
         )
@@ -1213,6 +1256,9 @@ def run_channel(channel, prompt, ctx, args):
             stderr=facts["stderr"],
             last_message=facts["last_message"],
             last_message_error=facts["last_message_error"],
+            # Просьба — отсюда (что легло в argv). ОТВЕТ канала классификатор
+            # добывает сам из его же протокола: наружу он ходил, мы нет.
+            model_requested=facts.get("model_sent"),
             **common
         )
 
@@ -1260,6 +1306,7 @@ def run_channel(channel, prompt, ctx, args):
         poll_timeout=facts.get("poll_timeout", False),
         credit_usage=facts.get("credit_usage"),
         split_error=facts.get("split_error"),
+        model_reported=facts.get("model"),
         **common
     )
 
@@ -1308,9 +1355,13 @@ def fetch_only(args):
             status=got["status"],
             body=text if (state == _MANUS_DONE and text.strip()) else got["body"],
             credit_usage=manus_credit_usage(got["body"]),
+            model_reported=manus_model(got["body"]),
             **common
         )
-    sys.stdout.write("ИСХОД: %s (%s) — %s\n" % (verdict["title"], verdict["reason"], verdict["detail"]))
+    sys.stdout.write(
+        "ИСХОД: %s (%s) · голова %s — %s\n"
+        % (verdict["title"], verdict["reason"], review_send.model_words(verdict)[0], verdict["detail"])
+    )
     return {"answered": 0, "refused": 3, "unknown": 4}[verdict["outcome"]]
 
 
@@ -1457,11 +1508,12 @@ def main(argv=None):
         outcomes.append(verdict["outcome"])
 
         sys.stdout.write(
-            "КАНАЛ %s: %s (%s) · ответ %d знаков · цена %s %s → %s\n"
+            "КАНАЛ %s: %s (%s) · голова %s · ответ %d знаков · цена %s %s → %s\n"
             % (
                 channel,
                 verdict["title"],
                 verdict["reason"],
+                review_send.model_words(verdict)[0],
                 verdict["answer_chars"],
                 "—" if verdict.get("cost_value") is None else verdict["cost_value"],
                 verdict.get("cost_unit") or "",

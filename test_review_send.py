@@ -1144,5 +1144,287 @@ class CodexModelHandle(unittest.TestCase):
                 self.assertNotIn(name, fh.read(), "%s держит вторую копию имени модели" % rel)
 
 
+# ───────────── голова канала: кто ОТВЕТИЛ, а не кого просили ─────────────
+#
+# Повод — замер 21.09.2026 (артефакт 69m): поле `model` канал Manus печатает в
+# КАЖДОМ ответе, и ни одна строка нашего кода его не читала. Именно оно —
+# единственное, сменившее значение между отвечавшей и молчащей половинами корпуса
+# (`manus-1.6-agent` 01.09 → `manus-1.6-adaptive` 05–21.09). Ниже — отрицательные
+# пробы ровно на то, чем новое поле могло бы соврать: выдуманным значением,
+# пустой строкой, нашей же константой вместо чужого решения и цитатой из ответа
+# вместо шапки протокола.
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_LIVE_CODEX_HEAD = os.path.join(_HERE, "fixtures", "codex_protocol_header.live.txt")
+
+
+def _live_codex_header():
+    """Дословная шапка протокола живого захода Codex. → str.
+
+    Снята с `tmp/review_auto/codex_stderr.txt` захода 21.09.2026 и лежит файлом, а
+    не строкой в тесте: сочинённая шапка проверяла бы наше представление о канале,
+    а не канал. Ровно эти одиннадцать строк канал печатает перед каждым ответом.
+    """
+    with io.open(_LIVE_CODEX_HEAD, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _live_body_without_model():
+    """Живое тело Manus, из которого поле `model` УБРАНО. → str.
+
+    Строится ИЗ живого удалением одного ключа, а не пишется с нуля: всё остальное
+    остаётся посимвольно тем же, и отрицательная проба судит РОВНО отсутствие поля,
+    а не нашу выдумку о том, как выглядит ответ без него.
+    """
+    obj = json.loads(_live_empty_body())
+    del obj["model"]
+    return json.dumps(obj, ensure_ascii=False)
+
+
+class ChannelHeadIsNamed(unittest.TestCase):
+    def _manus(self, *, body=None, **over):
+        """Вердикт Manus ТОЙ ЖЕ проводкой, что в бою.
+
+        Имя головы приезжает в классификатор отдельным доводом, а не выковыривается
+        им из тела, и это не прихоть теста: на успешном заходе `facts["body"]`
+        ЗАМЕЩАЕТСЯ собранным текстом ассистента, и никакого JSON с полем `model`
+        классификатор уже не увидит. Проводка повторена здесь дословно по
+        `review_send_run.run_channel`.
+        """
+        kw = _common(body=body, **over)
+        kw.setdefault("model_reported", review_send_run.manus_model(body))
+        verdict, _answer = classify_manus(**kw)
+        return verdict
+
+    def _codex(self, **over):
+        verdict, _answer = classify_codex(**_common(**over))
+        return verdict
+
+    # ── что канал сказал ──────────────────────────────────────────────────
+
+    def test_live_manus_body_names_its_head(self):
+        """Живое тело: поле читается и доезжает до вердикта тем же путём, что квитанция."""
+        body = _live_empty_body()
+        self.assertEqual(review_send_run.manus_model(body), "manus-1.6-adaptive")
+        verdict = self._manus(request_sent=True, status=200, body=body, credit_usage=0)
+        self.assertEqual(verdict["model_reported"], "manus-1.6-adaptive")
+        self.assertIsNone(verdict["model_requested"], "Manus имени модели не просят — поля нет в теле запроса")
+
+    def test_live_codex_protocol_names_its_head(self):
+        """Шапка живого протокола: имя берётся из ВЫВОДА канала, а не из argv."""
+        self.assertEqual(review_send.parse_codex_model(_live_codex_header()), "gpt-5.6-terra")
+
+    def test_codex_verdict_holds_both_sides_and_shows_them_apart(self):
+        """ГЛАВНЫЙ случай: просили одно, ответила другая — обе стороны видны РАЗНЫМИ.
+
+        Это класс 12–20.09.2026: 26 карточек подряд легли потому, что CLI молча
+        брал `gpt-6-astra`. Слитые в одно поле, эти два имени сделали бы разбор
+        невозможным ещё раз.
+        """
+        verdict = self._codex(
+            returncode=0,
+            stdout=LONG_ANSWER,
+            stderr=_live_codex_header(),
+            last_message=LONG_ANSWER,
+            model_requested="имя-которое-мы-просили",
+        )
+        self.assertEqual(verdict["model_reported"], "gpt-5.6-terra")
+        self.assertEqual(verdict["model_requested"], "имя-которое-мы-просили")
+        self.assertNotEqual(verdict["model_reported"], verdict["model_requested"])
+        card = render_answer(verdict, LONG_ANSWER, pack_rel="docs/review_outbox/%s" % PACK_NAME)
+        self.assertIn("gpt-5.6-terra", card)
+        self.assertIn("имя-которое-мы-просили", card)
+
+    def test_requested_name_comes_from_argv_not_from_the_default_constant(self):
+        """Просьба берётся оттуда, где она РЕАЛЬНО уехала, — из собранного argv."""
+        spy = _CodexArgvSpy()
+        real = subprocess.run
+        subprocess.run = spy
+        self.addCleanup(setattr, subprocess, "run", real)
+        with tempfile.TemporaryDirectory() as tmp:
+            facts = review_send_run.send_codex(
+                "текст", root=tmp, workdir=tmp, binary=__file__, model="имя-из-ручки"
+            )
+        self.assertEqual(facts["model_sent"], "имя-из-ручки")
+        self.assertEqual(spy.argv[spy.argv.index("-m") + 1], facts["model_sent"],
+                         "факт разошёлся с argv — значит он рапортует не о том, что ушло")
+
+    # ── чего канал НЕ говорил ─────────────────────────────────────────────
+
+    def test_body_without_the_field_says_unnamed_not_empty_and_not_invented(self):
+        """Отрицательная проба задания: ответ без `model` → «не названа»."""
+        body = _live_body_without_model()
+        self.assertIsNone(review_send_run.manus_model(body))
+        verdict = self._manus(request_sent=True, status=200, body=body, credit_usage=0)
+        self.assertIsNone(verdict["model_reported"], "поля нет — значение обязано быть None, а не строкой")
+        card = render_answer(verdict, "", pack_rel="docs/review_outbox/%s" % PACK_NAME)
+        line = [ln for ln in card.split("\n") if ln.startswith("голова канала")]
+        self.assertEqual(len(line), 1, "строка про голову обязана быть в карточке ровно одна: %r" % (line,))
+        self.assertIn("не названа", line[0])
+        self.assertNotIn("``", line[0], "пустая пара кавычек вместо имени читается как «поля нет»")
+        self.assertNotIn("manus-1.6", line[0], "имя вчерашней головы в карточке без поля — выдумка")
+
+    def test_the_head_cannot_rise_without_an_answer(self):
+        """Признак приходит ИЗ ОТВЕТА: без ответа его поднять нечем ни одной веткой."""
+        no_key = self._manus(credentials_present=False, key_env_name="ИМЯ_ПЕРЕМЕННОЙ")
+        self.assertIsNone(no_key["model_reported"], "наружу не ушло ничего — голове взяться неоткуда")
+        broken = self._manus(request_sent=True, transport_error="обрыв после отправки")
+        self.assertIsNone(broken["model_reported"])
+        never_launched = self._codex(launch_error="бинаря нет", model_requested="просили-вот-это")
+        self.assertIsNone(never_launched["model_reported"], "процесса не было — протокола нет — имени нет")
+        self.assertEqual(never_launched["model_requested"], "просили-вот-это",
+                         "просьба известна и без ответа: она наша")
+
+    def test_answer_text_is_not_mistaken_for_the_protocol_header(self):
+        """Ответ ревьюера про модели не становится «головой канала».
+
+        Пакет второго мнения сам спрашивает про модели, и строка `model: …` в
+        ответе законна. Читай мы stdout первым или без предела по шапке — поле
+        цитировало бы наш же разговор вместо чужого решения.
+        """
+        answer = "1. Упрощаемо.\nmodel: выдуманная-голова\n" + LONG_ANSWER
+        verdict = self._codex(
+            returncode=0,
+            stdout=answer,
+            stderr=_live_codex_header(),
+            last_message=answer,
+            model_requested="имя-из-argv",
+        )
+        self.assertEqual(verdict["model_reported"], "gpt-5.6-terra")
+        self.assertNotEqual(verdict["model_reported"], "выдуманная-голова")
+
+    def test_a_model_line_deep_in_the_answer_is_not_the_header(self):
+        """Предел по шапке, а не один якорь: `model:` в ХВОСТЕ потока — не голова.
+
+        Шапку Codex печатает четвёртой строкой и только в начале. Строка
+        «model: …» тридцатью абзацами ниже принадлежит уже ответу ревьюера — и
+        без предела по шапке именно она стала бы «головой канала». Здесь stderr
+        пуст СОЗНАТЕЛЬНО: иначе живая шапка ответила бы за разбор и проба бы
+        ничего не проверила.
+        """
+        deep = "\n".join(["строка ответа %d" % i for i in range(60)] + ["model: выдуманная-голова"])
+        self.assertIsNone(review_send.parse_codex_model(deep), "имя взято из тела ответа, а не из шапки")
+        verdict = self._codex(returncode=0, stdout=deep + "\n" + LONG_ANSWER, stderr="",
+                              last_message=LONG_ANSWER, model_requested="имя-из-argv")
+        self.assertIsNone(verdict["model_reported"])
+
+    def test_reader_tells_absent_from_blank_from_not_a_string(self):
+        """Четыре вида молчания дают ОДИН честный None, и ни один — пустую строку."""
+        for body in (None, "", "не json вовсе", "[]", json.dumps({"model": "   "}),
+                     json.dumps({"model": 17}), json.dumps({"model": None})):
+            self.assertIsNone(review_send_run.manus_model(body), "тело %r дало не-None" % (body,))
+
+    def _poll_named_running(self):
+        """Первый опрос: канал НАЗВАЛСЯ, но работа ещё идёт."""
+        obj = json.loads(_live_empty_body())
+        obj["status"] = "running"
+        return {"body": json.dumps(obj, ensure_ascii=False)}
+
+    def _poll_nameless_done(self):
+        """Следующие опросы: работа кончена, головы канал больше не называет."""
+        return {"body": _live_body_without_model()}
+
+    def _facts(self):
+        return {"task_id": _TASK_ID, "polls": 0, "waited_sec": 0, "last_state": None,
+                "last_poll_error": None, "poll_note": None, "request_sent": False,
+                "transport_error": None, "status": None, "body": None, "idle_error": None,
+                "poll_timeout": False, "credit_usage": None, "model": None,
+                "empty_polls": 0, "missing_polls": 0, "last_signature": None,
+                "settled_polls": 0, "ready_by": None}
+
+    def _serve(self, polls):
+        real = review_send_run.manus_http
+        self.addCleanup(setattr, review_send_run, "manus_http", real)
+        review_send_run.manus_http = _FakeManus(polls)
+
+    def test_a_named_head_is_not_erased_by_a_later_nameless_poll_while_waiting(self):
+        """Боевое ожидание части: назвавшаяся голова переживает безымянные опросы."""
+        self._serve([self._poll_named_running(), self._poll_nameless_done()])
+        facts, clock = self._facts(), _Clock()
+        started = clock()
+        review_send_run._wait_reply(
+            facts, marker=review_send_run._PART_MARK % (1, 9), key="проба",
+            base="https://api.manus.ai", task_path=review_send_run.DEFAULT_MANUS_TASK_PATH,
+            poll=10, deadline=started + 600, started=started, clock=clock, sleep=clock.sleep,
+        )
+        self.assertGreaterEqual(facts["polls"], 2, "проба обязана пройти больше одного опроса")
+        self.assertEqual(facts["model"], "manus-1.6-adaptive",
+                         "безымянный опрос стёр показание — разбор молчания останется без головы")
+
+    def test_a_named_head_survives_the_settle_wait_too(self):
+        """То же в месте ожидания затишья: два места — два замка, а не один."""
+        self._serve([self._poll_named_running(), self._poll_nameless_done()])
+        facts, clock = self._facts(), _Clock()
+        started = clock()
+        outcome = review_send_run._wait_settled(
+            facts, key="проба", base="https://api.manus.ai",
+            task_path=review_send_run.DEFAULT_MANUS_TASK_PATH, poll=10, settle_polls=2,
+            deadline=started + 600, started=started, clock=clock, sleep=clock.sleep,
+        )
+        self.assertEqual(outcome, "ready")
+        self.assertEqual(facts["model"], "manus-1.6-adaptive")
+
+    # ── где это видно ─────────────────────────────────────────────────────
+
+    def test_card_puts_the_head_next_to_outcome_and_reason(self):
+        """Задание про МЕСТО: строка стои́т рядом с исходом и причиной, а не в хвосте."""
+        verdict = self._manus(request_sent=True, status=200, body=_live_empty_body(), credit_usage=0)
+        rows = render_answer(verdict, "", pack_rel="docs/review_outbox/%s" % PACK_NAME).split("\n")
+        where = [i for i, ln in enumerate(rows) if ln.startswith("голова канала")][0]
+        self.assertTrue(rows[where - 2].startswith("исход: "), "над головой обязан стоять исход: %r" % rows[where - 2])
+        self.assertTrue(rows[where - 1].startswith("причина: "), "над головой обязана стоять причина")
+
+    def test_verdict_sha_covers_the_new_fields(self):
+        """Поле в вердикте, а не рядом с ним: подмена головы меняет отпечаток."""
+        body = _live_empty_body()
+        same = self._manus(request_sent=True, status=200, body=body, credit_usage=0)
+        other = self._manus(request_sent=True, status=200, body=_live_body_without_model(), credit_usage=0)
+        self.assertNotEqual(same["sha256"], other["sha256"],
+                            "sha256 вердикта не заметил смены головы — значит поле вне отпечатка")
+
+    def test_live_wait_fills_the_fact_the_verdict_reads(self):
+        """Сквозная проба: боевое место ожидания кладёт голову в факты само.
+
+        Мок стои́т на границе сокета — разбор тела, счёт опросов и запись факта
+        работают боевым кодом. Без этого теста проводка «тело → факт → вердикт»
+        держалась бы на честном слове: поле в вердикте есть, а заполнять его на
+        живом пути было бы некому, и карточка вечно говорила бы «не названа».
+        """
+        real = review_send_run.manus_http
+        self.addCleanup(setattr, review_send_run, "manus_http", real)
+        fake = _FakeManus([{"body": _live_empty_body()}])
+        review_send_run.manus_http = fake
+        clock = _Clock()
+        facts = {"task_id": _TASK_ID, "polls": 0, "waited_sec": 0, "last_state": None,
+                 "last_poll_error": None, "poll_note": None, "request_sent": False,
+                 "transport_error": None, "status": None, "body": None, "idle_error": None,
+                 "poll_timeout": False, "credit_usage": None, "model": None}
+        started = clock()
+        review_send_run._wait_reply(
+            facts, marker=review_send_run._PART_MARK % (1, 9), key="проба",
+            base="https://api.manus.ai", task_path=review_send_run.DEFAULT_MANUS_TASK_PATH,
+            poll=10, deadline=started + 60, started=started, clock=clock, sleep=clock.sleep,
+        )
+        self.assertEqual(facts["model"], "manus-1.6-adaptive", "живое ожидание головы не записало")
+        self.assertIn("голова manus-1.6-adaptive", facts["idle_error"] or "",
+                      "разбор чужого молчания обязан называть голову, которая молчала")
+
+    def test_run_channel_hands_the_fact_over_to_the_verdict(self):
+        """Последнее звено проводки: собранный факт доезжает до классификатора."""
+        with io.open(review_send_run.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('model_reported=facts.get("model")', src)
+        self.assertIn('model_requested=facts.get("model_sent")', src)
+
+    def test_auto_contour_carries_both_names_too(self):
+        """Отчёт ступени A знает обе стороны — иначе смена видна только в карточке."""
+        import review_auto_run
+
+        with io.open(review_auto_run.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('"model_reported": verdict.get("model_reported")', src)
+        self.assertIn('"model_requested": verdict.get("model_requested")', src)
+
+
 if __name__ == "__main__":
     unittest.main()
