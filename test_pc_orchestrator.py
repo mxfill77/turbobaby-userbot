@@ -5651,12 +5651,35 @@ class TestFailReasonEvidence(Base):
         self.assertIn("причина=run_timeout", self.fb.tasks[tid]["result"])
 
     def test_exec_error_reason(self):
+        """НАША ошибка выполнения — и она обязана нести СВИДЕТЕЛЬСТВО выхода процесса.
+
+        Фикстура сменилась 21.09 намеренно. Прежней здесь стояла «API Error: 529 Overloaded»,
+        и она была примером НЕ ТОГО: 529 — это отказ чужой стороны, а не наша поломка, и с
+        21.09 такой ряд закрывается кодом `external_limit` (см. соседний тест). Наша поломка —
+        это падение НАШЕГО кода, и её словарь отказов не знает, поэтому имя остаётся прежним,
+        а вот код возврата и хвост stderr теперь сохраняются: до 21.09 при НЕПУСТОМ stdout
+        ветка `out_s or err_tail` до stderr не доходила вовсе."""
         tid = self.fb.add(status="new")
-        self._claude(1, "", "API Error: 529 Overloaded")
+        self._claude(1, "начал и упал", "Traceback: TypeError: NoneType is not callable")
         o.process_new()
         r = self.fb.tasks[tid]["result"]
         self.assertIn("причина=exec_error", r)
         self.assertIn("claude exit=1", r)
+        self.assertIn("TypeError", r)          # хвост stderr больше не теряется
+        self.assertIn("СВИДЕТЕЛЬСТВО", r)
+
+    def test_foreign_refusal_is_no_longer_called_our_exec_error(self):
+        """ТА ЖЕ ФИКСТУРА, ЧТО СТОЯЛА ВЫШЕ ДО 21.09 — и теперь у неё своё имя.
+
+        «API Error: 529 Overloaded» — живая строка ряда #101 (03.09). До 21.09 владелец читал
+        про неё «ошибка выполнения», то есть «мы сломались», и следующий шаг выбирал не тот."""
+        tid = self.fb.add(status="new")
+        self._claude(1, "", "API Error: 529 Overloaded")
+        o.process_new()
+        r = self.fb.tasks[tid]["result"]
+        self.assertIn("причина=external_limit", r)
+        self.assertIn("claude exit=1", r)
+        self.assertTrue(r.startswith(o.LIMIT_MARK))
 
     def test_selfheal_gate_untouched_by_new_text(self):
         # ⏱-гейт: думатель по-прежнему НЕ чинит таймауты — даже когда итог рассказал о работе
@@ -6277,10 +6300,14 @@ class TestLocalDecChain(Base):
         # Гейт шага цепи знал ТРИ префикса, гейт одиночки — только ⏱ (зеркальная дыра, класс №9
         # свода). Теперь набор один на оба: «нет» человека / ⏱-таймаут / ✋-снова-красное /
         # 📡-внешний обрыв связи (05.08.2026: сеть переформулировкой задачи не чинится, а 04.08
-        # думатель самопочинки сам упал в тот же обрыв — «timed out after 180 seconds»).
+        # думатель самопочинки сам упал в тот же обрыв — «timed out after 180 seconds») /
+        # 🚧-внешнее ограничение (21.09.2026: лимит подписки переформулировкой не поднимается, и
+        # думатель уходил в ТОТ ЖЕ отказ — из шести рядов exec_error за 14–21.09 он падал
+        # exit=1 в четырёх, то есть круг сгорал на стороне поставщика, а не на задаче).
         o._selfheal_on = lambda: True
         self.assertEqual(o.NO_HEAL_PREFIXES,
-                         (o._REJECT_PREFIX, o.TIMEOUT_MARK, o.MANUAL_MARK, o.NET_MARK))
+                         (o._REJECT_PREFIX, o.TIMEOUT_MARK, o.MANUAL_MARK, o.NET_MARK,
+                          o.LIMIT_MARK))
         boom = mock.Mock(side_effect=AssertionError("одиночная самопочинка не должна зваться"))
         with mock.patch.object(o, "_maybe_task_selfheal", boom):
             for pref in o.NO_HEAL_PREFIXES:

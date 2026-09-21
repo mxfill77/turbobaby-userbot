@@ -366,7 +366,11 @@ class TestNegativeThreeEnds(unittest.TestCase):
                               % (sb.MARK, tid, sb.HEAD_WORDS)} for tid in (37, 38)]
         one = sig.signal_a(sig.box_rows(rows), judged={}, day="2026-09-15")
         self.assertFalse(one["on"], one["why"])
-        self.assertIn("внешних отказов: 2", one["why"])
+        # СЧЁТ СВЕРЯЕТСЯ С КОНСТАНТОЙ МОДУЛЯ, А НЕ С ЕГО ВЧЕРАШНЕЙ ФОРМУЛИРОВКОЙ.
+        # Литерал «внешних отказов: 2» протух молча: 19.09 (коммит 4698922c) строка
+        # вычерка стала собираться из `SORT_EXT`, и обе проверки лежали красными, ничего
+        # не охраняя. Предмет теста — что ряды вычеркнуты и посчитаны, а не как названы.
+        self.assertIn("%s: 2" % sig.SORT_EXT, one["why"])
 
     def test_end2_paired_control_two_of_ours_DO_raise_signal_a(self):
         """Парный контроль: правило «никогда не поднимать» прошло бы конец 2 идеально.
@@ -393,7 +397,11 @@ class TestNegativeThreeEnds(unittest.TestCase):
                               % (sb.MARK, tid, sb.HEAD_WORDS)} for tid in (51, 52)]
         one = sig.signal_a(sig.box_rows(rows), judged={}, day="2026-09-16")
         self.assertFalse(one["on"], one["why"])
-        self.assertIn("внешних отказов: 2", one["why"])
+        # СЧЁТ СВЕРЯЕТСЯ С КОНСТАНТОЙ МОДУЛЯ, А НЕ С ЕГО ВЧЕРАШНЕЙ ФОРМУЛИРОВКОЙ.
+        # Литерал «внешних отказов: 2» протух молча: 19.09 (коммит 4698922c) строка
+        # вычерка стала собираться из `SORT_EXT`, и обе проверки лежали красными, ничего
+        # не охраняя. Предмет теста — что ряды вычеркнуты и посчитаны, а не как названы.
+        self.assertIn("%s: 2" % sig.SORT_EXT, one["why"])
 
     def test_end2_three_in_a_row_still_stop_the_box_and_name_the_words(self):
         """Тормоз не снят, а переименован: три подряд — сигнал Д, и в строке слова процесса.
