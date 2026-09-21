@@ -9271,9 +9271,334 @@ def _agent_lock_read(path=None):
         return None
 
 
+# ══════════ ТРИ ЗАМКА САМОПОДЪЁМА (задание Штаба 70h, 22.09.2026) ══════════════════════════
+# ПРЕМИСА ЗАДАНИЯ НЕ ПОДТВЕРДИЛАСЬ, и от этого зависит всё ниже: агент поднимается на новом коде
+# САМ с 07.09.2026 (`selfraise_agent`), а слово владельца («обновись» → `pc_agent.self_restart`)
+# — лишь ВТОРОЙ пуск из трёх (третий — задача Планировщика после смерти процесса). Поэтому замки
+# не строятся с нуля, а ДОСТРАИВАЮТСЯ к живому самоподъёму, и два из трёх признаков, на которые
+# он опирался, названы негодными по третьему вопросу задания («можно ли поднять признак, НЕ
+# СОВЕРШИВ события»):
+#   • ЗАМОК 1 (гейт). Жило `agent_code_parses` = один `compile()`. Признак поднимается без
+#     события: битый `import`, опечатка в имени модуля, падение строки уровня модуля — всё это
+#     РАЗБИРАЕТСЯ и падает при старте. Годный признак — код возврата ОТДЕЛЬНОГО интерпретатора,
+#     который этот модуль ИМПОРТИРОВАЛ (`selfupdate_gate.code_gate`): его не получить, не совершив
+#     события. Ровно этот гейт стои́т на пути слова владельца с 23.07 — самоподъём шёл мимо него.
+#   • ЗАМОК 2 (дверь). Жило «PID сменился · лок переписан · процесс жив спустя паузу» — это
+#     ПРОЦЕСС, а не ДВЕРЬ: живой python с невалидным токеном, без сети или с конфликтом getUpdates
+#     даёт все три факта и не отвечает владельцу ни разу. Годный признак — строка
+#     `Application started`, которую пишет САМА библиотека (`telegram.ext.Application.start`,
+#     venv/Lib/site-packages/telegram/ext/_application.py:631) СТРОГО ПОСЛЕ `initialize()`
+#     (в нём `bot.get_me()`) и ПОСЛЕ `updater.start_polling()` (порядок — `__run`, там же:1063-1070).
+#     Её нельзя написать, не получив ответа Telegram; подделать позицией нельзя, потому что ищем её
+#     ТОЛЬКО в байтах, дописанных ПОСЛЕ снятого перед подъёмом смещения.
+#     ЗАМЕР СРОКА (корпус pc_agent.log + .1 + .2 + .3, 23 старта с 02.09 по 21.09): строка нашлась
+#     в 23 из 23; пауза «ЗАПУСК → Application started» — медиана 5.93 с, p90 12.87 с, МАКСИМУМ
+#     26.89 с (18.09 21:38:43.800 → 21:39:10.687). Отсюда срок двери 90 с = 3.35× измеренного
+#     максимума: на всём корпусе — ноль ложных «дверь молчит».
+#   • ЗАМОК 3 (откат). В живом коде его НЕ БЫЛО вовсе: при недоказанном подъёме — только крик
+#     «подними вручную». «Откат есть» на словах — ровно тот признак, который поднимается, не
+#     совершив события. Годный признак — ПРЕЖНИЙ КОД, УЖЕ ЛЕЖАЩИЙ НА ДИСКЕ и разобранный: те же
+#     байты и копируются назад, если дверь не ответит. Репетиция идёт ДО снятия живого агента.
+AGENT_DOOR_MARK = os.getenv("PC_AGENT_DOOR_MARK", "") or "Application started"
+AGENT_DOOR_DEADLINE = int(os.getenv("PC_AGENT_DOOR_DEADLINE", "90") or "90")   # срок ответа двери, с
+AGENT_DOOR_POLL = int(os.getenv("PC_AGENT_DOOR_POLL", "5") or "5")             # шаг проб хвоста, с
+AGENT_LOG_PATH = os.path.join(REPO, "pc_agent.log")
+AGENT_ROLLBACK_DIR = os.path.join(REPO, "tmp", "agent_selfraise_rollback")
+
+
+def agent_code_gated(names=None, gate_fn=None, closure_fn=None):
+    """ЗАМОК 1: новый код агента ПРОШЁЛ ГЕЙТ (py_compile + import-smoke)? → (ok, словами).
+
+    FAIL-CLOSED по всем веткам: не посчитано замыкание, не запустился гейт, не названы файлы —
+    всё это ОТКАЗ, а не «прошёл». Дверь владельца не снимают ради кода, про который неизвестно,
+    поднимется ли он. Боевой гейт под юнит-тестами не зовётся вовсе (пункт «боевой путь и проверка
+    обязаны различаться»): забытая инъекция обязана дать отказ, а не спавн интерпретатора."""
+    if names is None:
+        closure, why = _agent_closure(closure_fn=closure_fn)
+        if not closure:
+            return False, ("замыкание агента не посчитано (%s) — гейт гонять не по чему"
+                           % (why or "причина не названа"))
+        names = sorted(closure)
+    names = [str(n) for n in names if str(n).endswith(".py")]
+    if not names:
+        return False, "гейту нечего проверять — ни одного .py в замыкании агента"
+    gate = gate_fn
+    if gate is None:
+        if "unittest" in sys.modules:
+            return False, "боевой гейт запрещён под юнит-тестами (проверка идёт на подставном гейте)"
+        try:
+            import selfupdate_gate          # lazy: тот же модуль, что у слова владельца
+        except Exception as e:                                             # noqa: BLE001
+            return False, "selfupdate_gate не импортируется (%s: %s)" % (type(e).__name__, str(e)[:80])
+        gate = selfupdate_gate.code_gate
+    try:
+        ok, msg = gate(VENV_PY, REPO, names, "pc_agent")
+    except Exception as e:                                                 # noqa: BLE001
+        return False, "гейт не запустился (%s: %s)" % (type(e).__name__, str(e)[:120])
+    if not ok:
+        return False, str(msg)[:400]
+    return True, "гейт пройден на %d файл(ах): py_compile + import-smoke в отдельном python" % len(names)
+
+
+def agent_log_offset(path=None):
+    """Размер pc_agent.log ДО подъёма — точка отсчёта замка двери. → байты | None (не прочитан)."""
+    try:
+        return os.path.getsize(path or AGENT_LOG_PATH)
+    except Exception as e:                                                 # noqa: BLE001
+        log.warning("замок двери: размер pc_agent.log не снят (%s) — свежесть строки доказать нечем", e)
+        return None
+
+
+def agent_log_tail(offset, path=None):
+    """Байты pc_agent.log, дописанные ПОСЛЕ снятого смещения. → (текст | None, ротация?).
+
+    Ротация (файл стал КОРОЧЕ смещения) не прячется под «ничего не дописано»: возвращаем весь файл
+    и честный флаг — судить такую находку по позиции нельзя, только по времени строки."""
+    p = path or AGENT_LOG_PATH
+    if offset is None:
+        return None, False
+    try:
+        size = os.path.getsize(p)
+        rotated = size < offset
+        with open(p, "rb") as f:
+            if not rotated:
+                f.seek(offset)
+            data = f.read()
+        return data.decode("utf-8", "replace"), rotated
+    except Exception as e:                                                 # noqa: BLE001
+        log.warning("замок двери: хвост pc_agent.log не прочитан (%s)", e)
+        return None, False
+
+
+def _agent_log_stamp(line):
+    """Штамп строки лога агента (`2026-09-21 22:11:55,329 | INFO | ...`) → epoch | None."""
+    head = str(line).split(" | ", 1)[0].strip()
+    try:
+        return datetime.datetime.strptime(head, "%Y-%m-%d %H:%M:%S,%f").timestamp()
+    except Exception:                                                      # noqa: BLE001
+        return None
+
+
+def agent_door_verdict(tail, rotated=False, raise_at=None, mark=None):
+    """ЗАМОК 2: дверь владельца ОТВЕТИЛА? → ('ok'|'silent'|'unknown', словами). ЧИСТАЯ (голден).
+
+    'unknown' — третий исход и НЕ успех: не прочитали хвост, провернулся лог — значит доказать
+    нечем, и владельца зовут. Стара́я строка `Application started` засчитаться не может физически:
+    ищем только в байтах ПОСЛЕ смещения, снятого до подъёма."""
+    mark = AGENT_DOOR_MARK if mark is None else mark
+    if tail is None:
+        return "unknown", "хвост pc_agent.log не прочитан — ответила ли дверь, ДОКАЗАТЬ НЕЧЕМ"
+    hits = [ln.strip() for ln in tail.splitlines() if mark in ln]
+    if not hits:
+        return "silent", "строки «%s» в дописанном хвосте НЕТ — дверь МОЛЧИТ" % mark
+    if not rotated:
+        return "ok", "«%s» дописана ПОСЛЕ подъёма: %s" % (mark, _tail(hits[-1], 120))
+    if raise_at is None:
+        return "unknown", ("pc_agent.log провернулся, а времени подъёма нет — свежесть строки "
+                           "«%s» доказать нечем" % mark)
+    for ln in hits:
+        got = _agent_log_stamp(ln)
+        if got is not None and got >= float(raise_at) - 1.0:
+            return "ok", ("«%s» со штампом %s — позже подъёма (лог провернулся, судим по времени)"
+                          % (mark, str(ln).split(" | ", 1)[0]))
+    return "unknown", ("pc_agent.log провернулся, и ни одна из %d строк «%s» не доказана свежей — "
+                       "исход НЕИЗВЕСТЕН" % (len(hits), mark))
+
+
+def agent_door_ready(offset, raise_at=None, deadline=None, poll=None, tail_fn=None, sleeper=None):
+    """Ждём ответа двери до срока. → ('ok'|'silent'|'unknown', словами).
+    Шаги считаем накоплением (как `_agent_wait_pids`): часов не спрашиваем — ПК умеет спать."""
+    deadline = AGENT_DOOR_DEADLINE if deadline is None else deadline
+    poll = AGENT_DOOR_POLL if poll is None else poll
+    sleep = sleeper or time.sleep
+    read = tail_fn or (lambda: agent_log_tail(offset))
+    waited = 0.0
+    while True:
+        try:
+            chunk, rotated = read()
+        except Exception as e:                                             # noqa: BLE001
+            log.warning("замок двери: проба хвоста упала (%s) — исход НЕИЗВЕСТЕН", e)
+            chunk, rotated = None, False
+        outcome, said = agent_door_verdict(chunk, rotated, raise_at)
+        if outcome == "ok":
+            return outcome, said
+        if waited >= deadline:
+            return outcome, "%s (ждали %s)" % (said, fmt_sleep(deadline))
+        step = min(max(1, poll), max(0.0, deadline - waited))
+        sleep(step)
+        waited += step
+
+
+def _git_show_bytes(commit, name):
+    """Содержимое файла на КОММИТЕ, как байты. → bytes | None (git не отдал)."""
+    try:
+        r = subprocess.run(["git", "-C", REPO, "show", "%s:%s" % (commit, name)],
+                           capture_output=True, timeout=30, creationflags=NO_WINDOW)
+    except Exception as e:                                                 # noqa: BLE001
+        log.warning("откат агента: git show %s:%s упал (%s)", commit, name, e)
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _git_has_path(commit, name):
+    """Файл вообще СУЩЕСТВОВАЛ на этом коммите? → bool. Отличает «не было» от «git не отдал»."""
+    out = _git_out(["ls-tree", "-r", "--name-only", str(commit), "--", str(name)])
+    return bool((out or "").strip())
+
+
+def _agent_prev_commit(names, log_fn=None):
+    """Коммит, на котором лежал ПРЕЖНИЙ код агента = предпоследний коммит, тронувший его
+    замыкание. → хеш | ''. Именно он, а не RUNNING_COMMIT: в реконсиляции демон уже стои́т на
+    новом HEAD, и «откат» туда вернул бы ровно тот код, из-за которого дверь и не ответила."""
+    out = (log_fn or _git_out)(["log", "-n", "2", "--format=%H", "--", *[str(n) for n in names]])
+    lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    return lines[1] if len(lines) > 1 else ""
+
+
+def _match_eol(blob, path):
+    """Байты из git приходят с LF, а на диске полосы лежит CRLF (замер 22.09: blob pc_agent.py —
+    118286 байт против 119989 на диске, разница 1703 = ровно число строк). Возвращаем перевод
+    строки ТОГО ЖЕ вида, что лежит сейчас: иначе откат в глазах git подменяет файл целиком."""
+    try:
+        with open(path, "rb") as f:
+            cur = f.read(65536)
+    except Exception:                                                      # noqa: BLE001
+        return blob
+    if b"\r\n" in cur and b"\r\n" not in blob:
+        return blob.replace(b"\n", b"\r\n")
+    return blob
+
+
+def agent_rollback_rehearse(old_commit=None, names=None, out_dir=None, show_fn=None,
+                            has_fn=None, closure_fn=None, prev_fn=None, eol_fn=None):
+    """ЗАМОК 3: откат ПРОВЕРЕН ЗАРАНЕЕ? → (ok, словами, payload {имя: путь}).
+
+    Проверка — не описание, а СОБЫТИЕ: прежние байты достаются из git, КЛАДУТСЯ НА ДИСК и
+    РАЗБИРАЮТСЯ. Не достались (коммит потерян, git молчит) или не разбираются — откат объявляется
+    невозможным, и самоподъём не начинается вовсе. Файл, которого на прежнем коммите НЕ БЫЛО,
+    пропускается поимённо: лишний модуль на диске прежнему коду не мешает, а удалять запрещено."""
+    if names is None:
+        closure, why = _agent_closure(closure_fn=closure_fn)
+        if not closure:
+            return False, ("замыкание агента не посчитано (%s) — что возвращать, неизвестно"
+                           % (why or "причина не названа")), {}
+        names = sorted(closure)
+    names = [str(n) for n in names if str(n).endswith(".py")]
+    if not names:
+        return False, "возвращать нечего — ни одного .py в замыкании агента", {}
+    old_commit = old_commit or (prev_fn or _agent_prev_commit)(names)
+    if not old_commit:
+        return False, "ПРЕЖНЕГО коммита кода агента в истории нет — вернуться НЕКУДА", {}
+    show = show_fn or _git_show_bytes
+    has = has_fn or _git_has_path
+    eol = eol_fn or _match_eol
+    dest = out_dir or os.path.join(AGENT_ROLLBACK_DIR, str(old_commit)[:12])
+    try:
+        os.makedirs(dest, exist_ok=True)
+    except Exception as e:                                                 # noqa: BLE001
+        return False, "место репетиции не создано (%s: %s)" % (type(e).__name__, str(e)[:80]), {}
+    payload, total, skipped = {}, 0, []
+    for name in names:
+        blob = show(old_commit, name)
+        if blob is None:
+            if not has(old_commit, name):
+                skipped.append(name)                    # на прежнем коммите файла не было
+                continue
+            return False, ("%s НЕ достаётся из %s — прежнего кода в git нет, откат НЕВОЗМОЖЕН"
+                           % (name, str(old_commit)[:9])), {}
+        try:
+            src = blob.decode("utf-8")
+        except Exception as e:                                             # noqa: BLE001
+            return False, "%s из %s не читается как utf-8 (%s)" % (name, str(old_commit)[:9],
+                                                                   type(e).__name__), {}
+        try:
+            compile(src, "%s@%s" % (name, str(old_commit)[:9]), "exec")
+        except SyntaxError as e:
+            return False, ("ПРЕЖНИЙ %s:%s не разбирается (%s) — возвращаться туда нельзя"
+                           % (name, e.lineno, e.msg or "")), {}
+        except Exception as e:                                             # noqa: BLE001
+            return False, "ПРЕЖНИЙ %s не разбирается (%s)" % (name, type(e).__name__), {}
+        base = os.path.basename(name)
+        path = os.path.join(dest, base)
+        try:
+            with open(path, "wb") as f:
+                f.write(eol(blob, os.path.join(REPO, base)))
+        except Exception as e:                                             # noqa: BLE001
+            return False, "%s не лёг на диск (%s: %s)" % (name, type(e).__name__, str(e)[:80]), {}
+        payload[base] = path
+        total += len(blob)
+    if not payload:
+        return False, "из %s не вернулось ни одного файла — откат пуст" % str(old_commit)[:9], {}
+    return True, ("откат ОТРЕПЕТИРОВАН на %s: %d файл(ов), %d байт лежат на диске и разбираются%s "
+                  "→ %s" % (str(old_commit)[:9], len(payload), total,
+                            ("; не было на прежнем коммите: " + ", ".join(skipped)) if skipped else "",
+                            dest)), payload
+
+
+def agent_rollback_apply(payload, dest_dir=None, copy_fn=None):
+    """Вернуть прежний код агента НА ДЕЛЕ: отрепетированные байты копируются в рабочее дерево.
+    → (вернулись, отказ словами). Под юнит-тестами боевое копирование запрещено (пункт 6)."""
+    if not payload:
+        return [], "откат не репетировался — возвращать нечего"
+    if copy_fn is None and "unittest" in sys.modules:
+        return [], "боевой откат запрещён под юнит-тестами (проверка идёт на подставном копире)"
+    copy = copy_fn or shutil.copyfile
+    dest_dir = dest_dir or REPO
+    restored, err = [], ""
+    for name, path in sorted(payload.items()):
+        try:
+            copy(path, os.path.join(dest_dir, os.path.basename(name)))
+            restored.append(os.path.basename(name))
+        except Exception as e:                                             # noqa: BLE001
+            err = "%s НЕ возвращён (%s: %s)" % (name, type(e).__name__, str(e)[:80])
+            break
+    return restored, err
+
+
+def selfraise_fallback(payload, commit="", finder=None, killer=None, raiser=None, apply_fn=None,
+                       door_fn=None, offset_fn=None, sleeper=None, now=None, wait_pids=None,
+                       wait_gone=None):
+    """БЕЗОПАСНЫЙ РЕЖИМ замка 2: дверь не ответила ⇒ возвращаем ПРЕЖНИЙ код и поднимаем на нём.
+    → (ok, словами). Кричит НЕ здесь: крик обязателен в ЛЮБОМ исходе и живёт у вызывающего."""
+    now = time.time() if now is None else now
+    restored, err = (apply_fn or agent_rollback_apply)(payload)
+    if not restored:
+        return False, "ОТКАТ НЕ ВЫПОЛНЕН (%s) — дверь осталась на новом коде" % (err or "нечего возвращать")
+    back = ("вернул прежний код агента (%d файл(ов): %s)%s"
+            % (len(restored), ", ".join(restored), ("; " + err) if err else ""))
+    find = finder or (lambda: _find_pids_by_script(_AGENT_ENTRY))
+    try:
+        alive = find()
+    except Exception as e:                                                 # noqa: BLE001
+        log.warning("откат агента: поиск PID упал (%s)", e)
+        alive = None
+    if alive:
+        (killer or _stop_pc_agent)(alive, now)
+        gone, left = (wait_gone or _agent_wait_gone)(find, sleeper=sleeper)
+        if not gone:
+            seen = ", ".join(map(str, left)) if left else "номер не виден (CIM слеп)"
+            return False, "%s, но процесс на новом коде НЕ СНЯЛСЯ (видно: %s) — подъём отменён" % (back, seen)
+    offset = (offset_fn or agent_log_offset)()
+    try:
+        rok, rdetail = (raiser or _raise_pc_agent_guarded)()
+    except Exception as e:                                                 # noqa: BLE001
+        rok, rdetail = False, "подниматель упал: %s" % e
+    after = (wait_pids or _agent_wait_pids)(find, sleeper=sleeper)
+    if not after:
+        return False, ("%s, но ПРЕЖНИЙ код не поднялся (PID не появился; команда подъёма ok=%s: %s)"
+                       % (back, rok, _tail(str(rdetail), 100)))
+    outcome, said = (door_fn or agent_door_ready)(offset, now, sleeper=sleeper)
+    if outcome == "ok":
+        return True, "%s и поднял его (PID %s): ДВЕРЬ ОТВЕТИЛА — %s" % (back, ", ".join(map(str, after)), said)
+    return False, ("%s и поднял (PID %s), но дверь ВСЁ РАВНО не ответила: %s"
+                   % (back, ", ".join(map(str, after)), said))
+
+
 def selfraise_agent(commit="", why="self-update", finder=None, killer=None, raiser=None,
                     parse_fn=None, lock_fn=None, sleeper=None, now=None, state=None,
-                    notifier=None, critical=None, journal=None, wait_pids=None, wait_gone=None):
+                    notifier=None, critical=None, journal=None, wait_pids=None, wait_gone=None,
+                    gate_fn=None, rehearse_fn=None, door_fn=None, fallback_fn=None,
+                    offset_fn=None, old_commit=None):
     """ПОДНЯТЬ ДВЕРЬ ВЛАДЕЛЬЦА САМИМ после правки её собственного кода. → строка-итог для лога.
 
     Порядок обязателен, и в нём весь смысл (задание Штаба 07.09):
@@ -9312,6 +9637,30 @@ def selfraise_agent(commit="", why="self-update", finder=None, killer=None, rais
             "⚠️ Оркестратор: новый код pc_agent НЕ РАЗБИРАЕТСЯ — %s.\nЖивой агент НЕ тронут, дверь "
             "владельца осталась на прежнем коде (это лучше, чем снять её ради кода, который не "
             "поднимется). Нужен фикс синтаксиса." % pdetail)
+    # ── ЗАМОК 1: ГЕЙТ, а не разбор (22.09.2026) ──────────────────────────────────────────────
+    # `compile()` выше доказал СИНТАКСИС и промолчал про импорт. Дверь владельца снимаем только под
+    # ТЕМ ЖЕ гейтом, под которым её снимает слово владельца (`pc_agent.self_restart`): py_compile +
+    # import-smoke в ОТДЕЛЬНОМ интерпретаторе. Отказ — ОСТАНОВКА, живой агент не тронут ни разу.
+    gok, gdetail = (gate_fn or agent_code_gated)()
+    if not gok:
+        return _stop(
+            "%s, но новый код НЕ ПРОШЁЛ ГЕЙТ (%s) — ЖИВОЙ АГЕНТ НЕ ТРОНУТ, %s" % (head, gdetail, manual),
+            "⚠️ Оркестратор: новый код pc_agent разбирается, но НЕ ПРОХОДИТ ГЕЙТ — %s.\nЖивой агент "
+            "НЕ тронут, дверь владельца осталась на прежнем (работающем) коде: снять её ради кода, "
+            "который падает при импорте, значило бы остаться без канала управления." % gdetail)
+    # ── ЗАМОК 3: ОТКАТ ОТРЕПЕТИРОВАН ДО СНЯТИЯ ЖИВОГО (22.09.2026) ───────────────────────────
+    # «Откат есть» на словах — признак, который поднимается, не совершив события. Здесь событие
+    # совершается: прежние байты достаются из git, ложатся на диск и разбираются — и ИМЕННО ОНИ
+    # копируются назад, если дверь не ответит. Не отрепетировался — ОСТАНОВКА: снимать дверь, не
+    # имея куда вернуться, запрещено.
+    rbok, rbdetail, payload = (rehearse_fn or agent_rollback_rehearse)(old_commit)
+    if not rbok:
+        return _stop(
+            "%s, но ОТКАТ НЕВОЗМОЖЕН (%s) — ЖИВОЙ АГЕНТ НЕ ТРОНУТ, %s" % (head, rbdetail, manual),
+            "⚠️ Оркестратор: самоподъём pc_agent НЕ НАЧАТ — вернуться некуда (%s).\nЖивой агент НЕ "
+            "тронут: поднимать дверь на новом коде, не имея проверенного отката, нельзя. Подними "
+            "агента вручную, если правка нужна прямо сейчас." % rbdetail)
+    log.info("самоподъём агента: %s", rbdetail)
     # ── ПУНКТ 4: петлевая защита ─────────────────────────────────────────────────────────────
     allowed, limit_why, limit_loud = agent_raise_allowed(now, state)
     if not allowed:
@@ -9349,6 +9698,9 @@ def selfraise_agent(commit="", why="self-update", finder=None, killer=None, rais
                 "Сними агента вручную и запусти задачу Планировщика pc_agent."
                 % (seen, (": " + kill_err) if kill_err else ""))
     lock_before = (lock_fn or _agent_lock_read)()
+    # ТОЧКА ОТСЧЁТА ЗАМКА 2 — снимается ДО подъёма и ПОСЛЕ смерти старого: строка двери будет
+    # искаться ТОЛЬКО в байтах, дописанных после неё, поэтому вчерашняя строка засчитаться не может.
+    offset = (offset_fn or agent_log_offset)()
     # ── ПУНКТ 3 (механика): подъём ровно тем, чем поднимает сторож ───────────────────────────
     try:
         rok, rdetail = (raiser or _raise_pc_agent_guarded)()
@@ -9368,22 +9720,42 @@ def selfraise_agent(commit="", why="self-update", finder=None, killer=None, rais
     outcome, said = agent_raise_verdict(before, after, late, lock_before, lock_after)
     was_s = ", ".join(map(str, before)) or "агент лежал"
     if outcome == "ok":
-        pid_s = ", ".join(map(str, late))
-        msg = "%s — САМОПОДЪЁМ ВЫПОЛНЕН: %s" % (head, said)
-        log.info("самоподъём агента: %s", msg)
-        say("авто-применил %s: pc_agent поднят САМ (PID %s → %s), владельца не звали"
-            % (commit or "правку", was_s, pid_s))
-        quiet("🔁 pc_agent ПОДНЯТ САМ после правки его кода (%s)\n%s\nвладельца звать не потребовалось"
-              % (commit or "новый коммит", said))
-        return msg
+        # ── ЗАМОК 2: ПРОЦЕСС ≠ ДВЕРЬ (22.09.2026) ────────────────────────────────────────────
+        # Три факта выше доказали ПРОЦЕСС. Дверь доказывает только сама библиотека: строку
+        # «Application started» она пишет после ответа Telegram на get_me и после старта полинга.
+        dout, dsaid = (door_fn or agent_door_ready)(offset, now, sleeper=sleeper)
+        if dout == "ok":
+            pid_s = ", ".join(map(str, late))
+            msg = "%s — САМОПОДЪЁМ ВЫПОЛНЕН: %s; ДВЕРЬ ОТВЕТИЛА (%s)" % (head, said, dsaid)
+            log.info("самоподъём агента: %s", msg)
+            say("авто-применил %s: pc_agent поднят САМ (PID %s → %s), дверь ответила, владельца не звали"
+                % (commit or "правку", was_s, pid_s))
+            quiet("🔁 pc_agent ПОДНЯТ САМ после правки его кода (%s)\n%s\nдверь ответила: %s\n"
+                  "владельца звать не потребовалось" % (commit or "новый коммит", said, dsaid))
+            return msg
+        outcome = "door_" + dout
+        said = "%s, НО ДВЕРЬ НЕ ОТВЕТИЛА: %s" % (said, dsaid)
+    # ── БЕЗОПАСНЫЙ РЕЖИМ С КРИКОМ (пункт 5 задания) ─────────────────────────────────────────
+    # Подъём не доказан ЛИБО процесс встал, а дверь молчит — в обоих случаях владелец остался без
+    # канала. Возвращаем ПРЕЖНИЙ код (те самые отрепетированные байты) и поднимаем на нём. Кричим
+    # ВСЕГДА, чем бы откат ни кончился: даже удавшийся откат оставляет дерево с прежним кодом
+    # поверх нового HEAD, и решение об этом принимает человек, а не демон.
+    fb_ok, fb_said = (fallback_fn or selfraise_fallback)(
+        payload, commit=commit, sleeper=sleeper, now=now)
+    log.info("самоподъём агента: откат — %s", fb_said)
     return _stop(
-        "%s — САМОПОДЪЁМ НЕ ДОКАЗАН (%s): %s; было PID %s, снято %s; команда подъёма: %s. %s"
+        "%s — САМОПОДЪЁМ НЕ ДОКАЗАН (%s): %s; было PID %s, снято %s; команда подъёма: %s. "
+        "ОТКАТ: %s. %s"
         % (head, outcome, said, was_s, ", ".join(map(str, stopped)) or "никого",
-           _tail(str(rdetail), 120), manual),
+           _tail(str(rdetail), 120), fb_said, manual),
         "⚠️ САМОПОДЪЁМ pc_agent НЕ ПОДТВЕРЖДЁН — %s\nбыло: PID %s · снято: %s · команда подъёма "
-        "(ok=%s): %s\n%s — подними агента вручную задачей Планировщика pc_agent."
+        "(ok=%s): %s\n%s ОТКАТ: %s\n%s — %s"
         % (said, was_s, ", ".join(map(str, stopped)) or "никого", rok, _tail(str(rdetail), 120),
-           RAISE_LOSS.get("pc_agent", "процесс контура не работает")))
+           "✅" if fb_ok else "⛔", fb_said,
+           RAISE_LOSS.get("pc_agent", "процесс контура не работает"),
+           "дверь жива на ПРЕЖНЕМ коде — посмотри, почему новый не отвечает, дерево сейчас "
+           "грязное прежним кодом агента." if fb_ok
+           else "подними агента вручную задачей Планировщика pc_agent."))
 
 
 def _raise_client_bot(kind):

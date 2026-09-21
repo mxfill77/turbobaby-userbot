@@ -13,6 +13,7 @@ import json
 import types
 import shutil
 import inspect
+import hashlib            # ТРИ ЗАМКА 70h: откат сверяется по sha256 прежних байтов, а не «на глаз»
 import tempfile
 import datetime
 import threading            # ДВЕ РУКИ (задача 238): барьер доказывает перекрытие заходов
@@ -13384,6 +13385,15 @@ class SelfRaiseAgentFlowTest(unittest.TestCase):
         Ни одного боевого вызова: ни CIM, ни taskkill, ни Планировщика."""
         base = dict(commit="c0ffee1", why="self-update",
                     parse_fn=lambda: (True, "разобрано 8 файл(ов)"),
+                    # ТРИ ЗАМКА (22.09.2026) — подставные по умолчанию: боевой гейт, боевой git и
+                    # боевой pc_agent.log в этих голденах не участвуют ни одной веткой. Забытая
+                    # инъекция даёт ОТКАЗ (fail-closed), а не боевой вызов — это отдельный голден.
+                    gate_fn=lambda: (True, "гейт пройден на 8 файл(ах)"),
+                    rehearse_fn=lambda old=None: (True, "откат ОТРЕПЕТИРОВАН на dead1234",
+                                                  {"pc_agent.py": "tmp/rehearsed/pc_agent.py"}),
+                    offset_fn=lambda: 4096,
+                    door_fn=lambda off, at=None, **kw: ("ok", "«Application started» после подъёма"),
+                    fallback_fn=lambda pay, **kw: (False, "подставной откат не звался"),
                     killer=lambda pids, seen: (self.killed.extend(pids) or list(pids), ""),
                     raiser=self._raiser,
                     lock_fn=lambda: ({"pid": 222, "written": 2000.0} if self.raised
@@ -13550,6 +13560,275 @@ class SelfRaiseAgentBoundaryTest(unittest.TestCase):
             selfraise_fn=lambda *a, **k: called.append(a) or "не должно")
         self.assertEqual(called, [], "правка бота не смеет поднимать дверь владельца")
         self.assertIn("анти-флап", note)
+
+
+class AgentSelfRaiseLocksTest(unittest.TestCase):
+    """ТРИ ЗАМКА САМОПОДЪЁМА (задание Штаба 70h, 22.09.2026) — и МУТАНТ на каждый.
+
+    Зелёный тест без мутанта замком не считается, поэтому у каждого замка здесь есть пара:
+    защищаемое поведение ломается НАМЕРЕННО, и проверка обязана увидеть это числом. Боевого в
+    голденах нет ничего: pc_agent.log подставной (temp), git подставной, копирование — в
+    temp-дерево. Временное место НЕ убирается за собой сознательно (запрет задания «ничего не
+    удалять»): каталоги остаются в системном temp."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="selfraise_locks_")
+        self.loud, self.cards, self.cows = [], [], []
+        self.killed, self.raised = [], []
+
+    def _raise(self, **kw):
+        """Подставной самоподъём: ВСЕ три замка и все боевые руки инъектированы."""
+        base = dict(commit="c0ffee1", why="self-update",
+                    parse_fn=lambda: (True, "разобрано 8 файл(ов)"),
+                    gate_fn=lambda: (True, "гейт пройден на 8 файл(ах)"),
+                    rehearse_fn=lambda old=None: (True, "откат ОТРЕПЕТИРОВАН на dead1234",
+                                                  {"pc_agent.py": os.path.join(self.tmp, "pc_agent.py")}),
+                    offset_fn=lambda: 4096,
+                    door_fn=lambda off, at=None, **k: ("ok", "«Application started» после подъёма"),
+                    fallback_fn=lambda pay, **k: (True, "вернул прежний код и поднял: ДВЕРЬ ОТВЕТИЛА"),
+                    finder=lambda: ([222] if self.raised else [111]),
+                    killer=lambda pids, seen: (self.killed.extend(pids) or list(pids), ""),
+                    raiser=lambda: (self.raised.append(1) or (True, "schtasks rc=0")),
+                    lock_fn=lambda: ({"pid": 222, "written": 2000.0} if self.raised
+                                     else {"pid": 111, "written": 1000.0}),
+                    wait_gone=lambda find, sleeper=None: (True, []),
+                    wait_pids=lambda find, sleeper=None: find(),
+                    sleeper=lambda s: None, now=1000.0, state=[],
+                    journal=self.cows.append, critical=self.loud.append, notifier=self.cards.append)
+        base.update(kw)
+        return o.selfraise_agent(**base)
+
+    def _log(self, lines):
+        p = os.path.join(self.tmp, "pc_agent.log")
+        with open(p, "a", encoding="utf-8") as f:
+            for ln in lines:
+                f.write(ln + "\n")
+        return p
+
+    # ───────────────── ЗАМОК 1: ГЕЙТ, А НЕ РАЗБОР ─────────────────
+    def test_zamok1_mutant_kod_razbiraetsya_no_ne_importiruetsya(self):
+        """МУТАНТ замка 1: ломаем РОВНО защищаемое поведение — код, который РАЗБИРАЕТСЯ, но
+        падает при импорте. Прежний признак (compile) зеленеет 1 из 1, новый (гейт) ловит 1 из 1.
+        Ровно этот класс и снимает дверь владельца: агент стартует и умирает на импорте."""
+        src = "import no_such_module_ever_xyz\nX = 1\n"
+        with open(os.path.join(self.tmp, "mutant_door.py"), "w", encoding="utf-8") as f:
+            f.write(src)
+        compile(src, "mutant_door.py", "exec")            # ПРЕЖНИЙ признак: «разобрался», 1 из 1
+        ok, msg = selfupdate_gate.code_gate(sys.executable, self.tmp,
+                                            ["mutant_door.py"], "mutant_door")
+        self.assertFalse(ok, "гейт обязан заметить непроходимый импорт")
+        self.assertIn("import-smoke", msg)
+
+    def test_zamok1_zdorovyi_kod_tot_zhe_gate_prohodit(self):
+        """Контроль мутанта: на здоровом коде тот же гейт зелёный — замок ловит поломку, а не всё."""
+        with open(os.path.join(self.tmp, "healthy_door.py"), "w", encoding="utf-8") as f:
+            f.write("X = 1\n")
+        ok, msg = selfupdate_gate.code_gate(sys.executable, self.tmp,
+                                            ["healthy_door.py"], "healthy_door")
+        self.assertTrue(ok, msg)
+
+    def test_zamok1_otkaz_eto_ostanovka_zhivogo_ne_trogaem(self):
+        """ПУНКТ 5: отказ замка 1 — ОСТАНОВКА. Ни снятия, ни подъёма, ни репетиции; крик — 1."""
+        note = self._raise(gate_fn=lambda: (False, "import-smoke: ModuleNotFoundError"),
+                           rehearse_fn=lambda old=None: self.fail("репетиция после отказа гейта"))
+        self.assertEqual(self.killed, [], "живого агента тронули после отказа гейта")
+        self.assertEqual(self.raised, [])
+        self.assertEqual(len(self.loud), 1)
+        self.assertIn("НЕ ПРОШЁЛ ГЕЙТ", note)
+        self.assertIn("НЕ ТРОНУТ", note)
+
+    def test_zamok1_zabytaya_inyekciya_daet_otkaz_a_ne_spavn(self):
+        """Fail-closed: без подставного гейта боевой не зовётся вовсе."""
+        ok, msg = o.agent_code_gated()
+        self.assertFalse(ok)
+        self.assertIn("под юнит-тестами", msg)
+
+    def test_zamok1_bez_zamykaniya_otkaz(self):
+        ok, msg = o.agent_code_gated(closure_fn=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("нет графа")))
+        self.assertFalse(ok)
+        self.assertIn("не посчитано", msg)
+
+    # ───────────────── ЗАМОК 2: ДВЕРЬ, А НЕ ПРОЦЕСС ─────────────────
+    def test_zamok2_staraya_stroka_dveri_ne_zaschityvaetsya(self):
+        """МУТАНТ замка 2: строка двери в логе ЕСТЬ, но она ВЧЕРАШНЯЯ — события не было.
+        Числа: в файле 1 строка «Application started», в дописанном хвосте — 0 → 'silent'."""
+        p = self._log(["2026-09-20 22:54:12,857 | INFO | Application started"])
+        offset = o.agent_log_offset(p)
+        self._log(["2026-09-21 22:11:42,458 | INFO | pc_agent ЗАПУСК — слушаю HQ/тему 205."])
+        tail, rotated = o.agent_log_tail(offset, p)
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(f.read().count("Application started"), 1)
+        self.assertEqual(tail.count("Application started"), 0)
+        self.assertEqual(o.agent_door_verdict(tail, rotated)[0], "silent")
+        # а как только дверь ОТВЕТИЛА на самом деле — тот же замок зеленеет
+        self._log(["2026-09-21 22:11:55,329 | INFO | Application started"])
+        tail2, rot2 = o.agent_log_tail(offset, p)
+        self.assertEqual(o.agent_door_verdict(tail2, rot2)[0], "ok")
+
+    def test_zamok2_rotaciya_ne_zelenit_staroi_strokoi(self):
+        """Лог провернулся — позиции нет, и судим по времени: вчерашняя строка даёт 'unknown'
+        (третий исход, НЕ успех), сегодняшняя — 'ok'."""
+        raise_at = datetime.datetime(2026, 9, 21, 22, 11, 42).timestamp()
+        stale = "2026-09-20 22:54:12,857 | INFO | Application started"
+        fresh = "2026-09-21 22:11:55,329 | INFO | Application started"
+        self.assertEqual(o.agent_door_verdict(stale, True, raise_at)[0], "unknown")
+        self.assertEqual(o.agent_door_verdict(fresh, True, raise_at)[0], "ok")
+        self.assertEqual(o.agent_door_verdict(fresh, True, None)[0], "unknown")
+
+    def test_zamok2_ne_prochitannyi_hvost_eto_neizvestno_a_ne_uspeh(self):
+        self.assertEqual(o.agent_door_verdict(None)[0], "unknown")
+        self.assertEqual(o.agent_log_tail(None, os.path.join(self.tmp, "нет.log")), (None, False))
+
+    def test_zamok2_srok_izmeren_a_ne_naznachen(self):
+        """Корпус 23 старта (pc_agent.log + .1 + .2 + .3): max паузы «ЗАПУСК → Application
+        started» = 26.89 с. Срок обязан перекрывать измеренный максимум ВТРОЕ."""
+        self.assertGreaterEqual(o.AGENT_DOOR_DEADLINE, 26.89 * 3)
+
+    def test_zamok2_zhivoi_process_pri_molchashchei_dveri_ne_podyom(self):
+        """МУТАНТ ЖИВОГО ПРИЗНАКА: три прежних факта (номер сменился · лок переписан · жив спустя
+        паузу) ОСТАВЛЕНЫ ЗЕЛЁНЫМИ, сломана ровно дверь. Прежний вердикт — 'ok' (ложный зелёный
+        1 из 1), новый — отказ, откат зовётся 1 раз, крик 1."""
+        self.assertEqual(o.agent_raise_verdict([111], [222], [222],
+                                               {"pid": 111, "written": 1.0},
+                                               {"pid": 222, "written": 2.0})[0], "ok")
+        fb = []
+        note = self._raise(door_fn=lambda off, at=None, **k: ("silent", "строки нет — дверь МОЛЧИТ"),
+                           fallback_fn=lambda pay, **k: (fb.append(pay) or
+                                                         (True, "вернул прежний код и поднял: ДВЕРЬ ОТВЕТИЛА")))
+        self.assertEqual(len(fb), 1, "откат не позвали при молчащей двери")
+        self.assertIn("ДВЕРЬ НЕ ОТВЕТИЛА", note)
+        self.assertIn("ОТКАТ:", note)
+        self.assertEqual(len(self.loud), 1, "безопасный режим обязан КРИЧАТЬ")
+
+    def test_zamok2_dver_otvetila_vladeltsa_ne_zovut(self):
+        note = self._raise()
+        self.assertIn("САМОПОДЪЁМ ВЫПОЛНЕН", note)
+        self.assertIn("ДВЕРЬ ОТВЕТИЛА", note)
+        self.assertEqual(self.loud, [], "при живой двери владельца не будят")
+        self.assertEqual(len(self.cards), 1)
+
+    def test_zamok2_zhdyot_dver_do_sroka_a_potom_sdayotsya(self):
+        seen = []
+        outcome, said = o.agent_door_ready(0, 1000.0, deadline=20, poll=5,
+                                           tail_fn=lambda: (seen.append(1) or ("пусто", False)),
+                                           sleeper=lambda s: None)
+        self.assertEqual(outcome, "silent")
+        self.assertEqual(len(seen), 5, "проб хвоста должно быть 5 (0,5,10,15,20 с)")
+        self.assertIn("ждали", said)
+
+    # ───────────────── ЗАМОК 3: ОТКАТ ОТРЕПЕТИРОВАН ─────────────────
+    def test_zamok3_repeticiya_kladet_prezhnii_kod_na_disk(self):
+        old = b"X = 1\n"
+        ok, said, payload = o.agent_rollback_rehearse(
+            "dead1234", names=["pc_agent.py", "io_utf8.py"], out_dir=self.tmp,
+            show_fn=lambda c, n: old, has_fn=lambda c, n: True, eol_fn=lambda b, p: b)
+        self.assertTrue(ok, said)
+        self.assertEqual(sorted(payload), ["io_utf8.py", "pc_agent.py"])
+        self.assertIn("12 байт", said)                 # 2 файла × 6 байт — число, а не слово
+        for path in payload.values():
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), old)
+
+    def test_zamok3_mutant_git_poteryal_prezhnii_kod(self):
+        """МУТАНТ замка 3: прежних байтов в git НЕТ (файл на коммите был, а show молчит) —
+        откат объявляется невозможным, payload пуст."""
+        ok, said, payload = o.agent_rollback_rehearse(
+            "dead1234", names=["pc_agent.py"], out_dir=self.tmp,
+            show_fn=lambda c, n: None, has_fn=lambda c, n: True)
+        self.assertFalse(ok)
+        self.assertEqual(payload, {})
+        self.assertIn("НЕВОЗМОЖЕН", said)
+
+    def test_zamok3_mutant_prezhnii_kod_ne_razbiraetsya(self):
+        """МУТАНТ: вернуться можно только в РАБОЧИЙ код — битый прежний файл замок обязан отвергнуть."""
+        ok, said, payload = o.agent_rollback_rehearse(
+            "dead1234", names=["pc_agent.py"], out_dir=self.tmp,
+            show_fn=lambda c, n: b"def (:\n", has_fn=lambda c, n: True)
+        self.assertFalse(ok)
+        self.assertEqual(payload, {})
+        self.assertIn("не разбирается", said)
+
+    def test_zamok3_net_prezhnego_kommita_vernutsya_nekuda(self):
+        ok, said, payload = o.agent_rollback_rehearse(
+            None, names=["pc_agent.py"], out_dir=self.tmp, prev_fn=lambda names: "")
+        self.assertFalse(ok)
+        self.assertIn("НЕКУДА", said)
+
+    def test_zamok3_fayla_ne_bylo_na_kommite_propusk_poimenno(self):
+        """Модуль, которого на прежнем коммите не было, пропускается ПОИМЁННО: лишний файл на
+        диске прежнему коду не мешает, а удалять запрещено."""
+        ok, said, payload = o.agent_rollback_rehearse(
+            "dead1234", names=["pc_agent.py", "novyi.py"], out_dir=self.tmp,
+            show_fn=lambda c, n: (None if n == "novyi.py" else b"X = 1\n"),
+            has_fn=lambda c, n: n != "novyi.py", eol_fn=lambda b, p: b)
+        self.assertTrue(ok, said)
+        self.assertEqual(list(payload), ["pc_agent.py"])
+        self.assertIn("novyi.py", said)
+
+    def test_zamok3_otkaz_ostanavlivaet_do_snyatiya_zhivogo(self):
+        """ПУНКТ 5: отказ замка 3 — ОСТАНОВКА. Снимать дверь, не имея куда вернуться, нельзя."""
+        note = self._raise(rehearse_fn=lambda old=None: (False, "вернуться НЕКУДА", {}))
+        self.assertEqual(self.killed, [])
+        self.assertEqual(self.raised, [])
+        self.assertIn("ОТКАТ НЕВОЗМОЖЕН", note)
+        self.assertEqual(len(self.loud), 1)
+
+    def test_zamok3_prezhnii_kommit_eto_predposlednii_tronuvshii_zamykanie(self):
+        out = "ccc3333\nbbb2222\n"
+        self.assertEqual(o._agent_prev_commit(["pc_agent.py"], log_fn=lambda a: out), "bbb2222")
+        self.assertEqual(o._agent_prev_commit(["pc_agent.py"], log_fn=lambda a: "ccc3333\n"), "")
+
+    # ───────────────── ПУНКТ 4: ОТКАТ ПРОВЕРЯЕТСЯ НА ДЕЛЕ ─────────────────
+    def test_otkat_na_dele_vozvrashchaet_prezhnie_baity(self):
+        """ПУНКТ 4: не словами. Дерево-подставка несёт НОВЫЙ (битый) код; после отката в нём лежат
+        РОВНО прежние байты — сверка по sha256, 2 из 2 файлов."""
+        tree = os.path.join(self.tmp, "tree")
+        os.makedirs(tree, exist_ok=True)
+        old = {"pc_agent.py": b"OLD = 1\n", "io_utf8.py": b"OLD = 2\n"}
+        ok, said, payload = o.agent_rollback_rehearse(
+            "dead1234", names=sorted(old), out_dir=os.path.join(self.tmp, "reh"),
+            show_fn=lambda c, n: old[n], has_fn=lambda c, n: True, eol_fn=lambda b, p: b)
+        self.assertTrue(ok, said)
+        for name in old:                               # в дереве лежит НОВЫЙ код, и он битый
+            with open(os.path.join(tree, name), "wb") as f:
+                f.write(b"import no_such_module_ever_xyz\n")
+        restored, err = o.agent_rollback_apply(payload, dest_dir=tree, copy_fn=shutil.copyfile)
+        self.assertEqual(restored, sorted(old))
+        self.assertEqual(err, "")
+        same = 0
+        for name, blob in old.items():
+            with open(os.path.join(tree, name), "rb") as f:
+                if hashlib.sha256(f.read()).hexdigest() == hashlib.sha256(blob).hexdigest():
+                    same += 1
+        self.assertEqual(same, 2, "откат вернул НЕ те байты")
+
+    def test_otkat_pod_yunitami_boevogo_dereva_ne_kasaetsya(self):
+        restored, err = o.agent_rollback_apply({"pc_agent.py": os.path.join(self.tmp, "нет")})
+        self.assertEqual(restored, [])
+        self.assertIn("под юнит-тестами", err)
+
+    def test_otkat_obyavlyaet_uspeh_tolko_po_dveri(self):
+        """Безопасный режим не смеет объявить себя удавшимся по живому процессу: судит дверь."""
+        common = dict(apply_fn=lambda p: (["pc_agent.py"], ""), finder=lambda: [],
+                      raiser=lambda: (True, "schtasks rc=0"), offset_fn=lambda: 0,
+                      wait_pids=lambda find, sleeper=None: [333],
+                      wait_gone=lambda find, sleeper=None: (True, []),
+                      sleeper=lambda s: None, now=1000.0)
+        ok, said = o.selfraise_fallback({"pc_agent.py": "x"},
+                                        door_fn=lambda off, at=None, **k: ("silent", "строки нет"),
+                                        **common)
+        self.assertFalse(ok)
+        self.assertIn("не ответила", said)
+        ok2, said2 = o.selfraise_fallback({"pc_agent.py": "x"},
+                                          door_fn=lambda off, at=None, **k: ("ok", "«Application started»"),
+                                          **common)
+        self.assertTrue(ok2)
+        self.assertIn("ДВЕРЬ ОТВЕТИЛА", said2)
+
+    def test_otkat_bez_repeticii_nichego_ne_delaet(self):
+        ok, said = o.selfraise_fallback({}, apply_fn=o.agent_rollback_apply, sleeper=lambda s: None)
+        self.assertFalse(ok)
+        self.assertIn("ОТКАТ НЕ ВЫПОЛНЕН", said)
 
 
 if __name__ == "__main__":
