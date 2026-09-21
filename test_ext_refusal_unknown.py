@@ -593,9 +593,18 @@ class TestCutDoesNotJudge62s(unittest.TestCase):
     """Решение — по полному тексту; маркер судьи — в начале строки и до части демона."""
 
     def test_the_live_queue_form_really_starts_with_the_header(self):
-        """Посылка замков: у живого итога первая строка — шапка, а не маркер и не причина."""
+        """Посылка замков: у живого итога сверху ШАПКА, а не маркер судьи и не часть демона.
+
+        ПОПРАВЛЕНО 21.09.2026 (заход 69t). Прежде посылка звучала «первая строка —
+        „СПРАШИВАЛИ“», и это было ровно тем дефектом, который 69n измерила числом:
+        человек читал первой строкой ЦЕЛЬ задания. Теперь первая строка шапки —
+        ПРИЧИНА, «СПРАШИВАЛИ» второй. Для замков 62-s это ничего не меняет и
+        проверяется здесь же: якорь судьи и часть демона по-прежнему НИЖЕ шапки,
+        а показ слепка (110 знаков) по-прежнему до фразы демона не достаёт."""
         text = _queue(LIVE_51)
-        self.assertTrue(text.startswith(cm.L_ASK), text[:40])
+        self.assertFalse(text.startswith(cm.L_ASK), text[:40])
+        self.assertEqual(text.split("\n")[0], cm.why_line(LIVE_51, "failed", o.NO_HEAL_PREFIXES))
+        self.assertTrue(text.split("\n")[1].startswith(cm.L_ASK), text[:80])
         self.assertGreater(text.index("Следов работы"), qs.WHY_MAX)
 
     def test_live_51_in_the_queue_form_is_unknown_in_the_snapshot(self):

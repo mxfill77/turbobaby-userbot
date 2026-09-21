@@ -542,11 +542,19 @@ class NegativeAndDeathLook(unittest.TestCase):
             {"verdict": done_judge_pc.UNPROVEN,
              "reason": "по адресу ПУСТО: за 04.09 в «docs/artifacts» нет ни одного файла"},
             cheer)
+        # ПОПРАВЛЕНО 21.09: у провала нулевой строкой идёт ПРИЧИНА, поэтому строки
+        # ищутся ПО МЕТКАМ, а не по номеру — номер съедет на следующей правке порядка.
         lines = cm.lead(TASK, report, "failed").split("\n")
-        self.assertIn(done_judge_pc.UNPROVEN, lines[1])
+        got = [ln for ln in lines if ln.startswith(cm.L_GOT)][0]
+        nxt = [ln for ln in lines if ln.startswith(cm.L_NEXT)][0]
+        self.assertIn(done_judge_pc.UNPROVEN, got)
         for word in ("ПРЕКРАСНО", "зелены", "замечаний"):
-            self.assertNotIn(word, lines[1])
-        self.assertTrue(lines[2].startswith(cm.L_NEXT + "остановились"), lines[2])
+            self.assertNotIn(word, got)
+        self.assertTrue(nxt.startswith(cm.L_NEXT + "остановились"), nxt)
+        # …и бодрая проза не пролезает в САМУЮ ВИДНУЮ строку тоже: она цитирует судью.
+        self.assertTrue(lines[0].startswith(done_judge_pc.UNPROVEN), lines[0])
+        for word in ("ПРЕКРАСНО", "зелены", "замечаний"):
+            self.assertNotIn(word, lines[0])
 
 
 class Prepend(unittest.TestCase):
@@ -616,24 +624,222 @@ class KeepFirst(unittest.TestCase):
         self.assertEqual(once.count(cm.L_ASK), 1)
 
     def test_unknown_marker_is_not_invented_by_the_module(self):
-        # Набор приходит СНАРУЖИ. Пустой набор — прежнее поведение: шапка первой
-        # строкой даже перед ⏱. Иначе модуль завёл бы свою копию перечня и она
+        # Набор приходит СНАРУЖИ. Пустой набор — маркер НЕ поднимается: шапка идёт
+        # первой, даже перед ⏱. Иначе модуль завёл бы свою копию перечня и она
         # протухла бы на первом новом маркере.
+        # ПОПРАВЛЕНО 21.09: «шапка» у провала начинается СТРОКОЙ ПРИЧИНЫ, а не
+        # «СПРАШИВАЛИ»; предмет теста прежний — поднят маркер или нет.
         out = cm.prepend(self._timeout_body(), TASK, "failed")
-        self.assertTrue(out.startswith(cm.L_ASK))
         self.assertFalse(out.startswith(self.MARK))
+        self.assertEqual(out.split("\n")[0], cm.why_line(self._timeout_body(), "failed"))
+        self.assertTrue(out.split("\n")[1].startswith(cm.L_ASK))
 
     def test_only_a_leading_marker_is_lifted_not_one_from_the_middle(self):
         body = "провал: исполнитель написал " + self.MARK + " в середине отчёта"
         out = cm.prepend(body, TASK, "failed", self.KEEP)
-        self.assertTrue(out.startswith(cm.L_ASK))
+        self.assertFalse(out.startswith(self.MARK))
         self.assertTrue(out.endswith(body))
 
     def test_has_lead_sees_the_head_behind_the_marker(self):
         once = cm.prepend(self._timeout_body(), TASK, "failed", self.KEEP)
         self.assertTrue(cm.has_lead(once, self.KEEP))
-        self.assertFalse(cm.has_lead(once), "без набора маркер шапку заслоняет — это и есть баг")
         self.assertFalse(cm.has_lead(self._timeout_body(), self.KEEP))
+        # ПОПРАВЛЕНО 21.09, и поправка — УСИЛЕНИЕ, а не ослабление. Прежде без набора
+        # маркер заслонял шапку собой («это и есть баг»), потому что стоял на ОДНОЙ
+        # строке со «СПРАШИВАЛИ». Теперь на его строке стои́т ПРИЧИНА, а пара меток
+        # «СПРАШИВАЛИ»+«ВЫШЛО» лежит строками ниже — и шапка узнаётся даже слепым к
+        # набору читателем. Вторая шапка не припишется ни с набором, ни без него.
+        self.assertTrue(cm.has_lead(once))
+        self.assertEqual(once.count(cm.L_ASK), 1)
+
+
+class WhyBeforeGoal(unittest.TestCase):
+    """ПРИЧИНА ВПЕРЕДИ ЦЕЛИ — правило 21.09.2026 (заход 69t), проверяется ЧИСЛОМ.
+
+    Что стережёт этот класс, одной строкой: сообщение о провале, уходящее ЧЕЛОВЕКУ,
+    начинается тем, ПОЧЕМУ он случился, а не тем, ЧЕГО ОТ ЗАДАЧИ ХОТЕЛИ.
+
+    Класс заведён по измеренному дефекту, а не по вкусу. Перепись 69n
+    (`docs/artifacts/2026-09-21-69n-PRICHINAPOLEM-2109.md`) насчитала за неделю
+    14–21.09 пятнадцать сообщений о провале, и ДВЕНАДЦАТЬ назвали человеку причиной
+    ЦЕЛЬ задания; по штатной дороге `process_new` — двенадцать из двенадцати.
+
+    ПОКАЗЫ ЗОВУТСЯ ЖИВЫЕ, А НЕ ПЕРЕСКАЗАННЫЕ: ниже берутся ТЕ ЖЕ функции, которыми
+    полоса показывает провал человеку. Но ОТПРАВКИ НЕТ НИ ОДНОЙ — зовутся только
+    сборщики текста (`_human`, `shown`, `quote`, `_clip`); `dispatch_notify` не
+    импортируется и не вызывается, в темы и владельцу из набора не уходит ничего."""
+
+    TID = 153
+    SAID = "You've hit your weekly limit · resets Sep 22, 4am (Asia/Bangkok)."
+
+    def _fake_fail(self, code=None):
+        """ПОДДЕЛАННЫЙ провал с ИЗВЕСТНОЙ причиной — живой формой демона, а не строкой руками."""
+        import exit_evidence
+        import pc_orchestrator as o
+
+        code = code or o.FAIL_EXTERNAL_LIMIT
+        ev = exit_evidence.evidence(1, "", self.SAID)
+        body = o.fail_result(code, "claude exit=1: " + self.SAID + " | СВИДЕТЕЛЬСТВО: " + ev,
+                             since=None)
+        return o, cm.prepend(body, TASK, "failed", o.NO_HEAL_PREFIXES, None)
+
+    def _shows(self, result):
+        """ПЯТЬ ПОКАЗОВ ЧЕЛОВЕКУ по переписи 69n. → {имя показа: текст, который он даёт}."""
+        import queue_snapshot_pc as qs
+        import vitrina_pc_run as vr
+        import pc_orchestrator as o
+
+        return {
+            "карточка devbot (поле result)": result.split("\n")[0],
+            "заголовок жизненного цикла (_human)": o._human("failed", self.TID, result),
+            "слепок очереди в мозг (shown)": qs.shown(result, qs.WHY_MAX),
+            "витрина владельцу (48 знаков)": vr.quote(result, 48),
+            "журнал полосы (_cowork/_clip)": o._clip(result),
+        }
+
+    GOAL_WORDS = ("СПРАШИВАЛИ", "Сообщение о закрытии")
+    NAME_HEAD = 24          # столько знаков имени видно даже в самом коротком показе
+
+    def test_all_five_shows_lead_with_the_reason_not_the_goal(self):
+        """ЧИСЛО: во ВСЕХ пяти показах первой идёт причина, и ни в одном — цель.
+
+        Сверяется НАЧАЛО имени, а не имя целиком: самый короткий показ (витрина)
+        режет текст по своему пределу, и требовать от него полного имени значило бы
+        проверять не правило, а длину чужой строки. Предмет правила — ЧТО ИДЁТ
+        ПЕРВЫМ; сколько из этого видно, меряет отдельный тест ниже."""
+        o, result = self._fake_fail()
+        name = o.FAIL_REASONS[o.FAIL_EXTERNAL_LIMIT][0][:self.NAME_HEAD]
+        shows = self._shows(result)
+        led = [k for k, v in shows.items() if name in v.split("СПРАШИВАЛИ")[0]]
+        self.assertEqual(5, len(shows))
+        self.assertEqual(sorted(shows), sorted(led),
+                         "причина не первая в: %s" % sorted(set(shows) - set(led)))
+        # …и цель в самом коротком показе не появляется вовсе: её вытеснила причина.
+        for word in self.GOAL_WORDS:
+            self.assertNotIn(word, shows["витрина владельцу (48 знаков)"])
+
+    def test_the_vitrina_names_by_number_how_much_of_the_reason_it_shows(self):
+        """ПРЕДЕЛ ВИТРИНЫ НЕ ПОДГОНЯЕТСЯ МОЛЧА — он НАЗЫВАЕТСЯ ЧИСЛОМ (п. 2 задания 69t).
+
+        Замер 21.09.2026. У витрины предел 48 знаков, но 13 из них забирает ПОМЕТКА
+        ОБРЕЗКИ («… [N из M]»), которую ставит `review_audit.safe_line`; тексту
+        остаётся 35. В 35 знаков влезают ШЕСТЬ имён словаря демона из восьми. Двум
+        длинным не хватает: «внешнее ограничение — работать не дали» с маркером — 40
+        знаков (нужен предел 53), «заявка на красное без карточки гарда» — 38 (нужен
+        51). Предел витрины ЭТОТ ЗАХОД НЕ ТРОГАЛ: показ чужой полосы правится своим
+        заданием, а молча подогнанное число было бы ровно тем враньём, ради выхода из
+        которого правило и заведено. Оба длинных имени в витрине всё равно ВЕДУТ
+        причиной — просто обрезанной, и обрезка объявляет себя числом сама.
+
+        Тест падает, когда числа разойдутся, — чтобы расхождение было ВИДНО."""
+        import pc_orchestrator as o
+        import vitrina_pc_run as vr
+
+        limit = 48
+        budget = len(vr.quote("я" * 400, limit).split("… [", 1)[0])
+        self.assertEqual(35, budget, "бюджет текста витрины: %d из %d" % (budget, limit))
+        names = {code: len((mark + " " if mark else "") + label)
+                 for code, (label, mark) in o.FAIL_REASONS.items()}
+        fit = sorted(c for c, n in names.items() if n <= budget)
+        self.assertEqual(6, len(fit), "влезают целиком: %s" % fit)
+        self.assertEqual(53, max(names.values()) + (limit - budget),
+                         "самому длинному имени нужен предел: %d" % (max(names.values())
+                                                                     + limit - budget))
+
+    def test_every_reason_of_the_daemons_dictionary_leads(self):
+        """Голдены по ВСЕМУ словарю демона, а не по одному коду: новый код придёт завтра."""
+        import pc_orchestrator as o
+
+        for code, (label, _mark) in o.FAIL_REASONS.items():
+            _o, result = self._fake_fail(code)
+            self.assertTrue(result.split("\n")[0].endswith(label)
+                            or label in result.split("\n")[0], "%s: %r" % (code, result[:80]))
+            self.assertTrue(result.split("\n")[1].startswith(cm.L_ASK), code)
+
+    def test_the_process_own_words_stand_between_the_name_and_the_goal(self):
+        """Дословные слова процесса — ПОСЛЕ имени причины и ДО цели, а не вместо."""
+        _o, result = self._fake_fail()
+        first = result.split("\n")[0]
+        self.assertIn("hit your weekly limit", first)
+        self.assertLess(first.index("не дали"), first.index("hit your weekly limit"))
+        self.assertLess(result.index("hit your weekly limit"), result.index(cm.L_ASK))
+
+    def test_the_goal_is_not_thrown_away_it_moves_one_line_down(self):
+        """Цель НЕ ВЫБРАСЫВАЕТСЯ — она уезжает ниже, дословно и целиком."""
+        _o, result = self._fake_fail()
+        rows = result.split("\n")
+        self.assertTrue(rows[1].startswith(cm.L_ASK))
+        self.assertIn("Сообщение о закрытии задачи начинается тремя строками", rows[1])
+
+    def test_a_judge_verdict_leads_with_the_judges_own_words(self):
+        """Второй словарь (вердикт судьи) ведёт СВОИМ словом и своей причиной."""
+        reason = "по адресу ПУСТО: за 21.09 в «docs/artifacts» нет ни одного файла"
+        body = done_judge_pc.fail_result({"verdict": done_judge_pc.UNPROVEN, "reason": reason},
+                                         "ВСЁ ПРЕКРАСНО: 20 из 20 зелены.")
+        out = cm.prepend(body, TASK, "failed", (), None)
+        self.assertTrue(out.startswith(done_judge_pc.UNPROVEN + ":"), out[:60])
+        # …и якорь судьи от этого не сдвинулся: причина читается обратно ЦЕЛИКОМ.
+        self.assertEqual(reason, done_judge_pc.reason_of(out))
+        self.assertEqual(done_judge_pc.UNPROVEN, done_judge_pc.outcome_of(out))
+
+    def test_no_reason_at_all_is_said_in_words_not_by_the_goal(self):
+        """ТРЕТИЙ ИСХОД: причины в тексте нет → так и сказано, а не подставлена цель."""
+        out = cm.prepend("итог без единого признака причины", TASK, "failed", (), None)
+        self.assertTrue(out.startswith(cm.WHY_UNKNOWN), out[:60])
+        for word in self.GOAL_WORDS[1:]:
+            self.assertNotIn(word, out.split("\n")[0])
+
+    def test_a_success_has_no_reason_line_at_all(self):
+        """У закрытой задачи причины провала не существует — строки нет, шапка прежняя."""
+        out = cm.prepend(report_ok(), TASK, "done", (), None)
+        self.assertTrue(out.startswith(cm.L_ASK))
+        self.assertEqual(out.split("\n\n", 1)[0].count("\n"), 2)
+        self.assertEqual("", cm.why_line(report_ok(), "done"))
+
+    def test_the_owners_refusal_does_not_say_the_same_thing_twice(self):
+        """Маркер-СЛОВО уже назвал причину: второй строки с тем же смыслом нет."""
+        import pc_orchestrator as o
+
+        body = o._REJECT_PREFIX + " (ответ с ПК: Filipp/org)"
+        out = cm.prepend(body, TASK, "failed", o.NO_HEAL_PREFIXES, None)
+        self.assertTrue(out.startswith(o._REJECT_PREFIX))
+        self.assertEqual("", cm.why_line(body, "failed", o.NO_HEAL_PREFIXES))
+        self.assertNotIn(cm.WHY_UNKNOWN, out)
+
+    def test_the_machine_contract_of_the_first_character_survived(self):
+        """Маркер по-прежнему ПЕРВЫЙ СИМВОЛ: гейты самопочинки читают его, а не причину."""
+        import pc_orchestrator as o
+
+        for code, (_label, mark) in o.FAIL_REASONS.items():
+            if not mark:
+                continue
+            _o, result = self._fake_fail(code)
+            self.assertTrue(result.startswith(mark), code)
+            self.assertTrue(result.lstrip().startswith(o.NO_HEAL_PREFIXES), code)
+
+    def test_the_rule_lives_in_one_place_not_in_each_show(self):
+        """ЗАМОК ПРОТИВ ШЕСТОГО МЕСТА: разбор причины для ПОКАЗА живёт в одном модуле.
+
+        Показы читают ГОТОВУЮ первую строку и своего разбора причины не заводят.
+        Заведись он у показа — пятый экземпляр разошёлся бы с четырьмя молча, и
+        правило врало бы ровно там, где его дописали последним."""
+        import pc_orchestrator as o
+
+        def read(name):
+            with open(os.path.join(REPO, name), encoding="utf-8") as f:
+                return f.read()
+
+        src = read("close_msg_pc.py")
+        self.assertEqual(1, src.count("def why_line("))
+        # Вызов ровно один, и он в сборке — не у показа.
+        self.assertEqual(1, src.count("why_line(report, status, keep_first)"))
+        for name in ("vitrina_pc_run.py", "queue_snapshot_pc.py"):
+            self.assertNotIn("FAIL_REASONS", read(name), name)
+        # …а демон по-прежнему отдаёт сборке свой набор маркеров (иначе отказ владельца
+        # потерял бы первый символ и получил бы вторую строку причины).
+        self.assertIn("close_msg_pc.prepend(result, text, status, NO_HEAL_PREFIXES",
+                      read("pc_orchestrator.py"))
+        self.assertTrue(o.NO_HEAL_PREFIXES)
 
 
 class Invariants(unittest.TestCase):
