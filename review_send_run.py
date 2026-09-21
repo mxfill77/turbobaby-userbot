@@ -1307,6 +1307,11 @@ def run_channel(channel, prompt, ctx, args):
         credit_usage=facts.get("credit_usage"),
         split_error=facts.get("split_error"),
         model_reported=facts.get("model"),
+        # Идентификатор задачи уезжает в ВЕРДИКТ, а не только в прозу подробности:
+        # из вердикта его печатает полем файл лотка, оттуда забирает разборщик, и
+        # дальше он живёт в реестре очереди — то есть переживает и повтор того же
+        # дня (он перезаписывает файл лотка), и этот временный протокол.
+        task_id=facts.get("task_id"),
         **common
     )
 
@@ -1356,6 +1361,7 @@ def fetch_only(args):
             body=text if (state == _MANUS_DONE and text.strip()) else got["body"],
             credit_usage=manus_credit_usage(got["body"]),
             model_reported=manus_model(got["body"]),
+            task_id=args.manus_task,
             **common
         )
     sys.stdout.write(

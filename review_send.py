@@ -265,6 +265,7 @@ def _verdict(
     model_requested=None,
     target=None,
     prompt_sha256=None,
+    task_id=None,
 ):
     """Вердикт одного захода. → dict.
 
@@ -296,6 +297,12 @@ def _verdict(
         "reason": reason,
         "detail": detail,
         "target": target,
+        # Задача на стороне канала: у асинхронного Manus это единственный адрес,
+        # по которому с уже оплаченным заходом можно говорить дальше. ``None`` —
+        # «канал задачи не заводил» (Codex, отказ до сокета), и это показание, а
+        # не пустота. Поле лежит ВНУТРИ вердикта и потому покрыто его sha256:
+        # адрес, за который заплачено, обязан быть частью подписанного факта.
+        "task_id": (task_id or None) if not isinstance(task_id, str) else (task_id.strip() or None),
         "answer_chars": len(answer),
         "answer_sha256": _sha256_text(answer) if answer else None,
         "cost_unit": cost_unit,
@@ -567,6 +574,7 @@ def classify_manus(
     credit_usage=None,
     split_error=None,
     model_reported=None,
+    task_id=None,
 ):
     """Факты HTTP-захода → вердикт. → (dict, str answer). Чистая функция.
 
@@ -600,6 +608,7 @@ def classify_manus(
         answer=answer,
         cost_unit="request",
         cost_value=cost,
+        task_id=task_id,
         model_reported=model_reported,
         model_requested=None,
         target=channel_target,
@@ -811,6 +820,13 @@ def render_answer(verdict, answer, *, pack_rel):
     lines.append("голова канала (по ответу): `%s` · в запросе просили: `%s`" % (said, asked))
     lines.append("отправлено: **%s** · канал: **%s**" % (verdict["send_date"], verdict["channel"]))
     lines.append("адрес канала: `%s`" % (verdict.get("target") or _NA))
+    # ЗАДАЧА КАНАЛА — ПОЛЕ, А НЕ ПРОЗА. До 21.09.2026 идентификатор оплаченной
+    # задачи попадал наружу только внутрь фразы «ПОДРОБНОСТЬ ИСХОДА», то есть
+    # читался глазами и ни одним разборщиком; пережить сутки ему было негде
+    # (протокол отправщика — временный, файл лотка повтор того же дня
+    # перезаписывает собой). Строка печатается ВСЕГДА, даже прочерком: её
+    # отсутствие было бы неотличимо от старого файла, где поля не было вовсе.
+    lines.append("задача канала: `%s`" % (verdict.get("task_id") or _NA))
     lines.append("пакет: `%s`" % pack_rel)
     lines.append("sha256 пакета: `%s`" % (verdict.get("pack_sha256") or _NA))
     lines.append("sha256 отправленного текста: `%s`" % (verdict.get("prompt_sha256") or _NA))

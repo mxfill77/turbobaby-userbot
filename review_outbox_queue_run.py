@@ -233,6 +233,14 @@ def sync(state, *, root=HERE, inbox=DEFAULT_INBOX, files=None, now=None, headers
                 rec = Q.new_record(
                     pack=pack, channel=channel, send_date=h.get("send_date") or "",
                     reason=h.get("reason") or "", at=at, answer_rel=h.get("rel"),
+                    # ИДЕНТИФИКАТОР ОПЛАЧЕННОЙ ЗАДАЧИ — из шапки захода (21.09.2026).
+                    # До этой строки он жил ровно в двух местах, и оба расходные:
+                    # временный протокол отправщика (переписывается следующим
+                    # заходом канала) и проза файла лотка (повтор в тот же день
+                    # перезаписывает файл целиком — имя склеено из даты, пакета и
+                    # канала). Реестр очереди переживает и сутки, и архив: записи
+                    # здесь помечаются, а не стираются.
+                    task_id=h.get("task_id") or None,
                 )
             except Q.ReviewOutboxError as exc:
                 skipped.append((h.get("rel") or "?", "запись не собралась: %s" % exc.reason))
@@ -252,7 +260,8 @@ def sync(state, *, root=HERE, inbox=DEFAULT_INBOX, files=None, now=None, headers
         last = Q.parse_iso(rec.get("last_at"))
         if seen is None or (last is not None and seen <= last):
             continue
-        state["packs"][k] = Q.advance(rec, reason=h.get("reason") or "", at=at)
+        state["packs"][k] = Q.advance(rec, reason=h.get("reason") or "", at=at,
+                                      task_id=h.get("task_id") or None)
         advanced.append(state["packs"][k])
     return {"added": added, "closed": closed, "advanced": advanced, "skipped": skipped}
 

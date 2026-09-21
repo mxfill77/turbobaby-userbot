@@ -137,6 +137,9 @@ _RE_OUTCOME = re.compile(r"^исход:\s*\*\*(.+?)\*\*\s*\(`([a-z_]+)`\)\s*$", 
 _RE_REASON = re.compile(r"^причина:\s*`([^`]*)`\s*$", re.M)
 _RE_SENT = re.compile(r"^отправлено:\s*\*\*(\d{4}-\d{2}-\d{2})\*\*\s*·\s*канал:\s*\*\*(\S+?)\*\*\s*$", re.M)
 _RE_PACK = re.compile(r"^пакет:\s*`([^`]*)`\s*$", re.M)
+# Задача канала. Поля может не быть вовсе — файлы лотка старше 21.09.2026 писаны
+# рендером без него, и «нет строки» здесь значит «не знаем», а не «задачи не было».
+_RE_TASK = re.compile(r"^задача канала:\s*`([^`]*)`\s*$", re.M)
 _RE_PACK_SHA = re.compile(r"^sha256 пакета:\s*`([^`]*)`\s*$", re.M)
 _RE_ANSWER_SHA = re.compile(r"^ответ:\s*(\d+)\s*знаков\s*·\s*sha256\s*`([^`]*)`\s*$", re.M)
 _RE_BODY_HEAD = re.compile(r"^##\s*ОТВЕТ КАНАЛА \(дословно\)\s*$", re.M)
@@ -242,6 +245,12 @@ def parse_answer(text):
     pack_sha = _RE_PACK_SHA.search(text)
     reason = _RE_REASON.search(text)
     answer = _RE_ANSWER_SHA.search(text)
+    task = _RE_TASK.search(text)
+    task_id = (task.group(1) if task else "").strip()
+    if task_id in ("—", "-"):
+        # Прочерк рендера — это «канал задачи не заводил», и пустая строка здесь
+        # честнее прочерка: дальше по пути идентификатор либо есть, либо его нет.
+        task_id = ""
     out = {
         "schema": SCHEMA,
         "pack": head.group(1).strip(),
@@ -252,6 +261,7 @@ def parse_answer(text):
         "reason": (reason.group(1) if reason else "") or "",
         "pack_path": (pack.group(1) if pack else "") or "",
         "pack_sha256": (pack_sha.group(1) if pack_sha else "") or "",
+        "task_id": task_id,
         "answer_chars": int(answer.group(1)) if answer else 0,
         "answer_sha256": (answer.group(2) if answer else "") or "",
         "body": "",

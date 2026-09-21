@@ -134,20 +134,21 @@ class TestRetryKind(unittest.TestCase):
     def test_empty_and_unfinished_are_routed_apart(self):
         """«Канал кончил и промолчал» и «канал ещё работает» — РАЗНЫЕ повторы.
 
-        Замер 05.09.2026: у 25 промахов канал печатал `credit_usage: 0` при
-        `status=completed`. Звать это «оплачено» и добирать ЗАБОРОМ — повтор,
-        который не мог сработать ни разу: терминальная пустая задача пуста
-        навсегда. Единственный повтор с шансом — новая ОТПРАВКА.
+        Немота НАЗВАННОГО канала (manus) повтора не получает вовсе: замер 21.09.2026
+        по девяти живым телам — 6 пакетов → 9 задач → 10 кредитов → 0 ответов, то
+        есть отправка покупала второй платный разбор тех же вопросов. Немота
+        канала, которого никто не мерил, судится как раньше.
         """
+        self.assertEqual(Q.origin("channel_idle", "manus")[0], "paid_mute")
+        self.assertEqual(Q.retry_kind("paid_mute")[0], "none")
         self.assertEqual(Q.origin("channel_idle")[0], "external")
-        self.assertEqual(Q.retry_kind(*Q.origin("channel_idle")[:1])[0], "resend")
 
         # А вот НЕзаконченная работа оплачена по-настоящему и добирается забором:
         # задача на той стороне живая и может дописаться после нашего ухода.
-        self.assertEqual(Q.origin("poll_timeout")[0], "spent")
+        self.assertEqual(Q.origin("poll_timeout", "manus")[0], "spent")
         self.assertEqual(Q.retry_kind("spent", task_id="tsk1")[0], "refetch")
 
-        self.assertNotEqual(Q.origin("channel_idle")[0], Q.origin("poll_timeout")[0])
+        self.assertNotEqual(Q.origin("channel_idle", "manus")[0], Q.origin("poll_timeout", "manus")[0])
 
     def test_parts_split_is_resend_not_refetch(self):
         """Обрезок в задаче ревьюера не дописывается: забирать нечего, повтор — отправкой."""
@@ -461,7 +462,7 @@ class TestAuditTextForOurOwnDefect(unittest.TestCase):
 # ═════════════════════════ 6. руки: лоток → очередь ═════════════════════════
 
 
-def _head(pack, channel, outcome, reason, rel, date="2026-09-01"):
+def _head(pack, channel, outcome, reason, rel, date="2026-09-01", task_id=""):
     """Шапка захода в ЖИВОМ виде, который отдаёт `review_audit_run.answer_headers`.
 
     Ключей ДВА — ``pack`` (имя) и ``pack_path`` (путь), — потому что их два у
@@ -470,7 +471,7 @@ def _head(pack, channel, outcome, reason, rel, date="2026-09-01"):
     неисполнимую команду. Правило-класс «мок обязан копировать живой формат».
     """
     return {"rel": rel, "pack": pack.rsplit("/", 1)[-1], "pack_path": pack, "channel": channel,
-            "send_date": date, "outcome": outcome, "reason": reason,
+            "send_date": date, "outcome": outcome, "reason": reason, "task_id": task_id,
             "answered": outcome == "answered"}
 
 
@@ -684,6 +685,129 @@ class TestRunRetry(unittest.TestCase):
                      runner=lambda *a, **k: self.fail("потолок обязан остановить повтор"))
         self.assertEqual(rep["retried"], [])
         self.assertTrue(any("потолок" in why for _k, why in rep["retry_skipped"]))
+
+
+class TestPaidMuteNeverBuysASecondReview(unittest.TestCase):
+    """ОТРИЦАТЕЛЬНАЯ ПРОБА немоты оплаченного канала (21.09.2026).
+
+    Подделывается ровно живой случай: `channel_idle` канала manus по пакету
+    `2026-09-21-digest-2026-09-21.md`, который за 19 минут уехал ДВАЖДЫ (оба
+    кредита списаны, оба тела пусты). Проверяется ЧИСЛОМ — сколько раз запущен
+    отправщик, — а не словом «настроено»: запуск считает шпион-runner.
+
+    Замок проверяется и МУТАНТОМ: со снятым списком каналов тот же сценарий
+    покупает вторую отправку (1 запуск против 0), то есть строка держит нагрузку,
+    а не украшает модуль.
+    """
+
+    PACK = "docs/review_outbox/2026-09-21-digest-2026-09-21.md"
+    REL = "docs/review_inbox/2026-09-21-2026-09-21-digest-2026-09-21-manus.md"
+    TASK = "HJdDARXGuf9EfAzFFV2Qcr"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="paid_mute_")
+        self.state = os.path.join(self.tmp, "state.json")
+        os.makedirs(os.path.join(self.tmp, "docs", "review_outbox"))
+        with io.open(os.path.join(self.tmp, self.PACK.replace("/", os.sep)), "w", encoding="utf-8") as fh:
+            fh.write("пакет второго мнения")
+        self.calls = []
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _runner(self, argv, **kw):
+        self.calls.append(argv)
+
+        class _Done:
+            returncode = 0
+            stdout = b""
+            stderr = b""
+
+        return _Done()
+
+    def _heads(self, task_id=None):
+        return [_head(self.PACK, "manus", "unknown", "channel_idle", self.REL,
+                      date="2026-09-21", task_id=self.TASK if task_id is None else task_id)]
+
+    def _record_after_a_faked_idle(self):
+        R.tick(root=self.tmp, state_path=self.state, headers=[], retry=False, clock=lambda: at(11))
+        rep = R.tick(root=self.tmp, state_path=self.state, headers=self._heads(), retry=False,
+                     clock=lambda: at(12))
+        self.assertEqual(len(rep["added"]), 1)
+        return rep["added"][0]
+
+    def test_faked_idle_of_manus_costs_zero_new_sends(self):
+        rec = self._record_after_a_faked_idle()
+        self.assertEqual(rec["origin"], "paid_mute")
+        self.assertEqual(rec["kind"], "none")
+        self.assertEqual(rec["state"], "exhausted", "повтора нет — ряд закрыт на месте")
+        self.assertIsNone(rec["next_at"], "времени следующей отправки не назначается вовсе")
+
+        # Три оборота подряд в те часы, когда прежний код повторял (пауза 300 и
+        # 900 с): отправщик не запускается НИ РАЗУ.
+        for minute in (5, 10, 30):
+            R.tick(root=self.tmp, state_path=self.state, headers=self._heads(),
+                   clock=lambda m=minute: at(12, m), runner=self._runner)
+        self.assertEqual(len(self.calls), 0, "немота оплаченного канала повторов не покупает")
+
+    def test_the_outcome_stays_unknown_and_says_so_in_its_own_words(self):
+        rec = self._record_after_a_faked_idle()
+        outc, title, why = Q.outcome(rec)
+        self.assertEqual(outc, "unknown")
+        self.assertEqual(title, "НЕИЗВЕСТНО")
+        self.assertIn("промолчал", rec["origin_why"] + rec["kind_why"])
+        self.assertIn("второй платный разбор", rec["kind_why"])
+        self.assertIn("«готово» здесь не пишется", why)
+
+    def test_the_paid_task_id_outlives_the_day_the_file_and_the_archive(self):
+        """Id оплаченной задачи — не расходник: он переживает всё, что его тёрло."""
+        rec = self._record_after_a_faked_idle()
+        self.assertEqual(rec["task_id"], self.TASK)
+
+        # 1. Реестр на диске — JSON: идентификатор переживает круг «записали → прочитали».
+        with io.open(self.state, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        self.assertEqual(saved["packs"][rec["key"]]["task_id"], self.TASK)
+
+        # 2. Повтор ТОГО ЖЕ ДНЯ перезаписывает файл лотка собой, и новая шапка
+        #    идентификатора может не нести вовсе — записанный не обнуляется.
+        again = Q.advance(rec, reason="channel_idle", at=at(13), task_id=None)
+        self.assertEqual(again["task_id"], self.TASK)
+
+        # 3. Сутки спустя запись уходит в АРХИВ — и уносит идентификатор с собой,
+        #    а исход архива остаётся НЕИЗВЕСТНО (канал отработал и списал).
+        old = Q.archive(again, at=at(12, day=3))
+        self.assertEqual(old["task_id"], self.TASK)
+        self.assertEqual(old["archive_outcome"], "unknown")
+        self.assertIn(self.TASK, old["archived_why"])
+
+    def test_the_card_offers_the_paid_task_and_never_a_second_send(self):
+        rec = self._record_after_a_faked_idle()
+        text = Q.audit_text(rec)
+        self.assertIn("--manus-task", text)
+        self.assertIn(self.TASK, text)
+        self.assertNotIn("--pack", text, "предлагать вторую отправку рукой — это предлагать вторую оплату")
+        self.assertIn("ОТРАБОТАЛ", text, "«канал лежал» здесь было бы ложью о его работе")
+
+    def test_codex_keeps_its_own_outcomes(self):
+        """Замок назван ПОИМЁННО: канал, которого мы не мерили, судится как раньше."""
+        self.assertEqual(Q.origin("channel_idle", "codex")[0], "external")
+        self.assertEqual(Q.retry_kind(*Q.origin("channel_idle", "codex")[:1])[0], "resend")
+        self.assertNotIn("codex", Q._MUTE_CHANNELS)
+
+    def test_mutant_without_the_lock_buys_the_second_send(self):
+        """МУТАНТ: снимаем список немых каналов — и второй платный заход возвращается."""
+        saved = Q._MUTE_CHANNELS
+        Q._MUTE_CHANNELS = ()
+        try:
+            rec = self._record_after_a_faked_idle()
+            self.assertEqual(rec["kind"], "resend", "мутант обязан вернуть прежнее поведение")
+            R.tick(root=self.tmp, state_path=self.state, headers=self._heads(),
+                   clock=lambda: at(12, 10), runner=self._runner)
+        finally:
+            Q._MUTE_CHANNELS = saved
+        self.assertEqual(len(self.calls), 1, "без замка тот же сценарий покупает вторую отправку")
+        self.assertIn("--pack", self.calls[0])
 
 
 class TestAnnounceBudgetAndAddress(unittest.TestCase):

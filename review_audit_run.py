@@ -140,6 +140,11 @@ def answer_headers(root=HERE, inbox=DEFAULT_INBOX, files=None):
                     "send_date": header.get("send_date") or "",
                     "outcome": header.get("outcome") or "",
                     "reason": header.get("reason") or "",
+                    # Идентификатор задачи канала. Добавлен 21.09 ступенью F: у
+                    # оплаченного захода это единственный адрес, по которому с
+                    # каналом ещё можно говорить, и жить он обязан в реестре, а
+                    # не в файле, который повтор того же дня перезаписывает.
+                    "task_id": header.get("task_id") or "",
                     "answered": bool(header.get("ok"))})
     return out, skipped
 
