@@ -1217,7 +1217,13 @@ class TestApplyWritesLessonsAndAdvances(DeskBase):
             lessons = lesson_store.load(self.lessons).lessons
             self.assertEqual(len(lesson_store.active(lessons)), 0)
             self.assertEqual(len(lesson_store.candidates(lessons)), 1)
-            self.assertIn("КАНДИДАТАМИ", msg)
+            # СЛОВО «КАНДИДАТ» ГОВОРИТ ТЕПЕРЬ СТРОКА УРОКА, А НЕ ШАПКА ТАПА (22.09.2026, 70i).
+            # Прежде здесь искалось «КАНДИДАТАМИ» — слово ОБЩЕЙ шапки, которая знала режим и не
+            # знала причину и потому звала «действующими СРАЗУ» в том числе кандидатов. Проверка
+            # стала строже: состояние названо у КАЖДОГО урока, и у ждущего названо слово включения.
+            import lesson_word_forms
+            self.assertIn("«кандидат»", msg)
+            self.assertIn(lesson_word_forms.promote_phrase(1), msg)
         finally:
             exam_show.EXAM_LESSON_MODE = was
 
@@ -1285,10 +1291,19 @@ class TestOwnWordsLesson(DeskBase):
         self.assertEqual(len(lesson_store.candidates(lessons)), 1)
 
     def test_the_card_says_in_one_line_how_to_switch_it_on(self):
+        """СТРОКА ВКЛЮЧЕНИЯ — СЛОВО В ЧАТ, А НЕ КОМАНДА КОНСОЛИ (правка 22.09.2026, 70i).
+
+        Прежде здесь искалась строка запуска `lesson_promote.py --why …`: она верна, но требует
+        ПК, а карточка приходит в телефон. Слово «урок включи N: …» владелец может сказать прямо
+        с телефона, и разбирает его живой роутер — поэтому образец диктуется словом. Форма и её
+        адрес берутся из `lesson_word_forms`, то есть из того же места, что и разбор: строка,
+        написанная здесь руками, пережила бы правку разбора и осталась бы врать молча."""
+        import lesson_word_forms
         self.start()
         _ok, msg = self.take("правило своими словами")
-        self.assertIn("lesson_promote.py", msg)
-        self.assertIn("--why", msg)
+        self.assertIn(lesson_word_forms.promote_phrase(1), msg)
+        self.assertIn(lesson_word_forms.PROMOTE_TOPIC, msg,
+                      "слово названо без адреса — сказанное не в той теме не разбирает никто")
 
     def test_the_verdict_and_the_next_case_follow_the_own_lesson(self):
         self.start()
@@ -3029,6 +3044,37 @@ class TestTheExamDoorCallsTheInstrument(TwoSetsBase):
         self.assertEqual(exam_show.SET_LIVE, "живой")
         self.assertEqual(lesson_regress.SET_LIVE, "live",
                          "набор двери — слово человеку, ключ прибора — argv ребёнка")
+
+
+# ───── КВИТАНЦИЯ НЕ ЗОВЁТ НЕИЗВЕСТНОЕ ДЕЙСТВУЮЩИМ (22.09.2026, задание 70i) ─────
+# Полный регресс квитанции живёт в `test_lesson_receipt.py`. Здесь стои́т ОДИН замок, и стои́т он
+# ИМЕННО ЗДЕСЬ по устройству гейта: правка `exam_show.py` подтягивает `test_exam_show` и НЕ
+# подтягивает `test_lesson_receipt` (`gate_selective.affected_test_modules` сопоставляет по стему
+# имени файла). Без него правка этого модуля могла бы молча вернуть «действует» на месте
+# непрочитанного состояния — а это и есть тот единственный исход, ради которого всё писалось.
+
+class TestReceiptNeverGuessesState(unittest.TestCase):
+    """Состояние прочитать нечем → «НЕ ЗНАЮ» с причиной, а не «ДЕЙСТВУЕТ»."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="exam_receipt_blind_")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def test_missing_base_is_named_not_assumed(self):
+        said = exam_show.lessons_roster([1], path=os.path.join(self.dir, "net-takogo.tsv"))
+        self.assertIn("#1", said)
+        self.assertIn("НЕ ЗНАЮ", said)
+        self.assertNotIn("ДЕЙСТВУЕТ", said)
+        self.assertNotIn("«кандидат»", said)
+
+    def test_absent_number_is_named_not_assumed(self):
+        base = os.path.join(self.dir, "lessons.tsv")
+        import lesson_store
+        lesson_store.add_candidate(question="в", bot_answer="о", correct="п", who="t",
+                                   source=lesson_store.SOURCE_EXAM, path=base)
+        said = exam_show.lessons_roster([777], path=base)
+        self.assertIn("НЕ ЗНАЮ", said)
+        self.assertNotIn("ДЕЙСТВУЕТ", said)
 
 
 if __name__ == "__main__":

@@ -62,7 +62,12 @@ def _candidates_card(path=None):
         why = " ".join(str(les.why or "").split()) or "— причина не названа"
         out.append("  #%d от @%s (%s): %s\n      почему: %s"
                    % (les.number, les.who, les.when, text, why))
-    out.append("— всего кандидатов: %d. Включить: «урок включи N: причина словами»." % len(rows))
+    # ОБРАЗЕЦ НЕ ПИШЕТСЯ ЗДЕСЬ РУКАМИ (22.09.2026, 70i): его собирает и сверяет собственным
+    # разбором `lesson_word_forms` — то же место, где живёт форма слова. Прежде строка была
+    # написана по памяти, и правка глагола в разборе оставила бы карточку диктовать мёртвую форму.
+    import lesson_word_forms                                # noqa: PLC0415 — дверь-CLI, импорт по месту
+    out.append("— всего кандидатов: %d. Включить: «%s»."
+               % (len(rows), lesson_word_forms.promote_phrase()))
     return "\n".join(out)
 
 
