@@ -233,7 +233,8 @@ test_the_daemon_assembles_the_three_lines_in_exactly_one_place`). Пять по�
 
 Красного нет ни одного — коммит правомерен.
 
-**Коммит:** `0ee5bc4e` — «69t ZAGOLOVOKPRAVDY 2109: soobshchenie o provale nachinaetsya prichinoy».
+**Коммит:** `b663e671` — «69t ZAGOLOVOKPRAVDY 2109: soobshchenie o provale nachinaetsya
+prichinoy, a ne celyu» (5 файлов, +655 −19).
 
 Файлы коммита:
 
