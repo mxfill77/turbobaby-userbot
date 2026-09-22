@@ -1139,6 +1139,92 @@ def update_waits(state, facts, now):
     state["waits"] = cur           # строки, ушедшие из ожидания, выпадают сами: состояние не растёт
 
 
+# ═══════════ ГЛАЗ О8: ШТАМП ЧАСОВ ЗАХВАТА ПЕРЕПИСКИ (22.09.2026) ═══════════════════════════
+# ПУТЬ ДЕРЖИТСЯ КОПИЕЙ, а не импортом `chatlog_ingest`: наблюдатель не импортирует наблюдаемого —
+# иначе поломка захвата (синтаксис, битый импорт, отсутствующий модуль) роняла бы прибор О8 ровно
+# в ту минуту, ради которой он заведён, и молчание выглядело бы благополучием. Копия закреплена
+# тестом, который читает исходник `chatlog_ingest.py` ТЕКСТОМ: съехавший путь обязан покраснеть.
+CHATLOG_TICK_STATE = os.path.join(REPO, "tmp", "chatlog_tick", "state.json")
+
+
+def chatlog_facts(path=None):
+    """ШТАМП ЧАСОВ ЗАХВАТА → факт для `ex.chatlog_state`. ТОЛЬКО ЧТЕНИЕ одного json.
+
+    ПЕРЕПИСКИ ЭТОТ ГЛАЗ НЕ ВИДИТ НИ ОДНОЙ СТРОКОЙ, и это не осторожность, а устройство: он
+    открывает штамп часов (пять чисел), а не архив. Ни `chatlog/`, ни `userbot.log`, ни
+    `dispatch_notify.log` здесь не открываются ни одной веткой.
+
+    `own` — ПОДПИСЬ ЗАХОДА для накопителя тишины: пара `(runs, ran_at)`. Пара, а не одно число:
+    `runs` отвечает «сколько заходов было», `ran_at` — «когда объявлен последний», и порознь обе
+    врут. Счётчик, сброшенный руками в ноль, оставил бы `runs` неподвижным при живых заходах;
+    `ran_at`, уехавший назад переводом часов, выглядел бы новым заходом.
+
+    ТРИ ИСХОДА: файла нет / json битый / не словарь → `ok=False` с ИМЕНЕМ КЛАССА ошибки, и
+    решение обязано сказать «неизвестно», а не «захода нет»."""
+    p = path or CHATLOG_TICK_STATE
+    try:
+        with open(p, encoding="utf-8") as f:
+            st = json.load(f)
+    except Exception as e:                                            # noqa: BLE001
+        return {"ok": False, "err": type(e).__name__, "src": p, "own": None}
+    if not isinstance(st, dict):
+        return {"ok": False, "err": "штамп не словарь", "src": p, "own": None}
+    return {"ok": True, "err": "", "src": p,
+            "ran_at": st.get("ran_at"), "runs": st.get("runs"),
+            "written": st.get("written"), "total_written": st.get("total_written"),
+            "last_error": st.get("last_error"), "errors": st.get("errors"),
+            "own": "%s|%s" % (st.get("runs"), st.get("ran_at"))}
+
+
+def update_chatlog_silence(state, fact, awake, now):
+    """Накопить ТИШИНУ ЧАСОВ ЗАХВАТА в часах бодрствования → {"measured","awake","since","why"}.
+
+    Устройство то же, что у `update_silence`/`update_kid_silence`, и по той же причине: `due`
+    внутри захвата считает по СТЕННЫМ часам, поэтому после сна машины заход законно происходит
+    первым же витком — а стенной разрыв при этом равен порогу плюс весь сон. Мерить такой разрыв
+    стенными часами значит звать сон пропущенным тиком.
+
+    ОБНУЛЯЕТ ТОЛЬКО СМЕНА ПОДПИСИ ЗАХОДА (`own`), то есть ЗАПИСЬ, сделанная самим тиком. Ни
+    чтение файла, ни его mtime, ни живой процесс счётчик не трогают: именно этим прибор отличается
+    от «файл на месте — значит работает».
+
+    ТРИ ЧЕСТНЫХ «НЕ ИЗМЕРЕНО»: часов бодрствования нет · штамп не прочитан · прошлого наблюдения
+    нет либо часы пошли назад (машина перезагрузилась)."""
+    prev = state.get("chatlog") if isinstance(state.get("chatlog"), dict) else {}
+    stamp = (fact or {}).get("own")
+    cur = {"own": stamp, "awake": awake, "wall": now}
+    since = prev.get("since") or now
+    if awake is None:
+        state["chatlog"] = dict(cur, silent=None, since=since)
+        return {"measured": False, "awake": None, "since": since,
+                "why": "часов бодрствования на этой машине нет — сон от молчания не отличить"}
+    if not (fact or {}).get("ok"):
+        # ШТАМП НЕ ПРОЧИТАН — ПРОШЛОЕ НАБЛЮДЕНИЕ НЕ ТРОГАЕМ: накопленное не теряется, но и не
+        # растёт. Промах чтения не является ни заходом, ни его отсутствием.
+        state["chatlog"] = dict(prev, awake=awake, wall=now)
+        return {"measured": False, "awake": None, "since": since,
+                "why": "штамп часов захвата не прочитан"}
+    prev_awake = prev.get("awake")
+    try:
+        prev_awake = None if prev_awake is None else float(prev_awake)
+    except (TypeError, ValueError):
+        prev_awake = None
+    moved = prev.get("own") != stamp
+    if moved or prev_awake is None or awake < prev_awake:
+        why = ("заход состоялся — тишина обнулена" if moved else
+               "прошлого наблюдения нет" if prev_awake is None else
+               "часы бодрствования пошли назад — машина перезагрузилась")
+        state["chatlog"] = dict(cur, silent=0.0, since=now)
+        return {"measured": False, "awake": 0.0, "since": now, "why": why}
+    try:
+        silent = float(prev.get("silent") or 0.0)
+    except (TypeError, ValueError):
+        silent = 0.0
+    silent += max(0.0, min(awake - prev_awake, STEP_CAP_SEC))
+    state["chatlog"] = dict(cur, silent=silent, since=since)
+    return {"measured": True, "awake": silent, "since": since, "why": ""}
+
+
 def snapshot(state, now=None, getter=None):
     """ФАКТЫ и ни одного решения. Порогов здесь нет — их применяет expectations_pc.verdict()."""
     now = time.time() if now is None else float(now)
@@ -1152,6 +1238,7 @@ def snapshot(state, now=None, getter=None):
     # сам снимок и счётчик слепоты О1, который обязан обновиться ТЕМ ЖЕ наблюдением, а не задним
     # числом. Второго вызова моста это не добавляет ни одного — вызов ровно один, как и был.
     queue = queue_facts(getter)
+    chat = chatlog_facts()
     mod_silence = update_mod_silence(state, mod, awake, now)
     # КАЖДЫЙ РЕБЁНОК — СО СВОИМ ИСТОЧНИКОМ И СВОИМ СЧЁТЧИКОМ ТИШИНЫ (18.08.2026). Модербот кладётся
     # сюда ТЕМИ ЖЕ объектами, что и в свои прежние ключи, — не копией: один ребёнок обязан иметь
@@ -1202,6 +1289,12 @@ def snapshot(state, now=None, getter=None):
         # наблюдателя. Накопленный счётчик, как у О2/О3, здесь только терял бы эпизод при каждом
         # рестарте задачи Планировщика.
         "price": price_facts(),
+        # О8: ШТАМП ЧАСОВ ЗАХВАТА ПЕРЕПИСКИ и накопленная тишина между заходами. Счётчик нужен
+        # ровно по той же причине, что у О2: `chatlog_ingest.due` считает стенными часами, и
+        # после сна машины законный заход даёт стенной разрыв «порог + весь сон». Порядок тот же,
+        # что у О5: счётчик обновляется ПОСЛЕ чтения, ТЕМ ЖЕ наблюдением, а не задним числом.
+        "chatlog": chat,
+        "chatlog_silence": update_chatlog_silence(state, chat, awake, now),
     }
 
 
@@ -1306,6 +1399,7 @@ def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
     mstate, minfo = ex.moderbot_state(facts, cfg, now)
     cstate, cinfo = ex.client_state(facts, cfg, now)
     pstate, pinfo = ex.price_state(facts, cfg, now)
+    chstate, chinfo = ex.chatlog_state(facts, cfg, now)
     out = {"verdicts": len(verdicts), "notes": [], "closed": [], "dry": bool(dry),
            "queue": qstate, "turn": tstate, "why": tinfo.get("why", ""),
            # ОЧЕРЕДЬ ХОДИТ ТРОЙКОЙ «исход + причина + счёт эпизодов», и счёт едет в витрину
@@ -1332,7 +1426,12 @@ def run(dry=False, now=None, getter=None, notifier=None, pulser=None):
            # замолчать, пока молчание живо, ни задержаться, когда пересчёт вернулся: снимает её
            # тот же замер, что и ставит. Час начала и причина едут рядом со словом.
            "price": pstate, "price_since": pinfo.get("since"), "price_age": pinfo.get("age"),
-           "price_why": pinfo.get("why", ""), "price_gate_why": pinfo.get("gate_why")}
+           "price_why": pinfo.get("why", ""), "price_gate_why": pinfo.get("gate_why"),
+           # О8 ЕДЕТ В ВИТРИНУ ВСЕГДА, а не только при нарушении, — по той же причине, что О7:
+           # ветка, чей ожидаемый результат «тихо и хорошо», без строки в `--status` неотличима
+           # от ветки выключенной. Слово, накопленная тишина и причина ходят тройкой.
+           "chatlog": chstate, "chatlog_awake": chinfo.get("awake"),
+           "chatlog_runs": chinfo.get("runs"), "chatlog_why": chinfo.get("why", "")}
 
     # 1. ЗАКРЫТИЕ ЭПИЗОДОВ — первым: владелец обязан узнать, что кончилось, даже если сейчас
     #    открылось что-то новое.
@@ -1514,6 +1613,13 @@ def main():
             print("цена клиентам (О7): %s%s"
                   % (out.get("price"),
                      (" (%s)" % out.get("price_why")) if out.get("price_why") else ""))
+        # ВИТРИНА О8. Печатается ВСЕГДА, а не только при нарушении: ветка, чей ожидаемый
+        # результат «тихо и хорошо», без строки в витрине неотличима от ветки выключенной — а
+        # именно так архив переписки и простоял шестнадцать суток, никого не потревожив.
+        print("часы захвата переписки (О8): %s — заходов %s%s"
+              % (out.get("chatlog"),
+                 "не прочитано" if out.get("chatlog_runs") is None else out.get("chatlog_runs"),
+                 (" (%s)" % out.get("chatlog_why")) if out.get("chatlog_why") else ""))
         print("дети контура (публикация; у каждого СВОЙ признак и СВОЙ предел):")
         for k in out.get("kids") or []:
             print("  %-15s %-14s %-32s %s"

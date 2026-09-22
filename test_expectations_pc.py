@@ -22,6 +22,7 @@ import ast
 import datetime
 import json
 import os
+import re
 import sys
 import tempfile
 import types
@@ -3765,6 +3766,317 @@ class TestQueueBlindIsTheThirdOutcome(TestRunHands):
         doc = ex._o1_blind.__doc__ or ""
         for must in ("НЕ НАБЛЮДАЕТ", "ПОЧЕМУ молчит мост", "СОБСТВЕННУЮ СМЕРТЬ"):
             self.assertIn(must, doc)
+
+
+#  О8 — ЧАСЫ ЗАХВАТА ПЕРЕПИСКИ (22.09.2026): замок, который КРАСНЕЕТ НА ПРОПУЩЕННОМ ТИКЕ
+# ═══════════════════════════════════════════════════════════════════════════════════════════
+# ЖИВОЙ ФОРМАТ ФАКТА — ДОСЛОВНО. Снято с боевого `tmp/chatlog_tick/state.json` 22.09.2026 07:25
+# UTC: ровно пять ключей, `ran_at` — float epoch, `last_error` — null, `errors` в нём НЕТ вовсе
+# (писатель заводит ключ только после первого провала). Идеализированной схемы «как удобно тесту»
+# здесь нет: мок, разошедшийся с живым штампом, зеленел бы молча.
+CHAT_LIVE = {"last_error": None, "ran_at": 1790041899.9981089, "runs": 2,
+             "total_written": 1590, "written": 3}
+
+
+def chat_fact(ok=True, ran_at=CHAT_LIVE["ran_at"], runs=2, last_error=None, err="",
+              total=1590, written=3):
+    """Факт штампа часов захвата в ТОМ ЖЕ виде, в каком его кладут руки (`run_mod.chatlog_facts`)."""
+    if not ok:
+        return {"ok": False, "err": err or "FileNotFoundError", "src": "tmp/chatlog_tick/state.json",
+                "own": None}
+    return {"ok": True, "err": "", "src": "tmp/chatlog_tick/state.json",
+            "ran_at": ran_at, "runs": runs, "written": written, "total_written": total,
+            "last_error": last_error, "errors": None, "own": "%s|%s" % (runs, ran_at)}
+
+
+def chat_sil(measured=True, awake=0.0, since=None, why=""):
+    return {"measured": measured, "awake": awake, "since": since, "why": why}
+
+
+def chat_facts(now=NOW, fact=None, sil=None, **kw):
+    """ПОЛНЫЕ факты полосы + раздел О8: остальные ожидания обязаны молчать, иначе вердикт О8
+    невозможно отличить от чужого шума."""
+    f = facts(now=now, **kw)
+    f["chatlog"] = chat_fact() if fact is None else fact
+    f["chatlog_silence"] = chat_sil() if sil is None else sil
+    return f
+
+
+class TestO8ChatlogTick(unittest.TestCase):
+    """РЕШЕНИЕ О8: три исхода, порог из двух названных слагаемых, откат нулём."""
+
+    def test_threshold_is_the_sum_of_two_declared_numbers(self):
+        """Порог НЕ «красивое число»: интервал часов захвата плюс потолок законной задержки
+        витка. Оба слагаемых объявлены константами и обязаны помещаться в порог."""
+        self.assertEqual(ex.config({})["chatlog"], 27600.0)
+        self.assertEqual(ex.CHATLOG_EVERY_SEC, 21600.0)
+        self.assertEqual(ex.CHATLOG_TAIL_SEC, 5520.0)
+        self.assertGreaterEqual(ex.config({})["chatlog"],
+                                ex.CHATLOG_EVERY_SEC + ex.CHATLOG_TAIL_SEC)
+
+    def test_env_overrides_and_garbage_falls_back(self):
+        self.assertEqual(ex.config({"EXPECT_PC_CHATLOG_MIN": "30"})["chatlog"], 1800.0)
+        self.assertEqual(ex.config({"EXPECT_PC_CHATLOG_MIN": "мусор"})["chatlog"], 27600.0)
+
+    def test_zero_kills_the_branch_before_facts_are_read(self):
+        """Ноль — ОБЪЯВЛЕННЫЙ ОТКАТ: ни вердикта, ни слова о состоянии — честное «неизвестно»."""
+        f = chat_facts(sil=chat_sil(awake=99999.0))
+        self.assertTrue(ex._o8(f, ex.config({}), NOW))          # с дефолтом ветка кричит
+        cfg0 = ex.config({"EXPECT_PC_CHATLOG_MIN": "0"})
+        self.assertEqual(ex._o8(f, cfg0, NOW), [])
+        self.assertEqual(ex.chatlog_state(f, cfg0, NOW)[0], ex.CHAT_UNKNOWN)
+
+    def test_fresh_stamp_is_a_pass(self):
+        st, info = ex.chatlog_state(chat_facts(sil=chat_sil(awake=600.0)), ex.config({}), NOW)
+        self.assertEqual(st, ex.CHAT_OK)
+        self.assertEqual(info["runs"], 2)
+
+    # ── ОТРИЦАТЕЛЬНЫЙ ТЕСТ ВЕТКИ: пропущенный тик при ЖИВОМ НА ВИД признаке ────────────────
+    def test_o8_otricatelnyy_propushchennyy_tik(self):
+        """ПРОПУЩЕННЫЙ ТИК ПРИ ЖИВОМ НА ВИД ПРИЗНАКЕ — ПРИБОР ОБЯЗАН ПОКАЗАТЬ ОТКАЗ.
+
+        Всё, на что обычно смотрят, здесь ЗЕЛЕНО: файл штампа на месте и ЧИТАЕТСЯ (`ok=True`),
+        в нём живые числа, демон даёт обороты (О2 молчит), задача не висит (О1 молчит). Неверно
+        ровно одно — ПАРА `(runs, ran_at)` не двинулась дольше порога. Прибор, судящий наличие
+        файла, PID или код возврата, здесь промолчал бы; этот обязан сказать «захода нет»."""
+        f = chat_facts(sil=chat_sil(awake=27601.0, since=NOW - 27601.0))
+        cfg = ex.config({})
+        self.assertEqual(ex.turn_state(f, cfg, NOW)[0], ex.TURN_OK,
+                         "демон обязан выглядеть живым — иначе тест ловит не то")
+        self.assertTrue(f["chatlog"]["ok"], "источник обязан ЧИТАТЬСЯ — в этом весь смысл кейса")
+        st, info = ex.chatlog_state(f, cfg, NOW)
+        self.assertEqual(st, ex.CHAT_MISS)
+        v = [x for x in ex.verdict(f, cfg) if x["kind"] == "o8_pc_chatlog"]
+        self.assertEqual(len(v), 1, "нарушение обязано доехать до вердикта ровно одно")
+        self.assertEqual(v[0]["key"], "o8c|chatlog")
+        self.assertEqual([x["kind"] for x in ex.verdict(f, cfg)], ["o8_pc_chatlog"],
+                         "кричать обязана ТОЛЬКО О8: чужой шум подменил бы доказательство")
+
+    def test_one_second_under_the_limit_is_still_a_pass(self):
+        """Вторая половина отрицательного теста: у порога есть обе стороны, и ровно на нём
+        прибор молчит. Иначе «краснеет всегда» было бы неотличимо от «краснеет на пропуске»."""
+        f = chat_facts(sil=chat_sil(awake=27600.0))
+        self.assertEqual(ex.chatlog_state(f, ex.config({}), NOW)[0], ex.CHAT_OK)
+
+    # ── ТРЕТИЙ ИСХОД: «не смог проверить» НИ ОДНОЙ ВЕТКОЙ не становится ни «хорошо», ни «плохо»
+    def test_missing_section_is_unknown(self):
+        f = facts(now=NOW)
+        self.assertEqual(ex.chatlog_state(f, ex.config({}), NOW)[0], ex.CHAT_UNKNOWN)
+        self.assertEqual(ex._o8(f, ex.config({}), NOW), [])
+
+    def test_unreadable_stamp_is_unknown_not_a_violation(self):
+        """Не прочитать штамп и не иметь захода — РАЗНЫЕ новости. Путать их значит звать
+        слепоту поломкой (и наоборот — молчать о поломке, приняв её за слепоту)."""
+        f = chat_facts(fact=chat_fact(ok=False), sil=chat_sil(measured=False, awake=None,
+                                                              why="штамп не прочитан"))
+        st, info = ex.chatlog_state(f, ex.config({}), NOW)
+        self.assertEqual(st, ex.CHAT_UNKNOWN)
+        self.assertIn("не прочитан", info["why"])
+        self.assertEqual(ex._o8(f, ex.config({}), NOW), [])
+
+    def test_stamp_without_ran_at_is_unknown(self):
+        f = chat_facts(fact=chat_fact(ran_at=None))
+        st, info = ex.chatlog_state(f, ex.config({}), NOW)
+        self.assertEqual(st, ex.CHAT_UNKNOWN)
+        self.assertIn("`ran_at`", info["why"])
+
+    def test_unmeasured_silence_over_the_limit_is_unknown_not_a_violation(self):
+        """Тишина НЕ ИЗМЕРЕНА, а штамп старше порога: чем набран возраст — молчанием часов или
+        сном машины — не известно. Третий исход, и он НЕ закрывает открытый эпизод."""
+        f = chat_facts(now=CHAT_LIVE["ran_at"] + 99999.0,
+                       fact=chat_fact(), sil=chat_sil(measured=False, awake=None,
+                                                      why="прошлого наблюдения нет"))
+        st, _ = ex.chatlog_state(f, ex.config({}), CHAT_LIVE["ran_at"] + 99999.0)
+        self.assertEqual(st, ex.CHAT_UNKNOWN)
+
+    def test_unmeasured_silence_under_the_limit_is_a_pass(self):
+        f = chat_facts(now=CHAT_LIVE["ran_at"] + 600.0,
+                       sil=chat_sil(measured=False, awake=None, why="прошлого наблюдения нет"))
+        st, _ = ex.chatlog_state(f, ex.config({}), CHAT_LIVE["ran_at"] + 600.0)
+        self.assertEqual(st, ex.CHAT_OK)
+
+    def test_sleep_does_not_count_as_silence(self):
+        """ПК СПАЛ ДЕСЯТЬ ЧАСОВ: стенной разрыв втрое больше порога, а бодрствования — десять
+        минут. `chatlog_ingest.due` считает стенными часами и после сна сходит первым же витком,
+        поэтому судить стенным разрывом значило бы звать сон пропущенным тиком."""
+        now = CHAT_LIVE["ran_at"] + 36000.0 + 600.0
+        f = chat_facts(now=now, sil=chat_sil(awake=600.0))
+        st, info = ex.chatlog_state(f, ex.config({}), now)
+        self.assertEqual(st, ex.CHAT_OK)
+        self.assertAlmostEqual(info["slept"], 36000.0, places=3)
+
+    # ── ЗАХОД БЫЛ И УПАЛ — это НЕ «делает заход» ───────────────────────────────────────────
+    def test_failed_capture_is_a_violation_even_with_a_fresh_stamp(self):
+        """`ran_at` ставится ДО захода, значит сдвинувшаяся пара САМА ПО СЕБЕ продукта не
+        доказывает. Записанный самим тиком провал обязан краснеть при какой угодно свежести."""
+        f = chat_facts(sil=chat_sil(awake=1.0), fact=chat_fact(last_error="JSONDecodeError"))
+        st, info = ex.chatlog_state(f, ex.config({}), NOW)
+        self.assertEqual(st, ex.CHAT_MISS)
+        self.assertTrue(info["failed"])
+        v = ex._o8(f, ex.config({}), NOW)[0]
+        self.assertEqual(v["last_error"], "JSONDecodeError")
+        self.assertIn("JSONDecodeError", ex.render(v))
+
+    def test_error_text_of_the_capture_is_never_quoted(self):
+        """Наружу из захвата идёт ИМЯ КЛАССА, а не текст исключения: `str(e)` разбора цитирует
+        разбираемый документ, то есть переписку. Прибор обязан печатать ровно то, что ему дали,
+        и не иметь ни одной ветки, идущей за текстом в архив."""
+        v = ex._o8(chat_facts(sil=chat_sil(awake=1.0),
+                              fact=chat_fact(last_error="UnicodeDecodeError")),
+                   ex.config({}), NOW)[0]
+        said = ex.render(v)
+        for forbidden in ("chatlog/", "userbot.log", "dispatch_notify.log", "delivery_6m"):
+            self.assertNotIn(forbidden, said)
+
+    # ── ЭПИЗОД: постоянный ключ, закрытие ТОЛЬКО доказанным заходом ────────────────────────
+    def test_key_does_not_move_with_the_age(self):
+        """Ключ, съехавший вместе с окном наблюдения, дал бы вторую заметку об ОДНОМ И ТОМ ЖЕ
+        молчании — ровно тот шум, ради отсутствия которого слой держит «одну заметку на эпизод»."""
+        keys = {ex._o8(chat_facts(sil=chat_sil(awake=a)), ex.config({}), NOW)[0]["key"]
+                for a in (27601.0, 30000.0, 99999.0)}
+        self.assertEqual(keys, {"o8c|chatlog"})
+
+    def test_only_a_proven_tick_closes_the_episode(self):
+        cfg = ex.config({})
+        opened = ["o8c|chatlog"]
+        alive = chat_facts(sil=chat_sil(awake=99999.0))
+        self.assertEqual(ex.closures(alive, cfg, opened), [], "нарушение живо — закрывать нечего")
+        blind = chat_facts(fact=chat_fact(ok=False),
+                           sil=chat_sil(measured=False, awake=None, why="штамп не прочитан"))
+        self.assertEqual(ex.closures(blind, cfg, opened), [],
+                         "перестать ВИДЕТЬ штамп — не то же самое, что дождаться захода")
+        ok = chat_facts(sil=chat_sil(awake=10.0))
+        self.assertEqual(ex.closures(ok, cfg, opened), ["o8c|chatlog"])
+        self.assertIn("штамп часов захвата сдвинулся", ex.render_close("o8c|chatlog"))
+
+    # ── ФОРМА ЗАМЕТКИ: обещает ровно то, что измерено ─────────────────────────────────────
+    def test_every_kind_has_a_head_and_o8_is_among_them(self):
+        self.assertIn("o8_pc_chatlog", ex.KINDS)
+        for kind in ex.KINDS:
+            self.assertIn(kind, ex.NOTE_HEAD)
+
+    def test_note_names_the_measurement_and_promises_nothing_else(self):
+        v = ex._o8(chat_facts(sil=chat_sil(awake=27601.0)), ex.config({}), NOW)[0]
+        said = ex.render(v)
+        for must in ("архив переписки не делает захода", "сужу ЗАПИСЬ", "не PID",
+                     "chatlog_tick/state.json", "часам бодрствования", "CHATLOG_TICK_OFF"):
+            self.assertIn(must, said)
+        for forbidden in ("архив сломан", "переписка теряется", "модуль упал"):
+            self.assertNotIn(forbidden, said)
+
+    def test_note_names_both_halves_of_the_threshold(self):
+        """Порог обязан читаться ТАМ ЖЕ, где читается вывод: число без основания советует
+        авторитетно и молча."""
+        said = ex.render(ex._o8(chat_facts(sil=chat_sil(awake=27601.0)), ex.config({}), NOW)[0])
+        self.assertIn("360 мин", said)          # интервал часов захвата
+        self.assertIn("92 мин", said)           # потолок законной задержки витка
+
+    def test_the_watchman_names_its_own_border_out_loud(self):
+        doc = ex.chatlog_state.__doc__ or ""
+        for must in ("НЕ НАБЛЮДАЕТ", "ПОЛНОТУ архива", "СОБСТВЕННУЮ смерть",
+                     "ОТРИЦАТЕЛЬНЫЙ ТЕСТ", "ИСТОЧНИК ИСТИНЫ", "СПОСОБ НАБЛЮДЕНИЯ"):
+            self.assertIn(must, doc)
+
+
+class TestO8Hands(unittest.TestCase):
+    """РУКИ О8: чтение штампа, накопитель тишины, копия чисел наблюдаемого."""
+
+    def _tmp(self, payload):
+        d = tempfile.mkdtemp(prefix="o8_")
+        p = os.path.join(d, "state.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(payload)
+        return p
+
+    def test_reads_the_live_shape_of_the_stamp(self):
+        f = run_mod.chatlog_facts(self._tmp(json.dumps(CHAT_LIVE)))
+        self.assertTrue(f["ok"])
+        self.assertEqual(f["runs"], 2)
+        self.assertEqual(f["total_written"], 1590)
+        self.assertEqual(f["own"], "2|1790041899.9981089")
+
+    def test_three_honest_failures_of_reading(self):
+        self.assertEqual(run_mod.chatlog_facts(os.path.join(tempfile.mkdtemp(), "нет.json"))["ok"],
+                         False)
+        self.assertEqual(run_mod.chatlog_facts(self._tmp("{не json"))["ok"], False)
+        bad = run_mod.chatlog_facts(self._tmp("[1, 2]"))
+        self.assertEqual((bad["ok"], bad["err"]), (False, "штамп не словарь"))
+
+    def test_counter_resets_only_on_a_written_tick(self):
+        st, now = {}, NOW
+        run_mod.update_chatlog_silence(st, chat_fact(), 1000.0, now)          # первое наблюдение
+        s = run_mod.update_chatlog_silence(st, chat_fact(), 1600.0, now + 600)
+        self.assertEqual((s["measured"], s["awake"]), (True, 600.0))
+        s = run_mod.update_chatlog_silence(st, chat_fact(), 2200.0, now + 1200)
+        self.assertEqual(s["awake"], 1200.0, "тишина копится, пока подпись та же")
+        s = run_mod.update_chatlog_silence(st, chat_fact(runs=3, ran_at=9.0), 2800.0, now + 1800)
+        self.assertEqual((s["measured"], s["awake"]), (False, 0.0))
+        self.assertIn("заход состоялся", s["why"])
+
+    def test_signature_is_a_pair_and_either_half_moves_it(self):
+        """Подпись — ПАРА. Порознь обе врут: обнулённый руками `runs` не двигался бы при живых
+        заходах, а уехавший назад `ran_at` выглядел бы новым заходом при мёртвых часах."""
+        base = chat_fact()
+        st = {}
+        run_mod.update_chatlog_silence(st, base, 100.0, NOW)
+        run_mod.update_chatlog_silence(st, base, 200.0, NOW + 100)
+        only_runs = run_mod.update_chatlog_silence(st, chat_fact(runs=3), 300.0, NOW + 200)
+        self.assertEqual(only_runs["awake"], 0.0)
+        st = {}
+        run_mod.update_chatlog_silence(st, base, 100.0, NOW)
+        run_mod.update_chatlog_silence(st, base, 200.0, NOW + 100)
+        only_time = run_mod.update_chatlog_silence(st, chat_fact(ran_at=1.0), 300.0, NOW + 200)
+        self.assertEqual(only_time["awake"], 0.0)
+
+    def test_unreadable_stamp_neither_counts_nor_loses(self):
+        st = {}
+        run_mod.update_chatlog_silence(st, chat_fact(), 100.0, NOW)
+        run_mod.update_chatlog_silence(st, chat_fact(), 700.0, NOW + 600)
+        kept = dict(st["chatlog"])
+        s = run_mod.update_chatlog_silence(st, chat_fact(ok=False), 1300.0, NOW + 1200)
+        self.assertEqual((s["measured"], s["awake"]), (False, None))
+        self.assertEqual(st["chatlog"]["silent"], kept["silent"], "накопленное не теряется")
+        self.assertEqual(st["chatlog"]["own"], kept["own"], "и не подменяется пустой подписью")
+
+    def test_no_clock_at_all_is_unknown(self):
+        s = run_mod.update_chatlog_silence({}, chat_fact(), None, NOW)
+        self.assertEqual((s["measured"], s["awake"]), (False, None))
+        self.assertIn("часов бодрствования", s["why"])
+
+    # ── КОПИЯ ЧИСЕЛ НАБЛЮДАЕМОГО СВЕРЯЕТСЯ С ИСХОДНИКОМ ТЕКСТОМ ──────────────────────────
+    def test_interval_copy_matches_the_observed_source(self):
+        """Наблюдатель не импортирует наблюдаемого, поэтому интервал держится КОПИЕЙ — а копия
+        обязана краснеть, когда оригинал уедет. Сверка идёт по ИСХОДНИКУ текстом, без импорта."""
+        src = open(os.path.join(REPO, "chatlog_ingest.py"), encoding="utf-8").read()
+        m = re.search(r'EVERY_MIN\s*=\s*int\(os\.environ\.get\("CHATLOG_TICK_EVERY_MIN",\s*"(\d+)"\)\)',
+                      src)
+        self.assertIsNotNone(m, "объявление интервала в chatlog_ingest.py не найдено — сверять нечем")
+        self.assertEqual(float(m.group(1)) * 60.0, ex.CHATLOG_EVERY_SEC)
+
+    def test_state_path_copy_matches_the_observed_source(self):
+        src = open(os.path.join(REPO, "chatlog_ingest.py"), encoding="utf-8").read()
+        self.assertIn('DEFAULT_TICK_STATE = os.path.join(HERE, "tmp", "chatlog_tick", "state.json")',
+                      src, "путь штампа в наблюдаемом уехал — копия в руках О8 стала ложной")
+        self.assertEqual(run_mod.CHATLOG_TICK_STATE,
+                         os.path.join(REPO, "tmp", "chatlog_tick", "state.json"))
+
+    def test_the_eye_opens_the_stamp_and_never_the_archive(self):
+        """ГЛАЗ О8 ЧИТАЕТ ПЯТЬ ЧИСЕЛ, А НЕ ПЕРЕПИСКУ. Ни один источник захвата в его теле не
+        упоминается — значит наружу из этой ветки не может уйти ни одна строка переписки."""
+        tree = ast.parse(open(RUN_SRC, encoding="utf-8").read())
+        fn = [n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == "chatlog_facts"]
+        self.assertEqual(len(fn), 1)
+        # ДОКСТРИНГ ОТБРАСЫВАЕТСЯ НАМЕРЕННО: он как раз ПЕРЕЧИСЛЯЕТ источники, чтобы сказать,
+        # что их здесь нет. Предмет замка — ИСПОЛНЯЕМЫЕ строки, а не проза о них.
+        code = [n for n in fn[0].body
+                if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                        and isinstance(n.value.value, str))]
+        self.assertTrue(code, "тело функции пустое — замок сторожил бы ничто")
+        body = "".join(ast.dump(n) for n in code)
+        for forbidden in ("chatlog/", "userbot.log", "dispatch_notify.log", "delivery_6m",
+                          "data_export"):
+            self.assertNotIn(forbidden, body)
 
 
 if __name__ == "__main__":
