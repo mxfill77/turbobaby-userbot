@@ -32,6 +32,13 @@ pc_agent.py — удалённое управление userbot'ом с теле
                               называть объект — ключ И число строк; без числа или с чужим числом
                               отказ, и не тронуто ничего
   урок набор верни <ключ>   → вернуть набор ровно в то состояние, что было до снятия (побайтно)
+  урок перенос              → уроки НАБОРА экзамена, которые можно перенести в базу бота: номер и
+                              тема в два-три слова (lesson_transfer.py --ready, чтение)
+  урок перенеси N: причина  → перенести урок набора #N в базу правил бота (lesson_transfer.py; имя
+                              автора — из ОТПРАВИТЕЛЯ сообщения, причина — его же словами; без
+                              причины урок ляжет кандидатом)
+  урок перенос откати M     → откатить перенос урока БАЗЫ БОТА #M байт в байт
+  урок перенос след         → кто, когда и какой урок переносил
   иное → подсказка со списком команд
 
 Большие выводы (>3500 символов) — файлом (send_document), в тексте короткая выжимка.
@@ -649,6 +656,10 @@ KNOWN_COMMANDS = (
     "урок наборы · урок набор <ключ> — какие наборы есть и что в наборе (чтение)",
     "урок набор сними <ключ> <N>: причина — снять НАБОР целиком (объект: ключ И число)",
     "урок набор верни <ключ> — вернуть набор ровно в то, что было до снятия",
+    "урок перенос — какие уроки набора экзамена можно перенести в базу бота (номер и тема)",
+    "урок перенеси N: причина — перенести урок НАБОРА #N в базу бота (без причины — кандидатом)",
+    "урок перенос откати M — откатить перенос урока БОТА #M",
+    "урок перенос след — кто, когда и какой урок переносил",
 )
 
 
@@ -980,6 +991,133 @@ def _lesson_cli(action, number, why, who, source=""):
         answer_at = BATCH_ANSWER_AT if action in LESSON_BATCH_ACTS else LESSON_ANSWER_AT
         return (f"урок: движение «{action}» НЕ прошло ({type(e).__name__}: {e}). "
                 f"Запасной путь — {answer_at}.")
+
+
+# ── СЛОВО ВЛАДЕЛЬЦА: ПЕРЕНЕСТИ УРОК НАБОРА В БАЗУ БОТА (22.09.2026, задание 71e TELEFONUROK) ──
+# ЗАЧЕМ. Дверь переноса `lesson_transfer.py` (71b) доказана на копиях, но звать её можно было
+# только из консоли ПК, и в консоли без списка прав она отказывает всем. Владелец рулит с
+# телефона — значит его собственный урок не ехал вовсе. Слово заведено здесь, у единственной его
+# двери, тем же устройством, что «урок включи N: причина»: агент роутит и показывает, а право,
+# причину, след и сверку с живым читателем правил держит ДВЕРЬ субпроцессом.
+#
+# АВТОРСТВО — ИЗ ИСТОЧНИКА СОБЫТИЯ, И ТОЛЬКО ОТТУДА (`transfer_author`). Отправителя сообщения
+# Telegram называет числом (`from.id`), которое текстом не подделать; имя в `--who` — это
+# `username` ТОГО ЖЕ отправителя. Имени из текста сообщения, из записи тренажёра или из
+# константы нет ни в одной ветке: владелец, у которого ника нет, получает отказ словами, а не
+# чужое имя. Чужому числу — отказ словами, и дверь при этом не поднимается вовсе.
+#
+# ПРИЧИНА ЕДЕТ ЧЕРЕЗ stdin, А НЕ ЧЕРЕЗ argv — тот же принцип, что у урока своими словами
+# (`_exam_cli`): из Telegram в командную строку едут только число и имя отправителя. Дверь читает
+# stdin в явном UTF-8 (`io_utf8.read_stdin_utf8`), и мохибейк, которым испорчены три урока набора,
+# этим путём в базу бота не доедет.
+TRANSFER_ON_RE = lesson_word_forms.TRANSFER_ON_RE
+TRANSFER_BACK_RE = lesson_word_forms.TRANSFER_BACK_RE
+TRANSFER_LIST_RE = lesson_word_forms.TRANSFER_LIST_RE
+TRANSFER_TRACE_RE = lesson_word_forms.TRANSFER_TRACE_RE
+TRANSFER_HEAD_RE = lesson_word_forms.TRANSFER_HEAD_RE
+# Движения, которые ПИШУТ в базу бота: им нужен автор. Перечень и след — только чтение.
+TRANSFER_WRITE_ACTS = ("transfer", "untransfer")
+
+TRANSFER_DENIED = ("⛔ Нет прав: переносить урок в базу бота может ТОЛЬКО владелец. "
+                   "Ничего не перенесено, база бота не тронута.")
+TRANSFER_NO_NAME = ("⛔ Перенос НЕ сделан: у отправителя нет имени (username) в Telegram. Имя "
+                    "автора берётся только из самого сообщения — из текста и подстановкой его не "
+                    "берём. Ничего не перенесено, база бота не тронута.")
+TRANSFER_UNPARSED = (
+    "⚠️ Не разобрал команду переноса. Формы: «%s» — что можно перенести · «%s» — перенести урок "
+    "НАБОРА #N (без причины ляжет кандидатом) · «урок перенос откати M» — откатить перенос урока "
+    "БОТА #M · «урок перенос след» — кто и что переносил. Ничего не изменено."
+    % (lesson_word_forms.TRANSFER_LIST_PHRASE, lesson_word_forms.transfer_phrase()))
+TRANSFER_ANSWER_AT = ("консоль ПК, командой «venv/Scripts/python.exe lesson_transfer.py --who "
+                      "<имя> --from-set N --why \"причина\"»")
+
+
+def transfer_word(text):
+    """Слово переноса → (действие, номер, причина) | None. ЧИСТАЯ функция.
+
+    Действия: `transfer` (номер НАБОРА и причина), `untransfer` (номер БАЗЫ БОТА), `ready`,
+    `trace`. Регистр команды не значим, регистр причины сохраняется дословно."""
+    if text is None:
+        return None                     # сообщение без текста (фото, стикер) — не слово
+    body = " ".join(str(text).split()).strip().lstrip("/").strip()
+    if not body:
+        return None
+    m = TRANSFER_ON_RE.match(body)
+    if m:
+        return ("transfer", int(m.group(1)), m.group(2).strip())
+    m = TRANSFER_BACK_RE.match(body)
+    if m:
+        return ("untransfer", int(m.group(1)), "")
+    if TRANSFER_LIST_RE.match(body):
+        return ("ready", None, "")
+    if TRANSFER_TRACE_RE.match(body):
+        return ("trace", None, "")
+    return None
+
+
+def transfer_author(user):
+    """Автор движения переносом — ОПОЗНАННЫЙ ОТПРАВИТЕЛЬ сообщения → (имя, отказ | None).
+
+    Число отправителя сверяется ЗДЕСЬ ещё раз, хотя роутер темы 205 чужих уже отсёк: замок имени
+    не должен держаться на порядке веток роутера. Имя — `username` того же отправителя; `@` в
+    начале и пробелы срезаются, регистр оставлен как есть (сверку без регистра делает право)."""
+    uid = getattr(user, "id", None) if user is not None else None
+    if uid != ALLOWED_USER_ID:
+        return "", TRANSFER_DENIED
+    raw = getattr(user, "username", None)   # ника у пользователя Telegram может не быть вовсе
+    if raw is None:
+        return "", TRANSFER_NO_NAME
+    name = str(raw).strip().lstrip("@").strip()
+    if not name:
+        return "", TRANSFER_NO_NAME
+    return name, None
+
+
+def _transfer_cli(action, number, why, who):
+    """Движение переносом через дверь-CLI `lesson_transfer.py` → текст ответа. Слова исхода
+    (вошёл ли урок в ответ, под каким номером лёг, чем откатить) печатает ДВЕРЬ, а не мы."""
+    if not VENV_PY.exists():
+        return f"перенос урока: не нашёл python venv ({VENV_PY})."
+    argv = [str(VENV_PY), str(REPO_DIR / "lesson_transfer.py")]
+    stdin_text = None
+    if action == "transfer":
+        argv += ["--who", who, "--from-set", str(int(number)), "--why-stdin"]
+        stdin_text = why
+    elif action == "untransfer":
+        argv += ["--who", who, "--rollback", str(int(number))]
+    elif action == "ready":
+        argv += ["--ready"]
+    elif action == "trace":
+        argv += ["--trace"]
+    else:
+        return f"перенос урока: не понял действие ({action})."
+    try:
+        r = subprocess.run(
+            argv, input=stdin_text, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=120, cwd=str(REPO_DIR), creationflags=NO_WINDOW,
+        )
+        # capture_output + text: оба потока — строки всегда (пустая строка, а не None)
+        out = r.stdout.strip() or r.stderr.strip()
+        return out or (f"перенос урока: пустой ответ двери на «{action}» (код {r.returncode}) — "
+                       f"успехом это не считается. Запасной путь — {TRANSFER_ANSWER_AT}.")
+    except Exception as e:
+        return (f"перенос урока: движение «{action}» НЕ прошло ({type(e).__name__}: {e}). "
+                f"Запасной путь — {TRANSFER_ANSWER_AT}.")
+
+
+def transfer_reply(user, raw):
+    """Сообщение владельца в теме 205 → ответ | None (это не слово переноса). Пишущему движению
+    автор берётся ТОЛЬКО из отправителя (`transfer_author`); не опознан — отказ, дверь не зовётся."""
+    parsed = transfer_word(raw)
+    if parsed is None:
+        return None
+    act, num, why = parsed
+    who = ""
+    if act in TRANSFER_WRITE_ACTS:
+        who, stop = transfer_author(user)
+        if stop:
+            return stop
+    return _transfer_cli(act, num, why, who)
 
 
 def _gate_cb_parse(data):
@@ -1395,6 +1533,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send(context, chat_id,
                         "⛔ Нет прав: сигнальную остановку ящика снимает ТОЛЬКО владелец. "
                         "Ничего не снято, ящик держится.")
+        # ВТОРОЕ ИСКЛЮЧЕНИЕ (22.09.2026, 71e): слово переноса урока в базу бота. Чужому — отказ
+        # словами, а не тишина (условие задания), и дверь переноса при этом НЕ поднимается:
+        # ответ — литерал, а не вызов.
+        elif transfer_word(msg.text) or TRANSFER_HEAD_RE.match(text):
+            alog.warning("перенос урока: отказ чужому отправителю id %s", uid)
+            await _send(context, chat_id, TRANSFER_DENIED)
         return
 
     try:
@@ -1445,6 +1589,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mark = box_word_mark(text)
             alog.info("команда: снять остановку ящика, метка %s", mark)
             await _send(context, chat_id, await asyncio.to_thread(_box_cli, "free", mark))
+
+        elif transfer_word(msg.text):
+            # ПРИЧИНА — ИЗ ОРИГИНАЛА (`msg.text`), автор — из ОТПРАВИТЕЛЯ (`user`), не из текста.
+            act, num, _why = transfer_word(msg.text)
+            alog.info("команда переноса: %s #%s от id %s", act, num, uid)
+            await _send(context, chat_id,
+                        await asyncio.to_thread(transfer_reply, user, msg.text))
+
+        elif TRANSFER_HEAD_RE.match(text):
+            # текст здесь есть всегда: голова слова уже совпала на нём
+            alog.info("перенос урока: хвост не разобран в %r", msg.text[:120])
+            await _send(context, chat_id, TRANSFER_UNPARSED)
 
         elif lesson_word(msg.text):
             # ПРИЧИНА БЕРЁТСЯ ИЗ ОРИГИНАЛА (`msg.text`), а не из `text`: тот приведён к нижнему

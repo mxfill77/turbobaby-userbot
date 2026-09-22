@@ -45,9 +45,20 @@ lesson_transfer.py — ДВЕРЬ ПЕРЕНОСА одного урока ЖИ�
   • откат освобождает номер: следующая запись в базу может получить тот же номер. Запись о переносе
     хранит отпечатки, поэтому байты не спутаются, но номер в истории станет неоднозначным.
 
+С ТЕЛЕФОНА (22.09.2026, задание 71e TELEFONUROK). Та же дверь зовётся словом владельца в теме 205
+(`pc_agent` → `_transfer_cli`): «урок перенос» → `--ready` (переносимые уроки номером и темой в
+два-три слова), «урок перенеси N: причина» → `--from-set N --why-stdin`, «урок перенос откати M» →
+`--rollback M`. Имя в `--who` агент берёт из ОПОЗНАННОГО ОТПРАВИТЕЛЯ сообщения, а не из текста;
+причина едет через stdin в явном UTF-8 (`io_utf8.read_stdin_utf8`) — ровно тот путь, на котором
+в набор легли три испорченных урока, закрыт тем же устройством, что у двери экзамена. Для боевой
+базы карточка диктует откат СЛОВОМ, которое агент разбирает (`lesson_word_forms`), для копии —
+консольную строку с явным адресом: слово без адреса ударило бы в боевую базу.
+
 ЗАПУСК (боевые адреса — по умолчанию; `--set`/`--base` уводят на копии):
     venv/Scripts/python.exe lesson_transfer.py --list
+    venv/Scripts/python.exe lesson_transfer.py --ready
     venv/Scripts/python.exe lesson_transfer.py --who <имя> --from-set 7 --why "причина словами"
+    echo причина | venv/Scripts/python.exe lesson_transfer.py --who <имя> --from-set 7 --why-stdin
     venv/Scripts/python.exe lesson_transfer.py --who <имя> --rollback 10
     venv/Scripts/python.exe lesson_transfer.py --trace
 
@@ -317,9 +328,23 @@ def _promote_hint(number, base_path):
     Иначе слово ударило бы в одноимённый номер чужой базы — ровно класс 70x (дверь A2)."""
     import lesson_word_forms                        # noqa: PLC0415 — форма живёт там же, где разбор
     if _same_file(base_path, LS.STORE_PATH):
-        return "в %s: «%s»" % (lesson_word_forms.PROMOTE_WHERE, lesson_word_forms.promote_phrase(number))
+        # падеж — из атома темы (`PROMOTE_TOPIC`): «в тема «PC-дев»» читалось с телефона криво (71e)
+        return "в теме %s: «%s»" % (lesson_word_forms.PROMOTE_TOPIC,
+                                    lesson_word_forms.promote_phrase(number))
     return ("консолью: venv/Scripts/python.exe lesson_promote.py --path %s --who <имя> --promote %s "
             "--why \"%s\"" % (set_key(base_path), number, lesson_word_forms.PROMOTE_REASON_SLOT))
+
+
+def _rollback_hint(number, base_path):
+    """Как откатить перенос урока бота #number ЭТОЙ базы → строка. Слово в теме 205 бьёт в БОЕВУЮ
+    базу (агент зовёт дверь без `--base`), поэтому диктуется только ей; копии — консольная строка с
+    явным адресом. Довод тот же, что у `_promote_hint`: слово не должно ударить в чужую базу."""
+    import lesson_word_forms                        # noqa: PLC0415
+    if _same_file(base_path, LS.STORE_PATH):
+        return "одним сообщением в теме %s: «%s»" % (lesson_word_forms.PROMOTE_TOPIC,
+                                                     lesson_word_forms.transfer_back_phrase(number))
+    return ("консолью: venv/Scripts/python.exe lesson_transfer.py --base %s --who <имя> --rollback %s"
+            % (set_key(base_path), number))
 
 
 def _refused(reason, **kw):
@@ -397,11 +422,9 @@ def _transfer(set_number, who, why, src, base, may_write, now, build):
 
     out = {"n": number, "set_n": num, "who": author, "why": reason, "state": state, "stamp": stamp,
            "sha_before": _sha(data_before), "sha_after": _sha(data_after)}
-    trail = ("📌 След: перенёс @%s, %s; урок набора #%s (%s) → урок бота #%s (%s). Откатить перенос: "
-             "venv/Scripts/python.exe lesson_transfer.py%s --who <имя> --rollback %s."
-             % (author, stamp, num, key, number, set_key(base_path),
-                "" if _same_file(base_path, LS.STORE_PATH) else " --base " + set_key(base_path),
-                number))
+    trail = ("↩️ Откатить перенос %s.\n📌 След: перенёс @%s, %s; урок набора #%s (%s) → урок бота #%s "
+             "(%s)." % (_rollback_hint(number, base_path), author, stamp, num, key, number,
+                        set_key(base_path)))
     if not reason:
         return dict(out, status=STATUS_CANDIDATE, card=(
             "📝 Урок набора #%s записан в базу бота КАНДИДАТОМ как урок #%s: причина не названа, поэтому в "
@@ -498,7 +521,8 @@ def rollback_transfer(number, who=None, base=None, may_write=None, now=None):
 
 
 # ---------------------------------------------------------------------------------------
-# ЧТЕНИЕ: перечень набора и след переносов. Текстов уроков не печатает — только номера и признаки.
+# ЧТЕНИЕ: перечень набора и след переносов. `--list`/`--trace` текстов уроков не печатают — только
+# номера и признаки; `--ready` (телефон) добавляет к номеру тему в два-три слова — начало правила.
 # ---------------------------------------------------------------------------------------
 def list_card(src=None, base=None):
     src_path = LIVE_SET_PATH if src is None else src
@@ -523,6 +547,68 @@ def list_card(src=None, base=None):
     return "\n".join(out)
 
 
+# ТЕМА УРОКА В ДВА-ТРИ СЛОВА — для перечня С ТЕЛЕФОНА (71e). Графы темы в формате набора нет, и
+# формат ради неё не переписывался; выдумывать тему за владельца тоже нечем. Поэтому тема — это
+# НАЧАЛО самого правила («как правильно»): первые три слова, а если третье — связка («не», «на»,
+# «под»…), то до первого слова со смыслом, но не длиннее пяти. Отрицание не срезается: «не повторяй»
+# и «повторяй» — противоположные уроки. Текст вопроса клиента и ответа бота в перечень не попадает.
+_TOPIC_GLUE = frozenset("не ни на в во к ко о об обо и а с со у по под над для при про из от до "
+                        "как чем что если пока когда это то же ли бы или".split())
+TOPIC_WORDS = 3
+TOPIC_MAX = 5
+_TOPIC_STRIP = ".,;:!?()[]«»\"'—–-"
+
+
+def topic_of(text):
+    """Правило урока → тема в два-три слова (его начало) → str; пустое правило → «(без текста)»."""
+    words = [w.strip(_TOPIC_STRIP) for w in str(text).split()]
+    words = [w for w in words if w]
+    if not words:
+        return "(без текста)"
+    out = []
+    for w in words:
+        out.append(w)
+        if len(out) >= TOPIC_MAX:
+            break
+        if len(out) >= TOPIC_WORDS and out[-1].lower() not in _TOPIC_GLUE:
+            break
+    return " ".join(out) + ("…" if len(words) > len(out) else "")
+
+
+def ready_card(src=None, base=None):
+    """Перечень для телефона: какие уроки набора можно перенести СЕЙЧАС — номер и тема в два-три
+    слова; что не переносится и почему — номерами. Только чтение."""
+    import lesson_word_forms                        # noqa: PLC0415
+    src_path = LIVE_SET_PATH if src is None else src
+    got = LS.load(src_path)
+    if not got.exists:
+        return "Набора нет по адресу %s." % set_key(src_path)
+    key = set_key(src_path)
+    ready, moved, spoiled, gone = [], [], [], []
+    for les in got.lessons:
+        prior = open_transfer(LS._path(base), les.number, key)
+        if prior is not None:
+            moved.append("#%d → урок бота #%d" % (les.number, prior.number))
+        elif not (LS.is_active(les) or LS.is_candidate(les)):
+            gone.append("#%d" % les.number)
+        elif looks_mojibake(les.correct):
+            spoiled.append("#%d" % les.number)
+        else:
+            ready.append("#%d — %s" % (les.number, topic_of(les.correct)))
+    out = ["📚 Уроки набора экзамена, которые можно перенести в базу бота: %d из %d."
+           % (len(ready), len(got.lessons))]
+    out += ready
+    if moved:
+        out.append("Уже в базе бота: %s." % ", ".join(moved))
+    if spoiled:
+        out.append("Не переносятся — текст испорчен кодировкой: %s." % ", ".join(spoiled))
+    if gone:
+        out.append("Не переносятся — сняты: %s." % ", ".join(gone))
+    out.append("Перенести: «%s». Номер — из этого перечня (номер НАБОРА). Без причины урок ляжет "
+               "кандидатом и в ответ бота не войдёт." % lesson_word_forms.transfer_phrase())
+    return "\n".join(out)
+
+
 def trace_card(base=None):
     seen = load_moves(base)
     if len(seen) == 0:
@@ -543,8 +629,12 @@ def main(argv=None):
     ap.add_argument("--from-set", type=int, metavar="N", dest="from_set",
                     help="перенести урок НАБОРА #N в базу бота")
     ap.add_argument("--why", default="", help="причина СЛОВАМИ; пусто — урок ляжет кандидатом")
+    ap.add_argument("--why-stdin", action="store_true", dest="why_stdin",
+                    help="причину прочесть со stdin в UTF-8 (так её везёт агент темы 205)")
     ap.add_argument("--rollback", type=int, metavar="M", help="откатить перенос урока БАЗЫ БОТА #M")
     ap.add_argument("--list", action="store_true", help="уроки набора и их перенос (чтение)")
+    ap.add_argument("--ready", action="store_true",
+                    help="переносимые уроки номером и темой в два-три слова (чтение, для телефона)")
     ap.add_argument("--trace", action="store_true", help="записи о переносе (чтение)")
     ap.add_argument("--set", dest="src", help="другой файл набора (по умолчанию exam_live/lessons.tsv)")
     ap.add_argument("--base", help="другой файл базы бота (по умолчанию lesson_store.tsv)")
@@ -552,6 +642,9 @@ def main(argv=None):
 
     if args.list:
         print(list_card(args.src, args.base))
+        return EXIT_OK
+    if args.ready:
+        print(ready_card(args.src, args.base))
         return EXIT_OK
     if args.trace:
         print(trace_card(args.base))
@@ -562,7 +655,13 @@ def main(argv=None):
               "БОТА). Посмотреть: --list / --trace.")
         return EXIT_REFUSED
     if args.from_set is not None:
-        dec = transfer_lesson(args.from_set, who=args.who, why=args.why, src=args.src, base=args.base)
+        why = args.why
+        if args.why_stdin:
+            if why.strip():
+                print("Причину назови ОДНИМ путём: --why либо --why-stdin. Ничего не перенесено.")
+                return EXIT_REFUSED
+            why = io_utf8.read_stdin_utf8()
+        dec = transfer_lesson(args.from_set, who=args.who, why=why, src=args.src, base=args.base)
     else:
         dec = rollback_transfer(args.rollback, who=args.who, base=args.base)
     print(dec["card"])

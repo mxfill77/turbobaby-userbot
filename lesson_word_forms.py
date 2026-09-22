@@ -85,3 +85,62 @@ def promote_phrase(number=None, why=""):
         raise PromoteFormBroken(
             "образец перевода не разбирается собственным разбором: %r" % probe)
     return phrase
+
+
+# ── СЛОВО ПЕРЕНОСА «урок перенеси N: причина» (22.09.2026, задание 71e TELEFONUROK) ──────────
+# ЗАЧЕМ. Дверь переноса урока набора в базу бота (`lesson_transfer.py`, 71b) была только
+# консольной, а владелец рулит с телефона: его собственный урок не ехал вовсе. Слово слушает тот
+# же единственный роутер — `pc_agent`, тема 205. Форма живёт ЗДЕСЬ по тому же доводу, что и форма
+# включения: её разбирает агент, а образец печатает дверь («откатить одним сообщением: …»), и
+# разойтись им здесь нечем — образец собирается и тут же сверяется этим же разбором.
+#
+# НОМЕРА У ДВУХ БАЗ СВОИ, И ГЛАГОЛ ЭТО ГОВОРИТ. У «перенеси N» число — номер НАБОРА (откуда
+# берём); у «перенос откати M» — номер БАЗЫ БОТА (что откатываем). Форма отката начинается
+# словом «перенос», а не голым «откати»: голое «урок откати M» — это ОТКАТ ВКЛЮЧЕНИЯ
+# (`LESSON_BACK_RE` агента), и перепутать два движения одним словом было бы нельзя исправить
+# тем же словом.
+TRANSFER_ON_RE = re.compile(
+    r"^(?:урок|lesson)[\s:]+(?:перенеси|перенести|transfer)\s+#?(\d+)\s*[:\-—]?\s*(.*)$",
+    re.IGNORECASE | re.DOTALL)
+TRANSFER_BACK_RE = re.compile(
+    r"^(?:урок|lesson)[\s:]+(?:перенос|transfer)[\s:]+(?:откати(?:ть)?|rollback)\s+#?(\d+)$",
+    re.IGNORECASE)
+TRANSFER_LIST_RE = re.compile(r"^(?:урок|lesson)[\s:]+(?:перенос|переносимые|transfers)$",
+                              re.IGNORECASE)
+TRANSFER_TRACE_RE = re.compile(r"^(?:урок|lesson)[\s:]+(?:перенос|transfer)[\s:]+(?:след|trace)$",
+                               re.IGNORECASE)
+# «Почти команда»: слово переноса узнано, хвост не разобран (довод тот же, что у `LESSON_HEAD_RE`).
+TRANSFER_HEAD_RE = re.compile(
+    r"^(?:урок|lesson)[\s:]+(?:перенеси|перенести|перенос|переносимые|transfers?)\b",
+    re.IGNORECASE)
+
+TRANSFER_VERB = "перенеси"
+TRANSFER_NOUN = "перенос"
+TRANSFER_LIST_PHRASE = "%s %s" % (PROMOTE_NOUN, TRANSFER_NOUN)
+
+
+def transfer_phrase(number=None, why=""):
+    """Дословная строка, которой владелец переносит урок набора #number. → str (без кавычек).
+
+    `number=None` — безномерная форма («урок перенеси N: …») для перечня. Сверяется разбором тут
+    же — по той же причине, что `promote_phrase`."""
+    slot = " ".join(str(why).split()).strip() or PROMOTE_REASON_SLOT
+    shown = PROMOTE_NUMBER_SLOT if number is None else str(int(number))
+    phrase = "%s %s %s: %s" % (PROMOTE_NOUN, TRANSFER_VERB, shown, slot)
+    probe = phrase if number is not None else "%s %s %d: %s" % (
+        PROMOTE_NOUN, TRANSFER_VERB, _PROBE_NUMBER, slot)
+    want = _PROBE_NUMBER if number is None else int(number)
+    m = TRANSFER_ON_RE.match(probe)
+    if m is None or int(m.group(1)) != want or m.group(2).strip() != slot:
+        raise PromoteFormBroken(
+            "образец переноса не разбирается собственным разбором: %r" % probe)
+    return phrase
+
+
+def transfer_back_phrase(number):
+    """Дословная строка отката переноса урока БАЗЫ БОТА #number — одним сообщением. → str."""
+    phrase = "%s %s откати %d" % (PROMOTE_NOUN, TRANSFER_NOUN, int(number))
+    m = TRANSFER_BACK_RE.match(phrase)
+    if m is None or int(m.group(1)) != int(number):
+        raise PromoteFormBroken("образец отката переноса не разбирается: %r" % phrase)
+    return phrase
