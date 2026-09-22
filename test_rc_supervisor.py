@@ -446,6 +446,123 @@ class TestPreflightGate(unittest.TestCase):
         self.assertEqual(len(cards), 2)
 
 
+class TestChildEnvProfileChoice(unittest.TestCase):
+    """Рычаг 70w доехал до RC (22.09). Постоянная CLAUDE_CONFIG_DIR=D:\\claude_profile_2 увела обе
+    ветки в профиль второго аккаунта: 91 старт rc-server, 88 гашений ЗОМБИ, 0 регистраций, и телефон
+    на другом аккаунте. Теперь окружение детей и doctor решает claude_profile_choice.txt, а третий
+    исход файла оставляет прежнее наследование байт-в-байт (env в Popen не передаётся вовсе)."""
+
+    KEY = "CLAUDE_CONFIG_DIR"
+    SHIM = r"C:\Users\u\.local\bin\claude.exe"
+    BASE = {"CLAUDE_CONFIG_DIR": r"D:\claude_profile_2", "PATH": r"C:\x", "USERPROFILE": r"C:\u"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = self.tmp.name
+        self.log = os.path.join(self.repo, "rc_test_env_liveness.log")
+        self.spec = {"label": "t", "mode": ("rc",), "log": self.log}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _choice(self, text):
+        with open(os.path.join(self.repo, "claude_profile_choice.txt"), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_main_word_drops_key_keeps_rest(self):
+        self._choice("# строка отката\nОСНОВНОЙ\n")
+        env, why = rc.child_env(base=dict(self.BASE), repo=self.repo)
+        self.assertIsNotNone(env)
+        self.assertNotIn(self.KEY, env)                       # ключа НЕТ, а не пустой
+        self.assertEqual(env["PATH"], r"C:\x")               # прочее окружение цело
+        self.assertIn("основной профиль", why)
+
+    def test_existing_path_sets_key(self):
+        self._choice(self.repo + "\n")
+        env, _ = rc.child_env(base=dict(self.BASE), repo=self.repo)
+        self.assertEqual(env[self.KEY], self.repo)
+
+    def test_third_outcome_keeps_inheritance(self):
+        # файла нет / две значимые строки / несуществующий путь — env не передаём вовсе
+        cases = (None, "ОСНОВНОЙ\nD:\\x\n", r"D:\нет_такого_каталога_rc_test")
+        for text in cases:
+            if text is not None:
+                self._choice(text)
+            env, why = rc.child_env(base=dict(self.BASE), repo=self.repo)
+            self.assertIsNone(env, text)
+            self.assertIn("НЕ ПРИМЕНЁН", why)
+
+    def test_never_empty_value(self):
+        for text in ("ОСНОВНОЙ", "", "\"\"", "  \n# c\n", self.repo):
+            self._choice(text)
+            env, _ = rc.child_env(base=dict(self.BASE), repo=self.repo)
+            self.assertNotEqual((env or {}).get(self.KEY, "absent"), "")
+
+    def test_base_env_not_mutated(self):
+        self._choice("ОСНОВНОЙ")
+        base = dict(self.BASE)
+        rc.child_env(base=base, repo=self.repo)
+        self.assertEqual(base, self.BASE)                     # правим копию, не окружение сторожа
+
+    def test_chooser_crash_falls_back_to_inheritance(self):
+        class _Boom:
+            ACT_KEEP = "keep"
+
+            @staticmethod
+            def apply_to(env, repo=None):
+                raise ValueError("сломан")
+        env, why = rc.child_env(chooser=_Boom, base=dict(self.BASE), repo=self.repo)
+        self.assertIsNone(env)
+        self.assertIn("сорвался", why)
+
+    def test_module_missing_falls_back_to_inheritance(self):
+        saved = rc.profile_choice
+        rc.profile_choice = None
+        try:
+            env, why = rc.child_env(base=dict(self.BASE), repo=self.repo)
+        finally:
+            rc.profile_choice = saved
+        self.assertIsNone(env)
+        self.assertIn("не импортирован", why)
+
+    def test_spawn_passes_env_and_keeps_tty(self):
+        seen = {}
+
+        def fake_popen(cmd, **kw):
+            seen["kw"] = kw
+            return _FakeProc()
+        env = {"PATH": r"C:\x"}
+        rc.default_spawn(self.SHIM, self.spec, verbose=False, popen=fake_popen,
+                         envf=lambda: (env, "выбор учётки строителей: тест"))
+        self.assertIs(seen["kw"].get("env"), env)
+        self.assertNotIn("creationflags", seen["kw"])         # консоль не гасим
+        for k in ("stdout", "stderr", "stdin"):
+            self.assertNotIn(k, seen["kw"])                   # TTY цел
+        self.assertEqual(seen["kw"].get("cwd"), rc.REPO)
+
+    def test_spawn_keep_passes_no_env_kwarg(self):
+        seen = {}
+
+        def fake_popen(cmd, **kw):
+            seen["kw"] = kw
+            return _FakeProc()
+        rc.default_spawn(self.SHIM, self.spec, verbose=False, popen=fake_popen,
+                         envf=lambda: (None, "выбор учётки НЕ ПРИМЕНЁН: тест"))
+        self.assertEqual(seen["kw"], {"cwd": rc.REPO})        # прежний вызов байт-в-байт
+
+    def test_doctor_judges_same_profile_as_children(self):
+        seen = []
+        env = {"PATH": r"C:\x"}
+
+        def runner(*a, **k):
+            seen.append(k)
+            return TestPreflightGate._P(TestPreflightGate.DOCTOR_OK)
+        rc.rc_ready(r"C:\c.exe", runner=runner, envf=lambda: (env, "drop"))
+        rc.rc_ready(r"C:\c.exe", runner=runner, envf=lambda: (None, "keep"))
+        self.assertIs(seen[0].get("env"), env)
+        self.assertNotIn("env", seen[1])
+
+
 class TestMain(unittest.TestCase):
     """Один синглтон-супервизор поднимает ОБЕ ветки в потоках; вторая копия молча выходит."""
 

@@ -141,6 +141,17 @@ try:
 except Exception:
     rc_auth_detect = None
 
+# УЧЁТКА ДЕТЕЙ — рычаг 70w (`claude_profile_choice.txt`, читатель profile_choice.py), тот же, что у
+# детей демона. Живой прокол 18–22.09 (docs/artifacts/2026-09-22-rc-device-profile2-stall.md):
+# постоянная переменная пользователя CLAUDE_CONFIG_DIR=D:\claude_profile_2 увела ОБЕ ветки в
+# профиль второго аккаунта. Там `claude rc` ждёт ответа первого запуска в скрытой консоли —
+# 91 старт, 88 гашений ЗОМБИ, 0 регистраций, — а телефон вдобавок сидит на основном аккаунте.
+# Импорт мягкий: не импортировался — окружение детей наследуется, как было до правки.
+try:
+    import profile_choice
+except Exception:
+    profile_choice = None
+
 log = logging.getLogger("rc_supervisor")
 log.setLevel(logging.INFO)
 log.propagate = False
@@ -276,15 +287,42 @@ RC_BLOCKERS = (
 )
 
 
-def rc_ready(claude, runner=None, timeout=120):
+def child_env(chooser=None, base=None, repo=None):
+    """Окружение детей супервизора (обе ветки И doctor пре-флайта) → (env | None, строка журнала).
+
+    Решение даёт файл выбора учётки (рычаг 70w): ОСНОВНОЙ — ключ CLAUDE_CONFIG_DIR снят, путь —
+    поставлен. env=None значит «не передавать env в Popen вовсе», то есть прежнее наследование
+    байт-в-байт. Так будет при третьем исходе файла, при отсутствии модуля и при его срыве.
+    doctor обязан судить ТОТ ЖЕ профиль, в котором поднимется ветка, иначе гейт даёт вердикт
+    о чужом входе. chooser/base/repo — инъекция для тестов."""
+    _pc = chooser if chooser is not None else profile_choice
+    if _pc is None:
+        return None, ("выбор учётки НЕ ПРИМЕНЁН: модуль profile_choice не импортирован — "
+                      "окружение детей наследуется")
+    env = dict(os.environ if base is None else base)
+    try:
+        d = _pc.apply_to(env, repo=repo or REPO)
+        why = _pc.line(d)
+    except Exception as e:          # рычаг не смеет уронить канал
+        return None, ("выбор учётки НЕ ПРИМЕНЁН: сорвался (%s) — окружение детей наследуется"
+                      % type(e).__name__)
+    if d.action == _pc.ACT_KEEP:
+        return None, why
+    return env, why
+
+
+def rc_ready(claude, runner=None, timeout=120, envf=None):
     """Готов ли контур поднять мост Remote Control → (ok, detail).
 
     FAIL-OPEN: если сам doctor не запустился/завис — НЕ блокируем канал (гард обязан ловить
-    известную поломку, а не становиться новой точкой отказа)."""
+    известную поломку, а не становиться новой точкой отказа). doctor идёт с окружением детей
+    (child_env), envf — инъекция для тестов."""
+    env, _why = (envf or child_env)()
+    kw = {"env": env} if env is not None else {}
     try:
         p = (runner or subprocess.run)([claude, "doctor"], capture_output=True, text=True,
                                        encoding="utf-8", errors="replace",
-                                       timeout=timeout, cwd=REPO)
+                                       timeout=timeout, cwd=REPO, **kw)
     except Exception as e:
         return True, "doctor не отработал (%s) — не блокируем" % type(e).__name__
     out = (getattr(p, "stdout", "") or "") + (getattr(p, "stderr", "") or "")
@@ -390,19 +428,23 @@ def fmt_age(age_sec):
     return "нет файла" if age_sec is None else "%.0fс" % age_sec
 
 
-def default_spawn(claude, spec, verbose=None, popen=None):
+def default_spawn(claude, spec, verbose=None, popen=None, envf=None):
     """Поднять процесс ветки. Сначала УСЕКАЕМ лог живости (свежий mtime = чистая точка отсчёта на
     новую жизнь процесса), затем Popen БЕЗ перенаправления stdio и БЕЗ creationflags: интерактивной
     сессии нужен живой TTY скрытой консоли wscript (redirect/CREATE_NO_WINDOW его убивают — классы
-    «мёртвый TTY» / «мигающие чёрные окна»). verbose=None → берём по файлу-флагу. popen —
-    инъекция для тестов. → объект процесса (.poll/.pid/.terminate) | None."""
+    «мёртвый TTY» / «мигающие чёрные окна»). Окружение — по рычагу учётки (child_env): env
+    передаётся только при решении drop/set, консоль и stdio он не трогает. verbose=None → берём по
+    файлу-флагу. popen/envf — инъекция для тестов. → объект процесса (.poll/.pid/.terminate) | None."""
     try:
         open(spec["log"], "w", encoding="utf-8").close()
     except Exception:
         pass
     vb = os.path.exists(DEBUG_FLAG) if verbose is None else verbose
+    env, why = (envf or child_env)()
+    log.info("[%s] %s", spec["label"], why)
+    kw = {"env": env} if env is not None else {}
     try:
-        return (popen or subprocess.Popen)(build_cmd(claude, spec, verbose=vb), cwd=REPO)
+        return (popen or subprocess.Popen)(build_cmd(claude, spec, verbose=vb), cwd=REPO, **kw)
     except Exception as e:
         log.error("[%s] процесс не поднялся (%s)", spec["label"], type(e).__name__)
         return None
