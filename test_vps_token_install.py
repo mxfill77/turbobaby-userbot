@@ -166,6 +166,157 @@ class Verdict(unittest.TestCase):
         self.assertEqual(vti.verdict_of_probe(1, '{"is_error":false,"result":"OK"}')[0], vti.OTHER)
 
 
+class LiveEnvelopeForm(unittest.TestCase):
+    u"""Голдены на ЖИВОЙ форме конверта (71u, 22.09.2026), а не на форме транскрипта.
+
+    Живой конверт 71r (`tmp/vps_token_switch/probe_neg.json`) несёт поле `api_error_status`, а
+    под ним — строку хука `SessionEnd hook … failed`. Прежний судья читал `apiErrorStatus` (имя
+    из транскрипта) и `json.loads` с хвостом. Первые два теста до правки давали НЕВЕРНЫЙ вердикт."""
+
+    HOOK_TAIL = ("\nSessionEnd hook [D:/turbobaby-bot/venv/Scripts/python.exe "
+                 "D:/turbobaby-bot/dispatch_notify.py --hook session_end] failed: Hook cancelled\n")
+
+    def test_snake_field_beats_limit_words(self):
+        u"""До правки: поле не найдено → текст «weekly limit» → 429. Верно — 401."""
+        envelope = ('{"is_error":true,"subtype":"success","api_error_status":401,'
+                    '"result":"earlier we saw weekly limit resets Sep 27, 9am (UTC)","type":"result"}')
+        self.assertEqual(vti.verdict_of_probe(1, envelope)[0], vti.DENIED)
+
+    def test_clean_envelope_with_hook_tail_is_green(self):
+        u"""До правки: «Extra data» → конверт не разобран → «иное» на чистом ответе."""
+        envelope = '{"is_error":false,"subtype":"success","api_error_status":null,"result":"OK"}'
+        self.assertEqual(vti.verdict_of_probe(0, envelope + self.HOOK_TAIL)[0], vti.GREEN)
+
+    def test_live_71r_negative_envelope(self):
+        envelope = ('{"duration_api_ms":0,"modelUsage":{},"terminal_reason":"api_error",'
+                    '"is_error":true,"num_turns":1,"subtype":"success","api_error_status":401,'
+                    '"result":"Failed to authenticate. API Error: 401 Invalid bearer token","type":"result"}')
+        data = vti.parse_envelope(envelope + self.HOOK_TAIL)
+        self.assertEqual(vti.status_of(data, envelope), 401)
+        self.assertEqual(vti.verdict_of_probe(1, envelope + self.HOOK_TAIL)[0], vti.DENIED)
+
+    def test_429_snake_is_limit(self):
+        envelope = ('{"is_error":true,"api_error_status":429,'
+                    '"result":"You\'ve hit your weekly limit · resets Sep 27, 9am (UTC)"}')
+        self.assertEqual(vti.verdict_of_probe(1, envelope)[0], vti.LIMIT)
+
+    def test_transcript_name_still_read(self):
+        self.assertEqual(vti.status_of({"apiErrorStatus": "429"}, ""), 429)
+        self.assertIsNone(vti.status_of({"api_error_status": True}, ""))
+
+
+def _probe_out(active, filled="1", rc=1, envelope=None, loaded="1", mtime=100, start=200):
+    u"""Синтетический вывод программы пробы: `k=v` сверху, конверт, `probe_rc` снизу."""
+    head = "loaded=%s\n" % loaded
+    if loaded != "1":
+        return head
+    head += "slot_filled=%s\n" % filled
+    if filled != "1":
+        return head
+    head += "is_active=%s\nfile_mtime=%d\ndaemon_start=%d\n" % (active, mtime, start)
+    return head + (envelope or "") + "\nprobe_rc=%d\n" % rc
+
+
+ENV_429 = ('{"is_error":true,"subtype":"success","api_error_status":429,'
+           '"result":"You\'ve hit your weekly limit · resets Sep 27, 9am (UTC)","type":"result"}')
+ENV_401 = ('{"is_error":true,"subtype":"success","api_error_status":401,'
+           '"result":"Failed to authenticate. API Error: 401 OAuth access token is invalid.","type":"result"}')
+ENV_OK = '{"is_error":false,"subtype":"success","api_error_status":null,"result":"OK","type":"result"}'
+
+
+class ProbeSlots(unittest.TestCase):
+    u"""Режим `--probe-slots`: один вызов на имя, имена — из закрытого списка, значений наружу нет."""
+
+    def test_unknown_name_is_refused(self):
+        with self.assertRaises(ValueError):
+            vti.probe_slot_script("/etc/a/one", "PATH; rm -rf /")
+
+    def test_script_closes_every_named_channel(self):
+        for name in vti.PROBE_NAMES:
+            s = vti.probe_slot_script("/etc/a/one", name)
+            lines = s.splitlines()
+            self.assertEqual(lines[0], "exec 2>/dev/null")        # обломок токена не напечатается
+            self.assertIn("cd / ", s)
+            self.assertIn("</dev/null", s)                        # stdin — программа, не подсказка
+            self.assertIn("--no-session-persistence", s)
+            self.assertIn("--setting-sources project", s)         # хуки сервера пробой не зовутся
+            self.assertIn("env -u ANTHROPIC_API_KEY", s)          # как у демона
+            self.assertIn('CLAUDE_CODE_OAUTH_TOKEN="${%s}"' % name, s)
+            self.assertNotIn(vti.TOKEN_PREFIX, s)
+            calls = [l for l in lines if "--output-format" in l]
+            self.assertEqual(len(calls), 1, u"вызов поставщика на имя — ровно один")
+            self.assertLess(lines.index("echo slot_filled=1"), lines.index(calls[0]))
+
+    def test_script_parses_as_bash(self):
+        import shutil
+        import subprocess
+        bash = shutil.which("bash")
+        if not bash:
+            self.skipTest(u"bash на этой машине не найден")
+        for name in vti.PROBE_NAMES:
+            p = subprocess.run([bash, "-n"], input=vti.probe_slot_script("/etc/a/one", name).encode("utf-8"),
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+            self.assertEqual(p.returncode, 0, p.stdout)
+
+    def test_three_ssh_calls_script_in_stdin(self):
+        seen = []
+        real = vti.ssh_run
+
+        def fake(cmd, stdin_text=None, timeout=None):
+            seen.append((cmd, stdin_text, timeout))
+            return 0, _probe_out("1", envelope=ENV_429)
+
+        vti.ssh_run = fake
+        try:
+            rows = vti.probe_slots("/etc/a/one", save=False)
+        finally:
+            vti.ssh_run = real
+        self.assertEqual(len(seen), 3)
+        self.assertEqual([c for c, _s, _t in seen], ["bash -s"] * 3)
+        self.assertEqual([t for _c, _s, t in seen], [vti.SSH_PROBE_TIMEOUT] * 3)
+        for (_c, script, _t), name in zip(seen, vti.PROBE_NAMES):
+            self.assertIn('"${%s}"' % name, script)
+        self.assertEqual([r["code"] for r in rows], [429, 429, 429])
+
+    def test_row_words(self):
+        r = vti.slot_row(vti.NAME_SLOT_A, _probe_out("0", envelope=ENV_401))
+        self.assertEqual((r["code"], r["word"], r["is_error"], r["active"]), (401, vti.DENIED, True, "0"))
+        self.assertIn("OAuth access token is invalid", r["text"])
+        r = vti.slot_row(vti.NAME_ACTIVE, _probe_out("1", rc=0, envelope=ENV_OK))
+        self.assertEqual((r["code"], r["word"], r["is_error"]), (200, vti.GREEN, False))
+        r = vti.slot_row(vti.NAME_SLOT_B, _probe_out("0", filled="0"))
+        self.assertFalse(r["called"])
+        self.assertEqual(r["word"], u"пуст")
+        r = vti.slot_row(vti.NAME_SLOT_B, u"ssh не ответил за 300 с", channel_rc=255)
+        self.assertFalse(r["called"])
+        self.assertIsNone(r["code"])
+        r = vti.slot_row(vti.NAME_ACTIVE, _probe_out("1", loaded="0"))
+        self.assertFalse(r["called"])
+
+    def test_summary_premise_71r_shape(self):
+        u"""Форма 71r: действующее и B — 429 и одно значение, A — 401."""
+        rows = [vti.slot_row(vti.NAME_ACTIVE, _probe_out("1", envelope=ENV_429)),
+                vti.slot_row(vti.NAME_SLOT_A, _probe_out("0", envelope=ENV_401)),
+                vti.slot_row(vti.NAME_SLOT_B, _probe_out("1", envelope=ENV_429))]
+        counts, lines = vti.summarize_slots(rows)
+        self.assertEqual((counts[200], counts[429], counts[401]), (0, 2, 1))
+        text = u"\n".join(lines)
+        self.assertIn(u"ДЕЙСТВУЮЩИЙ отвечает 429", text)
+        self.assertIn(vti.NAME_SLOT_B, text.split(u"тем же значением")[1].splitlines()[0])
+        self.assertIn(u"не менялся после старта демона", text)
+
+    def test_summary_owner_shape(self):
+        u"""Форма слов владельца: действующий 200, лимит на одном."""
+        rows = [vti.slot_row(vti.NAME_ACTIVE, _probe_out("1", rc=0, envelope=ENV_OK)),
+                vti.slot_row(vti.NAME_SLOT_A, _probe_out("1", rc=0, envelope=ENV_OK)),
+                vti.slot_row(vti.NAME_SLOT_B, _probe_out("0", envelope=ENV_429, mtime=300, start=200))]
+        counts, lines = vti.summarize_slots(rows)
+        self.assertEqual((counts[200], counts[429], counts[401]), (2, 1, 0))
+        text = u"\n".join(lines)
+        self.assertIn(u"ДЕЙСТВУЮЩИЙ отвечает 200", text)
+        self.assertIn(u"ВНИМАНИЕ: файл окружения изменён ПОСЛЕ старта демона", text)
+
+
 class SecretChannel(unittest.TestCase):
     u"""Значение уходит ТОЛЬКО в stdin-блобе. В argv его нет — иначе `ps` покажет токен целиком."""
 
@@ -226,7 +377,8 @@ class Pure(unittest.TestCase):
     u"""VPS_TOKEN_PURE: судьи не знают двери наружу. Зеркало EXPECT_PC_PURE слоя ожиданий."""
 
     PURE = ("parse_env_files", "check_shape", "env_rewrite", "plan_write", "verdict_of_probe",
-            "backup_name", "synth_value", "synth_env", "bad_cases", "bad_envelopes")
+            "backup_name", "synth_value", "synth_env", "bad_cases", "bad_envelopes",
+            "parse_envelope", "status_of", "probe_slot_script", "slot_row", "summarize_slots")
     FORBIDDEN = {"subprocess", "ssh_run", "run_remote_py", "getpass", "input", "open",
                  "restart_unit", "probe", "restore", "apply_value", "preflight", "find_env_path"}
 

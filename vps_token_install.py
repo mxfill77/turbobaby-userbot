@@ -62,6 +62,9 @@ u"""vps_token_install.py — ОДНА КОМАНДА ВЛАДЕЛЬЦА: нов�
     venv\\Scripts\\python.exe vps_token_install.py --check     # только разведка сервера, без ввода
     venv\\Scripts\\python.exe vps_token_install.py --dry       # ввод и проверка формы, сервер не правим
     venv\\Scripts\\python.exe vps_token_install.py --selftest  # отрицательный тест НА КОПИИ, без сети
+    venv\\Scripts\\python.exe vps_token_install.py --probe-slots  # перемер: 1 вызов на каждое из 3 имён
+Режим `--probe-slots` (22.09.2026, 71u) файл не правит и демон не трогает, но ЧИТАЕТ файл окружения
+на сервере в процесс оболочки — это класс `env`, и запускает его владелец, а не headless-заход.
 Ключ `--force` пропускает вопрос при идущей на сервере задаче; `--keep-nongreen` оставляет новый
 токен, когда проба ответила `429` (лимит — не порча токена), вместо отката по умолчанию.
 
@@ -77,6 +80,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 
@@ -244,39 +248,75 @@ def plan_write(text, value, names=WRITE_NAMES):
     return True, shape["reason"], new_text, report
 
 
+def parse_envelope(text):
+    u"""Вывод CLI → конверт `--output-format json` (dict) либо None. Чистая функция.
+
+    Конверт — одна строка-объект, но чужой текст вокруг неё бывает С ОБЕИХ сторон: строки `k=v`
+    пробы слотов сверху и строка хука `SessionEnd hook … failed` СНИЗУ (живой конверт 71r,
+    `tmp/vps_token_switch/probe_neg.json`). Прежний `json.loads(text[первая скобка:])` на таком
+    хвосте падал «Extra data», и ЧИСТЫЙ конверт уходил в «иное» (правка 22.09.2026, 71u).
+    `raw_decode` берёт первый объект и хвост не читает."""
+    text = text or u""
+    dec = json.JSONDecoder()
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("{"):
+            try:
+                data, _end = dec.raw_decode(s)
+            except ValueError:
+                continue
+            if isinstance(data, dict):
+                return data
+    brace = text.find("{")
+    if brace >= 0:
+        try:
+            data, _end = dec.raw_decode(text[brace:])
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+    return None
+
+
+def status_of(data, text):
+    u"""Статус поставщика машинным полем → int | None. Чистая функция.
+
+    ИМЁН ДВА, и путать их уже стоило верного вердикта. Конверт `--output-format json` называет
+    поле `api_error_status` (живой замер 71r: `"api_error_status":401`; так же читает серверный
+    `limit_slot.envelope`), а `apiErrorStatus` — имя того же поля в ТРАНСКРИПТЕ `.jsonl`. До
+    22.09 судья читал только второе, машинного поля в живом конверте не видел вовсе и судил по
+    тексту — то есть ровно тем способом, от которого предостерегает его же шапка."""
+    if isinstance(data, dict):
+        for key in ("api_error_status", "apiErrorStatus"):
+            raw = data.get(key)
+            if isinstance(raw, bool) or raw is None:
+                continue
+            if isinstance(raw, int):
+                return raw
+            if isinstance(raw, str) and raw.strip().isdigit():
+                return int(raw.strip())
+    m = re.search(r'"(?:api_error_status|apiErrorStatus)"\s*:\s*"?(\d{3})', text or u"")
+    return int(m.group(1)) if m else None
+
+
 def verdict_of_probe(rc, out):
     u"""Ответ дешёвого вызова → (слово исхода, пояснение). Чистая функция: судит ТЕКСТ, не сеть.
 
     МАШИННОЕ ПОЛЕ СТАРШЕ ТЕКСТА, и это не вкусовщина: строка «resets Sep 27, 9am (UTC)» живёт в
     транскриптах ПК 29 раз и ни разу как собственный отказ (артефакт 71r), поэтому поиск слов по
-    тексту даёт ровно обратный вывод. Сначала `is_error`/`apiErrorStatus`, слова — только когда
+    тексту даёт ровно обратный вывод. Сначала `is_error`/`api_error_status`, слова — только когда
     машинных полей нет вовсе."""
     text = out or u""
-    data = None
-    brace = text.find("{")
-    if brace >= 0:
-        try:
-            data = json.loads(text[brace:])
-        except Exception:
-            data = None
+    data = parse_envelope(text)
     if isinstance(data, dict) and data.get("is_error") is False and rc == 0:
         return GREEN, u"поставщик ответил без ошибки (is_error=false, exit=0)"
 
-    status = None
-    if isinstance(data, dict):
-        raw = data.get("apiErrorStatus")
-        if isinstance(raw, (int, str)) and str(raw).isdigit():
-            status = int(raw)
-    if status is None:
-        m = re.search(r'"apiErrorStatus"\s*:\s*"?(\d{3})', text)
-        if m:
-            status = int(m.group(1))
+    status = status_of(data, text)
     if status == 429:
-        return LIMIT, u"вход ПРИНЯТ, но недельный лимит учётки исчерпан (apiErrorStatus=429)"
+        return LIMIT, u"вход ПРИНЯТ, но лимит учётки исчерпан (api_error_status=429)"
     if status == 401:
-        return DENIED, u"вход НЕ принят: поставщик отверг токен (apiErrorStatus=401)"
+        return DENIED, u"вход НЕ принят: поставщик отверг токен (api_error_status=401)"
     if status is not None:
-        return OTHER, u"apiErrorStatus=%d; ответ поставщика: %s" % (status, _squeeze(text))
+        return OTHER, u"api_error_status=%d; ответ поставщика: %s" % (status, _squeeze(text))
 
     low = text.lower()
     if "429" in low or "rate_limit" in low or "weekly limit" in low or "usage limit" in low:
@@ -300,6 +340,134 @@ def backup_name(path, stamp):
     u"""Имя копии РЯДОМ с боевым файлом. Копия не удаляется никогда, поэтому имя обязано быть
     уникальным само по себе — метка времени в UTC до секунды."""
     return "%s.bak-%s" % (path, stamp)
+
+
+# ─── перемер слотов (`--probe-slots`, заведён 22.09.2026, задание Штаба 0018t-71u.2209) ───
+# Вопрос «где на самом деле отказ» до 22.09 решался по ЛОГУ демона: живой ответ поставщика был
+# только у того слота, под которым демон случайно шёл, а равенство «действующее == B» — выводом
+# из строки `слот=B`. Здесь — по ОДНОМУ дешёвому вызову под каждым из трёх имён, и наружу
+# уходят только имя, «действующий ли», машинные поля конверта и текст поставщика.
+PROBE_NAMES = (NAME_ACTIVE, NAME_SLOT_A, NAME_SLOT_B)
+
+
+def probe_slot_script(target, name, model=PROBE_MODEL, claude_bin=CLAUDE_BIN, unit=UNIT):
+    u"""Программа оболочки для ОДНОГО имени входа. Уезжает в stdin `bash -s`. Чистая функция.
+
+    Каждая строка закрывает конкретный канал утечки или расхождения с демоном:
+      • `exec 2>/dev/null` ДО чтения файла: строка-обломок токена (класс 28.07, перенос при
+        вставке) исполнилась бы командой, и `bash` напечатал бы её ХВОСТ в сообщении
+        «command not found». Поток ошибок у чтения файла закрыт насовсем;
+      • сравнение `[ "$X" = "$Y" ]` — встроенная команда: значений нет ни в argv, ни в выводе,
+        наружу уходит только 1/0 (ровно как `limit_slot.active_slot` на сервере);
+      • значение попадает в `claude` ПРЕФИКСОМ-присваиванием, а не аргументом (`ps` его не видит);
+      • `env -u ANTHROPIC_API_KEY` — как у демона (`child_env.pop`), иначе платный ключ перекрыл бы
+        вход и проба мерила бы не тот канал;
+      • `cd /` + `--setting-sources project`: из корня проектных настроек нет, а пользовательские
+        не грузятся — хуки сервера (карточки, журнал) пробой не зовутся. Живой довод: проба 71r
+        на ПК дёрнула `SessionEnd`-хук (хвост `probe_neg.json`);
+      • `--no-session-persistence` — на сервере не остаётся транскрипта (временного не заводим);
+      • `</dev/null` — `claude -p` читает stdin в подсказку, а stdin здесь — сама программа;
+      • `file_mtime` и `daemon_start` — чтобы «действующий по файлу» можно было назвать входом
+        ДЕМОНА: демон держит копию окружения со старта и файл не перечитывает."""
+    if name not in PROBE_NAMES:
+        raise ValueError(u"имя %r не из трёх имён входа — в оболочку не подставляется" % (name,))
+    q = shlex.quote(target)
+    lines = [
+        "exec 2>/dev/null",
+        "cd / || exit 3",
+        "set -a; . %s || { echo loaded=0; exit 0; }; set +a" % q,
+        "echo loaded=1",
+        'if [ -z "${%s}" ]; then echo slot_filled=0; exit 0; fi' % name,
+        "echo slot_filled=1",
+        'if [ "${%s}" = "${%s}" ]; then echo is_active=1; else echo is_active=0; fi' % (name, NAME_ACTIVE),
+        "echo file_mtime=$(stat -c %%Y %s)" % q,
+        'echo daemon_start=$(date -d "$(systemctl show %s -p ExecMainStartTimestamp --value)" +%%s)' % unit,
+        ('CLAUDE_CODE_OAUTH_TOKEN="${%s}" env -u ANTHROPIC_API_KEY timeout 240 %s '
+         '-p "Reply with exactly: OK" --model %s --output-format json '
+         '--no-session-persistence --setting-sources project </dev/null 2>&1') % (name, claude_bin, model),
+        "echo probe_rc=$?",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def slot_row(name, out, channel_rc=0):
+    u"""Сырой вывод пробы одного имени → строка отчёта. Чистая функция.
+
+    `code` — статус поставщика: 200, если конверт без ошибки, иначе `api_error_status`; `None`,
+    если вызова не было (слот пуст, файл не загрузился, канал упал). Код выхода `claude` берётся
+    из `probe_rc` программы, а не у ssh: у ssh он всегда от последнего `echo`."""
+    kv = parse_kv(out)
+    row = {"name": name, "active": kv.get("is_active"), "filled": kv.get("slot_filled"),
+           "is_error": None, "code": None, "word": OTHER, "text": u"", "called": False,
+           "file_after_start": None}
+    try:
+        row["file_after_start"] = int(kv.get("file_mtime", "")) > int(kv.get("daemon_start", ""))
+    except ValueError:
+        row["file_after_start"] = None
+    if channel_rc == 255:
+        row["text"] = u"канал: %s" % _squeeze(out, 300)
+        return row
+    if kv.get("loaded") != "1":
+        row["text"] = u"файл окружения не загрузился — вызова не было"
+        return row
+    if kv.get("slot_filled") == "0":
+        row["word"], row["text"] = u"пуст", u"значения под этим именем нет — вызова не было"
+        return row
+    rc_raw = kv.get("probe_rc", "")
+    rc = int(rc_raw) if rc_raw.isdigit() else 255
+    row["called"] = True
+    data = parse_envelope(out)
+    word, why = verdict_of_probe(rc, out)
+    row["word"] = word
+    if isinstance(data, dict):
+        row["is_error"] = data.get("is_error")
+        row["text"] = _squeeze(u"%s" % data.get("result", u""), 300)
+    else:
+        row["text"] = u"конверта нет (exit=%s): %s" % (rc, _squeeze(out, 300))
+    row["code"] = 200 if word == GREEN else status_of(data, out)
+    if word == OTHER and not row["text"]:
+        row["text"] = why
+    return row
+
+
+def summarize_slots(rows):
+    u"""Строки отчёта → счёт и приговор словами. Чистая функция.
+
+    Отвечает ровно на два вопроса владельца: «действующий без лимита?» и «лимит только на
+    одном?». Имена, чьи значения побайтно равны действующему, считаются ПО ИМЕНАМ (задание
+    просит вызов на имя), но разных входов может быть меньше трёх — это называется отдельно."""
+    counts = {200: 0, 429: 0, 401: 0, "other": 0, "none": 0}
+    for r in rows:
+        if not r["called"]:
+            counts["none"] += 1
+        elif r["code"] in (200, 429, 401):
+            counts[r["code"]] += 1
+        else:
+            counts["other"] += 1
+    act = [r for r in rows if r["name"] == NAME_ACTIVE]
+    act_code = act[0]["code"] if act else None
+    same = [r["name"] for r in rows if r["name"] != NAME_ACTIVE and r["active"] == "1"]
+    lines = [u"ИТОГО по именам: 200 — %d · 429 — %d · 401 — %d · иное — %d · без вызова — %d"
+             % (counts[200], counts[429], counts[401], counts["other"], counts["none"])]
+    if act_code == 200:
+        lines.append(u"ДЕЙСТВУЮЩИЙ отвечает 200 — вход демона рабочий, лимита на нём нет.")
+    elif act_code == 429:
+        lines.append(u"ДЕЙСТВУЮЩИЙ отвечает 429 — вход принят, лимит исчерпан.")
+    elif act_code == 401:
+        lines.append(u"ДЕЙСТВУЮЩИЙ отвечает 401 — вход не принят.")
+    else:
+        lines.append(u"ДЕЙСТВУЮЩИЙ: живого статуса нет — исход НЕИЗВЕСТНО.")
+    lines.append(u"Слоты с тем же значением, что у действующего: %s"
+                 % (u", ".join(same) if same else u"нет"))
+    green = [r["name"] for r in rows if r["code"] == 200]
+    lines.append(u"Отвечают 200: %s" % (u", ".join(green) if green else u"ни одно имя"))
+    fas = [r["file_after_start"] for r in rows if r["file_after_start"] is not None]
+    if fas and not any(fas):
+        lines.append(u"Файл окружения не менялся после старта демона — «действующий» здесь = вход демона.")
+    elif any(fas):
+        lines.append(u"ВНИМАНИЕ: файл окружения изменён ПОСЛЕ старта демона — демон держит прежнее "
+                     u"значение, «действующий по файлу» ≠ вход демона до его перезапуска.")
+    return counts, lines
 
 
 # ═══════════════════ программы для сервера ═══════════════════
@@ -589,6 +757,50 @@ def probe(target):
     return word, why, out
 
 
+PROBE_WORK = os.path.join(REPO, "tmp", "vps_slots_probe")   # временное место перемера, названо заданием 71u
+
+
+def probe_slots(target, save=True):
+    u"""По ОДНОМУ дешёвому вызову под каждым именем входа. → список строк отчёта (`slot_row`).
+
+    Ровно три ssh-захода и не больше трёх вызовов поставщика: пустой слот вызова не рождает.
+    Сырой вывод каждого захода кладётся в `tmp/vps_slots_probe/` — в нём только `k=v`-признаки
+    и конверт CLI, значений входа в нём не бывает (конверт их не содержит, замер 71r), и
+    следующий заход ПК читает исход отсюда, а не со слов."""
+    stamp = time.strftime("%Y%m%d-%H%M%SZ", time.gmtime())
+    rows = []
+    for name in PROBE_NAMES:
+        rc, out = ssh_run("bash -s", stdin_text=probe_slot_script(target, name), timeout=SSH_PROBE_TIMEOUT)
+        if save:
+            os.makedirs(PROBE_WORK, exist_ok=True)
+            with io.open(os.path.join(PROBE_WORK, "%s-%s.txt" % (stamp, name)), "w",
+                         encoding="utf-8", newline="\n") as f:
+                f.write(u"ssh_rc=%s\n%s" % (rc, out))
+        rows.append(slot_row(name, out, channel_rc=rc))
+    return rows
+
+
+def run_probe_slots():
+    u"""Режим `--probe-slots`: адрес файла у юнита → три пробы → отчёт по именам и приговор."""
+    print(u"Перемер слотов: сервер %s · юнит %s · модель пробы %s" % (SRV_HOST, UNIT, PROBE_MODEL))
+    target, words = find_env_path()
+    print(u"Адрес файла окружения: %s — %s" % (target if target else u"НЕ ОПРЕДЕЛЁН", words))
+    if not target:
+        print(u"ОТКАЗ ДОКАЗАН, причина названа. Вызовов не было.")
+        return 2
+    rows = probe_slots(target)
+    for r in rows:
+        print(u"СЛОТ %-24s действующий=%-3s is_error=%-5s статус=%-4s %s · «%s»"
+              % (r["name"], {"1": u"да", "0": u"нет"}.get(r["active"], u"?"),
+                 {True: "true", False: "false"}.get(r["is_error"], "-"),
+                 r["code"] if r["code"] is not None else "-", r["word"], r["text"]))
+    _counts, lines = summarize_slots(rows)
+    for line in lines:
+        print(line)
+    print(u"Сырой вывод (без значений): %s" % PROBE_WORK)
+    return 0 if all(r["called"] or r["word"] == u"пуст" for r in rows) else 2
+
+
 def restore(target, bak):
     u"""Шаг ж: вернуть файл из копии. Копия остаётся на диске. → (ok, факты, словами)."""
     rc, fields, raw = run_remote_py(_remote_program(_RS_RESTORE, TARGET=target, BAK=bak))
@@ -735,10 +947,15 @@ def main(argv=None):
     ap.add_argument("--force", action="store_true", help=u"не спрашивать при идущем заходе на сервере")
     ap.add_argument("--keep-nongreen", action="store_true",
                     help=u"оставить новый токен, если проба ответила 429 (лимит — не порча токена)")
+    ap.add_argument("--probe-slots", action="store_true",
+                    help=u"перемер: по одному дешёвому вызову под каждым из трёх имён входа, "
+                         u"файл не правим, демон не трогаем, значения не печатаем")
     args = ap.parse_args(argv)
 
     if args.selftest:
         return selftest()
+    if args.probe_slots:
+        return run_probe_slots()
 
     print(u"Сервер: %s · юнит: %s" % (SRV_HOST, UNIT))
     print(u"Пишем в имена: %s. Слот B (%s) НЕ трогаем — исправен, вторая учётка, после 27.09 запасной."
