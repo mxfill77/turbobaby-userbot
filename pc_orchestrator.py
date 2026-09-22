@@ -57,6 +57,7 @@ import client_contour         # признак клиентского конту
 import lesson_router          # обработчик задач-уроков (родитель 292, шаг 3): классификация+маршрут; suggest тянет лениво
 import card_duty              # ДЕЖУРНЫЙ ПО КАРТОЧКАМ: чистое решение без ввода-вывода (см. _maybe_card_duty)
 import card_terminal_log      # ТЕРМИНАЛ карточки → строка журнала: чистое ядро, ни моста, ни часов (см. process_card_terminals)
+import card_ledger_pc         # СЧЁТ карточек и ответов владельца: строка на событие (см. _card_ledger)
 import decision_waits         # ОТКРЫТЫЕ РЕШЕНИЯ ВЛАДЕЛЬЦА: срок закрывает РЯД, а не ВОПРОС; чистый, ничего не применяет
 import parse_outcome          # КОНТРАКТ читателя живого текста: осмотрено/разобрано + третий исход «неразбор»
 import result_spill           # обрезка отчёта, которая НАЗЫВАЕТ СЕБЯ + тело на диск ДО реза; чистая, без сети
@@ -4590,6 +4591,9 @@ def _process_one(task, _plan_queue):
         ok, why = _card_delivery_receipt(bc.set_needs_approval(tid, result))
         log.info("NEEDS_APPROVAL id=%s", tid)
         if ok:
+            # Сюда управление приходит ТОЛЬКО через маркер гарда (`_detect_needs_approval`) —
+            # поэтому источник SRC_GUARD и есть признак операции, а не слово из карточки.
+            _card_ledger_shown(tid, card_ledger_pc.SRC_GUARD, result)
             _cowork(f"задача #{tid} → needs_approval (красное, жду «да»)")
         else:
             log.error("NEEDS_APPROVAL id=%s: расписки о доставке НЕТ (%s) — карточки у владельца "
@@ -4684,6 +4688,41 @@ def _process_one(task, _plan_queue):
 CARD_WATCH_FILE = _state(os.path.join(REPO, "pc_orchestrator.card_watch.json"))
 CARD_TERMINAL_STATUSES = ("approved", "failed")   # см. «чего не читает» выше
 
+# ═══ СЧЁТ КАРТОЧЕК И ОТВЕТОВ (22.09.2026, задание Штаба 0015g-71a.2209) ═══════════════════════
+# Строка на событие в момент события: «показана» — там, где карточку выписали и расписка моста
+# легла; «ответ» — там, где терминал наблюдён. Решение (что такое операция, как считать) — в
+# `card_ledger_pc`; здесь только руки. Сбой следа карточку не отменяет. Откат: CARD_LEDGER_OFF=1.
+CARD_LEDGER_FILE = _state(os.path.join(REPO, "pc_orchestrator.cards_ledger.jsonl"))
+
+
+def _card_ledger_shown(tid, src, card_text="", cls=None, path=None, now=None):
+    """Карточка ДОСТАВЛЕНА → строка «показана». Класс и объект гардовой карточки снимаются с
+    маркера гарда (`_card_facts`); у ревизора класс свой, объекта нет (в тексте — переписка)."""
+    if card_ledger_pc.off():
+        return
+    try:
+        obj = ""
+        if cls is None:
+            kinds, obj, _top, _card = _card_facts({"result": card_text})
+            cls = card_ledger_pc.class_of(kinds)
+        if not card_ledger_pc.append(path or CARD_LEDGER_FILE,
+                                     card_ledger_pc.shown_row(tid, cls, src, _utc_iso(now), obj)):
+            log.warning("счёт карточек: показ #%s не записан", tid)
+    except Exception as ex:
+        log.warning("счёт карточек: показ #%s не записан (%s)", tid, ex)
+
+
+def _card_ledger_answer(tid, cls, answer, src, path=None, now=None):
+    """Терминал карточки НАБЛЮДЁН → строка «ответ». Никогда не бросает."""
+    if card_ledger_pc.off():
+        return
+    try:
+        if not card_ledger_pc.append(path or CARD_LEDGER_FILE,
+                                     card_ledger_pc.answer_row(tid, cls, answer, src, _utc_iso(now))):
+            log.warning("счёт карточек: ответ #%s не записан", tid)
+    except Exception as ex:
+        log.warning("счёт карточек: ответ #%s не записан (%s)", tid, ex)
+
 
 def _card_terminal_off():
     """Ручка отката. Читается КАЖДЫЙ раз, а не на импорте: снять след надо уметь без рестарта."""
@@ -4754,7 +4793,13 @@ def process_card_terminals(path=None, now=None):
     entries = card_terminal_log.load(p)
     if not entries:
         return 0                       # открытых карточек нет → моста не трогаем вовсе
-    lines, keep, dropped = card_terminal_log.resolve(entries, _card_terminal_index(), _utc_iso(now))
+    index = _card_terminal_index()
+    lines, keep, dropped = card_terminal_log.resolve(entries, index, _utc_iso(now))
+    for e in entries:                  # те же исходы, что у строк журнала, — строкой счёта
+        outcome = card_terminal_log.classify(index.get(str(e.get("task") or "")))
+        if outcome is not None:
+            _card_ledger_answer(e.get("task"), card_ledger_pc.class_of(e.get("kinds")), outcome,
+                                card_ledger_pc.SRC_TERMINAL, now=now)
     for ln in lines:
         log.info("CARD-TERMINAL %s", ln)
         _cowork(ln)
@@ -4779,6 +4824,8 @@ def process_approved():
         if _is_revizor_owner_card(task.get("task_text")):
             # info-карточка ревизора: approve = «принято», без headless-прогона фиктивного текста
             _complete(tid, "done", "🔍 owner-находки ревизора приняты Филиппом")
+            _card_ledger_answer(tid, card_ledger_pc.CLS_REVIZOR, card_terminal_log.OUT_APPROVED,
+                                card_ledger_pc.SRC_REVIZOR_ANSWER)
             _cowork(f"ревизор: owner-карточка #{tid} принята (approve)")
             log.info("APPROVED id=%s ревизор-owner-карточка → принято", tid)
             continue
@@ -7600,6 +7647,10 @@ _ORCH_RUNTIME = ("pc_orchestrator.py", "gate_selective.py", "task_metrics.py",
                  # задачи, а то, что штаб ПРОЧТЁТ о судьбе карточки — то есть его картину занятости
                  # полосы. Модуль чистый (json/os/re/sqlite3), замыкание не растит.
                  "card_terminal_log.py",
+                 # 22.09.2026: СЧЁТ карточек и ответов владельца. Верхний импорт; цена грязи — то,
+                 # что штаб прочтёт числом о карточках. Модуль чистый (json/os + card_terminal_log
+                 # строкой выше), замыкание не растит.
+                 "card_ledger_pc.py",
                  # 22.08.2026: черновик доклада захода. Верхний импорт, и цена грязи здесь своя и
                  # высшая в этом списке: незакоммиченная правка `report_draft.py` меняет ЕДИНСТВЕННЫЙ
                  # канал, которым оборванный заход вообще способен что-то сказать. Модуль чистый
@@ -11224,6 +11275,10 @@ def _revizor_harvest_card_answers(items, now=None, path=None, reg_path=None):
             keep[tid] = rec
             out["open"] += 1
             continue
+        if outcome in (card_terminal_log.OUT_REJECTED, card_terminal_log.OUT_EXPIRED):
+            # «Разрешено» пишет process_approved в момент «принято»; здесь — отказ и истечение.
+            _card_ledger_answer(tid, card_ledger_pc.CLS_REVIZOR, outcome,
+                                card_ledger_pc.SRC_REVIZOR_ANSWER)
         if outcome != card_terminal_log.OUT_REJECTED:
             # Принято / истёк TTL / закрыто — вердикта НЕТ. Особо про TTL: «подтверждение не
             # получено» значит, что владелец не решал НИЧЕГО, и молчать за него мы не смеем.
@@ -13341,6 +13396,7 @@ def _revizor_post_owner_card(owner_findings, items, now=None):
             bc.set_needs_approval(tid, what, topic=NEEDS_APPROVAL_TOPIC))
         if not ok:
             return False, tid, why
+        _card_ledger_shown(tid, card_ledger_pc.SRC_REVIZOR, cls=card_ledger_pc.CLS_REVIZOR)
         _revizor_card_keys_add(tid, owner_findings, now=now)              # расписка: за что отвечает «нет» по этой карточке
         log.info("ревизор: owner-карточка обновлена (tid=%s, инбокс %s)", tid, NEEDS_APPROVAL_TOPIC)
         return True, tid, ""
@@ -13352,6 +13408,7 @@ def _revizor_post_owner_card(owner_findings, items, now=None):
     ok, why = _card_delivery_receipt(bc.set_needs_approval(tid, what, topic=NEEDS_APPROVAL_TOPIC))
     if not ok:
         return False, tid, why
+    _card_ledger_shown(tid, card_ledger_pc.SRC_REVIZOR, cls=card_ledger_pc.CLS_REVIZOR)
     _revizor_card_keys_add(tid, owner_findings, now=now)                  # расписка пишется ПОСЛЕ доставки: обещать погашение недоставленного нельзя
     log.info("ревизор: owner-карточка создана (tid=%s, инбокс %s)", tid, NEEDS_APPROVAL_TOPIC)
     return True, tid, ""
