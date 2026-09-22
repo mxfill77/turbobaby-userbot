@@ -5768,7 +5768,21 @@ def card_from_decision(reason):
     return parts[-1]
 
 
-def _push(card):
+# Ключ отправителя для СЧЁТА ПУШЕЙ (22.09.2026, 0015i-71c): гард — место события родов 🔴/⛔,
+# и признак «за пушем стоит перехваченная операция» уходит отсюда СТРУКТУРОЙ argv, а не словом
+# в тексте карточки. dispatch_notify по этому ключу пишет строку реестра после доставки.
+# Та же строка, что dispatch_notify.GUARD_PUSH_FLAG / card_ledger_pc.GUARD_PUSH_FLAG (сверяет тест).
+GUARD_PUSH_FLAG = "--guard-push"
+
+
+def guard_push_argv(card, kind=""):
+    """argv отправителя пуша гарда: `--guard-push <red|top> <класс|-> <текст>`. Род — из
+    `is_top_tier(kind)`, то есть из класса, который гард САМ определил, а не из текста."""
+    return [VENV_PY, DNOTIFY, GUARD_PUSH_FLAG, "top" if is_top_tier(kind) else "red",
+            (kind or "").strip() or "-", card]
+
+
+def _push(card, kind=""):
     """КАНАЛ 1 к владельцу. Глушение живёт ВНУТРИ отправителя, а не на месте вызова: так
     «гард решил отправить карточку» и «карточка ушла» остаются РАЗНЫМИ событиями — первое видно
     тесту, второе физически не происходит. Прежняя развилка на месте вызова означала бы, что в
@@ -5789,7 +5803,7 @@ def _push(card):
         return None
     try:
         subprocess.Popen(
-            [VENV_PY, DNOTIFY, card],
+            guard_push_argv(card, kind),
             cwd=PROJECT,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
         )
@@ -5933,7 +5947,7 @@ def _emit_ask(card, kind=""):
         # блока в маркере, звала бы владельца решать по тому, чего в подтверждаемой карточке нет.
         latched = not _write_marker(mk, card, kind)   # канал 2 (развод боя и пробы — внутри писателя)
     if not latched:
-        _push(card)                       # канал 1 (глушение пробы — внутри отправителя)
+        _push(card, kind)                 # канал 1 (глушение пробы — внутри отправителя)
     # ТЕКСТ РЕШЕНИЯ читает ИСПОЛНИТЕЛЬ, а не владелец: в пробе показываем перехват на границе
     # (дословную карточку, которая собиралась уйти), в бою — саму карточку, как было. При латче —
     # прямую команду остановиться: исполнителю нужно знать, что второй карточки не будет.

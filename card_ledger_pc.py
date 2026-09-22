@@ -33,6 +33,8 @@
 
 import json
 import os
+import re as _re
+from datetime import datetime as _dt
 
 import card_terminal_log
 
@@ -155,13 +157,227 @@ def classes_without_op(rows):
     return sorted(c for c, s in tally(rows).items() if s["cards"] > 0 and s["op"] == 0)
 
 
-if __name__ == "__main__":        # только чтение: счёт по файлу, путь — первым аргументом
-    import sys
-    p = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "pc_orchestrator.cards_ledger.jsonl")
+# ══ ПУШИ БЕЗ КНОПКИ (22.09.2026, задание Штаба 0015i-71c.2209) ═══════════════════════════════
+# Замер 71a: кнопочных карточек за 16.08–22.09 — 22, а мимо счёта с 05.09 ушло 525 `🔴`, 59 `⛔` и
+# 169 `🔔`. Это три РОДА сообщений без кнопки, и у них ДВА места события:
+#   • `🔴`/`⛔` — `pretool_guard._emit_ask` → `_push`: гард ПЕРЕХВАТИЛ настоящий вызов инструмента
+#     и выписал карточку; `⛔` — тот же путь для класса высшей цены (`is_top_tier`). Гард зовёт
+#     отправителя ЯВНЫМ КЛЮЧОМ `--guard-push <род> <класс>` — это и есть признак из места события;
+#   • `🔔` — хук `Notification` Claude Code (`dispatch_notify --hook notification`): сессия ждёт
+#     разрешения. В payload хука есть только ТЕКСТ («Claude needs your permission to use Bash»),
+#     решения гарда хук не видит, класса операции не знает. ПРИЗНАКОМ ЭТОТ РОД НЕ НАДЕЛЯЕТСЯ:
+#     `op=None` («в месте события признака нет»), а не False и не True.
+# Строка пишется ПОСЛЕ доставки (Telegram вернул message_id): событие — «сообщение ушло», а не
+# «собирались отправить». Текста сообщения в строке нет — только род, класс, источник, канал и
+# номер сообщения; по номеру строка СВЕРЯЕМА с журналом доставки (`reconcile`).
+EV_PUSH = "пуш"
+
+ROD_GUARD = "гард-карточка"        # 🔴
+ROD_GUARD_TOP = "гард-высшая"      # ⛔ ВЫСШАЯ ЦЕНА
+ROD_WAIT = "хук-ожидания"          # 🔔 Dispatch ждёт твоего разрешения
+PUSH_RODS = (ROD_GUARD, ROD_GUARD_TOP, ROD_WAIT)
+
+SRC_GUARD_PUSH = "гард-пуш"        # dispatch_notify --guard-push (зовёт ТОЛЬКО pretool_guard._push)
+SRC_WAIT_HOOK = "хук-notification" # dispatch_notify --hook notification
+_PUSH_OP_SOURCES = frozenset((SRC_GUARD_PUSH,))
+_PUSH_NO_SIGN_SOURCES = frozenset((SRC_WAIT_HOOK,))
+
+GUARD_PUSH_FLAG = "--guard-push"   # ключ отправителя; гард и dispatch_notify берут ОДНУ константу
+
+
+def push_row(rod, src, cls, channel, mid, now_iso):
+    """Строка «пуш без кнопки ушёл». Параметра `op` НЕТ: признак выводится из источника.
+    SRC_GUARD_PUSH → True (гард перехватил вызов); SRC_WAIT_HOOK → None (признака в месте события
+    нет); любой другой источник → None (не знаем — не наделяем)."""
+    s = str(src or "")
+    op = True if s in _PUSH_OP_SOURCES else None
+    return {"ts": str(now_iso or ""), "event": EV_PUSH, "rod": str(rod or ""),
+            "class": str(cls or CLS_UNNAMED), "op": op, "src": s,
+            "channel": str(channel or ""), "mid": str(mid or "")}
+
+
+def push_tally(rows):
+    """ЧИСТЫЙ счёт пушей по родам → {род: {pushes, op_true, op_none, classes: {класс: n}}}."""
+    t = {}
+    for r in rows or ():
+        if r.get("event") != EV_PUSH:
+            continue
+        s = t.setdefault(str(r.get("rod") or ""), {"pushes": 0, "op_true": 0, "op_none": 0,
+                                                   "classes": {}})
+        s["pushes"] += 1
+        if r.get("op") is True:
+            s["op_true"] += 1
+        elif r.get("op") is None:
+            s["op_none"] += 1
+        c = str(r.get("class") or CLS_UNNAMED)
+        s["classes"][c] = s["classes"].get(c, 0) + 1
+    return t
+
+
+# ── ЖУРНАЛ ДОСТАВКИ (`dispatch_notify.log`) → записи. Нужен ДВУМ приборам: сверке и парам. ──────
+# Род строки журнала здесь определяется для АУДИТА (какие сообщения ушли), а не для признака
+# операции: `op` из журнала не выводится нигде. Формат строки — `arch_text` отправителя:
+# `ГГГГ-ММ-ДД ЧЧ:ММ:СС,мс | итог[(ветка)]: channel=… ok=… mid=… | <текст>` (местное время).
+_RE_ITOG = _re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \| итог(\([^)]*\))?: "
+                       r"channel=(\S+) ok=(\S+) mid=(\S+) \| (.*)$")
+_RE_CMD = _re.compile(r"Команда: (?:(?:Bash|PowerShell|Write|Edit|NotebookEdit|Read): )?(.*?)(?: ⏎ |$)")
+
+
+def parse_itog(line):
+    """Строка журнала доставки → dict | None (не строка итога / без mid)."""
+    m = _RE_ITOG.match(str(line or "").rstrip("\r\n"))
+    if not m:
+        return None
+    ts, branch, channel, ok, mid, text = m.groups()
+    return {"ts": ts, "branch": (branch or "")[1:-1], "channel": channel,
+            "ok": ok == "True", "mid": mid, "text": text}
+
+
+def rod_of_itog(rec):
+    """Род отправленного сообщения по записи журнала → ROD_* | None (не наш род)."""
+    t, b = rec.get("text") or "", rec.get("branch") or ""
+    if b == "notification" and t.startswith("🔔"):
+        return ROD_WAIT
+    if b not in ("", SRC_GUARD_PUSH):
+        return None                       # ветки с кнопкой / тема / критич — чужие роды
+    if t.startswith("🔴"):
+        return ROD_GUARD
+    if t.startswith("⛔") and "ВЫСШАЯ ЦЕНА" in t:
+        return ROD_GUARD_TOP
+    return None
+
+
+def sent_pushes(lines, since=""):
+    """Записи журнала: ушедшие (ok=True, есть номер) сообщения трёх родов, не раньше `since`."""
+    out = []
+    for ln in lines or ():
+        rec = parse_itog(ln)
+        if not rec or not rec["ok"] or not rec["mid"].isdigit():
+            continue
+        if since and rec["ts"] < since:
+            continue
+        rod = rod_of_itog(rec)
+        if rod:
+            rec["rod"] = rod
+            out.append(rec)
+    return out
+
+
+def reconcile(lines, rows, since):
+    """СВЕРКА «ушло ⇔ записано» по номеру сообщения → dict(verdict, sent, registered, missing).
+
+    verdict: «СВЕРЕНО» — каждому ушедшему пушу трёх родов есть строка реестра с тем же
+    (канал, номер); «ОТКАЗ» — хоть одному нет; «НЕИЗВЕСТНО» — сверять нечего (ноль ушедших:
+    это не успех). `since` обязателен — окно начинается с применения, а не «когда-нибудь»."""
+    if not since:
+        return {"verdict": "НЕИЗВЕСТНО", "why": "окно не названо", "sent": 0, "registered": 0,
+                "missing": []}
+    have = {(str(r.get("channel") or ""), str(r.get("mid") or ""))
+            for r in rows or () if r.get("event") == EV_PUSH}
+    sent = sent_pushes(lines, since)
+    missing = [(p["ts"], p["rod"], p["channel"], p["mid"]) for p in sent
+               if (p["channel"], p["mid"]) not in have]
+    if not sent:
+        verdict = "НЕИЗВЕСТНО"
+    else:
+        verdict = "ОТКАЗ" if missing else "СВЕРЕНО"
+    return {"verdict": verdict, "why": "", "sent": len(sent), "registered": len(sent) - len(missing),
+            "missing": missing}
+
+
+def _cmd_key(text, n=40):
+    m = _RE_CMD.search(text or "")
+    return "".join((m.group(1) if m else "").split())[:n]
+
+
+def pair_waits(lines, since="", until="", window_s=60):
+    """ДУБЛЬ ЧИСЛОМ: каждому ушедшему `🔔` ищется ушедший `🔴`/`⛔` ±window_s (пара один к одному).
+
+    → dict(total, proven, time_only, none). proven — пара по времени И тот же повод (ключ
+    команды: первые 40 непробельных знаков команды совпали); time_only — пара по времени, повод
+    НЕ сверен (команда другая или её нет) — это НЕИЗВЕСТНО, а не дубль; none — пары нет, тоже
+    НЕИЗВЕСТНО, а не «не дубль». Знаменатель — total."""
+    recs = [p for p in sent_pushes(lines, since) if not until or p["ts"] < until]
+    t = lambda p: _dt.strptime(p["ts"], "%Y-%m-%d %H:%M:%S")
+    guards = [p for p in recs if p["rod"] in (ROD_GUARD, ROD_GUARD_TOP)]
+    used = set()
+    out = {"total": 0, "proven": 0, "time_only": 0, "none": 0}
+    for w in (p for p in recs if p["rod"] == ROD_WAIT):
+        out["total"] += 1
+        tw, kw = t(w), _cmd_key(w["text"])
+        best = None
+        for i, g in enumerate(guards):
+            if i in used:
+                continue
+            d = abs((tw - t(g)).total_seconds())
+            if d <= window_s and (best is None or d < best[0]):
+                best = (d, i, g)
+        if best is None:
+            out["none"] += 1
+            continue
+        used.add(best[1])
+        kg = _cmd_key(best[2]["text"])
+        if kw and kg and (kw.startswith(kg) or kg.startswith(kw)):
+            out["proven"] += 1
+        else:
+            out["time_only"] += 1
+    return out
+
+
+def default_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "pc_orchestrator.cards_ledger.jsonl")
+
+
+def _read_lines(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()
+    except Exception:
+        return []
+
+
+def main(argv):
+    """Только чтение. Без ключей — счёт карточек и пушей по реестру.
+    `--reconcile <с какого местного времени> [журнал] [реестр]` → код 0 СВЕРЕНО / 1 ОТКАЗ / 2 НЕИЗВЕСТНО.
+    `--pairs <с> <до> [журнал]` — пары `🔔`↔`🔴`/`⛔` за окно."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    log_p = os.path.join(here, "dispatch_notify.log")
+    if argv and argv[0] == "--reconcile":
+        since = argv[1] if len(argv) > 1 else ""
+        lp = argv[2] if len(argv) > 2 else log_p
+        rp = argv[3] if len(argv) > 3 else default_path()
+        r = reconcile(_read_lines(lp), load(rp), since)
+        print("сверка с %s: %s · ушло %d · записано %d · без строки %d"
+              % (since or "—", r["verdict"], r["sent"], r["registered"], len(r["missing"])))
+        for ts, rod, ch, mid in r["missing"][:20]:
+            print("  нет строки: %s %s %s mid=%s" % (ts, rod, ch, mid))
+        return {"СВЕРЕНО": 0, "ОТКАЗ": 1}.get(r["verdict"], 2)
+    if argv and argv[0] == "--pairs":
+        since = argv[1] if len(argv) > 1 else ""
+        until = argv[2] if len(argv) > 2 else ""
+        lp = argv[3] if len(argv) > 3 else log_p
+        lines = _read_lines(lp)
+        sp = [p for p in sent_pushes(lines, since) if not until or p["ts"] < until]
+        per = {}
+        for p in sp:
+            per[p["rod"]] = per.get(p["rod"], 0) + 1
+        print("окно %s … %s (местное) · ушло по родам: %s" % (since, until or "конец", per))
+        print("пары 🔔: %s" % pair_waits(lines, since, until))
+        return 0
+    p = argv[0] if argv else default_path()
     rs = load(p)
     print("строк: %d · файл: %s" % (len(rs), p))
     for c, s in sorted(tally(rs).items()):
         print("%-24s карточек %d · показов %d · с операцией %d · ответов %d · без ответа %d · %s"
               % (c, s["cards"], s["shown"], s["op"], s["answered"], s["unanswered"], s["answers"]))
     print("классы без операций:", ", ".join(classes_without_op(rs)) or "нет")
+    for rod, s in sorted(push_tally(rs).items()):
+        print("пуш %-16s %d · признак да %d · признака нет %d · %s"
+              % (rod, s["pushes"], s["op_true"], s["op_none"], s["classes"]))
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main(sys.argv[1:]))

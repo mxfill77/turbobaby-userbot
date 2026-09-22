@@ -1051,6 +1051,55 @@ def _write_session_metrics(line):
         return False
 
 
+# ─── СЧЁТ ПУШЕЙ БЕЗ КНОПКИ (22.09.2026, задание Штаба 0015i-71c.2209) ──────────────────────────
+# Три рода сообщений без кнопки уходили владельцу мимо реестра карточек (замер 71a: с 05.09 —
+# 525 `🔴`, 59 `⛔`, 169 `🔔`). Строку в реестр пишет ЭТОТ процесс и ТОЛЬКО после доставки: номер
+# сообщения есть лишь тогда, когда Telegram его вернул, и по нему строка сверяется с журналом
+# доставки (`card_ledger_pc.reconcile`). Признак операции сюда приходит НЕ из текста: для
+# `🔴`/`⛔` — из ключа `--guard-push`, которым зовёт ТОЛЬКО гард в момент перехвата
+# (`pretool_guard._push`); для `🔔` признака в месте события нет, и строка его не несёт.
+# Боевой путь и проверка различаются в коде: без `path` строка ложится в боевой реестр ТОЛЬКО
+# при боевой точке входа (замок 1, `live_send_verdict`); проверка пишет в названный ей путь.
+# Импорт под подавлением: сломанный счёт не смеет уронить доставку.
+GUARD_PUSH_FLAG = "--guard-push"   # та же строка, что card_ledger_pc.GUARD_PUSH_FLAG (сверяет тест)
+LEDGER_FILE = os.path.join(HERE, "pc_orchestrator.cards_ledger.jsonl")
+try:
+    import card_ledger_pc
+except Exception:                     # noqa: BLE001
+    card_ledger_pc = None
+
+
+def _ledger_push(branch, rod_key, cls, channel, ok, path=None):
+    """Строка «пуш ушёл» в реестр → True (легла) | False (не пишем / не легла). Никогда не бросает.
+
+    branch — КТО зовёт (ветка main): "guard" = `--guard-push`, "wait" = `--hook notification`;
+    rod_key — от гарда: "red" (🔴) | "top" (⛔ высшая цена). Источник и признак выводит
+    `card_ledger_pc.push_row` из branch, а не из текста сообщения."""
+    try:
+        cl = card_ledger_pc
+        if cl is None or cl.off() or not ok:
+            return False
+        mid = last_send_id()
+        if mid == "-":
+            return False                  # номера нет — сообщения нет, строки тоже
+        if path is None:
+            if not live_send_verdict()[0]:
+                return False              # проба/тест: в боевой реестр не пишем НИКОГДА
+            path = LEDGER_FILE
+        if branch == "guard":
+            src = cl.SRC_GUARD_PUSH
+            rod = {"red": cl.ROD_GUARD, "top": cl.ROD_GUARD_TOP}.get(rod_key, "неизвестный")
+        elif branch == "wait":
+            src, rod = cl.SRC_WAIT_HOOK, cl.ROD_WAIT
+        else:
+            return False
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        c = "" if cls in (None, "", "-") else cls
+        return cl.append(path, cl.push_row(rod, src, c, channel, mid, now))
+    except Exception:                     # noqa: BLE001
+        return False
+
+
 def _read_stdin_json():
     # BOM/пробелы срезаем ЯВНО: живой stdin хука приходит чистым, но любой перенаправляющий
     # слой (PowerShell-пайп) ставит ﻿ впереди — strip() его НЕ убирает, и полезная
@@ -1132,6 +1181,18 @@ def main():
                       f"| {arch_text(text)}")
             print(f"channel={channel} ok={int(bool(ok))}")
             sys.exit(0)
+        if args and args[0] == GUARD_PUSH_FLAG:
+            # ПУШ ГАРДА (роды 🔴/⛔): `--guard-push <red|top> <класс> <текст>`. Зовёт ТОЛЬКО
+            # `pretool_guard._push` в момент перехвата настоящего вызова — поэтому строка реестра
+            # несёт признак операции. Адрес по-прежнему выбирает deliver (ничего не меняется).
+            rod_key = args[1] if len(args) > 1 else ""
+            cls = args[2] if len(args) > 2 else ""
+            text = " ".join(args[3:]).strip() or "🔴 Гард: карточка"
+            channel, ok = deliver(text)
+            _log.info(f"итог(гард-пуш): channel={channel} ok={ok} mid={last_send_id()} "
+                      f"| {arch_text(text)}")
+            _ledger_push("guard", rod_key, cls, channel, ok)
+            sys.exit(0)
         if args and args[0] == "--card":
             # карточка управления цепью дирижёра: текст + кнопки [⏹ Стоп цепи][📊 Статус цепи].
             # Кнопка = место для ответа, значит инбокс (ЗАМОК-1 в deliver): раньше такая карточка
@@ -1202,6 +1263,7 @@ def main():
                 channel, ok = deliver(text)
                 _log.info(f"итог(notification): channel={channel} ok={ok} "
                           f"mid={last_send_id()} | {arch_text(text)}")
+                _ledger_push("wait", "", "", channel, ok)   # род 🔔: признака в месте события нет
                 sys.exit(0)
         elif args:
             text = " ".join(args).strip()
