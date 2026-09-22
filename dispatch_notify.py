@@ -1215,6 +1215,21 @@ def main():
                       f"mid={last_send_id()} | {arch_text(text)}")
             print(f"channel={channel} ok={int(bool(ok))}")
             sys.exit(0)
+        if args and args[0] == "--pachka-card":
+            # СУТОЧНЫЙ СПИСОК НАХОДОК РЕВИЗОРА (22.09.2026): текст и готовые кнопки — из файла, который
+            # положил демон (`_revizor_pachka_send_live`); под каждой строкой кнопка ❌N, её ловит
+            # pc_agent. Кнопка включает ЗАМОК-1 — список ложится в инбокс, адрес решает deliver.
+            # Клавиатуру собирает демон, а не этот модуль: импорт `revizor_pachka` отсюда втянул бы
+            # его в клиентское замыкание (dispatch_notify в нём живёт), а ему там делать нечего.
+            with open(args[1] if len(args) > 1 else "", encoding="utf-8") as f:
+                pl = json.load(f)
+            text = str(pl.get("text") or "").strip() or "🔍 Ревизор: суточный список"
+            kb = pl.get("markup")
+            channel, ok = deliver(text, kb if isinstance(kb, dict) and kb.get("inline_keyboard") else None)
+            _log.info(f"итог(суточный список ревизора): channel={channel} ok={ok} "
+                      f"mid={last_send_id()} | {arch_text(text)}")
+            print(f"channel={channel} ok={int(bool(ok))}")
+            sys.exit(0)
         if args and args[0] == "--hook":
             kind = args[1] if len(args) > 1 else ""
             # Диагностика бюджета размышления: хук — РЕБЁНОК сессии, значит видит её env. Строка

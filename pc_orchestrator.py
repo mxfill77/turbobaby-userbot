@@ -58,6 +58,7 @@ import lesson_router          # обработчик задач-уроков (р
 import card_duty              # ДЕЖУРНЫЙ ПО КАРТОЧКАМ: чистое решение без ввода-вывода (см. _maybe_card_duty)
 import card_terminal_log      # ТЕРМИНАЛ карточки → строка журнала: чистое ядро, ни моста, ни часов (см. process_card_terminals)
 import card_ledger_pc         # СЧЁТ карточек и ответов владельца: строка на событие (см. _card_ledger)
+import revizor_pachka         # СУТОЧНЫЙ СПИСОК находок ревизора с отбраковкой построчно; чистый, без ввода-вывода
 import decision_waits         # ОТКРЫТЫЕ РЕШЕНИЯ ВЛАДЕЛЬЦА: срок закрывает РЯД, а не ВОПРОС; чистый, ничего не применяет
 import parse_outcome          # КОНТРАКТ читателя живого текста: осмотрено/разобрано + третий исход «неразбор»
 import result_spill           # обрезка отчёта, которая НАЗЫВАЕТ СЕБЯ + тело на диск ДО реза; чистая, без сети
@@ -7651,6 +7652,10 @@ _ORCH_RUNTIME = ("pc_orchestrator.py", "gate_selective.py", "task_metrics.py",
                  # что штаб прочтёт числом о карточках. Модуль чистый (json/os + card_terminal_log
                  # строкой выше), замыкание не растит.
                  "card_ledger_pc.py",
+                 # 22.09.2026: суточный список находок ревизора. Верхний импорт; цена грязи — какие
+                 # находки владелец увидит строкой списка, а какие карточкой. Модуль чистый
+                 # (datetime/hashlib), замыкание не растит.
+                 "revizor_pachka.py",
                  # 22.08.2026: черновик доклада захода. Верхний импорт, и цена грязи здесь своя и
                  # высшая в этом списке: незакоммиченная правка `report_draft.py` меняет ЕДИНСТВЕННЫЙ
                  # канал, которым оборванный заход вообще способен что-то сказать. Модуль чистый
@@ -13101,6 +13106,7 @@ def _revizor_demote_deploy_task(f):
     if not (str(g.get("evidence") or "").strip()):
         g["evidence"] = str(f.get("task_text") or "").strip()[:_REVIZOR_EVIDENCE_MAX]
     g["task_text"] = ""
+    g["op_src"] = revizor_pachka.OP_DEPLOY      # признак операции — ЗДЕСЬ, в месте решения (в список не склеится)
     return g
 
 
@@ -13145,6 +13151,7 @@ def _revizor_demote_client_task(f, hits, determinate):
     # (заморозка контура) решение принимается по нему: судить «клиентская ли это находка» по тексту
     # «[клиентский контур…]» значило бы судить по подстроке — правило 5 свода среды прямо запрещает.
     g["gate"] = REVIZOR_GATE_CLIENT
+    g["op_src"] = revizor_pachka.OP_CLIENT      # признак операции — ЗДЕСЬ, в месте решения (в список не склеится)
     return g
 
 
@@ -13414,6 +13421,171 @@ def _revizor_post_owner_card(owner_findings, items, now=None):
     return True, tid, ""
 
 
+# ---------- РЕВИЗОР: СУТОЧНЫЙ СПИСОК С ОТБРАКОВКОЙ ПОСТРОЧНО (22.09.2026, задание 71d) ----------
+# Находки с НУЛЕВЫМ признаком операции больше не едут owner-карточкой поштучно: они копятся в
+# ожидании (REVIZOR_PACHKA_FILE) и раз в сутки приходят ОДНИМ списком, у каждой строки кнопка ❌.
+# Нажатие пишет ТОТ ЖЕ вердикт «ложная» в ТОТ ЖЕ реестр, ТЕМ ЖЕ ключом и существом и с тем же
+# источником (REVIZOR_SRC_OWNER), что жатва «нет» по карточке; разница одна — основание (`why`)
+# называет строку списка вместо номера карточки. Логика — в чистом `revizor_pachka`, здесь только
+# файлы, часы, реестр и дверь наружу. Откат: REVIZOR_PACHKA_OFF=1 — показ снова поштучный.
+REVIZOR_PACHKA_FILE = _state(os.path.join(REPO, "pc_orchestrator.revizor_pachka.json"))     # ожидание + след списков
+REVIZOR_PACHKA_FULL = _state(os.path.join(REPO, "tmp", "revizor_pachka_full.txt"))          # полный текст последнего списка
+REVIZOR_PACHKA_PAYLOAD = _state(os.path.join(REPO, "pc_orchestrator.revizor_pachka_send.json"))  # текст+метки для отправителя
+REVIZOR_PACHKA_HOUR = int(os.getenv("REVIZOR_PACHKA_HOUR", str(revizor_pachka.DEFAULT_HOUR))
+                          or revizor_pachka.DEFAULT_HOUR)
+REVIZOR_PACHKA_TZ = float(os.getenv("REVIZOR_PACHKA_TZ", str(revizor_pachka.DEFAULT_TZ_HOURS))
+                          or revizor_pachka.DEFAULT_TZ_HOURS)
+REVIZOR_PACHKA_WINDOW = int(os.getenv("REVIZOR_PACHKA_WINDOW", str(revizor_pachka.DEFAULT_WINDOW_LINES))
+                            or revizor_pachka.DEFAULT_WINDOW_LINES)
+REVIZOR_PACHKA_SRC_WHY = "отказ владельца в суточном списке ревизора, строка"
+
+
+def _revizor_pachka_on():
+    """Суточный список включён? Дефолт — ДА (решение владельца 22.09); REVIZOR_PACHKA_OFF=1 — откат."""
+    return (os.environ.get("REVIZOR_PACHKA_OFF") or "").strip() not in ("1", "true", "yes")
+
+
+def _revizor_pachka_read(path=None):
+    """Ожидание с диска. Файла нет → пусто (норма); файл битый → None (читать не смогли — и это
+    НЕ «ожидать нечего»: зовущий обязан не писать поверх, иначе затёр бы висящие строки)."""
+    p = REVIZOR_PACHKA_FILE if path is None else path
+    if not os.path.exists(p):
+        return revizor_pachka.empty_store()
+    try:
+        with open(p, encoding="utf-8") as f:
+            return revizor_pachka.norm_store(json.load(f))
+    except Exception as e:
+        log.warning("ревизор: суточный список (%s) НЕ прочитан: %s", p, e)
+        return None
+
+
+def _revizor_pachka_save(store, path=None):
+    p = REVIZOR_PACHKA_FILE if path is None else path
+    try:
+        tmp = str(p) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, p)
+        return True
+    except Exception as e:
+        log.warning("ревизор: суточный список не записан (%s): %s", p, e)
+        return False
+
+
+def _revizor_pachka_collect(findings, now=None, path=None):
+    """Находки → в ожидание суточного списка. → сколько добавлено | None (записать не смогли —
+    зовущий возвращает их в карточку: показ остаётся прежним, находка не теряется)."""
+    st = _revizor_pachka_read(path)
+    if st is None:
+        return None
+    now = time.time() if now is None else now
+    iso = datetime.datetime.fromtimestamp(float(now), datetime.timezone.utc).isoformat()
+    n = revizor_pachka.add(st, findings, _revizor_verdict_key, _revizor_finding_gist, iso)
+    if not _revizor_pachka_save(st, path):
+        return None
+    log.info("ревизор: %d находок → суточный список (новых строк %d, ждут всего %d)",
+             len(findings), n, len(st["lines"]))
+    return n
+
+
+def _revizor_pachka_decided(reg):
+    """Предикат «по строке вердикт «ложная» с ТЕМ ЖЕ существом уже стоит» для чистого модуля."""
+    def decided(key, gist):
+        rec = reg.get(key) if isinstance(reg, dict) else None
+        return (isinstance(rec, dict) and _revizor_text(rec.get("verdict")) == REVIZOR_VERDICT_FALSE
+                and _revizor_text(rec.get("gist")) == gist)
+    return decided
+
+
+def _revizor_pachka_send_live(text, marks):
+    """БОЕВАЯ отправка списка: payload на диск + dispatch_notify --pachka-card через ЕДИНСТВЕННУЮ
+    дверь демона наружу (`_dnotify_spawn`, замок пробы на ней). Тесты зовут `maybe_revizor_pachka`
+    со СВОИМ `sender` — этой функции они не касаются ни одной веткой."""
+    with open(REVIZOR_PACHKA_PAYLOAD, "w", encoding="utf-8") as f:
+        json.dump({"text": text, "marks": list(marks), "markup": revizor_pachka.markup(marks)}, f,
+                  ensure_ascii=False)
+    return _dnotify_spawn(["--pachka-card", REVIZOR_PACHKA_PAYLOAD], "суточный список ревизора")
+
+
+def maybe_revizor_pachka(now=None, path=None, full_path=None, reg_path=None, sender=None):
+    """Раз в местные сутки (REVIZOR_PACHKA_HOUR по Пхукету) — список ожидающих находок владельцу.
+    → dict-сводка | None (слать не пора / выключено). Строки показом НЕ снимаются: уходят только
+    отбраковкой. `sender(text, marks) -> bool` — инъекция; по умолчанию боевая дверь."""
+    if not _revizor_pachka_on():
+        return None
+    st = _revizor_pachka_read(path)
+    if st is None:
+        return None
+    now = time.time() if now is None else now
+    gone = revizor_pachka.drop_decided(st, _revizor_pachka_decided(_revizor_verdicts_read(reg_path)))
+    ok_due, why = revizor_pachka.due(st, now, REVIZOR_PACHKA_HOUR, REVIZOR_PACHKA_TZ)
+    if not ok_due:
+        if gone:
+            _revizor_pachka_save(st, path)
+        return None
+    fp = REVIZOR_PACHKA_FULL if full_path is None else full_path
+    r = revizor_pachka.render(st, fp, REVIZOR_PACHKA_WINDOW)
+    try:
+        os.makedirs(os.path.dirname(fp) or ".", exist_ok=True)
+        with open(fp, "w", encoding="utf-8") as f:
+            f.write(r["full"] + "\n")
+    except Exception as e:
+        log.warning("ревизор: полный текст списка не записан (%s): %s", fp, e)
+    try:
+        sent = (sender or _revizor_pachka_send_live)(r["text"], r["marks"])
+    except Exception as e:                    # noqa: BLE001 — сбой двери не роняет виток
+        log.warning("ревизор: отправка суточного списка упала (%s: %s)", type(e).__name__, e)
+        sent = False
+    day, _h = revizor_pachka.local_day(now, REVIZOR_PACHKA_TZ)
+    iso = datetime.datetime.fromtimestamp(float(now), datetime.timezone.utc).isoformat()
+    if not sent:
+        # Сутки помечаем попыткой, а показов строкам НЕ добавляем: новые остаются новыми и придут
+        # завтра; повтор каждую минуту витка был бы флудом двери, которая только что отказала.
+        st["last_list"] = {"day": day, "at": float(now), "iso": iso, "shown": 0, "failed": True}
+        _revizor_pachka_save(st, path)
+        log.warning("ревизор: суточный список НЕ отправлен (%s) — %d строк ждут следующих суток",
+                    why, len(st["lines"]))
+        _cowork(f"ревизор: ⚠️ суточный список НЕ отправлен — {len(st['lines'])} строк ждут следующих "
+                f"суток (строки не сняты)")
+        return {"sent": False, **{k: r[k] for k in ("shown", "hidden", "new", "carried")}}
+    revizor_pachka.mark_shown(st, r["marks"], now, iso, day)
+    _revizor_pachka_save(st, path)
+    _cowork(f"ревизор: суточный список владельцу — {r['shown']} строк с кнопкой (новых {r['new']}, "
+            f"перенесено {r['carried']}, не показано {r['hidden']}; снято вердиктом до показа {gone}); "
+            f"повод: {why}")
+    return {"sent": True, **{k: r[k] for k in ("shown", "hidden", "new", "carried")}, "dropped": gone}
+
+
+def revizor_pachka_reject(mark, now=None, path=None, reg_path=None):
+    """Нажатие ❌ в суточном списке → (ok, текст). Вердикт — `revizor_set_verdict` с источником
+    REVIZOR_SRC_OWNER (как у жатвы «нет» карточки); успех — только по обратному чтению реестра."""
+    st = _revizor_pachka_read(path)
+    if st is None:
+        return False, "⛔ ОТКАЗ: суточный список на диске не читается — вердикт НЕ записан (легло 0 из 1)"
+    now = time.time() if now is None else now
+    iso = datetime.datetime.fromtimestamp(float(now), datetime.timezone.utc).isoformat()
+
+    def write(key, gist):
+        ok, _k, msg = revizor_set_verdict(key, REVIZOR_VERDICT_FALSE, gist=gist, now=now, path=reg_path,
+                                          source=REVIZOR_SRC_OWNER,
+                                          why=f"{REVIZOR_PACHKA_SRC_WHY} {mark}")
+        return ok, msg
+
+    def read(key):
+        rec = _revizor_verdicts_read(reg_path).get(key)
+        if not isinstance(rec, dict):
+            return "", ""
+        return _revizor_text(rec.get("verdict")), _revizor_text(rec.get("gist"))
+
+    ok, text = revizor_pachka.reject(st, mark, write, read, iso)
+    if ok and not _revizor_pachka_save(st, path):
+        # Вердикт лёг — это главное, и находка больше не придёт (её глушит реестр). Строка в списке
+        # снимется сама на следующем показе (`drop_decided`), поэтому успех не отменяем, а называем.
+        text += " (след списка не обновлён — строка снимется вердиктом при следующем показе)"
+    log.info("ревизор: отбраковка из списка, метка %s → %s", mark, "ок" if ok else "ОТКАЗ")
+    return ok, text
+
+
 # ---------- РЕВИЗОР: ПОСТ-РЕЛИЗНАЯ СВЕРКА ЖИВЫХ ЧЕРНОВИКОВ (шаг 5/6 родителя 92) ----------
 # К LLM-думателю (классы а–ж) добавлен ДЕТЕРМИНИРОВАННЫЙ пост-релизный проход по ЖИВЫМ черновикам
 # окна ТЕМ ЖЕ чек-листом #92, что гоняет e2e-смоук suggest.runLiveSmoke (suggest._smoke_checks) —
@@ -13634,7 +13806,7 @@ def _revizor_route(packages, now=None):
             continue
         cid = (pkg or {}).get("client_id")
         for raw in findings:
-            f = dict(raw)
+            f = revizor_pachka.strip_event_fields(raw)   # признак операции думатель поставить не вправе
             f["client_id"] = cid
             act = f.get("action")
             if act == "task":
@@ -13716,9 +13888,29 @@ def _revizor_route(packages, now=None):
         log.info("ревизор: %d находок нерешаемы под заморозкой контура — в ленту, карточка по ним "
                  "НЕ рождается (классы: %s)", len(frozen_held),
                  ", ".join(sorted({_revizor_field(f, "class") or "?" for f in frozen_held})))
-    if not task_f and not owner_f:              # окна чисты (или только шум/сбой/разобранное/нерешаемое) → наружу тишина
+    # СУТОЧНЫЙ СПИСОК (22.09.2026, решение владельца «решать скопом») — СТРОГО за заморозкой и по
+    # тому же доводу порядка: сперва решение человека, потом статистика, потом состояние мира, и
+    # только затем АДРЕС показа. Склеиваются ТОЛЬКО находки с нулевым признаком операции (замок в
+    # `revizor_pachka.split`); поднятый признак едет отдельной карточкой, как раньше. Список на диск
+    # не лёг → показ прежний: находки возвращаются в карточку, а не теряются.
+    batched = []
+    if _revizor_pachka_on():
+        batch, owner_f = revizor_pachka.split(owner_f)
+        if batch:
+            if _revizor_pachka_collect(batch, now=now) is None:
+                owner_f = list(owner_f) + list(batch)
+            else:
+                batched = batch
+    pachka_note = (f"{len(batched)} находок → суточный список ({REVIZOR_PACHKA_HOUR:02d}:00 по "
+                   f"Пхукету), отдельной карточкой не выписаны" if batched else "")
+    pn = f"; {pachka_note}" if pachka_note else ""
+    if not task_f and not owner_f:              # окна чисты (или только шум/сбой/разобранное/нерешаемое/список) → наружу тишина
         if spooled:
             _revizor_spool_save([])             # отложенное снято вердиктом — иначе лежало бы в спуле вечно
+        if batched and not frozen_held and not muted and not bench_note and not (n and failed >= n):
+            _cowork(f"ревизор: {n} окон; {pachka_note}" + (f" (+{noise_n} шум)" if noise_n else ""))
+            return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed,
+                    "muted": 0, "benched": 0, "batched": len(batched)}
         if frozen_held:
             # РЕШАТЬ НЕЧЕГО. Карточка не рождается; уже открытая — закрывается САМИМ ревизором,
             # если все её пункты того же рода: `needs_approval` без вопроса это не ожидание, а поза.
@@ -13727,26 +13919,26 @@ def _revizor_route(packages, now=None):
                     + (f"; открытая карточка #{closed_tid} закрыта сама ({closed_n} пунктов)"
                        if closed_tid else "")
                     + (f"; {bench_note}" if bench_note else "")
-                    + (f"; {len(muted)} разобраны ранее как ложные" if muted else "")
+                    + (f"; {len(muted)} разобраны ранее как ложные" if muted else "") + pn
                     + (f" (+{noise_n} шум)" if noise_n else ""))
             return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed,
                     "muted": len(muted), "benched": len(benched), "frozen_held": len(frozen_held),
-                    "card_closed": closed_tid}
+                    "card_closed": closed_tid, "batched": len(batched)}
         if n and failed >= n:
             _cowork(f"ревизор: думатель не ответил ни по одному из {n} окон — прогон пропущен"
                     + (f" ({len(muted)} находок разобраны ранее как ложные — в ленту)" if muted else "")
-                    + (f"; {bench_note}" if bench_note else ""))
+                    + (f"; {bench_note}" if bench_note else "") + pn)
         elif muted:
             _cowork(f"ревизор: {n} окон; {len(muted)} находок разобраны ранее как ложные — заметкой в "
-                    f"ленту, владельцу не выписаны" + (f"; {bench_note}" if bench_note else "")
+                    f"ленту, владельцу не выписаны" + (f"; {bench_note}" if bench_note else "") + pn
                     + (f" (+{noise_n} шум)" if noise_n else ""))
         elif bench_note:
-            _cowork(f"ревизор: {n} окон; {bench_note}" + (f" (+{noise_n} шум)" if noise_n else ""))
+            _cowork(f"ревизор: {n} окон; {bench_note}" + pn + (f" (+{noise_n} шум)" if noise_n else ""))
         elif n:
             tail = f" (+{noise_n} шум)" if noise_n else ""
             _cowork(f"ревизор: {n} окон, чисто{tail}")
         return {"windows": n, "tasks": 0, "owner": 0, "noise": noise_n, "failed": failed,
-                "muted": len(muted), "benched": len(benched)}
+                "muted": len(muted), "benched": len(benched), "batched": len(batched)}
     # снимок очереди (все статусы) — бюджет/дедуп/поиск карточки — уже снят выше, вместе с жатвой
     if items is None:                           # частичная картина опаснее ожидания → откладываем, не флудим
         kept = _revizor_spool_save(task_f + owner_f)    # СОХРАНЯЕМ: «отложены» без спула = выброшены
@@ -13819,13 +14011,15 @@ def _revizor_route(packages, now=None):
         parts.append(frozen_note)
     if bench_note:
         parts.append(bench_note)
+    if pachka_note:
+        parts.append(pachka_note)
     if not parts:                               # находки были, но все отсеяны бюджетом/дедупом
         parts.append(f"находки отсеяны (бюджет/дедуп): task {len(task_f)}, skip {skip}")
     _cowork("ревизор: " + ", ".join(parts))
     return {"windows": n, "tasks": enq, "owner": len(owner_f), "noise": noise_n, "failed": failed,
             "demoted": demoted, "demoted_client": demoted_client, "spooled": len(left),
             "muted": len(muted), "benched": len(benched), "frozen_held": len(frozen_held),
-            "card_delivered": True}
+            "card_delivered": True, "batched": len(batched)}
 
 
 # ------------------- OS-синглтон демона (разбор #128, часть 4) ----------------
@@ -14068,6 +14262,10 @@ def _main_loop():
             maybe_client_watchdog()   # часть 3: следим за pc_agent/userbot/moderation_bot (троттлинг 5 мин)
             maybe_session_watch()     # инцидент 29.07: немая сессия (жива, но не работает) → карточка в 328
             maybe_revizor()           # шаг 2/7 (262): ревизор диалогов за DIALOG_REVIZOR (троттлинг REVIZOR_HOURS)
+            try:
+                maybe_revizor_pachka()    # суточный список находок ревизора (REVIZOR_PACHKA_HOUR по Пхукету)
+            except Exception as e:        # noqa: BLE001 — список не смеет ронять виток
+                log.warning("ревизор: суточный список упал (%s: %s)", type(e).__name__, e)
             maybe_review_auto()       # ступень A: пакет второго мнения за REVIEW_AUTO (троттлинг REVIEW_AUTO_MIN_SEC)
             maybe_review_intake()     # ступень B: находки ответа → ЗАЯВКИ очереди (троттлинг REVIEW_INTAKE_MIN_SEC)
             maybe_review_audit()      # ступень D: высокие находки + суточная сводка → тема Аудит (AUDIT_TOPIC)
@@ -14753,6 +14951,17 @@ if __name__ == "__main__":
                   f"вердикты: {', '.join(REVIZOR_VERDICTS)}")
             sys.exit(2)
         ok, _k, msg = revizor_set_verdict(key, verdict, gist=gist, why=why, source=REVIZOR_SRC_HAND)
+        print(msg)
+        sys.exit(0 if ok else 1)
+    elif arg == "--pachka-no":
+        # ОТБРАКОВКА СТРОКИ СУТОЧНОГО СПИСКА РЕВИЗОРА (pc_agent зовёт по кнопке ❌ после owner-gate):
+        # вердикт «ложная» в реестр по метке строки; код возврата 1 — вердикт НЕ лёг.
+        mark = sys.argv[2] if len(sys.argv) > 2 else ""
+        try:
+            ok, msg = revizor_pachka_reject(mark)
+        except Exception as e:
+            print(f"⛔ ОТКАЗ: отбраковка строки {mark} упала ({type(e).__name__}: {e}) — вердикт НЕ записан")
+            sys.exit(1)
         print(msg)
         sys.exit(0 if ok else 1)
     elif arg in ("--approve", "--reject"):

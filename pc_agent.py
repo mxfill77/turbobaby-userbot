@@ -763,6 +763,43 @@ EXAM_CHAT_ID = -5193185299
 # РОВНО один записанный случай. Хвост callback_data — метка случая (12 hex, `mark_of`), и в
 # командную строку из Telegram уезжает только она, уже просеянная этой регуляркой.
 BOX_CB_RE = re.compile(r"^box:free:([0-9a-f]{6,32})$")
+
+
+# ── КНОПКА ОТБРАКОВКИ СТРОКИ СУТОЧНОГО СПИСКА РЕВИЗОРА (22.09.2026, задание 71d) ────────────
+# Список шлёт демон (`dispatch_notify --pachka-card`), у каждой строки кнопка ❌N. ТАП зовёт
+# `pc_orchestrator.py --pachka-no <метка>`: вердикт «ложная» ложится в реестр ревизора тем же ключом,
+# что «нет» по карточке, и проверяется обратным чтением — ответ двери называет «легло 1 из 1» или
+# ОТКАЗ. Хвост — метка строки (12 hex, `revizor_pachka.MARK_LEN`); из Telegram в командную строку
+# уезжает только она, уже просеянная этой регуляркой.
+PACHKA_CB_RE = re.compile(r"^pachka:no:([0-9a-f]{12})$")
+PACHKA_ANSWER_AT = ("консоль репозитория, командой «pc_orchestrator.py --pachka-no <метка>» — метка "
+                    "стоит в полном тексте списка (tmp/revizor_pachka_full.txt)")
+
+
+def _pachka_cb_parse(data):
+    """callback_data кнопки суточного списка → ("no", метка) | None (не наш callback)."""
+    m = PACHKA_CB_RE.match(str(data or ""))
+    return ("no", m.group(1)) if m else None
+
+
+def _pachka_cli(action, mark):
+    """Отбраковка строки через дверь демона → текст ответа. Слова исхода печатает ДВЕРЬ."""
+    if action != "no" or not PACHKA_CB_RE.match("pachka:no:%s" % mark):
+        return f"список ревизора: кнопка не разобрана ({action}, {mark}). Ничего не записано."
+    if not VENV_PY.exists():
+        return f"список ревизора: не нашёл python venv ({VENV_PY}). Вердикт НЕ записан."
+    try:
+        r = subprocess.run(
+            [str(VENV_PY), str(REPO_DIR / "pc_orchestrator.py"), "--pachka-no", str(mark)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=90, cwd=str(REPO_DIR), creationflags=NO_WINDOW,
+        )
+        out = (r.stdout or "").strip() or (r.stderr or "").strip()
+        return out or (f"список ревизора: пустой ответ двери по строке {mark} (код {r.returncode}) — "
+                       f"успехом это не считается. Запасной путь — {PACHKA_ANSWER_AT}.")
+    except Exception as e:
+        return (f"список ревизора: отбраковка строки {mark} НЕ прошла ({type(e).__name__}: {e}). "
+                f"Запасной путь — {PACHKA_ANSWER_AT}.")
 # Слово владельца — запасной путь на случай, когда кнопка не сработала (живой класс 05.09:
 # процесс агента оказался СТАРШЕ кнопки, и тап получил «карточка устарела»). Форма та же, что
 # печатает извещение (`shtab_box_signals.RELEASE_WORD`), и сверяет их тест.
@@ -1355,10 +1392,17 @@ def _chain_cb_route(data, uid):
     box = _box_cb_parse(data)
     exam = _exam_cb_parse(data)
     exam_live = _exam_live_cb_parse(data)
+    pachka = _pachka_cb_parse(data)
     if not _chain_cb_authorized(uid):
         # owner-gate раньше разбора: чужому не подсказываем формат кнопок.
         return {"ok": False, "kind": None, "action": None, "pid": None,
                 "answer": "⛔ нет прав", "alert": True, "note": None}
+    if pachka is not None:
+        # Кнопка ОТБРАКОВКИ строки суточного списка ревизора. Тост говорит «записываю», а не
+        # «записано»: легло ли — скажет ответ двери после обратного чтения реестра.
+        action, mark = pachka
+        return {"ok": True, "kind": "pachka", "action": action, "pid": mark,
+                "answer": "❌ записываю «ложная»…", "alert": False, "note": None}
     if box is not None:
         # Кнопка СНЯТИЯ ОСТАНОВКИ ЯЩИКА. Тост говорит «снимаю», а не «ящик поехал»:
         # взятие произойдёт следующим витком ящика, и обещать его немедленно значило
@@ -1403,8 +1447,8 @@ def _chain_cb_route(data, uid):
                 "answer": ("✅ принимаю к сведению…" if action == "yes" else "❌ закрываю заявку…"),
                 "alert": False, "note": None}
     if parsed is None:
-        # Наш бот (AGENT_BOT_TOKEN) шлёт ТОЛЬКО карточки цепи, заявок, ворот, ящика и экзамена
-        # (пять видов, шестого нет) → неразобранный
+        # Наш бот (AGENT_BOT_TOKEN) шлёт ТОЛЬКО карточки цепи, заявок, ворот, ящика, экзамена и
+        # суточный список ревизора (шесть видов, седьмого нет) → неразобранный
         # callback = старый формат / протухшая карточка. Честно говорим это, а не молчим.
         #
         # ПРИЧИНУ НЕ ВЫДУМЫВАЕМ (класс 06.09.2026, живой замер). 05.09 10:29:12 владелец нажал
@@ -1478,7 +1522,7 @@ async def on_chain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # `getattr`, а не `.username`: у пользователя Telegram ника может не быть вовсе (поле
     # необязательное), и падение здесь уронило бы обработчик ВСЕХ кнопок, а не одной нашей.
     who = getattr(q.from_user, "username", "") or ""
-    runner = {"zayavka": _zayavka_cli, "gate": _gate_cli, "box": _box_cli,
+    runner = {"zayavka": _zayavka_cli, "gate": _gate_cli, "box": _box_cli, "pachka": _pachka_cli,
               "exam": (lambda a, p: _exam_cli(a, p, who)),
               "exam_live": (lambda a, p: _exam_cli(a, p, who, live=True))}.get(
                   route.get("kind"), _chain_cli)

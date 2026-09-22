@@ -32,6 +32,12 @@ os.environ["LESSON_LLM_ROUTE"] = "0"   # боевой .env-рубильник н
 for _marker in ("PRETOOL_APPROVED_KINDS", "PRETOOL_APPROVED_OBJECT", "PRETOOL_APPROVED_TASK"):
     os.environ.pop(_marker, None)
 
+# СУТОЧНЫЙ СПИСОК РЕВИЗОРА (22.09.2026) по умолчанию ВКЛЮЧЁН: находки без признака операции идут
+# строкой списка, а не карточкой. Тесты маршрута ниже закрепляют путь КАРТОЧКИ — он жив для находок
+# с операцией и для отката (REVIZOR_PACHKA_OFF=1), — поэтому в этом наборе список выключен. Путь
+# списка и замок операции закреплены отдельно: `test_revizor_pachka` (флаг там снимается на тест).
+os.environ["REVIZOR_PACHKA_OFF"] = "1"
+
 import pc_orchestrator as o           # noqa: E402
 import pretool_guard                  # noqa: E402  (словарь видов/разбор карточки — смычка с гардом)
 import selfupdate_gate                # noqa: E402  (голден «гейт не спавнит claude»)
