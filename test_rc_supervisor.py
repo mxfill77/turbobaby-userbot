@@ -100,10 +100,17 @@ class TestBuildCmd(unittest.TestCase):
         self.assertEqual(cmd, [self.SHIM, "rc", "--debug-file", rc.SERVER_LOG])
 
     def test_named_branch_cmd(self):
-        # `claude --remote-control <имя>` = именованная интерактивная сессия
+        # `claude --remote-control <имя> --no-chrome` = именованная интерактивная сессия. Флаг ПОСЛЕ
+        # имени: без него канал висит на окне «Claude in Chrome extension detected» (22.09)
         cmd = rc.build_cmd(self.SHIM, rc.NAMED_SPEC)
-        self.assertEqual(cmd, [self.SHIM, "--remote-control", rc.SESSION_NAME,
+        self.assertEqual(cmd, [self.SHIM, "--remote-control", rc.SESSION_NAME, "--no-chrome",
                                "--debug-file", rc.NAMED_LOG])
+
+    def test_server_gets_no_root_options(self):
+        # `claude rc` не стартует с корневыми опциями перед глаголом — --no-chrome ему нельзя
+        cmd = rc.build_cmd(self.SHIM, rc.SERVER_SPEC)
+        self.assertNotIn("--no-chrome", cmd)
+        self.assertEqual(cmd[1], "rc")
 
     def test_both_branches_use_resolved_binary_and_own_log(self):
         s = rc.build_cmd(self.SHIM, rc.SERVER_SPEC)
@@ -483,15 +490,40 @@ class TestChildEnvProfileChoice(unittest.TestCase):
         env, _ = rc.child_env(base=dict(self.BASE), repo=self.repo)
         self.assertEqual(env[self.KEY], self.repo)
 
-    def test_third_outcome_keeps_inheritance(self):
-        # файла нет / две значимые строки / несуществующий путь — env не передаём вовсе
-        cases = (None, "ОСНОВНОЙ\nD:\\x\n", r"D:\нет_такого_каталога_rc_test")
+    def test_third_outcome_rc_fallback_drops_inherited_key(self):
+        # файла нет / две значимые строки / несуществующий путь / BOM-мусор. У демона это
+        # «наследовать», у RC наследовать значит профиль 2 (91 старт, 0 регистраций) → ключ снят
+        cases = (None, "ОСНОВНОЙ\nD:\\x\n", r"D:\нет_такого_каталога_rc_test", "\x00мусор")
         for text in cases:
             if text is not None:
                 self._choice(text)
             env, why = rc.child_env(base=dict(self.BASE), repo=self.repo)
-            self.assertIsNone(env, text)
+            self.assertIsNotNone(env, text)
+            self.assertNotIn(self.KEY, env, text)
+            self.assertEqual(env["PATH"], r"C:\x")
             self.assertIn("НЕ ПРИМЕНЁН", why)
+            self.assertIn("RC-страховка", why)
+            self.assertIn(r"D:\\claude_profile_2", why)        # снятое значение названо
+
+    def test_third_outcome_without_key_passes_no_env(self):
+        base = {"PATH": r"C:\x"}                               # ключа нет — наследование = основной
+        env, why = rc.child_env(base=base, repo=self.repo)     # файла выбора нет
+        self.assertIsNone(env)
+        self.assertIn("и так на основном", why)
+
+    def test_inherited_empty_value_is_dropped(self):
+        # M2 замера 70u: пустой ключ = профиль БЕЗ входа. Мусор в рычаге + пустое наследство
+        self._choice("ОСНОВНОЙ\nОСНОВНОЙ\n")
+        env, _ = rc.child_env(base={"CLAUDE_CONFIG_DIR": "", "PATH": r"C:\x"}, repo=self.repo)
+        self.assertIsNotNone(env)
+        self.assertNotIn(self.KEY, env)
+
+    def test_explicit_path_still_wins_over_fallback(self):
+        # нарочно увести RC в другой профиль можно — но только явным путём в файле
+        self._choice(self.repo)
+        env, why = rc.child_env(base=dict(self.BASE), repo=self.repo)
+        self.assertEqual(env[self.KEY], self.repo)
+        self.assertNotIn("RC-страховка", why)
 
     def test_never_empty_value(self):
         for text in ("ОСНОВНОЙ", "", "\"\"", "  \n# c\n", self.repo):
@@ -513,18 +545,34 @@ class TestChildEnvProfileChoice(unittest.TestCase):
             def apply_to(env, repo=None):
                 raise ValueError("сломан")
         env, why = rc.child_env(chooser=_Boom, base=dict(self.BASE), repo=self.repo)
-        self.assertIsNone(env)
+        self.assertNotIn(self.KEY, env)                       # RC-страховка, не профиль 2
         self.assertIn("сорвался", why)
 
-    def test_module_missing_falls_back_to_inheritance(self):
+    def test_module_missing_falls_back_to_main_profile(self):
         saved = rc.profile_choice
         rc.profile_choice = None
         try:
             env, why = rc.child_env(base=dict(self.BASE), repo=self.repo)
         finally:
             rc.profile_choice = saved
-        self.assertIsNone(env)
+        self.assertNotIn(self.KEY, env)
         self.assertIn("не импортирован", why)
+
+    def test_login_hint_names_the_profile_doctor_judged(self):
+        main = rc.login_hint({"PATH": r"C:\x"})
+        self.assertIn("основной", main)
+        self.assertIn("Remove-Item Env:CLAUDE_CONFIG_DIR", main)
+        self.assertIn("claude auth login", main)
+        other = rc.login_hint({"CLAUDE_CONFIG_DIR": r"D:\p2"})
+        self.assertIn(r"$env:CLAUDE_CONFIG_DIR='D:\p2'", other)
+
+    def test_blocked_doctor_detail_carries_login_hint(self):
+        runner = lambda *a, **k: TestPreflightGate._P(TestPreflightGate.DOCTOR_BAD)
+        ok, detail = rc.rc_ready(r"C:\c.exe", runner=runner,
+                                 envf=lambda: ({"PATH": r"C:\x"}, "drop"))
+        self.assertFalse(ok)
+        self.assertIn("user:profile", detail)
+        self.assertIn("профиль doctor: основной", detail)
 
     def test_spawn_passes_env_and_keeps_tty(self):
         seen = {}

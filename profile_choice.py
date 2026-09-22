@@ -91,7 +91,11 @@ def read_raw(repo=None, path=None):
     try:
         if not os.path.isfile(p):
             return None, ""
-        with io.open(p, encoding="utf-8") as f:
+        # utf-8-sig, а не utf-8: PowerShell 5.1 (`Set-Content -Encoding UTF8`, `Out-File`) пишет
+        # BOM. str.strip() его не снимает, поэтому первая `#`-строка переставала быть комментарием →
+        # «значимых строк 2» → ACT_KEEP, то есть молча прежний профиль (разбор 22.09,
+        # docs/artifacts/2026-09-22-rc-device-profile2-stall.md). Без BOM читается так же, как utf-8.
+        with io.open(p, encoding="utf-8-sig") as f:
             return f.read(), ""
     except Exception as e:                       # noqa: BLE001 — любой отказ чтения = не знаем
         return None, "%s: %s" % (type(e).__name__, str(e)[:120])

@@ -245,6 +245,35 @@ class TestBothSpawnBranchesAsk(unittest.TestCase):
         self.assertIn("profile_choice", tops)
 
 
+class TestBomTolerated(unittest.TestCase):
+    """Файл, сохранённый PowerShell 5.1 (`Set-Content -Encoding UTF8`), начинается с BOM. До 22.09
+    BOM прилипал к первой `#`-строке, она переставала быть комментарием, и решение молча уходило
+    в ACT_KEEP («значимых строк 2»). Читаем с диска живой функцией, а не инъекцией."""
+
+    TEXT = "# строка отката\n# ещё комментарий\nОСНОВНОЙ\n"
+
+    def _decide_file(self, data):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, pc.CHOICE_REL)
+            with open(p, "wb") as f:
+                f.write(data)
+            raw, err = pc.read_raw(path=p)
+        return pc.decide(raw, err)
+
+    def test_bom_file_still_decides_main(self):
+        d = self._decide_file(b"\xef\xbb\xbf" + self.TEXT.encode("utf-8"))
+        self.assertEqual(d.action, pc.ACT_DROP, d.reason)
+
+    def test_plain_utf8_unchanged(self):
+        d = self._decide_file(self.TEXT.encode("utf-8"))
+        self.assertEqual(d.action, pc.ACT_DROP, d.reason)
+
+    def test_bom_crlf_file_still_decides_main(self):
+        d = self._decide_file(b"\xef\xbb\xbf" + self.TEXT.replace("\n", "\r\n").encode("utf-8"))
+        self.assertEqual(d.action, pc.ACT_DROP, d.reason)
+
+
 class TestLiveChoiceFile(unittest.TestCase):
     """Живой файл полосы читается ТЕМ ЖЕ кодом (правило «мок обязан копировать живой формат»).
 

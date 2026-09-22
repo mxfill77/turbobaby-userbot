@@ -131,7 +131,7 @@ Pointer читается уже ПОСЛЕ вопросов.
   (rc-server). wscript 9180 и conhost 13904 вышли сами, задача перешла в Ready. Затем
   `Start-ScheduledTask TurboBabyRC`. Новый супервизор — pid **19924** (17:18:18), ветки 27200 (канал)
   и 24504 (rc-server). Сессия десктопа и демон вне этого дерева, их не трогали.
-- **Живое подтверждение** (`rc_supervisor.log` и `rc_server_debug.log`, 17:18:20–17:18:24):
+- **Живое подтверждение** (`rc_remote_control.log` и `rc_server_debug.log`, 17:18:20–17:18:24):
   - обе ветки: `выбор учётки строителей: слово ОСНОВНОЙ — ключ CLAUDE_CONFIG_DIR снят … (основной профиль)`;
   - `[bridge:init] … Registered, server environmentId=env_01QFWiKT…`, `organization_uuid` =
     **`30c614de`** — организация телефона;

@@ -8,8 +8,9 @@ rc_supervisor.py — вечный ДВУХРЕЖИМНЫЙ сеанс Claude Cod
   • «rc-server»     — `claude rc` (алиас `remote-control`, «persistent server», same-dir,
                       capacity 32): регистрирует Environment машины и держит его в poll-loop —
                       ЭТО и есть постоянная запись в списке Devices/Environments приложения;
-  • «named-channel» — `claude --remote-control <имя>` («interactive session»): именованная
-                      сессия, через которую с телефона поднимаются удалённые сессии.
+  • «named-channel» — `claude --remote-control <имя> --no-chrome` («interactive session»):
+                      ОДНА именованная интерактивная сессия. Устройство и сессии с телефона даёт
+                      ветка rc-server, а не она (поправка 22.09, артефакт 2026-07-24-rc-device-mode).
 Обе ветки эмпирически СОСУЩЕСТВУЮТ в одном каталоге без конфликта синглтона (живой факт 24.07:
 сервер + именованная сессия работали одновременно). Падение/рестарт одной НЕ трогает другую.
 
@@ -147,12 +148,17 @@ UNREG_BACKOFF = int(os.getenv("RC_UNREG_BACKOFF", "3600") or "3600")            
 UNREG_BACKOFF_MAX = int(os.getenv("RC_UNREG_BACKOFF_MAX", "21600") or "21600")     # 6 ч
 
 # Две ветки супервизора. `mode` — аргументы claude ПОСЛЕ бинаря и ДО --debug-file:
-#   rc-server:     ['rc']                          → постоянный сервер-Environment (устройство)
-#   named-channel: ['--remote-control', <имя>]     → именованная интерактивная сессия
+#   rc-server:     ['rc']                                   → постоянный сервер-Environment (устройство)
+#   named-channel: ['--remote-control', <имя>, '--no-chrome'] → именованная интерактивная сессия
+# --no-chrome у канала (22.09, docs/artifacts/2026-09-22-rc-device-profile2-stall.md): без него
+# интерактивная сессия на последнем экране первого запуска показывает окно «Claude in Chrome extension
+# detected» (Yes/No, без таймера). В скрытой консоли ответить некому, и канал с 24.07 ни разу не
+# прошёл showSetupScreens. Флаг ставим ПОСЛЕ имени: [имя] у --remote-control необязателен, и так разбор
+# однозначен. Серверу его давать НЕЛЬЗЯ: `claude rc` не стартует с корневыми опциями перед глаголом.
 SERVER_SPEC = {"label": "rc-server", "mode": ("rc",), "log": SERVER_LOG,
                "max_age": SERVER_LIVENESS_MAX_AGE, "auth_watch": True}
-NAMED_SPEC = {"label": "named-channel", "mode": ("--remote-control", SESSION_NAME), "log": NAMED_LOG,
-              "max_age": NAMED_LIVENESS_MAX_AGE}
+NAMED_SPEC = {"label": "named-channel", "mode": ("--remote-control", SESSION_NAME, "--no-chrome"),
+              "log": NAMED_LOG, "max_age": NAMED_LIVENESS_MAX_AGE}
 BRANCHES = (SERVER_SPEC, NAMED_SPEC)
 
 # Детектор ПРОТУХШЕЙ авторизации (вариант «а» артефакта 2026-07-29-rc-token-staleness-prevention):
@@ -167,9 +173,11 @@ except Exception:
 # УЧЁТКА ДЕТЕЙ — рычаг 70w (`claude_profile_choice.txt`, читатель profile_choice.py), тот же, что у
 # детей демона. Живой прокол 18–22.09 (docs/artifacts/2026-09-22-rc-device-profile2-stall.md):
 # постоянная переменная пользователя CLAUDE_CONFIG_DIR=D:\claude_profile_2 увела ОБЕ ветки в
-# профиль второго аккаунта. Там `claude rc` ждёт ответа первого запуска в скрытой консоли —
-# 91 старт, 88 гашений ЗОМБИ, 0 регистраций, — а телефон вдобавок сидит на основном аккаунте.
-# Импорт мягкий: не импортировался — окружение детей наследуется, как было до правки.
+# профиль второго аккаунта: 91 старт, 88 гашений ЗОМБИ, 0 регистраций, а телефон при этом сидит на
+# основном аккаунте. Почему `claude rc` там стоит — вывод, а не наблюдение: вопрос первого запуска в
+# скрытой консоли (см. артефакт, §МЕХАНИЗМ). Импорт мягкий. Если модуль не поднялся или рычаг не дал
+# решения, у RC срабатывает своя страховка (_rc_fallback), а не наследование профиля 2.
+PROFILE_KEY = "CLAUDE_CONFIG_DIR"
 try:
     import profile_choice
 except Exception:
@@ -314,24 +322,54 @@ def child_env(chooser=None, base=None, repo=None):
     """Окружение детей супервизора (обе ветки И doctor пре-флайта) → (env | None, строка журнала).
 
     Решение даёт файл выбора учётки (рычаг 70w): ОСНОВНОЙ — ключ CLAUDE_CONFIG_DIR снят, путь —
-    поставлен. env=None значит «не передавать env в Popen вовсе», то есть прежнее наследование
-    байт-в-байт. Так будет при третьем исходе файла, при отсутствии модуля и при его срыве.
+    поставлен. Если файл решения не дал (третий исход, модуля нет, рычаг сорвался), работает
+    RC-страховка _rc_fallback. env=None значит «не передавать env в Popen вовсе»: это бывает, только
+    когда ключа в окружении нет и наследование и так ведёт в основной профиль.
     doctor обязан судить ТОТ ЖЕ профиль, в котором поднимется ветка, иначе гейт даёт вердикт
     о чужом входе. chooser/base/repo — инъекция для тестов."""
+    src = os.environ if base is None else base
     _pc = chooser if chooser is not None else profile_choice
     if _pc is None:
-        return None, ("выбор учётки НЕ ПРИМЕНЁН: модуль profile_choice не импортирован — "
-                      "окружение детей наследуется")
-    env = dict(os.environ if base is None else base)
+        return _rc_fallback(src, "модуль profile_choice не импортирован")
+    env = dict(src)
     try:
         d = _pc.apply_to(env, repo=repo or REPO)
         why = _pc.line(d)
     except Exception as e:          # рычаг не смеет уронить канал
-        return None, ("выбор учётки НЕ ПРИМЕНЁН: сорвался (%s) — окружение детей наследуется"
-                      % type(e).__name__)
+        return _rc_fallback(src, "рычаг сорвался (%s)" % type(e).__name__)
     if d.action == _pc.ACT_KEEP:
-        return None, why
+        return _rc_fallback(src, d.reason)
     return env, why
+
+
+def _rc_fallback(src, reason):
+    """Рычаг решения не дал → (env | None, строка журнала со словами «НЕ ПРИМЕНЁН»).
+
+    У демона в этом исходе безопасно унаследовать окружение. У RC наследовать сегодня значит
+    профиль 2, то есть второй аккаунт: 18–22.09 это дало 91 старт и 0 регистраций, а телефон сидит
+    на основном. Поэтому RC снимает унаследованный ключ и уходит в основной профиль, аккаунт телефона.
+    Пустое значение (M2 замера 70u, профиль без входа) снимается так же. Нарочно увести RC в другой
+    профиль можно только явным путём в файле рычага. Ключа нет → env=None: наследование и так ведёт
+    в основной профиль."""
+    if PROFILE_KEY not in src:
+        return None, ("выбор учётки НЕ ПРИМЕНЁН: %s; ключа %s в окружении нет — дети и так на "
+                      "основном профиле" % (reason, PROFILE_KEY))
+    env = dict(src)
+    val = env.pop(PROFILE_KEY)
+    return env, ("выбор учётки НЕ ПРИМЕНЁН: %s; RC-страховка: унаследованный %s=%r снят — дети "
+                 "на основном профиле (аккаунт телефона)" % (reason, PROFILE_KEY, val))
+
+
+def login_hint(env):
+    """Какой профиль судил doctor и как войти ИМЕННО в него → строка для детали и карточки.
+    В окне владельца CLAUDE_CONFIG_DIR может указывать на другой профиль (переменная пользователя),
+    поэтому голое `claude auth login` увело бы вход не туда."""
+    val = (os.environ if env is None else env).get(PROFILE_KEY)
+    if val:
+        return ("профиль doctor: %s; вход в PowerShell: `$env:%s='%s'; claude auth login`"
+                % (val, PROFILE_KEY, val))
+    return ("профиль doctor: основной; вход в PowerShell: `Remove-Item Env:%s "
+            "-ErrorAction SilentlyContinue; claude auth login`" % PROFILE_KEY)
 
 
 def rc_ready(claude, runner=None, timeout=120, envf=None):
@@ -351,7 +389,7 @@ def rc_ready(claude, runner=None, timeout=120, envf=None):
     out = (getattr(p, "stdout", "") or "") + (getattr(p, "stderr", "") or "")
     hits = [m for m in RC_BLOCKERS if m in out]
     if hits:
-        return False, "; ".join(hits)
+        return False, "%s [%s]" % ("; ".join(hits), login_hint(env))
     return True, "doctor: препятствий для Remote Control нет"
 
 
@@ -464,7 +502,8 @@ def default_spawn(claude, spec, verbose=None, popen=None, envf=None):
         pass
     vb = os.path.exists(DEBUG_FLAG) if verbose is None else verbose
     env, why = (envf or child_env)()
-    log.info("[%s] %s", spec["label"], why)
+    # третий исход рычага звучит громче успеха: WARNING, как у демона
+    (log.warning if "НЕ ПРИМЕНЁН" in why else log.info)("[%s] %s", spec["label"], why)
     kw = {"env": env} if env is not None else {}
     try:
         return (popen or subprocess.Popen)(build_cmd(claude, spec, verbose=vb), cwd=REPO, **kw)
@@ -503,8 +542,10 @@ def default_gate(claude, ready=None, notifier=None, now=None):
             _notify_ts[0] = _now
             (notifier or notify_owner)(
                 "⚠️ Канал Remote Control на ПК не поднимается: " + detail +
-                ". Нужен вход руками: открой обычное окно терминала и выполни "
-                "`claude auth login` (аккаунт claude.ai), затем разреши Remote Control. "
+                ". Нужен вход руками в ТОТ профиль, что судил doctor: открой обычное окно "
+                "PowerShell и выполни команду из скобок выше — это `claude auth login` с нужным "
+                "профилем (аккаунт claude.ai; голая команда может войти не в тот профиль), затем "
+                "разреши Remote Control. "
                 "Супервизор ждёт и поднимет канал сам, как только вход станет пригодным.")
     return False, detail
 
