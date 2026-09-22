@@ -1,0 +1,31 @@
+# ФИКСТУРА: начало живого rc_server_debug.log ЗДОРОВОЙ жизни rc-server — старт 09.09.2026 19:31:49Z.
+# Происхождение названо честно (правило-класс «мок обязан копировать живой формат»):
+#   • первые 22 строки файла D:\turbobaby-bot\rc_server_debug.log.1 — это ротация САМОГО CLI (10 МБ,
+#     12.09 18:43), то есть та же жизнь продолжала писать в новый файл; прочитаны 22.09.2026;
+#   • идентификаторы замаскированы С СОХРАНЕНИЕМ ФОРМЫ: env_/cse_/session_<id> → тот же префикс и
+#     столько же `X`, uuid (bridgeId, organization_uuid) → `xxxxxxxx-xxxx-…`. Всё прочее — дословно.
+# ЧЕМ ВАЖНА: здоровый старт доходит до регистрации за 3,3 с (19:31:49.377 → 19:31:52.668):
+# `[bridge:init] … Registered` → `[bridge:work] Starting poll loop`. Грейс сторожа 180 с больше в ~54 раза.
+# Время в логе — UTC. Строки-комментарии (#) — часть фикстуры, а не лога: тест их отбрасывает.
+2026-09-09T19:31:49.377Z [DEBUG] MDM settings load completed in 39ms
+2026-09-09T19:31:49.430Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Program Files\ClaudeCode\managed-settings.json
+2026-09-09T19:31:49.477Z [DEBUG] Error log sink initialized
+2026-09-09T19:31:49.482Z [DEBUG] Error log sink initialized
+2026-09-09T19:31:49.483Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Program Files\ClaudeCode\managed-settings.json
+2026-09-09T19:31:49.523Z [DEBUG] [bridge:init] Found prior environment env_XXXXXXXXXXXXXXXXXXXXXXXX in pointer (ageMs=3084036.7094726562); requesting reuse on registration
+2026-09-09T19:31:49.557Z [DEBUG] [bridge:init] bridgeId=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx reuseEnvironmentId=env_XXXXXXXXXXXXXXXXXXXXXXXX dir=D:\turbobaby-bot branch=main gitRepoUrl=https://github.com/mxfill77/turbobaby-userbot.git machine=mxfillpc
+2026-09-09T19:31:49.558Z [DEBUG] [bridge:init] apiBaseUrl=https://api.anthropic.com sessionIngressUrl=https://api.anthropic.com
+2026-09-09T19:31:49.558Z [DEBUG] [bridge:init] sandbox=false debugFile=D:\turbobaby-bot\rc_server_debug.log
+2026-09-09T19:31:49.558Z [DEBUG] [bridge:api] POST /v1/environments/bridge bridgeId=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+2026-09-09T19:31:50.377Z [DEBUG] [bridge:api] POST /v1/environments/bridge -> 200 environment_id=env_XXXXXXXXXXXXXXXXXXXXXXXX
+2026-09-09T19:31:50.377Z [DEBUG] [bridge:api] >>> {"machine_name":"mxfillpc","directory":"D:\\turbobaby-bot","branch":"main","git_repo_url":"https://github.com/mxfill77/turbobaby-userbot.git","max_sessions":32,"metadata":{"worker_type":"claude_code"}}
+2026-09-09T19:31:50.377Z [DEBUG] [bridge:api] <<< {"environment_id":"env_XXXXXXXXXXXXXXXXXXXXXXXX","organization_uuid":"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx","environment_secret":"[REDACTED]"}
+2026-09-09T19:31:51.499Z [DEBUG] [bridge:pointer] wrote C:\Users\mxfill1\.claude\projects\D--turbobaby-bot\bridge-pointer.json
+2026-09-09T19:31:51.503Z [DEBUG] [bridge:api] POST /v1/environments/env_XXXXXXXXXXXXXXXXXXXXXXXX/bridge/reconnect session_id=[REDACTED]
+2026-09-09T19:31:51.926Z [DEBUG] [bridge:init] reconnectSession(session_XXXXXXXXXXXXXXXXXXXXXXXX) failed: ReconnectSession: Failed with status 400: Session not found.
+2026-09-09T19:31:51.926Z [DEBUG] [bridge:api] POST /v1/environments/env_XXXXXXXXXXXXXXXXXXXXXXXX/bridge/reconnect session_id=[REDACTED]
+2026-09-09T19:31:52.668Z [DEBUG] [bridge:api] POST .../bridge/reconnect -> 200
+2026-09-09T19:31:52.668Z [DEBUG] [bridge:init] Adopted session cse_XXXXXXXXXXXXXXXXXXXXXXXX re-queued via bridge/reconnect
+2026-09-09T19:31:52.668Z [DEBUG] [bridge:init] Registered, server environmentId=env_XXXXXXXXXXXXXXXXXXXXXXXX
+2026-09-09T19:31:52.674Z [DEBUG] [bridge:pointer] wrote C:\Users\mxfill1\.claude\projects\D--turbobaby-bot\bridge-pointer.json
+2026-09-09T19:31:52.676Z [DEBUG] [bridge:work] Starting poll loop spawnMode=same-dir maxSessions=32 environmentId=env_XXXXXXXXXXXXXXXXXXXXXXXX

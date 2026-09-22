@@ -123,6 +123,29 @@ NAMED_LIVENESS_MAX_AGE = int(os.getenv("RC_NAMED_LIVENESS_MAX_LOG_AGE", "43200")
 # (стабильно стар+0conn) ловится за это время (по умолчанию ~90с после порога).
 LIVENESS_STRIKES = int(os.getenv("RC_LIVENESS_STRIKES", "3") or "3")
 
+# --- Жизнь БЕЗ РЕГИСТРАЦИИ в мосте (класс 18–22.09, docs/artifacts/2026-09-22-rc-device-profile2-stall.md) ---
+# `claude rc` на профиле 2 висел до `[bridge:init]` (вопрос первого запуска в скрытой консоли): 91
+# старт, 88 гашений ЗОМБИ, 0 регистраций, 0 карточек за 3,8 суток. Предикат живости тут бессилен:
+# стартовый всплеск (11 строк за 0,9 с) держит лог «свежим» весь час порога 3600с, а между жизнями
+# сторож не помнил ничего, и 88-й одинаковый вердикт выглядел как первый. Поэтому у ветки с
+# spec["auth_watch"] (rc-server) есть ВТОРОЙ вопрос — была ли в жизни регистрация
+# (rc_auth_detect.registered: True / False / None):
+#   • после грейса жизнь без регистрации и БЕЗ ESTABLISHED-соединений LIVENESS_STRIKES проверок подряд
+#     гасится сразу (180 + 3×30 = 270 с), а не через час;
+#   • UNREG_LIVES погашенных так жизней подряд → ОДНА карточка владельцу (notify_owner, --critical →
+#     инбокс 1160) и рестарты реже: UNREG_BACKOFF, дальше ×2, не выше UNREG_BACKOFF_MAX (1→2→4→6 ч);
+#   • жизнь с регистрацией рвёт серию и снова взводит карточку; «не знаю» не считается и не рвёт.
+# ВЫШЕДШАЯ САМА жизнь без регистрации в серию тоже не идёт и её не рвёт: выход — собственный
+# вердикт процесса с кодом в журнале, а не молчаливое зависание. Замер 05.08: час сетевого отказа
+# («Unable to connect to API») дал 79, а затем ещё 6 выходов exit=1 подряд раз в 30 с, и оба раза
+# сеть вернулась сама. Засчитай их — было бы 2 ложные карточки «почини» и ~57 мин лишнего простоя
+# устройства после второго (реплей — в артефакте 2026-09-22-rc-unregistered-life.md).
+# Пороги 24.07/30.07 (свежесть, channel_alive, страйки) не тронуты; ветку канала этот вопрос не судит.
+UNREG_ENABLED = os.getenv("RC_UNREG", "1") != "0"        # запасной клапан: RC_UNREG=0 — как до 22.09
+UNREG_LIVES = max(1, int(os.getenv("RC_UNREG_LIVES", "3") or "3"))
+UNREG_BACKOFF = int(os.getenv("RC_UNREG_BACKOFF", "3600") or "3600")               # 1 ч
+UNREG_BACKOFF_MAX = int(os.getenv("RC_UNREG_BACKOFF_MAX", "21600") or "21600")     # 6 ч
+
 # Две ветки супервизора. `mode` — аргументы claude ПОСЛЕ бинаря и ДО --debug-file:
 #   rc-server:     ['rc']                          → постоянный сервер-Environment (устройство)
 #   named-channel: ['--remote-control', <имя>]     → именованная интерактивная сессия
@@ -486,9 +509,77 @@ def default_gate(claude, ready=None, notifier=None, now=None):
     return False, detail
 
 
+def unreg_pause(streak, lives=None, base=None, cap=None):
+    """Пауза перед следующим стартом после жизни, погашенной без регистрации → сек.
+
+    Серия короче lives — обычная RESTART_DELAY. С lives-й жизни — base, дальше ×2 на каждую
+    следующую, не выше cap (по умолчанию 1 → 2 → 4 → 6 ч). Не меньше RESTART_DELAY: ноль в ручке не
+    превращает backoff в тугой цикл."""
+    k = UNREG_LIVES if lives is None else max(1, lives)
+    b = UNREG_BACKOFF if base is None else base
+    top = UNREG_BACKOFF_MAX if cap is None else cap
+    if streak < k:
+        return RESTART_DELAY
+    step = min(streak - k, 32)            # дальше потолок достигнут при любой разумной ручке
+    return max(RESTART_DELAY, min(b * (2 ** step), top))
+
+
+def fmt_pause(sec):
+    """Пауза для строки журнала и карточки: 3600 → «1 ч», 900 → «15 мин», 15 → «15 с»."""
+    sec = int(sec)
+    if sec >= 3600 and sec % 3600 == 0:
+        return "%d ч" % (sec // 3600)
+    if sec >= 60 and sec % 60 == 0:
+        return "%d мин" % (sec // 60)
+    return "%d с" % sec
+
+
+def binary_note(path, getmtime=None):
+    """Бинарь ветки С ВРЕМЕНЕМ его записи: апдейт CLI и смена профиля — первые два подозреваемых,
+    и mtime шима отличает одно от другого без чтения чего-либо ещё."""
+    try:
+        m = (getmtime or os.path.getmtime)(path)
+        return "%s (mtime %s)" % (path, time.strftime("%d.%m.%Y %H:%M:%S", time.localtime(m)))
+    except Exception as e:
+        return "%s (mtime не прочитан: %s)" % (path, type(e).__name__)
+
+
+def unreg_card(spec, streak, stage, life_sec, claude, pause, envf=None):
+    """Карточка владельцу о серии жизней без регистрации: стадия (с числом строк лога), бинарь и
+    его mtime, учётка детей, следующая пауза и что сделать после починки."""
+    try:
+        why = (envf or child_env)()[1]
+    except Exception as e:
+        why = "выбор учётки не прочитан (%s)" % type(e).__name__
+    return ("🛑 RC: сервер устройства (`claude rc`, ветка %s) %d жизней подряд НЕ зарегистрировался "
+            "в мосте — в Devices на телефоне ПК нет. Последняя жизнь ≈%d с, стадия: %s. "
+            "Бинарь: %s. Учётка детей сейчас: %s. Такие жизни сторож гасит после грейса, а "
+            "рестарты теперь реже: следующий через %s, дальше ×2, не чаще раза в %s. Карточка одна "
+            "на серию, новая будет только после жизни с регистрацией. После починки перезапусти "
+            "TurboBabyRC: серия и пауза живут в памяти супервизора. Разбор похожего случая: "
+            "docs/artifacts/2026-09-22-rc-device-profile2-stall.md"
+            % (spec["label"], streak, life_sec, stage, binary_note(claude), why,
+               fmt_pause(pause), fmt_pause(max(pause, UNREG_BACKOFF_MAX))))
+
+
+def unreg_knobs_note(branches, auth=None):
+    """Что стартовая строка говорит о суде над жизнями без регистрации: ручки ЧИСЛАМИ, как их держит
+    ПАМЯТЬ процесса (константы связаны на импорте — урок 30.07), либо прямо названная причина, по
+    которой суда нет."""
+    watched = [b["label"] for b in branches if b.get("auth_watch")]
+    if not watched:
+        return "жизни без регистрации: веток под судом нет"
+    _auth = auth if auth is not None else rc_auth_detect
+    if _auth is None or getattr(_auth, "registered", None) is None:
+        return "жизни без регистрации: НЕ судятся — детектора регистрации нет"
+    return ("жизни без регистрации (%s): RC_UNREG=%s RC_UNREG_LIVES=%s RC_UNREG_BACKOFF=%sс "
+            "RC_UNREG_BACKOFF_MAX=%sс" % (",".join(watched), "1" if UNREG_ENABLED else "0 (выключено)",
+                                          UNREG_LIVES, UNREG_BACKOFF, UNREG_BACKOFF_MAX))
+
+
 def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
                      sleeper=None, killer=None, rounds=None, checks=None, grace_checks=None,
-                     strikes_needed=None, auth=None, notifier=None, probe=None):
+                     strikes_needed=None, auth=None, notifier=None, probe=None, envf=None):
     """Вечный НЕЗАВИСИМЫЙ цикл ОДНОЙ ветки (свой поток): резолв шима → пре-флайт → подъём процесса
     → монитор → пауза → снова. Монитор рестартует по ДВУМ причинам: процесс ВЫШЕЛ сам (poll!=None)
     ЛИБО зомби — процесс жив, но канал мёртв по probe_alive _strikes_needed проверок ПОДРЯД (после
@@ -497,10 +588,15 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
     новые сессии убиты дословным «token has been revoked» и падением за секунды (rc_auth_detect).
     Грейс её НЕ касается: этот отказ виден с первой же убитой сессии, а ждать 3 минуты значит
     подарить владельцу ещё один труп.
+    ЧЕТВЁРТАЯ причина, у той же ветки: ЖИЗНЬ БЕЗ РЕГИСТРАЦИИ в мосте (класс 18–22.09, см. ручки
+    UNREG_*) — после грейса регистрации нет и ESTABLISHED-соединений 0 _strikes_needed проверок
+    подряд. Каждая жизнь в конце получает вердикт (есть регистрация / нет / не знаю), и серия таких
+    жизней переживает рестарты: карточка владельцу и backoff пауз.
     rounds/checks/grace_checks/strikes_needed — ограничители/инъекции для тестов
     (None = боевой бесконечный режим); auth/notifier — инъекция детектора кредов;
     probe — инъекция пробы С ЧИСЛАМИ (probe_detail), alive — старая булева (числа в строке
-    сноса тогда неизвестны). → 0."""
+    сноса тогда неизвестны; суд о регистрации без числа соединений не гасит ничего);
+    envf — инъекция выбора учётки для строки карточки. → 0."""
     _resolve = resolver or resolve_claude
     _spawn = spawner or default_spawn
     if probe is not None:
@@ -517,7 +613,15 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
     _strikes_needed = LIVENESS_STRIKES if strikes_needed is None else strikes_needed
     _auth = auth if auth is not None else rc_auth_detect
     _notify = notifier or notify_owner
-    _auth_on = bool(spec.get("auth_watch") and _auth is not None and getattr(_auth, "ENABLED", True))
+    _watch = bool(spec.get("auth_watch") and _auth is not None)
+    _auth_on = bool(_watch and getattr(_auth, "ENABLED", True))
+    # Суд о регистрации — только у ветки auth_watch и только у детектора, который умеет на него
+    # отвечать (двойник без registered = прежнее поведение байт-в-байт). Читатель лога у него общий с
+    # детектором кредов, но RC_AUTH_WATCH=0 выключает рестарт по кредам, а не этот вопрос.
+    _registered = getattr(_auth, "registered", None) if _watch else None
+    _unreg_on = bool(UNREG_ENABLED and _registered is not None)
+    unreg_streak = 0               # погашенных жизней без регистрации ПОДРЯД — переживает рестарты
+    unreg_armed = True             # карточка одна на серию; взводится жизнью с регистрацией
     n = 0
     while rounds is None or n < rounds:
         n += 1
@@ -541,9 +645,11 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
                  claude, " ".join(spec["mode"]))
         c = 0
         strikes = 0
+        unreg_strikes = 0
+        ended = None                   # чем кончилась жизнь: "exit" — сам, "killed" — сторож
         # Состояние детектора кредов заводим НА ЖИЗНЬ ПРОЦЕССА: default_spawn только что усёк
         # лог ветки, значит смещение 0 — честная точка отсчёта, старые улики не в счёт.
-        auth_state = _auth.new_state() if _auth_on else None
+        auth_state = _auth.new_state() if (_auth_on or _unreg_on) else None
         auth_blind_said = False        # третий исход читателя говорим ОДИН раз на жизнь процесса
         while checks is None or c < checks:
             c += 1
@@ -552,13 +658,14 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
             if code is not None:
                 log.info("[%s] процесс вышел (exit=%s) — рестарт через %s с",
                          spec["label"], code, RESTART_DELAY)
+                ended = "exit"
                 break
             # Протухшая авторизация: сервер жив и здоров по всем пробам, но НОВЫЕ сессии убиты
             # (дословная фраза + падение за секунды). Рестарт = новый сервер со свежими кредами.
             if auth_state is not None:
                 try:
                     auth_state = _auth.scan(spec["log"], auth_state)
-                    if _auth.should_restart(auth_state):
+                    if _auth_on and _auth.should_restart(auth_state):
                         log.info("[%s] %s — гашу pid=%s, рестарт",
                                  spec["label"], _auth.describe(auth_state), getattr(proc, "pid", "?"))
                         _notify("♻️ Канал Remote Control: " + _auth.describe(auth_state) +
@@ -566,6 +673,7 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
                                 "свежих кредах. На телефоне может смениться Environment.")
                         if proc.poll() is None:
                             _kill(proc)
+                        ended = "killed"
                         break
                     # ТРЕТИЙ ИСХОД читателя (parse_outcome.NONPARSE): хвост лога непуст, а формат
                     # не опознан НИ В ОДНОЙ строке. Молчать здесь нельзя: ноль отказов от слепого
@@ -589,6 +697,26 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
             if LIVENESS_ENABLED and c > _grace:
                 ok_live, age, est, thr = _probe(spec, proc.pid)
                 dead = not ok_live
+                # Жизнь БЕЗ РЕГИСТРАЦИИ: свежесть лога тут не довод — стартовый всплеск держит его
+                # «свежим» весь час порога. Гасим, только когда оба ответа ТВЁРДЫЕ: детектор сказал
+                # False (а не «не знаю») и соединений ровно 0 (число неизвестно — не гасим)
+                # _strikes_needed проверок подряд. Здоровый старт регистрируется за 3,3 с.
+                if _unreg_on:
+                    try:
+                        bare = _registered(auth_state) is False and est == 0
+                    except Exception:           # суд не смеет уронить сторож
+                        bare = False
+                    unreg_strikes = unreg_strikes + 1 if bare else 0
+                    if unreg_strikes >= _strikes_needed:
+                        log.info("[%s] БЕЗ РЕГИСТРАЦИИ: жизнь ≈%sс, грейс %sс позади, %s; соединений 0"
+                                 " %s проверок подряд — гашу pid=%s, рестарт",
+                                 spec["label"], c * CHECK_INTERVAL, _grace * CHECK_INTERVAL,
+                                 _life_stage(_auth, auth_state), unreg_strikes,
+                                 getattr(proc, "pid", "?"))
+                        if proc.poll() is None:
+                            _kill(proc)
+                        ended = "killed"
+                        break
             if dead:
                 strikes += 1
                 if strikes >= _strikes_needed:
@@ -601,11 +729,81 @@ def supervise_branch(spec, resolver=None, spawner=None, alive=None, gate=None,
                              getattr(proc, "pid", "?"))
                     if proc.poll() is None:
                         _kill(proc)
+                    ended = "killed"
                     break
             else:
                 strikes = 0
-        _sleep(RESTART_DELAY)
+        pause = RESTART_DELAY
+        if _unreg_on:
+            pause, unreg_streak, unreg_armed = _close_life(
+                spec, proc, claude, c, ended, _auth, auth_state, unreg_streak, unreg_armed,
+                _notify, envf)
+        _sleep(pause)
     return 0
+
+
+def _life_stage(auth, state):
+    """Стадия жизни от детектора; детектор без life_stage или сорвавшийся — не причина молчать."""
+    try:
+        return auth.life_stage(state)
+    except Exception as e:
+        return "стадия неизвестна (%s)" % type(e).__name__
+
+
+def _close_life(spec, proc, claude, c, ended, auth, state, streak, armed, notify, envf):
+    """Вердикт кончившейся жизни ветки и его след: серия, карточка, пауза → (pause, streak, armed).
+
+    Последний проход по логу — до вердикта: процесс мог дописать строки после прошлой проверки.
+      • регистрация была → серия рвётся, карточка снова взведена;
+      • регистрации нет, жизнь ПОГАСИЛ сторож → серия +1; на UNREG_LIVES-й — одна карточка и backoff;
+      • регистрации нет, но процесс ВЫШЕЛ САМ, либо «не знаю» → серия не растёт и не рвётся (выход —
+        свой вердикт процесса с кодом в журнале; 05.08 так выглядел сетевой отказ, прошедший сам)."""
+    if state is not None:
+        try:
+            state = auth.scan(spec["log"], state)
+        except Exception:
+            state = None
+    try:
+        verdict = auth.registered(state)
+    except Exception:
+        verdict = None
+    stage = _life_stage(auth, state)
+    life_sec = c * CHECK_INTERVAL
+    counts = verdict is False and ended == "killed"
+    if verdict is True:
+        if streak:
+            log.info("[%s] серия без регистрации (%s подряд) прервана жизнью с регистрацией — "
+                     "карточка снова взведена", spec["label"], streak)
+        streak, armed = 0, True
+    elif counts:
+        streak += 1
+    if verdict is True:
+        say = "регистрация есть"
+    elif verdict is False:
+        say = ("регистрации НЕТ" if counts else
+               "регистрации НЕТ, но процесс вышел сам — в серию не идёт")
+    else:
+        say = "про регистрацию не знаю — в серию не идёт и её не рвёт"
+    log.info("[%s] итог жизни pid=%s (≈%sс, %s): %s; %s — серия без регистрации %s из %s",
+             spec["label"], getattr(proc, "pid", "?"), life_sec,
+             {"exit": "вышла сама", "killed": "погашена сторожем"}.get(ended, "не окончена"),
+             say, stage, streak, UNREG_LIVES)
+    if not (counts and streak >= UNREG_LIVES):
+        return RESTART_DELAY, streak, armed
+    pause = unreg_pause(streak)
+    if armed:
+        try:
+            sent = notify(unreg_card(spec, streak, stage, life_sec, claude, pause, envf=envf))
+        except Exception as e:            # карточка не смеет уронить сторож
+            log.warning("[%s] карточка о серии без регистрации сорвалась (%s)", spec["label"],
+                        type(e).__name__)
+            sent = False
+        armed = sent is False           # не ушла — повторим на следующей жизни серии
+        log.info("[%s] %s жизней подряд без регистрации — карточка владельцу %s",
+                 spec["label"], streak, "НЕ ушла, повторю" if armed else "ушла")
+    log.info("[%s] backoff: следующий старт через %s (серия %s, потолок %s)", spec["label"],
+             fmt_pause(pause), streak, fmt_pause(UNREG_BACKOFF_MAX))
+    return pause, streak, armed
 
 
 def main(singleton=None, branch_runner=None, branches=None):
@@ -624,11 +822,12 @@ def main(singleton=None, branch_runner=None, branches=None):
     # строку сноса — то есть узнать порог только в момент ПРОВАЛА. Файл на диске не доказывает
     # ничего: константы связываются ОДИН раз на импорте, hot-reload в CPython нет — 30.07 супервизор
     # 20 часов гасил канал каждые 21,5 мин по старому числу, когда на диске уже лежало новое.
-    # Теперь процесс сам сообщает, что держит в ПАМЯТИ, первой же строкой после рестарта.
-    log.info("супервизор стартовал (pid=%s, ветки=%s, cwd=%s)",
+    # Теперь процесс сам сообщает, что держит в ПАМЯТИ, первой же строкой после рестарта. Так же —
+    # ручки суда о регистрации (22.09): «правка в силе» видна на старте, а не на первой карточке.
+    log.info("супервизор стартовал (pid=%s, ветки=%s, %s, cwd=%s)",
              os.getpid(),
              ["%s:порог %sс" % (b["label"], b.get("max_age") or LIVENESS_MAX_AGE) for b in _br],
-             REPO)
+             unreg_knobs_note(_br), REPO)
     threads = []
     for spec in _br:
         t = threading.Thread(target=_run, args=(spec,), name="rc-%s" % spec["label"], daemon=True)

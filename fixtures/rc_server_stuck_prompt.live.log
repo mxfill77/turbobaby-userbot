@@ -1,0 +1,23 @@
+# ФИКСТУРА: живой rc_server_debug.log ЗАВИСШЕЙ жизни rc-server (класс 18–22.09.2026: 91 старт,
+# 88 гашений ЗОМБИ, 0 регистраций — docs/artifacts/2026-09-22-rc-device-profile2-stall.md).
+# Происхождение названо честно (правило-класс «мок обязан копировать живой формат»):
+#   • жизнь pid 11580 на профиле 2, старт 22.09.2026 16:35:39 местного (09:35:39Z);
+#   • файл прочитан `cat -A` ДО 17:18:20 (в нём тогда было ровно 11 строк, 1006 байт, концы LF);
+#   • в 17:18:20 рестарт TurboBabyRC с починкой 4264ca90 усёк живой файл, поэтому фикстура собрана
+#     из того чтения и сверена по размеру: тело ниже — те же 1006 байт и 11 строк.
+# Идентификаторов в этих строках нет (хвост `.tmp.11580.f8e0eed9e58e` — pid и случайный суффикс
+# временного файла), маскировать нечего: строки дословные.
+# ЧЕМ ВАЖНА: за 0,9 с (09:35:39.203 → 09:35:40.075) процесс пишет 11 строк настроек и запись .claude.json — и больше НИЧЕГО.
+# Строки `[bridge:` нет ни одной; этот всплеск целый час выглядел для порога 3600с «свежим логом».
+# Время в логе — UTC. Строки-комментарии (#) — часть фикстуры, а не лога: тест их отбрасывает.
+2026-09-22T09:35:39.203Z [DEBUG] MDM settings load completed in 37ms
+2026-09-22T09:35:39.261Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Program Files\ClaudeCode\managed-settings.json
+2026-09-22T09:35:39.275Z [DEBUG] CA certs: Config fallback - globalEnv keys: , settingsEnv keys: none
+2026-09-22T09:35:39.280Z [DEBUG] Error log sink initialized
+2026-09-22T09:35:39.336Z [DEBUG] Error log sink initialized
+2026-09-22T09:35:40.068Z [DEBUG] Preserving file permissions: 100666
+2026-09-22T09:35:40.068Z [DEBUG] Writing to temp file: D:\claude_profile_2\.claude.json.tmp.11580.f8e0eed9e58e
+2026-09-22T09:35:40.069Z [DEBUG] Applied original permissions to temp file
+2026-09-22T09:35:40.072Z [DEBUG] Temp file written successfully, size: 48659 bytes
+2026-09-22T09:35:40.072Z [DEBUG] Renaming D:\claude_profile_2\.claude.json.tmp.11580.f8e0eed9e58e to D:\claude_profile_2\.claude.json
+2026-09-22T09:35:40.075Z [DEBUG] File D:\claude_profile_2\.claude.json written atomically

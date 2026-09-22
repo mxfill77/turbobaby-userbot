@@ -13,6 +13,7 @@ docs/artifacts/2026-07-29-rc-token-staleness-prevention.md).
 
 import io
 import os
+import re
 import unittest
 
 import parse_outcome
@@ -22,6 +23,16 @@ FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "fixtures", "rc_server_auth_revoked.live.log")
 IDLE_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "fixtures", "rc_server_idle_poll.live.log")
+REGISTERED_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "fixtures", "rc_server_registered_start.live.log")
+STUCK_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "fixtures", "rc_server_stuck_prompt.live.log")
+
+
+def live_lines(path):
+    """Строки живого лога из фикстуры без её комментариев (в настоящем логе их нет)."""
+    with io.open(path, encoding="utf-8") as f:
+        return [ln for ln in f.read().splitlines() if not ln.startswith("#")]
 
 # Дословные строки живого лога (в фикстуре — они же).
 LINE_REVOKED = ("2026-07-29T05:03:43.827Z [DEBUG] [code-session] Get "
@@ -281,6 +292,139 @@ class TestReadingContract(unittest.TestCase):
         st = ad.feed(real, ad.new_state())
         self.assertEqual(st["parsed"], len(real))
         self.assertGreater(st["marks"], 0)
+
+
+class TestLifeRegistration(unittest.TestCase):
+    """ЖИЗНЬ БЕЗ РЕГИСТРАЦИИ (класс 18–22.09, docs/artifacts/2026-09-22-rc-device-profile2-stall.md):
+    91 старт, 88 гашений ЗОМБИ, 0 регистраций. Детектор читал каждую из этих жизней и ни разу не
+    сказал, что регистрации не было. Голдены — на живых строках: здоровый старт 09.09 (ids
+    замаскированы) и 11-строчный лог зависшей жизни 22.09."""
+
+    def _reg_line(self):
+        return next(l for l in live_lines(REGISTERED_FIXTURE) if "[bridge:init] Registered" in l)
+
+    # --- фикстуры живые, а не пересказ ---
+    def test_fixtures_are_live_format_and_masked(self):
+        ok, stuck = live_lines(REGISTERED_FIXTURE), live_lines(STUCK_FIXTURE)
+        self.assertEqual((len(ok), len(stuck)), (22, 11))
+        # 11 строк зависшей жизни = те же 1006 байт, что лежали в живом файле при чтении
+        self.assertEqual(len(("\n".join(stuck) + "\n").encode("utf-8")), 1006)
+        for line in ok + stuck:
+            self.assertRegex(line, ad._SHAPE_RE)
+        text = "\n".join(ok)
+        # каждый идентификатор замаскирован с сохранением формы, живого не осталось ни одного
+        self.assertIsNone(re.search(r"\b(?:env|cse|session)_(?!X+\b)[A-Za-z0-9]{8,}", text))
+        self.assertIsNone(re.search(r"\b(?!x{8}-)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                                    r"[0-9a-f]{12}\b", text))
+        self.assertIn("env_XXXXXXXX", text)
+
+    # --- три исхода: да ---
+    def test_healthy_start_is_registered(self):
+        st = ad.feed(live_lines(REGISTERED_FIXTURE), ad.new_state())
+        self.assertIs(ad.registered(st), True)
+        self.assertGreater(st["bridge"], 0)
+        self.assertIn("зарегистрирован", ad.life_stage(st))
+        self.assertFalse(ad.should_restart(st))            # здоровый старт кредов не трогает
+
+    def test_each_marker_alone_is_enough(self):
+        """Маркеров три, и каждый — живая строка: итог регистрации, вход в поллинг, сам поллинг."""
+        pool = live_lines(REGISTERED_FIXTURE) + idle_lines()
+        for mark in ad.REGISTERED_MARKS:
+            line = next(l for l in pool if mark in l)
+            st = ad.feed(live_lines(STUCK_FIXTURE) + [line], ad.new_state())
+            self.assertIs(ad.registered(st), True, mark)
+
+    def test_idle_polling_life_is_registered(self):
+        """Живой простой 08.08: одни вехи поллинга — это жизнь с регистрацией, а не «нет»."""
+        self.assertIs(ad.registered(ad.feed(idle_lines(), ad.new_state())), True)
+
+    def test_registration_later_in_life_counts(self):
+        st = ad.feed(live_lines(STUCK_FIXTURE), ad.new_state())
+        self.assertIs(ad.registered(st), False)
+        st = ad.feed([self._reg_line()], st)
+        self.assertIs(ad.registered(st), True)
+
+    # --- три исхода: нет ---
+    def test_stuck_life_is_not_registered(self):
+        """ДОСЛОВНО живой случай: 11 строк настроек и записи .claude.json, строки моста нет."""
+        st = ad.feed(live_lines(STUCK_FIXTURE), ad.new_state())
+        self.assertIs(ad.registered(st), False)
+        self.assertEqual((st["life_lines"], st["life_parsed"], st["bridge"]), (11, 11, 0))
+        stage = ad.life_stage(st)
+        self.assertIn("до [bridge:init]", stage)
+        self.assertIn("строк лога 11", stage)
+        self.assertIn("строк моста 0", stage)
+        # прежние ответы детектора на ту же жизнь не изменились: не слеп и кредов не судит
+        self.assertFalse(ad.is_blind(st))
+        self.assertFalse(ad.should_restart(st))
+
+    def test_bridge_started_but_not_registered(self):
+        """Мост начат (`[bridge:init]`, POST регистрации), а итога нет — это тоже «нет», и стадия
+        отличает его от зависания до моста."""
+        ok = live_lines(REGISTERED_FIXTURE)
+        before = ok[:ok.index(self._reg_line())]
+        st = ad.feed(before, ad.new_state())
+        self.assertIs(ad.registered(st), False)
+        self.assertGreater(st["bridge"], 0)
+        self.assertIn("мост начат, регистрации нет", ad.life_stage(st))
+
+    # --- ротация лога самим CLI ---
+    def test_cli_rotation_keeps_the_life_counters(self):
+        """CLI ротирует свой лог на 10 МБ посреди жизни (живой .log.1, 12.09): файл становится
+        короче смещения. Регистрация этой жизни от этого не исчезает; пара контракта — как раньше."""
+        ok_text = "\n".join(live_lines(REGISTERED_FIXTURE)) + "\n"
+        st = ad.scan("x", ad.new_state(), opener=lambda p: io.StringIO(ok_text),
+                     sizer=lambda p: len(ok_text))
+        self.assertEqual((ad.registered(st), st["rotations"]), (True, 0))
+        after_lines = live_lines(STUCK_FIXTURE)[:3]         # строки без единого маркера
+        after = "\n".join(after_lines) + "\n"
+        st = ad.scan("x", st, opener=lambda p: io.StringIO(after), sizer=lambda p: len(after))
+        self.assertEqual(st["rotations"], 1)
+        self.assertIs(ad.registered(st), True, "ротация CLI не смеет стереть регистрацию жизни")
+        self.assertEqual(st["life_lines"], 22 + 3)
+        self.assertEqual(st["seen"], 3)                     # правило пары контракта не менялось
+        self.assertIn("ротаций лога 1", ad.life_stage(st))
+
+    def test_fresh_life_start_is_not_a_rotation(self):
+        text = "\n".join(live_lines(STUCK_FIXTURE)) + "\n"
+        st = ad.scan("x", ad.new_state(), opener=lambda p: io.StringIO(text), sizer=lambda p: len(text))
+        self.assertEqual(st["rotations"], 0)
+
+    # --- три исхода: не знаю ---
+    def test_no_state_and_old_state_are_unknown(self):
+        self.assertIsNone(ad.registered(None))
+        old = {"offset": 0, "pending": {}, "failures": 0,
+               "seen": 0, "parsed": 0, "marks": 0, "unread": 0}      # образец до 22.09
+        ad.feed(live_lines(STUCK_FIXTURE), old)
+        self.assertIsNone(ad.registered(old), "счёт с середины жизни превратил бы «не знаю» в «нет»")
+        self.assertNotIn("life_lines", old)
+        self.assertIn("старого образца", ad.life_stage(old))
+        self.assertIn("не заводился", ad.life_stage(None))
+
+    def test_empty_life_is_unknown(self):
+        st = ad.feed([], ad.new_state())
+        self.assertIsNone(ad.registered(st))
+        self.assertIn("не знаю: лог жизни пуст", ad.life_stage(st))
+
+    def test_blind_reader_is_unknown_not_no(self):
+        """Формат уехал: строки есть, форма не опознана ни в одной — «не знаю», а не «нет»:
+        по «нет» сторож гасит процесс."""
+        st = ad.feed(["[22/09/26 16:35] settings ok"] * 11, ad.new_state())
+        self.assertIsNone(ad.registered(st))
+        self.assertIn("формат лога не опознан", ad.life_stage(st))
+
+    def test_failed_last_read_is_unknown_until_next_good_read(self):
+        st = ad.feed(live_lines(STUCK_FIXTURE), ad.new_state())
+        ad.feed(None, st)                                   # чтение сорвалось
+        self.assertIsNone(ad.registered(st))
+        self.assertIn("последнее чтение лога сорвалось", ad.life_stage(st))
+        ad.feed([], st)                                     # прочитал, новых строк нет
+        self.assertIs(ad.registered(st), False)
+
+    def test_seen_registration_beats_a_failed_read(self):
+        st = ad.feed(live_lines(REGISTERED_FIXTURE), ad.new_state())
+        ad.feed(None, st)
+        self.assertIs(ad.registered(st), True)
 
 
 if __name__ == "__main__":

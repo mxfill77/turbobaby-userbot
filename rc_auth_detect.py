@@ -79,6 +79,30 @@ ESTABLISHED 4/10 у сервера, 10/10 у воркера). Инцидент �
 
 «НЕ ПРОЧИТАЛ» ≠ «ХВОСТ ПУСТ»: сбой stat/чтения отдаёт `read_new(...)[0] is None` и считается
 в `unread`, а не приходит наверх пустым списком строк.
+
+ЖИЗНЬ БЕЗ РЕГИСТРАЦИИ (правка 22.09.2026, разбор docs/artifacts/2026-09-22-rc-device-profile2-stall.md).
+
+ЧТО ИЗМЕРЕНО. С 18.09 21:39 по 22.09 `claude rc` стартовал 91 раз, 88 раз был погашен как ЗОМБИ и
+не зарегистрировался в мосте ни разу. Лог зависшей жизни — 11 строк за 0,9 с (настройки, запись
+`.claude.json`), и ни одной строки `[bridge:`. Здоровый старт 09.09 доходит до `[bridge:init] …
+Registered` за 3,3 с. Детектор читал все эти строки каждые 30 с, но вопроса «была ли регистрация»
+ему никто не задавал.
+
+ЧТО СТАЛО. Состояние жизни несёт ещё и счётчики регистрации: `life_lines`/`life_parsed` (строк за
+жизнь, осмотрено/опознано), `bridge` (строк моста), `registered` (встретился ли хоть один из
+`REGISTERED_MARKS`), `rotations` (сколько раз файл стал короче смещения). Ответ даёт
+`registered(state)`, и исходов у него ТРИ:
+  • True  — маркер регистрации был в этой жизни;
+  • False — лог жизни прочитан, форма строк опознана, маркера нет ни в одной строке;
+  • None  — «не знаю»: состояния нет, оно старого образца (без счётчиков), лог жизни пуст, формат
+    не опознан ни в одной строке, последнее чтение сорвалось. «Не знаю» не приводится к «нет»:
+    по False сторож ГАСИТ процесс.
+
+ПОЧЕМУ СЧЁТЧИКИ ЖИЗНИ НЕ СБРАСЫВАЮТСЯ НА УСЕЧЕНИИ. Файл становится короче не только на подъёме
+ветки: CLI сам ротирует свой лог на 10 МБ (живой `rc_server_debug.log.1`, 12.09 18:43, посреди
+жизни, начатой 09.09). Сброс там стёр бы регистрацию, и здоровый сервер стал бы «незарегистрированным».
+Новую жизнь сторож и так начинает с `new_state()`, поэтому сбрасывать эти счётчики на усечении
+незачем. Пара контракта `seen`/`parsed` сбрасывается как раньше: её правило не менялось.
 """
 
 import os
@@ -107,15 +131,25 @@ FAILS_NEEDED = int(os.getenv("RC_AUTH_FAILS", "1") or "1")
 ID_PREFIX_MIN = 8
 ENABLED = os.getenv("RC_AUTH_WATCH", "1") != "0"    # запасной клапан: выключить детектор целиком
 
+# Регистрация сервера в мосте. Маркеров три и они РАЗНОГО рода (итог регистрации, вход в цикл
+# поллинга, сам поллинг): здоровый старт 09.09 и 22.09 пишет все три за секунды, так что обрыв строки
+# на границе чтения или переименование одного маркера не превращает здоровую жизнь в «нет».
+REGISTERED_MARKS = ("[bridge:init] Registered", "[bridge:work] Starting poll loop", "/work/poll")
+BRIDGE_MARK = "[bridge:"
+_LIFE_KEY = "life_lines"      # по нему узнаём состояние нового образца (со счётчиками жизни)
+
 
 def new_state():
     """Чистое состояние детектора.
 
     `seen`/`parsed` — пара контракта (осмотрено/опознано) за ЖИЗНЬ процесса ветки; `marks` —
     строк с хоть одним из четырёх маркеров; `unread` — неудачных чтений лога («не прочитал» —
-    отдельное число, а не пустой хвост)."""
+    отдельное число, а не пустой хвост). Счётчики регистрации (`life_*`, `bridge`, `registered`,
+    `rotations`, `last_unread`) — про всю жизнь процесса, ротацию лога CLI они переживают (шапка)."""
     return {"offset": 0, "pending": {}, "failures": 0,
-            "seen": 0, "parsed": 0, "marks": 0, "unread": 0}
+            "seen": 0, "parsed": 0, "marks": 0, "unread": 0,
+            _LIFE_KEY: 0, "life_parsed": 0, "bridge": 0, "registered": False,
+            "rotations": 0, "last_unread": False}
 
 
 def ids_match(a, b, minlen=ID_PREFIX_MIN):
@@ -173,15 +207,32 @@ def feed(lines, state):
     Каждая строка идёт в `seen`; опознанная по форме (`_SHAPE_RE`) — ещё и в `parsed`; несущая
     хоть один из четырёх маркеров — в `marks`. Фраза отказа кладёт id в ожидание; строка падения
     с ТЕМ ЖЕ id и малой длительностью подтверждает отказ ДЕЙСТВИЕМ и увеличивает счётчик.
-    Ожидание живёт PAIR_WINDOW строк — пережитый рефрешем 401 так и уходит в никуда."""
+    Ожидание живёт PAIR_WINDOW строк — пережитый рефрешем 401 так и уходит в никуда.
+
+    Счётчики жизни ведутся, только если они в состоянии УЖЕ есть. Состояние старого образца
+    посреди жизни их не получает: начни мы счёт с середины, «не знаю, что было до» стало бы «не было»."""
+    life = _LIFE_KEY in state
     if lines is None:
         state["unread"] = state.get("unread", 0) + 1
+        if life:
+            state["last_unread"] = True
         return state
+    if life:
+        state["last_unread"] = False
     pending = state.setdefault("pending", {})
     for line in lines:
         state["seen"] = state.get("seen", 0) + 1
-        if _SHAPE_RE.match(line):
+        shaped = bool(_SHAPE_RE.match(line))
+        if shaped:
             state["parsed"] = state.get("parsed", 0) + 1
+        if life:
+            state[_LIFE_KEY] += 1
+            if shaped:
+                state["life_parsed"] = state.get("life_parsed", 0) + 1
+            if BRIDGE_MARK in line:
+                state["bridge"] = state.get("bridge", 0) + 1
+            if not state.get("registered") and any(m in line for m in REGISTERED_MARKS):
+                state["registered"] = True
         if _has_mark(line):
             state["marks"] = state.get("marks", 0) + 1
         for key in list(pending):
@@ -218,8 +269,55 @@ def scan(path, state, opener=None, sizer=None):
         state["seen"] = 0                  # и пара контракта тоже: она про ТЕКУЩУЮ жизнь ветки
         state["parsed"] = 0
         state["marks"] = 0
+        # Счётчики регистрации НЕ сбрасываем: файл короче смещения бывает и посреди жизни, когда
+        # CLI ротирует свой лог на 10 МБ (шапка). Считаем только, сколько раз это случилось.
+        if _LIFE_KEY in state:
+            state["rotations"] = state.get("rotations", 0) + 1
     state["offset"] = offset
     return feed(lines, state)
+
+
+def registered(state):
+    """Была ли в ЭТОЙ жизни процесса регистрация в мосте → True / False / None.
+
+    False выносится, только когда есть на чём судить: строки жизни прочитаны, форма хоть одной
+    опознана, последнее чтение удалось, а маркера нет. Всё прочее — None («не знаю»): по False
+    сторож гасит процесс, и незнание приговором быть не смеет."""
+    if state is None or _LIFE_KEY not in state:
+        return None                        # детектора не было или состояние старого образца
+    if state.get("registered"):
+        return True
+    if state.get("last_unread"):
+        return None                        # последнее чтение сорвалось — хвоста не видел
+    if int(state.get(_LIFE_KEY, 0)) <= 0 or int(state.get("life_parsed", 0)) <= 0:
+        return None                        # лог жизни пуст или формат не опознан
+    return False
+
+
+def life_stage(state):
+    """До какой стадии дошла жизнь — для строки сторожа и карточки владельцу, С ЧИСЛАМИ."""
+    if state is None:
+        return "детектор не заводился: состояния нет"
+    if _LIFE_KEY not in state:
+        return "состояние старого образца: счётчиков жизни в нём нет"
+    nums = "строк лога %d, строк моста %d" % (int(state.get(_LIFE_KEY, 0)),
+                                              int(state.get("bridge", 0)))
+    if state.get("rotations"):
+        nums += ", ротаций лога %d" % int(state["rotations"])
+    reg = registered(state)
+    if reg is True:
+        return "зарегистрирован в мосте (%s)" % nums
+    if reg is None:
+        if state.get("last_unread"):
+            why = "последнее чтение лога сорвалось"
+        elif int(state.get(_LIFE_KEY, 0)) <= 0:
+            why = "лог жизни пуст"
+        else:
+            why = "формат лога не опознан ни в одной строке"
+        return "не знаю: %s (%s)" % (why, nums)
+    if int(state.get("bridge", 0)) <= 0:
+        return "до [bridge:init] — ни одной строки моста (%s)" % nums
+    return "мост начат, регистрации нет (%s)" % nums
 
 
 def reading(state):
