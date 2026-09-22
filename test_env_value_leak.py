@@ -16,7 +16,7 @@ import pretool_guard as g
 FAKE_NEEDLE = "Zq7w2Er9Ty4Ui1Op6As3Df"          # 22 алфанум подряд — выше порога 16
 ENV_FIX = {
     "FIXTURE_TOKEN": FAKE_NEEDLE,
-    "THINKER_MODEL": "claude-opus-5",            # 6 — ниже порога, стоит в каждом файле репо
+    "THINKER_MODEL": "claude-opus-5-5",          # 6 — ниже порога, стоит в каждом файле репо
     "PATH": r"C:\Windows\System32;C:\Program Files\Git\cmd",
     "USERNAME": "mxfill1",
     "PRETOOL_MARKER_TOKEN": "abcdefghijklm",     # 13 — ровно под нижним краем промежутка 13→18
@@ -38,8 +38,8 @@ class ThresholdMeasured(unittest.TestCase):
         self.assertEqual(names, ["FIXTURE_TOKEN"])
 
     def test_model_name_never_becomes_needle(self):
-        """`claude-opus-5` стоит в CLAUDE.md и в .env — иглой ему быть НЕЛЬЗЯ никогда."""
-        self.assertEqual(g._env_value_in_text("модель claude-opus-5 единственная", ENV_FIX), "")
+        """`claude-opus-5-5` стоит в CLAUDE.md и в .env — иглой ему быть НЕЛЬЗЯ никогда."""
+        self.assertEqual(g._env_value_in_text("модель claude-opus-5-5 основная", ENV_FIX), "")
 
     def test_path_is_not_specific(self):
         """Значение с разделителем пути специфичным не считается: путь совпадёт с чем угодно."""

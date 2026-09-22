@@ -2345,7 +2345,8 @@ def resolve_claude(retries=1, retry_sleep=2.0):
 
 
 # --- модель ИСПОЛНИТЕЛЯ headless-задач lane=pc (решение владельца 24.07.2026, тема 328;
-# 30.07.2026 переведён на claude-opus-5 — «Opus 5 для наших задач лучше») ----------------------
+# 30.07.2026 переведён на claude-opus-5 — «Opus 5 для наших задач лучше»; 23.09.2026 — на
+# claude-opus-5-5, решение владельца: основная claude-opus-5-5, запасная claude-opus-5) ---------
 # Раньше run_claude звал claude -p БЕЗ --model: модель ТИХО бралась из .claude/settings.json
 # (дефолт интерактивных сессий репо). Env-ручки ORCH_MODEL / EXECUTOR_MODEL / EXECUTOR_EFFORT —
 # имена VPS-полосы, ПК-код их НЕ читает: «запрошен sonnet — берётся чужая модель» ровно отсюда
@@ -2354,9 +2355,9 @@ def resolve_claude(retries=1, retry_sleep=2.0):
 # смена модели = правка строки + коммит → self-update сам перезапустит демон штатным потоком.
 # Env сознательно НЕ читаем (детерминизм: застрявший .env / унаследованный os.environ не смеют
 # молча переключить модель — класс #194). SUGGEST_MODEL (клиентский suggest, sonnet) и
-# THINKER_MODEL (думатель, claude-opus-5) не задеты — у них свои явные --model. Полный id
+# THINKER_MODEL (думатель, claude-opus-5-5) не задеты — у них свои явные --model. Полный id
 # обязателен: короткий алиас → HTTP 404 у claude -p (класс #194).
-EXECUTOR_MODEL = "claude-opus-5"
+EXECUTOR_MODEL = "claude-opus-5-5"
 
 
 # ─── ЧАСЫ БОДРСТВОВАНИЯ: СОН МАШИНЫ НЕ ТРАТИТ БЮДЖЕТ ЗАДАЧИ (разбор 01.08.2026) ──────────────
@@ -5853,20 +5854,35 @@ STEP_SELFHEAL_TIMEOUT = int(os.getenv("PC_SELFHEAL_TIMEOUT", "180") or "180")   
 # короткий алиас → ПОЛНЫЙ id ЗДЕСЬ, на старте: иммунно к застрявшему env, переживает наследование
 # через _spawn_daemon и рестарты/перезагрузки ПК.
 # 30.07.2026, решение владельца «убрать снятую голову из работы»: ВСЕ её имена — и короткие, и
-# полное — ведут на claude-opus-5. Слева они живут ТОЛЬКО как ключи снятия: застрявшее в чьём-то
-# окружении старое значение развернётся в Opus 5, а не вернёт снятую модель чёрным ходом мимо
+# полное — ведут на основную голову. Слева они живут ТОЛЬКО как ключи снятия: застрявшее в чьём-то
+# окружении старое значение развернётся в основную, а не вернёт снятую модель чёрным ходом мимо
 # .env. Убрать ключи нельзя — тогда старое значение уйдёт в claude -p как есть и даст 404 (#194).
-_MODEL_ALIAS_FULL = {"fable-5": "claude-opus-5", "fable5": "claude-opus-5",
-                     "fable": "claude-opus-5", "claude-fable-5": "claude-opus-5",
-                     "opus-4.8": "claude-opus-4-8", "opus-4-8": "claude-opus-4-8"}
+# 23.09.2026 лестница сдвинута (решение владельца): основная claude-opus-5-5, запасная
+# claude-opus-5. claude-opus-4-8 ушёл с лестницы и встал в ключи снятия рядом с fable — ВСЕ его
+# имена, и полное тоже. claude-opus-5 ключом НЕ является: это живая запасная ступень.
+_MODEL_ALIAS_FULL = {"fable-5": "claude-opus-5-5", "fable5": "claude-opus-5-5",
+                     "fable": "claude-opus-5-5", "claude-fable-5": "claude-opus-5-5",
+                     "opus-4.8": "claude-opus-5-5", "opus-4-8": "claude-opus-5-5",
+                     "claude-opus-4-8": "claude-opus-5-5"}
+_THINKER_RESERVE = "claude-opus-5"   # запасная ступень лестницы (решение владельца 23.09.2026)
 def _norm_model_id(m):
-    """Короткий алиас модели → ПОЛНЫЙ id (claude -p на коротком отвечает 404, #194); имена снятой
-    головы → claude-opus-5. Неизвестное значение возвращаем как есть — не ломаем валидные полные
+    """Короткий алиас модели → ПОЛНЫЙ id (claude -p на коротком отвечает 404, #194); имена снятых
+    голов → claude-opus-5-5. Неизвестное значение возвращаем как есть — не ломаем валидные полные
     id, «sonnet» и будущие модели."""
     m = (m or "").strip()
     return _MODEL_ALIAS_FULL.get(m, m)
-THINKER_MODEL = _norm_model_id(os.getenv("THINKER_MODEL", "claude-opus-5")) or "claude-opus-5"  # своя голова думателя (НЕ SUGGEST_MODEL); нормализована в ПОЛНЫЙ id
-THINKER_FALLBACK = _norm_model_id(os.getenv("THINKER_FALLBACK", "claude-opus-4-8"))               # свой фолбэк думателя; нормализован в ПОЛНЫЙ id
+def _norm_fallback_id(m, main):
+    """Фолбэк думателя → ПОЛНЫЙ id, и НИКОГДА не равный основной. Снятое имя карта ведёт на
+    основную, поэтому застрявший в окружении фолбэк со снятой головой схлопнул бы лестницу в одну
+    ступень: --fallback-model == --model — это «запасной нет», а SDK такую пару прямо отвергает
+    («Fallback model cannot be the same as the main model»). Совпал с основной → запасная ступень;
+    совпала и она (основной назначена сама запасная) → фолбэка нет, флаг не передаётся."""
+    f = _norm_model_id(m)
+    if f and f == main:
+        f = _THINKER_RESERVE if main != _THINKER_RESERVE else ""
+    return f
+THINKER_MODEL = _norm_model_id(os.getenv("THINKER_MODEL", "claude-opus-5-5")) or "claude-opus-5-5"  # своя голова думателя (НЕ SUGGEST_MODEL); нормализована в ПОЛНЫЙ id
+THINKER_FALLBACK = _norm_fallback_id(os.getenv("THINKER_FALLBACK", _THINKER_RESERVE), THINKER_MODEL)  # свой фолбэк думателя; ПОЛНЫЙ id, не равен основной
 # Маркер перерождения одиночной задачи стоит ПЕРВЫМ в тексте → якорь ^ (страховка от ложного
 # срабатывания на ТЗ, где маркер лишь упомянут в теле). N = id исходной задачи.
 _HEAL_TASK_RE = re.compile(r"^\s*\[самопочинка задачи (\d+), попытка (\d+)\]")
@@ -10550,7 +10566,7 @@ REVIZOR_CHECKLIST_DEFAULT = (
 # статичная РОЛЬ (_PREFIX) + ЖИВОЙ чек-лист классов (_revizor_checklist) + статичный КОНТРАКТ ВЫВОДА
 # (_SUFFIX). Тот же _thinker_exec-паттерн, что и самопочинка (read-only, --max-turns 1, --allowed-tools
 # '', нейтральный cwd → НИЧЕГО не исполняет, файлы не читает — судит строго по данным пакета). Модель
-# THINKER_MODEL=claude-opus-5, фолбэк claude-opus-4-8, таймаут REVIZOR_TIMEOUT=300с. Задача —
+# THINKER_MODEL=claude-opus-5-5, фолбэк claude-opus-5, таймаут REVIZOR_TIMEOUT=300с. Задача —
 # ПОСТ-ФАКТУМ аудит одного клиентского окна (реплики клиента + наши отправленные + черновики) по
 # чек-листу дефектов ответа. Выход — СТРОГО JSON-массив находок (пустой [] = нарушений нет); каждая
 # находка маршрутизируется позднейшими шагами 262 по полю action. Думатель ничего не чинит сам.

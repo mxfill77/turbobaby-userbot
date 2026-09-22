@@ -611,11 +611,11 @@ class TestSessionMetrics(unittest.TestCase):
          "entrypoint": "claude-desktop"},
         {"type": "last-prompt", "lastPrompt": "ultrathink ТОЛЬКО read-only, ничего не менять"},
         {"type": "assistant", "timestamp": "2026-07-24T21:35:00.000Z",
-         "message": {"role": "assistant", "model": "claude-opus-5",
+         "message": {"role": "assistant", "model": "claude-opus-5-5",
                      "usage": {"input_tokens": 2, "cache_read_input_tokens": 1000,
                                "cache_creation_input_tokens": 500, "output_tokens": 40}}},
         {"type": "assistant", "timestamp": "2026-07-24T21:35:03.500Z",
-         "message": {"role": "assistant", "model": "claude-opus-5",
+         "message": {"role": "assistant", "model": "claude-opus-5-5",
                      "usage": {"input_tokens": 3, "cache_read_input_tokens": 2000,
                                "cache_creation_input_tokens": 0, "output_tokens": 60}}},
     ]
@@ -635,7 +635,7 @@ class TestSessionMetrics(unittest.TestCase):
             line = dn._session_metrics_line(self._transcript())
         self.assertTrue(line.startswith("METRICS "), line)
         self.assertIn(" task=78d27126 ", line)
-        self.assertIn(" model=claude-opus-5 ", line)
+        self.assertIn(" model=claude-opus-5-5 ", line)
         self.assertIn(" effort=xhigh ", line)
         self.assertIn(" src=claude-desktop ", line)
         self.assertIn(" outcome=done ", line)

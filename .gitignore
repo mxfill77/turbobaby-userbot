@@ -12,7 +12,7 @@ chatlog/
 chatlog_superseded_*/
 venv/
 # .claude/* игнорим целиком, КРОМЕ общих настроек проекта: в settings.json лежит дефолт репо
-# (модель claude-opus-5, effortLevel xhigh, MAX_THINKING_TOKENS, хуки Notification/Stop/
+# (модель claude-opus-5-5, effortLevel xhigh, MAX_THINKING_TOKENS, хуки Notification/Stop/
 # SessionEnd/PreToolUse). Без версии этот дефолт жил бы ТОЛЬКО на этом ПК и терялся при
 # переустановке. Личный settings.local.json (машинные allow-правила) как был, так и игнорится.
 # Здесь именно `.claude/*`, а не `.claude/`: git не умеет ре-включать файл внутри исключённого
