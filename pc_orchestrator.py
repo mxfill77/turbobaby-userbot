@@ -69,6 +69,7 @@ import deploy_voice           # ГОЛОС подъёма ребёнка МИМ�
 import close_msg_pc           # ТРИ ЧЕЛОВЕЧЕСКИЕ СТРОКИ в начале сообщения о закрытии; чистая, ничего не судит
 import git_serial_pc          # ОДИН ИНДЕКС — ОДНА РУКА: замок ядра на git-писателей полосы (задача 238)
 import exit_evidence          # СВИДЕТЕЛЬСТВО ВЫХОДА процесса (код возврата + хвост stderr) и разведение «не дали работать»/«сломались»; чистый
+import profile_choice         # ВЫБОР УЧЁТКИ СТРОИТЕЛЕЙ: файл дерева решает судьбу CLAUDE_CONFIG_DIR у ребёнка; чистый, реестра не касается
 try:
     # Словарь ВИДОВ красных операций и разбор карточки — у гарда, и только у него: демону нужно
     # понять, НА ЧТО именно владелец сказал «да» (`kinds_from_card`), а держать второй список
@@ -2939,6 +2940,17 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
     # равенство закреплено инвариантом `test_probe_isolation.TestDaemonStripsTheSameFlags`.
     for _test_flag in ("PRETOOL_TEST_RUN", "ORCH_TEST_MODE", "PRETOOL_NOPUSH", "PYTEST_CURRENT_TEST"):
         env.pop(_test_flag, None)
+    # ── УЧЁТКА СТРОИТЕЛЕЙ РЕШАЕТСЯ ФАЙЛОМ ДЕРЕВА, А НЕ РЕЕСТРОМ (22.09.2026) ─────────────────
+    # До сих пор её решала постоянная переменная пользователя `CLAUDE_CONFIG_DIR` в
+    # `HKCU\Environment` — рычаг за пределами проекта (полоса не может тронуть его сама),
+    # действующий на ВСЕ процессы учётной записи и требующий перезахода владельца. Теперь
+    # решение живёт в `claude_profile_choice.txt` и применяется ПОВЕРХ унаследованного значения
+    # ровно здесь, при сборке окружения ребёнка. Реестр не трогается ни на чтение, ни на запись.
+    # Третий исход (файла нет, пусто, мусор, путь не существует) НЕ трогает окружение ВОВСЕ и
+    # называет причину строкой в журнале — это прежнее поведение байт-в-байт.
+    _pchoice = profile_choice.apply_to(env, REPO)
+    (log.warning if _pchoice.action == profile_choice.ACT_KEEP else log.info)(
+        "%s", profile_choice.line(_pchoice, tid))
     env["PYTHONIOENCODING"] = "utf-8"            # ребёнок пишет stdout/stderr в utf-8 → нет кракозябр (пара к encoding в run_claude)
     env[ASK_MARKER_ENV] = marker_path            # pretool_guard в headless пишет сюда красную карточку
     env[MARKER_TOKEN_ENV] = run_token            # …штампуя её нашим токеном — чужие карточки отсеем
@@ -5981,6 +5993,14 @@ def _thinker_exec(prompt, timeout, tag):
     # ребёнок несёт свой гард. Один класс — обе ветки спавна, иначе зеркальная течь.
     for _test_flag in ("PRETOOL_TEST_RUN", "ORCH_TEST_MODE", "PRETOOL_NOPUSH", "PYTEST_CURRENT_TEST"):
         env.pop(_test_flag, None)
+    # ТОТ ЖЕ ВЫБОР УЧЁТКИ, ЧТО У ИСПОЛНИТЕЛЯ (`_run_task_impl`): думатель тоже спавнит claude и
+    # тоже ходит по подписке. Один класс — обе ветки спавна, иначе зеркальная течь: исполнитель
+    # уехал бы на основной профиль, а думатель остался бы на том, что застряло в окружении
+    # демона, — и разошлись бы они МОЛЧА. Равенство веток держит тест
+    # `test_profile_choice.TestBothSpawnBranchesAsk`.
+    _pchoice = profile_choice.apply_to(env, REPO)
+    (log.warning if _pchoice.action == profile_choice.ACT_KEEP else log.info)(
+        "%s: %s", tag, profile_choice.line(_pchoice))
     env["PYTHONIOENCODING"] = "utf-8"
     # Глубина размышления ЯВНО. Нейтральный cwd (tempdir) — сознательное решение выше: он
     # отсекает hooks/pretool_guard репо. Но вместе с ними отсекается и `effortLevel` из
@@ -7647,6 +7667,14 @@ _ORCH_RUNTIME = ("pc_orchestrator.py", "gate_selective.py", "task_metrics.py",
                  # утечёт ли в запись секрет из stderr. Модуль чистый (только `re`, инвариант
                  # test_module_imports_only_re) — замыкание не растит ни на файл.
                  "exit_evidence.py",
+                 # 22.09.2026: ВЫБОР УЧЁТКИ СТРОИТЕЛЕЙ. Верхний импорт, и цена грязи здесь своя и
+                 # МОЛЧАЛИВАЯ: `profile_choice.py` решает, какой учёткой полоса вообще работает.
+                 # Ошибка в одну сторону уводит строителей в профиль БЕЗ ВХОДА (замер 70u: пустой
+                 # `CLAUDE_CONFIG_DIR` даёт три маркера отказа входа), в другую — оставляет их на
+                 # резервном профиле; и ни то ни другое демон в лог сам не пишет — увидят это по
+                 # провалу задач, а не по строке. Модуль чистый (io/os/collections, инвариант
+                 # PROFILE_CHOICE_PURE), замыкание не растит ни на файл.
+                 "profile_choice.py",
                  # 30.07.2026: демон импортирует их СВЕРХУ, значит незакоммиченная правка уедет в
                  # бой вместе с рестартом. pretool_guard — новый импорт (словарь видов красного для
                  # разбора одобренной карточки), io_utf8 стоял в импортах и в список не попал.
