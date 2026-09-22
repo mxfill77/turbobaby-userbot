@@ -31,9 +31,17 @@ lesson_promote.py — ДВЕРЬ, которой урок переводится
     venv/Scripts/python.exe lesson_promote.py --who filipp --rollback 7
     venv/Scripts/python.exe lesson_promote.py --trace
 
+СЛОВА «БОТ ОТВЕЧАЕТ» — ТОЛЬКО ПОСЛЕ ЖИВОГО ЧИТАТЕЛЯ (22.09.2026, задание 71b). До 22.09 карточка
+перевода говорила «ВКЛЮЧЁН — бот отвечает по нему со следующего ответа» при любом `--path`: замер 70x —
+перевод внутри `exam_live/lessons.tsv` печатал эти слова, а живой читатель видел 0 из 13 действующих
+строк той копии. Теперь дверь меряет собранный промпт ДО и ПОСЛЕ перевода (`lesson_transfer
+.answer_verdict`); строка урока не вернулась — первая строка карточки заменяется правдой («переведён в
+действующие этой базы, но в ответ ещё НЕ вошёл»), и код возврата 3, а не 0.
+
 Код возврата: 0 — сделано, 1 — отказано (внятными словами в stdout), 2 — разбор командной
-строки. Отказ печатается в stdout, а не в stderr: эту строку читает ЧЕЛОВЕК (её пересылает в
-Telegram `pc_agent`), а не разборщик логов.
+строки, 3 — перевод записан, но в ответ бота НЕ вошёл (или сверить не удалось). Отказ печатается в
+stdout, а не в stderr: эту строку читает ЧЕЛОВЕК (её пересылает в Telegram `pc_agent`), а не
+разборщик логов.
 """
 
 import argparse
@@ -43,6 +51,7 @@ import io_utf8
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
+EXIT_NOT_IN_ANSWER = 3
 
 
 def _candidates_card(path=None):
@@ -114,7 +123,17 @@ def main(argv=None):
 
     import trainer
     if args.promote is not None:
+        import lesson_transfer
+        # Замер «до» — по буллету кандидата: перевод меняет только «почему» и состояние, а буллет
+        # собирается из «как правильно» и «когда», поэтому до и после перевода он один и тот же.
+        bullet = lesson_transfer.row_bullet(args.promote, args.path)
+        before = lesson_transfer.answer_count(bullet)
         dec = trainer.promote_lesson(args.promote, why=args.why, who=args.who, path=args.path)
+        if dec["status"] == trainer.STATUS_PROMOTED:
+            seen = lesson_transfer.answer_verdict(bullet, before)
+            if not seen.ok:
+                print(lesson_transfer.promoted_not_in_answer_card(dec, seen, args.path))
+                return EXIT_NOT_IN_ANSWER
     else:
         dec = trainer.rollback_promotion(args.rollback, who=args.who, path=args.path)
     print(dec["card"])

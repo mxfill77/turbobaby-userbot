@@ -64,6 +64,14 @@ class _Base(unittest.TestCase):
         # которым путь не передают.
         self.addCleanup(setattr, LS, "STORE_PATH", LS.STORE_PATH)
         LS.STORE_PATH = self.store
+        # ЖИВОЙ ЧИТАТЕЛЬ ПРАВИЛ (22.09.2026): дверь перевода сверяет собранный промпт, а читатель берёт
+        # и книгу. Книга уводится во временный каталог, чтение базы — включено и по умолчанию смотрит
+        # в подменённый `STORE_PATH`: боевые книга и база не читаются ни одной веткой теста.
+        for name in ("PLAYBOOK_FILE", "LESSON_BASE_PATH", "LESSON_BASE_OFF"):
+            self.addCleanup(setattr, suggest, name, getattr(suggest, name))
+        suggest.PLAYBOOK_FILE = os.path.join(self.box, "playbook.md")
+        suggest.LESSON_BASE_PATH = None
+        suggest.LESSON_BASE_OFF = False
         self.meta = {trainer.K_INCOMING: Q, trainer.K_ANSWER: A}
 
     def get(self, key):
