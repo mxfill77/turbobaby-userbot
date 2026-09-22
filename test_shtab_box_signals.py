@@ -2182,7 +2182,9 @@ class TestThreeOutcomesSplit68i(unittest.TestCase):
         """Один вход — три РАЗНЫХ имени исхода, а не одно «недоказана»."""
         self.assertEqual(sig.SORT_OURS, sig.sort_of(_ours_fail(112), {})[0])
         self.assertEqual(sig.SORT_FOREIGN, sig.sort_of(_vps(113), {})[0])
-        self.assertEqual(sig.SORT_UNREAD, sig.sort_of(_vps(114, "done", ""), {})[0])
+        # #114 — lane=vps, done, реестра ПК о нём нет и быть не может. С 22.09 (задание 70p)
+        # у этого факта СВОЁ имя: «судьи у полосы нет» вместо общего «вердикта нет вовсе».
+        self.assertEqual(sig.SORT_NOJUDGE, sig.sort_of(_vps(114, "done", ""), {})[0])
         self.assertEqual(sig.SORT_EXT, sig.sort_of(_ext(101), {})[0])
         # ИМЯ РЯДА ПОДНИМАЕТСЯ ИЗ `goal`, а `goal` кладёт `box_rows` — спрашивать судью
         # о сыром ряде очереди нельзя ни здесь, ни в бою (тот же класс, что правка 11.09).
@@ -2195,7 +2197,7 @@ class TestThreeOutcomesSplit68i(unittest.TestCase):
         self.assertEqual({sig.SORT_OURS: sig.SIG_A, sig.SORT_EXT: sig.SIG_E,
                           sig.SORT_UNREAD: sig.SIG_F, sig.SORT_FOREIGN: sig.SIG_G},
                          sig.SORT_SIGNAL)
-        rep = _tick(closed=[_ext(101), _vps(113), _vps(114, "done", ""), _ours_fail(115)],
+        rep = _tick(closed=[_ext(101), _vps(113), _closed(114), _ours_fail(115)],
                     budget=50)
         why = [s for s in rep["signals"] if s["sig"] == sig.SIG_A][0]["why"]
         for word in (sig.SORT_EXT, sig.SORT_UNREAD, sig.SORT_FOREIGN,
@@ -2252,7 +2254,7 @@ class TestThreeOutcomesSplit68i(unittest.TestCase):
     # ── п.3: ПРАВО НЕ ОСЛАБЛЕНО ──────────────────────────────────────────
     def test_RIGHT_is_not_weakened_owner_word_only_and_no_self_release_branch(self):
         """Снимает ТОЛЬКО владелец, ветки самоснятия у новых сигналов НЕТ ни одной."""
-        for one in (sig.signal_f([_vps(i, "done", "") for i in (1, 2, 3)], {}),
+        for one in (sig.signal_f([_closed(i) for i in (1, 2, 3)], {}),
                     sig.signal_g([_vps(i) for i in (1, 2, 3)], {})):
             self.assertTrue(one["on"], one["why"])
             self.assertEqual(sig.BY_OWNER, one["release"])
@@ -2264,7 +2266,7 @@ class TestThreeOutcomesSplit68i(unittest.TestCase):
 
     def test_RIGHT_is_not_weakened_the_new_sorts_still_stop_the_box(self):
         """Разведение — не льгота: три подряд каждого нового сорта ДЕРЖАТ ящик."""
-        for closed in ([_vps(i, "done", "") for i in (11, 12, 13)],
+        for closed in ([_closed(i) for i in (11, 12, 13)],
                        [_vps(i) for i in (21, 22, 23)]):
             rep = _tick(closed=closed, budget=50)
             self.assertIn("СИГНАЛЬНАЯ ОСТАНОВКА ЯЩИКА", rep["stop"])
@@ -2292,13 +2294,15 @@ class TestThreeOutcomesSplit68i(unittest.TestCase):
         self.assertEqual(sig.SORT_OURS, sig.sort_of(got[1], rows_led)[0])  # судья: «без адреса»
 
     # ── счёт сортов и невычеркнутые ряды ─────────────────────────────────
-    def test_the_tally_always_names_all_five_sorts(self):
+    def test_the_tally_always_names_every_sort(self):
         """Ключ без значения читался бы как «сорта не существует»."""
         self.assertEqual({s: 0 for s in sig.SORTS}, sig.sort_tally([], {}))
         got = sig.sort_tally(sig.box_rows([_ours_fail(1), _ext(2), _vps(3),
-                                           _vps(4, "done", "")]), {})
+                                           _vps(4, "done", ""), _closed(5),
+                                           _uncalled(6)]), {})
         self.assertEqual({sig.SORT_OURS: 1, sig.SORT_EXT: 1, sig.SORT_FOREIGN: 1,
-                          sig.SORT_UNREAD: 1, sig.SORT_PROVED: 0}, got)
+                          sig.SORT_UNREAD: 1, sig.SORT_NOJUDGE: 1, sig.SORT_UNCALLED: 1,
+                          sig.SORT_PROVED: 0}, got)
 
     def test_a_proved_row_between_two_failures_still_breaks_the_streak(self):
         """Доказанная задача РВЁТ череду — вычёркиваются только три немых сорта."""
@@ -2318,6 +2322,152 @@ class TestThreeOutcomesSplit68i(unittest.TestCase):
         got = sig.evaluate(closed=[], open_rows=[], judged={}, day=TODAY, left=5, budget=50)
         self.assertEqual(list(sig.SIGNALS), [s["sig"] for s in got])
         self.assertEqual(7, len(got))
+
+
+# ═══════════ ТРИ ФАКТА ПОД ПРИЗНАКОМ «ВЕРДИКТА НЕТ» (22.09.2026, задание 70p) ═
+# ЖИВЫЕ РЯДЫ, А НЕ ВЫДУМАННЫЕ. Корпус — ВСЕ ТРИ постановки сигнала Е за всю его
+# жизнь (`pc_orchestrator.shtab_box_hold.jsonl`, 21.09.2026 13:26 · 13:40 · 21:04;
+# улики #6,#7,#8 · #7,#8,#9 · #23,#25,#26). Полосу каждого ряда даёт долгая память
+# ящика (`pc_orchestrator.shtab_box_taken.jsonl`): #6,#7,#8,#9,#25,#26 — `vps`,
+# #23 — `pc`. Дверь закрытия #23 названа журналом демона (`pc_orchestrator.log`,
+# 22.09 02:58:55 `MARK-ADDR-CLOSE id=23`), и ни одной строки `V0-DONE id=23` там нет.
+def _uncalled(tid, day=TODAY, key=None):
+    """Ряд, закрытый ЗЕЛЁНЫМ дверью маркера-против-адреса — живая форма #23.
+
+    Текст собирает САМ владелец двери (`mark_vs_address_pc.close_result`), а не эта
+    фикстура: наберём голову здесь литералом — и набор будет зеленеть на подписи,
+    которой в бою уже нет. Черновик доклада стои́т НИЖЕ головы ровно как в бою.
+    """
+    import mark_vs_address_pc as mva
+
+    return _closed(tid, "done",
+                   mva.close_result("🔴 гард: правка .env — разрешить?", mva.R_PROVEN,
+                                    "V0 прочитал продукт", obj=".env", kind="env",
+                                    draft="🧾 ЧЕРНОВИК: сделано, артефакт лежит"),
+                   day=day, key=key)
+
+
+class TestSilentSplit70p(unittest.TestCase):
+    """Остановка встаёт на ОДНОМ сорте из трёх — и это показано числом на каждом."""
+
+    # ── п.1: три сорта поимённо, и признак каждого назван ────────────────
+    def test_three_rows_one_silent_registry_three_different_sorts(self):
+        """Один и тот же ответ реестра («записи нет») — три РАЗНЫХ имени исхода."""
+        self.assertEqual(sig.SORT_UNREAD, sig.sort_of(_closed(1), {})[0])
+        self.assertEqual(sig.SORT_NOJUDGE, sig.sort_of(_vps(2, "done", ""), {})[0])
+        self.assertEqual(sig.SORT_UNCALLED, sig.sort_of(_uncalled(3), {})[0])
+        # Все три ряда — «вердикта нет вовсе»: разводит их НЕ реестр.
+        for row in (_closed(1), _vps(2, "done", ""), _uncalled(3)):
+            self.assertEqual(cd.JUDGE_SILENT,
+                             cd.judged_of(row["id"], {}, goal=row["task_text"]))
+
+    def test_the_sign_of_the_third_sort_comes_from_the_daemons_place(self):
+        """Признак «судью не звали» — ПЕРВАЯ строка итога, и она пишется демоном.
+
+        Цитата той же фразы В ТЕЛЕ доклада подписью двери не является: иначе
+        задача, разбирающая этот самый класс, объявила бы себя закрытой чужой
+        дверью (тот же замок, что у `daemon_part`).
+        """
+        self.assertTrue(sig.addr_door(_uncalled(4))[0])
+        quoted = _closed(5, "done", "🧾 ЧЕРНОВИК: дверь пишет «%s» — разбираю"
+                         % sig.ADDR_CLOSE_HEAD)
+        self.assertFalse(sig.addr_door(quoted)[0])
+        self.assertEqual(sig.SORT_UNREAD, sig.sort_of(quoted, {})[0])
+
+    # ── п.4: ТРИ МУТАНТА, ТРИ ЧИСЛА ──────────────────────────────────────
+    def test_MUTANT_1_judge_was_called_and_failed_DOES_stop_the_box(self):
+        """Три ряда нашей полосы обычной дверью без вердикта — Е ВСТАЁТ, число 3."""
+        rep = _tick(closed=[_closed(i) for i in (11, 12, 13)], budget=50)
+        one = [s for s in rep["signals"] if s["sig"] == sig.SIG_F][0]
+        self.assertTrue(one["on"], one["why"])
+        self.assertEqual(sig.UNREAD_STREAK_FLOOR, one["count"])
+        self.assertEqual(["#11", "#12", "#13"], one["evidence"])
+        self.assertIn("СИГНАЛЬНАЯ ОСТАНОВКА ЯЩИКА", rep["stop"])
+
+    def test_MUTANT_2_foreign_lane_rows_do_NOT_stop_the_box(self):
+        """Живая форма #25/#26 (lane=vps, done) — Е МОЛЧИТ, число 0, ящик не стои́т."""
+        rep = _tick(closed=[_vps(i, "done", "") for i in (24, 25, 26)], budget=50)
+        one = [s for s in rep["signals"] if s["sig"] == sig.SIG_F][0]
+        self.assertFalse(one["on"], one["why"])
+        self.assertEqual(0, one["count"])
+        self.assertEqual("", rep["stop"])
+
+    def test_MUTANT_3_rows_closed_by_the_other_door_do_NOT_stop_the_box(self):
+        """Живая форма #23 (MARK-ADDR-CLOSE) — Е МОЛЧИТ, число 0, ящик не стои́т."""
+        rep = _tick(closed=[_uncalled(i) for i in (21, 22, 23)], budget=50)
+        one = [s for s in rep["signals"] if s["sig"] == sig.SIG_F][0]
+        self.assertFalse(one["on"], one["why"])
+        self.assertEqual(0, one["count"])
+        self.assertEqual("", rep["stop"])
+
+    # ── п.2: имя, счёт и строка человеку у сортов, которые не гасят ──────
+    def test_the_two_quiet_sorts_still_get_a_name_a_count_and_a_line(self):
+        """Вычеркнуть молча нельзя: оба сорта названы и посчитаны в строке человеку."""
+        rows = sig.box_rows([_vps(31, "done", ""), _uncalled(32), _closed(33)])
+        words = sig.silent_words(rows, {})
+        for part in (sig.SORT_UNREAD, sig.SORT_NOJUDGE, sig.SORT_UNCALLED,
+                     "ящик ими не останавливается"):
+            self.assertIn(part, words)
+        self.assertIn("Вердикта нет вовсе у 3 ряд(ов)", words)
+        # И при молчащем Е, и при сработавшем — строка на месте.
+        self.assertIn(sig.SORT_UNCALLED, sig.signal_f(rows, {})["why"])
+        loud = [_closed(i) for i in (41, 42, 43)]
+        self.assertIn(sig.SORT_UNCALLED, sig.signal_f(loud, {})["why"])
+
+    # ── п.3: счёт серии не слит ──────────────────────────────────────────
+    def test_the_uncalled_row_is_neither_success_nor_failure_for_signal_a(self):
+        """Ряд «судью не звали» не кормит А и не рвёт его череду — выходит с ПРИЧИНОЙ."""
+        rows = sig.box_rows([_ours_fail(51), _uncalled(52), _ours_fail(53)])
+        one = sig.signal_a(rows, {})
+        self.assertTrue(one["on"], one["why"])            # соседство по НАШИМ рядам цело
+        self.assertEqual(["#51", "#53"], one["evidence"])  # ряд 52 не рвёт череду
+        self.assertIn(sig.SORT_UNCALLED, one["why"])       # и вычеркнут НЕ МОЛЧА
+        self.assertIn("ящик ими не останавливается", one["why"])
+        # И успехом он тоже не стал: доказанной задачей его никто не объявлял.
+        self.assertNotEqual(sig.SORT_PROVED, sig.sort_of(rows[1], {})[0])
+
+    def test_a_quiet_sort_is_named_even_when_signal_a_is_calm(self):
+        """А молчит — счёт немых сортов всё равно виден: сорт без строки невидим."""
+        rows = sig.box_rows([_uncalled(61), _closed(62)])
+        one = sig.signal_a(rows, _ledger((62, True, True))(None)[0])
+        self.assertFalse(one["on"], one["why"])
+        self.assertIn(sig.SORT_UNCALLED, one["why"])
+
+    # ── п.5: РЕПЛЕЙ живого корпуса трёх остановок 21.09 ──────────────────
+    def test_REPLAY_all_three_live_holds_of_signal_e_disappear(self):
+        """Живые улики трёх остановок: было 3, осталось бы 0. И ни одна не была сортом Е."""
+        live = {6: "vps", 7: "vps", 8: "vps", 9: "vps",
+                23: "pc-uncalled", 25: "vps", 26: "vps"}
+
+        def row(tid):
+            return _uncalled(tid) if live[tid] == "pc-uncalled" else _vps(tid, "done", "")
+
+        stopped = 0
+        for evidence in ([6, 7, 8], [7, 8, 9], [23, 25, 26]):
+            rows = sig.box_rows([row(t) for t in evidence])
+            one = sig.signal_f(rows, {})
+            stopped += 1 if one["on"] else 0
+            self.assertEqual(0, one["count"], evidence)
+        self.assertEqual(0, stopped)
+
+    def test_REPLAY_the_old_condition_raises_all_three_on_the_same_input(self):
+        """КОНТРФАКТ: прежнее условие (сорт = просто «записи нет») встаёт на всех трёх."""
+        for evidence in ([6, 7, 8], [7, 8, 9], [23, 25, 26]):
+            rows = sig.box_rows([_uncalled(t) if t == 23 else _vps(t, "done", "")
+                                 for t in evidence])
+            old_hits = [r for r in rows
+                        if str(r.get("status")) == "done"
+                        and cd.judged_of(r["id"], {}, goal=r["goal"]) == cd.JUDGE_SILENT]
+            self.assertEqual(sig.UNREAD_STREAK_FLOOR, len(old_hits), evidence)
+
+    # ── зеркало литерала ─────────────────────────────────────────────────
+    def test_the_door_head_equals_the_one_its_owner_writes(self):
+        """Подпись двери заимствована, а не придумана: расхождение обязано ронять ТЕСТ."""
+        import mark_vs_address_pc as mva
+
+        self.assertEqual(mva.CLOSE_HEAD, sig.ADDR_CLOSE_HEAD)
+        self.assertTrue(mva.close_result("карточка", mva.R_PROVEN, "чем")
+                        .startswith(mva.CLOSE_HEAD))
 
 
 if __name__ == "__main__":            # pragma: no cover
