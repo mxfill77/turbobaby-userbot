@@ -7,6 +7,7 @@ test_rc_supervisor.py — ДВУХРЕЖИМНЫЙ супервизор кана
 """
 
 import os
+import time
 import logging
 import tempfile
 import unittest
@@ -945,6 +946,256 @@ class TestAuthStalenessWiring(unittest.TestCase):
         spawns, kills, cards = self._run(rc.SERVER_SPEC, Boom(), rounds=1, checks=3)
         self.assertEqual((kills, cards), ([], []))
         self.assertEqual(len(spawns), 1)
+
+
+_FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
+def _fixture_body(name):
+    """Тело живого лога из фикстуры: без строк-комментариев, концы LF — как пишет CLI."""
+    with open(os.path.join(_FIX, name), encoding="utf-8") as f:
+        return "\n".join(l for l in f.read().splitlines() if not l.startswith("#")) + "\n"
+
+
+STUCK = _fixture_body("rc_server_stuck_prompt.live.log")        # 11 строк, моста нет (22.09)
+HEALTHY = _fixture_body("rc_server_registered_start.live.log")  # старт 09.09 до poll loop
+EMPTY = ""                                                      # лог жизни пуст → «не знаю»
+ALIEN = "[22/09/26 16:35] settings ok\n" * 11                   # формат уехал → «не знаю»
+
+
+class TestUnregisteredLife(unittest.TestCase):
+    """ЖИЗНЬ БЕЗ РЕГИСТРАЦИИ (класс 18–22.09, docs/artifacts/2026-09-22-rc-device-profile2-stall.md):
+    `claude rc` висел до `[bridge:init]`, стартовый всплеск (11 строк за 0,9 с) держал лог «свежим» весь
+    час порога 3600с — 91 старт, 88 гашений ЗОМБИ, 0 регистраций, 0 карточек.
+
+    Здесь — НАСТОЯЩИЙ детектор rc_auth_detect на временном логе (боевой rc_server_debug.log не
+    читается): спавнер пишет в лог то, что пишет CLI, а проба отвечает как в живом случае — лог
+    «свеж» (старый предикат говорит «жив»), соединений столько, сколько задал тест."""
+
+    SAVED = ("UNREG_ENABLED", "UNREG_LIVES", "UNREG_BACKOFF", "UNREG_BACKOFF_MAX", "LIVENESS_ENABLED")
+
+    def setUp(self):
+        self._saved = {k: getattr(rc, k) for k in self.SAVED}
+        rc.UNREG_ENABLED, rc.UNREG_LIVES = True, 3
+        rc.UNREG_BACKOFF, rc.UNREG_BACKOFF_MAX = 3600, 21600
+        rc.LIVENESS_ENABLED = True
+        self._auth_enabled = rc.rc_auth_detect.ENABLED
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = os.path.join(self.tmp.name, "rc_server_debug.log")
+        self.spec = dict(rc.SERVER_SPEC, log=self.log)
+        self.binary = os.path.join(self.tmp.name, "claude.exe")
+        with open(self.binary, "w", encoding="utf-8") as f:
+            f.write("шим")
+        self.handler = _Collect()
+        rc.log.addHandler(self.handler)
+
+    def tearDown(self):
+        rc.log.removeHandler(self.handler)
+        for k, v in self._saved.items():
+            setattr(rc, k, v)
+        rc.rc_auth_detect.ENABLED = self._auth_enabled
+        self.tmp.cleanup()
+
+    def _run(self, lives, conns=None, checks=12, spec=None, auth=None, notifier=None):
+        """lives — список (тело лога, код выхода | None) на каждую жизнь. → (kills, cards, pauses,
+        checks_slept). pauses — паузы МЕЖДУ жизнями (всё, что спало не интервалом проверки)."""
+        kills, cards, slept = [], [], []
+        queue = list(lives)
+        _conns = conns or (lambda: 0)
+
+        def spawner(claude, sp):
+            body, code = queue.pop(0)
+            with open(sp["log"], "w", encoding="utf-8", newline="\n") as f:
+                f.write(body)            # то, что CLI пишет в лог, который default_spawn усёк
+            return _FakeProc(poll_value=code, pid=4000 + len(queue))
+
+        rc.supervise_branch(
+            spec or self.spec, resolver=lambda: self.binary, spawner=spawner,
+            probe=lambda sp, pid: (True, 20.0, _conns(), sp.get("max_age")),
+            gate=lambda c: (True, "ok"), sleeper=slept.append, killer=kills.append,
+            rounds=len(lives), checks=checks, grace_checks=6, strikes_needed=3,
+            auth=auth if auth is not None else rc.rc_auth_detect,
+            notifier=notifier if notifier is not None else cards.append,
+            envf=lambda: (None, "выбор учётки строителей: слово ОСНОВНОЙ — тест"))
+        pauses = [s for s in slept if s != rc.CHECK_INTERVAL]
+        return kills, cards, pauses, slept.count(rc.CHECK_INTERVAL)
+
+    def _lines(self, word):
+        return [l for l in self.handler.lines if word in l]
+
+    # --- раннее гашение ---
+    def test_stuck_life_killed_after_grace_and_three_strikes(self):
+        """ДОСЛОВНО живой случай: 11 строк, моста нет, 0 соединений → гашение на 9-й проверке
+        (грейс 6 + 3 страйка) = 270 с, а не через 3661 с, как 88 раз с 18.09."""
+        kills, cards, pauses, checks = self._run([(STUCK, None)])
+        self.assertEqual((len(kills), checks), (1, 9))
+        self.assertEqual(9 * rc.CHECK_INTERVAL, 270)
+        line = self._lines("БЕЗ РЕГИСТРАЦИИ")[0]
+        for token in ("≈270с", "грейс 180с", "до [bridge:init]", "строк лога 11", "соединений 0",
+                      "3 проверок подряд", "pid="):
+            self.assertIn(token, line)
+        self.assertEqual(self._lines("ЗОМБИ"), [])          # это не старый путь сноса
+        self.assertEqual(cards, [])                         # одна жизнь — ещё не серия
+
+    def test_old_predicate_alone_keeps_the_zombie_alive(self):
+        """Без нового вопроса (RC_UNREG=0) та же жизнь живёт: свежий лог = «жив». Так и было 88 раз."""
+        rc.UNREG_ENABLED = False
+        kills, cards, pauses, _ = self._run([(STUCK, None)], checks=40)
+        self.assertEqual((kills, cards, pauses), ([], [], [rc.RESTART_DELAY]))
+        self.assertEqual(self._lines("итог жизни"), [])      # клапан выключает суд целиком
+
+    def test_registered_life_with_zero_conns_is_not_killed(self):
+        kills, _, _, _ = self._run([(HEALTHY, None)], checks=40)
+        self.assertEqual(kills, [])
+
+    def test_unregistered_but_connected_is_not_killed(self):
+        kills, _, _, _ = self._run([(STUCK, None)], conns=lambda: 1, checks=40)
+        self.assertEqual(kills, [])
+
+    def test_unknown_verdict_never_kills_early(self):
+        for body in (EMPTY, ALIEN):
+            kills, _, _, _ = self._run([(body, None)], checks=40)
+            self.assertEqual(kills, [], repr(body[:20]))
+
+    def test_connection_blip_resets_strikes(self):
+        seq = iter([0, 0, 1, 0, 0, 0, 0, 0])               # с 7-й проверки (после грейса)
+        kills, _, _, checks = self._run([(STUCK, None)], conns=lambda: next(seq))
+        self.assertEqual((len(kills), checks), (1, 12))     # 7,8 → сброс на 9 → 10,11,12
+
+    def test_grace_protects_a_fresh_life(self):
+        kills, _, _, _ = self._run([(STUCK, None)], checks=6)
+        self.assertEqual(kills, [])
+
+    def test_liveness_killswitch_also_stops_early_kill(self):
+        rc.LIVENESS_ENABLED = False                         # RC_LIVENESS=0: «рестарт лишь по выходу»
+        kills, _, _, _ = self._run([(STUCK, None)], checks=40)
+        self.assertEqual(kills, [])
+
+    def test_auth_watch_off_does_not_blind_the_registration_question(self):
+        """RC_AUTH_WATCH=0 выключает рестарт по кредам, а не вопрос о регистрации."""
+        rc.rc_auth_detect.ENABLED = False
+        kills, _, _, _ = self._run([(STUCK, None)])
+        self.assertEqual(len(kills), 1)
+
+    # --- серия, карточка, backoff ---
+    def test_three_lives_one_card_then_backoff_capped_at_6h(self):
+        kills, cards, pauses, _ = self._run([(STUCK, None)] * 10)
+        self.assertEqual(len(kills), 10)
+        self.assertEqual(len(cards), 1, "карточка одна на серию, а не на жизнь")
+        self.assertEqual(pauses, [rc.RESTART_DELAY, rc.RESTART_DELAY,
+                                  3600, 7200, 14400, 21600, 21600, 21600, 21600, 21600])
+        self.assertEqual(len(self._lines("итог жизни")), 10)
+
+    def test_card_names_stage_lines_binary_mtime_and_the_fix(self):
+        _, cards, _, _ = self._run([(STUCK, None)] * 3)
+        card = cards[0]
+        mtime = time.strftime("%d.%m.%Y %H:%M:%S", time.localtime(os.path.getmtime(self.binary)))
+        for token in ("3 жизней подряд НЕ зарегистрировался", "до [bridge:init]", "строк лога 11",
+                      self.binary, "mtime " + mtime, "слово ОСНОВНОЙ", "следующий через 1 ч",
+                      "не чаще раза в 6 ч", "перезапусти TurboBabyRC",
+                      "2026-09-22-rc-device-profile2-stall.md"):
+            self.assertIn(token, card)
+
+    def test_card_goes_the_critical_path(self):
+        """notify_owner (карточка по умолчанию) зовёт dispatch_notify с --critical: deliver с
+        declared=True → send_critical → инбокс 1160. Проверяем argv, в сеть не ходим."""
+        calls = []
+        rc.notify_owner("🛑 RC: тест", runner=lambda argv, **kw: calls.append(argv))
+        argv = calls[0]
+        self.assertTrue(argv[1].endswith("dispatch_notify.py"))
+        self.assertEqual(argv[2:], ["--critical", "🛑 RC: тест"])
+
+    def test_registered_life_resets_streak_and_rearms_card(self):
+        s, r = (STUCK, None), (HEALTHY, None)
+        _, cards, pauses, _ = self._run([s, s, s, r, s, s, s])
+        self.assertEqual(len(cards), 2)
+        d = rc.RESTART_DELAY
+        self.assertEqual(pauses, [d, d, 3600, d, d, d, 3600])   # после регистрации — снова с нуля
+        self.assertEqual(len(self._lines("прервана жизнью с регистрацией")), 1)
+
+    def test_unknown_life_neither_counts_nor_resets(self):
+        s = (STUCK, None)
+        _, cards, pauses, _ = self._run([s, s, (EMPTY, None), (ALIEN, None), s])
+        self.assertEqual(len(cards), 1)                     # серия 3 — на пятой жизни, не на третьей
+        d = rc.RESTART_DELAY
+        self.assertEqual(pauses, [d, d, d, d, 3600])
+        self.assertEqual(len(self._lines("про регистрацию не знаю")), 2)
+
+    def test_self_exited_unregistered_life_is_not_a_hang(self):
+        """Выход — собственный вердикт процесса (05.08: 79 + 6 выходов exit=1 за сетевой отказ,
+        прошедший сам). В серию зависаний он не идёт и её не рвёт; вердикт в журнале — есть."""
+        s = (STUCK, None)
+        kills, cards, pauses, _ = self._run([s, (STUCK, 1), s, s])
+        self.assertEqual(len(kills), 3)
+        self.assertEqual(len(cards), 1)
+        d = rc.RESTART_DELAY
+        self.assertEqual(pauses, [d, d, d, 3600])
+        self.assertEqual(len(self._lines("вышел сам — в серию не идёт")), 1)
+
+    def test_exit_loop_alone_never_backs_off(self):
+        """Живой 05.08 01:17–02:18 в миниатюре: выход exit=1 на первой проверке раз за разом —
+        ни карточки, ни паузы длиннее обычной: сеть вернётся, и старт через 15 с её поймает."""
+        _, cards, pauses, _ = self._run([(STUCK, 1)] * 8)
+        self.assertEqual(cards, [])
+        self.assertEqual(pauses, [rc.RESTART_DELAY] * 8)
+
+    def test_failed_card_is_retried_on_the_next_life(self):
+        attempts = []
+
+        def flaky(text):
+            attempts.append(text)
+            if len(attempts) == 1:
+                raise OSError("dispatch_notify не поднялся")
+            return True
+        _, _, pauses, _ = self._run([(STUCK, None)] * 5, notifier=flaky)
+        self.assertEqual(len(attempts), 2)                  # сорвалась → повтор → ушла → тишина
+        self.assertEqual(pauses[2:], [3600, 7200, 14400])   # backoff от срыва карточки не зависит
+        self.assertEqual(len(self._lines("сорвалась")), 1)
+
+    def test_notifier_false_counts_as_not_sent(self):
+        attempts = []
+        _, _, _, _ = self._run([(STUCK, None)] * 5,
+                               notifier=lambda t: attempts.append(t) or False)
+        self.assertEqual(len(attempts), 3)                  # жизни 3, 4, 5 — пока не уйдёт
+
+    # --- границы: чего правка не трогает ---
+    def test_named_channel_is_never_judged(self):
+        spec = dict(rc.NAMED_SPEC, log=self.log)
+        kills, cards, pauses, _ = self._run([(STUCK, None)] * 4, spec=spec, checks=40)
+        self.assertEqual((kills, cards), ([], []))
+        self.assertEqual(pauses, [rc.RESTART_DELAY] * 4)
+        self.assertEqual(self._lines("итог жизни") + self._lines("БЕЗ РЕГИСТРАЦИИ"), [])
+
+    def test_detector_without_registered_is_the_old_behaviour(self):
+        """Двойник без registered (все прежние тесты ветки) — байт-в-байт прежнее поведение."""
+        kills, cards, pauses, _ = self._run([(STUCK, None)] * 4, auth=_Auth(), checks=40)
+        self.assertEqual((kills, cards), ([], []))
+        self.assertEqual(pauses, [rc.RESTART_DELAY] * 4)
+        self.assertEqual(self._lines("итог жизни"), [])
+
+    def test_unreg_pause_sequence(self):
+        seq = [rc.unreg_pause(k, lives=3, base=3600, cap=21600) for k in range(1, 9)]
+        d = rc.RESTART_DELAY
+        self.assertEqual(seq, [d, d, 3600, 7200, 14400, 21600, 21600, 21600])
+        self.assertEqual(rc.unreg_pause(10 ** 6, lives=3, base=3600, cap=21600), 21600)
+        self.assertEqual(rc.unreg_pause(3, lives=3, base=0, cap=0), d)   # ноль в ручке — не тугой цикл
+
+    def test_defaults_are_the_named_ones(self):
+        for k, v in self._saved.items():
+            setattr(rc, k, v)
+        self.assertEqual((rc.UNREG_LIVES, rc.UNREG_BACKOFF, rc.UNREG_BACKOFF_MAX), (3, 3600, 21600))
+        self.assertTrue(rc.UNREG_ENABLED)
+
+    def test_startup_line_names_the_unreg_knobs(self):
+        rc.main(singleton=lambda: (True, None), branch_runner=lambda spec: None)
+        start = [l for l in self.handler.lines if "супервизор стартовал" in l][0]
+        for token in ("жизни без регистрации (rc-server)", "RC_UNREG=1", "RC_UNREG_LIVES=3",
+                      "RC_UNREG_BACKOFF=3600с", "RC_UNREG_BACKOFF_MAX=21600с",
+                      "rc-server:порог %sс" % rc.SERVER_LIVENESS_MAX_AGE):
+            self.assertIn(token, start)
+        rc.UNREG_ENABLED = False
+        self.assertIn("RC_UNREG=0 (выключено)", rc.unreg_knobs_note(rc.BRANCHES))
+        self.assertIn("НЕ судятся", rc.unreg_knobs_note(rc.BRANCHES, auth=_Auth()))
 
 
 if __name__ == "__main__":
