@@ -1100,6 +1100,30 @@ def _ledger_push(branch, rod_key, cls, channel, ok, path=None):
         return False
 
 
+def _ledger_muted(rod_key, cls, path=None):
+    """ГАСИТЬ ли пуш гарда → True ТОЛЬКО если класс вне списка владельца (`card_ledger_pc.push_shown`
+    ответил False) И строка `погашено` в реестре ЛЕГЛА. Любой иной исход — False, пуш уходит как
+    раньше: немого гашения нет, сломанный счёт показ не отменяет. Никогда не бросает.
+    Боевой путь и проверка различаются так же, как у `_ledger_push`: без `path` — только боевая
+    точка входа и боевой реестр; проверка пишет в названный ей путь."""
+    try:
+        cl = card_ledger_pc
+        if cl is None or cl.off():
+            return False
+        rod = {"red": cl.ROD_GUARD, "top": cl.ROD_GUARD_TOP}.get(rod_key, "неизвестный")
+        c = "" if cls in (None, "", "-") else cls
+        if cl.push_shown(rod, c) is not False:
+            return False
+        if path is None:
+            if not live_send_verdict()[0]:
+                return False              # проба/тест: в боевой реестр не пишем НИКОГДА
+            path = LEDGER_FILE
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return cl.append(path, cl.muted_row(rod, cl.SRC_GUARD_PUSH, c, now))
+    except Exception:                     # noqa: BLE001
+        return False
+
+
 def _read_stdin_json():
     # BOM/пробелы срезаем ЯВНО: живой stdin хука приходит чистым, но любой перенаправляющий
     # слой (PowerShell-пайп) ставит ﻿ впереди — strip() его НЕ убирает, и полезная
@@ -1188,6 +1212,11 @@ def main():
             rod_key = args[1] if len(args) > 1 else ""
             cls = args[2] if len(args) > 2 else ""
             text = " ".join(args[3:]).strip() or "🔴 Гард: карточка"
+            if _ledger_muted(rod_key, cls):
+                # ПОКАЗ СНЯТ, РЕШЕНИЕ НЕ ТРОНУТО (0015k-71f): класс вне списка владельца, строка
+                # `погашено` в реестре ЛЕГЛА — только тогда пуш не уходит. Не `итог`: сообщения нет.
+                _log.info(f"погашено(гард-пуш): класс={cls} род={rod_key} | {arch_text(text)}")
+                sys.exit(0)
             channel, ok = deliver(text)
             _log.info(f"итог(гард-пуш): channel={channel} ok={ok} mid={last_send_id()} "
                       f"| {arch_text(text)}")

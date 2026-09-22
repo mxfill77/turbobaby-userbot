@@ -324,6 +324,72 @@ def pair_waits(lines, since="", until="", window_s=60):
     return out
 
 
+# ══ ПОКАЗ ТОЛЬКО ПО СПИСКУ ВЛАДЕЛЬЦА (22.09.2026, задание Штаба 0015k-71f.2209) ════════════════
+# Замер 71f (`docs/artifacts/2026-09-22-71f-VOSEMDESYATODIN-2209.md`): пуши гарда классов, которых
+# нет в закрытом списке владельца, — основная масса того, что он получает. ПОКАЗАТЬ и РЕШИТЬ —
+# разные действия, и здесь меняется ТОЛЬКО первое: решение (ask / deny / маркер → кнопочная
+# карточка демона) остаётся за гардом, его код этой правкой не тронут ни строкой. Гашение
+# меняет адресат пуша: вместо чата — строка `погашено` в этом реестре с родом, классом и причиной.
+#
+# СПИСОК ВЛАДЕЛЬЦА = `pretool_guard._TOP_TIER` ДОСЛОВНО (сверяет тест): гард и показ читают один
+# список, а не два. Показ ОСТАЁТСЯ и вне списка, где он несёт защиту:
+#   • класс не определён (`unknown`, пусто, без штампа) — доказать «вне списка» нечем, FAIL-SAFE;
+#   • секреты (`env`/`read_secret`/`edit_secret`) — по заданию показ здесь гасится ТОЛЬКО вместе
+#     с отказом по умолчанию, а отказ меняет РЕШЕНИЕ, не адресат (разбор — в артефакте 71f, п.3).
+# НЕМОГО ГАШЕНИЯ НЕТ: отправитель гасит пуш только если строка `погашено` ЛЕГЛА; не легла (реестр
+# выключен, диск) — пуш уходит как раньше. Откат целиком: `OWNER_MUTE_OFF=1`.
+OWNER_LIST_KINDS = ("live_sheet", "clasp", "clasp_push", "clasp_deploy", "clasp_run",
+                    "py_write", "delete", "kill")
+VAULT_KINDS = ("env", "read_secret", "edit_secret")   # классы файла ключей (п.3 задания 71f)
+FAILSAFE_SHOW = ("unknown", "unknown_tool")
+# ГАСИТСЯ ТОЛЬКО НАЗВАННОЕ: перечень, а не «всё, чего нет в списке». Новый класс гарда, опечатка,
+# пустое имя, «без-класса» — показываются: доказать «вне списка» можно только поимённо. Четыре
+# перечня вместе дают ровно `pretool_guard._KIND_VOCAB` и не пересекаются (сверяет тест).
+MUTED_KINDS = ("network", "outside", "write_outside", "edit_claude", "git_force", "sqlite",
+               "schtasks")
+EV_MUTED = "погашено"
+ROD_DEMON_RESTART = "демон-авторестарт"   # ⛔ «авто-рестарт отменён» (опись; гашением не управляется)
+MUTE_REASON = "класс вне списка владельца — показ снят, решение осталось за гардом"
+
+
+def mute_off(env=None):
+    e = os.environ if env is None else env
+    return (str(e.get("OWNER_MUTE_OFF", "")).strip() or "0") not in ("0", "", "false", "no")
+
+
+def push_shown(rod, cls, env=None):
+    """Показывать ли пуш владельцу → True (показ) | False (гасится) | None (род не наш — не решаем).
+
+    Решает ТОЛЬКО для пуша гарда. `гард-высшая` показывается всегда: гард ставит этот род из
+    `is_top_tier(kind)`, то есть ровно из списка владельца."""
+    if rod not in (ROD_GUARD, ROD_GUARD_TOP):
+        return None
+    if mute_off(env) or rod == ROD_GUARD_TOP:
+        return True
+    c = str(cls or "").strip()
+    if c in OWNER_LIST_KINDS:
+        return True                       # список владельца — показ всегда
+    return c not in MUTED_KINDS           # секреты, unknown, неназванное — показ (см. шапку)
+
+
+def muted_row(rod, src, cls, now_iso, reason=MUTE_REASON):
+    """Строка «пуш погашен». Признак операции — из источника, как у `push_row`."""
+    s = str(src or "")
+    return {"ts": str(now_iso or ""), "event": EV_MUTED, "rod": str(rod or ""),
+            "class": str(cls or CLS_UNNAMED), "op": True if s in _PUSH_OP_SOURCES else None,
+            "src": s, "reason": str(reason or "")}
+
+
+def muted_tally(rows):
+    """{(род, класс): n} по строкам `погашено`."""
+    t = {}
+    for r in rows or ():
+        if r.get("event") == EV_MUTED:
+            k = (str(r.get("rod") or ""), str(r.get("class") or CLS_UNNAMED))
+            t[k] = t.get(k, 0) + 1
+    return t
+
+
 def default_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "pc_orchestrator.cards_ledger.jsonl")
