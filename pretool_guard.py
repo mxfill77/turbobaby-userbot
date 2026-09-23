@@ -682,7 +682,13 @@ def _is_pure_config_read(cmd):
     if _RE_CFG_REDIR.search(_redirect_text(c)) or _RE_CFG_WRITE.search(c):
         return False
     return bool(_RE_CFG_READ.search(c))
-_RE_OUTSIDE_WRITE = re.compile(r"(?i)(>>?|out-file|set-content|new-item|move-item|copy-item)\s+[\"']?([a-z]:[\\/][^\"'\s]+)")
+# Цель — группа 2 (контракт для `test_card_duty` и ветки `outside`). Три формы цели: `X:\…`,
+# MSYS `/x/…` (Git Bash) и UNC `\\…`. После `>`/`>>` пробел НЕ обязателен (`echo x >C:\y`) —
+# до 23.09.2026 без пробела, в MSYS-форме и в UNC запись вне проекта проходила МОЛЧА (нашла
+# состязательная проверка правки 23.09); `2>&1` и `2>/dev/null` формой цели не являются.
+_RE_OUTSIDE_WRITE = re.compile(
+    r"(?i)(>>?(?=\s*[\"']?(?:[a-z]:[\\/]|/[a-z]/|\\\\))\s*|(?:out-file|set-content|new-item|move-item"
+    r"|copy-item)\s+)[\"']?((?:[a-z]:[\\/]|/[a-z]/|\\\\)[^\"'\s]+)")
 
 # ------------------------- СЕТЬ: выход наружу против своего канала -----------------------------
 # Прежний признак был подстрочный: слово ssh/nc где угодно в строке красило команду. За сутки это
@@ -811,13 +817,45 @@ def _net_scan(cmd):
 # `return`, поэтому все прочие красные ветви (env, секреты, запись, удаление) судят команду как
 # раньше — тем же заходом.
 _NET_READ_TOOLS = {"curl", "wget", "iwr", "irm", "invoke-webrequest", "invoke-restmethod"}
+# ПОДДОМЕНЫ t27.ai (23.09.2026, замер и решение владельца). Список выше сравнивается ТОЧНО, и
+# `app.t27.ai` — где живёт сам сайт Queen — мимо `t27.ai` не проходил: с 22.09 18:31 по 23.09 19:00
+# `pretool_guard.log` дал 56 карточек `network`, и ВСЕ 56 несли `app.t27.ai` (владелец сидел в
+# bypass-режиме и спросил, откуда поток). Суффикс заведён ТОЛЬКО для t27.ai: у github.com
+# поддомены бывают каналом загрузки (`uploads.github.com`), и их остаётся судить точным именем.
+# Туда же — публичный бэкенд того же сайта (`trios-agent-server-production.up.railway.app`,
+# адрес из его же бандла; 3 карточки за те же сутки). `up.railway.app` общий для чужих
+# приложений, поэтому точным именем, а не суффиксом.
 _NET_ALLOWED_HOSTS = ("api.github.com", "raw.githubusercontent.com", "github.com",
-                      "objects.githubusercontent.com", "codeload.github.com", "t27.ai")
+                      "objects.githubusercontent.com", "codeload.github.com", "t27.ai",
+                      "trios-agent-server-production.up.railway.app")
+_NET_ALLOWED_SUFFIXES = (".t27.ai",)
+
+
+def _net_host_allowed(host):
+    """Хост из белого списка: точное имя ИЛИ поддомен из `_NET_ALLOWED_SUFFIXES`. Сравнение по
+    концу имени с ТОЧКОЙ, поэтому `evilt27.ai` и `t27.ai.evil.com` не проходят."""
+    h = (host or "").lower().rstrip(".")
+    return h in _NET_ALLOWED_HOSTS or any(h.endswith(s) for s in _NET_ALLOWED_SUFFIXES)
+# Короткие флаги curl РЕГИСТРОЗАВИСИМЫ (23.09.2026): прежний общий `(?i)` читал `-D -` (выгрузка
+# ЗАГОЛОВКОВ ответа) как `-d` (отправка тела), `-f` (--fail) как `-F`, `-t` как `-T` — чтение с
+# `-D -` спрашивало `network` (замер: карточка 23.09 17:08 на `curl -s -m 30 -D - https://app.t27.ai…`).
+# Длинные имена и параметры PowerShell — без учёта регистра, как и были. Добавлены отправки,
+# которых список не знал: `--form-string`, `-K/--config` (флаги из файла), wget `--post-data`,
+# `--post-file`, `--body-data`, `--body-file`, `--method=POST`.
 _RE_NET_SEND = re.compile(
-    r"(?i)(?:^|\s)(?:-d|--data(?:-[a-z]+)?|--json|-F|--form|-T|--upload-file|-Body|-InFile|-Form)"
-    r"(?:[=\s]|$)"
-    r"|(?:^|\s)(?:-X|--request|-Method)[=\s]+(?:POST|PUT|PATCH|DELETE)\b")
+    r"(?:^|\s)(?:-d|-F|-T|-K)(?:[=\s]|$)"
+    r"|(?i:(?:^|\s)(?:--data(?:-[a-z]+)?|--json|--form(?:-string)?|--upload-file|--config"
+    r"|--post-data|--post-file|--body-data|--body-file|-Body|-InFile|-Form)(?:[=\s]|$))"
+    r"|(?i:(?:^|\s)(?:-X|--request|-Method|--method)[=\s]+(?:POST|PUT|PATCH|DELETE)\b)")
+# Склеенные короткие флаги curl (`-sd @x`, `-sT file`, `-XPOST`): отдельный `-d` ловит строка
+# выше, а в связке он прятался. Только для curl — у wget те же буквы значат другое (`-d` отладка,
+# `-T` таймаут), его отправки узнаются по длинным именам.
+_RE_CURL_SEND_CLUSTER = re.compile(r"(?:^|\s)-[A-Za-z]*[dFTK][A-Za-z]*(?=[=\s'\"]|$)")
 _RE_NET_URL = re.compile(r"(?i)\bhttps?://([A-Za-z0-9._\-]+)")
+# userinfo в адресе: всё до `@` curl считает логином, а идёт к хосту ПОСЛЕ него. Без этого замка
+# белый список обходился бы строкой `https://github.com@чужой.хост/` (заведён 23.09.2026 вместе с
+# суффиксом — суффикс расширил ровно то место, которое маска обманывает).
+_RE_NET_USERINFO = re.compile(r"(?i)\bhttps?://[^/\s\"'?#]*@")
 # КУДА ЛОЖИТСЯ СКАЧАННОЕ. Заведено 12.09.2026 вместе с послаблением и СТОИТ КОМПЕНСАЦИЕЙ: до него
 # `curl … -o C:/Windows/x` проходил бы молча, потому что `-o` — флаг инструмента, а не
 # перенаправление шелла, и сторож редиректов (`_RE_LEAK_REDIR`) его не видит. Раньше эту запись
@@ -825,6 +863,235 @@ _RE_NET_URL = re.compile(r"(?i)\bhttps?://([A-Za-z0-9._\-]+)")
 _RE_NET_OUT = re.compile(r"(?i)(?:^|\s)(?:-o|--output|-OutFile)[=\s]+(\S+)")
 _RE_NET_REMOTE_NAME = re.compile(r"(?:^|\s)(?:-O|--remote-name)(?:\s|$)")
 _NET_OUT_NULL = ("/dev/null", "nul", "$null")
+
+
+# АДРЕС ИЗ ПЕРЕМЕННОЙ ТОГО ЖЕ ВЫЗОВА (23.09.2026). `B=https://app.t27.ai/…; curl $B` — самый
+# частый вид оставшихся карточек `network` в потоке 22–23.09 (13 из 22 после суффикса t27.ai).
+# Это не угадывание: значение ЛИТЕРАЛОМ стоит в той же строке, его остаётся подставить. Граница
+# «угадывать нельзя» сохранена — подставляем ТОЛЬКО то, что доказуемо одно:
+#   • присваивание — ОТДЕЛЬНЫЙ оператор (`B=…;`), а не префикс команды (`B=… curl $B` раскрывает
+#     ВНЕШНЕЕ `$B`), со значением-литералом (адрес или путь) без `$`/`` ` ``; два разных
+#     значения одного имени — неоднозначно, имя не подставляется;
+#   • имя, которое получает значение иначе (`for B in`, `read B`, `B+=`, `printf -v B`,
+#     `declare`/`mapfile`) — не подставляется никогда;
+#   • `${B…}` с модификатором (`${B/x/y}`, `${B:-…}`) — отказ целиком: итог не литерал;
+#   • адрес ТОЛЬКО из переменных — каждая обязана подставиться; и после подставки хост не смеет
+#     сразу продолжаться переменной или `@` (`"$B$p"` с `p=@чужой.хост` увёл бы запрос).
+_RE_SHELL_ASSIGN_STMT = re.compile(
+    r"^\s*(?:export\s+|local\s+|readonly\s+)?([A-Za-z_][A-Za-z0-9_]*)=(\"[^\"]*\"|'[^']*'|[^\s;&|]*)\s*$")
+_RE_SHELL_ASSIGN_ANY = re.compile(r"(?:^|[\s;&|(])([A-Za-z_][A-Za-z0-9_]*)\+?=")
+_RE_SHELL_VAR_SET = re.compile(
+    r"(?i)(?:\bfor\s+([A-Za-z_]\w*)\s+in\b|\bread\s+(?:-\S+\s+)*([A-Za-z_]\w*)|\bprintf\s+-v\s+([A-Za-z_]\w*)"
+    r"|\b(?:declare|typeset|mapfile|readarray)\s+(?:-\S+\s+)*([A-Za-z_]\w*)|([A-Za-z_]\w*)\+=)")
+_RE_SHELL_VAR_REF = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+_RE_SHELL_VAR_MOD = re.compile(r"\$\{(?![A-Za-z_][A-Za-z0-9_]*\})")
+_RE_NET_HOST_THEN_VAR = re.compile(r"(?i)\bhttps?://[A-Za-z0-9._\-]+[$@`]")
+
+
+def _literal_vars(cmd):
+    """{имя: значение} для переменных, которым в этой команде присвоен РОВНО ОДИН литерал
+    (адрес или путь, без `$`/`` ` ``) отдельным оператором и которые не получают значения никак
+    иначе. Пути нужны `-o "$SP/x"`: цель скачивания судится ПОСЛЕ подставки."""
+    vals, spoiled = {}, set()
+    if re.search(r"\bIFS\s*\+?=", cmd or ""):
+        return {}                   # свой IFS режет подставленное значение по-своему — не подставляем
+    for m in _RE_SHELL_VAR_SET.finditer(cmd or ""):
+        spoiled.update(n for n in m.groups() if n)
+    for i, seg in enumerate(_split_segments(cmd or "")):
+        if i % 2:
+            continue
+        m = _RE_SHELL_ASSIGN_STMT.match(seg)
+        if not m:
+            spoiled.update(_RE_SHELL_ASSIGN_ANY.findall(seg))   # префикс команды и прочее
+            continue
+        name, v = m.group(1), m.group(2)
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        if not v or any(c in v for c in "$`") or (name in vals and vals[name] != v):
+            spoiled.add(name)
+            continue
+        vals[name] = v
+    return {k: v for k, v in vals.items() if k not in spoiled}
+
+
+def _net_expand(seg, known):
+    """Подставить известные адреса в сегмент → (текст, неразрешённые имена) или (None, None),
+    если в сегменте `${…}` с модификатором."""
+    if _RE_SHELL_VAR_MOD.search(seg):
+        return None, None
+    unresolved = set()
+
+    def sub(m):
+        name = m.group(1) or m.group(2)
+        if name in known:
+            return known[name]
+        unresolved.add(name)
+        return m.group(0)
+    return _RE_SHELL_VAR_REF.sub(sub, seg), unresolved
+
+
+# РАЗБОР АРГУМЕНТОВ ЧТЕНИЯ (23.09.2026, самопроверка правки). Белый список смотрел только на
+# хосты, найденные по `https://`, и молча пропускал то, что уводит запрос мимо них:
+#   • адрес БЕЗ схемы вторым аргументом (`curl https://api.github.com чужой.хост` — curl сходит на
+#     оба); • перенаправление соединения (`--proxy`, `--connect-to`, `--resolve`, `--doh-url` …);
+#   • у wget — адреса из файла (`-i`), обход по ссылкам (`-r`, `-H`), свои команды (`-e`).
+# Теперь каждый аргумент обязан быть ИЗВЕСТНЫМ: флагом без значения, опцией со значением или
+# адресом из белого списка. Незнакомая опция — карточка (fail-closed), как и всё сомнительное.
+_CURL_SHORT_FLAG = set("sSLfIivkGOJNg#qZ46lRjaB:")
+_CURL_SHORT_VAL = set("oDHAeuwmXrbcCyYzEUP")
+_CURL_LONG_FLAG = {
+    "--silent", "--show-error", "--location", "--fail", "--fail-with-body", "--head", "--include",
+    "--verbose", "--insecure", "--get", "--remote-name", "--remote-header-name", "--no-buffer",
+    "--globoff", "--progress-bar", "--compressed", "--http1.0", "--http1.1", "--http2", "--http3",
+    "--parallel", "--create-dirs", "--no-progress-meter", "--remote-time", "--raw", "--tr-encoding",
+    "--ssl-no-revoke", "--list-only", "--junk-session-cookies", "--location-trusted", "--no-keepalive",
+    "--path-as-is", "--ipv4", "--ipv6", "--fail-early", "--no-sessionid", "--retry-connrefused",
+    "--retry-all-errors", "--show-headers", "--no-clobber", "--remove-on-error", "--next", "--disable"}
+_CURL_LONG_VAL = {
+    "--output", "--dump-header", "--header", "--user-agent", "--referer", "--user", "--write-out",
+    "--max-time", "--connect-timeout", "--request", "--range", "--cookie", "--cookie-jar",
+    "--continue-at", "--speed-time", "--speed-limit", "--time-cond", "--retry", "--retry-delay",
+    "--retry-max-time", "--max-filesize", "--max-redirs", "--limit-rate", "--cert", "--cacert",
+    "--capath", "--key", "--output-dir", "--url", "--proto", "--proto-redir", "--url-query",
+    "--expect100-timeout", "--keepalive-time", "--stderr", "--trace", "--trace-ascii",
+    "--etag-save", "--etag-compare", "--parallel-max"}
+_WGET_TOKEN_FLAG = {
+    "-q", "--quiet", "-nv", "--no-verbose", "-v", "--verbose", "-S", "--server-response", "-c",
+    "--continue", "-N", "--timestamping", "-nc", "--no-clobber", "-nd", "--no-directories",
+    "--spider", "--no-check-certificate", "-4", "-6", "--inet4-only", "--inet6-only", "-np",
+    "--no-parent", "--content-disposition", "--no-cache"}
+_WGET_TOKEN_VAL = {
+    "-O", "--output-document", "-o", "--output-file", "-a", "--append-output", "-P",
+    "--directory-prefix", "-T", "--timeout", "-t", "--tries", "-U", "--user-agent", "-w", "--wait",
+    "-Q", "--quota", "--header", "--limit-rate", "--referer", "--max-redirect", "--dns-timeout",
+    "--connect-timeout", "--read-timeout"}
+_PS_NET_FLAG = {"-usebasicparsing", "-skipcertificatecheck", "-disablekeepalive"}
+_PS_NET_VAL = {"-uri", "-outfile", "-method", "-timeoutsec", "-useragent", "-maximumredirection",
+               "-erroraction", "-headers"}
+_RE_REDIR_TOKEN = re.compile(r"^\d*(?:>>?|<|&>)(?:&\d+)?")
+# Интерпретаторы, которым нельзя отдавать скачанное трубой: `curl … | sh` — это исполнение
+# кода из сети, а не чтение (до 23.09 для github.com проходило молча).
+_NET_EXEC_SINKS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "pwsh", "powershell", "cmd",
+                   "iex", "invoke-expression", "perl", "ruby", "node", "php", "deno", "bun",
+                   "source", ".", "xargs"}
+_RE_PY_EXEC_WORD = re.compile(r"\b(exec|eval|compile|runpy|subprocess|os\.system|os\.popen|"
+                              r"importlib|__import__|pickle|marshal)\b")
+
+
+def _net_url_ok(tok):
+    """Аргумент-адрес: `http(s)://` с хостом из белого списка."""
+    m = re.match(r"(?i)^https?://([A-Za-z0-9._\-]+)", tok or "")
+    return bool(m) and _net_host_allowed(m.group(1))
+
+
+def _net_args_ok(name, args):
+    """Каждый аргумент чтения — известный флаг, опция со значением или разрешённый адрес.
+    Редирект шелла (`> x`, `2>&1`) пропускается: его цель судит ветка записи."""
+    expect = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if expect is not None:
+            if expect in ("--url", "-uri") and not _net_url_ok(a):
+                return False
+            expect = None
+            continue
+        r = _RE_REDIR_TOKEN.match(a)
+        if r:
+            if r.end() == len(a):
+                i += 1                       # `>`, `2>` — следующий токен цель, не адрес
+            continue
+        if name in ("invoke-webrequest", "invoke-restmethod", "iwr", "irm"):
+            low = a.lower()
+            if low.startswith("-"):
+                if low in _PS_NET_FLAG:
+                    continue
+                if low in _PS_NET_VAL:
+                    expect = low
+                    if low == "-method" and i < len(args) and args[i].lower() not in ("get", "head"):
+                        return False
+                    continue
+                return False                 # `-Proxy`, `-Body`, незнакомый параметр
+            if not _net_url_ok(a):
+                return False
+            continue
+        if name == "wget":
+            opt, eq, val = a.partition("=")
+            if a.startswith("-"):
+                if a in _WGET_TOKEN_FLAG:
+                    continue
+                if opt in _WGET_TOKEN_VAL:
+                    if not eq:
+                        expect = opt
+                    continue
+                m = re.match(r"^-([qvSNc]*)([OoaPTtUwQ])(.*)$", a)   # `-qO-`, `-O-`, `-T10`
+                if m:
+                    if not m.group(3):
+                        expect = "-" + m.group(2)
+                    continue
+                return False                 # `-e`, `-i`, `-r`, `-H`, `-m`, `-B`, незнакомое
+            if not _net_url_ok(a):
+                return False
+            continue
+        # curl
+        if a == "--":
+            continue
+        if a.startswith("--"):
+            opt, eq, val = a.partition("=")
+            if opt in _CURL_LONG_FLAG:
+                continue
+            if opt in _CURL_LONG_VAL:
+                if eq:
+                    if opt == "--url" and not _net_url_ok(val):
+                        return False
+                else:
+                    expect = opt
+                continue
+            return False                     # `--proxy`, `--connect-to`, `--resolve`, незнакомое
+        if a.startswith("-") and len(a) > 1:
+            chars = a[1:]
+            for k, ch in enumerate(chars):
+                if ch in _CURL_SHORT_FLAG:
+                    continue
+                if ch in _CURL_SHORT_VAL:
+                    if k == len(chars) - 1:
+                        expect = "-" + ch
+                    break                    # остаток связки — значение (`-m60`)
+                return False                 # `-x` (прокси), `-d`/`-F`/`-T`/`-K`, незнакомое
+            continue
+        if not _net_url_ok(a):
+            return False                     # адрес без схемы, `-` и прочее позиционное
+    return True
+
+
+def _net_pipe_to_exec(segs):
+    """В конвейере с сетевым чтением есть интерпретатор, которому уходит скачанное."""
+    pipe, net = [], False
+    for i, seg in enumerate(segs + [";"]):
+        if i % 2:
+            if seg.strip() != "|":
+                if net and any(pipe):
+                    return True
+                pipe, net = [], False
+            continue
+        try:
+            toks = shlex.split(seg)
+        except Exception:
+            toks = seg.split()
+        j = _cmd_index(toks)
+        if j is None or j >= len(toks):
+            continue
+        b = _base(toks[j])
+        if b in _OPEN_NET_TOOLS:
+            net = True
+            continue
+        danger = b in _NET_EXEC_SINKS
+        if _RE_PY.search(toks[j]) or b in ("python", "python3", "py"):
+            code = toks[toks.index("-c") + 1] if "-c" in toks[j:-1] else None
+            danger = code is None or bool(_RE_PY_EXEC_WORD.search(code))
+        pipe.append(danger)
+    return False
 
 
 def _net_sanctioned(cmd, cwd=None):
@@ -839,8 +1106,12 @@ def _net_sanctioned(cmd, cwd=None):
         return False
     if _env_value_in_text(cmd) or _secret_value_leak(cmd):
         return False
+    segs = _split_segments(cmd)
+    if _net_pipe_to_exec(segs):
+        return False                # `curl … | sh` — исполнение скачанного, а не чтение
     seen = False
-    for i, seg in enumerate(_split_segments(cmd)):
+    known = _literal_vars(cmd)
+    for i, seg in enumerate(segs):
         if i % 2:
             continue
         try:
@@ -858,15 +1129,41 @@ def _net_sanctioned(cmd, cwd=None):
             return False
         if _RE_NET_SEND.search(seg):
             return False
-        hosts = [h.lower() for h in _RE_NET_URL.findall(seg)]
-        if not hosts or any(h not in _NET_ALLOWED_HOSTS for h in hosts):
+        if name == "curl" and _RE_CURL_SEND_CLUSTER.search(seg):
             return False
+        # Адрес ЗАПРОСА — в аргументах команды, а не в env-префиксе: `B=https://x curl $B`
+        # раскрывает ВНЕШНЕЕ `$B`, и адрес префикса запросом не является.
+        literal_hosts = _RE_NET_URL.findall(" ".join(toks[j + 1:]))
+        seg, unresolved = _net_expand(seg, known)
+        if seg is None:
+            return False            # `${B/…}`/`${B:-…}` — итог не литерал, угадывать нельзя
+        if not literal_hosts and unresolved:
+            return False            # адрес только из переменных, и не каждая подставилась
+        if _RE_NET_USERINFO.search(seg) or _RE_NET_HOST_THEN_VAR.search(seg):
+            return False            # `https://app.t27.ai@evil.com`, `"$B$p"` — хост лишь маска
+        hosts = [h.lower() for h in _RE_NET_URL.findall(seg)]
+        if not hosts or not all(_net_host_allowed(h) for h in hosts):
+            return False
+        try:
+            toks2 = shlex.split(seg)
+        except Exception:
+            return False            # после подставки не разбирается — угадывать нельзя
+        j2 = _cmd_index(toks2)
+        if j2 is None or not _net_args_ok(name, toks2[j2 + 1:]):
+            return False            # адрес без схемы, прокси/перенаправление, незнакомая опция
         if _RE_NET_REMOTE_NAME.search(seg):
             return False            # имя файла выбирает СЕРВЕР, а каталог — чужой cwd
         for tgt in _RE_NET_OUT.findall(seg):
             t = tgt.strip("'\"")
             if t.lower() in _NET_OUT_NULL:
                 continue
+            # MSYS-форма Git Bash (`-o /d/tmp/x.html`): без перевода это `\d\tmp\…` на текущем
+            # диске, и свой корень `D:\tmp` не узнавался (замер 23.09: карточка на ровно такой `-o`)
+            t = _to_win_path(t) if re.match(r"^/[A-Za-z]/", t) else t
+            if "$" in t or "`" in t:
+                # цель из НЕподставленной переменной (`-o $HOME/.bashrc`): до 23.09 она
+                # склеивалась с cwd и молча считалась «внутри проекта» — куда ляжет, неизвестно
+                return False
             p = t if os.path.isabs(t) else os.path.join(cwd or PROJECT, t)
             if not (_inside_project(p) or _sanctioned_outside(p)):
                 return False        # скачанное ложится ВНЕ разрешённых зон → карточка
@@ -1276,6 +1573,63 @@ def _live_sheet_decide(text):
 _RE_SAFE_SCRIPTS = re.compile(r"(?i)(cowork_log_append|dispatch_notify|brain_writer)\.py")
 _RE_GIT_SAFE = re.compile(r"(?i)(^|[\s;&|(])git\s+(status|diff|log|add|commit|push|fetch|pull|branch|show|check-ignore|rev-parse|remote|ls-files|config\s+--get)")
 _RE_TESTS = re.compile(r"(?i)-m\s+(pytest|py_compile|unittest)(\s|$)|(^|[\s/\\])pytest(\s|$)")
+# CARGO: сборка и тесты — то же, что `pytest` строкой выше (23.09.2026). `cargo` не знала ни одна
+# ветка, и `cd D:/turbobaby-bike-bot && cargo test …` падал в `unknown` — hard-карточку, всегда
+# (реплей потока 22–23.09: 9 таких команд, прежде их закрывала карточка `outside`). Тесты и сборка
+# своего проекта исполняют код ИЗ git (build.rs, тесты) — доверие по происхождению, как у
+# отслеживаемого .py. Зелёные ТОЛЬКО подкоманды ниже; `run` (запуск самого бота), `install`,
+# `publish`, `login`, `owner`, `yank` и любое незнакомое слово — прежний `unknown`.
+_CARGO_SAFE_SUB = {"build", "b", "check", "c", "test", "t", "bench", "clippy", "fmt", "doc",
+                   "tree", "metadata", "version", "--version", "-V", "-vV", "locate-project",
+                   "pkgid", "verify-project"}
+
+
+# Соседи cargo в одной команде, которые ничего не исполняют и не пишут (цели `>` судит ветка
+# записи раньше). Всё прочее — `./target/debug/bot`, чужой бинарь, скрипт — зелёным от cargo
+# НЕ становится: зелёная ветка судит КАЖДЫЙ сегмент, а не «cargo где-то в строке».
+_CARGO_NEIGHBOURS = {"cd", "pushd", "popd", "echo", "printf", "tail", "head", "grep", "rg", "wc",
+                     "ls", "cat", "sort", "uniq", "cut", "true", "pwd", "date"}
+# `export PATH="$HOME/.cargo/bin:$PATH"` — единственная законная правка окружения рядом: прочие
+# (RUSTC_WRAPPER, CARGO_TARGET_*_RUNNER, RUSTFLAGS с линкером) — это подмена исполняемого.
+_RE_CARGO_PATH_EXPORT = re.compile(r'^PATH=["\']?\$HOME/\.cargo/bin:\$PATH["\']?$')
+_CARGO_BAD_ARGS = ("--config", "-Z", "--manifest-path")
+
+
+def _cargo_all_safe(cmd):
+    """True ⇔ в команде есть cargo, КАЖДЫЙ вызов — с подкомандой из `_CARGO_SAFE_SUB` без
+    `--config`/`-Z`/`--manifest-path` и без env-префикса, а все прочие сегменты — из
+    `_CARGO_NEIGHBOURS` или экспорт пути к cargo."""
+    seen = False
+    for i, seg in enumerate(_split_segments(cmd or "")):
+        if i % 2:
+            continue
+        try:
+            toks = shlex.split(seg)
+        except Exception:
+            return False
+        if not toks:
+            continue
+        j = _cmd_index(toks)
+        if j is None or j >= len(toks):
+            return False
+        if any(_RE_ENV_ASSIGN.match(t) for t in toks[:j]):
+            return False                      # `RUSTC_WRAPPER=evil cargo build`
+        b = _base(toks[j])
+        if b == "cargo":
+            rest = toks[j + 1:]
+            if rest and rest[0].startswith("+"):
+                rest = rest[1:]               # `cargo +nightly test`
+            if not rest or rest[0] not in _CARGO_SAFE_SUB:
+                return False
+            if any(a == o or a.startswith(o + "=") for a in rest for o in _CARGO_BAD_ARGS):
+                return False
+            seen = True
+        elif b == "export":
+            if len(toks) != j + 2 or not _RE_CARGO_PATH_EXPORT.match(toks[j + 1]):
+                return False
+        elif b not in _CARGO_NEIGHBOURS:
+            return False
+    return seen
 _RE_READONLY_SHELL = re.compile(r"(?i)^\s*(ls|dir|echo|type|cat|head|tail|wc|stat|findstr|grep|rg|get-content|get-childitem|select-string|get-item|get-ciminstance|test-path|measure-object|where|get-command|git|py|python\s+--version)\b")
 # Цикл ОЖИДАНИЯ вида `until <смотрелка>; do sleep N; done[; <смотрелка>]` — зелёный: чистое
 # чтение + sleep (кейс 314: headless ждал вердикт фонового прогона в task-output). Условие и
@@ -1875,7 +2229,42 @@ def _is_memory_store(path):
         i = parts.index("memory")
     except ValueError:
         return False
-    return ".claude" in parts[:i] and "projects" in parts[:i]
+    if ".claude" in parts[:i] and "projects" in parts[:i]:
+        return True
+    # Профиль НЕ в `.claude` (23.09.2026): на этом ПК сессии живут с `CLAUDE_CONFIG_DIR=D:\
+    # claude_profile_2`, и память лежит в `D:\claude_profile_2\projects\<репо>\memory\` — слова
+    # `.claude` в пути нет, и собственные заметки сессии спрашивали `write_outside` (2 карточки
+    # 23.09). Форма та же, что выше, но СТРОЖЕ: ровно `<профиль>\projects\<репо>\memory\<файл>`.
+    rel = _config_dir_rel(path)
+    return rel is not None and len(rel) >= 4 and rel[0] == "projects" and rel[2] == "memory"
+
+
+def _config_dir_rel(path):
+    """Части пути ПОСЛЕ корня профиля Claude Code из `CLAUDE_CONFIG_DIR`, или None, если путь не
+    под ним (или переменной нет). Корень читается на КАЖДОМ вызове: тест меняет окружение, а
+    хук живёт один вызов. Путь нормализуется до сравнения, поэтому `..` из-под корня не выводит."""
+    root = os.environ.get("CLAUDE_CONFIG_DIR") or ""
+    if not root.strip() or not path:
+        return None
+    try:
+        r = os.path.normcase(os.path.normpath(root))
+        p = os.path.normcase(os.path.normpath(path))
+    except Exception:
+        return None
+    if not p.startswith(r.rstrip(os.sep) + os.sep):
+        return None
+    return p[len(r.rstrip(os.sep)) + 1:].split(os.sep)
+
+
+def _is_workflow_script(path):
+    """Сохранённый сценарий Workflow этой же сессии:
+    `<профиль>\\projects\\<репо>\\<сессия>\\workflows\\scripts\\<имя>.js`. Правится ради повторного
+    запуска (так велит сам инструмент), прав не расширяет: запуск всё равно идёт через Workflow,
+    а агенты внутри судятся этим же гардом. Замер 22.09: 6 карточек `write_outside` — все на
+    правку такого файла. Стенограммы `*.jsonl` рядом НЕ входят."""
+    rel = _config_dir_rel(path)
+    return (rel is not None and len(rel) == 6 and rel[0] == "projects"
+            and rel[3] == "workflows" and rel[4] == "scripts" and rel[5].endswith(".js"))
 
 
 # Корни ЧУЖИХ проектов владельца, где запись подтверждения не требует. Список НАЗНАЧЕН ЗАМЕРОМ,
@@ -1913,8 +2302,23 @@ def _sanctioned_outside(path):
     (`%TEMP%\\claude\\**`, включая скретчпад), хранилище памяти агента и рабочие корни владельца
     (`_TRUSTED_ROOTS`). Первые два — рабочая зона самой сессии, не вектор эскалации (живой факт
     аудита 22:27: 6 из 20 последних Allow были про них); третий заведён замером 12.09.2026."""
+    # Служебное нутро git (`.git\hooks`, `.git\config` …) доверенной зоной НЕ бывает (23.09.2026):
+    # хук, положенный в `D:\turbobaby-bike-bot\.git\hooks\pre-commit`, исполнит следующий
+    # `git commit`, а тот зелёный — это запуск любого кода мимо гарда. Через Write дыра стояла
+    # с 12.09 (свои корни), шелл-запись её расширила бы; состязательная проверка 23.09 нашла.
+    if _has_git_dir_segment(path):
+        return False
     return (_is_scratchpad(path) or _is_temp_zone(path) or _is_memory_store(path)
-            or _is_trusted_root(path))
+            or _is_workflow_script(path) or _is_trusted_root(path))
+
+
+def _has_git_dir_segment(path):
+    """В нормализованном пути есть каталог `.git` с чем-то внутри."""
+    try:
+        parts = os.path.normcase(os.path.normpath(path or "")).split(os.sep)
+    except Exception:
+        return True                           # не разобрали — доверия нет
+    return ".git" in parts[:-1]
 
 
 def _is_test_target(path):
@@ -2923,9 +3327,20 @@ def _scan_python(cmd, cwd, env_probe=False):
     content = ""
     py_srcs = []          # те же куски ПОРОЗНЬ: разобрать питон можно только целым куском, а не склейкой
     saw_target = False
+    # ФЛАГИ ЧУЖОЙ КОМАНДЫ — НЕ ФЛАГИ PYTHON (23.09.2026). Разбор шёл с НУЛЕВОГО токена, и
+    # `curl -s -m 60 https://… | python -c "…"` читался как `python -m 60`: таймаут curl
+    # становился модулем, и чтение сайта спрашивало `py_write` с объектом «-m 60» (замер реплеем
+    # потока 22–23.09 — так уходили все трубы `curl -m N | python -c`). Флаги начинаем смотреть
+    # с ПЕРВОГО интерпретатора; всё после него — как раньше, включая второй запуск python.
+    # `.py`-цели по-прежнему смотрим ВСЕ, с нулевого токена: сужение касается только флагов.
+    # Интерпретатора среди токенов нет (ветка сырого текста выше) — флаги тоже все, как прежде.
+    py_start = next((k for k, t in enumerate(toks) if _RE_PY.search(t)), 0)
     i = 0
     while i < len(toks):
         t = toks[i]
+        if i < py_start and t in ("-c", "-", "-m"):
+            i += 1
+            continue
         if t == "-c":
             src = toks[i + 1] if i + 1 < len(toks) else ""
             content += src
@@ -3757,9 +4172,21 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False, skip_kinds=frozenset()):
     if m and "edit_claude" not in skip_kinds and not _is_pure_config_read(cmd) \
             and _cfg_reach(cmd) is None:
         return ("ask", "edit_claude", m.group(0))
-    m = _RE_OUTSIDE_WRITE.search(cmd)
-    if m and "outside" not in skip_kinds and not _inside_project(m.group(2)):
-        return ("ask", "outside", m.group(2))
+    # Запись шеллом (`>`/`Out-File`/`Copy-Item` …) судится ТЕМИ ЖЕ зонами, что запись инструментом
+    # (`_decide_write`): скретчпад, временная зона, память, свои корни владельца. До 23.09.2026
+    # здесь стояло одно `_inside_project`, и `cargo test > <скретчпад>\log.txt` спрашивал, а тот
+    # же файл через Write молчал — 34 карточки `outside` за сутки 22–23.09. Смотрим КАЖДУЮ цель,
+    # а не первую: иначе разрешённая первая прикрыла бы вторую (`> скретчпад; > C:\Windows\x`).
+    if "outside" not in skip_kinds:
+        for m in _RE_OUTSIDE_WRITE.finditer(cmd):
+            t = m.group(2)
+            if re.match(r"^/[A-Za-z]/", t):
+                t = _to_win_path(t)          # `/c/Windows/x` → `c:\Windows\x`, иначе мимо проверки
+            if _inside_project(t):
+                continue
+            # секрет внутри разрешённой зоны спрашивает, как у Write (`edit_secret`)
+            if not _sanctioned_outside(t) or _is_secret_path(t, missing_is_secret=False):
+                return ("ask", "outside", t)
     # УДАЛЕНИЕ — СВОИМ РАЗБОРОМ ПО СЫРОЙ КОМАНДЕ, и место у него ровно здесь: НИЖЕ всех красных
     # ветвей (ни одно прежнее красное не перехвачено) и ВЫШЕ зелёных шорткатов. Без этой строки
     # `git rm suggest.py` умирал в шорткате `_RE_READONLY_SHELL` (в нём стоит имя `git`), а
@@ -3776,6 +4203,8 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False, skip_kinds=frozenset()):
     if _RE_GIT_SAFE.search(cmd):
         return ("defer", "", "")
     if _RE_TESTS.search(cmd):
+        return ("defer", "", "")
+    if _cargo_all_safe(cmd):
         return ("defer", "", "")
     if _RE_PY.search(cmd):
         if _all_py_targets_are_tests(cmd):        # прямой запуск только test_*.py → без контент-скана
