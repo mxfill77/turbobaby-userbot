@@ -477,6 +477,14 @@ class TestEncoding(Base):
         self.assertEqual(argv[argv.index("--model") + 1], "claude-opus-5-5")
         self.assertEqual(argv[argv.index("--effort") + 1], "xhigh")
         self.assertEqual(argv[-1], "p")                                     # prompt строго последним
+        # ЗАПАСНАЯ ИСПОЛНИТЕЛЯ (задание Штаба 0023-72b, 23.09.2026): до правки флага не было вовсе,
+        # и отказ основной ронял задачу, а не уводил её на claude-opus-5 (71w, живой argv PID 7816).
+        self.assertEqual(o.EXECUTOR_FALLBACK, "claude-opus-5")
+        self.assertIn("--fallback-model", argv)
+        self.assertEqual(argv[argv.index("--fallback-model") + 1], "claude-opus-5")
+        self.assertNotEqual(argv[argv.index("--fallback-model") + 1],
+                            argv[argv.index("--model") + 1])                  # CLI отвергает равную пару
+        self.assertEqual(argv.count("p"), 1)                                # prompt не задвоен флагом
 
     def test_child_env_has_pythonioencoding_utf8(self):
         captured = {}
@@ -2503,6 +2511,9 @@ class TestTaskSelfheal(Base):
         # 23.09.2026 лестница сдвинута: основная claude-opus-5-5, запасная claude-opus-5;
         # claude-opus-4-8 снят. Снятое имя в ФОЛБЭКЕ уходит на запасную, а не на основную —
         # иначе лестница схлопнулась бы в одну ступень.
+        # С 23.09 (0023-72b) грязное наследство до головы не доходит вовсе: пару решает файл .env,
+        # прочитанный на старте процесса (см. test_thinker_pair_handover_equals_fresh_start);
+        # направления нормализации ниже по-прежнему держат ИМЕНА, прочитанные из файла.
         import subprocess
         env = dict(os.environ)
         env["THINKER_MODEL"] = "fable-5"      # ровно то, что PEB показал в живом PID 1120
@@ -2553,6 +2564,86 @@ class TestTaskSelfheal(Base):
         diag = (p.stdout or "") + (p.stderr or "")
         self.assertEqual(vals.get("T"), "claude-opus-5-5", diag)
         self.assertEqual(vals.get("F"), "claude-opus-5", diag)
+
+    def test_thinker_pair_handover_equals_fresh_start(self):
+        # ЖИВОЙ КЛАСС 22–23.09.2026 (71w). Self-update рожает новый процесс с окружением СТАРОГО
+        # (`_spawn_daemon` → dict(os.environ)), а load_dotenv(override=False) унаследованное не
+        # перебивает. Демон, свежестартовавший 22.09 22:53 со старым .env, пронёс через две эстафеты
+        # THINKER_MODEL=claude-opus-5 / THINKER_FALLBACK=claude-opus-4-8 — и думатель пошёл бы
+        # ПЕРЕВЁРНУТОЙ лестницей claude-opus-5 → claude-opus-5-5, хотя .env уже говорил обратное.
+        # ИНВАРИАНТ: эстафета = свежий старт. Процесс, рождённый с ГРЯЗНЫМ наследством (ровно пара
+        # 71w + метка эстафеты), обязан получить ту же пару, что процесс с ЧИСТЫМ окружением, — какой
+        # бы ни стояла строка .env (литерала .env тест не зеркалит). И окружение процесса после импорта
+        # обязано говорить ту же правду: его наследуют дети и следующая эстафета.
+        # Значения .env тест НЕ печатает даже при провале — только имена разошедшихся полей.
+        import subprocess
+        code = ("import os, pc_orchestrator as m;"
+                "print('T=' + m.THINKER_MODEL);"
+                "print('F=' + m.THINKER_FALLBACK);"
+                "print('M=' + repr(os.environ.get('THINKER_MODEL')));"
+                "print('B=' + repr(os.environ.get('THINKER_FALLBACK')))")
+
+        def run(env):
+            p = subprocess.run([sys.executable, "-c", code], cwd=o.REPO, env=env,
+                               capture_output=True, text=True, timeout=60)
+            vals = {ln[0]: ln[2:] for ln in p.stdout.splitlines()
+                    if len(ln) > 2 and ln[1] == "=" and ln[0] in "TFMB"}
+            return vals, "rc=%s, полей %d" % (p.returncode, len(vals))
+
+        clean = {k: v for k, v in os.environ.items() if k not in ("THINKER_MODEL", "THINKER_FALLBACK")}
+        dirty = dict(clean, THINKER_MODEL="claude-opus-5", THINKER_FALLBACK="claude-opus-4-8",
+                     PC_ORCH_SUPERSEDE_PID="8756")
+        vc, dc = run(clean)
+        vd, dd = run(dirty)
+        self.assertEqual(len(vc), 4, dc)
+        self.assertEqual(len(vd), 4, dd)
+        self.assertTrue(vc["T"].startswith("claude-"), "чистый старт: основная не полный id")
+        diff = [k for k in "TFMB" if vc.get(k) != vd.get(k)]
+        self.assertEqual(diff, [], "эстафета с наследством 71w разошлась со свежим стартом в полях %s "
+                                   "(T/F — пара думателя, M/B — окружение процесса)" % ", ".join(diff))
+
+    def test_thinker_env_fresh_file_decides_not_inheritance(self):
+        # Чистая функция свежего источника пары думателя: решает ФАЙЛ .env, наследство — нет.
+        stale_env = {"THINKER_MODEL": "claude-opus-5", "THINKER_FALLBACK": "claude-opus-4-8", "X": "1"}
+        file_now = {"THINKER_MODEL": "claude-opus-5-5", "THINKER_FALLBACK": "claude-opus-4-8"}
+        raw, from_file, stale = o._thinker_env_fresh("x.env", environ=stale_env,
+                                                     reader=lambda p: dict(file_now))
+        self.assertTrue(from_file)
+        self.assertEqual(raw, file_now)
+        self.assertEqual(stale, ["THINKER_MODEL"])                    # разошлась ровно основная
+        self.assertEqual(o._thinker_pair(raw), ("claude-opus-5-5", "claude-opus-5"))
+        # то, что дало бы наследство 71w, — перевёрнутая лестница (для этого и нужен свежий источник)
+        self.assertEqual(o._thinker_pair(stale_env), ("claude-opus-5", "claude-opus-5-5"))
+        # ключа в файле нет → дефолт кода, наследство НЕ подставляется (так же, как на свежем старте)
+        raw, from_file, stale = o._thinker_env_fresh("x.env", environ=stale_env,
+                                                     reader=lambda p: {"OTHER": "1"})
+        self.assertTrue(from_file)
+        self.assertEqual(raw, {"THINKER_MODEL": None, "THINKER_FALLBACK": None})
+        self.assertEqual(stale, ["THINKER_MODEL", "THINKER_FALLBACK"])
+        self.assertEqual(o._thinker_pair(raw), ("claude-opus-5-5", "claude-opus-5"))
+        # пустое значение в файле значит пустое — фолбэк выключен, ровно как при load_dotenv
+        raw, _, _ = o._thinker_env_fresh("x.env", environ={},
+                                         reader=lambda p: {"THINKER_FALLBACK": ""})
+        self.assertEqual(raw["THINKER_FALLBACK"], "")
+        self.assertEqual(o._thinker_pair(raw), ("claude-opus-5-5", ""))
+        # файл не прочитан → прежнее поведение (окружение), и это НАЗВАНО (from_file=False)
+        def boom(p):
+            raise OSError("нет доступа")
+        raw, from_file, stale = o._thinker_env_fresh("x.env", environ=stale_env, reader=boom)
+        self.assertFalse(from_file)
+        self.assertEqual(raw, {"THINKER_MODEL": "claude-opus-5", "THINKER_FALLBACK": "claude-opus-4-8"})
+        self.assertEqual(stale, [])
+        # настоящий парсер dotenv (живой формат строки, без мока парсера), без диска — поток
+        from dotenv import dotenv_values
+        raw, from_file, _ = o._thinker_env_fresh(
+            "x.env", environ=stale_env,
+            reader=lambda p: dotenv_values(stream=io.StringIO(
+                "# c\nOTHER=1\nTHINKER_MODEL=claude-opus-5-5\n")))
+        self.assertEqual(raw, {"THINKER_MODEL": "claude-opus-5-5", "THINKER_FALLBACK": None})
+        # синхронизация окружения: правду наследуют дети и следующая эстафета; чужие ключи не тронуты
+        e = dict(stale_env)
+        o._thinker_env_sync({"THINKER_MODEL": "claude-opus-5-5", "THINKER_FALLBACK": None}, e)
+        self.assertEqual(e, {"THINKER_MODEL": "claude-opus-5-5", "X": "1"})
 
 
 class TestThinkerEffort(unittest.TestCase):

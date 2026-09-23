@@ -2358,6 +2358,14 @@ def resolve_claude(retries=1, retry_sleep=2.0):
 # THINKER_MODEL (думатель, claude-opus-5-5) не задеты — у них свои явные --model. Полный id
 # обязателен: короткий алиас → HTTP 404 у claude -p (класс #194).
 EXECUTOR_MODEL = "claude-opus-5-5"
+# ЗАПАСНАЯ ИСПОЛНИТЕЛЯ (задание Штаба 0023-72b, 23.09.2026; решение владельца: запасная на всех
+# головах — claude-opus-5). До этой строки флага не было вовсе (71w: живой argv PID 7816 без
+# --fallback-model): отказ основной ронял задачу, а не уводил её на запасную. Фолбэк исполняет САМ
+# CLI в этом же вызове — «when the default model is overloaded or not available» (справка флага в
+# бинаре CLI этого ПК); лимит учётки (429) он НЕ лечит: учётка у обеих голов одна. Константа, а не
+# env — по той же причине, что EXECUTOR_MODEL выше. Та же ступень — запасная думателя
+# (`_THINKER_RESERVE` ниже): одно решение владельца, одно место в коде.
+EXECUTOR_FALLBACK = "claude-opus-5"
 
 
 # ─── ЧАСЫ БОДРСТВОВАНИЯ: СОН МАШИНЫ НЕ ТРАТИТ БЮДЖЕТ ЗАДАЧИ (разбор 01.08.2026) ──────────────
@@ -2518,7 +2526,10 @@ def run_claude(prompt, timeout, cwd, env, popen=None, waiter=None):
         # (24.07.2026, тема 328): --model EXECUTOR_MODEL — исполнитель на Opus, settings.json
         # остаётся про интерактивные сессии. prompt держим ПОСЛЕДНИМ.
         eff = task_metrics.norm_effort(repo_thinking_settings()[0])
-        argv = [cbin, "-p", "--model", EXECUTOR_MODEL, "--effort", eff, prompt]
+        argv = [cbin, "-p", "--model", EXECUTOR_MODEL]
+        if EXECUTOR_FALLBACK and EXECUTOR_FALLBACK != EXECUTOR_MODEL:   # CLI отвергает равную пару
+            argv += ["--fallback-model", EXECUTOR_FALLBACK]
+        argv += ["--effort", eff, prompt]
         # Popen вместо subprocess.run — не «стиль», а единственный способ переоценивать бюджет
         # ПО ХОДУ: у run таймаут задаётся один раз на старте и мерится смещёнными часами.
         # capture_output=True разворачивается в две трубы явно, остальное слово в слово прежнее.
@@ -5864,7 +5875,7 @@ _MODEL_ALIAS_FULL = {"fable-5": "claude-opus-5-5", "fable5": "claude-opus-5-5",
                      "fable": "claude-opus-5-5", "claude-fable-5": "claude-opus-5-5",
                      "opus-4.8": "claude-opus-5-5", "opus-4-8": "claude-opus-5-5",
                      "claude-opus-4-8": "claude-opus-5-5"}
-_THINKER_RESERVE = "claude-opus-5"   # запасная ступень лестницы (решение владельца 23.09.2026)
+_THINKER_RESERVE = EXECUTOR_FALLBACK   # запасная ступень лестницы — ОДНА на обе головы (решение владельца 23.09.2026)
 def _norm_model_id(m):
     """Короткий алиас модели → ПОЛНЫЙ id (claude -p на коротком отвечает 404, #194); имена снятых
     голов → claude-opus-5-5. Неизвестное значение возвращаем как есть — не ломаем валидные полные
@@ -5881,8 +5892,63 @@ def _norm_fallback_id(m, main):
     if f and f == main:
         f = _THINKER_RESERVE if main != _THINKER_RESERVE else ""
     return f
-THINKER_MODEL = _norm_model_id(os.getenv("THINKER_MODEL", "claude-opus-5-5")) or "claude-opus-5-5"  # своя голова думателя (НЕ SUGGEST_MODEL); нормализована в ПОЛНЫЙ id
-THINKER_FALLBACK = _norm_fallback_id(os.getenv("THINKER_FALLBACK", _THINKER_RESERVE), THINKER_MODEL)  # свой фолбэк думателя; ПОЛНЫЙ id, не равен основной
+# ─── ПАРА ДУМАТЕЛЯ — ИЗ ФАЙЛА .env НА КАЖДОМ СТАРТЕ ПРОЦЕССА, А НЕ ИЗ НАСЛЕДСТВА ЭСТАФЕТЫ ──────
+# (задание Штаба 0023-72b, 23.09.2026; разбор 71w). Нормализатор выше лечит ИМЕНА, но не ВОЗРАСТ
+# значения. Self-update рожает новый процесс с окружением старого (`_spawn_daemon` →
+# dict(os.environ)), а load_dotenv(override=False) унаследованное не перебивает. Живой случай:
+# демон, свежестартовавший 22.09 22:53 со старым .env, пронёс через две эстафеты пару
+# claude-opus-5 / claude-opus-4-8 — карта развернула фолбэк в claude-opus-5-5, и думатель встал
+# ПЕРЕВЁРНУТОЙ лестницей, хотя строка .env уже говорила claude-opus-5-5. Лечила это только
+# перезагрузка (свежий старт сторожем 23.09 17:33), то есть случайность, а не код.
+# Теперь для этих двух ключей решает ФАЙЛ, прочитанный этим процессом на его старте: эстафета
+# равна свежему старту (держит `test_thinker_pair_handover_equals_fresh_start`). Ключа в файле
+# нет → дефолт кода (как на свежем старте), наследство не подставляется. Файл не прочитан →
+# прежнее поведение (окружение), и это названо в баннере старта: «не смог проверить» не выдаётся
+# за «проверил». Окружение процесса затем приводится к той же правде — его наследуют дети и
+# СЛЕДУЮЩАЯ эстафета, и диагностика по env ребёнка (так 71w снимал пару) больше не врёт.
+_THINKER_KEYS = ("THINKER_MODEL", "THINKER_FALLBACK")
+
+
+def _thinker_env_fresh(path=None, environ=None, reader=None):
+    """Сырые THINKER_MODEL/THINKER_FALLBACK из ФАЙЛА .env → (raw, from_file, stale).
+
+    raw — {ключ: значение | None}; None = ключа в файле нет (дальше — дефолт кода). from_file —
+    файл прочитан; False → raw взят из окружения (прежнее поведение). stale — имена ключей, в
+    которых унаследованное окружение разошлось с файлом (на свежем старте всегда пусто: load_dotenv
+    уже положил туда файл). reader/environ — инъекция для тестов; по умолчанию dotenv_values —
+    тот же парсер, что у load_dotenv."""
+    env = os.environ if environ is None else environ
+    try:
+        if reader is None:
+            from dotenv import dotenv_values as reader
+        vals = reader(path or os.path.join(REPO, ".env")) or {}
+    except Exception:
+        return {k: env.get(k) for k in _THINKER_KEYS}, False, []
+    raw = {k: vals.get(k) for k in _THINKER_KEYS}
+    return raw, True, [k for k in _THINKER_KEYS if env.get(k) != raw[k]]
+
+
+def _thinker_env_sync(raw, environ=None):
+    """Привести окружение процесса к свежему источнику: значение → поставить, None → убрать."""
+    env = os.environ if environ is None else environ
+    for k in _THINKER_KEYS:
+        if raw.get(k) is None:
+            env.pop(k, None)
+        else:
+            env[k] = raw[k]
+
+
+def _thinker_pair(raw):
+    """Сырые значения → (основная, фолбэк) думателя: полные id, фолбэк не равен основной."""
+    m, fb = raw.get("THINKER_MODEL"), raw.get("THINKER_FALLBACK")
+    main = _norm_model_id("claude-opus-5-5" if m is None else m) or "claude-opus-5-5"
+    return main, _norm_fallback_id(_THINKER_RESERVE if fb is None else fb, main)
+
+
+_THINKER_RAW, _THINKER_FROM_FILE, _THINKER_STALE = _thinker_env_fresh()
+if _THINKER_FROM_FILE:
+    _thinker_env_sync(_THINKER_RAW)
+THINKER_MODEL, THINKER_FALLBACK = _thinker_pair(_THINKER_RAW)  # своя пара думателя (НЕ SUGGEST_MODEL); ПОЛНЫЕ id, фолбэк не равен основной
 # Маркер перерождения одиночной задачи стоит ПЕРВЫМ в тексте → якорь ^ (страховка от ложного
 # срабатывания на ТЗ, где маркер лишь упомянут в теле). N = id исходной задачи.
 _HEAL_TASK_RE = re.compile(r"^\s*\[самопочинка задачи (\d+), попытка (\d+)\]")
@@ -14218,6 +14284,16 @@ def _main_loop():
              os.environ.get("STEP_SELFHEAL"), os.environ.get("PLAN_ADAPT"),
              os.environ.get("PC_LOCAL_DEC"),
              int(_flag_forced_off("STEP_SELFHEAL")), int(_flag_forced_off("PLAN_ADAPT")))
+    # ГОЛОВЫ И ИХ ЗАПАСНЫЕ — в баннер (23.09.2026, 71w). До этой строки пару думателя живьём было
+    # не снять ничем, кроме вывода кодом из env ребёнка: сам думатель зовётся редко, а METRICS
+    # пишет только исполнитель и только основную. Печатаем ДЕЙСТВУЮЩИЕ (нормализованные) id и
+    # ИСТОЧНИК, а не сырые строки .env; «наследство расходилось» называет ИМЕНА ключей, которые
+    # свежий источник поправил на этой эстафете (на свежем старте там всегда «нет»).
+    log.info("=== ГОЛОВЫ: исполнитель %s → запасная %s (константы кода); думатель %s → запасная %s "
+             "(источник пары думателя: %s; наследство эстафеты расходилось с файлом: %s) ===",
+             EXECUTOR_MODEL, EXECUTOR_FALLBACK or "нет", THINKER_MODEL, THINKER_FALLBACK or "нет",
+             "файл .env" if _THINKER_FROM_FILE else "ОКРУЖЕНИЕ — файл .env не прочитан",
+             ", ".join(_THINKER_STALE) or "нет")
     # ДЕЖУРНЫЙ ПО КАРТОЧКАМ — отдельной строкой, и по той же причине, что абзацем выше, только
     # цена молчания здесь выше: этот рубильник решает не «как демон чинится», а КАКИЕ ВОПРОСЫ
     # ВЛАДЕЛЕЦ УВИДИТ. До этой строки его состояние не читалось НИОТКУДА, кроме `.env`, — то есть
