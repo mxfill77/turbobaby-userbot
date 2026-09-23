@@ -69,6 +69,7 @@ _LIVE_TARGET = {
     "edit_secret":  (r"D:\turbobaby-bot\.env", ""),
     "read_secret":  (r"D:\turbobaby-bot\.env", ""),
     "edit_claude":  (r"D:\turbobaby-bot\.claude\settings.json", ""),
+    "edit_git":     (r"D:\turbobaby-bot\.git\hooks\pre-commit", ""),
     # ДВА ИМЕНИ НЕЗНАНИЯ ГАРДА. Цели у них нет ЗАКОНОМЕРНО — и держит их вторая половина
     # `_highest_kind`, а не наличие объекта (см. `test_unparsed_kinds_held_without_object`).
     "unknown":      ("", "нераспознанная команда"),

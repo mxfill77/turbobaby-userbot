@@ -53,9 +53,16 @@ Claude Code, но решение хука «ask» он не отменяет —
 | запись в `.git\hooks`, `.git\config` ДОВЕРЕННЫХ корней (Write — с 12.09; шелл — расширила бы эта правка) | да / вводилась | карточка: `.git` не бывает доверенной зоной |
 | `cargo test && ./target/debug/bot`, `RUSTC_WRAPPER=…`/`CARGO_TARGET_*_RUNNER=…` перед cargo | вводилась | карточка |
 
-**НЕ закрыто (вынесено отдельной задачей):** запись в `.git\hooks`/`.git\config` САМОГО репозитория
-`D:\turbobaby-bot` молчит (было и до правки) — нужен свой вид карточки, а он тянет правку
-`card_ledger_pc.py`, `pc_orchestrator.py`, `docs/guard-classes.md`, `test_card_duty.py`.
+**Закрыто вторым коммитом того же дня — новый вид `edit_git`.** Запись в `.git\hooks`/
+`.git\config`/`.git\info\*` САМОГО репозитория молчала (было и до правки): Write/Edit и шелл
+(`>`, `tee`, `cp`/`mv`/`install` в хук, `chmod +x`, `sed -i`, `Set-Content`). Теперь это карточка
+`edit_git` где угодно — в репо, в своих корнях, во временной зоне; чтение (`cat`, `grep`, `ls`,
+`cp .git/config куда-то`) — зелёное. Вид внесён в `_KIND_VOCAB` (21 имя), `_stays_red`, откат,
+фразу последствия, `card_ledger_pc.MUTED_KINDS` (рядом с `edit_claude`), `test_card_duty`;
+`pc_orchestrator.py` не менялся (список исполнителя — отдельный, расхождение описано в
+`docs/guard-classes.md`). **Цена:** из 31 957 решений журнала с 09.09 20:15 ни одно не стало бы
+`edit_git` (`tmp/prompt_flood_2309/git_cost.py`). Попутная находка теста: POSIX-shlex съедал `\`
+в PowerShell-пути, `.git\hooks\x` превращался в `.githooksx` — разбор теперь идёт по `/`.
 
 ## Эффект (реплей того же журнала гардом HEAD и рабочего дерева)
 
@@ -69,7 +76,8 @@ Claude Code, но решение хука «ask» он не отменяет —
 
 - `test_pretool_guard` + модули, импортирующие гард (`test_card_*`, `test_env_value_leak`,
   `test_exec_position`, `test_guard_action_not_text`, `test_mark_vs_address_pc`, `test_owner_mute`,
-  `test_probe_isolation`, `test_pc_orchestrator`) — **1920 тестов, все зелёные**.
+  `test_probe_isolation`, `test_pc_orchestrator`) — **1920 тестов, все зелёные**; после `edit_git`
+  — **1922**, все зелёные.
 - Состязательная проверка, проход 1 (workflow, 3 атакующих): зоны записи дали находки выше
   (`.git` корней, запись без пробела/MSYS/UNC); сеть и исполнение вернулись пустыми.
 - Проход 2 (workflow) не состоялся: все три агента остановлены до первой пробы — **не зачтён**.

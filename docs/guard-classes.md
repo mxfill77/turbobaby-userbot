@@ -29,6 +29,14 @@
 **12 у исполнителя:** `delete`, `env`, `kill`, `schtasks`, `network`, `sqlite`, `clasp`,
 `outside`, `py_write`, `git_force`, `edit_claude`, `other`.
 
+> **Поправка 23.09.2026:** одобряемых стало **20** — добавлен `edit_git` (запись в нутро `.git`:
+> хуки, `config`, `info/*` — Write/Edit и шелл `>`/`tee`/`cp`/`mv`/`install`/`chmod`/`sed -i`/
+> `Set-Content`). В `_KIND_VOCAB` вместе с `unknown_tool` — 21 имя. Исполнителю он НЕ назван
+> (список из 12 не менялся), так что в §2 расхождение — **8** классов. Уведомление гасится
+> (`card_ledger_pc.MUTED_KINDS`, рядом с `edit_claude`). Замер цены: 31 957 решений журнала с
+> 09.09 — ни одно не стало бы `edit_git`. Разбор —
+> `docs/artifacts/2026-09-23-GARD-potok-podtverzhdeniy-2309.md`.
+
 ---
 
 ## 2. Главное расхождение: 7 классов исполнитель назвать НЕ МОЖЕТ

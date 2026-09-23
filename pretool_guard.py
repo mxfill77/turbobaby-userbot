@@ -540,6 +540,7 @@ def _human(kind, obj=""):
         "edit_secret": "Хочу изменить секретный файл " + (o or ".env/сессия") + " (секреты/токен)",
         "read_secret": "Хочу прочитать секретный файл " + (o or ".env/сессия") + " (секреты/токен)",
         "edit_claude": "Хочу изменить конфиг Claude Code (.claude): " + (o or "*"),
+        "edit_git": "Хочу изменить служебный файл git (.git — хуки и настройки исполняются следующей git-командой): " + (o or "*"),
         "write_outside": "Хочу записать за пределами проекта: " + (o or "вне D:\\turbobaby-bot"),
         "unknown": "Требуется подтверждение: команда не распознана как безопасная",
         # Канал вне реестра. Фраза называет ОБЪЕКТ — имя инструмента: это единственное, что гард
@@ -2315,10 +2316,55 @@ def _sanctioned_outside(path):
 def _has_git_dir_segment(path):
     """В нормализованном пути есть каталог `.git` с чем-то внутри."""
     try:
-        parts = os.path.normcase(os.path.normpath(path or "")).split(os.sep)
+        parts = os.path.normcase(os.path.normpath((path or "").strip("'\""))).split(os.sep)
     except Exception:
         return True                           # не разобрали — доверия нет
     return ".git" in parts[:-1]
+
+
+# Писатели шелла: у первых целью может быть ЛЮБОЙ аргумент, у вторых — последний (назначение;
+# источник `.git/config` при `cp .git/config backup` — это чтение).
+_GIT_WRITE_ANY_ARG = {"tee", "touch", "chmod", "truncate", "out-file", "set-content", "add-content",
+                      "new-item", "sed"}
+_GIT_WRITE_DEST = {"cp", "mv", "install", "ln", "rsync", "copy-item", "move-item", "rename-item",
+                   "copy", "move"}
+_RE_REDIR_ANY_TARGET = re.compile(r"(?:^|[^<>&\d])\d*>>?\|?\s*([\"']?)([^\s\"'|;&<>]+)\1")
+
+
+def _git_internal_write_target(cmd):
+    """Цель записи шеллом внутрь `.git` (редирект или писатель) → путь | None."""
+    for i, seg in enumerate(_split_segments(cmd or "")):
+        if i % 2:
+            continue
+        for m in _RE_REDIR_ANY_TARGET.finditer(seg):
+            t = m.group(2)
+            if _has_git_dir_segment(_to_win_path(t) if re.match(r"^/[A-Za-z]/", t) else t):
+                return t
+        # `\` → `/` ДО разбора: POSIX-shlex съедает обратный слэш, и `.git\hooks\x` PowerShell-формы
+        # превращался в `.githooksx` (нашёл тест 23.09)
+        flat = seg.replace("\\", "/")
+        try:
+            toks = shlex.split(flat)
+        except Exception:
+            toks = flat.split()
+        j = _cmd_index(toks)
+        if j is None or j >= len(toks):
+            continue
+        b = _base(toks[j])
+        opts = toks[j + 1:]
+        if b == "sed" and not any(a.startswith("-i") or a.startswith("--in-place") for a in opts):
+            continue                          # sed без -i только печатает
+        args = [a for a in opts if not a.startswith("-")]
+        if b in _GIT_WRITE_ANY_ARG:
+            cand = args
+        elif b in _GIT_WRITE_DEST:
+            cand = args[-1:]
+        else:
+            continue
+        for a in cand:
+            if _has_git_dir_segment(a):
+                return a
+    return None
 
 
 def _is_test_target(path):
@@ -3969,6 +4015,10 @@ def _decide_write(ti, cwd):
         return ("ask", "edit_secret", os.path.basename(path))
     if _is_claude_path(path):
         return ("ask", "edit_claude", os.path.basename(path))
+    # Нутро `.git` — где угодно, и внутри репозитория тоже (23.09.2026): хук или `core.hooksPath`
+    # исполнит следующий `git commit`, а он зелёный — запуск любого кода мимо гарда.
+    if _has_git_dir_segment(path):
+        return ("ask", "edit_git", path)
     # ВЫНОС ЗНАЧЕНИЯ В ФАЙЛ инструментом (не шеллом). Улик две, обе про ТЕЛО записи, а не про имя:
     # ДОСЛОВНОЕ значение из окружения этого процесса (`_env_value_in_text`) и ЛЮБОЕ присваивание
     # секрета с настоящим значением (`_secret_value_leak` — тот же прибор, что у тел heredoc).
@@ -4172,6 +4222,12 @@ def _decide_bash_body(cmd, cwd, scan, env_probe=False, skip_kinds=frozenset()):
     if m and "edit_claude" not in skip_kinds and not _is_pure_config_read(cmd) \
             and _cfg_reach(cmd) is None:
         return ("ask", "edit_claude", m.group(0))
+    # Нутро `.git` через шелл — тем же видом, что у Write (23.09.2026): `>`, `tee`, `cp`/`mv`
+    # в хук, `chmod +x` хука, `sed -i` по `.git/config`. Чтение (`cat .git/config`) — зелёное.
+    if "edit_git" not in skip_kinds:
+        t = _git_internal_write_target(cmd)
+        if t:
+            return ("ask", "edit_git", t)
     # Запись шеллом (`>`/`Out-File`/`Copy-Item` …) судится ТЕМИ ЖЕ зонами, что запись инструментом
     # (`_decide_write`): скретчпад, временная зона, память, свои корни владельца. До 23.09.2026
     # здесь стояло одно `_inside_project`, и `cargo test > <скретчпад>\log.txt` спрашивал, а тот
@@ -4501,7 +4557,7 @@ def _is_stamp_place(lines, i):
 _KIND_VOCAB = ("delete", "kill", "schtasks", "git_force", "sqlite", "clasp", "clasp_push",
                "clasp_deploy", "clasp_run", "live_sheet", "network", "env", "outside",
                "write_outside", "py_write", "edit_secret", "read_secret", "edit_claude",
-               "unknown", KIND_UNKNOWN_TOOL)
+               "edit_git", "unknown", KIND_UNKNOWN_TOOL)
 
 
 def owner_approved_kinds(env=None):
@@ -5059,6 +5115,7 @@ def _stays_red(kind, obj, cmd):
                 "network",                                # выход в сеть = канал утечки секретов
                 "outside", "write_outside",               # требование п.1: правки ТОЛЬКО внутри репо
                 "edit_claude",                            # иначе сессия молча расширит собственные права
+                "edit_git",                               # хук/настройка .git = код на следующем зелёном git
                 KIND_UNKNOWN_TOOL):                       # канал вне реестра (02.08.2026)
         # ПОЧЕМУ КАНАЛ ВНЕ РЕЕСТРА СТОИТ ИМЕННО ЗДЕСЬ. Без этой строки fail-closed из `decide`
         # умер бы прямо ниже: последняя строка функции («незнакомое САМО ПО СЕБЕ не красное»)
@@ -5195,6 +5252,7 @@ _ROLLBACK = {
     # `.claude/` лежат И отслеживаемый `settings.json`, И локальные файлы под `.gitignore`.
     # Названный объект уводит разбор в `_rollback` → `_claude_cfg_tracked`.
     "edit_claude": "Откат: вернуть прежний файл конфига — из git, если он под git; иначе из бэкапа",
+    "edit_git": "Откат: .git в истории не хранится — прежнее вернуть вручную, подложенный хук удалить",
     "outside": "Откат: удалить созданное вручную — это вне репозитория",
     "write_outside": "Откат: удалить созданное вручную — это вне репозитория",
     "py_write": "Откат: боевую запись Bridge снимает только обратная операция (void_last/…)",
@@ -5604,6 +5662,7 @@ _CONSEQ = {
     "edit_secret": "команда исполнится, и секретный файл %s будет перезаписан",
     "read_secret": "файл %s будет прочитан целиком, и его содержимое ляжет в контекст сессии",
     "edit_claude": "команда исполнится, и конфиг Claude Code %s станет другим",
+    "edit_git": "команда исполнится, и служебный файл git %s станет другим — сработает на следующей git-команде",
     # Гард не разобрал команду — и честная фраза говорит ИМЕННО ЭТО, а не выдумывает эффект.
     # Отказывать здесь нельзя: вид `unknown` держит hard-блок, и «карточки нет» у него означало
     # бы, что владелец не может подтвердить НИ ОДНУ неразобранную команду.
@@ -5872,7 +5931,7 @@ def card_gate(kind, obj, num=""):
           спрашивают как спрашивали; без объекта получают в `card_decision` `deny` наравне со
           всеми. Требование списка («молчать нельзя») отказ удовлетворяет строже вопроса.
         • ОБЪЕКТ: решать, что делать при его отсутствии, обязан `card_decision`, а не эта
-          функция. Без названного объекта ЛЮБОЙ из 20 видов получит там `deny` (17.08.2026;
+          функция. Без названного объекта ЛЮБОЙ из 21 вида (с 23.09.2026 — вместе с edit_git) получит там `deny` (17.08.2026;
           до этого — только 8 видов `_TOP_TIER`). Разбор — ниже.
 
     ПОЧЕМУ ФУНКЦИЯ ОСТАЛАСЬ, А НЕ СНЯТА ВМЕСТЕ С ВЕТКОЙ. Это ЕДИНСТВЕННОЕ названное место
@@ -5949,7 +6008,7 @@ def card_decision(kind, obj="", raw_cmd=""):
         ask     — карточка как была (обычный вид; высший вид — с шапкой);
         journal — НЕДОСТИЖИМО с 02.08.2026 (класс Д-3): `card_gate` безусловна. Ветка оставлена
                   единственной точкой, где правило спрашивают, и снимется вместе с ним;
-        deny    — ОБЪЕКТ НЕ НАЗВАН, у ЛЮБОГО из 20 видов: карточку не выписываем ВОВСЕ.
+        deny    — ОБЪЕКТ НЕ НАЗВАН, у ЛЮБОГО из 21 вида: карточку не выписываем ВОВСЕ.
 
     Про `deny` отдельно, потому что это единственное место, где гард ЗАПРЕЩАЕТ, а не спрашивает.
     Позиция «хук только добавляет подтверждения» не нарушена: `deny` строже `ask`, новых

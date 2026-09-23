@@ -3631,7 +3631,7 @@ class TestTwoTiersOfCards(unittest.TestCase):
         8 видов из 20. Тест держит границу на СЛОВАРЕ, а не на списке из восьми: любой новый вид
         приезжает под замок сам, и забыть его нельзя — иначе повторится ровно census-дефект
         «замок есть, входа в него у этого вида нет»."""
-        self.assertEqual(len(g._KIND_VOCAB), 20, "словарь видов изменился — замок пересчитать")
+        self.assertEqual(len(g._KIND_VOCAB), 21, "словарь видов изменился — замок пересчитать")
         denied = [k for k in g._KIND_VOCAB if g.card_decision(k, "", "")[0] == "deny"]
         self.assertEqual(sorted(denied), sorted(g._KIND_VOCAB),
                          "без объекта отказ обязан быть у КАЖДОГО вида, а не у высших")
@@ -5552,11 +5552,40 @@ class TestPromptFlood2309(unittest.TestCase):
     def test_git_internals_in_trusted_root_ask_for_write_and_shell(self):
         for p in (r"D:\turbobaby-bike-bot\.git\hooks\pre-commit", r"D:\turbobaby-bike-bot\.git\config",
                   r"D:\t27work\wt-bindings-2209\.git\hooks\post-checkout"):
-            self.assertEqual(g.decide(self._w(p, "#!/bin/sh\necho x"))[:2], ("ask", "write_outside"), p)
+            self.assertEqual(g.decide(self._w(p, "#!/bin/sh\necho x"))[:2], ("ask", "edit_git"), p)
             c = "echo x > " + p.replace("\\", "/")
-            self.assertEqual(g.decide(bash(c))[:2], ("ask", "outside"), c)
+            self.assertEqual(g.decide(bash(c))[:2], ("ask", "edit_git"), c)
+        # вне своих корней `.git` не делает зону доверенной и через `_sanctioned_outside`
+        self.assertFalse(g._sanctioned_outside(r"D:\turbobaby-bike-bot\.git\hooks\pre-commit"))
         # соседи по имени — обычные файлы проекта, как и были
         for p in (r"D:\turbobaby-bike-bot\.gitignore", r"D:\turbobaby-bike-bot\.github\workflows\ci.yml"):
+            self.assertEqual(g.decide(self._w(p))[0], "defer", p)
+
+    def test_own_repo_git_internals_ask_as_edit_git(self):
+        """Дыра, найденная 23.09 и прежде вынесенная задачей: внутри САМОГО репозитория запись
+        в `.git\\hooks` / `.git\\config` молчала — и Write, и шелл. Следующий зелёный
+        `git commit` исполнил бы подложенный хук."""
+        for p in (r"D:\turbobaby-bot\.git\hooks\pre-commit", r"D:\turbobaby-bot\.git\config",
+                  r"D:\turbobaby-bot\.git\info\attributes"):
+            self.assertEqual(g.decide(self._w(p))[:2], ("ask", "edit_git"), p)
+            self.assertEqual(g.decide(edit(p))[:2], ("ask", "edit_git"), p)
+        for c in ("echo x > .git/hooks/pre-commit", "echo x >.git/hooks/pre-commit",
+                  "echo x >> D:/turbobaby-bot/.git/config", "echo x | tee .git/hooks/post-merge",
+                  "cp evil.sh .git/hooks/pre-commit", "mv evil.sh .git/hooks/pre-push",
+                  "chmod +x .git/hooks/pre-commit", "sed -i 's/a/b/' .git/config",
+                  "install -m 755 evil.sh .git/hooks/pre-commit"):
+            self.assertEqual(g.decide(bash(c))[:2], ("ask", "edit_git"), c)
+        c = "Set-Content -Path .git\\hooks\\pre-commit -Value x"
+        self.assertEqual(g.decide({"tool_name": "PowerShell", "tool_input": {"command": c},
+                                   "cwd": PROJ})[:2], ("ask", "edit_git"), c)
+
+    def test_reading_git_internals_and_lookalikes_stay_silent(self):
+        for c in ("cat .git/config", "grep -n url .git/config", "ls .git/hooks",
+                  "cp .git/config " + self.SCRATCH + "/config.bak", "sed -n 1,5p .git/config",
+                  "git status > " + self.SCRATCH + "/st.txt"):
+            self.assertNotEqual(g.decide(bash(c))[1], "edit_git", c)
+        for p in (r"D:\turbobaby-bot\.gitignore", r"D:\turbobaby-bot\.github\workflows\x.yml",
+                  r"D:\turbobaby-bot\docs\about.git.md"):
             self.assertEqual(g.decide(self._w(p))[0], "defer", p)
 
     def test_redirect_target_forms_that_used_to_slip(self):

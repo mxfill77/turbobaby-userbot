@@ -345,8 +345,8 @@ FAILSAFE_SHOW = ("unknown", "unknown_tool")
 # ГАСИТСЯ ТОЛЬКО НАЗВАННОЕ: перечень, а не «всё, чего нет в списке». Новый класс гарда, опечатка,
 # пустое имя, «без-класса» — показываются: доказать «вне списка» можно только поимённо. Четыре
 # перечня вместе дают ровно `pretool_guard._KIND_VOCAB` и не пересекаются (сверяет тест).
-MUTED_KINDS = ("network", "outside", "write_outside", "edit_claude", "git_force", "sqlite",
-               "schtasks")
+MUTED_KINDS = ("network", "outside", "write_outside", "edit_claude", "edit_git", "git_force",
+               "sqlite", "schtasks")   # edit_git (23.09.2026) — рядом с edit_claude: тот же класс само-эскалации
 EV_MUTED = "погашено"
 ROD_DEMON_RESTART = "демон-авторестарт"   # ⛔ «авто-рестарт отменён» (опись; гашением не управляется)
 MUTE_REASON = "класс вне списка владельца — показ снят, решение осталось за гардом"
