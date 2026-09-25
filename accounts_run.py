@@ -337,6 +337,9 @@ def report_text(reg, pc_rows, srv, choice, rc_words, now=None):
             s_words = u"слота нет"
         out.append(u"№%d «%s» · ПК %s: %s · сервер %s"
                    % (n, row["label"], row["profile"], _code_words(pc), s_words))
+        sr = by_letter.get(row["slot"]) if (row["slot"] and not row.get("slot_error") and srv.get("ok")) else None
+        if probes_disagree(pc, sr):
+            out.append(disagree_words(n, pc, row["slot"], sr))
     if "main" in pc_rows:
         out.append(u"%s · ПК %s: %s" % (u"без реестра — строители идут так" if reg.state != accounts.ST_OK
                                           else u"откат строителей (строки в реестре нет)",
@@ -517,7 +520,25 @@ def _code(row):
     return (row or {}).get("code")
 
 
-def init_plan(slot_a, pc_main, pc3, now):
+def probes_disagree(pc_row, srv_row):
+    """Спорят ли пробы ПК и слота сервера ОДНОЙ строки реестра. Чистая функция.
+
+    Посылка та же, что у правила П2: лимит у учётки один на обе машины, значит одна учётка не бывает
+    на одной стороне живой (200), а на другой — в лимите (429). Такая пара — «похоже, РАЗНЫЕ учётки»
+    (не доказательство: модели проб у ПК и сервера разные, и лимит по модели дал бы то же). Всё прочее —
+    оба 200, оба 429, 401, 529, проб нет — спором НЕ считается: коды учётку не называют, и «не
+    спорят» ≠ «одна учётка» (находка проверки 25.09: профиль 2 и слот B сегодня могут быть разными)."""
+    a, b = _code(pc_row), _code(srv_row)
+    return a in (200, 429) and b in (200, 429) and a != b
+
+
+def disagree_words(n, pc_row, letter, srv_row):
+    return (u"⚠️ №%d: ПК %s, сервер (слот %s) %s — одна учётка не бывает живой и в лимите сразу: похоже, "
+            u"РАЗНЫЕ учётки; «учётка %d» развела бы полосы — поправь строку на ПК «accounts_run.py --set %d»"
+            % (n, _code_words(pc_row), letter, _code_words(srv_row), n, n))
+
+
+def init_plan(slot_a, pc_main, pc3, now, slot_b=None, pc2=None):
     """ЧИСТОЕ решение заведения → (строки, №строителей, слова, повторить).
 
     `повторить` = True — судить не по чему (проба дала 529, таймаут, сбой канала): реестр НЕ пишется,
@@ -546,8 +567,19 @@ def init_plan(slot_a, pc_main, pc3, now):
     else:
         words.append(u"%s — пробы не сходятся с правилом П2, чей вход в A, не доказано: слоты №1 и №3 "
                      u"НЕ назначены, назначь «accounts_run.py --set» на ПК" % probes)
+    slot2 = u"B"
+    if probes_disagree(pc2, slot_b):
+        # п.1 задания кладёт №2 = профиль 2 + слот B, но пробы спорят: профиль 2 и слот B сегодня —
+        # похоже, разные учётки, и «учётка 2» развела бы полосы. Слот не назначаем — назначит владелец.
+        slot2 = u""
+        words.append(u"№2: ПК профиль 2 — %s, слот B — %s — одна учётка не бывает живой и в лимите "
+                     u"сразу: похоже, РАЗНЫЕ учётки; слот B за №2 НЕ назначен, назначь «accounts_run.py "
+                     u"--set 2» на ПК" % (_code_words(pc2), _code_words(slot_b)))
+    elif pc2 is not None and slot_b is not None:
+        words.append(u"№2: ПК профиль 2 — %s · слот B — %s — пробы не спорят (одну учётку коды не "
+                     u"доказывают)" % (_code_words(pc2), _code_words(slot_b)))
     rows = {1: {"profile": accounts.WORD_MAIN, "slot": slot1, "label": u"основная"},
-            2: {"profile": INIT_PROFILE_2, "slot": u"B", "label": u"вторая"},
+            2: {"profile": INIT_PROFILE_2, "slot": slot2, "label": u"вторая"},
             3: {"profile": INIT_PROFILE_3, "slot": slot3, "label": u"третья"}}
     if t == 200:
         builders = 3
@@ -575,8 +607,10 @@ def init_registry(runner=None, srv_probe=None, isdir=None, repo=None, today=None
     by_letter, active_letters, active_row = srv_map(srv.get("rows"))
     pc_main = pc_probe(accounts.WORD_MAIN, runner=runner, isdir=isdir)
     pc3 = pc_probe(INIT_PROFILE_3, runner=runner, isdir=isdir)
+    pc2 = pc_probe(INIT_PROFILE_2, runner=runner, isdir=isdir)
     rows, builders, words, retry = init_plan(by_letter.get("A"), pc_main, pc3,
-                                             today or tuple(time.gmtime()[:5]))
+                                             today or tuple(time.gmtime()[:5]),
+                                             slot_b=by_letter.get("B"), pc2=pc2)
     if retry:
         return 2, (u"⛔ Реестр НЕ заведён: %s. Слот, записанный по такой пробе, остался бы чужим навсегда — "
                    u"повтори «учётки заведи» позже. Ничего не изменено." % u"; ".join(words))
@@ -585,7 +619,7 @@ def init_registry(runner=None, srv_probe=None, isdir=None, repo=None, today=None
     except (FileExistsError, ValueError) as e:
         return 2, u"⛔ Реестр НЕ заведён: %s. Ничего не изменено." % e
     if save:
-        _remember(repo, {1: pc_main, 3: pc3}, srv)
+        _remember(repo, {1: pc_main, 2: pc2, 3: pc3}, srv)
     out = [u"🆕 Реестр учёток заведён (%s, вне git):" % accounts.REGISTRY_REL]
     for n, row in sorted(rows.items()):
         out.append(u"№%d «%s» · ПК %s · сервер %s" % (n, row["label"], row["profile"],
@@ -602,6 +636,8 @@ SCREEN = u"""КАК ЗАВЕСТИ УЧЁТКУ N (руки владельца; 
 0. Первый раз и только для трёх известных учёток — одним словом с телефона: «учётки заведи».
    Реестр ляжет по п.1 задания 25.09, слоты №1/№3 — по пробам слота A, основной и №3 (правило
    П2 до 28.09 21:00 UTC; пробы не сходятся — слоты пусты, назначить --set), строители — по №3.
+   №2 ← слот B, если профиль 2 и слот B не спорят; 200 на одной стороне и 429 на другой —
+   похоже, разные учётки: слот за №2 не назначается, «учётки» говорит это строкой ⚠️.
    Проба дала 529/таймаут — реестр не пишется, слово повторить позже.
    Дальше — шаги ниже для четвёртой и следующих.
 

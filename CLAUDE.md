@@ -149,6 +149,11 @@ A/B: демон на слоте C и дальше повтора не делае
 владельца:** из захода строителей (метки демона `PRETOOL_ASK_MARKER`/`PRETOOL_MARKER_TOKEN`/
 `GIT_SERIAL_PC_OWNER` в окружении) `accounts_run.py --switch/--init/--report` и
 `vps_token_install.py --use/--slot/--probe-slots` отказывают словами (`accounts_registry.builder_child`).
+**Самоподъём агента не рвёт слово учёток (25.09, проверка перед слиянием):** пока идёт «учётка N»/«учётки»,
+агент держит отметку `tmp/accounts_door.json`; демон в `selfraise_agent` её спрашивает и подъём ОТКЛАДЫВАЕТ
+(пометка `pc_orchestrator.agent_raise_pending.json`, поднимает главный цикл — `maybe_raise_deferred_agent`),
+иначе `taskkill /T` убил бы переключение посреди хода. Любое сомнение в отметке — «свободна», то есть
+прежнее поведение.
 
 ## Ритуал журнала (ОБЯЗАТЕЛЬНО)
 

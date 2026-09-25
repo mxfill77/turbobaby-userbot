@@ -284,6 +284,25 @@ class TestBomTolerated(unittest.TestCase):
         d = self._decide_file(b"\xef\xbb\xbf" + self.TEXT.replace("\n", "\r\n").encode("utf-8"))
         self.assertEqual(d.action, pc.ACT_DROP, d.reason)
 
+    def test_bom_in_the_middle_after_a_merge_is_still_a_comment(self):
+        """Живая форма из симуляции слияния рычага 25.09 (проверка check:merge, 3 из 3 BOM-вариантов):
+        git вставил строки НАД первой, и BOM PowerShell-сохранения уехал в начало строки внутри
+        файла. `utf-8-sig` его там уже не снимает; до правки — «значимых строк 2» → ОСНОВНОЙ."""
+        import tempfile
+        pc_text = "\ufeff# строка отката\n# ещё комментарий\nD:\\claude_profile_3\n"
+        for eol in ("\n", "\r\n"):
+            data = ("# шапка сверху 1\n# шапка сверху 2\n" + pc_text).replace("\n", eol).encode("utf-8")
+            with self.subTest(eol=repr(eol)), tempfile.TemporaryDirectory() as d:
+                p = os.path.join(d, pc.CHOICE_REL)
+                with open(p, "wb") as f:
+                    f.write(data)
+                raw, err = pc.read_raw(path=p)
+                got = pc.decide(raw, err, isdir=lambda _p: True)
+                self.assertEqual((got.action, got.value), (pc.ACT_SET, "D:\\claude_profile_3"), got.reason)
+
+    def test_value_line_with_a_stray_bom_is_the_value(self):
+        self.assertEqual(pc.payload("# шапка\n\ufeffОСНОВНОЙ\n"), ("ОСНОВНОЙ", ""))
+
 
 class TestLiveChoiceFile(unittest.TestCase):
     """Живой файл полосы читается ТЕМ ЖЕ кодом (правило «мок обязан копировать живой формат»).
