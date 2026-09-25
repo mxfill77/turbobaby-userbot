@@ -863,6 +863,22 @@ class TestAccountsWord(unittest.TestCase):
                 self.assertEqual(self.sent, [a.ACCOUNTS_UNPARSED])
         self.assertEqual(self.door, [])
 
+    def test_quotes_and_edge_marks_are_not_part_of_the_word(self):
+        """Живой случай 25.09 15:32: владелец скопировал подсказку с закрывающей «»», и строгая форма
+        ответила «не знаю». Кавычки и знаки по краям снимаются, сама форма строга как была."""
+        for raw, want in (("учётки заведи»", ("init", None)), ("«учётки заведи»", ("init", None)),
+                          ("«учётки»", ("list", None)), ("учётки.", ("list", None)),
+                          ("учётка «3»", ("switch", "3")), ('"учётка 3"!', ("switch", "3"))):
+            with self.subTest(raw):
+                self.assertEqual(a.accounts_word(raw), want)
+        for raw in ("учётка 3 и ещё", "учётки заведи сервер", "учётка «три»"):
+            with self.subTest(raw):
+                self.assertIsNone(a.accounts_word(raw))
+                self.assertTrue(a.accounts_head(raw))          # похоже на слово учёток → «не разобрал»
+        self.sent.clear()
+        self.say("учётки заведи»")                               # дословно, как в теме 205
+        self.assertEqual(self.door, [("init", None)])
+
     def test_cli_argv_carries_only_digits(self):
         seen = {}
 

@@ -237,20 +237,25 @@ class TestRcUntouchedByBuilders(_Tree):
         return (env if env is not None else dict(self.PARENT)), why
 
     def test_builders_switch_leaves_rc_alone(self):
-        seen = []
-        for b in (1, 2, 3):
-            _registry(self.repo, b, self.acc)
-            _write(os.path.join(self.repo, profile_choice.CHOICE_REL), self.p3 + u"\n")
-            env_b = {"PATH": "x"}
-            accounts.apply_builders(env_b, self.repo)
-            env, _why = self._rc_env()
-            self.assertNotIn(KEY, env, u"RC ушёл с ОСНОВНОГО при строителях №%d" % b)
-            seen.append(sorted(env.items()))
-        self.assertEqual(seen[0], seen[1])
-        self.assertEqual(seen[1], seen[2])
+        u"""Строителей гоняем по №1…3 реестром (так их двигает слово «учётка N»). Прежний файл дерева
+        держит то, что держит (мост RC до своего файла), — окружение RC ОДНО И ТО ЖЕ при любом
+        номере строителей, в обоих состояниях прежнего файла."""
+        for legacy, want in ((self.p3, self.p3), (u"ОСНОВНОЙ", None)):
+            _write(os.path.join(self.repo, profile_choice.CHOICE_REL), legacy + u"\n")
+            seen = []
+            for b in (1, 2, 3):
+                _registry(self.repo, b, self.acc)
+                env_b = {"PATH": "x"}
+                accounts.apply_builders(env_b, self.repo)
+                env, _why = self._rc_env()
+                self.assertEqual(env.get(KEY), want, u"RC сдвинулся при строителях №%d" % b)
+                seen.append(sorted(env.items()))
+            self.assertEqual(seen[0], seen[1])
+            self.assertEqual(seen[1], seen[2])
 
     def test_rc_reads_only_its_own_file(self):
         _registry(self.repo, 3, self.acc)
+        _write(os.path.join(self.repo, profile_choice.CHOICE_REL), self.p3 + u"\n")   # свой бьёт прежний
         _write(os.path.join(self.repo, rc.RC_CHOICE_REL), self.p2 + u"\n")
         env, why = self._rc_env()
         self.assertEqual(env[KEY], self.p2)                      # явный путь RC работает
@@ -273,6 +278,73 @@ class TestRcUntouchedByBuilders(_Tree):
                   and isinstance(n.value, str)}
         self.assertNotIn(accounts.REGISTRY_REL, consts)
         self.assertNotIn(profile_choice.CHOICE_REL, consts)
+
+
+class TestBridgeDeliveryKeepsTheAccount(_Tree):
+    u"""МОСТ 25.09: доставка кода не переводит учётку сама. Живое состояние ПК на 25.09 15:16 (коммит
+    0d34f16 на ПК): реестра нет, своего файла RC нет, прежний файл дерева = профиль 3. До доставки
+    строители и RC шли профилем 3 — после неё обязаны идти им же, с WARNING «заведи реестр»."""
+
+    def _legacy(self, text):
+        _write(os.path.join(self.repo, profile_choice.CHOICE_REL), text)
+
+    def _builders(self, parent=u"/родитель"):
+        env = {"PATH": "x", KEY: parent}
+        return env, accounts.apply_builders(env, self.repo)
+
+    def test_live_state_of_25_09_is_kept_for_builders_and_rc(self):
+        self._legacy(u"# шапка\n" + self.p3 + u"\n")
+        env, c = self._builders()
+        self.assertEqual((env.get(KEY), c.action, c.warn), (self.p3, accounts.ACT_SET, True))
+        self.assertIn(u"прежний файл", c.reason)
+        self.assertIn(u"учётки заведи", c.reason)
+        rc_env, why = rc.child_env(base={KEY: r"D:\claude_profile_2", "PATH": "x"}, repo=self.repo)
+        self.assertEqual(rc_env.get(KEY), self.p3)
+        self.assertIn(rc.RC_CHOICE_REL, why)
+        self.assertIn(u"прежний файл", why)
+
+    def test_legacy_main_word_drops_the_key(self):
+        self._legacy(u"ОСНОВНОЙ\n")
+        env, c = self._builders()
+        self.assertEqual((KEY in env, c.warn), (False, True))
+
+    def test_legacy_that_decides_nothing_is_main_plus_warning(self):
+        for text in (u"две\nстроки\n", u"/нет/такого/каталога\n", None):
+            with self.subTest(text=text):
+                p = os.path.join(self.repo, profile_choice.CHOICE_REL)
+                if text is not None:
+                    self._legacy(text)
+                elif os.path.exists(p):
+                    continue                                        # без удалений: случай «нет файла» — в свежем REPO
+                env, c = self._builders()
+                self.assertEqual((KEY in env, c.warn), (False, True))
+                self.assertIn(u"не решает", c.reason)
+        env = {"PATH": "x", KEY: u"/родитель"}
+        c = accounts.apply_builders(env, _tmp())                     # свежий REPO: ни реестра, ни прежнего файла
+        self.assertEqual((KEY in env, c.warn), (False, True))
+
+    def test_registry_wins_over_legacy(self):
+        self._legacy(self.p3 + u"\n")
+        _registry(self.repo, 1, self.acc)
+        env, c = self._builders()
+        self.assertEqual((KEY in env, c.warn, c.number), (False, False, 1))
+
+    def test_broken_registry_ignores_legacy(self):
+        self._legacy(self.p3 + u"\n")
+        _write(os.path.join(self.repo, accounts.REGISTRY_REL), u"{битый")
+        env, c = self._builders()
+        self.assertEqual((KEY in env, c.warn), (False, True))
+
+    def test_bridge_writes_nothing(self):
+        self._legacy(self.p3 + u"\n")
+        p = os.path.join(self.repo, profile_choice.CHOICE_REL)
+        before = _sha(p)
+        for _ in range(3):
+            self._builders()
+            rc.child_env(base={"PATH": "x"}, repo=self.repo)
+        self.assertEqual(_sha(p), before)
+        self.assertFalse(os.path.exists(os.path.join(self.repo, accounts.REGISTRY_REL)))
+        self.assertFalse(os.path.exists(os.path.join(self.repo, rc.RC_CHOICE_REL)))
 
 
 class TestBuilderChild(unittest.TestCase):
@@ -317,7 +389,7 @@ class TestReviewFixes(_Tree):
     def test_apply_builders_never_throws(self):
         u"""Любое исключение разбора → ОСНОВНОЙ плюс WARNING с причиной, а не трасса в спавне."""
         env = {"PATH": "x", KEY: "/родитель"}
-        with mock.patch.object(accounts, "builders_choice", side_effect=RuntimeError("сломано")):
+        with mock.patch.object(accounts, "builders_effective", side_effect=RuntimeError("сломано")):
             c = accounts.apply_builders(env, self.repo)
         self.assertEqual((c.action, c.warn), (accounts.ACT_DROP, True))
         self.assertIn(u"RuntimeError", c.reason)

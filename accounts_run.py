@@ -212,17 +212,21 @@ def pc_probe(profile, runner=None, claude=None, isdir=None, base_env=None):
 # ═══════════════════ чистые сборщики слов ═══════════════════
 
 def rc_choice_words(repo=None, isdir=None):
-    """Что действует у RC: его СОБСТВЕННЫЙ файл. Нет файла → ОСНОВНОЙ (умолчание RC)."""
-    path = os.path.join(repo or REPO, RC_CHOICE_REL)
-    raw, err = profile_choice.read_raw(path=path)
+    """Что действует у RC — тем же порядком, что `rc_supervisor.child_env`: свой файл; его нет — МОСТ
+    на прежний файл дерева (как до 25.09); не решает ни один → ОСНОВНОЙ (RC-страховка)."""
+    raw, err = profile_choice.read_raw(path=os.path.join(repo or REPO, RC_CHOICE_REL))
+    src = u"свой файл %s" % RC_CHOICE_REL
     if raw is None and not err:
-        return u"%s (свой выбор не задан — умолчание RC)" % accounts.WORD_MAIN
+        raw, err = profile_choice.read_raw(repo=repo or REPO)
+        src = u"своего файла нет — прежний файл %s" % profile_choice.CHOICE_REL
+        if raw is None and not err:
+            return u"%s (ни своего файла, ни прежнего — RC-страховка)" % accounts.WORD_MAIN
     d = profile_choice.decide(raw, err, isdir)
     if d.action == profile_choice.ACT_DROP:
-        return u"%s (свой файл %s)" % (accounts.WORD_MAIN, RC_CHOICE_REL)
+        return u"%s (%s)" % (accounts.WORD_MAIN, src)
     if d.action == profile_choice.ACT_SET:
-        return u"%s (свой файл %s)" % (d.value, RC_CHOICE_REL)
-    return u"%s (свой файл не разобран: %s — RC-страховка)" % (accounts.WORD_MAIN, d.reason)
+        return u"%s (%s)" % (d.value, src)
+    return u"%s (%s не разобран: %s — RC-страховка)" % (accounts.WORD_MAIN, src, d.reason)
 
 
 def _code_words(row):
@@ -277,13 +281,38 @@ def retry_words(srv, owner_of):
             u"учётку он НЕ переключает" % (other, who)]
 
 
+def builders_words(choice):
+    """Choice строителей → слова: «№N», путь (мост на прежний файл) или ОСНОВНОЙ, плюс WARNING."""
+    if choice.number is not None and not choice.warn:
+        b = u"№%d" % choice.number
+    elif choice.action == accounts.ACT_SET and choice.value:
+        b = choice.value
+    else:
+        b = accounts.WORD_MAIN
+    if choice.warn:
+        why = choice.reason
+        tail = u" — строители на %s (WARNING)" % accounts.WORD_MAIN
+        if why.endswith(tail):                     # то же слово дважды в одной строке не повторяем
+            why = why[:-len(tail)]
+        b += u" (WARNING: %s)" % why
+    return b
+
+
+def registry_fix_words(reg):
+    """Что делать, если реестр не прочитан: нет — завести словом; битый — «заведи» откажет, правка на ПК."""
+    if reg.state == accounts.ST_ABSENT:
+        return u"завести реестр одним словом — «учётки заведи»"
+    return u"реестр есть, но не разобран — «учётки заведи» его не перезапишет; поправить на ПК: " \
+           u"«accounts_run.py --show», затем «--set»"
+
+
 def report_text(reg, pc_rows, srv, choice, rc_words, now=None):
     """Реестр + пробы → ответ «учётки». Чистая функция (всё, что нужно, приходит параметрами)."""
     now = now or time.strftime("%H:%M UTC", time.gmtime())
     out = [u"👥 Учётки — живые пробы, %s" % now]
+    b = builders_words(choice)
     if reg.state != accounts.ST_OK:
-        out.append(u"⚠️ %s — строители на %s (WARNING). Как завести: «accounts_run.py --screen» на ПК."
-                   % (reg.reason, accounts.WORD_MAIN))
+        out.append(u"⚠️ %s — %s." % (reg.reason, registry_fix_words(reg)))
     for err in reg.errors:
         out.append(u"⚠️ реестр: %s" % err)
     by_letter, active_letters, active_row = srv_map(srv.get("rows"))
@@ -309,16 +338,14 @@ def report_text(reg, pc_rows, srv, choice, rc_words, now=None):
         out.append(u"№%d «%s» · ПК %s: %s · сервер %s"
                    % (n, row["label"], row["profile"], _code_words(pc), s_words))
     if "main" in pc_rows:
-        out.append(u"%s · ПК %s: %s" % (u"без реестра" if reg.state != accounts.ST_OK else
-                                          u"откат строителей (строки в реестре нет)",
-                                          accounts.WORD_MAIN, _code_words(pc_rows["main"])))
+        out.append(u"%s · ПК %s: %s" % (u"без реестра — строители идут так" if reg.state != accounts.ST_OK
+                                          else u"откат строителей (строки в реестре нет)",
+                                          pc_rows["main"].get("profile") or accounts.WORD_MAIN,
+                                          _code_words(pc_rows["main"])))
     stray = sorted(set(by_letter) - set(owner_of))
     for letter in stray:
         out.append(u"слот %s вне реестра: %s%s" % (letter, _code_words(by_letter[letter]),
                                                    u" ✓действует" if letter in active_letters else u""))
-    b = (u"№%d" % choice.number) if (choice.number is not None and not choice.warn) else accounts.WORD_MAIN
-    if choice.warn:
-        b += u" (WARNING: %s)" % choice.reason
     if not srv.get("ok"):
         s_act = u"не проверено — %s" % (srv.get("words") or u"сервер не ответил")
     elif active_letters:
@@ -343,17 +370,18 @@ def report(runner=None, srv_probe=None, isdir=None, repo=None, save=True):
     pc_rows = {}
     for n, row in sorted(reg.data["accounts"].items()):
         pc_rows[n] = pc_probe(row["profile"], runner=runner, isdir=isdir)
-    choice0 = accounts.builders_choice(reg, isdir)
-    has_main = any(row["profile"] == accounts.WORD_MAIN for row in reg.data["accounts"].values())
-    if reg.state != accounts.ST_OK or (choice0.warn and not has_main):
-        # строители откатились на ОСНОВНОЙ, а строки с ним в реестре нет — меряем ТО, чем они идут
-        pc_rows["main"] = pc_probe(accounts.WORD_MAIN, runner=runner, isdir=isdir)
+    choice0 = accounts.builders_effective(repo, isdir=isdir)
+    eff = choice0.value if (choice0.action == accounts.ACT_SET and choice0.value) else accounts.WORD_MAIN
+    known = set(os.path.normcase(row["profile"]) for row in reg.data["accounts"].values())
+    if (choice0.number is None or choice0.warn) and os.path.normcase(eff) not in known:
+        # строители идут профилем, которого нет среди строк реестра (реестра нет — мост на прежний
+        # файл; откат на ОСНОВНОЙ без его строки) — меряем ТО, чем они идут на самом деле
+        pc_rows["main"] = dict(pc_probe(eff, runner=runner, isdir=isdir), profile=eff)
     try:
         srv = (srv_probe or vti.probe_all_slots)(work=WORK)
     except Exception as e:                            # noqa: BLE001 — сервер не смеет уронить отчёт ПК
         srv = {"ok": False, "words": u"проба сервера упала (%s)" % type(e).__name__, "rows": []}
-    choice = accounts.builders_choice(reg, isdir)
-    text = report_text(reg, pc_rows, srv, choice, rc_choice_words(repo, isdir))
+    text = report_text(reg, pc_rows, srv, choice0, rc_choice_words(repo, isdir))
     if save:
         _remember(repo, pc_rows, srv)
     return text
@@ -381,8 +409,9 @@ def switch(n, runner=None, use=None, isdir=None, repo=None, save=True):
     reg = accounts.load(repo)
     num = accounts.parse_number(n)
     if reg.state != accounts.ST_OK:
-        return 2, (u"⛔ Учётку не переключаю: %s. Строители на %s (WARNING). Как завести реестр — "
-                   u"«accounts_run.py --screen» на ПК. Ничего не изменено." % (reg.reason, accounts.WORD_MAIN))
+        return 2, (u"⛔ Учётку не переключаю: %s. Строители сейчас: %s. Дальше: %s. Ничего не изменено."
+                   % (reg.reason, builders_words(accounts.builders_effective(repo, isdir=isdir)),
+                      registry_fix_words(reg)))
     have = u", ".join(u"№%d" % x for x in sorted(reg.data["accounts"])) or u"ни одной"
     if num is None or num not in reg.data["accounts"]:
         return 2, (u"⛔ Учётки «%s» в реестре нет. Есть: %s. Ничего не изменено." % (n, have))
@@ -458,7 +487,7 @@ def show(repo=None, isdir=None):
                       (u"слот %s" % row["slot"]) if row["slot"] else
                       (u"слот спорный — %s" % row["slot_error"]) if row.get("slot_error") else u"слота нет",
                       (u" (последний ответ: %s, %s)" % (_code_words(sr), sr.get("at"))) if sr else u""))
-    c = accounts.builders_choice(reg, isdir)
+    c = accounts.builders_effective(repo, isdir=isdir)
     out.append(u"Строители: %s" % accounts.line(c))
     out.append(u"RC: %s" % rc_choice_words(repo, isdir))
     return u"\n".join(out)
@@ -587,12 +616,14 @@ SCREEN = u"""КАК ЗАВЕСТИ УЧЁТКУ N (руки владельца; 
 3. Строка в реестр (файл accounts_registry.json вне git, метка — без почты):
      venv\\Scripts\\python.exe accounts_run.py --set N --profile D:\\claude_profile_N --slot C --label "N-я"
    Основной профиль: --profile ОСНОВНОЙ. Слота нет: --slot -.
-   Номер строителей в новом реестре пуст (строители на ОСНОВНОЙ с WARNING) — назначить без
+   Номер строителей в новом реестре пуст (строители на ОСНОВНОЙ с WARNING; пока реестра нет
+   вовсе — по прежнему claude_profile_choice.txt) — назначить без
    сервера: accounts_run.py --builders N, либо словом «учётка N» (тогда и сервер).
 4. Проверить: «учётки» в теме 205 — у №N должен стоять ответ 200 (или 429 со временем сброса).
 5. Перевести обе полосы: «учётка N». Слово = разрешение на ОДИН рестарт демона сервера; если на
    сервере идёт заход — ответ скажет «стоп», повторить позже. RC остаётся на своём выборе
-   (файл rc_profile_choice.txt, по умолчанию ОСНОВНОЙ) — телефонный канал не переезжает.
+   (файл rc_profile_choice.txt; нет его — прежний claude_profile_choice.txt) — телефонный канал
+   не переезжает.
 
 Автопереключения учётки по лимиту НЕТ: полосы переходят на другую учётку только словом владельца.
 Сервер при 429 на слоте A/B повторяет ОДНУ задачу под вторым слотом (старый повтор 20.09);

@@ -1010,7 +1010,9 @@ class BuilderGate(unittest.TestCase):
         from unittest import mock
         boom = mock.Mock(side_effect=AssertionError("ssh из захода строителей"))
         with mock.patch.dict(os.environ, {"PRETOOL_ASK_MARKER": "/tmp/m"}), \
-                mock.patch.object(vti, "ssh_run", boom):
+                mock.patch.object(vti, "ssh_run", boom), mock.patch.object(vti, "_ask_value", boom):
+            # запрос значения — тоже ловушка: без неё снятый гейт вёл `--slot` в input() и тест ВИСЕЛ
+            # (мутант M6b в фоне: 900 с без вердикта), вместо того чтобы покраснеть
             for argv in (["--use", "A"], ["--slot", "C"], ["--probe-slots"], []):
                 with self.subTest(argv=argv):
                     self.assertEqual(vti.main(argv), 3)

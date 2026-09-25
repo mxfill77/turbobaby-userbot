@@ -699,9 +699,28 @@ ACCOUNTS_ANSWER_AT = ("консоль ПК: «venv\\Scripts\\python.exe accounts
                       "«--switch N»")
 
 
+# Кавычки и знаки по краям слова НЕ часть команды (25.09.2026, живой случай): владелец скопировал
+# подсказку «учётки заведи» вместе с закрывающей «»», и строгая форма ответила «не знаю». Кавычки
+# снимаются в ЛЮБОМ месте (их нет ни в одной форме), знаки препинания — только по краям; сама форма
+# после этого сверяется так же строго, как была: «учётка 3 и ещё» по-прежнему не разобрана.
+_ACCOUNTS_QUOTES = re.compile(u"[«»\"'“”„‘’`]")
+_ACCOUNTS_EDGE = u" .,!?;:()[]"
+
+
+def accounts_norm(text):
+    """Текст → форма для сверки слов учёток: пробелы схлопнуты, кавычки сняты, края очищены."""
+    s = _ACCOUNTS_QUOTES.sub(u"", u" ".join((text or u"").split()))
+    return u" ".join(s.strip(_ACCOUNTS_EDGE).split())
+
+
+def accounts_head(text):
+    """Похоже на слово учёток (для ответа «не разобрал» / отказа чужому)? Кавычки — как у формы."""
+    return bool(ACCOUNT_HEAD_RE.match(accounts_norm(text)))
+
+
 def accounts_word(text):
     """Текст (уже нижний регистр) → ("list", None) | ("init", None) | ("switch", "N") | None."""
-    s = " ".join((text or "").split())
+    s = accounts_norm(text)
     if ACCOUNTS_LIST_RE.match(s):
         return ("list", None)
     if ACCOUNTS_INIT_RE.match(s):
@@ -1690,7 +1709,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             alog.warning("перенос урока: отказ чужому отправителю id %s", uid)
             await _send(context, chat_id, TRANSFER_DENIED)
         # ТРЕТЬЕ ИСКЛЮЧЕНИЕ (25.09.2026): слова учёток. Отказ словами, дверь не поднимается вовсе.
-        elif accounts_word(text) or ACCOUNT_HEAD_RE.match(text):
+        elif accounts_word(text) or accounts_head(text):
             alog.warning("учётки: отказ чужому отправителю id %s", uid)
             await _send(context, chat_id, ACCOUNTS_DENIED)
         return
@@ -1759,7 +1778,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                "проба, один рестарт демона). До нескольких минут." % num))
                 _background(context, _accounts_door(context, chat_id, act, num))
 
-        elif ACCOUNT_HEAD_RE.match(text):
+        elif accounts_head(text):
             alog.info("учётки: слово не разобрано в %r", (msg.text or "")[:120])
             await _send(context, chat_id, ACCOUNTS_UNPARSED)
 

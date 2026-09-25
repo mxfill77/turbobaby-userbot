@@ -181,10 +181,12 @@ PROFILE_KEY = "CLAUDE_CONFIG_DIR"
 # СВОЙ ВЫБОР RC (25.09.2026, задание «учётки одним словом»). До 25.09 RC читал ТОТ ЖЕ файл, что
 # строители (`claude_profile_choice.txt`), и слово владельца «учётка N» увело бы телефонный канал
 # вместе с ними — а профиль другой учётки у `claude rc` не регистрируется (18–22.09: 91 старт,
-# 0 регистраций). Теперь у RC свой файл рядом, вне git (строка в .gitignore). Файла нет — это
-# штатно и значит ОСНОВНОЙ: третий исход уходит в RC-страховку `_rc_fallback`, которая снимает
-# унаследованный ключ. Выбор строителей (реестр `accounts_registry.json`) RC не читает НИ ОДНОЙ
-# веткой — замок `test_accounts.TestRcUntouchedByBuilders`.
+# 0 регистраций). Теперь у RC свой файл рядом, вне git (строка в .gitignore). СВОЕГО ФАЙЛА НЕТ —
+# МОСТ: решает прежний файл дерева, ровно как RC читал до 25.09 (25.09 в 15:16 владелец перевёл RC
+# на профиль 3 именно им, и доставка кода не смеет увести телефонный канал обратно). Прежний файл
+# не решает — RC-страховка `_rc_fallback` (ключ снят → ОСНОВНОЙ). Слово «учётка N» прежний файл НЕ
+# правит (строители живут в реестре `accounts_registry.json`, который RC не читает НИ ОДНОЙ веткой),
+# поэтому смена строителей RC не двигает — замок `test_accounts.TestRcUntouchedByBuilders`.
 RC_CHOICE_REL = "rc_profile_choice.txt"
 try:
     import profile_choice
@@ -341,12 +343,18 @@ def child_env(chooser=None, base=None, repo=None):
         return _rc_fallback(src, "модуль profile_choice не импортирован")
     env = dict(src)
     try:
-        d = _pc.apply_to(env, repo=repo or REPO, path=os.path.join(repo or REPO, RC_CHOICE_REL))
-        why = _pc.line(d, subject="RC")
+        own = os.path.join(repo or REPO, RC_CHOICE_REL)
+        bridge = u""
+        if os.path.exists(own):
+            d = _pc.apply_to(env, repo=repo or REPO, path=own)
+        else:                       # мост 25.09: своего файла нет — прежний файл дерева, как до 25.09
+            d = _pc.apply_to(env, repo=repo or REPO)
+            bridge = u" (своего %s нет — решает прежний файл дерева)" % RC_CHOICE_REL
+        why = _pc.line(d, subject="RC") + bridge
     except Exception as e:          # рычаг не смеет уронить канал
         return _rc_fallback(src, "рычаг сорвался (%s)" % type(e).__name__)
     if d.action == _pc.ACT_KEEP:
-        return _rc_fallback(src, d.reason)
+        return _rc_fallback(src, d.reason + bridge)
     return env, why
 
 
