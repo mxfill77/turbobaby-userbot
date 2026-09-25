@@ -253,7 +253,7 @@ class TestBothSpawnBranchesAsk(unittest.TestCase):
 
     def test_daemon_imports_module_on_top(self):
         tops = {a.name for n in self.tree.body if isinstance(n, ast.Import) for a in n.names}
-        self.assertIn("accounts", tops)
+        self.assertIn("accounts_registry", tops)
 
 
 class TestBomTolerated(unittest.TestCase):

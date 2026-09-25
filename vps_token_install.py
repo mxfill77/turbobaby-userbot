@@ -81,7 +81,7 @@ u"""vps_token_install.py — ОДНА КОМАНДА ВЛАДЕЛЬЦА: нов�
     рестарта сознательно: она меряет то же, с чем поднимется демон (файл), а отказ тогда не стоит
     второго рестарта «обратно». Пустой слот действующим не становится НИ ОДНОЙ веткой — проверка
     дважды: по разведке ПК и в самой серверной программе, ДО копии и записи;
-  • `X` — буква A–Z либо номер учётки из реестра ПК (`accounts.py`): номер переводится в букву.
+  • `X` — буква A–Z либо номер учётки из реестра ПК (`accounts_registry.py`): номер переводится в букву.
 Ключ `--force` пропускает вопрос при идущей на сервере задаче; `--keep-nongreen` оставляет новый
 токен, когда проба ответила `429` (лимит — не порча токена), вместо отката по умолчанию.
 
@@ -573,7 +573,9 @@ def summarize_slots(rows):
 # сторонах), ни на диск, ни в лог оболочки. Удалённая команда при этом состоит из двух слов без
 # единой кавычки — ей нечего поломать ни в разборе Windows, ни в разборе sh.
 
-_REMOTE_BOOT = "base64 -d | python3"
+# `-u`: вывод программы НЕ буферизуется. Иначе строка `backup=…` уходила бы только на выходе, и
+# оборванный после записи канал выглядел бы «копии нет — файл не менялся» (находка ревью 25.09).
+_REMOTE_BOOT = "base64 -d | python3 -u"
 
 _RS_PREFLIGHT = r'''
 import os, sys, time
@@ -603,13 +605,17 @@ try:
 except Exception as e:
     out("read_err", type(e).__name__)
 out("names", ",".join(seen) if seen else "-")
-# идёт ли прямо сейчас заход исполнителя: рестарт убил бы его вместе с cgroup демона
-busy = 0
-for pid in os.listdir("/proc"):
+# идёт ли прямо сейчас заход исполнителя: рестарт убил бы его вместе с cgroup демона.
+# Считаем ТОЛЬКО процессы claude ВНУТРИ cgroup юнита (25.09.2026): живая сессия владельца в tmux
+# `cc` и прочие claude на машине заходом демона не являются и рестарту не мешают — прежний счёт
+# «любой claude на хосте» отказывал бы слову «учётка N» всегда, пока владелец сидит в сессии.
+# Общий счёт остаётся в выводе для сведения (`busy_claude_all`).
+busy = busy_all = cg_seen = 0
+for pid in os.listdir(PROC):
     if not pid.isdigit():
         continue
     try:
-        fh = open("/proc/%s/cmdline" % pid, "rb")
+        fh = open(os.path.join(PROC, pid, "cmdline"), "rb")
         try:
             cmd = fh.read()
         finally:
@@ -617,8 +623,21 @@ for pid in os.listdir("/proc"):
     except Exception:
         continue
     if b"claude" in cmd and b"base64" not in cmd:
-        busy += 1
+        busy_all += 1
+        try:
+            fh = open(os.path.join(PROC, pid, "cgroup"), "r")
+            try:
+                cg = fh.read()
+            finally:
+                fh.close()
+            cg_seen += 1
+        except Exception:
+            cg = ""
+        if ("/" + UNIT_CG) in cg:
+            busy += 1
 out("busy_claude", busy)
+out("busy_claude_all", busy_all)
+out("busy_cgroup_read", cg_seen)
 '''
 
 _RS_APPLY = r'''
@@ -667,7 +686,9 @@ for r in report:
 # ── запись: временный файл с правами 600 и атомарная подмена. Мусора не остаётся, а оборванная
 # запись не может оставить полуфайл на месте боевого.
 tmp = TARGET + ".new"
-fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+# O_BINARY: без него Windows пишет os.write в ТЕКСТОВОМ режиме (\n -> \r\n), и обратное чтение
+# расходится с записанным. На сервере (Linux) флага нет — getattr даёт 0, поведение прежнее.
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
 try:
     os.write(fd, after.encode("utf-8"))
 finally:
@@ -786,7 +807,9 @@ after, report = env_rewrite(before, src, (ACTIVE_NAME,))
 for r in report:
     out("line", "%s:%s:%s:%s->%s" % (r["line"], r["name"], r["action"], r["old_len"], r["new_len"]))
 tmp = TARGET + ".new"
-fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+# O_BINARY: без него Windows пишет os.write в ТЕКСТОВОМ режиме (\n -> \r\n), и обратное чтение
+# расходится с записанным. На сервере (Linux) флага нет — getattr даёт 0, поведение прежнее.
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
 try:
     os.write(fd, after.encode("utf-8"))
 finally:
@@ -900,7 +923,8 @@ def find_env_path():
 
 def preflight(target):
     u"""Разведка БЕЗ значения: есть ли файл, какие в нём имена, идёт ли заход. → (ok, факты, словами)."""
-    rc, fields, raw = run_remote_py(_remote_program(_RS_PREFLIGHT, TARGET=target))
+    rc, fields, raw = run_remote_py(_remote_program(_RS_PREFLIGHT, TARGET=target, PROC="/proc",
+                                                    UNIT_CG=UNIT + ".service"))
     if rc == 255 or not fields.get("host_ok"):
         return False, fields, u"ssh до сервера не поднялся: %s" % _squeeze(raw, 300)
     if fields.get("file_exists") != "1":
@@ -940,11 +964,20 @@ def probe(target):
 
     Окружение берётся тем же файлом, который читает systemd (`set -a; . файл`), а не из
     `/proc/<pid>/environ`: так проба меряет ровно то, с чем поднимется демон. Значение при этом
-    не печатается ни здесь, ни на сервере — наружу идёт только конверт CLI."""
-    cmd = ("set -a; . %s; set +a; %s -p 'Reply with exactly: OK' --model %s --output-format json"
-           % (target, CLAUDE_BIN, PROBE_MODEL))
-    rc, out = ssh_run(cmd, timeout=SSH_PROBE_TIMEOUT)
-    word, why = verdict_of_probe(rc, out)
+    не печатается ни здесь, ни на сервере — наружу идёт только конверт CLI.
+
+    ★ 25.09.2026: идёт ТОЙ ЖЕ программой, что перемер (`probe_slot_script`): `exec 2>/dev/null`
+    ДО чтения файла (обломок токена не напечатается ошибкой оболочки), `cd /` +
+    `--setting-sources project` (хуки сервера не зовутся), `env -u ANTHROPIC_API_KEY` (как у демона).
+    Прежняя форма грузила файл без глушения stderr — находка ревью 25.09."""
+    rc, out = ssh_run("bash -s", stdin_text=probe_slot_script(target, NAME_ACTIVE),
+                      timeout=SSH_PROBE_TIMEOUT)
+    row = slot_row(NAME_ACTIVE, out, channel_rc=rc)
+    if not row["called"]:
+        return OTHER, row["text"] or u"вызова не было", out
+    kv = parse_kv(out)
+    prc = kv.get("probe_rc", "")
+    word, why = verdict_of_probe(int(prc) if prc.isdigit() else 255, out)
     return word, why, out
 
 
@@ -1043,13 +1076,47 @@ def _row_words(row):
     return u"%s (%s)%s" % (code if code is not None else u"без статуса", row.get("word"), tail)
 
 
+def busy_of(facts):
+    u"""Факты разведки → (число заходов демона | None, словами). ЧИСТАЯ функция.
+
+    «Не проверено» — отдельный исход, а не ноль: поля нет (разведка оборвалась до счёта) или
+    у процесса claude не прочиталась cgroup — тогда про ЭТОТ процесс неизвестно, демона он или
+    чужой, и рестарт вслепую запрещён (задание: идёт заход — не рестартовать)."""
+    raw = (facts or {}).get("busy_claude")
+    if raw is None or not str(raw).strip().isdigit():
+        return None, u"разведка не дошла до счёта заходов"
+    n = int(raw)
+    all_raw = str((facts or {}).get("busy_claude_all") or "")
+    seen_raw = str((facts or {}).get("busy_cgroup_read") or "")
+    if all_raw.isdigit() and seen_raw.isdigit() and int(seen_raw) < int(all_raw):
+        return None, (u"у %d из %d процессов claude cgroup не прочиталась — чей это заход, неизвестно"
+                      % (int(all_raw) - int(seen_raw), int(all_raw)))
+    return n, u"заходов демона: %d" % n
+
+
+def daemon_mark():
+    u"""Отметка ЖИЗНИ демона: MainPID + момент старта. → строка | None (не спросить).
+    Нужна, чтобы узнать, не перезапустился ли демон САМ, пока шла проба (Restart=always, свой
+    отложенный рестарт задачи): тогда он поднялся с НОВЫМ файлом, и возврат файла из копии
+    демона уже не возвращает — нужен рестарт на прежнем значении."""
+    rc, out = ssh_run("systemctl show %s -p MainPID -p ExecMainStartTimestampMonotonic" % UNIT)
+    kv = parse_kv(out)
+    if rc != 0 or not kv.get("MainPID") or "ExecMainStartTimestampMonotonic" not in kv:
+        return None
+    return u"%s@%s" % (kv.get("MainPID"), kv.get("ExecMainStartTimestampMonotonic"))
+
+
 def use_slot(slot, force=False, work=None, stamp=None):
     u"""`--use X`: значение слота X → действующее, ОДНА проба, при зелёном ОДИН рестарт демона.
 
     → {"ok", "stage", "slot", "name", "lines", "row", "backup", "restarted", "rolled_back"}.
     `stage` называет, где ход остановился: slot_name · address · preflight · slot_empty · busy ·
     write · already · probe · busy_late · restart · done. Любой отказ после записи — возврат файла
-    из копии; копия не удаляется НИКОГДА."""
+    из копии; копия не удаляется НИКОГДА.
+
+    Рестарт демона — не больше ОДНОГО по слову владельца, кроме двух названных случаев возврата:
+    сам рестарт не поднял демона (поднимаем обратно) и демон САМ перезапустился во время пробы,
+    схватив новый файл (поднимаем на прежнем значении — иначе он держал бы отвергнутый вход)."""
     res = {"ok": False, "stage": u"", "slot": u"%s" % slot, "name": u"", "lines": [], "row": None,
            "backup": u"", "restarted": False, "rolled_back": False}
     say = res["lines"].append
@@ -1077,13 +1144,19 @@ def use_slot(slot, force=False, work=None, stamp=None):
         say(u"ОТКАЗ: слот %s (%s) %s — пустой слот действующим НЕ становится. Файл и демон не "
             u"тронуты." % (letter, name, u"пуст" if name in names else u"в файле не назван"))
         return res
-    busy = int(facts.get("busy_claude") or 0)
+    busy, bwords = busy_of(facts)
+    if busy is None and not force:
+        res["stage"] = "busy"
+        say(u"СТОП: не проверено, идёт ли заход демона (%s) — рестарт вслепую НЕ делаю. Файл и "
+            u"демон не тронуты; повтори слово." % bwords)
+        return res
     if busy and not force:
         res["stage"] = "busy"
-        say(u"СТОП: на сервере идёт заход (процессов claude: %d). Рестарт убил бы его вместе с "
-            u"cgroup демона — НЕ перезапускаю. Файл и демон не тронуты; повтори слово, когда заход "
+        say(u"СТОП: на сервере идёт заход демона (процессов claude в cgroup юнита: %d). Рестарт убил "
+            u"бы его — НЕ перезапускаю. Файл и демон не тронуты; повтори слово, когда заход "
             u"кончится." % busy)
         return res
+    mark0 = daemon_mark()
     stamp = stamp or time.strftime("%Y%m%d-%H%M%SZ", time.gmtime())
     prog = _remote_program(_RS_USE, TARGET=target, SLOT_NAME=name, ACTIVE_NAME=NAME_ACTIVE,
                            BAK=backup_name(target, stamp))
@@ -1098,7 +1171,27 @@ def use_slot(slot, force=False, work=None, stamp=None):
         return res
     if fields.get("already_active") == "1":
         row = probe_one(target, NAME_ACTIVE, work)
-        res["row"], res["ok"], res["stage"] = row, row.get("code") == 200, "already"
+        res["row"], res["stage"] = row, "already"
+        if row.get("code") != 200:
+            say(u"Слот %s уже действующий по файлу, но проба: %s — рестарт не делаю, переключать "
+                u"не на что." % (letter, _row_words(row)))
+            return res
+        if row.get("file_after_start") is True:
+            # Файл сменили ПОСЛЕ старта демона: демон держит прежнее значение. Единственный рестарт —
+            # но только если за время пробы демон не взял задачу (тот же замок, что у главного пути).
+            okb, factsb, _wb = preflight(target)
+            bb, bwb = busy_of(factsb) if okb else (None, u"повторная разведка не удалась")
+            if (bb is None or bb) and not force:
+                say(u"Слот %s уже действующий по файлу, но демон стартовал РАНЬШЕ правки файла; рестарт "
+                    u"НЕ делаю (%s) — повтори слово, когда заход кончится."
+                    % (letter, bwb if bb is None else u"идёт заход демона: %d" % bb))
+                return res
+            rok_u, _rf, rwords_u = restart_unit()
+            res["restarted"], res["ok"] = True, rok_u
+            say(u"Слот %s уже действующий по файлу, но демон стартовал РАНЬШЕ правки файла — рестарт: %s."
+                % (letter, rwords_u))
+            return res
+        res["ok"] = True
         say(u"Слот %s уже действующий: файл не менялся, рестарта не было. Проба действующего: %s."
             % (letter, _row_words(row)))
         return res
@@ -1107,10 +1200,23 @@ def use_slot(slot, force=False, work=None, stamp=None):
         why = fields.get("err") or (u"канал: %s" % _squeeze(raw, 200) if rc == 255
                                     else u"запись не подтвердилась обратным чтением")
         say(u"ОТКАЗ на записи: %s." % why)
-        if bak:
+        if fields.get("err") == "backup_mismatch":
+            say(u"Копия не сошлась с оригиналом — запись НЕ делалась, файл не менялся; из такой копии "
+                u"не возвращаем (%s лежит рядом для разбора)." % bak)
+        elif bak:
             rok, _rf, rwords = restore(target, bak)
             res["rolled_back"] = rok
             say(u"ОТКАТ: %s" % rwords)
+        elif rc == 255:
+            # Канал оборвался, строки копии нет: менялся ли файл — НЕИЗВЕСТНО. Пробуем вернуть из
+            # копии по ожидаемому имени; её нет — значит до копии (и записи) дело не дошло.
+            expect = backup_name(target, stamp)
+            rok, rf, rwords = restore(target, expect)
+            res["rolled_back"] = rok
+            say(u"Менялся ли файл — НЕИЗВЕСТНО (канал оборвался). %s" % (
+                u"ОТКАТ из копии %s: %s" % (expect, rwords) if rok else
+                u"Копии %s нет — запись до файла не дошла; сверь «учётки»." % expect
+                if rf.get("err") == "backup_missing" else u"Вернуть не удалось: %s" % rwords))
         else:
             say(u"Копии нет — файл не менялся.")
         return res
@@ -1122,18 +1228,37 @@ def use_slot(slot, force=False, work=None, stamp=None):
         rok, _rf, rwords = restore(target, bak)
         res["rolled_back"] = rok
         say(u"Проба по новому файлу: %s — зелёным считается только 200." % _row_words(row))
-        say(u"ОТКАТ: %s. Демон НЕ перезапускался — он и не уходил с прежнего значения." % rwords
-            if rok else u"ОТКАТ НЕ СОСТОЯЛСЯ: %s — нужна рука владельца (демон не перезапускался, "
-                        u"но файл на диске уже другой)." % rwords)
+        if not rok:
+            say(u"ОТКАТ НЕ СОСТОЯЛСЯ: %s — нужна рука владельца (файл на диске уже другой)." % rwords)
+            return res
+        mark1 = daemon_mark()
+        if mark0 is not None and mark1 == mark0:
+            say(u"ОТКАТ: %s. Демон НЕ перезапускался — он и не уходил с прежнего значения." % rwords)
+            return res
+        # Демон перезапускался во время пробы (или сверить нечем): он мог схватить отвергнутый
+        # вход. Возвращаем его на прежнее значение — это и есть единственный рестарт слова.
+        b3, bw3 = busy_of(preflight(target)[1])
+        if b3 == 0 or force:
+            rok_u, _rf, rwords_u = restart_unit()
+            res["restarted"] = True
+            say(u"ОТКАТ: %s. Демон %s во время пробы — поднят заново на прежнем значении: %s."
+                % (rwords, u"перезапускался" if mark0 is not None and mark1 is not None
+                   else u"не сверить, перезапускался ли", rwords_u))
+        else:
+            say(u"ОТКАТ файла: %s. НО демон мог перезапуститься во время пробы и держать ОТВЕРГНУТЫЙ "
+                u"вход, а рестарт сейчас нельзя (%s) — нужен `systemctl restart %s`, когда заход "
+                u"кончится." % (rwords, bw3, UNIT))
         return res
     ok2, facts2, _w2 = preflight(target)
-    busy2 = int(facts2.get("busy_claude") or 0) if ok2 else 0
-    if busy2 and not force:
-        # Пока шла проба, демон взял задачу. Рестарт убил бы её — возвращаем файл, демон не трогаем.
+    busy2, bw2 = busy_of(facts2) if ok2 else (None, u"повторная разведка не удалась")
+    if (busy2 is None or busy2) and not force:
+        # Пока шла проба, демон взял задачу (или проверить нельзя). Рестарт убил бы её — файл
+        # возвращаем, демон не трогаем.
         res["stage"] = "busy_late"
         rok, _rf, rwords = restore(target, bak)
         res["rolled_back"] = rok
-        say(u"СТОП: пока шла проба, на сервере начался заход (%d). Рестарт НЕ делаю; %s." % (busy2, rwords))
+        say(u"СТОП после пробы (%s). Рестарт НЕ делаю; %s." % (
+            bw2 if busy2 is None else u"начался заход демона: %d" % busy2, rwords))
         return res
     rok_u, rfacts, rwords_u = restart_unit()
     res["restarted"] = True
@@ -1145,7 +1270,7 @@ def use_slot(slot, force=False, work=None, stamp=None):
         say(u"Рестарт: %s. ОТКАТ: %s; демон поднят обратно: %s." % (rwords_u, rwords, w3))
         return res
     res["ok"], res["stage"] = True, "done"
-    say(u"Проба действующего: %s. Рестарт: %s." % (_row_words(row), rwords_u))
+    say(u"Проба действующего (модель %s): %s. Рестарт: %s." % (PROBE_MODEL, _row_words(row), rwords_u))
     return res
 
 
@@ -1184,7 +1309,7 @@ def install_slot(slot, value, work=None, stamp=None):
     if not ok:
         res["stage"] = "write"
         say(u"ОТКАЗ на записи: %s." % words)
-        if bak:
+        if bak and fields.get("err") != "backup_mismatch":
             rok, _rf, rwords = restore(target, bak)
             res["rolled_back"] = rok
             say(u"ОТКАТ: %s" % rwords)
@@ -1206,13 +1331,54 @@ def install_slot(slot, value, work=None, stamp=None):
     return res
 
 
+def _builder_marker():
+    u"""Метка ребёнка-строителя в окружении (`accounts.builder_child`) | "". Реестр не читается."""
+    try:
+        import accounts_registry as accounts
+        return accounts.builder_child()
+    except Exception:                                 # noqa: BLE001 — нет модуля: судим сами
+        for name in ("PRETOOL_ASK_MARKER", "PRETOOL_MARKER_TOKEN", "GIT_SERIAL_PC_OWNER"):
+            if os.environ.get(name):
+                return name
+        return u""
+
+
+def legacy_registry_guard(loader=None):
+    u"""Старый режим (без --slot/--use) пишет токен в действующее И в слот A. С 25.09 слот A может
+    принадлежать учётке реестра ПК; тогда старый режим молча перепишет её вход чужим, и слово
+    «учётка N» переключит сервер НЕ на ту учётку. → строка отказа | "" (старый режим разрешён).
+
+    Реестра нет — разрешено (прежнее поведение). Реестр не разобран — отказ: чей слот A, неизвестно."""
+    try:
+        if loader is None:
+            import accounts_registry as accounts
+            reg = accounts.load()
+            ok_state = accounts.ST_OK
+            absent = accounts.ST_ABSENT
+        else:
+            reg, ok_state, absent = loader()
+    except Exception as e:                            # noqa: BLE001
+        return u"реестр учёток не читается (%s) — чей слот A, неизвестно; используй --slot <буква>" % (
+            type(e).__name__)
+    if reg.state == absent:
+        return u""
+    if reg.state != ok_state:
+        return u"%s — чей слот A, неизвестно; используй --slot <буква>" % reg.reason
+    owners = [n for n, row in sorted(reg.data["accounts"].items()) if row["slot"] == u"A"]
+    if owners:
+        return (u"слот A по реестру учёток — у №%d «%s»; старый режим переписал бы его вход. Токен "
+                u"учётки клади в ЕЁ слот: --slot <буква или номер учётки>, переключить — --use / «учётка N»"
+                % (owners[0], reg.data["accounts"][owners[0]]["label"]))
+    return u""
+
+
 def resolve_slot_arg(arg):
     u"""Аргумент `--slot`/`--use` → (буква | "", словами). Буква A–Z — как есть; номер — через
-    реестр учёток ПК (`accounts.py`). Номера нет в реестре или у учётки нет слота — отказ словами."""
+    реестр учёток ПК (`accounts_registry.py`). Номера нет в реестре или у учётки нет слота — отказ словами."""
     raw = (u"%s" % (arg or u"")).strip()
     if raw.isdigit():
         try:
-            import accounts
+            import accounts_registry as accounts
         except Exception as e:                        # noqa: BLE001
             return u"", u"реестр учёток не читается (%s)" % type(e).__name__
         reg = accounts.load()
@@ -1389,8 +1555,19 @@ def main(argv=None):
 
     if args.selftest:
         return selftest()
+    if not args.check:
+        marker = _builder_marker()
+        if marker:
+            print(u"ОТКАЗ: это ход владельца — из захода строителей (метка %s в окружении) "
+                  u"`--use`/`--slot`/`--probe-slots` и вписывание не запускаются. Разрешены --check "
+                  u"и --selftest. Ничего не менялось." % marker)
+            return 3
     if args.probe_slots:
         return run_probe_slots()
+    if args.slot and args.use:
+        print(u"ОТКАЗ: --slot и --use разом — неясно, какой слот сделать действующим. Сначала --slot X, "
+              u"затем отдельно --use X. Ничего не менялось.")
+        return 2
     if args.slot or args.use:
         letter, words = resolve_slot_arg(args.slot or args.use)
         print(u"Сервер: %s · юнит: %s · %s" % (SRV_HOST, UNIT, words))
@@ -1431,6 +1608,11 @@ def main(argv=None):
         print(u"Режим --check: значение не спрашивали, ничего не меняли.")
         return 0
 
+    guard = legacy_registry_guard()
+    if guard:
+        print(u"ОТКАЗ: %s. Значение не спрашивали, ничего не менялось." % guard)
+        return 2
+
     value = _ask_value()
     shape = check_shape(value)
     print(u"Форма: %s — %s" % (u"СОШЛАСЬ" if shape["ok"] else u"НЕ СОШЛАСЬ", shape["reason"]))
@@ -1457,7 +1639,7 @@ def main(argv=None):
     for line in facts.get("lines", []):
         print(u"  строка %s" % line)
     if not ok:
-        if bak:
+        if bak and facts.get("err") != "backup_mismatch":
             rok, _rf, rwords = restore(target, bak)
             print(u"ОТКАТ: %s" % rwords)
             print(u"  откат %s" % (u"состоялся" if rok else u"НЕ состоялся — нужна рука владельца"))

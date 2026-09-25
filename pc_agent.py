@@ -41,6 +41,9 @@ pc_agent.py — удалённое управление userbot'ом с теле
   урок перенос след         → кто, когда и какой урок переносил
   учётки                    → все учётки подписки: жива/лимит/до какого часа, что действует на ПК
                               (строители, RC) и на сервере (accounts_run.py --report; 25.09.2026)
+  учётки заведи             → первый реестр учёток по п.1 задания 25.09 (№1 основная, №2 профиль 2 +
+                              слот B, №3 профиль 3; слоты №1/№3 — по пробе слота A), строители — по
+                              пробе профиля №3; не перезаписывает, сервер не трогает
   учётка N                  → обе полосы на учётку N: строители ПК — реестром вне git, сервер —
                               vps_token_install.use_slot (слово = один рестарт демона сервера); RC не
                               трогается. Чужому — отказ словами, дверь не поднимается
@@ -666,6 +669,7 @@ KNOWN_COMMANDS = (
     "урок перенос откати M — откатить перенос урока БОТА #M",
     "урок перенос след — кто, когда и какой урок переносил",
     "учётки — все учётки: жива/лимит/до какого часа, что действует на ПК и сервере",
+    "учётки заведи — первый реестр учёток (1, 2, 3; слоты по пробе), сервер не трогает",
     "учётка N — обе полосы на учётку N (RC не трогается; = один рестарт демона сервера)",
 )
 
@@ -677,9 +681,11 @@ KNOWN_COMMANDS = (
 # `accounts_run.py` (субпроцессом, та же механика, что `_lesson_cli`). Из Telegram в командную
 # строку уезжает только ЧИСЛО — номер учётки, уже просеянный регуляркой.
 # СЛОВО «учётка N» = РАЗРЕШЕНИЕ ВЛАДЕЛЬЦА НА ОДИН РЕСТАРТ ДЕМОНА СЕРВЕРА (прямо по заданию). Идёт
-# заход на сервере — дверь рестарт не делает и говорит это словами. Автопереключения по лимиту
-# НЕТ: дверь не зовёт ни один таймер, только это слово.
+# заход на сервере — дверь рестарт не делает и говорит это словами. Автопереключения УЧЁТКИ по
+# лимиту НЕТ: дверь не зовёт ни один таймер, только это слово (серверный повтор ОДНОЙ задачи под
+# вторым слотом при 429 — старый `limit_slot`, действующее он не меняет; «учётки» его называют).
 ACCOUNTS_LIST_RE = re.compile(r"^уч[её]тки$")
+ACCOUNTS_INIT_RE = re.compile(r"^уч[её]тки\s+заведи$")
 ACCOUNT_SWITCH_RE = re.compile(r"^уч[её]тка\s+([0-9]{1,2})$")
 ACCOUNT_HEAD_RE = re.compile(r"^уч[её]тк[аиу]\b")
 ACCOUNTS_DENIED = ("⛔ Нет прав: учётки смотрит и переключает ТОЛЬКО владелец. Ничего не изменено, "
@@ -694,14 +700,48 @@ ACCOUNTS_ANSWER_AT = ("консоль ПК: «venv\\Scripts\\python.exe accounts
 
 
 def accounts_word(text):
-    """Текст (уже нижний регистр) → ("list", None) | ("switch", "N") | None. Только форма слова."""
+    """Текст (уже нижний регистр) → ("list", None) | ("init", None) | ("switch", "N") | None."""
     s = " ".join((text or "").split())
     if ACCOUNTS_LIST_RE.match(s):
         return ("list", None)
+    if ACCOUNTS_INIT_RE.match(s):
+        return ("init", None)
     m = ACCOUNT_SWITCH_RE.match(s)
     if m:
         return ("switch", m.group(1))
     return None
+
+
+# ДВЕРЬ ИДЁТ В ФОНЕ, А НЕ В ОБРАБОТЧИКЕ (находка ревью 25.09). PTB разбирает сообщения ПО ОДНОМУ:
+# пока `await` висит на двери учёток (пробы — минуты, потолок час), агент не ответил бы ни на одну
+# команду темы 205, включая «стоп userbot». Поэтому обработчик ставит дверь фоновой задачей и сразу
+# освобождается. Замок — ОДНО слово учёток за раз: два переключения параллельно дали бы два хода
+# `use_slot` и два рестарта демона сервера на одно слово владельца. Тот же замок держит «обновись»:
+# перезапуск агента убил бы дверь посреди переключения (файл сервера сменён, отката нет).
+_ACCOUNTS_RUNNING = {"act": None}
+ACCOUNTS_BUSY = ("⏳ Предыдущее слово учёток («%s») ещё идёт — дождись его ответа. Это слово НЕ "
+                 "принято, ничего не изменено.")
+
+
+def _background(context, coro):
+    """Фоновая задача: у PTB — `application.create_task` (ошибки идут в его обработчик), иначе —
+    задача текущего цикла (тесты)."""
+    app = getattr(context, "application", None)
+    if app is not None and hasattr(app, "create_task"):
+        return app.create_task(coro)
+    return asyncio.ensure_future(coro)
+
+
+async def _accounts_door(context, chat_id, act, number):
+    """Дверь учёток в фоне → ответ владельцу. Замок снимается ДО отправки: ответ уже на руках."""
+    try:
+        reply = await asyncio.to_thread(_accounts_cli, act, number)
+    except Exception as e:                      # noqa: BLE001 — фон не смеет умереть молча
+        reply = (f"учётки: «{act}» НЕ прошло ({type(e).__name__}: {e}). "
+                 f"Запасной путь — {ACCOUNTS_ANSWER_AT}.")
+    finally:
+        _ACCOUNTS_RUNNING["act"] = None
+    await _send(context, chat_id, reply)
 
 
 def _accounts_cli(action, number=None):
@@ -711,6 +751,8 @@ def _accounts_cli(action, number=None):
     argv = [str(VENV_PY), str(REPO_DIR / "accounts_run.py")]
     if action == "list":
         argv += ["--report"]
+    elif action == "init":
+        argv += ["--init"]
     elif action == "switch" and number is not None and str(number).isdigit():
         argv += ["--switch", str(int(number))]
     else:
@@ -1692,17 +1734,30 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif text in ("обновись", "перезапустись", "обнови себя", "restart"):
             alog.info("команда: self-restart")
-            await self_restart(context, chat_id)
+            if _ACCOUNTS_RUNNING["act"]:
+                await _send(context, chat_id,
+                            "⏳ Сейчас идёт слово учёток («%s»): перезапуск агента оборвал бы его "
+                            "посреди переключения. Повтори «обновись», когда придёт ответ. Ничего "
+                            "не перезапущено." % _ACCOUNTS_RUNNING["act"])
+            else:
+                await self_restart(context, chat_id)
 
         elif accounts_word(text):
             act, num = accounts_word(text)
             alog.info("команда учёток: %s %s от id %s", act, num or "", uid)
-            await _send(context, chat_id,
-                        "⏳ Меряю учётки: по одной пробе на профиль ПК и на слот сервера, до "
-                        "нескольких минут." if act == "list" else
-                        "⏳ Перевожу обе полосы на учётку №%s: проба ПК, затем сервер (копия, "
-                        "проба, один рестарт демона). До нескольких минут." % num)
-            await _send(context, chat_id, await asyncio.to_thread(_accounts_cli, act, num))
+            if _ACCOUNTS_RUNNING["act"]:
+                await _send(context, chat_id, ACCOUNTS_BUSY % _ACCOUNTS_RUNNING["act"])
+            else:
+                _ACCOUNTS_RUNNING["act"] = ("учётка %s" % num) if num else {
+                    "list": "учётки", "init": "учётки заведи"}.get(act, act)
+                await _send(context, chat_id, {
+                    "list": "⏳ Меряю учётки: по одной пробе на профиль ПК и на слот сервера, до "
+                            "нескольких минут. Другие команды темы работают.",
+                    "init": "⏳ Завожу реестр учёток: проба слотов сервера, основной и №3 на ПК; сервер не "
+                            "переключаю. До нескольких минут.",
+                }.get(act) or ("⏳ Перевожу обе полосы на учётку №%s: проба ПК, затем сервер (копия, "
+                               "проба, один рестарт демона). До нескольких минут." % num))
+                _background(context, _accounts_door(context, chat_id, act, num))
 
         elif ACCOUNT_HEAD_RE.match(text):
             alog.info("учётки: слово не разобрано в %r", (msg.text or "")[:120])

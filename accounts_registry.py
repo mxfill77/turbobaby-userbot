@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-accounts.py — РЕЕСТР УЧЁТОК ПОДПИСКИ ОБЕИХ ПОЛОС И ВЫБОР СТРОИТЕЛЕЙ, ВНЕ GIT (25.09.2026).
+accounts_registry.py — РЕЕСТР УЧЁТОК ПОДПИСКИ ОБЕИХ ПОЛОС И ВЫБОР СТРОИТЕЛЕЙ, ВНЕ GIT (25.09.2026).
 
 ЗАЧЕМ. До 25.09 учётку строителей ПК решал файл `claude_profile_choice.txt`, а он лежит В GIT.
 Правка отслеживаемого файла делает дерево грязным, а грязное дерево останавливает авто-фетч демона
@@ -80,6 +80,27 @@ ST_ABSENT = "absent"
 ST_BROKEN = "broken"
 
 
+# ═══════════════════ чьё слово: владельца или захода строителей ═══════════════════
+# Переключение учётки — СЛОВО ВЛАДЕЛЬЦА (задание 25.09: «слово = разрешение на один рестарт демона
+# сервера»). Гейт владельца живёт в pc_agent, но сами команды (`accounts_run.py --switch/--init`,
+# `vps_token_install.py --use`) лежат в дереве, и заход строителей мог бы позвать их сам — гард
+# ПК судит текст команды, а рестарт внутри программы для сервера для него не красный. Поэтому
+# команды спрашивают окружение: демон кладёт КАЖДОМУ ребёнку-строителю эти метки
+# (`pc_orchestrator._run_task_impl`; имена сверяет тест с исходником демона). Нашли метку —
+# это заход строителей, и переключение отказывает словами. Предел назван: процесс того же
+# пользователя может снять метки руками — это граница против ошибки, а не против злого умысла.
+BUILDER_MARKERS = ("PRETOOL_ASK_MARKER", "PRETOOL_MARKER_TOKEN", "GIT_SERIAL_PC_OWNER")
+
+
+def builder_child(env=None):
+    """Окружение → имя первой найденной метки ребёнка-строителя | "" (не строитель). Чистая."""
+    src = os.environ if env is None else env
+    for name in BUILDER_MARKERS:
+        if src.get(name):
+            return name
+    return ""
+
+
 def registry_path(repo=None, path=None):
     """Абсолютный путь реестра. `path` — прямое указание (тесты, разовые замеры)."""
     if path:
@@ -157,7 +178,9 @@ def parse_number(raw):
         return None
     if isinstance(raw, int):
         n = raw
-    elif isinstance(raw, str) and raw.strip().isdigit():
+    elif isinstance(raw, str) and re.fullmatch(r"[0-9]{1,3}", raw.strip()):
+        # ТОЛЬКО ASCII-цифры: `str.isdigit()` пропускает «²»/«①», а `int()` на них падает — и
+        # падение уронило бы спавн КАЖДОГО захода демона (находка ревью 25.09).
         n = int(raw.strip())
     else:
         return None
@@ -210,8 +233,10 @@ def validate(data):
                           % (slot, ", №".join(str(x) for x in sorted(nums))))
             for x in nums:
                 accounts[x]["slot"] = ""
+                # след снятого слота: «слота нет» и «слот спорный» — разные ответы владельцу
+                accounts[x]["slot_error"] = "слот %s назван и у другой учётки — спорный" % slot
     builders = None
-    if "builders" in data:
+    if data.get("builders") is not None:              # null — «ещё не назначен», не ошибка
         builders = parse_number(data.get("builders"))
         if builders is None:
             errors.append("номер строителей «%s» — не число 1…%d" % (data.get("builders"), NUM_MAX))
@@ -285,8 +310,15 @@ def builders_choice(reg, isdir=None):
 
 def apply_builders(env, repo=None, path=None, isdir=None, reader=None):
     """ПРИМЕНИТЬ выбор строителей к УЖЕ СОБРАННОМУ окружению ребёнка (правка на месте) → Choice.
-    Зовут ОБЕ ветки спавна демона (исполнитель и думатель) — замок в тесте."""
-    c = builders_choice(load(repo, path, reader), isdir)
+    Зовут ОБЕ ветки спавна демона (исполнитель и думатель) — замок в тесте.
+
+    НЕ БРОСАЕТ НИКОГДА: вызов стоит без `try` в обеих ветках спавна, и исключение здесь уронило бы
+    каждый заход полосы. Любой сбой разбора → ОСНОВНОЙ плюс WARNING с названной причиной."""
+    try:
+        c = builders_choice(load(repo, path, reader), isdir)
+    except Exception as e:                             # noqa: BLE001
+        c = Choice(ACT_DROP, "", "выбор учётки сорвался (%s: %s) — строители на %s (WARNING)"
+                   % (type(e).__name__, str(e)[:80], WORD_MAIN), True, None)
     if c.action == ACT_SET and c.value:
         env[KEY] = c.value
     else:
@@ -337,6 +369,34 @@ def set_builders(n, repo=None, path=None):
     return prev
 
 
+def create(rows, builders, repo=None, path=None):
+    """Завести НОВЫЙ реестр целиком (слово «учётки заведи»). → разобранные данные (как `validate`).
+
+    Файл уже есть — любой, даже битый, — FileExistsError: заведение НЕ перезаписывает руку
+    владельца. Негодная строка — ValueError, и ничего не пишется (проверка та же, что при чтении)."""
+    p = registry_path(repo, path)
+    if os.path.exists(p):
+        raise FileExistsError("реестр %s уже есть — заведение не перезаписывает" % p)
+    data = {"form": FORM, "builders": builders,
+            "accounts": dict((u"%d" % n, dict(row)) for n, row in sorted(rows.items()))}
+    reg, errors = validate(data)
+    if errors:
+        raise ValueError("; ".join(errors))
+    # O_EXCL, а не `os.replace`: файл, появившийся между проверкой выше и записью (рука владельца с
+    # консоли, `--set`), НЕ затирается — создание падает FileExistsError (находка ревью 25.09, гонка
+    # проверки и записи). Блок меньше килобайта пишется одним вызовом; оборванную запись читатель
+    # увидит «не JSON» → ОСНОВНОЙ плюс WARNING, а не чужой выбор.
+    blob = (json.dumps(data, ensure_ascii=False, indent=2, sort_keys=False) + "\n").encode("utf-8")
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)
+    try:
+        done = 0
+        while done < len(blob):
+            done += os.write(fd, blob[done:])
+    finally:
+        os.close(fd)
+    return reg
+
+
 def set_entry(n, profile, slot, label, repo=None, path=None):
     """Завести или поправить учётку №n. Та же проверка, что при чтении: негодное не пишется."""
     p = registry_path(repo, path)
@@ -371,8 +431,11 @@ def load_last(repo=None):
         with io.open(p, encoding="utf-8") as f:
             data = json.loads(f.read())
         if isinstance(data, dict):
-            data.setdefault("pc", {})
-            data.setdefault("srv", {})
+            # кривые ветви (null, список) заменяются пустыми: иначе запись итога падала бы УЖЕ ПОСЛЕ
+            # переключения сервера, и владелец получил бы трассу вместо итога (находка ревью 25.09)
+            for key in ("pc", "srv"):
+                if not isinstance(data.get(key), dict):
+                    data[key] = {}
             return data
     except Exception:                                      # noqa: BLE001 — нет истории ≠ ошибка
         pass

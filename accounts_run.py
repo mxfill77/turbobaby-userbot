@@ -3,7 +3,7 @@
 accounts_run.py — РУКИ РЕЕСТРА УЧЁТОК: «учётки» и «учётка N» с телефона, заведение учётки с ПК
 (25.09.2026, задание Штаба «учётки одним словом»).
 
-Решение (что такое реестр, какой профиль у строителей) живёт в `accounts.py` — его импортирует
+Решение (что такое реестр, какой профиль у строителей) живёт в `accounts_registry.py` — его импортирует
 демон. Здесь — всё, что ходит наружу: живые пробы профилей ПК (`claude -p` под каталогом профиля),
 пробы слотов сервера и переключение серверного демона (`vps_token_install`, ssh). Демон этот модуль
 НЕ импортирует: замыкание демона не растёт ни на `subprocess`, ни на ssh.
@@ -20,7 +20,9 @@ accounts_run.py — РУКИ РЕЕСТРА УЧЁТОК: «учётки» и «
                 возврат копии, идёт заход — стоп словами). Слово владельца = разрешение на один
                 рестарт демона сервера; второго рестарта «обратно» ход не делает — проба стоит до
                 рестарта. RC этим словом не трогается ни одной веткой.
-АВТОПЕРЕКЛЮЧЕНИЯ ПО ЛИМИТУ НЕТ: этот модуль зовут только слово владельца и его консоль.
+АВТОПЕРЕКЛЮЧЕНИЯ УЧЁТКИ ПО ЛИМИТУ НЕТ: этот модуль зовут только слово владельца и его консоль.
+Старый серверный повтор ОДНОЙ задачи под вторым слотом при 429 (`limit_slot`, 20.09) остаётся
+как был — действующее он не меняет; «учётки» называет, под чьим слотом он пойдёт.
 
 СЕКРЕТЫ. Токенов и `.credentials.json` модуль не читает вовсе: проба профиля — это запуск CLI с
 `CLAUDE_CONFIG_DIR`, а наружу идут только слово исхода, статус, время сброса и текст поставщика
@@ -28,6 +30,7 @@ accounts_run.py — РУКИ РЕЕСТРА УЧЁТОК: «учётки» и «
 
 ЗАПУСК:
     venv\\Scripts\\python.exe accounts_run.py --report          # «учётки»
+    venv\\Scripts\\python.exe accounts_run.py --init            # «учётки заведи» (первый реестр)
     venv\\Scripts\\python.exe accounts_run.py --switch 3        # «учётка 3»
     venv\\Scripts\\python.exe accounts_run.py --show            # реестр без проб, без сети
     venv\\Scripts\\python.exe accounts_run.py --set 4 --profile D:\\claude_profile_4 --slot C --label четвёртая
@@ -36,13 +39,15 @@ accounts_run.py — РУКИ РЕЕСТРА УЧЁТОК: «учётки» и «
 """
 
 import argparse
+import glob
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
 
-import accounts
+import accounts_registry as accounts
 import exit_evidence
 import io_utf8
 import profile_choice
@@ -72,17 +77,73 @@ PC_UNKNOWN = u"неизвестно"
 
 # ═══════════════════ проба профиля ПК ═══════════════════
 
-def find_claude(which=None, isfile=None):
-    """CLI claude: PATH-шим → вечный нативный шим ~/.local/bin. Нет → None (проба «неизвестно»).
-    Урезанное зеркало `rc_supervisor.resolve_claude` (его импорт вешает лог-обработчик)."""
+def _ver_key(name):
+    """'2.1.217' → (2, 1, 217); нечисловое → (0,). Зеркало `rc_supervisor._ver_key`."""
+    nums = re.findall(r"\d+", name or "")
+    return tuple(int(n) for n in nums) if nums else (0,)
+
+
+def claude_base_dirs():
+    """Базы версий claude-code, включая РЕАЛЬНУЮ MSIX-базу. Зеркало `rc_supervisor.claude_base_dirs`:
+    pc_agent поднимает Планировщик, и Roaming-редирект MSIX ему не виден."""
+    home = os.path.expanduser("~")
+    appdata = os.getenv("APPDATA") or os.path.join(home, "AppData", "Roaming")
+    local = os.getenv("LOCALAPPDATA") or os.path.join(os.getenv("USERPROFILE") or home,
+                                                      "AppData", "Local")
+    out = [os.path.join(appdata, "Claude", "claude-code")]
+    try:
+        for cc in glob.glob(os.path.join(local, "Packages", "Claude_*", "LocalCache",
+                                         "Roaming", "Claude", "claude-code")):
+            if cc not in out:
+                out.append(cc)
+    except Exception:                                  # noqa: BLE001
+        pass
+    return out
+
+
+def newest_versioned_claude(bases=None, globber=None, isfile=None):
+    """Новейшая версионная установка по ЧИСЛОВОМУ ключу. Зеркало `rc_supervisor.newest_versioned_claude`."""
+    bases = bases if bases is not None else claude_base_dirs()
+    _glob = globber or glob.glob
+    _isf = isfile or os.path.isfile
+    cands = []
+    try:
+        for base in bases:
+            for d in _glob(os.path.join(base, "*")):
+                exe = os.path.join(d, "claude.exe")
+                if _isf(exe):
+                    cands.append((_ver_key(os.path.basename(d)), exe))
+    except Exception:                                  # noqa: BLE001
+        return None
+    if not cands:
+        return None
+    cands.sort()
+    return cands[-1][1]
+
+
+def find_claude(which=None, isfile=None, newest=None):
+    """CLI claude ТЕМ ЖЕ порядком, что у RC (`rc_supervisor.resolve_claude`; равенство держит тест):
+    PATH-шим → вечный нативный шим ~/.local/bin → новейшая версионная установка (Desktop/MSIX) →
+    прочие схемы. Импортировать rc_supervisor отсюда нельзя: он вешает лог-обработчик на старте.
+    Нет нигде → None (проба «неизвестно», а не «жива»)."""
     _which = which or shutil.which
     _isf = isfile or os.path.isfile
-    got = _which("claude")
-    if got:
-        return got
+    shim = _which("claude")
+    if shim:
+        return shim
     home = os.path.expanduser("~")
     for c in (os.path.join(home, ".local", "bin", "claude.exe"),
               os.path.join(home, ".local", "bin", "claude.cmd")):
+        if _isf(c):
+            return c
+    exe = (newest or newest_versioned_claude)()
+    if exe:
+        return exe
+    local = os.getenv("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+    appdata = os.getenv("APPDATA") or os.path.join(home, "AppData", "Roaming")
+    for c in (os.path.join(local, "Programs", "claude", "claude.exe"),
+              os.path.join(local, "Programs", "claude-code", "claude.exe"),
+              os.path.join(appdata, "npm", "claude.cmd")):
         if _isf(c):
             return c
     return None
@@ -195,6 +256,27 @@ def srv_map(rows):
     return by_letter, sorted(active_letters), active_row
 
 
+def retry_words(srv, owner_of):
+    u"""Честная строка про СЕРВЕРНЫЙ повтор задачи при лимите (`limit_slot`, 20.09). Чистая функция.
+
+    Слово «автопереключения нет» верно для УЧЁТКИ: действующий вход сервера меняет только слово
+    владельца. Но демон, упёршись в 429 на слоте A или B, повторяет ОДНУ задачу под вторым из них —
+    действующее при этом не меняется. Владелец обязан видеть, под чьей учёткой пойдёт такой повтор."""
+    if not srv.get("ok"):
+        return []
+    by_letter, active_letters, _ar = srv_map(srv.get("rows"))
+    if len(active_letters) != 1 or active_letters[0] not in (u"A", u"B"):
+        return [u"повтор задачи при 429 на сервере: нет (действующее не совпало ровно с A или B)"]
+    act = active_letters[0]
+    other = u"B" if act == u"A" else u"A"
+    row = by_letter.get(other)
+    if not row or not row.get("called"):
+        return [u"повтор задачи при 429 на сервере: нет — слот %s пуст или его нет" % other]
+    who = (u" (№%d)" % owner_of[other]) if other in owner_of else u""
+    return [u"при 429 сервер повторит ЗАДАЧУ один раз под слотом %s%s — старый повтор limit_slot; "
+            u"учётку он НЕ переключает" % (other, who)]
+
+
 def report_text(reg, pc_rows, srv, choice, rc_words, now=None):
     """Реестр + пробы → ответ «учётки». Чистая функция (всё, что нужно, приходит параметрами)."""
     now = now or time.strftime("%H:%M UTC", time.gmtime())
@@ -208,7 +290,9 @@ def report_text(reg, pc_rows, srv, choice, rc_words, now=None):
     owner_of = {}
     for n, row in sorted(reg.data["accounts"].items()):
         pc = pc_rows.get(n)
-        if row["slot"]:
+        if row.get("slot_error"):
+            s_words = u"слот спорный — %s" % row["slot_error"]
+        elif row["slot"]:
             owner_of[row["slot"]] = n
             sr = by_letter.get(row["slot"])
             if not srv.get("ok"):
@@ -224,8 +308,10 @@ def report_text(reg, pc_rows, srv, choice, rc_words, now=None):
             s_words = u"слота нет"
         out.append(u"№%d «%s» · ПК %s: %s · сервер %s"
                    % (n, row["label"], row["profile"], _code_words(pc), s_words))
-    if reg.state != accounts.ST_OK and "main" in pc_rows:
-        out.append(u"без реестра · ПК %s: %s" % (accounts.WORD_MAIN, _code_words(pc_rows["main"])))
+    if "main" in pc_rows:
+        out.append(u"%s · ПК %s: %s" % (u"без реестра" if reg.state != accounts.ST_OK else
+                                          u"откат строителей (строки в реестре нет)",
+                                          accounts.WORD_MAIN, _code_words(pc_rows["main"])))
     stray = sorted(set(by_letter) - set(owner_of))
     for letter in stray:
         out.append(u"слот %s вне реестра: %s%s" % (letter, _code_words(by_letter[letter]),
@@ -242,6 +328,8 @@ def report_text(reg, pc_rows, srv, choice, rc_words, now=None):
     else:
         s_act = u"значение действующего не совпало ни с одним слотом, проба: %s" % _code_words(active_row)
     out.append(u"ДЕЙСТВУЕТ: строители ПК — %s · RC — %s · сервер — %s" % (b, rc_words, s_act))
+    out.extend(retry_words(srv, owner_of))
+    out.append(u"модели проб: ПК %s · сервер %s" % (PROBE_MODEL, vti.PROBE_MODEL))
     if srv.get("ok") and srv.get("busy"):
         out.append(u"на сервере сейчас идёт заход (%d) — «учётка N» рестарт отложит словами" % srv["busy"])
     return u"\n".join(out)
@@ -255,7 +343,10 @@ def report(runner=None, srv_probe=None, isdir=None, repo=None, save=True):
     pc_rows = {}
     for n, row in sorted(reg.data["accounts"].items()):
         pc_rows[n] = pc_probe(row["profile"], runner=runner, isdir=isdir)
-    if reg.state != accounts.ST_OK:
+    choice0 = accounts.builders_choice(reg, isdir)
+    has_main = any(row["profile"] == accounts.WORD_MAIN for row in reg.data["accounts"].values())
+    if reg.state != accounts.ST_OK or (choice0.warn and not has_main):
+        # строители откатились на ОСНОВНОЙ, а строки с ним в реестре нет — меряем ТО, чем они идут
         pc_rows["main"] = pc_probe(accounts.WORD_MAIN, runner=runner, isdir=isdir)
     try:
         srv = (srv_probe or vti.probe_all_slots)(work=WORK)
@@ -318,7 +409,10 @@ def switch(n, runner=None, use=None, isdir=None, repo=None, save=True):
                       prev))
     # ── сервер ──
     srv_ok, srv_row = False, None
-    if not row["slot"]:
+    if row.get("slot_error"):
+        out.append(u"Сервер: НЕ переключён — %s (реестр: %s). Демон не тронут." % (
+            row["slot_error"], u"; ".join(reg.errors)))
+    elif not row["slot"]:
         out.append(u"Сервер: у учётки №%d слота нет — демон НЕ переключён и не перезапущен." % num)
     else:
         try:
@@ -341,7 +435,7 @@ def switch(n, runner=None, use=None, isdir=None, repo=None, save=True):
             accounts.save_last(last, repo)
         except Exception:                             # noqa: BLE001
             pass
-    both = pc_ok and (srv_ok or not row["slot"])
+    both = pc_ok and (srv_ok or (not row["slot"] and not row.get("slot_error")))
     out.append(u"ИТОГ: %s" % (u"обе полосы на №%d" % num if (pc_ok and srv_ok)
                              else u"ПК на №%d, сервера у учётки нет" % num if both
                              else u"переключено НЕ всё — см. строки выше"))
@@ -361,7 +455,8 @@ def show(repo=None, isdir=None):
         out.append(u"  №%d «%s» · ПК %s (последний ответ: %s%s) · сервер %s%s"
                    % (n, row["label"], row["profile"], _code_words(pc),
                       (u", %s" % pc["at"]) if pc else u"",
-                      (u"слот %s" % row["slot"]) if row["slot"] else u"слота нет",
+                      (u"слот %s" % row["slot"]) if row["slot"] else
+                      (u"слот спорный — %s" % row["slot_error"]) if row.get("slot_error") else u"слота нет",
                       (u" (последний ответ: %s, %s)" % (_code_words(sr), sr.get("at"))) if sr else u""))
     c = accounts.builders_choice(reg, isdir)
     out.append(u"Строители: %s" % accounts.line(c))
@@ -369,7 +464,117 @@ def show(repo=None, isdir=None):
     return u"\n".join(out)
 
 
+# ═══════════════════ «учётки заведи»: первый реестр одним словом ═══════════════════
+# Без реестра слово «учётка N» отказывает, а завести реестр можно было только с консоли ПК —
+# то есть «одним словом с телефона» не работало ни разу. Заведение кладёт ровно п.1 задания
+# 25.09: №1 — основной каталог, №2 — `D:\claude_profile_2` и слот B, №3 — `D:\claude_profile_3` и
+# тот слот, где по пробе третья учётка; слот основной — по факту пробы. И заодно п.0: проба
+# профиля №3, 200 → строители на №3, иначе на №1. Сервер заведение НЕ трогает (ни записи, ни
+# рестарта) — его переключает только «учётка N».
+INIT_PROFILE_2 = u"D:\\claude_profile_2"
+INIT_PROFILE_3 = u"D:\\claude_profile_3"
+# Правило П2 (слово Штаба 25.09): слот A = 200 → в A третья учётка; A = 429 → в A ещё основная.
+# Слово Штаба держится на ПОСЫЛКЕ «основная в лимите, третья жива», и заведение её МЕРЯЕТ, а не берёт
+# на веру: пробуются основная и №3 на ПК (учётка одна — лимит у неё один на обеих машинах). Слот
+# назначается ТОЛЬКО когда три пробы не противоречат друг другу (находка ревью 25.09: по одной пробе
+# A при третьей тоже в лимите A = 429 записал бы №1 ← A навсегда). Окно правила — до ИЗМЕРЕННОГО
+# сброса недели основной, 28.09 21:00 UTC (артефакт 2209, «Sep 29, 4am (Asia/Bangkok)»): «до 29.09»
+# Штаба — местная дата. После — A = 200 учёток не различает, и правило гаснет само.
+P2_RULE_UNTIL = (2026, 9, 28, 21, 0)                # UTC (год, месяц, день, час, минута)
+CONCLUSIVE = (200, 401, 429)                       # ответы, по которым можно судить; прочее — «не знаю»
+
+
+def _code(row):
+    return (row or {}).get("code")
+
+
+def init_plan(slot_a, pc_main, pc3, now):
+    """ЧИСТОЕ решение заведения → (строки, №строителей, слова, повторить).
+
+    `повторить` = True — судить не по чему (проба дала 529, таймаут, сбой канала): реестр НЕ пишется,
+    владелец повторяет слово позже. Иначе реестр пишется, и слот №1/№3 назначен ТОЛЬКО по правилу П2 с
+    подтверждённой посылкой; противоречие проб — слоты пусты, и это сказано словами."""
+    words = []
+    slot1 = slot3 = u""
+    a, m, t = _code(slot_a), _code(pc_main), _code(pc3)
+    live = tuple(now) < P2_RULE_UNTIL
+    if live and slot_a and any(c not in CONCLUSIVE for c in (a, m, t)):
+        words.append(u"судить не по чему: слот A — %s · основная на ПК — %s · №3 на ПК — %s"
+                     % (_code_words(slot_a), _code_words(pc_main), _code_words(pc3)))
+        return None, None, words, True
+    probes = u"слот A = %s · основная на ПК = %s · №3 на ПК = %s" % (a, m, t)
+    if not live:
+        words.append(u"правило П2 истекло (28.09 21:00 UTC — сброс недели основной; A = 200 учёток больше "
+                     u"не различает) — слоты №1 и №3 НЕ назначены, назначь «accounts_run.py --set» на ПК")
+    elif not slot_a:
+        words.append(u"слота A на сервере нет — слоты №1 и №3 НЕ назначены")
+    elif a == 200 and m == 429 and t != 429:
+        slot3 = u"A"
+        words.append(u"%s → основная в лимите, 200 ей не принадлежит: №3 ← A, у №1 слота нет" % probes)
+    elif a == 429 and m == 429 and t == 200:
+        slot1 = u"A"
+        words.append(u"%s → третья жива, 429 ей не принадлежит: №1 ← A (основная), у №3 слота нет" % probes)
+    else:
+        words.append(u"%s — пробы не сходятся с правилом П2, чей вход в A, не доказано: слоты №1 и №3 "
+                     u"НЕ назначены, назначь «accounts_run.py --set» на ПК" % probes)
+    rows = {1: {"profile": accounts.WORD_MAIN, "slot": slot1, "label": u"основная"},
+            2: {"profile": INIT_PROFILE_2, "slot": u"B", "label": u"вторая"},
+            3: {"profile": INIT_PROFILE_3, "slot": slot3, "label": u"третья"}}
+    if t == 200:
+        builders = 3
+        words.append(u"п.0: проба профиля №3 — 200 (is_error=false) → строители на №3")
+    else:
+        builders = 1
+        words.append(u"п.0: проба профиля №3 — %s → строители на №1 (ОСНОВНОЙ)"
+                     % (_code_words(pc3) + ((u", %s" % pc3["text"]) if (pc3 or {}).get("text") else u"")))
+    return rows, builders, words, False
+
+
+def init_registry(runner=None, srv_probe=None, isdir=None, repo=None, today=None, save=True):
+    """«учётки заведи» → (код, текст). 0 — заведён; 2 — отказ без единой записи."""
+    reg = accounts.load(repo)
+    if reg.state != accounts.ST_ABSENT:
+        return 2, (u"⛔ Реестр уже есть (%s) — «учётки заведи» не перезаписывает. Смотреть: «учётки»; "
+                   u"править: accounts_run.py --set на ПК. Ничего не изменено." % reg.reason)
+    try:
+        srv = (srv_probe or vti.probe_all_slots)(work=WORK)
+    except Exception as e:                            # noqa: BLE001
+        srv = {"ok": False, "words": u"проба сервера упала (%s)" % type(e).__name__, "rows": []}
+    if not srv.get("ok"):
+        return 2, (u"⛔ Реестр НЕ заведён: сервер не ответил (%s), а слот третьей учётки решает его проба. "
+                   u"Повтори «учётки заведи» позже. Ничего не изменено." % (srv.get("words") or u"причина не названа"))
+    by_letter, active_letters, active_row = srv_map(srv.get("rows"))
+    pc_main = pc_probe(accounts.WORD_MAIN, runner=runner, isdir=isdir)
+    pc3 = pc_probe(INIT_PROFILE_3, runner=runner, isdir=isdir)
+    rows, builders, words, retry = init_plan(by_letter.get("A"), pc_main, pc3,
+                                             today or tuple(time.gmtime()[:5]))
+    if retry:
+        return 2, (u"⛔ Реестр НЕ заведён: %s. Слот, записанный по такой пробе, остался бы чужим навсегда — "
+                   u"повтори «учётки заведи» позже. Ничего не изменено." % u"; ".join(words))
+    try:
+        accounts.create(rows, builders, repo)
+    except (FileExistsError, ValueError) as e:
+        return 2, u"⛔ Реестр НЕ заведён: %s. Ничего не изменено." % e
+    if save:
+        _remember(repo, {1: pc_main, 3: pc3}, srv)
+    out = [u"🆕 Реестр учёток заведён (%s, вне git):" % accounts.REGISTRY_REL]
+    for n, row in sorted(rows.items()):
+        out.append(u"№%d «%s» · ПК %s · сервер %s" % (n, row["label"], row["profile"],
+                                                      (u"слот %s" % row["slot"]) if row["slot"] else u"слота нет"))
+    out.extend(words)
+    act = u", ".join(active_letters) or u"значение действующего не совпало ни с одним слотом"
+    out.append(u"ДЕЙСТВУЕТ: строители ПК — №%d · RC — %s · сервер — %s (заведение сервер НЕ трогает; "
+               u"перевести его — «учётка N»)" % (builders, rc_choice_words(repo, isdir), act))
+    return 0, u"\n".join(out)
+
+
 SCREEN = u"""КАК ЗАВЕСТИ УЧЁТКУ N (руки владельца; код не правится)
+
+0. Первый раз и только для трёх известных учёток — одним словом с телефона: «учётки заведи».
+   Реестр ляжет по п.1 задания 25.09, слоты №1/№3 — по пробам слота A, основной и №3 (правило
+   П2 до 28.09 21:00 UTC; пробы не сходятся — слоты пусты, назначить --set), строители — по №3.
+   Проба дала 529/таймаут — реестр не пишется, слово повторить позже.
+   Дальше — шаги ниже для четвёртой и следующих.
 
 1. Профиль ПК — войти в новую учётку в СВОЁМ каталоге (PowerShell на ПК):
      $env:CLAUDE_CONFIG_DIR='D:\\claude_profile_N'; claude auth login
@@ -389,13 +594,17 @@ SCREEN = u"""КАК ЗАВЕСТИ УЧЁТКУ N (руки владельца; 
    сервере идёт заход — ответ скажет «стоп», повторить позже. RC остаётся на своём выборе
    (файл rc_profile_choice.txt, по умолчанию ОСНОВНОЙ) — телефонный канал не переезжает.
 
-Автопереключения по лимиту НЕТ: полосы переходят на другую учётку только словом владельца."""
+Автопереключения учётки по лимиту НЕТ: полосы переходят на другую учётку только словом владельца.
+Сервер при 429 на слоте A/B повторяет ОДНУ задачу под вторым слотом (старый повтор 20.09);
+действующий вход он не меняет — «учётки» называет, под чьим слотом пойдёт такой повтор."""
 
 
 def main(argv=None):
     io_utf8.force_utf8()
     ap = argparse.ArgumentParser(description=u"Реестр учёток: пробы и переключение обеих полос.")
     ap.add_argument("--report", action="store_true", help=u"«учётки»: живые пробы ПК и сервера")
+    ap.add_argument("--init", action="store_true",
+                    help=u"«учётки заведи»: первый реестр по п.1 задания 25.09 (если его ещё нет)")
     ap.add_argument("--switch", metavar="N", help=u"«учётка N»: обе полосы на учётку N")
     ap.add_argument("--show", action="store_true", help=u"реестр без проб и без сети")
     ap.add_argument("--screen", action="store_true", help=u"экран владельца: как завести учётку N")
@@ -409,6 +618,19 @@ def main(argv=None):
     if args.screen:
         print(SCREEN)
         return 0
+    if args.show:
+        print(show())
+        return 0
+    marker = accounts.builder_child()
+    if marker:
+        print(u"⛔ Это слово владельца: пробы и переключение учёток из захода строителей не "
+              u"запускаются (в окружении метка %s). Скажи владельцу: «учётки» / «учётка N» в теме 205. "
+              u"Ничего не изменено, проб не было." % marker)
+        return 3
+    if args.init:
+        code, text = init_registry()
+        print(text)
+        return code
     if args.builders:
         try:
             prev = accounts.set_builders(args.builders)
@@ -417,9 +639,6 @@ def main(argv=None):
             return 2
         print(u"Строители ПК: %s → №%s (сервер не тронут; RC не тронут)"
               % ((u"№%s" % prev) if prev else accounts.WORD_MAIN, args.builders))
-        return 0
-    if args.show:
-        print(show())
         return 0
     if args.set:
         if not args.profile:

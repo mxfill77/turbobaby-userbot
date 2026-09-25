@@ -28,7 +28,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-import accounts
+import accounts_registry as accounts
 import profile_choice
 import rc_supervisor as rc
 
@@ -275,11 +275,148 @@ class TestRcUntouchedByBuilders(_Tree):
         self.assertNotIn(profile_choice.CHOICE_REL, consts)
 
 
+class TestBuilderChild(unittest.TestCase):
+    u"""Слово владельца не зовётся из захода строителей: метки ребёнка демона узнаются по имени."""
+
+    def test_markers_found_and_absent(self):
+        self.assertEqual(accounts.builder_child({}), "")
+        self.assertEqual(accounts.builder_child({"PATH": "x", "PRETOOL_MARKER_TOKEN": "t"}),
+                         "PRETOOL_MARKER_TOKEN")
+        self.assertEqual(accounts.builder_child({"PRETOOL_ASK_MARKER": ""}), "")   # пустая — не метка
+
+    def test_marker_names_match_the_daemon(self):
+        import re
+        import git_serial_pc
+        with io.open(os.path.join(HERE, "pc_orchestrator.py"), encoding="utf-8") as f:
+            src = f.read()
+        ask = re.search(r'^ASK_MARKER_ENV\s*=\s*"([^"]+)"', src, re.M).group(1)
+        tok = re.search(r'^MARKER_TOKEN_ENV\s*=\s*"([^"]+)"', src, re.M).group(1)
+        self.assertEqual(set(accounts.BUILDER_MARKERS), {ask, tok, git_serial_pc.OWNER_ENV})
+        # демон обязан по-прежнему класть их ребёнку — иначе гейт ослеп бы молча
+        for const in ("env[ASK_MARKER_ENV]", "env[MARKER_TOKEN_ENV]", "env[git_serial_pc.OWNER_ENV]"):
+            self.assertIn(const, src)
+
+
+class TestReviewFixes(_Tree):
+    u"""Находки ревью 25.09: каждая — случай, где демон или слово владельца падали трассой или молчали."""
+
+    def test_non_ascii_digit_never_throws(self):
+        u"""«²», «③», арабская «٣» — `isdigit()` их пропускал, `int()` падал, и падение роняло спавн."""
+        for raw in (u"²", u"①", u"٣", u"３"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(accounts.parse_number(raw))
+                _registry(self.repo, raw, self.acc)
+                reg = accounts.load(self.repo)
+                self.assertEqual(reg.state, accounts.ST_OK)
+                self.assertTrue(any(u"номер строителей" in e for e in reg.errors))
+                env = {"PATH": "x", KEY: "/родитель"}
+                c = accounts.apply_builders(env, self.repo)
+                self.assertTrue(c.warn)
+                self.assertNotIn(KEY, env)
+
+    def test_apply_builders_never_throws(self):
+        u"""Любое исключение разбора → ОСНОВНОЙ плюс WARNING с причиной, а не трасса в спавне."""
+        env = {"PATH": "x", KEY: "/родитель"}
+        with mock.patch.object(accounts, "builders_choice", side_effect=RuntimeError("сломано")):
+            c = accounts.apply_builders(env, self.repo)
+        self.assertEqual((c.action, c.warn), (accounts.ACT_DROP, True))
+        self.assertIn(u"RuntimeError", c.reason)
+        self.assertNotIn(KEY, env)
+        self.assertTrue(accounts.line(c).startswith("WARNING: "))
+
+    def test_builders_null_is_not_an_error(self):
+        _registry(self.repo, None, self.acc)
+        reg = accounts.load(self.repo)
+        self.assertEqual((reg.state, reg.errors), (accounts.ST_OK, []))
+        c = accounts.builders_choice(reg)
+        self.assertEqual((c.action, c.warn), (accounts.ACT_DROP, True))
+        self.assertIn(u"не назван номер строителей", c.reason)
+        _registry(self.repo, "три", self.acc)                   # близнец: слово вместо числа — ошибка
+        self.assertTrue(accounts.load(self.repo).errors)
+
+    def test_shared_slot_leaves_a_named_trace(self):
+        acc = dict(self.acc)
+        acc["3"] = dict(acc["3"], slot="A")
+        _registry(self.repo, 1, acc)
+        reg = accounts.load(self.repo)
+        for n in (1, 3):
+            self.assertIn(u"спорный", reg.data["accounts"][n].get("slot_error", u""))
+        self.assertNotIn("slot_error", reg.data["accounts"][2])     # близнец: чужой слот не задет
+
+    def test_malformed_history_is_reset_not_thrown(self):
+        u"""`accounts_last.json` с `null`/списком в ветвях: итог слова не смеет упасть ПОСЛЕ сервера."""
+        _write(os.path.join(self.repo, accounts.LAST_REL), json.dumps({"pc": None, "srv": [1, 2]}))
+        last = accounts.load_last(self.repo)
+        self.assertEqual((last["pc"], last["srv"]), ({}, {}))
+        last["pc"]["1"] = {"code": 200}
+        accounts.save_last(last, self.repo)
+        self.assertEqual(accounts.load_last(self.repo)["pc"]["1"]["code"], 200)
+
+    def test_create_refuses_existing_and_bad_rows(self):
+        rows = {1: {"profile": u"ОСНОВНОЙ", "slot": "", "label": u"основная"},
+                3: {"profile": self.p3, "slot": "A", "label": u"третья"}}
+        data = accounts.create(rows, 3, self.repo)
+        self.assertEqual(data["builders"], 3)
+        self.assertEqual(accounts.load(self.repo).state, accounts.ST_OK)
+        before = _sha(os.path.join(self.repo, accounts.REGISTRY_REL))
+        with self.assertRaises(FileExistsError):
+            accounts.create(rows, 1, self.repo)
+        self.assertEqual(_sha(os.path.join(self.repo, accounts.REGISTRY_REL)), before)
+        other = _tmp()
+        with self.assertRaises(ValueError):
+            accounts.create({1: {"profile": self.p3, "slot": "A", "label": u"x@y"}}, 1, other)
+        self.assertFalse(os.path.exists(os.path.join(other, accounts.REGISTRY_REL)))
+
+
+class TestCreateIsExclusive(_Tree):
+    u"""Находка ревью 25.09: проверка «файла нет» и запись разнесены во времени; реестр, положенный
+    рукой владельца в этот промежуток, заведение НЕ затирает."""
+
+    def test_file_appearing_after_the_check_is_not_overwritten(self):
+        rows = {1: {"profile": u"ОСНОВНОЙ", "slot": "", "label": u"основная"}}
+        p = os.path.join(self.repo, accounts.REGISTRY_REL)
+        _registry(self.repo, 2, self.acc)                           # «рука владельца» уже положила файл
+        before = _sha(p)
+        real_exists = os.path.exists
+        with mock.patch.object(accounts.os.path, "exists",
+                               lambda x: False if x == p else real_exists(x)):   # проверка его «не видела»
+            with self.assertRaises(FileExistsError):
+                accounts.create(rows, 1, self.repo)
+        self.assertEqual(_sha(p), before)
+        self.assertFalse(real_exists(p + ".tmp"))
+
+
+class TestClientGateNotWeakened(unittest.TestCase):
+    u"""Находка ревью 25.09: ворота входа клиентского контура (`client_contour.mentions`) ищут в тексте
+    задания голый stem КАЖДОГО модуля корня. Модуль с именем-словом прозы (`accounts`) делал бы
+    находку «клиенту не приходят ответы про accounts» ВНУТРЕННЕЙ вместо fail-closed «клиентской».
+    Модули этой правки обязаны не менять вердикт ворот ни на одном таком тексте."""
+
+    TEXTS = (u"клиенту не приходят ответы про accounts", u"account клиента заблокирован",
+             u"Accounts page shows wrong price to the client")
+
+    def test_prose_word_does_not_name_our_modules(self):
+        import client_contour as cc
+        cl = cc.closure(HERE)
+        self.assertTrue(cl.ok)
+        for text in self.TEXTS:
+            with self.subTest(text=text):
+                self.assertEqual(cc.mentions(text, repo=HERE, cl=cl), (True, [], False))
+
+    def test_our_modules_stay_out_of_the_client_closure(self):
+        import client_contour as cc
+        cl = cc.closure(HERE)
+        for mod in ("accounts_registry.py", "accounts_run.py", "vps_token_install.py"):
+            with self.subTest(mod=mod):
+                self.assertFalse(cc.is_client(mod, cl=cl))
+        self.assertFalse(os.path.exists(os.path.join(HERE, "accounts.py")))   # имя-слово не вернулось
+
+
 class TestPurity(unittest.TestCase):
     ALLOWED = {"io", "json", "os", "re", "collections", "profile_choice"}
 
     def setUp(self):
-        with io.open(os.path.join(HERE, "accounts.py"), encoding="utf-8") as f:
+        with io.open(os.path.join(HERE, "accounts_registry.py"), encoding="utf-8") as f:
             self.tree = ast.parse(f.read())
 
     def test_imports_are_narrow(self):
