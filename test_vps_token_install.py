@@ -396,5 +396,639 @@ class Pure(unittest.TestCase):
                                      u"%s зовёт .%s" % (name, node.attr))
 
 
+# ═══════════════════ 25.09.2026: слоты любой буквы, `--use`, `--slot` — НА КОПИИ ═══════════════════
+import io
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+
+def _copy_env(slots):
+    u"""Синтетическая КОПИЯ файла окружения во временном каталоге (системный temp, префикс
+    `uchetki_2509_`; не удаляется — запрет «ничего не удалять»). `slots` — {буква: значение|""}."""
+    d = tempfile.mkdtemp(prefix="uchetki_2509_")
+    path = os.path.join(d, "executor-environment-copy")
+    lines = [u"# синтетика, боевых значений нет", vti.NAME_ACTIVE + "=" + vti.synth_value("Act")]
+    for letter, val in sorted(slots.items()):
+        lines.append(vti.SLOT_PREFIX + letter + "=" + val)
+    with io.open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(u"\n".join(lines) + u"\n")
+    return d, path
+
+
+def _read(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _val(text, name):
+    found = ""
+    for line in text.splitlines():
+        k, _, v = line.partition("=")
+        if k.strip() == name:
+            found = v.strip()
+    return found
+
+
+class _LocalServer(object):
+    u"""Сервер, который исполняет СВОИ программы ЛОКАЛЬНО против КОПИИ файла окружения.
+
+    Серверные программы (`_RS_PREFLIGHT`, `_RS_USE`, `_RS_APPLY`, `_RS_RESTORE`) идут НАСТОЯЩИЕ —
+    тем же интерпретатором, что и тест, и правят КОПИЮ по-настоящему. Подменено только то, чего у
+    копии нет: каталог процессов (`proc` — пустой либо фальшивое дерево теста; счёт заходов можно
+    задать прямо `busy`), рестарт юнита (счётчик), отметка жизни демона (`marks` — по вызову) и
+    ответ поставщика (`answer` по имени входа). Проба `bash -s` читает копию и сравнивает значения
+    так же, как программа пробы на сервере, — наружу из неё уходят только признаки."""
+
+    MARK = "MainPID=4242\nExecMainStartTimestampMonotonic=100\n"
+
+    def __init__(self, target, answer=None, busy=None, busy_after=None, restart_ok=True, proc=None,
+                 marks=None, fail_preflight_after=None):
+        self.target, self.busy, self.busy_after, self.restart_ok = target, busy, busy_after, restart_ok
+        self.answer = answer or {}
+        self.proc = proc or tempfile.mkdtemp(prefix="uchetki_2509_proc_")
+        self.marks = list(marks) if marks is not None else None
+        self.fail_preflight_after = fail_preflight_after
+        self.calls, self.restarts, self.preflights, self.probed = [], 0, 0, []
+        self.file_at_restart = []
+
+    def ssh_run(self, cmd, stdin_text=None, timeout=None):
+        self.calls.append(cmd)
+        if cmd == vti._REMOTE_BOOT:
+            program = base64.b64decode(stdin_text).decode("utf-8")
+            is_pre = "busy_claude" in program
+            if is_pre:
+                self.preflights += 1
+                if self.fail_preflight_after is not None and self.preflights > self.fail_preflight_after:
+                    return 255, u"ssh не ответил за 90 с"
+                # список процессов копии не принадлежит: каталог процессов — свой у теста
+                program = program.replace("PROC = '/proc'", "PROC = %r" % self.proc)
+            p = subprocess.run([sys.executable, "-"], input=program.encode("utf-8"),
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
+                               env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+            out = p.stdout.decode("utf-8", "replace")
+            want = self.busy if (self.busy_after is None or self.preflights == 1) else self.busy_after
+            if is_pre and want is not None:
+                out = re.sub(r"busy_claude=\d+", "busy_claude=%d" % want, out)
+            return p.returncode, out
+        if cmd == "bash -s":
+            m = re.search(r'if \[ -z "\$\{(\w+)\}" \]', stdin_text)
+            name = m.group(1)
+            self.probed.append(name)
+            with io.open(self.target, encoding="utf-8") as f:
+                text = f.read()
+            val, act = _val(text, name), _val(text, vti.NAME_ACTIVE)
+            if not val:
+                return 0, _probe_out("0", filled="0")
+            env_text = self.answer.get(name, self.answer.get("*", ENV_OK))
+            rc = 0 if env_text == ENV_OK else 1
+            after = self.answer.get("file_after_start")
+            return 0, _probe_out("1" if val == act else "0", rc=rc, envelope=env_text,
+                                 mtime=300 if after else 100, start=200)
+        if cmd.startswith("systemctl restart"):
+            self.restarts += 1
+            self.file_at_restart.append(_read(self.target))   # С КАКИМ файлом поднимается демон
+            # Живая форма: `restart; show` отдаёт код ПОСЛЕДНЕЙ команды (show) = 0 даже при провале
+            # рестарта — провал виден только полем ActiveState. Код 1 здесь спрятал бы эту проверку.
+            if not self.restart_ok:
+                return 0, "MainPID=0\nActiveState=failed\nSubState=failed\nNRestarts=1\n"
+            return 0, "MainPID=4242\nActiveState=active\nSubState=running\nNRestarts=0\n"
+        if cmd.startswith("systemctl show") and "ExecMainStartTimestampMonotonic" in cmd:
+            if self.marks is None:
+                return 0, self.MARK
+            mark = self.marks.pop(0) if len(self.marks) > 1 else self.marks[0]
+            return (0, mark) if mark else (1, u"")
+        return 1, u"неожиданная команда в тесте: %s" % cmd
+
+
+def _fake_proc(procs):
+    u"""Фальшивый каталог процессов: {pid: (cmdline-байты, cgroup-текст | None)}."""
+    d = tempfile.mkdtemp(prefix="uchetki_2509_proc_")
+    for pid, (cmd, cg) in procs.items():
+        os.mkdir(os.path.join(d, str(pid)))
+        with open(os.path.join(d, str(pid), "cmdline"), "wb") as f:
+            f.write(cmd)
+        if cg is not None:
+            with io.open(os.path.join(d, str(pid), "cgroup"), "w", encoding="utf-8") as f:
+                f.write(cg)
+    os.mkdir(os.path.join(d, "self"))                  # нечисловое имя обязано пропускаться
+    return d
+
+
+class _WithServer(unittest.TestCase):
+    def serve(self, target, **kw):
+        srv = _LocalServer(target, **kw)
+        self.addCleanup(setattr, vti, "ssh_run", vti.ssh_run)
+        self.addCleanup(setattr, vti, "ENV_PATH_FORCED", vti.ENV_PATH_FORCED)
+        vti.ssh_run = srv.ssh_run
+        vti.ENV_PATH_FORCED = target            # адрес «назвал человек» — systemctl show не зовём
+        return srv
+
+    def backups(self, d):
+        return sorted(x for x in os.listdir(d) if ".bak-" in x)
+
+
+class SlotNames(unittest.TestCase):
+    def test_letter_to_name_and_refusals(self):
+        self.assertEqual(vti.slot_name("c"), "TB_CLAUDE_TOKEN_C")
+        for bad in ("", "AB", "1", "Ж", "C; rm", None):
+            with self.assertRaises(ValueError):
+                vti.slot_name(bad)
+
+    def test_probe_script_accepts_any_letter_but_not_garbage(self):
+        vti.probe_slot_script("/etc/a/one", "TB_CLAUDE_TOKEN_Q")
+        for bad in ("TB_CLAUDE_TOKEN_QQ", "TB_CLAUDE_TOKEN_", "HOME", "TB_CLAUDE_TOKEN_A; id",
+                    "TB_CLAUDE_TOKEN_A\n"):                        # `$` регулярки пропустил бы перевод строки
+            with self.assertRaises(ValueError):
+                vti.probe_slot_script("/etc/a/one", bad)
+
+    def test_names_from_preflight_and_order(self):
+        names = vti.names_from_preflight("2:CLAUDE_CODE_OAUTH_TOKEN:108,3:TB_CLAUDE_TOKEN_B:108,"
+                                         "4:TB_CLAUDE_TOKEN_A:108,5:TB_CLAUDE_TOKEN_C:0,6:PATH:9")
+        self.assertEqual(names["TB_CLAUDE_TOKEN_C"], 0)
+        self.assertEqual(vti.probe_names_of(names),
+                         (vti.NAME_ACTIVE, "TB_CLAUDE_TOKEN_A", "TB_CLAUDE_TOKEN_B", "TB_CLAUDE_TOKEN_C"))
+        self.assertEqual(vti.probe_names_of({}), vti.PROBE_NAMES)      # разведки нет — прежние три
+
+    def test_reset_only_on_429_and_in_provider_words(self):
+        r = vti.slot_row(vti.NAME_SLOT_B, _probe_out("0", envelope=ENV_429))
+        self.assertEqual(r["reset"], u"Sep 27, 9am (UTC)")
+        r = vti.slot_row(vti.NAME_SLOT_A, _probe_out("0", envelope=ENV_401))
+        self.assertEqual(r["reset"], u"")                          # мина 71r: на 401 не ищем
+        env = '{"is_error":true,"api_error_status":429,"result":"Claude AI usage limit reached|1790499600"}'
+        self.assertIn(u"UTC", vti.slot_row(vti.NAME_SLOT_A, _probe_out("0", envelope=env))["reset"])
+        env = ('{"is_error":true,"api_error_status":429,'
+               '"result":"You\'ve hit your session limit · resets 4am (Asia/Bangkok)."}')
+        self.assertEqual(vti.slot_row(vti.NAME_SLOT_A, _probe_out("0", envelope=env))["reset"],
+                         u"4am (Asia/Bangkok)")
+
+
+class UseSlotOnCopy(_WithServer):
+    u"""`--use X` на КОПИИ. Отрицательные тесты задания: пустой слот и 401 после записи."""
+
+    def test_empty_slot_never_becomes_active(self):
+        u"""ПУСТОЙ СЛОТ НЕ СТАНОВИТСЯ ДЕЙСТВУЮЩИМ: файл побайтно тот же, копии нет, рестартов 0."""
+        d, path = _copy_env({"A": vti.synth_value("Aa1"), "C": ""})
+        before = _read(path)
+        srv = self.serve(path)
+        res = vti.use_slot("C", work=None, stamp="20260925-000000Z")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["stage"], "slot_empty")
+        self.assertEqual(_read(path), before)
+        self.assertEqual(self.backups(d), [])
+        self.assertEqual((srv.restarts, srv.probed), (0, []))
+        self.assertIn(u"пустой слот", u" ".join(res["lines"]))
+
+    def test_empty_slot_refused_by_server_program_itself(self):
+        u"""Второй рубеж: сама серверная программа отказывает пустому слоту ДО копии и записи."""
+        d, path = _copy_env({"C": ""})
+        before = _read(path)
+        srv = self.serve(path)
+        prog = vti._remote_program(vti._RS_USE, TARGET=path, SLOT_NAME="TB_CLAUDE_TOKEN_C",
+                                   ACTIVE_NAME=vti.NAME_ACTIVE, BAK=vti.backup_name(path, "X"))
+        rc, fields, _raw = vti.run_remote_py(prog)
+        self.assertEqual((fields.get("slot_filled"), fields.get("err")), ("0", "slot_empty"))
+        self.assertEqual(_read(path), before)
+        self.assertEqual(self.backups(d), [])
+        self.assertEqual(srv.restarts, 0)
+
+    def test_401_after_use_rolls_back_the_copy(self):
+        u"""401 ПОСЛЕ --use ОТКАТЫВАЕТ КОПИЮ: файл побайтно прежний, копия на месте, рестартов 0."""
+        d, path = _copy_env({"A": vti.synth_value("Aa1"), "B": vti.synth_value("Bb2")})
+        before = _read(path)
+        srv = self.serve(path, answer={vti.NAME_ACTIVE: ENV_401})
+        res = vti.use_slot("B", work=None, stamp="20260925-000001Z")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["stage"], "probe")
+        self.assertTrue(res["rolled_back"])
+        self.assertEqual(_read(path), before, u"файл после 401 не вернулся к копии")
+        baks = self.backups(d)
+        self.assertEqual(len(baks), 1, u"копия обязана остаться на диске")
+        self.assertEqual(_read(os.path.join(d, baks[0])), before)
+        self.assertEqual(srv.restarts, 0, u"демон не должен был перезапускаться")
+        self.assertEqual(srv.probed, [vti.NAME_ACTIVE])            # ровно одна проба
+
+    def test_429_after_use_rolls_back_too(self):
+        d, path = _copy_env({"B": vti.synth_value("Bb2")})
+        before = _read(path)
+        srv = self.serve(path, answer={vti.NAME_ACTIVE: ENV_429})
+        res = vti.use_slot("B", work=None, stamp="20260925-000002Z")
+        self.assertEqual((res["ok"], res["stage"], srv.restarts), (False, "probe", 0))
+        self.assertEqual(_read(path), before)
+
+    def test_green_use_switches_active_and_restarts_once(self):
+        u"""Близнец отрицательных: зелёная проба → действующее = слот B, прочие строки те же, ОДИН рестарт."""
+        slot_b = vti.synth_value("Bb2")
+        d, path = _copy_env({"A": vti.synth_value("Aa1"), "B": slot_b})
+        before = _read(path).decode("utf-8")
+        srv = self.serve(path)
+        res = vti.use_slot("B", work=None, stamp="20260925-000003Z")
+        self.assertTrue(res["ok"], res["lines"])
+        self.assertEqual(res["stage"], "done")
+        with io.open(path, encoding="utf-8") as f:
+            after = f.read()
+        self.assertEqual(_val(after, vti.NAME_ACTIVE), slot_b)
+        for name in ("TB_CLAUDE_TOKEN_A", "TB_CLAUDE_TOKEN_B"):
+            self.assertEqual(_val(after, name), _val(before, name))
+        self.assertEqual(srv.restarts, 1)
+        self.assertEqual(len(self.backups(d)), 1)
+        with io.open(path, "rb") as f:
+            self.assertEqual(srv.file_at_restart, [f.read()])      # поднялся уже на новом файле
+        joined = u"\n".join(res["lines"])
+        self.assertNotIn(slot_b, joined)                           # значение не выходит наружу
+        self.assertNotIn(vti.TOKEN_PREFIX, joined)
+
+    def test_busy_server_is_not_restarted_and_file_untouched(self):
+        d, path = _copy_env({"B": vti.synth_value("Bb2")})
+        before = _read(path)
+        srv = self.serve(path, busy=1)
+        res = vti.use_slot("B", work=None)
+        self.assertEqual((res["ok"], res["stage"], srv.restarts), (False, "busy", 0))
+        self.assertEqual(_read(path), before)
+        self.assertEqual(self.backups(d), [])
+        self.assertIn(u"НЕ перезапускаю", u" ".join(res["lines"]))
+
+    def test_task_started_during_probe_rolls_back_without_restart(self):
+        d, path = _copy_env({"B": vti.synth_value("Bb2")})
+        before = _read(path)
+        srv = self.serve(path, busy=0, busy_after=1)
+        res = vti.use_slot("B", work=None, stamp="20260925-000004Z")
+        self.assertEqual((res["ok"], res["stage"], srv.restarts), (False, "busy_late", 0))
+        self.assertEqual(_read(path), before)
+
+    def test_failed_restart_restores_and_raises_back(self):
+        d, path = _copy_env({"B": vti.synth_value("Bb2")})
+        before = _read(path)
+        srv = self.serve(path, restart_ok=False)
+        res = vti.use_slot("B", work=None, stamp="20260925-000005Z")
+        self.assertEqual((res["ok"], res["stage"]), (False, "restart"))
+        self.assertEqual(_read(path), before)
+        self.assertEqual(srv.restarts, 2)                          # неудачный + «поднять обратно»
+
+    def test_already_active_writes_nothing(self):
+        d, path = _copy_env({"B": ""})
+        with io.open(path, encoding="utf-8") as f:
+            text = f.read()
+        act = _val(text, vti.NAME_ACTIVE)
+        with io.open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text.replace(vti.SLOT_PREFIX + "B=", vti.SLOT_PREFIX + "B=" + act))
+        before = _read(path)
+        srv = self.serve(path)
+        res = vti.use_slot("B", work=None)
+        self.assertEqual((res["stage"], srv.restarts), ("already", 0))
+        self.assertEqual(_read(path), before)
+        self.assertEqual(self.backups(d), [])
+
+
+DAEMON_CG = "0::/system.slice/orchestrator-daemon.service\n"
+OWNER_CG = "0::/user.slice/user-0.slice/session-3.scope\n"          # tmux `cc` владельца
+
+
+class BusyByDaemonCgroup(_WithServer):
+    u"""«Идёт заход» — это claude ВНУТРИ cgroup демона. Живая сессия владельца в tmux `cc` слову
+    «учётка N» не мешает; процесс, чью cgroup не прочитать, — «не проверено», рестарта нет."""
+
+    def facts(self, procs):
+        d, path = _copy_env({"B": vti.synth_value("Bb2")})
+        self.serve(path, proc=_fake_proc(procs))
+        ok, facts, _w = vti.preflight(path)
+        self.assertTrue(ok)
+        return facts
+
+    def test_owner_session_is_not_a_daemon_task(self):
+        facts = self.facts({101: (b"claude\x00--resume", OWNER_CG), 102: (b"python3\x00x.py", DAEMON_CG)})
+        self.assertEqual(vti.busy_of(facts)[0], 0)
+        self.assertEqual(facts.get("busy_claude_all"), "1")
+
+    def test_daemon_child_is_busy(self):
+        facts = self.facts({201: (b"/usr/bin/claude\x00-p\x00x", DAEMON_CG), 202: (b"claude", OWNER_CG)})
+        self.assertEqual(vti.busy_of(facts)[0], 1)
+
+    def test_unreadable_cgroup_is_unknown_not_zero(self):
+        facts = self.facts({301: (b"claude\x00-p", None)})
+        n, words = vti.busy_of(facts)
+        self.assertIsNone(n)
+        self.assertIn(u"неизвестно", words)
+
+    def test_missing_field_is_unknown(self):
+        self.assertIsNone(vti.busy_of({})[0])
+        self.assertIsNone(vti.busy_of({"busy_claude": ""})[0])
+
+    def test_use_goes_through_with_owner_session_open(self):
+        d, path = _copy_env({"B": vti.synth_value("Bb2")})
+        srv = self.serve(path, proc=_fake_proc({101: (b"claude", OWNER_CG)}))
+        res = vti.use_slot("B", work=None, stamp="20260925-000010Z")
+        self.assertEqual((res["ok"], res["stage"], srv.restarts), (True, "done", 1), res["lines"])
+
+    def test_use_refuses_on_unknown_busy(self):
+        d, path = _copy_env({"B": vti.synth_value("Bb2")})
+        before = _read(path)
+        srv = self.serve(path, proc=_fake_proc({301: (b"claude", None)}))
+        res = vti.use_slot("B", work=None)
+        self.assertEqual((res["ok"], res["stage"], srv.restarts), (False, "busy", 0))
+        self.assertEqual(_read(path), before)
+        self.assertIn(u"не проверено", u" ".join(res["lines"]))
+
+
+class DaemonRestartedDuringProbe(_WithServer):
+    u"""Проба стоит ДО рестарта. Если демон САМ перезапустился, пока шла проба (Restart=always,
+    отложенный рестарт задачи), он схватил отвергнутый вход — возврата файла мало, нужен один рестарт."""
+
+    M0 = "MainPID=4242\nExecMainStartTimestampMonotonic=100\n"
+    M1 = "MainPID=5555\nExecMainStartTimestampMonotonic=900\n"
+
+    def test_refused_probe_and_daemon_restarted_meanwhile(self):
+        d, path = _copy_env({"B": vti.synth_value("Bb2")})
+        before = _read(path)
+        srv = self.serve(path, answer={vti.NAME_ACTIVE: ENV_401}, marks=[self.M0, self.M1])
+        res = vti.use_slot("B", work=None, stamp="20260925-000011Z")
+        self.assertEqual((res["ok"], res["stage"], res["rolled_back"]), (False, "probe", True))
+        self.assertEqual(_read(path), before)
+        self.assertEqual(srv.restarts, 1, u"демон с отвергнутым входом обязан подняться на прежнем")
+        self.assertEqual(srv.file_at_restart, [before], u"рестарт обязан идти ПОСЛЕ возврата файла")
+        self.assertIn(u"поднят заново на прежнем значении", u" ".join(res["lines"]))
+
+    def test_refused_probe_and_mark_unknown_restarts_once(self):
+        d, path = _copy_env({"B": vti.synth_value("Bb2")})
+        srv = self.serve(path, answer={vti.NAME_ACTIVE: ENV_401}, marks=[""])
+        res = vti.use_slot("B", work=None, stamp="20260925-000012Z")
+        self.assertEqual((res["stage"], srv.restarts), ("probe", 1))
+
+    def test_refused_probe_daemon_steady_no_restart(self):
+        d, path = _copy_env({"B": vti.synth_value("Bb2")})
+        srv = self.serve(path, answer={vti.NAME_ACTIVE: ENV_401}, marks=[self.M0, self.M0])
+        res = vti.use_slot("B", work=None, stamp="20260925-000013Z")
+        self.assertEqual((res["stage"], srv.restarts), ("probe", 0))
+
+    def test_second_preflight_lost_is_not_a_green_light(self):
+        u"""Повторная разведка оборвалась → «не проверено», а не «не занято»: рестарта нет, файл назад."""
+        d, path = _copy_env({"B": vti.synth_value("Bb2")})
+        before = _read(path)
+        srv = self.serve(path, fail_preflight_after=1)
+        res = vti.use_slot("B", work=None, stamp="20260925-000014Z")
+        self.assertEqual((res["ok"], res["stage"], srv.restarts), (False, "busy_late", 0))
+        self.assertEqual(_read(path), before)
+
+    def test_already_active_but_daemon_older_than_file(self):
+        d, path = _copy_env({"B": ""})
+        with io.open(path, encoding="utf-8") as f:
+            text = f.read()
+        act = _val(text, vti.NAME_ACTIVE)
+        with io.open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text.replace(vti.SLOT_PREFIX + "B=", vti.SLOT_PREFIX + "B=" + act))
+        before = _read(path)
+        srv = self.serve(path, answer={"file_after_start": True})
+        res = vti.use_slot("B", work=None)
+        self.assertEqual((res["stage"], res["ok"], srv.restarts), ("already", True, 1))
+        self.assertEqual(_read(path), before)
+
+    def test_already_active_older_daemon_but_busy_now(self):
+        d, path = _copy_env({"B": ""})
+        with io.open(path, encoding="utf-8") as f:
+            text = f.read()
+        act = _val(text, vti.NAME_ACTIVE)
+        with io.open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text.replace(vti.SLOT_PREFIX + "B=", vti.SLOT_PREFIX + "B=" + act))
+        srv = self.serve(path, answer={"file_after_start": True}, busy=0, busy_after=1)
+        res = vti.use_slot("B", work=None)
+        self.assertEqual((res["stage"], res["ok"], srv.restarts), ("already", False, 0))
+        self.assertIn(u"рестарт НЕ делаю", u" ".join(res["lines"]))
+
+
+class InstallSlotOnCopy(_WithServer):
+    u"""`--slot X` на КОПИИ: пишется ТОЛЬКО слот X; 401 → откат; 429 → оставлен; рестартов нет."""
+
+    def test_only_named_slot_changes(self):
+        d, path = _copy_env({"A": vti.synth_value("Aa1"), "B": vti.synth_value("Bb2")})
+        before = _read(path).decode("utf-8")
+        srv = self.serve(path, answer={"TB_CLAUDE_TOKEN_C": ENV_429})
+        new = vti.synth_value("Cc3")
+        res = vti.install_slot("C", new, work=None, stamp="20260925-000006Z")
+        self.assertTrue(res["ok"], res["lines"])
+        with io.open(path, encoding="utf-8") as f:
+            after = f.read()
+        self.assertEqual(_val(after, "TB_CLAUDE_TOKEN_C"), new)
+        for name in (vti.NAME_ACTIVE, "TB_CLAUDE_TOKEN_A", "TB_CLAUDE_TOKEN_B"):
+            self.assertEqual(_val(after, name), _val(before, name))
+        self.assertEqual(srv.restarts, 0)
+        self.assertEqual(srv.probed, ["TB_CLAUDE_TOKEN_C"])
+        self.assertNotIn(new, u"\n".join(res["lines"]))
+
+    def test_401_on_slot_rolls_back(self):
+        d, path = _copy_env({"C": vti.synth_value("Old")})
+        before = _read(path)
+        self.serve(path, answer={"TB_CLAUDE_TOKEN_C": ENV_401})
+        res = vti.install_slot("C", vti.synth_value("Cc3"), work=None, stamp="20260925-000007Z")
+        self.assertEqual((res["ok"], res["stage"], res["rolled_back"]), (False, "probe", True))
+        self.assertEqual(_read(path), before)
+
+    def test_bad_shape_never_reaches_server(self):
+        d, path = _copy_env({"C": ""})
+        srv = self.serve(path)
+        res = vti.install_slot("C", "fake-" + "x" * 100, work=None)
+        self.assertEqual(res["stage"], "shape")
+        self.assertEqual(srv.calls, [])
+
+
+class ProbeAllSlotsOnCopy(_WithServer):
+    u"""`--probe-slots` меряет действующее и КАЖДЫЙ слот из файла: одна проба на имя, пустой — без вызова."""
+
+    def test_every_slot_letter_is_probed(self):
+        d, path = _copy_env({"A": vti.synth_value("Aa1"), "B": vti.synth_value("Bb2"), "D": ""})
+        before = _read(path)
+        srv = self.serve(path, answer={"TB_CLAUDE_TOKEN_B": ENV_429})
+        res = vti.probe_all_slots(work=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual([r["name"] for r in res["rows"]],
+                         [vti.NAME_ACTIVE, "TB_CLAUDE_TOKEN_A", "TB_CLAUDE_TOKEN_B", "TB_CLAUDE_TOKEN_D"])
+        self.assertEqual(srv.probed, [r["name"] for r in res["rows"]])
+        words = {r["name"]: (r["code"], r["word"]) for r in res["rows"]}
+        self.assertEqual(words["TB_CLAUDE_TOKEN_B"], (429, vti.LIMIT))
+        self.assertEqual(words["TB_CLAUDE_TOKEN_D"], (None, u"пуст"))
+        self.assertEqual((_read(path), srv.restarts), (before, 0))   # перемер ничего не пишет
+
+
+class ChannelCutAndBadCopy(_WithServer):
+    u"""Канал оборвался на записи и копия не сошлась с оригиналом: исход НЕ угадывается.
+
+    Обрыв после записи — файл уже другой, строки `backup=` в выводе нет: без возврата по ожидаемому
+    имени копии действующим остался бы НЕПРОВЕРЕННЫЙ вход. Обрыв до записи — копии нет, возвращать
+    нечего, и об этом сказано. Копия не сошлась — возврат из неё был бы порчей, его нет."""
+
+    def _cut(self, srv, ran):
+        real = srv.ssh_run
+
+        def cut(cmd, stdin_text=None, timeout=None):
+            if cmd == vti._REMOTE_BOOT and "already_active" in base64.b64decode(stdin_text).decode("utf-8"):
+                if ran:
+                    real(cmd, stdin_text, timeout)              # программа отработала, ответ потерян
+                return 255, u"ssh не ответил за 90 с"
+            return real(cmd, stdin_text, timeout)
+        vti.ssh_run = cut
+
+    def test_cut_after_write_restores_by_expected_backup(self):
+        d, path = _copy_env({"A": vti.synth_value("Aa1"), "B": vti.synth_value("Bb2")})
+        before = _read(path)
+        srv = self.serve(path)
+        self._cut(srv, ran=True)
+        res = vti.use_slot("B", work=None, stamp="20260925-000010Z")
+        self.assertEqual((res["ok"], res["stage"], res["rolled_back"]), (False, "write", True))
+        self.assertEqual(_read(path), before, u"после обрыва файл не вернулся")
+        self.assertEqual(self.backups(d), [os.path.basename(vti.backup_name(path, "20260925-000010Z"))])
+        self.assertEqual((srv.restarts, srv.probed), (0, []))
+        self.assertIn(u"НЕИЗВЕСТНО", u" ".join(res["lines"]))
+
+    def test_cut_before_write_says_nothing_to_restore(self):
+        d, path = _copy_env({"B": vti.synth_value("Bb2")})
+        before = _read(path)
+        srv = self.serve(path)
+        self._cut(srv, ran=False)
+        res = vti.use_slot("B", work=None, stamp="20260925-000011Z")
+        self.assertEqual((res["ok"], res["stage"], res["rolled_back"]), (False, "write", False))
+        self.assertEqual(_read(path), before)
+        self.assertEqual(self.backups(d), [])
+        self.assertEqual(srv.restarts, 0)
+        self.assertIn(u"запись до файла не дошла", u" ".join(res["lines"]))
+
+    def test_backup_mismatch_is_never_restored_from(self):
+        d, path = _copy_env({"B": vti.synth_value("Bb2")})
+        srv = self.serve(path)
+        real, seen = srv.ssh_run, []
+
+        def mismatch(cmd, stdin_text=None, timeout=None):
+            if cmd == vti._REMOTE_BOOT:
+                prog = base64.b64decode(stdin_text).decode("utf-8")
+                seen.append(prog)
+                if "already_active" in prog:
+                    return 4, u"slot_filled=1\nalready_active=0\nbackup=%s.bak-x\nerr=backup_mismatch\n" % path
+            return real(cmd, stdin_text, timeout)
+        vti.ssh_run = mismatch
+        res = vti.use_slot("B", work=None, stamp="20260925-000012Z")
+        self.assertEqual((res["ok"], res["stage"], res["rolled_back"], srv.restarts), (False, "write", False, 0))
+        self.assertFalse(any("restored_ok" in p for p in seen), u"возврат из несошедшейся копии")
+        self.assertIn(u"не возвращаем", u" ".join(res["lines"]))
+
+    def test_twin_clean_write_is_not_treated_as_cut(self):
+        d, path = _copy_env({"B": vti.synth_value("Bb2")})
+        srv = self.serve(path)
+        res = vti.use_slot("B", work=None, stamp="20260925-000013Z")
+        self.assertEqual((res["ok"], res["stage"], srv.restarts), (True, "done", 1))
+
+
+class MainRefusals(unittest.TestCase):
+    u"""`--slot` и `--use` разом — отказ ДО ssh: неясно, какой слот сделать действующим."""
+
+    def test_slot_and_use_together_refused_without_ssh(self):
+        from unittest import mock
+        boom = mock.Mock(side_effect=AssertionError("ssh при --slot+--use"))
+        clean = dict((k, v) for k, v in os.environ.items()
+                     if k not in ("PRETOOL_ASK_MARKER", "PRETOOL_MARKER_TOKEN", "GIT_SERIAL_PC_OWNER"))
+        with mock.patch.dict(os.environ, clean, clear=True), mock.patch.object(vti, "ssh_run", boom), \
+                mock.patch.object(vti, "_ask_value", side_effect=AssertionError("спросили значение")):
+            self.assertEqual(vti.main(["--slot", "B", "--use", "C"]), 2)
+        boom.assert_not_called()
+
+    def test_remote_boot_is_unbuffered(self):
+        u"""`python3 -u`: при обрыве канала уже напечатанные строки (`backup=`) не застревают в буфере."""
+        self.assertEqual(vti._REMOTE_BOOT.split("|")[-1].split(), ["python3", "-u"])
+
+
+class RemoteWritesAreBinary(unittest.TestCase):
+    u"""Замок Windows: каждая запись `os.open` в программах для сервера — с `O_BINARY`.
+
+    Без флага Windows пишет `os.write` в ТЕКСТОВОМ режиме (\\n → \\r\\n), обратное чтение расходится
+    с записанным, и тесты «на копии» краснеют в гейте самообновления ПК (на Linux это не видно)."""
+
+    def test_every_os_open_write_carries_o_binary(self):
+        for name in ("_RS_APPLY", "_RS_USE"):
+            src = getattr(vti, name)
+            opens = [l for l in src.splitlines() if "os.open(" in l]
+            self.assertTrue(opens, name)
+            for l in opens:
+                self.assertIn('getattr(os, "O_BINARY", 0)', l, u"%s: %s" % (name, l.strip()))
+
+
+class LegacyModeRespectsRegistry(unittest.TestCase):
+    u"""Старый режим пишет в действующее И в A. Когда A по реестру чей-то — отказ ДО ввода значения."""
+
+    @staticmethod
+    def _loader(text):
+        import accounts_registry as accounts
+        return lambda: (accounts.decode(text, "", "x"), accounts.ST_OK, accounts.ST_ABSENT)
+
+    def test_absent_registry_keeps_legacy(self):
+        self.assertEqual(vti.legacy_registry_guard(self._loader(None)), u"")
+
+    def test_slot_a_owned_refuses(self):
+        import json
+        text = json.dumps({"builders": 3, "accounts": {
+            "1": {"profile": u"ОСНОВНОЙ", "slot": "", "label": u"основная"},
+            "3": {"profile": "D:\\p3", "slot": "A", "label": u"третья"}}}, ensure_ascii=False)
+        words = vti.legacy_registry_guard(self._loader(text))
+        self.assertIn(u"№3", words)
+        self.assertIn(u"--slot", words)
+
+    def test_slot_a_free_keeps_legacy(self):
+        import json
+        text = json.dumps({"accounts": {"2": {"profile": "D:\\p2", "slot": "B", "label": u"вторая"}}})
+        self.assertEqual(vti.legacy_registry_guard(self._loader(text)), u"")
+
+    def test_broken_registry_refuses(self):
+        self.assertIn(u"неизвестно", vti.legacy_registry_guard(self._loader(u"{битый")))
+
+    def test_guard_runs_before_the_value_is_asked(self):
+        src = inspect.getsource(vti.main)
+        # последний вызов ввода — старый режим (ветка --slot спрашивает значение раньше и сама)
+        self.assertLess(src.index("legacy_registry_guard()"), src.rindex("_ask_value()"))
+
+
+class LegacyProbeIsCareful(_WithServer):
+    u"""Прежняя проба вписывания идёт той же аккуратной программой: stderr заглушён ДО чтения файла."""
+
+    def test_legacy_probe_uses_the_probe_program(self):
+        d, path = _copy_env({})
+        srv = self.serve(path, answer={vti.NAME_ACTIVE: ENV_401})
+        word, _why, _raw = vti.probe(path)
+        self.assertEqual(word, vti.DENIED)
+        self.assertEqual(srv.calls, ["bash -s"])
+        self.assertEqual(srv.probed, [vti.NAME_ACTIVE])
+        src = inspect.getsource(vti.probe)
+        self.assertIn("probe_slot_script(target, NAME_ACTIVE)", src)
+
+    def test_legacy_probe_green(self):
+        d, path = _copy_env({})
+        self.serve(path)
+        self.assertEqual(vti.probe(path)[0], vti.GREEN)
+
+
+class BuilderGate(unittest.TestCase):
+    u"""`--use`/`--slot`/`--probe-slots` и вписывание — ход владельца; из захода строителей отказ ДО ssh."""
+
+    def test_builder_child_refused_without_ssh(self):
+        from unittest import mock
+        boom = mock.Mock(side_effect=AssertionError("ssh из захода строителей"))
+        with mock.patch.dict(os.environ, {"PRETOOL_ASK_MARKER": "/tmp/m"}), \
+                mock.patch.object(vti, "ssh_run", boom):
+            for argv in (["--use", "A"], ["--slot", "C"], ["--probe-slots"], []):
+                with self.subTest(argv=argv):
+                    self.assertEqual(vti.main(argv), 3)
+        boom.assert_not_called()
+
+    def test_check_still_allowed(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"PRETOOL_ASK_MARKER": "/tmp/m"}), \
+                mock.patch.object(vti, "find_env_path", lambda: ("", u"нет адреса")):
+            self.assertEqual(vti.main(["--check"]), 2)          # дошёл до разведки, а не отказ по метке
+
+
+class SlotArg(unittest.TestCase):
+    def test_letter_passes_and_garbage_refused(self):
+        self.assertEqual(vti.resolve_slot_arg("c")[0], "C")
+        self.assertEqual(vti.resolve_slot_arg("CC")[0], "")
+        self.assertEqual(vti.resolve_slot_arg("")[0], "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

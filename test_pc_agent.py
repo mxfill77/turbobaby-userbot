@@ -793,5 +793,148 @@ class TestSafeModeAtBothRaisePlaces(unittest.TestCase):
         self.assertEqual(src.count("_safe_mode_gate("), 3)   # объявление + два места подъёма
 
 
+class TestAccountsWord(unittest.TestCase):
+    """«учётки» / «учётка N» (25.09.2026, задание «учётки одним словом»).
+
+    ОТРИЦАТЕЛЬНЫЕ ТЕСТЫ ЗАДАНИЯ: не владелец — отказ словами, дверь не поднимается; «учётка 9» —
+    доходит до двери ТОЛЬКО числом, отказ произносит дверь (реестр 1…3). Дверь `_accounts_cli`
+    подменена шпионом, отправка — сборщиком: наружу не уходит ничего, subprocess не зовётся."""
+
+    def setUp(self):
+        self.sent, self.door = [], []
+
+        async def _collect(context, chat_id, text, **kw):
+            self.sent.append(text)
+
+        def _spy(action, number=None):
+            self.door.append((action, number))
+            return "ДВЕРЬ: %s %s" % (action, number)
+        for name, val in (("_send", _collect), ("_accounts_cli", _spy)):
+            self.addCleanup(setattr, a, name, getattr(a, name))
+            setattr(a, name, val)
+
+    def say(self, text, uid=None):
+        msg = types.SimpleNamespace(text=text, message_thread_id=a.HQ_THREAD_ID)
+        update = types.SimpleNamespace(
+            effective_message=msg, effective_chat=types.SimpleNamespace(id=a.HQ_CHAT_ID),
+            effective_user=types.SimpleNamespace(id=a.ALLOWED_USER_ID if uid is None else uid,
+                                                 username="owner", is_bot=False))
+
+        async def go():
+            # обработчик ставит дверь ФОНОВОЙ задачей и возвращается сразу; ответ двери дожидаемся
+            await a.on_message(update, types.SimpleNamespace(bot=None))
+            rest = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            if rest:
+                await asyncio.gather(*rest)
+        asyncio.run(go())
+
+    def test_stranger_is_refused_in_words_and_door_not_raised(self):
+        for word in ("учётки", "Учётка 3", "учетка 1", "учётка abc"):
+            with self.subTest(word):
+                self.sent.clear()
+                self.say(word, uid=777)
+                self.assertEqual(self.sent, [a.ACCOUNTS_DENIED])
+        self.assertEqual(self.door, [])
+
+    def test_owner_list_goes_to_door(self):
+        self.say("Учётки")
+        self.assertEqual(self.door, [("list", None)])
+        self.assertEqual(len(self.sent), 2)                 # «меряю…» + ответ двери
+        self.assertEqual(self.sent[-1], "ДВЕРЬ: list None")
+
+    def test_owner_init_goes_to_door_stranger_refused(self):
+        self.say("Учётки  заведи")
+        self.assertEqual(self.door, [("init", None)])
+        self.sent.clear()
+        self.say("учётки заведи", uid=777)
+        self.assertEqual(self.sent, [a.ACCOUNTS_DENIED])
+        self.assertEqual(self.door, [("init", None)])
+
+    def test_owner_nine_reaches_door_only_as_number(self):
+        self.say("учётка 9")
+        self.assertEqual(self.door, [("switch", "9")])
+        self.assertIn("№9", self.sent[0])
+
+    def test_garbage_number_refused_in_words(self):
+        for word in ("учётка", "учётка три", "учётка 100", "учётка 3; rm"):
+            with self.subTest(word):
+                self.sent.clear()
+                self.say(word)
+                self.assertEqual(self.sent, [a.ACCOUNTS_UNPARSED])
+        self.assertEqual(self.door, [])
+
+    def test_cli_argv_carries_only_digits(self):
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["argv"] = list(argv)
+            return types.SimpleNamespace(stdout="ok", stderr="", returncode=0)
+        with mock.patch.object(a.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(a, "VENV_PY", Path(sys.executable)):
+            door = a._accounts_cli                  # шпион setUp снимается на время прямого вызова
+            a._accounts_cli = type(self)._real_cli
+            try:
+                self.assertEqual(a._accounts_cli("switch", "03"), "ok")
+                self.assertEqual(seen["argv"][-2:], ["--switch", "3"])
+                self.assertEqual(a._accounts_cli("list"), "ok")
+                self.assertEqual(seen["argv"][-1], "--report")
+                self.assertEqual(a._accounts_cli("switch", "3; rm"), a.ACCOUNTS_UNPARSED)
+            finally:
+                a._accounts_cli = door
+
+    def test_handler_returns_before_the_door_answers(self):
+        u"""PTB разбирает сообщения по одному: обработчик обязан вернуться, пока дверь ещё работает."""
+        gate = {"returned": False}
+        real = a._background
+
+        def spy_bg(context, coro):
+            gate["returned"] = False
+            task = real(context, coro)
+            return task
+        self.addCleanup(setattr, a, "_background", real)
+        a._background = spy_bg
+        msg = types.SimpleNamespace(text="учётки", message_thread_id=a.HQ_THREAD_ID)
+        update = types.SimpleNamespace(
+            effective_message=msg, effective_chat=types.SimpleNamespace(id=a.HQ_CHAT_ID),
+            effective_user=types.SimpleNamespace(id=a.ALLOWED_USER_ID, username="owner", is_bot=False))
+
+        async def go():
+            await a.on_message(update, types.SimpleNamespace(bot=None))
+            gate["returned"] = True
+            self.assertEqual(self.door, [])              # дверь ещё не отработала — обработчик свободен
+            self.assertEqual(len(self.sent), 1)          # только «⏳ меряю…»
+            await asyncio.gather(*[t for t in asyncio.all_tasks() if t is not asyncio.current_task()])
+        asyncio.run(go())
+        self.assertTrue(gate["returned"])
+        self.assertEqual(self.door, [("list", None)])
+        self.assertEqual(self.sent[-1], "ДВЕРЬ: list None")
+        self.assertIsNone(a._ACCOUNTS_RUNNING["act"])    # замок снят после ответа
+
+    def test_second_word_while_running_is_refused(self):
+        self.addCleanup(a._ACCOUNTS_RUNNING.__setitem__, "act", None)
+        a._ACCOUNTS_RUNNING["act"] = "учётка 3"
+        self.say("учётка 2")
+        self.assertEqual(self.door, [])
+        self.assertEqual(self.sent, [a.ACCOUNTS_BUSY % "учётка 3"])
+
+    def test_self_restart_waits_for_accounts_word(self):
+        boom = mock.Mock(side_effect=AssertionError("агент перезапустился посреди слова учёток"))
+        self.addCleanup(setattr, a, "self_restart", a.self_restart)
+        a.self_restart = boom
+        self.addCleanup(a._ACCOUNTS_RUNNING.__setitem__, "act", None)
+        a._ACCOUNTS_RUNNING["act"] = "учётка 3"
+        self.say("обновись")
+        boom.assert_not_called()
+        self.assertIn("оборвал бы", self.sent[-1])
+
+    def test_commands_listed_in_help(self):
+        joined = "\n".join(a.KNOWN_COMMANDS)
+        self.assertIn("учётки", joined)
+        self.assertIn("учётка N", joined)
+
+
+TestAccountsWord._real_cli = staticmethod(a._accounts_cli)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
