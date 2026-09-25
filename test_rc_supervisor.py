@@ -474,7 +474,8 @@ class TestChildEnvProfileChoice(unittest.TestCase):
         self.tmp.cleanup()
 
     def _choice(self, text):
-        with open(os.path.join(self.repo, "claude_profile_choice.txt"), "w", encoding="utf-8") as f:
+        # с 25.09 у RC СВОЙ файл выбора (rc.RC_CHOICE_REL), общий со строителями он не читает
+        with open(os.path.join(self.repo, rc.RC_CHOICE_REL), "w", encoding="utf-8") as f:
             f.write(text)
 
     def test_main_word_drops_key_keeps_rest(self):

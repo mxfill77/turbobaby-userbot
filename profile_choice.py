@@ -127,14 +127,16 @@ def payload(text):
     return v, ""
 
 
-def decide(raw, err="", isdir=None):
+def decide(raw, err="", isdir=None, rel=CHOICE_REL):
     """ЧИСТОЕ решение: (сырой текст файла | None, причина отказа чтения) → Decision.
-    `isdir` инъектируется в тестах — иначе единственное обращение к диску здесь."""
+    `isdir` инъектируется в тестах — иначе единственное обращение к диску здесь. `rel` — имя
+    файла для причины: с 25.09 тем же разбором читается и СВОЙ файл RC (`rc_profile_choice.txt`),
+    и причина обязана называть файл, который на самом деле читали."""
     isdir = isdir or os.path.isdir
     if err:
-        return Decision(ACT_KEEP, "", "файл выбора %s не прочитан (%s)" % (CHOICE_REL, err))
+        return Decision(ACT_KEEP, "", "файл выбора %s не прочитан (%s)" % (rel, err))
     if raw is None:
-        return Decision(ACT_KEEP, "", "файла выбора %s нет" % CHOICE_REL)
+        return Decision(ACT_KEEP, "", "файла выбора %s нет" % rel)
     value, bad = payload(raw)
     if bad:
         # ВЕТКА «ИСПОРЧЕННОЕ ЗНАЧЕНИЕ НЕ ТРОГАЕТ ОКРУЖЕНИЕ». Соблазн поставить сюда `value` (то
@@ -161,7 +163,7 @@ def apply_to(env, repo=None, path=None, isdir=None, reader=None):
     ACT_KEEP не трогает `env` НИ ОДНИМ ключом — это проверяется тестом сравнением словарей
     целиком, а не наличием `KEY`."""
     raw, err = (reader or read_raw)(repo, path)
-    d = decide(raw, err, isdir)
+    d = decide(raw, err, isdir, os.path.basename(str(path)) if path else CHOICE_REL)
     if d.action == ACT_DROP:
         env.pop(KEY, None)
     elif d.action == ACT_SET:
@@ -169,11 +171,12 @@ def apply_to(env, repo=None, path=None, isdir=None, reader=None):
     return d
 
 
-def line(d, tid=None):
+def line(d, tid=None, subject="строителей"):
     """Строка для журнала захода. «Не применён» и «применён» звучат РАЗНЫМИ словами: третий
-    исход обязан называть себя, а не выглядеть успехом."""
+    исход обязан называть себя, а не выглядеть успехом. `subject` — чей выбор (с 25.09 тем же
+    разбором читает свой файл и RC: его строка обязана называть RC, а не строителей)."""
     who = ("id=%s " % tid) if tid is not None else ""
     if d.action == ACT_KEEP:
-        return ("%sвыбор учётки строителей НЕ ПРИМЕНЁН: %s — окружение ребёнка по %s не тронуто "
-                "(наследуется от демона)" % (who, d.reason, KEY))
-    return "%sвыбор учётки строителей: %s" % (who, d.reason)
+        return ("%sвыбор учётки %s НЕ ПРИМЕНЁН: %s — окружение ребёнка по %s не тронуто "
+                "(наследуется от демона)" % (who, subject, d.reason, KEY))
+    return "%sвыбор учётки %s: %s" % (who, subject, d.reason)

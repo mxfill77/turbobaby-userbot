@@ -71,7 +71,7 @@ import deploy_voice           # ГОЛОС подъёма ребёнка МИМ�
 import close_msg_pc           # ТРИ ЧЕЛОВЕЧЕСКИЕ СТРОКИ в начале сообщения о закрытии; чистая, ничего не судит
 import git_serial_pc          # ОДИН ИНДЕКС — ОДНА РУКА: замок ядра на git-писателей полосы (задача 238)
 import exit_evidence          # СВИДЕТЕЛЬСТВО ВЫХОДА процесса (код возврата + хвост stderr) и разведение «не дали работать»/«сломались»; чистый
-import profile_choice         # ВЫБОР УЧЁТКИ СТРОИТЕЛЕЙ: файл дерева решает судьбу CLAUDE_CONFIG_DIR у ребёнка; чистый, реестра не касается
+import accounts               # ВЫБОР УЧЁТКИ СТРОИТЕЛЕЙ (25.09): реестр учёток вне git решает судьбу CLAUDE_CONFIG_DIR у ребёнка; чистый (io/json/os/re + profile_choice)
 try:
     # Словарь ВИДОВ красных операций и разбор карточки — у гарда, и только у него: демону нужно
     # понять, НА ЧТО именно владелец сказал «да» (`kinds_from_card`), а держать второй список
@@ -2962,9 +2962,12 @@ def _run_task_impl(tid, text, note="", _mctx=None, approved=(), approved_object=
     # ровно здесь, при сборке окружения ребёнка. Реестр не трогается ни на чтение, ни на запись.
     # Третий исход (файла нет, пусто, мусор, путь не существует) НЕ трогает окружение ВОВСЕ и
     # называет причину строкой в журнале — это прежнее поведение байт-в-байт.
-    _pchoice = profile_choice.apply_to(env, REPO)
-    (log.warning if _pchoice.action == profile_choice.ACT_KEEP else log.info)(
-        "%s", profile_choice.line(_pchoice, tid))
+    # ★ 25.09.2026: решение переехало из файла дерева в РЕЕСТР УЧЁТОК ВНЕ GIT (`accounts.py`,
+    # `accounts_registry.json`). Файл дерева был в git, и его правка словом с телефона пачкала бы
+    # дерево и останавливала авто-фетч. Реестра нет/не разобран/номер или каталог не найден →
+    # ОСНОВНОЙ плюс WARNING (прямое требование задания), пустого значения нет ни на одной дороге.
+    _pchoice = accounts.apply_builders(env, REPO)
+    (log.warning if _pchoice.warn else log.info)("%s", accounts.line(_pchoice, tid))
     env["PYTHONIOENCODING"] = "utf-8"            # ребёнок пишет stdout/stderr в utf-8 → нет кракозябр (пара к encoding в run_claude)
     env[ASK_MARKER_ENV] = marker_path            # pretool_guard в headless пишет сюда красную карточку
     env[MARKER_TOKEN_ENV] = run_token            # …штампуя её нашим токеном — чужие карточки отсеем
@@ -6127,10 +6130,9 @@ def _thinker_exec(prompt, timeout, tag):
     # тоже ходит по подписке. Один класс — обе ветки спавна, иначе зеркальная течь: исполнитель
     # уехал бы на основной профиль, а думатель остался бы на том, что застряло в окружении
     # демона, — и разошлись бы они МОЛЧА. Равенство веток держит тест
-    # `test_profile_choice.TestBothSpawnBranchesAsk`.
-    _pchoice = profile_choice.apply_to(env, REPO)
-    (log.warning if _pchoice.action == profile_choice.ACT_KEEP else log.info)(
-        "%s: %s", tag, profile_choice.line(_pchoice))
+    # `test_profile_choice.TestBothSpawnBranchesAsk` (с 25.09 — реестр учёток, `accounts.py`).
+    _pchoice = accounts.apply_builders(env, REPO)
+    (log.warning if _pchoice.warn else log.info)("%s: %s", tag, accounts.line(_pchoice))
     env["PYTHONIOENCODING"] = "utf-8"
     # Глубина размышления ЯВНО. Нейтральный cwd (tempdir) — сознательное решение выше: он
     # отсекает hooks/pretool_guard репо. Но вместе с ними отсекается и `effortLevel` из
@@ -7813,6 +7815,13 @@ _ORCH_RUNTIME = ("pc_orchestrator.py", "gate_selective.py", "task_metrics.py",
                  # провалу задач, а не по строке. Модуль чистый (io/os/collections, инвариант
                  # PROFILE_CHOICE_PURE), замыкание не растит ни на файл.
                  "profile_choice.py",
+                 # 25.09.2026: РЕЕСТР УЧЁТОК. Верхний импорт (обе ветки спавна), цена грязи та же и
+                 # такая же молчаливая, что у `profile_choice.py` строкой выше, — теперь решение о
+                 # профиле строителей принимает он, а `profile_choice` стал его словарём. Сам реестр
+                 # (`accounts_registry.json`) — вне git и в этот список НЕ входит: его правка словом
+                 # «учётка N» дерево не пачкает по построению. Модуль чистый (io/json/os/re +
+                 # profile_choice) — замыкание не растит ни на `subprocess`, ни на ssh.
+                 "accounts.py",
                  # 30.07.2026: демон импортирует их СВЕРХУ, значит незакоммиченная правка уедет в
                  # бой вместе с рестартом. pretool_guard — новый импорт (словарь видов красного для
                  # разбора одобренной карточки), io_utf8 стоял в импортах и в список не попал.

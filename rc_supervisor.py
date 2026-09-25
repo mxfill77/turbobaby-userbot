@@ -170,14 +170,22 @@ try:
 except Exception:
     rc_auth_detect = None
 
-# УЧЁТКА ДЕТЕЙ — рычаг 70w (`claude_profile_choice.txt`, читатель profile_choice.py), тот же, что у
-# детей демона. Живой прокол 18–22.09 (docs/artifacts/2026-09-22-rc-device-profile2-stall.md):
+# УЧЁТКА ДЕТЕЙ — рычаг 70w (читатель profile_choice.py); с 25.09 СВОЙ файл RC (`RC_CHOICE_REL` ниже),
+# а не общий со строителями. Живой прокол 18–22.09 (docs/artifacts/2026-09-22-rc-device-profile2-stall.md):
 # постоянная переменная пользователя CLAUDE_CONFIG_DIR=D:\claude_profile_2 увела ОБЕ ветки в
 # профиль второго аккаунта: 91 старт, 88 гашений ЗОМБИ, 0 регистраций, а телефон при этом сидит на
 # основном аккаунте. Почему `claude rc` там стоит — вывод, а не наблюдение: вопрос первого запуска в
 # скрытой консоли (см. артефакт, §МЕХАНИЗМ). Импорт мягкий. Если модуль не поднялся или рычаг не дал
 # решения, у RC срабатывает своя страховка (_rc_fallback), а не наследование профиля 2.
 PROFILE_KEY = "CLAUDE_CONFIG_DIR"
+# СВОЙ ВЫБОР RC (25.09.2026, задание «учётки одним словом»). До 25.09 RC читал ТОТ ЖЕ файл, что
+# строители (`claude_profile_choice.txt`), и слово владельца «учётка N» увело бы телефонный канал
+# вместе с ними — а профиль другой учётки у `claude rc` не регистрируется (18–22.09: 91 старт,
+# 0 регистраций). Теперь у RC свой файл рядом, вне git (строка в .gitignore). Файла нет — это
+# штатно и значит ОСНОВНОЙ: третий исход уходит в RC-страховку `_rc_fallback`, которая снимает
+# унаследованный ключ. Выбор строителей (реестр `accounts_registry.json`) RC не читает НИ ОДНОЙ
+# веткой — замок `test_accounts.TestRcUntouchedByBuilders`.
+RC_CHOICE_REL = "rc_profile_choice.txt"
 try:
     import profile_choice
 except Exception:
@@ -333,8 +341,8 @@ def child_env(chooser=None, base=None, repo=None):
         return _rc_fallback(src, "модуль profile_choice не импортирован")
     env = dict(src)
     try:
-        d = _pc.apply_to(env, repo=repo or REPO)
-        why = _pc.line(d)
+        d = _pc.apply_to(env, repo=repo or REPO, path=os.path.join(repo or REPO, RC_CHOICE_REL))
+        why = _pc.line(d, subject="RC")
     except Exception as e:          # рычаг не смеет уронить канал
         return _rc_fallback(src, "рычаг сорвался (%s)" % type(e).__name__)
     if d.action == _pc.ACT_KEEP:

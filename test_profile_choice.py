@@ -229,20 +229,31 @@ class TestBothSpawnBranchesAsk(unittest.TestCase):
                 return node
         self.fail("в pc_orchestrator.py нет функции %s" % name)
 
-    def test_each_branch_calls_apply_to(self):
+    # ★ 25.09.2026: решение переехало в реестр учёток вне git (`accounts.apply_builders`), а
+    # `profile_choice` стал его словарём. Инвариант тот же — ОБЕ ветки спрашивают ОДНУ дверь.
+    def test_each_branch_calls_apply_builders(self):
         for name in self.BRANCHES:
             with self.subTest(name):
                 calls = [n for n in ast.walk(self._fn(name))
                          if isinstance(n, ast.Call)
                          and isinstance(n.func, ast.Attribute)
-                         and n.func.attr == "apply_to"
-                         and getattr(n.func.value, "id", "") == "profile_choice"]
+                         and n.func.attr == "apply_builders"
+                         and getattr(n.func.value, "id", "") == "accounts"]
                 self.assertEqual(len(calls), 1,
-                                 "%s зовёт profile_choice.apply_to %d раз" % (name, len(calls)))
+                                 "%s зовёт accounts.apply_builders %d раз" % (name, len(calls)))
+
+    def test_no_branch_reads_the_tree_file_anymore(self):
+        """Файл дерева в git больше не решает: его правка пачкала бы дерево (авто-фетч встаёт)."""
+        for name in self.BRANCHES:
+            with self.subTest(name):
+                calls = [n for n in ast.walk(self._fn(name))
+                         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                         and getattr(n.func.value, "id", "") == "profile_choice"]
+                self.assertEqual(calls, [])
 
     def test_daemon_imports_module_on_top(self):
         tops = {a.name for n in self.tree.body if isinstance(n, ast.Import) for a in n.names}
-        self.assertIn("profile_choice", tops)
+        self.assertIn("accounts", tops)
 
 
 class TestBomTolerated(unittest.TestCase):

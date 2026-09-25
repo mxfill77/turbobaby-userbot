@@ -39,6 +39,11 @@ pc_agent.py — удалённое управление userbot'ом с теле
                               причины урок ляжет кандидатом)
   урок перенос откати M     → откатить перенос урока БАЗЫ БОТА #M байт в байт
   урок перенос след         → кто, когда и какой урок переносил
+  учётки                    → все учётки подписки: жива/лимит/до какого часа, что действует на ПК
+                              (строители, RC) и на сервере (accounts_run.py --report; 25.09.2026)
+  учётка N                  → обе полосы на учётку N: строители ПК — реестром вне git, сервер —
+                              vps_token_install.use_slot (слово = один рестарт демона сервера); RC не
+                              трогается. Чужому — отказ словами, дверь не поднимается
   иное → подсказка со списком команд
 
 Большие выводы (>3500 символов) — файлом (send_document), в тексте короткая выжимка.
@@ -660,7 +665,66 @@ KNOWN_COMMANDS = (
     "урок перенеси N: причина — перенести урок НАБОРА #N в базу бота (без причины — кандидатом)",
     "урок перенос откати M — откатить перенос урока БОТА #M",
     "урок перенос след — кто, когда и какой урок переносил",
+    "учётки — все учётки: жива/лимит/до какого часа, что действует на ПК и сервере",
+    "учётка N — обе полосы на учётку N (RC не трогается; = один рестарт демона сервера)",
 )
+
+
+# ── СЛОВО ВЛАДЕЛЬЦА: УЧЁТКИ ПОДПИСКИ (25.09.2026, задание «учётки одним словом») ─────────────
+# ЗАЧЕМ. Кончилась учётка — полосы оживали только заходом Штаба: строителей ПК переключал коммит
+# файла дерева, сервер — ручной запуск `vps_token_install.py` из консоли ПК. Теперь одно слово.
+# Агент здесь только роутит и гейтит владельца; пробы, реестр и переключение живут в двери
+# `accounts_run.py` (субпроцессом, та же механика, что `_lesson_cli`). Из Telegram в командную
+# строку уезжает только ЧИСЛО — номер учётки, уже просеянный регуляркой.
+# СЛОВО «учётка N» = РАЗРЕШЕНИЕ ВЛАДЕЛЬЦА НА ОДИН РЕСТАРТ ДЕМОНА СЕРВЕРА (прямо по заданию). Идёт
+# заход на сервере — дверь рестарт не делает и говорит это словами. Автопереключения по лимиту
+# НЕТ: дверь не зовёт ни один таймер, только это слово.
+ACCOUNTS_LIST_RE = re.compile(r"^уч[её]тки$")
+ACCOUNT_SWITCH_RE = re.compile(r"^уч[её]тка\s+([0-9]{1,2})$")
+ACCOUNT_HEAD_RE = re.compile(r"^уч[её]тк[аиу]\b")
+ACCOUNTS_DENIED = ("⛔ Нет прав: учётки смотрит и переключает ТОЛЬКО владелец. Ничего не изменено, "
+                   "проб не было.")
+ACCOUNTS_UNPARSED = ("⚠️ Не разобрал: номер учётки — число. Формы: «учётки» — показать все · "
+                     "«учётка 3» — перевести обе полосы на №3. Ничего не изменено.")
+# Потолок двери: пробы идут подряд (профиль ПК до 240 с, слот сервера до 300 с), три профиля и
+# четыре слота в худшем случае ≈ 32 мин. Потолок с запасом — обрыв убил бы весь ответ разом.
+ACCOUNTS_TIMEOUT = int(os.getenv("PC_ACCOUNTS_TIMEOUT", "3600") or "3600")
+ACCOUNTS_ANSWER_AT = ("консоль ПК: «venv\\Scripts\\python.exe accounts_run.py --report» / "
+                      "«--switch N»")
+
+
+def accounts_word(text):
+    """Текст (уже нижний регистр) → ("list", None) | ("switch", "N") | None. Только форма слова."""
+    s = " ".join((text or "").split())
+    if ACCOUNTS_LIST_RE.match(s):
+        return ("list", None)
+    m = ACCOUNT_SWITCH_RE.match(s)
+    if m:
+        return ("switch", m.group(1))
+    return None
+
+
+def _accounts_cli(action, number=None):
+    """Дверь `accounts_run.py` субпроцессом → текст ответа. Слова исхода печатает ДВЕРЬ."""
+    if not VENV_PY.exists():
+        return f"учётки: не нашёл python venv ({VENV_PY})."
+    argv = [str(VENV_PY), str(REPO_DIR / "accounts_run.py")]
+    if action == "list":
+        argv += ["--report"]
+    elif action == "switch" and number is not None and str(number).isdigit():
+        argv += ["--switch", str(int(number))]
+    else:
+        return ACCOUNTS_UNPARSED
+    try:
+        r = subprocess.run(
+            argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=ACCOUNTS_TIMEOUT, cwd=str(REPO_DIR), creationflags=NO_WINDOW,
+        )
+        out = (r.stdout or "").strip() or (r.stderr or "").strip()
+        return out or f"учётки: пустой ответ двери. Запасной путь — {ACCOUNTS_ANSWER_AT}."
+    except Exception as e:
+        return (f"учётки: «{action}» НЕ прошло ({type(e).__name__}: {e}). "
+                f"Запасной путь — {ACCOUNTS_ANSWER_AT}.")
 
 
 def unknown_command_reply(raw_text):
@@ -1583,6 +1647,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif transfer_word(msg.text) or TRANSFER_HEAD_RE.match(text):
             alog.warning("перенос урока: отказ чужому отправителю id %s", uid)
             await _send(context, chat_id, TRANSFER_DENIED)
+        # ТРЕТЬЕ ИСКЛЮЧЕНИЕ (25.09.2026): слова учёток. Отказ словами, дверь не поднимается вовсе.
+        elif accounts_word(text) or ACCOUNT_HEAD_RE.match(text):
+            alog.warning("учётки: отказ чужому отправителю id %s", uid)
+            await _send(context, chat_id, ACCOUNTS_DENIED)
         return
 
     try:
@@ -1625,6 +1693,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif text in ("обновись", "перезапустись", "обнови себя", "restart"):
             alog.info("команда: self-restart")
             await self_restart(context, chat_id)
+
+        elif accounts_word(text):
+            act, num = accounts_word(text)
+            alog.info("команда учёток: %s %s от id %s", act, num or "", uid)
+            await _send(context, chat_id,
+                        "⏳ Меряю учётки: по одной пробе на профиль ПК и на слот сервера, до "
+                        "нескольких минут." if act == "list" else
+                        "⏳ Перевожу обе полосы на учётку №%s: проба ПК, затем сервер (копия, "
+                        "проба, один рестарт демона). До нескольких минут." % num)
+            await _send(context, chat_id, await asyncio.to_thread(_accounts_cli, act, num))
+
+        elif ACCOUNT_HEAD_RE.match(text):
+            alog.info("учётки: слово не разобрано в %r", (msg.text or "")[:120])
+            await _send(context, chat_id, ACCOUNTS_UNPARSED)
 
         elif box_word_mark(text):
             # СЛОВЕСНЫЙ ПУТЬ СНЯТИЯ — та же дверь, что у кнопки (`_box_cli`), и это

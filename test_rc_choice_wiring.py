@@ -107,7 +107,8 @@ class TestChoiceFileReachesLiveWiring(unittest.TestCase):
         os.mkdir(repo)
         rc.REPO = repo
         if text is not None:
-            with open(os.path.join(repo, "claude_profile_choice.txt"), "w", encoding="utf-8") as f:
+            # с 25.09 у RC СВОЙ файл выбора (rc.RC_CHOICE_REL), общий со строителями он не читает
+            with open(os.path.join(repo, rc.RC_CHOICE_REL), "w", encoding="utf-8") as f:
                 f.write(text)
 
     def _spec(self, spec):
