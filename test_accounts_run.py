@@ -188,7 +188,8 @@ class TestReport(_Base):
         run = _Runner({accounts.WORD_MAIN: ENV_OK})
         text = ar.report(runner=run, srv_probe=self.srv(), repo=self.repo, save=False)
         self.assertIn(u"WARNING", text)
-        self.assertIn(u"без реестра · ПК ОСНОВНОЙ: 200 жива", text)
+        self.assertIn(u"без реестра — строители идут так · ПК ОСНОВНОЙ: 200 жива", text)
+        self.assertIn(u"«учётки заведи»", text)
         self.assertIn(u"строители ПК — ОСНОВНОЙ (WARNING", text)
 
     def test_server_silent_is_said(self):
@@ -409,6 +410,35 @@ class TestReviewFixesRun(_Base):
         self.assertEqual(code, 0, text)
         last = accounts.load_last(self.repo)
         self.assertEqual((last["pc"]["3"]["code"], last["srv_active"]), (200, "A"))
+
+
+class TestBridgeInWords(_Base):
+    u"""Мост 25.09 в словах: «учётки» меряет и называет то, чем строители и RC идут НА САМОМ ДЕЛЕ."""
+
+    def _srv(self):
+        rows = [vti.slot_row(vti.NAME_ACTIVE, _out("1", ENV_OK, rc=0)),
+                vti.slot_row("TB_CLAUDE_TOKEN_A", _out("1", ENV_OK, rc=0))]
+        return lambda work=None: {"ok": True, "target": "/x", "words": "", "rows": rows, "busy": 0}
+
+    def test_no_registry_legacy_profile_is_probed_and_named(self):
+        with io.open(os.path.join(self.repo, "claude_profile_choice.txt"), "w", encoding="utf-8") as f:
+            f.write(self.p3 + u"\n")
+        run = _Runner({self.p3: ENV_OK})
+        text = ar.report(runner=run, srv_probe=self._srv(), repo=self.repo, save=False)
+        self.assertEqual([c["profile"] for c in run.calls], [self.p3])      # меряем профиль 3, не ОСНОВНОЙ
+        self.assertIn(u"без реестра — строители идут так · ПК %s: 200 жива" % self.p3, text)
+        self.assertIn(u"строители ПК — %s (WARNING: реестра нет — решает прежний файл" % self.p3, text)
+        self.assertIn(u"RC — %s (своего файла нет — прежний файл claude_profile_choice.txt)" % self.p3, text)
+
+    def test_switch_without_registry_points_to_the_word(self):
+        code, text = ar.switch("3", runner=_Runner({}), use=_Use(), repo=self.repo, save=False)
+        self.assertEqual(code, 2)
+        self.assertIn(u"«учётки заведи»", text)
+        with io.open(self.reg_path, "w", encoding="utf-8") as f:
+            f.write(u"{битый")
+        code, text = ar.switch("3", runner=_Runner({}), use=_Use(), repo=self.repo, save=False)
+        self.assertEqual(code, 2)
+        self.assertIn(u"не перезапишет", text)                           # битый реестр — слово не поможет
 
 
 class TestBuilderGate(unittest.TestCase):
