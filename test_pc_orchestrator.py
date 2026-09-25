@@ -3563,7 +3563,7 @@ class TestAgentHitByClosure(unittest.TestCase):
             # 07.09.2026: пометка «ждёт ручного» сменилась САМОПОДЪЁМОМ. Предмет теста прежний —
             # признак агента по ВЫЧИСЛЕННОМУ замыканию; подъём здесь подставной (боевого процесса
             # юниты не касаются), а его вызов и есть доказательство, что признак сработал.
-            selfraise_fn=lambda commit, why="": (raised.append((commit, why))
+            selfraise_fn=lambda commit, why="", **kw: (raised.append((commit, why))
                                                  or "pc_agent изменён — САМОПОДЪЁМ ВЫПОЛНЕН"))
         self.assertEqual(kinds, [], "рестартить этим заходом не должны были НИКОГО")
         self.assertEqual(raised, [("bbb2222", "self-update")])
@@ -3577,7 +3577,7 @@ class TestAgentHitByClosure(unittest.TestCase):
             "aaa1111", "bbb2222", diff_fn=lambda a, b: ["io_utf8.py"],
             restart_fn=lambda kind: kinds.append(kind) or (True, [1], "ok"),
             state={}, dirty_fn=lambda: [], client_block_fn=lambda *a, **k: [],
-            selfraise_fn=lambda commit, why="": "подставной самоподъём")
+            selfraise_fn=lambda commit, why="", **kw: "подставной самоподъём")
         self.assertEqual(kinds, [], "ни один бот не смеет рестартоваться от правки инфраструктуры")
         self.assertEqual(o._classify_changed(["io_utf8.py"]), ([], []))
 
@@ -3782,7 +3782,7 @@ class TestSelfUpdateChildren(Base):
             diff_fn=lambda a, b: ["pc_agent.py"],
             restart_fn=lambda kind: kinds.append(kind) or (True, [1], "x"),
             state={}, now=1, cooldown=120,
-            selfraise_fn=lambda commit, why="": (raised.append(commit)
+            selfraise_fn=lambda commit, why="", **kw: (raised.append(commit)
                                                  or "pc_agent изменён — САМОПОДЪЁМ ВЫПОЛНЕН"))
         self.assertEqual(kinds, [])                     # маршрутом ботов агента НЕ трогаем
         self.assertEqual(raised, ["c3"])                # его поднимает своя, узкая ветка
@@ -13083,11 +13083,17 @@ class TestParallelLanes(Base):
         self.fb.add(status="new")
         self.fb.add(status="new")
         both_in = threading.Barrier(2, timeout=20)
+        both_judged = threading.Barrier(2, timeout=20)
         verdicts = []
 
         def fake(prompt, timeout, cwd, env):
             both_in.wait()          # обе руки внутри — вот момент, ради которого тест написан
             verdicts.append({tid: o._executor_verdict(tid)[0] for tid in (1, 2)})
+            # Никто не выходит, пока ОБА не вынесли приговор: иначе быстрая рука убирала себя из
+            # множества, и медленная видела соседа уже законно вышедшим — ложный красный ТЕСТА,
+            # не кода (2 из 40 изолированных прогонов на 472abd4, проверка перед слиянием 25.09;
+            # красный unittest-гейт самообновления запоминается по блобу и держит старый код).
+            both_judged.wait()
             return (0, "сделано\nRESULT: сделано", "")
         o.run_claude = fake
         o.process_new()

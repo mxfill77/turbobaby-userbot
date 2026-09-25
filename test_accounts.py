@@ -335,6 +335,18 @@ class TestBridgeDeliveryKeepsTheAccount(_Tree):
         env, c = self._builders()
         self.assertEqual((KEY in env, c.warn), (False, True))
 
+    def test_bridge_reads_the_repo_not_the_current_directory(self):
+        u"""Находка проверки 25.09: консольный `accounts_run.py --report`, запущенный из
+        C:\\Users\\…, читал прежний файл из cwd и называл строителей ОСНОВНЫМИ, а демон шёл профилем 3."""
+        self._legacy(self.p3 + u"\n")
+        elsewhere = _tmp()
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        with mock.patch.object(accounts, "REPO", self.repo):
+            os.chdir(elsewhere)
+            c = accounts.builders_effective()
+        self.assertEqual((c.action, c.value), (accounts.ACT_SET, self.p3), c.reason)
+
     def test_bridge_writes_nothing(self):
         self._legacy(self.p3 + u"\n")
         p = os.path.join(self.repo, profile_choice.CHOICE_REL)

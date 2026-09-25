@@ -330,7 +330,7 @@ def builders_effective(repo=None, path=None, isdir=None, reader=None, legacy_rea
     reg = load(repo, path, reader)
     if reg.state != ST_ABSENT:
         return builders_choice(reg, isdir)
-    raw, err = (legacy_reader or profile_choice.read_raw)(repo, None)
+    raw, err = (legacy_reader or profile_choice.read_raw)(repo or REPO, None)   # не cwd: консоль зовут откуда угодно
     d = profile_choice.decide(raw, err, isdir)
     if d.action in (ACT_SET, ACT_DROP) and (d.action == ACT_DROP or d.value):
         return Choice(d.action, d.value if d.action == ACT_SET else "",

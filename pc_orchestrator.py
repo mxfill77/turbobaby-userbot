@@ -8674,7 +8674,12 @@ def _selfupdate_restart_children(old_commit, new_commit, diff_fn=None, restart_f
     notes = []
     if "pc_agent" in procs:                        # ДВЕРЬ ВЛАДЕЛЬЦА ПОДНИМАЕМ САМИ (07.09.2026):
         procs.pop("pc_agent")                      # прежде здесь была только пометка «ждёт ручного»
-        notes.append((selfraise_fn or selfraise_agent)(new_commit, "self-update"))
+        # Прежний коммит — тот, на котором стоит СТАРЫЙ демон (он ещё не ушёл): откат агента вернёт
+        # код, лежавший на диске до обновления. Без него откат искал «предпоследний коммит
+        # замыкания агента», и после слияния чужой ветки это промежуточный коммит той ветки, а не
+        # то, что работало (проверка перед слиянием main ПК, 25.09.2026).
+        _old = old_commit if old_commit and old_commit != "?" else None
+        notes.append((selfraise_fn or selfraise_agent)(new_commit, "self-update", old_commit=_old))
     # ВОРОТА КЛИЕНТСКОГО КОНТУРА (30.07): self-update демона имеет право обновить СЕБЯ, но не имеет
     # права молча выкатить клиентскую правку, попавшую в тот же диапазон коммитов, — ровно так 28.07
     # старый suggest.py уехал «прицепом» к чужому self-update. Держим только ДЕТЕЙ-ботов: сам демон
@@ -9824,11 +9829,87 @@ def selfraise_fallback(payload, commit="", finder=None, killer=None, raiser=None
                    % (back, ", ".join(map(str, after)), said))
 
 
+# ══════════ ДВЕРЬ УЧЁТОК ДЕРЖИТ САМОПОДЪЁМ (25.09.2026, проверка перед слиянием main ПК) ══════════
+# Самоподъём снимает агента `taskkill /T` вместе с деревом, а в дереве может идти «учётка N»: её
+# `accounts_run.py` к этому моменту мог уже переписать файл окружения сервера и ждать пробы. Убить
+# его там — оставить серверу непроверенный вход без отката и владельцу без ответа. Замок двери живёт
+# в памяти агента, поэтому агент кладёт отметку на диск (`pc_agent.door_mark`), а демон её читает.
+# Занято → подъём ОТКЛАДЫВАЕТСЯ пометкой на диске (старый демон при самообновлении уходит сразу после
+# подъёма — память не переживёт эстафету), и главный цикл поднимает агента, когда дверь свободна.
+# Сомнение в отметке (нет её, не читается, протухла, чужой экземпляр) → НЕ занято: вечно держать
+# подъём хуже, чем прежнее поведение. Потолок свежести — таймаут двери плюс хвост.
+ACCOUNTS_DOOR_FILE = _state(os.path.join(REPO, "tmp", "accounts_door.json"))
+AGENT_RAISE_PENDING_FILE = _state(os.path.join(REPO, "pc_orchestrator.agent_raise_pending.json"))
+ACCOUNTS_DOOR_MAX = int(os.getenv("PC_ACCOUNTS_TIMEOUT", "3600") or "3600") + 600
+
+
+def accounts_door_busy(now=None, path=None, lock_fn=None):
+    """Идёт ли у агента слово учёток? → (занято, словами). Любое сомнение → не занято."""
+    now = time.time() if now is None else now
+    try:
+        with open(path or ACCOUNTS_DOOR_FILE, encoding="utf-8") as f:
+            mark = json.load(f)
+    except FileNotFoundError:
+        return False, "отметки двери учёток нет"
+    except Exception as e:                                                 # noqa: BLE001
+        return False, "отметка двери учёток не читается (%s)" % type(e).__name__
+    if not isinstance(mark, dict) or not mark.get("running"):
+        return False, "дверь учёток свободна"
+    try:
+        age = now - float(mark.get("at") or 0)
+        mpid = int(mark.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False, "отметка двери учёток испорчена"
+    if age < 0 or age > ACCOUNTS_DOOR_MAX:
+        return False, "отметка двери учёток протухла (%d с)" % int(age)
+    lock = (lock_fn or _agent_lock_read)()
+    lpid = int((lock or {}).get("pid") or 0) if isinstance(lock, dict) else 0
+    if lpid and mpid and lpid != mpid:
+        return False, "отметку ставил другой экземпляр агента (pid %s, живой %s)" % (mpid, lpid)
+    return True, "идёт слово учёток «%s» (%d мин)" % (mark.get("act") or "?", int(age // 60))
+
+
+def _raise_pending_write(data, path=None):
+    p = path or AGENT_RAISE_PENDING_FILE
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, p)
+
+
+def maybe_raise_deferred_agent(now=None, path=None, busy_fn=None, raise_fn=None):
+    """Отложенный самоподъём: пометка есть и дверь учёток свободна → поднять. → итог | None."""
+    now = time.time() if now is None else now
+    p = path or AGENT_RAISE_PENDING_FILE
+    try:
+        with open(p, encoding="utf-8") as f:
+            pend = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as e:                                                 # noqa: BLE001
+        log.warning("отложенный самоподъём агента: пометка не читается (%s)", e)
+        return None
+    if not isinstance(pend, dict) or not pend.get("pending"):
+        return None
+    busy, _bwhy = (busy_fn or accounts_door_busy)(now)
+    if busy:
+        return None
+    try:            # пометку снимаем ДО подъёма: подъём сам может отложиться снова и поставить новую
+        _raise_pending_write({"pending": False, "done_at": now, "commit": pend.get("commit")}, p)
+    except Exception as e:                                                 # noqa: BLE001
+        log.warning("отложенный самоподъём агента: пометку не снять (%s) — не поднимаю, чтобы не "
+                    "поднимать каждый тик", e)
+        return None
+    return (raise_fn or selfraise_agent)(pend.get("commit") or "",
+                                         "%s, отложенный" % (pend.get("why") or "self-update"),
+                                         old_commit=pend.get("old_commit") or None)
+
+
 def selfraise_agent(commit="", why="self-update", finder=None, killer=None, raiser=None,
                     parse_fn=None, lock_fn=None, sleeper=None, now=None, state=None,
                     notifier=None, critical=None, journal=None, wait_pids=None, wait_gone=None,
                     gate_fn=None, rehearse_fn=None, door_fn=None, fallback_fn=None,
-                    offset_fn=None, old_commit=None):
+                    offset_fn=None, old_commit=None, busy_fn=None, pending_path=None):
     """ПОДНЯТЬ ДВЕРЬ ВЛАДЕЛЬЦА САМИМ после правки её собственного кода. → строка-итог для лога.
 
     Порядок обязателен, и в нём весь смысл (задание Штаба 07.09):
@@ -9856,6 +9937,20 @@ def selfraise_agent(commit="", why="self-update", finder=None, killer=None, rais
 
     if AGENT_SELFRAISE_OFF:
         msg = "%s — самоподъём выключен рубильником PC_AGENT_SELFRAISE_OFF, %s" % (head, manual)
+        log.info("самоподъём агента: %s", msg)
+        say(msg)
+        return msg
+    # ── ДВЕРЬ УЧЁТОК: идёт «учётка N» — агента НЕ снимаем, подъём откладываем (25.09.2026) ───
+    busy, bwhy = (busy_fn or accounts_door_busy)(now, lock_fn=lock_fn)
+    if busy:
+        try:
+            _raise_pending_write({"pending": True, "commit": commit, "why": why,
+                                  "old_commit": old_commit, "at": now}, pending_path)
+            later = "подниму сам, когда слово кончится"
+        except Exception as e:                                             # noqa: BLE001
+            later = "пометку отсрочки НЕ записал (%s) — %s" % (type(e).__name__, manual)
+        msg = ("%s — самоподъём ОТЛОЖЕН: %s; агента не снимаю (taskkill /T убил бы переключение "
+               "учётки посреди хода), %s" % (head, bwhy, later))
         log.info("самоподъём агента: %s", msg)
         say(msg)
         return msg
@@ -14380,6 +14475,7 @@ def _main_loop():
             maybe_lesson_commit_retry()  # пакет «полнота лога» п.6: докоммитить урок из спула (провал коммита ≠ вечная грязь)
             maybe_git_ff_pull()       # родитель #221: подтянуть origin/main ff-only ДО реконсиляции/self-update (тот же тик применит)
             maybe_reconcile_children()  # класс-фикс c6d8a30: применить свежий код детей на ЛЮБОЙ новый коммит
+            maybe_raise_deferred_agent()  # отложенный самоподъём агента: шло слово учёток (25.09.2026)
             # СОКРАЩЁННЫЙ ВИТОК ОБЯЗАН БЫТЬ НАЗВАН СЛОВАМИ. Молчаливое сокращение неотличимо от
             # поломки: «ящик ничего не взял» и «ящика не спрашивали, мост был занят» выглядели бы
             # в логе одинаково. Строка идёт ДО self-update: тот выходит из функции return'ом.

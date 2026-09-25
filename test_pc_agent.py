@@ -926,6 +926,27 @@ class TestAccountsWord(unittest.TestCase):
         self.assertEqual(self.sent[-1], "ДВЕРЬ: list None")
         self.assertIsNone(a._ACCOUNTS_RUNNING["act"])    # замок снят после ответа
 
+    def test_failed_ack_never_strands_the_lock(self):
+        """Проверка перед слиянием 25.09 (две независимые проверки): «⏳» упало TimedOut → прежде
+        дверь не запускалась, замок стоял навсегда, «учётки» и «обновись» получали ложное «ещё идёт».
+        Теперь «⏳» — лучшее усилие: дверь идёт, замок после неё свободен, следующее слово принято."""
+        self.addCleanup(a._ACCOUNTS_RUNNING.__setitem__, "act", None)
+        calls = {"n": 0}
+        ok_send = a._send
+
+        async def flaky(context, chat_id, text, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("Timed out")               # живой класс: TimedOut на «⏳»
+            await ok_send(context, chat_id, text, **kw)
+        a._send = flaky
+        self.say("учётка 3")
+        self.assertEqual(self.door, [("switch", "3")])         # дверь всё-таки пошла
+        self.assertIsNone(a._ACCOUNTS_RUNNING["act"])          # и замок после неё снят
+        self.assertEqual(self.sent, ["ДВЕРЬ: switch 3"])
+        self.say("учётки")                                     # следующее слово принято, а не «ещё идёт»
+        self.assertEqual(self.door[-1], ("list", None))
+
     def test_second_word_while_running_is_refused(self):
         self.addCleanup(a._ACCOUNTS_RUNNING.__setitem__, "act", None)
         a._ACCOUNTS_RUNNING["act"] = "учётка 3"

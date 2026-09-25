@@ -751,8 +751,44 @@ def _background(context, coro):
     return asyncio.ensure_future(coro)
 
 
+# ЗАМОК ДВЕРИ ВИДЕН СНАРУЖИ (25.09.2026, проверка перед слиянием main ПК). Демон при самоподъёме
+# снимает агента `taskkill /PID … /F /T` — ВМЕСТЕ с дочерним `accounts_run.py` и его ssh; а
+# `_ACCOUNTS_RUNNING` живёт в памяти агента, и демону не виден. «учётка N», убитая после записи
+# файла сервера и до пробы, оставила бы там непроверенный вход без отката и без ответа владельцу.
+# Поэтому пока дверь идёт, на диске лежит отметка; демон её читает (`pc_orchestrator.
+# accounts_door_busy`) и откладывает подъём до конца слова. Отметка не удаляется, а переписывается
+# «running: false» — чтение без гонки, и мусора в дереве нет (путь под .gitignore: tmp/).
+ACCOUNTS_DOOR_FILE = str(REPO_DIR / "tmp" / "accounts_door.json")
+
+
+def _door_path():
+    try:
+        import log_setup                          # под тестом — одноразовый temp, как у демона
+        return log_setup.state_path(ACCOUNTS_DOOR_FILE)
+    except Exception:                             # noqa: BLE001
+        return ACCOUNTS_DOOR_FILE
+
+
+def door_mark(running, act=""):
+    """Отметка «дверь учёток идёт / свободна» для демона. Сбой записи не роняет дверь (слово важнее)."""
+    p = _door_path()
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"running": bool(running), "pid": os.getpid(), "at": time.time(),
+                       "act": act or ""}, f, ensure_ascii=False)
+        os.replace(tmp, p)
+        return True
+    except Exception as e:                        # noqa: BLE001
+        alog.warning("учётки: отметка двери не записана (%s: %s) — самоподъём её не увидит",
+                     type(e).__name__, e)
+        return False
+
+
 async def _accounts_door(context, chat_id, act, number):
     """Дверь учёток в фоне → ответ владельцу. Замок снимается ДО отправки: ответ уже на руках."""
+    door_mark(True, ("учётка %s" % number) if number else act)
     try:
         reply = await asyncio.to_thread(_accounts_cli, act, number)
     except Exception as e:                      # noqa: BLE001 — фон не смеет умереть молча
@@ -760,6 +796,7 @@ async def _accounts_door(context, chat_id, act, number):
                  f"Запасной путь — {ACCOUNTS_ANSWER_AT}.")
     finally:
         _ACCOUNTS_RUNNING["act"] = None
+        door_mark(False)
     await _send(context, chat_id, reply)
 
 
@@ -1769,14 +1806,27 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 _ACCOUNTS_RUNNING["act"] = ("учётка %s" % num) if num else {
                     "list": "учётки", "init": "учётки заведи"}.get(act, act)
-                await _send(context, chat_id, {
-                    "list": "⏳ Меряю учётки: по одной пробе на профиль ПК и на слот сервера, до "
-                            "нескольких минут. Другие команды темы работают.",
-                    "init": "⏳ Завожу реестр учёток: проба слотов сервера, основной и №3 на ПК; сервер не "
-                            "переключаю. До нескольких минут.",
-                }.get(act) or ("⏳ Перевожу обе полосы на учётку №%s: проба ПК, затем сервер (копия, "
-                               "проба, один рестарт демона). До нескольких минут." % num))
-                _background(context, _accounts_door(context, chat_id, act, num))
+                # ЗАМОК НЕ ОСТАЁТСЯ БЕЗ ДВЕРИ (25.09.2026, проверка перед слиянием main ПК). Прежде сбой
+                # отправки «⏳» (TimedOut — живой класс этого ПК) выходил в общий except ДО запуска
+                # двери: замок стоял навсегда, и любое слово учёток и «обновись» получали ложное «ещё
+                # идёт». Теперь «⏳» — лучшее усилие, а дверь запускается всегда; не запустилась —
+                # замок снят.
+                try:
+                    await _send(context, chat_id, {
+                        "list": "⏳ Меряю учётки: по одной пробе на профиль ПК и на слот сервера, до "
+                                "нескольких минут. Другие команды темы работают.",
+                        "init": "⏳ Завожу реестр учёток: проба слотов сервера, профилей №2 и №3 и "
+                                "основного на ПК; сервер не переключаю. До нескольких минут.",
+                    }.get(act) or ("⏳ Перевожу обе полосы на учётку №%s: проба ПК, затем сервер (копия, "
+                                   "проба, один рестарт демона). До нескольких минут." % num))
+                except Exception as e:                  # noqa: BLE001 — «⏳» не держит слово владельца
+                    alog.warning("учётки: «⏳» не ушло (%s: %s) — дверь всё равно запускаю",
+                                 type(e).__name__, e)
+                try:
+                    _background(context, _accounts_door(context, chat_id, act, num))
+                except Exception:
+                    _ACCOUNTS_RUNNING["act"] = None
+                    raise
 
         elif accounts_head(text):
             alog.info("учётки: слово не разобрано в %r", (msg.text or "")[:120])

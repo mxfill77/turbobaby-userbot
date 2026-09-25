@@ -209,10 +209,12 @@ class TestInit(_Base):
         self.addCleanup(setattr, ar, "INIT_PROFILE_3", ar.INIT_PROFILE_3)
         ar.INIT_PROFILE_2, ar.INIT_PROFILE_3 = self.p2, self.p3
 
-    def srv(self, a_env, a_rc=1, ok=True):
+    def srv(self, a_env, a_rc=1, ok=True, b_env=ENV_OK, b_rc=0):
+        # слот B по умолчанию жив — как профиль 2 у двойника (_Runner отдаёт 200 всем, кого не назвали):
+        # пробы №2 не спорят. Спор профиля 2 и слота B — отдельные тесты (TestSecondAccountSplit)
         rows = [vti.slot_row(vti.NAME_ACTIVE, _out("1", a_env, rc=a_rc)),
                 vti.slot_row("TB_CLAUDE_TOKEN_A", _out("1", a_env, rc=a_rc)),
-                vti.slot_row("TB_CLAUDE_TOKEN_B", _out("0", ENV_429))]
+                vti.slot_row("TB_CLAUDE_TOKEN_B", _out("0", b_env, rc=b_rc))]
         return lambda work=None: {"ok": ok, "target": "/x", "words": u"ssh не поднялся", "rows": rows if ok else [],
                                   "busy": 0}
 
@@ -227,7 +229,9 @@ class TestInit(_Base):
         self.assertEqual((acc[1]["profile"], acc[2]["profile"], acc[3]["profile"]),
                          (accounts.WORD_MAIN, self.p2, self.p3))
         self.assertEqual(reg.data["builders"], 3)
-        self.assertEqual([c["profile"] for c in run.calls], [accounts.WORD_MAIN, self.p3])
+        self.assertEqual([c["profile"] for c in run.calls], [accounts.WORD_MAIN, self.p3, self.p2])
+        self.assertIn(u"№2: ПК профиль 2 — 200 жива · слот B — 200 жива — пробы не спорят", text)
+        self.assertEqual(accounts.load_last(self.repo)["pc"]["2"]["code"], 200)   # память знает и №2
         self.assertIn(u"строители на №3", text)
         self.assertIn(u"сервер НЕ трогает", text)
         self.assertIn(u"основная в лимите, 200 ей не принадлежит", text)
@@ -344,6 +348,111 @@ class TestInit(_Base):
         self.assertEqual(code, 0, text)
         self.assertEqual(use.calls, [("B", False)])
         self.assertEqual(accounts.load(self.repo).data["builders"], 2)
+
+
+class TestSecondAccountSplit(_Base):
+    u"""Находка проверки 25.09: профиль 2 на ПК сегодня вошёл в ТУ ЖЕ учётку, что профиль 3, а слот B
+    сервера — вторая учётка. «учётки заведи» писало №2 = профиль 2 + слот B вслепую, и «учётка 2»
+    отвечала «обе полосы на №2», разведя полосы по РАЗНЫМ учёткам молча. Судить можно только по
+    кодам: 200 на одной стороне и 429 на другой у одной учётки не бывает (посылка правила П2)."""
+
+    def setUp(self):
+        _Base.setUp(self)
+        self.addCleanup(setattr, ar, "INIT_PROFILE_2", ar.INIT_PROFILE_2)
+        self.addCleanup(setattr, ar, "INIT_PROFILE_3", ar.INIT_PROFILE_3)
+        ar.INIT_PROFILE_2, ar.INIT_PROFILE_3 = self.p2, self.p3
+
+    def init(self, pc2_env, b_env, b_rc, repo=None):
+        pcs = {accounts.WORD_MAIN: ENV_429, self.p3: ENV_OK, self.p2: pc2_env}
+        return ar.init_registry(runner=_Runner(pcs), repo=repo or self.repo, today=(2026, 9, 25),
+                                srv_probe=TestInit.srv(self, ENV_OK, a_rc=0, b_env=b_env, b_rc=b_rc))
+
+    def test_disagreeing_second_gets_no_slot_and_switch_leaves_server_alone(self):
+        for name, pc2_env, b_env, b_rc in ((u"ПК 200, B 429", ENV_OK, ENV_429, 1),
+                                           (u"ПК 429, B 200", ENV_429, ENV_OK, 0)):
+            with self.subTest(name=name):
+                repo = tempfile.mkdtemp(prefix="uchetki_2509_")
+                code, text = self.init(pc2_env, b_env, b_rc, repo=repo)
+                self.assertEqual(code, 0, text)
+                acc = accounts.load(repo).data["accounts"]
+                self.assertEqual((acc[2]["profile"], acc[2]["slot"]), (self.p2, ""))
+                self.assertEqual(acc[3]["slot"], "A")                    # соседние строки не задеты
+                self.assertIn(u"похоже, РАЗНЫЕ учётки; слот B за №2 НЕ назначен", text)
+                self.assertIn(u"№2 «вторая» · ПК %s · сервер слота нет" % self.p2, text)
+                use = _Use(ok=True)
+                code, text = ar.switch("2", runner=_Runner({self.p2: ENV_OK}), use=use, repo=repo, save=False)
+                self.assertEqual(use.calls, [])                          # сервер под №2 НЕ переводится
+                self.assertIn(u"ПК на №2, сервера у учётки нет", text)
+                self.assertNotIn(u"обе полосы на №2", text)
+
+    def test_twins_that_do_not_disagree_keep_slot_b(self):
+        u"""Близнецы: коды не спорят (оба 200, оба 429, у ПК 401/нет каталога/529) — №2 ← B, как п.1
+        задания. «Не спорят» не значит «одна учётка» — это сказано словами, а не подразумевается."""
+        env_529 = '{"is_error":true,"api_error_status":529,"result":"Overloaded","type":"result"}'
+        for name, pc2_env, b_env, b_rc in ((u"оба 200", ENV_OK, ENV_OK, 0),
+                                           (u"оба 429", ENV_429, ENV_429, 1),
+                                           (u"ПК 401", ENV_401, ENV_429, 1),
+                                           (u"ПК 529", env_529, ENV_OK, 0)):
+            with self.subTest(name=name):
+                repo = tempfile.mkdtemp(prefix="uchetki_2509_")
+                code, text = self.init(pc2_env, b_env, b_rc, repo=repo)
+                self.assertEqual(code, 0, text)
+                self.assertEqual(accounts.load(repo).data["accounts"][2]["slot"], "B")
+                self.assertNotIn(u"РАЗНЫЕ", text)
+                self.assertIn(u"пробы не спорят (одну учётку коды не доказывают)", text)
+
+    def test_second_profile_probe_never_blocks_the_registry(self):
+        u"""Проба профиля 2 в заведении — СВЕДЕНИЕ, а не условие: её 529 реестр не отменяет (иначе
+        лишняя проба отняла бы у владельца «заведи» из-за учётки, которая заведению не нужна)."""
+        env_529 = '{"is_error":true,"api_error_status":529,"result":"Overloaded","type":"result"}'
+        code, text = self.init(env_529, ENV_429, 1)
+        self.assertEqual(code, 0, text)
+        self.assertTrue(os.path.exists(self.reg_path))
+
+    def test_plan_is_pure_and_default_keeps_old_shape(self):
+        u"""Без проб №2 (прежний вызов init_plan) — строка №2 = B, как было: правка ничего не меняет
+        тем, кто её не зовёт."""
+        a = {"code": 200}
+        rows, _b, words, retry = ar.init_plan(a, {"code": 429}, {"code": 200}, (2026, 9, 25))
+        self.assertFalse(retry)
+        self.assertEqual(rows[2]["slot"], "B")
+        self.assertFalse(any(u"№2" in w for w in words))
+        rows, _b, words, _r = ar.init_plan(a, {"code": 429}, {"code": 200}, (2026, 9, 25),
+                                           slot_b={"code": 429}, pc2={"code": 200})
+        self.assertEqual(rows[2]["slot"], "")
+
+    def test_disagree_verdict_table(self):
+        yes = ((200, 429), (429, 200))
+        no = ((200, 200), (429, 429), (200, 401), (401, 429), (None, 200), (429, None), (529, 200),
+              (200, 529), (None, None))
+        for pc, sv in yes:
+            self.assertTrue(ar.probes_disagree({"code": pc}, {"code": sv}), (pc, sv))
+        for pc, sv in no:
+            self.assertFalse(ar.probes_disagree({"code": pc}, {"code": sv}), (pc, sv))
+        self.assertFalse(ar.probes_disagree(None, {"code": 429}))
+        self.assertFalse(ar.probes_disagree({"code": 200}, None))
+
+    def test_report_flags_a_disagreeing_row_and_only_it(self):
+        u"""«учётки» называет спор строки прямо: реестр уже есть (заведён до правки или руками) — владелец
+        видит, что «учётка N» развела бы полосы. Близнец: строка без спора предупреждения не получает."""
+        data = {"form": 1, "builders": 3, "accounts": {
+            "1": {"profile": u"ОСНОВНОЙ", "slot": "", "label": u"основная"},
+            "2": {"profile": self.p2, "slot": "B", "label": u"вторая"},
+            "3": {"profile": self.p3, "slot": "A", "label": u"третья"}}}
+        with io.open(self.reg_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False))
+        srv = TestInit.srv(self, ENV_OK, a_rc=0, b_env=ENV_429, b_rc=1)
+        text = ar.report(runner=_Runner({accounts.WORD_MAIN: ENV_429, self.p2: ENV_OK, self.p3: ENV_OK}),
+                         srv_probe=srv, repo=self.repo, save=False)
+        self.assertIn(u"⚠️ №2: ПК 200 жива, сервер (слот B) 429 лимит", text)
+        self.assertIn(u"похоже, РАЗНЫЕ учётки", text)
+        self.assertNotIn(u"⚠️ №3", text)                                 # A и профиль 3 оба 200
+        text = ar.report(runner=_Runner({accounts.WORD_MAIN: ENV_429, self.p2: ENV_429, self.p3: ENV_OK}),
+                         srv_probe=srv, repo=self.repo, save=False)
+        self.assertNotIn(u"РАЗНЫЕ", text)
+        silent = lambda work=None: {"ok": False, "words": u"ssh не поднялся", "rows": []}
+        text = ar.report(runner=_Runner({self.p2: ENV_OK}), srv_probe=silent, repo=self.repo, save=False)
+        self.assertNotIn(u"РАЗНЫЕ", text)                                 # сервер молчит — судить не по чему
 
 
 def _out(active, envelope, rc=1):
