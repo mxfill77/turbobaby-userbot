@@ -179,7 +179,8 @@ class TestBothSidesMeet(unittest.TestCase):
             asyncio.run(a._accounts_door(None, 1, "switch", "9"))
         self.assertEqual(seen, [True, True])                               # во время слова — занято
         self.assertFalse(o.accounts_door_busy(lock_fn=_lock(os.getpid()))[0])   # после — свободно
-        self.assertIn(u"НЕ прошло", sent[1])                               # и после падения тоже
+        self.assertIn(u"Слово «учётка 9» оборвалось на ПК", sent[1])       # и после падения тоже — словами
+        self.assertNotIn(u"RuntimeError", sent[1])
 
 
 class TestWiring(unittest.TestCase):

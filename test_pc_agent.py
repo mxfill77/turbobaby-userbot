@@ -835,6 +835,8 @@ class TestAccountsWord(unittest.TestCase):
                 self.say(word, uid=777)
                 self.assertEqual(self.sent, [a.ACCOUNTS_DENIED])
         self.assertEqual(self.door, [])
+        self.assertIn("только владелец", a.ACCOUNTS_DENIED)          # отказ словами, а не тишина
+        self.assertIn("Ничего не изменено", a.ACCOUNTS_DENIED)
 
     def test_owner_list_goes_to_door(self):
         self.say("Учётки")
@@ -862,6 +864,10 @@ class TestAccountsWord(unittest.TestCase):
                 self.say(word)
                 self.assertEqual(self.sent, [a.ACCOUNTS_UNPARSED])
         self.assertEqual(self.door, [])
+        # отказ СЛОВАМИ: пустая строка или «?» прошли бы сравнение с константой — держим сами слова
+        self.assertIn("Не понял", a.ACCOUNTS_UNPARSED)
+        self.assertIn("«учётка 3»", a.ACCOUNTS_UNPARSED)
+        self.assertIn("Ничего не изменено", a.ACCOUNTS_UNPARSED)
 
     def test_quotes_and_edge_marks_are_not_part_of_the_word(self):
         """Живой случай 25.09 15:32: владелец скопировал подсказку с закрывающей «»», и строгая форма
@@ -968,6 +974,82 @@ class TestAccountsWord(unittest.TestCase):
         joined = "\n".join(a.KNOWN_COMMANDS)
         self.assertIn("учётки", joined)
         self.assertIn("учётка N", joined)
+
+    def test_accounts_words_are_short_and_human(self):
+        """Просьба владельца 25.09: слова учёток — коротко и по-человечески, без кухни (демон, слот, RC,
+        рестарт, коды) и без крика заглавными."""
+        texts = [a.ACCOUNTS_DENIED, a.ACCOUNTS_UNPARSED, a.ACCOUNTS_BUSY % "учётка 3",
+                 a.ACCOUNTS_RESTART_WAIT % "учётка 3", a.ACCOUNTS_ACK["list"], a.ACCOUNTS_ACK["init"],
+                 a.ACCOUNTS_ACK["switch"] % "3", a.ACCOUNTS_NO_PYTHON,
+                 a.ACCOUNTS_FAILED % a._accounts_said("switch", "3"),
+                 a.ACCOUNTS_NOT_STARTED % a._accounts_said("switch", "3"),
+                 a.ACCOUNTS_TIMEOUT_SAID % ("учётка 3", "час", a._accounts_said("switch", "3")[1]),
+                 a.ACCOUNTS_EMPTY % a._accounts_said("list")]
+        texts += [c for c in a.KNOWN_COMMANDS if c.startswith("учётк")]
+        for text in texts:
+            with self.subTest(text=text):
+                for raw in ("демон", "слот", "RC", "рестарт", "полос", "ТОЛЬКО", "НЕ ", "WARNING", "venv\\"):
+                    self.assertNotIn(raw, text)
+                self.assertLessEqual(len(text), 140)
+                self.assertGreater(len(text), 10)                 # пустая строка — не ответ
+        self.assertEqual(a.ACCOUNTS_ACK["switch"] % "3", "⏳ Перевожу ПК и сервер на учётку №3 — пара минут.")
+        self.assertEqual(a.ACCOUNTS_ACK["list"], "⏳ Проверяю учётки — минута-две.")
+        self.assertEqual(a.ACCOUNTS_ACK["init"], "⏳ Завожу реестр учёток — минута-две. Сервер не трогаю.")
+        self.assertIn("не принял, ничего не изменено", a.ACCOUNTS_BUSY % "учётка 3")
+
+    def test_door_failure_is_said_in_words(self):
+        with mock.patch.object(a.subprocess, "run", side_effect=OSError("нет")), \
+                mock.patch.object(a, "VENV_PY", Path(sys.executable)):
+            door = a._accounts_cli
+            a._accounts_cli = type(self)._real_cli
+            try:
+                text = a._accounts_cli("switch", "3")
+            finally:
+                a._accounts_cli = door
+        self.assertTrue(text.startswith("❔ Слово «учётка 3» не запустилось на ПК — ничего не менял."), text)
+        self.assertNotIn("OSError", text)                         # имя исключения — в журнал, не в тему
+        self.assertIn("accounts_run.py --report / --switch 3", text)   # запасной путь — под это слово
+
+    def test_door_timeout_crash_and_stderr_stay_words(self):
+        """Находка ревью: имя исключения, трасса Python и stderr двери в тему не идут — только слова; у
+        «учётка N» запасной путь с консоли называет и «--switch N»."""
+        tb = "Traceback (most recent call last):\n  File \"accounts_run.py\", line 1\nKeyError: 'x'"
+        cases = (
+            ({"side_effect": subprocess.TimeoutExpired(["x"], 3600)},
+             "❔ Слово «учётка 3» не успело за час — прервал. Что изменилось, покажет «учётки»"),
+            ({"side_effect": RuntimeError("boom")}, "❔ Слово «учётка 3» оборвалось на ПК."),
+            ({"return_value": types.SimpleNamespace(stdout="", stderr=tb, returncode=1)},
+             "❔ Слово «учётка 3» оборвалось на ПК."),
+            ({"return_value": types.SimpleNamespace(stdout="", stderr="", returncode=1)},
+             "❔ Слово «учётка 3» оборвалось на ПК."),        # убита/сбой без слов — не «повтори», а «проверь»
+            ({"return_value": types.SimpleNamespace(stdout="", stderr="", returncode=3221225477)},
+             "❔ Слово «учётка 3» оборвалось на ПК."),
+            ({"return_value": types.SimpleNamespace(stdout="", stderr="", returncode=0)},
+             "❔ Слово «учётка 3» вернулось пустым."),
+        )
+        for kw, head in cases:
+            with self.subTest(head=head):
+                with mock.patch.object(a.subprocess, "run", **kw), \
+                        mock.patch.object(a, "VENV_PY", Path(sys.executable)):
+                    door = a._accounts_cli
+                    a._accounts_cli = type(self)._real_cli
+                    try:
+                        text = a._accounts_cli("switch", "3")
+                    finally:
+                        a._accounts_cli = door
+                self.assertTrue(text.startswith(head), text)
+                for raw in ("Traceback", "KeyError", "TimeoutExpired", "RuntimeError", "boom", "File "):
+                    self.assertNotIn(raw, text)
+                self.assertIn("--switch 3", text)
+        answered = types.SimpleNamespace(stdout="👥 Учётки · 23:28\n", stderr="предупреждение", returncode=0)
+        with mock.patch.object(a.subprocess, "run", return_value=answered), \
+                mock.patch.object(a, "VENV_PY", Path(sys.executable)):
+            door = a._accounts_cli
+            a._accounts_cli = type(self)._real_cli
+            try:
+                self.assertEqual(a._accounts_cli("list"), "👥 Учётки · 23:28")   # ответ двери — как есть
+            finally:
+                a._accounts_cli = door
 
 
 TestAccountsWord._real_cli = staticmethod(a._accounts_cli)

@@ -668,9 +668,9 @@ KNOWN_COMMANDS = (
     "урок перенеси N: причина — перенести урок НАБОРА #N в базу бота (без причины — кандидатом)",
     "урок перенос откати M — откатить перенос урока БОТА #M",
     "урок перенос след — кто, когда и какой урок переносил",
-    "учётки — все учётки: жива/лимит/до какого часа, что действует на ПК и сервере",
-    "учётки заведи — первый реестр учёток (1, 2, 3; слоты по пробе), сервер не трогает",
-    "учётка N — обе полосы на учётку N (RC не трогается; = один рестарт демона сервера)",
+    "учётки — какие работают, какие в лимите и до скольки, на какой сейчас ПК, телефон и сервер",
+    "учётки заведи — завести реестр учёток (один раз)",
+    "учётка N — перевести ПК и сервер на учётку N (сервер перезапустится)",
 )
 
 
@@ -688,15 +688,40 @@ ACCOUNTS_LIST_RE = re.compile(r"^уч[её]тки$")
 ACCOUNTS_INIT_RE = re.compile(r"^уч[её]тки\s+заведи$")
 ACCOUNT_SWITCH_RE = re.compile(r"^уч[её]тка\s+([0-9]{1,2})$")
 ACCOUNT_HEAD_RE = re.compile(r"^уч[её]тк[аиу]\b")
-ACCOUNTS_DENIED = ("⛔ Нет прав: учётки смотрит и переключает ТОЛЬКО владелец. Ничего не изменено, "
-                   "проб не было.")
-ACCOUNTS_UNPARSED = ("⚠️ Не разобрал: номер учётки — число. Формы: «учётки» — показать все · "
-                     "«учётка 3» — перевести обе полосы на №3. Ничего не изменено.")
+ACCOUNTS_DENIED = "⛔ Учётками распоряжается только владелец. Ничего не изменено."
+ACCOUNTS_UNPARSED = ("⚠️ Не понял. Можно так: «учётки» — показать все, «учётка 3» — перейти на №3. "
+                     "Ничего не изменено.")
 # Потолок двери: пробы идут подряд (профиль ПК до 240 с, слот сервера до 300 с), три профиля и
 # четыре слота в худшем случае ≈ 32 мин. Потолок с запасом — обрыв убил бы весь ответ разом.
 ACCOUNTS_TIMEOUT = int(os.getenv("PC_ACCOUNTS_TIMEOUT", "3600") or "3600")
-ACCOUNTS_ANSWER_AT = ("консоль ПК: «venv\\Scripts\\python.exe accounts_run.py --report» / "
-                      "«--switch N»")
+ACCOUNTS_ANSWER_AT = "с консоли ПК: accounts_run.py --report"
+ACCOUNTS_ANSWER_AT_SWITCH = "с консоли ПК: accounts_run.py --report / --switch %s"
+# Ответы, когда сама дверь не ответила: владельцу — словами, без имени исключения, трассы и путей
+# (имя исключения и stderr двери — в журнал агента). Не запустилась — ничего не менялось; оборвалась
+# или вышел потолок — что успело измениться, покажет «учётки».
+ACCOUNTS_TIMEOUT_SAID = ("❔ Слово «%s» не успело за %s — прервал. Что изменилось, покажет «учётки»; "
+                         "можно %s.")
+ACCOUNTS_FAILED = "❔ Слово «%s» оборвалось на ПК. Что успело измениться, покажет «учётки»; можно и %s."
+ACCOUNTS_NOT_STARTED = "❔ Слово «%s» не запустилось на ПК — ничего не менял. Можно %s."
+ACCOUNTS_NO_PYTHON = "❔ Учётки: на ПК не нашёлся python — слово не выполнено."
+ACCOUNTS_EMPTY = "❔ Слово «%s» вернулось пустым. Повтори через минуту; если снова — %s."
+ACCOUNTS_SAID = {"list": "учётки", "init": "учётки заведи", "switch": "учётка"}
+
+
+def _accounts_said(action, number=None):
+    """Слово владельца для ответа («учётка 3») и запасной путь с консоли ПК под это слово."""
+    if action == "switch" and number is not None and str(number).isdigit():
+        return "учётка %s" % int(number), ACCOUNTS_ANSWER_AT_SWITCH % int(number)
+    return ACCOUNTS_SAID.get(action, action), ACCOUNTS_ANSWER_AT
+
+
+def _timeout_words(secs):
+    """Потолок двери словами: «час» · «2 ч» · «45 мин»."""
+    if secs == 3600:
+        return "час"
+    if secs % 3600 == 0:
+        return "%d ч" % (secs // 3600)
+    return "%d мин" % max(1, secs // 60)
 
 
 # Кавычки и знаки по краям слова НЕ часть команды (25.09.2026, живой случай): владелец скопировал
@@ -738,8 +763,14 @@ def accounts_word(text):
 # `use_slot` и два рестарта демона сервера на одно слово владельца. Тот же замок держит «обновись»:
 # перезапуск агента убил бы дверь посреди переключения (файл сервера сменён, отката нет).
 _ACCOUNTS_RUNNING = {"act": None}
-ACCOUNTS_BUSY = ("⏳ Предыдущее слово учёток («%s») ещё идёт — дождись его ответа. Это слово НЕ "
-                 "принято, ничего не изменено.")
+ACCOUNTS_BUSY = "⏳ Ещё выполняю «%s» — дождись ответа. Это слово не принял, ничего не изменено."
+ACCOUNTS_RESTART_WAIT = ("⏳ Сейчас выполняю «%s» — перезапуск агента оборвал бы его. Повтори «обновись», "
+                         "когда придёт ответ. Ничего не перезапущено.")
+ACCOUNTS_ACK = {
+    "list": "⏳ Проверяю учётки — минута-две.",
+    "init": "⏳ Завожу реестр учёток — минута-две. Сервер не трогаю.",
+    "switch": "⏳ Перевожу ПК и сервер на учётку №%s — пара минут.",
+}
 
 
 def _background(context, coro):
@@ -792,8 +823,8 @@ async def _accounts_door(context, chat_id, act, number):
     try:
         reply = await asyncio.to_thread(_accounts_cli, act, number)
     except Exception as e:                      # noqa: BLE001 — фон не смеет умереть молча
-        reply = (f"учётки: «{act}» НЕ прошло ({type(e).__name__}: {e}). "
-                 f"Запасной путь — {ACCOUNTS_ANSWER_AT}.")
+        alog.warning("учётки: дверь «%s %s» упала (%s: %s)", act, number or "", type(e).__name__, e)
+        reply = ACCOUNTS_FAILED % _accounts_said(act, number)
     finally:
         _ACCOUNTS_RUNNING["act"] = None
         door_mark(False)
@@ -803,7 +834,7 @@ async def _accounts_door(context, chat_id, act, number):
 def _accounts_cli(action, number=None):
     """Дверь `accounts_run.py` субпроцессом → текст ответа. Слова исхода печатает ДВЕРЬ."""
     if not VENV_PY.exists():
-        return f"учётки: не нашёл python venv ({VENV_PY})."
+        return ACCOUNTS_NO_PYTHON
     argv = [str(VENV_PY), str(REPO_DIR / "accounts_run.py")]
     if action == "list":
         argv += ["--report"]
@@ -813,16 +844,33 @@ def _accounts_cli(action, number=None):
         argv += ["--switch", str(int(number))]
     else:
         return ACCOUNTS_UNPARSED
+    said, fallback = _accounts_said(action, number)
     try:
         r = subprocess.run(
             argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=ACCOUNTS_TIMEOUT, cwd=str(REPO_DIR), creationflags=NO_WINDOW,
         )
-        out = (r.stdout or "").strip() or (r.stderr or "").strip()
-        return out or f"учётки: пустой ответ двери. Запасной путь — {ACCOUNTS_ANSWER_AT}."
-    except Exception as e:
-        return (f"учётки: «{action}» НЕ прошло ({type(e).__name__}: {e}). "
-                f"Запасной путь — {ACCOUNTS_ANSWER_AT}.")
+    except subprocess.TimeoutExpired:
+        alog.warning("учётки: «%s» не уложилось в %d с — прервано", said, ACCOUNTS_TIMEOUT)
+        return ACCOUNTS_TIMEOUT_SAID % (said, _timeout_words(ACCOUNTS_TIMEOUT), fallback)
+    except OSError as e:
+        alog.warning("учётки: «%s» не запустилось (%s: %s)", said, type(e).__name__, e)
+        return ACCOUNTS_NOT_STARTED % (said, fallback)
+    except Exception as e:                      # noqa: BLE001
+        alog.warning("учётки: «%s» оборвалось (%s: %s)", said, type(e).__name__, e)
+        return ACCOUNTS_FAILED % (said, fallback)
+    out = (r.stdout or "").strip()
+    err = (r.stderr or "").strip()
+    code = getattr(r, "returncode", 0)
+    if err:                                     # трасса двери — в журнал агента, в тему не идёт никогда
+        alog.warning("учётки: «%s» — stderr двери (код %s): %s", said, code, err[-1500:])
+    if out:
+        return out
+    # Пусто и код не 0 (дверь убита, жёсткий сбой) — «учётка N» могла успеть сменить сервер: не «повтори»,
+    # а «что успело измениться, покажет «учётки»». «Вернулось пустым» — только чистый выход без слов.
+    if not err and code not in (0, None):
+        alog.warning("учётки: «%s» — дверь вышла с кодом %s без единого слова", said, code)
+    return (ACCOUNTS_FAILED if (err or code not in (0, None)) else ACCOUNTS_EMPTY) % (said, fallback)
 
 
 def unknown_command_reply(raw_text):
@@ -1791,10 +1839,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif text in ("обновись", "перезапустись", "обнови себя", "restart"):
             alog.info("команда: self-restart")
             if _ACCOUNTS_RUNNING["act"]:
-                await _send(context, chat_id,
-                            "⏳ Сейчас идёт слово учёток («%s»): перезапуск агента оборвал бы его "
-                            "посреди переключения. Повтори «обновись», когда придёт ответ. Ничего "
-                            "не перезапущено." % _ACCOUNTS_RUNNING["act"])
+                await _send(context, chat_id, ACCOUNTS_RESTART_WAIT % _ACCOUNTS_RUNNING["act"])
             else:
                 await self_restart(context, chat_id)
 
@@ -1813,12 +1858,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # замок снят.
                 try:
                     await _send(context, chat_id, {
-                        "list": "⏳ Меряю учётки: по одной пробе на профиль ПК и на слот сервера, до "
-                                "нескольких минут. Другие команды темы работают.",
-                        "init": "⏳ Завожу реестр учёток: проба слотов сервера, профилей №2 и №3 и "
-                                "основного на ПК; сервер не переключаю. До нескольких минут.",
-                    }.get(act) or ("⏳ Перевожу обе полосы на учётку №%s: проба ПК, затем сервер (копия, "
-                                   "проба, один рестарт демона). До нескольких минут." % num))
+                        "list": ACCOUNTS_ACK["list"],
+                        "init": ACCOUNTS_ACK["init"],
+                    }.get(act) or (ACCOUNTS_ACK["switch"] % num))
                 except Exception as e:                  # noqa: BLE001 — «⏳» не держит слово владельца
                     alog.warning("учётки: «⏳» не ушло (%s: %s) — дверь всё равно запускаю",
                                  type(e).__name__, e)
