@@ -215,3 +215,9 @@ accounts_registry.json.tmp
 accounts_last.json
 accounts_last.json.tmp
 rc_profile_choice.txt
+
+# Local investigation copies: keep files on disk, exclude from automatic diff scans.
+# 2026-09-27: Codex spawned hundreds of git diff --no-index workers for these trees
+# during a period of repeated system resource exhaustion. Tracked files stay tracked.
+/_scratch*/
+/tmp_*/
