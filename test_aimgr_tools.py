@@ -156,6 +156,40 @@ class BikeHistoryTest(unittest.TestCase):
         bad = T.bridge_reader(lambda action, **p: {"ok": False, "items": []})
         self.assertEqual(T.bike_history(self.BIKE, today=TODAY, read=bad)["verdict"], T.UNMEASURED)
 
+    # --- день события из живого msg_date (задание 0063-75f.3009) ---
+    LIVE_MSG_DATE = "Tue Sep 29 2026 00:00:00 GMT+0700 (เวลาอินโดจีน)"   # живой вид, AIMGRLIVE3009 §4
+
+    def test_live_msg_date_form_gives_event_day(self):
+        # recorded_at на три дня раньше: если msg_date не разобран, запись выпадет из свежих.
+        live = {"msg_date": self.LIVE_MSG_DATE, "recorded_at": "2026-09-26T04:25:08.567Z",
+                "event_type": "photo", "mileage": "", "notes": "", "status": "recorded"}
+        r = self.hist([live])
+        self.assertEqual(r["last_day"], "2026-09-29")
+        self.assertEqual(r["verdict"], T.AVAILABLE)
+        self.assertEqual(r["day_src"], {"msg_date": 1, "recorded_at": 0})
+        self.assertEqual(r["text"], "доступен")
+
+    def test_parse_day_all_live_forms(self):
+        d = datetime.date(2026, 9, 29)
+        self.assertEqual(T._parse_day(self.LIVE_MSG_DATE), d)
+        self.assertEqual(T._parse_day("Tue Sep 29 2026"), d)
+        self.assertEqual(T._parse_day("2026-09-28T17:00:00.000Z"), d)    # полночь Пхукета в UTC
+        self.assertEqual(T._parse_day("2026-09-29T04:25:08.567Z"), d)
+        self.assertEqual(T._parse_day("2026-09-29 10:00:00"), d)
+        self.assertEqual(T._parse_day("29.09.2026"), d)
+        self.assertIsNone(T._parse_day("вчера"))
+        self.assertIsNone(T._parse_day(""))
+
+    def test_recorded_at_fallback_is_visible(self):
+        for md in ("", "вчера"):
+            e = {"msg_date": md, "recorded_at": "2026-09-28T18:30:00Z", "event_type": "photo",
+                 "notes": "", "status": "recorded"}
+            r = self.hist([e])
+            self.assertEqual(r["last_day"], "2026-09-29")            # 18:30 UTC = 01:30 Пхукета
+            self.assertEqual(r["day_src"], {"msg_date": 0, "recorded_at": 1})
+            self.assertIn("день по recorded_at у 1 из 1 записей", r["text"])
+            self.assertTrue(any("recorded_at" in w for w in r["why"]))
+
     def test_ready_fits_client_date(self):
         d = datetime.date
         self.assertIs(T.ready_fits(d(2026, 10, 5), d(2026, 10, 5)), True)
@@ -203,6 +237,87 @@ class RulesTest(unittest.TestCase):
         self.assertEqual(r["source"], "книга-снимок")
         self.assertIsNone(r["only_in_book"])
         self.assertEqual(r["text"], BOOK.strip())
+
+
+ARCHIVE = os.path.join(HERE, "fixtures", "aimgr_servicing")       # выдуманный архив, 4 дня, 4 темы
+NOW = datetime.datetime(2026, 9, 24, 0, 0, tzinfo=datetime.timezone.utc)
+AGE_HEAD = "возраст архива: последняя строка 2026-09-23 08:46 UTC — 0.6 сут назад"
+
+
+class BikeTopicMsgsTest(unittest.TestCase):
+    def setUp(self):
+        p = mock.patch.dict(os.environ, {"CHATLOG_ROOT": ARCHIVE})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def msgs(self, bike, **kw):
+        kw.setdefault("now", NOW)
+        return T.bike_topic_msgs(bike, **kw)
+
+    def assert_age_first(self, r):
+        first = r["text"].splitlines()[0]
+        self.assertTrue(first.startswith(AGE_HEAD), first)
+        self.assertIn("порога-отказа нет", first)
+
+    def test_found_rows_age_first_then_envelope(self):
+        import chatlog_find
+        r = self.msgs("ADV 350 GREY 798")
+        self.assertEqual(r["verdict"], T.FOUND)
+        self.assert_age_first(r)
+        lines = r["text"].splitlines()
+        self.assertEqual(lines[1], chatlog_find.ENVELOPE)
+        self.assertEqual(r["topic"], {"id": 64, "name": "ADV 350 GREY 798", "rows_all": 3})
+        self.assertEqual(r["counts"], {"window": 3, "shown": 3, "photo": 1, "human_text": 1})
+        self.assertEqual([v["ts"][:10] for v in r["rows"]], ["2026-09-21", "2026-09-22", "2026-09-23"])
+        self.assertEqual([(v["photo"], v["bot"]) for v in r["rows"]], [(True, False), (False, True), (False, False)])
+        self.assertEqual(r["rows"][0]["files"],
+                         ["docs/obsluzhivanie-snimki/2026-09/2026-09-21_17-00-00_t64_msg101.jpg"])
+        self.assertIn("человек · фото: да, docs/obsluzhivanie-snimki/", lines[3])
+        self.assertIn("бот · фото: нет · выдуманный ответ бота", lines[4])
+
+    def test_limit_keeps_latest(self):
+        r = self.msgs("ADV 350 GREY 798", limit=2)
+        self.assertEqual((r["counts"]["window"], r["counts"]["shown"]), (3, 2))
+        self.assertEqual([v["ts"][:10] for v in r["rows"]], ["2026-09-22", "2026-09-23"])
+
+    def test_fleet_name_found_by_plate(self):
+        r = self.msgs("ADV 350CC GREY BKK 798")
+        self.assertEqual((r["verdict"], r["topic"]["id"]), (T.FOUND, 64))
+
+    def test_topic_present_window_empty(self):
+        r = self.msgs("NMAX 155 BLACK GOLD 4255", days=7)
+        self.assertEqual(r["verdict"], T.EMPTY)
+        self.assert_age_first(r)
+        self.assertEqual(r["text"].splitlines()[1], "тема «NMAX 155 BLACK GOLD 4255»: сообщений нет за 7 суток")
+        self.assertEqual(r["rows"], [])
+
+    def test_no_topic_is_unknown_not_empty(self):
+        r = self.msgs("PCX 160 9999")
+        self.assertEqual(r["verdict"], "НЕИЗВЕСТНО")
+        self.assert_age_first(r)
+        self.assertTrue(r["text"].splitlines()[1].startswith("НЕИЗВЕСТНО: темы у байка в архиве нет"))
+        self.assertNotIn("сообщений нет", r["text"])
+
+    def test_archive_unread_is_unknown(self):
+        with mock.patch.dict(os.environ, {"CHATLOG_ROOT": os.path.join(ARCHIVE, "нет_такого")}):
+            r = self.msgs("ADV 350 GREY 798")
+        self.assertEqual(r["verdict"], "НЕИЗВЕСТНО")
+        self.assertEqual(r["text"].splitlines()[0], "возраст архива: неизвестен — последняя строка не найдена")
+        self.assertIn("НЕИЗВЕСТНО: архив не прочитан", r["text"])
+        self.assertNotIn("сообщений нет", r["text"])
+
+        def boom():
+            raise OSError("диск")
+        r = self.msgs("ADV 350 GREY 798", read=boom)
+        self.assertEqual(r["verdict"], "НЕИЗВЕСТНО")
+        self.assertIn("архив не прочитан: OSError", r["text"])
+        self.assertNotIn("сообщений нет", r["text"])
+
+    def test_ambiguous_plate_is_unknown(self):
+        r = self.msgs("PCX 160 4685")
+        self.assertEqual(r["verdict"], "НЕИЗВЕСТНО")
+        self.assertIn("подходят 2 темы", r["text"])
+        self.assertEqual(r["rows"], [])
 
 
 class ClosureTest(unittest.TestCase):
