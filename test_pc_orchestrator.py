@@ -13969,5 +13969,138 @@ class AgentSelfRaiseLocksTest(unittest.TestCase):
         self.assertIn("ОТКАТ НЕ ВЫПОЛНЕН", said)
 
 
+# ═══ ЧАСЫ АРХИВА ОБСЛУЖИВАНИЯ: исход каждого захода — одной строкой в журнал демона (30.09.2026) ═══
+# Сами часы (срок, заявка, флаг, замок) держит `test_chatlog_servicing_tick`. Здесь — голос демона:
+# ок со счётом, ошибка со словами, пропуск с причиной, ровно ОДНА строка на заход, и две беды,
+# молчаливые без него (заход без исхода; срок наступил, а заявки нет). Боевой штамп не читается:
+# пути — во временном каталоге, память — своя на тест.
+class TestSvcClockDemon(unittest.TestCase):
+    T = 1_790_000_000.0
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="turbobaby_TESTING_svcclock_demon_")
+        self.sp = os.path.join(self.tmp, "state.json")
+        self.ap = os.path.join(self.tmp, "said.json")
+        self.mem = {"said": None, "due_seen": None, "spawned_at": None}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def put(self, **st):
+        with open(self.sp, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+
+    def report(self, now, mem=None):
+        with self.assertLogs("pc_orchestrator", level="INFO") as cm:
+            o.log.info("—")                      # якорь: assertLogs требует хотя бы одну строку
+            said = o._svc_clock_report(self.sp, self.ap, now=now, mem=self.mem if mem is None else mem)
+        return said, [r for r in cm.records if r.getMessage() != "—"]
+
+    def test_ok_odna_stroka_so_schetom_strok(self):
+        self.put(seq=1, done_seq=1, ran_at=self.T, next_at=self.T + 43200, outcome="ok", written=12,
+                 dup=83, messages=95, topics=6, saved=5, not_downloaded=1, duration_s=41.2,
+                 newest_utc="2026-09-30T08:46:53+00:00")
+        said, recs = self.report(self.T + 60)
+        self.assertEqual(len(said), 1)
+        self.assertIn("заход №1", said[0])
+        self.assertIn("ок, новых строк 12", said[0])
+        self.assertIn("30.09 08:46 UTC", said[0])
+        self.assertEqual([r.levelname for r in recs], ["INFO"])
+        again, _ = self.report(self.T + 240)
+        self.assertEqual(again, [], "исход сказан дважды — строка на заход одна")
+
+    def test_oshibka_vidna_slovami_i_urovnem(self):
+        self.put(seq=2, done_seq=2, ran_at=self.T, next_at=self.T + 43200, outcome="error",
+                 error="код 3", why="не авторизованы по копии сессии — входить не стали")
+        said, recs = self.report(self.T + 60)
+        self.assertEqual(len(said), 1)
+        self.assertIn("ОШИБКА: не авторизованы по копии сессии", said[0])
+        self.assertIn("код 3", said[0])
+        self.assertIn("повтора нет до", said[0])
+        self.assertEqual([r.levelname for r in recs], ["WARNING"])
+
+    def test_propusk_s_prichinoy(self):
+        self.put(seq=1, done_seq=1, ran_at=self.T, next_at=self.T + 43200, outcome="skip",
+                 why="выключено флагом CHATLOG_SERVICING_TICK_OFF")
+        said, _ = self.report(self.T + 60)
+        self.assertEqual(len(said), 1)
+        self.assertIn("пропуск: выключено флагом CHATLOG_SERVICING_TICK_OFF", said[0])
+
+    def test_estafeta_ne_povtoryaet_i_ne_teryaet(self):
+        """Новый процесс демона (память пуста) читает, что уже сказано, из файла."""
+        self.put(seq=1, done_seq=1, ran_at=self.T, next_at=self.T + 43200, outcome="ok", written=3)
+        self.report(self.T + 60)
+        said, _ = self.report(self.T + 120, mem={"said": None, "due_seen": None, "spawned_at": None})
+        self.assertEqual(said, [], "эстафета повторила прошлый исход")
+        self.put(seq=2, done_seq=2, ran_at=self.T + 43200, next_at=self.T + 86400, outcome="ok",
+                 written=4)
+        said, _ = self.report(self.T + 43300, mem={"said": None, "due_seen": None, "spawned_at": None})
+        self.assertEqual(len(said), 1, "исход между двумя процессами потерян")
+
+    def test_shtamp_nachat_zanovo_ishody_ne_molchat(self):
+        self.put(seq=7, done_seq=7, ran_at=self.T, next_at=self.T + 43200, outcome="ok", written=3)
+        self.report(self.T + 60)
+        self.put(seq=1, done_seq=1, ran_at=self.T + 100, next_at=self.T + 43300, outcome="ok",
+                 written=2)
+        said, _ = self.report(self.T + 200)
+        self.assertEqual(len(said), 1)
+
+    def test_zahod_bez_ishoda_odin_raz(self):
+        self.put(seq=2, done_seq=2, ran_at=self.T - 43200, next_at=self.T, outcome="ok", written=1)
+        self.report(self.T - 43000)
+        self.put(seq=3, done_seq=2, ran_at=self.T, next_at=self.T + 43200, outcome="ok", written=1,
+                 running=True)
+        said, _ = self.report(self.T + 600)
+        self.assertEqual(said, [], "заход ещё в пределах потолка")
+        said, recs = self.report(self.T + o.SVC_CLOCK_HUNG_S + 60)
+        self.assertEqual(len(said), 1)
+        self.assertIn("заход №3", said[0])
+        self.assertIn("исхода не записал", said[0])
+        self.assertEqual([r.levelname for r in recs], ["WARNING"])
+        said, _ = self.report(self.T + o.SVC_CLOCK_HUNG_S + 600)
+        self.assertEqual(said, [])
+
+    def test_srok_nastupil_a_zayavki_net(self):
+        self.put(seq=4, done_seq=4, ran_at=self.T, next_at=self.T + 43200, outcome="ok", written=1)
+        self.report(self.T + 60)
+        self.mem["spawned_at"] = self.T + 60
+        t = self.T + 43200 + 30
+        self.assertEqual(self.report(t)[0], [])      # срок увиден
+        self.assertEqual(self.report(t + 600)[0], [])
+        said, recs = self.report(t + o.SVC_CLOCK_LATE_S + 1)
+        self.assertEqual(len(said), 1)
+        self.assertIn("заявки нет", said[0])
+        self.assertEqual([r.levelname for r in recs], ["WARNING"])
+        self.assertEqual(self.report(t + o.SVC_CLOCK_LATE_S + 300)[0], [])
+
+    def test_zayavka_poyavilas_trevogi_net(self):
+        self.put(seq=4, done_seq=4, ran_at=self.T, next_at=self.T + 43200, outcome="ok", written=1)
+        self.report(self.T + 60)
+        self.mem["spawned_at"] = self.T + 60
+        t = self.T + 43200 + 30
+        self.report(t)
+        self.put(seq=5, done_seq=4, ran_at=t + 1, next_at=t + 43201, outcome="ok", written=1,
+                 running=True)
+        self.assertEqual(self.report(t + o.SVC_CLOCK_LATE_S + 1)[0], [])
+
+    def test_do_pervogo_vyzova_chasov_trevogi_net(self):
+        """Демон сам не оборачивался (сон, длинный заход) — это не вина часов."""
+        self.put(seq=4, done_seq=4, ran_at=self.T, next_at=self.T + 43200, outcome="ok", written=1)
+        self.report(self.T + 60)
+        t = self.T + 43200 + 30
+        self.report(t)
+        self.assertEqual(self.report(t + o.SVC_CLOCK_LATE_S * 3)[0], [])
+
+    def test_bityy_shtamp_ne_valit_oborot(self):
+        with open(self.sp, "w", encoding="utf-8") as f:
+            f.write("{нет")
+        self.assertEqual(o._svc_clock_report(self.sp, self.ap, now=self.T, mem=self.mem), [])
+
+    def test_shtamp_demona_tot_zhe_chto_u_chasov(self):
+        import chatlog_servicing_tick as ct
+        self.assertEqual(os.path.normcase(o.SVC_CLOCK_STATE), os.path.normcase(ct.DEFAULT_STATE),
+                         "демон читает не тот штамп, что пишут часы")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

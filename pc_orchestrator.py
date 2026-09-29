@@ -1244,7 +1244,11 @@ def _chatlog_capture(why):
     12 фикстурных расписок» — проверка обязана отличаться от боевого пути, иначе гейт становится
     писателем. Второй замок (взаимное исключение самих заходов) стоит в `chatlog_ingest.tick`.
 
-    ОТКАТ: `CHATLOG_TICK_OFF=1` в окружении демона — ветка мертва целиком."""
+    ОТКАТ: `CHATLOG_TICK_OFF=1` в окружении демона — ветка мертва целиком.
+
+    ВТОРОЙ ВЫЗОВ — ЧАСЫ ФОРУМА ОБСЛУЖИВАНИЯ (30.09.2026, SVCCLOCK3009): `chatlog_servicing_tick.py`,
+    тот же спавн без импорта. Срок (720 мин), замок и флаг решает он сам; демон только читает его
+    штамп и пишет исход каждого захода ОДНОЙ строкой в свой журнал (`_svc_clock_report`)."""
     if "unittest" in sys.modules:
         return
     try:
@@ -1253,6 +1257,137 @@ def _chatlog_capture(why):
                          stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
     except Exception as e:
         log.warning("захват переписки (%s) не запущен: %s", why, e)
+    _svc_clock_report()
+    try:
+        subprocess.Popen([VENV_PY, os.path.join(REPO, "chatlog_servicing_tick.py")],
+                         cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        _SVC_CLOCK_MEM["spawned_at"] = time.time()
+    except Exception as e:
+        log.warning("архив Обслуживания: часы (%s) не запущены: %s", why, e)
+
+
+# ─── ЧАСЫ АРХИВА ОБСЛУЖИВАНИЯ: исход каждого захода — одной строкой в журнал демона (30.09.2026) ───
+# Ребёнок (`chatlog_servicing_tick.py`) живёт с stdout в никуда, поэтому говорит он ШТАМПОМ, а
+# вслух — демон. Что демон уже сказал, лежит в своём файле (`SVC_CLOCK_SAID`): эстафета self-update
+# не повторяет прошлый исход и не теряет исход, легший между двумя процессами.
+# Три беды, которые без этого были бы МОЛЧАЛИВЫ:
+#   • заход упал/оборвался после заявки — штамп «идёт» дольше потолка захода (`SVC_CLOCK_HUNG_S`);
+#   • ребёнок не стартует вовсе (битый модуль, стек до заявки) или замок архива залип — срок
+#     наступил, демон зовёт часы уже `SVC_CLOCK_LATE_S`, а заявки нет;
+#   • флаг выключил часы — это ПРОПУСК со словами, раз в период, а не тишина.
+SVC_CLOCK_STATE = os.path.join(REPO, "tmp", "chatlog_servicing_tick", "state.json")
+SVC_CLOCK_SAID = os.path.join(REPO, "tmp", "chatlog_servicing_tick", "demon_said.json")
+SVC_CLOCK_HUNG_S = 1800        # потолок захода `chatlog_servicing_fetch.RUN_TIMEOUT_S` 1500 с + хвост
+SVC_CLOCK_LATE_S = 900         # 15 мин ≈ 5 оборотов с вызовом при наступившем сроке — и ни одной заявки
+_SVC_CLOCK_MEM = {"said": None, "due_seen": None, "spawned_at": None}
+
+
+def _svc_hm(ts):
+    try:
+        return time.strftime("%d.%m %H:%M UTC", time.gmtime(float(ts)))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
+
+
+def _svc_iso_hm(iso):
+    try:
+        return (datetime.datetime.fromisoformat(str(iso)).astimezone(datetime.timezone.utc)
+                .strftime("%d.%m %H:%M UTC"))
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _svc_clock_lines(st, said, now, due_seen, spawned_at=None):
+    """ЧИСТАЯ: штамп часов + что демон уже сказал → (строки [(уровень, текст)], said, due_seen).
+
+    `due_seen` — (когда демон впервые увидел наступивший срок, номер заявки на тот момент) или None.
+    Считается только после того, как демон хоть раз ПОЗВАЛ часы (`spawned_at`): тишина, пока демон
+    сам не оборачивался (сон, длинный заход), — не вина часов."""
+    st = st if isinstance(st, dict) else {}
+    said = dict(said or {})
+    lines = []
+    seq, done = int(st.get("seq") or 0), int(st.get("done_seq") or 0)
+    nxt = st.get("next_at")
+    if seq < int(said.get("done_seq") or 0):
+        said = {}                            # штамп начат заново — иначе новые исходы молчали бы до №N
+    if done > int(said.get("done_seq") or 0):
+        head = "архив Обслуживания: заход №%d %s" % (done, _svc_hm(st.get("ran_at")))
+        out = st.get("outcome")
+        if out == "ok":
+            lines.append(("info", "%s — ок, новых строк %d (дублей %d, в окне сообщений %d, тем %d, "
+                                  "снимков сохранено %d, не скачано %d), свежайшее %s; за %sс; "
+                                  "следующий не раньше %s" % (
+                head, int(st.get("written") or 0), int(st.get("dup") or 0),
+                int(st.get("messages") or 0), int(st.get("topics") or 0), int(st.get("saved") or 0),
+                int(st.get("not_downloaded") or 0), _svc_iso_hm(st.get("newest_utc")),
+                st.get("duration_s", "?"), _svc_hm(nxt))))
+        elif out == "skip":
+            lines.append(("info", "%s — пропуск: %s; следующий срок %s" % (
+                head, st.get("why") or "причина не записана", _svc_hm(nxt))))
+        else:
+            lines.append(("warning", "%s — ОШИБКА: %s (%s); повтора нет до %s" % (
+                head, st.get("why") or "причина не записана", st.get("error") or out,
+                _svc_hm(nxt))))
+        said["done_seq"] = done
+    elif seq > done and seq > int(said.get("hung_seq") or 0):
+        age = now - float(st.get("ran_at") or now)
+        if age > SVC_CLOCK_HUNG_S:
+            lines.append(("warning", "архив Обслуживания: заход №%d начат %s и исхода не записал "
+                                     "за %d мин (оборван или завис); повтора нет до %s" % (
+                seq, _svc_hm(st.get("ran_at")), int(age // 60), _svc_hm(nxt))))
+            said["hung_seq"] = seq
+    is_due = (not nxt) or now >= float(nxt)
+    if not is_due or (due_seen is not None and seq != due_seen[1]):
+        due_seen = None
+    elif due_seen is None:
+        if spawned_at is not None:
+            due_seen = (now, seq)
+    elif now - due_seen[0] >= SVC_CLOCK_LATE_S:
+        key = "%d:%s" % (seq, nxt)
+        if said.get("late_key") != key:
+            lines.append(("warning", "архив Обслуживания: срок захода %s наступил, демон зовёт часы "
+                                     "с %s, а заявки нет %d мин — ребёнок не стартует или замок "
+                                     "архива занят" % (
+                _svc_hm(nxt) if nxt else "(штампа нет — первый заход)", _svc_hm(due_seen[0]),
+                int((now - due_seen[0]) // 60))))
+            said["late_key"] = key
+    return lines, said, due_seen
+
+
+def _svc_clock_report(state_path=None, said_path=None, now=None, mem=None):
+    """Прочитать штамп часов и сказать новое в журнал. → список сказанных строк. Не падает никогда."""
+    mem = _SVC_CLOCK_MEM if mem is None else mem
+    sp, ap = state_path or SVC_CLOCK_STATE, said_path or SVC_CLOCK_SAID
+    try:
+        try:
+            with open(sp, encoding="utf-8") as f:
+                st = json.load(f)
+        except FileNotFoundError:
+            st = {}
+        except (OSError, ValueError):
+            return []                        # штамп пишется прямо сейчас — прочтём на следующем обороте
+        said = mem.get("said")
+        if said is None:
+            try:
+                with open(ap, encoding="utf-8") as f:
+                    said = json.load(f)
+            except (OSError, ValueError):
+                said = {}
+        lines, new_said, mem["due_seen"] = _svc_clock_lines(
+            st, said, time.time() if now is None else now, mem.get("due_seen"), mem.get("spawned_at"))
+        for level, text in lines:
+            (log.warning if level == "warning" else log.info)("%s", text)
+        mem["said"] = new_said
+        if new_said != said:
+            os.makedirs(os.path.dirname(ap), exist_ok=True)
+            with open(ap + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(new_said, f, ensure_ascii=False, sort_keys=True)
+            os.replace(ap + ".tmp", ap)
+        return [t for _l, t in lines]
+    except Exception as e:
+        log.warning("архив Обслуживания: штамп часов не прочитан (%s)", type(e).__name__)
+        return []
 
 
 def _live_send_allowed():
