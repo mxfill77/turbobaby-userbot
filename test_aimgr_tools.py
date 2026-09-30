@@ -93,7 +93,15 @@ def reader(events, services=()):
 class BikeHistoryTest(unittest.TestCase):
     BIKE = "ADV 350 4444"
 
+    def setUp(self):
+        # Прямые вызовы без topic= читают архив по умолчанию — только выдуманный, штампа нет.
+        p = mock.patch.dict(os.environ, {"CHATLOG_ROOT": os.path.join(HERE, "fixtures", "aimgr_servicing"),
+                                         T.STAMP_ENV: os.path.join(HERE, "fixtures", "нет_штампа.json")})
+        p.start()
+        self.addCleanup(p.stop)
+
     def hist(self, events, services=(), **kw):
+        kw.setdefault("topic", None)
         return T.bike_history(self.BIKE, today=TODAY, read=reader(events, services), **kw)
 
     def test_steering_bearings_is_repair(self):
@@ -241,12 +249,14 @@ class RulesTest(unittest.TestCase):
 
 ARCHIVE = os.path.join(HERE, "fixtures", "aimgr_servicing")       # выдуманный архив, 4 дня, 4 темы
 NOW = datetime.datetime(2026, 9, 24, 0, 0, tzinfo=datetime.timezone.utc)
-AGE_HEAD = "возраст архива: последняя строка 2026-09-23 08:46 UTC — 0.6 сут назад"
+AGE_HEAD = "возраст архива: НЕИЗВЕСТНО — штампа часов нет"
+AGE_LAST = "; последняя строка 2026-09-23 08:46 UTC — 0.6 сут назад"
 
 
 class BikeTopicMsgsTest(unittest.TestCase):
     def setUp(self):
-        p = mock.patch.dict(os.environ, {"CHATLOG_ROOT": ARCHIVE})
+        p = mock.patch.dict(os.environ, {"CHATLOG_ROOT": ARCHIVE,
+                                         T.STAMP_ENV: os.path.join(ARCHIVE, "нет_штампа.json")})
         p.start()
         self.addCleanup(p.stop)
 
@@ -257,6 +267,7 @@ class BikeTopicMsgsTest(unittest.TestCase):
     def assert_age_first(self, r):
         first = r["text"].splitlines()[0]
         self.assertTrue(first.startswith(AGE_HEAD), first)
+        self.assertIn(AGE_LAST, first)
         self.assertIn("порога-отказа нет", first)
 
     def test_found_rows_age_first_then_envelope(self):
@@ -288,7 +299,8 @@ class BikeTopicMsgsTest(unittest.TestCase):
         r = self.msgs("NMAX 155 BLACK GOLD 4255", days=7)
         self.assertEqual(r["verdict"], T.EMPTY)
         self.assert_age_first(r)
-        self.assertEqual(r["text"].splitlines()[1], "тема «NMAX 155 BLACK GOLD 4255»: сообщений нет за 7 суток")
+        self.assertEqual(r["text"].splitlines()[1],
+                         "тема «NMAX 155 BLACK GOLD 4255»: сообщений нет за 7 суток (последнее 2026-09-10 03:00 UTC)")
         self.assertEqual(r["rows"], [])
 
     def test_no_topic_is_unknown_not_empty(self):
@@ -302,7 +314,8 @@ class BikeTopicMsgsTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CHATLOG_ROOT": os.path.join(ARCHIVE, "нет_такого")}):
             r = self.msgs("ADV 350 GREY 798")
         self.assertEqual(r["verdict"], "НЕИЗВЕСТНО")
-        self.assertEqual(r["text"].splitlines()[0], "возраст архива: неизвестен — последняя строка не найдена")
+        self.assertTrue(r["text"].splitlines()[0].startswith(AGE_HEAD))
+        self.assertTrue(r["text"].splitlines()[0].endswith("; последняя строка не найдена"))
         self.assertIn("НЕИЗВЕСТНО: архив не прочитан", r["text"])
         self.assertNotIn("сообщений нет", r["text"])
 
@@ -318,6 +331,156 @@ class BikeTopicMsgsTest(unittest.TestCase):
         self.assertEqual(r["verdict"], "НЕИЗВЕСТНО")
         self.assertIn("подходят 2 темы", r["text"])
         self.assertEqual(r["rows"], [])
+
+
+# --- пять пределов AIMGRACCEPT3009 §5 (задание 0068-75k.3009) — выдуманные строки и штамп ---
+NOW30 = datetime.datetime(2026, 9, 30, 13, 0, tzinfo=datetime.timezone.utc)
+STAMP_FILE = os.path.join(ARCHIVE, "tick_state.json")      # удачный заход №2, 30.09 09:03 UTC
+
+
+def stamp_ok(**kw):
+    import json
+    with open(STAMP_FILE, encoding="utf-8") as f:
+        st = json.load(f)
+    st.update(kw)
+    return lambda: (st, None)
+
+
+def row(ts, tid, name, text="", photo=False, bot=False):
+    return {"ts": ts, "topic_id": tid, "topic_name": name, "text": text, "bot": bot,
+            "media": [{"kind": "photo", "outcome": "СОХРАНЁН", "file": "x.jpg"}] if photo else []}
+
+
+ROWS = [
+    row("2026-09-22T04:33:00+00:00", 64, "ADV 350 GREY 798", "выдуманная: подшипник гудит"),
+    row("2026-09-24T05:00:00+00:00", 201, "NMAX 155 GREY GOLD 6908", photo=True),
+    row("2026-09-26T05:29:00+00:00", 76, "NMAX 155 BLACK GOLD-2 4685", "выдуманная: в мастерскую"),
+    row("2026-09-27T07:45:00+00:00", 201, "NMAX 155 GREY GOLD 6908", "выдуманная: тормоз скрипит"),
+    row("2026-09-27T08:00:00+00:00", 201, "NMAX 155 GREY GOLD 6908", "выдуманный ответ бота", bot=True),
+    row("2026-09-28T01:00:00+00:00", 3, "Oil and filters batteries", "выдуманная: масло"),
+    row("2026-09-29T04:25:00+00:00", 76, "NMAX 155 BLACK GOLD-2 4685", photo=True),
+    row("2026-09-29T08:18:00+00:00", 1190, "X-Max Black 9315", photo=True),
+]
+U6908, U4685, U9315 = "NMAX 155CC GREY GOLD PHUKET 6908", "NMAX 155CC BLACK GOLD-2 PHUKET 4685", \
+    "XMAX 300CC NEW BROWN BANGKOK 9315"
+U798, U4957 = "ADV 350CC GREY BKK 798", "NMAX 155CC GREEN-B PHUKET 4957"
+
+
+def msgs30(bike, stamp=None, rows=ROWS, **kw):
+    return T.bike_topic_msgs(bike, now=NOW30, read=lambda: (rows, None), stamp=stamp or stamp_ok(), **kw)
+
+
+def hist30(bike, events=(), stamp=None, rows=ROWS):
+    topic = lambda b: msgs30(b, stamp=stamp, rows=rows, days=9, limit=0)   # noqa: E731
+    return T.bike_history(bike, today=TODAY, read=reader(list(events)), topic=topic)
+
+
+class FiveLimitsTest(unittest.TestCase):
+    # п.1 — возраст от удачного захода часов, последняя строка отдельно
+    def test_age_from_clock_run_and_last_row_separately(self):
+        first = msgs30(U6908)["text"].splitlines()[0]
+        self.assertTrue(first.startswith("возраст архива: последний удачный заход часов 2026-09-30 09:03 UTC — "
+                                         "0.2 сут назад; последняя строка 2026-09-29 08:18 UTC — 1.2 сут назад"),
+                        first)
+
+    def test_age_unknown_when_stamp_unread_or_last_run_failed(self):
+        r = msgs30(U6908, stamp=lambda: (None, "штампа часов нет (x)"))
+        self.assertTrue(r["text"].startswith("возраст архива: НЕИЗВЕСТНО — штампа часов нет (x); последняя строка "
+                                             "2026-09-29 08:18 UTC"), r["text"])
+        self.assertIsNone(r["clock_at"])
+        r = msgs30(U6908, stamp=stamp_ok(outcome="error", error="код 3", why="не авторизованы", seq=3, done_seq=3))
+        self.assertIn("возраст архива: НЕИЗВЕСТНО — последний завершённый заход часов №3 — error (не авторизованы)",
+                      r["text"].splitlines()[0])
+        self.assertIsNone(r["clock_at"])
+
+    def test_age_while_new_run_in_progress_is_from_done_run(self):
+        # Идёт заход №3: ran_at — уже его заявка (12:00), удачный №2 стартовал в 09:03.
+        r = msgs30(U6908, stamp=stamp_ok(seq=3, running=True, ran_at=1790769600.0))
+        self.assertIn("последний удачный заход часов 2026-09-30 09:03 UTC", r["text"].splitlines()[0])
+
+    def test_read_stamp_file(self):
+        with mock.patch.dict(os.environ, {T.STAMP_ENV: STAMP_FILE}):
+            st, why = T._read_stamp()
+        self.assertEqual((st["outcome"], st["oldest_utc"], why), ("ok", "2026-09-24T03:23:38+00:00", None))
+        st, why = T._read_stamp(os.path.join(ARCHIVE, "нет_штампа.json"))
+        self.assertIsNone(st)
+        self.assertTrue(why.startswith("штампа часов нет"))
+
+    # п.2 — темы нет: «тихо с <начало покрытия>» при известном покрытии, иначе НЕИЗВЕСТНО
+    def test_no_topic_with_known_coverage_is_quiet_since(self):
+        r = msgs30(U4957)
+        self.assertEqual((r["verdict"], r["quiet_since"]), (T.QUIET, "2026-09-24 03:23"))
+        line = r["text"].splitlines()[1]
+        self.assertTrue(line.startswith("в теме тихо с 2026-09-24 03:23 UTC: темы с номером 4957 в архиве нет"), line)
+        self.assertIn("2026-09-24 03:23 → 2026-09-30 09:03 UTC без разрыва", line)
+        self.assertIn("тем без номера в имени 1", line)
+        self.assertNotIn("НЕИЗВЕСТНО", r["text"])
+
+    def test_no_topic_without_known_coverage_is_unknown(self):
+        for st in (lambda: (None, "штампа часов нет (x)"), stamp_ok(outcome="error", why="код 4"),
+                   stamp_ok(oldest_utc=None)):
+            r = msgs30(U4957, stamp=st)
+            self.assertEqual(r["verdict"], T.UNKNOWN)
+            self.assertIn("НЕИЗВЕСТНО: темы у байка в архиве нет (номер 4957", r["text"])
+            self.assertNotIn("тихо", r["text"])
+        stale = [x for x in ROWS if x["ts"] < "2026-09-24"]           # архив старше окна захода
+        r = msgs30(U4957, rows=stale)
+        self.assertEqual(r["verdict"], T.UNKNOWN)
+        self.assertIn("в архиве нет строк окна последнего захода", r["text"])
+
+    # п.3 — история видит тему
+    def test_history_repair_from_topic_with_last_message(self):
+        r = hist30(U6908)                                         # событий 0, в теме «тормоз» 27.09
+        self.assertEqual(r["verdict"], T.REPAIR)
+        self.assertEqual([h["ts"] for h in r["topic"]["repair"]], ["2026-09-27 07:45"])
+        self.assertIn("тема «NMAX 155 GREY GOLD 6908»: последнее 2026-09-27 08:00 UTC · бот · фото: нет; "
+                      "слова ремонта за 3 сут: 2026-09-27 07:45 UTC (человек)", r["text"])
+
+    def test_history_last_message_people_text_and_old_topic_quiet(self):
+        r = hist30(U798)                                          # тема: только 22.09, 8 сут назад
+        self.assertEqual(r["verdict"], T.ASK_THAI)
+        self.assertIn("тема «ADV 350 GREY 798»: последнее 2026-09-22 04:33 UTC · человек · фото: нет · "
+                      "выдуманная: подшипник гудит; слова ремонта за 3 сут: нет", r["text"])
+        self.assertEqual(r["marks"], [])                          # 8 сут > 7 — без пометки
+
+    def test_history_fresh_topic_record_is_fresh(self):
+        r = hist30(U9315)                                         # событий 0, фото человека 29.09
+        self.assertEqual(r["verdict"], T.AVAILABLE)
+        self.assertEqual(r["topic"]["fresh_human"], 1)
+        self.assertIn("последнее 2026-09-29 08:18 UTC · человек · фото: да · —", r["text"])
+
+    def test_history_quiet_and_unknown_topic_visible(self):
+        r = hist30(U4957)
+        self.assertEqual(r["verdict"], T.ASK_THAI)
+        self.assertTrue(r["text"].endswith("; тема: тихо с 2026-09-24 03:23 UTC"), r["text"])
+        r = hist30(U4957, stamp=lambda: (None, "штампа часов нет (x)"))
+        self.assertIn("; тема: НЕИЗВЕСТНО — темы у байка в архиве нет", r["text"])
+
+    # п.4 — ремонт старше окна, не старше 7 суток: пометка, вердикт тот же
+    def test_old_repair_word_marks_without_changing_verdict(self):
+        r = hist30(U4685)                                         # «мастерская» 26.09 (4 сут), фото 29.09
+        self.assertEqual(r["verdict"], T.AVAILABLE)
+        self.assertEqual(r["marks"], ["было упоминание ремонта 26.09, уточнить"])
+        self.assertEqual(r["topic"]["repair"], [])
+        r = T.bike_history(U4957, today=TODAY, topic=None,
+                           read=reader([ev("2026-09-29", "пробег записан"), ev("2026-09-25", "тормоза скрипят"),
+                                        ev("2026-09-22", "колодки")]))
+        self.assertEqual((r["verdict"], r["marks"]), (T.AVAILABLE, ["было упоминание ремонта 25.09, уточнить"]))
+        r = T.bike_history(U4957, today=TODAY, topic=None,
+                           read=reader([ev("2026-09-29", "пробег записан"), ev("2026-09-22", "колодки")]))
+        self.assertEqual((r["verdict"], r["marks"]), (T.AVAILABLE, []))       # 8 сут > 7 — без пометки
+
+    # п.5 — тема по номеру с другим именем
+    def test_plate_match_with_other_name_is_marked(self):
+        r = msgs30(U9315)
+        self.assertIn("тема найдена по номеру 9315: имя темы «X-Max Black 9315», имя юнита «%s» (нет в имени юнита: "
+                      "black)" % U9315, r["text"])
+        self.assertEqual((r["name_gap"] or {}).get("words"), ["black"])
+        h = hist30(U9315)
+        self.assertIn("тема по номеру 9315: имя темы «X-Max Black 9315», имя юнита «%s» — уточнить" % U9315,
+                      h["marks"])
+        for bike in (U6908, U4685, U798, "ADV 350 GREY 798"):    # имена сходятся — пометки нет
+            self.assertIsNone(msgs30(bike)["name_gap"], bike)
 
 
 class ClosureTest(unittest.TestCase):

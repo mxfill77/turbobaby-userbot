@@ -1,0 +1,15 @@
+{
+ "done_at": 1790759040.2025268,
+ "done_seq": 2,
+ "duration_s": 45.7,
+ "error": null,
+ "every_min": 720,
+ "messages": 12,
+ "newest_utc": "2026-09-29T08:18:00+00:00",
+ "oldest_utc": "2026-09-24T03:23:38+00:00",
+ "outcome": "ok",
+ "ran_at": 1790758994.446715,
+ "running": false,
+ "seq": 2,
+ "why": null
+}

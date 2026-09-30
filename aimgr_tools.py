@@ -6,6 +6,11 @@
 Задание 0063-75f.3009: `bike_history` берёт день события из живого `msg_date` (строка JS-даты), и
 четвёртый — `bike_topic_msgs` (последние сообщения темы байка из архива форума «Обслуживание» на ПК,
 возраст архива первой строкой).
+Задание 0068-75k.3009 (пять пределов AIMGRACCEPT3009 §5): возраст архива — от последнего УДАЧНОГО
+захода часов по их штампу, время последней строки — отдельно; «темы нет» при известном покрытии —
+«в теме тихо с <начало>»; `bike_history` видит тему (последнее сообщение, слова ремонта за N суток,
+«в ремонте» по событиям ИЛИ теме); слова ремонта старше окна, но не старше 7 суток — пометка без
+смены вердикта; тема по номеру с расходящимся именем — пометка с обоими именами.
 
 ГРАНИЦА С КЛИЕНТСКИМ КОНТУРОМ — В ОДНУ СТОРОНУ. Этот модуль МОЖЕТ читать `suggest`/`pricing`
 (ленивым импортом внутри функций: одна мерка с боевым путём, своих копий правил нет), но ни
@@ -25,6 +30,8 @@
 """
 
 import datetime
+import json
+import os
 import re
 
 # ------------------------------- 1. free_bikes ---------------------------------------------------
@@ -193,7 +200,55 @@ def _service_marks(bike, services):
     return marks
 
 
-def bike_history(bike, *, today=None, read=None, days=FRESH_DAYS):
+REPAIR_NOTE_DAYS = 7          # слова ремонта старше окна, но не старше 7 суток — пометка, не вердикт
+
+
+def _ago(day, today):
+    return (today - day).days
+
+
+def _topic_part(t, today, days):
+    """Ответ `bike_topic_msgs` → сводка темы для `bike_history` (без вердикта): последнее сообщение,
+    слова ремонта за `days` суток, свежие записи людей, слова ремонта старше окна (≤ 7 суток)."""
+    part = {"verdict": (t or {}).get("verdict", UNKNOWN), "id": None, "name": None, "last": None,
+            "repair": [], "repair_old": [], "fresh_human": 0, "why": list((t or {}).get("why") or ()),
+            "quiet_since": (t or {}).get("quiet_since"), "name_gap": (t or {}).get("name_gap")}
+    if part["verdict"] not in (FOUND, EMPTY):
+        return part
+    part["id"], part["name"] = t["topic"]["id"], t["topic"]["name"]
+    part["last"] = t.get("last")
+    for v in t.get("rows") or ():
+        ts = _row_ts(v)
+        if ts is None:
+            continue
+        age = _ago(ts.astimezone(PHUKET).date(), today)
+        word = _REPAIR_RE.search(v.get("text") or "")
+        hit = {"ts": ts.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M"), "bot": v.get("bot"),
+               "day": ts.astimezone(PHUKET).date(), "word": word.group(0).lower() if word else None}
+        if age <= days:
+            if word:
+                part["repair"].append(hit)
+            if not v.get("bot"):
+                part["fresh_human"] += 1
+        elif age <= REPAIR_NOTE_DAYS and word:
+            part["repair_old"].append(hit)
+    return part
+
+
+def _topic_text(p, days):
+    if p["verdict"] == QUIET:
+        return "тема: тихо с %s UTC" % p["quiet_since"]
+    if p["verdict"] not in (FOUND, EMPTY):
+        return "тема: %s — %s" % (UNKNOWN, "; ".join(p["why"]) or "не прочитана")
+    last = p["last"] or {}
+    who = "бот" if last.get("bot") else "человек"
+    say = "" if last.get("bot") else " · " + ((last.get("text") or "").replace("\n", " ") or "—")
+    rep = ", ".join("%s UTC (%s)" % (h["ts"], "бот" if h["bot"] else "человек") for h in p["repair"])
+    return "тема «%s»: последнее %s UTC · %s · фото: %s%s; слова ремонта за %d сут: %s" % (
+        p["name"], _hm(last.get("ts")), who, "да" if last.get("photo") else "нет", say, days, rep or "нет")
+
+
+def bike_history(bike, *, today=None, read=None, days=FRESH_DAYS, topic="archive", now=None):
     """Последние события и ТО байка → вердикт для агента.
 
     read(bike) → (события, строки_обслуживания): события — `items` ответа `read_events`, строки —
@@ -203,10 +258,17 @@ def bike_history(bike, *, today=None, read=None, days=FRESH_DAYS):
     День записи — из `msg_date` (живой вид — строка JS-даты), запасной `recorded_at` — только когда
     msg_date нет или он не разобран; сколько записей датировано запасным, видно в `day_src`, `why`
     и в хвосте `text`.
-    → {"bike","verdict","text","marks","why","fresh","last_day","day_src"}"""
-    today = today or datetime.datetime.now(PHUKET).date()
+    topic(bike) → ответ `bike_topic_msgs` (по умолчанию — архив Обслуживания на ПК, окно 8 суток);
+    None — тема не читается (прежнее поведение). Тема ВИДНА в ответе: последнее сообщение и слова
+    ремонта за `days` суток; «в ремонте» — слово ремонта в событиях ИЛИ в теме за `days` суток;
+    свежая запись человека в теме — свежая запись (тайцы — только когда свежего нет нигде). Слова
+    ремонта старше окна, но не старше 7 суток — пометка «было упоминание ремонта <дата>, уточнить»,
+    вердикт от неё не меняется. Тема по номеру с другим именем — пометка с обоими именами.
+    → {"bike","verdict","text","marks","why","fresh","last_day","day_src","topic"}"""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    today = today or now.astimezone(PHUKET).date()
     out = {"bike": bike, "verdict": UNMEASURED, "text": UNMEASURED, "marks": [], "why": [],
-           "fresh": 0, "last_day": None, "day_src": {"msg_date": 0, "recorded_at": 0}}
+           "fresh": 0, "last_day": None, "day_src": {"msg_date": 0, "recorded_at": 0}, "topic": None}
     if read is None:
         out["why"].append("источник не подключён")
         return out
@@ -238,15 +300,28 @@ def bike_history(bike, *, today=None, read=None, days=FRESH_DAYS):
         out["why"].append("даты записей не читаются")
         return out
     out["last_day"] = dated[0][0].isoformat() if dated else None
-    fresh = [(d, ev) for d, ev in dated if (today - d).days <= days]
+    fresh = [(d, ev) for d, ev in dated if _ago(d, today) <= days]
     out["fresh"] = len(fresh)
     out["marks"] = _service_marks(bike, services)
-    if not fresh:
+    tp = None
+    if topic == "archive":
+        topic = lambda b: bike_topic_msgs(b, days=REPAIR_NOTE_DAYS + 1, limit=0, now=now)  # noqa: E731
+    if topic is not None:
+        try:
+            tp = _topic_part(topic(bike), today, days)
+        except Exception as e:                   # noqa: BLE001 — тема не прочитана = НЕИЗВЕСТНО
+            tp = _topic_part({"verdict": UNKNOWN, "why": ["тема не прочитана: %s" % type(e).__name__]},
+                             today, days)
+        out["topic"] = tp
+    t_repair, t_fresh = (tp["repair"], tp["fresh_human"]) if tp else ([], 0)
+    if not fresh and not t_fresh:
         out["verdict"] = ASK_THAI
-        out["why"].append("в теме нет записей за %d дн. (последняя: %s)" % (days, out["last_day"] or "нет"))
-    elif any(_REPAIR_RE.search(str(ev.get("notes") or "")) for _d, ev in fresh):
+        out["why"].append("нет записей за %d дн. ни в событиях (последняя: %s), ни от людей в теме"
+                          % (days, out["last_day"] or "нет"))
+    elif t_repair or any(_REPAIR_RE.search(str(ev.get("notes") or "")) for _d, ev in fresh):
         out["verdict"] = REPAIR
-        out["why"].append("свежая запись о тормозах/подшипниках/мастерской")
+        out["why"].append("свежая запись о тормозах/подшипниках/мастерской (%s)"
+                          % ("тема" if t_repair else "события"))
     else:
         out["verdict"] = AVAILABLE
         for _d, ev in fresh:                     # newest-first: мойка раньше грязи снимает пометку
@@ -255,8 +330,19 @@ def bike_history(bike, *, today=None, read=None, days=FRESH_DAYS):
             if _DIRTY_RE.search(str(ev.get("notes") or "")):
                 out["marks"].insert(0, "помыть")
                 break
+    old = [d for d, ev in dated if days < _ago(d, today) <= REPAIR_NOTE_DAYS
+           and _REPAIR_RE.search(str(ev.get("notes") or ""))]
+    old += [h["day"] for h in (tp or {}).get("repair_old") or ()]
+    if old:
+        out["marks"].append("было упоминание ремонта %s, уточнить" % max(old).strftime("%d.%m"))
+    gap = (tp or {}).get("name_gap")
+    if gap:
+        out["marks"].append("тема по номеру %s: имя темы «%s», имя юнита «%s» — уточнить"
+                            % (gap["plate"], gap["topic"], gap["bike"]))
     sep = ", " if out["verdict"] == AVAILABLE else "; "
     out["text"] = out["verdict"] + (sep + "пометка: " + ", ".join(out["marks"]) if out["marks"] else "") + tail
+    if tp:
+        out["text"] += "; " + _topic_text(tp, days)
     return out
 
 
@@ -319,14 +405,21 @@ def rules():
 # ИСТОЧНИК (AIMGRTOPIC3009): архив форума «Обслуживание» на ПК — `chatlog/servicing/ГГГГ/ММ/*.jsonl`,
 # строка = сообщение темы: ts (ISO с поясом), topic_id, topic_name (= имя байка), text (очищен
 # `chatlog_store.scrub`), media (фото: исход СОХРАНЁН и путь к файлу), bot, who_ref. Читается ДВЕРЬЮ
-# `chatlog_find.search_days`, выдача — в её конверте ENVELOPE. Архив сам не обновляется (захват
-# `chatlog_servicing_fetch` — руками), поэтому ПЕРВАЯ строка ответа — возраст архива.
+# `chatlog_find.search_days`, выдача — в её конверте ENVELOPE. ПЕРВАЯ строка ответа — возраст архива.
+# Архив пополняют ЧАСЫ (`chatlog_servicing_tick`, SVCCLOCK3009) — их штамп
+# `tmp/chatlog_servicing_tick/state.json` хранит ran_at / outcome / newest_utc / oldest_utc последнего
+# завершённого захода. Возраст считается от удачного ЗАХОДА (тишина форума — не отставание архива),
+# время последней строки — отдельно. Захват читает ВЕСЬ форум от новых к старым, поэтому окно
+# удачного захода [oldest_utc, заход] скачано без разрыва по всем темам — на этом стоит «тихо».
 FOUND = "есть сообщения"
 EMPTY = "сообщений нет"
+QUIET = "тихо"
 UNKNOWN = "НЕИЗВЕСТНО"
 TOPIC_GROUP = "servicing"
 TOPIC_DAYS = 7
 TOPIC_LIMIT = 20
+STAMP_ENV = "CHATLOG_SERVICING_TICK_STATE"      # то же имя, что у самих часов
+DEFAULT_STAMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp", "chatlog_servicing_tick", "state.json")
 
 
 def _norm_name(s):
@@ -354,12 +447,78 @@ def _read_archive(group=TOPIC_GROUP):
     return rows, None
 
 
-def _age_line(last, now):
+def _hm(t):
+    """Миг (datetime или ISO-строка) → «ГГГГ-ММ-ДД ЧЧ:ММ» UTC."""
+    if not isinstance(t, datetime.datetime):
+        t = _row_ts({"ts": t})
+    return t.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M") if t else "?"
+
+
+def _read_stamp(path=None):
+    """Штамп часов архива → (dict, None) или (None, причина). Только чтение файла."""
+    path = path or (os.getenv(STAMP_ENV) or "").strip() or DEFAULT_STAMP
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        return None, "штампа часов нет (%s)" % path
+    except (OSError, ValueError) as e:
+        return None, "штамп часов не прочитан: %s" % type(e).__name__
+    return (st, None) if isinstance(st, dict) else (None, "штамп часов не словарь")
+
+
+def _clock_at(st):
+    """Штамп → (миг последнего УДАЧНОГО захода, None) или (None, причина).
+
+    Поля исхода штампа (outcome, newest/oldest_utc, done_at, duration_s) — всегда про заход
+    № done_seq. Пока идёт новый заход (running / seq ≠ done_seq), `ran_at` — уже ЕГО заявка, и миг
+    удачного берётся как done_at − duration_s (старт того захода)."""
+    if st.get("outcome") != "ok":
+        return None, "последний завершённый заход часов №%s — %s%s: миг удачного захода штамп не хранит" % (
+            st.get("done_seq") or "?", st.get("outcome") or "исхода нет",
+            " (%s)" % (st.get("why") or st.get("error")) if (st.get("why") or st.get("error")) else "")
+    try:
+        if st.get("seq") == st.get("done_seq") and not st.get("running"):
+            at = float(st["ran_at"])
+        else:
+            at = float(st["done_at"]) - float(st["duration_s"])
+        return datetime.datetime.fromtimestamp(at, datetime.timezone.utc), None
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return None, "в штампе нет времени удачного захода"
+
+
+def _age_line(last, now, at=None, at_why=None):
+    """Первая строка ответа: возраст по удачному ЗАХОДУ часов, последняя строка — отдельно."""
+    if at is not None:
+        head = "возраст архива: последний удачный заход часов %s UTC — %.1f сут назад" % (
+            _hm(at), (now - at).total_seconds() / 86400.0)
+    else:
+        head = "возраст архива: %s — %s" % (UNKNOWN, at_why or "штамп часов не прочитан")
     if last is None:
-        return "возраст архива: неизвестен — последняя строка не найдена"
-    return ("возраст архива: последняя строка %s UTC — %.1f сут назад (порога-отказа нет: не измерено, "
-            "какая давность ещё годна)" % (last.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                                          (now - last).total_seconds() / 86400.0))
+        return head + "; последняя строка не найдена"
+    return head + ("; последняя строка %s UTC — %.1f сут назад (порога-отказа нет: не измерено, какая "
+                   "давность ещё годна)" % (_hm(last), (now - last).total_seconds() / 86400.0))
+
+
+def _coverage(st, at, last):
+    """→ ((начало, конец), None) или (None, причина). Покрытие без разрыва — окно удачного захода:
+    от старейшего взятого сообщения (`oldest_utc`) до мига захода. Архив обязан это окно содержать
+    (последняя строка не старше `oldest_utc`), иначе читаем не тот архив, что описывает штамп."""
+    if at is None:
+        return None, "удачного захода часов не видно"
+    old = _row_ts({"ts": (st or {}).get("oldest_utc")})
+    if old is None:
+        return None, "штамп не называет начало окна захода (oldest_utc)"
+    if last is None or last < old:
+        return None, "в архиве нет строк окна последнего захода (последняя строка %s, окно с %s)" % (
+            _hm(last) if last else "—", _hm(old))
+    return (old, at), None
+
+
+def _name_gap(topic_name, bike):
+    """Слова имени темы, которых нет в имени юнита (сверка без пробелов/дефисов: «X-Max» = «XMAX»)."""
+    squashed = re.sub(r"[\W_]+", "", str(bike or "").lower())
+    return [w for w in re.findall(r"[^\W_]+", str(topic_name or "").lower()) if w not in squashed]
 
 
 def _msg_view(r):
@@ -377,21 +536,30 @@ def _msg_line(v):
     return "%s · %s · %s · %s" % (head, who, ph, v["text"].replace("\n", " ") or "—")
 
 
-def bike_topic_msgs(bike, *, days=TOPIC_DAYS, limit=TOPIC_LIMIT, now=None, read=None):
+def bike_topic_msgs(bike, *, days=TOPIC_DAYS, limit=TOPIC_LIMIT, now=None, read=None, stamp=None):
     """Последние сообщения темы байка из архива форума «Обслуживание» за `days` суток.
 
     Тема ищется по имени байка: сначала точное имя темы, потом номер (`plate_of`, зеркало моста).
     read() → (строки, причина_отказа) — инъекция для тестов; по умолчанию дверь `chatlog_find`.
-    Три исхода:
+    stamp() → (штамп часов, причина_отказа) — инъекция; по умолчанию файл штампа (только чтение).
+    Четыре исхода:
       FOUND — сообщения в окне есть: последние `limit` штук по времени (старые → новые);
       EMPTY — тема в архиве есть, в окне пусто: «сообщений нет за N суток»;
-      UNKNOWN — архив не прочитан или темы у байка в архиве нет: НЕИЗВЕСТНО с причиной (молчание
-      архива пустотой не является: он хранит только скачанные окна).
-    Первая строка `text` — ВСЕГДА возраст архива (время последней строки, сколько суток назад).
-    → {"bike","verdict","text","age","last_ts","topic","rows","counts","why"}"""
+      QUIET — темы у байка в архиве нет, а покрытие без разрыва известно по штампу часов:
+      «в теме тихо с <начало покрытия>»;
+      UNKNOWN — архив не прочитан, или темы нет и покрытие НЕ известно: НЕИЗВЕСТНО с причиной
+      (молчание архива пустотой не является: он хранит только скачанные окна).
+    Первая строка `text` — ВСЕГДА возраст архива: от последнего удачного захода часов (штамп не
+    прочитан — НЕИЗВЕСТНО с причиной), время последней строки — отдельно.
+    Тема найдена по номеру, а в её имени есть слова, которых нет в имени юнита, — `name_gap` и
+    строка с обоими именами. `last` — последнее сообщение темы вне зависимости от окна.
+    → {"bike","verdict","text","age","clock_at","coverage","last_ts","topic","last","rows","counts",
+       "name_gap","quiet_since","why"}"""
     now = now or datetime.datetime.now(datetime.timezone.utc)
-    out = {"bike": bike, "verdict": UNKNOWN, "text": "", "age": None, "last_ts": None, "topic": None,
-           "rows": [], "counts": {"window": 0, "shown": 0, "photo": 0, "human_text": 0}, "why": []}
+    out = {"bike": bike, "verdict": UNKNOWN, "text": "", "age": None, "clock_at": None, "coverage": None,
+           "last_ts": None, "topic": None, "last": None, "rows": [],
+           "counts": {"window": 0, "shown": 0, "photo": 0, "human_text": 0}, "name_gap": None,
+           "quiet_since": None, "why": []}
     try:
         rows, why = (read or _read_archive)()
     except Exception as e:                       # noqa: BLE001 — не прочитан = НЕИЗВЕСТНО
@@ -399,7 +567,15 @@ def bike_topic_msgs(bike, *, days=TOPIC_DAYS, limit=TOPIC_LIMIT, now=None, read=
     stamped = [(t, r) for t, r in ((_row_ts(r), r) for r in (rows or ())) if t]
     last = max((t for t, _r in stamped), default=None)
     out["last_ts"] = last.isoformat() if last else None
-    out["age"] = _age_line(last, now)
+    try:
+        st, st_why = (stamp or _read_stamp)()
+    except Exception as e:                       # noqa: BLE001 — штамп не прочитан = НЕИЗВЕСТНО
+        st, st_why = None, "штамп часов не прочитан: %s" % type(e).__name__
+    at, at_why = _clock_at(st) if st is not None else (None, st_why)
+    out["clock_at"] = at.isoformat() if at else None
+    out["age"] = _age_line(last, now, at, at_why)
+    cov, cov_why = _coverage(st, at, last)
+    out["coverage"] = [cov[0].isoformat(), cov[1].isoformat()] if cov else None
     if rows is None or not stamped:
         out["why"].append(why or "архив не прочитан: у строк нет читаемого времени")
     else:
@@ -410,10 +586,19 @@ def bike_topic_msgs(bike, *, days=TOPIC_DAYS, limit=TOPIC_LIMIT, now=None, read=
         hit = [tid for tid, names in topics.items() if want and want in {_norm_name(n) for n in names}]
         if not hit and plate:
             hit = [tid for tid, names in topics.items() if any(plate_of(n) == plate for n in names)]
-        if not hit:
+        if not hit and plate and cov:
+            bare = sum(1 for names in topics.values() if not any(plate_of(n) for n in names))
+            out["verdict"] = QUIET
+            out["quiet_since"] = _hm(cov[0])
+            out["why"].append("темы с номером %s в архиве нет, а архив покрывает %s → %s UTC без разрыва "
+                              "(последний удачный заход часов); позже захода — не скачано; тем без номера "
+                              "в имени %d — среди них тему байка не опознать"
+                              % (plate, _hm(cov[0]), _hm(cov[1]), bare))
+        elif not hit:
             out["why"].append("темы у байка в архиве нет (%s; тем в архиве %d) — архив хранит только скачанные "
-                              "окна, это не «пусто»" % ("номер %s" % plate if plate else "в имени нет номера",
-                                                         len(topics)))
+                              "окна, это не «пусто»; покрытие не известно: %s" % (
+                                  "номер %s" % plate if plate else "в имени нет номера", len(topics),
+                                  cov_why or "в имени нет номера"))
         elif len(hit) > 1:
             out["why"].append("байку подходят %d темы архива — какая его, не решить" % len(hit))
         else:
@@ -421,6 +606,11 @@ def bike_topic_msgs(bike, *, days=TOPIC_DAYS, limit=TOPIC_LIMIT, now=None, read=
             mine = sorted(((t, r) for t, r in stamped if r.get("topic_id") == tid), key=lambda p: p[0])
             name = str(mine[-1][1].get("topic_name") or "")
             out["topic"] = {"id": tid, "name": name, "rows_all": len(mine)}
+            out["last"] = _msg_view(mine[-1][1])
+            by_name = want in {_norm_name(r.get("topic_name")) for _t, r in mine}
+            gap = [] if by_name else _name_gap(name, bike)
+            if gap:
+                out["name_gap"] = {"plate": plate, "topic": name, "bike": bike, "words": gap}
             since = now - datetime.timedelta(days=days)
             win = [_msg_view(r) for t, r in mine if t >= since]
             shown = win[-limit:] if limit else win
@@ -430,16 +620,25 @@ def bike_topic_msgs(bike, *, days=TOPIC_DAYS, limit=TOPIC_LIMIT, now=None, read=
                              "human_text": sum(1 for v in win if not v["bot"] and v["text"].strip())}
             out["verdict"] = FOUND if win else EMPTY
     lines = [out["age"]]
+    gap = out["name_gap"]
+    gap_line = ("тема найдена по номеру %s: имя темы «%s», имя юнита «%s» (нет в имени юнита: %s) — та ли "
+                "это тема, уточнить" % (gap["plate"], gap["topic"], gap["bike"], ", ".join(gap["words"]))
+                if gap else None)
     if out["verdict"] == UNKNOWN:
         lines.append("%s: %s" % (UNKNOWN, "; ".join(out["why"])))
+    elif out["verdict"] == QUIET:
+        lines.append("в теме тихо с %s UTC: %s" % (out["quiet_since"], "; ".join(out["why"])))
     elif out["verdict"] == EMPTY:
-        lines.append("тема «%s»: сообщений нет за %d суток" % (out["topic"]["name"], days))
+        lines.append("тема «%s»: сообщений нет за %d суток (последнее %s UTC)"
+                     % (out["topic"]["name"], days, _hm(out["last"]["ts"])))
+        lines.extend([gap_line] if gap_line else [])
     else:
         import chatlog_find
         c = out["counts"]
         lines.append(chatlog_find.ENVELOPE)
         lines.append("тема «%s»: за %d суток сообщений %d (показаны последние %d), с фото %d, людей с текстом %d"
                      % (out["topic"]["name"], days, c["window"], c["shown"], c["photo"], c["human_text"]))
+        lines.extend([gap_line] if gap_line else [])
         lines.extend(_msg_line(v) for v in out["rows"])
     out["text"] = "\n".join(lines)
     return out
