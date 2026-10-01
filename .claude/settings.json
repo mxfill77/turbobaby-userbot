@@ -116,7 +116,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "D:/turbobaby-bot/venv/Scripts/python.exe D:/turbobaby-bot/dispatch_notify.py --hook notification"
+            "command": "D:/turbobaby-bot/venv/Scripts/pythonw.exe D:/turbobaby-bot/dispatch_notify.py --hook notification"
           }
         ]
       }
@@ -126,7 +126,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "D:/turbobaby-bot/venv/Scripts/python.exe D:/turbobaby-bot/dispatch_notify.py --hook stop"
+            "command": "D:/turbobaby-bot/venv/Scripts/pythonw.exe D:/turbobaby-bot/dispatch_notify.py --hook stop"
           }
         ]
       }
@@ -136,7 +136,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "D:/turbobaby-bot/venv/Scripts/python.exe D:/turbobaby-bot/dispatch_notify.py --hook session_end"
+            "command": "D:/turbobaby-bot/venv/Scripts/pythonw.exe D:/turbobaby-bot/dispatch_notify.py --hook session_end"
           }
         ]
       }
@@ -147,7 +147,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "D:/turbobaby-bot/venv/Scripts/python.exe D:/turbobaby-bot/pretool_guard.py"
+            "command": "D:/turbobaby-bot/venv/Scripts/pythonw.exe D:/turbobaby-bot/pretool_guard.py"
           }
         ]
       }

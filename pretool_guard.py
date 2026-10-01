@@ -6294,6 +6294,7 @@ def _push(card, kind=""):
             guard_push_argv(card, kind),
             cwd=PROJECT,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            creationflags=_NO_WINDOW,
         )
     except Exception:
         pass  # пуш вторичен — не роняем решение
