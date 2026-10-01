@@ -130,6 +130,7 @@ def main(argv=None):
             input=line.encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         sys.stdout.write("ЖУРНАЛ: код %d %s\n" % (done.returncode, done.stdout.decode("utf-8", "replace").strip()))
         if done.returncode != 0:

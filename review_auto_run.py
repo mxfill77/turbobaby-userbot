@@ -106,6 +106,7 @@ def journal(line, repo=HERE, runner=None):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=240,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except Exception as exc:                      # журнал НИКОГДА не роняет контур
         return -1, "журнал не ответил: %s" % exc
@@ -130,6 +131,7 @@ def verify_commits(claimed, root=HERE, runner=None):
             done = run(
                 ["git", "cat-file", "-e", "%s^{commit}" % sha],
                 cwd=root, capture_output=True, timeout=GIT_TIMEOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except Exception:
             continue                              # git недоступен → коммит НЕ подтверждён (не «подтверждён»)

@@ -241,7 +241,7 @@ def git_moves(root, since_ts, paths, runner=None):
     when = datetime.datetime.fromtimestamp(float(since_ts), datetime.timezone.utc).isoformat()
     argv = ["git", "log", "--since=%s" % when, "--pretty=format:%h %s", "--"] + list(paths)
     try:
-        done = run(argv, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        done = run(argv, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception as exc:                       # noqa: BLE001
         return None, "git не ответил: %s" % _cause(exc)
     if done.returncode != 0:

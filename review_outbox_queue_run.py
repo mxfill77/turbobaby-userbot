@@ -302,7 +302,7 @@ def retry_one(rec, *, root=HERE, runner=None, timeout=RETRY_TIMEOUT):
     run = runner or subprocess.run
     argv = retry_argv(rec, root)
     try:
-        done = run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, cwd=root)
+        done = run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, cwd=root, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception as exc:                       # noqa: BLE001 — повтор НИКОГДА не роняет оборот
         return False, "retry_launch_failed", "повтор не запустился: %s" % exc
     out = (done.stdout or b"").decode("utf-8", "replace")
@@ -495,7 +495,7 @@ def journal(line, repo=HERE, runner=None):
     try:
         done = run([sys.executable, os.path.join(repo, JOURNAL_WRITER), "-"],
                    input=line.encode("utf-8"), stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE, timeout=240)
+                   stderr=subprocess.PIPE, timeout=240, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception as exc:                       # noqa: BLE001 — журнал НИКОГДА не роняет оборот
         return -1, "журнал не ответил: %s" % exc
     return done.returncode, done.stdout.decode("utf-8", "replace").strip()

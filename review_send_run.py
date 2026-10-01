@@ -305,6 +305,7 @@ def send_codex(prompt, *, root, workdir, binary=None, model=None, cd=None, timeo
             cwd=root,
             env=child_env(),
             timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except subprocess.TimeoutExpired:
         facts["timed_out"] = True
@@ -1534,6 +1535,7 @@ def main(argv=None):
                 input=line.encode("utf-8"),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             sys.stdout.write(
                 "ЖУРНАЛ: код %d %s\n" % (done.returncode, done.stdout.decode("utf-8", "replace").strip())

@@ -371,7 +371,7 @@ def journal(line, repo=HERE, runner=None):
     try:
         done = run([sys.executable, os.path.join(repo, JOURNAL_WRITER), "-"],
                    input=line.encode("utf-8"), stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE, timeout=240)
+                   stderr=subprocess.PIPE, timeout=240, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception as exc:                       # журнал НИКОГДА не роняет ступень
         return -1, "журнал не ответил: %s" % exc
     return done.returncode, done.stdout.decode("utf-8", "replace").strip()

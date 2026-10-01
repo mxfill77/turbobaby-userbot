@@ -592,7 +592,7 @@ def _default_git_verify(ref):
     try:
         p = subprocess.run(["git", "rev-parse", "--verify", "--quiet", str(ref) + "^{commit}"],
                            cwd=REPO, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=15)
+                           errors="replace", timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return p.returncode == 0
     except Exception:
         return False

@@ -176,7 +176,7 @@ def _git(args, root, runner=None):
     run = runner or subprocess.run
     try:
         done = run(["git", "-C", root] + list(args), stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE, timeout=GIT_TIMEOUT)
+                   stderr=subprocess.PIPE, timeout=GIT_TIMEOUT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception as exc:                       # noqa: BLE001 — «git не ответил» ≠ «пусто»
         return None, str(exc)
     if done.returncode != 0:
@@ -447,7 +447,7 @@ def journal(line, repo=HERE, runner=None):
     try:
         done = run([sys.executable, os.path.join(repo, JOURNAL_WRITER), "-"],
                    input=line.encode("utf-8"), stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE, timeout=240)
+                   stderr=subprocess.PIPE, timeout=240, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception as exc:                       # журнал НИКОГДА не роняет контур
         return -1, "журнал не ответил: %s" % exc
     return done.returncode, done.stdout.decode("utf-8", "replace").strip()
