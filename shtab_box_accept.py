@@ -64,7 +64,12 @@ SCHEMA = "turbobaby.shtab_box_accept/v1"
 ACCEPTED = "ПРИНЯТО"
 RETRY = "ДОЖАТЬ"
 UNKNOWN = "НЕИЗВЕСТНО"
-VERDICTS = (ACCEPTED, RETRY, UNKNOWN)
+# 02.10.2026 (задание 0124e-78m.0210): ЧЕТВЁРТЫЙ ИСХОД — прочитали заявленное, и оно НЕ
+# подтвердилось. Граница та же, что у судьи закрытия (`done_judge_pc.UNPROVEN`): «не доказан»
+# выдаётся ТОЛЬКО после удавшегося чтения, ответившего «нет»; не прочитали — НЕИЗВЕСТНО.
+# На дожим он НЕ уходит: дожим чинит недописанный артефакт, а не несуществующий коммит.
+UNPROVEN = "НЕ ДОКАЗАН"
+VERDICTS = (ACCEPTED, RETRY, UNKNOWN, UNPROVEN)
 
 # ═════════════════════════ ПОТОЛОК ПОПЫТОК ═══════════════════════════════════
 # ПЯТЬ НА ЗАДАНИЕ — прямое решение владельца 04.09.2026: «если на одно задание
@@ -343,11 +348,253 @@ def answered(point_terms, art_stems, share=SHARE, min_hits=MIN_HITS):
     return bool(ok), missing, len(found), total
 
 
+# ═════════════════════════ ДОКАЗАТЕЛЬСТВО, А НЕ ПОКРЫТИЕ СЛОВ (02.10.2026) ═══════════════
+# ПОВОД — находка 1 внешнего аудита 02.10: accept() принял КОПИЮ ЗАДАНИЯ и отчёт
+# «доставка НЕ проверена, идентификатор НЕ записан, коммит НЕ применён, версия НЕ
+# подтверждена». Оба проходили по одной причине: доля опорных слов не знает, ОТКУДА слово
+# пришло (из самого задания) и ЧТО о нём сказано (что его НЕТ). Лексика остаётся, но
+# вспомогательным признаком; три правила ниже отнимают у неё право принимать в одиночку.
+#
+# ПРАВИЛО 1 — СВОИ СЛОВА. Опорное слово засчитывается, только если оно стоит в СВОЁМ тексте
+# артефакта, а не в куске, дословно взятом из тела задания (совпадение подряд из
+# :data:`COPY_NGRAM` слов). Своего текста меньше :data:`COPY_OWN_MIN` — артефакт и есть
+# копия задания: НЕИЗВЕСТНО с причиной.
+# ПРАВИЛО 2 — НЕ ПОД ОТРИЦАНИЕМ. Слово, стоящее только в отрезке с «не/нет/ни/нельзя»,
+# уликой не является. Отрезок — кусок между знаками препинания: «коммит НЕ применён» —
+# отрезок, и подлежащее «коммит» в нём отрицанием накрыто.
+# ПРАВИЛО 3 — ЗАЯВЛЕННОЕ ПРОВЕРЯЕТСЯ ЧТЕНИЕМ. Строка «РЕЗУЛЬТАТ:» тела задания называет вид
+# результата; судья читает его там, где он должен лежать, через ПОДАННОГО читателя (модуль
+# чистый: ssh живёт в руках, `shtab_box_run.server_reader`).
+#
+# Каждое правило, сработав, кладёт в вердикт поле ``rule`` — по нему судья закрытия
+# (`pc_orchestrator._judge_done`) узнаёт, что вердикт вынесен правилом доказательства, и
+# переносит его в очередь тем же словом. Одна функция — один вердикт на обоих путях.
+RULE_COPY, RULE_NEGATION, RULE_RESULT = "copy", "negation", "result"
+PROOF_RULES = (RULE_COPY, RULE_NEGATION, RULE_RESULT)
+
+# Пять слов подряд: «ветка на origin сервера» (4) — обычная фраза, её повтор цитатой не
+# является; пять совпавших подряд уже переписаны, а не сказаны. Замер на 32 артефактах
+# 02.10 — в таблице артефакта BOXACCEPTPROOF0210.
+COPY_NGRAM = 5
+COPY_OWN_MIN = 0.25
+TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+NEG_WORDS = frozenset(("не", "нет", "ни", "нельзя", "not"))
+CLAUSE_RE = re.compile(r"[\n\r.;:!?,—–()«»\[\]|]")
+
+# ── строка «РЕЗУЛЬТАТ:» ──
+RESULT_LINE_RE = re.compile(r"^\s*РЕЗУЛЬТАТ\s*:\s*(?P<what>\S.*?)\s*$", re.MULTILINE)
+KIND_BRANCH, KIND_MAIN, KIND_DECISION = "ветка", "живой main", "решение"
+KINDS = (KIND_BRANCH, KIND_MAIN, KIND_DECISION)
+# Имя ветки уходит в КОМАНДНУЮ СТРОКУ на сервере — форма проверяется здесь, до читателя.
+BRANCH_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._/-]{0,99}$")
+SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+# Хеш работы в FACT — тот, что стоит сразу после «commit/коммит». «main = f8f65b3» и
+# «HEAD f8f65b3» в той же строке — СВЕДЕНИЕ о чужом состоянии, а не заявка о своей работе:
+# прими их судья за заявку, артефакт «в прод НЕ применено, живой HEAD f8f65b3» прошёл бы
+# сверку с живым main (ровно класс «только ветка при требовании применения»).
+FACT_COMMIT_RE = re.compile(r"(?:commit|коммит\w*)\s+[`*]*([0-9a-f]{7,40})\b", re.IGNORECASE)
+FACT_BRANCH_RE = re.compile(r"(?:ветк[аеиуо]\w*|branch)\s+[`*]*([0-9A-Za-z][0-9A-Za-z._/-]{1,99})",
+                            re.IGNORECASE)
+FACT_HEAD_RE = re.compile(r"^[\s>*`#|+-]*FACT\b")
+DECISION_LINE_RE = re.compile(r"^[\s>*`#|+-]*РЕШЕНИЕ[*`]*\s*[:—-]\s*(?P<text>\S.*)$", re.MULTILINE)
+_BRANCH_NOISE = frozenset(("на", "origin", "сервера", "сервер", "github"))
+
+
+def _norm(word):
+    return word.casefold().replace("ё", "е")
+
+
+def _ngrams(words, n=COPY_NGRAM):
+    return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)}
+
+
+def own_text(body, artifact_text, n=COPY_NGRAM):
+    """Артефакт → (свои слова по отрезкам, доля своего). → ([(отрицание?, [слова])], float).
+
+    «Своё» — слово, не попавшее ни в одну цепочку из ``n`` слов подряд, дословно стоящую в
+    теле задания. Отрезок — кусок текста между знаками препинания; ``отрицание?`` — есть ли в
+    отрезке слово из :data:`NEG_WORDS` (считается по ВСЕМ словам отрезка, цитата тоже
+    отрицает). Доля своего — по словам артефакта; пустой артефакт — доля 0.0.
+    """
+    text = str(artifact_text or "")
+    toks = [(m.start(), _norm(m.group(0))) for m in TOKEN_RE.finditer(text)]
+    body_grams = _ngrams([_norm(w) for w in TOKEN_RE.findall(str(body or ""))], n)
+    copied = [False] * len(toks)
+    words = [w for _p, w in toks]
+    for i in range(len(words) - n + 1):
+        if tuple(words[i:i + n]) in body_grams:
+            for j in range(i, i + n):
+                copied[j] = True
+    cuts = [m.start() for m in CLAUSE_RE.finditer(text)]
+    clauses, ci, cur, cur_neg = [], 0, [], False
+    for k, (pos, word) in enumerate(toks):
+        while ci < len(cuts) and cuts[ci] < pos:
+            if cur or cur_neg:
+                clauses.append((cur_neg, cur))
+            cur, cur_neg = [], False
+            ci += 1
+        if word in NEG_WORDS:
+            cur_neg = True
+        if not copied[k]:
+            cur.append(word)
+    if cur or cur_neg:
+        clauses.append((cur_neg, cur))
+    share = (float(copied.count(False)) / len(toks)) if toks else 0.0
+    return clauses, share
+
+
+def _stems_of(clauses, negated=None):
+    out = set()
+    for neg, words in clauses:
+        if negated is None or neg == negated:
+            out |= stems(" ".join(words))
+    return out
+
+
+def result_claim(body):
+    """Тело задания → заявленный вид результата | None (строки «РЕЗУЛЬТАТ:» нет).
+
+    → ``{'kind': одно из KINDS | '', 'branch': имя | '', 'raw': строка}``. Незнакомый вид —
+    ``kind=''``: Штаб заявил то, чего судья проверять не умеет, и это НЕИЗВЕСТНО, а не
+    «строки нет» — молча вернуться на путь слов значило бы проглотить заявку.
+    """
+    match = RESULT_LINE_RE.search(str(body or ""))
+    if not match:
+        return None
+    raw = match.group("what").strip()
+    low = _norm(raw)
+    if low.startswith("ветк"):
+        branch = ""
+        for tok in raw.split()[1:]:
+            tok = tok.strip("`«»\"'.,;")
+            if tok and _norm(tok) not in _BRANCH_NOISE and BRANCH_RE.match(tok):
+                branch = tok
+                break
+        return {"kind": KIND_BRANCH, "branch": branch, "raw": raw}
+    if "main" in low or low.startswith("живой"):
+        return {"kind": KIND_MAIN, "branch": "main", "raw": raw}
+    if low.startswith("решени"):
+        return {"kind": KIND_DECISION, "branch": "", "raw": raw}
+    return {"kind": "", "branch": "", "raw": raw}
+
+
+def fact_lines(artifact_text):
+    """Строки FACT артефакта (с любой разметкой в начале). → [str]."""
+    return [ln for ln in str(artifact_text or "").splitlines() if FACT_HEAD_RE.match(ln)]
+
+
+def fact_commits(artifact_text):
+    """Хеши РАБОТЫ из строк FACT (после «commit/коммит»), по порядку, без повторов. → [str]."""
+    out = []
+    for ln in fact_lines(artifact_text):
+        for sha in FACT_COMMIT_RE.findall(ln):
+            sha = sha.lower()
+            if sha not in out:
+                out.append(sha)
+    return out
+
+
+def fact_branch(artifact_text):
+    """Первая ветка, названная в строке FACT. → str ('' — не названа)."""
+    for ln in fact_lines(artifact_text):
+        for name in FACT_BRANCH_RE.findall(ln):
+            name = name.rstrip(".,;:")
+            if BRANCH_RE.match(name) and _norm(name) not in _BRANCH_NOISE:
+                return name
+    return ""
+
+
+def _sha_match(remote, claimed):
+    remote = str(remote or "").strip().lower()
+    return bool(SHA_RE.match(remote[:40] or "x")) and any(remote.startswith(c) for c in claimed)
+
+
+def _read(reader, what, arg):
+    """Вызов читателя без права уронить приёмку. → (ok, value, why)."""
+    if reader is None:
+        return False, "", "читателя сервера не подали — проверить заявленное нечем"
+    try:
+        got = reader(what, arg)
+    except Exception as exc:                       # noqa: BLE001 — сбой чтения = НЕИЗВЕСТНО
+        return False, "", "чтение сорвалось: %s: %s" % (type(exc).__name__, str(exc)[:120])
+    if not isinstance(got, dict):
+        return False, "", "читатель ответил не по форме"
+    return bool(got.get("ok")), str(got.get("value") or ""), str(got.get("why") or "")
+
+
+def prove(body, artifact_text, reader=None):
+    """Строка «РЕЗУЛЬТАТ:» → проверка ЧТЕНИЕМ. → None (строки нет) | dict.
+
+    dict: ``verdict`` (:data:`ACCEPTED` — подтверждено, :data:`UNPROVEN`, :data:`UNKNOWN`),
+    ``why`` словами, ``kind``. ``reader(what, arg)`` → ``{'ok', 'value', 'why'}``:
+    ``('ls-remote', ветка)`` → хеш головы ветки на origin сервера ('' — ветки нет);
+    ``('live-main', None)`` → «<хеш> <имя ветки>» живого дерева сервера.
+    """
+    claim = result_claim(body)
+    if claim is None:
+        return None
+    kind = claim["kind"]
+
+    def out(verdict, why):
+        return {"verdict": verdict, "why": "РЕЗУЛЬТАТ «%s»: %s" % (claim["raw"][:80], why),
+                "kind": kind}
+
+    if not kind:
+        return out(UNKNOWN, "вид результата не распознан (знаю: %s) — проверять нечем"
+                   % ", ".join(KINDS))
+    if kind == KIND_DECISION:
+        body_low = _norm(str(body or ""))
+        for match in DECISION_LINE_RE.finditer(str(artifact_text or "")):
+            text = match.group("text").strip()
+            if len(TOKEN_RE.findall(text)) >= 3 and _norm(text) not in body_low:
+                return out(ACCEPTED, "решение названо строкой РЕШЕНИЕ своими словами")
+        return out(UNPROVEN, "в артефакте нет строки «РЕШЕНИЕ:» своими словами — "
+                             "заявленное решение не названо")
+    claimed = fact_commits(artifact_text)
+    if not claimed:
+        return out(UNPROVEN, "строки FACT не называют коммит (commit <хеш>) — заявленное "
+                             "подтверждать нечем")
+    if kind == KIND_BRANCH:
+        branch = claim["branch"] or fact_branch(artifact_text)
+        if not branch:
+            return out(UNPROVEN, "ветка не названа ни строкой РЕЗУЛЬТАТ, ни строкой FACT")
+        if not BRANCH_RE.match(branch) or ".." in branch:
+            return out(UNKNOWN, "имя ветки %r не по форме — читать сервер таким именем не стали"
+                       % branch[:60])
+        ok, value, why = _read(reader, "ls-remote", branch)
+        if not ok:
+            return out(UNKNOWN, "git ls-remote ветки %s не прочитан: %s" % (branch, why))
+        if not value.strip():
+            return out(UNPROVEN, "ветки %s на origin сервера НЕТ (ls-remote — 0 строк); FACT "
+                                 "называет %s" % (branch, ", ".join(c[:12] for c in claimed[:3])))
+        if _sha_match(value, claimed):
+            return out(ACCEPTED, "голова %s на origin = %s, совпала с FACT"
+                       % (branch, value.strip()[:12]))
+        return out(UNPROVEN, "голова %s на origin = %s, а FACT называет %s — заявленного SHA "
+                             "на origin нет" % (branch, value.strip()[:12],
+                                                ", ".join(c[:12] for c in claimed[:3])))
+    ok, value, why = _read(reader, "live-main", None)
+    if not ok:
+        return out(UNKNOWN, "rev-parse живого дерева не прочитан: %s" % why)
+    parts = value.split()
+    head = parts[0].lower() if parts else ""
+    on = parts[1] if len(parts) > 1 else ""
+    if not SHA_RE.match(head[:40] or "x"):
+        return out(UNKNOWN, "rev-parse ответил не хешем (%r)" % value[:60])
+    if on != "main":
+        return out(UNPROVEN, "живое дерево сервера не на main (%s, HEAD %s)" % (on or "?", head[:12]))
+    if _sha_match(head, claimed):
+        return out(ACCEPTED, "живой main = %s, совпал с FACT" % head[:12])
+    return out(UNPROVEN, "живой main = %s, а FACT называет %s — применение не подтверждено "
+                         "(ветка без применения — не «живой main»)"
+               % (head[:12], ", ".join(c[:12] for c in claimed[:3])))
+
+
 # ═════════════════════════ ПРИЁМКА ═══════════════════════════════════════════
 
 
 def accept(body, artifact_text, artifact_ok=True, why_unread="", share=SHARE,
-           min_hits=MIN_HITS):
+           min_hits=MIN_HITS, reader=None):
     """ПРИЁМКА: тело задания + текст артефакта → вердикт. → dict.
 
     Поля: ``verdict`` (:data:`ACCEPTED` | :data:`RETRY` | :data:`UNKNOWN`),
@@ -367,6 +614,11 @@ def accept(body, artifact_text, artifact_ok=True, why_unread="", share=SHARE,
     Сомнение живёт в пункте 4, а не в третьем исходе: «сверил и не нашёл» — это
     ДОЖАТЬ, «не смог сверить» — это НЕИЗВЕСТНО. Путать их значит либо принимать
     несделанное, либо гонять полосу по кругу на сбое чтения.
+
+    С 02.10.2026 между 3 и 4 стоят правила доказательства (§«ДОКАЗАТЕЛЬСТВО, А НЕ
+    ПОКРЫТИЕ СЛОВ»): копия задания → НЕИЗВЕСТНО; строка «РЕЗУЛЬТАТ:» не подтвердилась
+    чтением → НЕ ДОКАЗАН/НЕИЗВЕСТНО; а после 4 — пункты, чьи слова стоят только в цитате
+    задания или под отрицанием, → НЕИЗВЕСТНО. Вердикт правила несёт поле ``rule``.
     """
     got = points(body)
     if not artifact_ok:
@@ -379,7 +631,24 @@ def accept(body, artifact_text, artifact_ok=True, why_unread="", share=SHARE,
                 "why": ("в задании не разобран раздел «ЧТО СДЕЛАТЬ» — сверять артефакт не с чем "
                         "(нумерованных пунктов не найдено)")}
     art = stems(artifact_text)
-    remainder, unjudged, judged = [], [], 0
+    clauses, own_share = own_text(body, artifact_text)
+    if own_share < COPY_OWN_MIN:
+        return {"verdict": UNKNOWN, "remainder": [], "unjudged": [], "points": len(got),
+                "rule": RULE_COPY,
+                "why": ("артефакт — копия тела задания: своих слов %.0f%% при пороге %.0f%% "
+                        "(остальное — цепочки по %d слов подряд из задания); покрытие пунктов "
+                        "цитатой доказательством не является"
+                        % (own_share * 100, COPY_OWN_MIN * 100, COPY_NGRAM))}
+    proof = prove(body, artifact_text, reader)
+    if proof is not None and proof["verdict"] != ACCEPTED:
+        return {"verdict": proof["verdict"], "remainder": [], "unjudged": [], "points": len(got),
+                "rule": RULE_RESULT, "why": proof["why"]}
+    # Улика пункта — СВОЁ слово вне отрицания. Решение («нельзя, потому что…») законно
+    # отрицательное, поэтому при заявленном и подтверждённом решении отрицание не снимает слов.
+    decided = proof is not None and proof.get("kind") == KIND_DECISION
+    own_all = _stems_of(clauses)
+    own_yes = own_all if decided else _stems_of(clauses, negated=False)
+    remainder, unjudged, hollow, judged = [], [], [], 0
     for point in got:
         pterms = terms(point["text"])
         if not pterms:
@@ -390,21 +659,55 @@ def accept(body, artifact_text, artifact_ok=True, why_unread="", share=SHARE,
         if not ok:
             remainder.append({"n": point["n"], "text": point["text"][:POINT_CHARS],
                               "found": found, "total": total, "missing": missing[:8]})
+            continue
+        # Прежняя мера пункт приняла. Держится ли он на СВОИХ словах вне отрицания?
+        ok2, missing2, found2, _t = answered(pterms, own_yes, share=share, min_hits=min_hits)
+        if ok2:
+            continue
+        ok_all, _m, found_all, _t = answered(pterms, own_all, share=share, min_hits=min_hits)
+        if ok_all:
+            cause = "под отрицанием"
+        elif found_all < int(min_hits):
+            # «ТОЛЬКО в цитате» — буквально: своих слов пункта меньше двух. Мягче доли НАМЕРЕННО:
+            # пункт, который сам есть текст для воспроизведения (шесть шаблонов дословно, 0106a
+            # 02.10), артефакт обязан повторить, и своих слов в нём не может быть половина.
+            cause = "в цитате задания"
+        else:
+            continue
+        hollow.append({"n": point["n"], "text": point["text"][:POINT_CHARS],
+                       "found": found2, "total": total, "missing": missing2[:8],
+                       "cause": cause})
     if not judged:
         return {"verdict": UNKNOWN, "remainder": [], "unjudged": unjudged, "points": len(got),
                 "why": ("ни у одного из %d пунктов нет собственных опорных слов — сверять нечем"
                         % len(got))}
     tail = ("; пункты без собственных слов (не судились): %s"
             % ", ".join(str(n) for n in unjudged)) if unjudged else ""
+    hollow_words = ("; слова есть, но только %s: %s" % (
+        "/".join(sorted({h["cause"] for h in hollow})),
+        ", ".join("п.%d" % h["n"] for h in hollow))) if hollow else ""
+    proved = ("; %s" % proof["why"]) if proof is not None else ""
     if remainder:
-        return {"verdict": RETRY, "remainder": remainder, "unjudged": unjudged,
+        # ДОЖИМ — прежний путь. Пустые пункты едут в остаток вместе с неотвеченными: второй
+        # заход обязан ответить на них своими словами, а не повторить «не сделано».
+        rest = sorted(remainder + [{k: v for k, v in h.items() if k != "cause"} for h in hollow],
+                      key=lambda r: r["n"])
+        return {"verdict": RETRY, "remainder": rest, "unjudged": unjudged,
                 "points": len(got),
                 "why": ("сверка артефакта с пунктами раздела «ЧТО СДЕЛАТЬ»: не отвечено %d из %d "
-                        "(%s)%s" % (len(remainder), judged,
-                                    ", ".join("п.%d" % r["n"] for r in remainder), tail))}
+                        "(%s)%s%s%s" % (len(remainder), judged,
+                                        ", ".join("п.%d" % r["n"] for r in remainder), tail,
+                                        hollow_words, proved))}
+    if hollow:
+        return {"verdict": UNKNOWN, "remainder": [], "unjudged": unjudged, "points": len(got),
+                "rule": RULE_NEGATION, "hollow": [h["n"] for h in hollow],
+                "why": ("опорные слова пунктов %s стоят только %s — ответ «сделано» из них не "
+                        "читается (отчёт из отрицаний или цитата задания — не доказательство)%s%s"
+                        % (", ".join("п.%d" % h["n"] for h in hollow),
+                           "/".join(sorted({h["cause"] for h in hollow})), tail, proved))}
     return {"verdict": ACCEPTED, "remainder": [], "unjudged": unjudged, "points": len(got),
-            "why": ("сверка артефакта с пунктами раздела «ЧТО СДЕЛАТЬ»: отвечены все %d%s"
-                    % (judged, tail))}
+            "why": ("сверка артефакта с пунктами раздела «ЧТО СДЕЛАТЬ»: отвечены все %d%s%s"
+                    % (judged, tail, proved))}
 
 
 # ═════════════════════════ ТЕЛО ДОЖИМА ═══════════════════════════════════════

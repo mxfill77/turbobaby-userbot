@@ -549,8 +549,98 @@ def artifact_of(text, root=HERE):
     return hits[0][1], True, "", hits[0][0]
 
 
+# ═══ ЧИТАТЕЛЬ СЕРВЕРА ДЛЯ СТРОКИ «РЕЗУЛЬТАТ:» (02.10.2026, задание 0124e-78m.0210) ═══════
+# Чистая приёмка (`shtab_box_accept.prove`) судит заявленное, а ЧИТАЕТ его здесь: ssh у
+# чистого модуля под запретом инвариантом SHTAB_BOX_PURE. Только чтение и ровно две команды:
+# `git ls-remote origin refs/heads/<ветка>` и `git rev-parse` живого дерева. Опции ssh —
+# дословно из задания; ключ — тот же файл, которым полоса уже ходит на свой VPS.
+SERVER = "root@5.223.94.179"
+SERVER_TREE = "/root/turbobaby-manager-bot"
+SERVER_KEY = "~/.ssh/turbobaby_vps"
+SSH_OPTS = ("-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=4", "-o", "BatchMode=yes")
+SSH_TIMEOUT = 60          # потолок одного чтения; ConnectTimeout + две паузы keepalive с запасом
+
+
+def _ssh_argv(remote_cmd):
+    return (["ssh", "-i", os.path.expanduser(SERVER_KEY)] + list(SSH_OPTS)
+            + [SERVER, remote_cmd])
+
+
+def server_reader(what, arg=None, runner=None):
+    """Чтение заявленного результата на сервере. → {'ok', 'value', 'why'}.
+
+    ``('ls-remote', ветка)`` → value = хеш головы ветки на origin ('' — ветки нет);
+    ``('live-main', None)`` → value = «<хеш HEAD> <имя ветки>» живого дерева.
+    Любой отказ — ``ok=False`` с причиной: приёмка скажет НЕИЗВЕСТНО, а не «нет».
+    ``runner(argv)`` → (rc, stdout, stderr) — дверь для тестов; по умолчанию subprocess.
+    """
+    import shlex
+
+    if what == "ls-remote":
+        branch = str(arg or "")
+        if not acc.BRANCH_RE.match(branch) or ".." in branch:
+            return {"ok": False, "value": "", "why": "имя ветки не по форме"}
+        cmd = "cd %s && git ls-remote origin %s" % (SERVER_TREE,
+                                                    shlex.quote("refs/heads/" + branch))
+    elif what == "live-main":
+        cmd = "cd %s && git rev-parse HEAD && git rev-parse --abbrev-ref HEAD" % SERVER_TREE
+    else:
+        return {"ok": False, "value": "", "why": "незнакомое чтение %r" % (what,)}
+    if runner is None:
+        def runner(argv):
+            import subprocess
+
+            flags = 0x08000000 if os.name == "nt" else 0       # CREATE_NO_WINDOW
+            done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
+                                  timeout=SSH_TIMEOUT, creationflags=flags)
+            return (done.returncode, done.stdout.decode("utf-8", "replace"),
+                    done.stderr.decode("utf-8", "replace"))
+    try:
+        rc, out, err = runner(_ssh_argv(cmd))
+    except Exception as exc:                       # noqa: BLE001 — сбой чтения = НЕИЗВЕСТНО
+        return {"ok": False, "value": "", "why": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
+    if rc != 0:
+        return {"ok": False, "value": "",
+                "why": "ssh rc=%s: %s" % (rc, (str(err or "").strip() or "без вывода")[:120])}
+    lines = [ln.strip() for ln in str(out or "").splitlines() if ln.strip()]
+    if what == "ls-remote":
+        want = "refs/heads/" + branch
+        for ln in lines:
+            parts = ln.split()
+            if len(parts) == 2 and parts[1] == want:
+                return {"ok": True, "value": parts[0], "why": ""}
+        return {"ok": True, "value": "", "why": ""}
+    if len(lines) < 2:
+        return {"ok": False, "value": "", "why": "rev-parse ответил не двумя строками"}
+    return {"ok": True, "value": "%s %s" % (lines[0], lines[1]), "why": ""}
+
+
+def v0_proof(text, art_text, reader=server_reader):
+    """Судья закрытия спрашивает у приёмки ТЕ ЖЕ правила доказательства. → (слово V0 | None, причина).
+
+    ОДНА ФУНКЦИЯ — ОДИН ВЕРДИКТ. Демон (`pc_orchestrator._judge_done`) зовёт это на ряд ящика,
+    который V0 признал «сделано»; ответ — вердикт той же :func:`shtab_box_accept.accept`, что
+    позже позовут руки ящика. Слово V0 возвращается ТОЛЬКО когда сработало правило
+    доказательства (``rule``): ДОЖАТЬ и прежние НЕИЗВЕСТНО (нет раздела «ЧТО СДЕЛАТЬ») судье
+    закрытия не принадлежат — дожим живёт на ``done``, и уронить ряд в ``failed`` значило бы
+    его убить. ``None`` — правило не сработало, вердикт V0 остаётся как был.
+    """
+    if not acc.key_of(text):
+        return None, ""
+    out = acc.accept(acc.body_of(text), art_text, reader=reader)
+    if out.get("rule") not in acc.PROOF_RULES:
+        return None, ""
+    word = {acc.UNPROVEN: done_judge_pc.UNPROVEN,
+            acc.UNKNOWN: done_judge_pc.UNKNOWN}.get(out["verdict"])
+    if word is None:
+        return None, ""
+    return word, "приёмка ящика (%s): %s" % (out["verdict"], out["why"])
+
+
 def retry_blocks(closed_rows, seen_keys, root=HERE, artifact_fn=None,
-                 attempt_max=acc.ATTEMPT_MAX, body_max=shtab_box.BODY_MAX):
+                 attempt_max=acc.ATTEMPT_MAX, body_max=shtab_box.BODY_MAX,
+                 reader=server_reader):
     """Закрытые ряды ящика → (блоки ДОЖИМА, строки исходов приёмки). Диск только на чтение.
 
     ПРИЁМКА ЗАХОДИТ ПОСЛЕ ЗАКРЫТИЯ и только к ``done``: провал (``failed``) — это не
@@ -586,7 +676,8 @@ def retry_blocks(closed_rows, seen_keys, root=HERE, artifact_fn=None,
             continue
         body = acc.body_of(text)
         art_text, art_ok, art_why, art_path = art(text)
-        verdict = acc.accept(body, art_text, artifact_ok=art_ok, why_unread=art_why)
+        verdict = acc.accept(body, art_text, artifact_ok=art_ok, why_unread=art_why,
+                             reader=reader)
         note = {"key": key, "id": row.get("id"), "verdict": verdict["verdict"],
                 "why": verdict["why"], "artifact": art_path, "attempt": acc.attempt_of(key),
                 "card": "", "next": "", "held": ""}

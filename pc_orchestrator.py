@@ -4394,6 +4394,34 @@ def _maybe_mark_vs_address(tid, text, card, base):
     return True
 
 
+# ═══ ПРАВИЛА ДОКАЗАТЕЛЬСТВА ЯЩИКА НА ПУТИ V0 (02.10.2026, задание 0124e-78m.0210) ═════════════
+# Ряд ящика, который V0 признал «сделано» (продукт по адресу есть и свеж), спрашивается ТЕМИ ЖЕ
+# правилами, что приёмка ящика: копия задания, слова только под отрицанием, строка «РЕЗУЛЬТАТ:»,
+# не подтверждённая чтением сервера. Функция одна (`shtab_box_run.v0_proof` → `accept`), поэтому
+# оба пути дают один вердикт: правило сработало здесь — ряд ложится `failed` с маркером
+# НЕ ДОКАЗАНО/НЕИЗВЕСТНО и до приёмки не доходит; V0 выключен — то же слово скажет приёмка.
+# ДОЖАТЬ сюда не переносится: дожим живёт на `done`. Сбой самой проверки — НЕИЗВЕСТНО с виной,
+# как сбой судьи (`done_judge_pc._judged`): проверка, падающая молча, закрыла бы ряд зелёным.
+def _box_proof(tid, text, verdict):
+    if verdict.get("verdict") != done_judge_pc.DONE or not verdict.get("chosen"):
+        return verdict
+    if not str(text or "").lstrip().startswith("[от Штаба"):
+        return verdict
+    try:
+        import shtab_box_run as _sbr
+        art = done_judge_pc._read_text(
+            os.path.join(done_judge_pc.REPO, str(verdict["chosen"]).replace("/", os.sep)),
+            done_judge_pc.MAX_ARTIFACT_BYTES)
+        word, why = _sbr.v0_proof(text, art)
+    except Exception as exc:                                   # noqa: BLE001 — см. шапку
+        word, why = done_judge_pc.UNKNOWN, ("СБОЙ приёмки ящика (%s: %s) — это не «сделано»"
+                                            % (type(exc).__name__, str(exc)[:120]))
+    if not word:
+        return verdict
+    log.warning("V0-DONE id=%s: правило доказательства ящика → %s (%s)", tid, word, why[:300])
+    return dict(verdict, verdict=word, reason=why[:600])
+
+
 # ═══ СТУПЕНЬ C: ЗАКРЫТИЕ ЗАДАЧИ СУДИТ V0, А НЕ ОТЧЁТ (01.09.2026) ════════════════════════════
 # Единственная точка ВЫЗОВА судьи на полосе. Правило и границы — в докстринге `done_judge_pc`;
 # здесь только руки: журнал, текст отчёта и статус.
@@ -4428,6 +4456,7 @@ def _judge_done(tid, text, status, result, base):
         run_id=done_judge_pc.run_token(tid, (_task_started_rec(tid) or {}).get("draft")))
     if not verdict:
         return status, result
+    verdict = _box_proof(tid, text, verdict)
     mode = done_judge_pc.enforce_mode()
     log.info("V0-DONE id=%s вердикт=%s режим=%s причина=%s",
              tid, verdict["verdict"], mode, verdict["reason"])
