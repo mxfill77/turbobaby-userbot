@@ -161,6 +161,11 @@ def _retry_read(call):
             return call()
         except Exception as e:
             last = e
+            # Чтение не сделано потолком витка дирижёра (`orch_loop_guard.ReadSkipped`): повтор не
+            # лечит, а жжёт паузы после того, как время витка уже кончилось. Иных отказов это не
+            # касается — у них признака нет, и повтор прежний.
+            if getattr(e, "no_retry", False):
+                break
             if i + 1 < _READ_TRIES:
                 time.sleep(_READ_PAUSE * (i + 1))
     raise last

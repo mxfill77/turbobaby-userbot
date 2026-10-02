@@ -95,6 +95,7 @@ import sys
 import content_product_verifier as v0
 import done_judge_pc
 import io_utf8
+import orch_loop_guard as _olg   # плечи мозга под потолком чтений витка дирижёра (выкл. → пусто)
 import recon_auto_run
 import review_intake
 import shtab_box
@@ -421,7 +422,8 @@ def read_node(name=None, reader=None):
 
             return brain_writer.read_text(name=doc)
     try:
-        text = reader(node)
+        with _olg.G.reading("read_doc"):
+            text = reader(node)
     except Exception as exc:                            # noqa: BLE001 — любой отказ = «неизвестно»
         return "", False, "узел %s не прочитан: %s" % (node, str(exc)[:200])
     if not isinstance(text, str) or not text.strip():
@@ -459,14 +461,24 @@ def read_folder(prefix=None, lister=None):
             import brain_writer
 
             return brain_writer.list_folder(prefix=p)
+    # ПЕРЕЧИСЛЕНИЕ — ПЛЕЧО ВИТКА (02.10.2026): под потолком чтений и с памятью об отказе. Упало —
+    # факт пишется в виток ВСЕГДА (показ причины), а зависимые чтения мозга этого же витка (тело,
+    # шапка, повторное перечисление витрины) при включённом ORCH_READ_BUDGET_SEC уже не делаются.
+    # Срезанное потолком (`ReadSkipped`) отказом перечисления НЕ считается: мост не отвечал «нет».
     try:
-        r = lister(pref)
+        with _olg.G.reading("list_brain_folder"):
+            r = lister(pref)
     except Exception as exc:                            # noqa: BLE001 — любой отказ = «неизвестно»
-        return [], False, ("перечисление папки мозга не удалось: %s: %s"
-                           % (type(exc).__name__, str(exc)[:180]))
+        why = ("перечисление папки мозга не удалось: %s: %s"
+               % (type(exc).__name__, str(exc)[:180]))
+        if not isinstance(exc, _olg.ReadSkipped) and "ReadSkipped" not in str(exc):
+            _olg.G.note_brain_fail(why, _olg._fail_kind(exc))
+        return [], False, why
     if not isinstance(r, dict) or not r.get("ok"):
-        return [], False, ("перечисление папки мозга ответило НЕ ok: %s"
-                           % json.dumps(r, ensure_ascii=False, default=str)[:200])
+        why = ("перечисление папки мозга ответило НЕ ok: %s"
+               % json.dumps(r, ensure_ascii=False, default=str)[:200])
+        _olg.G.note_brain_fail(why)
+        return [], False, why
     files = r.get("files")
     if not isinstance(files, list):
         return [], False, "в ответе перечисления нет списка файлов — читать нечего"
@@ -498,7 +510,8 @@ def read_doc_text(doc_id, reader=None):
 
             return brain_writer.read_text(doc_id=fid)
     try:
-        text = reader(ident)
+        with _olg.G.reading("read_doc"):
+            text = reader(ident)
     except Exception as exc:                            # noqa: BLE001 — любой отказ = «неизвестно»
         return "", False, ("тело документа не прочитано (id %s): %s: %s"
                            % (ident[:12], type(exc).__name__, str(exc)[:160]))

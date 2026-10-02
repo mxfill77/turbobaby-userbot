@@ -48,6 +48,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import orch_loop_guard as _olg   # потолок чтений витка дирижёра: срок ЧТЕНИЯ (None = прежнее поведение)
+
 DEFAULT_TIMEOUT = 30
 MAX_HOPS = 6              # столько же, сколько у VPS-образца
 ECHO_TRIES = 3            # попыток забрать расписку со второго плеча
@@ -212,7 +214,28 @@ _BOUNCE_TEXT = ("второе плечо моста (echo) бросает обр
 # отдельной задачи VPS-полосы; здесь мы её просто не повторяем.
 
 
-def _fetch_receipt(url, timeout, opener, sleeper, origin, method, tries=ECHO_TRIES):
+# ── СРОК ЧТЕНИЯ ВИТКА (ORCH_READ_BUDGET_SEC, 02.10.2026, ORCHIDLEGUARD0210) ─────────────────────
+# Срок `dl` приходит ТОЛЬКО для GET внутри области `orch_loop_guard.G.reading()` — её открывают
+# разрезаемые чтения демона и ящика. Вне её (мутации, `_in_status`, журнал, CLI) `dl` = None, и
+# обе функции ниже отдают ровно то, что получили: прежний путь байт-в-байт. Внутри неё таймаут
+# сокета не длиннее остатка, а пауза повтора не переживает срок: потолок держит и ЗАВИСШИЙ вызов,
+# а не только следующий (дыра потолка 04.09: проверка шла до вызова, вызов сам жил до 4802 с).
+def _cap(timeout, dl, leg=""):
+    if dl is None:
+        return timeout
+    rem = dl - _olg.G.now()
+    if rem <= 0:
+        raise _olg.ReadSkipped("budget", leg)
+    return rem if timeout is None else min(timeout, rem)
+
+
+def _nap(sleeper, sec, dl, leg=""):
+    if dl is not None and _olg.G.now() + sec >= dl:
+        raise _olg.ReadSkipped("budget", leg)
+    sleeper(sec)
+
+
+def _fetch_receipt(url, timeout, opener, sleeper, origin, method, tries=ECHO_TRIES, dl=None):
     """GET по `Location` — забрать расписку со ВТОРОГО плеча, с повторами на 404/429/5xx/таймаут
     и на возврате к своему же `/exec`.
 
@@ -222,9 +245,10 @@ def _fetch_receipt(url, timeout, opener, sleeper, origin, method, tries=ECHO_TRI
     last = None
     for attempt in range(max(1, tries)):
         if attempt:
-            sleeper(ECHO_PAUSE * (2 ** (attempt - 1)))
+            _nap(sleeper, ECHO_PAUSE * (2 ** (attempt - 1)), dl)
+        t_cap = _cap(timeout, dl)
         try:
-            resp = opener.open(urllib.request.Request(url, method="GET"), timeout=timeout)
+            resp = opener.open(urllib.request.Request(url, method="GET"), timeout=t_cap)
         except urllib.error.HTTPError as e:
             if not _echo_retryable(e.code):
                 raise
@@ -256,14 +280,14 @@ def _fetch_receipt(url, timeout, opener, sleeper, origin, method, tries=ECHO_TRI
     raise last
 
 
-def _walk(url, method, params, payload, timeout, op, slp, max_hops, answered):
+def _walk(url, method, params, payload, timeout, op, slp, max_hops, answered, dl=None):
     """Один проход цепочки. → финальный ответ.
 
     `answered` — список-флаг: как только первое плечо ответило редиректом, сюда падает отметка.
     По ней внешний цикл отличает «до моста не дошли» (повторять не наше дело) от «отказало ВТОРОЕ
     плечо» (для GET лечится новым запросом целиком)."""
     origin = _endpoint(url)
-    resp = op.open(_request(url, method, params, payload), timeout=timeout)
+    resp = op.open(_request(url, method, params, payload), timeout=_cap(timeout, dl))
     cur, hops = url, 0
     while _status(resp) in _REDIRECT_CODES:
         answered.append(True)
@@ -279,7 +303,7 @@ def _walk(url, method, params, payload, timeout, op, slp, max_hops, answered):
         cur = urllib.parse.urljoin(cur, loc)
         if _endpoint(cur) == origin:
             raise _leg_error(method, _BOUNCE_TEXT)   # первое плечо ведёт назад — повторять нечего
-        resp = _fetch_receipt(cur, timeout, op, slp, origin, method)
+        resp = _fetch_receipt(cur, timeout, op, slp, origin, method, dl=dl)
         hops += 1
     return resp
 
@@ -312,14 +336,19 @@ def exchange(url, method, params=None, payload=None, timeout=DEFAULT_TIMEOUT,
     op = opener or _default_opener()
     slp = sleeper or time.sleep
     n = 1 if str(method).upper() != "GET" else max(1, READ_TRIES if tries is None else tries)
+    dl = _olg.G.deadline() if str(method).upper() == "GET" else None
     for attempt in range(n):
         answered = []
         try:
-            return _walk(url, method, params, payload, timeout, op, slp, max_hops, answered)
+            return _walk(url, method, params, payload, timeout, op, slp, max_hops, answered, dl)
         except Exception as e:
+            # Отказ, пойманный ПОСЛЕ срока, — наш срез (таймаут сокета был урезан по остатку), а не
+            # новость о мосте: исход НЕИЗВЕСТНО, и повторять его нечем.
+            if dl is not None and not isinstance(e, _olg.ReadSkipped) and _olg.G.now() >= dl:
+                raise _olg.ReadSkipped("budget") from e
             if attempt + 1 >= n or not answered or not _read_retryable(e):
                 raise
-            slp(READ_PAUSE * (2 ** attempt))
+            _nap(slp, READ_PAUSE * (2 ** attempt), dl)
 
 
 def _doget_refusal(data):
@@ -396,10 +425,34 @@ def explain(exc, timeout=None):
     return "отказ не опознан (%s): %s" % (name, str(exc)[:300])
 
 
+def _action_of(method, params, payload):
+    src = params if str(method).upper() == "GET" else payload
+    try:
+        return str((src or {}).get("action") or method)
+    except Exception:
+        return str(method)
+
+
 def request_json(url, method, params=None, payload=None, timeout=DEFAULT_TIMEOUT,
                  opener=None, sleeper=None, tries=None):
     """Вызов моста → разобранный JSON. Транспортный сбой — ИСКЛЮЧЕНИЕ (контракт прежних
-    `_get`/`_post` на голом urlopen сохранён дословно)."""
+    `_get`/`_post` на голом urlopen сохранён дословно).
+
+    УЧЁТ ПЛЕЧ (02.10.2026): каждый вызов — действие, секунды, отказ — ложится в показ витка
+    дирижёра (`orch_loop_guard.G.account`). Это ТОЛЬКО счёт: ни сети, ни пауз он не добавляет, а
+    вне витка демона (CLI, журнал, тесты без `begin`) не делает ничего."""
+    t0 = _olg.G.now()
+    err = None
+    try:
+        return _request_json(url, method, params, payload, timeout, opener, sleeper, tries)
+    except BaseException as e:
+        err = e
+        raise
+    finally:
+        _olg.G.account(_action_of(method, params, payload), method, _olg.G.now() - t0, err)
+
+
+def _request_json(url, method, params, payload, timeout, opener, sleeper, tries):
     resp = exchange(url, method, params=params, payload=payload, timeout=timeout,
                     opener=opener, sleeper=sleeper, tries=tries)
     try:

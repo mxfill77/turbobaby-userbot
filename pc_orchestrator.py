@@ -51,6 +51,7 @@ import urllib.error
 
 import io_utf8               # переключатель stdout/stderr в UTF-8 (класс «charmap can't encode 📊»)
 import bridge_http            # durable-транспорт к мосту: ручной обход редиректа (класс 02.08.2026)
+import orch_loop_guard as _olg  # виток: показ фаз + idle_reason (всегда), потолок чтений и быстрый подхват (выключатели)
 import gate_selective         # селективный тест-гейт авто-применения (порт VPS GATE_STEP/SINGLE_SELECTIVE); чистый, без сети
 import task_metrics           # единый формат строки METRICS (обе полосы) + norm_effort/extract_tokens/selfheal_count
 import client_contour         # признак клиентского контура (граф импортов ботов) + реестр оснований пропуска ворот; чистый, без сети
@@ -866,6 +867,81 @@ def _bridge_budget_note(budget=None, logger=None):
     return line
 
 
+# ══ ВИТОК: ФАЗЫ, ПРИЧИНА ПРОСТОЯ, ПОТОЛОК ЧТЕНИЙ, БЫСТРЫЙ ПОДХВАТ (02.10.2026, ORCHIDLEGUARD0210) ══
+# Состояние витка живёт в ОТДЕЛЬНОМ модуле `orch_loop_guard` (один объект на процесс), а не здесь:
+# здешний счётчик 04.09 у одолженного клиента (`import pc_orchestrator` из ящика при демоне-
+# `__main__`) не обнулялся никогда — ровно из-за этого `PC_BRIDGE_LOOP_BUDGET` откатан в 0.
+#   • ПОКАЗ — всегда: строка «ВИТОК …» в конце каждого витка (фазы, плечи моста, idle_reason);
+#   • ORCH_READ_BUDGET_SEC — потолок GET-чтений моста за виток, умолчание 0 = прежнее поведение;
+#     тот же выключатель гасит повторные чтения мозга после упавшего перечисления папки;
+#   • ORCH_WAKE_ON_DONE — «1» = после закрытой задачи ящик смотрит в том же витке (мимо пола
+#     паузы), а поставленный ряд/закрытая задача укорачивают сон до WAKE_NAP_SEC. Умолчание выкл.
+# CLAIM, его атомарность и приоритет владельца не тронуты: подхват — это тот же `poll_once` со
+# своим порядком (одобренное → новое, владелец впереди), просто без минуты сна перед ним.
+ORCH_READ_BUDGET_SEC = _olg.read_budget_sec()
+ORCH_WAKE_ON_DONE = _olg.wake_on_done()
+WAKE_NAP_SEC = 1            # сон после события вместо POLL_SEC: секунда — чтобы стоп-флаг читался
+WAKE_MAX = 5                # подряд укороченных снов не больше: дальше обычный POLL_SEC
+_wake_streak = 0
+
+
+def _budget_skip(name, exc=None):
+    """Третий исход чтения под потолком витка — та же форма, что у потолка 04.09
+    (`BridgeLoopBudget.skip`): потребители её уже знают и говорят причину словами."""
+    text = str(exc) if exc is not None else str(_olg.ReadSkipped("budget", name))
+    return {"ok": False, "error": BUDGET_ERROR, "error_kind": KIND_BUDGET, "error_text": text,
+            "budget_skipped": True, "ms": 0}
+
+
+def _wake_decision(on, worked, placed, streak, poll=None, nap=None, cap=None):
+    """Сколько спать после витка. → (секунд, новая серия, слово для строки). Чистая, голден.
+
+    Выключено → ровно POLL_SEC и серия 0 (прежнее поведение). Включено: укорачиваем ТОЛЬКО на
+    событии (задача закрыта · ящик поставил ряд) и не больше `cap` раз подряд — горячей петли
+    без работы здесь не бывает ни одной веткой."""
+    poll = POLL_SEC if poll is None else poll
+    nap = WAKE_NAP_SEC if nap is None else nap
+    cap = WAKE_MAX if cap is None else cap
+    if not on or not (worked or placed):
+        return poll, 0, ""
+    if streak >= cap:
+        return poll, 0, "подхват: %d подряд — сплю обычные %dс" % (streak, poll)
+    why = "задача закрыта" if worked else "ящик поставил ряд"
+    return nap, streak + 1, "подхват: %s — сон %dс вместо %dс" % (why, nap, poll)
+
+
+def _box_facts(box):
+    """Отчёт ящика → факты витка (None — ящик в этом витке не смотрел)."""
+    if not isinstance(box, dict):
+        return {}
+    placed = [r for r in (box.get("placed") or []) if isinstance(r, dict)]
+    return {"placed": bool(placed),
+            "placed_pc": any(str(r.get("lane") or "pc") == "pc" for r in placed),
+            "box_stop": bool(box.get("stop")) or bool(box.get("off")),
+            "owner_busy": bool(box.get("owner_busy"))}
+
+
+def _loop_report(loop_wall, box=None, logger=None, guard=None):
+    """Строка «ВИТОК …» в конце витка. Показ: ничего не решает и ничего не роняет. → (причина, строка)."""
+    g = guard or _olg.G
+    if g.facts.get("said"):                    # ровно одна строка на виток (зовётся и из except)
+        return "", ""
+    try:
+        g.note(said=True)
+        bf = _box_facts(box)
+        g.note(worked=_last_work_at >= loop_wall, placed=bf.get("placed", False),
+               box_stop=bf.get("box_stop", False), owner_busy=bf.get("owner_busy", False),
+               stopped=_stopped())
+        snap = g.snapshot()
+        reason = _olg.idle_reason(_olg.facts_of(snap))
+        line = _olg.line(snap, reason)
+        (logger or log).info("%s", line)
+        return reason, line
+    except Exception as e:                     # noqa: BLE001 — показ не смеет ронять виток
+        (logger or log).warning("строка витка не собрана: %s", e)
+        return "", ""
+
+
 # ═══ МАРШРУТ ИНФОРМАЦИОННОЙ ЗАЯВКИ: СПИСКОМ, А НЕ КАРТОЧКОЙ (09.09.2026) ═════════
 # Решает чистый слой `zayavki_route_pc`; здесь только руки: спросить второй признак,
 # записать снятое в реестр и КРИКНУТЬ в лог. Разбор, числа и оба признака — в шапке
@@ -998,11 +1074,25 @@ class Bridge:
         name = str(action or method)
         if b is not None and cuttable and b.exhausted():
             return b.skip(name)                      # третий исход: сети не касаемся вовсе
+        # ПОТОЛОК ЧТЕНИЙ ВИТКА (ORCH_READ_BUDGET_SEC, 02.10.2026): режется ТОЛЬКО разрезаемый GET.
+        # POST и `_in_status` (cuttable=False) в область не входят — путь записи и его
+        # доказательство не режутся ни одной веткой. Выключатель 0 → `reading` пуст, путь прежний.
+        read_cut = cuttable and str(method).upper() == "GET"
         t0 = time.perf_counter()
         wit = self.witness or net_witness
         try:
-            data = bridge_http.request_json(self.url, method, params=params, payload=payload,
-                                            timeout=self.timeout, opener=self.opener)
+            if read_cut:
+                with _olg.G.reading(name):
+                    data = bridge_http.request_json(self.url, method, params=params,
+                                                    payload=payload, timeout=self.timeout,
+                                                    opener=self.opener)
+            else:
+                data = bridge_http.request_json(self.url, method, params=params, payload=payload,
+                                                timeout=self.timeout, opener=self.opener)
+        except _olg.ReadSkipped as e:
+            # НЕ СПРАШИВАЛИ (или срезали сами) — свидетелю связи об этом не говорим: это наше
+            # решение о времени, а не факт о сети.
+            return _budget_skip(name, e)
         except Exception as e:
             kind = bridge_http.error_kind(e)
             text = bridge_http.explain(e, self.timeout)
@@ -5727,7 +5817,8 @@ def poll_once():
     process_approval_timeouts()
     process_local_chains()        # локальный дирижёр: done-шаг → релиз следующего, финал → сводка
     process_stuck_chains()        # вотчдог: цепь висит между шагами (потерянный релиз) → reconcile-досдвиг
-    process_new()
+    with _olg.G.phase("process_new"):   # показ витка (02.10): только часы, порядок и тело не тронуты
+        process_new()
     _srv_delivery()               # 03.09: работа серверной полосы доезжает в общий репозиторий сама
     _chatlog_capture("poll")      # 22.09: архив переписки получил ЧАСЫ (сам решает, идти ли на диск)
     # Слепок очереди — ПЕРЕД heartbeat СОЗНАТЕЛЬНО: `_write_heartbeat()` обязан остаться
@@ -12940,11 +13031,15 @@ def _shtab_box_announce(report, said_before, journal=None):
     return list(said_before or []) + fresh
 
 
-def maybe_shtab_box(now=None, tick_path=None, runner=None):
+def maybe_shtab_box(now=None, tick_path=None, runner=None, force=False):
     """Один оборот ящика за тик, с троттлингом по МЕТКЕ НА ДИСКЕ. → отчёт | None.
 
     None — ветка выключена или пол паузы не прошёл. Метку пишем ВСЕГДА, даже когда ящик пуст:
     иначе «пусто» стоило бы чтения мозга и чтения очереди каждые POLL_SEC.
+
+    `force` (02.10.2026, ORCH_WAKE_ON_DONE): в этом витке закрыта задача — пол паузы НЕ ждём,
+    следующее назначенное берётся в том же витке. Все пять замков ящика, сигналы, суточный
+    потолок и «не больше одной за виток» остаются: снят только пол паузы между взглядами.
 
     «Ничего не взяли» — НЕ тишина: причина едет в лог строкой. Выключено стоп-файлом · узел не
     прочитан (НЕИЗВЕСТНО, а не «пусто») · ящик пуст · работа владельца · блок не принят воротами
@@ -12956,7 +13051,7 @@ def maybe_shtab_box(now=None, tick_path=None, runner=None):
     st = _shtab_box_read_tick(tick_path)
     said_before = _shtab_box_said(st)
     prev = st.get("ts")
-    if prev is not None:
+    if prev is not None and not force:
         try:
             if (now - float(prev)) < SHTAB_BOX_MIN_SEC:
                 return None
@@ -14578,8 +14673,13 @@ def _main_loop():
     if _stopped():
         log.info("рубильник pc_orchestrator.stop активен — не стартую поллинг")
         return
-    global _loop_prev_wall, _loop_prev_awake, _client_grace_until
+    global _loop_prev_wall, _loop_prev_awake, _client_grace_until, _wake_streak
     while not _stopped():
+        # ВИТОК ОТКРЫВАЕТСЯ В ОБЩЕМ МОДУЛЕ (02.10.2026): его видят и `__main__`, и одолженный ящиком
+        # клиент, и транспорт. Потолок 0 → только показ; поведение прежнее байт-в-байт.
+        _olg.G.begin(limit=ORCH_READ_BUDGET_SEC)
+        loop_wall = time.time()
+        box = None
         try:
             # (2) Детект сна/пробуждения ДО вотчдога: если ПК спал, wall-clock скакнёт — взводим grace,
             # чтобы первый пост-пробуждение прогон вотчдога (троттлинг уже истёк) не принял медленный
@@ -14618,7 +14718,8 @@ def _main_loop():
                         log.warning("сигнал о долгом сне не отправлен: %s", e)
             _loop_prev_wall = now
             _loop_prev_awake = awake_now
-            poll_once()
+            with _olg.G.phase("poll"):
+                poll_once()
             maybe_client_watchdog()   # часть 3: следим за pc_agent/userbot/moderation_bot (троттлинг 5 мин)
             maybe_session_watch()     # инцидент 29.07: немая сессия (жива, но не работает) → карточка в 328
             maybe_revizor()           # шаг 2/7 (262): ревизор диалогов за DIALOG_REVIZOR (троттлинг REVIZOR_HOURS)
@@ -14630,7 +14731,8 @@ def _main_loop():
             maybe_review_intake()     # ступень B: находки ответа → ЗАЯВКИ очереди (троттлинг REVIEW_INTAKE_MIN_SEC)
             maybe_review_audit()      # ступень D: высокие находки + суточная сводка → тема Аудит (AUDIT_TOPIC)
             maybe_recon_auto()        # ступень E: поводы полосы → разведочные автозадачи (троттлинг RECON_AUTO_MIN_SEC)
-            maybe_shtab_box()         # ящик Штаба: узел мозга → задача полосы, НЕ БОЛЬШЕ ОДНОЙ за виток (SHTAB_BOX_MIN_SEC)
+            with _olg.G.phase("box"):  # ящик Штаба: узел мозга → задача полосы, НЕ БОЛЬШЕ ОДНОЙ за виток (SHTAB_BOX_MIN_SEC)
+                box = maybe_shtab_box(force=bool(ORCH_WAKE_ON_DONE and _last_work_at >= loop_wall))
             maybe_review_outbox()     # ступень F: не доехавший пакет → очередь исходящих с повтором (REVIEW_OUTBOX_MIN_SEC)
             maybe_contour_digest()    # сводка контура: СОСТОЯНИЕ полосы в тему сводок раз в CONTOUR_DIGEST_SEC (4 ч)
             maybe_vitrina()           # живая витрина: ОДНО сообщение темы правится на месте при СМЕНЕ ЧИСЕЛ (VITRINA_PC_SEC)
@@ -14644,13 +14746,20 @@ def _main_loop():
             # поломки: «ящик ничего не взял» и «ящика не спрашивали, мост был занят» выглядели бы
             # в логе одинаково. Строка идёт ДО self-update: тот выходит из функции return'ом.
             _bridge_budget_note()
+            _loop_report(loop_wall, box)   # строка «ВИТОК …» — ДО self-update: тот выходит return'ом
             if maybe_self_update():   # задача цикла обновила pc_orchestrator.py → эстафета новому
                 log.info("=== ДЕМОН ВЫШЕЛ ПО SELF-UPDATE (эстафета новому процессу) ===")
                 return
         except Exception as e:
             _bridge_budget_note()     # виток, упавший ПОСЛЕ обрезки, обязан назвать обрезку тоже
             log.exception("ошибка цикла: %s", e)
-        for _ in range(POLL_SEC):
+            _loop_report(loop_wall, box)
+        bf = _box_facts(box)
+        nap, _wake_streak, wake_word = _wake_decision(
+            ORCH_WAKE_ON_DONE, _last_work_at >= loop_wall, bf.get("placed_pc", False), _wake_streak)
+        if wake_word:
+            log.info("%s", wake_word)
+        for _ in range(nap):
             if _stopped():
                 break
             time.sleep(1)

@@ -444,10 +444,12 @@ def journal(line, repo=HERE, runner=None):
     класс), а у писателя весь argv и так считается текстом записи.
     """
     run = runner or subprocess.run
+    import orch_loop_guard                         # фаза «журнал» строки витка дирижёра — только часы
     try:
-        done = run([sys.executable, os.path.join(repo, JOURNAL_WRITER), "-"],
-                   input=line.encode("utf-8"), stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE, timeout=240, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        with orch_loop_guard.G.phase("journal"):
+            done = run([sys.executable, os.path.join(repo, JOURNAL_WRITER), "-"],
+                       input=line.encode("utf-8"), stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, timeout=240, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception as exc:                       # журнал НИКОГДА не роняет контур
         return -1, "журнал не ответил: %s" % exc
     return done.returncode, done.stdout.decode("utf-8", "replace").strip()
