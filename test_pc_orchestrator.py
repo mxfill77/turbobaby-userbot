@@ -14102,5 +14102,61 @@ class TestSvcClockDemon(unittest.TestCase):
                          "демон читает не тот штамп, что пишут часы")
 
 
+class TestTgFeedPush(unittest.TestCase):
+    """Пушер ленты Telegram (03.10.2026, TGPUSHPC0310): вызов из демона ТОЛЬКО при TG_FEED_PUSH=1,
+    отдельным процессом с таймаутом ≤ 20 с, без импорта; строки пушера — в журнал демона."""
+
+    def _run(self, value, runner):
+        env = {k: v for k, v in os.environ.items() if k != "TG_FEED_PUSH"}
+        if value is not None:
+            env["TG_FEED_PUSH"] = value
+        with mock.patch.dict(os.environ, env, clear=True):
+            return o._tg_feed_push(runner=runner)
+
+    def test_switch_off_means_zero_calls(self):
+        for value in (None, "", "0", "true", "yes", "on", " 2 ", "да"):
+            with self.subTest(value=value):
+                runner = mock.Mock()
+                self.assertIsNone(self._run(value, runner))
+                runner.assert_not_called()
+
+    def test_switch_on_spawns_once_with_timeout(self):
+        runner = mock.Mock(return_value=types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+        self.assertEqual(self._run(" 1 ", runner), 0)
+        self.assertEqual(runner.call_count, 1)
+        argv, kw = runner.call_args[0][0], runner.call_args[1]
+        self.assertEqual(os.path.basename(argv[1]), "tg_feed_push.py")
+        self.assertEqual(argv[2:], ["--tick"])
+        self.assertLessEqual(kw["timeout"], 20)
+        self.assertEqual(kw["cwd"], o.REPO)
+
+    def test_unittest_guard_without_runner(self):
+        with mock.patch.object(o.subprocess, "run") as run:
+            self.assertIsNone(self._run("1", None))
+            run.assert_not_called()
+
+    def test_loud_lines_go_to_error_and_timeout_is_caught(self):
+        out = "TG-ПУШЕР: отправлено 3 рядов\n!! TG-ПУШЕР: ПОТОЛОК — x\n"
+        runner = mock.Mock(return_value=types.SimpleNamespace(returncode=1, stdout=out, stderr=""))
+        with mock.patch.object(o, "log") as log:
+            self._run("1", runner)
+        self.assertEqual([c[0][1] for c in log.error.call_args_list], ["!! TG-ПУШЕР: ПОТОЛОК — x"])
+        self.assertEqual([c[0][1] for c in log.info.call_args_list], ["TG-ПУШЕР: отправлено 3 рядов"])
+        runner = mock.Mock(side_effect=o.subprocess.TimeoutExpired(["x"], 20))
+        with mock.patch.object(o, "log") as log:
+            self.assertIsNone(self._run("1", runner))
+        self.assertEqual(log.error.call_count, 1)
+
+    def test_poll_once_order_and_no_import(self):
+        src = inspect.getsource(o.poll_once)
+        body = [ln.strip() for ln in src.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        self.assertEqual(body[-1], "_write_heartbeat()")
+        self.assertLess(src.index("_tg_feed_push()"), src.index('_queue_snapshot("poll")'))
+        with open(o.__file__, encoding="utf-8") as f:
+            text = f.read()
+        self.assertNotIn("import tg_feed_push", text)
+        self.assertNotIn("from tg_feed_push", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

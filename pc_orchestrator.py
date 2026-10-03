@@ -1267,6 +1267,48 @@ def _chatlog_capture(why):
         log.warning("архив Обслуживания: часы (%s) не запущены: %s", why, e)
 
 
+TG_FEED_PUSH_TIMEOUT = 20      # с, потолок одного захода пушера (задание 0128p-79n.0310: ≤ 20 с)
+
+
+def _tg_feed_push(runner=None):
+    """Пушер ленты Telegram на сервер (`tg_feed_push.py --tick`) — отдельным процессом С ТАЙМАУТОМ
+    (03.10.2026, TGPUSHPC0310). По умолчанию ВЫКЛЮЧЕН: вызов только при `TG_FEED_PUSH=1` в
+    окружении демона; любое иное значение — ни одного спавна.
+
+    ПОЧЕМУ subprocess.run, А НЕ fire-and-forget, КАК У СОСЕДЕЙ ВЫШЕ: у пушера два сторожа — свой
+    бюджет 15 с внутри и этот таймаут 20 с снаружи; второй держит зависший заход (DNS, сокет), и
+    `subprocess.run` его снимает сам. Оборот удлиняется не больше чем на 20 с: max законной паузы
+    витка 605 с + 20 = 625 < порога О2 1200 с. Заходы не перекрываются — курсор пишет один процесс
+    (и замок ОС в самом пушере). Его строки демон кладёт в свой журнал: «!!» — ERROR, прочие — INFO;
+    молчит пушер, когда слать нечего.
+
+    ИМПОРТА НЕТ СОЗНАТЕЛЬНО (как у `chatlog_ingest`): спавн не заводит ребра в графе, клиентское
+    замыкание не растёт. Под юнит-тестами без подменённого runner не спавнит вовсе — гейт не должен
+    стать отправителем. ОТКАТ: убрать `TG_FEED_PUSH=1` — ветка мертва целиком."""
+    if str(os.getenv("TG_FEED_PUSH", "") or "").strip() != "1":
+        return None
+    if runner is None and "unittest" in sys.modules:
+        return None
+    try:
+        p = (runner or subprocess.run)(
+            [VENV_PY, os.path.join(REPO, "tg_feed_push.py"), "--tick"],
+            cwd=REPO, stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=TG_FEED_PUSH_TIMEOUT, creationflags=NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        log.error("TG-ПУШЕР: заход дольше %s с — снят по таймауту; курсор стоит на последнем "
+                  "подтверждённом ряде", TG_FEED_PUSH_TIMEOUT)
+        return None
+    except Exception as e:
+        log.warning("TG-ПУШЕР: не запущен: %s", e)
+        return None
+    for line in (p.stdout or "").splitlines():
+        if line.strip():
+            (log.error if line.startswith("!!") else log.info)("%s", line.strip())
+    if p.returncode not in (0, 1, 2, 3):
+        log.error("TG-ПУШЕР: код %s · %s", p.returncode, " ".join((p.stderr or "").split())[-300:])
+    return p.returncode
+
+
 # ─── ЧАСЫ АРХИВА ОБСЛУЖИВАНИЯ: исход каждого захода — одной строкой в журнал демона (30.09.2026) ───
 # Ребёнок (`chatlog_servicing_tick.py`) живёт с stdout в никуда, поэтому говорит он ШТАМПОМ, а
 # вслух — демон. Что демон уже сказал, лежит в своём файле (`SVC_CLOCK_SAID`): эстафета self-update
@@ -5730,6 +5772,7 @@ def poll_once():
     process_new()
     _srv_delivery()               # 03.09: работа серверной полосы доезжает в общий репозиторий сама
     _chatlog_capture("poll")      # 22.09: архив переписки получил ЧАСЫ (сам решает, идти ли на диск)
+    _tg_feed_push()               # 03.10: лента Telegram → дверь сервера; только при TG_FEED_PUSH=1, ≤ 20 с
     # Слепок очереди — ПЕРЕД heartbeat СОЗНАТЕЛЬНО: `_write_heartbeat()` обязан остаться
     # ПОСЛЕДНЕЙ строкой оборота (на этом стоят О2 и О4 — «оборот замкнулся», а не «начался»).
     _queue_snapshot("poll")
